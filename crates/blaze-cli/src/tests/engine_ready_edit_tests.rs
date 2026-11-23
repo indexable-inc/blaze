@@ -1140,8 +1140,9 @@ fn ready_edit_succeeds_with_failed_and_cut_workspace_members_and_matches_phases(
         assert_eq!(r_lines, p_lines, "2-crate edit {n}: stdout lines equal Phases");
     }
 
-    // Case 2: 3-crate workspace (`p` ScopeFailed + `b` cut-scope Unstood + `w` Held) — `Auto`
-    // stays on `ready`, `b`'s outlines are read back and visited, and the answer equals `Phases`.
+    // Case 2: 3-crate workspace (`p` ScopeFailed + `b` CutScope + `w` Held) — `Auto` stays on
+    // `ready`, BOTH `p` (`ScopeFailed`) and `b` (`CutScope`) stand unvisited with 0 outlines read
+    // back, and the answer matches `Phases` byte-for-byte.
     let (ready3, phases3) = (setup(96, true), setup(96, true));
     let edit3 = "pub fn work() -> u8 {\n    42\n}\n";
     write(&ready3, "w/src/lib.rs", edit3);
@@ -1152,7 +1153,120 @@ fn ready_edit_succeeds_with_failed_and_cut_workspace_members_and_matches_phases(
     let prof3 = profile(&ready3);
     assert!(prof3.contains("driver: ready"), "3-crate edit: expected driver: ready:\n{prof3}");
     assert_eq!(rs3.header_shards_read, 0, "3-crate edit: 0 header shards");
+    assert_eq!(r3.files.read_back, 0, "3-crate edit: standing ScopeFailed + CutScope members read 0 outlines back");
+    assert_eq!(r3.members_stood, (4, 2), "3-crate edit: p (2 units) and b (2 units) stood unvisited; only w (lib + test) visited");
     assert_eq!(rs3.root, ps3.root, "3-crate edit: root equals Phases");
     assert_eq!(rs3.pages, ps3.pages, "3-crate edit: pages equal Phases");
     assert_eq!(r3_lines, p3_lines, "3-crate edit: stdout lines equal Phases");
+}
+
+/// Wave 9 (Win 2): a member with a valid own `CrateScope` and a failed dependency crate in its
+/// check scope (`b` depending on failed proc-macro `p`) is recorded as `MemberState::CutScope`:
+/// 1. On a 1-line edit to another member crate `w`, `driver: ready` stands `b` unvisited (0
+///    outlines read back for `b`, 0 names records opened for `b`), matching `Phases` byte-for-byte.
+/// 2. On a 1-line edit to `b/src/lib.rs` itself, `b` does NOT stand (its held file moved), gets
+///    visited and emits the exact refusal matching `Phases` byte-for-byte.
+/// 3. When `p` is later fixed so its `CrateScope` succeeds, `b` does NOT stand and gets checked
+///    normally, matching `Phases` byte-for-byte (and subsequent edits to `w` stand `b` as `Held`).
+#[test]
+fn cut_scope_member_stands_on_ready_edit_and_invalidates_when_dep_fixed() {
+    let setup = |seed: u64| -> Io {
+        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"p\", \"b\", \"w\"]\nresolver = \"2\"\n");
+        write(&io, "p/Cargo.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\nproc-macro = true\n");
+        write(&io, "p/src/lib.rs", "pub fn nothing() {}\n");
+        write(&io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\np = { path = \"../p\" }\n");
+        write(&io, "b/src/lib.rs", "pub fn dep_fn() -> u8 {\n    1\n}\n");
+        write(&io, "w/Cargo.toml", "[package]\nname = \"w\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        write(&io, "w/src/lib.rs", "pub fn work() -> u8 {\n    1\n}\n");
+        let (_, cold) = engine_opts(&io, opts(&io, 2, true));
+        assert!(cold.stored.is_some(), "cold stored");
+        io
+    };
+
+    let run_checked = |io: &Io, driver: Driver| -> (engine_check::Checked, std::vec::Vec<std::string::String>) {
+        let mut options = opts(io, 2, false);
+        options.driver = driver;
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let frame = cx.frame();
+        let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+        let out = io.need_out().expect("out");
+        let err = io.need_err().expect("err");
+        let mut phases = super::engine_check_tests::boxed(|| Phases::new(io.need_clock().expect("a clock")));
+        let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame);
+        let before = stdout(io).len();
+        let fs = io.need_fs().expect("files");
+        let host = io.need_host().expect("host");
+        let mut rng = io.need_rng().expect("rng");
+        let args = io.args();
+        let net = io.net();
+        let checked = engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, options, &mut shown, &mut phases, &out, &err)
+            .unwrap_or_else(|e| panic!("{driver:?} failed: {e}"));
+        let text = stdout(io).split_off(before);
+        let mut lines: std::vec::Vec<std::string::String> = text.lines().map(str::to_owned).collect();
+        lines.pop();
+        (checked, lines)
+    };
+
+    let (ready, phases) = (setup(101), setup(101));
+
+    // 1. Edit `w/src/lib.rs`: `p` (`ScopeFailed`) and `b` (`CutScope`) BOTH stand unvisited!
+    let edit_w1 = "pub fn work() -> u8 {\n    7\n}\n";
+    write(&ready, "w/src/lib.rs", edit_w1);
+    write(&phases, "w/src/lib.rs", edit_w1);
+    let (r1, r1_lines) = run_checked(&ready, Driver::Auto);
+    let (p1, p1_lines) = run_checked(&phases, Driver::Phases);
+    let (rs1, ps1) = (r1.stored.expect("r1 stored"), p1.stored.expect("p1 stored"));
+    let prof1 = profile(&ready);
+    assert!(prof1.contains("driver: ready"), "step 1 must run driver: ready:\n{prof1}");
+    assert!(prof1.contains("scopes opened 2 of 6 members"), "step 1 must open ONLY w's lib+test scopes (never b's):\n{prof1}");
+    assert!(prof1.contains("names records opened 2 ("), "step 1 must open ONLY w's lib+test names records (never b's):\n{prof1}");
+    assert_eq!(r1.files.read_back, 0, "step 1: 0 outlines read back for standing p and b");
+    assert_eq!(r1.members_stood, (4, 2), "step 1: 4 units stood (p + b), 2 visited (w lib + test)");
+    assert_eq!(rs1.root, ps1.root, "step 1: root equals Phases");
+    assert_eq!(rs1.pages, ps1.pages, "step 1: pages equal Phases");
+    assert_eq!(r1_lines, p1_lines, "step 1: stdout lines equal Phases");
+
+    // 2. Edit `b/src/lib.rs` itself: `b` MUST NOT stand; it is visited and matches `Phases`.
+    let edit_b = "pub fn dep_fn() -> u8 {\n    2\n}\n";
+    write(&ready, "b/src/lib.rs", edit_b);
+    write(&phases, "b/src/lib.rs", edit_b);
+    let (r2, r2_lines) = run_checked(&ready, Driver::Auto);
+    let (p2, p2_lines) = run_checked(&phases, Driver::Phases);
+    let (rs2, ps2) = (r2.stored.expect("r2 stored"), p2.stored.expect("p2 stored"));
+    let prof2 = profile(&ready);
+    assert!(prof2.contains("driver: ready"), "step 2 must stay on driver: ready:\n{prof2}");
+    assert_eq!(r2.members_stood, (4, 2), "step 2: 4 units stood (p + w), 2 visited (b lib + test)");
+    assert_eq!(rs2.root, ps2.root, "step 2: root equals Phases");
+    assert_eq!(rs2.pages, ps2.pages, "step 2: pages equal Phases");
+    assert_eq!(r2_lines, p2_lines, "step 2: stdout lines equal Phases");
+
+    // 3. Fix `p` (plain lib crate instead of proc-macro): `p`'s `CrateScope` succeeds, `b` MUST NOT
+    //    stand and gets checked normally, matching `Phases` byte-for-byte!
+    let fixed_p = "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+    write(&ready, "p/Cargo.toml", fixed_p);
+    write(&phases, "p/Cargo.toml", fixed_p);
+    let (r3, r3_lines) = run_checked(&ready, Driver::Auto);
+    let (p3, p3_lines) = run_checked(&phases, Driver::Phases);
+    let (rs3, ps3) = (r3.stored.expect("r3 stored"), p3.stored.expect("p3 stored"));
+    assert_eq!(r3.status, p3.status, "step 3: fixed status matches Phases");
+    assert_eq!(rs3.root, ps3.root, "step 3: root equals Phases after fixing missing dep");
+    assert_eq!(rs3.pages, ps3.pages, "step 3: pages equal Phases after fixing missing dep");
+    assert_eq!(r3_lines, p3_lines, "step 3: stdout lines equal Phases after fixing missing dep");
+
+    // 4. Subsequent 1-line edit to `w/src/lib.rs`: back on `driver: ready` with `p` and `b` both
+    //    standing as `Held`, 0 outlines read back, matching `Phases` byte-for-byte.
+    let edit_w2 = "pub fn work() -> u8 {\n    99\n}\n";
+    write(&ready, "w/src/lib.rs", edit_w2);
+    write(&phases, "w/src/lib.rs", edit_w2);
+    let (r4, r4_lines) = run_checked(&ready, Driver::Auto);
+    let (p4, p4_lines) = run_checked(&phases, Driver::Phases);
+    let (rs4, ps4) = (r4.stored.expect("r4 stored"), p4.stored.expect("p4 stored"));
+    let prof4 = profile(&ready);
+    assert!(prof4.contains("driver: ready"), "step 4 must run driver: ready:\n{prof4}");
+    assert_eq!(r4.files.read_back, 0, "step 4: 0 outlines read back for standing p and b");
+    assert_eq!(r4.members_stood, (4, 2), "step 4: 4 units stood (p + b), 2 visited (w lib + test)");
+    assert_eq!(rs4.root, ps4.root, "step 4: root equals Phases");
+    assert_eq!(rs4.pages, ps4.pages, "step 4: pages equal Phases");
+    assert_eq!(r4_lines, p4_lines, "step 4: stdout lines equal Phases");
 }

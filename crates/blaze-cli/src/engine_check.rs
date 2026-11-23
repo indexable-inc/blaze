@@ -2338,7 +2338,7 @@ fn checking<'f, 'd>(
             }
         }
         // 3. Print: the whole answer's lines, in a call of their own ([`lines_of`]).
-        let made = lines_of(&finished, last_lines.as_ref(), (names.as_ref(), &*scripts, &mut *bodies, &*heads, &*lints), (outlined, unread_notes.as_slice()), discovered, rows, skipped, heap, erased.handle(), alloc, frame)?;
+        let made = lines_of(&finished, last_lines.as_ref(), (names.as_ref(), &*scripts, &mut *bodies, &*heads, &*lints), (outlined, unread_notes.as_slice()), discovered, rows, skipped, heap, alloc, frame)?;
         phases.mark_cx(cx, "lines made", frame);
         let heap_lines_made = crate::engine_phase_mem::heap_now();
         // The closing line's count: every file the request has an outline of (on the ready setup,
@@ -2374,7 +2374,7 @@ fn checking<'f, 'd>(
                     false
                 }
             }
-        }, |kind, path| script_sweep.as_ref().is_some_and(|sweep| sweep.is_direct(kind, path)), rows);
+        }, |kind, path| script_sweep.as_ref().is_some_and(|sweep| sweep.is_direct(kind, path)), |kind, path, answer| crate::engine_script_reads::settled_meta_stamp(cx, root, &stamps, sweep::Plant::None, kind, path, answer), rows);
         if let Some(error) = refused.into_inner() {
             return Err(EngineError::from(error).into());
         }
@@ -2670,7 +2670,7 @@ type LineStages<'x, 'f, 'b> = (
 #[expect(clippy::too_many_arguments, reason = "the request's handles this step reads, each by its own name")]
 fn lines_of<'a, 'f>(
     finished: &blaze_engine::Finished<'_>,
-    last_lines: Option<&crate::engine_lines::Last<'_, '_>>,
+    last_lines: Option<&crate::engine_lines::Last<'a, '_>>,
     (names, scripts, bodies, heads, lints): LineStages<'_, 'f, '_>,
     // The request's outlines, and the plan notes of the files it did not read back (the ready
     // setup's, [`read_needed`]): each kept from the last record.
@@ -2680,7 +2680,6 @@ fn lines_of<'a, 'f>(
     rows: &Rows<'_>,
     skipped: &Skipped<'_>,
     heap: &'static blaze_own::Heap,
-    scratch: blaze_own::Alloc<'_>,
     alloc: SharedAlloc<'a>,
     frame: &Frame,
 ) -> Result<Made<'a>, CliError> {
@@ -2699,13 +2698,13 @@ fn lines_of<'a, 'f>(
     // stage not whole as a body entered now would (`bodies.whole()`). Read here, over the rows
     // with findings alone (a clean body has none), so O(rows with findings).
     let mut standing_bodies_whole = true;
-    for (name, _) in finished.answer.print_rows_in(scratch).map_err(EngineError::from)?.iter() {
+    for name in finished.answer.with_findings.iter() {
         if !entered_now.contains(name) {
             match last_lines.and_then(|last| last.block(*name)) {
                 Some(block) => {
                     // A block that does not decode is not known to be of a whole check: not
                     // whole (a pass is never implied, rule 3); `print_all` says its error.
-                    if name.kind == blaze_drive::Kind::BodyCheck && crate::engine_lines::not_checked_whole(block).unwrap_or(true) {
+                    if standing_bodies_whole && name.kind == blaze_drive::Kind::BodyCheck && crate::engine_lines::not_checked_whole(block).unwrap_or(true) {
                         standing_bodies_whole = false;
                     }
                     // A file's Told note is the tail's (a target its features skip), made or
