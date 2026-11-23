@@ -190,6 +190,13 @@ pub struct ImplTablesDone<'a> {
     pub failed: Option<ImplTablesFailed>,
 }
 
+/// The digest of a crate's written impl tables (`OUT_DOMAIN`).
+pub fn impl_tables_out(records: &CrateImpls<'_>) -> ContentId {
+    let mut out = Hasher::new(OUT_DOMAIN);
+    out.part(&records.directory).part(&records.no_impls_of);
+    out.finish()
+}
+
 /// THE TASK: crate `krate`'s impl tables from its impl rows `rows` (the task's input, which its
 /// key covers), each name the filing asks answered through the read-only view over `records`
 /// with its cells recorded, its buffers in `alloc`. Pure in (rows, records, alloc).
@@ -201,11 +208,10 @@ pub fn impl_tables_task<'n, 'a>(records: &'n Records<'n>, krate: usize, rows: &[
     let reads = recorder.finish();
     let failed = match (written, reads) {
         (Ok(t), Ok(reads)) => {
-            let mut out = Hasher::new(OUT_DOMAIN);
-            out.part(&t.records.directory).part(&t.records.no_impls_of);
+            let out = impl_tables_out(&t.records);
             let mut defines: AVec<'a, (drive::Cell, ContentId)> = AVec::with_capacity_in(t.defines.len(), alloc);
             defines.extend(t.defines.iter().map(|(cell, digest)| (drive::Cell(*cell), *digest)));
-            return ImplTablesDone { name: impl_tables_name(t.krate), key: drive::Key(t.key), out: out.finish(), records: Some(t.records), defines, reads, counts: t.counts, failed: None };
+            return ImplTablesDone { name: impl_tables_name(t.krate), key: drive::Key(t.key), out, records: Some(t.records), defines, reads, counts: t.counts, failed: None };
         }
         (Err(e), _) => ImplTablesFailed::Tables(e),
         (Ok(_), Err(e)) => ImplTablesFailed::Reads(e),
@@ -305,19 +311,27 @@ pub fn rows_key(crate_key: CrateItemKey, rows: &[ImplRow<'_>]) -> ContentId {
     key_of(crate_key, by_key.iter().map(|it| it.1))
 }
 
-/// Crate `krate`'s impl tables from its impl rows `rows` (its items record's, in any order)
-/// and the names `names` resolves them by: a pure function of the two, its buffers in
-/// `alloc`. Every row is filed once ([`file_rows`]); a row blaze-surface refuses is in
-/// [`CrateImpls::refused`], named.
-pub fn write_impl_tables<'n, 'a, S: NamesSource<'n>>(names: S, krate: usize, rows: &[ImplRow<'n>], alloc: Alloc<'a>) -> Result<ImplTables<'a>, TablesError> {
-    let crate_key = names.crate_key(krate).ok_or(TablesError::NoCrateKey { krate })?;
-    // Each row's digest and header flags, by impl key.
-    let mut by_key: AVec<'a, (LibKey, ContentId, surface::ImplFlags)> = AVec::with_capacity_in(rows.len(), alloc);
+/// One contiguous chunk of a crate's impl rows filed independently ([`file_impl_rows_chunk`]),
+/// combined with every other chunk by [`finish_impl_tables`] so large crates can file impls in
+/// parallel across workers while keeping identical output bytes.
+pub struct ImplChunk<A: core::alloc::Allocator> {
+    pub key_digests: blaze_own::Vec<(LibKey, ContentId), A>,
+    pub out: blaze_own::Vec<surface::ImplRow, A>,
+    pub named: blaze_own::Vec<CrateItemKey, A>,
+    pub counts: FileCounts,
+    pub no_checker_type: u32,
+}
+
+/// Files one contiguous slice `rows` of crate `krate`'s impl rows against `names`, returning its
+/// filed rows and row digests for [`finish_impl_tables`].
+pub fn file_impl_rows_chunk<'n, A: core::alloc::Allocator + Copy, S: NamesSource<'n>>(names: S, krate: usize, rows: &[ImplRow<'n>], alloc: A) -> Result<ImplChunk<A>, TablesError> {
+    let mut by_key: blaze_own::Vec<(LibKey, ContentId, surface::ImplFlags), A> = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
     by_key.extend(rows.iter().map(|row| (row.key, row_digest(row), row.flags.intersect(surface::ImplFlags::HEADER))));
     by_key.sort_unstable_by_key(|it| it.0);
-    let key = key_of(crate_key, by_key.iter().map(|it| it.1));
-    let mut out: AVec<'a, surface::ImplRow> = AVec::with_capacity_in(rows.len(), alloc);
-    let mut named: AVec<'a, CrateItemKey> = AVec::new_in(alloc);
+    let mut key_digests: blaze_own::Vec<(LibKey, ContentId), A> = blaze_own::Vec::with_capacity_in(by_key.len(), alloc);
+    key_digests.extend(by_key.iter().map(|it| (it.0, it.1)));
+    let mut out: blaze_own::Vec<surface::ImplRow, A> = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
+    let mut named: blaze_own::Vec<CrateItemKey, A> = blaze_own::Vec::new_in(alloc);
     let mut no_checker_type = 0u32;
     let mut failed: Option<TablesError> = None;
     let counts = file_rows(names, krate, rows, &mut |filing| {
@@ -345,6 +359,34 @@ pub fn write_impl_tables<'n, 'a, S: NamesSource<'n>>(names: S, krate: usize, row
     if let Some(error) = failed {
         return Err(error);
     }
+    Ok(ImplChunk { key_digests, out, named, counts, no_checker_type })
+}
+
+/// Combines filed chunks ([`file_impl_rows_chunk`]) of crate `crate_key` into deterministic
+/// [`ImplTables`] (order-independent across chunk splits).
+pub fn finish_impl_tables<'a, A: core::alloc::Allocator>(crate_key: CrateItemKey, chunks: &[ImplChunk<A>], alloc: Alloc<'a>) -> Result<ImplTables<'a>, TablesError> {
+    let total_digests: usize = chunks.iter().map(|c| c.key_digests.len()).sum();
+    let mut all_digests: AVec<'a, (LibKey, ContentId)> = AVec::with_capacity_in(total_digests, alloc);
+    for c in chunks.iter() {
+        all_digests.extend_from_slice(&c.key_digests);
+    }
+    all_digests.sort_unstable_by_key(|it| it.0);
+    let key = key_of(crate_key, all_digests.iter().map(|it| it.1));
+    let total_out: usize = chunks.iter().map(|c| c.out.len()).sum();
+    let mut out: AVec<'a, surface::ImplRow> = AVec::with_capacity_in(total_out, alloc);
+    let mut named: AVec<'a, CrateItemKey> = AVec::new_in(alloc);
+    let mut counts = FileCounts::default();
+    let mut no_checker_type = 0u32;
+    for c in chunks.iter() {
+        out.extend_from_slice(&c.out);
+        named.extend_from_slice(&c.named);
+        counts.from_rows = counts.from_rows.saturating_add(c.counts.from_rows);
+        counts.from_text = counts.from_text.saturating_add(c.counts.from_text);
+        for (dst, src) in counts.row_misses.iter_mut().zip(c.counts.row_misses.iter()) {
+            *dst = dst.saturating_add(*src);
+        }
+        no_checker_type = no_checker_type.saturating_add(c.no_checker_type);
+    }
     named.sort_unstable();
     named.dedup();
     let records = surface::build_impl_index(crate_key, &out, alloc).map_err(TablesError::Index)?;
@@ -357,6 +399,16 @@ pub fn write_impl_tables<'n, 'a, S: NamesSource<'n>>(names: S, krate: usize, row
     defines.sort_unstable();
     defines.dedup();
     Ok(ImplTables { krate: crate_key, key, records, named, counts, no_checker_type, defines })
+}
+
+/// Crate `krate`'s impl tables from its impl rows `rows` (its items record's, in any order)
+/// and the names `names` resolves them by: a pure function of the two, its buffers in
+/// `alloc`. Every row is filed once ([`file_rows`]); a row blaze-surface refuses is in
+/// [`CrateImpls::refused`], named.
+pub fn write_impl_tables<'n, 'a, S: NamesSource<'n>>(names: S, krate: usize, rows: &[ImplRow<'n>], alloc: Alloc<'a>) -> Result<ImplTables<'a>, TablesError> {
+    let crate_key = names.crate_key(krate).ok_or(TablesError::NoCrateKey { krate })?;
+    let chunk = file_impl_rows_chunk(names, krate, rows, alloc)?;
+    finish_impl_tables(crate_key, &[chunk], alloc)
 }
 
 /// The table row of one filing (module docs' table); `None` for an impl filed nowhere.

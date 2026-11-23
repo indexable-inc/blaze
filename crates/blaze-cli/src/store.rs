@@ -685,7 +685,7 @@ impl Sharing for ToolchainCrates {
     }
 
     fn all_names_public(&self, parts: &[&[u8]]) -> bool {
-        let public = |name: Name| matches!(name.kind, Kind::CrateScope | Kind::Script) && self.subjects.binary_search(&name.subject).is_ok();
+        let public = |name: Name| matches!(name.kind, Kind::CrateScope | Kind::Script | Kind::ImplBucket | Kind::Signature) && self.subjects.binary_search(&name.subject).is_ok();
         // One record whole, or a whole record's head and payload (engine_store.rs `put_all`);
         // anything else is not a drive record.
         let opened = match parts {
@@ -969,9 +969,9 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
     }
 
     /// Whether `name` is a toolchain crate's record ([`Store::toolchain_crates`]): a
-    /// `CrateScope` name of one of its subjects.
+    /// `CrateScope`, `ImplBucket`, or closed `Signature` name of one of its subjects.
     pub fn is_toolchain(&self, name: Name) -> bool {
-        name.kind == Kind::CrateScope && self.toolchain.binary_search(&name.subject).is_ok()
+        matches!(name.kind, Kind::CrateScope | Kind::ImplBucket | Kind::Signature) && self.toolchain.binary_search(&name.subject).is_ok()
     }
 }
 

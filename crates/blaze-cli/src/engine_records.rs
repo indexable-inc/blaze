@@ -27,10 +27,9 @@
 //!   and the bytes copied into the heap on the way, which is 0 on this path (the [`Copying`]
 //!   route of the tests is the control that the counter counts a copy).
 
-use std::alloc::Global;
-
 use blaze_cas::plain::{Aligned16, Misaligned, NotInPlace};
 use blaze_drive::{Input, Key, Name};
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_id::CrateItemKey;
 use blaze_own::Alloc;
 use bstd::cx::Cx;
@@ -190,7 +189,8 @@ pub(crate) struct Exports<'j> {
 /// `Effect::StartProgram` through run_names.rs), dropped with the store before its `Lent` is
 /// committed and let go: nothing of `'r` lives in a stage.
 pub(crate) struct EngineRecords<'r> {
-    read: std::vec::Vec<(Name, Key, CrateRecords<'r>), Global>,
+    read: Map<(Name, Key), CrateRecords<'r>, FixedState, Alloc<'r>>,
+    exports_cache: Map<(Name, Key), Exports<'r>, FixedState, Alloc<'r>>,
     counts: ReadCounts,
     /// The crate (by its name) a test plants unreadable for a check scope's read
     /// ([`EngineRecords::scope_records`]; engine_check.rs `Opts::unreadable`, rule 23). The
@@ -199,8 +199,13 @@ pub(crate) struct EngineRecords<'r> {
 }
 
 impl<'r> EngineRecords<'r> {
-    pub(crate) fn new() -> EngineRecords<'r> {
-        EngineRecords { read: std::vec::Vec::new_in(Global), counts: ReadCounts::default(), unreadable: None }
+    pub(crate) fn new(alloc: Alloc<'r>) -> EngineRecords<'r> {
+        EngineRecords {
+            read: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            exports_cache: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            counts: ReadCounts::default(),
+            unreadable: None,
+        }
     }
 
     /// Plants crate `krate`'s records unreadable for every check scope read
@@ -223,7 +228,7 @@ impl<'r> EngineRecords<'r> {
     /// Crate `key`'s records from the record `input` names: opened in place at the first ask,
     /// the same borrow after it.
     pub(crate) fn records(&mut self, cx: &Cx, store: &mut dyn Store<'r>, input: &Input, key: CrateItemKey, alloc: Alloc<'r>) -> Result<CrateRecords<'r>, ReadError> {
-        if let Some((_, _, records)) = self.read.iter().find(|(name, at, _)| *name == input.name && *at == input.at) {
+        if let Some(records) = self.read.get(&(input.name, input.at)) {
             self.counts.hits += 1;
             // The meter (D169): an ask answered from the read list, no key reached the store:
             // a repeat ask, D168's floor 0 (gets minus keys).
@@ -236,21 +241,25 @@ impl<'r> EngineRecords<'r> {
         };
         let record = held.place.map_err(|why| ReadError::NotInPlace { name: input.name, why })?;
         let records = open_record::<InPlace>(input.name, record, key, &mut self.counts, alloc)?;
-        self.read.push((input.name, input.at, records));
+        self.read.insert((input.name, input.at), records);
         Ok(records)
     }
 
     /// The exports section of the dependency record `input` names, for a names task (names/
-    /// scope.rs `prepare`, engine_names.rs): opened where it lies in the store's mapping and
-    /// borrowed for `'r`, never copied (route [`InPlace`]), counted in this reader's counts. Not
-    /// kept here: the wave that asks keeps each crate's borrow once (names/scope.rs
-    /// `ScopeRound`). The record was put and committed by an earlier names phase of this request
+    /// scope.rs `prepare`, engine_names.rs): opened once where it lies in the store's mapping and
+    /// borrowed for `'r`, never copied (route [`InPlace`]), cached in memory across waves so
+    /// shared crates (`core`/`alloc`/`std`/`bstd`) are opened once per request and counted in this
+    /// reader's counts. The record was put and committed by an earlier names phase of this request
     /// (engine_check.rs, `commit_puts` after each phase's puts) or by an earlier request; one in
     /// this command's arena is [`ReadError::NotInPlace`] (rule 3).
     pub(crate) fn exports<'j, R: Route>(&mut self, cx: &Cx, store: &mut dyn Store<'r>, input: &Input, alloc: Alloc<'j>) -> Result<Exports<'j>, ReadError>
     where
         'r: 'j,
     {
+        if let Some(cached) = self.exports_cache.get(&(input.name, input.at)) {
+            self.counts.hits += 1;
+            return Ok(*cached);
+        }
         let cx = cx.span("engine: a dependency's exports read in place");
         let Some(held) = store.get(&cx, input.at).map_err(LoadError::Store)? else {
             return Err(LoadError::NotInStore { name: input.name, at: input.at }.into());
@@ -262,6 +271,9 @@ impl<'r> EngineRecords<'r> {
         store_read(record.len());
         self.counts.sections += parts.exports.len() as u64;
         let exports = R::exports(input.name, parts.exports, &mut self.counts, alloc)?;
+        if let Ok(aligned) = Aligned16::new(parts.exports) {
+            self.exports_cache.insert((input.name, input.at), Exports { payload: payload.bytes(), exports: aligned.bytes() });
+        }
         Ok(Exports { payload: payload.bytes(), exports })
     }
 

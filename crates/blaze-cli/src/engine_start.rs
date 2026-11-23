@@ -287,7 +287,7 @@ pub(crate) fn run_program(
     let erased = blaze_own::Erased::new(frame);
     let alloc = erased.handle();
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
-    let mut read = EngineRecords::new();
+    let mut read = EngineRecords::new(heap.alloc());
     let seen = TreesSeen::default();
     let root = standing.checkout;
     let lints = crate::lints::of_root(cx, root, frame)?;
@@ -382,7 +382,7 @@ fn suite_closure<'a>(list: &blaze_world::crate_list::CrateList<'_>, test: usize,
     // Only `key` is read (`image_for` checks the walk's crates against the keys handed).
     let at_of = |at: usize| {
         let key = list.key(at);
-        crate::engine_seeds::CrateAt { prefix: key.prefix(), key, names_at: None, member: list.member(at), closed: !list.member(at) }
+        crate::engine_seeds::CrateAt { prefix: key.prefix(), key, names_at: None, member: list.member(at), closed: !list.member(at), toolchain: list.toolchain(at) }
     };
     let mut closure: blaze_own::AVec<'a, crate::engine_seeds::CrateAt> = blaze_own::Vec::with_capacity_in(list.len(), alloc);
     closure.push(at_of(test));
@@ -411,7 +411,7 @@ pub(crate) fn run_tests(
     let out = launch.out;
     let err = standing.err;
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
-    let mut read = EngineRecords::new();
+    let mut read = EngineRecords::new(heap.alloc());
     let seen = TreesSeen::default();
     let root = standing.checkout;
     let lints = crate::lints::of_root(cx, root, frame)?;

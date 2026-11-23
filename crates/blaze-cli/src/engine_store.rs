@@ -203,6 +203,7 @@ pub(crate) fn outline_from<A: core::alloc::Allocator + Copy>(name: Name, key: Ke
     Ok(made)
 }
 
+#[cfg(test)]
 const PUTS_DIGEST: &str = "blaze-cli engine records put 1";
 
 /// One stage's records as the profile prints them: "records (Names): N put, B bytes; held after
@@ -273,6 +274,7 @@ pub(crate) struct Ledger {
     /// (each one, its bytes in 16-byte blocks: blaze-cas plain/lent.rs `copy_in`): the stage's
     /// line counts its tasks' records' copies, so these are taken from it at the merge.
     extra_copies: [(u64, u64); STAGES],
+    #[cfg(test)]
     digest: blaze_ids::Hasher,
     /// The process's memory at each stage's end (engine_memory.rs): the profile's alone, never
     /// in the digest (rule 25).
@@ -307,6 +309,7 @@ impl Ledger {
             seen: crate::store::StoreKept::default(),
             seen_read: crate::engine_records::ReadCounts::default(),
             extra_copies: [(0, 0); STAGES],
+            #[cfg(test)]
             digest: blaze_ids::Hasher::new(PUTS_DIGEST),
             memory: crate::engine_memory::Memory::new(),
         }
@@ -326,7 +329,10 @@ impl Ledger {
     /// An extra record of `stage`'s task put under `key` after its owner ([`put_all`]), the
     /// store's answer `put`: in the digest in put order, written or not; counted when written.
     pub(crate) fn put_extra(&mut self, stage: Stage, key: Key, bytes: &[u8], put: blaze_keyed::store::Put) {
+        #[cfg(test)]
         self.digest.update(&key.0.0).update(&(bytes.len() as u64).to_le_bytes()).update(bytes);
+        #[cfg(not(test))]
+        let _ = key;
         if put == blaze_keyed::store::Put::Written {
             let line = &mut self.extras[stage.index()];
             line.puts += 1;
@@ -357,10 +363,15 @@ impl Ledger {
         blaze_meter::add(blaze_meter::Count::StorePuts, 1);
         blaze_meter::add(blaze_meter::Count::StorePutBytes, len as u64);
         self.results[stage.index()] += payload as u64;
-        self.digest.update(&key.0.0).update(&(len as u64).to_le_bytes());
-        for part in parts {
-            self.digest.update(part);
+        #[cfg(test)]
+        {
+            self.digest.update(&key.0.0).update(&(len as u64).to_le_bytes());
+            for part in parts {
+                self.digest.update(part);
+            }
         }
+        #[cfg(not(test))]
+        let _ = key;
     }
 
     /// `payload` bytes of a result of `stage` freed after its put.
@@ -383,6 +394,7 @@ impl Ledger {
     }
 
     /// The digest of every record put so far (key, length, bytes, in put order).
+    #[cfg(test)]
     pub(crate) fn digest(&self) -> ContentId {
         self.digest.finish()
     }

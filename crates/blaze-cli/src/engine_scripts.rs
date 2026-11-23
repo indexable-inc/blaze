@@ -1343,6 +1343,8 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
         if runner_clock().is_some_and(|clock| clock.global_names_barrier()) && (!self.scripts.is_empty() || engine.has_pending_stage(Stage::Scripts)) {
             return Ok(());
         }
+        let scripts_pending = !self.scripts.is_empty() || engine.has_pending_stage(Stage::Scripts);
+        self.names.set_width(self.scripts.scope, handles, scripts_pending);
         loop {
             self.name_reads.clear();
             self.script_reads.clear();
@@ -1358,7 +1360,7 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
             if phase.is_none() { break; }
             let mark = handles.board.phase_began(Stage::Names, engine.tasks().len() as u64, handles.board.now(&handles.env.clock));
             for &task in engine.tasks() {
-                self.names.submit(self.scripts.scope, cx, names, store, read, handles, task, alloc, frame, self.scripts.waiter())?;
+                self.names.submit(self.scripts.scope, cx, names, store, read, handles, task, alloc, frame, self.scripts.waiter(), scripts_pending)?;
             }
             handles.board.phase_ended(mark, 0, handles.board.now(&handles.env.clock));
         }
@@ -1421,10 +1423,11 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
             }
             entered.push(task);
             // A script may immediately release a reader, including one in this
-            // same Names wave. Module lookups and ready crate peers file in bulk.
+            // same Names wave. Non-leaf Names tasks break before leaf tasks so
+            // downstream waves can be admitted without waiting on leaves.
             if name.kind == Kind::Script { break; }
             let Some(next) = self.first(names) else { break };
-            if next.planned.phase != first.planned.phase { break; }
+            if next.planned.phase != first.planned.phase || (!script && names.feeds_names(name) && !names.feeds_names(next.planned.name)) { break; }
             task = next;
         }
         Ok(())

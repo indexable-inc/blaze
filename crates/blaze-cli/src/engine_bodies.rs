@@ -1668,6 +1668,88 @@ impl core::fmt::Display for ScopeRefusal {
     }
 }
 
+/// Per-phase cache of each crate's opened `(Input, CrateRecords)` indexed by world crate index
+/// (`0..list.len()`), so building check scopes for many crates in one phase (`HeadsStage`) asks
+/// `EngineRecords` at most once per unique crate instead of repeating lookups across overlapping
+/// dependency closures.
+pub(crate) struct ScopeCache<'r> {
+    slots: blaze_own::Vec<Option<(blaze_drive::Input, crate::front_load::CrateRecords<'r>)>, blaze_own::Alloc<'static>>,
+}
+
+impl<'r> ScopeCache<'r> {
+    pub(crate) fn new(len: usize, alloc: blaze_own::Alloc<'static>) -> ScopeCache<'r> {
+        let mut slots = blaze_own::Vec::with_capacity_in(len, alloc);
+        slots.resize(len, None);
+        ScopeCache { slots }
+    }
+
+    pub(crate) fn records_of(
+        &mut self,
+        read: &mut EngineRecords<'r>,
+        cx: &Cx,
+        store: &mut dyn crate::store::Store<'r>,
+        names: NamesInputs<'_, '_>,
+        list: &blaze_world::crate_list::CrateList<'static>,
+        at: usize,
+        g: blaze_own::Alloc<'static>,
+    ) -> Result<(blaze_drive::Input, crate::front_load::CrateRecords<'r>), ScopeRefusal> {
+        if let Some(cached) = self.slots.get(at).copied().flatten() {
+            return Ok(cached);
+        }
+        let name = blaze_drive::key::crate_scope_name(&list.key(at));
+        let krate = CrateGraph::name(list, at);
+        let input = names.input_of(name).ok_or_else(|| ScopeRefusal::NoNamesRecord { krate, at, failed: names.failed(name) })?;
+        let records = read.scope_records(cx, store, &input, list.key(at), krate, g).map_err(|error| ScopeRefusal::Records { krate, at, error })?;
+        if let Some(slot) = self.slots.get_mut(at) {
+            *slot = Some((input, records));
+        }
+        Ok((input, records))
+    }
+}
+
+/// Crate `at`'s check scope (blaze-world check_scope.rs `check_scope_in`), reusing `cache` so
+/// each crate's records are asked of `read` at most once per phase across all scopes built with
+/// `cache`.
+#[expect(clippy::too_many_arguments, reason = "a stage's handles, each named")]
+pub(crate) fn scope_of_cached<'r>(
+    cache: &mut ScopeCache<'r>,
+    read: &mut EngineRecords<'r>,
+    cx: &Cx,
+    store: &mut dyn crate::store::Store<'r>,
+    names: NamesInputs<'_, '_>,
+    list: &blaze_world::crate_list::CrateList<'static>,
+    at: usize,
+    heap: &'static blaze_own::Heap,
+) -> Result<(Scope<'r>, bool), ScopeRefusal> {
+    let g = heap.alloc();
+    let (_, own_records) = cache.records_of(read, cx, store, names, list, at, g)?;
+    let no_core = blaze_scope::names_record::NamesRecord::open(own_records.names_proof).crate_root().head().no_core;
+    let checked = blaze_world::check_scope::check_scope_in(list, at, no_core, g).map_err(|error| ScopeRefusal::CheckScope { error })?;
+    let mut scope = Scope { own_records, crates: Vec::new_in(Global), lang: Vec::new_in(Global), scope: Vec::new_in(Global), cut: None };
+    scope.lang.extend(checked.lang_places());
+    let mut whole = true;
+    for one in checked.crates() {
+        let (input, records) = match cache.records_of(read, cx, store, names, list, one, g) {
+            Ok(found) => found,
+            Err(ScopeRefusal::NoNamesRecord { failed, .. }) => {
+                whole = false;
+                scope.cut = Some((one, CutWhy::NoNamesRecord { failed }));
+                break;
+            }
+            Err(ScopeRefusal::Records { error, .. }) => {
+                whole = false;
+                scope.cut = Some((one, CutWhy::Unreadable(error)));
+                break;
+            }
+            Err(ScopeRefusal::CheckScope { error }) => return Err(ScopeRefusal::CheckScope { error }),
+        };
+        scope.crates.push(Crate { records, name: CrateGraph::name(list, one), package: list.shown_from(one), world_at: one });
+        scope.scope.push(input.name);
+    }
+    scope.scope.sort_unstable();
+    Ok((scope, whole))
+}
+
 /// Crate `at`'s check scope (blaze-world check_scope.rs `check_scope_in`), each crate's
 /// records read in place through `read` (engine_records.rs), and whether every crate of it had
 /// records (`false`: the scope was cut, [`Scope::cut`] says where and why, and the caller refuses by
@@ -1675,36 +1757,8 @@ impl core::fmt::Display for ScopeRefusal {
 /// ([`ScopeRefusal`]); nothing is dropped (rule 3).
 #[expect(clippy::too_many_arguments, reason = "a stage's handles, each named")]
 pub(crate) fn scope_of<'r>(read: &mut EngineRecords<'r>, cx: &Cx, store: &mut dyn crate::store::Store<'r>, names: NamesInputs<'_, '_>, list: &blaze_world::crate_list::CrateList<'static>, at: usize, heap: &'static blaze_own::Heap) -> Result<(Scope<'r>, bool), ScopeRefusal> {
-    let g = heap.alloc();
-    let name_at = |at: usize| blaze_drive::key::crate_scope_name(&list.key(at));
-    let input_at = |at: usize| names.input_of(name_at(at));
-    let krate = CrateGraph::name(list, at);
-    let own = input_at(at).ok_or_else(|| ScopeRefusal::NoNamesRecord { krate, at, failed: names.failed(name_at(at)) })?;
-    let own_records = read.scope_records(cx, store, &own, list.key(at), krate, g).map_err(|error| ScopeRefusal::Records { krate, at, error })?;
-    let no_core = blaze_scope::names_record::NamesRecord::open(own_records.names_proof).crate_root().head().no_core;
-    let checked = blaze_world::check_scope::check_scope_in(list, at, no_core, g).map_err(|error| ScopeRefusal::CheckScope { error })?;
-    let mut scope = Scope { own_records, crates: Vec::new_in(Global), lang: Vec::new_in(Global), scope: Vec::new_in(Global), cut: None };
-    scope.lang.extend(checked.lang_places());
-    let mut whole = true;
-    for one in checked.crates() {
-        let Some(input) = input_at(one) else {
-            whole = false;
-            scope.cut = Some((one, CutWhy::NoNamesRecord { failed: names.failed(name_at(one)) }));
-            break;
-        };
-        let records = match read.scope_records(cx, store, &input, list.key(one), CrateGraph::name(list, one), g) {
-            Ok(records) => records,
-            Err(error) => {
-                whole = false;
-                scope.cut = Some((one, CutWhy::Unreadable(error)));
-                break;
-            }
-        };
-        scope.crates.push(Crate { records, name: CrateGraph::name(list, one), package: list.shown_from(one), world_at: one });
-        scope.scope.push(input.name);
-    }
-    scope.scope.sort_unstable();
-    Ok((scope, whole))
+    let mut cache = ScopeCache::new(CrateGraph::len(list), heap.alloc());
+    scope_of_cached(&mut cache, read, cx, store, names, list, at, heap)
 }
 
 /// Crate `at`'s check scope MADE BY NEED (piece C (a)) over its own records `own_records`, which

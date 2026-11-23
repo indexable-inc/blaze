@@ -500,7 +500,7 @@ impl Program {
             let key = self.list.key(at);
             let mut prefix = [0u8; 8];
             prefix.copy_from_slice(&key.0.0[..8]);
-            crate::engine_seeds::CrateAt { prefix, key, names_at, member: self.list.member(at), closed: false }
+            crate::engine_seeds::CrateAt { prefix, key, names_at, member: self.list.member(at), closed: false, toolchain: CrateGraph::toolchain(&self.list, at) }
         };
         let mut closure = AVec::with_capacity_in(self.crates.len() + 1, alloc);
         let own = self.crates.iter().find(|(at, _)| *at == self.owner).map(|(_, input)| input.at);

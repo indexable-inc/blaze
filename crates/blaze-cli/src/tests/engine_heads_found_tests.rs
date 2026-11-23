@@ -184,7 +184,7 @@ fn command(tape: &Tape, store: &mut ModelStore, features: u8, plant: Plant, heap
     let mut crates = blaze_own::Vec::new_in(heap.shared());
     let mut krate = [0u8; 32];
     krate[..8].copy_from_slice(&PREFIX);
-    crates.push(CrateAt { prefix: PREFIX, key: CrateItemKey(ContentId(krate)), names_at: Some(names_at(features, plant)), member: false, closed: true });
+    crates.push(CrateAt { prefix: PREFIX, key: CrateItemKey(ContentId(krate)), names_at: Some(names_at(features, plant)), member: false, closed: true, toolchain: false });
     let tool = Tool(ContentId::of("blaze-cli engine heads found tests tool", b""));
     table.find_dependencies(DependencyFinder::new(store.snapshot(), crates, tool));
     // Two workers, each asking every cell (the second in the other order), interleaved.
