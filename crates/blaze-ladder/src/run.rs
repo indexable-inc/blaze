@@ -1036,6 +1036,10 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
         self.0.fn_lang(FnLang::named(name)?)
     }
 
+    fn type_names(&self) -> Option<&dyn blaze_build::type_name::TypeNames> {
+        self.0.type_names()
+    }
+
     fn future_poll(&self) -> Option<ItemKey> {
         self.4.coroutines.poll
     }

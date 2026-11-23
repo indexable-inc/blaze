@@ -608,6 +608,10 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
         None
     }
 
+    fn type_names(&self) -> Option<&dyn blaze_build::type_name::TypeNames> {
+        Some(self)
+    }
+
     // (5) Literals: of the live body of `owner`.
 
     fn int_lit(&self, owner: ItemKey, e: ExprId) -> Option<u128> {
@@ -704,5 +708,11 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// The statics made so far, sorted by key: each one's own data record.
     fn static_records(&self) -> &[(ItemKey, DataRecord<Global>)] {
         &self.statics.values
+    }
+}
+
+impl<'n, S: NamesSource<'n>> blaze_build::type_name::TypeNames for LazyProgram<'n, S> {
+    fn item_path(&self, item: ItemKey, out: &mut dyn FnMut(&str)) -> bool {
+        crate::front2::type_name::item_path(self.front.names, &self.front.keys, &self.store, item, out)
     }
 }

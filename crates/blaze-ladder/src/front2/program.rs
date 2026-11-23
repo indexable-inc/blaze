@@ -1971,6 +1971,10 @@ impl FrontEnd for Front2Program<'_> {
         self.left.get(&key).map(|why| &**why)
     }
 
+    fn type_names(&self) -> Option<&dyn blaze_build::type_name::TypeNames> {
+        Some(self)
+    }
+
     /// The item's path in the names library (`crate::module::Name`).
     fn item_named(&self, key: ItemKey) -> Option<Box<str>> {
         // A member (a trait's fn: what a resolve refusal names) by its container's path.
@@ -2206,5 +2210,11 @@ impl FrontEnd for Front2Program<'_> {
             (None, None) => self.store.fns.get(&owner).map(|h| h.text),
         };
         super::consts::item_code_id(owner, text)
+    }
+}
+
+impl blaze_build::type_name::TypeNames for Front2Program<'_> {
+    fn item_path(&self, item: ItemKey, out: &mut dyn FnMut(&str)) -> bool {
+        super::type_name::item_path(self.front.names, &self.front.keys, &self.store, item, out)
     }
 }
