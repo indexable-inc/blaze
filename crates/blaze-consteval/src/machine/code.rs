@@ -1751,7 +1751,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 // (`Typed::default_fields`), a constant of the field's type over the ADT's
                 // generics (or empty args for a structural record), read at this expression's
                 // type's ground arguments as a constant path is read (`Op::Const`).
-                if base == blaze_typeck::StructBase::Defaults {
+                if base_r.is_none() {
                     let typed = cc.typed;
                     for i in rows(typed.default_fields.0, e) {
                         let Some(&idx) = typed.default_fields.1.get(i) else { return Err(malformed("a field default past its column")) };

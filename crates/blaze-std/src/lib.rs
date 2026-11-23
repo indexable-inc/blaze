@@ -307,6 +307,10 @@ pub mod view;
 /// Structural Records (`{ a: T, b: U }`) and named-argument functions with defaults (`bstd::record_fn!`, `bstd::call!`).
 pub mod record_ty;
 /// Zero-copy shared Prefabs (`LocalShare` + `TypeSet!`) and reactive Templates with retractions.
+/// Zero-unsafe, sans-IO, Flecs 4.2-equivalent archetype Entity-Component-System (`World`,
+/// generational `Entity`, `(Rel, Target)` pairs with `ChildOf` cascade & `IsA` prefab inheritance,
+/// incrementally synced `CachedQuery`, reactive observers, and conflict-free phased `Pipeline`).
+pub mod ecs;
 pub mod prefab;
 /// The native backend's reads of its host's facts.
 #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]

@@ -7,15 +7,15 @@ use blaze_ids::ContentId;
 use blaze_own::Alloc;
 use blaze_typeck::fixture::Fx;
 use blaze_typeck::{
-    Adt, Arm, BinOp, BindAnn, BodyView, Checked, Edition, Expr, ExprId, Fetch, FieldInit, FieldPat, InferCtx, IntSuffix,
-    ItemKey, List, Lit, Mutbl, Name, Needs, Outcome, PNode, PTy, PTys, Pat, PatId, PortableTys, Range, RecordSchema,
-    ScopeId, Stmt, StmtId, StructBase, UintTy, UnOp, check,
+    Adt, Arm, BinOp, BindAnn, BodyPath, BodyView, Checked, Edition, Expr, ExprId, Fetch, FieldInit, FieldPat, InferCtx,
+    IntSuffix, IntTy, ItemKey, List, Lit, Mutbl, Name, Needs, Outcome, PNode, PTy, PTys, Pat, PatId, PathIdx,
+    PortableTys, Range, RecordSchema, ScopeId, Segment, Stmt, StmtId, StructBase, UintTy, UnOp, check,
 };
 
 use crate::layout::{LayoutFacts, Layouts, Missing, ReprAttrs, ValidRange};
 use crate::machine::{Answer, Codes, value_of};
 use crate::record::{ConstRecord, RecordKey};
-use crate::{ConstWorld, FnKind, Limits, Lits, Typed};
+use crate::{ConstWorld, FnKind, Intrinsic, Limits, Lits, Typed};
 
 fn heap() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
@@ -65,11 +65,13 @@ fn empty_body<'b>(owner: ItemKey, types: PTys<'b>, root: ExprId) -> BodyView<'b>
 struct OneBodyWorld<'b> {
     item: ItemKey,
     typed: Typed<'b>,
+    fx: Option<&'b Fx>,
+    intrinsics: &'b [(ItemKey, Intrinsic)],
 }
 
 impl LayoutFacts for OneBodyWorld<'_> {
-    fn adt(&self, _: ItemKey) -> Option<Adt<'_>> {
-        None
+    fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
+        self.fx.and_then(|fx| fx.adt_of(key))
     }
 
     fn repr(&self, _: ItemKey) -> Result<ReprAttrs, Missing> {
@@ -94,8 +96,11 @@ impl ConstWorld for OneBodyWorld<'_> {
         }
     }
 
-    fn fn_kind(&self, _: ItemKey) -> FnKind {
-        FnKind::NotConst
+    fn fn_kind(&self, item: ItemKey) -> FnKind {
+        self.intrinsics
+            .iter()
+            .find(|&&(k, _)| k == item)
+            .map_or(FnKind::NotConst, |&(_, intr)| FnKind::Intrinsic(intr))
     }
 
     fn code_id(&self, item: ItemKey) -> ContentId {
@@ -128,7 +133,7 @@ fn check_and_eval_u32(fx: &Fx, bv: &BodyView<'_>, owner: ItemKey, lit_text: &str
     };
     let lits = Lits { text: lit_text, exprs: lit_exprs, pats: (&[], &[]) };
     let typed = Typed::new(*bv, &checked, lit_text, lits, ContentId::of("test-body", lit_text.as_bytes()));
-    let world = OneBodyWorld { item: owner, typed };
+    let world = OneBodyWorld { item: owner, typed, fx: None, intrinsics: &[] };
     let mut ground = PortableTys::new_in(alloc);
     let mut layouts = Layouts::new_in(alloc);
     let mut codes = Codes::new_in(alloc);
@@ -539,4 +544,211 @@ fn union_niche_ref_unit_and_single_member() {
     let lit_ids = [ExprId(0)];
     let lit_ranges = [Range { start: 0, end: 5 }];
     assert_eq!(check_and_eval_u32(&fx, &bv, owner, "55u32", (&lit_ids, &lit_ranges)), 55);
+}
+
+fn eval_reflect_call(
+    fx: &Fx,
+    body_tys: PTys<'_>,
+    owner: ItemKey,
+    intrinsics: &[(ItemKey, Intrinsic)],
+    fn_name: &str,
+    type_args: &[PTy],
+) -> u64 {
+    let alloc = heap();
+    let paths = [BodyPath { scope: ScopeId(0), segments: List { start: 0, len: 1 }, lang: None, anchor: None }];
+    let segments = [Segment {
+        name: Name::of(fn_name),
+        generic_args: List { start: 0, len: u32::try_from(type_args.len()).unwrap_or(0) },
+        has_args: true,
+    }];
+    let segment_ranges = [Range { start: 0, end: 1 }];
+    let type_list_ranges = ranges_for(type_args.len());
+    let exprs = [
+        Expr::Path(PathIdx(0)),
+        Expr::Call { callee: ExprId(0), args: List::EMPTY },
+    ];
+    let expr_ranges = [Range { start: 0, end: 1 }, Range { start: 1, end: 2 }];
+
+    let mut bv = empty_body(owner, body_tys, ExprId(1));
+    bv.paths = &paths;
+    bv.segments = &segments;
+    bv.segment_ranges = &segment_ranges;
+    bv.type_lists = type_args;
+    bv.type_list_ranges = &type_list_ranges;
+    bv.exprs = &exprs;
+    bv.expr_ranges = &expr_ranges;
+
+    let mut cx = InferCtx::new_in(alloc);
+    let checked: Checked<'static> = match check(&bv, fx, &mut cx, &Needs::new_in(alloc), alloc) {
+        Ok(Outcome::Done(c)) => {
+            assert!(c.diags.is_empty(), "check diagnostics for `{fn_name}`: {:?}", c.diags);
+            c
+        }
+        Ok(Outcome::Need(n)) => panic!("check missed {:?}", n.questions),
+        Err(e) => panic!("check error: {e:?}"),
+    };
+    let lits = Lits { text: "", exprs: (&[], &[]), pats: (&[], &[]) };
+    let typed = Typed::new(bv, &checked, "", lits, ContentId::of("test-reflect", fn_name.as_bytes()));
+    let world = OneBodyWorld { item: owner, typed, fx: Some(fx), intrinsics };
+    let mut ground = PortableTys::new_in(alloc);
+    let mut layouts = Layouts::new_in(alloc);
+    let mut codes = Codes::new_in(alloc);
+    let rec = match value_of(&world, &mut layouts, &mut codes, owner, List::EMPTY, &mut ground, Limits::DEFAULT, alloc) {
+        Ok(Answer::Done(r)) => r,
+        Ok(Answer::Need(n)) => panic!("unexpected need: {n:?}"),
+        Err(e) => panic!("consteval refused `{fn_name}`: {:?}", e.refusal),
+    };
+    let bytes = rec.data.allocs[0].bytes.as_slice();
+    match bytes {
+        &[b] => u64::from(b),
+        &[b0, b1, b2, b3, b4, b5, b6, b7] => u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]),
+        other => panic!("unexpected result width {} for `{fn_name}`", other.len()),
+    }
+}
+
+/// Evaluates `blaze_field_count::<T>() -> usize`, `blaze_records_disjoint::<A, B>() -> bool`,
+/// and `blaze_record_schema_id::<T>() -> u64` in `blaze-consteval` across structural records
+/// (empty, overlapping, disjoint, reordered canonical schemas), tuples, structs, enums, and
+/// primitives.
+#[test]
+fn structural_record_reflection_intrinsics_in_consteval() {
+    let alloc = heap();
+    let mut fx = Fx::new();
+    let fx_usize = fx.ty(PNode::Uint(UintTy::Usize));
+    let fx_bool = fx.ty(PNode::Bool);
+    let fx_u64 = fx.ty(PNode::Uint(UintTy::U64));
+    let fx_u32 = fx.u32();
+    let fx_i32 = fx.ty(PNode::Int(IntTy::I32));
+
+    let k_field_count = fx.func("blaze_field_count", 1, &[], fx_usize, Default::default());
+    let k_disjoint = fx.func("blaze_records_disjoint", 2, &[], fx_bool, Default::default());
+    let k_schema_id = fx.func("blaze_record_schema_id", 1, &[], fx_u64, Default::default());
+
+    let c_usize = fx.func("C_USIZE", 0, &[], fx_usize, Default::default());
+    let c_bool = fx.func("C_BOOL", 0, &[], fx_bool, Default::default());
+    let c_u64 = fx.func("C_U64", 0, &[], fx_u64, Default::default());
+
+    let unit_struct = fx.strukt("UnitS", 0, &[]);
+    let braced_struct = fx.strukt("Point", 0, &[("x", fx_i32), ("y", fx_i32)]);
+    let tuple_struct = fx.tuple_strukt("Triple", 0, &[fx_u32, fx_u32, fx_u32]);
+    let (multi_enum, _) = fx.enum_("Choice", 0, &[("A", &[fx_u32]), ("B", &[fx_i32, fx_u32])]);
+    let (single_enum, _) = fx.enum_("Solo", 0, &[("Only", &[fx_u32, fx_i32])]);
+    fx.finish();
+
+    let intrinsics = [
+        (k_field_count, Intrinsic::BlazeFieldCount),
+        (k_disjoint, Intrinsic::BlazeRecordsDisjoint),
+        (k_schema_id, Intrinsic::BlazeRecordSchemaId),
+    ];
+
+    let mut body_tys = PortableTys::new_in(alloc);
+    let b_u8 = body_tys.intern(PNode::Uint(UintTy::U8)).expect("u8");
+    let b_u16 = body_tys.intern(PNode::Uint(UintTy::U16)).expect("u16");
+    let b_u32 = body_tys.intern(PNode::Uint(UintTy::U32)).expect("u32");
+    let b_u64 = body_tys.intern(PNode::Uint(UintTy::U64)).expect("u64");
+    let b_i32 = body_tys.intern(PNode::Int(IntTy::I32)).expect("i32");
+    let b_bool = body_tys.intern(PNode::Bool).expect("bool");
+    let b_unit = body_tys.intern(PNode::Tuple(List::EMPTY)).expect("()");
+    let b_pair = {
+        let l = body_tys.intern_list(&[b_u8, b_u32]).expect("pair list");
+        body_tys.intern(PNode::Tuple(l)).expect("pair")
+    };
+    let b_quad = {
+        let l = body_tys.intern_list(&[b_u8, b_u16, b_u32, b_u64]).expect("quad list");
+        body_tys.intern(PNode::Tuple(l)).expect("quad")
+    };
+    let b_unit_struct = body_tys.intern(PNode::Adt(unit_struct, List::EMPTY)).expect("UnitS");
+    let b_braced_struct = body_tys.intern(PNode::Adt(braced_struct, List::EMPTY)).expect("Point");
+    let b_tuple_struct = body_tys.intern(PNode::Adt(tuple_struct, List::EMPTY)).expect("Triple");
+    let b_multi_enum = body_tys.intern(PNode::Adt(multi_enum, List::EMPTY)).expect("Choice");
+    let b_single_enum = body_tys.intern(PNode::Adt(single_enum, List::EMPTY)).expect("Solo");
+
+    // Records:
+    // empty = {}
+    body_tys.register_record_schema(RecordSchema::EMPTY, &[]).expect("empty schema");
+    let rec_empty = body_tys.intern(PNode::Record(RecordSchema::EMPTY, List::EMPTY)).expect("{}");
+
+    // pos = { x: i32, y: i32 }
+    let pos_names = [Name::of("x"), Name::of("y")];
+    let pos_schema = RecordSchema::of_sorted_names(&pos_names);
+    body_tys.register_record_schema(pos_schema, &pos_names).expect("pos schema");
+    let pos_fields = body_tys.intern_list(&[b_i32, b_i32]).expect("pos fields");
+    let rec_pos = body_tys.intern(PNode::Record(pos_schema, pos_fields)).expect("pos");
+
+    // Reordered-source canonical record `{ y: i32, x: i32 }` -> same canonical sorted names [x, y]
+    let reordered_names = [Name::of("x"), Name::of("y")];
+    let reordered_schema = RecordSchema::of_sorted_names(&reordered_names);
+    let rec_pos_reordered = body_tys.intern(PNode::Record(reordered_schema, pos_fields)).expect("pos reordered");
+
+    // vel = { vx: i32, vy: i32 } (disjoint from pos)
+    let vel_names = [Name::of("vx"), Name::of("vy")];
+    let vel_schema = RecordSchema::of_sorted_names(&vel_names);
+    body_tys.register_record_schema(vel_schema, &vel_names).expect("vel schema");
+    let vel_fields = body_tys.intern_list(&[b_i32, b_i32]).expect("vel fields");
+    let rec_vel = body_tys.intern(PNode::Record(vel_schema, vel_fields)).expect("vel");
+
+    // hp_a = { hp: u32, x: i32 }, hp_b = { hp: u64, shield: u32 } (overlapping on `hp`)
+    let hpa_names = [Name::of("hp"), Name::of("x")];
+    let hpa_schema = RecordSchema::of_sorted_names(&hpa_names);
+    body_tys.register_record_schema(hpa_schema, &hpa_names).expect("hpa schema");
+    let hpa_fields = body_tys.intern_list(&[b_u32, b_i32]).expect("hpa fields");
+    let rec_hpa = body_tys.intern(PNode::Record(hpa_schema, hpa_fields)).expect("hpa");
+
+    let hpb_names = [Name::of("hp"), Name::of("shield")];
+    let hpb_schema = RecordSchema::of_sorted_names(&hpb_names);
+    body_tys.register_record_schema(hpb_schema, &hpb_names).expect("hpb schema");
+    let hpb_fields = body_tys.intern_list(&[b_u64, b_u32]).expect("hpb fields");
+    let rec_hpb = body_tys.intern(PNode::Record(hpb_schema, hpb_fields)).expect("hpb");
+
+    // tri = { a: u8, b: u16, c: u32 }
+    let tri_names = [Name::of("a"), Name::of("b"), Name::of("c")];
+    let tri_schema = RecordSchema::of_sorted_names(&tri_names);
+    body_tys.register_record_schema(tri_schema, &tri_names).expect("tri schema");
+    let tri_fields = body_tys.intern_list(&[b_u8, b_u16, b_u32]).expect("tri fields");
+    let rec_tri = body_tys.intern(PNode::Record(tri_schema, tri_fields)).expect("tri");
+
+    let view = body_tys.view();
+
+    // 1. `blaze_field_count::<T>() -> usize`
+    let count_of = |t: PTy| eval_reflect_call(&fx, view, c_usize, &intrinsics, "blaze_field_count", &[t]);
+    assert_eq!(count_of(rec_empty), 0, "empty record");
+    assert_eq!(count_of(rec_pos), 2, "2-field record");
+    assert_eq!(count_of(rec_tri), 3, "3-field record");
+    assert_eq!(count_of(b_unit), 0, "unit tuple");
+    assert_eq!(count_of(b_pair), 2, "2-tuple");
+    assert_eq!(count_of(b_quad), 4, "4-tuple");
+    assert_eq!(count_of(b_unit_struct), 0, "unit struct");
+    assert_eq!(count_of(b_braced_struct), 2, "braced struct");
+    assert_eq!(count_of(b_tuple_struct), 3, "tuple struct");
+    assert_eq!(count_of(b_multi_enum), 0, "multi-variant enum");
+    assert_eq!(count_of(b_single_enum), 0, "single-variant enum");
+    assert_eq!(count_of(b_u32), 0, "primitive u32");
+    assert_eq!(count_of(b_bool), 0, "primitive bool");
+
+    // 2. `blaze_records_disjoint::<A, B>() -> bool`
+    let disjoint = |a: PTy, b: PTy| eval_reflect_call(&fx, view, c_bool, &intrinsics, "blaze_records_disjoint", &[a, b]);
+    assert_eq!(disjoint(rec_pos, rec_vel), 1, "{{ x, y }} vs {{ vx, vy }} are disjoint");
+    assert_eq!(disjoint(rec_hpa, rec_hpb), 0, "{{ hp, x }} vs {{ hp, shield }} overlap on `hp`");
+    assert_eq!(disjoint(rec_pos, rec_hpa), 0, "{{ x, y }} vs {{ hp, x }} overlap on `x`");
+    assert_eq!(disjoint(rec_pos, rec_pos), 0, "non-empty record overlaps itself");
+    assert_eq!(disjoint(rec_empty, rec_pos), 1, "empty record is disjoint from any record");
+    assert_eq!(disjoint(rec_empty, rec_empty), 1, "empty record is disjoint from empty record");
+    assert_eq!(disjoint(rec_pos, b_unit), 1, "record vs () is disjoint");
+    assert_eq!(disjoint(b_unit, rec_pos), 1, "() vs record is disjoint");
+    assert_eq!(disjoint(b_unit, b_unit), 1, "() vs () is disjoint");
+    assert_eq!(disjoint(b_u32, b_u32), 0, "same non-record type is not disjoint");
+    assert_eq!(disjoint(b_u32, b_i32), 1, "distinct non-record types are disjoint");
+    assert_eq!(disjoint(rec_pos, b_u32), 1, "record vs non-record are disjoint");
+
+    // 3. `blaze_record_schema_id::<T>() -> u64`
+    let schema_id = |t: PTy| eval_reflect_call(&fx, view, c_u64, &intrinsics, "blaze_record_schema_id", &[t]);
+    assert_eq!(schema_id(rec_pos), pos_schema.0, "record returns its canonical schema hash");
+    assert_eq!(schema_id(rec_pos_reordered), pos_schema.0, "reordered fields share identical schema ID");
+    assert_ne!(schema_id(rec_pos), schema_id(rec_vel), "different field sets have distinct schema IDs");
+    assert_ne!(schema_id(rec_pos), 0, "record schema ID is non-zero");
+    assert_eq!(schema_id(rec_empty), RecordSchema::EMPTY.0, "empty record returns RecordSchema::EMPTY.0");
+    assert_eq!(schema_id(b_u32), 0, "primitive returns 0");
+    assert_eq!(schema_id(b_pair), 0, "tuple returns 0");
+    assert_eq!(schema_id(b_braced_struct), 0, "nominal struct returns 0");
+    assert_eq!(schema_id(b_multi_enum), 0, "enum returns 0");
 }

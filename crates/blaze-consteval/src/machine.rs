@@ -1982,6 +1982,30 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 let ((fb, fs), (tb, _)) = (info(self, from)?, info(self, to)?);
                 s(blaze_build::intrinsics::int_cast_bits(int(0)?, fb, fs, tb))
             }
+            // blaze's structural reflection intrinsics: the one rule in blaze-build intrinsics.rs
+            // (`field_count`, `records_disjoint`, `record_schema_id`).
+            Intrinsic::BlazeFieldCount => {
+                let t = t0.ok_or(malformed("`blaze_field_count` with no type"))?;
+                let count = blaze_build::intrinsics::field_count(t, self.ground.view(), self.world).map_err(|e| match e {
+                    blaze_build::intrinsics::FieldCountError::MissingType => malformed("`blaze_field_count` of a type not in the ground table"),
+                    blaze_build::intrinsics::FieldCountError::NoAdt(item) => Stop::Refused(Refusal::Missing { what: "ADT definition", item }),
+                })?;
+                s(u128::from(count))
+            }
+            Intrinsic::BlazeRecordsDisjoint => {
+                let (a, b) = (t0.ok_or(malformed("`blaze_records_disjoint` types"))?, t1.ok_or(malformed("`blaze_records_disjoint` types"))?);
+                let disjoint = blaze_build::intrinsics::records_disjoint(a, b, self.ground.view()).map_err(|e| match e {
+                    blaze_build::intrinsics::DisjointError::MissingType => malformed("`blaze_records_disjoint` of a type not in the ground table"),
+                    blaze_build::intrinsics::DisjointError::MissingRecordNames => malformed("`blaze_records_disjoint` of a record without registered schema field names"),
+                })?;
+                s(u128::from(disjoint))
+            }
+            Intrinsic::BlazeRecordSchemaId => {
+                let t = t0.ok_or(malformed("`blaze_record_schema_id` with no type"))?;
+                let id = blaze_build::intrinsics::record_schema_id(t, self.ground.view())
+                    .ok_or(malformed("`blaze_record_schema_id` of a type not in the ground table"))?;
+                s(u128::from(id))
+            }
             // `raw_eq::<T>(a, b)` ("Determines whether the raw bytes of the two values are
             // equal") and `compare_bytes(left, right, bytes)` ("Lexicographically compare ... as
             // unsigned bytes"): one bounds, init and provenance check per slice, then direct

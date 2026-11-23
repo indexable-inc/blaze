@@ -1100,3 +1100,63 @@ fn error_unions_and_typed_binding_patterns_lower_cleanly() {
         dump_of(&isig)
     );
 }
+
+#[test]
+fn record_type_spread_lowers_cleanly() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let exts = parser::Extensions::RECORDS;
+
+    let actor_src = "type Actor = { ..Transform, hp: u32 = 100 };";
+    let actor = crate::lower_signature_with_extensions(actor_src, Edition::E2024, exts, &mut Unix, alloc)
+        .expect("Actor spread alias lowers");
+    let av = actor.view();
+    assert!(av.unhandled.is_empty(), "unhandled:\n{}", dump_of(&actor));
+    assert!(av.diags.is_empty(), "diags:\n{}", dump_of(&actor));
+    let actor_fields = (0..av.types.len() as u32)
+        .find_map(|i| match av.ty(TypeId(i)) {
+            Ok(TypeRef::Record(l)) => Some(l),
+            _ => None,
+        })
+        .expect("expected TypeRef::Record for Actor");
+    assert_eq!(actor_fields.len, 2);
+    let arows = av.rows(actor_fields).expect("Actor field rows");
+    let af0 = Field::decode(arows[0]).expect("spread field");
+    let af1 = Field::decode(arows[1]).expect("hp field");
+    assert!(af0.name.is_none(), "spread `..Transform` must have name: None");
+    assert!(af0.default.is_none(), "spread `..Transform` must have default: None");
+    assert_eq!(av.text_at(av.type_range(af0.ty).expect("spread ty range")).expect("spread ty text").trim(), "Transform");
+    assert_eq!(av.name_text(af1.name.expect("hp name")).expect("hp name text"), "hp");
+    assert!(af1.default.is_some(), "`hp` must keep its default `100`");
+
+    let boss_src = "type Boss = { ..Actor, ..Combat, hp: u32 = 500, shield: u32 = 50 };";
+    let boss = crate::lower_signature_with_extensions(boss_src, Edition::E2024, exts, &mut Unix, alloc)
+        .expect("Boss multi-spread alias lowers");
+    let bv = boss.view();
+    assert!(bv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&boss));
+    assert!(bv.diags.is_empty(), "diags:\n{}", dump_of(&boss));
+    let boss_fields = (0..bv.types.len() as u32)
+        .find_map(|i| match bv.ty(TypeId(i)) {
+            Ok(TypeRef::Record(l)) => Some(l),
+            _ => None,
+        })
+        .expect("expected TypeRef::Record for Boss");
+    assert_eq!(boss_fields.len, 4);
+    let brows = bv.rows(boss_fields).expect("Boss field rows");
+    assert!(Field::decode(brows[0]).expect("f0").name.is_none());
+    assert!(Field::decode(brows[1]).expect("f1").name.is_none());
+    assert!(Field::decode(brows[2]).expect("f2").name.is_some());
+    assert!(Field::decode(brows[3]).expect("f3").name.is_some());
+
+    // Generic argument starting with a spread: `Vec<{ ..Transform, hp: u32 }>`.
+    let generic_src = "fn list(xs: Vec<{ ..Transform, hp: u32 }>) -> u32;";
+    let generic = crate::lower_signature_with_extensions(generic_src, Edition::E2024, exts, &mut Unix, alloc)
+        .expect("generic arg spread lowers");
+    let gv = generic.view();
+    assert!(gv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&generic));
+    assert!(gv.diags.is_empty(), "diags:\n{}", dump_of(&generic));
+    assert!(
+        (0..gv.types.len() as u32).any(|i| matches!(gv.ty(TypeId(i)), Ok(TypeRef::Record(l)) if l.len == 2)),
+        "expected TypeRef::Record(2) inside Vec<...>:\n{}",
+        dump_of(&generic)
+    );
+}

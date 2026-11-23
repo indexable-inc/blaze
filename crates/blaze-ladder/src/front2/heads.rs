@@ -261,6 +261,10 @@ pub struct Maps {
     pub trait_lifetimes: Rows<ItemKey, u32>,
     pub assoc_lifetimes: Rows<(ItemKey, Name), u32>,
     pub opaque_lifetimes: Rows<ItemKey, u32>,
+    /// Canonical source spellings of structural record fields lowered into this store
+    /// (`Name -> text`), used by structural record type spread (`{ ..Base, extra: T }`) to sort
+    /// merged fields alphabetically by source spelling rather than by `Name` hash.
+    pub record_field_names: Rows<Name, blaze_own::String<Alloc<'static>>>,
     /// The tables' allocator ([`Store::new`]'s): what an asked anonymous constant's marks
     /// are copied into ([`Heads::mark_alloc`]).
     alloc: Alloc<'static>,
@@ -298,6 +302,7 @@ impl Maps {
             trait_lifetimes: Rows::new_in(alloc),
             assoc_lifetimes: Rows::new_in(alloc),
             opaque_lifetimes: Rows::new_in(alloc),
+            record_field_names: Rows::new_in(alloc),
         }
     }
 }
@@ -384,6 +389,16 @@ impl Heads for Maps {
     }
     fn opaque_lifetimes(&self, opaque: ItemKey) -> Option<u32> {
         self.opaque_lifetimes.get(&opaque).copied()
+    }
+    fn note_record_field_name(&self, name: Name, text: &str) {
+        if !self.record_field_names.contains_key(&name) {
+            let mut owned = blaze_own::String::with_capacity_in(text.len(), self.alloc);
+            owned.push_str(text);
+            self.record_field_names.insert_absent(name, owned);
+        }
+    }
+    fn record_field_name(&self, name: Name) -> Option<&str> {
+        self.record_field_names.get(&name).map(|s| s.as_str())
     }
     fn const_len(&self, key: LibKey) -> Option<u64> {
         self.replay_const(key);
@@ -2870,7 +2885,7 @@ impl<'n> Store<'n> {
             }
             (Want::Head(_), ItemDetail::Trait) => self.trait_head(names, keys, key, module, &v, text),
             (Want::Head(_), ItemDetail::TraitAlias) => self.trait_alias(names, keys, key, module, &v),
-            (Want::Head(_), ItemDetail::TypeAlias) => match self.alias(names, key, module, &v) {
+            (Want::Head(_), ItemDetail::TypeAlias) => match self.alias(names, keys, key, module, &v) {
                 Err(why @ (Why::Need(_) | Why::NeedConst(..))) => Err(why),
                 Err(why) => {
                     self.maps.aliases.insert(key, None);
@@ -3402,7 +3417,7 @@ impl<'n> Store<'n> {
 
     /// A free type alias's head: its generics and the aliased type, read in the alias's own
     /// module with its own parameters (a bound on an alias's parameter binds nothing).
-    fn alias<S: NamesSource<'n>>(&mut self, names: S, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
+    fn alias<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
         let marks = self.marks(names, key, v.item())?;
@@ -3457,6 +3472,7 @@ impl<'n> Store<'n> {
             self.preds.insert(o.key, o.preds);
             self.opaques.insert(o.key, (alias_ck, o.index));
         }
+        self.register_record_defaults(names, keys, key, &env, marks, v)?;
         self.maps.alias_defaults.insert(key, defaults);
         self.maps.aliases.insert(key, Some((generics, ty)));
         self.maps.const_params.insert(key, cs);
@@ -4059,6 +4075,7 @@ impl<'n> Store<'n> {
             args |= is_args_attr(path);
         }
         let discrs = discriminants(&b, &mut self.tys, &env, v, repr, &written)?;
+        self.register_record_defaults(names, keys, key, &env, marks, v)?;
         let (lifetimes, field_region_at, field_region_list) = super::borrows::freeze_field_regions(names, keys, self, ck, v, kind, &fields, self.tys.alloc())?;
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.tys.alloc());
         self.adts.insert(ck, AdtRow { kind, generics, variants, fields, repr, valid, discrs, args, marks: coherence, lifetimes, field_regions });
@@ -4503,7 +4520,8 @@ impl<'n> Store<'n> {
     }
 
     /// Registers anonymous constant heads for any `TypeRef::Record` field defaults written in `v`
-    /// (`{ width: u32 = 80, name: &str }`), keyed under `RecordSchema::defaults_key()` in
+    /// (`{ width: u32 = 80, name: &str }`) or inherited via structural record spread
+    /// (`{ ..Base, hp: u32 = 100 }`), keyed under `RecordSchema::defaults_key()` in
     /// `self.field_defaults` so `Expr::Record { .. }` resolves them via `World::field_defaults`.
     pub(super) fn register_record_defaults<S: NamesSource<'n>>(
         &mut self,
@@ -4514,43 +4532,113 @@ impl<'n> Store<'n> {
         marks: Option<TextMarks<'n>>,
         v: &View<'_>,
     ) -> Result<(), Why> {
+        #[derive(Clone, Copy)]
+        enum DefaultEntry {
+            None,
+            Inherited(ItemKey),
+            Written(lf::TypeId, lf::ConstIdx),
+        }
+
         let alloc = self.tys.alloc();
         for i in 0..v.types.len() {
             let Ok(ti) = u32::try_from(i) else { break };
             let Ok(lf::TypeRef::Record(fields)) = v.ty(lf::TypeId(ti)) else { continue };
             let rows = v.rows(fields)?;
             let mut has_default = false;
+            let mut has_spread = false;
             for &row in rows {
-                if lf::Field::decode(row)?.default.is_some() {
+                let f = lf::Field::decode(row)?;
+                if f.default.is_some() {
                     has_default = true;
-                    break;
+                }
+                if f.name.is_none() {
+                    has_spread = true;
                 }
             }
-            if !has_default {
+            if !has_default && !has_spread {
                 continue;
             }
-            let mut named = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
-            for (i, &row) in rows.iter().enumerate() {
+            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+            let mut merged: blaze_own::Vec<(&str, Name, DefaultEntry), Alloc<'_>> = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
+            let mut inherited_any = false;
+            let mut spread_ok = true;
+            for &row in rows {
                 let f = lf::Field::decode(row)?;
-                let text = match f.name {
-                    Some(nm) => v.name_text(nm)?,
-                    None => "",
-                };
-                named.push((text, i, Name::of(text), f.ty, f.default));
+                match f.name {
+                    Some(nm) => {
+                        let text = v.name_text(nm)?;
+                        let name = Name::of(text);
+                        self.maps.note_record_field_name(name, text);
+                        let entry = match f.default {
+                            Some(c) => DefaultEntry::Written(f.ty, c),
+                            None => DefaultEntry::None,
+                        };
+                        if let Some(slot) = merged.iter_mut().find(|(_, existing, _)| *existing == name) {
+                            *slot = (text, name, entry);
+                        } else {
+                            merged.push((text, name, entry));
+                        }
+                    }
+                    None => {
+                        let base_ty = b.ty(&mut self.tys, env, v, f.ty)?;
+                        let Some(PNode::Record(base_schema, _)) = self.tys.view().get(base_ty).copied() else {
+                            spread_ok = false;
+                            break;
+                        };
+                        let mut base_names: blaze_own::Vec<Name, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+                        if let Some(ns) = self.tys.view().record_names(base_schema) {
+                            base_names.extend_from_slice(ns);
+                        } else {
+                            spread_ok = false;
+                            break;
+                        }
+                        let base_defaults = self.field_defaults.get(&base_schema.defaults_key());
+                        for (idx, &bnm) in base_names.iter().enumerate() {
+                            let Some(btext) = self.maps.record_field_name(bnm) else {
+                                spread_ok = false;
+                                break;
+                            };
+                            let entry = match base_defaults.and_then(|ds| ds.get(idx).copied().flatten()) {
+                                Some(dk) => {
+                                    inherited_any = true;
+                                    DefaultEntry::Inherited(dk)
+                                }
+                                None => DefaultEntry::None,
+                            };
+                            if let Some(slot) = merged.iter_mut().find(|(_, existing, _)| *existing == bnm) {
+                                *slot = (btext, bnm, entry);
+                            } else {
+                                merged.push((btext, bnm, entry));
+                            }
+                        }
+                        if !spread_ok {
+                            break;
+                        }
+                    }
+                }
             }
-            named.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-            let mut sorted_names = blaze_own::Vec::with_capacity_in(named.len(), alloc);
-            for &(_, _, nm, _, _) in named.iter() {
+            if !spread_ok || (!has_default && !inherited_any) {
+                continue;
+            }
+            merged.sort_by(|a, b| a.0.cmp(b.0));
+            let mut sorted_names = blaze_own::Vec::with_capacity_in(merged.len(), alloc);
+            for &(_, nm, _) in merged.iter() {
                 sorted_names.push(nm);
             }
             let schema = tc::RecordSchema::of_sorted_names(&sorted_names);
             let rk = schema.defaults_key();
-            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
-            let mut defaults = blaze_own::Vec::with_capacity_in(named.len(), alloc);
-            for (j, &(_, _, _, fty, fdefault)) in named.iter().enumerate() {
-                let Some(c) = fdefault else {
-                    defaults.push(None);
-                    continue;
+            let mut defaults = blaze_own::Vec::with_capacity_in(merged.len(), alloc);
+            for (j, &(_, _, entry)) in merged.iter().enumerate() {
+                let (fty, c) = match entry {
+                    DefaultEntry::None => {
+                        defaults.push(None);
+                        continue;
+                    }
+                    DefaultEntry::Inherited(dk) => {
+                        defaults.push(Some(dk));
+                        continue;
+                    }
+                    DefaultEntry::Written(fty, c) => (fty, c),
                 };
                 let ty = b.ty(&mut self.tys, env, v, fty)?;
                 let at = v.const_range(c)?;
@@ -5866,5 +5954,239 @@ pub struct B;
         assert!(matches!(tys.node(members[0]), Ok(PNode::Adt(k, _)) if k == a_key));
         assert!(matches!(tys.node(members[1]), Ok(PNode::Adt(k, _)) if k == b_key));
         assert_eq!(buckets::shape_of(tys, uni_ty), Some(Shape::Union(2)));
+    }
+
+    #[test]
+    fn record_spread_canonical_schema_override_regions_and_error() {
+        use blaze_id::{ContentId, CrateItemKey};
+        use blaze_scope::graph::Sysroot;
+        use blaze_scope::resolve::{CrateInput, SourceTexts, resolve_crates};
+        use blaze_scope::task::Serial;
+        use blaze_surface::Edition;
+        use blaze_typeck::{IntTy, Name, PNode, RecordSchema, UintTy};
+        use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+        const SRC: &str = "#![blaze::records]
+#![feature(no_core, lang_items)]
+#![no_core]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+pub type Transform = { x: i32, y: i32, scale: i32 };
+pub type Combat = { atk: u32, hp: u8 };
+pub type Actor = { ..Transform, hp: u32 };
+pub type FlatActor = { hp: u32, scale: i32, x: i32, y: i32 };
+pub type Boss = { ..Actor, ..Combat, hp: u32, shield: u32 };
+pub type FlatBoss = { atk: u32, hp: u32, scale: i32, shield: u32, x: i32, y: i32 };
+pub type Bad = { ..u32, hp: u32 };
+pub type WithRef<'a> = { name: &'a str, x: i32 };
+pub type NamedActor<'a> = { ..WithRef<'a>, hp: u32 };
+pub fn use_named<'a>(a: NamedActor<'a>) -> &'a str { a.name }
+";
+        struct SrcText(&'static str);
+        impl<'a> SourceTexts<'a> for SrcText {
+            fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+                (krate == 0 && path == "/app/lib.rs").then_some(self.0)
+            }
+        }
+        let g = a();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let bump = frame.alloc(blaze_own::Erased::new(&frame)).bump();
+        let crates = [CrateInput {
+            name: "app",
+            key: CrateItemKey(ContentId::of("record spread test", b"app")),
+            edition: Edition::E2024,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: false, entry: false },
+            root: "/app/lib.rs",
+            shown_from: "/",
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        }];
+        let sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
+        let solved = resolve_crates(&crates, sysroot, &SrcText(SRC), &Serial, bump).expect("resolve_crates");
+        let names = &solved;
+        let find = |wanted: &str| -> LibKey {
+            let mut found = None;
+            NamesSource::each_item(names, 0, &mut |key, _| {
+                if NamesSource::name_of(names, key) == Some(wanted) {
+                    found = Some(key);
+                }
+            });
+            found.unwrap_or_else(|| panic!("`{wanted}` in fixture"))
+        };
+        let sized = Some(find("Sized"));
+        let mut store = Store::new(sized, &frame, g);
+        let mut keys = Keys::new();
+
+        for name in ["Actor", "FlatActor", "Boss", "FlatBoss", "NamedActor"] {
+            let lib = find(name);
+            store.ensure(names, &mut keys, Want::Head(lib)).unwrap_or_else(|e| panic!("ensure `{name}`: {e:?}"));
+        }
+        let use_named_key = find("use_named");
+        store.ensure(names, &mut keys, Want::Fn(use_named_key)).unwrap_or_else(|e| panic!("ensure `use_named`: {e:?}"));
+
+        let actor_ty = store.maps.aliases.get(&find("Actor")).copied().flatten().expect("Actor alias").1;
+        let flat_actor_ty = store.maps.aliases.get(&find("FlatActor")).copied().flatten().expect("FlatActor alias").1;
+        assert_eq!(actor_ty, flat_actor_ty, "`{{ ..Transform, hp: u32 }}` must equal `{{ hp: u32, scale: i32, x: i32, y: i32 }}`");
+
+        let tys = store.tys.view();
+        let PNode::Record(actor_schema, actor_fields) = tys.node(actor_ty).expect("actor node") else {
+            panic!("expected PNode::Record for Actor");
+        };
+        let expected_actor_schema = RecordSchema::of_sorted_names(&[Name::of("hp"), Name::of("scale"), Name::of("x"), Name::of("y")]);
+        assert_eq!(actor_schema, expected_actor_schema);
+        let af = tys.list(actor_fields).expect("actor fields");
+        assert_eq!(af.len(), 4);
+        assert_eq!(tys.node(af[0]).expect("hp"), PNode::Uint(UintTy::U32));
+        assert_eq!(tys.node(af[1]).expect("scale"), PNode::Int(IntTy::I32));
+        assert_eq!(tys.node(af[2]).expect("x"), PNode::Int(IntTy::I32));
+        assert_eq!(tys.node(af[3]).expect("y"), PNode::Int(IntTy::I32));
+
+        // Multi-spread + field override (`hp: u32` overrides `Combat`'s `hp: u8` without duplicating `hp`).
+        let boss_ty = store.maps.aliases.get(&find("Boss")).copied().flatten().expect("Boss alias").1;
+        let flat_boss_ty = store.maps.aliases.get(&find("FlatBoss")).copied().flatten().expect("FlatBoss alias").1;
+        assert_eq!(boss_ty, flat_boss_ty, "`Boss` must canonically equal `FlatBoss`");
+
+        // Lifetime-bearing spread lays regions cleanly without region gaps.
+        assert!(store.maps.alias_slots.get(&find("NamedActor")).is_some(), "NamedActor<'a> must lay alias region slots");
+        assert!(store.region_gaps.get(&checker_of(use_named_key)).is_none(), "use_named must have no region gap");
+
+        // Non-record spread `..u32` is rejected cleanly in `alias_gaps`.
+        let bad_key = find("Bad");
+        store.ensure(names, &mut keys, Want::Head(bad_key)).unwrap_or_else(|e| panic!("ensure `Bad`: {e:?}"));
+        assert!(store.maps.aliases.get(&bad_key).copied().flatten().is_none(), "`Bad` must be refused");
+        let gap = store.maps.alias_gaps.get(&bad_key).expect("Bad alias gap");
+        assert!(gap.text.contains("record type spread"), "unexpected gap message: {}", gap.text);
+    }
+
+    #[test]
+    fn record_spread_defaults_and_nested_elision_end_to_end() {
+        use crate::refusal::SourceFile;
+        use crate::run::{FrontChoice, NewFront, run_with};
+
+        const NEW: NewFront<'static> = NewFront {
+            package: "ladder",
+            edition: "blaze-2026.11",
+            shelf: None,
+            overflow: blaze_build::OverflowChecks::Off,
+        };
+        const HEAD: &str = "#![blaze::records]
+#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u8 {}
+impl Copy for u32 {}
+impl Copy for i32 {}
+impl Copy for bool {}
+";
+
+        let run_src = |body: &str| -> Result<u8, blaze_own::String<blaze_own::Alloc<'static>>> {
+            let alloc = blaze_own::testing::heap().alloc();
+            let mut text = blaze_own::String::new_in(alloc);
+            text.push_str(HEAD);
+            text.push_str(body);
+            let files = [SourceFile { path: "src/main.rs", text: text.as_str() }];
+            run_with(&files, "src/main.rs", None, FrontChoice::New(NEW), blaze_own::testing::heap().shared()).map_err(|e| {
+                let mut msg = blaze_own::String::new_in(alloc);
+                let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("{e}"));
+                msg
+            })
+        };
+
+        // 1. Structural record spread with inherited, overridden, and multi-spread defaults,
+        //    plus flat structural compatibility and width-subtyping to base record.
+        let spread_ok = run_src("
+type Transform = { x: i32 = 0, y: i32 = 0, scale: i32 = 1 };
+type Combat = { atk: u32 = 10, hp: u32 = 50 };
+type Actor = { ..Transform, hp: u32 = 100 };
+type Boss = { ..Actor, ..Combat, hp: u32 = 200, shield: u32 = 15 };
+
+fn take_flat(r: { hp: u32, scale: i32, x: i32, y: i32 }) -> i32 {
+    r.x + r.y + r.scale + r.hp as i32
+}
+
+fn take_transform(t: Transform) -> i32 {
+    t.x + t.y + t.scale
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let a: Actor = { x: 10 };
+    let b: Boss = { y: 5 };
+    // take_flat(a) = 10 + 0 + 1 + 100 = 111
+    // take_transform(b) = 0 + 5 + 1 = 6
+    // b.atk (10) + b.shield (15) = 25
+    // b.hp (200) -> use delta (b.hp - 180 = 20) so total fits in exit status u8: 111 + 6 + 25 + 20 = 162
+    take_flat(a) + take_transform(b) + (b.atk + b.shield + (b.hp - 180)) as i32
+}
+");
+        assert_eq!(spread_ok, Ok(162));
+
+        // 2. Re-declaring a field without a default clears the inherited default.
+        let cleared_err = run_src("
+type Transform = { x: i32 = 0, y: i32 = 0, scale: i32 = 1 };
+type Actor = { ..Transform, hp: u32 = 100 };
+type RequiredHp = { ..Actor, hp: u32, tag: u8 = 7 };
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let r: RequiredHp = { x: 1 };
+    r.x
+}
+");
+        assert!(cleared_err.is_err(), "omitting cleared-default field `hp` must fail typecheck");
+
+        let cleared_ok = run_src("
+type Transform = { x: i32 = 0, y: i32 = 0, scale: i32 = 1 };
+type Actor = { ..Transform, hp: u32 = 100 };
+type RequiredHp = { ..Actor, hp: u32, tag: u8 = 7 };
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let r: RequiredHp = { hp: 34 };
+    r.x + r.y + r.scale + r.hp as i32 + r.tag as i32
+}
+");
+        assert_eq!(cleared_ok, Ok(42));
+
+        // 3. Nested partial record default elision:
+        //    `{ transform: { x: 10 } }`, `{ transform: { .. }, hp: 20 }`, `{ .. }`,
+        //    `{ transform: { x: 10, ..base.transform }, ..base }`, `{ transform: { x: 7 }, ..base }`.
+        let nested_ok = run_src("
+type Transform = { x: i32 = 0, y: i32 = 0, scale: i32 = 1 };
+type Entity = { transform: Transform = { x: 0, y: 0, scale: 1 }, hp: u32 = 100 };
+
+fn score(e: Entity) -> i32 {
+    e.transform.x + e.transform.y + e.transform.scale + e.hp as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let e1: Entity = { transform: { x: 10 } };
+    let e2: Entity = { transform: { .. }, hp: 20 };
+    let e3: Entity = { .. };
+    let base: Entity = { transform: { x: 3, y: 4, scale: 2 }, hp: 10 };
+    let e4: Entity = { transform: { x: 10, ..base.transform }, ..base };
+    let e5: Entity = { transform: { x: 7 }, ..base };
+    // score(e1) = 10 + 0 + 1 + 100 = 111
+    // score(e2) = 0 + 0 + 1 + 20 = 21
+    // score(e3) = 0 + 0 + 1 + 100 = 101
+    // score(e4) = 10 + 4 + 2 + 10 = 26
+    // score(e5) = 7 + 0 + 1 + 10 = 18
+    // total - 200 = 277 - 200 = 77
+    score(e1) + score(e2) + score(e3) + score(e4) + score(e5) - 200
+}
+");
+        assert_eq!(nested_ok, Ok(77));
     }
 }
