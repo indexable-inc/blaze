@@ -21,11 +21,13 @@ blaze-own.workspace = true
 
 [dev-dependencies]
 blaze-body-build.workspace = true
+blaze-body-lower.workspace = true
 blaze-build.workspace = true
+blaze-flow-lower.workspace = true
 blaze-lir = { workspace = true, features = ["eval"] }
 blaze-own = { workspace = true, features = ["testing"] }
 blaze-sim.workspace = true
-blaze-typeck.workspace = true
+blaze-typeck = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

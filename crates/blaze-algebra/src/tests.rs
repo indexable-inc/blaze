@@ -802,4 +802,11 @@ fn declarative_rules_table_drives_egraph_and_exports_lean4_obligations() {
         assert!(src.contains(&def_pat), "missing {def_pat} in Lean export");
         assert!(src.contains(&fld_pat), "missing {fld_pat} in AllSound");
     }
+
+    // 3. Zero-drift gate: checked-in `lean/analysis/BlazeDiff/Generated.lean` must match byte-for-byte!
+    let checked_in = include_str!("../../../lean/analysis/BlazeDiff/Generated.lean");
+    assert_eq!(
+        src, checked_in,
+        "lean/analysis/BlazeDiff/Generated.lean drifted from blaze_algebra::rules::export_lean_theorems"
+    );
 }
