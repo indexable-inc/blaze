@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-314 invariants, 44 refinements, 12 reference models.
-By level: 255 tested, 87 simulated, 1 model-checked, 15 proved.
+315 invariants, 44 refinements, 12 reference models.
+By level: 256 tested, 87 simulated, 1 model-checked, 15 proved.
 
 ## Invariants
 
@@ -481,6 +481,8 @@ By level: 255 tested, 87 simulated, 1 model-checked, 15 proved.
   Controls: `pointer_loop_miss`.
 - **`property_dotenv_round_trip`** *tested* (`crates/blaze-std/src/dotenv.rs`): dotenv formatting and parsing round-trip arbitrary keys and escaped values without loss.
   Controls: `skipped_escapes`.
+- **`property_world_matches_reference_model_and_bijection`** *tested* (`crates/blaze-std/src/ecs/tests.rs`): any sequence of spawns, despawns, component sets/removals, exclusive `ChildOf` reparenting, and `IsA` inheritance links preserves exact entity liveness, direct and inherited component values, `ChildOf` exclusivity, and table-row bijection against the reference model.
+  Controls: `stale_entity_row_update`.
 - **`property_hex_round_trip`** *tested* (`crates/blaze-std/src/hex.rs`): hex encoding and decoding round-trip arbitrary byte slices exactly.
   Controls: `swapped_nibbles`.
 - **`property_escape_round_trip_and_sanitizer_never_leaks_xss`** *tested* (`crates/blaze-std/src/html.rs`): HTML entity escaping round-trips arbitrary UTF-8 and `sanitize_html_in` never emits `<script`, `onerror=`, or `javascript:`.
