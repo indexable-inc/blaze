@@ -129,6 +129,26 @@ blaze-toolchain.opt-level = 3
 blaze-lex.opt-level = 3
 parser.opt-level = 3
 rustc_lexer.opt-level = 3
+# Hot compiler pipeline and crypto crates run inside integration tests (variadic_call,
+# native_so_descriptor, impls, sha512): opt-level = 2 cuts debug test runtime by ~10x while
+# keeping dev rebuilds fast.
+blaze-own.opt-level = 2
+blaze-ids.opt-level = 2
+blaze-lower.opt-level = 2
+blaze-ty.opt-level = 2
+blaze-solve.opt-level = 2
+blaze-typeck.opt-level = 2
+blaze-impls.opt-level = 2
+blaze-body.opt-level = 2
+blaze-body-lower.opt-level = 2
+blaze-flow.opt-level = 2
+blaze-flow-lower.opt-level = 2
+blaze-consteval.opt-level = 2
+blaze-build.opt-level = 2
+blaze-lir.opt-level = 2
+blaze-emit.opt-level = 2
+blaze-ed25519.opt-level = 2
+blaze-deflate.opt-level = 2
 
 [profile.release]
 # Set this to 1 or 2 to get more useful backtraces in debugger.
@@ -287,7 +307,6 @@ blaze-screen = { path = "crates/blaze-screen" }
 blaze-script = { path = "crates/blaze-script" }
 # v2 (docs/v2/plan.md)
 blaze-algebra = { path = "crates/blaze-algebra" }
-blaze-algebra-body = { path = "crates/blaze-algebra-body" }
 blaze-alloc-count = { path = "crates/blaze-alloc-count" }
 blaze-answer = { path = "crates/blaze-answer" }
 blaze-ask = { path = "crates/blaze-ask" }

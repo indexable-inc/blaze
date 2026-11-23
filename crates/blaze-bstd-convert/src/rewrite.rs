@@ -186,7 +186,9 @@ pub fn convert_workspace(
             if stats.structs_changed > 0 {
                 wf.src = updated;
                 total_parameterized_structs += stats.structs_changed;
-                crate_summaries[wf.summary_idx].ast_edits_applied += stats.edits_applied;
+                if let Some(summary) = crate_summaries.get_mut(wf.summary_idx) {
+                    summary.ast_edits_applied += stats.edits_applied;
+                }
             }
         }
     }
@@ -198,7 +200,9 @@ pub fn convert_workspace(
         &mut ws_files,
         alloc_strategy,
         &mut |summary_idx, edits| {
-            crate_summaries[summary_idx].ast_edits_applied += edits;
+            if let Some(summary) = crate_summaries.get_mut(summary_idx) {
+                summary.ast_edits_applied += edits;
+            }
         },
     );
     for wf in ws_files {
@@ -1591,35 +1595,19 @@ fn propagate_and_rewrite_workspace_capabilities(
         file_imports.push(imports);
     }
 
-    // Build unambiguous lookup tables using borrowed `&str` keys (zero intermediate String clones).
-    let mut free_fn_counts: BTreeMap<(usize, &str), usize> = BTreeMap::new();
-    let mut method_counts: BTreeMap<(usize, &str), usize> = BTreeMap::new();
-    let mut pub_fn_counts: BTreeMap<(&str, &str), usize> = BTreeMap::new();
-    for f in &fns {
-        if f.is_method {
-            *method_counts.entry((f.summary_idx, f.name.as_str())).or_default() += 1;
-        } else {
-            *free_fn_counts.entry((f.summary_idx, f.name.as_str())).or_default() += 1;
-            if f.is_pub {
-                *pub_fn_counts.entry((f.crate_ident.as_str(), f.name.as_str())).or_default() += 1;
-            }
-        }
-    }
-    let mut free_fn_idx: BTreeMap<(usize, &str), usize> = BTreeMap::new();
-    let mut method_idx: BTreeMap<(usize, &str), usize> = BTreeMap::new();
-    let mut ws_pub_fn_idx: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    // Build unambiguous lookup tables using borrowed `&str` keys (single pass: `Some(idx)` = unique,
+    // `None` = ambiguous).
+    let mut free_fn_idx: BTreeMap<(usize, &str), Option<usize>> = BTreeMap::new();
+    let mut method_idx: BTreeMap<(usize, &str), Option<usize>> = BTreeMap::new();
+    let mut ws_pub_fn_idx: BTreeMap<(&str, &str), Option<usize>> = BTreeMap::new();
     for (idx, f) in fns.iter().enumerate() {
         if !f.is_method {
-            if free_fn_counts.get(&(f.summary_idx, f.name.as_str())).copied() == Some(1) {
-                free_fn_idx.insert((f.summary_idx, f.name.as_str()), idx);
+            free_fn_idx.entry((f.summary_idx, f.name.as_str())).and_modify(|s| *s = None).or_insert(Some(idx));
+            if f.is_pub {
+                ws_pub_fn_idx.entry((f.crate_ident.as_str(), f.name.as_str())).and_modify(|s| *s = None).or_insert(Some(idx));
             }
-            if f.is_pub && pub_fn_counts.get(&(f.crate_ident.as_str(), f.name.as_str())).copied() == Some(1) {
-                ws_pub_fn_idx.insert((f.crate_ident.as_str(), f.name.as_str()), idx);
-            }
-        } else if method_counts.get(&(f.summary_idx, f.name.as_str())).copied() == Some(1)
-            && !is_common_std_method(&f.name)
-        {
-            method_idx.insert((f.summary_idx, f.name.as_str()), idx);
+        } else if !is_common_std_method(&f.name) {
+            method_idx.entry((f.summary_idx, f.name.as_str())).and_modify(|s| *s = None).or_insert(Some(idx));
         }
     }
 
@@ -1628,26 +1616,32 @@ fn propagate_and_rewrite_workspace_capabilities(
         fns.iter().map(|f| f.needed.iter().copied().collect()).collect();
     for _ in 0..MAX_CAP_PROP_ITERS {
         let mut changed = false;
-        let snapshot: Vec<Vec<CapParam>> =
-            needed_per_fn.iter().map(|s| s.iter().copied().collect()).collect();
-        for (idx, f) in fns.iter().enumerate() {
-            let before = needed_per_fn[idx].len();
+        let snapshot: BTreeMap<usize, BTreeSet<CapParam>> =
+            needed_per_fn.iter().enumerate().map(|(i, s)| (i, s.iter().copied().collect())).collect();
+        for (needed, f) in needed_per_fn.iter_mut().zip(&fns) {
+            let before = needed.len();
             for callee in &f.free_callees {
-                if let Some(&cidx) = free_fn_idx.get(&(f.summary_idx, callee.as_str())) {
-                    needed_per_fn[idx].extend(snapshot[cidx].iter().copied());
+                if let Some(&Some(cidx)) = free_fn_idx.get(&(f.summary_idx, callee.as_str()))
+                    && let Some(caps) = snapshot.get(&cidx)
+                {
+                    needed.extend(caps.iter().copied());
                 }
             }
             for (target_crate, callee) in &f.cross_crate_callees {
-                if let Some(&cidx) = ws_pub_fn_idx.get(&(target_crate.as_str(), callee.as_str())) {
-                    needed_per_fn[idx].extend(snapshot[cidx].iter().copied());
+                if let Some(&Some(cidx)) = ws_pub_fn_idx.get(&(target_crate.as_str(), callee.as_str()))
+                    && let Some(caps) = snapshot.get(&cidx)
+                {
+                    needed.extend(caps.iter().copied());
                 }
             }
             for callee in &f.method_callees {
-                if let Some(&cidx) = method_idx.get(&(f.summary_idx, callee.as_str())) {
-                    needed_per_fn[idx].extend(snapshot[cidx].iter().copied());
+                if let Some(&Some(cidx)) = method_idx.get(&(f.summary_idx, callee.as_str()))
+                    && let Some(caps) = snapshot.get(&cidx)
+                {
+                    needed.extend(caps.iter().copied());
                 }
             }
-            if needed_per_fn[idx].len() > before {
+            if needed.len() > before {
                 changed = true;
             }
         }
@@ -1661,21 +1655,21 @@ fn propagate_and_rewrite_workspace_capabilities(
     let mut added_by_free_name: BTreeMap<(usize, &str), BTreeSet<CapParam>> = BTreeMap::new();
     let mut added_by_method_name: BTreeMap<(usize, &str), BTreeSet<CapParam>> = BTreeMap::new();
     let mut added_by_ws_pub_fn: BTreeMap<(&str, &str), BTreeSet<CapParam>> = BTreeMap::new();
-    for (idx, f) in fns.iter().enumerate() {
+    for (needed, f) in needed_per_fn.iter().zip(&fns) {
         let added: BTreeSet<CapParam> =
-            needed_per_fn[idx].difference(&f.already_has).copied().collect();
+            needed.difference(&f.already_has).copied().collect();
         if added.is_empty() {
             continue;
         }
         added_by_fn.insert((f.file_idx, f.fn_start), added.iter().copied().collect());
         if !f.is_method {
-            if free_fn_idx.contains_key(&(f.summary_idx, f.name.as_str())) {
+            if matches!(free_fn_idx.get(&(f.summary_idx, f.name.as_str())), Some(Some(_))) {
                 added_by_free_name.insert((f.summary_idx, f.name.as_str()), added.iter().copied().collect());
             }
-            if f.is_pub && ws_pub_fn_idx.contains_key(&(f.crate_ident.as_str(), f.name.as_str())) {
+            if f.is_pub && matches!(ws_pub_fn_idx.get(&(f.crate_ident.as_str(), f.name.as_str())), Some(Some(_))) {
                 added_by_ws_pub_fn.insert((f.crate_ident.as_str(), f.name.as_str()), added);
             }
-        } else if method_idx.contains_key(&(f.summary_idx, f.name.as_str())) {
+        } else if matches!(method_idx.get(&(f.summary_idx, f.name.as_str())), Some(Some(_))) {
             added_by_method_name.insert((f.summary_idx, f.name.as_str()), added);
         }
     }
@@ -1687,7 +1681,7 @@ fn propagate_and_rewrite_workspace_capabilities(
     // 3. Emit signature edits + intra-crate & cross-crate call-site argument forwarding.
     let mut cross_crate_rewrites = 0usize;
 
-    for (file_idx, wf) in files.iter_mut().enumerate() {
+    for (file_idx, (wf, imports)) in files.iter_mut().zip(&file_imports).enumerate() {
         let summary_idx = &wf.summary_idx;
         let crate_ident = &wf.crate_ident;
         let path = &wf.path;
@@ -1695,7 +1689,6 @@ fn propagate_and_rewrite_workspace_capabilities(
         if path == "build.rs" || path.ends_with("/build.rs") {
             continue;
         }
-        let imports = &file_imports[file_idx];
         let parse = SourceFile::parse(src, Edition::CURRENT);
         let root = parse.tree();
         let mut edits: Vec<SpanEdit> = Vec::new();

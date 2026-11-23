@@ -71,7 +71,7 @@ re-exported as `bstd::algebra`), backed by two small compiler seams when lifting
      simplification, and `eval_const` inside `const` items today.
    - `emit_rust_fn` and multi-output `emit_rust_multi_fn` emit zero-allocation, CSE-shared SSA
      Rust functions (`pub fn f_and_grad(...) -> [f64; K]`) over `blaze_math`.
-7. **Proof-Carrying MIR Compiler Seam (`crates/blaze-algebra-body`)**:
+7. **Proof-Carrying MIR Compiler Seam (`crates/blaze-body-flow/src/algebra`)**:
    - `lift_body`: lifts verified pure acyclic `blaze_body::Verified<'_>` — including comparison
      `StmtKind::Switch` diamonds and nested `if/else` returns — into `ExprGraph<A>` (`Op::Select`),
      refusing cycles and impure calls with typed `BodyAlgebraError` naming `Block` and `Stmt`.
@@ -95,7 +95,7 @@ re-exported as `bstd::algebra`), backed by two small compiler seams when lifting
   `RewriteMode::IeeeExact` vs `FastMath`, `blaze_math::Interval` dead-branch pruning, `jvp`/`hvp`/
   `active_vars` sparsity vs full Hessian, custom `PatNode`/`RewriteRule`, symbolic linear system
   solving, and exact Newton-Raphson.
-- `blaze-algebra-body` (`8 passed, 0 failed`, 0 `.clone()` calls): end-to-end MIR → `diff_body` /
+- `blaze-body-flow::algebra` (`9 passed, 0 failed`, 0 `.clone()` calls): end-to-end MIR → `diff_body` /
   `grad_bodies` / `value_and_grad_body` / `hvp_body` / `simplify_body_with` → `blaze_body::verify`
   → `eval_pure_body` / `eval_pure_multi_body` verified against `eval_dual` and `hessian` across
   rational bodies, multi-block transcendental `Call` bodies, round-trip `Switch` diamond lifting +

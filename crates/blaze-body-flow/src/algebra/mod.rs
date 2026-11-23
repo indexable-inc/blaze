@@ -13,14 +13,6 @@
 //!   `Body` MIR compiler transforms (forward symbolic diff, O(|V|) reverse-mode symbolic gradient,
 //!   exact rational polynomial normalization, and bounded e-graph simplification).
 
-#![no_std]
-#![forbid(unsafe_code)]
-#![feature(register_tool, custom_inner_attributes)]
-#![register_tool(blaze)]
-#![blaze::sans_io]
-
-#[cfg(test)]
-extern crate std;
 
 use core::alloc::Allocator;
 use core::fmt;
@@ -219,6 +211,19 @@ fn bare_local(
     Ok(row.local)
 }
 
+fn set_local<T>(
+    env: &mut [Option<T>],
+    local: Local,
+    val: Option<T>,
+    block: Block,
+    stmt: Stmt,
+) -> Result<(), BodyAlgebraError> {
+    let slot =
+        env.get_mut(local.index()).ok_or(BodyAlgebraError::UnassignedLocal { block, stmt, local })?;
+    *slot = val;
+    Ok(())
+}
+
 fn lift_operand<A: Allocator + Copy>(
     body: Verified<'_>,
     block: Block,
@@ -236,7 +241,10 @@ fn lift_operand<A: Allocator + Copy>(
                 .ok_or(BodyAlgebraError::UnassignedLocal { block, stmt, local })
         }
         Operand::Const(c) => match body.konst(c).kind {
-            ConstKind::Scalar { bits } => Ok(g.lit(f64::from_bits(bits as u64))),
+            ConstKind::Scalar { bits } => match u64::try_from(bits) {
+                Ok(b) => Ok(g.lit(f64::from_bits(b))),
+                Err(_) => Err(BodyAlgebraError::UnsupportedConst { block, stmt }),
+            },
             _ => Err(BodyAlgebraError::UnsupportedConst { block, stmt }),
         },
     }
@@ -255,23 +263,31 @@ fn copy_env<A: Allocator + Copy>(
     out
 }
 
+fn new_bool_vec<A: Allocator + Copy>(len: usize, alloc: A) -> OwnVec<bool, A> {
+    let mut out = OwnVec::with_capacity_in(len, alloc);
+    for _ in 0..len {
+        out.push(false);
+    }
+    out
+}
+
 fn collect_reachable_blocks<A: Allocator + Copy>(
     body: Verified<'_>,
     start: Block,
     alloc: A,
 ) -> OwnVec<bool, A> {
-    let nb = body.blocks() as usize;
-    let mut seen = OwnVec::with_capacity_in(nb, alloc);
-    for _ in 0..nb {
-        seen.push(false);
-    }
+    let nb = usize::try_from(body.blocks()).unwrap_or(0);
+    let mut seen = new_bool_vec(nb, alloc);
     let mut stack = OwnVec::new_in(alloc);
     stack.push(start);
     while let Some(b) = stack.pop() {
-        if seen[b.index()] {
+        let Some(slot) = seen.get_mut(b.index()) else {
+            continue;
+        };
+        if *slot {
             continue;
         }
-        seen[b.index()] = true;
+        *slot = true;
         let term = body.terminator(b);
         match body.stmt(term).kind {
             StmtKind::Goto(next) => stack.push(next),
@@ -300,22 +316,21 @@ fn find_join_block<A: Allocator + Copy>(
         return Some(bb_then);
     }
     let reach_then = collect_reachable_blocks(body, bb_then, alloc);
-    let nb = body.blocks() as usize;
-    let mut visited = OwnVec::with_capacity_in(nb, alloc);
-    for _ in 0..nb {
-        visited.push(false);
-    }
+    let nb = usize::try_from(body.blocks()).unwrap_or(0);
+    let mut visited = new_bool_vec(nb, alloc);
     let mut queue = OwnVec::new_in(alloc);
     queue.push(bb_else);
     let mut head = 0usize;
-    while head < queue.len() {
-        let cur = queue[head];
+    while let Some(&cur) = queue.get(head) {
         head += 1;
-        if visited[cur.index()] {
+        let Some(vis_slot) = visited.get_mut(cur.index()) else {
+            continue;
+        };
+        if *vis_slot {
             continue;
         }
-        visited[cur.index()] = true;
-        if reach_then[cur.index()] {
+        *vis_slot = true;
+        if reach_then.get(cur.index()).copied().unwrap_or(false) {
             return Some(cur);
         }
         let term = body.terminator(cur);
@@ -339,226 +354,341 @@ enum RegionEnd {
     ReachedJoin,
 }
 
+struct RegionState<A: Allocator + Copy> {
+    cur: Block,
+    stop_at: Option<Block>,
+    env: OwnVec<Option<AlgExprId>, A>,
+    cmp_env: OwnVec<Option<AlgExprId>, A>,
+    visited: OwnVec<bool, A>,
+    steps: u32,
+    depth: u32,
+}
+
+enum SwitchStage<A: Allocator + Copy> {
+    Then {
+        bb_else: Block,
+        env_else: OwnVec<Option<AlgExprId>, A>,
+        cmp_else: OwnVec<Option<AlgExprId>, A>,
+    },
+    Else {
+        then_end: RegionEnd,
+        env_then: OwnVec<Option<AlgExprId>, A>,
+    },
+}
+
+struct SwitchFrame<A: Allocator + Copy> {
+    parent: RegionState<A>,
+    switch_block: Block,
+    switch_stmt: Stmt,
+    cond_expr: AlgExprId,
+    join: Option<Block>,
+    stage: SwitchStage<A>,
+}
+
 fn lift_region<A: Allocator + Copy, R: MathResolver>(
     body: Verified<'_>,
     math: &R,
     graph: &mut ExprGraph<A>,
     start: Block,
-    stop_at: Option<Block>,
-    env: &mut OwnVec<Option<AlgExprId>, A>,
-    cmp_env: &mut OwnVec<Option<AlgExprId>, A>,
-    depth: u32,
+    env: OwnVec<Option<AlgExprId>, A>,
+    cmp_env: OwnVec<Option<AlgExprId>, A>,
     alloc: A,
 ) -> Result<RegionEnd, BodyAlgebraError> {
     let max_blocks = body.blocks();
-    let mut visited: OwnVec<bool, A> = OwnVec::with_capacity_in(max_blocks as usize, alloc);
-    for _ in 0..max_blocks {
-        visited.push(false);
-    }
+    let max_blocks_usize = usize::try_from(max_blocks)
+        .map_err(|_| BodyAlgebraError::CycleOrStepLimit { block: start, steps: 0 })?;
 
-    let mut cur = start;
-    let mut steps = 0u32;
+    let mut active = RegionState {
+        cur: start,
+        stop_at: None,
+        env,
+        cmp_env,
+        visited: new_bool_vec(max_blocks_usize, alloc),
+        steps: 0,
+        depth: 0,
+    };
+    let mut frames: OwnVec<SwitchFrame<A>, A> = OwnVec::new_in(alloc);
+
     loop {
-        if stop_at == Some(cur) {
-            return Ok(RegionEnd::ReachedJoin);
-        }
-        if steps >= max_blocks || visited[cur.index()] {
-            return Err(BodyAlgebraError::CycleOrStepLimit { block: cur, steps });
-        }
-        visited[cur.index()] = true;
-        steps += 1;
+        let finished: Option<RegionEnd> = if active.stop_at == Some(active.cur) {
+            Some(RegionEnd::ReachedJoin)
+        } else {
+            let cur = active.cur;
+            let Some(vis_slot) = active.visited.get_mut(cur.index()) else {
+                return Err(BodyAlgebraError::CycleOrStepLimit { block: cur, steps: active.steps });
+            };
+            if active.steps >= max_blocks || *vis_slot {
+                return Err(BodyAlgebraError::CycleOrStepLimit { block: cur, steps: active.steps });
+            }
+            *vis_slot = true;
+            active.steps += 1;
 
-        let brow = body.block(cur);
-        for s_idx in brow.stmts.start..brow.stmts.end {
-            let stmt = Stmt(s_idx);
-            match body.stmt(stmt).kind {
-                StmtKind::StorageLive(_) | StmtKind::StorageDead(_) => {}
-                StmtKind::Assign { dest, value } => {
-                    let local = bare_local(body, cur, stmt, dest)?;
-                    match value {
-                        Value::Use(op) => {
-                            let expr = lift_operand(body, cur, stmt, op, env, graph)?;
-                            env[local.index()] = Some(expr);
-                            cmp_env[local.index()] = None;
-                        }
-                        Value::Unary { op: UnOp::Neg, operand } => {
-                            let a = lift_operand(body, cur, stmt, operand, env, graph)?;
-                            env[local.index()] = Some(graph.neg(a));
-                            cmp_env[local.index()] = None;
-                        }
-                        Value::Binary { op, lhs, rhs } => {
-                            let a = lift_operand(body, cur, stmt, lhs, env, graph)?;
-                            let b = lift_operand(body, cur, stmt, rhs, env, graph)?;
-                            match op {
-                                BinOp::Add => {
-                                    env[local.index()] = Some(graph.add(a, b));
-                                    cmp_env[local.index()] = None;
-                                }
-                                BinOp::Sub => {
-                                    env[local.index()] = Some(graph.sub(a, b));
-                                    cmp_env[local.index()] = None;
-                                }
-                                BinOp::Mul => {
-                                    env[local.index()] = Some(graph.mul(a, b));
-                                    cmp_env[local.index()] = None;
-                                }
-                                BinOp::Div => {
-                                    env[local.index()] = Some(graph.div(a, b));
-                                    cmp_env[local.index()] = None;
-                                }
-                                // Comparisons produce a signed condition expression (> 0 when true).
-                                BinOp::Gt | BinOp::Ge => {
-                                    cmp_env[local.index()] = Some(graph.sub(a, b));
-                                    env[local.index()] = None;
-                                }
-                                BinOp::Lt | BinOp::Le => {
-                                    cmp_env[local.index()] = Some(graph.sub(b, a));
-                                    env[local.index()] = None;
-                                }
-                                _ => return Err(BodyAlgebraError::UnsupportedValue { block: cur, stmt }),
+            let mut block_end = None;
+            let brow = body.block(cur);
+            for s_idx in brow.stmts.start..brow.stmts.end {
+                let stmt = Stmt(s_idx);
+                match body.stmt(stmt).kind {
+                    StmtKind::StorageLive(_) | StmtKind::StorageDead(_) => {}
+                    StmtKind::Assign { dest, value } => {
+                        let local = bare_local(body, cur, stmt, dest)?;
+                        match value {
+                            Value::Use(op) => {
+                                let expr = lift_operand(body, cur, stmt, op, &active.env, graph)?;
+                                set_local(&mut active.env, local, Some(expr), cur, stmt)?;
+                                set_local(&mut active.cmp_env, local, None, cur, stmt)?;
                             }
-                        }
-                        _ => return Err(BodyAlgebraError::UnsupportedValue { block: cur, stmt }),
-                    }
-                }
-                StmtKind::Goto(next) => {
-                    cur = next;
-                    break;
-                }
-                StmtKind::Switch { on, cases, otherwise } => {
-                    if depth >= MAX_SWITCH_DEPTH || cases.len() != 1 {
-                        return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt });
-                    }
-                    let Some((case_val, bb_then)) = body.cases(cases).next() else {
-                        return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt });
-                    };
-                    if case_val != 1 {
-                        return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt });
-                    }
-                    let cond_expr = match on {
-                        Operand::Copy(p) | Operand::Move(p) => {
-                            let loc = bare_local(body, cur, stmt, p)?;
-                            cmp_env
-                                .get(loc.index())
-                                .copied()
-                                .flatten()
-                                .ok_or(BodyAlgebraError::UnsupportedStmt { block: cur, stmt })?
-                        }
-                        _ => return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt }),
-                    };
-                    let mut env_then = copy_env(env, alloc);
-                    let mut cmp_then = copy_env(cmp_env, alloc);
-                    let mut env_else = copy_env(env, alloc);
-                    let mut cmp_else = copy_env(cmp_env, alloc);
-
-                    if let Some(bb_join) = find_join_block(body, bb_then, otherwise, alloc) {
-                        let r_then = lift_region(
-                            body,
-                            math,
-                            graph,
-                            bb_then,
-                            Some(bb_join),
-                            &mut env_then,
-                            &mut cmp_then,
-                            depth + 1,
-                            alloc,
-                        )?;
-                        let r_else = lift_region(
-                            body,
-                            math,
-                            graph,
-                            otherwise,
-                            Some(bb_join),
-                            &mut env_else,
-                            &mut cmp_else,
-                            depth + 1,
-                            alloc,
-                        )?;
-                        match (r_then, r_else) {
-                            (RegionEnd::ReachedJoin, RegionEnd::ReachedJoin) => {
-                                for i in 0..env.len() {
-                                    if env_then[i] != env_else[i] {
-                                        env[i] = match (env_then[i], env_else[i]) {
-                                            (Some(t), Some(e)) => Some(graph.select(cond_expr, t, e)),
-                                            (Some(t), None) => Some(t),
-                                            (None, Some(e)) => Some(e),
-                                            (None, None) => None,
-                                        };
+                            Value::Unary { op: UnOp::Neg, operand } => {
+                                let a = lift_operand(body, cur, stmt, operand, &active.env, graph)?;
+                                let expr = graph.neg(a);
+                                set_local(&mut active.env, local, Some(expr), cur, stmt)?;
+                                set_local(&mut active.cmp_env, local, None, cur, stmt)?;
+                            }
+                            Value::Binary { op, lhs, rhs } => {
+                                let a = lift_operand(body, cur, stmt, lhs, &active.env, graph)?;
+                                let b = lift_operand(body, cur, stmt, rhs, &active.env, graph)?;
+                                match op {
+                                    BinOp::Add => {
+                                        let expr = graph.add(a, b);
+                                        set_local(&mut active.env, local, Some(expr), cur, stmt)?;
+                                        set_local(&mut active.cmp_env, local, None, cur, stmt)?;
+                                    }
+                                    BinOp::Sub => {
+                                        let expr = graph.sub(a, b);
+                                        set_local(&mut active.env, local, Some(expr), cur, stmt)?;
+                                        set_local(&mut active.cmp_env, local, None, cur, stmt)?;
+                                    }
+                                    BinOp::Mul => {
+                                        let expr = graph.mul(a, b);
+                                        set_local(&mut active.env, local, Some(expr), cur, stmt)?;
+                                        set_local(&mut active.cmp_env, local, None, cur, stmt)?;
+                                    }
+                                    BinOp::Div => {
+                                        let expr = graph.div(a, b);
+                                        set_local(&mut active.env, local, Some(expr), cur, stmt)?;
+                                        set_local(&mut active.cmp_env, local, None, cur, stmt)?;
+                                    }
+                                    // Comparisons produce a signed condition expression (> 0 when true).
+                                    BinOp::Gt | BinOp::Ge => {
+                                        let cond = graph.sub(a, b);
+                                        set_local(
+                                            &mut active.cmp_env,
+                                            local,
+                                            Some(cond),
+                                            cur,
+                                            stmt,
+                                        )?;
+                                        set_local(&mut active.env, local, None, cur, stmt)?;
+                                    }
+                                    BinOp::Lt | BinOp::Le => {
+                                        let cond = graph.sub(b, a);
+                                        set_local(
+                                            &mut active.cmp_env,
+                                            local,
+                                            Some(cond),
+                                            cur,
+                                            stmt,
+                                        )?;
+                                        set_local(&mut active.env, local, None, cur, stmt)?;
+                                    }
+                                    _ => {
+                                        return Err(BodyAlgebraError::UnsupportedValue {
+                                            block: cur,
+                                            stmt,
+                                        });
                                     }
                                 }
-                                cur = bb_join;
-                                break;
                             }
-                            _ => return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt }),
-                        }
-                    } else {
-                        let r_then = lift_region(
-                            body,
-                            math,
-                            graph,
-                            bb_then,
-                            None,
-                            &mut env_then,
-                            &mut cmp_then,
-                            depth + 1,
-                            alloc,
-                        )?;
-                        let r_else = lift_region(
-                            body,
-                            math,
-                            graph,
-                            otherwise,
-                            None,
-                            &mut env_else,
-                            &mut cmp_else,
-                            depth + 1,
-                            alloc,
-                        )?;
-                        match (r_then, r_else) {
-                            (RegionEnd::Returned(t), RegionEnd::Returned(e)) => {
-                                return Ok(RegionEnd::Returned(graph.select(cond_expr, t, e)));
+                            _ => {
+                                return Err(BodyAlgebraError::UnsupportedValue { block: cur, stmt });
                             }
-                            _ => return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt }),
                         }
                     }
-                }
-                StmtKind::Call { callee, args, dest, target, .. } => {
-                    let Some(math_op) = math.classify(body.callee(callee)) else {
-                        return Err(BodyAlgebraError::UnsupportedCall { block: cur, stmt });
-                    };
-                    let (Some(dest_place), Some(next_block)) = (dest, target) else {
-                        return Err(BodyAlgebraError::UnsupportedCall { block: cur, stmt });
-                    };
-                    if args.len() as usize != math_op.arity() {
-                        return Err(BodyAlgebraError::UnsupportedCall { block: cur, stmt });
+                    StmtKind::Goto(next) => {
+                        active.cur = next;
+                        break;
                     }
-                    let mut lifted_args: [AlgExprId; 3] = [AlgExprId(0); 3];
-                    for (k, op) in body.ops(args).enumerate() {
-                        lifted_args[k] = lift_operand(body, cur, stmt, op, env, graph)?;
+                    StmtKind::Switch { on, cases, otherwise } => {
+                        if active.depth >= MAX_SWITCH_DEPTH || cases.len() != 1 {
+                            return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt });
+                        }
+                        let Some((case_val, bb_then)) = body.cases(cases).next() else {
+                            return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt });
+                        };
+                        if case_val != 1 {
+                            return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt });
+                        }
+                        let cond_expr = match on {
+                            Operand::Copy(p) | Operand::Move(p) => {
+                                let loc = bare_local(body, cur, stmt, p)?;
+                                active
+                                    .cmp_env
+                                    .get(loc.index())
+                                    .copied()
+                                    .flatten()
+                                    .ok_or(BodyAlgebraError::UnsupportedStmt { block: cur, stmt })?
+                            }
+                            _ => {
+                                return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt });
+                            }
+                        };
+                        let env_then = copy_env(&active.env, alloc);
+                        let cmp_then = copy_env(&active.cmp_env, alloc);
+                        let env_else = copy_env(&active.env, alloc);
+                        let cmp_else = copy_env(&active.cmp_env, alloc);
+                        let join = find_join_block(body, bb_then, otherwise, alloc);
+
+                        let then_state = RegionState {
+                            cur: bb_then,
+                            stop_at: join,
+                            env: env_then,
+                            cmp_env: cmp_then,
+                            visited: new_bool_vec(max_blocks_usize, alloc),
+                            steps: 0,
+                            depth: active.depth + 1,
+                        };
+                        let parent = core::mem::replace(&mut active, then_state);
+                        frames.push(SwitchFrame {
+                            parent,
+                            switch_block: cur,
+                            switch_stmt: stmt,
+                            cond_expr,
+                            join,
+                            stage: SwitchStage::Then { bb_else: otherwise, env_else, cmp_else },
+                        });
+                        break;
                     }
-                    let res_expr = match math_op {
-                        MathOp::Sin => graph.sin(lifted_args[0]),
-                        MathOp::Cos => graph.cos(lifted_args[0]),
-                        MathOp::Tan => graph.tan(lifted_args[0]),
-                        MathOp::Exp => graph.exp(lifted_args[0]),
-                        MathOp::Ln => graph.ln(lifted_args[0]),
-                        MathOp::Sqrt => graph.sqrt(lifted_args[0]),
-                        MathOp::Tanh => graph.tanh(lifted_args[0]),
-                        MathOp::Abs => graph.abs(lifted_args[0]),
-                        MathOp::Pow => graph.pow(lifted_args[0], lifted_args[1]),
-                        MathOp::Fma => graph.fma(lifted_args[0], lifted_args[1], lifted_args[2]),
-                    };
-                    let local = bare_local(body, cur, stmt, dest_place)?;
-                    env[local.index()] = Some(res_expr);
-                    cmp_env[local.index()] = None;
-                    cur = next_block;
-                    break;
+                    StmtKind::Call { callee, args, dest, target, .. } => {
+                        let Some(math_op) = math.classify(body.callee(callee)) else {
+                            return Err(BodyAlgebraError::UnsupportedCall { block: cur, stmt });
+                        };
+                        let (Some(dest_place), Some(next_block)) = (dest, target) else {
+                            return Err(BodyAlgebraError::UnsupportedCall { block: cur, stmt });
+                        };
+                        if usize::try_from(args.len()) != Ok(math_op.arity()) {
+                            return Err(BodyAlgebraError::UnsupportedCall { block: cur, stmt });
+                        }
+                        let mut lifted_args: [AlgExprId; 3] = [AlgExprId(0); 3];
+                        for (slot, op) in lifted_args.iter_mut().zip(body.ops(args)) {
+                            *slot = lift_operand(body, cur, stmt, op, &active.env, graph)?;
+                        }
+                        let [a0, a1, a2] = lifted_args;
+                        let res_expr = match math_op {
+                            MathOp::Sin => graph.sin(a0),
+                            MathOp::Cos => graph.cos(a0),
+                            MathOp::Tan => graph.tan(a0),
+                            MathOp::Exp => graph.exp(a0),
+                            MathOp::Ln => graph.ln(a0),
+                            MathOp::Sqrt => graph.sqrt(a0),
+                            MathOp::Tanh => graph.tanh(a0),
+                            MathOp::Abs => graph.abs(a0),
+                            MathOp::Pow => graph.pow(a0, a1),
+                            MathOp::Fma => graph.fma(a0, a1, a2),
+                        };
+                        let local = bare_local(body, cur, stmt, dest_place)?;
+                        set_local(&mut active.env, local, Some(res_expr), cur, stmt)?;
+                        set_local(&mut active.cmp_env, local, None, cur, stmt)?;
+                        active.cur = next_block;
+                        break;
+                    }
+                    StmtKind::Return => {
+                        let result = active
+                            .env
+                            .first()
+                            .copied()
+                            .flatten()
+                            .ok_or(BodyAlgebraError::MissingReturnValue { block: cur })?;
+                        block_end = Some(RegionEnd::Returned(result));
+                        break;
+                    }
+                    _ => return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt }),
                 }
-                StmtKind::Return => {
-                    let result = env[0].ok_or(BodyAlgebraError::MissingReturnValue { block: cur })?;
-                    return Ok(RegionEnd::Returned(result));
+            }
+            block_end
+        };
+
+        if let Some(mut finished_end) = finished {
+            let mut finished_env = active.env;
+            loop {
+                let Some(frame) = frames.pop() else {
+                    return Ok(finished_end);
+                };
+                match frame.stage {
+                    SwitchStage::Then { bb_else, env_else, cmp_else } => {
+                        let child_depth = frame.parent.depth + 1;
+                        let else_state = RegionState {
+                            cur: bb_else,
+                            stop_at: frame.join,
+                            env: env_else,
+                            cmp_env: cmp_else,
+                            visited: new_bool_vec(max_blocks_usize, alloc),
+                            steps: 0,
+                            depth: child_depth,
+                        };
+                        frames.push(SwitchFrame {
+                            parent: frame.parent,
+                            switch_block: frame.switch_block,
+                            switch_stmt: frame.switch_stmt,
+                            cond_expr: frame.cond_expr,
+                            join: frame.join,
+                            stage: SwitchStage::Else {
+                                then_end: finished_end,
+                                env_then: finished_env,
+                            },
+                        });
+                        active = else_state;
+                        break;
+                    }
+                    SwitchStage::Else { then_end, env_then } => {
+                        let env_else = finished_env;
+                        let else_end = finished_end;
+                        if let Some(bb_join) = frame.join {
+                            match (then_end, else_end) {
+                                (RegionEnd::ReachedJoin, RegionEnd::ReachedJoin) => {
+                                    let mut parent = frame.parent;
+                                    for (dst, (&t_val, &e_val)) in parent
+                                        .env
+                                        .iter_mut()
+                                        .zip(env_then.iter().zip(env_else.iter()))
+                                    {
+                                        if t_val != e_val {
+                                            *dst = match (t_val, e_val) {
+                                                (Some(t), Some(e)) => {
+                                                    Some(graph.select(frame.cond_expr, t, e))
+                                                }
+                                                (Some(t), None) => Some(t),
+                                                (None, Some(e)) => Some(e),
+                                                (None, None) => None,
+                                            };
+                                        }
+                                    }
+                                    parent.cur = bb_join;
+                                    active = parent;
+                                    break;
+                                }
+                                _ => {
+                                    return Err(BodyAlgebraError::UnsupportedStmt {
+                                        block: frame.switch_block,
+                                        stmt: frame.switch_stmt,
+                                    });
+                                }
+                            }
+                        } else {
+                            match (then_end, else_end) {
+                                (RegionEnd::Returned(t), RegionEnd::Returned(e)) => {
+                                    finished_end =
+                                        RegionEnd::Returned(graph.select(frame.cond_expr, t, e));
+                                    finished_env = frame.parent.env;
+                                }
+                                _ => {
+                                    return Err(BodyAlgebraError::UnsupportedStmt {
+                                        block: frame.switch_block,
+                                        stmt: frame.switch_stmt,
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
-                _ => return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt }),
             }
         }
     }
@@ -572,15 +702,17 @@ pub fn lift_body<A: Allocator + Copy, R: MathResolver>(
     math: &R,
     alloc: A,
 ) -> Result<LiftedBody<A>, BodyAlgebraError> {
-    let nlocals = body.locals() as usize;
+    let nlocals = usize::try_from(body.locals()).unwrap_or(0);
     if nlocals == 0 {
         return Err(BodyAlgebraError::MissingReturnLocal);
     }
     let f64_ty = body.local(Local(0)).ty;
     let nargs = body.args();
+    let nargs_usize = usize::try_from(nargs)
+        .map_err(|_| BodyAlgebraError::ArgOutOfRange { arg: 0, args: nargs })?;
 
     let mut graph = ExprGraph::new_in(alloc);
-    let mut vars: OwnVec<VarId, A> = OwnVec::with_capacity_in(nargs as usize, alloc);
+    let mut vars: OwnVec<VarId, A> = OwnVec::with_capacity_in(nargs_usize, alloc);
     let mut env: OwnVec<Option<AlgExprId>, A> = OwnVec::with_capacity_in(nlocals, alloc);
     let mut cmp_env: OwnVec<Option<AlgExprId>, A> = OwnVec::with_capacity_in(nlocals, alloc);
     for _ in 0..nlocals {
@@ -591,8 +723,9 @@ pub fn lift_body<A: Allocator + Copy, R: MathResolver>(
     // Bind argument locals `Local(1..=args)` as symbolic variables.
     const ARG_NAMES: [&str; 8] = ["x", "y", "z", "w", "a", "b", "c", "d"];
     for i in 0..nargs {
-        let name = ARG_NAMES.get(i as usize).copied().unwrap_or("v");
-        let (vid, eid) = if (i as usize) < ARG_NAMES.len() {
+        let (vid, eid) = if let Some(name) =
+            usize::try_from(i).ok().and_then(|idx| ARG_NAMES.get(idx)).copied()
+        {
             graph.var(name)
         } else {
             let mut buf = blaze_own::String::new_in(alloc);
@@ -600,10 +733,15 @@ pub fn lift_body<A: Allocator + Copy, R: MathResolver>(
             graph.var(buf.as_str())
         };
         vars.push(vid);
-        env[(i + 1) as usize] = Some(eid);
+        let slot = usize::try_from(i)
+            .ok()
+            .and_then(|idx| idx.checked_add(1))
+            .and_then(|idx| env.get_mut(idx))
+            .ok_or(BodyAlgebraError::ArgOutOfRange { arg: i, args: nargs })?;
+        *slot = Some(eid);
     }
 
-    match lift_region(body, math, &mut graph, Block(0), None, &mut env, &mut cmp_env, 0, alloc)? {
+    match lift_region(body, math, &mut graph, Block(0), env, cmp_env, alloc)? {
         RegionEnd::Returned(result) => Ok(LiftedBody { graph, vars, result, f64_ty }),
         RegionEnd::ReachedJoin => Err(BodyAlgebraError::MissingReturnValue { block: Block(0) }),
     }
@@ -611,37 +749,53 @@ pub fn lift_body<A: Allocator + Copy, R: MathResolver>(
 
 fn collect_postorder<A: Allocator + Copy>(
     g: &ExprGraph<A>,
-    id: AlgExprId,
+    root: AlgExprId,
     visited: &mut OwnVec<bool, A>,
     order: &mut OwnVec<AlgExprId, A>,
+    alloc: A,
 ) -> Result<(), AlgebraError> {
-    let idx = id.0 as usize;
-    if visited[idx] {
-        return Ok(());
-    }
-    visited[idx] = true;
-    match g.node(id)? {
-        Op::Const(_) | Op::Var(_) => {}
-        Op::Neg(a)
-        | Op::Sin(a)
-        | Op::Cos(a)
-        | Op::Tan(a)
-        | Op::Exp(a)
-        | Op::Ln(a)
-        | Op::Sqrt(a)
-        | Op::Tanh(a)
-        | Op::Abs(a) => collect_postorder(g, a, visited, order)?,
-        Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) | Op::Pow(a, b) => {
-            collect_postorder(g, a, visited, order)?;
-            collect_postorder(g, b, visited, order)?;
+    let n = g.len();
+    let mut stack: OwnVec<(AlgExprId, bool), A> = OwnVec::new_in(alloc);
+    stack.push((root, false));
+    while let Some((id, expanded)) = stack.pop() {
+        if expanded {
+            order.push(id);
+            continue;
         }
-        Op::Select(c, t, e) | Op::Fma(c, t, e) => {
-            collect_postorder(g, c, visited, order)?;
-            collect_postorder(g, t, visited, order)?;
-            collect_postorder(g, e, visited, order)?;
+        let idx = usize::try_from(id.0)
+            .map_err(|_| AlgebraError::InvalidExpr { expr: id, node_count: n })?;
+        let slot = visited
+            .get_mut(idx)
+            .ok_or(AlgebraError::InvalidExpr { expr: id, node_count: n })?;
+        if *slot {
+            continue;
+        }
+        *slot = true;
+        stack.push((id, true));
+        match g.node(id)? {
+            Op::Const(_) | Op::Var(_) => {}
+            Op::Neg(a)
+            | Op::Sin(a)
+            | Op::Cos(a)
+            | Op::Tan(a)
+            | Op::Exp(a)
+            | Op::Ln(a)
+            | Op::Sqrt(a)
+            | Op::Tanh(a)
+            | Op::Abs(a) => {
+                stack.push((a, false));
+            }
+            Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) | Op::Pow(a, b) => {
+                stack.push((b, false));
+                stack.push((a, false));
+            }
+            Op::Select(c, t, e) | Op::Fma(c, t, e) => {
+                stack.push((e, false));
+                stack.push((t, false));
+                stack.push((c, false));
+            }
         }
     }
-    order.push(id);
     Ok(())
 }
 
@@ -675,6 +829,31 @@ pub fn splice_multi_body<A: Allocator + Copy, E: MathEmitter>(
     splice_body_impl(g, roots, vars, f64_ty, Some(array_ty), math, alloc)
 }
 
+fn get_node_op(
+    node_ops: &[Option<Operand>],
+    id: AlgExprId,
+    node_count: usize,
+) -> Result<Operand, BodyAlgebraError> {
+    usize::try_from(id.0)
+        .ok()
+        .and_then(|idx| node_ops.get(idx).copied().flatten())
+        .ok_or(BodyAlgebraError::Algebra(AlgebraError::InvalidExpr { expr: id, node_count }))
+}
+
+fn set_node_op(
+    node_ops: &mut [Option<Operand>],
+    id: AlgExprId,
+    op: Operand,
+    node_count: usize,
+) -> Result<(), BodyAlgebraError> {
+    let slot = usize::try_from(id.0)
+        .ok()
+        .and_then(|idx| node_ops.get_mut(idx))
+        .ok_or(BodyAlgebraError::Algebra(AlgebraError::InvalidExpr { expr: id, node_count }))?;
+    *slot = Some(op);
+    Ok(())
+}
+
 fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
     g: &ExprGraph<A>,
     roots: &[AlgExprId],
@@ -686,7 +865,13 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
 ) -> Result<Body<A>, BodyAlgebraError> {
     let n = g.len();
     for &root in roots {
-        if (root.0 as usize) >= n {
+        let Ok(r_idx) = usize::try_from(root.0) else {
+            return Err(BodyAlgebraError::Algebra(AlgebraError::InvalidExpr {
+                expr: root,
+                node_count: n,
+            }));
+        };
+        if r_idx >= n {
             return Err(BodyAlgebraError::Algebra(AlgebraError::InvalidExpr {
                 expr: root,
                 node_count: n,
@@ -694,13 +879,10 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
         }
     }
 
-    let mut visited: OwnVec<bool, A> = OwnVec::with_capacity_in(n, alloc);
-    for _ in 0..n {
-        visited.push(false);
-    }
+    let mut visited = new_bool_vec(n, alloc);
     let mut order: OwnVec<AlgExprId, A> = OwnVec::new_in(alloc);
     for &root in roots {
-        collect_postorder(g, root, &mut visited, &mut order)?;
+        collect_postorder(g, root, &mut visited, &mut order, alloc)?;
     }
 
     let mut b = BodyBuilder::new_in(alloc);
@@ -710,9 +892,11 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
 
     let mut var_places: OwnVec<Place, A> = OwnVec::with_capacity_in(vars.len(), alloc);
     for (idx, _) in vars.iter().enumerate() {
+        let arg_idx = u32::try_from(idx)
+            .map_err(|_| BodyAlgebraError::ArgOutOfRange { arg: u32::MAX, args: u32::MAX })?;
         let l = b.new_local(LocalDecl {
             ty: f64_ty,
-            kind: LocalKind::Arg(idx as u32),
+            kind: LocalKind::Arg(arg_idx),
             mutbl: Mutbl::Not,
         });
         var_places.push(b.local_place(l));
@@ -740,10 +924,10 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
     };
 
     let emit_math_call = |b: &mut BodyBuilder<A>,
-                              op: MathOp,
-                              call_args: &[Operand],
-                              dest: Place,
-                              cur_block: &mut Block|
+                          op: MathOp,
+                          call_args: &[Operand],
+                          dest: Place,
+                          cur_block: &mut Block|
      -> Result<(), BodyAlgebraError> {
         let callee = math.callee_for(op).ok_or(BodyAlgebraError::MissingMathCallee { op })?;
         let cid = b.callee(callee);
@@ -776,7 +960,7 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
                     ty: f64_ty,
                 });
                 let operand = Operand::Const(c);
-                node_ops[id.0 as usize] = Some(operand);
+                set_node_op(&mut node_ops, id, operand, n)?;
                 if is_single_root {
                     b.assign(ret_place, Value::Use(operand), span);
                 }
@@ -789,38 +973,59 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
                         var: vid,
                         env_len: vars.len(),
                     }))?;
-                let operand = Operand::Copy(var_places[pos]);
-                node_ops[id.0 as usize] = Some(operand);
+                let &place = var_places.get(pos).ok_or(BodyAlgebraError::Algebra(
+                    AlgebraError::UnknownVar { var: vid, env_len: vars.len() },
+                ))?;
+                let operand = Operand::Copy(place);
+                set_node_op(&mut node_ops, id, operand, n)?;
                 if is_single_root {
                     b.assign(ret_place, Value::Use(operand), span);
                 }
             }
             Op::Neg(a) => {
-                let oa = node_ops[a.0 as usize].expect("postorder visited child");
+                let oa = get_node_op(&node_ops, a, n)?;
                 let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Not) };
                 b.assign(dest, Value::Unary { op: UnOp::Neg, operand: oa }, span);
-                node_ops[id.0 as usize] = Some(Operand::Copy(dest));
+                set_node_op(&mut node_ops, id, Operand::Copy(dest), n)?;
             }
             Op::Add(a, b_id) | Op::Sub(a, b_id) | Op::Mul(a, b_id) | Op::Div(a, b_id) => {
-                let oa = node_ops[a.0 as usize].expect("postorder visited lhs");
-                let ob = node_ops[b_id.0 as usize].expect("postorder visited rhs");
+                let oa = get_node_op(&node_ops, a, n)?;
+                let ob = get_node_op(&node_ops, b_id, n)?;
                 let bin = match op {
                     Op::Add(_, _) => BinOp::Add,
                     Op::Sub(_, _) => BinOp::Sub,
                     Op::Mul(_, _) => BinOp::Mul,
                     Op::Div(_, _) => BinOp::Div,
-                    _ => unreachable!(),
+                    Op::Const(_)
+                    | Op::Var(_)
+                    | Op::Neg(_)
+                    | Op::Pow(_, _)
+                    | Op::Sin(_)
+                    | Op::Cos(_)
+                    | Op::Tan(_)
+                    | Op::Exp(_)
+                    | Op::Ln(_)
+                    | Op::Sqrt(_)
+                    | Op::Tanh(_)
+                    | Op::Abs(_)
+                    | Op::Select(_, _, _)
+                    | Op::Fma(_, _, _) => {
+                        return Err(BodyAlgebraError::Algebra(AlgebraError::InvalidExpr {
+                            expr: id,
+                            node_count: n,
+                        }));
+                    }
                 };
                 let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Not) };
                 b.assign(dest, Value::Binary { op: bin, lhs: oa, rhs: ob }, span);
-                node_ops[id.0 as usize] = Some(Operand::Copy(dest));
+                set_node_op(&mut node_ops, id, Operand::Copy(dest), n)?;
             }
             Op::Pow(a, b_id) => {
-                let oa = node_ops[a.0 as usize].expect("postorder visited base");
-                let ob = node_ops[b_id.0 as usize].expect("postorder visited exp");
+                let oa = get_node_op(&node_ops, a, n)?;
+                let ob = get_node_op(&node_ops, b_id, n)?;
                 let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Not) };
                 emit_math_call(&mut b, MathOp::Pow, &[oa, ob], dest, &mut cur_block)?;
-                node_ops[id.0 as usize] = Some(Operand::Copy(dest));
+                set_node_op(&mut node_ops, id, Operand::Copy(dest), n)?;
             }
             Op::Sin(a)
             | Op::Cos(a)
@@ -830,7 +1035,7 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
             | Op::Sqrt(a)
             | Op::Tanh(a)
             | Op::Abs(a) => {
-                let oa = node_ops[a.0 as usize].expect("postorder visited arg");
+                let oa = get_node_op(&node_ops, a, n)?;
                 let mop = match op {
                     Op::Sin(_) => MathOp::Sin,
                     Op::Cos(_) => MathOp::Cos,
@@ -840,16 +1045,30 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
                     Op::Sqrt(_) => MathOp::Sqrt,
                     Op::Tanh(_) => MathOp::Tanh,
                     Op::Abs(_) => MathOp::Abs,
-                    _ => unreachable!(),
+                    Op::Const(_)
+                    | Op::Var(_)
+                    | Op::Neg(_)
+                    | Op::Add(_, _)
+                    | Op::Sub(_, _)
+                    | Op::Mul(_, _)
+                    | Op::Div(_, _)
+                    | Op::Pow(_, _)
+                    | Op::Select(_, _, _)
+                    | Op::Fma(_, _, _) => {
+                        return Err(BodyAlgebraError::Algebra(AlgebraError::InvalidExpr {
+                            expr: id,
+                            node_count: n,
+                        }));
+                    }
                 };
                 let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Not) };
                 emit_math_call(&mut b, mop, &[oa], dest, &mut cur_block)?;
-                node_ops[id.0 as usize] = Some(Operand::Copy(dest));
+                set_node_op(&mut node_ops, id, Operand::Copy(dest), n)?;
             }
             Op::Select(c_id, t_id, e_id) => {
-                let oc = node_ops[c_id.0 as usize].expect("postorder visited cond");
-                let ot = node_ops[t_id.0 as usize].expect("postorder visited then");
-                let oe = node_ops[e_id.0 as usize].expect("postorder visited else");
+                let oc = get_node_op(&node_ops, c_id, n)?;
+                let ot = get_node_op(&node_ops, t_id, n)?;
+                let oe = get_node_op(&node_ops, e_id, n)?;
                 let zero_c = b.new_const(ConstDecl {
                     kind: ConstKind::Scalar { bits: u128::from(0.0_f64.to_bits()) },
                     ty: f64_ty,
@@ -877,15 +1096,15 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
                 b.terminate(StmtKind::Goto(bb_join), span);
                 b.start(bb_join);
                 cur_block = bb_join;
-                node_ops[id.0 as usize] = Some(Operand::Copy(dest));
+                set_node_op(&mut node_ops, id, Operand::Copy(dest), n)?;
             }
             Op::Fma(a, b_id, c_id) => {
-                let oa = node_ops[a.0 as usize].expect("postorder visited fma a");
-                let ob = node_ops[b_id.0 as usize].expect("postorder visited fma b");
-                let oc = node_ops[c_id.0 as usize].expect("postorder visited fma c");
+                let oa = get_node_op(&node_ops, a, n)?;
+                let ob = get_node_op(&node_ops, b_id, n)?;
+                let oc = get_node_op(&node_ops, c_id, n)?;
                 let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Not) };
                 emit_math_call(&mut b, MathOp::Fma, &[oa, ob, oc], dest, &mut cur_block)?;
-                node_ops[id.0 as usize] = Some(Operand::Copy(dest));
+                set_node_op(&mut node_ops, id, Operand::Copy(dest), n)?;
             }
         }
     }
@@ -893,7 +1112,7 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
     if let Some(arr_ty) = array_ty {
         let mut elem_ops: OwnVec<Operand, A> = OwnVec::with_capacity_in(roots.len(), alloc);
         for &r in roots {
-            elem_ops.push(node_ops[r.0 as usize].expect("postorder visited root"));
+            elem_ops.push(get_node_op(&node_ops, r, n)?);
         }
         let ops = b.operands(elem_ops.as_slice());
         b.assign(
@@ -936,7 +1155,10 @@ pub fn diff_body_with_plant<A: Allocator + Copy, R: MathResolver, E: MathEmitter
         return Err(BodyAlgebraError::ArgOutOfRange { arg: arg_index, args: nargs });
     }
     let mut lifted = lift_body(body, resolve, alloc)?;
-    let wrt = lifted.vars[arg_index as usize];
+    let wrt = usize::try_from(arg_index)
+        .ok()
+        .and_then(|idx| lifted.vars.get(idx).copied())
+        .ok_or(BodyAlgebraError::ArgOutOfRange { arg: arg_index, args: nargs })?;
     let target = if plant == BodyPlant::SpliceOriginalInsteadOfDeriv {
         lifted.result
     } else {
@@ -1091,15 +1313,17 @@ fn eval_pure_impl<A: Allocator + Copy, R: MathResolver>(
     math: &R,
     alloc: A,
 ) -> Result<MirVal<A>, BodyAlgebraError> {
-    let nlocals = body.locals() as usize;
+    let nlocals = usize::try_from(body.locals()).unwrap_or(0);
     if nlocals == 0 {
         return Err(BodyAlgebraError::MissingReturnLocal);
     }
-    let nargs = body.args() as usize;
+    let nargs_u32 = body.args();
+    let nargs = usize::try_from(nargs_u32)
+        .map_err(|_| BodyAlgebraError::ArgOutOfRange { arg: 0, args: nargs_u32 })?;
     if args_in.len() < nargs {
         return Err(BodyAlgebraError::ArgOutOfRange {
-            arg: args_in.len() as u32,
-            args: nargs as u32,
+            arg: u32::try_from(args_in.len()).unwrap_or(u32::MAX),
+            args: nargs_u32,
         });
     }
 
@@ -1107,8 +1331,8 @@ fn eval_pure_impl<A: Allocator + Copy, R: MathResolver>(
     for _ in 0..nlocals {
         env.push(None);
     }
-    for (i, &v) in args_in.iter().take(nargs).enumerate() {
-        env[i + 1] = Some(MirVal::Scalar(v));
+    for (slot, &v) in env.iter_mut().skip(1).zip(args_in.iter().take(nargs)) {
+        *slot = Some(MirVal::Scalar(v));
     }
 
     let read_f64 = |block: Block,
@@ -1126,7 +1350,10 @@ fn eval_pure_impl<A: Allocator + Copy, R: MathResolver>(
                 }
             }
             Operand::Const(c) => match body.konst(c).kind {
-                ConstKind::Scalar { bits } => Ok(f64::from_bits(bits as u64)),
+                ConstKind::Scalar { bits } => match u64::try_from(bits) {
+                    Ok(b) => Ok(f64::from_bits(b)),
+                    Err(_) => Err(BodyAlgebraError::UnsupportedConst { block, stmt }),
+                },
                 _ => Err(BodyAlgebraError::UnsupportedConst { block, stmt }),
             },
         }
@@ -1154,18 +1381,20 @@ fn eval_pure_impl<A: Allocator + Copy, R: MathResolver>(
     };
 
     let max_blocks = body.blocks();
-    let mut visited: OwnVec<bool, A> = OwnVec::with_capacity_in(max_blocks as usize, alloc);
-    for _ in 0..max_blocks {
-        visited.push(false);
-    }
+    let max_blocks_usize = usize::try_from(max_blocks)
+        .map_err(|_| BodyAlgebraError::CycleOrStepLimit { block: Block(0), steps: 0 })?;
+    let mut visited = new_bool_vec(max_blocks_usize, alloc);
 
     let mut cur = Block(0);
     let mut steps = 0u32;
     loop {
-        if steps >= max_blocks || visited[cur.index()] {
+        let Some(vis_slot) = visited.get_mut(cur.index()) else {
+            return Err(BodyAlgebraError::CycleOrStepLimit { block: cur, steps });
+        };
+        if steps >= max_blocks || *vis_slot {
             return Err(BodyAlgebraError::CycleOrStepLimit { block: cur, steps });
         }
-        visited[cur.index()] = true;
+        *vis_slot = true;
         steps += 1;
 
         let brow = body.block(cur);
@@ -1203,7 +1432,9 @@ fn eval_pure_impl<A: Allocator + Copy, R: MathResolver>(
                             }
                         }
                         Value::Aggregate { kind: AggregateKind::Array, operands, .. } => {
-                            let mut elems = OwnVec::with_capacity_in(operands.len() as usize, alloc);
+                            let cap = usize::try_from(operands.len())
+                                .map_err(|_| BodyAlgebraError::UnsupportedValue { block: cur, stmt })?;
+                            let mut elems = OwnVec::with_capacity_in(cap, alloc);
                             for op in body.ops(operands) {
                                 elems.push(read_f64(cur, stmt, op, &env)?);
                             }
@@ -1211,7 +1442,7 @@ fn eval_pure_impl<A: Allocator + Copy, R: MathResolver>(
                         }
                         _ => return Err(BodyAlgebraError::UnsupportedValue { block: cur, stmt }),
                     };
-                    env[local.index()] = Some(val);
+                    set_local(&mut env, local, Some(val), cur, stmt)?;
                 }
                 StmtKind::Goto(next) => {
                     cur = next;
@@ -1236,32 +1467,36 @@ fn eval_pure_impl<A: Allocator + Copy, R: MathResolver>(
                     let (Some(dest_place), Some(next_block)) = (dest, target) else {
                         return Err(BodyAlgebraError::UnsupportedCall { block: cur, stmt });
                     };
-                    if args.len() as usize != math_op.arity() {
+                    if usize::try_from(args.len()) != Ok(math_op.arity()) {
                         return Err(BodyAlgebraError::UnsupportedCall { block: cur, stmt });
                     }
                     let mut vals = [0.0_f64; 3];
-                    for (k, op) in body.ops(args).enumerate() {
-                        vals[k] = read_f64(cur, stmt, op, &env)?;
+                    for (slot, op) in vals.iter_mut().zip(body.ops(args)) {
+                        *slot = read_f64(cur, stmt, op, &env)?;
                     }
+                    let [v0, v1, v2] = vals;
                     let res = match math_op {
-                        MathOp::Sin => blaze_math::sin(vals[0]),
-                        MathOp::Cos => blaze_math::cos(vals[0]),
-                        MathOp::Tan => blaze_math::tan(vals[0]),
-                        MathOp::Exp => blaze_math::exp(vals[0]),
-                        MathOp::Ln => blaze_math::ln(vals[0]),
-                        MathOp::Sqrt => blaze_math::sqrt(vals[0]),
-                        MathOp::Tanh => det_tanh(vals[0]),
-                        MathOp::Abs => blaze_math::abs(vals[0]),
-                        MathOp::Pow => blaze_math::pow(vals[0], vals[1]),
-                        MathOp::Fma => blaze_math::mul_add(vals[0], vals[1], vals[2]),
+                        MathOp::Sin => blaze_math::sin(v0),
+                        MathOp::Cos => blaze_math::cos(v0),
+                        MathOp::Tan => blaze_math::tan(v0),
+                        MathOp::Exp => blaze_math::exp(v0),
+                        MathOp::Ln => blaze_math::ln(v0),
+                        MathOp::Sqrt => blaze_math::sqrt(v0),
+                        MathOp::Tanh => det_tanh(v0),
+                        MathOp::Abs => blaze_math::abs(v0),
+                        MathOp::Pow => blaze_math::pow(v0, v1),
+                        MathOp::Fma => blaze_math::mul_add(v0, v1, v2),
                     };
                     let local = bare_local(body, cur, stmt, dest_place)?;
-                    env[local.index()] = Some(MirVal::Scalar(res));
+                    set_local(&mut env, local, Some(MirVal::Scalar(res)), cur, stmt)?;
                     cur = next_block;
                     break;
                 }
                 StmtKind::Return => {
-                    return env[0].take().ok_or(BodyAlgebraError::MissingReturnValue { block: cur });
+                    return env
+                        .first_mut()
+                        .and_then(Option::take)
+                        .ok_or(BodyAlgebraError::MissingReturnValue { block: cur });
                 }
                 _ => return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt }),
             }

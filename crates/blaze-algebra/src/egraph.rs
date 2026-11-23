@@ -10,7 +10,10 @@ use core::alloc::Allocator;
 use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_own::Vec as OwnVec;
 
-use crate::{AlgebraError, ExprGraph, ExprId, Op, VarId, canonical_f64_bits, det_tanh};
+use crate::{
+    AlgebraError, ExprGraph, ExprId, Op, VarId, canonical_f64_bits, det_tanh, u32_to_usize,
+    usize_to_u32,
+};
 
 /// E-class identifier inside an [`EGraph`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -172,9 +175,32 @@ impl<A: Allocator + Copy> EGraph<A> {
         }
     }
 
+    #[inline]
+    fn class_nodes(&self, id: EClassId) -> &[ENode] {
+        self.classes.get(u32_to_usize(id.0)).map(OwnVec::as_slice).unwrap_or(&[])
+    }
+
+    #[inline]
+    fn class_len(&self, id: EClassId) -> usize {
+        self.class_nodes(id).len()
+    }
+
+    #[inline]
+    fn class_node(&self, id: EClassId, idx: usize) -> Option<ENode> {
+        self.class_nodes(id).get(idx).copied()
+    }
+
+    #[inline]
+    fn is_canonical_cid(&self, cid: usize) -> bool {
+        self.parent.get(cid).copied() == Some(usize_to_u32(cid))
+    }
+
     pub fn find(&self, mut id: EClassId) -> EClassId {
-        while self.parent[id.0 as usize] != id.0 {
-            id = EClassId(self.parent[id.0 as usize]);
+        while let Some(&p) = self.parent.get(u32_to_usize(id.0)) {
+            if p == id.0 {
+                break;
+            }
+            id = EClassId(p);
         }
         id
     }
@@ -182,10 +208,14 @@ impl<A: Allocator + Copy> EGraph<A> {
     fn find_mut(&mut self, id: EClassId) -> EClassId {
         let root = self.find(id);
         let mut cur = id;
-        while self.parent[cur.0 as usize] != root.0 {
-            let next = EClassId(self.parent[cur.0 as usize]);
-            self.parent[cur.0 as usize] = root.0;
-            cur = next;
+        while let Some(&p) = self.parent.get(u32_to_usize(cur.0)) {
+            if p == root.0 {
+                break;
+            }
+            if let Some(slot) = self.parent.get_mut(u32_to_usize(cur.0)) {
+                *slot = root.0;
+            }
+            cur = EClassId(p);
         }
         root
     }
@@ -223,7 +253,7 @@ impl<A: Allocator + Copy> EGraph<A> {
         if let Some(existing) = self.lookup(canon) {
             return existing;
         }
-        let cid = EClassId(self.parent.len() as u32);
+        let cid = EClassId(usize_to_u32(self.parent.len()));
         self.parent.push(cid.0);
         let mut list = OwnVec::new_in(self.alloc);
         list.push(canon);
@@ -245,18 +275,31 @@ impl<A: Allocator + Copy> EGraph<A> {
             return false;
         }
         let (keep, merge) = if ra.0 < rb.0 { (ra, rb) } else { (rb, ra) };
-        self.parent[merge.0 as usize] = keep.0;
-        if self.const_val[keep.0 as usize].is_none() {
-            self.const_val[keep.0 as usize] = self.const_val[merge.0 as usize];
+        let keep_idx = u32_to_usize(keep.0);
+        let merge_idx = u32_to_usize(merge.0);
+        if let Some(slot) = self.parent.get_mut(merge_idx) {
+            *slot = keep.0;
         }
-        let moved_len = self.classes[merge.0 as usize].len();
+        let merge_const = self.const_val.get(merge_idx).copied().flatten();
+        if let Some(keep_c) = self.const_val.get_mut(keep_idx)
+            && keep_c.is_none()
+        {
+            *keep_c = merge_const;
+        }
+        let moved_len = self.class_len(merge);
         for i in 0..moved_len {
-            let n = self.classes[merge.0 as usize][i];
-            if !self.classes[keep.0 as usize].iter().any(|&e| e == n) {
-                self.classes[keep.0 as usize].push(n);
+            let Some(n) = self.class_node(merge, i) else {
+                break;
+            };
+            if let Some(keep_list) = self.classes.get_mut(keep_idx)
+                && !keep_list.iter().any(|&e| e == n)
+            {
+                keep_list.push(n);
             }
         }
-        self.classes[merge.0 as usize].clear();
+        if let Some(merge_list) = self.classes.get_mut(merge_idx) {
+            merge_list.clear();
+        }
         true
     }
 
@@ -273,14 +316,17 @@ impl<A: Allocator + Copy> EGraph<A> {
             let mut merges: OwnVec<(EClassId, EClassId), A> = OwnVec::new_in(self.alloc);
 
             for cid in 0..nclasses {
-                if self.parent[cid] != cid as u32 {
+                if !self.is_canonical_cid(cid) {
                     continue;
                 }
-                let root = EClassId(cid as u32);
+                let root = EClassId(usize_to_u32(cid));
                 let mut dedup = OwnVec::new_in(self.alloc);
-                let len = self.classes[cid].len();
+                let len = self.class_len(root);
                 for i in 0..len {
-                    let c = self.canonicalize(self.classes[cid][i]);
+                    let Some(raw) = self.class_node(root, i) else {
+                        break;
+                    };
+                    let c = self.canonicalize(raw);
                     if let Some(&prev) = self.hashcons.get(&c) {
                         let prev_root = self.find(prev);
                         if prev_root != root {
@@ -294,7 +340,9 @@ impl<A: Allocator + Copy> EGraph<A> {
                         dedup.push(c);
                     }
                 }
-                self.classes[cid] = dedup;
+                if let Some(slot) = self.classes.get_mut(cid) {
+                    *slot = dedup;
+                }
             }
             for &(a, b) in merges.iter() {
                 if self.union(a, b) {
@@ -305,13 +353,12 @@ impl<A: Allocator + Copy> EGraph<A> {
     }
 
     fn is_const(&self, id: EClassId, val: f64) -> bool {
-        let r = self.find(id);
-        self.const_val[r.0 as usize] == Some(val)
+        self.const_of(id) == Some(val)
     }
 
     fn const_of(&self, id: EClassId) -> Option<f64> {
         let r = self.find(id);
-        self.const_val[r.0 as usize]
+        self.const_val.get(u32_to_usize(r.0)).copied().flatten()
     }
 
     /// Run one equality-saturation rewrite pass over all live e-classes.
@@ -325,16 +372,18 @@ impl<A: Allocator + Copy> EGraph<A> {
             if self.total_enodes >= max_enodes {
                 break;
             }
-            if self.parent[cid] != cid as u32 {
+            if !self.is_canonical_cid(cid) {
                 continue;
             }
-            let me = EClassId(cid as u32);
-            let nlen = self.classes[cid].len();
+            let me = EClassId(usize_to_u32(cid));
+            let nlen = self.class_len(me);
             for i in 0..nlen {
                 if self.total_enodes >= max_enodes {
                     break;
                 }
-                let node = self.classes[cid][i];
+                let Some(node) = self.class_node(me, i) else {
+                    break;
+                };
                 match node {
                     ENode::Neg(a) => {
                         if let Some(ca) = self.const_of(a) {
@@ -343,9 +392,9 @@ impl<A: Allocator + Copy> EGraph<A> {
                         }
                         // -(-x) = x (IEEE-754 bit-exact)
                         let ra = self.find(a);
-                        let alen = self.classes[ra.0 as usize].len();
+                        let alen = self.class_len(ra);
                         for j in 0..alen {
-                            if let ENode::Neg(x) = self.classes[ra.0 as usize][j] {
+                            if let Some(ENode::Neg(x)) = self.class_node(ra, j) {
                                 pending_unions.push((me, x));
                             }
                         }
@@ -376,9 +425,9 @@ impl<A: Allocator + Copy> EGraph<A> {
                             }
                             // x + (-x) = 0
                             let rb = self.find(b);
-                            let blen = self.classes[rb.0 as usize].len();
+                            let blen = self.class_len(rb);
                             for j in 0..blen {
-                                if let ENode::Neg(x) = self.classes[rb.0 as usize][j] {
+                                if let Some(ENode::Neg(x)) = self.class_node(rb, j) {
                                     if self.find(x) == self.find(a) {
                                         let z = self.add_const(0.0);
                                         pending_unions.push((me, z));
@@ -389,9 +438,11 @@ impl<A: Allocator + Copy> EGraph<A> {
                             // FMA fusion: (x * y) + b = fma(x, y, b)
                             // Pythagorean trig identity: sin(u)^2 + cos(u)^2 = 1
                             let ra = self.find(a);
-                            let alen = self.classes[ra.0 as usize].len();
+                            let alen = self.class_len(ra);
                             for ai in 0..alen {
-                                let an = self.classes[ra.0 as usize][ai];
+                                let Some(an) = self.class_node(ra, ai) else {
+                                    break;
+                                };
                                 if fuse_fma
                                     && let ENode::Mul(x, y) = an
                                 {
@@ -399,7 +450,9 @@ impl<A: Allocator + Copy> EGraph<A> {
                                     pending_unions.push((me, f));
                                 }
                                 for bi in 0..blen {
-                                    let bn = self.classes[rb.0 as usize][bi];
+                                    let Some(bn) = self.class_node(rb, bi) else {
+                                        break;
+                                    };
                                     match (an, bn) {
                                         (ENode::Mul(k1, x), ENode::Mul(k2, y))
                                             if self.find(k1) == self.find(k2) =>
@@ -430,7 +483,7 @@ impl<A: Allocator + Copy> EGraph<A> {
                             }
                             // Associativity: (x + y) + z = x + (y + z)
                             for ai in 0..alen {
-                                if let ENode::Add(x, y) = self.classes[ra.0 as usize][ai] {
+                                if let Some(ENode::Add(x, y)) = self.class_node(ra, ai) {
                                     let yz = self.add(ENode::Add(y, b));
                                     let assoc = self.add(ENode::Add(x, yz));
                                     pending_unions.push((me, assoc));
@@ -459,17 +512,17 @@ impl<A: Allocator + Copy> EGraph<A> {
                             // FMA fusion: (x * y) - b = fma(x, y, -b)
                             let ra = self.find(a);
                             let rb = self.find(b);
-                            let alen = self.classes[ra.0 as usize].len();
-                            let blen = self.classes[rb.0 as usize].len();
+                            let alen = self.class_len(ra);
+                            let blen = self.class_len(rb);
                             for ai in 0..alen {
-                                if let ENode::Mul(k1, x) = self.classes[ra.0 as usize][ai] {
+                                if let Some(ENode::Mul(k1, x)) = self.class_node(ra, ai) {
                                     if fuse_fma {
                                         let nb = self.add(ENode::Neg(b));
                                         let f = self.add(ENode::Fma(k1, x, nb));
                                         pending_unions.push((me, f));
                                     }
                                     for bi in 0..blen {
-                                        if let ENode::Mul(k2, y) = self.classes[rb.0 as usize][bi] {
+                                        if let Some(ENode::Mul(k2, y)) = self.class_node(rb, bi) {
                                             if self.find(k1) == self.find(k2) {
                                                 let diff_xy = self.add(ENode::Sub(x, y));
                                                 let fac = self.add(ENode::Mul(k1, diff_xy));
@@ -504,17 +557,17 @@ impl<A: Allocator + Copy> EGraph<A> {
                             // sqrt(x) * sqrt(x) = x
                             let ra = self.find(a);
                             if ra == self.find(b) {
-                                let alen = self.classes[ra.0 as usize].len();
+                                let alen = self.class_len(ra);
                                 for ai in 0..alen {
-                                    if let ENode::Sqrt(x) = self.classes[ra.0 as usize][ai] {
+                                    if let Some(ENode::Sqrt(x)) = self.class_node(ra, ai) {
                                         pending_unions.push((me, x));
                                     }
                                 }
                             }
                             // Associativity: (x * y) * z = x * (y * z)
-                            let alen = self.classes[ra.0 as usize].len();
+                            let alen = self.class_len(ra);
                             for ai in 0..alen {
-                                if let ENode::Mul(x, y) = self.classes[ra.0 as usize][ai] {
+                                if let Some(ENode::Mul(x, y)) = self.class_node(ra, ai) {
                                     let yz = self.add(ENode::Mul(y, b));
                                     let assoc = self.add(ENode::Mul(x, yz));
                                     pending_unions.push((me, assoc));
@@ -544,9 +597,9 @@ impl<A: Allocator + Copy> EGraph<A> {
                             // (x * y) / y = x
                             let ra = self.find(a);
                             let rb = self.find(b);
-                            let alen = self.classes[ra.0 as usize].len();
+                            let alen = self.class_len(ra);
                             for ai in 0..alen {
-                                if let ENode::Mul(x, y) = self.classes[ra.0 as usize][ai] {
+                                if let Some(ENode::Mul(x, y)) = self.class_node(ra, ai) {
                                     if self.find(y) == rb {
                                         pending_unions.push((me, x));
                                     } else if self.find(x) == rb {
@@ -583,9 +636,9 @@ impl<A: Allocator + Copy> EGraph<A> {
                         if fast {
                             // ln(exp(x)) = x
                             let ra = self.find(a);
-                            let alen = self.classes[ra.0 as usize].len();
+                            let alen = self.class_len(ra);
                             for ai in 0..alen {
-                                if let ENode::Exp(x) = self.classes[ra.0 as usize][ai] {
+                                if let Some(ENode::Exp(x)) = self.class_node(ra, ai) {
                                     pending_unions.push((me, x));
                                 }
                             }
@@ -599,9 +652,9 @@ impl<A: Allocator + Copy> EGraph<A> {
                         if fast {
                             // exp(ln(x)) = x
                             let ra = self.find(a);
-                            let alen = self.classes[ra.0 as usize].len();
+                            let alen = self.class_len(ra);
                             for ai in 0..alen {
-                                if let ENode::Ln(x) = self.classes[ra.0 as usize][ai] {
+                                if let Some(ENode::Ln(x)) = self.class_node(ra, ai) {
                                     pending_unions.push((me, x));
                                 }
                             }
@@ -680,8 +733,8 @@ impl<A: Allocator + Copy> EGraph<A> {
     fn is_sin_cos_pair(&self, p1: EClassId, p2: EClassId) -> bool {
         let r1 = self.find(p1);
         let r2 = self.find(p2);
-        for &n1 in self.classes[r1.0 as usize].iter() {
-            for &n2 in self.classes[r2.0 as usize].iter() {
+        for &n1 in self.class_nodes(r1).iter() {
+            for &n2 in self.class_nodes(r2).iter() {
                 match (n1, n2) {
                     (ENode::Sin(u), ENode::Cos(v)) | (ENode::Cos(u), ENode::Sin(v))
                         if self.find(u) == self.find(v) =>
@@ -698,22 +751,27 @@ impl<A: Allocator + Copy> EGraph<A> {
     /// Compute minimum tree-cost e-node for every live e-class via Bellman-Ford relaxation.
     fn compute_best(&self, model: CostModel) -> (OwnVec<u32, A>, OwnVec<Option<ENode>, A>) {
         let n = self.classes.len();
+        let inf = u32::MAX / 4;
         let mut costs: OwnVec<u32, A> = OwnVec::with_capacity_in(n, self.alloc);
         let mut best: OwnVec<Option<ENode>, A> = OwnVec::with_capacity_in(n, self.alloc);
         for _ in 0..n {
-            costs.push(u32::MAX / 4);
+            costs.push(inf);
             best.push(None);
         }
+        let cost_of = |costs: &[u32], id: EClassId| -> u32 {
+            costs.get(u32_to_usize(self.find(id).0)).copied().unwrap_or(inf)
+        };
         let mut changed = true;
         let mut guard = 0usize;
         while changed && guard < 64 {
             changed = false;
             guard += 1;
             for cid in 0..n {
-                if self.parent[cid] != cid as u32 {
+                if !self.is_canonical_cid(cid) {
                     continue;
                 }
-                for &node in self.classes[cid].iter() {
+                let class_slice = self.classes.get(cid).map(OwnVec::as_slice).unwrap_or(&[]);
+                for &node in class_slice.iter() {
                     let c = node.op_cost(model).saturating_add(match node {
                         ENode::Const(_) | ENode::Var(_) => 0,
                         ENode::Neg(a)
@@ -724,20 +782,24 @@ impl<A: Allocator + Copy> EGraph<A> {
                         | ENode::Ln(a)
                         | ENode::Sqrt(a)
                         | ENode::Tanh(a)
-                        | ENode::Abs(a) => costs[self.find(a).0 as usize],
+                        | ENode::Abs(a) => cost_of(costs.as_slice(), a),
                         ENode::Add(a, b)
                         | ENode::Sub(a, b)
                         | ENode::Mul(a, b)
                         | ENode::Div(a, b)
-                        | ENode::Pow(a, b) => costs[self.find(a).0 as usize]
-                            .saturating_add(costs[self.find(b).0 as usize]),
-                        ENode::Select(c, t, e) | ENode::Fma(c, t, e) => costs[self.find(c).0 as usize]
-                            .saturating_add(costs[self.find(t).0 as usize])
-                            .saturating_add(costs[self.find(e).0 as usize]),
+                        | ENode::Pow(a, b) => cost_of(costs.as_slice(), a)
+                            .saturating_add(cost_of(costs.as_slice(), b)),
+                        ENode::Select(c, t, e) | ENode::Fma(c, t, e) => cost_of(costs.as_slice(), c)
+                            .saturating_add(cost_of(costs.as_slice(), t))
+                            .saturating_add(cost_of(costs.as_slice(), e)),
                     });
-                    if c < costs[cid] {
-                        costs[cid] = c;
-                        best[cid] = Some(node);
+                    if costs.get(cid).copied().unwrap_or(inf) > c {
+                        if let Some(slot) = costs.get_mut(cid) {
+                            *slot = c;
+                        }
+                        if let Some(slot) = best.get_mut(cid) {
+                            *slot = Some(node);
+                        }
                         changed = true;
                     }
                 }
@@ -764,14 +826,21 @@ impl<A: Allocator + Copy> EGraph<A> {
         depth: usize,
     ) -> ExprId {
         let r = self.find(id);
-        let idx = r.0 as usize;
-        if let Some(hit) = memo[idx] {
+        let idx = u32_to_usize(r.0);
+        if let Some(hit) = memo.get(idx).copied().flatten() {
             return hit;
         }
         if depth > 128 {
             return g.lit(0.0);
         }
-        let node = best[idx].unwrap_or_else(|| self.classes[idx][0]);
+        let Some(node) = best
+            .get(idx)
+            .copied()
+            .flatten()
+            .or_else(|| self.class_node(r, 0))
+        else {
+            return g.lit(0.0);
+        };
         let eid = match node {
             ENode::Const(b) => g.intern(Op::Const(b)),
             ENode::Var(v) => g.intern(Op::Var(v)),
@@ -849,7 +918,9 @@ impl<A: Allocator + Copy> EGraph<A> {
                 g.fma(ea, eb, ec)
             }
         };
-        memo[idx] = Some(eid);
+        if let Some(slot) = memo.get_mut(idx) {
+            *slot = Some(eid);
+        }
         eid
     }
 }
@@ -866,160 +937,210 @@ pub fn expr_cost_with<A: Allocator + Copy>(
     model: CostModel,
 ) -> Result<u32, AlgebraError> {
     let n = g.len();
-    if (root.0 as usize) >= n {
+    if u32_to_usize(root.0) >= n {
         return Err(AlgebraError::InvalidExpr { expr: root, node_count: n });
     }
     let mut memo: OwnVec<Option<u32>, A> = OwnVec::with_capacity_in(n, g.alloc());
     for _ in 0..n {
         memo.push(None);
     }
-    expr_cost_memo(g, root, model, &mut memo)
-}
-
-fn expr_cost_memo<A: Allocator + Copy>(
-    g: &ExprGraph<A>,
-    id: ExprId,
-    model: CostModel,
-    memo: &mut OwnVec<Option<u32>, A>,
-) -> Result<u32, AlgebraError> {
-    let idx = id.0 as usize;
-    if let Some(hit) = memo[idx] {
-        return Ok(hit);
-    }
-    let op = g.node(id)?;
     let dummy = EClassId(0);
-    let base = match op {
-        Op::Const(_) => ENode::Const(0).op_cost(model),
-        Op::Var(v) => ENode::Var(v).op_cost(model),
-        Op::Neg(_) => ENode::Neg(dummy).op_cost(model),
-        Op::Add(_, _) => ENode::Add(dummy, dummy).op_cost(model),
-        Op::Sub(_, _) => ENode::Sub(dummy, dummy).op_cost(model),
-        Op::Mul(_, _) => ENode::Mul(dummy, dummy).op_cost(model),
-        Op::Div(_, _) => ENode::Div(dummy, dummy).op_cost(model),
-        Op::Pow(_, _) => ENode::Pow(dummy, dummy).op_cost(model),
-        Op::Sin(_) => ENode::Sin(dummy).op_cost(model),
-        Op::Cos(_) => ENode::Cos(dummy).op_cost(model),
-        Op::Tan(_) => ENode::Tan(dummy).op_cost(model),
-        Op::Exp(_) => ENode::Exp(dummy).op_cost(model),
-        Op::Ln(_) => ENode::Ln(dummy).op_cost(model),
-        Op::Sqrt(_) => ENode::Sqrt(dummy).op_cost(model),
-        Op::Tanh(_) => ENode::Tanh(dummy).op_cost(model),
-        Op::Abs(_) => ENode::Abs(dummy).op_cost(model),
-        Op::Select(_, _, _) => ENode::Select(dummy, dummy, dummy).op_cost(model),
-        Op::Fma(_, _, _) => ENode::Fma(dummy, dummy, dummy).op_cost(model),
+    let get_c = |memo: &[Option<u32>], e: ExprId| -> u32 {
+        memo.get(u32_to_usize(e.0)).copied().flatten().unwrap_or(0)
     };
-    let c = match op {
-        Op::Const(_) | Op::Var(_) => base,
-        Op::Neg(a)
-        | Op::Sin(a)
-        | Op::Cos(a)
-        | Op::Tan(a)
-        | Op::Exp(a)
-        | Op::Ln(a)
-        | Op::Sqrt(a)
-        | Op::Tanh(a)
-        | Op::Abs(a) => base.saturating_add(expr_cost_memo(g, a, model, memo)?),
-        Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) | Op::Pow(a, b) => base
-            .saturating_add(expr_cost_memo(g, a, model, memo)?)
-            .saturating_add(expr_cost_memo(g, b, model, memo)?),
-        Op::Select(c, t, e) | Op::Fma(c, t, e) => base
-            .saturating_add(expr_cost_memo(g, c, model, memo)?)
-            .saturating_add(expr_cost_memo(g, t, model, memo)?)
-            .saturating_add(expr_cost_memo(g, e, model, memo)?),
-    };
-    memo[idx] = Some(c);
-    Ok(c)
+    let mut stack: OwnVec<(ExprId, bool), A> = OwnVec::new_in(g.alloc());
+    stack.push((root, false));
+    while let Some((id, ready)) = stack.pop() {
+        let idx = u32_to_usize(id.0);
+        if memo.get(idx).copied().flatten().is_some() {
+            continue;
+        }
+        let op = g.node(id)?;
+        if !ready {
+            match op {
+                Op::Const(_) | Op::Var(_) => {}
+                Op::Neg(a)
+                | Op::Sin(a)
+                | Op::Cos(a)
+                | Op::Tan(a)
+                | Op::Exp(a)
+                | Op::Ln(a)
+                | Op::Sqrt(a)
+                | Op::Tanh(a)
+                | Op::Abs(a) => {
+                    stack.push((id, true));
+                    stack.push((a, false));
+                    continue;
+                }
+                Op::Add(a, b)
+                | Op::Sub(a, b)
+                | Op::Mul(a, b)
+                | Op::Div(a, b)
+                | Op::Pow(a, b) => {
+                    stack.push((id, true));
+                    stack.push((b, false));
+                    stack.push((a, false));
+                    continue;
+                }
+                Op::Select(c, t, e) | Op::Fma(c, t, e) => {
+                    stack.push((id, true));
+                    stack.push((e, false));
+                    stack.push((t, false));
+                    stack.push((c, false));
+                    continue;
+                }
+            }
+        }
+        let base = match op {
+            Op::Const(_) => ENode::Const(0).op_cost(model),
+            Op::Var(v) => ENode::Var(v).op_cost(model),
+            Op::Neg(_) => ENode::Neg(dummy).op_cost(model),
+            Op::Add(_, _) => ENode::Add(dummy, dummy).op_cost(model),
+            Op::Sub(_, _) => ENode::Sub(dummy, dummy).op_cost(model),
+            Op::Mul(_, _) => ENode::Mul(dummy, dummy).op_cost(model),
+            Op::Div(_, _) => ENode::Div(dummy, dummy).op_cost(model),
+            Op::Pow(_, _) => ENode::Pow(dummy, dummy).op_cost(model),
+            Op::Sin(_) => ENode::Sin(dummy).op_cost(model),
+            Op::Cos(_) => ENode::Cos(dummy).op_cost(model),
+            Op::Tan(_) => ENode::Tan(dummy).op_cost(model),
+            Op::Exp(_) => ENode::Exp(dummy).op_cost(model),
+            Op::Ln(_) => ENode::Ln(dummy).op_cost(model),
+            Op::Sqrt(_) => ENode::Sqrt(dummy).op_cost(model),
+            Op::Tanh(_) => ENode::Tanh(dummy).op_cost(model),
+            Op::Abs(_) => ENode::Abs(dummy).op_cost(model),
+            Op::Select(_, _, _) => ENode::Select(dummy, dummy, dummy).op_cost(model),
+            Op::Fma(_, _, _) => ENode::Fma(dummy, dummy, dummy).op_cost(model),
+        };
+        let c = match op {
+            Op::Const(_) | Op::Var(_) => base,
+            Op::Neg(a)
+            | Op::Sin(a)
+            | Op::Cos(a)
+            | Op::Tan(a)
+            | Op::Exp(a)
+            | Op::Ln(a)
+            | Op::Sqrt(a)
+            | Op::Tanh(a)
+            | Op::Abs(a) => base.saturating_add(get_c(memo.as_slice(), a)),
+            Op::Add(a, b)
+            | Op::Sub(a, b)
+            | Op::Mul(a, b)
+            | Op::Div(a, b)
+            | Op::Pow(a, b) => base
+                .saturating_add(get_c(memo.as_slice(), a))
+                .saturating_add(get_c(memo.as_slice(), b)),
+            Op::Select(c, t, e) | Op::Fma(c, t, e) => base
+                .saturating_add(get_c(memo.as_slice(), c))
+                .saturating_add(get_c(memo.as_slice(), t))
+                .saturating_add(get_c(memo.as_slice(), e)),
+        };
+        if let Some(slot) = memo.get_mut(idx) {
+            *slot = Some(c);
+        }
+    }
+    Ok(get_c(memo.as_slice(), root))
 }
 
 fn insert_expr<A: Allocator + Copy>(
     g: &ExprGraph<A>,
-    id: ExprId,
+    root: ExprId,
     eg: &mut EGraph<A>,
     memo: &mut OwnVec<Option<EClassId>, A>,
 ) -> Result<EClassId, AlgebraError> {
-    let idx = id.0 as usize;
-    if let Some(hit) = memo[idx] {
-        return Ok(hit);
-    }
-    let cid = match g.node(id)? {
-        Op::Const(b) => eg.add(ENode::Const(b)),
-        Op::Var(v) => eg.add(ENode::Var(v)),
-        Op::Neg(a) => {
-            let ca = insert_expr(g, a, eg, memo)?;
-            eg.add(ENode::Neg(ca))
-        }
-        Op::Add(a, b) => {
-            let ca = insert_expr(g, a, eg, memo)?;
-            let cb = insert_expr(g, b, eg, memo)?;
-            eg.add(ENode::Add(ca, cb))
-        }
-        Op::Sub(a, b) => {
-            let ca = insert_expr(g, a, eg, memo)?;
-            let cb = insert_expr(g, b, eg, memo)?;
-            eg.add(ENode::Sub(ca, cb))
-        }
-        Op::Mul(a, b) => {
-            let ca = insert_expr(g, a, eg, memo)?;
-            let cb = insert_expr(g, b, eg, memo)?;
-            eg.add(ENode::Mul(ca, cb))
-        }
-        Op::Div(a, b) => {
-            let ca = insert_expr(g, a, eg, memo)?;
-            let cb = insert_expr(g, b, eg, memo)?;
-            eg.add(ENode::Div(ca, cb))
-        }
-        Op::Pow(a, b) => {
-            let ca = insert_expr(g, a, eg, memo)?;
-            let cb = insert_expr(g, b, eg, memo)?;
-            eg.add(ENode::Pow(ca, cb))
-        }
-        Op::Sin(a) => {
-            let ca = insert_expr(g, a, eg, memo)?;
-            eg.add(ENode::Sin(ca))
-        }
-        Op::Cos(a) => {
-            let ca = insert_expr(g, a, eg, memo)?;
-            eg.add(ENode::Cos(ca))
-        }
-        Op::Tan(a) => {
-            let ca = insert_expr(g, a, eg, memo)?;
-            eg.add(ENode::Tan(ca))
-        }
-        Op::Exp(a) => {
-            let ca = insert_expr(g, a, eg, memo)?;
-            eg.add(ENode::Exp(ca))
-        }
-        Op::Ln(a) => {
-            let ca = insert_expr(g, a, eg, memo)?;
-            eg.add(ENode::Ln(ca))
-        }
-        Op::Sqrt(a) => {
-            let ca = insert_expr(g, a, eg, memo)?;
-            eg.add(ENode::Sqrt(ca))
-        }
-        Op::Tanh(a) => {
-            let ca = insert_expr(g, a, eg, memo)?;
-            eg.add(ENode::Tanh(ca))
-        }
-        Op::Abs(a) => {
-            let ca = insert_expr(g, a, eg, memo)?;
-            eg.add(ENode::Abs(ca))
-        }
-        Op::Select(c, t, e) => {
-            let cc = insert_expr(g, c, eg, memo)?;
-            let ct = insert_expr(g, t, eg, memo)?;
-            let ce = insert_expr(g, e, eg, memo)?;
-            eg.add(ENode::Select(cc, ct, ce))
-        }
-        Op::Fma(a, b, c) => {
-            let ca = insert_expr(g, a, eg, memo)?;
-            let cb = insert_expr(g, b, eg, memo)?;
-            let cc = insert_expr(g, c, eg, memo)?;
-            eg.add(ENode::Fma(ca, cb, cc))
-        }
+    let get_cid = |memo: &[Option<EClassId>], e: ExprId| -> EClassId {
+        memo.get(u32_to_usize(e.0)).copied().flatten().unwrap_or(EClassId(0))
     };
-    memo[idx] = Some(cid);
-    Ok(cid)
+    let mut stack: OwnVec<(ExprId, bool), A> = OwnVec::new_in(g.alloc());
+    stack.push((root, false));
+    while let Some((id, ready)) = stack.pop() {
+        let idx = u32_to_usize(id.0);
+        if memo.get(idx).copied().flatten().is_some() {
+            continue;
+        }
+        let op = g.node(id)?;
+        if !ready {
+            match op {
+                Op::Const(_) | Op::Var(_) => {}
+                Op::Neg(a)
+                | Op::Sin(a)
+                | Op::Cos(a)
+                | Op::Tan(a)
+                | Op::Exp(a)
+                | Op::Ln(a)
+                | Op::Sqrt(a)
+                | Op::Tanh(a)
+                | Op::Abs(a) => {
+                    stack.push((id, true));
+                    stack.push((a, false));
+                    continue;
+                }
+                Op::Add(a, b)
+                | Op::Sub(a, b)
+                | Op::Mul(a, b)
+                | Op::Div(a, b)
+                | Op::Pow(a, b) => {
+                    stack.push((id, true));
+                    stack.push((b, false));
+                    stack.push((a, false));
+                    continue;
+                }
+                Op::Select(c, t, e) | Op::Fma(c, t, e) => {
+                    stack.push((id, true));
+                    stack.push((e, false));
+                    stack.push((t, false));
+                    stack.push((c, false));
+                    continue;
+                }
+            }
+        }
+        let cid = match op {
+            Op::Const(b) => eg.add(ENode::Const(b)),
+            Op::Var(v) => eg.add(ENode::Var(v)),
+            Op::Neg(a) => eg.add(ENode::Neg(get_cid(memo.as_slice(), a))),
+            Op::Add(a, b) => eg.add(ENode::Add(
+                get_cid(memo.as_slice(), a),
+                get_cid(memo.as_slice(), b),
+            )),
+            Op::Sub(a, b) => eg.add(ENode::Sub(
+                get_cid(memo.as_slice(), a),
+                get_cid(memo.as_slice(), b),
+            )),
+            Op::Mul(a, b) => eg.add(ENode::Mul(
+                get_cid(memo.as_slice(), a),
+                get_cid(memo.as_slice(), b),
+            )),
+            Op::Div(a, b) => eg.add(ENode::Div(
+                get_cid(memo.as_slice(), a),
+                get_cid(memo.as_slice(), b),
+            )),
+            Op::Pow(a, b) => eg.add(ENode::Pow(
+                get_cid(memo.as_slice(), a),
+                get_cid(memo.as_slice(), b),
+            )),
+            Op::Sin(a) => eg.add(ENode::Sin(get_cid(memo.as_slice(), a))),
+            Op::Cos(a) => eg.add(ENode::Cos(get_cid(memo.as_slice(), a))),
+            Op::Tan(a) => eg.add(ENode::Tan(get_cid(memo.as_slice(), a))),
+            Op::Exp(a) => eg.add(ENode::Exp(get_cid(memo.as_slice(), a))),
+            Op::Ln(a) => eg.add(ENode::Ln(get_cid(memo.as_slice(), a))),
+            Op::Sqrt(a) => eg.add(ENode::Sqrt(get_cid(memo.as_slice(), a))),
+            Op::Tanh(a) => eg.add(ENode::Tanh(get_cid(memo.as_slice(), a))),
+            Op::Abs(a) => eg.add(ENode::Abs(get_cid(memo.as_slice(), a))),
+            Op::Select(c, t, e) => eg.add(ENode::Select(
+                get_cid(memo.as_slice(), c),
+                get_cid(memo.as_slice(), t),
+                get_cid(memo.as_slice(), e),
+            )),
+            Op::Fma(a, b, c) => eg.add(ENode::Fma(
+                get_cid(memo.as_slice(), a),
+                get_cid(memo.as_slice(), b),
+                get_cid(memo.as_slice(), c),
+            )),
+        };
+        if let Some(slot) = memo.get_mut(idx) {
+            *slot = Some(cid);
+        }
+    }
+    Ok(get_cid(memo.as_slice(), root))
 }
 
 /// One node in a flat, `const`-constructible declarative e-graph pattern (`PatNode`).
@@ -1082,18 +1203,23 @@ impl<A: Allocator + Copy> EGraph<A> {
             return;
         }
         let cid = self.find(class_id);
-        match pat[pat_idx] {
+        let Some(&pnode) = pat.get(pat_idx) else {
+            return;
+        };
+        match pnode {
             PatNode::Var(v) => {
-                let vi = v as usize;
-                if vi >= MAX_PAT_VARS {
+                let vi = usize::from(v);
+                let Some(&bound) = subst.get(vi) else {
                     return;
-                }
-                match subst[vi] {
+                };
+                match bound {
                     Some(prev) if self.find(prev) == cid => out.push(subst),
                     Some(_) => {}
                     None => {
                         let mut next = subst;
-                        next[vi] = Some(cid);
+                        if let Some(slot) = next.get_mut(vi) {
+                            *slot = Some(cid);
+                        }
                         out.push(next);
                     }
                 }
@@ -1105,7 +1231,7 @@ impl<A: Allocator + Copy> EGraph<A> {
                 }
             }
             node_pat => {
-                for &enode in self.classes[cid.0 as usize].iter() {
+                for &enode in self.class_nodes(cid).iter() {
                     if out.len() >= MAX_MATCHES_PER_CLASS {
                         break;
                     }
@@ -1139,73 +1265,84 @@ impl<A: Allocator + Copy> EGraph<A> {
         }
     }
 
-    fn instantiate_pat(&mut self, pat: &[PatNode], idx: usize, subst: &Subst) -> Option<EClassId> {
-        let cid = match pat[idx] {
-            PatNode::Var(v) => subst.get(v as usize).copied().flatten()?,
-            PatNode::Const(bits) => self.add(ENode::Const(bits)),
-            PatNode::Neg(a) => {
-                let ca = self.instantiate_pat(pat, a, subst)?;
-                self.add(ENode::Neg(ca))
+    fn instantiate_pat(&mut self, pat: &[PatNode], root: usize, subst: &Subst) -> Option<EClassId> {
+        let mut results: OwnVec<Option<EClassId>, A> = OwnVec::with_capacity_in(pat.len(), self.alloc);
+        for _ in 0..pat.len() {
+            results.push(None);
+        }
+        let mut stack: OwnVec<(usize, bool), A> = OwnVec::new_in(self.alloc);
+        stack.push((root, false));
+        while let Some((idx, ready)) = stack.pop() {
+            if results.get(idx).copied().flatten().is_some() {
+                continue;
             }
-            PatNode::Add(a, b) => {
-                let ca = self.instantiate_pat(pat, a, subst)?;
-                let cb = self.instantiate_pat(pat, b, subst)?;
-                self.add(ENode::Add(ca, cb))
+            let &node = pat.get(idx)?;
+            if !ready {
+                match node {
+                    PatNode::Var(_) | PatNode::Const(_) => {}
+                    PatNode::Neg(a)
+                    | PatNode::Sin(a)
+                    | PatNode::Cos(a)
+                    | PatNode::Tan(a)
+                    | PatNode::Exp(a)
+                    | PatNode::Ln(a)
+                    | PatNode::Sqrt(a)
+                    | PatNode::Tanh(a)
+                    | PatNode::Abs(a) => {
+                        stack.push((idx, true));
+                        stack.push((a, false));
+                        continue;
+                    }
+                    PatNode::Add(a, b)
+                    | PatNode::Sub(a, b)
+                    | PatNode::Mul(a, b)
+                    | PatNode::Div(a, b)
+                    | PatNode::Pow(a, b) => {
+                        stack.push((idx, true));
+                        stack.push((b, false));
+                        stack.push((a, false));
+                        continue;
+                    }
+                }
             }
-            PatNode::Sub(a, b) => {
-                let ca = self.instantiate_pat(pat, a, subst)?;
-                let cb = self.instantiate_pat(pat, b, subst)?;
-                self.add(ENode::Sub(ca, cb))
+            let cid = match node {
+                PatNode::Var(v) => subst.get(usize::from(v)).copied().flatten()?,
+                PatNode::Const(bits) => self.add(ENode::Const(bits)),
+                PatNode::Neg(a) => self.add(ENode::Neg(results.get(a).copied().flatten()?)),
+                PatNode::Add(a, b) => self.add(ENode::Add(
+                    results.get(a).copied().flatten()?,
+                    results.get(b).copied().flatten()?,
+                )),
+                PatNode::Sub(a, b) => self.add(ENode::Sub(
+                    results.get(a).copied().flatten()?,
+                    results.get(b).copied().flatten()?,
+                )),
+                PatNode::Mul(a, b) => self.add(ENode::Mul(
+                    results.get(a).copied().flatten()?,
+                    results.get(b).copied().flatten()?,
+                )),
+                PatNode::Div(a, b) => self.add(ENode::Div(
+                    results.get(a).copied().flatten()?,
+                    results.get(b).copied().flatten()?,
+                )),
+                PatNode::Pow(a, b) => self.add(ENode::Pow(
+                    results.get(a).copied().flatten()?,
+                    results.get(b).copied().flatten()?,
+                )),
+                PatNode::Sin(a) => self.add(ENode::Sin(results.get(a).copied().flatten()?)),
+                PatNode::Cos(a) => self.add(ENode::Cos(results.get(a).copied().flatten()?)),
+                PatNode::Tan(a) => self.add(ENode::Tan(results.get(a).copied().flatten()?)),
+                PatNode::Exp(a) => self.add(ENode::Exp(results.get(a).copied().flatten()?)),
+                PatNode::Ln(a) => self.add(ENode::Ln(results.get(a).copied().flatten()?)),
+                PatNode::Sqrt(a) => self.add(ENode::Sqrt(results.get(a).copied().flatten()?)),
+                PatNode::Tanh(a) => self.add(ENode::Tanh(results.get(a).copied().flatten()?)),
+                PatNode::Abs(a) => self.add(ENode::Abs(results.get(a).copied().flatten()?)),
+            };
+            if let Some(slot) = results.get_mut(idx) {
+                *slot = Some(cid);
             }
-            PatNode::Mul(a, b) => {
-                let ca = self.instantiate_pat(pat, a, subst)?;
-                let cb = self.instantiate_pat(pat, b, subst)?;
-                self.add(ENode::Mul(ca, cb))
-            }
-            PatNode::Div(a, b) => {
-                let ca = self.instantiate_pat(pat, a, subst)?;
-                let cb = self.instantiate_pat(pat, b, subst)?;
-                self.add(ENode::Div(ca, cb))
-            }
-            PatNode::Pow(a, b) => {
-                let ca = self.instantiate_pat(pat, a, subst)?;
-                let cb = self.instantiate_pat(pat, b, subst)?;
-                self.add(ENode::Pow(ca, cb))
-            }
-            PatNode::Sin(a) => {
-                let ca = self.instantiate_pat(pat, a, subst)?;
-                self.add(ENode::Sin(ca))
-            }
-            PatNode::Cos(a) => {
-                let ca = self.instantiate_pat(pat, a, subst)?;
-                self.add(ENode::Cos(ca))
-            }
-            PatNode::Tan(a) => {
-                let ca = self.instantiate_pat(pat, a, subst)?;
-                self.add(ENode::Tan(ca))
-            }
-            PatNode::Exp(a) => {
-                let ca = self.instantiate_pat(pat, a, subst)?;
-                self.add(ENode::Exp(ca))
-            }
-            PatNode::Ln(a) => {
-                let ca = self.instantiate_pat(pat, a, subst)?;
-                self.add(ENode::Ln(ca))
-            }
-            PatNode::Sqrt(a) => {
-                let ca = self.instantiate_pat(pat, a, subst)?;
-                self.add(ENode::Sqrt(ca))
-            }
-            PatNode::Tanh(a) => {
-                let ca = self.instantiate_pat(pat, a, subst)?;
-                self.add(ENode::Tanh(ca))
-            }
-            PatNode::Abs(a) => {
-                let ca = self.instantiate_pat(pat, a, subst)?;
-                self.add(ENode::Abs(ca))
-            }
-        };
-        Some(cid)
+        }
+        results.get(root).copied().flatten()
     }
 
     fn apply_custom_rules(&mut self, rules: &[RewriteRule<'_>], max_enodes: usize) -> bool {
@@ -1224,10 +1361,10 @@ impl<A: Allocator + Copy> EGraph<A> {
                 if self.total_enodes >= max_enodes {
                     break;
                 }
-                if self.parent[cid] != cid as u32 {
+                if !self.is_canonical_cid(cid) {
                     continue;
                 }
-                let me = EClassId(cid as u32);
+                let me = EClassId(usize_to_u32(cid));
                 let mut matches: OwnVec<Subst, A> = OwnVec::new_in(self.alloc);
                 self.ematch_node(rule.lhs, lhs_root, me, [None; MAX_PAT_VARS], &mut matches);
                 for subst in matches.iter() {

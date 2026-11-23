@@ -4,7 +4,7 @@
 # starts at 0 (AGENTS.md correct-by-construction; the conversions are crates/blaze-int's).
 # Written by scripts/src/bin/casts.rs (`{"command": "write"}`), checked in CI.
 # crate	casts
-blaze-algebra	113
+blaze-algebra	29
 blaze-alloc-count	2
 blaze-answer	80
 blaze-ask	12

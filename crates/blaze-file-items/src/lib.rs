@@ -208,7 +208,7 @@ pub use blaze_ids::ContentId;
 pub use chain::{CHAIN_DOMAIN, chain_at, head_of, item_chain};
 pub use header::{GenericsError, HeaderError, ImplHeader, declared_lifetimes, impl_header};
 pub use walk::Bodies;
-pub use parser::SyntaxKind;
+pub use parser::{Extensions, SyntaxKind};
 
 /// The domain of [`Item::hash`]: the Merkle step over an item's signature digest, the rest of
 /// its own tokens (or bytes) and its children's digests (crate docs, "Identity"). `3` since the
@@ -302,6 +302,102 @@ pub fn outline_with<'a>(text: &str, edition: Edition, bodies: Bodies, alloc: All
     walk::rows::outline::<SideBySide, ByTokens>(text, parser_edition(edition), bodies, alloc)
 }
 
+/// [`outline_with`] with explicit blaze syntax extensions ([`Extensions`]) enabled on the parser.
+pub fn outline_with_extensions<'a>(
+    text: &str,
+    edition: Edition,
+    bodies: Bodies,
+    extensions: Extensions,
+    alloc: Alloc<'a>,
+) -> Outline<'a> {
+    walk::rows::outline_with_extensions::<SideBySide, ByTokens>(text, parser_edition(edition), bodies, extensions, alloc)
+}
+
+/// Scans leading inner attributes (`#![blaze::uniq]`, `#![blaze::records]`,
+/// `#![blaze::error_unions]`) at the top of `text` before the first item, returning the combined
+/// [`Extensions`] set with zero allocations.
+pub fn detect_blaze_extensions(text: &str) -> Extensions {
+    let bytes = text.as_bytes();
+    let mut at = 0usize;
+    // Skip optional UTF-8 BOM.
+    if bytes.get(0..3) == Some(&[0xEF, 0xBB, 0xBF]) {
+        at = 3;
+    }
+    let mut ext = Extensions::NONE;
+    while at < bytes.len() {
+        // Skip whitespace and comments (`//...`, `/*...*/`).
+        while let Some(&b) = bytes.get(at) {
+            if b.is_ascii_whitespace() {
+                at += 1;
+            } else if bytes.get(at..at + 2) == Some(b"//") {
+                at += 2;
+                while let Some(&c) = bytes.get(at) {
+                    at += 1;
+                    if c == b'\n' {
+                        break;
+                    }
+                }
+            } else if bytes.get(at..at + 2) == Some(b"/*") {
+                at += 2;
+                let mut depth = 1usize;
+                while depth > 0 && at < bytes.len() {
+                    if bytes.get(at..at + 2) == Some(b"/*") {
+                        depth += 1;
+                        at += 2;
+                    } else if bytes.get(at..at + 2) == Some(b"*/") {
+                        depth -= 1;
+                        at += 2;
+                    } else {
+                        at += 1;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        // Only leading `#![...]` inner attributes can enable crate/file extensions.
+        if bytes.get(at..at + 3) != Some(b"#![") {
+            break;
+        }
+        at += 3;
+        let inner_start = at;
+        let mut depth = 1usize;
+        while depth > 0 && at < bytes.len() {
+            match bytes.get(at).copied() {
+                Some(b'[') => depth += 1,
+                Some(b']') => depth -= 1,
+                _ => {}
+            }
+            at += 1;
+        }
+        if depth != 0 {
+            break;
+        }
+        let inner_end = at - 1;
+        if let Some(inner) = text.get(inner_start..inner_end) {
+            let trimmed = inner.trim();
+            if let Some(rest) = trimmed.strip_prefix("blaze")
+                && let Some(rest) = rest.trim_start().strip_prefix("::")
+            {
+                match rest.trim() {
+                    "uniq" => ext = ext.with(Extensions::UNIQ),
+                    "records" => ext = ext.with(Extensions::RECORDS),
+                    "error_unions" => ext = ext.with(Extensions::ERROR_UNIONS),
+                    _ => {}
+                }
+            }
+        }
+    }
+    ext
+}
+
+/// [`outline_with_extensions`] using the blaze syntax extensions declared in `text`'s leading
+/// `#![blaze::...]` inner attributes ([`detect_blaze_extensions`]).
+pub fn outline_auto_extensions<'a>(text: &str, edition: Edition, bodies: Bodies, alloc: Alloc<'a>) -> Outline<'a> {
+    let extensions = detect_blaze_extensions(text);
+    outline_with_extensions(text, edition, bodies, extensions, alloc)
+}
+
 /// [`outline_with`], its digests hashed by `C`: the seam [`SideBySide`] and its twin
 /// [`OneByOne`] are tested equal at.
 pub fn outline_hashed_by<'a, C: Compress>(text: &str, edition: Edition, bodies: Bodies, alloc: Alloc<'a>) -> Outline<'a> {
@@ -371,6 +467,8 @@ pub struct Outline<'a> {
     own_flags: ItemFlags,
     /// `own_flags` and every entry's together.
     flags: ItemFlags,
+    /// The blaze syntax extensions active when this outline was parsed.
+    extensions: Extensions,
 }
 
 impl Outline<'_> {
@@ -393,7 +491,13 @@ impl Outline<'_> {
             file_names: self.file_names,
             own_flags: self.own_flags,
             flags: self.flags,
+            extensions: self.extensions,
         }
+    }
+
+    /// The blaze syntax extensions active when this outline was parsed.
+    pub fn extensions(&self) -> Extensions {
+        self.extensions
     }
 
     /// Every flag the file's tokens set, its own and its entries' ([`ItemFlags`]).
@@ -446,6 +550,9 @@ impl Outline<'_> {
         let items = &self.items;
         let mut hasher = blaze_ids::Hasher::new(SURFACE_DOMAIN);
         hasher.id(&self.file_names);
+        if self.extensions != Extensions::NONE {
+            hasher.part(&[self.extensions.bits()]);
+        }
         let mut at = 0;
         while at < items.len() {
             let item = &items[at];
@@ -538,6 +645,7 @@ impl PartialEq for Outline<'_> {
             && self.file_names == other.file_names
             && self.own_flags == other.own_flags
             && self.flags == other.flags
+            && self.extensions == other.extensions
     }
 }
 
@@ -551,5 +659,32 @@ impl fmt::Debug for Outline<'_> {
             .field("file_attrs", &self.file_attrs)
             .field("errors", &&self.errors[..])
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod extensions_tests {
+    use super::*;
+
+    #[test]
+    fn detect_and_outline_uniq_and_records_extensions() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let src = "//! UI module\n#![blaze::uniq]\n#![blaze::records]\nfn obj_row(ui: &uniq UiWorld, p: { name: &str, depth: u32 = 0, open: bool = false }) {}\n";
+        let detected = detect_blaze_extensions(src);
+        assert_eq!(detected, Extensions::UNIQ.with(Extensions::RECORDS));
+
+        let out = outline_auto_extensions(src, Edition::E2024, Bodies::Skipped, alloc);
+        assert_eq!(out.extensions(), Extensions::UNIQ.with(Extensions::RECORDS));
+        assert!(out.errors().is_empty(), "expected zero syntax errors with auto extensions, got {:?}", out.errors());
+        assert_eq!(out.items().len(), 1);
+        assert_eq!(out.items()[0].kind(), ItemKind::Function);
+        assert_eq!(out.items()[0].name.map(|n| out.items()[0].text(src, n)), Some("obj_row"));
+
+        // Surface digest is sensitive to active syntax extensions even without inner attributes.
+        let plain = "fn f(x: &u32) {}\n";
+        let s_none = outline_with_extensions(plain, Edition::E2024, Bodies::Skipped, Extensions::NONE, alloc).surface();
+        let s_uniq = outline_with_extensions(plain, Edition::E2024, Bodies::Skipped, Extensions::UNIQ, alloc).surface();
+        assert_ne!(s_none, s_uniq, "extensions must participate in Outline::surface()");
     }
 }

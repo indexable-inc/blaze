@@ -348,6 +348,18 @@ pub(crate) fn outline<'a, C: Compress, F: Feed>(
     bodies: Bodies,
     alloc: Alloc<'a>,
 ) -> Outline<'a> {
+    outline_with_extensions::<C, F>(text, edition, bodies, parser::Extensions::NONE, alloc)
+}
+
+/// [`outline`] with explicit blaze syntax extensions ([`parser::Extensions`]) enabled on the
+/// parser input.
+pub(crate) fn outline_with_extensions<'a, C: Compress, F: Feed>(
+    text: &str,
+    edition: Edition,
+    bodies: Bodies,
+    extensions: parser::Extensions,
+    alloc: Alloc<'a>,
+) -> Outline<'a> {
     assert!(
         u32::try_from(text.len()).is_ok(),
         "a source file of {} bytes: an outline's ranges are u32 pairs",
@@ -358,8 +370,9 @@ pub(crate) fn outline<'a, C: Compress, F: Feed>(
     let lexed = LexedStr::new(edition, text);
     working.columns.fill(&lexed, edition);
     let Columns { words, starts, ends, flags } = &working.columns;
+    out.extensions = extensions;
     sink_rows(Seen { text, words, starts, ends, flags }, &mut working.rows, out, |tokens, rows| {
-        parser::source_file_into(tokens, bodies == Bodies::Skipped, rows)
+        parser::source_file_into(tokens.with_extensions(extensions), bodies == Bodies::Skipped, rows)
     });
     lexer_errors(&lexed, out);
     out.flags = out.items.iter().fold(out.own_flags, |flags, item| flags | item.flags);

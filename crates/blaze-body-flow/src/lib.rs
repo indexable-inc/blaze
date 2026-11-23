@@ -23,6 +23,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod algebra;
 pub mod canon;
 pub mod project;
 

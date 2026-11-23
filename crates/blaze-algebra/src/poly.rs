@@ -12,7 +12,7 @@ use core::fmt;
 
 use blaze_own::{AllocFailure, CloneIn, Vec as OwnVec};
 
-use crate::{AlgebraError, ExprGraph, ExprId, Op, VarId, expr_cost};
+use crate::{AlgebraError, ExprGraph, ExprId, Op, VarId, expr_cost, u32_to_usize};
 
 /// Maximum polynomial degree accepted by `pow_u32` and `expr_to_poly` (`bounded-progress`).
 pub const MAX_POLY_DEGREE: u32 = 32;
@@ -106,7 +106,7 @@ impl Rat {
             let n = num.checked_neg().ok_or(PolyError::Overflow)?;
             (n, den.unsigned_abs())
         } else {
-            (num, den as u128)
+            (num, den.cast_unsigned())
         };
         let g = gcd_u128(signed_num.unsigned_abs(), pos_den);
         let red_den = pos_den / g;
@@ -188,7 +188,7 @@ impl Rat {
             }
             let a = a_f as i128;
             let h2 = a.checked_mul(h1)?.checked_add(h0)?;
-            let k2 = (a as u128).checked_mul(k1)?.checked_add(k0)?;
+            let k2 = a.cast_unsigned().checked_mul(k1)?.checked_add(k0)?;
             if k2 > 1_000_000 {
                 break;
             }
@@ -247,8 +247,10 @@ impl Rat {
         }
         let g1 = gcd_u128(self.num.unsigned_abs(), rhs.den);
         let g2 = gcd_u128(rhs.num.unsigned_abs(), self.den);
-        let n1 = self.num / (g1 as i128);
-        let n2 = rhs.num / (g2 as i128);
+        let g1_i = i128::try_from(g1).map_err(|_| PolyError::Overflow)?;
+        let g2_i = i128::try_from(g2).map_err(|_| PolyError::Overflow)?;
+        let n1 = self.num / g1_i;
+        let n2 = rhs.num / g2_i;
         let d1 = self.den / g2;
         let d2 = rhs.den / g1;
         let num = n1.checked_mul(n2).ok_or(PolyError::Overflow)?;
@@ -369,14 +371,13 @@ impl<A: Allocator + Copy> Monomial<A> {
         }
         let a = self.powers.as_slice();
         let b = other.powers.as_slice();
-        let min_len = a.len().min(b.len());
-        for i in 0..min_len {
-            if a[i].0 != b[i].0 {
+        for (&(va, ea), &(vb, eb)) in a.iter().zip(b.iter()) {
+            if va != vb {
                 // Smaller VarId is considered "higher" (like x > y > z).
-                return b[i].0.cmp(&a[i].0);
+                return vb.cmp(&va);
             }
-            if a[i].1 != b[i].1 {
-                return a[i].1.cmp(&b[i].1);
+            if ea != eb {
+                return ea.cmp(&eb);
             }
         }
         a.len().cmp(&b.len())
@@ -388,36 +389,34 @@ impl<A: Allocator + Copy> Monomial<A> {
         let b = other.powers.as_slice();
         let (mut i, mut j) = (0, 0);
         let mut total_deg = 0u32;
-        while i < a.len() && j < b.len() {
-            match a[i].0.cmp(&b[j].0) {
+        while let (Some(&(va, ea)), Some(&(vb, eb))) = (a.get(i), b.get(j)) {
+            match va.cmp(&vb) {
                 Ordering::Less => {
-                    total_deg = total_deg.saturating_add(a[i].1);
-                    out.push(a[i]);
+                    total_deg = total_deg.saturating_add(ea);
+                    out.push((va, ea));
                     i += 1;
                 }
                 Ordering::Greater => {
-                    total_deg = total_deg.saturating_add(b[j].1);
-                    out.push(b[j]);
+                    total_deg = total_deg.saturating_add(eb);
+                    out.push((vb, eb));
                     j += 1;
                 }
                 Ordering::Equal => {
-                    let e = a[i].1.saturating_add(b[j].1);
+                    let e = ea.saturating_add(eb);
                     total_deg = total_deg.saturating_add(e);
-                    out.push((a[i].0, e));
+                    out.push((va, e));
                     i += 1;
                     j += 1;
                 }
             }
         }
-        while i < a.len() {
-            total_deg = total_deg.saturating_add(a[i].1);
-            out.push(a[i]);
-            i += 1;
+        for &(va, ea) in a.get(i..).unwrap_or(&[]) {
+            total_deg = total_deg.saturating_add(ea);
+            out.push((va, ea));
         }
-        while j < b.len() {
-            total_deg = total_deg.saturating_add(b[j].1);
-            out.push(b[j]);
-            j += 1;
+        for &(vb, eb) in b.get(j..).unwrap_or(&[]) {
+            total_deg = total_deg.saturating_add(eb);
+            out.push((vb, eb));
         }
         if total_deg > MAX_POLY_DEGREE {
             return Err(PolyError::DegreeLimitExceeded { degree: total_deg, limit: MAX_POLY_DEGREE });
@@ -469,12 +468,10 @@ impl<A: Allocator + Copy> PartialEq for Poly<A> {
         if self.terms.len() != other.terms.len() {
             return false;
         }
-        for i in 0..self.terms.len() {
-            if self.terms[i].0 != other.terms[i].0 || self.terms[i].1 != other.terms[i].1 {
-                return false;
-            }
-        }
-        true
+        self.terms
+            .iter()
+            .zip(other.terms.iter())
+            .all(|((m1, c1), (m2, c2))| m1 == m2 && c1 == c2)
     }
 }
 
@@ -518,8 +515,10 @@ impl<A: Allocator + Copy> Poly<A> {
         if self.terms.is_empty() {
             return Some(Rat::ZERO);
         }
-        if self.terms.len() == 1 && self.terms[0].0.is_one() {
-            return Some(self.terms[0].1);
+        if let [(m, c)] = self.terms.as_slice()
+            && m.is_one()
+        {
+            return Some(*c);
         }
         None
     }
@@ -557,15 +556,15 @@ impl<A: Allocator + Copy> Poly<A> {
             return Ok(());
         }
         let mut pos = 0usize;
-        while pos < self.terms.len() {
-            match mono.total_cmp(&self.terms[pos].0) {
+        while let Some((cur_m, cur_c)) = self.terms.get_mut(pos) {
+            match mono.total_cmp(cur_m) {
                 Ordering::Greater => break,
                 Ordering::Equal => {
-                    let sum = self.terms[pos].1.checked_add(coeff)?;
+                    let sum = cur_c.checked_add(coeff)?;
                     if sum.is_zero() {
                         let _ = self.terms.remove_shift(pos);
                     } else {
-                        self.terms[pos].1 = sum;
+                        *cur_c = sum;
                     }
                     return Ok(());
                 }
@@ -676,7 +675,7 @@ impl<A: Allocator + Copy> Poly<A> {
             let mut term = *c;
             for &(v, e) in m.powers() {
                 let val = env
-                    .get(v.0 as usize)
+                    .get(u32_to_usize(v.0))
                     .copied()
                     .ok_or(PolyError::MissingVar { var: v, env_len: env.len() })?;
                 term = term.checked_mul(val.checked_pow(e)?)?;
@@ -693,7 +692,7 @@ impl<A: Allocator + Copy> Poly<A> {
             let mut term = c.to_f64();
             for &(v, e) in m.powers() {
                 let val = env
-                    .get(v.0 as usize)
+                    .get(u32_to_usize(v.0))
                     .copied()
                     .ok_or(PolyError::MissingVar { var: v, env_len: env.len() })?;
                 for _ in 0..e {
@@ -735,18 +734,23 @@ impl<A: Allocator + Copy> Poly<A> {
         divisor.assert_univariate_in(var)?;
 
         let div_deg = divisor.degree_in(var);
-        let div_lc = divisor.terms[0].1;
+        let Some(&(_, div_lc)) = divisor.terms.first() else {
+            return Err(PolyError::DivisionByZero);
+        };
         let mut q = Self::zero_in(self.alloc);
         let mut r = self.clone_in(self.alloc);
 
         let mut steps = 0usize;
-        while !r.is_zero() && steps < (MAX_POLY_DEGREE as usize + 2) {
+        let max_steps = u32_to_usize(MAX_POLY_DEGREE).saturating_add(2);
+        while !r.is_zero() && steps < max_steps {
             steps += 1;
             let r_deg = r.degree_in(var);
             if r_deg < div_deg {
                 break;
             }
-            let r_lc = r.terms[0].1;
+            let Some(&(_, r_lc)) = r.terms.first() else {
+                break;
+            };
             let q_coeff = r_lc.checked_div(div_lc)?;
             let q_mono = Monomial::var_in(var, r_deg - div_deg, self.alloc);
             q.add_term(q_mono.clone_in(self.alloc), q_coeff)?;
@@ -805,7 +809,7 @@ pub fn expr_to_poly<A: Allocator + Copy>(
     root: ExprId,
 ) -> Result<Option<Poly<A>>, AlgebraError> {
     let n = g.len();
-    if (root.0 as usize) >= n {
+    if u32_to_usize(root.0) >= n {
         return Err(AlgebraError::InvalidExpr { expr: root, node_count: n });
     }
     let mut cache: OwnVec<Option<Option<Poly<A>>>, A> = OwnVec::with_capacity_in(n, g.alloc());
@@ -820,9 +824,9 @@ fn expr_to_poly_memo<A: Allocator + Copy>(
     id: ExprId,
     cache: &mut OwnVec<Option<Option<Poly<A>>>, A>,
 ) -> Result<Option<Poly<A>>, AlgebraError> {
-    let idx = id.0 as usize;
+    let idx = u32_to_usize(id.0);
     let alloc = g.alloc();
-    if let Some(hit) = &cache[idx] {
+    if let Some(Some(hit)) = cache.get(idx) {
         return Ok(hit.as_ref().map(|p| p.clone_in(alloc)));
     }
     let res: Option<Poly<A>> = match g.node(id)? {
@@ -853,12 +857,9 @@ fn expr_to_poly_memo<A: Allocator + Copy>(
         },
         Op::Pow(a, b) => {
             if let Some(exp_f) = g.node(b)?.as_const() {
-                if exp_f >= 0.0
-                    && exp_f <= f64::from(MAX_POLY_DEGREE)
-                    && blaze_math::trunc(exp_f) == exp_f
-                {
+                if let Some(exp_u) = (0..=MAX_POLY_DEGREE).find(|&k| f64::from(k) == exp_f) {
                     match expr_to_poly_memo(g, a, cache)? {
-                        Some(pa) => pa.pow_u32(exp_f as u32).ok(),
+                        Some(pa) => pa.pow_u32(exp_u).ok(),
                         None => None,
                     }
                 } else {
@@ -886,7 +887,9 @@ fn expr_to_poly_memo<A: Allocator + Copy>(
         | Op::Abs(_)
         | Op::Select(_, _, _) => None,
     };
-    cache[idx] = Some(res.as_ref().map(|p| p.clone_in(alloc)));
+    if let Some(slot) = cache.get_mut(idx) {
+        *slot = Some(res.as_ref().map(|p| p.clone_in(alloc)));
+    }
     Ok(res)
 }
 
@@ -928,7 +931,10 @@ pub fn poly_to_expr<A: Allocator + Copy>(g: &mut ExprGraph<A>, poly: &Poly<A>) -
             None => term_expr,
             Some(prev) => {
                 if coeff.num() < 0 {
-                    let pos_c = Rat::new(-coeff.num(), coeff.den() as i128).unwrap_or(*coeff);
+                    let pos_c = i128::try_from(coeff.den())
+                        .ok()
+                        .and_then(|d| Rat::new(-coeff.num(), d).ok())
+                        .unwrap_or(*coeff);
                     let pos_term = match mono_expr {
                         None => g.lit(pos_c.to_f64()),
                         Some(me) if pos_c.is_one() => me,
