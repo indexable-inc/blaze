@@ -52,7 +52,7 @@ Not now:
 ## How work is done
 
 - Work in parallel: lanes write in one directory and never wait on a compile or on a yes (35, 48).
-- Until `blaze run` exists again, a merge's proof is the whole build and its tests, quoted (68).
+- A merge carries the run, check and test smoke of a release blaze built from its exact tree (68).
 - Every command has a timeout; a hang is a bug to report, never one to wait out (69, 18).
 - Facts come from tool output in this session (61); verdicts from real projects, run first (7, 82).
 - Build, test and land: docs/contributing.md. Every doc: docs/README.md.
@@ -160,7 +160,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 - **37. land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`; never push to main.
 - **38. own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning lane what changed.
 - **40. credit-people**: Credit a suggestion, diagnosis or patch with a `Co-authored-by:` trailer.
-- **68. proof-before-merge**: Until `blaze run` exists again: the workspace compiles and its tests pass on the exact tree.
+- **68. proof-before-merge**: The PR quotes a release blaze running, checking and testing hello-world on the exact tree.
 
 ### Docs and scripts (skill `docs-and-scripts`)
 - **33. no-mcp**: Agent interfaces are a Unix socket or HTTP with one versioned schema in deterministic CBOR.
