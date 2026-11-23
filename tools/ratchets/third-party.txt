@@ -31,6 +31,7 @@ blaze-build-script	0	0	86
 blaze-bytes	0	0	1
 blaze-c	0	0	8
 blaze-cad	0	0	1
+blaze-cad-cloth	0	0	1
 blaze-cad-field	0	0	1
 blaze-cad-mesh	0	0	1
 blaze-cad-out	0	0	1

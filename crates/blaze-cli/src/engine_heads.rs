@@ -955,7 +955,7 @@ fn tables_of(
     let frame = cx.frame();
     let g = heap.alloc();
     let scope_crates = job.scope_crates(scope_records);
-    let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, frame, g, snapshot)?;
+    let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
     let records = opened.records;
     let mut rows = Vec::new_in(g);
     if !NamesSource::each_impl_row(records, 0, &mut |row| rows.push(row)) {
@@ -988,7 +988,7 @@ fn tables_of(
                     let g = heap.alloc();
                     let chunk_frame = cx.frame();
                     let chunk_crates = job.scope_crates(scope_records);
-                    let opened_chunk = open_scope_by_need(cx, root, fs, outlined, chunk_crates, packs, corrected, procs, chunk_frame, g, snapshot)?;
+                    let opened_chunk = open_scope_by_need(cx, root, fs, outlined, chunk_crates, packs, corrected, procs, chunk_frame, g, snapshot).map_err(OpenScopeRefused::message)?;
                     let rec = opened_chunk.records;
                     let recorder = Recorder::new(RecorderOpts { alloc: g });
                     let view = Tables::new(TablesOpts { records: rec, impls: None, lang_crates: &[], reads: &recorder });
@@ -3708,6 +3708,21 @@ struct CrateSetup {
     listing: &'static Listing,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct OpenScopeRefused;
+
+impl OpenScopeRefused {
+    const fn message(self) -> &'static str {
+        "its crate's records could not be opened (run_names.rs `names_records`)"
+    }
+}
+
+impl core::fmt::Display for OpenScopeRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
 /// A job's scope's records opened by need in `frame` (run_names.rs `names_records_over`): what
 /// the setup, each split, and each impl tables job open, the one place a head job opens them.
 #[expect(clippy::too_many_arguments, reason = "the names records' edge: each argument one input of them")]
@@ -3723,10 +3738,10 @@ fn open_scope_by_need<'n>(
     frame: &'n Frame,
     g: Alloc<'static>,
     snapshot: &'n crate::store::StoreSnapshot,
-) -> Result<crate::run_names::Opened<'n>, &'static str> {
+) -> Result<crate::run_names::Opened<'n>, OpenScopeRefused> {
     let packs = ((packs, fs), Some(outlined));
     crate::run_names::names_records_over(cx, root, crates, packs, corrected, procs, std::vec::Vec::new_in(Global), None, Some(snapshot), None, frame, g)
-        .map_err(|_| "its crate's records could not be opened (run_names.rs `names_records`)")
+        .map_err(|_| OpenScopeRefused)
 }
 
 /// One member crate's setup for its head tasks, on a worker, once a crate a phase: its records
@@ -3752,7 +3767,7 @@ fn crate_setup(
 ) -> Result<CrateSetup, &'static str> {
     let frame = cx.frame();
     let g = heap.alloc();
-    let opened = open_scope_by_need(cx, root, fs, outlined, job.scope_crates(scope_records), packs, corrected, procs, frame, g, snapshot)?;
+    let opened = open_scope_by_need(cx, root, fs, outlined, job.scope_crates(scope_records), packs, corrected, procs, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
     let records = opened.records;
     let mut lang: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(job.lang.len(), g);
     lang.extend_from_slice(&job.lang);
@@ -3866,7 +3881,7 @@ fn heads_of(
     let frame = cx.frame();
     let g = heap.alloc();
     let scope_crates = job.scope_crates(scope_records);
-    let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, frame, g, snapshot)?;
+    let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
     let records = opened.records;
     let CrateSetup { lang, sized, pointers, lang_reads, pointer_reads, members, listing } = *setup;
     let unused = Recorder::new(RecorderOpts { alloc: g });

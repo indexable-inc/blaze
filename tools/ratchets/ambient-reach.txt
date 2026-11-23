@@ -11,7 +11,8 @@ blaze-bench	3	2	0	0	0	0
 blaze-blake3	3	0	0	0	0	0
 blaze-bstd-convert	0	1	0	0	0	0
 blaze-build-script	0	1	0	1	0	0
-blaze-cad	16	3	0	0	0	0
+blaze-cad	18	4	0	0	0	0
+blaze-cad-cloth	9	1	0	1	0	0
 blaze-cad-field	3	0	0	0	0	0
 blaze-cad-mesh	2	0	0	0	0	0
 blaze-cad-out	1	0	0	0	0	0

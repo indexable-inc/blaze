@@ -11,7 +11,7 @@ blaze-build-script	0	1	0	0	0
 blaze-cas	1	2	0	0	0
 blaze-cbor	0	1	0	0	0
 blaze-check	19	0	0	0	0
-blaze-cli	12	64	0	0	5
+blaze-cli	12	63	0	0	5
 blaze-core	8	1	0	0	0
 blaze-emit	0	8	0	0	0
 blaze-fmt	1	7	0	0	0
@@ -32,7 +32,7 @@ blaze-protocol	1	0	0	0	0
 blaze-remote	25	3	0	0	0
 blaze-scope	0	1	0	0	0
 blaze-script	8	0	0	0	0
-blaze-std	32	0	0	0	0
+blaze-std	32	1	0	0	0
 blaze-store-check	1	0	0	0	0
 blaze-tokens	0	1	0	0	0
 blaze-v2-proof	2	0	0	0	0
