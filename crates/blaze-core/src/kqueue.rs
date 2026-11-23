@@ -1187,21 +1187,23 @@ impl<S: Split, O: Opening> Kqueue<S, O> {
         loop {
             let Some(listening) = self.listens.get(listen) else { return };
             let tag = listening.tag;
-            let accepted = listening.listener.accept().and_then(|socket| {
-                socket.set_nonblocking(true)?;
-                no_sigpipe(socket.fd())?;
-                Ok(socket)
-            });
-            match accepted {
+            match listening.listener.accept() {
                 Ok(socket) => {
-                    let conn = self.adopt(socket);
-                    self.ready.push(Completion { tag, done: Done::Accepted { conn } });
+                    // Per-connection setup failure (e.g. macOS returning EINVAL from SO_NOSIGPIPE
+                    // when a probing client closed immediately after connect()) drops only that
+                    // accepted socket and never tears down the listener.
+                    if socket.set_nonblocking(true).is_ok() && no_sigpipe(socket.fd()).is_ok() {
+                        let conn = self.adopt(socket);
+                        self.ready.push(Completion { tag, done: Done::Accepted { conn } });
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
                 Err(error)
                     if matches!(
                         error.kind(),
-                        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
                     ) => {}
                 Err(error) => {
                     // A failure ends the listen.

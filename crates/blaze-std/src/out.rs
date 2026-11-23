@@ -169,6 +169,8 @@ pub enum OutWhy {
     /// The host refused the write, saying this (a closed pipe, a full disk behind a
     /// redirection).
     Host(String),
+    /// A custom [`OutSink`] refused the write, saying this.
+    Sink(&'static str),
 }
 
 /// A write that failed: the stream, and how.
@@ -184,23 +186,52 @@ impl fmt::Display for OutError {
         match &self.why {
             OutWhy::Stopped(stopped) => write!(f, "bstd::out write to {stream}: {stopped}"),
             OutWhy::Host(said) => write!(f, "bstd::out write to {stream}: the host refused: {said}"),
+            OutWhy::Sink(said) => write!(f, "bstd::out write to {stream}: {said}"),
         }
     }
 }
 
 impl core::error::Error for OutError {}
 
+/// A custom output sink backing an [`Out`] capability (e.g. a resident daemon streaming
+/// `ServerFrame::Out` / `ServerFrame::Err` over a client Unix socket while faithfully reporting
+/// the client's terminal capabilities).
+pub trait OutSink: Send + Sync {
+    /// Writes one chunk of bytes to the sink; `Err(why)` fails the caller's [`Out`] write.
+    fn write_chunk(&self, cx: &Cx, bytes: &[u8]) -> Result<(), &'static str>;
+}
+
+/// Type-erased shared handle to a custom [`OutSink`].
+pub type SharedSink = blaze_own::Arc<dyn OutSink, blaze_own::SharedAlloc<'static>>;
+
+#[derive(Clone)]
+enum Target {
+    World(Io),
+    Sink { tty: crate::term::Tty, sink: SharedSink },
+}
+
 /// One of the process's streams: standard output from [`Io::out`], standard error from
 /// [`Io::err`].
 #[derive(Clone)] // clone: copying authority held adds none
 pub struct Out {
-    io: Io,
+    target: Target,
     stream: Stream,
 }
 
 impl Out {
     pub(crate) fn new(io: Io, stream: Stream) -> Out {
-        Out { io, stream }
+        Out { target: Target::World(io), stream }
+    }
+
+    /// Creates an [`Out`] backed by a custom [`OutSink`] and terminal description `tty`.
+    pub fn with_sink_in<S: OutSink + 'static>(
+        stream: Stream,
+        tty: crate::term::Tty,
+        sink: S,
+        alloc: blaze_own::SharedAlloc<'static>,
+    ) -> Out {
+        let shared: SharedSink = blaze_own::Arc::new_in(sink, alloc);
+        Out { target: Target::Sink { tty, sink: shared }, stream }
     }
 
     /// Which stream this is.
@@ -257,12 +288,17 @@ impl Out {
     /// have its output out before it waits on something else (another process reading a pipe
     /// it shares). Nothing when the buffer is empty.
     pub fn flush(&self, cx: &Cx) -> Result<(), OutError> {
-        if let Err(stopped) = cx.stopped(&self.io) {
-            return Err(OutError { stream: self.stream, why: OutWhy::Stopped(stopped) });
-        }
-        match self.io.flush_out(self.stream, cx.name()) {
-            Ok(()) => Ok(()),
-            Err(said) => Err(OutError { stream: self.stream, why: OutWhy::Host(said) }),
+        match &self.target {
+            Target::World(io) => {
+                if let Err(stopped) = cx.stopped(io) {
+                    return Err(OutError { stream: self.stream, why: OutWhy::Stopped(stopped) });
+                }
+                match io.flush_out(self.stream, cx.name()) {
+                    Ok(()) => Ok(()),
+                    Err(said) => Err(OutError { stream: self.stream, why: OutWhy::Host(said) }),
+                }
+            }
+            Target::Sink { .. } => Ok(()),
         }
     }
 
@@ -278,25 +314,46 @@ impl Out {
     /// the span `bstd.out.write` inside `cx`'s, and only then (an append records nothing).
     /// Written plainly (no closure, no `?` over a conversion): it is on every hello's path.
     fn hand(&self, cx: &Cx, bytes: &[u8], end: bool) -> Result<(), OutError> {
-        if let Err(stopped) = cx.stopped(&self.io) {
-            return Err(OutError { stream: self.stream, why: OutWhy::Stopped(stopped) });
-        }
-        match self.io.put_out(self.stream, cx.name(), bytes, end) {
-            Ok(()) => Ok(()),
-            Err(said) => Err(OutError { stream: self.stream, why: OutWhy::Host(said) }),
+        match &self.target {
+            Target::World(io) => {
+                if let Err(stopped) = cx.stopped(io) {
+                    return Err(OutError { stream: self.stream, why: OutWhy::Stopped(stopped) });
+                }
+                match io.put_out(self.stream, cx.name(), bytes, end) {
+                    Ok(()) => Ok(()),
+                    Err(said) => Err(OutError { stream: self.stream, why: OutWhy::Host(said) }),
+                }
+            }
+            Target::Sink { sink, .. } => {
+                if bytes.is_empty() {
+                    return Ok(());
+                }
+                match sink.write_chunk(cx, bytes) {
+                    Ok(()) => Ok(()),
+                    Err(said) => Err(OutError { stream: self.stream, why: OutWhy::Sink(said) }),
+                }
+            }
         }
     }
 
     /// Whether this stream is a terminal (`isatty` on its descriptor), read once, at the
     /// first ask, and kept: whether colours and frames are drawn for someone.
     pub fn is_terminal(&self) -> bool {
-        matches!(self.io.tty(self.stream), crate::term::Tty::Terminal(_))
+        let tty = match &self.target {
+            Target::World(io) => io.tty(self.stream),
+            Target::Sink { tty, .. } => *tty,
+        };
+        matches!(tty, crate::term::Tty::Terminal(_))
     }
 
     /// This stream's terminal size in cells (`TIOCGWINSZ`), read with [`Out::is_terminal`]:
     /// `None` when it is not a terminal or the terminal says no size.
     pub fn size(&self) -> Option<crate::term::Size> {
-        match self.io.tty(self.stream) {
+        let tty = match &self.target {
+            Target::World(io) => io.tty(self.stream),
+            Target::Sink { tty, .. } => *tty,
+        };
+        match tty {
             crate::term::Tty::Terminal(size) => size,
             crate::term::Tty::NotTerminal => None,
         }

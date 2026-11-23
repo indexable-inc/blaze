@@ -220,6 +220,52 @@ pub fn stat_at(dir: Fd, path: Path<'_>, flags: c_int) -> Result<stat, Errno> {
     Ok(status)
 }
 
+/// `AT_SYMLINK_NOFOLLOW` for [`stat_at`]: stat the symlink itself rather than its target.
+#[cfg(target_os = "macos")]
+pub const AT_SYMLINK_NOFOLLOW: c_int = 0x20;
+/// `AT_SYMLINK_NOFOLLOW` for [`stat_at`]: stat the symlink itself rather than its target.
+#[cfg(target_os = "linux")]
+pub const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
+
+/// Resolves `path` (including `.`, `..`, and symlinks) into `into` (no NUL terminator) and returns
+/// the written slice.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn realpath_into<'a>(path: Path<'_>, into: &'a mut [u8]) -> Result<&'a [u8], Errno> {
+    #[cfg(target_os = "macos")]
+    {
+        const DARWIN_PATH_MAX: usize = 1024;
+        let mut resolved = [0u8; DARWIN_PATH_MAX];
+        // SAFETY: `path` is NUL-terminated; `resolved` has `PATH_MAX` (1024) writable bytes,
+        // matching Darwin's `realpath$DARWIN_EXTSN` contract.
+        let ptr = unsafe { realpath(path.as_ptr().cast(), resolved.as_mut_ptr().cast()) };
+        if ptr.is_null() {
+            return Err(crate::posix::signal::errno());
+        }
+        let mut len = 0usize;
+        while let Some(&byte) = resolved.get(len) {
+            if byte == 0 {
+                break;
+            }
+            len = len.wrapping_add(1);
+        }
+        let Some(dst) = into.get_mut(..len) else {
+            return Err(Errno::NameTooLong);
+        };
+        let Some(src) = resolved.get(..len) else {
+            return Err(Errno::NameTooLong);
+        };
+        dst.copy_from_slice(src);
+        Ok(dst)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::task::realpath(path, into).map_err(|err| match err {
+            crate::linux::task::RealPathError::Path(e) | crate::linux::task::RealPathError::Proc(e) => e,
+        })
+    }
+}
+
 /// `S_IFMT` (sys/stat.h): the bits of `st_mode` that are the file's kind.
 /// replaces libc::S_IFMT
 pub const S_IFMT: mode_t = 0o170_000;

@@ -32,7 +32,7 @@ use crate::{
     mem::TASK_FRAME,
 };
 
-pub use crate::rt::{Exit, run, run_with, run_with_heap, run_with_heap_at};
+pub use crate::rt::{Exit, StartBlock, run, run_with, run_with_heap, run_with_heap_at, start_block};
 
 /// The process's heap, as the grant a `main` or a test is handed ([`crate::mem::Heap`]): the
 /// ONE call of `blaze_own::Heap::process()` in the tree (D120). Every entry of bstd takes its

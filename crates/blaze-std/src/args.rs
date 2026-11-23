@@ -5,6 +5,8 @@
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
+use blaze_own::SharedAlloc;
+
 /// A world's command line, the program's own name first: what an [`Args`] reads.
 #[derive(Clone)] // clone: a refcount, or a `&'static`
 pub struct ArgList(Source);
@@ -15,6 +17,7 @@ enum Source {
     /// arguments after the program's name the launcher took (an ordinary start's `--grant`s).
     Process { args: &'static [&'static str], skip: usize },
     Given(Arc<[String]>),
+    Owned(blaze_own::Arc<blaze_own::Vec<blaze_own::String<SharedAlloc<'static>>, SharedAlloc<'static>>, SharedAlloc<'static>>),
 }
 
 impl ArgList {
@@ -22,6 +25,17 @@ impl ArgList {
     pub fn given(args: Vec<String>) -> ArgList {
         // alloc: once per world, its command line.
         ArgList(Source::Given(args.into()))
+    }
+
+    /// A command line built from borrowed slices in an explicit shared allocator (e.g. a resident
+    /// daemon request's argv).
+    pub fn from_slices_in(args: &[&str], alloc: SharedAlloc<'static>) -> ArgList {
+        let mut owned: blaze_own::Vec<blaze_own::String<SharedAlloc<'static>>, SharedAlloc<'static>> =
+            blaze_own::Vec::with_capacity_in(args.len(), alloc);
+        for &arg in args {
+            owned.push(blaze_own::String::from_str_in(arg, alloc));
+        }
+        ArgList(Source::Owned(blaze_own::Arc::new_in(owned, alloc)))
     }
 
     /// The process's own, borrowed from its start block.
@@ -44,6 +58,7 @@ impl ArgList {
                 _ => args.get(at.saturating_add(*skip)).copied(),
             },
             Source::Given(args) => args.get(at).map(String::as_str),
+            Source::Owned(args) => args.get(at).map(blaze_own::String::as_str),
         }
     }
 
@@ -54,6 +69,7 @@ impl ArgList {
         match &self.0 {
             Source::Process { args, skip } => args.len().saturating_sub(*skip),
             Source::Given(args) => args.len(),
+            Source::Owned(args) => args.len(),
         }
     }
 }
@@ -69,6 +85,15 @@ impl Args {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub(crate) fn new(args: ArgList) -> Args {
+        Args { args }
+    }
+
+    /// Wraps an [`ArgList`] as an [`Args`] capability (e.g. a resident daemon constructing one
+    /// from a client request's decoded argv).
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn from_list(args: ArgList) -> Args {
         Args { args }
     }
 

@@ -61,7 +61,7 @@ crates/blaze-cli/src/engine_scope_reads.rs	GRAINS_MAGIC	none
 crates/blaze-cli/src/engine_script_reads.rs	COVERAGE_MAGIC	none
 crates/blaze-cli/src/graph_payload.rs	MAGIC	none
 crates/blaze-cli/src/journal_checkpoint.rs	MAGIC	none
-crates/blaze-cli/src/layout.rs	LAYOUT	none
+crates/blaze-cli/src/layout.rs	LAYOUT	test previous_layout_without_daemon_folder_is_handled
 crates/blaze-cli/src/names/sections.rs	MAGIC	none
 crates/blaze-cli/src/roster.rs	MAGIC	none
 crates/blaze-cli/src/roster.rs	VERSION	none

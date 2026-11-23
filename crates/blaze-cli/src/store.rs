@@ -921,6 +921,58 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
     Ok(after.cleanup)
 }
 
+/// Commits this request's puts and roots for the resident daemon WITHOUT dropping `lent` or
+/// spawning background GC yet (the daemon sends `ServerFrame::Done` to the client first, then
+/// calls [`post_done_for_daemon`] to reclaim arenas and spawn background GC).
+pub(crate) fn after_answer_for_daemon(
+    cx: &Cx,
+    lent: &CommandLent,
+    home: &Home,
+) -> Result<(roots::CleanupLine, bool), CliError> {
+    // Queue lease release so the idle daemon holds zero leases on disk (never blocking `blaze gc`).
+    lent.release_lease();
+    let needs_hk = lent.needs_housekeeping(lent.wall_ns());
+    let bg_detached = home.bg_gc.is_detached();
+    let slices = if needs_hk && !bg_detached { AFTER_ANSWER_SLICES } else { 0 };
+    let has_work = slices > 0 || lent.needs_commit();
+    if !has_work {
+        let named = lent.named();
+        let before = lent.put_tally();
+        let cleanup = roots::CleanupLine {
+            roots: named.roots,
+            keys: named.keys,
+            indexed: named.indexed,
+            swept_bytes: 0,
+            slices: 0,
+            carried: lent.carried(),
+            leases: u32::try_from(lent.leases_len()).unwrap_or(u32::MAX),
+            put: roots::PutLine { before_answer: before, after_answer: blaze_cas::plain::PutTally::default() },
+        };
+        return Ok((cleanup, bg_detached && needs_hk));
+    }
+    let after = plain_place::after_answer(cx, lent, slices)?;
+    let manifest_changed = after.segments_written > 0 || after.sealed || after.compaction_slices > 0;
+    let spawn_bg = bg_detached && (needs_hk || (manifest_changed && lent.needs_housekeeping(lent.wall_ns())));
+    Ok((after.cleanup, spawn_bg))
+}
+
+/// Runs post-`Done` store maintenance inside the resident daemon after the client has already
+/// received `ServerFrame::Done`: reclaims per-request arena chunks while keeping mapped segments
+/// warm, and spawns detached background GC if queued.
+pub(crate) fn post_done_for_daemon(
+    cx: &Cx,
+    lent: &mut CommandLent,
+    home: &Home,
+    spawn_bg: bool,
+    err: &Out,
+) {
+    let _ = lent.reclaim_between_requests();
+    if spawn_bg {
+        let cx = cx.span("daemon post-done: spawn detached background gc");
+        let _ = home.bg_gc.spawn(&cx, home.dir(), err);
+    }
+}
+
 /// A planted bug of the nonce's test (`store/nonce_tests.rs`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum NoncePlant {
