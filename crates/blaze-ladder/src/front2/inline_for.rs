@@ -652,13 +652,37 @@ enum ZipPat<'s> {
     Named(&'s str, &'s str, &'s str),
 }
 
+/// Typed failure while parsing or rendering a `zip_fields(lhs, rhs)` unrolling site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZipRenderError {
+    BadPat,
+    ReadPatElems,
+    SlicePat,
+    SliceLhs,
+    SliceRhs,
+    SliceBody,
+}
+
+impl ZipRenderError {
+    const fn message(self) -> &'static str {
+        match self {
+            ZipRenderError::BadPat => "zip_fields requires a `(a, b)` or `(name, a, b)` tuple pattern",
+            ZipRenderError::ReadPatElems => "could not read zip_fields pattern elements",
+            ZipRenderError::SlicePat => "could not slice zip_fields pattern",
+            ZipRenderError::SliceLhs => "could not slice lhs source text for zip_fields expansion",
+            ZipRenderError::SliceRhs => "could not slice rhs source text for zip_fields expansion",
+            ZipRenderError::SliceBody => "could not slice body source text for zip_fields expansion",
+        }
+    }
+}
+
 /// Parses a `zip_fields` loop pattern as `(a, b)` or `(name, a, b)`.
-fn parse_zip_pat<'v>(view: &blaze_lower::View<'v>, pat: tc::PatId) -> Result<ZipPat<'v>, &'static str> {
+fn parse_zip_pat<'v>(view: &blaze_lower::View<'v>, pat: tc::PatId) -> Result<ZipPat<'v>, ZipRenderError> {
     let Ok(blaze_lower::Pat::Tuple { elems, rest: None }) = view.pat(pat) else {
-        return Err("zip_fields requires a `(a, b)` or `(name, a, b)` tuple pattern");
+        return Err(ZipRenderError::BadPat);
     };
     let Ok(ids) = view.ids(elems) else {
-        return Err("could not read zip_fields pattern elements");
+        return Err(ZipRenderError::ReadPatElems);
     };
     match ids {
         [p0, p1] => {
@@ -666,12 +690,12 @@ fn parse_zip_pat<'v>(view: &blaze_lower::View<'v>, pat: tc::PatId) -> Result<Zip
                 .pat_range(tc::PatId(*p0))
                 .ok()
                 .and_then(|r| view.text_at(r).ok())
-                .ok_or("could not slice zip_fields pattern")?;
+                .ok_or(ZipRenderError::SlicePat)?;
             let b_src = view
                 .pat_range(tc::PatId(*p1))
                 .ok()
                 .and_then(|r| view.text_at(r).ok())
-                .ok_or("could not slice zip_fields pattern")?;
+                .ok_or(ZipRenderError::SlicePat)?;
             Ok(ZipPat::Pair(a_src, b_src))
         }
         [p0, p1, p2] => {
@@ -679,20 +703,20 @@ fn parse_zip_pat<'v>(view: &blaze_lower::View<'v>, pat: tc::PatId) -> Result<Zip
                 .pat_range(tc::PatId(*p0))
                 .ok()
                 .and_then(|r| view.text_at(r).ok())
-                .ok_or("could not slice zip_fields pattern")?;
+                .ok_or(ZipRenderError::SlicePat)?;
             let a_src = view
                 .pat_range(tc::PatId(*p1))
                 .ok()
                 .and_then(|r| view.text_at(r).ok())
-                .ok_or("could not slice zip_fields pattern")?;
+                .ok_or(ZipRenderError::SlicePat)?;
             let b_src = view
                 .pat_range(tc::PatId(*p2))
                 .ok()
                 .and_then(|r| view.text_at(r).ok())
-                .ok_or("could not slice zip_fields pattern")?;
+                .ok_or(ZipRenderError::SlicePat)?;
             Ok(ZipPat::Named(name_src, a_src, b_src))
         }
-        _ => Err("zip_fields requires a `(a, b)` or `(name, a, b)` tuple pattern"),
+        _ => Err(ZipRenderError::BadPat),
     }
 }
 
@@ -708,23 +732,23 @@ fn render_zip_unrolled<'a>(
     round: usize,
     site_idx: usize,
     alloc: Alloc<'a>,
-) -> Result<AString<'a>, &'static str> {
+) -> Result<AString<'a>, ZipRenderError> {
     let zip_pat = parse_zip_pat(view, site.pat)?;
     let lhs_src = view
         .expr_range(lhs)
         .ok()
         .and_then(|r| view.text_at(r).ok())
-        .ok_or("could not slice lhs source text for zip_fields expansion")?;
+        .ok_or(ZipRenderError::SliceLhs)?;
     let rhs_src = view
         .expr_range(rhs)
         .ok()
         .and_then(|r| view.text_at(r).ok())
-        .ok_or("could not slice rhs source text for zip_fields expansion")?;
+        .ok_or(ZipRenderError::SliceRhs)?;
     let body_src = view
         .expr_range(site.body)
         .ok()
         .and_then(|r| view.text_at(r).ok())
-        .ok_or("could not slice body source text for zip_fields expansion")?;
+        .ok_or(ZipRenderError::SliceBody)?;
     let mut out = OwnString::new_in(alloc);
     if fields.is_empty() {
         let _ = write!(out, "{{ let _ = ({lhs_src}); let _ = ({rhs_src}); }}");
@@ -955,7 +979,7 @@ pub fn expand_concrete_body<'n, S: NamesSource<'n>>(
                             .map_err(|why| CheckFail::InlineFor {
                                 owner: body.owner,
                                 at: body.typeck.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default(),
-                                why,
+                                why: why.message(),
                             })?;
                             rewrites.push(Rewrite { start, end, replacement });
                         }

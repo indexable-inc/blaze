@@ -67,7 +67,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 if adt.kind != blaze_typeck::AdtKind::Struct || adt.variants.len() != 1 {
                     return Err(malformed("a builtin `clone` of an ADT that is not a struct"));
                 }
-                let mut a: Vec<PTy, A> = Vec::new_in(self.alloc);
+                let mut a = blaze_own::Vec::new_in(self.alloc);
                 a.extend_from_slice(self.ground.view().list(adt_args).map_err(past)?);
                 for f in adt.fields.iter() {
                     let g = crate::instance::ground(adt.types, f.ty, &a, self.ground, self.scratch, facts)?;
