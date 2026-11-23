@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-315 invariants, 44 refinements, 12 reference models.
-By level: 256 tested, 87 simulated, 1 model-checked, 15 proved.
+318 invariants, 44 refinements, 12 reference models.
+By level: 259 tested, 87 simulated, 1 model-checked, 15 proved.
 
 ## Invariants
 
@@ -487,6 +487,8 @@ By level: 256 tested, 87 simulated, 1 model-checked, 15 proved.
   Controls: `swapped_nibbles`.
 - **`property_escape_round_trip_and_sanitizer_never_leaks_xss`** *tested* (`crates/blaze-std/src/html.rs`): HTML entity escaping round-trips arbitrary UTF-8 and `sanitize_html_in` never emits `<script`, `onerror=`, or `javascript:`.
   Controls: `bypassed_javascript_url_check`.
+- **`property_lz4_round_trip_and_hostile_bytes_never_panic`** *tested* (`crates/blaze-std/src/lz4.rs`): LZ4 raw blocks and v1.6.4 frames round-trip with verified XXH32 checksums and hostile bytes never panic.
+  Controls: `skipped_frame_checksum`.
 - **`property_hostile_markdown_obeys_limits_escapes_script_and_strips_ansi`** *tested* (`crates/blaze-std/src/markdown/tests.rs`): hostile markdown respects depth/size limits, escapes HTML script tags, and strips ANSI escapes.
   Controls: `unescaped_html_script_tag`.
 - **`property_base32_round_trip`** *tested* (`crates/blaze-std/src/otp.rs`): RFC 4648 and Crockford Base32 encoding and decoding round-trip arbitrary byte slices.
@@ -505,6 +507,8 @@ By level: 256 tested, 87 simulated, 1 model-checked, 15 proved.
   Controls: `inverted_greediness`, `ignored_case_flag`.
 - **`property_router_matches_linear_oracle`** *tested* (`crates/blaze-std/src/router.rs`): iterative trie routing matches the linear brute-force static-over-param-over-wildcard precedence oracle on every route table and request path.
   Controls: `wrong_precedence`.
+- **`property_snappy_round_trip_and_hostile_bytes_never_panic`** *tested* (`crates/blaze-std/src/snappy.rs`): Snappy raw blocks and framed streams round-trip with verified masked CRC-32C and hostile bytes never panic.
+  Controls: `skipped_crc32c`.
 - **`property_sse_chunked_round_trip`** *tested* (`crates/blaze-std/src/sse.rs`): chunked SSE parsing matches whole-buffer parsing and strips leading event field spaces.
   Controls: `missing_space_strip`.
 - **`property_natural_cmp_strict_total_order`** *tested* (`crates/blaze-std/src/strx.rs`): `natural_cmp` is a strict total order (reflexive, antisymmetric, transitive) and orders embedded decimal integers numerically.
@@ -603,6 +607,8 @@ By level: 256 tested, 87 simulated, 1 model-checked, 15 proved.
   Controls: `unquoted_keyword_strings`.
 - **`property_zip_round_trip_and_hostile_bytes_never_panic`** *tested* (`crates/blaze-std/src/zip.rs`): Store and Deflate ZIP archives round-trip with verified CRC-32 and hostile archive bytes never panic.
   Controls: `skipped_crc_verification`.
+- **`property_zstd_round_trip_and_hostile_bytes_never_panic`** *tested* (`crates/blaze-std/src/zstd/tests.rs`): RFC 8878 Zstandard compression and decompression round-trip across arbitrary inputs and hostile bytes never panic.
+  Controls: `skipped_checksum`.
 
 ### blaze-surface
 

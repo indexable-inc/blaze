@@ -248,6 +248,8 @@ pub mod kv;
 pub mod local;
 /// The locale: time zone, language and formats, as plain data.
 pub mod locale;
+/// Bounded LZ4 Raw Block and LZ4 Frame v1.6.4 compression and decompression (`XXH32` checksums).
+pub mod lz4;
 /// Bounded, non-recursive CommonMark + GFM Markdown parser with HTML and ANSI terminal renderers.
 pub mod markdown;
 pub mod mem;
@@ -350,6 +352,8 @@ pub mod router;
 /// `#[bstd::test]`: a test shaped like `main`, run on the simulation under many seeds with its
 /// faults on. Its items are [`test`]'s.
 mod simtest;
+/// Bounded Google Snappy raw block and Snappy Framing Format compression (`crc32c` masked checksums).
+pub mod snappy;
 /// Streams to an origin: `Streams`, from the host or a handler.
 pub mod streams;
 /// Everyday text transformations: case conversions, Unicode `slugify_in`, `natural_cmp`, `dedent_in`/`indent_in`, and ANSI/CJK `truncate_width_in`.
@@ -391,6 +395,8 @@ pub mod xml;
 pub mod yaml;
 /// Bounded, traversal-safe Store/Deflate ZIP archive reader and writer over [`compress`] and [`digest::Crc32`].
 pub mod zip;
+/// Pure `#![no_std]` RFC 8878 Zstandard compression and decompression (`XXH64` checksums).
+pub mod zstd;
 /// A worker's state as a value the pool owns, in typed columns (D171): `Workers`, `Slot<T>`,
 /// `cx.on_worker`.
 #[expect(
