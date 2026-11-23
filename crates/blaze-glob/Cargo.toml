@@ -13,6 +13,13 @@ repository.workspace = true
 [lib]
 doctest = false
 
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+blaze-own.workspace = true
+
 [dev-dependencies]
 blaze-sim.workspace = true
 

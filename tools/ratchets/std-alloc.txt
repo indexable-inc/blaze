@@ -50,7 +50,7 @@ blaze-format-core	3	0	14	22
 blaze-format-tiers	4	1	0	45
 blaze-fuzz	5	1	0	7
 blaze-git-fetch	0	0	2	0
-blaze-glob	6	1	0	18
+blaze-glob	6	1	0	3
 blaze-graph	186	1	3	511
 blaze-h1	0	0	2	1
 blaze-hash	4	0	6	9

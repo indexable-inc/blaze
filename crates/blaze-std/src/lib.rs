@@ -182,6 +182,9 @@ pub mod clock;
 pub mod code;
 /// Strict, bounded, zero-dependency RFC 4180 CSV / TSV reader and writer.
 pub mod csv;
+/// Authenticated encryption (ChaCha20-Poly1305 RFC 8439), key derivation (HKDF-SHA256 RFC 5869,
+/// PBKDF2-HMAC-SHA256 RFC 2898), and strict Ed25519 verification (`blaze-ed25519`).
+pub mod crypto;
 pub mod cx;
 /// The device capabilities: `Camera`, `Screen`, `Location`, `Bluetooth`, `Usb`, `Serial`,
 /// `Clipboard`, `Notify`.
@@ -193,6 +196,8 @@ pub mod diff;
 pub mod digest;
 /// The simulated disk's ledger: what file calls paid, and which names a crash may undo.
 pub mod disk;
+/// Strict, bounded, sans-IO `.env` file parser, variable interpolator, and formatter.
+pub mod dotenv;
 pub mod entry;
 pub mod env;
 /// Who decides how a pure function is computed: `Eval` and its providers, memo points, keys.
@@ -204,6 +209,8 @@ pub mod eval;
 )]
 pub mod flat;
 pub mod fs;
+/// Unix shell glob matching (`Pattern`, `GlobSet`) and capability-confined directory globbing (`glob_dir`).
+pub mod glob;
 pub mod gpu;
 /// Strict, zero-dependency RFC 4648 §8 hexadecimal encoding and decoding.
 pub mod hex;
@@ -227,6 +234,8 @@ pub mod kv;
 pub mod local;
 /// The locale: time zone, language and formats, as plain data.
 pub mod locale;
+/// Bounded, non-recursive CommonMark + GFM Markdown parser with HTML and ANSI terminal renderers.
+pub mod markdown;
 pub mod mem;
 /// Typed names: a key's, a device's, a module's, an application's.
 pub mod name;
@@ -292,6 +301,8 @@ pub mod power;
 pub mod procs;
 #[cfg(feature = "net")]
 pub mod quic;
+/// Linear-time Thompson NFA / PikeVM regular expression engine with bounded step budgets.
+pub mod regex;
 /// Making requests: `Http`, one type over a `Net`, the host or a handler. Behind `requests`.
 #[cfg(feature = "requests")]
 pub mod requests;
@@ -311,13 +322,19 @@ pub mod roots;
 mod simtest;
 /// Streams to an origin: `Streams`, from the host or a handler.
 pub mod streams;
+/// Sans-IO W3C Server-Sent Events (SSE) streaming parser and event formatter.
+pub mod sse;
 pub mod sync;
+/// ANSI-aware word wrapping (`wrap_ansi_in`) and box-drawn Unicode/ASCII/Markdown tables.
+pub mod table;
 pub mod task;
 // What a run used and where its time went, kept per worker and merged into one `Report` at
 // exit (D178): spans, distributions, effects by kind, the pool, the longest chain.
 pub mod telemetry;
 /// The terminal as a device: `Term`, its size, raw mode, styled text and keys.
 pub mod term;
+/// Civil calendar dates, Unix epoch conversions, strict RFC 3339 parsing/formatting, and human durations.
+pub mod time;
 pub mod trace;
 /// The rustc debug build's check that a must-finish value was finished, not dropped.
 pub(crate) mod unfinished;
@@ -332,6 +349,10 @@ pub mod user;
 pub mod uuid;
 /// The program's windows: `Window`, a surface's size and its events.
 pub mod window;
+/// Sans-IO RFC 6455 WebSocket handshake (`accept_key`) and frame encoder/decoder.
+pub mod ws;
+/// Strict, bounded, non-recursive YAML 1.2 Core Schema parser and emitter over `blaze_data::Value`.
+pub mod yaml;
 /// A worker's state as a value the pool owns, in typed columns (D171): `Workers`, `Slot<T>`,
 /// `cx.on_worker`.
 #[expect(
@@ -612,6 +633,11 @@ pub mod cbor {
 /// Strict TOML 1.0 parser, writer, and lossless format-preserving editor (`blaze-toml`).
 pub mod toml {
     pub use blaze_toml::*;
+}
+
+/// LLM-first tabular structured data format (TAB) over [`data::Value`] (`blaze-tab`).
+pub mod tab {
+    pub use blaze_tab::*;
 }
 
 /// Canonical RFC 4648 Base64 encoding and decoding (`STANDARD`, `URL_SAFE`, padded and unpadded; `blaze-base64`).

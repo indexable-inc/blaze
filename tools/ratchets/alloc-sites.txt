@@ -36,7 +36,7 @@ blaze-format	3	0	0	4
 blaze-format-core	0	0	5	3
 blaze-format-tiers	16	0	0	24
 blaze-fuzz	0	0	0	4
-blaze-glob	0	0	10	3
+blaze-glob	0	0	10	2
 blaze-graph	193	0	29	112
 blaze-hash	0	0	6	1
 blaze-hashcons	2	0	4	2

@@ -460,3 +460,128 @@ fn property_parse_patch_hostile_input_never_panics() {
         let _ = parse_patches(text.as_str(), limits, h.alloc());
     });
 }
+
+#[test]
+fn merge3_clean_convergent_and_conflict() {
+    let h = heap();
+    let base = "line1\nline2\nline3\nline4\n";
+    let ours = "LINE1\nline2\nline3\nline4\n";
+    let theirs = "line1\nline2\nline3\nLINE4\n";
+
+    // Disjoint edits merge cleanly.
+    let res = merge3(
+        base,
+        ours,
+        theirs,
+        MergeOpts {
+            algorithm: Algorithm::Myers,
+            budget: DEFAULT_BUDGET,
+            style: ConflictStyle::Standard,
+            base_label: "base",
+            ours_label: "ours",
+            theirs_label: "theirs",
+            alloc: h.alloc(),
+        },
+    )
+    .expect("merge3");
+    assert!(res.is_clean());
+    let merged = res
+        .render_in(ConflictStyle::Standard, "base", "ours", "theirs", h.alloc())
+        .expect("render");
+    assert_eq!(merged.as_str(), "LINE1\nline2\nline3\nLINE4\n");
+
+    // Identical edits on both sides converge with zero conflicts.
+    let same = merge3(
+        base,
+        ours,
+        ours,
+        MergeOpts {
+            algorithm: Algorithm::Myers,
+            budget: DEFAULT_BUDGET,
+            style: ConflictStyle::Standard,
+            base_label: "base",
+            ours_label: "ours",
+            theirs_label: "theirs",
+            alloc: h.alloc(),
+        },
+    )
+    .expect("convergent");
+    assert!(same.is_clean());
+    assert_eq!(
+        same.render_in(ConflictStyle::Standard, "base", "ours", "theirs", h.alloc())
+            .expect("render")
+            .as_str(),
+        ours
+    );
+
+    // Divergent edits to the same line produce a conflict with diff3 markers.
+    let conf = merge3(
+        "a\nb\nc\n",
+        "a\nOURS\nc\n",
+        "a\nTHEIRS\nc\n",
+        MergeOpts {
+            algorithm: Algorithm::Myers,
+            budget: DEFAULT_BUDGET,
+            style: ConflictStyle::Diff3,
+            base_label: "base",
+            ours_label: "ours",
+            theirs_label: "theirs",
+            alloc: h.alloc(),
+        },
+    )
+    .expect("conflict");
+    assert!(conf.has_conflicts());
+    assert_eq!(conf.conflict_count, 1);
+    let txt = conf
+        .render_in(ConflictStyle::Diff3, "base", "ours", "theirs", h.alloc())
+        .expect("render");
+    assert_eq!(
+        txt.as_str(),
+        "a\n<<<<<<< ours\nOURS\n||||||| base\nb\n=======\nTHEIRS\n>>>>>>> theirs\nc\n"
+    );
+}
+
+#[test]
+fn inline_ansi_patch_strips_back_identically() {
+    let h = heap();
+    let a = "fn main() {\n    let x = \"node index.js\";\n}\n";
+    let b = "fn main() {\n    let x = \"bun index.ts\";\n}\n";
+    let patch = create_patch(
+        a,
+        b,
+        PatchOpts {
+            algorithm: Algorithm::Myers,
+            context: 3,
+            old_name: Some("a/main.rs"),
+            new_name: Some("b/main.rs"),
+            budget: DEFAULT_BUDGET,
+            alloc: h.alloc(),
+        },
+    )
+    .expect("patch");
+    let inline = format_patch_ansi_inline(patch.as_str(), h.alloc()).expect("inline ansi");
+    assert!(crate::ansi::has_ansi(inline.as_str()));
+    let stripped = crate::ansi::strip_in(inline.as_str(), h.alloc()).expect("strip");
+    assert_eq!(stripped.as_str(), patch.as_str());
+}
+
+#[test]
+fn value_diff_and_rfc6902_patch_round_trip() {
+    let h = heap();
+    let old = crate::json::read_in(
+        br#"{"name":"app","scripts":{"start":"node","test":"jest"},"tags":[1,2,3],"a/b~c":true}"#,
+        crate::json::Limits::SHIPPED,
+        h.alloc(),
+    )
+    .expect("old json");
+    let new = crate::json::read_in(
+        br#"{"name":"app","scripts":{"start":"bun","lint":"oxlint"},"tags":[1,4],"a/b~c":false,"extra":null}"#,
+        crate::json::Limits::SHIPPED,
+        h.alloc(),
+    )
+    .expect("new json");
+    let patch_ops = diff_values(&old, &new, h.alloc()).expect("diff values");
+    assert!(!patch_ops.is_empty());
+    let applied = apply_value_patch(&old, patch_ops.as_slice(), h.alloc()).expect("apply");
+    assert_eq!(applied, new);
+}

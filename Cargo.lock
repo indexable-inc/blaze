@@ -1060,6 +1060,7 @@ dependencies = [
 name = "blaze-glob"
 version = "0.0.0"
 dependencies = [
+ "blaze-own",
  "blaze-sim",
 ]
 
@@ -2100,7 +2101,9 @@ dependencies = [
  "blaze-core",
  "blaze-data",
  "blaze-deflate",
+ "blaze-ed25519",
  "blaze-format",
+ "blaze-glob",
  "blaze-h1",
  "blaze-hash",
  "blaze-hashcons",
@@ -2123,6 +2126,7 @@ dependencies = [
  "blaze-sim",
  "blaze-spin",
  "blaze-sys",
+ "blaze-tab",
  "blaze-tar",
  "blaze-text",
  "blaze-toml",
