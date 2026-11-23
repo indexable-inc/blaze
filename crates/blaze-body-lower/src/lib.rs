@@ -630,7 +630,9 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         if i >= self.pat_place.len() {
             self.pat_place.resize(i + 1, Place(NONE));
         }
-        self.pat_place[i] = place;
+        if let Some(slot) = self.pat_place.get_mut(i) {
+            *slot = place;
+        }
     }
 
     /// The place binding pattern `p` was given.

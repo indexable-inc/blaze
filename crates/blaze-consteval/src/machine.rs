@@ -1288,7 +1288,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     /// The ground type of field `field` (of the variant's own numbering) of ADT or tuple `t`.
     fn field_ty(&mut self, t: PTy, variant: u32, field: u32) -> R<'a, PTy> {
         match self.node(t)? {
-            PNode::Tuple(l) | PNode::Record(l) => self
+            PNode::Tuple(l) | PNode::Record(_, l) => self
                 .ground
                 .view()
                 .list(l)
@@ -2173,7 +2173,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                         }
                     }
                 }
-                PNode::Tuple(l) | PNode::Record(l) => {
+                PNode::Tuple(l) | PNode::Record(_, l) => {
                     let len = self.ground.view().list(l).map_err(|_| malformed("a list past the ground table"))?.len() as u32;
                     for f in 0..len {
                         let (off, ft) = (self.field_offset(ty, 0, f)?, self.field_ty(ty, 0, f)?);

@@ -1616,7 +1616,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         };
         match view {
             TyView::Tuple(l)
-            | TyView::Record(l)
+            | TyView::Record(_, l)
             | TyView::Union(l)
             | TyView::Adt(_, l)
             | TyView::FnDef(_, l)
@@ -1701,7 +1701,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         use TyView::*;
         let rebuilt = match view {
             Tuple(l) => Tuple(self.normalized_list(l, done, items)?),
-            Record(l) => Record(self.normalized_list(l, done, items)?),
+            Record(s, l) => Record(s, self.normalized_list(l, done, items)?),
             Union(l) => Union(self.normalized_list(l, done, items)?),
             Ref(m, t) => Ref(m, self.normalized_child(t, done)),
             Ptr(m, t) => Ptr(m, self.normalized_child(t, done)),
@@ -2075,7 +2075,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             PNode::Str => TyView::Str,
             PNode::Never => TyView::Never,
             PNode::Tuple(l) => TyView::Tuple(self.lowered_list(memo, types, l)?),
-            PNode::Record(l) => TyView::Record(self.lowered_list(memo, types, l)?),
+            PNode::Record(s, l) => TyView::Record(s, self.lowered_list(memo, types, l)?),
             PNode::Union(l) => TyView::Union(self.lowered_list(memo, types, l)?),
             PNode::Ref(m, t) => TyView::Ref(m, Self::lowered(memo, t)?),
             PNode::Ptr(m, t) => TyView::Ptr(m, Self::lowered(memo, t)?),
@@ -2426,7 +2426,9 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             TyView::Float(f) => Shape::Float(f),
             TyView::Str => Shape::Str,
             TyView::Never => Shape::Never,
-            TyView::Tuple(l) | TyView::Record(l) | TyView::Union(l) => Shape::Tuple(self.ty.list_len(l)),
+            TyView::Tuple(l) => Shape::Tuple(self.ty.list_len(l)),
+            TyView::Record(s, l) => Shape::Record(s.0, self.ty.list_len(l)),
+            TyView::Union(l) => Shape::Union(self.ty.list_len(l)),
             TyView::Ref(m, _) => Shape::Ref(m),
             TyView::Ptr(m, _) => Shape::Ptr(m),
             TyView::Array(..) => Shape::Array,

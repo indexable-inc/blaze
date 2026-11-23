@@ -333,6 +333,8 @@ impl<'a> Terms<'a> {
             TyKind::Closure(d, l) => K::Closure(self.sdef(d), self.slist(l)),
             TyKind::Coroutine(d, l) => K::Coroutine(self.sdef(d), self.slist(l)),
             TyKind::Tuple(l) => K::Tuple(self.slist(l)),
+            TyKind::Record(s, l) => K::Record(s, self.slist(l)),
+            TyKind::Union(l) => K::Union(self.slist(l)),
             TyKind::Alias { kind, rigid, def, args } => K::Alias(
                 if rigid { Rigid::Yes } else { Rigid::No },
                 s_alias(kind),
@@ -520,6 +522,14 @@ impl<'a> blaze_solve::Tys for Terms<'a> {
             K::Tuple(l) => {
                 let l = self.blist(l)?;
                 self.cx.tys.tuple(l).node()
+            }
+            K::Record(s, l) => {
+                let l = self.blist(l)?;
+                self.cx.tys.record(s, l).node()
+            }
+            K::Union(l) => {
+                let l = self.blist(l)?;
+                self.cx.tys.union(l).node()
             }
             K::Ref(r, p, m) => {
                 let (r, p) = (self.region(r)?, self.ty(p)?);

@@ -171,7 +171,7 @@ pub fn region_arity<F: Arity + ?Sized>(t: PTy, node: PNode, facts: &F) -> Result
         | PNode::Str
         | PNode::Never
         | PNode::Tuple(_)
-        | PNode::Record(_)
+        | PNode::Record(..)
         | PNode::Union(_)
         | PNode::Ptr(..)
         | PNode::Array(..)
@@ -206,7 +206,7 @@ fn kids<'a>(tys: PTys<'a>, t: PTy, node: PNode) -> Result<Kids<'a>, RegionError>
     let list = |l| tys.list(l).map_err(RegionError::Table);
     Ok(match node {
         PNode::Tuple(l)
-        | PNode::Record(l)
+        | PNode::Record(_, l)
         | PNode::Union(l)
         | PNode::Adt(_, l)
         | PNode::FnDef(_, l)

@@ -2768,11 +2768,13 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             .any(|n| Param::decode(*n).is_ok_and(|p| p.variadic))
     }
 
-    fn bound_name(&self, p: PatId) -> Option<NameIdx> {
-        match Pat::decode(self.out.pats[p.0 as usize]).ok()? {
-            Pat::Bind { name, .. } => Some(name),
-            Pat::Box(inner) => self.bound_name(inner),
-            _ => None,
+    fn bound_name(&self, mut p: PatId) -> Option<NameIdx> {
+        loop {
+            match Pat::decode(*self.out.pats.get(p.0 as usize)?).ok()? {
+                Pat::Bind { name, .. } => return Some(name),
+                Pat::Box(inner) => p = inner,
+                _ => return None,
+            }
         }
     }
 

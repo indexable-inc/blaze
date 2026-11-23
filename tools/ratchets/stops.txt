@@ -18,9 +18,7 @@ blaze-blake3	413
 blaze-body	82
 blaze-body-build	39
 blaze-body-drops	24
-blaze-body-eval	1
 blaze-body-flow	39
-blaze-body-lower	8
 blaze-bstd-convert	109
 blaze-build	550
 blaze-build-script	246
@@ -43,7 +41,7 @@ blaze-comptime	68
 blaze-comptime-sys	48
 blaze-comptime/rungs/derive-hello	2
 blaze-cond	115
-blaze-consteval	209
+blaze-consteval	208
 blaze-core	908
 blaze-cunit	41
 blaze-data	52
@@ -88,7 +86,7 @@ blaze-lex	63
 blaze-lint	270
 blaze-lint-defs	109
 blaze-lir	1553
-blaze-lower	321
+blaze-lower	320
 blaze-macro-run	4
 blaze-malloc	65
 blaze-manifest	150

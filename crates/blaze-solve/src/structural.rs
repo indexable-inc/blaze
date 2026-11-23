@@ -222,7 +222,7 @@ fn step_auto<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result
             tys.push(e);
             reach.push(Reach::Pointee);
         }
-        TyKind::Tuple(l) => {
+        TyKind::Tuple(l) | TyKind::Record(_, l) | TyKind::Union(l) => {
             tys.extend_from_slice(&cx.list_small(l));
             for i in 0..l.len {
                 reach.push(Reach::Element(i));
@@ -383,6 +383,14 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
                     let sized = require_lang(cx, Lang::Sized)?;
                     preds.push(trait_pred(cx, sized, &[e])?);
                 }
+                kids.push(e);
+            }
+        }
+        TyKind::Record(_, l) | TyKind::Union(l) => {
+            for i in 0..l.len {
+                let e = cx.arg(l, i);
+                let sized = require_lang(cx, Lang::Sized)?;
+                preds.push(trait_pred(cx, sized, &[e])?);
                 kids.push(e);
             }
         }

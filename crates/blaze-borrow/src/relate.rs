@@ -121,6 +121,28 @@ struct BoundAt {
     var: u32,
 }
 
+const WALK_STACK_CAP: usize = 512;
+const COMP_STACK_CAP: usize = 512;
+
+#[derive(Clone, Copy)]
+struct WalkFrame<'c> {
+    a_ty: PTy,
+    b_ty: PTy,
+    ra: Slots<'c>,
+    rb: Slots<'c>,
+    v: Variance,
+    next_k: u32,
+    depth: u32,
+}
+
+#[derive(Clone, Copy)]
+struct CompFrame<'c> {
+    ty: PTy,
+    rest: Slots<'c>,
+    next_k: u32,
+    depth: u32,
+}
+
 struct Walk<'w, 'c, A: Allocator + Copy> {
     types: &'c dyn RegionTypes,
     sig_types: &'c dyn RegionTypes,
@@ -137,6 +159,10 @@ struct Walk<'w, 'c, A: Allocator + Copy> {
     bound_len: usize,
     /// How many impls' where-clauses are being related around this point ([`Walk::impl_where`]).
     nested: u32,
+    walk_stack: [Option<WalkFrame<'c>>; WALK_STACK_CAP],
+    walk_sp: usize,
+    comp_stack: [Option<CompFrame<'c>>; COMP_STACK_CAP],
+    comp_sp: usize,
 }
 
 /// The ask's arguments `[Self, trait args..]`, where a side holds them.
@@ -356,57 +382,116 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     /// `a` (a side, followed through its environment) against `b` (a type of the caller's
     /// table), every region erased: the key a selection row is matched by ([`AskArgs`]).
     fn erased(&self, a: Side<'c>, b: PTy, depth: u32, budget: &Cell<u32>) -> Keyed {
-        if depth > MOST_WALK_DEPTH || budget.get() == 0 {
-            return Keyed::Unknown;
+        const MAX_FRAMES: usize = 257; // MOST_WALK_DEPTH (256) + 1
+        #[derive(Clone, Copy)]
+        struct ErasedFrame<'c> {
+            a: Side<'c>,
+            b: PTy,
+            next_k: u32,
+            depth: u32,
         }
-        budget.set(budget.get() - 1);
-        let a = match self.resolve(a) {
-            Ok(Resolved::Side(s)) => s,
-            Ok(Resolved::Unbound { .. }) | Err(_) => return Keyed::Unknown,
-        };
-        // One table: a node is its type (regions live in columns, never in nodes).
-        if let Slots::Caller(_) = a.slots
-            && a.ty == b
-        {
-            return Keyed::Same;
-        }
-        let (Ok(na), Ok(nb)) = (self.node(a), self.types.node(b)) else { return Keyed::Unknown };
-        // What structure does not decide: a hole, an error, an alias not normalized here, an
-        // opaque type against anything but the same opaque type.
         let open = |n: PNode| matches!(n, PNode::Infer | PNode::Error | PNode::Alias { .. });
-        if open(na) || open(nb) {
-            return Keyed::Unknown;
-        }
-        match (na, nb) {
-            (PNode::Opaque(x, _), PNode::Opaque(y, _)) if x != y => return Keyed::Unknown,
-            (PNode::Opaque(..), PNode::Opaque(..)) => {}
-            (PNode::Opaque(..), _) | (_, PNode::Opaque(..)) => return Keyed::Unknown,
-            // A const's type is a node of its own table: compare its bits, then its type.
-            (PNode::ConstValue { ty: ta, bits: x }, PNode::ConstValue { ty: tb, bits: y }) => {
-                if x != y {
+        let mut stack: [Option<ErasedFrame<'c>>; MAX_FRAMES] = [None; MAX_FRAMES];
+        let mut sp: usize = 0;
+        let mut out = Keyed::Same;
+        let mut enter = Some((a, b, depth));
+        loop {
+            if let Some((a, b, d)) = enter.take() {
+                if d > MOST_WALK_DEPTH || budget.get() == 0 {
+                    out = Keyed::Unknown;
+                    continue;
+                }
+                budget.set(budget.get() - 1);
+                let a = match self.resolve(a) {
+                    Ok(Resolved::Side(s)) => s,
+                    Ok(Resolved::Unbound { .. }) | Err(_) => {
+                        out = Keyed::Unknown;
+                        continue;
+                    }
+                };
+                // One table: a node is its type (regions live in columns, never in nodes).
+                if let Slots::Caller(_) = a.slots
+                    && a.ty == b
+                {
+                    continue;
+                }
+                let (Ok(na), Ok(nb)) = (self.node(a), self.types.node(b)) else {
+                    out = Keyed::Unknown;
+                    continue;
+                };
+                // What structure does not decide: a hole, an error, an alias not normalized here, an
+                // opaque type against anything but the same opaque type.
+                if open(na) || open(nb) {
+                    out = Keyed::Unknown;
+                    continue;
+                }
+                match (na, nb) {
+                    (PNode::Opaque(x, _), PNode::Opaque(y, _)) if x != y => {
+                        out = Keyed::Unknown;
+                        continue;
+                    }
+                    (PNode::Opaque(..), PNode::Opaque(..)) => {}
+                    (PNode::Opaque(..), _) | (_, PNode::Opaque(..)) => {
+                        out = Keyed::Unknown;
+                        continue;
+                    }
+                    // A const's type is a node of its own table: compare its bits, then its type.
+                    (PNode::ConstValue { ty: ta, bits: x }, PNode::ConstValue { ty: tb, bits: y }) => {
+                        if x != y {
+                            return Keyed::Differ;
+                        }
+                        enter = Some((Side { ty: ta, slots: a.slots }, tb, d + 1));
+                        continue;
+                    }
+                    _ => {}
+                }
+                if !head_eq(na, nb) {
                     return Keyed::Differ;
                 }
-                return self.erased(Side { ty: ta, slots: a.slots }, tb, depth + 1, budget);
+                let (Ok(ka), Ok(kb)) = (self.kids_of(a), self.types.kids(b)) else {
+                    out = Keyed::Unknown;
+                    continue;
+                };
+                if ka.len() != kb.len() {
+                    return Keyed::Differ;
+                }
+                if ka.len() > 0 {
+                    let Some(slot) = stack.get_mut(sp) else {
+                        out = Keyed::Unknown;
+                        continue;
+                    };
+                    *slot = Some(ErasedFrame { a, b, next_k: 0, depth: d });
+                    sp += 1;
+                }
+                continue;
             }
-            _ => {}
-        }
-        if !head_eq(na, nb) {
-            return Keyed::Differ;
-        }
-        let (Ok(ka), Ok(kb)) = (self.kids_of(a), self.types.kids(b)) else { return Keyed::Unknown };
-        if ka.len() != kb.len() {
-            return Keyed::Differ;
-        }
-        let mut out = Keyed::Same;
-        for k in 0..ka.len() {
-            let (Some(x), Some(y)) = (ka.get(k), kb.get(k)) else { return Keyed::Unknown };
-            match self.erased(Side { ty: x, slots: a.slots }, y, depth + 1, budget) {
-                Keyed::Differ => return Keyed::Differ,
-                Keyed::Unknown => out = Keyed::Unknown,
-                Keyed::Same => {}
+            let Some(top_idx) = sp.checked_sub(1) else {
+                return out;
+            };
+            let Some(Some(mut frame)) = stack.get(top_idx).copied() else {
+                return Keyed::Unknown;
+            };
+            let (Ok(ka), Ok(kb)) = (self.kids_of(frame.a), self.types.kids(frame.b)) else {
+                out = Keyed::Unknown;
+                sp = top_idx;
+                continue;
+            };
+            if frame.next_k < ka.len() {
+                let k = frame.next_k;
+                frame.next_k = k + 1;
+                if let Some(slot) = stack.get_mut(top_idx) {
+                    *slot = Some(frame);
+                }
+                let (Some(x), Some(y)) = (ka.get(k), kb.get(k)) else {
+                    out = Keyed::Unknown;
+                    sp = top_idx;
+                    continue;
+                };
+                enter = Some((Side { ty: x, slots: frame.a.slots }, y, frame.depth + 1));
+            } else {
+                sp = top_idx;
             }
         }
-        out
     }
 
     fn len(&self, s: Side<'c>) -> Result<SlotCount, Refused> {
@@ -433,71 +518,111 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
 
     /// `a` flows where `b` is wanted, under `v`.
     fn walk(&mut self, a: Side<'c>, b: Side<'c>, v: Variance, depth: u32) -> Result<(), Refused> {
-        self.step(a.ty, depth)?;
-        if depth == 0 {
-            // A new relation: its binders are its own.
-            self.bound_len = 0;
-        }
-        let (a, b) = match (self.resolve(a)?, self.resolve(b)?) {
-            (Resolved::Side(a), Resolved::Side(b)) => (a, b),
-            (Resolved::Unbound { env, param }, Resolved::Side(other)) | (Resolved::Side(other), Resolved::Unbound { env, param }) => {
-                return self.envs.bind_type(env, param, other).map_err(|w| self.malformed(other.ty, w));
+        let base_sp = self.walk_sp;
+        let res = self.walk_loop(a, b, v, depth, base_sp);
+        self.walk_sp = base_sp;
+        res
+    }
+
+    fn walk_loop(&mut self, a: Side<'c>, b: Side<'c>, v: Variance, depth: u32, base_sp: usize) -> Result<(), Refused> {
+        let mut enter = Some((a, b, v, depth));
+        loop {
+            if let Some((a, b, v, d)) = enter.take() {
+                self.step(a.ty, d)?;
+                if d == 0 {
+                    // A new relation: its binders are its own.
+                    self.bound_len = 0;
+                }
+                let (a, b) = match (self.resolve(a)?, self.resolve(b)?) {
+                    (Resolved::Side(a), Resolved::Side(b)) => (a, b),
+                    (Resolved::Unbound { env, param }, Resolved::Side(other)) | (Resolved::Side(other), Resolved::Unbound { env, param }) => {
+                        self.envs.bind_type(env, param, other).map_err(|w| self.malformed(other.ty, w))?;
+                        continue;
+                    }
+                    (Resolved::Unbound { param, .. }, Resolved::Unbound { .. }) => return Err(self.malformed(a.ty, Bad::Unconstrained { index: param })),
+                };
+                let (na, nb) = (self.node(a)?, self.node(b)?);
+                // Two CONST arguments (a value or a const parameter each: `[T; 32]` against `[T; N]`,
+                // `Foo<3>` against `Foo<{ N }>` as the callee's head and the caller's instance write
+                // them) carry no region (types.rs: no own slot, no child), and the type checker has
+                // already proved them equal: the region relation has nothing to say and no shape to
+                // check. A const against a TYPE is still `Shape` below (relate tests
+                // `a_const_argument_relates_nothing` and its twin).
+                if is_const(na) && is_const(nb) {
+                    continue;
+                }
+                // An alias meets something other than the same alias: normalize it through the impl
+                // the type checker selected at this call.
+                let same_alias = matches!((na, nb), (PNode::Alias { trait_: t, name: n, .. }, PNode::Alias { trait_: u, name: m, .. }) if t == u && n == m);
+                if !same_alias {
+                    if let PNode::Alias { .. } = na {
+                        let a = self.normalize(a, na, d)?;
+                        enter = Some((a, b, v, d + 1));
+                        continue;
+                    }
+                    if let PNode::Alias { .. } = nb {
+                        let b = self.normalize(b, nb, d)?;
+                        enter = Some((a, b, v, d + 1));
+                        continue;
+                    }
+                }
+                if !head_eq(na, nb) {
+                    return Err(Refused::Shape { item: self.item, a: a.ty, b: b.ty, why: ShapeWhy::Heads { a: Head::of(na), b: Head::of(nb) } });
+                }
+                self.fits(a)?;
+                self.fits(b)?;
+                let own = self.own(a)?;
+                if self.own(b)? != own {
+                    return Err(Refused::Shape { item: self.item, a: a.ty, b: b.ty, why: ShapeWhy::OwnCount });
+                }
+                let ta = self.tab(a.slots);
+                for k in 0..own.get() {
+                    let vk = v.then(ta.variance(a.ty, Pos::Own(k)).map_err(|u| self.count_err(u))?);
+                    let (ra, rb) = (self.slot(a, k)?, self.slot(b, k)?);
+                    self.pair(a.ty, ra, rb, vk, Self::env_of(a), Self::env_of(b))?;
+                }
+                let (ka, kb) = (self.kids_of(a)?, self.kids_of(b)?);
+                if ka.len() != kb.len() {
+                    return Err(Refused::Shape { item: self.item, a: a.ty, b: b.ty, why: ShapeWhy::KidCount });
+                }
+                let (_, ra) = a.slots.split(own).ok_or(self.malformed(a.ty, Bad::StepBound))?;
+                let (_, rb) = b.slots.split(own).ok_or(self.malformed(b.ty, Bad::StepBound))?;
+                if ka.len() > 0 {
+                    let Some(slot) = self.walk_stack.get_mut(self.walk_sp) else {
+                        return Err(self.malformed(a.ty, Bad::StepBound));
+                    };
+                    *slot = Some(WalkFrame { a_ty: a.ty, b_ty: b.ty, ra, rb, v, next_k: 0, depth: d });
+                    self.walk_sp += 1;
+                }
+                continue;
             }
-            (Resolved::Unbound { param, .. }, Resolved::Unbound { .. }) => return Err(self.malformed(a.ty, Bad::Unconstrained { index: param })),
-        };
-        let (na, nb) = (self.node(a)?, self.node(b)?);
-        // Two CONST arguments (a value or a const parameter each: `[T; 32]` against `[T; N]`,
-        // `Foo<3>` against `Foo<{ N }>` as the callee's head and the caller's instance write
-        // them) carry no region (types.rs: no own slot, no child), and the type checker has
-        // already proved them equal: the region relation has nothing to say and no shape to
-        // check. A const against a TYPE is still `Shape` below (relate tests
-        // `a_const_argument_relates_nothing` and its twin).
-        if is_const(na) && is_const(nb) {
-            return Ok(());
-        }
-        // An alias meets something other than the same alias: normalize it through the impl
-        // the type checker selected at this call.
-        let same_alias = matches!((na, nb), (PNode::Alias { trait_: t, name: n, .. }, PNode::Alias { trait_: u, name: m, .. }) if t == u && n == m);
-        if !same_alias {
-            if let PNode::Alias { .. } = na {
-                let a = self.normalize(a, na, depth)?;
-                return self.walk(a, b, v, depth + 1);
+            if self.walk_sp <= base_sp {
+                return Ok(());
             }
-            if let PNode::Alias { .. } = nb {
-                let b = self.normalize(b, nb, depth)?;
-                return self.walk(a, b, v, depth + 1);
+            let top_idx = self.walk_sp - 1;
+            let Some(Some(mut frame)) = self.walk_stack.get(top_idx).copied() else {
+                return Err(self.malformed(a.ty, Bad::StepBound));
+            };
+            let fa = Side { ty: frame.a_ty, slots: frame.ra };
+            let fb = Side { ty: frame.b_ty, slots: frame.rb };
+            let (ka, kb) = (self.kids_of(fa)?, self.kids_of(fb)?);
+            if frame.next_k < ka.len() {
+                let k = frame.next_k;
+                let ta = self.tab(fa.slots);
+                let vk = frame.v.then(ta.variance(fa.ty, Pos::Kid(k)).map_err(|u| self.count_err(u))?);
+                let (ca, na_) = self.kid(fa, &ka, frame.ra, k)?;
+                let (cb, nb_) = self.kid(fb, &kb, frame.rb, k)?;
+                frame.ra = na_;
+                frame.rb = nb_;
+                frame.next_k = k + 1;
+                if let Some(slot) = self.walk_stack.get_mut(top_idx) {
+                    *slot = Some(frame);
+                }
+                enter = Some((ca, cb, vk, frame.depth + 1));
+            } else {
+                self.walk_sp = top_idx;
             }
         }
-        if !head_eq(na, nb) {
-            return Err(Refused::Shape { item: self.item, a: a.ty, b: b.ty, why: ShapeWhy::Heads { a: Head::of(na), b: Head::of(nb) } });
-        }
-        self.fits(a)?;
-        self.fits(b)?;
-        let own = self.own(a)?;
-        if self.own(b)? != own {
-            return Err(Refused::Shape { item: self.item, a: a.ty, b: b.ty, why: ShapeWhy::OwnCount });
-        }
-        let ta = self.tab(a.slots);
-        for k in 0..own.get() {
-            let vk = v.then(ta.variance(a.ty, Pos::Own(k)).map_err(|u| self.count_err(u))?);
-            let (ra, rb) = (self.slot(a, k)?, self.slot(b, k)?);
-            self.pair(a.ty, ra, rb, vk, Self::env_of(a), Self::env_of(b))?;
-        }
-        let (ka, kb) = (self.kids_of(a)?, self.kids_of(b)?);
-        if ka.len() != kb.len() {
-            return Err(Refused::Shape { item: self.item, a: a.ty, b: b.ty, why: ShapeWhy::KidCount });
-        }
-        let (_, mut ra) = a.slots.split(own).ok_or(self.malformed(a.ty, Bad::StepBound))?;
-        let (_, mut rb) = b.slots.split(own).ok_or(self.malformed(b.ty, Bad::StepBound))?;
-        for k in 0..ka.len() {
-            let vk = v.then(ta.variance(a.ty, Pos::Kid(k)).map_err(|u| self.count_err(u))?);
-            let (ca, na_) = self.kid(a, &ka, ra, k)?;
-            let (cb, nb_) = self.kid(b, &kb, rb, k)?;
-            ra = na_;
-            rb = nb_;
-            self.walk(ca, cb, vk, depth + 1)?;
-        }
-        Ok(())
     }
 
     /// The selected impl's value for the alias `s` (its node `n`), its parameters bound by
@@ -557,63 +682,100 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
 
     /// Every component of `s` outlives `region`.
     fn components(&mut self, s: Side<'c>, region: Reg, depth: u32) -> Result<(), Refused> {
-        self.step(s.ty, depth)?;
-        let s = match self.resolve(s)? {
-            Resolved::Side(s) => s,
-            Resolved::Unbound { param, .. } => return Err(self.malformed(s.ty, Bad::Unconstrained { index: param })),
-        };
-        let n = self.node(s)?;
-        match n {
-            PNode::Param(p) => {
-                // The caller's own type parameter: `ρ_P: 'r`, checked against the caller's bounds.
-                let rho = self.owner.param(p).ok_or(self.malformed(s.ty, Bad::NoParamOrigin { param: p }))?;
-                return self.outlives(s.ty, Reg::Origin(rho), region);
-            }
-            PNode::Alias { trait_, name, .. } => {
-                let selected: &'c dyn Selected = self.selected;
-                let key = Keyer { walk: &*self, at: AskAt::Kids(s), budget: Cell::new(MOST_WALK_STEPS) };
-                if let Selection::Impl { value: Some(_), .. } = selected.select_keyed(Ask { trait_, name: Some(name), written: s.ty }, &key) {
-                    let value = self.normalize(s, n, depth)?;
-                    return self.components(value, region, depth + 1);
+        let base_sp = self.comp_sp;
+        let res = self.components_loop(s, region, depth, base_sp);
+        self.comp_sp = base_sp;
+        res
+    }
+
+    fn components_loop(&mut self, s: Side<'c>, region: Reg, depth: u32, base_sp: usize) -> Result<(), Refused> {
+        let mut enter = Some((s, depth));
+        loop {
+            if let Some((cur, d)) = enter.take() {
+                self.step(cur.ty, d)?;
+                let cur = match self.resolve(cur)? {
+                    Resolved::Side(s) => s,
+                    Resolved::Unbound { param, .. } => return Err(self.malformed(cur.ty, Bad::Unconstrained { index: param })),
+                };
+                let n = self.node(cur)?;
+                match n {
+                    PNode::Param(p) => {
+                        // The caller's own type parameter: `ρ_P: 'r`, checked against the caller's bounds.
+                        let rho = self.owner.param(p).ok_or(self.malformed(cur.ty, Bad::NoParamOrigin { param: p }))?;
+                        self.outlives(cur.ty, Reg::Origin(rho), region)?;
+                        continue;
+                    }
+                    PNode::Alias { trait_, name, .. } => {
+                        let selected: &'c dyn Selected = self.selected;
+                        let key = Keyer { walk: &*self, at: AskAt::Kids(cur), budget: Cell::new(MOST_WALK_STEPS) };
+                        if let Selection::Impl { value: Some(_), .. } = selected.select_keyed(Ask { trait_, name: Some(name), written: cur.ty }, &key) {
+                            let value = self.normalize(cur, n, d)?;
+                            enter = Some((value, d + 1));
+                            continue;
+                        }
+                        // Not selected: the alias outlives `'r` if its arguments do (RFC 1214's
+                        // projection rule, its sufficient half).
+                    }
+                    PNode::Closure { .. } | PNode::Future(..) if matches!(cur.slots, Slots::Caller(_)) => {
+                        // A body type of the caller: every type parameter its captures hold outlives
+                        // `'r` (the Reference, "Closure types"; `spawn(|| use_p(p))` with `F: 'static`
+                        // asks `P: 'static`, E0310 where the caller has no such bound). Its own slots
+                        // below. Census wave-1119 (b): `(Param(1), Uni(Static))` at `spawn_blocking`.
+                        let owner: &'c dyn Owner = self.owner;
+                        let params = owner.body_params(cur.ty).ok_or(self.malformed(cur.ty, Bad::BodyParamsUnread))?;
+                        for &p in params {
+                            let rho = owner.param(p).ok_or(self.malformed(cur.ty, Bad::NoParamOrigin { param: p }))?;
+                            self.outlives(cur.ty, Reg::Origin(rho), region)?;
+                        }
+                    }
+                    _ => {}
                 }
-                // Not selected: the alias outlives `'r` if its arguments do (RFC 1214's
-                // projection rule, its sufficient half).
-            }
-            PNode::Closure { .. } | PNode::Future(..) if matches!(s.slots, Slots::Caller(_)) => {
-                // A body type of the caller: every type parameter its captures hold outlives
-                // `'r` (the Reference, "Closure types"; `spawn(|| use_p(p))` with `F: 'static`
-                // asks `P: 'static`, E0310 where the caller has no such bound). Its own slots
-                // below. Census wave-1119 (b): `(Param(1), Uni(Static))` at `spawn_blocking`.
-                let owner: &'c dyn Owner = self.owner;
-                let params = owner.body_params(s.ty).ok_or(self.malformed(s.ty, Bad::BodyParamsUnread))?;
-                for &p in params {
-                    let rho = owner.param(p).ok_or(self.malformed(s.ty, Bad::NoParamOrigin { param: p }))?;
-                    self.outlives(s.ty, Reg::Origin(rho), region)?;
+                self.fits(cur)?;
+                let own = self.own(cur)?;
+                for k in 0..own.get() {
+                    match self.slot(cur, k)? {
+                        RegAt::Known(Reg::Bound { .. }) => {}
+                        RegAt::Known(r) => self.outlives(cur.ty, r, region)?,
+                        RegAt::Unbound { param, .. } => return Err(self.malformed(cur.ty, Bad::Unconstrained { index: param })),
+                    }
                 }
+                if let PNode::Dynamic(_) = n {
+                    // `dyn Tr + 'o: 'r` iff `'o: 'r`.
+                    continue;
+                }
+                let kids = self.kids_of(cur)?;
+                let (_, rest) = cur.slots.split(own).ok_or(self.malformed(cur.ty, Bad::StepBound))?;
+                if kids.len() > 0 {
+                    let Some(slot) = self.comp_stack.get_mut(self.comp_sp) else {
+                        return Err(self.malformed(cur.ty, Bad::StepBound));
+                    };
+                    *slot = Some(CompFrame { ty: cur.ty, rest, next_k: 0, depth: d });
+                    self.comp_sp += 1;
+                }
+                continue;
             }
-            _ => {}
-        }
-        self.fits(s)?;
-        let own = self.own(s)?;
-        for k in 0..own.get() {
-            match self.slot(s, k)? {
-                RegAt::Known(Reg::Bound { .. }) => {}
-                RegAt::Known(r) => self.outlives(s.ty, r, region)?,
-                RegAt::Unbound { param, .. } => return Err(self.malformed(s.ty, Bad::Unconstrained { index: param })),
+            if self.comp_sp <= base_sp {
+                return Ok(());
+            }
+            let top_idx = self.comp_sp - 1;
+            let Some(Some(mut frame)) = self.comp_stack.get(top_idx).copied() else {
+                return Err(self.malformed(s.ty, Bad::StepBound));
+            };
+            let fs = Side { ty: frame.ty, slots: frame.rest };
+            let kids = self.kids_of(fs)?;
+            if frame.next_k < kids.len() {
+                let k = frame.next_k;
+                let (c, r) = self.kid(fs, &kids, frame.rest, k)?;
+                frame.rest = r;
+                frame.next_k = k + 1;
+                if let Some(slot) = self.comp_stack.get_mut(top_idx) {
+                    *slot = Some(frame);
+                }
+                enter = Some((c, frame.depth + 1));
+            } else {
+                self.comp_sp = top_idx;
             }
         }
-        if let PNode::Dynamic(_) = n {
-            // `dyn Tr + 'o: 'r` iff `'o: 'r`.
-            return Ok(());
-        }
-        let kids = self.kids_of(s)?;
-        let (_, mut rest) = s.slots.split(own).ok_or(self.malformed(s.ty, Bad::StepBound))?;
-        for k in 0..kids.len() {
-            let (c, r) = self.kid(s, &kids, rest, k)?;
-            rest = r;
-            self.components(c, region, depth + 1)?;
-        }
-        Ok(())
     }
 
     /// The well-formedness of an instantiated signature type at a call (RFC 1214, `WF(&'r T)`
@@ -624,33 +786,70 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     /// well-formedness is the type checker's). A reference whose region a binder inside the
     /// signature binds (`Reg::Bound`) adds nothing here.
     fn wf(&mut self, s: Side<'c>, depth: u32) -> Result<(), Refused> {
-        self.step(s.ty, depth)?;
-        let s = match self.resolve(s)? {
-            Resolved::Side(s) => s,
-            Resolved::Unbound { param, .. } => return Err(self.malformed(s.ty, Bad::Unconstrained { index: param })),
-        };
-        let n = self.node(s)?;
-        let descend = matches!(n, PNode::Ref(..) | PNode::Ptr(..) | PNode::Slice(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Adt(..));
-        if !descend {
-            return Ok(());
+        const MAX_FRAMES: usize = 257; // MOST_WALK_DEPTH (256) + 1
+        #[derive(Clone, Copy)]
+        struct WfFrame<'c> {
+            s: Side<'c>,
+            is_ref: bool,
+            rest: Slots<'c>,
+            next_k: u32,
+            depth: u32,
         }
-        self.fits(s)?;
-        let own = self.own(s)?;
-        let kids = self.kids_of(s)?;
-        let (_, mut rest) = s.slots.split(own).ok_or(self.malformed(s.ty, Bad::StepBound))?;
-        for k in 0..kids.len() {
-            let (c, r) = self.kid(s, &kids, rest, k)?;
-            rest = r;
-            if let PNode::Ref(..) = n {
-                match self.slot(s, 0)? {
-                    RegAt::Known(Reg::Bound { .. }) => {}
-                    RegAt::Known(region) => self.components(c, region, depth + 1)?,
-                    RegAt::Unbound { param, .. } => return Err(self.malformed(s.ty, Bad::Unconstrained { index: param })),
+        let mut stack: [Option<WfFrame<'c>>; MAX_FRAMES] = [None; MAX_FRAMES];
+        let mut sp: usize = 0;
+        let mut enter = Some((s, depth));
+        loop {
+            if let Some((cur, d)) = enter.take() {
+                self.step(cur.ty, d)?;
+                let cur = match self.resolve(cur)? {
+                    Resolved::Side(s) => s,
+                    Resolved::Unbound { param, .. } => return Err(self.malformed(cur.ty, Bad::Unconstrained { index: param })),
+                };
+                let n = self.node(cur)?;
+                let descend = matches!(n, PNode::Ref(..) | PNode::Ptr(..) | PNode::Slice(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Adt(..));
+                if !descend {
+                    continue;
                 }
+                self.fits(cur)?;
+                let own = self.own(cur)?;
+                let kids = self.kids_of(cur)?;
+                let (_, rest) = cur.slots.split(own).ok_or(self.malformed(cur.ty, Bad::StepBound))?;
+                if kids.len() > 0 {
+                    let Some(slot) = stack.get_mut(sp) else {
+                        return Err(self.malformed(cur.ty, Bad::StepBound));
+                    };
+                    *slot = Some(WfFrame { s: cur, is_ref: matches!(n, PNode::Ref(..)), rest, next_k: 0, depth: d });
+                    sp += 1;
+                }
+                continue;
             }
-            self.wf(c, depth + 1)?;
+            let Some(top_idx) = sp.checked_sub(1) else {
+                return Ok(());
+            };
+            let Some(Some(mut frame)) = stack.get(top_idx).copied() else {
+                return Err(self.malformed(s.ty, Bad::StepBound));
+            };
+            let kids = self.kids_of(frame.s)?;
+            if frame.next_k < kids.len() {
+                let k = frame.next_k;
+                let (c, r) = self.kid(frame.s, &kids, frame.rest, k)?;
+                frame.rest = r;
+                frame.next_k = k + 1;
+                if let Some(slot) = stack.get_mut(top_idx) {
+                    *slot = Some(frame);
+                }
+                if frame.is_ref {
+                    match self.slot(frame.s, 0)? {
+                        RegAt::Known(Reg::Bound { .. }) => {}
+                        RegAt::Known(region) => self.components(c, region, frame.depth + 1)?,
+                        RegAt::Unbound { param, .. } => return Err(self.malformed(frame.s.ty, Bad::Unconstrained { index: param })),
+                    }
+                }
+                enter = Some((c, frame.depth + 1));
+            } else {
+                sp = top_idx;
+            }
         }
-        Ok(())
     }
 
     /// `subject: trait_ref`: its regions tied to what proves it.
@@ -824,42 +1023,78 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     /// empty where the clause WRITES no region (`T: Marker`, `I: Iterator<Item = T>`, `F:
     /// FnOnce(T) -> U`), while the instance of `T` may hold any.
     fn inert(&self, s: Side<'c>, depth: u32, budget: &mut u32) -> Result<bool, Refused> {
-        if depth > MOST_WALK_DEPTH || *budget == 0 {
-            return Err(self.malformed(s.ty, Bad::StepBound));
+        const MAX_FRAMES: usize = 257; // MOST_WALK_DEPTH (256) + 1
+        #[derive(Clone, Copy)]
+        struct InertFrame<'c> {
+            s: Side<'c>,
+            rest: Slots<'c>,
+            next_k: u32,
+            depth: u32,
         }
-        *budget -= 1;
-        let s = match self.resolve(s)? {
-            Resolved::Side(s) => s,
-            // An impl parameter no header walk bound: the proof's choice, which may be anything.
-            Resolved::Unbound { .. } => return Ok(false),
-        };
-        if self.fits(s)? != SlotCount::ZERO {
-            return Ok(false);
-        }
-        match self.node(s)? {
-            // The caller's own parameter (its `ρ_P`), or a type not decided.
-            PNode::Param(_) | PNode::Infer | PNode::Error => return Ok(false),
-            PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => {
-                // A body type of the caller with no slot: inert only where its captures hold no
-                // caller parameter (`Owner::body_params`, the components rule's answer). A body
-                // type in a declared column is never laid there: not inert.
-                let Slots::Caller(_) = s.slots else { return Ok(false) };
-                let owner: &'c dyn Owner = self.owner;
-                return Ok(matches!(owner.body_params(s.ty), Some(p) if p.is_empty()));
+        let mut stack: [Option<InertFrame<'c>>; MAX_FRAMES] = [None; MAX_FRAMES];
+        let mut sp: usize = 0;
+        let mut enter = Some((s, depth));
+        loop {
+            if let Some((cur, d)) = enter.take() {
+                if d > MOST_WALK_DEPTH || *budget == 0 {
+                    return Err(self.malformed(cur.ty, Bad::StepBound));
+                }
+                *budget -= 1;
+                let cur = match self.resolve(cur)? {
+                    Resolved::Side(s) => s,
+                    // An impl parameter no header walk bound: the proof's choice, which may be anything.
+                    Resolved::Unbound { .. } => return Ok(false),
+                };
+                if self.fits(cur)? != SlotCount::ZERO {
+                    return Ok(false);
+                }
+                match self.node(cur)? {
+                    // The caller's own parameter (its `ρ_P`), or a type not decided.
+                    PNode::Param(_) | PNode::Infer | PNode::Error => return Ok(false),
+                    PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => {
+                        // A body type of the caller with no slot: inert only where its captures hold no
+                        // caller parameter (`Owner::body_params`, the components rule's answer). A body
+                        // type in a declared column is never laid there: not inert.
+                        let Slots::Caller(_) = cur.slots else { return Ok(false) };
+                        let owner: &'c dyn Owner = self.owner;
+                        if !matches!(owner.body_params(cur.ty), Some(p) if p.is_empty()) {
+                            return Ok(false);
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                // No slot under `cur` (`fits` above): each child takes none of `rest`.
+                let kids = self.kids_of(cur)?;
+                if kids.len() > 0 {
+                    let Some(slot) = stack.get_mut(sp) else {
+                        return Err(self.malformed(cur.ty, Bad::StepBound));
+                    };
+                    *slot = Some(InertFrame { s: cur, rest: cur.slots, next_k: 0, depth: d });
+                    sp += 1;
+                }
+                continue;
             }
-            _ => {}
-        }
-        // No slot under `s` (`fits` above): each child takes none of `rest`.
-        let kids = self.kids_of(s)?;
-        let mut rest = s.slots;
-        for k in 0..kids.len() {
-            let (c, r) = self.kid(s, &kids, rest, k)?;
-            rest = r;
-            if !self.inert(c, depth + 1, budget)? {
-                return Ok(false);
+            let Some(top_idx) = sp.checked_sub(1) else {
+                return Ok(true);
+            };
+            let Some(Some(mut frame)) = stack.get(top_idx).copied() else {
+                return Err(self.malformed(s.ty, Bad::StepBound));
+            };
+            let kids = self.kids_of(frame.s)?;
+            if frame.next_k < kids.len() {
+                let k = frame.next_k;
+                let (c, r) = self.kid(frame.s, &kids, frame.rest, k)?;
+                frame.rest = r;
+                frame.next_k = k + 1;
+                if let Some(slot) = stack.get_mut(top_idx) {
+                    *slot = Some(frame);
+                }
+                enter = Some((c, frame.depth + 1));
+            } else {
+                sp = top_idx;
             }
         }
-        Ok(true)
     }
 
     /// `<T as Tr<A..>>::N == U` (an `ExProj` laid subject-first, `[T, A..]` then the term `U`).
@@ -991,7 +1226,8 @@ pub fn head_eq(a: PNode, b: PNode) -> bool {
         (PNode::Int(x), PNode::Int(y)) => x == y,
         (PNode::Uint(x), PNode::Uint(y)) => x == y,
         (PNode::Float(x), PNode::Float(y)) => x == y,
-        (PNode::Tuple(_), PNode::Tuple(_)) | (PNode::Record(_), PNode::Record(_)) | (PNode::Union(_), PNode::Union(_)) | (PNode::Slice(_), PNode::Slice(_)) | (PNode::Dynamic(_), PNode::Dynamic(_)) => true,
+        (PNode::Tuple(_), PNode::Tuple(_)) | (PNode::Union(_), PNode::Union(_)) | (PNode::Slice(_), PNode::Slice(_)) | (PNode::Dynamic(_), PNode::Dynamic(_)) => true,
+        (PNode::Record(s1, _), PNode::Record(s2, _)) => s1 == s2,
         (PNode::Ref(m, _), PNode::Ref(n, _)) | (PNode::Ptr(m, _), PNode::Ptr(n, _)) => m == n,
         // The length is a const: equal by the type checker.
         (PNode::Array(..), PNode::Array(..)) | (PNode::Pat(..), PNode::Pat(..)) => true,
@@ -1029,6 +1265,10 @@ fn walker<'w, 'c, 'k: 'c, A: Allocator + Copy>(cx: &'w mut Cx<'k, '_>, envs: &'w
         bound: [None; MOST_BOUND_PAIRS],
         bound_len: 0,
         nested: 0,
+        walk_stack: [None; WALK_STACK_CAP],
+        walk_sp: 0,
+        comp_stack: [None; COMP_STACK_CAP],
+        comp_sp: 0,
     }
 }
 

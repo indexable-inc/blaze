@@ -38,11 +38,16 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         // a closure's its environment's inside its one field (closure.rs `capture_offsets`).
         let mut fields: Vec<PTy, A> = Vec::new_in(self.alloc);
         let mut base = 0u32;
+        let mut is_union = false;
         let held = match self.ground_node(me).map_err(sig_err)? {
             PNode::FnDef(..) | PNode::FnPtr(..) => None,
-            PNode::Tuple(l) | PNode::Record(l) => {
+            PNode::Tuple(l) | PNode::Record(_, l) => {
                 fields.extend_from_slice(self.ground.view().list(l).map_err(past)?);
                 Some(me)
+            }
+            PNode::Union(l) => {
+                is_union = true;
+                if l.len == 0 { None } else { Some(me) }
             }
             PNode::Closure { .. } => {
                 let parts = self.closure_parts(me).map_err(sig_err)?;
@@ -83,6 +88,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return Err(malformed("a builtin `clone`'s `&self` not passed as a pointer"));
         };
         match held {
+            Some(_) if !copy && is_union => self.clone_union(clone, at, me)?,
             Some(held) if !copy => self.clone_fields(clone, at, held, base, &fields)?,
             _ => {
                 // `*self`: the bytes, whatever `Self` holds.
@@ -95,6 +101,116 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return Err(BuildError::Lir(error.clone()));
         }
         Ok(())
+    }
+
+    /// Clones a tagged `PNode::Union` at `at` by switching on its discriminant and cloning only
+    /// the active variant's member, writing its tag into the result.
+    fn clone_union(&mut self, clone: ItemKey, at: Value, me: PTy) -> Result<(), BuildError> {
+        let sig_err = |error: TyErr| match error {
+            TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
+            TyErr::Malformed(what) => malformed(what),
+            TyErr::Other(error) => error,
+        };
+        let full = |_| malformed("the ground table is full");
+        let ptr_pass = self.rust_pass(Repr::Ptr)?;
+        if let PNode::Union(l) = self.ground_node(me).map_err(sig_err)?
+            && l.len == 1
+        {
+            let only = self
+                .ground
+                .view()
+                .list(l)
+                .ok()
+                .and_then(|xs| xs.first().copied())
+                .ok_or(malformed("a union list past the ground table"))?;
+            self.push_val(V::Scalar(at), None);
+            let args = self.ground.intern_list(&[only]).map_err(full)?;
+            let rpass = self.rust_pass(self.ret)?;
+            self.call_instance(None, Instance { item: clone, args }, &[Repr::Ptr], &[ptr_pass], None, self.ret, rpass)?;
+            let v = self.pop()?;
+            return self.ret_value(v);
+        }
+        let Repr::Agg(lh) = self.ret else {
+            return self.ret_value(V::None);
+        };
+        let lh_idx = usize::try_from(lh).map_err(|_| malformed("a layout index past usize"))?;
+        let Shape::Enum { id, first, len } = self.layouts.get(lh_idx).ok_or(malformed("a layout index past layouts"))?.shape else {
+            return Err(malformed("a union without an enum shape"));
+        };
+        let to = self.temp(self.ret);
+        let variants = self.ls.get(id).variants;
+        match variants {
+            Variants::Single { index } => {
+                if index < len {
+                    let vrow = first
+                        .checked_add(index)
+                        .and_then(|k| usize::try_from(k).ok())
+                        .and_then(|k| self.layout_variants.get(k).copied())
+                        .ok_or(malformed("a variant past `layout_variants`"))?;
+                    if vrow.1 == 1 {
+                        let fidx = usize::try_from(vrow.0).map_err(|_| malformed("a field index past usize"))?;
+                        let &(_, off, frepr) = self.layout_fields.get(fidx).ok_or(malformed("a field past `layout_fields`"))?;
+                        let &ft = self.layout_field_tys.get(fidx).ok_or(malformed("a field past `layout_field_tys`"))?;
+                        let off_i32 = i32::try_from(off).map_err(|_| malformed("a field offset past i32"))?;
+                        let to_off = to.1.checked_add(off_i32).ok_or(malformed("a field offset past i32"))?;
+                        let field = self.address((at, off_i32));
+                        self.push_val(V::Scalar(field), None);
+                        let args = self.ground.intern_list(&[ft]).map_err(full)?;
+                        let rpass = self.rust_pass(frepr)?;
+                        self.call_instance(None, Instance { item: clone, args }, &[Repr::Ptr], &[ptr_pass], None, frepr, rpass)?;
+                        let cloned = self.pop()?;
+                        self.store(cloned, frepr, (to.0, to_off))?;
+                    }
+                }
+                self.ret_value(V::Place(to.0, to.1))
+            }
+            Variants::Multiple { .. } => {
+                let d = self.read_discriminant(id, (at, 0))?;
+                let join = self.create();
+                let none = self.create();
+                let cap = usize::try_from(len).map_err(|_| malformed("too many union variants"))?;
+                let mut cases = blaze_own::Vec::with_capacity_in(cap, self.alloc);
+                let mut arms = blaze_own::Vec::with_capacity_in(cap, self.alloc);
+                for v in 0..len {
+                    let block = self.create();
+                    cases.push((self.discriminant_case(id, v)?, block));
+                    arms.push((v, block));
+                }
+                self.switch(d, none, &cases);
+                self.begin(none);
+                self.unreachable_of_enum(id, len, None)?;
+                for &(v, block) in arms.iter() {
+                    self.begin(block);
+                    if self.ls.variant(id, v).is_none() {
+                        self.unreachable_of_enum(id, len, None)?;
+                        continue;
+                    }
+                    let vrow = first
+                        .checked_add(v)
+                        .and_then(|k| usize::try_from(k).ok())
+                        .and_then(|k| self.layout_variants.get(k).copied())
+                        .ok_or(malformed("a variant past `layout_variants`"))?;
+                    if vrow.1 == 1 {
+                        let fidx = usize::try_from(vrow.0).map_err(|_| malformed("a field index past usize"))?;
+                        let &(_, off, frepr) = self.layout_fields.get(fidx).ok_or(malformed("a field past `layout_fields`"))?;
+                        let &ft = self.layout_field_tys.get(fidx).ok_or(malformed("a field past `layout_field_tys`"))?;
+                        let off_i32 = i32::try_from(off).map_err(|_| malformed("a field offset past i32"))?;
+                        let to_off = to.1.checked_add(off_i32).ok_or(malformed("a field offset past i32"))?;
+                        let field = self.address((at, off_i32));
+                        self.push_val(V::Scalar(field), None);
+                        let args = self.ground.intern_list(&[ft]).map_err(full)?;
+                        let rpass = self.rust_pass(frepr)?;
+                        self.call_instance(None, Instance { item: clone, args }, &[Repr::Ptr], &[ptr_pass], None, frepr, rpass)?;
+                        let cloned = self.pop()?;
+                        self.store(cloned, frepr, (to.0, to_off))?;
+                    }
+                    self.write_tag(Some(id), v, to);
+                    self.jump(join, &[]);
+                }
+                self.begin(join);
+                self.ret_value(V::Place(to.0, to.1))
+            }
+        }
     }
 
     /// `(self.0.clone(), self.1.clone(), ..)` of the fields `fields` of `held` (a tuple), at

@@ -140,7 +140,7 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
         let mut i = self.sched.len();
         while i > to {
             i -= 1;
-            let x = self.sched[i];
+            let Some(&x) = self.sched.get(i) else { return self.refuse(crate::Construct::Malformed, self.body.root) };
             if x.drops {
                 let unwind = self.chain(i);
                 let next = self.b.new_block(BlockKind::Normal);
@@ -161,7 +161,7 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
         let mut i = to;
         while i > from {
             i -= 1;
-            let x = self.sched[i];
+            let Some(&x) = self.sched.get(i) else { return self.refuse(crate::Construct::Malformed, self.body.root) };
             if x.drops {
                 let unwind = self.chain(i);
                 let next = self.b.new_block(BlockKind::Normal);
@@ -189,10 +189,10 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
     pub(crate) fn chain(&mut self, top: usize) -> Unwind {
         let mut todo: Vec<usize, A> = Vec::new_in(self.alloc);
         let mut below: Option<Block> = None;
-        let mut j = top;
+        let mut j = top.min(self.sched.len());
         while j > 0 {
             j -= 1;
-            let x = self.sched[j];
+            let Some(&x) = self.sched.get(j) else { continue };
             if !x.drops {
                 continue;
             }
@@ -204,13 +204,16 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
         }
         // `todo` holds the entries without a block, highest first: make them lowest first.
         while let Some(i) = todo.pop() {
+            let Some(place) = self.sched.get(i).map(|x| x.place) else { continue };
             let next = match below {
                 Some(b) => b,
                 None => self.resume_block(),
             };
             let block = self.b.new_block(BlockKind::Cleanup);
-            self.pending.push(Pending::Drop { block, place: self.sched[i].place, next });
-            self.sched[i].cleanup = Some(block);
+            self.pending.push(Pending::Drop { block, place, next });
+            if let Some(entry) = self.sched.get_mut(i) {
+                entry.cleanup = Some(block);
+            }
             below = Some(block);
         }
         match below {
@@ -240,8 +243,8 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
     /// Fills each cleanup block made, after the body's last normal block.
     pub(crate) fn fill_cleanups(&mut self, span: Span) {
         let mut i = 0;
-        while i < self.pending.len() {
-            match self.pending[i] {
+        while let Some(&pending) = self.pending.get(i) {
+            match pending {
                 Pending::Drop { block, place, next } => {
                     self.b.start(block);
                     self.b.terminate(StmtKind::Drop { place, target: next, unwind: Unwind::Terminate }, span);

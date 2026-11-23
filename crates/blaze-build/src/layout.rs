@@ -1280,7 +1280,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         let view = cx.ground.view();
         let node = view.node(t).map_err(|_| Refusal::Malformed("a type past the ground table"))?;
         match node {
-            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => out.extend_from_slice(view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?),
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => out.extend_from_slice(view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?),
             PNode::Array(e, _) | PNode::Slice(e) | PNode::Pat(e, _) => out.push(e),
             // A closure (codegen.md, "Closures and the Fn traits"): a struct of one field, its
             // environment, a fact of its identity grounded at the owner's arguments.
@@ -1497,96 +1497,44 @@ impl<A: Allocator + Clone> Layouts<A> {
                     discrs: (0, 0),
                 }
             }
-            PNode::Tuple(_) | PNode::Record(_) | PNode::Closure { .. } => {
+            PNode::Tuple(_) | PNode::Record(..) | PNode::Closure { .. } => {
                 let u = self.univariant(parts, Order::Decreasing, ReprAttrs::RUST, 0, 0, cx.scratch)?;
                 self.struct_row(t, u)
             }
-            PNode::Union(_) => match parts {
-                [] => zst(true),
-                [only] => {
-                    let inner_id = self.done(*only).ok_or(Refusal::Malformed("a union member not laid out"))?;
-                    let inner = *self.get(inner_id);
-                    Layout { ty: t, ..inner }
-                }
-                _ => {
-                    let count = u32::try_from(parts.len()).map_err(|_| Refusal::TooLarge)?;
-                    let tag_prim = if parts.len() <= 256 {
-                        Prim::Int { bytes: 1, signed: false }
-                    } else if parts.len() <= 65_536 {
-                        Prim::Int { bytes: 2, signed: false }
-                    } else {
-                        Prim::Int { bytes: 4, signed: false }
-                    };
-                    let tag_align = tag_prim.align();
-                    let tag = Scalar {
-                        prim: tag_prim,
-                        valid: WrappingRange { start: 0, end: u128::from(count - 1) },
-                    };
-                    let mut max_align = 0u8;
-                    let mut max_payload_size = 0u64;
-                    let mut uninhabited = true;
-                    for &p in parts {
-                        let lid = self.done(p).ok_or(Refusal::Malformed("a union member not laid out"))?;
-                        let l = *self.get(lid);
-                        if l.tail != Tail::Sized {
-                            return Err(Refusal::Malformed("a union of an unsized member"));
-                        }
-                        max_align = max_align.max(l.align);
-                        max_payload_size = max_payload_size.max(l.size);
-                        uninhabited &= l.uninhabited;
-                    }
-                    let align = tag_align.max(max_align);
-                    let payload_offset = align_up(tag_prim.size(), max_align)?;
-                    let raw_size = payload_offset.checked_add(max_payload_size).ok_or(Refusal::TooLarge)?;
-                    let size = align_up(raw_size, align)?;
-                    let discr_first = u32::try_from(self.discrs.len()).map_err(|_| Refusal::TooLarge)?;
-                    let variants_first = u32::try_from(self.variant_rows.len()).map_err(|_| Refusal::TooLarge)?;
-                    for (v, &p) in parts.iter().enumerate() {
-                        let v_u32 = u32::try_from(v).map_err(|_| Refusal::TooLarge)?;
-                        self.discrs.push(i128::from(v_u32));
-                        let lid = self.done(p).ok_or(Refusal::Malformed("a union member not laid out"))?;
-                        let member_uninhabited = self.get(lid).uninhabited;
-                        let off_first = u32::try_from(self.offsets.len()).map_err(|_| Refusal::TooLarge)?;
-                        self.offsets.push(payload_offset);
-                        let v_id = self.push(Layout {
-                            ty: t,
-                            call_ty: t,
-                            size,
-                            align,
-                            tail: Tail::Sized,
-                            uninhabited: member_uninhabited,
-                            scalar: None,
-                            pair: None,
-                            fields: Fields::Struct { first: off_first, len: 1 },
-                            variants: Variants::Single { index: v_u32 },
-                            niche: None,
-                            discrs: (0, 0),
-                        })?;
-                        self.variant_rows.push(v_id);
-                    }
-                    let scalar = (size == tag_prim.size()).then_some(tag);
-                    Layout {
-                        ty: t,
-                        call_ty: t,
-                        size,
-                        align,
-                        tail: Tail::Sized,
-                        uninhabited,
-                        scalar,
-                        pair: None,
-                        fields: Fields::Struct { first: 0, len: 0 },
-                        variants: Variants::Multiple {
-                            tag,
-                            tag_offset: 0,
-                            encoding: TagEncoding::Direct,
-                            first: variants_first,
-                            count,
-                        },
-                        niche: Niche::of(0, tag),
-                        discrs: (discr_first, count),
+            PNode::Union(_) => {
+                for &p in parts {
+                    let lid = self.done(p).ok_or(Refusal::Malformed("a union member not laid out"))?;
+                    if self.get(lid).tail != Tail::Sized {
+                        return Err(Refusal::Malformed("a union of an unsized member"));
                     }
                 }
-            },
+                let count = u32::try_from(parts.len()).map_err(|_| Refusal::TooLarge)?;
+                let discr_first = u32::try_from(self.discrs.len()).map_err(|_| Refusal::TooLarge)?;
+                for v in 0..count {
+                    self.discrs.push(i128::from(v));
+                }
+                let discrs = (discr_first, count);
+                if parts.is_empty() {
+                    let mut l = self.zst_row(t, true);
+                    l.discrs = discrs;
+                    return self.push(l);
+                }
+                if let [only] = parts {
+                    let inner = *self.get(self.done(*only).ok_or(Refusal::Malformed("a union member not laid out"))?);
+                    let u = self.univariant(parts, Order::Decreasing, ReprAttrs::RUST, 0, 0, cx.scratch)?;
+                    let mut row = self.struct_row(t, u);
+                    row.call_ty = inner.call_ty;
+                    row.variants = Variants::Single { index: 0 };
+                    row.discrs = discrs;
+                    return self.push(row);
+                }
+                let fields_of = |v: usize| {
+                    v.checked_add(1)
+                        .and_then(|end| parts.get(v..end))
+                        .ok_or(Refusal::Malformed("a union variant past its parts"))
+                };
+                return self.repr_rust_variants(t, parts.len(), ReprAttrs::RUST, &fields_of, discrs, cx.scratch);
+            }
             PNode::Adt(key, _) => return self.adt(t, key, cx, parts),
             // A coroutine's state (coroutine.rs): a struct of one field, its upvars' tuple at
             // offset 0, in the size and alignment the pass gave the instance's built body. No
@@ -1678,7 +1626,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 PNode::Str => return Ok(Some(Tail::Slice { stride: 1 })),
                 PNode::Slice(_) => return Ok(Some(Tail::Slice { stride: 0 })),
                 PNode::Dynamic(_) => return Ok(Some(Tail::Dyn)),
-                PNode::Tuple(l) | PNode::Record(l) => match view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?.last() {
+                PNode::Tuple(l) | PNode::Record(_, l) => match view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?.last() {
                     Some(&last) => p = last,
                     None => return Ok(None),
                 },
@@ -2014,6 +1962,21 @@ impl<A: Allocator + Clone> Layouts<A> {
             return self.tagged(t, n, tag, 0, start, c_attrs, Order::Declaration, &fields_of, discrs, scratch);
         }
 
+        self.repr_rust_variants(t, n, attrs, &fields_of, discrs, scratch)
+    }
+
+    /// `repr(Rust)` multi-variant layout: rustc's `layout_of_enum`
+    /// (`crates/rustc_abi/src/layout.rs`), shared by `repr(Rust)` enums and `PNode::Union`.
+    fn repr_rust_variants<'p>(
+        &mut self,
+        t: PTy,
+        n: usize,
+        attrs: ReprAttrs,
+        fields_of: &dyn Fn(usize) -> Result<&'p [PTy], Refusal>,
+        discrs: (u32, u32),
+        scratch: Alloc<'_>,
+    ) -> Result<LayoutId, Refusal> {
+        let discr_first = discrs.0;
         // repr(Rust): rustc's `layout_of_enum` (crates/rustc_abi/src/layout.rs, the pinned
         // toolchain's), each step named there. Each variant alone, as a struct.
         let mut probes: Vec<Probe, Alloc<'_>> = Vec::with_capacity_in(n, scratch);
@@ -2096,7 +2059,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         values.extend(necessary.iter().map(|&d| (d as u128) & mask(tag_bits)));
         let tag = Scalar { prim: tag_prim, valid: smallest_range(&mut values, tag_bits) };
         let mark = (self.offsets.len(), self.variant_rows.len(), self.rows.len());
-        let tagged = self.tagged(t, n, tag, 0, tag_prim.size(), attrs, Order::Increasing, &fields_of, discrs, scratch)?;
+        let tagged = self.tagged(t, n, tag, 0, tag_prim.size(), attrs, Order::Increasing, fields_of, discrs, scratch)?;
         #[cfg(test)]
         if self.niche_off {
             return Ok(tagged);

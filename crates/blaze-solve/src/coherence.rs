@@ -209,7 +209,9 @@ fn orphan_walk_inner<T: Tys, F: Facts, L: Log + ?Sized>(
             | TyKind::Pat(..)
             | TyKind::RawPtr(..)
             | TyKind::Never
-            | TyKind::Tuple(_) => {}
+            | TyKind::Tuple(_)
+            | TyKind::Record(..)
+            | TyKind::Union(_) => {}
             // The reference panics: the orphan check expects only inference variables.
             TyKind::Param(index) => {
                 let at = core::panic::Location::caller();

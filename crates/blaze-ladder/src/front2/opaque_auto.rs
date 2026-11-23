@@ -732,7 +732,7 @@ fn copy_reached<'a>(
             | PNode::Foreign(_)) => n,
             PNode::ConstValue { ty, bits } => PNode::ConstValue { ty: m(ty, &mapped)?, bits },
             PNode::Tuple(a) => PNode::Tuple(l(a, &mapped, out)?),
-            PNode::Record(a) => PNode::Record(l(a, &mapped, out)?),
+            PNode::Record(s, a) => PNode::Record(s, l(a, &mapped, out)?),
             PNode::Union(a) => PNode::Union(l(a, &mapped, out)?),
             PNode::Ref(mu, a) => PNode::Ref(mu, m(a, &mapped)?),
             PNode::Ptr(mu, a) => PNode::Ptr(mu, m(a, &mapped)?),

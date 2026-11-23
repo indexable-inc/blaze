@@ -1433,8 +1433,8 @@ pub fn pty_is_copy<'a, 'c, F: Facts, A: Allocator + Copy, E>(
         | PNode::Ref(Mutbl::Not, _) => Some(true),
         PNode::Ref(Mutbl::Mut, _) => Some(false),
         PNode::Param(i) => Some(walk.facts.param_copy(i)),
-        PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) if l.len == 0 => Some(true),
-        PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
+        PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) if l.len == 0 => Some(true),
+        PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
         PNode::Closure { owner, .. } => match walk.closures {
             ClosureCopy::ByValueCaptures { owner: body_owner, .. } if owner == body_owner => None,
             _ => Some(false),
@@ -1483,7 +1483,7 @@ pub fn pty_is_copy<'a, 'c, F: Facts, A: Allocator + Copy, E>(
             | PNode::ConstParam(_)
             | PNode::Ref(Mutbl::Not, _) => {}
             PNode::Ref(Mutbl::Mut, _) => return set_false(),
-            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => {
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
                 let s = list(l).ok_or_else(|| on_err(CopyWalkError::Malformed))?;
                 stack.extend_from_slice(s);
             }
@@ -1620,8 +1620,8 @@ pub fn pty_needs_drop<'a, 'c, F: Facts, A: Allocator + Copy, E>(
         return Ok(false);
     }
     let quick = match node(root).ok_or_else(|| on_err(DropWalkError::Malformed))? {
-        PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) if l.len == 0 => Some(false),
-        PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
+        PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) if l.len == 0 => Some(false),
+        PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
         PNode::Param(_)
         | PNode::Alias { .. }
         | PNode::Opaque(..)
@@ -1669,7 +1669,7 @@ pub fn pty_needs_drop<'a, 'c, F: Facts, A: Allocator + Copy, E>(
             }
         }
         match node(t).ok_or_else(|| on_err(DropWalkError::Malformed))? {
-            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => {
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
                 let s = list(l).ok_or_else(|| on_err(DropWalkError::Malformed))?;
                 stack.extend_from_slice(s);
             }
@@ -2150,7 +2150,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             | PNode::ConstParam(_)
             | PNode::ExAuto(_)
             | PNode::Foreign(_) => Some(0),
-            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) if l.len == 0 => Some(0),
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) if l.len == 0 => Some(0),
             PNode::Opaque(_, _) | PNode::Alias { .. } | PNode::Dynamic(_) => Some(1),
             _ => None,
         };
@@ -2217,7 +2217,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 PNode::Ref(_, i) => stack.push(i),
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) => stack.push(i),
                 PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.list(l, e)?),
                 PNode::Adt(_, l) => stack.extend_from_slice(self.list(l, e)?),
                 // Not descended into (as before P0): one position each, counted above.
                 PNode::Opaque(_, _) | PNode::Alias { .. } | PNode::Dynamic(_) => {}
@@ -2292,7 +2292,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         }
         let quick = match self.node(root, e)? {
             PNode::Ptr(..) | PNode::Slice(_) | PNode::Pat(..) | PNode::Array(..) | PNode::FnPtr(..) | PNode::Adt(..) => None,
-            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) if l.len > 0 => None,
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) if l.len > 0 => None,
             PNode::Ref(..)
             | PNode::Alias { .. }
             | PNode::Dynamic(_)
@@ -2329,7 +2329,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             match self.node(t, e)? {
                 PNode::Opaque(_, _) => {}
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.list(l, e)?),
                 PNode::Adt(k, l) => {
                     if self.adt_facts(k, e)?.lifetimes > 0 {
                         if let Some(rc) = self.all_opaque_memo.get(root.0 as usize) {
@@ -2452,7 +2452,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     any = true;
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) | PNode::Ref(_, i) => stack.push(i),
-                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::Adt(_, l) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) | PNode::Adt(_, l) => stack.extend_from_slice(self.list(l, e)?),
                 _ => {}
             }
         }
@@ -2646,7 +2646,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     fn is_unit_or_never(&self, t: PTy, e: ExprId) -> Result<bool, Refusal> {
         Ok(match self.node(t, e)? {
             PNode::Never => true,
-            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => l.len == 0,
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => l.len == 0,
             _ => false,
         })
     }
@@ -2753,7 +2753,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         let len = self.npos_d(child, e)?;
                         info = PInfo { start: pi.start, len, exact: true, ..info };
                     }
-                    (Proj::Field(i), PNode::Tuple(l) | PNode::Record(l)) => {
+                    (Proj::Field(i), PNode::Tuple(l) | PNode::Record(_, l)) => {
                         let elems = self.list(l, e)?;
                         let mut off = 0;
                         for &t in elems.iter().take(i as usize) {
@@ -3382,7 +3382,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) => stack.push((i, at)),
                 PNode::Array(i, _) => stack.push((i, at)),
-                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => {
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
                     let mut off = at;
                     for &x in self.list(l, e)? {
                         stack.push((x, off));
@@ -3629,7 +3629,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     stack.push(i);
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.head_list(l, e)?),
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.head_list(l, e)?),
                 PNode::Adt(k, l) => {
                     regular += self.adt_facts(k, e)?.lifetimes;
                     stack.extend_from_slice(self.head_list(l, e)?);
@@ -3681,7 +3681,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     stack.push(i);
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::FnPtr(l, _) => {
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) | PNode::FnPtr(l, _) => {
                     for &y in self.head_list(l, e)?.iter().rev() {
                         stack.push(y);
                     }
@@ -3784,11 +3784,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     | (PNode::Pat(..), PNode::Pat(..))
                     | (PNode::Array(..), PNode::Array(..))
                     | (PNode::Tuple(_), PNode::Tuple(_))
-                    | (PNode::Record(_), PNode::Record(_))
                     | (PNode::Union(_), PNode::Union(_))
                     | (PNode::FnPtr(..), PNode::FnPtr(..))
                     | (PNode::Adt(..), PNode::Adt(..))
-            );
+            ) || matches!((dn, bn), (PNode::Record(s1, _), PNode::Record(s2, _)) if s1 == s2);
             let step = if opens { heads.own(d) } else { heads.count(d) };
             sc = match (sc, step) {
                 (Ok(s), Ok(n)) => s.checked_add(n.get() as usize).ok_or(Uncounted::Overflow),
@@ -3849,9 +3848,17 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 | (PNode::Pat(di, _), PNode::Pat(bi, _))
                 | (PNode::Array(di, _), PNode::Array(bi, _)) => stack.push((di, bi)),
                 (PNode::Tuple(dl), PNode::Tuple(bl))
-                | (PNode::Record(dl), PNode::Record(bl))
                 | (PNode::Union(dl), PNode::Union(bl))
                 | (PNode::FnPtr(dl, _), PNode::FnPtr(bl, _)) => {
+                    let (ds, bs) = (self.head_list(dl, e)?, self.list(bl, e)?);
+                    if ds.len() != bs.len() {
+                        return Ok(false);
+                    }
+                    for (&x, &y) in ds.iter().zip(bs.iter()).rev() {
+                        stack.push((x, y));
+                    }
+                }
+                (PNode::Record(ds_schema, dl), PNode::Record(bs_schema, bl)) if ds_schema == bs_schema => {
                     let (ds, bs) = (self.head_list(dl, e)?, self.list(bl, e)?);
                     if ds.len() != bs.len() {
                         return Ok(false);
@@ -5735,7 +5742,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         // `B`'s). Every other aggregate (a struct or variant, whose field types the heads do not
         // give yet) is related as a call of unknown signature.
         let elems: Option<&'c [PTy]> = match (ty.wrap, self.node(ty.ty, e)?) {
-            (None, PNode::Tuple(l) | PNode::Record(l)) => Some(self.list(l, e)?),
+            (None, PNode::Tuple(l) | PNode::Record(_, l)) => Some(self.list(l, e)?),
             _ => None,
         };
         // A tuple-like constructor whose every field holding positions is declared as a bare

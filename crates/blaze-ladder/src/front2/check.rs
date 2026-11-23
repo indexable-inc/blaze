@@ -644,20 +644,30 @@ pub(crate) fn key_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemK
 /// its trait's synthetic associated type (RFC 3425; front2 rpitit.rs): the type of `s.make()`
 /// at a generic `S: Tr` keeps the opaque, and reads as the projection it reveals does,
 /// [`synthetic_shown`]. A key no head made keeps its key, said so.
-pub(crate) fn opaque_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, opaque: ItemKey) -> String {
+pub(crate) fn opaque_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, mut opaque: ItemKey) -> String {
     // The default of a provided trait fn's `impl Trait` (front2 rpitit.rs `Twin`).
-    if let Some(twin) = r.store.rpitit_defaults.get(&opaque) {
-        return format!("the default body's type for {}", opaque_shown(r, twin.source));
+    let mut depth: usize = 0;
+    while let Some(twin) = r.store.rpitit_defaults.get(&opaque) {
+        depth += 1;
+        opaque = twin.source;
+        if depth >= 64 {
+            break;
+        }
     }
-    if let Some(trait_fn) = rpitit_fn(r, opaque) {
-        return synthetic_shown(r, trait_fn);
+    let mut out = if let Some(trait_fn) = rpitit_fn(r, opaque) {
+        synthetic_shown(r, trait_fn)
+    } else {
+        match r.store.opaques.get(&opaque) {
+            Some(&(owner, 0)) if super::async_output::of(&*r.store, owner).is_some() => format!("the future of {}", key_shown(r, owner)),
+            Some(&(owner, ordinal)) if super::tait::of_alias(ordinal) => format!("an `impl Trait` of type alias {}", key_shown(r, owner)),
+            Some(&(owner, ordinal)) => format!("the `impl Trait` type #{ordinal} of {}", key_shown(r, owner)),
+            None => format!("an `impl Trait` type no head made (key {:032x})", opaque.0),
+        }
+    };
+    for _ in 0..depth {
+        out = format!("the default body's type for {out}");
     }
-    match r.store.opaques.get(&opaque) {
-        Some(&(owner, 0)) if super::async_output::of(&*r.store, owner).is_some() => format!("the future of {}", key_shown(r, owner)),
-        Some(&(owner, ordinal)) if super::tait::of_alias(ordinal) => format!("an `impl Trait` of type alias {}", key_shown(r, owner)),
-        Some(&(owner, ordinal)) => format!("the `impl Trait` type #{ordinal} of {}", key_shown(r, owner)),
-        None => format!("an `impl Trait` type no head made (key {:032x})", opaque.0),
-    }
+    out
 }
 
 /// The trait fn whose return type holds `opaque` when it is a trait fn's `impl Trait`, its
@@ -866,7 +876,7 @@ pub(super) fn ty_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::
                 }
                 seq.push(Step::Lit(")"));
             }
-            Ok(tc::PNode::Record(l)) => {
+            Ok(tc::PNode::Record(_, l)) => {
                 let kids = list(l);
                 seq.push(Step::Lit("record("));
                 joined(&mut seq, kids, ", ");
@@ -1626,7 +1636,7 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
     let builtin = match self_ty {
         Some(t) => matches!(
             ground.view().node(t).map_err(|error| CheckFail::Check { owner, error })?,
-            tc::PNode::Tuple(_) | tc::PNode::Record(_) | tc::PNode::Closure { .. } | tc::PNode::FnDef(..) | tc::PNode::FnPtr(..)
+            tc::PNode::Tuple(_) | tc::PNode::Record(..) | tc::PNode::Closure { .. } | tc::PNode::FnDef(..) | tc::PNode::FnPtr(..)
         ),
         None => false,
     };
@@ -1799,7 +1809,7 @@ fn holds_param(v: tc::PTys<'_>, args: tc::List) -> Result<bool, tc::CheckError> 
                 work.push(term);
                 Some(l)
             }
-            tc::PNode::Tuple(l) | tc::PNode::Record(l) | tc::PNode::Union(l) | tc::PNode::Adt(_, l) | tc::PNode::FnDef(_, l) | tc::PNode::FnPtr(l, _) | tc::PNode::Dynamic(l) | tc::PNode::ExTrait(_, l) => Some(l),
+            tc::PNode::Tuple(l) | tc::PNode::Record(_, l) | tc::PNode::Union(l) | tc::PNode::Adt(_, l) | tc::PNode::FnDef(_, l) | tc::PNode::FnPtr(l, _) | tc::PNode::Dynamic(l) | tc::PNode::ExTrait(_, l) => Some(l),
         };
         if let Some(l) = lists {
             work.extend_from_slice(v.list(l)?);

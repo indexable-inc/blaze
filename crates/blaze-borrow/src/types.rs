@@ -226,8 +226,7 @@ pub trait RegionTypes {
 
     /// How many slots the whole of `ty` has: its own, then its children's, bounded.
     fn count(&self, ty: PTy) -> Result<SlotCount, Unknown> {
-        let mut budget = MOST_COUNT_STEPS;
-        count_in(self, ty, &mut budget, 0)
+        count_in(self, ty)
     }
 
     /// The variance of `ty`'s own slot or child at `at`, within `ty`: [`rule_variance`].
@@ -236,21 +235,67 @@ pub trait RegionTypes {
     }
 }
 
-fn count_in<T: RegionTypes + ?Sized>(types: &T, ty: PTy, budget: &mut u32, depth: u32) -> Result<SlotCount, Unknown> {
-    if *budget == 0 || depth > MOST_DEPTH {
-        return Err(Unknown { node: ty, why: Why::Bound });
-    }
-    *budget -= 1;
-    let mut n = types.own(ty)?;
-    let kids = types.kids(ty)?;
-    for k in 0..kids.len() {
-        let Some(c) = kids.get(k) else {
-            return Err(Unknown { node: ty, why: Why::Table });
+#[derive(Clone, Copy)]
+struct CountFrame<'t> {
+    ty: PTy,
+    kids: Kids<'t>,
+    next_k: u32,
+    acc: SlotCount,
+}
+
+fn count_in<T: RegionTypes + ?Sized>(types: &T, root: PTy) -> Result<SlotCount, Unknown> {
+    const MAX_FRAMES: usize = 257; // MOST_DEPTH (256) + 1
+    let mut budget = MOST_COUNT_STEPS;
+    let mut stack: [Option<CountFrame<'_>>; MAX_FRAMES] = [None; MAX_FRAMES];
+    let mut sp: usize = 0;
+
+    let mut enter = Some(root);
+    let mut finished: Option<SlotCount> = None;
+
+    loop {
+        if let Some(ty) = enter.take() {
+            if budget == 0 || sp >= MAX_FRAMES {
+                return Err(Unknown { node: ty, why: Why::Bound });
+            }
+            budget -= 1;
+            let acc = types.own(ty)?;
+            let kids = types.kids(ty)?;
+            if kids.len() == 0 {
+                finished = Some(acc);
+            } else {
+                let Some(slot) = stack.get_mut(sp) else {
+                    return Err(Unknown { node: ty, why: Why::Bound });
+                };
+                *slot = Some(CountFrame { ty, kids, next_k: 0, acc });
+                sp += 1;
+            }
+            continue;
+        }
+
+        let Some(top_idx) = sp.checked_sub(1) else {
+            return finished.ok_or(Unknown { node: root, why: Why::Bound });
         };
-        let m = count_in(types, c, budget, depth + 1)?;
-        n = n.checked_add(m).ok_or(Unknown { node: ty, why: Why::Overflow })?;
+        let Some(Some(top)) = stack.get_mut(top_idx) else {
+            return Err(Unknown { node: root, why: Why::Bound });
+        };
+
+        if let Some(child_count) = finished.take() {
+            top.acc = top.acc.checked_add(child_count).ok_or(Unknown { node: top.ty, why: Why::Overflow })?;
+        }
+
+        if top.next_k < top.kids.len() {
+            let k = top.next_k;
+            top.next_k += 1;
+            let Some(c) = top.kids.get(k) else {
+                return Err(Unknown { node: top.ty, why: Why::Table });
+            };
+            enter = Some(c);
+        } else {
+            let acc = top.acc;
+            sp = top_idx;
+            finished = Some(acc);
+        }
     }
-    Ok(n)
 }
 
 /// THE VARIANCE RULE (the Reference, "Subtyping and Variance", its table): `&'a T` covariant in
@@ -265,7 +310,7 @@ pub fn rule_variance<T: RegionTypes + ?Sized>(types: &T, ty: PTy, at: Pos) -> Re
         (PNode::Ref(..), Pos::Own(_)) | (PNode::Dynamic(_), Pos::Own(_)) => Variance::Co,
         (PNode::Ref(Mutbl::Not, _) | PNode::Ptr(Mutbl::Not, _), Pos::Kid(_)) => Variance::Co,
         (PNode::Ref(Mutbl::Mut, _) | PNode::Ptr(Mutbl::Mut, _), Pos::Kid(_)) => Variance::In,
-        (PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Slice(_) | PNode::Array(..) | PNode::Pat(..), _) => Variance::Co,
+        (PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Slice(_) | PNode::Array(..) | PNode::Pat(..), _) => Variance::Co,
         (PNode::Adt(adt, _), at) => {
             let i = match at {
                 Pos::Own(k) => k as usize,
@@ -329,7 +374,7 @@ impl RegionTypes for Columns<'_> {
         let list = |l| self.tys.list(l).map_err(|_| Unknown { node: ty, why: Why::Table });
         Ok(match node {
             PNode::Tuple(l)
-            | PNode::Record(l)
+            | PNode::Record(_, l)
             | PNode::Union(l)
             | PNode::Adt(_, l)
             | PNode::FnDef(_, l)

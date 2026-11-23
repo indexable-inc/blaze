@@ -62,6 +62,8 @@ const T_EX_AUTO: u32 = 31;
 const T_LIST: u32 = 32;
 const T_COROUTINE: u32 = 33;
 const T_PAT: u32 = 34;
+const T_RECORD: u32 = 35;
+const T_UNION: u32 = 36;
 
 // Predicate tags.
 const P_TRAIT: u32 = 64;
@@ -311,6 +313,13 @@ fn emit<T: Tys>(tys: &T, out: &mut Vec<u32, Alloc<'_>>, k: TyKind) {
         TyKind::Str => out.push(header(T_STR, 0)),
         TyKind::Never => out.push(header(T_NEVER, 0)),
         TyKind::Tuple(l) => out.push(header(T_TUPLE, l.len)),
+        TyKind::Record(s, l) => {
+            out.push(header(T_RECORD, l.len));
+            let [b0, b1, b2, b3, b4, b5, b6, b7] = s.to_le_bytes();
+            out.push(u32::from_le_bytes([b0, b1, b2, b3]));
+            out.push(u32::from_le_bytes([b4, b5, b6, b7]));
+        }
+        TyKind::Union(l) => out.push(header(T_UNION, l.len)),
         TyKind::Ref(_, _, m) => {
             out.push(header(T_REF, 2));
             out.push(mutbl_word(m));
@@ -514,6 +523,19 @@ impl<'a> Decode<'a> {
                 T_TUPLE => {
                     self.pop_kids(n, at)?;
                     TyKind::Tuple(tys.mk_list(&self.kids)?)
+                }
+                T_RECORD => {
+                    need(2)?;
+                    i += 2;
+                    let lo = *w.get(at + 1).ok_or(bad(at))?;
+                    let hi = *w.get(at + 2).ok_or(bad(at))?;
+                    let s = u64::from(lo) | (u64::from(hi) << 32);
+                    self.pop_kids(n, at)?;
+                    TyKind::Record(s, tys.mk_list(&self.kids)?)
+                }
+                T_UNION => {
+                    self.pop_kids(n, at)?;
+                    TyKind::Union(tys.mk_list(&self.kids)?)
                 }
                 T_REF => {
                     need(1)?;

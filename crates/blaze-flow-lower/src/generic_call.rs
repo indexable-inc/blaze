@@ -175,8 +175,8 @@ pub enum Skel {
     Under,
     /// A tuple of this many elements.
     Tuple(u32),
-    /// A structural record of this many fields.
-    Record(u32),
+    /// A structural record of this schema and field count.
+    Record(blaze_typeck::RecordSchema, u32),
     /// A structural union of this many members.
     Union(u32),
     /// A fn pointer of this many inputs and output (its list's length): they are the children.
@@ -438,7 +438,7 @@ fn under<A: Allocator + Copy>(
         match node {
             PNode::Param(i) => joins.push(i),
             PNode::Tuple(l)
-            | PNode::Record(l)
+            | PNode::Record(_, l)
             | PNode::Union(l)
             | PNode::Adt(_, l)
             | PNode::FnDef(_, l)
@@ -523,7 +523,7 @@ pub fn read_shape<A: Allocator + Copy>(
                     PNode::Ref(..) => Skel::Ref,
                     PNode::Ptr(..) | PNode::Slice(_) | PNode::Pat(..) | PNode::Array(..) => Skel::Under,
                     PNode::Tuple(l) => Skel::Tuple(u32::try_from(tys.list(l).map_err(unread(part))?.len()).map_err(|_| ShapeRefusal::Bound { part })?),
-                    PNode::Record(l) => Skel::Record(u32::try_from(tys.list(l).map_err(unread(part))?.len()).map_err(|_| ShapeRefusal::Bound { part })?),
+                    PNode::Record(s, l) => Skel::Record(s, u32::try_from(tys.list(l).map_err(unread(part))?.len()).map_err(|_| ShapeRefusal::Bound { part })?),
                     PNode::Union(l) => Skel::Union(u32::try_from(tys.list(l).map_err(unread(part))?.len()).map_err(|_| ShapeRefusal::Bound { part })?),
                     PNode::FnPtr(l, _) => Skel::FnPtr(tys.list(l).map_err(unread(part))?.len() as u32),
                     PNode::Adt(k, _) => Skel::Adt(k),
@@ -539,7 +539,7 @@ pub fn read_shape<A: Allocator + Copy>(
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
                 // A fn pointer's positions are its inputs' then its output's (lib.rs `npos`), each
                 // the next region of the lifetime part (sig.rs reads a bound one as `Bound`).
-                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::FnPtr(l, _) => {
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) | PNode::FnPtr(l, _) => {
                     for &x in tys.list(l).map_err(unread(part))?.iter().rev() {
                         stack.push(x);
                     }
@@ -635,11 +635,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 (Skel::Ref, PNode::Ref(_, i)) => stack.push(i),
                 (Skel::Under, PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _)) => stack.push(i),
                 (Skel::Tuple(n), PNode::Tuple(l))
-                | (Skel::Record(n), PNode::Record(l))
                 | (Skel::Union(n), PNode::Union(l))
                 | (Skel::FnPtr(n), PNode::FnPtr(l, _)) => {
                     let xs = self.list(l, e)?;
                     if xs.len() as u32 != n {
+                        return Ok(false);
+                    }
+                    for &x in xs.iter().rev() {
+                        stack.push(x);
+                    }
+                }
+                (Skel::Record(s1, n), PNode::Record(s2, l)) if s1 == s2 => {
+                    let xs = self.list(l, e)?;
+                    if u32::try_from(xs.len()).ok() != Some(n) {
                         return Ok(false);
                     }
                     for &x in xs.iter().rev() {
@@ -701,7 +709,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         stack.push(i);
                     }
                     PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                    PNode::Tuple(xs) | PNode::Record(xs) | PNode::Union(xs) => {
+                    PNode::Tuple(xs) | PNode::Record(_, xs) | PNode::Union(xs) => {
                         for &y in self.list(xs, root)?.iter().rev() {
                             stack.push(y);
                         }

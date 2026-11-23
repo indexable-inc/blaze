@@ -945,7 +945,10 @@ fn hash_node(h: &mut StableHasher, n: &LaidNode) {
             h.tag(12);
             h.u128(k.0);
         }
-        N::Record(_) => h.tag(13),
+        N::Record(s, _) => {
+            h.tag(13);
+            h.u64(s.0);
+        }
         N::Union(_) => h.tag(14),
         N::Bool
         | N::Char

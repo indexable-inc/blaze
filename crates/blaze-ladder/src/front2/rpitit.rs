@@ -382,7 +382,8 @@ pub(crate) fn place_in(tv: PTys<'_>, tr: PTy, iv: PTys<'_>, imp: PTy, o: ItemKey
 fn same_head(a: PNode, b: PNode) -> bool {
     use PNode as N;
     match (a, b) {
-        (N::Tuple(x), N::Tuple(y)) | (N::Record(x), N::Record(y)) | (N::Union(x), N::Union(y)) | (N::Dynamic(x), N::Dynamic(y)) => x.len == y.len,
+        (N::Tuple(x), N::Tuple(y)) | (N::Union(x), N::Union(y)) | (N::Dynamic(x), N::Dynamic(y)) => x.len == y.len,
+        (N::Record(s1, x), N::Record(s2, y)) => s1 == s2 && x.len == y.len,
         (N::Ref(m, _), N::Ref(n, _)) | (N::Ptr(m, _), N::Ptr(n, _)) => m == n,
         (N::Array(..), N::Array(..)) | (N::Slice(_), N::Slice(_)) => true,
         (N::Adt(k, _), N::Adt(j, _)) | (N::FnDef(k, _), N::FnDef(j, _)) | (N::ExTrait(k, _), N::ExTrait(j, _)) | (N::Foreign(k), N::Foreign(j)) => k == j,

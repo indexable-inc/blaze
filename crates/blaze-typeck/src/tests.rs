@@ -709,3 +709,52 @@ fn an_unreadable_handle_fails_its_body_not_the_process() {
     assert_eq!(cx.take_malformed(), Some(Malformed::Unreadable { node: past.0, what: Unreadable::NotInArena }));
     assert_eq!(cx.take_malformed(), None, "the note is taken once");
 }
+
+#[test]
+fn record_schema_and_infer_non_unification() {
+    use crate::ids::{IntTy, Name, RecordSchema, UintTy};
+    use crate::ty::{TyView, TypeCtx, VarKind};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut cx = InferCtx::new_in(alloc);
+
+    let schema_ab = RecordSchema::of_sorted_names(&[Name::of("a"), Name::of("b")]);
+    let schema_xy = RecordSchema::of_sorted_names(&[Name::of("x"), Name::of("y")]);
+    assert_eq!(RecordSchema::EMPTY, RecordSchema::of_sorted_names(&[]));
+    assert_ne!(schema_ab, schema_xy);
+    assert_ne!(schema_ab, RecordSchema::EMPTY);
+
+    let i32_ty = cx.mk(TyView::Int(IntTy::I32)).expect("i32");
+    let u8_ty = cx.mk(TyView::Uint(UintTy::U8)).expect("u8");
+    let fields = cx.mk_list(&[i32_ty, u8_ty]).expect("fields");
+
+    let tup = cx.mk(TyView::Tuple(fields)).expect("tuple");
+    let rec_ab = cx.mk(TyView::Record(schema_ab, fields)).expect("rec_ab");
+    let rec_xy = cx.mk(TyView::Record(schema_xy, fields)).expect("rec_xy");
+    let uni = cx.mk(TyView::Union(fields)).expect("union");
+
+    assert_eq!(cx.view(tup), TyView::Tuple(fields));
+    assert_eq!(cx.view(rec_ab), TyView::Record(schema_ab, fields));
+    assert_eq!(cx.view(rec_xy), TyView::Record(schema_xy, fields));
+    assert_eq!(cx.view(uni), TyView::Union(fields));
+
+    // Tuple, Record, and Union NEVER unify with each other; distinct RecordSchemas NEVER unify.
+    assert!(!cx.unify(tup, rec_ab).expect("unify"));
+    assert!(!cx.unify(tup, uni).expect("unify"));
+    assert!(!cx.unify(rec_ab, uni).expect("unify"));
+    assert!(!cx.unify(rec_ab, rec_xy).expect("unify"));
+
+    // Same-schema Record unifies element-wise and binds variables.
+    let v1 = cx.fresh(VarKind::Ty).expect("fresh v1");
+    let rec_var_fields = cx.mk_list(&[v1, u8_ty]).expect("rec var fields");
+    let rec_ab_var = cx.mk(TyView::Record(schema_ab, rec_var_fields)).expect("rec_ab_var");
+    assert!(cx.unify(rec_ab, rec_ab_var).expect("unify same schema"));
+    assert_eq!(cx.shallow_resolve(v1), i32_ty);
+
+    // Union unifies element-wise and binds variables.
+    let v2 = cx.fresh(VarKind::Ty).expect("fresh v2");
+    let uni_var_fields = cx.mk_list(&[i32_ty, v2]).expect("uni var fields");
+    let uni_var = cx.mk(TyView::Union(uni_var_fields)).expect("uni_var");
+    assert!(cx.unify(uni, uni_var).expect("unify union"));
+    assert_eq!(cx.shallow_resolve(v2), u8_ty);
+}

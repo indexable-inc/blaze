@@ -38,7 +38,7 @@ use blaze_solve::{Clause, EnvId, Goal as SGoal, Solver, Tys as _};
 use blaze_ty::{AliasKind, ConstKind, FnHeader, Node, Region, TyKind};
 
 use crate::error::{CheckError, Stop};
-use crate::ids::{ExprId, ItemKey, Name};
+use crate::ids::{ExprId, ItemKey, Name, RecordSchema};
 use crate::ty::{FulfillError, FulfillErrorKind, Goal, Normalized, Obligation, Ty, TyList, TyView, TypeCtx, Var, VarKind};
 use crate::world::{Reads, World};
 
@@ -834,6 +834,8 @@ impl<'x, 'a> Seen<'x, 'a> {
             TyKind::Str => TyView::Str,
             TyKind::Never => TyView::Never,
             TyKind::Tuple(l) => TyView::Tuple(list(l)),
+            TyKind::Record(s, l) => TyView::Record(RecordSchema(s), list(l)),
+            TyKind::Union(l) => TyView::Union(list(l)),
             TyKind::Ref(_, p, m) => TyView::Ref(mutbl(m), ty(p)),
             TyKind::RawPtr(p, m) => TyView::Ptr(mutbl(m), ty(p)),
             TyKind::Array(e, n) => TyView::Array(ty(e), Ty(n.node().bits())),
@@ -1631,9 +1633,17 @@ impl<'a> TypeCtx for InferCtx<'a> {
             TyView::Float(f) => B::float(terms::b_float(facts_float(f))),
             TyView::Str => B::STR,
             TyView::Never => B::NEVER,
-            TyView::Tuple(l) | TyView::Record(l) | TyView::Union(l) => {
+            TyView::Tuple(l) => {
                 let l = self.blist(l);
                 self.terms.cx.tys.tuple(l)
+            }
+            TyView::Record(s, l) => {
+                let l = self.blist(l);
+                self.terms.cx.tys.record(s.0, l)
+            }
+            TyView::Union(l) => {
+                let l = self.blist(l);
+                self.terms.cx.tys.union(l)
             }
             TyView::Ref(m, t) => {
                 let t = self.bty(t);

@@ -65,6 +65,33 @@ impl ContentHash for Name {
     }
 }
 
+/// Content hash of a structural record's sorted canonical field names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RecordSchema(pub u64);
+
+impl RecordSchema {
+    /// The empty structural record `{}`.
+    pub const EMPTY: RecordSchema = RecordSchema(
+        StableHasher::new("record-schema").bytes(&0u64.to_le_bytes()).finish(),
+    );
+
+    /// Computes the schema hash from canonical sorted field names.
+    pub fn of_sorted_names(names: &[Name]) -> RecordSchema {
+        let mut h = StableHasher::new("record-schema");
+        h.u64(u64::try_from(names.len()).unwrap_or(u64::MAX));
+        for &name in names {
+            h.u64(name.0);
+        }
+        RecordSchema(h.finish())
+    }
+}
+
+impl ContentHash for RecordSchema {
+    fn hash_into(&self, h: &mut StableHasher) {
+        h.u64(self.0);
+    }
+}
+
 macro_rules! index {
     ($(#[$m:meta])* $name:ident) => {
         $(#[$m])*

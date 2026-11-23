@@ -905,6 +905,10 @@ fn niche_encoding_decodes_every_value() {
 
 #[test]
 fn record_and_union_layouts() {
+    use crate::abi::Pass;
+    use crate::intrinsics::validity::{Check, permits};
+    use blaze_lir::{Ty, func::Ext};
+
     let w = World::default();
     let mut g = G::new();
     let h = blaze_own::testing::heap();
@@ -912,27 +916,96 @@ fn record_and_union_layouts() {
     let u64_t = g.n(PNode::Uint(UintTy::U64));
     let u8_t = g.n(U8);
     let bool_t = g.n(PNode::Bool);
+    let char_t = g.n(PNode::Char);
+    let unit_t = g.tuple(&[]);
+    let never_t = g.n(PNode::Never);
+    let ref_u64_t = g.r(u64_t);
+    let ref_u8_t = g.r(u8_t);
 
     // PNode::Record([u64, u8]) -> size 16, align 8
     let rec_list = g.t.intern_list(&[u64_t, u8_t]).unwrap();
-    let rec_ty = g.n(PNode::Record(rec_list));
+    let rec_ty = g.n(PNode::Record(blaze_typeck::RecordSchema::EMPTY, rec_list));
     let rec_id = lay(&w, &mut g, &mut ls, rec_ty).unwrap();
     assert_eq!(size_align(&ls, rec_id), (16, 8));
     assert!(!ls.get(rec_id).uninhabited);
 
-    // PNode::Union([u64, u8]) -> size 16, align 8
+    // PNode::Union([&u64, ()]) -> size 8, align 8 (pointer niche optimization)
+    let u_ref_unit_list = g.t.intern_list(&[ref_u64_t, unit_t]).unwrap();
+    let u_ref_unit_ty = g.n(PNode::Union(u_ref_unit_list));
+    let u_ref_unit_id = lay(&w, &mut g, &mut ls, u_ref_unit_ty).unwrap();
+    assert_eq!(size_align(&ls, u_ref_unit_id), (8, 8));
+    assert!(!ls.get(u_ref_unit_id).uninhabited);
+    assert!(ls.get(u_ref_unit_id).scalar.is_some());
+    assert_eq!(
+        ls.get(u_ref_unit_id).rust_pass(g.t.view()).unwrap(),
+        Pass::Scalar { ty: Ty::PTR, ext: Ext::None, agg: true }
+    );
+    assert!(matches!(
+        ls.get(u_ref_unit_id).variants,
+        Variants::Multiple { tag_offset: 0, encoding: TagEncoding::Niche { untagged: 0, first: 1, last: 1, start: 0 }, .. }
+    ));
+    assert_eq!(ls.tag_write(u_ref_unit_id, 0), None);
+    let unit_write = ls.tag_write(u_ref_unit_id, 1).unwrap();
+    assert_eq!((unit_write.offset, unit_write.value), (0, 0));
+    assert_eq!(ls.variant_of_tag(u_ref_unit_id, 0), Some(1));
+    assert_eq!(ls.variant_of_tag(u_ref_unit_id, 0x1000), Some(0));
+
+    // PNode::Union([bool, ()]) -> size 1, align 1 (bool niche optimization)
+    let u_bool_unit_list = g.t.intern_list(&[bool_t, unit_t]).unwrap();
+    let u_bool_unit_ty = g.n(PNode::Union(u_bool_unit_list));
+    let u_bool_unit_id = lay(&w, &mut g, &mut ls, u_bool_unit_ty).unwrap();
+    assert_eq!(size_align(&ls, u_bool_unit_id), (1, 1));
+    assert!(!ls.get(u_bool_unit_id).uninhabited);
+    assert_eq!(ls.tag_write(u_bool_unit_id, 0), None);
+    let bool_unit_write = ls.tag_write(u_bool_unit_id, 1).unwrap();
+    assert_eq!((bool_unit_write.offset, bool_unit_write.value), (0, 2));
+    assert_eq!(ls.variant_of_tag(u_bool_unit_id, 0), Some(0));
+    assert_eq!(ls.variant_of_tag(u_bool_unit_id, 1), Some(0));
+    assert_eq!(ls.variant_of_tag(u_bool_unit_id, 2), Some(1));
+
+    // PNode::Union([char, ()]) -> size 4, align 4 (char niche optimization)
+    let u_char_unit_list = g.t.intern_list(&[char_t, unit_t]).unwrap();
+    let u_char_unit_ty = g.n(PNode::Union(u_char_unit_list));
+    let u_char_unit_id = lay(&w, &mut g, &mut ls, u_char_unit_ty).unwrap();
+    assert_eq!(size_align(&ls, u_char_unit_id), (4, 4));
+    assert!(!ls.get(u_char_unit_id).uninhabited);
+    assert_eq!(ls.tag_write(u_char_unit_id, 0), None);
+    let char_unit_write = ls.tag_write(u_char_unit_id, 1).unwrap();
+    assert_eq!(char_unit_write.offset, 0);
+    assert_eq!(ls.variant_of_tag(u_char_unit_id, char_unit_write.value), Some(1));
+    assert_eq!(ls.variant_of_tag(u_char_unit_id, u128::from(u32::from('a'))), Some(0));
+
+    // PNode::Union([u64, !]) -> size 8, align 8 (uninhabited member collapsed)
+    let u_64_never_list = g.t.intern_list(&[u64_t, never_t]).unwrap();
+    let u_64_never_ty = g.n(PNode::Union(u_64_never_list));
+    let u_64_never_id = lay(&w, &mut g, &mut ls, u_64_never_ty).unwrap();
+    assert_eq!(size_align(&ls, u_64_never_id), (8, 8));
+    assert!(!ls.get(u_64_never_id).uninhabited);
+    assert_eq!(ls.get(u_64_never_id).variants, Variants::Single { index: 0 });
+    assert_eq!(ls.tag_write(u_64_never_id, 0), None);
+    assert_eq!(ls.variant_of_tag(u_64_never_id, 0), Some(0));
+
+    // PNode::Union([u64, u8]) -> size 16, align 8 (direct tagged, round-trip both variants)
     let u_64_8_list = g.t.intern_list(&[u64_t, u8_t]).unwrap();
     let u_64_8_ty = g.n(PNode::Union(u_64_8_list));
     let u_64_8_id = lay(&w, &mut g, &mut ls, u_64_8_ty).unwrap();
     assert_eq!(size_align(&ls, u_64_8_id), (16, 8));
     assert!(!ls.get(u_64_8_id).uninhabited);
+    for v in 0..2u32 {
+        let wr = ls.tag_write(u_64_8_id, v).unwrap();
+        assert_eq!(ls.variant_of_tag(u_64_8_id, wr.value), Some(v));
+    }
 
-    // PNode::Union([u8, bool]) -> size 2, align 1
+    // PNode::Union([u8, bool]) -> size 2, align 1 (direct tagged, round-trip both variants)
     let u_8_bool_list = g.t.intern_list(&[u8_t, bool_t]).unwrap();
     let u_8_bool_ty = g.n(PNode::Union(u_8_bool_list));
     let u_8_bool_id = lay(&w, &mut g, &mut ls, u_8_bool_ty).unwrap();
     assert_eq!(size_align(&ls, u_8_bool_id), (2, 1));
     assert!(!ls.get(u_8_bool_id).uninhabited);
+    for v in 0..2u32 {
+        let wr = ls.tag_write(u_8_bool_id, v).unwrap();
+        assert_eq!(ls.variant_of_tag(u_8_bool_id, wr.value), Some(v));
+    }
 
     // PNode::Union([u64]) -> size 8, align 8 (transparent)
     let u_64_list = g.t.intern_list(&[u64_t]).unwrap();
@@ -940,10 +1013,31 @@ fn record_and_union_layouts() {
     let u_64_id = lay(&w, &mut g, &mut ls, u_64_ty).unwrap();
     assert_eq!(size_align(&ls, u_64_id), (8, 8));
     assert!(!ls.get(u_64_id).uninhabited);
+    assert_eq!(ls.get(u_64_id).variants, Variants::Single { index: 0 });
+    assert_eq!(ls.field_offset(u_64_id, 0), Some(0));
 
     // PNode::Union([]) -> size 0, uninhabited
     let u_empty_ty = g.n(PNode::Union(List::EMPTY));
     let u_empty_id = lay(&w, &mut g, &mut ls, u_empty_ty).unwrap();
     assert_eq!(ls.get(u_empty_id).size, 0);
     assert!(ls.get(u_empty_id).uninhabited);
+
+    // Zero-validity and inhabitedness checks on niche-tagged vs non-zero-valid unions
+    let u_refs_list = g.t.intern_list(&[ref_u64_t, ref_u8_t]).unwrap();
+    let u_refs_ty = g.n(PNode::Union(u_refs_list));
+    let u_nevers_list = g.t.intern_list(&[never_t, never_t]).unwrap();
+    let u_nevers_ty = g.n(PNode::Union(u_nevers_list));
+    for (check, ty, want) in [
+        (Check::Zero, u_ref_unit_ty, true),
+        (Check::Zero, u_refs_ty, false),
+        (Check::Ones, u_ref_unit_ty, false),
+        (Check::Zero, u_bool_unit_ty, true),
+        (Check::Ones, u_bool_unit_ty, true),
+        (Check::Inhabited, u_64_never_ty, true),
+        (Check::Inhabited, u_nevers_ty, false),
+        (Check::Inhabited, u_empty_ty, false),
+    ] {
+        let mut cx = LayoutCx { ground: &mut g.t, facts: &w, scratch: h.alloc() };
+        assert_eq!(permits(check, ty, &mut ls, &mut cx).unwrap(), want, "{check:?} of union type {}", ty.0);
+    }
 }
