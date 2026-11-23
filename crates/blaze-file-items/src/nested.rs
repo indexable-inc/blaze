@@ -238,7 +238,7 @@ enum Lead {
     Qualifier,
     /// `extern`, then perhaps an ABI string: `crate`, `fn`, or a block.
     Extern,
-    /// `const`: a name (an item), `fn` and its qualifiers, or `{` (an inline const).
+    /// `const`: a name (an item), `fn`/`trait`/`impl` and their qualifiers, or `{` (an inline const).
     Const,
     /// `static`: an item unless a closure follows.
     Static,
@@ -1078,7 +1078,9 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                     (Lead::Static, "move") => None,
                     (Lead::Static, _) => Some(NestedKind::Static),
                     (Lead::Const, "fn") => Some(NestedKind::Fn),
-                    (Lead::Const, "unsafe" | "async" | "extern" | "safe") => None,
+                    (Lead::Const, "trait") => Some(NestedKind::Trait),
+                    (Lead::Const, "impl") => Some(NestedKind::Impl),
+                    (Lead::Const, "unsafe" | "async" | "extern" | "safe" | "auto") => None,
                     (Lead::Const, _) => Some(NestedKind::Const),
                     (Lead::Extern, "crate") => Some(NestedKind::ExternCrate),
                     (Lead::None, "pub") => None,
@@ -1097,7 +1099,7 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                         stmt_start = Some(begin);
                         continue;
                     }
-                    (Lead::Const, "unsafe" | "async" | "safe") => Lead::Const,
+                    (Lead::Const, "unsafe" | "async" | "safe" | "auto") => Lead::Const,
                     (Lead::Const, "extern") => Lead::Extern,
                     (Lead::None | Lead::Qualifier, w) => lead_word(w),
                     _ => Lead::None,
@@ -1488,6 +1490,10 @@ mod tests {
         let write_fmt = "fn write_fmt(&mut self, args: Arguments<'_>) -> Result { trait SpecWriteFmt { fn spec_write_fmt(self, args: Arguments<'_>) -> Result; } impl<W: Write + ?Sized> SpecWriteFmt for &mut W { fn spec_write_fmt(self, args: Arguments<'_>) -> Result { write(self, args) } } self.spec_write_fmt(args) }";
         let kinds: std::vec::Vec<NestedKind> = items(write_fmt).iter().map(|i| i.0).collect();
         assert_eq!(kinds, [NestedKind::Trait, NestedKind::Impl]);
+        // Nightly core `Iterator::advance_by` shape: `const trait` + `const impl` inside a body.
+        let advance_by = "fn advance_by(&mut self, n: usize) { const trait SpecAdvanceBy { fn spec_advance_by(&mut self, n: usize); } const impl<I> SpecAdvanceBy for I { default fn spec_advance_by(&mut self, n: usize) {} } const unsafe trait UnsafeConst {} unsafe const trait ConstUnsafe {} self.spec_advance_by(n); }";
+        assert!(items(advance_by).iter().map(|i| i.0).eq([NestedKind::Trait, NestedKind::Impl, NestedKind::Trait, NestedKind::Trait]));
+        assert!(scan(advance_by, blaze_own::testing::heap().alloc()).makes_module(), "a block's const trait makes no module");
         assert!(!scan("fn f() { fn g() {} g() }", blaze_own::testing::heap().alloc()).makes_module());
     }
 
