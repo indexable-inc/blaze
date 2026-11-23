@@ -378,14 +378,14 @@ impl<'a, N: Name> Sink<'a, N> {
     pub(crate) fn new_in(alloc: Alloc<'a>, scan: Scan) -> Sink<'a, N> {
         Sink {
             scan,
-            need: Vec::new_in(alloc.clone()),
-            waits: Vec::new_in(alloc.clone()),
-            used: Vec::new_in(alloc.clone()),
+            need: Vec::new_in(alloc),
+            waits: Vec::new_in(alloc),
+            used: Vec::new_in(alloc),
             amb: None,
-            touched: Vec::new_in(alloc.clone()),
+            touched: Vec::new_in(alloc),
             overrun: None,
             undet_glob: None,
-            blame: Vec::new_in(alloc.clone()),
+            blame: Vec::new_in(alloc),
             via_glob: false,
             stats: FillStats::default(),
             #[cfg(test)]
@@ -506,9 +506,9 @@ pub(crate) struct Outbox<'a, N> {
 impl<'a, N> Outbox<'a, N> {
     pub(crate) fn new_in(alloc: Alloc<'a>) -> Outbox<'a, N> {
         Outbox {
-            asks: Vec::new_in(alloc.clone()),
-            expand: Vec::new_in(alloc.clone()),
-            cycle: Vec::new_in(alloc.clone()),
+            asks: Vec::new_in(alloc),
+            expand: Vec::new_in(alloc),
+            cycle: Vec::new_in(alloc),
             stats: FillStats::default(),
             work: None,
         }
@@ -674,8 +674,8 @@ impl<'a, N: Name> Resolver<'a, N> {
     ) -> Result<Resolver<'a, N>, ResolveError> {
         let surface = |error| ResolveError::Surface { module, error };
         let info = facts.module(module).map_err(surface)?;
-        let mut chain = Vec::new_in(alloc.clone());
-        let mut chain_names = Vec::new_in(alloc.clone());
+        let mut chain = Vec::new_in(alloc);
+        let mut chain_names = Vec::new_in(alloc);
         chain.push(module);
         chain_names.push(info.name);
         let mut implicit_prelude = !info.no_implicit_prelude;
@@ -693,14 +693,14 @@ impl<'a, N: Name> Resolver<'a, N> {
         let root = chain[chain.len() - 1];
         let krate = info.krate;
         let cr = facts.crate_root(krate).map_err(surface)?;
-        let mut extern_prelude = Vec::from_slice_in(&cr.extern_prelude, alloc.clone());
+        let mut extern_prelude = Vec::from_slice_in(&cr.extern_prelude, alloc);
         // By name, then key: a total order, so a working form made by hand (which may hold a
         // name twice, where a record cannot) still gives one result.
         extern_prelude.sort_unstable();
-        let deps = Vec::from_slice_in(&cr.deps, alloc.clone());
-        let macro_use = Vec::from_slice_in(&cr.macro_use, alloc.clone());
-        let tools = Vec::from_slice_in(&cr.tools, alloc.clone());
-        let mut builtin_attrs = Vec::from_slice_in(&cr.builtin_attrs, alloc.clone());
+        let deps = Vec::from_slice_in(&cr.deps, alloc);
+        let macro_use = Vec::from_slice_in(&cr.macro_use, alloc);
+        let tools = Vec::from_slice_in(&cr.tools, alloc);
+        let mut builtin_attrs = Vec::from_slice_in(&cr.builtin_attrs, alloc);
         builtin_attrs.sort_unstable();
         let mut r = Resolver {
             module,
@@ -717,17 +717,17 @@ impl<'a, N: Name> Resolver<'a, N> {
             arbitrary_ints: cr.head.arbitrary_ints,
             tools,
             builtin_attrs,
-            frags: Vec::new_in(alloc.clone()),
-            defs: HashMap::new_in(alloc.clone()),
-            imports: Vec::new_in(alloc.clone()),
-            named: HashMap::new_in(alloc.clone()),
-            globs: Vec::new_in(alloc.clone()),
-            edges: Vec::new_in(alloc.clone()),
-            calls: Vec::new_in(alloc.clone()),
+            frags: Vec::new_in(alloc),
+            defs: HashMap::new_in(alloc),
+            imports: Vec::new_in(alloc),
+            named: HashMap::new_in(alloc),
+            globs: Vec::new_in(alloc),
+            edges: Vec::new_in(alloc),
+            calls: Vec::new_in(alloc),
             unexpanded: 0,
             blocked_calls: 0,
             expansions: 0,
-            answers: HashMap::new_in(alloc.clone()),
+            answers: HashMap::new_in(alloc),
             out: Outbox::new_in(alloc),
             finished: false,
             alloc,
@@ -779,7 +779,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         match vis {
             WrittenVis::Private | WrittenVis::SelfOnly => self.restricted(self.module),
             WrittenVis::WithoutIn(path) => {
-                bad.push(path.copy_in(self.alloc.clone()));
+                bad.push(path.copy_in(self.alloc));
                 self.restricted(self.module)
             }
             WrittenVis::Pub => Visibility::Public,
@@ -789,7 +789,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                 None => {
                     bad.push(Path {
                         kind: PathKind::Super(1),
-                        segments: Vec::new_in(self.alloc.clone()),
+                        segments: Vec::new_in(self.alloc),
                     });
                     self.restricted(self.module)
                 }
@@ -816,7 +816,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                 match at {
                     Some(i) => self.restricted(self.chain[i]),
                     None => {
-                        bad.push(path.copy_in(self.alloc.clone()));
+                        bad.push(path.copy_in(self.alloc));
                         self.restricted(self.module)
                     }
                 }
@@ -863,13 +863,13 @@ impl<'a, N: Name> Resolver<'a, N> {
     ) -> Result<u32, ResolveError> {
         let module = self.module;
         let fid = count(self.frags.len(), module)?;
-        let a = self.alloc.clone();
-        let mut items = Vec::new_in(a.clone());
-        let mut bad_extern = Vec::new_in(a.clone());
-        let mut bad_vis = Vec::new_in(a.clone());
-        let mut deferred_vis = Vec::new_in(a.clone());
-        let mut exports = Vec::new_in(a.clone());
-        let mut ordered: AVec<'a, (u32, Slot<N>)> = Vec::new_in(a.clone());
+        let a = self.alloc;
+        let mut items = Vec::new_in(a);
+        let mut bad_extern = Vec::new_in(a);
+        let mut bad_vis = Vec::new_in(a);
+        let mut deferred_vis = Vec::new_in(a);
+        let mut exports = Vec::new_in(a);
+        let mut ordered: AVec<'a, (u32, Slot<N>)> = Vec::new_in(a);
         let entry = |def: Def, vis: Visibility, origin: Origin| DefEntry {
             def,
             vis,
@@ -917,7 +917,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         for (index, u) in decls.uses.iter().enumerate() {
             let site = UseSite { expansion: call, index: count(index, module)? };
             let vis = self.resolve_vis(&u.vis, &mut bad_vis);
-            let path = u.path.copy_in(a.clone());
+            let path = u.path.copy_in(a);
             let placeholder = At { frag: fid, slot: 0 };
             match u.leaf {
                 UseForm::Glob => {
@@ -944,7 +944,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                     };
                     let i = count(self.imports.len(), module)?;
                     if let Some(name) = bound {
-                        self.named.entry(name).or_insert_with(|| Vec::new_in(a.clone())).push(i);
+                        self.named.entry(name).or_insert_with(|| Vec::new_in(a)).push(i);
                     }
                     self.imports.push(Import {
                         site,
@@ -982,7 +982,7 @@ impl<'a, N: Name> Resolver<'a, N> {
             };
             self.calls.push(Call {
                 key: c.call,
-                path: c.path.copy_in(a.clone()),
+                path: c.path.copy_in(a),
                 kind: c.kind,
                 at: At { frag: fid, slot: 0 },
                 item: c.item,
@@ -1039,7 +1039,7 @@ impl<'a, N: Name> Resolver<'a, N> {
 
     /// The slots of the calls a fragment is inside, from the module's text down.
     fn frag_path(&self, frag: u32) -> AVec<'a, u32> {
-        let mut path = Vec::new_in(self.alloc.clone());
+        let mut path = Vec::new_in(self.alloc);
         let mut cur = frag;
         while let Some(p) = self.frags[cur as usize].parent {
             path.push(p.slot);
@@ -1085,9 +1085,9 @@ impl<'a, N: Name> Resolver<'a, N> {
                 (_, Answer::InProgress { module }) => Cached::InProgress(module),
                 (Read::Name { .. }, Answer::Name(answer)) => Cached::Name(answer),
                 (Read::Globs { .. }, Answer::Globs { edges, krate, chain, digest }) => {
-                    let mut e = Vec::with_capacity_in(edges.len(), self.alloc.clone());
+                    let mut e = Vec::with_capacity_in(edges.len(), self.alloc);
                     e.extend_from_slice(edges);
-                    let mut c = Vec::with_capacity_in(chain.len(), self.alloc.clone());
+                    let mut c = Vec::with_capacity_in(chain.len(), self.alloc);
                     c.extend_from_slice(chain);
                     Cached::Globs { edges: e, krate, chain: c, digest }
                 }
@@ -1095,12 +1095,12 @@ impl<'a, N: Name> Resolver<'a, N> {
                     Read::TextualEntry { .. } | Read::TextualOut { .. },
                     Answer::Textual { defs, digest },
                 ) => {
-                    let mut v = Vec::with_capacity_in(defs.len(), self.alloc.clone());
+                    let mut v = Vec::with_capacity_in(defs.len(), self.alloc);
                     v.extend_from_slice(defs);
                     Cached::Textual { defs: v, digest }
                 }
                 (Read::DeriveHelpers { .. }, Answer::Helpers { names, digest }) => {
-                    let mut v = Vec::with_capacity_in(names.len(), self.alloc.clone());
+                    let mut v = Vec::with_capacity_in(names.len(), self.alloc);
                     v.extend_from_slice(names);
                     v.sort_unstable();
                     Cached::Helpers { names: v, digest }
@@ -1378,9 +1378,9 @@ pub(crate) fn finish<'a, N: Name, F: ScopeFacts<Name = N>>(
     alloc: Alloc<'a>,
 ) -> Result<Ran<'a, N>, ResolveError> {
     {
-        let mut done = Vec::with_capacity_in(ms.len(), alloc.clone());
-        let mut asks = Vec::new_in(alloc.clone());
-        let mut waits = Vec::new_in(alloc.clone());
+        let mut done = Vec::with_capacity_in(ms.len(), alloc);
+        let mut asks = Vec::new_in(alloc);
+        let mut waits = Vec::new_in(alloc);
         
         {
             let env = Env { members: &*ms };
@@ -1416,7 +1416,7 @@ pub(crate) fn finish<'a, N: Name, F: ScopeFacts<Name = N>>(
         let by_records = true;
         if ms.len() > 1 && by_records {
             // A member's read list reads its fellows by their records, as any module's does.
-            match crate::finish::settle_reads(ms, done, facts, &mut out.stats, alloc.clone())? {
+            match crate::finish::settle_reads(ms, done, facts, &mut out.stats, alloc)? {
                 crate::finish::Settled::Done(all) => done = all,
                 crate::finish::Settled::Need { asks, waits } => {
                     if !asks.is_empty() {

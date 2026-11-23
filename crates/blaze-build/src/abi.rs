@@ -33,8 +33,8 @@ pub enum Pass {
 
 /// The lowered signature of passes `inputs` and `ret`: a result pointer first (Rust's plain
 /// pointer, C's `sret`), then each input's registers; both lists in `alloc`.
-pub fn sig_of_in<A: Allocator + Clone>(inputs: &[Pass], ret: Pass, alloc: A) -> (Vec<Param, A>, Vec<Param, A>) {
-    let mut params = Vec::with_capacity_in(inputs.len() + 1, alloc.clone());
+pub fn sig_of_in<A: Allocator + Copy>(inputs: &[Pass], ret: Pass, alloc: A) -> (Vec<Param, A>, Vec<Param, A>) {
+    let mut params = Vec::with_capacity_in(inputs.len() + 1, alloc);
     let mut rets = Vec::with_capacity_in(2, alloc);
     let memory = |kind, size, align| Param { kind, facts: Facts { size, align, ..Param::of(Ty::PTR).facts }, ..Param::of(Ty::PTR) };
     match ret {

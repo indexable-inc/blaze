@@ -106,7 +106,7 @@ fn ones(bits: u32) -> u128 {
     if bits >= 128 { u128::MAX } else { (1u128 << bits) - 1 }
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// When `failed` (an `i1`) holds, calls `which`'s entry point (it never returns); the walk
     /// goes on in the block where it does not. An entry point the program does not declare is
     /// refused by name ([`BuildError::NoLangFn`]), as Rust refuses a program missing it.

@@ -139,6 +139,9 @@ pub struct ResolveOpts {
     pub features: RequestedFeatures,
 }
 
+impl blaze_own::Share for ResolveOpts {}
+impl blaze_own::LocalShare for ResolveOpts {}
+
 impl ResolveOpts {
     /// Creates a `ResolveOpts` that resolves everything.
     pub fn everything() -> ResolveOpts {
@@ -308,7 +311,7 @@ pub(super) type DepInfo = (Dependency, Rc<[Summary]>, FeaturesSet);
 /// We maintain a list of conflicts for error reporting as well as backtracking
 /// purposes. Each reason here is why candidates may be rejected or why we may
 /// fail to resolve a dependency.
-#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 pub enum ConflictReason {
     /// There was a semver conflict, for example we tried to activate a package
     /// 1.0.2 but 1.1.0 was already activated (aka a compatible semver version
@@ -389,3 +392,6 @@ impl<T> Clone for RcVecIter<T> {
         RcVecIter { vec: Rc::clone(&self.vec), offset: self.offset }
     }
 }
+
+impl<T> blaze_own::Share for RcVecIter<T> {}
+impl<T> blaze_own::LocalShare for RcVecIter<T> {}
