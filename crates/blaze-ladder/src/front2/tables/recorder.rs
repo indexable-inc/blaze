@@ -271,6 +271,10 @@ pub struct Recorder<'a> {
     /// ([`slot_of`], a byte of the key, no hash). A repeat of a recent cell is one load and one
     /// compare; a miss probes `seen` as before.
     recent: [Cell<Option<ReadKey>>; FILTER_SLOTS],
+    /// Direct-mapped filter in front of `mapped` for raw questions placed via [`Recorder::read_mapped`]:
+    /// kept in the recorder's scratch allocator (not on the stack) and only populated after
+    /// placement succeeds (or on a `mapped` hit), so a placement error is never hidden.
+    recent_raw: blaze_own::ABox<'a, [Cell<Option<TableRead>>; FILTER_SLOTS]>,
     /// Reads offered since the last item transferred its new cells, including repeats; a
     /// repeated question's muted offers are not ([`Recorder::memo`]).
     offered: Cell<u64>,
@@ -306,6 +310,7 @@ impl<'a> Recorder<'a> {
             allocating: Cell::new(None),
             checking: Cell::new(None),
             recent: [const { Cell::new(None) }; FILTER_SLOTS],
+            recent_raw: blaze_own::Box::new_in([const { Cell::new(None) }; FILTER_SLOTS], opts.alloc),
             offered: Cell::new(0),
             repeats: Cell::new(Repeats::Quiet),
             asking: Cell::new(None),
@@ -354,7 +359,7 @@ impl<'a> Recorder<'a> {
         let raw = core::mem::size_of::<TableRead>() as u64;
         let list = self.reads.borrow().capacity() as u64 * raw;
         let seen = self.seen.borrow().capacity() as u64 * (slot + 1);
-        let filter = core::mem::size_of_val(&self.recent) as u64;
+        let filter = (core::mem::size_of_val(&self.recent) + core::mem::size_of_val(&*self.recent_raw)) as u64;
         list + seen + filter + self.mapped.borrow().capacity() as u64 * (raw + 1)
     }
 
@@ -532,12 +537,23 @@ impl Recorder<'_> {
         if !self.offer() {
             return Ok(());
         }
+        let recent = self.recent_raw.get(slot_of(ReadKey::Raw(read)));
+        if recent.is_some_and(|slot| slot.get() == Some(read)) {
+            self.filtered.set(self.filtered.get().saturating_add(1));
+            return Ok(());
+        }
         let mut mapped = self.mapped.borrow_mut();
         if mapped.len() == MEMO_LIMIT {
             if mapped.contains(&read) {
+                if let Some(slot) = recent {
+                    slot.set(Some(read));
+                }
                 return Ok(());
             }
             mapped.clear();
+            for cell in self.recent_raw.iter() {
+                cell.set(None);
+            }
         }
         let may_grow = mapped.len() == mapped.capacity();
         if may_grow {
@@ -548,10 +564,18 @@ impl Recorder<'_> {
             self.allocating.set(None);
         }
         if !first {
+            if let Some(slot) = recent {
+                slot.set(Some(read));
+            }
             return Ok(());
         }
         match place() {
-            Ok(cell) => self.keep(read, cell),
+            Ok(cell) => {
+                if let Some(slot) = recent {
+                    slot.set(Some(read));
+                }
+                self.keep(read, cell);
+            }
             Err(error) => {
                 mapped.remove(&read);
                 // Early setup or seed refusal can stop the check before its stored
@@ -805,6 +829,28 @@ mod tests {
         let (list, tally) = r.finish_tallied().expect("within the cap");
         assert_eq!(list.len(), 2);
         assert_eq!((tally.offered, tally.filtered), (20, 18), "two modules in two slots: every repeat met by the filter");
+    }
+
+    /// `read_mapped` hits the direct-mapped raw filter on repeats without hiding placement errors.
+    #[test]
+    fn read_mapped_filters_recent_raw_repeats_and_keeps_errors_visible() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let r = Recorder::new(RecorderOpts { alloc });
+        let ok_read = TableRead::Names(NameCell::Root { krate: [1; 8] });
+        let err_read = TableRead::Names(NameCell::Root { krate: [2; 8] });
+        let mut placements = 0u32;
+        for _ in 0..8 {
+            r.read_mapped(ok_read, || {
+                placements += 1;
+                Ok::<_, ()>(Some(super::PlacedCell { kind: 1, subject: [1; 32], cell: [1; 16] }))
+            }).expect("ok placement");
+        }
+        assert_eq!(placements, 1);
+        assert_eq!(r.read_mapped(err_read, || Err(())), Err(()));
+        assert_eq!(r.read_mapped(err_read, || Err(())), Err(()), "placement error must not be cached in recent_raw");
+        let (list, tally) = r.finish_tallied().expect("within the cap");
+        assert_eq!(list.len(), 2);
+        assert_eq!(tally.filtered, 8, "7 repeats of ok_read in recent_raw + 1 repeat of err_read in keep");
     }
 
     /// Control: the planted drop removes exactly that cell.

@@ -60,15 +60,25 @@ pub struct BucketRead {
     pub answer: u64,
 }
 
+/// What one answered trait question read over buckets or impl tables.
+pub(super) struct TraitReads {
+    /// Question-specific reads (all reads for `admit_asked` and non-`Home::Any` `admit_tables`;
+    /// shape-specific reads only when `uses_any_filter` is true).
+    pub(super) own: Vec<BucketRead, Global>,
+    /// When true, this question also read the per-body `TablesCache` (`all_unread_reads` and
+    /// `trait_any_filter[&trait_]`).
+    pub(super) uses_any_filter: bool,
+}
+
 /// What [`Buckets::admit_asked`] keeps: which buckets are filed, and what each question read.
 pub(super) struct Indexed {
     /// Each (crate, bucket) filed, with its digest.
     filed: HashMap<(usize, BucketKey), u64, Global>,
     /// Each crate whose unfiled list is filed, with the list's digest.
     unfiled: HashMap<usize, u64, Global>,
-    /// The incoherent fact's digest, once `Buckets::incoherent` holds it.
-    incoherent: Option<u64>,
-    pub(super) trait_reads: HashMap<(ItemKey, Shape), Vec<BucketRead, Global>, Global>,
+    /// The incoherent fact's digest, once `BucketIndex::crate_state` holds it.
+    pub(super) incoherent: Option<u64>,
+    pub(super) trait_reads: HashMap<(ItemKey, Shape), TraitReads, Global>,
     pub(super) inherent_reads: HashMap<Shape, Vec<BucketRead, Global>, Global>,
     /// How many impls were filed from a bucket: no impl row decoded, no text opened.
     pub(super) from_index: u32,
@@ -171,19 +181,22 @@ impl BucketIndex {
         let Homes { all, bare, blanket, local: _ } = home;
         let mut reads: Vec<BucketRead, Global> = Vec::new_in(Global);
         if [all, bare, blanket].contains(&Home::Incoherent) {
-            match names.incoherent_crates() {
-                Some((crates, digest)) => {
-                    if self.indexed.incoherent.is_none() {
-                        for krate in 0..self.incoherent.len() {
-                            self.incoherent[krate] = crates.contains(&krate);
+            if let Some(digest) = self.indexed.incoherent {
+                reads.push(BucketRead { krate: 0, bucket: INCOHERENT_FACT, answer: digest });
+            } else {
+                match names.incoherent_crates() {
+                    Some((crates, digest)) => {
+                        for krate in 0..self.crate_state.len() {
+                            self.crate_state[krate].incoherent = crates.contains(&krate);
                         }
-                        self.indexed.incoherent = Some(first8(digest));
+                        let answer = first8(digest);
+                        self.indexed.incoherent = Some(answer);
+                        reads.push(BucketRead { krate: 0, bucket: INCOHERENT_FACT, answer });
                     }
-                    reads.push(BucketRead { krate: 0, bucket: INCOHERENT_FACT, answer: first8(digest) });
+                    // Not told: every crate stays admitted (the wide side), and the gap voids
+                    // the verdict by name.
+                    None => names.gap("which crates may write an incoherent inherent impl (the records were named no lang crates: `Records::name_lang_crates`)", None),
                 }
-                // Not told: every crate stays admitted (the wide side), and the gap voids
-                // the verdict by name.
-                None => names.gap("which crates may write an incoherent inherent impl (the records were named no lang crates: `Records::name_lang_crates`)", None),
             }
         }
         // The buckets asked of each crate, how an impl found in each is filed, and whether the
@@ -217,7 +230,7 @@ impl BucketIndex {
             }
             // A proc-macro unit the program reaches answers none of its questions; the
             // program's own crate (0) does, a proc macro's too (linked.rs `links_unit`).
-            if !crate::front2::linked::links_unit(krate == 0, names.proc_macro(krate) == Some(true)) {
+            if !self.crate_linked(names, krate) {
                 continue;
             }
             // Never skipped without a word: an admitted crate not asked leaves its impls out.
@@ -277,9 +290,13 @@ impl BucketIndex {
         reads.sort_unstable();
         reads.dedup();
         match ask {
-            Ask::Trait(t, shape) => self.indexed.trait_reads.insert((t, shape), reads),
-            Ask::Inherent(shape) => self.indexed.inherent_reads.insert(shape, reads),
-        };
+            Ask::Trait(t, shape) => {
+                self.indexed.trait_reads.insert((t, shape), TraitReads { own: reads, uses_any_filter: false });
+            }
+            Ask::Inherent(shape) => {
+                self.indexed.inherent_reads.insert(shape, reads);
+            }
+        }
         Ok(filed)
     }
 
@@ -296,10 +313,36 @@ impl BucketIndex {
         self.count(counts);
     }
 
+    /// Visits the parts of an answered trait question's reads without allocating: its own reads
+    /// and, when answered via the per-body `Home::Any` filter cache, the shared `UnreadTrait`
+    /// and per-trait `NoImplsOf` read slices.
+    pub(super) fn with_trait_reads<R>(&self, trait_: ItemKey, shape: Shape, f: impl FnOnce(&[BucketRead], Option<(&[BucketRead], &[BucketRead])>) -> R) -> R {
+        let Some(entry) = self.indexed.trait_reads.get(&(trait_, shape)) else {
+            return f(&[], None);
+        };
+        if !entry.uses_any_filter {
+            return f(&entry.own, None);
+        }
+        let shared = self.tables_cache.as_ref().map(|cache| (cache.all_unread_reads(), cache.trait_reads_for(trait_)));
+        f(&entry.own, shared)
+    }
+
     /// What the answered trait question read, sorted: each (crate, bucket) with its digest
     /// (module docs). Empty before the question is asked, and where no bucket index is read.
-    pub fn trait_reads(&self, trait_: ItemKey, shape: Shape) -> &[BucketRead] {
-        self.indexed.trait_reads.get(&(trait_, shape)).map_or(&[], |v| v.as_slice())
+    pub fn trait_reads(&self, trait_: ItemKey, shape: Shape) -> blaze_own::Vec<BucketRead, Global> {
+        let mut out: blaze_own::Vec<BucketRead, Global> = blaze_own::Vec::new_in(Global);
+        self.with_trait_reads(trait_, shape, |own, shared| {
+            let extra = shared.map_or(0, |(u, t)| u.len() + t.len());
+            out.reserve(own.len() + extra);
+            out.extend_from_slice(own);
+            if let Some((unread, trait_filter)) = shared {
+                out.extend_from_slice(unread);
+                out.extend_from_slice(trait_filter);
+                out.sort_unstable();
+                out.dedup();
+            }
+        });
+        out
     }
 
     /// What the answered inherent question at `shape` read, sorted.

@@ -795,3 +795,70 @@ fn rows_touched_by_one_edit() {
     assert_eq!(after.report.entered, 2, "one body edit enters its outline and its body: {:?}", &after.entered[..]);
     assert!(touched * 20 < total as u64, "rows touched {touched} of {total}: one edit asked for a twentieth of the answer or more");
 }
+
+/// Growing from a tiny `bits = 0` base (like `tool-base`) to a large workspace must re-page
+/// inside `encode_changes` and produce the exact same root as a full `encode`.
+#[test]
+fn encode_changes_repages_when_growing_from_small_base() {
+    use crate::Stage;
+    use crate::pages::{Kept, Sealed, VerifiedPage, decode_root, encode, encode_changes};
+
+    struct SmallBase<'b> {
+        page: VerifiedPage<'b>,
+    }
+    impl crate::StoredPages for SmallBase<'_> {
+        fn page(&self, _: Name) -> Result<Option<&VerifiedPage<'_>>, crate::pages::PagesError> {
+            Ok(Some(&self.page))
+        }
+        fn finding(&self, _: Name) -> Option<u32> { None }
+        fn refusal(&self) -> Option<crate::pages::PagesError> { None }
+        fn visit_rows(&self, visit: &mut dyn FnMut(Name) -> Result<(), LastError>) -> Result<(), LastError> {
+            self.page.row_names().try_for_each(visit)
+        }
+    }
+
+    let outline = Name::file(b"src/lib.rs");
+    let scope = Name::new(blaze_drive::Kind::CrateScope, ContentId([6; 32]));
+    let values = [ContentId([1; 32]), ContentId([2; 32]), ContentId([3; 32]), ContentId([4; 32]), ContentId([5; 32])];
+    let plan = |name, stage| Planned { name, phase: Phase::new(stage, 0), file: outline, source: ContentId([1; 32]) };
+    let small_readers: StdVec<StdVec<usize>> = StdVec::from([StdVec::from([0])]);
+    let mut small_plans = StdVec::from([plan(outline, Stage::Outlines), plan(scope, Stage::Names)]);
+    small_plans[0].source = dag_outline_source(0, &values);
+    small_plans.push(Planned { source: dag_body_source(0, &small_readers[0]), ..plan(dag_body(0), Stage::Bodies) });
+    let base_res = dag_request(Answer::new_in(alloc()), &[(outline, &small_plans)], outline, scope, &values, &small_readers).expect("small base");
+    let base_kept = Kept::after(crate::SMap::new_in(alloc()), base_res.answer, &base_res.causes, crate::SMap::new_in(alloc()));
+    let base_encoded = encode(&base_kept, None, alloc());
+    assert_eq!(base_encoded.bits, 0, "small base fits on one page");
+    let mut base_bytes: crate::SMap<'_, Key, crate::SVec<'_, u8>> = crate::SMap::new_in(alloc());
+    for (k, v) in base_encoded.puts.iter() {
+        base_bytes.insert(*k, crate::SVec::from_slice_in(v, alloc()));
+    }
+    let base_root = decode_root(Sealed::hashed(base_encoded.root, &base_bytes[&base_encoded.root]).expect("base root"), alloc()).expect("decode base root");
+    let base_page_key = base_root.pages[0];
+
+    // Grow to 220 bodies (each reading all 5 selectors -> > 64 KiB -> bits >= 1).
+    let mut big_readers: StdVec<StdVec<usize>> = StdVec::from([StdVec::from([0])]);
+    let mut big_plans = small_plans;
+    for i in 1..220 {
+        let sels = StdVec::from([4, 3, 2, 1, 0]);
+        big_plans.push(Planned { source: dag_body_source(0, &sels), ..plan(dag_body(i), Stage::Bodies) });
+        big_readers.push(sels);
+    }
+    let big_files = [(outline, big_plans.as_slice())];
+    let eager = dag_request(base_kept.answer, &big_files, outline, scope, &values, &big_readers).expect("eager big");
+    let repaged = {
+        let base_page = VerifiedPage::open(Sealed::hashed(base_page_key, &base_bytes[&base_page_key]).expect("base page"), 0, 0).expect("open base page");
+        let stored = SmallBase { page: base_page };
+        let paged = dag_request(Answer::from_pages(&stored, base_root.serial, alloc()), &big_files, outline, scope, &values, &big_readers).expect("paged big");
+        assert_eq!(&eager.entered[..], &paged.entered[..], "same tasks entered on paged vs in-memory base");
+        let paged_kept = Kept::after(crate::SMap::new_in(alloc()), paged.answer, &paged.causes, crate::SMap::new_in(alloc()));
+        encode_changes(&paged_kept, &base_root, alloc()).expect("repage encode_changes")
+    };
+    let mem_kept = Kept::after(base_kept.causes, eager.answer, &eager.causes, base_kept.records);
+    let expected = encode(&mem_kept, Some(&base_root), alloc());
+
+    assert!(repaged.bits > base_root.bits, "growing from tiny base must increase bits: {} -> {}", base_root.bits, repaged.bits);
+    assert_eq!(repaged.bits, expected.bits, "repaged bits match full encode");
+    assert_eq!(repaged.root, expected.root, "repaged root is byte-for-byte identical to full encode");
+    println!("repaged {} -> {} bits ({} bytes, {} pages), root matches full encode", base_root.bits, repaged.bits, repaged.bytes, repaged.pages.len());
+}

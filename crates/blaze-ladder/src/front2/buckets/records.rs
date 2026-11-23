@@ -578,8 +578,8 @@ const FLOAT_WIDTHS: [FloatWidth; 4] = [FloatWidth::F16, FloatWidth::F32, FloatWi
 /// name where the shape has no row shape: a nominal type whose library key the key map and the
 /// records do not give, or a shape blaze-surface refuses. Never an empty answer in its place:
 /// a question that reads no bucket answers "no impl", which is not what is known (D193 point 5).
-fn asked_shapes<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Result<Vec<SelfShape, Global>, ImplQuestionError> {
-    let mut out: Vec<SelfShape, Global> = Vec::new_in(Global);
+fn asked_shapes<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape, alloc: Alloc<'static>) -> Result<AVec<'static, SelfShape>, ImplQuestionError> {
+    let mut out: AVec<'static, SelfShape> = AVec::new_in(alloc);
     let lib = |k: ItemKey| keys.library_in(names, k);
     let mut put = |s: Shape| -> Result<(), ImplQuestionError> {
         let written = self_shape(s, &lib).map_err(|why| match why {
@@ -1358,7 +1358,138 @@ fn filing_of<'n, S: NamesSource<'n>>(names: S, row: &surface::ImplRow) -> Result
     Ok(Filing { key: row.impl_, filed, blanket, by_text, unread_bare, path_self })
 }
 
+/// Per-body cache for `Home::Any` trait lookups over impl tables, allocated in the body's
+/// scratch `alloc`. Probing `NoImplsOf` for `Probe::UnreadTrait` once per body and
+/// `Probe::Trait(t)` once per distinct trait avoids rescanning all linked crates and
+/// reallocating ~1,000 `BucketRead` rows on every `(trait, shape)` question.
+pub(super) struct TablesCache {
+    alloc: Alloc<'static>,
+    /// All linked crates in index order (`(crate_key, crate_index)`).
+    linked_crates: AVec<'static, (CrateItemKey, usize)>,
+    /// `Probe::UnreadTrait` fact row for every linked crate, probed once per body.
+    all_unread_reads: AVec<'static, BucketRead>,
+    /// Per trait (keyed by checker `ItemKey`), the linked crates whose `NoImplsOf` filter may
+    /// hold the trait, plus the `Probe::Trait` fact row for every linked crate.
+    trait_any_filter: HashMap<ItemKey, TraitAnyFilter, Alloc<'static>>,
+}
+
+struct TraitAnyFilter {
+    crates: AVec<'static, CrateItemKey>,
+    indexes: AVec<'static, usize>,
+    reads: AVec<'static, BucketRead>,
+}
+
+impl TablesCache {
+    pub(super) fn all_unread_reads(&self) -> &[BucketRead] {
+        &self.all_unread_reads
+    }
+
+    pub(super) fn trait_reads_for(&self, trait_: ItemKey) -> &[BucketRead] {
+        self.trait_any_filter.get(&trait_).map_or(&[], |entry| &entry.reads)
+    }
+}
+
+fn read_no_impls_of<'a>(tables: &'a TableSet<'_>, krate: CrateItemKey) -> Result<surface::NoImplsOfView<'a>, TablesReadError> {
+    let bytes = tables.no_impls_of(krate).map_err(|error| {
+        TablesReadError::Lookup(ImplLookupError::Records { krate, record: RecordKind::NoImplsOf, error })
+    })?;
+    let filter = surface::NoImplsOfView::read(bytes).map_err(|error| {
+        TablesReadError::Lookup(ImplLookupError::Format { krate, record: RecordKind::NoImplsOf, error })
+    })?;
+    if filter.krate() != krate {
+        return Err(TablesReadError::Lookup(ImplLookupError::WrongCrate {
+            krate,
+            record: RecordKind::NoImplsOf,
+            found: filter.krate(),
+        }));
+    }
+    Ok(filter)
+}
+
 impl BucketIndex {
+    /// Initializes [`BucketIndex::tables_cache`] on the first `Home::Any` trait question:
+    /// records `NameCell::Root` once per crate (via [`BucketIndex::crate_linked`]) and
+    /// `Probe::UnreadTrait` once per linked crate.
+    fn ensure_tables_cache<'n, S: NamesSource<'n>>(&mut self, names: S, tables: &TableSet<'_>, alloc: Alloc<'static>) -> Result<(), TablesReadError> {
+        if self.tables_cache.is_some() {
+            return Ok(());
+        }
+        let n = self.crate_state.len();
+        let mut linked_crates = AVec::with_capacity_in(n, alloc);
+        for krate in 0..n {
+            if !self.crate_linked(names, krate) {
+                continue;
+            }
+            let key = names.crate_key(krate).ok_or(TablesReadError::NoCrateKey { krate })?;
+            linked_crates.push((key, krate));
+        }
+        let mut all_unread_reads = AVec::with_capacity_in(linked_crates.len(), alloc);
+        let probes = self.table_reads.get_or_insert_with(|| BucketReadUnion::new(alloc));
+        let unread_id = probes.id(u128::from_be_bytes(ProbeName::UNREAD.cell));
+        for &(key, krate) in linked_crates.iter() {
+            let filter = read_no_impls_of(tables, key)?;
+            let krate_id = first16(key.0);
+            if probes.mark(krate, unread_id) {
+                names.impls_read(TableRead::Impls { krate: krate_id.to_be_bytes(), bucket: ProbeName::UNREAD.cell });
+            }
+            all_unread_reads.push(BucketRead {
+                krate: krate_id,
+                bucket: ProbeName::UNREAD.fact,
+                answer: u64::from(filter.has_unread()),
+            });
+        }
+        self.tables_cache = Some(TablesCache {
+            alloc,
+            linked_crates,
+            all_unread_reads,
+            trait_any_filter: HashMap::new_in(alloc),
+        });
+        Ok(())
+    }
+
+    /// Ensures `trait_any_filter` holds `trait_`, probing `NoImplsOf::may_hold_trait(lib_trait)`
+    /// once across all linked crates and recording `Probe::Trait(lib_trait)` into `names`.
+    fn ensure_trait_any_filter<'n, S: NamesSource<'n>>(
+        &mut self,
+        names: S,
+        trait_: ItemKey,
+        lib_trait: LibKey,
+        tables: &TableSet<'_>,
+        alloc: Alloc<'static>,
+    ) -> Result<(), TablesReadError> {
+        self.ensure_tables_cache(names, tables, alloc)?;
+        let Some(cache) = self.tables_cache.as_mut() else { return Ok(()) };
+        if cache.trait_any_filter.contains_key(&trait_) {
+            return Ok(());
+        }
+        let cache_alloc = cache.alloc;
+        let name = tables.probe(Probe::Trait(lib_trait));
+        let probes = self.table_reads.get_or_insert_with(|| BucketReadUnion::new(cache_alloc));
+        let probe_id = probes.id(u128::from_be_bytes(name.cell));
+        let mut crates = AVec::new_in(cache_alloc);
+        let mut indexes = AVec::new_in(cache_alloc);
+        let mut reads = AVec::with_capacity_in(cache.linked_crates.len(), cache_alloc);
+        for &(key, krate) in cache.linked_crates.iter() {
+            let filter = read_no_impls_of(tables, key)?;
+            let may_hold = filter.may_hold_trait(lib_trait);
+            let krate_id = first16(key.0);
+            if probes.mark(krate, probe_id) {
+                names.impls_read(TableRead::Impls { krate: krate_id.to_be_bytes(), bucket: name.cell });
+            }
+            reads.push(BucketRead {
+                krate: krate_id,
+                bucket: name.fact,
+                answer: u64::from(may_hold),
+            });
+            if may_hold {
+                crates.push(key);
+                indexes.push(krate);
+            }
+        }
+        cache.trait_any_filter.insert(trait_, TraitAnyFilter { crates, indexes, reads });
+        Ok(())
+    }
+
     /// Files what the question `ask` at `home` can be answered from, from the impl tables
     /// `tables` (module docs): the crates `home` admits, as [`Buckets::admit_asked`] chooses
     /// them, each asked through blaze-impls' lookups at every shape `ask`'s stands for. A
@@ -1374,14 +1505,20 @@ impl BucketIndex {
         let Homes { all, bare, blanket, local: _ } = home;
         let mut reads: Vec<BucketRead, Global> = Vec::new_in(Global);
         if [all, bare, blanket].contains(&Home::Incoherent) {
-            match names.incoherent_crates() {
-                Some((crates, digest)) => {
-                    for krate in 0..self.incoherent.len() {
-                        self.incoherent[krate] = crates.contains(&krate);
+            if let Some(digest) = self.indexed.incoherent {
+                reads.push(BucketRead { krate: 0, bucket: INCOHERENT_FACT, answer: digest });
+            } else {
+                match names.incoherent_crates() {
+                    Some((crates, digest)) => {
+                        for krate in 0..self.crate_state.len() {
+                            self.crate_state[krate].incoherent = crates.contains(&krate);
+                        }
+                        let answer = first8(&digest.0);
+                        self.indexed.incoherent = Some(answer);
+                        reads.push(BucketRead { krate: 0, bucket: INCOHERENT_FACT, answer });
                     }
-                    reads.push(BucketRead { krate: 0, bucket: INCOHERENT_FACT, answer: first8(&digest.0) });
+                    None => names.gap("which crates may write an incoherent inherent impl (the records were named no lang crates: `Records::name_lang_crates`)", None),
                 }
-                None => names.gap("which crates may write an incoherent inherent impl (the records were named no lang crates: `Records::name_lang_crates`)", None),
             }
         }
         let (trait_, shape) = match ask {
@@ -1391,26 +1528,39 @@ impl BucketIndex {
         // A question no bucket of which can be asked is refused by name: answered from no
         // bucket it would read "no impl", which is not what is known (D193 point 5). These were
         // a names-log gap and `Ok(0)`, so the body went on to that wrong answer.
-        let shapes = asked_shapes(names, keys, shape)?;
+        let shapes = asked_shapes(names, keys, shape, alloc)?;
         let lib_trait = match trait_ {
             Some(t) => Some(keys.library_in(names, t).ok_or(ImplQuestionError::NoLibraryKey { of: "the trait an impl question is about", key: t })?),
             None => None,
         };
-        // The crates asked, in index order: those `home` admits that the program links.
-        let mut crates: Vec<CrateItemKey, Global> = Vec::new_in(Global);
-        let mut indexes: Vec<usize, Global> = Vec::new_in(Global);
-        for krate in 0..self.incoherent.len() {
-            if !(self.admits(all, krate) || self.admits(bare, krate) || self.admits(blanket, krate)) {
-                continue;
+        // When `home` admits all linked crates for a trait question, share the per-body
+        // `NoImplsOf` precheck across shapes so `candidates_in` only visits matching holders.
+        let uses_any_filter = matches!((trait_, lib_trait), (Some(_), Some(_))) && [all, bare, blanket].contains(&Home::Any);
+        let mut crates: AVec<'static, CrateItemKey> = AVec::new_in(alloc);
+        let mut indexes: AVec<'static, usize> = AVec::new_in(alloc);
+        if let (true, Some(t), Some(lib_t)) = (uses_any_filter, trait_, lib_trait) {
+            self.ensure_trait_any_filter(names, t, lib_t, tables, alloc)?;
+            if let Some(entry) = self.tables_cache.as_ref().and_then(|c| c.trait_any_filter.get(&t)) {
+                crates.reserve(entry.crates.len());
+                indexes.reserve(entry.indexes.len());
+                crates.extend_from_slice(&entry.crates);
+                indexes.extend_from_slice(&entry.indexes);
             }
-            if !crate::front2::linked::links_unit(krate == 0, names.proc_macro(krate) == Some(true)) {
-                continue;
+        } else {
+            // The crates asked, in index order: those `home` admits that the program links.
+            for krate in 0..self.crate_state.len() {
+                if !(self.admits(all, krate) || self.admits(bare, krate) || self.admits(blanket, krate)) {
+                    continue;
+                }
+                if !self.crate_linked(names, krate) {
+                    continue;
+                }
+                // Never skipped without a word: a crate the home admits whose tables are not asked
+                // would leave its impls out of the answer unseen.
+                let key = names.crate_key(krate).ok_or(TablesReadError::NoCrateKey { krate })?;
+                crates.push(key);
+                indexes.push(krate);
             }
-            // Never skipped without a word: a crate the home admits whose tables are not asked
-            // would leave its impls out of the answer unseen.
-            let key = names.crate_key(krate).ok_or(TablesReadError::NoCrateKey { krate })?;
-            crates.push(key);
-            indexes.push(krate);
         }
         let mut filed = 0usize;
         for (width, s) in shapes.iter().enumerate() {
@@ -1419,7 +1569,8 @@ impl BucketIndex {
             }
             // A trait rejection covers every width of a numeric survey. Only holders
             // that passed the first width's trait check need the remaining heads.
-            let narrow = width == 0 && shapes.len() > 1 && lib_trait.is_some();
+            // Under `uses_any_filter`, every crate in `crates` already passed the trait check.
+            let narrow = !uses_any_filter && width == 0 && shapes.len() > 1 && lib_trait.is_some();
             let remaining = RefCell::new(Vec::new_in(alloc));
             // Slots are local to a concrete shape. Its nth want is the same probe in
             // every holder, so only the first holder needs the stretch interner.
@@ -1430,7 +1581,7 @@ impl BucketIndex {
             let note = |holder: usize, slot: usize, read: ImplRead| {
                 let row = match read {
                     ImplRead::Filter { krate, probe, may_hold } => {
-                        if width != 0 && matches!(probe, Probe::Trait(_) | Probe::UnreadTrait) {
+                        if (uses_any_filter || width != 0) && matches!(probe, Probe::Trait(_) | Probe::UnreadTrait) {
                             return;
                         }
                         if narrow && may_hold && matches!(probe, Probe::Trait(_)) {
@@ -1491,9 +1642,13 @@ impl BucketIndex {
         reads.sort_unstable();
         reads.dedup();
         match ask {
-            Ask::Trait(t, shape) => self.indexed.trait_reads.insert((t, shape), reads),
-            Ask::Inherent(shape) => self.indexed.inherent_reads.insert(shape, reads),
-        };
+            Ask::Trait(t, shape) => {
+                self.indexed.trait_reads.insert((t, shape), asked::TraitReads { own: reads, uses_any_filter });
+            }
+            Ask::Inherent(shape) => {
+                self.indexed.inherent_reads.insert(shape, reads);
+            }
+        }
         Ok(filed)
     }
 }

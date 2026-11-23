@@ -99,3 +99,69 @@ fn unrelated_fresh_repo_reuses_toolchain_base_automatically() {
     assert!(b.entered(blaze_engine::Stage::Heads) < a1.entered(blaze_engine::Stage::Heads), "B reuses toolchain `ImplBucket`s from `tool-base`:\n{}", b.profile);
     assert_eq!(b.errors, 0, "B checks cleanly:\n{}", b.profile);
 }
+
+#[test]
+fn toolchain_base_populates_cells_and_merges_from_work_rows() {
+    BASE_PLANT.set(BasePlant::None);
+    let io = Io::simulated(SimWorld::new(23, Limits::USUAL));
+    let shelf = lang_shelf(&io);
+    // A1 is a plain Rust crate (populates `tool-base` from `kept.answer.rows` on cold check).
+    repository_a(&io, A1);
+    // B is a different unrelated repo with a second edition / fresh build on top of `tool-base`
+    // (`from_last == true`, so newly computed rows live in `kept.answer.work().rows`).
+    repository_b(&io, B);
+    let check_with_shelf = |checkout: Checkout| {
+        let opts = || {
+            let mut opts = engine_check_tests::opts(&io, 2, false);
+            opts.place.checkout = checkout.dir;
+            opts.toolchain = shelf;
+            opts
+        };
+        check_in::<fix::Atomic>(&io, checkout, &opts, View::Person, None)
+    };
+    let a1 = check_with_shelf(A1);
+    assert_eq!(a1.errors, 0, "A1 checks cleanly:\n{}", a1.profile);
+    // Verify `tool-base` actually stored `cells` for every toolchain row's `defines`.
+    use crate::store::Store as _;
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+    let frame = Frame::with_reserve(16 << 20, bstd::mem::Tag::Other).expect("frame");
+    let alloc = blaze_own::Erased::new(&frame);
+    let opts = engine_check_tests::opts(&io, 2, false);
+    let fs = io.need_fs().expect("files");
+    let root = fs.open_dir(&cx, &Path::new(A1.dir).expect("a path")).expect("open");
+    let err = io.need_err().expect("err");
+    let clock = io.need_clock().expect("clock");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let opened = crate::store::open_for_command(&cx, &fs, &host, &mut rng, opts.place.home, &root, A1.dir, &clock, &err, opts.heap).expect("open store");
+    let mut store = crate::store::CommandStore::new(&cx, &opened.lent, false, opened.open_ns, None, clock.clone(), &err, alloc.handle()).expect("store");
+    let ptr = crate::engine_answer::load_toolchain_base(&cx, &mut store, shelf, &opts.tools, &frame)
+        .expect("load tool-base")
+        .expect("tool-base exists")
+        .expect("tool-base readable");
+    let decoded = blaze_engine::pages::decode(
+        ptr.root,
+        |k| match store.get(&cx, k) {
+            Ok(Some(held)) => Some(Ok(blaze_engine::pages::Sealed::by_store(k, held.bytes, held.proof))),
+            _ => None,
+        },
+        opts.heap.shared(),
+    )
+    .expect("decode tool-base");
+    assert!(!decoded.answer.rows.is_empty(), "tool-base holds toolchain rows");
+    let mut expected_cells = 0usize;
+    for (&name, row) in decoded.answer.rows.iter() {
+        for &(cell, digest) in row.defines.iter() {
+            expected_cells += 1;
+            let got = decoded.answer.cells.get(&blaze_engine::CellId { of: name, cell });
+            assert_eq!(got.map(|&(d, _)| d), Some(digest), "tool-base must store cell digest for {name:?}/{cell:?}");
+        }
+    }
+    assert!(expected_cells > 0, "toolchain rows define cells that must be stored in tool-base");
+    drop(store);
+    drop(opened);
+    let b = check_with_shelf(B);
+    assert!(b.engine().from_last, "B starts from tool-base:\n{}", b.profile);
+    assert_eq!(b.entered(blaze_engine::Stage::Names), 2, "B reuses all toolchain Names from tool-base:\n{}", b.profile);
+    assert_eq!(b.errors, 0, "B checks cleanly:\n{}", b.profile);
+}
