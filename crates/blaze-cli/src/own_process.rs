@@ -57,6 +57,21 @@ use crate::run_loop::{self, LoopError};
 use crate::run_parent::{self, Front, Lazy, Needs, ParentError, RECORDS, RecordsDir};
 use crate::start_list;
 
+/// Sans-IO decision for whether a finished `blaze run` should unlink its `.telem` and `.meta`
+/// files immediately on child exit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RunCleanup {
+    UnlinkTelemAndMeta,
+    KeepForViewer,
+}
+
+fn decide_run_cleanup(open: blaze_run::viewer::OpenExplore, viewer_active: bool) -> RunCleanup {
+    match (open, viewer_active) {
+        (blaze_run::viewer::OpenExplore::No, false) => RunCleanup::UnlinkTelemAndMeta,
+        (blaze_run::viewer::OpenExplore::Open, _) | (_, true) => RunCleanup::KeepForViewer,
+    }
+}
+
 /// The span the parent's loop runs in: the wait for the program's end, which D103 exempts from
 /// a deadline (the module's doc says why).
 pub(crate) const PROGRAM_SPAN: &str = "blaze run: the program to exit (no deadline: the program's lifetime is the user's, D103)";
@@ -386,6 +401,26 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
         let name = bstd::mem::format_in!(frame, "{}.build.json", stem.as_str());
         if let Ok(rel) = Path::new(name.as_str()) {
             let _ = dir.publish(cx, &rel, bstd::fs::Content::bytes(body.as_bytes()), bstd::fs::Durable::No);
+        }
+        // Reclaim the 256 KiB `.telem` ring and `.meta` immediately on child exit when `--open`
+        // was not passed and no live viewer holds `v2/runs/viewer.lock` (1 stat fast path when
+        // no viewer has run; leaves files for the viewer's 15s collector when one is active).
+        let viewer_active = match launch.open {
+            blaze_run::viewer::OpenExplore::Open => true,
+            blaze_run::viewer::OpenExplore::No => {
+                Path::new(".blaze")
+                    .ok()
+                    .and_then(|rel| fs.home(cx, home, &rel).ok())
+                    .map_or(false, |blaze_dir| crate::gc::viewer_lock_is_held(cx, &blaze_dir))
+            }
+        };
+        if decide_run_cleanup(launch.open, viewer_active) == RunCleanup::UnlinkTelemAndMeta {
+            for ext in [".telem", ".meta"] {
+                let leaf = bstd::mem::format_in!(frame, "{}{ext}", stem.as_str());
+                if let Ok(rel) = Path::new(leaf.as_str()) {
+                    let _ = dir.remove(cx, &rel, bstd::fs::Durable::No);
+                }
+            }
         }
     }
     // A crash the program's handler told by place, named while the walk is alive (rule 19,

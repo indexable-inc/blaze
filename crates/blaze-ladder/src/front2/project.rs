@@ -259,10 +259,24 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     /// over the read-only view (`Tables`), so its key map, head store, impl index, constants
     /// and prepared macros are the task's own and nothing is kept from one body to the next.
     pub fn over(front: Front2<'n, S>, alloc: Alloc<'static>) -> ProjectWorld<'n, S> {
+        Self::over_with(front, None, alloc)
+    }
+
+    /// As [`ProjectWorld::over`], sharing a caller-owned `prepared` macro table across a stretch
+    /// of bodies so each body leaves 0 bytes in `front.frame` for `Prepares` and macro definitions
+    /// are compiled once per stretch instead of leaked per body. When `prepared` is `None`,
+    /// allocates a fresh `Prepares` in `front.frame`.
+    pub fn over_with(front: Front2<'n, S>, prepared: Option<&'n Prepares<'n>>, alloc: Alloc<'static>) -> ProjectWorld<'n, S> {
         let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
         store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
-        let bump = front.frame.alloc(blaze_own::Erased::new(front.frame)).bump();
-        ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(bump), alloc, by_chain: None }
+        let prepared = match prepared {
+            Some(prepared) => prepared,
+            None => {
+                let bump = front.frame.alloc(blaze_own::Erased::new(front.frame)).bump();
+                Prepares::new_in(bump)
+            }
+        };
+        ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared, alloc, by_chain: None }
     }
 
     /// The meter the checks file their parts in (front2 tables/cost.rs): a measurement only.

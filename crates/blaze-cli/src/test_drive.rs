@@ -3063,6 +3063,9 @@ fn run_selected<'h>(
         alloc,
     );
     watch.see(blaze_screen::Step::Says);
+    // Clean up this command's per-run `$TMPDIR` tree (`v2/test/tmp/<pid>-<ns>`) on both Ok and Err
+    // paths now that all child test processes have exited.
+    let _ = crate::gc::remove_tree_best_effort(&cx, &temps, &command_path);
     // A run that stopped in blaze: ONE line naming the test, what failed and its cause, then
     // the command's own error (`OneStopped`) says the line above is why (rule 19). The
     // runner's `Seam` error says only that one stopped, so it is not shown.

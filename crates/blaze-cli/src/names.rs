@@ -465,7 +465,10 @@ fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name:
         (blaze_scope::names_cells::Section::Expansions, expansions),
     ];
     let cells = blaze_scope::names_cells::crate_table(done.names, &names_record, &items_record, &wholes, bump).map_err(|error| unwritten("cell table", std::format!("{error:?}")))?;
-    let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..], tests, expansions, &links[..], &cells[..]]);
+    // Section::Inner is omitted (&[]) on disk: no reader consumes it (only `names/scope.rs`
+    // hashes `done.inner` in memory into the task's `out` digest). Keeping the 8-section wire
+    // header avoids bumping the format while cutting 14-18% off every stored CrateScope record.
+    let payload = sections::write(unresolved, [&done.record[..], &[], &names_record[..], &items_record[..], tests, expansions, &links[..], &cells[..]]);
     #[cfg(test)]
     sections::watch_tests(crate_name, &payload, tests);
     Ok(ScopeRecord { payload, findings, unresolved, tests_refused, test_marks, expansions: extras })

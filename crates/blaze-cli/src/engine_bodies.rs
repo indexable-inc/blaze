@@ -643,10 +643,9 @@ const BODY_SCRATCH: usize = 1 << 30;
 /// grew it to (blaze-mem `Frame::reset`), so a run's scratch held its largest body's high-water
 /// until the run's last body ended, once a worker. Past this the blocks ahead of the cursor go
 /// back to the kernel as the next body begins (`Frame::trim`): a worker holds at most this
-/// between bodies, and a large body pays its own page faults. 32 MiB holds the scratch of every
-/// body of the ladder's projects whose profile line names one (the recorder's cells for about
-/// 200,000 reads).
-const SCRATCH_KEEP: usize = 32 << 20;
+/// between bodies, and a large body pays its own page faults. 8 MiB holds the scratch of typical
+/// bodies without pinning 576 MiB across 18 workers.
+const SCRATCH_KEEP: usize = 8 << 20;
 
 /// What the runs' frames held committed (rule 16): the scratch's most at a body's end, the
 /// stretch frame's most at a stretch's end, and how many times a scratch was trimmed back to
@@ -6409,7 +6408,11 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
     // only in a build with the feature.
     let census: Option<&blaze_ladder::front2::call_census::CensusCell> =
         cfg!(feature = "call-census").then(|| &*frame.alloc(blaze_ladder::front2::call_census::CensusCell::new(shared.heap.shared())));
-    let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed.map(|s| s as &dyn HeadSeed<'_>), sources: Some(opened.sources), goals: None, census };
+    // One stretch-scoped macro preparation table shared across every body in the stretch so
+    // `ProjectWorld::over_prepared` allocates 0 bytes in `frame` per body and macros are prepared
+    // once per stretch rather than leaked per body.
+    let prepared: &blaze_scope::prepares::Prepares<'_> = blaze_scope::prepares::Prepares::new_in(fb);
+    let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed.map(|s| s as &dyn HeadSeed<'_>), sources: Some(opened.sources), goals: None, census, prepared: Some(prepared) };
     // Each crate's listing from the request's table (engine_heads.rs `Listings`): made once a
     // request, not once a stretch that places a read in it.
     let set_lang = clock.now();
@@ -6542,7 +6545,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                 let result = {
                     let keyer = BodyReadKeyer {
                         grains: shared.grains,
-                        fine_buckets: shared.scope_reads.tables_at_cells() || shared.plants.fine_buckets,
+                        fine_buckets: shared.plants.fine_buckets,
                         ids: core::cell::RefCell::new(&mut ids),
                     };
                     let active = recording.as_mut().expect("the entry owns its recorder");
