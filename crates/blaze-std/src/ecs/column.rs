@@ -6,10 +6,66 @@
 use core::alloc::Allocator;
 use core::any::{Any, TypeId};
 
-use blaze_own::{Box as OwnBox, String as OwnString, Vec as OwnVec};
+use blaze_own::{AllocFailure, Box as OwnBox, String as OwnString, Vec as OwnVec};
+
+use crate::data::Value;
 
 use super::error::EcsError;
 use super::id::{ComponentId, TableId};
+use super::reflect::{ReflectComponent, ReflectError};
+
+/// Optional safe reflection vtable stored per reflected [`TypedColumn`].
+pub(crate) struct ReflectVtable<T: 'static, A: Allocator + Copy> {
+    pub(crate) to_value: fn(&T, A) -> Result<Value<A>, ReflectError>,
+    pub(crate) patch_value: fn(&mut T, &Value<A>, A) -> Result<(), ReflectError>,
+    pub(crate) from_value: fn(&Value<A>, A) -> Result<T, ReflectError>,
+}
+
+impl<T: 'static, A: Allocator + Copy> Clone for ReflectVtable<T, A> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: 'static, A: Allocator + Copy> Copy for ReflectVtable<T, A> {}
+
+/// Construct a [`ReflectVtable`] for any [`ReflectComponent`] type `T`.
+pub(crate) fn reflect_vtable<T: ReflectComponent, A: Allocator + Copy>() -> ReflectVtable<T, A> {
+    fn to_val<T: ReflectComponent, A: Allocator + Copy>(
+        v: &T,
+        alloc: A,
+    ) -> Result<Value<A>, ReflectError> {
+        v.reflect_to_value(alloc)
+    }
+    fn patch_val<T: ReflectComponent, A: Allocator + Copy>(
+        v: &mut T,
+        patch: &Value<A>,
+        alloc: A,
+    ) -> Result<(), ReflectError> {
+        v.patch_value(patch, alloc)
+    }
+    fn from_val<T: ReflectComponent, A: Allocator + Copy>(
+        val: &Value<A>,
+        alloc: A,
+    ) -> Result<T, ReflectError> {
+        T::from_patch_value(val, alloc)
+    }
+    ReflectVtable {
+        to_value: to_val::<T, A>,
+        patch_value: patch_val::<T, A>,
+        from_value: from_val::<T, A>,
+    }
+}
+
+/// Validate that `val` decodes cleanly as `T` before mutating any world table.
+pub(crate) fn validate_reflected_value<T: ReflectComponent, A: Allocator + Copy>(
+    val: &Value<A>,
+    alloc: A,
+) -> Result<(), ReflectError> {
+    let _ = T::from_patch_value(val, alloc)?;
+    Ok(())
+}
 
 /// Type-erased contiguous SoA column stored inside an archetype [`super::table::Table`].
 pub trait AnyColumn<A: Allocator + Copy> {
@@ -56,19 +112,60 @@ pub trait AnyColumn<A: Allocator + Copy> {
 
     /// Construct a fresh empty column of the same component type in `alloc`.
     fn make_empty(&self, alloc: A) -> OwnBox<dyn AnyColumn<A>, A>;
+
+    /// Whether this column has live [`ReflectComponent`] reflection hooks enabled.
+    fn is_reflected(&self) -> bool;
+
+    /// Reflect the value at `row` into a [`Value`], returning `Ok(None)` if this column is opaque.
+    fn row_to_value(
+        &self,
+        table: TableId,
+        row: usize,
+        cid: ComponentId,
+        alloc: A,
+    ) -> Result<Option<Value<A>>, ReflectError>;
+
+    /// Patch the value at `row` in-place from `patch` using this column's reflection vtable.
+    fn patch_row_from_value(
+        &mut self,
+        table: TableId,
+        row: usize,
+        cid: ComponentId,
+        patch: &Value<A>,
+        alloc: A,
+    ) -> Result<(), ReflectError>;
+
+    /// Decode a new component value from `val` and push it onto the back of this column.
+    fn push_from_value(
+        &mut self,
+        cid: ComponentId,
+        val: &Value<A>,
+        alloc: A,
+    ) -> Result<(), ReflectError>;
 }
 
 /// Concrete contiguous SoA column for component type `T`.
 pub struct TypedColumn<T: 'static, A: Allocator + Copy> {
     data: OwnVec<T, A>,
     duplicator: Option<fn(&T) -> T>,
+    reflect: Option<ReflectVtable<T, A>>,
 }
 
 impl<T: 'static, A: Allocator + Copy> TypedColumn<T, A> {
     /// Create an empty column in `alloc` with an optional value duplicator for prefab instantiation.
     #[inline]
     pub fn new_in(alloc: A, duplicator: Option<fn(&T) -> T>) -> Self {
-        Self { data: OwnVec::new_in(alloc), duplicator }
+        Self { data: OwnVec::new_in(alloc), duplicator, reflect: None }
+    }
+
+    /// Create an empty column in `alloc` with optional duplicator and reflection vtable.
+    #[inline]
+    pub(crate) fn new_with_reflect_in(
+        alloc: A,
+        duplicator: Option<fn(&T) -> T>,
+        reflect: Option<ReflectVtable<T, A>>,
+    ) -> Self {
+        Self { data: OwnVec::new_in(alloc), duplicator, reflect }
     }
 
     /// Enable value duplication for a `Copy` component column (used when upgrading a lazily
@@ -82,6 +179,15 @@ impl<T: 'static, A: Allocator + Copy> TypedColumn<T, A> {
             *v
         }
         self.duplicator = Some(copy_val::<T>);
+    }
+
+    /// Enable live `bstd::data` reflection on an existing component column.
+    #[inline]
+    pub(crate) fn enable_reflect(&mut self)
+    where
+        T: ReflectComponent,
+    {
+        self.reflect = Some(reflect_vtable::<T, A>());
     }
 
     /// Push a new value onto the back of the column.
@@ -195,7 +301,65 @@ impl<T: 'static, A: Allocator + Copy + 'static> AnyColumn<A> for TypedColumn<T, 
     }
 
     fn make_empty(&self, alloc: A) -> OwnBox<dyn AnyColumn<A>, A> {
-        OwnBox::new_in(TypedColumn::<T, A>::new_in(alloc, self.duplicator), alloc)
+        OwnBox::new_in(
+            TypedColumn::<T, A>::new_with_reflect_in(alloc, self.duplicator, self.reflect),
+            alloc,
+        )
+    }
+
+    #[inline]
+    fn is_reflected(&self) -> bool {
+        self.reflect.is_some()
+    }
+
+    fn row_to_value(
+        &self,
+        table: TableId,
+        row: usize,
+        _cid: ComponentId,
+        alloc: A,
+    ) -> Result<Option<Value<A>>, ReflectError> {
+        let Some(vtable) = self.reflect else {
+            return Ok(None);
+        };
+        let len = self.data.len();
+        let val = self
+            .data
+            .get(row)
+            .ok_or(ReflectError::Ecs(EcsError::RowOutOfBounds { table, row, len }))?;
+        (vtable.to_value)(val, alloc).map(Some)
+    }
+
+    fn patch_row_from_value(
+        &mut self,
+        table: TableId,
+        row: usize,
+        cid: ComponentId,
+        patch: &Value<A>,
+        alloc: A,
+    ) -> Result<(), ReflectError> {
+        let Some(vtable) = self.reflect else {
+            return Err(ReflectError::NotReflected(cid));
+        };
+        let len = self.data.len();
+        let slot = self
+            .data
+            .get_mut(row)
+            .ok_or(ReflectError::Ecs(EcsError::RowOutOfBounds { table, row, len }))?;
+        (vtable.patch_value)(slot, patch, alloc)
+    }
+
+    fn push_from_value(
+        &mut self,
+        cid: ComponentId,
+        val: &Value<A>,
+        alloc: A,
+    ) -> Result<(), ReflectError> {
+        let Some(vtable) = self.reflect else {
+            return Err(ReflectError::NotReflected(cid));
+        };
+        let item = (vtable.from_value)(val, alloc)?;
+        self.push(item).map_err(ReflectError::from)
     }
 }
 
@@ -252,10 +416,18 @@ pub struct ComponentMeta<A: Allocator + Copy> {
     pub id: ComponentId,
     pub name: OwnString<A>,
     pub type_id: TypeId,
+    /// Size in bytes of the registered component type (`core::mem::size_of::<T>()`).
+    pub size: usize,
     /// Optional Blaze record schema ID hook (e.g. `blaze_record_schema_id::<T>()`).
     pub schema_id: Option<u64>,
     pub(crate) make_column: fn(A) -> OwnBox<dyn AnyColumn<A>, A>,
+    pub(crate) enable_copy_col: Option<fn(&mut dyn AnyColumn<A>)>,
+    pub(crate) enable_reflect_col: Option<fn(&mut dyn AnyColumn<A>)>,
     pub can_copy: bool,
+    /// Whether live `bstd::data` reflection is enabled for this component.
+    pub reflected: bool,
+    pub(crate) schema_fn: Option<fn(A) -> Result<Value<A>, AllocFailure>>,
+    pub(crate) validate_value_fn: Option<fn(&Value<A>, A) -> Result<(), ReflectError>>,
 }
 
 impl<A: Allocator + Copy> ComponentMeta<A> {
@@ -264,21 +436,59 @@ impl<A: Allocator + Copy> ComponentMeta<A> {
     pub fn name(&self) -> &str {
         self.name.as_str()
     }
+
+    /// Return this component's reflected schema [`Value`], or `Ok(None)` if not reflected.
+    #[inline]
+    pub fn schema(&self, alloc: A) -> Result<Option<Value<A>>, AllocFailure> {
+        match self.schema_fn {
+            Some(f) => f(alloc).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Construct a fresh empty column configured with this component's current copy & reflection hooks.
+    pub(crate) fn create_column(&self, alloc: A) -> OwnBox<dyn AnyColumn<A>, A> {
+        let mut col = (self.make_column)(alloc);
+        if let Some(enable) = self.enable_copy_col {
+            enable(col.as_mut());
+        }
+        if let Some(enable) = self.enable_reflect_col {
+            enable(col.as_mut());
+        }
+        col
+    }
+
+    /// Validate that `val` decodes cleanly as this component before mutating any table.
+    #[inline]
+    pub(crate) fn validate_value(&self, val: &Value<A>, alloc: A) -> Result<(), ReflectError> {
+        match self.validate_value_fn {
+            Some(f) => f(val, alloc),
+            None => Err(ReflectError::NotReflected(self.id)),
+        }
+    }
 }
 
-/// Helper column factory for non-copyable components.
+/// Helper column factory for any component type `T`.
 pub(crate) fn make_column_plain<T: 'static, A: Allocator + Copy + 'static>(
     alloc: A,
 ) -> OwnBox<dyn AnyColumn<A>, A> {
     OwnBox::new_in(TypedColumn::<T, A>::new_in(alloc, None), alloc)
 }
 
-/// Helper column factory for `Copy` components (enables prefab instantiation).
-pub(crate) fn make_column_copy<T: Copy + 'static, A: Allocator + Copy + 'static>(
-    alloc: A,
-) -> OwnBox<dyn AnyColumn<A>, A> {
-    fn copy_val<T: Copy>(v: &T) -> T {
-        *v
+/// Type-erased hook that enables `Copy` duplication on a `TypedColumn<T, A>`.
+pub(crate) fn enable_copy_any<T: Copy + 'static, A: Allocator + Copy + 'static>(
+    col: &mut dyn AnyColumn<A>,
+) {
+    if let Some(typed) = col.as_any_mut().downcast_mut::<TypedColumn<T, A>>() {
+        typed.enable_copy();
     }
-    OwnBox::new_in(TypedColumn::<T, A>::new_in(alloc, Some(copy_val::<T>)), alloc)
+}
+
+/// Type-erased hook that enables live reflection on a `TypedColumn<T, A>`.
+pub(crate) fn enable_reflect_any<T: ReflectComponent + 'static, A: Allocator + Copy + 'static>(
+    col: &mut dyn AnyColumn<A>,
+) {
+    if let Some(typed) = col.as_any_mut().downcast_mut::<TypedColumn<T, A>>() {
+        typed.enable_reflect();
+    }
 }

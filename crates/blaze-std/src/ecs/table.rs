@@ -10,6 +10,8 @@ use core::cmp::Ordering;
 
 use blaze_own::{Box as OwnBox, Vec as OwnVec};
 
+use crate::data::Value;
+
 use super::column::{
     AnyColumn, ComponentMeta, downcast_slice, downcast_slice_mut, downcast_typed,
     downcast_typed_mut,
@@ -17,6 +19,7 @@ use super::column::{
 use super::error::EcsError;
 use super::id::{ComponentId, Entity, Id, TableId, u32_to_usize};
 use super::map::FlatMap;
+use super::reflect::ReflectError;
 
 /// Canonical sorted archetype key usable for zero-allocation `&[Id]` lookups in [`FlatMap`].
 pub(crate) struct ArchetypeKey<A: Allocator + Copy>(pub(crate) OwnVec<Id, A>);
@@ -91,7 +94,7 @@ impl<A: Allocator + Copy + 'static> Table<A> {
                 let meta = components
                     .get(u32_to_usize(cid.0))
                     .ok_or(EcsError::UnknownComponent(cid))?;
-                let col = (meta.make_column)(alloc);
+                let col = meta.create_column(alloc);
                 columns
                     .try_push(TableColumn { id: cid, col })
                     .map_err(|r| EcsError::Alloc(r.why))?;
@@ -480,6 +483,44 @@ impl<A: Allocator + Copy + 'static> Table<A> {
         let entry = self.columns.get_mut(idx).ok_or(EcsError::MissingComponent(cid))?;
         let typed = downcast_typed_mut::<T, A>(entry.col.as_mut(), cid)?;
         typed.push(value)
+    }
+
+    /// Reflect the component value at `(cid, row)` into a [`Value`], returning `Ok(None)` if opaque.
+    pub(crate) fn row_to_value(
+        &self,
+        cid: ComponentId,
+        row: usize,
+        alloc: A,
+    ) -> Result<Option<Value<A>>, ReflectError> {
+        let idx = self.column_index(cid).ok_or(ReflectError::MissingComponent(cid))?;
+        let entry = self.columns.get(idx).ok_or(ReflectError::MissingComponent(cid))?;
+        entry.col.row_to_value(self.id, row, cid, alloc)
+    }
+
+    /// Patch the component value at `(cid, row)` in-place from `patch`.
+    pub(crate) fn patch_row_from_value(
+        &mut self,
+        cid: ComponentId,
+        row: usize,
+        patch: &Value<A>,
+        alloc: A,
+    ) -> Result<(), ReflectError> {
+        let tid = self.id;
+        let idx = self.column_index(cid).ok_or(ReflectError::MissingComponent(cid))?;
+        let entry = self.columns.get_mut(idx).ok_or(ReflectError::MissingComponent(cid))?;
+        entry.col.patch_row_from_value(tid, row, cid, patch, alloc)
+    }
+
+    /// Decode a reflected value from `val` and push it into component column `cid`.
+    pub(crate) fn push_component_from_value(
+        &mut self,
+        cid: ComponentId,
+        val: &Value<A>,
+        alloc: A,
+    ) -> Result<(), ReflectError> {
+        let idx = self.column_index(cid).ok_or(ReflectError::MissingComponent(cid))?;
+        let entry = self.columns.get_mut(idx).ok_or(ReflectError::MissingComponent(cid))?;
+        entry.col.push_from_value(cid, val, alloc)
     }
 
     /// Swap-remove `row` from `self.entities` and drop every column value at `row`.

@@ -1461,3 +1461,349 @@ pub extern \"C\" fn main() -> i32 {
         "private-field struct `FileHandle(u32)` must NOT be auto-Copy, got: {private_rejected:?}"
     );
 }
+
+/// Native compile-and-run e2e test proving zero-macro `serde`-equivalent serialization,
+/// live in-place field patching by runtime field name, and snapshot/diff logging across:
+/// - plain all-`pub` structs (`Pos`, `Health`) with zero `#[derive]` / zero macros (auto-`Copy`/`Clone`)
+/// - composed structural records with spread & defaults (`type EntityRecord = { ..BasePos, hp: i32 = 100 }`)
+/// using `inline for (name, val) in v`, `inline for (name, field) in dst` (`&mut T`), and
+/// `inline for (name, a, b) in zip_fields(before, after)`.
+#[test]
+fn inline_for_zero_macro_serde_and_live_patch() {
+    let got = run_head(RECORDS_HEAD, "
+impl Copy for usize {}
+
+#[lang = \"panic_const_div_by_zero\"]
+fn panic_const_div_by_zero() -> ! {
+    loop {}
+}
+
+#[lang = \"panic_const_rem_by_zero\"]
+fn panic_const_rem_by_zero() -> ! {
+    loop {}
+}
+
+#[lang = \"clone\"]
+trait Clone: Sized {
+    fn clone(&self) -> Self;
+}
+
+impl Clone for i32 {
+    fn clone(&self) -> Self { *self }
+}
+
+#[repr(C)]
+struct Words {
+    data: usize,
+    len: usize,
+}
+impl Copy for Words {}
+
+union Wide {
+    s: &'static str,
+    bytes: &'static [u8],
+    words: Words,
+}
+
+fn str_len(s: &'static str) -> usize {
+    unsafe { Wide { s }.words.len }
+}
+
+fn str_bytes(s: &'static str) -> &'static [u8] {
+    unsafe { Wide { s }.bytes }
+}
+
+fn str_eq(a: &'static str, b: &'static str) -> bool {
+    let n = str_len(a);
+    if n != str_len(b) {
+        return false;
+    }
+    let ab = str_bytes(a);
+    let bb = str_bytes(b);
+    let mut i: usize = 0;
+    while i < n {
+        if ab[i] != bb[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+struct SerBuf {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl SerBuf {
+    fn new() -> SerBuf {
+        SerBuf { buf: [0u8; 64], len: 0 }
+    }
+
+    fn push_byte(&mut self, b: u8) {
+        if self.len < 64 {
+            self.buf[self.len] = b;
+            self.len = self.len + 1;
+        }
+    }
+
+    fn push_str(&mut self, s: &'static str) {
+        let n = str_len(s);
+        let bytes = str_bytes(s);
+        let mut i: usize = 0;
+        while i < n {
+            self.push_byte(bytes[i]);
+            i = i + 1;
+        }
+    }
+
+    fn push_u32(&mut self, mut v: u32) {
+        if v == 0 {
+            self.push_byte(b'0');
+            return;
+        }
+        let mut tmp = [0u8; 12];
+        let mut k: usize = 0;
+        while v > 0 {
+            let digit = (v % 10) as u8;
+            tmp[k] = b'0' + digit;
+            k = k + 1;
+            v = v / 10;
+        }
+        while k > 0 {
+            k = k - 1;
+            self.push_byte(tmp[k]);
+        }
+    }
+
+    fn push_i32(&mut self, v: i32) {
+        if v < 0 {
+            self.push_byte(b'-');
+            self.push_u32((0 - v) as u32);
+        } else {
+            self.push_u32(v as u32);
+        }
+    }
+
+    fn push_signed_i32(&mut self, v: i32) {
+        if v < 0 {
+            self.push_byte(b'-');
+            self.push_u32((0 - v) as u32);
+        } else {
+            self.push_byte(b'+');
+            self.push_u32(v as u32);
+        }
+    }
+
+    fn eq_str(&self, expected: &'static str) -> bool {
+        let n = str_len(expected);
+        if self.len != n {
+            return false;
+        }
+        let eb = str_bytes(expected);
+        let mut i: usize = 0;
+        while i < n {
+            if self.buf[i] != eb[i] {
+                return false;
+            }
+            i = i + 1;
+        }
+        true
+    }
+}
+
+// Plain all-`pub` structs with ZERO `#[derive]`, ZERO `impl Copy`/`Clone`, ZERO macros.
+struct Pos {
+    pub x: i32,
+    pub y: i32,
+}
+
+struct Health {
+    pub hp: i32,
+    pub max_hp: i32,
+}
+
+// Composed structural records with spread & defaults.
+type BasePos = { x: i32 = 10, y: i32 = 20 };
+type EntityRecord = { ..BasePos, hp: i32 = 100 };
+
+// Zero-macro `serde`-equivalent serializer over any struct or structural record with `i32` fields.
+fn serialize_i32_fields<T>(v: T, out: &mut SerBuf) {
+    inline for (name, val) in v {
+        out.push_str(name);
+        out.push_byte(b'=');
+        out.push_i32(val);
+        out.push_byte(b';');
+    }
+}
+
+// Zero-macro live in-place field patcher by runtime field name (`&mut T`).
+fn patch_i32_field<T>(dst: &mut T, target: &'static str, new_val: i32) -> bool {
+    inline for (name, field) in dst {
+        if str_eq(name, target) {
+            *field = new_val;
+            return true;
+        }
+    }
+    false
+}
+
+// Zero-macro live diff / undo log via lockstep `zip_fields(before, after)`.
+fn diff_i32_fields<T>(before: T, after: T, out: &mut SerBuf) -> i32 {
+    let mut sum_delta: i32 = 0;
+    inline for (name, a, b) in zip_fields(before, after) {
+        if a != b {
+            let delta = b - a;
+            sum_delta = sum_delta + delta;
+            out.push_str(name);
+            out.push_byte(b':');
+            out.push_signed_i32(delta);
+            out.push_byte(b';');
+        }
+    }
+    sum_delta
+}
+
+fn require_copy<T: Copy>(v: T) -> T {
+    v
+}
+
+fn runtime_field_name(sel: i32) -> &'static str {
+    if sel == 0 {
+        \"x\"
+    } else if sel == 1 {
+        \"y\"
+    } else if sel == 2 {
+        \"hp\"
+    } else if sel == 3 {
+        \"max_hp\"
+    } else {
+        \"nope\"
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    // 1. Named all-`pub` struct `Pos`: auto-Copy, auto-Clone, serialize, live patch, snapshot diff.
+    let mut pos = Pos { x: 10, y: 20 };
+    let before_pos = require_copy(pos);
+    let cloned_pos = pos.clone();
+
+    let mut s_pos = SerBuf::new();
+    serialize_i32_fields(pos, &mut s_pos);
+    if !s_pos.eq_str(\"x=10;y=20;\") {
+        return 1;
+    }
+
+    // Live-patch `pos.x` to 42 by runtime name, leave `pos.y` untouched.
+    if !patch_i32_field(&mut pos, runtime_field_name(0), 42) {
+        return 2;
+    }
+    if pos.x != 42 || pos.y != 20 {
+        return 3;
+    }
+    // Unknown field returns false and leaves `pos` unchanged.
+    if patch_i32_field(&mut pos, runtime_field_name(9), 99) {
+        return 4;
+    }
+    if pos.x != 42 || pos.y != 20 {
+        return 5;
+    }
+
+    // Snapshot diff via `zip_fields(before_pos, pos)` reports exact changed field and delta.
+    let mut pos_diff = SerBuf::new();
+    let pos_delta = diff_i32_fields(before_pos, pos, &mut pos_diff);
+    if pos_delta != 32 || !pos_diff.eq_str(\"x:+32;\") {
+        return 6;
+    }
+    // Cloned snapshot still matches `before_pos` with empty diff.
+    let mut zero_diff = SerBuf::new();
+    if diff_i32_fields(before_pos, cloned_pos, &mut zero_diff) != 0 || zero_diff.len != 0 {
+        return 7;
+    }
+
+    // Concrete (non-generic) `inline for (name, field) in &mut pos` live patch also works.
+    let target_y = runtime_field_name(1);
+    inline for (name, field) in &mut pos {
+        if str_eq(name, target_y) {
+            *field = 30;
+        }
+    }
+    if pos.x != 42 || pos.y != 30 {
+        return 8;
+    }
+    // Concrete (non-generic) `inline for (name, a, b) in zip_fields(before_pos, pos)` live diff.
+    let mut pos_diff2 = SerBuf::new();
+    inline for (name, a, b) in zip_fields(before_pos, pos) {
+        if a != b {
+            pos_diff2.push_str(name);
+            pos_diff2.push_byte(b':');
+            pos_diff2.push_signed_i32(b - a);
+            pos_diff2.push_byte(b';');
+        }
+    }
+    if !pos_diff2.eq_str(\"x:+32;y:+10;\") {
+        return 20;
+    }
+
+    // 2. Named all-`pub` struct `Health`: serialize & live patch `max_hp`.
+    let mut health = Health { hp: 80, max_hp: 100 };
+    let before_health = health;
+    let mut s_hp = SerBuf::new();
+    serialize_i32_fields(health, &mut s_hp);
+    if !s_hp.eq_str(\"hp=80;max_hp=100;\") {
+        return 9;
+    }
+    if !patch_i32_field(&mut health, runtime_field_name(3), 250) {
+        return 10;
+    }
+    if health.hp != 80 || health.max_hp != 250 {
+        return 11;
+    }
+    if patch_i32_field(&mut health, \"shield\", 50) {
+        return 12;
+    }
+    let mut hp_diff = SerBuf::new();
+    let hp_delta = diff_i32_fields(before_health, health, &mut hp_diff);
+    if hp_delta != 150 || !hp_diff.eq_str(\"max_hp:+150;\") {
+        return 13;
+    }
+
+    // 3. Composed structural record with spread & defaults (`EntityRecord`).
+    let mut ent: EntityRecord = { x: 10 };
+    let before_ent = require_copy(ent);
+    let mut s_ent_before = SerBuf::new();
+    serialize_i32_fields(ent, &mut s_ent_before);
+    // Structural record fields are canonically ordered alphabetically: `hp`, `x`, `y`.
+    if !s_ent_before.eq_str(\"hp=100;x=10;y=20;\") {
+        return 14;
+    }
+
+    if !patch_i32_field(&mut ent, runtime_field_name(1), 55) {
+        return 15;
+    }
+    if !patch_i32_field(&mut ent, runtime_field_name(2), 75) {
+        return 16;
+    }
+    if patch_i32_field(&mut ent, runtime_field_name(9), 123) {
+        return 17;
+    }
+    let mut s_ent_after = SerBuf::new();
+    serialize_i32_fields(ent, &mut s_ent_after);
+    if !s_ent_after.eq_str(\"hp=75;x=10;y=55;\") {
+        return 18;
+    }
+
+    // Snapshot diff on composed record: `hp` changed by -25, `y` changed by +35, `x` untouched.
+    let mut ent_diff = SerBuf::new();
+    let ent_delta = diff_i32_fields(before_ent, ent, &mut ent_diff);
+    if ent_delta != 10 || !ent_diff.eq_str(\"hp:-25;y:+35;\") {
+        return 19;
+    }
+
+    // Return 42 = pos_delta (32) + ent_delta (10)
+    pos_delta + ent_delta
+}
+");
+    assert_eq!(got, Ok(42));
+}

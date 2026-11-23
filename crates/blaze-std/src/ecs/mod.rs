@@ -21,16 +21,22 @@
 //!   [`TypedQuery`] filters.
 //! - [`world`]: Core [`World`] API with prefab inheritance (`IsA`), hierarchy cascade (`ChildOf`),
 //!   arbitrary relations, and deterministic [`World::snapshot_tab`] summaries.
+//! - [`reflect`]: Live `bstd::data`-backed component reflection ([`ReflectComponent`],
+//!   [`ReflectError`], and [`reflect_struct!`]).
+//! - [`explorer`]: Pure sans-IO Flecs Explorer HTTP/JSON/TAB API ([`handle_request`],
+//!   [`handle_http_request`], [`ExplorerResponse`]) and embedded Web UI ([`EXPLORER_HTML`]).
 
 
 pub mod column;
 pub mod error;
+pub mod explorer;
 pub mod fetch;
 pub mod id;
 pub(crate) mod map;
 pub mod observer;
 pub mod pipeline;
 pub mod query;
+pub mod reflect;
 pub mod table;
 pub mod typed;
 pub mod world;
@@ -38,13 +44,16 @@ pub mod world;
 #[cfg(test)]
 mod tests;
 
+pub use crate::reflect_struct;
 pub use column::{AnyColumn, ComponentMeta, TypedColumn};
 pub use error::EcsError;
+pub use explorer::{EXPLORER_HTML, ExplorerResponse, handle_http_request, handle_request};
 pub use fetch::{FetchIds, QueryFetch, TypedQuery};
 pub use id::{Builtins, ComponentId, Entity, Id, TableId};
 pub use observer::{DEFAULT_OBSERVER_CAP, Event, EventKind, ObserverCallback, ObserverId};
 pub use pipeline::{Batch, Batches, Phase, PhaseSchedule, Pipeline, SystemDesc, SystemFn};
 pub use query::{CachedQuery, QuerySpec, QueryTerm};
+pub use reflect::{ReflectComponent, ReflectError};
 pub use table::Table;
 pub use typed::{
     Bundle, ChildOf, CopyBundle, EntityMut, IsA, NoParent, Prefab, PrefabInit, PrefabParent,
