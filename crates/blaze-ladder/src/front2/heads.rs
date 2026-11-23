@@ -2747,14 +2747,14 @@ impl<'n> Store<'n> {
             (Want::Fn(_), ItemDetail::Fn { .. } | ItemDetail::Const { .. }) => {
                 let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
                 let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
-                self.fn_head(names, key, ck, None, &env, 0, &[], &v, text, detail, marks)
+                self.fn_head(names, keys, key, ck, None, &env, 0, &[], &v, text, detail, marks)
             }
             // A static's head is its type, as a const's, and its mutability (the Reference,
             // "Static items": "Mutable statics", `static mut`).
             (Want::Fn(_), ItemDetail::Static { .. }) => {
                 let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
                 let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
-                let made = self.fn_head(names, key, ck, None, &env, 0, &[], &v, text, detail, marks);
+                let made = self.fn_head(names, keys, key, ck, None, &env, 0, &[], &v, text, detail, marks);
                 if made.is_ok() {
                     let m = if v.head[head::FLAGS] & sig::MUT != 0 { tc::Mutbl::Mut } else { tc::Mutbl::Not };
                     self.statics.insert(ck, m);
@@ -3569,7 +3569,7 @@ impl<'n> Store<'n> {
                     // of the trait's members is met before the trait is made again, so a trait
                     // of n members is made at most a few times, not once per need (Iterator's
                     // members: 62 restarts and 126 ms of 149 a body, front2_tables_cost.rs).
-                    match self.member_fn_head(names, key, mk, Some(ck), &env, own + 1, &inherited, &mv, m, marks) {
+                    match self.member_fn_head(names, keys, key, mk, Some(ck), &env, own + 1, &inherited, &mv, m, marks) {
                         Ok(()) => {}
                         Err(Why::Need(k)) if self.needs == NeedsMet::All => needs.push(k),
                         Err(why) => return Err(why),
@@ -4336,9 +4336,9 @@ impl<'n> Store<'n> {
     /// `fn_gaps` and the container's head goes on (a need is passed up: the store makes the
     /// head it names and makes the container again).
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
-    fn member_fn_head<S: NamesSource<'n>>(&mut self, names: S, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, member: &Member<'n>, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
+    fn member_fn_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, member: &Member<'n>, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
         names.read_member_signature(member.lib, member.written_by);
-        match self.fn_head(names, lib, key, container, outer, parent, inherited, v, member.text, member.detail, marks) {
+        match self.fn_head(names, keys, lib, key, container, outer, parent, inherited, v, member.text, member.detail, marks) {
             Err(why @ (Why::Need(_) | Why::NeedConst(..))) => Err(why),
             Err(why) => {
                 self.fn_gaps.insert(key, why);
@@ -4352,11 +4352,111 @@ impl<'n> Store<'n> {
         }
     }
 
+    /// Registers anonymous constant heads for any `TypeRef::Record` field defaults written in `v`
+    /// (`{ width: u32 = 80, name: &str }`), keyed under `RecordSchema::defaults_key()` in
+    /// `self.field_defaults` so `Expr::Record { .. }` resolves them via `World::field_defaults`.
+    pub(super) fn register_record_defaults<S: NamesSource<'n>>(
+        &mut self,
+        names: S,
+        keys: &Keys,
+        lib: LibKey,
+        env: &Env<'_>,
+        marks: Option<TextMarks<'n>>,
+        v: &View<'_>,
+    ) -> Result<(), Why> {
+        let alloc = self.tys.alloc();
+        for i in 0..v.types.len() {
+            let Ok(ti) = u32::try_from(i) else { break };
+            let Ok(lf::TypeRef::Record(fields)) = v.ty(lf::TypeId(ti)) else { continue };
+            let rows = v.rows(fields)?;
+            let mut has_default = false;
+            for &row in rows {
+                if lf::Field::decode(row)?.default.is_some() {
+                    has_default = true;
+                    break;
+                }
+            }
+            if !has_default {
+                continue;
+            }
+            let mut named = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
+            for (i, &row) in rows.iter().enumerate() {
+                let f = lf::Field::decode(row)?;
+                let text = match f.name {
+                    Some(nm) => v.name_text(nm)?,
+                    None => "",
+                };
+                named.push((text, i, Name::of(text), f.ty, f.default));
+            }
+            named.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            let mut sorted_names = blaze_own::Vec::with_capacity_in(named.len(), alloc);
+            for &(_, _, nm, _, _) in named.iter() {
+                sorted_names.push(nm);
+            }
+            let schema = tc::RecordSchema::of_sorted_names(&sorted_names);
+            let rk = schema.defaults_key();
+            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+            let mut defaults = blaze_own::Vec::with_capacity_in(named.len(), alloc);
+            for (j, &(_, _, _, fty, fdefault)) in named.iter().enumerate() {
+                let Some(c) = fdefault else {
+                    defaults.push(None);
+                    continue;
+                };
+                let ty = b.ty(&mut self.tys, env, v, fty)?;
+                let at = v.const_range(c)?;
+                let r = v.site(at)?;
+                let ty_text = v.text_at(v.type_range(fty)?)?.trim();
+                let value_text = v.text_at(at)?.trim();
+                let mut label = blaze_own::String::new_in(alloc);
+                let _ = core::fmt::Write::write_fmt(&mut label, format_args!("record default {j}: {ty_text} = {value_text}"));
+                let dk = keys
+                    .member(rk, MemberKind::Anon, &label)
+                    .map_err(|e| {
+                        let mut msg = blaze_own::String::new_in(alloc);
+                        let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("{e}"));
+                        Why::Program(msg.as_str().into(), r)
+                    })?;
+                let mut src = blaze_own::String::new_in(alloc);
+                let _ = core::fmt::Write::write_fmt(&mut src, format_args!("const _: {ty_text} = {value_text};"));
+                let text: &'n str = self.locals.keep_text(&src);
+                let scope = Scope::item(v, None, 0, alloc).map_err(Why::Regions)?;
+                self.preds.insert(dk, Preds::new_in(scope));
+                let row = FnHead {
+                    lib,
+                    text,
+                    qualifiers: FnQualifiers::CONST.note_lifetimes(text),
+                    text_prefix: None,
+                    container: None,
+                    parent: 0,
+                    own: 0,
+                    declared: 0,
+                    self_param: false,
+                    header: tc::FnPtrHeader::RUST,
+                    c_variadic: false,
+                    legacy_const_generics: Default::default(),
+                    inputs: Default::default(),
+                    output: ty,
+                    has_body: true,
+                    module: env.module,
+                    params: Default::default(),
+                    consts: Default::default(),
+                    bounds: Default::default(),
+                    self_: SelfTy::None,
+                    self_assoc: Default::default(),
+                };
+                self.fns.insert(dk, row);
+                defaults.push(Some(dk));
+            }
+            self.field_defaults.insert(rk, defaults.into_iter().collect());
+        }
+        Ok(())
+    }
+
     /// A fn's signature and clauses: `env` is its container's (its params `0..parent`),
     /// `inherited` its container's clauses, `v` its own text's, `marks` its text's tokens'
     /// (front2 item_site.rs).
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
-    fn fn_head<S: NamesSource<'n>>(&mut self, names: S, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, detail: ItemDetail, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
+    fn fn_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, detail: ItemDetail, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
         let mut ps = Vec::new_in(Global);
         ps.extend_from_slice(outer.params);
         let mut cs = Vec::new_in(Global);
@@ -4883,6 +4983,8 @@ impl<'n> Store<'n> {
             }
         };
         file_regions(self, key, filed);
+        let rec_env = Env { module, params: &ps, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &anon, consts: &cs, body: None };
+        self.register_record_defaults(names, keys, lib, &rec_env, marks, v)?;
         self.fns.insert(key, FnHead { lib, text, text_prefix, container, parent, own, declared, self_param, header, c_variadic, qualifiers, legacy_const_generics, inputs, output, has_body, module, params: ps, consts: cs, bounds, self_, self_assoc });
         Ok(())
     }

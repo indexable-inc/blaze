@@ -610,7 +610,10 @@ impl MakerState {
         // ([`build_one`]'s ctor arm).
         // The trait's `Clone::clone` has no body either: the one instance tabled at it is a
         // builtin clone ([`build_one`]'s arm; clone_shim.rs `language_clone`).
-        if program.ctor_of(key).is_some() || program.lang_trait_fn(LangItem::Clone, "clone") == Some(key) {
+        if program.ctor_of(key).is_some()
+            || program.lang_trait_fn(LangItem::Clone, "clone") == Some(key)
+            || program.lang_trait_fn(LangItem::From, "from") == Some(key)
+        {
             let at = program.head_row(key)?;
             self.asked.insert_shift(slot, (key, at));
             return Ok(at);
@@ -956,7 +959,10 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     // A ctor's fn reads no constant: its fields in, its value out. Nor a builtin clone (a copy,
     // or its fields' own clones), nor a shim of a fn with no body.
     if (function.kind == FnKind::Ctor && function.body.is_none())
-        || (function.body.is_none() && (instance.item != function.key || crate::clone_shim::language_clone(&*program, instance, &work.ground).is_some()))
+        || (function.body.is_none()
+            && (instance.item != function.key
+                || crate::clone_shim::language_clone(&*program, instance, &work.ground).is_some()
+                || crate::clone_shim::language_from(&*program, instance, &work.ground).is_some()))
     {
         return Ok(());
     }
@@ -1358,9 +1364,13 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         None if instance.item == function.key => crate::clone_shim::language_clone(program, instance, &work.ground),
         _ => None,
     };
+    let builtin_from = match function.body {
+        None if instance.item == function.key && builtin_clone.is_none() => crate::clone_shim::language_from(program, instance, &work.ground),
+        _ => None,
+    };
     let checked = match (function.body, bodies.checked.get(i).and_then(Option::as_ref)) {
         (Some((body, _)), Some(done)) => Some((body, done)),
-        _ if ctor_row.is_some() || builtin_clone.is_some() => None,
+        _ if ctor_row.is_some() || builtin_clone.is_some() || builtin_from.is_some() => None,
         _ => return Err(callee_refusal(program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, work.ground.view())),
     };
     let malformed = |_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
@@ -1450,11 +1460,18 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, &adts, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, &adts, Global),
             }
-        } else if let Some(made) = builtin_clone {
-            // A fn item's and a fn pointer's clone is a copy of its bytes (`Copy` by the
-            // language, no solver asked); a tuple's or a closure's clones each field by its own
-            // `clone` (clone_shim.rs `language_clone`: what it does is a function of the type).
-            blaze_build::build_builtin_clone(made.clone, made.bytes, &mut subst, &adts, Global)
+        } else if builtin_clone.is_some() || builtin_from.is_some() {
+            let g = Global;
+            if let Some(made) = builtin_clone {
+                // A fn item's and a fn pointer's clone is a copy of its bytes (`Copy` by the
+                // language, no solver asked); a tuple's or a closure's clones each field by its own
+                // `clone` (clone_shim.rs `language_clone`: what it does is a function of the type).
+                blaze_build::build_builtin_clone(made.clone, made.bytes, &mut subst, &adts, g)
+            } else if let Some(made) = builtin_from {
+                blaze_build::build_builtin_from(made.from, &mut subst, &adts, g)
+            } else {
+                Err(BuildError::Malformed { what: "unreachable builtin row" })
+            }
         } else if let Some(variant) = ctor_row {
             // The ctor's own instance (a shim of it was taken above): its fields in, its value out.
             blaze_build::build_ctor_fn(function.key, variant, &program.sig(i), &mut subst, &adts, Global)
@@ -1681,6 +1698,13 @@ fn name_ref<'p, P: FrontEnd>(
         let Some(c) = program.fn_index(clone) else {
             let refusal = callee_refusal(program, name(), at, called, crate::callee_shown::CalleeGap::NotTabled, ground.view());
             return Ok(Named1::Untabled(clone, refusal));
+        };
+        return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(|e| named(e, called, &*ground));
+    }
+    if let Some(crate::clone_shim::LanguageFrom { from }) = crate::clone_shim::language_from(program, called, ground) {
+        let Some(c) = program.fn_index(from) else {
+            let refusal = callee_refusal(program, name(), at, called, crate::callee_shown::CalleeGap::NotTabled, ground.view());
+            return Ok(Named1::Untabled(from, refusal));
         };
         return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(|e| named(e, called, &*ground));
     }

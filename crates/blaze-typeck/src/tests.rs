@@ -1257,3 +1257,130 @@ fn structural_records_literal_field_update_and_destructure() {
     assert!(checked.same_result(&decoded));
     assert_eq!(decoded.types.view().record_names(schema), Some(&sorted_names[..]));
 }
+
+#[test]
+fn union_match_exhaustiveness_and_redundant_arms() {
+    use crate::body::{Arm, IntSuffix, Lit};
+    use crate::diag::DiagCode;
+    use crate::ids::{IntTy, UintTy};
+    use crate::portable::{PNode, PortableTys};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let owner = ItemKey(1005);
+    let mut tys = PortableTys::new_in(alloc);
+    let i32_t = tys.intern(PNode::Int(IntTy::I32)).expect("i32");
+    let u8_t = tys.intern(PNode::Uint(UintTy::U8)).expect("u8");
+    let ab_l = tys.intern_list(&[i32_t, u8_t]).expect("ab");
+    let ab = tys.intern(PNode::Union(ab_l)).expect("i32 | u8");
+
+    let mut body_tys = PortableTys::new_in(alloc);
+    let b_i32 = body_tys.intern(PNode::Int(IntTy::I32)).expect("b i32");
+    let b_u8 = body_tys.intern(PNode::Uint(UintTy::U8)).expect("b u8");
+
+    let world = SigWorld::new(owner, tys, &[ab], i32_t, alloc);
+    let params = [PatId(0)];
+    let p_x = Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("x"), sub: None, ty: None };
+    let p_a = Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("a"), sub: None, ty: Some(b_i32) };
+    let p_b = Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("b"), sub: None, ty: Some(b_u8) };
+    let p_rest = Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("rest"), sub: None, ty: None };
+    let p_a2 = Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("a2"), sub: None, ty: Some(b_i32) };
+    let e_x = Expr::Local(PatId(0));
+    let e_1 = Expr::Lit(Lit::Int(Some(IntSuffix::Int(IntTy::I32))));
+    let e_2 = Expr::Lit(Lit::Int(Some(IntSuffix::Int(IntTy::I32))));
+    let e_3 = Expr::Lit(Lit::Int(Some(IntSuffix::Int(IntTy::I32))));
+    let e_true = Expr::Lit(Lit::Bool(true));
+
+    // 1. Non-exhaustive: `match x { a: i32 => 1 }` (missing `u8`).
+    let pats1 = [p_x, p_a];
+    let pat_r1 = [Range { start: 0, end: 1 }, Range { start: 2, end: 8 }];
+    let exprs1 = [e_x, e_1, Expr::Match { scrutinee: ExprId(0), arms: List { start: 0, len: 1 } }];
+    let expr_r1 = [Range { start: 10, end: 11 }, Range { start: 12, end: 13 }, Range { start: 14, end: 30 }];
+    let arms1 = [Arm { pat: PatId(1), guard: None, body: ExprId(1) }];
+    let mut bv = empty_body(owner, body_tys.view(), ExprId(2));
+    bv.params = &params;
+    bv.pats = &pats1;
+    bv.pat_ranges = &pat_r1;
+    bv.exprs = &exprs1;
+    bv.expr_ranges = &expr_r1;
+    bv.arms = &arms1;
+    let c1 = run_sig_check(&bv, &world, alloc);
+    assert_eq!(c1.diags.len(), 1, "diags: {:?}", c1.diags);
+    assert_eq!(c1.diags[0].code, DiagCode::NonExhaustiveMatch);
+    assert_eq!(c1.diags[0].expected.and_then(|t| c1.types.view().node(t).ok()), Some(PNode::Uint(UintTy::U8)));
+
+    // 2. Guarded arm: `match x { a: i32 if true => 1, b: u8 => 2 }` -> still missing `i32`!
+    let pats2 = [p_x, p_a, p_b];
+    let pat_r2 = [Range { start: 0, end: 1 }, Range { start: 2, end: 8 }, Range { start: 9, end: 14 }];
+    let exprs2 = [e_x, e_1, e_2, e_true, Expr::Match { scrutinee: ExprId(0), arms: List { start: 0, len: 2 } }];
+    let expr_r2 = [
+        Range { start: 20, end: 21 },
+        Range { start: 22, end: 23 },
+        Range { start: 24, end: 25 },
+        Range { start: 26, end: 30 },
+        Range { start: 31, end: 50 },
+    ];
+    let arms2 = [
+        Arm { pat: PatId(1), guard: Some(ExprId(3)), body: ExprId(1) },
+        Arm { pat: PatId(2), guard: None, body: ExprId(2) },
+    ];
+    let mut bv2 = empty_body(owner, body_tys.view(), ExprId(4));
+    bv2.params = &params;
+    bv2.pats = &pats2;
+    bv2.pat_ranges = &pat_r2;
+    bv2.exprs = &exprs2;
+    bv2.expr_ranges = &expr_r2;
+    bv2.arms = &arms2;
+    let c2 = run_sig_check(&bv2, &world, alloc);
+    assert_eq!(c2.diags.len(), 1, "diags: {:?}", c2.diags);
+    assert_eq!(c2.diags[0].code, DiagCode::NonExhaustiveMatch);
+    assert_eq!(c2.diags[0].expected.and_then(|t| c2.types.view().node(t).ok()), Some(PNode::Int(IntTy::I32)));
+
+    // 3. Exhaustive typed arms: `match x { a: i32 => 1, b: u8 => 2 }` -> 0 diags.
+    let exprs3 = [e_x, e_1, e_2, Expr::Match { scrutinee: ExprId(0), arms: List { start: 0, len: 2 } }];
+    let expr_r3 = [Range { start: 20, end: 21 }, Range { start: 22, end: 23 }, Range { start: 24, end: 25 }, Range { start: 26, end: 40 }];
+    let arms3 = [
+        Arm { pat: PatId(1), guard: None, body: ExprId(1) },
+        Arm { pat: PatId(2), guard: None, body: ExprId(2) },
+    ];
+    let mut bv3 = empty_body(owner, body_tys.view(), ExprId(3));
+    bv3.params = &params;
+    bv3.pats = &pats2;
+    bv3.pat_ranges = &pat_r2;
+    bv3.exprs = &exprs3;
+    bv3.expr_ranges = &expr_r3;
+    bv3.arms = &arms3;
+    let c3 = run_sig_check(&bv3, &world, alloc);
+    assert!(c3.diags.is_empty(), "diags: {:?}", c3.diags);
+
+    // 4. Exhaustive with catch-all: `match x { a: i32 => 1, rest => 2 }` -> 0 diags.
+    let pats4 = [p_x, p_a, p_rest];
+    bv3.pats = &pats4;
+    let c4 = run_sig_check(&bv3, &world, alloc);
+    assert!(c4.diags.is_empty(), "diags: {:?}", c4.diags);
+
+    // 5. Redundant arm: `match x { a: i32 => 1, a2: i32 => 2, b: u8 => 3 }` -> RedundantPattern.
+    let pats5 = [p_x, p_a, p_a2, p_b];
+    let pat_r5 = [
+        Range { start: 0, end: 1 },
+        Range { start: 2, end: 8 },
+        Range { start: 9, end: 16 },
+        Range { start: 17, end: 22 },
+    ];
+    let exprs5 = [e_x, e_1, e_2, e_3, Expr::Match { scrutinee: ExprId(0), arms: List { start: 0, len: 3 } }];
+    let arms5 = [
+        Arm { pat: PatId(1), guard: None, body: ExprId(1) },
+        Arm { pat: PatId(2), guard: None, body: ExprId(2) },
+        Arm { pat: PatId(3), guard: None, body: ExprId(3) },
+    ];
+    let mut bv5 = empty_body(owner, body_tys.view(), ExprId(4));
+    bv5.params = &params;
+    bv5.pats = &pats5;
+    bv5.pat_ranges = &pat_r5;
+    bv5.exprs = &exprs5;
+    bv5.expr_ranges = &expr_r2;
+    bv5.arms = &arms5;
+    let c5 = run_sig_check(&bv5, &world, alloc);
+    assert_eq!(c5.diags.len(), 1, "diags: {:?}", c5.diags);
+    assert_eq!(c5.diags[0].code, DiagCode::RedundantPattern);
+    assert_eq!(c5.diags[0].found.and_then(|t| c5.types.view().node(t).ok()), Some(PNode::Int(IntTy::I32)));
+}

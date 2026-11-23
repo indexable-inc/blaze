@@ -735,6 +735,8 @@ pub enum Lang {
     CallOnceFuture,
     /// `AsyncFnMut::CallRefFuture` (`call_ref_future`).
     CallRefFuture,
+    /// The trait `From` (`from` / `core::convert::From`), for error-union conversions.
+    From,
 }
 
 /// The shape of a self type impls are bucketed by (rustc's `SimplifiedType`, blaze-impls'

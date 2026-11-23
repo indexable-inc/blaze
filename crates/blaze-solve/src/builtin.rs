@@ -99,6 +99,9 @@ pub enum Rule {
     /// `consider_builtin_async_fn_trait_candidates` for this goal kind; `c` is
     /// `Tuple([inputs, output])` (async_fn.rs).
     AsyncFnTrait(ClosureKind),
+    /// Builtin `From<Src> for Dst` where `Dst` is a structural union and `Src` is a strict
+    /// member or strict sub-union of `Dst`; `c` is `Src`.
+    FromUnion,
 }
 
 /// A closure kind (`rustc_type_ir::ClosureKind`), in the order of `extends`.
@@ -432,6 +435,7 @@ pub fn assemble<T: Tys, F: Facts>(
                     out.push(certain(Certainty::Yes));
                 }
             }
+            Some(Lang::From) => assemble_from(cx, g, self_ty, out)?,
             _ => {}
         }
     }
@@ -741,6 +745,109 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
         Rule::UnsizeArray => step_array_unsize(cx, cand),
         Rule::UnsizeStruct => step_struct_unsize(cx, cand),
         Rule::AsyncFnTrait(_) => crate::async_fn::step_async_fn_trait(cx, cand),
+        Rule::FromUnion => step_from_union(cx, cand),
+    }
+}
+
+/// Builtin `From<Src> for Dst` where `Dst` is a structural union and `Src` is a strict member or
+/// strict sub-union of `Dst`. Does not fire when `Src` has the same arity as `Dst` (or larger) so
+/// `impl<T> From<T> for T` stays unambiguous for `Dst == Src`.
+fn assemble_from<T: Tys, F: Facts>(
+    cx: &mut Cx<'_, '_, T, F>,
+    g: TraitGoal,
+    self_ty: Ty,
+    out: &mut Vec<Cand, Alloc<'_>>,
+) -> Result<(), Stop> {
+    if g.polarity != Polarity::Positive || g.args.len != 2 {
+        return Ok(());
+    }
+    let TyKind::Union(dst_l) = cx.tys.kind(self_ty) else {
+        return Ok(());
+    };
+    let src_ty = cx.resolve(cx.arg(g.args, 1));
+    match cx.tys.kind(src_ty) {
+        TyKind::Infer(Var { kind: VarKind::Ty, .. }) | TyKind::Alias(Rigid::No, ..) => {
+            out.push(certain(Certainty::Ambiguous));
+            return Ok(());
+        }
+        TyKind::Union(src_l) => {
+            if src_l.len == 0 || src_l.len >= dst_l.len {
+                return Ok(());
+            }
+        }
+        _ => {
+            if dst_l.len == 0 {
+                return Ok(());
+            }
+        }
+    }
+    let packed = pack_args(cx, g.args, self_ty)?;
+    out.push(Cand {
+        c: src_ty,
+        ..seeded(cand(BuiltinSource::Misc, CandRule::Builtin(Rule::FromUnion)), self_ty, packed, g.trait_)
+    });
+    Ok(())
+}
+
+/// Verifies that every member of `cand.c` (or `cand.c` itself if non-union) unifies with a unique
+/// member of `cand.a = TyKind::Union(dst_l)`.
+fn step_from_union<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<Step, Stop> {
+    let TyKind::Union(dst_l) = cx.kind(cand.a) else {
+        return Ok(Step::No);
+    };
+    let src_ty = cx.resolve(cand.c);
+    let dst = cx.list_small(dst_l);
+    match cx.kind(src_ty) {
+        TyKind::Union(src_l) => {
+            if src_l.len == 0 || src_l.len >= dst_l.len {
+                return Ok(Step::No);
+            }
+            let src = cx.list_small(src_l);
+            for &sm in src.iter() {
+                let mut found: Option<Ty> = None;
+                let mut count = 0u32;
+                for &dm in dst.iter() {
+                    if may_unify(cx, &[(sm, dm)])? {
+                        found = Some(dm);
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    return Ok(Step::No);
+                }
+                if count > 1 {
+                    return Ok(Step::Done(Certainty::Ambiguous));
+                }
+                if let Some(dm) = found
+                    && !cx.eq(sm, dm)?
+                {
+                    return Ok(Step::No);
+                }
+            }
+            Ok(Step::Done(Certainty::Yes))
+        }
+        _ => {
+            let mut found: Option<Ty> = None;
+            let mut count = 0u32;
+            for &dm in dst.iter() {
+                if may_unify(cx, &[(src_ty, dm)])? {
+                    found = Some(dm);
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                return Ok(Step::No);
+            }
+            if count > 1 {
+                return Ok(Step::Done(Certainty::Ambiguous));
+            }
+            if let Some(dm) = found
+                && !cx.eq(src_ty, dm)?
+            {
+                return Ok(Step::No);
+            }
+            Ok(Step::Done(Certainty::Yes))
+        }
     }
 }
 

@@ -489,38 +489,70 @@ impl<'t> Parser<'t> {
     }
 
     fn expr(&mut self) -> Result<CfgExpr, CfgError> {
-        let save = self.at;
-        match self.next()? {
-            Some((_, Token::Ident { raw: false, name: op @ ("all" | "any") })) => {
-                let mut es = Vec::new_in(Global);
-                self.eat(Token::LeftParen)?;
-                while !self.take(Token::RightParen) {
-                    es.push(self.expr()?);
-                    if !self.take(Token::Comma) {
-                        self.eat(Token::RightParen)?;
-                        break;
+        enum Frame {
+            List(CfgExpr),
+            Not,
+        }
+
+        let alloc = Global;
+        let mut stack = blaze_own::Vec::new_in(alloc);
+
+        'parse: loop {
+            let save = self.at;
+            let mut expr = match self.next()? {
+                Some((_, Token::Ident { raw: false, name: op @ ("all" | "any") })) => {
+                    let es = Vec::new_in(alloc);
+                    self.eat(Token::LeftParen)?;
+                    let list = if op == "all" { CfgExpr::All(es) } else { CfgExpr::Any(es) };
+                    if self.take(Token::RightParen) {
+                        list
+                    } else {
+                        stack.push(Frame::List(list));
+                        continue 'parse;
                     }
                 }
-                Ok(if op == "all" { CfgExpr::All(es) } else { CfgExpr::Any(es) })
+                Some((_, Token::Ident { raw: false, name: "not" })) => {
+                    self.eat(Token::LeftParen)?;
+                    stack.push(Frame::Not);
+                    continue 'parse;
+                }
+                Some(_) => {
+                    self.at = save;
+                    match self.cfg()? {
+                        Cfg::Name(n) if n == "true" => CfgExpr::True,
+                        Cfg::Name(n) if n == "false" => CfgExpr::False,
+                        v => CfgExpr::Value(v),
+                    }
+                }
+                None => {
+                    let expected = "start of a cfg expression";
+                    return Err(self.err(self.text.len(), CfgWhat::Incomplete { expected }));
+                }
+            };
+
+            while let Some(frame) = stack.pop() {
+                match frame {
+                    Frame::Not => {
+                        self.eat(Token::RightParen)?;
+                        expr = CfgExpr::Not(Box::new_in(expr, alloc));
+                    }
+                    Frame::List(mut list) => {
+                        if let CfgExpr::All(es) | CfgExpr::Any(es) = &mut list {
+                            es.push(expr);
+                        }
+                        if !self.take(Token::Comma) {
+                            self.eat(Token::RightParen)?;
+                            expr = list;
+                        } else if self.take(Token::RightParen) {
+                            expr = list;
+                        } else {
+                            stack.push(Frame::List(list));
+                            continue 'parse;
+                        }
+                    }
+                }
             }
-            Some((_, Token::Ident { raw: false, name: "not" })) => {
-                self.eat(Token::LeftParen)?;
-                let e = self.expr()?;
-                self.eat(Token::RightParen)?;
-                Ok(CfgExpr::Not(Box::new_in(e, Global)))
-            }
-            Some(_) => {
-                self.at = save;
-                Ok(match self.cfg()? {
-                    Cfg::Name(n) if n == "true" => CfgExpr::True,
-                    Cfg::Name(n) if n == "false" => CfgExpr::False,
-                    v => CfgExpr::Value(v),
-                })
-            }
-            None => {
-                let expected = "start of a cfg expression";
-                Err(self.err(self.text.len(), CfgWhat::Incomplete { expected }))
-            }
+            return Ok(expr);
         }
     }
 

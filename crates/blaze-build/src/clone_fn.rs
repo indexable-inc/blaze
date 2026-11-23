@@ -73,7 +73,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
         self.b.set_signature(own);
         let entry = self.create();
-        self.reached[entry.index()] = true;
+        if let Some(slot) = self.reached.get_mut(entry.index()) {
+            *slot = true;
+        }
         self.begin(entry);
         let mut values = Vec::with_capacity_in(params.len(), self.alloc);
         for p in params.iter() {
@@ -97,6 +99,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 self.ret_value(v)?;
             }
         }
+        self.finish_builtin()
+    }
+
+    fn finish_builtin(&self) -> Result<(), BuildError> {
         if let Some(error) = self.b.error() {
             return Err(BuildError::Lir(error.clone()));
         }
@@ -257,6 +263,112 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.truncate_vals(mark);
         self.ret_value(v)
     }
+
+    /// Builtin `From::from(v: Src) -> Dst` for structural error unions (`self.args = [Dst, Src]`),
+    /// where `Src` is a strict member or strict sub-union of `Dst`.
+    fn run_builtin_from(&mut self) -> Result<(), BuildError> {
+        let sig_err = |error: TyErr| match error {
+            TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
+            TyErr::Malformed(what) => malformed(what),
+            TyErr::Other(error) => error,
+        };
+        let past = |_| malformed("a list past the ground table");
+        let &[dst, src] = self.args else {
+            return Err(malformed("a builtin `from` whose instance is not `[Self, T]`"));
+        };
+        let PNode::Union(dst_l_list) = self.ground_node(dst).map_err(sig_err)? else {
+            return Err(malformed("a builtin `from` whose `Self` is not a structural union"));
+        };
+        let mut dst_members: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc);
+        dst_members.extend_from_slice(self.ground.view().list(dst_l_list).map_err(past)?);
+        self.ret = self.repr(dst).map_err(sig_err)?;
+        self.ret_pass = self.rust_pass(self.ret)?;
+        let src_repr = self.repr(src).map_err(sig_err)?;
+        let src_pass = self.rust_pass(src_repr)?;
+        let (params, rets) = self.sig_of(&[src_pass], self.ret_pass);
+        let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        self.b.set_signature(own);
+        let entry = self.create();
+        if let Some(slot) = self.reached.get_mut(entry.index()) {
+            *slot = true;
+        }
+        self.begin(entry);
+        let mut values = blaze_own::Vec::with_capacity_in(params.len(), self.alloc);
+        for p in params.iter() {
+            values.push(self.b.param(p.ty));
+        }
+        let mut next = values.iter().copied();
+        if let Pass::Ref | Pass::Memory { .. } = self.ret_pass {
+            self.sret = Some(next.next().ok_or(malformed("a result pointer without its value"))?);
+        }
+        self.scope_marks.push(0);
+        let v = self.take_passed(src_repr, src_pass, &mut next)?;
+        let mut inject_member: Option<u32> = None;
+        let mut src_members: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc);
+        match self.ground_node(src).map_err(sig_err)? {
+            PNode::Union(src_l_list) => {
+                src_members.extend_from_slice(self.ground.view().list(src_l_list).map_err(past)?);
+                if let [only] = src_members.as_slice() {
+                    let j = dst_members
+                        .iter()
+                        .position(|dm| dm == only)
+                        .ok_or(malformed("a builtin `from` missing a source union member"))?;
+                    inject_member = Some(u32::try_from(j).map_err(|_| malformed("a union variant index past `u32`"))?);
+                }
+            }
+            _ => {
+                let j = dst_members
+                    .iter()
+                    .position(|&dm| dm == src)
+                    .ok_or(malformed("a builtin `from` missing a source member"))?;
+                inject_member = Some(u32::try_from(j).map_err(|_| malformed("a union variant index past `u32`"))?);
+            }
+        }
+        if let Some(variant) = inject_member {
+            if dst_members.len() == 1 {
+                if variant != 0 {
+                    return Err(malformed("a single-member union injection at a non-zero variant"));
+                }
+                self.ret_value(v)?;
+            } else {
+                match self.ret {
+                    Repr::None => self.ret_value(V::None)?,
+                    Repr::Agg(dst_l) => {
+                        let (first, len, tag) = self.variant_rows(dst_l, variant)?;
+                        if len != 1 {
+                            return Err(malformed("a union variant without exactly one payload field"));
+                        }
+                        let first_idx = usize::try_from(first).map_err(|_| malformed("a union field index past `usize`"))?;
+                        let &(_, field_off, field_repr) = self
+                            .layout_fields
+                            .get(first_idx)
+                            .ok_or(malformed("a union variant's field past `layout_fields`"))?;
+                        let field_off_i32 = i32::try_from(field_off).map_err(|_| malformed("a union field offset past `i32`"))?;
+                        let dst_at = self.temp(self.ret);
+                        self.write_tag(tag, variant, dst_at);
+                        self.store(v, field_repr, (dst_at.0, dst_at.1 + field_off_i32))?;
+                        self.ret_value(V::Place(dst_at.0, dst_at.1))?;
+                    }
+                    _ => return Err(malformed("a multi-member union not held as an aggregate")),
+                }
+            }
+        } else {
+            match self.ret {
+                Repr::None => self.ret_value(V::None)?,
+                Repr::Agg(dst_l) => {
+                    let Repr::Agg(src_l) = src_repr else {
+                        return Err(malformed("a multi-member source union not held as an aggregate"));
+                    };
+                    let src_at = self.place(v, src_repr)?;
+                    let dst_at = self.temp(self.ret);
+                    self.remap_union(None, src_l, src_at, &src_members, dst_l, dst_at, &dst_members)?;
+                    self.ret_value(V::Place(dst_at.0, dst_at.1))?;
+                }
+                _ => return Err(malformed("a multi-member union not held as an aggregate")),
+            }
+        }
+        self.finish_builtin()
+    }
 }
 
 /// Builds the builtin `clone` of `Self` (`subst.args`, one type: a tuple, a closure, a fn item
@@ -274,5 +386,19 @@ pub(crate) fn build_builtin_clone<A: Allocator + Copy>(
     let body = super::empty_view(clone, checked.types.view());
     let mut w = Walk::new(&body, &checked, subst, adts, alloc);
     w.run_builtin_clone(clone, copy)?;
+    w.into_built()
+}
+
+/// Builds the builtin `From::from` shim for structural error unions (`subst.args = [Dst, Src]`).
+pub(crate) fn build_builtin_from<A: Allocator + Copy>(
+    from: ItemKey,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    let checked = super::empty_record(subst.scratch);
+    let body = super::empty_view(from, checked.types.view());
+    let mut w = Walk::new(&body, &checked, subst, adts, alloc);
+    w.run_builtin_from()?;
     w.into_built()
 }

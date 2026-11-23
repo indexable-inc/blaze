@@ -679,18 +679,37 @@ fn closure_expr<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
 // }
 fn if_expr<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![if]));
-    let m = p.start();
+    let outer = p.start();
     p.bump(T![if]);
     expr_no_struct(p);
     block_expr(p);
-    if p.eat(T![else]) {
-        if p.at(T![if]) {
-            if_expr(p);
-        } else {
-            block_expr(p);
-        }
+    if !p.eat(T![else]) {
+        return outer.complete(p, IF_EXPR);
     }
-    m.complete(p, IF_EXPR)
+    if !p.at(T![if]) {
+        block_expr(p);
+        return outer.complete(p, IF_EXPR);
+    }
+    blaze_mem::scratch::with_u32s(|markers| {
+        loop {
+            let m = p.start();
+            p.bump(T![if]);
+            expr_no_struct(p);
+            block_expr(p);
+            markers.push(m.into_raw());
+            if !p.eat(T![else]) {
+                break;
+            }
+            if !p.at(T![if]) {
+                block_expr(p);
+                break;
+            }
+        }
+        while let Some(raw) = markers.pop() {
+            Marker::from_raw(raw).complete(p, IF_EXPR);
+        }
+    });
+    outer.complete(p, IF_EXPR)
 }
 
 // test label

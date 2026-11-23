@@ -478,80 +478,87 @@ fn lock(
 fn summary_for_patch(
     original_patch: &Patch,
     orig_patch_url: &Url,
-    locked: &Option<LockedPatchDependency>,
+    mut locked: &Option<LockedPatchDependency>,
     mut summaries: Vec<Summary>,
     source: &impl Registry,
 ) -> Result<(Summary, Option<PackageId>)> {
-    if summaries.len() == 1 {
-        return Ok((summaries.pop().unwrap(), None));
-    }
-    if summaries.len() > 1 {
-        // TODO: In the future, it might be nice to add all of these
-        // candidates so that version selection would just pick the
-        // appropriate one. However, as this is currently structured, if we
-        // added these all as patches, the unselected versions would end up in
-        // the "unused patch" listing, and trigger a warning. It might take a
-        // fair bit of restructuring to make that work cleanly, and there
-        // isn't any demand at this time to support that.
-        let mut vers: Vec<_> = summaries.iter().map(|summary| summary.version()).collect();
-        vers.sort();
-        let versions: Vec<_> = vers.into_iter().map(|v| v.to_string()).collect();
-        return Err(ResolveError::PatchManyCandidates {
-            dep: original_patch.dep.package_name(),
-            source: original_patch.dep.source_id(),
-            versions,
-            url: orig_patch_url.clone(),
-            loc: original_patch.loc.clone(),
-        });
-    }
-    assert!(summaries.is_empty());
-    let candidates = |dep: &Dependency| -> Vec<Summary> {
-        let found = match source.query_vec(dep, QueryKind::Exact) {
-            Ok(Lookup::Answered(found)) => found,
-            // None this round, which the resolve machine throws away once it is answered.
-            Ok(Lookup::Unknown) => Vec::new(),
-            Err(e) => {
-                blaze_trace::warn!("could not query {:?}: {:?}", dep, e);
-                Vec::new()
+    let mut unlock = None;
+    loop {
+        if summaries.len() == 1 {
+            if let Some(summary) = summaries.pop() {
+                return Ok((summary, unlock));
+            }
+        }
+        if summaries.len() > 1 {
+            // TODO: In the future, it might be nice to add all of these
+            // candidates so that version selection would just pick the
+            // appropriate one. However, as this is currently structured, if we
+            // added these all as patches, the unselected versions would end up in
+            // the "unused patch" listing, and trigger a warning. It might take a
+            // fair bit of restructuring to make that work cleanly, and there
+            // isn't any demand at this time to support that.
+            let mut vers: Vec<_> = summaries.iter().map(|summary| summary.version()).collect();
+            vers.sort();
+            let versions: Vec<_> = vers.into_iter().map(|v| v.to_string()).collect();
+            return Err(ResolveError::PatchManyCandidates {
+                dep: original_patch.dep.package_name(),
+                source: original_patch.dep.source_id(),
+                versions,
+                url: orig_patch_url.clone(),
+                loc: original_patch.loc.clone(),
+            });
+        }
+        assert!(summaries.is_empty());
+        let candidates = |dep: &Dependency| -> Vec<Summary> {
+            let found = match source.query_vec(dep, QueryKind::Exact) {
+                Ok(Lookup::Answered(found)) => found,
+                // None this round, which the resolve machine throws away once it is answered.
+                Ok(Lookup::Unknown) => Vec::new(),
+                Err(e) => {
+                    blaze_trace::warn!("could not query {:?}: {:?}", dep, e);
+                    Vec::new()
+                }
+            };
+            found
+                .into_iter()
+                .filter_map(|s| match s {
+                    IndexSummary::Candidate(s) => Some(s),
+                    _ => None,
+                })
+                .collect()
+        };
+        // No summaries found, try to help the user figure out what is wrong.
+        if let Some(locked_dep) = locked {
+            // Since the locked patch did not match anything, try the unlocked one.
+            summaries = candidates(&original_patch.dep);
+            unlock = Some(locked_dep.package_id);
+            locked = &None;
+            continue;
+        }
+        // Try checking if there are *any* packages that match this by name.
+        let name_only_dep = Dependency::new_override(
+            original_patch.dep.package_name(),
+            original_patch.dep.source_id(),
+        );
+        let mut vers = candidates(&name_only_dep).iter().map(|s| s.version()).collect::<Vec<_>>();
+        let found = match vers.len() {
+            0 => String::new(),
+            1 => format!("version `{}`", vers[0]),
+            _ => {
+                vers.sort();
+                let strs: Vec<_> = vers.into_iter().map(|v| v.to_string()).collect();
+                format!("versions `{}`", strs.join(", "))
             }
         };
-        found
-            .into_iter()
-            .filter_map(|s| match s {
-                IndexSummary::Candidate(s) => Some(s),
-                _ => None,
-            })
-            .collect()
-    };
-    // No summaries found, try to help the user figure out what is wrong.
-    if let Some(locked) = locked {
-        // Since the locked patch did not match anything, try the unlocked one.
-        let orig_matches = candidates(&original_patch.dep);
-        let summary =
-            summary_for_patch(original_patch, orig_patch_url, &None, orig_matches, source)?;
-        return Ok((summary.0, Some(locked.package_id)));
+        let (dep, source) = (original_patch.dep.package_name(), original_patch.dep.source_id());
+        let (url, loc) = (orig_patch_url.clone(), original_patch.loc.clone());
+        return Err(if found.is_empty() {
+            ResolveError::PatchNoMatch { dep, source, url, loc }
+        } else {
+            let req = original_patch.dep.version_req().clone();
+            ResolveError::PatchVersionMismatch { dep, found, req, source, url, loc }
+        });
     }
-    // Try checking if there are *any* packages that match this by name.
-    let name_only_dep =
-        Dependency::new_override(original_patch.dep.package_name(), original_patch.dep.source_id());
-    let mut vers = candidates(&name_only_dep).iter().map(|s| s.version()).collect::<Vec<_>>();
-    let found = match vers.len() {
-        0 => String::new(),
-        1 => format!("version `{}`", vers[0]),
-        _ => {
-            vers.sort();
-            let strs: Vec<_> = vers.into_iter().map(|v| v.to_string()).collect();
-            format!("versions `{}`", strs.join(", "))
-        }
-    };
-    let (dep, source) = (original_patch.dep.package_name(), original_patch.dep.source_id());
-    let (url, loc) = (orig_patch_url.clone(), original_patch.loc.clone());
-    Err(if found.is_empty() {
-        ResolveError::PatchNoMatch { dep, source, url, loc }
-    } else {
-        let req = original_patch.dep.version_req().clone();
-        ResolveError::PatchVersionMismatch { dep, found, req, source, url, loc }
-    })
 }
 
 /// The workspace, as far as resolving it goes.
@@ -762,10 +769,12 @@ fn register_previous_locks<R: Registry>(
     // however, nothing else in the dependency graph depends on `log` and the
     // newer version of `serde` requires a new version of `log` it'll get pulled
     // in (as we didn't accidentally lock it to an old version).
-    let mut avoid_locking = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
+    let alloc = Global;
+    let mut avoid_locking = Set::new(SetOpts { hasher: FixedState, alloc, capacity: None });
+    let mut pending = blaze_own::Vec::new_in(alloc);
     for node in resolve.iter() {
         if !keep(&node) {
-            add_deps(resolve, node, &mut avoid_locking);
+            add_deps(resolve, node, &mut avoid_locking, &mut pending);
         }
     }
 
@@ -802,7 +811,7 @@ fn register_previous_locks<R: Registry>(
     // come up first before newer version, if newer version are available.
     {
         let mut path_deps: Vec<&Summary> = ws.members.members.to_vec();
-        let mut visited = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
+        let mut visited = Set::new(SetOpts { hasher: FixedState, alloc, capacity: None });
         while let Some(member) = path_deps.pop() {
             if !visited.insert(member.package_id()) {
                 continue;
@@ -851,7 +860,7 @@ fn register_previous_locks<R: Registry>(
                     dep.package_name()
                 );
                 for id in resolve.iter().filter(|id| id.source_id() == dep.source_id()) {
-                    add_deps(resolve, id, &mut avoid_locking);
+                    add_deps(resolve, id, &mut avoid_locking, &mut pending);
                 }
             }
         }
@@ -902,14 +911,22 @@ fn register_previous_locks<R: Registry>(
         registry.register_lock(node, deps);
     }
 
-    /// Recursively add `node` and all its transitive dependencies to `set`.
-    fn add_deps(resolve: &Resolve, node: PackageId, set: &mut Set<PackageId, FixedState, Global>) {
-        if !set.insert(node) {
-            return;
-        }
-        debug!("ignoring any lock pointing directly at {}", node);
-        for (dep, _) in resolve.deps_not_replaced(node) {
-            add_deps(resolve, dep, set);
+    /// Add `node` and all its transitive dependencies to `set`.
+    fn add_deps<A: core::alloc::Allocator>(
+        resolve: &Resolve,
+        node: PackageId,
+        set: &mut Set<PackageId, FixedState, Global>,
+        pending: &mut blaze_own::Vec<PackageId, A>,
+    ) {
+        pending.push(node);
+        while let Some(cur) = pending.pop() {
+            if !set.insert(cur) {
+                continue;
+            }
+            debug!("ignoring any lock pointing directly at {}", cur);
+            for (dep, _) in resolve.deps_not_replaced(cur) {
+                pending.push(dep);
+            }
         }
     }
 }

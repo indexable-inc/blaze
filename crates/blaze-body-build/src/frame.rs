@@ -149,11 +149,13 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         }
         let ret_local = ret_local.ok_or(self.malformed("a body without its return place"))?;
         // The signature: a result pointer first when the result is passed by reference.
-        self.ret = self.pass_of(self.tys[ret_local.index()])?;
+        let ret_ty = *self.tys.get(ret_local.index()).ok_or(self.malformed("a return local past the frame"))?;
+        self.ret = self.pass_of(ret_ty)?;
         let mut passes: Vec<Pass, A> = Vec::with_capacity_in(args.len(), self.alloc);
         for a in args.iter() {
             let a = a.ok_or(self.malformed("an argument without its local"))?;
-            passes.push(self.pass_of(self.tys[a.index()])?);
+            let a_ty = *self.tys.get(a.index()).ok_or(self.malformed("an argument local past the frame"))?;
+            passes.push(self.pass_of(a_ty)?);
         }
         let (params, rets) = abi::sig_of_in(&passes, self.ret, self.alloc);
         let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
@@ -169,25 +171,27 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         let mut decided: Vec<Option<Held>, A> = Vec::new_in(self.alloc);
         decided.resize(locals, None);
         let mut memory: Vec<bool, A> = Vec::with_capacity_in(locals, self.alloc);
-        for i in 0..locals {
-            memory.push(taken[i] || self.value_held(self.lays[i])?.is_none());
+        for (&is_taken, &lay) in taken.iter().zip(self.lays.iter()) {
+            memory.push(is_taken || self.value_held(lay)?.is_none());
         }
         let mut next = values.iter().copied();
         if self.ret == Pass::Ref {
             let hidden = next.next().ok_or(self.malformed("a signature without its result pointer"))?;
-            decided[ret_local.index()] = Some(Held::At(hidden));
+            *decided.get_mut(ret_local.index()).ok_or(self.malformed("a return local past the frame"))? = Some(Held::At(hidden));
         }
         let mut given = Vec::with_capacity_in(args.len(), self.alloc);
-        for (n, a) in args.iter().enumerate() {
+        for (a, &pass) in args.iter().zip(passes.iter()) {
             let a = a.ok_or(self.malformed("an argument without its local"))?;
-            match passes[n] {
+            match pass {
                 Pass::Ignore => {}
                 pass @ (Pass::Scalar { .. } | Pass::Ref) => {
                     let x = next.next().ok_or(self.malformed("a parameter without its register"))?;
-                    if pass == Pass::Ref && memory[a.index()] {
-                        decided[a.index()] = Some(Held::At(x));
+                    let is_mem = *memory.get(a.index()).ok_or(self.malformed("an argument local past the frame"))?;
+                    if pass == Pass::Ref && is_mem {
+                        *decided.get_mut(a.index()).ok_or(self.malformed("an argument local past the frame"))? = Some(Held::At(x));
                     } else if pass == Pass::Ref {
-                        let value = self.load_at(x, 0, self.lays[a.index()])?;
+                        let lay = *self.lays.get(a.index()).ok_or(self.malformed("an argument local past the frame"))?;
+                        let value = self.load_at(x, 0, lay)?;
                         given.push((a, value));
                     } else {
                         given.push((a, V::One(x)));
@@ -203,22 +207,25 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         }
         self.cur.resize(locals, [None, None]);
         for i in 0..locals {
-            let held = match decided[i] {
+            let dec = *decided.get(i).ok_or(self.malformed("a local past the frame"))?;
+            let is_mem = *memory.get(i).ok_or(self.malformed("a local past the frame"))?;
+            let lay = *self.lays.get(i).ok_or(self.malformed("a local past the frame"))?;
+            let held = match dec {
                 Some(held) => held,
-                None if memory[i] => {
+                None if is_mem => {
                     let kind = match self.v.local(Local(i as u32)).kind {
                         LocalKind::Binding(_) => SlotKind::Named,
                         _ => SlotKind::Temp,
                     };
-                    Held::Slot(self.new_slot(self.lays[i], kind)?)
+                    Held::Slot(self.new_slot(lay, kind)?)
                 }
-                None => self.value_held(self.lays[i])?.ok_or(self.malformed("a value local of no value hold"))?,
+                None => self.value_held(lay)?.ok_or(self.malformed("a value local of no value hold"))?,
             };
             self.held.push(held);
         }
         // The parameters' values put where their locals are.
         for &(a, value) in given.iter() {
-            let lay = self.lays[a.index()];
+            let lay = *self.lays.get(a.index()).ok_or(self.malformed("an argument local past the frame"))?;
             self.put(a, value, lay)?;
         }
         // The body's blocks; a cleanup block only when panics unwind.
@@ -241,7 +248,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// Writes value `x` of layout `lay` as the whole of local `l`, held either way.
     pub(crate) fn put(&mut self, l: Local, x: V, lay: LayoutId) -> Result<(), BuildError> {
         let i = self.ix(l)?;
-        match self.held[i] {
+        let held = *self.held.get(i).ok_or(self.malformed("a local past the frame"))?;
+        match held {
             Held::None => Ok(()),
             Held::One(_) => {
                 let x = match x {
@@ -250,7 +258,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 };
                 match x {
                     V::One(v) => {
-                        self.cur[i] = [Some(v), None];
+                        let err = self.malformed("a local past the frame");
+                        *self.cur.get_mut(i).ok_or(err)? = [Some(v), None];
                         Ok(())
                     }
                     _ => Err(self.malformed("a value of another shape written to a one-value local")),
@@ -263,7 +272,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 };
                 match x {
                     V::Two(a, b) => {
-                        self.cur[i] = [Some(a), Some(b)];
+                        let err = self.malformed("a local past the frame");
+                        *self.cur.get_mut(i).ok_or(err)? = [Some(a), Some(b)];
                         Ok(())
                     }
                     _ => Err(self.malformed("a value of another shape written to a two-value local")),
@@ -278,7 +288,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
 
     /// The address of memory-held local `l`.
     pub(crate) fn base(&mut self, l: Local) -> Result<Value, BuildError> {
-        match self.held[self.ix(l)?] {
+        let i = self.ix(l)?;
+        match *self.held.get(i).ok_or(self.malformed("a local past the frame"))? {
             Held::Slot(slot) => Ok(self.b.slot_addr(slot)),
             Held::At(ptr) => Ok(ptr),
             Held::None | Held::One(_) | Held::Two(..) => Err(self.malformed("the address of a value local")),
@@ -289,18 +300,18 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// written yet passes `uninit`.
     pub(crate) fn local_args(&mut self) -> Result<Vec<Value, A>, BuildError> {
         let mut out = Vec::with_capacity_in(self.held.len(), self.alloc);
-        for i in 0..self.held.len() {
-            match self.held[i] {
+        for (&held, &[c0, c1]) in self.held.iter().zip(self.cur.iter()) {
+            match held {
                 Held::One(t) => {
-                    let x = match self.cur[i][0] {
+                    let x = match c0 {
                         Some(x) => x,
                         None => self.b.uninit(t),
                     };
                     out.push(x);
                 }
                 Held::Two(t, u) => {
-                    for (k, ty) in [t, u].into_iter().enumerate() {
-                        let x = match self.cur[i][k] {
+                    for (cur, ty) in [(c0, t), (c1, u)] {
+                        let x = match cur {
                             Some(x) => x,
                             None => self.b.uninit(ty),
                         };
@@ -334,8 +345,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
             BodyKind::Cleanup => Some(self.b.param(Ty::PTR)),
             BodyKind::Normal => None,
         };
-        for i in 0..self.held.len() {
-            self.cur[i] = match self.held[i] {
+        for (&held, cur) in self.held.iter().zip(self.cur.iter_mut()) {
+            *cur = match held {
                 Held::One(t) => [Some(self.b.param(t)), None],
                 Held::Two(t, u) => {
                     let a = self.b.param(t);
@@ -351,7 +362,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     pub(crate) fn blocks(&mut self) -> Result<(), BuildError> {
         for bi in 0..self.v.blocks() {
             let bi = BodyBlock(bi);
-            if self.blocks[bi.index()].is_none() {
+            if self.blocks.get(bi.index()).copied().flatten().is_none() {
                 continue;
             }
             self.begin_body_block(bi)?;
@@ -374,16 +385,20 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         match kind {
             StmtKind::Assign { dest, value } => self.assign(dest, value),
             StmtKind::StorageLive(l) => {
-                if let Held::Slot(slot) = self.held[self.ix(l)?] {
+                let i = self.ix(l)?;
+                if let Some(&Held::Slot(slot)) = self.held.get(i) {
                     self.b.slot_live(slot);
                 }
                 Ok(())
             }
             StmtKind::StorageDead(l) => {
                 let i = self.ix(l)?;
-                match self.held[i] {
+                match *self.held.get(i).ok_or(self.malformed("a local past the frame"))? {
                     Held::Slot(slot) => self.b.slot_dead(slot),
-                    Held::One(_) | Held::Two(..) => self.cur[i] = [None, None],
+                    Held::One(_) | Held::Two(..) => {
+                        let err = self.malformed("a local past the frame");
+                        *self.cur.get_mut(i).ok_or(err)? = [None, None];
+                    }
                     Held::None | Held::At(_) => {}
                 }
                 Ok(())

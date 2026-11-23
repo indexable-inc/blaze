@@ -291,7 +291,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// `check_match`. `f.t` is the scrutinee's type, `f.a` the arm, `f.b` the site, `f.c` bit 0
     /// the scrutinee's divergence and bit 1 "every arm so far diverges".
-    pub(crate) fn expr_match(&mut self, mut f: Frame, _e: ExprId, scrutinee: ExprId, arms: List) -> Result<Flow, Stop> {
+    pub(crate) fn expr_match(&mut self, mut f: Frame, e: ExprId, scrutinee: ExprId, arms: List) -> Result<Flow, Stop> {
         let arm_list = self.body.arm_list(arms)?;
         match f.state {
             0 => {
@@ -302,6 +302,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             1 => {
                 f.t = self.ret;
                 if arm_list.is_empty() {
+                    if self.push_match_narrow(f.t)?
+                        && let Some(narrow) = self.match_narrow.pop()
+                        && let Some(&rem_v) = narrow.remaining.first()
+                    {
+                        let uncovered = self.ty.list_get(narrow.orig_members, rem_v);
+                        self.diag(DiagCode::NonExhaustiveMatch, At::Expr(e), About::expected(uncovered));
+                    }
                     return Ok(Flow::Done(self.common.never));
                 }
                 f.c = u32::from(self.diverges) | 2;
@@ -310,27 +317,93 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 if self.push_match_narrow(f.t)? {
                     f.c |= 4;
                 }
-                self.match_pats(f, arm_list)
+                self.match_pats(f, e, arm_list)
             }
             2 => {
                 if f.c & 4 != 0
                     && let Some(prev_idx) = f.a.checked_sub(1)
                     && let Some(prev_arm) = usize::try_from(prev_idx).ok().and_then(|i| arm_list.get(i))
-                    && prev_arm.guard.is_none()
                 {
-                    let matched = self
-                        .union_pats
-                        .iter()
-                        .rev()
-                        .find(|&&(p, _)| p == prev_arm.pat)
-                        .map(|&(_, kind)| kind);
-                    if let Some(UnionPat::Variant(v)) = matched
-                        && let Some(narrow) = self.match_narrow.last_mut()
-                    {
-                        narrow.remaining.retain(|&idx| idx != v);
+                    let unguarded = prev_arm.guard.is_none();
+                    let pat = self.body.pat(prev_arm.pat)?;
+                    match pat {
+                        Pat::Wild | Pat::Bind { ty: None, .. } => {
+                            if unguarded && let Some(narrow) = self.match_narrow.last_mut() {
+                                narrow.remaining.clear();
+                            }
+                        }
+                        Pat::Or { alts } => {
+                            let alt_pats = self.body.pat_list(alts)?;
+                            let mut all_typed = !alt_pats.is_empty();
+                            let mut has_catchall = false;
+                            let mut matched_vs: blaze_own::Vec<u32, Alloc<'a>> =
+                                blaze_own::Vec::with_capacity_in(alt_pats.len(), self.alloc);
+                            for &ap in alt_pats {
+                                let alt_kind = self.body.pat(ap)?;
+                                if matches!(alt_kind, Pat::Wild | Pat::Bind { ty: None, .. }) {
+                                    has_catchall = true;
+                                    all_typed = false;
+                                } else {
+                                    let m = self
+                                        .union_pats
+                                        .iter()
+                                        .rev()
+                                        .find(|&&(p, _)| p == ap)
+                                        .map(|&(_, kind)| kind);
+                                    match m {
+                                        Some(UnionPat::Variant(v)) => matched_vs.push(v),
+                                        _ => all_typed = false,
+                                    }
+                                }
+                            }
+                            if all_typed {
+                                let mut redundant_ty: Option<Ty> = None;
+                                if let Some(narrow) = self.match_narrow.last_mut() {
+                                    let orig_members = narrow.orig_members;
+                                    for &v in matched_vs.iter() {
+                                        let present = narrow.remaining.iter().any(|&idx| idx == v);
+                                        if !present && redundant_ty.is_none() {
+                                            redundant_ty = Some(self.ty.list_get(orig_members, v));
+                                        }
+                                        if unguarded {
+                                            narrow.remaining.retain(|&idx| idx != v);
+                                        }
+                                    }
+                                }
+                                if let Some(ty) = redundant_ty {
+                                    self.diag(DiagCode::RedundantPattern, At::Pat(prev_arm.pat), About::found(ty));
+                                }
+                            } else if has_catchall && unguarded && let Some(narrow) = self.match_narrow.last_mut() {
+                                narrow.remaining.clear();
+                            }
+                        }
+                        Pat::Bind { ty: Some(_), .. } => {
+                            let matched = self
+                                .union_pats
+                                .iter()
+                                .rev()
+                                .find(|&&(p, _)| p == prev_arm.pat)
+                                .map(|&(_, kind)| kind);
+                            if let Some(UnionPat::Variant(v)) = matched {
+                                let mut redundant_ty: Option<Ty> = None;
+                                if let Some(narrow) = self.match_narrow.last_mut() {
+                                    let present = narrow.remaining.iter().any(|&idx| idx == v);
+                                    if !present {
+                                        redundant_ty = Some(self.ty.list_get(narrow.orig_members, v));
+                                    }
+                                    if unguarded {
+                                        narrow.remaining.retain(|&idx| idx != v);
+                                    }
+                                }
+                                if let Some(ty) = redundant_ty {
+                                    self.diag(DiagCode::RedundantPattern, At::Pat(prev_arm.pat), About::found(ty));
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                self.match_pats(f, arm_list)
+                self.match_pats(f, e, arm_list)
             }
             3 => {
                 // The arm's guard is done (or there was none): its body.
@@ -382,7 +455,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// The patterns of every arm, in order, then the first arm.
-    fn match_pats(&mut self, mut f: Frame, arms: &[crate::body::Arm]) -> Result<Flow, Stop> {
+    fn match_pats(&mut self, mut f: Frame, e: ExprId, arms: &[crate::body::Arm]) -> Result<Flow, Stop> {
         if let Some(arm) = arms.get(f.a as usize) {
             f.a += 1;
             self.resume(f, 2)?;
@@ -422,7 +495,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             return Ok(Flow::Wait);
         }
         if f.c & 4 != 0 {
-            self.match_narrow.pop();
+            if let Some(narrow) = self.match_narrow.pop()
+                && let Some(&rem_v) = narrow.remaining.first()
+            {
+                let uncovered = self.ty.list_get(narrow.orig_members, rem_v);
+                self.diag(DiagCode::NonExhaustiveMatch, At::Expr(e), About::expected(uncovered));
+            }
             f.c &= !4;
         }
         f.expect = self.adjust_for_branches(f.expect);

@@ -390,12 +390,13 @@ pub fn lang_item(l: Lang) -> LangItem {
         Lang::AsyncFnOnceOutput => LangItem::AsyncFnOnceOutput,
         Lang::CallOnceFuture => LangItem::CallOnceFuture,
         Lang::CallRefFuture => LangItem::CallRefFuture,
+        Lang::From => LangItem::From,
     }
 }
 
 /// The solver's lang item of typeck's, for the ones the solver knows.
 fn solver_lang(l: LangItem) -> Option<Lang> {
-    const ALL: [Lang; 35] = [
+    const ALL: [Lang; 36] = [
         Lang::Sized,
         Lang::MetaSized,
         Lang::PointeeSized,
@@ -431,6 +432,7 @@ fn solver_lang(l: LangItem) -> Option<Lang> {
         Lang::AsyncFnOnceOutput,
         Lang::CallOnceFuture,
         Lang::CallRefFuture,
+        Lang::From,
     ];
     ALL.into_iter().find(|&s| lang_item(s) == l)
 }

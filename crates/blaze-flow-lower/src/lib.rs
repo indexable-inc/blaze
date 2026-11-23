@@ -5284,7 +5284,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     }
                     Val { at: At::Place(tp), ty: out }
                 }
-                AdjustKind::UnionInject { .. } | AdjustKind::UnionWiden => {
+                AdjustKind::UnionInject { .. } | AdjustKind::UnionWiden | AdjustKind::RecordProject => {
                     let op = self.operand(v, e)?;
                     let t = self.temp(out, e)?;
                     let tp = self.place_of(t);

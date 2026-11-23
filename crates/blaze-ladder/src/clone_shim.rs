@@ -73,9 +73,42 @@ pub(crate) fn language_clone<P: FrontEnd>(program: &P, called: Instance, ground:
     let &[me] = view.list(called.args).ok()? else { return None };
     match view.node(me).ok()? {
         PNode::FnDef(..) | PNode::FnPtr(..) => Some(LanguageClone { clone, bytes: true }),
-        PNode::Tuple(_) | PNode::Record(..) | PNode::Closure { .. } => Some(LanguageClone { clone, bytes: false }),
+        PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Closure { .. } => Some(LanguageClone { clone, bytes: false }),
         _ => None,
     }
+}
+
+/// Builtin `From::from` for structural error unions (`Self = A | B`, `T = A` or strict sub-union).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LanguageFrom {
+    /// The lang trait's `from`.
+    pub from: ItemKey,
+}
+
+/// Recognizes a call to `From::from` where `Self` is a structural union `Dst` and `T` is a strict
+/// member or strict sub-union of `Dst` (`Src != Dst`).
+pub(crate) fn language_from<P: FrontEnd>(program: &P, called: Instance, ground: &PortableTys<'_>) -> Option<LanguageFrom> {
+    let from = program.lang_trait_fn(LangItem::From, "from")?;
+    if called.item != from {
+        return None;
+    }
+    let view = ground.view();
+    let &[dst, src] = view.list(called.args).ok()? else { return None };
+    if dst == src {
+        return None;
+    }
+    let PNode::Union(dst_l) = view.node(dst).ok()? else { return None };
+    let dst_members = view.list(dst_l).ok()?;
+    let ok = match view.node(src).ok()? {
+        PNode::Union(src_l) => {
+            let src_members = view.list(src_l).ok()?;
+            !src_members.is_empty()
+                && src_members.len() < dst_members.len()
+                && src_members.iter().all(|sm| dst_members.iter().any(|dm| dm == sm))
+        }
+        _ => dst_members.iter().any(|&dm| dm == src),
+    };
+    ok.then_some(LanguageFrom { from })
 }
 
 /// Why a builtin clone's `Self: Copy` has no answer: the solver's (a record it could not make),
@@ -125,7 +158,7 @@ impl Clones {
         let view = ground.view();
         let &[me] = view.list(called.args).ok()? else { return None };
         match view.node(me).ok()? {
-            PNode::Tuple(_) | PNode::Record(..) | PNode::Closure { .. } | PNode::FnDef(..) | PNode::FnPtr(..) => Some(CloneShim { clone, me }),
+            PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Closure { .. } | PNode::FnDef(..) | PNode::FnPtr(..) => Some(CloneShim { clone, me }),
             _ => None,
         }
     }

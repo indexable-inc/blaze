@@ -66,32 +66,35 @@ impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
         N: Hash,
     {
         let mut ret = Vec::with_capacity(self.nodes.len());
-        let mut marks = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: Some(self.nodes.len()) });
+        let alloc = Global;
+        let mut marks =
+            Set::new(SetOpts { hasher: FixedState, alloc, capacity: Some(self.nodes.len()) });
+        let mut stack = blaze_own::Vec::new_in(alloc);
 
         for node in self.nodes.keys() {
-            self.sort_inner_visit(node, &mut ret, &mut marks);
+            if !marks.insert(node) {
+                continue;
+            }
+            let children = self.nodes.get(node).map(persistent::OrdMap::keys);
+            stack.push((node, children));
+            while let Some(top) = stack.last_mut() {
+                match top.1.as_mut().and_then(Iterator::next) {
+                    Some(child) => {
+                        if marks.insert(child) {
+                            let child_iter = self.nodes.get(child).map(persistent::OrdMap::keys);
+                            stack.push((child, child_iter));
+                        }
+                    }
+                    None => {
+                        if let Some((cur, _)) = stack.pop() {
+                            ret.push(cur.clone());
+                        }
+                    }
+                }
+            }
         }
 
         ret
-    }
-
-    fn sort_inner_visit<'a>(
-        &'a self,
-        node: &'a N,
-        dst: &mut Vec<N>,
-        marks: &mut Set<&'a N, FixedState, Global>,
-    ) where
-        N: Hash,
-    {
-        if !marks.insert(node) {
-            return;
-        }
-
-        for child in self.nodes[node].keys() {
-            self.sort_inner_visit(child, dst, marks);
-        }
-
-        dst.push(node.clone());
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &N> {

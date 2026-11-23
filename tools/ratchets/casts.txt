@@ -17,7 +17,7 @@ blaze-body	66
 blaze-body-build	22
 blaze-body-drops	16
 blaze-body-eval	57
-blaze-body-flow	25
+blaze-body-flow	24
 blaze-body-lower	24
 blaze-borrow	25
 blaze-bstd-convert	9
@@ -110,7 +110,7 @@ blaze-screen	13
 blaze-script	11
 blaze-sha256	1
 blaze-sim	29
-blaze-solve	464
+blaze-solve	458
 blaze-sort	14
 blaze-spawn	2
 blaze-sql	4

@@ -60,6 +60,7 @@ fn lang_of(name: &str) -> Option<Lang> {
         "destruct" => Lang::Destruct,
         "drop" => Lang::Drop,
         "unsize" => Lang::Unsize,
+        "from" => Lang::From,
         "coerce_unsized" => Lang::CoerceUnsized,
         "dispatch_from_dyn" => Lang::DispatchFromDyn,
         "phantom_data" => Lang::PhantomData,
@@ -185,8 +186,8 @@ pub struct Scope<'s> {
     pub bound: &'s [String],
 }
 
-fn err(line: u32, what: String) -> CaseError {
-    CaseError { line, what }
+fn err(line: u32, what: impl Into<String>) -> CaseError {
+    CaseError { line, what: what.into() }
 }
 
 fn solve_err(line: u32, e: SolveError) -> CaseError {
@@ -215,158 +216,344 @@ impl Names {
         Err(err(line, format!("no item `{name}` in `{trait_}` or its supertraits")))
     }
 
-    pub fn ty<S: Sink>(&self, s: &mut S, sc: Scope<'_>, line: u32, t: &TyA) -> Parsed<Ty> {
+    pub fn ty<'a, S: Sink>(&self, s: &mut S, sc: Scope<'_>, line: u32, t: &'a TyA) -> Parsed<Ty> {
+        enum Work<'a> {
+            Eval(&'a TyA),
+            EvalConstVar(&'a str),
+            Tuple(usize),
+            Ref(&'a Lt, crate::term::Mutbl),
+            Ptr(crate::term::Mutbl),
+            Slice,
+            Array,
+            Adt(Def, usize),
+            FnPtr(usize),
+            FnDef(Def, usize),
+            Closure { n: u64, ups_tuple_len: Option<usize> },
+            Dyn { bounds: &'a [BoundA], lt: &'a Lt },
+            Proj { item: Def, kind: AssocKind, generics: u32, total_args: usize, own_len: usize, rigid: bool },
+            Opaque(Def, bool, usize),
+        }
         let e = |x: SolveError| solve_err(line, x);
-        let k = match t {
-            TyA::Bool => TyKind::Bool,
-            TyA::Char => TyKind::Char,
-            TyA::Int(i) => TyKind::Int(*i),
-            TyA::Uint(u) => TyKind::Uint(*u),
-            TyA::Float(f) => TyKind::Float(*f),
-            TyA::Str => TyKind::Str,
-            TyA::Never => TyKind::Never,
-            TyA::Error => TyKind::Error,
-            TyA::Const(n) | TyA::Kind(n) => TyKind::ConstValue(crate::term::ValTy::USIZE, u128::from(*n)),
-            TyA::Placeholder(i) => TyKind::Placeholder(1, *i),
-            TyA::Region(lt) => return self.region(s, line, lt),
-            TyA::Tuple(xs) => {
-                let l = self.tys(s, sc, line, xs)?;
-                TyKind::Tuple(l)
-            }
-            TyA::Ref(lt, x, m) => {
-                let r = self.region(s, line, lt)?;
-                let x = self.ty(s, sc, line, x)?;
-                TyKind::Ref(r, x, *m)
-            }
-            TyA::Ptr(x, m) => TyKind::RawPtr(self.ty(s, sc, line, x)?, *m),
-            TyA::Slice(x) => TyKind::Slice(self.ty(s, sc, line, x)?),
-            TyA::Array(x, n) => {
-                let x = self.ty(s, sc, line, x)?;
-                let n = self.ty(s, sc, line, n)?;
-                TyKind::Array(x, n)
-            }
-            TyA::Path(name, args) => {
-                if args.is_empty() {
-                    if let Some(i) = sc.bound.iter().position(|b| b == name) {
-                        return s.node(TyKind::Bound(0, i as u32)).map_err(e);
-                    }
-                    if let Some(i) = sc.params.iter().position(|b| b == name) {
-                        return s.node(TyKind::Param(i as u32)).map_err(e);
-                    }
-                }
-                if let Some(&d) = self.adts.get(name) {
-                    let l = self.tys(s, sc, line, args)?;
-                    TyKind::Adt(d, l)
-                } else if let Some(&d) = self.foreign.get(name) {
-                    TyKind::Foreign(d)
-                } else {
-                    return Err(err(line, format!("no type `{name}`")));
-                }
-            }
-            TyA::FnPtr(ins, out) => {
-                let mut v = Vec::new();
-                for x in ins {
-                    v.push(self.ty(s, sc, line, x)?);
-                }
-                v.push(self.ty(s, sc, line, out)?);
-                TyKind::FnPtr(s.list(&v).map_err(e)?, crate::term::FnPtrHeader::RUST)
-            }
-            TyA::FnItem(name, args) => {
-                let d = *self.fns.get(name).ok_or_else(|| err(line, format!("no fn `{name}`")))?;
-                TyKind::FnDef(d, self.tys(s, sc, line, args)?)
-            }
-            TyA::Closure(n, kind, sig, ups) => {
-                let k = match &**kind {
-                    TyA::Var(v) => s.var(v, VarKind::Const).map_err(e)?.ok_or_else(|| err(line, "a variable outside a case".to_string()))?,
-                    other => self.ty(s, sc, line, other)?,
-                };
-                let sig = self.ty(s, sc, line, sig)?;
-                let ups = match &**ups {
-                    TyA::Tuple(xs) => {
-                        let l = self.tys(s, sc, line, xs)?;
-                        s.node(TyKind::Tuple(l)).map_err(e)?
-                    }
-                    other => {
-                        let one = self.ty(s, sc, line, other)?;
-                        let l = s.list(&[one]).map_err(e)?;
-                        s.node(TyKind::Tuple(l)).map_err(e)?
-                    }
-                };
-                let l = s.list(&[k, sig, ups]).map_err(e)?;
-                TyKind::Closure(def_of("closure", &n.to_string()), l)
-            }
-            TyA::Dyn(bounds, lt) => {
-                let mut principal = Vec::new();
-                let mut projs = Vec::new();
-                let mut autos = Vec::new();
-                // `Self` of the existential: an erased self, never read.
-                for b in bounds {
-                    if !b.assoc_bounds.is_empty() {
-                        return Err(err(line, "an associated item constraint with bounds in a `dyn` type".to_string()));
-                    }
-                    let tn = self.trait_(line, &b.trait_)?.clone();
-                    if tn.auto {
-                        autos.push(s.node(TyKind::ExAuto(tn.def)).map_err(e)?);
-                        continue;
-                    }
-                    let args = self.tys(s, sc, line, &b.args)?;
-                    principal.push(s.node(TyKind::ExTrait(tn.def, args)).map_err(e)?);
-                    for (name, v) in &b.assoc {
-                        let (item, _, _) = self.item(line, &b.trait_, name)?;
-                        let v = self.ty(s, sc, line, v)?;
-                        projs.push((item, s.node(TyKind::ExProj(item, args, v)).map_err(e)?));
-                    }
-                }
-                if principal.len() > 1 {
-                    return Err(err(line, "a dyn type with two principal traits".to_string()));
-                }
-                projs.sort_by_key(|p| p.0);
-                let mut autos_d: Vec<(Def, Ty)> = autos
-                    .into_iter()
-                    .map(|t| match s.kind_of(t) {
-                        TyKind::ExAuto(d) => (d, t),
-                        _ => (Def(0), t),
-                    })
-                    .collect();
-                autos_d.sort_by_key(|p| p.0);
-                autos_d.dedup_by_key(|p| p.0);
-                let mut all = principal;
-                all.extend(projs.into_iter().map(|p| p.1));
-                all.extend(autos_d.into_iter().map(|p| p.1));
-                let l = s.list(&all).map_err(e)?;
-                let r = self.region(s, line, lt)?;
-                TyKind::Dynamic(l, r)
-            }
-            TyA::Proj { self_ty, trait_, args, name, own, rigid } => {
-                let (item, kind, generics) = self.item(line, trait_, name)?;
-                let mut v = std::vec![self.ty(s, sc, line, self_ty)?];
-                for a in args {
-                    v.push(self.ty(s, sc, line, a)?);
-                }
-                // An item of a supertrait takes the supertrait's arguments: the leading ones.
-                v.truncate(generics as usize);
-                for a in own {
-                    v.push(self.ty(s, sc, line, a)?);
-                }
-                let l = s.list(&v).map_err(e)?;
-                let ak = if kind == AssocKind::Const { AliasKind::Const } else { AliasKind::Projection };
-                TyKind::Alias(if *rigid { Rigid::Yes } else { Rigid::No }, ak, item, l)
-            }
-            TyA::Opaque(name, args, rigid) => {
-                let d = *self.opaques.get(name).ok_or_else(|| err(line, format!("no opaque `{name}`")))?;
-                let l = self.tys(s, sc, line, args)?;
-                TyKind::Alias(if *rigid { Rigid::Yes } else { Rigid::No }, AliasKind::Opaque, d, l)
-            }
-            TyA::Var(name) => {
-                let kind = match name.as_bytes() {
-                    [b'i', rest @ ..] if !rest.is_empty() && rest.iter().all(u8::is_ascii_digit) => VarKind::Int,
-                    [b'f', rest @ ..] if !rest.is_empty() && rest.iter().all(u8::is_ascii_digit) => VarKind::Float,
-                    _ => VarKind::Ty,
-                };
-                return s.var(name, kind).map_err(e)?.ok_or_else(|| err(line, format!("variable ?{name} outside a case")));
-            }
+        let mut work: [Option<Work<'a>>; 256] = [const { None }; 256];
+        let mut wp = 0usize;
+        let mut vals = [Ty::NONE; 256];
+        let mut vp = 0usize;
+        let push_w = |work: &mut [Option<Work<'a>>; 256], wp: &mut usize, w: Work<'a>| -> Parsed<()> {
+            let Some(slot) = work.get_mut(*wp) else {
+                return Err(err(line, "type lowering stack overflow"));
+            };
+            *slot = Some(w);
+            *wp += 1;
+            Ok(())
         };
-        s.node(k).map_err(e)
+        let push_v = |vals: &mut [Ty; 256], vp: &mut usize, v: Ty| -> Parsed<()> {
+            let Some(slot) = vals.get_mut(*vp) else {
+                return Err(err(line, "type lowering value stack overflow"));
+            };
+            *slot = v;
+            *vp += 1;
+            Ok(())
+        };
+        let pop_v = |vals: &[Ty; 256], vp: &mut usize| -> Parsed<Ty> {
+            *vp = vp.checked_sub(1).ok_or_else(|| err(line, "type lowering value stack underflow"))?;
+            vals.get(*vp).copied().ok_or_else(|| err(line, "type lowering value stack out of bounds"))
+        };
+        fn slice_v(line: u32, vals: &[Ty; 256], start: usize, len: usize) -> Parsed<&[Ty]> {
+            let end = start.checked_add(len).ok_or_else(|| err(line, "type lowering slice overflow"))?;
+            vals.get(start..end).ok_or_else(|| err(line, "type lowering slice out of bounds"))
+        }
+        push_w(&mut work, &mut wp, Work::Eval(t))?;
+        while wp > 0 {
+            wp -= 1;
+            let Some(item) = work.get_mut(wp).and_then(Option::take) else { break };
+            match item {
+                Work::EvalConstVar(v) => {
+                    let ty = s
+                        .var(v, VarKind::Const)
+                        .map_err(e)?
+                        .ok_or_else(|| err(line, "a variable outside a case"))?;
+                    push_v(&mut vals, &mut vp, ty)?;
+                }
+                Work::Eval(node) => match node {
+                    TyA::Bool => push_v(&mut vals, &mut vp, s.node(TyKind::Bool).map_err(e)?)?,
+                    TyA::Char => push_v(&mut vals, &mut vp, s.node(TyKind::Char).map_err(e)?)?,
+                    TyA::Int(i) => push_v(&mut vals, &mut vp, s.node(TyKind::Int(*i)).map_err(e)?)?,
+                    TyA::Uint(u) => push_v(&mut vals, &mut vp, s.node(TyKind::Uint(*u)).map_err(e)?)?,
+                    TyA::Float(f) => push_v(&mut vals, &mut vp, s.node(TyKind::Float(*f)).map_err(e)?)?,
+                    TyA::Str => push_v(&mut vals, &mut vp, s.node(TyKind::Str).map_err(e)?)?,
+                    TyA::Never => push_v(&mut vals, &mut vp, s.node(TyKind::Never).map_err(e)?)?,
+                    TyA::Error => push_v(&mut vals, &mut vp, s.node(TyKind::Error).map_err(e)?)?,
+                    TyA::Const(n) | TyA::Kind(n) => {
+                        push_v(&mut vals, &mut vp, s.node(TyKind::ConstValue(crate::term::ValTy::USIZE, u128::from(*n))).map_err(e)?)?;
+                    }
+                    TyA::Placeholder(i) => push_v(&mut vals, &mut vp, s.node(TyKind::Placeholder(1, *i)).map_err(e)?)?,
+                    TyA::Region(lt) => push_v(&mut vals, &mut vp, self.region(s, line, lt)?)?,
+                    TyA::Tuple(xs) => {
+                        push_w(&mut work, &mut wp, Work::Tuple(xs.len()))?;
+                        for x in xs.iter().rev() {
+                            push_w(&mut work, &mut wp, Work::Eval(x))?;
+                        }
+                    }
+                    TyA::Ref(lt, x, m) => {
+                        push_w(&mut work, &mut wp, Work::Ref(lt, *m))?;
+                        push_w(&mut work, &mut wp, Work::Eval(x))?;
+                    }
+                    TyA::Ptr(x, m) => {
+                        push_w(&mut work, &mut wp, Work::Ptr(*m))?;
+                        push_w(&mut work, &mut wp, Work::Eval(x))?;
+                    }
+                    TyA::Slice(x) => {
+                        push_w(&mut work, &mut wp, Work::Slice)?;
+                        push_w(&mut work, &mut wp, Work::Eval(x))?;
+                    }
+                    TyA::Array(x, n) => {
+                        push_w(&mut work, &mut wp, Work::Array)?;
+                        push_w(&mut work, &mut wp, Work::Eval(n))?;
+                        push_w(&mut work, &mut wp, Work::Eval(x))?;
+                    }
+                    TyA::Path(name, args) => {
+                        if args.is_empty() {
+                            if let Some(i) = sc.bound.iter().position(|b| b == name) {
+                                let idx = u32::try_from(i).map_err(|_| err(line, "bound index overflow"))?;
+                                push_v(&mut vals, &mut vp, s.node(TyKind::Bound(0, idx)).map_err(e)?)?;
+                                continue;
+                            }
+                            if let Some(i) = sc.params.iter().position(|b| b == name) {
+                                let idx = u32::try_from(i).map_err(|_| err(line, "param index overflow"))?;
+                                push_v(&mut vals, &mut vp, s.node(TyKind::Param(idx)).map_err(e)?)?;
+                                continue;
+                            }
+                        }
+                        if let Some(&d) = self.adts.get(name) {
+                            push_w(&mut work, &mut wp, Work::Adt(d, args.len()))?;
+                            for a in args.iter().rev() {
+                                push_w(&mut work, &mut wp, Work::Eval(a))?;
+                            }
+                        } else if let Some(&d) = self.foreign.get(name) {
+                            push_v(&mut vals, &mut vp, s.node(TyKind::Foreign(d)).map_err(e)?)?;
+                        } else {
+                            return Err(err(line, format!("no type `{name}`")));
+                        }
+                    }
+                    TyA::FnPtr(ins, out) => {
+                        push_w(&mut work, &mut wp, Work::FnPtr(ins.len() + 1))?;
+                        push_w(&mut work, &mut wp, Work::Eval(out))?;
+                        for x in ins.iter().rev() {
+                            push_w(&mut work, &mut wp, Work::Eval(x))?;
+                        }
+                    }
+                    TyA::FnItem(name, args) => {
+                        let d = *self.fns.get(name).ok_or_else(|| err(line, format!("no fn `{name}`")))?;
+                        push_w(&mut work, &mut wp, Work::FnDef(d, args.len()))?;
+                        for a in args.iter().rev() {
+                            push_w(&mut work, &mut wp, Work::Eval(a))?;
+                        }
+                    }
+                    TyA::Closure(n, kind, sig, ups) => match &**ups {
+                        TyA::Tuple(xs) => {
+                            push_w(&mut work, &mut wp, Work::Closure { n: *n, ups_tuple_len: Some(xs.len()) })?;
+                            for x in xs.iter().rev() {
+                                push_w(&mut work, &mut wp, Work::Eval(x))?;
+                            }
+                            push_w(&mut work, &mut wp, Work::Eval(sig))?;
+                            match &**kind {
+                                TyA::Var(v) => push_w(&mut work, &mut wp, Work::EvalConstVar(v))?,
+                                other => push_w(&mut work, &mut wp, Work::Eval(other))?,
+                            }
+                        }
+                        other => {
+                            push_w(&mut work, &mut wp, Work::Closure { n: *n, ups_tuple_len: None })?;
+                            push_w(&mut work, &mut wp, Work::Eval(other))?;
+                            push_w(&mut work, &mut wp, Work::Eval(sig))?;
+                            match &**kind {
+                                TyA::Var(v) => push_w(&mut work, &mut wp, Work::EvalConstVar(v))?,
+                                k => push_w(&mut work, &mut wp, Work::Eval(k))?,
+                            }
+                        }
+                    },
+                    TyA::Dyn(bounds, lt) => {
+                        push_w(&mut work, &mut wp, Work::Dyn { bounds, lt })?;
+                        for b in bounds.iter().rev() {
+                            if !b.assoc_bounds.is_empty() {
+                                return Err(err(line, "an associated item constraint with bounds in a `dyn` type"));
+                            }
+                            let tn = self.trait_(line, &b.trait_)?;
+                            if tn.auto {
+                                continue;
+                            }
+                            for (_, v) in b.assoc.iter().rev() {
+                                push_w(&mut work, &mut wp, Work::Eval(v))?;
+                            }
+                            for a in b.args.iter().rev() {
+                                push_w(&mut work, &mut wp, Work::Eval(a))?;
+                            }
+                        }
+                    }
+                    TyA::Proj { self_ty, trait_, args, name, own, rigid } => {
+                        let (item, kind, generics) = self.item(line, trait_, name)?;
+                        push_w(
+                            &mut work,
+                            &mut wp,
+                            Work::Proj { item, kind, generics, total_args: 1 + args.len(), own_len: own.len(), rigid: *rigid },
+                        )?;
+                        for a in own.iter().rev() {
+                            push_w(&mut work, &mut wp, Work::Eval(a))?;
+                        }
+                        for a in args.iter().rev() {
+                            push_w(&mut work, &mut wp, Work::Eval(a))?;
+                        }
+                        push_w(&mut work, &mut wp, Work::Eval(self_ty))?;
+                    }
+                    TyA::Opaque(name, args, rigid) => {
+                        let d = *self.opaques.get(name).ok_or_else(|| err(line, format!("no opaque `{name}`")))?;
+                        push_w(&mut work, &mut wp, Work::Opaque(d, *rigid, args.len()))?;
+                        for a in args.iter().rev() {
+                            push_w(&mut work, &mut wp, Work::Eval(a))?;
+                        }
+                    }
+                    TyA::Var(name) => {
+                        let kind = match name.as_bytes() {
+                            [b'i', rest @ ..] if !rest.is_empty() && rest.iter().all(u8::is_ascii_digit) => VarKind::Int,
+                            [b'f', rest @ ..] if !rest.is_empty() && rest.iter().all(u8::is_ascii_digit) => VarKind::Float,
+                            _ => VarKind::Ty,
+                        };
+                        let ty = s
+                            .var(name, kind)
+                            .map_err(e)?
+                            .ok_or_else(|| err(line, format!("variable ?{name} outside a case")))?;
+                        push_v(&mut vals, &mut vp, ty)?;
+                    }
+                },
+                Work::Tuple(n) => {
+                    vp = vp.saturating_sub(n);
+                    let l = s.list(slice_v(line, &vals, vp, n)?).map_err(e)?;
+                    push_v(&mut vals, &mut vp, s.node(TyKind::Tuple(l)).map_err(e)?)?;
+                }
+                Work::Ref(lt, m) => {
+                    let x = pop_v(&vals, &mut vp)?;
+                    let r = self.region(s, line, lt)?;
+                    push_v(&mut vals, &mut vp, s.node(TyKind::Ref(r, x, m)).map_err(e)?)?;
+                }
+                Work::Ptr(m) => {
+                    let x = pop_v(&vals, &mut vp)?;
+                    push_v(&mut vals, &mut vp, s.node(TyKind::RawPtr(x, m)).map_err(e)?)?;
+                }
+                Work::Slice => {
+                    let x = pop_v(&vals, &mut vp)?;
+                    push_v(&mut vals, &mut vp, s.node(TyKind::Slice(x)).map_err(e)?)?;
+                }
+                Work::Array => {
+                    let n = pop_v(&vals, &mut vp)?;
+                    let x = pop_v(&vals, &mut vp)?;
+                    push_v(&mut vals, &mut vp, s.node(TyKind::Array(x, n)).map_err(e)?)?;
+                }
+                Work::Adt(d, n) => {
+                    vp = vp.saturating_sub(n);
+                    let l = s.list(slice_v(line, &vals, vp, n)?).map_err(e)?;
+                    push_v(&mut vals, &mut vp, s.node(TyKind::Adt(d, l)).map_err(e)?)?;
+                }
+                Work::FnPtr(n) => {
+                    vp = vp.saturating_sub(n);
+                    let l = s.list(slice_v(line, &vals, vp, n)?).map_err(e)?;
+                    push_v(&mut vals, &mut vp, s.node(TyKind::FnPtr(l, crate::term::FnPtrHeader::RUST)).map_err(e)?)?;
+                }
+                Work::FnDef(d, n) => {
+                    vp = vp.saturating_sub(n);
+                    let l = s.list(slice_v(line, &vals, vp, n)?).map_err(e)?;
+                    push_v(&mut vals, &mut vp, s.node(TyKind::FnDef(d, l)).map_err(e)?)?;
+                }
+                Work::Closure { n, ups_tuple_len } => {
+                    let ups = match ups_tuple_len {
+                        Some(ulen) => {
+                            vp = vp.saturating_sub(ulen);
+                            let l = s.list(slice_v(line, &vals, vp, ulen)?).map_err(e)?;
+                            s.node(TyKind::Tuple(l)).map_err(e)?
+                        }
+                        None => {
+                            let one = pop_v(&vals, &mut vp)?;
+                            let l = s.list(&[one]).map_err(e)?;
+                            s.node(TyKind::Tuple(l)).map_err(e)?
+                        }
+                    };
+                    let sig = pop_v(&vals, &mut vp)?;
+                    let k = pop_v(&vals, &mut vp)?;
+                    let l = s.list(&[k, sig, ups]).map_err(e)?;
+                    push_v(&mut vals, &mut vp, s.node(TyKind::Closure(def_of("closure", &n.to_string()), l)).map_err(e)?)?;
+                }
+                Work::Dyn { bounds, lt } => {
+                    let mut total = 0usize;
+                    for b in bounds {
+                        let tn = self.trait_(line, &b.trait_)?;
+                        if !tn.auto {
+                            total += b.args.len() + b.assoc.len();
+                        }
+                    }
+                    vp = vp.saturating_sub(total);
+                    let mut cursor = vp;
+                    let mut principal = Vec::new();
+                    let mut projs = Vec::new();
+                    let mut autos = Vec::new();
+                    for b in bounds {
+                        let tn = self.trait_(line, &b.trait_)?.clone();
+                        if tn.auto {
+                            autos.push(s.node(TyKind::ExAuto(tn.def)).map_err(e)?);
+                            continue;
+                        }
+                        let args = s.list(slice_v(line, &vals, cursor, b.args.len())?).map_err(e)?;
+                        cursor += b.args.len();
+                        principal.push(s.node(TyKind::ExTrait(tn.def, args)).map_err(e)?);
+                        for (name, _) in &b.assoc {
+                            let (item, _, _) = self.item(line, &b.trait_, name)?;
+                            let v = vals.get(cursor).copied().ok_or_else(|| err(line, "dyn value stack out of bounds"))?;
+                            cursor += 1;
+                            projs.push((item, s.node(TyKind::ExProj(item, args, v)).map_err(e)?));
+                        }
+                    }
+                    if principal.len() > 1 {
+                        return Err(err(line, "a dyn type with two principal traits"));
+                    }
+                    projs.sort_by_key(|p| p.0);
+                    let mut autos_d: Vec<(Def, Ty)> = autos
+                        .into_iter()
+                        .map(|t| match s.kind_of(t) {
+                            TyKind::ExAuto(d) => (d, t),
+                            _ => (Def(0), t),
+                        })
+                        .collect();
+                    autos_d.sort_by_key(|p| p.0);
+                    autos_d.dedup_by_key(|p| p.0);
+                    let mut all = principal;
+                    all.extend(projs.into_iter().map(|p| p.1));
+                    all.extend(autos_d.into_iter().map(|p| p.1));
+                    let l = s.list(&all).map_err(e)?;
+                    let r = self.region(s, line, lt)?;
+                    push_v(&mut vals, &mut vp, s.node(TyKind::Dynamic(l, r)).map_err(e)?)?;
+                }
+                Work::Proj { item, kind, generics, total_args, own_len, rigid } => {
+                    vp = vp.saturating_sub(total_args + own_len);
+                    let keep = total_args.min(usize::try_from(generics).unwrap_or(total_args));
+                    let mut buf = [Ty::NONE; 64];
+                    let Some(first_dst) = buf.get_mut(..keep) else {
+                        return Err(err(line, "too many projection arguments"));
+                    };
+                    first_dst.copy_from_slice(slice_v(line, &vals, vp, keep)?);
+                    let Some(own_dst) = buf.get_mut(keep..keep + own_len) else {
+                        return Err(err(line, "too many projection arguments"));
+                    };
+                    own_dst.copy_from_slice(slice_v(line, &vals, vp + total_args, own_len)?);
+                    let all_slice = buf.get(..keep + own_len).ok_or_else(|| err(line, "too many projection arguments"))?;
+                    let l = s.list(all_slice).map_err(e)?;
+                    let ak = if kind == AssocKind::Const { AliasKind::Const } else { AliasKind::Projection };
+                    push_v(&mut vals, &mut vp, s.node(TyKind::Alias(if rigid { Rigid::Yes } else { Rigid::No }, ak, item, l)).map_err(e)?)?;
+                }
+                Work::Opaque(d, rigid, n) => {
+                    vp = vp.saturating_sub(n);
+                    let l = s.list(slice_v(line, &vals, vp, n)?).map_err(e)?;
+                    push_v(&mut vals, &mut vp, s.node(TyKind::Alias(if rigid { Rigid::Yes } else { Rigid::No }, AliasKind::Opaque, d, l)).map_err(e)?)?;
+                }
+            }
+        }
+        vals.first().copied().ok_or_else(|| err(line, "empty type lowering stack".to_string()))
     }
 
     fn region<S: Sink>(&self, s: &mut S, line: u32, lt: &Lt) -> Parsed<Ty> {
@@ -388,37 +575,55 @@ impl Names {
 
     /// `self_ty: b` as predicates: the trait predicate, then one projection per binding.
     pub fn bound<S: Sink>(&self, s: &mut S, sc: Scope<'_>, line: u32, self_ty: Ty, b: &BoundA, out: &mut Vec<Pred>) -> Parsed<()> {
-        if b.maybe {
-            return Ok(());
-        }
         let e = |x: SolveError| solve_err(line, x);
-        let tn = self.trait_(line, &b.trait_)?.clone();
-        let mut v = std::vec![self_ty];
-        for a in &b.args {
-            v.push(self.ty(s, sc, line, a)?);
-        }
-        let args = s.list(&v).map_err(e)?;
-        let polarity = if b.negative { Polarity::Negative } else { Polarity::Positive };
-        out.push(Pred::Trait { trait_: tn.def, args, polarity });
-        for (name, val) in &b.assoc {
-            let (item, kind, generics) = self.item(line, &b.trait_, name)?;
-            let l = s.list(&v[..generics as usize]).map_err(e)?;
-            let ak = if kind == AssocKind::Const { AliasKind::Const } else { AliasKind::Projection };
-            let alias = s.node(TyKind::Alias(Rigid::No, ak, item, l)).map_err(e)?;
-            let term = self.ty(s, sc, line, val)?;
-            out.push(Pred::Projection { alias, term });
-        }
-        // `Name: Bounds` (RFC 2289): `self_ty: Tr<Name: B>` is `self_ty: Tr` and
-        // `<self_ty as Tr>::Name: B`, nested as written (`Tr<A: U<B: V>>`).
-        for (name, list) in &b.assoc_bounds {
-            let (item, kind, generics) = self.item(line, &b.trait_, name)?;
-            if kind == AssocKind::Const {
-                return Err(err(line, format!("`{name}: ..` bounds an associated const")));
+        let mut stack = [(self_ty, b); 64];
+        let mut sp = 1usize;
+        while sp > 0 {
+            sp -= 1;
+            let Some(&(self_ty, b)) = stack.get(sp) else { break };
+            if b.maybe {
+                continue;
             }
-            let l = s.list(&v[..generics as usize]).map_err(e)?;
-            let alias = s.node(TyKind::Alias(Rigid::No, AliasKind::Projection, item, l)).map_err(e)?;
-            for nb in list {
-                self.bound(s, sc, line, alias, nb, out)?;
+            let tn = self.trait_(line, &b.trait_)?.clone();
+            let mut v = std::vec![self_ty];
+            for a in &b.args {
+                v.push(self.ty(s, sc, line, a)?);
+            }
+            let args = s.list(&v).map_err(e)?;
+            let polarity = if b.negative { Polarity::Negative } else { Polarity::Positive };
+            out.push(Pred::Trait { trait_: tn.def, args, polarity });
+            for (name, val) in &b.assoc {
+                let (item, kind, generics) = self.item(line, &b.trait_, name)?;
+                let g = usize::try_from(generics).unwrap_or(v.len());
+                let slice = v.get(..g).ok_or_else(|| err(line, "assoc generics out of range".to_string()))?;
+                let l = s.list(slice).map_err(e)?;
+                let ak = if kind == AssocKind::Const { AliasKind::Const } else { AliasKind::Projection };
+                let alias = s.node(TyKind::Alias(Rigid::No, ak, item, l)).map_err(e)?;
+                let term = self.ty(s, sc, line, val)?;
+                out.push(Pred::Projection { alias, term });
+            }
+            // `Name: Bounds` (RFC 2289): `self_ty: Tr<Name: B>` is `self_ty: Tr` and
+            // `<self_ty as Tr>::Name: B`, nested as written (`Tr<A: U<B: V>>`).
+            let base = sp;
+            for (name, list) in &b.assoc_bounds {
+                let (item, kind, generics) = self.item(line, &b.trait_, name)?;
+                if kind == AssocKind::Const {
+                    return Err(err(line, format!("`{name}: ..` bounds an associated const")));
+                }
+                let g = usize::try_from(generics).unwrap_or(v.len());
+                let slice = v.get(..g).ok_or_else(|| err(line, "assoc generics out of range".to_string()))?;
+                let l = s.list(slice).map_err(e)?;
+                let alias = s.node(TyKind::Alias(Rigid::No, AliasKind::Projection, item, l)).map_err(e)?;
+                for nb in list {
+                    let Some(slot) = stack.get_mut(sp) else {
+                        return Err(err(line, "nested associated-type bound depth exceeded".to_string()));
+                    };
+                    *slot = (alias, nb);
+                    sp += 1;
+                }
+            }
+            if let Some(pushed) = stack.get_mut(base..sp) {
+                pushed.reverse();
             }
         }
         Ok(())

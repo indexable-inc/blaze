@@ -236,11 +236,16 @@ pub fn needs_of<A: Allocator + Copy>(
         if last != Some(e) {
             let t = *done.expr_ty.get(e.0 as usize).ok_or(malformed("a struct expression with defaults past the record's types"))?;
             let g = blaze_build::ground(types, t, args, ground, scratch, facts)?;
-            let PNode::Adt(_, list) = ground.view().node(g).map_err(|_| malformed("a grounded type past the ground table"))? else {
-                return Err(malformed("a struct expression with defaults of a type that is not an ADT"));
-            };
-            grounded.clear();
-            grounded.extend_from_slice(ground.view().list(list).map_err(|_| malformed("an ADT's arguments past the ground table"))?);
+            match ground.view().node(g).map_err(|_| malformed("a grounded type past the ground table"))? {
+                PNode::Adt(_, list) => {
+                    grounded.clear();
+                    grounded.extend_from_slice(ground.view().list(list).map_err(|_| malformed("an ADT's arguments past the ground table"))?);
+                }
+                PNode::Record(..) => {
+                    grounded.clear();
+                }
+                _ => return Err(malformed("a struct expression with defaults of a type that is not an ADT or record")),
+            }
             last = Some(e);
         }
         out.push(ConstNeed::Item(key), &grounded)?;

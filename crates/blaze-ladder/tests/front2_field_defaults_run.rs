@@ -403,3 +403,158 @@ pub extern \"C\" fn main() -> i32 {{
         assert_eq!(got, Ok(expected), "input {input}");
     }
 }
+
+/// Real `?` propagation across error unions (`From<ErrA> for ErrA | ErrB`,
+/// `From<ErrB> for ErrA | ErrB`, and `From<ErrA | ErrB> for ErrA | ErrB | ErrC`).
+#[test]
+fn union_try_question_mark_propagation() {
+    let defs = "
+enum Infallible {}
+
+enum ControlFlow<B, C> {
+    #[lang = \"Continue\"]
+    Continue(C),
+    #[lang = \"Break\"]
+    Break(B),
+}
+
+#[lang = \"from\"]
+trait From<T> {
+    fn from(value: T) -> Self;
+}
+
+impl<T> From<T> for T {
+    fn from(value: T) -> Self {
+        value
+    }
+}
+
+trait FromResidual<R = <Self as Try>::Residual> {
+    #[lang = \"from_residual\"]
+    fn from_residual(residual: R) -> Self;
+}
+
+trait Try: FromResidual {
+    type Output;
+    type Residual;
+    #[lang = \"branch\"]
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output>;
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+impl<T, E> Try for Result<T, E> {
+    type Output = T;
+    type Residual = Result<Infallible, E>;
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output> {
+        match self {
+            Result::Ok(v) => ControlFlow::Continue(v),
+            Result::Err(e) => ControlFlow::Break(Result::Err(e)),
+        }
+    }
+}
+
+impl<T, E, F: From<E>> FromResidual<Result<Infallible, E>> for Result<T, F> {
+    fn from_residual(residual: Result<Infallible, E>) -> Self {
+        match residual {
+            Result::Err(e) => Result::Err(From::from(e)),
+            Result::Ok(x) => match x {},
+        }
+    }
+}
+
+struct ErrA(u32);
+struct ErrB(u32);
+struct ErrC(u32);
+
+fn read(mode: u32) -> u32 ! ErrA {
+    if mode == 1 {
+        Result::Err(ErrA(10))
+    } else {
+        Result::Ok(mode)
+    }
+}
+
+fn parse(x: u32) -> u32 ! ErrB {
+    if x == 2 {
+        Result::Err(ErrB(20))
+    } else {
+        Result::Ok(x + 42)
+    }
+}
+
+fn load(mode: u32) -> u32 ! ErrA | ErrB {
+    let a = read(mode)?;
+    let b = parse(a)?;
+    Result::Ok(b)
+}
+
+fn outer(mode: u32) -> u32 ! ErrA | ErrB | ErrC {
+    if mode == 3 {
+        return Result::Err(ErrC(30));
+    }
+    let v = load(mode)?;
+    Result::Ok(v)
+}
+
+fn dispatch(mode: u32) -> u32 {
+    match outer(mode) {
+        Result::Ok(v) => v,
+        Result::Err(e) => match e {
+            a: ErrA => a.0 + 1,
+            b: ErrB => b.0 + 2,
+            c: ErrC => c.0 + 3,
+        },
+    }
+}
+";
+    for (mode, expected) in [(0u32, 42u8), (1, 11), (2, 22), (3, 33)] {
+        let got = run_head(UNIONS_HEAD, &format!(
+            "{defs}
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {{
+    dispatch({mode}) as i32
+}}
+"
+        ));
+        assert_eq!(got, Ok(expected), "mode {mode}");
+    }
+}
+
+/// Structural record width-subtyping coercion `{ host, port, tls } -> { host }` -> exit 42.
+#[test]
+fn record_width_subtyping_coercion() {
+    let got = run_head(RECORDS_HEAD, "
+fn read_host(r: { host: u32 }) -> u32 {
+    r.host
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let wide = { host: 20u32, port: 8080u32, tls: true };
+    let a = read_host(wide);
+    let b = read_host({ host: 22u32, port: 443u32, tls: false });
+    (a + b) as i32
+}
+");
+    assert_eq!(got, Ok(42));
+}
+
+/// Structural record type-level defaults `{ a: u32, b: u32 = 32 }` with `{ a: 10u32, .. }` -> exit 42.
+#[test]
+fn record_type_level_defaults() {
+    let got = run_head(RECORDS_HEAD, "
+fn sum(r: { a: u32, b: u32 = 32 }) -> u32 {
+    r.a + r.b
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    sum({ a: 10u32, .. }) as i32
+}
+");
+    assert_eq!(got, Ok(42));
+}

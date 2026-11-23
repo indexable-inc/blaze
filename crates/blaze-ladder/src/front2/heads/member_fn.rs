@@ -118,7 +118,7 @@ impl<'n> Store<'n> {
             inherited.extend_from_slice(&clauses.clauses);
             let env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
             let marks = super::super::item_site::member_marks(names, impl_, m.written_by, m.text).map_err(super::super::item_site::MarksLost::why)?;
-            return self.member_fn_head(names, impl_, fn_, Some(ck), &env, generics, &inherited, &v, m, marks);
+            return self.member_fn_head(names, keys, impl_, fn_, Some(ck), &env, generics, &inherited, &v, m, marks);
         }
         Err(Why::Program(format!("impl {ck:?} holds no fn `{name}` its crate's cfg keeps").into_boxed_str(), whole))
     }

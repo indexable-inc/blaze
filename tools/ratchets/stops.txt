@@ -16,11 +16,8 @@ blaze-base64	24
 blaze-bench	7
 blaze-blake3	413
 blaze-body	82
-blaze-body-build	39
-blaze-body-drops	24
-blaze-body-flow	39
 blaze-bstd-convert	109
-blaze-build	550
+blaze-build	549
 blaze-build-script	246
 blaze-bytes	3
 blaze-c	325
@@ -54,7 +51,6 @@ blaze-emit	1000
 blaze-engine	261
 blaze-expand	469
 blaze-export	248
-blaze-facts	2
 blaze-fetch	175
 blaze-file-items	277
 blaze-flow	284
@@ -114,10 +110,9 @@ blaze-queue	9
 blaze-radix	49
 blaze-real	153
 blaze-reclaim	2
-blaze-record	7
 blaze-remote	217
 blaze-report	162
-blaze-resolve	56
+blaze-resolve	54
 blaze-rng	3
 blaze-roots	24
 blaze-run	273
@@ -128,7 +123,7 @@ blaze-script	91
 blaze-semver	9
 blaze-sha256	43
 blaze-sim	155
-blaze-solve	420
+blaze-solve	418
 blaze-sort	59
 blaze-source	15
 blaze-spawn	9
@@ -171,7 +166,7 @@ paths	9
 rustc_abi	109
 rustc_lexer	7
 stdx	71
-syntax	458
+syntax	457
 syntax-tree	112
 target-features	36
 test-utils	98
