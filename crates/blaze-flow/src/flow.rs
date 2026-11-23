@@ -496,7 +496,7 @@ impl<A: Allocator> Flow<A> {
 const NO_CHILD: u32 = u32::MAX;
 
 /// Builds a flow by hand: reserve blocks, then fill each in turn, ending it with a terminator.
-pub struct FlowBuilder<A: Allocator + Clone> {
+pub struct FlowBuilder<A: Allocator + Copy> {
     flow: Flow<A>,
     filled: Vec<bool, A>,
     /// Intrusive linked list of direct children per place (`NO_CHILD` = end).
@@ -508,14 +508,14 @@ pub struct FlowBuilder<A: Allocator + Clone> {
     error: Option<FlowError>,
 }
 
-impl<A: Allocator + Clone> FlowBuilder<A> {
+impl<A: Allocator + Copy> FlowBuilder<A> {
     /// A body of `locals` locals, of which `1..=args` are arguments (`Local(0)` returns).
     pub fn new_in(locals: u32, args: u32, alloc: A) -> FlowBuilder<A> {
         let cap = locals as usize;
-        let mut places = Vec::with_capacity_in(cap, alloc.clone());
-        let mut local_places = Vec::with_capacity_in(cap, alloc.clone());
-        let mut first_child = Vec::with_capacity_in(cap, alloc.clone());
-        let mut next_sibling = Vec::with_capacity_in(cap, alloc.clone());
+        let mut places = Vec::with_capacity_in(cap, alloc);
+        let mut local_places = Vec::with_capacity_in(cap, alloc);
+        let mut first_child = Vec::with_capacity_in(cap, alloc);
+        let mut next_sibling = Vec::with_capacity_in(cap, alloc);
         for l in 0..locals {
             local_places.push(Place(l));
             places.push(PlaceRow {
@@ -534,17 +534,17 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
                 locals,
                 args,
                 places,
-                stmts: Vec::new_in(alloc.clone()),
-                blocks: Vec::new_in(alloc.clone()),
-                stmt_block: Vec::new_in(alloc.clone()),
-                operands: Vec::new_in(alloc.clone()),
-                succ: Vec::new_in(alloc.clone()),
-                loans: Vec::new_in(alloc.clone()),
-                subsets: Vec::new_in(alloc.clone()),
+                stmts: Vec::new_in(alloc),
+                blocks: Vec::new_in(alloc),
+                stmt_block: Vec::new_in(alloc),
+                operands: Vec::new_in(alloc),
+                succ: Vec::new_in(alloc),
+                loans: Vec::new_in(alloc),
+                subsets: Vec::new_in(alloc),
                 origins: 0,
-                placeholder: Vec::new_in(alloc.clone()),
-                local_origins: Vec::new_in(alloc.clone()),
-                known: Vec::new_in(alloc.clone()),
+                placeholder: Vec::new_in(alloc),
+                local_origins: Vec::new_in(alloc),
+                known: Vec::new_in(alloc),
                 local_places,
             },
             filled: Vec::new_in(alloc),

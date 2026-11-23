@@ -16,6 +16,7 @@
 use std::{sync::Arc, time::Instant};
 
 use blaze_core::{Completion, Done, Driver, Effect, FileName, Names, Tag, wait::Deadline};
+use blaze_own::Share;
 
 /// Submits `effects` and polls until each has completed; every one must have done.
 fn round(driver: &mut impl Driver, effects: &mut Vec<Effect>, done: &mut Vec<Completion>) {
@@ -78,7 +79,7 @@ fn main() {
 
     for file in files.iter().cycle().take(4000) {
         let began = Instant::now();
-        effects.push(Effect::Stat { file: file.clone(), tag: Tag(1) });
+        effects.push(Effect::Stat { file: file.share(), tag: Tag(1) });
         round(&mut driver, &mut effects, &mut done);
         us.push(began.elapsed().as_secs_f64() * 1e6);
     }
@@ -86,7 +87,7 @@ fn main() {
 
     for chunk in files.chunks_exact(32).cycle().take(400) {
         let began = Instant::now();
-        effects.extend(chunk.iter().enumerate().map(|(at, file)| Effect::Stat { file: file.clone(), tag: Tag(at as u64) }));
+        effects.extend(chunk.iter().enumerate().map(|(at, file)| Effect::Stat { file: file.share(), tag: Tag(at as u64) }));
         round(&mut driver, &mut effects, &mut done);
         us.push(began.elapsed().as_secs_f64() * 1e6 / 32.0);
     }

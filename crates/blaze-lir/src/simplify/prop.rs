@@ -67,12 +67,12 @@ enum Fact {
 
 /// The function `view` with its copies and constants propagated and its integer operations
 /// on constants folded, in `alloc`, verified.
-pub fn propagate<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
+pub fn propagate<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
     propagate_planted(view, Plant::None, alloc)
 }
 
 /// [`propagate`] with `plant` (a test's control; ignored outside tests).
-pub fn propagate_planted<A: Allocator + Clone>(view: View<'_>, plant: Plant, alloc: A) -> Result<Func<A>, SimplifyError> {
+pub fn propagate_planted<A: Allocator + Copy>(view: View<'_>, plant: Plant, alloc: A) -> Result<Func<A>, SimplifyError> {
     if view.blocks() == 0 {
         return Err(SimplifyError::Refused { inst: 0, what: "a function with no blocks" });
     }
@@ -85,8 +85,8 @@ pub fn propagate_planted<A: Allocator + Clone>(view: View<'_>, plant: Plant, all
     // fact, record each eligible block parameter's block, and seed the worklist.
     let mut param_block = filled(len, NONE, &alloc);
     let mut use_counts = filled(len + 1, 0u32, &alloc);
-    let mut raw_edges: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
-    let mut call_indirects: Vec<u32, A> = Vec::new_in(alloc.clone());
+    let mut raw_edges: Vec<(u32, u32), A> = Vec::new_in(alloc);
+    let mut call_indirects: Vec<u32, A> = Vec::new_in(alloc);
     let mut queue = Queue::new(len, &alloc);
     let mut in_work = filled(len, false, &alloc);
 
@@ -95,7 +95,7 @@ pub fn propagate_planted<A: Allocator + Clone>(view: View<'_>, plant: Plant, all
         let params = view.params(block);
         if into.targets_only[b] {
             let edges = into.edges_into(b);
-            for (k, param) in params.clone().enumerate() {
+            for (k, param) in (params.start..params.end).enumerate() {
                 param_block[param] = b as u32;
                 let p = param as u32;
                 for &args in edges {
@@ -142,7 +142,7 @@ pub fn propagate_planted<A: Allocator + Clone>(view: View<'_>, plant: Plant, all
     let mut facts = Facts {
         view,
         plant: cfg!(test) && plant == Plant::FoldSubAsAdd,
-        stands: Vec::with_capacity_in(len, alloc.clone()),
+        stands: Vec::with_capacity_in(len, alloc),
         known: filled(len, Known::No, &alloc),
     };
     for value in 0..len as u32 {
@@ -154,7 +154,7 @@ pub fn propagate_planted<A: Allocator + Clone>(view: View<'_>, plant: Plant, all
     // its undecided users must be woken.
     let mut stand_head = filled(len, NONE, &alloc);
     let mut stand_next = filled(len, NONE, &alloc);
-    let mut relay_stack: Vec<u32, A> = Vec::new_in(alloc.clone());
+    let mut relay_stack: Vec<u32, A> = Vec::new_in(alloc);
 
     let mut any_stands = false;
     let mut any_folded = false;
@@ -216,7 +216,7 @@ pub fn propagate_planted<A: Allocator + Clone>(view: View<'_>, plant: Plant, all
         return Ok(view.to_func_in(alloc));
     }
 
-    let mut stands = Vec::with_capacity_in(len, alloc.clone());
+    let mut stands = Vec::with_capacity_in(len, alloc);
     let mut constant = filled(len, None, &alloc);
     for value in 0..len {
         stands.push(facts.resolve(value as u32));
@@ -232,6 +232,7 @@ pub fn propagate_planted<A: Allocator + Clone>(view: View<'_>, plant: Plant, all
         jump: no_jumps,
         devirt,
         merge_next: filled(view.blocks(), NONE, &alloc),
+        fma_fuse: filled(len, None, &alloc),
     };
     rebuild(view, &edit, alloc)
 }
@@ -245,7 +246,7 @@ struct Queue<A: Allocator> {
     count: usize,
 }
 
-impl<A: Allocator + Clone> Queue<A> {
+impl<A: Allocator + Copy> Queue<A> {
     fn new(len: usize, alloc: &A) -> Self {
         Self { buf: filled(len.max(1), 0u32, alloc), head: 0, tail: 0, count: 0 }
     }

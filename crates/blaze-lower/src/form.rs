@@ -654,6 +654,12 @@ pub enum TypeRef {
     /// `pattern_type!` expands to in every type position (library/core/src/pat.rs: "Creates a
     /// pattern type. `type Positive = std::pat::pattern_type!(i32 is 1..);`").
     Pat { base: TypeId, pat: TyPat },
+    /// A structural record type (`#![blaze::records]`): `{ name: &str, depth: u32 = 0 }`.
+    /// Each element of `fields` is a [`ROW_FIELD`] row carrying name, type, and optional default.
+    Record(List),
+    /// A structural type set / error union (`#![blaze::error_unions]`): `A | B | C`.
+    /// Each element of the list is a member [`TypeId`].
+    Union(List),
     /// What the lowering cannot make (counted in `unhandled`).
     Error,
 }
@@ -696,6 +702,8 @@ impl TypeRef {
             TypeRef::Error => n.with(13),
             TypeRef::Pat { base, pat: TyPat::NotNull } => Node { a: base.0, ..n.with(14 | 1 << 8) },
             TypeRef::Pat { base, pat: TyPat::Of(p) } => Node { a: base.0, b: p.0, ..n.with(14) },
+            TypeRef::Record(l) => Node { a: l.start, b: l.len, ..n.with(15) },
+            TypeRef::Union(l) => Node { a: l.start, b: l.len, ..n.with(16) },
         }
     }
 
@@ -728,6 +736,8 @@ impl TypeRef {
             13 => TypeRef::Error,
             14 if n.flags & (1 << 8) != 0 => TypeRef::Pat { base: TypeId(n.a), pat: TyPat::NotNull },
             14 => TypeRef::Pat { base: TypeId(n.a), pat: TyPat::Of(PatId(n.b)) },
+            15 => TypeRef::Record(list(n.a, n.b)),
+            16 => TypeRef::Union(list(n.a, n.b)),
             _ => return Err(bad("types", n.tag)),
         })
     }
@@ -836,6 +846,8 @@ pub enum Expr {
     Underscore,
     /// `operand.await`, in an async body.
     Await(ExprId),
+    /// An anonymous structural record literal (`#![blaze::records]`): `{ name: "x", depth: 2, .. }`.
+    Record { fields: List, base: StructBase },
 }
 
 const BIN_OPS: [BinOp; 18] = [
@@ -960,6 +972,14 @@ impl Expr {
             E::OffsetOf { ty, fields } => Node { a: ty.0, b: fields.start, c: fields.len, ..n(34) },
             E::Underscore => n(35),
             E::Await(e) => Node { a: e.0, ..n(36) },
+            E::Record { fields, base } => {
+                let (k, c) = match base {
+                    StructBase::None => (0, NONE),
+                    StructBase::Expr(e) => (1, e.0),
+                    StructBase::Defaults => (2, NONE),
+                };
+                Node { a: fields.start, b: fields.len, c, ..n(37).with(k) }
+            }
         }
     }
 
@@ -1041,6 +1061,15 @@ impl Expr {
             34 => E::OffsetOf { ty: TypeId(n.a), fields: list(n.b, n.c) },
             35 => E::Underscore,
             36 => E::Await(ExprId(n.a)),
+            37 => E::Record {
+                fields: list(n.a, n.b),
+                base: match n.flags {
+                    0 => StructBase::None,
+                    1 => StructBase::Expr(ExprId(n.c)),
+                    2 => StructBase::Defaults,
+                    _ => return Err(err),
+                },
+            },
             _ => return Err(err),
         })
     }
@@ -1079,6 +1108,8 @@ pub enum Pat {
     Rest,
     /// A macro call in pattern position: a row of [`MacroCall`].
     MacroCall { row: RowIdx },
+    /// An anonymous structural record pattern (`#![blaze::records]`): `{ name, depth: d, .. }`.
+    Record { fields: List, rest: bool },
 }
 
 fn ann_bits(ann: BindAnn) -> u16 {
@@ -1139,6 +1170,7 @@ impl Pat {
             }
             P::Rest => n(14),
             P::MacroCall { row } => Node { a: row.0, ..n(15) },
+            P::Record { fields, rest } => Node { a: fields.start, b: fields.len, ..n(16).with(u16::from(rest)) },
         }
     }
 
@@ -1167,6 +1199,7 @@ impl Pat {
             13 => P::Range { lo: unopt(n.a).map(PatId), hi: unopt(n.b).map(PatId), inclusive: n.flags & 1 != 0 },
             14 => P::Rest,
             15 => P::MacroCall { row: RowIdx(n.a) },
+            16 => P::Record { fields: list(n.a, n.b), rest: n.flags & 1 != 0 },
             _ => return Err(err),
         })
     }

@@ -1188,7 +1188,7 @@ impl<'n> Consts<'n> {
         // Its closures' facts, by the build's one rule (`run::ClosureTable::add`): a closure
         // written in a constant's body is laid out from the body that holds it, as a fn's is.
         // Its owner's parameters: the head's (a free constant has none and no row).
-        if checked.closures.len() != 0 {
+        if !checked.closures.is_empty() {
             let alloc = r.store.tys.alloc();
             let generics = r.store.fns.get(&item).map_or(0, |h| h.parent + h.own);
             let tys = lowered.tys.view(&r.store.tys).expect("a body's types over the records' table it was lowered over");

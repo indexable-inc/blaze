@@ -108,7 +108,7 @@ impl fmt::Display for ProjectError {
 }
 
 /// A body's flow and the map both ways between their ids.
-pub struct Projected<A: Allocator + Clone> {
+pub struct Projected<A: Allocator + Copy> {
     pub flow: Flow<A>,
     /// Per body statement: its flow statement (the one a finding there names), or [`NONE`].
     flow_stmt: Vec<u32, A>,
@@ -136,7 +136,7 @@ fn at(v: &[u32], i: usize) -> Option<u32> {
     }
 }
 
-impl<A: Allocator + Clone> Projected<A> {
+impl<A: Allocator + Copy> Projected<A> {
     /// The flow statement body row `s` became (a finding at it names this one); `None` for a
     /// row of a left-out cleanup block.
     pub fn flow_stmt(&self, s: bd::Stmt) -> Option<fl::Stmt> {
@@ -196,7 +196,7 @@ impl<A: Allocator + Clone> Projected<A> {
     /// What drop elaboration does at each projected body `Drop`, in row order, from the move
     /// check's two dataflows (`blaze_flow::moves::drop_kind`).
     pub fn drop_kinds(&self, alloc: A) -> Result<Vec<(bd::Stmt, DropKind), A>, Bound> {
-        let st = fl::moves::inits(&self.flow, fl::record::Plant::None, alloc.clone())?;
+        let st = fl::moves::inits(&self.flow, fl::record::Plant::None, alloc)?;
         let mut out = Vec::with_capacity_in(self.drops.len(), alloc);
         for &(row, s, p) in self.drops.iter() {
             out.push((row, fl::moves::drop_kind(&self.flow, &st, s, p)));
@@ -225,7 +225,7 @@ fn span(s: bd::Span) -> fl::Span {
 }
 
 /// Projects `body` to its flow (the module doc gives each row's form).
-pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Projected<A>, ProjectError> {
+pub fn project<A: Allocator + Copy>(body: Verified<'_>, alloc: A) -> Result<Projected<A>, ProjectError> {
     let locals = body.locals();
     let args = body.args();
     for i in 1..=args {
@@ -234,7 +234,7 @@ pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Pro
             _ => return Err(ProjectError::ArgOrder { local: bd::Local(i) }),
         }
     }
-    let mut b = FlowBuilder::new_in(locals, args, alloc.clone());
+    let mut b = FlowBuilder::new_in(locals, args, alloc);
     for o in 0..body.origins() {
         b.origin(body.placeholder(bd::Origin(o)));
     }
@@ -246,7 +246,7 @@ pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Pro
     }
 
     // Places in row order: a parent is an earlier row (verify), so it is mapped first.
-    let mut flow_place = filled(body.places() as usize, alloc.clone());
+    let mut flow_place = filled(body.places() as usize, alloc);
     for i in 0..body.places() {
         let row = body.place(bd::Place(i));
         let p = match (row.parent, row.proj) {
@@ -270,10 +270,10 @@ pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Pro
     }
 
     // Blocks: every normal block in id order, so the body's entry is the flow's.
-    let mut flow_block = filled(body.blocks() as usize, alloc.clone());
-    let mut body_block = Vec::new_in(alloc.clone());
-    let mut left_out = Vec::new_in(alloc.clone());
-    let mut cleanup = Vec::with_capacity_in(body.blocks() as usize, alloc.clone());
+    let mut flow_block = filled(body.blocks() as usize, alloc);
+    let mut body_block = Vec::new_in(alloc);
+    let mut left_out = Vec::new_in(alloc);
+    let mut cleanup = Vec::with_capacity_in(body.blocks() as usize, alloc);
     for x in 0..body.blocks() {
         let kind = body.block(bd::Block(x)).kind;
         cleanup.push(kind == BlockKind::Cleanup);
@@ -287,8 +287,8 @@ pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Pro
     }
 
     // Loans: the flow numbers them as the borrows are pushed, which is row order.
-    let mut flow_loan = filled(body.loans() as usize, alloc.clone());
-    let mut body_loan = Vec::new_in(alloc.clone());
+    let mut flow_loan = filled(body.loans() as usize, alloc);
+    let mut body_loan = Vec::new_in(alloc);
     for s in 0..body.stmts() {
         if cleanup[body.block_of(bd::Stmt(s)).index()] {
             continue;
@@ -304,7 +304,7 @@ pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Pro
         }
     }
 
-    let mut subs = Vec::new_in(alloc.clone());
+    let mut subs = Vec::new_in(alloc);
     subs.extend(body.subsets());
     let mut e = Emit {
         body,
@@ -313,14 +313,14 @@ pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Pro
         flow_place,
         flow_block,
         flow_loan,
-        flow_stmt: filled(body.stmts() as usize, alloc.clone()),
-        body_stmt: Vec::new_in(alloc.clone()),
-        ops: Vec::new_in(alloc.clone()),
-        targets: Vec::new_in(alloc.clone()),
+        flow_stmt: filled(body.stmts() as usize, alloc),
+        body_stmt: Vec::new_in(alloc),
+        ops: Vec::new_in(alloc),
+        targets: Vec::new_in(alloc),
         subs,
         sub_at: 0,
         scratch: None,
-        drops: Vec::new_in(alloc.clone()),
+        drops: Vec::new_in(alloc),
     };
     let n = body.stmts();
     let mut s = 0;
@@ -366,7 +366,7 @@ pub fn project<A: Allocator + Clone>(body: Verified<'_>, alloc: A) -> Result<Pro
 }
 
 /// The projection's state: the builder and the maps as they fill.
-struct Emit<'v, A: Allocator + Clone> {
+struct Emit<'v, A: Allocator + Copy> {
     body: Verified<'v>,
     b: FlowBuilder<A>,
     /// Per body block: whether it is a cleanup block (left out).
@@ -385,7 +385,7 @@ struct Emit<'v, A: Allocator + Clone> {
     drops: Vec<(bd::Stmt, fl::Stmt, fl::Place), A>,
 }
 
-impl<A: Allocator + Clone> Emit<'_, A> {
+impl<A: Allocator + Copy> Emit<'_, A> {
     fn place(&self, p: bd::Place) -> fl::Place {
         fl::Place(self.flow_place[p.index()])
     }

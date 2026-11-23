@@ -128,15 +128,15 @@ pub(super) fn each(view: &View<'_>, inst: usize, mut f: impl FnMut(Item)) {
 }
 
 /// `len` copies of `item` in `alloc`.
-pub(super) fn filled<T: Clone, A: Allocator + Clone>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
-    Vec::from_elem_in(item, len, alloc.clone())
+pub(super) fn filled<T: Clone, A: Allocator + Copy>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
+    Vec::from_elem_in(item, len, *alloc)
 }
 
 /// Per block, whether an edge path from the entry reaches it; a terminator with a `jump`
 /// choice (`jump[inst] != NONE`) has only that target as an edge. A work list.
-pub(super) fn reachable<A: Allocator + Clone>(view: &View<'_>, jump: &[u32], alloc: &A) -> Vec<bool, A> {
+pub(super) fn reachable<A: Allocator + Copy>(view: &View<'_>, jump: &[u32], alloc: &A) -> Vec<bool, A> {
     let mut seen = filled(view.blocks(), false, alloc);
-    let mut work: Vec<u32, A> = Vec::with_capacity_in(view.blocks(), alloc.clone());
+    let mut work: Vec<u32, A> = Vec::with_capacity_in(view.blocks(), *alloc);
     seen[0] = true;
     work.push(0);
     while let Some(b) = work.pop() {
@@ -171,7 +171,7 @@ impl<A: Allocator> Incoming<A> {
     }
 }
 
-pub(super) fn incoming<A: Allocator + Clone>(
+pub(super) fn incoming<A: Allocator + Copy>(
     view: &View<'_>,
     reached: &[bool],
     jump: &[u32],
@@ -216,7 +216,7 @@ pub(super) fn incoming<A: Allocator + Clone>(
 }
 
 /// Per instruction, its block.
-pub(super) fn owners<A: Allocator + Clone>(view: &View<'_>, alloc: &A) -> Vec<u32, A> {
+pub(super) fn owners<A: Allocator + Copy>(view: &View<'_>, alloc: &A) -> Vec<u32, A> {
     let mut owner = filled(view.len(), NONE, alloc);
     for b in 0..view.blocks() {
         for inst in view.block(Block(b as u32)) {
@@ -265,16 +265,19 @@ pub(super) struct Edit<A: Allocator> {
     /// Per block: [`NONE`], or the sole-predecessor block `B` coalesced into this block across
     /// its `jump` terminator (dropping this block's `jump` and `B`'s parameters).
     pub(super) merge_next: Vec<u32, A>,
+    /// Per instruction: `Some([a, b, c])` when an `fadd(fmul(a, b), c)` with `Flags::CONTRACT`
+    /// is fused into a single hardware `Op::Fma(a, b, c)`.
+    pub(super) fma_fuse: Vec<Option<[u32; 3]>, A>,
 }
 
 /// The function `view` with `edit` made, in `alloc`, verified.
-pub(super) fn rebuild<A: Allocator + Clone>(view: View<'_>, edit: &Edit<A>, alloc: A) -> Result<Func<A>, SimplifyError> {
+pub(super) fn rebuild<A: Allocator + Copy>(view: View<'_>, edit: &Edit<A>, alloc: A) -> Result<Func<A>, SimplifyError> {
     if !edit.block_kept[0] {
         return Err(SimplifyError::Refused { inst: 0, what: "a rewrite without the entry block" });
     }
     let blocks = view.blocks();
     let len = view.len();
-    let mut func = view.to_func_in(alloc.clone());
+    let mut func = view.to_func_in(alloc);
     func.ops.clear();
     func.flags.clear();
     func.tys.clear();
@@ -319,7 +322,7 @@ pub(super) fn rebuild<A: Allocator + Clone>(view: View<'_>, edit: &Edit<A>, allo
 
     // Coalescing path: merge `A -> Jump(B, args)` chains into single blocks.
     let mut merged_into_pred = filled(blocks, false, &alloc);
-    let mut resolved_stands = Vec::with_capacity_in(len, alloc.clone());
+    let mut resolved_stands = Vec::with_capacity_in(len, alloc);
     resolved_stands.extend_from_slice(&edit.stands);
 
     for a in 0..blocks {
@@ -420,7 +423,7 @@ pub(super) fn rebuild<A: Allocator + Clone>(view: View<'_>, edit: &Edit<A>, allo
 }
 
 /// The output being made by [`rebuild`].
-struct Out<'v, 'e, A: Allocator + Clone> {
+struct Out<'v, 'e, A: Allocator + Copy> {
     view: View<'v>,
     edit: &'e Edit<A>,
     stands: &'e [u32],
@@ -429,7 +432,7 @@ struct Out<'v, 'e, A: Allocator + Clone> {
     func: Func<A>,
 }
 
-impl<A: Allocator + Clone> Out<'_, '_, A> {
+impl<A: Allocator + Copy> Out<'_, '_, A> {
     fn raw(&mut self, op: Op, flags: u8, ty: u16, data: u32, attrs: u32, loc: u32) {
         self.func.ops.push(op as u8);
         self.func.flags.push(flags);
@@ -563,9 +566,25 @@ impl<A: Allocator + Clone> Out<'_, '_, A> {
         Ok(())
     }
 
-    /// An integer constant `value` of scalar type `ty`, as [`crate::Builder::iconst`] encodes
-    /// one: in `data` when it fits `Op::Iconst`'s rule, else `iconst_wide`.
+    /// A scalar integer or float constant `value` of type `ty`, encoded as [`crate::Builder::iconst`]
+    /// / [`crate::Builder::fconst`] encode one.
     fn constant(&mut self, ty: Ty, value: u128, loc: u32) {
+        if ty.is_float() {
+            let bits = ty.bits(self.view.head.ptr_bits);
+            let le = value.to_le_bytes();
+            let word0 = u32::from_le_bytes([le[0], le[1], le[2], le[3]]);
+            if bits <= 32 {
+                return self.raw(Op::Fconst, 0, ty.0, word0, 0, loc);
+            }
+            let start = u32::try_from(self.func.extra.len()).unwrap_or(u32::MAX);
+            let words = usize::try_from(ty.const_words()).unwrap_or(0);
+            for chunk in le.chunks_exact(4).take(words) {
+                if let [b0, b1, b2, b3] = *chunk {
+                    self.func.extra.push(u32::from_le_bytes([b0, b1, b2, b3]));
+                }
+            }
+            return self.raw(Op::FconstWide, 0, ty.0, start, 0, loc);
+        }
         let bits = ty.bits(self.view.head.ptr_bits);
         if bits <= 32 {
             return self.raw(Op::Iconst, 0, ty.0, value as u32, 0, loc);
@@ -589,6 +608,19 @@ impl<A: Allocator + Clone> Out<'_, '_, A> {
         let (flags, ty, attrs, loc) = (view.flags[inst], view.tys[inst], view.attrs[inst], view.locs[inst]);
         if let Some(value) = self.edit.constant[inst] {
             self.constant(Ty(ty), value, loc);
+            return Ok(());
+        }
+        if let Some(&Some([a, b, c])) = self.edit.fma_fuse.get(inst) {
+            let va = self.value(inst, a)?;
+            let vb = self.value(inst, b)?;
+            let vc = self.value(inst, c)?;
+            let start = u32::try_from(self.func.extra.len()).unwrap_or(u32::MAX);
+            self.func.extra.push(va);
+            self.func.extra.push(vb);
+            self.func.extra.push(vc);
+            // `Flags::CONTRACT` has been consumed by emitting `Op::Fma`; dropping a promise refines the IR.
+            let fma_flags = Flags(flags).without(Flags::CONTRACT).bits();
+            self.raw(Op::Fma, fma_flags, ty, start, 0, loc);
             return Ok(());
         }
         let target_ref = self.edit.devirt[inst];
@@ -765,7 +797,7 @@ fn trivial(view: &View<'_>, inst: usize) -> u32 {
 
 /// The function `view` without its dead code and trivial branches, in `alloc`, verified:
 /// the module's [`dead`] pass.
-pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
+pub fn dead<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
     if view.blocks() == 0 {
         return Err(SimplifyError::Refused { inst: 0, what: "a function with no blocks" });
     }
@@ -785,7 +817,7 @@ pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, S
     let owner = owners(&view, &alloc);
     let mut live = filled(len, false, &alloc);
     let mut live_count = 0usize;
-    let mut work: Vec<u32, A> = Vec::with_capacity_in(len, alloc.clone());
+    let mut work: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     let mark = |live: &mut Vec<bool, A>, work: &mut Vec<u32, A>, live_count: &mut usize, value: u32| {
         if !live[value as usize] {
             live[value as usize] = true;
@@ -855,7 +887,7 @@ pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, S
         verify(view).map_err(SimplifyError::Verify)?;
         return Ok(view.to_func_in(alloc));
     }
-    let mut stands = Vec::with_capacity_in(len, alloc.clone());
+    let mut stands = Vec::with_capacity_in(len, alloc);
     for value in 0..len as u32 {
         stands.push(value);
     }
@@ -867,13 +899,14 @@ pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, S
         jump,
         devirt: filled(len, NONE, &alloc),
         merge_next,
+        fma_fuse: filled(len, None, &alloc),
     };
     rebuild(view, &edit, alloc)
 }
 
 /// Coalesces single-predecessor `jump` chains (`A -> Jump(B, args)` when `B` has `A` as its
 /// sole reached predecessor) without altering any live computation, in `alloc`, verified.
-pub fn coalesce_cfg<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
+pub fn coalesce_cfg<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
     if view.blocks() == 0 {
         return Err(SimplifyError::Refused { inst: 0, what: "a function with no blocks" });
     }
@@ -909,7 +942,7 @@ pub fn coalesce_cfg<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Fu
         verify(view).map_err(SimplifyError::Verify)?;
         return Ok(view.to_func_in(alloc));
     }
-    let mut stands = Vec::with_capacity_in(len, alloc.clone());
+    let mut stands = Vec::with_capacity_in(len, alloc);
     for value in 0..len as u32 {
         stands.push(value);
     }
@@ -921,6 +954,7 @@ pub fn coalesce_cfg<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Fu
         jump: no_jumps,
         devirt: filled(len, NONE, &alloc),
         merge_next,
+        fma_fuse: filled(len, None, &alloc),
     };
     rebuild(view, &edit, alloc)
 }

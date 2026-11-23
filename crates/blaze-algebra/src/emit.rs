@@ -7,16 +7,116 @@ use core::fmt::Write as _;
 
 use blaze_own::{String as OwnString, Vec as OwnVec};
 
-use crate::{AlgebraError, ExprGraph, ExprId, Op};
+use crate::{AlgebraError, ExprGraph, ExprId, Op, u32_to_usize, usize_to_u32};
+
+enum FmtTask {
+    Node(ExprId, u8),
+    Str(&'static str),
+}
 
 /// Format `root` as a clean human-readable infix formula with minimal parentheses.
-pub fn format_expr<A: Allocator + Clone>(
+pub fn format_expr<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     root: ExprId,
 ) -> Result<OwnString<A>, AlgebraError> {
     let mut out = OwnString::new_in(g.alloc());
-    fmt_rec(g, root, 0, &mut out)?;
+    let mut stack: OwnVec<FmtTask, A> = OwnVec::new_in(g.alloc());
+    stack.push(FmtTask::Node(root, 0));
+    while let Some(task) = stack.pop() {
+        match task {
+            FmtTask::Str(s) => out.push_str(s),
+            FmtTask::Node(id, parent_prec) => {
+                let op = g.node(id)?;
+                let prec = op_prec(op);
+                let need_parens = prec < parent_prec;
+                if need_parens {
+                    out.push('(');
+                    stack.push(FmtTask::Str(")"));
+                }
+                match op {
+                    Op::Const(bits) => {
+                        let v = f64::from_bits(bits);
+                        let _ = write!(out, "{v}");
+                    }
+                    Op::Var(vid) => {
+                        if let Some(name) = g.var_name(vid) {
+                            out.push_str(name);
+                        } else {
+                            let _ = write!(out, "v{}", vid.0);
+                        }
+                    }
+                    Op::Neg(a) => {
+                        out.push('-');
+                        stack.push(FmtTask::Node(a, 3));
+                    }
+                    Op::Add(a, b) => {
+                        stack.push(FmtTask::Node(b, 1));
+                        stack.push(FmtTask::Str(" + "));
+                        stack.push(FmtTask::Node(a, 1));
+                    }
+                    Op::Sub(a, b) => {
+                        stack.push(FmtTask::Node(b, 2));
+                        stack.push(FmtTask::Str(" - "));
+                        stack.push(FmtTask::Node(a, 1));
+                    }
+                    Op::Mul(a, b) => {
+                        stack.push(FmtTask::Node(b, 2));
+                        stack.push(FmtTask::Str(" * "));
+                        stack.push(FmtTask::Node(a, 2));
+                    }
+                    Op::Div(a, b) => {
+                        stack.push(FmtTask::Node(b, 3));
+                        stack.push(FmtTask::Str(" / "));
+                        stack.push(FmtTask::Node(a, 2));
+                    }
+                    Op::Pow(a, b) => {
+                        stack.push(FmtTask::Node(b, 4));
+                        stack.push(FmtTask::Str("^"));
+                        stack.push(FmtTask::Node(a, 4));
+                    }
+                    Op::Sin(a) => push_call(&mut out, &mut stack, "sin", a),
+                    Op::Cos(a) => push_call(&mut out, &mut stack, "cos", a),
+                    Op::Tan(a) => push_call(&mut out, &mut stack, "tan", a),
+                    Op::Exp(a) => push_call(&mut out, &mut stack, "exp", a),
+                    Op::Ln(a) => push_call(&mut out, &mut stack, "ln", a),
+                    Op::Sqrt(a) => push_call(&mut out, &mut stack, "sqrt", a),
+                    Op::Tanh(a) => push_call(&mut out, &mut stack, "tanh", a),
+                    Op::Abs(a) => push_call(&mut out, &mut stack, "abs", a),
+                    Op::Select(c, t, e) => {
+                        out.push_str("select(");
+                        stack.push(FmtTask::Str(")"));
+                        stack.push(FmtTask::Node(e, 0));
+                        stack.push(FmtTask::Str(", "));
+                        stack.push(FmtTask::Node(t, 0));
+                        stack.push(FmtTask::Str(", "));
+                        stack.push(FmtTask::Node(c, 0));
+                    }
+                    Op::Fma(a, b, c) => {
+                        out.push_str("fma(");
+                        stack.push(FmtTask::Str(")"));
+                        stack.push(FmtTask::Node(c, 0));
+                        stack.push(FmtTask::Str(", "));
+                        stack.push(FmtTask::Node(b, 0));
+                        stack.push(FmtTask::Str(", "));
+                        stack.push(FmtTask::Node(a, 0));
+                    }
+                }
+            }
+        }
+    }
     Ok(out)
+}
+
+fn push_call<A: Allocator + Copy>(
+    out: &mut OwnString<A>,
+    stack: &mut OwnVec<FmtTask, A>,
+    name: &str,
+    arg: ExprId,
+) {
+    out.push_str(name);
+    out.push('(');
+    stack.push(FmtTask::Str(")"));
+    stack.push(FmtTask::Node(arg, 0));
 }
 
 fn op_prec(op: Op) -> u8 {
@@ -30,7 +130,9 @@ fn op_prec(op: Op) -> u8 {
         | Op::Ln(_)
         | Op::Sqrt(_)
         | Op::Tanh(_)
-        | Op::Abs(_) => 5,
+        | Op::Abs(_)
+        | Op::Select(_, _, _)
+        | Op::Fma(_, _, _) => 5,
         Op::Pow(_, _) => 4,
         Op::Neg(_) => 3,
         Op::Mul(_, _) | Op::Div(_, _) => 2,
@@ -38,90 +140,9 @@ fn op_prec(op: Op) -> u8 {
     }
 }
 
-fn fmt_rec<A: Allocator + Clone>(
-    g: &ExprGraph<A>,
-    id: ExprId,
-    parent_prec: u8,
-    out: &mut OwnString<A>,
-) -> Result<(), AlgebraError> {
-    let op = g.node(id)?;
-    let prec = op_prec(op);
-    let need_parens = prec < parent_prec;
-    if need_parens {
-        out.push('(');
-    }
-    match op {
-        Op::Const(bits) => {
-            let v = f64::from_bits(bits);
-            let _ = write!(out, "{v}");
-        }
-        Op::Var(vid) => {
-            if let Some(name) = g.var_name(vid) {
-                out.push_str(name);
-            } else {
-                let _ = write!(out, "v{}", vid.0);
-            }
-        }
-        Op::Neg(a) => {
-            out.push('-');
-            fmt_rec(g, a, 3, out)?;
-        }
-        Op::Add(a, b) => {
-            fmt_rec(g, a, 1, out)?;
-            out.push_str(" + ");
-            fmt_rec(g, b, 1, out)?;
-        }
-        Op::Sub(a, b) => {
-            fmt_rec(g, a, 1, out)?;
-            out.push_str(" - ");
-            fmt_rec(g, b, 2, out)?;
-        }
-        Op::Mul(a, b) => {
-            fmt_rec(g, a, 2, out)?;
-            out.push_str(" * ");
-            fmt_rec(g, b, 2, out)?;
-        }
-        Op::Div(a, b) => {
-            fmt_rec(g, a, 2, out)?;
-            out.push_str(" / ");
-            fmt_rec(g, b, 3, out)?;
-        }
-        Op::Pow(a, b) => {
-            fmt_rec(g, a, 4, out)?;
-            out.push('^');
-            fmt_rec(g, b, 4, out)?;
-        }
-        Op::Sin(a) => fmt_call(g, "sin", a, out)?,
-        Op::Cos(a) => fmt_call(g, "cos", a, out)?,
-        Op::Tan(a) => fmt_call(g, "tan", a, out)?,
-        Op::Exp(a) => fmt_call(g, "exp", a, out)?,
-        Op::Ln(a) => fmt_call(g, "ln", a, out)?,
-        Op::Sqrt(a) => fmt_call(g, "sqrt", a, out)?,
-        Op::Tanh(a) => fmt_call(g, "tanh", a, out)?,
-        Op::Abs(a) => fmt_call(g, "abs", a, out)?,
-    }
-    if need_parens {
-        out.push(')');
-    }
-    Ok(())
-}
-
-fn fmt_call<A: Allocator + Clone>(
-    g: &ExprGraph<A>,
-    name: &str,
-    arg: ExprId,
-    out: &mut OwnString<A>,
-) -> Result<(), AlgebraError> {
-    out.push_str(name);
-    out.push('(');
-    fmt_rec(g, arg, 0, out)?;
-    out.push(')');
-    Ok(())
-}
-
 /// Emit a zero-allocation, CSE-shared SSA Rust function computing `root` using deterministic
 /// `blaze_math` calls. Every shared DAG node is computed once into a `let tN: f64 = ...;` local.
-pub fn emit_rust_fn<A: Allocator + Clone>(
+pub fn emit_rust_fn<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     fn_name: &str,
     root: ExprId,
@@ -132,7 +153,7 @@ pub fn emit_rust_fn<A: Allocator + Clone>(
 /// Emit a zero-allocation, multi-output CSE-shared SSA Rust function returning `[f64; K]`
 /// (for example `[f, df/dx, df/dy]` or a full Jacobian), sharing every common subexpression
 /// across all outputs in one topological SSA schedule!
-pub fn emit_rust_multi_fn<A: Allocator + Clone>(
+pub fn emit_rust_multi_fn<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     fn_name: &str,
     roots: &[ExprId],
@@ -140,7 +161,7 @@ pub fn emit_rust_multi_fn<A: Allocator + Clone>(
     emit_ssa_body(g, fn_name, roots, true)
 }
 
-fn emit_ssa_body<A: Allocator + Clone>(
+fn emit_ssa_body<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     fn_name: &str,
     roots: &[ExprId],
@@ -148,7 +169,7 @@ fn emit_ssa_body<A: Allocator + Clone>(
 ) -> Result<OwnString<A>, AlgebraError> {
     let n = g.len();
     for &root in roots {
-        if (root.0 as usize) >= n {
+        if u32_to_usize(root.0) >= n {
             return Err(AlgebraError::InvalidExpr { expr: root, node_count: n });
         }
     }
@@ -169,7 +190,7 @@ fn emit_ssa_body<A: Allocator + Clone>(
         if i > 0 {
             out.push_str(", ");
         }
-        let vname = g.var_name(crate::VarId(i as u32)).unwrap_or("x");
+        let vname = g.var_name(crate::VarId(usize_to_u32(i))).unwrap_or("x");
         let _ = write!(out, "{vname}: f64");
     }
     if as_array {
@@ -232,6 +253,12 @@ fn emit_ssa_body<A: Allocator + Clone>(
             Op::Abs(a) => {
                 let _ = write!(out, "blaze_math::abs(t{})", a.0);
             }
+            Op::Select(c, t, e) => {
+                let _ = write!(out, "if t{} > 0.0_f64 {{ t{} }} else {{ t{} }}", c.0, t.0, e.0);
+            }
+            Op::Fma(a, b, c) => {
+                let _ = write!(out, "blaze_math::mul_add(t{}, t{}, t{})", a.0, b.0, c.0);
+            }
         }
         out.push_str(";\n");
     }
@@ -244,40 +271,55 @@ fn emit_ssa_body<A: Allocator + Clone>(
             let _ = write!(out, "t{}", root.0);
         }
         out.push_str("]\n");
-    } else {
-        let _ = writeln!(out, "    t{}", roots[0].0);
+    } else if let Some(&first) = roots.first() {
+        let _ = writeln!(out, "    t{}", first.0);
     }
     out.push_str("}\n");
     Ok(out)
 }
 
-fn collect_postorder<A: Allocator + Clone>(
+fn collect_postorder<A: Allocator + Copy>(
     g: &ExprGraph<A>,
-    id: ExprId,
+    root: ExprId,
     visited: &mut OwnVec<bool, A>,
     order: &mut OwnVec<ExprId, A>,
 ) -> Result<(), AlgebraError> {
-    let idx = id.0 as usize;
-    if visited[idx] {
-        return Ok(());
-    }
-    visited[idx] = true;
-    match g.node(id)? {
-        Op::Const(_) | Op::Var(_) => {}
-        Op::Neg(a)
-        | Op::Sin(a)
-        | Op::Cos(a)
-        | Op::Tan(a)
-        | Op::Exp(a)
-        | Op::Ln(a)
-        | Op::Sqrt(a)
-        | Op::Tanh(a)
-        | Op::Abs(a) => collect_postorder(g, a, visited, order)?,
-        Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) | Op::Pow(a, b) => {
-            collect_postorder(g, a, visited, order)?;
-            collect_postorder(g, b, visited, order)?;
+    let mut stack: OwnVec<(ExprId, bool), A> = OwnVec::new_in(g.alloc());
+    stack.push((root, false));
+    while let Some((id, expanded)) = stack.pop() {
+        let idx = u32_to_usize(id.0);
+        if expanded {
+            order.push(id);
+            continue;
+        }
+        if visited.get(idx).copied().unwrap_or(true) {
+            continue;
+        }
+        if let Some(slot) = visited.get_mut(idx) {
+            *slot = true;
+        }
+        stack.push((id, true));
+        match g.node(id)? {
+            Op::Const(_) | Op::Var(_) => {}
+            Op::Neg(a)
+            | Op::Sin(a)
+            | Op::Cos(a)
+            | Op::Tan(a)
+            | Op::Exp(a)
+            | Op::Ln(a)
+            | Op::Sqrt(a)
+            | Op::Tanh(a)
+            | Op::Abs(a) => stack.push((a, false)),
+            Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) | Op::Pow(a, b) => {
+                stack.push((b, false));
+                stack.push((a, false));
+            }
+            Op::Select(c, t, e) | Op::Fma(c, t, e) => {
+                stack.push((e, false));
+                stack.push((t, false));
+                stack.push((c, false));
+            }
         }
     }
-    order.push(id);
     Ok(())
 }

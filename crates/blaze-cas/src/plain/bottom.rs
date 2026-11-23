@@ -98,6 +98,7 @@ use blaze_core::{
     wait::Deadline,
 };
 use blaze_ids::ContentId;
+use blaze_own::Share;
 
 /// The store's driver: [`OverDir`] or [`OverBlock`], over the driver beneath.
 pub trait Bottom: Driver + Sized {
@@ -399,7 +400,7 @@ enum Stage {
     SyncSlot,
 }
 
-struct Flip<A: Allocator + Clone> {
+struct Flip<A: Allocator + Copy> {
     generation: Generation,
     stage: Stage,
     waiters: Vec<(Tag, Done), A>,
@@ -415,7 +416,7 @@ pub struct HighWater {
 }
 
 /// The store's files as extents of one device file (the module's docs).
-pub struct OverBlock<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> {
+pub struct OverBlock<D: Driver, A: Allocator + Copy, P: Planted<BottomPlant>> {
     inner: D,
     alloc: A,
     plant: P,
@@ -451,7 +452,7 @@ pub struct OverBlock<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> {
     high: HighWater,
 }
 
-impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P> {
+impl<D: Driver, A: Allocator + Copy, P: Planted<BottomPlant>> OverBlock<D, A, P> {
     /// The bottom over `device` (a file of `inner`'s, made at `limits.device_bytes` if it is
     /// not there), its lock taken, its head read; what it keeps in `alloc`.
     pub fn open(inner: D, device: FileName, limits: Limits, alloc: A, plant: P) -> Result<OverBlock<D, A, P>, BottomError> {
@@ -460,17 +461,17 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
             plant,
             limits,
             device,
-            files: Vec::new_in(alloc.clone()),
-            dirs: Vec::new_in(alloc.clone()),
-            reserved: Vec::new_in(alloc.clone()),
-            dropped: Vec::new_in(alloc.clone()),
+            files: Vec::new_in(alloc),
+            dirs: Vec::new_in(alloc),
+            reserved: Vec::new_in(alloc),
+            dropped: Vec::new_in(alloc),
             durable: Generation::EMPTY,
             next: Generation::EMPTY.next(),
-            stale_free: Vec::new_in(alloc.clone()),
+            stale_free: Vec::new_in(alloc),
             trusted_free: None,
-            ops: Vec::new_in(alloc.clone()),
-            flips: Vec::new_in(alloc.clone()),
-            busy: Vec::new_in(alloc.clone()),
+            ops: Vec::new_in(alloc),
+            flips: Vec::new_in(alloc),
+            busy: Vec::new_in(alloc),
             parked: Vec::new(),
             out: Vec::new(),
             done: Vec::new(),
@@ -482,7 +483,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
             alloc,
         };
         // clone: a name, a refcount.
-        let device = it.device.clone();
+        let device = it.device.share();
         it.lock = it.tag();
         let lock = it.lock;
         match it.own(|file, _| Effect::Lock { file, mode: LockMode::Exclusive, tag: lock }, lock, "taking the device's lock")? {
@@ -580,14 +581,14 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
             other => IoError(format!("an unexpected completion: {other:?}")),
         };
         // clone: a name, a refcount.
-        BottomError::Inner { device: self.device.clone(), what, why }
+        BottomError::Inner { device: self.device.share(), what, why }
     }
 
     /// One effect of the bottom's own on the device, under `tag`, run to its completion: an
     /// open's and a close's, when nothing of the store's is in flight.
     fn own(&mut self, make: impl FnOnce(FileName, Tag) -> Effect, tag: Tag, what: &'static str) -> Result<Done, BottomError> {
         // clone: a name, a refcount.
-        self.out.push(make(self.device.clone(), tag));
+        self.out.push(make(self.device.share(), tag));
         self.inner.submit(&mut self.out);
         let mut since = self.inner.now();
         loop {
@@ -596,7 +597,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
                 since = self.inner.now();
             } else if stall.passed(self.inner.now()) {
                 // clone: a name, a refcount.
-                return Err(BottomError::Stalled { device: self.device.clone(), what });
+                return Err(BottomError::Stalled { device: self.device.share(), what });
             }
             if let Some(at) = self.done.iter().position(|c| c.tag == tag) {
                 return Ok(self.done.swap_remove(at).done);
@@ -666,7 +667,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
         let cap = bytes.max(self.limits.extent_floor).next_multiple_of(self.limits.align);
         if self.placed(file).is_none() && self.files.len() as u32 >= self.limits.files {
             // clone: names, refcounts.
-            return Err(BottomError::Files { device: self.device.clone(), file: file.clone(), most: self.limits.files });
+            return Err(BottomError::Files { device: self.device.share(), file: file.share(), most: self.limits.files });
         }
         let found = match &mut self.trusted_free {
             // The plant: the stored map trusted, nothing checked against the table.
@@ -687,18 +688,18 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
                 Ok(run)
             }
             // clone: names, refcounts.
-            None => Err(BottomError::Full { device: self.device.clone(), file: file.clone(), bytes: cap }),
+            None => Err(BottomError::Full { device: self.device.share(), file: file.share(), bytes: cap }),
         }
     }
 
     /// Every run no live, reserved or dropped extent covers, in order.
     fn free_runs(&self) -> Vec<Run, A> {
-        let mut used = Vec::with_capacity_in(self.files.len() + self.reserved.len() + self.dropped.len(), self.alloc.clone());
+        let mut used = Vec::with_capacity_in(self.files.len() + self.reserved.len() + self.dropped.len(), self.alloc);
         used.extend(self.files.iter().map(|it| it.run));
         used.extend(self.reserved.iter().copied());
         used.extend(self.dropped.iter().map(|it| it.run));
         used.sort_unstable_by_key(|it| it.at);
-        let mut free = Vec::new_in(self.alloc.clone());
+        let mut free = Vec::new_in(self.alloc);
         let mut at = self.limits.data_start();
         for run in used {
             if run.at > at {
@@ -735,7 +736,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
                 let now = self.free_runs();
                 core::mem::replace(&mut self.stale_free, now)
             }
-            false => Vec::new_in(self.alloc.clone()),
+            false => Vec::new_in(self.alloc),
         };
         for n in [self.files.len(), self.dirs.len(), free.len(), 0] {
             slot.extend_from_slice(&(n as u32).to_le_bytes());
@@ -756,7 +757,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
         self.high.table_bytes = self.high.table_bytes.max(slot.len() as u64);
         if slot.len() + DIGEST > size {
             // clone: a name, a refcount.
-            return Err(BottomError::TableFull { device: self.device.clone(), bytes: slot.len() as u64, super_bytes: self.limits.super_bytes });
+            return Err(BottomError::TableFull { device: self.device.share(), bytes: slot.len() as u64, super_bytes: self.limits.super_bytes });
         }
         slot.resize(size - DIGEST, 0);
         let digest = ContentId::of(DIGEST_DOMAIN, &slot);
@@ -767,7 +768,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
     /// A slot read back: `None` when it is not whole.
     fn decode(&self, slot: &[u8]) -> Option<Head<A>> {
         if slot.iter().all(|b| *b == 0) {
-            return Some(Head { generation: Generation::EMPTY, files: Vec::new_in(self.alloc.clone()), dirs: Vec::new_in(self.alloc.clone()), free: Vec::new_in(self.alloc.clone()) });
+            return Some(Head { generation: Generation::EMPTY, files: Vec::new_in(self.alloc), dirs: Vec::new_in(self.alloc), free: Vec::new_in(self.alloc) });
         }
         let body = slot.len().checked_sub(DIGEST)?;
         if ContentId::of(DIGEST_DOMAIN, &slot[..body]).0[..] != slot[body..] || slot[..8] != MAGIC {
@@ -779,9 +780,9 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
         r.u32()?;
         let mut head = Head {
             generation,
-            files: Vec::with_capacity_in(files as usize, self.alloc.clone()),
-            dirs: Vec::with_capacity_in(dirs as usize, self.alloc.clone()),
-            free: Vec::with_capacity_in(free as usize, self.alloc.clone()),
+            files: Vec::with_capacity_in(files as usize, self.alloc),
+            dirs: Vec::with_capacity_in(dirs as usize, self.alloc),
+            free: Vec::with_capacity_in(free as usize, self.alloc),
         };
         for _ in 0..files {
             let name = r.name()?;
@@ -916,10 +917,10 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
         let own = self.tag();
         if let Some(file) = &file {
             // clone: a name, a refcount.
-            self.busy.push(file.clone());
+            self.busy.push(file.share());
         }
         // clone: a name, a refcount.
-        self.out.push(make(self.device.clone(), own));
+        self.out.push(make(self.device.share(), own));
         self.ops.push(Op { own: own.0, outer, file, then });
     }
 
@@ -933,7 +934,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
                     whole.extend_from_slice(&bytes);
                     let change = Change::Placed { run, len: need };
                     // clone: a name, a refcount.
-                    self.inner_op(tag, Some(file.clone()), Then::Landed { file, change, done, flip: false }, |device, own| {
+                    self.inner_op(tag, Some(file.share()), Then::Landed { file, change, done, flip: false }, |device, own| {
                         Effect::WriteAt { file: device, at: run.within(0).get(), bytes: whole, tag: own }
                     });
                 }
@@ -952,7 +953,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
                 };
                 let change = Change::Grew { len: need.max(len) };
                 // clone: a name, a refcount.
-                self.inner_op(tag, Some(file.clone()), Then::Landed { file, change, done, flip: false }, |device, own| {
+                self.inner_op(tag, Some(file.share()), Then::Landed { file, change, done, flip: false }, |device, own| {
                     Effect::WriteAt { file: device, at: run.within(from).get(), bytes, tag: own }
                 });
             }
@@ -971,7 +972,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
                 Ok(run) => {
                     let change = Change::Placed { run, len };
                     // clone: a name, a refcount.
-                    self.inner_op(tag, Some(file.clone()), Then::Landed { file, change, done: Done::Truncated, flip: false }, |device, own| {
+                    self.inner_op(tag, Some(file.share()), Then::Landed { file, change, done: Done::Truncated, flip: false }, |device, own| {
                         Effect::WriteAt { file: device, at: run.within(0).get(), bytes: vec![0u8; len as usize], tag: own }
                     });
                 }
@@ -986,7 +987,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
             Some((run, had)) if len <= run.cap => {
                 let change = Change::Grew { len };
                 // clone: a name, a refcount.
-                self.inner_op(tag, Some(file.clone()), Then::Landed { file, change, done: Done::Truncated, flip: false }, |device, own| {
+                self.inner_op(tag, Some(file.share()), Then::Landed { file, change, done: Done::Truncated, flip: false }, |device, own| {
                     Effect::WriteAt { file: device, at: run.within(had).get(), bytes: vec![0u8; (len - had) as usize], tag: own }
                 });
             }
@@ -1000,7 +1001,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
             Ok(run) => {
                 let change = Change::Placed { run, len };
                 // clone: a name, a refcount.
-                self.inner_op(tag, Some(file.clone()), Then::Landed { file, change, done: Done::Written, flip: durable }, |device, own| {
+                self.inner_op(tag, Some(file.share()), Then::Landed { file, change, done: Done::Written, flip: durable }, |device, own| {
                     Effect::WriteAt { file: device, at: run.within(0).get(), bytes, tag: own }
                 });
             }
@@ -1018,7 +1019,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
         match self.alloc(&file, need.max(2 * run.cap)) {
             Ok(to) => {
                 // clone: a name, a refcount.
-                self.inner_op(tag, Some(file.clone()), Then::Moving { file, to, edit, done, flip: false }, |device, own| {
+                self.inner_op(tag, Some(file.share()), Then::Moving { file, to, edit, done, flip: false }, |device, own| {
                     Effect::Read { file: device, at: run.within(0).get(), len: len as usize, tag: own }
                 });
             }
@@ -1064,13 +1065,13 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
         let mut listed: Vec<(FileName, Meta)> = Vec::new();
         for it in self.dirs.iter().filter(|it| under(it.as_str())) {
             // clone: a name, a refcount.
-            listed.push((it.clone(), Meta { len: 0, dir: true, modified_ns: 0, changed_ns: 0, ino: 0, dev: 0 }));
+            listed.push((it.share(), Meta { len: 0, dir: true, modified_ns: 0, changed_ns: 0, ino: 0, dev: 0 }));
         }
         for it in self.files.iter().filter(|it| under(it.name.as_str())) {
             let ino = it.run.at.get() / self.limits.align + 1;
             let meta = Meta { len: it.len, dir: false, modified_ns: it.modified_ns, changed_ns: it.modified_ns, ino, dev: 0 };
             // clone: a name, a refcount.
-            listed.push((it.name.clone(), meta));
+            listed.push((it.name.share(), meta));
         }
         listed.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         self.answer(tag, Done::Listed(listed));
@@ -1091,7 +1092,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
             last.waiters.push((tag, done));
             return;
         }
-        let mut waiters = Vec::new_in(self.alloc.clone());
+        let mut waiters = Vec::new_in(self.alloc);
         waiters.push((tag, done));
         // Its generation is the next one free when it starts, not now.
         self.flips.push(Flip { generation: Generation::EMPTY, stage: Stage::Queued, waiters });
@@ -1108,7 +1109,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
         self.mark();
         let own = self.tag();
         // clone: a name, a refcount.
-        self.out.push(Effect::Sync { file: self.device.clone(), tag: own });
+        self.out.push(Effect::Sync { file: self.device.share(), tag: own });
         self.ops.push(Op { own: own.0, outer: Tag(0), file: None, then: Then::Flip });
     }
 
@@ -1142,7 +1143,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
                     self.set_stage(Stage::Slot);
                     let own = self.tag();
                     // clone: a name, a refcount.
-                    self.out.push(Effect::WriteAt { file: self.device.clone(), at, bytes, tag: own });
+                    self.out.push(Effect::WriteAt { file: self.device.share(), at, bytes, tag: own });
                     self.ops.push(Op { own: own.0, outer: Tag(0), file: None, then: Then::Flip });
                 }
                 // alloc: an error's message.
@@ -1172,7 +1173,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
     fn flip_sync(&mut self) {
         let own = self.tag();
         // clone: a name, a refcount.
-        self.out.push(Effect::Sync { file: self.device.clone(), tag: own });
+        self.out.push(Effect::Sync { file: self.device.share(), tag: own });
         self.ops.push(Op { own: own.0, outer: Tag(0), file: None, then: Then::Flip });
     }
 
@@ -1255,7 +1256,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
                     };
                     let change = Change::Placed { run: to, len };
                     // clone: a name, a refcount.
-                    self.inner_op(op.outer, Some(file.clone()), Then::Landed { file, change, done: then, flip }, |device, own| {
+                    self.inner_op(op.outer, Some(file.share()), Then::Landed { file, change, done: then, flip }, |device, own| {
                         Effect::WriteAt { file: device, at: to.within(0).get(), bytes, tag: own }
                     });
                 }
@@ -1279,7 +1280,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> OverBlock<D, A, P
     }
 }
 
-impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> Driver for OverBlock<D, A, P> {
+impl<D: Driver, A: Allocator + Copy, P: Planted<BottomPlant>> Driver for OverBlock<D, A, P> {
     fn submit(&mut self, effects: &mut Vec<Effect>) {
         for effect in effects.drain(..) {
             self.pending += 1;
@@ -1339,7 +1340,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> Driver for OverBl
     }
 }
 
-impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> Bottom for OverBlock<D, A, P> {
+impl<D: Driver, A: Allocator + Copy, P: Planted<BottomPlant>> Bottom for OverBlock<D, A, P> {
     type Inner = D;
 
     fn into_inner(self) -> D {
@@ -1347,7 +1348,7 @@ impl<D: Driver, A: Allocator + Clone, P: Planted<BottomPlant>> Bottom for OverBl
     }
 }
 
-struct Head<A: Allocator + Clone> {
+struct Head<A: Allocator + Copy> {
     generation: Generation,
     files: Vec<Placed, A>,
     dirs: Vec<FileName, A>,

@@ -2538,7 +2538,7 @@ impl<FieldIdx: Idx> VariantLayout<FieldIdx> {
     }
 
     pub fn has_fields(&self) -> bool {
-        self.field_offsets.len() > 0
+        !self.field_offsets.is_empty()
     }
 
     /// blaze: the variant's fields by increasing offset.

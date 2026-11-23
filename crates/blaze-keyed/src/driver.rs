@@ -843,7 +843,7 @@ struct OldChunk<A: Allocator> {
     posting_at: Vec<u32, A>,
 }
 
-impl<A: Allocator + Clone> OldChunk<A> {
+impl<A: Allocator + Copy> OldChunk<A> {
     fn entry(&self, item: &StableId) -> Option<usize> {
         self.entries.binary_search_by(|entry| entry.item.cmp(&item.0)).ok()
     }
@@ -1098,7 +1098,7 @@ fn copy_in<T: Copy, A: Allocator>(from: &[T], alloc: A) -> Vec<T, A> {
 ///
 /// Programs (`W`, [`crate::program`]): once every unit is complete, each program's plans and
 /// code are found or made as its walker asks, and one link step is given the rows that moved.
-pub struct Driver<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker = NoWalk> {
+pub struct Driver<'s, 'm, M: Memo, X: Executor, A: Allocator + Copy, W: Walker = NoWalk> {
     walker: W,
     progs: program::Progs<A>,
     /// Every failure, with its place ([`Driver::failures`]); the first in that order is the
@@ -1154,7 +1154,7 @@ pub struct Driver<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker 
     places_out: u32,
 }
 
-impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A, NoWalk> {
+impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Copy> Driver<'s, 'm, M, X, A, NoWalk> {
     /// A driver of one request in `snap` that builds no program, over memo `M` and executor
     /// `X`, both static policies; at most `executor.capacity()` tasks run at once.
     /// `certificate_lookup`: the certificate's lookup made before the driver, which it takes
@@ -1188,7 +1188,7 @@ pub fn certificate_with(plan: &Plan<'_>, programs: &[ProgramPlan]) -> Key<Certif
     Key::from_id(hasher.finish())
 }
 
-impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, 'm, M, X, A, W> {
+impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Copy, W: Walker> Driver<'s, 'm, M, X, A, W> {
     /// A driver of one request in `snap` that builds the units of `plan` and then each of
     /// `programs`, walked by `walker`. `certificate_lookup`: the certificate's lookup made
     /// before the driver; it must be finished and of this request's key ([`certificate_with`]),
@@ -1217,12 +1217,12 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             Some(early) => early,
         };
         let count = plan.units.len();
-        let mut units = Vec::with_capacity_in(count, alloc.clone());
-        let mut dependents = Vec::with_capacity_in(count, alloc.clone());
+        let mut units = Vec::with_capacity_in(count, alloc);
+        let mut dependents = Vec::with_capacity_in(count, alloc);
         for _ in 0..count {
-            dependents.push(Vec::new_in(alloc.clone()));
+            dependents.push(Vec::new_in(alloc));
         }
-        let mut owners = Vec::with_capacity_in(count, alloc.clone());
+        let mut owners = Vec::with_capacity_in(count, alloc);
         for (index, unit) in plan.units.iter().enumerate() {
             if !unit.owner.is_crate() {
                 return Err(PlanError::Owner { unit: index as u32 });
@@ -1237,47 +1237,47 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             units.push(Unit {
                 state: UnitState::Waiting,
                 waiting: unit.deps.len() as u32,
-                deps: copy_in(unit.deps, alloc.clone()),
+                deps: copy_in(unit.deps, alloc),
                 owner: unit.owner,
                 namespace: unit.namespace,
                 bodies: unit.bodies,
                 plan_last: unit.last,
                 text: Key::from_id(ZERO),
                 surface_key: Key::from_id(ZERO),
-                files: Vec::new_in(alloc.clone()),
-                span_files: Vec::new_in(alloc.clone()),
+                files: Vec::new_in(alloc),
+                span_files: Vec::new_in(alloc),
                 mark: Key::from_id(ZERO),
                 audit_mark: None,
                 last: None,
-                now: Vec::new_in(alloc.clone()),
-                changed: Vec::new_in(alloc.clone()),
+                now: Vec::new_in(alloc),
+                changed: Vec::new_in(alloc),
                 row_ask: RowAsk::Deps,
-                asked_rows: Vec::new_in(alloc.clone()),
-                asked_ids: Vec::new_in(alloc.clone()),
-                old_of: Vec::new_in(alloc.clone()),
-                chunks: Vec::new_in(alloc.clone()),
-                walks: Vec::new_in(alloc.clone()),
-                slots: Vec::new_in(alloc.clone()),
-                index: Vec::new_in(alloc.clone()),
-                made: Vec::new_in(alloc.clone()),
-                makers: Vec::new_in(alloc.clone()),
-                text_items: Vec::new_in(alloc.clone()),
+                asked_rows: Vec::new_in(alloc),
+                asked_ids: Vec::new_in(alloc),
+                old_of: Vec::new_in(alloc),
+                chunks: Vec::new_in(alloc),
+                walks: Vec::new_in(alloc),
+                slots: Vec::new_in(alloc),
+                index: Vec::new_in(alloc),
+                made: Vec::new_in(alloc),
+                makers: Vec::new_in(alloc),
+                text_items: Vec::new_in(alloc),
                 maker_rows: MakerRows::Unread,
-                named: Vec::new_in(alloc.clone()),
-                wave: Vec::new_in(alloc.clone()),
-                answer: Vec::new_in(alloc.clone()),
+                named: Vec::new_in(alloc),
+                wave: Vec::new_in(alloc),
+                answer: Vec::new_in(alloc),
                 answer_epoch: STALE,
                 rows_gated: false,
-                deps_universe: Vec::new_in(alloc.clone()),
-                own_universe: Vec::new_in(alloc.clone()),
+                deps_universe: Vec::new_in(alloc),
+                own_universe: Vec::new_in(alloc),
                 surface_kept: false,
                 surface_result: ZERO,
                 manifest: None,
                 universe: None,
                 mark_holds: None,
-                closure: Vec::new_in(alloc.clone()),
+                closure: Vec::new_in(alloc),
                 filing: Filing::Chunks,
-                chunk_out: Vec::new_in(alloc.clone()),
+                chunk_out: Vec::new_in(alloc),
                 manifest_out: None,
                 mark_out: None,
                 puts: 0,
@@ -1288,14 +1288,14 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         if let Some(pair) = owners.windows(2).find(|pair| pair[0].0 == pair[1].0) {
             return Err(PlanError::Owner { unit: pair[1].1.max(pair[0].1) });
         }
-        let mut unasked = Vec::new_in(alloc.clone());
+        let mut unasked = Vec::new_in(alloc);
         unasked.extend(owners.iter().copied().filter(|&(_, index)| plan.units[index as usize].bodies == Bodies::NotAsked));
-        let mut manifests = Vec::with_capacity_in(count, alloc.clone());
+        let mut manifests = Vec::with_capacity_in(count, alloc);
         manifests.resize(count, Key::from_id(ZERO));
         Ok(Driver {
             walker,
-            progs: program::Progs::new(programs, alloc.clone()),
-            failures: Vec::new_in(alloc.clone()),
+            progs: program::Progs::new(programs, alloc),
+            failures: Vec::new_in(alloc),
             failed_units: 0,
             snap,
             memo,
@@ -1305,15 +1305,15 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             phase: Phase::Start,
             units,
             unasked,
-            demands: Vec::new_in(alloc.clone()),
-            demanded: Vec::new_in(alloc.clone()),
+            demands: Vec::new_in(alloc),
+            demanded: Vec::new_in(alloc),
             demand_epoch: 0,
-            loading: Vec::new_in(alloc.clone()),
+            loading: Vec::new_in(alloc),
             dependents,
-            ready: VecDeque::new_in(alloc.clone()),
-            runs: VecDeque::new_in(alloc.clone()),
-            held: Vec::new_in(alloc.clone()),
-            pending: Vec::new_in(alloc.clone()),
+            ready: VecDeque::new_in(alloc),
+            runs: VecDeque::new_in(alloc),
+            held: Vec::new_in(alloc),
+            pending: Vec::new_in(alloc),
             next_ticket: 0,
             manifests,
             complete: 0,
@@ -1862,7 +1862,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             Ok(settled) => settled,
             Err(raced) => return self.fail(Failure::Raced { at: raced.at }),
         };
-        let mut payload = Vec::with_capacity_in(self.manifests.len() * 32, self.alloc.clone());
+        let mut payload = Vec::with_capacity_in(self.manifests.len() * 32, self.alloc);
         self.manifests.iter().for_each(|key| payload.extend_from_slice(&key.id().0));
         // Then each program's kept manifest, in plan order: the next request's `last`.
         for p in 0..self.progs.len() {
@@ -1957,7 +1957,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         if payload.len() != 32 * (units + count) {
             return Err(bad("a certificate naming another number of manifests than the plan has units and programs"));
         }
-        let mut keys = Vec::with_capacity_in(count, self.alloc.clone());
+        let mut keys = Vec::with_capacity_in(count, self.alloc);
         for chunk in payload[32 * units..].chunks_exact(32) {
             let mut id = [0u8; 32];
             id.copy_from_slice(chunk);
@@ -1980,14 +1980,14 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         items: &[(StableId, Key<Body>)],
         names: &[ContentId],
     ) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         // Its files as span tables read them, from every file (a span table of an owner of a
         // unit not asked reads its files too): taken before a unit not asked drops its files.
         if names.len() != files.len() {
             return self.fail(Failure::Misused("a key task whose printed names are not one per file"));
         }
         let owner = self.units[u as usize].owner;
-        let mut span_files = Vec::with_capacity_in(files.len(), alloc.clone());
+        let mut span_files = Vec::with_capacity_in(files.len(), alloc);
         for (file, name) in files.iter().zip(names) {
             if *name != ZERO {
                 span_files.push(Fact { id: record::span_file_id(owner, name), digest: record::span_file_digest(&file.image) });
@@ -2033,7 +2033,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         }
         let view = {
             let deps = &self.units[u as usize].deps;
-            let mut uds = Vec::with_capacity_in(deps.len(), alloc.clone());
+            let mut uds = Vec::with_capacity_in(deps.len(), alloc);
             for &dep in deps.iter() {
                 match self.units[dep as usize].universe {
                     Some(ud) => uds.push(ud),
@@ -2042,7 +2042,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             }
             record::view(&uds)
         };
-        let mut closure = Vec::new_in(alloc.clone());
+        let mut closure = Vec::new_in(alloc);
         for &dep in self.units[u as usize].deps.iter() {
             closure.extend_from_slice(&self.units[dep as usize].closure);
         }
@@ -2052,12 +2052,12 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         let unit = &mut self.units[u as usize];
         unit.text = manifest;
         unit.surface_key = surface;
-        unit.files = copy_in(files, alloc.clone());
+        unit.files = copy_in(files, alloc);
         unit.slots.clear();
-        unit.slots.push(new_slot(SURFACE_ITEM, surface.id(), u32::MAX, alloc.clone()));
+        unit.slots.push(new_slot(SURFACE_ITEM, surface.id(), u32::MAX, alloc));
         for (f, file) in files.iter().enumerate() {
             for &(item, key) in &items[file.at as usize..(file.at + file.len) as usize] {
-                unit.slots.push(new_slot(item, key.id(), f as u32, alloc.clone()));
+                unit.slots.push(new_slot(item, key.id(), f as u32, alloc));
             }
         }
         unit.index.clear();
@@ -2066,7 +2066,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         if unit.index.windows(2).any(|pair| pair[0].0 == pair[1].0) {
             return self.fail(Failure::Misused("a key task that gave one item twice"));
         }
-        let mut own = copy_in(&closure, alloc.clone());
+        let mut own = copy_in(&closure, alloc);
         own.push(TableRef { unit: u, owner: unit.owner, surface: None, manifest: None });
         own.sort_by_key(|table| table.owner);
         unit.deps_universe = closure;
@@ -2133,21 +2133,21 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         let Some(address) = self.units[u as usize].plan_last else {
             return self.fail(Failure::Misused("a last manifest read for a unit with none"));
         };
-        let last = match read_last(address, bytes, self.alloc.clone()) {
+        let last = match read_last(address, bytes, self.alloc) {
             Ok(last) => last,
             Err(why) => return self.fail(Failure::Record { tag: UnitManifest::TAG, key: address.id(), why }),
         };
         if let Ok(hit) = proof::hit::<UnitManifest>(self.snap, address, bytes) {
             memo_keep(&mut *self.memo, u, hit.holds().into(), bytes);
         }
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let unit = &mut self.units[u as usize];
         let rows = last.dictionary.len();
-        unit.now = Vec::with_capacity_in(rows, alloc.clone());
+        unit.now = Vec::with_capacity_in(rows, alloc);
         unit.now.extend(last.dictionary.iter().map(|row| row.digest));
-        unit.changed = Vec::with_capacity_in(rows, alloc.clone());
+        unit.changed = Vec::with_capacity_in(rows, alloc);
         unit.changed.resize(rows, false);
-        unit.chunks = Vec::with_capacity_in(last.files.len(), alloc.clone());
+        unit.chunks = Vec::with_capacity_in(last.files.len(), alloc);
         for _ in 0..last.files.len() {
             unit.chunks.push(ChunkState::Unread);
         }
@@ -2204,7 +2204,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
 
     /// The dependency rows answered: the surface stands, or is examined.
     fn after_deps(&mut self, u: u32) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let unit = &mut self.units[u as usize];
         let Some(last) = unit.last.as_ref() else {
             return self.fail(Failure::Misused("a dictionary answered with no last manifest"));
@@ -2246,7 +2246,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         let Some(last) = unit.last.as_ref() else {
             // Cold: every body is examined.
             unit.state = UnitState::Items;
-            let mut all = Vec::with_capacity_in(unit.slots.len(), self.alloc.clone());
+            let mut all = Vec::with_capacity_in(unit.slots.len(), self.alloc);
             all.extend(1..unit.slots.len() as u32);
             return self.examine_all(u, &all);
         };
@@ -2278,15 +2278,15 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
 
     /// Every row but the made ones answered: which chunks are read, and which facts walked.
     fn after_own(&mut self, u: u32) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let unit = &mut self.units[u as usize];
         unit.state = UnitState::Chunks;
         let Some(last) = unit.last.as_ref() else {
             return self.fail(Failure::Misused("rows answered with no last manifest"));
         };
-        let mut used = Vec::with_capacity_in(last.files.len(), alloc.clone());
+        let mut used = Vec::with_capacity_in(last.files.len(), alloc);
         used.resize(last.files.len(), false);
-        unit.old_of = Vec::with_capacity_in(unit.files.len(), alloc.clone());
+        unit.old_of = Vec::with_capacity_in(unit.files.len(), alloc);
         for file in unit.files.iter() {
             let old = last.files.iter().enumerate().position(|(o, chunk)| !used[o] && chunk.file == file.image.id());
             if let Some(o) = old {
@@ -2336,7 +2336,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     }
 
     fn got_chunk(&mut self, u: u32, o: u32, record: Option<&[u8]>) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let Some(address) = self.units[u as usize].last.as_ref().and_then(|last| last.files.get(o as usize)).map(|file| file.chunk)
         else {
             return self.fail(Failure::Misused("a chunk read of a unit with no such old file"));
@@ -2359,8 +2359,8 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// The first time every chunk asked is held: each file's items whose key moved, or whose
     /// file has no old chunk, are examined; then the walks.
     fn map_files(&mut self, u: u32) {
-        let alloc = self.alloc.clone();
-        let mut examine = Vec::new_in(alloc.clone());
+        let alloc = self.alloc;
+        let mut examine = Vec::new_in(alloc);
         {
             let unit = &mut self.units[u as usize];
             unit.state = UnitState::Items;
@@ -2381,7 +2381,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
                     match chunk.and_then(|chunk| chunk.entry(&slot.item).map(|at| (chunk, at))) {
                         Some((chunk, at)) => {
                             if chunk.entries[at].key != slot.key {
-                                slot.old = Some(OldEntry { address: chunk.entries[at].address, shape: chunk.shape_of(at, alloc.clone()) });
+                                slot.old = Some(OldEntry { address: chunk.entries[at].address, shape: chunk.shape_of(at, alloc) });
                                 examine.push(s as u32);
                             }
                         }
@@ -2396,12 +2396,12 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// Walks the postings of every fact in `walks` whose chunks are held: each kept reader is
     /// examined with its old entry.
     fn walk(&mut self, u: u32) {
-        let alloc = self.alloc.clone();
-        let mut examine = Vec::new_in(alloc.clone());
+        let alloc = self.alloc;
+        let mut examine = Vec::new_in(alloc);
         {
             let unit = &mut self.units[u as usize];
             let Some(last) = unit.last.as_ref() else { return };
-            let walks = core::mem::replace(&mut unit.walks, Vec::new_in(alloc.clone()));
+            let walks = core::mem::replace(&mut unit.walks, Vec::new_in(alloc));
             for id in walks.iter() {
                 let Some(row) = last.row(id) else { continue };
                 for &c in last.readers(row) {
@@ -2412,7 +2412,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
                         let s = unit.index[at].1;
                         let slot = &mut unit.slots[s as usize];
                         if slot.state == SlotState::Kept && !slot.examined {
-                            slot.old = Some(OldEntry { address: entry.address, shape: chunk.shape_of(e as usize, alloc.clone()) });
+                            slot.old = Some(OldEntry { address: entry.address, shape: chunk.shape_of(e as usize, alloc) });
                             examine.push(s);
                         }
                     }
@@ -2502,7 +2502,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         if self.waits_on_maker(u, s, false) {
             return;
         }
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let slot = &mut self.units[u as usize].slots[s as usize];
         match slot.old.as_ref() {
             Some(old) if planted(Plant::CacheHitNoReplay) => {
@@ -2615,7 +2615,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     }
 
     fn probed(&mut self, u: u32, s: u32, now: &[ContentId]) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let slot = &mut self.units[u as usize].slots[s as usize];
         if now.len() != slot.probe.len() {
             return self.fail(Failure::Misused("a shape answered with another number of facts than it asks"));
@@ -2681,7 +2681,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     }
 
     fn got_node(&mut self, u: u32, s: u32, record: Option<&[u8]>) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let slot = &mut self.units[u as usize].slots[s as usize];
         let Some(node) = slot.node else {
             return self.fail(Failure::Misused("a shape node read with no node asked"));
@@ -2772,7 +2772,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// into the next wave). Cost: a sort of the wave and one copy of each of its units' made
     /// answer, the size of the merge `made_for` does per demand anyway.
     fn start_wave(&mut self) {
-        let mut wave = core::mem::replace(&mut self.held, Vec::new_in(self.alloc.clone()));
+        let mut wave = core::mem::replace(&mut self.held, Vec::new_in(self.alloc));
         wave.sort_unstable();
         // The (unit, whether a surface) last frozen: slot 0, the surface, sorts first.
         let mut frozen = (u32::MAX, false);
@@ -2800,7 +2800,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// name rather than answer one of them from the other's table.
     fn freeze(&mut self, u: u32, s: u32) {
         self.sync_answer(Work::Run(u, s));
-        let mut wave = core::mem::replace(&mut self.units[u as usize].wave, Vec::new_in(self.alloc.clone()));
+        let mut wave = core::mem::replace(&mut self.units[u as usize].wave, Vec::new_in(self.alloc));
         wave.clear();
         let now: &[Fact] = match s {
             SURFACE => &self.demanded,
@@ -2812,7 +2812,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
 
     fn ran_slot(&mut self, u: u32, s: u32, record: &[u8]) {
         let snap = self.snap;
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let slot = &mut self.units[u as usize].slots[s as usize];
         let (key, asked) = (slot.key, slot.asked);
         let (address, root) = match read_slot(s, key, record) {
@@ -2887,7 +2887,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
 
     /// Item `s` holds the record at `address`: its shape, its made facts and its result.
     fn settle(&mut self, u: u32, s: u32, address: ContentId, bytes: &[u8]) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let root = match blaze_format::open::<Traced>(bytes) {
             Ok(root) => root,
             Err(error) => return self.fail(Failure::Record { tag: slot_tag(s), key: address, why: RecordError::Format(error) }),
@@ -2945,7 +2945,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         slot.settles += 1;
         slot.address = address;
         slot.result = result;
-        slot.reads = copy_in(reads, alloc.clone());
+        slot.reads = copy_in(reads, alloc);
         if s != SURFACE {
             // Every fact is a made fact of this unit: checked above.
             slot.made = copy_in(facts, alloc);
@@ -2983,7 +2983,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// bodies went from asked to not asked).
     fn refresh_made(&mut self, u: u32) {
         let unit = &mut self.units[u as usize];
-        let mut rows: Vec<(Fact, ContentId), A> = Vec::new_in(self.alloc.clone());
+        let mut rows: Vec<(Fact, ContentId), A> = Vec::new_in(self.alloc);
         if let Some(last) = unit.last.as_ref() {
             for (fact, maker) in last.made.iter().zip(last.makers.iter()) {
                 let pending = match unit.index.binary_search_by(|(item, _)| item.0.cmp(maker)) {
@@ -3017,7 +3017,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// that unit. A surface's reads of its own unit's made facts are none of them: its universe
     /// holds no table of its own unit, so it is answered `GONE` whether the unit is asked or not.
     fn unasked_reads(&self, u: u32, s: u32, ids: impl Iterator<Item = ContentId>) -> Vec<(u32, ContentId), A> {
-        let mut out = Vec::new_in(self.alloc.clone());
+        let mut out = Vec::new_in(self.alloc);
         for id in ids {
             if let Ok(Route::Made(owner)) = record::route(&id)
                 && let Ok(at) = self.unasked.binary_search_by_key(&owner, |&(owner, _)| owner)
@@ -3079,12 +3079,12 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         let (item, key) = unit.text_items[at];
         let by = |demand: &Demand<A>| (demand.unit, demand.item);
         if let Err(at) = self.demands.binary_search_by_key(&(d, item), by) {
-            let alloc = self.alloc.clone();
+            let alloc = self.alloc;
             let unit = &mut self.units[d as usize];
             let s = unit.slots.len() as u32;
             // A unit not asked is checked by no request: its body is made for its MIR and the
             // facts it makes alone, under the key that says so.
-            let mut slot = new_slot(item, Steps::Mir.key(key, item).id(), u32::MAX, alloc.clone());
+            let mut slot = new_slot(item, Steps::Mir.key(key, item).id(), u32::MAX, alloc);
             slot.steps = Steps::Mir;
             slot.examined = true;
             slot.state = SlotState::Waiting;
@@ -3119,9 +3119,9 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// Whether demand `from`'s maker is slot `to`, or waits, through other demanded makers, on
     /// slot `to`: a cycle if `to` waited on `from`. Bounded: each demand is visited once.
     fn reaches(&self, from: usize, to: (u32, u32)) -> bool {
-        let mut seen = Vec::with_capacity_in(self.demands.len(), self.alloc.clone());
+        let mut seen = Vec::with_capacity_in(self.demands.len(), self.alloc);
         seen.resize(self.demands.len(), false);
-        let mut stack = Vec::new_in(self.alloc.clone());
+        let mut stack = Vec::new_in(self.alloc);
         stack.push(from);
         while let Some(k) = stack.pop() {
             if seen[k] {
@@ -3156,7 +3156,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             self.demanded.dedup_by_key(|fact| fact.id);
             self.demand_epoch += 1;
         }
-        let waiters = core::mem::replace(&mut self.demands[k].waiters, Vec::new_in(self.alloc.clone()));
+        let waiters = core::mem::replace(&mut self.demands[k].waiters, Vec::new_in(self.alloc));
         self.resume(&waiters);
     }
 
@@ -3210,8 +3210,8 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// Keeps unit `d`'s maker rows for the request from its surface's `facts` (sorted by id),
     /// with the text ids they name. Floor: one pass over the facts, one sort of the makers.
     fn keep_makers(&mut self, d: u32, facts: &[Fact]) {
-        let alloc = self.alloc.clone();
-        let mut rows = Vec::new_in(alloc.clone());
+        let alloc = self.alloc;
+        let mut rows = Vec::new_in(alloc);
         rows.extend(facts.iter().filter(|fact| record::kind_of(&fact.id) == Some(record::FactKind::Maker)).copied());
         let mut named = Vec::with_capacity_in(rows.len(), alloc);
         named.extend(rows.iter().map(|row: &Fact| StableId(row.digest)));
@@ -3227,7 +3227,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// (its address checked); a record the store does not hold, or that does not open, fails
     /// by name: a demanded fact must not be answered `absent` for want of a read.
     fn got_makers(&mut self, d: u32, record: Option<&[u8]>) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let Some((_, _, address)) = self.get_of(Work::GetMakers(d)) else {
             return self.fail(Failure::Misused("maker rows read of a unit with no surface"));
         };
@@ -3257,7 +3257,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// Slot `s` of unit `u` read a demanded fact as another answer than its maker gave (it ran
     /// before the maker settled): examined again from its shape, answered now.
     fn redo_demanded(&mut self, u: u32, s: u32, address: ContentId, reads: &[Fact]) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let slot = &mut self.units[u as usize].slots[s as usize];
         if slot.redos >= SETTLES_MOST {
             let mut items = Vec::with_capacity_in(1, Global);
@@ -3356,7 +3356,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             return self.block(u);
         }
         self.refresh_made(u);
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         // The rows of the unit's own made facts, now, against the last manifest's.
         {
             let unit = &mut self.units[u as usize];
@@ -3393,7 +3393,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         }
         // Readers examined in this request against the made table now.
         if !planted(Plant::MakerAfterReader) {
-            let mut redo = Vec::new_in(alloc.clone());
+            let mut redo = Vec::new_in(alloc);
             {
                 let unit = &self.units[u as usize];
                 for (s, slot) in unit.slots.iter().enumerate().skip(1) {
@@ -3418,7 +3418,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
                 self.ran.redone += redo.len() as u32;
                 for &s in redo.iter() {
                     let slot = &mut unit.slots[s as usize];
-                    let mut shape = Vec::with_capacity_in(slot.reads.len(), alloc.clone());
+                    let mut shape = Vec::with_capacity_in(slot.reads.len(), alloc);
                     shape.extend(slot.reads.iter().map(|read| read.id));
                     slot.old = Some(OldEntry { address: slot.address, shape });
                     slot.holds = None;
@@ -3468,10 +3468,10 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     // ---- filing a unit ----
 
     fn write(&mut self, u: u32) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let deps_uds = {
             let deps = &self.units[u as usize].deps;
-            let mut uds = Vec::with_capacity_in(deps.len(), alloc.clone());
+            let mut uds = Vec::with_capacity_in(deps.len(), alloc);
             uds.extend(deps.iter().map(|&dep| self.units[dep as usize].universe.unwrap_or(ZERO)));
             uds
         };
@@ -3489,7 +3489,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             unit.chunk_out.clear();
             (last.address, last.surface, last.surface_result, record::table_digest(&last.made))
         } else {
-            match build_manifest(u, unit, alloc.clone()) {
+            match build_manifest(u, unit, alloc) {
                 Ok((key, bytes)) => {
                     self.ran.manifests += 1;
                     self.ran.chunks += unit.chunk_out.iter().filter(|(_, bytes)| bytes.is_some()).count() as u32;
@@ -3599,7 +3599,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     }
 
     fn unit_complete(&mut self, u: u32) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let unit = &mut self.units[u as usize];
         if unit.state == UnitState::Complete {
             return;
@@ -3681,7 +3681,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         if self.done() {
             return;
         }
-        let mut stack = Vec::new_in(self.alloc.clone());
+        let mut stack = Vec::new_in(self.alloc);
         stack.push(u);
         while let Some(f) = stack.pop() {
             let unit = &mut self.units[f as usize];
@@ -3712,7 +3712,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             return self.fail(Failure::Misused("a demanded maker failed with no demand of it"));
         };
         self.failed_at((u, s), why.clone());
-        let waiters = core::mem::replace(&mut self.demands[k].waiters, Vec::new_in(self.alloc.clone()));
+        let waiters = core::mem::replace(&mut self.demands[k].waiters, Vec::new_in(self.alloc));
         for waiter in waiters {
             if self.done() {
                 return;
@@ -3729,7 +3729,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     }
 }
 
-fn new_slot<'s, A: Allocator + Clone>(item: StableId, key: ContentId, file: u32, alloc: A) -> Slot<'s, A> {
+fn new_slot<'s, A: Allocator + Copy>(item: StableId, key: ContentId, file: u32, alloc: A) -> Slot<'s, A> {
     Slot {
         item,
         key,
@@ -3742,13 +3742,13 @@ fn new_slot<'s, A: Allocator + Clone>(item: StableId, key: ContentId, file: u32,
         parked: false,
         settles: 0,
         probing: Probing::Old,
-        probe: Vec::new_in(alloc.clone()),
+        probe: Vec::new_in(alloc),
         asked: ZERO,
         depth: 0,
         node: None,
         address: ZERO,
         result: ZERO,
-        reads: Vec::new_in(alloc.clone()),
+        reads: Vec::new_in(alloc),
         made: Vec::new_in(alloc),
         bytes: None,
         node_bytes: None,
@@ -3795,7 +3795,7 @@ fn malformed(at: usize, what: &'static str) -> RecordError {
 }
 
 /// The last manifest's root, checked and copied out: every index in its bounds.
-fn read_last<A: Allocator + Clone>(address: Key<UnitManifest>, bytes: &[u8], alloc: A) -> Result<Last<A>, RecordError> {
+fn read_last<A: Allocator + Copy>(address: Key<UnitManifest>, bytes: &[u8], alloc: A) -> Result<Last<A>, RecordError> {
     let root: &ManifestRoot = record::open::<UnitManifest>(bytes, &address)?;
     let follow = |error| RecordError::Format(error);
     let files = root.files.follow(bytes).map_err(follow)?;
@@ -3831,18 +3831,18 @@ fn read_last<A: Allocator + Clone>(address: Key<UnitManifest>, bytes: &[u8], all
         surface_key: root.surface_key,
         surface: root.surface,
         surface_result: root.surface_result,
-        files: copy_in(files, alloc.clone()),
-        dictionary: copy_in(dictionary, alloc.clone()),
-        readers: copy_in(readers, alloc.clone()),
-        reader_at: copy_in(reader_at, alloc.clone()),
-        surface_shape: copy_in(surface_shape, alloc.clone()),
-        made: copy_in(made, alloc.clone()),
+        files: copy_in(files, alloc),
+        dictionary: copy_in(dictionary, alloc),
+        readers: copy_in(readers, alloc),
+        reader_at: copy_in(reader_at, alloc),
+        surface_shape: copy_in(surface_shape, alloc),
+        made: copy_in(made, alloc),
         makers: copy_in(makers, alloc),
     })
 }
 
 /// An old chunk, checked and copied out.
-fn read_chunk<A: Allocator + Clone>(address: Key<UnitChunk>, bytes: &[u8], alloc: A) -> Result<OldChunk<A>, RecordError> {
+fn read_chunk<A: Allocator + Copy>(address: Key<UnitChunk>, bytes: &[u8], alloc: A) -> Result<OldChunk<A>, RecordError> {
     let root: &ChunkRoot = record::open::<UnitChunk>(bytes, &address)?;
     let follow = |error| RecordError::Format(error);
     let entries = root.entries.follow(bytes).map_err(follow)?;
@@ -3870,10 +3870,10 @@ fn read_chunk<A: Allocator + Clone>(address: Key<UnitChunk>, bytes: &[u8], alloc
         return Err(malformed(at, "postings"));
     }
     Ok(OldChunk {
-        entries: copy_in(entries, alloc.clone()),
-        shapes: copy_in(shapes, alloc.clone()),
-        dictionary: copy_in(dictionary, alloc.clone()),
-        postings: copy_in(postings, alloc.clone()),
+        entries: copy_in(entries, alloc),
+        shapes: copy_in(shapes, alloc),
+        dictionary: copy_in(dictionary, alloc),
+        postings: copy_in(postings, alloc),
         posting_at: copy_in(posting_at, alloc),
     })
 }
@@ -3886,8 +3886,8 @@ struct NewEntry<A: Allocator> {
 
 /// A chunk of `entries`: its dictionary of every id the entries' shapes ask, their shapes as
 /// ordinals, and the postings. Floor: one sort of the ids, one pass.
-fn build_chunk<A: Allocator + Clone>(unit: ContentId, file: ContentId, entries: &mut [NewEntry<A>], alloc: A) -> (Key<UnitChunk>, Vec<u8>) {
-    let mut dictionary = Vec::new_in(alloc.clone());
+fn build_chunk<A: Allocator + Copy>(unit: ContentId, file: ContentId, entries: &mut [NewEntry<A>], alloc: A) -> (Key<UnitChunk>, Vec<u8>) {
+    let mut dictionary = Vec::new_in(alloc);
     for entry in entries.iter() {
         dictionary.extend_from_slice(&entry.shape);
     }
@@ -3896,9 +3896,9 @@ fn build_chunk<A: Allocator + Clone>(unit: ContentId, file: ContentId, entries: 
     if planted(Plant::DictionaryMissesFact) {
         dictionary.pop();
     }
-    let mut shapes = Vec::new_in(alloc.clone());
-    let mut rows = Vec::with_capacity_in(entries.len(), alloc.clone());
-    let mut readers: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
+    let mut shapes = Vec::new_in(alloc);
+    let mut rows = Vec::with_capacity_in(entries.len(), alloc);
+    let mut readers: Vec<(u32, u32), A> = Vec::new_in(alloc);
     for (e, entry) in entries.iter_mut().enumerate() {
         let at = shapes.len() as u32;
         for id in entry.shape.iter() {
@@ -3912,7 +3912,7 @@ fn build_chunk<A: Allocator + Clone>(unit: ContentId, file: ContentId, entries: 
         rows.push(entry.entry);
     }
     readers.sort_unstable();
-    let mut postings = Vec::with_capacity_in(readers.len(), alloc.clone());
+    let mut postings = Vec::with_capacity_in(readers.len(), alloc);
     let mut posting_at = Vec::with_capacity_in(dictionary.len() + 1, alloc);
     let mut next = 0;
     for k in 0..dictionary.len() as u32 {
@@ -3934,21 +3934,21 @@ fn kept_digest<A: Allocator>(unit: &Unit<'_, A>, id: &ContentId) -> Option<Conte
 
 /// The unit's chunks (each reused when nothing in its file moved, else rebuilt) and its root:
 /// `unit.chunk_out` is filled, and the root's address and bytes returned.
-fn build_manifest<A: Allocator + Clone>(u: u32, unit: &mut Unit<'_, A>, alloc: A) -> Result<(Key<UnitManifest>, Vec<u8>), Failure> {
+fn build_manifest<A: Allocator + Copy>(u: u32, unit: &mut Unit<'_, A>, alloc: A) -> Result<(Key<UnitManifest>, Vec<u8>), Failure> {
     let n = unit.files.len();
     let unit_id = unit.text.id();
-    let mut files = Vec::with_capacity_in(n, alloc.clone());
+    let mut files = Vec::with_capacity_in(n, alloc);
     // (id, digest, reader): every fact a record of the unit read, by the chunk that holds it.
-    let mut rows: Vec<(ContentId, ContentId, u32), A> = Vec::new_in(alloc.clone());
+    let mut rows: Vec<(ContentId, ContentId, u32), A> = Vec::new_in(alloc);
     let old_files = unit.last.as_ref().map_or(0, |last| last.files.len());
-    let mut reused: Vec<Option<u32>, A> = Vec::with_capacity_in(old_files, alloc.clone());
+    let mut reused: Vec<Option<u32>, A> = Vec::with_capacity_in(old_files, alloc);
     reused.resize(old_files, None);
     unit.chunk_out.clear();
     for f in 0..n {
         let file = unit.files[f];
-        let range = 1 + file.at as usize..1 + (file.at + file.len) as usize;
-        let keys = slot_keys(&unit.slots[range.clone()]);
-        let examined = unit.slots[range.clone()].iter().any(|slot| slot.examined);
+        let slots = &unit.slots[1 + file.at as usize..1 + (file.at + file.len) as usize];
+        let keys = slot_keys(slots);
+        let examined = slots.iter().any(|slot| slot.examined);
         let old = unit.old_of.get(f).copied().flatten();
         if let (Some(o), Some(last), false) = (old, unit.last.as_ref(), examined) {
             let chunk = last.files[o as usize];
@@ -3966,8 +3966,8 @@ fn build_manifest<A: Allocator + Clone>(u: u32, unit: &mut Unit<'_, A>, alloc: A
             },
             None => None,
         };
-        let mut entries = Vec::with_capacity_in(file.len as usize, alloc.clone());
-        for slot in &unit.slots[range] {
+        let mut entries = Vec::with_capacity_in(file.len as usize, alloc);
+        for slot in slots {
             let entry = |address, result| Entry {
                 item: slot.item.0,
                 key: slot.key,
@@ -3980,7 +3980,7 @@ fn build_manifest<A: Allocator + Clone>(u: u32, unit: &mut Unit<'_, A>, alloc: A
                 pad2: 0,
             };
             if slot.examined {
-                let mut shape = Vec::with_capacity_in(slot.reads.len(), alloc.clone());
+                let mut shape = Vec::with_capacity_in(slot.reads.len(), alloc);
                 shape.extend(slot.reads.iter().map(|read| read.id));
                 for read in slot.reads.iter() {
                     rows.push((read.id, read.digest, f as u32));
@@ -3991,7 +3991,7 @@ fn build_manifest<A: Allocator + Clone>(u: u32, unit: &mut Unit<'_, A>, alloc: A
             let Some((chunk, at)) = held.and_then(|chunk| chunk.entry(&slot.item).map(|at| (chunk, at))) else {
                 return Err(Failure::Misused("an item kept with no entry of its last chunk held"));
             };
-            let shape = chunk.shape_of(at, alloc.clone());
+            let shape = chunk.shape_of(at, alloc);
             for id in shape.iter() {
                 let Some(digest) = kept_digest(unit, id) else {
                     return Err(Failure::Misused("a kept item's fact is not in its last dictionary"));
@@ -4001,7 +4001,7 @@ fn build_manifest<A: Allocator + Clone>(u: u32, unit: &mut Unit<'_, A>, alloc: A
             let old = chunk.entries[at];
             entries.push(NewEntry { entry: entry(old.address, old.result), shape });
         }
-        let (address, bytes) = build_chunk(unit_id, file.image.id(), &mut entries, alloc.clone());
+        let (address, bytes) = build_chunk(unit_id, file.image.id(), &mut entries, alloc);
         files.push(FileChunk { file: file.image.id(), chunk: address.id(), keys, items: file.len, pad: 0 });
         unit.chunk_out.push((address, Some(Aligned::copy_from(&bytes))));
     }
@@ -4031,9 +4031,9 @@ fn build_manifest<A: Allocator + Clone>(u: u32, unit: &mut Unit<'_, A>, alloc: A
     }
     rows.sort_unstable();
     rows.dedup();
-    let mut dictionary = Vec::new_in(alloc.clone());
-    let mut readers = Vec::with_capacity_in(rows.len(), alloc.clone());
-    let mut reader_at = Vec::new_in(alloc.clone());
+    let mut dictionary = Vec::new_in(alloc);
+    let mut readers = Vec::with_capacity_in(rows.len(), alloc);
+    let mut reader_at = Vec::new_in(alloc);
     for (at, &(id, digest, reader)) in rows.iter().enumerate() {
         match dictionary.last().map(|fact: &Fact| (fact.id, fact.digest)) {
             Some((last, seen)) if last == id => {
@@ -4052,7 +4052,7 @@ fn build_manifest<A: Allocator + Clone>(u: u32, unit: &mut Unit<'_, A>, alloc: A
         }
     }
     reader_at.push(readers.len() as u32);
-    let mut surface_shape = Vec::new_in(alloc.clone());
+    let mut surface_shape = Vec::new_in(alloc);
     match (unit.surface_kept, unit.last.as_ref()) {
         (true, Some(last)) => {
             for &row in last.surface_shape.iter() {

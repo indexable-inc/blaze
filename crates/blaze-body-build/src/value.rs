@@ -1,7 +1,7 @@
 //! Operands, places and the `Value` variants of an assignment. Overflow is already an `Assert`
 //! row of the body, so every operation here is the plain one.
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 use core::alloc::Allocator;
 
 use blaze_body::{AggregateKind, BinOp, CastKind, Const, ConstKind, Local, Operand, Place, Proj, UnOp, Value as BodyValue};
@@ -10,7 +10,7 @@ use blaze_build::layout::{Fields, Layout, LayoutCx, LayoutId, Variants};
 use blaze_build::{Instance, ground};
 use blaze_lir::builder::MemAttrs;
 use blaze_lir::func::{RefKind, SlotKind};
-use blaze_lir::{Flags, IntCond, Op, Ty, Value};
+use blaze_lir::{Flags, FloatCond, IntCond, Op, Ty, Value};
 use blaze_typeck::{AdtKind, PNode, PTy};
 
 use crate::{BuildError, Cx, Held, V};
@@ -34,16 +34,74 @@ pub(crate) fn second(l: &Layout) -> i32 {
 /// The most elements a `[x; N]` row is written as stores of.
 const REPEAT_CAP: u64 = 4096;
 
-impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// `ty` of the body's table at this instance, in the ground table.
+    /// Grounding also handles types interned into the body's own overlay (`BodyBuilder::intern_ty`)
+    /// recursively up to a fixed depth bound.
     pub(crate) fn ground(&mut self, ty: PTy) -> Result<PTy, BuildError> {
-        // A type of the body's own overlay (blaze-body's `intern_ty`) is past `from`: grounding
-        // it needs one table over both, which blaze-typeck does not let a reader build yet
-        // (`PTys::overlay` is crate-private).
-        if let Ok(Some(_)) = self.v.own_ty(ty) {
-            return Err(self.unsupported("a type of the body's own overlay (not in its record's table)"));
+        self.ground_depth(ty, 0)
+    }
+
+    fn ground_depth(&mut self, ty: PTy, depth: u32) -> Result<PTy, BuildError> {
+        const MAX_OVERLAY_DEPTH: u32 = 32;
+        if let Ok(Some(node)) = self.v.own_ty(ty) {
+            if depth >= MAX_OVERLAY_DEPTH {
+                return Err(self.unsupported("a deeply nested type of the body's own overlay"));
+            }
+            let grounded = match node {
+                PNode::Bool
+                | PNode::Char
+                | PNode::Str
+                | PNode::Never
+                | PNode::Int(_)
+                | PNode::Uint(_)
+                | PNode::Float(_) => node,
+                PNode::ConstValue { ty: cty, bits } => {
+                    let cty = self.ground_depth(cty, depth + 1)?;
+                    PNode::ConstValue { ty: cty, bits }
+                }
+                PNode::Ref(m, inner) => PNode::Ref(m, self.ground_depth(inner, depth + 1)?),
+                PNode::Ptr(m, inner) => PNode::Ptr(m, self.ground_depth(inner, depth + 1)?),
+                PNode::Slice(inner) => PNode::Slice(self.ground_depth(inner, depth + 1)?),
+                PNode::Array(elem, len) => {
+                    let elem = self.ground_depth(elem, depth + 1)?;
+                    let len = self.ground_depth(len, depth + 1)?;
+                    PNode::Array(elem, len)
+                }
+                PNode::Tuple(list) => {
+                    let list = self.ground_overlay_list(list, depth + 1)?;
+                    PNode::Tuple(list)
+                }
+                PNode::Adt(k, list) => {
+                    let list = self.ground_overlay_list(list, depth + 1)?;
+                    PNode::Adt(k, list)
+                }
+                PNode::FnDef(k, list) => {
+                    let list = self.ground_overlay_list(list, depth + 1)?;
+                    PNode::FnDef(k, list)
+                }
+                _ => return Err(self.unsupported("a type of the body's own overlay (not in its record's table)")),
+            };
+            return self.subst.ground.intern(grounded).map_err(|_| self.malformed("the ground table is full"));
         }
         ground(self.from, ty, self.subst.args, self.subst.ground, self.subst.scratch, self.adts.facts()).map_err(|e| self.facts(e))
+    }
+
+    fn ground_overlay_list(&mut self, list: blaze_typeck::List, depth: u32) -> Result<blaze_typeck::List, BuildError> {
+        let items: Vec<PTy, A> = {
+            let cap = usize::try_from(list.len).unwrap_or(0);
+            let mut out = Vec::with_capacity_in(cap, self.alloc);
+            let entries = self.v.ty_list(&self.from, list).map_err(|_| self.malformed("an overlay type list past its table"))?;
+            for t in entries.iter() {
+                out.push(t);
+            }
+            out
+        };
+        let mut grounded: Vec<PTy, A> = Vec::with_capacity_in(items.len(), self.alloc);
+        for &t in items.iter() {
+            grounded.push(self.ground_depth(t, depth)?);
+        }
+        self.subst.ground.intern_list(&grounded).map_err(|_| self.malformed("the ground table is full"))
     }
 
     /// The layout of ground type `g`.
@@ -62,12 +120,9 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
         Ok(matches!(self.node(g)?, PNode::Int(_)))
     }
 
-    /// Whether ground type `g` is a float: its operations are not built yet.
-    fn refuse_float(&mut self, g: PTy) -> Result<(), BuildError> {
-        match self.node(g)? {
-            PNode::Float(_) => Err(self.unsupported("a float operation")),
-            _ => Ok(()),
-        }
+    /// Whether ground type `g` is a floating-point scalar.
+    fn is_float(&self, g: PTy) -> Result<bool, BuildError> {
+        Ok(matches!(self.node(g)?, PNode::Float(_)))
     }
 
     /// The bits of a ground `ConstValue` (an array's length).
@@ -144,7 +199,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
     /// Where place `p` is, and its ground type: its local, then each projection in turn.
     pub(crate) fn resolve(&mut self, p: Place) -> Result<(At, PTy), BuildError> {
         let depth = self.v.place(p).depth as usize;
-        let mut chain: Vec<Proj, A> = Vec::with_capacity_in(depth, self.alloc.clone());
+        let mut chain: Vec<Proj, A> = Vec::with_capacity_in(depth, self.alloc);
         let mut q = p;
         while chain.len() < depth {
             let row = self.v.place(q);
@@ -309,7 +364,9 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
                 if l.is_zst() {
                     V::None
                 } else if let Some(s) = l.scalar {
-                    V::One(self.b.iconst(lir(s.prim).0, bits))
+                    let ty = lir(s.prim).0;
+                    let v = if ty.is_float() { self.b.fconst(ty, bits) } else { self.b.iconst(ty, bits) };
+                    V::One(v)
                 } else {
                     return Err(self.unsupported("a scalar constant of a type that is not one scalar"));
                 }
@@ -370,7 +427,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
                 return Err(self.malformed("an enum variant built into a value local"));
             }
             // The fields, at their offsets, make the local's one or two values.
-            let mut parts: Vec<(i32, Value), A> = Vec::with_capacity_in(2, self.alloc.clone());
+            let mut parts: Vec<(i32, Value), A> = Vec::with_capacity_in(2, self.alloc);
             for &(idx, x, flay) in fields {
                 let foff = self.field_off(lay, idx)?;
                 let x = match x {
@@ -480,7 +537,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
                     _ => return Err(self.unsupported("a repeat count that is not a scalar constant")),
                 };
                 let n = u64::try_from(n).ok().filter(|&n| n <= REPEAT_CAP).ok_or(self.unsupported("a repeat of more than 4096 elements"))?;
-                let mut fields: Vec<(u32, V, LayoutId), A> = Vec::with_capacity_in(n as usize, self.alloc.clone());
+                let mut fields: Vec<(u32, V, LayoutId), A> = Vec::with_capacity_in(n as usize, self.alloc);
                 for i in 0..n as u32 {
                     fields.push((i, x, elem));
                 }
@@ -555,13 +612,34 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
         self.b.binary(Op::And, Flags::NONE, y, mask)
     }
 
-    /// `lhs op rhs`, wrapping.
+    /// `lhs op rhs`, wrapping (or IEEE 754 for floats).
     fn binary(&mut self, op: BinOp, lhs: Operand, rhs: Operand) -> Result<Value, BuildError> {
         let (a, ga) = self.operand(lhs)?;
         let (b, gb) = self.operand(rhs)?;
-        self.refuse_float(ga)?;
         let x = self.scalar(a)?;
         let y = self.scalar(b)?;
+        if self.is_float(ga)? {
+            return Ok(match op {
+                BinOp::Add => self.b.binary(Op::Fadd, Flags::NONE, x, y),
+                BinOp::Sub => self.b.binary(Op::Fsub, Flags::NONE, x, y),
+                BinOp::Mul => self.b.binary(Op::Fmul, Flags::NONE, x, y),
+                BinOp::Div => self.b.binary(Op::Fdiv, Flags::NONE, x, y),
+                BinOp::Rem => self.b.binary(Op::Frem, Flags::NONE, x, y),
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                    let cond = match op {
+                        BinOp::Eq => FloatCond::Oeq,
+                        BinOp::Ne => FloatCond::Une,
+                        BinOp::Lt => FloatCond::Olt,
+                        BinOp::Le => FloatCond::Ole,
+                        BinOp::Gt => FloatCond::Ogt,
+                        _ => FloatCond::Oge,
+                    };
+                    let c = self.b.fcmp(cond, x, y);
+                    self.widen_bool(c)
+                }
+                _ => return Err(self.malformed("a non-float binary operation on a float")),
+            });
+        }
         let signed = self.signed(ga)?;
         let pick = |s: Op, u: Op| if signed { s } else { u };
         let cmp = |s: IntCond, u: IntCond| if signed { s } else { u };
@@ -624,7 +702,9 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
     fn checked(&mut self, op: BinOp, lhs: Operand, rhs: Operand) -> Result<(Value, Value, LayoutId), BuildError> {
         let (a, ga) = self.operand(lhs)?;
         let (b, _) = self.operand(rhs)?;
-        self.refuse_float(ga)?;
+        if self.is_float(ga)? {
+            return Err(self.malformed("a checked operation on a float"));
+        }
         let rlay = self.layout(ga)?;
         let x = self.scalar(a)?;
         let y = self.scalar(b)?;
@@ -667,14 +747,15 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
                 _ => Err(self.malformed("the metadata of a value that is not a pointer")),
             },
             UnOp::Not | UnOp::Neg => {
-                self.refuse_float(g)?;
                 let x = self.scalar(a)?;
                 Ok(V::One(match (op, self.node(g)?) {
                     (UnOp::Not, PNode::Bool) => {
                         let one = self.b.iconst(Ty::I8, 1);
                         self.b.binary(Op::Xor, Flags::NONE, x, one)
                     }
+                    (UnOp::Not, PNode::Float(_)) => return Err(self.malformed("bitwise not on a float")),
                     (UnOp::Not, _) => self.b.unary(Op::Not, Flags::NONE, x),
+                    (UnOp::Neg, PNode::Float(_)) => self.b.unary(Op::Fneg, Flags::NONE, x),
                     _ => self.b.unary(Op::Neg, Flags::NONE, x),
                 }))
             }
@@ -736,7 +817,31 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
                 let r = self.func_ref(Instance { item, args });
                 V::One(self.b.func_addr(r))
             }
-            CastKind::IntToFloat | CastKind::FloatToInt | CastKind::FloatToFloat => return Err(self.unsupported("a float cast")),
+            CastKind::IntToFloat => {
+                let x = self.scalar(a)?;
+                let ty = target(self)?;
+                let op = if self.signed(g)? { Op::SitoFp } else { Op::UitoFp };
+                V::One(self.b.convert(op, Flags::NONE, ty, x))
+            }
+            CastKind::FloatToInt => {
+                let x = self.scalar(a)?;
+                let ty = target(self)?;
+                let op = if self.signed(to)? { Op::FptoSi } else { Op::FptoUi };
+                V::One(self.b.convert(op, Flags::NONE, ty, x))
+            }
+            CastKind::FloatToFloat => {
+                let x = self.scalar(a)?;
+                let ty = target(self)?;
+                let from_bits = self.b.ty(x).bits(crate::PTR_BITS);
+                let to_bits = ty.bits(crate::PTR_BITS);
+                if from_bits == to_bits {
+                    V::One(x)
+                } else if from_bits < to_bits {
+                    V::One(self.b.convert(Op::Fpext, Flags::NONE, ty, x))
+                } else {
+                    V::One(self.b.convert(Op::Fptrunc, Flags::NONE, ty, x))
+                }
+            }
             CastKind::ClosureFnPointer => return Err(self.unsupported("a closure to fn pointer cast")),
         })
     }
@@ -756,9 +861,9 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
             }
             AggregateKind::Coroutine => return Err(self.unsupported("a coroutine built from its upvars")),
         };
-        let mut fields: Vec<(u32, V, LayoutId), A> = Vec::with_capacity_in(operands.len() as usize, self.alloc.clone());
+        let mut fields: Vec<(u32, V, LayoutId), A> = Vec::with_capacity_in(operands.len() as usize, self.alloc);
         let ops: Vec<Operand, A> = {
-            let mut out = Vec::with_capacity_in(operands.len() as usize, self.alloc.clone());
+            let mut out = Vec::with_capacity_in(operands.len() as usize, self.alloc);
             out.extend(self.v.ops(operands));
             out
         };

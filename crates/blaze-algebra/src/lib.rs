@@ -29,6 +29,9 @@ pub mod comptime;
 pub mod diff;
 pub mod egraph;
 pub mod emit;
+pub mod interval;
+pub mod poly;
+pub mod rules;
 pub mod solve;
 
 #[cfg(test)]
@@ -44,12 +47,25 @@ use blaze_own::{String as OwnString, Vec as OwnVec};
 
 pub use comptime::{ConstExpr, ConstGraph};
 pub use diff::{
-    AlgebraPlant, Dual, diff, eval_dual, grad, grad_reverse, grad_reverse_with_plant, hessian,
-    jacobian, nth_diff, taylor,
+    AlgebraPlant, Dual, active_vars, diff, eval_dual, grad, grad_reverse, grad_reverse_with_plant,
+    hessian, hvp, jacobian, jvp, nth_diff, taylor,
 };
-pub use egraph::{EGraph, SimplifyOpts, SimplifyStats, expr_cost, simplify, simplify_with};
+pub use egraph::{
+    CostModel, EGraph, PatNode, RewriteMode, RewriteRule, SimplifyOpts, SimplifyStats, expr_cost,
+    expr_cost_with, simplify, simplify_with, simplify_with_rules,
+};
 pub use emit::{emit_rust_fn, emit_rust_multi_fn, format_expr};
-pub use solve::{Solution, solve_for};
+pub use interval::{Interval, eval_interval, eval_intervals, prune_branches};
+pub use poly::{
+    Monomial, Poly, PolyError, PolyPlant, Rat, expr_to_poly, poly_to_expr, simplify_poly_expr,
+};
+pub use rules::{
+    AlgebraicRule, DERIV_RULES, DerivRule, STANDARD_REWRITE_RULES, export_lean_theorems,
+    standard_rewrite_rules,
+};
+pub use solve::{
+    NewtonOpts, NewtonResult, Solution, eval_newton, newton_step, solve_for, solve_linear_system,
+};
 
 /// Typed variable index inside an [`ExprGraph`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -113,6 +129,18 @@ pub const fn canonical_f64_bits(v: f64) -> u64 {
     if v == 0.0 { 0.0_f64.to_bits() } else { v.to_bits() }
 }
 
+/// Lossless `u32 -> usize` index conversion (saturating to `usize::MAX` on 16-bit targets).
+#[inline]
+pub(crate) fn u32_to_usize(v: u32) -> usize {
+    usize::try_from(v).unwrap_or(usize::MAX)
+}
+
+/// Lossless `usize -> u32` ID conversion (saturating to `u32::MAX` if arena exceeds `u32::MAX`).
+#[inline]
+pub(crate) fn usize_to_u32(v: usize) -> u32 {
+    u32::try_from(v).unwrap_or(u32::MAX)
+}
+
 /// One operation node in a hash-consed [`ExprGraph`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Op {
@@ -134,6 +162,11 @@ pub enum Op {
     Sqrt(ExprId),
     Tanh(ExprId),
     Abs(ExprId),
+    /// Piecewise branch: `if cond > 0.0 { then_val } else { else_val }`.
+    /// Enables differentiable `relu`, `max`, `min`, `clamp`, and piecewise CAD/physics fields.
+    Select(ExprId, ExprId, ExprId),
+    /// Fused multiply-add: `a.mul_add(b, c)` (`a * b + c` in one IEEE-754 rounding step).
+    Fma(ExprId, ExprId, ExprId),
 }
 
 impl Op {
@@ -169,31 +202,31 @@ pub fn det_tanh(x: f64) -> f64 {
 }
 
 /// Hash-consed symbolic expression DAG backed by an explicit caller-provided allocator `A`.
-pub struct ExprGraph<A: Allocator + Clone> {
+pub struct ExprGraph<A: Allocator + Copy> {
     nodes: OwnVec<Op, A>,
     intern_map: Map<Op, ExprId, FixedState, A>,
     var_names: OwnVec<OwnString<A>, A>,
     alloc: A,
 }
 
-impl<A: Allocator + Clone> ExprGraph<A> {
+impl<A: Allocator + Copy> ExprGraph<A> {
     /// Construct an empty expression graph using allocator `alloc`.
     pub fn new_in(alloc: A) -> Self {
         Self {
-            nodes: OwnVec::new_in(alloc.clone()),
+            nodes: OwnVec::new_in(alloc),
             intern_map: Map::new(MapOpts {
                 hasher: FixedState,
-                alloc: alloc.clone(),
+                alloc: alloc,
                 capacity: None,
             }),
-            var_names: OwnVec::new_in(alloc.clone()),
+            var_names: OwnVec::new_in(alloc),
             alloc,
         }
     }
 
     #[inline]
     pub fn alloc(&self) -> A {
-        self.alloc.clone()
+        self.alloc
     }
 
     #[inline]
@@ -209,14 +242,14 @@ impl<A: Allocator + Clone> ExprGraph<A> {
     #[inline]
     pub fn node(&self, id: ExprId) -> Result<Op, AlgebraError> {
         self.nodes
-            .get(id.0 as usize)
+            .get(u32_to_usize(id.0))
             .copied()
             .ok_or(AlgebraError::InvalidExpr { expr: id, node_count: self.nodes.len() })
     }
 
     #[inline]
     pub fn var_name(&self, var: VarId) -> Option<&str> {
-        self.var_names.get(var.0 as usize).map(|s| s.as_str())
+        self.var_names.get(u32_to_usize(var.0)).map(|s| s.as_str())
     }
 
     #[inline]
@@ -228,13 +261,13 @@ impl<A: Allocator + Clone> ExprGraph<A> {
     pub fn var(&mut self, name: &str) -> (VarId, ExprId) {
         for (idx, existing) in self.var_names.iter().enumerate() {
             if existing.as_str() == name {
-                let vid = VarId(idx as u32);
+                let vid = VarId(usize_to_u32(idx));
                 let eid = self.intern(Op::Var(vid));
                 return (vid, eid);
             }
         }
-        let vid = VarId(self.var_names.len() as u32);
-        self.var_names.push(OwnString::from_str_in(name, self.alloc.clone()));
+        let vid = VarId(usize_to_u32(self.var_names.len()));
+        self.var_names.push(OwnString::from_str_in(name, self.alloc));
         let eid = self.intern(Op::Var(vid));
         (vid, eid)
     }
@@ -246,7 +279,7 @@ impl<A: Allocator + Clone> ExprGraph<A> {
         if let Some(&existing) = self.intern_map.get(&normalized) {
             return existing;
         }
-        let id = ExprId(self.nodes.len() as u32);
+        let id = ExprId(usize_to_u32(self.nodes.len()));
         self.nodes.push(normalized);
         self.intern_map.insert(normalized, id);
         id
@@ -327,8 +360,48 @@ impl<A: Allocator + Clone> ExprGraph<A> {
         self.intern(Op::Abs(a))
     }
 
+    /// Piecewise branch: `if cond > 0.0 { then_val } else { else_val }`.
+    #[inline]
+    pub fn select(&mut self, cond: ExprId, then_val: ExprId, else_val: ExprId) -> ExprId {
+        self.intern(Op::Select(cond, then_val, else_val))
+    }
+
+    /// Fused multiply-add: `a.mul_add(b, c)` (`a * b + c`).
+    #[inline]
+    pub fn fma(&mut self, a: ExprId, b: ExprId, c: ExprId) -> ExprId {
+        self.intern(Op::Fma(a, b, c))
+    }
+
+    /// Rectified linear unit `max(0, x) = select(x, x, 0)`.
+    #[inline]
+    pub fn relu(&mut self, x: ExprId) -> ExprId {
+        let z = self.lit(0.0);
+        self.select(x, x, z)
+    }
+
+    /// Differentiable piecewise maximum `select(a - b, a, b)`.
+    #[inline]
+    pub fn max_expr(&mut self, a: ExprId, b: ExprId) -> ExprId {
+        let c = self.sub(a, b);
+        self.select(c, a, b)
+    }
+
+    /// Differentiable piecewise minimum `select(b - a, a, b)`.
+    #[inline]
+    pub fn min_expr(&mut self, a: ExprId, b: ExprId) -> ExprId {
+        let c = self.sub(b, a);
+        self.select(c, a, b)
+    }
+
+    /// Differentiable piecewise clamp `min(max(x, lo), hi)`.
+    #[inline]
+    pub fn clamp_expr(&mut self, x: ExprId, lo: ExprId, hi: ExprId) -> ExprId {
+        let ge = self.max_expr(x, lo);
+        self.min_expr(ge, hi)
+    }
+
     fn const_of(&self, id: ExprId) -> Option<f64> {
-        self.nodes.get(id.0 as usize).and_then(|op| op.as_const())
+        self.nodes.get(u32_to_usize(id.0)).and_then(|op| op.as_const())
     }
 
     fn normalize_op(&self, op: Op) -> Op {
@@ -337,8 +410,8 @@ impl<A: Allocator + Clone> ExprGraph<A> {
                 if let Some(c) = self.const_of(a) {
                     return Op::const_f64(-c);
                 }
-                if let Some(&Op::Neg(inner)) = self.nodes.get(a.0 as usize) {
-                    if let Some(&inner_op) = self.nodes.get(inner.0 as usize) {
+                if let Some(&Op::Neg(inner)) = self.nodes.get(u32_to_usize(a.0)) {
+                    if let Some(&inner_op) = self.nodes.get(u32_to_usize(inner.0)) {
                         return inner_op;
                     }
                 }
@@ -349,12 +422,12 @@ impl<A: Allocator + Clone> ExprGraph<A> {
                     return Op::const_f64(ca + cb);
                 }
                 if self.const_of(a) == Some(0.0) {
-                    if let Some(&bop) = self.nodes.get(b.0 as usize) {
+                    if let Some(&bop) = self.nodes.get(u32_to_usize(b.0)) {
                         return bop;
                     }
                 }
                 if self.const_of(b) == Some(0.0) {
-                    if let Some(&aop) = self.nodes.get(a.0 as usize) {
+                    if let Some(&aop) = self.nodes.get(u32_to_usize(a.0)) {
                         return aop;
                     }
                 }
@@ -368,7 +441,7 @@ impl<A: Allocator + Clone> ExprGraph<A> {
                     return Op::const_f64(ca - cb);
                 }
                 if self.const_of(b) == Some(0.0) {
-                    if let Some(&aop) = self.nodes.get(a.0 as usize) {
+                    if let Some(&aop) = self.nodes.get(u32_to_usize(a.0)) {
                         return aop;
                     }
                 }
@@ -385,12 +458,12 @@ impl<A: Allocator + Clone> ExprGraph<A> {
                     return Op::const_f64(0.0);
                 }
                 if self.const_of(a) == Some(1.0) {
-                    if let Some(&bop) = self.nodes.get(b.0 as usize) {
+                    if let Some(&bop) = self.nodes.get(u32_to_usize(b.0)) {
                         return bop;
                     }
                 }
                 if self.const_of(b) == Some(1.0) {
-                    if let Some(&aop) = self.nodes.get(a.0 as usize) {
+                    if let Some(&aop) = self.nodes.get(u32_to_usize(a.0)) {
                         return aop;
                     }
                 }
@@ -406,12 +479,9 @@ impl<A: Allocator + Clone> ExprGraph<A> {
                     return Op::const_f64(0.0);
                 }
                 if self.const_of(b) == Some(1.0) {
-                    if let Some(&aop) = self.nodes.get(a.0 as usize) {
+                    if let Some(&aop) = self.nodes.get(u32_to_usize(a.0)) {
                         return aop;
                     }
-                }
-                if a == b {
-                    return Op::const_f64(1.0);
                 }
                 Op::Div(a, b)
             }
@@ -420,7 +490,7 @@ impl<A: Allocator + Clone> ExprGraph<A> {
                     return Op::const_f64(1.0);
                 }
                 if self.const_of(b) == Some(1.0) {
-                    if let Some(&aop) = self.nodes.get(a.0 as usize) {
+                    if let Some(&aop) = self.nodes.get(u32_to_usize(a.0)) {
                         return aop;
                     }
                 }
@@ -481,6 +551,28 @@ impl<A: Allocator + Clone> ExprGraph<A> {
                 }
                 Op::Abs(a)
             }
+            Op::Select(c, t, e) => {
+                if t == e {
+                    if let Some(&top) = self.nodes.get(u32_to_usize(t.0)) {
+                        return top;
+                    }
+                }
+                if let Some(cv) = self.const_of(c) {
+                    let chosen = if cv > 0.0 { t } else { e };
+                    if let Some(&cop) = self.nodes.get(u32_to_usize(chosen.0)) {
+                        return cop;
+                    }
+                }
+                Op::Select(c, t, e)
+            }
+            Op::Fma(a, b, c) => {
+                if let (Some(av), Some(bv), Some(cv)) =
+                    (self.const_of(a), self.const_of(b), self.const_of(c))
+                {
+                    return Op::const_f64(blaze_math::mul_add(av, bv, cv));
+                }
+                Op::Fma(a, b, c)
+            }
             other => other,
         }
     }
@@ -488,10 +580,10 @@ impl<A: Allocator + Clone> ExprGraph<A> {
     /// Evaluate `root` deterministically using `blaze-math` with memoization over the DAG.
     pub fn eval(&self, root: ExprId, env: &[f64]) -> Result<f64, AlgebraError> {
         let n = self.nodes.len();
-        if (root.0 as usize) >= n {
+        if u32_to_usize(root.0) >= n {
             return Err(AlgebraError::InvalidExpr { expr: root, node_count: n });
         }
-        let mut cache: OwnVec<Option<f64>, A> = OwnVec::with_capacity_in(n, self.alloc.clone());
+        let mut cache: OwnVec<Option<f64>, A> = OwnVec::with_capacity_in(n, self.alloc);
         for _ in 0..n {
             cache.push(None);
         }
@@ -504,7 +596,7 @@ impl<A: Allocator + Clone> ExprGraph<A> {
         env: &[f64],
         cache: &mut OwnVec<Option<f64>, A>,
     ) -> Result<f64, AlgebraError> {
-        let idx = id.0 as usize;
+        let idx = u32_to_usize(id.0);
         if let Some(v) = cache.get(idx).copied().flatten() {
             return Ok(v);
         }
@@ -512,7 +604,7 @@ impl<A: Allocator + Clone> ExprGraph<A> {
         let val = match op {
             Op::Const(bits) => f64::from_bits(bits),
             Op::Var(v) => *env
-                .get(v.0 as usize)
+                .get(u32_to_usize(v.0))
                 .ok_or(AlgebraError::UnknownVar { var: v, env_len: env.len() })?,
             Op::Neg(a) => -self.eval_memo(a, env, cache)?,
             Op::Add(a, b) => self.eval_memo(a, env, cache)? + self.eval_memo(b, env, cache)?,
@@ -528,6 +620,18 @@ impl<A: Allocator + Clone> ExprGraph<A> {
             Op::Sqrt(a) => blaze_math::sqrt(self.eval_memo(a, env, cache)?),
             Op::Tanh(a) => det_tanh(self.eval_memo(a, env, cache)?),
             Op::Abs(a) => blaze_math::abs(self.eval_memo(a, env, cache)?),
+            Op::Select(c, t, e) => {
+                if self.eval_memo(c, env, cache)? > 0.0 {
+                    self.eval_memo(t, env, cache)?
+                } else {
+                    self.eval_memo(e, env, cache)?
+                }
+            }
+            Op::Fma(a, b, c) => blaze_math::mul_add(
+                self.eval_memo(a, env, cache)?,
+                self.eval_memo(b, env, cache)?,
+                self.eval_memo(c, env, cache)?,
+            ),
         };
         if let Some(slot) = cache.get_mut(idx) {
             *slot = Some(val);
@@ -538,10 +642,10 @@ impl<A: Allocator + Clone> ExprGraph<A> {
     /// Substitute `var := replacement` across `root`, returning a new interned [`ExprId`].
     pub fn substitute(&mut self, root: ExprId, var: VarId, replacement: ExprId) -> Result<ExprId, AlgebraError> {
         let n = self.nodes.len();
-        if (root.0 as usize) >= n {
+        if u32_to_usize(root.0) >= n {
             return Err(AlgebraError::InvalidExpr { expr: root, node_count: n });
         }
-        let mut cache: OwnVec<Option<ExprId>, A> = OwnVec::with_capacity_in(n, self.alloc.clone());
+        let mut cache: OwnVec<Option<ExprId>, A> = OwnVec::with_capacity_in(n, self.alloc);
         for _ in 0..n {
             cache.push(None);
         }
@@ -555,7 +659,7 @@ impl<A: Allocator + Clone> ExprGraph<A> {
         replacement: ExprId,
         cache: &mut OwnVec<Option<ExprId>, A>,
     ) -> Result<ExprId, AlgebraError> {
-        let idx = id.0 as usize;
+        let idx = u32_to_usize(id.0);
         if let Some(hit) = cache.get(idx).copied().flatten() {
             return Ok(hit);
         }
@@ -624,6 +728,18 @@ impl<A: Allocator + Clone> ExprGraph<A> {
                 let sa = self.sub_memo(a, var, replacement, cache)?;
                 self.abs(sa)
             }
+            Op::Select(c, t, e) => {
+                let sc = self.sub_memo(c, var, replacement, cache)?;
+                let st = self.sub_memo(t, var, replacement, cache)?;
+                let se = self.sub_memo(e, var, replacement, cache)?;
+                self.select(sc, st, se)
+            }
+            Op::Fma(a, b, c) => {
+                let sa = self.sub_memo(a, var, replacement, cache)?;
+                let sb = self.sub_memo(b, var, replacement, cache)?;
+                let sc = self.sub_memo(c, var, replacement, cache)?;
+                self.fma(sa, sb, sc)
+            }
         };
         if let Some(slot) = cache.get_mut(idx) {
             *slot = Some(out);
@@ -634,17 +750,17 @@ impl<A: Allocator + Clone> ExprGraph<A> {
     /// True if `var` occurs anywhere inside the DAG rooted at `root`.
     pub fn contains_var(&self, root: ExprId, var: VarId) -> bool {
         let n = self.nodes.len();
-        if (root.0 as usize) >= n {
+        if u32_to_usize(root.0) >= n {
             return false;
         }
-        let mut seen: OwnVec<bool, A> = OwnVec::with_capacity_in(n, self.alloc.clone());
+        let mut seen: OwnVec<bool, A> = OwnVec::with_capacity_in(n, self.alloc);
         for _ in 0..n {
             seen.push(false);
         }
-        let mut stack: OwnVec<ExprId, A> = OwnVec::new_in(self.alloc.clone());
+        let mut stack: OwnVec<ExprId, A> = OwnVec::new_in(self.alloc);
         stack.push(root);
         while let Some(cur) = stack.pop() {
-            let idx = cur.0 as usize;
+            let idx = u32_to_usize(cur.0);
             if seen.get(idx).copied().unwrap_or(true) {
                 continue;
             }
@@ -668,6 +784,11 @@ impl<A: Allocator + Clone> ExprGraph<A> {
                     stack.push(a);
                     stack.push(b);
                 }
+                Op::Select(c, t, e) | Op::Fma(c, t, e) => {
+                    stack.push(c);
+                    stack.push(t);
+                    stack.push(e);
+                }
             }
         }
         false
@@ -682,11 +803,11 @@ impl<A: Allocator + Clone> ExprGraph<A> {
 /// let (_, y) = s.var("y");
 /// let energy = (x * y).sin() / (s.lit(1.0) + x * x);
 /// ```
-pub struct SymScope<A: Allocator + Clone> {
+pub struct SymScope<A: Allocator + Copy> {
     graph: RefCell<ExprGraph<A>>,
 }
 
-impl<A: Allocator + Clone> SymScope<A> {
+impl<A: Allocator + Copy> SymScope<A> {
     pub fn new_in(alloc: A) -> Self {
         Self { graph: RefCell::new(ExprGraph::new_in(alloc)) }
     }
@@ -707,20 +828,20 @@ impl<A: Allocator + Clone> SymScope<A> {
 }
 
 /// Copyable symbolic expression handle tied to a [`SymScope`].
-pub struct Sym<'g, A: Allocator + Clone> {
+pub struct Sym<'g, A: Allocator + Copy> {
     scope: &'g SymScope<A>,
     id: ExprId,
 }
 
-impl<'g, A: Allocator + Clone> Clone for Sym<'g, A> {
+impl<'g, A: Allocator + Copy> Clone for Sym<'g, A> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'g, A: Allocator + Clone> Copy for Sym<'g, A> {}
+impl<'g, A: Allocator + Copy> Copy for Sym<'g, A> {}
 
-impl<'g, A: Allocator + Clone> Sym<'g, A> {
+impl<'g, A: Allocator + Copy> Sym<'g, A> {
     #[inline]
     pub const fn id(self) -> ExprId {
         self.id
@@ -777,9 +898,39 @@ impl<'g, A: Allocator + Clone> Sym<'g, A> {
         let id = g.pow(self.id, e);
         Self { scope: self.scope, id }
     }
+
+    pub fn select(self, then_val: Self, else_val: Self) -> Self {
+        let id = self.scope.graph.borrow_mut().select(self.id, then_val.id, else_val.id);
+        Self { scope: self.scope, id }
+    }
+
+    pub fn relu(self) -> Self {
+        let id = self.scope.graph.borrow_mut().relu(self.id);
+        Self { scope: self.scope, id }
+    }
+
+    pub fn max(self, other: Self) -> Self {
+        let id = self.scope.graph.borrow_mut().max_expr(self.id, other.id);
+        Self { scope: self.scope, id }
+    }
+
+    pub fn min(self, other: Self) -> Self {
+        let id = self.scope.graph.borrow_mut().min_expr(self.id, other.id);
+        Self { scope: self.scope, id }
+    }
+
+    pub fn clamp(self, lo: Self, hi: Self) -> Self {
+        let id = self.scope.graph.borrow_mut().clamp_expr(self.id, lo.id, hi.id);
+        Self { scope: self.scope, id }
+    }
+
+    pub fn mul_add(self, b: Self, c: Self) -> Self {
+        let id = self.scope.graph.borrow_mut().fma(self.id, b.id, c.id);
+        Self { scope: self.scope, id }
+    }
 }
 
-impl<'g, A: Allocator + Clone> Neg for Sym<'g, A> {
+impl<'g, A: Allocator + Copy> Neg for Sym<'g, A> {
     type Output = Self;
     fn neg(self) -> Self {
         let id = self.scope.graph.borrow_mut().neg(self.id);
@@ -787,7 +938,7 @@ impl<'g, A: Allocator + Clone> Neg for Sym<'g, A> {
     }
 }
 
-impl<'g, A: Allocator + Clone> Add for Sym<'g, A> {
+impl<'g, A: Allocator + Copy> Add for Sym<'g, A> {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
         let id = self.scope.graph.borrow_mut().add(self.id, rhs.id);
@@ -795,7 +946,7 @@ impl<'g, A: Allocator + Clone> Add for Sym<'g, A> {
     }
 }
 
-impl<'g, A: Allocator + Clone> Sub for Sym<'g, A> {
+impl<'g, A: Allocator + Copy> Sub for Sym<'g, A> {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self {
         let id = self.scope.graph.borrow_mut().sub(self.id, rhs.id);
@@ -803,7 +954,7 @@ impl<'g, A: Allocator + Clone> Sub for Sym<'g, A> {
     }
 }
 
-impl<'g, A: Allocator + Clone> Mul for Sym<'g, A> {
+impl<'g, A: Allocator + Copy> Mul for Sym<'g, A> {
     type Output = Self;
     fn mul(self, rhs: Self) -> Self {
         let id = self.scope.graph.borrow_mut().mul(self.id, rhs.id);
@@ -811,7 +962,7 @@ impl<'g, A: Allocator + Clone> Mul for Sym<'g, A> {
     }
 }
 
-impl<'g, A: Allocator + Clone> Div for Sym<'g, A> {
+impl<'g, A: Allocator + Copy> Div for Sym<'g, A> {
     type Output = Self;
     fn div(self, rhs: Self) -> Self {
         let id = self.scope.graph.borrow_mut().div(self.id, rhs.id);

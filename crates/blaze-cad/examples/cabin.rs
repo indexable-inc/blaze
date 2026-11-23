@@ -175,6 +175,10 @@ fn build_cabin(model: &mut Model<'_>) -> Result<(), ModelError> {
     Ok(())
 }
 
+fn write_out(dir: &str, name: &str, bytes: &[u8]) {
+    std::fs::write(format!("{dir}/{name}"), bytes).expect(name);
+}
+
 fn main() -> Result<(), ModelError> {
     let heap = blaze_own::testing::heap();
     let alloc = heap.alloc();
@@ -206,7 +210,7 @@ fn main() -> Result<(), ModelError> {
     println!("=== Blaze CAD Game-Asset Cabin Report ({build_ms:.1} ms) ===");
     print!("{}", Shown(&asset.report));
 
-    std::fs::write(format!("{dir}/cabin.glb"), &asset.glb[..]).expect("write cabin.glb");
+    write_out(&dir, "cabin.glb", &asset.glb[..]);
 
     // WYSIWYG previews rendered directly from the ACTUAL exported, decimated, GPU-ready meshes!
     let view = View {
@@ -230,7 +234,7 @@ fn main() -> Result<(), ModelError> {
         alloc,
         scratch: alloc,
     })?;
-    std::fs::write(format!("{dir}/cabin_mesh.png"), &mesh_png[..]).expect("write cabin_mesh.png");
+    write_out(&dir, "cabin_mesh.png", &mesh_png[..]);
 
     let wire_pic = asset.preview(
         &MATERIALS,
@@ -249,7 +253,7 @@ fn main() -> Result<(), ModelError> {
         alloc,
         scratch: alloc,
     })?;
-    std::fs::write(format!("{dir}/cabin_wireframe.png"), &wire_png[..]).expect("write cabin_wireframe.png");
+    write_out(&dir, "cabin_wireframe.png", &wire_png[..]);
 
     let parts_pic = asset.preview_part_colors(
         view,
@@ -266,7 +270,7 @@ fn main() -> Result<(), ModelError> {
         alloc,
         scratch: alloc,
     })?;
-    std::fs::write(format!("{dir}/cabin_parts.png"), &parts_png[..]).expect("write cabin_parts.png");
+    write_out(&dir, "cabin_parts.png", &parts_png[..]);
     let preview_ms = t1.elapsed().as_secs_f64() * 1e3;
 
     println!(

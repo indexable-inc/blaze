@@ -456,6 +456,11 @@ fn expr(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, e: ExprId) -> fmt::
             StructBase::Expr(b) => node(p, work, "struct", &[W::Path(path), W::Rows(fields), W::S(".."), W::Expr(b)]),
             StructBase::Defaults => node(p, work, "struct", &[W::Path(path), W::Rows(fields), W::S("..")]),
         },
+        Expr::Record { fields, base } => match base {
+            StructBase::None => node(p, work, "record", &[W::Rows(fields)]),
+            StructBase::Expr(b) => node(p, work, "record", &[W::Rows(fields), W::S(".."), W::Expr(b)]),
+            StructBase::Defaults => node(p, work, "record", &[W::Rows(fields), W::S("..")]),
+        },
         Expr::Index { base, index } => node(p, work, "index", &[W::Expr(base), W::Expr(index)]),
         Expr::Closure { row } | Expr::FormatArgs { row } | Expr::MacroCall { row } => {
             work.push(W::Row(row));
@@ -514,6 +519,10 @@ fn pat(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, x: PatId) -> fmt::Re
         Pat::Struct { path, fields, rest } => match rest {
             true => node(p, work, "struct", &[W::Path(path), W::Rows(fields), W::S("..")]),
             false => node(p, work, "struct", &[W::Path(path), W::Rows(fields)]),
+        },
+        Pat::Record { fields, rest } => match rest {
+            true => node(p, work, "record_pat", &[W::Rows(fields), W::S("..")]),
+            false => node(p, work, "record_pat", &[W::Rows(fields)]),
         },
         Pat::Or { alts } => node(p, work, "or", &[W::Pats(alts)]),
         Pat::Slice { elems, .. } => node(p, work, "slice", &[W::Pats(elems)]),
@@ -593,6 +602,8 @@ fn ty(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, t: TypeId) -> fmt::Re
         TypeRef::For { binder, inner } => node(p, work, "for", &[W::Rows(binder), W::Ty(inner)]),
         TypeRef::Pat { base, pat: TyPat::NotNull } => node(p, work, "pattern_type", &[W::Ty(base), W::S("!null")]),
         TypeRef::Pat { base, pat: TyPat::Of(pat) } => node(p, work, "pattern_type", &[W::Ty(base), W::Pat(pat)]),
+        TypeRef::Record(fields) => node(p, work, "record_type", &[W::Rows(fields)]),
+        TypeRef::Union(members) => node(p, work, "union_type", &[W::Types(members)]),
         TypeRef::Error => p.atom("(error)"),
     }
 }

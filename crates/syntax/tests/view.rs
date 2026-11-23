@@ -38,11 +38,11 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every parser fixture, and the sources of `syntax`, `parser` and `hir-def`.
+/// Every parser fixture, and the sources of `syntax`, `parser` and `blaze-lower`.
 fn corpus() -> Vec<(PathBuf, String)> {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let mut paths = Vec::new();
-    for dir in ["parser/test_data", "syntax/src", "parser/src", "hir-def/src"] {
+    for dir in ["parser/test_data", "syntax/src", "parser/src", "blaze-lower/src"] {
         rust_files(&crates.join(dir), &mut paths);
     }
     assert!(paths.len() > 500, "the corpus is {} files", paths.len());

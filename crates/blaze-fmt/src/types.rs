@@ -358,7 +358,7 @@ fn format_function_type(
         Shape::legacy(budget, offset)
     };
 
-    let is_inputs_empty = inputs.len() == 0;
+    let is_inputs_empty = inputs.is_empty();
     let list_lo = context.snippet_provider.span_after(span, "(");
     let (list_str, tactic) = if is_inputs_empty {
         let tactic = get_tactics(&[], &output, shape);

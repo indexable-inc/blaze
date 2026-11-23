@@ -35,7 +35,8 @@
 
 
 extern crate alloc;
-use alloc::vec::Vec;
+use alloc::vec::Vec as AllocVec;
+use blaze_own::Vec;
 mod frame;
 mod term;
 mod value;
@@ -141,7 +142,7 @@ pub(crate) enum V {
 pub(crate) use blaze_build::abi::Pass;
 
 /// The state of one build.
-pub(crate) struct Cx<'a, 'g, 't, A: Allocator + Clone> {
+pub(crate) struct Cx<'a, 'g, 't, A: Allocator + Copy> {
     pub(crate) v: Verified<'a>,
     /// The body's own type table, which its locals, constants and projections name.
     pub(crate) from: PTys<'a>,
@@ -164,7 +165,7 @@ pub(crate) struct Cx<'a, 'g, 't, A: Allocator + Clone> {
     /// How the result leaves: `_0`'s pass.
     pub(crate) ret: Pass,
     /// By function reference place: the instance, and the reference made for it.
-    pub(crate) refs: Vec<Instance, A>,
+    pub(crate) refs: AllocVec<Instance, A>,
     pub(crate) ref_ids: Vec<RefId, A>,
     /// The row being built, which every error names.
     pub(crate) stmt: Option<Stmt>,
@@ -175,7 +176,7 @@ pub(crate) struct Cx<'a, 'g, 't, A: Allocator + Clone> {
 ///
 /// The body is drop-elaborated and verified (`Verified` is the proof); the result is verified
 /// LIR. An unsupported row is refused by name ([`BuildError::Unsupported`]), never skipped.
-pub fn build<A: Allocator + Clone>(
+pub fn build<A: Allocator + Copy>(
     body: Verified<'_>,
     from: PTys<'_>,
     item: ItemKey,
@@ -195,19 +196,19 @@ pub fn build<A: Allocator + Clone>(
         from,
         subst,
         adts,
-        alloc: alloc.clone(),
-        b: Builder::new_in(PTR_BITS, alloc.clone()),
-        layouts: Layouts::new_in(alloc.clone()),
+        alloc: alloc,
+        b: Builder::new_in(PTR_BITS, alloc),
+        layouts: Layouts::new_in(alloc),
         panic: adts.panic(),
-        tys: Vec::new_in(alloc.clone()),
-        lays: Vec::new_in(alloc.clone()),
-        held: Vec::new_in(alloc.clone()),
-        cur: Vec::new_in(alloc.clone()),
-        blocks: Vec::new_in(alloc.clone()),
+        tys: Vec::new_in(alloc),
+        lays: Vec::new_in(alloc),
+        held: Vec::new_in(alloc),
+        cur: Vec::new_in(alloc),
+        blocks: Vec::new_in(alloc),
         exn: None,
         ret: Pass::Ignore,
-        refs: Vec::new_in(alloc.clone()),
-        ref_ids: Vec::new_in(alloc.clone()),
+        refs: AllocVec::new_in(alloc),
+        ref_ids: Vec::new_in(alloc),
         stmt: None,
     };
     cx.frame()?;
@@ -216,18 +217,18 @@ pub fn build<A: Allocator + Clone>(
     Ok(Built {
         func,
         refs: cx.refs,
-        statics: Vec::new_in(alloc.clone()),
-        thread_locals: Vec::new_in(alloc.clone()),
+        statics: AllocVec::new_in(alloc),
+        thread_locals: AllocVec::new_in(alloc),
         // This builder marks no `unreachable` with its construct yet: its records carry no trap
         // rows (blaze-code record.rs `TrapSource`), so a fault in them is said by its code alone.
-        traps: Vec::new_in(alloc.clone()),
-        vtables: Vec::new_in(alloc),
+        traps: AllocVec::new_in(alloc),
+        vtables: AllocVec::new_in(alloc),
         // This builder has no `copy` of its own (blaze-build walk.rs): none counted.
         copy_insts: 0,
     })
 }
 
-impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     pub(crate) fn malformed(&self, what: &'static str) -> BuildError {
         BuildError::Malformed { stmt: self.stmt, what }
     }

@@ -27,13 +27,22 @@ pub struct RootMarks {
     pub driver: bool,
     /// `#![blaze::trust(unsafe, reason = "..")]`: the crate root explains why it uses `unsafe`.
     pub trust_unsafe: bool,
+    /// `#![blaze::uniq]`: crate uses `&uniq` / `ref uniq`, turning on `blaze::mut_ref` deprecation.
+    pub uniq: bool,
     /// The rules whose lint the file denies or forbids, as [`Rule::bit`]s.
     denied: u64,
 }
 
 impl RootMarks {
     /// No mark: a file whose top says none of these.
-    pub const NONE: RootMarks = RootMarks { no_std: false, sans_io: false, driver: false, trust_unsafe: false, denied: 0 };
+    pub const NONE: RootMarks = RootMarks {
+        no_std: false,
+        sans_io: false,
+        driver: false,
+        trust_unsafe: false,
+        uniq: false,
+        denied: 0,
+    };
 
     /// The marks `text`'s leading inner attributes give. Comments and doc comments between them
     /// are passed over; the first token that does not start an inner attribute ends the read.
@@ -61,6 +70,7 @@ impl RootMarks {
             sans_io: self.sans_io || file.sans_io,
             driver: self.driver || file.driver,
             trust_unsafe: self.trust_unsafe || file.trust_unsafe,
+            uniq: self.uniq || file.uniq,
             denied: self.denied | file.denied,
         }
     }
@@ -69,8 +79,9 @@ impl RootMarks {
     /// equal. The rules they add ([`RootMarks::rules`]) are a function of it, so a key that has
     /// it covers them.
     pub const fn key(&self) -> u64 {
-        const _: () = assert!(Rule::COUNT < 60, "RootMarks::key reserves bits 60..64 for flags");
+        const _: () = assert!(Rule::COUNT < 59, "RootMarks::key reserves bits 59..64 for flags");
         self.denied
+            | (if self.uniq { 1u64 << 59 } else { 0 })
             | (self.no_std as u64) << 60
             | (self.sans_io as u64) << 61
             | (self.driver as u64) << 62
@@ -104,6 +115,9 @@ impl RootMarks {
         if self.sans_io {
             rules = rules.with(Rule::SansIoCore);
         }
+        if self.uniq {
+            rules = rules.with(Rule::MutRef);
+        }
         rules
     }
 
@@ -136,6 +150,7 @@ impl RootMarks {
             "blaze" => match blaze_path(sig) {
                 Some("sans_io") if peek_is(sig, TokenKind::CloseBracket) => self.sans_io = true,
                 Some("driver") if peek_is(sig, TokenKind::CloseBracket) => self.driver = true,
+                Some("uniq") if peek_is(sig, TokenKind::CloseBracket) => self.uniq = true,
                 Some("trust") if peek_is(sig, TokenKind::OpenParen) => {
                     if trust_unsafe(sig) {
                         self.trust_unsafe = true;

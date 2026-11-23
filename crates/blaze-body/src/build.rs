@@ -82,7 +82,7 @@ impl From<VerifyError> for BuildError {
 
 /// Builds a body: make locals, constants and blocks, then fill each block in turn, ending it
 /// with a terminator.
-pub struct BodyBuilder<A: Allocator + Clone> {
+pub struct BodyBuilder<A: Allocator + Copy> {
     body: Body<A>,
     filled: Vec<bool, A>,
     open: Option<Block>,
@@ -100,7 +100,7 @@ pub struct BodyBuilder<A: Allocator + Clone> {
 /// The record's types and the overlay's, by node, and their lists, by entries: what
 /// [`BodyBuilder::intern_ty`] and [`BodyBuilder::intern_list`] look up. Built once from the
 /// record's table, O(its size); no borrow of the table is kept.
-struct TypeIndex<A: Allocator + Clone> {
+struct TypeIndex<A: Allocator + Copy> {
     ty_base: u32,
     list_base: u32,
     /// Every type, the record's then the overlay's, by its canonical node (each list the first
@@ -138,7 +138,7 @@ fn find_list<A: Allocator>(
     Err(k)
 }
 
-impl<A: Allocator + Clone> TypeIndex<A> {
+impl<A: Allocator + Copy> TypeIndex<A> {
     /// `l` as its canonical list: the empty list, the first list of its entries, or itself.
     fn canonical_list(&self, l: List) -> List {
         match (l.len, self.canon.get(&l)) {
@@ -234,13 +234,13 @@ impl<A: Allocator + Clone> TypeIndex<A> {
     }
 }
 
-impl<A: Allocator + Clone> BodyBuilder<A> {
+impl<A: Allocator + Copy> BodyBuilder<A> {
     /// An empty body that names the types of `record` (the checked record's table, from
     /// `ck.types.view()`) and may add its own: [`Self::intern_ty`] answers the record's handle
     /// for a node the record holds, else a handle numbered after the record's types. Indexes
     /// the record's nodes and lists once, in `alloc`.
     pub fn new_with_types_in(record: PTys<'_>, alloc: A) -> BodyBuilder<A> {
-        let mut b = BodyBuilder::new_in(alloc.clone());
+        let mut b = BodyBuilder::new_in(alloc);
         // The table the body's handles index, named once so the kept record (kept.rs) can
         // refuse this body written against another table of the same size.
         b.body.table = Some(crate::kept::TableId::of(record));
@@ -256,15 +256,15 @@ impl<A: Allocator + Clone> BodyBuilder<A> {
             list_base,
             nodes: Map::new(MapOpts {
                 hasher: FixedState,
-                alloc: alloc.clone(),
+                alloc,
                 capacity: Some(ty_base as usize),
             }),
             lists: Map::new(MapOpts {
                 hasher: FixedState,
-                alloc: alloc.clone(),
+                alloc,
                 capacity: Some((list_base as usize).min(ty_base as usize)),
             }),
-            canon: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            canon: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             entries: Vec::with_capacity_in(list_base as usize, alloc),
         };
         for t in record.lists() {
@@ -328,35 +328,35 @@ impl<A: Allocator + Clone> BodyBuilder<A> {
     pub fn new_in(alloc: A) -> BodyBuilder<A> {
         BodyBuilder {
             body: Body {
-                locals: Vec::new_in(alloc.clone()),
-                local_places: Vec::new_in(alloc.clone()),
-                places: Vec::new_in(alloc.clone()),
-                consts: Vec::new_in(alloc.clone()),
-                data: Vec::new_in(alloc.clone()),
-                callees: Vec::new_in(alloc.clone()),
-                stmts: Vec::new_in(alloc.clone()),
-                spans: Vec::new_in(alloc.clone()),
-                stmt_block: Vec::new_in(alloc.clone()),
-                blocks: Vec::new_in(alloc.clone()),
-                operands: Vec::new_in(alloc.clone()),
-                cases: Vec::new_in(alloc.clone()),
-                loans: Vec::new_in(alloc.clone()),
-                subsets: Vec::new_in(alloc.clone()),
-                placeholder: Vec::new_in(alloc.clone()),
-                local_origins: Vec::new_in(alloc.clone()),
-                known: Vec::new_in(alloc.clone()),
+                locals: Vec::new_in(alloc),
+                local_places: Vec::new_in(alloc),
+                places: Vec::new_in(alloc),
+                consts: Vec::new_in(alloc),
+                data: Vec::new_in(alloc),
+                callees: Vec::new_in(alloc),
+                stmts: Vec::new_in(alloc),
+                spans: Vec::new_in(alloc),
+                stmt_block: Vec::new_in(alloc),
+                blocks: Vec::new_in(alloc),
+                operands: Vec::new_in(alloc),
+                cases: Vec::new_in(alloc),
+                loans: Vec::new_in(alloc),
+                subsets: Vec::new_in(alloc),
+                placeholder: Vec::new_in(alloc),
+                local_origins: Vec::new_in(alloc),
+                known: Vec::new_in(alloc),
                 ty_base: NONE,
                 list_base: NONE,
-                tys: Vec::new_in(alloc.clone()),
-                ty_lists: Vec::new_in(alloc.clone()),
+                tys: Vec::new_in(alloc),
+                ty_lists: Vec::new_in(alloc),
                 table: None,
             },
-            filled: Vec::new_in(alloc.clone()),
+            filled: Vec::new_in(alloc),
             open: None,
             error: None,
-            places_index: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
-            consts_index: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
-            bytes_index: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
+            places_index: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            consts_index: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            bytes_index: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             types: None,
         }
     }

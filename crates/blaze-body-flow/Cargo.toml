@@ -15,10 +15,14 @@ doctest = false
 
 # core only beside the crates it names; the allocator is a value the caller passes in.
 [dependencies]
+# Proof-carrying MIR <-> symbolic algebra pass (`algebra` module).
+blaze-algebra.workspace = true
 # `Verified`, every row form: what is projected.
 blaze-body.workspace = true
 # `FlowBuilder`, `Flow`, `moves::{inits, drop_kind}`: what it is projected to, and the drop kinds read back.
 blaze-flow.workspace = true
+# `blaze-math` elementary functions used by the MIR algebra pass.
+blaze-math.workspace = true
 # `Vec`: the maps, in the allocator the caller names.
 blaze-own.workspace = true
 # The oracle (tests/equal_flows.rs, feature `oracle` only): the old lowering and the new one, so
@@ -34,10 +38,19 @@ blaze-body-lower = { workspace = true, optional = true }
 oracle = ["dep:blaze-flow-lower", "dep:blaze-body-lower"]
 
 [dev-dependencies]
+# End-to-end MIR -> LIR lowering and execution tests for `algebra` MIR passes.
+blaze-body-build.workspace = true
+blaze-body-lower.workspace = true
+blaze-build.workspace = true
+blaze-emit.workspace = true
+blaze-flow-lower.workspace = true
+blaze-lir = { workspace = true, features = ["eval"] }
 # The fixture world and the type checker the oracle's bodies are checked by.
 blaze-typeck = { workspace = true, features = ["testing"] }
 # `testing::heap()`: a test's root allocator capability (D102).
 blaze-own = { workspace = true, features = ["std", "testing"] }
+# Property-based tests for `algebra` MIR passes.
+blaze-sim.workspace = true
 
 [[test]]
 name = "equal_flows"

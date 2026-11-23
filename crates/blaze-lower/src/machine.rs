@@ -1612,7 +1612,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             }
             REF_TYPE => {
                 let lifetime = self.first(f, V::Lifetime).map(|v| NameIdx(v.id));
-                let mutbl = if self.has_tok(f, MUT_KW) { Mutbl::Mut } else { Mutbl::Not };
+                let mutbl = if self.has_tok(f, MUT_KW) || self.has_tok(f, UNIQ_KW) { Mutbl::Mut } else { Mutbl::Not };
                 let inner = self.first(f, V::Type);
                 self.done(f);
                 self.type_of(inner, r, |inner| TypeRef::Ref { mutbl, lifetime, inner });
@@ -1714,7 +1714,19 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let t = self.put_type(t, r);
                 self.push(V::Type, t.0, r);
             }
-            UNSAFE_BINDER_TYPE | UNION_TYPE | RECORD_TYPE => {
+            RECORD_TYPE => {
+                let fields = self.list_of(f, L::Fields(Shape::Record)).map_or(List { start: 0, len: 0 }, |l| l.0);
+                self.done(f);
+                let t = self.put_type(TypeRef::Record(fields), r);
+                self.push(V::Type, t.0, r);
+            }
+            UNION_TYPE => {
+                let members = self.put_ids(f, V::Type);
+                self.done(f);
+                let t = self.put_type(TypeRef::Union(members), r);
+                self.push(V::Type, t.0, r);
+            }
+            UNSAFE_BINDER_TYPE => {
                 self.done(f);
                 self.unhandled(f.kind, r, Why::Kind);
                 let t = self.put_type(TypeRef::Error, r);
@@ -1724,7 +1736,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let s = self.kid(f, 0, |v| matches!(v, V::Tok(STRING)));
                 self.done(f);
                 let mut node = Node::of(0);
-                node.a = s.is_some() as u32;
+                node.a = u32::from(s.is_some());
                 self.vals.push(Val { v: V::Abi, id: NONE, node, range: s.map_or(r, |s| s.range) });
             }
             // Bounds and generics.
@@ -2185,7 +2197,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             }
             REF_EXPR => {
                 let raw = self.has_tok(f, RAW_KW);
-                let mutbl = if self.has_tok(f, MUT_KW) { Mutbl::Mut } else { Mutbl::Not };
+                let mutbl = if self.has_tok(f, MUT_KW) || self.has_tok(f, UNIQ_KW) { Mutbl::Mut } else { Mutbl::Not };
                 let e = self.first(f, V::Expr);
                 self.done(f);
                 e.map_or(Expr::Missing, |e| Expr::Ref { mutbl, raw, operand: ExprId(e.id) })
@@ -2232,6 +2244,14 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                             _ => StructBase::None,
                         };
                         Expr::Struct { path: PathIdx(p.id), fields: List { start: l.id, len: l.node.a }, base }
+                    }
+                    (None, Some(l)) => {
+                        let base = match l.node.b {
+                            1 => StructBase::Expr(ExprId(l.node.c)),
+                            2 => StructBase::Defaults,
+                            _ => StructBase::None,
+                        };
+                        Expr::Record { fields: List { start: l.id, len: l.node.a }, base }
                     }
                     _ => Expr::Missing,
                 }
@@ -2497,9 +2517,10 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         let p = match f.kind {
             IDENT_PAT => {
                 let by_ref = self.has_tok(f, REF_KW);
-                let mutable = self.has_tok(f, MUT_KW);
+                let mutable = self.has_tok(f, MUT_KW) || (by_ref && self.has_tok(f, UNIQ_KW));
                 let name = self.first(f, V::Name);
                 let sub = self.first(f, V::Pat).map(|v| PatId(v.id));
+                let has_typed_ascription = self.first(f, V::Type).is_some();
                 self.done(f);
                 let Some(name) = name else { return };
                 let ann = BindAnn { by_ref: by_ref.then_some(if mutable { Mutbl::Mut } else { Mutbl::Not }), mutable: mutable && !by_ref };
@@ -2507,7 +2528,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let p = self.put_pat(Pat::Bind { ann, name, sub, shadows: None }, r);
                 // Settled at the end, when every block's items are known: a bare name that
                 // is a constant, a unit struct or a unit variant becomes a path pattern.
-                let bare = !by_ref && !mutable && sub.is_none();
+                let bare = !by_ref && !mutable && sub.is_none() && !has_typed_ascription;
                 self.idents.push(Ident { pat: p.0, scope: self.scope().0, bare });
                 let hash = self.local_key(name);
                 self.push_pending(hash, p);
@@ -2541,7 +2562,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 return;
             }
             REF_PAT => {
-                let mutbl = if self.has_tok(f, MUT_KW) { Mutbl::Mut } else { Mutbl::Not };
+                let mutbl = if self.has_tok(f, MUT_KW) || self.has_tok(f, UNIQ_KW) { Mutbl::Mut } else { Mutbl::Not };
                 let p = self.first(f, V::Pat);
                 self.done(f);
                 p.map_or(Pat::Missing, |p| Pat::Ref { mutbl, inner: PatId(p.id) })
@@ -2573,6 +2594,10 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 match (path, fields) {
                     (Some(p), Some(l)) => Pat::Struct {
                         path: PathIdx(p.id),
+                        fields: List { start: l.id, len: l.node.a },
+                        rest: l.node.b == 1,
+                    },
+                    (None, Some(l)) => Pat::Record {
                         fields: List { start: l.id, len: l.node.a },
                         rest: l.node.b == 1,
                     },
@@ -2979,7 +3004,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
 
     fn self_param(&mut self, f: &Frame, r: Range) {
         let amp = self.has_tok(f, AMP);
-        let mutable = self.has_tok(f, MUT_KW);
+        let mutable = self.has_tok(f, MUT_KW) || (amp && self.has_tok(f, UNIQ_KW));
         let lifetime = self.first(f, V::Lifetime).map(|v| NameIdx(v.id));
         let name = self.first(f, V::Name);
         let ty = self.first(f, V::Type).map(|v| TypeId(v.id));

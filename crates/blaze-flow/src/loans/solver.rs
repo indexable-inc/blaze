@@ -64,9 +64,9 @@ struct Input<A: Allocator> {
     loans: Vec<LoanWord, A>,
 }
 
-impl<A: Allocator + Clone> Input<A> {
+impl<A: Allocator + Copy> Input<A> {
     fn new(alloc: A) -> Self {
-        Self { edges: Vec::new_in(alloc.clone()), loans: Vec::new_in(alloc) }
+        Self { edges: Vec::new_in(alloc), loans: Vec::new_in(alloc) }
     }
 
     fn clear(&mut self) {
@@ -137,11 +137,11 @@ struct Inputs<A: Allocator> {
     free: Vec<usize, A>,
 }
 
-impl<A: Allocator + Clone> Inputs<A> {
+impl<A: Allocator + Copy> Inputs<A> {
     fn new(points: usize, alloc: A) -> Self {
         Self {
-            slot: Vec::from_elem_in(None, points, alloc.clone()),
-            rows: Vec::new_in(alloc.clone()), free: Vec::new_in(alloc),
+            slot: Vec::from_elem_in(None, points, alloc),
+            rows: Vec::new_in(alloc), free: Vec::new_in(alloc),
         }
     }
 
@@ -172,20 +172,20 @@ struct Scratch<A: Allocator> {
     first: BTreeMap<Edge, Point, A>,
 }
 
-impl<A: Allocator + Clone> Scratch<A> {
+impl<A: Allocator + Copy> Scratch<A> {
     fn new(flow: &Flow<A>, alloc: A) -> Self {
         let words = flow.loans.len().div_ceil(64);
-        let mut return_origin = Vec::from_elem_in(false, flow.origins as usize, alloc.clone());
+        let mut return_origin = Vec::from_elem_in(false, flow.origins as usize, alloc);
         for &(local, origin) in &flow.local_origins {
             if local == Local(0) { return_origin[origin.index()] = true; }
         }
         Self {
-            graph: Components::new(alloc.clone()), component_loans: Vec::new_in(alloc.clone()),
-            closed: Vec::new_in(alloc.clone()), placeholders: Vec::new_in(alloc.clone()),
-            live_loans: Vec::from_elem_in(0, words, alloc.clone()),
-            killed: Vec::from_elem_in(0, words, alloc.clone()),
-            returned: Vec::from_elem_in(0, words, alloc.clone()), return_origin,
-            invalid: BTreeSet::new_in(alloc.clone()), first: BTreeMap::new_in(alloc),
+            graph: Components::new(alloc), component_loans: Vec::new_in(alloc),
+            closed: Vec::new_in(alloc), placeholders: Vec::new_in(alloc),
+            live_loans: Vec::from_elem_in(0, words, alloc),
+            killed: Vec::from_elem_in(0, words, alloc),
+            returned: Vec::from_elem_in(0, words, alloc), return_origin,
+            invalid: BTreeSet::new_in(alloc), first: BTreeMap::new_in(alloc),
         }
     }
 
@@ -307,7 +307,7 @@ impl<A: Allocator + Clone> Scratch<A> {
     }
 }
 
-pub(super) fn solve<A: Allocator + Clone, N>(
+pub(super) fn solve<A: Allocator + Copy, N>(
     function: N, flow: &Flow<A>, facts: &Facts<A>, plant: Plant, alloc: A, meter: &mut Meter,
 ) -> Result<Vec<BorrowFinding, A>, Bound<N>> {
     run(flow, facts, plant, alloc, meter).map_err(|Exhausted| Bound::TierTwo {
@@ -316,14 +316,14 @@ pub(super) fn solve<A: Allocator + Clone, N>(
     })
 }
 
-fn run<A: Allocator + Clone>(
+fn run<A: Allocator + Copy>(
     flow: &Flow<A>, facts: &Facts<A>, plant: Plant, alloc: A, meter: &mut Meter,
 ) -> Result<Vec<BorrowFinding, A>, Exhausted> {
-    let keep = candidates(flow, facts, plant, meter, alloc.clone())?;
-    let mut out = Vec::new_in(alloc.clone());
+    let keep = candidates(flow, facts, plant, meter, alloc)?;
+    let mut out = Vec::new_in(alloc);
     if !keep.origins.iter().any(|&keep| keep) { return Ok(out); }
-    let mut cfg = Points::new(flow, meter, alloc.clone())?;
-    let mut inputs = Inputs::new(flow.stmts.len() * 2, alloc.clone());
+    let mut cfg = Points::new(flow, meter, alloc)?;
+    let mut inputs = Inputs::new(flow.stmts.len() * 2, alloc);
     meter.charge(flow.subsets.len())?;
     for &(s, a, b) in &flow.subsets {
         if a != b && keep.origins[a.index()] && keep.origins[b.index()] {
@@ -340,19 +340,19 @@ fn run<A: Allocator + Clone>(
     for row in &mut inputs.rows { row.normalize(meter)?; }
 
     let check_placeholders = plant != Plant::AllKnown && flow.placeholder.iter().filter(|p| **p).take(2).count() == 2;
-    let mut known = Components::new(alloc.clone());
+    let mut known = Components::new(alloc);
     if check_placeholders && plant != Plant::KnownIgnored && !flow.known.is_empty() {
         known.build(&flow.known, meter)?;
         let targets = Vec::from_iter_in(
             flow.placeholder.iter().enumerate().filter_map(|(i, &p)| p.then_some(Origin(i as u32))),
-            alloc.clone(),
+            alloc,
         );
         known.index_targets(&targets, meter)?;
     }
     meter.charge(flow.local_origins.len())?;
-    let mut scratch = Scratch::new(flow, alloc.clone());
-    let mut source = Input::new(alloc.clone());
-    let mut sent = Input::new(alloc.clone());
+    let mut scratch = Scratch::new(flow, alloc);
+    let mut source = Input::new(alloc);
+    let mut sent = Input::new(alloc);
     let mut merge = Input::new(alloc);
     while let Some(p) = cfg.pop() {
         meter.charge(1)?;

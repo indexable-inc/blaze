@@ -98,6 +98,8 @@
 
 use core::fmt;
 
+use blaze_own::Share;
+
 use super::host::Plant;
 use super::{Duration, Global, NameChange, Named, Op, Rng, Sim, SimFile, keep_ordered};
 use crate::world::disk::{SECTOR, mixed, sectors};
@@ -235,7 +237,7 @@ impl AfterCrash {
         let mut files: Vec<Left> = Vec::with_capacity_in(sim.files.len(), Global);
         for (name, file) in sim.files.iter() {
             // clone: a refcount; the bytes are the disk's copy, which is what is asked.
-            files.push(Left { name: name.clone(), link: file.link, bytes: file.contents() });
+            files.push(Left { name: name.share(), link: file.link, bytes: file.contents() });
         }
         files.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         let mut dirs: Vec<FileName> = Vec::with_capacity_in(sim.host.made.len(), Global);
@@ -411,13 +413,13 @@ fn copy_named(change: &NameChange) -> NameChange {
 fn copy_change_of_name(named: &Named) -> Named {
     // clone: refcounts of names and a copy of the disk at a moment.
     match named {
-        Named::Put { file, was } => Named::Put { file: file.clone(), was: was.as_ref().map(copy_file) },
-        Named::Gone { file, was } => Named::Gone { file: file.clone(), was: copy_file(was) },
+        Named::Put { file, was } => Named::Put { file: file.share(), was: was.as_ref().map(copy_file) },
+        Named::Gone { file, was } => Named::Gone { file: file.share(), was: copy_file(was) },
         Named::Moved { from, to, was } => {
-            Named::Moved { from: from.clone(), to: to.clone(), was: was.as_ref().map(copy_file) }
+            Named::Moved { from: from.share(), to: to.share(), was: was.as_ref().map(copy_file) }
         }
-        Named::MadeDir { dir } => Named::MadeDir { dir: dir.clone() },
-        Named::RemovedDir { dir } => Named::RemovedDir { dir: dir.clone() },
+        Named::MadeDir { dir } => Named::MadeDir { dir: dir.share() },
+        Named::RemovedDir { dir } => Named::RemovedDir { dir: dir.share() },
     }
 }
 
@@ -426,7 +428,7 @@ impl DiskCopy {
         let mut files: Vec<(FileName, SimFile)> = Vec::with_capacity_in(sim.files.len(), Global);
         for (name, file) in sim.files.iter() {
             // clone: a refcount.
-            files.push((name.clone(), copy_file(file)));
+            files.push((name.share(), copy_file(file)));
         }
         files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let mut names = Vec::with_capacity_in(sim.names.len(), Global);
@@ -444,7 +446,7 @@ impl DiskCopy {
     fn restore(&self, sim: &mut Sim) {
         for (name, file) in &self.files {
             // clone: a refcount.
-            sim.files.insert(name.clone(), copy_file(file));
+            sim.files.insert(name.share(), copy_file(file));
         }
         // clone: refcounts.
         sim.host.made.extend(self.dirs.iter().cloned());
@@ -523,7 +525,7 @@ impl Steps<'_> {
     /// not enumerate.
     fn keep(&mut self, step: &'static str) -> Result<(), Refused> {
         let after = self.moments.len();
-        if self.sim.pending.len() > 0 {
+        if !self.sim.pending.is_empty() {
             return Err(Refused::InFlight { after, effects: self.sim.pending.len() });
         }
         if !self.sim.drawn.is_empty() {
@@ -532,7 +534,7 @@ impl Steps<'_> {
         for (name, file) in self.sim.files.iter() {
             if file.link && core::str::from_utf8(&file.contents()).is_err() {
                 // clone: a refcount, for the error.
-                return Err(Refused::LinkNotText { name: name.clone() });
+                return Err(Refused::LinkNotText { name: name.share() });
             }
         }
         self.moments.push(Moment { after, step, disk: DiskCopy::of(self.sim) });
@@ -612,7 +614,7 @@ fn rebuilt(disk: &AfterCrash, seed: u64) -> Sim {
         let mut file = SimFile::whole(left.bytes.clone());
         file.link = left.link;
         // clone: a refcount.
-        sim.files.insert(left.name.clone(), file);
+        sim.files.insert(left.name.share(), file);
     }
     // clone: refcounts; sorted, as `made` is kept.
     sim.host.made.extend(disk.dirs.iter().cloned());
@@ -815,7 +817,7 @@ fn take(files: &mut Vec<Left>, name: &FileName) -> Option<Left> {
 /// A file put back by an undo: its durable bytes, as `SimFile::durable_only` leaves it.
 fn put_back(name: &FileName, was: &SimFile) -> Left {
     // clone: a refcount and the rebuilt disk's own bytes.
-    Left { name: name.clone(), link: was.link, bytes: was.durable.clone() }
+    Left { name: name.share(), link: was.link, bytes: was.durable.clone() }
 }
 
 /// The disk one crash point leaves, as `crash_with` makes it: each file's cut, then each
@@ -831,7 +833,7 @@ fn left_by(disk: &DiskCopy, files: &[FileCut], undone: &[bool]) -> AfterCrash {
             Some(tear) => mixed(&file.after(cut.whole), &file.after(tear.upto), tear.len, &tear.landed),
         };
         // clone: a refcount.
-        left.push(Left { name: name.clone(), link: file.link, bytes });
+        left.push(Left { name: name.share(), link: file.link, bytes });
     }
     for (change, undo) in disk.names.iter().zip(undone).rev() {
         if !*undo {
@@ -848,7 +850,7 @@ fn left_by(disk: &DiskCopy, files: &[FileCut], undone: &[bool]) -> AfterCrash {
             Named::Moved { from, to, was } => {
                 if let Some(moved) = take(&mut left, to) {
                     // clone: a refcount.
-                    put(&mut left, Left { name: from.clone(), ..moved });
+                    put(&mut left, Left { name: from.share(), ..moved });
                 }
                 if let Some(was) = was {
                     put(&mut left, put_back(to, was));
@@ -864,7 +866,7 @@ fn left_by(disk: &DiskCopy, files: &[FileCut], undone: &[bool]) -> AfterCrash {
             Named::RemovedDir { dir } => match dirs.binary_search(dir) {
                 Ok(_) => unreachable!("{dir}: a directory whose removal is undone is not there: a later make of it was undone first"),
                 // clone: a refcount.
-                Err(at) => dirs.insert(at, dir.clone()),
+                Err(at) => dirs.insert(at, dir.share()),
             },
         }
     }
@@ -887,7 +889,7 @@ fn enumerate(moment: &Moment) -> Result<Vec<(CrashPoint, AfterCrash)>, Refused> 
                 let mut files = Vec::with_capacity_in(lists.len(), Global);
                 for ((((name, file), (kept, _)), list), at) in disk.files.iter().zip(&cut).zip(&lists).zip(&index) {
                     // clone: a refcount and the point's own copy of its tear.
-                    files.push(FileCut { name: name.clone(), changes: file.ops.len(), whole: *kept, tear: list[*at].clone() });
+                    files.push(FileCut { name: name.share(), changes: file.ops.len(), whole: *kept, tear: list[*at].clone() });
                 }
                 for set in &undone {
                     let left = left_by(disk, &files, set);

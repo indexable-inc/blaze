@@ -67,21 +67,21 @@ pub(super) struct Components<A: Allocator> {
     touched: Vec<usize, A>,
 }
 
-impl<A: Allocator + Clone> Components<A> {
+impl<A: Allocator + Copy> Components<A> {
     pub(super) fn new(alloc: A) -> Self {
         Self {
-            by_origin: Vec::new_in(alloc.clone()),
-            vertices: Vec::new_in(alloc.clone()),
-            edges: Vec::new_in(alloc.clone()),
-            dfs: Vec::new_in(alloc.clone()),
-            pending: Vec::new_in(alloc.clone()),
-            groups: Vec::new_in(alloc.clone()),
-            members: Vec::new_in(alloc.clone()),
-            outgoing: Vec::new_in(alloc.clone()),
-            reach: Vec::new_in(alloc.clone()),
-            target_offsets: Vec::new_in(alloc.clone()),
-            target_origins: Vec::new_in(alloc.clone()),
-            scratch: Vec::new_in(alloc.clone()),
+            by_origin: Vec::new_in(alloc),
+            vertices: Vec::new_in(alloc),
+            edges: Vec::new_in(alloc),
+            dfs: Vec::new_in(alloc),
+            pending: Vec::new_in(alloc),
+            groups: Vec::new_in(alloc),
+            members: Vec::new_in(alloc),
+            outgoing: Vec::new_in(alloc),
+            reach: Vec::new_in(alloc),
+            target_offsets: Vec::new_in(alloc),
+            target_origins: Vec::new_in(alloc),
+            scratch: Vec::new_in(alloc),
             touched: Vec::new_in(alloc),
         }
     }

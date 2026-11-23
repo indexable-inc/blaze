@@ -186,7 +186,9 @@ pub fn convert_workspace(
             if stats.structs_changed > 0 {
                 wf.src = updated;
                 total_parameterized_structs += stats.structs_changed;
-                crate_summaries[wf.summary_idx].ast_edits_applied += stats.edits_applied;
+                if let Some(summary) = crate_summaries.get_mut(wf.summary_idx) {
+                    summary.ast_edits_applied += stats.edits_applied;
+                }
             }
         }
     }
@@ -198,7 +200,9 @@ pub fn convert_workspace(
         &mut ws_files,
         alloc_strategy,
         &mut |summary_idx, edits| {
-            crate_summaries[summary_idx].ast_edits_applied += edits;
+            if let Some(summary) = crate_summaries.get_mut(summary_idx) {
+                summary.ast_edits_applied += edits;
+            }
         },
     );
     for wf in ws_files {
@@ -1504,9 +1508,6 @@ fn propagate_and_rewrite_workspace_capabilities(
     // 1. Collect all threadable functions & per-file cross-crate imports across the workspace.
     let mut fns: Vec<FnCapInfo> = Vec::new();
     let mut file_imports: Vec<BTreeMap<String, (String, String)>> = Vec::with_capacity(files.len());
-    let mut free_fn_counts: BTreeMap<(usize, String), usize> = BTreeMap::new();
-    let mut method_counts: BTreeMap<(usize, String), usize> = BTreeMap::new();
-    let mut pub_fn_counts: BTreeMap<(String, String), usize> = BTreeMap::new();
 
     for (file_idx, wf) in files.iter().enumerate() {
         let summary_idx = &wf.summary_idx;
@@ -1542,14 +1543,6 @@ fn propagate_and_rewrite_workspace_capabilities(
                 && func
                     .visibility()
                     .is_some_and(|v| v.syntax().text().to_string().trim() == "pub");
-            if is_method {
-                *method_counts.entry((*summary_idx, name.clone())).or_default() += 1;
-            } else {
-                *free_fn_counts.entry((*summary_idx, name.clone())).or_default() += 1;
-                if is_pub {
-                    *pub_fn_counts.entry((crate_ident.clone(), name.clone())).or_default() += 1;
-                }
-            }
 
             let mut already_has = BTreeSet::new();
             if let Some(plist) = func.param_list() {
@@ -1602,47 +1595,53 @@ fn propagate_and_rewrite_workspace_capabilities(
         file_imports.push(imports);
     }
 
-    // Build unambiguous lookup tables (per-crate free fns, per-crate methods, workspace pub fns).
-    let mut free_fn_idx: BTreeMap<(usize, String), usize> = BTreeMap::new();
-    let mut method_idx: BTreeMap<(usize, String), usize> = BTreeMap::new();
-    let mut ws_pub_fn_idx: BTreeMap<(String, String), usize> = BTreeMap::new();
+    // Build unambiguous lookup tables using borrowed `&str` keys (single pass: `Some(idx)` = unique,
+    // `None` = ambiguous).
+    let mut free_fn_idx: BTreeMap<(usize, &str), Option<usize>> = BTreeMap::new();
+    let mut method_idx: BTreeMap<(usize, &str), Option<usize>> = BTreeMap::new();
+    let mut ws_pub_fn_idx: BTreeMap<(&str, &str), Option<usize>> = BTreeMap::new();
     for (idx, f) in fns.iter().enumerate() {
         if !f.is_method {
-            if free_fn_counts.get(&(f.summary_idx, f.name.clone())).copied() == Some(1) {
-                free_fn_idx.insert((f.summary_idx, f.name.clone()), idx);
+            free_fn_idx.entry((f.summary_idx, f.name.as_str())).and_modify(|s| *s = None).or_insert(Some(idx));
+            if f.is_pub {
+                ws_pub_fn_idx.entry((f.crate_ident.as_str(), f.name.as_str())).and_modify(|s| *s = None).or_insert(Some(idx));
             }
-            if f.is_pub && pub_fn_counts.get(&(f.crate_ident.clone(), f.name.clone())).copied() == Some(1) {
-                ws_pub_fn_idx.insert((f.crate_ident.clone(), f.name.clone()), idx);
-            }
-        } else if method_counts.get(&(f.summary_idx, f.name.clone())).copied() == Some(1)
-            && !is_common_std_method(&f.name)
-        {
-            method_idx.insert((f.summary_idx, f.name.clone()), idx);
+        } else if !is_common_std_method(&f.name) {
+            method_idx.entry((f.summary_idx, f.name.as_str())).and_modify(|s| *s = None).or_insert(Some(idx));
         }
     }
 
     // 2. Bounded workspace-wide call-graph fixpoint: propagate callee capabilities to callers.
+    let mut needed_per_fn: Vec<BTreeSet<CapParam>> =
+        fns.iter().map(|f| f.needed.iter().copied().collect()).collect();
     for _ in 0..MAX_CAP_PROP_ITERS {
         let mut changed = false;
-        let snapshot: Vec<BTreeSet<CapParam>> = fns.iter().map(|f| f.needed.clone()).collect();
-        for f in &mut fns {
-            let before = f.needed.len();
+        let snapshot: BTreeMap<usize, BTreeSet<CapParam>> =
+            needed_per_fn.iter().enumerate().map(|(i, s)| (i, s.iter().copied().collect())).collect();
+        for (needed, f) in needed_per_fn.iter_mut().zip(&fns) {
+            let before = needed.len();
             for callee in &f.free_callees {
-                if let Some(&cidx) = free_fn_idx.get(&(f.summary_idx, callee.clone())) {
-                    f.needed.extend(snapshot[cidx].iter().copied());
+                if let Some(&Some(cidx)) = free_fn_idx.get(&(f.summary_idx, callee.as_str()))
+                    && let Some(caps) = snapshot.get(&cidx)
+                {
+                    needed.extend(caps.iter().copied());
                 }
             }
             for (target_crate, callee) in &f.cross_crate_callees {
-                if let Some(&cidx) = ws_pub_fn_idx.get(&(target_crate.clone(), callee.clone())) {
-                    f.needed.extend(snapshot[cidx].iter().copied());
+                if let Some(&Some(cidx)) = ws_pub_fn_idx.get(&(target_crate.as_str(), callee.as_str()))
+                    && let Some(caps) = snapshot.get(&cidx)
+                {
+                    needed.extend(caps.iter().copied());
                 }
             }
             for callee in &f.method_callees {
-                if let Some(&cidx) = method_idx.get(&(f.summary_idx, callee.clone())) {
-                    f.needed.extend(snapshot[cidx].iter().copied());
+                if let Some(&Some(cidx)) = method_idx.get(&(f.summary_idx, callee.as_str()))
+                    && let Some(caps) = snapshot.get(&cidx)
+                {
+                    needed.extend(caps.iter().copied());
                 }
             }
-            if f.needed.len() > before {
+            if needed.len() > before {
                 changed = true;
             }
         }
@@ -1653,24 +1652,25 @@ fn propagate_and_rewrite_workspace_capabilities(
 
     // Map `(file_idx, fn_start)` -> newly added `CapParam`s (excluding already_has).
     let mut added_by_fn: BTreeMap<(usize, usize), BTreeSet<CapParam>> = BTreeMap::new();
-    let mut added_by_free_name: BTreeMap<(usize, String), BTreeSet<CapParam>> = BTreeMap::new();
-    let mut added_by_method_name: BTreeMap<(usize, String), BTreeSet<CapParam>> = BTreeMap::new();
-    let mut added_by_ws_pub_fn: BTreeMap<(String, String), BTreeSet<CapParam>> = BTreeMap::new();
-    for f in &fns {
-        let added: BTreeSet<CapParam> = f.needed.difference(&f.already_has).copied().collect();
+    let mut added_by_free_name: BTreeMap<(usize, &str), BTreeSet<CapParam>> = BTreeMap::new();
+    let mut added_by_method_name: BTreeMap<(usize, &str), BTreeSet<CapParam>> = BTreeMap::new();
+    let mut added_by_ws_pub_fn: BTreeMap<(&str, &str), BTreeSet<CapParam>> = BTreeMap::new();
+    for (needed, f) in needed_per_fn.iter().zip(&fns) {
+        let added: BTreeSet<CapParam> =
+            needed.difference(&f.already_has).copied().collect();
         if added.is_empty() {
             continue;
         }
-        added_by_fn.insert((f.file_idx, f.fn_start), added.clone());
+        added_by_fn.insert((f.file_idx, f.fn_start), added.iter().copied().collect());
         if !f.is_method {
-            if free_fn_idx.contains_key(&(f.summary_idx, f.name.clone())) {
-                added_by_free_name.insert((f.summary_idx, f.name.clone()), added.clone());
+            if matches!(free_fn_idx.get(&(f.summary_idx, f.name.as_str())), Some(Some(_))) {
+                added_by_free_name.insert((f.summary_idx, f.name.as_str()), added.iter().copied().collect());
             }
-            if f.is_pub && ws_pub_fn_idx.contains_key(&(f.crate_ident.clone(), f.name.clone())) {
-                added_by_ws_pub_fn.insert((f.crate_ident.clone(), f.name.clone()), added);
+            if f.is_pub && matches!(ws_pub_fn_idx.get(&(f.crate_ident.as_str(), f.name.as_str())), Some(Some(_))) {
+                added_by_ws_pub_fn.insert((f.crate_ident.as_str(), f.name.as_str()), added);
             }
-        } else if method_idx.contains_key(&(f.summary_idx, f.name.clone())) {
-            added_by_method_name.insert((f.summary_idx, f.name.clone()), added);
+        } else if matches!(method_idx.get(&(f.summary_idx, f.name.as_str())), Some(Some(_))) {
+            added_by_method_name.insert((f.summary_idx, f.name.as_str()), added);
         }
     }
 
@@ -1681,7 +1681,7 @@ fn propagate_and_rewrite_workspace_capabilities(
     // 3. Emit signature edits + intra-crate & cross-crate call-site argument forwarding.
     let mut cross_crate_rewrites = 0usize;
 
-    for (file_idx, wf) in files.iter_mut().enumerate() {
+    for (file_idx, (wf, imports)) in files.iter_mut().zip(&file_imports).enumerate() {
         let summary_idx = &wf.summary_idx;
         let crate_ident = &wf.crate_ident;
         let path = &wf.path;
@@ -1689,7 +1689,6 @@ fn propagate_and_rewrite_workspace_capabilities(
         if path == "build.rs" || path.ends_with("/build.rs") {
             continue;
         }
-        let imports = &file_imports[file_idx];
         let parse = SourceFile::parse(src, Edition::CURRENT);
         let root = parse.tree();
         let mut edits: Vec<SpanEdit> = Vec::new();
@@ -1756,7 +1755,7 @@ fn propagate_and_rewrite_workspace_capabilities(
                     edits.push(SpanEdit { start: ins_pos, end: ins_pos, replacement: text });
                 }
                 SyntaxKind::CALL_EXPR => {
-                    let Some(call) = ast::CallExpr::cast(node.clone()) else { continue };
+                    let Some(call) = ast::CallExpr::cast(node) else { continue };
                     let Some(expr) = call.expr() else { continue };
                     let raw_callee = expr.syntax().text().to_string();
                     let compact: String = raw_callee.chars().filter(|c| !c.is_whitespace()).collect();
@@ -1776,27 +1775,29 @@ fn propagate_and_rewrite_workspace_capabilities(
                         && first_seg != crate_ident.as_str()
                         && known_crates.contains(first_seg)
                     {
-                        match added_by_ws_pub_fn.get(&(first_seg.to_owned(), leaf.to_owned())) {
+                        match added_by_ws_pub_fn.get(&(first_seg, leaf)) {
                             Some(a) => (Some(a), true),
                             None => (None, false),
                         }
                     } else if !cleaned.contains("::") {
                         if let Some((target_crate, orig_fn)) = imports.get(leaf) {
-                            match added_by_ws_pub_fn.get(&(target_crate.clone(), orig_fn.clone())) {
+                            match added_by_ws_pub_fn.get(&(target_crate.as_str(), orig_fn.as_str())) {
                                 Some(a) => (Some(a), true),
-                                None => (added_by_free_name.get(&(*summary_idx, leaf.to_owned())), false),
+                                None => (added_by_free_name.get(&(*summary_idx, leaf)), false),
                             }
                         } else {
-                            (added_by_free_name.get(&(*summary_idx, leaf.to_owned())), false)
+                            (added_by_free_name.get(&(*summary_idx, leaf)), false)
                         }
                     } else {
-                        (added_by_free_name.get(&(*summary_idx, leaf.to_owned())), false)
+                        (added_by_free_name.get(&(*summary_idx, leaf)), false)
                     };
 
                     let Some(callee_added) = callee_added else { continue };
                     let Some(arg_list) = call.arg_list() else { continue };
                     let Some(rparen) = arg_list.r_paren_token() else { continue };
-                    if let Some(args_str) = format_forwarded_args(&node, callee_added, file_idx, &added_by_fn) {
+                    if let Some(args_str) =
+                        format_forwarded_args(call.syntax(), callee_added, file_idx, &added_by_fn)
+                    {
                         let ins_pos: usize = rparen.text_range().start().into();
                         let has_args = arg_list.args().next().is_some();
                         let before = src[..ins_pos.min(src.len())].trim_end();
@@ -1815,13 +1816,15 @@ fn propagate_and_rewrite_workspace_capabilities(
                     }
                 }
                 SyntaxKind::METHOD_CALL_EXPR => {
-                    let Some(mc) = ast::MethodCallExpr::cast(node.clone()) else { continue };
+                    let Some(mc) = ast::MethodCallExpr::cast(node) else { continue };
                     let Some(mname_ref) = mc.name_ref() else { continue };
                     let mname = mname_ref.text().to_string();
-                    let Some(callee_added) = added_by_method_name.get(&(*summary_idx, mname)) else { continue };
+                    let Some(callee_added) = added_by_method_name.get(&(*summary_idx, mname.as_str())) else { continue };
                     let Some(arg_list) = mc.arg_list() else { continue };
                     let Some(rparen) = arg_list.r_paren_token() else { continue };
-                    if let Some(args_str) = format_forwarded_args(&node, callee_added, file_idx, &added_by_fn) {
+                    if let Some(args_str) =
+                        format_forwarded_args(mc.syntax(), callee_added, file_idx, &added_by_fn)
+                    {
                         let ins_pos: usize = rparen.text_range().start().into();
                         let has_args = arg_list.args().next().is_some();
                         let before = src[..ins_pos.min(src.len())].trim_end();
@@ -1867,12 +1870,13 @@ pub fn rewrite_struct_alloc_fields_into(
 
     // 1. Inspect structs and rewrite owned-heap fields + add `'a` lifetime param.
     for node in root.syntax().descendants() {
-        let Some(st) = ast::Struct::cast(node.clone()) else { continue };
-        if node.ancestors().any(|a| is_cfg_test_item(&a)) || is_cfg_test_item(&node) {
+        let Some(st) = ast::Struct::cast(node) else { continue };
+        let st_syn = st.syntax();
+        if st_syn.ancestors().any(|a| is_cfg_test_item(&a)) || is_cfg_test_item(st_syn) {
             continue;
         }
         // Skip structs nested inside function bodies.
-        if node.ancestors().skip(1).any(|a| a.kind() == SyntaxKind::FN) {
+        if st_syn.ancestors().skip(1).any(|a| a.kind() == SyntaxKind::FN) {
             continue;
         }
         let Some(name_tok) = st.name() else { continue };
@@ -1945,8 +1949,8 @@ pub fn rewrite_struct_alloc_fields_into(
 
     // 2. Update matching inherent `impl` blocks in the same file (`impl Foo` -> `impl<'a> Foo<'a>`).
     for node in root.syntax().descendants() {
-        let Some(imp) = ast::Impl::cast(node.clone()) else { continue };
-        if imp.trait_().is_some() || node.ancestors().any(|a| is_cfg_test_item(&a)) {
+        let Some(imp) = ast::Impl::cast(node) else { continue };
+        if imp.trait_().is_some() || imp.syntax().ancestors().any(|a| is_cfg_test_item(&a)) {
             continue;
         }
         let Some(self_ty) = imp.self_ty() else { continue };
@@ -2477,12 +2481,14 @@ pub fn rewrite_manifest(
         if bstd_features.is_empty() {
             let _ = writeln!(additions, "bstd = {{ {base_spec} }}");
         } else {
-            let feats: Vec<String> = bstd_features.iter().map(|f| format!("\"{f}\"")).collect();
-            let _ = writeln!(
-                additions,
-                "bstd = {{ {base_spec}, features = [{}] }}",
-                feats.join(", ")
-            );
+            let _ = write!(additions, "bstd = {{ {base_spec}, features = [");
+            for (i, f) in bstd_features.iter().enumerate() {
+                if i > 0 {
+                    additions.push_str(", ");
+                }
+                let _ = write!(additions, "\"{f}\"");
+            }
+            additions.push_str("] }\n");
         }
     }
     for extra in extra_blaze_crates {

@@ -2,12 +2,13 @@
 //! instance's reference, or through a fn pointer), asserts, drops, resume and unreachable
 //! (lib.rs, "Unwinding").
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 use core::alloc::Allocator;
 
 use blaze_body::{AssertKind, BinOp, Block as BodyBlock, Callee, CalleeId, Operand, Ops, Place, StmtKind, Unwind};
+use blaze_build::intrinsics::target::{Target as IntrinsicTarget, float::FloatCall};
 use blaze_build::layout::LayoutId;
-use blaze_build::{Instance, Panic, PanicConst, abi};
+use blaze_build::{Instance, Intrinsic, Panic, PanicConst, abi};
 use blaze_lir::builder::Variadic;
 use blaze_lir::func::{BlockKind, Conv, RefId, SigId, SlotKind};
 use blaze_lir::{Block, Flags, IntCond, Ty, Value};
@@ -47,7 +48,7 @@ enum ResultTo {
     Memory { dest: Place, lay: LayoutId, temp: Option<Value> },
 }
 
-impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// The terminator `kind`, the last row of its block.
     pub(crate) fn terminator(&mut self, kind: StmtKind) -> Result<(), BuildError> {
         match kind {
@@ -90,16 +91,16 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
         let (x, _) = self.operand(on)?;
         let x = self.scalar(x)?;
         let default = (self.lir_block(otherwise)?, self.args_for(otherwise)?);
-        let mut targets: Vec<(u128, Block, Vec<Value, A>), A> = Vec::with_capacity_in(cases.len() as usize, self.alloc.clone());
+        let mut targets: Vec<(u128, Block, Vec<Value, A>), A> = Vec::with_capacity_in(cases.len() as usize, self.alloc);
         let rows: Vec<(u128, BodyBlock), A> = {
-            let mut out = Vec::with_capacity_in(cases.len() as usize, self.alloc.clone());
+            let mut out = Vec::with_capacity_in(cases.len() as usize, self.alloc);
             out.extend(self.v.cases(cases));
             out
         };
         for &(value, to) in rows.iter() {
             targets.push((value, self.lir_block(to)?, self.args_for(to)?));
         }
-        let mut arms: Vec<(u128, (Block, &[Value])), A> = Vec::with_capacity_in(targets.len(), self.alloc.clone());
+        let mut arms: Vec<(u128, (Block, &[Value])), A> = Vec::with_capacity_in(targets.len(), self.alloc);
         for (value, block, args) in targets.iter() {
             arms.push((*value, (*block, args.as_slice())));
         }
@@ -147,7 +148,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
         let from = self.from;
         let v = self.v;
         let tys = v.ty_list(&from, args).map_err(|_| self.malformed("a callee's arguments past the body's tables"))?;
-        let mut ground: Vec<blaze_typeck::PTy, A> = Vec::with_capacity_in(tys.len(), self.alloc.clone());
+        let mut ground: Vec<blaze_typeck::PTy, A> = Vec::with_capacity_in(tys.len(), self.alloc);
         for t in tys.iter() {
             ground.push(self.ground(t)?);
         }
@@ -193,9 +194,58 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
         Ok(())
     }
 
+    /// Lowers a scalar floating-point intrinsic (`llvm.fma.*`, `llvm.sqrt.*`, `llvm.fabs.*`,
+    /// etc.) directly to its native hardware LIR instruction, with zero call overhead.
+    fn float_intrinsic(&mut self, fc: FloatCall, args: Ops, dest: Option<Place>, target: Option<BodyBlock>) -> Result<(), BuildError> {
+        if fc.shape.lanes().is_some() {
+            return Err(self.unsupported("a vector float intrinsic call"));
+        }
+        let arity = fc.func.arity();
+        if usize::try_from(args.len()).ok() != Some(arity) {
+            return Err(self.malformed("a float intrinsic call with the wrong number of arguments"));
+        }
+        let ops: Vec<Operand, A> = {
+            let mut out = Vec::with_capacity_in(arity, self.alloc);
+            out.extend(self.v.ops(args));
+            out
+        };
+        let mut vals = [Value(0); 3];
+        let elem = fc.shape.elem();
+        for (slot, &o) in vals.iter_mut().zip(ops.iter()) {
+            let (x, _) = self.operand(o)?;
+            let v = self.scalar(x)?;
+            if self.b.ty(v) != elem {
+                return Err(self.malformed("a float intrinsic argument of the wrong scalar type"));
+            }
+            *slot = v;
+        }
+        let [v0, v1, v2] = vals;
+        let op = fc.func.op();
+        let res = match arity {
+            1 => self.b.unary(op, Flags::NONE, v0),
+            2 => self.b.binary(op, Flags::NONE, v0, v1),
+            3 => self.b.ternary(op, Flags::NONE, v0, v1, v2),
+            _ => return Err(self.malformed("a float intrinsic of unsupported arity")),
+        };
+        if let Some(dest) = dest {
+            let lay = self.dest_layout(dest)?;
+            self.write(dest, V::One(res), lay)?;
+        }
+        match target {
+            Some(to) => self.goto(to),
+            None => {
+                self.b.unreachable();
+                Ok(())
+            }
+        }
+    }
+
     fn call(&mut self, callee: CalleeId, args: Ops, dest: Option<Place>, target: Option<BodyBlock>, unwind: Unwind) -> Result<(), BuildError> {
         let (to, may_unwind) = match self.v.callee(callee) {
-            Callee::FnItem { key, args } => {
+            Callee::FnItem { key, args: fn_args } => {
+                if let Some(Intrinsic::Target(IntrinsicTarget::Float(fc))) = self.adts.intrinsic(key) {
+                    return self.float_intrinsic(fc, args, dest, target);
+                }
                 match self.adts.abi(key) {
                     Some(blaze_build::Abi::Rust) => {}
                     Some(blaze_build::Abi::C | blaze_build::Abi::RustCall) => {
@@ -203,7 +253,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
                     }
                     None => return Err(BuildError::NoAbi { item: key }),
                 }
-                let instance = self.instance(key, args)?;
+                let instance = self.instance(key, fn_args)?;
                 if self.adts.track_caller(instance, self.subst.ground) == Some(true) {
                     return Err(BuildError::TrackCaller { stmt: self.row()?, name: "the callee" });
                 }
@@ -214,15 +264,20 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
                 (Target::Pointer(self.scalar(x)?), true)
             }
             Callee::Method { .. } => return Err(self.unsupported("a trait method call (its impl's fn is not resolved here yet)")),
-            Callee::Intrinsic { .. } => return Err(self.unsupported("an intrinsic call")),
+            Callee::Intrinsic { key, .. } => {
+                if let Some(Intrinsic::Target(IntrinsicTarget::Float(fc))) = self.adts.intrinsic(key) {
+                    return self.float_intrinsic(fc, args, dest, target);
+                }
+                return Err(self.unsupported("an intrinsic call"));
+            }
         };
         let ops: Vec<Operand, A> = {
-            let mut out = Vec::with_capacity_in(args.len() as usize, self.alloc.clone());
+            let mut out = Vec::with_capacity_in(args.len() as usize, self.alloc);
             out.extend(self.v.ops(args));
             out
         };
-        let mut passes: Vec<Pass, A> = Vec::with_capacity_in(ops.len(), self.alloc.clone());
-        let mut values: Vec<Value, A> = Vec::with_capacity_in(ops.len() + 1, self.alloc.clone());
+        let mut passes: Vec<Pass, A> = Vec::with_capacity_in(ops.len(), self.alloc);
+        let mut values: Vec<Value, A> = Vec::with_capacity_in(ops.len() + 1, self.alloc);
         // The result: through a hidden first pointer, or as the call's value.
         let (rpass, result) = match dest {
             None => (Pass::Ignore, ResultTo::Nothing),
@@ -258,7 +313,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
             self.pass_arg(x, lay, pass, matches!(o, Operand::Move(_)), &mut values)?;
             passes.push(pass);
         }
-        let (params, rets) = abi::sig_of_in(&passes, rpass, self.alloc.clone());
+        let (params, rets) = abi::sig_of_in(&passes, rpass, self.alloc);
         let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
         let landing = self.landing(unwind, may_unwind);
         self.emit(to, sig, &values, landing, result, target)
@@ -300,7 +355,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
                 // What the cleanup block takes, as the call's block holds it.
                 let carried = match landing {
                     Landing::Cleanup(_) => self.local_args()?,
-                    Landing::Terminate => Vec::new_in(self.alloc.clone()),
+                    Landing::Terminate => Vec::new_in(self.alloc),
                 };
                 let normal = self.b.create_block(BlockKind::Normal);
                 let pad = self.b.create_block(match landing {
@@ -316,7 +371,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
                 match landing {
                     Landing::Cleanup(block) => {
                         let lir = self.lir_block(block)?;
-                        let mut args: Vec<Value, A> = Vec::with_capacity_in(carried.len() + 1, self.alloc.clone());
+                        let mut args: Vec<Value, A> = Vec::with_capacity_in(carried.len() + 1, self.alloc);
                         args.push(exn);
                         args.extend(carried.iter().copied());
                         self.b.jump((lir, &args));
@@ -381,9 +436,9 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
             Some(m) => V::Two(address, m),
             None => V::One(address),
         };
-        let mut values: Vec<Value, A> = Vec::with_capacity_in(1, self.alloc.clone());
+        let mut values: Vec<Value, A> = Vec::with_capacity_in(1, self.alloc);
         self.pass_arg(x, plain, pass, false, &mut values)?;
-        let (params, rets) = abi::sig_of_in(&[pass], Pass::Ignore, self.alloc.clone());
+        let (params, rets) = abi::sig_of_in(&[pass], Pass::Ignore, self.alloc);
         let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
         let landing = self.landing(unwind, may_unwind);
         self.emit(Target::Direct(r), sig, &values, landing, ResultTo::Nothing, Some(target))
@@ -431,7 +486,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
     /// are the length, then the index.
     fn bounds_panic(&mut self, msg: Ops, unwind: Unwind) -> Result<(), BuildError> {
         let ops: Vec<Operand, A> = {
-            let mut out = Vec::with_capacity_in(2, self.alloc.clone());
+            let mut out = Vec::with_capacity_in(2, self.alloc);
             out.extend(self.v.ops(msg));
             out
         };

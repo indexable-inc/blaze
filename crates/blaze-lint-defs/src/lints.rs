@@ -232,7 +232,17 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::unmarked_nonblocking", Allow, "detects a function the effects walk proves never blocks the thread that lacks `#[blaze::nonblocking]`, which callers could rely on")
         .externally_loaded(),
-    l("blaze::mut_ref", Allow, "detects a unique reference spelled `&mut` or `ref mut` in a crate that says `#![blaze::uniq]`, which spells it `&uniq` and `ref uniq`")
+    l("blaze::mut_ref", Allow, "deprecates unique references spelled `&mut` or `ref mut` in favor of `&uniq` and `ref uniq` (with mechanical auto-fix)")
+        .externally_loaded(),
+    l("blaze::mut_for_uniq_borrow", Allow, "detects `let mut x = ..;` when `x` is never reassigned and only borrowed uniquely (`&uniq x` / `&mut x`); under Blaze's edition `let x` permits `&uniq x` directly and `mut` is reserved for local rebinding")
+        .externally_loaded(),
+    l("blaze::magic_slice_len", Warn, "detects hardcoded magic slice range lengths (`bytes.get(0..3) == Some(..)`, `bytes.get(at..at + 2)`, `&x[..7] == b\"..\"`, `starts_with` followed by hardcoded advance) and suggests deriving the length via `strip_prefix`, `starts_with`, `.len()`, `size_of::<T>()`, or a named `const`")
+        .externally_loaded(),
+    l("blaze::bool_as_int", Warn, "detects boolean-to-integer `as` casts (`(a == b) as u32`, `x.is_some() as usize`) and mechanically auto-fixes them to infallible `T::from(..)` conversions")
+        .externally_loaded(),
+    l("blaze::manual_slice_idioms", Warn, "detects manual length/index slice patterns (`x.len() == 0` / `x.len() > 0` auto-fixed to `is_empty()`, `for i in 0..xs.len() { xs[i] }` index loops, and `.find(..)` followed by manual slice splitting instead of `split_once`)")
+        .externally_loaded(),
+    l("blaze::test_ambient_leak", Warn, "detects `Alloc::global()` and `#[cfg(test)] extern crate std;` in test code, which violate Blaze's test-world allocator and `#![no_std]` test ratchets")
         .externally_loaded(),
     l("blaze::undeclared_effect", Deny, "detects a function that may panic, allocate from the global heap, block the thread or not return (`diverge`), through any call, where its `#[blaze::expect(..)]`, its trait method's, the default of a module around it or `#![blaze::effects]` does not allow it; and an impl's method that lists an effect its trait's method does not; a list that is not one; and the deleted `#[blaze::may(..)]`, respelled `#[blaze::expect(..)]`")
         .externally_loaded(),

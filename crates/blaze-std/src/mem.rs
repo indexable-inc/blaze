@@ -47,7 +47,10 @@ use core::{
     ptr::NonNull,
 };
 
-pub use blaze_own::{Alloc, Erased, SharedAlloc};
+pub use blaze_own::{
+    Alloc, CloneIn, DefaultIn, Erased, FromIn, FromStrIn, IntoIn, LocalShare, ParseIn, Share,
+    SharedAlloc, ToOwnedIn,
+};
 pub use blaze_own::pod::{
     self, AnyBitPattern, CastError, CheckedBitPattern, NoUninit, Pod, TransparentWrapper, Zeroable,
 };

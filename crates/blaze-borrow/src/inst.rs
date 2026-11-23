@@ -260,9 +260,9 @@ pub struct Envs<'c, A: Allocator> {
 /// The most environments one call makes (rule 18).
 pub const MOST_ENVS: usize = 256;
 
-impl<'c, A: Allocator + Clone> Envs<'c, A> {
+impl<'c, A: Allocator + Copy> Envs<'c, A> {
     pub fn new_in(alloc: A) -> Envs<'c, A> {
-        Envs { envs: Vec::new_in(alloc.clone()), alloc }
+        Envs { envs: Vec::new_in(alloc), alloc }
     }
 
     fn push(&mut self, mode: Mode, regs: Vec<Option<Reg>, A>, types: Vec<Option<Side<'c>>, A>) -> Option<EnvId> {
@@ -270,22 +270,22 @@ impl<'c, A: Allocator + Clone> Envs<'c, A> {
             return None;
         }
         let id = EnvId(self.envs.len() as u32);
-        self.envs.push(Env { mode, regs, late: Vec::new_in(self.alloc.clone()), types });
+        self.envs.push(Env { mode, regs, late: Vec::new_in(self.alloc), types });
         Some(id)
     }
 
     /// A fresh environment for an impl of `lifetimes` lifetime and `types` type parameters,
     /// every one unbound.
     pub(crate) fn impl_env(&mut self, lifetimes: u32, types: u32) -> Option<EnvId> {
-        let regs = Vec::from_elem_in(None, lifetimes as usize, self.alloc.clone());
-        let tys = Vec::from_elem_in(None, types as usize, self.alloc.clone());
+        let regs = Vec::from_elem_in(None, lifetimes as usize, self.alloc);
+        let tys = Vec::from_elem_in(None, types as usize, self.alloc);
         self.push(Mode::Item { bindable: true }, regs, tys)
     }
 
     /// An environment in the caller's numbering (a bound of the caller's read for a tie).
     pub(crate) fn owner_env(&mut self) -> Option<EnvId> {
-        let regs = Vec::new_in(self.alloc.clone());
-        let tys = Vec::new_in(self.alloc.clone());
+        let regs = Vec::new_in(self.alloc);
+        let tys = Vec::new_in(self.alloc);
         self.push(Mode::Owner { binder: None }, regs, tys)
     }
 
@@ -375,14 +375,14 @@ enum Lifetimes<'c> {
 /// the instantiated binder's fresh (`fresh`, called once per region in `Param` order, then per
 /// binder variable in column order), its clauses instantiated. Normalization is done as the
 /// relation meets an alias (relate.rs `normalize`), with the same environments.
-pub fn instantiate<'c, A: Allocator + Clone>(
+pub fn instantiate<'c, A: Allocator + Copy>(
     callee: Callee<'c>,
     generics: GenericArgs<'_>,
     fresh: &mut impl FnMut(Late) -> Origin,
     alloc: A,
 ) -> Result<Inst<'c, A>, Refused> {
     let item = callee.item();
-    let mut envs: Envs<'c, A> = Envs::new_in(alloc.clone());
+    let mut envs: Envs<'c, A> = Envs::new_in(alloc);
     let (inputs, output, clauses_in, lifetimes): (&'c [Typed<'c>], Typed<'c>, &'c [ClauseIn<'c>], Option<Lifetimes<'c>>) = match callee {
         Callee::Fn(sig) | Callee::Method { sig, .. } | Callee::Operator { sig, .. } => {
             (sig.inputs, sig.output, sig.clauses, Some(Lifetimes::Params(sig.params)))
@@ -397,7 +397,7 @@ pub fn instantiate<'c, A: Allocator + Clone>(
                 Lifetimes::Params(p) => p.count(),
                 Lifetimes::Early(n) => n,
             };
-            let mut regs: Vec<Option<Reg>, A> = Vec::with_capacity_in(count as usize, alloc.clone());
+            let mut regs: Vec<Option<Reg>, A> = Vec::with_capacity_in(count as usize, alloc);
             let mut early = 0u32;
             for i in 0..count {
                 let late = match l {
@@ -415,7 +415,7 @@ pub fn instantiate<'c, A: Allocator + Clone>(
             if early != generics.lifetimes.count().get() {
                 return Err(malformed(output.ty, Bad::LifetimeArgs { want: early, got: generics.lifetimes.count().get() }));
             }
-            let mut types: Vec<Option<Side<'c>>, A> = Vec::with_capacity_in(generics.types.len(), alloc.clone());
+            let mut types: Vec<Option<Side<'c>>, A> = Vec::with_capacity_in(generics.types.len(), alloc);
             for a in generics.types {
                 types.push(Some(Side::caller(*a)));
             }
@@ -426,8 +426,8 @@ pub fn instantiate<'c, A: Allocator + Clone>(
                 Callee::Closure { binder, .. } | Callee::Value { binder, .. } => binder,
                 _ => return Err(malformed(output.ty, Bad::NotOfKind)),
             };
-            let regs = Vec::new_in(alloc.clone());
-            let types = Vec::new_in(alloc.clone());
+            let regs = Vec::new_in(alloc);
+            let types = Vec::new_in(alloc);
             let e = envs.push(Mode::Owner { binder: Some(binder) }, regs, types).ok_or(malformed(output.ty, Bad::StepBound))?;
             // The binder's variables, fresh once each, in column order (inputs, then output).
             let env = envs.envs.get_mut(e.0 as usize).ok_or(malformed(output.ty, Bad::StepBound))?;
@@ -445,7 +445,7 @@ pub fn instantiate<'c, A: Allocator + Clone>(
         }
     };
     let sig_side = |t: Typed<'c>| Side { ty: t.ty, slots: Slots::Sig { col: t.col, env: e0 } };
-    let mut ins: Vec<Side<'c>, A> = Vec::with_capacity_in(inputs.len(), alloc.clone());
+    let mut ins: Vec<Side<'c>, A> = Vec::with_capacity_in(inputs.len(), alloc);
     for t in inputs {
         ins.push(sig_side(*t));
     }

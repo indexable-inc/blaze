@@ -27,7 +27,7 @@ use blaze_typeck::{ExprId, ItemKey, List, Name, PNode, PTy};
 use crate::generic_call::{CallBounds, ShapeBuf};
 use crate::{AwaitUnrelated, CallValue, Facts, Form, Lower, Plant, Refusal, Region, SigLife, TyD, Val};
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
+impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
     /// Relates `dest = into_future(v)` (the call statement just added) through the callee the
     /// record names at the `.await` `e` (the module doc).
     pub(crate) fn relate_into_future(&mut self, v: Val, dest: Place, dest_ty: TyD, e: ExprId) -> Result<(), Refusal> {
@@ -194,7 +194,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
                 return Ok(Some(AwaitUnrelated::BoundUnread { param: i as u32 }));
             }
         }
-        let mut shape = ShapeBuf::new_in(self.alloc.clone());
+        let mut shape = ShapeBuf::new_in(self.alloc);
         if !self.awaited_shape(life, written, &mut shape, e)? {
             return Ok(Some(AwaitUnrelated::ShapeUnread));
         }

@@ -71,12 +71,12 @@ pub fn split_in<A: Allocator + Clone>(
 /// Per slot, whether a block after some suspension (a resume or cancel target, and every block
 /// reached from one, unwind edges included) takes its address: by a `slot_addr` there, or by
 /// using a `slot_addr` value made before; or whose address escapes anywhere (below).
-pub(super) fn reached_after<A: Allocator + Clone>(body: &Body<'_, A>, alloc: &A) -> Vec<bool, A> {
+pub(super) fn reached_after<A: Allocator + Copy>(body: &Body<'_, A>, alloc: &A) -> Vec<bool, A> {
     let view = &body.view;
     let blocks = view.blocks();
     let held = |b: usize| body.in_poll[b] || body.in_drop[b];
     let mut seen = filled(blocks, false, alloc);
-    let mut work: Vec<u32, A> = Vec::new_in(alloc.clone());
+    let mut work: Vec<u32, A> = Vec::new_in(*alloc);
     for s in body.suspends.iter() {
         for b in [s.resume, s.cancel] {
             if !seen[b as usize] {
@@ -135,7 +135,7 @@ pub(super) fn reached_after<A: Allocator + Clone>(body: &Body<'_, A>, alloc: &A)
 /// (`lir_kept`) and code after a suspension reaches it, which is refused by name. Refused
 /// too: a name of no slot or of one slot twice, a name outside the region or misaligned for
 /// its slot, two named slots sharing bytes.
-pub(super) fn kept_by_name<A: Allocator + Clone>(
+pub(super) fn kept_by_name<A: Allocator + Copy>(
     body: &Body<'_, A>,
     lir_kept: &[bool],
     region: Region,
@@ -161,7 +161,7 @@ pub(super) fn kept_by_name<A: Allocator + Clone>(
         kept[i] = true;
     }
     // Two named slots sharing bytes: by offset, each must end before the next begins.
-    let mut by_offset: Vec<(u32, u32), A> = Vec::with_capacity_in(names.len(), alloc.clone());
+    let mut by_offset: Vec<(u32, u32), A> = Vec::with_capacity_in(names.len(), *alloc);
     by_offset.extend(names.iter().map(|n| (n.offset, n.slot.0)));
     by_offset.sort_unstable();
     for w in by_offset.windows(2) {
@@ -180,8 +180,8 @@ pub(super) fn kept_by_name<A: Allocator + Clone>(
 }
 
 /// The offsets of the kept slots in slot order (what `overlap::offsets` gives without a region).
-pub(super) fn placed<A: Allocator + Clone>(kept: &[bool], at: &[u32], alloc: &A) -> Vec<u32, A> {
-    let mut out = Vec::new_in(alloc.clone());
+pub(super) fn placed<A: Allocator + Copy>(kept: &[bool], at: &[u32], alloc: &A) -> Vec<u32, A> {
+    let mut out = Vec::new_in(*alloc);
     out.extend(kept.iter().zip(at.iter()).filter(|it| *it.0).map(|it| *it.1));
     out
 }

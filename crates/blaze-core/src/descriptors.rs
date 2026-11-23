@@ -81,7 +81,10 @@ use std::{
 };
 
 use blaze_hash::{FixedState, Map, MapOpts, SharedMapOpts};
-use blaze_own::planted::{NoPlant, Planted, Plants};
+use blaze_own::{
+    Share,
+    planted::{NoPlant, Planted, Plants},
+};
 
 use crate::{
     Cache, FileName, fs,
@@ -249,7 +252,7 @@ impl<H: Send + Sync + 'static> Table<H> {
                 let mut evicted = None;
                 if owned.files.len() >= self.bound && !plant.has(TablePlant::PastBound) {
                     // The oldest stamp; under the lock both halves hold the same keys.
-                    let oldest = pinned.iter().min_by_key(|(_, found)| found.used.load(Ordering::Relaxed)).map(|(key, _)| key.clone()); // clone: two refcounts, once a descriptor closed
+                    let oldest = pinned.iter().min_by_key(|(_, found)| found.used.load(Ordering::Relaxed)).map(|((name, cache, access), _)| (name.share(), *cache, *access)); // clone: two refcounts, once a descriptor closed
                     if let Some(oldest) = oldest {
                         pinned.remove(&oldest);
                         evicted = owned.files.remove(&oldest);
@@ -263,7 +266,7 @@ impl<H: Send + Sync + 'static> Table<H> {
                 }
                 let now = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
                 // alloc: an entry of each half, once a descriptor kept.
-                pinned.insert(key.clone(), Found { file: Arc::downgrade(&opened), used: AtomicU64::new(now) }); // clone: a refcount
+                pinned.insert((key.0.share(), key.1, key.2), Found { file: Arc::downgrade(&opened), used: AtomicU64::new(now) }); // clone: a refcount
                 owned.files.insert(key, Arc::clone(&opened)); // clone: a refcount, the table's
                 (opened, evicted)
             }
@@ -357,7 +360,7 @@ impl Descriptors {
             // alloc: the control's open, kept by nothing.
             return self.open(root, name, cache, access).map(Arc::new);
         }
-        let key = (name.clone(), cache, access); // clone: a refcount
+        let key = (name.share(), cache, access); // clone: a refcount
         if let Some(file) = self.table.get(&key) {
             return Ok(file);
         }

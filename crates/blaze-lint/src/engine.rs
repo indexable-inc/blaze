@@ -13,11 +13,12 @@ use blaze_own::{AVec, Alloc};
 use crate::matcher::{DEAD, Live, NO_SEQ};
 use crate::sequences::{
     ArgOf, BANG, BAR, BRACE, CLOSE, Cut, DOT, DOTDOT, Guard, LT, MAX_WORD_LEN, MIN_WORD_LEN, NE, NO_WORD, OPEN, OTHER,
-    SEP, SEQS, TRIE, W_ALLOC, W_ARC, W_AS, W_BLOCK_ON, W_CLONE, W_EXPECT, W_EXTERN, W_FILE, W_FN, W_FOR, W_GLOBAL,
-    W_IMPL, W_INSTANT, W_JOIN, W_LIBC, W_LOCK, W_MOD, W_ORDERING, W_RECV, W_RUSTIX, W_SELF, W_SEQCST, W_STD, W_STRING,
-    W_SYSTEM_TIME, W_THREAD_LOCAL, W_TRAIT, W_TYPE, W_UNSAFE, W_UNWRAP, W_USE, W_VEC, W_WAIT, WC_COLLECTION,
-    WC_DEFINING, WC_DISPATCHED, WC_IO_MODULE, WC_IO_TYPE, WC_LOCK_TYPE, WC_PRINT_MACRO, WC_RENAME, WC_SANS_IO,
-    WC_STATIC, WORD, WORD_CLASS, WORD_FIRST_BY_LEN,
+    SEP, SEQS, TRIE, W_ALLOC, W_ALLOC_TYPE, W_ARC, W_AS, W_BLOCK_ON, W_CLONE, W_CRATE, W_EXPECT, W_EXTERN, W_FALSE,
+    W_FILE, W_FIND, W_FN, W_FOR, W_GET, W_GLOBAL, W_GLOBAL_FN, W_IMPL, W_IN, W_INSTANT, W_IS_SOME_AND, W_JOIN, W_LEN,
+    W_LET, W_LIBC, W_LOCK, W_MOD, W_MUT, W_ORDERING, W_RECV, W_REF, W_RUSTIX, W_SELF, W_SEQCST, W_SOME, W_STARTS_WITH, W_STD,
+    W_STRING, W_SYSTEM_TIME, W_THREAD_LOCAL, W_TRAIT, W_TRUE, W_TRY_INTO, W_TYPE, W_UNIQ, W_UNSAFE, W_UNWRAP, W_USE, W_VEC,
+    W_WAIT, WC_COLLECTION, WC_DEFINING, WC_DISPATCHED, WC_IO_MODULE, WC_IO_TYPE, WC_LOCK_TYPE, WC_PRINT_MACRO,
+    WC_RENAME, WC_SANS_IO, WC_STATIC, WORD, WORD_CLASS, WORD_FIRST_BY_LEN,
 };
 use crate::{
     Arg, Block, Cost, Finding, Findings, Fix, LintError, Mark, ONLY_OWN, Owner, Rule, RuleSet, Run, Scope, Span,
@@ -103,6 +104,16 @@ enum Plan {
     Rename { row: u32, name: Span, after: u32 },
     /// These four tokens deleted, each a whole token (`dbg`, `!`, `(`, `)` around a value).
     Strip { tokens: [Span; 4] },
+    /// Replace one token span with fixed text (e.g. `mut` -> `uniq` in `&mut` / `ref mut`).
+    Replace { range: Span, text: &'static str },
+    /// Rewrite `&recv[..N] == RHS` -> `recv.starts_with(RHS)` in three disjoint edits:
+    /// delete `&`, replace `[..N] == ` with `.starts_with(`, and insert `)` after `RHS`.
+    WrapStartsWith { amp: Span, middle: Span, after_rhs: u32 },
+    /// Rewrite `expr as T` -> `T::from(expr)` (or `(expr) as T` -> `T::from(expr)` without double
+    /// parens when `parens` is false).
+    WrapFrom { before_expr: u32, after_expr: u32, as_end: u32, prefix: &'static str, add_close: bool },
+    /// Insert `!` at `bang_at` and replace `range` with `text` (e.g. `x.len() > 0` -> `!x.is_empty()`).
+    NegateReplace { bang_at: u32, range: Span, text: &'static str },
 }
 
 /// A finding before test code is known.
@@ -133,7 +144,21 @@ const ALLOCATING: [(&str, usize); 9] = [
     ("BinaryHeap", 2),
     ("LinkedList", 2),
 ];
-const HANDLES: [&str; 2] = ["Arc", "Rc"];
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HandleKind {
+    /// Thread-local non-atomic handle (`Rc`, `ARc`): autofix to `.local_share()`.
+    Local,
+    /// Cross-thread atomic handle (`Arc`, `AArc`, `ThinArc`, `AThinArc`, `ThinStr`, `AThinStr`): autofix to `.share()`.
+    Shared,
+}
+
+fn classify_handle(word: &str) -> Option<HandleKind> {
+    match word {
+        "Rc" | "ARc" => Some(HandleKind::Local),
+        "Arc" | "AArc" | "ThinArc" | "AThinArc" | "ThinStr" | "AThinStr" => Some(HandleKind::Shared),
+        _ => None,
+    }
+}
 const HANDLE_WORDS: [&str; 11] =
     ["refcount", "refcounts", "count", "counts", "handle", "handles", "arc", "rc", "interned", "cursor", "cursors"];
 const HANDLE_PHRASES: [&str; 2] = ["allocates nothing", "no allocation"];
@@ -155,9 +180,9 @@ pub(crate) const FORMAT_MACROS: [&str; 8] =
     ["format", "format_args", "write", "writeln", "print", "println", "eprint", "eprintln"];
 /// Every word [`Pass::on_word`] matches on by name: each must be in `sequences::WORDS`, which a
 /// compile-time check there holds, since a word not in the table is never dispatched.
-pub(crate) const DISPATCHED: [&str; 17] = [
+pub(crate) const DISPATCHED: [&str; 25] = [
     "use", "as", "clone", "Global", "fn", "type", "impl", "trait", "mod", "for", "self", "unwrap", "expect", "std",
-    "alloc", "unsafe", "Ordering",
+    "alloc", "unsafe", "Ordering", "ref", "let", "get", "starts_with", "len", "find", "Alloc", "extern",
 ];
 /// The words `process-static` starts at ([`Pass::process_static`]).
 pub(crate) const STATIC_WORDS: [&str; 2] = ["static", "thread_local"];
@@ -726,6 +751,16 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                     }
                 }
                 K::P(b'#') => self.attribute(i, t),
+                K::P(b'&') => {
+                    if self.rules.runs(Rule::MutRef) {
+                        self.cost.add(Rule::MutRef);
+                        self.mut_ref_amp(i, t);
+                    }
+                    if self.rules.runs(Rule::MagicSliceLen) {
+                        self.cost.add(Rule::MagicSliceLen);
+                        self.magic_slice_amp_index(i, t);
+                    }
+                }
                 K::Ident => self.on_word(i, t),
                 K::Raw => self.defining = false,
                 K::Lit => {
@@ -828,9 +863,15 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
         if class & WC_DISPATCHED != 0 {
             match word_id {
                 W_USE => self.in_use = true,
-                W_AS if rules.runs(Rule::Casts) => {
-                    self.cost.add(Rule::Casts);
-                    self.cast(i, t);
+                W_AS => {
+                    if rules.runs(Rule::Casts) {
+                        self.cost.add(Rule::Casts);
+                        self.cast(i, t);
+                    }
+                    if rules.runs(Rule::BoolAsInt) {
+                        self.cost.add(Rule::BoolAsInt);
+                        self.bool_as_int(i, t);
+                    }
                 }
                 W_CLONE if rules.runs(Rule::Clones) => {
                     self.cost.add(Rule::Clones);
@@ -862,8 +903,13 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                         _ => Block::Module,
                     });
                 }
-                W_FOR if self.header == Some(Block::Impl) && !matches!(self.tok(i + 1), Some(n) if n.k == K::P(b'<')) => {
-                    self.header = Some(Block::TraitImpl);
+                W_FOR => {
+                    if self.header == Some(Block::Impl) && !matches!(self.tok(i + 1), Some(n) if n.k == K::P(b'<')) {
+                        self.header = Some(Block::TraitImpl);
+                    } else if rules.runs(Rule::ManualSliceIdioms) {
+                        self.cost.add(Rule::ManualSliceIdioms);
+                        self.manual_index_loop(i, t);
+                    }
                 }
                 W_SELF => {
                     if let Some(sig) = self.sig
@@ -893,6 +939,38 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                 W_ORDERING if rules.runs(Rule::SeqCstUnexplained) => {
                     self.cost.add(Rule::SeqCstUnexplained);
                     self.seqcst_word(i, t);
+                }
+                W_REF if rules.runs(Rule::MutRef) => {
+                    self.cost.add(Rule::MutRef);
+                    self.ref_mut_word(i, t);
+                }
+                W_LET if rules.runs(Rule::MutForUniqBorrow) => {
+                    self.cost.add(Rule::MutForUniqBorrow);
+                    self.let_mut_word(i, t);
+                }
+                W_GET if rules.runs(Rule::MagicSliceLen) => {
+                    self.cost.add(Rule::MagicSliceLen);
+                    self.magic_slice_get(i, t);
+                }
+                W_STARTS_WITH if rules.runs(Rule::MagicSliceLen) => {
+                    self.cost.add(Rule::MagicSliceLen);
+                    self.magic_slice_starts_with(i, t);
+                }
+                W_LEN if rules.runs(Rule::ManualSliceIdioms) => {
+                    self.cost.add(Rule::ManualSliceIdioms);
+                    self.manual_len_zero(i, t);
+                }
+                W_FIND if rules.runs(Rule::ManualSliceIdioms) => {
+                    self.cost.add(Rule::ManualSliceIdioms);
+                    self.manual_find_split(i, t);
+                }
+                W_ALLOC_TYPE if rules.runs(Rule::TestAmbientLeak) => {
+                    self.cost.add(Rule::TestAmbientLeak);
+                    self.test_global_alloc(i, t);
+                }
+                W_EXTERN if rules.runs(Rule::TestAmbientLeak) => {
+                    self.cost.add(Rule::TestAmbientLeak);
+                    self.test_extern_std(i, t);
                 }
                 _ => {}
             }
@@ -1049,24 +1127,38 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
         } else {
             return;
         };
+        let handle_kind = match receiver {
+            // A field's declaration is the file's, which an item does not see: its own
+            // text is read (clones.rs reads the whole file).
+            Some(Receiver { name, is_field: true }) => self.declared_handle(0, self.toks.len(), name, false),
+            Some(Receiver { name, is_field: false }) => self.declared_handle(self.last_fn.unwrap_or(0), i, name, true),
+            None => None,
+        };
         let context = self.scope.context;
         let template = match self.look(t.start as usize, clone_mark, context.clone_above, context.clone_after) {
             Some(Mark::Handle) => Template::CloneHandle,
             Some(Mark::ErrorPath) => Template::CloneErrorPath,
             Some(Mark::Deep) => Template::CloneDeep,
             _ => {
-                let handle = match receiver {
-                    // A field's declaration is the file's, which an item does not see: its own
-                    // text is read (clones.rs reads the whole file).
-                    Some(Receiver { name, is_field: true }) => self.declared_handle(0, self.toks.len(), name, false),
-                    Some(Receiver { name, is_field: false }) => self.declared_handle(self.last_fn.unwrap_or(0), i, name, true),
-                    None => false,
-                };
-                if handle { Template::CloneHandle } else { Template::CloneUnknown }
+                if handle_kind.is_some() {
+                    Template::CloneHandle
+                } else {
+                    Template::CloneUnknown
+                }
             }
         };
-        let end = if self.method(i) { self.tok(i + 2).map_or(t.end, |c| c.end) } else { t.end };
-        self.push(template, t.start, end, None);
+        let is_method = self.method(i);
+        let end = if is_method { self.tok(i + 2).map_or(t.end, |c| c.end) } else { t.end };
+        let plan = if is_method && template == Template::CloneHandle {
+            match handle_kind {
+                Some(HandleKind::Local) => Plan::Replace { range: Span::new(t.start, t.end), text: "local_share" },
+                Some(HandleKind::Shared) => Plan::Replace { range: Span::new(t.start, t.end), text: "share" },
+                None => Plan::None,
+            }
+        } else {
+            Plan::None
+        };
+        self.cands.push(Cand { template, range: Span::new(t.start, end), arg: None, plan });
     }
 
     /// clones.rs's `receiver_of`: the last name of the run of names and dots before the `.`
@@ -1097,31 +1189,31 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
 
     /// clones.rs's `declared_handle` over tokens `from..to`: `name: [&][mut] path::Arc<` or
     /// `Rc<`, and with `assigned`, `name = path::Arc::..` or `Rc::..`.
-    fn declared_handle(&self, from: usize, to: usize, name: &str, assigned: bool) -> bool {
+    fn declared_handle(&self, from: usize, to: usize, name: &str, assigned: bool) -> Option<HandleKind> {
         let mut k = from;
         // Bounded: one turn per token of the range.
         while k < to {
             if self.is_word(self.tok(k), name) {
                 let next = self.tok(k + 1);
                 if matches!(next, Some(n) if n.k == K::P(b':')) && !self.colons_at(k + 1) {
-                    if self.handle_type(k + 2) {
-                        return true;
+                    if let Some(kind) = self.handle_type(k + 2) {
+                        return Some(kind);
                     }
                 } else if assigned
                     && let Some(eq) = next
                     && eq.k == K::P(b'=')
                     && !matches!(self.tok(k + 2), Some(n) if matches!(n.k, K::P(b'=' | b'>')) && n.start == eq.end)
-                    && self.handle_value(k + 2)
+                    && let Some(kind) = self.handle_value(k + 2)
                 {
-                    return true;
+                    return Some(kind);
                 }
             }
             k += 1;
         }
-        false
+        None
     }
 
-    fn handle_type(&self, mut k: usize) -> bool {
+    fn handle_type(&self, mut k: usize) -> Option<HandleKind> {
         // Bounded: each turn moves `k` forward past one `&`.
         while matches!(self.tok(k), Some(t) if t.k == K::P(b'&')) {
             k += 1;
@@ -1129,18 +1221,26 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
         if self.is_word(self.tok(k), "mut") {
             k += 1;
         }
-        let Some(last) = self.path_end(k) else { return false };
-        HANDLES.contains(&self.word(self.tok(last)).unwrap_or("")) && matches!(self.tok(last + 1), Some(t) if t.k == K::P(b'<'))
+        let last = self.path_end(k)?;
+        if matches!(self.tok(last + 1), Some(t) if t.k == K::P(b'<')) {
+            classify_handle(self.word(self.tok(last)).unwrap_or(""))
+        } else {
+            None
+        }
     }
 
-    fn handle_value(&self, k: usize) -> bool {
-        let Some(last) = self.path_end(k) else { return false };
+    fn handle_value(&self, k: usize) -> Option<HandleKind> {
+        let last = self.path_end(k)?;
         // `Arc::<T>::default()`: the path stops at a turbofish, its last word the type (as
         // clones.rs's `path_run` stops at the `<`).
         if self.colons_at(last + 1) {
-            return HANDLES.contains(&self.word(self.tok(last)).unwrap_or(""));
+            return classify_handle(self.word(self.tok(last)).unwrap_or(""));
         }
-        last >= k + 3 && HANDLES.contains(&self.word(self.tok(last - 3)).unwrap_or(""))
+        if last >= k + 3 {
+            classify_handle(self.word(self.tok(last - 3)).unwrap_or(""))
+        } else {
+            None
+        }
     }
 
     /// The last token of the path `name (:: name)*` starting at `k`.
@@ -2921,6 +3021,1191 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
         (last == k).then_some(owner)
     }
 
+    // ---- mut-ref (`&mut` / `ref mut` -> `&uniq` / `ref uniq`) ---------------------------
+
+    /// Flags `&mut` and `&'a mut` unique references (types, receivers, expressions, patterns)
+    /// and attaches a mechanical fix replacing `mut` with `uniq`. Ignores `&raw mut`, `*mut`,
+    /// `let mut`, and raw identifiers (`r#mut`).
+    fn mut_ref_amp(&mut self, i: usize, amp: Tok) {
+        let Some(next) = self.tok(i + 1) else { return };
+        let mut_tok = if next.k == K::Ident && next.word == W_MUT {
+            next
+        } else if next.k == K::Life
+            && let Some(after_life) = self.tok(i + 2)
+            && after_life.k == K::Ident
+            && after_life.word == W_MUT
+        {
+            after_life
+        } else {
+            return;
+        };
+        self.cands.push(Cand {
+            template: Template::MutRef,
+            range: Span::new(amp.start, mut_tok.end),
+            arg: None,
+            plan: Plan::Replace { range: Span::new(mut_tok.start, mut_tok.end), text: "uniq" },
+        });
+    }
+
+    /// Flags `ref mut` bindings and attaches a mechanical fix replacing `mut` with `uniq`.
+    fn ref_mut_word(&mut self, i: usize, ref_tok: Tok) {
+        let Some(next) = self.tok(i + 1) else { return };
+        if next.k == K::Ident && next.word == W_MUT {
+            self.cands.push(Cand {
+                template: Template::RefMut,
+                range: Span::new(ref_tok.start, next.end),
+                arg: None,
+                plan: Plan::Replace { range: Span::new(next.start, next.end), text: "uniq" },
+            });
+        }
+    }
+
+    /// Flags `let mut x = ..;` when `x` is never rebound (`x = ..`, `x += ..`, ...) in its
+    /// enclosing block and is only borrowed uniquely (`&uniq x` / `&mut x`), attaching a
+    /// mechanical fix that removes the redundant `mut ` keyword.
+    fn let_mut_word(&mut self, i: usize, let_tok: Tok) {
+        let Some(mut_tok) = self.tok(i + 1) else { return };
+        if mut_tok.k != K::Ident || mut_tok.word != W_MUT {
+            return;
+        }
+        let Some(name_tok) = self.tok(i + 2) else { return };
+        if name_tok.k != K::Ident {
+            return;
+        }
+        // Only simple `let mut x = ...;` or `let mut x: T = ...;` bindings (not destructuring).
+        let Some(after_name) = self.tok(i + 3) else { return };
+        if !matches!(after_name.k, K::P(b'=') | K::P(b':')) {
+            return;
+        }
+        let name = self.str_of(name_tok);
+        if name.is_empty() || name.starts_with('_') {
+            return;
+        }
+
+        // Advance past the initializer statement's `;` at delimiter depth 0.
+        let mut depth = 0i32;
+        let mut j = i + 3;
+        while let Some(tok) = self.tok(j) {
+            match tok.k {
+                K::P(b'{' | b'(' | b'[') => depth += 1,
+                K::P(b'}' | b')' | b']') => {
+                    if depth == 0 {
+                        return;
+                    }
+                    depth -= 1;
+                }
+                K::P(b';') if depth == 0 => {
+                    j += 1;
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+
+        // Scan the rest of the enclosing block (`block_depth >= 0`) until it closes or `name` is shadowed.
+        let mut uniq_borrowed = false;
+        let mut rebound = false;
+        let mut block_depth = 0i32;
+        while let Some(tok) = self.tok(j) {
+            match tok.k {
+                K::P(b'{') => block_depth += 1,
+                K::P(b'}') => {
+                    if block_depth == 0 {
+                        break;
+                    }
+                    block_depth -= 1;
+                }
+                K::Ident if tok.word == W_LET && block_depth == 0 => {
+                    let next1 = self.tok(j + 1);
+                    let shadow = if next1.is_some_and(|t| t.k == K::Ident && t.word == W_MUT) {
+                        self.tok(j + 2)
+                    } else {
+                        next1
+                    };
+                    if shadow.is_some_and(|t| t.k == K::Ident && self.str_of(t) == name) {
+                        break;
+                    }
+                }
+                K::Ident if self.str_of(tok) == name => {
+                    let prev = if j > 0 { self.tok(j - 1) } else { None };
+                    let prev2 = if j > 1 { self.tok(j - 2) } else { None };
+                    // Check `&uniq name` or `&mut name`.
+                    let is_uniq_borrow = prev.is_some_and(|p| {
+                        p.k == K::Ident && (p.word == W_UNIQ || p.word == W_MUT)
+                    }) && prev2.is_some_and(|p2| p2.k == K::P(b'&'));
+                    if is_uniq_borrow {
+                        uniq_borrowed = true;
+                    } else {
+                        // Skip field/path access `.name` / `::name`.
+                        let is_member = prev.is_some_and(|p| matches!(p.k, K::P(b'.' | b':')));
+                        if !is_member {
+                            if let Some(next) = self.tok(j + 1) {
+                                let next2 = self.tok(j + 2);
+                                // Bare rebinding: `name = expr` (not `==` / `=>`) or compound assign.
+                                let is_eq = next.k == K::P(b'=')
+                                    && !next2.is_some_and(|n2| matches!(n2.k, K::P(b'=' | b'>')));
+                                let is_compound = matches!(
+                                    next.k,
+                                    K::P(b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^')
+                                ) && next2.is_some_and(|n2| n2.k == K::P(b'='));
+                                let is_shift_assign = matches!(next.k, K::P(b'<' | b'>'))
+                                    && next2.is_some_and(|n2| n2.k == next.k)
+                                    && self.tok(j + 3).is_some_and(|n3| n3.k == K::P(b'='));
+                                if is_eq || is_compound || is_shift_assign {
+                                    rebound = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+
+        if uniq_borrowed && !rebound {
+            self.cands.push(Cand {
+                template: Template::MutForUniqBorrow,
+                range: Span::new(let_tok.start, name_tok.end),
+                arg: None,
+                plan: Plan::Replace { range: Span::new(mut_tok.start, name_tok.start), text: "" },
+            });
+        }
+    }
+
+    // ---- magic-slice-len (`bytes.get(0..3) == Some(..)`, `.get(at..at + 2)`, etc.) ------
+
+    /// Finds the matching closing delimiter (`open_b` / `close_b`) starting at `open_idx`.
+    fn find_matching_delim(&self, open_idx: usize, open_b: u8, close_b: u8) -> Option<usize> {
+        let mut depth = 0u32;
+        let mut j = open_idx;
+        while let Some(tok) = self.tok(j) {
+            if tok.k == K::P(open_b) {
+                depth += 1;
+            } else if tok.k == K::P(close_b) {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            j += 1;
+        }
+        None
+    }
+
+    /// Parses a magic slice range inside tokens `[from..to)`:
+    /// - `..N` / `0..N` (length `N`, `from_zero = true`)
+    /// - `..=N` / `0..=N` (length `N + 1`, `from_zero = true`)
+    /// - `pos..pos + N` (length `N`, `from_zero = false`)
+    /// - `pos..=pos + N` (length `N + 1`, `from_zero = false`)
+    /// Returns `Some((len, from_zero))` only when `N` is a bare integer literal with `len >= 1`.
+    fn parse_magic_range(&self, from: usize, to: usize) -> Option<(usize, bool)> {
+        if from >= to {
+            return None;
+        }
+        // Locate `..` (two adjacent `.` tokens) inside `[from..to)`.
+        let mut dd = None;
+        let mut j = from;
+        while j + 1 < to {
+            if let (Some(a), Some(b)) = (self.tok(j), self.tok(j + 1))
+                && a.k == K::P(b'.')
+                && b.k == K::P(b'.')
+                && a.end == b.start
+            {
+                dd = Some(j);
+                break;
+            }
+            j += 1;
+        }
+        let dd = dd?;
+        let mut rhs_start = dd + 2;
+        let mut inclusive = false;
+        if rhs_start < to
+            && let (Some(dot2), Some(eq)) = (self.tok(dd + 1), self.tok(rhs_start))
+            && eq.k == K::P(b'=')
+            && dot2.end == eq.start
+        {
+            inclusive = true;
+            rhs_start += 1;
+        }
+        let lhs_count = dd.saturating_sub(from);
+        let rhs_count = to.saturating_sub(rhs_start);
+        if rhs_count == 0 {
+            return None;
+        }
+        // Case 1: `..N`, `0..N`, `..=N`, `0..=N`.
+        let is_zero_start = lhs_count == 0
+            || (lhs_count == 1
+                && self.tok(from).is_some_and(|t| t.k == K::Int && parse_small_uint(self.str_of(t)) == Some(0)));
+        if is_zero_start {
+            if rhs_count == 1
+                && let Some(end_tok) = self.tok(rhs_start)
+                && end_tok.k == K::Int
+                && let Some(n) = parse_small_uint(self.str_of(end_tok))
+            {
+                let len = if inclusive { n.checked_add(1)? } else { n };
+                if len >= 1 {
+                    return Some((len, true));
+                }
+            }
+            return None;
+        }
+        // Case 2: `pos..pos + N` or `pos..=pos + N` (same identifier on both sides).
+        if lhs_count == 1
+            && rhs_count == 3
+            && let (Some(l_id), Some(r_id), Some(plus), Some(n_tok)) =
+                (self.tok(from), self.tok(rhs_start), self.tok(rhs_start + 1), self.tok(rhs_start + 2))
+            && l_id.k == K::Ident
+            && r_id.k == K::Ident
+            && plus.k == K::P(b'+')
+            && n_tok.k == K::Int
+            && self.str_of(l_id) == self.str_of(r_id)
+            && let Some(n) = parse_small_uint(self.str_of(n_tok))
+        {
+            let len = if inclusive { n.checked_add(1)? } else { n };
+            if len >= 1 {
+                return Some((len, false));
+            }
+        }
+        None
+    }
+
+    /// Computes the static byte/element length of a literal or `&[e1, e2, ...]` slice expression
+    /// over tokens `[from..to)`, when statically known.
+    fn static_slice_rhs_len(&self, from: usize, to: usize) -> Option<usize> {
+        if from >= to {
+            return None;
+        }
+        // Unwrap a leading `&` or `*` (e.g. `&b"foo"[..]`, `*b"foo"`, `&[1, 2, 3]`).
+        let mut s = from;
+        while s < to && self.tok(s).is_some_and(|t| t.k == K::P(b'&') || t.k == K::P(b'*')) {
+            s += 1;
+        }
+        // Strip a trailing `[..]` slice coercion if present (`&b"foo"[..]`).
+        let mut e = to;
+        if e >= s + 4
+            && self.tok(e - 1).is_some_and(|t| t.k == K::P(b']'))
+            && self.tok(e - 2).is_some_and(|t| t.k == K::P(b'.'))
+            && self.tok(e - 3).is_some_and(|t| t.k == K::P(b'.'))
+            && self.tok(e - 4).is_some_and(|t| t.k == K::P(b'['))
+        {
+            e -= 4;
+        }
+        if s >= e {
+            return None;
+        }
+        if s + 1 == e
+            && let Some(lit) = self.tok(s)
+            && lit.k == K::Lit
+        {
+            return static_str_lit_byte_len(self.str_of(lit));
+        }
+        if self.tok(s).is_some_and(|t| t.k == K::P(b'['))
+            && self.tok(e - 1).is_some_and(|t| t.k == K::P(b']'))
+        {
+            return self.count_array_elems(s + 1, e - 1);
+        }
+        None
+    }
+
+    /// Counts comma-separated top-level elements in an array literal `[a, b, c]`. Returns `None`
+    /// for repeat syntax `[val; count]` or empty expressions that can't be counted simply.
+    fn count_array_elems(&self, from: usize, to: usize) -> Option<usize> {
+        if from >= to {
+            return Some(0);
+        }
+        let mut count = 0usize;
+        let mut saw_token_in_elem = false;
+        let mut depth = 0u32;
+        let mut j = from;
+        while j < to {
+            let Some(tok) = self.tok(j) else { break };
+            match tok.k {
+                K::P(b'(' | b'[' | b'{') => {
+                    depth += 1;
+                    saw_token_in_elem = true;
+                }
+                K::P(b')' | b']' | b'}') => {
+                    depth = depth.saturating_sub(1);
+                    saw_token_in_elem = true;
+                }
+                K::P(b';') if depth == 0 => return None,
+                K::P(b',') if depth == 0 => {
+                    if saw_token_in_elem {
+                        count += 1;
+                        saw_token_in_elem = false;
+                    }
+                }
+                _ => {
+                    saw_token_in_elem = true;
+                }
+            }
+            j += 1;
+        }
+        if saw_token_in_elem {
+            count += 1;
+        }
+        Some(count)
+    }
+
+    /// Returns `(is_eq, op_end_idx)` if tokens starting at `idx` are `==` or `!=`.
+    fn eq_op_at(&self, idx: usize) -> Option<(bool, usize)> {
+        let (a, b) = (self.tok(idx)?, self.tok(idx + 1)?);
+        if a.end != b.start || b.k != K::P(b'=') {
+            return None;
+        }
+        match a.k {
+            K::P(b'=') => Some((true, idx + 2)),
+            K::P(b'!') => Some((false, idx + 2)),
+            _ => None,
+        }
+    }
+
+    /// Walks back one token to include the simple receiver identifier before `.get(...)` when
+    /// available, solely for a clearer diagnostic span.
+    fn receiver_start_before_dot(&self, dot_idx: usize, fallback: u32) -> u32 {
+        if dot_idx > 0
+            && let Some(prev) = self.tok(dot_idx - 1)
+            && prev.k == K::Ident
+        {
+            prev.start
+        } else {
+            fallback
+        }
+    }
+
+    /// Checks `.get(0..N)`, `.get(..N)`, `.get(pos..pos + N)`, `.get(pos..=pos + N)`:
+    /// - Followed by `== Some(RHS)` / `!= Some(RHS)` or `.is_some_and(|x| x == RHS)` ->
+    ///   `MagicSlicePrefix` (or `MagicSlicePrefixMismatch` if length mismatches literal), with a
+    ///   mechanical `starts_with(` auto-fix for `0..N`/`..N` + `== Some(RHS)`.
+    /// - Followed by `.try_into()` or a fixed byte-width (`2`, `4`, `8`, `16`) -> `MagicSliceBytes`.
+    /// - Otherwise -> `MagicSliceRange`.
+    fn magic_slice_get(&mut self, i: usize, get_tok: Tok) {
+        if i == 0 || !self.tok(i - 1).is_some_and(|t| t.k == K::P(b'.')) {
+            return;
+        }
+        // Ignore `..get(` (impossible, but guard against range dot).
+        if i >= 2
+            && let (Some(a), Some(b)) = (self.tok(i - 2), self.tok(i - 1))
+            && a.k == K::P(b'.')
+            && a.end == b.start
+        {
+            return;
+        }
+        let open_idx = i + 1;
+        if !self.tok(open_idx).is_some_and(|t| t.k == K::P(b'(')) {
+            return;
+        }
+        let Some(close_idx) = self.find_matching_delim(open_idx, b'(', b')') else {
+            return;
+        };
+        let Some((range_len, from_zero)) = self.parse_magic_range(open_idx + 1, close_idx) else {
+            return;
+        };
+        let Some(close_tok) = self.tok(close_idx) else { return };
+        let start = self.receiver_start_before_dot(i - 1, get_tok.start);
+
+        // Form A1: `.get(..) == Some(RHS)` or `!= Some(RHS)`.
+        if let Some((is_eq, after_op)) = self.eq_op_at(close_idx + 1)
+            && let (Some(some_tok), Some(some_open)) = (self.tok(after_op), self.tok(after_op + 1))
+            && some_tok.k == K::Ident
+            && some_tok.word == W_SOME
+            && some_open.k == K::P(b'(')
+            && let Some(some_close) = self.find_matching_delim(after_op + 1, b'(', b')')
+            && some_close > after_op + 2
+            && let (Some(rhs_first), Some(rhs_last), Some(some_close_tok)) =
+                (self.tok(after_op + 2), self.tok(some_close - 1), self.tok(some_close))
+        {
+            let rhs_span = Span::new(rhs_first.start, rhs_last.end);
+            let full_span = Span::new(start, some_close_tok.end);
+            let lit_len = self.static_slice_rhs_len(after_op + 2, some_close);
+            if let Some(expected) = lit_len
+                && expected != range_len
+            {
+                self.cands.push(Cand {
+                    template: Template::MagicSlicePrefixMismatch,
+                    range: full_span,
+                    arg: Some(Arg::Span(rhs_span)),
+                    plan: Plan::None,
+                });
+                return;
+            }
+            let plan = if from_zero && is_eq {
+                Plan::Replace { range: Span::new(get_tok.start, some_open.end), text: "starts_with(" }
+            } else {
+                Plan::None
+            };
+            self.cands.push(Cand {
+                template: Template::MagicSlicePrefix,
+                range: full_span,
+                arg: Some(Arg::Span(rhs_span)),
+                plan,
+            });
+            return;
+        }
+
+        // Form A2: `.get(..).is_some_and(|x| x == RHS)`.
+        if let (Some(dot), Some(isa), Some(isa_open)) =
+            (self.tok(close_idx + 1), self.tok(close_idx + 2), self.tok(close_idx + 3))
+            && dot.k == K::P(b'.')
+            && isa.k == K::Ident
+            && isa.word == W_IS_SOME_AND
+            && isa_open.k == K::P(b'(')
+            && let Some(isa_close) = self.find_matching_delim(close_idx + 3, b'(', b')')
+            && let Some(isa_close_tok) = self.tok(isa_close)
+        {
+            // Look for `|id| id == RHS` inside `is_some_and(...)`.
+            let b0 = close_idx + 4;
+            if let (Some(bar1), Some(param), Some(bar2), Some(lhs_id)) =
+                (self.tok(b0), self.tok(b0 + 1), self.tok(b0 + 2), self.tok(b0 + 3))
+                && bar1.k == K::P(b'|')
+                && param.k == K::Ident
+                && bar2.k == K::P(b'|')
+                && lhs_id.k == K::Ident
+                && self.str_of(param) == self.str_of(lhs_id)
+                && let Some((_, rhs_start)) = self.eq_op_at(b0 + 4)
+                && rhs_start < isa_close
+                && let (Some(rhs_first), Some(rhs_last)) = (self.tok(rhs_start), self.tok(isa_close - 1))
+            {
+                let rhs_span = Span::new(rhs_first.start, rhs_last.end);
+                let full_span = Span::new(start, isa_close_tok.end);
+                let template = match self.static_slice_rhs_len(rhs_start, isa_close) {
+                    Some(expected) if expected != range_len => Template::MagicSlicePrefixMismatch,
+                    _ => Template::MagicSlicePrefix,
+                };
+                let is_eq = self.eq_op_at(b0 + 4).is_some_and(|(eq, _)| eq);
+                let rhs_is_ref_or_lit = rhs_first.k == K::Lit || rhs_first.k == K::P(b'&');
+                let plan = if template == Template::MagicSlicePrefix && from_zero && is_eq && rhs_is_ref_or_lit {
+                    Plan::Replace { range: Span::new(get_tok.start, rhs_first.start), text: "starts_with(" }
+                } else {
+                    Plan::None
+                };
+                self.cands.push(Cand { template, range: full_span, arg: Some(Arg::Span(rhs_span)), plan });
+                return;
+            }
+        }
+
+        // Form C: standalone `.get(0..N)` / `.get(..N)` / `.get(pos..pos + N)`.
+        let mut after = close_idx + 1;
+        if self.tok(after).is_some_and(|t| t.k == K::P(b'?')) {
+            after += 1;
+        }
+        let feeds_try_into = self.tok(after).is_some_and(|t| t.k == K::P(b'.'))
+            && self.tok(after + 1).is_some_and(|t| t.k == K::Ident && t.word == W_TRY_INTO);
+        let template = if feeds_try_into || matches!(range_len, 2 | 4 | 8 | 16) {
+            Template::MagicSliceBytes
+        } else {
+            Template::MagicSliceRange
+        };
+        self.cands.push(Cand { template, range: Span::new(start, close_tok.end), arg: None, plan: Plan::None });
+    }
+
+    /// Checks `&x[0..N] == RHS`, `&x[..N] == RHS`, `&x[pos..pos + N] == RHS` (and `!=`).
+    fn magic_slice_amp_index(&mut self, i: usize, amp: Tok) {
+        let Some(recv) = self.tok(i + 1) else { return };
+        if recv.k != K::Ident {
+            return;
+        }
+        let open_idx = i + 2;
+        if !self.tok(open_idx).is_some_and(|t| t.k == K::P(b'[')) {
+            return;
+        }
+        let Some(close_idx) = self.find_matching_delim(open_idx, b'[', b']') else {
+            return;
+        };
+        let Some((range_len, from_zero)) = self.parse_magic_range(open_idx + 1, close_idx) else {
+            return;
+        };
+        let Some((is_eq, rhs_start)) = self.eq_op_at(close_idx + 1) else {
+            return;
+        };
+        // Find end of a simple RHS expression: literal `b"..."` / `"..."`, `&[...]`, or ident.
+        let (rhs_end, rhs_span, rhs_is_ref_or_lit) = if let Some(first) = self.tok(rhs_start) {
+            if first.k == K::Lit {
+                (rhs_start + 1, Span::new(first.start, first.end), true)
+            } else if first.k == K::P(b'&')
+                && self.tok(rhs_start + 1).is_some_and(|t| t.k == K::P(b'['))
+                && let Some(arr_close) = self.find_matching_delim(rhs_start + 1, b'[', b']')
+                && let Some(end_tok) = self.tok(arr_close)
+            {
+                (arr_close + 1, Span::new(first.start, end_tok.end), true)
+            } else if first.k == K::Ident {
+                (rhs_start + 1, Span::new(first.start, first.end), false)
+            } else {
+                return;
+            }
+        } else {
+            return;
+        };
+        let template = match self.static_slice_rhs_len(rhs_start, rhs_end) {
+            Some(expected) if expected != range_len => Template::MagicSlicePrefixMismatch,
+            _ => Template::MagicSlicePrefix,
+        };
+        let plan = if template == Template::MagicSlicePrefix
+            && from_zero
+            && is_eq
+            && rhs_is_ref_or_lit
+            && let Some(open_tok) = self.tok(open_idx)
+        {
+            Plan::WrapStartsWith {
+                amp: Span::new(amp.start, amp.end),
+                middle: Span::new(open_tok.start, rhs_span.start),
+                after_rhs: rhs_span.end,
+            }
+        } else {
+            Plan::None
+        };
+        self.cands.push(Cand {
+            template,
+            range: Span::new(amp.start, rhs_span.end),
+            arg: Some(Arg::Span(rhs_span)),
+            plan,
+        });
+    }
+
+    /// Checks `x.starts_with(LIT)` followed immediately in its `{ ... }` body by a hardcoded
+    /// advance (`+= N`, `= N`, or `[N..]`) where `N` equals `LIT`'s static byte length.
+    fn magic_slice_starts_with(&mut self, i: usize, _sw: Tok) {
+        if i == 0 || !self.tok(i - 1).is_some_and(|t| t.k == K::P(b'.')) {
+            return;
+        }
+        let open_idx = i + 1;
+        if !self.tok(open_idx).is_some_and(|t| t.k == K::P(b'(')) {
+            return;
+        }
+        let Some(close_idx) = self.find_matching_delim(open_idx, b'(', b')') else {
+            return;
+        };
+        if close_idx <= open_idx + 1 {
+            return;
+        }
+        let Some(lit_len) = self.static_slice_rhs_len(open_idx + 1, close_idx) else {
+            return;
+        };
+        if lit_len == 0 {
+            return;
+        }
+        let (Some(arg_first), Some(arg_last)) = (self.tok(open_idx + 1), self.tok(close_idx - 1)) else {
+            return;
+        };
+        let prefix_span = Span::new(arg_first.start, arg_last.end);
+        // Only look into an immediate `{ ... }` block right after `starts_with(LIT)`.
+        let brace_idx = close_idx + 1;
+        if !self.tok(brace_idx).is_some_and(|t| t.k == K::P(b'{')) {
+            return;
+        }
+        let Some(brace_close) = self.find_matching_delim(brace_idx, b'{', b'}') else {
+            return;
+        };
+        // Scan up to the first 16 tokens of the block at depth 0 for `[N..]` or `+= N` / `= N`.
+        let limit = brace_close.min(brace_idx + 20);
+        let mut j = brace_idx + 1;
+        while j < limit {
+            let Some(tok) = self.tok(j) else { break };
+            // Pattern 1: `[N..]` where `N == lit_len`.
+            if tok.k == K::P(b'[')
+                && let (Some(n_tok), Some(d1), Some(d2), Some(rb)) =
+                    (self.tok(j + 1), self.tok(j + 2), self.tok(j + 3), self.tok(j + 4))
+                && n_tok.k == K::Int
+                && parse_small_uint(self.str_of(n_tok)) == Some(lit_len)
+                && d1.k == K::P(b'.')
+                && d2.k == K::P(b'.')
+                && d1.end == d2.start
+                && rb.k == K::P(b']')
+            {
+                self.cands.push(Cand {
+                    template: Template::MagicSliceAdvance,
+                    range: Span::new(tok.start, rb.end),
+                    arg: Some(Arg::Span(prefix_span)),
+                    plan: Plan::None,
+                });
+                return;
+            }
+            // Pattern 2: `at += N;` or `at = N;` where `N == lit_len`.
+            if tok.k == K::Ident
+                && let (Some(op1), Some(op2), Some(n_tok)) = (self.tok(j + 1), self.tok(j + 2), self.tok(j + 3))
+                && op1.k == K::P(b'+')
+                && op2.k == K::P(b'=')
+                && op1.end == op2.start
+                && n_tok.k == K::Int
+                && parse_small_uint(self.str_of(n_tok)) == Some(lit_len)
+            {
+                self.cands.push(Cand {
+                    template: Template::MagicSliceAdvance,
+                    range: Span::new(tok.start, n_tok.end),
+                    arg: Some(Arg::Span(prefix_span)),
+                    plan: Plan::None,
+                });
+                return;
+            }
+            j += 1;
+        }
+    }
+
+    // ---- bool-as-int (`(a == b) as u32`, `x.is_some() as usize` -> `T::from(..)`) -------
+
+    /// Finds the matching opening delimiter walking backwards from `close_idx`.
+    fn find_matching_open(&self, close_idx: usize, open_b: u8, close_b: u8) -> Option<usize> {
+        let mut depth = 0u32;
+        let mut j = close_idx;
+        loop {
+            let tok = self.tok(j)?;
+            if tok.k == K::P(close_b) {
+                depth += 1;
+            } else if tok.k == K::P(open_b) {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            if j == 0 {
+                return None;
+            }
+            j -= 1;
+        }
+    }
+
+    /// True if tokens inside `[from..to)` contain a top-level boolean comparison/logical operator
+    /// (`==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`). Note: bare `!x` is intentionally NOT
+    /// matched here because `!` is bitwise NOT on integer types.
+    fn is_bool_expr_tokens(&self, from: usize, to: usize) -> bool {
+        if from >= to {
+            return false;
+        }
+        let mut depth = 0u32;
+        let mut turbo_depth = 0u32;
+        let mut j = from;
+        while j < to {
+            let Some(tok) = self.tok(j) else { break };
+            match tok.k {
+                K::P(b'(' | b'[' | b'{') => depth += 1,
+                K::P(b')' | b']' | b'}') => depth = depth.saturating_sub(1),
+                K::P(b'<') if depth == 0 => {
+                    // Distinguish comparison `<` from turbofish `::<` (preceded by `::`) and `<<`.
+                    let is_turbo = j >= 2
+                        && self.tok(j - 1).is_some_and(|t| t.k == K::P(b':'))
+                        && self.tok(j - 2).is_some_and(|t| t.k == K::P(b':'));
+                    let is_shl = self.tok(j + 1).is_some_and(|t| t.k == K::P(b'<') && tok.end == t.start);
+                    if is_turbo || turbo_depth > 0 {
+                        turbo_depth += 1;
+                    } else if is_shl {
+                        j += 1;
+                    } else {
+                        return true;
+                    }
+                }
+                K::P(b'>') if depth == 0 => {
+                    if turbo_depth > 0 {
+                        turbo_depth -= 1;
+                    } else {
+                        let is_shr = self.tok(j + 1).is_some_and(|t| t.k == K::P(b'>') && tok.end == t.start);
+                        let is_arrow = j > from && self.tok(j - 1).is_some_and(|t| (t.k == K::P(b'-') || t.k == K::P(b'=')) && t.end == tok.start);
+                        if !is_shr && !is_arrow {
+                            return true;
+                        }
+                        if is_shr {
+                            j += 1;
+                        }
+                    }
+                }
+                K::P(b'=' | b'!') if depth == 0 => {
+                    if self.tok(j + 1).is_some_and(|t| t.k == K::P(b'=') && tok.end == t.start) {
+                        return true;
+                    }
+                }
+                K::P(b'&') if depth == 0 => {
+                    if self.tok(j + 1).is_some_and(|t| t.k == K::P(b'&') && tok.end == t.start) {
+                        return true;
+                    }
+                }
+                K::P(b'|') if depth == 0 => {
+                    if self.tok(j + 1).is_some_and(|t| t.k == K::P(b'|') && tok.end == t.start) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        false
+    }
+
+    /// True if `at` sits inside a `const fn` or `const NAME: ... =` item (where non-const
+    /// `T::from(..)` cannot be called).
+    fn inside_const_context(&self, at: usize) -> bool {
+        let mut depth = 0u32;
+        let mut j = at;
+        while j > 0 {
+            j -= 1;
+            let Some(tok) = self.tok(j) else { break };
+            match tok.k {
+                K::P(b'}') => depth += 1,
+                K::P(b'{') => {
+                    if depth > 0 {
+                        depth -= 1;
+                    } else {
+                        // Look back up to 16 tokens before `{` for `const fn`.
+                        let lo = j.saturating_sub(24);
+                        let mut k = j;
+                        while k > lo {
+                            k -= 1;
+                            if let Some(t) = self.tok(k)
+                                && t.k == K::Ident
+                                && t.word == W_FN
+                            {
+                                return k > 0
+                                    && self.tok(k - 1).is_some_and(|p| p.k == K::Ident && self.str_of(p) == "const");
+                            }
+                        }
+                        return false;
+                    }
+                }
+                K::P(b';') if depth == 0 => return false,
+                K::Ident if depth == 0 && self.str_of(tok) == "const" => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// True if `at` sits directly inside a function named `target_name` (e.g. `fn is_empty`).
+    fn inside_fn_named(&self, at: usize, target_name: &str) -> bool {
+        let mut depth = 0u32;
+        let mut j = at;
+        while j > 0 {
+            j -= 1;
+            let Some(tok) = self.tok(j) else { break };
+            match tok.k {
+                K::P(b'}') => depth += 1,
+                K::P(b'{') => {
+                    if depth > 0 {
+                        depth -= 1;
+                    } else {
+                        let lo = j.saturating_sub(24);
+                        let mut k = j;
+                        while k > lo {
+                            k -= 1;
+                            if let Some(t) = self.tok(k)
+                                && t.k == K::Ident
+                                && t.word == W_FN
+                            {
+                                return self
+                                    .tok(k + 1)
+                                    .is_some_and(|n| n.k == K::Ident && self.str_of(n) == target_name);
+                            }
+                        }
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Flags provably boolean expressions cast via `as <int>` (`(a == b) as u32`, `(!flag) as u8`,
+    /// `x.is_some() as usize`, `true as u64`) and attaches a mechanical `T::from(..)` auto-fix.
+    fn bool_as_int(&mut self, i: usize, _as_tok: Tok) {
+        if i == 0 || self.in_use || self.inside_const_context(i) {
+            return;
+        }
+        let Some(ty_tok) = self.tok(i + 1) else { return };
+        if ty_tok.k != K::Ident {
+            return;
+        }
+        let ty_name = self.str_of(ty_tok);
+        let Some((prefix_paren, prefix_bare)) = int_from_prefixes(ty_name) else {
+            return;
+        };
+        let Some(prev) = self.tok(i - 1) else { return };
+        // Case 1: `(bool_expr) as T` -> `T::from(bool_expr)`.
+        if prev.k == K::P(b')')
+            && let Some(open_idx) = self.find_matching_open(i - 1, b'(', b')')
+            && let Some(open_tok) = self.tok(open_idx)
+        {
+            // Subcase 1a: `recv.is_*() as T` -> `T::from(recv.is_*())`.
+            if open_idx >= 2
+                && let (Some(method), Some(dot)) = (self.tok(open_idx - 1), self.tok(open_idx - 2))
+                && method.k == K::Ident
+                && dot.k == K::P(b'.')
+                && is_bool_method(self.str_of(method))
+            {
+                let expr_start = self.simple_chain_start(open_idx - 2);
+                self.cands.push(Cand {
+                    template: Template::BoolAsInt,
+                    range: Span::new(expr_start, ty_tok.end),
+                    arg: Some(Arg::Span(Span::new(ty_tok.start, ty_tok.end))),
+                    plan: Plan::WrapFrom {
+                        before_expr: expr_start,
+                        after_expr: prev.end,
+                        as_end: ty_tok.end,
+                        prefix: prefix_bare,
+                        add_close: true,
+                    },
+                });
+                return;
+            }
+            // Subcase 1b: parenthesized bool expression `(a == b) as T`, `(!x) as T`.
+            let preceded_by_ident = open_idx > 0
+                && self.tok(open_idx - 1).is_some_and(|t| t.k == K::Ident);
+            if !preceded_by_ident && self.is_bool_expr_tokens(open_idx + 1, i - 1) {
+                self.cands.push(Cand {
+                    template: Template::BoolAsInt,
+                    range: Span::new(open_tok.start, ty_tok.end),
+                    arg: Some(Arg::Span(Span::new(ty_tok.start, ty_tok.end))),
+                    plan: Plan::WrapFrom {
+                        before_expr: open_tok.start,
+                        after_expr: prev.end,
+                        as_end: ty_tok.end,
+                        prefix: prefix_paren,
+                        add_close: false,
+                    },
+                });
+                return;
+            }
+        }
+        // Case 2: `true as T` / `false as T`.
+        if prev.k == K::Ident && (prev.word == W_TRUE || prev.word == W_FALSE) {
+            self.cands.push(Cand {
+                template: Template::BoolAsInt,
+                range: Span::new(prev.start, ty_tok.end),
+                arg: Some(Arg::Span(Span::new(ty_tok.start, ty_tok.end))),
+                plan: Plan::WrapFrom {
+                    before_expr: prev.start,
+                    after_expr: prev.end,
+                    as_end: ty_tok.end,
+                    prefix: prefix_bare,
+                    add_close: true,
+                },
+            });
+        }
+    }
+
+    /// Walks back across simple `a.b.c` identifier/field chains before `dot_idx`.
+    fn simple_chain_start(&self, dot_idx: usize) -> u32 {
+        let mut cur = dot_idx;
+        let mut best = self.tok(dot_idx).map_or(0, |t| t.start);
+        while cur > 0 {
+            let Some(prev) = self.tok(cur - 1) else { break };
+            if prev.k == K::Ident {
+                best = prev.start;
+                if cur >= 2 && self.tok(cur - 2).is_some_and(|t| t.k == K::P(b'.')) {
+                    cur -= 2;
+                    continue;
+                }
+            }
+            break;
+        }
+        best
+    }
+
+    // ---- manual-slice-idioms (`.len() == 0`, `for i in 0..xs.len()`, `.find` + split) ---
+
+    /// Flags `x.len() == 0`, `x.len() > 0`, `x.len() != 0`, `x.len() >= 1` and attaches a
+    /// mechanical `is_empty()` / `!is_empty()` auto-fix.
+    fn manual_len_zero(&mut self, i: usize, len_tok: Tok) {
+        if i == 0 || !self.tok(i - 1).is_some_and(|t| t.k == K::P(b'.')) {
+            return;
+        }
+        // Never rewrite `self.len() == 0` inside `fn is_empty(&self)` (would cause infinite recursion!).
+        if i >= 2
+            && self.tok(i - 2).is_some_and(|t| t.k == K::Ident && t.word == W_SELF)
+            && self.inside_fn_named(i, "is_empty")
+        {
+            return;
+        }
+        if !self.tok(i + 1).is_some_and(|t| t.k == K::P(b'('))
+            || !self.tok(i + 2).is_some_and(|t| t.k == K::P(b')'))
+        {
+            return;
+        }
+        let op_idx = i + 3;
+        let (is_empty, rhs_tok, after_rhs_idx) = if let Some((is_eq, rhs_i)) = self.eq_op_at(op_idx)
+            && let Some(rhs) = self.tok(rhs_i)
+            && rhs.k == K::Int
+            && parse_small_uint(self.str_of(rhs)) == Some(0)
+        {
+            (is_eq, rhs, rhs_i + 1)
+        } else if let (Some(gt), Some(next)) = (self.tok(op_idx), self.tok(op_idx + 1))
+            && gt.k == K::P(b'>')
+            && next.k == K::Int
+            && parse_small_uint(self.str_of(next)) == Some(0)
+        {
+            (false, next, op_idx + 2)
+        } else if let (Some(gt), Some(eq), Some(rhs)) = (self.tok(op_idx), self.tok(op_idx + 1), self.tok(op_idx + 2))
+            && gt.k == K::P(b'>')
+            && eq.k == K::P(b'=')
+            && gt.end == eq.start
+            && rhs.k == K::Int
+            && parse_small_uint(self.str_of(rhs)) == Some(1)
+        {
+            (false, rhs, op_idx + 3)
+        } else {
+            return;
+        };
+        // Guard against compound RHS expressions like `bytes.len() >= 1 << 20` or `x.len() > 0 + n`.
+        if self.tok(after_rhs_idx).is_some_and(|t| {
+            matches!(t.k, K::P(b'+' | b'-' | b'*' | b'/' | b'%' | b'<' | b'>' | b'.' | b'^'))
+                || (t.k == K::P(b'&') && !self.tok(after_rhs_idx + 1).is_some_and(|n| n.k == K::P(b'&') && t.end == n.start))
+                || (t.k == K::P(b'|') && !self.tok(after_rhs_idx + 1).is_some_and(|n| n.k == K::P(b'|') && t.end == n.start))
+        }) {
+            return;
+        }
+        let recv_start = self.simple_chain_start(i - 1);
+        // Guard against compound LHS expressions like `a.len() + b.len() >= 1`.
+        let mut recv_tok_idx = i - 1;
+        while recv_tok_idx > 0
+            && self.tok(recv_tok_idx - 1).is_some_and(|t| t.start >= recv_start)
+        {
+            recv_tok_idx -= 1;
+        }
+        if recv_tok_idx > 0
+            && self.tok(recv_tok_idx - 1).is_some_and(|t| {
+                matches!(t.k, K::P(b'+' | b'-' | b'*' | b'/' | b'%' | b'^' | b'<' | b'>'))
+            })
+        {
+            return;
+        }
+        let can_negate = i >= 2
+            && self.tok(i - 2).is_some_and(|t| t.k == K::Ident)
+            && !self.tok(i - 1).is_some_and(|t| t.start == recv_start);
+        let replace_span = Span::new(len_tok.start, rhs_tok.end);
+        let plan = if is_empty {
+            Plan::Replace { range: replace_span, text: "is_empty()" }
+        } else if can_negate {
+            Plan::NegateReplace { bang_at: recv_start, range: replace_span, text: "is_empty()" }
+        } else {
+            Plan::None
+        };
+        self.cands.push(Cand {
+            template: Template::LenZeroCheck,
+            range: Span::new(recv_start, rhs_tok.end),
+            arg: None,
+            plan,
+        });
+    }
+
+    /// Flags `for idx in 0..xs.len() { ... xs[idx] ... }` index loops that cause unchecked index
+    /// stops and redundant bounds checks.
+    fn manual_index_loop(&mut self, i: usize, for_tok: Tok) {
+        let (Some(idx_tok), Some(in_tok), Some(zero_tok), Some(d1), Some(d2)) =
+            (self.tok(i + 1), self.tok(i + 2), self.tok(i + 3), self.tok(i + 4), self.tok(i + 5))
+        else {
+            return;
+        };
+        if idx_tok.k != K::Ident
+            || in_tok.k != K::Ident
+            || in_tok.word != W_IN
+            || zero_tok.k != K::Int
+            || parse_small_uint(self.str_of(zero_tok)) != Some(0)
+            || d1.k != K::P(b'.')
+            || d2.k != K::P(b'.')
+            || d1.end != d2.start
+        {
+            return;
+        }
+        // Match `xs.len() {` after `0..`.
+        let (Some(xs_tok), Some(dot), Some(len_tok), Some(lp), Some(rp), Some(lb)) = (
+            self.tok(i + 6),
+            self.tok(i + 7),
+            self.tok(i + 8),
+            self.tok(i + 9),
+            self.tok(i + 10),
+            self.tok(i + 11),
+        ) else {
+            return;
+        };
+        if xs_tok.k != K::Ident
+            || dot.k != K::P(b'.')
+            || len_tok.k != K::Ident
+            || len_tok.word != W_LEN
+            || lp.k != K::P(b'(')
+            || rp.k != K::P(b')')
+            || lb.k != K::P(b'{')
+        {
+            return;
+        }
+        let Some(rb_idx) = self.find_matching_delim(i + 11, b'{', b'}') else {
+            return;
+        };
+        let idx_name = self.str_of(idx_tok);
+        let xs_name = self.str_of(xs_tok);
+        // Check if the loop body actually indexes `xs[idx]` (skipping `xs[idx] = ...` mutations
+        // only? No, `for x in &mut xs` / `xs.iter_mut()` is also cleaner than `xs[idx] = ...`!).
+        let mut j = i + 12;
+        while j + 3 < rb_idx {
+            if let (Some(a), Some(lb2), Some(b), Some(rb2)) =
+                (self.tok(j), self.tok(j + 1), self.tok(j + 2), self.tok(j + 3))
+                && a.k == K::Ident
+                && lb2.k == K::P(b'[')
+                && b.k == K::Ident
+                && rb2.k == K::P(b']')
+                && self.str_of(a) == xs_name
+                && self.str_of(b) == idx_name
+            {
+                self.cands.push(Cand {
+                    template: Template::IndexLoop,
+                    range: Span::new(for_tok.start, rp.end),
+                    arg: Some(Arg::Span(Span::new(xs_tok.start, xs_tok.end))),
+                    plan: Plan::None,
+                });
+                return;
+            }
+            j += 1;
+        }
+    }
+
+    /// Flags `let Some(pos) = s.find(pat)` / `Some(pos) => ...` followed by manual `&s[..pos]` or
+    /// `&s[pos + 1..]` splitting where `s.split_once(pat)` derives both halves safely.
+    fn manual_find_split(&mut self, i: usize, find_tok: Tok) {
+        if i == 0 || !self.tok(i - 1).is_some_and(|t| t.k == K::P(b'.')) {
+            return;
+        }
+        let open_idx = i + 1;
+        if !self.tok(open_idx).is_some_and(|t| t.k == K::P(b'(')) {
+            return;
+        }
+        let Some(close_idx) = self.find_matching_delim(open_idx, b'(', b')') else {
+            return;
+        };
+        if close_idx <= open_idx + 1 {
+            return;
+        }
+        let (Some(pat_first), Some(pat_last), Some(close_tok)) =
+            (self.tok(open_idx + 1), self.tok(close_idx - 1), self.tok(close_idx))
+        else {
+            return;
+        };
+        // Only flag when the pattern is a single char or string literal (not a closure predicate).
+        if pat_first.k != K::Lit || pat_first.start != pat_last.start {
+            return;
+        }
+        let pat_span = Span::new(pat_first.start, pat_last.end);
+        // Find bound variable `pos` in `Some(pos) = s.find(...)` just before `s.find(...)`.
+        let mut bound_pos = None;
+        let back_limit = i.saturating_sub(10);
+        let mut b = i;
+        while b > back_limit {
+            b -= 1;
+            if let (Some(some_t), Some(lp), Some(id), Some(rp)) =
+                (self.tok(b), self.tok(b + 1), self.tok(b + 2), self.tok(b + 3))
+                && some_t.k == K::Ident
+                && some_t.word == W_SOME
+                && lp.k == K::P(b'(')
+                && id.k == K::Ident
+                && rp.k == K::P(b')')
+            {
+                bound_pos = Some(self.str_of(id));
+                break;
+            }
+        }
+        let Some(pos_name) = bound_pos else {
+            return;
+        };
+        // Look ahead in the next 32 tokens for `[..pos]` or `[pos + 1..]`.
+        let scan_end = close_idx + 32;
+        let mut j = close_idx + 1;
+        while j < scan_end {
+            let Some(tok) = self.tok(j) else { break };
+            if tok.k == K::P(b'[') {
+                // `[..pos]`
+                if let (Some(d1), Some(d2), Some(id), Some(rb)) =
+                    (self.tok(j + 1), self.tok(j + 2), self.tok(j + 3), self.tok(j + 4))
+                    && d1.k == K::P(b'.')
+                    && d2.k == K::P(b'.')
+                    && d1.end == d2.start
+                    && id.k == K::Ident
+                    && self.str_of(id) == pos_name
+                    && rb.k == K::P(b']')
+                {
+                    let start = self.receiver_start_before_dot(i - 1, find_tok.start);
+                    self.cands.push(Cand {
+                        template: Template::ManualFindSplit,
+                        range: Span::new(start, close_tok.end),
+                        arg: Some(Arg::Span(pat_span)),
+                        plan: Plan::None,
+                    });
+                    return;
+                }
+                // `[pos + 1..]`
+                if let (Some(id), Some(plus), Some(one), Some(d1), Some(d2), Some(rb)) = (
+                    self.tok(j + 1),
+                    self.tok(j + 2),
+                    self.tok(j + 3),
+                    self.tok(j + 4),
+                    self.tok(j + 5),
+                    self.tok(j + 6),
+                ) && id.k == K::Ident
+                    && self.str_of(id) == pos_name
+                    && plus.k == K::P(b'+')
+                    && one.k == K::Int
+                    && d1.k == K::P(b'.')
+                    && d2.k == K::P(b'.')
+                    && d1.end == d2.start
+                    && rb.k == K::P(b']')
+                {
+                    let start = self.receiver_start_before_dot(i - 1, find_tok.start);
+                    self.cands.push(Cand {
+                        template: Template::ManualFindSplit,
+                        range: Span::new(start, close_tok.end),
+                        arg: Some(Arg::Span(pat_span)),
+                        plan: Plan::None,
+                    });
+                    return;
+                }
+            }
+            j += 1;
+        }
+    }
+
+    // ---- test-ambient-leak (`Alloc::global()` in tests, `#[cfg(test)] extern crate std;`)
+
+    /// Flags `Alloc::global()` inside test code (trips `alloc_global_tests` ratchet).
+    fn test_global_alloc(&mut self, i: usize, alloc_tok: Tok) {
+        if !self.test_at(alloc_tok.start).meets(TestBits::ANY) {
+            return;
+        }
+        if let (Some(c1), Some(c2), Some(glob), Some(lp), Some(rp)) =
+            (self.tok(i + 1), self.tok(i + 2), self.tok(i + 3), self.tok(i + 4), self.tok(i + 5))
+            && c1.k == K::P(b':')
+            && c2.k == K::P(b':')
+            && c1.end == c2.start
+            && glob.k == K::Ident
+            && glob.word == W_GLOBAL_FN
+            && lp.k == K::P(b'(')
+            && rp.k == K::P(b')')
+        {
+            self.cands.push(Cand {
+                template: Template::TestGlobalAlloc,
+                range: Span::new(alloc_tok.start, rp.end),
+                arg: None,
+                plan: Plan::None,
+            });
+        }
+    }
+
+    /// Flags `extern crate std;` inside test-gated items (`#[cfg(test)] extern crate std;`).
+    fn test_extern_std(&mut self, i: usize, extern_tok: Tok) {
+        if !self.test_at(extern_tok.start).meets(TestBits::ANY) {
+            return;
+        }
+        if let (Some(krate), Some(std_tok)) = (self.tok(i + 1), self.tok(i + 2))
+            && krate.k == K::Ident
+            && krate.word == W_CRATE
+            && std_tok.k == K::Ident
+            && std_tok.word == W_STD
+        {
+            self.cands.push(Cand {
+                template: Template::TestExternStd,
+                range: Span::new(extern_tok.start, std_tok.end),
+                arg: None,
+                plan: Plan::None,
+            });
+        }
+    }
+
     // ---- allocs' hatch ------------------------------------------------------------------
 
     /// allocs.rs's `keeps`: a line comment with `// alloc: <reason>`, the reason not empty.
@@ -2976,6 +4261,30 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                     }
                     out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
                 }
+                Plan::Replace { range, text } => {
+                    let edits_from = count(out.edits.len())?;
+                    out.push_edit(range, text)?;
+                    out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
+                }
+                Plan::WrapStartsWith { amp, middle, after_rhs } => {
+                    let edits_from = count(out.edits.len())?;
+                    out.push_edit(amp, "")?;
+                    out.push_edit(middle, ".starts_with(")?;
+                    out.push_edit(Span::new(after_rhs, after_rhs), ")")?;
+                    out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
+                }
+                Plan::WrapFrom { before_expr, after_expr, as_end, prefix, add_close } => {
+                    let edits_from = count(out.edits.len())?;
+                    out.push_edit(Span::new(before_expr, before_expr), prefix)?;
+                    out.push_edit(Span::new(after_expr, as_end), if add_close { ")" } else { "" })?;
+                    out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
+                }
+                Plan::NegateReplace { bang_at, range, text } => {
+                    let edits_from = count(out.edits.len())?;
+                    out.push_edit(Span::new(bang_at, bang_at), "!")?;
+                    out.push_edit(range, text)?;
+                    out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
+                }
             }
             let fixes = Run { from: fixes_from, to: count(out.fixes.len())? };
             out.list.push(Finding { template: c.template, range: c.range, args, fixes });
@@ -2997,6 +4306,127 @@ enum Called {
     SelfType,
     SelfMethod,
     Other,
+}
+
+/// Returns `(prefix_for_parenthesized, prefix_for_bare)` for integer types supporting `From<bool>`.
+fn int_from_prefixes(ty: &str) -> Option<(&'static str, &'static str)> {
+    match ty {
+        "u8" => Some(("u8::from", "u8::from(")),
+        "u16" => Some(("u16::from", "u16::from(")),
+        "u32" => Some(("u32::from", "u32::from(")),
+        "u64" => Some(("u64::from", "u64::from(")),
+        "u128" => Some(("u128::from", "u128::from(")),
+        "usize" => Some(("usize::from", "usize::from(")),
+        "i8" => Some(("i8::from", "i8::from(")),
+        "i16" => Some(("i16::from", "i16::from(")),
+        "i32" => Some(("i32::from", "i32::from(")),
+        "i64" => Some(("i64::from", "i64::from(")),
+        "i128" => Some(("i128::from", "i128::from(")),
+        "isize" => Some(("isize::from", "isize::from(")),
+        _ => None,
+    }
+}
+
+/// Methods whose return type is unambiguously `bool`.
+fn is_bool_method(name: &str) -> bool {
+    matches!(
+        name,
+        "is_some"
+            | "is_none"
+            | "is_ok"
+            | "is_err"
+            | "is_empty"
+            | "is_ascii"
+            | "is_ascii_digit"
+            | "is_ascii_alphabetic"
+            | "is_ascii_alphanumeric"
+            | "is_ascii_whitespace"
+            | "is_ascii_hexdigit"
+            | "is_sign_positive"
+            | "is_sign_negative"
+            | "is_nan"
+            | "is_infinite"
+            | "is_finite"
+            | "is_power_of_two"
+            | "starts_with"
+            | "ends_with"
+            | "contains"
+    )
+}
+
+/// Parses a plain unsigned decimal integer literal (allowing `_` separators and optional
+/// `usize`/`u32`/`u64` suffix). Returns `None` for hex/binary/octal or non-decimal tokens.
+fn parse_small_uint(s: &str) -> Option<usize> {
+    if s.starts_with("0x") || s.starts_with("0X") || s.starts_with("0b") || s.starts_with("0B") || s.starts_with("0o") || s.starts_with("0O") {
+        return None;
+    }
+    let digits = s
+        .strip_suffix("usize")
+        .or_else(|| s.strip_suffix("u32"))
+        .or_else(|| s.strip_suffix("u64"))
+        .or_else(|| s.strip_suffix("u16"))
+        .or_else(|| s.strip_suffix("u8"))
+        .unwrap_or(s);
+    if digits.is_empty() {
+        return None;
+    }
+    let mut val = 0usize;
+    let mut saw = false;
+    for b in digits.bytes() {
+        if b == b'_' {
+            continue;
+        }
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        saw = true;
+        val = val.checked_mul(10)?.checked_add(usize::from(b - b'0'))?;
+    }
+    saw.then_some(val)
+}
+
+/// Computes the exact byte length of a Rust string or byte-string literal (`"..."`, `b"..."`,
+/// `r#"..."#`, `br#"..."#`) when statically decidable. Returns `None` for non-string literals or
+/// unrecognized escape sequences.
+fn static_str_lit_byte_len(lit: &str) -> Option<usize> {
+    // Raw strings / raw byte strings: `r"..."`, `r#"..."#`, `br"..."`, `br#"..."#`.
+    let rest = lit.strip_prefix('b').unwrap_or(lit);
+    if let Some(after_r) = rest.strip_prefix('r') {
+        let hashes = after_r.bytes().take_while(|&b| b == b'#').count();
+        let inner = after_r.get(hashes..)?.strip_prefix('"')?;
+        let end = inner.len().checked_sub(1 + hashes)?;
+        let content = inner.get(..end)?;
+        return Some(content.len());
+    }
+    let inner = rest.strip_prefix('"')?.strip_suffix('"')?;
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    let mut len = 0usize;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'\\' {
+            let Some(&esc) = bytes.get(i + 1) else { return None };
+            match esc {
+                b'n' | b'r' | b't' | b'\\' | b'0' | b'\'' | b'"' => {
+                    len += 1;
+                    i += 2;
+                }
+                b'x' => {
+                    // `\xHH` is always 1 byte in byte strings and ASCII in strings (if < 0x80).
+                    const HEX_ESCAPE_LEN: usize = 4;
+                    if bytes.len().saturating_sub(i) < HEX_ESCAPE_LEN {
+                        return None;
+                    }
+                    len += 1;
+                    i += HEX_ESCAPE_LEN;
+                }
+                _ => return None,
+            }
+        } else {
+            len += 1;
+            i += 1;
+        }
+    }
+    Some(len)
 }
 
 /// A type name that holds interior state: a cell (`Cell`, `RefCell`, `UnsafeCell`, `OnceCell`,

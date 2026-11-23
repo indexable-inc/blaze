@@ -596,6 +596,7 @@ impl<'o, 'a> Assembled<'o, 'a> {
                 .map_or_else(|| crate::names_digest::file_names_digest("", &[]), |part| part.outline.file_names),
             own_flags: self.parts.first().map_or(ItemFlags::NONE, |part| part.outline.own_flags),
             flags: self.flags,
+            extensions: self.parts.first().map_or(parser::Extensions::NONE, |part| part.outline.extensions),
         };
         out.items.extend(self.items());
         for part in &self.parts {

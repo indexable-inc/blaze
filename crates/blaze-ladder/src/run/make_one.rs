@@ -624,7 +624,7 @@ impl MakerState {
                 while self.checked.len() < program.fn_count().max(i + 1) {
                     self.checked.push(None);
                 }
-                let mut refresh = done.closures.len() != 0;
+                let mut refresh = !done.closures.is_empty();
                 if !refresh && let Some((body, _)) = program.function(i).body {
                     let view = body.view(program.body_types(i));
                     refresh = blaze_build::coroutines_in(&view).into_iter().next().is_some();

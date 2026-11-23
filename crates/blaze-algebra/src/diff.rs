@@ -6,7 +6,7 @@ use core::alloc::Allocator;
 
 use blaze_own::Vec as OwnVec;
 
-use crate::{AlgebraError, ExprGraph, ExprId, Op, VarId, det_tanh};
+use crate::{AlgebraError, ExprGraph, ExprId, Op, VarId, det_tanh, u32_to_usize};
 
 /// Planted bugs for oracle controls (`dst-not-review`, rule 43).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -151,14 +151,14 @@ impl Dual {
 
 /// Evaluate `root` with forward-mode dual numbers seeded at `wrt` (`d(wrt)/d(wrt) = 1.0`,
 /// all other variables `0.0`), independent of symbolic differentiation rules.
-pub fn eval_dual<A: Allocator + Clone>(
+pub fn eval_dual<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     root: ExprId,
     env: &[f64],
     wrt: VarId,
 ) -> Result<Dual, AlgebraError> {
     let n = g.len();
-    if (root.0 as usize) >= n {
+    if u32_to_usize(root.0) >= n {
         return Err(AlgebraError::InvalidExpr { expr: root, node_count: n });
     }
     let mut cache: OwnVec<Option<Dual>, A> = OwnVec::with_capacity_in(n, g.alloc());
@@ -168,14 +168,14 @@ pub fn eval_dual<A: Allocator + Clone>(
     eval_dual_memo(g, root, env, wrt, &mut cache)
 }
 
-fn eval_dual_memo<A: Allocator + Clone>(
+fn eval_dual_memo<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     id: ExprId,
     env: &[f64],
     wrt: VarId,
     cache: &mut OwnVec<Option<Dual>, A>,
 ) -> Result<Dual, AlgebraError> {
-    let idx = id.0 as usize;
+    let idx = u32_to_usize(id.0);
     if let Some(hit) = cache.get(idx).copied().flatten() {
         return Ok(hit);
     }
@@ -183,7 +183,7 @@ fn eval_dual_memo<A: Allocator + Clone>(
         Op::Const(bits) => Dual::constant(f64::from_bits(bits)),
         Op::Var(v) => {
             let val = *env
-                .get(v.0 as usize)
+                .get(u32_to_usize(v.0))
                 .ok_or(AlgebraError::UnknownVar { var: v, env_len: env.len() })?;
             Dual::var(val, if v == wrt { 1.0 } else { 0.0 })
         }
@@ -221,6 +221,23 @@ fn eval_dual_memo<A: Allocator + Clone>(
         Op::Sqrt(a) => eval_dual_memo(g, a, env, wrt, cache)?.sqrt(),
         Op::Tanh(a) => eval_dual_memo(g, a, env, wrt, cache)?.tanh(),
         Op::Abs(a) => eval_dual_memo(g, a, env, wrt, cache)?.abs(),
+        Op::Select(c, t, e) => {
+            let dc = eval_dual_memo(g, c, env, wrt, cache)?;
+            if dc.val > 0.0 {
+                eval_dual_memo(g, t, env, wrt, cache)?
+            } else {
+                eval_dual_memo(g, e, env, wrt, cache)?
+            }
+        }
+        Op::Fma(a, b, c) => {
+            let da = eval_dual_memo(g, a, env, wrt, cache)?;
+            let db = eval_dual_memo(g, b, env, wrt, cache)?;
+            let dc = eval_dual_memo(g, c, env, wrt, cache)?;
+            Dual {
+                val: blaze_math::mul_add(da.val, db.val, dc.val),
+                deriv: blaze_math::mul_add(da.deriv, db.val, blaze_math::mul_add(da.val, db.deriv, dc.deriv)),
+            }
+        }
     };
     if let Some(slot) = cache.get_mut(idx) {
         *slot = Some(d);
@@ -229,7 +246,7 @@ fn eval_dual_memo<A: Allocator + Clone>(
 }
 
 /// Compute the symbolic partial derivative `∂(root) / ∂(wrt)` over the shared DAG (memoized O(|V|)).
-pub fn diff<A: Allocator + Clone>(
+pub fn diff<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     wrt: VarId,
@@ -238,148 +255,208 @@ pub fn diff<A: Allocator + Clone>(
 }
 
 /// Symbolic partial derivative with explicit `AlgebraPlant` for planted-bug oracle controls.
-pub fn diff_with_plant<A: Allocator + Clone>(
+pub fn diff_with_plant<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     wrt: VarId,
     plant: AlgebraPlant,
 ) -> Result<ExprId, AlgebraError> {
     let n = g.len();
-    if (root.0 as usize) >= n {
+    if u32_to_usize(root.0) >= n {
         return Err(AlgebraError::InvalidExpr { expr: root, node_count: n });
     }
     let mut cache: OwnVec<Option<ExprId>, A> = OwnVec::with_capacity_in(n, g.alloc());
     for _ in 0..n {
         cache.push(None);
     }
-    diff_memo(g, root, wrt, plant, &mut cache)
-}
-
-fn diff_memo<A: Allocator + Clone>(
-    g: &mut ExprGraph<A>,
-    id: ExprId,
-    wrt: VarId,
-    plant: AlgebraPlant,
-    cache: &mut OwnVec<Option<ExprId>, A>,
-) -> Result<ExprId, AlgebraError> {
-    let idx = id.0 as usize;
-    if let Some(hit) = cache.get(idx).copied().flatten() {
-        return Ok(hit);
-    }
-    let op = g.node(id)?;
-    let out = match op {
-        Op::Const(_) => g.lit(0.0),
-        Op::Var(v) => g.lit(if v == wrt { 1.0 } else { 0.0 }),
-        Op::Neg(u) => {
-            let du = diff_memo(g, u, wrt, plant, cache)?;
-            g.neg(du)
-        }
-        Op::Add(u, v) => {
-            let du = diff_memo(g, u, wrt, plant, cache)?;
-            let dv = diff_memo(g, v, wrt, plant, cache)?;
-            g.add(du, dv)
-        }
-        Op::Sub(u, v) => {
-            let du = diff_memo(g, u, wrt, plant, cache)?;
-            let dv = diff_memo(g, v, wrt, plant, cache)?;
-            g.sub(du, dv)
-        }
-        Op::Mul(u, v) => {
-            let du = diff_memo(g, u, wrt, plant, cache)?;
-            let dv = diff_memo(g, v, wrt, plant, cache)?;
-            let t1 = g.mul(du, v);
-            let t2 = g.mul(u, dv);
-            g.add(t1, t2)
-        }
-        Op::Div(u, v) => {
-            let du = diff_memo(g, u, wrt, plant, cache)?;
-            let dv = diff_memo(g, v, wrt, plant, cache)?;
-            let t1 = g.mul(du, v);
-            let t2 = g.mul(u, dv);
-            let num = if plant == AlgebraPlant::WrongQuotientSign {
-                g.add(t1, t2)
-            } else {
-                g.sub(t1, t2)
-            };
-            let two = g.lit(2.0);
-            let den = g.pow(v, two);
-            g.div(num, den)
-        }
-        Op::Pow(u, v) => {
-            let du = diff_memo(g, u, wrt, plant, cache)?;
-            let dv = diff_memo(g, v, wrt, plant, cache)?;
-            // Constant exponent fast-path: d/dx (u^c) = c * u^(c - 1) * du
-            if g.node(dv)?.as_const() == Some(0.0) {
-                let one = g.lit(1.0);
-                let vm1 = g.sub(v, one);
-                let up = g.pow(u, vm1);
-                let c_up = g.mul(v, up);
-                g.mul(c_up, du)
-            } else {
-                // General rule: d/dx (u^v) = u^v * (dv * ln(u) + v * du / u)
-                let ln_u = g.ln(u);
-                let t1 = g.mul(dv, ln_u);
-                let v_du = g.mul(v, du);
-                let t2 = g.div(v_du, u);
-                let sum = g.add(t1, t2);
-                g.mul(id, sum)
-            }
-        }
-        Op::Sin(u) => {
-            let du = diff_memo(g, u, wrt, plant, cache)?;
-            let cu = g.cos(u);
-            let res = g.mul(cu, du);
-            if plant == AlgebraPlant::WrongSinDeriv { g.neg(res) } else { res }
-        }
-        Op::Cos(u) => {
-            let du = diff_memo(g, u, wrt, plant, cache)?;
-            let su = g.sin(u);
-            let nsu = g.neg(su);
-            g.mul(nsu, du)
-        }
-        Op::Tan(u) => {
-            let du = diff_memo(g, u, wrt, plant, cache)?;
-            let cu = g.cos(u);
-            let two = g.lit(2.0);
-            let cu2 = g.pow(cu, two);
-            g.div(du, cu2)
-        }
-        Op::Exp(u) => {
-            let du = diff_memo(g, u, wrt, plant, cache)?;
-            g.mul(id, du)
-        }
-        Op::Ln(u) => {
-            let du = diff_memo(g, u, wrt, plant, cache)?;
-            g.div(du, u)
-        }
-        Op::Sqrt(u) => {
-            let du = diff_memo(g, u, wrt, plant, cache)?;
-            let two = g.lit(2.0);
-            let den = g.mul(two, id);
-            g.div(du, den)
-        }
-        Op::Tanh(u) => {
-            let du = diff_memo(g, u, wrt, plant, cache)?;
-            let one = g.lit(1.0);
-            let two = g.lit(2.0);
-            let t2 = g.pow(id, two);
-            let sech2 = g.sub(one, t2);
-            g.mul(sech2, du)
-        }
-        Op::Abs(u) => {
-            let du = diff_memo(g, u, wrt, plant, cache)?;
-            let sign = g.div(u, id);
-            g.mul(sign, du)
-        }
+    let zero = g.lit(0.0);
+    let get_d = |cache: &[Option<ExprId>], e: ExprId| -> ExprId {
+        cache.get(u32_to_usize(e.0)).copied().flatten().unwrap_or(zero)
     };
-    if let Some(slot) = cache.get_mut(idx) {
-        *slot = Some(out);
+    let mut stack: OwnVec<(ExprId, bool), A> = OwnVec::new_in(g.alloc());
+    stack.push((root, false));
+    while let Some((id, ready)) = stack.pop() {
+        let idx = u32_to_usize(id.0);
+        if cache.get(idx).copied().flatten().is_some() {
+            continue;
+        }
+        let op = g.node(id)?;
+        if !ready {
+            match op {
+                Op::Const(_) => {
+                    if let Some(slot) = cache.get_mut(idx) {
+                        *slot = Some(zero);
+                    }
+                }
+                Op::Var(v) => {
+                    let val = g.lit(if v == wrt { 1.0 } else { 0.0 });
+                    if let Some(slot) = cache.get_mut(idx) {
+                        *slot = Some(val);
+                    }
+                }
+                Op::Neg(u)
+                | Op::Sin(u)
+                | Op::Cos(u)
+                | Op::Tan(u)
+                | Op::Exp(u)
+                | Op::Ln(u)
+                | Op::Sqrt(u)
+                | Op::Tanh(u)
+                | Op::Abs(u) => {
+                    stack.push((id, true));
+                    stack.push((u, false));
+                }
+                Op::Add(u, v)
+                | Op::Sub(u, v)
+                | Op::Mul(u, v)
+                | Op::Div(u, v)
+                | Op::Pow(u, v) => {
+                    stack.push((id, true));
+                    stack.push((v, false));
+                    stack.push((u, false));
+                }
+                Op::Select(_, t, e) => {
+                    stack.push((id, true));
+                    stack.push((e, false));
+                    stack.push((t, false));
+                }
+                Op::Fma(a, b, c) => {
+                    stack.push((id, true));
+                    stack.push((c, false));
+                    stack.push((b, false));
+                    stack.push((a, false));
+                }
+            }
+            continue;
+        }
+        let out = match op {
+            Op::Const(_) => zero,
+            Op::Var(v) => g.lit(if v == wrt { 1.0 } else { 0.0 }),
+            Op::Neg(u) => {
+                let du = get_d(cache.as_slice(), u);
+                g.neg(du)
+            }
+            Op::Add(u, v) => {
+                let du = get_d(cache.as_slice(), u);
+                let dv = get_d(cache.as_slice(), v);
+                g.add(du, dv)
+            }
+            Op::Sub(u, v) => {
+                let du = get_d(cache.as_slice(), u);
+                let dv = get_d(cache.as_slice(), v);
+                g.sub(du, dv)
+            }
+            Op::Mul(u, v) => {
+                let du = get_d(cache.as_slice(), u);
+                let dv = get_d(cache.as_slice(), v);
+                let t1 = g.mul(du, v);
+                let t2 = g.mul(u, dv);
+                g.add(t1, t2)
+            }
+            Op::Div(u, v) => {
+                let du = get_d(cache.as_slice(), u);
+                let dv = get_d(cache.as_slice(), v);
+                let t1 = g.mul(du, v);
+                let t2 = g.mul(u, dv);
+                let num = if plant == AlgebraPlant::WrongQuotientSign {
+                    g.add(t1, t2)
+                } else {
+                    g.sub(t1, t2)
+                };
+                let two = g.lit(2.0);
+                let den = g.pow(v, two);
+                g.div(num, den)
+            }
+            Op::Pow(u, v) => {
+                let du = get_d(cache.as_slice(), u);
+                let dv = get_d(cache.as_slice(), v);
+                // Constant exponent fast-path: d/dx (u^c) = c * u^(c - 1) * du
+                if g.node(dv)?.as_const() == Some(0.0) {
+                    let one = g.lit(1.0);
+                    let vm1 = g.sub(v, one);
+                    let up = g.pow(u, vm1);
+                    let c_up = g.mul(v, up);
+                    g.mul(c_up, du)
+                } else {
+                    // General rule: d/dx (u^v) = u^v * (dv * ln(u) + v * du / u)
+                    let ln_u = g.ln(u);
+                    let t1 = g.mul(dv, ln_u);
+                    let v_du = g.mul(v, du);
+                    let t2 = g.div(v_du, u);
+                    let sum = g.add(t1, t2);
+                    g.mul(id, sum)
+                }
+            }
+            Op::Sin(u) => {
+                let du = get_d(cache.as_slice(), u);
+                let cu = g.cos(u);
+                let res = g.mul(cu, du);
+                if plant == AlgebraPlant::WrongSinDeriv { g.neg(res) } else { res }
+            }
+            Op::Cos(u) => {
+                let du = get_d(cache.as_slice(), u);
+                let su = g.sin(u);
+                let nsu = g.neg(su);
+                g.mul(nsu, du)
+            }
+            Op::Tan(u) => {
+                let du = get_d(cache.as_slice(), u);
+                let cu = g.cos(u);
+                let two = g.lit(2.0);
+                let cu2 = g.pow(cu, two);
+                g.div(du, cu2)
+            }
+            Op::Exp(u) => {
+                let du = get_d(cache.as_slice(), u);
+                g.mul(id, du)
+            }
+            Op::Ln(u) => {
+                let du = get_d(cache.as_slice(), u);
+                g.div(du, u)
+            }
+            Op::Sqrt(u) => {
+                let du = get_d(cache.as_slice(), u);
+                let two = g.lit(2.0);
+                let den = g.mul(two, id);
+                g.div(du, den)
+            }
+            Op::Tanh(u) => {
+                let du = get_d(cache.as_slice(), u);
+                let one = g.lit(1.0);
+                let two = g.lit(2.0);
+                let t2 = g.pow(id, two);
+                let sech2 = g.sub(one, t2);
+                g.mul(sech2, du)
+            }
+            Op::Abs(u) => {
+                let du = get_d(cache.as_slice(), u);
+                let sign = g.div(u, id);
+                g.mul(sign, du)
+            }
+            Op::Select(c, t, e) => {
+                let dt = get_d(cache.as_slice(), t);
+                let de = get_d(cache.as_slice(), e);
+                g.select(c, dt, de)
+            }
+            Op::Fma(a, b, c) => {
+                let da = get_d(cache.as_slice(), a);
+                let db = get_d(cache.as_slice(), b);
+                let dc = get_d(cache.as_slice(), c);
+                let t1 = g.mul(da, b);
+                let t2 = g.mul(a, db);
+                let sum = g.add(t1, t2);
+                g.add(sum, dc)
+            }
+        };
+        if let Some(slot) = cache.get_mut(idx) {
+            *slot = Some(out);
+        }
     }
-    Ok(out)
+    Ok(get_d(cache.as_slice(), root))
 }
 
 /// Compute the `order`-th symbolic derivative `∂^n(root) / ∂(wrt)^n`.
-pub fn nth_diff<A: Allocator + Clone>(
+pub fn nth_diff<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     wrt: VarId,
@@ -394,7 +471,7 @@ pub fn nth_diff<A: Allocator + Clone>(
 
 /// Compute the symbolic gradient `[∂f/∂v0, ∂f/∂v1, ...]` with respect to `vars` via forward
 /// memoized DAG differentiation (O(N · |V|)). For many inputs, prefer [`grad_reverse`].
-pub fn grad<A: Allocator + Clone>(
+pub fn grad<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     vars: &[VarId],
@@ -409,7 +486,7 @@ pub fn grad<A: Allocator + Clone>(
 /// Compute the full symbolic gradient `[∂f/∂v0, ∂f/∂v1, ...]` in a SINGLE reverse-mode
 /// symbolic adjoint sweep over the DAG — **O(|V|) total time & graph growth independent of
 /// `vars.len()`**! All partial derivatives share intermediate nodes inside `g`.
-pub fn grad_reverse<A: Allocator + Clone>(
+pub fn grad_reverse<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     vars: &[VarId],
@@ -418,14 +495,14 @@ pub fn grad_reverse<A: Allocator + Clone>(
 }
 
 /// Reverse-mode symbolic gradient with explicit [`AlgebraPlant`] for oracle controls.
-pub fn grad_reverse_with_plant<A: Allocator + Clone>(
+pub fn grad_reverse_with_plant<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     vars: &[VarId],
     plant: AlgebraPlant,
 ) -> Result<OwnVec<ExprId, A>, AlgebraError> {
     let n = g.len();
-    if (root.0 as usize) >= n {
+    if u32_to_usize(root.0) >= n {
         return Err(AlgebraError::InvalidExpr { expr: root, node_count: n });
     }
     // 1. Collect reachable nodes in post-order (children always precede parents).
@@ -441,25 +518,28 @@ pub fn grad_reverse_with_plant<A: Allocator + Clone>(
     for _ in 0..n {
         adj.push(None);
     }
-    adj[root.0 as usize] = Some(g.lit(1.0));
+    if let Some(slot) = adj.get_mut(u32_to_usize(root.0)) {
+        *slot = Some(g.lit(1.0));
+    }
 
     // Helper: accumulate `adj[child] += contrib` (or overwrite under `WrongReverseAdjointAccum`).
     let accum = |g: &mut ExprGraph<A>, adj: &mut [Option<ExprId>], child: ExprId, contrib: ExprId| {
-        let idx = child.0 as usize;
+        let Some(slot) = adj.get_mut(u32_to_usize(child.0)) else {
+            return;
+        };
         if plant == AlgebraPlant::WrongReverseAdjointAccum {
-            adj[idx] = Some(contrib);
+            *slot = Some(contrib);
             return;
         }
-        adj[idx] = match adj[idx] {
+        *slot = match *slot {
             None => Some(contrib),
             Some(prev) => Some(g.add(prev, contrib)),
         };
     };
 
     // 3. Single reverse sweep: parents precede children in `order.iter().rev()`.
-    for i in (0..order.len()).rev() {
-        let id = order[i];
-        let Some(bar) = adj[id.0 as usize] else {
+    for &id in order.iter().rev() {
+        let Some(bar) = adj.get(u32_to_usize(id.0)).copied().flatten() else {
             continue;
         };
         let op = g.node(id)?;
@@ -556,6 +636,20 @@ pub fn grad_reverse_with_plant<A: Allocator + Clone>(
                 let c = g.mul(bar, sign);
                 accum(g, &mut adj, u, c);
             }
+            Op::Select(cond, t, e) => {
+                let z = g.lit(0.0);
+                let ct = g.select(cond, bar, z);
+                let ce = g.select(cond, z, bar);
+                accum(g, &mut adj, t, ct);
+                accum(g, &mut adj, e, ce);
+            }
+            Op::Fma(a, b, c) => {
+                let ca = g.mul(bar, b);
+                let cb = g.mul(bar, a);
+                accum(g, &mut adj, a, ca);
+                accum(g, &mut adj, b, cb);
+                accum(g, &mut adj, c, bar);
+            }
         }
     }
 
@@ -564,50 +658,61 @@ pub fn grad_reverse_with_plant<A: Allocator + Clone>(
     let mut out = OwnVec::with_capacity_in(vars.len(), g.alloc());
     for &v in vars {
         let var_node = g.intern(Op::Var(v));
-        let deriv = if (var_node.0 as usize) < n {
-            adj[var_node.0 as usize].unwrap_or(zero)
-        } else {
-            zero
-        };
+        let deriv = adj.get(u32_to_usize(var_node.0)).copied().flatten().unwrap_or(zero);
         out.push(deriv);
     }
     Ok(out)
 }
 
-fn collect_reachable_postorder<A: Allocator + Clone>(
+fn collect_reachable_postorder<A: Allocator + Copy>(
     g: &ExprGraph<A>,
-    id: ExprId,
+    root: ExprId,
     visited: &mut OwnVec<bool, A>,
     order: &mut OwnVec<ExprId, A>,
 ) -> Result<(), AlgebraError> {
-    let idx = id.0 as usize;
-    if visited[idx] {
-        return Ok(());
-    }
-    visited[idx] = true;
-    match g.node(id)? {
-        Op::Const(_) | Op::Var(_) => {}
-        Op::Neg(a)
-        | Op::Sin(a)
-        | Op::Cos(a)
-        | Op::Tan(a)
-        | Op::Exp(a)
-        | Op::Ln(a)
-        | Op::Sqrt(a)
-        | Op::Tanh(a)
-        | Op::Abs(a) => collect_reachable_postorder(g, a, visited, order)?,
-        Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) | Op::Pow(a, b) => {
-            collect_reachable_postorder(g, a, visited, order)?;
-            collect_reachable_postorder(g, b, visited, order)?;
+    let mut stack: OwnVec<(ExprId, bool), A> = OwnVec::new_in(g.alloc());
+    stack.push((root, false));
+    while let Some((id, expanded)) = stack.pop() {
+        let idx = u32_to_usize(id.0);
+        if expanded {
+            order.push(id);
+            continue;
+        }
+        if visited.get(idx).copied().unwrap_or(true) {
+            continue;
+        }
+        if let Some(slot) = visited.get_mut(idx) {
+            *slot = true;
+        }
+        stack.push((id, true));
+        match g.node(id)? {
+            Op::Const(_) | Op::Var(_) => {}
+            Op::Neg(a)
+            | Op::Sin(a)
+            | Op::Cos(a)
+            | Op::Tan(a)
+            | Op::Exp(a)
+            | Op::Ln(a)
+            | Op::Sqrt(a)
+            | Op::Tanh(a)
+            | Op::Abs(a) => stack.push((a, false)),
+            Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) | Op::Pow(a, b) => {
+                stack.push((b, false));
+                stack.push((a, false));
+            }
+            Op::Select(c, t, e) | Op::Fma(c, t, e) => {
+                stack.push((e, false));
+                stack.push((t, false));
+                stack.push((c, false));
+            }
         }
     }
-    order.push(id);
     Ok(())
 }
 
 /// Compute the symbolic Jacobian matrix `J[r * vars.len() + c] = ∂(outputs[r]) / ∂(vars[c])`
 /// in row-major order, automatically selecting reverse-mode per output row when `vars.len() > 1`.
-pub fn jacobian<A: Allocator + Clone>(
+pub fn jacobian<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     outputs: &[ExprId],
     vars: &[VarId],
@@ -624,7 +729,7 @@ pub fn jacobian<A: Allocator + Clone>(
 
 /// Compute the symbolic Hessian matrix `H[i * n + j] = ∂²f / (∂v_i ∂v_j)` in row-major order,
 /// using reverse-mode symbolic adjoints for both the first and second passes.
-pub fn hessian<A: Allocator + Clone>(
+pub fn hessian<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     vars: &[VarId],
@@ -633,8 +738,212 @@ pub fn hessian<A: Allocator + Clone>(
     jacobian(g, &first, vars)
 }
 
+/// Single-sweep O(|V|) forward-mode directional derivative (Jacobian-Vector Product)
+/// `Df(x)[v] = Σ_i (∂f / ∂vars[i]) * dir[i]` over the shared DAG.
+pub fn jvp<A: Allocator + Copy>(
+    g: &mut ExprGraph<A>,
+    root: ExprId,
+    vars: &[VarId],
+    dir: &[ExprId],
+) -> Result<ExprId, AlgebraError> {
+    let n = g.len();
+    if u32_to_usize(root.0) >= n {
+        return Err(AlgebraError::InvalidExpr { expr: root, node_count: n });
+    }
+    let mut visited: OwnVec<bool, A> = OwnVec::with_capacity_in(n, g.alloc());
+    for _ in 0..n {
+        visited.push(false);
+    }
+    let mut order: OwnVec<ExprId, A> = OwnVec::new_in(g.alloc());
+    collect_reachable_postorder(g, root, &mut visited, &mut order)?;
+
+    let mut tang: OwnVec<Option<ExprId>, A> = OwnVec::with_capacity_in(n, g.alloc());
+    for _ in 0..n {
+        tang.push(None);
+    }
+    let zero = g.lit(0.0);
+    let get_t = |tang: &[Option<ExprId>], e: ExprId| -> ExprId {
+        tang.get(u32_to_usize(e.0)).copied().flatten().unwrap_or(zero)
+    };
+
+    for &id in order.iter() {
+        let dt = match g.node(id)? {
+            Op::Const(_) => zero,
+            Op::Var(v) => {
+                let mut found = zero;
+                for (k, &vr) in vars.iter().enumerate() {
+                    if vr == v {
+                        if let Some(&dv) = dir.get(k) {
+                            found = dv;
+                        }
+                        break;
+                    }
+                }
+                found
+            }
+            Op::Neg(u) => {
+                let du = get_t(tang.as_slice(), u);
+                g.neg(du)
+            }
+            Op::Add(u, v) => {
+                let du = get_t(tang.as_slice(), u);
+                let dv = get_t(tang.as_slice(), v);
+                g.add(du, dv)
+            }
+            Op::Sub(u, v) => {
+                let du = get_t(tang.as_slice(), u);
+                let dv = get_t(tang.as_slice(), v);
+                g.sub(du, dv)
+            }
+            Op::Mul(u, v) => {
+                let du = get_t(tang.as_slice(), u);
+                let dv = get_t(tang.as_slice(), v);
+                let t1 = g.mul(du, v);
+                let t2 = g.mul(u, dv);
+                g.add(t1, t2)
+            }
+            Op::Div(u, v) => {
+                let du = get_t(tang.as_slice(), u);
+                let dv = get_t(tang.as_slice(), v);
+                let t1 = g.mul(du, v);
+                let t2 = g.mul(u, dv);
+                let num = g.sub(t1, t2);
+                let two = g.lit(2.0);
+                let den = g.pow(v, two);
+                g.div(num, den)
+            }
+            Op::Pow(u, v) => {
+                let du = get_t(tang.as_slice(), u);
+                let dv = get_t(tang.as_slice(), v);
+                if g.node(dv)?.as_const() == Some(0.0) {
+                    let one = g.lit(1.0);
+                    let vm1 = g.sub(v, one);
+                    let up = g.pow(u, vm1);
+                    let c_up = g.mul(v, up);
+                    g.mul(c_up, du)
+                } else {
+                    let ln_u = g.ln(u);
+                    let t1 = g.mul(dv, ln_u);
+                    let v_du = g.mul(v, du);
+                    let t2 = g.div(v_du, u);
+                    let sum = g.add(t1, t2);
+                    g.mul(id, sum)
+                }
+            }
+            Op::Sin(u) => {
+                let du = get_t(tang.as_slice(), u);
+                let cu = g.cos(u);
+                g.mul(cu, du)
+            }
+            Op::Cos(u) => {
+                let du = get_t(tang.as_slice(), u);
+                let su = g.sin(u);
+                let nsu = g.neg(su);
+                g.mul(nsu, du)
+            }
+            Op::Tan(u) => {
+                let du = get_t(tang.as_slice(), u);
+                let cu = g.cos(u);
+                let two = g.lit(2.0);
+                let cu2 = g.pow(cu, two);
+                g.div(du, cu2)
+            }
+            Op::Exp(u) => {
+                let du = get_t(tang.as_slice(), u);
+                g.mul(id, du)
+            }
+            Op::Ln(u) => {
+                let du = get_t(tang.as_slice(), u);
+                g.div(du, u)
+            }
+            Op::Sqrt(u) => {
+                let du = get_t(tang.as_slice(), u);
+                let two = g.lit(2.0);
+                let den = g.mul(two, id);
+                g.div(du, den)
+            }
+            Op::Tanh(u) => {
+                let du = get_t(tang.as_slice(), u);
+                let one = g.lit(1.0);
+                let two = g.lit(2.0);
+                let t2 = g.pow(id, two);
+                let sech2 = g.sub(one, t2);
+                g.mul(sech2, du)
+            }
+            Op::Abs(u) => {
+                let du = get_t(tang.as_slice(), u);
+                let sign = g.div(u, id);
+                g.mul(sign, du)
+            }
+            Op::Select(c, t, e) => {
+                let dt_val = get_t(tang.as_slice(), t);
+                let de_val = get_t(tang.as_slice(), e);
+                g.select(c, dt_val, de_val)
+            }
+            Op::Fma(a, b, c) => {
+                let da = get_t(tang.as_slice(), a);
+                let db = get_t(tang.as_slice(), b);
+                let dc = get_t(tang.as_slice(), c);
+                let t1 = g.mul(da, b);
+                let t2 = g.mul(a, db);
+                let sum = g.add(t1, t2);
+                g.add(sum, dc)
+            }
+        };
+        if let Some(slot) = tang.get_mut(u32_to_usize(id.0)) {
+            *slot = Some(dt);
+        }
+    }
+    Ok(get_t(tang.as_slice(), root))
+}
+
+/// Exact **O(|V|)** Hessian-Vector Product `H(f)(x) · v = ∇_x (Df(x)[v])` computed in two linear
+/// sweeps (forward tangent [`jvp`] followed by reverse-mode [`grad_reverse`]), avoiding the
+/// O(N² |V|) cost of forming the full Hessian matrix.
+pub fn hvp<A: Allocator + Copy>(
+    g: &mut ExprGraph<A>,
+    root: ExprId,
+    vars: &[VarId],
+    dir: &[ExprId],
+) -> Result<OwnVec<ExprId, A>, AlgebraError> {
+    let directional = jvp(g, root, vars, dir)?;
+    grad_reverse(g, directional, vars)
+}
+
+/// O(|V|) DAG sparsity detection: returns a boolean mask of length `nvars` where entry `i` is
+/// `true` iff `VarId(i)` is reachable from `root`.
+pub fn active_vars<A: Allocator + Copy>(
+    g: &ExprGraph<A>,
+    root: ExprId,
+    nvars: usize,
+) -> Result<OwnVec<bool, A>, AlgebraError> {
+    let n = g.len();
+    if u32_to_usize(root.0) >= n {
+        return Err(AlgebraError::InvalidExpr { expr: root, node_count: n });
+    }
+    let mut visited: OwnVec<bool, A> = OwnVec::with_capacity_in(n, g.alloc());
+    for _ in 0..n {
+        visited.push(false);
+    }
+    let mut order: OwnVec<ExprId, A> = OwnVec::new_in(g.alloc());
+    collect_reachable_postorder(g, root, &mut visited, &mut order)?;
+
+    let mut active: OwnVec<bool, A> = OwnVec::with_capacity_in(nvars, g.alloc());
+    for _ in 0..nvars {
+        active.push(false);
+    }
+    for &id in order.iter() {
+        if let Op::Var(v) = g.node(id)?
+            && let Some(slot) = active.get_mut(u32_to_usize(v.0))
+        {
+            *slot = true;
+        }
+    }
+    Ok(active)
+}
+
 /// Compute the symbolic Taylor polynomial of `root` around `wrt = center` up to degree `order`.
-pub fn taylor<A: Allocator + Clone>(
+pub fn taylor<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     wrt: VarId,

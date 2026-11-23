@@ -39,6 +39,7 @@ use std::{
 
 use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_mem::{MemError, Slab, Tag as MemTag};
+use blaze_own::Share;
 use blaze_sys::{
     Errno, Fd,
     posix::{
@@ -891,7 +892,7 @@ impl<S: Split, O: Opening> Kqueue<S, O> {
         if start {
             let n = self.dispatch.started(lane) - 1;
             // clone: one count of each per file thread, at its start.
-            let (root, queue, notify) = (Arc::clone(&self.root), self.queues[lane.index()].clone(), Arc::clone(&self.notify));
+            let (root, queue, notify) = (Arc::clone(&self.root), self.queues[lane.index()].share(), Arc::clone(&self.notify));
             let kept = Arc::clone(&self.descriptors); // clone: as above.
             let count = Arc::clone(&self.opened_by_name); // clone: as above.
             let (clock, class) = (self.clock(), self.class);

@@ -157,12 +157,12 @@ impl Under {
     }
 }
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
+impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
     /// Whether a call's type arguments name anything whose lifetimes the call does not fix: a
     /// type parameter of the caller, a projection, an opaque type, a trait object, a closure
     /// or coroutine (a bounded work list, no recursion).
     pub(crate) fn mentions_unknown(&self, args: &[PTy], e: ExprId) -> Result<bool, Refusal> {
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
         stack.extend_from_slice(args);
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
@@ -188,11 +188,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
     /// projection subtrees in one type, counts that do not add up, a malformed column): the
     /// caller refuses the call by name, never reads one slot as another position's.
     pub(crate) fn lay_sig(&self, life: SigLife<'_>, e: ExprId) -> Result<Result<LaidSig<A>, u32>, Refusal> {
-        let mut laid = LaidSig { at: Vec::new_in(self.alloc.clone()), ends: Vec::new_in(self.alloc.clone()) };
+        let mut laid = LaidSig { at: Vec::new_in(self.alloc), ends: Vec::new_in(self.alloc) };
         if !life.well_formed() {
             return Ok(Err(0));
         }
-        let mut child: Vec<Option<Region>, A> = Vec::new_in(self.alloc.clone());
+        let mut child: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         for k in 0..=life.inputs() {
             let slots = if k < life.inputs() { life.input(k) } else { life.output() };
             let Some(slots) = slots else { return Ok(Err(k)) };
@@ -258,7 +258,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         let known = !generic_origins && !unknown_args;
         // Each input's hidden subtree among its argument's origins; `None`: no origin under a
         // hidden position (or no hidden position).
-        let mut unders: Vec<Option<Under>, A> = Vec::new_in(self.alloc.clone());
+        let mut unders: Vec<Option<Under>, A> = Vec::new_in(self.alloc);
         for (i, v) in vs.iter().enumerate() {
             let input = i as u32;
             let refused = |why| Form::CallHiddenInput { callee: item, input, why };
@@ -371,7 +371,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         let output_empty = d.exact && d.len == 0 && laid.output().iter().all(Option::is_none);
         if out_hidden && !output_empty {
             // Known: each hidden input's origins outlive `'static`; the output stays coarse.
-            let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc.clone());
+            let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc);
             for (i, v) in vs.iter().enumerate() {
                 let (Some(u), At::Place(p)) = (unders[i], v.at) else { continue };
                 let start = self.info(p).start;
@@ -386,8 +386,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         }
         // Known, no hidden output (or one into no position): the whole call by the signature,
         // each hidden input expanded to its argument's `'static` positions.
-        let mut regions: Vec<Region, A> = Vec::new_in(self.alloc.clone());
-        let mut ends: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut regions: Vec<Region, A> = Vec::new_in(self.alloc);
+        let mut ends: Vec<u32, A> = Vec::new_in(self.alloc);
         if !expand(&laid, &unders, output_empty, &mut regions, &mut ends) {
             return self.refuse(Form::CallHiddenInput { callee: item, input: u32::MAX, why: HiddenWhy::Expand }, e);
         }
@@ -440,7 +440,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
 /// position of it laid as none when `output_empty` (its destination holds no position). `false`
 /// when the output holds a hidden position otherwise (the caller has ruled that out: a broken
 /// promise is refused, never laid by a guess) or an input's end is malformed.
-fn expand<A: Allocator + Clone, B: Allocator>(laid: &LaidSig<B>, unders: &[Option<Under>], output_empty: bool, regions: &mut Vec<Region, A>, ends: &mut Vec<u32, A>) -> bool {
+fn expand<A: Allocator + Copy, B: Allocator>(laid: &LaidSig<B>, unders: &[Option<Under>], output_empty: bool, regions: &mut Vec<Region, A>, ends: &mut Vec<u32, A>) -> bool {
     for i in 0..laid.ends.len() {
         let Some(part) = laid.input(i) else { return false };
         for &r in part {

@@ -216,7 +216,7 @@ fn macho<A: Allocator>(bytes: &[u8], funcs: &mut Vec<Func, A>) -> Result<(), Sym
                 let header = at + 72 + s * 80;
                 let sect = get::<16>(bytes, header, "section name")?;
                 let seg = get::<16>(bytes, header + 16, "section's segment name")?;
-                if &sect[..7] == b"__text\0" && &seg[..7] == b"__TEXT\0" {
+                if sect.starts_with(b"__text\0") && seg.starts_with(b"__TEXT\0") {
                     let addr = u64_at(bytes, header + 32, "section address")?;
                     let len = u64_at(bytes, header + 40, "section size")?;
                     text = Some((ordinal, addr, addr.saturating_add(len)));

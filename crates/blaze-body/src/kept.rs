@@ -204,10 +204,7 @@ impl<'b, A: Allocator> Kept<'b, A> {
 /// Opens a kept record: its layout checked once (blaze-format), the versions, the table decoded
 /// into `alloc` and checked to be the one the record names, the body's bases checked against
 /// the table's counts, and the body verified. Every refusal says which check refused.
-pub fn open<'b, A: Allocator>(bytes: &'b [u8], alloc: A) -> Result<Kept<'b, A>, KeptError>
-where
-    A: Clone,
-{
+pub fn open<'b, A: Allocator + Copy>(bytes: &'b [u8], alloc: A) -> Result<Kept<'b, A>, KeptError> {
     let root = open_as::<KeptRoot>(bytes, <KeptRoot as Record>::SCHEMA)?;
     if root.version != KEPT_VERSION {
         return Err(KeptError::Version { found: root.version, want: KEPT_VERSION });
@@ -219,7 +216,7 @@ where
     let body = body_of(body_root, bytes).map_err(KeptError::Open)?;
     let words: &'b [TyWords] = root.nodes.follow(bytes)?;
     let entries: &'b [u32] = root.lists.follow(bytes)?;
-    let mut nodes = Vec::with_capacity_in(words.len(), alloc.clone());
+    let mut nodes = Vec::with_capacity_in(words.len(), alloc);
     for (row, w) in words.iter().enumerate() {
         match decode_ty(*w) {
             Some(n) => nodes.push(n),

@@ -101,6 +101,61 @@ impl<T, Tags: UniqueSet> Tagged<T, Tags> {
     }
 }
 
+impl<Tags: UniqueSet> Tagged<f64, Tags> {
+    /// Add two dimensionally-compatible quantities (same `Tags` in any order via `Subset`).
+    #[inline(always)]
+    pub fn add_dim<OtherTags: UniqueSet, Indices>(self, rhs: Tagged<f64, OtherTags>) -> Self
+    where
+        OtherTags: Subset<Tags, Indices>,
+    {
+        let rhs_aligned: Self = rhs.narrow();
+        Tagged::new(self.value + rhs_aligned.value)
+    }
+
+    /// Subtract two dimensionally-compatible quantities (same `Tags` in any order).
+    #[inline(always)]
+    pub fn sub_dim<OtherTags: UniqueSet, Indices>(self, rhs: Tagged<f64, OtherTags>) -> Self
+    where
+        OtherTags: Subset<Tags, Indices>,
+    {
+        let rhs_aligned: Self = rhs.narrow();
+        Tagged::new(self.value - rhs_aligned.value)
+    }
+
+    /// Scale a dimensionally-tagged quantity by a dimensionless scalar.
+    #[inline(always)]
+    pub const fn scale(self, factor: f64) -> Self {
+        Tagged { value: self.value * factor, _tags: PhantomData }
+    }
+
+    /// Multiply by an orthogonal unit `Dim<U, E>` (compile-time checked disjoint via `UniqueSet`).
+    #[inline(always)]
+    pub fn mul_unit<U, const E: i8>(
+        self,
+        rhs: Tagged<f64, Cons<Dim<U, E>, crate::type_set::Nil>>,
+    ) -> Tagged<f64, Cons<Dim<U, E>, Tags>>
+    where
+        Cons<Dim<U, E>, crate::type_set::Nil>: UniqueSet,
+        Cons<Dim<U, E>, Tags>: UniqueSet,
+    {
+        Tagged::new(self.value * rhs.value)
+    }
+
+    /// Divide by an orthogonal unit `Dim<U, 1>`, producing `Dim<U, -1>` in the result `TypeSet!`
+    /// (e.g. `Distance / Time -> Velocity`).
+    #[inline(always)]
+    pub fn div_unit<U>(
+        self,
+        rhs: Tagged<f64, Cons<Dim<U, 1>, crate::type_set::Nil>>,
+    ) -> Tagged<f64, Cons<Dim<U, -1>, Tags>>
+    where
+        Cons<Dim<U, 1>, crate::type_set::Nil>: UniqueSet,
+        Cons<Dim<U, -1>, Tags>: UniqueSet,
+    {
+        Tagged::new(self.value / rhs.value)
+    }
+}
+
 impl<T: core::fmt::Debug, Tags: UniqueSet> core::fmt::Debug for Tagged<T, Tags> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         core::fmt::Debug::fmt(&self.value, f)
@@ -178,6 +233,15 @@ mod tests {
         let swapped: Tagged<f64, VelocitySwapped> = speed.narrow();
         assert_eq!(*swapped.require::<Dim<Metre, 1>, _>(), 9.81);
         assert_eq!(*swapped.require::<Dim<Second, -1>, _>(), 9.81);
+
+        // Dimensional arithmetic: Distance / Time -> Velocity (order-independent `add_dim`).
+        type Distance = TypeSet![Dim<Metre, 1>];
+        type Time = TypeSet![Dim<Second, 1>];
+        let d: Tagged<f64, Distance> = Tagged::new(100.0);
+        let t: Tagged<f64, Time> = Tagged::new(10.0);
+        let v: Tagged<f64, Velocity> = d.div_unit(t).narrow();
+        let total_v: Tagged<f64, Velocity> = v.add_dim(swapped).scale(2.0);
+        assert!((*total_v.require::<Dim<Metre, 1>, _>() - 39.62).abs() < 1e-12);
     }
 
     #[test]

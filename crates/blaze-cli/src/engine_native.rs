@@ -880,7 +880,10 @@ mod tests {
             words: Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("the words' frame"),
             scratch: Frame::with_reserve(256 << 20, bstd::mem::Tag::Other).expect("the image's frame"),
             producer: Producers::for_tests(producer).get::<Whole>(),
-            platform: native_image::platform().expect("this host's target has an image form (arm64 macOS or Linux)"),
+            // The fixture constructs a simulated Apple SDK at `/sdk` (`SDK_STUBS`) and exercises
+            // Mach-O image writing purely over simulated IO, so pin the target platform rather than
+            // reading the host OS (otherwise Linux CI fails with `Write(NotMac)`).
+            platform: Platform::MacosArm64,
             sdk: sdk_at("/sdk", r#"{"Version":"27.2"}"#, BUILD_26B118),
         }
     }

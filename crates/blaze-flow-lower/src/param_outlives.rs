@@ -49,7 +49,7 @@ pub struct ParamOrigin {
     pub certain: bool,
 }
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
+impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
     /// The body's type parameters `t` holds (pushed to `params`; unsorted, may repeat), and
     /// whether it holds another type whose lifetimes the lowering does not count as positions:
     /// an alias, an opaque type, a closure, a coroutine, a trait object, an inference variable,
@@ -62,7 +62,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
     /// A projection of that same value can depend on other types (e.g. its output).
     /// Only open the captures for the former, and only with an exact capture witness.
     pub(crate) fn outlives_components(&self, t: PTy, e: ExprId, params: &mut Vec<u32, A>, captures: bool) -> Result<bool, Refusal> {
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
         stack.push(t);
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
@@ -135,7 +135,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
     pub(crate) fn sig_param_bounds(&mut self, t: TyD, start: u32, e: ExprId) -> Result<(), Refusal> {
         // (type, its first position, the position of the nearest enclosing reference or
         // `u32::MAX`, under an ADT with lifetimes)
-        let mut stack: Vec<(PTy, u32, u32, bool), A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<(PTy, u32, u32, bool), A> = Vec::new_in(self.alloc);
         if t.wrap.is_some() {
             stack.push((t.ty, 1, 0, false));
         } else {
@@ -238,7 +238,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
                 return Ok(Some(subject.param()));
             }
         }
-        let mut params: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut params: Vec<u32, A> = Vec::new_in(self.alloc);
         for (i, &t) in args.iter().enumerate() {
             let i = i as u32;
             let bound = i < bounds.unread_below || bounds.outlives.iter().any(|&(s, _)| s == OutlivesType::Param(i));

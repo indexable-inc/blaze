@@ -62,12 +62,12 @@ pub(crate) struct Log<A: Allocator> {
 }
 
 /// [`FlowBuilder`] with its subsets recorded when asked.
-pub(crate) struct Builder<A: Allocator + Clone> {
+pub(crate) struct Builder<A: Allocator + Copy> {
     inner: FlowBuilder<A>,
     log: Option<Log<A>>,
 }
 
-impl<A: Allocator + Clone> Builder<A> {
+impl<A: Allocator + Copy> Builder<A> {
     pub(crate) fn new(inner: FlowBuilder<A>) -> Builder<A> {
         Builder { inner, log: None }
     }
@@ -133,7 +133,7 @@ impl<A: Allocator + Clone> Builder<A> {
 /// a method call on the plain field `self.b` is a two-phase borrow, so `self.b.stmt(k,
 /// self.span(e))` reads `self` in its arguments as it did when the field was the flow builder;
 /// an overloaded `deref_mut` takes `&mut self.b` before the arguments run and refuses it (E0502).
-impl<A: Allocator + Clone> Builder<A> {
+impl<A: Allocator + Copy> Builder<A> {
     pub(crate) fn add_local(&mut self) -> Local {
         self.inner.add_local()
     }

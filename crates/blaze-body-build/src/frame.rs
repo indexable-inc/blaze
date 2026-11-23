@@ -1,7 +1,7 @@
 //! The frame: which locals are values and which are memory, the function's signature, its entry
 //! block and the parameters of every body block (lib.rs, "The frame" and "Block parameters").
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 use core::alloc::Allocator;
 
 use blaze_body::{Block as BodyBlock, BlockKind as BodyKind, Local, LocalKind, Place, Proj, StmtKind, Value as BodyValue};
@@ -15,7 +15,7 @@ use blaze_typeck::{LangItem, PTy};
 
 use crate::{BuildError, Cx, Held, Pass, V};
 
-impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// Whether the projection nearest local of place `p` is a dereference: then a use of `p` is
     /// a use of memory the local points to, not of the local's own. `None` for the local itself.
     fn first_proj(&self, p: Place) -> Result<Option<Proj>, BuildError> {
@@ -48,7 +48,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
     /// The address-taken locals, by one pass over the rows: a borrow or raw borrow of a place
     /// of the local's own bytes, a projection written through, a drop.
     fn address_taken(&self) -> Result<Vec<bool, A>, BuildError> {
-        let mut taken = Vec::new_in(self.alloc.clone());
+        let mut taken = Vec::new_in(self.alloc);
         taken.resize(self.v.locals() as usize, false);
         for s in 0..self.v.stmts() {
             match self.v.stmt(blaze_body::Stmt(s)).kind {
@@ -129,7 +129,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
     pub(crate) fn frame(&mut self) -> Result<(), BuildError> {
         let taken = self.address_taken()?;
         let locals = self.v.locals() as usize;
-        let mut args: Vec<Option<Local>, A> = Vec::new_in(self.alloc.clone());
+        let mut args: Vec<Option<Local>, A> = Vec::new_in(self.alloc);
         args.resize(self.v.args() as usize, None);
         let mut ret_local = None;
         for i in 0..locals {
@@ -150,25 +150,25 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
         let ret_local = ret_local.ok_or(self.malformed("a body without its return place"))?;
         // The signature: a result pointer first when the result is passed by reference.
         self.ret = self.pass_of(self.tys[ret_local.index()])?;
-        let mut passes: Vec<Pass, A> = Vec::with_capacity_in(args.len(), self.alloc.clone());
+        let mut passes: Vec<Pass, A> = Vec::with_capacity_in(args.len(), self.alloc);
         for a in args.iter() {
             let a = a.ok_or(self.malformed("an argument without its local"))?;
             passes.push(self.pass_of(self.tys[a.index()])?);
         }
-        let (params, rets) = abi::sig_of_in(&passes, self.ret, self.alloc.clone());
+        let (params, rets) = abi::sig_of_in(&passes, self.ret, self.alloc);
         let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
         self.b.set_signature(sig);
         let entry = self.b.create_block(BlockKind::Normal);
         self.b.begin(entry);
-        let mut values: Vec<Value, A> = Vec::with_capacity_in(params.len(), self.alloc.clone());
+        let mut values: Vec<Value, A> = Vec::with_capacity_in(params.len(), self.alloc);
         for p in params.iter() {
             values.push(self.b.param(p.ty));
         }
         // How each local is held: memory when its address is taken or its layout is not one or
         // two scalars; a parameter in memory at its caller's copy, the result at its pointer.
-        let mut decided: Vec<Option<Held>, A> = Vec::new_in(self.alloc.clone());
+        let mut decided: Vec<Option<Held>, A> = Vec::new_in(self.alloc);
         decided.resize(locals, None);
-        let mut memory: Vec<bool, A> = Vec::with_capacity_in(locals, self.alloc.clone());
+        let mut memory: Vec<bool, A> = Vec::with_capacity_in(locals, self.alloc);
         for i in 0..locals {
             memory.push(taken[i] || self.value_held(self.lays[i])?.is_none());
         }
@@ -177,7 +177,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
             let hidden = next.next().ok_or(self.malformed("a signature without its result pointer"))?;
             decided[ret_local.index()] = Some(Held::At(hidden));
         }
-        let mut given = Vec::with_capacity_in(args.len(), self.alloc.clone());
+        let mut given = Vec::with_capacity_in(args.len(), self.alloc);
         for (n, a) in args.iter().enumerate() {
             let a = a.ok_or(self.malformed("an argument without its local"))?;
             match passes[n] {
@@ -288,7 +288,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
     /// The values every value local holds now, in local order: what an edge passes. One not
     /// written yet passes `uninit`.
     pub(crate) fn local_args(&mut self) -> Result<Vec<Value, A>, BuildError> {
-        let mut out = Vec::with_capacity_in(self.held.len(), self.alloc.clone());
+        let mut out = Vec::with_capacity_in(self.held.len(), self.alloc);
         for i in 0..self.held.len() {
             match self.held[i] {
                 Held::One(t) => {
@@ -317,7 +317,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
     /// then [`Cx::local_args`].
     pub(crate) fn args_for(&mut self, to: BodyBlock) -> Result<Vec<Value, A>, BuildError> {
         let cleanup = self.v.block(to).kind == BodyKind::Cleanup;
-        let mut out = Vec::with_capacity_in(self.held.len() + 1, self.alloc.clone());
+        let mut out = Vec::with_capacity_in(self.held.len() + 1, self.alloc);
         if cleanup {
             out.push(self.exn.ok_or(self.malformed("an edge to a cleanup block from outside unwinding"))?);
         }

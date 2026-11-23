@@ -16,16 +16,16 @@ use crate::{
 /// The body `view` (whose identity is `root`; its callees from `bodies`) through the whole
 /// stage, in `alloc`, verified; with the bodies the inliner spliced into it, sorted, unique:
 /// exactly what the fast record's read list gains.
-pub fn simplify<A: Allocator + Clone>(
+pub fn simplify<A: Allocator + Copy>(
     view: View<'_>,
     root: BodyId,
     bodies: &dyn Bodies,
     bound: Bound,
     alloc: A,
 ) -> Result<(Func<A>, Vec<BodyId, A>), SimplifyError> {
-    let inlined = inline_trivial(view, root, bodies, bound, alloc.clone()).map_err(from_inline)?;
-    let replaced = scalar_replace(inlined.func.view(), alloc.clone())?;
-    let propagated = propagate(replaced.view(), alloc.clone())?;
+    let inlined = inline_trivial(view, root, bodies, bound, alloc).map_err(from_inline)?;
+    let replaced = scalar_replace(inlined.func.view(), alloc)?;
+    let propagated = propagate(replaced.view(), alloc)?;
     let func = dead(propagated.view(), alloc)?;
     Ok((func, inlined.read))
 }

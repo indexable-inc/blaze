@@ -74,7 +74,7 @@ pub enum Plant {
 
 /// Elaborates every `Drop` row of `body` from `facts`, writing the output in `alloc`. The output
 /// is meant for [`blaze_body::verify`], which the caller runs for its proof.
-pub fn elaborate<F: DropFacts, A: Allocator + Clone>(
+pub fn elaborate<F: DropFacts, A: Allocator + Copy>(
     body: Verified<'_>,
     facts: &F,
     alloc: A,
@@ -83,7 +83,7 @@ pub fn elaborate<F: DropFacts, A: Allocator + Clone>(
 }
 
 #[doc(hidden)]
-pub fn elaborate_planted<F: DropFacts, A: Allocator + Clone>(
+pub fn elaborate_planted<F: DropFacts, A: Allocator + Copy>(
     body: Verified<'_>,
     facts: &F,
     alloc: A,
@@ -93,17 +93,17 @@ pub fn elaborate_planted<F: DropFacts, A: Allocator + Clone>(
         v: body,
         facts,
         plant,
-        b: BodyBuilder::new_in(alloc.clone()),
-        flags: Vec::new_in(alloc.clone()),
-        chains: Vec::new_in(alloc.clone()),
-        plans: Vec::with_capacity_in(body.stmts() as usize, alloc.clone()),
-        steps: Vec::new_in(alloc.clone()),
-        pending: Vec::new_in(alloc.clone()),
-        subsets: Vec::new_in(alloc.clone()),
+        b: BodyBuilder::new_in(alloc),
+        flags: Vec::new_in(alloc),
+        chains: Vec::new_in(alloc),
+        plans: Vec::with_capacity_in(body.stmts() as usize, alloc),
+        steps: Vec::new_in(alloc),
+        pending: Vec::new_in(alloc),
+        subsets: Vec::new_in(alloc),
         next_subset: 0,
-        ops: Vec::new_in(alloc.clone()),
-        cases: Vec::new_in(alloc.clone()),
-        order: Vec::new_in(alloc.clone()),
+        ops: Vec::new_in(alloc),
+        cases: Vec::new_in(alloc),
+        order: Vec::new_in(alloc),
         blocks: Vec::new_in(alloc),
         konst: None,
     };
@@ -158,7 +158,7 @@ enum Pending {
     Resume { block: Block, span: Span },
 }
 
-struct Elab<'v, 'f, F: DropFacts, A: Allocator + Clone> {
+struct Elab<'v, 'f, F: DropFacts, A: Allocator + Copy> {
     v: Verified<'v>,
     facts: &'f F,
     plant: Plant,
@@ -185,7 +185,7 @@ fn path_order(a: &[Field], b: &[Field]) -> Ordering {
     a.iter().map(|f| f.index).cmp(b.iter().map(|f| f.index))
 }
 
-impl<F: DropFacts, A: Allocator + Clone> Elab<'_, '_, F, A> {
+impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
     /// `got` must be the input's id `want` of `table`: the builder's first error if it has one.
     fn same(&self, table: Table, got: u32, want: u32) -> Result<(), ElabError> {
         if got == want {

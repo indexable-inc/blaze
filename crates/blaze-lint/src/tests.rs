@@ -646,6 +646,12 @@ fn new_rules_are_off_until_named() {
         Rule::LockWithoutReason,
         Rule::DoubleIndirectionArc,
         Rule::RawSandboxExec,
+        Rule::MutRef,
+        Rule::MagicSliceLen,
+        Rule::BoolAsInt,
+        Rule::ManualSliceIdioms,
+        Rule::TestAmbientLeak,
+        Rule::MutForUniqBorrow,
     ] {
         assert!(!Step::Strict.rules().runs(rule), "{} runs in strict", rule.name());
         assert!(Step::Strict.rules().with(rule).runs(rule));
@@ -1120,10 +1126,14 @@ fn rule_trie_equals_a_scan_per_sequence() {
 
 /// The fixes of `text`'s findings applied.
 fn fixed(text: &str) -> StdString {
+    fixed_rules(&RuleSet::ALL, text)
+}
+
+fn fixed_rules(rules: &RuleSet, text: &str) -> StdString {
     let alloc = blaze_own::testing::heap().alloc();
     let mut out = Findings::new_in(alloc);
     let unit = Unit { text, holes: &[], scope: FILE };
-    assert!(lint(&RuleSet::ALL, &unit, alloc, &mut out).is_ok());
+    assert!(lint(rules, &unit, alloc, &mut out).is_ok());
     match apply_all(text, &out, alloc) {
         Ok(new) => new.as_str().to_string(),
         Err(error) => panic!("fixes refused on {text:?}: {error:?}"),
@@ -1133,14 +1143,17 @@ fn fixed(text: &str) -> StdString {
 #[test]
 fn renamed() {
     let rule = Rule::Renamed;
+    let only = RuleSet::only(&[rule]);
     let typed = "fn f(al: A) {\n    let mut v: AVec<'_, u8> = AVec::new_in(al);\n    v.insert(0, 1);\n}";
     assert_eq!(kinds(rule, typed), ["fixed"]);
     assert_eq!(fixed(typed), "fn f(al: A) {\n    let mut v: AVec<'_, u8> = AVec::new_in(al);\n    v.insert_shift(0, 1);\n}");
     let param = "fn f(v: &mut AVec<'_, u8>) -> bool {\n    v.contains(&1)\n}";
-    assert_eq!(fixed(param), "fn f(v: &mut AVec<'_, u8>) -> bool {\n    v.scan_for(&1).is_some()\n}");
+    assert_eq!(fixed_rules(&only, param), "fn f(v: &mut AVec<'_, u8>) -> bool {\n    v.scan_for(&1).is_some()\n}");
+    assert_eq!(fixed(param), "fn f(v: &uniq AVec<'_, u8>) -> bool {\n    v.scan_for(&1).is_some()\n}");
     let init = "fn f(al: A) {\n    let mut d = ADeque::new_in(al);\n    d.remove(0);\n}";
     assert_eq!(fixed(init), "fn f(al: A) {\n    let mut d = ADeque::new_in(al);\n    d.remove_shift(0);\n}");
-    assert_eq!(fixed("fn f() { AVec::swap_remove(&mut v, 0); }"), "fn f() { AVec::remove_swap(&mut v, 0); }");
+    assert_eq!(fixed_rules(&only, "fn f() { AVec::swap_remove(&mut v, 0); }"), "fn f() { AVec::remove_swap(&mut v, 0); }");
+    assert_eq!(fixed("fn f() { AVec::swap_remove(&mut v, 0); }"), "fn f() { AVec::remove_swap(&uniq v, 0); }");
     assert_eq!(kinds(rule, "fn f(x: &mut X) {\n    x.insert_many(0, &[1]);\n}"), ["for-a-person"]);
     none(rule, &[
         "fn f(m: &mut HashMap<u8, u8>) {\n    m.insert(1, 2);\n}",
@@ -2082,5 +2095,312 @@ fn raw_sandbox_exec() {
         "fn f() {\n    // /usr/bin/sandbox-exec\n    /* sandbox-exec */\n}",
         "#[test]\nfn t() { Command::new(\"/usr/bin/sandbox-exec\"); }",
         "#[cfg(test)]\nmod t {\n    const S: &str = \"sandbox-exec\";\n}",
+    ]);
+}
+
+#[test]
+fn mut_ref_deprecated_with_autofix() {
+    let rule = Rule::MutRef;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("mut-ref"), Some(rule));
+    assert_eq!(Rule::from_lint("mut_ref"), Some(rule));
+    assert_eq!(Template::MutRef.rule(), rule);
+    assert_eq!(Template::RefMut.rule(), rule);
+    assert!(Step::Edition.rules().runs(rule), "Step::Edition runs mut-ref deprecation");
+    assert!(!Step::Rust.rules().runs(rule));
+
+    // RootMarks turns on mut-ref via `#![blaze::uniq]` or `#![deny(blaze::mut_ref)]`.
+    let uniq_marks = RootMarks::read("#![blaze::uniq]\nfn f() {}");
+    assert!(uniq_marks.uniq);
+    assert!(uniq_marks.rules(Step::Rust.rules()).runs(rule));
+    assert_ne!(uniq_marks.key(), RootMarks::NONE.key());
+
+    let deny_marks = RootMarks::read("#![deny(blaze::mut_ref)]\nfn f() {}");
+    assert!(deny_marks.denies(rule));
+    assert!(deny_marks.rules(Step::Rust.rules()).runs(rule));
+    assert_eq!(deny_marks.levels(Step::Rust.levels()).of(rule), Level::Error);
+
+    // Detection across `&mut`, `&'a mut`, `&&mut`, and `ref mut`.
+    let src = "fn obj_row<'a>(&'a mut self, ui: &mut UiWorld, x: &&mut i32) { let mut n = 0; let r = &mut n; let ref mut y = n; let &mut z = r; }";
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    assert!(lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    let matched: StdVec<(&str, &str)> =
+        out.list.iter().map(|f| (f.template.kind(), f.range.of(src))).collect();
+    assert_eq!(
+        matched,
+        [
+            ("mut-ref", "&'a mut"),
+            ("mut-ref", "&mut"),
+            ("mut-ref", "&mut"),
+            ("mut-ref", "&mut"),
+            ("ref-mut", "ref mut"),
+            ("mut-ref", "&mut"),
+        ]
+    );
+
+    // Mechanical auto-fix converts every `&mut` / `ref mut` to `&uniq` / `ref uniq`,
+    // leaving `let mut n = 0;` untouched.
+    let fixed = apply_all(src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(
+        fixed.as_str(),
+        "fn obj_row<'a>(&'a uniq self, ui: &uniq UiWorld, x: &&uniq i32) { let mut n = 0; let r = &uniq n; let ref uniq y = n; let &uniq z = r; }"
+    );
+
+    // Re-linting the fixed output produces zero findings!
+    out.clear();
+    assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert!(out.list.is_empty(), "fixed code must have zero mut-ref findings");
+
+    // Deprecation message mentions `&uniq`.
+    out.clear();
+    let msg_src = "fn f(x: &mut i32) {}";
+    assert!(lint(&only, &Unit { text: msg_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    let mut msg = OwnString::new_in(alloc);
+    show_message(&only, msg_src, &out, &out.list[0], &mut msg);
+    assert!(msg.as_str().contains("deprecated") && msg.as_str().contains("&uniq"), "{}", msg.as_str());
+
+    // Negative controls: `let mut`, `*mut`, `&raw mut`, `mut` bindings, raw idents, strings, comments.
+    none(rule, &[
+        "fn f(mut x: i32) { let mut y = x; y += 1; }",
+        "fn f(p: *mut u8) -> *mut u8 { p }",
+        "fn f(mut x: i32) { let _ = &raw mut x; }",
+        "fn f(ui: &uniq UiWorld) { let ref uniq y = *ui; }",
+        "fn f() { let s = \"&mut ref mut\"; /* &mut */ // ref mut\n }",
+        "fn f(r#mut: i32) { let _ = &r#mut; }",
+    ]);
+}
+
+#[test]
+fn clone_handle_autofixes_rc_to_local_share_and_arc_to_share() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let only = RuleSet::only(&[Rule::Clones]);
+    let src = "fn f(a: &Arc<u8>, r: &Rc<u8>) {\n    let a2 = a.clone();\n    let r2 = r.clone();\n    let r3 = Rc::new_in(1, alloc);\n    let r4 = r3.clone();\n}\n";
+    let mut out = Findings::new_in(alloc);
+    assert!(lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 3);
+    let fixed = apply_all(src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(
+        fixed.as_str(),
+        "fn f(a: &Arc<u8>, r: &Rc<u8>) {\n    let a2 = a.share();\n    let r2 = r.local_share();\n    let r3 = Rc::new_in(1, alloc);\n    let r4 = r3.local_share();\n}\n"
+    );
+    // Re-linting the fixed code produces zero CloneHandle findings!
+    out.clear();
+    assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert!(out.list.is_empty(), "fixed code must have zero clone findings");
+}
+
+#[test]
+fn magic_slice_len_detects_and_autofixes() {
+    let rule = Rule::MagicSliceLen;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("magic-slice-len"), Some(rule));
+    assert_eq!(Rule::from_lint("magic_slice_len"), Some(rule));
+    assert_eq!(Template::MagicSlicePrefix.rule(), rule);
+    assert_eq!(Template::MagicSlicePrefixMismatch.rule(), rule);
+    assert_eq!(Template::MagicSliceAdvance.rule(), rule);
+    assert_eq!(Template::MagicSliceBytes.rule(), rule);
+    assert_eq!(Template::MagicSliceRange.rule(), rule);
+    assert!(Step::Edition.rules().runs(rule), "Step::Edition runs magic-slice-len");
+    assert!(!Step::Rust.rules().runs(rule));
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+
+    // 1. Auto-fixable prefix comparisons (`0..3`, `..4`, `&x[..7] == b".."`, `.get(..4).is_some_and`).
+    let autofix_src = "fn f(bytes: &[u8], sect: &[u8]) -> bool { bytes.get(0..3) == Some(&[0xEF, 0xBB, 0xBF]) && bytes.get(..4) == Some(b\"RIFF\") && &sect[..7] == b\"__text\\0\" && bytes.get(..4).is_some_and(|m| m == b\"WEBP\") }";
+    assert!(lint(&only, &Unit { text: autofix_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 4, "expected 4 prefix findings");
+    assert!(out.list.iter().all(|f| f.template == Template::MagicSlicePrefix));
+    let mut msg = OwnString::new_in(alloc);
+    show_message(&only, autofix_src, &out, &out.list[0], &mut msg);
+    assert!(msg.as_str().contains("strip_prefix(&[0xEF, 0xBB, 0xBF])"), "{}", msg.as_str());
+    let fixed = apply_all(autofix_src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(
+        fixed.as_str(),
+        "fn f(bytes: &[u8], sect: &[u8]) -> bool { bytes.starts_with(&[0xEF, 0xBB, 0xBF]) && bytes.starts_with(b\"RIFF\") && sect.starts_with(b\"__text\\0\") && bytes.starts_with(b\"WEBP\") }"
+    );
+    // Re-linting fixed output produces zero findings!
+    out.clear();
+    assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert!(out.list.is_empty(), "fixed code must have zero magic-slice-len findings");
+
+    // 2. Cursor prefix (`at..at + 2 == Some(b"//")`), `&sect[..7] == b"__text\0"`, and `.is_some_and`.
+    let cursor_src = r#"fn f(bytes: &[u8], at: usize, entry: &[u8]) -> bool {
+        if bytes.get(at..at + 2) == Some(b"//") { return true; }
+        if &bytes[..7] == b"__text\0" { return true; }
+        entry.get(..8).is_some_and(|m| m == MAGIC)
+    }"#;
+    out.clear();
+    assert!(lint(&only, &Unit { text: cursor_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 3, "expected 3 prefix findings");
+    assert!(out.list.iter().all(|f| f.template == Template::MagicSlicePrefix));
+
+    // 3. Bug detector: hardcoded length mismatches literal length (`0..4` vs `b"//"`).
+    let mismatch_src = "fn f(bytes: &[u8]) -> bool { bytes.get(0..4) == Some(b\"//\") }";
+    out.clear();
+    assert!(lint(&only, &Unit { text: mismatch_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 1);
+    assert_eq!(out.list[0].template, Template::MagicSlicePrefixMismatch);
+    assert!(out.list[0].fixes.is_empty(), "mismatched length bug must not silently autofix");
+
+    // 4. `starts_with` followed by hardcoded `[N..]` or `+= N` advance.
+    let adv_src = r#"fn f(s: &str, mut at: usize) -> &str {
+        if s.starts_with("0x") { return &s[2..]; }
+        if s.starts_with("//") { at += 2; }
+        let _ = at;
+        s
+    }"#;
+    out.clear();
+    assert!(lint(&only, &Unit { text: adv_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 2);
+    assert!(out.list.iter().all(|f| f.template == Template::MagicSliceAdvance));
+
+    // 5. Standalone byte-width `.get(at..at + 4)?.try_into()` vs general `.get(0..3)`.
+    let standalone_src = r#"fn f(bytes: &[u8], at: usize) -> Option<&[u8]> {
+        let _w: [u8; 4] = bytes.get(at..at + 4)?.try_into().ok()?;
+        bytes.get(0..3)
+    }"#;
+    out.clear();
+    assert!(lint(&only, &Unit { text: standalone_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 2);
+    assert_eq!(out.list[0].template, Template::MagicSliceBytes);
+    assert_eq!(out.list[1].template, Template::MagicSliceRange);
+
+    // 6. Negative controls: clean derived code & tests must produce zero findings.
+    none(rule, &[
+        "fn f(text: &str) -> Option<&str> { text.strip_prefix(\"//\") }",
+        "fn f(bytes: &[u8]) -> bool { bytes.starts_with(&[0xEF, 0xBB, 0xBF]) }",
+        "fn f(bytes: &[u8]) -> Option<&[u8]> { bytes.get(..MAGIC.len()) }",
+        "fn f(bytes: &[u8], at: usize) -> Option<&[u8]> { bytes.get(at..at + HEADER_LEN) }",
+        "fn f(bytes: &[u8], at: usize) -> Option<&[u8]> { bytes.get(at..at + size_of::<u32>()) }",
+        "fn f(bytes: &[u8], start: usize, end: usize) -> Option<&[u8]> { bytes.get(start..end) }",
+        "fn f(bytes: &[u8]) -> Option<&u8> { bytes.get(0) }",
+        "#[test]\nfn t() { let b = b\"abc\"; assert!(b.get(0..3) == Some(b\"abc\")); }",
+    ]);
+}
+
+#[test]
+fn bool_as_int_detects_and_autofixes() {
+    let rule = Rule::BoolAsInt;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("bool-as-int"), Some(rule));
+    assert_eq!(Rule::from_lint("bool_as_int"), Some(rule));
+    assert_eq!(Template::BoolAsInt.rule(), rule);
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    let src = "fn f(a: u32, b: u32, opt: Option<u8>) -> usize { (a == b) as usize + opt.is_some() as usize + (a < b) as usize + true as usize }";
+    assert!(lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 4);
+    let fixed = apply_all(src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(
+        fixed.as_str(),
+        "fn f(a: u32, b: u32, opt: Option<u8>) -> usize { usize::from(a == b) + usize::from(opt.is_some()) + usize::from(a < b) + usize::from(true) }"
+    );
+    out.clear();
+    assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert!(out.list.is_empty());
+
+    none(rule, &[
+        "fn f(x: u32) -> u64 { x as u64 }",
+        "fn f(x: usize) -> u32 { (x + 1) as u32 }",
+        "fn f(x: u32) -> usize { (x << 2) as usize }",
+        "fn f(mask: u32) -> u64 { (!mask) as u64 }",
+        "fn f() -> u32 { (size_of::<u64>() / size_of::<u32>()) as u32 }",
+        "const fn f(a: u32, b: u32) -> u32 { (a == b) as u32 }",
+        "fn f(b: bool) -> usize { usize::from(b) }",
+    ]);
+}
+
+#[test]
+fn manual_slice_idioms_detects_and_autofixes() {
+    let rule = Rule::ManualSliceIdioms;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("manual-slice-idioms"), Some(rule));
+    assert_eq!(Rule::from_lint("manual_slice_idioms"), Some(rule));
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+
+    // 1. `.len() == 0` / `.len() > 0` / `.len() != 0` / `.len() >= 1` -> `is_empty()` / `!is_empty()`.
+    let len_src = "fn f(xs: &[u8], ys: &[u8]) -> bool { xs.len() == 0 && ys.len() > 0 && xs.len() != 0 && ys.len() >= 1 }";
+    assert!(lint(&only, &Unit { text: len_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 4);
+    assert!(out.list.iter().all(|f| f.template == Template::LenZeroCheck));
+    let fixed = apply_all(len_src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(
+        fixed.as_str(),
+        "fn f(xs: &[u8], ys: &[u8]) -> bool { xs.is_empty() && !ys.is_empty() && !xs.is_empty() && !ys.is_empty() }"
+    );
+    out.clear();
+    assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert!(out.list.is_empty());
+
+    // 2. Index loop `for i in 0..xs.len() { let _ = xs[i]; }`.
+    let loop_src = "fn f(xs: &[u8]) -> u8 { let mut s = 0; for i in 0..xs.len() { s += xs[i]; } s }";
+    out.clear();
+    assert!(lint(&only, &Unit { text: loop_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 1);
+    assert_eq!(out.list[0].template, Template::IndexLoop);
+
+    // 3. `.find('\n')` followed by `[..pos]` / `[pos + 1..]`.
+    let find_src = "fn f(s: &str) -> (&str, &str) { if let Some(pos) = s.find(':') { (&s[..pos], &s[pos + 1..]) } else { (s, \"\") } }";
+    out.clear();
+    assert!(lint(&only, &Unit { text: find_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 1);
+    assert_eq!(out.list[0].template, Template::ManualFindSplit);
+
+    none(rule, &[
+        "fn f(xs: &[u8], ys: &[u8]) -> bool { xs.is_empty() || xs.len() == 2 || xs.len() >= 1 << 20 || xs.len() + ys.len() >= 1 }",
+        "impl S { pub fn is_empty(&self) -> bool { self.len() == 0 } }",
+        "fn f(xs: &[u8]) -> u8 { let mut s = 0; for &x in xs { s += x; } s }",
+        "fn f(s: &str) -> Option<(&str, &str)> { s.split_once(':') }",
+    ]);
+}
+
+#[test]
+fn test_ambient_leak_catches_test_global_alloc_and_extern_std() {
+    let rule = Rule::TestAmbientLeak;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("test-ambient-leak"), Some(rule));
+    assert_eq!(Rule::from_lint("test_ambient_leak"), Some(rule));
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    let src = "#[cfg(test)]\nextern crate std;\n#[test]\nfn t() { let _a = Alloc::global(); }\n";
+    assert!(lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 2);
+    assert_eq!(out.list[0].template, Template::TestExternStd);
+    assert_eq!(out.list[1].template, Template::TestGlobalAlloc);
+
+    // Outside tests, `test-ambient-leak` stays silent (other rules cover production code).
+    none(rule, &[
+        "extern crate std;\nfn prod() { let _a = Alloc::global(); }",
+        "#[test]\nfn clean() { let heap = blaze_own::testing::heap(); let _a = heap.alloc(); }",
+    ]);
+}
+
+#[test]
+fn mut_for_uniq_borrow_autofixes_non_rebound_let_mut_and_keeps_rebindings() {
+    let rule = Rule::MutForUniqBorrow;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("mut-for-uniq-borrow"), Some(rule));
+    assert_eq!(Rule::from_lint("mut_for_uniq_borrow"), Some(rule));
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    let src = "fn demo() -> i32 { let mut n = 41; bump(&uniq n); n }";
+    assert!(lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 1);
+    assert_eq!(out.list[0].template, Template::MutForUniqBorrow);
+    let fixed = apply_all(src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(fixed.as_str(), "fn demo() -> i32 { let n = 41; bump(&uniq n); n }");
+
+    // Actual local rebinding (`n = ..`, `n += ..`) keeps `let mut`.
+    none(rule, &[
+        "fn rebound() -> i32 { let mut n = 0; bump(&uniq n); n = 5; n }",
+        "fn compound() -> i32 { let mut n = 0; bump(&uniq n); n += 1; n }",
+        "fn no_borrow() -> i32 { let mut n = 0; n }",
     ]);
 }

@@ -503,6 +503,9 @@ fn wildcard_pat<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![_]));
     let m = p.start();
     p.bump(T![_]);
+    if p.typed_pat_gate() && p.at(T![:]) && !p.at(T![::]) {
+        p.with_unions(false, |p| types::ascription(p));
+    }
     m.complete(p, WILDCARD_PAT)
 }
 
@@ -591,7 +594,7 @@ fn tuple_pat<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
             break;
         }
         has_rest |= !p.at(T![..=]) && p.at(T![..]) && !RANGE_PAT_END_FIRST.contains(p.nth(2));
-        pattern_top_guard(p);
+        p.with_typed_pats(true, pattern_top_guard);
         if !p.at(T![')']) {
             has_comma = true;
             p.expect(T![,]);
@@ -618,7 +621,7 @@ fn slice_pat<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
 
 fn pat_list<S: Sink>(p: &mut Parser<'_, S>, ket: SyntaxKind) {
     while !p.at(EOF) && !p.at(ket) {
-        pattern_top_guard(p);
+        p.with_typed_pats(true, pattern_top_guard);
         if !p.eat(T![,]) {
             if p.at_ts(PAT_TOP_FIRST) || at_record_pat(p) {
                 // alloc: error path only, the message names the token found
@@ -651,6 +654,8 @@ fn ident_pat<S: Sink>(p: &mut Parser<'_, S>, with_at: bool) -> CompletedMarker {
     name_r(p, PAT_RECOVERY_SET);
     if with_at && p.eat(T![@]) {
         pattern_single(p);
+    } else if p.typed_pat_gate() && p.at(T![:]) && !p.at(T![::]) {
+        p.with_unions(false, |p| types::ascription(p));
     }
     m.complete(p, IDENT_PAT)
 }

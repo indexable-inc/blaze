@@ -1732,7 +1732,7 @@ impl<'a> Iterator for CommentCodeSlices<'a> {
 
         for (kind, (i, c)) in &mut iter {
             let is_comment_connector = self.last_slice_kind == CodeCharKind::Normal
-                && &subslice[..2] == "//"
+                && subslice.starts_with("//")
                 && [' ', '\t'].contains(&c);
 
             if is_comment_connector && first_whitespace.is_none() {

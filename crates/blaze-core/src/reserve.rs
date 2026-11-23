@@ -25,6 +25,8 @@
 
 use std::fmt;
 
+use blaze_own::Share;
+
 use crate::{Done, Effect, FileName, IoError, MappingWrite, Tag};
 
 /// What a reservation's scratch name adds to its key's: `<key>.part-<tag>`.
@@ -135,7 +137,7 @@ impl Reserve {
         // alloc: the scratch file's name, once per reservation.
         let tmp = FileName::new(&format!("{key}{PART}{}", tag.0)).expect("a key's name with a suffix is a name");
         // clone: a refcount, the name the effect carries.
-        let ask = Effect::MapWrite { file: tmp.clone(), len: room, tag };
+        let ask = Effect::MapWrite { file: tmp.share(), len: room, tag };
         let reserve = Reserve {
             tmp,
             key,
@@ -163,7 +165,7 @@ impl Reserve {
 
     fn error(&self, why: Why) -> ReserveError {
         // clone: a refcount, the name the error carries.
-        ReserveError { file: self.tmp.clone(), step: self.step, why }
+        ReserveError { file: self.tmp.share(), step: self.step, why }
     }
 
     /// The completion of the effect last asked.
@@ -184,12 +186,12 @@ impl Reserve {
             (Step::Cutting, Done::Truncated) if planted => {
                 self.step = Step::Renaming;
                 // clone: refcounts, the names the effect carries.
-                Ok(Next::Ask(Effect::Rename { from: self.tmp.clone(), to: self.key.clone(), tag: self.tag }))
+                Ok(Next::Ask(Effect::Rename { from: self.tmp.share(), to: self.key.share(), tag: self.tag }))
             }
             (Step::Renaming, Done::Renamed) if planted => {
                 self.step = Step::Syncing;
                 // clone: a refcount, the name the effect carries.
-                Ok(Next::Ask(Effect::Sync { file: self.key.clone(), tag: self.tag }))
+                Ok(Next::Ask(Effect::Sync { file: self.key.share(), tag: self.tag }))
             }
             (Step::Syncing, Done::Synced) if planted => {
                 self.step = Step::Stored;
@@ -198,12 +200,12 @@ impl Reserve {
             (Step::Cutting, Done::Truncated) => {
                 self.step = Step::Syncing;
                 // clone: a refcount, the name the effect carries.
-                Ok(Next::Ask(Effect::Sync { file: self.tmp.clone(), tag: self.tag }))
+                Ok(Next::Ask(Effect::Sync { file: self.tmp.share(), tag: self.tag }))
             }
             (Step::Syncing, Done::Synced) => {
                 self.step = Step::Renaming;
                 // clone: refcounts, the names the effect carries.
-                Ok(Next::Ask(Effect::Rename { from: self.tmp.clone(), to: self.key.clone(), tag: self.tag }))
+                Ok(Next::Ask(Effect::Rename { from: self.tmp.share(), to: self.key.share(), tag: self.tag }))
             }
             (Step::Renaming, Done::Renamed) => {
                 self.step = Step::Stored;
@@ -242,7 +244,7 @@ impl Reserve {
         drop(mapping);
         self.step = Step::Cutting;
         // clone: a refcount, the name the effect carries.
-        Ok(Effect::Truncate { file: self.tmp.clone(), len, tag: self.tag })
+        Ok(Effect::Truncate { file: self.tmp.share(), len, tag: self.tag })
     }
 
     /// Undo the reservation, at any step before the record is stored: the mapping (if the
@@ -256,7 +258,7 @@ impl Reserve {
             Step::Mapping | Step::Mapped | Step::Cutting | Step::Syncing | Step::Renaming => {
                 self.step = Step::Removing;
                 // clone: a refcount, the name the effect carries.
-                Some(Effect::Remove { file: self.tmp.clone(), tag: self.tag })
+                Some(Effect::Remove { file: self.tmp.share(), tag: self.tag })
             }
         }
     }
@@ -332,7 +334,7 @@ mod tests {
         let fill = sim.rng().below(255) as u8 + 1;
         let record: Vec<u8> = (0..len).map(|i| fill.wrapping_add(i as u8)).collect();
         let crash_after = sim.rng().below(8);
-        let (mut reserve, first) = Reserve::new(key.clone(), room, Tag(7));
+        let (mut reserve, first) = Reserve::new(key.share(), room, Tag(7));
         if let Some(plant) = plant {
             reserve.plant(plant);
         }

@@ -256,6 +256,31 @@ pub enum Rule {
     /// macOS Seatbelt + Linux Landlock/seccomp from one sans-IO `Plan`.
     /// The lint `blaze::raw_sandbox_exec`.
     RawSandboxExec = 35,
+    /// Deprecated `&mut` / `ref mut` unique reference spelling (`docs/v2/plan/design/edition.md`,
+    /// change 10): Blaze spells unique references `&uniq` and `ref uniq`, with mechanical auto-fix.
+    /// Does not flag `let mut`, `*mut`, `&raw mut`, or `mut x` bindings.
+    /// The lint `blaze::mut_ref`.
+    MutRef = 36,
+    /// Hardcoded magic slice range length (`bytes.get(0..3) == Some(..)`, `bytes.get(at..at + 2)`,
+    /// `&s[..7] == b".."`, or `starts_with` followed by a hardcoded advance) where the length should
+    /// be derived via `strip_prefix`, `starts_with`, `.len()`, `size_of::<T>()`, or a named `const`.
+    /// The lint `blaze::magic_slice_len`.
+    MagicSliceLen = 37,
+    /// Boolean-to-integer `as` cast (`(a == b) as u32`, `x.is_some() as usize`) that should use
+    /// infallible `T::from(..)` (with mechanical auto-fix). The lint `blaze::bool_as_int`.
+    BoolAsInt = 38,
+    /// Manual slice length/index idioms (`x.len() == 0` / `x.len() > 0` -> `is_empty()`,
+    /// `for i in 0..xs.len()` indexing `xs[i]`, `.find(..)` followed by manual slicing instead of
+    /// `split_once`). The lint `blaze::manual_slice_idioms`.
+    ManualSliceIdioms = 39,
+    /// Test-code ambient leaks (`Alloc::global()` in tests and `#[cfg(test)] extern crate std;`)
+    /// that trip Blaze's `alloc_global_tests` and `std-alloc-tests` ratchets.
+    /// The lint `blaze::test_ambient_leak`.
+    TestAmbientLeak = 40,
+    /// `let mut x = ..;` where `x` is never rebound (`x = ..`) and only borrowed uniquely
+    /// (`&uniq x` / `&mut x`); under Blaze's edition `let x` permits `&uniq x` directly and
+    /// `mut` is reserved for local rebinding. The lint `blaze::mut_for_uniq_borrow`.
+    MutForUniqBorrow = 41,
 }
 
 impl Rule {
@@ -299,6 +324,12 @@ impl Rule {
         Rule::ProcMacroDef,
         Rule::DoubleIndirectionArc,
         Rule::RawSandboxExec,
+        Rule::MutRef,
+        Rule::MagicSliceLen,
+        Rule::BoolAsInt,
+        Rule::ManualSliceIdioms,
+        Rule::TestAmbientLeak,
+        Rule::MutForUniqBorrow,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -358,6 +389,12 @@ impl Rule {
             Rule::ProcMacroDef => "proc-macro-def",
             Rule::DoubleIndirectionArc => "double-indirection-arc",
             Rule::RawSandboxExec => "raw-sandbox-exec",
+            Rule::MutRef => "mut-ref",
+            Rule::MagicSliceLen => "magic-slice-len",
+            Rule::BoolAsInt => "bool-as-int",
+            Rule::ManualSliceIdioms => "manual-slice-idioms",
+            Rule::TestAmbientLeak => "test-ambient-leak",
+            Rule::MutForUniqBorrow => "mut-for-uniq-borrow",
         }
     }
 
@@ -389,6 +426,12 @@ impl Rule {
             Rule::ProcMacroDef => Some("proc_macro_derive"),
             Rule::DoubleIndirectionArc => Some("double_indirection_arc"),
             Rule::RawSandboxExec => Some("raw_sandbox_exec"),
+            Rule::MutRef => Some("mut_ref"),
+            Rule::MagicSliceLen => Some("magic_slice_len"),
+            Rule::BoolAsInt => Some("bool_as_int"),
+            Rule::ManualSliceIdioms => Some("manual_slice_idioms"),
+            Rule::TestAmbientLeak => Some("test_ambient_leak"),
+            Rule::MutForUniqBorrow => Some("mut_for_uniq_borrow"),
             _ => None,
         }
     }
@@ -433,7 +476,7 @@ impl Rule {
     pub const fn exempt(self) -> TestBits {
         match self {
             Rule::Allocs => TestBits::CFG,
-            Rule::UnsafeComment | Rule::VariantCount => TestBits::NONE,
+            Rule::UnsafeComment | Rule::VariantCount | Rule::MutRef | Rule::TestAmbientLeak | Rule::MutForUniqBorrow => TestBits::NONE,
             _ => TestBits::ANY,
         }
     }
@@ -599,6 +642,43 @@ pub enum Template {
     DoubleIndirectionArc = 300,
     /// Literal `"sandbox-exec"` or `"/usr/bin/sandbox-exec"` outside `bstd::procs::hermetic`.
     RawSandboxExec = 310,
+    /// Deprecated `&mut` (or `&'a mut`) unique reference; fixed mechanically to `&uniq` (`&'a uniq`).
+    MutRef = 320,
+    /// Deprecated `ref mut` binding mode; fixed mechanically to `ref uniq`.
+    RefMut = 321,
+    /// Hardcoded slice range compared to a prefix (`bytes.get(0..3) == Some(rhs)`,
+    /// `bytes.get(at..at + 2) == Some(rhs)`, `&s[..7] == rhs`); argument: `rhs` span.
+    /// Fixed mechanically to `.starts_with(..)` when the range starts at 0 and uses `== Some(..)`.
+    MagicSlicePrefix = 330,
+    /// Hardcoded slice range whose literal length does NOT match the compared literal prefix (bug!);
+    /// argument: `rhs` span.
+    MagicSlicePrefixMismatch = 331,
+    /// `x.starts_with(lit)` followed immediately by a hardcoded advance (`+= N`, `= N`, or `[N..]`);
+    /// argument: `lit` span.
+    MagicSliceAdvance = 332,
+    /// Hardcoded byte-width slice `.get(0..N)` / `.get(at..at + N)` feeding `.try_into()` or a
+    /// fixed-width integer decode (`2`, `4`, `8`, `16` bytes).
+    MagicSliceBytes = 333,
+    /// Standalone hardcoded magic slice range `.get(0..N)` / `.get(..N)` / `.get(at..at + N)`
+    /// where `N` is a bare integer literal instead of a derived length or named `const`.
+    MagicSliceRange = 334,
+    /// Boolean-to-integer `as` cast (`(a == b) as u32`, `x.is_some() as usize`); argument: target
+    /// integer type span. Fixed mechanically to `T::from(..)`.
+    BoolAsInt = 340,
+    /// `x.len() == 0` / `x.len() > 0` / `x.len() != 0` / `x.len() >= 1`; fixed mechanically to
+    /// `x.is_empty()` / `!x.is_empty()`.
+    LenZeroCheck = 350,
+    /// `for i in 0..xs.len()` indexing `xs[i]` in its body; argument: indexed slice span.
+    IndexLoop = 351,
+    /// `.find(pat)` followed by manual slice splitting `[..pos]` / `[pos + 1..]`; argument: `pat`.
+    ManualFindSplit = 352,
+    /// `Alloc::global()` inside test code (trips `alloc_global_tests`).
+    TestGlobalAlloc = 360,
+    /// `#[cfg(test)] extern crate std;` (trips `std-alloc-tests`).
+    TestExternStd = 361,
+    /// `let mut x = ..;` when `x` is never rebound and only uniquely borrowed (`&uniq x`/`&mut x`);
+    /// fixed mechanically by removing `mut`.
+    MutForUniqBorrow = 370,
 }
 
 impl Template {
@@ -637,6 +717,12 @@ impl Template {
             290 => Rule::ProcMacroDef,
             300 => Rule::DoubleIndirectionArc,
             310 => Rule::RawSandboxExec,
+            320..=321 => Rule::MutRef,
+            330..=334 => Rule::MagicSliceLen,
+            340 => Rule::BoolAsInt,
+            350..=352 => Rule::ManualSliceIdioms,
+            360..=361 => Rule::TestAmbientLeak,
+            370 => Rule::MutForUniqBorrow,
             _ => Rule::VariantCount,
         }
     }
@@ -716,6 +802,20 @@ impl Template {
             Template::ProcMacroDef => "proc-macro-def",
             Template::DoubleIndirectionArc => "double-indirection-arc",
             Template::RawSandboxExec => "raw-sandbox-exec",
+            Template::MutRef => "mut-ref",
+            Template::RefMut => "ref-mut",
+            Template::MagicSlicePrefix => "magic-slice-prefix",
+            Template::MagicSlicePrefixMismatch => "magic-slice-prefix-mismatch",
+            Template::MagicSliceAdvance => "magic-slice-advance",
+            Template::MagicSliceBytes => "magic-slice-bytes",
+            Template::MagicSliceRange => "magic-slice-range",
+            Template::BoolAsInt => "bool-as-int",
+            Template::LenZeroCheck => "len-zero-check",
+            Template::IndexLoop => "index-loop",
+            Template::ManualFindSplit => "manual-find-split",
+            Template::TestGlobalAlloc => "test-global-alloc",
+            Template::TestExternStd => "test-extern-std",
+            Template::MutForUniqBorrow => "mut-for-uniq-borrow",
         }
     }
 }
@@ -1278,8 +1378,21 @@ impl Step {
     /// toolchain has.
     pub const SUGGEST: [Rule; 4] = [Rule::UnsafeComment, Rule::Untyped, Rule::Recursion, Rule::VariantCount];
     /// The rules of [`Step::Edition`].
-    pub const EDITION: [Rule; 7] =
-        [Rule::UnsafeComment, Rule::Untyped, Rule::Recursion, Rule::VariantCount, Rule::Stops, Rule::Casts, Rule::Clones];
+    pub const EDITION: [Rule; 13] = [
+        Rule::UnsafeComment,
+        Rule::Untyped,
+        Rule::Recursion,
+        Rule::VariantCount,
+        Rule::Stops,
+        Rule::Casts,
+        Rule::Clones,
+        Rule::MutRef,
+        Rule::MagicSliceLen,
+        Rule::BoolAsInt,
+        Rule::ManualSliceIdioms,
+        Rule::TestAmbientLeak,
+        Rule::MutForUniqBorrow,
+    ];
 
     /// The step as configuration writes it (`rust`, `suggest`, `edition`, `strict`).
     pub fn from_name(name: &str) -> Option<Step> {

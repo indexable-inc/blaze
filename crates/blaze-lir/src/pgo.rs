@@ -82,7 +82,7 @@ pub struct PgoSiteTable<A: Allocator> {
     total_body_weight: u64,
 }
 
-impl<A: Allocator + Clone> PgoSiteTable<A> {
+impl<A: Allocator + Copy> PgoSiteTable<A> {
     /// Builds a sorted, deduplicated PGO table from raw call-site and body weight entries.
     ///
     /// Duplicate `(caller, site_inst)` or `body` entries are summed saturatingly.
@@ -94,7 +94,7 @@ impl<A: Allocator + Clone> PgoSiteTable<A> {
         default_weight: u64,
         alloc: A,
     ) -> PgoSiteTable<A> {
-        let mut sites = OwnVec::with_capacity_in(raw_sites.len(), alloc.clone());
+        let mut sites = OwnVec::with_capacity_in(raw_sites.len(), alloc);
         sites.extend_from_slice(raw_sites);
         sites.sort_unstable_by(|a, b| a.caller.cmp(&b.caller).then_with(|| a.site_inst.cmp(&b.site_inst)));
         // Coalesce duplicate `(caller, site_inst)` keys in-place.
@@ -199,8 +199,8 @@ impl<A: Allocator + Clone> PgoSiteTable<A> {
     /// assigns higher weights to call sites and bodies with loops, baseline weights to normal
     /// code, and `0` to `#[cold]` bodies and unwind/landing blocks.
     pub fn estimate_static(module: &[ModuleBody<A>], alloc: A) -> PgoSiteTable<A> {
-        let mut raw_sites = OwnVec::new_in(alloc.clone());
-        let mut raw_bodies = OwnVec::with_capacity_in(module.len(), alloc.clone());
+        let mut raw_sites = OwnVec::new_in(alloc);
+        let mut raw_bodies = OwnVec::with_capacity_in(module.len(), alloc);
         for mb in module {
             let view = mb.func.view();
             let summary = FnSummary::compute(view, &alloc);
@@ -249,7 +249,7 @@ impl<A: Allocator + Clone> PgoSiteTable<A> {
         alloc: A,
     ) -> PgoSiteTable<A> {
         let den = decay_den.max(1);
-        let mut merged_sites = OwnVec::with_capacity_in(self.sites.len() + fresh.sites.len(), alloc.clone());
+        let mut merged_sites = OwnVec::with_capacity_in(self.sites.len() + fresh.sites.len(), alloc);
         for s in self.sites.iter() {
             let decayed = s.weight.saturating_mul(decay_num) / den;
             if decayed > 0 {
@@ -258,7 +258,7 @@ impl<A: Allocator + Clone> PgoSiteTable<A> {
         }
         merged_sites.extend_from_slice(&fresh.sites);
 
-        let mut merged_bodies = OwnVec::with_capacity_in(self.bodies.len() + fresh.bodies.len(), alloc.clone());
+        let mut merged_bodies = OwnVec::with_capacity_in(self.bodies.len() + fresh.bodies.len(), alloc);
         for b in self.bodies.iter() {
             let decayed = b.weight.saturating_mul(decay_num) / den;
             if decayed > 0 {
@@ -337,7 +337,7 @@ impl<A: Allocator + Clone> PgoSiteTable<A> {
         }
 
         let mut cur = HEADER;
-        let mut raw_sites = OwnVec::with_capacity_in(nsites, alloc.clone());
+        let mut raw_sites = OwnVec::with_capacity_in(nsites, alloc);
         for _ in 0..nsites {
             let mut caller = [0u8; 32];
             caller.copy_from_slice(&bytes[cur..cur + 32]);
@@ -351,7 +351,7 @@ impl<A: Allocator + Clone> PgoSiteTable<A> {
             cur += 8;
             raw_sites.push(SiteEntry { caller: BodyId(caller), site_inst, weight });
         }
-        let mut raw_bodies = OwnVec::with_capacity_in(nbodies, alloc.clone());
+        let mut raw_bodies = OwnVec::with_capacity_in(nbodies, alloc);
         for _ in 0..nbodies {
             let mut body = [0u8; 32];
             body.copy_from_slice(&bytes[cur..cur + 32]);

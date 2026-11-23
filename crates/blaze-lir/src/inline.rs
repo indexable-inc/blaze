@@ -210,7 +210,7 @@ impl core::error::Error for InlineError {}
 
 /// `view` (the body `root`) with its trivial sites spliced, the callees found through
 /// `bodies`, within `bound`, in `alloc`.
-pub fn inline_trivial<A: Allocator + Clone>(
+pub fn inline_trivial<A: Allocator + Copy>(
     view: View<'_>,
     root: BodyId,
     bodies: &dyn Bodies,
@@ -223,7 +223,7 @@ pub fn inline_trivial<A: Allocator + Clone>(
 /// [`inline_trivial`] with a planted bug (test builds only): the first spliced call's first two
 /// arguments are swapped.
 #[cfg(test)]
-pub(crate) fn inline_swapping_first_args<A: Allocator + Clone>(
+pub(crate) fn inline_swapping_first_args<A: Allocator + Copy>(
     view: View<'_>,
     root: BodyId,
     bodies: &dyn Bodies,
@@ -233,7 +233,7 @@ pub(crate) fn inline_swapping_first_args<A: Allocator + Clone>(
     inline_as(view, root, bodies, bound, true, alloc)
 }
 
-fn inline_as<A: Allocator + Clone>(
+fn inline_as<A: Allocator + Copy>(
     view: View<'_>,
     root: BodyId,
     bodies: &dyn Bodies,
@@ -244,7 +244,7 @@ fn inline_as<A: Allocator + Clone>(
     let mut summaries = new_map(&alloc);
     let (nodes, children) = plan_trivial(view, root, bodies, bound, &mut summaries, &alloc)?;
     let (func, _imported) = emit(&nodes, &children, bodies, false, swap, &alloc)?;
-    let mut read = Vec::with_capacity_in(nodes.len().saturating_sub(1), alloc.clone());
+    let mut read = Vec::with_capacity_in(nodes.len().saturating_sub(1), alloc);
     read.extend(nodes.iter().skip(1).map(|node| node.id));
     read.sort_unstable();
     read.dedup();
@@ -253,7 +253,7 @@ fn inline_as<A: Allocator + Clone>(
 
 /// PGO + cost-model priority inliner: splices sites into `view` (body `root`) using `weights`
 /// and `policy`, caching [`FnSummary`] per callee body, in `alloc`.
-pub fn inline_guided<A: Allocator + Clone>(
+pub fn inline_guided<A: Allocator + Copy>(
     view: View<'_>,
     root: BodyId,
     bodies: &dyn Bodies,
@@ -267,7 +267,7 @@ pub fn inline_guided<A: Allocator + Clone>(
 
 /// Shared-cache entry point used by [`crate::lto`] so callee summaries are computed at most
 /// once across an entire module.
-pub(crate) fn inline_guided_with_cache<A: Allocator + Clone>(
+pub(crate) fn inline_guided_with_cache<A: Allocator + Copy>(
     view: View<'_>,
     root: BodyId,
     bodies: &dyn Bodies,
@@ -280,7 +280,7 @@ pub(crate) fn inline_guided_with_cache<A: Allocator + Clone>(
         plan_guided(view, root, bodies, weights, policy, summaries, &alloc)?;
     let (func, imported_refs) =
         emit(&nodes, &children, bodies, policy.allow_external_refs, false, &alloc)?;
-    let mut read = Vec::with_capacity_in(nodes.len().saturating_sub(1), alloc.clone());
+    let mut read = Vec::with_capacity_in(nodes.len().saturating_sub(1), alloc);
     read.extend(nodes.iter().skip(1).map(|node| node.id));
     read.sort_unstable();
     read.dedup();
@@ -299,8 +299,8 @@ struct Node<'v> {
 }
 
 #[inline]
-fn new_map<K, V, A: Allocator + Clone>(alloc: &A) -> Map<K, V, FixedState, A> {
-    Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None })
+fn new_map<K, V, A: Allocator + Copy>(alloc: &A) -> Map<K, V, FixedState, A> {
+    Map::new(MapOpts { hasher: FixedState, alloc: *alloc, capacity: None })
 }
 
 fn too_large(table: &'static str) -> InlineError {
@@ -311,18 +311,18 @@ fn row(len: usize, table: &'static str) -> Result<u32, InlineError> {
     u32::try_from(len).map_err(|_| too_large(table))
 }
 
-fn filled<T: Clone, A: Allocator + Clone>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
-    let mut column = Vec::with_capacity_in(len, alloc.clone());
+fn filled<T: Clone, A: Allocator + Copy>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
+    let mut column = Vec::with_capacity_in(len, *alloc);
     column.resize(len, item);
     column
 }
 
-fn own_filled<T: Clone, A: Allocator + Clone>(len: usize, item: T, alloc: &A) -> OwnVec<T, A> {
-    OwnVec::from_elem_in(item, len, alloc.clone())
+fn own_filled<T: Clone, A: Allocator + Copy>(len: usize, item: T, alloc: &A) -> OwnVec<T, A> {
+    OwnVec::from_elem_in(item, len, *alloc)
 }
 
 /// Cached [`FnSummary`] lookup for `id`/`view`.
-fn summary_of<A: Allocator + Clone>(
+fn summary_of<A: Allocator + Copy>(
     id: BodyId,
     view: View<'_>,
     summaries: &mut Map<BodyId, FnSummary, FixedState, A>,
@@ -373,7 +373,7 @@ fn each_successor(view: View<'_>, at: usize, f: &mut impl FnMut(u32)) -> Result<
 
 /// Whether every reference node `n` keeps in the output is carried (used when
 /// `allow_external_refs` is false).
-fn closed_with<A: Allocator + Clone>(
+fn closed_with<A: Allocator + Copy>(
     view: View<'_>,
     summary: FnSummary,
     n: u32,
@@ -457,7 +457,7 @@ fn check_legal(
 }
 
 /// The callee of the call `at` of node `n`, if the trivial site is inlined.
-fn candidate_trivial<'v, A: Allocator + Clone>(
+fn candidate_trivial<'v, A: Allocator + Copy>(
     nodes: &[Node<'v>],
     n: u32,
     at: usize,
@@ -507,7 +507,7 @@ fn candidate_trivial<'v, A: Allocator + Clone>(
 }
 
 /// The trivial inlining tree, in the output's layout order (preorder): node 0 is the root.
-fn plan_trivial<'v, A: Allocator + Clone>(
+fn plan_trivial<'v, A: Allocator + Copy>(
     view: View<'v>,
     root: BodyId,
     bodies: &'v dyn Bodies,
@@ -515,13 +515,13 @@ fn plan_trivial<'v, A: Allocator + Clone>(
     summaries: &mut Map<BodyId, FnSummary, FixedState, A>,
     alloc: &A,
 ) -> Result<(Vec<Node<'v>, A>, Map<(u32, usize), u32, FixedState, A>), InlineError> {
-    let mut nodes = Vec::new_in(alloc.clone());
-    let mut node_summaries: OwnVec<Option<FnSummary>, A> = OwnVec::new_in(alloc.clone());
+    let mut nodes = Vec::new_in(*alloc);
+    let mut node_summaries: OwnVec<Option<FnSummary>, A> = OwnVec::new_in(*alloc);
     let mut children: Map<(u32, usize), u32, FixedState, A> = new_map(alloc);
     nodes.push(Node { id: root, view, parent: NONE, site: 0, depth: 0 });
     node_summaries.push(None);
     // Per node being walked: the node and its next instruction.
-    let mut stack: OwnVec<(u32, usize), A> = OwnVec::new_in(alloc.clone());
+    let mut stack: OwnVec<(u32, usize), A> = OwnVec::new_in(*alloc);
     stack.push((0, 0));
     let mut used = 0u64;
     while let Some(&(n, at)) = stack.last() {
@@ -564,13 +564,13 @@ fn plan_trivial<'v, A: Allocator + Clone>(
 
 /// Computes natural loop depth per block of `view` via iterative DFS back-edge detection.
 /// Fast path: returns all zeroes with zero graph allocation when all edges go forward (`to > from`).
-fn loop_depths<A: Allocator + Clone>(view: View<'_>, alloc: &A) -> Result<OwnVec<u8, A>, InlineError> {
+fn loop_depths<A: Allocator + Copy>(view: View<'_>, alloc: &A) -> Result<OwnVec<u8, A>, InlineError> {
     let blocks = view.blocks();
     let mut depths = own_filled(blocks, 0u8, alloc);
     if blocks <= 1 {
         return Ok(depths);
     }
-    let mut edges: OwnVec<(u32, u32), A> = OwnVec::new_in(alloc.clone());
+    let mut edges: OwnVec<(u32, u32), A> = OwnVec::new_in(*alloc);
     let mut succ_starts = own_filled(blocks + 1, 0usize, alloc);
     let mut any_back = false;
     for b in 0..blocks {
@@ -611,8 +611,8 @@ fn loop_depths<A: Allocator + Clone>(view: View<'_>, alloc: &A) -> Result<OwnVec
 
     // Iterative DFS from block 0 to find back-edges `(u -> h)` where `h` is on stack.
     let mut state = own_filled(blocks, 0u8, alloc); // 0=unvisited, 1=on-stack, 2=done
-    let mut dfs: OwnVec<(u32, usize), A> = OwnVec::with_capacity_in(blocks, alloc.clone());
-    let mut back_edges: OwnVec<(u32, u32), A> = OwnVec::new_in(alloc.clone());
+    let mut dfs: OwnVec<(u32, usize), A> = OwnVec::with_capacity_in(blocks, *alloc);
+    let mut back_edges: OwnVec<(u32, u32), A> = OwnVec::new_in(*alloc);
     state[0] = 1;
     dfs.push((0, succ_starts[0]));
     while let Some(top) = dfs.last_mut() {
@@ -645,7 +645,7 @@ fn loop_depths<A: Allocator + Clone>(view: View<'_>, alloc: &A) -> Result<OwnVec
     back_edges.sort_unstable_by_key(|&(u, h)| (h, u));
     let mut seen_stamp = own_filled(blocks, 0u32, alloc);
     let mut stamp = 0u32;
-    let mut work: OwnVec<u32, A> = OwnVec::with_capacity_in(blocks, alloc.clone());
+    let mut work: OwnVec<u32, A> = OwnVec::with_capacity_in(blocks, *alloc);
     let mut i = 0;
     while i < back_edges.len() {
         let header = back_edges[i].1;
@@ -681,9 +681,9 @@ struct MaxHeap<T, A: Allocator> {
     data: OwnVec<T, A>,
 }
 
-impl<T: Ord, A: Allocator + Clone> MaxHeap<T, A> {
+impl<T: Ord, A: Allocator + Copy> MaxHeap<T, A> {
     fn new_in(alloc: &A) -> Self {
-        Self { data: OwnVec::new_in(alloc.clone()) }
+        Self { data: OwnVec::new_in(*alloc) }
     }
 
     fn push(&mut self, item: T) {
@@ -774,7 +774,7 @@ impl Ord for SiteCandidate<'_> {
 
 /// Scans node `n`'s blocks and pushes all policy-eligible call sites onto `heap`.
 #[expect(clippy::too_many_arguments)]
-fn enqueue_sites<'v, A: Allocator + Clone>(
+fn enqueue_sites<'v, A: Allocator + Copy>(
     nodes: &[Node<'v>],
     n: u32,
     root_site_for_node: usize,
@@ -926,7 +926,7 @@ fn enqueue_sites<'v, A: Allocator + Clone>(
 }
 
 /// Priority-scored planning for [`inline_guided`], canonicalized into DFS preorder for [`emit`].
-fn plan_guided<'v, A: Allocator + Clone>(
+fn plan_guided<'v, A: Allocator + Copy>(
     view: View<'v>,
     root: BodyId,
     bodies: &'v dyn Bodies,
@@ -935,8 +935,8 @@ fn plan_guided<'v, A: Allocator + Clone>(
     summaries: &mut Map<BodyId, FnSummary, FixedState, A>,
     alloc: &A,
 ) -> Result<(Vec<Node<'v>, A>, Map<(u32, usize), u32, FixedState, A>), InlineError> {
-    let mut raw_nodes: OwnVec<Node<'v>, A> = OwnVec::new_in(alloc.clone());
-    let mut raw_summaries: OwnVec<Option<FnSummary>, A> = OwnVec::new_in(alloc.clone());
+    let mut raw_nodes: OwnVec<Node<'v>, A> = OwnVec::new_in(*alloc);
+    let mut raw_summaries: OwnVec<Option<FnSummary>, A> = OwnVec::new_in(*alloc);
     let mut raw_children: Map<(u32, usize), u32, FixedState, A> = new_map(alloc);
     raw_nodes.push(Node { id: root, view, parent: NONE, site: 0, depth: 0 });
     raw_summaries.push(None);
@@ -998,9 +998,9 @@ fn plan_guided<'v, A: Allocator + Clone>(
 
     // Canonicalize surviving nodes into DFS preorder (children sorted by `site` ascending)
     // so `emit` visits every frame in exact layout order.
-    let mut adj: OwnVec<OwnVec<(usize, u32), A>, A> = OwnVec::with_capacity_in(raw_nodes.len(), alloc.clone());
+    let mut adj: OwnVec<OwnVec<(usize, u32), A>, A> = OwnVec::with_capacity_in(raw_nodes.len(), *alloc);
     for _ in 0..raw_nodes.len() {
-        adj.push(OwnVec::new_in(alloc.clone()));
+        adj.push(OwnVec::new_in(*alloc));
     }
     for i in 1..raw_nodes.len() {
         if alive[i] {
@@ -1012,9 +1012,9 @@ fn plan_guided<'v, A: Allocator + Clone>(
         list.sort_unstable_by_key(|&(site, _)| site);
     }
 
-    let mut ordered = Vec::with_capacity_in(raw_nodes.len(), alloc.clone());
+    let mut ordered = Vec::with_capacity_in(raw_nodes.len(), *alloc);
     let mut children: Map<(u32, usize), u32, FixedState, A> = new_map(alloc);
-    let mut stack: OwnVec<(u32, u32), A> = OwnVec::with_capacity_in(raw_nodes.len(), alloc.clone());
+    let mut stack: OwnVec<(u32, u32), A> = OwnVec::with_capacity_in(raw_nodes.len(), *alloc);
     // Stack holds `(raw_idx, new_parent_idx)`.
     stack.push((0, NONE));
     while let Some((raw_idx, new_parent)) = stack.pop() {
@@ -1088,7 +1088,7 @@ fn hash_val(v: impl Hash) -> u64 {
 
 /// O(1) expected-time table interning with exact equality check and collision fallback
 /// (matching [`crate::builder::Builder`]'s `intern` pattern).
-fn intern<A: Allocator + Clone>(
+fn intern<A: Allocator + Copy>(
     map: &mut Map<u64, u32, FixedState, A>,
     hash: u64,
     rows: u32,
@@ -1123,7 +1123,7 @@ fn resolve_semantic_target(
     None
 }
 
-struct Emit<'p, 'v, 'b, A: Allocator + Clone> {
+struct Emit<'p, 'v, 'b, A: Allocator + Copy> {
     nodes: &'p [Node<'v>],
     children: &'p Map<(u32, usize), u32, FixedState, A>,
     bodies: &'b dyn Bodies,
@@ -1159,7 +1159,7 @@ fn remap_range(range: u32, off: u32) -> u32 {
     }
 }
 
-impl<A: Allocator + Clone> Emit<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Emit<'_, '_, '_, A> {
     fn seed_interners(&mut self) {
         let out = &self.out;
         for (i, rec) in out.compounds.iter().enumerate() {
@@ -1318,7 +1318,7 @@ impl<A: Allocator + Clone> Emit<'_, '_, '_, A> {
         let view = self.nodes[frame as usize].view;
         let rec = view.sigs[sig as usize];
         let len = rec.params as usize + rec.rets as usize;
-        let mut params: OwnVec<ParamRec, A> = OwnVec::with_capacity_in(len, self.alloc.clone());
+        let mut params: OwnVec<ParamRec, A> = OwnVec::with_capacity_in(len, self.alloc);
         for param in &view.sig_params[rec.first as usize..][..len] {
             let mut param = *param;
             param.ty = self.ty(frame, Ty(param.ty))?.0;
@@ -1539,7 +1539,7 @@ impl<A: Allocator + Clone> Emit<'_, '_, '_, A> {
         if cached != NONE {
             return Ok(cached);
         }
-        let mut reloc_work: OwnVec<(usize, u32), A> = OwnVec::new_in(self.alloc.clone());
+        let mut reloc_work: OwnVec<(usize, u32), A> = OwnVec::new_in(self.alloc);
         let top = self.resolve_ref_step(frame, reference, inst, &mut reloc_work)?;
         let mut cursor = 0;
         while cursor < reloc_work.len() {
@@ -1693,7 +1693,7 @@ impl<A: Allocator + Clone> Emit<'_, '_, '_, A> {
         let number = self.begin(view.block_kind(Block(block)))?;
         self.frames[frame as usize].blocks[block as usize] = number;
         let params = view.params(Block(block));
-        for at in params.clone() {
+        for at in params.start..params.end {
             let ty = self.ty(frame, Ty(view.tys[at]))?;
             let (attrs, loc) = (self.attrs(frame, view.attrs[at]), self.loc(frame, view.locs[at]));
             let made = self.raw(Op::Param, view.flags[at], ty, 0, attrs, loc)?;
@@ -1853,7 +1853,7 @@ impl<A: Allocator + Clone> Emit<'_, '_, '_, A> {
 }
 
 /// The output: the plan's tree, spliced, plus any external references imported into `out.refs`.
-fn emit<A: Allocator + Clone>(
+fn emit<A: Allocator + Copy>(
     nodes: &[Node<'_>],
     children: &Map<(u32, usize), u32, FixedState, A>,
     bodies: &dyn Bodies,
@@ -1865,9 +1865,9 @@ fn emit<A: Allocator + Clone>(
     // No-op fast path: nothing spliced -> verify and copy directly.
     if nodes.len() == 1 {
         verify(view).map_err(InlineError::Verify)?;
-        return Ok((view.to_func_in(alloc.clone()), Vec::new_in(alloc.clone())));
+        return Ok((view.to_func_in(*alloc), Vec::new_in(*alloc)));
     }
-    let mut out = view.to_func_in(alloc.clone());
+    let mut out = view.to_func_in(*alloc);
     out.ops.clear();
     out.flags.clear();
     out.tys.clear();
@@ -1883,8 +1883,8 @@ fn emit<A: Allocator + Clone>(
         bodies,
         allow_external_refs,
         out,
-        frames: Vec::with_capacity_in(nodes.len(), alloc.clone()),
-        fixups: Vec::new_in(alloc.clone()),
+        frames: Vec::with_capacity_in(nodes.len(), *alloc),
+        fixups: Vec::new_in(*alloc),
         compound_rows: new_map(alloc),
         fact_rows: new_map(alloc),
         sig_rows: new_map(alloc),
@@ -1893,10 +1893,10 @@ fn emit<A: Allocator + Clone>(
         target_ref_rows: new_map(alloc),
         source_ref_rows: new_map(alloc),
         next_place: [0; 5],
-        imported_refs: Vec::new_in(alloc.clone()),
+        imported_refs: Vec::new_in(*alloc),
         scoped: !view.span_scopes.is_empty(),
         swap,
-        alloc: alloc.clone(),
+        alloc: *alloc,
     };
     e.seed_interners();
     e.frames.push(Frame {
@@ -1908,11 +1908,11 @@ fn emit<A: Allocator + Clone>(
         span_off: 0,
         range_off: 0,
         mem_off: 0,
-        refs: Vec::new_in(alloc.clone()),
-        sigs: Vec::new_in(alloc.clone()),
-        intrinsics: Vec::new_in(alloc.clone()),
+        refs: Vec::new_in(*alloc),
+        sigs: Vec::new_in(*alloc),
+        intrinsics: Vec::new_in(*alloc),
     });
-    let mut stack: OwnVec<Cursor, A> = OwnVec::new_in(alloc.clone());
+    let mut stack: OwnVec<Cursor, A> = OwnVec::new_in(*alloc);
     let at = e.body_block(0, 0)?;
     stack.push(Cursor { frame: 0, block: 0, at });
     while let Some(&cursor) = stack.last() {

@@ -41,6 +41,7 @@
 use std::alloc::Allocator;
 
 use blaze_core::{Effect, Extent};
+use blaze_own::Share;
 use blaze_keyed::{
     kind::{Namespace, ReservedTag, Tag},
     store::StoreError,
@@ -318,7 +319,7 @@ impl<A: Allocator + Clone> Plain<A> {
     pub fn placed(&self, found: Found) -> Option<Placed> {
         let At::Mapped { map, entry } = found.at else { return None };
         let mapped = &self.maps[map];
-        Some(Placed { key: found.key, tag: entry.tag, namespace: mapped.seg().namespace, segment: mapped.seg().digest, file: mapped.file().clone(), at: entry.at, len: entry.len })
+        Some(Placed { key: found.key, tag: entry.tag, namespace: mapped.seg().namespace, segment: mapped.seg().digest, file: mapped.file().share(), at: entry.at, len: entry.len })
     }
 
     /// One row's map asked, within the grace of the open (see the module's docs).
