@@ -358,6 +358,15 @@ impl<'s> ScriptQueue<'s> {
         self.order.is_empty()
     }
 
+    /// True when every queued script task is an instantaneously-answered `Given` cell (zero
+    /// `Script` or `MacroModule` tasks queued, waiting, or running). Finishing `Given` cells
+    /// before admitting `Stage::Names` is worker-count invariant, keeps `Scripts` at 0 crate
+    /// records read when no script runs, and lets `Names` run at full width once it is known
+    /// whether any `Script` woke up.
+    fn only_given(&self) -> bool {
+        !self.order.is_empty() && self.order.values().all(|task| task.planned.name.kind == Kind::Given)
+    }
+
     pub(crate) fn is_finished(&self, name: Name) -> bool { self.answered.contains_key(&name) }
 
     pub(crate) fn waiter(&self) -> &'s blaze_core::wait::Parker { self.waiter }
@@ -1382,6 +1391,14 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
             scripts.submit(cx, store, handles, names, engine.tasks(), &mut self.scripts, frame)?;
             handles.board.phase_ended(mark, 0, handles.board.now(&handles.env.clock));
             self.script_reads.clear();
+        }
+        // When only `Given` cells are queued in `Stage::Scripts` (no `Script` or `MacroModule`
+        // task queued), finish and merge that instant batch before admitting `Stage::Names`
+        // (which opens dependency crate records via `EngineRecords`). That is worker-count
+        // invariant, keeps `Scripts` at 0 crate records read when no script runs, and lets
+        // `Names` run at full unthrottled width once it is known whether any `Script` woke up.
+        if self.scripts.only_given() {
+            return Ok(());
         }
         #[cfg(test)]
         if runner_clock().is_some_and(|clock| clock.global_names_barrier()) && (!self.scripts.is_empty() || engine.has_pending_stage(Stage::Scripts)) {

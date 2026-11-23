@@ -450,3 +450,70 @@ fn status_replay_observes_index_mode_links_and_root_entries() {
     check(TRACKED, None);
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// When `Stage::Scripts` enters only `Given` tasks (0 `Script` runs), `Scripts` finishes its
+/// synchronous `Given` cells before admitting `Stage::Names` and reads 0 crate records (0 bytes),
+/// while `Stage::Names` still opens its dependency exports and matches a fresh oracle.
+#[test]
+fn scripts_with_only_given_tasks_reads_zero_crate_records() {
+    use blaze_engine::Stage;
+
+    const WORKSPACE: &str = "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n";
+    const A_MANIFEST: &str = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+    const B_MANIFEST: &str = "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\na = { path = \"../a\" }\n";
+    const A_LIB: &str = "#![no_core]\npub struct Tag;\n";
+    const B_LIB: &str = "#![no_core]\n\
+        extern crate a;\n\
+        #[rustc_builtin_macro]\nmacro_rules! include_str { () => {} }\n\
+        #[rustc_builtin_macro]\nmacro_rules! concat { () => {} }\n\
+        pub fn use_a(x: a::Tag) -> a::Tag { x }\n\
+        pub fn target() { let _ = include_str!(concat!(\"../assets/\", \"g.json\")); }\n";
+    const B_LIB_EDITED: &str = "#![no_core]\n\
+        extern crate a;\n\
+        #[rustc_builtin_macro]\nmacro_rules! include_str { () => {} }\n\
+        #[rustc_builtin_macro]\nmacro_rules! concat { () => {} }\n\
+        pub fn use_a(x: a::Tag) -> a::Tag { x }\n\
+        pub fn target() { let _ = include_str!(concat!(\"../assets/\", \"g.json\")); }\n\
+        fn _private_helper() {}\n";
+
+    let build_world = |b_lib: &str, data: &str| {
+        let io = Io::simulated(SimWorld::new(83, Limits::USUAL));
+        write(&io, "Cargo.toml", WORKSPACE);
+        write(&io, "a/Cargo.toml", A_MANIFEST);
+        write(&io, "a/src/lib.rs", A_LIB);
+        write(&io, "b/Cargo.toml", B_MANIFEST);
+        write(&io, "b/src/lib.rs", b_lib);
+        write(&io, "b/assets/g.json", data);
+        io
+    };
+
+    for workers in [1, 2] {
+        let io = build_world(B_LIB, "one\n");
+        let (cold_ids, _) = super::engine_check_tests::engine_from(&io, workers, false);
+        assert!(cold_ids.is_empty(), "cold check clean: {cold_ids:?}");
+
+        // Edit the computed data include (enters 1 Given task in Stage::Scripts, 0 Script tasks)
+        // AND add a private fn in `b` (enters `b`'s CrateScope in Stage::Names, which reads `a`).
+        write(&io, "b/assets/g.json", "two\n");
+        write(&io, "b/src/lib.rs", B_LIB_EDITED);
+        let (ids, checked) = super::engine_check_tests::engine_from(&io, workers, false);
+
+        assert_eq!(checked.stages[Stage::Scripts.index()].entered, 1, "workers={workers}: exactly the 1 Given task enters Scripts");
+        assert!(checked.stages[Stage::Names.index()].entered >= 1, "workers={workers}: b's CrateScope enters Names");
+        let script_reads = checked.records.reads[Stage::Scripts.index()];
+        assert_eq!(
+            (script_reads.records, script_reads.bytes),
+            (0, 0),
+            "workers={workers}: Scripts with only Given tasks must read 0 crate records: {script_reads:?}"
+        );
+        let names_reads = checked.records.reads[Stage::Names.index()];
+        assert!(
+            names_reads.records >= 1,
+            "workers={workers}: Names must read b's dependency exports itself: {names_reads:?}"
+        );
+
+        let (fresh_ids, fresh) = super::engine_check_tests::engine_from(&build_world(B_LIB_EDITED, "two\n"), workers, true);
+        assert_eq!(ids, fresh_ids, "workers={workers}: incremental answer matches fresh oracle");
+        assert_eq!(checked.status.0, fresh.status.0, "workers={workers}: incremental status matches fresh oracle");
+    }
+}
