@@ -543,15 +543,17 @@ pub(crate) enum PagedPlant {
     Misses,
 }
 
-/// The ready path's head entries: a head task's row read where the stored answer keeps it, on
-/// the first ask (blaze-engine `StoredPages::header`, from the row's own page: the ready path's
-/// header index is absent, engine_check.rs `checking`). No head task enters on the ready path
-/// (engine_ready_edit.rs `admit`), so the stored row is today's: a row is planned today when its
-/// file is not edited (the file's plan digest stands) or an edited file's plan lists it.
+/// On-demand head entries: a head task's row is served from a small sorted in-memory `overlay`
+/// of `Signature` tasks that ran in `Stage::Heads` during this request (empty on the ready path),
+/// and on miss read where the stored answer keeps it, on the first ask (blaze-engine
+/// `StoredPages::header`, from the row's own page). A stored row is planned today when its file
+/// is not edited (the file's plan digest stands) or an edited file's plan lists it.
 pub(crate) struct PagedHeads<'p> {
     pages: &'p dyn blaze_engine::StoredPages,
     /// Today's plan of each edited file (the engine's `Edit`), a deleted one's empty.
     files: &'p [(Name, &'p [Planned])],
+    /// Sorted overlay of `Signature` rows updated by `Stage::Heads` during this request.
+    overlay: blaze_own::Vec<(Name, HeadEntry), SharedAlloc<'static>>,
     found: blaze_core::SharedMap<Name, HeadEntry, SharedAlloc<'static>>,
     records: AtomicU32,
     fault: std::sync::OnceLock<&'static str>,
@@ -560,7 +562,27 @@ pub(crate) struct PagedHeads<'p> {
 
 impl<'p> PagedHeads<'p> {
     pub(crate) fn new(pages: &'p dyn blaze_engine::StoredPages, files: &'p [(Name, &'p [Planned])], plant: PagedPlant, heap: &'static blaze_own::Heap) -> PagedHeads<'p> {
-        PagedHeads { pages, files, found: blaze_core::SharedMap::new_in("engine.head task rows found on the stored answer's pages", heap.shared()), records: AtomicU32::new(0), fault: std::sync::OnceLock::new(), plant }
+        Self::with_overlay(pages, files, blaze_own::Vec::new_in(heap.shared()), plant, heap)
+    }
+
+    /// [`Self::new`] with a sorted in-memory `overlay` of `Signature` rows produced in
+    /// `Stage::Heads` this request, checked before paging from `pages`.
+    pub(crate) fn with_overlay(
+        pages: &'p dyn blaze_engine::StoredPages,
+        files: &'p [(Name, &'p [Planned])],
+        overlay: blaze_own::Vec<(Name, HeadEntry), SharedAlloc<'static>>,
+        plant: PagedPlant,
+        heap: &'static blaze_own::Heap,
+    ) -> PagedHeads<'p> {
+        PagedHeads {
+            pages,
+            files,
+            overlay,
+            found: blaze_core::SharedMap::new_in("engine.head task rows found on the stored answer's pages", heap.shared()),
+            records: AtomicU32::new(0),
+            fault: std::sync::OnceLock::new(),
+            plant,
+        }
     }
 
     /// `name`'s entry, read once a request.
@@ -580,11 +602,14 @@ impl<'p> PagedHeads<'p> {
         }
     }
 
-    /// [`HeadEntries::Built`]'s answer for `name`, from its stored row: a planned `Signature`
-    /// task's row, failed, or holding a record (one no unit holds holds none).
+    /// [`HeadEntries::Built`]'s answer for `name`, from the moved-heads overlay or its stored row:
+    /// a planned `Signature` task's row, failed, or holding a record (one no unit holds holds none).
     fn read(&self, name: Name) -> HeadEntry {
         if name.kind != Kind::Signature || self.plant == PagedPlant::Misses {
             return HeadEntry::None;
+        }
+        if let Some(&(_, entry)) = self.overlay.binary_search_by_key(&name, |(one, _)| *one).ok().and_then(|at| self.overlay.get(at)) {
+            return entry;
         }
         let header = match self.pages.header(name) {
             Ok(Some(header)) => header,

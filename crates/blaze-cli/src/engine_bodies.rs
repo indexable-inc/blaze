@@ -2399,6 +2399,280 @@ impl OwedListing {
     }
 }
 
+/// One packed or unread dependency file's outlined `FileItemsView` bytes, cached once per phase
+/// so stretches do not re-lex, re-outline, or re-digest immutable dependency files and never leak
+/// temporary `Outline` ASTs into a stretch's bump frame.
+struct CachedDepFile {
+    world_at: usize,
+    index: u32,
+    edition: u8,
+    text_len: usize,
+    surface: ContentId,
+    bytes: Vec<u8, SharedAlloc<'static>>,
+}
+
+/// Power-of-two slot count for [`DependencyFiles`]'s lock-free direct-mapped cache.
+const DEP_FILE_SLOTS: usize = 512;
+
+/// Lock-free request-wide cache of outlined dependency files (owned by [`Prepared`], dropped with
+/// the phase): uses `PublishOnce` slots allocated on first miss so zero locks are constructed.
+struct DependencyFiles {
+    slots: bstd::sync::PublishOnce<Vec<bstd::sync::PublishOnce<CachedDepFile>, SharedAlloc<'static>>>,
+    heap: &'static blaze_own::Heap,
+}
+
+impl DependencyFiles {
+    fn new(heap: &'static blaze_own::Heap) -> DependencyFiles {
+        DependencyFiles { slots: bstd::sync::PublishOnce::new(), heap }
+    }
+
+    fn slot_index(world_at: usize, index: u32, edition: u8) -> usize {
+        let idx = usize::try_from(index).unwrap_or(0);
+        let h = world_at.wrapping_mul(0x9E37_79B9) ^ idx.wrapping_mul(0x85EB_CA6B) ^ usize::from(edition);
+        h & (DEP_FILE_SLOTS - 1)
+    }
+
+    fn get_or_outline<'n>(
+        &self,
+        world_at: usize,
+        index: u32,
+        text: &'n str,
+        edition: blaze_surface::Edition,
+        bump: blaze_own::Bump<'n>,
+    ) -> Result<blaze_scope::items_record::CurrentFile<'n>, blaze_scope::items_record::ItemsRecordError> {
+        let ed = edition.byte();
+        let at = Self::slot_index(world_at, index, ed);
+        if let Some(slots) = self.slots.get()
+            && let Some(cached) = slots.get(at).and_then(|slot| slot.get())
+            && cached.world_at == world_at
+            && cached.index == index
+            && cached.edition == ed
+            && cached.text_len == text.len()
+        {
+            let view = blaze_surface::FileItemsView::read(blaze_scope::resolve::aligned(&cached.bytes, bump))
+                .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsRead { file: index, why })?;
+            return Ok(blaze_scope::items_record::CurrentFile { view, text, surface: cached.surface });
+        }
+        let alloc = self.heap.alloc();
+        let outline = blaze_file_items::outline(text, edition, alloc);
+        let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
+        let raw = outline.to_file_items(text, digest, alloc)
+            .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsBuild { file: index, why })?;
+        let surface = outline.surface();
+        let mut bytes: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(raw.len(), self.heap.shared());
+        bytes.extend_from_slice(&raw);
+        let view = blaze_surface::FileItemsView::read(blaze_scope::resolve::aligned(&bytes, bump))
+            .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsRead { file: index, why })?;
+        let slots = match self.slots.get() {
+            Some(slots) => Some(slots),
+            None => {
+                let table = Vec::from_iter_in((0..DEP_FILE_SLOTS).map(|_| bstd::sync::PublishOnce::new()), self.heap.shared());
+                let _ = self.slots.set(table);
+                self.slots.get()
+            }
+        };
+        if let Some(slot) = slots.and_then(|slots| slots.get(at)) {
+            let _ = slot.set(CachedDepFile { world_at, index, edition: ed, text_len: text.len(), surface, bytes });
+        }
+        Ok(blaze_scope::items_record::CurrentFile { view, text, surface })
+    }
+}
+
+/// Whether `outlines` (sorted by slot `Name`) holds the planned outline for checkout path `real`
+/// (either at its literal path or at its `x.rs` module slot for `x/mod.rs`).
+fn outline_exists(outlines: &[Outlined<'_>], real: &str, alloc: blaze_own::Alloc<'_>) -> bool {
+    let locate = |slot: Name| {
+        outlines
+            .binary_search_by_key(&slot, |one| one.name)
+            .ok()
+            .and_then(|i| outlines.get(i))
+            .is_some_and(|one| one.path.as_slice() == real.as_bytes())
+    };
+    if locate(Name::file(real.as_bytes())) {
+        return true;
+    }
+    let Some(stem) = real.strip_suffix("/mod.rs") else { return false };
+    let mut slot = blaze_own::AVec::from_slice_in(stem.as_bytes(), alloc);
+    slot.extend_from_slice(b".rs");
+    locate(Name::file(&slot))
+}
+
+/// Stretch-local [`blaze_ladder::front2::source::Load`] over [`crate::front_load::StoreLoad`]:
+/// reuses each crate's already-verified `CrateRecords::names_proof` (avoiding repeat
+/// `Verified::check` per stretch), answers `proc_macro` directly from the crate graph (avoiding
+/// opening unused dependency `CrateScope` records during impl lookup), uses planned outlines
+/// whenever present, and caches outlined packed/unread dependency files across stretches.
+struct BodiesLoad<'n> {
+    inner: &'n crate::front_load::StoreLoad<'n>,
+    crates: crate::front_load::CratesFrom<'n>,
+    texts: &'n crate::job_texts::JobTexts<'n>,
+    world_ats: &'n [usize],
+    packages: &'n [&'n str],
+    list: &'n blaze_world::crate_list::CrateList<'static>,
+    outlines: &'n [Outlined<'n>],
+    has_unread_outlines: bool,
+    dep_files: &'n DependencyFiles,
+    alloc: blaze_own::Alloc<'n>,
+}
+
+impl<'n> blaze_ladder::front2::source::Load<'n> for BodiesLoad<'n> {
+    fn names(&self, krate: usize) -> Option<&'n [u8]> {
+        self.inner.names(krate)
+    }
+
+    fn names_verified(&self, krate: usize) -> Option<blaze_scope::names_record::Verified<'n>> {
+        // On `Err`, return `None` so `VerifiedNames` falls back to `self.names(krate)`, recording
+        // `StoreLoad::refused` and logging `SourceError::NoRecord`.
+        self.crates.records(krate)?.ok().map(|records| records.names_proof)
+    }
+
+    fn items(&self, krate: usize) -> Option<&'n [u8]> {
+        self.inner.items(krate)
+    }
+
+    fn proc_macro(&self, krate: usize) -> Option<bool> {
+        self.world_ats.get(krate).map(|&at| CrateGraph::proc_macro(self.list, at))
+    }
+
+    fn file(&self, krate: usize, path: blaze_scope::package_path::PackagePath<'_>) -> Option<&'n str> {
+        self.inner.file(krate, path)
+    }
+
+    fn file_items(
+        &self,
+        krate: usize,
+        index: u32,
+        path: blaze_scope::package_path::PackagePath<'_>,
+        surface: ContentId,
+        edition: blaze_surface::Edition,
+        bump: blaze_own::Bump<'n>,
+    ) -> Result<Option<blaze_scope::items_record::CurrentFile<'n>>, blaze_scope::items_record::ItemsRecordError> {
+        let Some(package) = self.packages.get(krate) else { return Ok(None) };
+        let Some(full) = path.in_package(package, self.alloc) else { return Ok(None) };
+        if let Some(real) = full.strip_prefix("/0/")
+            && (!self.has_unread_outlines || outline_exists(self.outlines, real, self.alloc))
+        {
+            return self.inner.file_items(krate, index, path, surface, edition, bump);
+        }
+        let Some(text) = blaze_scope::resolve::SourceTexts::read(self.texts, krate, &full) else {
+            return Ok(None);
+        };
+        let Some(&world_at) = self.world_ats.get(krate) else {
+            return blaze_scope::items_record::CurrentFile::from_text(index, text, edition, bump).map(Some);
+        };
+        self.dep_files.get_or_outline(world_at, index, text, edition, bump).map(Some)
+    }
+
+    fn expansion(&self, krate: usize, call: ItemKey) -> Option<blaze_ladder::front2::source::LoadedExpansion<'n>> {
+        self.inner.expansion(krate, call)
+    }
+}
+
+/// Opens one stretch's `Records` directly over [`BodiesLoad`], matching
+/// `run_names::names_records_over` while reusing verified names proofs, crate-graph `proc_macro`
+/// flags, planned outlines, and cached dependency file outlines.
+#[inline(never)]
+#[expect(clippy::too_many_arguments, reason = "a stretch's records edge: each argument one input of them")]
+fn open_stretch_records<'n>(
+    cx: &'n Cx,
+    root: &'n Dir<ReadWrite>,
+    crates: crate::run_names::ScopeCrates<'_, 'n>,
+    list: &'n blaze_world::crate_list::CrateList<'static>,
+    packs: crate::job_texts::Packs<'n>,
+    outlines: &'n [Outlined<'n>],
+    has_unread_outlines: bool,
+    dep_files: &'n DependencyFiles,
+    corrected: &'n [(u32, &'n str, &'n str)],
+    procs: Option<&'n crate::proc_runner::ProcRunner<'static>>,
+    env: Option<&'n blaze_scope::crate_env::CrateEnv<'n>>,
+    snapshot: &'n StoreSnapshot,
+    expansion_keys: &'n SharedSet<Key, SharedAlloc<'static>>,
+    frame: &'n Frame,
+    g: blaze_own::Alloc<'static>,
+) -> crate::run_names::Opened<'n> {
+    use core::cell::RefCell;
+    let count = crates.len();
+    let mut crate_names: Vec<&'n str, &'n Frame> = Vec::with_capacity_in(count, frame);
+    let mut packages: Vec<&'n str, &'n Frame> = Vec::with_capacity_in(count, frame);
+    let mut world_ats: Vec<usize, &'n Frame> = Vec::with_capacity_in(count, frame);
+    let mut callers: Vec<(usize, usize, blaze_expand::Edition), &'n Frame> = Vec::with_capacity_in(count, frame);
+    let mut by_need: Option<(&'n [crate::front_load::Unopened], &'n dyn crate::front_load::OpenByNeed)> = None;
+    let from = match crates {
+        crate::run_names::ScopeCrates::Opened(crates) => {
+            let mut records: Vec<crate::front_load::CrateRecords<'n>, &'n Frame> = Vec::with_capacity_in(count, frame);
+            for (at, one) in crates.iter().enumerate() {
+                records.push(one.records);
+                crate_names.push(one.name);
+                packages.push(one.package);
+                world_ats.push(one.world_at);
+                callers.push((at, one.world_at, one.records.edition));
+            }
+            crate::front_load::CratesFrom::Opened(records.into_bump_slice())
+        }
+        crate::run_names::ScopeCrates::ByNeed(scope) => {
+            crate_names.push(scope.own.name);
+            packages.push(scope.own.package);
+            world_ats.push(scope.own.world_at);
+            callers.push((0, scope.own.world_at, scope.own.records.edition));
+            by_need = Some((scope.rest, scope.records));
+            for one in scope.rest {
+                crate_names.push(one.name);
+                packages.push(one.package);
+                world_ats.push(one.world_at);
+            }
+            crate::front_load::CratesFrom::ByNeed { own: scope.own.records, rest: scope.rest, records: scope.records }
+        }
+    };
+    let crate_names: &'n [&'n str] = crate_names.into_bump_slice();
+    let packages: &'n [&'n str] = packages.into_bump_slice();
+    let world_ats: &'n [usize] = world_ats.into_bump_slice();
+    let callers: &'n [(usize, usize, blaze_expand::Edition)] = callers.into_bump_slice();
+    let texts: &'n crate::job_texts::JobTexts<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
+        crate::job_texts::JobTexts {
+            cx,
+            root,
+            frame,
+            packs,
+            corrected,
+            env: env.map(|env| (0, env)),
+            envs: None,
+            read: RefCell::new(std::vec::Vec::new_in(Global)),
+            unread: RefCell::new(Vec::new_in(frame)),
+            data: RefCell::new(std::vec::Vec::new_in(Global)),
+            left: RefCell::new(std::vec::Vec::new_in(Global)),
+            procs: crate::job_texts::Procs::of(procs),
+            own: None,
+            callers,
+            by_need,
+            run_stopped: core::cell::Cell::new(None),
+            activity: None,
+        },
+        frame,
+    ));
+    let storage = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(blaze_own::Erased::new(frame), frame));
+    let alloc = storage.handle();
+    let load: &'n crate::front_load::StoreLoad<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
+        crate::front_load::StoreLoad::from_crates(from, packages, texts, Some(snapshot), Some(expansion_keys), Some(outlines), alloc),
+        frame,
+    ));
+    let bodies_load: &'n BodiesLoad<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
+        BodiesLoad { inner: load, crates: from, texts, world_ats, packages, list, outlines, has_unread_outlines, dep_files, alloc },
+        frame,
+    ));
+    let log: &'n blaze_ladder::front2::source::Log<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
+        blaze_ladder::front2::source::Log::new(crate_names, g),
+        frame,
+    ));
+    let keys = load.keys(frame);
+    let records: &'n blaze_ladder::front2::source::Records<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
+        blaze_ladder::front2::source::Records::new(keys, bodies_load, log, frame, g),
+        frame,
+    ));
+    let sources: &'n blaze_ladder::front2::body_host::Sourced<'n, crate::job_texts::JobTexts<'n>> =
+        blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(blaze_ladder::front2::body_host::Sourced(texts), frame));
+    crate::run_names::Opened { records, load, sources }
+}
+
 /// A Bodies phase's setup ([`BodiesStage::prepare`]): what every body check of the phase reads,
 /// made once on the coordinator and read by its runs through [`Prepared::runner`] from any
 /// worker. Owned here,
@@ -2408,6 +2682,8 @@ pub(crate) struct Prepared<'s, 'f, 'r> {
     /// The store's committed snapshot, for lazy expansion texts.
     snapshot: crate::store::SharedSnapshot,
     expansion_keys: SharedSet<Key, SharedAlloc<'static>>,
+    /// Outlined dependency files cached once per phase across all stretches.
+    dep_files: DependencyFiles,
     /// Each member's check scope, files and item keys (`groups`); `None` when the stage stopped
     /// (every task's row is then in the phase's buffer, filed by `prepare`).
     found: Option<Found<'f, 'r>>,
@@ -2541,6 +2817,8 @@ pub(crate) struct BodyRunner<'v, 'f, 'r> {
     /// The request's scope records opened by need ([`Prepared::scope_records`]): every run's
     /// crates past its member ([`GroupCrates::ByNeed`]) are opened here at their first question.
     by_need: &'v dyn crate::front_load::OpenByNeed,
+    /// Outlined dependency files cached once per phase across stretches.
+    dep_files: &'v DependencyFiles,
 }
 
 /// A body a run was asked for that its setup did not leave to check (rule 19), in the owned,
@@ -2590,6 +2868,7 @@ impl<'v, 'f, 'r> BodyRunner<'v, 'f, 'r> {
             has_unread_outlines: self.has_unread_outlines,
             plants: self.plants,
             by_need: self.by_need,
+            dep_files: self.dep_files,
         }
     }
 
@@ -2645,6 +2924,7 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
             ones: self.ones,
             clock: self.clock,
             by_need,
+            dep_files: &self.dep_files,
         }
     }
 
@@ -2676,9 +2956,15 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
     /// referenced by `self.ones`) ONCE in parallel across `workers` before body stretches begin,
     /// avoiding redundant nested spawns and `OnceLock` contention across concurrent stretches.
     pub(crate) fn pre_open_lang(&self, cx: &Cx, by_need: &LazyScopeRecords<'_>, workers: NonZeroU32) {
-        let Some(found) = self.found.as_ref() else { return };
+        self.pre_open_lang_with(cx, by_need, workers, |_| ());
+    }
+
+    /// Runs `work` on the current thread while pre-opening the distinct lang crates (`core`,
+    /// `alloc`, `std`, `bstd`) of active groups in parallel on `workers`.
+    pub(crate) fn pre_open_lang_with<T>(&self, cx: &Cx, by_need: &LazyScopeRecords<'_>, workers: NonZeroU32, work: impl FnOnce(&Cx) -> T) -> T {
+        let Some(found) = self.found.as_ref() else { return work(cx) };
         if self.ones.is_empty() || workers.get() <= 1 {
-            return;
+            return work(cx);
         }
         let mut to_open: [Option<&crate::front_load::Unopened>; 8] = [None; 8];
         let mut count = 0usize;
@@ -2709,7 +2995,7 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
             }
         }
         if count < 2 {
-            return;
+            return work(cx);
         }
         let pre_cx = cx.span("engine: pre-open lang crates");
         let scope = pre_cx.scope();
@@ -2721,10 +3007,12 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
                 Ok::<_, Infallible>(())
             }));
         }
+        let out = work(cx);
         for handle in handles.into_iter() {
             let _ = handle.join(&pre_cx);
         }
         let _ = scope.join(&pre_cx);
+        out
     }
 
     /// The `Ready` driver's bodies joined into `stage` (D187): the runs its `BodyCheck` kind
@@ -2881,6 +3169,10 @@ impl<'f> BodiesStage<'f> {
     /// member, refuses the ready request ([`crate::engine_ready_edit::ReadyRefused::Members`],
     /// rule 3), never a reach guessed.
     #[expect(clippy::too_many_arguments, reason = "the plan's edge: each argument one handle of it")]
+    pub(crate) fn reach(&self) -> Option<&Reach> {
+        self.reach.as_ref()
+    }
+
     pub(crate) fn plan_reach<'r>(
         &mut self,
         cx: &Cx,
@@ -3393,6 +3685,7 @@ impl<'f> BodiesStage<'f> {
         Ok(Prepared {
             snapshot: snapshot_owner,
             expansion_keys,
+            dep_files: DependencyFiles::new(heap),
             found,
             ones,
             outlined: handles.outlined,
@@ -5333,6 +5626,8 @@ struct Shared<'s, 'a, 'f, 'r, R: ?Sized + CellDigests> {
     plants: RowPlants,
     /// The request's scope records opened by need ([`BodyRunner::by_need`]).
     by_need: &'s dyn crate::front_load::OpenByNeed,
+    /// Outlined dependency files cached once per phase across stretches.
+    dep_files: &'s DependencyFiles,
 }
 
 impl<R: ?Sized + CellDigests> Shared<'_, '_, '_, '_, R> {
@@ -5873,12 +6168,25 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
         Ok(env) => env,
         Err(error) => return refuse(run, leak(g, format_args!("its member's environment did not copy into the run: {error:?} (blaze-scope crate_env.rs `EnvLent::copy_in`)")), scope, out, ran, run_out, alloc),
     };
-    let files = ((shared.packs, shared.fs), (!shared.has_unread_outlines).then_some(shared.outlined));
     // Its scope crates past the member opened by need, at their first question, through the
     // request's memo (`shared.by_need`, piece C (a)); the oracle arm's all opened at the setup.
-    let Ok(opened) = crate::run_names::names_records_over(cx, shared.root, group.crates.scope(shared.by_need), files, shared.corrected, shared.procs, std::vec::Vec::new_in(Global), env, Some(shared.snapshot), Some(shared.expansion_keys), frame, g) else {
-        return refuse(run, "its member's records could not be opened in the run", scope, out, ran, run_out, alloc);
-    };
+    let opened = open_stretch_records(
+        cx,
+        shared.root,
+        group.crates.scope(shared.by_need),
+        &group.list,
+        (shared.packs, shared.fs).into(),
+        shared.outlined,
+        shared.has_unread_outlines,
+        shared.dep_files,
+        shared.corrected,
+        shared.procs,
+        env,
+        shared.snapshot,
+        shared.expansion_keys,
+        frame,
+        g,
+    );
     let set_records = clock.now();
     let unused: &Recorder<'_> = frame.alloc(Recorder::new(RecorderOpts { alloc: fa }));
     let tables = Tables::new(TablesOpts { records: opened.records, impls: Some(impls), lang_crates: &group.lang, reads: unused });

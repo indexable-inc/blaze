@@ -26,19 +26,19 @@
 //! reads the log after each body ([`Records::errors`]) and, when it is not empty, prints those
 //! INSTEAD of the body's result: the result of a body checked over a logged error is void.
 
-use core::cell::{Cell, Ref, RefCell};
+use core::cell::{Cell, OnceCell, Ref, RefCell};
 
 use blaze_hash::HashMap;
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_own::{ARc, AVec, Alloc, Bump, Erased, LocalShare};
 use blaze_scope::attr_values::{RowRefusal, RowValue};
 use blaze_scope::items_record::{CurrentFile, ImplRow, ItemsDecoded, ItemsRecord, ItemsRecordError, LoadItems, RecordItems};
-use blaze_scope::names::{self, PathError, Resolved, Unheld, Why, Written};
-use blaze_scope::names_record::{Decoded, LoadNames, NamesRecord, NamesRecordError, RecordNames};
+use blaze_scope::names::{self, PathError, Resolved, Unheld, VariantHit, Why, World, Written};
+use blaze_scope::names_record::{Decoded, NamesRecord, NamesRecordError, Verified};
 use blaze_scope::package_path::PackagePath;
 use blaze_scope::resolve::{Names, Place};
 use blaze_scope::task::{ItemText, MacroBody, MacroSrc, Variant};
-use blaze_surface::{Def, Edition, ItemDetail, ItemIndex, ItemKind, Namespace, ThroughScratch};
+use blaze_surface::{CrateRootView, Def, Edition, ItemDetail, ItemIndex, ItemKind, Namespace, ScopeView, ThroughScratch};
 
 mod item_grain;
 
@@ -906,6 +906,16 @@ pub trait Load<'n> {
     fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, _surface: blaze_id::ContentId, edition: Edition, bump: Bump<'n>) -> Result<Option<CurrentFile<'n>>, ItemsRecordError> {
         self.file(krate, path).map(|text| CurrentFile::from_text(index, text, edition, bump)).transpose()
     }
+    /// An already-verified names record proof for crate `krate` (rule 74), avoiding redundant
+    /// `Verified::check` per stretch when the caller verified the record once at load time.
+    fn names_verified(&self, _krate: usize) -> Option<Verified<'n>> {
+        None
+    }
+    /// Whether crate `krate` is a proc-macro crate when known from the crate graph without
+    /// opening its `ItemsRecord` (still recorded as `NameCell::Root` by `Tables::proc_macro`).
+    fn proc_macro(&self, _krate: usize) -> Option<bool> {
+        None
+    }
 }
 
 /// One read of an expansion's record ([`Load::expansion`]): the text and its origins, both
@@ -940,13 +950,100 @@ pub struct Loader<'n> {
     origins: ARc<'n, OriginParts<'n>>,
 }
 
-impl<'n> LoadNames<'n> for Loader<'n> {
-    fn load(&self, krate: usize) -> Option<&'n [u8]> {
-        let bytes = self.load.names(krate);
-        if bytes.is_none() {
-            self.log.put(SourceError::NoRecord { krate, name: self.log.name(krate), which: Which::Names });
+/// Names records reader using pre-verified [`Verified`] proofs from [`Load::names_verified`]
+/// when available (O(1), zero re-verification per stretch), falling back to [`Verified::check`].
+struct VerifiedNames<'n> {
+    by_prefix: HashMap<[u8; 8], usize, Alloc<'n>>,
+    proofs: AVec<'n, OnceCell<Option<Verified<'n>>>>,
+    load: &'n dyn Load<'n>,
+    log: &'n Log<'n>,
+}
+
+impl<'n> VerifiedNames<'n> {
+    fn new(keys: &[CrateItemKey], load: &'n dyn Load<'n>, log: &'n Log<'n>, alloc: Alloc<'n>) -> VerifiedNames<'n> {
+        let mut by_prefix = HashMap::new_in(alloc);
+        for (i, k) in keys.iter().enumerate() {
+            by_prefix.insert(k.prefix(), i);
         }
-        bytes
+        let mut proofs = AVec::with_capacity_in(keys.len(), alloc);
+        proofs.resize_with(keys.len(), OnceCell::new);
+        VerifiedNames { by_prefix, proofs, load, log }
+    }
+
+    fn crate_of(&self, key: ItemKey) -> Option<usize> {
+        self.by_prefix.get(&key.crate_prefix()).copied()
+    }
+
+    fn record(&self, krate: usize) -> Option<NamesRecord<'n>> {
+        let proof = self.proofs.get(krate)?.get_or_init(|| {
+            if let Some(proof) = self.load.names_verified(krate) {
+                return Some(proof);
+            }
+            let Some(bytes) = self.load.names(krate) else {
+                self.log.put(SourceError::NoRecord { krate, name: self.log.name(krate), which: Which::Names });
+                return None;
+            };
+            match Verified::check(bytes) {
+                Ok(proof) => Some(proof),
+                Err(error) => {
+                    self.log.put(SourceError::Names { krate, name: self.log.name(krate), error });
+                    None
+                }
+            }
+        });
+        proof.map(NamesRecord::open)
+    }
+
+    fn decoded(&self) -> Decoded {
+        let mut sum = Decoded::default();
+        for proof in self.proofs.iter().filter_map(|c| c.get()).flatten() {
+            sum.crates += 1;
+            sum.bytes += proof.byte_len();
+        }
+        sum
+    }
+
+    fn of(&self, key: ItemKey) -> Option<NamesRecord<'n>> {
+        self.record(self.crate_of(key)?)
+    }
+}
+
+impl<'n, 's> World<&'s str> for VerifiedNames<'n> {
+    type Scope<'w>
+        = ScopeView<'w>
+    where
+        Self: 'w;
+    type Root<'w>
+        = CrateRootView<'w>
+    where
+        Self: 'w;
+
+    fn scope(&self, module: ItemKey) -> Option<ScopeView<'_>> {
+        self.of(module)?.scope(module)
+    }
+
+    fn chain(&self, module: ItemKey) -> Option<&[ItemKey]> {
+        self.of(module)?.chain(module)
+    }
+
+    fn root_of(&self, key: ItemKey) -> Option<CrateRootView<'_>> {
+        Some(self.of(key)?.crate_root())
+    }
+
+    fn root(&self, krate: CrateItemKey) -> Option<CrateRootView<'_>> {
+        Some(self.record(*self.by_prefix.get(&krate.prefix())?)?.crate_root())
+    }
+
+    fn variant(&self, owner: ItemKey, name: &'s str) -> Option<Option<VariantHit>> {
+        Some(self.of(owner)?.variants(owner)?.find(name))
+    }
+
+    fn no_implicit_prelude(&self, module: ItemKey) -> bool {
+        self.of(module).is_some_and(|r| r.no_implicit_prelude(module))
+    }
+
+    fn anonymous(&self, module: ItemKey) -> bool {
+        self.of(module).is_some_and(|r| r.anonymous(module))
     }
 }
 
@@ -1063,7 +1160,7 @@ impl ExactSizeIterator for VariantIter<'_> {}
 
 /// Every crate's names through its two records: the second [`NamesSource`] (as `&Records`).
 pub struct Records<'n> {
-    paths: RecordNames<'n, Loader<'n>>,
+    paths: VerifiedNames<'n>,
     items: RecordItems<'n, Loader<'n>>,
     keys: &'n [CrateItemKey],
     /// The origin parts the items reader's loader brought with each expansion text it read, the
@@ -1130,7 +1227,7 @@ impl<'n> Records<'n> {
         let origin_parts: ARc<'n, OriginParts<'n>> = ARc::new_in(RefCell::new(HashMap::new_in(alloc)), alloc);
         let bump = frame.alloc(Erased::new(frame)).bump();
         Records {
-            paths: RecordNames::new(keys, Loader { load, log, origins: origin_parts.local_share() }, alloc),
+            paths: VerifiedNames::new(keys, load, log, alloc),
             items: RecordItems::new(keys, Loader { load, log, origins: origin_parts.local_share() }, bump),
             keys,
             origin_parts,
@@ -1496,7 +1593,7 @@ impl<'n> Records<'n> {
             },
             |i| {
                 touch(i);
-                self.items_of(i).map(|r| r.proc_macro()).ok_or(())
+                self.proc_macro(i).ok_or(())
             },
         );
         closure.ok()
@@ -1561,6 +1658,9 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     }
 
     fn proc_macro(self, krate: usize) -> Option<bool> {
+        if let Some(pm) = self.load.proc_macro(krate) {
+            return Some(pm);
+        }
         Some(self.items_of(krate)?.proc_macro())
     }
 
@@ -2189,5 +2289,157 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         let krate = self.items.crate_of(trait_)?;
         let record = self.items_of(krate)?;
         self.read(krate, record.assoc_lifetimes(trait_, |m| blaze_typeck::Name::of(m) == name))?.map(u32::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::cell::Cell;
+
+    use blaze_id::{ContentId, CrateItemKey};
+    use blaze_own::Alloc;
+    use blaze_scope::graph::Sysroot;
+    use blaze_scope::items_record;
+    use blaze_scope::names_record::{self, Verified};
+    use blaze_scope::resolve::{CrateInput, SourceTexts, aligned, resolve_crates};
+    use blaze_surface::Edition;
+    use blaze_unit_graph::{Implicit, Prelude, StdIs};
+    use bstd::mem::Frame;
+
+    use super::*;
+
+    const LIB_SRC: &str = "#![no_core]\npub struct Alpha;\n";
+    const PM_SRC: &str = "#![no_core]\npub struct Beta;\n";
+
+    struct MemTexts;
+    impl<'a> SourceTexts<'a> for MemTexts {
+        fn read(&self, _krate: usize, path: &str) -> Option<&'a str> {
+            match path {
+                "/0/lib/lib.rs" => Some(LIB_SRC),
+                "/1/pm/lib.rs" => Some(PM_SRC),
+                _ => None,
+            }
+        }
+    }
+
+    struct FastLoad<'n> {
+        names_bytes: &'n [&'n [u8]],
+        proofs: &'n [Verified<'n>],
+        items_bytes: &'n [&'n [u8]],
+        proc_macros: &'n [bool],
+        use_fast: bool,
+        names_calls: Cell<u32>,
+        items_calls: Cell<u32>,
+    }
+
+    impl<'n> Load<'n> for FastLoad<'n> {
+        fn names(&self, krate: usize) -> Option<&'n [u8]> {
+            self.names_calls.set(self.names_calls.get() + 1);
+            self.names_bytes.get(krate).copied()
+        }
+
+        fn names_verified(&self, krate: usize) -> Option<Verified<'n>> {
+            self.use_fast.then(|| self.proofs.get(krate).copied()).flatten()
+        }
+
+        fn items(&self, krate: usize) -> Option<&'n [u8]> {
+            self.items_calls.set(self.items_calls.get() + 1);
+            self.items_bytes.get(krate).copied()
+        }
+
+        fn proc_macro(&self, krate: usize) -> Option<bool> {
+            self.use_fast.then(|| self.proc_macros.get(krate).copied()).flatten()
+        }
+
+        fn file(&self, _krate: usize, _path: PackagePath<'_>) -> Option<&'n str> {
+            None
+        }
+
+        fn expansion(&self, _krate: usize, _call: ItemKey) -> Option<LoadedExpansion<'n>> {
+            None
+        }
+    }
+
+    #[test]
+    fn names_verified_and_proc_macro_fast_paths_skip_recheck_and_items_open() {
+        let g = blaze_own::testing::heap().alloc();
+        let frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("test frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let plain = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
+        let pm = Implicit { proc_macro: true, ..plain };
+        let inputs = [
+            CrateInput {
+                name: "lib",
+                key: CrateItemKey(ContentId::of("front2 source test", b"lib")),
+                edition: Edition::E2021,
+                implicit: plain,
+                root: "/0/lib/lib.rs",
+                shown_from: "/",
+                features: &[],
+                deps: &[],
+                cfg: &[],
+                script: None,
+            },
+            CrateInput {
+                name: "pm",
+                key: CrateItemKey(ContentId::of("front2 source test", b"pm")),
+                edition: Edition::E2021,
+                implicit: pm,
+                root: "/1/pm/lib.rs",
+                shown_from: "/",
+                features: &[],
+                deps: &[],
+                cfg: &[],
+                script: None,
+            },
+        ];
+        let solved = resolve_crates(&inputs, Sysroot { core: None, alloc: None, std: None, bstd: None }, &MemTexts, &blaze_scope::task::Serial, bump)
+            .expect("solve test crates");
+        let n0 = aligned(&names_record::encode(&solved.crates()[0], g).expect("encode n0"), bump);
+        let n1 = aligned(&names_record::encode(&solved.crates()[1], g).expect("encode n1"), bump);
+        let i0 = aligned(&items_record::encode(&solved.crates()[0], g).expect("encode i0"), bump);
+        let i1 = aligned(&items_record::encode(&solved.crates()[1], g).expect("encode i1"), bump);
+        let p0 = Verified::check(n0).expect("verify n0");
+        let p1 = Verified::check(n1).expect("verify n1");
+        let keys = [inputs[0].key, inputs[1].key];
+        let names_bytes = [n0, n1];
+        let proofs = [p0, p1];
+        let items_bytes = [i0, i1];
+        let proc_macros = [false, true];
+        let crate_names = ["lib", "pm"];
+
+        let root0 = solved.crates()[0].root;
+        // Fast path: `names_verified` and `proc_macro` provided.
+        let fast_pm = {
+            let fast_frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("fast frame");
+            let fast_load = FastLoad { names_bytes: &names_bytes, proofs: &proofs, items_bytes: &items_bytes, proc_macros: &proc_macros, use_fast: true, names_calls: Cell::new(0), items_calls: Cell::new(0) };
+            let fast_log = fast_frame.alloc(Log::new(&crate_names, g));
+            let fast = fast_frame.alloc(Records::new(&keys, &fast_load, fast_log, &fast_frame, g));
+            let pm0 = NamesSource::proc_macro(&*fast, 0);
+            let pm1 = NamesSource::proc_macro(&*fast, 1);
+            assert_eq!(pm0, Some(false));
+            assert_eq!(pm1, Some(true));
+            assert_eq!(fast_load.items_calls.get(), 0, "proc_macro fast-path must not open ItemsRecord");
+            assert_eq!(fast.opened().items.crates, 0, "no ItemsRecord decoded for proc_macro");
+            assert!(NamesSource::binds(&*fast, root0, Namespace::Types, "Alpha"));
+            assert_eq!(fast_load.names_calls.get(), 0, "names_verified fast-path must not call Load::names");
+            assert!(fast_log.errors().is_empty(), "zero source errors on fast path");
+            (pm0, pm1)
+        };
+
+        // Fallback path: default `None` for both hooks matches byte-for-byte.
+        {
+            let slow_frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("slow frame");
+            let slow_load = FastLoad { names_bytes: &names_bytes, proofs: &proofs, items_bytes: &items_bytes, proc_macros: &proc_macros, use_fast: false, names_calls: Cell::new(0), items_calls: Cell::new(0) };
+            let slow_log = slow_frame.alloc(Log::new(&crate_names, g));
+            let slow = slow_frame.alloc(Records::new(&keys, &slow_load, slow_log, &slow_frame, g));
+            assert_eq!(NamesSource::proc_macro(&*slow, 0), fast_pm.0);
+            assert_eq!(NamesSource::proc_macro(&*slow, 1), fast_pm.1);
+            assert_eq!(slow_load.items_calls.get(), 2, "fallback opens ItemsRecord for each crate");
+            assert!(NamesSource::binds(&*slow, root0, Namespace::Types, "Alpha"));
+            assert_eq!(slow_load.names_calls.get(), 1, "fallback calls Load::names");
+            assert!(slow_log.errors().is_empty(), "zero source errors on fallback path");
+        }
     }
 }
