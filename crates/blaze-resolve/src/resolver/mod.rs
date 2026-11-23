@@ -981,58 +981,72 @@ fn find_candidate(
 }
 
 fn check_cycles(resolve: &Resolve) -> CargoResult<()> {
+    enum Frame {
+        Enter(PackageId),
+        Exit(PackageId),
+    }
+
     // Perform a simple cycle check by visiting all nodes.
     // We visit each node at most once and we keep
     // track of the path through the graph as we walk it. If we walk onto the
     // same node twice that's a cycle.
-    let mut checked = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: Some(resolve.len()) });
+    let alloc = Global;
+    let mut checked =
+        Set::new(SetOpts { hasher: FixedState, alloc, capacity: Some(resolve.len()) });
     let mut path = Vec::with_capacity(4);
-    let mut visited = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: Some(4) });
+    let mut visited = Set::new(SetOpts { hasher: FixedState, alloc, capacity: Some(4) });
+    let mut stack = blaze_own::Vec::new_in(alloc);
     for pkg in resolve.iter() {
-        if !checked.contains(&pkg) {
-            visit(resolve, pkg, &mut visited, &mut path, &mut checked)?
+        if checked.contains(&pkg) {
+            continue;
         }
-    }
-    return Ok(());
+        stack.push(Frame::Enter(pkg));
+        while let Some(frame) = stack.pop() {
+            match frame {
+                Frame::Enter(id) => {
+                    if !visited.insert(id) {
+                        // We found a cycle and need to construct an error. Performance is no longer top priority.
+                        let iter = path.iter().rev().scan(id, |child, parent| {
+                            let dep = resolve.transitive_deps_not_replaced(*parent).find_map(
+                                |(dep_id, transitive_dep)| {
+                                    (*child == dep_id
+                                        || Some(*child) == resolve.replacement(dep_id))
+                                    .then_some(transitive_dep)
+                                },
+                            );
+                            *child = *parent;
+                            Some((parent, dep))
+                        });
+                        let iter = std::iter::once((&id, None)).chain(iter);
+                        let cycle = errors::describe_path(iter);
+                        return Err(crate::ResolveError::PackageCycle { package: id, path: cycle });
+                    }
 
-    fn visit(
-        resolve: &Resolve,
-        id: PackageId,
-        visited: &mut Set<PackageId, FixedState, Global>,
-        path: &mut Vec<PackageId>,
-        checked: &mut Set<PackageId, FixedState, Global>,
-    ) -> CargoResult<()> {
-        if !visited.insert(id) {
-            // We found a cycle and need to construct an error. Performance is no longer top priority.
-            let iter = path.iter().rev().scan(id, |child, parent| {
-                let dep = resolve.transitive_deps_not_replaced(*parent).find_map(
-                    |(dep_id, transitive_dep)| {
-                        (*child == dep_id || Some(*child) == resolve.replacement(dep_id))
-                            .then_some(transitive_dep)
-                    },
-                );
-                *child = *parent;
-                Some((parent, dep))
-            });
-            let iter = std::iter::once((&id, None)).chain(iter);
-            let cycle = errors::describe_path(iter);
-            return Err(crate::ResolveError::PackageCycle { package: id, path: cycle });
-        }
-
-        if checked.insert(id) {
-            path.push(id);
-            for (dep_id, _transitive_dep) in resolve.transitive_deps_not_replaced(id) {
-                visit(resolve, dep_id, visited, path, checked)?;
-                if let Some(replace_id) = resolve.replacement(dep_id) {
-                    visit(resolve, replace_id, visited, path, checked)?;
+                    if checked.insert(id) {
+                        path.push(id);
+                        stack.push(Frame::Exit(id));
+                        let start = stack.len();
+                        for (dep_id, _transitive_dep) in resolve.transitive_deps_not_replaced(id) {
+                            stack.push(Frame::Enter(dep_id));
+                            if let Some(replace_id) = resolve.replacement(dep_id) {
+                                stack.push(Frame::Enter(replace_id));
+                            }
+                        }
+                        if let Some(tail) = stack.get_mut(start..) {
+                            tail.reverse();
+                        }
+                    } else {
+                        visited.remove(&id);
+                    }
+                }
+                Frame::Exit(id) => {
+                    path.pop();
+                    visited.remove(&id);
                 }
             }
-            path.pop();
         }
-
-        visited.remove(&id);
-        Ok(())
     }
+    Ok(())
 }
 
 /// Checks that packages are unique when written to lock file.

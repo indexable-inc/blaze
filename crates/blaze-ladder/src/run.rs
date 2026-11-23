@@ -566,6 +566,7 @@ fn language_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, g
     crate::front2::coroutines::owner_of(program, adts, called, ground)
         .or_else(|| closure_owner(program, adts, called, ground))
         .or_else(|| crate::fn_shim::fn_shim_owner(program, adts, called, ground, caller))
+        .or_else(|| crate::clone_shim::language_from(program, called, ground).and_then(|f| program.fn_index(f.from)))
 }
 
 /// The refusal of `function`'s call of trait fn `called` when impl selection refused it: a
@@ -2355,9 +2356,14 @@ fn build_from<P: FrontEnd>(
             None => clones.shim_of(instance, &ground).map(|s| (s, clones.copy_of(s))),
             Some(_) => None,
         };
+        // Builtin `From::from` for structural error unions (clone_shim.rs `language_from`).
+        let from_row = match function.body {
+            None if clone_row.is_none() => crate::clone_shim::language_from(&*program, instance, &ground),
+            _ => None,
+        };
         let (body, done) = match (function.body, checked[i].as_ref()) {
             (Some((body, _)), Some(done)) => (Some(body), Some(done)),
-            _ if ctor_row.is_some() || clone_row.is_some() => (None, None),
+            _ if ctor_row.is_some() || clone_row.is_some() || from_row.is_some() => (None, None),
             _ => {
             let refusal = callee_refusal(&*program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, ground.view());
             // A survey files it (by the fn and the callee) and goes on, as its doc promises; a
@@ -2423,7 +2429,7 @@ fn build_from<P: FrontEnd>(
         let function = program.function(i);
         let name = || function.named();
         let body = function.body.map(|(body, _)| body);
-        if body.is_none() && ctor_row.is_none() && clone_row.is_none() {
+        if body.is_none() && ctor_row.is_none() && clone_row.is_none() && from_row.is_none() {
             return Err(callee_refusal(&*program, named, instance.args, instance, crate::callee_shown::CalleeGap::NoBody, ground.view()));
         }
         // The record walk: the entry its key's pointer names is used only when every row of its
@@ -2550,7 +2556,7 @@ fn build_from<P: FrontEnd>(
         // built into its state BEFORE this build (run/lay_states.rs): the build never meets a
         // state not laid. A coroutine's own function was built with its coroutine; a shim has
         // no body of its own.
-        if from_coroutine.is_none() && shim.is_none() && clone_row.is_none() {
+        if from_coroutine.is_none() && shim.is_none() && clone_row.is_none() && from_row.is_none() {
             let adts = FrontAdts(&*program, i, &consts, &langs, &checked_bodies);
             let laid = match lay_states::roots_of_instance(&*program, &checked_bodies, &adts, i, &args, &mut ground, alloc) {
                 Ok(roots) if roots.is_empty() => Ok(lay_states::Lay::Done),
@@ -2587,11 +2593,18 @@ fn build_from<P: FrontEnd>(
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, world, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, world, Global),
             }
-        } else if let Some((s, copy)) = clone_row {
-            // A builtin clone: its bytes when `Self: Copy`, else each field's own `clone`.
-            match copy {
-                Some(copy) => blaze_build::build_builtin_clone(s.clone, copy, &mut subst, world, Global),
-                None => Err(BuildError::Malformed { what: "a builtin `clone` built before its `Self: Copy` was asked" }),
+        } else if clone_row.is_some() || from_row.is_some() {
+            let g = Global;
+            if let Some((s, copy)) = clone_row {
+                // A builtin clone: its bytes when `Self: Copy`, else each field's own `clone`.
+                match copy {
+                    Some(copy) => blaze_build::build_builtin_clone(s.clone, copy, &mut subst, world, g),
+                    None => Err(BuildError::Malformed { what: "a builtin `clone` built before its `Self: Copy` was asked" }),
+                }
+            } else if let Some(f) = from_row {
+                blaze_build::build_builtin_from(f.from, &mut subst, world, g)
+            } else {
+                Err(BuildError::Malformed { what: "unreachable builtin row" })
             }
         } else if let Some(variant) = ctor_row {
             // The ctor's own instance (a shim of it was taken above): its fields in, its value out.

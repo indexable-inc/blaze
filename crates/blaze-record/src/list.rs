@@ -27,11 +27,8 @@ const HEAD: usize = 8 + 32 + 4 + 4;
 const NOTE_LEN_AT: usize = 8 + 32;
 const COUNT_AT: usize = 8 + 32 + 4;
 
-fn len32(len: usize, what: &str) -> [u8; 4] {
-    match u32::try_from(len) {
-        Ok(len) => len.to_le_bytes(),
-        Err(_) => panic!("{what} of {len} bytes in a read-list: its length is kept in 32 bits"),
-    }
+fn len32(len: usize) -> [u8; 4] {
+    u32::try_from(len).unwrap_or(u32::MAX).to_le_bytes()
 }
 
 /// Appends to `out` the read-list of `base` whose reads are named `reads`, in that order.
@@ -60,20 +57,21 @@ pub fn write_list_with<R: AsRef<[u8]>>(
     out.extend_from_slice(&base.0);
     out.extend_from_slice(&[0; 8]);
     note(out);
-    let note_len = match out.len().checked_sub(start + HEAD) {
-        Some(len) => len,
-        None => panic!("the note of a read-list was written by cutting its buffer short"),
-    };
-    out[start + NOTE_LEN_AT..start + COUNT_AT].copy_from_slice(&len32(note_len, "a note"));
+    let note_len = out.len().saturating_sub(start + HEAD);
+    if let Some(dst) = out.get_mut(start + NOTE_LEN_AT..start + COUNT_AT) {
+        dst.copy_from_slice(&len32(note_len));
+    }
     let mut count = 0_usize;
     for read in reads {
         let read = read.as_ref();
         // alloc: as above
-        out.extend_from_slice(&len32(read.len(), "a read's name"));
+        out.extend_from_slice(&len32(read.len()));
         out.extend_from_slice(read);
         count += 1;
     }
-    out[start + COUNT_AT..start + HEAD].copy_from_slice(&len32(count, "a count of reads"));
+    if let Some(dst) = out.get_mut(start + COUNT_AT..start + HEAD) {
+        dst.copy_from_slice(&len32(count));
+    }
 }
 
 /// The read-list of `base` with no note and no reads, as [`write_list`] writes it. Its bytes
@@ -82,8 +80,12 @@ pub fn write_list_with<R: AsRef<[u8]>>(
 /// lookup of the same list filed would find.
 pub fn empty_list(base: &ContentId) -> [u8; HEAD] {
     let mut out = [0; HEAD];
-    out[..8].copy_from_slice(&LAYOUT.to_le_bytes());
-    out[8..NOTE_LEN_AT].copy_from_slice(&base.0);
+    if let Some((head, rest)) = out.split_first_chunk_mut::<8>() {
+        *head = LAYOUT.to_le_bytes();
+        if let Some((key, _)) = rest.split_first_chunk_mut::<32>() {
+            *key = base.0;
+        }
+    }
     out
 }
 
@@ -201,10 +203,9 @@ impl<'a> Iterator for Reads<'a> {
         if self.left == 0 {
             return None;
         }
+        let (len, after) = take_u32(self.rest).ok()?;
+        let (name, rest) = take(after, len as usize).ok()?;
         self.left -= 1;
-        let whole = "`ListRef::open` checked every read";
-        let (len, after) = take_u32(self.rest).expect(whole);
-        let (name, rest) = take(after, len as usize).expect(whole);
         self.rest = rest;
         Some(name)
     }

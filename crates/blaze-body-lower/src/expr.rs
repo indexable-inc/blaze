@@ -313,7 +313,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
                 self.b.assign(t, Value::Cast { kind, operand: op, ty: to }, span);
                 Ok(Val::Place(t, to))
             }
-            AdjustKind::UnionInject { .. } | AdjustKind::UnionWiden => self.refuse(Construct::Union, e),
+            AdjustKind::UnionInject { .. } | AdjustKind::UnionWiden | AdjustKind::RecordProject => self.refuse(Construct::Union, e),
         }
     }
 

@@ -496,10 +496,24 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 StructBase::None | StructBase::Defaults => {
                     f.a = 0;
                     if let Some((rec_ty, field_tys)) = exp_rec {
+                        let is_wider = base == StructBase::None
+                            && if let TyView::Record(exp_schema, _) = self.view(rec_ty)
+                                && let Some(exp_names) = self.record_names(exp_schema)
+                            {
+                                inits.len() > exp_names.len()
+                                    && exp_names.iter().all(|&en| inits.iter().any(|w| w.name == en))
+                            } else {
+                                false
+                            };
                         f.t = rec_ty;
                         f.l = field_tys;
-                        f.b = 0;
-                        f.state = 3;
+                        if is_wider {
+                            f.b = 3;
+                            f.state = 4;
+                        } else {
+                            f.b = 0;
+                            f.state = 3;
+                        }
                     } else {
                         f.b = 2;
                         f.state = 4;
@@ -580,6 +594,43 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             self.fru_fields.push((e, idx, t));
                         }
                     }
+                } else if base == StructBase::Defaults {
+                    let n = self.ty.list_len(field_tys);
+                    let mut missing: Option<Name> = None;
+                    let mut unwritten: blaze_own::Vec<(u32, ItemKey), Alloc<'a>> = blaze_own::Vec::new_in(self.alloc);
+                    {
+                        let defaults = self.reads.field_defaults(schema.defaults_key())?;
+                        if let Some(names) = self.record_names(schema) {
+                            for (i, &nm) in names.iter().enumerate() {
+                                if inits.iter().any(|w| w.name == nm) {
+                                    continue;
+                                }
+                                match defaults.get(i).copied().flatten() {
+                                    Some(key) => {
+                                        if let Ok(idx) = u32::try_from(i) {
+                                            unwritten.push((idx, key));
+                                        }
+                                    }
+                                    None => {
+                                        if missing.is_none() {
+                                            missing = Some(nm);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(nm) = missing {
+                        self.diag(DiagCode::MissingFields, At::Expr(e), About::found_named(f.t, nm));
+                    } else {
+                        for (idx, key) in unwritten {
+                            if idx < n {
+                                let t = self.ty.list_get(field_tys, idx);
+                                self.fru_fields.push((e, idx, t));
+                                self.default_fields.push((e, idx, key));
+                            }
+                        }
+                    }
                 } else {
                     let missing = self.record_names(schema).and_then(|names| {
                         names.iter().copied().find(|&nm| !inits.iter().any(|i| i.name == nm))
@@ -591,11 +642,21 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             return Ok(Flow::Done(f.t));
         }
-        // State 4: inferred anonymous record literal `{ b: 1u8, a: 2i32 }`.
+        // State 4: inferred anonymous record literal `{ b: 1u8, a: 2i32 }` (or wider record
+        // literal coerced via width-subtyping when `f.b == 3`).
         if let Some(init) = usize::try_from(f.a).ok().and_then(|i| inits.get(i)).copied() {
             f.a += 1;
+            let hint = if f.b == 3
+                && let TyView::Record(exp_schema, field_tys) = self.view(f.t)
+                && let Some(idx) = self.record_field_index(exp_schema, init.name)
+                && idx < self.ty.list_len(field_tys)
+            {
+                Expectation::HasType(self.ty.list_get(field_tys, idx))
+            } else {
+                Expectation::None
+            };
             self.resume(f, 4)?;
-            self.push_expr(init.expr, Expectation::None, Then::Nothing)?;
+            self.push_expr(init.expr, hint, Then::Nothing)?;
             return Ok(Flow::Wait);
         }
         let schema = match self.body.record_expr_schema(e) {

@@ -37,6 +37,8 @@ pub enum AdjustKind {
     UnionInject { variant: u32 },
     /// Sub-union widening (`A | B -> A | B | C`).
     UnionWiden,
+    /// Structural record width-subtyping projection (`{ a, b } -> { a }`).
+    RecordProject,
 }
 
 /// How a pattern binds or narrows a structural union (`PNode::Union`).

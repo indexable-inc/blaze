@@ -51,13 +51,22 @@ mod counting {
 static ALLOCATOR: Counting = Counting;
 
 fn files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            files(&path, out);
-        } else if path.extension().is_some_and(|it| it == "rs") {
-            out.push(path);
+    let mut dirs = blaze_mem::scratch::Scratch::new();
+    let dirs = dirs.take();
+    dirs.push(dir.to_path_buf());
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let start = dirs.len();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|it| it == "rs") {
+                out.push(path);
+            }
+        }
+        if let Some(tail) = dirs.get_mut(start..) {
+            tail.reverse();
         }
     }
 }

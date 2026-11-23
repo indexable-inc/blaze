@@ -1636,7 +1636,7 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
     let builtin = match self_ty {
         Some(t) => matches!(
             ground.view().node(t).map_err(|error| CheckFail::Check { owner, error })?,
-            tc::PNode::Tuple(_) | tc::PNode::Record(..) | tc::PNode::Closure { .. } | tc::PNode::FnDef(..) | tc::PNode::FnPtr(..)
+            tc::PNode::Tuple(_) | tc::PNode::Record(..) | tc::PNode::Union(_) | tc::PNode::Closure { .. } | tc::PNode::FnDef(..) | tc::PNode::FnPtr(..)
         ),
         None => false,
     };

@@ -296,28 +296,38 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
             DropState::Partial(parts) => parts,
         };
         self.order.clear();
-        for i in 0..parts.len() {
-            if parts[i].path.is_empty() {
+        for (i, part) in parts.iter().enumerate() {
+            if part.path.is_empty() {
                 return Err(ElabError::BadPart { stmt });
             }
             self.order.push(i);
         }
-        self.order.sort_unstable_by(|&a, &b| path_order(parts[a].path, parts[b].path));
+        self.order.sort_unstable_by(|&a, &b| {
+            let pa = parts.get(a).map_or(&[][..], |p| p.path);
+            let pb = parts.get(b).map_or(&[][..], |p| p.path);
+            path_order(pa, pb)
+        });
         for w in self.order.windows(2) {
-            let (a, b) = (parts[w[0]].path, parts[w[1]].path);
-            if b.len() >= a.len() && path_order(a, &b[..a.len()]) == Ordering::Equal {
+            let [i, j] = w else { continue };
+            let (Some(a), Some(b)) = (parts.get(*i).map(|p| p.path), parts.get(*j).map(|p| p.path)) else {
+                return Err(ElabError::BadPart { stmt });
+            };
+            if let Some(prefix) = b.get(..a.len())
+                && path_order(a, prefix) == Ordering::Equal
+            {
                 return Err(ElabError::BadPart { stmt });
             }
         }
         let start = self.steps.len() as u32;
         for k in 0..self.order.len() {
-            let part = parts[self.order[k]];
+            let Some(&ord) = self.order.get(k) else { continue };
+            let Some(&part) = parts.get(ord) else { return Err(ElabError::BadPart { stmt }) };
             let mut p = place;
             for f in part.path {
                 p = self.b.project(p, Proj::Field { index: f.index, ty: f.ty });
             }
-            let ty = part.path[part.path.len() - 1].ty;
-            if facts.needs_drop(ty) == NeedsDrop::No {
+            let Some(last) = part.path.last() else { return Err(ElabError::BadPart { stmt }) };
+            if facts.needs_drop(last.ty) == NeedsDrop::No {
                 continue;
             }
             let flag = match part.state {
@@ -356,16 +366,17 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
 
     /// Whether `d` is `place` of flag `i` or a prefix of it.
     fn covers(&self, d: Place, i: usize) -> bool {
-        self.chains[self.flags[i].chain.range()].contains(&d)
+        let Some(flag) = self.flags.get(i) else { return false };
+        self.chains.get(flag.chain.range()).is_some_and(|c| c.contains(&d))
     }
 
     /// Writes flag `i`. Only reached with a flag `i`, and `plan` made the constants with the
     /// first flag, so `konst` is set here.
     fn set(&mut self, i: usize, on: bool, span: Span) {
         let Some((off, on_c)) = self.konst else { return };
+        let Some(flag) = self.flags.get(i) else { return };
         let c = if on { on_c } else { off };
-        let dest = self.flags[i].flag;
-        self.b.assign(dest, Value::Use(Operand::Const(c)), span);
+        self.b.assign(flag.flag, Value::Use(Operand::Const(c)), span);
     }
 
     /// Clears each flag `p` covers, but the ones `keep` names and the ones the steps test.
@@ -375,7 +386,7 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
                 continue;
             }
             if let Some((a, b)) = steps
-                && self.steps[a as usize..b as usize].iter().any(|s| s.flag == Some(i as u32))
+                && self.steps.get(a as usize..b as usize).is_some_and(|s| s.iter().any(|s| s.flag == Some(i as u32)))
             {
                 continue;
             }
@@ -500,7 +511,8 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
             self.b.start(block);
             if bi == 0 {
                 for i in 0..self.flags.len() {
-                    let l = self.flags[i].of.0;
+                    let Some(flag) = self.flags.get(i) else { continue };
+                    let l = flag.of.0;
                     self.set(i, l >= 1 && l <= v.args(), Span::default());
                 }
             }
@@ -543,7 +555,7 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
             }
             StmtKind::StorageLive(l) | StmtKind::StorageDead(l) => {
                 for i in 0..self.flags.len() {
-                    if self.flags[i].of == l {
+                    if self.flags.get(i).is_some_and(|f| f.of == l) {
                         self.set(i, false, span);
                     }
                 }
@@ -593,21 +605,21 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
     }
 
     fn drop(&mut self, s: Stmt, place: Place, target: Block, unwind: Unwind, kind: BlockKind, span: Span) -> Result<(), ElabError> {
-        match self.plans[s.index()] {
-            Plan::NotDrop => return Err(ElabError::Copy { table: Table::Stmts, row: s.0 }),
-            Plan::Remove => {
+        match self.plans.get(s.index()).copied() {
+            None | Some(Plan::NotDrop) => return Err(ElabError::Copy { table: Table::Stmts, row: s.0 }),
+            Some(Plan::Remove) => {
                 self.clear_under(place, None, None, span);
                 self.b.terminate(StmtKind::Goto(target), span);
             }
-            Plan::Keep => {
+            Some(Plan::Keep) => {
                 self.clear_under(place, None, None, span);
                 self.b.terminate(StmtKind::Drop { place, target, unwind }, span);
             }
-            Plan::Flag(f) => {
+            Some(Plan::Flag(f)) => {
                 self.clear_under(place, None, Some(f), span);
                 self.drop_one(place, Some(f), target, unwind, kind, span);
             }
-            Plan::Parts { start, end } => {
+            Some(Plan::Parts { start, end }) => {
                 self.clear_under(place, Some((start, end)), None, span);
                 self.chain(start, end, target, unwind, kind, span);
             }
@@ -621,9 +633,11 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
             self.b.terminate(StmtKind::Drop { place, target, unwind }, span);
             return;
         };
+        let Some(flag_row) = self.flags.get(f as usize) else { return };
+        let flag_place = flag_row.flag;
         let guarded = self.b.new_block(kind);
         let cases = self.b.cases(&[(0, target)]);
-        let on = Operand::Copy(self.flags[f as usize].flag);
+        let on = Operand::Copy(flag_place);
         self.b.terminate(StmtKind::Switch { on, cases, otherwise: guarded }, span);
         self.pending.push(Pending::Guarded { block: guarded, flag: f, place, target, unwind, span });
     }
@@ -653,21 +667,24 @@ impl<F: DropFacts, A: Allocator + Copy> Elab<'_, '_, F, A> {
             };
         }
         for k in 0..n {
-            let step = self.steps[start as usize + k];
-            let to = if k + 1 < n { self.blocks[k] } else { target };
-            let uw = if ladder && k + 1 < n { Unwind::Cleanup(self.blocks[rungs + k]) } else { unwind };
+            let Some(&step) = self.steps.get(start as usize + k) else { continue };
+            let to = if k + 1 < n { self.blocks.get(k).copied().unwrap_or(target) } else { target };
+            let uw = if ladder && k + 1 < n {
+                self.blocks.get(rungs + k).copied().map_or(unwind, Unwind::Cleanup)
+            } else {
+                unwind
+            };
             if k == 0 {
                 self.drop_one(step.place, step.flag, to, uw, kind, span);
-            } else {
-                let block = self.blocks[k - 1];
+            } else if let Some(&block) = self.blocks.get(k - 1) {
                 self.pending.push(Pending::Drop { block, place: step.place, flag: step.flag, target: to, unwind: uw, kind, span });
             }
         }
         if ladder {
-            for k in 0..n - 1 {
-                let step = self.steps[start as usize + k + 1];
-                let to = if k + 1 < n - 1 { self.blocks[rungs + k + 1] } else { bottom };
-                let block = self.blocks[rungs + k];
+            for k in 0..n.saturating_sub(1) {
+                let Some(&step) = self.steps.get(start as usize + k + 1) else { continue };
+                let Some(&block) = self.blocks.get(rungs + k) else { continue };
+                let to = if k + 1 < n - 1 { self.blocks.get(rungs + k + 1).copied().unwrap_or(bottom) } else { bottom };
                 self.pending.push(Pending::Drop {
                     block,
                     place: step.place,

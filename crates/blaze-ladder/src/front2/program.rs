@@ -370,8 +370,18 @@ struct Made<'n> {
 /// each looked up once in [`Front2Program::make`], a refusal stopping the program by the item's
 /// name there, so those answers never meet a lookup that fails. `Clone`: its `clone`, the
 /// builtin clone's (blaze-ladder clone_shim.rs).
-const SEAM_LANGS: [LangItem; 9] =
-    [LangItem::Drop, LangItem::Deref, LangItem::DerefMut, LangItem::Fn, LangItem::FnMut, LangItem::FnOnce, LangItem::Index, LangItem::IndexMut, LangItem::Clone];
+const SEAM_LANGS: [LangItem; 10] = [
+    LangItem::Drop,
+    LangItem::Deref,
+    LangItem::DerefMut,
+    LangItem::Fn,
+    LangItem::FnMut,
+    LangItem::FnOnce,
+    LangItem::Index,
+    LangItem::IndexMut,
+    LangItem::Clone,
+    LangItem::From,
+];
 
 fn lang_of(front: &Front2<'_>, item: LangItem) -> Result<Option<ItemKey>, crate::seam::LangRefusal> {
     match super::langs::find(&front.index, front.resolver, item) {

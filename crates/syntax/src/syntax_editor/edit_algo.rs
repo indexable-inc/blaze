@@ -191,15 +191,26 @@ impl EditPlan {
 
     /// Appends a dependency subtree in post order fashion.
     fn append_postorder(
-        index: usize,
+        root: usize,
         children: &[Vec<usize>],
         planned: &mut [Option<PlannedChange>],
         ordered: &mut Vec<PlannedChange>,
     ) {
-        for &child in &children[index] {
-            Self::append_postorder(child, children, planned, ordered);
+        let mut stack = blaze_mem::scratch::Scratch::new();
+        let stack = stack.take();
+        stack.push((root, false));
+        while let Some((index, visited)) = stack.pop() {
+            if visited {
+                ordered.push(planned[index].take().expect("reachable plan nodes are not discarded"));
+            } else {
+                stack.push((index, true));
+                if let Some(node_children) = children.get(index) {
+                    for &child in node_children.iter().rev() {
+                        stack.push((child, false));
+                    }
+                }
+            }
         }
-        ordered.push(planned[index].take().expect("reachable plan nodes are not discarded"));
     }
 
     /// Checks that replacement at the same tree depth do not overlap

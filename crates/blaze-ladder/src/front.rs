@@ -1115,6 +1115,7 @@ fn trait_lang(name: &str) -> Option<LangItem> {
         "pointee_trait" => LangItem::Pointee,
         "discriminant_kind" => LangItem::DiscriminantKind,
         "future_trait" => LangItem::Future,
+        "from" => LangItem::From,
         _ => return None,
     })
 }

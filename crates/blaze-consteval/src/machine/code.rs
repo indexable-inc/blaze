@@ -2286,8 +2286,8 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     self.emit_unsize(code, cc, dst, src, n);
                     dst
                 }
-                AdjustKind::UnionInject { .. } | AdjustKind::UnionWiden => {
-                    return Err(unsupported("a structural union coercion in a constant"));
+                AdjustKind::UnionInject { .. } | AdjustKind::UnionWiden | AdjustKind::RecordProject => {
+                    return Err(unsupported("a structural union or record coercion in a constant"));
                 }
             };
             ty = next;

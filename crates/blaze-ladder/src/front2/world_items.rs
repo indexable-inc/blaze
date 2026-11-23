@@ -1162,7 +1162,11 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
         Ok(Some(TraitDef {
             generics: t.generics,
             flags: t.flags,
-            lang: self.index.lang_name_of(lib).and_then(trait_lang),
+            lang: self.index.lang_name_of(lib).and_then(trait_lang).or_else(|| {
+                (t.generics == 2
+                    && super::langs::find(self.index, self.resolver(), LangItem::From).ok().flatten() == Some(lib))
+                    .then_some(LangItem::From)
+            }),
             supertraits: &extra.supertraits,
             // With a synthetic associated type per `impl Trait` at a place of a fn's return type
             // (super::rpitit), after the written ones.
