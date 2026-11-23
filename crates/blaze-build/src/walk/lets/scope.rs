@@ -64,7 +64,7 @@ pub(in crate::walk) enum LetAnchor {
     Above(ExprId),
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether this body follows the edition-2024 rule for `if let` temporaries.
     pub(in crate::walk) fn if_let_2024(&self) -> bool {
         self.body.edition >= Edition::E2024

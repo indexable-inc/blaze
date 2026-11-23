@@ -87,7 +87,7 @@ pub(in crate::walk) fn from_ty(error: TyErr) -> BuildError {
     }
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The contents type `T` when ground type `g` is a `Box<T, ..>` (the `owned_box` lang
     /// item), else `None`.
     pub(in crate::walk) fn box_arg(&self, g: PTy) -> Result<Option<PTy>, TyErr> {
@@ -429,7 +429,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             return Ok(None);
         }
         let rows = self.adjust_rows(e);
-        let kinds = self.checked.adjusts.column::<1>().get(rows.clone()).ok_or(malformed("adjustment rows past their column"))?;
+        let kinds = self.checked.adjusts.column::<1>().get(rows.start..rows.end).ok_or(malformed("adjustment rows past their column"))?;
         let lead = kinds.iter().take_while(|k| matches!(k, AdjustKind::Deref { .. })).count();
         let borrow_after = matches!(kinds.get(lead), Some(AdjustKind::Borrow { .. }));
         if lead > 0 {

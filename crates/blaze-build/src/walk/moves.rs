@@ -144,15 +144,15 @@ pub(super) struct Moves<A: Allocator> {
     box_self: Option<(ExprId, Value)>,
 }
 
-impl<A: Allocator + Clone> Moves<A> {
+impl<A: Allocator + Copy> Moves<A> {
     pub(super) fn new_in(alloc: A) -> Self {
         Moves {
-            steps: Vec::new_in(alloc.clone()),
-            parts: Vec::new_in(alloc.clone()),
-            roots: Vec::new_in(alloc.clone()),
-            assigned: Vec::new_in(alloc.clone()),
+            steps: Vec::new_in(alloc),
+            parts: Vec::new_in(alloc),
+            roots: Vec::new_in(alloc),
+            assigned: Vec::new_in(alloc),
             cx: None,
-            pending: Vec::new_in(alloc.clone()),
+            pending: Vec::new_in(alloc),
             alt_owned: Vec::new_in(alloc),
             box_self: None,
         }
@@ -190,7 +190,7 @@ type Seen = (PatId, PTy, u32, Option<Step>, bool);
 
 const MOVE_OUT: &str = "a binding by value of a part that needs drop, in a match by tests (a move out)";
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Before match `m` by tests (`e`, on `scrutinee`, its value `s` held as `srepr`) tests its
     /// arms: a scrutinee that needs drop is owned. A local (walk/matches.rs `tested_place`
     /// takes its place) moves by its field flags; a temporary joins its statement's
@@ -477,8 +477,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// not followed (no move goes through one), so a binding under one is refused by name, and
     /// so is one under a type that implements `Drop`. An or-pattern's alternatives are.
     fn move_path(&mut self, root: PatId, g: PTy, target: PatId) -> Result<(u32, u32), BuildError> {
-        let mut seen: Vec<Seen, A> = Vec::new_in(self.alloc.clone());
-        let mut todo: Vec<(PatId, PTy, u32, Option<Step>), A> = Vec::new_in(self.alloc.clone());
+        let mut seen: Vec<Seen, A> = Vec::new_in(self.alloc);
+        let mut todo: Vec<(PatId, PTy, u32, Option<Step>), A> = Vec::new_in(self.alloc);
         todo.push((root, g, u32::MAX, None));
         let mut found = None;
         while let Some((q, g, parent, step)) = todo.pop() {
@@ -612,7 +612,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// enum switch's `field_bit`s. In the Reference's order: fields in declaration order, an
     /// enum's live variant's fields, an array's elements first to last.
     pub(super) fn drop_moved(&mut self, g: PTy, at: (Value, i32), mask: SlotId, switch_bits: bool) -> Result<(), BuildError> {
-        let mut ps: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut ps: Vec<u32, A> = Vec::new_in(self.alloc);
         for (i, q) in self.moves.parts.iter().enumerate() {
             if q.mask == mask {
                 ps.push(i as u32);
@@ -626,7 +626,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
     /// Drops node `root` of a value at `at` (word `mask`, parts `ps`), part by part.
     fn drop_tree(&mut self, root: Node, at: (Value, i32), mask: SlotId, switch_bits: bool, ps: &[u32]) -> Result<(), BuildError> {
-        let mut todo: Vec<Do, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<Do, A> = Vec::new_in(self.alloc);
         todo.push(Do::Visit(root));
         while let Some(d) = todo.pop() {
             match d {
@@ -863,7 +863,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         // The part `part_bit` found or made (an equal one found gives the steps back).
         let me = *self.moves.parts.iter().find(|q| q.mask == mask && q.bit == bit).ok_or(malformed("an assigned part missing from its word"))?;
         self.moves.assigned.push(Assigned { mask, start: me.start, len: me.len, by: lhs });
-        let mut ps: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut ps: Vec<u32, A> = Vec::new_in(self.alloc);
         let mut bits = 0u64;
         for (i, q) in self.moves.parts.iter().enumerate() {
             if q.mask == mask && self.part_under(*q, me.start, me.len) {
@@ -982,8 +982,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 // the rest drop whole by the glue, which reads the discriminant again.
                 let join = self.create();
                 let default = self.create();
-                let mut cases = Vec::with_capacity_in(len as usize, self.alloc.clone());
-                let mut bodies = Vec::with_capacity_in(len as usize, self.alloc.clone());
+                let mut cases = Vec::with_capacity_in(len as usize, self.alloc);
+                let mut bodies = Vec::with_capacity_in(len as usize, self.alloc);
                 for v in 0..len {
                     let (ff, fl) = self.layout_variants[(first + v) as usize];
                     if !self.fields_need_drop(ff, fl) {
@@ -1025,7 +1025,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// `match` on a local with such an arm may move a part out, so the local gets field
     /// flags).
     pub(super) fn moves_deep(&self, p: PatId) -> Result<bool, BuildError> {
-        let mut todo: Vec<(PatId, bool), A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<(PatId, bool), A> = Vec::new_in(self.alloc);
         todo.push((p, true));
         while let Some((q, root)) = todo.pop() {
             let pat = self.pat(q)?;

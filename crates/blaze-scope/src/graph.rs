@@ -254,9 +254,9 @@ impl<'a, N: Name> CrateGraph<'a, N> {
         }
         // Which sysroot crates each crate is built from: bit `s` of `built_from[c]` is set when
         // `c` is the sysroot crate `s` or one of its dependencies, near or far.
-        let mut built_from: AVec<'a, u8> = AVec::with_capacity_in(n, alloc.clone());
+        let mut built_from: AVec<'a, u8> = AVec::with_capacity_in(n, alloc);
         built_from.resize(n, 0);
-        let mut stack: AVec<'a, u32> = AVec::new_in(alloc.clone());
+        let mut stack: AVec<'a, u32> = AVec::new_in(alloc);
         for (bit, s) in sysroot.all().iter().enumerate() {
             let Some(s) = s else { continue };
             if s.index() >= n {
@@ -275,7 +275,7 @@ impl<'a, N: Name> CrateGraph<'a, N> {
         }
         // Dependents, as a flat list of (dependency, dependent) sorted by dependency: the
         // dependency lines, and every sysroot crate before each crate it is not built from.
-        let mut edges: AVec<'a, (u32, u32)> = AVec::new_in(alloc.clone());
+        let mut edges: AVec<'a, (u32, u32)> = AVec::new_in(alloc);
         for (i, c) in crates.iter().enumerate() {
             for d in c.deps.iter() {
                 edges.push((d.krate.0, i as u32));
@@ -290,15 +290,15 @@ impl<'a, N: Name> CrateGraph<'a, N> {
         }
         edges.sort_unstable();
         // Kahn's algorithm by waves: a crate's wave is one past its deepest dependency's.
-        let mut left: AVec<'a, u32> = AVec::with_capacity_in(n, alloc.clone());
-        let mut wave: AVec<'a, u32> = AVec::with_capacity_in(n, alloc.clone());
+        let mut left: AVec<'a, u32> = AVec::with_capacity_in(n, alloc);
+        let mut wave: AVec<'a, u32> = AVec::with_capacity_in(n, alloc);
         left.resize(n, 0);
         wave.resize(n, 0);
         for &(_, dependent) in edges.iter() {
             left[dependent as usize] += 1;
         }
-        let mut order: AVec<'a, CrateId> = AVec::with_capacity_in(n, alloc.clone());
-        let mut current: AVec<'a, u32> = AVec::new_in(alloc.clone());
+        let mut order: AVec<'a, CrateId> = AVec::with_capacity_in(n, alloc);
+        let mut current: AVec<'a, u32> = AVec::new_in(alloc);
         for (i, l) in left.iter().enumerate() {
             if *l == 0 {
                 current.push(i as u32);
@@ -306,7 +306,7 @@ impl<'a, N: Name> CrateGraph<'a, N> {
         }
         let mut depth = 0u32;
         while !current.is_empty() {
-            let mut next: AVec<'a, u32> = AVec::new_in(alloc.clone());
+            let mut next: AVec<'a, u32> = AVec::new_in(alloc);
             for &c in current.iter() {
                 wave[c as usize] = depth;
                 order.push(CrateId(c));
@@ -379,7 +379,7 @@ impl<'a, N: Name> CrateGraph<'a, N> {
         let not_self = |k: Option<CrateId>| {
             k.filter(|k| sys.all().iter().enumerate().all(|(bit, s)| *s != Some(*k) || sysroot_before(built_from, bit)))
         };
-        let mut prelude: AVec<'a, GraphDep<N>> = AVec::new_in(self.alloc.clone());
+        let mut prelude: AVec<'a, GraphDep<N>> = AVec::new_in(self.alloc);
         prelude.extend(c.deps.iter().copied());
         let add = |list: &mut AVec<'a, GraphDep<N>>, name: N, krate: Option<CrateId>| {
             if let Some(krate) = krate {
@@ -390,7 +390,7 @@ impl<'a, N: Name> CrateGraph<'a, N> {
         };
         // The extern prelude the rule adds (`core`, `std`, `proc_macro`), less what the root's
         // `#![no_core]` and `#![no_std]` take away.
-        let mut dropped: AVec<'a, DroppedExtern> = AVec::new_in(self.alloc.clone());
+        let mut dropped: AVec<'a, DroppedExtern> = AVec::new_in(self.alloc);
         if !attrs.no_core {
             for (name, unit) in implicit.externs(&units) {
                 if name == "std" && attrs.no_std {
@@ -407,7 +407,7 @@ impl<'a, N: Name> CrateGraph<'a, N> {
             }
         }
         // What `extern crate` may name besides: the rule's `core`, `alloc` and `std`.
-        let mut deps = prelude.clone();
+        let mut deps = prelude.clone_in(self.alloc);
         for name in ["core", "alloc", "std"] {
             add(&mut deps, word(name), not_self(implicit.extern_crate(name, &units).and_then(Sysroot::crate_of)));
         }
@@ -471,7 +471,7 @@ impl<'n> NameOf for &'n str {
 /// follow a dependency that is also left until a crate repeats; the crates from its first
 /// visit on are the cycle.
 fn cycle_of<'a, N: Name>(crates: &[GraphCrate<'a, N>], left: &[u32], alloc: Alloc<'a>) -> AVec<'a, N> {
-    let mut path: AVec<'a, u32> = AVec::new_in(alloc.clone());
+    let mut path: AVec<'a, u32> = AVec::new_in(alloc);
     let mut out: AVec<'a, N> = AVec::new_in(alloc);
     let Some(start) = left.iter().position(|l| *l > 0) else { return out };
     let mut at = start as u32;

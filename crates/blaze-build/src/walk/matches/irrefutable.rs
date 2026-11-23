@@ -50,7 +50,7 @@ use super::super::{Shape, V, Walk, malformed};
 use super::At;
 use crate::BuildError;
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Binds `v`, the binder's own value of pattern `root`'s type, to irrefutable pattern
     /// `root`, by a work list. Every form outside "Refutability"'s irrefutable ones, and every
     /// irrefutable one not built here, is refused by name.
@@ -91,8 +91,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     pub(super) fn bind_pattern_at(&mut self, root: PatId, at: At, owned: bool) -> Result<(), BuildError> {
         // (pattern, its part's place, whether the part is the binder's own: not behind a
         // reference the pattern followed).
-        let mut todo: Vec<(PatId, At, bool), A> = Vec::new_in(self.alloc.clone());
-        let mut parts: Vec<(PatId, At), A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<(PatId, At, bool), A> = Vec::new_in(self.alloc);
+        let mut parts: Vec<(PatId, At), A> = Vec::new_in(self.alloc);
         todo.push((root, at, owned));
         while let Some((p, at, owned)) = todo.pop() {
             let pat = self.pat(p)?;
@@ -268,7 +268,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// (`only_variant`), a slice pattern over a slice `[T]` (its length untested). The same
     /// refusals `bind_pattern_at` makes on its way.
     fn refuse_refutable(&mut self, root: PatId) -> Result<(), BuildError> {
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(root);
         while let Some(p) = todo.pop() {
             let elems = match self.pat(p)? {
@@ -336,7 +336,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// (each binds from a value there is none of) are refused by name.
     pub(in crate::walk) fn declare_let(&mut self, pat: PatId) -> Result<(), BuildError> {
         self.refuse_refutable(pat)?;
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(pat);
         while let Some(p) = todo.pop() {
             let elems = match self.pat(p)? {
@@ -485,7 +485,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// binding's subpattern is not looked into: a by-value binding takes the whole part, and
     /// a `ref` one borrows it (ref_bind.rs builds that `let`).
     fn let_leaves_drops(&mut self, root: PatId) -> Result<bool, BuildError> {
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(root);
         while let Some(p) = todo.pop() {
             let pat = self.pat(p)?;

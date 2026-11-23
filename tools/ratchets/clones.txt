@@ -9,7 +9,7 @@ blaze-ask	6
 blaze-audit	30
 blaze-blake3	1
 blaze-bstd-convert	102
-blaze-build	286
+blaze-build	12
 blaze-build-script	22
 blaze-c	2
 blaze-cas	122
@@ -53,7 +53,7 @@ blaze-lint	6
 blaze-lint-defs	1
 blaze-lir	29
 blaze-lower	20
-blaze-manifest	298
+blaze-manifest	243
 blaze-mem	5
 blaze-memo	4
 blaze-memo-macros	51
@@ -72,8 +72,8 @@ blaze-real	46
 blaze-rel	7
 blaze-remote	51
 blaze-report	1
-blaze-resolve	124
-blaze-scope	283
+blaze-resolve	68
+blaze-scope	75
 blaze-screen	8
 blaze-script	50
 blaze-semver	12
@@ -95,7 +95,7 @@ blaze-typeck	20
 blaze-unit-graph	61
 blaze-url	1
 blaze-watch	22
-blaze-world	144
+blaze-world	18
 gpu-macros	15
 harness/harness	126
 harness/harness-browser	54

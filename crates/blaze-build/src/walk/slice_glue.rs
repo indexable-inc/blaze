@@ -37,7 +37,7 @@ fn ty_error(error: TyErr) -> BuildError {
     }
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether ground type `g`, `drop_glue`'s argument, is a slice or `str`: the pointees whose
     /// glue [`Self::slice_glue`] builds.
     pub(super) fn is_slice_pointee(&self, g: PTy) -> Result<bool, BuildError> {

@@ -25,6 +25,7 @@ use crate::{Dependency, FeatureValue, PackageId, PackageIdSpec, Registry, Resolv
 
 use crate::resolver::{FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_ids::radix;
+use blaze_own::{LocalShare, Share};
 use std::alloc::Global;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -81,7 +82,7 @@ impl<'a, T: Registry> RegistryQueryer<'a, T> {
         dep: &Dependency,
         first_version: Option<VersionOrdering>,
     ) -> CargoResult<Lookup<Rc<[Summary]>>> {
-        let key = (dep.clone(), first_version);
+        let key = (dep.share(), first_version);
         if let Some(found) = self.candidates.get(&key) {
             return Ok(Lookup::Answered(Rc::clone(found)));
         }
@@ -221,7 +222,7 @@ impl<'a, T: Registry> RegistryQueryer<'a, T> {
     ) -> ActivateResult<Rc<(Set<InternedString, FixedState, Global>, Rc<[DepInfo]>)>> {
         // if we have calculated a result before, then we can just return it,
         // as it is a "pure" query of its arguments.
-        if let Some(out) = self.summary_cache.get(&(parent, candidate.clone(), opts.clone())) {
+        if let Some(out) = self.summary_cache.get(&(parent, candidate.share(), opts.local_share())) {
             return Ok(Rc::clone(out));
         }
         // First, figure out our set of dependencies based on the requested set
@@ -255,7 +256,7 @@ impl<'a, T: Registry> RegistryQueryer<'a, T> {
 
         // If we succeed we add the result to the cache so we can use it again next time.
         // We don't cache the failure cases as they don't impl Clone.
-        self.summary_cache.insert((parent, candidate.clone(), opts.clone()), Rc::clone(&out));
+        self.summary_cache.insert((parent, candidate.share(), opts.local_share()), Rc::clone(&out));
 
         Ok(out)
     }
@@ -290,7 +291,7 @@ pub(super) fn resolve_features<'b>(
         // name.
         let mut base = reqs.deps.get(&dep.name_in_toml()).unwrap_or(&default_dep).clone();
         base.extend(dep.features().iter());
-        ret.push((dep.clone(), Rc::new(base)));
+        ret.push((dep.share(), Rc::new(base)));
     }
 
     // This is a special case for command-line `--features

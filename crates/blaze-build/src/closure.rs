@@ -72,7 +72,7 @@ fn method_name(which: FnTrait) -> &'static str {
     }
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether the checker resolved call `e` through a `Fn*` trait (its callee row names
     /// `call`, `call_mut` or `call_once`): a callee of a type parameter `F: Fn*(..)`, which an
     /// instance may ground to a closure. The Reference, "Call expressions": "for closures and
@@ -96,7 +96,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         };
         let facts = self.adts.facts();
         let c = facts.closure(owner, ordinal).ok_or(TyErr::Unsupported("a closure whose facts the world did not answer"))?;
-        let mut a: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut a: Vec<PTy, A> = Vec::new_in(self.alloc);
         a.extend_from_slice(self.ground.view().list(args).map_err(|_| TyErr::Malformed("a list past the ground table"))?);
         let sig = crate::instance::ground(c.types, c.sig, &a, self.ground, self.scratch, facts).map_err(TyErr::Other)?;
         let env = crate::instance::ground(c.types, c.env, &a, self.ground, self.scratch, facts).map_err(TyErr::Other)?;
@@ -168,7 +168,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let t = self.expr_ty(e)?;
         let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
         let repr = self.repr(g).map_err(|error| Self::ty_err(e, error))?;
-        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc.clone());
+        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc);
         for f in self.checked.env_fields(e) {
             fields.push(f);
         }
@@ -182,7 +182,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             self.push_val(V::None, None);
             return Ok(());
         }
-        let mut offs = Vec::new_in(self.alloc.clone());
+        let mut offs = Vec::new_in(self.alloc);
         self.capture_offsets(e, g, fields.len(), &mut offs)?;
         let at = self.temp(repr);
         for (j, &f) in fields.iter().enumerate() {
@@ -244,7 +244,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         };
         let all = self.ground.view().list(l).map_err(|_| malformed("a list past the ground table"))?;
         let (&output, inputs) = all.split_last().ok_or(malformed("a closure's signature without its output"))?;
-        let mut own: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut own: Vec<PTy, A> = Vec::new_in(self.alloc);
         own.extend_from_slice(inputs);
         let list = self.ground.intern_list(&own).map_err(full)?;
         Ok((self.ground.intern(PNode::Tuple(list)).map_err(full)?, output))
@@ -284,8 +284,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let instance = self.body_instance(e, g, parts)?;
         let n = written.len() + 1;
         let base = self.vals.len().checked_sub(n).ok_or(malformed("a closure call's arguments missing from the value stack (a build bug)"))?;
-        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(n, self.alloc);
+        let mut passes = Vec::with_capacity_in(n, self.alloc);
         match parts.kind {
             FnTrait::Fn | FnTrait::FnMut => {
                 let V::Place(p, off) = self.vals[base] else {
@@ -344,7 +344,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let PNode::Tuple(l) = self.ground_node(tuple).map_err(|error| Self::ty_err(closure, error))? else {
             return Err(malformed("a closure's arguments not a tuple"));
         };
-        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc);
         inputs.extend_from_slice(self.ground.view().list(l).map_err(|_| malformed("a list past the ground table"))?);
         if inputs.len() != self.body.params.len() {
             return Err(malformed("a closure whose signature and parameters differ in number"));
@@ -353,8 +353,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             FnTrait::Fn | FnTrait::FnMut => Repr::Ptr,
             FnTrait::FnOnce => self.repr(g).map_err(|error| Self::ty_err(closure, error))?,
         };
-        let mut reprs = Vec::with_capacity_in(inputs.len() + 1, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(inputs.len() + 1, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(inputs.len() + 1, self.alloc);
+        let mut passes = Vec::with_capacity_in(inputs.len() + 1, self.alloc);
         reprs.push(env_repr);
         passes.push(match parts.kind {
             FnTrait::Fn | FnTrait::FnMut => self.rust_pass(Repr::Ptr)?,
@@ -373,7 +373,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let entry = self.create();
         self.reached[entry.index()] = true;
         self.begin(entry);
-        let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc);
         for p in params.iter() {
             values.push(self.b.param(p.ty));
         }
@@ -389,11 +389,11 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             V::None => None,
             V::Unsized(..) => return Err(malformed("a closure's environment as an unsized place")),
         };
-        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc.clone());
+        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc);
         for f in self.checked.env_fields(closure) {
             fields.push(f);
         }
-        let mut offs = Vec::new_in(self.alloc.clone());
+        let mut offs = Vec::new_in(self.alloc);
         self.capture_offsets(closure, g, fields.len(), &mut offs)?;
         for (j, &f) in fields.iter().enumerate() {
             // A place below its binding (`x.a`): its uses read the field (walk/moves/env_places.rs).
@@ -467,12 +467,12 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let PNode::Tuple(l) = self.ground_node(tuple).map_err(|error| Self::ty_err(closure, error))? else {
             return Err(malformed("a closure's arguments not a tuple"));
         };
-        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc);
         inputs.extend_from_slice(self.ground.view().list(l).map_err(|_| malformed("a list past the ground table"))?);
         let env_repr = self.repr(g).map_err(|error| Self::ty_err(closure, error))?;
         let n = inputs.len() + 1;
-        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(n, self.alloc);
+        let mut passes = Vec::with_capacity_in(n, self.alloc);
         match which {
             FnTrait::Fn | FnTrait::FnMut => {
                 reprs.push(Repr::Ptr);
@@ -496,7 +496,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let entry = self.create();
         self.reached[entry.index()] = true;
         self.begin(entry);
-        let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc);
         for p in params.iter() {
             values.push(self.b.param(p.ty));
         }
@@ -569,7 +569,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let PNode::Tuple(l) = self.ground_node(tuple).map_err(sig_err)? else {
             return Err(malformed("a fn shim's arguments not a tuple"));
         };
-        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc);
         inputs.extend_from_slice(self.ground.view().list(l).map_err(past)?);
         // The direct callee (a fn item's instance) or none (a pointer), the callee's ABI, the
         // item a C refusal names, and the output.
@@ -608,8 +608,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             FnTrait::FnOnce => self.repr(callee).map_err(sig_err)?,
         };
         let n = inputs.len() + 1;
-        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(n, self.alloc);
+        let mut passes = Vec::with_capacity_in(n, self.alloc);
         reprs.push(self_repr);
         passes.push(self.rust_pass(self_repr)?);
         for &gi in inputs.iter() {
@@ -625,7 +625,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let entry = self.create();
         self.reached[entry.index()] = true;
         self.begin(entry);
-        let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc);
         for p in params.iter() {
             values.push(self.b.param(p.ty));
         }
@@ -658,8 +658,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 Callee::Pointer(p)
             }
         };
-        let mut treprs = Vec::with_capacity_in(n - 1, self.alloc.clone());
-        let mut tpasses = Vec::with_capacity_in(n - 1, self.alloc.clone());
+        let mut treprs = Vec::with_capacity_in(n - 1, self.alloc);
+        let mut tpasses = Vec::with_capacity_in(n - 1, self.alloc);
         for i in 1..n {
             let v = self.take_passed(reprs[i], passes[i], &mut next)?;
             self.push_val(v, None);
@@ -728,7 +728,7 @@ pub(crate) fn empty_record(a: Alloc<'_>) -> Checked<'_> {
 /// Builds the shim of fn item or fn pointer `callee` as `Fn*` method `which` at `[callee,
 /// tuple]` (lib.rs `build_fn_shim`, `Walk::run_fn_shim`). Its walk is given an empty body,
 /// named by the trait method, and an empty check record: neither is read.
-pub(crate) fn build_fn_shim<A: Allocator + Clone>(
+pub(crate) fn build_fn_shim<A: Allocator + Copy>(
     callee: PTy,
     tuple: PTy,
     which: FnTrait,

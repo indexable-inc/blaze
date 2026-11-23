@@ -28,6 +28,8 @@ pub struct Summary {
     inner: Arc<Inner>,
 }
 
+impl blaze_own::Share for Summary {}
+
 #[derive(Debug, Clone)]
 struct Inner {
     package_id: PackageId,
@@ -241,7 +243,7 @@ where
             match fv {
                 Feature(f) => {
                     if !features.contains_key(f) {
-                        let (feature, value) = (*feature, fv.clone()); // clone: error path
+                        let (feature, value) = (*feature, *fv);
                         if !is_any_dep {
                             let closest = closest_msg(f, features.keys(), |k| k, "feature");
                             return Err(ResolveError::FeatureUnknown { feature, value, closest });
@@ -258,7 +260,7 @@ where
                     }
                 }
                 Dep { dep_name } => {
-                    let (feature, value, dep) = (*feature, fv.clone(), *dep_name); // clone: error path
+                    let (feature, value, dep) = (*feature, *fv, *dep_name);
                     if !is_any_dep {
                         return Err(ResolveError::FeatureDepNotListed { feature, value, dep });
                     }
@@ -268,7 +270,7 @@ where
                 }
                 DepFeature { dep_name, dep_feature, weak } => {
                     if dep_feature.contains('/') {
-                        let value = fv.clone(); // clone: error path
+                        let value = *fv;
                         return Err(ResolveError::FeatureSlashes { feature: *feature, value });
                     }
                     if let Some(stripped_dep) = dep_name.strip_prefix("dep:") {
@@ -276,7 +278,7 @@ where
                         let is_optional = dep_map.get(stripped_dep).is_some_and(|&o| o);
                         let help = (!(*weak || has_other_dep || !is_optional))
                             .then(|| (InternedString::new(stripped_dep), *dep_feature));
-                        let value = fv.clone(); // clone: error path
+                        let value = *fv;
                         return Err(ResolveError::FeatureDepAndSlash {
                             feature: *feature,
                             value,
@@ -286,13 +288,13 @@ where
                     if !is_any_dep {
                         return Err(ResolveError::MissingDependency(MissingDependencyError {
                             feature: *feature,
-                            feature_value: fv.clone(), // clone: error path
+                            feature_value: *fv,
                             dep_name: *dep_name,
                             weak_optional: *weak,
                         }));
                     }
                     if *weak && !is_optional_dep {
-                        let (feature, value, dep) = (*feature, fv.clone(), *dep_name); // clone: error path
+                        let (feature, value, dep) = (*feature, *fv, *dep_name);
                         return Err(ResolveError::FeatureWeakNotOptional { feature, value, dep });
                     }
                 }
@@ -319,7 +321,7 @@ where
 }
 
 /// One entry of a feature's list.
-#[derive(Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub enum FeatureValue {
     /// `feat`: another feature, or the implicit feature of an optional dependency.
     Feature(InternedString),
