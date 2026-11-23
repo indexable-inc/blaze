@@ -39,11 +39,9 @@ impl Names for NoNames {
     }
 }
 
-#[repr(C, align(4096))]
-struct PollPage([u8; 4096]);
-static POLL: PollPage = PollPage([0; 4096]);
-
-struct LeafWords;
+struct LeafWords {
+    page: u64,
+}
 impl Words for LeafWords {
     fn word(&mut self, target: Target, _call: bool) -> Result<u64, ImageError> {
         Err(ImageError::Unbound { target })
@@ -51,7 +49,7 @@ impl Words for LeafWords {
 
     fn value(&mut self, target: Target) -> Result<u64, ImageError> {
         if target.space == Space::Outside && target.symbol == Symbol::of_name(POLL_PAGE) {
-            Ok(core::ptr::addr_of!(POLL) as u64)
+            Ok(self.page)
         } else {
             Err(ImageError::Unbound { target })
         }
@@ -71,11 +69,15 @@ fn load_exec(emitted: Emitted<'static>) -> (Executable, usize) {
     let align = 1usize << view.relro_align();
     let sym = Symbol::of_name("blaze-emit sota test");
     let mut done: Result<(), PlaceError> = Ok(());
-    let exec = Executable::written(code_bytes, relro_len + align, |code, data| {
-        let skip = (align - data.as_ptr() as usize % align) % align;
-        let relro = &mut data[skip..skip + relro_len];
+    let exec = Executable::written(code_bytes, 8192 + relro_len + align, |code, data| {
+        let poll_skip = (4096 - data.as_ptr() as usize % 4096) % 4096;
+        let (poll_and_pad, rest) = data.split_at_mut(poll_skip + 4096);
+        let poll = &mut poll_and_pad[poll_skip..];
+        poll.fill(0);
+        let skip = (align - rest.as_ptr() as usize % align) % align;
+        let relro = &mut rest[skip..skip + relro_len];
         let at = At { code: code.as_ptr() as u64, relro: relro.as_ptr() as u64 };
-        let mut words = LeafWords;
+        let mut words = LeafWords { page: poll.as_ptr() as u64 };
         done = place(&view, sym, at, &mut words, code, relro);
     })
     .expect("W^X exec mapping must succeed");

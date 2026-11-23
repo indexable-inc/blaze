@@ -92,31 +92,31 @@ impl fmt::Display for ProductRowError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             ProductRowError::InvalidFieldName { name } => {
-                write!(f, "invalid product field name `{name}`")
+                write!(f, "invalid product field name '{name}'")
             }
             ProductRowError::DuplicateSlot { key } => {
-                write!(f, "duplicate product slot `{key:?}`")
+                write!(f, "duplicate product slot '{key:?}'")
             }
             ProductRowError::MissingLacksBound { row, slot } => {
-                write!(f, "extending open row `{row:?}` with `{slot:?}` requires `Lacks` bound")
+                write!(f, "extending open row '{row:?}' with '{slot:?}' requires `Lacks` bound")
             }
             ProductRowError::LacksViolated { row, slot } => {
-                write!(f, "row `{row:?}` violated `Lacks` constraint for `{slot:?}`")
+                write!(f, "row '{row:?}' violated `Lacks` constraint for '{slot:?}'")
             }
             ProductRowError::MissingSlot { key } => {
-                write!(f, "missing required product slot `{key:?}`")
+                write!(f, "missing required product slot '{key:?}'")
             }
             ProductRowError::UnexpectedSlot { key } => {
-                write!(f, "unexpected extra product slot `{key:?}`")
+                write!(f, "unexpected extra product slot '{key:?}'")
             }
             ProductRowError::TypeMismatch { key, expected, found } => {
-                write!(f, "slot `{key:?}` type mismatch: expected {expected:?}, found {found:?}")
+                write!(f, "slot '{key:?}' type mismatch: expected {expected:?}, found {found:?}")
             }
             ProductRowError::BothOpen { lhs, rhs } => {
-                write!(f, "cannot unify two open rows `{lhs:?}` and `{rhs:?}` directly")
+                write!(f, "cannot unify two open rows '{lhs:?}' and '{rhs:?}' directly")
             }
             ProductRowError::UnknownSlot { key } => {
-                write!(f, "unknown product slot `{key:?}`")
+                write!(f, "unknown product slot '{key:?}'")
             }
         }
     }

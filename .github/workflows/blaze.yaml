@@ -262,51 +262,7 @@ jobs:
         run: cargo +"$(cat pins/toolchain)" check --locked --workspace --exclude blaze-std --all-targets --message-format short
       - name: cargo test --workspace --exclude blaze-std
         run: |
-          set -euo pipefail
-          tc="$(cat pins/toolchain)"
-          # Keep TMPDIR on $HOME's filesystem so test shelf hard-links succeed with 0 bytes copied
-          # (avoiding EXDEV copying the multi-GB toolchain shelf into /tmp tmpfs per test binary).
-          tmp_dir="$(mktemp -d "$HOME/.ci-tmp.XXXXXX")"
-          trap 'rm -rf "$tmp_dir"' EXIT
-          export TMPDIR="$tmp_dir"
-          # Keep non-daemon integration tests from spawning dozens of orphaned 64-thread daemons
-          # into temporary homes; daemon_tests explicitly clears BLAZE_NO_DAEMON to test the daemon.
-          export BLAZE_NO_DAEMON=1
-          bins="$tmp_dir/bins.txt"
-          cargo +"$tc" test --locked --workspace --exclude blaze-std --no-run --message-format=json-render-diagnostics \
-            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | "\(.manifest_path | sub("/Cargo\\.toml$"; ""))|\(.executable)"' \
-            | sort -u > "$bins"
-          nproc_val="$(nproc 2>/dev/null || echo 8)"
-          jobs=$(( nproc_val / 4 ))
-          [ "$jobs" -lt 1 ] && jobs=1
-          [ "$jobs" -gt 16 ] && jobs=16
-          export FAIL_DIR="$tmp_dir"
-          export RUST_TEST_THREADS=4
-          sysroot_lib="$(rustc +"$tc" --print sysroot)/lib"
-          target_lib="$(rustc +"$tc" --print target-libdir)"
-          export LD_LIBRARY_PATH="$sysroot_lib:$target_lib:${LD_LIBRARY_PATH:-}"
-          tr '\n' '\0' < "$bins" | xargs -0 -r -n 1 -P "$jobs" bash -c '
-            dir="${1%%|*}"
-            bin="${1#*|}"
-            name="$(basename "$bin")"
-            out="$FAIL_DIR/$name.log"
-            if (cd "$dir" && CARGO_MANIFEST_DIR="$dir" timeout 600 "$bin") >"$out" 2>&1; then
-              rm -f "$out"
-            else
-              rc=$?
-              echo "::error::FAIL $name (exit $rc)"
-              cat "$out"
-              echo "$name" >> "$FAIL_DIR/failed.list"
-            fi
-          ' _
-          if ! cargo +"$tc" test --locked --workspace --exclude blaze-std --doc --no-fail-fast; then
-            echo "doctests" >> "$tmp_dir/failed.list"
-          fi
-          if [ -s "$tmp_dir/failed.list" ]; then
-            echo "::error::failing test binaries:"
-            cat "$tmp_dir/failed.list"
-            exit 1
-          fi
+          "$BLAZE_SCRIPTS/ci_test" '{"exclude": ["blaze-std"]}'
       # D180: blaze-sys's compiled objects reference no C-library symbol on Linux (both
       # architectures), and on macOS only the libSystem symbols of
       # tools/ratchets/blaze-sys-libsystem.txt (scripts/src/bin/sys_imports.rs). Its lib alone,
@@ -334,23 +290,54 @@ jobs:
     timeout-minutes: 5
     steps:
       - env:
-          NEEDS: ${{ toJSON(needs) }}
           TIER: ${{ needs.changes.outputs.tier }}
+          R_CHANGES: ${{ needs.changes.result }}
+          R_SCRIPTS: ${{ needs.scripts.result }}
+          R_WORKFLOWS: ${{ needs.workflows.result }}
+          R_LEAN: ${{ needs.lean.result }}
+          R_CARGO: ${{ needs.cargo.result }}
         run: |
-          echo "$NEEDS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"'
-          ! echo "$NEEDS" | jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' > /dev/null
+          set -euo pipefail
+          printf '%s\t%s\n' \
+            "$R_CHANGES" changes \
+            "$R_SCRIPTS" scripts \
+            "$R_WORKFLOWS" workflows \
+            "$R_LEAN" lean \
+            "$R_CARGO" cargo
           # What this tier was expected to run, each of which has to have succeeded: the absence
           # of a failure is not a pass (agents.json A39), and a job this tier runs that was
           # skipped is a gate that tested nothing. `none` (a change of no code) runs the first
           # four; any other tier the cargo check and tests too.
           case "$TIER" in
-            none) expected='["changes","scripts","workflows","lean"]' ;;
-            gate|warm) expected='["changes","scripts","workflows","lean","cargo"]' ;;
+            none) expected="changes scripts workflows lean" ;;
+            gate|warm) expected="changes scripts workflows lean cargo" ;;
             *) echo "::error::the tier is '$TIER', none of none, gate and warm: what this run was to test is not known"; exit 1 ;;
           esac
-          missed=$(echo "$NEEDS" | jq -r --argjson expected "$expected" '$expected - [to_entries[] | select(.value.result == "success") | .key] | join(", ")')
+          failed=0
+          for r in "$R_CHANGES" "$R_SCRIPTS" "$R_WORKFLOWS" "$R_LEAN" "$R_CARGO"; do
+            if [ "$r" = failure ] || [ "$r" = cancelled ]; then failed=1; fi
+          done
+          result_of() {
+            case "$1" in
+              changes) printf '%s' "$R_CHANGES" ;;
+              scripts) printf '%s' "$R_SCRIPTS" ;;
+              workflows) printf '%s' "$R_WORKFLOWS" ;;
+              lean) printf '%s' "$R_LEAN" ;;
+              cargo) printf '%s' "$R_CARGO" ;;
+            esac
+          }
+          missed=""
+          for job in $expected; do
+            if [ "$(result_of "$job")" != success ]; then
+              missed="${missed:+$missed, }$job"
+            fi
+          done
           if [ -n "$missed" ]; then
             echo "::error::tier $TIER expected these jobs to run and succeed, and they did not: $missed"
             exit 1
           fi
-          echo "tier $TIER: each of $expected ran and succeeded"
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::one or more jobs failed or were cancelled"
+            exit 1
+          fi
+          echo "tier $TIER: each of [$expected] ran and succeeded"

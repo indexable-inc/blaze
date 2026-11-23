@@ -82,7 +82,7 @@ impl fmt::Display for PatTyError {
                 write!(f, "pattern type has no valid values")
             }
             PatTyError::InvalidBitWidth { width } => {
-                write!(f, "invalid integer bit width `{width}`")
+                write!(f, "invalid integer bit width '{width}'")
             }
             PatTyError::VariantOutOfBounds { variant, total } => {
                 write!(f, "variant index {variant} out of range for enum with {total} variants")

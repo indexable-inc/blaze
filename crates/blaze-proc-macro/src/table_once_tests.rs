@@ -76,7 +76,6 @@ fn table_once_a_row_is_two_blocks_of_their_own_length() {
     let mut list_len = 0usize;
     list_pieces(&produced.reads, |piece| list_len += piece.len()).expect("keepable");
     let floor = list_len + answer_len(&produced);
-    println!("row in one block per part: {made} allocations (floor 2), {bytes} bytes live (floor {floor})");
     assert_eq!(made, 2, "a row's parts were grown, not made once");
     assert_eq!(live, 2, "a row is two blocks held until the keep");
     assert_eq!(bytes, floor, "a row's blocks are not of their own length");

@@ -29,7 +29,7 @@ use blaze_own::{AVec, Alloc, Vec};
 use blaze_tier::record::{encode, place_resolved, read, seal};
 use blaze_tier::{Emitted, Table, TierError, TierName};
 
-use super::{Nameless, POLL, PollOnly, TierFn, fast, reference, table};
+use super::{Nameless, POLL_PAGE_ROOM, PollOnly, TierFn, carve_poll_page, fast, reference, table};
 use crate::pass::DATA_ALIGN_PAST;
 use crate::tests::one;
 
@@ -104,13 +104,14 @@ fn placed(record: &[u8], tier: TierName, values: &[u8], shift: usize) -> Result<
     let (code_align, relro_align) = (1usize << view.code_align(), 1usize << view.relro_align());
     let symbol = Symbol::of_name("blaze-emit tier_tests::own_data: the function under test");
     let mut done: Result<u64, PlaceError> = Ok(0);
-    let exec = Executable::written(code_len + code_align + shift, relro_len + relro_align + shift, |code, data| {
+    let exec = Executable::written(code_len + code_align + shift, POLL_PAGE_ROOM + relro_len + relro_align + shift, |code, data| {
+        let (page, rest) = carve_poll_page(data);
         let c = (code_align - code.as_ptr() as usize % code_align) % code_align + shift;
-        let r = (relro_align - data.as_ptr() as usize % relro_align) % relro_align + shift;
+        let r = (relro_align - rest.as_ptr() as usize % relro_align) % relro_align + shift;
         let code = &mut code[c..c + code_len];
-        let relro = &mut data[r..r + relro_len];
+        let relro = &mut rest[r..r + relro_len];
         let at = At { code: code.as_ptr() as u64, relro: relro.as_ptr() as u64 };
-        let mut words = PollOnly { page: core::ptr::addr_of!(POLL) as u64 };
+        let mut words = PollOnly { page };
         done = place_resolved(&view, symbol, at, &mut words, code, relro, values).map(|()| at.code);
     })
     .expect("the code maps");

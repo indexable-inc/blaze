@@ -1639,9 +1639,38 @@ fn the_one_form_slots_answer_or_refuse_by_name() {
     let file = scratch_file(&scratch, "f", b"");
     match AtomicWrite::choose(atomic_write_bounds(file.fd()).unwrap()) {
         Ok(slot) => {
-            let unit = vec![1u8; slot.min() as usize];
-            assert_eq!(slot.write(file.fd(), &unit, 0), Ok(unit.len()));
-            assert_eq!(slot.write(file.fd(), &unit, 1), Err(Errno::Inval), "unaligned");
+            // Linux requires O_DIRECT and an aligned buffer for RWF_ATOMIC (`kiocb_set_rw_flags`
+            // refuses buffered descriptors with EOPNOTSUPP).
+            let direct = openat(
+                scratch.fd(),
+                Path::new(c"f"),
+                OpenFlags::READ_WRITE | OpenFlags::CLOSE_ON_EXEC | OpenFlags::DIRECT,
+                0,
+            );
+            // SAFETY: querying the host page size; no memory touched.
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            let len = slot.min() as usize;
+            let map_len = len.next_multiple_of(page);
+            // SAFETY: a private anonymous page-aligned buffer, filled and unmapped below.
+            let buf_ptr = unsafe {
+                mmap(None, map_len, Prot::READ | Prot::WRITE, MapFlags::PRIVATE | MapFlags::ANONYMOUS, None, 0)
+            }
+            .unwrap();
+            // SAFETY: `buf_ptr` points to `map_len >= len` freshly mapped writable bytes.
+            let unit = unsafe { core::slice::from_raw_parts_mut(buf_ptr.as_ptr(), len) };
+            unit.fill(1u8);
+            match direct {
+                Ok(direct_fd) => match slot.write(direct_fd.fd(), unit, 0) {
+                    Ok(n) => assert_eq!(n, unit.len()),
+                    Err(Errno::OpNotSupp) => println!("atomic write: refused EOPNOTSUPP on this filesystem"),
+                    other => panic!("atomic write on O_DIRECT fd: {other:?}"),
+                },
+                Err(Errno::Inval | Errno::OpNotSupp) => println!("atomic write: O_DIRECT refused on this filesystem"),
+                Err(errno) => panic!("opening O_DIRECT fd: {errno:?}"),
+            }
+            assert_eq!(slot.write(file.fd(), unit, 1), Err(Errno::Inval), "unaligned");
+            // SAFETY: unmaps the private anonymous buffer mapped above.
+            unsafe { munmap(buf_ptr, map_len) }.unwrap();
         }
         Err(refused) => println!("{refused}"),
     }

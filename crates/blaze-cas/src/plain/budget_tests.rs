@@ -157,14 +157,14 @@ fn verify_surviving_roots(store: &Plain<&Frame>, now_ns: u64, model: &Map<[u8; 3
         if exp <= now_ns {
             continue;
         }
-        let got_root = store.get(&root_key).unwrap_or_else(|| panic!("surviving root `{name}` record missing"));
+        let got_root = store.get(&root_key).unwrap_or_else(|| panic!("surviving root '{name}' record missing"));
         for chunk in got_root.bytes.chunks_exact(32) {
             let raw: [u8; 32] = chunk.try_into().expect("32 bytes");
             let rec_key = Key(ContentId(raw));
-            let got = store.get(&rec_key).unwrap_or_else(|| panic!("surviving root `{name}` has hole at {rec_key:?}"));
+            let got = store.get(&rec_key).unwrap_or_else(|| panic!("surviving root '{name}' has hole at {rec_key:?}"));
             if let Some(&(n, size)) = model.get(&raw) {
                 let want = value(n, size, root);
-                assert_eq!(got.bytes, want.as_slice(), "corrupt bytes for surviving root `{name}` record {n}");
+                assert_eq!(got.bytes, want.as_slice(), "corrupt bytes for surviving root '{name}' record {n}");
                 checked_records += 1;
             }
         }
@@ -925,17 +925,17 @@ fn multi_slice_compact_foreground_reclaims_many_segments_and_roots_soundly() {
         if exp <= now_ns {
             continue;
         }
-        let root_got = lent.get(&root_key).expect("lent get root").unwrap_or_else(|| panic!("surviving root `{name}` missing in Lent"));
-        let root_snap = snap.get(&root_key).expect("snap get root").unwrap_or_else(|| panic!("surviving root `{name}` missing in Snapshot"));
-        assert_eq!(root_got.bytes, root_snap, "root `{name}` bytes differ between Lent and Snapshot");
+        let root_got = lent.get(&root_key).expect("lent get root").unwrap_or_else(|| panic!("surviving root '{name}' missing in Lent"));
+        let root_snap = snap.get(&root_key).expect("snap get root").unwrap_or_else(|| panic!("surviving root '{name}' missing in Snapshot"));
+        assert_eq!(root_got.bytes, root_snap, "root '{name}' bytes differ between Lent and Snapshot");
         let check_leaf = |raw: [u8; 32]| {
             let k = Key(ContentId(raw));
             let Some(&(id, sz)) = model.get(&raw) else {
                 return;
             };
             let want = value(id, sz, &root);
-            let g1 = lent.get(&k).expect("lent get").unwrap_or_else(|| panic!("key {id} of `{name}` missing in Lent"));
-            let g2 = snap.get(&k).expect("snap get").unwrap_or_else(|| panic!("key {id} of `{name}` missing in Snapshot"));
+            let g1 = lent.get(&k).expect("lent get").unwrap_or_else(|| panic!("key {id} of '{name}' missing in Lent"));
+            let g2 = snap.get(&k).expect("snap get").unwrap_or_else(|| panic!("key {id} of '{name}' missing in Snapshot"));
             assert_eq!(g1.bytes, want.as_slice(), "Lent mismatch for key {id}");
             assert_eq!(g2, want.as_slice(), "Snapshot mismatch for key {id}");
         };

@@ -76,7 +76,7 @@ const BORROWS_COUNT: &str = "type-checked whole had the move and borrow check re
 /// prints it now.
 const OLD_FIRST: &str = "note: check-old: the OLD checker";
 /// The usage line of a word that is no command (main.rs `command`'s last arm).
-const NO_COMMAND: &str = "the command is check, run, test, clean or explain";
+const NO_COMMAND: &str = "the command is check, run, test, peer, clean, gc, warm-toolchain or explain";
 
 fn write(path: &Path, text: &str) {
     if let Some(dir) = path.parent() {

@@ -17,7 +17,7 @@ use blaze_own::{AVec, Alloc, Vec};
 use blaze_tier::record::{Declare, DeclaredKind, Declares, declare, encode, place, read, seal};
 use blaze_tier::{Emitted, Named, Names, Outside, RoutinePlaces, Table, TierName};
 
-use super::{POLL, TierFn, fast, reference, table};
+use super::{POLL_PAGE_ROOM, TierFn, carve_poll_page, fast, reference, table};
 use crate::compose::emit::POLL_PAGE;
 use crate::tls_index_tests::bump;
 use crate::tls_index_tests::run::{Desc, GETTER_CALLS, getter, pthread_getspecific};
@@ -101,17 +101,18 @@ fn placed(mut e: Emitted<'static>, tier: TierName, desc: &'static Desc) -> Execu
     let align = 1usize << view.relro_align();
     let symbol = Symbol::of_name("blaze-emit tier_tests::thread_locals: bump");
     let mut done: Result<(), PlaceError> = Ok(());
-    let exec = Executable::written(view.code().len(), relro_len + align + 8 + 24, |code, data| {
-        let skip = (align - data.as_ptr() as usize % align) % align;
+    let exec = Executable::written(view.code().len(), POLL_PAGE_ROOM + relro_len + align + 8 + 24, |code, data| {
+        let (page, rest) = carve_poll_page(data);
+        let skip = (align - rest.as_ptr() as usize % align) % align;
         let words_at = skip + relro_len.next_multiple_of(8);
         let values = [desc as *const Desc as u64, getter as usize as u64, 0];
         for (k, value) in values.into_iter().enumerate() {
-            data[words_at + 8 * k..words_at + 8 * k + 8].copy_from_slice(&value.to_le_bytes());
+            rest[words_at + 8 * k..words_at + 8 * k + 8].copy_from_slice(&value.to_le_bytes());
         }
-        let words = data[words_at..].as_ptr() as u64;
-        let relro = &mut data[skip..skip + relro_len];
+        let words = rest[words_at..].as_ptr() as u64;
+        let relro = &mut rest[skip..skip + relro_len];
         let at = At { code: code.as_ptr() as u64, relro: relro.as_ptr() as u64 };
-        let mut bound = Bound { page: core::ptr::addr_of!(POLL) as u64, words };
+        let mut bound = Bound { page, words };
         done = place(&view, symbol, at, &mut bound, code, relro);
     })
     .expect("the code maps");
