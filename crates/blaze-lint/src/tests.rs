@@ -651,6 +651,7 @@ fn new_rules_are_off_until_named() {
         Rule::BoolAsInt,
         Rule::ManualSliceIdioms,
         Rule::TestAmbientLeak,
+        Rule::MutForUniqBorrow,
     ] {
         assert!(!Step::Strict.rules().runs(rule), "{} runs in strict", rule.name());
         assert!(Step::Strict.rules().with(rule).runs(rule));
@@ -2377,5 +2378,29 @@ fn test_ambient_leak_catches_test_global_alloc_and_extern_std() {
     none(rule, &[
         "extern crate std;\nfn prod() { let _a = Alloc::global(); }",
         "#[test]\nfn clean() { let heap = blaze_own::testing::heap(); let _a = heap.alloc(); }",
+    ]);
+}
+
+#[test]
+fn mut_for_uniq_borrow_autofixes_non_rebound_let_mut_and_keeps_rebindings() {
+    let rule = Rule::MutForUniqBorrow;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("mut-for-uniq-borrow"), Some(rule));
+    assert_eq!(Rule::from_lint("mut_for_uniq_borrow"), Some(rule));
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    let src = "fn demo() -> i32 { let mut n = 41; bump(&uniq n); n }";
+    assert!(lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 1);
+    assert_eq!(out.list[0].template, Template::MutForUniqBorrow);
+    let fixed = apply_all(src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(fixed.as_str(), "fn demo() -> i32 { let n = 41; bump(&uniq n); n }");
+
+    // Actual local rebinding (`n = ..`, `n += ..`) keeps `let mut`.
+    none(rule, &[
+        "fn rebound() -> i32 { let mut n = 0; bump(&uniq n); n = 5; n }",
+        "fn compound() -> i32 { let mut n = 0; bump(&uniq n); n += 1; n }",
+        "fn no_borrow() -> i32 { let mut n = 0; n }",
     ]);
 }

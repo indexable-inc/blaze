@@ -225,6 +225,32 @@ impl FnHeader {
     pub const fn bound_vars(self) -> u16 {
         Cast::<u32, u16>::truncate(self.0 >> 16)
     }
+
+    /// Attaches an explicit Blaze effect list (`expect(..)`) into header bits `10..15`.
+    /// Bit 10 marks an explicit list; bits 11..14 store the 4-bit [`crate::effect_ty::EffectSet`].
+    pub const fn with_effects(self, effects: crate::effect_ty::EffectSet) -> FnHeader {
+        let cleared = self.0 & !(0b1_1111 << 10);
+        let mask = (1u32 << 10) | (Cast::<u8, u32>::widen(effects.bits()) << 11);
+        FnHeader(cleared | mask)
+    }
+
+    /// Explicitly declared Blaze effect set, or `None` for an unmarked Rust function pointer.
+    pub const fn declared_effects(self) -> Option<crate::effect_ty::EffectSet> {
+        if self.0 & (1 << 10) == 0 {
+            None
+        } else {
+            let bits = Cast::<u32, u8>::truncate((self.0 >> 11) & 0b1111);
+            Some(crate::effect_ty::EffectSet::from_bits(bits))
+        }
+    }
+
+    /// Effective effects of this function pointer (`EffectSet::ALL` when unmarked).
+    pub const fn effective_effects(self) -> crate::effect_ty::EffectSet {
+        match self.declared_effects() {
+            Some(e) => e,
+            None => crate::effect_ty::EffectSet::ALL,
+        }
+    }
 }
 
 /// A type, read back (rustc_type_ir/src/ty_kind.rs, `TyKind`).

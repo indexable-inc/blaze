@@ -131,6 +131,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::bool_as_int",
             "blaze::manual_slice_idioms",
             "blaze::test_ambient_leak",
+            "blaze::mut_for_uniq_borrow",
             // Code written the way the edition wants it (docs/v2/plan/design/facts.md).
             "blaze::program_lifetime",
         ],

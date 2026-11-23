@@ -49,6 +49,12 @@ pub(crate) struct Parser<'t, S: Sink = EventSink> {
     /// the builtin's own, never a bare pattern type's, so `u8 is 1..` and `*const T is !null`
     /// are read as rustc reads them ([`Parser::with_pattern_base`]).
     pattern_base: bool,
+    /// Whether an `IDENT_PAT` or `WILDCARD_PAT` may carry a union member type ascription
+    /// (`Err(e: FsError)`, `Err(_: Stopped)`, `match e { x: FsError => .. }` under
+    /// `#![blaze::error_unions]`). Enabled inside `match` arms and nested pattern delimiters
+    /// (tuples, tuple structs, slices, parens); false at top-level `let`, `fn`, and closure
+    /// parameter bindings where `:` belongs to the surrounding item.
+    typed_pats: bool,
 }
 
 const PARSER_STEP_LIMIT: usize = if cfg!(debug_assertions) { 150_000 } else { 15_000_000 };
@@ -88,6 +94,7 @@ impl<'t, S: Sink> Parser<'t, S> {
             bare_pattern_types: true,
             unions: inp.any_extensions().error_unions(),
             pattern_base: false,
+            typed_pats: false,
         }
     }
 
@@ -134,6 +141,20 @@ impl<'t, S: Sink> Parser<'t, S> {
     /// here) is Rust's.
     pub(crate) fn records_gate(&self) -> bool {
         self.inp.extensions_at(self.pos).records()
+    }
+
+    /// Whether a typed binding pattern (`e: FsError`, `_: Stopped`) is permitted here under
+    /// `#![blaze::error_unions]`.
+    pub(crate) fn typed_pat_gate(&self) -> bool {
+        self.typed_pats && self.inp.extensions_at(self.pos).error_unions()
+    }
+
+    /// Runs `parse` with typed binding patterns allowed or disallowed, then restores the prior
+    /// setting.
+    pub(crate) fn with_typed_pats(&mut self, allowed: bool, parse: impl FnOnce(&mut Parser<'t, S>)) {
+        let before = core::mem::replace(&mut self.typed_pats, allowed);
+        parse(self);
+        self.typed_pats = before;
     }
 
     /// Runs `parse` with error unions allowed (`true`, inside a delimiter: only when some

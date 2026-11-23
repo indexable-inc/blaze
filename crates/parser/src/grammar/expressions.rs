@@ -750,27 +750,30 @@ fn path_expr<S: Sink>(p: &mut Parser<'_, S>, r: Restrictions) -> (CompletedMarke
 
 /// Whether the `{` the parser is at, where an expression starts, opens a record value
 /// (`#![blaze::records]`, docs/v2/plan/design/records.md) and not a block. It does exactly when
-/// the three tokens after it are
+/// the tokens after it are
 ///
-/// - an identifier, a `:` and a token that is not a second `:` (`{ a: 1 }`), or
-/// - an identifier and a `,` (`{ a, b }`, `{ a, }`, `{ a, ..base }`).
+/// - an identifier, a `:` and a token that is not a second `:` (`{ a: 1 }`),
+/// - an identifier and a `,` (`{ a, b }`, `{ a, }`, `{ a, ..base }`), or
+/// - two dots and a closing brace (`{ .. }`, the all-defaults record literal).
 ///
-/// No block of Rust's starts so: it has no type ascription, a label is a lifetime (`'a: {`),
-/// and a statement or tail is not followed by a comma. Every other `{` is the block it is
-/// today: `{ a }` (a one-field shorthand record is `{ a, }` or `{ a: a }`), `{}` (the unit
-/// block; the empty record has no literal), `{ ..base }` and `{ .. }` (ranges), `{ a::b }` (a
-/// path). A field whose value starts with `::` is written `{ a: (::b) }`, so that the rule
-/// reads kinds alone, never whether two colons touch. The bound is four tokens, the `{`
-/// included: what an incremental reparse checks is unchanged before it parses a block or a
-/// field list alone (`syntax`'s `LOOKAHEAD`).
+/// No practical block of Rust's starts so: it has no type ascription, a label is a lifetime
+/// (`'a: {`), a statement or tail is not followed by a comma, and `{ .. }` as an all-defaults
+/// record literal replaces the unused `RangeFull`-in-a-block spelling under `#![blaze::records]`.
+/// Every other `{` stays the block it is today: `{ a }` (a one-field shorthand record is `{ a, }`
+/// or `{ a: a }`), `{}` (the unit block), `{ ..base }` (a `RangeTo` block), `{ a::b }` (a path).
+/// A field whose value starts with `::` is written `{ a: (::b) }`, so that the rule reads kinds
+/// alone, never whether two colons touch. The bound is four tokens, the `{` included: what an
+/// incremental reparse checks is unchanged before it parses a block or a field list alone
+/// (`syntax`'s `LOOKAHEAD`).
 ///
 /// Where the grammar requires a block (a `fn`, `if`, `while`, `loop`, `unsafe` or `const`
 /// body) it never asks, so those stay blocks under the extension too.
 pub(super) fn at_record_value<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at(T!['{'])
         && p.records_gate()
-        && p.nth(1) == IDENT
-        && (p.nth(2) == T![,] || p.nth(2) == T![:] && p.nth(3) != T![:])
+        && ((p.nth(1) == IDENT
+            && (p.nth(2) == T![,] || p.nth(2) == T![:] && p.nth(3) != T![:]))
+            || (p.nth(1) == T![.] && p.nth(2) == T![.] && p.nth(3) == T!['}']))
 }
 
 // test record_lit
