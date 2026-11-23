@@ -1104,6 +1104,66 @@ impl<'a> PortableTys<'a> {
         mapped.get(&root).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }))
     }
 
+    /// Copies `root` from `src` into this table. When `args` is `Some(repl)`, each `Param(i)`
+    /// and `ConstParam(i)` is replaced by `repl[i]` (already in `self`, not descended into);
+    /// when `args` is `None`, parameters are copied verbatim.
+    pub fn copy_from(&mut self, src: PTys<'_>, root: PTy, args: Option<&[PTy]>) -> Result<PTy, CheckError> {
+        let alloc = self.alloc();
+        let mut mapped = HashMap::new_in(alloc);
+        let mut stack = Vec::new_in(alloc);
+        let mut children = Vec::new_in(alloc);
+        stack.push((root, false));
+        while let Some((at, expanded)) = stack.pop() {
+            if mapped.contains_key(&at) {
+                continue;
+            }
+            let node = src.node(at)?;
+            if let Some(repl) = args
+                && let PNode::Param(index) | PNode::ConstParam(index) = node
+            {
+                let site = crate::error::ParamSite::PortableSubstitution { root, node: at };
+                let count = u32::try_from(repl.len()).unwrap_or(u32::MAX);
+                let &arg = usize::try_from(index).ok().and_then(|i| repl.get(i)).ok_or(CheckError::Malformed(Malformed::Param {
+                    index,
+                    args: count,
+                    site,
+                }))?;
+                self.view().node(arg)?;
+                mapped.insert(at, arg);
+                continue;
+            }
+            if let PNode::Record(schema, _) = node
+                && let Some(names) = src.record_names(schema)
+            {
+                self.register_record_schema(schema, names).map_err(table_full)?;
+            }
+            children.clear();
+            src.children_of(node, &mut children)?;
+            if children.is_empty() {
+                let value = self.rebuild(node, &children)?;
+                mapped.insert(at, value);
+                continue;
+            }
+            if !expanded {
+                stack.push((at, true));
+                for &child in children.iter().rev() {
+                    if child.0 >= at.0 {
+                        return Err(CheckError::Malformed(Malformed::TypeOrder { node: at.0, child: child.0 }));
+                    }
+                    stack.push((child, false));
+                }
+                continue;
+            }
+            for child in children.iter_mut() {
+                let replacement = *mapped.get(child).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: at.0, child: child.0 }))?;
+                *child = replacement;
+            }
+            let value = self.rebuild(node, &children)?;
+            mapped.insert(at, value);
+        }
+        mapped.get(&root).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }))
+    }
+
     /// Reassembles a node from the children returned by `PTys::children_of`, in that order.
     fn rebuild(&mut self, node: PNode, children: &[PTy]) -> Result<PTy, CheckError> {
         let node = match node {

@@ -1811,12 +1811,7 @@ fn vtable_rows<P: FrontEnd>(
             continue;
         }
         seen.push(t);
-        let shape = Shape::of(t.principal, |k| adts.object_trait(k), Global).map_err(|e| fail(VtableFail::Shape(e)))?;
-        for w in shape.words.iter() {
-            if let Word::Super(s) = *w {
-                todo.push(VtableRef { concrete: t.concrete, principal: s, args: List::EMPTY });
-            }
-        }
+        let shape = Shape::of(t.principal, |k| adts.object_trait(k), alloc).map_err(|e| fail(VtableFail::Shape(e)))?;
         let id = {
             let mut cx = LayoutCx { ground: &mut *ground, facts: adts, scratch: alloc };
             layouts.of(t.concrete, &mut cx).map_err(|e| fail(VtableFail::Layout(e)))?
@@ -1832,7 +1827,7 @@ fn vtable_rows<P: FrontEnd>(
         let glue_item = glue.map(|g| g.item);
         let mut targs: AVec<'_, PTy> = blaze_own::Vec::new_in(alloc);
         targs.extend_from_slice(ground.view().list(t.args).map_err(|_| full())?);
-        let table = Vtable::build(&shape, t.concrete, &targs, size, align, glue, &mut *ground, Global).map_err(|e| fail(VtableFail::Build(e)))?;
+        let table = Vtable::build(&shape, t.concrete, &targs, size, align, glue, &mut *ground, adts, alloc, Global).map_err(|e| fail(VtableFail::Build(e)))?;
         // The table's datum (code_records.rs `VtableDatum`): its bytes as built (the header's
         // size and alignment, every address word 0), each address word a target by symbol.
         let mut datum = blaze_code::datum::Datum::new_in(blaze_code::datum::Place::ReadOnly, 3, alloc);
@@ -1843,8 +1838,9 @@ fn vtable_rows<P: FrontEnd>(
         for &(off, to) in table.relocs.iter() {
             let f = match to {
                 VtableTarget::Fn(f) => f,
-                VtableTarget::Super(s) => {
-                    let symbol = vtable_symbol(VtableRef { concrete: t.concrete, principal: s, args: List::EMPTY }, ground.view(), alloc).map_err(sym)?;
+                VtableTarget::Super(sup) => {
+                    todo.push(sup);
+                    let symbol = vtable_symbol(sup, ground.view(), alloc).map_err(sym)?;
                     let target = datum.target(blaze_code::record::Target { space: blaze_code::record::Space::Vtable, symbol });
                     datum.words.push(blaze_code::record::Word { at: off, target, addend: 0 });
                     continue;
