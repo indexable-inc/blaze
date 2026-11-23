@@ -160,6 +160,8 @@
 extern crate alloc;
 
 pub mod args;
+/// Zero-alloc ANSI escape sequence parsing, stripping, terminal display width, and styling.
+pub mod ansi;
 /// Sound: `AudioOut` and `AudioIn`, PCM streams pulled by the device.
 pub mod audio;
 /// Driving other applications: `Automation`, narrowed to one.
@@ -178,10 +180,17 @@ pub mod cell;
 pub mod clock;
 /// Turning data into instructions: `Code`, executable memory and native modules.
 pub mod code;
+/// Strict, bounded, zero-dependency RFC 4180 CSV / TSV reader and writer.
+pub mod csv;
 pub mod cx;
 /// The device capabilities: `Camera`, `Screen`, `Location`, `Bluetooth`, `Usb`, `Serial`,
 /// `Clipboard`, `Notify`.
 pub mod device;
+/// Text and slice diffing (Myers O(ND) linear-space & Patience), unified patch creation,
+/// parsing, forward/reverse application, ANSI highlighting, edit distance, and similarity.
+pub mod diff;
+/// Cryptographic digests (BLAKE3, SHA-256), HMAC-SHA256, constant-time equality, and CRC-32 / Adler-32.
+pub mod digest;
 /// The simulated disk's ledger: what file calls paid, and which names a crash may undo.
 pub mod disk;
 pub mod entry;
@@ -196,6 +205,8 @@ pub mod eval;
 pub mod flat;
 pub mod fs;
 pub mod gpu;
+/// Strict, zero-dependency RFC 4648 §8 hexadecimal encoding and decoding.
+pub mod hex;
 pub mod host;
 // The heavy areas, each behind its feature (Cargo.toml, "[features]"; std.md, "What a program
 // pays for at start"): a program that turns none on links none of their dependencies.
@@ -316,6 +327,9 @@ pub mod video;
 pub mod url;
 /// Who is running: `User`, its name, ids and home directory.
 pub mod user;
+/// RFC 9562 UUIDs (v4 random, v7 Unix-millisecond time-ordered, deterministic v8 via BLAKE3)
+/// with zero ambient RNG or clock access.
+pub mod uuid;
 /// The program's windows: `Window`, a surface's size and its events.
 pub mod window;
 /// A worker's state as a value the pool owns, in typed columns (D171): `Workers`, `Slot<T>`,
@@ -579,10 +593,56 @@ pub mod phf {
     };
 }
 
-/// Digests: BLAKE3 (blaze-ids' `b3`, the one copy) and SHA-256 (blaze-sha256).
-pub mod digest {
-    pub use blaze_ids::b3::{Hasher as Blake3, OUT_LEN as BLAKE3_LEN, hash as blake3};
-    pub use blaze_sha256::{Sha256, digest as sha256};
+/// Format-neutral structured data model (`Value`, `Map`, `Cursor`, `FromValue`, `ToValue`,
+/// `value!`), shared across [`json`], [`toml`], and [`cbor`] (`blaze-data`).
+pub mod data {
+    pub use blaze_data::*;
+}
+
+/// Strict RFC 8259 JSON streaming pull reader, writer, and `Value` codec (`blaze-json`).
+pub mod json {
+    pub use blaze_json::*;
+}
+
+/// Deterministic RFC 8949 §4.2.1 CBOR reader, streaming encoder/decoder, and `Value` codec (`blaze-cbor`).
+pub mod cbor {
+    pub use blaze_cbor::*;
+}
+
+/// Strict TOML 1.0 parser, writer, and lossless format-preserving editor (`blaze-toml`).
+pub mod toml {
+    pub use blaze_toml::*;
+}
+
+/// Canonical RFC 4648 Base64 encoding and decoding (`STANDARD`, `URL_SAFE`, padded and unpadded; `blaze-base64`).
+pub mod base64 {
+    pub use blaze_base64::*;
+}
+
+/// SemVer 2.0.0 versions and Cargo version requirement matching (`blaze-semver`).
+pub mod semver {
+    pub use blaze_semver::*;
+}
+
+/// Bounded streaming DEFLATE (RFC 1951), zlib (RFC 1950), and gzip (RFC 1952) compression,
+/// plus CRC-32 and Adler-32 checksums (`blaze-deflate`).
+pub mod compress {
+    pub use blaze_deflate::*;
+}
+
+/// Deterministic ustar tar writer and traversal-safe sans-IO tar reader (`blaze-tar`).
+pub mod tar {
+    pub use blaze_tar::*;
+}
+
+/// SIMD/SWAR byte and substring search (`memchr`, `memchr2`, `memchr3`, `memrchr`, `memmem::Finder`; `blaze-memchr`).
+pub mod search {
+    pub use blaze_memchr::*;
+}
+
+/// Zero-dependency typed bitflags macro and `Flags` trait (`blaze-bitflags`).
+pub mod bitflags {
+    pub use blaze_bitflags::*;
 }
 
 /// Zero-copy records: the bytes in memory are the bytes on disk (blaze-format).
