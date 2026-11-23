@@ -49,9 +49,9 @@ re-exported as `bstd::algebra`), backed by two small compiler seams when lifting
      bounded e-matching so callers can supply domain identities (e.g.
      `exp(?0) * exp(?1) => exp(?0 + ?1)`). `STANDARD_REWRITE_RULES` (14 rules) and `DERIV_RULES`
      (11 rules) drive both the e-graph and `export_lean_theorems`, which emits a Lean 4
-     `BlazeAlgebra.Verified` module (`structure AllSound : Prop where`) matching
-     `lean/analysis/BlazeDiff/Rewrites.lean` so compiler rules and formal proof obligations share
-     one source of truth.
+     `BlazeAlgebra.Verified` module (`structure AllSound : Prop where`) checked into
+     `lean/analysis/BlazeDiff/Generated.lean` and enforced byte-for-byte in unit tests so compiler
+     rules and Lean proof obligations can never drift.
 4. **Symbolic Equation, Linear System & Exact Newton-Raphson Solvers (`solve_for`, `solve_linear_system`, `newton_step`, `eval_newton`)**:
    - `solve_for`: solves `lhs = rhs` symbolically via structural unwrapping of invertible operations
      (`+`, `-`, `*`, `/`, `-u`, `exp`, `ln`, `sqrt`, `pow`) and exact polynomial extraction
@@ -76,26 +76,33 @@ re-exported as `bstd::algebra`), backed by two small compiler seams when lifting
      simplification, and `eval_const` inside `const` items today.
    - `emit_rust_fn` and multi-output `emit_rust_multi_fn` emit zero-allocation, CSE-shared SSA
      Rust functions (`pub fn f_and_grad(...) -> [f64; K]`) over `blaze_math`.
-7. **Proof-Carrying MIR Compiler Seam (`crates/blaze-body-flow/src/algebra`) & End-to-End LIR Lowering (`crates/blaze-body-build`)**:
-   - `lift_body`: lifts verified pure `blaze_body::Verified<'_>` — including comparison
-     `StmtKind::Switch` diamonds, nested `if/else` returns, constant-trip-count `for i in 0..K`
-     loops (bounded by `MAX_UNROLL_STEPS = 64`), and fixed-size `[f64; N]` / tuple element indexing
-     (`Proj::Field`, `Proj::ConstIndex`, `Proj::Index(Local)`, bounded by `MAX_ARRAY_ELEMS = 16`)
-     — into `ExprGraph<A>`, refusing unbounded cycles and impure calls with typed `BodyAlgebraError`
-     naming `Block` and `Stmt`.
+7. **Proof-Carrying MIR Compiler Seam (`crates/blaze-body-flow/src/algebra`) & Native Float/Intrinsic LIR Lowering (`crates/blaze-body-build`)**:
+   - `lift_body` / `lift_body_with_helpers`: lifts verified pure `blaze_body::Verified<'_>` —
+     including comparison `StmtKind::Switch` diamonds (both `case 1` and `blaze-body-lower`'s
+     `case 0` conventions), nested `if/else` returns, constant-trip-count `for i in 0..K` loops
+     (bounded by `MAX_UNROLL_STEPS = 64`), fixed-size `[f64; N]` / tuple element indexing
+     (`Proj::Field`, `Proj::ConstIndex`, `Proj::Index(Local)`, bounded by `MAX_ARRAY_ELEMS = 16`),
+     and bounded interprocedural inlining of pure user-defined helper callees (`CalleeBodyResolver`,
+     `MAX_INLINE_DEPTH = 8`) — into `ExprGraph<A>`, refusing unbounded cycles, recursion past the
+     depth cap (`InlineDepthLimit`), and impure calls with typed `BodyAlgebraError` naming `Block`
+     and `Stmt`.
    - `splice_body` & `splice_multi_body` (taking typed `ScalarTys { f64_ty, bool_ty }`): CSE
      topological walk emitting a fresh `blaze_body::Body<A>` — including math `Call` continuation
      blocks (including 3-arg `MathOp::Fma`), `bool`-typed `BinOp::Gt` + `StmtKind::Switch` diamond
      CFGs for `Op::Select`, and `Value::Aggregate { kind: Array, .. }` for multi-output `[f64; K]`
      bodies — checked via `blaze_body::verify`.
-   - `BodyTransform` + `run_body_transform` (`Simplify`, `Diff`, `ValueAndGrad`, `Hvp`) provide a
-     single compiler pass entry point over `Verified<Body>`, alongside `diff_body`, `grad_bodies`,
-     `value_and_grad_body`, `hvp_body`, and `simplify_body_with`.
+   - `BodyTransform` + `run_body_transform` / `run_body_transform_with_helpers` (`Simplify`, `Diff`,
+     `DiffWith`, `ValueAndGrad`, `Hvp`) provide a single compiler pass entry point over
+     `Verified<Body>`, alongside `diff_body`, `grad_bodies`, `value_and_grad_body`, `hvp_body`, and
+     `simplify_body_with`.
    - `blaze-body-build` lowers all IEEE 754 floating-point scalar constants (`fconst`), arithmetic
-     (`fadd`, `fsub`, `fmul`, `fdiv`, `frem`, `fneg`), ordered/unordered comparisons (`fcmp`), and
-     float/int casts (`sitofp`, `uitofp`, `fptosi`, `fptoui`, `fpext`, `fptrunc`) to verified
-     `blaze-lir::Func`, enabling full `blaze-body` → `blaze-body-flow::algebra` → `blaze-body-build` →
-     `blaze-lir::eval` compilation and execution.
+     (`fadd`, `fsub`, `fmul`, `fdiv`, `frem`, `fneg`), ordered/unordered comparisons (`fcmp`),
+     float/int casts (`sitofp`, `uitofp`, `fptosi`, `fptoui`, `fpext`, `fptrunc`), and all 15
+     scalar hardware float intrinsics (`Intrinsic::Target(Target::Float(_))`: `Op::Fma`, `Op::Sqrt`,
+     `Op::Fabs`, `Op::Floor`, `Op::Ceil`, `Op::Ftrunc`, `Op::Fround`, `Op::Nearest`, `Op::FminNum`,
+     `Op::FmaxNum`, `Op::Fminimum`, `Op::Fmaximum`, `Op::Fcopysign`) directly into native LIR
+     instructions with zero call overhead, enabling full `blaze-body` → `blaze-body-flow::algebra` →
+     `blaze-body-build` → `blaze-lir::eval` compilation and execution.
 
 ## Proof
 - `blaze-algebra` (`15 passed, 0 failed`, 0 `.clone()` calls): `blaze-sim` property tests over
@@ -106,17 +113,18 @@ re-exported as `bstd::algebra`), backed by two small compiler seams when lifting
   (`relu`/`max`/`min`/`clamp` + `const fn`), `Op::Fma` + `CostModel::CpuFma`,
   `RewriteMode::IeeeExact` vs `FastMath`, `blaze_math::Interval` dead-branch pruning, `jvp`/`hvp`/
   `active_vars` sparsity vs full Hessian, custom `PatNode`/`RewriteRule`, `STANDARD_REWRITE_RULES`
-  + `DERIV_RULES` + `export_lean_theorems` Lean 4 verification export, symbolic linear system
-  solving, and exact Newton-Raphson.
-- `blaze-body-flow::algebra` (`11 passed, 0 failed`, 0 `.clone()` calls) & `blaze-body-build` (`7 passed,
-  0 failed`, 0 `.clone()` calls): end-to-end MIR → `run_body_transform` / `diff_body` /
-  `grad_bodies` / `value_and_grad_body` / `hvp_body` / `simplify_body_with` → `blaze_body::verify`
-  → `eval_pure_body` / `eval_pure_multi_body` AND live `blaze_body_build::build` → verified LIR →
-  `blaze_lir::eval::run_in` execution (both polynomial and piecewise `max`/`fdiv` `Switch` diamond
-  derivatives), unrolled 3-element dot-product loop `[f64; 3]` lifting + fused value-and-gradient,
-  interval branch pruning (7+ blocks collapsed to 1), HVP & FMA MIR fusion, exact polynomial
-  collapsing to 2 MIR rows, cyclic refusal, and 32 `blaze-sim` random MIR bodies with planted-bug
-  control `SpliceOriginalInsteadOfDeriv`.
+  + `DERIV_RULES` + byte-for-byte zero-drift verification of `lean/analysis/BlazeDiff/Generated.lean`,
+  symbolic linear system solving, and exact Newton-Raphson.
+- `blaze-body-flow::algebra` (`13 passed, 0 failed`, 0 `.clone()` calls) & `blaze-body-build` (`7 passed,
+  0 failed`, 0 `.clone()` calls): full real-compiler pipeline `blaze-typeck::check` →
+  `blaze-body-lower::lower` → `blaze_body::verify` → `run_body_transform_with_helpers` (inlining
+  pure helper `spring(x, y)` into `loss(x, y)`, differentiating w.r.t. `x`, and fusing via
+  `CostModel::CpuFma`) → `blaze_body_build::build` → verified LIR containing native hardware
+  `Op::Fma`/`Op::Sqrt`/`Op::Fabs` with zero `Op::Call` instructions → `blaze_lir::eval::run_in`
+  execution, plus modular `CalleeBodyResolver` value-and-gradient + `InlineDepthLimit` refusal,
+  unrolled 3-element dot-product loop `[f64; 3]`, interval branch pruning (7+ blocks collapsed to
+  1), HVP, exact polynomial collapsing to 2 MIR rows, cyclic refusal, and 32 `blaze-sim` random
+  MIR bodies with planted-bug control `SpliceOriginalInsteadOfDeriv`.
 - E-graph equivalence & cost-reduction property tests (`eval(orig) ≈ eval(simplified)` and
   `cost(simplified) <= cost(original)`).
 - Symbolic solver substitution tests (`eval(lhs, x = root) ≈ eval(rhs, x = root)`).

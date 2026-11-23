@@ -8,9 +8,10 @@ use blaze_body::{
 use blaze_own::Alloc;
 
 use super::{
-    BodyAlgebraError, BodyPlant, BodyTransform, MathEmitter, MathOp, MathResolver, NoMathCalls,
-    ScalarTys, diff_body, diff_body_with_plant, eval_pure_body, eval_pure_multi_body, grad_bodies,
-    hvp_body, lift_body, run_body_transform, simplify_body, simplify_body_with, splice_body,
+    BodyAlgebraError, BodyPlant, BodyTransform, CalleeBodyResolver, MathEmitter, MathOp,
+    MathResolver, NoMathCalls, ScalarTys, diff_body, diff_body_with_plant, eval_pure_body,
+    eval_pure_multi_body, grad_bodies, hvp_body, lift_body, run_body_transform,
+    run_body_transform_with_helpers, simplify_body, simplify_body_with, splice_body,
     splice_multi_body, value_and_grad_body,
 };
 
@@ -944,4 +945,420 @@ fn end_to_end_mir_diff_compiles_through_blaze_body_build_to_verified_lir_and_exe
     assert!(close(eval_f64(built_dh.func.view(), 3.0, 2.0), 2.0, 1e-12));
     // At (1, 2): x^2 = 1 <= 4 => ∂h/∂x = 0.0
     assert!(close(eval_f64(built_dh.func.view(), 1.0, 2.0), 0.0, 1e-12));
+}
+
+#[test]
+fn interprocedural_helper_inlining_differentiates_modular_functions_and_enforces_depth_limit() {
+    use blaze_body::Value;
+
+    let spring_key = ItemKey(500);
+    // Helper: fn spring(d: f64, k: f64) -> f64 { 0.5 * k * d * d }
+    let spring_body = {
+        let mut g = ExprGraph::new_in(heap());
+        let (vd, ed) = g.var("d");
+        let (vk, ek) = g.var("k");
+        let half = g.lit(0.5);
+        let d2 = g.mul(ed, ed);
+        let kd2 = g.mul(ek, d2);
+        let root = g.mul(half, kd2);
+        splice_body(&g, root, &[vd, vk], TEST_TYS, &NoMathCalls, heap()).unwrap()
+    };
+    let v_spring = verify(&spring_body).unwrap();
+
+    // Caller: fn energy(x: f64, y: f64) -> f64 { spring(x - y, 4.0) + 0.5 * x * x }
+    let energy_body = {
+        let mut b = BodyBuilder::new_in(heap());
+        let ret = b.new_local(LocalDecl { ty: PTy(0), kind: LocalKind::Return, mutbl: Mutbl::Mut });
+        let lx = b.new_local(LocalDecl { ty: PTy(0), kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+        let ly = b.new_local(LocalDecl { ty: PTy(0), kind: LocalKind::Arg(1), mutbl: Mutbl::Not });
+        let ld = b.new_local(LocalDecl { ty: PTy(0), kind: LocalKind::Temp(MirExprId(0), Role::Value), mutbl: Mutbl::Not });
+        let ls = b.new_local(LocalDecl { ty: PTy(0), kind: LocalKind::Temp(MirExprId(1), Role::Value), mutbl: Mutbl::Not });
+        let lx2 = b.new_local(LocalDecl { ty: PTy(0), kind: LocalKind::Temp(MirExprId(2), Role::Value), mutbl: Mutbl::Not });
+        let lreg = b.new_local(LocalDecl { ty: PTy(0), kind: LocalKind::Temp(MirExprId(3), Role::Value), mutbl: Mutbl::Not });
+        let bb0 = b.new_block(BlockKind::Normal);
+        let bb1 = b.new_block(BlockKind::Normal);
+        let span = Span { lo: 0, hi: 0 };
+
+        b.start(bb0);
+        let px = b.local_place(lx);
+        let py = b.local_place(ly);
+        let pd = b.local_place(ld);
+        let ps = b.local_place(ls);
+        let px2 = b.local_place(lx2);
+        let preg = b.local_place(lreg);
+        let pret = b.local_place(ret);
+        b.assign(pd, Value::Binary { op: BinOp::Sub, lhs: Operand::Copy(px), rhs: Operand::Copy(py) }, span);
+        let c4 = b.new_const(ConstDecl { kind: ConstKind::Scalar { bits: u128::from(4.0_f64.to_bits()) }, ty: PTy(0) });
+        let callee = b.callee(Callee::FnItem { key: spring_key, args: List::EMPTY });
+        let args = b.operands(&[Operand::Copy(pd), Operand::Const(c4)]);
+        b.terminate(
+            StmtKind::Call { callee, args, dest: Some(ps), target: Some(bb1), unwind: blaze_body::Unwind::Continue },
+            span,
+        );
+
+        b.start(bb1);
+        b.assign(px2, Value::Binary { op: BinOp::Mul, lhs: Operand::Copy(px), rhs: Operand::Copy(px) }, span);
+        let c_half = b.new_const(ConstDecl { kind: ConstKind::Scalar { bits: u128::from(0.5_f64.to_bits()) }, ty: PTy(0) });
+        b.assign(preg, Value::Binary { op: BinOp::Mul, lhs: Operand::Const(c_half), rhs: Operand::Copy(px2) }, span);
+        b.assign(pret, Value::Binary { op: BinOp::Add, lhs: Operand::Copy(ps), rhs: Operand::Copy(preg) }, span);
+        b.terminate(StmtKind::Return, span);
+        b.finish().unwrap()
+    };
+    let v_energy = verify(&energy_body).unwrap();
+
+    struct OneHelper<'a> {
+        key: ItemKey,
+        body: blaze_body::Verified<'a>,
+    }
+    impl CalleeBodyResolver for OneHelper<'_> {
+        fn resolve_body(&self, callee: Callee) -> Option<blaze_body::Verified<'_>> {
+            match callee {
+                Callee::FnItem { key, .. } if key == self.key => Some(self.body),
+                _ => None,
+            }
+        }
+    }
+
+    let helpers = OneHelper { key: spring_key, body: v_spring };
+    let vg = run_body_transform_with_helpers(
+        v_energy,
+        BodyTransform::ValueAndGrad { array_ty: PTy(1) },
+        None,
+        &NoMathCalls,
+        &helpers,
+        &NoMathCalls,
+        heap(),
+    )
+    .expect("inlined value_and_grad succeeds");
+    let v_vg = verify(&vg).unwrap();
+
+    // At (x = 5.0, y = 2.0):
+    //   energy = 2*(5-2)^2 + 0.5*25 = 18 + 12.5 = 30.5
+    //   ∂/∂x   = 4*(5-2) + 5        = 17.0
+    //   ∂/∂y   = -4*(5-2)           = -12.0
+    let out = eval_pure_multi_body(v_vg, &[5.0, 2.0], &NoMathCalls, heap()).unwrap();
+    assert_eq!(out.len(), 3);
+    assert!(close(out[0], 30.5, 1e-12), "energy={}", out[0]);
+    assert!(close(out[1], 17.0, 1e-12), "d/dx={}", out[1]);
+    assert!(close(out[2], -12.0, 1e-12), "d/dy={}", out[2]);
+
+    // Self-recursive helper must hit bounded `InlineDepthLimit` (rule 18 `bounded-progress`).
+    let rec_key = ItemKey(501);
+    let rec_body = {
+        let mut b = BodyBuilder::new_in(heap());
+        let ret = b.new_local(LocalDecl { ty: PTy(0), kind: LocalKind::Return, mutbl: Mutbl::Mut });
+        let lx = b.new_local(LocalDecl { ty: PTy(0), kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+        let bb0 = b.new_block(BlockKind::Normal);
+        let bb1 = b.new_block(BlockKind::Normal);
+        let span = Span { lo: 0, hi: 0 };
+        b.start(bb0);
+        let callee = b.callee(Callee::FnItem { key: rec_key, args: List::EMPTY });
+        let px = b.local_place(lx);
+        let pret = b.local_place(ret);
+        let args = b.operands(&[Operand::Copy(px)]);
+        b.terminate(
+            StmtKind::Call { callee, args, dest: Some(pret), target: Some(bb1), unwind: blaze_body::Unwind::Continue },
+            span,
+        );
+        b.start(bb1);
+        b.terminate(StmtKind::Return, span);
+        b.finish().unwrap()
+    };
+    let v_rec = verify(&rec_body).unwrap();
+    let rec_helpers = OneHelper { key: rec_key, body: v_rec };
+    let err = run_body_transform_with_helpers(
+        v_rec,
+        BodyTransform::Diff { arg: 0 },
+        None,
+        &NoMathCalls,
+        &rec_helpers,
+        &NoMathCalls,
+        heap(),
+    )
+    .err()
+    .expect("self-recursive helper must be refused by InlineDepthLimit");
+    assert!(matches!(err, BodyAlgebraError::InlineDepthLimit { depth: 8, .. }), "got {err:?}");
+}
+
+#[test]
+fn real_typeck_body_lower_algebra_fma_body_build_native_lir_pipeline() {
+    use blaze_body_lower::{BodyFacts, lower};
+    use blaze_build::intrinsics::target::{Target as IntrTarget, float::{FloatCall, FloatFn, Shape}};
+    use blaze_build::layout::{LayoutFacts, Missing, ReprAttrs, ValidRange};
+    use blaze_build::{Abi, Adts, Intrinsic, OverflowChecks, Panic, Subst};
+    use blaze_flow_lower::{AdtFacts, CalleeFacts, Facts};
+    use blaze_lir::eval::{Outcome, Val, run_in};
+    use blaze_typeck::fixture::{Bb, Fx};
+    use blaze_typeck::{
+        Adt, BinOp as TyBinOp, Checked, Expr, ExprId as TyExprId, FloatTy, InferCtx, Name, Needs,
+        Outcome as TyOutcome, PNode, PortableTys,
+    };
+
+    // 1. Real typeck world with `fn spring(x: f64, y: f64) -> f64` and `fn loss(x: f64, y: f64) -> f64`.
+    let mut fx = Fx::new();
+    let f64_fx = fx.ty(PNode::Float(FloatTy::F64));
+    let spring_key = fx.func("spring", 0, &[f64_fx, f64_fx], f64_fx, Default::default());
+    let loss_key = fx.func("loss", 0, &[f64_fx, f64_fx], f64_fx, Default::default());
+    fx.finish();
+
+    // Helper for building typeck expressions on `Bb`.
+    let mk_bin = |b: &mut Bb, op: TyBinOp, lhs: TyExprId, rhs: TyExprId| -> TyExprId {
+        let id = b.bool();
+        b.exprs[id.ix()] = Expr::Binary { op, lhs, rhs };
+        id
+    };
+    let mk_if = |b: &mut Bb, cond: TyExprId, then: TyExprId, else_: TyExprId| -> TyExprId {
+        let id = b.bool();
+        b.exprs[id.ix()] = Expr::If { cond, then, else_: Some(else_) };
+        id
+    };
+
+    struct FloatFacts<'a> {
+        floats: &'a [(TyExprId, f64)],
+    }
+    impl Facts for FloatFacts<'_> {
+        fn regions(&self) -> &dyn blaze_flow_lower::RegionFacts { &blaze_flow_lower::NoRegions }
+        fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> { None }
+        fn adt_variances(&self, _: ItemKey) -> Option<&[blaze_flow_lower::Variance]> { None }
+        fn implied_bounds(&self) -> Option<(&[(u32, blaze_flow_lower::Region)], &[(blaze_flow_lower::Region, blaze_flow_lower::Region)])> { None }
+        fn constant_initializer(&self) -> bool { false }
+        fn fn_binders(&self) -> bool { true }
+        fn closure_bodies_checked(&self) -> bool { false }
+        fn closure_requirements(&self, _: TyExprId) -> &[blaze_flow_lower::Requirement] { &[] }
+        fn async_bodies_checked(&self) -> bool { false }
+        fn is_future(&self, _: PTy) -> Option<bool> { None }
+        fn shape(&self, _: ItemKey) -> Option<blaze_flow_lower::Shape<'_>> { None }
+        fn object_trait_lifetimes(&self, _: ItemKey) -> Option<bool> { None }
+        fn call_bounds(&self, _: ItemKey) -> Option<blaze_flow_lower::CallBounds<'_>> { None }
+        fn trait_lifetimes(&self, _: ItemKey) -> Option<u32> { None }
+        fn alias_lifetimes(&self, _: ItemKey, _: Name) -> Option<u32> { None }
+        fn ties(&self, _: ItemKey) -> Option<blaze_flow_lower::Ties<'_>> { None }
+        fn field_param(&self, _: ItemKey, _: u32, _: u32) -> Option<u32> { None }
+        fn field_lead(&self, _: ItemKey, _: u32, _: u32) -> Option<blaze_flow_lower::FieldLead> { None }
+        fn field_regions(&self, _: ItemKey, _: u32, _: u32) -> Option<&[blaze_flow_lower::FieldRegion]> { None }
+        fn copy_args(&self, _: ItemKey) -> Option<&[bool]> { None }
+        fn adt(&self, _: ItemKey) -> Option<AdtFacts> {
+            Some(AdtFacts { copy: true, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false })
+        }
+        fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
+            Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
+        }
+        fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> { None }
+        fn field_count(&self, _: ItemKey, _: u32) -> Option<u32> { None }
+        fn param_copy(&self, _: u32) -> bool { true }
+    }
+    impl BodyFacts for FloatFacts<'_> {
+        fn float_lit(&self, e: TyExprId) -> Option<u128> {
+            self.floats.iter().find(|&&(id, _)| id == e).map(|&(_, v)| u128::from(v.to_bits()))
+        }
+        fn trait_item(&self, _: ItemKey) -> Option<bool> { Some(false) }
+    }
+
+    let check_and_lower = |fx: &Fx, b: &Bb, owner: ItemKey, root: TyExprId, facts: &FloatFacts<'_>| -> (Checked<'static>, Body<Alloc<'static>>) {
+        let mut cx = InferCtx::new_in(heap());
+        let view = b.view(owner, root);
+        let ck = match blaze_typeck::check(&view, fx, &mut cx, &Needs::new_in(heap()), heap()) {
+            Ok(TyOutcome::Done(c)) => {
+                assert!(c.diags.is_empty(), "typeck diagnostics: {:?}", c.diags);
+                c
+            }
+            Ok(TyOutcome::Need(n)) => panic!("typeck needed: {:?}", n.questions),
+            Err(e) => panic!("typeck error: {e:?}"),
+        };
+        let mir = lower(&view, &ck, facts, heap()).expect("blaze-body-lower succeeds");
+        (ck, mir)
+    };
+
+    // 2. Build & lower REAL `fn spring(x: f64, y: f64) -> f64 { x * x * y + 2.0 * x }`.
+    let mut bs = Bb::new();
+    let sx = bs.param("x");
+    let sy = bs.param("y");
+    let sx1 = bs.local(sx);
+    let sx2 = bs.local(sx);
+    let s_x2 = mk_bin(&mut bs, TyBinOp::Mul, sx1, sx2);
+    let sy1 = bs.local(sy);
+    let s_x2y = mk_bin(&mut bs, TyBinOp::Mul, s_x2, sy1);
+    let lit2 = bs.float(Some(FloatTy::F64));
+    let sx3 = bs.local(sx);
+    let s_2x = mk_bin(&mut bs, TyBinOp::Mul, lit2, sx3);
+    let spring_root = mk_bin(&mut bs, TyBinOp::Add, s_x2y, s_2x);
+    let spring_facts = FloatFacts { floats: &[(lit2, 2.0)] };
+    let (_ck_spring, spring_mir) = check_and_lower(&fx, &bs, spring_key, spring_root, &spring_facts);
+    let v_spring = verify(&spring_mir).expect("lowered spring MIR verifies");
+
+    // 3. Build & lower REAL `fn loss(x: f64, y: f64) -> f64 { let s = spring(x, y); if s > 10.0 { s + 3.0 * y } else { y * y + x } }`.
+    let mut bl = Bb::new();
+    let lx = bl.param("x");
+    let ly = bl.param("y");
+    let sp_fn = bl.path(&["spring"]);
+    let lx1 = bl.local(lx);
+    let ly1 = bl.local(ly);
+    let sp_call = bl.call(sp_fn, &[lx1, ly1]);
+    let s_pat = bl.bind("s");
+    let let_s = bl.let_(s_pat, None, sp_call);
+
+    let s_ref1 = bl.local(s_pat);
+    let lit10 = bl.float(Some(FloatTy::F64));
+    let cond = mk_bin(&mut bl, TyBinOp::Gt, s_ref1, lit10);
+
+    let s_ref2 = bl.local(s_pat);
+    let lit3 = bl.float(Some(FloatTy::F64));
+    let ly2 = bl.local(ly);
+    let three_y = mk_bin(&mut bl, TyBinOp::Mul, lit3, ly2);
+    let then_e = mk_bin(&mut bl, TyBinOp::Add, s_ref2, three_y);
+
+    let ly3 = bl.local(ly);
+    let ly4 = bl.local(ly);
+    let y2 = mk_bin(&mut bl, TyBinOp::Mul, ly3, ly4);
+    let lx2 = bl.local(lx);
+    let else_e = mk_bin(&mut bl, TyBinOp::Add, y2, lx2);
+
+    let if_e = mk_if(&mut bl, cond, then_e, else_e);
+    let loss_root = bl.block(&[let_s], Some(if_e));
+    let loss_facts = FloatFacts { floats: &[(lit10, 10.0), (lit3, 3.0)] };
+    let (ck_loss, loss_mir) = check_and_lower(&fx, &bl, loss_key, loss_root, &loss_facts);
+    let v_loss = verify(&loss_mir).expect("lowered loss MIR verifies");
+
+    // 4. Run `run_body_transform_with_helpers`: inline `spring` into `loss`, differentiate w.r.t. `x`,
+    //    and fuse `2*x*y + 2` into native `Op::Fma` using `CostModel::CpuFma`!
+    struct HelperMap<'a> {
+        key: ItemKey,
+        body: blaze_body::Verified<'a>,
+    }
+    impl CalleeBodyResolver for HelperMap<'_> {
+        fn resolve_body(&self, callee: Callee) -> Option<blaze_body::Verified<'_>> {
+            match callee {
+                Callee::FnItem { key, .. } if key == self.key => Some(self.body),
+                _ => None,
+            }
+        }
+    }
+    const FMA_KEY: ItemKey = ItemKey(900);
+    const SQRT_KEY: ItemKey = ItemKey(901);
+    const FABS_KEY: ItemKey = ItemKey(902);
+    struct IntrMath;
+    impl MathResolver for IntrMath {
+        fn classify(&self, callee: Callee) -> Option<MathOp> {
+            match callee {
+                Callee::Intrinsic { key, .. } | Callee::FnItem { key, .. } => match key {
+                    k if k == FMA_KEY => Some(MathOp::Fma),
+                    k if k == SQRT_KEY => Some(MathOp::Sqrt),
+                    k if k == FABS_KEY => Some(MathOp::Abs),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+    }
+    impl MathEmitter for IntrMath {
+        fn callee_for(&self, op: MathOp) -> Option<Callee> {
+            let key = match op {
+                MathOp::Fma => FMA_KEY,
+                MathOp::Sqrt => SQRT_KEY,
+                MathOp::Abs => FABS_KEY,
+                _ => return None,
+            };
+            Some(Callee::Intrinsic { key, args: List::EMPTY })
+        }
+    }
+
+    let helpers = HelperMap { key: spring_key, body: v_spring };
+    let fma_opts = SimplifyOpts { cost_model: CostModel::CpuFma, ..SimplifyOpts::default() };
+    let diff_mir = run_body_transform_with_helpers(
+        v_loss,
+        BodyTransform::DiffWith { arg: 0, opts: fma_opts },
+        None,
+        &IntrMath,
+        &helpers,
+        &IntrMath,
+        heap(),
+    )
+    .expect("inlined + FMA-fused MIR diff succeeds");
+    let v_diff = verify(&diff_mir).expect("transformed MIR verifies");
+
+    // 5. Compile the FMA-fused differentiated MIR through `blaze_body_build::build` into verified LIR!
+    struct NativeMathWorld;
+    impl LayoutFacts for NativeMathWorld {
+        fn adt(&self, _: ItemKey) -> Option<Adt<'_>> { None }
+        fn repr(&self, _: ItemKey) -> Result<ReprAttrs, Missing> { Ok(ReprAttrs::RUST) }
+        fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> { Ok(None) }
+        fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> { Ok(ValidRange::default()) }
+    }
+    impl Adts for NativeMathWorld {
+        fn adt(&self, _: ItemKey) -> Option<Adt<'_>> { None }
+        fn facts(&self) -> &dyn LayoutFacts { self }
+        fn panic(&self) -> Panic { Panic::Abort }
+        fn overflow_checks(&self) -> OverflowChecks { OverflowChecks::Off }
+        fn ub_checks(&self) -> blaze_build::UbChecks { blaze_build::UbChecks::Off }
+        fn drop_impl(&self, _: PTy, _: &mut PortableTys<'_>) -> Result<Option<ItemKey>, blaze_build::BuildError> { Ok(None) }
+        fn abi(&self, _: ItemKey) -> Option<Abi> { Some(Abi::Rust) }
+        fn lang_fn(&self, _: &str) -> Option<ItemKey> { None }
+        fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic> {
+            let func = match item {
+                k if k == FMA_KEY => FloatFn::Fma,
+                k if k == SQRT_KEY => FloatFn::Sqrt,
+                k if k == FABS_KEY => FloatFn::Fabs,
+                _ => return None,
+            };
+            Some(Intrinsic::Target(IntrTarget::Float(FloatCall { func, shape: Shape::F64 })))
+        }
+    }
+
+    let mut ground = PortableTys::new_in(heap());
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: heap() };
+    let built = blaze_body_build::build(
+        v_diff,
+        ck_loss.types.view(),
+        loss_key,
+        &mut subst,
+        &NativeMathWorld,
+        heap(),
+    )
+    .expect("real lowered + inlined + FMA-fused diff MIR compiles to verified LIR");
+
+    // 6. Prove the compiled LIR uses a real native hardware `Op::Fma` instruction and ZERO calls!
+    let view = built.func.view();
+    let has_fma = (0..view.ops.len()).any(|i| view.ops[i] == blaze_lir::Op::Fma as u8);
+    let has_call = (0..view.ops.len()).any(|i| view.ops[i] == blaze_lir::Op::Call as u8);
+    assert!(has_fma, "compiled LIR must contain native hardware Op::Fma instruction");
+    assert!(!has_call, "compiled LIR must have zero Op::Call instructions (pure inlined + native FMA)");
+
+    // 7. Execute the compiled LIR directly via `blaze_lir::eval::run_in` on BOTH branches!
+    let eval_lir = |v: blaze_lir::View<'_>, x: f64, y: f64| -> f64 {
+        let args = [Val::Int(u128::from(x.to_bits())), Val::Int(u128::from(y.to_bits()))];
+        match run_in(v, &args, 10_000, heap()).expect("LIR eval succeeds") {
+            Outcome::Returned(vals) => {
+                let Val::Int(bits) = vals[0] else { panic!("expected float bits") };
+                f64::from_bits(bits as u64)
+            }
+            other => panic!("expected Returned([f64]), got {other:?}"),
+        }
+    };
+    // Branch 1: (3, 2) => spring(3,2) = 24 > 10 => ∂loss/∂x = 2*3*2 + 2 = 14.0
+    assert!(close(eval_lir(view, 3.0, 2.0), 14.0, 1e-12));
+    // Branch 2: (1, 1) => spring(1,1) = 3 <= 10 => ∂loss/∂x = 1.0
+    assert!(close(eval_lir(view, 1.0, 1.0), 1.0, 1e-12));
+
+    // 8. Also verify `sqrt` and `fabs` intrinsics lower to native `Op::Sqrt` and `Op::Fabs` LIR!
+    let mut from = PortableTys::new_in(heap());
+    let f64_t = from.intern(PNode::Float(FloatTy::F64)).unwrap();
+    let bool_t = from.intern(PNode::Bool).unwrap();
+    let mut gs = ExprGraph::new_in(heap());
+    let (vx, ex) = gs.var("x");
+    let (vy, ey) = gs.var("y");
+    let ax = gs.abs(ex);
+    let y2 = gs.mul(ey, ey);
+    let sum_sa = gs.add(ax, y2);
+    let root_sa = gs.sqrt(sum_sa);
+    let sa_mir = splice_body(&gs, root_sa, &[vx, vy], ScalarTys { f64_ty: f64_t, bool_ty: bool_t }, &IntrMath, heap()).unwrap();
+    let v_sa = verify(&sa_mir).unwrap();
+    let mut ground2 = PortableTys::new_in(heap());
+    let mut subst2 = Subst { args: &[], ground: &mut ground2, scratch: heap() };
+    let built_sa = blaze_body_build::build(v_sa, from.view(), ItemKey(3), &mut subst2, &NativeMathWorld, heap())
+        .expect("sqrt + fabs intrinsics compile cleanly to verified LIR");
+    let vsa = built_sa.func.view();
+    assert!((0..vsa.ops.len()).any(|i| vsa.ops[i] == blaze_lir::Op::Sqrt as u8));
+    assert!((0..vsa.ops.len()).any(|i| vsa.ops[i] == blaze_lir::Op::Fabs as u8));
+    // sqrt(|-7.0| + 3.0^2) = sqrt(7 + 9) = 4.0
+    assert!(close(eval_lir(vsa, -7.0, 3.0), 4.0, 1e-12));
 }

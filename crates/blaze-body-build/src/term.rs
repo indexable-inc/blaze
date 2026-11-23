@@ -6,8 +6,9 @@ use blaze_own::Vec;
 use core::alloc::Allocator;
 
 use blaze_body::{AssertKind, BinOp, Block as BodyBlock, Callee, CalleeId, Operand, Ops, Place, StmtKind, Unwind};
+use blaze_build::intrinsics::target::{Target as IntrinsicTarget, float::FloatCall};
 use blaze_build::layout::LayoutId;
-use blaze_build::{Instance, Panic, PanicConst, abi};
+use blaze_build::{Instance, Intrinsic, Panic, PanicConst, abi};
 use blaze_lir::builder::Variadic;
 use blaze_lir::func::{BlockKind, Conv, RefId, SigId, SlotKind};
 use blaze_lir::{Block, Flags, IntCond, Ty, Value};
@@ -193,9 +194,58 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         Ok(())
     }
 
+    /// Lowers a scalar floating-point intrinsic (`llvm.fma.*`, `llvm.sqrt.*`, `llvm.fabs.*`,
+    /// etc.) directly to its native hardware LIR instruction, with zero call overhead.
+    fn float_intrinsic(&mut self, fc: FloatCall, args: Ops, dest: Option<Place>, target: Option<BodyBlock>) -> Result<(), BuildError> {
+        if fc.shape.lanes().is_some() {
+            return Err(self.unsupported("a vector float intrinsic call"));
+        }
+        let arity = fc.func.arity();
+        if usize::try_from(args.len()).ok() != Some(arity) {
+            return Err(self.malformed("a float intrinsic call with the wrong number of arguments"));
+        }
+        let ops: Vec<Operand, A> = {
+            let mut out = Vec::with_capacity_in(arity, self.alloc);
+            out.extend(self.v.ops(args));
+            out
+        };
+        let mut vals = [Value(0); 3];
+        let elem = fc.shape.elem();
+        for (slot, &o) in vals.iter_mut().zip(ops.iter()) {
+            let (x, _) = self.operand(o)?;
+            let v = self.scalar(x)?;
+            if self.b.ty(v) != elem {
+                return Err(self.malformed("a float intrinsic argument of the wrong scalar type"));
+            }
+            *slot = v;
+        }
+        let [v0, v1, v2] = vals;
+        let op = fc.func.op();
+        let res = match arity {
+            1 => self.b.unary(op, Flags::NONE, v0),
+            2 => self.b.binary(op, Flags::NONE, v0, v1),
+            3 => self.b.ternary(op, Flags::NONE, v0, v1, v2),
+            _ => return Err(self.malformed("a float intrinsic of unsupported arity")),
+        };
+        if let Some(dest) = dest {
+            let lay = self.dest_layout(dest)?;
+            self.write(dest, V::One(res), lay)?;
+        }
+        match target {
+            Some(to) => self.goto(to),
+            None => {
+                self.b.unreachable();
+                Ok(())
+            }
+        }
+    }
+
     fn call(&mut self, callee: CalleeId, args: Ops, dest: Option<Place>, target: Option<BodyBlock>, unwind: Unwind) -> Result<(), BuildError> {
         let (to, may_unwind) = match self.v.callee(callee) {
-            Callee::FnItem { key, args } => {
+            Callee::FnItem { key, args: fn_args } => {
+                if let Some(Intrinsic::Target(IntrinsicTarget::Float(fc))) = self.adts.intrinsic(key) {
+                    return self.float_intrinsic(fc, args, dest, target);
+                }
                 match self.adts.abi(key) {
                     Some(blaze_build::Abi::Rust) => {}
                     Some(blaze_build::Abi::C | blaze_build::Abi::RustCall) => {
@@ -203,7 +253,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                     }
                     None => return Err(BuildError::NoAbi { item: key }),
                 }
-                let instance = self.instance(key, args)?;
+                let instance = self.instance(key, fn_args)?;
                 if self.adts.track_caller(instance, self.subst.ground) == Some(true) {
                     return Err(BuildError::TrackCaller { stmt: self.row()?, name: "the callee" });
                 }
@@ -214,7 +264,12 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 (Target::Pointer(self.scalar(x)?), true)
             }
             Callee::Method { .. } => return Err(self.unsupported("a trait method call (its impl's fn is not resolved here yet)")),
-            Callee::Intrinsic { .. } => return Err(self.unsupported("an intrinsic call")),
+            Callee::Intrinsic { key, .. } => {
+                if let Some(Intrinsic::Target(IntrinsicTarget::Float(fc))) = self.adts.intrinsic(key) {
+                    return self.float_intrinsic(fc, args, dest, target);
+                }
+                return Err(self.unsupported("an intrinsic call"));
+            }
         };
         let ops: Vec<Operand, A> = {
             let mut out = Vec::with_capacity_in(args.len() as usize, self.alloc);

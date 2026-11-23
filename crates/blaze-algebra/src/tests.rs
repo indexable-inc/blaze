@@ -807,4 +807,11 @@ fn declarative_rules_table_drives_egraph_and_exports_lean4_obligations() {
         let _ = core::fmt::Write::write_fmt(&mut pat, format_args!("deriv_{0} : deriv_{0}", d.op));
         assert!(src.contains(pat.as_str()), "missing {pat} in AllSound");
     }
+
+    // 3. Zero-drift gate: checked-in `lean/analysis/BlazeDiff/Generated.lean` must match byte-for-byte!
+    let checked_in = include_str!("../../../lean/analysis/BlazeDiff/Generated.lean");
+    assert_eq!(
+        src, checked_in,
+        "lean/analysis/BlazeDiff/Generated.lean drifted from blaze_algebra::rules::export_lean_theorems"
+    );
 }
