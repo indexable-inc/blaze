@@ -187,6 +187,8 @@ pub struct Attrs {
     /// `dyn_undecided trait T`: a trait whose dyn compatibility the world did not decide
     /// (`TraitFlags::DYN_UNDECIDED` in place of `DYN_COMPATIBLE`).
     pub dyn_undecided: bool,
+    /// `auto_copy_pub struct S`: Blaze-edition transparent all-`pub` struct (`AdtFlags::AUTO_COPY_PUB`).
+    pub auto_copy_pub: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -512,6 +514,7 @@ impl P<'_> {
                     "const" => a.const_ = true,
                     "reservation" => a.reservation = true,
                     "dyn_undecided" => a.dyn_undecided = true,
+                    "auto_copy_pub" => a.auto_copy_pub = true,
                     "lang" => {
                         self.i += 1;
                         self.expect("(")?;

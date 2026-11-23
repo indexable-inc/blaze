@@ -479,6 +479,41 @@ impl Heads for Maps {
     }
 }
 
+/// Whether a lowered struct view `v` of item `key` (in `module`) is eligible for Blaze-edition
+/// automatic `Copy`/`Clone` (`AdtFlags::AUTO_COPY_PUB`):
+/// - defined in a crate on Blaze edition (`StdIs::Bstd(_)`),
+/// - `AdtKind::Struct`,
+/// - if it has fields: every field is `pub` (`lf::Vis::Pub`),
+/// - if it has no fields (unit/empty struct): the struct itself is `pub` (`lf::Vis::Pub`).
+pub(crate) fn is_auto_copy_pub_view<'n, S: NamesSource<'n>>(
+    names: S,
+    key: LibKey,
+    module: LibKey,
+    kind: tc::AdtKind,
+    v: &View<'_>,
+) -> Result<bool, Why> {
+    if kind != tc::AdtKind::Struct {
+        return Ok(false);
+    }
+    let Some(krate) = names.crate_of(key).or_else(|| names.crate_of(module)) else {
+        return Ok(false);
+    };
+    if !matches!(names.std_is(krate), Some(blaze_unit_graph::StdIs::Bstd(_))) {
+        return Ok(false);
+    }
+    let field_rows = v.rows(v.list(head::FIELDS))?;
+    if field_rows.is_empty() {
+        return Ok(v.vis() == lf::Vis::Pub);
+    }
+    for &n in field_rows {
+        let f = lf::Field::decode(n)?;
+        if f.vis != lf::Vis::Pub {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Whether a field default (`a: u8 = 1`, RFC 3681 `default_field_values`) may be written on
 /// a field of `adt`'s variant of constructor `ctor`, at `r`:
 /// - only on a named field of a struct or an enum's struct variant: a tuple struct's or tuple
@@ -2004,6 +2039,9 @@ pub struct Store<'n> {
     pub tys: PortableTys<'static>,
     pub maps: Maps,
     pub adts: Rows<ItemKey, AdtRow>,
+    /// Each ADT's Blaze-edition automatic `Copy`/`Clone` eligibility (`AdtFlags::AUTO_COPY_PUB`),
+    /// kept in a side table so `AdtRow` and `head_record::VERSION` stay untouched.
+    pub auto_copy_pub: Rows<ItemKey, bool>,
     /// Made by `Want::Head`, including when a field type needs its own ADT's inherent constant.
     pub adt_declarations: Rows<ItemKey, AdtDeclaration>,
     /// Each ADT's field defaults (`struct S { a: u8 = 1 }`, RFC 3681), made with its head in
@@ -2483,6 +2521,7 @@ impl<'n> Store<'n> {
             },
             maps: Maps::new_in(alloc),
             adts: Rows::new_in(alloc),
+            auto_copy_pub: Rows::new_in(alloc),
             adt_declarations: Rows::new_in(alloc),
             field_defaults: Rows::new_in(alloc),
             impls: Rows::new_in(alloc),
@@ -2545,6 +2584,29 @@ impl<'n> Store<'n> {
     /// records carry it, form 9).
     pub fn member_frame(&self, ck: ItemKey) -> Option<&MemberFrame> {
         self.member_frames.get(&ck)
+    }
+
+    /// Whether ADT `item` is eligible for Blaze-edition automatic `Copy`/`Clone`
+    /// (`AdtFlags::AUTO_COPY_PUB`). Cached in `self.auto_copy_pub` so `AdtRow` and
+    /// `head_record::VERSION` stay untouched; for an ADT loaded from a frozen head record,
+    /// Rust-edition crates immediately answer and cache `false` without lowering text.
+    pub(crate) fn is_auto_copy_pub<S: NamesSource<'n>>(&self, names: S, keys: &Keys, item: ItemKey) -> bool {
+        if let Some(&v) = self.auto_copy_pub.get(&item) {
+            return v;
+        }
+        let eligible = self.adts.get(&item).is_some_and(|a| a.kind == tc::AdtKind::Struct)
+            && keys.library_in(names, item).is_some_and(|lib| {
+                let Some(krate) = names.crate_of(lib) else { return false };
+                if !matches!(names.std_is(krate), Some(blaze_unit_graph::StdIs::Bstd(_))) {
+                    return false;
+                }
+                let Some(text) = names.signature_text_of(lib) else { return false };
+                let Ok(low) = lower(names, lib, text.text) else { return false };
+                let view = low.view();
+                is_auto_copy_pub_view(names, lib, lib, tc::AdtKind::Struct, &view).is_ok_and(|x| x)
+            });
+        self.auto_copy_pub.insert_absent(item, eligible);
+        eligible
     }
 
     /// The resolved return type of `key` in `self.tys`: for a function whose signature wrote `_`
@@ -4082,6 +4144,8 @@ impl<'n> Store<'n> {
         self.register_record_defaults(names, keys, key, &env, marks, v)?;
         let (lifetimes, field_region_at, field_region_list) = super::borrows::freeze_field_regions(names, keys, self, ck, v, kind, &fields, self.tys.alloc())?;
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.tys.alloc());
+        let auto_copy = is_auto_copy_pub_view(names, key, module, kind, v)?;
+        self.auto_copy_pub.insert(ck, auto_copy);
         self.adts.insert(ck, AdtRow { kind, generics, variants, fields, repr, valid, discrs, args, marks: coherence, lifetimes, field_regions });
         let _ = self.adt_life(names, keys, key);
         Ok(())

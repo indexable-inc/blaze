@@ -1694,7 +1694,7 @@ fn name_ref<'p, P: FrontEnd>(
     // Config` cloning its `fn(..)` field, 30 tests NOT RUN; t1855d: the same `Config` cloning a
     // tuple field, 30 NOT RUN). Tabled at the trait's `clone` row; a tuple's field clones are
     // resolved in that row's world (world_items.rs `ctor_world`: its trait's).
-    if let Some(crate::clone_shim::LanguageClone { clone, .. }) = crate::clone_shim::language_clone(program, called, ground) {
+    if let Some(crate::clone_shim::LanguageClone { clone, .. }) = crate::clone_shim::language_clone_unconditional(program, called, ground) {
         let Some(c) = program.fn_index(clone) else {
             let refusal = callee_refusal(program, name(), at, called, crate::callee_shown::CalleeGap::NotTabled, ground.view());
             return Ok(Named1::Untabled(clone, refusal));
@@ -1718,6 +1718,17 @@ fn name_ref<'p, P: FrontEnd>(
     };
     let (item, resolved) = match selected {
         Ok(r) => r,
+        Err(blaze_typeck::ResolveError::NoImpl { trait_, .. }) => match crate::clone_shim::language_clone_adt(program, i, called, trait_, ground) {
+            Ok(Some(crate::clone_shim::LanguageClone { clone, .. })) => {
+                let Some(c) = program.fn_index(clone) else {
+                    let refusal = callee_refusal(program, name(), at, called, crate::callee_shown::CalleeGap::NotTabled, ground.view());
+                    return Ok(Named1::Untabled(clone, refusal));
+                };
+                return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(|e| named(e, called, &*ground));
+            }
+            Ok(None) => return Err(resolve_refusal(program, adts, ground, name(), called, blaze_typeck::ResolveError::NoImpl { trait_, item: called.item })),
+            Err(error) => return Err(resolve_refusal(program, adts, ground, name(), called, error)),
+        },
         Err(error) => return Err(resolve_refusal(program, adts, ground, name(), called, error)),
     };
     let callee = Instance { item, args: resolved };

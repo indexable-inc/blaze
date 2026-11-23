@@ -999,6 +999,9 @@ impl World {
                 if attrs.fundamental {
                     flags |= AdtFlags::FUNDAMENTAL;
                 }
+                if attrs.auto_copy_pub {
+                    flags |= AdtFlags::AUTO_COPY_PUB;
+                }
                 if let Some(l) = &attrs.lang {
                     let l = lang_of(l).ok_or_else(|| err(line, format!("no lang item `{l}`")))?;
                     flags |= match l {

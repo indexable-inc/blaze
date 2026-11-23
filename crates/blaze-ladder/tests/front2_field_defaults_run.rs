@@ -1357,3 +1357,107 @@ pub extern \"C\" fn main() -> i32 {
 ");
     assert_eq!(got, Ok(42));
 }
+
+/// Combined native compile-and-run e2e test proving:
+/// - All-`pub` no-`Drop` structs (`Pos`, `Vel`, `Health`) are automatically `Copy` and `Clone`
+///   (with synthesized `Clone::clone` shims and zero `#[derive]`)
+/// - Private-field structs (`FileHandle(u32)`) remain strictly move-only (rejected by `T: Copy`)
+/// - Lockstep `inline for (a, b) in zip_fields(lhs, rhs)` powers zero-macro generic structural
+///   `eq_all<T>` and `inline for (name, f) in v` powers zero-macro generic `hash_all<T>` across
+///   both auto-`Copy` structs and composed `{ ..Base }` structural records.
+#[test]
+fn auto_copy_pub_structs_and_inline_for_zip_reflection() {
+    let ok = run_head(RECORDS_HEAD, "
+#[lang = \"clone\"]
+trait Clone: Sized {
+    fn clone(&self) -> Self;
+}
+
+impl Clone for i32 {
+    fn clone(&self) -> Self { *self }
+}
+impl Clone for u32 {
+    fn clone(&self) -> Self { *self }
+}
+
+// ZERO `impl Copy` or `impl Clone` — all fields are `pub`!
+struct Pos { pub x: i32, pub y: i32 }
+struct Vel { pub dx: i32, pub dy: i32 }
+struct Health(pub u32);
+
+trait EqVal {
+    fn eq_val(&self, other: &Self) -> bool;
+}
+
+impl EqVal for i32 {
+    fn eq_val(&self, other: &Self) -> bool { *self == *other }
+}
+impl EqVal for u32 {
+    fn eq_val(&self, other: &Self) -> bool { *self == *other }
+}
+impl EqVal for Pos {
+    fn eq_val(&self, other: &Self) -> bool { eq_all(self, other) }
+}
+impl EqVal for Vel {
+    fn eq_val(&self, other: &Self) -> bool { eq_all(self, other) }
+}
+impl EqVal for Health {
+    fn eq_val(&self, other: &Self) -> bool { eq_all(self, other) }
+}
+
+fn eq_all<T>(lhs: &T, rhs: &T) -> bool {
+    inline for (a, b) in zip_fields(lhs, rhs) {
+        if !a.eq_val(b) {
+            return false;
+        }
+    }
+    true
+}
+
+fn require_copy<T: Copy>(v: T) -> T {
+    v
+}
+
+type Movable = { pos: Pos = Pos { x: 1, y: 2 }, vel: Vel = Vel { dx: 3, dy: 4 } };
+type Unit = { ..Movable, hp: Health = Health(32) };
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let p = Pos { x: 10, y: 20 };
+    let p_copy = require_copy(p);
+    let p_clone = p.clone();
+    if !eq_all(&p, &p_copy) || !eq_all(&p, &p_clone) {
+        return 1;
+    }
+
+    let u1: Unit = { pos: p };
+    let u2: Unit = u1.clone();
+    let u3: Unit = { pos: Pos { x: 10, y: 99 }, ..u1 };
+    if !eq_all(&u1, &u2) || eq_all(&u1, &u3) {
+        return 2;
+    }
+    (u2.pos.x as u32 + u2.hp.0) as i32
+}
+");
+    assert_eq!(ok, Ok(42));
+
+    // Private-field struct must remain strictly move-only (NOT auto-Copy).
+    let private_rejected = run_head(RECORDS_HEAD, "
+struct FileHandle(u32);
+
+fn require_copy<T: Copy>(v: T) -> T {
+    v
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let h = FileHandle(7);
+    let _ = require_copy(h);
+    0
+}
+");
+    assert!(
+        private_rejected.is_err(),
+        "private-field struct `FileHandle(u32)` must NOT be auto-Copy, got: {private_rejected:?}"
+    );
+}

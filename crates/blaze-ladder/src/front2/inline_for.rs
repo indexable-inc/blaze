@@ -14,7 +14,7 @@ use core::fmt::Write as _;
 use blaze_hash::HashMap;
 use blaze_ids::Hasher;
 use blaze_lower::scoped::Prepares;
-use blaze_lower::typeck::{InlineForSite, TypeckBody};
+use blaze_lower::typeck::{InlineForKind, InlineForSite, TypeckBody};
 use blaze_own::{AString, AVec, Alloc, String as OwnString, Vec as OwnVec};
 use blaze_typeck::{
     self as tc, Checked, ItemKey, List, Mutbl, PNode, PTy, PTys, PortableTys,
@@ -385,12 +385,20 @@ struct FieldSpec<'a> {
     access: AString<'a>,
 }
 
+/// Structural or nominal aggregate identity (after peeling one `&` / `&mut`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AggShape {
+    Record(tc::RecordSchema),
+    Tuple(usize),
+    Struct(ItemKey),
+}
+
 /// Classification of an `inline for` iterable's type.
 enum IterKind<'a> {
     /// Depends on a generic type parameter (`T`, `&T`, `&mut T`): defer to monomorphic specialization.
     Generic,
     /// Concrete record, tuple, or single-variant struct (optionally behind `&` or `&mut`).
-    Concrete { ref_mutbl: Option<Mutbl>, fields: AVec<'a, FieldSpec<'a>> },
+    Concrete { shape: AggShape, ref_mutbl: Option<Mutbl>, fields: AVec<'a, FieldSpec<'a>> },
     /// Not a record, tuple, or single-variant struct.
     NotIterable(&'static str),
 }
@@ -440,7 +448,7 @@ fn extract_fields<'n, 'a, S: NamesSource<'n>>(
                 access.push_str(text);
                 fields.push(FieldSpec { name, access });
             }
-            IterKind::Concrete { ref_mutbl, fields }
+            IterKind::Concrete { shape: AggShape::Record(schema), ref_mutbl, fields }
         }
         PNode::Tuple(elems) => {
             let count = usize::try_from(elems.len).unwrap_or(0);
@@ -452,7 +460,7 @@ fn extract_fields<'n, 'a, S: NamesSource<'n>>(
                 let _ = write!(access, "{idx}");
                 fields.push(FieldSpec { name, access });
             }
-            IterKind::Concrete { ref_mutbl, fields }
+            IterKind::Concrete { shape: AggShape::Tuple(count), ref_mutbl, fields }
         }
         PNode::Adt(adt_key, _) => {
             if !r.store.adts.contains_key(&adt_key) {
@@ -469,15 +477,21 @@ fn extract_fields<'n, 'a, S: NamesSource<'n>>(
                 return IterKind::NotIterable("inline for supports records, tuples, and structs (not enums or unions)");
             }
             let Some(variant) = adt.variants.first() else {
-                return IterKind::Concrete { ref_mutbl, fields: OwnVec::new_in(alloc) };
+                return IterKind::Concrete {
+                    shape: AggShape::Struct(adt_key),
+                    ref_mutbl,
+                    fields: OwnVec::new_in(alloc),
+                };
             };
             let Some(adt_fields) = adt.fields.get(variant.fields.range()) else {
                 return IterKind::NotIterable("struct field range is out of bounds");
             };
             match variant.ctor {
-                tc::CtorKind::Unit => {
-                    IterKind::Concrete { ref_mutbl, fields: OwnVec::new_in(alloc) }
-                }
+                tc::CtorKind::Unit => IterKind::Concrete {
+                    shape: AggShape::Struct(adt_key),
+                    ref_mutbl,
+                    fields: OwnVec::new_in(alloc),
+                },
                 tc::CtorKind::Tuple => {
                     let mut fields: AVec<'a, FieldSpec<'a>> =
                         OwnVec::with_capacity_in(adt_fields.len(), alloc);
@@ -488,7 +502,7 @@ fn extract_fields<'n, 'a, S: NamesSource<'n>>(
                         let _ = write!(access, "{idx}");
                         fields.push(FieldSpec { name, access });
                     }
-                    IterKind::Concrete { ref_mutbl, fields }
+                    IterKind::Concrete { shape: AggShape::Struct(adt_key), ref_mutbl, fields }
                 }
                 tc::CtorKind::Braces => {
                     let Some(lib) = r.keys.library_in(r.names, adt_key) else {
@@ -516,7 +530,7 @@ fn extract_fields<'n, 'a, S: NamesSource<'n>>(
                         access.push_str(text);
                         fields.push(FieldSpec { name, access });
                     }
-                    IterKind::Concrete { ref_mutbl, fields }
+                    IterKind::Concrete { shape: AggShape::Struct(adt_key), ref_mutbl, fields }
                 }
             }
         }
@@ -526,11 +540,51 @@ fn extract_fields<'n, 'a, S: NamesSource<'n>>(
     }
 }
 
+/// Checks that two concrete `zip_fields` iterables share the same aggregate shape and field list.
+fn zip_fields_match(
+    lhs_shape: AggShape,
+    lhs_fields: &[FieldSpec<'_>],
+    rhs_shape: AggShape,
+    rhs_fields: &[FieldSpec<'_>],
+) -> bool {
+    if lhs_shape != rhs_shape || lhs_fields.len() != rhs_fields.len() {
+        return false;
+    }
+    for (lf, rf) in lhs_fields.iter().zip(rhs_fields.iter()) {
+        if lf.name.as_str() != rf.name.as_str() || lf.access.as_str() != rf.access.as_str() {
+            return false;
+        }
+    }
+    true
+}
+
 /// One byte-range replacement for an `inline for` expression inside an item's source text.
 struct Rewrite<'a> {
     start: usize,
     end: usize,
     replacement: AString<'a>,
+}
+
+/// Appends one field access expression for a bound aggregate temporary (`binding_round_site`).
+fn write_field_access(
+    out: &mut AString<'_>,
+    binding: &str,
+    round: usize,
+    site_idx: usize,
+    ref_mutbl: Option<Mutbl>,
+    access: &str,
+) {
+    match ref_mutbl {
+        None => {
+            let _ = write!(out, "{binding}_{round}_{site_idx}.{access}");
+        }
+        Some(Mutbl::Not) => {
+            let _ = write!(out, "&(*{binding}_{round}_{site_idx}).{access}");
+        }
+        Some(Mutbl::Mut) => {
+            let _ = write!(out, "&mut (*{binding}_{round}_{site_idx}).{access}");
+        }
+    }
 }
 
 /// Formats one unrolled `inline for` expansion into `out`.
@@ -576,32 +630,162 @@ fn render_unrolled<'a>(
                 let _ = write!(out, " {{ let {pat_src} = ");
             }
         }
-        match ref_mutbl {
-            None => {
-                let _ = write!(
-                    out,
-                    "__blaze_inline_iter_{round}_{site_idx}.{}; {body_src} }}",
-                    field.access.as_str()
+        write_field_access(
+            &mut out,
+            "__blaze_inline_iter",
+            round,
+            site_idx,
+            ref_mutbl,
+            field.access.as_str(),
+        );
+        let _ = write!(out, "; {body_src} }}");
+    }
+    out.push_str(" }");
+    Some(out)
+}
+
+/// Binding form for `inline for pat in zip_fields(lhs, rhs) { body }`.
+enum ZipPat<'s> {
+    /// `(a, b)`
+    Pair(&'s str, &'s str),
+    /// `(name, a, b)`
+    Named(&'s str, &'s str, &'s str),
+}
+
+/// Parses a `zip_fields` loop pattern as `(a, b)` or `(name, a, b)`.
+fn parse_zip_pat<'v>(view: &blaze_lower::View<'v>, pat: tc::PatId) -> Result<ZipPat<'v>, &'static str> {
+    let Ok(blaze_lower::Pat::Tuple { elems, rest: None }) = view.pat(pat) else {
+        return Err("zip_fields requires a `(a, b)` or `(name, a, b)` tuple pattern");
+    };
+    let Ok(ids) = view.ids(elems) else {
+        return Err("could not read zip_fields pattern elements");
+    };
+    match ids {
+        [p0, p1] => {
+            let a_src = view
+                .pat_range(tc::PatId(*p0))
+                .ok()
+                .and_then(|r| view.text_at(r).ok())
+                .ok_or("could not slice zip_fields pattern")?;
+            let b_src = view
+                .pat_range(tc::PatId(*p1))
+                .ok()
+                .and_then(|r| view.text_at(r).ok())
+                .ok_or("could not slice zip_fields pattern")?;
+            Ok(ZipPat::Pair(a_src, b_src))
+        }
+        [p0, p1, p2] => {
+            let name_src = view
+                .pat_range(tc::PatId(*p0))
+                .ok()
+                .and_then(|r| view.text_at(r).ok())
+                .ok_or("could not slice zip_fields pattern")?;
+            let a_src = view
+                .pat_range(tc::PatId(*p1))
+                .ok()
+                .and_then(|r| view.text_at(r).ok())
+                .ok_or("could not slice zip_fields pattern")?;
+            let b_src = view
+                .pat_range(tc::PatId(*p2))
+                .ok()
+                .and_then(|r| view.text_at(r).ok())
+                .ok_or("could not slice zip_fields pattern")?;
+            Ok(ZipPat::Named(name_src, a_src, b_src))
+        }
+        _ => Err("zip_fields requires a `(a, b)` or `(name, a, b)` tuple pattern"),
+    }
+}
+
+/// Formats one unrolled `inline for pat in zip_fields(lhs, rhs) { body }` expansion into `out`.
+fn render_zip_unrolled<'a>(
+    view: &blaze_lower::View<'_>,
+    site: InlineForSite,
+    lhs: tc::ExprId,
+    rhs: tc::ExprId,
+    lhs_mutbl: Option<Mutbl>,
+    rhs_mutbl: Option<Mutbl>,
+    fields: &[FieldSpec<'a>],
+    round: usize,
+    site_idx: usize,
+    alloc: Alloc<'a>,
+) -> Result<AString<'a>, &'static str> {
+    let zip_pat = parse_zip_pat(view, site.pat)?;
+    let lhs_src = view
+        .expr_range(lhs)
+        .ok()
+        .and_then(|r| view.text_at(r).ok())
+        .ok_or("could not slice lhs source text for zip_fields expansion")?;
+    let rhs_src = view
+        .expr_range(rhs)
+        .ok()
+        .and_then(|r| view.text_at(r).ok())
+        .ok_or("could not slice rhs source text for zip_fields expansion")?;
+    let body_src = view
+        .expr_range(site.body)
+        .ok()
+        .and_then(|r| view.text_at(r).ok())
+        .ok_or("could not slice body source text for zip_fields expansion")?;
+    let mut out = OwnString::new_in(alloc);
+    if fields.is_empty() {
+        let _ = write!(out, "{{ let _ = ({lhs_src}); let _ = ({rhs_src}); }}");
+        return Ok(out);
+    }
+    let _ = write!(
+        out,
+        "{{ let __blaze_inline_lhs_{round}_{site_idx} = ({lhs_src}); let __blaze_inline_rhs_{round}_{site_idx} = ({rhs_src});"
+    );
+    for field in fields {
+        match zip_pat {
+            ZipPat::Pair(a_src, b_src) => {
+                let _ = write!(out, " {{ let {a_src} = ");
+                write_field_access(
+                    &mut out,
+                    "__blaze_inline_lhs",
+                    round,
+                    site_idx,
+                    lhs_mutbl,
+                    field.access.as_str(),
                 );
+                let _ = write!(out, "; let {b_src} = ");
+                write_field_access(
+                    &mut out,
+                    "__blaze_inline_rhs",
+                    round,
+                    site_idx,
+                    rhs_mutbl,
+                    field.access.as_str(),
+                );
+                let _ = write!(out, "; {body_src} }}");
             }
-            Some(Mutbl::Not) => {
+            ZipPat::Named(name_src, a_src, b_src) => {
                 let _ = write!(
                     out,
-                    "&(*__blaze_inline_iter_{round}_{site_idx}).{}; {body_src} }}",
-                    field.access.as_str()
+                    " {{ let {name_src}: &'static str = \"{}\"; let {a_src} = ",
+                    field.name.as_str()
                 );
-            }
-            Some(Mutbl::Mut) => {
-                let _ = write!(
-                    out,
-                    "&mut (*__blaze_inline_iter_{round}_{site_idx}).{}; {body_src} }}",
-                    field.access.as_str()
+                write_field_access(
+                    &mut out,
+                    "__blaze_inline_lhs",
+                    round,
+                    site_idx,
+                    lhs_mutbl,
+                    field.access.as_str(),
                 );
+                let _ = write!(out, "; let {b_src} = ");
+                write_field_access(
+                    &mut out,
+                    "__blaze_inline_rhs",
+                    round,
+                    site_idx,
+                    rhs_mutbl,
+                    field.access.as_str(),
+                );
+                let _ = write!(out, "; {body_src} }}");
             }
         }
     }
     out.push_str(" }");
-    Some(out)
+    Ok(out)
 }
 
 /// Iteratively unrolls all concrete `inline for` loops in `body` in place, without running the
@@ -656,45 +840,126 @@ pub fn expand_concrete_body<'n, S: NamesSource<'n>>(
         let mut any_generic = false;
         let probe_tys = probe.types.view();
         for (site_idx, &(site, start, end)) in top_sites.iter().enumerate() {
-            let iter_ty = probe
-                .expr_ty
-                .get(site.iter.ix())
-                .copied()
-                .ok_or(CheckFail::InlineFor {
-                    owner: body.owner,
-                    at: body.typeck.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default(),
-                    why: "inline for iterable expression has no recorded type",
-                })?;
-            let field_res = {
-                let view = body.lowered.view();
-                let spell = Spelling::of(&view).map_err(|_| CheckFail::InlineFor {
-                    owner: body.owner,
-                    at: body.typeck.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default(),
-                    why: "could not spell names for inline for expansion",
-                })?;
-                extract_fields(r, probe_tys, iter_ty, &spell, alloc)
-            };
-            match field_res {
-                IterKind::Generic => {
-                    any_generic = true;
-                }
-                IterKind::NotIterable(why) => {
-                    let at = body.typeck.expr_ranges.get(site.iter.ix()).copied().unwrap_or_default();
-                    return Err(CheckFail::InlineFor { owner: body.owner, at, why });
-                }
-                IterKind::Concrete { ref_mutbl, fields } => {
-                    let view = body.lowered.view();
-                    let Some(replacement) =
-                        render_unrolled(&view, site, ref_mutbl, &fields, round, site_idx, alloc)
-                    else {
-                        let at = body.typeck.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default();
-                        return Err(CheckFail::InlineFor {
+            match site.kind {
+                InlineForKind::Single { iter } => {
+                    let iter_ty = probe
+                        .expr_ty
+                        .get(iter.ix())
+                        .copied()
+                        .ok_or(CheckFail::InlineFor {
                             owner: body.owner,
-                            at,
-                            why: "could not slice source text for inline for expansion",
-                        });
+                            at: body.typeck.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default(),
+                            why: "inline for iterable expression has no recorded type",
+                        })?;
+                    let field_res = {
+                        let view = body.lowered.view();
+                        let spell = Spelling::of(&view).map_err(|_| CheckFail::InlineFor {
+                            owner: body.owner,
+                            at: body.typeck.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default(),
+                            why: "could not spell names for inline for expansion",
+                        })?;
+                        extract_fields(r, probe_tys, iter_ty, &spell, alloc)
                     };
-                    rewrites.push(Rewrite { start, end, replacement });
+                    match field_res {
+                        IterKind::Generic => {
+                            any_generic = true;
+                        }
+                        IterKind::NotIterable(why) => {
+                            let at = body.typeck.expr_ranges.get(iter.ix()).copied().unwrap_or_default();
+                            return Err(CheckFail::InlineFor { owner: body.owner, at, why });
+                        }
+                        IterKind::Concrete { ref_mutbl, fields, .. } => {
+                            let view = body.lowered.view();
+                            let Some(replacement) =
+                                render_unrolled(&view, site, ref_mutbl, &fields, round, site_idx, alloc)
+                            else {
+                                let at = body.typeck.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default();
+                                return Err(CheckFail::InlineFor {
+                                    owner: body.owner,
+                                    at,
+                                    why: "could not slice source text for inline for expansion",
+                                });
+                            };
+                            rewrites.push(Rewrite { start, end, replacement });
+                        }
+                    }
+                }
+                InlineForKind::Zip { lhs, rhs } => {
+                    let lhs_ty = probe
+                        .expr_ty
+                        .get(lhs.ix())
+                        .copied()
+                        .ok_or(CheckFail::InlineFor {
+                            owner: body.owner,
+                            at: body.typeck.expr_ranges.get(lhs.ix()).copied().unwrap_or_default(),
+                            why: "zip_fields left expression has no recorded type",
+                        })?;
+                    let rhs_ty = probe
+                        .expr_ty
+                        .get(rhs.ix())
+                        .copied()
+                        .ok_or(CheckFail::InlineFor {
+                            owner: body.owner,
+                            at: body.typeck.expr_ranges.get(rhs.ix()).copied().unwrap_or_default(),
+                            why: "zip_fields right expression has no recorded type",
+                        })?;
+                    let (lhs_res, rhs_res) = {
+                        let view = body.lowered.view();
+                        let spell = Spelling::of(&view).map_err(|_| CheckFail::InlineFor {
+                            owner: body.owner,
+                            at: body.typeck.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default(),
+                            why: "could not spell names for zip_fields expansion",
+                        })?;
+                        (
+                            extract_fields(r, probe_tys, lhs_ty, &spell, alloc),
+                            extract_fields(r, probe_tys, rhs_ty, &spell, alloc),
+                        )
+                    };
+                    match (lhs_res, rhs_res) {
+                        (IterKind::NotIterable(why), _) => {
+                            let at = body.typeck.expr_ranges.get(lhs.ix()).copied().unwrap_or_default();
+                            return Err(CheckFail::InlineFor { owner: body.owner, at, why });
+                        }
+                        (_, IterKind::NotIterable(why)) => {
+                            let at = body.typeck.expr_ranges.get(rhs.ix()).copied().unwrap_or_default();
+                            return Err(CheckFail::InlineFor { owner: body.owner, at, why });
+                        }
+                        (IterKind::Generic, _) | (_, IterKind::Generic) => {
+                            any_generic = true;
+                        }
+                        (
+                            IterKind::Concrete { shape: lhs_shape, ref_mutbl: lhs_mutbl, fields: lhs_fields },
+                            IterKind::Concrete { shape: rhs_shape, ref_mutbl: rhs_mutbl, fields: rhs_fields },
+                        ) => {
+                            if !zip_fields_match(lhs_shape, &lhs_fields, rhs_shape, &rhs_fields) {
+                                let at = body.typeck.expr_ranges.get(site.iter.ix()).copied().unwrap_or_default();
+                                return Err(CheckFail::InlineFor {
+                                    owner: body.owner,
+                                    at,
+                                    why: "zip_fields requires two values of the same record, tuple, or struct type",
+                                });
+                            }
+                            let view = body.lowered.view();
+                            let replacement = render_zip_unrolled(
+                                &view,
+                                site,
+                                lhs,
+                                rhs,
+                                lhs_mutbl,
+                                rhs_mutbl,
+                                &lhs_fields,
+                                round,
+                                site_idx,
+                                alloc,
+                            )
+                            .map_err(|why| CheckFail::InlineFor {
+                                owner: body.owner,
+                                at: body.typeck.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default(),
+                                why,
+                            })?;
+                            rewrites.push(Rewrite { start, end, replacement });
+                        }
+                    }
                 }
             }
         }
@@ -1250,4 +1515,404 @@ pub fn specialize_generic_inline_fors<'n>(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::refusal::SourceFile;
+    use crate::run::{FrontChoice, NewFront, RunError, run_with};
+    use blaze_lower::typeck::{Refused, Types, no_const_arg, to_typeck};
+    use blaze_lower::{
+        Cfg, CfgAnswer, ConstIdx, Edition, ExprId, NoModule, TypeId, View, lower_body,
+    };
+
+    struct NoCfg;
+
+    impl Cfg for NoCfg {
+        fn atom(&mut self, _: &str, _: Option<&str>) -> CfgAnswer {
+            CfgAnswer::No
+        }
+    }
+
+    struct DummyTypes;
+
+    impl Types for DummyTypes {
+        fn ty(&mut self, _view: &View<'_>, _t: TypeId, tys: &mut PortableTys<'_>) -> Result<PTy, Refused> {
+            tys.intern(PNode::Infer).map_err(Refused::Check)
+        }
+
+        fn repeat_len(&mut self, _view: &View<'_>, _len: ExprId) -> Result<u64, Refused> {
+            Ok(0)
+        }
+
+        fn const_arg(&mut self, view: &View<'_>, c: ConstIdx, _tys: &mut PortableTys<'_>) -> Result<PTy, Refused> {
+            Err(no_const_arg(view, c))
+        }
+    }
+
+    fn make_field<'a>(name: &str, alloc: Alloc<'a>) -> FieldSpec<'a> {
+        let mut n = OwnString::with_capacity_in(name.len(), alloc);
+        n.push_str(name);
+        let mut a = OwnString::with_capacity_in(name.len(), alloc);
+        a.push_str(name);
+        FieldSpec { name: n, access: a }
+    }
+
+    const NEW_FRONT: NewFront<'static> = NewFront {
+        package: "ladder",
+        edition: "blaze-2026.11",
+        shelf: None,
+        overflow: blaze_build::OverflowChecks::Off,
+    };
+
+    const ZIP_HEAD: &str = "#![blaze::records]
+#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_index: usize, _len: usize) -> ! {
+    loop {}
+}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u8 {}
+impl Copy for u32 {}
+impl Copy for i32 {}
+impl Copy for usize {}
+impl Copy for bool {}
+";
+
+    fn run_zip(body: &str) -> Result<u8, RunError> {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let mut src = OwnString::with_capacity_in(ZIP_HEAD.len() + body.len(), alloc);
+        src.push_str(ZIP_HEAD);
+        src.push_str(body);
+        let files = [SourceFile { path: "src/main.rs", text: src.as_str() }];
+        run_with(&files, "src/main.rs", None, FrontChoice::New(NEW_FRONT), heap.shared())
+    }
+
+    #[test]
+    fn zip_fields_lowers_and_renders_all_forms() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let text = "fn f(lhs: i32, rhs: i32) {
+    inline for (a, b) in zip_fields(lhs, rhs) { a; b; }
+    inline for (name, x, y) in zip_fields(&mut lhs, &rhs) { name; x; y; }
+    inline for bad in zip_fields(lhs, rhs) { bad; }
+}";
+        let mut cfg = NoCfg;
+        let mut values = NoModule;
+        let Ok(lowered) = lower_body(text, Edition::E2024, &mut cfg, &mut values, alloc) else {
+            assert!(false, "lower_body failed");
+            return;
+        };
+        let view = lowered.view();
+        let mut tys = PortableTys::new_in(alloc);
+        let mut dt = DummyTypes;
+        let Ok(tb) = to_typeck(&view, ItemKey(1), &mut tys, &mut dt, alloc) else {
+            assert!(false, "to_typeck failed");
+            return;
+        };
+        assert_eq!(tb.inline_fors.len(), 3);
+
+        // Site 0: `(a, b)` in `zip_fields(lhs, rhs)`
+        let Some(&site0) = tb.inline_fors.first() else {
+            assert!(false, "missing site 0");
+            return;
+        };
+        let InlineForKind::Zip { lhs: lhs0, rhs: rhs0 } = site0.kind else {
+            assert!(false, "expected Zip kind for site 0");
+            return;
+        };
+        assert!(matches!(tb.exprs.get(site0.iter.ix()), Some(tc::Expr::Missing)));
+        let Some(tc::Expr::Block { stmts, tail: None, .. }) = tb.exprs.get(site0.expr.ix()) else {
+            assert!(false, "expected wired 2-stmt probe block");
+            return;
+        };
+        assert_eq!(stmts.len, 2);
+
+        let mut fields = OwnVec::with_capacity_in(2, alloc);
+        fields.push(make_field("x", alloc));
+        fields.push(make_field("y", alloc));
+
+        // `&T` + `&T`
+        let rendered_ref = render_zip_unrolled(
+            &view,
+            site0,
+            lhs0,
+            rhs0,
+            Some(Mutbl::Not),
+            Some(Mutbl::Not),
+            &fields,
+            0,
+            0,
+            alloc,
+        );
+        assert_eq!(
+            rendered_ref.as_ref().map(|s| s.as_str()),
+            Ok("{ let __blaze_inline_lhs_0_0 = (lhs); let __blaze_inline_rhs_0_0 = (rhs); { let a = &(*__blaze_inline_lhs_0_0).x; let b = &(*__blaze_inline_rhs_0_0).x; { a; b; } } { let a = &(*__blaze_inline_lhs_0_0).y; let b = &(*__blaze_inline_rhs_0_0).y; { a; b; } } }")
+        );
+
+        // By-value `T` + `T`
+        let rendered_val = render_zip_unrolled(&view, site0, lhs0, rhs0, None, None, &fields, 0, 1, alloc);
+        assert_eq!(
+            rendered_val.as_ref().map(|s| s.as_str()),
+            Ok("{ let __blaze_inline_lhs_0_1 = (lhs); let __blaze_inline_rhs_0_1 = (rhs); { let a = __blaze_inline_lhs_0_1.x; let b = __blaze_inline_rhs_0_1.x; { a; b; } } { let a = __blaze_inline_lhs_0_1.y; let b = __blaze_inline_rhs_0_1.y; { a; b; } } }")
+        );
+
+        // Zero-field aggregate
+        let rendered_empty = render_zip_unrolled(&view, site0, lhs0, rhs0, None, None, &[], 0, 2, alloc);
+        assert_eq!(
+            rendered_empty.as_ref().map(|s| s.as_str()),
+            Ok("{ let _ = (lhs); let _ = (rhs); }")
+        );
+
+        // Site 1: `(name, x, y)` in `zip_fields(&mut lhs, &rhs)` with mixed mutability
+        let Some(&site1) = tb.inline_fors.get(1) else {
+            assert!(false, "missing site 1");
+            return;
+        };
+        let InlineForKind::Zip { lhs: lhs1, rhs: rhs1 } = site1.kind else {
+            assert!(false, "expected Zip kind for site 1");
+            return;
+        };
+        let rendered_named = render_zip_unrolled(
+            &view,
+            site1,
+            lhs1,
+            rhs1,
+            Some(Mutbl::Mut),
+            Some(Mutbl::Not),
+            &fields,
+            1,
+            0,
+            alloc,
+        );
+        assert_eq!(
+            rendered_named.as_ref().map(|s| s.as_str()),
+            Ok("{ let __blaze_inline_lhs_1_0 = (&mut lhs); let __blaze_inline_rhs_1_0 = (&rhs); { let name: &'static str = \"x\"; let x = &mut (*__blaze_inline_lhs_1_0).x; let y = &(*__blaze_inline_rhs_1_0).x; { name; x; y; } } { let name: &'static str = \"y\"; let x = &mut (*__blaze_inline_lhs_1_0).y; let y = &(*__blaze_inline_rhs_1_0).y; { name; x; y; } } }")
+        );
+
+        // Site 2: invalid 1-binding pattern rejected
+        let Some(&site2) = tb.inline_fors.get(2) else {
+            assert!(false, "missing site 2");
+            return;
+        };
+        let InlineForKind::Zip { lhs: lhs2, rhs: rhs2 } = site2.kind else {
+            assert!(false, "expected Zip kind for site 2");
+            return;
+        };
+        let rendered_bad = render_zip_unrolled(&view, site2, lhs2, rhs2, None, None, &fields, 0, 0, alloc);
+        assert!(rendered_bad.is_err());
+
+        // `zip_fields_match` checks aggregate shape and field names
+        assert!(zip_fields_match(AggShape::Tuple(2), &fields, AggShape::Tuple(2), &fields));
+        assert!(!zip_fields_match(AggShape::Tuple(2), &fields, AggShape::Tuple(3), &fields));
+        assert!(!zip_fields_match(AggShape::Struct(ItemKey(1)), &fields, AggShape::Struct(ItemKey(2)), &fields));
+    }
+
+    #[test]
+    fn zip_fields_generic_eq_diff_copy_and_by_value_run() {
+        let got = run_zip(
+            "
+#[repr(C)]
+struct Words {
+    data: usize,
+    len: usize,
+}
+impl Copy for Words {}
+union Wide {
+    s: &'static str,
+    words: Words,
+}
+fn str_len(s: &'static str) -> u32 {
+    unsafe { Wide { s }.words.len as u32 }
+}
+
+trait EqVal {
+    fn eq_val(&self, other: &Self) -> bool;
+}
+
+trait CopyFrom {
+    fn copy_from(&mut self, src: &Self);
+}
+
+trait TakeDiff {
+    fn take_diff(self, other: Self) -> u32;
+}
+
+struct A(u32);
+struct B(u32);
+struct C(u32);
+
+impl EqVal for A {
+    fn eq_val(&self, other: &A) -> bool { self.0 == other.0 }
+}
+impl EqVal for B {
+    fn eq_val(&self, other: &B) -> bool { self.0 == other.0 }
+}
+impl EqVal for C {
+    fn eq_val(&self, other: &C) -> bool { self.0 == other.0 }
+}
+
+impl CopyFrom for A {
+    fn copy_from(&mut self, src: &A) { self.0 = src.0; }
+}
+impl CopyFrom for B {
+    fn copy_from(&mut self, src: &B) { self.0 = src.0; }
+}
+
+impl TakeDiff for A {
+    fn take_diff(self, other: A) -> u32 { if self.0 >= other.0 { self.0 - other.0 } else { other.0 - self.0 } }
+}
+impl TakeDiff for B {
+    fn take_diff(self, other: B) -> u32 { if self.0 >= other.0 { self.0 - other.0 } else { other.0 - self.0 } }
+}
+
+struct Named {
+    alpha: A,
+    beta: B,
+}
+
+struct Pair(A, B);
+
+struct Empty;
+
+fn eq_all<T>(lhs: &T, rhs: &T) -> bool {
+    inline for (a, b) in zip_fields(lhs, rhs) {
+        if !a.eq_val(b) {
+            return false;
+        }
+    }
+    true
+}
+
+fn diff_name_len<T>(lhs: &T, rhs: &T) -> u32 {
+    let mut acc: u32 = 0;
+    inline for (name, a, b) in zip_fields(lhs, rhs) {
+        if !a.eq_val(b) {
+            acc = acc + str_len(name);
+        }
+    }
+    acc
+}
+
+fn copy_into<T>(dst: &mut T, src: &T) {
+    inline for (d, s) in zip_fields(dst, src) {
+        d.copy_from(s);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut score: u32 = 0;
+    // 1. Structural records (including swapped literal field order): +1, +0 => 1
+    let r1 = { hp: A(10), mp: B(20) };
+    let r2 = { mp: B(20), hp: A(10) };
+    let r3 = { hp: A(10), mp: B(99) };
+    if eq_all(&r1, &r2) { score = score + 1; }
+    if !eq_all(&r1, &r3) { score = score + 2; }
+    // 2. Heterogeneous tuples: +4 => 7
+    let t1 = (A(1), B(2), C(3));
+    let t2 = (A(1), B(2), C(3));
+    let t3 = (A(1), B(9), C(3));
+    if eq_all(&t1, &t2) && !eq_all(&t1, &t3) { score = score + 4; }
+    // 3. Named struct & 3-binding diff: \"alpha\" (5) differs -> +5; equal pair -> +8 => 20
+    let n1 = Named { alpha: A(5), beta: B(6) };
+    let n2 = Named { alpha: A(7), beta: B(6) };
+    let n3 = Named { alpha: A(5), beta: B(6) };
+    if eq_all(&n1, &n3) { score = score + 8; }
+    score = score + diff_name_len(&n1, &n2);
+    // 4. Tuple struct: +10 => 30
+    let p1 = Pair(A(3), B(4));
+    let p2 = Pair(A(3), B(4));
+    if eq_all(&p1, &p2) { score = score + 10; }
+    // 5. Zero-field aggregates (unit struct and empty tuple): +2 => 32
+    let e1 = Empty;
+    let e2 = Empty;
+    if eq_all(&e1, &e2) { score = score + 1; }
+    let u1 = ();
+    let u2 = ();
+    if eq_all(&u1, &u2) { score = score + 1; }
+    // 6. Mixed mutability &mut + & (both generic copy_into and concrete zip_fields):
+    //    dst becomes { hp: 10, mp: 20 } -> +30 => 62
+    let mut dst = { hp: A(1), mp: B(2) };
+    copy_into(&mut dst, &r1);
+    let mut dst2 = Named { alpha: A(0), beta: B(0) };
+    inline for (d, s) in zip_fields(&mut dst2, &n1) {
+        d.copy_from(s);
+    }
+    score = score + dst.hp.0 + dst.mp.0 + dst2.alpha.0 + dst2.beta.0;
+    // 7. By-value non-Copy zip_fields: |9-4| + |8-3| = 10 => 72 + 11 = 83
+    let mv1 = { x: A(9), y: B(8) };
+    let mv2 = { x: A(4), y: B(3) };
+    inline for (a, b) in zip_fields(mv1, mv2) {
+        score = score + a.take_diff(b);
+    }
+    // Total: 1+2+4+8+5+10+1+1 + (10+20+5+6=41) + 10 = 83
+    score as i32
+}
+",
+        );
+        assert!(matches!(got, Ok(83)));
+    }
+
+    #[test]
+    fn zip_fields_rejects_mismatched_and_non_aggregate_types() {
+        let cases = [
+            // Mismatched record schemas
+            "
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let a = { x: 1u32 };
+    let b = { y: 1u32 };
+    inline for (l, r) in zip_fields(&a, &b) { let _ = l; let _ = r; }
+    0
+}
+",
+            // Mismatched tuple arities
+            "
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let a = (1u32, 2u32);
+    let b = (1u32, 2u32, 3u32);
+    inline for (l, r) in zip_fields(&a, &b) { let _ = l; let _ = r; }
+    0
+}
+",
+            // Mismatched named struct types
+            "
+struct S1 { x: u32 }
+struct S2 { x: u32 }
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let a = S1 { x: 1 };
+    let b = S2 { x: 1 };
+    inline for (l, r) in zip_fields(&a, &b) { let _ = l; let _ = r; }
+    0
+}
+",
+            // Non-aggregate types
+            "
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let a: u32 = 1;
+    let b: u32 = 2;
+    inline for (l, r) in zip_fields(&a, &b) { let _ = l; let _ = r; }
+    0
+}
+",
+        ];
+        for src in cases {
+            assert!(run_zip(src).is_err());
+        }
+    }
 }

@@ -1705,10 +1705,16 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
     // records its answer reads are made by this loop's fills. `Copy`'s key is filed in the key
     // map (no body need name the trait for the world to find its record).
     let builtin = match self_ty {
-        Some(t) => matches!(
-            ground.view().node(t).map_err(|error| CheckFail::Check { owner, error })?,
-            tc::PNode::Tuple(_) | tc::PNode::Record(..) | tc::PNode::Union(_) | tc::PNode::Closure { .. } | tc::PNode::FnDef(..) | tc::PNode::FnPtr(..)
-        ),
+        Some(t) => match ground.view().node(t).map_err(|error| CheckFail::Check { owner, error })? {
+            tc::PNode::Tuple(_)
+            | tc::PNode::Record(..)
+            | tc::PNode::Union(_)
+            | tc::PNode::Closure { .. }
+            | tc::PNode::FnDef(..)
+            | tc::PNode::FnPtr(..) => true,
+            tc::PNode::Adt(adt, _) => r.store.is_auto_copy_pub(r.names, r.keys, adt),
+            _ => false,
+        },
         None => false,
     };
     let copy = match builtin {
