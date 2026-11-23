@@ -635,7 +635,7 @@ impl<'f> NamesStage<'f> {
                                     }
                                 }
                             }
-                            let job = Job { at, crates, all, deps: &deps, script: script_bytes, home, env, packs, corrected, procs, kept, workers, oracle, clock, serve };
+                            let job = Job { at, crates, all, deps: &deps, script: script_bytes, home, env, packs, corrected, procs, kept, workers, oracle, clock, board, serve };
                             job.run(cx, root, task, outlined, alloc)
                         });
                         shown.end(board.now(clock));
@@ -1364,7 +1364,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         } else { None };
         let workers = self.set_width(scope, handles, scripts_pending);
         let job = Job { at, crates: columns.crates, all, deps, script: script_bytes, home: handles.env.home, env, packs: columns.packs,
-            corrected: columns.corrected, procs: gate.as_ref().ok().copied().flatten(), kept: handles.env.heap.shared(), workers, oracle: handles.oracle, clock: &handles.env.clock, serve: handles.serve() };
+            corrected: columns.corrected, procs: gate.as_ref().ok().copied().flatten(), kept: handles.env.heap.shared(), workers, oracle: handles.oracle, clock: &handles.env.clock, board: handles.board, serve: handles.serve() };
         self.order.insert((!feeds_names, task.planned.phase.wave, name), task);
         self.waiting.push_back(WaitingName { task, scope, job, script, blocked: gate.err(), root: handles.root, clock: &handles.env.clock,
             board: handles.board, outlined: handles.outlined, alloc, waiter, submitted: crate::engine_times::ns(handles.env.clock.now().since_start()) });
@@ -1461,6 +1461,7 @@ struct Job<'j> {
     /// `--names-oracle` ([`NamesOracle`]) and the clock its check is timed by (rule 75).
     oracle: NamesOracle,
     clock: &'j bstd::clock::Clock,
+    board: &'j crate::engine_status::Board<'j>,
     /// What it serves the files its crate finds by ([`Serve`]).
     serve: Serve<'j>,
 }
@@ -1621,7 +1622,7 @@ impl Job<'_> {
             }
             (env, _) => env,
         };
-        let job = ScopeJob { workers: self.workers, kept: self.kept, at: self.at, input: CrateInput { deps: &own_deps, ..input }, deps: &exports, sysroot, packs: self.packs, corrected: self.corrected, env, procs: self.procs, oracle: self.oracle, clock: self.clock };
+        let job = ScopeJob { workers: self.workers, kept: self.kept, at: self.at, input: CrateInput { deps: &own_deps, ..input }, deps: &exports, sysroot, packs: self.packs, corrected: self.corrected, env, procs: self.procs, oracle: self.oracle, clock: self.clock, board: Some(self.board) };
         let (resolved, ok, unresolved, oracle) = match crate::names::resolve(cx, root, &job, cx.frame()).0 {
             Resolution::Made { resolved, ok, unresolved, oracle } => (resolved, ok, unresolved, oracle),
             Resolution::Need(keys) => return need(&keys),

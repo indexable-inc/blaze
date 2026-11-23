@@ -2942,6 +2942,7 @@ fn run_selected<'h>(
     let mut runner = Runner::new(zygotes, &config.plan, TestHost::THIS, alloc);
     let mut unkept = Unkept::default();
     let mut print = |bytes: &[u8]| -> Result<(), DriveError> {
+        watch.see(blaze_screen::Step::Says);
         for chunk in bytes.utf8_chunks() {
             out.write(&cx, chunk.valid()).map_err(|_| DriveError::Print)?;
             if !chunk.invalid().is_empty() {
@@ -2950,7 +2951,9 @@ fn run_selected<'h>(
         }
         Ok(())
     };
+    watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Testing));
     let status = drive(config, rows, &owners, filtered, &mut runner, &mut refuse, &mut unkept, &mut print, alloc);
+    watch.see(blaze_screen::Step::Says);
     // A run that stopped in blaze: ONE line naming the test, what failed and its cause, then
     // the command's own error (`OneStopped`) says the line above is why (rule 19). The
     // runner's `Seam` error says only that one stopped, so it is not shown.

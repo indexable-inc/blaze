@@ -494,7 +494,14 @@ fn serve(
         let Some(target) = why else {
             let checked = match flags.fix {
                 None => {
-                    let line = crate::run_line::LineOpts::from_env(env, err, flags.color);
+                    let line = crate::run_line::LineOpts::from_env(
+                        env,
+                        err,
+                        flags.color,
+                        blaze_screen::Command::Check,
+                        view,
+                        flags.status_every.is_some(),
+                    );
                     let ran = crate::run_line::watched(cx, err, clock, line, |watch, bg| {
                         watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
                         let live = line.live.then_some(bg);
@@ -1556,7 +1563,7 @@ fn checking<'f>(
                 let mut discovered = {
                     let answer_units = AnswerUnits { stored: stored.as_ref(), records: &records, alloc: request };
                     let back = crate::engine_units::Back::new(&answer_units);
-                    crate::engine_units::discover(cx, root, &mut store, &mut laid_here, units, tools, &back, stood, &env, frame)?
+                    crate::engine_units::discover(cx, root, &mut store, &mut laid_here, units, tools, &back, stood, &env, board, frame)?
                 };
                 phases.mark_cx(cx, discovered.cause.phase(), frame);
                 let kept = Kept { slots: &today_slots, answer: &start, records: &records, tools: &tools, read: core::cell::Cell::new(0) };

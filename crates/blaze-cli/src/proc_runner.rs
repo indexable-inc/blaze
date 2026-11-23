@@ -140,6 +140,8 @@ mod with_sandbox {
         procs: ProcMacros<'r>,
         /// Each macro crate by its world index: its key. Sorted by index.
         keys: std::vec::Vec<(usize, CrateItemKey), Global>,
+        /// Each macro crate's package name by its runner key, sorted by key (for live status).
+        crate_names: blaze_own::Vec<(CrateItemKey, blaze_own::String<blaze_own::SharedAlloc<'static>>), blaze_own::SharedAlloc<'static>>,
         /// Each crate's package as the macro is shown it, by its index in the names world (proc_env.rs).
         callers: crate::proc_env::Callers,
     }
@@ -151,6 +153,15 @@ mod with_sandbox {
         pub(crate) fn key_of(&self, krate: usize) -> Option<CrateItemKey> {
             let at = self.keys.binary_search_by_key(&krate, |(k, _)| *k).ok()?;
             Some(self.keys[at].1)
+        }
+
+        /// Package name of the proc-macro crate that defines `def` (for live status attribution).
+        pub(crate) fn crate_name(&self, def: &MacroDefinition<'_>) -> Option<&str> {
+            let blaze_expand::MacroKind::ProcMacro { krate, .. } = def.kind() else {
+                return None;
+            };
+            let at = self.crate_names.binary_search_by_key(&krate, |(key, _)| *key).ok()?;
+            self.crate_names.get(at).map(|(_, name)| name.as_str())
         }
 
         /// Runs the proc macro `def` on `call`, written in the crate at index `krate` of the
@@ -219,6 +230,7 @@ mod with_sandbox {
         let world = names.world();
         let graph = names.graph();
         let mut keys = std::vec::Vec::new_in(Global);
+        let mut crate_names = blaze_own::Vec::new_in(side.heap.shared());
         let mut callers = crate::proc_env::Callers::new();
         let placed = names.placed();
         for (at, krate) in world.crates.iter().enumerate() {
@@ -260,8 +272,11 @@ mod with_sandbox {
             }
             procs.add_crate(key, &identity.package, &identity.version, module);
             keys.push((at, key));
+            crate_names.push((key, blaze_own::String::from_str_in(identity.package.as_str(), side.heap.shared())));
         }
-        let runner = ProcRunner { procs, keys, callers };
+        crate_names.sort_unstable_by_key(|(key, _)| *key);
+        crate_names.dedup_by_key(|(key, _)| *key);
+        let runner = ProcRunner { procs, keys, crate_names, callers };
         Ok(std::boxed::Box::leak(std::boxed::Box::new_in(runner, Global)))
     }
 
@@ -279,6 +294,12 @@ mod without_sandbox {
 
     impl ProcRunner<'_> {
         pub(crate) fn key_of(&self, _krate: usize) -> Option<CrateItemKey> {
+            match self {
+                ProcRunner::Never(never, _) => match *never {},
+            }
+        }
+
+        pub(crate) fn crate_name(&self, _def: &MacroDefinition<'_>) -> Option<&str> {
             match self {
                 ProcRunner::Never(never, _) => match *never {},
             }

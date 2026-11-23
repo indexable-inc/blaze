@@ -19,7 +19,7 @@ use blaze_report::{
 };
 
 use crate::frame::{Frame, Line, Progress, Role, Span};
-use crate::run_line::{LineBuf, StatusFrame, StatusLine};
+use crate::run_line::{LineBuf, StatusBlock, StatusFrame, StatusGroup, StatusLine, WorkKind};
 
 /// The SGR parameters of a role on `terminal`: the palette's value of its token
 /// (`blaze_report::palette`), for how many colours the terminal draws and its background.
@@ -175,12 +175,292 @@ pub fn encode(frame: &Frame, terminal: &Terminal, out: &mut String) {
 pub fn encode_status(frame: &StatusFrame<'_>, terminal: &Terminal, out: &mut dyn fmt::Write) -> fmt::Result {
     match frame {
         StatusFrame::Erase => out.write_str("\x1b[K"),
+        StatusFrame::EraseLines(rows) => {
+            if *rows <= 1 {
+                return out.write_str("\x1b[K");
+            }
+            out.write_str("\x1b[?2026h\r\x1b[2K")?;
+            for _ in 1..*rows {
+                out.write_str("\r\n\x1b[2K")?;
+            }
+            write!(out, "\r\x1b[{}A\x1b[?2026l", rows.saturating_sub(1))
+        }
         StatusFrame::Draw(line) => {
             out.write_str("\x1b[?2026h\x1b7\x1b[?7l")?;
             status_text(line, terminal, out)?;
             out.write_str("\x1b[K\x1b[?7h\x1b8\x1b[?2026l")
         }
+        StatusFrame::DrawBlock(block) => encode_block(block, terminal, out),
     }
+}
+
+/// Formats `ms` as a compact live timer (`0.4s`, `42.1s`, `2m05s`).
+fn write_timer(out: &mut dyn fmt::Write, ms: u64) -> fmt::Result {
+    match ms {
+        0..60_000 => write!(out, "{}.{}s", ms / 1000, ms % 1000 / 100),
+        _ => write!(out, "{}m{:02}s", ms / 60_000, ms % 60_000 / 1000),
+    }
+}
+
+/// Renders a multi-line [`StatusBlock`] in place, erasing any extra stale lines left from
+/// `block.prev_rows`, and always returning the cursor to row 0, column 0.
+fn encode_block(block: &StatusBlock<'_>, terminal: &Terminal, out: &mut dyn fmt::Write) -> fmt::Result {
+    let new_rows = block.rows();
+    let max_rows = new_rows.max(block.prev_rows);
+    if max_rows <= 1 {
+        out.write_str("\x1b[?2026h\x1b7\x1b[?7l")?;
+        block_summary(block, terminal, out)?;
+        return out.write_str("\x1b[K\x1b[?7h\x1b8\x1b[?2026l");
+    }
+    out.write_str("\x1b[?2026h\x1b[?7l\r")?;
+    block_summary(block, terminal, out)?;
+    out.write_str("\x1b[K")?;
+    let count = usize::from(block.group_count);
+    for slot in block.groups.iter().take(count) {
+        if let Some(group) = slot {
+            out.write_str("\r\n")?;
+            block_group_row(block, group, terminal, out)?;
+            out.write_str("\x1b[K")?;
+        }
+    }
+    for _ in new_rows..max_rows {
+        out.write_str("\r\n\x1b[2K")?;
+    }
+    write!(out, "\r\x1b[{}A\x1b[?7h\x1b[?2026l", max_rows.saturating_sub(1))
+}
+
+/// Line 0 of [`StatusBlock`]: `⠋ blaze check  [████████░░] 482/538  14.2s  (12 active)`.
+fn block_summary(block: &StatusBlock<'_>, terminal: &Terminal, out: &mut dyn fmt::Write) -> fmt::Result {
+    const SPINNER: [&str; 10] = ["⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ "];
+    let budget = usize::from(block.cols).saturating_sub(1);
+    if budget == 0 {
+        return Ok(());
+    }
+    let glyph = if block.unicode {
+        let idx = usize::try_from((block.elapsed_ms / 80) % 10).unwrap_or(0);
+        *SPINNER.get(idx).unwrap_or(&"▶ ")
+    } else {
+        "> "
+    };
+    let mut cmd = LineBuf::<32>::new();
+    let _ = write!(cmd, "blaze {}", block.command);
+
+    let mut mid = LineBuf::<48>::new();
+    let mid_is_bar = match block.progress {
+        Some((done, total)) if total > 0 => {
+            let clamped = done.min(total);
+            let filled = usize::try_from(u64::from(clamped).saturating_mul(10) / u64::from(total))
+                .unwrap_or(0)
+                .min(10);
+            let (full, empty) = if block.unicode { ('█', '░') } else { ('#', '.') };
+            let _ = mid.write_char('[');
+            for i in 0..10 {
+                let _ = mid.write_char(if i < filled { full } else { empty });
+            }
+            let _ = write!(mid, "] {clamped}/{total}");
+            true
+        }
+        _ => {
+            let _ = mid.write_str(block.verb);
+            false
+        }
+    };
+
+    let mut time = LineBuf::<24>::new();
+    let _ = write_timer(&mut time, block.elapsed_ms);
+
+    let mut active = LineBuf::<24>::new();
+    if block.active > 0 {
+        let _ = write!(active, "({} active)", block.active);
+    }
+
+    let glyph_w = columns(glyph);
+    let cmd_w = columns(cmd.as_str());
+    let head = glyph_w + cmd_w;
+    if head > budget {
+        let used = fitting(out, glyph, budget)?;
+        return fitting(out, cmd.as_str(), budget.saturating_sub(used)).map(drop);
+    }
+
+    let time_w = columns(time.as_str());
+    let mid_w = columns(mid.as_str());
+    let active_w = columns(active.as_str());
+
+    let show_time = head + 2 + time_w <= budget;
+    let mut used = head + if show_time { 2 + time_w } else { 0 };
+    let show_mid = mid_w > 0 && used + 2 + mid_w <= budget;
+    if show_mid {
+        used += 2 + mid_w;
+    }
+    let show_active = active_w > 0 && used + 2 + active_w <= budget;
+
+    painted(out, terminal, Token::Running, glyph)?;
+    painted(out, terminal, Token::Emphasis, cmd.as_str())?;
+    if show_mid {
+        out.write_str("  ")?;
+        let token = if mid_is_bar { Token::Number } else { Token::Dim };
+        painted(out, terminal, token, mid.as_str())?;
+    }
+    if show_time {
+        out.write_str("  ")?;
+        painted(out, terminal, Token::Dim, time.as_str())?;
+    }
+    if show_active {
+        out.write_str("  ")?;
+        painted(out, terminal, Token::Dim, active.as_str())?;
+    }
+    Ok(())
+}
+
+/// One category row of [`StatusBlock`], strictly within `cols - 1` columns:
+/// `  build.rs    librocksdb-sys · cc/c++ (42.1s), openssl-sys (3.2s)  [external]`.
+fn block_group_row(
+    block: &StatusBlock<'_>,
+    group: &StatusGroup<'_>,
+    terminal: &Terminal,
+    out: &mut dyn fmt::Write,
+) -> fmt::Result {
+    let budget = usize::from(block.cols).saturating_sub(1);
+    if budget == 0 {
+        return Ok(());
+    }
+    let label = group.kind.label(block.verb);
+    let label_token = match group.kind {
+        WorkKind::BuildScript => Token::Warning,
+        WorkKind::Fetch | WorkKind::ProcMacro => Token::Waiting,
+        WorkKind::Blaze => Token::Running,
+    };
+    let label_w = columns(label);
+    let pad = 10usize.saturating_sub(label_w);
+    let prefix_w = 2 + label_w + pad + 2;
+    if prefix_w >= budget {
+        let mut used = fitting(out, "  ", budget)?;
+        used += fitting(out, label, budget.saturating_sub(used))?;
+        let _ = used;
+        return Ok(());
+    }
+
+    // Build optional right-hand suffix (`  [external]` for build.rs, `  · <hint>` for Blaze).
+    let mut suffix = LineBuf::<64>::new();
+    let suffix_token = match group.kind {
+        WorkKind::BuildScript => {
+            let _ = suffix.write_str("  [external]");
+            Token::Warning
+        }
+        WorkKind::Blaze => {
+            if let Some(hint) = block.hint.filter(|s| !s.is_empty()) {
+                let sep = if block.unicode { "  · " } else { "  - " };
+                let _ = suffix.write_str(sep);
+                let _ = suffix.write_str(hint);
+            }
+            Token::Dim
+        }
+        WorkKind::Fetch | WorkKind::ProcMacro => Token::Dim,
+    };
+
+    let avail = budget - prefix_w;
+    let suffix_w = columns(suffix.as_str());
+    let show_suffix = suffix_w > 0 && avail >= suffix_w + 16;
+    let items_room = if show_suffix { avail - suffix_w } else { avail };
+
+    out.write_str("  ")?;
+    painted(out, terminal, label_token, label)?;
+    for _ in 0..(pad + 2) {
+        out.write_char(' ')?;
+    }
+
+    let count = usize::from(group.count);
+    let ellipsis = if block.unicode { "…" } else { "..." };
+    let ellipsis_w = columns(ellipsis);
+    let mut used = 0usize;
+    let mut shown = 0usize;
+    let item_token = match group.kind {
+        WorkKind::BuildScript => Token::Emphasis,
+        WorkKind::Fetch | WorkKind::ProcMacro | WorkKind::Blaze => Token::Code,
+    };
+    let time_token = match group.kind {
+        WorkKind::BuildScript => Token::Warning,
+        WorkKind::Fetch | WorkKind::ProcMacro | WorkKind::Blaze => Token::Dim,
+    };
+
+    for item in group.items.iter().take(count).flatten() {
+        let mut timer = LineBuf::<24>::new();
+        if item.elapsed_ms >= 100 {
+            let _ = timer.write_str(" (");
+            let _ = write_timer(&mut timer, item.elapsed_ms);
+            let _ = timer.write_char(')');
+        }
+        let name_w = columns(item.label);
+        let timer_w = columns(timer.as_str());
+        let item_w = name_w + timer_w;
+
+        if shown == 0 {
+            if item_w <= items_room {
+                painted(out, terminal, item_token, item.label)?;
+                if !timer.as_str().is_empty() {
+                    painted(out, terminal, time_token, timer.as_str())?;
+                }
+                used += item_w;
+            } else if timer_w > 0 && items_room >= timer_w + ellipsis_w + 2 {
+                let keep = items_room - timer_w - ellipsis_w;
+                let code = terminal.sgr(item_token);
+                if !code.is_empty() {
+                    write!(out, "\x1b[{code}m")?;
+                }
+                let wrote = fitting(out, item.label, keep)?;
+                out.write_str(ellipsis)?;
+                if !code.is_empty() {
+                    out.write_str("\x1b[0m")?;
+                }
+                painted(out, terminal, time_token, timer.as_str())?;
+                used += wrote + ellipsis_w + timer_w;
+            } else if items_room > ellipsis_w {
+                let keep = items_room - ellipsis_w;
+                let code = terminal.sgr(item_token);
+                if !code.is_empty() {
+                    write!(out, "\x1b[{code}m")?;
+                }
+                let wrote = fitting(out, item.label, keep)?;
+                out.write_str(ellipsis)?;
+                if !code.is_empty() {
+                    out.write_str("\x1b[0m")?;
+                }
+                used += wrote + ellipsis_w;
+            } else {
+                used += fitting(out, item.label, items_room)?;
+            }
+            shown += 1;
+            continue;
+        }
+
+        // Subsequent items: only emit if `, ` + full item fits cleanly.
+        if used + 2 + item_w <= items_room {
+            out.write_str(", ")?;
+            painted(out, terminal, item_token, item.label)?;
+            if !timer.as_str().is_empty() {
+                painted(out, terminal, time_token, timer.as_str())?;
+            }
+            used += 2 + item_w;
+            shown += 1;
+        } else {
+            break;
+        }
+    }
+
+    let omitted = usize::from(group.extra).saturating_add(count.saturating_sub(shown));
+    if omitted > 0 {
+        let mut plus = LineBuf::<16>::new();
+        let _ = write!(plus, " +{omitted}");
+        let plus_w = columns(plus.as_str());
+        if used + plus_w <= items_room {
+            painted(out, terminal, Token::Dim, plus.as_str())?;
+        }
+    }
+
+    if show_suffix {
+        painted(out, terminal, suffix_token, suffix.as_str())?;
+    }
+    Ok(())
 }
 
 /// The columns `text` takes, its control characters (which are never written) left out.

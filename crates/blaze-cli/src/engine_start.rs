@@ -227,8 +227,14 @@ pub(crate) fn command(
     };
     let launch = program::Launch { fs, env, host, out, err, select, grants: &flags.grants, args: &flags.program };
     let words = crate::words(command, out, err);
-    // `blaze run`'s live line on a terminal's stderr (run_line.rs), as the old path had it.
-    let line = crate::run_line::LineOpts::from_env(env, err, flags.color);
+    // `blaze run` / `blaze test`'s live inline TUI on a terminal's stderr (run_line.rs).
+    let screen_cmd = match command {
+        Command::Run => blaze_screen::Command::Run,
+        Command::Test => blaze_screen::Command::Test,
+        Command::Check => blaze_screen::Command::Check,
+    };
+    let view = flags.view.unwrap_or(blaze_report::frame::plain::View::Person);
+    let line = crate::run_line::LineOpts::from_env(env, err, flags.color, screen_cmd, view, flags.status_every.is_some());
     let line = crate::run_line::LineOpts { live: line.live && matches!(command, Command::Run | Command::Test), ..line };
     let lined = crate::run_line::watched(cx, err, clock, line, |watch, bg| {
         watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
@@ -316,7 +322,7 @@ pub(crate) fn run_program(
     // The program's crate first, then its scope's: from the crate list the walk read, so the
     // unit graph is not read again here (engine_native.rs reads it once more inside).
     let closure = program_found.closure_in(alloc);
-    let native = crate::engine_native::image_for(cx, &mut standing, &closure)
+    let native = crate::engine_native::image_for(cx, &mut standing, &closure, watch)
         .map_err(|error| CliError::Start(StartError::Native { shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) }))?;
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::BodyIds));
     let list = found.list().ok_or(CliError::Start(StartError::NoProgram))?;
@@ -494,7 +500,7 @@ pub(crate) fn run_tests(
                 continue;
             }
             let closure = suite_closure(list, unit.at, alloc);
-            let image = crate::engine_native::image_for(cx, &mut standing, &closure)
+            let image = crate::engine_native::image_for(cx, &mut standing, &closure, watch)
                 .map(|image| image.send)
                 .map_err(|error| crate::work::held_str(bstd::mem::format_in!(frame, "{error}").as_str(), frame));
             images.push(image);
