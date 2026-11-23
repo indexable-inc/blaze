@@ -160,7 +160,11 @@ fn names_groups_record_gives_each_members_scope() {
         for (paths, g) in solved.groups.iter() {
             for &m in g.members.iter() {
                 let bytes = g.scope_of(m).unwrap_or_else(|e| panic!("{paths:?}: {e:?}"));
-                let view = blaze_surface::ScopeView::read(bytes).unwrap_or_else(|e| panic!("{paths:?}: the scope does not read: {e:?}"));
+                let mut buf = std::vec![0u8; bytes.len() + 16];
+                let pad = buf.as_ptr().align_offset(16);
+                buf[pad..pad + bytes.len()].copy_from_slice(bytes);
+                let aligned = &buf[pad..pad + bytes.len()];
+                let view = blaze_surface::ScopeView::read(aligned).unwrap_or_else(|e| panic!("{paths:?}: the scope does not read: {e:?}"));
                 assert_eq!(view.module(), m, "{paths:?}: another member's scope");
             }
             let other = solved.groups.iter().map(|(_, o)| o.members[0]).find(|k| !g.members.contains(k));

@@ -123,8 +123,12 @@ fn link_toolchain_shelf(home: &Path) {
             } else if kind.is_symlink() {
                 let target = std::fs::read_link(&src).expect("read_link");
                 std::os::unix::fs::symlink(&target, &dst).unwrap_or_else(|e| panic!("symlink {}: {e}", dst.display()));
-            } else {
-                std::fs::hard_link(&src, &dst).unwrap_or_else(|e| panic!("hard_link {} -> {}: {e}", src.display(), dst.display()));
+            } else if let Err(e) = std::fs::hard_link(&src, &dst) {
+                if e.kind() == std::io::ErrorKind::CrossesDevices || e.raw_os_error() == Some(18) {
+                    std::fs::copy(&src, &dst).unwrap_or_else(|copy_e| panic!("copy {} -> {}: {copy_e}", src.display(), dst.display()));
+                } else {
+                    panic!("hard_link {} -> {}: {e}", src.display(), dst.display());
+                }
             }
         }
     }

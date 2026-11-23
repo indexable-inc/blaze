@@ -6,7 +6,7 @@ blaze-answer 6
 blaze-bench 4
 blaze-bstd-convert 31
 blaze-build 15
-blaze-build-script 32
+blaze-build-script 30
 blaze-cas 55
 blaze-cc 6
 blaze-cert 1

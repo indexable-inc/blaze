@@ -483,7 +483,9 @@ pub fn export_lean_theorems<A: Allocator + Copy>(
         if r.lhs.is_empty() || r.rhs.is_empty() {
             continue;
         }
-        let _ = writeln!(out, "/-- `{}`: {} -/", r.name, r.doc);
+        out.push_str("/-- `");
+        out.push_str(r.name);
+        let _ = writeln!(out, "`: {} -/", r.doc);
         let _ = writeln!(out, "def rule_{} : Prop :=", r.name);
         let max_v = max_pat_var(r.lhs).into_iter().chain(max_pat_var(r.rhs)).max();
         out.push_str("  ");
@@ -507,7 +509,9 @@ pub fn export_lean_theorems<A: Allocator + Copy>(
     }
 
     for d in derivs {
-        let _ = writeln!(out, "/-- Derivative soundness for `{}` (arity {}). -/", d.op, d.arity);
+        out.push_str("/-- Derivative soundness for `");
+        out.push_str(d.op);
+        let _ = writeln!(out, "` (arity {}). -/", d.arity);
         let _ = writeln!(out, "def deriv_{} : Prop :=\n  {}\n", d.op, d.lean_stmt);
     }
 
