@@ -54,11 +54,13 @@ pub(crate) fn file_tasks<'h>(outlined: &[crate::engine_tasks::Outlined<'_>], ski
     into.extend(crate::engine_lints::plan(outlined, rules, alloc));
 }
 
-/// Which driver `check` runs an edit on (`--driver=ready|phases`, main.rs `Flags::driver`): the
-/// phase path (engine_check.rs) or the ready set (this file's plan run on blaze-engine's
-/// `Ready`). `Phases` until both give byte-equal stored answers on tempo (D187).
+/// Which driver `check` runs an edit on (`--driver=auto|ready|phases`, main.rs `Flags::driver`):
+/// `Auto` (the default) runs the fast ready path whenever the edit is eligible and falls back
+/// cleanly to the phase path on any typed [`ReadyRefused`]; `Ready` is strict (refuses rather than
+/// falling back, for tests and diagnostics); `Phases` runs the phase path explicitly (D187).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Driver {
+    Auto,
     Phases,
     Ready,
 }
@@ -66,6 +68,7 @@ pub(crate) enum Driver {
 impl Driver {
     pub(crate) fn parse(word: &str) -> Option<Driver> {
         match word {
+            "auto" => Some(Driver::Auto),
             "phases" => Some(Driver::Phases),
             "ready" => Some(Driver::Ready),
             _ => None,
@@ -235,6 +238,26 @@ impl core::fmt::Display for ReadyRefused {
     }
 }
 
+impl ReadyRefused {
+    /// The [`PhasesWhy`] recorded on the profile's `driver:` line when [`Driver::Auto`] routes a
+    /// ready-ineligible request to the phase path.
+    pub(crate) fn phases_why(self) -> PhasesWhy {
+        match self {
+            ReadyRefused::Root(why) => why,
+            ReadyRefused::Kind { name } => PhasesWhy::ReadyKind(name.kind),
+            ReadyRefused::ModuleTree { .. } => PhasesWhy::ModuleTree,
+            ReadyRefused::Members { .. } => PhasesWhy::Members,
+            ReadyRefused::Unsorted { .. }
+            | ReadyRefused::NoRow { .. }
+            | ReadyRefused::Graph(_)
+            | ReadyRefused::NoList
+            | ReadyRefused::ListFact { .. }
+            | ReadyRefused::NoPlace { .. }
+            | ReadyRefused::SkippedTargets { .. } => PhasesWhy::ReadySetup,
+        }
+    }
+}
+
 /// The second step of the precondition: the wake's entering names (sorted, each once) admitted
 /// to the `Ready` path when every one is of a kind it runs ([`READY_KINDS`]); else the first
 /// that is not, by name. Reads no page: a name carries its kind.
@@ -249,7 +272,7 @@ pub(crate) fn admit(names: &[Name]) -> Result<EditPath<'_>, ReadyRefused> {
 /// Why a `check` takes the phase path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PhasesWhy {
-    /// `--driver=phases` (the default until both drivers give byte-equal answers on tempo).
+    /// `--driver=phases` asked explicitly for the phase path.
     Chosen,
     /// No stored answer for this checkout: a first check.
     NoAnswer,
@@ -276,6 +299,16 @@ pub(crate) enum PhasesWhy {
     /// had none): its leaves were all followed here and its journal places are not this
     /// checkout's, so no wake from changed files is proved; the phase path plans every file.
     OtherCheckout,
+    /// The forward wake entered a task whose kind is not yet on the ready path (e.g. a
+    /// signature, crate scope, or impl bucket).
+    ReadyKind(blaze_drive::Kind),
+    /// An edited file's outline changed the module tree (`mod ...;` added, removed, or moved).
+    ModuleTree,
+    /// No compatible members record opened over today's unit graph.
+    Members,
+    /// The stored answer lacked a ready-setup precondition (graph row, crate list, file place, or
+    /// skipped-target note).
+    ReadySetup,
 }
 
 /// What the stored answer a request starts from is to it: a precondition of the certificate
@@ -303,6 +336,15 @@ impl PhasesWhy {
             PhasesWhy::NothingMoved => "nothing moved",
             PhasesWhy::ToolsMoved => "a tool moved since the stored answer (its rows are entered by their keys)",
             PhasesWhy::OtherCheckout => "the stored answer is another checkout's (this one had none)",
+            PhasesWhy::ReadyKind(kind) => match kind {
+                blaze_drive::Kind::Signature => "the edit enters a Signature task (not on the ready path yet)",
+                blaze_drive::Kind::CrateScope => "the edit enters a CrateScope task (not on the ready path yet)",
+                blaze_drive::Kind::ImplBucket => "the edit enters an ImplBucket task (not on the ready path yet)",
+                _ => "the edit enters a task kind not on the ready path yet",
+            },
+            PhasesWhy::ModuleTree => "an edited file's module tree moved",
+            PhasesWhy::Members => "no compatible members record opens over today's unit graph",
+            PhasesWhy::ReadySetup => "the stored answer lacked a ready-setup precondition",
         }
     }
 }
@@ -319,31 +361,37 @@ impl core::fmt::Display for EditPath<'_> {
 /// The first step of the precondition, from the driver chosen, the stored answer's root
 /// (`None`: none stored), what that answer is to this request ([`StoredBase`]), and the sweep's
 /// changed leaves. Reads no row and no header. Under `--driver=phases` the phase path; under
-/// `--driver=ready` the wake, or the refusal that stops the request ([`ReadyRefused::Root`]).
+/// `--driver=auto` the wake when eligible else the phase path; under `--driver=ready` the wake,
+/// or the refusal that stops the request ([`ReadyRefused::Root`]).
 pub(crate) fn choose(driver: Driver, root: Option<&blaze_engine::pages::Root<'_>>, base: StoredBase, changed: &[Changed]) -> Result<Chosen, ReadyRefused> {
     if driver == Driver::Phases {
         return Ok(Chosen::Phases(PhasesWhy::Chosen));
     }
-    let Some(root) = root else { return Err(ReadyRefused::Root(PhasesWhy::NoAnswer)) };
+    let refuse = |why: PhasesWhy| match driver {
+        Driver::Auto => Ok(Chosen::Phases(why)),
+        Driver::Ready => Err(ReadyRefused::Root(why)),
+        Driver::Phases => Ok(Chosen::Phases(PhasesWhy::Chosen)),
+    };
+    let Some(root) = root else { return refuse(PhasesWhy::NoAnswer) };
     match base {
         StoredBase::Own => {}
-        StoredBase::ToolsMoved => return Err(ReadyRefused::Root(PhasesWhy::ToolsMoved)),
-        StoredBase::OtherCheckout => return Err(ReadyRefused::Root(PhasesWhy::OtherCheckout)),
+        StoredBase::ToolsMoved => return refuse(PhasesWhy::ToolsMoved),
+        StoredBase::OtherCheckout => return refuse(PhasesWhy::OtherCheckout),
     }
     if !root.owed_tasks.is_empty() || !root.owed_cells.is_empty() {
-        return Err(ReadyRefused::Root(PhasesWhy::Owed { tasks: root.owed_tasks.len(), cells: root.owed_cells.len() }));
+        return refuse(PhasesWhy::Owed { tasks: root.owed_tasks.len(), cells: root.owed_cells.len() });
     }
     if changed.is_empty() {
-        return Err(ReadyRefused::Root(PhasesWhy::NothingMoved));
+        return refuse(PhasesWhy::NothingMoved);
     }
     if changed.iter().any(|one| one.kind.by_script()) {
-        return Err(ReadyRefused::Root(PhasesWhy::ScriptRead));
+        return refuse(PhasesWhy::ScriptRead);
     }
     if changed.iter().any(|one| !matches!(one.kind, crate::sweep::LeafKind::Slot)) {
-        return Err(ReadyRefused::Root(PhasesWhy::Layout));
+        return refuse(PhasesWhy::Layout);
     }
     if changed.iter().any(|one| !one.both) {
-        return Err(ReadyRefused::Root(PhasesWhy::FileAddedOrRemoved));
+        return refuse(PhasesWhy::FileAddedOrRemoved);
     }
     Ok(Chosen::Wake { files: changed.len() })
 }

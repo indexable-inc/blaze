@@ -165,3 +165,53 @@ fn toolchain_base_populates_cells_and_merges_from_work_rows() {
     assert_eq!(b.entered(blaze_engine::Stage::Names), 2, "B reuses all toolchain Names from tool-base:\n{}", b.profile);
     assert_eq!(b.errors, 0, "B checks cleanly:\n{}", b.profile);
 }
+
+#[test]
+fn incremental_edit_and_second_cold_repo_do_not_rewrite_toolchain_base() {
+    BASE_PLANT.set(BasePlant::None);
+    let io = Io::simulated(SimWorld::new(29, Limits::USUAL));
+    let shelf = lang_shelf(&io);
+    repository_a(&io, A1);
+    repository_b(&io, B);
+    let check_with_shelf = |checkout: Checkout| {
+        let opts = || {
+            let mut opts = engine_check_tests::opts(&io, 2, false);
+            opts.place.checkout = checkout.dir;
+            opts.toolchain = shelf;
+            opts.driver = crate::engine_ready_edit::Driver::Auto;
+            opts
+        };
+        check_in::<fix::Atomic>(&io, checkout, &opts, View::Person, None)
+    };
+    let read_tc_ptr = || {
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let frame = Frame::with_reserve(16 << 20, bstd::mem::Tag::Other).expect("frame");
+        let alloc = blaze_own::Erased::new(&frame);
+        let opts = engine_check_tests::opts(&io, 2, false);
+        let fs = io.need_fs().expect("files");
+        let root = fs.open_dir(&cx, &Path::new(A1.dir).expect("a path")).expect("open");
+        let err = io.need_err().expect("err");
+        let clock = io.need_clock().expect("clock");
+        let host = io.need_host().expect("host");
+        let mut rng = io.need_rng().expect("rng");
+        let opened = crate::store::open_for_command(&cx, &fs, &host, &mut rng, opts.place.home, None, &root, A1.dir, &clock, &err, opts.heap).expect("open store");
+        let mut store = crate::store::CommandStore::new(&cx, &opened.lent, false, opened.open_ns, None, clock.clone(), &err, alloc.handle()).expect("store");
+        let ptr = crate::engine_answer::load_toolchain_base(&cx, &mut store, shelf, &opts.tools, &frame)
+            .expect("load tool-base")
+            .expect("tool-base exists")
+            .expect("tool-base readable");
+        ptr.key
+    };
+    let a1 = check_with_shelf(A1);
+    assert_eq!(a1.errors, 0, "A1 cold check clean:\n{}", a1.profile);
+    let key_after_cold = read_tc_ptr();
+    // 1-line body edit in A1 under Driver::Auto (takes ready path, 0 toolchain rows touched).
+    write_in(&io, A1, "src/a.rs", "pub fn g() -> u8 {\n    42\n}\n");
+    let a1_edit = check_with_shelf(A1);
+    assert_eq!(a1_edit.errors, 0, "A1 body edit clean:\n{}", a1_edit.profile);
+    assert_eq!(read_tc_ptr(), key_after_cold, "body edit did not rewrite tool-base");
+    // Unrelated repo B on the same toolchain also leaves tool-base untouched.
+    let b = check_with_shelf(B);
+    assert_eq!(b.errors, 0, "B cold check clean:\n{}", b.profile);
+    assert_eq!(read_tc_ptr(), key_after_cold, "second cold repo on same toolchain did not rewrite tool-base");
+}

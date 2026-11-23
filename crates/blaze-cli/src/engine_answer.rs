@@ -1116,6 +1116,13 @@ impl fmt::Display for Rekeyed {
 /// index among the pages') is never read: it expires by its life.
 pub(crate) const REACH_ROOT: &str = "reach";
 pub(crate) const ANSWER_ROOT: &str = "answer";
+/// Page slots per reach shard once an answer spans more than one shard (`> 512` pages):
+/// at Tempo's 65,536 pages, 128 shards (`{name}.reach.00`..`{name}.reach.7f`) let a 4-page edit
+/// renew 124 unchanged shards in O(1) (`Lent::renew_root`, 0 CAS probes) and write at most 4
+/// shards (<= 2,048 probes, <= 64 KiB) instead of probing and rewriting all 65,536 page indexes
+/// (2.1 MiB) on every edit. Small answers (`<= 512` pages) keep the single `{name}.reach` root.
+pub(crate) const REACH_SHARD_PAGES: usize = 512;
+pub(crate) const REACH_SHARDS_MOST: usize = (1usize << blaze_drive::answers::MOST_BITS) / REACH_SHARD_PAGES;
 
 const PAGES_DOMAIN: &str = "blaze-cli engine-check page keys";
 
@@ -1445,8 +1452,15 @@ fn save<'m, D: Driver, S: Sharing>(
         (Some(base), Some(key)) => Some((&base.root.pages[..], key)),
         _ => None,
     };
-    let (indexes, rekeyed) = page_indexes(lent, (reach_name.as_str(), answer_name.as_str()), last_pages, &encoded.pages, rekey, alloc)?;
-    saved.pages = u32::try_from(indexes.len()).unwrap_or(u32::MAX);
+    let (pages_live, rekeyed) = if encoded.pages.len() <= REACH_SHARD_PAGES {
+        let (indexes, rekeyed) = page_indexes(lent, (reach_name.as_str(), answer_name.as_str()), last_pages, &encoded.pages, rekey, alloc)?;
+        let count = u32::try_from(indexes.len()).unwrap_or(u32::MAX);
+        lent.root_through(reach_name.as_str(), &indexes, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+        (count, rekeyed)
+    } else {
+        publish_reach_shards(lent, name, answer_name.as_str(), last_pages, &encoded.pages, rekey, alloc, frame)?
+    };
+    saved.pages = pages_live;
     saved.rekeyed = rekeyed;
     let mut direct = blaze_own::Vec::new_in(alloc);
     direct.push(blaze_cas::Key(encoded.root.0));
@@ -1458,12 +1472,11 @@ fn save<'m, D: Driver, S: Sharing>(
     // engine_member_rows.rs): named here so they live while the answer does, and the next
     // command reads them by key instead of opening and listing each member again.
     direct.extend(row_keys.iter().map(|key| blaze_cas::Key(key.0)));
-    // Two roots, one commit: the pages' indexes (at most one a page: `ROOT_INDEXES_MOST` is
-    // the most pages a root's paging makes), and the answer's own index, which names this
-    // answer's root key: the next commit's proof that the reach root is this answer's
-    // ([`page_indexes`]).
+    // Two roots, one commit: the pages' reach roots (one `{name}.reach` up to 256 pages, or
+    // 256-page shards `{name}.reach.00`..`{name}.reach.ff` above that, where unchanged shards
+    // renew in O(1)), and the answer's own index, which names this answer's root key: the next
+    // commit's proof that the reach roots are this answer's ([`prove_last_reach`]).
     let answer_index = lent.index(&direct).map_err(crate::store::PlaceError::from)?;
-    lent.root_through(reach_name.as_str(), &indexes, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
     lent.root_through(answer_name.as_str(), &[answer_index], blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
     // This root accumulates indexes across commands. Unchanged pages' toolchain
     // payloads were admitted with the page and this renewal extends their lifetime.
@@ -1652,11 +1665,6 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
         kept.answer.rows.get(name)
     };
     let mut fresh_names: blaze_own::Vec<Name, &Frame> = blaze_own::Vec::new_in(frame);
-    for (&name, row) in kept.answer.rows.iter() {
-        if !row.failed && store.is_toolchain(name) && kept.records.contains_key(&name) {
-            fresh_names.push(name);
-        }
-    }
     if let Some(work) = kept.answer.work() {
         for (&name, slot) in work.rows.iter() {
             if let Some(row) = slot
@@ -1667,6 +1675,12 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
                 fresh_names.push(name);
             }
         }
+    } else {
+        for (&name, row) in kept.answer.rows.iter() {
+            if !row.failed && store.is_toolchain(name) && kept.records.contains_key(&name) {
+                fresh_names.push(name);
+            }
+        }
     }
     fresh_names.sort_unstable();
     fresh_names.dedup();
@@ -1674,11 +1688,40 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
         return Ok(());
     }
     let tc_root = toolchain_base_root(toolchain, tools, frame);
-    let prev = match load_pointer(cx, store, tc_root.as_str())? {
-        Some(Ok(ptr)) => {
+    let existing_ptr = match load_pointer(cx, store, tc_root.as_str())? {
+        Some(Ok(ptr)) => Some((ptr.root, ptr.headers)),
+        _ => None,
+    };
+    // Fast unchanged check: inspect ONLY the pages holding `fresh_names` in place via `Stored`
+    // without decoding the entire `tool-base` answer. Only fall through to `pages::decode` +
+    // merge when at least one toolchain row is new or changed.
+    if let Some((ptr_root, ref ptr_headers)) = existing_ptr
+        && let Ok(root) = open_root(cx, store, ptr_root, alloc)?
+    {
+        let snapshot = store.snapshot_in(alloc)?;
+        let existing = Stored::new(&root, &snapshot, ptr_headers, pages::Check::Store, alloc);
+        let unchanged = fresh_names.iter().all(|name| {
+            let Some(new_row) = row_of(name) else { return false };
+            let Ok(Some(page)) = existing.page(*name) else { return false };
+            let Some(old_row) = page.row(*name) else { return false };
+            !old_row.facts.failed
+                && old_row.facts.key == new_row.key
+                && old_row.facts.out == new_row.out
+                && page.record(*name) == kept.records.get(name).copied()
+                && new_row.defines.iter().all(|&(cell, digest)| {
+                    page.cell(&blaze_engine::CellId { of: *name, cell })
+                        .is_some_and(|(stored_digest, _)| stored_digest == digest)
+                })
+        });
+        if unchanged {
+            return Ok(());
+        }
+    }
+    let prev = match existing_ptr {
+        Some((ptr_root, _)) => {
             let mut store_err: Option<CliError> = None;
             let decoded = pages::decode(
-                ptr.root,
+                ptr_root,
                 |k| {
                     if store_err.is_some() {
                         return None;
@@ -1699,30 +1742,8 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
             }
             decoded.ok()
         }
-        _ => None,
+        None => None,
     };
-    // Skip rewriting when every fresh toolchain row already stands identically in `tool-base`
-    // AND its defined cells are already present in `existing.answer.cells`.
-    if let Some(existing) = &prev {
-        let unchanged = fresh_names.iter().all(|name| {
-            let Some(new_row) = row_of(name) else { return false };
-            let Some(old_row) = existing.answer.rows.get(name) else { return false };
-            !old_row.failed
-                && old_row.key == new_row.key
-                && old_row.out == new_row.out
-                && existing.records.get(name) == kept.records.get(name)
-                && old_row.defines.iter().all(|&(cell, digest)| {
-                    existing
-                        .answer
-                        .cells
-                        .get(&blaze_engine::CellId { of: *name, cell })
-                        .is_some_and(|&(stored_digest, _)| stored_digest == digest)
-                })
-        });
-        if unchanged {
-            return Ok(());
-        }
-    }
     let mut tc_kept = match prev {
         Some(mut existing) => {
             existing.places.clear();
@@ -1833,67 +1854,56 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
     Ok(())
 }
 
-/// The reach root's page indexes for the pages `now` (one a page with anything on it, its
-/// blaze-cas `beside_key`), sorted, and what was keyed for them. Under [`Rekey::Changed`] over a
-/// last answer (its pages and its root's key), only the pages whose key moved are keyed (the old
-/// key's index out, the new one's in); every other index is carried from the last commit's reach
-/// root, read in place, once its answer root (`names.1`) proves that commit was the last answer's
-/// (its one index names `last`'s root key: both roots are set in one commit). Before, every
-/// commit keyed every page: 65,536 digests on tempo for a one-body edit (edit12 profile,
-/// c0340wave89, `answer stored` 10.5 ms). The floor is the changed pages' digests plus one pass
-/// over the carried keys (a merge of sorted lists); the comparison of `last`'s and `now`'s keys
-/// is one more such pass. A reach root that is not the last answer's, or none, is made whole and
-/// says why ([`WhyWhole`]); a carried root that lacks a changed page's old index is refused.
-fn page_indexes<'h, D: Driver>(
+/// Reads the raw sorted key bytes of a named root record (`None` when absent/expired).
+fn held_root_bytes<'l, D: Driver>(lent: &'l blaze_cas::plain::Lent<D, crate::store::StoreAlloc>, name: &str) -> Result<Option<&'l [u8]>, CliError> {
+    let Some(key) = lent.root_named(name) else { return Ok(None) };
+    let held = lent.get(&key).map_err(crate::store::PlaceError::from)?;
+    let held = held.ok_or_else(|| page_error(PagesError::Reach { owner: Key(key.0), index: Key(key.0), what: "a named root's record is not held" }))?;
+    if held.bytes.len() % 32 != 0 {
+        return Err(page_error(PagesError::Reach { owner: Key(key.0), index: Key(key.0), what: "a root's record is not whole keys" }));
+    }
+    Ok(Some(held.bytes))
+}
+
+#[inline]
+fn cas_key_at(bytes: &[u8], at: usize) -> blaze_cas::Key {
+    blaze_cas::Key(ContentId(bytes[at * 32..at * 32 + 32].try_into().expect("a whole key")))
+}
+
+/// Proves that the previous commit's `{name}.answer` root names `last_root` and its paging matches
+/// `now_len`, returning either `Ok((old_pages, last_root))` or the exact [`WhyWhole`] reason to
+/// build the reach roots whole.
+fn prove_last_reach<'a, D: Driver>(
     lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
-    names: (&str, &str),
-    last: Option<(&[Key], Key)>,
-    now: &[Key],
+    answer_name: &str,
+    last: Option<(&'a [Key], Key)>,
+    now_len: usize,
     rekey: Rekey,
-    alloc: SharedAlloc<'h>,
-) -> Result<(blaze_own::Vec<blaze_cas::Key, SharedAlloc<'h>>, Rekeyed), CliError> {
-    let index_of = |page: Key| blaze_cas::plain::beside_key(blaze_cas::Key(page.0));
-    let whole = |why: WhyWhole| {
-        let mut indexes = blaze_own::Vec::new_in(alloc);
-        indexes.extend(now.iter().filter(|page| **page != Key::default()).map(|page| index_of(*page)));
-        indexes.sort_unstable();
-        let pages = u32::try_from(indexes.len()).unwrap_or(u32::MAX);
-        Ok((indexes, Rekeyed { pages, whole: Some(why) }))
-    };
+) -> Result<Result<(&'a [Key], Key), WhyWhole>, CliError> {
     #[cfg(test)]
     if rekey == Rekey::All {
-        return whole(WhyWhole::Planted);
+        return Ok(Err(WhyWhole::Planted));
     }
     #[cfg(not(test))]
     let Rekey::Changed = rekey;
-    let Some((old, last_root)) = last else { return whole(WhyWhole::NoLast) };
-    if old.len() != now.len() {
-        return whole(WhyWhole::Paging);
+    let Some((old, last_root)) = last else { return Ok(Err(WhyWhole::NoLast)) };
+    if old.len() != now_len {
+        return Ok(Err(WhyWhole::Paging));
     }
-    fn held<'l, D: Driver>(lent: &'l blaze_cas::plain::Lent<D, crate::store::StoreAlloc>, name: &str) -> Result<Option<&'l [u8]>, CliError> {
-        let Some(key) = lent.root_named(name) else { return Ok(None) };
-        let held = lent.get(&key).map_err(crate::store::PlaceError::from)?;
-        let held = held.ok_or_else(|| page_error(PagesError::Reach { owner: Key(key.0), index: Key(key.0), what: "a named root's record is not held" }))?;
-        if held.bytes.len() % 32 != 0 {
-            return Err(page_error(PagesError::Reach { owner: Key(key.0), index: Key(key.0), what: "a root's record is not whole keys" }));
-        }
-        Ok(Some(held.bytes))
-    }
-    let key_at = |bytes: &[u8], at: usize| blaze_cas::Key(ContentId(bytes[at * 32..at * 32 + 32].try_into().expect("a whole key")));
-    // The proof: the answer root's one index names the last answer's root key.
-    let Some(answer) = held(lent, names.1)? else { return whole(WhyWhole::NoRoot) };
+    let Some(answer) = held_root_bytes(lent, answer_name)? else { return Ok(Err(WhyWhole::NoRoot)) };
     if answer.len() != 32 {
-        return whole(WhyWhole::NotLast);
+        return Ok(Err(WhyWhole::NotLast));
     }
-    let direct = lent.get(&key_at(answer, 0)).map_err(crate::store::PlaceError::from)?;
-    let Some(direct) = direct.filter(|got| blaze_keyed::kind::ReservedTag::Index.is(got.tag) &&got.bytes.len() % 32 == 0) else { return whole(WhyWhole::NotLast) };
-    // An index's keys are sorted (blaze-cas `index`): found by halving.
+    let direct = lent.get(&cas_key_at(answer, 0)).map_err(crate::store::PlaceError::from)?;
+    let Some(direct) = direct.filter(|got| blaze_keyed::kind::ReservedTag::Index.is(got.tag) && got.bytes.len() % 32 == 0) else {
+        return Ok(Err(WhyWhole::NotLast));
+    };
     let wanted = blaze_cas::Key(last_root.0);
     let (mut low, mut high) = (0usize, direct.bytes.len() / 32);
     let mut names_last = false;
     while low < high {
         let mid = low + (high - low) / 2;
-        match key_at(direct.bytes, mid).cmp(&wanted) {
+        match cas_key_at(direct.bytes, mid).cmp(&wanted) {
             core::cmp::Ordering::Less => low = mid + 1,
             core::cmp::Ordering::Greater => high = mid,
             core::cmp::Ordering::Equal => {
@@ -1903,10 +1913,21 @@ fn page_indexes<'h, D: Driver>(
         }
     }
     if !names_last {
-        return whole(WhyWhole::NotLast);
+        return Ok(Err(WhyWhole::NotLast));
     }
-    let Some(carried) = held(lent, names.0)? else { return whole(WhyWhole::NoRoot) };
-    // The changed pages: the old key's index out, the new one's in.
+    Ok(Ok((old, last_root)))
+}
+
+/// Merges the changed pages between `old` and `now` into `carried` (the previous sorted root
+/// bytes), returning the updated sorted page-index list and how many pages moved.
+fn merge_carried_indexes<'h>(
+    carried: &[u8],
+    old: &[Key],
+    now: &[Key],
+    last_root: Key,
+    alloc: SharedAlloc<'h>,
+) -> Result<(blaze_own::Vec<blaze_cas::Key, SharedAlloc<'h>>, u32), CliError> {
+    let index_of = |page: Key| blaze_cas::plain::beside_key(blaze_cas::Key(page.0));
     let mut out: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'h>> = blaze_own::Vec::new_in(alloc);
     let mut into: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'h>> = blaze_own::Vec::new_in(alloc);
     let mut pages = 0u32;
@@ -1921,12 +1942,11 @@ fn page_indexes<'h, D: Driver>(
     }
     out.sort_unstable();
     into.sort_unstable();
-    // One merge of three sorted lists: the carried keys but `out`, and `into`.
     let count = carried.len() / 32;
     let mut indexes: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'h>> = blaze_own::Vec::with_capacity_in((count + into.len()).saturating_sub(out.len()), alloc);
     let (mut gone, mut added) = (0usize, 0usize);
     for at in 0..count {
-        let key = key_at(carried, at);
+        let key = cas_key_at(carried, at);
         while added < into.len() && into[added] < key {
             indexes.push(into[added]);
             added += 1;
@@ -1944,7 +1964,117 @@ fn page_indexes<'h, D: Driver>(
         return Err(page_error(PagesError::Reach { owner: Key(last_root.0), index: Key(out[gone].0), what: "the last answer's reach root lacks a changed page's old index" }));
     }
     indexes.extend_from_slice(&into[added..]);
+    Ok((indexes, pages))
+}
+
+/// The reach root's page indexes for the pages `now` (one a page with anything on it, its
+/// blaze-cas `beside_key`), sorted, and what was keyed for them. Used for answers with at most
+/// [`REACH_SHARD_PAGES`] pages (single `{name}.reach` root); larger answers use
+/// [`publish_reach_shards`].
+fn page_indexes<'h, D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    names: (&str, &str),
+    last: Option<(&[Key], Key)>,
+    now: &[Key],
+    rekey: Rekey,
+    alloc: SharedAlloc<'h>,
+) -> Result<(blaze_own::Vec<blaze_cas::Key, SharedAlloc<'h>>, Rekeyed), CliError> {
+    let index_of = |page: Key| blaze_cas::plain::beside_key(blaze_cas::Key(page.0));
+    let whole = |why: WhyWhole| {
+        let mut indexes = blaze_own::Vec::new_in(alloc);
+        indexes.extend(now.iter().filter(|page| **page != Key::default()).map(|page| index_of(*page)));
+        indexes.sort_unstable();
+        let pages = u32::try_from(indexes.len()).unwrap_or(u32::MAX);
+        Ok((indexes, Rekeyed { pages, whole: Some(why) }))
+    };
+    let (old, last_root) = match prove_last_reach(lent, names.1, last, now.len(), rekey)? {
+        Ok(proven) => proven,
+        Err(why) => return whole(why),
+    };
+    let Some(carried) = held_root_bytes(lent, names.0)? else { return whole(WhyWhole::NoRoot) };
+    let (indexes, pages) = merge_carried_indexes(carried, old, now, last_root, alloc)?;
     Ok((indexes, Rekeyed { pages, whole: None }))
+}
+
+/// Sharded reach roots (`{name}.reach.00`..`{name}.reach.ff`, [`REACH_SHARD_PAGES`] page slots per
+/// shard) for answers spanning more than [`REACH_SHARD_PAGES`] pages. Unchanged shards renew in
+/// O(1) via [`blaze_cas::plain::Lent::renew_root`] (0 CAS probes, 0 hashes, 0 writes); only shards
+/// containing a changed page call [`blaze_cas::plain::Lent::root_through`] on their <= 256 keys.
+#[expect(clippy::too_many_arguments, reason = "reach shard publisher: each argument one handle")]
+fn publish_reach_shards<D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    name: &str,
+    answer_name: &str,
+    last: Option<(&[Key], Key)>,
+    now: &[Key],
+    rekey: Rekey,
+    alloc: SharedAlloc<'_>,
+    frame: &Frame,
+) -> Result<(u32, Rekeyed), CliError> {
+    let index_of = |page: Key| blaze_cas::plain::beside_key(blaze_cas::Key(page.0));
+    let proof = prove_last_reach(lent, answer_name, last, now.len(), rekey)?;
+    let mut shard_name = blaze_own::String::new_in(frame);
+    let mut scratch: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::with_capacity_in(REACH_SHARD_PAGES, alloc);
+    let mut total_live = 0u32;
+    let mut rekeyed_pages = 0u32;
+    let mut missing_shard = false;
+    for (shard, now_slice) in now.chunks(REACH_SHARD_PAGES).enumerate() {
+        let start = shard * REACH_SHARD_PAGES;
+        let end = start + now_slice.len();
+        let live_here = u32::try_from(now_slice.iter().filter(|page| **page != Key::default()).count()).unwrap_or(u32::MAX);
+        total_live = total_live.saturating_add(live_here);
+        shard_name.clear();
+        let _ = write!(shard_name, "{name}.{REACH_ROOT}.{shard:02x}");
+        if let Ok((old, last_root)) = proof
+            && let Some(old_slice) = old.get(start..end)
+        {
+            if old_slice == now_slice {
+                if lent.renew_root(shard_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
+                    continue;
+                }
+                missing_shard = true;
+            } else if let Some(carried) = held_root_bytes(lent, shard_name.as_str())? {
+                let (indexes, moved) = merge_carried_indexes(carried, old_slice, now_slice, last_root, alloc)?;
+                rekeyed_pages = rekeyed_pages.saturating_add(moved);
+                lent.root_through(shard_name.as_str(), &indexes, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+                continue;
+            } else {
+                missing_shard = true;
+            }
+        }
+        scratch.clear();
+        scratch.extend(now_slice.iter().filter(|page| **page != Key::default()).map(|page| index_of(*page)));
+        scratch.sort_unstable();
+        rekeyed_pages = rekeyed_pages.saturating_add(u32::try_from(scratch.len()).unwrap_or(u32::MAX));
+        lent.root_through(shard_name.as_str(), &scratch, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+    }
+    let whole = match proof {
+        Err(why) => Some(why),
+        Ok(_) if missing_shard => Some(WhyWhole::NoRoot),
+        Ok(_) => None,
+    };
+    Ok((total_live, Rekeyed { pages: rekeyed_pages, whole }))
+}
+
+/// Appends any live sharded reach root names (`{name}.reach.00`..`{name}.reach.ff`) to `out` so a
+/// certified no-op check renews every live reach shard in O(1) alongside the single `{name}.reach`
+/// root. Small answers (`<= 256` pages) check shard `00` once (a manifest miss, 0 reads) and add
+/// nothing.
+pub(crate) fn push_reach_shards<'f, D: Driver, S: Sharing>(
+    store: &mut CommandStore<'_, '_, D, S>,
+    name: &str,
+    frame: &'f Frame,
+    out: &mut blaze_own::Vec<blaze_own::String<&'f Frame>, &'f Frame>,
+) -> Result<(), CliError> {
+    let first = bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}.00");
+    if store.named(first.as_str())?.is_none() {
+        return Ok(());
+    }
+    out.push(first);
+    for shard in 1..REACH_SHARDS_MOST {
+        out.push(bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}.{shard:02x}"));
+    }
+    Ok(())
 }
 
 fn reach_error(error: crate::engine_answer_rows::PublishError) -> CliError {
@@ -1967,3 +2097,91 @@ mod page_edit;
 #[cfg(test)]
 #[path = "tests/engine_bases_tests.rs"]
 mod bases_tests;
+
+#[cfg(test)]
+mod reach_shard_tests {
+    use super::*;
+    use blaze_cas::plain::Settings;
+    use bstd::io::{Io, Limits, SimWorld};
+    use bstd::mem::TASK_FRAME;
+    use bstd::test::BUDGET;
+
+    /// Answers spanning `> REACH_SHARD_PAGES` pages shard reach roots into `{name}.reach.00`..
+    /// so an incremental edit touching 1 page renews unchanged shards in O(1) (0 CAS probes) and
+    /// probes at most `REACH_SHARD_PAGES` keys in the changed shard alone.
+    #[test]
+    fn sharded_reach_roots_renew_unchanged_shards_in_o1_and_keep_every_page_reachable() {
+        let io = Io::simulated(SimWorld::new(41, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let home = crate::store::Home::of(&cx, &io.need_fs().expect("filesystem"), Some("/h")).expect("home");
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("stderr");
+        let lent = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 41 }, heap.alloc()).expect("store");
+        let mut store = CommandStore::new(&cx, &lent, false, 0, None, clock.clone(), &err, erased.handle()).expect("command store");
+
+        // 4 shards of REACH_SHARD_PAGES (2,048 pages total).
+        let total_pages = REACH_SHARD_PAGES * 4;
+        let mut pages = blaze_own::Vec::with_capacity_in(total_pages, alloc);
+        for i in 0..total_pages {
+            let bytes = (i as u32).to_le_bytes();
+            let page_key = Key(ContentId::of("reach shard test page", &bytes));
+            store.put(&cx, page_key, &bytes).expect("put page");
+            let cas = blaze_cas::Key(page_key.0);
+            lent.index_beside(cas, &[cas]).expect("index beside");
+            pages.push(page_key);
+        }
+        let first_root = Key(ContentId::of("reach shard test root", b"v1"));
+        store.put(&cx, first_root, b"v1").expect("put first root");
+        let answer_index = lent.index(&[blaze_cas::Key(first_root.0)]).expect("answer index");
+        let (live, rekeyed) = publish_reach_shards(&lent, "big", "big.answer", None, &pages, Rekey::Changed, alloc, frame).expect("cold publish shards");
+        lent.root_through("big.answer", &[answer_index], blaze_cas::plain::ROOT_LIFE_NS).expect("pin big.answer");
+        assert_eq!(live as usize, total_pages);
+        assert_eq!(rekeyed.whole, Some(WhyWhole::NoLast));
+        lent.commit().expect("commit cold shards");
+
+        // `push_reach_shards` detects sharded answers and skips unsharded names.
+        let mut shards_found = blaze_own::Vec::new_in(frame);
+        push_reach_shards(&mut store, "small-absent", frame, &mut shards_found).expect("unsharded check");
+        assert!(shards_found.is_empty(), "absent/unsharded root adds 0 shard names");
+        push_reach_shards(&mut store, "big", frame, &mut shards_found).expect("sharded check");
+        assert_eq!(shards_found.len(), REACH_SHARDS_MOST);
+        assert_eq!(shards_found[0].as_str(), "big.reach.00");
+
+        // Mutate ONLY 1 page in shard 0 (shards 1, 2, 3 remain untouched).
+        let mut next_pages = blaze_own::Vec::with_capacity_in(total_pages, alloc);
+        next_pages.extend_from_slice(&pages);
+        let replaced_old = next_pages[7];
+        let replacement = Key(ContentId::of("reach shard test page", b"edited-7"));
+        store.put(&cx, replacement, b"edited-7").expect("put replacement page");
+        let rep_cas = blaze_cas::Key(replacement.0);
+        lent.index_beside(rep_cas, &[rep_cas]).expect("index beside replacement");
+        next_pages[7] = replacement;
+
+        let probes_before = lent.put_tally().disk.root_probes;
+        let (live2, rekeyed2) = publish_reach_shards(&lent, "big", "big.answer", Some((&pages, first_root)), &next_pages, Rekey::Changed, alloc, frame).expect("edit publish shards");
+        let probes_delta = lent.put_tally().disk.root_probes - probes_before;
+        assert_eq!(live2 as usize, total_pages);
+        assert_eq!(rekeyed2, Rekeyed { pages: 1, whole: None }, "only the 1 edited page re-keyed");
+        assert!(
+            probes_delta <= REACH_SHARD_PAGES as u64,
+            "unchanged shards 1..3 renewed in O(1) with 0 CAS probes (got {probes_delta}, total pages {total_pages})",
+        );
+        lent.commit().expect("commit edited shards");
+
+        // Verify shard 0 has the replacement beside_key and dropped the old one, and shards 1..3 hold all theirs.
+        let old_beside = blaze_cas::plain::beside_key(blaze_cas::Key(replaced_old.0)).0.0;
+        let new_beside = blaze_cas::plain::beside_key(rep_cas).0.0;
+        let shard0 = store.named("big.reach.00").expect("read shard 0").expect("shard 0 live");
+        assert!(shard0.chunks_exact(32).any(|k| k == &new_beside), "shard 0 holds replacement page index");
+        assert!(!shard0.chunks_exact(32).any(|k| k == &old_beside), "shard 0 dropped replaced page index");
+        for shard in 1..4usize {
+            let name = bstd::mem::format_in!(frame, "big.reach.{shard:02x}");
+            let bytes = store.named(name.as_str()).expect("read shard").expect("shard live");
+            assert_eq!(bytes.len(), REACH_SHARD_PAGES * 32, "unchanged shard {shard} preserved all keys");
+        }
+    }
+}
