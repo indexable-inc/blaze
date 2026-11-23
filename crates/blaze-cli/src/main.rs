@@ -108,8 +108,10 @@ mod test_loop;
 mod test_run;
 mod toolchain;
 mod units;
+mod unused_deps;
 mod work;
 mod check_command;
+mod ci_command;
 mod engine_answer;
 mod engine_answer_rows;
 mod engine_check;
@@ -302,7 +304,7 @@ impl fmt::Display for CliError {
         match self {
             CliError::Usage(what) => write!(
                 f,
-                "usage: blaze check [dir] [--color=auto|always|never] [--view person|agent|json] [--each] [--workers N] [--status-every S], blaze <run|test> [dir] [--stats] [--workers N], blaze clean [dir] [--store], blaze gc [--max-gb N] [--dry-run] [--all-formats], blaze explain [status]: {what}"
+                "usage: blaze check [dir] [--color=auto|always|never] [--view person|agent|json] [--each] [--workers N] [--status-every S], blaze ci [dir] [--workers N] [--format auto|plain|github] [--todo <path>] [--todo-format nuon|json] [--no-todo] [--no-test] [--fix] [--allow-incomplete], blaze <run|test> [dir] [--stats] [--workers N], blaze clean [dir] [--store], blaze gc [--max-gb N] [--dry-run] [--all-formats], blaze explain [status]: {what}"
             ),
             CliError::NotOnEngine { flag, why } => write!(f, "`blaze check {flag}`: the engine's check does not take {flag} yet ({why}; check_command.rs)"),
             CliError::NotBuilt { command } => write!(f, "`blaze {command}` is not built on the new item layer yet (drive.md)"),
@@ -368,6 +370,7 @@ fn every_rule(rule: u16) -> bool {
     // A names warning (D111's include outside its package; a test marked twice) is never an
     // error.
     !names::warning(rule)
+        && rule != unused_deps::UNUSED_DEPENDENCY
         && rule != body_types::TYPES_NOT_CHECKED
         && rule != body_types::BORROWS_NOT_CHECKED
         // A task that failed only because one it needs failed: its root is the failure.
@@ -644,6 +647,7 @@ fn command(
         // (rule 30). `engine-check` is its old name, an alias until the scripts that type it
         // are moved.
         Some("check" | "engine-check") => check_command::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap, spawn_daemon),
+        Some("ci") => ci_command::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
         Some("why") => engine_check::why(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
         // Hidden: the edit path's forward wake over the stored answer, dry (D187; engine_dry.rs).
         Some("engine-dry") => engine_dry::run(cx, args, fs, env, host, rng, out, err, phases, heap, engine_dry::Mode::Dry),
@@ -680,7 +684,7 @@ fn command(
         Some("warm-toolchain") => engine_check::warm_toolchain(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
         Some("store") => store::publish_command::run(cx, args, fs, env, clock, host, rng, out, err, heap),
         Some("peer") => peer::run(cx, args, fs, env, net, clock, rng, out),
-        Some(_) | None => Err(CliError::Usage("the command is check, run, test, peer, clean, gc, warm-toolchain or explain")),
+        Some(_) | None => Err(CliError::Usage("the command is check, ci, run, test, peer, clean, gc, warm-toolchain or explain")),
     }
 }
 

@@ -2683,7 +2683,7 @@ pub(crate) fn list(cx: &Cx, suites: &[(Found<'_>, TestUnit<'_>)], config: LoopCo
         Format::Text => out.line(cx, format_args!("{tests} tests, {benches} benchmarks")),
         Format::Json => out.line(cx, format_args!("{{\"event\":\"listed_summary\",\"tests\":{tests},\"benches\":{benches}}}")),
     }.map_err(|_| DriveError::Print)?;
-    Ok(Status { failed: 0, not_run: 0, check_errors: 0 })
+    Ok(Status { passed: 0, failed: 0, ignored: 0, not_run: 0, check_errors: 0 })
 }
 
 pub(crate) struct Suite<'s, 'h> {

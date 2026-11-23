@@ -191,8 +191,12 @@ pub(crate) enum Effect<'a> {
 /// The command's verdict.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Status {
+    /// Tests that passed (ran or cached).
+    pub passed: u32,
     /// Tests that ran and failed.
     pub failed: u32,
+    /// Tests ignored or benches skipped.
+    pub ignored: u32,
     /// Tests the plan wanted run that could not be.
     pub not_run: u32,
     /// The check's error findings.
@@ -968,8 +972,23 @@ impl<'a, 'r> TestLoop<'a, 'r> {
             self.ordered_summary(&mut text)?;
         }
         out.push(Effect::Print { text });
+        let mut passed = 0u32;
+        let mut ignored = 0u32;
+        for entry in self.entries.iter() {
+            match entry.outcome {
+                Outcome::Cached(_) | Outcome::Passed { .. } => passed = passed.saturating_add(1),
+                Outcome::Ignored | Outcome::Bench => ignored = ignored.saturating_add(1),
+                Outcome::Failed { .. } => {}
+            }
+        }
         let not_run = self.not_run.len() + self.not_built.len();
-        let status = Status { failed: self.failed, not_run: u32::try_from(not_run).map_err(|_| ReportError::TooMany { count: not_run })?, check_errors };
+        let status = Status {
+            passed,
+            failed: self.failed,
+            ignored,
+            not_run: u32::try_from(not_run).map_err(|_| ReportError::TooMany { count: not_run })?,
+            check_errors,
+        };
         self.phase = Phase::Finished;
         out.push(Effect::Done { status });
         Ok(())

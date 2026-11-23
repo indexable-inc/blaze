@@ -947,6 +947,34 @@ impl<'r, 'm> Standing<'r, 'm> {
 /// The contract's shape returns `Standing`; it is handed to `start` instead, because the store
 /// borrows the lent store opened here and the answer borrows both (a returned value would
 /// refer to itself). COST: the check's, then one pointer get, one root get and the snapshot.
+/// What `blaze ci` reads after the engine's check completes: the placed findings (`shown`),
+/// the check summary (`checked`), and optionally `standing` (present whenever `UnitGraph`
+/// succeeded, so `blaze test` runs over the exact same check answer without checking twice).
+pub(crate) struct CiContext<'r, 'm, 'f> {
+    pub(crate) checkout: &'r Dir<ReadWrite>,
+    pub(crate) shown: &'r print::Shown<'f>,
+    pub(crate) checked: &'r Checked,
+    pub(crate) standing: Option<Standing<'r, 'm>>,
+    pub(crate) fixes_applied: u32,
+    pub(crate) files_fixed: u32,
+    pub(crate) frame: &'f Frame,
+    pub(crate) member: &'f str,
+}
+
+/// How [`check_and_open`] configures the check and standing answer for its caller.
+enum OpenMode {
+    Start { quiet_when_clean: bool },
+    Ci { apply_fixes: bool },
+}
+
+/// The engine's check of the checkout, its answer printed to `out` (stderr for `run`, whose
+/// stdout is its program's), then `start` over what it stored ([`Standing`]); the store's one
+/// commit after the start returns. `flags` are the command's, parsed by its caller (main.rs:
+/// `test`'s `-p` packages are collected there).
+///
+/// The contract's shape returns `Standing`; it is handed to `start` instead, because the store
+/// borrows the lent store opened here and the answer borrows both (a returned value would
+/// refer to itself). COST: the check's, then one pointer get, one root get and the snapshot.
 #[expect(clippy::too_many_arguments, reason = "the start's edge: each argument one specific capability")]
 pub(crate) fn check_for_start<R>(
     cx: &Cx,
@@ -965,13 +993,96 @@ pub(crate) fn check_for_start<R>(
     live: Option<&(dyn blaze_screen::Watch + Sync)>,
     start: impl for<'r, 'm> FnOnce(Standing<'r, 'm>, &mut Phases, &mut bstd::rng::Rng) -> Result<R, CliError>,
 ) -> Result<R, CliError> {
+    check_and_open(
+        cx, args, fs, env, net, host, rng, out, err, phases, heap, flags,
+        OpenMode::Start { quiet_when_clean },
+        live,
+        |ci, phases, rng| {
+            let standing = ci.standing.ok_or(EngineCheckError::StartNoGraph)?;
+            start(standing, phases, rng)
+        },
+    )
+}
+
+/// Run the engine check for `blaze ci` (quiet, structured `Shown::listed` populated even on
+/// certificate hits, optional safe `--fix` pre-pass), then hand [`CiContext`] to `then` with
+/// `Standing` ready for `blaze test` and commit the store once afterward.
+#[expect(clippy::too_many_arguments, reason = "the CI command's edge: each argument one specific capability")]
+pub(crate) fn check_for_ci<R>(
+    cx: &Cx,
+    args: Option<&bstd::args::Args>,
+    fs: &bstd::fs::Fs,
+    env: Option<&bstd::env::Env>,
+    net: Option<&bstd::net::Net>,
+    host: &bstd::host::Host,
+    rng: &mut bstd::rng::Rng,
+    out: &Out,
+    err: &Out,
+    phases: &mut Phases,
+    heap: &'static blaze_own::Heap,
+    flags: &crate::Flags<'_>,
+    apply_fixes: bool,
+    then: impl for<'r, 'm, 'f> FnOnce(CiContext<'r, 'm, 'f>, &mut Phases, &mut bstd::rng::Rng) -> Result<R, CliError>,
+) -> Result<R, CliError> {
+    check_and_open(
+        cx, args, fs, env, net, host, rng, out, err, phases, heap, flags,
+        OpenMode::Ci { apply_fixes },
+        None,
+        then,
+    )
+}
+
+/// Shared implementation of [`check_for_start`] and [`check_for_ci`] (rule 30).
+#[expect(clippy::too_many_arguments, reason = "the start/CI edge: each argument one specific capability")]
+fn check_and_open<R>(
+    cx: &Cx,
+    args: Option<&bstd::args::Args>,
+    fs: &bstd::fs::Fs,
+    env: Option<&bstd::env::Env>,
+    net: Option<&bstd::net::Net>,
+    host: &bstd::host::Host,
+    rng: &mut bstd::rng::Rng,
+    out: &Out,
+    err: &Out,
+    phases: &mut Phases,
+    heap: &'static blaze_own::Heap,
+    flags: &crate::Flags<'_>,
+    mode: OpenMode,
+    live: Option<&(dyn blaze_screen::Watch + Sync)>,
+    then: impl for<'r, 'm, 'f> FnOnce(CiContext<'r, 'm, 'f>, &mut Phases, &mut bstd::rng::Rng) -> Result<R, CliError>,
+) -> Result<R, CliError> {
     let request = request_frame()?;
     edge(cx, fs, env, net, host, out, err, phases, heap, flags, None, &request, |edge, phases| {
         #[cfg(unix)]
-        let Edge { root, opts, mut shown, err, frame, place, tools, workers, producers, member, signals, .. } = edge;
+        let Edge { root, opts, mut shown, err, caps, shown_root, frame, place, workers, producers, member, signals, .. } = edge;
         #[cfg(not(unix))]
-        let Edge { root, opts, mut shown, err, frame, place, tools, workers, producers, member, .. } = edge;
-        shown.quiet_when_clean = quiet_when_clean;
+        let Edge { root, opts, mut shown, err, caps, shown_root, frame, place, workers, producers, member, .. } = edge;
+        let mut fixes_applied: u32 = 0;
+        let mut files_fixed: u32 = 0;
+        let require_graph = match mode {
+            OpenMode::Start { quiet_when_clean } => {
+                shown.quiet_when_clean = quiet_when_clean;
+                true
+            }
+            OpenMode::Ci { apply_fixes } => {
+                if apply_fixes {
+                    let mut first = print::Shown::new(caps, blaze_report::frame::plain::View::Agent, shown_root, frame);
+                    first.quiet = true;
+                    first.output_only = false;
+                    let _ = check_live(cx, fs, host, rng, args, net, root, opts(), &mut first, phases, out, err, None)?;
+                    if first.listed.iter().any(|l| l.fix.is_some())
+                        && let Ok(applied) = crate::fix::apply(cx, root, &crate::fix::Atomic, &first.listed, &["all"], frame)?
+                    {
+                        fixes_applied = u32::try_from(applied.fixed.len()).unwrap_or(u32::MAX);
+                        files_fixed = u32::try_from(applied.files).unwrap_or(u32::MAX);
+                    }
+                }
+                shown.view = blaze_report::frame::plain::View::Agent;
+                shown.quiet = true;
+                shown.output_only = false;
+                false
+            }
+        };
         let opts = opts();
         let toolchain = opts.toolchain;
         let checked = check_live(cx, fs, host, rng, args, net, root, opts, &mut shown, phases, out, err, live)?;
@@ -991,23 +1102,34 @@ pub(crate) fn check_for_start<R>(
         let alloc = request_mem.shared();
         let answer_root = crate::engine_answer::root_name(place.checkout, frame);
         let pointer = match crate::engine_answer::load_pointer(cx, &mut store, &answer_root)? {
-            Some(Ok(pointer)) => pointer,
-            Some(Err(why)) => return Err(EngineCheckError::StartNoAnswer { why: Some(why) }.into()),
-            None => return Err(EngineCheckError::StartNoAnswer { why: None }.into()),
+            Some(Ok(pointer)) => Some(pointer),
+            Some(Err(why)) if require_graph => return Err(EngineCheckError::StartNoAnswer { why: Some(why) }.into()),
+            None if require_graph => return Err(EngineCheckError::StartNoAnswer { why: None }.into()),
+            _ => None,
         };
-        let stood_root = match crate::engine_answer::open_root(cx, &mut store, pointer.root, alloc)? {
-            Ok(stood_root) => stood_root,
-            Err(why) => return Err(EngineCheckError::StartNoAnswer { why: Some(why) }.into()),
+        let stood_root = match &pointer {
+            Some(pointer) => match crate::engine_answer::open_root(cx, &mut store, pointer.root, alloc)? {
+                Ok(stood_root) => Some(stood_root),
+                Err(why) if require_graph => return Err(EngineCheckError::StartNoAnswer { why: Some(why) }.into()),
+                Err(_) => None,
+            },
+            None => None,
         };
-        let snapshot = store.snapshot_in(alloc)?;
-        let stored = crate::engine_answer::Stored::new(&stood_root, &snapshot, &pointer.headers, blaze_engine::pages::Check::Store, alloc);
-        let rows = stored.answer();
-        let records: &dyn crate::engine_run_answer::Records = &stored;
+        let snapshot = if stood_root.is_some() { Some(store.snapshot_in(alloc)?) } else { None };
+        let stored = match (&pointer, &stood_root, &snapshot) {
+            (Some(pointer), Some(stood_root), Some(snapshot)) => {
+                Some(crate::engine_answer::Stored::new(stood_root, snapshot, &pointer.headers, blaze_engine::pages::Check::Store, alloc))
+            }
+            _ => None,
+        };
+        let rows = stored.as_ref().map(|s| s.answer());
         // A row's input: its record (the page header's) and its out (the row's), `None` for a
         // row that failed or has no record. A refused page is kept and stops the command after
         // the start (rule 3), never read as "no row".
         let refused: core::cell::Cell<Option<(Name, &'static str)>> = core::cell::Cell::new(None);
         let input = |name: Name| -> Option<blaze_drive::Input> {
+            let records: &dyn crate::engine_run_answer::Records = stored.as_ref()?;
+            let rows_ref = rows.as_ref()?;
             let at = match records.record(name) {
                 Ok(at) => at?,
                 Err(why) => {
@@ -1015,7 +1137,7 @@ pub(crate) fn check_for_start<R>(
                     return None;
                 }
             };
-            match rows.row_facts(name) {
+            match rows_ref.row_facts(name) {
                 Ok(Some(row)) if !row.failed => Some(blaze_drive::Input { name, at, out: row.out }),
                 Ok(_) => None,
                 Err(_) => {
@@ -1024,34 +1146,50 @@ pub(crate) fn check_for_start<R>(
                 }
             }
         };
-        let graph = input(Name::unit_graph()).ok_or(EngineCheckError::StartNoGraph)?;
-        if let Some((name, why)) = refused.get() {
+        let graph = input(Name::unit_graph());
+        if require_graph && let Some((name, why)) = refused.get() {
             return Err(EngineCheckError::StartPage { name, why }.into());
         }
-        let standing = Standing {
-            root: pointer.root.0,
-            store: &mut store,
-            lent: &opened.lent,
-            rows: &rows,
-            records,
-            graph,
-            names: &input,
-            errors,
-            status: checked.status,
+        let standing = match (pointer.as_ref(), rows.as_ref(), stored.as_ref(), graph) {
+            (Some(pointer), Some(rows_ref), Some(stored_ref), Some(graph)) if refused.get().is_none() => {
+                let records: &dyn crate::engine_run_answer::Records = stored_ref;
+                Some(Standing {
+                    root: pointer.root.0,
+                    store: &mut store,
+                    lent: &opened.lent,
+                    rows: rows_ref,
+                    records,
+                    graph,
+                    names: &input,
+                    errors,
+                    status: checked.status,
+                    checkout: root,
+                    place,
+                    toolchain,
+                    tools: crate::home::tools(producers, crate::lints::Lints::NONE.rules),
+                    producers,
+                    workers,
+                    err,
+                    heap,
+                    frame,
+                    native: crate::engine_native::NativeAsk { producer: producers.get::<blaze_ids::producer::Whole>(), home: place.home, words: frame, fs: fs.clone() },
+                    member,
+                })
+            }
+            _ => None,
+        };
+        let ci_ctx = CiContext {
             checkout: root,
-            place,
-            toolchain,
-            tools: crate::home::tools(producers, crate::lints::Lints::NONE.rules),
-            producers,
-            workers,
-            err,
-            heap,
+            shown: &shown,
+            checked: &checked,
+            standing,
+            fixes_applied,
+            files_fixed,
             frame,
-            native: crate::engine_native::NativeAsk { producer: producers.get::<blaze_ids::producer::Whole>(), home: place.home, words: frame, fs: fs.clone() },
             member,
         };
-        let started = start(standing, phases, rng);
-        if let Some((name, why)) = refused.get() {
+        let started = then(ci_ctx, phases, rng);
+        if require_graph && let Some((name, why)) = refused.get() {
             return Err(EngineCheckError::StartPage { name, why }.into());
         }
         let started = started?;
@@ -2338,7 +2476,7 @@ fn checking<'f, 'd>(
             }
         }
         // 3. Print: the whole answer's lines, in a call of their own ([`lines_of`]).
-        let made = lines_of(&finished, last_lines.as_ref(), (names.as_ref(), &*scripts, &mut *bodies, &*heads, &*lints), (outlined, unread_notes.as_slice()), discovered, rows, skipped, heap, alloc, frame)?;
+        let made = lines_of(cx, root, laid_now, &finished, last_lines.as_ref(), (names.as_ref(), &*scripts, &mut *bodies, &*heads, &*lints), (outlined, unread_notes.as_slice()), discovered, rows, skipped, heap, alloc, frame)?;
         phases.mark_cx(cx, "lines made", frame);
         let heap_lines_made = crate::engine_phase_mem::heap_now();
         // The closing line's count: every file the request has an outline of (on the ready setup,
@@ -2669,6 +2807,9 @@ type LineStages<'x, 'f, 'b> = (
 #[inline(never)]
 #[expect(clippy::too_many_arguments, reason = "the request's handles this step reads, each by its own name")]
 fn lines_of<'a, 'f>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    laid: Option<&crate::units::Laid<'_>>,
     finished: &blaze_engine::Finished<'_>,
     last_lines: Option<&crate::engine_lines::Last<'a, '_>>,
     (names, scripts, bodies, heads, lints): LineStages<'_, 'f, '_>,
@@ -2712,6 +2853,9 @@ fn lines_of<'a, 'f>(
                     match name.kind {
                         blaze_drive::Kind::FileItems => {
                             lines.keep_split(*name, block, false).map_err(EngineCheckError::Lines)?;
+                        }
+                        blaze_drive::Kind::Units => {
+                            lines.keep_split_rule(*name, block, crate::unused_deps::UNUSED_DEPENDENCY, false).map_err(EngineCheckError::Lines)?;
                         }
                         _ => lines.keep(*name, block),
                     }
@@ -2823,6 +2967,30 @@ fn lines_of<'a, 'f>(
         let last = last_lines.ok_or(EngineCheckError::ReadyRefused(crate::engine_ready_edit::ReadyRefused::Root(crate::engine_ready_edit::PhasesWhy::NoAnswer)))?;
         for &(name, block) in last.blocks_of(blaze_drive::Kind::FileItems) {
             lines.keep_split(name, block, true).map_err(EngineCheckError::Lines)?;
+        }
+    }
+    // Unused-dependency warnings (unused_deps.rs): computed fresh on the Phases path where `laid`
+    // holds every member's manifest metadata, and carried forward from the last lines record on
+    // the Ready path (zero extra manifest I/O on body-only edits).
+    match laid {
+        Some(laid) => {
+            let mut skipped_roots: Vec<&str, &Frame> = Vec::with_capacity_in(skipped.targets.len(), frame);
+            for target in skipped.targets.iter() {
+                if let Ok(at) = outlined.binary_search_by(|one| one.name.cmp(&target.root))
+                    && let Some(one) = outlined.get(at)
+                    && let Ok(path) = core::str::from_utf8(&one.path)
+                {
+                    skipped_roots.push(path);
+                }
+            }
+            crate::unused_deps::collect(cx, root, laid, names, finished, outlined, &skipped_roots, &mut lines, frame)?;
+        }
+        None => {
+            if let Some(last) = last_lines {
+                for &(name, block) in last.blocks_of(blaze_drive::Kind::Units) {
+                    lines.keep_split_rule(name, block, crate::unused_deps::UNUSED_DEPENDENCY, true).map_err(EngineCheckError::Lines)?;
+                }
+            }
         }
     }
     // A build script whose outputs this command uses and does not keep says so, once (lane NR2).
