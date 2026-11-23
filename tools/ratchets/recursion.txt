@@ -8,7 +8,6 @@ blaze-algebra	9
 blaze-bench	1
 blaze-blake3	2
 blaze-body	1
-blaze-body-build	1
 blaze-body-eval	1
 blaze-body-flow	1
 blaze-body-lower	2
