@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-297 invariants, 44 refinements, 12 reference models.
-By level: 238 tested, 87 simulated, 1 model-checked, 15 proved.
+303 invariants, 44 refinements, 12 reference models.
+By level: 244 tested, 87 simulated, 1 model-checked, 15 proved.
 
 ## Invariants
 
@@ -465,6 +465,10 @@ By level: 238 tested, 87 simulated, 1 model-checked, 15 proved.
 
 - **`property_strip_inverts_styled_and_preserves_width`** *tested* (`crates/blaze-std/src/ansi.rs`): stripping ANSI styling recovers the original text and preserves visible width.
   Controls: `unstripped_osc`.
+- **`property_random_argv_never_panics_and_double_dash_preserves_tail`** *tested* (`crates/blaze-std/src/cli.rs`): random argv never panics and every token after `--` is preserved verbatim as a positional argument.
+  Controls: `broken_double_dash_separator`.
+- **`property_next_after_is_strictly_minimal_match`** *tested* (`crates/blaze-std/src/cron.rs`): `next_after` returns the strictly earliest future timestamp matching the schedule under Vixie DOM/DOW semantics.
+  Controls: `skipped_dom_dow_or_rule`.
 - **`property_aead_round_trip_and_single_bit_tamper_rejection`** *tested* (`crates/blaze-std/src/crypto.rs`): AEAD seal/open round-trips arbitrary plaintext and rejects any single-bit tamper in ciphertext or AAD.
   Controls: `unauthenticated_aad`.
 - **`property_csv_round_trip`** *tested* (`crates/blaze-std/src/csv.rs`): CSV formatting and parsing round-trip arbitrary cell values without loss.
@@ -475,8 +479,12 @@ By level: 238 tested, 87 simulated, 1 model-checked, 15 proved.
   Controls: `skipped_escapes`.
 - **`property_hex_round_trip`** *tested* (`crates/blaze-std/src/hex.rs`): hex encoding and decoding round-trip arbitrary byte slices exactly.
   Controls: `swapped_nibbles`.
+- **`property_escape_round_trip_and_sanitizer_never_leaks_xss`** *tested* (`crates/blaze-std/src/html.rs`): HTML entity escaping round-trips arbitrary UTF-8 and `sanitize_html_in` never emits `<script`, `onerror=`, or `javascript:`.
+  Controls: `bypassed_javascript_url_check`.
 - **`property_hostile_markdown_obeys_limits_escapes_script_and_strips_ansi`** *tested* (`crates/blaze-std/src/markdown/tests.rs`): hostile markdown respects depth/size limits, escapes HTML script tags, and strips ANSI escapes.
   Controls: `unescaped_html_script_tag`.
+- **`property_query_round_trip`** *tested* (`crates/blaze-std/src/query.rs`): `format_query_in` and `parse_query_in` round-trip arbitrary key/value pairs including spaces encoded as `+`.
+  Controls: `missing_plus_to_space`, `skipped_boundary_collision_check`.
 - **`property_literals_match_substring_search_and_split_reconstructs`** *tested* (`crates/blaze-std/src/regex/tests.rs`): compiled literal patterns match substring search and split reconstructs the exact input.
   Controls: `inverted_greediness`, `ignored_case_flag`.
 - **`property_sse_chunked_round_trip`** *tested* (`crates/blaze-std/src/sse.rs`): chunked SSE parsing matches whole-buffer parsing and strips leading event field spaces.
@@ -485,6 +493,8 @@ By level: 238 tested, 87 simulated, 1 model-checked, 15 proved.
   Controls: `byte_len_table_misalignment_and_lost_wrap_style`.
 - **`model_lazy_pool_runs_every_task_and_stops_after_every_start`** *model-checked* (`crates/blaze-std/src/task/idle.rs`): the lazy pool idle protocol starts each worker thread at most once, counts starts before threads exit, loses no wake-up including for unstarted workers, and runs every spawned task.
   Controls: `a_wake_that_skips_an_unstarted_worker`, `a_start_counted_after_its_thread`.
+- **`property_xss_safety_escaped_var`** *tested* (`crates/blaze-std/src/template.rs`): escaped template interpolation `{{var}}` never emits unescaped `<script` into rendered output.
+  Controls: `skipped_html_escape`.
 - **`ancestors_are_the_granted_folders_and_only_read`** *simulated* (`crates/blaze-std/src/tests/ancestors.rs`): exactly the granted folders above, each reading what is there; a step past the top and a name back into the start are typed refusals.
   Controls: `an_unbounded_top`.
 - **`an_arena_never_hands_out_more_than_its_limit`** *tested* (`crates/blaze-std/src/tests/arena.rs`): an arena never hands out more than its limit. Whatever appends are made to bytes in a named arena, its use stays within its limit, an append past it is `Stopped::OutOfMemory` naming the arena and changes nothing, and the bytes are exactly the appends that were taken.
@@ -567,6 +577,8 @@ By level: 238 tested, 87 simulated, 1 model-checked, 15 proved.
   Controls: `unmasked_decode_bug`.
 - **`property_yaml_round_trip`** *tested* (`crates/blaze-std/src/yaml.rs`): YAML serialization and parsing round-trip structured values including quoted keyword strings.
   Controls: `unquoted_keyword_strings`.
+- **`property_zip_round_trip_and_hostile_bytes_never_panic`** *tested* (`crates/blaze-std/src/zip.rs`): Store and Deflate ZIP archives round-trip with verified CRC-32 and hostile archive bytes never panic.
+  Controls: `skipped_crc_verification`.
 
 ### blaze-surface
 
