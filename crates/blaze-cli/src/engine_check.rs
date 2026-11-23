@@ -1799,7 +1799,7 @@ fn checking<'f, 'd>(
             given_answers.extend(given_planned.iter().map(|(one, answer, _)| (one.name, *answer)));
             let mut planned: SVec<'_, Planned> = SVec::new_in(alloc);
             planned.extend(given_planned.iter().map(|(one, _, _)| *one));
-            crate::engine_ready_edit::file_tasks(&outlined, &skipped.files, names.is_some(), &linting.rules, reach, alloc, &mut planned);
+            crate::engine_ready_edit::file_tasks(&outlined, &skipped.files, &skipped.external, names.is_some(), &linting.rules, reach, alloc, &mut planned);
             planned.sort_unstable_by_key(|one| (one.file, one.name));
             let mut pre_files: SVec<'_, (Name, &[Planned])> = SVec::new_in(alloc);
             for group in planned.chunk_by(|a, b| a.file == b.file) {
@@ -1947,7 +1947,7 @@ fn checking<'f, 'd>(
             };
             let found_edges = crate::engine_body_plan::found_edges(&found_units, &found_places, heap.alloc());
             let reach = bodies.plan_reach(cx, &mut store, graph, plan_list, &outlined, &found_edges, crate::engine_bodies::ReachFrom::Walk, heap.alloc())?;
-            crate::engine_ready_edit::file_tasks(&outlined, &skipped.files, names.is_some(), &linting.rules, reach, alloc, &mut planned);
+            crate::engine_ready_edit::file_tasks(&outlined, &skipped.files, &skipped.external, names.is_some(), &linting.rules, reach, alloc, &mut planned);
             planned.sort_unstable_by_key(|one| (one.file, one.name));
             Ok(blaze_own::Box::new_in(
                 CheckedSetup {
@@ -2203,7 +2203,7 @@ fn checking<'f, 'd>(
     let scope = cx.scope();
     let mut pipeline = crate::engine_scripts::Pipeline::new(&scope, job_frame, job_alloc.handle(), &handles);
     // What the names say of the found files, set once by the drive ([`serve_found`]).
-    let serving = ServeFound { rules: linting.rules, skipped: &skipped.files, places: &file_places, served: core::cell::OnceCell::new() };
+    let serving = ServeFound { rules: linting.rules, skipped: &skipped.files, external: &skipped.external, places: &file_places, served: core::cell::OnceCell::new() };
     // The drive's state, made once and placed in the request's frame: every stage from here is
     // a call taking it by `&mut`, so this frame holds its pointer and each stage's temporaries
     // die with its call (rule 54; [`Drive`]).
@@ -3179,6 +3179,9 @@ struct ServeFound<'d, 'r> {
     rules: blaze_lint::RuleSet,
     /// The files of skipped targets only, sorted (their bodies are not planned).
     skipped: &'d [Name],
+    /// The files of non-member checkout path packages only, sorted (outlined for `CrateScope`,
+    /// never planned for bodies, heads or lints).
+    external: &'d [Name],
     /// Each file's place from the walk ([`plan`]): a found file's names its last flags.
     places: &'d [(Name, blaze_engine::pages::FilePlace)],
     /// Set once, by [`serve_found`], only when what the names said moves the plan.
@@ -3391,18 +3394,32 @@ fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
     }
     let Some(list) = stage.names.as_ref().map(|world| world.list()) else { return Ok(()) };
     let units = crate::engine_body_plan::found_units(list, heap.alloc()).map_err(EngineCheckError::FoundUnitsShare)?;
-    let unit_of = |unit: Name| units.iter().find(|one| one.2 == unit).map(|one| (one.0, one.1));
+    // Every checkout crate in the list (workspace members and non-member checkout path packages):
+    // both read files from tree 0 and may find macro-written modules or computed data includes.
+    let mut checkout_units: SVec<'_, (Name, bool, Name, bool)> = SVec::new_in(alloc);
+    for &(root, test, unit) in units.iter() {
+        checkout_units.push((root, test, unit, false));
+    }
+    for at in 0..blaze_world::crate_list::CrateGraph::len(list) {
+        if !list.member(at)
+            && let Some(path) = list.root(at).strip_prefix("/0/")
+        {
+            let root = Name::file(path.as_bytes());
+            let unit = blaze_drive::key::crate_scope_name(&list.key(at));
+            checkout_units.push((root, list.test(at), unit, true));
+        }
+    }
+    checkout_units.sort_unstable();
+    let unit_of = |unit: Name| checkout_units.iter().find(|one| one.2 == unit).map(|one| (one.0, one.1, one.3));
     // 1. Each found file's root and flags now: a unit whose names answered gives its flag where
     // they read the file; one that stood or failed keeps its flag; one the list no longer has
     // gives none.
     let mut masks: SMap<'_, Name, (Name, u8)> = SMap::new_in(alloc);
     for one in by.iter() {
-        let Some((root, test)) = unit_of(one.unit) else {
-            // A crate no member unit is: a fetched or toolchain crate (every checkout crate, a
-            // path dependency too, is a member: blaze-world crate_list.rs `member`), whose names
-            // read its pack and list no checkout read (job_texts.rs `read`), so it finds
-            // nothing. A checkout read listed by one is the stop of a read no outline holds,
-            // named (rule 3): no member's tree could hold the file.
+        let Some((root, test, _)) = unit_of(one.unit) else {
+            // A crate no checkout unit is: a fetched or toolchain crate, whose names read its
+            // pack and list no checkout read (job_texts.rs `read`), so it finds nothing. A
+            // checkout read listed by one is the stop of a read no outline holds, named (rule 3).
             if let Some(file) = one.read.first() {
                 return Err(EngineCheckError::Unseen { task: one.unit, read: *file }.into());
             }
@@ -3417,22 +3434,22 @@ fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
             if place.flags & found_bit(test) == 0 {
                 continue;
             }
-            let Ok(at) = units.binary_search_by(|one| (one.0, one.1).cmp(&(place.unit, test))) else { continue };
-            if by.binary_search_by_key(&units[at].2, |one| one.unit).is_ok() {
+            let Some(found_unit) = checkout_units.iter().find(|one| one.0 == place.unit && one.1 == test) else { continue };
+            if by.binary_search_by_key(&found_unit.2, |one| one.unit).is_ok() {
                 continue;
             }
             found_mark(&mut masks, *file, place.unit, found_bit(test))?;
         }
     }
-    // Each new file's one outline, with its probe and its finder's root: two finders' (the
-    // non-test and test units of one root) must be equal.
-    let mut fresh: SVec<'_, (&Outlined<'static>, &(SVec<'static, u8>, sweep::Probed, bool), Name)> = SVec::new_in(alloc);
+    // Each new file's one outline, with its probe, its finder's root and whether its finder is
+    // external: two finders' (the non-test and test units of one root) must be equal.
+    let mut fresh: SVec<'_, (&Outlined<'static>, &(SVec<'static, u8>, sweep::Probed, bool), Name, bool)> = SVec::new_in(alloc);
     for one in by.iter() {
-        let Some((root, _)) = unit_of(one.unit) else { continue };
-        fresh.extend(one.outlined.iter().zip(one.probes.iter()).map(|(outline, probe)| (outline, probe, root)));
+        let Some((root, _, external)) = unit_of(one.unit) else { continue };
+        fresh.extend(one.outlined.iter().zip(one.probes.iter()).map(|(outline, probe)| (outline, probe, root, external)));
     }
-    fresh.sort_unstable_by_key(|(outline, _, root)| (outline.name, *root));
-    let mut news: SVec<'_, (&Outlined<'static>, &(SVec<'static, u8>, sweep::Probed, bool), Name)> = SVec::new_in(alloc);
+    fresh.sort_unstable_by_key(|(outline, _, root, external)| (outline.name, *root, *external));
+    let mut news: SVec<'_, (&Outlined<'static>, &(SVec<'static, u8>, sweep::Probed, bool), Name, bool)> = SVec::new_in(alloc);
     for one in fresh.iter().copied() {
         if let Some(last) = news.last().copied()
             && last.0.name == one.0.name
@@ -3465,12 +3482,13 @@ fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
     seen.extend(merged.iter().map(|one| one.name));
     seen.extend(news.iter().map(|(outline, ..)| outline.name));
     let mut wave: SVec<'r, Want<'r>> = SVec::new_in(alloc);
-    for (outline, probe, root) in news.iter().copied() {
+    for (outline, probe, root, external) in news.iter().copied() {
         let copy = outline_copy(outline, alloc)?;
         if let Ok(record) = &copy.made {
-            wants(&record.parts, &record.paths, &record.path_bytes, Some(root), &mut seen, &mut wave, alloc)?;
+            wants(&record.parts, &record.paths, &record.path_bytes, Some(root), external, &mut seen, &mut wave, alloc)?;
         }
-        new_places.push((copy.name, FilePlace { unit: root, edition: copy.edition, flags: if probe.2 { PLACE_MODULE } else { 0 } }));
+        let flags = (if probe.2 { PLACE_MODULE } else { 0 }) | (if external { PLACE_EXTERNAL } else { 0 });
+        new_places.push((copy.name, FilePlace { unit: root, edition: copy.edition, flags }));
         probes.push((SVec::from_slice_in(&probe.0, alloc), probe.1));
         merged.push(copy);
     }
@@ -3479,9 +3497,10 @@ fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
         for want in wave.iter() {
             let (one, probed) = outline_one(cx, rq.root, &rq.handles.stamps, want, None, rq.handles.plants.lints, alloc).map_err(|stopped| stopped.of(want))?;
             if let Ok(record) = &one.made {
-                wants(&record.parts, &record.paths, &record.path_bytes, Some(want.root), &mut seen, &mut next, alloc)?;
+                wants(&record.parts, &record.paths, &record.path_bytes, Some(want.root), want.external, &mut seen, &mut next, alloc)?;
             }
-            new_places.push((want.name, FilePlace { unit: want.root, edition: want.edition, flags: if want.module { PLACE_MODULE } else { 0 } }));
+            let flags = (if want.module { PLACE_MODULE } else { 0 }) | (if want.external { PLACE_EXTERNAL } else { 0 });
+            new_places.push((want.name, FilePlace { unit: want.root, edition: want.edition, flags }));
             probes.push((SVec::from_slice_in(&want.slot, alloc), probed));
             merged.push(one);
         }
@@ -3517,11 +3536,11 @@ fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
             stack.extend(record.parts.iter().filter(|part| matches!(part.locate, Locate::File { .. })).map(|part| part.name));
         }
     }
-    // Live: a found file now, a member's root, a file a part of a file outside the affected
+    // Live: a found file now, a checkout root, a file a part of a file outside the affected
     // ones names, and a file a part of a live one names; an affected file with no outline is not.
     let mut live: SSet<'_, Name> = SSet::new_in(alloc);
     live.extend(found_now.iter().map(|(file, _)| *file));
-    live.extend(units.iter().map(|one| one.0).filter(|root| affected.contains(root)));
+    live.extend(checkout_units.iter().map(|one| one.0).filter(|root| affected.contains(root)));
     let mut inner: SVec<'_, (Name, Name)> = SVec::new_in(alloc);
     for one in merged.iter() {
         let Ok(record) = &one.made else { continue };
@@ -3546,10 +3565,15 @@ fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
     }
     live.retain(|file| merged.binary_search_by_key(file, |one| one.name).is_ok());
     merged.retain(|one| !affected.contains(&one.name) || live.contains(&one.name));
+    let mut external_now: SVec<'_, Name> = SVec::new_in(alloc);
+    external_now.extend(serve.external.iter().copied());
+    external_now.extend(new_places.iter().filter(|(_, place)| place.flags & PLACE_EXTERNAL != 0).map(|(file, _)| *file));
+    external_now.sort_unstable();
+    external_now.dedup();
     // 3. The reach with today's found edges, and each affected file's plan from it.
     let reach = rq.bodies.plan_reach(cx, &mut *store, rq.graph, Some(list), &merged, &edges, crate::engine_bodies::ReachFrom::Walk, heap.alloc())?;
     let mut plan_now: SVec<'r, Planned> = SVec::new_in(alloc);
-    crate::engine_ready_edit::file_tasks(&merged, serve.skipped, true, &serve.rules, reach, alloc, &mut plan_now);
+    crate::engine_ready_edit::file_tasks(&merged, serve.skipped, &external_now, true, &serve.rules, reach, alloc, &mut plan_now);
     // The request's plan: each affected file's tasks of the stages `file_tasks` plans are
     // today's; a dropped file has none.
     let mut planned: SVec<'r, Planned> = SVec::new_in(alloc);
@@ -4180,6 +4204,7 @@ fn ready_setup<'f, 'h, 'a>(
     // root (a place that is its own crate root, as a member target's root is, the crate list
     // not listing it) must have its note there, else the request is refused before any work.
     let mut skipped_files: SVec<'h, Name> = SVec::new_in(alloc);
+    let mut external_files: SVec<'h, Name> = SVec::new_in(alloc);
     let mut unnoted = 0usize;
     for (&file, place) in last.places.iter() {
         let is_listed = match cached_listed_roots {
@@ -4195,6 +4220,9 @@ fn ready_setup<'f, 'h, 'a>(
         }
         if place.flags & PLACE_SKIPPED != 0 {
             skipped_files.push(file);
+        }
+        if place.flags & PLACE_EXTERNAL != 0 {
+            external_files.push(file);
         }
     }
     if unnoted > 0 {
@@ -4236,6 +4264,7 @@ fn ready_setup<'f, 'h, 'a>(
             edition: place.edition,
             root: place.unit,
             found: place.flags & PLACE_FOUND,
+            external: place.flags & PLACE_EXTERNAL != 0,
             #[cfg(test)]
             text_only_outline: TEXT_ONLY_OUTLINE.get(),
         };
@@ -4308,7 +4337,7 @@ fn ready_setup<'f, 'h, 'a>(
     }
     outlined.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     deferred.sort_unstable_by(|a, b| a.0.name.cmp(&b.0.name));
-    let skipped = Skipped { files: skipped_files, targets: SVec::new_in(alloc), carried: true };
+    let skipped = Skipped { files: skipped_files, external: external_files, targets: SVec::new_in(alloc), carried: true };
     Ok(Ok(ReadySetup { rows, names, graph, outlined, deferred, slots, files, skipped, places, rows_read: kept.read.load(core::sync::atomic::Ordering::Relaxed) }))
 }
 
@@ -5441,6 +5470,10 @@ struct Want<'h> {
     /// ([`serve_found`]); 0 for a file a part names, a found file's parts too (each unit's reach
     /// walks them from the found file under its cuts, engine_body_plan.rs `reached_under`).
     found: u8,
+    /// Whether this file belongs only to a non-member checkout path package (`PLACE_EXTERNAL`):
+    /// outlined for `CrateScope` and tracked in the sweep leaf table, never linted or checked as
+    /// a workspace member's bodies or heads.
+    external: bool,
     #[cfg(test)]
     text_only_outline: bool,
 }
@@ -5452,6 +5485,10 @@ struct SkippedTarget {
 
 struct Skipped<'h> {
     files: SVec<'h, Name>,
+    /// Files belonging exclusively to non-member checkout path packages (`PLACE_EXTERNAL`),
+    /// sorted: outlined for `CrateScope` and sweep invalidation, never planned for bodies, heads
+    /// or lints.
+    external: SVec<'h, Name>,
     /// The targets the walk found skipped, each note made now ([`lines_of`]); empty on the
     /// ready path, which walks nothing.
     targets: SVec<'h, SkippedTarget>,
@@ -5645,7 +5682,41 @@ fn plan<'h, 'm>(
         }
     }
     for (_, made) in laid.members.iter() {
-        wants(&made.parts, &made.paths, &made.path_bytes, None, &mut seen, &mut wave, alloc)?;
+        wants(&made.parts, &made.paths, &made.path_bytes, None, false, &mut seen, &mut wave, alloc)?;
+    }
+    // Reached non-member checkout path packages (`[patch.*]` and excluded/transitive path deps):
+    // walk their source trees as `PLACE_EXTERNAL` leaves so `CrateScope` reads their `Surface`
+    // cells and editing them invalidates soundly without checking them as workspace members.
+    if let Some(names) = names {
+        let list = names.list();
+        for r in 0..blaze_world::crate_list::CrateGraph::len(list) {
+            if !list.member(r)
+                && let Some(root_path) = list.root(r).strip_prefix("/0/")
+            {
+                let file = Name::file(root_path.as_bytes());
+                if !seen.insert(file) {
+                    continue;
+                }
+                let edition = laid
+                    .path_roots
+                    .iter()
+                    .find(|(path, _)| *path == root_path)
+                    .map_or(blaze_surface::Edition::E2021.byte(), |(_, ed)| *ed);
+                let mut slot = SVec::new_in(alloc);
+                slot.extend_from_slice(root_path.as_bytes());
+                wave.push(Want {
+                    name: file,
+                    slot,
+                    module: false,
+                    edition,
+                    root: file,
+                    found: 0,
+                    external: true,
+                    #[cfg(test)]
+                    text_only_outline: TEXT_ONLY_OUTLINE.get(),
+                });
+            }
+        }
     }
     let mut outlined: SVec<'h, Outlined<'h>> = SVec::new_in(alloc);
     // The found files' wants once the roots' walk is done (above): a file it reached is not one.
@@ -5837,9 +5908,10 @@ fn plan<'h, 'm>(
             match joined {
                 Ok(Ok((one, probed))) => {
                     if let Ok(record) = &one.made {
-                        wants(&record.parts, &record.paths, &record.path_bytes, Some(want.root), &mut seen, &mut next, alloc)?;
+                        wants(&record.parts, &record.paths, &record.path_bytes, Some(want.root), want.external, &mut seen, &mut next, alloc)?;
                     }
-                    places.push((want.name, blaze_engine::pages::FilePlace { unit: want.root, edition: want.edition, flags: (if want.module { PLACE_MODULE } else { 0 }) | want.found }));
+                    let flags = (if want.module { PLACE_MODULE } else { 0 }) | want.found | (if want.external { PLACE_EXTERNAL } else { 0 });
+                    places.push((want.name, blaze_engine::pages::FilePlace { unit: want.root, edition: want.edition, flags }));
                     outlined.push(one);
                     let mut slot = SVec::new_in(alloc);
                     slot.extend_from_slice(&want.slot);
@@ -5905,12 +5977,18 @@ fn plan<'h, 'm>(
     let mut skipped_file_names = SVec::new_in(alloc);
     skipped_file_names.extend(skipped_files.iter().copied());
     skipped_file_names.sort_unstable();
+    let mut external_files = SVec::new_in(alloc);
     for (file, place) in places.iter_mut() {
         if skipped_file_names.binary_search(file).is_ok() {
             place.flags |= PLACE_SKIPPED;
         }
+        if place.flags & PLACE_EXTERNAL != 0 {
+            external_files.push(*file);
+        }
     }
-    Ok((outlined, probes, files, Skipped { files: skipped_file_names, targets: skipped_targets, carried: false }, places))
+    external_files.sort_unstable();
+    external_files.dedup();
+    Ok((outlined, probes, files, Skipped { files: skipped_file_names, external: external_files, targets: skipped_targets, carried: false }, places))
 }
 
 /// A [`blaze_engine::pages::FilePlace`]'s flag: a `mod x;` named the file (its file is at
@@ -5929,6 +6007,10 @@ pub(crate) const PLACE_FOUND_LIB: u8 = 4;
 pub(crate) const PLACE_FOUND_TEST: u8 = 8;
 /// Both found flags: a place with either is a found file's.
 pub(crate) const PLACE_FOUND: u8 = PLACE_FOUND_LIB | PLACE_FOUND_TEST;
+/// A [`blaze_engine::pages::FilePlace`]'s flag: the file belongs only to a non-member checkout
+/// path package (`[patch.*]` or excluded/transitive path dependency): outlined for `CrateScope`
+/// and sweep invalidation, never linted or checked as a workspace member's bodies or heads.
+pub(crate) const PLACE_EXTERNAL: u8 = 16;
 
 /// The found flag of a member unit by whether it is a test build.
 pub(crate) const fn found_bit(test: bool) -> u8 {
@@ -6119,6 +6201,7 @@ fn wants<'h>(
     // The crate root of the file whose parts these are; `None` for a member's units record,
     // whose every file part is a target's root.
     root: Option<Name>,
+    external: bool,
     seen: &mut SSet<'h, Name>,
     into: &mut SVec<'h, Want<'h>>,
     alloc: SharedAlloc<'h>,
@@ -6134,7 +6217,7 @@ fn wants<'h>(
         let mut slot = SVec::new_in(alloc);
         slot.extend_from_slice(&path_bytes[start as usize..end as usize]);
         into.push(Want {
-            name: part.name, slot, module, edition, root: root.unwrap_or(part.name), found: 0,
+            name: part.name, slot, module, edition, root: root.unwrap_or(part.name), found: 0, external,
             #[cfg(test)]
             text_only_outline: TEXT_ONLY_OUTLINE.get(),
         });
@@ -6165,6 +6248,7 @@ fn found_wants<'h>(kept: &Kept<'_, '_, '_>, found_last: &[(Name, blaze_engine::p
             edition: place.edition,
             root: place.unit,
             found: place.flags & PLACE_FOUND,
+            external: place.flags & PLACE_EXTERNAL != 0,
             #[cfg(test)]
             text_only_outline: TEXT_ONLY_OUTLINE.get(),
         });
@@ -6235,7 +6319,7 @@ fn outline_one<'h>(cx: &Cx, root: &Dir<ReadWrite>, stamps: &FromMeta, want: &Wan
         flags,
         edition: want.edition,
         expect: source,
-        lints,
+        lints: if want.external { None } else { lints },
     };
     let made = match work::unwinding(|| work::outline_file(cx, root, &job, scratch, alloc)) {
         Ok(Ok(made)) => made,
@@ -6256,6 +6340,7 @@ pub(crate) struct FoundWant<'p> {
     pub(crate) module: bool,
     pub(crate) edition: u8,
     pub(crate) root: Name,
+    pub(crate) external: bool,
 }
 
 /// One found file probed and outlined, on the names worker that found it, in its task's frame,
@@ -6272,6 +6357,7 @@ pub(crate) fn outline_found<'h>(cx: &Cx, root: &Dir<ReadWrite>, stamps: &FromMet
         edition: found.edition,
         root: found.root,
         found: 0,
+        external: found.external,
         #[cfg(test)]
         text_only_outline: plants.text_only_outline,
     };

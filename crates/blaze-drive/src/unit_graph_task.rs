@@ -35,6 +35,9 @@ pub struct UnitGraphInputs<'i, 'a> {
     pub workspace_read: ContentId,
     /// Each member's lock id and facts.
     pub members: &'i [(LockId, Package<'a>)],
+    /// Each non-member checkout path package's lock id and facts (from `[patch.*]` or path
+    /// dependencies outside `workspace.members`).
+    pub path_packages: &'i [(LockId, Package<'a>)],
     pub resolver: Resolver,
     pub target: &'i TargetDesc<'a>,
     pub host: &'i TargetDesc<'a>,
@@ -139,8 +142,18 @@ pub fn run<'b, 'a, R: Records<'b>>(
     let mut findings = AVec::new_in(alloc);
     let mut sources = StoreSources::new(lock, records, open, alloc).map_err(UnitGraphTaskError::Source)?;
     let mut res = Resolution::new(lock, inputs.target, inputs.host, inputs.ask, inputs.resolver, alloc);
-    for (id, package) in inputs.members {
-        res.member(*id, package.clone()).map_err(UnitGraphTaskError::Resolve)?;
+    for (is_member, (id, package)) in inputs
+        .members
+        .iter()
+        .map(|entry| (true, entry))
+        .chain(inputs.path_packages.iter().map(|entry| (false, entry)))
+    {
+        let package = package.clone();
+        match is_member {
+            true => res.member(*id, package),
+            false => res.package(*id, Some(package)),
+        }
+        .map_err(UnitGraphTaskError::Resolve)?;
     }
     let mut not_fetched = 0u32;
     for _ in 0..MOST_PASSES {

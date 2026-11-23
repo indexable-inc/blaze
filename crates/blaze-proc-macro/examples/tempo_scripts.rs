@@ -244,13 +244,13 @@ fn main() {
     let mut roots = AVec::new_in(alloc);
     let mut members = Vec::new();
     // Each member's folder, checkout-relative: where the world finds a path package's files.
-    let mut paths: Vec<(LockId, &'static str)> = Vec::new();
+    let mut paths: Vec<blaze_world::CheckoutPath<'static>> = Vec::new();
     for m in ws.members.iter() {
         if let Some(id) = lock.named(&m.name).find(|id| matches!(lock.package(*id).source, LockSource::Path)) {
             roots.push(id);
             member_dirs.insert(id, m.dir.as_str().to_owned());
             members.push((id, Package::from_member(m, alloc)));
-            paths.push((id, Box::leak(m.dir.as_str().to_owned().into_boxed_str())));
+            paths.push(blaze_world::CheckoutPath { id, dir: Box::leak(m.dir.as_str().to_owned().into_boxed_str()), kind: blaze_world::PathKind::Member });
         }
     }
     let ask: &'static Ask<'static> =

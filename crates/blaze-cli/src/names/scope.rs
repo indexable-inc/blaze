@@ -55,6 +55,9 @@ pub(crate) struct ScopeJob<'j> {
     pub(crate) kept: blaze_own::SharedAlloc<'static>,
     /// The crate's index in the world (its texts' `krate`).
     pub(crate) at: usize,
+    /// Whether this crate belongs to a workspace member (only workspace members emit user-facing
+    /// unresolved-path, missing-module, failed-call, include-outside, and test-mark findings).
+    pub(crate) member: bool,
     /// Its input, its dependencies renumbered to `deps`' order.
     pub(crate) input: CrateInput<'j>,
     /// The exports record of each crate it reads, in its local order, each checked once where
@@ -471,25 +474,25 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
     };
     metered.outside(super::metered::Outside::Record);
     // Each include that left its package inside the workspace (D111): a warning finding at
-    // its call, placed in the crate's own files (none when the crate failed).
-    let left_package = match &done {
-        Ok(done) => crate::names::include_outside::findings(done.names, &texts.left.borrow(), job.input.shown_from),
-        Err(_) => blaze_own::Vec::new_in(Global),
+    // its call, placed in the crate's own files (none when the crate failed or is external).
+    let left_package = match (job.member, &done) {
+        (true, Ok(done)) => crate::names::include_outside::findings(done.names, &texts.left.borrow(), job.input.shown_from),
+        _ => blaze_own::Vec::new_in(Global),
     };
     // The out of a resolved crate: its names record here, its files below ([`OUT_DOMAIN`]);
     // `None`: failed ([`crate::work::failed_out`]).
     // Each failed or refused macro call of the crate's own code (a `main` the implicit
     // `::std::main` did not write among them): an error finding at the call with its reason.
-    let failed_calls = match &done {
-        Ok(done) => crate::names::failed_call::findings(done.names, bump),
-        Err(_) => blaze_own::Vec::new_in(Global),
+    let failed_calls = match (job.member, &done) {
+        (true, Ok(done)) => crate::names::failed_call::findings(done.names, bump),
+        _ => blaze_own::Vec::new_in(Global),
     };
     // Each `mod` of the crate's own code whose file is at neither place (or whose `#[path]`
     // names none): an error finding at the `mod` item (E0583; cfg decided by the walk). The
     // module is empty for the rest of the crate, which is still solved.
-    let module_missing = match &done {
-        Ok(done) => crate::names::module_missing::findings(done.names, job.kept),
-        Err(_) => blaze_own::Vec::new_in(job.kept),
+    let module_missing = match (job.member, &done) {
+        (true, Ok(done)) => crate::names::module_missing::findings(done.names, job.kept),
+        _ => blaze_own::Vec::new_in(job.kept),
     };
     // The crate's failed dependencies (each handed as an error record, engine_names.rs): a path
     // that fails behind one (written into it, or through a glob or import that failed into it)
@@ -500,7 +503,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         Some(blaze_scope::waits_on::FailedDep { called: Some(*called), name, key })
     }));
     let (out, payload, findings, failed, ok, unresolved, test_marks, expansions) = match done {
-        Ok(done) => match scope_record(&done, crate_name, &blaze_scope::waits_on::WaitsOn::of(done.names, &failed_deps, alloc), bump, job.kept) {
+        Ok(done) => match scope_record(&done, crate_name, job.member, &blaze_scope::waits_on::WaitsOn::of(done.names, &failed_deps, alloc), bump, job.kept) {
             Ok(record) => {
                 // Both records (rule 21): a dependent reads the exports, but the crate's own
                 // bodies read its inner names (front_load.rs), so an out over the exports alone

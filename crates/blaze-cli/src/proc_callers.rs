@@ -100,6 +100,14 @@ pub(crate) fn shown(
             workspace: std::path::PathBuf::from(checkout),
             root: blaze_proc_macro::script_sandbox::ScriptRoot::member(dir)?,
         }),
+        Place::Path { dir } => {
+            // Validate `dir` by the same rule (no `..` or absolute path), then mount that
+            // package's folder alone at `/package` (`Files::Folder` has `SeenRoot::Package`).
+            let _ = blaze_proc_macro::script_sandbox::ScriptRoot::member(dir)?;
+            let base = if checkout.is_empty() { std::path::Path::new(".") } else { std::path::Path::new(checkout) };
+            let folder = if dir.is_empty() { base.to_path_buf() } else { base.join(dir) };
+            Ok(blaze_proc_macro::sandbox::Files::Folder(folder))
+        }
         Place::Pack { view, dir } => Ok(sandbox_files(PackageAt::Pack { view, dir })),
     }
 }

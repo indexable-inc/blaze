@@ -374,7 +374,7 @@ pub fn encode_with<'a>(world: &World<'_>, facts: &dyn ListFacts, alloc: Alloc<'a
         if matches!(c.origin, Origin::Toolchain(_)) {
             flags |= TOOLCHAIN;
         }
-        if c.input.root.starts_with("/0/") {
+        if c.member {
             flags |= MEMBER;
         }
         if world.refusal(at).is_some() {
@@ -1033,7 +1033,7 @@ fn differences_inner(world: &World<'_>, list: &CrateList<'_>, check_packs: bool)
             + usize::from(list.side(r) != c.side)
             + usize::from(list.proc_macro(r) != c.proc_macro)
             + usize::from(list.toolchain(r) != world.toolchain(at))
-            + usize::from(list.member(r) != c.input.root.starts_with("/0/"))
+            + usize::from(list.member(r) != c.member)
             + usize::from(list.refused(r) != world.refused(at))
             + usize::from(!world.texts.crate_env(at).is_some_and(|env| same_facts(&env.facts(), &list.env_facts(r))));
         let mut deps = list.deps_named(r);

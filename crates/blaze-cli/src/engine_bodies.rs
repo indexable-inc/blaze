@@ -206,14 +206,14 @@ const REFUSED_CAUSES_SHOWN: usize = 16;
 /// plan time does not know) has no row of it: a `#[cfg(test)]` body is the test build's alone,
 /// at its plain name when the test build is its first holder; a body a unit reaching its file
 /// cuts everywhere has no row at all. What plan time cannot decide keeps every reacher's row.
-pub(crate) fn plan_views<'h, P: ViewPlan>(outlined: &[Outlined<'_>], skipped: &[Name], reach: Option<&Reach>, alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
+pub(crate) fn plan_views<'h, P: ViewPlan>(outlined: &[Outlined<'_>], skipped: &[Name], external: &[Name], reach: Option<&Reach>, alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
     let mut planned: SVec<'h, Planned> = SVec::new_in(alloc);
     // The holders' views of the body at hand, in rank: what `P` is asked over.
     let mut views: SVec<'h, ViewKey> = SVec::new_in(alloc);
     for one in outlined.iter() {
         // Outlines are retained for the module closure and its note, but a file exclusive to a
-        // skipped target has no Bodies task and therefore cannot become ownerless.
-        if skipped.binary_search(&one.name).is_ok() {
+        // skipped target or an external checkout path package has no Bodies task.
+        if skipped.binary_search(&one.name).is_ok() || external.binary_search(&one.name).is_ok() {
             continue;
         }
         let Ok(record) = &one.made else { continue };

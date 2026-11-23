@@ -180,7 +180,7 @@ pub fn crate_list<'w, P: Packages<'w>>(
         asked.push(unit.package.0);
         match packages.place(unit.package)? {
             Place::Checkout { dir } => members.push(Member::new(unit.package, dir).map_err(|error| WorldError::MemberDir { package: &unit.name, error })?),
-            Place::Pack { .. } => {}
+            Place::Path { .. } | Place::Pack { .. } => {}
         }
     }
     unit_crates(graph, lock, &members, view, triple, alloc).map_err(WorldError::Units)
@@ -313,7 +313,7 @@ fn key_list<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                         }
                     };
                     match place {
-                        Place::Checkout { dir } => Some(dir),
+                        Place::Checkout { dir } | Place::Path { dir } => Some(dir),
                         Place::Pack { .. } => None,
                     }
                 } else {
@@ -442,7 +442,7 @@ fn world_inner<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     }
     // The lock's fetch plan, made at the first fetched package placed: which record holds it.
     let mut fetch_plan: Option<blaze_fetch::Plan<'w, 'w>> = None;
-    let mut placed: BTreeMap<u32, (u32, &'w str), Alloc<'w>> = BTreeMap::new_in(alloc);
+    let mut placed: BTreeMap<u32, (u32, &'w str, bool), Alloc<'w>> = BTreeMap::new_in(alloc);
 
     let mut crates: AVec<'w, Crate<'w>> = AVec::with_capacity_in(tc.len() + pending.len(), alloc);
     let mut envs: AVec<'w, CrateEnv<'w>> = AVec::with_capacity_in(tc.len() + pending.len(), alloc);
@@ -478,6 +478,7 @@ fn world_inner<'w, P: Packages<'w>, B: AsRef<[u8]>>(
             units: 0,
             script: Script::None,
             proc_macro: c.proc_macro,
+            member: false,
             package: c.name,
             version: c.version,
             side: Side::Target,
@@ -486,10 +487,10 @@ fn world_inner<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     for &p in order.iter() {
         let pend = &pending[p as usize];
         let c = &list.crates[pend.at];
-        let (root, shown_from, facts, origin, proc_macro, package, version) = match c.origin {
+        let (root, shown_from, facts, origin, proc_macro, is_member, package, version) = match c.origin {
             ListOrigin::Unit(id) => {
                 let unit = &units[id.index()];
-                let (root, shown_from, seen): (&'w str, &'w str, SeenRoot<'w>) = if let Some(stored) = stored_list {
+                let (root, shown_from, seen, is_member): (&'w str, &'w str, SeenRoot<'w>, bool) = if let Some(stored) = stored_list {
                     match early.get(&unit.package.0) {
                         Some(Place::Checkout { dir }) => {
                             let shown = join("/0/", dir, alloc);
@@ -499,15 +500,24 @@ fn world_inner<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                                 shown_from.push_str("/");
                             }
                             let seen = SeenRoot::member(dir).map_err(|error| WorldError::MemberDir { package: &unit.name, error })?;
-                            (root, bump.alloc_str(&shown_from), seen)
+                            (root, bump.alloc_str(&shown_from), seen, true)
+                        }
+                        Some(Place::Path { dir }) => {
+                            let shown = join("/0/", dir, alloc);
+                            let root: &'w str = bump.alloc_str(&join(&shown, &unit.root, alloc));
+                            let mut shown_from = shown;
+                            if !shown_from.ends_with('/') {
+                                shown_from.push_str("/");
+                            }
+                            (root, bump.alloc_str(&shown_from), SeenRoot::Package, false)
                         }
                         _ => match stored.find(pend.key) {
-                            Some(row) => (stored.root(row), stored.shown_from(row), SeenRoot::Package),
-                            None => ("", "", SeenRoot::Package),
+                            Some(row) => (stored.root(row), stored.shown_from(row), SeenRoot::Package, false),
+                            None => ("", "", SeenRoot::Package, false),
                         },
                     }
                 } else {
-                    let (tree, dir) = match placed.get(&unit.package.0) {
+                    let (tree, dir, is_member) = match placed.get(&unit.package.0) {
                         Some(&it) => it,
                         None => {
                             let place = match early.get(&unit.package.0) {
@@ -515,7 +525,8 @@ fn world_inner<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                                 None => packages.place(unit.package)?,
                             };
                             let it = match place {
-                                Place::Checkout { dir } => (0, dir),
+                                Place::Checkout { dir } => (0, dir, true),
+                                Place::Path { dir } => (0, dir, false),
                                 Place::Pack { view, dir } => {
                                     let key = source_key(&mut fetch_plan, view, lock, unit.package, &unit.name, alloc)?;
                                     packs.push(view);
@@ -524,7 +535,7 @@ fn world_inner<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                                     if let Some(row) = corrections.find_text(&unit.name, &unit.version) {
                                         correct_pack(row, view, tree, dir, unit, &mut corrected, &mut used, bump)?;
                                     }
-                                    (tree, dir)
+                                    (tree, dir, false)
                                 }
                             };
                             placed.insert(unit.package.0, it);
@@ -541,8 +552,8 @@ fn world_inner<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                     if !shown_from.ends_with('/') {
                         shown_from.push_str("/");
                     }
-                    let seen = if tree == 0 { SeenRoot::member(dir).map_err(|error| WorldError::MemberDir { package: &unit.name, error })? } else { SeenRoot::Package };
-                    (root, bump.alloc_str(&shown_from), seen)
+                    let seen = if is_member { SeenRoot::member(dir).map_err(|error| WorldError::MemberDir { package: &unit.name, error })? } else { SeenRoot::Package };
+                    (root, bump.alloc_str(&shown_from), seen, is_member)
                 };
                 let test_or_bench = matches!(unit.kind, UnitKind::IntegrationTest(_) | UnitKind::Bench(_));
                 let bin_exes = match test_or_bench {
@@ -564,7 +575,7 @@ fn world_inner<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                     bin_exes,
                     meta: graph.meta_of(unit.package).map(|meta| meta.vars()),
                 };
-                (root, shown_from, facts, Origin::Unit(id), unit.kind == UnitKind::ProcMacro, unit.name.as_str(), unit.version.as_str())
+                (root, shown_from, facts, Origin::Unit(id), unit.kind == UnitKind::ProcMacro, is_member, unit.name.as_str(), unit.version.as_str())
             }
             ListOrigin::Toolchain { unit, .. } => {
                 let (root, shown_from, version): (&'w str, &'w str, &'w str) = if let Some(stored) = stored_list {
@@ -601,7 +612,7 @@ fn world_inner<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                     bin_exes: blaze_scope::crate_env::BinNames::NONE,
                     meta: None,
                 };
-                (root, shown_from, facts, Origin::Toolchain(unit), false, c.name, version)
+                (root, shown_from, facts, Origin::Toolchain(unit), false, false, c.name, version)
             }
         };
         let mut deps: BVec<'w, (&'w str, usize)> = BVec::with_capacity_in(c.deps.len() + 1, bump);
@@ -634,6 +645,7 @@ fn world_inner<'w, P: Packages<'w>, B: AsRef<[u8]>>(
             units: pend.units,
             script: pend.script,
             proc_macro,
+            member: is_member,
             package,
             version,
             side: pend.side,
@@ -723,6 +735,7 @@ pub fn script_world<'w, B: AsRef<[u8]>>(
             units: 0,
             script: Script::None,
             proc_macro: c.proc_macro,
+            member: false,
             package: c.name,
             version: c.version,
             side: Side::Target,
@@ -790,6 +803,7 @@ pub fn script_world<'w, B: AsRef<[u8]>>(
             units: 0,
             script: Script::None,
             proc_macro: false,
+            member: false,
             package: c.name,
             version,
             side: Side::Macro,

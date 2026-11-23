@@ -43,15 +43,15 @@ use crate::engine_answer::Stored;
 /// `reach`: which member units reach each file (engine_body_plan.rs `Reach`, D191), made once a
 /// request by engine_bodies.rs `BodiesStage::plan_reach`: a body's row is planned at each unit
 /// that reaches its file; `None` (no crate list) plans each body's base row alone.
-pub(crate) fn file_tasks<'h>(outlined: &[crate::engine_tasks::Outlined<'_>], skipped: &[Name], heads: bool, rules: &blaze_lint::RuleSet, reach: Option<&crate::engine_body_plan::Reach>, alloc: blaze_own::SharedAlloc<'h>, into: &mut SVec<'h, blaze_engine::Planned>) {
+pub(crate) fn file_tasks<'h>(outlined: &[crate::engine_tasks::Outlined<'_>], skipped: &[Name], external: &[Name], heads: bool, rules: &blaze_lint::RuleSet, reach: Option<&crate::engine_body_plan::Reach>, alloc: blaze_own::SharedAlloc<'h>, into: &mut SVec<'h, blaze_engine::Planned>) {
     for one in outlined.iter() {
         into.push(blaze_engine::Planned { name: one.name, phase: blaze_engine::Phase::new(blaze_engine::Stage::Outlines, 0), source: one.outline_source, file: one.name });
     }
-    into.extend(crate::engine_bodies::plan_views::<blaze_drive::view::Production>(outlined, skipped, reach, alloc));
+    into.extend(crate::engine_bodies::plan_views::<blaze_drive::view::Production>(outlined, skipped, external, reach, alloc));
     if heads {
-        into.extend(crate::engine_heads::plan_items(outlined, alloc));
+        into.extend(crate::engine_heads::plan_items(outlined, external, alloc));
     }
-    into.extend(crate::engine_lints::plan(outlined, rules, alloc));
+    into.extend(crate::engine_lints::plan(outlined, external, rules, alloc));
 }
 
 /// Which driver `check` runs an edit on (`--driver=auto|ready|phases`, main.rs `Flags::driver`):
