@@ -10,7 +10,7 @@ use blaze_build::layout::{Fields, Layout, LayoutCx, LayoutId, Variants};
 use blaze_build::{Instance, ground};
 use blaze_lir::builder::MemAttrs;
 use blaze_lir::func::{RefKind, SlotKind};
-use blaze_lir::{Flags, IntCond, Op, Ty, Value};
+use blaze_lir::{Flags, FloatCond, IntCond, Op, Ty, Value};
 use blaze_typeck::{AdtKind, PNode, PTy};
 
 use crate::{BuildError, Cx, Held, V};
@@ -62,12 +62,9 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         Ok(matches!(self.node(g)?, PNode::Int(_)))
     }
 
-    /// Whether ground type `g` is a float: its operations are not built yet.
-    fn refuse_float(&mut self, g: PTy) -> Result<(), BuildError> {
-        match self.node(g)? {
-            PNode::Float(_) => Err(self.unsupported("a float operation")),
-            _ => Ok(()),
-        }
+    /// Whether ground type `g` is a floating-point scalar.
+    fn is_float(&self, g: PTy) -> Result<bool, BuildError> {
+        Ok(matches!(self.node(g)?, PNode::Float(_)))
     }
 
     /// The bits of a ground `ConstValue` (an array's length).
@@ -309,7 +306,9 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 if l.is_zst() {
                     V::None
                 } else if let Some(s) = l.scalar {
-                    V::One(self.b.iconst(lir(s.prim).0, bits))
+                    let ty = lir(s.prim).0;
+                    let v = if ty.is_float() { self.b.fconst(ty, bits) } else { self.b.iconst(ty, bits) };
+                    V::One(v)
                 } else {
                     return Err(self.unsupported("a scalar constant of a type that is not one scalar"));
                 }
@@ -555,13 +554,34 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         self.b.binary(Op::And, Flags::NONE, y, mask)
     }
 
-    /// `lhs op rhs`, wrapping.
+    /// `lhs op rhs`, wrapping (or IEEE 754 for floats).
     fn binary(&mut self, op: BinOp, lhs: Operand, rhs: Operand) -> Result<Value, BuildError> {
         let (a, ga) = self.operand(lhs)?;
         let (b, gb) = self.operand(rhs)?;
-        self.refuse_float(ga)?;
         let x = self.scalar(a)?;
         let y = self.scalar(b)?;
+        if self.is_float(ga)? {
+            return Ok(match op {
+                BinOp::Add => self.b.binary(Op::Fadd, Flags::NONE, x, y),
+                BinOp::Sub => self.b.binary(Op::Fsub, Flags::NONE, x, y),
+                BinOp::Mul => self.b.binary(Op::Fmul, Flags::NONE, x, y),
+                BinOp::Div => self.b.binary(Op::Fdiv, Flags::NONE, x, y),
+                BinOp::Rem => self.b.binary(Op::Frem, Flags::NONE, x, y),
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                    let cond = match op {
+                        BinOp::Eq => FloatCond::Oeq,
+                        BinOp::Ne => FloatCond::Une,
+                        BinOp::Lt => FloatCond::Olt,
+                        BinOp::Le => FloatCond::Ole,
+                        BinOp::Gt => FloatCond::Ogt,
+                        _ => FloatCond::Oge,
+                    };
+                    let c = self.b.fcmp(cond, x, y);
+                    self.widen_bool(c)
+                }
+                _ => return Err(self.malformed("a non-float binary operation on a float")),
+            });
+        }
         let signed = self.signed(ga)?;
         let pick = |s: Op, u: Op| if signed { s } else { u };
         let cmp = |s: IntCond, u: IntCond| if signed { s } else { u };
@@ -624,7 +644,9 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     fn checked(&mut self, op: BinOp, lhs: Operand, rhs: Operand) -> Result<(Value, Value, LayoutId), BuildError> {
         let (a, ga) = self.operand(lhs)?;
         let (b, _) = self.operand(rhs)?;
-        self.refuse_float(ga)?;
+        if self.is_float(ga)? {
+            return Err(self.malformed("a checked operation on a float"));
+        }
         let rlay = self.layout(ga)?;
         let x = self.scalar(a)?;
         let y = self.scalar(b)?;
@@ -667,14 +689,15 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 _ => Err(self.malformed("the metadata of a value that is not a pointer")),
             },
             UnOp::Not | UnOp::Neg => {
-                self.refuse_float(g)?;
                 let x = self.scalar(a)?;
                 Ok(V::One(match (op, self.node(g)?) {
                     (UnOp::Not, PNode::Bool) => {
                         let one = self.b.iconst(Ty::I8, 1);
                         self.b.binary(Op::Xor, Flags::NONE, x, one)
                     }
+                    (UnOp::Not, PNode::Float(_)) => return Err(self.malformed("bitwise not on a float")),
                     (UnOp::Not, _) => self.b.unary(Op::Not, Flags::NONE, x),
+                    (UnOp::Neg, PNode::Float(_)) => self.b.unary(Op::Fneg, Flags::NONE, x),
                     _ => self.b.unary(Op::Neg, Flags::NONE, x),
                 }))
             }
@@ -736,7 +759,31 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 let r = self.func_ref(Instance { item, args });
                 V::One(self.b.func_addr(r))
             }
-            CastKind::IntToFloat | CastKind::FloatToInt | CastKind::FloatToFloat => return Err(self.unsupported("a float cast")),
+            CastKind::IntToFloat => {
+                let x = self.scalar(a)?;
+                let ty = target(self)?;
+                let op = if self.signed(g)? { Op::SitoFp } else { Op::UitoFp };
+                V::One(self.b.convert(op, Flags::NONE, ty, x))
+            }
+            CastKind::FloatToInt => {
+                let x = self.scalar(a)?;
+                let ty = target(self)?;
+                let op = if self.signed(to)? { Op::FptoSi } else { Op::FptoUi };
+                V::One(self.b.convert(op, Flags::NONE, ty, x))
+            }
+            CastKind::FloatToFloat => {
+                let x = self.scalar(a)?;
+                let ty = target(self)?;
+                let from_bits = self.b.ty(x).bits(crate::PTR_BITS);
+                let to_bits = ty.bits(crate::PTR_BITS);
+                if from_bits == to_bits {
+                    V::One(x)
+                } else if from_bits < to_bits {
+                    V::One(self.b.convert(Op::Fpext, Flags::NONE, ty, x))
+                } else {
+                    V::One(self.b.convert(Op::Fptrunc, Flags::NONE, ty, x))
+                }
+            }
             CastKind::ClosureFnPointer => return Err(self.unsupported("a closure to fn pointer cast")),
         })
     }

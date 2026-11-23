@@ -1,13 +1,14 @@
 use blaze_own::Alloc;
 
 use crate::{
-    AlgebraPlant, ConstExpr, ConstGraph, CostModel, ExprGraph, ExprId, Interval, NewtonOpts, Op,
-    PatNode, Poly, PolyPlant, Rat, RewriteMode, RewriteRule, SimplifyOpts, Solution, SymScope,
-    active_vars, diff, diff::diff_with_plant, emit_rust_fn, emit_rust_multi_fn, eval_dual,
-    eval_interval, eval_newton, expr_cost, expr_cost_with, expr_to_poly, format_expr, grad,
-    grad_reverse, grad_reverse_with_plant, hessian, hvp, jacobian, jvp, newton_step, poly_to_expr,
+    AlgebraPlant, ConstExpr, ConstGraph, CostModel, DERIV_RULES, ExprGraph, ExprId, Interval,
+    NewtonOpts, Op, PatNode, Poly, PolyPlant, Rat, RewriteMode, RewriteRule,
+    STANDARD_REWRITE_RULES, SimplifyOpts, Solution, SymScope, active_vars, diff,
+    diff::diff_with_plant, emit_rust_fn, emit_rust_multi_fn, eval_dual, eval_interval, eval_newton,
+    export_lean_theorems, expr_cost, expr_cost_with, expr_to_poly, format_expr, grad, grad_reverse,
+    grad_reverse_with_plant, hessian, hvp, jacobian, jvp, newton_step, poly_to_expr,
     prune_branches, simplify, simplify_poly_expr, simplify_with, simplify_with_rules, solve_for,
-    solve_linear_system, taylor,
+    solve_linear_system, standard_rewrite_rules, taylor,
 };
 
 fn heap() -> Alloc<'static> {
@@ -769,4 +770,36 @@ fn jvp_hvp_and_active_vars_sparsity_match_full_hessian_oracle() {
         assert!(close(got_hi, expected_hi, 1e-11), "hvp[{i}]: {got_hi} vs {expected_hi}");
     }
     assert_eq!(g.eval(hv[2], &env).unwrap(), 0.0);
+}
+
+#[test]
+fn declarative_rules_table_drives_egraph_and_exports_lean4_obligations() {
+    // 1. Same STANDARD_REWRITE_RULES drives Rust e-graph saturation:
+    let s = SymScope::new_in(heap());
+    let (_, x) = s.var("x");
+    let (_, y) = s.var("y");
+    let e = (x.exp() * y.exp() + x.ln() + y.ln()).id();
+    let mut g = s.into_graph();
+    let rules = standard_rewrite_rules(RewriteMode::FastMath, heap());
+    let (simp, stats) = simplify_with_rules(&mut g, e, SimplifyOpts::default(), rules.as_slice()).unwrap();
+    assert!(stats.cost_after < stats.cost_before);
+    assert!(close(g.eval(e, &[1.3, 2.7]).unwrap(), g.eval(simp, &[1.3, 2.7]).unwrap(), 1e-12));
+
+    // 2. And exports a complete Lean 4 proof-obligation module with AllSound witness fields:
+    let lean = export_lean_theorems(STANDARD_REWRITE_RULES, DERIV_RULES, heap());
+    let src = lean.as_str();
+    assert!(src.contains("namespace BlazeAlgebra.Verified"));
+    assert!(src.contains("structure AllSound : Prop where"));
+    for r in STANDARD_REWRITE_RULES {
+        let def_pat = std::format!("def rule_{} : Prop :=", r.name);
+        let fld_pat = std::format!("rule_{0} : rule_{0}", r.name);
+        assert!(src.contains(&def_pat), "missing {def_pat} in Lean export");
+        assert!(src.contains(&fld_pat), "missing {fld_pat} in AllSound");
+    }
+    for d in DERIV_RULES {
+        let def_pat = std::format!("def deriv_{} : Prop :=", d.op);
+        let fld_pat = std::format!("deriv_{0} : deriv_{0}", d.op);
+        assert!(src.contains(&def_pat), "missing {def_pat} in Lean export");
+        assert!(src.contains(&fld_pat), "missing {fld_pat} in AllSound");
+    }
 }
