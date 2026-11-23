@@ -79,7 +79,7 @@ fn engine_check_puts_an_equal_expansion_once() {
     assert!(now.bytes - was.bytes <= 2 * 512, "the two expansion records are {} bytes, over 2 x 512", now.bytes - was.bytes);
     let grew = names_now.bytes.saturating_sub(names_was.bytes);
     assert!(grew <= rows * 640, "the names records grew {grew} bytes for {rows} rows over the hand-written fns, over {}", rows * 640);
-    assert_eq!(names_now.held, 0, "nothing of a names record or its expansions is held after its merge: {names_now}");
+    assert_eq!(names_now.results_held, 0, "nothing of a names record or its expansions is held in the stage's results after its merge: {names_now}");
     // One call edited: the next request (from the stored answer) puts its one new record.
     macro_chain(&io, true, Some(3));
     let (_, edit) = engine_from(&io, 2, false);

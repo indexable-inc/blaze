@@ -351,6 +351,30 @@ impl<'b> VerifiedPage<'b> {
         (self.first[section]..self.first[section + 1]).map(|j| self.entry(j))
     }
 
+    pub(super) fn section_count(&self, section: usize) -> usize {
+        let from = self.first.get(section).copied().unwrap_or(0);
+        let to = self.first.get(section + 1).copied().unwrap_or(from);
+        to.saturating_sub(from)
+    }
+
+    pub(super) fn section_start(&self, section: usize) -> usize {
+        self.start(self.first.get(section).copied().unwrap_or(0))
+    }
+
+    pub(super) fn section_entry_start(&self, section: usize, offset: usize) -> usize {
+        self.start(self.first.get(section).copied().unwrap_or(0) + offset)
+    }
+
+    pub(super) fn section_bytes(&self, section: usize) -> &'b [u8] {
+        let from = self.start(self.first.get(section).copied().unwrap_or(0));
+        let to = self.start(self.first.get(section + 1).copied().unwrap_or(0));
+        self.bytes.get(from..to).unwrap_or_default()
+    }
+
+    pub(super) fn readers_raw(&self, wanted: &CellId) -> Option<&'b [u8]> {
+        self.find(READERS, wanted, cell_id)
+    }
+
     fn find<K: Ord>(&self, section: usize, wanted: &K, key: impl Fn(&[u8]) -> K) -> Option<&'b [u8]> {
         let (from, to) = (self.first[section], self.first[section + 1]);
         let (mut lo, mut hi) = (from, to);

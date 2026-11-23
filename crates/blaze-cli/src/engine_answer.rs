@@ -733,7 +733,9 @@ impl<'a> Stored<'a> {
 
     /// One ask of `name`'s page for `ask`: counted, and kept under the cap for [`Stored::asked`].
     fn note_ask(&self, name: Name, ask: blaze_engine::Ask) {
-        self.asks.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if self.asks.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= MOST_ASKS_KEPT {
+            return;
+        }
         let mut asked = self.asked.lock();
         if asked.len() < MOST_ASKS_KEPT {
             // A refused growth leaves the name untold, counted by `asks` (rule 3: the count
@@ -858,6 +860,12 @@ impl<'a> Stored<'a> {
     /// The header index this answer names (the profile's `headers:` word).
     pub(crate) fn headers(&self) -> &'a Headers {
         self.headers
+    }
+
+    /// Lock-free read of a committed record from this answer's snapshot (for parallel standing
+    /// outline read-backs in `engine_check::plan`).
+    pub(crate) fn snapshot_record(&self, key: Key) -> Result<Option<&'a [u8]>, blaze_cas::plain::SnapshotError> {
+        Ok(crate::store::plain_place::snapshot_get(self.snapshot, key)?.map(|held| held.bytes))
     }
 
     pub(crate) fn read_counts(&self) -> (usize, usize) {
@@ -1174,9 +1182,9 @@ pub(crate) fn save_edit<'m, D: Driver, S: Sharing>(
     alloc: SharedAlloc<'_>,
     frame: &Frame,
     row_keys: &[Key],
-    last_root: Option<Key>,
+    (last_root, workers): (Option<Key>, core::num::NonZeroU32),
 ) -> Result<Saved, CliError> {
-    save(cx, store, lent, name, toolchain, tools, kept, printed, lines, last, Writer::Phases, rows, journal, alloc, frame, row_keys, (last_root, Rekey::Changed))
+    save(cx, store, lent, name, toolchain, tools, kept, printed, lines, last, Writer::Phases, rows, journal, alloc, frame, row_keys, (last_root, Rekey::Changed), workers)
 }
 
 /// [`save_edit`] keying every page into the reach root: the page edit test's planted control.
@@ -1199,7 +1207,7 @@ pub(crate) fn save_edit_rekeying_all<'m, D: Driver, S: Sharing>(
     frame: &Frame,
     last_root: Option<Key>,
 ) -> Result<Saved, CliError> {
-    save(cx, store, lent, name, toolchain, tools, kept, printed, lines, last, Writer::Phases, rows, journal, alloc, frame, &[], (last_root, Rekey::All))
+    save(cx, store, lent, name, toolchain, tools, kept, printed, lines, last, Writer::Phases, rows, journal, alloc, frame, &[], (last_root, Rekey::All), core::num::NonZeroU32::MIN)
 }
 
 /// The `Ready` driver's commit of an edit (D187, engine_ready_check.rs): `kept`'s changed rows
@@ -1224,11 +1232,14 @@ pub(crate) fn save_changes<'m, D: Driver, S: Sharing>(
     alloc: SharedAlloc<'_>,
     frame: &Frame,
     row_keys: &[Key],
-    last_root: Option<Key>,
+    (last_root, workers): (Option<Key>, core::num::NonZeroU32),
 ) -> Result<Saved, CliError> {
-    save(cx, store, lent, name, toolchain, tools, kept, printed, lines, Some(last), Writer::Ready, rows, journal, alloc, frame, row_keys, (last_root, Rekey::Changed))
+    save(cx, store, lent, name, toolchain, tools, kept, printed, lines, Some(last), Writer::Ready, rows, journal, alloc, frame, row_keys, (last_root, Rekey::Changed), workers)
 }
 
+const SAVE_TASK_FRAME: usize = 64 << 10;
+
+#[inline(never)]
 #[expect(clippy::too_many_arguments, reason = "the write's inputs, each one handle")]
 fn save<'m, D: Driver, S: Sharing>(
     cx: &Cx,
@@ -1248,9 +1259,53 @@ fn save<'m, D: Driver, S: Sharing>(
     frame: &Frame,
     row_keys: &[Key],
     (last_root, rekey): (Option<Key>, Rekey),
+    workers: core::num::NonZeroU32,
 ) -> Result<Saved, CliError> {
     let encoded = match last {
-        Some(stored) => pages::encode_changes(kept, stored.root, alloc).map_err(page_error)?,
+        Some(stored) => {
+            let mut pool_err: Option<CliError> = None;
+            let encoded = pages::encode_changes_with(kept, stored.root, alloc, |jobs| {
+                let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc);
+                if jobs.len() <= 4 || workers.get() <= 1 {
+                    for job in jobs {
+                        out.push(job.run(alloc));
+                    }
+                    return out;
+                }
+                let chunk = jobs.len().div_ceil(usize::try_from(workers.get()).unwrap_or(1)).max(1);
+                let scope = cx.scope();
+                scope.narrow_workers(workers, bstd::task::Class::Foreground);
+                let mut handles = blaze_own::Vec::with_capacity_in(jobs.len().div_ceil(chunk), alloc);
+                for slice in jobs.chunks(chunk) {
+                    handles.push(scope.may_overlap("answer pages", SAVE_TASK_FRAME, move |_cx: &Cx| -> Result<_, core::convert::Infallible> {
+                        let mut part = blaze_own::Vec::with_capacity_in(slice.len(), alloc);
+                        for job in slice {
+                            part.push(job.run(alloc));
+                        }
+                        Ok(part)
+                    }));
+                }
+                for handle in handles {
+                    match handle.join(cx) {
+                        Ok(part) => out.extend(part),
+                        Err(error) => {
+                            pool_err.get_or_insert(CliError::Pool(error));
+                        }
+                    }
+                }
+                if let Err(error) = scope.join(cx) {
+                    pool_err.get_or_insert(CliError::Pool(error));
+                }
+                if pool_err.is_some() {
+                    out.clear();
+                }
+                out
+            }).map_err(page_error)?;
+            if let Some(error) = pool_err {
+                return Err(error);
+            }
+            encoded
+        }
         None => pages::encode(kept, None, alloc),
     };
     // The encoder's puts are the new pages and the root (pages.rs `encode`).
@@ -1277,10 +1332,50 @@ fn save<'m, D: Driver, S: Sharing>(
             saved.largest_new_page = saved.largest_new_page.max(len);
         }
     }
-    let (headers, writes) = Headers::after(last.map(|base| base.headers), kept, writer, kept.answer.serial, HeadersPlant::None, |index| match last {
+    let mut header_pool_err: Option<CliError> = None;
+    let (headers, writes) = Headers::after_with(last.map(|base| base.headers), kept, writer, kept.answer.serial, HeadersPlant::None, |index| match last {
         Some(base) => base.headers_at(index),
         None => Ok(None),
-    }, alloc).map_err(page_error)?;
+    }, alloc, |jobs| {
+        let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc);
+        if jobs.len() <= 4 || workers.get() <= 1 {
+            for job in jobs {
+                out.push(job.run(alloc));
+            }
+            return out;
+        }
+        let chunk = jobs.len().div_ceil(usize::try_from(workers.get()).unwrap_or(1)).max(1);
+        let scope = cx.scope();
+        scope.narrow_workers(workers, bstd::task::Class::Foreground);
+        let mut handles = blaze_own::Vec::with_capacity_in(jobs.len().div_ceil(chunk), alloc);
+        for slice in jobs.chunks(chunk) {
+            handles.push(scope.may_overlap("answer headers", SAVE_TASK_FRAME, move |_cx: &Cx| -> Result<_, core::convert::Infallible> {
+                let mut part = blaze_own::Vec::with_capacity_in(slice.len(), alloc);
+                for job in slice {
+                    part.push(job.run(alloc));
+                }
+                Ok(part)
+            }));
+        }
+        for handle in handles {
+            match handle.join(cx) {
+                Ok(part) => out.extend(part),
+                Err(error) => {
+                    header_pool_err.get_or_insert(CliError::Pool(error));
+                }
+            }
+        }
+        if let Err(error) = scope.join(cx) {
+            header_pool_err.get_or_insert(CliError::Pool(error));
+        }
+        if header_pool_err.is_some() {
+            out.clear();
+        }
+        out
+    }).map_err(page_error)?;
+    if let Some(error) = header_pool_err {
+        return Err(error);
+    }
     saved.new_headers = writes.len() as u32;
     for (key, bytes) in &writes {
         store.put(cx, *key, bytes)?;
@@ -1378,6 +1473,9 @@ fn save<'m, D: Driver, S: Sharing>(
     // automatically reuses pre-warmed `core`/`alloc`/`std`/`bstd`.
     keep_toolchain_base(cx, store, lent, toolchain, tools, kept, alloc, frame)?;
     store.pin(name, &[key])?;
+    // Reset `<name>.journal` to `[key]` (reusing the exact same 32-byte root record as `name`)
+    // so subsequent runs do not probe older segments for a stale checkpoint of an earlier answer.
+    store.pin(crate::journal_checkpoint::name(name, frame).as_str(), &[key])?;
     // This answer as its workspace's newest base: a checkout of it with none of its own starts
     // from it ([`BASES_ROOT`]). The control keeps the one home-wide pointer instead.
     #[cfg(test)]

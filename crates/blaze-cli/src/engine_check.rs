@@ -1581,7 +1581,7 @@ fn checking<'f>(
                     crate::engine_units::discover(cx, root, &mut store, &mut laid_here, units, tools, &back, stood, &env, board, frame)?
                 };
                 phases.mark_cx(cx, discovered.cause.phase(), frame);
-                let kept = Kept { slots: &today_slots, answer: &start, records: &records, tools: &tools, read: core::cell::Cell::new(0) };
+                let kept = Kept { slots: &today_slots, answer: &start, records: &records, stored: stored.as_ref(), tools: &tools, read: core::sync::atomic::AtomicU32::new(0) };
                 // The last answer's found files (D161, [`PLACE_FOUND`]), sorted: the walk takes each
                 // it does not reach from the roots ([`plan`]).
                 let mut found_last: SVec<'_, (Name, blaze_engine::pages::FilePlace)> = SVec::new_in(alloc);
@@ -1592,7 +1592,7 @@ fn checking<'f>(
                     let cx = cx.span(FILE_WALK_SPAN);
                     plan(&cx, root, &stamps, &laid_here, workers, &kept, &mut store, discovered.names.as_ref(), &found_last, Some(linting.rules), alloc)?
                 };
-                discovered.plan.files_read = kept.read.get();
+                discovered.plan.files_read = kept.read.load(core::sync::atomic::Ordering::Relaxed);
                 discovered.plan.files_total = file_counts.read_back.saturating_add(file_counts.outlined);
                 // Each file's row in the leaf table, so the next request's sweep proves it unchanged
                 // by its stamp alone (engine_answer.rs).
@@ -1818,14 +1818,14 @@ fn checking<'f>(
             if let Some(&name) = names_missing.get() {
                 return Err(EngineCheckError::MissingRecord { name }.into());
             }
-            let kept = Kept { slots: &[], answer: &start, records: &records, tools: &tools, read: core::cell::Cell::new(0) };
+            let kept = Kept { slots: &[], answer: &start, records: &records, stored: Some(last), tools: &tools, read: core::sync::atomic::AtomicU32::new(0) };
             // The planted control (engine_ready_edit.rs `CommitPlant::ReadsNoVisitedTree`).
             let closed: &[Name] = match ready_plant {
                 crate::engine_ready_edit::CommitPlant::ReadsNoVisitedTree => &[],
                 _ => &closed,
             };
             let unread = read_needed(cx, root, &stamps, &kept, &mut store, &deferred, (closed, owed.as_slice()), &mut outlined, &mut file_counts, Some(linting.rules), alloc)?;
-            discovered.plan.files_read = discovered.plan.files_read.saturating_add(kept.read.get());
+            discovered.plan.files_read = discovered.plan.files_read.saturating_add(kept.read.load(core::sync::atomic::Ordering::Relaxed));
             let mut unread_files: Vec<Name, blaze_own::Alloc<'static>> = Vec::with_capacity_in(unread.files.len(), g);
             unread_files.extend_from_slice(&unread.files);
             bodies.unread_outlines(unread_files);
@@ -2128,8 +2128,8 @@ fn checking<'f>(
         // either: the ready path's writes the pages its changed rows sit on and no header shard
         // (engine_answer.rs `save_changes`); the phase path's rewrites the shards too (`save_edit`).
         let saved = match (chosen, stored.as_ref()) {
-            (crate::engine_ready_edit::Chosen::Wake { .. }, Some(last)) => crate::engine_answer::save_changes(cx, &mut store, &opened.lent, &answer_root, toolchain, &tools, &kept_answer, printed, (lines_key, &lines_bytes), last, &rows, &journal, alloc, frame, &kept_beside[..], pointer.as_ref().map(|pointer| pointer.root)),
-            _ => crate::engine_answer::save_edit(cx, &mut store, &opened.lent, &answer_root, toolchain, &tools, &kept_answer, printed, (lines_key, &lines_bytes), stored.as_ref(), &rows, &journal, alloc, frame, &kept_beside[..], pointer.as_ref().map(|pointer| pointer.root)),
+            (crate::engine_ready_edit::Chosen::Wake { .. }, Some(last)) => crate::engine_answer::save_changes(cx, &mut store, &opened.lent, &answer_root, toolchain, &tools, &kept_answer, printed, (lines_key, &lines_bytes), last, &rows, &journal, alloc, frame, &kept_beside[..], (pointer.as_ref().map(|pointer| pointer.root), workers)),
+            _ => crate::engine_answer::save_edit(cx, &mut store, &opened.lent, &answer_root, toolchain, &tools, &kept_answer, printed, (lines_key, &lines_bytes), stored.as_ref(), &rows, &journal, alloc, frame, &kept_beside[..], (pointer.as_ref().map(|pointer| pointer.root), workers)),
         }?;
         if let Some(sweep) = script_sweep.as_mut() { sweep.keep(cx, &mut store, answer_root.as_str(), &rows, frame)?; sweep_counts.status = Some(sweep.counts()); }
         let stored_keys = crate::engine_answer::StoredKeys::of(&saved, stored.as_ref());
@@ -2703,11 +2703,12 @@ fn certified<'m, 'f, D: blaze_core::Driver, S: crate::store::Sharing>(
     // The certificate stood on this pointer at this replay's places: when due, they are kept as
     // its journal checkpoint, riding the commit after (journal_checkpoint.rs).
     journal_counts.written = crate::journal_checkpoint::after_certificate(cx, store, answer_root, pointer.key, chosen, now_places.stored(), crate::journal_checkpoint::DUE_EVENTS, frame)?;
+    let journal_root = crate::journal_checkpoint::name(answer_root, frame);
     let seeds_root = crate::engine_seeds::root_name(tools, frame);
     if view_hit {
-        store.renew(&[answer_root, reach.as_str(), answer_index.as_str(), view_slot.name.as_str(), seeds_root.as_str()], toolchain)?;
+        store.renew(&[answer_root, reach.as_str(), answer_index.as_str(), journal_root.as_str(), view_slot.name.as_str(), seeds_root.as_str()], toolchain)?;
     } else {
-        store.renew(&[answer_root, reach.as_str(), answer_index.as_str(), seeds_root.as_str()], toolchain)?;
+        store.renew(&[answer_root, reach.as_str(), answer_index.as_str(), journal_root.as_str(), seeds_root.as_str()], toolchain)?;
     }
     crate::store::Store::after_answer(store, cx, &mut blaze_drive::profile::Profile::default())?;
     Ok((status, tally))
@@ -3801,7 +3802,7 @@ fn ready_setup<'f, 'h, 'a>(
     let mut deferred: SVec<'h, (Want<'h>, sweep::Probed)> = SVec::new_in(alloc);
     let mut slots = 0u32;
     let mut files = Files::default();
-    let kept = Kept { slots: &[], answer: start, records, tools, read: core::cell::Cell::new(0) };
+    let kept = Kept { slots: &[], answer: start, records, stored: None, tools, read: core::sync::atomic::AtomicU32::new(0) };
     for (at, leaf) in followed.now.rows.iter().enumerate() {
         let slot = followed.now.path(leaf);
         rows.push(leaf.kind, leaf.flags, slot, leaf.stamp, leaf.id);
@@ -3897,7 +3898,7 @@ fn ready_setup<'f, 'h, 'a>(
     outlined.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     deferred.sort_unstable_by(|a, b| a.0.name.cmp(&b.0.name));
     let skipped = Skipped { files: skipped_files, targets: SVec::new_in(alloc), carried: true };
-    Ok(Ok(ReadySetup { rows, names, graph, outlined, deferred, slots, files, skipped, places, rows_read: kept.read.get() }))
+    Ok(Ok(ReadySetup { rows, names, graph, outlined, deferred, slots, files, skipped, places, rows_read: kept.read.load(core::sync::atomic::Ordering::Relaxed) }))
 }
 
 /// What [`read_needed`] leaves: the deferred files not read back, by name and by the name of
@@ -3921,7 +3922,7 @@ fn read_needed<'h>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     stamps: &FromMeta,
-    kept: &Kept<'_, '_>,
+    kept: &Kept<'_, '_, '_>,
     store: &mut dyn crate::store::Store<'_>,
     deferred: &[(Want<'h>, sweep::Probed)],
     (closed, owed): (&[Name], &[Name]),
@@ -4922,6 +4923,7 @@ impl OutlinePlants {
 /// names say after their stages whether each is still read ([`serve_found`]). One whose slot the
 /// sweep did not follow is not walked: its rows go with the last answer's plan of it, and a
 /// names task that still reads it finds it again.
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn plan<'h, 'm>(
     cx: &Cx,
@@ -4929,7 +4931,7 @@ fn plan<'h, 'm>(
     stamps: &FromMeta,
     laid: &crate::units::Laid<'_>,
     workers: NonZeroU32,
-    kept: &Kept<'_, '_>,
+    kept: &Kept<'_, '_, '_>,
     store: &mut dyn crate::store::Store<'m>,
     names: Option<&crate::names::Names<'_>>,
     found_last: &[(Name, blaze_engine::pages::FilePlace)],
@@ -4984,49 +4986,172 @@ fn plan<'h, 'm>(
         let scope = cx.scope();
         scope.narrow_workers(workers, Class::Foreground);
         // One a file of the wave: project-sized, so never in the command's fixed frame.
-        // Each want of the wave in its order: read back on this thread, or a worker's handle.
+        // Each want of the wave in its order: read back (in parallel chunks from the lock-free
+        // snapshot when a stored answer is open), or a worker's `outline_one` handle.
         let mut handles = Vec::with_capacity_in(wave.len(), alloc);
         let mut stopped = None;
-        for want in wave.iter() {
-            let known = kept.slot(want);
-            let standing = match known {
-                Some(probed) => match kept.stood(want, probed) {
-                    Ok(standing) => standing.map(|one| (probed, one)),
+        if let Some(stored) = kept.stored && wave.len() >= 8 && workers.get() > 1 {
+            enum StandingErr {
+                Pages(blaze_engine::pages::PagesError),
+                MissingRecord(Name),
+                OutlineBack(crate::engine_store::OutlineBack),
+                Snapshot(blaze_cas::plain::SnapshotError),
+                NotUtf8,
+            }
+            impl StandingErr {
+                fn into_cli(self) -> CliError {
+                    match self {
+                        StandingErr::Pages(error) => crate::engine_answer::page_error(error),
+                        StandingErr::MissingRecord(name) => EngineCheckError::MissingRecord { name }.into(),
+                        StandingErr::OutlineBack(why) => EngineCheckError::OutlineBack(why).into(),
+                        StandingErr::Snapshot(error) => crate::store::PlaceError::Snapshot(error).into(),
+                        StandingErr::NotUtf8 => CliError::Text { what: "a path is not UTF-8" },
+                    }
+                }
+            }
+            enum StandingOut<'h> {
+                Done(Outlined<'h>, sweep::Probed),
+                NeedStore { probed: sweep::Probed, key: blaze_drive::Key, source: blaze_ids::ContentId, outline_source: blaze_ids::ContentId },
+                NeedOutline { known: Option<sweep::Probed> },
+                Err(StandingErr),
+            }
+            let slots = kept.slots;
+            let tools = kept.tools;
+            let read = &kept.read;
+            let chunk = wave.len().div_ceil(usize::try_from(workers.get()).unwrap_or(1)).max(4);
+            let mut chunk_handles = Vec::with_capacity_in(wave.len().div_ceil(chunk), alloc);
+            for slice in wave.chunks(chunk) {
+                chunk_handles.push(scope.may_overlap("outline standing", 64 << 10, move |_cx: &Cx| -> Result<_, Infallible> {
+                    let mut out = Vec::with_capacity_in(slice.len(), alloc);
+                    for want in slice {
+                        let known = slot_of(slots, want);
+                        let Some(probed) = known else {
+                            out.push(StandingOut::NeedOutline { known: None });
+                            continue;
+                        };
+                        let standing = match stood_from_stored(stored, tools, read, want, probed) {
+                            Ok(Some(one)) => one,
+                            Ok(None) => {
+                                out.push(StandingOut::NeedOutline { known });
+                                continue;
+                            }
+                            Err(StoodErr::Pages(error)) => {
+                                out.push(StandingOut::Err(StandingErr::Pages(error)));
+                                continue;
+                            }
+                            Err(StoodErr::MissingRecord(name)) => {
+                                out.push(StandingOut::Err(StandingErr::MissingRecord(name)));
+                                continue;
+                            }
+                        };
+                        let (key, source, outline_source) = standing;
+                        match stored.snapshot_record(key) {
+                            Ok(Some(bytes)) => match crate::engine_store::outline_from(want.name, key, bytes, alloc) {
+                                Ok(record) => match core::str::from_utf8(&want.slot) {
+                                    Ok(slot) => {
+                                        let path = sweep::real_path_in(slot, probed.0, alloc);
+                                        out.push(StandingOut::Done(Outlined { name: want.name, path, source, outline_source, edition: want.edition, made: Ok(record) }, probed));
+                                    }
+                                    Err(_) => out.push(StandingOut::Err(StandingErr::NotUtf8)),
+                                },
+                                Err(why) => out.push(StandingOut::Err(StandingErr::OutlineBack(why))),
+                            },
+                            Ok(None) => out.push(StandingOut::NeedStore { probed, key, source, outline_source }),
+                            Err(error) => out.push(StandingOut::Err(StandingErr::Snapshot(error))),
+                        }
+                    }
+                    Ok(out)
+                }));
+            }
+            let mut wave_iter = wave.iter();
+            for chunk_handle in chunk_handles {
+                let part = match chunk_handle.join(cx) {
+                    Ok(part) => part,
                     Err(error) => {
-                        stopped.get_or_insert(error);
-                        handles.push(Err(Err(())));
+                        stopped.get_or_insert(CliError::Pool(error));
                         continue;
                     }
-                },
-                None => None,
-            };
-            match standing {
-                Some((probed, (key, source, outline_source))) => {
-                    // The store's own error stops the plan after the wave's workers are joined.
-                    let back = match store.get(cx, key) {
-                        Err(error) => Err(error),
-                        Ok(None) => Err(EngineCheckError::OutlineBack(crate::engine_store::OutlineBack::Missing { name: want.name, key }).into()),
-                        Ok(Some(held)) => crate::engine_store::outline_from(want.name, key, held.bytes, alloc).map_err(|why| EngineCheckError::OutlineBack(why).into()),
+                };
+                for item in part {
+                    let Some(want) = wave_iter.next() else {
+                        break;
                     };
-                    match back {
-                        Ok(record) => {
+                    match item {
+                        StandingOut::Done(one, probed) => {
                             files.read_back += 1;
-                            let scratch = cx.frame();
-                            let slot = core::str::from_utf8(&want.slot).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
-                            let mut path = SVec::new_in(alloc);
-                            path.extend_from_slice(&sweep::real_path(slot, probed.0, scratch));
-                            handles.push(Err(Ok((Outlined { name: want.name, path, source, outline_source, edition: want.edition, made: Ok(record) }, probed))));
+                            handles.push(Err(Ok((one, probed))));
                         }
-                        Err(error) => {
-                            stopped.get_or_insert(error);
+                        StandingOut::NeedStore { probed, key, source, outline_source } => {
+                            let back = match store.get(cx, key) {
+                                Err(error) => Err(error),
+                                Ok(None) => Err(EngineCheckError::OutlineBack(crate::engine_store::OutlineBack::Missing { name: want.name, key }).into()),
+                                Ok(Some(held)) => crate::engine_store::outline_from(want.name, key, held.bytes, alloc).map_err(|why| EngineCheckError::OutlineBack(why).into()),
+                            };
+                            match back {
+                                Ok(record) => {
+                                    files.read_back += 1;
+                                    let slot = core::str::from_utf8(&want.slot).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
+                                    let path = sweep::real_path_in(slot, probed.0, alloc);
+                                    handles.push(Err(Ok((Outlined { name: want.name, path, source, outline_source, edition: want.edition, made: Ok(record) }, probed))));
+                                }
+                                Err(error) => {
+                                    stopped.get_or_insert(error);
+                                    handles.push(Err(Err(())));
+                                }
+                            }
+                        }
+                        StandingOut::NeedOutline { known } => {
+                            files.outlined += 1;
+                            files.probed += u32::from(known.is_none());
+                            handles.push(Ok(scope.may_overlap("outline", TASK_FRAME, move |cx: &Cx| Ok::<_, Infallible>(outline_one(cx, root, stamps, want, known, lints, alloc)))));
+                        }
+                        StandingOut::Err(error) => {
+                            stopped.get_or_insert(error.into_cli());
                             handles.push(Err(Err(())));
                         }
                     }
                 }
-                None => {
-                    files.outlined += 1;
-                    files.probed += u32::from(known.is_none());
-                    handles.push(Ok(scope.may_overlap("outline", TASK_FRAME, move |cx: &Cx| Ok::<_, Infallible>(outline_one(cx, root, stamps, want, known, lints, alloc)))));
+            }
+        } else {
+            for want in wave.iter() {
+                let known = kept.slot(want);
+                let standing = match known {
+                    Some(probed) => match kept.stood(want, probed) {
+                        Ok(standing) => standing.map(|one| (probed, one)),
+                        Err(error) => {
+                            stopped.get_or_insert(error);
+                            handles.push(Err(Err(())));
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+                match standing {
+                    Some((probed, (key, source, outline_source))) => {
+                        // The store's own error stops the plan after the wave's workers are joined.
+                        let back = match store.get(cx, key) {
+                            Err(error) => Err(error),
+                            Ok(None) => Err(EngineCheckError::OutlineBack(crate::engine_store::OutlineBack::Missing { name: want.name, key }).into()),
+                            Ok(Some(held)) => crate::engine_store::outline_from(want.name, key, held.bytes, alloc).map_err(|why| EngineCheckError::OutlineBack(why).into()),
+                        };
+                        match back {
+                            Ok(record) => {
+                                files.read_back += 1;
+                                let slot = core::str::from_utf8(&want.slot).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
+                                let path = sweep::real_path_in(slot, probed.0, alloc);
+                                handles.push(Err(Ok((Outlined { name: want.name, path, source, outline_source, edition: want.edition, made: Ok(record) }, probed))));
+                            }
+                            Err(error) => {
+                                stopped.get_or_insert(error);
+                                handles.push(Err(Err(())));
+                            }
+                        }
+                    }
+                    None => {
+                        files.outlined += 1;
+                        files.probed += u32::from(known.is_none());
+                        handles.push(Ok(scope.may_overlap("outline", TASK_FRAME, move |cx: &Cx| Ok::<_, Infallible>(outline_one(cx, root, stamps, want, known, lints, alloc)))));
+                    }
                 }
             }
         }
@@ -5214,40 +5339,90 @@ impl RecordKeys<'_> {
 }
 
 /// Today's state of the slots followed by the sweep and the preceding answer.
-pub(crate) struct Kept<'k, 'a> {
+pub(crate) struct Kept<'k, 'a, 's> {
     slots: &'k [(&'k str, sweep::Probed)],
     answer: &'k Answer<'a>,
     records: &'k RecordKeys<'a>,
+    /// The open stored answer (when `answer` and `records` read directly from it with no overlay),
+    /// enabling a single header lookup per file and lock-free parallel standing read-backs.
+    stored: Option<&'k crate::engine_answer::Stored<'s>>,
     /// Today's tools: an outline row stands only under its key from today's outliner
     /// ([`Kept::stood`]): the stored answer is read under other tools too (engine_answer.rs
     /// "THE TOOLS").
     tools: &'k blaze_engine::Tools,
     /// The stored file rows read ([`Kept::stood`]), for the profile's `plan:` line.
-    read: core::cell::Cell<u32>,
+    read: core::sync::atomic::AtomicU32,
 }
 
-impl Kept<'_, '_> {
+fn slot_of(slots: &[(&str, sweep::Probed)], want: &Want<'_>) -> Option<sweep::Probed> {
+    let slot = core::str::from_utf8(&want.slot).ok()?;
+    let at = slots.binary_search_by(|(path, _)| (*path).cmp(slot)).ok()?;
+    let (_, probed) = *slots.get(at)?;
+    ((probed.0 & sweep::MODULE != 0) == want.module).then_some(probed)
+}
+
+enum StoodErr {
+    Pages(blaze_engine::pages::PagesError),
+    MissingRecord(Name),
+}
+
+fn stood_from_stored(
+    stored: &crate::engine_answer::Stored<'_>,
+    tools: &blaze_engine::Tools,
+    read: &core::sync::atomic::AtomicU32,
+    want: &Want<'_>,
+    probed: sweep::Probed,
+) -> Result<Option<(blaze_drive::Key, blaze_ids::ContentId, blaze_ids::ContentId)>, StoodErr> {
+    if probed.0 & (sweep::ABSENT | sweep::BOTH) != 0 {
+        return Ok(None);
+    }
+    read.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let Some(header) = stored.header(want.name).map_err(StoodErr::Pages)? else {
+        return Ok(None);
+    };
+    let row = header.facts;
+    if row.phase.stage != Stage::Outlines || row.failed {
+        return Ok(None);
+    }
+    let source = crate::engine_tasks::edition_source(probed.2, want.edition);
+    let outline_source = want.outline_source(source, probed.0);
+    // The key too: a row an older outliner wrote (its kind's producer moved) is outlined anew,
+    // as the engine would enter it (blaze-engine engine.rs `consider`, `KeyMoved`).
+    if row.source != outline_source || row.key != tools.key(want.name, &outline_source) {
+        return Ok(None);
+    }
+    let key = header.record.ok_or(StoodErr::MissingRecord(want.name))?;
+    Ok(Some((key, source, outline_source)))
+}
+
+impl Kept<'_, '_, '_> {
     /// The want's slot as the sweep found it today, when the last answer read it as this kind
     /// of slot (a `mod x;` slot or a named file).
     fn slot(&self, want: &Want<'_>) -> Option<sweep::Probed> {
-        let slot = core::str::from_utf8(&want.slot).ok()?;
-        let at = self.slots.binary_search_by(|(path, _)| (*path).cmp(slot)).ok()?;
-        let probed = self.slots[at].1;
-        ((probed.0 & sweep::MODULE != 0) == want.module).then_some(probed)
+        slot_of(self.slots, want)
     }
 
     /// A standing outline's record key, source with edition and source with placement.
     fn stood(&self, want: &Want<'_>, probed: sweep::Probed) -> Result<Option<(blaze_drive::Key, blaze_ids::ContentId, blaze_ids::ContentId)>, CliError> {
+        if let Some(stored) = self.stored {
+            return stood_from_stored(stored, self.tools, &self.read, want, probed).map_err(|error| match error {
+                StoodErr::Pages(error) => crate::engine_answer::page_error(error),
+                StoodErr::MissingRecord(name) => EngineCheckError::MissingRecord { name }.into(),
+            });
+        }
         if probed.0 & (sweep::ABSENT | sweep::BOTH) != 0 {
             return Ok(None);
         }
-        self.read.set(self.read.get().saturating_add(1));
+        self.read.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let Some(row) = self.answer.row_facts(want.name).map_err(EngineError::from)? else { return Ok(None) };
+        if row.phase.stage != Stage::Outlines || row.failed {
+            return Ok(None);
+        }
         let source = crate::engine_tasks::edition_source(probed.2, want.edition);
         let outline_source = want.outline_source(source, probed.0);
         // The key too: a row an older outliner wrote (its kind's producer moved) is outlined anew,
         // as the engine would enter it (blaze-engine engine.rs `consider`, `KeyMoved`).
-        if row.phase.stage != Stage::Outlines || row.failed || row.source != outline_source || row.key != self.tools.key(want.name, &outline_source) {
+        if row.source != outline_source || row.key != self.tools.key(want.name, &outline_source) {
             return Ok(None);
         }
         let key = self.records.get(want.name)?.ok_or(EngineCheckError::MissingRecord { name: want.name })?;
@@ -5298,7 +5473,7 @@ fn wants<'h>(
 /// Each found file of `found_last` (sorted by name) the walk has not reached, as a [`Want`] of
 /// `into` at the slot the sweep followed it at ([`Kept::slots`]), its place's crate root, edition,
 /// module form and found flags ([`plan`]). One the sweep did not follow is left: no slot today.
-fn found_wants<'h>(kept: &Kept<'_, '_>, found_last: &[(Name, blaze_engine::pages::FilePlace)], seen: &mut SSet<'h, Name>, into: &mut SVec<'h, Want<'h>>, alloc: SharedAlloc<'h>) -> Result<(), CliError> {
+fn found_wants<'h>(kept: &Kept<'_, '_, '_>, found_last: &[(Name, blaze_engine::pages::FilePlace)], seen: &mut SSet<'h, Name>, into: &mut SVec<'h, Want<'h>>, alloc: SharedAlloc<'h>) -> Result<(), CliError> {
     if found_last.is_empty() {
         return Ok(());
     }
