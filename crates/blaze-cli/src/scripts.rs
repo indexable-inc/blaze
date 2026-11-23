@@ -416,18 +416,19 @@ impl blaze_world::Tree for NoCheckout {
 
 static NO_CHECKOUT: NoCheckout = NoCheckout;
 
-/// Places only workspace path members for [`blaze_world::open_list`], without touching any
+/// Places only checkout path packages for [`blaze_world::open_list`], without touching any
 /// fetched registry or git package.
 struct MembersOnly<'f> {
-    members: &'f [(LockId, &'f str)],
+    members: &'f [blaze_world::CheckoutPath<'f>],
     lock: &'f Lock<'f>,
     bump: blaze_own::Bump<'f>,
 }
 
 impl<'f> blaze_world::Packages<'f> for MembersOnly<'f> {
     fn place(&mut self, package: LockId) -> Result<blaze_world::Place<'f>, blaze_world::WorldError<'f>> {
-        match self.members.iter().find(|(id, _)| *id == package) {
-            Some((_, dir)) => Ok(blaze_world::Place::Checkout { dir }),
+        match self.members.iter().find(|entry| entry.id == package) {
+            Some(blaze_world::CheckoutPath { dir, kind: blaze_world::PathKind::Member, .. }) => Ok(blaze_world::Place::Checkout { dir }),
+            Some(blaze_world::CheckoutPath { dir, kind: blaze_world::PathKind::External, .. }) => Ok(blaze_world::Place::Path { dir }),
             None => Err(blaze_world::WorldError::PathNotPlaced { package: self.bump.alloc_str(&self.lock.package(package).name) }),
         }
     }
@@ -441,7 +442,7 @@ impl<'f> Scripts<'f> {
         names: &crate::names::NamesWorld<'_>,
         graph_record: &'f [u8],
         lock: Option<&'f Lock<'static>>,
-        members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
+        members: Option<&[crate::graph::CheckoutDir]>,
         frame: &'f Frame,
     ) -> Result<Scripts<'f>, SetupError<'f>> {
         let by_subject = {
@@ -460,17 +461,17 @@ impl<'f> Scripts<'f> {
         names: &crate::names::Names<'f>,
         graph_record: &'f [u8],
         lock: Option<&'f Lock<'static>>,
-        members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
+        members: Option<&[crate::graph::CheckoutDir]>,
         frame: &'f Frame,
     ) -> Result<Scripts<'f>, SetupError<'f>> {
         let home = env.home.ok_or(SetupError::NoHome)?;
         let lock_ref: &'f Lock<'f> = lock.ok_or(SetupError::NoLock)?;
         let listed_members = members.ok_or(SetupError::NoMembers)?;
         let mut held_members = blaze_own::Vec::with_capacity_in(listed_members.len(), frame);
-        for (id, dir) in listed_members.iter() {
-            held_members.push((*id, crate::work::held_str(dir.as_str(), frame)));
+        for entry in listed_members.iter() {
+            held_members.push(blaze_world::CheckoutPath { id: entry.id, dir: crate::work::held_str(entry.dir.as_str(), frame), kind: entry.kind });
         }
-        let member_slice: &'f [(LockId, &'f str)] = held_members.into_bump_slice();
+        let member_slice: &'f [blaze_world::CheckoutPath<'f>] = held_members.into_bump_slice();
         let bump: blaze_own::Bump<'f> = frame.alloc(Erased::new(frame)).bump();
         let decoded = {
             let _cx = cx.span("scripts: unit graph decoded");
@@ -507,7 +508,7 @@ impl<'f> Scripts<'f> {
         by_subject: blaze_own::Vec<(ContentId, UnitId, Side), &'f Frame>,
         graph_record: &'f [u8],
         lock: Option<&'f Lock<'static>>,
-        members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
+        members: Option<&[crate::graph::CheckoutDir]>,
         frame: &'f Frame,
     ) -> Result<Scripts<'f>, SetupError<'f>> {
         if env.home.is_none() {
@@ -516,8 +517,8 @@ impl<'f> Scripts<'f> {
         let lock: &'f Lock<'f> = lock.ok_or(SetupError::NoLock)?;
         let listed = members.ok_or(SetupError::NoMembers)?;
         let mut held = blaze_own::Vec::with_capacity_in(listed.len(), frame);
-        for (id, dir) in listed.iter() {
-            held.push((*id, crate::work::held_str(dir.as_str(), frame)));
+        for entry in listed.iter() {
+            held.push((entry.id, crate::work::held_str(entry.dir.as_str(), frame)));
         }
         let members: &'f [(LockId, &'f str)] = held.into_bump_slice();
         let alloc: Alloc<'f> = env.heap.alloc();
@@ -780,7 +781,7 @@ pub(crate) fn job<'f: 'j, 'j>(
     tool: blaze_drive::Tool,
     workers: u32,
     lock: Option<&'f Lock<'static>>,
-    members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
+    members: Option<&[crate::graph::CheckoutDir]>,
     task: &Task<'_>,
     frame: &'f Frame,
     jobs: &'j Frame,

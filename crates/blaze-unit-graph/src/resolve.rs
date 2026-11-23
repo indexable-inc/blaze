@@ -267,9 +267,10 @@ impl<'l, 'a> Resolution<'l, 'a> {
         }
         if count > 1 {
             // Several of the name: by the kind of source, then by the requirement.
-            let kind_fits = |d: LockId| match (&dep.source, &self.lock.package(d).source) {
+            let kind_fits = |d: LockId, allow_patched_path: bool| match (&dep.source, &self.lock.package(d).source) {
                 (DepSource::Path, source) => core::mem::discriminant(source) == core::mem::discriminant(&me.source),
                 (DepSource::Registry { .. }, LockSource::Registry { .. }) => true,
+                (DepSource::Registry { .. } | DepSource::Git { .. }, LockSource::Path) => allow_patched_path,
                 (DepSource::Git { url }, LockSource::Git { url: locked, .. }) => url.trim_end_matches(".git") == locked.trim_end_matches(".git"),
                 _ => false,
             };
@@ -283,9 +284,19 @@ impl<'l, 'a> Resolution<'l, 'a> {
             found = None;
             count = 0;
             for d in named() {
-                if kind_fits(d) && req.as_ref().is_none_or(|req| req.matches(&self.lock.package(d).version)) {
+                if kind_fits(d, false) && req.as_ref().is_none_or(|req| req.matches(&self.lock.package(d).version)) {
                     found = Some(d);
                     count += 1;
+                }
+            }
+            if count == 0 {
+                // A `[patch.*]` entry can replace a registry or git dependency with a checkout
+                // path package (`LockSource::Path`).
+                for d in named() {
+                    if kind_fits(d, true) && req.as_ref().is_none_or(|req| req.matches(&self.lock.package(d).version)) {
+                        found = Some(d);
+                        count += 1;
+                    }
                 }
             }
         }

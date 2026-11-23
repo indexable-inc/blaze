@@ -55,19 +55,19 @@ pub type MacroCrates = std::vec::Vec<(ContentId, Result<MacroIdentity, Unidentif
 pub(crate) struct Place<'p, 'r> {
     pub home: Option<&'p str>,
     pub checkout: &'p str,
-    pub members: Option<&'p [(LockId, blaze_unit_graph::Text<'static>)]>,
+    pub members: Option<&'p [crate::graph::CheckoutDir]>,
     pub rows: &'p crate::sweep::Rows<'r>,
 }
 
 impl Place<'_, '_> {
-    /// The files digest of the member `id` (hex, `blaze_proc_macro::module::files_digest`) as
-    /// its `MacroFiles` row holds it: what a path macro crate's module key holds, by
+    /// The files digest of the checkout path package `id` (hex, `blaze_proc_macro::module::files_digest`)
+    /// as its `MacroFiles` row holds it: what a path macro crate's module key holds, by
     /// package-relative paths and bytes (rule 25), and what the lookup's own key holds through
-    /// the units' source (rule 21); `None` for a package that is no member, or a member no row
-    /// of which was read (then `PathWithoutFolder`, by name).
+    /// the units' source (rule 21); `None` for a package with no checkout folder or no row
+    /// read (then `PathWithoutFolder`, by name).
     pub(crate) fn member_files(&self, id: LockId) -> Option<std::string::String> {
-        let (_, dir) = self.members?.iter().find(|(member, _)| *member == id)?;
-        crate::macro_files::member_hex(self.rows, dir.as_str())
+        let entry = self.members?.iter().find(|entry| entry.id == id)?;
+        crate::macro_files::member_hex(self.rows, entry.dir.as_str())
     }
 
     /// The checkout as the bootstrap tool's `checkout` input takes it.

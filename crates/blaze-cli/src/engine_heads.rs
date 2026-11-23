@@ -1523,9 +1523,12 @@ pub(crate) fn outline_head_source(outline: &blaze_file_items::Outline<'_>, at: I
 /// `signature_name`: the file and the entry's chain), so its name and key are known from text
 /// before any phase runs. Its source is the persisted signature part ([`outline_head_source`])
 /// and the edition.
-pub(crate) fn plan_items<'h>(outlined: &[Outlined<'_>], alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
+pub(crate) fn plan_items<'h>(outlined: &[Outlined<'_>], external: &[Name], alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
     let mut planned = SVec::new_in(alloc);
     for one in outlined.iter() {
+        if external.binary_search(&one.name).is_ok() {
+            continue;
+        }
         let Ok(record) = &one.made else { continue };
         for part in record.parts.iter() {
             let (Kind::Signature, Locate::Source(head)) = (part.name.kind, part.locate) else { continue };

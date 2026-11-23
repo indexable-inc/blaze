@@ -727,3 +727,63 @@ fn an_old_crate_list_is_refused_by_name() {
     }
     std::println!("crate list: an old list: {words}");
 }
+
+/// An external checkout path package (`Place::Path`, e.g. `[patch.crates-io]` or an excluded path
+/// dependency) lives in tree 0 (`/0/<dir>/...`) so `FileItems` and edits invalidate cleanly, yet
+/// has `member == false` and `SeenRoot::Package` (not checked as a workspace member) and round-trips
+/// through `CrateList` with zero differences.
+#[test]
+fn external_checkout_path_package_is_tree_zero_non_member() {
+    use crate::crate_list::{CrateList, differences, encode};
+    const PATCH_LOCK: &str = "\
+version = 4
+
+[[package]]
+name = \"app\"
+version = \"0.1.0\"
+dependencies = [\"patched\"]
+
+[[package]]
+name = \"patched\"
+version = \"0.1.0\"
+";
+    let lock: &'static Lock<'static> = StdBox::leak(StdBox::new(Lock::read(PATCH_LOCK.as_bytes(), a()).expect("lock")));
+    let mut units = AVec::new_in(a());
+    units.push(unit(lock, "patched", UnitKind::Lib, false, &[]));
+    units.push(unit(lock, "app", UnitKind::Lib, false, &[("patched", 0)]));
+    let graph: &'static UnitGraph<'static> =
+        StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()), left_out: AVec::new_in(a()) }));
+    struct PatchPlaces {
+        app: LockId,
+        patched: LockId,
+    }
+    impl Packages<'static> for PatchPlaces {
+        fn place(&mut self, id: LockId) -> Result<Place<'static>, WorldError<'static>> {
+            if id == self.app {
+                Ok(Place::Checkout { dir: "crates/app" })
+            } else if id == self.patched {
+                Ok(Place::Path { dir: "vendor/patched" })
+            } else {
+                Err(WorldError::PathNotPlaced { package: "unknown" })
+            }
+        }
+    }
+    let mut places = PatchPlaces { app: lock.named("app").next().expect("app"), patched: lock.named("patched").next().expect("patched") };
+    let (id, mut shelf) = shelf(false);
+    let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut places, b()).unwrap_or_else(|e| panic!("{e}"));
+    let listed = StdBox::leak(StdBox::new(listed));
+    let w = world(graph, lock, listed, &mut places, &NoFiles, b()).unwrap_or_else(|e| panic!("{e}"));
+    let app_at = w.crates.iter().position(|c| c.input.name == "app").expect("app crate");
+    let patched_at = w.crates.iter().position(|c| c.input.name == "patched").expect("patched crate");
+    assert!(w.crates[app_at].member, "workspace member must have member == true");
+    assert!(!w.crates[patched_at].member, "external checkout path package must have member == false");
+    assert_eq!(w.crates[app_at].input.root, "/0/crates/app/src/lib.rs");
+    assert_eq!(w.crates[patched_at].input.root, "/0/vendor/patched/src/lib.rs");
+    let bytes = encode(&w, &|_| None, a()).unwrap_or_else(|e| panic!("{e}"));
+    let list = CrateList::open(&bytes).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(differences(&w, &list), 0);
+    assert!(list.member(app_at));
+    assert!(!list.member(patched_at));
+    assert_eq!(list.root(patched_at), "/0/vendor/patched/src/lib.rs");
+    assert_eq!(list.env_facts(patched_at).seen, blaze_scope::crate_env::SeenRoot::Package);
+}

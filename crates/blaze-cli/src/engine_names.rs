@@ -108,7 +108,7 @@ pub(crate) struct NamesStage<'f> {
 pub(crate) struct Handles<'h, 'f> {
     pub(crate) root: &'h Dir<ReadWrite>,
     pub(crate) lock: Option<&'f blaze_manifest::lock::Lock<'static>>,
-    pub(crate) members: Option<&'h [(blaze_manifest::lock::LockId, blaze_unit_graph::Text<'static>)]>,
+    pub(crate) members: Option<&'h [crate::graph::CheckoutDir]>,
     pub(crate) env: &'h FetchEnv<'h>,
     pub(crate) side: Option<&'h crate::proc_runner::MacroSide<'h, 'h, 'h>>,
     pub(crate) outlined: &'h [Outlined<'h>],
@@ -1657,7 +1657,7 @@ impl Job<'_> {
             }
             (env, _) => env,
         };
-        let job = ScopeJob { workers: self.workers, kept: self.kept, at: self.at, input: CrateInput { deps: &own_deps, ..input }, deps: &exports, sysroot, packs: self.packs.into(), corrected: self.corrected, env, procs: self.procs, oracle: self.oracle, clock: self.clock, board: Some(self.board) };
+        let job = ScopeJob { workers: self.workers, kept: self.kept, at: self.at, member: krate.member, input: CrateInput { deps: &own_deps, ..input }, deps: &exports, sysroot, packs: self.packs.into(), corrected: self.corrected, env, procs: self.procs, oracle: self.oracle, clock: self.clock, board: Some(self.board) };
         let (resolved, ok, unresolved, oracle) = match crate::names::resolve(cx, root, &job, cx.frame()).0 {
             Resolution::Made { resolved, ok, unresolved, oracle } => (resolved, ok, unresolved, oracle),
             Resolution::Need(keys) => return need(&keys),
@@ -1691,7 +1691,7 @@ impl Job<'_> {
                     (true, Some(dir)) => blaze_own::format_in!(local, "{dir}.rs"),
                     _ => blaze_own::String::from_str_in(need.path, local),
                 };
-                let want = crate::engine_check::FoundWant { slot: slot.as_str(), module, edition: if module { edition } else { blaze_drive::record::DATA_FILE }, root: unit_root };
+                let want = crate::engine_check::FoundWant { slot: slot.as_str(), module, edition: if module { edition } else { blaze_drive::record::DATA_FILE }, root: unit_root, external: !krate.member };
                 let (one, probed) = crate::engine_check::outline_found(cx, root, &self.serve.stamps, &want, self.serve.plants, self.kept).map_err(WorkerError::Unread)?;
                 found.read.push(one.name);
                 found.probes.push((SVec::from_slice_in(slot.as_bytes(), self.kept), probed, module));

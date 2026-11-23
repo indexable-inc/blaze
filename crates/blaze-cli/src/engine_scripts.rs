@@ -129,7 +129,7 @@ enum ModuleJob<'a> {
 struct MacroInputs<'a> {
     graph: &'a [u8],
     lock: &'a [u8],
-    members: &'a [(blaze_manifest::lock::LockId, &'a str, ContentId)],
+    members: &'a [(blaze_manifest::lock::LockId, &'a str, blaze_world::PathKind, ContentId)],
 }
 
 enum ModuleAnswer {
@@ -197,8 +197,8 @@ impl ModuleJob<'_> {
                 let mut members = Vec::new_in(frame);
                 let lock = match initial {
                     Some(input) => {
-                        for &(id, dir, digest) in input.members {
-                            members.push((id, blaze_unit_graph::Text::from_str_in(dir, heap.alloc())));
+                        for &(id, dir, kind, digest) in input.members {
+                            members.push(crate::graph::CheckoutDir { id, dir: blaze_unit_graph::Text::from_str_in(dir, heap.alloc()), kind });
                             rows.push(crate::sweep::LeafKind::MacroFiles, 0, dir, None, digest);
                         }
                         match crate::fetch::Lockfile::read(input.lock, heap, frame) {
@@ -1316,8 +1316,8 @@ impl<'f> ScriptsStage<'f> {
                 let mut members = Vec::new_in(queue.jobs);
                 for leaf in side.place.rows.of(crate::sweep::LeafKind::MacroFiles).filter(|leaf| !leaf.absent()) {
                     let path = side.place.rows.path(leaf);
-                    if let Some((id, _)) = side.place.members.and_then(|all| all.iter().find(|(_, dir)| dir.as_str() == path)) {
-                        members.push((*id, work::held_str(path, queue.jobs), leaf.id));
+                    if let Some(entry) = side.place.members.and_then(|all| all.iter().find(|entry| entry.dir.as_str() == path)) {
+                        members.push((entry.id, work::held_str(path, queue.jobs), entry.kind, leaf.id));
                     }
                 }
                 queue.macro_inputs = Some(MacroInputs { graph: queue.jobs.alloc(bytes).as_slice(), lock: side.lock.text, members: members.into_bump_slice() });

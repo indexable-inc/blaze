@@ -1139,7 +1139,7 @@ fn print_procs(t: usize, p: &Procs) {
 /// each proc-macro crate registered by its lock identity (registry checksum, a path package's
 /// files, a git commit and folder: the folder from the store's module identities, as the lock
 /// does not say it).
-fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, root: &FsPath, world: &World<'static>, graph: &UnitGraph<'static>, lock: &Lock<'static>, paths: &[(LockId, &'static str)], places: &mut P, heap: &'static blaze_own::Heap) -> Procs {
+fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, root: &FsPath, world: &World<'static>, graph: &UnitGraph<'static>, lock: &Lock<'static>, paths: &[blaze_world::CheckoutPath<'static>], places: &mut P, heap: &'static blaze_own::Heap) -> Procs {
     use blaze_proc_macro::hook::ProcMacros;
     let runtime: &'static blaze_proc_macro::host::Runtime = Box::leak(Box::new(blaze_proc_macro::host::Runtime::timed(proc_clock, heap).unwrap_or_else(|e| panic!("the proc-macro runtime: {e}"))));
     let records: &'static blaze_proc_macro::record::DirStore = Box::leak(Box::new(blaze_proc_macro::record::DirStore::new(out)));
@@ -1165,6 +1165,7 @@ fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, roo
                         workspace: root.to_path_buf(),
                         root: blaze_proc_macro::script_sandbox::ScriptRoot::member(dir).unwrap_or_else(|e| panic!("{}: {e}", c.package)),
                     },
+                    blaze_world::Place::Path { dir } => blaze_proc_macro::sandbox::Files::Folder(root.join(dir)),
                     blaze_world::Place::Pack { view, dir } => sandbox_files(PackageAt::Pack { view, dir }),
                 };
                 env.push(("CARGO_MANIFEST_DIR".to_string(), files.seen().to_string()));
@@ -1183,7 +1184,7 @@ fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, roo
             macro_units.push((i, &graph.units[uid.0 as usize]));
         }
     }
-    let path_dir = |id: LockId| paths.iter().find(|(p, _)| *p == id).map(|(_, dir)| root.join(dir));
+    let path_dir = |id: LockId| paths.iter().find(|p| p.id == id).map(|p| root.join(p.dir));
     let made = blaze_world::procs::register_macro_crates(&mut procs, store, lock, macro_units, path_dir).unwrap_or_else(|e| panic!("{e}"));
     for (i, why) in &made.unregistered {
         println!("procs         {} {}: not registered: {why:?}", world.crates[*i].package, world.crates[*i].version);
@@ -1595,7 +1596,7 @@ fn main() {
     let resolver = Resolver::of(written, ws.root_edition).unwrap_or_else(|_| panic!("unknown resolver {written:?}"));
     let mut roots_ids = AVec::new_in(g());
     let mut members = Vec::new();
-    let mut paths: Vec<(LockId, &'static str)> = Vec::new();
+    let mut paths: Vec<blaze_world::CheckoutPath<'static>> = Vec::new();
     for m in ws.members.iter() {
         let Some(id) = lock.named(&m.name).find(|id| matches!(lock.package(*id).source, LockSource::Path)) else {
             println!("member {} is not in Cargo.lock as a path package", m.name.as_str());
@@ -1603,7 +1604,7 @@ fn main() {
         };
         roots_ids.push(id);
         members.push((id, Package::from_member(m, g())));
-        paths.push((id, Box::leak(m.dir.as_str().to_string().into_boxed_str())));
+        paths.push(blaze_world::CheckoutPath { id, dir: Box::leak(m.dir.as_str().to_string().into_boxed_str()), kind: blaze_world::PathKind::Member });
     }
     let ask: &'static Ask<'static> = Box::leak(Box::new(Ask { roots: roots_ids, features: AVec::new_in(g()), all_features: false, no_default_features: false, tests: args.iter().any(|a| a == "--tests") }));
     let target: &'static TargetDesc<'static> = Box::leak(Box::new(mac()));

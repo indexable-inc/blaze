@@ -104,19 +104,32 @@ pub fn members_lock<'f>(units: &layout::Units<'_>, frame: &'f Frame) -> &'f [u8]
     text.into_bump_slice()
 }
 
-/// The members as the layout read them, before the lock is matched: each one's facts, its
-/// toolchain line dropped, and the workspace's resolver.
+/// One checkout path package matched to its lock entry: a workspace member (`PathKind::Member`)
+/// or a non-member path package (`PathKind::External`, from `[patch.*]` or excluded/transitive
+/// path dependencies).
+pub struct CheckoutDir {
+    pub id: LockId,
+    pub dir: blaze_unit_graph::Text<'static>,
+    pub kind: blaze_world::PathKind,
+}
+
+/// The members (and non-member checkout path packages) as the layout read them, before the lock
+/// is matched: each one's facts, its toolchain line dropped, and the workspace's resolver.
 pub struct Members {
     packages: std::vec::Vec<Package<'static>, std::alloc::Global>,
     /// Each member's directory, anchor-relative (`""` for the root's own package), in
     /// `packages`' order: the names world reads each member's files under its own.
     dirs: Vec<blaze_unit_graph::Text<'static>, Alloc<'static>>,
+    /// Non-member checkout path packages (`[patch.*]`, excluded/transitive path deps): each with
+    /// its package facts, written version (if any), and checkout-relative directory.
+    path_packages: Vec<(Package<'static>, Option<blaze_unit_graph::Text<'static>>, blaze_unit_graph::Text<'static>), Alloc<'static>>,
     resolver: Result<Resolver, NoResolver>,
     written: Option<std::string::String>,
 }
 
 impl Members {
-    /// The facts of `units`' members, on the process's `heap` (they live as long as the command).
+    /// The facts of `units`' members and non-member path packages, on the process's `heap` (they
+    /// live as long as the command).
     pub fn of(units: &layout::Units<'_>, heap: &'static blaze_own::Heap) -> Members {
         let mut packages = std::vec::Vec::with_capacity_in(units.members.len(), std::alloc::Global);
         let mut dirs = Vec::with_capacity_in(units.members.len(), heap.alloc());
@@ -127,29 +140,76 @@ impl Members {
             packages.push(package);
             dirs.push(blaze_unit_graph::Text::from_str_in(member.dir.as_str(), heap.alloc()));
         }
+        let mut path_packages = Vec::with_capacity_in(units.path_packages.len(), heap.alloc());
+        for pkg in units.path_packages.iter() {
+            let mut package = Package::from_member(pkg, heap.alloc());
+            let blaze = pkg.edition.blaze.is_some();
+            package.deps.retain(|dep| !toolchain_line(blaze, dep.key.as_str(), dep.package.as_str()));
+            let version = pkg.version.as_ref().map(|v| blaze_unit_graph::Text::from_str_in(v.as_str(), heap.alloc()));
+            let dir = blaze_unit_graph::Text::from_str_in(pkg.dir.as_str(), heap.alloc());
+            path_packages.push((package, version, dir));
+        }
         let written = units.resolver.as_ref().map(|(text, _)| text.as_str());
-        Members { packages, dirs, resolver: Resolver::of(written, units.root_edition), written: written.map(std::string::String::from) }
+        Members { packages, dirs, path_packages, resolver: Resolver::of(written, units.root_edition), written: written.map(std::string::String::from) }
     }
 
-    /// Each member matched to its lock entry (a path entry of its name).
+    /// Each member matched to its lock entry (a path entry of its name), and each non-member
+    /// path package matched to its lock entry when the lock holds one (an unused `[patch]` entry
+    /// is absent from `Cargo.lock` and skipped).
     pub fn locked(self, lock: &Lock<'_>) -> Result<Parts, Unlocked> {
         let resolver = self.resolver.map_err(|NoResolver| Unlocked::Resolver { written: self.written.unwrap_or_default() })?;
+        let alloc = *self.dirs.allocator();
         let mut members = std::vec::Vec::with_capacity_in(self.packages.len(), std::alloc::Global);
+        let mut path_packages = Vec::with_capacity_in(self.path_packages.len(), alloc);
         // On the allocator the members' directories were made on (`Members::of`'s heap).
-        let mut dirs = Vec::with_capacity_in(self.packages.len(), *self.dirs.allocator());
+        let mut dirs = Vec::with_capacity_in(self.packages.len() + self.path_packages.len(), alloc);
+        let mut used: Vec<LockId, Alloc<'static>> = Vec::with_capacity_in(self.packages.len() + self.path_packages.len(), alloc);
         for (package, dir) in self.packages.into_iter().zip(self.dirs) {
             let mut ids = lock.named(package.name.as_str()).filter(|id| matches!(lock.package(*id).source, LockSource::Path));
             let found = (ids.next(), ids.next());
             drop(ids);
             match found {
                 (Some(id), None) => {
+                    used.push(id);
                     members.push((id, package));
-                    dirs.push((id, dir));
+                    dirs.push(CheckoutDir { id, dir, kind: blaze_world::PathKind::Member });
                 }
                 _ => return Err(Unlocked::Member { name: std::string::String::from(package.name.as_str()) }),
             }
         }
-        Ok(Parts { members, dirs, resolver })
+        for (package, version, dir) in self.path_packages {
+            let mut matched = None;
+            let mut count = 0usize;
+            for id in lock.named(package.name.as_str()).filter(|id| matches!(lock.package(*id).source, LockSource::Path)) {
+                if !used.contains(&id) {
+                    matched = Some(id);
+                    count += 1;
+                }
+            }
+            if count > 1 {
+                let want = version.as_deref().unwrap_or("0.0.0");
+                matched = None;
+                count = 0;
+                let mut buf = blaze_unit_graph::Text::new_in(alloc);
+                for id in lock.named(package.name.as_str()).filter(|id| matches!(lock.package(*id).source, LockSource::Path)) {
+                    if used.contains(&id) {
+                        continue;
+                    }
+                    buf.clear();
+                    let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("{}", lock.package(id).version));
+                    if buf.as_str() == want {
+                        matched = Some(id);
+                        count += 1;
+                    }
+                }
+            }
+            if let (Some(id), 1) = (matched, count) {
+                used.push(id);
+                path_packages.push((id, package));
+                dirs.push(CheckoutDir { id, dir, kind: blaze_world::PathKind::External });
+            }
+        }
+        Ok(Parts { members, path_packages, dirs, resolver })
     }
 }
 
@@ -171,17 +231,20 @@ impl core::fmt::Display for Unlocked {
     }
 }
 
-/// The members matched to the lock, with the resolver.
+/// The members (and matched non-member checkout path packages) matched to the lock, with the
+/// resolver.
 pub struct Parts {
     members: std::vec::Vec<(LockId, Package<'static>), std::alloc::Global>,
-    /// Each member's lock entry and its directory, anchor-relative, in `members`' order.
-    dirs: Vec<(LockId, blaze_unit_graph::Text<'static>), Alloc<'static>>,
+    path_packages: Vec<(LockId, Package<'static>), Alloc<'static>>,
+    /// Each checkout path package's lock entry, directory (anchor-relative), and kind
+    /// (workspace member or external path package).
+    dirs: Vec<CheckoutDir, Alloc<'static>>,
     resolver: Resolver,
 }
 
 impl Parts {
-    /// Each member's lock entry and its directory, anchor-relative, in the layout's order.
-    pub fn member_dirs(&self) -> &[(LockId, blaze_unit_graph::Text<'static>)] {
+    /// Each checkout path package's lock entry, directory (anchor-relative), and kind.
+    pub fn member_dirs(&self) -> &[CheckoutDir] {
         &self.dirs
     }
 }
@@ -193,9 +256,9 @@ pub struct Graph<'f> {
     inputs: UnitGraphInputs<'f, 'static>,
     /// The records mapped so far, by key, sorted: a re-entry maps nothing again.
     mapped: Vec<(ContentId, &'f [u8]), &'f Frame>,
-    /// Each member's lock entry and its directory, anchor-relative (`""` for the root's own
-    /// package): where the names world reads that member's files ([`Graph::member_dirs`]).
-    dirs: Vec<(LockId, blaze_unit_graph::Text<'static>), Alloc<'static>>,
+    /// Each checkout path package's lock entry, directory (anchor-relative), and kind: where
+    /// the names world reads that package's files ([`Graph::member_dirs`]).
+    dirs: Vec<CheckoutDir, Alloc<'static>>,
     /// The rustflags blaze does not apply, said on the graph's record ([`RUSTFLAGS_NOT_APPLIED`]).
     told: Option<&'f str>,
 }
@@ -220,16 +283,22 @@ impl<'f> Graph<'f> {
         roots.extend(parts.members.iter().map(|(id, _)| *id));
         let ask = Ask { roots, features: Vec::new_in(heap.alloc()), all_features: false, no_default_features: false, tests };
         let members: &'f [(LockId, Package<'static>)] = std::boxed::Box::leak(std::boxed::Box::new_in(parts.members, frame));
+        let path_packages: &'f [(LockId, Package<'static>)] = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(parts.path_packages, frame));
         let target: &'f TargetDesc<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(target, frame));
         let host: &'f TargetDesc<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(host, frame));
         let ask: &'f Ask<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(ask, frame));
-        let inputs = UnitGraphInputs { lock: lockfile.text, workspace_read, members, resolver: parts.resolver, target, host, ask };
+        let inputs = UnitGraphInputs { lock: lockfile.text, workspace_read, members, path_packages, resolver: parts.resolver, target, host, ask };
         Graph { source: unit_graph_task::source(&inputs), inputs, mapped: Vec::new_in(frame), dirs: parts.dirs, told: None }
     }
 
-    /// Each member's lock entry and its directory, anchor-relative, in the layout's order.
-    pub fn member_dirs(&self) -> &[(LockId, blaze_unit_graph::Text<'static>)] {
+    /// Each checkout path package's lock entry, directory (anchor-relative), and kind.
+    pub fn member_dirs(&self) -> &[CheckoutDir] {
         &self.dirs
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inputs(&self) -> &UnitGraphInputs<'f, 'static> {
+        &self.inputs
     }
 
     /// The graph source is the standing proof's graph half. It is derived from the lock bytes,
