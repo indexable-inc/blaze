@@ -38,6 +38,10 @@ blaze-body-lower = { workspace = true, optional = true }
 oracle = ["dep:blaze-flow-lower", "dep:blaze-body-lower"]
 
 [dev-dependencies]
+# End-to-end MIR -> LIR lowering and execution tests for `algebra` MIR passes.
+blaze-body-build.workspace = true
+blaze-build.workspace = true
+blaze-lir = { workspace = true, features = ["eval"] }
 # The fixture world and the type checker the oracle's bodies are checked by.
 blaze-typeck = { workspace = true, features = ["testing"] }
 # `testing::heap()`: a test's root allocator capability (D102).

@@ -523,7 +523,7 @@ impl Steps<'_> {
     /// not enumerate.
     fn keep(&mut self, step: &'static str) -> Result<(), Refused> {
         let after = self.moments.len();
-        if self.sim.pending.len() > 0 {
+        if !self.sim.pending.is_empty() {
             return Err(Refused::InFlight { after, effects: self.sim.pending.len() });
         }
         if !self.sim.drawn.is_empty() {

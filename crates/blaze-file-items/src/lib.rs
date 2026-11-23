@@ -317,69 +317,65 @@ pub fn outline_with_extensions<'a>(
 /// `#![blaze::error_unions]`) at the top of `text` before the first item, returning the combined
 /// [`Extensions`] set with zero allocations.
 pub fn detect_blaze_extensions(text: &str) -> Extensions {
-    let bytes = text.as_bytes();
-    let mut at = 0usize;
-    // Skip optional UTF-8 BOM.
-    if bytes.get(0..3) == Some(&[0xEF, 0xBB, 0xBF]) {
-        at = 3;
-    }
+    let mut rest = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let mut ext = Extensions::NONE;
-    while at < bytes.len() {
-        // Skip whitespace and comments (`//...`, `/*...*/`).
-        while let Some(&b) = bytes.get(at) {
-            if b.is_ascii_whitespace() {
-                at += 1;
-            } else if bytes.get(at..at + 2) == Some(b"//") {
-                at += 2;
-                while let Some(&c) = bytes.get(at) {
-                    at += 1;
-                    if c == b'\n' {
-                        break;
-                    }
-                }
-            } else if bytes.get(at..at + 2) == Some(b"/*") {
-                at += 2;
+    loop {
+        // Skip whitespace and comments (`//...`, nested `/*...*/`) using slice prefix stripping
+        // (no manual byte indices or hardcoded token lengths).
+        loop {
+            rest = rest.trim_ascii_start();
+            if let Some(after) = rest.strip_prefix("//") {
+                rest = match after.split_once('\n') {
+                    Some((_, tail)) => tail,
+                    None => "",
+                };
+            } else if let Some(mut after) = rest.strip_prefix("/*") {
                 let mut depth = 1usize;
-                while depth > 0 && at < bytes.len() {
-                    if bytes.get(at..at + 2) == Some(b"/*") {
+                while depth > 0 && !after.is_empty() {
+                    if let Some(tail) = after.strip_prefix("/*") {
                         depth += 1;
-                        at += 2;
-                    } else if bytes.get(at..at + 2) == Some(b"*/") {
+                        after = tail;
+                    } else if let Some(tail) = after.strip_prefix("*/") {
                         depth -= 1;
-                        at += 2;
+                        after = tail;
                     } else {
-                        at += 1;
+                        let step = after.chars().next().map_or(1, char::len_utf8);
+                        after = after.get(step..).unwrap_or("");
                     }
                 }
+                rest = after;
             } else {
                 break;
             }
         }
         // Only leading `#![...]` inner attributes can enable crate/file extensions.
-        if bytes.get(at..at + 3) != Some(b"#![") {
+        let Some(after) = rest.strip_prefix("#![") else {
             break;
-        }
-        at += 3;
-        let inner_start = at;
+        };
         let mut depth = 1usize;
-        while depth > 0 && at < bytes.len() {
-            match bytes.get(at).copied() {
-                Some(b'[') => depth += 1,
-                Some(b']') => depth -= 1,
+        let mut inner_len = None;
+        for (idx, ch) in after.char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        inner_len = Some(idx);
+                        break;
+                    }
+                }
                 _ => {}
             }
-            at += 1;
         }
-        if depth != 0 {
+        let Some(end) = inner_len else {
             break;
-        }
-        let inner_end = at - 1;
-        if let Some(inner) = text.get(inner_start..inner_end) {
+        };
+        if let Some(inner) = after.get(..end) {
             let trimmed = inner.trim();
-            if let Some(rest) = trimmed.strip_prefix("blaze")
-                && let Some(rest) = rest.trim_start().strip_prefix("::")
+            if let Some(after_blaze) = trimmed.strip_prefix("blaze")
+                && let Some(name) = after_blaze.trim_start().strip_prefix("::")
             {
-                match rest.trim() {
+                match name.trim() {
                     "uniq" => ext = ext.with(Extensions::UNIQ),
                     "records" => ext = ext.with(Extensions::RECORDS),
                     "error_unions" => ext = ext.with(Extensions::ERROR_UNIONS),
@@ -387,6 +383,7 @@ pub fn detect_blaze_extensions(text: &str) -> Extensions {
                 }
             }
         }
+        rest = after.get(end + ']'.len_utf8()..).unwrap_or("");
     }
     ext
 }

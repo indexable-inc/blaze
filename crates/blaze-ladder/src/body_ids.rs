@@ -332,7 +332,7 @@ pub struct EntryForm;
 
 impl Form for EntryForm {
     fn declared(&self, entry: &[u8], out: &mut DeclaredList<'_>) -> Result<(), EntryError> {
-        if entry.get(..8) == Some(&STATIC_ENTRY_MAGIC[..]) {
+        if entry.starts_with(&STATIC_ENTRY_MAGIC[..]) {
             let view = StaticEntryView::read(entry)?;
             view.each_declared(
                 |d| {
@@ -360,7 +360,7 @@ impl Form for EntryForm {
     /// A code entry's read-list rows (code_records.rs `EntryView::reads_count`); a static's
     /// entry carries none (the module doc's OPEN).
     fn reads(&self, entry: &[u8]) -> Result<u32, EntryError> {
-        if entry.get(..8) == Some(&STATIC_ENTRY_MAGIC[..]) {
+        if entry.starts_with(&STATIC_ENTRY_MAGIC[..]) {
             return Ok(0);
         }
         Ok(EntryView::read(entry)?.reads_count())

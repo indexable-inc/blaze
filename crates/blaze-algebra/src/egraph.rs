@@ -1165,6 +1165,7 @@ pub enum PatNode {
     Sqrt(usize),
     Tanh(usize),
     Abs(usize),
+    Fma(usize, usize, usize),
 }
 
 impl PatNode {
@@ -1258,6 +1259,17 @@ impl<A: Allocator + Copy> EGraph<A> {
                                 self.ematch_node(pat, pb, eb, s1, out);
                             }
                         }
+                        (PatNode::Fma(pa, pb, pc), ENode::Fma(ea, eb, ec)) => {
+                            let mut mid1: OwnVec<Subst, A> = OwnVec::new_in(self.alloc);
+                            self.ematch_node(pat, pa, ea, subst, &mut mid1);
+                            for &s1 in mid1.iter() {
+                                let mut mid2: OwnVec<Subst, A> = OwnVec::new_in(self.alloc);
+                                self.ematch_node(pat, pb, eb, s1, &mut mid2);
+                                for &s2 in mid2.iter() {
+                                    self.ematch_node(pat, pc, ec, s2, out);
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1303,6 +1315,13 @@ impl<A: Allocator + Copy> EGraph<A> {
                         stack.push((a, false));
                         continue;
                     }
+                    PatNode::Fma(a, b, c) => {
+                        stack.push((idx, true));
+                        stack.push((c, false));
+                        stack.push((b, false));
+                        stack.push((a, false));
+                        continue;
+                    }
                 }
             }
             let cid = match node {
@@ -1337,6 +1356,11 @@ impl<A: Allocator + Copy> EGraph<A> {
                 PatNode::Sqrt(a) => self.add(ENode::Sqrt(results.get(a).copied().flatten()?)),
                 PatNode::Tanh(a) => self.add(ENode::Tanh(results.get(a).copied().flatten()?)),
                 PatNode::Abs(a) => self.add(ENode::Abs(results.get(a).copied().flatten()?)),
+                PatNode::Fma(a, b, c) => self.add(ENode::Fma(
+                    results.get(a).copied().flatten()?,
+                    results.get(b).copied().flatten()?,
+                    results.get(c).copied().flatten()?,
+                )),
             };
             if let Some(slot) = results.get_mut(idx) {
                 *slot = Some(cid);

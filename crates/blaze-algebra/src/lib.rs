@@ -31,6 +31,7 @@ pub mod egraph;
 pub mod emit;
 pub mod interval;
 pub mod poly;
+pub mod rules;
 pub mod solve;
 
 #[cfg(test)]
@@ -57,6 +58,10 @@ pub use emit::{emit_rust_fn, emit_rust_multi_fn, format_expr};
 pub use interval::{Interval, eval_interval, eval_intervals, prune_branches};
 pub use poly::{
     Monomial, Poly, PolyError, PolyPlant, Rat, expr_to_poly, poly_to_expr, simplify_poly_expr,
+};
+pub use rules::{
+    AlgebraicRule, DERIV_RULES, DerivRule, STANDARD_REWRITE_RULES, export_lean_theorems,
+    standard_rewrite_rules,
 };
 pub use solve::{
     NewtonOpts, NewtonResult, Solution, eval_newton, newton_step, solve_for, solve_linear_system,

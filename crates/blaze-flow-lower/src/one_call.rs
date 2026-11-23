@@ -867,13 +867,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         // (relate.rs `inert`), else tied through the selected impl or the caller's bound, or
         // refused by name. A projection clause that writes a region stays refused here.
         for cv in views.iter() {
-            if subjects.contains(&cv.nth) || (cv.col.len() == 0 && sig_clauses.contains(&cv.nth)) {
+            if subjects.contains(&cv.nth) || (cv.col.is_empty() && sig_clauses.contains(&cv.nth)) {
                 continue;
             }
             let clause = Typed { ty: cv.col.ty(), col: cv.col.as_slice() };
             match heads.node(cv.col.ty()) {
                 Ok(PNode::ExTrait(..)) => clauses.push(ClauseIn::TraitOf { trait_ref: clause }),
-                Ok(PNode::ExProj { .. }) if cv.col.len() == 0 => clauses.push(ClauseIn::ProjOf { proj: clause }),
+                Ok(PNode::ExProj { .. }) if cv.col.is_empty() => clauses.push(ClauseIn::ProjOf { proj: clause }),
                 Ok(PNode::ExProj { .. }) => return self.one_refuse(item, OneRuleWhy::ProjectionClause { clause: cv.nth }, e),
                 Ok(_) => {}
                 Err(u) => return self.one_refuse(item, OneRuleWhy::counted(u, CountAt::HeadClause), e),
