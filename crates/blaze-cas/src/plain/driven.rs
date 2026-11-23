@@ -454,20 +454,44 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     /// bytes with [`Driven::got`]. `None`: absent. The command's main thread reads this way;
     /// pool tasks read through the handle after [`Driven::map_all`].
     pub fn get(&mut self, key: &Key) -> Result<Option<Found>, StoreError> {
+        self.get_hinted(key, None)
+    }
+
+    /// [`Driven::get`] with an optional segment-generation locality hint (e.g. a manifest root's
+    /// generation): probes already-mapped segments first, then the hinted generation's segment,
+    /// then remaining segments in probe order (Bloom-filtered).
+    pub fn get_hinted(&mut self, key: &Key, hint_gen: Option<u64>) -> Result<Option<Found>, StoreError> {
         let before = self.core.probes().probes;
         let lost = self.core.report().lost.len();
+        self.core.set_probe_hint(hint_gen);
         // Bounded: each map is of a row not mapped before, and the generation names few.
-        let found = loop {
+        let result = loop {
             let now = self.driver.wall_ns();
-            match self.core.find_read(key, now, &mut self.effects)? {
-                Probe::Hit(found) => break Some(found),
-                Probe::Absent => break None,
-                Probe::Map => self.run("mapping a segment at its first probe")?,
+            match self.core.find_read(key, now, &mut self.effects) {
+                Ok(Probe::Hit(found)) => break Ok(Some(found)),
+                Ok(Probe::Absent) => break Ok(None),
+                Ok(Probe::Map) => {
+                    if let Err(err) = self.run("mapping a segment at its first probe") {
+                        break Err(err);
+                    }
+                }
+                Err(err) => break Err(err),
             }
         };
+        self.core.set_probe_hint(None);
+        let found = result?;
         self.core.count_get(before);
         self.hand_losses(lost);
         Ok(found)
+    }
+
+    /// Zero-allocation lookup of root `name` in the current manifest followed by a hinted read of
+    /// its root record (probing the root's creation generation before older/larger segments).
+    pub fn get_root(&mut self, name: &str) -> Result<Option<Found>, StoreError> {
+        let Some((key, generation)) = self.core.root_target(name) else {
+            return Ok(None);
+        };
+        self.get_hinted(&key, Some(generation))
     }
 
     /// The NEWEST record under `key` in [`Namespace::LOCAL`] ([`Plain::find_newest`]): what a

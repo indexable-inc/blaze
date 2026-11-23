@@ -385,10 +385,11 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
 
     /// The record the root `name` is, in place (its bytes the 32-byte keys it names, in order):
     /// a root is a name in the newest manifest, not a probe (drive.md ruling 7). `None`: no
-    /// root of that name.
+    /// root of that name. Uses the root's creation generation as a segment-locality hint so warm
+    /// reads avoid mapping older/larger segments.
     pub fn root(&self, name: &str) -> Result<Option<Held<'m>>, PlaceError> {
-        let Some((_, at)) = self.lent.roots().into_iter().find(|(it, _)| it == name) else { return Ok(None) };
-        self.get(Key(at.0))
+        let lent: &'m Lent<D, StoreAlloc> = self.lent;
+        Ok(lent.get_root(name)?.map(|lend| Held { bytes: lend.bytes, proof: Checked { _private: PhantomData }, place: lend.in_place() }))
     }
 
     /// Keeps `keys` under the root `name` from the next commit on, for blaze-cas

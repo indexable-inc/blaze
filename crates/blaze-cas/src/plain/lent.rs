@@ -546,6 +546,21 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// first namespace read that holds it (a segment mapped at its first probe, `Driven::get`),
     /// in place. `None`: absent.
     pub fn get(&self, key: &Key) -> Result<Option<Lend<'_>>, LentError> {
+        self.get_hinted(key, None)
+    }
+
+    /// Zero-allocation lookup of manifest root `name` and its root record, using the root's
+    /// creation generation as a segment-locality hint (avoids mapping older/larger segments on
+    /// warm reads).
+    pub fn get_root(&self, name: &str) -> Result<Option<Lend<'_>>, LentError> {
+        let target = self.inner.borrow().store.core().root_target(name);
+        let Some((key, generation)) = target else {
+            return Ok(None);
+        };
+        self.get_hinted(&key, Some(generation))
+    }
+
+    fn get_hinted(&self, key: &Key, hint_gen: Option<u64>) -> Result<Option<Lend<'_>>, LentError> {
         let mut inner = self.inner.borrow_mut();
         let inner = &mut *inner;
         inner.counts.gets += 1;
@@ -568,7 +583,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
             let shared = matches!(at.place, Place::Shared { .. });
             return Ok(Some(Lend { tag: at.tag, namespace: at.namespace, bytes: unsafe { lend(ptr, len) }, own: true, shared }));
         }
-        let Some(found) = inner.store.get(key).map_err(stopped("reading a record"))? else {
+        let Some(found) = inner.store.get_hinted(key, hint_gen).map_err(stopped("reading a record"))? else {
             inner.counts.misses += 1;
             return Ok(None);
         };
@@ -845,6 +860,11 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         self.inner.borrow().store.core().roots()
     }
 
+    /// Whether the current manifest names a root called `name`, without allocating.
+    pub fn has_root(&self, name: &str) -> bool {
+        self.inner.borrow().store.core().root_target(name).is_some()
+    }
+
     /// What is not yet committed, one segment per namespace, one flip (a whole store: the
     /// commit maps what is left first). From then on every put so far is read from its segment,
     /// in place; every arena chunk no get lent from is freed, and what a get lent stays lent
@@ -855,10 +875,15 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         if self.plant == LentPlant::RootFirst {
             inner.store.commit_with(&[]).map_err(stopped("committing the roots first (planted)"))?;
         }
+        let upto = inner.order.len();
+        if self.plant == LentPlant::None && inner.committed == upto && !inner.store.core().needs_commit() {
+            let committed = inner.store.commit_records(&[], &[]).map_err(stopped("committing nothing"))?;
+            inner.counts.commits += 1;
+            return Ok(committed);
+        }
         // The measure (rule 16): the calling thread's time in the commit, from its layout to its
         // flip and the new segment's map (the driver's wall clock: the simulation's in a test).
         let began = inner.store.driver().wall_ns();
-        let upto = inner.order.len();
         // THE SEAM (rule 78): under `InArena` the puts are lent to the layout where they lie,
         // no batch between (copy 2 gone, the CRC made at the put); under `AfterCommit` each is
         // copied into its namespace's batch first, as before. The same segments either way
@@ -1082,6 +1107,23 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// (`Plain::leases`).
     pub fn leases(&self) -> Vec<(u64, u64), A> {
         self.inner.borrow().store.core().leases()
+    }
+
+    /// Number of active leases named by the current manifest, without allocating.
+    pub fn leases_len(&self) -> usize {
+        self.inner.borrow().store.core().leases_len()
+    }
+
+    /// Whether [`Lent::commit`] has any uncommitted puts, pending roots, open stamps, or a
+    /// folded slice to write/flip.
+    pub fn needs_commit(&self) -> bool {
+        let inner = self.inner.borrow();
+        inner.committed < inner.order.len() || inner.store.core().needs_commit()
+    }
+
+    /// Whether [`Lent::seal`] has any unsealed segments of this boot or pending open stamps.
+    pub fn needs_seal(&self) -> bool {
+        self.inner.borrow().store.core().needs_seal()
     }
 
     /// Records this process's commits carried forward (`Plain::carried`).

@@ -186,6 +186,7 @@ pub mod settings;
 
 pub mod bottom;
 mod arena;
+mod bloom;
 mod core;
 mod driven;
 mod format;
@@ -205,6 +206,8 @@ mod cleanup_tests;
 mod index_tests;
 #[cfg(test)]
 mod beside_tests;
+#[cfg(test)]
+mod bloom_tests;
 #[cfg(test)]
 mod bottom_tests;
 #[cfg(test)]

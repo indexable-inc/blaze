@@ -30,7 +30,7 @@ const TAG: Tag = Tag(1);
 /// A process's store, its tables in the test's frame.
 type Store<'f> = Driven<Sim, &'f Frame>;
 
-fn cfg(n: u64, boot: u64, root: &Frame) -> PlainConfig<&Frame> {
+pub(super) fn cfg(n: u64, boot: u64, root: &Frame) -> PlainConfig<&Frame> {
     let mut writes = Vec::new_in(root);
     writes.push(Namespace::LOCAL);
     let mut reads = Vec::new_in(root);
