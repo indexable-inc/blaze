@@ -1794,7 +1794,7 @@ fn scope_by_need<'r>(
     own_records: crate::front_load::CrateRecords<'r>,
     snapshot: &StoreSnapshot,
     planted: Option<&'static str>,
-    defer_inputs: bool,
+    (defer_inputs, defer_present): (bool, bool),
     heap: &'static blaze_own::Heap,
 ) -> Result<Result<MadeScope<'r>, ScopeRefusal>, CliError> {
     let g = heap.alloc();
@@ -1822,9 +1822,9 @@ fn scope_by_need<'r>(
             continue;
         }
         if defer_inputs {
-            // Standing member below its heads on the ready driver: its scope stood whole at
-            // `today.made_at` and no `CrateScope` ran this request. Defer `names.input_of` and
-            // `snapshot.get` to the first actual question of `one` (`LazyScopeRecords`).
+            // Standing member on the ready driver: its scope stood whole in the members record
+            // and no `CrateScope` ran this request. Defer `names.input_of` and `snapshot.get`
+            // to the first actual question of `one` (`LazyScopeRecords`).
             rest.push(crate::front_load::Unopened {
                 input: Input { name: scope_name, at: Key::default(), out: ABSENT },
                 key: list.key(one),
@@ -1841,17 +1841,19 @@ fn scope_by_need<'r>(
             break;
         };
         let unopened = crate::front_load::Unopened { input, key: list.key(one), world_at: one, name, package: list.shown_from(one) };
-        let present: Result<(), crate::engine_records::ReadError> = if planted == Some(name) {
-            Err(crate::front_load::LoadError::NotInStore { name: input.name, at: input.at }.into())
-        } else {
-            crate::front_load::present(snapshot, &unopened).map_err(|error| CliError::Text {
-                what: crate::engine_head_notes::leak(g, format_args!("`{}`: its check scope's crate `{name}` does not read from the store's snapshot: {error:?} (front_load.rs `present`)", list.root(at))),
-            })?
-        };
-        if let Err(error) = present {
-            whole = false;
-            scope.cut = Some((one, CutWhy::Unreadable(error)));
-            break;
+        if !defer_present {
+            let present: Result<(), crate::engine_records::ReadError> = if planted == Some(name) {
+                Err(crate::front_load::LoadError::NotInStore { name: input.name, at: input.at }.into())
+            } else {
+                crate::front_load::present(snapshot, &unopened).map_err(|error| CliError::Text {
+                    what: crate::engine_head_notes::leak(g, format_args!("`{}`: its check scope's crate `{name}` does not read from the store's snapshot: {error:?} (front_load.rs `present`)", list.root(at))),
+                })?
+            };
+            if let Err(error) = present {
+                whole = false;
+                scope.cut = Some((one, CutWhy::Unreadable(error)));
+                break;
+            }
         }
         rest.push(unopened);
         scope.scope.push(input.name);
@@ -2422,6 +2424,7 @@ pub(crate) struct Prepared<'s, 'f, 'r> {
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     heap: &'static blaze_own::Heap,
     keep_scratch: bool,
+    has_unread_outlines: bool,
     plants: RowPlants,
 }
 
@@ -2479,6 +2482,8 @@ pub(crate) struct BodyRun<'a, 'f> {
     pub(crate) ran: SVec<'a, Ran<'f>>,
     pub(crate) findings: RunOut<'a>,
     pub(crate) tally: crate::engine_seeds::SeedTally,
+    /// The run's thread stretch `(start, end)` in ns since request start, for `Times::job`.
+    pub(crate) span: (u64, u64),
 }
 
 // Bounded where declared (rule 76; [`Census`]): 62 KiB each with the census by value.
@@ -2528,6 +2533,7 @@ pub(crate) struct BodyRunner<'v, 'f, 'r> {
     seeds: Option<&'v crate::engine_seeds::RequestTable<'v>>,
     board: &'v crate::engine_status::Board<'v>,
     keep_scratch: bool,
+    has_unread_outlines: bool,
     plants: RowPlants,
     /// The bodies this setup left to check, by (member, file, name).
     ones: &'v [One<'f>],
@@ -2581,6 +2587,7 @@ impl<'v, 'f, 'r> BodyRunner<'v, 'f, 'r> {
             scope_reads: self.stage.scope_reads,
             board: self.board,
             keep_scratch: self.keep_scratch,
+            has_unread_outlines: self.has_unread_outlines,
             plants: self.plants,
             by_need: self.by_need,
         }
@@ -2602,8 +2609,10 @@ impl<'v, 'f, 'r> BodyRunner<'v, 'f, 'r> {
         let name = task.planned.name;
         let one = self.ones.iter().find(|one| one.task.planned.name == name).ok_or(NotInSetup { body: name, what: "not a body its phase's setup left to check (engine_bodies.rs `prepare`)" })?;
         let shared = self.over(reads);
-        let mut run = BodyRun { out: Buffer::new_in(alloc), ran: SVec::new_in(alloc), findings: RunOut::new(alloc), tally: crate::engine_seeds::SeedTally::default() };
+        let mut run = BodyRun { out: Buffer::new_in(alloc), ran: SVec::new_in(alloc), findings: RunOut::new(alloc), tally: crate::engine_seeds::SeedTally::default(), span: (0, 0) };
+        let began = crate::engine_times::ns(self.clock.now().since_start());
         run_bodies(cx, &shared, core::slice::from_ref(one), self.clock, &mut run.out, &mut run.ran, &mut run.findings, &mut run.tally, alloc);
+        run.span = (began, crate::engine_times::ns(self.clock.now().since_start()));
         Ok(run)
     }
 }
@@ -2631,6 +2640,7 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
             seeds: self.seeds,
             board: self.board,
             keep_scratch: self.keep_scratch,
+            has_unread_outlines: self.has_unread_outlines,
             plants: self.plants,
             ones: self.ones,
             clock: self.clock,
@@ -2662,6 +2672,61 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
         LazyScopeRecords::new(self.snapshot.as_ref(), crates, self.names_keys, self.heap)
     }
 
+    /// Pre-opens the distinct lang crates (`core`, `alloc`, `std`, `bstd`) of active groups (those
+    /// referenced by `self.ones`) ONCE in parallel across `workers` before body stretches begin,
+    /// avoiding redundant nested spawns and `OnceLock` contention across concurrent stretches.
+    pub(crate) fn pre_open_lang(&self, cx: &Cx, by_need: &LazyScopeRecords<'_>, workers: NonZeroU32) {
+        let Some(found) = self.found.as_ref() else { return };
+        if self.ones.is_empty() || workers.get() <= 1 {
+            return;
+        }
+        let mut to_open: [Option<&crate::front_load::Unopened>; 8] = [None; 8];
+        let mut count = 0usize;
+        let mut seen_groups: [u32; 8] = [u32::MAX; 8];
+        let mut seen_count = 0usize;
+        for one in self.ones {
+            if seen_groups.iter().take(seen_count).any(|&g| g == one.group) {
+                continue;
+            }
+            if let Some(slot) = seen_groups.get_mut(seen_count) {
+                *slot = one.group;
+                seen_count += 1;
+            }
+            let Some(group) = usize::try_from(one.group).ok().and_then(|at| found.groups.get(at)) else { continue };
+            let GroupCrates::ByNeed { rest, .. } = &group.crates else { continue };
+            for &place in group.lang.iter() {
+                if place > 0
+                    && let Some(unopened) = rest.get(place - 1)
+                    && !to_open.iter().take(count).flatten().any(|prev| prev.world_at == unopened.world_at)
+                    && let Some(slot) = to_open.get_mut(count)
+                {
+                    *slot = Some(unopened);
+                    count += 1;
+                }
+            }
+            if count == to_open.len() {
+                break;
+            }
+        }
+        if count < 2 {
+            return;
+        }
+        let pre_cx = cx.span("engine: pre-open lang crates");
+        let scope = pre_cx.scope();
+        scope.narrow_workers(workers, Class::Foreground);
+        let mut handles = blaze_own::Vec::with_capacity_in(count, pre_cx.frame());
+        for unopened in to_open.iter().take(count).flatten().copied() {
+            handles.push(scope.may_overlap("engine: open lang crate", 1 << 20, move |_cx: &Cx| {
+                let _ = crate::front_load::OpenByNeed::open(by_need, unopened);
+                Ok::<_, Infallible>(())
+            }));
+        }
+        for handle in handles.into_iter() {
+            let _ = handle.join(&pre_cx);
+        }
+        let _ = scope.join(&pre_cx);
+    }
+
     /// The `Ready` driver's bodies joined into `stage` (D187): the runs its `BodyCheck` kind
     /// sank, each one entry's [`BodyRunner::run_body`] whose row the engine took, merged by THE
     /// ONE JOIN ([`BodiesStage::join_runs`]) as the phase path merges its runs; the setup's
@@ -2689,6 +2754,7 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
         let mut buffers: SVec<'a, (Buffer<'a>, SVec<'a, Ran<'f>>, RunOut<'a>)> = SVec::with_capacity_in(runs.len(), alloc);
         for run in runs.into_iter() {
             stage.seeds.add(&run.tally);
+            times.job(crate::engine_times::Step::BodiesRun, run.span.0, run.span.1);
             // The run's one entry: its body's `One` (`run_body` runs one, never a slice).
             let one = run.ran.first().and_then(|ran| self.ones.iter().find(|one| one.task.planned.name == ran.name));
             entries.push(one.map_or(&[][..], core::slice::from_ref));
@@ -2915,15 +2981,11 @@ impl<'f> BodiesStage<'f> {
         let world = names.stage().names.as_ref();
         let is_test = |name: Name| world.is_some_and(|names| names.crate_at(name.subject).is_some_and(|at| names.list().test(at)));
         let root_of = |at: usize| Name::file(list.root(at).strip_prefix("/0/").unwrap_or(list.root(at)).as_bytes());
-        // Each crate a visited member's bodies may read the item text of: the member crates it
-        // depends on, transitively (a superset of its check scope's members: blaze-world
-        // check_scope.rs). A body freezing a member head it did not read before reads that
-        // item's text from its file's outline (front_load.rs `StoreLoad::file_items`), so each
-        // such member's tree is read back whole (its root here, closed under file parts by the
-        // caller); a dependency that is not a member is a pack's text, never an outline.
-        let mut reached: Vec<bool, blaze_own::Alloc<'static>> = Vec::with_capacity_in(CrateGraph::len(&list), g);
-        reached.resize(CrateGraph::len(&list), false);
-        let mut walk: Vec<usize, blaze_own::Alloc<'static>> = Vec::new_in(g);
+        // Only the visited members' own module trees need planned outlines upfront (for `groups`'s
+        // `reached_under`, `file_heads`, and `list_files_with`). Any transitive member dependency's
+        // file text actually asked during checking (`StoreLoad::file_items`, e.g. a `const` body)
+        // is outlined on demand from disk (`CurrentFile::from_text`), so standing transitive
+        // dependency outlines are never eagerly read back from the store.
         for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at)) {
             let own_name = blaze_drive::key::crate_scope_name(&list.key(member));
             let unit = crate::engine_body_plan::Unit { name: own_name, prefix: list.key(member).prefix(), test: is_test(own_name) };
@@ -2935,20 +2997,6 @@ impl<'f> BodiesStage<'f> {
             if let Some(kept) = view.as_ref().and_then(|view| view.member(place)) {
                 seeds.extend(kept.held.iter().map(|held| held.slot));
                 seeds.extend(kept.not_held.iter().copied());
-            }
-            walk.push(member);
-            // Each crate is walked once over every visited member: at most the list's edges.
-            while let Some(at) = walk.pop() {
-                for dep in CrateGraph::deps(&list, at) {
-                    if reached.get(dep).is_none_or(|seen| *seen) {
-                        continue;
-                    }
-                    reached[dep] = true;
-                    if list.member(dep) {
-                        seeds.push(root_of(dep));
-                    }
-                    walk.push(dep);
-                }
             }
         }
         seeds.sort_unstable();
@@ -3010,6 +3058,11 @@ impl<'f> BodiesStage<'f> {
     /// The `FileItems` tasks entered in earlier phases of this request, sorted.
     pub(crate) fn outlines_entered(&self) -> &[Name] {
         self.outlines_entered.as_deref().unwrap_or(&[])
+    }
+
+    /// Whether any `ImplBucket` task entered in earlier phases of this request.
+    pub(crate) fn entered_impl_bucket(&self) -> bool {
+        self.grains_entered.as_deref().unwrap_or(&[]).iter().any(|name| name.kind == Kind::ImplBucket)
     }
 
     /// The grains record this request put: the key the checkout's grains root names from the
@@ -3353,6 +3406,7 @@ impl<'f> BodiesStage<'f> {
             procs,
             heap,
             keep_scratch: planted_keep_scratch(),
+            has_unread_outlines: self.unread.as_ref().is_some_and(|unread| !unread.is_empty()),
             plants,
         })
     }
@@ -3470,6 +3524,7 @@ impl<'f> BodiesStage<'f> {
         // The phase's scope records opened by need, one for all its runs (each crate opened
         // once whichever run asks it first); its counts read after the runs end.
         let by_need = prepared.scope_records();
+        prepared.pre_open_lang(&cx, &by_need, handles.workers);
         {
             let stage_reads = match paged_shelf {
                 Some(source) => self.reads_paged(source),
@@ -4118,14 +4173,20 @@ impl<'f> BodiesStage<'f> {
             };
             let probed = snapshot.get(row_key).map(|got| got.map(|bytes| crate::engine_member_rows::open(bytes, g)));
             tally.parts.files_ns = tally.parts.files_ns.saturating_add(lap(handles.clock, &mut member_mark));
-            // Standing member below its heads on the ready driver with no `CrateScope` entered
-            // this request and no planted unreadable crate: its scope stood whole in the members
-            // record, so defer dependency `names.input_of` and `present` checks to first ask.
-            let defer_scope_inputs = again.is_some()
+            // Standing member on the ready driver with no `CrateScope` entered this request and no
+            // planted unreadable crate: its scope stood whole in the members record, so defer both
+            // dependency `names.input_of` (stored page reads) and `present` checks to first ask.
+            // On all paths (both `ready` and `phases`) when no unreadable crate is planted, defer
+            // upfront `front_load::present` CAS lookups to `LazyScopeRecords::open` on first ask
+            // while still checking `names.input_of` (in-memory on `phases`) so failed `CrateScope`
+            // dependencies still cut the scope immediately.
+            let stood_in_record = again.is_some() || stood_view.as_ref().and_then(|view| view.member(place)).is_some();
+            let defer_scope_inputs = stood_in_record
                 && names.stood_on().is_some()
                 && names.stage().results.is_empty()
                 && self.grains_entered.as_deref().unwrap_or(&[]).iter().all(|name| name.kind != Kind::CrateScope)
                 && planted_unreadable.is_none();
+            let defer_present = planted_unreadable.is_none();
             // D168 (2) (c): the member's check scope, at need ([`OpenWorld`]): its bodies are
             // owed, or its row must be made (not stored, or its bytes do not open), or a crate of
             // its scope has no names input (the refusal `scope_of` words). Else nothing of its
@@ -4138,7 +4199,7 @@ impl<'f> BodiesStage<'f> {
             if needs_scope && whole_scope.is_none() {
                 // Piece C (a): made by need, the member's own record the one opened; every other
                 // scope crate's opened at a body's first question of it (`LazyScopeRecords`).
-                match scope_by_need(names, &list, member, own_records, snapshot, planted_unreadable, defer_scope_inputs, heap)? {
+                match scope_by_need(names, &list, member, own_records, snapshot, planted_unreadable, (defer_scope_inputs, defer_present), heap)? {
                     Ok(made) => whole_scope = Some(made),
                     Err(cause) => {
                         // As the oracle arm refuses it: before any claim or head subject of it.
@@ -5264,6 +5325,10 @@ struct Shared<'s, 'a, 'f, 'r, R: ?Sized + CellDigests> {
     /// PLANTED BUG when true, tests only ([`PLANT_KEEP_SCRATCH`]): a body's scratch is not
     /// reset when it ends.
     keep_scratch: bool,
+    /// True when the ready setup left standing dependency outlines unread (`BodiesStage::unread`),
+    /// so `run_stretch` passes `None` for outlines and lets `StoreLoad::file_items` outline any
+    /// dependency file actually queried on demand (`CurrentFile::from_text`).
+    has_unread_outlines: bool,
     /// PLANTED BUGS, tests only ([`RowPlants`]): the old row's capacity, or the coarse step off.
     plants: RowPlants,
     /// The request's scope records opened by need ([`BodyRunner::by_need`]).
@@ -5655,6 +5720,112 @@ fn join_slices<'a, 'f>(
     Ok((buffer, ran, joined))
 }
 
+/// Per-stretch lazy wrapper over `BodySeed`: serves all already-frozen member and dependency heads
+/// (`Known::Bytes`) and member refusals (`Known::Refused`) directly in O(1) without constructing
+/// `lang_index`, `Pointers`, `HeadConsts`, or `SeededHeads`. Only on a cold dependency head miss
+/// (`Known::Freeze`) does it lazily build the freezer once per stretch into `frame`.
+struct LazyBodySeed<'k, 'n, 't> {
+    names: &'n blaze_ladder::front2::source::Records<'n>,
+    heads: &'k crate::engine_seeds::StretchHeads<'k, 'k, 'n>,
+    tables: Tables<'t, 'n>,
+    evaluated: &'n Recorder<'n>,
+    lang_crates: &'t [usize],
+    frame: &'n Frame,
+    fb: blaze_own::Bump<'n>,
+    fa: blaze_own::Alloc<'n>,
+    g: blaze_own::Alloc<'static>,
+    body_locals: blaze_ladder::front2::tables::seeds::BodyLocals,
+    index_reads: core::cell::Cell<u64>,
+    lang_refused: core::cell::Cell<Option<&'static str>>,
+    inner: core::cell::OnceCell<Result<&'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>>, &'static str>>,
+}
+
+impl<'k, 'n, 't> LazyBodySeed<'k, 'n, 't> {
+    fn index_reads(&self) -> u64 {
+        self.index_reads.get()
+    }
+
+    fn lang_refused(&self) -> Option<&'static str> {
+        self.lang_refused.get()
+    }
+
+    fn with_failure<R>(&self, cell: Want, inspect: impl FnOnce(CellFailure<'_>) -> R) -> Option<R> {
+        self.inner.get()?.as_ref().ok()?.with_failure(cell, inspect)
+    }
+
+    #[inline(never)]
+    fn build_lang_index(&self) -> Result<&'n blaze_ladder::front2::index::Index<'n>, &'static str> {
+        match crate::engine_head_consts::lang_index(self.tables, self.evaluated, self.lang_crates) {
+            Ok(index) => Ok(self.frame.alloc(index)),
+            Err(twice) => {
+                let words = crate::engine_head_notes::leak(self.g, format_args!("its scope's constants have no lang index: {twice} (front2 index.rs `LangTwice`)"));
+                self.lang_refused.set(Some(words));
+                Err(words)
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn build_head_consts(&self, index: &'n blaze_ladder::front2::index::Index<'n>) -> &'n mut (dyn ConstValues<'n> + 'n) {
+        self.frame.alloc(crate::engine_head_consts::HeadConsts::new(self.tables.reading_into(self.evaluated), index, self.fb))
+    }
+
+    #[inline(never)]
+    fn build_body_seed(
+        &self,
+        index: &'n blaze_ladder::front2::index::Index<'n>,
+        consts: Option<&'n mut (dyn ConstValues<'n> + 'n)>,
+    ) -> &'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>> {
+        let sized = index.lang("sized");
+        // The program's receiver pointer types, as the Heads stage's freezes are made with
+        // (engine_heads.rs `heads_of`): without them this freezer would write other bytes
+        // under a dependency head's key (rule 21; lane H9).
+        let pointers = blaze_ladder::front2::receiver::Pointers::find(index, blaze_ladder::resolve::Paths { names: self.tables });
+        let freezer = SeededHeads::new(SeededHeadsOpts { names: self.names, sized, pointers, frame: self.frame, scratch: self.g, alloc: self.fa, consts, known: Some(self.heads), owners: None });
+        self.frame.alloc(crate::engine_seeds::BodySeed::new(RequestSeedOpts { names: self.names, heads: self.heads, freezer, body_locals: self.body_locals }))
+    }
+
+    #[inline(never)]
+    fn build_freezer(&self) -> Result<&'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>>, &'static str> {
+        let index = self.build_lang_index()?;
+        self.index_reads.set(self.evaluated.tally().offered);
+        let consts = Some(self.build_head_consts(index));
+        Ok(self.build_body_seed(index, consts))
+    }
+}
+
+impl<'n> HeadSeed<'n> for LazyBodySeed<'_, 'n, '_> {
+    fn seed(&self, store: &blaze_ladder::front2::heads::Store<'n>, keys: &blaze_ladder::front2::keys::Keys, need: Want, scratch: blaze_own::Alloc<'static>) -> Result<blaze_ladder::front2::heads::Seeded, SeedError> {
+        if self.body_locals == blaze_ladder::front2::tables::seeds::BodyLocals::Lowered
+            && blaze_ladder::front2::tables::seeds::of_the_body(store, need)
+        {
+            return Ok(blaze_ladder::front2::heads::Seeded::Lower);
+        }
+        let cell = blaze_ladder::front2::tables::head::cell_of(self.names, need).map_err(SeedError::Freeze)?;
+        match blaze_ladder::front2::tables::head::KnownHeads::known(self.heads, cell) {
+            blaze_ladder::front2::tables::head::Known::Bytes(bytes) => {
+                let frozen = blaze_ladder::front2::tables::head::FrozenHead::read(bytes)
+                    .map_err(|error| SeedError::Freeze(FreezeError::Read { want: cell, error }))?;
+                blaze_ladder::front2::tables::head::file_frozen(self.names, cell, frozen, store, keys, scratch)
+                    .map_err(SeedError::Freeze)?;
+                return Ok(blaze_ladder::front2::heads::Seeded::Filed);
+            }
+            blaze_ladder::front2::tables::head::Known::Refused(why) => {
+                return Err(SeedError::of_freeze(FreezeError::NotTheirs { want: cell, why }));
+            }
+            blaze_ladder::front2::tables::head::Known::Freeze => {}
+        }
+        let inner = self.inner.get_or_init(|| self.build_freezer());
+        match inner {
+            Ok(body_seed) => body_seed.seed(store, keys, need, scratch),
+            Err(words) => Err(SeedError::of_freeze(FreezeError::NotTheirs {
+                want: cell,
+                why: NotTheirs::Failed { said: words },
+            })),
+        }
+    }
+}
+
 /// One stretch of a run: its member's records opened once into `frame`, each body checked over
 /// one view until the frame is past [`STRETCH_FULL`]. How many bodies it took (at least one).
 #[expect(clippy::too_many_arguments, reason = "a stretch's edge: each argument one handle of it")]
@@ -5702,47 +5873,15 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
         Ok(env) => env,
         Err(error) => return refuse(run, leak(g, format_args!("its member's environment did not copy into the run: {error:?} (blaze-scope crate_env.rs `EnvLent::copy_in`)")), scope, out, ran, run_out, alloc),
     };
-    let files = ((shared.packs, shared.fs), Some(shared.outlined));
-    // Pre-open the scope's lang crates (`core`, `alloc`, `std`, `bstd`) concurrently before
-    // `lang_index` asks them serially on one thread. `run_stretch` unconditionally reads every
-    // crate in `group.lang` below (`each_lang`), so this opens zero crates beyond the floor.
-    if let GroupCrates::ByNeed { rest, .. } = &group.crates {
-        let mut to_open: [Option<&crate::front_load::Unopened>; 8] = [None; 8];
-        let mut count = 0usize;
-        for &place in group.lang.iter() {
-            if place > 0
-                && let Some(unopened) = rest.get(place - 1)
-                && let Some(slot) = to_open.get_mut(count)
-            {
-                *slot = Some(unopened);
-                count += 1;
-            }
-        }
-        if count >= 2 {
-            let pre_cx = cx.span("engine: pre-open lang crates");
-            let scope = pre_cx.scope();
-            let by_need = shared.by_need;
-            let mut handles = blaze_own::Vec::with_capacity_in(count, pre_cx.frame());
-            for unopened in to_open.iter().take(count).flatten().copied() {
-                handles.push(scope.may_overlap("engine: open lang crate", 1 << 20, move |_cx: &Cx| {
-                    let _ = by_need.open(unopened);
-                    Ok::<_, Infallible>(())
-                }));
-            }
-            for handle in handles.into_iter() {
-                let _ = handle.join(&pre_cx);
-            }
-            let _ = scope.join(&pre_cx);
-        }
-    }
+    let files = ((shared.packs, shared.fs), (!shared.has_unread_outlines).then_some(shared.outlined));
     // Its scope crates past the member opened by need, at their first question, through the
     // request's memo (`shared.by_need`, piece C (a)); the oracle arm's all opened at the setup.
     let Ok(opened) = crate::run_names::names_records_over(cx, shared.root, group.crates.scope(shared.by_need), files, shared.corrected, shared.procs, std::vec::Vec::new_in(Global), env, Some(shared.snapshot), Some(shared.expansion_keys), frame, g) else {
         return refuse(run, "its member's records could not be opened in the run", scope, out, ran, run_out, alloc);
     };
     let set_records = clock.now();
-    let unused = Recorder::new(RecorderOpts { alloc: g });
-    let tables = Tables::new(TablesOpts { records: opened.records, impls: Some(impls), lang_crates: &group.lang, reads: &unused });
+    let unused: &Recorder<'_> = frame.alloc(Recorder::new(RecorderOpts { alloc: fa }));
+    let tables = Tables::new(TablesOpts { records: opened.records, impls: Some(impls), lang_crates: &group.lang, reads: unused });
     // A stack owner drops the memo when this stretch ends. Its caller's heap reclaims old
     // buffers as it grows; a bump frame would retain every superseded capacity.
     let mut ids = ReadIds::new(tables, g);
@@ -5756,44 +5895,27 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
     // `StretchHeads`), on the stack so its `Owners` is dropped with the stretch.
     let stretch_heads = shared.seeds.map(|table| crate::engine_seeds::StretchHeads::new(table, shared.heads_failed, opened.records, shared.heads, group.crates.scope(shared.by_need), shared.listings, g));
     let set_heads = clock.now();
-    // The seed freezer's constant evaluator: the head tasks' own (engine_head_consts.rs), its
-    // lang index built once a stretch, and dependency const-fn head facts consumed by the
-    // body's on-demand body/value evaluator. Its reads stay in the stretch memo, so each
-    // body's read list takes the placed prefix ([`EvalReads`]).
-    // Two crates declaring one lang item refuse the stretch by name, as they fail a head task.
+    // The seed freezer's constant evaluator and lang index are built lazily on the first cold
+    // dependency head miss (`LazyBodySeed`): warm edits (0 heads frozen) pay 0 us here.
     let evaluated: &Recorder<'_> = frame.alloc(Recorder::new(RecorderOpts { alloc: fa }));
-    let index: Option<&blaze_ladder::front2::index::Index<'_>> = match shared.seeds {
-        Some(_) => match crate::engine_head_consts::lang_index(tables, evaluated, &group.lang) {
-            Ok(index) => Some(&*frame.alloc(index)),
-            Err(twice) => return refuse(run, crate::engine_head_notes::leak(g, format_args!("its scope's constants have no lang index: {twice} (front2 index.rs `LangTwice`)")), scope, out, ran, run_out, alloc),
-        },
-        None => None,
-    };
-    // The reads of building the index alone: a body takes the evaluator's reads only once it
-    // evaluated a constant (as a head task takes them when its evaluator was asked).
-    let index_reads = evaluated.tally().offered;
     let mut eval = EvalReads { placed: 0, ids: Vec::new_in(fa) };
-    let seed: Option<&crate::engine_seeds::BodySeed<'_, '_, '_, _, _>> = match &stretch_heads {
-        Some(table) => {
-            let mut sized = None;
-            for at in group.lang.iter() {
-                NamesSource::each_lang(opened.records, *at, &mut |name, key| {
-                    if name == "sized" {
-                        sized = Some(key);
-                    }
-                });
-            }
-            let consts = index.map(|index| frame.alloc(crate::engine_head_consts::HeadConsts::new(tables.reading_into(evaluated), index, fb)) as &mut (dyn ConstValues<'_> + '_));
-            // The program's receiver pointer types, as the Heads stage's freezes are made with
-            // (engine_heads.rs `heads_of`): without them this freezer would write other bytes
-            // under a dependency head's key (rule 21; lane H9).
-            let Some(index) = index else { return refuse(run, "its scope has no lang index for its receiver pointer types (engine_bodies.rs `run_stretch`)", scope, out, ran, run_out, alloc) };
-            let pointers = blaze_ladder::front2::receiver::Pointers::find(index, blaze_ladder::resolve::Paths { names: tables });
-            let freezer = SeededHeads::new(SeededHeadsOpts { names: opened.records, sized, pointers, frame, scratch: g, alloc: fa, consts, known: Some(table), owners: None });
-            Some(frame.alloc(crate::engine_seeds::BodySeed::new(RequestSeedOpts { names: opened.records, heads: table, freezer, body_locals: table.body_locals() })))
-        }
-        None => None,
-    };
+    let seed: Option<&LazyBodySeed<'_, '_, '_>> = stretch_heads.as_ref().map(|table| {
+        &*frame.alloc(LazyBodySeed {
+            names: opened.records,
+            heads: table,
+            tables,
+            evaluated,
+            lang_crates: &group.lang,
+            frame,
+            fb,
+            fa,
+            g,
+            body_locals: table.body_locals(),
+            index_reads: core::cell::Cell::new(0),
+            lang_refused: core::cell::Cell::new(None),
+            inner: core::cell::OnceCell::new(),
+        })
+    });
     // Each body's rounds (front2 tables/cost.rs `Spent::rounds`): one when its heads are all
     // seeded (runtime.md point 3).
     let cost: &Cost<'_> = frame.alloc(Cost::new(&NO_GAUGE));
@@ -6212,16 +6334,22 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                 scope_required = true;
                 seed_refused = false;
             }
+            if let Some(words) = seed.and_then(|s| s.lang_refused()) && !matches!(said, Some(Said::Panicked)) {
+                said = Some(Said::Refused(words));
+                scope_required = true;
+                seed_refused = false;
+            }
             // A checked verdict and a refusal at a seed both depend on the evaluator. Its
             // prepared definitions persist across this stretch, so each row takes its prefix.
             mem.allocating = "the constant evaluator's cell ID list";
+            let index_reads = seed.map_or(0, |s| s.index_reads());
             let placed = if !scope_required {
                 eval.update(evaluated, index_reads, &mut ids, opened.records, shared.heads)
                     .map_err(|error| error.words(&group.crates.opened(shared.by_need, g), g))
             } else {
                 Ok(())
             };
-            mem.offered += evaluated.tally().offered - offered_before + if taken == 1 { index_reads } else { 0 };
+            mem.offered += evaluated.tally().offered - offered_before;
             let mut head_failed = None;
             if seed_refused {
                 // Refused at a seed; never checked by lowering instead (rule 3). A head that cannot

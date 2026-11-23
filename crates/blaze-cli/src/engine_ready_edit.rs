@@ -175,9 +175,9 @@ pub(crate) enum Chosen {
 }
 
 /// The kinds the `Ready` edit path runs (engine_ready_check.rs: one `TaskKind` each). An
-/// entering task of any other kind (a signature, a crate's scope, an impl bucket) is refused by
-/// [`admit`] until its stage is ported.
-pub(crate) const READY_KINDS: [blaze_drive::Kind; 3] = [blaze_drive::Kind::FileItems, blaze_drive::Kind::Lint, blaze_drive::Kind::BodyCheck];
+/// entering task of any other kind (a signature, a crate's scope, an impl bucket, a build script)
+/// is refused by [`admit`] until its stage is ported.
+pub(crate) const READY_KINDS: [blaze_drive::Kind; 4] = [blaze_drive::Kind::FileItems, blaze_drive::Kind::Given, blaze_drive::Kind::Lint, blaze_drive::Kind::BodyCheck];
 
 /// Why `--driver=ready` cannot serve this request: the flag asked for a driver that cannot, so
 /// the request stops and says why (rule 3: the other driver is never run in its place; rule
@@ -223,7 +223,7 @@ impl core::fmt::Display for ReadyRefused {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ReadyRefused::Root(why) => write!(f, "--driver=ready cannot serve this request: {} (engine_ready_edit.rs `choose`)", why.words()),
-            ReadyRefused::Kind { name } => write!(f, "--driver=ready cannot serve this request: the edit enters {name}, a {} task, and the ready path runs only FileItems, Lint and BodyCheck tasks yet (engine_ready_edit.rs `admit`)", name.kind.name()),
+            ReadyRefused::Kind { name } => write!(f, "--driver=ready cannot serve this request: the edit enters {name}, a {} task, and the ready path runs only FileItems, Given, Lint and BodyCheck tasks yet (engine_ready_edit.rs `admit`)", name.kind.name()),
             ReadyRefused::Unsorted { at } => write!(f, "the entering names are not sorted and each once at {at} (engine_ready_edit.rs `admit`)"),
             ReadyRefused::NoRow { name } => write!(f, "--driver=ready cannot serve this request: the stored answer holds no row of {name}, which the ready setup reads in place of the units stage (engine_check.rs `ready_setup`)"),
             ReadyRefused::Graph(why) => write!(f, "--driver=ready cannot serve this request: {why} (engine_check.rs `ready_setup`)"),
@@ -259,10 +259,15 @@ impl ReadyRefused {
 }
 
 /// The second step of the precondition: the wake's entering names (sorted, each once) admitted
-/// to the `Ready` path when every one is of a kind it runs ([`READY_KINDS`]); else the first
-/// that is not, by name. Reads no page: a name carries its kind.
+/// to the `Ready` path when every one is of a kind it runs ([`READY_KINDS`]); a woken `Script`
+/// task refuses with [`ReadyRefused::Root`]`(`[`PhasesWhy::ScriptRead`]`)`, else the first
+/// unsupported task is refused by name ([`ReadyRefused::Kind`]). Reads no page: a name carries
+/// its kind.
 pub(crate) fn admit(names: &[Name]) -> Result<EditPath<'_>, ReadyRefused> {
     let entering = Entering::new(names).map_err(|unsorted| ReadyRefused::Unsorted { at: unsorted.at })?;
+    if names.iter().any(|name| name.kind == blaze_drive::Kind::Script) {
+        return Err(ReadyRefused::Root(PhasesWhy::ScriptRead));
+    }
     match names.iter().find(|name| !READY_KINDS.contains(&name.kind)) {
         Some(&name) => Err(ReadyRefused::Kind { name }),
         None => Ok(EditPath::Ready(entering)),
@@ -384,13 +389,10 @@ pub(crate) fn choose(driver: Driver, root: Option<&blaze_engine::pages::Root<'_>
     if changed.is_empty() {
         return refuse(PhasesWhy::NothingMoved);
     }
-    if changed.iter().any(|one| one.kind.by_script()) {
-        return refuse(PhasesWhy::ScriptRead);
-    }
-    if changed.iter().any(|one| !matches!(one.kind, crate::sweep::LeafKind::Slot)) {
+    if changed.iter().any(|one| !matches!(one.kind, crate::sweep::LeafKind::Slot) && !one.kind.by_script()) {
         return refuse(PhasesWhy::Layout);
     }
-    if changed.iter().any(|one| !one.both) {
+    if changed.iter().any(|one| matches!(one.kind, crate::sweep::LeafKind::Slot) && !one.both) {
         return refuse(PhasesWhy::FileAddedOrRemoved);
     }
     Ok(Chosen::Wake { files: changed.len() })
@@ -570,6 +572,7 @@ pub(crate) fn wake<'a>(
     stored: &Stored<'_>,
     tools: &blaze_engine::Tools,
     outlined: &[crate::engine_tasks::Outlined<'_>],
+    given: &[(Name, ContentId)],
     files: &[(Name, &[blaze_engine::Planned])],
     alloc: blaze_own::SharedAlloc<'a>,
 ) -> Result<(SVec<'a, Name>, Woke), CliError> {
@@ -578,8 +581,30 @@ pub(crate) fn wake<'a>(
     let mut moved: SVec<'a, Moved> = SVec::new_in(alloc);
     let mut woken: SVec<'a, (Name, Woken)> = SVec::new_in(alloc);
     for &(file, group) in files.iter() {
-        // An entry of the edit that is no source file's (a crate's, a script read's): its own
-        // task enters by its key, and `admit` names it when its kind is not the ready path's.
+        // A moved checkout read (`Kind::Given`): its `WHOLE` cell moves to today's answer digest,
+        // waking its stored readers (bodies reading an `include_str!` data file stay on `ready`;
+        // any woken `Script` task is refused by `admit` with `PhasesWhy::ScriptRead`).
+        if file.kind == blaze_drive::Kind::Given {
+            let answer = given
+                .binary_search_by_key(&file, |(name, _)| *name)
+                .ok()
+                .and_then(|at| given.get(at))
+                .map(|&(_, answer)| answer)
+                .ok_or_else(|| EngineCheckError::ReadyHost {
+                    task: file,
+                    what: "a moved `Given` task with no planned checkout read answer (engine_ready_edit.rs `wake`)",
+                })?;
+            let now = [(crate::engine_tasks::WHOLE, answer)];
+            if let Some(row) = page_for(stored, file, blaze_engine::Ask::Row)?.and_then(|page| page.row(file)) {
+                moved_cells(file, row.defines(), &now, &mut moved);
+            } else {
+                moved_cells(file, core::iter::empty(), &now, &mut moved);
+            }
+            woken.push((file, Woken::Keyed));
+            continue;
+        }
+        // An entry of the edit that is no source file's or checkout read's: its own task enters by
+        // its key, and `admit` names it when its kind is not the ready path's.
         if file.kind != blaze_drive::Kind::FileItems {
             woken.push((file, Woken::Keyed));
             continue;

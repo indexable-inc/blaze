@@ -517,3 +517,52 @@ fn ready_body_edit_runs_each_body_once_and_skips_unused_dep_headers() {
         "lazy scope_by_need must not query unused dep CrateScope headers (got {distinct_cs} distinct): {rows_line}",
     );
 }
+
+/// Monster #4: on `Driver::Phases`, an incremental edit that moves a member's `CrateScope` and
+/// adds a `Signature` task (0 `ImplBucket` tasks entered, e.g. adding a private fn) still opens
+/// only the scope crates bodies actually ask (not unused transitive dependencies) and pages
+/// standing `ImplBucket` tables lazily through `StoredShelf` instead of eagerly reading every
+/// crate's impl tables.
+#[test]
+fn phases_crate_scope_edit_opens_only_asked_scope_crates_and_pages_standing_shelf() {
+    use crate::engine_ready_edit::Driver;
+    let io = Io::simulated(SimWorld::new(53, Limits::USUAL));
+    let mut members = std::string::String::from("\"app\"");
+    let mut deps = std::string::String::new();
+    for i in 0..6 {
+        members.push_str(&format!(", \"dep{i}\""));
+        deps.push_str(&format!("dep{i} = {{ path = \"../dep{i}\" }}\n"));
+        write(&io, &format!("dep{i}/Cargo.toml"), &format!("[package]\nname = \"dep{i}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"));
+        write(&io, &format!("dep{i}/src/lib.rs"), &format!("pub fn val() -> u32 {{ {i} }}\n"));
+    }
+    write(&io, "Cargo.toml", &format!("[workspace]\nmembers = [{members}]\nresolver = \"2\"\n"));
+    write(&io, "app/Cargo.toml", &format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{deps}"));
+    write(&io, "app/src/lib.rs", "pub fn f() -> u32 {\n    dep0::val()\n}\n");
+
+    let (_, cold) = engine_opts(&io, opts(&io, 2, false));
+    assert_ne!(cold.status.0, Status::FAILED.0, "cold run checks clean");
+
+    // Add a private fn: moves `app`'s `CrateScope` and adds 1 `Signature` task, 0 `ImplBucket` tasks.
+    write(&io, "app/src/lib.rs", "pub fn f() -> u32 {\n    dep0::val()\n}\n\nfn _private_helper() -> u32 {\n    42\n}\n");
+    let mut edit_opts = opts(&io, 2, false);
+    edit_opts.driver = Driver::Phases;
+    let (_, edit) = engine_opts(&io, edit_opts);
+    assert_ne!(edit.status.0, Status::FAILED.0, "phases CrateScope edit checks clean");
+    assert!(edit.stages[blaze_engine::Stage::Names.index()].entered > 0, "CrateScope ran on phases");
+    assert!(edit.stages[blaze_engine::Stage::Heads.index()].entered > 0, "Signature ran on phases");
+    assert!(edit.stages[blaze_engine::Stage::Bodies.index()].entered > 0, "new private fn body checked");
+
+    let prof = profile(&io);
+    let opened_line = prof.lines().find(|l| l.starts_with("bodies: scope crates opened by need ")).expect("scope crates opened by need line");
+    let opened: u64 = opened_line
+        .strip_prefix("bodies: scope crates opened by need ")
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .expect("opened crate count");
+    // Only toolchain lang crates (<= 3) + at most what `_private_helper` asks (0 deps!): never the
+    // 6 workspace dependencies `dep0..dep5`.
+    assert!(
+        opened <= 4,
+        "phases edit must open only scope crates bodies actually ask, not unused deps (opened {opened}): {opened_line}\n{prof}",
+    );
+}
