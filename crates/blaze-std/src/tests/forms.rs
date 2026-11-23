@@ -505,4 +505,22 @@ fn batteries_are_exposed_and_work_in_a_frame() {
     assert_eq!(crate::base32::encode_rfc4648_in(b"foo", true, alloc).expect("b32").as_str(), "MZXW6===");
     assert_eq!(crate::strx::to_snake_case_in("HTTPServer", alloc).expect("snake").as_str(), "http_server");
     assert_eq!(crate::strx::slugify_in("Café & Bar!", '-', alloc).expect("slug").as_str(), "cafe-bar");
+
+    // Batch 5 codecs & checksums: zstd, lz4, snappy, xxh32, xxh64, crc32c
+    let sample = b"blaze-std zstd lz4 snappy compression test payload blaze-std zstd lz4 snappy!";
+    let zc = crate::zstd::compress_in(sample, crate::zstd::CompressOpts::DEFAULT, alloc).expect("zstd c");
+    let zd = crate::zstd::decompress_in(zc.as_slice(), crate::zstd::ZstdLimits::USUAL, alloc).expect("zstd d");
+    assert_eq!(zd.as_slice(), sample);
+
+    let lc = crate::lz4::compress_frame_in(sample, crate::lz4::Lz4FrameOpts::DEFAULT, alloc).expect("lz4 c");
+    let ld = crate::lz4::decompress_frame_in(lc.as_slice(), crate::lz4::Lz4Limits::USUAL, alloc).expect("lz4 d");
+    assert_eq!(ld.as_slice(), sample);
+
+    let sc = crate::snappy::compress_framed_in(sample, alloc).expect("snappy c");
+    let sd = crate::snappy::decompress_framed_in(sc.as_slice(), crate::snappy::SnappyLimits::USUAL, alloc).expect("snappy d");
+    assert_eq!(sd.as_slice(), sample);
+
+    assert_eq!(crate::digest::xxh32(b"", 0), 0x02CC_5D05);
+    assert_eq!(crate::digest::xxh64(b"", 0), 0xEF46_DB37_51D8_E999);
+    assert_eq!(crate::digest::crc32c(b"123456789"), 0xE306_9283);
 }
