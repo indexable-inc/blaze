@@ -19,6 +19,8 @@
 //! 4. `daemon_opt_out_blaze_no_daemon`:
 //!    Proves `BLAZE_NO_DAEMON=1` neither connects to nor spawns a daemon socket.
 
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,10 +63,61 @@ struct Scratch {
     homes: std::vec::Vec<(PathBuf, PathBuf)>,
 }
 
+#[cfg(unix)]
+fn posix_stat(p: &Path) -> Option<blaze_sys::posix::proc::stat> {
+    let s = p.to_str()?;
+    let mut buf = [0u8; 4096];
+    let b = s.as_bytes();
+    if b.is_empty() || b.len() >= buf.len() { return None; }
+    buf[..b.len()].copy_from_slice(b);
+    buf[b.len()] = 0;
+    let c = core::ffi::CStr::from_bytes_with_nul(&buf[..=b.len()]).ok()?;
+    blaze_sys::posix::proc::stat_at(blaze_sys::posix::io::CWD, blaze_sys::Path::new(c), 0).ok()
+}
+
+/// Chooses a short scratch root directory that stays on the toolchain shelf's filesystem
+/// (avoiding cross-device `EXDEV` copies of the ~2.5 GB shelf) while keeping
+/// `<home>/.blaze/v2/daemon/<16-hex>.sock` within Unix `sun_path` limits (104 B macOS / 108 B Linux).
+fn scratch_parent(tag: &str, seq: u64) -> PathBuf {
+    let leaf = format!("bd-{tag}-{}-{seq}", std::process::id());
+    let dev_of = |p: &Path| posix_stat(p).map(|st| st.st_dev);
+    let (owner_home, tmp) = (std::env::var_os("HOME"), std::env::temp_dir());
+    let shelf_dev = owner_home.as_ref().and_then(|h| dev_of(&Path::new(h).join(".blaze/v2/toolchain")));
+    let fits = |dir: &Path| -> bool {
+        let sample = dir.join(&leaf).join("standalone").join("h");
+        sample.to_str().is_some_and(|s| crate::daemon_server::socket_fits(Some(s)))
+    };
+    let mut candidates = [Some(tmp), None, Some(PathBuf::from("/tmp"))];
+    if let Some(h) = owner_home.as_ref() {
+        let short_home = Path::new(h).join(".blaze/t");
+        if std::fs::create_dir_all(&short_home).is_ok() {
+            candidates[1] = Some(short_home);
+        }
+    }
+    if let Some(want_dev) = shelf_dev {
+        for cand in candidates.iter().flatten() {
+            if let Ok(canon) = cand.canonicalize()
+                && dev_of(&canon) == Some(want_dev)
+                && fits(&canon)
+            {
+                return canon.join(&leaf);
+            }
+        }
+    }
+    for cand in candidates.iter().flatten() {
+        if let Ok(canon) = cand.canonicalize()
+            && fits(&canon)
+        {
+            return canon.join(&leaf);
+        }
+    }
+    PathBuf::from(format!("/tmp/{leaf}"))
+}
+
 impl Scratch {
     fn new(tag: &str) -> Scratch {
         let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let base = PathBuf::from(format!("/tmp/bd-{tag}-{}-{seq}", std::process::id()));
+        let base = scratch_parent(tag, seq);
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("create scratch base");
         let base = base.canonicalize().expect("canonicalize scratch base");
@@ -1183,7 +1236,6 @@ fn kqueue_vnode_script_stat_stamped_and_symlinks_do_not_loop_refresh() {
     use crate::daemon_watch::KqueueVnode;
     use crate::engine_script_reads::{NONE, NOT_A_FILE, NOT_A_FOLDER, ReadKind};
     use crate::sweep::{DIRECT_PATH, LeafKind, Leaves, Plant, Rows, Stamp};
-    use std::os::unix::fs::{MetadataExt, symlink};
 
     let mut scratch = Scratch::new("kqsym");
     let (_home, proj) = scratch.lane("p", true);
@@ -1282,4 +1334,126 @@ fn kqueue_vnode_script_stat_stamped_and_symlinks_do_not_loop_refresh() {
         p3.paths.as_slice(),
         p3.needs_refresh,
     );
+}
+
+#[test]
+fn env_fingerprint_tracks_path_developer_dir_and_toolchains() {
+    let heap = blaze_own::testing::heap();
+    let shared = heap.shared();
+    let alloc = heap.alloc();
+    let make_env = |pairs: &[(&str, &str)]| bstd::env::Env::from_vars(bstd::env::Vars::from_pairs_in(pairs, shared));
+
+    let base = super::EnvFingerprint::from_env(&make_env(&[("PATH", "/usr/bin"), ("DEVELOPER_DIR", "/dev1"), ("TOOLCHAINS", "t1")]), alloc);
+    let diff_path = super::EnvFingerprint::from_env(&make_env(&[("PATH", "/opt/bin"), ("DEVELOPER_DIR", "/dev1"), ("TOOLCHAINS", "t1")]), alloc);
+    let diff_dev = super::EnvFingerprint::from_env(&make_env(&[("PATH", "/usr/bin"), ("DEVELOPER_DIR", "/dev2"), ("TOOLCHAINS", "t1")]), alloc);
+    let diff_tc = super::EnvFingerprint::from_env(&make_env(&[("PATH", "/usr/bin"), ("DEVELOPER_DIR", "/dev1"), ("TOOLCHAINS", "t2")]), alloc);
+    assert!(base != diff_path, "PATH change must invalidate EnvFingerprint");
+    assert!(base != diff_dev, "DEVELOPER_DIR change must invalidate EnvFingerprint");
+    assert!(base != diff_tc, "TOOLCHAINS change must invalidate EnvFingerprint");
+}
+
+#[test]
+fn rebase_relative_origin_from_client_cwd() {
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("frame");
+    assert_eq!(super::rebase_relative_path("/ws/member", "../records", "/ws", &frame), Some("records"));
+    assert_eq!(super::rebase_relative_path("/ws/member", "sub/records", "/ws", &frame), Some("member/sub/records"));
+    assert_eq!(super::rebase_relative_path("/ws/member", "../../outside", "/ws", &frame), None);
+    assert_eq!(super::rebase_relative_path("/ws/member", "http://127.0.0.1:8080", "/ws", &frame), None);
+    assert_eq!(super::daemon_fs_root_abs("/parent/ws", "ws"), "/parent");
+}
+
+#[cfg(unix)]
+#[test]
+fn locate_workspace_root_respects_exclude_and_package_workspace() {
+    let mut scratch = Scratch::new("wsexcl");
+    let (_home, proj) = scratch.lane("p", false);
+    write_file(&proj, "Cargo.toml", "[workspace]\nmembers = [\"a\"]\nexclude = [\"excl\"]\n");
+    write_file(&proj, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\n");
+    write_file(&proj, "excl/Cargo.toml", "[package]\nname = \"excl\"\nversion = \"0.1.0\"\n");
+    write_file(&proj, "explicit/Cargo.toml", "[package]\nname = \"explicit\"\nversion = \"0.1.0\"\nworkspace = \"..\"\n");
+
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("frame");
+    let root_s = proj.to_string_lossy();
+    let a_s = proj.join("a").to_string_lossy().into_owned();
+    let excl_s = proj.join("excl").to_string_lossy().into_owned();
+    let explicit_s = proj.join("explicit").to_string_lossy().into_owned();
+
+    let mut out = [0u8; 4096];
+    assert_eq!(crate::daemon_client::locate_workspace_root(&a_s, &root_s, &frame, &mut out), Some(root_s.as_ref()));
+    assert_eq!(crate::daemon_client::locate_workspace_root(&excl_s, &root_s, &frame, &mut out), Some(excl_s.as_str()));
+    assert_eq!(crate::daemon_client::locate_workspace_root(&explicit_s, &root_s, &frame, &mut out), None);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn kqueue_vnode_root_symlink_retarget_invalidates_descendants_and_nested_git_watched() {
+    use crate::daemon_watch::KqueueVnode;
+    use crate::sweep::{LeafKind, Leaves, Rows, Stamp};
+    use blaze_sys::posix::io::CWD;
+    use blaze_sys::posix::proc::rename_at;
+
+    fn cpath<'a>(p: &Path, buf: &'a mut [u8; 4096]) -> blaze_sys::Path<'a> {
+        let b = p.to_str().expect("utf8").as_bytes();
+        buf[..b.len()].copy_from_slice(b);
+        buf[b.len()] = 0;
+        blaze_sys::Path::new(core::ffi::CStr::from_bytes_with_nul(&buf[..=b.len()]).expect("cstr"))
+    }
+    let make_link = |target: &Path, link: &Path| {
+        symlink(target, link).expect("symlink");
+    };
+
+    let mut scratch = Scratch::new("kqretarget");
+    let (_home, proj) = scratch.lane("p", false);
+    write_file(&proj, "target_a/Cargo.toml", "[package]\nname = \"m\"\nversion = \"0.1.0\"\n");
+    write_file(&proj, "target_a/src/lib.rs", "pub fn a() -> u32 { 1 }\n");
+    write_file(&proj, "target_b/Cargo.toml", "[package]\nname = \"m\"\nversion = \"0.1.0\"\n");
+    write_file(&proj, "target_b/src/lib.rs", "pub fn a() -> u32 { 2 }\n");
+    make_link(&proj.join("target_a"), &proj.join("member"));
+
+    // Nested git repository inside `sub/.git`.
+    write_file(&proj, "sub/.git/HEAD", "ref: refs/heads/main\n");
+    write_file(&proj, "sub/.git/refs/heads/main", "1111111111111111111111111111111111111111\n");
+
+    let target_stat_of = |rel: &str| -> Stamp {
+        let st = posix_stat(&proj.join(rel)).expect("stat");
+        Stamp {
+            len: st.st_size.cast_unsigned(),
+            mtime_ns: st.st_mtime.cast_unsigned().wrapping_mul(1_000_000_000).wrapping_add(st.st_mtime_nsec.cast_unsigned()),
+            ctime_ns: st.st_ctime.cast_unsigned().wrapping_mul(1_000_000_000).wrapping_add(st.st_ctime_nsec.cast_unsigned()),
+            ino: st.st_ino,
+            dev: i64::from(st.st_dev).cast_unsigned(),
+        }
+    };
+
+    let frame = bstd::mem::Frame::with_reserve(4 << 20, bstd::mem::Tag::Other).expect("frame");
+    let alloc = blaze_own::testing::heap().alloc();
+    let root_s = proj.to_string_lossy();
+    let mut rows = Rows::new_in(&frame);
+    rows.push(LeafKind::Manifest, 0, "member/Cargo.toml", Some(target_stat_of("member/Cargo.toml")), blaze_ids::ContentId([1; 32]));
+    rows.push(LeafKind::Slot, 0, "member/src/lib.rs", Some(target_stat_of("member/src/lib.rs")), blaze_ids::ContentId([2; 32]));
+    rows.push(LeafKind::ScriptGit, 0, "sub\nrev-parse HEAD", None, blaze_ids::ContentId([3; 32]));
+    let bytes = Leaves::bytes_in(&rows, &frame).expect("encode leaves");
+    let (leaves, _) = Leaves::of(&bytes).expect("decode leaves");
+
+    let mut kq = KqueueVnode::arm_with_env(&root_s, None, None, &leaves, true, &frame, alloc).expect("arm");
+    // Drain initial git verification.
+    let init = kq.poll_dirty(&frame);
+    assert!(init.git_dirty, "initial post-EV_ADD git drain expected");
+
+    // 1. Atomic retarget of root symlink `member`: must dirty `member/Cargo.toml` and `member/src/lib.rs`!
+    make_link(&proj.join("target_b"), &proj.join("member.tmp"));
+    let (mut b1, mut b2) = ([0u8; 4096], [0u8; 4096]);
+    rename_at(CWD, cpath(&proj.join("member.tmp"), &mut b1), CWD, cpath(&proj.join("member"), &mut b2)).expect("atomic rename");
+    let p_sym = kq.poll_dirty(&frame);
+    assert!(
+        p_sym.paths.iter().any(|&p| p == "member/Cargo.toml")
+            && p_sym.paths.iter().any(|&p| p == "member/src/lib.rs"),
+        "retargeting root symlink dir must dirty descendant leaves: {:?}",
+        p_sym.paths.as_slice(),
+    );
+
+    // 2. Updating the nested repo's `sub/.git/refs/heads/main` must fire `git_dirty`!
+    write_file(&proj, "sub/.git/refs/heads/main", "2222222222222222222222222222222222222222\n");
+    let p_git = kq.poll_dirty(&frame);
+    assert!(p_git.git_dirty, "nested ScriptGit repo ref update must fire git_dirty");
 }

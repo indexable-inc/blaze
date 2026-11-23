@@ -49,9 +49,9 @@ blaze-deflate	152
 blaze-drive	64
 blaze-ed25519	5
 blaze-emit	890
-blaze-engine	120
+blaze-engine	119
 blaze-expand	284
-blaze-export	486
+blaze-export	483
 blaze-facts	12
 blaze-fetch	213
 blaze-file-items	94

@@ -337,6 +337,7 @@ fn datum_to_export<'a>(target: Target, view: &DatumView<'a>, bump: Bump<'a>, hea
     })?;
     let word_count = view.words();
     let mut words: Vec<DataWord, Bump<'a>> = Vec::with_capacity_in(word_count, bump);
+    let mut outside: Vec<(CodeSymbol, &'a str), Bump<'a>> = Vec::new_in(bump);
     for w in 0..word_count {
         let word = view.word(w);
         let word_target = if word.target == OWN_DATUM {
@@ -347,7 +348,14 @@ fn datum_to_export<'a>(target: Target, view: &DatumView<'a>, bump: Bump<'a>, hea
                 what: "datum word target index",
                 shown: owned_str("word target index exceeds usize", heap.alloc()),
             })?;
-            Some(view.target(idx))
+            let t = view.target(idx);
+            if t.space == Space::Outside
+                && let Some(name) = view.name(t.symbol)
+                && !outside.iter().any(|(s, _)| *s == t.symbol)
+            {
+                outside.push((t.symbol, name));
+            }
+            Some(t)
         };
         words.push(DataWord { at: word.at, target: word_target, addend: word.addend });
     }
@@ -356,6 +364,7 @@ fn datum_to_export<'a>(target: Target, view: &DatumView<'a>, bump: Bump<'a>, hea
         bytes: view.bytes(),
         align,
         words: words.into_bump_slice(),
+        outside: outside.into_bump_slice(),
         place,
     })
 }

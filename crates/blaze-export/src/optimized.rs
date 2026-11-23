@@ -550,6 +550,19 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
             }
         }
     }
+    for &d in by_target.iter() {
+        let Some(datum) = data.get(usize::try_from(d).unwrap_or(usize::MAX)) else {
+            continue;
+        };
+        for w in datum.words {
+            if let Some(t) = w.target
+                && t.space == Space::Outside
+                && let Some(&(_, name)) = datum.outside.iter().find(|&&(sym, _)| sym == t.symbol)
+            {
+                imports.push(Import { symbol: t.symbol, name });
+            }
+        }
+    }
     imports.sort_unstable_by(|a, b| a.symbol.cmp(&b.symbol));
     imports.dedup_by(|a, b| a.symbol == b.symbol);
     let import_of = |symbol: Symbol| imports.binary_search_by(|it| it.symbol.cmp(&symbol)).ok();

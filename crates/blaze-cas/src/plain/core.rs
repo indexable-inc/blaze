@@ -1784,6 +1784,9 @@ struct Flip<A: Allocator + Clone> {
     /// Optional sidecar Bloom append or compact rewrite performed under the flip lock before
     /// `SLOT_WRITE`. Its failure never aborts the flip.
     bloom_effect: Option<Effect>,
+    /// `(replaced, written_bytes)` for `bloom_effect`, cleared if `BLOOM_WRITE` fails and applied
+    /// to `BloomIndex::mapped_bytes` when the flip commits.
+    bloom_written: Option<(bool, u64)>,
 }
 
 /// Parked `Ctx::Open` resolution waiting for the parallel `BLOOM_MAP` effect to settle.
@@ -2669,9 +2672,10 @@ impl<A: Allocator + Clone> Plain<A> {
     }
 
     /// Whether [`Plain::commit`] / [`Plain::commit_records`] with empty inputs has any pending
-    /// work (held records, root edits, open stamps, or a folded compaction slice).
+    /// work (held records, root edits, open stamps, acknowledged loss marks, or a folded
+    /// compaction slice).
     pub fn needs_commit(&self) -> bool {
-        self.holds_uncommitted() || !self.roots_pending.is_empty() || self.pending_stamps() || self.folding.is_some()
+        self.holds_uncommitted() || !self.roots_pending.is_empty() || self.pending_stamps() || self.folding.is_some() || !self.clearable.is_empty()
     }
 
     /// Whether [`Plain::seal`] has any unsealed local segments of this boot or pending stamps.
@@ -2724,7 +2728,8 @@ impl<A: Allocator + Clone> Plain<A> {
     /// When the store is whole (`self.eager`) and any live local segment lacks a filter (e.g.
     /// upgrading an existing store) or dead bytes exceed 2x live + 64 KiB, writes a compact
     /// replacement via atomic `WriteUnsynced`; otherwise appends only newly built records.
-    fn plan_bloom_effect(&mut self, m: &Manifest) -> Option<Effect> {
+    /// Returns `(effect, replaced, written_bytes)`.
+    fn plan_bloom_effect(&mut self, m: &Manifest) -> Option<(Effect, bool, u64)> {
         let has_pending = |pending: &[(ContentId, blaze_own::Vec<u8, Kept>)], digest: &ContentId| pending.iter().any(|(d, _)| d == digest);
         let needs_backfill = self.eager
             && m.segments
@@ -2754,7 +2759,8 @@ impl<A: Allocator + Clone> Plain<A> {
             if bytes.is_empty() {
                 return None;
             }
-            return Some(Effect::WriteUnsynced { file: self.bloom_file.share(), bytes: bytes.into_iter().collect(), tag: self.tag(BLOOM_WRITE, 0) });
+            let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            return Some((Effect::WriteUnsynced { file: self.bloom_file.share(), bytes: bytes.into_iter().collect(), tag: self.tag(BLOOM_WRITE, 0) }, true, len));
         }
         if self.pending_bloom.is_empty() {
             return None;
@@ -2768,7 +2774,8 @@ impl<A: Allocator + Clone> Plain<A> {
         if bytes.is_empty() {
             return None;
         }
-        Some(Effect::Append { file: self.bloom_file.share(), bytes: bytes.into_iter().collect(), tag: self.tag(BLOOM_WRITE, 0) })
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        Some((Effect::Append { file: self.bloom_file.share(), bytes: bytes.into_iter().collect(), tag: self.tag(BLOOM_WRITE, 0) }, false, len))
     }
 
     /// The leases this generation names: `(holder's nonce, expires ns)`.
@@ -3223,10 +3230,11 @@ impl<A: Allocator + Clone> Plain<A> {
     /// Only takes effect when no lease for this process is currently held (`!self.leased`), so a
     /// resident daemon holds zero leases while idle (never blocking `blaze gc`) yet acquires fresh
     /// lease protection starting from the current generation on the next multi-phase request.
-    pub fn rearm_lease(&mut self) {
+    pub fn rearm_lease(&mut self, now_ns: u64) {
         if !self.leased && self.released {
             self.released = false;
             self.opened_generation = self.manifest.generation;
+            self.opened_ns = now_ns;
         }
     }
 
@@ -3338,7 +3346,7 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         let mut rest = laid.into_iter();
         match rest.next() {
-            None if roots.is_empty() && !self.pending_stamps() && self.folding.is_none() => {
+            None if roots.is_empty() && !self.pending_stamps() && self.folding.is_none() && self.clearable.is_empty() => {
                 self.committed = Some(Ok(self.empty_committed()));
                 self.sealed.clear();
             }
@@ -4696,6 +4704,7 @@ impl<A: Allocator + Clone> Plain<A> {
             early: 0,
             deferred: None,
             bloom_effect: None,
+            bloom_written: None,
         }));
         effects.push(Effect::Lock { file: self.flip.share(), mode: LockMode::Exclusive, tag: self.tag(LOCK, 0) });
     }
@@ -5077,7 +5086,13 @@ impl<A: Allocator + Clone> Plain<A> {
         flip.log = self.log_file(log);
         flip.fresh = fresh;
         flip.removals = removals;
-        flip.bloom_effect = self.plan_bloom_effect(&m);
+        if let Some((effect, replaced, len)) = self.plan_bloom_effect(&m) {
+            flip.bloom_effect = Some(effect);
+            flip.bloom_written = Some((replaced, len));
+        } else {
+            flip.bloom_effect = None;
+            flip.bloom_written = None;
+        }
         flip.next = Some((slot, m));
         let first = if flip.new_log {
             flip.manifest_bytes = bytes;
@@ -5225,6 +5240,10 @@ impl<A: Allocator + Clone> Plain<A> {
             if self.manifest.segments.iter().any(|seg| seg.local && seg.digest == digest) {
                 self.bloom.insert_owned(rec);
             }
+        }
+        self.bloom.prune(&self.manifest.segments);
+        if let Some((replaced, len)) = flip.bloom_written {
+            self.bloom.note_written(replaced, len);
         }
         self.leased = self.manifest.leases.iter().any(|it| it.holder == self.cfg.nonce);
         // The slot names the log this flip wrote its manifest to.
@@ -6188,10 +6207,13 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.write_slot(effects);
                 Ok(())
             }
-            (BLOOM_WRITE, Phase::Flipping(_)) => {
+            (BLOOM_WRITE, Phase::Flipping(flip)) => {
                 // `bloom` is a rebuildable acceleration sidecar: an I/O error writing or
-                // appending to it never aborts the generation flip.
-                let _ = done;
+                // appending to it never aborts the generation flip, but we clear `bloom_written`
+                // so `BloomIndex::mapped_bytes` is only updated when the write actually succeeded.
+                if matches!(done, Done::Failed(_) | Done::Broken { .. }) {
+                    flip.bloom_written = None;
+                }
                 self.write_slot(effects);
                 Ok(())
             }

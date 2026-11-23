@@ -124,6 +124,28 @@ fn own_cut(view: &FileItemsView<'_>, item: Option<&Item>, edition: Edition, g: A
     view.cfgs(item).fold(Cut::HOLDS, |cut, (kind, written)| cut.and(attr_cut(kind, written, edition, g)))
 }
 
+/// Hashes the non-trivia Rust tokens of a `#[cfg(..)]` / `#[cfg_attr(..)]` attribute so
+/// whitespace reformatting or comments inside a cfg attribute do not invalidate descendant keys.
+pub(crate) fn hash_cfg_tokens(h: &mut Hasher, written: &str) {
+    let mut end = 0usize;
+    let mut count = 0u32;
+    for token in blaze_lex::tokenize(written, blaze_lex::FrontmatterAllowed::No, blaze_lex::Cpu::BASELINE) {
+        let start = end;
+        end += usize::try_from(token.len).unwrap_or(0);
+        if matches!(
+            token.kind,
+            blaze_lex::TokenKind::Whitespace | blaze_lex::TokenKind::LineComment { .. } | blaze_lex::TokenKind::BlockComment { .. }
+        ) {
+            continue;
+        }
+        if let Some(word) = written.get(start..end) {
+            h.part(word.as_bytes());
+            count = count.saturating_add(1);
+        }
+    }
+    h.update(&count.to_le_bytes());
+}
+
 /// Folds the `#[cfg]` / `#[cfg_attr]` attributes of `item` (or the file's `#![cfg]`s when `None`)
 /// onto `above`. Returns `None` when neither `above` nor `item` has any cfg attribute.
 fn fold_cfgs(above: Option<ContentId>, view: &FileItemsView<'_>, item: Option<&Item>) -> Option<ContentId> {
@@ -139,9 +161,11 @@ fn fold_cfgs(above: Option<ContentId>, view: &FileItemsView<'_>, item: Option<&I
                 None => h.update(&[0]),
             };
             let tag = |kind: AttrKind| u8::from(kind == AttrKind::CfgAttr);
-            h.update(&[tag(kind)]).part(written.as_bytes());
+            h.update(&[tag(kind)]);
+            hash_cfg_tokens(&mut h, written);
             for (kind, written) in iter {
-                h.update(&[tag(kind)]).part(written.as_bytes());
+                h.update(&[tag(kind)]);
+                hash_cfg_tokens(&mut h, written);
             }
             Some(h.finish())
         }
@@ -256,5 +280,31 @@ impl<'o, 'h, 'g> PlanCuts<'o, 'h, 'g> {
     pub(crate) fn file(&self, at: usize) -> Option<&FileCuts<'g>> {
         let slot = self.files.get(at)?;
         slot.get_or_init(|| self.outlined.get(at).and_then(|one| file_cuts(one, self.alloc))).as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_cfg_tokens_ignores_comments_and_whitespace() {
+        let a = {
+            let mut h = Hasher::new("cfg-test");
+            hash_cfg_tokens(&mut h, "all(unix, feature = \"foo\")");
+            h.finish()
+        };
+        let b = {
+            let mut h = Hasher::new("cfg-test");
+            hash_cfg_tokens(&mut h, "all( /* comment */ unix ,\n  // line\n  feature = \"foo\" )");
+            h.finish()
+        };
+        let c = {
+            let mut h = Hasher::new("cfg-test");
+            hash_cfg_tokens(&mut h, "all(unix, feature = \"bar\")");
+            h.finish()
+        };
+        assert_eq!(a, b, "comments and whitespace inside cfg must not change digest");
+        assert_ne!(a, c, "distinct cfg token must change digest");
     }
 }

@@ -336,6 +336,7 @@ pub(crate) struct DaemonCheckCtx<'d> {
     pub(crate) opened: &'d crate::store::Opened,
     pub(crate) watch: Option<crate::daemon_watch::PollOutcome<'d>>,
     pub(crate) hot_graph: &'d mut Option<HotGraph>,
+    pub(crate) requests: Option<&'d bstd::procs::Requests>,
     pub(crate) out: DaemonCheckOut,
 }
 
@@ -368,7 +369,8 @@ pub(crate) fn check_in_daemon<'d>(
         at: work::held_str(checkout_root_abs, &request),
         member: "",
     };
-    edge_at(cx, fs, env, net, host, out, err, phases, heap, &flags, None, Some(located), true, sdk_override.map(Ok), &request, |edge, phases| {
+    let daemon_requests = daemon.requests;
+    edge_at(cx, fs, env, net, host, out, err, phases, heap, &flags, None, Some(located), true, daemon_requests, sdk_override.map(Ok), &request, |edge, phases| {
         let Edge { root, opts, mut shown, err, caps, view, shown_root, frame, .. } = edge;
         let checked = match flags.fix {
             None => {
@@ -396,7 +398,10 @@ pub(crate) fn check_in_daemon<'d>(
                 if selectors.is_empty() {
                     selectors.push("all");
                 }
-                let mut ask = |mut shown| check_live_with_daemon(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, None, Some(&mut *daemon)).map(|checked| (checked, shown));
+                let mut ask = |mut shown| {
+                    daemon.opened.lent.rearm_lease();
+                    check_live_with_daemon(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, None, Some(&mut *daemon)).map(|checked| (checked, shown))
+                };
                 match crate::fix_then_check::<crate::fix::Atomic, Checked>(cx, root, &selectors, (caps, view, shown_root), frame, out, &mut ask)? {
                     crate::Fixed::Refused => None,
                     crate::Fixed::Checked(checked, _) => Some(checked),
@@ -553,7 +558,7 @@ pub(crate) fn warm_toolchain(
         None => bstd::mem::format_in!(&request, ".blaze/{rel_ws}"),
     };
     let located = crate::run_package::Located { root: ws_dir, at: work::held_str(abs_at.as_str(), &request), member: "" };
-    edge_at(cx, fs, env, net, host, out, err, phases, heap, &flags, None, Some(located), false, None, &request, |edge, phases| {
+    edge_at(cx, fs, env, net, host, out, err, phases, heap, &flags, None, Some(located), false, None, None, &request, |edge, phases| {
         let Edge { root, opts, mut shown, err, frame, .. } = edge;
         shown.quiet = true;
         let mut check_opts = opts();
@@ -698,7 +703,7 @@ fn edge<R>(
     frame: &Frame,
     then: impl for<'f> FnOnce(Edge<'f>, &mut Phases) -> Result<R, CliError>,
 ) -> Result<R, CliError> {
-    edge_at(cx, fs, env, net, host, out, err, phases, heap, flags, why, None, false, None, frame, then)
+    edge_at(cx, fs, env, net, host, out, err, phases, heap, flags, why, None, false, None, None, frame, then)
 }
 
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
@@ -716,6 +721,7 @@ fn edge_at<'l, R>(
     why: Option<&str>,
     located_override: Option<crate::run_package::Located<'l>>,
     skip_signals: bool,
+    daemon_requests: Option<&bstd::procs::Requests>,
     sdk_override: Option<Result<blaze_apple_sdk::Sdk<'l>, blaze_apple_sdk::SdkRefused<'l>>>,
     frame: &'l Frame,
     then: impl for<'f> FnOnce(Edge<'f>, &mut Phases) -> Result<R, CliError>,
@@ -838,9 +844,12 @@ fn edge_at<'l, R>(
         _ => None,
     };
     #[cfg(unix)]
-    let requests = asked.as_ref().map(bstd::procs::Asked::requests);
+    let requests = match asked.as_ref() {
+        Some(a) => Some(a.requests()),
+        None => daemon_requests,
+    };
     #[cfg(not(unix))]
-    let requests = None;
+    let requests = daemon_requests;
     let status = crate::engine_status::Asking {
         requests,
         every: flags.status_every.map(|seconds| core::time::Duration::from_secs(u64::from(seconds.get()))),
@@ -1491,8 +1500,9 @@ fn check_live_with_daemon<'f, 'd>(
     let clock = phases.clock().clone();
     let heap = opts.heap;
     let mut active = None;
+    let stop_host = daemon.is_none().then_some(host);
     let result = work::unwinding(|| {
-        crate::engine_status::watched(cx, Some(host), root, err, &clock, board, asking.every, live, || {
+        crate::engine_status::watched(cx, stop_host, root, err, &clock, board, asking.every, live, || {
             checking(cx, fs, host, rng, args, net, root, opts, shown, phases, out, err, board, &mut active, live, daemon)
         }).map_err(EngineCheckError::Watcher)?
     });
@@ -1595,13 +1605,13 @@ fn checking<'f, 'd>(
         Some(_) => None,
         None => {
             let opened = crate::store::open_for_command(cx, fs, host, rng, place.home, place.max_store_bytes, root, place.checkout, phases.clock(), err, heap)?;
-            crate::store::take::before_first_phase(cx, args, fs, net, &opened, toolchain, phases, err)?;
             Some(opened)
         }
     };
     let Some(opened) = daemon_opened.or(owned_opened.as_ref()) else {
         return Err(CliError::Text { what: "store must be opened either standalone or by daemon" });
     };
+    crate::store::take::before_first_phase(cx, args, fs, net, opened, toolchain, phases, err)?;
     let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, origin, phases.clock().clone(), err, erased.handle())?;
     phases.mark_cx(cx, "store open", frame);
     // 0. The stored answer (engine_answer.rs): its pointer, then the sweep of what it read.
@@ -1947,6 +1957,11 @@ fn checking<'f, 'd>(
                 }
                 pre_files.push((file, group));
             }
+            for &file in last.files.keys() {
+                if file.kind == Kind::Given && given_answers.binary_search_by_key(&file, |(name, _)| *name).is_err() {
+                    pre_files.push((file, &[]));
+                }
+            }
             let (mut woken, woke) = match crate::engine_ready_edit::wake(cx, &mut store, last_stored, &tools, &outlined, &given_answers, &pre_files, alloc) {
                 Ok(out) => out,
                 Err(CliError::EngineCheck(EngineCheckError::ReadyRefused(why))) => return Ok(Err(why)),
@@ -2157,9 +2172,10 @@ fn checking<'f, 'd>(
         // now): in the edit with no tasks, so its rows go and their cells move to absent. The phase
         // path's alone: the ready path plans the edited files only, and `choose` woke it because no
         // file was added or removed (engine_ready_edit.rs `PhasesWhy::FileAddedOrRemoved`).
-        if let (crate::engine_ready_edit::Chosen::Phases(_), Some(root)) = (chosen, last_root) {
+        if let Some(root) = last_root {
+            let whole_plan = matches!(chosen, crate::engine_ready_edit::Chosen::Phases(_));
             for file in root.files.keys() {
-                if !today.contains(file) {
+                if (whole_plan || file.kind == Kind::Given) && !today.contains(file) {
                     files.push((*file, &[]));
                 }
             }
@@ -2263,7 +2279,18 @@ fn checking<'f, 'd>(
             discovered.plan.files_read = discovered.plan.files_read.saturating_add(kept.read.load(core::sync::atomic::Ordering::Relaxed));
             let mut unread_files: Vec<Name, blaze_own::Alloc<'static>> = Vec::with_capacity_in(unread.files.len(), g);
             unread_files.extend_from_slice(&unread.files);
-            bodies.unread_outlines(unread_files);
+            let mut unread_digests: blaze_own::Vec<(blaze_own::String<blaze_own::SharedAlloc<'static>>, blaze_ids::ContentId), blaze_own::SharedAlloc<'static>> = blaze_own::Vec::new_in(heap.shared());
+            if !unread_files.is_empty()
+                && let Some(followed) = followed_kept.as_ref()
+            {
+                for row in followed.now.rows.iter() {
+                    if row.kind == crate::sweep::LeafKind::Slot && !row.absent() {
+                        unread_digests.push((blaze_own::String::from_str_in(followed.now.path(row), heap.shared()), row.id));
+                    }
+                }
+                unread_digests.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+            }
+            bodies.unread_outlines(unread_files, (!unread_digests.is_empty()).then(|| blaze_own::Arc::new_in(unread_digests, heap.shared())));
             phases.mark_cx(cx, "ready reads (the visited members' and the entering tasks' outlines read back)", frame);
             return Ok(unread.notes);
         }
@@ -3394,7 +3421,9 @@ where
     'f: 's,
     'm: 's,
 {
-    while one_phase(rq, engine, store, read, records, pipeline, last_lines, stored, files)? {}
+    let heads_snap: core::cell::OnceCell<crate::store::SharedSnapshot> = core::cell::OnceCell::new();
+    let mut heads_lazy: Option<crate::front_load::ScopeRecords<'_>> = None;
+    while one_phase(rq, engine, store, read, records, pipeline, last_lines, stored, files, &heads_snap, &mut heads_lazy)? {}
     Ok(())
 }
 
@@ -3410,7 +3439,7 @@ fn stop_point(rq: &Drive<'_, '_, '_, '_, '_>) -> Result<(), CliError> {
 /// ended. `false` when no phase is left.
 #[inline(never)]
 #[expect(clippy::too_many_arguments, reason = "phase handles, each named")]
-fn one_phase<'d, 'f, 'r, 's, 'w, 'm>(
+fn one_phase<'d, 'f, 'r, 's, 'w, 'm, 'l>(
     rq: &mut Drive<'d, 'f, 'r, 's, 'w>,
     engine: &mut Engine<'r, Everything>,
     store: &mut crate::store::CommandStore<'m, '_, bstd::io::LentDriver>,
@@ -3420,6 +3449,8 @@ fn one_phase<'d, 'f, 'r, 's, 'w, 'm>(
     last_lines: Option<&crate::engine_lines::Last<'_, '_>>,
     stored: Option<&crate::engine_answer::Stored<'_>>,
     files: &[(Name, &[Planned])],
+    heads_snap: &'l core::cell::OnceCell<crate::store::SharedSnapshot>,
+    heads_lazy: &mut Option<crate::front_load::ScopeRecords<'l>>,
 ) -> Result<bool, CliError>
 where
     'r: 's,
@@ -3482,7 +3513,7 @@ where
     rq.times.coordinator(Coordinator::Planning, ns(planning.since_start()), ns(began.since_start()));
     // The Bodies phase's run facts, in this phase's arena: made by `run_phase`, copied into the
     // put below, dropped with the phase's other buffers.
-    let phase_facts = run_stage(rq, engine, store, read, records, pipeline, last_lines, stored, files, phase, mixed, &mut entered, at_phase)?;
+    let phase_facts = run_stage(rq, engine, store, read, records, pipeline, last_lines, stored, files, phase, mixed, &mut entered, at_phase, heads_snap, heads_lazy)?;
     // Pipelined: the coordinator filed finished Scripts and Names tasks in order; else it ran
     // the phase whole (its pool joined).
     let what = if mixed.is_some() { Coordinator::Filing } else { Coordinator::Phase };
@@ -3867,7 +3898,7 @@ fn outline_copy<'r>(one: &Outlined<'_>, alloc: SharedAlloc<'r>) -> Result<Outlin
 /// stage's own driver. The Bodies phase hands back its run facts, in the phase's arena.
 #[inline(never)]
 #[expect(clippy::too_many_arguments, reason = "stage dispatch handles, each named")]
-fn run_stage<'d, 'f, 'r, 's, 'w, 'm, 'p>(
+fn run_stage<'d, 'f, 'r, 's, 'w, 'm, 'p, 'l>(
     rq: &mut Drive<'d, 'f, 'r, 's, 'w>,
     engine: &mut Engine<'r, Everything>,
     store: &mut crate::store::CommandStore<'m, '_, bstd::io::LentDriver>,
@@ -3881,6 +3912,8 @@ fn run_stage<'d, 'f, 'r, 's, 'w, 'm, 'p>(
     mixed: Option<Task>,
     entered: &mut SVec<'_, Task>,
     at_phase: SharedAlloc<'p>,
+    heads_snap: &'l core::cell::OnceCell<crate::store::SharedSnapshot>,
+    heads_lazy: &mut Option<crate::front_load::ScopeRecords<'l>>,
 ) -> Result<Option<crate::engine_bodies::MadeFacts<'p>>, CliError>
 where
     'r: 's,
@@ -3923,7 +3956,7 @@ where
         // PHASE-MEM-DEBT(Scripts): as Names': `ScriptsStage::results` on the request frame and
         // the process heap, kept to the command's end; to take `at_phase`.
         (None, Stage::Scripts) => rq.buffers[0].done.extend(entered.iter().map(|task| crate::engine_tasks::failed(task, alloc))),
-        (None, Stage::Heads) => heads_phase(rq, engine, store, read, &entered[..])?,
+        (None, Stage::Heads) => heads_phase(rq, engine, store, read, &entered[..], heads_snap, heads_lazy)?,
         // PHASE-MEM-DEBT(Lints): `LintsStage::made` on the process heap, kept to the command's
         // end for the put and the print; to take `at_phase`.
         (None, Stage::Lints) => {
@@ -4993,7 +5026,7 @@ fn ready_drive<'d, 'f, 'r, 's, 'w, 'm>(
     let by_need = prepared.scope_records();
     let parked = prepared.pre_open_lang_with(cx, &by_need, rq.workers, |cx| {
         crate::engine_ready_check::walk_lints(cx, &*rq.lints, rq.root, rq.outlined, &lint_tasks, alloc)
-    })?;
+    })??;
     let stages = crate::engine_ready_check::Stages { parked, runner: prepared.runner(rq.bodies.reads_paged(&stored_shelf), &by_need), decided };
     let driven = crate::engine_ready_check::drive_edit(engine, given_answers, &given_entering, rq.outlined, stages, &mut pool, alloc, heap.shared())?;
     let crate::engine_ready_check::Driven { finished, mut sunk, panicked } = driven;
@@ -5153,12 +5186,15 @@ fn ready_put<'m>(
 
 /// A Heads phase: the closed dependencies' heads found by key, then the head tasks run.
 #[inline(never)]
-fn heads_phase<'r, 'm>(
+#[expect(clippy::too_many_arguments, reason = "heads phase handles, each named")]
+fn heads_phase<'r, 'm, 'l>(
     rq: &mut Drive<'_, '_, 'r, '_, '_>,
     engine: &Engine<'r, Everything>,
     store: &mut crate::store::CommandStore<'m, '_, bstd::io::LentDriver>,
     read: &mut crate::engine_records::EngineRecords<'m>,
     entered: &[Task],
+    heads_snap: &'l core::cell::OnceCell<crate::store::SharedSnapshot>,
+    heads_lazy: &mut Option<crate::front_load::ScopeRecords<'l>>,
 ) -> Result<(), CliError> {
     #[cfg(test)]
     stack_probe::at("heads_phase");
@@ -5177,7 +5213,7 @@ fn heads_phase<'r, 'm>(
             once.find_dependencies(crate::engine_seeds::DependencyFinder::new(records, crates, crate::engine_seeds::tool_of(tools)));
         }
     }
-    rq.heads.run_phase(cx, &mut *store, &mut *read, &handles, kept, shelf, entered, engine.view(), &mut rq.buffers[0], &mut *rq.times, alloc, frame)
+    rq.heads.run_phase(cx, &mut *store, &mut *read, &handles, kept, shelf, entered, engine.view(), &mut rq.buffers[0], &mut *rq.times, alloc, frame, heads_snap, heads_lazy)
 }
 
 /// The phase's records to the store, sorted by key, committed before the next phase reads

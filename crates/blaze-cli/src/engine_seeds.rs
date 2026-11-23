@@ -206,8 +206,9 @@ fn each_crate_by(list: &CrateList<'static>, names_at: &dyn Fn(Name) -> Option<Ke
         let key = list.key(at);
         let names_at = names_at(blaze_drive::key::crate_scope_name(&key));
         let member = list.member(at);
+        let checkout_backed = member || list.root(at).starts_with("/0/");
         let toolchain = CrateGraph::toolchain(list, at);
-        push(CrateAt { prefix: key.prefix(), key, names_at, member, closed: !member, toolchain });
+        push(CrateAt { prefix: key.prefix(), key, names_at, member, closed: !checkout_backed, toolchain });
     }
 }
 
@@ -1051,8 +1052,8 @@ impl<'p> RequestTable<'p> {
         // case), renew the root in O(1) without probing, sorting, or hashing all listed keys.
         if puts.is_empty() && self.added_listed.is_empty() && self.had_root && self.listed_from_root <= MOST_CELLS {
             listed_count = self.listed_from_root;
-            if self.listed_from_root > 0 {
-                store.renew(&[root], RENEW_SENTINEL)?;
+            if self.listed_from_root > 0 && !store.renew_one(root)? {
+                return Err(CliError::Text { what: "the dependency heads' root expired before merge (engine_seeds.rs `merge`)" });
             }
         } else if !puts.is_empty() || !self.added_listed.is_empty() || self.listed_from_root > 0 {
             let mut keys: std::vec::Vec<Key, Global> = std::vec::Vec::with_capacity_in(self.listed_from_root + self.added_listed.len() + puts.len(), Global);
@@ -1065,6 +1066,8 @@ impl<'p> RequestTable<'p> {
                     key.copy_from_slice(chunk);
                     keys.push(Key(ContentId(key)));
                 }
+            } else if self.had_root && self.listed_from_root > 0 {
+                return Err(CliError::Text { what: "the dependency heads' root expired before merge (engine_seeds.rs `merge`)" });
             }
             if !self.added_listed.is_empty() {
                 keys.extend_from_slice(&self.added_listed);

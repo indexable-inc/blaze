@@ -162,6 +162,22 @@ impl Source for LocalDir {
     }
 }
 
+/// Reset-safe identity of the committed `head` file on disk: combines the head slot's full
+/// manifest coordinates (`generation`, `log`, `manifest_at`, `manifest_len`, `manifest_crc`) with
+/// the path-resolved `(dev, ino)` from `Stat`, so a resident daemon detects external commits,
+/// `blaze clean --store`, and wipe+recreate to the same generation number (even when an `io_uring`
+/// driver retains a cached descriptor for the unlinked old `head` inode).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HeadIdentity {
+    pub generation: u64,
+    pub log: u64,
+    pub manifest_at: u64,
+    pub manifest_len: u32,
+    pub manifest_crc: u32,
+    pub dev: u64,
+    pub ino: u64,
+}
+
 /// The plain store driven on the calling thread, what it keeps in the caller's `A`. The
 /// effect queues stay blaze-core's process-heap vectors (`Driver::submit`, `Driver::poll`).
 pub struct Driven<D: Driver, A: Allocator + Clone> {
@@ -764,66 +780,86 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         self.core.release_lease()
     }
 
-    /// [`Plain::rearm_lease`].
+    /// [`Plain::rearm_lease`], refreshing `opened_ns` to the driver's current wall clock.
     pub fn rearm_lease(&mut self) {
-        self.core.rearm_lease()
+        let now_ns = self.driver.wall_ns();
+        self.core.rearm_lease(now_ns)
     }
 
-    /// Reads only the fixed [`format::HEAD_LEN`] bytes of `head` through the driver (zero segment
-    /// opens or mmaps) and returns the current committed generation on disk (`0` when fresh or
-    /// missing), so a resident daemon can detect external commits, `blaze gc`, or
-    /// `blaze clean --store` in O(1) and reopen only when `disk_gen != self.core().generation()`.
-    pub fn head_generation_on_disk(&mut self) -> Result<u64, StoreError> {
+    /// Reads at most [`format::HEAD_LEN`] + 1 bytes of `head` through the driver (zero segment
+    /// opens or mmaps, bounded allocation) alongside a path-based `Stat` and returns the
+    /// reset-safe [`HeadIdentity`] on disk (`None` when fresh or missing).
+    pub fn head_identity_on_disk(&mut self) -> Result<Option<HeadIdentity>, StoreError> {
         let stat_tag = EffectTag(OWN_TAGS);
         let read_tag = EffectTag(OWN_TAGS + 1);
         let head = self.core.head_file().share();
         // `Effect::Stat` always resolves `head` by path (`OP_STATX` on Linux `io_uring`), whereas
-        // `Effect::ReadAll` may read from a kept descriptor in `Uring::names` if `head` was
-        // unlinked externally (e.g. `blaze clean --store`).
+        // `Effect::Read` may read from a kept descriptor in `Uring::names` if `head` was
+        // unlinked externally (e.g. `blaze clean --store`). Carrying `(dev, ino)` from `Stat`
+        // guarantees any replaced `head` inode produces a distinct `HeadIdentity`.
         self.effects.push(Effect::Stat { file: head.share(), tag: stat_tag });
-        self.effects.push(Effect::ReadAll { file: head, tag: read_tag });
+        self.effects.push(Effect::Read { file: head, at: 0, len: format::HEAD_LEN + 1, tag: read_tag });
         self.run("reading the head generation")?;
-        let mut head_exists = None;
+        let mut head_stat: Option<Option<(u64, u64)>> = None;
         let mut read_bytes = None;
-        let mut first_error = None;
+        let mut stat_error = None;
+        let mut read_error = None;
         for completion in self.own.drain(..) {
             if completion.tag == stat_tag {
                 match completion.done {
-                    Done::Stat(meta) => head_exists = Some(meta.is_some_and(|m| !m.dir)),
+                    Done::Stat(meta) => head_stat = Some(meta.filter(|m| !m.dir).map(|m| (m.dev, m.ino))),
                     Done::Failed(error) | Done::Broken { error, .. } => {
-                        first_error.get_or_insert(StoreError::Io { doing: "reading the head generation", file: StoreFile::Head, error: error.0 });
+                        stat_error.get_or_insert(StoreError::Io { doing: "reading the head generation", file: StoreFile::Head, error: error.0 });
                     }
                     _ => {
-                        first_error.get_or_insert(StoreError::Other { what: "unexpected completion while reading the head generation" });
+                        stat_error.get_or_insert(StoreError::Other { what: "unexpected completion while reading the head generation" });
                     }
                 }
             } else if completion.tag == read_tag {
                 match completion.done {
                     Done::Read(bytes) => read_bytes = Some(bytes),
                     Done::Failed(error) | Done::Broken { error, .. } => {
-                        first_error.get_or_insert(StoreError::Io { doing: "reading the head generation", file: StoreFile::Head, error: error.0 });
+                        read_error.get_or_insert(StoreError::Io { doing: "reading the head generation", file: StoreFile::Head, error: error.0 });
                     }
                     _ => {
-                        first_error.get_or_insert(StoreError::Other { what: "unexpected completion while reading the head generation" });
+                        read_error.get_or_insert(StoreError::Other { what: "unexpected completion while reading the head generation" });
                     }
                 }
             }
         }
-        if let Some(error) = first_error {
+        if let Some(error) = stat_error {
             return Err(error);
         }
-        if head_exists == Some(false) {
-            return Ok(0);
+        let Some(Some((dev, ino))) = head_stat else {
+            return Ok(None);
+        };
+        if let Some(error) = read_error {
+            return Err(error);
         }
         let Some(bytes) = read_bytes else {
             return Err(StoreError::Unfinished { what: "reading the head generation" });
         };
         match format::read_head(&bytes) {
-            format::HeadRead::Committed(newest, _, _) => Ok(newest.generation),
-            format::HeadRead::Fresh { .. } => Ok(0),
+            format::HeadRead::Committed(newest, _, _) => Ok(Some(HeadIdentity {
+                generation: newest.generation,
+                log: newest.log,
+                manifest_at: newest.manifest_at,
+                manifest_len: newest.manifest_len,
+                manifest_crc: newest.manifest_crc,
+                dev,
+                ino,
+            })),
+            format::HeadRead::Fresh { .. } => Ok(None),
             format::HeadRead::Version { found, .. } => Err(StoreError::Format { what: format::HEAD_SLOT, found, wanted: format::FORMAT }),
             format::HeadRead::Refused(why) => Err(why),
         }
+    }
+
+    /// Reads only the fixed [`format::HEAD_LEN`] bytes of `head` through the driver (zero segment
+    /// opens or mmaps) and returns the current committed generation on disk (`0` when fresh or
+    /// missing).
+    pub fn head_generation_on_disk(&mut self) -> Result<u64, StoreError> {
+        Ok(self.head_identity_on_disk()?.map_or(0, |id| id.generation))
     }
 
     /// The exit tail sealed ([`Plain::seal`]): a command calls it after it answered, before or
