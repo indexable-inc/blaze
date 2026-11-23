@@ -468,6 +468,28 @@ fn stamp_of_stat(st: &blaze_sys::posix::proc::stat) -> Stamp {
     }
 }
 
+/// Zero-TOCTOU post-`EV_ADD` verification that `fd` still refers to the inode currently at `cpath`.
+/// `openat(O_EVTONLY)` without `O_SYMLINK` follows symlinks, so `fstat(fd)` reports the target's
+/// `(st_dev, st_ino)` while `lstat` reports the link's own; when `lstat` sees `S_IFLNK`, verify
+/// against `stat_at(..., 0)` so symlinks verify cleanly instead of looping `initial_needs_refresh`.
+#[cfg(target_os = "macos")]
+fn fd_matches_path(fd: blaze_sys::Fd, cpath: blaze_sys::Path<'_>) -> Option<blaze_sys::posix::proc::stat> {
+    use blaze_sys::posix::io::CWD;
+    use blaze_sys::posix::proc::{AT_SYMLINK_NOFOLLOW, S_IFLNK, S_IFMT, stat_at, stat_fd};
+    let f = stat_fd(fd).ok()?;
+    let l = stat_at(CWD, cpath, AT_SYMLINK_NOFOLLOW).ok()?;
+    if f.st_dev == l.st_dev && f.st_ino == l.st_ino {
+        return Some(f);
+    }
+    if (l.st_mode & S_IFMT) == S_IFLNK {
+        let t = stat_at(CWD, cpath, 0).ok()?;
+        if f.st_dev == t.st_dev && f.st_ino == t.st_ino {
+            return Some(f);
+        }
+    }
+    None
+}
+
 #[cfg(target_os = "macos")]
 fn join_abs<'a>(base: &str, rel: &str, buf: &'a mut [u8; 4096]) -> Option<blaze_sys::Path<'a>> {
     let base_b = base.trim_end_matches('/').as_bytes();
@@ -693,6 +715,10 @@ impl KqueueVnode {
                         && row.id == crate::engine_script_reads::NONE;
                     if is_absent || script_none {
                         absent_checks.push((AString::from_str_in(path, heap), false));
+                    } else if path.is_empty() {
+                        // Checkout root `""` is already watched in Phase 1 (`dir_set`); mark its
+                        // stamp `None` so `verify_root_listing` checks every root leaf post-`EV_ADD`.
+                        dir_stamps.insert(AString::from_str_in("", heap), None);
                     } else {
                         let maybe_dir = row.kind == LeafKind::ScriptStat
                             || (row.kind == LeafKind::ScriptFile && row.id == crate::engine_script_reads::NOT_A_FILE);
@@ -805,12 +831,9 @@ impl KqueueVnode {
             if kevent(kq.fd(), &[ev], &mut [], None).is_err() {
                 return None;
             }
-            // Zero-TOCTOU post-EV_ADD verification: fstat(fd) + lstat(path) must match!
-            let f_st = stat_fd(fd.fd());
-            let l_st = stat_at(CWD, cpath, AT_SYMLINK_NOFOLLOW);
-            let (same_inode, stamp_ok) = match (f_st, l_st) {
-                (Ok(f), Ok(l)) => {
-                    let same = f.st_dev == l.st_dev && f.st_ino == l.st_ino && (f.st_mode & S_IFMT) == S_IFDIR;
+            // Zero-TOCTOU post-EV_ADD verification: fstat(fd) + path stat must match!
+            let (same_inode, stamp_ok) = match fd_matches_path(fd.fd(), cpath) {
+                Some(f) if (f.st_mode & S_IFMT) == S_IFDIR => {
                     let stamp_ok = match dir_stamps.get(dir_rel.as_str()) {
                         Some(Some(expected)) => stamp_of_stat(&f) == *expected,
                         // Listing leaf had `stamp == None` (unsettled dir or checkout root `""`):
@@ -819,7 +842,7 @@ impl KqueueVnode {
                         // Ancestor/module-stem dir only (not a Listing leaf itself).
                         None => true,
                     };
-                    (same, stamp_ok)
+                    (true, stamp_ok)
                 }
                 _ => (false, false),
             };
@@ -885,11 +908,8 @@ impl KqueueVnode {
             if kevent(kq.fd(), &[ev], &mut [], None).is_err() {
                 return None;
             }
-            let f_st = stat_fd(fd.fd());
-            let l_st = stat_at(CWD, cpath, AT_SYMLINK_NOFOLLOW);
-            let (same_inode, stamp_ok, kind_ok) = match (f_st, l_st) {
-                (Ok(f), Ok(l)) => {
-                    let same = f.st_dev == l.st_dev && f.st_ino == l.st_ino;
+            let (same_inode, stamp_ok, kind_ok) = match fd_matches_path(fd.fd(), cpath) {
+                Some(f) => {
                     // NEVER assume `expected_stamp == None` (unsettled/racy-window file or `BOTH`)
                     // is clean: always force verification on the next poll!
                     let stamp_ok = match expected_stamp {
@@ -897,9 +917,9 @@ impl KqueueVnode {
                         None => false,
                     };
                     let kind_ok = maybe_dir || (f.st_mode & S_IFMT) != S_IFDIR;
-                    (same, stamp_ok, kind_ok)
+                    (true, stamp_ok, kind_ok)
                 }
-                _ => (false, false, false),
+                None => (false, false, false),
             };
             if !same_inode || !kind_ok {
                 initial_needs_refresh = true;
@@ -1142,11 +1162,7 @@ impl KqueueVnode {
                                     if kevent(kq.fd(), &[ev], &mut [], None).is_err() {
                                         return None;
                                     }
-                                    let same = match (stat_fd(fd.fd()), stat_at(CWD, cpath, AT_SYMLINK_NOFOLLOW)) {
-                                        (Ok(f), Ok(l)) => f.st_dev == l.st_dev && f.st_ino == l.st_ino,
-                                        _ => false,
-                                    };
-                                    if !same {
+                                    if fd_matches_path(fd.fd(), cpath).is_none() {
                                         initial_facts_dirty = true;
                                         initial_needs_refresh = true;
                                     }
@@ -1199,29 +1215,60 @@ impl KqueueVnode {
         })
     }
 
-    /// Post-`EV_ADD` verification for the checkout root's `Listing("")` row (which always stores
-    /// `row.stamp = None`): if `sweep::list_dir("")` still matches `row.id`, clears `""` from
-    /// `initial_dirty` so even the very first warm request after arming can hit `PollOutcome::Clean`.
+    /// Post-`EV_ADD` verification for checkout root (`""`) leaves (`Listing`, `ScriptStat`,
+    /// `ScriptFile`, `ScriptListing`, which always store `row.stamp = None`): if EVERY root leaf
+    /// still matches today's value, clears `""` from `initial_dirty` so even the very first warm
+    /// request after arming can hit `PollOutcome::Clean`.
     pub(crate) fn verify_root_listing(&mut self, cx: &Cx, root: &Dir<ReadWrite>, leaves: &Leaves<'_>, frame: &Frame) {
         if !self.initial_dirty.iter().any(|p| p.as_str().is_empty()) {
             return;
         }
-        let mut expected_id = None;
+        let mut saw_root = false;
         for i in 0..leaves.len() {
             let row = leaves.row(i);
-            if row.kind == LeafKind::Listing && leaves.path(i).is_empty() && row.flags & ABSENT == 0 {
-                expected_id = Some(row.id);
-                break;
+            if !leaves.path(i).is_empty() {
+                continue;
+            }
+            match row.kind {
+                LeafKind::Listing => {
+                    if row.flags & ABSENT != 0 {
+                        return;
+                    }
+                    let Ok(entries) = crate::sweep::list_dir(cx, root, "", frame) else {
+                        return;
+                    };
+                    let (flags, id) = crate::sweep::listing_id(entries.as_ref().map(crate::sweep::Listing::entries));
+                    if flags != 0 || id != row.id {
+                        return;
+                    }
+                    saw_root = true;
+                }
+                LeafKind::ScriptStat => {
+                    if row.id != blaze_proc_macro::script_sandbox::stat_answer(true, 0) {
+                        return;
+                    }
+                    saw_root = true;
+                }
+                LeafKind::ScriptFile => {
+                    if row.id != crate::engine_script_reads::NOT_A_FILE {
+                        return;
+                    }
+                    saw_root = true;
+                }
+                LeafKind::ScriptListing => {
+                    let Ok(id) = crate::engine_script_reads::root_listing_id(cx, root, frame) else {
+                        return;
+                    };
+                    if id != row.id {
+                        return;
+                    }
+                    saw_root = true;
+                }
+                _ => return,
             }
         }
-        let Some(expected) = expected_id else {
-            return;
-        };
-        if let Ok(entries) = crate::sweep::list_dir(cx, root, "", frame) {
-            let (flags, id) = crate::sweep::listing_id(entries.as_ref().map(crate::sweep::Listing::entries));
-            if flags == 0 && id == expected {
-                self.initial_dirty.retain(|p| !p.as_str().is_empty());
-            }
+        if saw_root {
+            self.initial_dirty.retain(|p| !p.as_str().is_empty());
         }
     }
 

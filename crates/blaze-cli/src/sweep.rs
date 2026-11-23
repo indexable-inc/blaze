@@ -1188,10 +1188,28 @@ impl<S: Stamps> Follow<S> {
                                 LeafKind::ScriptStat => "sweep: a build script's stat asked again of its served tree",
                                 _ => "sweep: a build script's file asked again of its served tree",
                             });
+                            let before_stamp = match kind {
+                                crate::engine_script_reads::ReadKind::File | crate::engine_script_reads::ReadKind::Listing => {
+                                    crate::engine_script_reads::settled_path_stamp(&cx, root, &self.stamps, self.plant, path)
+                                }
+                                crate::engine_script_reads::ReadKind::Stat | crate::engine_script_reads::ReadKind::Git => None,
+                            };
                             asked.event("asked");
-                            let row = checkout.row(kind, path)?;
+                            let (flags, _, id) = checkout.row(kind, path)?;
                             asked.event("answered");
-                            row
+                            let stamp = match crate::engine_script_reads::settled_meta_stamp(&cx, root, &self.stamps, self.plant, kind, path, id) {
+                                Some(stamp) => Some(stamp),
+                                None if matches!(kind, crate::engine_script_reads::ReadKind::File | crate::engine_script_reads::ReadKind::Listing)
+                                    && before_stamp.is_some()
+                                    && id != crate::engine_script_reads::NONE
+                                    && id != crate::engine_script_reads::DENIED =>
+                                {
+                                    let after_stamp = crate::engine_script_reads::settled_path_stamp(&cx, root, &self.stamps, self.plant, path);
+                                    (after_stamp == before_stamp).then_some(before_stamp).flatten()
+                                }
+                                None => None,
+                            };
+                            (flags, stamp, id)
                         }
                         None => crate::engine_script_reads::now(&cx, root, &self.stamps, self.plant, kind, path, Some((old.stamp, old.id)), frame)?,
                     }

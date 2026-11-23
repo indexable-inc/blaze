@@ -85,7 +85,7 @@ pub(crate) const NONE: ContentId = ContentId([0xA0; 32]);
 pub(crate) use script_sandbox::{NOT_A_FILE, NOT_A_FOLDER};
 /// A read now stops at the sandbox boundary. The script must enter and see
 /// that refusal itself, even when its old observation was absence.
-const DENIED: ContentId = ContentId([0xA3; 32]);
+pub(crate) const DENIED: ContentId = ContentId([0xA3; 32]);
 
 /// The most checkout reads one run's record keeps: past it the run is refused by name (rule 18).
 pub(crate) const READS_CAP: usize = script_sandbox::READS_CAP;
@@ -427,14 +427,16 @@ pub(crate) fn file_read(path: &str, bytes: Option<&[u8]>) -> Option<(Name, Conte
 /// read no row reads any more leaves the table, so its task is no longer planned and is retired
 /// (rule 18: the followed set is bounded by the reads the answer holds).
 pub(crate) fn keep_rows<'r>(followed: Option<&Rows<'_>>, fresh: impl Iterator<Item = (ReadKind, &'r str, ContentId)>, kept_cells: impl Fn(Name) -> bool, out: &mut Rows<'_>) {
-    keep_rows_with(followed, core::iter::empty(), fresh, false, |name, _| kept_cells(name), |_, _| false, out);
+    keep_rows_with(followed, core::iter::empty(), fresh, false, |name, _| kept_cells(name), |_, _| false, |_, _, _| None, out);
 }
 
 /// Faster [`keep_rows`] for the command tail: `fresh_scripts` are reads recorded by kept,
 /// succeeded build scripts that ran in this request (so each is guaranteed to have a reader in
 /// `finished.answer` without querying `LastAnswer::readers`), deduplicated by `(kind, path)`
 /// before hashing. Preserves [`crate::sweep::DIRECT_PATH`] on followed rows and marks newly
-/// observed direct non-symlink paths via `is_direct`.
+/// observed direct non-symlink paths via `is_direct`; stamps freshly recorded meta-only rows
+/// via `stamp_of`.
+#[expect(clippy::too_many_arguments, reason = "the tail's script-row merger takes its inputs by name")]
 pub(crate) fn keep_rows_with<'r>(
     followed: Option<&Rows<'_>>,
     fresh_scripts: impl Iterator<Item = (ReadKind, &'r str, ContentId)>,
@@ -442,6 +444,7 @@ pub(crate) fn keep_rows_with<'r>(
     followed_all_kept: bool,
     kept_cells: impl Fn(Name, bool) -> bool,
     is_direct: impl Fn(ReadKind, &str) -> bool,
+    stamp_of: impl Fn(ReadKind, &str, ContentId) -> Option<Stamp>,
     out: &mut Rows<'_>,
 ) {
     let alloc = *out.rows.allocator();
@@ -472,7 +475,8 @@ pub(crate) fn keep_rows_with<'r>(
             } else {
                 leaf.flags
             };
-            out.push(leaf.kind, flags, path, leaf.stamp, leaf.id);
+            let stamp = leaf.stamp.or_else(|| stamp_of(kind, path, leaf.id));
+            out.push(leaf.kind, flags, path, stamp, leaf.id);
         }
     }
     for ((kind, path), answer) in fresh_unique.iter() {
@@ -481,7 +485,8 @@ pub(crate) fn keep_rows_with<'r>(
         }
         seen.insert((*kind, *path));
         let flags = if is_direct(*kind, *path) { crate::sweep::DIRECT_PATH } else { 0 };
-        out.push(kind.leaf(), flags, path, None, *answer);
+        let stamp = stamp_of(*kind, *path, *answer);
+        out.push(kind.leaf(), flags, path, stamp, *answer);
     }
     for (kind, path, answer) in more {
         if seen.contains(&(kind, path)) {
@@ -494,7 +499,8 @@ pub(crate) fn keep_rows_with<'r>(
         seen.insert((kind, path));
         seen_more.insert(name);
         let flags = if is_direct(kind, path) { crate::sweep::DIRECT_PATH } else { 0 };
-        out.push(kind.leaf(), flags, path, None, answer);
+        let stamp = stamp_of(kind, path, answer);
+        out.push(kind.leaf(), flags, path, stamp, answer);
     }
 }
 
@@ -535,9 +541,9 @@ pub(crate) fn now(
     match (kind, proven) {
         // Answered above, before any stat of its rest (which is no path).
         (ReadKind::Git, _) => Ok((0, None, git_now(cx, root, path, frame)?)),
-        (ReadKind::Stat, _) => Ok((0, None, script_sandbox::stat_answer(is_dir, meta.as_ref().map_or(0, |meta| meta.len)))),
-        (ReadKind::File, _) if is_dir => Ok((0, None, NOT_A_FILE)),
-        (ReadKind::Listing, _) if !is_dir => Ok((0, None, NOT_A_FOLDER)),
+        (ReadKind::Stat, _) => Ok((0, stamp, script_sandbox::stat_answer(is_dir, meta.as_ref().map_or(0, |meta| meta.len)))),
+        (ReadKind::File, _) if is_dir => Ok((0, stamp, NOT_A_FILE)),
+        (ReadKind::Listing, _) if !is_dir => Ok((0, stamp, NOT_A_FOLDER)),
         (_, Some(id)) => Ok((0, stamp, id)),
         (ReadKind::File, None) => {
             let mut bytes = Bytes::new_in(frame, "a file a build script read");
@@ -549,6 +555,70 @@ pub(crate) fn now(
         }
         (ReadKind::Listing, None) => Ok((0, stamp, listing(cx, root, path, frame)?)),
     }
+}
+
+/// The settled stamp of `path` under `root`, when `path` is a non-empty relative path that
+/// currently exists and its stat is settled under `stamps` and `plant`.
+pub(crate) fn settled_path_stamp(cx: &Cx, root: &Dir<ReadWrite>, stamps: &impl Stamps, plant: Plant, path: &str) -> Option<Stamp> {
+    if path.is_empty() || !relative(path) {
+        return None;
+    }
+    let path_obj = Path::new(path).ok()?;
+    let meta = root.stat(cx, &path_obj).ok()??;
+    match plant {
+        Plant::RacyTrusted => stamps.stamp(path, &meta),
+        Plant::None | Plant::AbsentForgotten => stamps.stamp(path, &meta).filter(|it| it.settled(stamps.swept_at_ns(), stamps.granularity_ns())),
+    }
+}
+
+/// A settled stamp proving `answer` from a single `stat(path)` alone (zero TOCTOU):
+/// - `ReadKind::Stat`: `stat_answer(meta.dir, meta.len) == answer`
+/// - `ReadKind::File`: `meta.dir && answer == NOT_A_FILE`
+/// - `ReadKind::Listing`: `!meta.dir && answer == NOT_A_FOLDER`
+/// Returns `None` if `path` is empty, non-relative, missing, unsettled, or disagrees with `answer`.
+pub(crate) fn settled_meta_stamp(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    stamps: &impl Stamps,
+    plant: Plant,
+    kind: ReadKind,
+    path: &str,
+    answer: ContentId,
+) -> Option<Stamp> {
+    if path.is_empty() || !relative(path) || answer == NONE || answer == DENIED {
+        return None;
+    }
+    let is_meta_only = match kind {
+        ReadKind::Stat => true,
+        ReadKind::File => answer == NOT_A_FILE,
+        ReadKind::Listing => answer == NOT_A_FOLDER,
+        ReadKind::Git => return None,
+    };
+    if !is_meta_only {
+        return None;
+    }
+    let path_obj = Path::new(path).ok()?;
+    let meta = root.stat(cx, &path_obj).ok()??;
+    let matches = match kind {
+        ReadKind::Stat => script_sandbox::stat_answer(meta.dir, meta.len) == answer,
+        ReadKind::File => meta.dir,
+        ReadKind::Listing => !meta.dir,
+        ReadKind::Git => false,
+    };
+    if !matches {
+        return None;
+    }
+    match plant {
+        Plant::RacyTrusted => stamps.stamp(path, &meta),
+        Plant::None | Plant::AbsentForgotten => stamps.stamp(path, &meta).filter(|it| it.settled(stamps.swept_at_ns(), stamps.granularity_ns())),
+    }
+}
+
+/// The `dir:` listing digest of the checkout root `""`, for post-`EV_ADD` verification of root
+/// `ScriptListing` leaves in `daemon_watch`.
+#[cfg(target_os = "macos")]
+pub(crate) fn root_listing_id(cx: &Cx, root: &Dir<ReadWrite>, frame: &Frame) -> Result<ContentId, CliError> {
+    listing(cx, root, "", frame)
 }
 
 /// The `dir:` answer of the folder at `path` ("" the checkout's root): every entry, in name order
@@ -669,6 +739,9 @@ impl<'f> Served<'f> {
 /// reason printed: [`NoCoverage`]), never an error.
 pub(crate) struct CheckoutSweep<'t, 'f> {
     tree: script_sandbox::Tree,
+    /// Canonical checkout root path when backed by a real disk tree (`Served::Root`), used to
+    /// verify that nonexistent script paths traverse no symlink (`absent_direct`).
+    root_abs: Option<&'f str>,
     /// Each status question asked this command, by its key ([`status_key`]): the answer's
     /// digest (the cell's), and the answer.
     status: blaze_own::BTreeMap<ContentId, (ContentId, StatusCell<'t>), &'f Frame>,
@@ -976,6 +1049,7 @@ impl<'t, 'f> CheckoutSweep<'t, 'f> {
     pub(crate) fn new(tree: script_sandbox::Tree, scratch: Alloc<'t>, frame: &'f Frame) -> Self {
         Self {
             tree,
+            root_abs: None,
             status: blaze_own::BTreeMap::new_in(frame),
             previous: Err(NoCoverage::NotRead),
             journal: None,
@@ -993,7 +1067,10 @@ impl<'t, 'f> CheckoutSweep<'t, 'f> {
             return Some(Self { plant: crate::engine_scripts::runner_coverage_plant(), ..Self::new(tree, scratch, frame) });
         }
         match served {
-            Served::Root(root) => Some(Self::new(script_sandbox::dir_tree(root), scratch, frame)),
+            Served::Root(root) => {
+                let root_abs = root.path().to_str().map(|s| &*frame.alloc_str(s));
+                Some(Self { root_abs, ..Self::new(script_sandbox::dir_tree(root), scratch, frame) })
+            }
             Served::Simulated => None,
         }
     }
@@ -1200,7 +1277,10 @@ impl<'t, 'f> CheckoutSweep<'t, 'f> {
     }
 
     pub(crate) fn is_direct(&self, kind: ReadKind, path: &str) -> bool {
-        matches!(kind, ReadKind::File | ReadKind::Stat | ReadKind::Listing) && relative(path) && self.tree.is_direct(path)
+        if !matches!(kind, ReadKind::File | ReadKind::Stat | ReadKind::Listing) || !relative(path) {
+            return false;
+        }
+        self.tree.is_direct(path) || self.root_abs.is_some_and(|root| absent_direct(root, path))
     }
 
     pub(crate) fn row(&mut self, kind: ReadKind, path: &str) -> Result<(u8, Option<Stamp>, ContentId), CliError> {
@@ -1218,7 +1298,7 @@ impl<'t, 'f> CheckoutSweep<'t, 'f> {
             Ok(answer) => answer.unwrap_or(NONE),
             Err(_) => DENIED,
         };
-        let flags = if self.tree.is_direct(path) { crate::sweep::DIRECT_PATH } else { 0 };
+        let flags = if self.is_direct(kind, path) { crate::sweep::DIRECT_PATH } else { 0 };
         Ok((flags, None, answer))
     }
 
@@ -1248,6 +1328,78 @@ impl<'t, 'f> CheckoutSweep<'t, 'f> {
             _ => Ok(script_sandbox::git_answer(&self.tree, folder, words, alloc).unwrap_or(NONE)),
         }
     }
+}
+
+/// Returns `true` when `path` is a clean relative checkout path that does not exist on disk and
+/// whose existing ancestor components under `root_abs` are all non-symlinks (and `path` itself
+/// is not a broken symlink). Such absent paths can only appear via a write in one of their
+/// watched ancestor directories.
+fn absent_direct(root_abs: &str, path: &str) -> bool {
+    use blaze_sys::Errno;
+    use blaze_sys::posix::io::CWD;
+    use blaze_sys::posix::proc::{AT_SYMLINK_NOFOLLOW, S_IFDIR, S_IFLNK, S_IFMT, stat_at};
+
+    if path.is_empty() || path.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+        return false;
+    }
+    let root_b = root_abs.trim_end_matches('/').as_bytes();
+    let mut buf = [0u8; 4096];
+    let mut end = 0usize;
+    while end < path.len() {
+        let Some(rest) = path.get(end..) else {
+            return false;
+        };
+        let next = rest.find('/').map_or(path.len(), |i| end + i);
+        let Some(prefix) = path.get(..next) else {
+            return false;
+        };
+        let Some(sep_at) = root_b.len().checked_add(1) else {
+            return false;
+        };
+        let Some(nul_at) = sep_at.checked_add(prefix.len()) else {
+            return false;
+        };
+        let Some(needed) = nul_at.checked_add(1) else {
+            return false;
+        };
+        let Some(dst_root) = buf.get_mut(..root_b.len()) else {
+            return false;
+        };
+        dst_root.copy_from_slice(root_b);
+        let Some(sep) = buf.get_mut(root_b.len()) else {
+            return false;
+        };
+        *sep = b'/';
+        let Some(dst_prefix) = buf.get_mut(sep_at..nul_at) else {
+            return false;
+        };
+        dst_prefix.copy_from_slice(prefix.as_bytes());
+        let Some(nul) = buf.get_mut(nul_at) else {
+            return false;
+        };
+        *nul = 0;
+        let Some(slice) = buf.get(..needed) else {
+            return false;
+        };
+        let Ok(cstr) = core::ffi::CStr::from_bytes_with_nul(slice) else {
+            return false;
+        };
+        match stat_at(CWD, blaze_sys::Path::new(cstr), AT_SYMLINK_NOFOLLOW) {
+            Ok(st) => {
+                let kind = st.st_mode & S_IFMT;
+                if kind == S_IFLNK {
+                    return false;
+                }
+                if kind != S_IFDIR {
+                    return next < path.len();
+                }
+            }
+            Err(Errno::NoEnt | Errno::NotDir) => return true,
+            Err(_) => return false,
+        }
+        end = next + 1;
+    }
+    false
 }
 
 fn git_parts<'s>(asked: &'s str, words: &mut [&'s str; MOST_GIT_WORDS]) -> Result<(&'s str, usize), CliError> {

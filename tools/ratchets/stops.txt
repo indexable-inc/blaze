@@ -32,7 +32,7 @@ blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1384
+blaze-cli	1383
 blaze-code	94
 blaze-columns	193
 blaze-comptime	68

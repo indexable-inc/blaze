@@ -38,12 +38,16 @@
 //! out (32); the tool (32); made at (u64); the member count (u32); then each member sorted by
 //! its place in the crate list: place (u32), its unit's name (kind u8, subject 32), its crate
 //! prefix (8), test (u8), its state tag (u8: 0 held, 1 refused because its `CrateScope` failed,
-//! 2 refused because it had no `Names` task, 3 refused/unstood — never stands); for held (tag 0):
-//! its names input's name (33) and out (32), its row's key (32), its row's uncovered count (u32),
-//! its row's named labels (u32 count, each a u32 length and UTF-8), its held files (u32 count,
-//! each: file index u32, outline name 33, outline path as a u32 length and bytes, entries digest
-//! 32); then for all tags: its reached files it does not hold (for refused/unstood, its entire
-//! reached module tree), in the order its claims were made (u32 count, each an outline name 33).
+//! 2 refused because it had no `Names` task, 3 refused/unstood — never stands, 4 cut check scope
+//! whose own `CrateScope` and `items` opened cleanly but a check-scope dependency had no names
+//! record); for held (tag 0): its names input's name (33) and out (32), its row's key (32), its
+//! row's uncovered count (u32), its row's named labels (u32 count, each a u32 length and UTF-8),
+//! its held files (u32 count, each: file index u32, outline name 33, outline path as a u32 length
+//! and bytes, entries digest 32); for cut scope (tag 4): its names input's name (33) and out (32),
+//! the first missing dependency crate's name (33) and failed flag (u8), and its held files (same
+//! form as tag 0); then for all tags: its reached files it does not hold (for refused/unstood, its
+//! entire reached module tree), in the order its claims were made (u32 count, each an outline name
+//! 33).
 
 use core::fmt;
 
@@ -55,7 +59,7 @@ use crate::engine_body_plan::Unit;
 use crate::engine_heads::Subject;
 
 /// The form's first bytes; the last is its version.
-const MAGIC: [u8; 8] = *b"BLZMEMB\x02";
+const MAGIC: [u8; 8] = *b"BLZMEMB\x03";
 
 /// The setup's strategy (rule 78: a type parameter at one seam, engine_bodies.rs `groups`).
 pub(crate) trait SetupInputs {
@@ -90,15 +94,35 @@ pub(crate) struct Member<'r> {
     pub(crate) not_held: AVec<'r, Name>,
 }
 
-/// Whether a recorded member was read whole and kept a row, or refused/unstood.
+/// Whether a recorded member was read whole and kept a row, had a cut check scope, or was
+/// refused/unstood.
 pub(crate) enum MemberState<'r> {
     /// Read whole, its listing row kept by the store, and every file row in its items record
     /// matched an outline: eligible to stand whole or below its heads.
     Held(HeldMember<'r>),
-    /// Refused or otherwise not eligible to stand as a held member: still recorded so
+    /// Its own `CrateScope` and `items` record opened cleanly and every file row matched an
+    /// outline, but its check scope was cut at a dependency crate with no names record
+    /// (`CutWhy::NoNamesRecord`): eligible to stand whole when none of its held or reached files
+    /// moved and neither its own `CrateScope` nor the missing dependency changed.
+    CutScope(CutScopeMember<'r>),
+    /// Refused or otherwise not eligible to stand as a held or cut-scope member: still recorded so
     /// `Reach::of_members` knows its module tree (`not_held`), and — when [`RefusedWhy::words`]
     /// is `Some` — eligible to stand as refused when none of its reached files moved.
     Refused(RefusedWhy),
+}
+
+/// One member whose own `CrateScope` and `items` record opened cleanly and every file row matched
+/// an outline, but whose check scope was cut at a dependency crate without a names record.
+pub(crate) struct CutScopeMember<'r> {
+    /// Its crate's own names input (`groups`' `members`): its name and the digest of its record.
+    pub(crate) names: Name,
+    pub(crate) names_out: ContentId,
+    /// The first check-scope dependency crate without a names record (`Scope::cut_name`), and
+    /// whether its `CrateScope` task failed (`true`) or it had no `Names` task (`false`).
+    pub(crate) missing: Name,
+    pub(crate) missing_failed: bool,
+    /// Each file it holds: its index in the items record and the outline it matched.
+    pub(crate) held: AVec<'r, Held<'r>>,
 }
 
 /// One member as a request read it whole and kept its row.
@@ -267,6 +291,20 @@ impl<'w> Writer<'w> {
                     into.extend_from_slice(&h.entries.0);
                 }
             }
+            MemberState::CutScope(cut) => {
+                into.push(4u8);
+                name(into, cut.names);
+                into.extend_from_slice(&cut.names_out.0);
+                name(into, cut.missing);
+                into.push(u8::from(cut.missing_failed));
+                count(into, cut.held.len());
+                for h in cut.held.iter() {
+                    into.extend_from_slice(&h.file.to_le_bytes());
+                    name(into, h.slot);
+                    bytes(into, h.path);
+                    into.extend_from_slice(&h.entries.0);
+                }
+            }
             MemberState::Refused(RefusedWhy::ScopeFailed) => into.push(1u8),
             MemberState::Refused(RefusedWhy::NoNamesTask) => into.push(2u8),
             MemberState::Refused(RefusedWhy::Unstood) => into.push(3u8),
@@ -412,6 +450,22 @@ impl<'r> View<'r> {
                 1 => MemberState::Refused(RefusedWhy::ScopeFailed),
                 2 => MemberState::Refused(RefusedWhy::NoNamesTask),
                 3 => MemberState::Refused(RefusedWhy::Unstood),
+                4 => {
+                    let names = c.name("a cut-scope member's names input")?;
+                    let names_out = c.id("a cut-scope member's names record digest")?;
+                    let missing = c.name("a cut-scope member's missing dependency")?;
+                    let missing_failed = c.u8("a cut-scope member's missing-failed flag")? != 0;
+                    let held_n = c.count(HELD_LEAST, "a cut-scope member's held files")?;
+                    let mut held = AVec::with_capacity_in(held_n, alloc);
+                    for _ in 0..held_n {
+                        let file = c.u32("a held file's index")?;
+                        let slot = c.name("a held file's outline")?;
+                        let path = c.bytes("a held file's path")?;
+                        let entries = c.id("a held file's entries")?;
+                        held.push(Held { file, slot, path, entries });
+                    }
+                    MemberState::CutScope(CutScopeMember { names, names_out, missing, missing_failed, held })
+                }
                 byte => return Err(MembersRefused::State { at: state_at, byte }),
             };
             let not_n = c.count(NAME_LEN, "a member's reached files it does not hold")?;
@@ -442,6 +496,11 @@ impl<'r> View<'r> {
         match &member.state {
             MemberState::Held(held) => {
                 if held.held.iter().any(|h| hit(&h.slot)) || member.not_held.iter().any(hit) {
+                    return None;
+                }
+            }
+            MemberState::CutScope(cut) => {
+                if cut.held.iter().any(|h| hit(&h.slot)) || member.not_held.iter().any(hit) {
                     return None;
                 }
             }
@@ -557,8 +616,54 @@ mod tests {
         assert!(matches!(View::open(&bytes[..COUNT_AT + 2], alloc), Err(MembersRefused::Short { what: "members", need: 2, .. })), "CONTROL: a cut header");
         let mut old = AVec::new_in(alloc);
         old.extend_from_slice(&bytes);
-        old[7] = 1;
-        assert!(matches!(View::open(&old, alloc), Err(MembersRefused::Magic)), "CONTROL: v1 version refused");
+        old[7] = 2;
+        assert!(matches!(View::open(&old, alloc), Err(MembersRefused::Magic)), "CONTROL: v2 version refused");
+    }
+
+    /// CUT-SCOPE MEMBERS ROUND-TRIP AND STANDING RULES: `MemberState::CutScope` round-trips
+    /// byte-identically, stands when none of its held or reached files moved, never stands below
+    /// heads, and stops standing if either a held file or a reached file moved.
+    #[test]
+    fn cut_scope_members_round_trip_and_stand_by_their_read_list() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let kind = blaze_drive::Kind::FileItems;
+        let (held_slot, reached, other) = (name(kind, 30), name(kind, 31), name(kind, 32));
+        let mut held = AVec::new_in(alloc);
+        held.push(Held { file: 0, slot: held_slot, path: b"b/src/lib.rs", entries: ContentId([7; 32]) });
+        let mut not_held = AVec::new_in(alloc);
+        not_held.push(reached);
+        let unit = Unit { name: name(blaze_drive::Kind::CrateScope, 11), prefix: [12; 8], test: false };
+        let own_names = name(blaze_drive::Kind::CrateScope, 11);
+        let own_out = ContentId([13; 32]);
+        let missing = name(blaze_drive::Kind::CrateScope, 14);
+        let member = Member {
+            at: 1,
+            unit,
+            state: MemberState::CutScope(CutScopeMember {
+                names: own_names,
+                names_out: own_out,
+                missing,
+                missing_failed: true,
+                held,
+            }),
+            not_held,
+        };
+        let mut writer = Writer::new(&header(5), alloc);
+        writer.member(&member);
+        let bytes = writer.finish();
+        let view = View::open(&bytes, alloc).expect("the record opens");
+        let got = view.standing(1, &header(5), &[other]).expect("CutScope stands when no file moved");
+        let MemberState::CutScope(got_cut) = &got.state else { panic!("expected CutScope") };
+        assert_eq!((got.unit, got_cut.names, got_cut.names_out, got_cut.missing, got_cut.missing_failed), (unit, own_names, own_out, missing, true));
+        assert_eq!(got_cut.held.len(), 1);
+        assert_eq!(got_cut.held[0].slot, held_slot);
+        assert_eq!(&got.not_held[..], &[reached]);
+        let mut again = Writer::new(&header(5), alloc);
+        again.member(got);
+        assert_eq!(&again.finish()[..], &bytes[..], "CutScope round-trips byte-for-byte");
+        assert!(view.standing(1, &header(5), &[held_slot]).is_none(), "CONTROL: moved held file breaks CutScope stand");
+        assert!(view.standing(1, &header(5), &[reached]).is_none(), "CONTROL: moved reached file breaks CutScope stand");
+        assert!(view.standing_below_heads(1, &header(5), &[held_slot], |_| Some(ContentId([7; 32]))).is_none(), "CutScope never stands below heads");
     }
 
     /// REFUSED MEMBERS ROUND-TRIP AND STANDING RULES: `ScopeFailed` and `NoNamesTask` round-trip,

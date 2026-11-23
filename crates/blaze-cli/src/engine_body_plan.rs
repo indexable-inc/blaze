@@ -710,8 +710,14 @@ impl Reach {
         for (rank, (at, one)) in ranked.iter().enumerate() {
             let rank = u32::try_from(rank).unwrap_or(u32::MAX);
             let kept = u32::try_from(*at).ok().and_then(|at| members.member(at)).filter(|kept| kept.unit.name == one.unit).ok_or(ReachUnknown { unit: one.unit })?;
-            if let crate::engine_members_record::MemberState::Held(held) = &kept.state {
-                files.extend(held.held.iter().map(|held| (held.slot, rank)));
+            match &kept.state {
+                crate::engine_members_record::MemberState::Held(held) => {
+                    files.extend(held.held.iter().map(|held| (held.slot, rank)));
+                }
+                crate::engine_members_record::MemberState::CutScope(cut) => {
+                    files.extend(cut.held.iter().map(|held| (held.slot, rank)));
+                }
+                crate::engine_members_record::MemberState::Refused(_) => {}
             }
             files.extend(kept.not_held.iter().map(|file| (*file, rank)));
         }
@@ -950,7 +956,7 @@ impl Outside {
     /// setup's: their outlines stand and no body of them was entered), each its last block, as a
     /// read-back outline with none entered keeps it.
     /// Its scratch is `frame`'s.
-    pub(crate) fn lines(&self, entered: impl Iterator<Item = u32>, outlined: &[Outlined<'_>], unread: &[Name], last: Option<&crate::engine_lines::Last<'_, '_>>, lines: &mut crate::engine_lines::Lines<'_>, frame: &Frame) {
+    pub(crate) fn lines<'a>(&self, entered: impl Iterator<Item = u32>, outlined: &[Outlined<'_>], unread: &[Name], last: Option<&crate::engine_lines::Last<'a, '_>>, lines: &mut crate::engine_lines::Lines<'a>, frame: &Frame) {
         for name in unread.iter() {
             if let Some(block) = last.and_then(|last| last.block(*name)) {
                 lines.keep(*name, block);

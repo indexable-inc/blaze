@@ -1176,3 +1176,110 @@ fn kqueue_vnode_does_not_double_count_nonexistent_module_stems() {
         dirty.paths.as_slice(),
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn kqueue_vnode_script_stat_stamped_and_symlinks_do_not_loop_refresh() {
+    use crate::daemon_watch::KqueueVnode;
+    use crate::engine_script_reads::{NONE, NOT_A_FILE, NOT_A_FOLDER, ReadKind};
+    use crate::sweep::{DIRECT_PATH, LeafKind, Leaves, Plant, Rows, Stamp};
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    let mut scratch = Scratch::new("kqsym");
+    let (_home, proj) = scratch.lane("p", true);
+    write_file(&proj, "Cargo.toml", "[package]\nname = \"kqsym\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write_file(&proj, "src/lib.rs", "pub fn ok() -> u8 { 1 }\n");
+    write_file(&proj, "real_dir/target.txt", "hello-symlink\n");
+    symlink(proj.join("real_dir/target.txt"), proj.join("src/link.txt")).expect("file symlink");
+    symlink(proj.join("real_dir"), proj.join("link_dir")).expect("dir symlink");
+
+    // 1. Verify `engine_script_reads::now` preserves settled stamps for `ReadKind::Stat`,
+    //    `(ReadKind::File, dir -> NOT_A_FILE)`, and `(ReadKind::Listing, file -> NOT_A_FOLDER)`.
+    struct FixedStamps;
+    impl crate::sweep::Stamps for FixedStamps {
+        fn stamp(&self, _path: &str, meta: &bstd::fs::Meta) -> Option<Stamp> {
+            Some(Stamp { len: meta.len, mtime_ns: 1, ctime_ns: 1, ino: 42, dev: 7 })
+        }
+        fn swept_at_ns(&self) -> u64 {
+            10_000_000_000
+        }
+        fn granularity_ns(&self) -> u64 {
+            1_000_000_000
+        }
+    }
+    let sim = bstd::io::Io::simulated(bstd::io::SimWorld::new(77, bstd::io::Limits::USUAL));
+    let cx = sim.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("cx");
+    let sim_root = sim.need_fs().expect("fs").open_dir(&cx, &bstd::path::Path::new("ws").expect("path")).expect("open sim");
+    sim_root
+        .publish(&cx, &bstd::path::Path::new("real_dir/target.txt").expect("path"), bstd::fs::Content::bytes(b"hello-symlink\n"), bstd::fs::Durable::No)
+        .expect("write sim");
+    let frame = bstd::mem::Frame::with_reserve(16 << 20, bstd::mem::Tag::Other).expect("frame");
+    let stamps = FixedStamps;
+
+    let (_, stat_file_stamp, stat_file_id) = crate::engine_script_reads::now(&cx, &sim_root, &stamps, Plant::None, ReadKind::Stat, "real_dir/target.txt", None, &frame).expect("stat file");
+    assert!(stat_file_stamp.is_some(), "ReadKind::Stat of a file must keep its settled stamp");
+    let (_, stat_dir_stamp, stat_dir_id) = crate::engine_script_reads::now(&cx, &sim_root, &stamps, Plant::None, ReadKind::Stat, "real_dir", None, &frame).expect("stat dir");
+    assert!(stat_dir_stamp.is_some(), "ReadKind::Stat of a dir must keep its settled stamp");
+    let (_, not_file_stamp, not_file_id) = crate::engine_script_reads::now(&cx, &sim_root, &stamps, Plant::None, ReadKind::File, "real_dir", None, &frame).expect("file on dir");
+    assert_eq!(not_file_id, NOT_A_FILE);
+    assert!(not_file_stamp.is_some(), "ReadKind::File on dir (NOT_A_FILE) must keep its settled stamp");
+    let (_, not_dir_stamp, not_dir_id) = crate::engine_script_reads::now(&cx, &sim_root, &stamps, Plant::None, ReadKind::Listing, "real_dir/target.txt", None, &frame).expect("listing on file");
+    assert_eq!(not_dir_id, NOT_A_FOLDER);
+    assert!(not_dir_stamp.is_some(), "ReadKind::Listing on file (NOT_A_FOLDER) must keep its settled stamp");
+
+    // 2. Verify `KqueueVnode` with stamped `ScriptStat`, symlinked file, symlinked dir, and absent
+    //    `ScriptStat` arms cleanly with ZERO `initial_dirty` and `!needs_refresh` (no infinite re-arm!).
+    let target_stat_of = |rel: &str| -> Stamp {
+        let md = std::fs::metadata(proj.join(rel)).expect("stat following symlink");
+        Stamp {
+            len: md.len(),
+            mtime_ns: md.mtime().cast_unsigned().wrapping_mul(1_000_000_000).wrapping_add(md.mtime_nsec().cast_unsigned()),
+            ctime_ns: md.ctime().cast_unsigned().wrapping_mul(1_000_000_000).wrapping_add(md.ctime_nsec().cast_unsigned()),
+            ino: md.ino(),
+            dev: md.dev(),
+        }
+    };
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let root_s = proj.to_string_lossy();
+    let mut rows = Rows::new_in(&frame);
+    rows.push(LeafKind::ScriptStat, DIRECT_PATH, "real_dir/target.txt", Some(target_stat_of("real_dir/target.txt")), stat_file_id);
+    rows.push(LeafKind::ScriptStat, DIRECT_PATH, "real_dir", Some(target_stat_of("real_dir")), stat_dir_id);
+    rows.push(LeafKind::ScriptFile, DIRECT_PATH, "real_dir", Some(target_stat_of("real_dir")), not_file_id);
+    rows.push(LeafKind::ScriptListing, DIRECT_PATH, "real_dir/target.txt", Some(target_stat_of("real_dir/target.txt")), not_dir_id);
+    rows.push(LeafKind::ScriptStat, DIRECT_PATH, "real_dir/absent.txt", None, NONE);
+    // Symlinked file & symlinked directory (previously looped `initial_needs_refresh = true` forever!).
+    rows.push(LeafKind::ScriptStat, 0, "src/link.txt", Some(target_stat_of("src/link.txt")), stat_file_id);
+    rows.push(LeafKind::Listing, 0, "link_dir", Some(target_stat_of("link_dir")), blaze_ids::ContentId([1; 32]));
+    let bytes = Leaves::bytes_in(&rows, &frame).expect("encode leaves");
+    let (leaves, _) = Leaves::of(&bytes).expect("decode leaves");
+
+    let mut kq = KqueueVnode::arm_with_env(&root_s, None, None, &leaves, true, &frame, alloc)
+        .expect("KqueueVnode::arm_with_env with stamped ScriptStat + symlinks");
+    let p1 = kq.poll_dirty(&frame);
+    assert!(
+        p1.paths.is_empty() && !p1.needs_refresh && !p1.full_rescan,
+        "stamped ScriptStat + symlinks must be immediately clean without refresh loop: paths={:?} needs_refresh={} full_rescan={}",
+        p1.paths.as_slice(),
+        p1.needs_refresh,
+        p1.full_rescan,
+    );
+
+    // 3. Mutations to symlink target and creating the absent ScriptStat path are still caught immediately!
+    write_file(&proj, "real_dir/target.txt", "hello-edited!!\n");
+    let p2 = kq.poll_dirty(&frame);
+    assert!(
+        p2.paths.iter().any(|&p| p == "src/link.txt") && p2.paths.iter().any(|&p| p == "real_dir/target.txt"),
+        "editing symlink target must dirty both symlink and target leaves: {:?}",
+        p2.paths.as_slice(),
+    );
+
+    write_file(&proj, "real_dir/absent.txt", "appeared\n");
+    let p3 = kq.poll_dirty(&frame);
+    assert!(
+        p3.paths.iter().any(|&p| p == "real_dir/absent.txt") && p3.needs_refresh,
+        "creating absent ScriptStat file must dirty it and mark needs_refresh: paths={:?} needs_refresh={}",
+        p3.paths.as_slice(),
+        p3.needs_refresh,
+    );
+}

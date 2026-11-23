@@ -1363,6 +1363,21 @@ fn stands_as(kept: &crate::engine_members_record::Member<'_>, unit: &crate::engi
             let Some((own_name, own_out)) = today else { return false };
             held.names == own_name && held.names_out == own_out && own_out != work::failed_out()
         }
+        crate::engine_members_record::MemberState::CutScope(cut) => {
+            let own_today = match names.entry(unit.name) {
+                Some(entered) => entered.map(|own| (own.name, own.out)),
+                None => names.stood_on().map(|_| (unit.name, cut.names_out)),
+            };
+            let Some((own_name, own_out)) = own_today else { return false };
+            if cut.names != own_name || cut.names_out != own_out || own_out == work::failed_out() {
+                return false;
+            }
+            match names.entry(cut.missing) {
+                Some(Some(_)) => false,
+                Some(None) => cut.missing_failed,
+                None => names.stood_on().is_some(),
+            }
+        }
         crate::engine_members_record::MemberState::Refused(crate::engine_members_record::RefusedWhy::ScopeFailed) => match names.entry(unit.name) {
             Some(None) => true,
             Some(Some(_)) => false,
@@ -1439,7 +1454,7 @@ fn own_row_entered(kept: &crate::engine_members_record::Member<'_>, rows: &[Task
     let Some(rank) = rank else { return true };
     match &kept.state {
         crate::engine_members_record::MemberState::Held(held) => rows.iter().any(|row| row.rank == rank && held.held.iter().any(|h| h.slot == row.file)),
-        crate::engine_members_record::MemberState::Refused(_) => true,
+        crate::engine_members_record::MemberState::CutScope(_) | crate::engine_members_record::MemberState::Refused(_) => true,
     }
 }
 
@@ -3305,8 +3320,10 @@ impl<'f> BodiesStage<'f> {
             }
             seeds.push(root_of(member));
             if let Some(kept) = view.as_ref().and_then(|view| view.member(place)) {
-                if let rec::MemberState::Held(held) = &kept.state {
-                    seeds.extend(held.held.iter().map(|held| held.slot));
+                match &kept.state {
+                    rec::MemberState::Held(held) => seeds.extend(held.held.iter().map(|held| held.slot)),
+                    rec::MemberState::CutScope(cut) => seeds.extend(cut.held.iter().map(|held| held.slot)),
+                    rec::MemberState::Refused(_) => {}
                 }
                 seeds.extend(kept.not_held.iter().copied());
             }
@@ -3432,7 +3449,7 @@ impl<'f> BodiesStage<'f> {
     /// The plan's notes into the request's lines (engine_body_plan.rs `Outside::lines`): a file
     /// no unit holds, said once, with no engine row; kept from `last` where no body of the file
     /// was entered. Its scratch is `frame`'s.
-    pub(crate) fn plan_lines(&self, outlined: &[Outlined<'_>], unread: &[Name], last: Option<&crate::engine_lines::Last<'_, '_>>, lines: &mut crate::engine_lines::Lines<'_>, frame: &Frame) {
+    pub(crate) fn plan_lines<'a>(&self, outlined: &[Outlined<'_>], unread: &[Name], last: Option<&crate::engine_lines::Last<'a, '_>>, lines: &mut crate::engine_lines::Lines<'a>, frame: &Frame) {
         self.outside.lines(self.ran.iter().map(|one| one.file), outlined, unread, last, lines, frame);
         // The bodies a macro wrote that no task checks: named once a request, never silent.
         // Decided by this request's phase when it read the members' records; else the last
@@ -4340,6 +4357,18 @@ impl<'f> BodiesStage<'f> {
                         tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
                         continue;
                     }
+                    rec::MemberState::CutScope(cut) => {
+                        tally.members_stood = tally.members_stood.saturating_add(1);
+                        members.push(cut.names);
+                        if !drop_standing_heads {
+                            heads.extend(cut.held.iter().map(|h| h.subject(kept.unit.prefix)));
+                        }
+                        member_files.extend(kept.not_held.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::NotHeld, reads: own_cells }));
+                        tally.files = tally.files.saturating_add(u32::try_from(cut.held.len()).unwrap_or(u32::MAX));
+                        members_out.member(kept);
+                        tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
+                        continue;
+                    }
                     rec::MemberState::Refused(why) => {
                         if let Some(words) = why.words() {
                             tally.members_stood = tally.members_stood.saturating_add(1);
@@ -4550,9 +4579,13 @@ impl<'f> BodiesStage<'f> {
             // The scope's cut, the cells a refusal of it reads, and the member's group: of an
             // opened scope alone. Not opened: no file of it is owed, its row stands, and every
             // crate of its scope has an input (`scope_of` would cut none at an input).
-            let (whole, cut_words, scope_cells, group) = match whole_scope {
+            let (whole, cut_words, cut_missing, scope_cells, group) = match whole_scope {
                 Some((mut scope, unopened, whole)) => {
                     let cut_words = scope.cut_cause(&list).map(|cause| crate::engine_head_notes::leak(heap.alloc(), format_args!("its member's {cause}")));
+                    let cut_missing = match scope.cut {
+                        Some((at, CutWhy::NoNamesRecord { failed })) => Some((blaze_drive::key::crate_scope_name(&list.key(at)), failed)),
+                        _ => None,
+                    };
                     // The cells a cut scope's refusal reads: the graph's, each scope crate's that
                     // had records and the first that had none (the one whose task comes or is fixed).
                     let mut cut_reads: Vec<Name, Global> = Vec::new_in(Global);
@@ -4577,9 +4610,9 @@ impl<'f> BodiesStage<'f> {
                         (Some(rest), Some(own)) => Some(GroupCrates::ByNeed { own, rest }),
                         (Some(_), None) => None,
                     };
-                    (whole, cut_words, scope_cells, crates.map(|crates| Group { list, own: own.name, crates, env, script, lang: scope.lang, scope: scope.scope }))
+                    (whole, cut_words, cut_missing, scope_cells, crates.map(|crates| Group { list, own: own.name, crates, env, script, lang: scope.lang, scope: scope.scope }))
                 }
-                None => (true, None, own_cells, None),
+                None => (true, None, None, own_cells, None),
             };
             // A file the planner's cfg-blind walk reaches that the items record lists at no path
             // of it: this unit's cfg cut its `mod` (engine_body_plan.rs). Not this unit's file,
@@ -4722,10 +4755,11 @@ impl<'f> BodiesStage<'f> {
             // (`kept`: so its scope and environment stood) and every file row of which an outline
             // matched (a row no outline matched is a file that may appear: never stood on). A
             // member visited at need (piece A) was written at its first turn, from the record.
+            let all_outlined = !file_heads.iter().any(|head| matches!(head, crate::engine_member_rows::FileHead::NotOutlined));
             if kept
                 && again.is_none()
                 && let Some(row) = row.as_ref()
-                && !file_heads.iter().any(|head| matches!(head, crate::engine_member_rows::FileHead::NotOutlined))
+                && all_outlined
             {
                 let mut named: Vec<&str, blaze_own::Alloc<'static>> = Vec::with_capacity_in(row.named.len(), g);
                 named.extend(row.named.iter().copied());
@@ -4738,6 +4772,23 @@ impl<'f> BodiesStage<'f> {
                         row: row_key,
                         uncovered: row.uncovered,
                         named,
+                        held: held_kept,
+                    }),
+                    not_held: not_held_kept,
+                });
+            } else if !whole
+                && again.is_none()
+                && all_outlined
+                && let Some((missing, missing_failed)) = cut_missing
+            {
+                members_out.member(&rec::Member {
+                    at: place,
+                    unit: unit_val,
+                    state: rec::MemberState::CutScope(rec::CutScopeMember {
+                        names: own.name,
+                        names_out: own.out,
+                        missing,
+                        missing_failed,
                         held: held_kept,
                     }),
                     not_held: not_held_kept,
