@@ -73,28 +73,12 @@ pub fn is_whole_capability(name: &str) -> bool {
 pub const fn narrows_to_device(capability: &str) -> bool {
     let mut at = 0;
     while at < ONE_DEVICE.len() {
-        if same_text(ONE_DEVICE[at], capability) {
+        if super::same(ONE_DEVICE[at], capability) {
             return true;
         }
         at += 1;
     }
     false
-}
-
-/// Byte equality, in a const fn.
-pub(super) const fn same_text(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut at = 0;
-    while at < a.len() {
-        if a[at] != b[at] {
-            return false;
-        }
-        at += 1;
-    }
-    true
 }
 
 /// A capability a grant narrows to one device: how it is had whole from its world, and its own

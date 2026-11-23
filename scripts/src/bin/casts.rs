@@ -15,9 +15,8 @@
 //! with no compiler, as `allocs` and `untyped` hold theirs, until a blaze lint with a fix
 //! (`blaze::int_cast`, rule 73) replaces it.
 //!
-//! Test code, the scanner, the list and the base comparison are `blaze_script::ratchet`'s;
-//! `count` still walks all of `crates/` (not only workspace members) because
-//! `tools/ratchets/casts.txt` tracks `harness/*` too.
+//! Test code, the scanner, the walk (`CrateScope::AllDirs`, since `tools/ratchets/casts.txt`
+//! tracks `harness/*` too), the list and the base comparison are `blaze_script::ratchet`'s.
 
 /// What the usage error prints.
 const DOC: &str = r#"casts: the integer `as` casts only go down, per crate (AGENTS.md correct-by-construction, rule 76).
@@ -83,8 +82,7 @@ use blaze_script::{
     TempDir, fail,
     finding::{self, Finding},
     input::{self, Fields, Input, InputError},
-    ratchet::{self, BaseError, FileTests, Hit, ListError, Policy, Run, Tests, comment_end, ident_len, quote_end, string_end, word_end},
-    universal_newlines,
+    ratchet::{self, BaseError, CrateScope, FileTests, Hit, ListError, Policy, Run, Tests, comment_end, ident_len, quote_end, string_end, word_end},
 };
 
 const SCRIPT: &str = "casts";
@@ -202,58 +200,14 @@ fn casts_to_integer(text: &str, from: usize) -> bool {
 }
 
 /// Each crate's casts outside test code, in file and line order; a crate with none is absent.
-/// Unlike `ratchet::walk`, this walks all of `crates/` (not only workspace members), because
-/// `tools/ratchets/casts.txt` tracks `harness/*` too.
+/// Walks all of `crates/` (`CrateScope::AllDirs`), because `tools/ratchets/casts.txt` tracks
+/// `harness/*` too.
 fn count(tests: &Tests, root: &Path) -> BTreeMap<String, Vec<Hit<()>>> {
-    let files = ratchet::rust_files(root);
-    let known: BTreeSet<String> = files.iter().map(|it| it.join("/")).collect();
-    let mut scanned: Vec<(Vec<String>, Vec<usize>)> = Vec::new();
-    let mut test: BTreeSet<String> = BTreeSet::new();
-    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for parts in files {
-        let path = parts.join("/");
-        let full = parts.iter().fold(root.to_path_buf(), |path, part| path.join(part));
-        // `read_text(errors="replace")`: what is not UTF-8 becomes U+FFFD.
-        let Ok(bytes) = std::fs::read(&full) else { fail(SCRIPT, &format!("{} could not be read", full.display())) };
-        let text = universal_newlines(String::from_utf8_lossy(&bytes).into_owned());
-        let found = tests.of(&text);
-        if ratchet::test_path(&parts) || found.whole {
-            test.insert(path.clone());
+    ratchet::walk_with(SCRIPT, root, CrateScope::AllDirs, tests, |_| false, |file, emit| {
+        for line in cast_lines(file.text) {
+            emit(line, ());
         }
-        for (name, in_test) in &found.mods {
-            for file in ratchet::module_files(&parts, name) {
-                if !known.contains(&file) {
-                    continue;
-                }
-                if *in_test {
-                    test.insert(file.clone());
-                }
-                children.entry(path.clone()).or_default().push(file);
-            }
-        }
-        scanned.push((parts, live_in(&found, &text)));
-    }
-    // A module that test code declares is test code, and so is every module it declares.
-    let mut todo: Vec<String> = test.iter().cloned().collect();
-    // Bounded: a file enters `test` once, and only a file that entered is taken again.
-    while let Some(path) = todo.pop() {
-        for child in children.get(&path).into_iter().flatten() {
-            if test.insert(child.clone()) {
-                todo.push(child.clone());
-            }
-        }
-    }
-    let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
-    let mut out: BTreeMap<String, Vec<Hit<()>>> = BTreeMap::new();
-    for (parts, sites) in scanned {
-        let path = parts.join("/");
-        if sites.is_empty() || test.contains(&path) {
-            continue;
-        }
-        let krate = ratchet::crate_of(root, &parts, &mut manifests);
-        out.entry(krate).or_default().extend(sites.into_iter().map(|line| Hit { path: path.clone(), line, what: () }));
-    }
-    out
+    })
 }
 
 fn named(it: &Hit<()>) -> String {

@@ -1347,6 +1347,217 @@ pub fn index_rows<T: Copy, A: Allocator>(col: &[T], len: usize, ix: impl Fn(T) -
     table
 }
 
+/// Why a type walk in [`pty_is_copy`] stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyWalkError {
+    /// A type id, list id, or closure capture record was out of range.
+    Malformed,
+    /// An ADT's [`AdtFacts`] were missing from [`Facts::adt`].
+    UnknownAdt,
+    /// The type walk passed `MOST_POSITIONS`.
+    Bound,
+    /// [`Facts::copy_args`] returned a mask whose length did not match the ADT's type arguments.
+    CopyArgsUnaligned { adt: ItemKey },
+}
+
+/// How [`pty_is_copy`] checks an ADT's generic arguments once [`AdtFacts::copy`] holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdtCopyArgs {
+    /// Require every type argument of the ADT to be `Copy`.
+    All,
+    /// Consult [`Facts::copy_args`] to check only the arguments bounded by the ADT's `Copy` impl.
+    Facts,
+}
+
+/// How [`pty_is_copy`] treats `PNode::Closure` nodes.
+#[derive(Clone, Copy)]
+pub enum ClosureCopy<'a, 'c> {
+    /// Closures are not `Copy` (body lowering).
+    Never,
+    /// A closure of `owner` is `Copy` if it captures nothing by mutable reference and every
+    /// by-value capture's type is `Copy`, using the precomputed CSR index over `ck.captures`
+    /// (flow lowering).
+    ByValueCaptures {
+        owner: ItemKey,
+        ck: &'a Checked<'c>,
+        cap_offsets: &'a [u32],
+        cap_rows: &'a [u32],
+    },
+}
+
+/// Memo table, facts, and allocator for [`pty_is_copy`].
+pub struct CopyWalk<'a, 'c, F: Facts, A: Allocator + Copy> {
+    pub facts: &'a F,
+    pub copy_memo: &'a [core::cell::Cell<u8>],
+    pub adt_args: AdtCopyArgs,
+    pub closures: ClosureCopy<'a, 'c>,
+    pub alloc: A,
+}
+
+/// Whether a value of `root` is `Copy`, memoized in `walk.copy_memo`
+/// (`0` = unknown, `1` = false, `2` = true).
+pub fn pty_is_copy<'a, 'c, F: Facts, A: Allocator + Copy, E>(
+    walk: CopyWalk<'a, 'c, F, A>,
+    root: PTy,
+    node: impl Fn(PTy) -> Option<PNode>,
+    list: impl Fn(List) -> Option<&'a [PTy]>,
+    on_err: impl Fn(CopyWalkError) -> E,
+) -> Result<bool, E> {
+    let root_ix = root.0 as usize;
+    if let Some(cell) = walk.copy_memo.get(root_ix) {
+        let v = cell.get();
+        if v != 0 {
+            return Ok(v == 2);
+        }
+    }
+    let quick = match node(root).ok_or_else(|| on_err(CopyWalkError::Malformed))? {
+        PNode::Bool
+        | PNode::Char
+        | PNode::Int(_)
+        | PNode::Uint(_)
+        | PNode::Float(_)
+        | PNode::Never
+        | PNode::Ptr(..)
+        | PNode::FnDef(..)
+        | PNode::FnPtr(..)
+        | PNode::ConstValue { .. }
+        | PNode::ConstParam(_)
+        | PNode::Ref(Mutbl::Not, _) => Some(true),
+        PNode::Ref(Mutbl::Mut, _) => Some(false),
+        PNode::Param(i) => Some(walk.facts.param_copy(i)),
+        PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) if l.len == 0 => Some(true),
+        PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
+        PNode::Closure { owner, .. } => match walk.closures {
+            ClosureCopy::ByValueCaptures { owner: body_owner, .. } if owner == body_owner => None,
+            _ => Some(false),
+        },
+        _ => Some(false),
+    };
+    if let Some(ans) = quick {
+        if let Some(cell) = walk.copy_memo.get(root_ix) {
+            cell.set(if ans { 2 } else { 1 });
+        }
+        return Ok(ans);
+    }
+    let set_false = || -> Result<bool, E> {
+        if let Some(rc) = walk.copy_memo.get(root_ix) {
+            rc.set(1);
+        }
+        Ok(false)
+    };
+    let mut stack = TyStack::new(root, walk.alloc);
+    let mut steps = 0u32;
+    while let Some(t) = stack.pop() {
+        steps += 1;
+        if steps > MOST_POSITIONS {
+            return Err(on_err(CopyWalkError::Bound));
+        }
+        if let Some(cell) = walk.copy_memo.get(t.0 as usize) {
+            let v = cell.get();
+            if v == 1 {
+                return set_false();
+            }
+            if v == 2 {
+                continue;
+            }
+        }
+        match node(t).ok_or_else(|| on_err(CopyWalkError::Malformed))? {
+            PNode::Bool
+            | PNode::Char
+            | PNode::Int(_)
+            | PNode::Uint(_)
+            | PNode::Float(_)
+            | PNode::Never
+            | PNode::Ptr(..)
+            | PNode::FnDef(..)
+            | PNode::FnPtr(..)
+            | PNode::ConstValue { .. }
+            | PNode::ConstParam(_)
+            | PNode::Ref(Mutbl::Not, _) => {}
+            PNode::Ref(Mutbl::Mut, _) => return set_false(),
+            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => {
+                let s = list(l).ok_or_else(|| on_err(CopyWalkError::Malformed))?;
+                stack.extend_from_slice(s);
+            }
+            PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
+            PNode::Adt(k, l) => {
+                let f = walk.facts.adt(k).ok_or_else(|| on_err(CopyWalkError::UnknownAdt))?;
+                if !f.copy {
+                    return set_false();
+                }
+                // The type is `Copy` when the arguments its `Copy` impl bounds are (the
+                // Reference, "Copy": an impl's bounds decide; `impl<T: ?Sized> Copy for
+                // NonNull<T>` bounds none, so `NonNull<Header>` is `Copy` and
+                // `(head.release)(job.0)` after `job.0.as_ref()` reads a copy, task/threads.rs
+                // `run_lent`). Unread: every argument, the derive's rule.
+                let args = list(l).ok_or_else(|| on_err(CopyWalkError::Malformed))?;
+                match walk.adt_args {
+                    AdtCopyArgs::All => stack.extend_from_slice(args),
+                    AdtCopyArgs::Facts => match walk.facts.copy_args(k) {
+                        None => stack.extend_from_slice(args),
+                        Some(need) if need.len() == args.len() => {
+                            for (&a, &req) in args.iter().zip(need.iter()) {
+                                if req {
+                                    stack.push(a);
+                                }
+                            }
+                        }
+                        Some(_) => return Err(on_err(CopyWalkError::CopyArgsUnaligned { adt: k })),
+                    },
+                }
+            }
+            PNode::Param(i) => {
+                if !walk.facts.param_copy(i) {
+                    return set_false();
+                }
+            }
+            // A closure of this body (the Reference, "Closure types", "Other traits": a
+            // closure is `Copy` when it captures nothing by mutable reference and every value
+            // it captures by value is `Copy`). A shared capture is a `&T`, `Copy`. tempo
+            // prover connection.rs:123 `let invalid = |..| ..; a.ok_or_else(invalid)?;
+            // b.map_err(invalid)?`: the second use read a moved closure (E0382).
+            PNode::Closure { owner, ordinal, .. } => match walk.closures {
+                ClosureCopy::ByValueCaptures { owner: body_owner, ck, cap_offsets, cap_rows } if owner == body_owner => {
+                    let Some(&ce) = ck.closures.column::<0>().get(ordinal as usize) else {
+                        return Err(on_err(CopyWalkError::Malformed));
+                    };
+                    let ix = ce.ix();
+                    let rows = cap_offsets
+                        .get(ix)
+                        .zip(cap_offsets.get(ix + 1))
+                        .and_then(|(&lo, &hi)| cap_rows.get(lo as usize..hi as usize))
+                        .unwrap_or(&[]);
+                    for &row in rows {
+                        let i = row as usize;
+                        let Some(&kind) = ck.captures.column::<2>().get(i) else {
+                            return Err(on_err(CopyWalkError::Malformed));
+                        };
+                        match kind {
+                            blaze_typeck::CaptureKind::ByRef => {}
+                            blaze_typeck::CaptureKind::ByMutRef => return set_false(),
+                            blaze_typeck::CaptureKind::ByValue => {
+                                let Some(&cap_local) = ck.captures.column::<1>().get(i) else {
+                                    return Err(on_err(CopyWalkError::Malformed));
+                                };
+                                match ck.local_ty.get(cap_local.ix()) {
+                                    Some(&ct) => stack.push(ct),
+                                    None => return Err(on_err(CopyWalkError::Malformed)),
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => return set_false(),
+            },
+            _ => return set_false(),
+        }
+    }
+    if let Some(rc) = walk.copy_memo.get(root_ix) {
+        rc.set(2);
+    }
+    Ok(true)
+}
+
 /// Why a type walk in [`pty_needs_drop`] stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropWalkError {
@@ -2358,151 +2569,31 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     }
 
     fn is_copy_pty(&self, root: PTy, e: ExprId) -> Result<bool, Refusal> {
-        if let Some(cell) = self.copy_memo.get(root.0 as usize) {
-            let v = cell.get();
-            if v != 0 {
-                return Ok(v == 2);
-            }
-        }
-        let quick = match self.node(root, e)? {
-            PNode::Bool
-            | PNode::Char
-            | PNode::Int(_)
-            | PNode::Uint(_)
-            | PNode::Float(_)
-            | PNode::Never
-            | PNode::Ptr(..)
-            | PNode::FnDef(..)
-            | PNode::FnPtr(..)
-            | PNode::ConstValue { .. }
-            | PNode::ConstParam(_)
-            | PNode::Ref(Mutbl::Not, _) => Some(true),
-            PNode::Ref(Mutbl::Mut, _) => Some(false),
-            PNode::Param(i) => Some(self.facts.param_copy(i)),
-            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) if l.len == 0 => Some(true),
-            PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
-            PNode::Closure { owner, .. } if owner == self.body.owner => None,
-            _ => Some(false),
-        };
-        if let Some(ans) = quick {
-            if let Some(cell) = self.copy_memo.get(root.0 as usize) {
-                cell.set(if ans { 2 } else { 1 });
-            }
-            return Ok(ans);
-        }
-        let mut stack = TyStack::new(root, self.alloc);
-        let mut steps = 0u32;
-        while let Some(t) = stack.pop() {
-            steps += 1;
-            if steps > MOST_POSITIONS {
-                return self.refuse(Form::Bound, e);
-            }
-            if let Some(cell) = self.copy_memo.get(t.0 as usize) {
-                let v = cell.get();
-                if v == 1 {
-                    if let Some(rc) = self.copy_memo.get(root.0 as usize) {
-                        rc.set(1);
-                    }
-                    return Ok(false);
+        pty_is_copy(
+            CopyWalk {
+                facts: self.facts,
+                copy_memo: &self.copy_memo,
+                adt_args: AdtCopyArgs::Facts,
+                closures: ClosureCopy::ByValueCaptures {
+                    owner: self.body.owner,
+                    ck: self.ck,
+                    cap_offsets: &self.cap_offsets,
+                    cap_rows: &self.cap_rows,
+                },
+                alloc: self.alloc,
+            },
+            root,
+            |t| self.tys.node(t).ok(),
+            |l| self.tys.list(l).ok(),
+            |err| match err {
+                CopyWalkError::Malformed => Refusal { form: Form::Malformed, range: range_of(self.body, e) },
+                CopyWalkError::UnknownAdt => Refusal { form: Form::UnknownAdt, range: range_of(self.body, e) },
+                CopyWalkError::Bound => Refusal { form: Form::Bound, range: range_of(self.body, e) },
+                CopyWalkError::CopyArgsUnaligned { adt } => {
+                    Refusal { form: Form::CopyArgsUnaligned { adt }, range: range_of(self.body, e) }
                 }
-                if v == 2 {
-                    continue;
-                }
-            }
-            match self.node(t, e)? {
-                PNode::Bool
-                | PNode::Char
-                | PNode::Int(_)
-                | PNode::Uint(_)
-                | PNode::Float(_)
-                | PNode::Never
-                | PNode::Ptr(..)
-                | PNode::FnDef(..)
-                | PNode::FnPtr(..)
-                | PNode::ConstValue { .. }
-                | PNode::ConstParam(_)
-                | PNode::Ref(Mutbl::Not, _) => {}
-                PNode::Ref(Mutbl::Mut, _) => {
-                    if let Some(rc) = self.copy_memo.get(root.0 as usize) {
-                        rc.set(1);
-                    }
-                    return Ok(false);
-                }
-                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => stack.extend_from_slice(self.list(l, e)?),
-                PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
-                PNode::Adt(k, l) => {
-                    if !self.adt_facts(k, e)?.copy {
-                        if let Some(rc) = self.copy_memo.get(root.0 as usize) {
-                            rc.set(1);
-                        }
-                        return Ok(false);
-                    }
-                    // The type is `Copy` when the arguments its `Copy` impl bounds are (the
-                    // Reference, "Copy": an impl's bounds decide; `impl<T: ?Sized> Copy for
-                    // NonNull<T>` bounds none, so `NonNull<Header>` is `Copy` and
-                    // `(head.release)(job.0)` after `job.0.as_ref()` reads a copy, task/threads.rs
-                    // `run_lent`). Unread: every argument, the derive's rule.
-                    let args = self.list(l, e)?;
-                    let facts: &'b F = self.facts;
-                    match facts.copy_args(k) {
-                        None => stack.extend_from_slice(args),
-                        Some(need) if need.len() == args.len() => {
-                            for (j, &a) in args.iter().enumerate() {
-                                if need[j] {
-                                    stack.push(a);
-                                }
-                            }
-                        }
-                        Some(_) => return self.refuse(Form::CopyArgsUnaligned { adt: k }, e),
-                    }
-                }
-                PNode::Param(i) => {
-                    if !self.facts.param_copy(i) {
-                        if let Some(rc) = self.copy_memo.get(root.0 as usize) {
-                            rc.set(1);
-                        }
-                        return Ok(false);
-                    }
-                }
-                // A closure of this body (the Reference, "Closure types", "Other traits": a
-                // closure is `Copy` when it captures nothing by mutable reference and every value
-                // it captures by value is `Copy`). A shared capture is a `&T`, `Copy`. tempo
-                // prover connection.rs:123 `let invalid = |..| ..; a.ok_or_else(invalid)?;
-                // b.map_err(invalid)?`: the second use read a moved closure (E0382).
-                PNode::Closure { owner, ordinal, .. } if owner == self.body.owner => {
-                    let ck: &'c Checked<'c> = self.ck;
-                    let Some(&ce) = ck.closures.column::<0>().get(ordinal as usize) else {
-                        return self.refuse(Form::Malformed, e);
-                    };
-                    for &row in self.captures_of(ce) {
-                        let i = row as usize;
-                        match ck.captures.column::<2>()[i] {
-                            blaze_typeck::CaptureKind::ByRef => {}
-                            blaze_typeck::CaptureKind::ByMutRef => {
-                                if let Some(rc) = self.copy_memo.get(root.0 as usize) {
-                                    rc.set(1);
-                                }
-                                return Ok(false);
-                            }
-                            blaze_typeck::CaptureKind::ByValue => match ck.local_ty.get(ck.captures.column::<1>()[i].ix()) {
-                                Some(&t) => stack.push(t),
-                                None => return self.refuse(Form::Malformed, e),
-                            },
-                        }
-                    }
-                }
-                _ => {
-                    if let Some(rc) = self.copy_memo.get(root.0 as usize) {
-                        rc.set(1);
-                    }
-                    return Ok(false);
-                }
-            }
-        }
-        if let Some(rc) = self.copy_memo.get(root.0 as usize) {
-            rc.set(2);
-        }
-        Ok(true)
+            },
+        )
     }
 
     /// Whether dropping a value of `t` may run code (more is safe: a `Drop` of a value that needs

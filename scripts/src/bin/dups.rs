@@ -44,7 +44,7 @@ const DOC: &str = r#"dups: find duplicate Rust code and hill-climb it down with 
     crate            restrict output to groups involving this crate, or null
     skip             crate names to skip ([])
     include_examples include files under `examples/` directories (true)
-    skip_generated   skip files under `generated/` directories or `*_generated.rs` (true)
+    skip_generated   skip files under `generated/` directories, `generated.rs`, `*_generated.rs` or `*.gen.rs` (true)
     cross_crate_only only keep duplicates spanning 2+ crates (false)
     kinds            detection tiers (["exact", "alpha", "near", "block"])
     item_kinds       syntax items to compare (["fn", "macro"])
@@ -1309,7 +1309,7 @@ fn walk_rs_files(dir: &Path, prefix: &mut Vec<String>, include_examples: bool, s
             walk_rs_files(&path, prefix, include_examples, skip_generated, out);
             prefix.pop();
         } else if name.ends_with(".rs") {
-            if skip_generated && (name.ends_with("_generated.rs") || name.ends_with(".gen.rs")) {
+            if skip_generated && (name == "generated.rs" || name.ends_with("_generated.rs") || name.ends_with(".gen.rs")) {
                 continue;
             }
             let mut p = prefix.clone();
@@ -3470,7 +3470,39 @@ pub fn unrelated_compressor_b(raw: &[u8], tag: u8) -> Vec<u8> {
         "undismissed group did not reappear in scan!"
     );
 
-    println!("dups selftest: ok (exact, alpha, near, block, negative-control, dismiss, prune, undismiss verified)");
+    // Verify `skip_generated` skips `generated.rs` (and includes it when false).
+    let gen_fn = r#"
+pub fn generated_table_lookup(key: u32, salt: u32) -> Option<u32> {
+    if key == 0 || salt == 0 {
+        return None;
+    }
+    let mixed = key.wrapping_mul(0x9e37_79b1) ^ salt.rotate_left(7);
+    let slot = mixed & 0x0fff;
+    if slot < 16 {
+        return None;
+    }
+    Some(slot ^ 0x5a5a)
+}
+"#;
+    fs::write(root.join("crates/alpha/src/generated.rs"), gen_fn).unwrap();
+    fs::write(root.join("crates/beta/src/generated.rs"), gen_fn).unwrap();
+    let (items_skip, _, _, _, _, _) = run_pipeline(&base_args("scan"), root);
+    assert!(
+        !items_skip.iter().any(|it| it.name == "generated_table_lookup"),
+        "generated.rs should be skipped when skip_generated is true"
+    );
+    let mut include_gen = base_args("scan");
+    include_gen.skip_generated = false;
+    let (items_keep, _, _, groups_keep, _, _) = run_pipeline(&include_gen, root);
+    assert!(
+        groups_keep.iter().any(|g| {
+            g.tier == DupTier::Exact
+                && g.members.iter().filter(|&&m| items_keep[m].name == "generated_table_lookup").count() == 2
+        }),
+        "generated.rs should be scanned when skip_generated is false"
+    );
+
+    println!("dups selftest: ok (exact, alpha, near, block, negative-control, dismiss, prune, undismiss, skip_generated verified)");
 }
 
 fn main() {

@@ -98,7 +98,7 @@ pub use contour::{
 };
 pub use decompose::{ConvexPiece, DecomposeError, DecomposeOpts, Decomposition, decompose};
 pub use digest::MeshDigest;
-pub use feature::{FeatureProtect, FeatureRegion, FeatureZone};
+pub use feature::{ClosestTrianglePoint, FeatureProtect, FeatureRegion, FeatureZone, TriangleRegion, closest_point_on_triangle};
 pub use geom::Aabb;
 pub use hull::{Flat, Hull, HullError, HullOpts, convex_hull, convex_hull_planted};
 pub use ids::{MaterialRole, PartId, TriId, VertexId, VertexPair};

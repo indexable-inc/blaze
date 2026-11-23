@@ -105,7 +105,7 @@ impl Manifest {
             }
             let mut before = 0;
             while before < at {
-                if super::one_device::same_text(defaults[before].name, default.name) {
+                if super::same(defaults[before].name, default.name) {
                     panic!("bstd::main: a parameter is given two defaults");
                 }
                 before += 1;
@@ -126,7 +126,7 @@ impl Manifest {
 const fn param_named(params: &'static [Param], name: &str) -> Option<Param> {
     let mut at = 0;
     while at < params.len() {
-        if super::one_device::same_text(params[at].name, name) {
+        if super::same(params[at].name, name) {
             return Some(params[at]);
         }
         at += 1;

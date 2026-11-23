@@ -89,19 +89,16 @@ struct BranchPatch {
     target_block: u32,
 }
 
-/// Source or destination location for a GPR parallel move (register or 8-byte spill slot).
+/// Source or destination location for a parallel move (register or 8-byte spill slot),
+/// tagged by register bank (`FP = false` for GPR, `FP = true` for FP).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum GprCopyLoc {
+enum CopyLoc<const FP: bool> {
     Reg(Reg),
     Spill(u32),
 }
 
-/// Source or destination location for an FP parallel move (register or 8-byte spill slot).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FpCopyLoc {
-    Reg(Reg),
-    Spill(u32),
-}
+type GprCopyLoc = CopyLoc<false>;
+type FpCopyLoc = CopyLoc<true>;
 
 #[inline]
 fn is_supported_scalar(ty: Ty) -> bool {
@@ -356,11 +353,12 @@ fn emit_st_spill_fp(words: &mut Vec<u32, Alloc<'_>>, vs: Reg, spill_base: u32, s
     words.push(enc::fp_access(enc::str(Size::X, vs, SP, off / 8)));
 }
 
-/// Resolves an arbitrary simultaneous parallel GPR copy `[(dst, src)]` over registers and spill slots,
-/// using `X16` as cycle breaker and `X17` as spill-to-spill transfer scratch.
-fn emit_parallel_gpr_moves(
-    words: &mut Vec<u32, Alloc<'_>>,
-    moves: &mut Vec<(GprCopyLoc, GprCopyLoc), Alloc<'_>>,
+/// Resolves an arbitrary simultaneous parallel copy `[(dst, src)]` over registers and spill slots,
+/// using `X16`/`X17` for GPR (`FP = false`) and `V31`/`V30` for FP (`FP = true`) as cycle
+/// breaker and spill-to-spill transfer scratch registers respectively.
+fn emit_parallel_moves<'a, const FP: bool>(
+    words: &mut Vec<u32, Alloc<'a>>,
+    moves: &mut Vec<(CopyLoc<FP>, CopyLoc<FP>), Alloc<'_>>,
     spill_base: u32,
 ) {
     let mut i = 0;
@@ -372,85 +370,35 @@ fn emit_parallel_gpr_moves(
         }
     }
 
-    let emit_one = |words: &mut Vec<u32, Alloc<'_>>, dst: GprCopyLoc, src: GprCopyLoc| match (dst, src) {
-        (GprCopyLoc::Reg(d), GprCopyLoc::Reg(s)) => {
-            if d != s {
-                words.push(enc::mov(d, s));
-            }
-        }
-        (GprCopyLoc::Reg(d), GprCopyLoc::Spill(s)) => {
+    let (cycle_scratch, spill_scratch) = if FP { (V31, V30) } else { (X16, X17) };
+    let emit_mov = |words: &mut Vec<u32, Alloc<'a>>, d: Reg, s: Reg| {
+        words.push(if FP { enc::fmov_reg(true, d, s) } else { enc::mov(d, s) });
+    };
+    let emit_ld = |words: &mut Vec<u32, Alloc<'a>>, d: Reg, s: u32| {
+        if FP {
+            emit_ld_spill_fp(words, d, spill_base, s);
+        } else {
             emit_ld_spill_gpr(words, d, spill_base, s);
         }
-        (GprCopyLoc::Spill(d), GprCopyLoc::Reg(s)) => {
+    };
+    let emit_st = |words: &mut Vec<u32, Alloc<'a>>, s: Reg, d: u32| {
+        if FP {
+            emit_st_spill_fp(words, s, spill_base, d);
+        } else {
             emit_st_spill_gpr(words, s, spill_base, d);
         }
-        (GprCopyLoc::Spill(d), GprCopyLoc::Spill(s)) => {
-            emit_ld_spill_gpr(words, X17, spill_base, s);
-            emit_st_spill_gpr(words, X17, spill_base, d);
-        }
     };
-
-    while !moves.is_empty() {
-        let mut ready = None;
-        for idx in 0..moves.len() {
-            let dst = moves[idx].0;
-            if !moves.iter().any(|&(_, s)| s == dst) {
-                ready = Some(idx);
-                break;
-            }
-        }
-        if let Some(idx) = ready {
-            let (dst, src) = moves.remove_swap(idx);
-            emit_one(words, dst, src);
-        } else {
-            // Pure cycle: save `moves[0].0` in `X16`, redirect all reads of `moves[0].0` to `X16`.
-            // Note: `emit_one` uses only `X17` for spill-to-spill, never touching `X16`.
-            let (dst, src) = moves.remove_swap(0);
-            match dst {
-                GprCopyLoc::Reg(d) => words.push(enc::mov(X16, d)),
-                GprCopyLoc::Spill(s) => emit_ld_spill_gpr(words, X16, spill_base, s),
-            }
-            for m in moves.iter_mut() {
-                if m.1 == dst {
-                    m.1 = GprCopyLoc::Reg(X16);
-                }
-            }
-            emit_one(words, dst, src);
-        }
-    }
-}
-
-/// Resolves an arbitrary simultaneous parallel FP copy `[(dst, src)]` over registers and spill slots,
-/// using `V31` as cycle breaker and `V30` as spill-to-spill transfer scratch.
-fn emit_parallel_fp_moves(
-    words: &mut Vec<u32, Alloc<'_>>,
-    moves: &mut Vec<(FpCopyLoc, FpCopyLoc), Alloc<'_>>,
-    spill_base: u32,
-) {
-    let mut i = 0;
-    while i < moves.len() {
-        if moves[i].0 == moves[i].1 {
-            moves.remove_swap(i);
-        } else {
-            i += 1;
-        }
-    }
-
-    let emit_one = |words: &mut Vec<u32, Alloc<'_>>, dst: FpCopyLoc, src: FpCopyLoc| match (dst, src) {
-        (FpCopyLoc::Reg(d), FpCopyLoc::Reg(s)) => {
+    let emit_one = |words: &mut Vec<u32, Alloc<'a>>, dst: CopyLoc<FP>, src: CopyLoc<FP>| match (dst, src) {
+        (CopyLoc::Reg(d), CopyLoc::Reg(s)) => {
             if d != s {
-                words.push(enc::fmov_reg(true, d, s));
+                emit_mov(words, d, s);
             }
         }
-        (FpCopyLoc::Reg(d), FpCopyLoc::Spill(s)) => {
-            emit_ld_spill_fp(words, d, spill_base, s);
-        }
-        (FpCopyLoc::Spill(d), FpCopyLoc::Reg(s)) => {
-            emit_st_spill_fp(words, s, spill_base, d);
-        }
-        (FpCopyLoc::Spill(d), FpCopyLoc::Spill(s)) => {
-            emit_ld_spill_fp(words, V30, spill_base, s);
-            emit_st_spill_fp(words, V30, spill_base, d);
+        (CopyLoc::Reg(d), CopyLoc::Spill(s)) => emit_ld(words, d, s),
+        (CopyLoc::Spill(d), CopyLoc::Reg(s)) => emit_st(words, s, d),
+        (CopyLoc::Spill(d), CopyLoc::Spill(s)) => {
+            emit_ld(words, spill_scratch, s);
+            emit_st(words, spill_scratch, d);
         }
     };
 
@@ -467,14 +415,17 @@ fn emit_parallel_fp_moves(
             let (dst, src) = moves.remove_swap(idx);
             emit_one(words, dst, src);
         } else {
+            // Pure cycle: save `moves[0].0` in `cycle_scratch`, redirect all reads of `moves[0].0`
+            // to `cycle_scratch`. Note: `emit_one` uses only `spill_scratch` for spill-to-spill,
+            // never touching `cycle_scratch`.
             let (dst, src) = moves.remove_swap(0);
             match dst {
-                FpCopyLoc::Reg(d) => words.push(enc::fmov_reg(true, V31, d)),
-                FpCopyLoc::Spill(s) => emit_ld_spill_fp(words, V31, spill_base, s),
+                CopyLoc::Reg(d) => emit_mov(words, cycle_scratch, d),
+                CopyLoc::Spill(s) => emit_ld(words, cycle_scratch, s),
             }
             for m in moves.iter_mut() {
                 if m.1 == dst {
-                    m.1 = FpCopyLoc::Reg(V31);
+                    m.1 = CopyLoc::Reg(cycle_scratch);
                 }
             }
             emit_one(words, dst, src);
@@ -1400,8 +1351,8 @@ pub(crate) fn emit_sota_a64<'a>(
             }
         }
     }
-    emit_parallel_gpr_moves(&mut words, &mut gpr_moves, spill_base);
-    emit_parallel_fp_moves(&mut words, &mut fp_moves, spill_base);
+    emit_parallel_moves(&mut words, &mut gpr_moves, spill_base);
+    emit_parallel_moves(&mut words, &mut fp_moves, spill_base);
     // Narrow sub-64-bit register-resident GPR entry params to preserve zero-extension invariant.
     for p in entry_params {
         if let AllocLoc::Gpr(dst) = reg_alloc.loc_of[p] {
@@ -1494,8 +1445,8 @@ pub(crate) fn emit_sota_a64<'a>(
                 AllocLoc::None => {}
             }
         }
-        emit_parallel_gpr_moves(words, gpr_moves, spill_base);
-        emit_parallel_fp_moves(words, fp_moves, spill_base);
+        emit_parallel_moves(words, gpr_moves, spill_base);
+        emit_parallel_moves(words, fp_moves, spill_base);
         // Materialize skipped constant edge arguments AFTER parallel moves so they never clobber any source!
         for &(dst, cval) in const_writes.iter() {
             match dst {
@@ -2689,8 +2640,8 @@ pub(crate) fn emit_sota_a64<'a>(
                             }
                         }
                     }
-                    emit_parallel_gpr_moves(&mut words, &mut gpr_moves, spill_base);
-                    emit_parallel_fp_moves(&mut words, &mut fp_moves, spill_base);
+                    emit_parallel_moves(&mut words, &mut gpr_moves, spill_base);
+                    emit_parallel_moves(&mut words, &mut fp_moves, spill_base);
                     for &(dst, cval) in const_edge_writes.iter() {
                         if let GprCopyLoc::Reg(r) = dst {
                             emit_const_u64(&mut words, r, cval);

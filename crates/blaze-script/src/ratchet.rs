@@ -1,8 +1,7 @@
 //! What a per-crate ratchet of scripts/ shares: reading Rust as text (comments, strings and
 //! characters skipped), which code is a test's, the walk of crates/, the list of rows and the
-//! comparison with a base (AGENTS.md one-concept-one-home). `recursion` and `stops` are built
-//! on it; `casts`, `clones`, `allocs`, `untyped` and `ambient` still hold copies of the scanner
-//! it was taken from, each to move here in a change of its own.
+//! comparison with a base (AGENTS.md one-concept-one-home). `recursion`, `stops`, `casts`,
+//! `clones`, `allocs` and `untyped` are built on it; `ambient` still holds its own walk.
 //!
 //! What test code is, in every ratchet that uses this:
 //!   - a file under a directory named `tests` or `benches`, or named `tests.rs` or `test.rs`;
@@ -34,8 +33,9 @@ const ROOT_FILES: [&str; 4] = ["lib.rs", "main.rs", "mod.rs", "build.rs"];
 /// The patterns that find test code, compiled once.
 pub struct Tests {
     cfg_test: Regex,
-    /// `#[test]`, or an attribute whose path ends in the word `test` (`#[tokio::test]`).
-    test_fn: Regex,
+    /// `#[test]`, or an attribute whose path ends in the word `test` (`#[tokio::test]`), when
+    /// enabled (`None` for [`Tests::cfg_test_only`]).
+    test_fn: Option<Regex>,
     inner_cfg_test: Regex,
     /// `mod <name>;`, attributes before it on the line allowed.
     module: Regex,
@@ -54,11 +54,21 @@ pub struct FileTests {
 
 impl Tests {
     pub fn new(script: &str) -> Tests {
+        Tests::make(script, true)
+    }
+
+    /// As [`Tests::new`], without matching `#[test]` / `#[*::test]` attributes (only
+    /// `#[cfg(test)]`, `#[cfg(all(test, ...))]` and `#![cfg(test)]`).
+    pub fn cfg_test_only(script: &str) -> Tests {
+        Tests::make(script, false)
+    }
+
+    fn make(script: &str, test_fns: bool) -> Tests {
         let re = |pattern: &str| Regex::new(pattern).unwrap_or_else(|e| fail(script, &e.to_string()));
         Tests {
             cfg_test: re(r"\A\s*#\[cfg\((?:test|all\(test\b[^\]]*)\)\]"),
             // To the attribute's `]`, so that the item read after it starts after the attribute.
-            test_fn: re(r"\A\s*#\[(?:\w+::)*test\b[^\]]*\]"),
+            test_fn: test_fns.then(|| re(r"\A\s*#\[(?:\w+::)*test\b[^\]]*\]")),
             inner_cfg_test: re(r"\A\s*#!\[cfg\((?:test|all\(test\b[^\]]*)\)\]"),
             module: re(r"\A\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?(\w+)\s*;"),
         }
@@ -74,7 +84,7 @@ impl Tests {
             if self.inner_cfg_test.is_match(line) {
                 out.whole = true;
             }
-            if let Some(found) = self.cfg_test.find(line).or_else(|| self.test_fn.find(line)) {
+            if let Some(found) = self.cfg_test.find(line).or_else(|| self.test_fn.as_ref().and_then(|re| re.find(line))) {
                 // The item runs from after the attribute to its `}` or `;`, on the line of that byte.
                 let last = match item_end(text, start + found.end()) {
                     Some(end) => at + text[start..end - 1].matches('\n').count(),
@@ -106,19 +116,67 @@ pub struct Hit<T> {
     pub what: T,
 }
 
+/// Which directories under `crates/` a walk reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrateScope {
+    /// Only members of the root `Cargo.toml`'s `[workspace]` (skipping excluded/parked dirs).
+    Members,
+    /// Every directory under `crates/` (excluding `target`).
+    AllDirs,
+}
+
+/// Each crate's counted sites outside test code, in file and line order.
+pub type Counts<T> = BTreeMap<String, Vec<Hit<T>>>;
+
+/// One `.rs` file visited by [`walk_with`].
+pub struct File<'a> {
+    /// Path components from the checkout root (e.g. `["crates", "a", "src", "lib.rs"]`).
+    pub parts: &'a [String],
+    /// The file's text (universal newlines, invalid UTF-8 replaced).
+    pub text: &'a str,
+    /// Test lines and out-of-line modules found in this file.
+    pub tests: &'a FileTests,
+}
+
 /// Each crate's sites outside test code, in file and line order; a crate with none is absent.
 /// `scan` is given each file's text and returns its sites, as (line from 1, what), test code
 /// included: the sites on a test line or in a test file are dropped here.
 pub fn walk<T>(script: &str, root: &Path, tests: &Tests, mut scan: impl FnMut(&str) -> Vec<(usize, T)>) -> BTreeMap<String, Vec<Hit<T>>> {
-    // Only the root workspace's code: a directory under crates/ it does not hold (its own
-    // workspace, or a parked crate) is not built and not counted.
-    let manifest = root.join("Cargo.toml");
-    let Ok(text) = std::fs::read_to_string(&manifest) else { fail(script, &format!("{} could not be read", manifest.display())) };
-    let members = Members::of(&text);
-    let files: Vec<Vec<String>> = rust_files(root).into_iter().filter(|parts| parts.len() < 2 || members.holds(&parts[..2].join("/"))).collect();
+    walk_with(script, root, CrateScope::Members, tests, |_| false, |file, emit| {
+        for (line, what) in scan(file.text) {
+            emit(line, what);
+        }
+    })
+}
+
+/// Walks `.rs` files under `crates/` according to `scope`, skips test files, any file for
+/// which `skip` returns true, and transitively any out-of-line module they declare, and
+/// groups the remaining sites by crate.
+///
+/// `scan` is called only for files that are not already skipped; it emits `(line, what)` pairs
+/// through `emit` (lines that are test code are dropped automatically).
+pub fn walk_with<T>(
+    script: &str,
+    root: &Path,
+    scope: CrateScope,
+    tests: &Tests,
+    mut skip: impl FnMut(&File<'_>) -> bool,
+    mut scan: impl FnMut(&File<'_>, &mut dyn FnMut(usize, T)),
+) -> Counts<T> {
+    let files = match scope {
+        // Only the root workspace's code: a directory under crates/ it does not hold (its own
+        // workspace, or a parked crate) is not built and not counted.
+        CrateScope::Members => {
+            let manifest = root.join("Cargo.toml");
+            let Ok(text) = std::fs::read_to_string(&manifest) else { fail(script, &format!("{} could not be read", manifest.display())) };
+            let members = Members::of(&text);
+            rust_files(root).into_iter().filter(|parts| parts.len() < 2 || members.holds(&parts[..2].join("/"))).collect()
+        }
+        CrateScope::AllDirs => rust_files(root),
+    };
     let known: BTreeSet<String> = files.iter().map(|it| it.join("/")).collect();
     let mut scanned: Vec<(Vec<String>, Vec<(usize, T)>)> = Vec::new();
-    let mut test: BTreeSet<String> = BTreeSet::new();
+    let mut skipped: BTreeSet<String> = BTreeSet::new();
     let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for parts in files {
         let path = parts.join("/");
@@ -127,42 +185,47 @@ pub fn walk<T>(script: &str, root: &Path, tests: &Tests, mut scan: impl FnMut(&s
         let Ok(bytes) = std::fs::read(&full) else { fail(script, &format!("{} could not be read", full.display())) };
         let text = universal_newlines(String::from_utf8_lossy(&bytes).into_owned());
         let found = tests.of(&text);
-        if test_path(&parts) || found.whole {
-            test.insert(path.clone());
+        let file = File { parts: &parts, text: &text, tests: &found };
+        let is_skipped = test_path(&parts) || found.whole || skip(&file);
+        if is_skipped {
+            skipped.insert(path.clone());
         }
         for (name, in_test) in &found.mods {
-            for file in module_files(&parts, name) {
-                if !known.contains(&file) {
+            for child in module_files(&parts, name) {
+                if !known.contains(&child) {
                     continue;
                 }
                 if *in_test {
-                    test.insert(file.clone());
+                    skipped.insert(child.clone());
                 }
-                children.entry(path.clone()).or_default().push(file);
+                children.entry(path.clone()).or_default().push(child);
             }
         }
-        let sites = if found.whole {
-            Vec::new()
-        } else {
-            scan(&text).into_iter().filter(|(line, _)| !found.test.get(line - 1).copied().unwrap_or(false)).collect()
-        };
+        let mut sites = Vec::new();
+        if !is_skipped {
+            scan(&file, &mut |line, what| {
+                if !found.test.get(line - 1).copied().unwrap_or(false) {
+                    sites.push((line, what));
+                }
+            });
+        }
         scanned.push((parts, sites));
     }
-    // A module that test code declares is test code, and so is every module it declares.
-    let mut todo: Vec<String> = test.iter().cloned().collect();
-    // Bounded: a file enters `test` once, and only a file that entered is taken again.
+    // A module that skipped code declares is skipped, and so is every module it declares.
+    let mut todo: Vec<String> = skipped.iter().cloned().collect();
+    // Bounded: a file enters `skipped` once, and only a file that entered is taken again.
     while let Some(path) = todo.pop() {
         for child in children.get(&path).into_iter().flatten() {
-            if test.insert(child.clone()) {
+            if skipped.insert(child.clone()) {
                 todo.push(child.clone());
             }
         }
     }
     let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
-    let mut out: BTreeMap<String, Vec<Hit<T>>> = BTreeMap::new();
+    let mut out: Counts<T> = Default::default();
     for (parts, sites) in scanned {
         let path = parts.join("/");
-        if sites.is_empty() || test.contains(&path) {
+        if sites.is_empty() || skipped.contains(&path) {
             continue;
         }
         let krate = crate_of(root, &parts, &mut manifests);

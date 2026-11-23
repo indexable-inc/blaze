@@ -164,7 +164,7 @@ impl FeatureRegion {
             FeatureRegion::Box(bx) => {
                 // Closest point on triangle to box center + edge midpoints.
                 let center = (bx.lo + bx.hi) * 0.5;
-                let cp = closest_point_on_triangle(center, a, b, c);
+                let cp = closest_point_on_triangle(center, a, b, c).point;
                 self.contains(cp)
                     || self.contains((a + b) * 0.5)
                     || self.contains((b + c) * 0.5)
@@ -172,7 +172,7 @@ impl FeatureRegion {
             }
             FeatureRegion::Ball { center, radius } => {
                 let r = radius.as_m().max(0.0);
-                let cp = closest_point_on_triangle(center, a, b, c);
+                let cp = closest_point_on_triangle(center, a, b, c).point;
                 (cp - center).dot(cp - center) <= r * r
             }
             FeatureRegion::Capsule { a: sa, b: sb, radius } => {
@@ -181,21 +181,21 @@ impl FeatureRegion {
                 let ab = sb - sa;
                 let denom = ab.dot(ab);
                 if !(denom > 1e-24) {
-                    let cp = closest_point_on_triangle(sa, a, b, c);
+                    let cp = closest_point_on_triangle(sa, a, b, c).point;
                     return (cp - sa).dot(cp - sa) <= r2;
                 }
                 let mut t = ((centroid - sa).dot(ab) / denom).clamp(0.0, 1.0);
                 for _ in 0..4 {
                     let sp = sa + ab * t;
-                    let cp = closest_point_on_triangle(sp, a, b, c);
+                    let cp = closest_point_on_triangle(sp, a, b, c).point;
                     if (cp - sp).dot(cp - sp) <= r2 {
                         return true;
                     }
                     t = ((cp - sa).dot(ab) / denom).clamp(0.0, 1.0);
                 }
                 // Also test endpoints directly against the triangle.
-                let ca = closest_point_on_triangle(sa, a, b, c);
-                let cb = closest_point_on_triangle(sb, a, b, c);
+                let ca = closest_point_on_triangle(sa, a, b, c).point;
+                let cb = closest_point_on_triangle(sb, a, b, c).point;
                 (ca - sa).dot(ca - sa) <= r2 || (cb - sb).dot(cb - sb) <= r2
             }
         }
@@ -297,57 +297,83 @@ fn segment_hits_aabb(a: Vec3, b: Vec3, bx: &Aabb3) -> bool {
     true
 }
 
-/// Exact closest point on triangle `(a, b, c)` to query point `p` (Ericson, *Real-Time Collision
-/// Detection*, §5.1.5).
+/// Voronoi region of triangle `(a, b, c)` containing the closest point to a query.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum TriangleRegion {
+    Face,
+    VertA,
+    VertB,
+    VertC,
+    EdgeAB,
+    EdgeBC,
+    EdgeCA,
+}
+
+/// Closest point on triangle `(a, b, c)` together with its non-negative barycentric coordinates
+/// (`[w_a, w_b, w_c]`, summing to `1.0`) and Voronoi [`TriangleRegion`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ClosestTrianglePoint {
+    pub point: Vec3,
+    pub bary: [f64; 3],
+    pub region: TriangleRegion,
+}
+
+/// Exact Voronoi-region closest point on triangle `(a, b, c)` to query point `p` (Ericson,
+/// *Real-Time Collision Detection*, §5.1.5).
 #[inline]
-fn closest_point_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+pub fn closest_point_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> ClosestTrianglePoint {
     let ab = b - a;
     let ac = c - a;
     let ap = p - a;
     let d1 = ab.dot(ap);
     let d2 = ac.dot(ap);
     if d1 <= 0.0 && d2 <= 0.0 {
-        return a;
+        return ClosestTrianglePoint { point: a, bary: [1.0, 0.0, 0.0], region: TriangleRegion::VertA };
     }
 
     let bp = p - b;
     let d3 = ab.dot(bp);
     let d4 = ac.dot(bp);
     if d3 >= 0.0 && d4 <= d3 {
-        return b;
+        return ClosestTrianglePoint { point: b, bary: [0.0, 1.0, 0.0], region: TriangleRegion::VertB };
     }
 
     let vc = d1 * d4 - d3 * d2;
     if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
-        let v = d1 / (d1 - d3);
-        return a + ab * v;
+        let denom = d1 - d3;
+        let v = if denom > 1e-24 { d1 / denom } else { 0.0 };
+        return ClosestTrianglePoint { point: a + ab * v, bary: [1.0 - v, v, 0.0], region: TriangleRegion::EdgeAB };
     }
 
     let cp = p - c;
     let d5 = ab.dot(cp);
     let d6 = ac.dot(cp);
     if d6 >= 0.0 && d5 <= d6 {
-        return c;
+        return ClosestTrianglePoint { point: c, bary: [0.0, 0.0, 1.0], region: TriangleRegion::VertC };
     }
 
     let vb = d5 * d2 - d1 * d6;
     if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
-        let w = d2 / (d2 - d6);
-        return a + ac * w;
+        let denom = d2 - d6;
+        let w = if denom > 1e-24 { d2 / denom } else { 0.0 };
+        return ClosestTrianglePoint { point: a + ac * w, bary: [1.0 - w, 0.0, w], region: TriangleRegion::EdgeCA };
     }
 
     let va = d3 * d6 - d5 * d4;
     if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
-        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        return b + (c - b) * w;
+        let num = d4 - d3;
+        let denom = num + (d5 - d6);
+        let w = if denom > 1e-24 { num / denom } else { 0.0 };
+        return ClosestTrianglePoint { point: b + (c - b) * w, bary: [0.0, 1.0 - w, w], region: TriangleRegion::EdgeBC };
     }
 
-    let denom = va + vb + vc;
-    if !(denom > 1e-24) {
-        return a;
+    let sum = va + vb + vc;
+    if !(sum > 1e-24) {
+        return ClosestTrianglePoint { point: a, bary: [1.0, 0.0, 0.0], region: TriangleRegion::Face };
     }
-    let inv = 1.0 / denom;
+    let inv = 1.0 / sum;
     let v = vb * inv;
     let w = vc * inv;
-    a + ab * v + ac * w
+    let u = (1.0 - v - w).max(0.0);
+    ClosestTrianglePoint { point: a + ab * v + ac * w, bary: [u, v, w], region: TriangleRegion::Face }
 }

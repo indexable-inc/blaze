@@ -104,8 +104,8 @@ use blaze_script::{
     finding::{self, Finding},
     input::{self, Fields, Input, InputError},
     json,
-    ratchet::{self, BaseError, Hit, ListError, Tests, comment_end, ident_len, is_ident, quote_end, string_end, word_end},
-    read_text, universal_newlines,
+    ratchet::{self, BaseError, CrateScope, FileTests, Hit, ListError, Tests, comment_end, ident_len, is_ident, quote_end, string_end, word_end},
+    read_text,
 };
 
 const SCRIPT: &str = "clones";
@@ -260,33 +260,27 @@ struct Classified {
 /// One call: its file, its line, and what [`Classified`] says of it.
 type Site = Hit<Classified>;
 
-/// What one file holds.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Scanned {
-    /// Its calls outside its test code, in order, as (line from 1, classification).
-    sites: Vec<(usize, Classified)>,
-    /// Each `mod <name>;` it declares, and whether test code declares it.
-    mods: Vec<(String, bool)>,
-    /// `#![cfg(test)]`: the whole file is test code.
-    test: bool,
-}
-
-/// The calls of one file's text, classified, and the modules it declares out of line.
-fn scan_file(tests: &Tests, text: &str) -> Scanned {
-    let found = tests.of(text);
-    if found.whole {
-        return Scanned { sites: Vec::new(), mods: found.mods, test: true };
-    }
+/// Emits each call of `text` outside its test code, classified, in order.
+fn scan_sites(text: &str, found: &FileTests, emit: &mut dyn FnMut(usize, Classified)) {
     let lines: Vec<&str> = text.split('\n').collect();
     let (calls, fns) = clone_calls(text);
     // A field's name, and whether this file declares it a handle: read once per name.
     let mut fields: BTreeMap<String, bool> = BTreeMap::new();
-    let sites = calls
-        .iter()
-        .filter(|call| !found.test[call.line - 1])
-        .map(|call| (call.line, classify(text, &lines, &fns, &mut fields, call)))
-        .collect();
-    Scanned { sites, mods: found.mods, test: false }
+    for call in &calls {
+        if !found.test[call.line - 1] {
+            emit(call.line, classify(text, &lines, &fns, &mut fields, call));
+        }
+    }
+}
+
+/// The calls of one file's text outside test code, classified (for selftest).
+fn scan_file(tests: &Tests, text: &str) -> Vec<(usize, Classified)> {
+    let found = tests.of(text);
+    let mut sites = Vec::new();
+    if !found.whole {
+        scan_sites(text, &found, &mut |line, what| sites.push((line, what)));
+    }
+    sites
 }
 
 /// A call's receiver, for a method call: the last name of the expression before its `.`.
@@ -505,57 +499,9 @@ fn handle_value(value: &str) -> bool {
 
 /// Each crate's calls outside test code, in file and line order; a crate with none is absent.
 fn count(tests: &Tests, root: &Path) -> BTreeMap<String, Vec<Site>> {
-    let files = ratchet::rust_files(root);
-    let known: BTreeSet<String> = files.iter().map(|it| it.join("/")).collect();
-    let mut scanned: Vec<(Vec<String>, Scanned)> = Vec::new();
-    let mut test: BTreeSet<String> = BTreeSet::new();
-    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for parts in files {
-        let path = parts.join("/");
-        let full = parts.iter().fold(root.to_path_buf(), |path, part| path.join(part));
-        // `read_text(errors="replace")`: what is not UTF-8 becomes U+FFFD.
-        let Ok(bytes) = std::fs::read(&full) else { fail(SCRIPT, &format!("{} could not be read", full.display())) };
-        let text = universal_newlines(String::from_utf8_lossy(&bytes).into_owned());
-        let found = scan_file(tests, &text);
-        if ratchet::test_path(&parts) || found.test {
-            test.insert(path.clone());
-        }
-        for (name, in_test) in &found.mods {
-            for file in ratchet::module_files(&parts, name) {
-                if !known.contains(&file) {
-                    continue;
-                }
-                if *in_test {
-                    test.insert(file.clone());
-                }
-                children.entry(path.clone()).or_default().push(file);
-            }
-        }
-        scanned.push((parts, found));
-    }
-    // A module that test code declares is test code, and so is every module it declares.
-    let mut todo: Vec<String> = test.iter().cloned().collect();
-    // Bounded: a file enters `test` once, and only a file that entered is taken again.
-    while let Some(path) = todo.pop() {
-        for child in children.get(&path).into_iter().flatten() {
-            if test.insert(child.clone()) {
-                todo.push(child.clone());
-            }
-        }
-    }
-    let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
-    let mut out: BTreeMap<String, Vec<Site>> = BTreeMap::new();
-    for (parts, found) in scanned {
-        let path = parts.join("/");
-        if found.sites.is_empty() || test.contains(&path) {
-            continue;
-        }
-        let krate = ratchet::crate_of(root, &parts, &mut manifests);
-        out.entry(krate)
-            .or_default()
-            .extend(found.sites.into_iter().map(|(line, what)| Hit { path: path.clone(), line, what }));
-    }
-    out
+    ratchet::walk_with(SCRIPT, root, CrateScope::AllDirs, tests, |_| false, |file, emit| {
+        scan_sites(file.text, file.tests, emit);
+    })
 }
 
 /// What is wrong: `counts` the tree's calls by crate, `rows` the list's, `base_rows` the base's
@@ -837,16 +783,16 @@ fn selftest(tests: &Tests) {
     want.sort();
     expect(all == want, &format!("the fixture's calls, test code in: found {all:?}, wanted {want:?}"));
     let found = scan_file(tests, FIXTURE);
-    let got: Vec<(usize, Kind, Source)> = found.sites.iter().map(|(line, it)| (*line, it.kind, it.source)).collect();
+    let got: Vec<(usize, Kind, Source)> = found.iter().map(|(line, it)| (*line, it.kind, it.source)).collect();
     expect(got == FIXTURE_SITES, &format!("the fixture's calls outside test code, classified: {got:?}"));
     // Planted: each cause removed, its effect goes.
-    let planted = scan_file(tests, &FIXTURE.replace("#[cfg(test)]\n", "\n")).sites;
+    let planted = scan_file(tests, &FIXTURE.replace("#[cfg(test)]\n", "\n"));
     expect(planted.iter().any(|(line, _)| *line == 19), "`t` outside test code is a site");
-    let planted = scan_file(tests, &FIXTURE.replace("    // clone: a deep copy of the vector", "    // a deep copy of the vector")).sites;
+    let planted = scan_file(tests, &FIXTURE.replace("    // clone: a deep copy of the vector", "    // a deep copy of the vector"));
     expect(planted.iter().any(|(line, it)| *line == 15 && it.kind == Kind::Unknown), "line 15 without its comment is unknown");
-    let planted = scan_file(tests, &FIXTURE.replace("fn g(a: Arc<u8>)", "fn g(a: Box<u8>)")).sites;
+    let planted = scan_file(tests, &FIXTURE.replace("fn g(a: Arc<u8>)", "fn g(a: Box<u8>)"));
     expect(planted.iter().any(|(line, it)| *line == 8 && it.kind == Kind::Unknown), "line 8 without its `Arc` is unknown");
-    let planted = scan_file(tests, &FIXTURE.replace("struct H { inner: Arc<u8> }", "struct H { inner: Box<u8> }")).sites;
+    let planted = scan_file(tests, &FIXTURE.replace("struct H { inner: Arc<u8> }", "struct H { inner: Box<u8> }"));
     expect(planted.iter().any(|(line, it)| *line == 23 && it.kind == Kind::Unknown), "line 23 without its field's `Arc` is unknown");
 
     // A tree: crates, test files by path and by declaration, a nested crate.

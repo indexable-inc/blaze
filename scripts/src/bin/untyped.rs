@@ -117,10 +117,8 @@ use blaze_script::{
     finding::{self, Finding},
     git,
     input::{self, Fields, Input, InputError},
-    ratchet::{
-        self, FileTests, Hit, Tests, comment_end, crate_of, ident_len, module_files, quote_end, rust_files, string_end, test_path, word_end,
-    },
-    read_text, universal_newlines,
+    ratchet::{self, CrateScope, FileTests, Hit, Tests, comment_end, ident_len, quote_end, string_end, word_end},
+    read_text,
 };
 
 const SCRIPT: &str = "untyped";
@@ -602,58 +600,18 @@ fn bin_root(parts: &[String]) -> bool {
 /// Each crate's sites outside test code and build scripts, in file and line order; a crate
 /// with none is absent.
 fn count(tests: &Tests, root: &Path) -> BTreeMap<String, Vec<Site>> {
-    let files = rust_files(root);
-    let known: BTreeSet<String> = files.iter().map(|it| it.join("/")).collect();
-    let mut scanned: Vec<(Vec<String>, Vec<(usize, Kind)>)> = Vec::new();
-    // The files not counted: test code and build scripts, and the modules they declare.
-    let mut skipped: BTreeSet<String> = BTreeSet::new();
-    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for parts in files {
-        let path = parts.join("/");
-        let full = parts.iter().fold(root.to_path_buf(), |path, part| path.join(part));
-        // `read_text(errors="replace")`: what is not UTF-8 becomes U+FFFD.
-        let Ok(bytes) = std::fs::read(&full) else { fail(SCRIPT, &format!("{} could not be read", full.display())) };
-        let text = universal_newlines(String::from_utf8_lossy(&bytes).into_owned());
-        let (found, sites) = scan_file(tests, &text, bin_root(&parts));
-        if test_path(&parts) || build_script(&parts) || found.whole {
-            skipped.insert(path.clone());
-        }
-        for (name, in_test) in &found.mods {
-            for file in module_files(&parts, name) {
-                if !known.contains(&file) {
-                    continue;
-                }
-                if *in_test {
-                    skipped.insert(file.clone());
-                }
-                children.entry(path.clone()).or_default().push(file);
+    ratchet::walk_with(
+        SCRIPT,
+        root,
+        CrateScope::AllDirs,
+        tests,
+        |file| build_script(file.parts),
+        |file, emit| {
+            for (line, kind) in untyped_items(file.text, bin_root(file.parts)) {
+                emit(line, kind);
             }
-        }
-        scanned.push((parts, sites));
-    }
-    // A module that skipped code declares is skipped, and so is every module it declares.
-    let mut todo: Vec<String> = skipped.iter().cloned().collect();
-    // Bounded: a file enters `skipped` once, and only a file that entered is taken again.
-    while let Some(path) = todo.pop() {
-        for child in children.get(&path).into_iter().flatten() {
-            if skipped.insert(child.clone()) {
-                todo.push(child.clone());
-            }
-        }
-    }
-    let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
-    let mut out: BTreeMap<String, Vec<Site>> = BTreeMap::new();
-    for (parts, sites) in scanned {
-        let path = parts.join("/");
-        if sites.is_empty() || skipped.contains(&path) {
-            continue;
-        }
-        let krate = crate_of(root, &parts, &mut manifests);
-        out.entry(krate)
-            .or_default()
-            .extend(sites.into_iter().map(|(line, what)| Site { path: path.clone(), line, what }));
-    }
-    out
+        },
+    )
 }
 
 /// The list as `write` writes it: the header, then `<crate><TAB><string><TAB><str><TAB><boxed>
