@@ -242,7 +242,7 @@ pub fn signal_name(signal: i32) -> Option<&'static str> {
 impl Crash {
     /// Its `panics` row: its addresses named by this executable's symbols and DWARF at its
     /// slide ([`crate::symbols::stack_slid`]), which [`read`] checked is the same executable.
-    pub fn row(&self) -> PanicRow {
+    pub fn row(self) -> PanicRow {
         let said = blaze_core::signal::described(self.signal).trim_start_matches(", ");
         // alloc: a row of a crash, once a file recovered
         let mut message = match said.is_empty() {
@@ -264,23 +264,20 @@ impl Crash {
             build_id: (self.build != 0).then_some(self.build),
             process: self.pid,
             thread: self.tid as u32,
-            // clone: a row of a crash
-            thread_name: self.thread.clone(),
+            thread_name: self.thread,
             t_ns: self.t_ns,
             kind: Kind::Signal,
             job: None,
             span_id: (self.span != 0 && self.span != crate::flight::UNRECORDED)
                 .then_some(self.span),
             message: Some(message),
-            // clone: a row of a crash
-            location: self.panic.as_ref().map(|(_, at)| at.clone()).filter(|it| !it.is_empty()),
+            location: self.panic.map(|(_, at)| at).filter(|it| !it.is_empty()),
             stack: crate::symbols::stack_slid(&self.pcs, self.slide),
             // alloc: a row of a crash
             stack_pcs: self.pcs.iter().rev().copied().collect(),
             boot: None,
             caught: false,
-            // clone: a row of a crash
-            open_spans: self.open.clone(),
+            open_spans: self.open,
             signal: signal_name(self.signal),
             fault_addr: Some(self.addr),
         }
@@ -968,6 +965,8 @@ mod tests {
         let page = page_in(&path, GONE);
         faults_here(page);
         let crash = read_back(&path).unwrap().expect("a crash recorded");
+        assert_eq!(crash.pid, GONE);
+        let image = crash.image().expect("an image of the crash");
         let row = &crash.row();
         assert_eq!(row.kind, Kind::Signal);
         assert_eq!(row.process, GONE);
@@ -995,8 +994,6 @@ mod tests {
             row.stack
         );
         assert_eq!(row.boot, None);
-        let image = crash.image().expect("an image of the crash");
-        assert_eq!(crash.pid, GONE);
         assert_eq!(image.blake3.as_deref(), Ok(crate::identity::binary().unwrap().as_str()));
         let inner = *row.stack_pcs.last().unwrap();
         assert!(

@@ -260,10 +260,26 @@ fn unit_key<'f>(pack: &[u8; 32], features: impl Iterator<Item = &'f str>) -> Vec
     out
 }
 
+/// Either owned by [`Inputs::new`] or borrowed from a solved [`library::Library`].
+pub(crate) enum Shared<'t, T> {
+    Owned(Vec<T>),
+    Borrowed(&'t [T]),
+}
+
+impl<T> core::ops::Deref for Shared<'_, T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Borrowed(s) => s,
+        }
+    }
+}
+
 /// The texts `resolve_crates` reads: the program's files, then each unit's pack.
 pub struct Texts<'t> {
     user: &'t [(String, String)],
-    packs: Vec<PackView<'t>>,
+    packs: Shared<'t, PackView<'t>>,
 }
 
 impl<'t> SourceTexts<'t> for Texts<'t> {
@@ -311,10 +327,10 @@ impl Toolchain {
 /// The inputs of one `resolve_crates` call: the program's crate first, then the units.
 pub struct Inputs<'t> {
     pub texts: Texts<'t>,
-    features: Vec<Vec<&'t str>>,
+    features: Shared<'t, Vec<&'t str>>,
     /// Each unit's cfg: the target's atoms and a `feature` atom per feature on.
-    cfgs: Vec<Vec<(&'t str, Option<&'t str>)>>,
-    deps: Vec<Vec<(&'t str, usize)>>,
+    cfgs: Shared<'t, Vec<(&'t str, Option<&'t str>)>>,
+    deps: Shared<'t, Vec<(&'t str, usize)>>,
     user: &'t UserCrate<'t>,
     tc: &'t Toolchain,
     sysroot: Sysroot,
@@ -344,7 +360,15 @@ impl<'t> Inputs<'t> {
         // The program crate's `cfg(panic)` is its inputs' strategy; the toolchain's crates keep
         // the strategy their records were cut under (the target list's), as Rust does with std.
         crate::panic_strategy::derive_cfg(&mut cfgs[0], user.panic);
-        Ok(Inputs { texts: Texts { user: user.files, packs }, features, cfgs, deps, user, tc, sysroot })
+        Ok(Inputs {
+            texts: Texts { user: user.files, packs: Shared::Owned(packs) },
+            features: Shared::Owned(features),
+            cfgs: Shared::Owned(cfgs),
+            deps: Shared::Owned(deps),
+            user,
+            tc,
+            sysroot,
+        })
     }
 
     /// The crate inputs, the program's at index 0.

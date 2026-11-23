@@ -22,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 use core::fmt::Write as _;
+use std::borrow::Cow;
 
 use blaze_expand::{
     Delim, Edition, LitKind, ProcCall, ProcKind, Produced, Reads, Spacing, TokenKind, TokenOrigin,
@@ -1249,25 +1250,20 @@ fn gen_serde_serialize(
                         }
                     }
                     FieldsShape::Named => {
-                        let active: Vec<(usize, String)> = (0..v.fields.len())
-                            .filter(|&i| !fs[i].skip_serializing)
-                            .map(|i| {
-                                let raw = v.fields[i].name.as_deref().unwrap_or("");
-                                let wire = fs[i]
-                                    .rename
-                                    .clone()
-                                    .unwrap_or_else(|| cattrs.rename_all.apply(raw));
-                                (i, wire)
-                            })
-                            .collect();
+                        let active_count = v.fields.iter().zip(fs.iter()).filter(|(_, f)| !f.skip_serializing).count();
                         let _ = writeln!(
                             out,
                             "        let mut __state = {sp}::Serializer::serialize_struct(__serializer, {}, {})?;",
                             quote_str(container_wire),
-                            active.len()
+                            active_count
                         );
-                        for (idx, wire) in active {
-                            let fname = v.fields[idx].name.as_deref()?;
+                        for (field, fa) in v.fields.iter().zip(fs.iter()).filter(|(_, f)| !f.skip_serializing) {
+                            let raw = field.name.as_deref().unwrap_or("");
+                            let wire = match fa.rename.as_deref() {
+                                Some(r) => Cow::Borrowed(r),
+                                None => Cow::Owned(cattrs.rename_all.apply(raw)),
+                            };
+                            let fname = field.name.as_deref()?;
                             let _ = writeln!(
                                 out,
                                 "        {sp}::ser::SerializeStruct::serialize_field(&mut __state, {}, &self.{fname})?;",
@@ -1286,10 +1282,10 @@ fn gen_serde_serialize(
                 let _ = writeln!(out, "        match *self {{");
                 for (vi, v) in adt.variants.iter().enumerate() {
                     let vname = &v.name;
-                    let vwire = vattrs[vi]
-                        .rename
-                        .clone()
-                        .unwrap_or_else(|| cattrs.rename_all.apply(vname));
+                    let vwire = match vattrs[vi].rename.as_deref() {
+                        Some(r) => Cow::Borrowed(r),
+                        None => Cow::Owned(cattrs.rename_all.apply(vname)),
+                    };
                     let fs = &fattrs[vi];
                     if vattrs[vi].skip_serializing {
                         let pat = match v.shape {
@@ -1361,11 +1357,11 @@ fn gen_serde_serialize(
                                     format!("{fnm}: ref __f{i}")
                                 })
                                 .collect();
-                            let active: Vec<(usize, String)> = (0..v.fields.len())
+                            let active: Vec<(usize, &str)> = (0..v.fields.len())
                                 .filter(|&i| !fs[i].skip_serializing)
                                 .map(|i| {
                                     let raw = v.fields[i].name.as_deref().unwrap_or("");
-                                    let wire = fs[i].rename.clone().unwrap_or_else(|| raw.to_owned());
+                                    let wire = fs[i].rename.as_deref().unwrap_or(raw);
                                     (i, wire)
                                 })
                                 .collect();
@@ -1650,14 +1646,14 @@ fn gen_serde_struct_visitor(
     sp: &str,
 ) -> Option<()> {
     let name = &adt.name;
-    let active: Vec<(usize, String, String)> = (0..v.fields.len())
+    let active: Vec<(usize, &str, Cow<'_, str>)> = (0..v.fields.len())
         .filter(|&i| !fs[i].skip_deserializing)
         .map(|i| {
-            let raw = v.fields[i].name.as_deref().unwrap_or("").to_owned();
-            let wire = fs[i]
-                .rename
-                .clone()
-                .unwrap_or_else(|| cattrs.rename_all.apply(&raw));
+            let raw = v.fields[i].name.as_deref().unwrap_or("");
+            let wire = match fs[i].rename.as_deref() {
+                Some(r) => Cow::Borrowed(r),
+                None => Cow::Owned(cattrs.rename_all.apply(raw)),
+            };
             (i, raw, wire)
         })
         .collect();
@@ -1832,10 +1828,10 @@ fn gen_serde_struct_visitor(
                 "                let __f{i} = match __f{i} {{ ::core::option::Option::Some(v) => v, ::core::option::Option::None => __default.{raw} }};"
             );
         } else {
-            let wire = fs[i]
-                .rename
-                .clone()
-                .unwrap_or_else(|| cattrs.rename_all.apply(raw));
+            let wire = match fs[i].rename.as_deref() {
+                Some(r) => Cow::Borrowed(r),
+                None => Cow::Owned(cattrs.rename_all.apply(raw)),
+            };
             let _ = writeln!(
                 out,
                 "                let __f{i} = match __f{i} {{ ::core::option::Option::Some(v) => v, ::core::option::Option::None => return ::core::result::Result::Err({sp}::de::Error::missing_field({})) }};",
@@ -1883,13 +1879,13 @@ fn gen_serde_enum_deserialize(
         return None;
     }
     let name = &adt.name;
-    let active_vars: Vec<(usize, String)> = (0..adt.variants.len())
+    let active_vars: Vec<(usize, Cow<'_, str>)> = (0..adt.variants.len())
         .filter(|&i| !vattrs[i].skip_deserializing)
         .map(|i| {
-            let wire = vattrs[i]
-                .rename
-                .clone()
-                .unwrap_or_else(|| cattrs.rename_all.apply(&adt.variants[i].name));
+            let wire = match vattrs[i].rename.as_deref() {
+                Some(r) => Cow::Borrowed(r),
+                None => Cow::Owned(cattrs.rename_all.apply(&adt.variants[i].name)),
+            };
             (i, wire)
         })
         .collect();
@@ -2549,24 +2545,34 @@ fn expand_derive_more(stream: &TokenStream<'_>, macro_name: &str) -> Option<Stri
                 .fields
                 .iter()
                 .enumerate()
-                .map(|(i, f)| {
-                    let pname = f.name.clone().unwrap_or_else(|| format!("__f{i}"));
-                    format!("{pname}: {}", f.ty)
+                .map(|(i, f)| match f.name.as_deref() {
+                    Some(pname) => format!("{pname}: {}", f.ty),
+                    None => format!("__f{i}: {}", f.ty),
                 })
                 .collect();
-            let body = match v.shape {
-                FieldsShape::Unit => name.clone(),
+            let body: Cow<'_, str> = match v.shape {
+                FieldsShape::Unit => Cow::Borrowed(name.as_str()),
                 FieldsShape::Tuple => {
-                    let args: Vec<String> = (0..v.fields.len()).map(|i| format!("__f{i}")).collect();
-                    format!("{name}({})", args.join(", "))
+                    let mut body = format!("{name}(");
+                    for i in 0..v.fields.len() {
+                        if i > 0 {
+                            body.push_str(", ");
+                        }
+                        let _ = write!(body, "__f{i}");
+                    }
+                    body.push(')');
+                    Cow::Owned(body)
                 }
                 FieldsShape::Named => {
-                    let args: Vec<String> = v
-                        .fields
-                        .iter()
-                        .map(|f| f.name.clone().unwrap_or_default())
-                        .collect();
-                    format!("{name} {{ {} }}", args.join(", "))
+                    let mut body = format!("{name} {{ ");
+                    for (i, f) in v.fields.iter().enumerate() {
+                        if i > 0 {
+                            body.push_str(", ");
+                        }
+                        body.push_str(f.name.as_deref().unwrap_or(""));
+                    }
+                    body.push_str(" }");
+                    Cow::Owned(body)
                 }
             };
             Some(format!(

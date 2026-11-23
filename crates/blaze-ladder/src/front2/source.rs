@@ -30,7 +30,7 @@ use core::cell::{Cell, Ref, RefCell};
 
 use blaze_hash::HashMap;
 use blaze_id::{CrateItemKey, ItemKey};
-use blaze_own::{ARc, AVec, Alloc};
+use blaze_own::{ARc, AVec, Alloc, LocalShare};
 use blaze_scope::attr_values::{RowRefusal, RowValue};
 use blaze_scope::items_record::{CurrentFile, ImplRow, ItemsDecoded, ItemsRecord, ItemsRecordError, LoadItems, RecordItems};
 use blaze_scope::names::{self, PathError, Resolved, Unheld, Why, Written};
@@ -1118,10 +1118,9 @@ impl<'n> Records<'n> {
     /// the crates. Nothing is read here.
     pub fn new(keys: &'n [CrateItemKey], load: &'n dyn Load<'n>, log: &'n Log<'n>, frame: &'n blaze_mem::Frame, alloc: Alloc<'n>) -> Records<'n> {
         let origin_parts: ARc<'n, OriginParts<'n>> = ARc::new_in(RefCell::new(HashMap::new_in(alloc)), alloc);
-        let loader = Loader { load, log, origins: origin_parts.clone() };
         Records {
-            paths: RecordNames::new(keys, loader.clone(), alloc),
-            items: RecordItems::new(keys, loader, alloc),
+            paths: RecordNames::new(keys, Loader { load, log, origins: origin_parts.local_share() }, alloc),
+            items: RecordItems::new(keys, Loader { load, log, origins: origin_parts.local_share() }, alloc),
             keys,
             origin_parts,
             load,

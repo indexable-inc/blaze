@@ -448,7 +448,7 @@ pub(crate) fn rewrite_macro_def(
         return snippet;
     }
 
-    let ts = def.body.tokens.clone();
+    let ts = blaze_own::Share::share(&def.body.tokens);
     let mut parser = MacroParser::new(ts.iter());
     let parsed_def = match parser.parse() {
         Some(def) => def,
@@ -845,9 +845,8 @@ impl MacroArgParser {
             "".to_owned()
         };
         self.result.push(ParsedMacroArg {
-            kind: MacroArgKind::Separator(self.buf.clone(), prefix),
+            kind: MacroArgKind::Separator(core::mem::take(&mut self.buf), prefix),
         });
-        self.buf.clear();
     }
 
     fn add_other(&mut self) {
@@ -857,9 +856,8 @@ impl MacroArgParser {
             "".to_owned()
         };
         self.result.push(ParsedMacroArg {
-            kind: MacroArgKind::Other(self.buf.clone(), prefix),
+            kind: MacroArgKind::Other(core::mem::take(&mut self.buf), prefix),
         });
-        self.buf.clear();
     }
 
     fn add_meta_variable(&mut self, iter: &mut TokenStreamIter<'_>) -> Option<()> {
@@ -872,10 +870,9 @@ impl MacroArgParser {
                 _,
             )) => {
                 self.result.push(ParsedMacroArg {
-                    kind: MacroArgKind::MetaVariable(name, self.buf.clone()),
+                    kind: MacroArgKind::MetaVariable(name, core::mem::take(&mut self.buf)),
                 });
 
-                self.buf.clear();
                 self.is_meta_var = false;
                 Some(())
             }

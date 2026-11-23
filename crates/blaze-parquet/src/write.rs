@@ -184,12 +184,12 @@ impl Plan {
 }
 
 /// The schema elements of `fields`, depth first under the root `schema`.
-fn schema<A: Allocator + Clone>(fields: &[Field<A>], alloc: &A) -> Vec<SchemaElement<A>, A> {
+fn schema<A: Allocator + Copy>(fields: &[Field<A>], alloc: A) -> Vec<SchemaElement<A>, A> {
     let element = |name: &str| SchemaElement {
         ty: None,
         type_length: None,
         repetition: None,
-        name: String::from_str_in(name, alloc.clone()),
+        name: String::from_str_in(name, alloc),
         num_children: None,
         converted: None,
         scale: None,
@@ -197,7 +197,7 @@ fn schema<A: Allocator + Clone>(fields: &[Field<A>], alloc: &A) -> Vec<SchemaEle
         field_id: None,
         logical: None,
     };
-    let mut out = Vec::with_capacity_in(1 + 3 * fields.len(), alloc.clone());
+    let mut out = Vec::with_capacity_in(1 + 3 * fields.len(), alloc);
     let mut root = element("schema");
     root.num_children = Some(fields.len().narrow_or_stop());
     out.push(root);
@@ -238,7 +238,7 @@ struct Stats<A: Allocator> {
     text: Option<(Vec<u8, A>, Vec<u8, A>)>,
 }
 
-impl<A: Allocator + Clone> Stats<A> {
+impl<A: Allocator + Copy> Stats<A> {
     fn new() -> Stats<A> {
         Stats { nulls: 0, int: None, float: None, boolean: None, text: None }
     }
@@ -267,7 +267,7 @@ impl<A: Allocator + Clone> Stats<A> {
         });
     }
 
-    fn text(&mut self, value: &[u8], alloc: &A) {
+    fn text(&mut self, value: &[u8], alloc: A) {
         match &mut self.text {
             Some((low, high)) => {
                 if value < low.as_slice() {
@@ -280,15 +280,14 @@ impl<A: Allocator + Clone> Stats<A> {
                 }
             }
             None => {
-                self.text =
-                    Some((Vec::from_slice_in(value, alloc.clone()), Vec::from_slice_in(value, alloc.clone())));
+                self.text = Some((Vec::from_slice_in(value, alloc), Vec::from_slice_in(value, alloc)));
             }
         }
     }
 
     /// The chunk's statistics in the leaf's plain encoding.
-    fn finish(&mut self, leaf: Leaf, alloc: &A) -> Statistics<A> {
-        let bytes = |raw: &[u8]| Some(Vec::from_slice_in(raw, alloc.clone()));
+    fn finish(&mut self, leaf: Leaf, alloc: A) -> Statistics<A> {
+        let bytes = |raw: &[u8]| Some(Vec::from_slice_in(raw, alloc));
         let (min, max) = match leaf.physical() {
             physical::INT32 => match self.int {
                 Some((low, high)) => {
@@ -344,7 +343,7 @@ fn refused_alloc(_: AllocFailure) -> ParquetError {
 
 /// One column's chunk of the row group being written: its finished pages, the page being
 /// filled and the chunk's dictionary.
-struct Chunk<A: Allocator + Clone> {
+struct Chunk<A: Allocator + Copy> {
     leaf: Leaf,
     /// The chunk's finished data pages, each a header and its body.
     pages: Vec<u8, A>,
@@ -381,16 +380,16 @@ struct Chunk<A: Allocator + Clone> {
     alloc: A,
 }
 
-impl<A: Allocator + Clone> Chunk<A> {
-    fn new(leaf: Leaf, alloc: &A) -> Chunk<A> {
-        let vec = || Vec::new_in(alloc.clone());
+impl<A: Allocator + Copy> Chunk<A> {
+    fn new(leaf: Leaf, alloc: A) -> Chunk<A> {
+        let vec = || Vec::new_in(alloc);
         Chunk {
             leaf,
             pages: vec(),
-            ints: Vec::new_in(alloc.clone()),
+            ints: Vec::new_in(alloc),
             bools: vec(),
             text: vec(),
-            ends: Vec::new_in(alloc.clone()),
+            ends: Vec::new_in(alloc),
             defs: vec(),
             reps: vec(),
             page_values: 0,
@@ -400,19 +399,19 @@ impl<A: Allocator + Clone> Chunk<A> {
             stats: Stats::new(),
             plan: None,
             fallback: Plan::Plain,
-            ints_dict: Dict::new_in(alloc.clone()),
-            text_dict: Dict::new_in(alloc.clone()),
+            ints_dict: Dict::new_in(alloc),
+            text_dict: Dict::new_in(alloc),
             dict_bytes: 0,
             dict_used: false,
-            encodings: Vec::new_in(alloc.clone()),
+            encodings: Vec::new_in(alloc),
             body: vec(),
             scratch: vec(),
-            alloc: alloc.clone(),
+            alloc,
         }
     }
 
     /// Value `at` of `values` appended to the page, and to the statistics unless a list's.
-    fn put(&mut self, values: &Values<A>, at: usize, alloc: &A) {
+    fn put(&mut self, values: &Values<A>, at: usize, alloc: A) {
         let stats = !self.leaf.list;
         match values {
             Values::Bool(it) => {
@@ -449,7 +448,7 @@ impl<A: Allocator + Clone> Chunk<A> {
         }
     }
 
-    fn text(&mut self, text: &str, stats: bool, alloc: &A) {
+    fn text(&mut self, text: &str, stats: bool, alloc: A) {
         self.text.extend_from_slice(text.as_bytes());
         // A page's text is below `u32::MAX`: a page ends at about `page_bytes`.
         self.ends.push(self.text.len().narrow_or_stop::<u32>());
@@ -459,7 +458,7 @@ impl<A: Allocator + Clone> Chunk<A> {
     }
 
     /// Rows `rows` of `column` appended, a page ending at each row that fills one.
-    fn push(&mut self, column: &Column<A>, rows: Range<usize>, options: &Options, alloc: &A) -> Result<(), ParquetError> {
+    fn push(&mut self, column: &Column<A>, rows: Range<usize>, options: &Options, alloc: A) -> Result<(), ParquetError> {
         let values = column.buffer();
         let valid = column.validity();
         let max_def = self.leaf.max_def;
@@ -493,7 +492,7 @@ impl<A: Allocator + Clone> Chunk<A> {
                             self.reps.push(0);
                             self.page_values += 1;
                         }
-                        for at in elements.clone() {
+                        for at in elements.start..elements.end {
                             self.defs.push(max_def);
                             self.reps.push(u8::from(at != elements.start));
                             self.put(values, at, alloc);
@@ -535,7 +534,7 @@ impl<A: Allocator + Clone> Chunk<A> {
     /// theirs.
     fn push_dict(&mut self) -> Result<usize, ParquetError> {
         let width = self.leaf.width();
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         match self.leaf.kind() {
             Kind::Text => {
                 let before = self.text_dict.len();
@@ -545,7 +544,7 @@ impl<A: Allocator + Clone> Chunk<A> {
                     let known = self.text_dict.distinct();
                     self.text_dict
                         .try_push_by(bytes, |it| {
-                            let mut own = Vec::try_with_capacity_in(it.len(), alloc.clone())?;
+                            let mut own = Vec::try_with_capacity_in(it.len(), alloc)?;
                             own.try_extend_from_slice(it)?;
                             Ok(own)
                         })
@@ -636,7 +635,7 @@ impl<A: Allocator + Clone> Chunk<A> {
 
     /// The page's values in `plan`, appended to `body`.
     fn values(&mut self, plan: Plan, n: usize) -> Result<(), ParquetError> {
-        let mut body = core::mem::replace(&mut self.body, Vec::new_in(self.alloc.clone()));
+        let mut body = core::mem::replace(&mut self.body, Vec::new_in(self.alloc));
         let written = self.values_into(plan, n, &mut body);
         self.body = body;
         written
@@ -845,7 +844,7 @@ fn prefixed<A: Allocator>(out: &mut Vec<u8, A>, values: &[u8], width: u8) -> Res
 }
 
 /// A Parquet file being written: batches in, row groups cut at [`Options::row_group_rows`].
-pub struct Writer<A: Allocator + Clone> {
+pub struct Writer<A: Allocator + Copy> {
     alloc: A,
     options: Options,
     fields: Vec<Field<A>, A>,
@@ -856,20 +855,20 @@ pub struct Writer<A: Allocator + Clone> {
     rows: i64,
 }
 
-impl<A: Allocator + Clone> Writer<A> {
+impl<A: Allocator + Copy> Writer<A> {
     /// A file of `fields`.
     pub fn new(fields: &[Field<A>], options: Options, alloc: A) -> Writer<A> {
-        let mut chunks = Vec::with_capacity_in(fields.len(), alloc.clone());
+        let mut chunks = Vec::with_capacity_in(fields.len(), alloc);
         for field in fields {
-            chunks.push(Chunk::new(Leaf::of(field.ty, field.nullable), &alloc));
+            chunks.push(Chunk::new(Leaf::of(field.ty, field.nullable), alloc));
         }
-        let mut out = Vec::new_in(alloc.clone());
+        let mut out = Vec::new_in(alloc);
         out.extend_from_slice(&MAGIC);
         Writer {
-            fields: Vec::from_iter_in(fields.iter().cloned(), alloc.clone()),
+            fields: Vec::from_iter_in(fields.iter().cloned(), alloc),
             chunks,
             out,
-            groups: Vec::new_in(alloc.clone()),
+            groups: Vec::new_in(alloc),
             group_rows: 0,
             rows: 0,
             options,
@@ -895,7 +894,7 @@ impl<A: Allocator + Clone> Writer<A> {
         while start < rows {
             let take = (rows - start).min(self.options.row_group_rows.max(1) - self.group_rows);
             for (chunk, column) in self.chunks.iter_mut().zip(batch.columns()) {
-                chunk.push(column, start..start + take, &self.options, &self.alloc)?;
+                chunk.push(column, start..start + take, &self.options, self.alloc)?;
             }
             self.group_rows += take;
             start += take;
@@ -910,7 +909,7 @@ impl<A: Allocator + Clone> Writer<A> {
         if self.group_rows == 0 {
             return Ok(());
         }
-        let mut columns = Vec::with_capacity_in(self.chunks.len(), self.alloc.clone());
+        let mut columns = Vec::with_capacity_in(self.chunks.len(), self.alloc);
         let group_start = self.out.len();
         let mut group_uncompressed = 0i64;
         for (chunk, field) in self.chunks.iter_mut().zip(self.fields.iter()) {
@@ -924,14 +923,14 @@ impl<A: Allocator + Clone> Writer<A> {
             let uncompressed = (dictionary + chunk.uncompressed).widen_to::<u64>().cast_signed();
             group_uncompressed += uncompressed;
             let leaf = chunk.leaf;
-            let statistics = chunk.stats.finish(leaf, &self.alloc);
-            let mut path = Vec::new_in(self.alloc.clone());
-            path.push(String::from_str_in(field.name(), self.alloc.clone()));
+            let statistics = chunk.stats.finish(leaf, self.alloc);
+            let mut path = Vec::new_in(self.alloc);
+            path.push(String::from_str_in(field.name(), self.alloc));
             if leaf.list {
-                path.push(String::from_str_in("list", self.alloc.clone()));
-                path.push(String::from_str_in("element", self.alloc.clone()));
+                path.push(String::from_str_in("list", self.alloc));
+                path.push(String::from_str_in("element", self.alloc));
             }
-            let mut encodings = Vec::new_in(self.alloc.clone());
+            let mut encodings = Vec::new_in(self.alloc);
             encodings.push(encoding::RLE);
             if chunk.dict_used {
                 encodings.push(encoding::PLAIN);
@@ -980,21 +979,21 @@ impl<A: Allocator + Clone> Writer<A> {
     /// metadata, the footer's length and `PAR1`.
     pub fn finish(mut self, metadata: &[(&str, &str)]) -> Result<Vec<u8, A>, ParquetError> {
         self.end_group()?;
-        let alloc = self.alloc.clone();
-        let mut key_value = Vec::with_capacity_in(metadata.len(), alloc.clone());
+        let alloc = self.alloc;
+        let mut key_value = Vec::with_capacity_in(metadata.len(), alloc);
         for (key, value) in metadata {
             key_value.push(KeyValue {
-                key: String::from_str_in(key, alloc.clone()),
-                value: Some(String::from_str_in(value, alloc.clone())),
+                key: String::from_str_in(key, alloc),
+                value: Some(String::from_str_in(value, alloc)),
             });
         }
         let footer = FileMeta {
             version: 1,
-            schema: schema(&self.fields, &alloc),
+            schema: schema(&self.fields, alloc),
             num_rows: self.rows,
-            row_groups: core::mem::replace(&mut self.groups, Vec::new_in(alloc.clone())),
+            row_groups: core::mem::replace(&mut self.groups, Vec::new_in(alloc)),
             key_value,
-            created_by: Some(String::from_str_in(self.options.created_by, alloc.clone())),
+            created_by: Some(String::from_str_in(self.options.created_by, alloc)),
             column_orders: self.fields.len(),
         };
         let start = self.out.len();
@@ -1010,7 +1009,7 @@ impl<A: Allocator + Clone> Writer<A> {
 }
 
 /// A file of `fields` holding `batches`, with `metadata` as its key-value metadata.
-pub fn write<A: Allocator + Clone>(
+pub fn write<A: Allocator + Copy>(
     fields: &[Field<A>],
     batches: &[Batch<A>],
     metadata: &[(&str, &str)],

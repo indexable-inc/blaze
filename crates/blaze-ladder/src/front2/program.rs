@@ -979,15 +979,6 @@ impl<'n> Front2Program<'n> {
         for (k, outcome) in census.fns.iter_mut() {
             match outcome {
                 Reached::Failed { class, detail, refusal } if let Some(out) = left_out.as_deref_mut() => {
-                    // The row keeps the walk's typed refusal (program/left_out.rs); a site that
-                    // named its cause by text only keeps the refusal a run stops with.
-                    let refusal = match refusal.take() {
-                        Some(r) => *r,
-                        None => Front2Refusal::Unchecked { function: super::item_shown::refused(&records, *k), class: class.clone(), first: detail.clone() },
-                    };
-                    let row = LeftOut::reached(&records, class.clone(), detail.clone(), refusal);
-                    out.push((fn_shown(&records, *k).into_boxed_str(), row));
-                    let (class, detail): (&str, &str) = (class, detail);
                     // The cause a caller's build names ([`RunError::LeftOut`]'s `why`): the class
                     // and its WHOLE detail, on one line (rule 19: an error names the thing; a cut
                     // at 160 characters hid the failing goal of Class O, 2026-11-16).
@@ -996,9 +987,21 @@ impl<'n> Front2Program<'n> {
                     why.push_str(": ");
                     why.extend(detail.chars().map(|c| if c == '\n' { ' ' } else { c }));
                     left.insert(*k, why.into_boxed_str());
+                    // The row keeps the walk's typed refusal (program/left_out.rs); a site that
+                    // named its cause by text only keeps the refusal a run stops with.
+                    let refusal = match refusal.take() {
+                        Some(r) => *r,
+                        None => Front2Refusal::Unchecked { function: super::item_shown::refused(&records, *k), class: class.clone(), first: detail.clone() },
+                    };
+                    let row = LeftOut::reached(&records, core::mem::take(class), core::mem::take(detail), refusal);
+                    out.push((fn_shown(&records, *k).into_boxed_str(), row));
                 }
                 Reached::Failed { class, detail, .. } => {
-                    return Err(Front2Refusal::Unchecked { function: super::item_shown::refused(&records, *k), class: class.clone(), first: detail.clone() });
+                    return Err(Front2Refusal::Unchecked {
+                        function: super::item_shown::refused(&records, *k),
+                        class: core::mem::take(class),
+                        first: core::mem::take(detail),
+                    });
                 }
                 Reached::NoBody => bodiless.push((*k, super::row_path::row_path_of(&records, *k))),
                 // A ctor is the language's: tabled as one, the build makes its value.

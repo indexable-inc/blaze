@@ -15,17 +15,17 @@ use crate::{
 };
 
 /// One input of a merge: its bytes and its footer.
-pub struct Input<B: AsRef<[u8]>, A: Allocator + Clone> {
+pub struct Input<B: AsRef<[u8]>, A: Allocator + Copy> {
     bytes: B,
     meta: FileMeta<A>,
     /// Where its footer begins.
     data_end: usize,
 }
 
-impl<B: AsRef<[u8]>, A: Allocator + Clone> Input<B, A> {
+impl<B: AsRef<[u8]>, A: Allocator + Copy> Input<B, A> {
     /// The input of `bytes`, a whole Parquet file: its footer read.
     pub fn open(bytes: B, alloc: &A) -> Result<Input<B, A>, ParquetError> {
-        let (meta, data_end) = read::footer(bytes.as_ref(), alloc)?;
+        let (meta, data_end) = read::footer(bytes.as_ref(), *alloc)?;
         Ok(Input { bytes, meta, data_end })
     }
 
@@ -44,7 +44,7 @@ pub struct Failed {
 }
 
 /// A merge under way.
-pub struct Concat<B: AsRef<[u8]>, A: Allocator + Clone> {
+pub struct Concat<B: AsRef<[u8]>, A: Allocator + Copy> {
     inputs: Vec<Input<B, A>, A>,
     alloc: A,
     /// The key of the merged rows' count: dropped from the first input's metadata and written
@@ -111,7 +111,7 @@ fn recode<A: Allocator>(
     Ok((data.ok_or_else(|| corrupt("a column chunk of no data page"))?, dictionary))
 }
 
-impl<B: AsRef<[u8]>, A: Allocator + Clone> Concat<B, A> {
+impl<B: AsRef<[u8]>, A: Allocator + Copy> Concat<B, A> {
     /// The merge of `inputs` (at least one, all of the first one's schema). Its metadata is the
     /// first input's, but for `rows_key`, which says the rows the inputs' footers held. The
     /// output is handed out in pieces of at least `piece` bytes. Its pages are compressed as
@@ -128,14 +128,14 @@ impl<B: AsRef<[u8]>, A: Allocator + Clone> Concat<B, A> {
         if inputs.is_empty() {
             return Err(Failed { input: None, doing: "starting a merge of no input", error: ParquetError::SchemaDiffers });
         }
-        let mut out = Vec::with_capacity_in(piece.saturating_add(1 << 20), alloc.clone());
+        let mut out = Vec::with_capacity_in(piece.saturating_add(1 << 20), alloc);
         out.extend_from_slice(&MAGIC);
         Ok(Concat {
             inputs,
             compression,
-            plain: Vec::new_in(alloc.clone()),
-            packed: Vec::new_in(alloc.clone()),
-            groups: Vec::new_in(alloc.clone()),
+            plain: Vec::new_in(alloc),
+            packed: Vec::new_in(alloc),
+            groups: Vec::new_in(alloc),
             alloc,
             rows_key,
             piece,
@@ -169,7 +169,7 @@ impl<B: AsRef<[u8]>, A: Allocator + Clone> Concat<B, A> {
             }
             let group = &input.meta.row_groups[group_at];
             let bytes = &input.bytes.as_ref()[..input.data_end];
-            let mut columns = Vec::with_capacity_in(group.columns.len(), self.alloc.clone());
+            let mut columns = Vec::with_capacity_in(group.columns.len(), self.alloc);
             let group_start = self.handed + self.out.len();
             let mut compressed = 0i64;
             for chunk in group.columns.iter() {
@@ -187,7 +187,7 @@ impl<B: AsRef<[u8]>, A: Allocator + Clone> Concat<B, A> {
                     .filter(|_| start >= MAGIC.len())
                     .ok_or_else(|| corrupt("a chunk past the input's data"))?;
                 let new_start = self.handed + self.out.len();
-                let mut column = column.clone();
+                let mut column = column.clone_in(self.alloc);
                 if column.codec == self.compression.codec() {
                     self.out.extend_from_slice(raw);
                     let shift = new_start.widen_to::<u64>().cast_signed() - column.start();
@@ -239,7 +239,7 @@ impl<B: AsRef<[u8]>, A: Allocator + Clone> Concat<B, A> {
     }
 
     fn hand_out(&mut self) -> Vec<u8, A> {
-        let piece = core::mem::replace(&mut self.out, Vec::with_capacity_in(self.piece.saturating_add(1 << 20), self.alloc.clone()));
+        let piece = core::mem::replace(&mut self.out, Vec::with_capacity_in(self.piece.saturating_add(1 << 20), self.alloc));
         self.handed += piece.len();
         piece
     }
@@ -247,23 +247,23 @@ impl<B: AsRef<[u8]>, A: Allocator + Clone> Concat<B, A> {
     fn footer(&mut self) -> Result<(), Failed> {
         let failed = |doing, error| Failed { input: None, doing, error };
         let first = &self.inputs[0].meta;
-        let alloc = self.alloc.clone();
-        let mut key_value = Vec::with_capacity_in(first.key_value.len() + 1, alloc.clone());
+        let alloc = self.alloc;
+        let mut key_value = Vec::with_capacity_in(first.key_value.len() + 1, alloc);
         for kv in first.key_value.iter().filter(|it| it.key.as_str() != self.rows_key) {
-            key_value.push(kv.clone());
+            key_value.push(kv.clone_in(alloc));
         }
-        let mut rows = String::new_in(alloc.clone());
+        let mut rows = String::new_in(alloc);
         write!(rows, "{}", self.rows).map_err(|_| {
             failed("writing the merged rows' count", ParquetError::TooLarge { column: crate::column_name(""), what: "a count" })
         })?;
-        key_value.push(KeyValue { key: String::from_str_in(self.rows_key, alloc.clone()), value: Some(rows) });
+        key_value.push(KeyValue { key: String::from_str_in(self.rows_key, alloc), value: Some(rows) });
         let footer = FileMeta {
             version: first.version,
-            schema: Vec::from_iter_in(first.schema.iter().cloned(), alloc.clone()),
+            schema: Vec::from_iter_in(first.schema.iter().cloned(), alloc),
             num_rows: self.rows,
-            row_groups: core::mem::replace(&mut self.groups, Vec::new_in(alloc.clone())),
+            row_groups: core::mem::replace(&mut self.groups, Vec::new_in(alloc)),
             key_value,
-            created_by: first.created_by.clone(),
+            created_by: first.created_by.as_ref().map(|s| s.clone_in(alloc)),
             column_orders: first.column_orders,
         };
         let start = self.out.len();
@@ -278,7 +278,7 @@ impl<B: AsRef<[u8]>, A: Allocator + Clone> Concat<B, A> {
 
     /// The whole output at once: for a caller that writes it in one write.
     pub fn all(mut self) -> Result<Vec<u8, A>, Failed> {
-        let mut out = Vec::new_in(self.alloc.clone());
+        let mut out = Vec::new_in(self.alloc);
         while let Some(piece) = self.next()? {
             out.extend_from_slice(&piece);
         }

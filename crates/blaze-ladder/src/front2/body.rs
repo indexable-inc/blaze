@@ -1149,13 +1149,14 @@ fn lower_fn_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys
         store.ensure(names, keys, Want::Fn(item)).map_err(|error| BodyError::Head { item, error })?;
     }
     let head = store.fns.get(&owner).ok_or(BodyError::NoHead(owner))?;
+    let alloc = *head.params.allocator();
     let site = Site {
         item, owner, krate, module, text, marks,
-        params: head.params.clone(),
-        consts: head.consts.clone(),
-        bounds: head.bounds.clone(),
+        params: head.params.to_vec_in(alloc),
+        consts: head.consts.to_vec_in(alloc),
+        bounds: head.bounds.to_vec_in(alloc),
         self_: head.self_,
-        self_assoc: head.self_assoc.clone(),
+        self_assoc: head.self_assoc.to_vec_in(alloc),
     };
     lower_at(names, prepared, keys, store, site, into)
 }
@@ -1213,6 +1214,7 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
             return Err(BodyError::Record { item: head.lib, owner: key, why });
         }
     };
+    let alloc = *head.params.allocator();
     let site = Site {
         item: head.lib,
         owner: key,
@@ -1220,11 +1222,11 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
         module: head.module,
         text: head.text,
         marks,
-        params: head.params.clone(),
-        consts: head.consts.clone(),
-        bounds: head.bounds.clone(),
+        params: head.params.to_vec_in(alloc),
+        consts: head.consts.to_vec_in(alloc),
+        bounds: head.bounds.to_vec_in(alloc),
         self_: head.self_,
-        self_assoc: head.self_assoc.clone(),
+        self_assoc: head.self_assoc.to_vec_in(alloc),
     };
     let container = head.container;
     let mut body = lower_at(names, prepared, keys, store, site, into)?;

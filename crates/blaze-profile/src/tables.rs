@@ -135,18 +135,25 @@ pub fn read(
     let mut out = Vec::new();
     for (file, entry) in pin.manifest().scoped(table.name, scope) {
         let path = dir.join(file);
-        schema::readable(entry.version).map_err(|why| TableError::Version {
-            path: path.clone(), // clone: an error
-            version: entry.version,
-            why,
-        })?;
+        if let Err(why) = schema::readable(entry.version) {
+            return Err(TableError::Version { path, version: entry.version, why });
+        }
         // alloc: a file's bytes, once a question
-        let bytes = fs::read(&path).map_err(|error| TableError::Io { path: path.clone(), error })?; // clone: an error
-        let parquet = |error| TableError::Parquet { path: path.clone(), error }; // clone: an error
-        let file = blaze_parquet::File::open(&bytes, Global).map_err(parquet)?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => return Err(TableError::Io { path, error }),
+        };
+        let file = match blaze_parquet::File::open(&bytes, Global) {
+            Ok(file) => file,
+            Err(error) => return Err(TableError::Parquet { path, error }),
+        };
         // alloc: a file's projection, once a file
         let roots: Vec<usize> = columns.iter().filter_map(|name| file.column(name)).collect();
-        for batch in file.read(&roots).map_err(parquet)? {
+        let batches = match file.read(&roots) {
+            Ok(batches) => batches,
+            Err(error) => return Err(TableError::Parquet { path, error }),
+        };
+        for batch in batches {
             // alloc: a batch's column map, once a batch
             let at = columns.iter().map(|name| batch.index_of(name)).collect();
             out.push(Rows { path: path.clone(), batch, at }); // clone: a path, once a batch

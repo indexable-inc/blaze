@@ -292,16 +292,16 @@ fn convert_one_crate(
     // Pass A: per-file path, grouped-use, direct implicit-alloc, and direct capability rewrites.
     // (Pass B whole-workspace capability/allocator propagation runs in `convert_workspace`.)
     for (file_idx, rs_path) in krate.rs_files.iter().enumerate() {
-        let Some(src) = out_files.get(rs_path).cloned() else {
+        let Some(slot) = out_files.get_mut(rs_path) else {
             continue;
         };
         let (rewritten, edit_count, has_remaining_std) =
-            rewrite_rust_source_expressions(&src, &active_crate_rewrites, alloc_strategy);
+            rewrite_rust_source_expressions(slot, &active_crate_rewrites, alloc_strategy);
         ast_edits_applied += edit_count;
         if has_remaining_std {
             still_uses_std = true;
         }
-        out_files.insert(rs_path.clone(), rewritten);
+        let src = core::mem::replace(slot, rewritten);
 
         if lift_mode == SmLiftMode::LiftAllCandidates {
             let file_stem = file_disambiguator(rs_path, file_idx);
@@ -328,7 +328,7 @@ fn convert_one_crate(
                     // skip duplicate emission rather than producing a colliding struct definition.
                     continue;
                 }
-                lifted_machines.push(sm.machine_name.clone());
+                lifted_machines.push(sm.machine_name);
                 let _ = writeln!(lifted_machines_code, "// --- Source: {rs_path} ---");
                 lifted_machines_code.push_str(&sm.sans_io_code);
                 lifted_machines_code.push('\n');
@@ -341,9 +341,9 @@ fn convert_one_crate(
     }
 
     if split_structs {
-        let mut used_struct_names: BTreeSet<String> = BTreeSet::new();
+        let mut used_struct_names: BTreeSet<&str> = BTreeSet::new();
         for cand in &krate.struct_sm_candidates {
-            if !used_struct_names.insert(cand.name.clone()) {
+            if !used_struct_names.insert(cand.name.as_str()) {
                 continue;
             }
             refactored_structs.push(format!("{}Core", cand.name));
@@ -430,9 +430,9 @@ fn convert_one_crate(
         .collect();
     let extra_list: Vec<String> = extra_blaze_crates.into_iter().collect();
 
-    if let Some(manifest_src) = out_files.get(&krate.manifest_path).cloned() {
-        let new_manifest = rewrite_manifest(
-            &manifest_src,
+    if let Some(manifest_src) = out_files.get_mut(&krate.manifest_path) {
+        *manifest_src = rewrite_manifest(
+            manifest_src,
             &removed_deps,
             &remove_build_deps,
             needs_bstd,
@@ -441,7 +441,6 @@ fn convert_one_crate(
             &extra_list,
             blaze_c_toml_section.as_deref(),
         );
-        out_files.insert(krate.manifest_path.clone(), new_manifest);
     }
 
     let mut graduated_no_std = false;
@@ -451,10 +450,9 @@ fn convert_one_crate(
         } else {
             format!("{}/src/lib.rs", krate.dir)
         };
-        if let Some(lib_src) = out_files.get(&lib_path).cloned() {
+        if let Some(lib_src) = out_files.get_mut(&lib_path) {
             if !lib_src.contains("#![no_std]") && !lib_src.contains("#![cfg_attr(not(test), no_std)]") {
-                let updated = format!("#![cfg_attr(not(test), no_std)]\n{lib_src}");
-                out_files.insert(lib_path, updated);
+                *lib_src = format!("#![cfg_attr(not(test), no_std)]\n{lib_src}");
                 graduated_no_std = true;
             }
         }
@@ -554,7 +552,7 @@ pub fn rewrite_rust_no_std_core(src: &str) -> (String, usize, bool, bool) {
                 }
             }
             SyntaxKind::USE => {
-                if let Some(use_item) = ast::Use::cast(node.clone()) {
+                if let Some(use_item) = ast::Use::cast(node) {
                     if let Some(tree) = use_item.use_tree() {
                         let mut leaves = Vec::new();
                         flatten_use_tree("", &tree, &mut leaves);
@@ -586,7 +584,7 @@ pub fn rewrite_rust_no_std_core(src: &str) -> (String, usize, bool, bool) {
                 }
             }
             SyntaxKind::USE => {
-                if let Some(use_item) = ast::Use::cast(node.clone()) {
+                if let Some(use_item) = ast::Use::cast(node) {
                     let Some(tree) = use_item.use_tree() else { continue };
                     let raw = use_item.syntax().text().to_string();
                     if !raw.contains('{') {
@@ -652,7 +650,7 @@ pub fn rewrite_rust_no_std_core(src: &str) -> (String, usize, bool, bool) {
                             rebuilt.push(format!("{vis_prefix}use std::{{{}}};", std_leaves.join(", ")));
                         }
                     }
-                    let range = node.text_range();
+                    let range = use_item.syntax().text_range();
                     let start: usize = range.start().into();
                     let end: usize = range.end().into();
                     grouped_use_ranges.push((start, end));
@@ -719,7 +717,7 @@ pub fn rewrite_rust_no_std_core(src: &str) -> (String, usize, bool, bool) {
                 }
             }
             SyntaxKind::METHOD_CALL_EXPR => {
-                if let Some(mc) = ast::MethodCallExpr::cast(node.clone()) {
+                if let Some(mc) = ast::MethodCallExpr::cast(node) {
                     let m = mc.name_ref().map(|n| n.text().to_string()).unwrap_or_default();
                     if m == "to_owned" && !existing_imports.contains("ToOwned") {
                         needs_alloc = true;
@@ -731,7 +729,7 @@ pub fn rewrite_rust_no_std_core(src: &str) -> (String, usize, bool, bool) {
                 }
             }
             SyntaxKind::MACRO_CALL => {
-                if let Some(mc) = ast::MacroCall::cast(node.clone()) {
+                if let Some(mc) = ast::MacroCall::cast(node) {
                     let mname = mc.path().map(|p| p.syntax().text().to_string()).unwrap_or_default();
                     let leaf = mname.rsplit("::").next().unwrap_or(&mname).trim();
                     if leaf == "format" && !existing_imports.contains("format") {
@@ -1010,7 +1008,7 @@ fn rewrite_rust_source_expressions(
                 }
             }
             SyntaxKind::USE => {
-                if let Some(use_item) = ast::Use::cast(node.clone()) {
+                if let Some(use_item) = ast::Use::cast(node) {
                     let Some(tree) = use_item.use_tree() else { continue };
                     let raw = use_item.syntax().text().to_string();
                     if !raw.contains('{') {
@@ -1080,7 +1078,7 @@ fn rewrite_rust_source_expressions(
                             rebuilt.push(format!("{vis_prefix}use std::{{{}}};", std_leaves.join(", ")));
                         }
                     }
-                    let range = node.text_range();
+                    let range = use_item.syntax().text_range();
                     let start: usize = range.start().into();
                     let end: usize = range.end().into();
                     grouped_use_ranges.push((start, end));
@@ -1146,13 +1144,13 @@ fn rewrite_rust_source_expressions(
                 }
             }
             SyntaxKind::CALL_EXPR => {
-                let Some(call) = ast::CallExpr::cast(node.clone()) else { continue };
-                let txt = call.syntax().text().to_string();
-                let compact: String = txt.chars().filter(|c| !c.is_whitespace()).collect();
                 let inside_threadable = enclosing_threadable_fn(&node).is_some();
                 if !inside_threadable {
                     continue;
                 }
+                let Some(call) = ast::CallExpr::cast(node) else { continue };
+                let txt = call.syntax().text().to_string();
+                let compact: String = txt.chars().filter(|c| !c.is_whitespace()).collect();
 
                 // 1. Direct capability call rewrites (`Instant::now()`, `SystemTime::now()`,
                 //    `env::var("K")`, `rand::thread_rng()`, `rand::rng()`).
@@ -1265,7 +1263,7 @@ fn rewrite_rust_source_expressions(
                 if enclosing_threadable_fn(&node).is_none() {
                     continue;
                 }
-                let Some(mc) = ast::MethodCallExpr::cast(node.clone()) else { continue };
+                let Some(mc) = ast::MethodCallExpr::cast(node) else { continue };
                 let Some(mname_ref) = mc.name_ref() else { continue };
                 let mname = mname_ref.text().to_string();
                 let has_args = mc.arg_list().is_some_and(|al| al.args().next().is_some());
@@ -1326,7 +1324,7 @@ fn rewrite_rust_source_expressions(
                 if enclosing_threadable_fn(&node).is_none() {
                     continue;
                 }
-                let Some(mc) = ast::MacroCall::cast(node.clone()) else { continue };
+                let Some(mc) = ast::MacroCall::cast(node) else { continue };
                 let mname = mc.path().map(|p| p.syntax().text().to_string()).unwrap_or_default();
                 let leaf = mname.rsplit("::").next().unwrap_or(&mname).trim();
                 let alloc_arg = match alloc_strategy {
@@ -2379,14 +2377,14 @@ fn is_threadable_fn(func: &ast::Fn) -> bool {
     }
     // Skip trait impl methods (trait fixes signature).
     for outer in func.syntax().ancestors().skip(1) {
-        if let Some(imp) = ast::Impl::cast(outer.clone()) {
+        if outer.kind() == SyntaxKind::TRAIT {
+            return false;
+        }
+        if let Some(imp) = ast::Impl::cast(outer) {
             if imp.trait_().is_some() {
                 return false;
             }
             break;
-        }
-        if outer.kind() == SyntaxKind::TRAIT {
-            return false;
         }
     }
     // Skip `#[test]` or `#[cfg(test)]` functions.

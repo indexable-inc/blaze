@@ -43,18 +43,18 @@ const MOST_ROWS: usize = 1 << 22;
 
 /// Keyed rows, filed through `&self`, each at an address that holds until the table drops; in
 /// the allocator `A` the table was made with (the module docs say whose).
-pub struct Rows<K, V, A: Allocator + Clone = Global> {
+pub struct Rows<K, V, A: Allocator + Copy = Global> {
     /// Every row ever filed, with its key, in segments that never move.
     rows: SharedSegs<(K, V), A>,
     /// Each live key's row.
     at: RefCell<HashMap<K, u32, A>>,
 }
 
-impl<K: Copy + Eq + Hash, V, A: Allocator + Clone> Rows<K, V, A> {
+impl<K: Copy + Eq + Hash, V, A: Allocator + Copy> Rows<K, V, A> {
     /// An empty table in `alloc` (its rows and its index): nothing is allocated until a row is
     /// filed.
     pub fn new_in(alloc: A) -> Rows<K, V, A> {
-        Rows { rows: SharedSegs::new_in(alloc.clone()), at: RefCell::new(HashMap::new_in(alloc)) }
+        Rows { rows: SharedSegs::new_in(alloc), at: RefCell::new(HashMap::new_in(alloc)) }
     }
 
     fn row(&self, i: u32) -> Option<&(K, V)> {
@@ -131,7 +131,7 @@ impl<K: Copy + Eq + Hash, V, A: Allocator + Clone> Rows<K, V, A> {
 }
 
 /// `rows[&k]`, as a map's: the caller has checked `k` is filed; a key that is not stops naming it.
-impl<K: Copy + Eq + Hash + core::fmt::Debug, V, A: Allocator + Clone> core::ops::Index<&K> for Rows<K, V, A> {
+impl<K: Copy + Eq + Hash + core::fmt::Debug, V, A: Allocator + Copy> core::ops::Index<&K> for Rows<K, V, A> {
     type Output = V;
 
     #[track_caller]
@@ -143,7 +143,7 @@ impl<K: Copy + Eq + Hash + core::fmt::Debug, V, A: Allocator + Clone> core::ops:
     }
 }
 
-impl<K: Copy + Eq + Hash + core::fmt::Debug, V: core::fmt::Debug, A: Allocator + Clone> core::fmt::Debug for Rows<K, V, A> {
+impl<K: Copy + Eq + Hash + core::fmt::Debug, V: core::fmt::Debug, A: Allocator + Copy> core::fmt::Debug for Rows<K, V, A> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }

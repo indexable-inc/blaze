@@ -4,6 +4,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use blaze_own::LocalShare;
+
 use crate::ast::{self, token::Delimiter, visit};
 use crate::span::{BytePos, Ident, Pos, Span, symbol};
 use blaze_trace::debug;
@@ -813,7 +815,7 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
             ctx.psess,
             ctx.config,
             ctx.snippet_provider,
-            ctx.report.clone(),
+            ctx.report.local_share(),
         );
         visitor.skip_context.update(ctx.skip_context.clone());
         visitor.set_parent_context(ctx);
@@ -1074,9 +1076,9 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
             snippet_provider: self.snippet_provider,
             macro_rewrite_failure: Cell::new(false),
             is_macro_def: self.is_macro_def,
-            report: self.report.clone(),
+            report: self.report.local_share(),
             skip_context: self.skip_context.clone(),
-            skipped_range: self.skipped_range.clone(),
+            skipped_range: Rc::clone(&self.skipped_range),
         }
     }
 

@@ -135,15 +135,15 @@ impl fmt::Display for ConstAtRefusal {
 
 /// The needs of one instance, each with its ground arguments (types of the build's ground
 /// table), once each, in the order met.
-pub struct Needs<A: Allocator + Clone> {
+pub struct Needs<A: Allocator + Copy> {
     /// The need and its arguments' range in `args`.
     rows: Vec<(ConstNeed, u32, u32), A>,
     args: Vec<PTy, A>,
 }
 
-impl<A: Allocator + Clone> Needs<A> {
+impl<A: Allocator + Copy> Needs<A> {
     pub fn new_in(alloc: A) -> Needs<A> {
-        Needs { rows: Vec::new_in(alloc.clone()), args: Vec::new_in(alloc) }
+        Needs { rows: Vec::new_in(alloc), args: Vec::new_in(alloc) }
     }
 
     pub fn clear(&mut self) {
@@ -185,7 +185,7 @@ impl<A: Allocator + Clone> Needs<A> {
 /// generics has no row: its one value is the program's own (`FrontEnd::const_record`), made
 /// when the program was.
 #[allow(clippy::too_many_arguments)]
-pub fn needs_of<A: Allocator + Clone>(
+pub fn needs_of<A: Allocator + Copy>(
     view: &BodyView<'_>,
     done: &Checked<'_>,
     args: &[PTy],
@@ -264,7 +264,7 @@ pub fn needs_of<A: Allocator + Clone>(
 /// verifier, which pulls a read list's `Const` rows here (`verify_instance`), asks the same
 /// table: one answer per constant, never the program's record at the build and this table's at
 /// the check (rule 30).
-pub fn plain_needs_of<A: Allocator + Clone>(done: &Checked<'_>, out: &mut Needs<A>) -> Result<(), BuildError> {
+pub fn plain_needs_of<A: Allocator + Copy>(done: &Checked<'_>, out: &mut Needs<A>) -> Result<(), BuildError> {
     let at_args = done.const_args.column::<0>();
     for (e, d) in done.expr_defs.column::<0>().iter().zip(done.expr_defs.column::<1>().iter()) {
         if let &Def::Const(item) = d
@@ -287,14 +287,14 @@ pub fn plain_needs_of<A: Allocator + Clone>(done: &Checked<'_>, out: &mut Needs<
 /// The values of one build's needs, by need and ground arguments (types of the build's ground
 /// table, interned: equal types have one id): filled by [`pull`] before each instance's walk,
 /// read by the builder's `Adts` during it.
-pub struct ConstTable<A: Allocator + Clone> {
+pub struct ConstTable<A: Allocator + Copy> {
     rows: SortedMap<(u8, u128, u32), Vec<(Vec<PTy, A>, DataRecord<Global>), A>, A>,
     alloc: A,
 }
 
-impl<A: Allocator + Clone> ConstTable<A> {
+impl<A: Allocator + Copy> ConstTable<A> {
     pub fn new_in(alloc: A) -> ConstTable<A> {
-        ConstTable { rows: SortedMap::new_in(alloc.clone()), alloc }
+        ConstTable { rows: SortedMap::new_in(alloc), alloc }
     }
 
     /// The value of `need` at `args`, if pulled.
@@ -303,8 +303,8 @@ impl<A: Allocator + Clone> ConstTable<A> {
     }
 
     fn insert(&mut self, need: ConstNeed, args: &[PTy], record: DataRecord<Global>) {
-        let alloc = self.alloc.clone();
-        let at = self.rows.get_or_insert_with(&need.order(), |&k| (k, Vec::new_in(alloc.clone())));
+        let alloc = self.alloc;
+        let at = self.rows.get_or_insert_with(&need.order(), |&k| (k, Vec::new_in(alloc)));
         let mut kept = Vec::new_in(alloc);
         kept.extend_from_slice(args);
         at.push((kept, record));
@@ -315,7 +315,7 @@ impl<A: Allocator + Clone> ConstTable<A> {
 /// in `table` yet, and files each answer. The first need refused is the instance's refusal.
 /// `closures`: the build's closure facts, which a closure type among the arguments is laid
 /// out from ([`FrontEnd::const_at`]).
-pub fn pull<P: FrontEnd, A: Allocator + Clone>(program: &mut P, needs: &Needs<A>, from: PTys<'_>, table: &mut ConstTable<A>, closures: &crate::run::ClosureTable) -> Result<(), ConstAtRefusal> {
+pub fn pull<P: FrontEnd, A: Allocator + Copy>(program: &mut P, needs: &Needs<A>, from: PTys<'_>, table: &mut ConstTable<A>, closures: &crate::run::ClosureTable) -> Result<(), ConstAtRefusal> {
     for (need, args) in needs.iter() {
         if table.get(need, args).is_some() {
             continue;

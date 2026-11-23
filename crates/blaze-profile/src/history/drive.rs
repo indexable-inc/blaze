@@ -83,8 +83,9 @@ impl Live {
         // Each read holds the postmortem's names until it drops: one at a time.
         let recovered =
             found.read(listed.map(|it| it.flushed)).map_err(HistoryError::Postmortem)?;
-        let files = recovered_files(&self.dir, &self.writer, seq, &recovered)?;
-        Ok(Recovery::Files { nonce: recovered.nonce, files })
+        let nonce = recovered.nonce;
+        let files = recovered_files(&self.dir, &self.writer, seq, recovered)?;
+        Ok(Recovery::Files { nonce, files })
     }
 }
 
@@ -115,12 +116,15 @@ impl Host for Live {
         };
         match crash::read(path, bytes, &hash) {
             Ok(None) => CrashRead::Nothing,
-            Ok(Some(crash)) => CrashRead::Row(CrashRow {
-                pid: crash.pid,
-                t_ns: crash.t_ns,
-                row: crash.row(),
-                image: crash.image(),
-            }),
+            Ok(Some(crash)) => {
+                let image = crash.image();
+                CrashRead::Row(CrashRow {
+                    pid: crash.pid,
+                    t_ns: crash.t_ns,
+                    row: crash.row(),
+                    image,
+                })
+            }
             Err(refused) => CrashRead::Refused(refused),
         }
     }
@@ -141,24 +145,23 @@ fn recovered_files(
     dir: &Path,
     writer: &Writer,
     seq: u64,
-    recovered: &postmortem::Recovered,
+    recovered: postmortem::Recovered,
 ) -> Result<Vec<Placed>, HistoryError> {
     let process = Process { pid: recovered.pid, name: &recovered.process, commit: None };
     let read = &recovered.read;
+    let last_ns = recovered.last_ns;
+    let blaze = &recovered.blaze;
     // alloc: a row a build the dead daemon was running, once a postmortem
     let crashed: Vec<BuildRow> = recovered
         .builds
-        .iter()
+        .into_iter()
         .map(|build| BuildRow {
             build_id: build.build_id,
-            // clone: a build's texts, once a postmortem
-            commit: build.commit.clone(),
-            // clone: as above
-            workspace: build.workspace.clone(),
-            // clone: as above
-            command: build.command.clone(),
+            commit: build.commit,
+            workspace: build.workspace,
+            command: build.command,
             started_ns: build.started_ns,
-            dur_ns: Some(recovered.last_ns.max(build.started_ns) - build.started_ns),
+            dur_ns: Some(last_ns.max(build.started_ns) - build.started_ns),
             started_unix_ns: build.started_unix_ns,
             outcome: BuildOutcome::Crashed,
             hits: None,
@@ -166,7 +169,7 @@ fn recovered_files(
             joined: None,
             tree: None,
             // clone: a hash, once a build
-            blaze: (!recovered.blaze.is_empty()).then(|| recovered.blaze.clone()),
+            blaze: (!blaze.is_empty()).then(|| blaze.clone()),
             client_ns: None,
             daemon_cpu_ns: None,
         })

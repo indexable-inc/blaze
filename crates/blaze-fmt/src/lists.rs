@@ -232,11 +232,10 @@ pub(crate) fn definitive_tactic<I, T>(
     width: usize,
 ) -> DefinitiveListTactic
 where
-    I: IntoIterator<Item = T> + Clone,
+    I: IntoIterator<Item = T> + Copy,
     T: AsRef<ListItem>,
 {
     let pre_line_comments = items
-        .clone()
         .into_iter()
         .any(|item| item.as_ref().has_single_line_comment());
 
@@ -248,7 +247,7 @@ where
         ListTactic::Mixed | ListTactic::HorizontalVertical => width,
     };
 
-    let (sep_count, total_width) = calculate_width(items.clone());
+    let (sep_count, total_width) = calculate_width(items);
     let total_sep_len = sep.len() * sep_count.saturating_sub(1);
     let real_total = total_width + total_sep_len;
 
@@ -265,7 +264,7 @@ where
 // Format a list of commented items into a string.
 pub(crate) fn write_list<I, T>(items: I, formatting: &ListFormatting<'_>) -> RewriteResult
 where
-    I: IntoIterator<Item = T> + Clone,
+    I: IntoIterator<Item = T> + Copy,
     T: AsRef<ListItem>,
 {
     let tactic = formatting.tactic;
@@ -275,7 +274,7 @@ where
     // will be a trailing separator.
     let mut trailing_separator = formatting.needs_trailing_separator();
     let mut result = String::with_capacity(128);
-    let cloned_items = items.clone();
+    let cloned_items = items;
     let mut iter = items.into_iter().enumerate().peekable();
     let mut item_max_width: Option<usize> = None;
     let sep_place =
@@ -287,7 +286,7 @@ where
     let indent_str = &formatting.shape.indent.to_string(formatting.config);
     while let Some((i, item)) = iter.next() {
         let item = item.as_ref();
-        let inner_item = item.item.as_ref().or_else(|err| Err(err.clone()))?;
+        let inner_item = item.item.as_ref().map_err(|&err| err)?;
         let first = i == 0;
         let last = iter.peek().is_none();
         let mut separate = match sep_place {
@@ -533,12 +532,12 @@ fn max_width_of_item_with_post_comment<I, T>(
     max_budget: usize,
 ) -> usize
 where
-    I: IntoIterator<Item = T> + Clone,
+    I: IntoIterator<Item = T> + Copy,
     T: AsRef<ListItem>,
 {
     let mut max_width = 0;
     let mut first = true;
-    for item in items.clone().into_iter().skip(i) {
+    for item in (*items).into_iter().skip(i) {
         let item = item.as_ref();
         let inner_item_width = unicode_str_width(item.inner_as_ref());
         if !first

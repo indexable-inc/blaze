@@ -13,7 +13,7 @@ blaze-bench	13	1	0	34
 blaze-blake3	23	0	0	20
 blaze-body-build	0	0	2	0
 blaze-body-eval	0	0	4	3
-blaze-bstd-convert	6	0	13	434
+blaze-bstd-convert	6	0	13	429
 blaze-build	4	1	0	297
 blaze-build-script	15	1	0	72
 blaze-bytes	0	0	3	19
@@ -43,7 +43,7 @@ blaze-export	12	0	0	0
 blaze-fetch	52	0	7	40
 blaze-file-items	64	0	4	72
 blaze-flow	0	0	1	0
-blaze-fmt	223	1	0	1051
+blaze-fmt	223	1	0	1050
 blaze-format	13	0	0	11
 blaze-format-core	3	0	14	22
 blaze-format-tiers	4	1	0	45
@@ -83,8 +83,8 @@ blaze-own	65	0	25	38
 blaze-pack	0	0	10	86
 blaze-parquet	0	0	2	0
 blaze-pg	0	0	7	39
-blaze-proc-macro	521	1	0	1015
-blaze-profile	349	1	17	1548
+blaze-proc-macro	515	1	0	1014
+blaze-profile	349	1	17	1546
 blaze-protocol	27	1	1	157
 blaze-queue	1	0	5	0
 blaze-radix	2	1	1	23
