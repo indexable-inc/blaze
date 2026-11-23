@@ -265,6 +265,8 @@ crates/blaze-std/src/telemetry/sampler/symbols.rs	ELF_MAGIC	none
 crates/blaze-std/src/telemetry/sampler/symbols.rs	MH_MAGIC_64	none
 crates/blaze-std/src/wasm64.rs	ABI_VERSION	none
 crates/blaze-std/src/wire.rs	VERSION	none
+crates/blaze-std/src/zip.rs	VERSION_MADE_BY_UNIX_20	not persisted: PKZIP archive header version constant
+crates/blaze-std/src/zip.rs	VERSION_NEEDED_20	not persisted: PKZIP archive header version constant
 crates/blaze-surface/src/crate_graph.rs	GRAPH_SCHEMA	none
 crates/blaze-surface/src/file_items.rs	SCHEMA	none
 crates/blaze-surface/src/impl_index.rs	BUCKET_SCHEMA	none

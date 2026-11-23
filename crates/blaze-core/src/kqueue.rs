@@ -1184,17 +1184,36 @@ impl<S: Split, O: Opening> Kqueue<S, O> {
     }
 
     fn accept(&mut self, listen: ListenId) {
+        let fail = |this: &mut Self, tag: Tag, error: io::Error| {
+            // A failure ends the listen.
+            this.end_listen(listen);
+            // alloc: an error path.
+            let done = Done::Failed(IoError(format!("accepting a connection: {error}")));
+            this.ready.push(Completion { tag, done });
+        };
         loop {
             let Some(listening) = self.listens.get(listen) else { return };
             let tag = listening.tag;
             match listening.listener.accept() {
                 Ok(socket) => {
-                    // Per-connection setup failure (e.g. macOS returning EINVAL from SO_NOSIGPIPE
-                    // when a probing client closed immediately after connect()) drops only that
-                    // accepted socket and never tears down the listener.
-                    if socket.set_nonblocking(true).is_ok() && no_sigpipe(socket.fd()).is_ok() {
-                        let conn = self.adopt(socket);
-                        self.ready.push(Completion { tag, done: Done::Accepted { conn } });
+                    // Only peer-gone errors during accepted-socket setup (including macOS
+                    // returning EINVAL from SO_NOSIGPIPE when a probing client closed immediately
+                    // after connect()) drop that socket alone; genuine OS setup failures end the
+                    // listen via Done::Failed.
+                    let setup = match socket.set_nonblocking(true) {
+                        Ok(()) => no_sigpipe(socket.fd()).map_err(|error| (error, true)),
+                        Err(error) => Err((error, false)),
+                    };
+                    match setup {
+                        Ok(()) => {
+                            let conn = self.adopt(socket);
+                            self.ready.push(Completion { tag, done: Done::Accepted { conn } });
+                        }
+                        Err((error, allow_einval)) if accept_setup_peer_gone(&error, allow_einval) => {}
+                        Err((error, _)) => {
+                            fail(self, tag, error);
+                            return;
+                        }
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
@@ -1206,11 +1225,7 @@ impl<S: Split, O: Opening> Kqueue<S, O> {
                             | io::ErrorKind::ConnectionReset
                     ) => {}
                 Err(error) => {
-                    // A failure ends the listen.
-                    self.end_listen(listen);
-                    // alloc: an error path.
-                    let done = Done::Failed(IoError(format!("accepting a connection: {error}")));
-                    self.ready.push(Completion { tag, done });
+                    fail(self, tag, error);
                     return;
                 }
             }
@@ -1837,6 +1852,28 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 fn no_sigpipe(fd: RawFd) -> io::Result<()> {
     sys_net::setsockopt_int(Fd::new(fd), sys_net::SOL_SOCKET, sys_net::SO_NOSIGPIPE, 1)
         .map_err(|errno| io::Error::from_raw_os_error(i32::from(errno.raw())))
+}
+
+/// Whether an error from setting up a freshly accepted socket means only that the peer already
+/// closed/reset the connection, rather than a genuine OS setup failure that must report
+/// [`Done::Failed`]. On macOS, `setsockopt(SO_NOSIGPIPE)` additionally returns `EINVAL` when the
+/// peer disconnected before the option was set (`allow_einval`).
+fn accept_setup_peer_gone(error: &io::Error, allow_einval: bool) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+    ) || matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == i32::from(Errno::ConnReset.raw())
+                || code == i32::from(Errno::ConnAborted.raw())
+                || code == i32::from(Errno::NotConn.raw())
+                || code == i32::from(Errno::Pipe.raw())
+                || (allow_einval && code == i32::from(Errno::Inval.raw()))
+    )
 }
 
 /// How a nonblocking connect of `fd` ended.
@@ -3432,5 +3469,20 @@ mod tests {
         crate::fs::assert_syncs_a_sealed_file(&mut Threads::new(&threads, 2), &threads);
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(threads).unwrap();
+    }
+
+    #[test]
+    fn accept_setup_peer_gone_distinguishes_peer_drop_from_os_failure() {
+        let from = |errno: Errno| io::Error::from_raw_os_error(i32::from(errno.raw()));
+        for errno in [Errno::ConnReset, Errno::ConnAborted, Errno::NotConn, Errno::Pipe] {
+            assert!(accept_setup_peer_gone(&from(errno), false), "{errno} is peer-gone");
+            assert!(accept_setup_peer_gone(&from(errno), true), "{errno} is peer-gone");
+        }
+        assert!(!accept_setup_peer_gone(&from(Errno::Inval), false), "EINVAL from set_nonblocking is not peer-gone");
+        assert!(accept_setup_peer_gone(&from(Errno::Inval), true), "EINVAL from SO_NOSIGPIPE is peer-gone on macOS");
+        for errno in [Errno::BadF, Errno::NoMem, Errno::NoProtoOpt, Errno::Acces, Errno::Fault] {
+            assert!(!accept_setup_peer_gone(&from(errno), false), "{errno} must surface as Done::Failed");
+            assert!(!accept_setup_peer_gone(&from(errno), true), "{errno} must surface as Done::Failed");
+        }
     }
 }

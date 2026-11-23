@@ -71,9 +71,6 @@ pub enum EngineCheckError {
     /// ([`FOUND_CAP`], rule 18): the chain named by its first and last file (engine_names.rs
     /// `unoutlined`), a macro that writes modules without end.
     FoundTooMany { task: Name, krate: blaze_own::String<SharedAlloc<'static>>, count: u32, cap: u32, first: blaze_own::String<SharedAlloc<'static>>, last: blaze_own::String<SharedAlloc<'static>> },
-    /// Two member units of one root and kind (engine_body_plan.rs `FoundUnitsShare`): a found
-    /// file's place could not say which found it.
-    FoundUnitsShare(crate::engine_body_plan::FoundUnitsShare),
     /// The found file `file` is read by member units of two roots: its place keeps one root
     /// ([`blaze_engine::pages::FilePlace`]'s `unit`), so the other's edge would be lost (rule 3).
     FoundTwoRoots { file: Name, first: Name, second: Name },
@@ -252,7 +249,6 @@ impl fmt::Display for EngineCheckError {
                 f,
                 "crate `{krate}`'s names ({task:?}) read {count} files the file walk did not outline, from `{first}` to `{last}`: past the cap of {cap} files a crate's names may find in one request (rule 18, engine_check.rs `FOUND_CAP`, engine_names.rs `unoutlined`)"
             ),
-            EngineCheckError::FoundUnitsShare(why) => write!(f, "{why}"),
             EngineCheckError::FoundTwoRoots { file, first, second } => write!(f, "the found file {file:?} is read by the names of member units of two roots, {first:?} and {second:?}: its place keeps one root, so the other's module tree would lose it (engine_check.rs `serve_found`, rule 3)"),
             EngineCheckError::FoundTwoOutlines { file } => write!(f, "two crates' names outlined the found file {file:?} to two outlines in one request: its text moved between their reads (engine_check.rs `serve_found`, rule 21)"),
             EngineCheckError::FoundOnReady { task, file } => write!(f, "{task:?} read {file:?}, a file no outline of the request holds, on the ready driver, which runs no names task (engine_ready_edit.rs `admit`, `READY_KINDS`): the driver's own inconsistency (engine_check.rs `FoundOnReady`)"),
@@ -1933,7 +1929,7 @@ fn checking<'f, 'd>(
             found_places.extend(last.places.iter().filter(|(_, place)| place.flags & PLACE_FOUND != 0).map(|(file, place)| (*file, *place)));
             found_places.sort_unstable_by_key(|(file, _)| *file);
             let found_units = match plan_list {
-                Some(list) if !found_places.is_empty() => crate::engine_body_plan::found_units(list, heap.alloc()).map_err(EngineCheckError::FoundUnitsShare)?,
+                Some(list) if !found_places.is_empty() => crate::engine_body_plan::found_units(list, heap.alloc()),
                 _ => blaze_own::Vec::new_in(heap.alloc()),
             };
             let found_edges = crate::engine_body_plan::found_edges(&found_units, &found_places, heap.alloc());
@@ -2095,7 +2091,7 @@ fn checking<'f, 'd>(
             found_places.extend(file_places.iter().filter(|(_, place)| place.flags & PLACE_FOUND != 0).copied());
             found_places.sort_unstable_by_key(|(file, _)| *file);
             let found_units = match plan_list {
-                Some(list) if !found_places.is_empty() => crate::engine_body_plan::found_units(list, heap.alloc()).map_err(EngineCheckError::FoundUnitsShare)?,
+                Some(list) if !found_places.is_empty() => crate::engine_body_plan::found_units(list, heap.alloc()),
                 _ => blaze_own::Vec::new_in(heap.alloc()),
             };
             let found_edges = crate::engine_body_plan::found_edges(&found_units, &found_places, heap.alloc());
@@ -3592,7 +3588,7 @@ fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
         return Ok(());
     }
     let Some(list) = stage.names.as_ref().map(|world| world.list()) else { return Ok(()) };
-    let units = crate::engine_body_plan::found_units(list, heap.alloc()).map_err(EngineCheckError::FoundUnitsShare)?;
+    let units = crate::engine_body_plan::found_units(list, heap.alloc());
     // Every checkout crate in the list (workspace members and non-member checkout path packages):
     // both read files from tree 0 and may find macro-written modules or computed data includes.
     let mut checkout_units: SVec<'_, (Name, bool, Name, bool)> = SVec::new_in(alloc);
@@ -3633,11 +3629,15 @@ fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
             if place.flags & found_bit(test) == 0 {
                 continue;
             }
-            let Some(found_unit) = checkout_units.iter().find(|one| one.0 == place.unit && one.1 == test) else { continue };
-            if by.binary_search_by_key(&found_unit.2, |one| one.unit).is_ok() {
-                continue;
+            let from = checkout_units.partition_point(|one| (one.0, one.1) < (place.unit, test));
+            let standing = checkout_units
+                .iter()
+                .skip(from)
+                .take_while(|one| (one.0, one.1) == (place.unit, test))
+                .any(|one| by.binary_search_by_key(&one.2, |b| b.unit).is_err());
+            if standing {
+                found_mark(&mut masks, *file, place.unit, found_bit(test))?;
             }
-            found_mark(&mut masks, *file, place.unit, found_bit(test))?;
         }
     }
     // Each new file's one outline, with its probe, its finder's root and whether its finder is
