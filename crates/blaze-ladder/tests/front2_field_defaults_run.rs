@@ -1080,3 +1080,280 @@ pub extern \"C\" fn main() -> i32 {
     assert!(annotated.contains("? MissingEntity"), "try propagation hint missing:\n{annotated}");
     println!("=== FLECS-WITHOUT-FLECS-SCRIPT POC (BLAZE INSPECT) ===\n{annotated}");
 }
+
+/// Comptime field unrolling (`inline for`) on heterogeneous structural records, tuples,
+/// `&rec` name+value destructuring without moving, and `&mut rec` in-place mutation.
+#[test]
+fn inline_for_record_and_tuple_heterogeneous_dispatch() {
+    let got = run_head(RECORDS_HEAD, "
+impl Copy for usize {}
+
+#[repr(C)]
+struct Words {
+    data: usize,
+    len: usize,
+}
+
+impl Copy for Words {}
+
+union Wide {
+    s: &'static str,
+    words: Words,
+}
+
+fn str_len(s: &'static str) -> u32 {
+    unsafe { Wide { s }.words.len as u32 }
+}
+
+trait Score {
+    fn score(&self) -> u32;
+    fn take_score(self) -> u32;
+    fn bump(&mut self);
+}
+
+struct A(u32);
+struct B(u32);
+struct C(u32);
+
+impl Score for A {
+    fn score(&self) -> u32 { self.0 }
+    fn take_score(self) -> u32 { self.0 }
+    fn bump(&mut self) { self.0 = self.0 + 1; }
+}
+
+impl Score for B {
+    fn score(&self) -> u32 { self.0 * 2 }
+    fn take_score(self) -> u32 { self.0 * 2 }
+    fn bump(&mut self) { self.0 = self.0 + 2; }
+}
+
+impl Score for C {
+    fn score(&self) -> u32 { self.0 + 3 }
+    fn take_score(self) -> u32 { self.0 + 3 }
+    fn bump(&mut self) { self.0 = self.0 + 3; }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut total: u32 = 0;
+    let rec = { a: A(4), b: B(5), c: C(3) };
+    // Borrowed (name, field) iteration without moving `rec`:
+    // names: 1 + 1 + 1 = 3; scores: 4 + 10 + 6 = 20 => 23
+    inline for (name, field) in &rec {
+        total = total + str_len(name) + field.score();
+    }
+    // By-value heterogeneous record iteration (moves disjoint fields):
+    // 4 + 10 + 6 = 20 => 43
+    inline for field in rec {
+        total = total + field.take_score();
+    }
+    // Heterogeneous tuple iteration:
+    // 1 + 4 + 6 = 11 => 54
+    inline for x in (A(1), B(2), C(3)) {
+        total = total + x.take_score();
+    }
+    // Mutable borrowed record iteration:
+    // A(2)->3, B(3)->5 => +8 => 62
+    let mut mut_rec = { x: A(2), y: B(3) };
+    inline for f in &mut mut_rec {
+        f.bump();
+    }
+    total = total + mut_rec.x.0 + mut_rec.y.0;
+    total as i32
+}
+");
+    assert_eq!(got, Ok(62));
+}
+
+/// Generic `fn score_all<T>(bundle: T) -> u32` using `inline for` with zero trait bounds on `T`:
+/// called with a composed defaulted record prefab, a heterogeneous tuple, a named struct, and a
+/// tuple struct — compiled straight to zero-overhead monomorphized native code.
+#[test]
+fn inline_for_generic_spawn_prefab_bundle() {
+    let got = run_head(RECORDS_HEAD, "
+trait Score {
+    fn score(self) -> u32;
+}
+
+struct Health(u32);
+struct Armor(u32);
+struct Shield(u32);
+
+impl Score for Health {
+    fn score(self) -> u32 { self.0 }
+}
+
+impl Score for Armor {
+    fn score(self) -> u32 { self.0 * 2 }
+}
+
+impl Score for Shield {
+    fn score(self) -> u32 { self.0 + 1 }
+}
+
+type Unit = { hp: Health = Health(10) };
+type Boss = { ..Unit, shield: Shield = Shield(12) };
+
+struct Pack {
+    h: Health,
+    s: Shield,
+}
+
+struct Pair(Health, Armor);
+
+fn score_all<T>(bundle: T) -> u32 {
+    let mut acc: u32 = 0;
+    inline for f in bundle {
+        acc = acc + f.score();
+    }
+    acc
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    // 1. Composed defaulted record prefab: Health(20) -> 20, Shield(12) -> 13 => 33
+    let s1 = score_all::<Boss>({ hp: Health(20) });
+    // 2. Heterogeneous tuple: Health(5) -> 5, Armor(5) -> 10, Shield(2) -> 3 => 18
+    let s2 = score_all((Health(5), Armor(5), Shield(2)));
+    // 3. Named struct: Health(4) -> 4, Shield(6) -> 7 => 11
+    let s3 = score_all(Pack { h: Health(4), s: Shield(6) });
+    // 4. Tuple struct: Health(3) -> 3, Armor(4) -> 8 => 11
+    let s4 = score_all(Pair(Health(3), Armor(4)));
+    (s1 + s2 + s3 + s4) as i32
+}
+");
+    assert_eq!(got, Ok(73));
+}
+
+/// `inline for` with `?` propagation and `Result<u32, _>` inferred structural error union.
+#[test]
+fn inline_for_with_error_union_try_propagation() {
+    let got = run_head("", "#![blaze::records]
+#![blaze::error_unions]
+#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_index: usize, _len: usize) -> ! {
+    loop {}
+}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u32 {}
+impl Copy for i32 {}
+
+#[lang = \"from\"]
+trait From<T> {
+    fn from(v: T) -> Self;
+}
+
+impl<T> From<T> for T {
+    fn from(v: T) -> T { v }
+}
+
+enum ControlFlow<B, C = ()> {
+    #[lang = \"Continue\"]
+    Continue(C),
+    #[lang = \"Break\"]
+    Break(B),
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+#[lang = \"Try\"]
+trait Try {
+    type Output;
+    type Residual;
+    #[lang = \"from_output\"]
+    fn from_output(output: Self::Output) -> Self;
+    #[lang = \"branch\"]
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output>;
+}
+
+#[lang = \"FromResidual\"]
+trait FromResidual<R = <Self as Try>::Residual> {
+    #[lang = \"from_residual\"]
+    fn from_residual(residual: R) -> Self;
+}
+
+impl<T, E> Try for Result<T, E> {
+    type Output = T;
+    type Residual = Result<T, E>;
+    fn from_output(output: T) -> Self { Result::Ok(output) }
+    fn branch(self) -> ControlFlow<Result<T, E>, T> {
+        match self {
+            Result::Ok(v) => ControlFlow::Continue(v),
+            Result::Err(e) => ControlFlow::Break(Result::Err(e)),
+        }
+    }
+}
+
+impl<T, E, F: From<E>> FromResidual<Result<T, E>> for Result<T, F> {
+    fn from_residual(residual: Result<T, E>) -> Self {
+        match residual {
+            Result::Err(e) => Result::Err(F::from(e)),
+            Result::Ok(_) => loop {},
+        }
+    }
+}
+
+struct ErrA(u32);
+struct ErrB(u32);
+struct CheckA(u32);
+struct CheckB(u32);
+
+impl CheckA {
+    fn verify(self) -> Result<u32, ErrA> {
+        if self.0 == 0 { Result::Err(ErrA(10)) } else { Result::Ok(self.0) }
+    }
+}
+
+impl CheckB {
+    fn verify(self) -> Result<u32, ErrB> {
+        if self.0 == 0 { Result::Err(ErrB(20)) } else { Result::Ok(self.0 * 2) }
+    }
+}
+
+fn check_all(r: { a: CheckA, b: CheckB }) -> Result<u32, _> {
+    let mut sum: u32 = 0;
+    inline for f in r {
+        sum = sum + f.verify()?;
+    }
+    Result::Ok(sum)
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let ok_val = match check_all({ a: CheckA(4), b: CheckB(4) }) {
+        Result::Ok(v) => v,
+        Result::Err(_) => 0,
+    };
+    let err_a = match check_all({ a: CheckA(0), b: CheckB(4) }) {
+        Result::Ok(_) => 0,
+        Result::Err(e) => match e {
+            a: ErrA => a.0,
+            b => b.0 + 100,
+        },
+    };
+    let err_b = match check_all({ a: CheckA(4), b: CheckB(0) }) {
+        Result::Ok(_) => 0,
+        Result::Err(e) => match e {
+            b: ErrB => b.0,
+            a => a.0 + 100,
+        },
+    };
+    // 12 + 10 + 20 = 42
+    (ok_val + err_a + err_b) as i32
+}
+");
+    assert_eq!(got, Ok(42));
+}

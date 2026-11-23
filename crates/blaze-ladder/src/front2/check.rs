@@ -98,6 +98,8 @@ pub enum CheckFail {
     /// two read-list digests under one owner (front2 body_reads.rs `Digests::file`; rule 21).
     /// `diff` names the rows that differ (rule 19).
     ReadsDiffer { owner: ItemKey, diff: Box<super::body_reads::ReadsDiff> },
+    /// Comptime `inline for` unrolling failed on `owner` at `at`.
+    InlineFor { owner: ItemKey, at: tc::Range, why: &'static str },
 }
 
 impl core::fmt::Display for CheckFail {
@@ -139,6 +141,7 @@ impl core::fmt::Display for CheckFail {
             CheckFail::ReadsDiffer { owner, diff } => write!(f, "checking {owner:?} again read other answers than its first check: two read-list digests under one body (rule 21): {diff}"),
             CheckFail::Resolve { owner, item, error, args } => write!(f, "in {owner:?}, the call of {item:?} at [{args}]: {error}"),
             CheckFail::Const { owner, key, shown, error } => write!(f, "checking {owner:?}: the constant {key:?} ({shown}) an array length names: {error:?}"),
+            CheckFail::InlineFor { owner, at, why } => write!(f, "checking {owner:?} at {}..{}: inline for: {why}", at.start, at.end),
         }
     }
 }
@@ -253,6 +256,21 @@ fn infer_boxed(alloc: blaze_own::Alloc<'static>) -> blaze_own::Box<InferCtx<'sta
 
 const _: () = assert!(core::mem::size_of::<blaze_own::Box<InferCtx<'static>, blaze_own::Alloc<'static>>>() == 2 * core::mem::size_of::<usize>());
 
+/// Pre-unroll probe pass for a body containing `inline for`: resolves `expr_ty` for each
+/// `inline for` iterable expression without failing on downstream diagnostics that depend on
+/// the unexpanded loop body, and without filing `inferred_output` / `reads` / `closures`.
+pub(crate) fn check_rounds_probe<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    body: &Body<'_>,
+    scope: &BodyScope<'_>,
+) -> Result<tc::Checked<'static>, CheckFail> {
+    let prev = r.store.inline_for_probe;
+    r.store.inline_for_probe = true;
+    let out = check_rounds_as(r, body, scope, None, None, super::stalled_goals::Stalls::Gap, None);
+    r.store.inline_for_probe = prev;
+    out
+}
+
 /// [`check_rounds`] with the check's entry for an auto-trait goal of an async block's future
 /// that fails only on the superset interior named (front2 stalled_goals.rs `Stalls`): only
 /// `ProjectWorld::check_borrows` passes `Stalls::Decide`, and it decides every stalled row.
@@ -265,6 +283,7 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     stalls: super::stalled_goals::Stalls,
     mut root_keys: Option<&mut Vec<u64, Global>>,
 ) -> Result<tc::Checked<'static>, CheckFail> {
+    let allow_diags = r.store.inline_for_probe;
     let owner = body.typeck.owner;
     // The store's allocator: the checked body outlives the round (`Checked<'static>`).
     let alloc = r.store.tys.alloc();
@@ -397,7 +416,7 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             // before the checker's: the body was checked with the error type in its place. So is
             // one of the fn's own signature (its head's, `Store::type_misses`): a body whose
             // head holds the error type is never a clean check, even where the walk read none.
-            Outcome::Done(done) if !round_gaps && (!done.diags.is_empty() || !body.type_misses.is_empty() || r.store.type_misses.contains_key(&owner)) => {
+            Outcome::Done(done) if !round_gaps && !allow_diags && (!done.diags.is_empty() || !body.type_misses.is_empty() || r.store.type_misses.contains_key(&owner)) => {
                 let mut diags = Vec::with_capacity_in(body.type_misses.len() + done.diags.len(), Global);
                 diags.extend(signature_misses(r, owner));
                 diags.extend(body.type_misses.iter().map(|m| (tc::DiagCode::UnresolvedType, m.range(), m.words.clone())));
@@ -420,7 +439,9 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
                 return Err(said(r, owner, diags, alloc));
             }
             Outcome::Done(done) if !round_gaps => {
-                if let Some(inferred_out) = done.inferred_output {
+                if !allow_diags
+                    && let Some(inferred_out) = done.inferred_output
+                {
                     let _ = r.store.file_inferred_output(owner, done.types.view(), inferred_out);
                 }
                 // The shared goals the finished round took (blaze-solve share.rs `GoalHit`): the
@@ -2158,12 +2179,17 @@ fn resolve_inferred_outputs<'n, S: NamesSource<'n>>(
                 Some(lib) => super::lower_made::LowerTarget::Free(lib),
                 None => super::lower_made::LowerTarget::Member(cur),
             };
-            let lowered = match super::lower_made::lower_made(r, prepared, target) {
+            let mut lowered = match super::lower_made::lower_made(r, prepared, target) {
                 Ok(l) => l,
                 Err(_) => {
                     return Err(InferredErr::Gap(Gap::InferredOutputFailed { item: cur, why: "body could not be lowered" }));
                 }
             };
+            if !lowered.typeck.inline_fors.is_empty()
+                && super::inline_for::expand_concrete_body(r, prepared, &mut lowered).is_err()
+            {
+                return Err(InferredErr::Gap(Gap::InferredOutputFailed { item: cur, why: "inline for expansion failed" }));
+            }
             let view = lowered.lowered.view();
             let spell = match Spelling::of(&view) {
                 Ok(s) => s,

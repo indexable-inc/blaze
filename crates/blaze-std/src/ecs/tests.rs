@@ -1051,3 +1051,389 @@ fn the_oracle_catches_stale_entity_row_update() {
         run_ecs_model_case(tape, plant)
     });
 }
+
+// -----------------------------------------------------------------------------
+// Zero-String Typed Flecs 4.2 Ergonomic API Tests
+// -----------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Shield(i32);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Wrapper<T>(T);
+
+struct Alive;
+struct Stunned;
+
+struct AllyRel;
+impl super::Relation for AllyRel {
+    const SYMMETRIC: bool = true;
+}
+
+struct LocatedInRel;
+impl super::Relation for LocatedInRel {
+    const TRANSITIVE: bool = true;
+}
+
+struct BaseUnit;
+impl super::Prefab for BaseUnit {
+    type Parent = super::NoParent;
+    type Components = (Health, Armor);
+
+    fn components() -> Self::Components {
+        (Health(100), Armor(5))
+    }
+}
+
+struct DragonBoss;
+impl super::Prefab for DragonBoss {
+    type Parent = BaseUnit;
+    type Components = (Health, Shield);
+
+    fn components() -> Self::Components {
+        (Health(500), Shield(80))
+    }
+}
+
+#[test]
+fn short_type_name_and_lazy_auto_registration() {
+    use super::typed::short_type_name_str;
+
+    assert_eq!(short_type_name_str("my_game::Pos"), "Pos");
+    assert_eq!(short_type_name_str("bstd::ecs::tests::Health"), "Health");
+    assert_eq!(short_type_name_str("foo::Bar<baz::Qux>"), "Bar<baz::Qux>");
+    assert_eq!(short_type_name_str("Pos"), "Pos");
+    assert_eq!(super::short_type_name::<Pos>(), "Pos");
+    assert_eq!(super::short_type_name::<Health>(), "Health");
+    let wrapped = super::short_type_name::<Wrapper<Pos>>();
+    assert!(wrapped.starts_with("Wrapper<"));
+    assert!(wrapped.ends_with('>'));
+
+    let a = alloc();
+    let mut w = World::new_in(a).expect("world");
+
+    // Zero manual registration: first `set` auto-registers `Pos` with short name "Pos".
+    let e = w.spawn().expect("e");
+    w.set(e, Pos { x: 4, y: 9 }).expect("lazy set Pos");
+    let pos_id = w.component_id::<Pos>().expect("Pos registered");
+    assert_eq!(w.component_meta(pos_id).expect("meta").name(), "Pos");
+    assert_eq!(w.component::<Pos>().expect("idempotent"), pos_id);
+
+    // Dead entity `set` must fail with `DeadEntity` without polluting component registry.
+    let dead = w.spawn().expect("dead");
+    w.despawn(dead).expect("despawn");
+    assert_eq!(w.set(dead, Damage(7)), Err(EcsError::DeadEntity(dead)));
+    assert_eq!(w.component_id::<Damage>(), None);
+
+    // `register` / `register_copy` short auto-named aliases reject duplicates.
+    let dmg_id = w.register::<Damage>().expect("reg Damage");
+    assert_eq!(w.component_meta(dmg_id).expect("meta").name(), "Damage");
+    assert_eq!(w.register::<Damage>(), Err(EcsError::ComponentAlreadyRegistered(dmg_id)));
+
+    let arm_id = w.register_copy::<Armor>().expect("reg copy Armor");
+    assert!(w.component_meta(arm_id).expect("meta").can_copy);
+
+    // `set_copy` registers copyable automatically AND upgrades previously plain `Pos` for prefabs!
+    let prefab = w.spawn_prefab("Unit").expect("prefab");
+    w.set_copy(prefab, Pos { x: 11, y: 22 }).expect("upgrade Pos to copyable");
+    w.set_copy(prefab, Vel { dx: 1, dy: -1 }).expect("lazy copy Vel");
+    let inst = w.instantiate(prefab).expect("instantiate");
+    assert_eq!(w.get::<Pos>(inst).expect("pos"), Some(&Pos { x: 11, y: 22 }));
+    assert_eq!(w.get::<Vel>(inst).expect("vel"), Some(&Vel { dx: 1, dy: -1 }));
+    w.verify_invariants().expect("invariants");
+}
+
+#[test]
+fn typed_prefab_hierarchy_fluent_entity_tags_and_relations() {
+    let a = alloc();
+    let mut w = World::new_in(a).expect("world");
+
+    let root = w.spawn_ent().expect("root").named("Root").expect("name").id();
+    let other = w.spawn_ent().expect("other").named("Companion").expect("name").id();
+
+    let dragon = w
+        .spawn_of::<DragonBoss>()
+        .expect("spawn_of DragonBoss")
+        .with(Pos { x: 10, y: 0 })
+        .expect("with Pos")
+        .child_of(root)
+        .expect("child_of")
+        .tag::<Alive>()
+        .expect("tag Alive")
+        .relate::<AllyRel>(other)
+        .expect("relate Ally")
+        .named("Smaug")
+        .expect("named")
+        .id();
+
+    // Inherited from BaseUnit + overridden/added by DragonBoss + direct Pos.
+    assert_eq!(w.get::<Health>(dragon).expect("hp"), Some(&Health(500)));
+    assert_eq!(w.get::<Shield>(dragon).expect("shield"), Some(&Shield(80)));
+    assert_eq!(w.get::<Armor>(dragon).expect("armor"), Some(&Armor(5)));
+    assert_eq!(w.get::<Pos>(dragon).expect("pos"), Some(&Pos { x: 10, y: 0 }));
+    assert_eq!(w.entity_by_name("Smaug"), Some(dragon));
+
+    // Built-in ChildOf relation maps directly to `w.child_of()`.
+    assert_eq!(w.relation_entity::<super::ChildOf>().expect("child_of"), w.child_of());
+    assert_eq!(w.relation_entity::<super::IsA>().expect("is_a"), w.is_a());
+    assert_eq!(w.parent_of(dragon).expect("parent"), Some(root));
+    assert!(w.has_relation::<super::ChildOf>(dragon, root).expect("has ChildOf"));
+
+    // Typed tags work cleanly.
+    assert!(w.has_tag_typed::<Alive>(dragon).expect("alive"));
+    assert!(!w.has_tag_typed::<Stunned>(dragon).expect("not stunned"));
+    assert!(w.remove_tag_typed::<Alive>(dragon).expect("untag"));
+    assert!(!w.has_tag_typed::<Alive>(dragon).expect("removed"));
+    w.entity_mut(dragon).expect("mut").tag::<Alive>().expect("re-tag");
+    assert!(w.has_tag_typed::<Alive>(dragon).expect("alive again"));
+
+    // Symmetric typed relation mirrors automatically.
+    assert!(w.has_relation::<AllyRel>(dragon, other).expect("d->o"));
+    assert!(w.has_relation::<AllyRel>(other, dragon).expect("o->d"));
+    assert!(w.unrelate::<AllyRel>(dragon, other).expect("unrelate"));
+    assert!(!w.has_relation::<AllyRel>(other, dragon).expect("mirrored removal"));
+
+    // Transitive typed relation works iteratively across multiple hops.
+    let room = w.spawn().expect("room");
+    let tower = w.spawn().expect("tower");
+    let city = w.spawn().expect("city");
+    w.relate::<LocatedInRel>(room, tower).expect("r->t");
+    w.relate::<LocatedInRel>(tower, city).expect("t->c");
+    assert!(w.has_transitive_relation::<LocatedInRel>(room, city).expect("transitive"));
+    assert!(!w.has_transitive_relation::<LocatedInRel>(city, room).expect("not reverse"));
+
+    // Prefab entities themselves are excluded from default `each`.
+    let mut health_count = 0usize;
+    w.each::<&Health>(|_| {
+        health_count += 1;
+    })
+    .expect("each Health");
+    assert_eq!(health_count, 1);
+
+    // `spawn_bundle` / `spawn_with` insert tuples with zero prior registration.
+    let bundled = w.spawn_bundle((Pos { x: 1, y: 2 }, Vel { dx: 3, dy: 4 })).expect("bundle");
+    assert_eq!(w.get::<Pos>(bundled).expect("p"), Some(&Pos { x: 1, y: 2 }));
+    assert_eq!(w.get::<Vel>(bundled).expect("v"), Some(&Vel { dx: 3, dy: 4 }));
+    w.verify_invariants().expect("invariants");
+}
+
+#[test]
+fn typed_queries_chunks_3_and_4_components_filters_and_aliasing_rejection() {
+    let a = alloc();
+    let mut w = World::new_in(a).expect("world");
+
+    let ally_target = w.spawn().expect("ally_target");
+
+    // Prefab with Pos + Vel must be excluded from default `each` / `each_chunk`.
+    let ship_prefab = w.spawn_prefab("ShipPrefab").expect("prefab");
+    w.set_copy(ship_prefab, Pos { x: 999, y: 999 }).expect("prefab pos");
+    w.set_copy(ship_prefab, Vel { dx: 100, dy: 100 }).expect("prefab vel");
+
+    // Archetype 1: (Pos, Vel) + Alive + (AllyRel, ally_target)
+    let e1 = w
+        .spawn_with((Pos { x: 1, y: 2 }, Vel { dx: 10, dy: 20 }))
+        .expect("e1")
+        .tag::<Alive>()
+        .expect("alive")
+        .relate::<AllyRel>(ally_target)
+        .expect("ally")
+        .id();
+
+    // Archetype 2: (Pos, Vel, Health, Armor) + Alive
+    let e2 = w
+        .spawn_with((Pos { x: 5, y: 6 }, Vel { dx: 2, dy: 3 }, Health(40), Armor(7)))
+        .expect("e2")
+        .tag::<Alive>()
+        .expect("alive")
+        .id();
+
+    // Archetype 3: (Pos, Vel, Health, Armor) + Alive + Stunned
+    let e3 = w
+        .spawn_with((Pos { x: 10, y: 10 }, Vel { dx: -1, dy: -2 }, Health(80), Armor(12)))
+        .expect("e3")
+        .tag::<Alive>()
+        .expect("alive")
+        .tag::<Stunned>()
+        .expect("stunned")
+        .id();
+
+    // 1-line `each::<(&mut Pos, &Vel)>` across all 3 live archetypes (excluding prefab).
+    w.each::<(&mut Pos, &Vel)>(|(p, v)| {
+        p.x += v.dx;
+        p.y += v.dy;
+    })
+    .expect("each 2");
+    assert_eq!(w.get::<Pos>(e1).expect("e1"), Some(&Pos { x: 11, y: 22 }));
+    assert_eq!(w.get::<Pos>(e2).expect("e2"), Some(&Pos { x: 7, y: 9 }));
+    assert_eq!(w.get::<Pos>(e3).expect("e3"), Some(&Pos { x: 9, y: 8 }));
+    assert_eq!(w.get::<Pos>(ship_prefab).expect("prefab untouched"), Some(&Pos { x: 999, y: 999 }));
+
+    // `each_chunk` visits contiguous SoA slices per archetype table.
+    let mut chunk_tables = 0usize;
+    w.each_chunk::<(&mut Pos, &Vel)>(|(ps, vs)| {
+        chunk_tables += 1;
+        for (p, v) in ps.iter_mut().zip(vs.iter()) {
+            p.x += v.dx;
+            p.y += v.dy;
+        }
+    })
+    .expect("each_chunk");
+    assert_eq!(chunk_tables, 3);
+    assert_eq!(w.get::<Pos>(e1).expect("e1"), Some(&Pos { x: 21, y: 42 }));
+
+    // `each_with_entity` yields exact Entity handles alongside components.
+    let mut visited = OwnVec::new_in(a);
+    w.each_with_entity::<(&Pos, &Vel)>(|ent, _| {
+        visited.push(ent);
+    })
+    .expect("each_with_entity");
+    assert_eq!(visited.len(), 3);
+    assert!(visited.as_slice().contains(&e1));
+    assert!(visited.as_slice().contains(&e2));
+    assert!(visited.as_slice().contains(&e3));
+
+    // 3-component queries.
+    w.each::<(&mut Health, &Pos, &Armor)>(|(hp, pos, arm)| {
+        hp.0 += pos.x + arm.0;
+    })
+    .expect("each 3");
+    assert_eq!(w.get::<Health>(e2).expect("e2 hp"), Some(&Health(40 + 9 + 7)));
+    assert_eq!(w.get::<Health>(e3).expect("e3 hp"), Some(&Health(80 + 8 + 12)));
+
+    // 4-component queries (`(&mut A, &B, &C, &D)` and `(&A, &B, &C, &D)`).
+    w.each::<(&mut Pos, &Vel, &Health, &Armor)>(|(p, v, hp, arm)| {
+        p.x += v.dx + hp.0 - arm.0;
+    })
+    .expect("each 4 mut");
+    let mut sum_x = 0i32;
+    w.each::<(&Pos, &Vel, &Health, &Armor)>(|(p, _, _, _)| {
+        sum_x += p.x;
+    })
+    .expect("each 4 ref");
+    assert_eq!(
+        sum_x,
+        w.get::<Pos>(e2).expect("e2").expect("s").x + w.get::<Pos>(e3).expect("e3").expect("s").x
+    );
+
+    // Filtered `TypedQuery` builder: `.with_tag`, `.without`, `.with_relation`, `.include_prefabs`.
+    let non_stunned_alive = w
+        .query::<(&Pos, &Vel)>()
+        .with_tag::<Alive>()
+        .expect("with Alive")
+        .without::<Stunned>()
+        .expect("without Stunned")
+        .count()
+        .expect("count");
+    assert_eq!(non_stunned_alive, 2);
+
+    let allied_count = w
+        .query::<(&Pos, &Vel)>()
+        .with_relation::<AllyRel>(ally_target)
+        .expect("with Ally")
+        .count()
+        .expect("count");
+    assert_eq!(allied_count, 1);
+
+    let with_prefabs = w.query::<(&Pos, &Vel)>().include_prefabs().count().expect("count");
+    assert_eq!(with_prefabs, 4);
+
+    // Aliasing conflicts rejected with `EcsError::ConflictingAccess`.
+    let pos_id = w.component_id::<Pos>().expect("Pos id");
+    assert_eq!(
+        w.each::<(&mut Pos, &Pos)>(|_| {}),
+        Err(EcsError::ConflictingAccess { id: Id::Component(pos_id) })
+    );
+    assert_eq!(
+        w.each::<(&Pos, &mut Pos)>(|_| {}),
+        Err(EcsError::ConflictingAccess { id: Id::Component(pos_id) })
+    );
+    assert_eq!(
+        w.each::<(&mut Pos, &mut Pos)>(|_| {}),
+        Err(EcsError::ConflictingAccess { id: Id::Component(pos_id) })
+    );
+    assert_eq!(
+        w.each::<(&mut Pos, &Vel, &Pos)>(|_| {}),
+        Err(EcsError::ConflictingAccess { id: Id::Component(pos_id) })
+    );
+    assert_eq!(
+        w.each::<(&mut Pos, &Vel, &Health, &Pos)>(|_| {}),
+        Err(EcsError::ConflictingAccess { id: Id::Component(pos_id) })
+    );
+
+    // Duplicate shared reads `(&Pos, &Pos)` are valid and never conflict.
+    let mut dup_read_hits = 0usize;
+    w.each::<(&Pos, &Pos)>(|(a, b)| {
+        assert_eq!(a, b);
+        dup_read_hits += 1;
+    })
+    .expect("shared duplicate reads ok");
+    assert_eq!(dup_read_hits, 3);
+    w.verify_invariants().expect("invariants");
+}
+
+fn sys_typed_move(world: &mut World<Alloc<'static>>) -> Result<(), EcsError> {
+    world.each::<(&mut Pos, &Vel)>(|(p, v)| {
+        p.x += v.dx;
+        p.y += v.dy;
+    })
+}
+
+fn sys_typed_heal(world: &mut World<Alloc<'static>>) -> Result<(), EcsError> {
+    world.each::<&mut Health>(|hp| {
+        hp.0 += 5;
+    })
+}
+
+fn sys_typed_audit(world: &mut World<Alloc<'static>>) -> Result<(), EcsError> {
+    let mut checksum = 0i32;
+    world.each::<(&Pos, &Health)>(|(p, hp)| {
+        checksum += p.x + p.y + hp.0;
+    })?;
+    if let Some(sink) = world.entity_by_name("AuditSink") {
+        world.set(sink, Damage(checksum))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn typed_pipeline_add_query_automatic_disjoint_batching() {
+    let a = alloc();
+    let mut w = World::new_in(a).expect("world");
+
+    let e = w
+        .spawn_with((Pos { x: 1, y: 2 }, Vel { dx: 4, dy: 6 }, Health(20)))
+        .expect("e")
+        .id();
+    let sink = w.spawn_named("AuditSink").expect("sink");
+
+    let mut pipe = Pipeline::new_in(a);
+
+    // Self-conflicting typed query rejected before adding to pipeline.
+    let pos_id = w.component_id::<Pos>().expect("Pos id");
+    assert_eq!(
+        pipe.add_query::<(&mut Pos, &Pos)>(&mut w, Phase::OnUpdate, "bad", sys_typed_move),
+        Err(EcsError::ConflictingAccess { id: Id::Component(pos_id) })
+    );
+
+    // Zero manual `.read()` / `.write()` calls: extracted automatically from `QueryFetch`!
+    pipe.add_query::<(&mut Pos, &Vel)>(&mut w, Phase::OnUpdate, "move", sys_typed_move)
+        .expect("add move");
+    pipe.add_query::<&mut Health>(&mut w, Phase::OnUpdate, "heal", sys_typed_heal)
+        .expect("add heal");
+    pipe.add_query::<(&Pos, &Health)>(&mut w, Phase::OnUpdate, "audit", sys_typed_audit)
+        .expect("add audit");
+
+    let schedule = pipe.batches().expect("batches");
+    assert_eq!(schedule.phases.len(), 1);
+    let update = schedule.phases.get(0).expect("OnUpdate");
+    // Batch 0: `move` (writes Pos, reads Vel) + `heal` (writes Health) -> disjoint parallel batch!
+    // Batch 1: `audit` (reads Pos, Health) -> conflicts with both writes in batch 0!
+    assert_eq!(update.batches.len(), 2);
+    assert_eq!(update.batches.get(0).expect("b0").systems.len(), 2);
+    assert_eq!(update.batches.get(1).expect("b1").systems.len(), 1);
+
+    pipe.run_tick(&mut w).expect("run_tick");
+    assert_eq!(w.get::<Pos>(e).expect("pos"), Some(&Pos { x: 5, y: 8 }));
+    assert_eq!(w.get::<Health>(e).expect("hp"), Some(&Health(25)));
+    assert_eq!(w.get::<Damage>(sink).expect("checksum"), Some(&Damage(5 + 8 + 25)));
+}

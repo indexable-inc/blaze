@@ -178,7 +178,13 @@ impl<A: Allocator + Copy + 'static> Table<A> {
     /// Binary search for the column slot of `cid`.
     #[inline]
     pub(crate) fn column_index(&self, cid: ComponentId) -> Option<usize> {
-        self.columns.as_slice().binary_search_by_key(&cid, |entry| entry.id).ok()
+        column_index_in(self.columns.as_slice(), cid)
+    }
+
+    /// Simultaneously borrow the immutable entity slice and mutable column slice of this table.
+    #[inline]
+    pub(crate) fn entities_and_columns_mut(&mut self) -> (&[Entity], &mut [TableColumn<A>]) {
+        (self.entities.as_slice(), self.columns.as_mut_slice())
     }
 
     /// Contiguous read-only slice for component `cid`.
@@ -257,6 +263,175 @@ impl<A: Allocator + Copy + 'static> Table<A> {
             let sr = downcast_slice::<R, A>(er.col.as_ref(), cr)?;
             Ok((sw, sr))
         }
+    }
+
+    /// Shared borrows of two component columns (`&[T1]`, `&[T2]`).
+    pub fn columns_2_ref<T1: 'static, T2: 'static>(
+        &self,
+        c1: ComponentId,
+        c2: ComponentId,
+    ) -> Result<(&[T1], &[T2]), EcsError> {
+        Ok((self.column::<T1>(c1)?, self.column::<T2>(c2)?))
+    }
+
+    /// Shared borrows of three component columns (`&[T1]`, `&[T2]`, `&[T3]`).
+    pub fn columns_3_ref<T1: 'static, T2: 'static, T3: 'static>(
+        &self,
+        c1: ComponentId,
+        c2: ComponentId,
+        c3: ComponentId,
+    ) -> Result<(&[T1], &[T2], &[T3]), EcsError> {
+        Ok((self.column::<T1>(c1)?, self.column::<T2>(c2)?, self.column::<T3>(c3)?))
+    }
+
+    /// Safe disjoint borrow of one mutable column `&mut [W]` and two shared columns (`&[R1]`,
+    /// `&[R2]`) with zero `unsafe`.
+    pub fn columns_3_1mut_2ref<W: 'static, R1: 'static, R2: 'static>(
+        &mut self,
+        cw: ComponentId,
+        cr1: ComponentId,
+        cr2: ComponentId,
+    ) -> Result<(&mut [W], &[R1], &[R2]), EcsError> {
+        if cw == cr1 || cw == cr2 {
+            return Err(EcsError::ConflictingAccess { id: Id::Component(cw) });
+        }
+        let iw = self.column_index(cw).ok_or(EcsError::MissingComponent(cw))?;
+        let ir1 = self.column_index(cr1).ok_or(EcsError::MissingComponent(cr1))?;
+        let ir2 = self.column_index(cr2).ok_or(EcsError::MissingComponent(cr2))?;
+        let (before, ew, after) = split_1mut(self.columns.as_mut_slice(), iw, cw)?;
+        let er1 = pick_ref_around_1(before, iw, after, ir1, cr1)?;
+        let er2 = pick_ref_around_1(before, iw, after, ir2, cr2)?;
+        Ok((
+            downcast_slice_mut::<W, A>(ew.col.as_mut(), cw)?,
+            downcast_slice::<R1, A>(er1.col.as_ref(), cr1)?,
+            downcast_slice::<R2, A>(er2.col.as_ref(), cr2)?,
+        ))
+    }
+
+    /// Safe disjoint borrow of two mutable columns (`&mut [W1]`, `&mut [W2]`) and one shared
+    /// column `&[R]` with zero `unsafe`.
+    pub fn columns_3_2mut_1ref<W1: 'static, W2: 'static, R: 'static>(
+        &mut self,
+        cw1: ComponentId,
+        cw2: ComponentId,
+        cr: ComponentId,
+    ) -> Result<(&mut [W1], &mut [W2], &[R]), EcsError> {
+        if cw1 == cw2 || cw1 == cr {
+            return Err(EcsError::ConflictingAccess { id: Id::Component(cw1) });
+        }
+        if cw2 == cr {
+            return Err(EcsError::ConflictingAccess { id: Id::Component(cw2) });
+        }
+        let iw1 = self.column_index(cw1).ok_or(EcsError::MissingComponent(cw1))?;
+        let iw2 = self.column_index(cw2).ok_or(EcsError::MissingComponent(cw2))?;
+        let ir = self.column_index(cr).ok_or(EcsError::MissingComponent(cr))?;
+        let (seg0, ew1, seg1, ew2, seg2, lo, hi) =
+            split_2mut(self.columns.as_mut_slice(), iw1, cw1, iw2, cw2)?;
+        let er = pick_ref_around_2(seg0, lo, seg1, hi, seg2, ir, cr)?;
+        Ok((
+            downcast_slice_mut::<W1, A>(ew1.col.as_mut(), cw1)?,
+            downcast_slice_mut::<W2, A>(ew2.col.as_mut(), cw2)?,
+            downcast_slice::<R, A>(er.col.as_ref(), cr)?,
+        ))
+    }
+
+    /// Safe disjoint mutable borrows of three distinct component columns with zero `unsafe`.
+    pub fn columns_3_mut<W1: 'static, W2: 'static, W3: 'static>(
+        &mut self,
+        c1: ComponentId,
+        c2: ComponentId,
+        c3: ComponentId,
+    ) -> Result<(&mut [W1], &mut [W2], &mut [W3]), EcsError> {
+        if c1 == c2 || c1 == c3 {
+            return Err(EcsError::ConflictingAccess { id: Id::Component(c1) });
+        }
+        if c2 == c3 {
+            return Err(EcsError::ConflictingAccess { id: Id::Component(c2) });
+        }
+        let i1 = self.column_index(c1).ok_or(EcsError::MissingComponent(c1))?;
+        let i2 = self.column_index(c2).ok_or(EcsError::MissingComponent(c2))?;
+        let i3 = self.column_index(c3).ok_or(EcsError::MissingComponent(c3))?;
+        let (e1, e2, e3) = split_3mut(self.columns.as_mut_slice(), i1, c1, i2, c2, i3, c3)?;
+        Ok((
+            downcast_slice_mut::<W1, A>(e1.col.as_mut(), c1)?,
+            downcast_slice_mut::<W2, A>(e2.col.as_mut(), c2)?,
+            downcast_slice_mut::<W3, A>(e3.col.as_mut(), c3)?,
+        ))
+    }
+
+    /// Shared borrows of four component columns (`&[T1]`, `&[T2]`, `&[T3]`, `&[T4]`).
+    pub fn columns_4_ref<T1: 'static, T2: 'static, T3: 'static, T4: 'static>(
+        &self,
+        c1: ComponentId,
+        c2: ComponentId,
+        c3: ComponentId,
+        c4: ComponentId,
+    ) -> Result<(&[T1], &[T2], &[T3], &[T4]), EcsError> {
+        Ok((
+            self.column::<T1>(c1)?,
+            self.column::<T2>(c2)?,
+            self.column::<T3>(c3)?,
+            self.column::<T4>(c4)?,
+        ))
+    }
+
+    /// Safe disjoint borrow of one mutable column `&mut [W]` and three shared columns
+    /// (`&[R1]`, `&[R2]`, `&[R3]`) with zero `unsafe`.
+    pub fn columns_4_1mut_3ref<W: 'static, R1: 'static, R2: 'static, R3: 'static>(
+        &mut self,
+        cw: ComponentId,
+        cr1: ComponentId,
+        cr2: ComponentId,
+        cr3: ComponentId,
+    ) -> Result<(&mut [W], &[R1], &[R2], &[R3]), EcsError> {
+        if cw == cr1 || cw == cr2 || cw == cr3 {
+            return Err(EcsError::ConflictingAccess { id: Id::Component(cw) });
+        }
+        let iw = self.column_index(cw).ok_or(EcsError::MissingComponent(cw))?;
+        let ir1 = self.column_index(cr1).ok_or(EcsError::MissingComponent(cr1))?;
+        let ir2 = self.column_index(cr2).ok_or(EcsError::MissingComponent(cr2))?;
+        let ir3 = self.column_index(cr3).ok_or(EcsError::MissingComponent(cr3))?;
+        let (before, ew, after) = split_1mut(self.columns.as_mut_slice(), iw, cw)?;
+        let er1 = pick_ref_around_1(before, iw, after, ir1, cr1)?;
+        let er2 = pick_ref_around_1(before, iw, after, ir2, cr2)?;
+        let er3 = pick_ref_around_1(before, iw, after, ir3, cr3)?;
+        Ok((
+            downcast_slice_mut::<W, A>(ew.col.as_mut(), cw)?,
+            downcast_slice::<R1, A>(er1.col.as_ref(), cr1)?,
+            downcast_slice::<R2, A>(er2.col.as_ref(), cr2)?,
+            downcast_slice::<R3, A>(er3.col.as_ref(), cr3)?,
+        ))
+    }
+
+    /// Safe disjoint borrow of two mutable columns (`&mut [W1]`, `&mut [W2]`) and two shared
+    /// columns (`&[R1]`, `&[R2]`) with zero `unsafe`.
+    pub fn columns_4_2mut_2ref<W1: 'static, W2: 'static, R1: 'static, R2: 'static>(
+        &mut self,
+        cw1: ComponentId,
+        cw2: ComponentId,
+        cr1: ComponentId,
+        cr2: ComponentId,
+    ) -> Result<(&mut [W1], &mut [W2], &[R1], &[R2]), EcsError> {
+        if cw1 == cw2 || cw1 == cr1 || cw1 == cr2 {
+            return Err(EcsError::ConflictingAccess { id: Id::Component(cw1) });
+        }
+        if cw2 == cr1 || cw2 == cr2 {
+            return Err(EcsError::ConflictingAccess { id: Id::Component(cw2) });
+        }
+        let iw1 = self.column_index(cw1).ok_or(EcsError::MissingComponent(cw1))?;
+        let iw2 = self.column_index(cw2).ok_or(EcsError::MissingComponent(cw2))?;
+        let ir1 = self.column_index(cr1).ok_or(EcsError::MissingComponent(cr1))?;
+        let ir2 = self.column_index(cr2).ok_or(EcsError::MissingComponent(cr2))?;
+        let (seg0, ew1, seg1, ew2, seg2, lo, hi) =
+            split_2mut(self.columns.as_mut_slice(), iw1, cw1, iw2, cw2)?;
+        let er1 = pick_ref_around_2(seg0, lo, seg1, hi, seg2, ir1, cr1)?;
+        let er2 = pick_ref_around_2(seg0, lo, seg1, hi, seg2, ir2, cr2)?;
+        Ok((
+            downcast_slice_mut::<W1, A>(ew1.col.as_mut(), cw1)?,
+            downcast_slice_mut::<W2, A>(ew2.col.as_mut(), cw2)?,
+            downcast_slice::<R1, A>(er1.col.as_ref(), cr1)?,
+            downcast_slice::<R2, A>(er2.col.as_ref(), cr2)?,
+        ))
     }
 
     /// Read a single entity's component value at `row`.
@@ -377,4 +552,159 @@ pub(crate) fn move_row_between_tables<A: Allocator + Copy + 'static>(
     let dst_row = dst.entities.len();
     dst.entities.try_push(entity).map_err(|r| EcsError::Alloc(r.why))?;
     Ok((dst_row, moved_in_src))
+}
+
+/// Binary search for `cid` inside a sorted [`TableColumn`] slice.
+#[inline]
+pub(crate) fn column_index_in<A: Allocator + Copy>(
+    cols: &[TableColumn<A>],
+    cid: ComponentId,
+) -> Option<usize> {
+    cols.binary_search_by_key(&cid, |entry| entry.id).ok()
+}
+
+/// Split `cols` around a single mutable column at `iw` into `(before, &mut col_w, after)`.
+pub(crate) fn split_1mut<'t, A: Allocator + Copy + 'static>(
+    cols: &'t mut [TableColumn<A>],
+    iw: usize,
+    cw: ComponentId,
+) -> Result<(&'t [TableColumn<A>], &'t mut TableColumn<A>, &'t [TableColumn<A>]), EcsError> {
+    let (before, from_w) = cols.split_at_mut_checked(iw).ok_or(EcsError::MissingComponent(cw))?;
+    let (w_slice, after) = from_w.split_at_mut_checked(1).ok_or(EcsError::MissingComponent(cw))?;
+    let w_col = w_slice.get_mut(0).ok_or(EcsError::MissingComponent(cw))?;
+    Ok((before, w_col, after))
+}
+
+/// Pick an immutable column at `ir` from the `before`/`after` halves produced by [`split_1mut`].
+pub(crate) fn pick_ref_around_1<'t, A: Allocator + Copy + 'static>(
+    before: &'t [TableColumn<A>],
+    iw: usize,
+    after: &'t [TableColumn<A>],
+    ir: usize,
+    cr: ComponentId,
+) -> Result<&'t TableColumn<A>, EcsError> {
+    if ir < iw {
+        before.get(ir).ok_or(EcsError::MissingComponent(cr))
+    } else if ir > iw {
+        let rel = ir.checked_sub(iw.saturating_add(1)).ok_or(EcsError::MissingComponent(cr))?;
+        after.get(rel).ok_or(EcsError::MissingComponent(cr))
+    } else {
+        Err(EcsError::ConflictingAccess { id: Id::Component(cr) })
+    }
+}
+
+/// Split `cols` around two distinct mutable columns at `i1` and `i2`, returning the three
+/// surrounding immutable segments, the two mutable columns in `(c1, c2)` order, and `(lo, hi)`.
+pub(crate) fn split_2mut<'t, A: Allocator + Copy + 'static>(
+    cols: &'t mut [TableColumn<A>],
+    i1: usize,
+    c1: ComponentId,
+    i2: usize,
+    c2: ComponentId,
+) -> Result<
+    (
+        &'t [TableColumn<A>],
+        &'t mut TableColumn<A>,
+        &'t [TableColumn<A>],
+        &'t mut TableColumn<A>,
+        &'t [TableColumn<A>],
+        usize,
+        usize,
+    ),
+    EcsError,
+> {
+    if i1 == i2 {
+        return Err(EcsError::ConflictingAccess { id: Id::Component(c1) });
+    }
+    if i1 < i2 {
+        let (seg0, from1) = cols.split_at_mut_checked(i1).ok_or(EcsError::MissingComponent(c1))?;
+        let (col1_s, after1) =
+            from1.split_at_mut_checked(1).ok_or(EcsError::MissingComponent(c1))?;
+        let rel2 = i2
+            .checked_sub(i1.saturating_add(1))
+            .ok_or(EcsError::ConflictingAccess { id: Id::Component(c2) })?;
+        let (seg1, from2) =
+            after1.split_at_mut_checked(rel2).ok_or(EcsError::MissingComponent(c2))?;
+        let (col2_s, seg2) =
+            from2.split_at_mut_checked(1).ok_or(EcsError::MissingComponent(c2))?;
+        let col1 = col1_s.get_mut(0).ok_or(EcsError::MissingComponent(c1))?;
+        let col2 = col2_s.get_mut(0).ok_or(EcsError::MissingComponent(c2))?;
+        Ok((seg0, col1, seg1, col2, seg2, i1, i2))
+    } else {
+        let (seg0, from2) = cols.split_at_mut_checked(i2).ok_or(EcsError::MissingComponent(c2))?;
+        let (col2_s, after2) =
+            from2.split_at_mut_checked(1).ok_or(EcsError::MissingComponent(c2))?;
+        let rel1 = i1
+            .checked_sub(i2.saturating_add(1))
+            .ok_or(EcsError::ConflictingAccess { id: Id::Component(c1) })?;
+        let (seg1, from1) =
+            after2.split_at_mut_checked(rel1).ok_or(EcsError::MissingComponent(c1))?;
+        let (col1_s, seg2) =
+            from1.split_at_mut_checked(1).ok_or(EcsError::MissingComponent(c1))?;
+        let col1 = col1_s.get_mut(0).ok_or(EcsError::MissingComponent(c1))?;
+        let col2 = col2_s.get_mut(0).ok_or(EcsError::MissingComponent(c2))?;
+        Ok((seg0, col1, seg1, col2, seg2, i2, i1))
+    }
+}
+
+/// Pick an immutable column at `ir` from the three segments produced by [`split_2mut`].
+pub(crate) fn pick_ref_around_2<'t, A: Allocator + Copy + 'static>(
+    seg0: &'t [TableColumn<A>],
+    lo: usize,
+    seg1: &'t [TableColumn<A>],
+    hi: usize,
+    seg2: &'t [TableColumn<A>],
+    ir: usize,
+    cr: ComponentId,
+) -> Result<&'t TableColumn<A>, EcsError> {
+    if ir < lo {
+        seg0.get(ir).ok_or(EcsError::MissingComponent(cr))
+    } else if ir == lo || ir == hi {
+        Err(EcsError::ConflictingAccess { id: Id::Component(cr) })
+    } else if ir < hi {
+        let rel = ir.checked_sub(lo.saturating_add(1)).ok_or(EcsError::MissingComponent(cr))?;
+        seg1.get(rel).ok_or(EcsError::MissingComponent(cr))
+    } else {
+        let rel = ir.checked_sub(hi.saturating_add(1)).ok_or(EcsError::MissingComponent(cr))?;
+        seg2.get(rel).ok_or(EcsError::MissingComponent(cr))
+    }
+}
+
+/// Split `cols` into three distinct mutable columns in `(c0, c1, c2)` order.
+pub(crate) fn split_3mut<'t, A: Allocator + Copy + 'static>(
+    cols: &'t mut [TableColumn<A>],
+    i0: usize,
+    c0: ComponentId,
+    i1: usize,
+    c1: ComponentId,
+    i2: usize,
+    c2: ComponentId,
+) -> Result<(&'t mut TableColumn<A>, &'t mut TableColumn<A>, &'t mut TableColumn<A>), EcsError> {
+    let mut order = [(i0, 0usize, c0), (i1, 1usize, c1), (i2, 2usize, c2)];
+    order.sort_unstable_by_key(|&(idx, _, _)| idx);
+    let mut out0: Option<&'t mut TableColumn<A>> = None;
+    let mut out1: Option<&'t mut TableColumn<A>> = None;
+    let mut out2: Option<&'t mut TableColumn<A>> = None;
+    let mut rest = cols;
+    let mut base = 0usize;
+    for (idx, slot, cid) in order {
+        let rel = idx
+            .checked_sub(base)
+            .ok_or(EcsError::ConflictingAccess { id: Id::Component(cid) })?;
+        let (_, tail) = rest.split_at_mut_checked(rel).ok_or(EcsError::MissingComponent(cid))?;
+        let (head, after) = tail.split_at_mut_checked(1).ok_or(EcsError::MissingComponent(cid))?;
+        let col = head.get_mut(0).ok_or(EcsError::MissingComponent(cid))?;
+        match slot {
+            0 => out0 = Some(col),
+            1 => out1 = Some(col),
+            _ => out2 = Some(col),
+        }
+        rest = after;
+        base = idx.saturating_add(1);
+    }
+    Ok((
+        out0.ok_or(EcsError::MissingComponent(c0))?,
+        out1.ok_or(EcsError::MissingComponent(c1))?,
+        out2.ok_or(EcsError::MissingComponent(c2))?,
+    ))
 }

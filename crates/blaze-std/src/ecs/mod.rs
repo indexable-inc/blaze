@@ -14,19 +14,25 @@
 //! - [`observer`]: Reactive [`EventKind`] (`OnAdd`, `OnSet`, `OnRemove`) observers with exact
 //!   and wildcard pair matching and bounded zero-recursion dispatch.
 //! - [`pipeline`]: Canonical Flecs 4.2 [`Phase`]s and deterministic conflict-free parallel
-//!   [`Pipeline`] batch scheduling.
+//!   [`Pipeline`] batch scheduling (with automatic typed [`Pipeline::add_query`] access sets).
+//! - [`typed`]: Zero-string [`short_type_name`], typed [`Relation`] / [`Bundle`] / [`Prefab`]
+//!   hierarchies, and fluent [`EntityMut`] builder.
+//! - [`fetch`]: 1-line typed [`QueryFetch`] (`&T`, `&mut T`, 2..=4 tuples) and chainable
+//!   [`TypedQuery`] filters.
 //! - [`world`]: Core [`World`] API with prefab inheritance (`IsA`), hierarchy cascade (`ChildOf`),
 //!   arbitrary relations, and deterministic [`World::snapshot_tab`] summaries.
 
 
 pub mod column;
 pub mod error;
+pub mod fetch;
 pub mod id;
 pub(crate) mod map;
 pub mod observer;
 pub mod pipeline;
 pub mod query;
 pub mod table;
+pub mod typed;
 pub mod world;
 
 #[cfg(test)]
@@ -34,9 +40,14 @@ mod tests;
 
 pub use column::{AnyColumn, ComponentMeta, TypedColumn};
 pub use error::EcsError;
+pub use fetch::{FetchIds, QueryFetch, TypedQuery};
 pub use id::{Builtins, ComponentId, Entity, Id, TableId};
 pub use observer::{DEFAULT_OBSERVER_CAP, Event, EventKind, ObserverCallback, ObserverId};
 pub use pipeline::{Batch, Batches, Phase, PhaseSchedule, Pipeline, SystemDesc, SystemFn};
 pub use query::{CachedQuery, QuerySpec, QueryTerm};
 pub use table::Table;
+pub use typed::{
+    Bundle, ChildOf, CopyBundle, EntityMut, IsA, NoParent, Prefab, PrefabInit, PrefabParent,
+    Relation, short_type_name,
+};
 pub use world::World;
