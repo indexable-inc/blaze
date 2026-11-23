@@ -56,7 +56,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             let mut r = self.records(true);
             lower_made(&mut r, prepared, target)
         };
-        let made = match lowered {
+        let mut made = match lowered {
             Ok(body) => {
                 self.lowerings.count.bodies_lowered += 1;
                 body
@@ -76,15 +76,18 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         };
         let checked = match typer {
             Typer::Check => {
-                let view = made.lowered.view();
-                let spell = match Spelling::of(&view) {
-                    Ok(spell) => spell,
-                    Err(_) => return Err(LazyRefusal::Spell { function }),
-                };
-                let scope = made.scope(&spell);
-                let checked = {
+                let checked = if made.typeck.inline_fors.is_empty() {
+                    let view = made.lowered.view();
+                    let spell = match Spelling::of(&view) {
+                        Ok(spell) => spell,
+                        Err(_) => return Err(LazyRefusal::Spell { function }),
+                    };
+                    let scope = made.scope(&spell);
                     let mut r = self.records(true);
                     check_body(&mut r, &made, &scope)
+                } else {
+                    let mut r = self.records(true);
+                    crate::front2::inline_for::unroll_concrete_body(&mut r, prepared, &mut made)
                 };
                 let checked = checked.map_err(|error| self.check_refusal(&function, error))?;
                 self.counts.checked += 1;

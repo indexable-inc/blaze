@@ -74,6 +74,7 @@ pub mod head_text;
 pub mod heads;
 pub mod rows;
 pub mod index;
+pub mod inline_for;
 pub mod inspect;
 pub mod keys;
 pub mod linked;

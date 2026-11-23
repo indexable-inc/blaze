@@ -144,6 +144,9 @@ const F_POPPED: u32 = 1 << 18;
 /// among them removes the item, as it removes a statement; at its first other child or token
 /// the rest of it is skipped wholesale (`Machine::attrs_read`).
 const F_ATTRS: u32 = 1 << 19;
+/// Comptime field-unrolling `inline for pat in iter { body }`: preserved as `Expr::InlineFor`
+/// instead of desugared to `IntoIterator`.
+const F_INLINE: u32 = 1 << 20;
 
 const NO_RANGE: Range = Range::new(NONE, NONE);
 
@@ -1084,12 +1087,16 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             FOR_EXPR if p.flags & F_FOR == 0 && self.count(&p, |v| matches!(v, V::Pat | V::Expr)) == 2 => {
                 // The body: the pattern's bindings come into scope, and the loop opens.
                 self.activate(p.pending);
-                let label = match p.aux {
-                    NONE => 0,
-                    name => self.local_key(NameIdx(name)),
-                };
-                self.push_entry(Jk::Loop, label);
-                self.top_mut().flags |= F_FOR | F_LOOP;
+                if p.flags & F_INLINE != 0 {
+                    self.top_mut().flags |= F_FOR;
+                } else {
+                    let label = match p.aux {
+                        NONE => 0,
+                        name => self.local_key(NameIdx(name)),
+                    };
+                    self.push_entry(Jk::Loop, label);
+                    self.top_mut().flags |= F_FOR | F_LOOP;
+                }
             }
             ARRAY_EXPR if p.flags & F_SEMI != 0 => {
                 // A repeat's length is an anonymous constant: no local of the body.
@@ -1173,6 +1180,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             (FN, ASYNC_KW) if depth == root => top.flags |= F_ASYNC,
             (FN, GEN_KW) if depth == root => top.flags |= F_GEN,
             (ARRAY_EXPR, SEMICOLON) => top.flags |= F_SEMI,
+            (FOR_EXPR, INLINE_KW) => top.flags |= F_INLINE,
             _ => {}
         }
     }
@@ -2359,6 +2367,11 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let pat = pat.unwrap_or_else(|| self.put_pat(Pat::Missing, r));
                 let head = head.unwrap_or_else(|| self.put_expr(Expr::Missing, r));
                 let body = body.unwrap_or_else(|| self.put_expr(Expr::Missing, r));
+                if f.flags & F_INLINE != 0 {
+                    let e = self.put_expr(Expr::InlineFor { pat, iter: head, body }, r);
+                    self.push(V::Expr, e.0, r);
+                    return;
+                }
                 let e = self.for_loop(pat, head, body, r);
                 if f.flags & F_LOOP != 0 {
                     self.loop_target = e.inner_loop.0;

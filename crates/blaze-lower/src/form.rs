@@ -848,6 +848,9 @@ pub enum Expr {
     Await(ExprId),
     /// An anonymous structural record literal (`#![blaze::records]`): `{ name: "x", depth: 2, .. }`.
     Record { fields: List, base: StructBase },
+    /// Comptime field unrolling (`inline for pat in iter { body }`): preserved intact rather than
+    /// desugared to `IntoIterator` so `front2` can unroll it over each field's concrete type.
+    InlineFor { pat: PatId, iter: ExprId, body: ExprId },
 }
 
 const BIN_OPS: [BinOp; 18] = [
@@ -980,6 +983,7 @@ impl Expr {
                 };
                 Node { a: fields.start, b: fields.len, c, ..n(37).with(k) }
             }
+            E::InlineFor { pat, iter, body } => Node { a: pat.0, b: iter.0, c: body.0, ..n(38) },
         }
     }
 
@@ -1070,6 +1074,7 @@ impl Expr {
                     _ => return Err(err),
                 },
             },
+            38 => E::InlineFor { pat: PatId(n.a), iter: ExprId(n.b), body: ExprId(n.c) },
             _ => return Err(err),
         })
     }
@@ -1317,7 +1322,7 @@ impl FieldInit {
         Node { a: self.name.0, b: self.expr.0, ..Node::of(ROW_FIELD_INIT).with(self.shorthand as u16) }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<FieldInit, BadRow> {
+    pub fn decode(n: Node) -> Result<FieldInit, BadRow> {
         check_tag!(n, ROW_FIELD_INIT, "field inits");
         Ok(FieldInit { name: NameIdx(n.a), expr: ExprId(n.b), shorthand: n.flags & 1 != 0 })
     }
@@ -1336,7 +1341,7 @@ impl FieldPat {
         Node { a: self.name.0, b: self.pat.0, ..Node::of(ROW_FIELD_PAT).with(self.shorthand as u16) }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<FieldPat, BadRow> {
+    pub fn decode(n: Node) -> Result<FieldPat, BadRow> {
         check_tag!(n, ROW_FIELD_PAT, "field pats");
         Ok(FieldPat { name: NameIdx(n.a), pat: PatId(n.b), shorthand: n.flags & 1 != 0 })
     }

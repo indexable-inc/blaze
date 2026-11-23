@@ -139,3 +139,19 @@ fn const_static_without_a_brace_is_as_before() {
     let blocks = tree.iter().filter(|it| *it == "BLOCK_EXPR").count();
     assert_eq!(blocks, 1, "the function's body, no `const static` block: {tree:#?}");
 }
+
+#[test]
+fn inline_for_is_a_for_expr_with_an_inline_token() {
+    let inline = clean("fn f() { inline for x in r { g(x); } inline for (k, v) in &r { h(k, v); } 'a: inline for y in t { g(y); } }");
+    assert_eq!(inline.iter().filter(|it| *it == "FOR_EXPR").count(), 3, "{inline:#?}");
+    assert_eq!(inline.iter().filter(|it| *it == "INLINE_KW \"inline\"").count(), 3, "{inline:#?}");
+    assert!(has_run(&inline, &["INLINE_KW \"inline\"", "WHITESPACE \" \"", "FOR_KW \"for\""]), "{inline:#?}");
+}
+
+#[test]
+fn inline_identifier_has_zero_conflict_without_for() {
+    let tree = clean("#[inline] fn f() { let inline = 1; let y = inline + 2; }");
+    assert!(!tree.iter().any(|it| it == "FOR_EXPR"), "{tree:#?}");
+    assert!(!tree.iter().any(|it| it == "INLINE_KW \"inline\""), "{tree:#?}");
+    assert!(tree.iter().filter(|it| *it == "IDENT \"inline\"").count() >= 3, "{tree:#?}");
+}

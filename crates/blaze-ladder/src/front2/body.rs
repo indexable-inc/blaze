@@ -325,6 +325,11 @@ pub struct Body<'n> {
     /// Each written type that names nothing (E0412, [`TypeMiss`]): converted as the error type,
     /// reported by the check beside its own findings (front2 check.rs `check_rounds_as`).
     pub type_misses: Vec<TypeMiss, Global>,
+    /// Rewritten item text produced by comptime `inline for` unrolling (`None` for ordinary bodies).
+    pub expanded_text: Option<&'n str>,
+    /// Original generic owner and concrete ground arguments for a monomorphized `inline for`
+    /// specialization (`None` for ordinary bodies).
+    pub param_subst: Option<(ItemKey, blaze_own::Vec<PTy, Alloc<'static>>)>,
 }
 
 impl<'n> Body<'n> {
@@ -1126,10 +1131,68 @@ enum TypesInto<'t> {
 /// body and record from one table (the run path's seam). The returned body's own `tys` is
 /// empty: its types are `into`'s.
 pub fn lower_again<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, body: &Body<'n>, into: &mut PortableTys<'static>) -> Result<Body<'n>, BodyError> {
+    if let Some(text) = body.expanded_text {
+        let subst = body.param_subst.as_ref().map(|(orig, args)| (*orig, args.as_slice()));
+        return lower_body_with_text(names, prepared, keys, store, body.item, body.owner, text, subst, Some(into));
+    }
     match keys.library_in(names, body.owner) {
         Some(lib) => lower_fn_into(names, prepared, keys, store, lib, Some(into)),
         None => lower_member_into(names, prepared, keys, store, body.owner, Some(into)),
     }
+}
+
+/// Lowers `owner`'s body from rewritten item text `text` (produced by `inline for` unrolling),
+/// optionally substituting generic parameter indices with concrete `subst` arguments from `orig`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_body_with_text<'n, S: NamesSource<'n>>(
+    names: S,
+    prepared: &Prepares<'n>,
+    keys: &mut Keys,
+    store: &mut Store<'n>,
+    item: LibKey,
+    owner: ItemKey,
+    text: &'n str,
+    param_subst: Option<(ItemKey, &[PTy])>,
+    into: Option<&mut PortableTys<'static>>,
+) -> Result<Body<'n>, BodyError> {
+    let head_key = param_subst.map_or(owner, |(orig, _)| orig);
+    let head = store.fns.get(&head_key).ok_or(BodyError::NoHead(head_key))?;
+    let krate = names.crate_of(head.lib).ok_or(BodyError::NoText(head.lib))?;
+    let alloc = *head.params.allocator();
+    let container = head.container;
+    let site = Site {
+        item,
+        owner,
+        krate,
+        module: head.module,
+        text,
+        marks: None,
+        params: head.params.to_vec_in(alloc),
+        consts: head.consts.to_vec_in(alloc),
+        bounds: head.bounds.to_vec_in(alloc),
+        self_: head.self_,
+        self_assoc: head.self_assoc.to_vec_in(alloc),
+    };
+    let subst_slice = param_subst.map(|(_, args)| args);
+    let mut body = lower_at(names, prepared, keys, store, site, into, subst_slice)?;
+    body.expanded_text = Some(text);
+    if let Some((orig, args)) = param_subst {
+        let store_alloc = store.tys.alloc();
+        let mut kept_args = blaze_own::Vec::with_capacity_in(args.len(), store_alloc);
+        kept_args.extend_from_slice(args);
+        body.param_subst = Some((orig, kept_args));
+        body.params.clear();
+        if let Some(spec_head) = store.fns.get(&owner) {
+            body.self_ = spec_head.self_;
+        }
+    }
+    if let Some(own) = super::own_trait::of_member(store, container).map_err(|e| BodyError::NoHead(e.0))? {
+        if let Err(at) = body.traits.binary_search(&own) {
+            body.traits.insert(at, own);
+            body.blocks.add(own, store.tys.alloc());
+        }
+    }
+    Ok(body)
 }
 
 fn lower_fn_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, item: LibKey, into: Option<&mut PortableTys<'static>>) -> Result<Body<'n>, BodyError> {
@@ -1158,7 +1221,7 @@ fn lower_fn_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys
         self_: head.self_,
         self_assoc: head.self_assoc.to_vec_in(alloc),
     };
-    lower_at(names, prepared, keys, store, site, into)
+    lower_at(names, prepared, keys, store, site, into, None)
 }
 
 /// Lowers and converts the body of the member fn `key` of a trait or an impl, in the env its
@@ -1229,7 +1292,7 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
         self_assoc: head.self_assoc.to_vec_in(alloc),
     };
     let container = head.container;
-    let mut body = lower_at(names, prepared, keys, store, site, into)?;
+    let mut body = lower_at(names, prepared, keys, store, site, into, None)?;
     // The body's own trait is in scope in it, imported or not (own_trait.rs: `impl
     // core::hash::Hash for X { .. self.field.hash(state) .. }`); `traits` stays sorted.
     if let Some(own) = super::own_trait::of_member(store, container).map_err(|e| BodyError::NoHead(e.0))? {
@@ -1355,7 +1418,7 @@ fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, ite
     None
 }
 
-fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, site: Site<'n>, mut into: Option<&mut PortableTys<'static>>) -> Result<Body<'n>, BodyError> {
+fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, site: Site<'n>, mut into: Option<&mut PortableTys<'static>>, param_subst: Option<&[PTy]>) -> Result<Body<'n>, BodyError> {
     let Site { item, owner, krate, module, text, marks, params, consts, bounds, self_, self_assoc } = site;
     // The body's local items keep these marks for their own heads and bodies (locals.rs
     // `LocalHead::marks`).
@@ -1491,6 +1554,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     // `NonNull` there while its body read it at `alloc::io::error`: E0412 (ladder rungs f3-dyn,
     // x0-ref-11, x0-ref-12). Any other body: its own module.
     let types_at = store.locals.head(owner).map_or(module, |h| h.names_at);
+    note_body_record_field_names(&view, &store.maps);
     let mut last = item;
     let mut typeck = None;
     for _ in 0..MOST_ROUNDS {
@@ -1538,15 +1602,33 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             (None, false) => TypesInto::Overlay,
         };
         let (converted, kept) = match target {
-            TypesInto::Again(t) => (to_typeck(&view, owner, t, &mut types, alloc), None),
+            TypesInto::Again(t) => {
+                let mut converted = to_typeck(&view, owner, t, &mut types, alloc);
+                if let (Ok(b), Some(subst_args)) = (&mut converted, param_subst) {
+                    if let Err(err) = super::inline_for::subst_typeck_body(b, t, subst_args) {
+                        converted = Err(Refused::Check(err));
+                    }
+                }
+                (converted, None)
+            }
             TypesInto::Store => {
-                let converted = to_typeck(&view, owner, &mut store.tys, &mut types, alloc);
+                let mut converted = to_typeck(&view, owner, &mut store.tys, &mut types, alloc);
+                if let (Ok(b), Some(subst_args)) = (&mut converted, param_subst) {
+                    if let Err(err) = super::inline_for::subst_typeck_body(b, &mut store.tys, subst_args) {
+                        converted = Err(Refused::Check(err));
+                    }
+                }
                 let kept = converted.is_ok().then(|| OwnTys::in_base(alloc));
                 (converted, kept)
             }
             TypesInto::Overlay => {
                 let mut own = PortableTys::over(&store.tys, alloc).map_err(|error| BodyError::Table { item, error })?;
-                let converted = to_typeck(&view, owner, &mut own, &mut types, alloc);
+                let mut converted = to_typeck(&view, owner, &mut own, &mut types, alloc);
+                if let (Ok(b), Some(subst_args)) = (&mut converted, param_subst) {
+                    if let Err(err) = super::inline_for::subst_typeck_body(b, &mut own, subst_args) {
+                        converted = Err(Refused::Check(err));
+                    }
+                }
                 let kept = match converted {
                     Ok(_) => Some(own.keep_in(alloc).map_err(|error| BodyError::Table { item, error })?),
                     Err(_) => None,
@@ -1606,5 +1688,42 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     // $crate::__macro_support::Callsite as _;` in the block its macros expand to).
     let blocks = super::block_traits::of(names, &store.locals, owner, module, krate, &traits, alloc);
     drop(view);
-    Ok(Body { item, owner, module, lowered, typeck, tys, params, self_, traits, blocks, type_misses })
+    Ok(Body { item, owner, module, lowered, typeck, tys, params, self_, traits, blocks, type_misses, expanded_text: None, param_subst: None })
+}
+
+/// Records the field name spellings of every structural record literal and record pattern in
+/// `view` into `maps.record_field_names` so `inline for` unrolling can spell anonymous record
+/// fields even across function boundaries.
+fn note_body_record_field_names(view: &View<'_>, maps: &super::heads::Maps) {
+    use super::types::Heads as _;
+    for i in 0..view.exprs.len() {
+        let Ok(idx) = u32::try_from(i) else { break };
+        let Ok(blaze_lower::Expr::Record { fields, .. }) = view.expr(ExprId(idx)) else { continue };
+        let Ok(rows) = view.rows(fields) else { continue };
+        for &row in rows {
+            let Ok(fi) = blaze_lower::form::FieldInit::decode(row) else { continue };
+            let Ok(hash) = view.name(fi.name) else { continue };
+            let Ok(r) = view.name_range(fi.name) else { continue };
+            let Ok(raw) = view.text_at(r) else { continue };
+            let text = raw.strip_prefix("r#").unwrap_or(raw);
+            if !text.is_empty() {
+                maps.note_record_field_name(Name(hash), text);
+            }
+        }
+    }
+    for i in 0..view.pats.len() {
+        let Ok(idx) = u32::try_from(i) else { break };
+        let Ok(blaze_lower::Pat::Record { fields, .. }) = view.pat(blaze_lower::PatId(idx)) else { continue };
+        let Ok(rows) = view.rows(fields) else { continue };
+        for &row in rows {
+            let Ok(fp) = blaze_lower::form::FieldPat::decode(row) else { continue };
+            let Ok(hash) = view.name(fp.name) else { continue };
+            let Ok(r) = view.name_range(fp.name) else { continue };
+            let Ok(raw) = view.text_at(r) else { continue };
+            let text = raw.strip_prefix("r#").unwrap_or(raw);
+            if !text.is_empty() {
+                maps.note_record_field_name(Name(hash), text);
+            }
+        }
+    }
 }

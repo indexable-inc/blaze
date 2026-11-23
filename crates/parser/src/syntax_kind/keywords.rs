@@ -121,6 +121,9 @@ const CONTEXTUAL: &[(&str, SyntaxKind, Option<Edition>)] = &[
     // `#![blaze::uniq]`'s unique reference (docs/v2/plan/design/edition.md, change 10): a
     // keyword only where the grammar's gated rules say (`grammar/uniq.rs`).
     ("uniq", UNIQ_KW, None),
+    // Comptime field unrolling (`inline for pat in expr { ... }`): contextual keyword only
+    // immediately before `for`.
+    ("inline", INLINE_KW, None),
 ];
 
 const fn names<const N: usize, T: Copy, U: Copy>(
@@ -479,6 +482,7 @@ mod tests {
             "recommends" => RECOMMENDS_KW,
             "requires" => REQUIRES_KW,
             "uniq" => UNIQ_KW,
+            "inline" => INLINE_KW,
             "yeet" => YEET_KW,
             _ => return None,
         };

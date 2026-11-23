@@ -21,6 +21,8 @@ pub enum EcsError {
     MissingComponent(ComponentId),
     /// Requested simultaneous mutable or conflicting borrows of the same component column.
     AliasedComponentAccess(ComponentId),
+    /// Query requested conflicting access to the same ID (e.g. `(&mut T, &T)` or `(&mut T, &mut T)`).
+    ConflictingAccess { id: Id },
     /// Adding `(relation, target)` to `entity` would introduce a cycle in a hierarchy/inheritance graph.
     HierarchyCycle { entity: Entity, relation: Entity, target: Entity },
     /// Used the `WILDCARD` sentinel where a concrete entity or relation was required.
@@ -64,6 +66,9 @@ impl fmt::Display for EcsError {
             Self::MissingComponent(cid) => write!(f, "missing component {cid:?}"),
             Self::AliasedComponentAccess(cid) => {
                 write!(f, "aliased mutable access requested for component {cid:?}")
+            }
+            Self::ConflictingAccess { id } => {
+                write!(f, "conflicting query access requested for {id:?}")
             }
             Self::HierarchyCycle { entity, relation, target } => {
                 write!(f, "hierarchy cycle adding ({relation}, {target}) to {entity}")

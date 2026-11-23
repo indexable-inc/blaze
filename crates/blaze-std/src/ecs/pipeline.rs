@@ -5,6 +5,7 @@ use core::alloc::Allocator;
 use blaze_own::Vec as OwnVec;
 
 use super::error::EcsError;
+use super::fetch::QueryFetch;
 use super::id::Id;
 use super::world::World;
 
@@ -178,6 +179,21 @@ impl<A: Allocator + Copy + 'static> Pipeline<A> {
         let idx = self.systems.len();
         self.systems.try_push(desc).map_err(|r| EcsError::Alloc(r.why))?;
         Ok(idx)
+    }
+
+    /// Register a typed query system in `phase`, automatically extracting its `reads` and `writes`
+    /// sets via [`QueryFetch::register_access`] so disjoint batching requires zero manual access
+    /// declarations.
+    pub fn add_query<Q: QueryFetch>(
+        &mut self,
+        world: &mut World<A>,
+        phase: Phase,
+        name: &'static str,
+        step: SystemFn<A>,
+    ) -> Result<usize, EcsError> {
+        let mut desc = SystemDesc::new_in(name, phase, step, self.alloc);
+        Q::register_access(world, &mut desc.reads, &mut desc.writes)?;
+        self.add_system(desc)
     }
 
     /// Partition every [`Phase`] into deterministic, order-preserving, pairwise conflict-free

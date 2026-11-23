@@ -7,13 +7,18 @@ use core::fmt::Write as _;
 
 use blaze_own::{String as OwnString, Vec as OwnVec};
 
-use super::column::{ComponentMeta, make_column_copy, make_column_plain};
+use super::column::{ComponentMeta, downcast_typed_mut, make_column_copy, make_column_plain};
 use super::error::EcsError;
+use super::fetch::{QueryFetch, TypedQuery};
 use super::id::{Builtins, ComponentId, Entity, Id, TableId, u32_to_usize, usize_to_u32};
 use super::map::{FlatMap, FlatSet};
 use super::observer::{DEFAULT_OBSERVER_CAP, Event, EventKind, Observer, ObserverCallback, ObserverId};
 use super::query::{CachedQuery, QuerySpec};
 use super::table::{ArchetypeKey, Table, move_row_between_tables};
+use super::typed::{
+    Bundle, ChildOf, EntityMut, IsA, MAX_PREFAB_DEPTH, Prefab, PrefabInit, Relation,
+    prefab_init_for, short_type_name,
+};
 
 struct EntitySlot<A: Allocator + Copy> {
     generation: u32,
@@ -33,6 +38,9 @@ pub struct World<A: Allocator + Copy + 'static> {
     names: FlatMap<OwnString<A>, Entity, A>,
     components: OwnVec<ComponentMeta<A>, A>,
     component_by_type: FlatMap<TypeId, ComponentId, A>,
+    tag_by_type: FlatMap<TypeId, Entity, A>,
+    relation_by_type: FlatMap<TypeId, Entity, A>,
+    prefab_by_type: FlatMap<TypeId, Entity, A>,
     tables: OwnVec<Table<A>, A>,
     table_by_archetype: FlatMap<ArchetypeKey<A>, TableId, A>,
     observers: OwnVec<Observer<A>, A>,
@@ -73,6 +81,9 @@ impl<A: Allocator + Copy + 'static> World<A> {
             names: FlatMap::new_in(alloc),
             components: OwnVec::new_in(alloc),
             component_by_type: FlatMap::new_in(alloc),
+            tag_by_type: FlatMap::new_in(alloc),
+            relation_by_type: FlatMap::new_in(alloc),
+            prefab_by_type: FlatMap::new_in(alloc),
             tables,
             table_by_archetype,
             observers: OwnVec::new_in(alloc),
@@ -214,6 +225,55 @@ impl<A: Allocator + Copy + 'static> World<A> {
     // -------------------------------------------------------------------------
     // Component Registration
     // -------------------------------------------------------------------------
+
+    /// Register a non-copyable component type `T` using its auto-shortened Rust type name.
+    #[inline]
+    pub fn register<T: 'static>(&mut self) -> Result<ComponentId, EcsError> {
+        self.register_component::<T>(short_type_name::<T>())
+    }
+
+    /// Register a `Copy` component type `T` using its auto-shortened Rust type name.
+    #[inline]
+    pub fn register_copy<T: Copy + 'static>(&mut self) -> Result<ComponentId, EcsError> {
+        self.register_copy_component::<T>(short_type_name::<T>())
+    }
+
+    /// Return the [`ComponentId`] for `T`, lazily registering `T` under [`short_type_name::<T>()`]
+    /// if not yet registered.
+    pub fn component<T: 'static>(&mut self) -> Result<ComponentId, EcsError> {
+        if let Some(cid) = self.component_id::<T>() {
+            return Ok(cid);
+        }
+        self.register_component::<T>(short_type_name::<T>())
+    }
+
+    /// Return the [`ComponentId`] for `Copy` type `T`, lazily registering `T` as copyable under
+    /// [`short_type_name::<T>()`] if not yet registered (and upgrading existing non-copyable
+    /// metadata/columns so prefab instantiation copies `T` seamlessly).
+    pub fn component_copy<T: Copy + 'static>(&mut self) -> Result<ComponentId, EcsError> {
+        if let Some(cid) = self.component_id::<T>() {
+            let needs_upgrade = self
+                .components
+                .get(u32_to_usize(cid.0))
+                .is_some_and(|meta| !meta.can_copy);
+            if needs_upgrade {
+                if let Some(meta) = self.components.get_mut(u32_to_usize(cid.0)) {
+                    meta.make_column = make_column_copy::<T, A>;
+                    meta.can_copy = true;
+                }
+                for table in self.tables.as_mut_slice() {
+                    if let Some(idx) = table.column_index(cid) {
+                        if let Some(entry) = table.columns.get_mut(idx) {
+                            let typed = downcast_typed_mut::<T, A>(entry.col.as_mut(), cid)?;
+                            typed.enable_copy();
+                        }
+                    }
+                }
+            }
+            return Ok(cid);
+        }
+        self.register_copy_component::<T>(short_type_name::<T>())
+    }
 
     /// Register a non-copyable component type `T`.
     pub fn register_component<T: 'static>(&mut self, name: &str) -> Result<ComponentId, EcsError> {
@@ -392,6 +452,75 @@ impl<A: Allocator + Copy + 'static> World<A> {
     #[inline]
     pub fn entity_name(&self, entity: Entity) -> Option<&str> {
         self.live_slot(entity).ok()?.name.as_ref().map(|s| s.as_str())
+    }
+
+    /// Assign or replace the unique name of a live entity.
+    pub fn set_name(&mut self, entity: Entity, name: &str) -> Result<(), EcsError> {
+        let _ = self.live_slot(entity)?;
+        if let Some(&owner) = self.names.get(name) {
+            if owner == entity {
+                return Ok(());
+            }
+            return Err(EcsError::DuplicateEntityName);
+        }
+        let key = OwnString::try_from_str_in(name, self.alloc)?;
+        let stored = OwnString::try_from_str_in(name, self.alloc)?;
+        if let Some(slot) = self.slots.get_mut(u32_to_usize(entity.slot())) {
+            if let Some(old_name) = slot.name.take() {
+                let _ = self.names.remove(old_name.as_str());
+            }
+            slot.name = Some(stored);
+        }
+        let _ = self.names.insert(key, entity)?;
+        Ok(())
+    }
+
+    /// Spawn a typed marker entity (tag, relation, or prefab), preferring its short type name and
+    /// falling back to full type name or anonymous entity if the name is already taken.
+    fn spawn_typed_entity(&mut self, short: &str, full: &str) -> Result<Entity, EcsError> {
+        if self.names.get(short).is_none() {
+            self.spawn_named(short)
+        } else if self.names.get(full).is_none() {
+            self.spawn_named(full)
+        } else {
+            self.spawn()
+        }
+    }
+
+    /// Spawn a new entity and return a fluent [`EntityMut`] handle.
+    #[inline]
+    pub fn spawn_ent(&mut self) -> Result<EntityMut<'_, A>, EcsError> {
+        let entity = self.spawn()?;
+        Ok(EntityMut::new(self, entity))
+    }
+
+    /// Spawn a new entity initialized with component tuple `bundle` and return its [`Entity`] ID.
+    pub fn spawn_bundle<B: Bundle>(&mut self, bundle: B) -> Result<Entity, EcsError> {
+        let entity = self.spawn()?;
+        bundle.insert_into(self, entity)?;
+        Ok(entity)
+    }
+
+    /// Spawn a new entity initialized with component tuple `bundle` and return a fluent
+    /// [`EntityMut`] handle.
+    pub fn spawn_with<B: Bundle>(&mut self, bundle: B) -> Result<EntityMut<'_, A>, EcsError> {
+        let entity = self.spawn_bundle(bundle)?;
+        Ok(EntityMut::new(self, entity))
+    }
+
+    /// Instantiate a live entity from typed prefab `P` (lazily creating `P` and its ancestor
+    /// prefab chain if needed) and return a fluent [`EntityMut`] handle.
+    pub fn spawn_of<P: Prefab>(&mut self) -> Result<EntityMut<'_, A>, EcsError> {
+        let prefab = self.prefab_entity::<P>()?;
+        let inst = self.instantiate(prefab)?;
+        Ok(EntityMut::new(self, inst))
+    }
+
+    /// Borrow an existing live entity as a fluent [`EntityMut`] handle.
+    #[inline]
+    pub fn entity_mut(&mut self, entity: Entity) -> Result<EntityMut<'_, A>, EcsError> {
+        let _ = self.live_slot(entity)?;
+        Ok(EntityMut::new(self, entity))
     }
 
     /// Spawn a named prefab entity tagged with `world.prefab()`.
@@ -657,11 +786,24 @@ impl<A: Allocator + Copy + 'static> World<A> {
     // Component Read / Write / Remove
     // -------------------------------------------------------------------------
 
-    /// Set (insert or overwrite) component `T` on `entity`.
+    /// Set (insert or overwrite) component `T` on `entity`, lazily registering `T` under
+    /// [`short_type_name::<T>()`] on first use.
     pub fn set<T: 'static>(&mut self, entity: Entity, value: T) -> Result<(), EcsError> {
-        let cid = self
-            .component_id::<T>()
-            .ok_or(EcsError::UnknownComponent(ComponentId(u32::MAX)))?;
+        let _ = self.live_slot(entity)?;
+        let cid = self.component::<T>()?;
+        self.set_by_id(entity, cid, value)
+    }
+
+    /// Set (insert or overwrite) `Copy` component `T` on `entity`, lazily registering `T` as
+    /// copyable under [`short_type_name::<T>()`] so prefab instantiation duplicates it
+    /// automatically.
+    pub fn set_copy<T: Copy + 'static>(
+        &mut self,
+        entity: Entity,
+        value: T,
+    ) -> Result<(), EcsError> {
+        let _ = self.live_slot(entity)?;
+        let cid = self.component_copy::<T>()?;
         self.set_by_id(entity, cid, value)
     }
 
@@ -1016,6 +1158,386 @@ impl<A: Allocator + Copy + 'static> World<A> {
         }
         out.as_mut_slice().sort_unstable();
         Ok(out)
+    }
+
+    // -------------------------------------------------------------------------
+    // Typed Tags, Relations & Prefabs (Zero-String Ergonomic API)
+    // -------------------------------------------------------------------------
+
+    /// Return the cached entity for typed tag `T` without creating one if absent.
+    #[inline]
+    pub fn tag_entity_id<T: 'static>(&self) -> Option<Entity> {
+        let ent = self.tag_by_type.get(&TypeId::of::<T>()).copied()?;
+        if self.is_alive(ent) { Some(ent) } else { None }
+    }
+
+    /// Return (or lazily spawn and cache) the named tag entity for marker type `T`.
+    pub fn tag_entity<T: 'static>(&mut self) -> Result<Entity, EcsError> {
+        let tid = TypeId::of::<T>();
+        if let Some(&existing) = self.tag_by_type.get(&tid) {
+            if self.is_alive(existing) {
+                return Ok(existing);
+            }
+        }
+        let ent = self.spawn_typed_entity(short_type_name::<T>(), core::any::type_name::<T>())?;
+        let _ = self.tag_by_type.insert(tid, ent)?;
+        Ok(ent)
+    }
+
+    /// Attach typed marker tag `T` to `entity`.
+    pub fn add_tag_typed<T: 'static>(&mut self, entity: Entity) -> Result<(), EcsError> {
+        let _ = self.live_slot(entity)?;
+        let tag = self.tag_entity::<T>()?;
+        self.add_tag(entity, tag)
+    }
+
+    /// Check whether `entity` carries typed marker tag `T`.
+    pub fn has_tag_typed<T: 'static>(&self, entity: Entity) -> Result<bool, EcsError> {
+        let (tid, _) = self.entity_table(entity)?;
+        let Some(tag) = self.tag_entity_id::<T>() else {
+            return Ok(false);
+        };
+        Ok(self.table(tid)?.has_id(Id::Tag(tag)))
+    }
+
+    /// Remove typed marker tag `T` from `entity`.
+    pub fn remove_tag_typed<T: 'static>(&mut self, entity: Entity) -> Result<bool, EcsError> {
+        let _ = self.live_slot(entity)?;
+        let Some(tag) = self.tag_entity_id::<T>() else {
+            return Ok(false);
+        };
+        self.remove_tag(entity, tag)
+    }
+
+    /// Return the cached entity for typed relation `R` without creating one if absent.
+    #[inline]
+    pub fn relation_entity_id<R: Relation>(&self) -> Option<Entity> {
+        let tid = TypeId::of::<R>();
+        if tid == TypeId::of::<ChildOf>() {
+            return Some(self.builtins.child_of);
+        }
+        if tid == TypeId::of::<IsA>() {
+            return Some(self.builtins.is_a);
+        }
+        let ent = self.relation_by_type.get(&tid).copied()?;
+        if self.is_alive(ent) { Some(ent) } else { None }
+    }
+
+    /// Return (or lazily spawn, configure trait tags, and cache) the entity for typed [`Relation`]
+    /// `R`. Built-in [`ChildOf`] and [`IsA`] map directly to `self.child_of()` / `self.is_a()`.
+    pub fn relation_entity<R: Relation>(&mut self) -> Result<Entity, EcsError> {
+        let tid = TypeId::of::<R>();
+        if tid == TypeId::of::<ChildOf>() {
+            return Ok(self.builtins.child_of);
+        }
+        if tid == TypeId::of::<IsA>() {
+            return Ok(self.builtins.is_a);
+        }
+        if let Some(&existing) = self.relation_by_type.get(&tid) {
+            if self.is_alive(existing) {
+                return Ok(existing);
+            }
+        }
+        let rel = self.spawn_typed_entity(short_type_name::<R>(), core::any::type_name::<R>())?;
+        if R::EXCLUSIVE {
+            self.add_tag(rel, self.builtins.exclusive)?;
+        }
+        if R::SYMMETRIC {
+            self.add_tag(rel, self.builtins.symmetric)?;
+        }
+        if R::TRANSITIVE {
+            self.add_tag(rel, self.builtins.transitive)?;
+        }
+        if R::ON_DELETE_CASCADE {
+            self.add_tag(rel, self.builtins.on_delete_cascade)?;
+        }
+        let _ = self.relation_by_type.insert(tid, rel)?;
+        Ok(rel)
+    }
+
+    /// Attach typed relation pair `(R, target)` to `entity`.
+    pub fn relate<R: Relation>(&mut self, entity: Entity, target: Entity) -> Result<(), EcsError> {
+        let _ = self.live_slot(entity)?;
+        let _ = self.live_slot(target)?;
+        let rel = self.relation_entity::<R>()?;
+        self.add_pair(entity, rel, target)
+    }
+
+    /// Remove typed relation pair `(R, target)` from `entity`.
+    pub fn unrelate<R: Relation>(
+        &mut self,
+        entity: Entity,
+        target: Entity,
+    ) -> Result<bool, EcsError> {
+        let _ = self.live_slot(entity)?;
+        let Some(rel) = self.relation_entity_id::<R>() else {
+            return Ok(false);
+        };
+        self.remove_pair(entity, rel, target)
+    }
+
+    /// Check whether `entity` directly carries typed relation pair `(R, target)`.
+    pub fn has_relation<R: Relation>(
+        &self,
+        entity: Entity,
+        target: Entity,
+    ) -> Result<bool, EcsError> {
+        let _ = self.live_slot(entity)?;
+        let Some(rel) = self.relation_entity_id::<R>() else {
+            return Ok(false);
+        };
+        self.has_pair(entity, rel, target)
+    }
+
+    /// Check whether `(entity, R, target)` holds directly or transitively (when `R::TRANSITIVE`).
+    pub fn has_transitive_relation<R: Relation>(
+        &self,
+        entity: Entity,
+        target: Entity,
+    ) -> Result<bool, EcsError> {
+        let _ = self.live_slot(entity)?;
+        let _ = self.live_slot(target)?;
+        let Some(rel) = self.relation_entity_id::<R>() else {
+            return Ok(false);
+        };
+        self.has_transitive(entity, rel, target)
+    }
+
+    /// Return the cached entity for typed prefab `P` without creating one if absent.
+    #[inline]
+    pub fn prefab_entity_id<P: Prefab>(&self) -> Option<Entity> {
+        let ent = self.prefab_by_type.get(&TypeId::of::<P>()).copied()?;
+        if self.is_alive(ent) { Some(ent) } else { None }
+    }
+
+    /// Return (or lazily create iteratively from root ancestor to leaf) the cached prefab entity
+    /// for typed [`Prefab`] `P`.
+    pub fn prefab_entity<P: Prefab>(&mut self) -> Result<Entity, EcsError> {
+        let leaf_tid = TypeId::of::<P>();
+        if let Some(&existing) = self.prefab_by_type.get(&leaf_tid) {
+            if self.is_alive(existing) {
+                return Ok(existing);
+            }
+        }
+
+        // Collect unmaterialized ancestor chain iteratively (leaf -> root), zero recursion.
+        let mut chain: OwnVec<PrefabInit<A>, A> = OwnVec::new_in(self.alloc);
+        let mut cur = prefab_init_for::<P, A>();
+        let mut prev_parent: Option<Entity> = None;
+
+        loop {
+            if chain.len() >= MAX_PREFAB_DEPTH {
+                return Err(EcsError::TraversalBoundExceeded { limit: MAX_PREFAB_DEPTH });
+            }
+            let next_parent_fn = cur.parent;
+            chain.try_push(cur).map_err(|r| EcsError::Alloc(r.why))?;
+            let Some(parent_fn) = next_parent_fn else {
+                break;
+            };
+            let next = parent_fn();
+            if let Some(&cached_parent) = self.prefab_by_type.get(&next.type_id) {
+                if self.is_alive(cached_parent) {
+                    prev_parent = Some(cached_parent);
+                    break;
+                }
+            }
+            cur = next;
+        }
+
+        // Materialize prefabs root-to-leaf, linking `(IsA, parent)` and inserting copyable bundles.
+        let mut result = Entity::NULL;
+        while let Some(step) = chain.pop() {
+            let ent = self.spawn_typed_entity(step.short_name, step.full_name)?;
+            self.add_tag(ent, self.builtins.prefab)?;
+            if let Some(parent_ent) = prev_parent {
+                self.add_pair(ent, self.builtins.is_a, parent_ent)?;
+            }
+            (step.insert)(self, ent)?;
+            let _ = self.prefab_by_type.insert(step.type_id, ent)?;
+            prev_parent = Some(ent);
+            result = ent;
+        }
+
+        Ok(result)
+    }
+
+    // -------------------------------------------------------------------------
+    // Typed 1-Line Queries & Filtered Query Builder
+    // -------------------------------------------------------------------------
+
+    /// Start a chainable filtered typed query for `Q` (`.with_tag`, `.without`, `.with_relation`,
+    /// `.include_prefabs`, `.each`, `.each_chunk`, `.each_with_entity`).
+    #[inline]
+    pub fn query<Q: QueryFetch>(&mut self) -> TypedQuery<'_, Q, A> {
+        TypedQuery::new(self)
+    }
+
+    /// Iterate all live non-prefab entities matching `Q` with zero heap allocation.
+    pub fn each<Q: QueryFetch>(
+        &mut self,
+        mut f: impl for<'a> FnMut(Q::Item<'a>),
+    ) -> Result<(), EcsError> {
+        Q::check_conflicts(self)?;
+        let Some(fetch_ids) = Q::lookup_ids(self) else {
+            return Ok(());
+        };
+        let ids = fetch_ids.as_slice();
+        let prefab_tag = self.builtins.prefab;
+        for table in self.tables.as_mut_slice() {
+            if table.is_empty() || table.has_id(Id::Tag(prefab_tag)) {
+                continue;
+            }
+            if !table_has_all_components(table, ids) {
+                continue;
+            }
+            Q::for_each_in_table(table, ids, &mut f)?;
+        }
+        Ok(())
+    }
+
+    /// Iterate contiguous SoA column slices for every non-empty, non-prefab archetype table
+    /// matching `Q` with zero heap allocation.
+    pub fn each_chunk<Q: QueryFetch>(
+        &mut self,
+        mut f: impl for<'a> FnMut(Q::Chunk<'a>),
+    ) -> Result<(), EcsError> {
+        Q::check_conflicts(self)?;
+        let Some(fetch_ids) = Q::lookup_ids(self) else {
+            return Ok(());
+        };
+        let ids = fetch_ids.as_slice();
+        let prefab_tag = self.builtins.prefab;
+        for table in self.tables.as_mut_slice() {
+            if table.is_empty() || table.has_id(Id::Tag(prefab_tag)) {
+                continue;
+            }
+            if !table_has_all_components(table, ids) {
+                continue;
+            }
+            Q::for_each_chunk_in_table(table, ids, &mut f)?;
+        }
+        Ok(())
+    }
+
+    /// Iterate all live non-prefab entities matching `Q`, passing `(Entity, Q::Item<'_>)`, with
+    /// zero heap allocation.
+    pub fn each_with_entity<Q: QueryFetch>(
+        &mut self,
+        mut f: impl for<'a> FnMut(Entity, Q::Item<'a>),
+    ) -> Result<(), EcsError> {
+        Q::check_conflicts(self)?;
+        let Some(fetch_ids) = Q::lookup_ids(self) else {
+            return Ok(());
+        };
+        let ids = fetch_ids.as_slice();
+        let prefab_tag = self.builtins.prefab;
+        for table in self.tables.as_mut_slice() {
+            if table.is_empty() || table.has_id(Id::Tag(prefab_tag)) {
+                continue;
+            }
+            if !table_has_all_components(table, ids) {
+                continue;
+            }
+            Q::for_each_with_entity_in_table(table, ids, &mut f)?;
+        }
+        Ok(())
+    }
+
+    /// Iterate all entities matching both `Q` and additional filter specification `extra`.
+    pub fn each_filtered<Q: QueryFetch>(
+        &mut self,
+        extra: &QuerySpec<A>,
+        mut f: impl for<'a> FnMut(Q::Item<'a>),
+    ) -> Result<(), EcsError> {
+        Q::check_conflicts(self)?;
+        let Some(fetch_ids) = Q::lookup_ids(self) else {
+            return Ok(());
+        };
+        let ids = fetch_ids.as_slice();
+        let prefab_tag = self.builtins.prefab;
+        let wildcard = self.builtins.wildcard;
+        for table in self.tables.as_mut_slice() {
+            if table.is_empty() || !table_has_all_components(table, ids) {
+                continue;
+            }
+            if !extra.matches_table(table, prefab_tag, wildcard) {
+                continue;
+            }
+            Q::for_each_in_table(table, ids, &mut f)?;
+        }
+        Ok(())
+    }
+
+    /// Iterate contiguous SoA chunks for all non-empty tables matching both `Q` and `extra`.
+    pub fn each_chunk_filtered<Q: QueryFetch>(
+        &mut self,
+        extra: &QuerySpec<A>,
+        mut f: impl for<'a> FnMut(Q::Chunk<'a>),
+    ) -> Result<(), EcsError> {
+        Q::check_conflicts(self)?;
+        let Some(fetch_ids) = Q::lookup_ids(self) else {
+            return Ok(());
+        };
+        let ids = fetch_ids.as_slice();
+        let prefab_tag = self.builtins.prefab;
+        let wildcard = self.builtins.wildcard;
+        for table in self.tables.as_mut_slice() {
+            if table.is_empty() || !table_has_all_components(table, ids) {
+                continue;
+            }
+            if !extra.matches_table(table, prefab_tag, wildcard) {
+                continue;
+            }
+            Q::for_each_chunk_in_table(table, ids, &mut f)?;
+        }
+        Ok(())
+    }
+
+    /// Iterate `(Entity, Q::Item<'_>)` for all entities matching both `Q` and `extra`.
+    pub fn each_with_entity_filtered<Q: QueryFetch>(
+        &mut self,
+        extra: &QuerySpec<A>,
+        mut f: impl for<'a> FnMut(Entity, Q::Item<'a>),
+    ) -> Result<(), EcsError> {
+        Q::check_conflicts(self)?;
+        let Some(fetch_ids) = Q::lookup_ids(self) else {
+            return Ok(());
+        };
+        let ids = fetch_ids.as_slice();
+        let prefab_tag = self.builtins.prefab;
+        let wildcard = self.builtins.wildcard;
+        for table in self.tables.as_mut_slice() {
+            if table.is_empty() || !table_has_all_components(table, ids) {
+                continue;
+            }
+            if !extra.matches_table(table, prefab_tag, wildcard) {
+                continue;
+            }
+            Q::for_each_with_entity_in_table(table, ids, &mut f)?;
+        }
+        Ok(())
+    }
+
+    /// Count all entities matching both `Q` and `extra`.
+    pub fn count_filtered<Q: QueryFetch>(&self, extra: &QuerySpec<A>) -> Result<usize, EcsError> {
+        Q::check_conflicts(self)?;
+        let Some(fetch_ids) = Q::lookup_ids(self) else {
+            return Ok(0);
+        };
+        let ids = fetch_ids.as_slice();
+        let prefab_tag = self.builtins.prefab;
+        let wildcard = self.builtins.wildcard;
+        let mut total = 0usize;
+        for table in self.tables.as_slice() {
+            if table.is_empty() || !table_has_all_components(table, ids) {
+                continue;
+            }
+            if !extra.matches_table(table, prefab_tag, wildcard) {
+                continue;
+            }
+            total = total.saturating_add(table.len());
+        }
+        Ok(total)
     }
 
     // -------------------------------------------------------------------------
@@ -1501,4 +2023,17 @@ impl<A: Allocator + Copy + 'static> World<A> {
         }
         Ok(())
     }
+}
+
+#[inline]
+fn table_has_all_components<A: Allocator + Copy + 'static>(
+    table: &Table<A>,
+    cids: &[ComponentId],
+) -> bool {
+    for &cid in cids {
+        if !table.has_id(Id::Component(cid)) {
+            return false;
+        }
+    }
+    true
 }

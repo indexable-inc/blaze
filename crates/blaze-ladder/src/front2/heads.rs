@@ -2141,6 +2141,9 @@ pub struct Store<'n> {
     pub(crate) inferred_output_wanted: Option<ItemKey>,
     /// Mutual recursion cycle `(caller, callee)` discovered while inferring `_`-returning functions.
     pub(crate) inferred_output_cycle: Option<(ItemKey, ItemKey)>,
+    /// True during the pre-unroll `inline for` probe check (allows downstream diagnostics that
+    /// depend on the unexpanded loop body and skips filing `inferred_outputs`).
+    pub(crate) inline_for_probe: bool,
     /// How a trait's members' needs are met: the seam the cost test proves equal.
     pub needs: NeedsMet,
     /// A body task's frozen heads (front2 tables/seeds.rs): with one, every head
@@ -2521,6 +2524,7 @@ impl<'n> Store<'n> {
             inferring_output_stack: blaze_own::Vec::new_in(alloc),
             inferred_output_wanted: None,
             inferred_output_cycle: None,
+            inline_for_probe: false,
             seeds: None,
             seed_error: None,
             // `First` until `All` is proven on clap-root: under `All`, clap's `Cmd` was refused

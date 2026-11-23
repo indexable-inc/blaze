@@ -369,6 +369,9 @@ pub enum SyntaxKind {
     // others too. Only a lexer token: the parser's input has it as a `{` of this contextual
     // kind, which the parser takes as a lazy `BLOCK_EXPR`, so no tree holds this kind.
     LAZY_BODY,
+    // Contextual `inline` keyword before `for` (`inline for x in expr { ... }`), after the
+    // others too so every earlier kind keeps its discriminant.
+    INLINE_KW,
     #[doc(hidden)]
     __LAST,
 }
@@ -721,6 +724,7 @@ impl SyntaxKind {
             RECOMMENDS_KW => Some("recommends"),
             REQUIRES_KW => Some("requires"),
             UNIQ_KW => Some("uniq"),
+            INLINE_KW => Some("inline"),
             YEET_KW => Some("yeet"),
             ASYNC_KW => Some("async"),
             AWAIT_KW => Some("await"),
@@ -840,6 +844,7 @@ impl SyntaxKind {
             RECOMMENDS_KW => true,
             REQUIRES_KW => true,
             UNIQ_KW => true,
+            INLINE_KW => true,
             YEET_KW => true,
             _ => false,
         }
@@ -947,6 +952,7 @@ impl SyntaxKind {
             RECOMMENDS_KW => true,
             REQUIRES_KW => true,
             UNIQ_KW => true,
+            INLINE_KW => true,
             YEET_KW => true,
             _ => false,
         }
@@ -1215,6 +1221,7 @@ macro_rules ! T_ {
     [recommends] => { $ crate :: SyntaxKind :: RECOMMENDS_KW };
     [requires] => { $ crate :: SyntaxKind :: REQUIRES_KW };
     [uniq] => { $ crate :: SyntaxKind :: UNIQ_KW };
+    [inline] => { $ crate :: SyntaxKind :: INLINE_KW };
     [yeet] => { $ crate :: SyntaxKind :: YEET_KW };
     [async] => { $ crate :: SyntaxKind :: ASYNC_KW };
     [await] => { $ crate :: SyntaxKind :: AWAIT_KW };
