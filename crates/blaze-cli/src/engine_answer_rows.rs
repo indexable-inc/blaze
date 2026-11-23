@@ -1111,30 +1111,26 @@ impl<D: Driver, S: Sharing> AnswerSink for StoreSink<'_, '_, '_, '_, D, S> {
 
         // CAS reach follows one index level. Include each expansion's key and its owner's
         // side index so a later carried names row can be indexed again after compaction.
-        let mut keys = blaze_own::BTreeSet::new_in(alloc);
-        let mut keep = |key| {
-            keys.insert(key);
-            if keys.len() > INDEX_KEYS_MOST {
-                return Err(PublishError::RowsReach { segment: owner, cap: INDEX_KEYS_MOST });
-            }
-            Ok(())
-        };
-        for key in records {
-            keep(*key)?;
-        }
+        let mut keys = Vec::with_capacity_in(records.len(), alloc);
+        keys.extend_from_slice(records);
         for &(_, record) in scopes {
             let index = beside_key(blaze_cas::Key(record.0));
             // put_all creates this optional local index only for a nonempty expansion set.
             let Some(held) = self.lent.get(&index).map_err(PublishError::Cas)? else { continue };
-            if held.namespace != blaze_cas::plain::Namespace::LOCAL || !ReservedTag::Index.is(held.tag) ||held.bytes.len() % 32 != 0 || held.bytes.len() / 32 > INDEX_KEYS_MOST {
+            if held.namespace != blaze_cas::plain::Namespace::LOCAL || !ReservedTag::Index.is(held.tag) || held.bytes.len() % 32 != 0 || held.bytes.len() / 32 > INDEX_KEYS_MOST {
                 return Err(PublishError::ExpansionIndex { record, index: Key(index.0), namespace: held.namespace.0, tag: held.tag.0, bytes: held.bytes.len() });
             }
-            keep(Key(index.0))?;
+            keys.reserve(1 + held.bytes.len() / 32);
+            keys.push(Key(index.0));
             for bytes in held.bytes.chunks_exact(32) {
-                keep(Key(ContentId(bytes.try_into().expect("a whole index key"))))?;
+                keys.push(Key(ContentId(bytes.try_into().expect("a whole index key"))));
             }
         }
-        let keys = Vec::from_iter_in(keys.iter().copied(), alloc);
+        keys.sort_unstable();
+        keys.dedup();
+        if keys.len() > INDEX_KEYS_MOST {
+            return Err(PublishError::RowsReach { segment: owner, cap: INDEX_KEYS_MOST });
+        }
         self.store.index_beside(self.cx, owner, &keys).map_err(PublishError::Command)
     }
 

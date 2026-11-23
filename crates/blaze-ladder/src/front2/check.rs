@@ -2192,10 +2192,10 @@ pub(super) fn trait_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S,
     candidates.retain(|k| sight.sees(b.krate(*k)));
     candidates.sort_unstable();
     candidates.dedup();
-    if let Made::Later(why) = lower_heads(names, heads, b, candidates, order)? {
+    if let Made::Later(why) = lower_heads(names, heads, b, &candidates, order)? {
         return Ok(Made::Later(why));
     }
-    b.answer(heads.store(), trait_, shape, home, sight).map_err(MakeFail::Buckets)?;
+    b.answer_candidates(heads.store(), trait_, shape, home, sight, &candidates).map_err(MakeFail::Buckets)?;
     Ok(Made::Made)
 }
 
@@ -2217,7 +2217,7 @@ pub(super) fn inherent_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names:
     // (census 7: "an array length names: Nested", 169 fns).
     let mut candidates = b.inherent_candidates(shape, home);
     candidates.retain(|&k| super::member_names::may_declare(names, k, name));
-    if let Made::Later(why) = lower_heads(names, heads, b, candidates.clone(), order)? {
+    if let Made::Later(why) = lower_heads(names, heads, b, &candidates, order)? {
         return Ok(Made::Later(why));
     }
     b.answer_inherent(heads.store(), shape, name, &candidates).map_err(MakeFail::Buckets)?;
@@ -2227,12 +2227,10 @@ pub(super) fn inherent_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names:
 /// Makes the headers of `candidates` the store does not hold yet, counting them. `Later` at
 /// the first `heads` leaves (the candidates before it are made and stay; it and those after
 /// are counted by the maker that makes them).
-fn lower_heads<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H, b: &Buckets, mut candidates: Vec<LibKey, Global>, order: BuildOrder) -> Result<Made<H::Later>, MakeFail> {
-    if order == BuildOrder::Reversed {
-        candidates.reverse();
-    }
+fn lower_heads<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H, b: &Buckets, candidates: &[LibKey], order: BuildOrder) -> Result<Made<H::Later>, MakeFail> {
     let mut refused = None;
-    for k in candidates {
+    let mut iter = candidates.iter();
+    while let Some(&k) = if order == BuildOrder::Reversed { iter.next_back() } else { iter.next() } {
         if heads.store().impls.contains_key(&checker_of(k)) || b.has_failed(k) {
             continue;
         }

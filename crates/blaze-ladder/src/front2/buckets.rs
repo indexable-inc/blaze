@@ -1259,6 +1259,16 @@ pub struct Buckets {
     index: RefCell<BucketIndex>,
 }
 
+/// Per-crate cached facts on [`BucketIndex`].
+#[derive(Clone, Copy)]
+pub(super) struct CrateState {
+    /// Whether the crate's root turns on `rustc_attrs` ([`Home::Incoherent`]).
+    pub(super) incoherent: bool,
+    /// Cached `linked::links_unit(krate == 0, names.proc_macro(krate) == Some(true))` so
+    /// repeated impl questions do not re-query `names.proc_macro(krate)` on every crate.
+    pub(super) linked: Option<bool>,
+}
+
 /// What [`Buckets`] files impls in and counts: every field but the answers, mutated through
 /// one `RefCell` ([`Buckets`]'s docs).
 pub struct BucketIndex {
@@ -1295,8 +1305,9 @@ pub struct BucketIndex {
     homes: HashMap<(ItemKey, Shape), Homes, Global>,
     /// The trait impls whose trait path is written with no generic arguments.
     bare: HashSet<LibKey, Global>,
-    /// Per crate: whether its root turns on `rustc_attrs` ([`Home::Incoherent`]).
-    incoherent: Vec<bool, Global>,
+    /// Per crate: whether its root turns on `rustc_attrs` ([`Home::Incoherent`]) and whether
+    /// it is a linked (non-proc-macro or root) unit.
+    crate_state: Vec<CrateState, Global>,
     /// The trait impls filed by their header's text ([`file_by_text`]) because the lowered
     /// header did not name their trait: each is a defect of the lowering or of the block's
     /// module to remove at its home, counted here so it is seen. A set: [`Buckets::answer`]
@@ -1333,6 +1344,9 @@ pub struct BucketIndex {
     indexed: asked::Indexed,
     /// The cells already offered to this body, allocated by its caller on the first lookup.
     table_reads: Option<BucketReadUnion<blaze_own::Alloc<'static>>>,
+    /// Cached `Home::Any` `NoImplsOf` precheck results per trait, allocated in the body's
+    /// scratch allocator on the first `Home::Any` trait lookup.
+    tables_cache: Option<records::TablesCache>,
 }
 
 impl Buckets {
@@ -1366,7 +1380,10 @@ impl Buckets {
         b.krates.extend(index.impls.iter().map(|at| (at.key, at.krate)));
         // `#![feature(rustc_attrs)]` is an inner attribute of the crate root, the first file
         // read; a mention anywhere in that text keeps the crate on the wide side.
-        b.incoherent.extend(names.crates().iter().map(|c| blaze_scope::items_record::root_may_write_incoherent(c)));
+        b.crate_state.extend(names.crates().iter().map(|c| CrateState {
+            incoherent: blaze_scope::items_record::root_may_write_incoherent(c),
+            linked: None,
+        }));
         b.file_all(names, &index.impls);
         // Each refused derive's gap (D193 point 5), as the items record writes it: the solve's
         // values give the same rows (blaze-scope `each_refused_impl_row`, the one home).
@@ -1392,7 +1409,7 @@ impl Buckets {
         let crates = names.crate_count();
         // Unknown until asked ([`Buckets::admit`]): the wide side, as `admits` reads a crate
         // with no row.
-        b.incoherent.resize(crates, true);
+        b.crate_state.resize(crates, CrateState { incoherent: true, linked: None });
         b.lazy_filed.resize(crates, false);
         Buckets::of(b)
     }
@@ -1534,8 +1551,12 @@ impl Buckets {
         out
     }
 
-    pub fn trait_reads(&self, trait_: ItemKey, shape: Shape) -> Ref<'_, [BucketRead]> {
-        Ref::map(self.index(), |ix| ix.trait_reads(trait_, shape))
+    pub fn trait_reads(&self, trait_: ItemKey, shape: Shape) -> blaze_own::Vec<BucketRead, Global> {
+        self.index().trait_reads(trait_, shape)
+    }
+
+    pub(super) fn with_trait_reads<R>(&self, trait_: ItemKey, shape: Shape, f: impl FnOnce(&[BucketRead], Option<(&[BucketRead], &[BucketRead])>) -> R) -> R {
+        self.index().with_trait_reads(trait_, shape, f)
     }
 
     pub fn inherent_reads(&self, shape: Shape) -> Ref<'_, [BucketRead]> {
@@ -1591,7 +1612,7 @@ impl BucketIndex {
             krates: HashMap::new_in(Global),
             homes: HashMap::new_in(Global),
             bare: HashSet::new_in(Global),
-            incoherent: Vec::new_in(Global),
+            crate_state: Vec::new_in(Global),
             by_text: HashSet::new_in(Global),
             blanket: HashSet::new_in(Global),
             bounded: HashMap::new_in(Global),
@@ -1601,6 +1622,7 @@ impl BucketIndex {
             row_misses: [0; 6],
             no_rows: false,
             table_reads: None,
+            tables_cache: None,
             indexed: asked::Indexed::new(),
         }
     }
@@ -1644,7 +1666,7 @@ impl BucketIndex {
             }
             if [all, bare, blanket].contains(&Home::Incoherent) {
                 // Not answered (no record: the source filed it): the wide side.
-                self.incoherent[krate] = names.may_write_incoherent(krate).unwrap_or(true);
+                self.crate_state[krate].incoherent = names.may_write_incoherent(krate).unwrap_or(true);
             }
             if !(self.admits(all, krate) || self.admits(bare, krate) || self.admits(blanket, krate)) {
                 continue;
@@ -1653,7 +1675,7 @@ impl BucketIndex {
             filed += 1;
             // A proc-macro unit the program reaches answers none of its questions; the
             // program's own crate (0) does, a proc macro's too (linked.rs `links_unit`).
-            if !super::linked::links_unit(krate == 0, names.proc_macro(krate) == Some(true)) {
+            if !self.crate_linked(names, krate) {
                 continue;
             }
             let mut rows: Vec<ImplRow<'n>, Global> = Vec::new_in(Global);
@@ -1815,13 +1837,27 @@ impl BucketIndex {
         });
     }
 
+    /// Whether `krate` is linked for impl lookup (root or non-proc-macro), memoized once per
+    /// crate on this [`BucketIndex`] so repeated impl questions do not re-query `names.proc_macro`
+    /// and re-offer `NameCell::Root` on every crate.
+    pub(super) fn crate_linked<'n, S: NamesSource<'n>>(&mut self, names: S, krate: usize) -> bool {
+        if let Some(linked) = self.crate_state.get(krate).and_then(|s| s.linked) {
+            return linked;
+        }
+        let linked = super::linked::links_unit(krate == 0, names.proc_macro(krate) == Some(true));
+        if let Some(slot) = self.crate_state.get_mut(krate) {
+            slot.linked = Some(linked);
+        }
+        linked
+    }
+
     /// Whether an impl written in crate `krate` can be in `home`.
     pub fn admits(&self, home: Home, krate: usize) -> bool {
         match home {
             Home::Any => true,
             Home::In(a, b) => krate == a || b == Some(krate),
             // A crate the names library has no row for stays on the wide side.
-            Home::Incoherent => self.incoherent.get(krate).copied().unwrap_or(true),
+            Home::Incoherent => self.crate_state.get(krate).map_or(true, |s| s.incoherent),
         }
     }
 
@@ -1927,6 +1963,27 @@ impl Buckets {
         if self.answers.contains_key(&asked) {
             return Ok(());
         }
+        let candidates = {
+            let ix = self.index();
+            // The negative impls are candidates too: the solver reads their polarity (a negative
+            // impl decides an auto trait's structural rule and never meets a positive goal).
+            let mut candidates = ix.trait_candidates(trait_, shape, home);
+            candidates.extend_from_slice(&ix.negative_of(trait_, shape, home));
+            candidates.retain(|k| sight.sees(ix.krate(*k)));
+            candidates.sort_unstable();
+            candidates.dedup();
+            candidates
+        };
+        self.answer_candidates(store, trait_, shape, home, sight, &candidates)
+    }
+
+    /// [`Buckets::answer`] reusing the caller's already assembled, sight-filtered, sorted, and
+    /// deduplicated candidate list (`check::trait_question`).
+    pub(crate) fn answer_candidates(&self, store: &Store<'_>, trait_: ItemKey, shape: Shape, home: Homes, sight: Sight<'_>, candidates: &[LibKey]) -> Result<(), Unfilled> {
+        let asked = (trait_, shape, sight.seen);
+        if self.answers.contains_key(&asked) {
+            return Ok(());
+        }
         let view = store.tys.view();
         let mut got = Vec::new_in(Global);
         // Candidates come sorted, so the first failed one is the least key.
@@ -1936,14 +1993,7 @@ impl Buckets {
             // methods and reads of `store`'s rows.
             let mut ix = self.index_mut();
             ix.homes.insert((trait_, shape), home);
-            // The negative impls are candidates too: the solver reads their polarity (a negative
-            // impl decides an auto trait's structural rule and never meets a positive goal).
-            let mut candidates = ix.trait_candidates(trait_, shape, home);
-            candidates.extend_from_slice(&ix.negative_of(trait_, shape, home));
-            candidates.retain(|k| sight.sees(ix.krate(*k)));
-            candidates.sort_unstable();
-            candidates.dedup();
-            for k in candidates {
+            for &k in candidates {
                 if ix.has_failed(k) {
                     first_failed = first_failed.or(Some(k));
                     continue;

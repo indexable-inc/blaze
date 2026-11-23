@@ -410,6 +410,9 @@ pub fn facts_with_buckets<'a>(
 ) -> Result<AVec<'a, Read>, ReadsError> {
     let mut rows: AVec<'a, Read> = AVec::new_in(alloc);
     let mut bucket_facts = super::buckets::BucketReadUnion::new(alloc);
+    let mut cached_sight: Option<super::buckets::Sight<'_>> = None;
+    let mut unread_added = false;
+    let mut traits_added: blaze_hash::HashSet<tc::ItemKey, Alloc<'a>> = blaze_hash::HashSet::new_in(alloc);
     for (i, &q) in questions.iter().enumerate() {
         let answer = answers.and_then(|all| all.get(i).copied());
         rows.push(Read { fact: fact_of(q, module, paths, segments)?, answer });
@@ -417,13 +420,39 @@ pub fn facts_with_buckets<'a>(
         let bucket_row = |bucket: &super::buckets::BucketRead| Read { fact: Fact { kind: FactKind::CrateBucket, key: bucket.krate, detail: bucket.bucket }, answer: Some(bucket.answer) };
         match q {
             Question::ImplsOf(trait_, shape) => {
-                // A shared borrow of the buckets' index, held over this question's rows only.
-                let read = b.trait_reads(trait_, shape);
-                if read.is_empty() {
-                    continue;
+                let mut sight_err = None;
+                b.with_trait_reads(trait_, shape, |own, shared| {
+                    let empty = own.is_empty() && shared.is_none_or(|(u, t)| u.is_empty() && t.is_empty());
+                    if empty {
+                        return;
+                    }
+                    let sight = match cached_sight {
+                        Some(s) => s,
+                        None => match b.sight_made(seen) {
+                            Ok(s) => {
+                                cached_sight = Some(s);
+                                s
+                            }
+                            Err(e) => {
+                                sight_err = Some(ReadsError::Unseen(e));
+                                return;
+                            }
+                        },
+                    };
+                    rows.extend(own.iter().filter(|bucket| sight.sees_read(bucket) && bucket_facts.keep_fact(bucket)).map(bucket_row));
+                    if let Some((unread, trait_filter)) = shared {
+                        if !unread_added {
+                            unread_added = true;
+                            rows.extend(unread.iter().filter(|bucket| sight.sees_read(bucket) && bucket_facts.keep_fact(bucket)).map(bucket_row));
+                        }
+                        if traits_added.insert(trait_) {
+                            rows.extend(trait_filter.iter().filter(|bucket| sight.sees_read(bucket) && bucket_facts.keep_fact(bucket)).map(bucket_row));
+                        }
+                    }
+                });
+                if let Some(err) = sight_err {
+                    return Err(err);
                 }
-                let sight = b.sight_made(seen).map_err(ReadsError::Unseen)?;
-                rows.extend(read.iter().filter(|bucket| sight.sees_read(bucket) && bucket_facts.keep_fact(bucket)).map(bucket_row));
             }
             Question::Inherent(shape, _) => rows.extend(b.inherent_reads(shape).iter().filter(|bucket| bucket_facts.keep_fact(bucket)).map(bucket_row)),
             _ => {}
