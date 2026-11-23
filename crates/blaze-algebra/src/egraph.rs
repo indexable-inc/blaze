@@ -1044,6 +1044,7 @@ pub enum PatNode {
     Sqrt(usize),
     Tanh(usize),
     Abs(usize),
+    Fma(usize, usize, usize),
 }
 
 impl PatNode {
@@ -1132,6 +1133,17 @@ impl<A: Allocator + Copy> EGraph<A> {
                                 self.ematch_node(pat, pb, eb, s1, out);
                             }
                         }
+                        (PatNode::Fma(pa, pb, pc), ENode::Fma(ea, eb, ec)) => {
+                            let mut mid1: OwnVec<Subst, A> = OwnVec::new_in(self.alloc);
+                            self.ematch_node(pat, pa, ea, subst, &mut mid1);
+                            for &s1 in mid1.iter() {
+                                let mut mid2: OwnVec<Subst, A> = OwnVec::new_in(self.alloc);
+                                self.ematch_node(pat, pb, eb, s1, &mut mid2);
+                                for &s2 in mid2.iter() {
+                                    self.ematch_node(pat, pc, ec, s2, out);
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1203,6 +1215,12 @@ impl<A: Allocator + Copy> EGraph<A> {
             PatNode::Abs(a) => {
                 let ca = self.instantiate_pat(pat, a, subst)?;
                 self.add(ENode::Abs(ca))
+            }
+            PatNode::Fma(a, b, c) => {
+                let ca = self.instantiate_pat(pat, a, subst)?;
+                let cb = self.instantiate_pat(pat, b, subst)?;
+                let cc = self.instantiate_pat(pat, c, subst)?;
+                self.add(ENode::Fma(ca, cb, cc))
             }
         };
         Some(cid)

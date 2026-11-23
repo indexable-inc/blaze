@@ -241,9 +241,13 @@ version = "0.0.0"
 dependencies = [
  "blaze-algebra",
  "blaze-body",
+ "blaze-body-build",
+ "blaze-build",
+ "blaze-lir",
  "blaze-math",
  "blaze-own",
  "blaze-sim",
+ "blaze-typeck",
 ]
 
 [[package]]

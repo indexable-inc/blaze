@@ -32,8 +32,8 @@ use blaze_algebra::{
 };
 use blaze_body::{
     AggregateKind, BinOp, Block, BlockKind, Body, BodyBuilder, BuildError, Callee, ConstDecl,
-    ConstKind, Local, LocalDecl, LocalKind, Operand, Place, Role, Span, Stmt, StmtKind, UnOp,
-    Unwind, Value, Verified, VerifyError,
+    ConstKind, Local, LocalDecl, LocalKind, Operand, Place, Proj, Role, Span, Stmt, StmtKind,
+    UnOp, Unwind, Value, Verified, VerifyError,
     body::{ExprId as MirExprId, Mutbl, PTy},
     verify,
 };
@@ -129,6 +129,8 @@ pub enum BodyAlgebraError {
     MissingReturnValue { block: Block },
     /// Splicing required a [`MathOp`] for which the [`MathEmitter`] supplied no [`Callee`].
     MissingMathCallee { op: MathOp },
+    /// Splicing an [`Op::Select`] requires a `bool` type handle in the target type table.
+    MissingBoolType,
     /// Underlying `blaze-algebra` failure.
     Algebra(AlgebraError),
     /// Underlying `blaze-body` builder failure.
@@ -189,6 +191,9 @@ impl fmt::Display for BodyAlgebraError {
             Self::MissingMathCallee { op } => {
                 write!(f, "math emitter supplied no callee for {op:?}")
             }
+            Self::MissingBoolType => {
+                write!(f, "splicing Op::Select requires a bool type handle")
+            }
             Self::Algebra(e) => write!(f, "algebra error: {e}"),
             Self::Build(e) => write!(f, "body build error: {e:?}"),
             Self::Verify(e) => write!(f, "emitted body failed verify: {e:?}"),
@@ -198,12 +203,20 @@ impl fmt::Display for BodyAlgebraError {
 
 impl core::error::Error for BodyAlgebraError {}
 
+/// Portable scalar type handles used when splicing an [`ExprGraph`] into MIR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScalarTys {
+    pub f64_ty: PTy,
+    pub bool_ty: PTy,
+}
+
 /// Result of lifting a verified pure numeric [`blaze_body::Body`] into [`ExprGraph`].
 pub struct LiftedBody<A: Allocator + Copy> {
     pub graph: ExprGraph<A>,
     pub vars: OwnVec<VarId, A>,
     pub result: AlgExprId,
     pub f64_ty: PTy,
+    pub bool_ty: Option<PTy>,
 }
 
 fn bare_local(
@@ -219,40 +232,181 @@ fn bare_local(
     Ok(row.local)
 }
 
-fn lift_operand<A: Allocator + Copy>(
-    body: Verified<'_>,
-    block: Block,
-    stmt: Stmt,
-    op: Operand,
-    env: &[Option<AlgExprId>],
-    g: &mut ExprGraph<A>,
-) -> Result<AlgExprId, BodyAlgebraError> {
-    match op {
-        Operand::Copy(p) | Operand::Move(p) => {
-            let local = bare_local(body, block, stmt, p)?;
-            env.get(local.index())
-                .copied()
-                .flatten()
-                .ok_or(BodyAlgebraError::UnassignedLocal { block, stmt, local })
+const MAX_SWITCH_DEPTH: u32 = 16;
+const MAX_UNROLL_STEPS: u32 = 64;
+const MAX_ARRAY_ELEMS: usize = 16;
+
+type ElemSlots = [Option<AlgExprId>; MAX_ARRAY_ELEMS];
+
+#[derive(Clone, Copy)]
+enum PlaceTarget {
+    Bare(Local),
+    Elem(Local, usize),
+}
+
+struct LiftState<A: Allocator + Copy> {
+    env: OwnVec<Option<AlgExprId>, A>,
+    cmp_env: OwnVec<Option<AlgExprId>, A>,
+    int_env: OwnVec<Option<i64>, A>,
+    elem_env: OwnVec<Option<ElemSlots>, A>,
+    bool_ty: Option<PTy>,
+}
+
+impl<A: Allocator + Copy> LiftState<A> {
+    fn new_in(nlocals: usize, alloc: A) -> Self {
+        let mut env = OwnVec::with_capacity_in(nlocals, alloc);
+        let mut cmp_env = OwnVec::with_capacity_in(nlocals, alloc);
+        let mut int_env = OwnVec::with_capacity_in(nlocals, alloc);
+        let mut elem_env = OwnVec::with_capacity_in(nlocals, alloc);
+        for _ in 0..nlocals {
+            env.push(None);
+            cmp_env.push(None);
+            int_env.push(None);
+            elem_env.push(None);
         }
-        Operand::Const(c) => match body.konst(c).kind {
-            ConstKind::Scalar { bits } => Ok(g.lit(f64::from_bits(bits as u64))),
-            _ => Err(BodyAlgebraError::UnsupportedConst { block, stmt }),
-        },
+        Self { env, cmp_env, int_env, elem_env, bool_ty: None }
+    }
+
+    fn snapshot(&self, alloc: A) -> Self {
+        let n = self.env.len();
+        let mut env = OwnVec::with_capacity_in(n, alloc);
+        let mut cmp_env = OwnVec::with_capacity_in(n, alloc);
+        let mut int_env = OwnVec::with_capacity_in(n, alloc);
+        let mut elem_env = OwnVec::with_capacity_in(n, alloc);
+        for i in 0..n {
+            env.push(self.env[i]);
+            cmp_env.push(self.cmp_env[i]);
+            int_env.push(self.int_env[i]);
+            elem_env.push(self.elem_env[i]);
+        }
+        Self { env, cmp_env, int_env, elem_env, bool_ty: self.bool_ty }
+    }
+
+    fn set_scalar(&mut self, local: Local, expr: AlgExprId) {
+        let i = local.index();
+        self.env[i] = Some(expr);
+        self.cmp_env[i] = None;
+        self.int_env[i] = None;
+    }
+
+    fn set_int(&mut self, local: Local, val: i64) {
+        let i = local.index();
+        self.int_env[i] = Some(val);
+        self.env[i] = None;
+        self.cmp_env[i] = None;
+    }
+
+    fn set_cmp(&mut self, local: Local, cond: AlgExprId) {
+        let i = local.index();
+        self.cmp_env[i] = Some(cond);
+        self.env[i] = None;
+        self.int_env[i] = None;
+    }
+
+    fn set_elem(&mut self, local: Local, idx: usize, expr: AlgExprId) {
+        let slot = self.elem_env[local.index()].get_or_insert([None; MAX_ARRAY_ELEMS]);
+        slot[idx] = Some(expr);
     }
 }
 
-const MAX_SWITCH_DEPTH: u32 = 16;
-
-fn copy_env<A: Allocator + Copy>(
-    src: &[Option<AlgExprId>],
-    alloc: A,
-) -> OwnVec<Option<AlgExprId>, A> {
-    let mut out = OwnVec::with_capacity_in(src.len(), alloc);
-    for &x in src {
-        out.push(x);
+fn resolve_place(
+    body: Verified<'_>,
+    block: Block,
+    stmt: Stmt,
+    place: Place,
+    int_env: &[Option<i64>],
+) -> Result<PlaceTarget, BodyAlgebraError> {
+    let row = body.place(place);
+    if row.depth == 0 && row.proj.is_none() {
+        return Ok(PlaceTarget::Bare(row.local));
     }
-    out
+    if row.depth == 1 {
+        let idx = match row.proj {
+            Some(Proj::Field { index, .. }) => usize::try_from(index).ok(),
+            Some(Proj::ConstIndex { offset, from_end: false, .. }) => usize::try_from(offset).ok(),
+            Some(Proj::Index(idx_local)) => {
+                int_env.get(idx_local.index()).copied().flatten().and_then(|v| usize::try_from(v).ok())
+            }
+            _ => None,
+        };
+        if let Some(i) = idx
+            && i < MAX_ARRAY_ELEMS
+        {
+            return Ok(PlaceTarget::Elem(row.local, i));
+        }
+    }
+    Err(BodyAlgebraError::ProjectedPlace { block, stmt, place })
+}
+
+fn try_int_operand(body: Verified<'_>, f64_ty: PTy, op: Operand, int_env: &[Option<i64>]) -> Option<i64> {
+    match op {
+        Operand::Copy(p) | Operand::Move(p) => {
+            let row = body.place(p);
+            if row.depth == 0 && row.proj.is_none() {
+                int_env.get(row.local.index()).copied().flatten()
+            } else {
+                None
+            }
+        }
+        Operand::Const(c) => {
+            let decl = body.konst(c);
+            if decl.ty == f64_ty {
+                return None;
+            }
+            match decl.kind {
+                ConstKind::Scalar { bits } => Some(bits as i64),
+                _ => None,
+            }
+        }
+    }
+}
+
+fn lift_scalar_operand<A: Allocator + Copy>(
+    body: Verified<'_>,
+    f64_ty: PTy,
+    block: Block,
+    stmt: Stmt,
+    op: Operand,
+    state: &mut LiftState<A>,
+    vars: &mut OwnVec<VarId, A>,
+    g: &mut ExprGraph<A>,
+    alloc: A,
+) -> Result<AlgExprId, BodyAlgebraError> {
+    match op {
+        Operand::Copy(p) | Operand::Move(p) => match resolve_place(body, block, stmt, p, &state.int_env)? {
+            PlaceTarget::Bare(local) => state
+                .env
+                .get(local.index())
+                .copied()
+                .flatten()
+                .ok_or(BodyAlgebraError::UnassignedLocal { block, stmt, local }),
+            PlaceTarget::Elem(local, idx) => {
+                if let Some(eid) = state.elem_env[local.index()].and_then(|s| s[idx]) {
+                    return Ok(eid);
+                }
+                // Lazily bind elements of array/tuple argument locals (`Local(1..=args)`).
+                if local.0 >= 1 && local.0 <= body.args() {
+                    let mut buf = blaze_own::String::new_in(alloc);
+                    let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("a{}_{idx}", local.0 - 1));
+                    let (vid, eid) = g.var(buf.as_str());
+                    vars.push(vid);
+                    state.set_elem(local, idx, eid);
+                    return Ok(eid);
+                }
+                Err(BodyAlgebraError::UnassignedLocal { block, stmt, local })
+            }
+        },
+        Operand::Const(c) => {
+            let decl = body.konst(c);
+            if decl.ty != f64_ty {
+                return Err(BodyAlgebraError::UnsupportedConst { block, stmt });
+            }
+            match decl.kind {
+                ConstKind::Scalar { bits } => Ok(g.lit(f64::from_bits(bits as u64))),
+                _ => Err(BodyAlgebraError::UnsupportedConst { block, stmt }),
+            }
+        }
+    }
 }
 
 fn collect_reachable_blocks<A: Allocator + Copy>(
@@ -341,31 +495,26 @@ enum RegionEnd {
 
 fn lift_region<A: Allocator + Copy, R: MathResolver>(
     body: Verified<'_>,
+    f64_ty: PTy,
     math: &R,
     graph: &mut ExprGraph<A>,
+    vars: &mut OwnVec<VarId, A>,
     start: Block,
     stop_at: Option<Block>,
-    env: &mut OwnVec<Option<AlgExprId>, A>,
-    cmp_env: &mut OwnVec<Option<AlgExprId>, A>,
+    state: &mut LiftState<A>,
     depth: u32,
     alloc: A,
 ) -> Result<RegionEnd, BodyAlgebraError> {
-    let max_blocks = body.blocks();
-    let mut visited: OwnVec<bool, A> = OwnVec::with_capacity_in(max_blocks as usize, alloc);
-    for _ in 0..max_blocks {
-        visited.push(false);
-    }
-
+    let max_steps = body.blocks().saturating_mul(8).clamp(body.blocks(), MAX_UNROLL_STEPS);
     let mut cur = start;
     let mut steps = 0u32;
     loop {
         if stop_at == Some(cur) {
             return Ok(RegionEnd::ReachedJoin);
         }
-        if steps >= max_blocks || visited[cur.index()] {
+        if steps >= max_steps {
             return Err(BodyAlgebraError::CycleOrStepLimit { block: cur, steps });
         }
-        visited[cur.index()] = true;
         steps += 1;
 
         let brow = body.block(cur);
@@ -374,48 +523,90 @@ fn lift_region<A: Allocator + Copy, R: MathResolver>(
             match body.stmt(stmt).kind {
                 StmtKind::StorageLive(_) | StmtKind::StorageDead(_) => {}
                 StmtKind::Assign { dest, value } => {
-                    let local = bare_local(body, cur, stmt, dest)?;
-                    match value {
-                        Value::Use(op) => {
-                            let expr = lift_operand(body, cur, stmt, op, env, graph)?;
-                            env[local.index()] = Some(expr);
-                            cmp_env[local.index()] = None;
+                    let target = resolve_place(body, cur, stmt, dest, &state.int_env)?;
+                    match (target, value) {
+                        (PlaceTarget::Bare(local), Value::Use(op)) => {
+                            if let Some(iv) = try_int_operand(body, f64_ty, op, &state.int_env) {
+                                state.set_int(local, iv);
+                            } else {
+                                let expr = lift_scalar_operand(
+                                    body, f64_ty, cur, stmt, op, state, vars, graph, alloc,
+                                )?;
+                                state.set_scalar(local, expr);
+                            }
                         }
-                        Value::Unary { op: UnOp::Neg, operand } => {
-                            let a = lift_operand(body, cur, stmt, operand, env, graph)?;
-                            env[local.index()] = Some(graph.neg(a));
-                            cmp_env[local.index()] = None;
+                        (PlaceTarget::Elem(local, idx), Value::Use(op)) => {
+                            let expr = lift_scalar_operand(
+                                body, f64_ty, cur, stmt, op, state, vars, graph, alloc,
+                            )?;
+                            state.set_elem(local, idx, expr);
                         }
-                        Value::Binary { op, lhs, rhs } => {
-                            let a = lift_operand(body, cur, stmt, lhs, env, graph)?;
-                            let b = lift_operand(body, cur, stmt, rhs, env, graph)?;
-                            match op {
-                                BinOp::Add => {
-                                    env[local.index()] = Some(graph.add(a, b));
-                                    cmp_env[local.index()] = None;
+                        (PlaceTarget::Bare(local), Value::Aggregate { kind: AggregateKind::Array | AggregateKind::Tuple, operands, .. }) => {
+                            if operands.len() as usize > MAX_ARRAY_ELEMS {
+                                return Err(BodyAlgebraError::UnsupportedValue { block: cur, stmt });
+                            }
+                            let mut slots: ElemSlots = [None; MAX_ARRAY_ELEMS];
+                            for (k, op) in body.ops(operands).enumerate() {
+                                slots[k] = Some(lift_scalar_operand(
+                                    body, f64_ty, cur, stmt, op, state, vars, graph, alloc,
+                                )?);
+                            }
+                            state.elem_env[local.index()] = Some(slots);
+                            state.env[local.index()] = None;
+                            state.int_env[local.index()] = None;
+                            state.cmp_env[local.index()] = None;
+                        }
+                        (PlaceTarget::Bare(local), Value::Unary { op: UnOp::Neg, operand }) => {
+                            if let Some(iv) = try_int_operand(body, f64_ty, operand, &state.int_env) {
+                                state.set_int(local, iv.wrapping_neg());
+                            } else {
+                                let a = lift_scalar_operand(
+                                    body, f64_ty, cur, stmt, operand, state, vars, graph, alloc,
+                                )?;
+                                state.set_scalar(local, graph.neg(a));
+                            }
+                        }
+                        (PlaceTarget::Bare(local), Value::Binary { op, lhs, rhs }) => {
+                            if let (Some(ia), Some(ib)) = (
+                                try_int_operand(body, f64_ty, lhs, &state.int_env),
+                                try_int_operand(body, f64_ty, rhs, &state.int_env),
+                            ) {
+                                let res = match op {
+                                    BinOp::Add => ia.wrapping_add(ib),
+                                    BinOp::Sub => ia.wrapping_sub(ib),
+                                    BinOp::Mul => ia.wrapping_mul(ib),
+                                    BinOp::Lt => i64::from(ia < ib),
+                                    BinOp::Le => i64::from(ia <= ib),
+                                    BinOp::Gt => i64::from(ia > ib),
+                                    BinOp::Ge => i64::from(ia >= ib),
+                                    BinOp::Eq => i64::from(ia == ib),
+                                    BinOp::Ne => i64::from(ia != ib),
+                                    _ => return Err(BodyAlgebraError::UnsupportedValue { block: cur, stmt }),
+                                };
+                                state.set_int(local, res);
+                            } else {
+                                let a = lift_scalar_operand(
+                                    body, f64_ty, cur, stmt, lhs, state, vars, graph, alloc,
+                                )?;
+                                let b = lift_scalar_operand(
+                                    body, f64_ty, cur, stmt, rhs, state, vars, graph, alloc,
+                                )?;
+                                match op {
+                                    BinOp::Add => state.set_scalar(local, graph.add(a, b)),
+                                    BinOp::Sub => state.set_scalar(local, graph.sub(a, b)),
+                                    BinOp::Mul => state.set_scalar(local, graph.mul(a, b)),
+                                    BinOp::Div => state.set_scalar(local, graph.div(a, b)),
+                                    // Comparisons produce a signed condition expression (> 0 when true).
+                                    BinOp::Gt | BinOp::Ge => {
+                                        state.bool_ty.get_or_insert(body.local(local).ty);
+                                        state.set_cmp(local, graph.sub(a, b));
+                                    }
+                                    BinOp::Lt | BinOp::Le => {
+                                        state.bool_ty.get_or_insert(body.local(local).ty);
+                                        state.set_cmp(local, graph.sub(b, a));
+                                    }
+                                    _ => return Err(BodyAlgebraError::UnsupportedValue { block: cur, stmt }),
                                 }
-                                BinOp::Sub => {
-                                    env[local.index()] = Some(graph.sub(a, b));
-                                    cmp_env[local.index()] = None;
-                                }
-                                BinOp::Mul => {
-                                    env[local.index()] = Some(graph.mul(a, b));
-                                    cmp_env[local.index()] = None;
-                                }
-                                BinOp::Div => {
-                                    env[local.index()] = Some(graph.div(a, b));
-                                    cmp_env[local.index()] = None;
-                                }
-                                // Comparisons produce a signed condition expression (> 0 when true).
-                                BinOp::Gt | BinOp::Ge => {
-                                    cmp_env[local.index()] = Some(graph.sub(a, b));
-                                    env[local.index()] = None;
-                                }
-                                BinOp::Lt | BinOp::Le => {
-                                    cmp_env[local.index()] = Some(graph.sub(b, a));
-                                    env[local.index()] = None;
-                                }
-                                _ => return Err(BodyAlgebraError::UnsupportedValue { block: cur, stmt }),
                             }
                         }
                         _ => return Err(BodyAlgebraError::UnsupportedValue { block: cur, stmt }),
@@ -426,6 +617,20 @@ fn lift_region<A: Allocator + Copy, R: MathResolver>(
                     break;
                 }
                 StmtKind::Switch { on, cases, otherwise } => {
+                    // 1. Constant-trip-count loop / static integer branch: take the known target!
+                    if let Some(iv) = try_int_operand(body, f64_ty, on, &state.int_env) {
+                        let discr = iv as u64 as u128;
+                        let mut target = otherwise;
+                        for (val, blk) in body.cases(cases) {
+                            if val == discr {
+                                target = blk;
+                                break;
+                            }
+                        }
+                        cur = target;
+                        break;
+                    }
+                    // 2. Dynamic float comparison branch: lift diamond / early-return into Op::Select!
                     if depth >= MAX_SWITCH_DEPTH || cases.len() != 1 {
                         return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt });
                     }
@@ -438,7 +643,8 @@ fn lift_region<A: Allocator + Copy, R: MathResolver>(
                     let cond_expr = match on {
                         Operand::Copy(p) | Operand::Move(p) => {
                             let loc = bare_local(body, cur, stmt, p)?;
-                            cmp_env
+                            state
+                                .cmp_env
                                 .get(loc.index())
                                 .copied()
                                 .flatten()
@@ -446,39 +652,23 @@ fn lift_region<A: Allocator + Copy, R: MathResolver>(
                         }
                         _ => return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt }),
                     };
-                    let mut env_then = copy_env(env, alloc);
-                    let mut cmp_then = copy_env(cmp_env, alloc);
-                    let mut env_else = copy_env(env, alloc);
-                    let mut cmp_else = copy_env(cmp_env, alloc);
+                    let mut st_then = state.snapshot(alloc);
+                    let mut st_else = state.snapshot(alloc);
 
                     if let Some(bb_join) = find_join_block(body, bb_then, otherwise, alloc) {
                         let r_then = lift_region(
-                            body,
-                            math,
-                            graph,
-                            bb_then,
-                            Some(bb_join),
-                            &mut env_then,
-                            &mut cmp_then,
-                            depth + 1,
-                            alloc,
+                            body, f64_ty, math, graph, vars, bb_then, Some(bb_join), &mut st_then,
+                            depth + 1, alloc,
                         )?;
                         let r_else = lift_region(
-                            body,
-                            math,
-                            graph,
-                            otherwise,
-                            Some(bb_join),
-                            &mut env_else,
-                            &mut cmp_else,
-                            depth + 1,
-                            alloc,
+                            body, f64_ty, math, graph, vars, otherwise, Some(bb_join), &mut st_else,
+                            depth + 1, alloc,
                         )?;
                         match (r_then, r_else) {
                             (RegionEnd::ReachedJoin, RegionEnd::ReachedJoin) => {
-                                for i in 0..env.len() {
-                                    if env_then[i] != env_else[i] {
-                                        env[i] = match (env_then[i], env_else[i]) {
+                                for i in 0..state.env.len() {
+                                    if st_then.env[i] != st_else.env[i] {
+                                        state.env[i] = match (st_then.env[i], st_else.env[i]) {
                                             (Some(t), Some(e)) => Some(graph.select(cond_expr, t, e)),
                                             (Some(t), None) => Some(t),
                                             (None, Some(e)) => Some(e),
@@ -493,26 +683,12 @@ fn lift_region<A: Allocator + Copy, R: MathResolver>(
                         }
                     } else {
                         let r_then = lift_region(
-                            body,
-                            math,
-                            graph,
-                            bb_then,
-                            None,
-                            &mut env_then,
-                            &mut cmp_then,
-                            depth + 1,
-                            alloc,
+                            body, f64_ty, math, graph, vars, bb_then, None, &mut st_then,
+                            depth + 1, alloc,
                         )?;
                         let r_else = lift_region(
-                            body,
-                            math,
-                            graph,
-                            otherwise,
-                            None,
-                            &mut env_else,
-                            &mut cmp_else,
-                            depth + 1,
-                            alloc,
+                            body, f64_ty, math, graph, vars, otherwise, None, &mut st_else,
+                            depth + 1, alloc,
                         )?;
                         match (r_then, r_else) {
                             (RegionEnd::Returned(t), RegionEnd::Returned(e)) => {
@@ -534,7 +710,9 @@ fn lift_region<A: Allocator + Copy, R: MathResolver>(
                     }
                     let mut lifted_args: [AlgExprId; 3] = [AlgExprId(0); 3];
                     for (k, op) in body.ops(args).enumerate() {
-                        lifted_args[k] = lift_operand(body, cur, stmt, op, env, graph)?;
+                        lifted_args[k] = lift_scalar_operand(
+                            body, f64_ty, cur, stmt, op, state, vars, graph, alloc,
+                        )?;
                     }
                     let res_expr = match math_op {
                         MathOp::Sin => graph.sin(lifted_args[0]),
@@ -548,14 +726,15 @@ fn lift_region<A: Allocator + Copy, R: MathResolver>(
                         MathOp::Pow => graph.pow(lifted_args[0], lifted_args[1]),
                         MathOp::Fma => graph.fma(lifted_args[0], lifted_args[1], lifted_args[2]),
                     };
-                    let local = bare_local(body, cur, stmt, dest_place)?;
-                    env[local.index()] = Some(res_expr);
-                    cmp_env[local.index()] = None;
+                    match resolve_place(body, cur, stmt, dest_place, &state.int_env)? {
+                        PlaceTarget::Bare(local) => state.set_scalar(local, res_expr),
+                        PlaceTarget::Elem(local, idx) => state.set_elem(local, idx, res_expr),
+                    }
                     cur = next_block;
                     break;
                 }
                 StmtKind::Return => {
-                    let result = env[0].ok_or(BodyAlgebraError::MissingReturnValue { block: cur })?;
+                    let result = state.env[0].ok_or(BodyAlgebraError::MissingReturnValue { block: cur })?;
                     return Ok(RegionEnd::Returned(result));
                 }
                 _ => return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt }),
@@ -564,9 +743,9 @@ fn lift_region<A: Allocator + Copy, R: MathResolver>(
     }
 }
 
-/// Lift a verified pure acyclic scalar numeric `f64` [`blaze_body::Body`] (including comparison
-/// `Switch` diamond branches and nested `if/else` returns) into an [`ExprGraph`], mapping
-/// `Local(1..=args)` to `VarId(0..args)` and `Local(0)` to `result`.
+/// Lift a verified pure numeric `f64` [`blaze_body::Body`] — including comparison `Switch`
+/// diamond branches, nested `if/else` returns, constant-trip-count `for i in 0..K` loops, and
+/// fixed-size `[f64; N]` / tuple element indexing — into an [`ExprGraph`].
 pub fn lift_body<A: Allocator + Copy, R: MathResolver>(
     body: Verified<'_>,
     math: &R,
@@ -581,30 +760,32 @@ pub fn lift_body<A: Allocator + Copy, R: MathResolver>(
 
     let mut graph = ExprGraph::new_in(alloc);
     let mut vars: OwnVec<VarId, A> = OwnVec::with_capacity_in(nargs as usize, alloc);
-    let mut env: OwnVec<Option<AlgExprId>, A> = OwnVec::with_capacity_in(nlocals, alloc);
-    let mut cmp_env: OwnVec<Option<AlgExprId>, A> = OwnVec::with_capacity_in(nlocals, alloc);
-    for _ in 0..nlocals {
-        env.push(None);
-        cmp_env.push(None);
-    }
+    let mut state = LiftState::new_in(nlocals, alloc);
 
-    // Bind argument locals `Local(1..=args)` as symbolic variables.
+    // Bind scalar `f64` argument locals eagerly; aggregate (`[f64; N]` / tuple) args bind lazily per element.
     const ARG_NAMES: [&str; 8] = ["x", "y", "z", "w", "a", "b", "c", "d"];
     for i in 0..nargs {
-        let name = ARG_NAMES.get(i as usize).copied().unwrap_or("v");
-        let (vid, eid) = if (i as usize) < ARG_NAMES.len() {
-            graph.var(name)
-        } else {
-            let mut buf = blaze_own::String::new_in(alloc);
-            let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("arg{i}"));
-            graph.var(buf.as_str())
-        };
-        vars.push(vid);
-        env[(i + 1) as usize] = Some(eid);
+        let local = Local(i + 1);
+        if body.local(local).ty == f64_ty {
+            let name = ARG_NAMES.get(i as usize).copied().unwrap_or("v");
+            let (vid, eid) = if (i as usize) < ARG_NAMES.len() {
+                graph.var(name)
+            } else {
+                let mut buf = blaze_own::String::new_in(alloc);
+                let _ = core::fmt::Write::write_fmt(&mut buf, format_args!("arg{i}"));
+                graph.var(buf.as_str())
+            };
+            vars.push(vid);
+            state.env[local.index()] = Some(eid);
+        }
     }
 
-    match lift_region(body, math, &mut graph, Block(0), None, &mut env, &mut cmp_env, 0, alloc)? {
-        RegionEnd::Returned(result) => Ok(LiftedBody { graph, vars, result, f64_ty }),
+    match lift_region(
+        body, f64_ty, math, &mut graph, &mut vars, Block(0), None, &mut state, 0, alloc,
+    )? {
+        RegionEnd::Returned(result) => {
+            Ok(LiftedBody { graph, vars, result, f64_ty, bool_ty: state.bool_ty })
+        }
         RegionEnd::ReachedJoin => Err(BodyAlgebraError::MissingReturnValue { block: Block(0) }),
     }
 }
@@ -653,11 +834,11 @@ pub fn splice_body<A: Allocator + Copy, E: MathEmitter>(
     g: &ExprGraph<A>,
     root: AlgExprId,
     vars: &[VarId],
-    f64_ty: PTy,
+    tys: ScalarTys,
     math: &E,
     alloc: A,
 ) -> Result<Body<A>, BodyAlgebraError> {
-    splice_body_impl(g, &[root], vars, f64_ty, None, math, alloc)
+    splice_body_impl(g, &[root], vars, tys.f64_ty, Some(tys.bool_ty), None, math, alloc)
 }
 
 /// Splice multiple [`ExprId`](AlgExprId) roots (e.g. `[f, ∂f/∂x, ∂f/∂y]`) into a **single**
@@ -667,12 +848,12 @@ pub fn splice_multi_body<A: Allocator + Copy, E: MathEmitter>(
     g: &ExprGraph<A>,
     roots: &[AlgExprId],
     vars: &[VarId],
-    f64_ty: PTy,
+    tys: ScalarTys,
     array_ty: PTy,
     math: &E,
     alloc: A,
 ) -> Result<Body<A>, BodyAlgebraError> {
-    splice_body_impl(g, roots, vars, f64_ty, Some(array_ty), math, alloc)
+    splice_body_impl(g, roots, vars, tys.f64_ty, Some(tys.bool_ty), Some(array_ty), math, alloc)
 }
 
 fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
@@ -680,6 +861,7 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
     roots: &[AlgExprId],
     vars: &[VarId],
     f64_ty: PTy,
+    bool_ty: Option<PTy>,
     array_ty: Option<PTy>,
     math: &E,
     alloc: A,
@@ -729,9 +911,9 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
     let span = Span { lo: 0, hi: 0 };
 
     let mut next_temp_id = 0u32;
-    let mut alloc_temp = |b: &mut BodyBuilder<A>, mutbl: Mutbl| -> Place {
+    let mut alloc_temp_ty = |b: &mut BodyBuilder<A>, ty: PTy, mutbl: Mutbl| -> Place {
         let l = b.new_local(LocalDecl {
-            ty: f64_ty,
+            ty,
             kind: LocalKind::Temp(MirExprId(next_temp_id), Role::Value),
             mutbl,
         });
@@ -797,7 +979,7 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
             }
             Op::Neg(a) => {
                 let oa = node_ops[a.0 as usize].expect("postorder visited child");
-                let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Not) };
+                let dest = if is_single_root { ret_place } else { alloc_temp_ty(&mut b, f64_ty, Mutbl::Not) };
                 b.assign(dest, Value::Unary { op: UnOp::Neg, operand: oa }, span);
                 node_ops[id.0 as usize] = Some(Operand::Copy(dest));
             }
@@ -811,14 +993,14 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
                     Op::Div(_, _) => BinOp::Div,
                     _ => unreachable!(),
                 };
-                let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Not) };
+                let dest = if is_single_root { ret_place } else { alloc_temp_ty(&mut b, f64_ty, Mutbl::Not) };
                 b.assign(dest, Value::Binary { op: bin, lhs: oa, rhs: ob }, span);
                 node_ops[id.0 as usize] = Some(Operand::Copy(dest));
             }
             Op::Pow(a, b_id) => {
                 let oa = node_ops[a.0 as usize].expect("postorder visited base");
                 let ob = node_ops[b_id.0 as usize].expect("postorder visited exp");
-                let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Not) };
+                let dest = if is_single_root { ret_place } else { alloc_temp_ty(&mut b, f64_ty, Mutbl::Not) };
                 emit_math_call(&mut b, MathOp::Pow, &[oa, ob], dest, &mut cur_block)?;
                 node_ops[id.0 as usize] = Some(Operand::Copy(dest));
             }
@@ -842,11 +1024,12 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
                     Op::Abs(_) => MathOp::Abs,
                     _ => unreachable!(),
                 };
-                let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Not) };
+                let dest = if is_single_root { ret_place } else { alloc_temp_ty(&mut b, f64_ty, Mutbl::Not) };
                 emit_math_call(&mut b, mop, &[oa], dest, &mut cur_block)?;
                 node_ops[id.0 as usize] = Some(Operand::Copy(dest));
             }
             Op::Select(c_id, t_id, e_id) => {
+                let bty = bool_ty.ok_or(BodyAlgebraError::MissingBoolType)?;
                 let oc = node_ops[c_id.0 as usize].expect("postorder visited cond");
                 let ot = node_ops[t_id.0 as usize].expect("postorder visited then");
                 let oe = node_ops[e_id.0 as usize].expect("postorder visited else");
@@ -854,8 +1037,9 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
                     kind: ConstKind::Scalar { bits: u128::from(0.0_f64.to_bits()) },
                     ty: f64_ty,
                 });
-                let cmp_place = alloc_temp(&mut b, Mutbl::Not);
-                let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Mut) };
+                let cmp_place = alloc_temp_ty(&mut b, bty, Mutbl::Not);
+                let dest =
+                    if is_single_root { ret_place } else { alloc_temp_ty(&mut b, f64_ty, Mutbl::Mut) };
                 b.assign(
                     cmp_place,
                     Value::Binary { op: BinOp::Gt, lhs: oc, rhs: Operand::Const(zero_c) },
@@ -883,7 +1067,7 @@ fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
                 let oa = node_ops[a.0 as usize].expect("postorder visited fma a");
                 let ob = node_ops[b_id.0 as usize].expect("postorder visited fma b");
                 let oc = node_ops[c_id.0 as usize].expect("postorder visited fma c");
-                let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Not) };
+                let dest = if is_single_root { ret_place } else { alloc_temp_ty(&mut b, f64_ty, Mutbl::Not) };
                 emit_math_call(&mut b, MathOp::Fma, &[oa, ob, oc], dest, &mut cur_block)?;
                 node_ops[id.0 as usize] = Some(Operand::Copy(dest));
             }
@@ -944,7 +1128,39 @@ pub fn diff_body_with_plant<A: Allocator + Copy, R: MathResolver, E: MathEmitter
         let d = simplify_poly_expr(&mut lifted.graph, d)?;
         simplify(&mut lifted.graph, d)?
     };
-    splice_body(&lifted.graph, target, &lifted.vars, lifted.f64_ty, emit, alloc)
+    splice_body_impl(&lifted.graph, &[target], &lifted.vars, lifted.f64_ty, lifted.bool_ty, None, emit, alloc)
+}
+
+/// Unified MIR compiler pass selector for the MIR pipeline (`blaze-body-lower` → `blaze-algebra-body` → `blaze-body-build`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyTransform {
+    /// Simplify the MIR body under [`SimplifyOpts`] (e.g. `IeeeExact`, `FastMath`, `CpuFma`).
+    Simplify(SimplifyOpts),
+    /// Differentiate the MIR body with respect to argument `arg`.
+    Diff { arg: u32 },
+    /// Compile `[f, ∂f/∂x_0, ..., ∂f/∂x_{N-1}]` into one fused CSE MIR body returning `array_ty`.
+    ValueAndGrad { array_ty: PTy },
+    /// Compile the O(|V|) Hessian-Vector Product `H(f)(x) · v` into one `2*N`-arg CSE MIR body.
+    Hvp { array_ty: PTy },
+}
+
+/// Single compiler pass entry point running a [`BodyTransform`] over a verified [`blaze_body::Body`].
+pub fn run_body_transform<A: Allocator + Copy, R: MathResolver, E: MathEmitter>(
+    body: Verified<'_>,
+    transform: BodyTransform,
+    bounds: Option<&[Interval]>,
+    resolve: &R,
+    emit: &E,
+    alloc: A,
+) -> Result<Body<A>, BodyAlgebraError> {
+    match transform {
+        BodyTransform::Simplify(opts) => simplify_body_with(body, opts, bounds, resolve, emit, alloc),
+        BodyTransform::Diff { arg } => diff_body(body, arg, resolve, emit, alloc),
+        BodyTransform::ValueAndGrad { array_ty } => {
+            value_and_grad_body(body, array_ty, resolve, emit, alloc)
+        }
+        BodyTransform::Hvp { array_ty } => hvp_body(body, array_ty, resolve, emit, alloc),
+    }
 }
 
 /// End-to-end MIR → MIR algebraic simplification pass (exact polynomial cancellation + e-graph):
@@ -978,7 +1194,7 @@ pub fn simplify_body_with<A: Allocator + Copy, R: MathResolver, E: MathEmitter>(
         s = simplify_poly_expr(&mut lifted.graph, s)?;
     }
     let (s, _) = simplify_with(&mut lifted.graph, s, opts)?;
-    splice_body(&lifted.graph, s, &lifted.vars, lifted.f64_ty, emit, alloc)
+    splice_body_impl(&lifted.graph, &[s], &lifted.vars, lifted.f64_ty, lifted.bool_ty, None, emit, alloc)
 }
 
 /// End-to-end MIR → MIR O(|V|) Hessian-Vector Product pass: compiles a verified scalar function
@@ -1015,12 +1231,13 @@ pub fn hvp_body<A: Allocator + Copy, R: MathResolver, E: MathEmitter>(
         let h = simplify(&mut lifted.graph, h)?;
         roots.push(h);
     }
-    splice_multi_body(
+    splice_body_impl(
         &lifted.graph,
         roots.as_slice(),
         all_vars.as_slice(),
         lifted.f64_ty,
-        array_ty,
+        lifted.bool_ty,
+        Some(array_ty),
         emit,
         alloc,
     )
@@ -1040,7 +1257,16 @@ pub fn grad_bodies<A: Allocator + Copy, R: MathResolver, E: MathEmitter>(
     for &d in grads.iter() {
         let d = simplify_poly_expr(&mut lifted.graph, d)?;
         let d = simplify(&mut lifted.graph, d)?;
-        let mir = splice_body(&lifted.graph, d, &lifted.vars, lifted.f64_ty, emit, alloc)?;
+        let mir = splice_body_impl(
+            &lifted.graph,
+            &[d],
+            &lifted.vars,
+            lifted.f64_ty,
+            lifted.bool_ty,
+            None,
+            emit,
+            alloc,
+        )?;
         out.push(mir);
     }
     Ok(out)
@@ -1068,12 +1294,13 @@ pub fn value_and_grad_body<A: Allocator + Copy, R: MathResolver, E: MathEmitter>
         let d = simplify(&mut lifted.graph, d)?;
         roots.push(d);
     }
-    splice_multi_body(
+    splice_body_impl(
         &lifted.graph,
         roots.as_slice(),
         &lifted.vars,
         lifted.f64_ty,
-        array_ty,
+        lifted.bool_ty,
+        Some(array_ty),
         emit,
         alloc,
     )
