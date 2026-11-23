@@ -1075,7 +1075,7 @@ impl<S: Allocator + Copy, A: Allocator> Emit<'_, '_, S, A> {
     }
 }
 
-impl<A: Allocator + Clone> RewriteSink for Emit<'_, '_, A> {
+impl<S: Allocator + Copy, A: Allocator> RewriteSink for Emit<'_, '_, S, A> {
     type Error = Infallible;
 
     /// Appends, to `extra`, the word that stands for the body's `value` in the current block.

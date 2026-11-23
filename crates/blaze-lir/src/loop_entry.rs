@@ -693,12 +693,12 @@ impl<A: Allocator + Copy> Emit<'_, A> {
     }
 }
 
-struct LoopRewrite<'e, 'v, A: Allocator + Clone> {
+struct LoopRewrite<'e, 'v, A: Allocator + Copy> {
     emit: &'e mut Emit<'v, A>,
     inst: usize,
 }
 
-impl<A: Allocator + Clone> RewriteSink for LoopRewrite<'_, '_, A> {
+impl<A: Allocator + Copy> RewriteSink for LoopRewrite<'_, '_, A> {
     type Error = LoopEntryError;
 
     fn put_value(&mut self, value: u32) {
