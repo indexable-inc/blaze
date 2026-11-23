@@ -806,6 +806,113 @@ pub enum WalkError<E> {
     Visit(E),
 }
 
+/// Sink for [`rewrite_fields`]: appends an instruction's rewritten `extra` operands.
+pub(crate) trait RewriteSink {
+    type Error;
+
+    fn put_value(&mut self, value: u32);
+    fn put_block(&mut self, block: u32);
+    fn put_slot(&mut self, slot: u32) -> Result<(), Self::Error>;
+    fn push_word(&mut self, word: u32);
+    fn push_words(&mut self, words: &[u32]);
+}
+
+/// Appends the operands `fields` from `words` to `sink`, rewriting each value, block and slot.
+/// The mirror of [`walk`] (which hands no list's count), on a verified function.
+pub(crate) fn rewrite_fields<S: RewriteSink>(
+    words: &[u32],
+    fields: &[Field],
+    ty: Ty,
+    tys: &[u16],
+    sink: &mut S,
+) -> Result<(), S::Error> {
+    let mut at = 0;
+    let mut scrutinee = None;
+    for &field in fields {
+        match field {
+            Field::Value => {
+                scrutinee = Some(words[at]);
+                sink.put_value(words[at]);
+                at += 1;
+            }
+            Field::Block => {
+                sink.put_block(words[at]);
+                at += 1;
+            }
+            Field::Slot => {
+                sink.put_slot(words[at])?;
+                at += 1;
+            }
+            Field::Imm
+            | Field::Offset
+            | Field::IntCond
+            | Field::FloatCond
+            | Field::Rmw
+            | Field::Ref
+            | Field::Sig
+            | Field::Intrinsic
+            | Field::Asm => {
+                sink.push_word(words[at]);
+                at += 1;
+            }
+            Field::Target => at = rewrite_target(words, at, sink),
+            Field::Values => {
+                let count = words[at];
+                sink.push_word(count);
+                at += 1;
+                for _ in 0..count {
+                    sink.put_value(words[at]);
+                    at += 1;
+                }
+            }
+            Field::Blocks => {
+                let count = words[at];
+                sink.push_word(count);
+                at += 1;
+                for _ in 0..count {
+                    sink.put_block(words[at]);
+                    at += 1;
+                }
+            }
+            Field::Mask => {
+                let n = words[at] as usize;
+                sink.push_words(&words[at..at + 1 + n]);
+                at += 1 + n;
+            }
+            Field::Const => {
+                let n = ty.const_words() as usize;
+                sink.push_words(&words[at..at + n]);
+                at += n;
+            }
+            Field::Cases => {
+                let width = scrutinee.map_or(0, |it: u32| Ty(tys[it as usize]).const_words()) as usize;
+                let count = words[at];
+                sink.push_word(count);
+                at += 1;
+                for _ in 0..count {
+                    sink.push_words(&words[at..at + width]);
+                    at += width;
+                    at = rewrite_target(words, at, sink);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Appends the target at `words[at..]` (a block, a count, the arguments); where its words end.
+fn rewrite_target(words: &[u32], mut at: usize, sink: &mut impl RewriteSink) -> usize {
+    sink.put_block(words[at]);
+    let count = words[at + 1];
+    sink.push_word(count);
+    at += 2;
+    for _ in 0..count {
+        sink.put_value(words[at]);
+        at += 1;
+    }
+    at
+}
+
 #[cfg(test)]
 mod tests {
     use super::{INFOS, Layout, Op};

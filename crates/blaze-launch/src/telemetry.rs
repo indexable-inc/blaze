@@ -219,6 +219,31 @@ impl Event {
         EventKind::from_raw(self.kind)
     }
 
+    const fn slot_event(
+        kind: EventKind,
+        thread: u32,
+        slot: Slot,
+        ts_ns: u64,
+        a: u64,
+        span: SpanId,
+        parent: SpanId,
+    ) -> Event {
+        Event {
+            kind: kind as u8,
+            flags: 0,
+            cpu: CPU_UNKNOWN,
+            thread,
+            slot_or_op: slot.0,
+            _pad2: 0,
+            ts_ns,
+            a,
+            b: span.0,
+            c: parent.0,
+            d: 0,
+            e: 0,
+        }
+    }
+
     pub const fn span_enter(
         thread: u32,
         slot: Slot,
@@ -227,20 +252,7 @@ impl Event {
         span: SpanId,
         parent: SpanId,
     ) -> Event {
-        Event {
-            kind: EventKind::SpanEnter as u8,
-            flags: 0,
-            cpu: CPU_UNKNOWN,
-            thread,
-            slot_or_op: slot.0,
-            _pad2: 0,
-            ts_ns,
-            a: caller_lr,
-            b: span.0,
-            c: parent.0,
-            d: 0,
-            e: 0,
-        }
+        Self::slot_event(EventKind::SpanEnter, thread, slot, ts_ns, caller_lr, span, parent)
     }
 
     pub const fn span_exit(
@@ -251,20 +263,7 @@ impl Event {
         span: SpanId,
         parent: SpanId,
     ) -> Event {
-        Event {
-            kind: EventKind::SpanExit as u8,
-            flags: 0,
-            cpu: CPU_UNKNOWN,
-            thread,
-            slot_or_op: slot.0,
-            _pad2: 0,
-            ts_ns,
-            a: duration_ns,
-            b: span.0,
-            c: parent.0,
-            d: 0,
-            e: 0,
-        }
+        Self::slot_event(EventKind::SpanExit, thread, slot, ts_ns, duration_ns, span, parent)
     }
 
     pub const fn span_unwound(
@@ -275,37 +274,11 @@ impl Event {
         span: SpanId,
         parent: SpanId,
     ) -> Event {
-        Event {
-            kind: EventKind::SpanUnwound as u8,
-            flags: 0,
-            cpu: CPU_UNKNOWN,
-            thread,
-            slot_or_op: slot.0,
-            _pad2: 0,
-            ts_ns,
-            a: duration_ns,
-            b: span.0,
-            c: parent.0,
-            d: 0,
-            e: 0,
-        }
+        Self::slot_event(EventKind::SpanUnwound, thread, slot, ts_ns, duration_ns, span, parent)
     }
 
     pub const fn hook_hit(thread: u32, slot: Slot, ts_ns: u64, caller_lr: u64) -> Event {
-        Event {
-            kind: EventKind::HookHit as u8,
-            flags: 0,
-            cpu: CPU_UNKNOWN,
-            thread,
-            slot_or_op: slot.0,
-            _pad2: 0,
-            ts_ns,
-            a: caller_lr,
-            b: 0,
-            c: 0,
-            d: 0,
-            e: 0,
-        }
+        Self::slot_event(EventKind::HookHit, thread, slot, ts_ns, caller_lr, SpanId::NONE, SpanId::NONE)
     }
 
     pub const fn alloc(

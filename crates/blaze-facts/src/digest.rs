@@ -9,7 +9,7 @@ use core::hash::{Hash, Hasher};
 use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::ContentId;
 use blaze_own::{Alloc, Vec};
-use blaze_typeck::{Adt, FnSig, ItemKey, List, Name, PNode, PTy, PTys, StableHasher};
+use blaze_typeck::{Adt, FnSig, ItemKey, List, Name, PTy, PTys, StableHasher, node_shape};
 
 use crate::answer::{Answer, Literal, Resolved, Vocab};
 use crate::fact::{ConstOf, Fact, Ground, Instance, LitAt, Term};
@@ -29,7 +29,7 @@ pub struct Digester<'a> {
     /// A table's identity and a node's index to the digest of the term under it.
     memo: Map<((usize, usize), u32), u64, FixedState, Alloc<'a>>,
     work: Vec<(u32, bool), Alloc<'a>>,
-    kids: Vec<u32, Alloc<'a>>,
+    kids: Vec<PTy, Alloc<'a>>,
 }
 
 /// `core::hash::Hasher` over a `StableHasher`, every integer little-endian: what a derived
@@ -193,22 +193,22 @@ impl<'a> Digester<'a> {
             }
             let node = t.node(PTy(n)).map_err(|_| PAST)?;
             self.kids.clear();
-            children(t, node, &mut self.kids)?;
+            t.children_of(node, &mut self.kids).map_err(|_| PAST)?;
             if !expanded {
                 self.work.push((n, true));
                 for &c in self.kids.iter() {
-                    if c >= n {
+                    if c.0 >= n {
                         return Err(ORDER);
                     }
-                    self.work.push((c, false));
+                    self.work.push((c.0, false));
                 }
                 continue;
             }
             let mut le = Le(StableHasher::new("blaze-facts term"));
-            shape(node).hash(&mut le);
+            node_shape(node).hash(&mut le);
             let mut h = le.0;
-            for c in self.kids.iter() {
-                let d = self.memo.get(&(tab, *c)).copied().ok_or(ORDER)?;
+            for &c in self.kids.iter() {
+                let d = self.memo.get(&(tab, c.0)).copied().ok_or(ORDER)?;
                 h.u64(d);
             }
             self.memo.insert((tab, n), h.finish());
@@ -372,108 +372,6 @@ impl<'a> Digester<'a> {
             Answer::Unknown(_) | Answer::Missing => return Err(FactError::Malformed { what: "an unanswered fact digested" }),
         }
         Ok(self.take())
-    }
-}
-
-/// The children of a node, in order: its list's terms, then its direct terms, as blaze-typeck's
-/// `node_children` lists them (a future's output and interior too, as its read digest does).
-fn children(t: PTys<'_>, n: PNode, out: &mut Vec<u32, Alloc<'_>>) -> Result<(), FactError> {
-    let list = |l: List, out: &mut Vec<u32, Alloc<'_>>| -> Result<(), FactError> {
-        for i in l.range() {
-            out.push(t.list_slot(i).ok_or(PAST)?.0);
-        }
-        Ok(())
-    };
-    match n {
-        PNode::Bool
-        | PNode::Char
-        | PNode::Int(_)
-        | PNode::Uint(_)
-        | PNode::Float(_)
-        | PNode::Str
-        | PNode::Never
-        | PNode::Param(_)
-        | PNode::ConstParam(_)
-        | PNode::Error
-        | PNode::ExAuto(_)
-        | PNode::Foreign(_)
-        | PNode::Infer => Ok(()),
-        PNode::Future(_, o, i) => {
-            out.push(o.0);
-            out.push(i.0);
-            Ok(())
-        }
-        PNode::ConstValue { ty: p, .. } | PNode::Ref(_, p) | PNode::Ptr(_, p) | PNode::Slice(p) => {
-            out.push(p.0);
-            Ok(())
-        }
-        PNode::Array(e, len) => {
-            out.push(e.0);
-            out.push(len.0);
-            Ok(())
-        }
-        PNode::Pat(b, l) => {
-            out.push(b.0);
-            list(l, out)
-        }
-        PNode::Tuple(l)
-        | PNode::Adt(_, l)
-        | PNode::FnDef(_, l)
-        | PNode::FnPtr(l, _)
-        | PNode::Opaque(_, l)
-        | PNode::Dynamic(l)
-        | PNode::ExTrait(_, l)
-        | PNode::Closure { args: l, .. }
-        | PNode::Coroutine { args: l, .. }
-        | PNode::Alias { args: l, .. } => list(l, out),
-        PNode::ExProj { args, term, .. } => {
-            list(args, out)?;
-            out.push(term.0);
-            Ok(())
-        }
-    }
-}
-
-/// A node with its handles cleared: a list keeps its length, a term becomes `PTy(0)`, so the
-/// shape hashes what the node is and not where its children are (blaze-typeck's
-/// `hash_node_shape`).
-fn shape(n: PNode) -> PNode {
-    let p = PTy(0);
-    let l = |l: List| List { start: 0, len: l.len };
-    match n {
-        PNode::Tuple(x) => PNode::Tuple(l(x)),
-        PNode::Ref(m, _) => PNode::Ref(m, p),
-        PNode::Ptr(m, _) => PNode::Ptr(m, p),
-        PNode::Array(..) => PNode::Array(p, p),
-        PNode::Slice(_) => PNode::Slice(p),
-        PNode::Pat(_, x) => PNode::Pat(p, l(x)),
-        PNode::Adt(k, x) => PNode::Adt(k, l(x)),
-        PNode::FnDef(k, x) => PNode::FnDef(k, l(x)),
-        PNode::FnPtr(x, hdr) => PNode::FnPtr(l(x), hdr),
-        PNode::Closure { owner, ordinal, args } => PNode::Closure { owner, ordinal, args: l(args) },
-        PNode::Future(e, ..) => PNode::Future(e, p, p),
-        PNode::Coroutine { owner, ordinal, args } => PNode::Coroutine { owner, ordinal, args: l(args) },
-        PNode::Alias { trait_, name, args } => PNode::Alias { trait_, name, args: l(args) },
-        PNode::Opaque(k, x) => PNode::Opaque(k, l(x)),
-        PNode::ConstValue { bits, .. } => PNode::ConstValue { ty: p, bits },
-        PNode::Dynamic(x) => PNode::Dynamic(l(x)),
-        PNode::ExTrait(k, x) => PNode::ExTrait(k, l(x)),
-        PNode::ExProj { trait_, name, args, .. } => PNode::ExProj { trait_, name, args: l(args), term: p },
-        leaf @ (PNode::Bool
-        | PNode::Char
-        | PNode::Int(_)
-        | PNode::Uint(_)
-        | PNode::Float(_)
-        | PNode::Str
-        | PNode::Never
-        | PNode::Param(_)
-        | PNode::Infer
-        | PNode::Error
-        | PNode::ConstParam(_)
-        | PNode::ExAuto(_)
-        // Its own variant: the derived `Hash` gives it its own discriminant (the last, so no
-        // earlier node's digest moves).
-        | PNode::Foreign(_)) => leaf,
     }
 }
 

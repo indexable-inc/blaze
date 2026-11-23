@@ -1,0 +1,293 @@
+{
+  "schema": "blaze-dups-not/1",
+  "dismissed": [
+    {
+      "id": "04450ba900c2",
+      "a": "crates/blaze-trace/src/macros.rs::macro::error_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::info_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "1625fd532633",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "16ca42bee5cb",
+      "a": "crates/blaze-trace/src/macros.rs::macro::info",
+      "b": "crates/blaze-trace/src/macros.rs::macro::trace_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "1bca78fb67e8",
+      "a": "crates/blaze-trace/src/macros.rs::macro::error_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::info",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "1c216d125505",
+      "a": "crates/blaze-trace/src/macros.rs::macro::info_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "1ddbed4b265a",
+      "a": "crates/blaze-trace/src/macros.rs::macro::error_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::trace",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "1fac87251ab9",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::info",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "2237522dcd92",
+      "a": "crates/blaze-trace/src/macros.rs::macro::info_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "27878e394604",
+      "a": "crates/blaze-trace/src/macros.rs::macro::info",
+      "b": "crates/blaze-trace/src/macros.rs::macro::info_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "2a6fc7fddad8",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "32df9db09b2b",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug",
+      "b": "crates/blaze-trace/src/macros.rs::macro::error_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "3c0fc7c2dfb5",
+      "a": "crates/blaze-trace/src/macros.rs::macro::trace_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "3c55e63daeb7",
+      "a": "crates/blaze-trace/src/macros.rs::macro::error",
+      "b": "crates/blaze-trace/src/macros.rs::macro::info_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "439359b0f4ca",
+      "a": "crates/blaze-trace/src/macros.rs::macro::error_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::trace_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "4528f0f95a91",
+      "a": "crates/blaze-trace/src/macros.rs::macro::error",
+      "b": "crates/blaze-trace/src/macros.rs::macro::error_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "4e1b009ab2d2",
+      "a": "crates/blaze-lex/src/lexer.rs::fn::impl<'a>Cursor<'a>::lifetime_or_char",
+      "b": "crates/rustc_lexer/src/lib.rs::fn::impl<'a>Cursor<'a>::lifetime_or_char",
+      "reason": "rustc_lexer is the upstream reference oracle that blaze-lex SIMD lexer is tested against"
+    },
+    {
+      "id": "4e9e5d7faa21",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::error_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "4ff615f4c616",
+      "a": "crates/blaze-trace/src/macros.rs::macro::trace",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "512e78eb8f48",
+      "a": "crates/blaze-profile/src/stack.rs::fn::frame_pointer",
+      "b": "crates/blaze-trace/src/record.rs::fn::counter",
+      "reason": "counter reads hardware cycle counter (cntvct_el0/rdtsc) while frame_pointer reads x29/rbp"
+    },
+    {
+      "id": "515d4f214e03",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug",
+      "b": "crates/blaze-trace/src/macros.rs::macro::debug_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "5dfafa8540f5",
+      "a": "crates/blaze-trace/src/macros.rs::macro::error",
+      "b": "crates/blaze-trace/src/macros.rs::macro::trace",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "6b3cb361e861",
+      "a": "crates/blaze-trace/src/macros.rs::macro::error",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "6d5c42af4fce",
+      "a": "crates/blaze-trace/src/macros.rs::macro::error_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "73d10ed75239",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "797147b85ad8",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug",
+      "b": "crates/blaze-trace/src/macros.rs::macro::info",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "82405591b68d",
+      "a": "crates/blaze-trace/src/macros.rs::macro::warn",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "856b25fbbe3e",
+      "a": "crates/blaze-trace/src/macros.rs::macro::trace_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "85b0d5a82565",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::trace_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "96df1bb87ab4",
+      "a": "crates/blaze-trace/src/macros.rs::macro::info",
+      "b": "crates/blaze-trace/src/macros.rs::macro::trace",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "9edf09578c55",
+      "a": "crates/blaze-trace/src/macros.rs::macro::info",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "a245a55e8289",
+      "a": "crates/blaze-trace/src/macros.rs::macro::info",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "ad4f30105f05",
+      "a": "crates/blaze-lex/src/lexer.rs::fn::impl<'a>Cursor<'a>::number",
+      "b": "crates/rustc_lexer/src/lib.rs::fn::impl<'a>Cursor<'a>::number",
+      "reason": "rustc_lexer is the upstream reference oracle that blaze-lex SIMD lexer is tested against"
+    },
+    {
+      "id": "ad7a42e17144",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug",
+      "b": "crates/blaze-trace/src/macros.rs::macro::trace",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "b5d375ad21b8",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::info_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "b60dac33d4c1",
+      "a": "crates/blaze-trace/src/macros.rs::macro::error",
+      "b": "crates/blaze-trace/src/macros.rs::macro::trace_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "c2e9a0078de4",
+      "a": "crates/blaze-trace/src/macros.rs::macro::error",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "cc2f072da56b",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug",
+      "b": "crates/blaze-trace/src/macros.rs::macro::error",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "cc3de2fe5b64",
+      "a": "crates/blaze-trace/src/macros.rs::macro::error",
+      "b": "crates/blaze-trace/src/macros.rs::macro::info",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "d1a979d66c1c",
+      "a": "crates/blaze-trace/src/macros.rs::macro::trace",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "d62a0b8f8ffe",
+      "a": "crates/blaze-trace/src/macros.rs::macro::error_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "e27462e1e466",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug",
+      "b": "crates/blaze-trace/src/macros.rs::macro::info_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "e394a0748a4a",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug",
+      "b": "crates/blaze-trace/src/macros.rs::macro::warn",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "e4812cc11420",
+      "a": "crates/blaze-trace/src/macros.rs::macro::info_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::trace_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "e487470ef46e",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::error",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "ede1e5dcc089",
+      "a": "crates/blaze-trace/src/macros.rs::macro::info_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::trace",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "ef2f1edb4ce7",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug_span",
+      "b": "crates/blaze-trace/src/macros.rs::macro::trace",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "fb92717edf34",
+      "a": "crates/blaze-trace/src/macros.rs::macro::debug",
+      "b": "crates/blaze-trace/src/macros.rs::macro::trace_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    },
+    {
+      "id": "fd757a8db6e9",
+      "a": "crates/blaze-trace/src/macros.rs::macro::trace",
+      "b": "crates/blaze-trace/src/macros.rs::macro::trace_span",
+      "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
+    }
+  ]
+}
