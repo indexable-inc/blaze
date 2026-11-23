@@ -107,6 +107,15 @@ pub(crate) fn try_run() -> ClientOutcome {
     let Ok(conn) = blaze_sys::posix::net::connect_unix(sock_path) else {
         return ClientOutcome::Fallthrough { spawn_daemon: true };
     };
+    // Raise Unix socket buffers above macOS's 8 KiB default so large stdout payloads (e.g. 519 KB)
+    // stream in 1-2 syscalls instead of ~65 round-trips.
+    {
+        use blaze_sys::posix::net::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, setsockopt_int};
+        if setsockopt_int(conn.fd(), SOL_SOCKET, SO_RCVBUF, 512 << 10).is_err() {
+            let _ = setsockopt_int(conn.fd(), SOL_SOCKET, SO_RCVBUF, 256 << 10);
+        }
+        let _ = setsockopt_int(conn.fd(), SOL_SOCKET, SO_SNDBUF, 64 << 10);
+    }
 
     let Ok(frame) = bstd::mem::Frame::with_reserve(8 << 20, bstd::mem::Tag::Other) else {
         return ClientOutcome::Fallthrough { spawn_daemon: false };

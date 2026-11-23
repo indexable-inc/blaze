@@ -479,6 +479,28 @@ pub fn encode_shutdown<A: Allocator>(out: &mut Vec<u8, A>) {
     });
 }
 
+/// Encodes the length-prefixed CBOR header for [`ServerFrame::Out`] (`is_err == false`) or
+/// [`ServerFrame::Err`] (`is_err == true`) preceding `payload_len` raw bytes, allowing callers to
+/// stream large stdout/stderr slices via vectored send without copying the payload into a frame
+/// buffer.
+pub fn encode_chunk_header(is_err: bool, payload_len: usize) -> ([u8; 16], usize) {
+    let mut out = [0u8; 16];
+    let arr = cbor::Head::new(cbor::major::ARRAY, 3);
+    let form = cbor::Head::new(cbor::major::UINT, u64::from(FORM));
+    let kind = cbor::Head::new(cbor::major::UINT, if is_err { KIND_ERR } else { KIND_OUT });
+    let bytes_head = cbor::Head::new(cbor::major::BYTES, u64::try_from(payload_len).unwrap_or(u64::MAX));
+    let mut pos = 4usize;
+    for part in [arr.as_bytes(), form.as_bytes(), kind.as_bytes(), bytes_head.as_bytes()] {
+        if let Some(slot) = out.get_mut(pos..pos + part.len()) {
+            slot.copy_from_slice(part);
+        }
+        pos += part.len();
+    }
+    let body_len = u32::try_from((pos - 4).saturating_add(payload_len)).unwrap_or(u32::MAX);
+    out[..4].copy_from_slice(&body_len.to_le_bytes());
+    (out, pos)
+}
+
 /// Frames sent from the resident daemon back to a `blaze` client.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ServerFrame<'a> {
@@ -1082,5 +1104,28 @@ mod tests {
         let mut c3 = DaemonCore::new(DaemonConfig::SHIPPED, ver(b"v1"), key(4), 3, Nanos(0));
         assert_eq!(c3.on_shutdown(), Death::Shutdown);
         assert_eq!(c3.on_hello_check(ver(b"v1"), key(4)), Err(CannotServe::ShuttingDown));
+    }
+
+    #[test]
+    fn encode_chunk_header_matches_server_frame_encode() {
+        for &is_err in &[false, true] {
+            for &len in &[0usize, 1, 23, 24, 255, 256, 65_535, 65_536, 520_000] {
+                let payload = std::vec![0xABu8; len];
+                let arena = std::boxed::Box::new(blaze_own::Inline::<600_000>::new());
+                let mut expected = Vec::with_capacity_in(len + 32, &*arena);
+                let frame = if is_err {
+                    ServerFrame::Err(&payload)
+                } else {
+                    ServerFrame::Out(&payload)
+                };
+                frame.encode(&mut expected);
+
+                let (head, head_len) = encode_chunk_header(is_err, len);
+                let mut vectored = std::vec::Vec::with_capacity(head_len + len);
+                vectored.extend_from_slice(&head[..head_len]);
+                vectored.extend_from_slice(&payload);
+                assert_eq!(vectored.as_slice(), expected.as_slice(), "mismatch for is_err={is_err} len={len}");
+            }
+        }
     }
 }

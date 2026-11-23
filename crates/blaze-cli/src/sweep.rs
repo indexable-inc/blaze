@@ -42,20 +42,24 @@ pub(crate) const EXECUTOR_FILE: &str = "/blaze/facts/executor";
 /// The command reads the pins once, however many question files share them. These are the
 /// same pins used by ScriptSetup::open before a script can receive a successful reply.
 #[derive(Default)]
-struct FactFiles {
+struct FactFiles<'a> {
     setting: Option<blaze_proc_macro::spawn_route::SpawnSetting>,
+    exe_dir: Option<&'a str>,
 }
 
-impl FactFiles {
+impl<'a> FactFiles<'a> {
     fn read(&mut self, path: &str, alloc: blaze_own::Alloc<'_>) -> Result<ContentId, CliError> {
         if path == SHIM_FILE {
             let installed = || {
+                if let Some(dir) = self.exe_dir {
+                    return Ok::<_, CliError>(std::path::Path::new(dir).join(blaze_build_script::fact_shim::SHIM_NAME));
+                }
                 let exe = std::env::current_exe().map_err(|_| CliError::Text { what: "cannot locate blaze to follow the native fact shim image" })?;
                 let dir = exe.parent().ok_or(CliError::Text { what: "blaze has no parent folder for its native fact shim" })?;
                 Ok::<_, CliError>(dir.join(blaze_build_script::fact_shim::SHIM_NAME))
             };
             #[cfg(test)]
-            let shim = TEST_FACT_INPUTS.with_borrow(|inputs| inputs.as_ref().and_then(|(_, path)| path.clone())).map_or_else(installed, Ok)?;
+            let shim = self.exe_dir.is_none().then(|| TEST_FACT_INPUTS.with_borrow(|inputs| inputs.as_ref().and_then(|(_, path)| path.clone()))).flatten().map_or_else(installed, Ok)?;
             #[cfg(not(test))]
             let shim = installed()?;
             return match blaze_proc_macro::native_facts::image_digest(&shim) {
@@ -89,6 +93,25 @@ impl FactFiles {
             FactNow::NotAFact => Err(CliError::Text { what: "saved build-script reply names no question in the pinned fact table" }),
         }
     }
+}
+
+/// Verifies every [`FACT_MOUNT`] leaf row in `leaves` against today's host shim image (under
+/// `exe_dir` when provided, else beside `current_exe`) and pinned userland facts. Returns `true`
+/// iff every `FACT_MOUNT` row matches its stored digest.
+pub(crate) fn verify_fact_leaves(leaves: &Leaves<'_>, exe_dir: Option<&str>, frame: &Frame) -> bool {
+    let erased = blaze_own::Erased::new(frame);
+    let mut fact_files = FactFiles { setting: None, exe_dir };
+    for i in 0..leaves.len() {
+        let row = leaves.row(i);
+        let path = leaves.path(i);
+        if row.kind == LeafKind::ScriptFile && path.starts_with(FACT_MOUNT) {
+            match fact_files.read(path, erased.handle()) {
+                Ok(id) if id == row.id => {}
+                _ => return false,
+            }
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1024,7 +1047,7 @@ impl<S: Stamps> Follow<S> {
     /// [`Follow::follow_marked`] by the walk `W` ([`Batched`] or the control [`Serial`]).
     #[cfg_attr(not(test), allow(dead_code, reason = "the walks' test (tests/sweep_looks_tests.rs) asks each walk by name"))]
     pub(crate) fn follow_marked_by<'f, W: Walk>(&self, cx: &Cx, root: &Dir<ReadWrite>, home: Option<&Dir<ReadWrite>>, last: &Leaves<'_>, marked: Option<&[bool]>, frame: &'f Frame) -> Result<(Followed<'f>, u32), CliError> {
-        self.follow_served_by::<W>(cx, root, home, last, marked, None, frame)
+        self.follow_served_by::<W>(cx, root, home, last, marked, None, false, frame)
     }
 
     /// [`Follow::follow_served_by`] with the batched looks.
@@ -1038,7 +1061,25 @@ impl<S: Stamps> Follow<S> {
         served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
-        self.follow_served_by::<Batched>(cx, root, home, last, marked, served, frame)
+        self.follow_served_by::<Batched>(cx, root, home, last, marked, served, false, frame)
+    }
+
+    /// [`Follow::follow_served`] with optional `facts_vouched` proof from the resident daemon's
+    /// synchronous vnode watcher (skipping redundant 800 KB `blaze-fact-shim` re-hashing when
+    /// `KqueueVnode` proved all [`FACT_MOUNT`] inputs unchanged with 0 events).
+    #[expect(clippy::too_many_arguments, reason = "follow_served with explicit facts_vouched proof")]
+    pub(crate) fn follow_served_with_facts<'f>(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        home: Option<&Dir<ReadWrite>>,
+        last: &Leaves<'_>,
+        marked: Option<&[bool]>,
+        served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
+        facts_vouched: bool,
+        frame: &'f Frame,
+    ) -> Result<(Followed<'f>, u32), CliError> {
+        self.follow_served_by::<Batched>(cx, root, home, last, marked, served, facts_vouched, frame)
     }
 
     /// A served script observation can depend on paths beyond its recorded name, including
@@ -1046,6 +1087,7 @@ impl<S: Stamps> Follow<S> {
     /// is journal_sweep.rs `ServedReach`'s, folded into `marked`, so an unmarked row is kept
     /// here as any other. Each served row's ask is bracketed by two events in a span naming its
     /// kind, so the profile says what the served reads cost.
+    #[expect(clippy::too_many_arguments, reason = "sweep follow: each input one capability or proof")]
     pub(crate) fn follow_served_by<'f, W: Walk>(
         &self,
         cx: &Cx,
@@ -1054,6 +1096,7 @@ impl<S: Stamps> Follow<S> {
         last: &Leaves<'_>,
         marked: Option<&[bool]>,
         mut served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
+        facts_vouched: bool,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
         let cx = cx.span("sweep: stat each path the last answer read, and read only what its stamp does not prove");
@@ -1078,7 +1121,7 @@ impl<S: Stamps> Follow<S> {
             let path = last.path(i);
             let old_state = old.state();
             let fact_file = old.kind == LeafKind::ScriptFile && path.starts_with(FACT_MOUNT);
-            if unmarked(i) && !fact_file && old.kind != LeafKind::MacroFiles {
+            if unmarked(i) && (!fact_file || facts_vouched) && old.kind != LeafKind::MacroFiles {
                 now.push(old.kind, old.flags, path, old.stamp, old.id);
                 was.push(old_state);
                 continue;

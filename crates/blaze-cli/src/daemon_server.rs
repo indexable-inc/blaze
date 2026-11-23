@@ -126,6 +126,7 @@ pub(crate) fn run(
     let socket_path = socket_beneath_blaze(&checkout_key, frame)?;
 
     let exe = host.exe()?;
+    let exe_dir = exe.rsplit_once('/').map(|(dir, _)| dir);
     let mut own_exe = OwnExe::open(cx, fs, &exe, build).ok();
     let instance = rng.next_u64();
 
@@ -156,7 +157,7 @@ pub(crate) fn run(
 
     let alloc = heap.alloc();
     let home_blaze_abs = bstd::mem::format_in!(frame, "{}/{}", home_str.trim_end_matches('/'), crate::store::HOME_FOLDER);
-    let watcher = CheckoutWatcher::new(cx, &located.root, clock, root_abs, Some(home_blaze_abs.as_str()), alloc);
+    let watcher = CheckoutWatcher::new(cx, &located.root, clock, root_abs, Some(home_blaze_abs.as_str()), exe_dir, alloc);
 
     let producers = crate::producers::table(build.as_bytes());
     let tools = crate::engine_store::tools(&crate::home::tools(&producers, crate::lints::Lints::NONE.rules));
@@ -402,7 +403,7 @@ impl CheckoutState<'_> {
             return;
         }
         let _ = erased;
-        self.watcher.arm(pointer.key, &pointer.leaves);
+        self.watcher.arm(cx, root, pointer.key, &pointer.leaves, frame);
         let lint_step = crate::lints::of_root(cx, root, frame).map_or(blaze_lint::Step::Rust, |l| l.step);
         self.hot_answer = Some(HotAnswer {
             pointer_key: pointer.key,
@@ -469,24 +470,21 @@ impl CheckoutState<'_> {
 }
 
 /// Streams `Out` or `Err` chunks as framed `ServerFrame::Out` / `ServerFrame::Err` over the
-/// client's Unix socket.
+/// client's Unix socket using `Conn::send_vectored` (zero intermediate frame buffer allocation).
 struct ConnOutSink {
     conn: Arc<Conn, SharedAlloc<'static>>,
     stream: Stream,
-    alloc: SharedAlloc<'static>,
 }
 
 impl OutSink for ConnOutSink {
     fn write_chunk(&self, cx: &Cx, bytes: &[u8]) -> Result<(), &'static str> {
-        let mut frame = Vec::new_in(self.alloc);
+        let is_err = self.stream == Stream::Err;
         for chunk in bytes.chunks(MOST_CHUNK) {
-            frame.clear();
-            let msg = match self.stream {
-                Stream::Out => ServerFrame::Out(chunk),
-                Stream::Err => ServerFrame::Err(chunk),
-            };
-            msg.encode(&mut frame);
-            self.conn.send_all(cx, &frame).map_err(|_| "daemon client socket write failed")?;
+            let (head, head_len) = daemon::encode_chunk_header(is_err, chunk.len());
+            let head_slice = head.get(..head_len).unwrap_or(&[]);
+            self.conn
+                .send_vectored(cx, &[head_slice, chunk])
+                .map_err(|_| "daemon client socket write failed")?;
         }
         Ok(())
     }
@@ -551,28 +549,11 @@ fn serve_loop(
         })?;
 
         // POST-DONE work: client has ALREADY received `ServerFrame::Done` and closed!
+        // Note: any required watcher re-arm ALREADY ran BEFORE `ServerFrame::Done` so the client
+        // can never race an edit into an unarmed `kqueue`.
         if let Some(post) = post {
             crate::store::post_done_for_daemon(cx, &mut state.opened.lent, &state.opened.home, post.spawn_bg, daemon_err);
             state.store_gen = state.opened.lent.generation();
-            if post.needs_watch_refresh || post.wrote_pointer {
-                conns.scope(|frame| {
-                    state.try_arm_from_store(cx, checkout_root, post.env_fp, frame);
-                });
-            } else if let Some((pkey, lkey, facts, lint_step)) = post.certified_update {
-                if !state.watcher.is_armed_for(pkey) {
-                    conns.scope(|frame| {
-                        state.try_arm_from_store(cx, checkout_root, post.env_fp, frame);
-                    });
-                } else {
-                    state.hot_answer = Some(HotAnswer {
-                        pointer_key: pkey,
-                        lines_key: lkey,
-                        facts,
-                        lint_step,
-                        env_fp: post.env_fp,
-                    });
-                }
-            }
             if let Some(death) = core.on_request_done(nanos(clock, born), post.was_phase_rebuild) {
                 return Ok(death);
             }
@@ -587,10 +568,6 @@ fn serve_loop(
 struct PostDone {
     was_phase_rebuild: bool,
     spawn_bg: bool,
-    wrote_pointer: bool,
-    needs_watch_refresh: bool,
-    certified_update: Option<(Key, Key, crate::engine_answer::Facts, blaze_lint::Step)>,
-    env_fp: Option<EnvFingerprint>,
 }
 
 /// Serves one accepted Unix-socket client connection.
@@ -709,13 +686,13 @@ fn execute_check_request(
     let out = Out::with_sink_in(
         Stream::Out,
         out_tty,
-        ConnOutSink { conn: conn_arc.share(), stream: Stream::Out, alloc: shared },
+        ConnOutSink { conn: conn_arc.share(), stream: Stream::Out },
         shared,
     );
     let err = Out::with_sink_in(
         Stream::Err,
         err_tty,
-        ConnOutSink { conn: conn_arc.share(), stream: Stream::Err, alloc: shared },
+        ConnOutSink { conn: conn_arc.share(), stream: Stream::Err },
         shared,
     );
 
@@ -723,7 +700,7 @@ fn execute_check_request(
         Ok(pair) => pair,
         Err(msg) => {
             let _ = err.line(cx, format_args!("error: {msg}"));
-            return (Status::FAILED, PostDone { was_phase_rebuild: false, spawn_bg: false, wrote_pointer: false, needs_watch_refresh: false, certified_update: None, env_fp: None });
+            return (Status::FAILED, PostDone { was_phase_rebuild: false, spawn_bg: false });
         }
     };
     let flags = match crate::flags(&args).and_then(|f| {
@@ -733,7 +710,7 @@ fn execute_check_request(
         Ok(f) => f,
         Err(error) => {
             let _ = err.line(cx, format_args!("error: {error}"));
-            return (Status::FAILED, PostDone { was_phase_rebuild: false, spawn_bg: false, wrote_pointer: false, needs_watch_refresh: false, certified_update: None, env_fp: None });
+            return (Status::FAILED, PostDone { was_phase_rebuild: false, spawn_bg: false });
         }
     };
 
@@ -745,7 +722,7 @@ fn execute_check_request(
         Ok(r) => r,
         Err(error) => {
             let _ = err.line(cx, format_args!("error: {error}"));
-            return (Status::FAILED, PostDone { was_phase_rebuild: false, spawn_bg: false, wrote_pointer: false, needs_watch_refresh: true, certified_update: None, env_fp: None });
+            return (Status::FAILED, PostDone { was_phase_rebuild: false, spawn_bg: false });
         }
     };
     state.opened.lent.rearm_lease();
@@ -771,6 +748,7 @@ fn execute_check_request(
 
     if eligible_fast
         && let Some(hot) = state.hot_answer.as_ref()
+        && state.watcher.is_armed_for(hot.pointer_key)
         && hot.facts.printed.replayable
         && hot.facts.owed == 0
         && hot.env_fp.as_ref() == Some(&env_fp)
@@ -788,19 +766,12 @@ fn execute_check_request(
             began,
             frame,
         ) {
-            let pkey = hot.pointer_key;
-            let lkey = hot.lines_key;
-            let facts = hot.facts;
-            let lint_step = hot.lint_step;
+            state.store_gen = state.opened.lent.generation();
             return (
                 status,
                 PostDone {
                     was_phase_rebuild: false,
                     spawn_bg,
-                    wrote_pointer: false,
-                    needs_watch_refresh: false,
-                    certified_update: Some((pkey, lkey, facts, lint_step)),
-                    env_fp: Some(env_fp),
                 },
             );
         }
@@ -838,50 +809,76 @@ fn execute_check_request(
         }
     };
 
-    let mut dctx = DaemonCheckCtx {
-        opened: &state.opened,
-        watch: Some(poll),
-        hot_graph: &mut state.hot_graph,
-        out: DaemonCheckOut::default(),
+    let (status, dout) = {
+        let mut dctx = DaemonCheckCtx {
+            opened: &state.opened,
+            watch: Some(poll),
+            hot_graph: &mut state.hot_graph,
+            out: DaemonCheckOut::default(),
+        };
+        let status = match crate::engine_check::check_in_daemon(
+            cx,
+            &args,
+            fs,
+            Some(&env),
+            net,
+            host,
+            clock,
+            rng,
+            &out,
+            &err,
+            phases,
+            state.heap,
+            dir_handle,
+            state.checkout_root_abs.as_str(),
+            sdk_copied,
+            &mut dctx,
+        ) {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = err.line(cx, format_args!("error: {error}"));
+                Status::FAILED
+            }
+        };
+        (status, dctx.out)
     };
-    let status = match crate::engine_check::check_in_daemon(
-        cx,
-        &args,
-        fs,
-        Some(&env),
-        net,
-        host,
-        clock,
-        rng,
-        &out,
-        &err,
-        phases,
-        state.heap,
-        dir_handle,
-        state.checkout_root_abs.as_str(),
-        sdk_copied,
-        &mut dctx,
-    ) {
-        Ok(status) => status,
-        Err(error) => {
-            let _ = err.line(cx, format_args!("error: {error}"));
-            Status::FAILED
-        }
-    };
+    state.store_gen = state.opened.lent.generation();
 
-    let dout = dctx.out;
     let certified_update = dout
         .certified_facts
         .and_then(|(pkey, lkey, facts)| dout.lint_step.map(|ls| (pkey, lkey, facts, ls)));
+
+    // Keep the existing `KqueueVnode` alive across in-place `ready` edits (ZERO FDs closed,
+    // ZERO FDs reopened, ZERO race gap!). Only re-arm when structural changes occurred (rename,
+    // create, delete, phase rebuild, leaf set changed, store reopen, or unarmed watcher) — AND
+    // always re-arm BEFORE returning `ServerFrame::Done` so the client cannot race an edit!
+    let needs_watch_refresh = poll_needs_refresh
+        || reopened
+        || dout.was_phase_rebuild
+        || dout.leaf_set_changed
+        || !state.watcher.is_armed();
+
+    if needs_watch_refresh {
+        state.try_arm_from_store(cx, checkout_root, Some(env_fp), frame);
+    } else if let Some((pkey, lkey, facts, lint_step)) = certified_update {
+        state.watcher.set_armed_pointer(pkey);
+        state.hot_answer = Some(HotAnswer {
+            pointer_key: pkey,
+            lines_key: lkey,
+            facts,
+            lint_step,
+            env_fp: Some(env_fp),
+        });
+    } else {
+        // Request errored without producing a pointer: clear `hot_answer` while keeping the live watcher.
+        state.hot_answer = None;
+    }
+
     (
         status,
         PostDone {
             was_phase_rebuild: dout.was_phase_rebuild,
             spawn_bg: dout.spawn_bg,
-            wrote_pointer: dout.wrote_pointer,
-            needs_watch_refresh: poll_needs_refresh || reopened || dout.wrote_pointer,
-            certified_update,
-            env_fp: Some(env_fp),
         },
     )
 }
@@ -959,6 +956,8 @@ fn try_fast_certified(
     let journal_root = crate::journal_checkpoint::name(state.answer_root.as_str(), frame);
     let seeds_root = crate::engine_seeds::root_name(&state.tools, frame);
     let life = blaze_cas::plain::ROOT_LIFE_NS;
+    let mut reach_shards = Vec::new_in(frame);
+    crate::engine_answer::push_reach_shards_plain(&place, state.answer_root.as_str(), frame, &mut reach_shards);
     for root_name in [
         state.answer_root.as_str(),
         reach.as_str(),
@@ -968,6 +967,9 @@ fn try_fast_certified(
         seeds_root.as_str(),
     ] {
         let _ = place.renew(root_name, life);
+    }
+    for shard in &reach_shards {
+        let _ = place.renew(shard.as_str(), life);
     }
     let _ = place.renew(crate::store::roots::RootName::toolchain(state.toolchain).as_str(), crate::store::roots::TOOLCHAIN_LIFE_NS);
 

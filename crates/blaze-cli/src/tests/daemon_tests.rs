@@ -707,3 +707,402 @@ fn daemon_kqueue_vnode_zero_toctou_and_atomic_rename() {
         first_poll.paths.as_slice(),
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn daemon_catches_rapid_back_to_back_equal_length_and_type_error_edits() {
+    let mut scratch = Scratch::new("rapid");
+    let (d_home, d_proj) = scratch.lane("d", true);
+    let (s_home, s_proj) = scratch.lane("s", true);
+
+    let cargo_toml = "[package]\nname = \"rapid\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\npath = \"src/lib.rs\"\n";
+    let init_lib = "pub fn answer() -> u32 {\n    1000\n}\n";
+
+    for proj in [&d_proj, &s_proj] {
+        write_file(proj, "Cargo.toml", cargo_toml);
+        write_file(proj, "src/lib.rs", init_lib);
+    }
+
+    let sock = daemon_socket_path(&d_home, &d_proj);
+
+    // Cold check spawns daemon.
+    let d0 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let s0 = run_blaze(&s_proj, &s_home, &["check"], true);
+    assert_step_matches("rapid-0-cold", &d_proj, &d_home, &d0, &s_proj, &s_home, &s0);
+    assert!(wait_for_socket(&sock, SOCKET_WAIT), "daemon socket did not appear");
+    let pid = find_daemon_pid(&sock).expect("live daemon pid");
+
+    // Warm #1 records env_fp; Warm #2 hits fast path.
+    let d_w1 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let s_w1 = run_blaze(&s_proj, &s_home, &["check"], true);
+    assert_step_matches("rapid-w1", &d_proj, &d_home, &d_w1, &s_proj, &s_home, &s_w1);
+    let d_w2 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let s_w2 = run_blaze(&s_proj, &s_home, &["check"], true);
+    assert_step_matches("rapid-w2-fast", &d_proj, &d_home, &d_w2, &s_proj, &s_home, &s_w2);
+
+    // Back-to-back edits with 0 ms sleep!
+    // Edit #1 (same byte length = 37):
+    let edit1 = "pub fn answer() -> u32 {\n    1001\n}\n";
+    assert_eq!(edit1.len(), init_lib.len());
+    for proj in [&d_proj, &s_proj] {
+        write_file(proj, "src/lib.rs", edit1);
+    }
+    let d1 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let prof1 = std::fs::read_to_string(d_proj.join(".blaze/v2/profile.txt")).expect("read prof1");
+    assert!(
+        prof1.contains("driver: ready") && !prof1.contains("certificate stood"),
+        "edit #1 must run driver: ready, got:\n{prof1}",
+    );
+    // IMMEDIATELY (0 ms sleep!) write Edit #2 (EXACT SAME BYTE LENGTH!) before even running standalone for #1!
+    let edit2 = "pub fn answer() -> u32 {\n    1002\n}\n";
+    assert_eq!(edit2.len(), edit1.len());
+    write_file(&d_proj, "src/lib.rs", edit2);
+    let d2 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let prof2 = std::fs::read_to_string(d_proj.join(".blaze/v2/profile.txt")).expect("read prof2");
+    assert!(
+        prof2.contains("driver: ready") && !prof2.contains("certificate stood"),
+        "edit #2 (0ms after edit #1, equal length!) was MISSED! profile:\n{prof2}",
+    );
+    // IMMEDIATELY (0 ms sleep!) write Edit #3 (type error!):
+    let edit3 = "pub fn answer() -> u32 {\n    \"oops\"\n}\n";
+    write_file(&d_proj, "src/lib.rs", edit3);
+    let d3 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let prof3 = std::fs::read_to_string(d_proj.join(".blaze/v2/profile.txt")).expect("read prof3");
+    assert_eq!(d3.code, 1, "edit #3 (type error 0ms after edit #2) must fail with exit 1! profile:\n{prof3}");
+    assert!(
+        prof3.contains("driver: ready") && !prof3.contains("certificate stood"),
+        "edit #3 must run driver: ready, got:\n{prof3}",
+    );
+    // IMMEDIATELY (0 ms sleep!) write Edit #4 (fix edit!):
+    let edit4 = "pub fn answer() -> u32 {\n    1004\n}\n";
+    write_file(&d_proj, "src/lib.rs", edit4);
+    let d4 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let prof4 = std::fs::read_to_string(d_proj.join(".blaze/v2/profile.txt")).expect("read prof4");
+    assert_ne!(d4.code, 1, "edit #4 (fix 0ms after error edit) must clear error! profile:\n{prof4}");
+    assert!(
+        prof4.contains("driver: ready") && !prof4.contains("certificate stood"),
+        "edit #4 must run driver: ready, got:\n{prof4}",
+    );
+    // IMMEDIATELY (0 ms sleep!) atomic rename edit #5 (forces kqueue re-arm before Done!):
+    let edit5 = "pub fn answer() -> u32 {\n    1005\n}\n";
+    write_file(&d_proj, "src/.lib.rs.tmp", edit5);
+    std::fs::rename(d_proj.join("src/.lib.rs.tmp"), d_proj.join("src/lib.rs")).expect("atomic rename #5");
+    let d5 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let prof5 = std::fs::read_to_string(d_proj.join(".blaze/v2/profile.txt")).expect("read prof5");
+    assert!(
+        prof5.contains("driver: ready") && !prof5.contains("certificate stood"),
+        "edit #5 (atomic rename) must run driver: ready, got:\n{prof5}",
+    );
+    // IMMEDIATELY (0 ms sleep!) write Edit #6 (type error right after atomic-rename re-arm!):
+    let edit6 = "pub fn answer() -> u32 {\n    \"boom\"\n}\n";
+    write_file(&d_proj, "src/lib.rs", edit6);
+    let d6 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let prof6 = std::fs::read_to_string(d_proj.join(".blaze/v2/profile.txt")).expect("read prof6");
+    assert_eq!(d6.code, 1, "edit #6 (type error 0ms after atomic rename re-arm) was MISSED! profile:\n{prof6}");
+
+    // Now run standalone through the exact same sequence and verify every output matches byte-for-byte!
+    let s1 = run_blaze(&s_proj, &s_home, &["check"], true);
+    assert_eq!(normalize_root(&d1.stdout, &d_proj), normalize_root(&s1.stdout, &s_proj), "edit #1 stdout mismatch");
+    write_file(&s_proj, "src/lib.rs", edit2);
+    let s2 = run_blaze(&s_proj, &s_home, &["check"], true);
+    assert_eq!(normalize_root(&d2.stdout, &d_proj), normalize_root(&s2.stdout, &s_proj), "edit #2 stdout mismatch");
+    write_file(&s_proj, "src/lib.rs", edit3);
+    let s3 = run_blaze(&s_proj, &s_home, &["check"], true);
+    assert_eq!(d3.code, s3.code);
+    assert_eq!(normalize_root(&d3.stdout, &d_proj), normalize_root(&s3.stdout, &s_proj), "edit #3 stdout mismatch");
+    write_file(&s_proj, "src/lib.rs", edit4);
+    let s4 = run_blaze(&s_proj, &s_home, &["check"], true);
+    assert_eq!(d4.code, s4.code);
+    assert_eq!(normalize_root(&d4.stdout, &d_proj), normalize_root(&s4.stdout, &s_proj), "edit #4 stdout mismatch");
+    write_file(&s_proj, "src/lib.rs", edit5);
+    let s5 = run_blaze(&s_proj, &s_home, &["check"], true);
+    assert_eq!(normalize_root(&d5.stdout, &d_proj), normalize_root(&s5.stdout, &s_proj), "edit #5 stdout mismatch");
+    write_file(&s_proj, "src/lib.rs", edit6);
+    let s6 = run_blaze(&s_proj, &s_home, &["check"], true);
+    assert_step_matches("rapid-6-final-error", &d_proj, &d_home, &d6, &s_proj, &s_home, &s6);
+
+    // Fix once more, then verify the warm no-op immediately hits the fast path on the same daemon PID!
+    let edit7 = "pub fn answer() -> u32 {\n    1007\n}\n";
+    for proj in [&d_proj, &s_proj] {
+        write_file(proj, "src/lib.rs", edit7);
+    }
+    let d7 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let s7 = run_blaze(&s_proj, &s_home, &["check"], true);
+    assert_step_matches("rapid-7-fix", &d_proj, &d_home, &d7, &s_proj, &s_home, &s7);
+
+    let d8 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let s8 = run_blaze(&s_proj, &s_home, &["check"], true);
+    assert_step_matches("rapid-8-warm-fast", &d_proj, &d_home, &d8, &s_proj, &s_home, &s8);
+    let prof8 = std::fs::read_to_string(d_proj.join(".blaze/v2/profile.txt")).expect("read prof8");
+    assert!(
+        prof8.contains("resident daemon fast path"),
+        "expected warm no-op right after in-place fix edit to hit fast path, got:\n{prof8}",
+    );
+    assert_eq!(find_daemon_pid(&sock), Some(pid), "same daemon served all rapid edits");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn daemon_kqueue_unsettled_none_stamp_marks_dirty() {
+    use blaze_ids::ContentId;
+    use crate::daemon_watch::KqueueVnode;
+    use crate::sweep::{DIRECT_PATH, LeafKind, Leaves, Rows, Stamp};
+
+    let mut scratch = Scratch::new("kqnone");
+    let (_home, proj) = scratch.lane("k", false);
+
+    write_file(&proj, "Cargo.toml", "[package]\nname = \"kqnone\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write_file(&proj, "src/lib.rs", "pub fn a() -> u32 { 1 }\n");
+    write_file(&proj, "src/dup.rs", "pub fn b() -> u32 { 2 }\n");
+
+    let stat_of = |rel: &str| -> Stamp {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::symlink_metadata(proj.join(rel)).unwrap_or_else(|e| panic!("lstat {rel}: {e}"));
+        let ns = |secs: i64, nsec: i64| secs.cast_unsigned().wrapping_mul(1_000_000_000).wrapping_add(nsec.cast_unsigned());
+        Stamp {
+            len: md.len(),
+            mtime_ns: ns(md.mtime(), md.mtime_nsec()),
+            ctime_ns: ns(md.ctime(), md.ctime_nsec()),
+            ino: md.ino(),
+            dev: md.dev(),
+        }
+    };
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("frame");
+    let root_s = proj.to_string_lossy();
+    let zero_id = ContentId([0; 32]);
+
+    // Case 1: Unsettled file (`row.stamp = None`) + unsettled Listing dir (`row.stamp = None`)
+    // + duplicate path (`Slot` with `Some(stamp)` AND `ScriptFile` with `None`).
+    let mut rows = Rows::new_in(&frame);
+    rows.push(LeafKind::Manifest, 0, "Cargo.toml", Some(stat_of("Cargo.toml")), zero_id);
+    rows.push(LeafKind::Slot, 0, "src/lib.rs", None, zero_id);
+    rows.push(LeafKind::Slot, 0, "src/dup.rs", Some(stat_of("src/dup.rs")), zero_id);
+    rows.push(LeafKind::ScriptFile, DIRECT_PATH, "src/dup.rs", None, zero_id);
+    rows.push(LeafKind::Listing, 0, "src", None, zero_id);
+    let bytes = Leaves::bytes_in(&rows, &frame).expect("encode leaves");
+    let (leaves, _) = Leaves::of(&bytes).expect("decode leaves");
+
+    let mut kq = KqueueVnode::arm(&root_s, None, &leaves, alloc).expect("KqueueVnode::arm");
+    let first = kq.poll_dirty(&frame);
+    assert!(
+        first.paths.iter().any(|&p| p == "src/lib.rs"),
+        "unsettled file (`stamp = None`) MUST be marked dirty on first poll: {:?}",
+        first.paths.as_slice(),
+    );
+    assert!(
+        first.paths.iter().any(|&p| p == "src/dup.rs"),
+        "duplicate path with one `Some(stamp)` and one `None` MUST be marked dirty: {:?}",
+        first.paths.as_slice(),
+    );
+    assert!(
+        first.paths.iter().any(|&p| p == "src"),
+        "unsettled Listing dir (`stamp = None`) MUST be marked dirty: {:?}",
+        first.paths.as_slice(),
+    );
+    assert!(
+        !first.needs_refresh,
+        "stamp-only `None` mismatches on live watched inodes must NOT force a full kqueue rebuild",
+    );
+
+    // Second poll (after initial_dirty drained, with no disk writes) must be clean!
+    let second = kq.poll_dirty(&frame);
+    assert!(
+        second.paths.is_empty() && !second.needs_refresh && !second.full_rescan,
+        "second poll after draining initial_dirty with no edits must be clean: {:?}",
+        second.paths.as_slice(),
+    );
+
+    // Subsequent in-place write to the previously-unsettled file must still be caught synchronously!
+    write_file(&proj, "src/lib.rs", "pub fn a() -> u32 { 2 }\n");
+    let third = kq.poll_dirty(&frame);
+    assert!(
+        third.paths.iter().any(|&p| p == "src/lib.rs"),
+        "in-place write after draining initial_dirty must be caught: {:?}",
+        third.paths.as_slice(),
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn daemon_fast_certified_fires_with_direct_script_and_git_leaves() {
+    use blaze_ids::ContentId;
+    use crate::daemon_watch::KqueueVnode;
+    use crate::sweep::{DIRECT_PATH, EXECUTOR_FILE, LeafKind, Leaves, PINS_FILE, Rows, SHIM_FILE, Stamp};
+
+    let mut scratch = Scratch::new("fastsg");
+    let (_home, proj) = scratch.lane("g", false);
+    let fake_exe_dir = scratch.base.join("bin");
+    std::fs::create_dir_all(&fake_exe_dir).expect("mkdir fake_exe_dir");
+
+    write_file(&proj, "Cargo.toml", "[package]\nname = \"sg\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write_file(&proj, "src/lib.rs", "pub fn ok() -> u32 { 1 }\n");
+    write_file(&proj, "data.txt", "hello\n");
+
+    // Initialize a real git repository with one commit.
+    let run_git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&proj)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr),
+        );
+    };
+    run_git(&["init", "-b", "main"]);
+    run_git(&["add", "."]);
+    run_git(&["commit", "-m", "initial"]);
+
+    let stat_of = |rel: &str| -> Stamp {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::symlink_metadata(proj.join(rel)).unwrap_or_else(|e| panic!("lstat {rel}: {e}"));
+        let ns = |secs: i64, nsec: i64| secs.cast_unsigned().wrapping_mul(1_000_000_000).wrapping_add(nsec.cast_unsigned());
+        Stamp {
+            len: md.len(),
+            mtime_ns: ns(md.mtime(), md.mtime_nsec()),
+            ctime_ns: ns(md.ctime(), md.ctime_nsec()),
+            ino: md.ino(),
+            dev: md.dev(),
+        }
+    };
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("frame");
+    let root_s = proj.to_string_lossy();
+    let exe_s = fake_exe_dir.to_string_lossy();
+    let zero_id = ContentId([0; 32]);
+
+    // Compute real FACT_MOUNT digests matching `fake_exe_dir` (where shim is absent -> NONE)
+    // and this host's pinned Apple userland so `verify_fact_leaves` passes!
+    let erased = blaze_own::Erased::new(&frame);
+    let setting = blaze_proc_macro::fact_pins::command_spawn_setting(crate::graph::TRIPLE, erased.handle())
+        .expect("command_spawn_setting");
+    let pins_id = blaze_proc_macro::native_facts::pins_digest(setting.pins.as_ref(), erased.handle());
+    let exec_id = setting.executor_id(erased.handle()).unwrap_or(crate::engine_script_reads::NONE);
+    let shim_id = crate::engine_script_reads::NONE;
+
+    let mut rows = Rows::new_in(&frame);
+    rows.push(LeafKind::Manifest, 0, "Cargo.toml", Some(stat_of("Cargo.toml")), zero_id);
+    rows.push(LeafKind::Slot, 0, "src/lib.rs", Some(stat_of("src/lib.rs")), zero_id);
+    rows.push(LeafKind::ScriptFile, DIRECT_PATH, "data.txt", None, zero_id);
+    rows.push(LeafKind::ScriptFile, 0, PINS_FILE, None, pins_id);
+    rows.push(LeafKind::ScriptFile, 0, EXECUTOR_FILE, None, exec_id);
+    rows.push(LeafKind::ScriptFile, 0, SHIM_FILE, None, shim_id);
+    rows.push(LeafKind::ScriptGit, 0, "\nrev-parse HEAD", None, zero_id);
+    let bytes = Leaves::bytes_in(&rows, &frame).expect("encode leaves");
+    let (leaves, _) = Leaves::of(&bytes).expect("decode leaves");
+
+    let mut kq = KqueueVnode::arm_with_env(&root_s, None, Some(&exe_s), &leaves, true, &frame, alloc)
+        .expect("arm_with_env with direct script + FACT_MOUNT + ScriptGit");
+
+    // Poll #1 drains initial verification for `data.txt` (unstamped ScriptFile) and `git_dirty`
+    // (initial post-EV_ADD git check), WITHOUT requiring a full kqueue rebuild!
+    let p1 = kq.poll_dirty(&frame);
+    assert!(p1.paths.iter().any(|&p| p == "data.txt"), "unstamped ScriptFile must verify once on poll #1");
+    assert!(p1.git_dirty, "non-status ScriptGit must verify once on poll #1");
+    assert!(!p1.facts_dirty, "matching FACT_MOUNT leaves must be immediately clean");
+    assert!(!p1.needs_refresh, "initial verification must keep kqueue alive");
+
+    // Poll #2 (nothing changed) -> 100% CLEAN (fast certified path eligible)!
+    let p2 = kq.poll_dirty(&frame);
+    assert!(
+        p2.paths.is_empty() && !p2.git_dirty && !p2.facts_dirty && !p2.home_dirty && !p2.needs_refresh && !p2.full_rescan,
+        "expected completely clean poll #2 with direct script + FACT_MOUNT + ScriptGit leaves",
+    );
+
+    // Mutate direct ScriptFile `data.txt` -> immediately caught!
+    write_file(&proj, "data.txt", "changed\n");
+    let p3 = kq.poll_dirty(&frame);
+    assert!(
+        p3.paths.iter().any(|&p| p == "data.txt"),
+        "direct ScriptFile edit not detected: {:?}",
+        p3.paths.as_slice(),
+    );
+
+    // Next poll clean again without rebuilding kqueue!
+    let p4 = kq.poll_dirty(&frame);
+    assert!(p4.paths.is_empty() && !p4.git_dirty && !p4.facts_dirty && !p4.needs_refresh);
+
+    // New git commit on `main` -> immediately invalidates via `.git/refs/heads/main`!
+    run_git(&["commit", "--allow-empty", "-m", "second"]);
+    let p5 = kq.poll_dirty(&frame);
+    assert!(p5.git_dirty && p5.needs_refresh, "git commit MUST immediately set git_dirty + needs_refresh!");
+
+    // Creating `blaze-fact-shim` in `fake_exe_dir` (was absent at arm time) -> immediately invalidates facts!
+    std::fs::write(fake_exe_dir.join(blaze_build_script::fact_shim::SHIM_NAME), b"fake-shim").expect("write fake shim");
+    let p6 = kq.poll_dirty(&frame);
+    assert!(p6.facts_dirty && p6.needs_refresh, "creating blaze-fact-shim MUST immediately set facts_dirty + needs_refresh!");
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_end_to_end_fast_path_with_direct_script_file_leaf() {
+    let mut scratch = Scratch::new("e2esg");
+    let (d_home, d_proj) = scratch.lane("d", true);
+    let (s_home, s_proj) = scratch.lane("s", true);
+
+    let cargo_toml = "[package]\nname = \"sg_e2e\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\npath = \"src/lib.rs\"\n";
+    // Computed `include_str!(concat!(...))` produces a real `LeafKind::ScriptFile` with `DIRECT_PATH`.
+    let lib_rs = "pub fn data() -> &'static str {\n    include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/data.txt\"))\n}\n";
+
+    for proj in [&d_proj, &s_proj] {
+        write_file(proj, "Cargo.toml", cargo_toml);
+        write_file(proj, "src/lib.rs", lib_rs);
+        write_file(proj, "data.txt", "good\n");
+    }
+
+    let sock = daemon_socket_path(&d_home, &d_proj);
+
+    // Cold check spawns daemon.
+    let d1 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let s1 = run_blaze(&s_proj, &s_home, &["check"], true);
+    assert_step_matches("e2esg-1-cold", &d_proj, &d_home, &d1, &s_proj, &s_home, &s1);
+    assert!(wait_for_socket(&sock, SOCKET_WAIT), "daemon socket did not appear");
+
+    // Warm #1 drains initial verification of `data.txt` (unstamped ScriptFile) + records env_fp.
+    let d2 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let s2 = run_blaze(&s_proj, &s_home, &["check"], true);
+    assert_step_matches("e2esg-2-warm1", &d_proj, &d_home, &d2, &s_proj, &s_home, &s2);
+
+    // Warm #2 MUST hit `resident daemon fast path` even with a direct `ScriptFile` leaf!
+    let d3 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let s3 = run_blaze(&s_proj, &s_home, &["check"], true);
+    assert_step_matches("e2esg-3-warm-fast", &d_proj, &d_home, &d3, &s_proj, &s_home, &s3);
+    let prof3 = std::fs::read_to_string(d_proj.join(".blaze/v2/profile.txt")).expect("read prof3");
+    assert!(
+        prof3.contains("resident daemon fast path"),
+        "expected warm no-op with direct ScriptFile leaf to hit fast path, got:\n{prof3}",
+    );
+
+    // Editing `data.txt` MUST immediately invalidate the certificate and match standalone!
+    for proj in [&d_proj, &s_proj] {
+        write_file(proj, "data.txt", "updated-data\n");
+    }
+    let d4 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let s4 = run_blaze(&s_proj, &s_home, &["check"], true);
+    let prof4 = std::fs::read_to_string(d_proj.join(".blaze/v2/profile.txt")).expect("read prof4");
+    assert!(
+        !prof4.contains("certificate stood"),
+        "editing direct ScriptFile `data.txt` MUST invalidate cached answer! profile:\n{prof4}",
+    );
+    assert_step_matches("e2esg-4-script-file-edit", &d_proj, &d_home, &d4, &s_proj, &s_home, &s4);
+
+    // Next warm no-op immediately hits fast path again!
+    let d5 = run_blaze(&d_proj, &d_home, &["check"], false);
+    let s5 = run_blaze(&s_proj, &s_home, &["check"], true);
+    assert_step_matches("e2esg-5-warm-fast-again", &d_proj, &d_home, &d5, &s_proj, &s_home, &s5);
+    let prof5 = std::fs::read_to_string(d_proj.join(".blaze/v2/profile.txt")).expect("read prof5");
+    assert!(
+        prof5.contains("resident daemon fast path"),
+        "expected warm no-op after ScriptFile edit to hit fast path again, got:\n{prof5}",
+    );
+}

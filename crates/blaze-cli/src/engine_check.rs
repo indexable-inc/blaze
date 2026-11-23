@@ -306,12 +306,13 @@ impl From<EngineCheckError> for CliError {
     }
 }
 
-/// Cached `UnitGraph` crate-list bytes held by the resident daemon across incremental edits so
-/// `ready_setup` never re-allocates or leaks `sections.list` on every edit (Wave 7).
+/// Cached `UnitGraph` crate-list & pre-indexed `Names` tables held by the resident daemon across
+/// incremental edits so `ready_setup` skips `stored_graph_at`, `CrateList::open`, and ~3,300
+/// BLAKE3 digests in `Names::of_list` (Wave 7).
 pub(crate) struct HotGraph {
     pub(crate) key: blaze_drive::Key,
     pub(crate) out: blaze_ids::ContentId,
-    pub(crate) list_bytes: &'static [u8],
+    pub(crate) hot_list: crate::names::HotList,
 }
 
 /// Outcome returned from [`check_in_daemon`] to the resident daemon server so it can update
@@ -321,6 +322,7 @@ pub(crate) struct DaemonCheckOut {
     pub(crate) was_phase_rebuild: bool,
     pub(crate) spawn_bg: bool,
     pub(crate) wrote_pointer: bool,
+    pub(crate) leaf_set_changed: bool,
     pub(crate) certified: bool,
     pub(crate) lint_step: Option<blaze_lint::Step>,
     pub(crate) certified_facts: Option<(blaze_drive::Key, blaze_drive::Key, crate::engine_answer::Facts)>,
@@ -1552,14 +1554,14 @@ fn checking<'f, 'd>(
             let mut taken = crate::journal_sweep::Taken::begin(cx, root, phases.clock(), frame)?;
             match watch {
                 crate::daemon_watch::PollOutcome::Clean { crash_cursor } => {
-                    taken.vouched_kqueue(&[], crash_cursor);
+                    taken.vouched_kqueue(&[], crash_cursor, false, true);
                 }
-                crate::daemon_watch::PollOutcome::Dirty { paths, crash_cursor, .. } => {
+                crate::daemon_watch::PollOutcome::Dirty { paths, crash_cursor, force_script_asks, facts_clean, .. } => {
                     let mut copied: blaze_own::Vec<&str, &Frame> = blaze_own::Vec::with_capacity_in(paths.len(), frame);
                     for path in paths.iter() {
                         copied.push(frame.alloc_str(path));
                     }
-                    taken.vouched_kqueue(copied.into_bump_slice(), crash_cursor);
+                    taken.vouched_kqueue(copied.into_bump_slice(), crash_cursor, force_script_asks, facts_clean);
                 }
                 crate::daemon_watch::PollOutcome::FullRescan { crash_cursor, .. } => {
                     taken.full_rescan_daemon(crash_cursor);
@@ -1608,7 +1610,8 @@ fn checking<'f, 'd>(
         };
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
-        let (followed, statted) = follow.follow_served(cx, root, Some(opened.home.dir()), &pointer.leaves, marked.as_deref(), script_sweep.as_mut(), frame)?;
+        let facts_vouched = base != crate::engine_ready_edit::StoredBase::OtherCheckout && journal.facts_vouched();
+        let (followed, statted) = follow.follow_served_with_facts(cx, root, Some(opened.home.dir()), &pointer.leaves, marked.as_deref(), script_sweep.as_mut(), facts_vouched, frame)?;
         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
         sweep_counts = journal.counts(statted, u32::try_from(pointer.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&pointer.leaves, frame)).with_looks(followed.looks, follow_ns);
         // Set, then borrowed SHARED: `Option::insert` hands back a `&mut`, and `today_slots` below
@@ -2451,10 +2454,22 @@ fn checking<'f, 'd>(
         // Nothing read in place outlives the store's borrow of its `Lent` (engine_records.rs).
         drop(read);
         drop(store);
-        Ok(blaze_own::Box::new_in((finished.causes, report, saved, stored_keys, (task_pages_read, header_pages_read, pages_read), (tally, status, oracle), accounts, macro_modules, (heap_engine, heap_lines_made, heap_printed, heap_stored), driver_line, signatures_entered, audited), heap.alloc()))
+        let new_data_file = bodies.data_files().any(|(kind, path, _)| {
+            followed_kept.as_ref().is_none_or(|f| {
+                !f.now.rows.iter().any(|leaf| leaf.kind == kind.leaf() && f.now.path(leaf) == path)
+            })
+        });
+        let leaf_set_changed = matches!(driver_line, DriverLine::Phases(_))
+            || new_data_file
+            || !followed_all_kept
+            || file_counts.probed > 0
+            || serving.served.get().is_some();
+        Ok(blaze_own::Box::new_in((finished.causes, report, saved, stored_keys, (task_pages_read, header_pages_read, pages_read), (tally, status, oracle), accounts, macro_modules, (heap_engine, heap_lines_made, heap_printed, heap_stored), driver_line, signatures_entered, audited, leaf_set_changed), heap.alloc()))
     })?;
     // The whole cleanup line: this profile is written after the commit (store.rs).
     let is_phase_rebuild = matches!(answered.9, DriverLine::Phases(_));
+    let leaf_set_changed = answered.12;
+    let new_pointer_facts = (answered.2.pointer_key, answered.2.lines_key, answered.2.facts);
     let cleanup = match owned_opened {
         Some(owned) => crate::store::after_answer_printed(cx, owned.lent, &owned.home, false, phases.clock(), err)?,
         None => {
@@ -2463,16 +2478,17 @@ fn checking<'f, 'd>(
                 dout.was_phase_rebuild = is_phase_rebuild;
                 dout.spawn_bg = spawn_bg;
                 dout.wrote_pointer = true;
+                dout.leaf_set_changed = leaf_set_changed;
                 dout.certified = false;
                 dout.lint_step = Some(linting.step);
-                dout.certified_facts = None;
+                dout.certified_facts = Some(new_pointer_facts);
             }
             cleanup
         }
     };
     phases.mark_cx(cx, "store committed", frame);
     own_frame(|| -> Result<BoxedChecked, CliError> {
-        let (causes, report, saved, stored_keys, (task_pages_read, header_pages_read, pages_read), (tally, status, oracle), accounts, macro_modules, (heap_engine, heap_lines_made, heap_printed, heap_stored), driver_line, signatures_entered, audited) = blaze_own::Box::into_inner(answered);
+        let (causes, report, saved, stored_keys, (task_pages_read, header_pages_read, pages_read), (tally, status, oracle), accounts, macro_modules, (heap_engine, heap_lines_made, heap_printed, heap_stored), driver_line, signatures_entered, audited, _leaf_set_changed) = blaze_own::Box::into_inner(answered);
         #[cfg(test)]
         let (undefined_reads, head_rows, lint_rows) = audited;
         #[cfg(not(test))]
@@ -4094,40 +4110,57 @@ fn ready_setup<'f, 'h, 'a>(
     let name = Name::unit_graph();
     let Some(row) = start.row_facts(name).map_err(EngineError::from)? else { return Ok(Err(ReadyRefused::NoRow { name })) };
     let Some(key) = records.get(name)? else { return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::NoKey))) };
-    let (view, sections) = match crate::engine_units::stored_graph_at(&cx, store, key)? {
-        Ok(found) => found,
-        Err(why) => return Ok(Err(ReadyRefused::Graph(why))),
-    };
-    if view.out != row.out {
-        return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::Out { key })));
-    }
-    if sections.list.is_empty() {
-        return Ok(Err(ReadyRefused::NoList));
-    }
-    let names = {
+    let (names, cached_listed_roots) = {
         let _cx = cx.span("names: the crate list read back");
-        let held: &'static [u8] = match hot_graph {
-            Some(slot) => match slot.as_ref() {
-                Some(cached) if cached.key == key && cached.out == view.out => cached.list_bytes,
-                _ => {
-                    let mut held = Vec::with_capacity_in(sections.list.len(), env.heap.alloc());
-                    held.extend_from_slice(sections.list);
-                    let leaked: &'static [u8] = held.leak_static();
-                    *slot = Some(HotGraph { key, out: view.out, list_bytes: leaked });
-                    leaked
-                }
-            },
-            None => {
-                let mut held = Vec::with_capacity_in(sections.list.len(), env.heap.alloc());
-                held.extend_from_slice(sections.list);
-                held.leak_static()
+        let load_fresh = |store: &mut dyn crate::store::Store<'_>| -> Result<Result<(crate::names::Names<'_>, blaze_ids::ContentId), ReadyRefused>, CliError> {
+            let (view, sections) = match crate::engine_units::stored_graph_at(&cx, store, key)? {
+                Ok(found) => found,
+                Err(why) => return Ok(Err(ReadyRefused::Graph(why))),
+            };
+            if view.out != row.out {
+                return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::Out { key })));
             }
+            if sections.list.is_empty() {
+                return Ok(Err(ReadyRefused::NoList));
+            }
+            let mut held = Vec::with_capacity_in(sections.list.len(), env.heap.alloc());
+            held.extend_from_slice(sections.list);
+            let leaked: &'static [u8] = held.leak_static();
+            let names = match crate::names::Names::of_list(leaked, None, env.heap.alloc()) {
+                Ok(names) => names,
+                Err(crate::names::NamesError::List(why)) => return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::List { key, why }))),
+                Err(crate::names::NamesError::ListFact { row: at, what }) => return Ok(Err(ReadyRefused::ListFact { row: at, what })),
+                Err(_) => return Err(CliError::Text { what: "names.rs `of_list` refused the crate list by neither `List` nor `ListFact` (engine_check.rs `ready_setup`)" }),
+            };
+            Ok(Ok((names, view.out)))
         };
-        match crate::names::Names::of_list(held, None, env.heap.alloc()) {
-            Ok(names) => names,
-            Err(crate::names::NamesError::List(why)) => return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::List { key, why }))),
-            Err(crate::names::NamesError::ListFact { row: at, what }) => return Ok(Err(ReadyRefused::ListFact { row: at, what })),
-            Err(_) => return Err(CliError::Text { what: "names.rs `of_list` refused the crate list by neither `List` nor `ListFact` (engine_check.rs `ready_setup`)" }),
+        match hot_graph {
+            Some(slot) => {
+                let hit = slot.as_ref().is_some_and(|cached| cached.key == key && cached.out == row.out);
+                let names = if hit {
+                    let Some(cached) = slot.as_ref() else {
+                        return Err(CliError::Text { what: "hot_graph cache unexpectedly empty" });
+                    };
+                    crate::names::Names::from_hot_list(&cached.hot_list, env.heap.alloc())
+                } else {
+                    let (names, out) = match load_fresh(store)? {
+                        Ok(pair) => pair,
+                        Err(why) => return Ok(Err(why)),
+                    };
+                    let hot_list = names.to_hot_list(env.heap.alloc());
+                    *slot = Some(HotGraph { key, out, hot_list });
+                    names
+                };
+                let roots = slot.as_ref().map(|cached| cached.hot_list.listed_roots.as_slice());
+                (names, roots)
+            }
+            None => {
+                let (names, _) = match load_fresh(store)? {
+                    Ok(pair) => pair,
+                    Err(why) => return Ok(Err(why)),
+                };
+                (names, None)
+            }
         }
     };
     crate::names::tell_public(store, &names);
@@ -4136,7 +4169,7 @@ fn ready_setup<'f, 'h, 'a>(
     // targets as [`plan`] finds them: a target root (a place that is its own crate root, as
     // every member target's root is: they are the first wave) the crate list does not list.
     let mut listed: SSet<'h, Name> = SSet::new_in(alloc);
-    {
+    if cached_listed_roots.is_none() {
         let list = names.list();
         for r in 0..blaze_world::crate_list::CrateGraph::len(list) {
             if let Some(file) = list.root(r).strip_prefix("/0/") {
@@ -4150,7 +4183,11 @@ fn ready_setup<'f, 'h, 'a>(
     let mut skipped_files: SVec<'h, Name> = SVec::new_in(alloc);
     let mut unnoted = 0usize;
     for (&file, place) in last.places.iter() {
-        if place.unit == file && !listed.contains(&file) {
+        let is_listed = match cached_listed_roots {
+            Some(roots) => roots.binary_search(&file).is_ok(),
+            None => listed.contains(&file),
+        };
+        if place.unit == file && !is_listed {
             let noted = match last_lines.block(file) {
                 Some(block) => crate::engine_lines::has_told(block).map_err(EngineCheckError::Lines)?,
                 None => false,
