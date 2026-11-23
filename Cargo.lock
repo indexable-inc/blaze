@@ -2168,6 +2168,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-tab"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-json",
+ "blaze-own",
+]
+
+[[package]]
 name = "blaze-tar"
 version = "0.0.0"
 dependencies = [
