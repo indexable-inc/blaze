@@ -1,8 +1,12 @@
-//! Pure `#![no_std]` modern authenticated encryption, key derivation, and Ed25519 verification:
+//! Pure `#![no_std]` modern authenticated encryption, key exchange, key derivation, and Ed25519 verification:
 //!
 //! - **Ed25519** signature verification: re-exported from [`blaze_ed25519`] as [`ed25519`].
 //! - **ChaCha20-Poly1305 AEAD** (RFC 8439): [`ChaCha20Poly1305`], [`KEY_LEN`], [`NONCE_LEN`],
 //!   [`TAG_LEN`], [`AuthError`], [`CryptoError`].
+//! - **XChaCha20-Poly1305 AEAD** (draft-irtf-cfrg-xchacha): [`hchacha20`], [`XChaCha20Poly1305`],
+//!   [`XNONCE_LEN`] (192-bit random-safe nonces).
+//! - **X25519** Diffie-Hellman key exchange (RFC 7748): [`x25519`], [`x25519_public_key`],
+//!   [`x25519_checked`], [`X25519_BASEPOINT`], [`WeakSharedSecret`].
 //! - **HKDF-SHA256** (RFC 5869): [`HkdfSha256`], [`hkdf_sha256`], [`HkdfError`].
 //! - **PBKDF2-HMAC-SHA256** (RFC 2898): [`pbkdf2_hmac_sha256`], [`Pbkdf2Error`].
 //!
@@ -23,8 +27,28 @@ pub const KEY_LEN: usize = 32;
 /// ChaCha20-Poly1305 nonce length in bytes (96 bits).
 pub const NONCE_LEN: usize = 12;
 
+/// XChaCha20-Poly1305 extended nonce length in bytes (192 bits, safe for random generation).
+pub const XNONCE_LEN: usize = 24;
+
 /// ChaCha20-Poly1305 Poly1305 authentication tag length in bytes (128 bits).
 pub const TAG_LEN: usize = 16;
+
+/// Canonical RFC 7748 X25519 basepoint (`u = 9`).
+pub const X25519_BASEPOINT: [u8; 32] = [
+    9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Returned by [`x25519_checked`] when the peer public key produces the all-zero low-order shared secret.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WeakSharedSecret;
+
+impl fmt::Display for WeakSharedSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("bstd::crypto::x25519: peer public key produced an all-zero shared secret")
+    }
+}
+
+impl core::error::Error for WeakSharedSecret {}
 
 /// Maximum output length of RFC 5869 HKDF-SHA256 (`255 * 32 = 8160` bytes).
 pub const HKDF_MAX_OUTPUT_LEN: usize = 255 * SHA256_LEN;
@@ -550,6 +574,465 @@ impl ChaCha20Poly1305 {
 }
 
 // ---------------------------------------------------------------------------
+// HChaCha20 & XChaCha20-Poly1305 (draft-irtf-cfrg-xchacha §2.2–§2.3)
+// ---------------------------------------------------------------------------
+
+/// Compute the 32-byte HChaCha20 subkey from a 32-byte key and 16-byte nonce prefix
+/// (draft-irtf-cfrg-xchacha §2.2).
+#[must_use]
+pub const fn hchacha20(key: &[u8; KEY_LEN], nonce16: &[u8; 16]) -> [u8; KEY_LEN] {
+    let [
+        k0, k1, k2, k3, k4, k5, k6, k7, k8, k9, k10, k11, k12, k13, k14, k15, k16, k17, k18, k19,
+        k20, k21, k22, k23, k24, k25, k26, k27, k28, k29, k30, k31,
+    ] = *key;
+    let [
+        n0, n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, n13, n14, n15,
+    ] = *nonce16;
+
+    let mut x0: u32 = 0x6170_7865;
+    let mut x1: u32 = 0x3320_646e;
+    let mut x2: u32 = 0x7962_2d32;
+    let mut x3: u32 = 0x6b20_6574;
+    let mut x4 = u32::from_le_bytes([k0, k1, k2, k3]);
+    let mut x5 = u32::from_le_bytes([k4, k5, k6, k7]);
+    let mut x6 = u32::from_le_bytes([k8, k9, k10, k11]);
+    let mut x7 = u32::from_le_bytes([k12, k13, k14, k15]);
+    let mut x8 = u32::from_le_bytes([k16, k17, k18, k19]);
+    let mut x9 = u32::from_le_bytes([k20, k21, k22, k23]);
+    let mut x10 = u32::from_le_bytes([k24, k25, k26, k27]);
+    let mut x11 = u32::from_le_bytes([k28, k29, k30, k31]);
+    let mut x12 = u32::from_le_bytes([n0, n1, n2, n3]);
+    let mut x13 = u32::from_le_bytes([n4, n5, n6, n7]);
+    let mut x14 = u32::from_le_bytes([n8, n9, n10, n11]);
+    let mut x15 = u32::from_le_bytes([n12, n13, n14, n15]);
+
+    let mut round = 0u8;
+    while round < 10 {
+        (x0, x4, x8, x12) = quarter_round(x0, x4, x8, x12);
+        (x1, x5, x9, x13) = quarter_round(x1, x5, x9, x13);
+        (x2, x6, x10, x14) = quarter_round(x2, x6, x10, x14);
+        (x3, x7, x11, x15) = quarter_round(x3, x7, x11, x15);
+
+        (x0, x5, x10, x15) = quarter_round(x0, x5, x10, x15);
+        (x1, x6, x11, x12) = quarter_round(x1, x6, x11, x12);
+        (x2, x7, x8, x13) = quarter_round(x2, x7, x8, x13);
+        (x3, x4, x9, x14) = quarter_round(x3, x4, x9, x14);
+        round += 1;
+    }
+
+    let [a0, a1, a2, a3] = x0.to_le_bytes();
+    let [b0, b1, b2, b3] = x1.to_le_bytes();
+    let [c0, c1, c2, c3] = x2.to_le_bytes();
+    let [d0, d1, d2, d3] = x3.to_le_bytes();
+    let [e0, e1, e2, e3] = x12.to_le_bytes();
+    let [f0, f1, f2, f3] = x13.to_le_bytes();
+    let [g0, g1, g2, g3] = x14.to_le_bytes();
+    let [h0, h1, h2, h3] = x15.to_le_bytes();
+
+    [
+        a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, d0, d1, d2, d3, e0, e1, e2, e3, f0, f1, f2,
+        f3, g0, g1, g2, g3, h0, h1, h2, h3,
+    ]
+}
+
+/// XChaCha20-Poly1305 AEAD cipher (draft-irtf-cfrg-xchacha §2.3) with 192-bit nonces safe for
+/// random generation.
+pub struct XChaCha20Poly1305 {
+    key: [u8; KEY_LEN],
+}
+
+impl fmt::Debug for XChaCha20Poly1305 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("XChaCha20Poly1305([REDACTED])")
+    }
+}
+
+impl Drop for XChaCha20Poly1305 {
+    fn drop(&mut self) {
+        for slot in self.key.iter_mut() {
+            *slot = 0;
+        }
+        core::hint::black_box(&self.key);
+    }
+}
+
+impl XChaCha20Poly1305 {
+    /// Initialize an XChaCha20-Poly1305 AEAD instance with a 32-byte key.
+    #[inline]
+    #[must_use]
+    pub const fn new(key: [u8; KEY_LEN]) -> Self {
+        Self { key }
+    }
+
+    #[inline]
+    const fn derive(&self, nonce: [u8; XNONCE_LEN]) -> (ChaCha20Poly1305, [u8; NONCE_LEN]) {
+        let [
+            n0, n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, n13, n14, n15, n16, n17, n18,
+            n19, n20, n21, n22, n23,
+        ] = nonce;
+        let subkey = hchacha20(
+            &self.key,
+            &[n0, n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, n13, n14, n15],
+        );
+        let subnonce = [0, 0, 0, 0, n16, n17, n18, n19, n20, n21, n22, n23];
+        (ChaCha20Poly1305::new(subkey), subnonce)
+    }
+
+    /// Encrypt `buf` in place under `(nonce, aad)` and return the 16-byte Poly1305 tag.
+    #[must_use]
+    pub fn seal_in_place(
+        &self,
+        nonce: [u8; XNONCE_LEN],
+        aad: &[u8],
+        buf: &mut [u8],
+    ) -> [u8; TAG_LEN] {
+        let (aead, subnonce) = self.derive(nonce);
+        aead.seal_in_place(subnonce, aad, buf)
+    }
+
+    /// Authenticate and decrypt `buf` in place; wipes `buf` on authentication failure.
+    pub fn open_in_place(
+        &self,
+        nonce: [u8; XNONCE_LEN],
+        aad: &[u8],
+        buf: &mut [u8],
+        tag: &[u8; TAG_LEN],
+    ) -> Result<(), AuthError> {
+        let (aead, subnonce) = self.derive(nonce);
+        aead.open_in_place(subnonce, aad, buf, tag)
+    }
+
+    /// Encrypt `plaintext` under `(nonce, aad)` into a new [`Vec<u8, A>`] with the 16-byte tag appended.
+    pub fn encrypt_in<A: Allocator>(
+        &self,
+        nonce: [u8; XNONCE_LEN],
+        aad: &[u8],
+        plaintext: &[u8],
+        alloc: A,
+    ) -> Result<Vec<u8, A>, AllocFailure> {
+        let (aead, subnonce) = self.derive(nonce);
+        aead.encrypt_in(subnonce, aad, plaintext, alloc)
+    }
+
+    /// Authenticate and decrypt `ciphertext_and_tag` into a new [`Vec<u8, A>`].
+    pub fn decrypt_in<A: Allocator>(
+        &self,
+        nonce: [u8; XNONCE_LEN],
+        aad: &[u8],
+        ciphertext_and_tag: &[u8],
+        alloc: A,
+    ) -> Result<Vec<u8, A>, CryptoError> {
+        let (aead, subnonce) = self.derive(nonce);
+        aead.decrypt_in(subnonce, aad, ciphertext_and_tag, alloc)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// X25519 Diffie-Hellman (RFC 7748) over GF(2^255 - 19) in 5x51-bit limbs
+// ---------------------------------------------------------------------------
+
+const MASK51: u64 = (1u64 << 51) - 1;
+const MASK51_128: u128 = (1u128 << 51) - 1;
+
+#[derive(Clone, Copy)]
+struct Fe([u64; 5]);
+
+#[inline]
+const fn u128_low51(x: u128) -> u64 {
+    let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = (x & MASK51_128).to_le_bytes();
+    u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7])
+}
+
+#[inline]
+const fn u128_low64(x: u128) -> u64 {
+    let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = x.to_le_bytes();
+    u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7])
+}
+
+impl Fe {
+    const ZERO: Self = Self([0, 0, 0, 0, 0]);
+    const ONE: Self = Self([1, 0, 0, 0, 0]);
+
+    const fn from_bytes(bytes: &[u8; 32]) -> Self {
+        let [
+            b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, b16, b17, b18,
+            b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31,
+        ] = *bytes;
+        let l0 = u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
+        let l1 = u64::from_le_bytes([b6, b7, b8, b9, b10, b11, b12, b13]);
+        let l2 = u64::from_le_bytes([b12, b13, b14, b15, b16, b17, b18, b19]);
+        let l3 = u64::from_le_bytes([b19, b20, b21, b22, b23, b24, b25, b26]);
+        let l4 = u64::from_le_bytes([b24, b25, b26, b27, b28, b29, b30, b31]);
+        // Mask top bit (bit 255) per RFC 7748 §5.
+        Self([
+            l0 & MASK51,
+            (l1 >> 3) & MASK51,
+            (l2 >> 6) & MASK51,
+            (l3 >> 1) & MASK51,
+            (l4 >> 12) & MASK51,
+        ])
+    }
+
+    const fn add(self, rhs: Self) -> Self {
+        let [a0, a1, a2, a3, a4] = self.0;
+        let [b0, b1, b2, b3, b4] = rhs.0;
+        Self([a0 + b0, a1 + b1, a2 + b2, a3 + b3, a4 + b4])
+    }
+
+    const fn sub(self, rhs: Self) -> Self {
+        // Add 2*p to prevent underflow (inputs bounded < 2^52).
+        const TWO_P0: u64 = 0x000f_ffff_ffff_ffda;
+        const TWO_P1234: u64 = 0x000f_ffff_ffff_fffe;
+        let [a0, a1, a2, a3, a4] = self.0;
+        let [b0, b1, b2, b3, b4] = rhs.0;
+        Self([
+            (a0 + TWO_P0) - b0,
+            (a1 + TWO_P1234) - b1,
+            (a2 + TWO_P1234) - b2,
+            (a3 + TWO_P1234) - b3,
+            (a4 + TWO_P1234) - b4,
+        ])
+    }
+
+    fn mul(self, rhs: Self) -> Self {
+        let [s0, s1, s2, s3, s4] = self.0;
+        let [o0, o1, o2, o3, o4] = rhs.0;
+        let a0 = u128::from(s0);
+        let a1 = u128::from(s1);
+        let a2 = u128::from(s2);
+        let a3 = u128::from(s3);
+        let a4 = u128::from(s4);
+
+        let b0 = u128::from(o0);
+        let b1 = u128::from(o1);
+        let b2 = u128::from(o2);
+        let b3 = u128::from(o3);
+        let b4 = u128::from(o4);
+
+        let b1_19 = b1 * 19;
+        let b2_19 = b2 * 19;
+        let b3_19 = b3 * 19;
+        let b4_19 = b4 * 19;
+
+        let t0 = a0 * b0 + a1 * b4_19 + a2 * b3_19 + a3 * b2_19 + a4 * b1_19;
+        let mut t1 = a0 * b1 + a1 * b0 + a2 * b4_19 + a3 * b3_19 + a4 * b2_19;
+        let mut t2 = a0 * b2 + a1 * b1 + a2 * b0 + a3 * b4_19 + a4 * b3_19;
+        let mut t3 = a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0 + a4 * b4_19;
+        let mut t4 = a0 * b4 + a1 * b3 + a2 * b2 + a3 * b1 + a4 * b0;
+
+        t1 += t0 >> 51;
+        let mut r0 = u128_low51(t0);
+        t2 += t1 >> 51;
+        let mut r1 = u128_low51(t1);
+        t3 += t2 >> 51;
+        let r2 = u128_low51(t2);
+        t4 += t3 >> 51;
+        let r3 = u128_low51(t3);
+        let carry = u128_low64(t4 >> 51);
+        let r4 = u128_low51(t4);
+
+        r0 += carry * 19;
+        r1 += r0 >> 51;
+        r0 &= MASK51;
+
+        Self([r0, r1, r2, r3, r4])
+    }
+
+    fn sq(self) -> Self {
+        self.mul(self)
+    }
+
+    fn mul_a24(self) -> Self {
+        const A24: u128 = 121_665;
+        let [s0, s1, s2, s3, s4] = self.0;
+        let t0 = u128::from(s0) * A24;
+        let t1 = u128::from(s1) * A24 + (t0 >> 51);
+        let t2 = u128::from(s2) * A24 + (t1 >> 51);
+        let t3 = u128::from(s3) * A24 + (t2 >> 51);
+        let t4 = u128::from(s4) * A24 + (t3 >> 51);
+
+        let mut r0 = u128_low51(t0) + u128_low64(t4 >> 51) * 19;
+        let r1 = u128_low51(t1) + (r0 >> 51);
+        r0 &= MASK51;
+        Self([r0, r1, u128_low51(t2), u128_low51(t3), u128_low51(t4)])
+    }
+
+    fn pow2k(mut self, mut k: u32) -> Self {
+        while k > 0 {
+            self = self.sq();
+            k -= 1;
+        }
+        self
+    }
+
+    /// Compute `self^(p - 2) mod p` (multiplicative inverse in `GF(2^255 - 19)`).
+    fn invert(self) -> Self {
+        let t0 = self.sq();
+        let t1 = t0.sq().sq();
+        let t2 = self.mul(t1);
+        let t3 = t0.mul(t2);
+        let t4 = t3.sq();
+        let t5 = t2.mul(t4);
+        let t6 = t5.pow2k(5).mul(t5);
+        let t7 = t6.pow2k(10).mul(t6);
+        let t8 = t7.pow2k(20).mul(t7);
+        let t9 = t8.pow2k(10).mul(t6);
+        let t10 = t9.pow2k(50).mul(t9);
+        let t11 = t10.pow2k(100).mul(t10);
+        let t12 = t11.pow2k(50).mul(t9);
+        t12.pow2k(5).mul(t3)
+    }
+
+    /// Canonical little-endian encoding modulo `2^255 - 19`.
+    const fn to_bytes(self) -> [u8; 32] {
+        let [mut h0, mut h1, mut h2, mut h3, mut h4] = self.0;
+
+        // Two full carry passes reduce h into [0, 2^255 + 19*2).
+        let mut pass = 0u8;
+        while pass < 2 {
+            h1 += h0 >> 51;
+            h0 &= MASK51;
+            h2 += h1 >> 51;
+            h1 &= MASK51;
+            h3 += h2 >> 51;
+            h2 &= MASK51;
+            h4 += h3 >> 51;
+            h3 &= MASK51;
+            h0 += (h4 >> 51) * 19;
+            h4 &= MASK51;
+            pass += 1;
+        }
+
+        // Subtract p if h >= p (constant-time).
+        let mut q = (h0 + 19) >> 51;
+        q = (h1 + q) >> 51;
+        q = (h2 + q) >> 51;
+        q = (h3 + q) >> 51;
+        q = (h4 + q) >> 51;
+
+        h0 += 19 * q;
+        h1 += h0 >> 51;
+        h0 &= MASK51;
+        h2 += h1 >> 51;
+        h1 &= MASK51;
+        h3 += h2 >> 51;
+        h2 &= MASK51;
+        h4 += h3 >> 51;
+        h3 &= MASK51;
+        h4 &= MASK51;
+
+        let [w0_0, w0_1, w0_2, w0_3, w0_4, w0_5, w0_6, w0_7] = (h0 | (h1 << 51)).to_le_bytes();
+        let [w1_0, w1_1, w1_2, w1_3, w1_4, w1_5, w1_6, w1_7] =
+            ((h1 >> 13) | (h2 << 38)).to_le_bytes();
+        let [w2_0, w2_1, w2_2, w2_3, w2_4, w2_5, w2_6, w2_7] =
+            ((h2 >> 26) | (h3 << 25)).to_le_bytes();
+        let [w3_0, w3_1, w3_2, w3_3, w3_4, w3_5, w3_6, w3_7] =
+            ((h3 >> 39) | (h4 << 12)).to_le_bytes();
+        [
+            w0_0, w0_1, w0_2, w0_3, w0_4, w0_5, w0_6, w0_7, w1_0, w1_1, w1_2, w1_3, w1_4, w1_5,
+            w1_6, w1_7, w2_0, w2_1, w2_2, w2_3, w2_4, w2_5, w2_6, w2_7, w3_0, w3_1, w3_2, w3_3,
+            w3_4, w3_5, w3_6, w3_7,
+        ]
+    }
+}
+
+#[inline]
+const fn cswap(swap: u64, a: &mut Fe, b: &mut Fe) {
+    let mask = 0u64.wrapping_sub(swap);
+    let [mut a0, mut a1, mut a2, mut a3, mut a4] = a.0;
+    let [mut b0, mut b1, mut b2, mut b3, mut b4] = b.0;
+    let x0 = mask & (a0 ^ b0);
+    a0 ^= x0;
+    b0 ^= x0;
+    let x1 = mask & (a1 ^ b1);
+    a1 ^= x1;
+    b1 ^= x1;
+    let x2 = mask & (a2 ^ b2);
+    a2 ^= x2;
+    b2 ^= x2;
+    let x3 = mask & (a3 ^ b3);
+    a3 ^= x3;
+    b3 ^= x3;
+    let x4 = mask & (a4 ^ b4);
+    a4 ^= x4;
+    b4 ^= x4;
+    a.0 = [a0, a1, a2, a3, a4];
+    b.0 = [b0, b1, b2, b3, b4];
+}
+
+/// RFC 7748 X25519 scalar multiplication (`scalar * u_coord` on Curve25519) in constant time.
+///
+/// Applies RFC 7748 §5 clamping to `scalar` and clears bit 255 of `u_coord`. For authenticated
+/// key exchange where low-order peer keys must be refused, prefer [`x25519_checked`].
+#[must_use]
+pub fn x25519(mut scalar: [u8; 32], u_coord: [u8; 32]) -> [u8; 32] {
+    if let Some(first) = scalar.first_mut() {
+        *first &= 248;
+    }
+    if let Some(last) = scalar.last_mut() {
+        *last &= 127;
+        *last |= 64;
+    }
+
+    let x_1 = Fe::from_bytes(&u_coord);
+    let mut x_2 = Fe::ONE;
+    let mut z_2 = Fe::ZERO;
+    let mut x_3 = x_1;
+    let mut z_3 = Fe::ONE;
+    let mut swap = 0u64;
+
+    let mut t = 255usize;
+    while t > 0 {
+        t -= 1;
+        let byte = scalar.get(t >> 3).copied().unwrap_or(0);
+        let k_t = u64::from((byte >> (t & 7)) & 1);
+        swap ^= k_t;
+        cswap(swap, &mut x_2, &mut x_3);
+        cswap(swap, &mut z_2, &mut z_3);
+        swap = k_t;
+
+        let a = x_2.add(z_2);
+        let aa = a.sq();
+        let b = x_2.sub(z_2);
+        let bb = b.sq();
+        let e = aa.sub(bb);
+        let c = x_3.add(z_3);
+        let d = x_3.sub(z_3);
+        let da = d.mul(a);
+        let cb = c.mul(b);
+        x_3 = da.add(cb).sq();
+        z_3 = x_1.mul(da.sub(cb).sq());
+        x_2 = aa.mul(bb);
+        z_2 = e.mul(aa.add(e.mul_a24()));
+    }
+
+    cswap(swap, &mut x_2, &mut x_3);
+    cswap(swap, &mut z_2, &mut z_3);
+
+    x_2.mul(z_2.invert()).to_bytes()
+}
+
+/// Derive the 32-byte X25519 public key from a 32-byte secret key (`x25519(secret, X25519_BASEPOINT)`).
+#[inline]
+#[must_use]
+pub fn x25519_public_key(secret: [u8; 32]) -> [u8; 32] {
+    x25519(secret, X25519_BASEPOINT)
+}
+
+/// RFC 7748 X25519 Diffie-Hellman key agreement that refuses the all-zero low-order shared secret
+/// in constant time (RFC 7748 §6.1).
+pub fn x25519_checked(
+    secret: [u8; 32],
+    peer_public: [u8; 32],
+) -> Result<[u8; 32], WeakSharedSecret> {
+    let shared = x25519(secret, peer_public);
+    if ct_eq(&shared, &[0u8; 32]) {
+        return Err(WeakSharedSecret);
+    }
+    Ok(shared)
+}
+
+// ---------------------------------------------------------------------------
 // HKDF-SHA256 (RFC 5869)
 // ---------------------------------------------------------------------------
 
@@ -1013,6 +1496,139 @@ mod tests {
                 ));
             }
             Ok(())
+        });
+    }
+
+    #[test]
+    fn xchacha20_poly1305_and_hchacha20_draft_vectors() {
+        let h = heap();
+        // draft-irtf-cfrg-xchacha-03 §2.2.1 HChaCha20 test vector
+        let key = crate::hex::decode_array::<32>(
+            b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        )
+        .expect("key");
+        let nonce16 = crate::hex::decode_array::<16>(b"000000090000004a0000000031415927")
+            .expect("nonce16");
+        let expected_subkey = crate::hex::decode_array::<32>(
+            b"82413b4227b27bfed30e42508a877d73a0f9e4d58a74a853c12ec41326d3ecdc",
+        )
+        .expect("subkey");
+        assert_eq!(hchacha20(&key, &nonce16), expected_subkey);
+
+        // draft-irtf-cfrg-xchacha-03 §A.3.1 XChaCha20-Poly1305 AEAD vector
+        let aead_key = crate::hex::decode_array::<32>(
+            b"808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+        )
+        .expect("aead_key");
+        let nonce24 = crate::hex::decode_array::<24>(
+            b"404142434445464748494a4b4c4d4e4f5051525354555657",
+        )
+        .expect("nonce24");
+        let aad = crate::hex::decode_array::<12>(b"50515253c0c1c2c3c4c5c6c7").expect("aad");
+        let pt = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        let expected_ct = crate::hex::decode_in(
+            b"bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b4522f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff921f9664c97637da9768812f615c68b13b52e",
+            h.alloc(),
+        )
+        .expect("ct");
+        let expected_tag = crate::hex::decode_array::<16>(b"c0875924c1c7987947deafd8780acf49")
+            .expect("tag");
+
+        let x = XChaCha20Poly1305::new(aead_key);
+        let sealed = x.encrypt_in(nonce24, &aad, pt, h.alloc()).expect("seal");
+        assert_eq!(&sealed.as_slice()[..pt.len()], expected_ct.as_slice());
+        assert_eq!(&sealed.as_slice()[pt.len()..], &expected_tag);
+        let opened = x.decrypt_in(nonce24, &aad, sealed.as_slice(), h.alloc()).expect("open");
+        assert_eq!(opened.as_slice(), pt);
+    }
+
+    #[test]
+    fn rfc7748_x25519_vectors_and_commutativity() {
+        // RFC 7748 §5.2 Vector 1
+        let s1 = crate::hex::decode_array::<32>(
+            b"a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4",
+        )
+        .expect("s1");
+        let u1 = crate::hex::decode_array::<32>(
+            b"e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c",
+        )
+        .expect("u1");
+        let out1 = crate::hex::decode_array::<32>(
+            b"c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552",
+        )
+        .expect("out1");
+        assert_eq!(x25519(s1, u1), out1);
+
+        // RFC 7748 §5.2 Vector 2
+        let s2 = crate::hex::decode_array::<32>(
+            b"4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d",
+        )
+        .expect("s2");
+        let u2 = crate::hex::decode_array::<32>(
+            b"e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493",
+        )
+        .expect("u2");
+        let out2 = crate::hex::decode_array::<32>(
+            b"95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957",
+        )
+        .expect("out2");
+        assert_eq!(x25519(s2, u2), out2);
+
+        // RFC 7748 §5.2 1,000-iteration test
+        let mut k = X25519_BASEPOINT;
+        let mut u = X25519_BASEPOINT;
+        for _ in 0..1000 {
+            let next = x25519(k, u);
+            u = k;
+            k = next;
+        }
+        let expected_1000 = crate::hex::decode_array::<32>(
+            b"684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51",
+        )
+        .expect("1000");
+        assert_eq!(k, expected_1000);
+
+        // RFC 7748 §6.1 Alice/Bob DH key agreement
+        let alice_priv = crate::hex::decode_array::<32>(
+            b"77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+        )
+        .expect("a_priv");
+        let alice_pub_expected = crate::hex::decode_array::<32>(
+            b"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        )
+        .expect("a_pub");
+        let bob_priv = crate::hex::decode_array::<32>(
+            b"5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb",
+        )
+        .expect("b_priv");
+        let bob_pub_expected = crate::hex::decode_array::<32>(
+            b"de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        )
+        .expect("b_pub");
+        let shared_expected = crate::hex::decode_array::<32>(
+            b"4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742",
+        )
+        .expect("shared");
+
+        let alice_pub = x25519_public_key(alice_priv);
+        let bob_pub = x25519_public_key(bob_priv);
+        assert_eq!(alice_pub, alice_pub_expected);
+        assert_eq!(bob_pub, bob_pub_expected);
+        assert_eq!(x25519_checked(alice_priv, bob_pub), Ok(shared_expected));
+        assert_eq!(x25519_checked(bob_priv, alice_pub), Ok(shared_expected));
+
+        // Low-order point (all-zero) must be refused by x25519_checked.
+        assert_eq!(x25519_checked(alice_priv, [0u8; 32]), Err(WeakSharedSecret));
+
+        // Property: random Alice/Bob keypairs always agree on the same shared secret.
+        blaze_sim::check(Config::cases(32), |tape| {
+            let mut a = [0u8; 32];
+            let mut b = [0u8; 32];
+            tape.fill(&mut a, "alice");
+            tape.fill(&mut b, "bob");
+            let a_pub = x25519_public_key(a);
+            let b_pub = x25519_public_key(b);
+            assert_eq!(x25519(a, b_pub), x25519(b, a_pub));
         });
     }
 }

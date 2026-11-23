@@ -179,6 +179,8 @@ pub mod budget;
 pub mod cell;
 /// Declarative sans-IO CLI argument parser, subcommand router, and ANSI-styled `--help` formatter.
 pub mod cli;
+/// IPv4/IPv6 CIDR subnet arithmetic, SSRF global-routability classifiers, and binary-trie LPM (`PrefixMap`).
+pub mod cidr;
 pub mod clock;
 /// Turning data into instructions: `Code`, executable memory and native modules.
 pub mod code;
@@ -202,6 +204,8 @@ pub mod diff;
 pub mod digest;
 /// The simulated disk's ledger: what file calls paid, and which names a crash may undo.
 pub mod disk;
+/// Sans-IO RFC 1035/3596/2782 DNS wire message encoder and loop-safe decoder.
+pub mod dns;
 /// Strict, bounded, sans-IO `.env` file parser, variable interpolator, and formatter.
 pub mod dotenv;
 pub mod entry;
@@ -255,6 +259,9 @@ pub mod net;
 pub mod network;
 /// Handing a URL to the user's default application: `Opener`, narrowed to a scheme.
 pub mod opener;
+/// RFC 4226 HOTP, RFC 6238 TOTP (`otpauth://`), RFC 4648 & Crockford Base32, and RFC 7468 PEM armor.
+pub mod otp;
+pub use crate::otp::{base32, pem};
 pub mod out;
 /// Data parallelism over disjoint chunks: `for_each`, `map_into`, `reduce`.
 pub mod par;
@@ -305,6 +312,8 @@ pub mod prefab;
 #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
 mod native;
 pub mod pending;
+/// RFC 6901 JSON Pointer, RFC 7396 JSON Merge Patch, and bounded JSONPath queries over `blaze_data::Value`.
+pub mod pointer;
 /// Power: the battery, and keeping the machine awake.
 pub mod power;
 /// Other processes: `Procs`, from `Host`, narrowed to one.
@@ -316,6 +325,8 @@ pub mod quic;
 pub mod query;
 /// Linear-time Thompson NFA / PikeVM regular expression engine with bounded step budgets.
 pub mod regex;
+/// Sans-IO explicit-clock rate limiters (`Gcra`, `TokenBucket`), `CircuitBreaker`, and jittered `Backoff`.
+pub mod rate;
 /// Making requests: `Http`, one type over a `Net`, the host or a handler. Behind `requests`.
 #[cfg(feature = "requests")]
 pub mod requests;
@@ -330,11 +341,15 @@ pub mod rng;
 pub(crate) mod rt;
 /// Whom TLS trusts: `Roots`, a set of trust anchors.
 pub mod roots;
+/// Fast sans-IO HTTP URL router (`Static > :param > *wildcard`, 404 vs 405 `Allow`).
+pub mod router;
 /// `#[bstd::test]`: a test shaped like `main`, run on the simulation under many seeds with its
 /// faults on. Its items are [`test`]'s.
 mod simtest;
 /// Streams to an origin: `Streams`, from the host or a handler.
 pub mod streams;
+/// Everyday text transformations: case conversions, Unicode `slugify_in`, `natural_cmp`, `dedent_in`/`indent_in`, and ANSI/CJK `truncate_width_in`.
+pub mod strx;
 /// Sans-IO W3C Server-Sent Events (SSE) streaming parser and event formatter.
 pub mod sse;
 pub mod sync;
@@ -366,6 +381,8 @@ pub mod uuid;
 pub mod window;
 /// Sans-IO RFC 6455 WebSocket handshake (`accept_key`) and frame encoder/decoder.
 pub mod ws;
+/// Bounded, iterative, XXE-proof XML 1.0 pull parser and canonical writer.
+pub mod xml;
 /// Strict, bounded, non-recursive YAML 1.2 Core Schema parser and emitter over `blaze_data::Value`.
 pub mod yaml;
 /// Bounded, traversal-safe Store/Deflate ZIP archive reader and writer over [`compress`] and [`digest::Crc32`].

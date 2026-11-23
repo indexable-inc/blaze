@@ -208,6 +208,126 @@ pub(crate) struct ExportNative<'a> {
 
 /// The install name every image links and the launcher has already loaded.
 const LIB_SYSTEM: &[u8] = b"/usr/lib/libSystem.B.dylib";
+/// The base C library soname every Linux image links and the launcher has already loaded.
+const LIBC_LINUX: &[u8] = b"libc.so.6";
+
+/// Why an ELF shared object's headers could not be inspected by [`elf_holds_native`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ElfNativeRead {
+    NotElf,
+    Bounds(&'static str),
+    BadPhEntSize,
+    StrtabOutsideLoads,
+}
+
+impl fmt::Display for ElfNativeRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            ElfNativeRead::NotElf => f.write_str("the record is not a 64-bit little-endian ELF file"),
+            ElfNativeRead::Bounds(what) => write!(f, "{what} runs past the ELF file's end"),
+            ElfNativeRead::BadPhEntSize => f.write_str("unexpected e_phentsize in ELF header"),
+            ElfNativeRead::StrtabOutsideLoads => f.write_str("DT_STRTAB lies outside every PT_LOAD"),
+        }
+    }
+}
+
+/// Whether the arm64 ELF shared object `file` holds native code of the program's crates: a byte
+/// of `.text`, or a `DT_NEEDED` library besides `libc.so.6` (which the launcher already has).
+fn elf_holds_native(file: &[u8]) -> Result<bool, ElfNativeRead> {
+    let u16_at = |at: usize| file.get(at..at + 2).and_then(|b| b.try_into().ok()).map(u16::from_le_bytes).ok_or(ElfNativeRead::Bounds("an ELF header field"));
+    let u32_at = |at: usize| file.get(at..at + 4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes).ok_or(ElfNativeRead::Bounds("an ELF field"));
+    let u64_at = |at: usize| file.get(at..at + 8).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes).ok_or(ElfNativeRead::Bounds("an ELF field"));
+    if file.get(0..6) != Some(&[0x7F, b'E', b'L', b'F', 2, 1][..]) {
+        return Err(ElfNativeRead::NotElf);
+    }
+    // Check `.text` section size via section headers (native_so.rs always emits them).
+    let shoff = usize::try_from(u64_at(40)?).map_err(|_| ElfNativeRead::Bounds("e_shoff"))?;
+    let shentsize = usize::from(u16_at(58)?);
+    let shnum = usize::from(u16_at(60)?);
+    let shstrndx = usize::from(u16_at(62)?);
+    if shoff > 0 && shnum > 0 && shentsize == 64 && shstrndx < shnum {
+        let shstr_hdr = shoff + shstrndx * 64;
+        let shstr_off = usize::try_from(u64_at(shstr_hdr + 24)?).map_err(|_| ElfNativeRead::Bounds(".shstrtab offset"))?;
+        let shstr_len = usize::try_from(u64_at(shstr_hdr + 32)?).map_err(|_| ElfNativeRead::Bounds(".shstrtab size"))?;
+        let shstr = file.get(shstr_off..shstr_off.saturating_add(shstr_len)).ok_or(ElfNativeRead::Bounds(".shstrtab"))?;
+        for k in 0..shnum {
+            let s = shoff + k * 64;
+            let name_off = usize::try_from(u32_at(s)?).map_err(|_| ElfNativeRead::Bounds("sh_name"))?;
+            if let Some(rest) = shstr.get(name_off..) {
+                let name = rest.split(|b| *b == 0).next().unwrap_or(rest);
+                if name == b".text" && u64_at(s + 32)? > 0 {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    // Check `DT_NEEDED` entries via `PT_DYNAMIC` and `PT_LOAD`.
+    let phoff = usize::try_from(u64_at(32)?).map_err(|_| ElfNativeRead::Bounds("e_phoff"))?;
+    let phentsize = usize::from(u16_at(54)?);
+    let phnum = usize::from(u16_at(56)?);
+    if phentsize != 56 {
+        return Err(ElfNativeRead::BadPhEntSize);
+    }
+    let mut dynamic: Option<(usize, usize)> = None;
+    for k in 0..phnum {
+        let p = phoff + k * 56;
+        if u32_at(p)? == 2 {
+            let off = usize::try_from(u64_at(p + 8)?).map_err(|_| ElfNativeRead::Bounds("PT_DYNAMIC offset"))?;
+            let len = usize::try_from(u64_at(p + 32)?).map_err(|_| ElfNativeRead::Bounds("PT_DYNAMIC size"))?;
+            dynamic = Some((off, len));
+            break;
+        }
+    }
+    let Some((dyn_off, dyn_len)) = dynamic else { return Ok(false) };
+    let (mut strtab_va, mut strsz) = (None, None);
+    let mut off = 0usize;
+    while off + 16 <= dyn_len {
+        let tag = u64_at(dyn_off + off)?;
+        let val = u64_at(dyn_off + off + 8)?;
+        match tag {
+            0 => break,
+            5 => strtab_va = Some(val),
+            10 => strsz = Some(val),
+            _ => {}
+        }
+        off += 16;
+    }
+    let (Some(strtab_va), Some(strsz)) = (strtab_va, strsz) else { return Ok(false) };
+    let mut strtab_off = None;
+    for k in 0..phnum {
+        let p = phoff + k * 56;
+        if u32_at(p)? == 1 {
+            let p_off = u64_at(p + 8)?;
+            let p_vaddr = u64_at(p + 16)?;
+            let p_filesz = u64_at(p + 32)?;
+            if strtab_va >= p_vaddr && strtab_va.saturating_add(strsz) <= p_vaddr.saturating_add(p_filesz) {
+                strtab_off = Some(usize::try_from(p_off + (strtab_va - p_vaddr)).map_err(|_| ElfNativeRead::Bounds("DT_STRTAB offset"))?);
+                break;
+            }
+        }
+    }
+    let Some(strtab_off) = strtab_off else { return Err(ElfNativeRead::StrtabOutsideLoads) };
+    let strsz_usize = usize::try_from(strsz).map_err(|_| ElfNativeRead::Bounds("DT_STRSZ"))?;
+    let strtab = file.get(strtab_off..strtab_off.saturating_add(strsz_usize)).ok_or(ElfNativeRead::Bounds("DT_STRTAB"))?;
+    let mut off = 0usize;
+    while off + 16 <= dyn_len {
+        let tag = u64_at(dyn_off + off)?;
+        let val = u64_at(dyn_off + off + 8)?;
+        if tag == 0 {
+            break;
+        }
+        if tag == 1 {
+            let name_off = usize::try_from(val).map_err(|_| ElfNativeRead::Bounds("DT_NEEDED offset"))?;
+            let rest = strtab.get(name_off..).ok_or(ElfNativeRead::Bounds("DT_NEEDED"))?;
+            let name = rest.split(|b| *b == 0).next().unwrap_or(rest);
+            if name != LIBC_LINUX {
+                return Ok(true);
+            }
+        }
+        off += 16;
+    }
+    Ok(false)
+}
 
 /// Whether the arm64 Mach-O image `file` holds native code of the program's crates: a byte of
 /// `__TEXT,__text`, or a library besides libSystem (which the launcher has). The words and the
@@ -255,17 +375,16 @@ fn macho_holds_native(file: &[u8]) -> Result<bool, &'static str> {
 
 /// What the start of the program whose image is `payload` is sent ([`NativeSend`]), `None`
 /// when the image holds no native code: on macOS by its Mach-O headers
-/// ([`macho_holds_native`]); on Linux by its descriptor (a Rust word, an initializer or a
-/// pointer row; the ELF text is not read yet, so a Linux image whose C only Rust calls is not
-/// sent and its first call is refused by name in the child, `RunModeError::Outside`). The file
-/// is put at `<HOME>/` [`crate::run_parent::RECORDS`]`/<the key's hex>` when it is not there.
+/// ([`macho_holds_native`]); on Linux by its descriptor and ELF headers ([`elf_holds_native`]).
+/// The file is put at `<HOME>/` [`crate::run_parent::RECORDS`]`/<the key's hex>` when it is not
+/// there.
 fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platform: Platform, ask: &NativeAsk<'w>, scratch: &Frame) -> Result<Option<NativeSend<'w>>, NativeError<'w>> {
     let refused = |words: &str| NativeError::Send { words: held(words, ask) };
     let (descriptor, names) = blaze_native::descriptor::read(payload, platform).map_err(|why| refused(bstd::mem::format_in!(scratch, "its descriptor: {why:?}").as_str()))?;
     let described = descriptor.words > 0 || descriptor.inits > 0 || descriptor.pointers > 0;
     let holds = match platform {
         Platform::MacosArm64 => described || macho_holds_native(payload).map_err(refused)?,
-        Platform::LinuxArm64 => described,
+        Platform::LinuxArm64 => described || elf_holds_native(payload).map_err(|why| refused(bstd::mem::format_in!(scratch, "{why}").as_str()))?,
     };
     if !holds {
         return Ok(None);
@@ -708,8 +827,8 @@ pub(crate) fn export_native_for<'r, 'm: 's, 's>(
         Err(error) => return Err(NativeError::Link { what: "the program's native image", words: held(bstd::mem::format_in!(out_frame, "{error:?}").as_str(), ask) }),
     };
     let has_text = image.region(blaze_native::image::Region::Text).is_some_and(|r| r.len > 0);
-    let has_extra_lib = image.libraries.iter().any(|l| l.install().as_bytes() != LIB_SYSTEM && l.install() != "libc.so.6");
-    if !has_text && image.words.is_empty() && image.inits == 0 && !has_extra_lib {
+    let has_extra_lib = image.libraries.iter().any(|l| l.install().as_bytes() != LIB_SYSTEM && l.install().as_bytes() != LIBC_LINUX);
+    if !has_text && image.words.is_empty() && image.inits == 0 && image.tls.is_empty() && !has_extra_lib {
         return Ok(None);
     }
     // Collect every Rust C export (unmangled name -> fn symbol), sorted by name for `native_merge`.
@@ -1247,5 +1366,41 @@ mod tests {
         assert_ne!(key(f.sdk), key(older), "two SDK versions keyed one image");
         assert_ne!(key(f.sdk), key(beta), "two builds of one SDK version keyed one image");
         std::println!("engine_native: a stub's install name moves the image's own key; the SDK's version and build move its key, its folder does not");
+    }
+
+    /// Linux ELF shared objects: `elf_holds_native` reports `false` for a bare `libc.so.6`-only
+    /// image with empty `.text`, and `true` when the image links an extra library (`libm.so.6`).
+    #[test]
+    fn elf_holds_native_detects_extra_libraries_and_empty_text() {
+        let f = fixture(b"engine_native elf holds");
+        let cx = f.io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
+        let ask = NativeAsk { producer: f.producer, home: None, words: &f.words, fs: f.io.need_fs().expect("files") };
+        let empty = leak(table(&[]));
+        let with_m = leak(table(&["m"]));
+        let mut store = Model::default();
+        let bare = image_in(
+            &cx,
+            &mut store,
+            native_image::program_name("src/main.rs"),
+            &[CrateIn { package: "app", links: links(1), table: empty, script: None }],
+            Platform::LinuxArm64,
+            None,
+            &ask,
+            &f.scratch,
+        )
+        .expect("bare linux image");
+        assert_eq!(elf_holds_native(store.image(bare.key)), Ok(false), "empty .text + libc.so.6 alone holds no native code");
+        let linked_m = image_in(
+            &cx,
+            &mut store,
+            native_image::program_name("src/main.rs"),
+            &[CrateIn { package: "app", links: links(1), table: with_m, script: None }],
+            Platform::LinuxArm64,
+            None,
+            &ask,
+            &f.scratch,
+        )
+        .expect("linux image linking libm");
+        assert_eq!(elf_holds_native(store.image(linked_m.key)), Ok(true), "DT_NEEDED libm.so.6 holds native dependency");
     }
 }
