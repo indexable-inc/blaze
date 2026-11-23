@@ -69,12 +69,12 @@ pub(crate) enum SavedPlant {
 }
 
 /// The saved locals of `flow`, the union over its `Suspend` statements.
-pub fn saved<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Saved<A>, Bound> {
+pub fn saved<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Saved<A>, Bound> {
     saved_with(flow, true, alloc)
 }
 
 #[cfg(test)]
-pub(crate) fn saved_planted<A: Allocator + Clone>(
+pub(crate) fn saved_planted<A: Allocator + Copy>(
     flow: &Flow<A>,
     plant: SavedPlant,
     alloc: A,
@@ -88,10 +88,10 @@ fn zeroed<A: Allocator>(words: usize, alloc: A) -> Vec<u64, A> {
     v
 }
 
-fn saved_with<A: Allocator + Clone>(flow: &Flow<A>, borrows: bool, alloc: A) -> Result<Saved<A>, Bound> {
+fn saved_with<A: Allocator + Copy>(flow: &Flow<A>, borrows: bool, alloc: A) -> Result<Saved<A>, Bound> {
     let locals = flow.locals as usize;
     let words = locals.div_ceil(64);
-    let mut out = zeroed(words, alloc.clone());
+    let mut out = zeroed(words, alloc);
     let suspends =
         flow.stmts.iter().filter(|row| matches!(row.kind, StmtKind::Suspend { .. })).count() as u32;
     if suspends == 0 {
@@ -100,26 +100,26 @@ fn saved_with<A: Allocator + Clone>(flow: &Flow<A>, borrows: bool, alloc: A) -> 
     let limit = flow.blocks.len() as u64 * locals as u64 + 1;
 
     // Maybe storage-live on entry: the arguments, and every local no storage statement names.
-    let mut named = zeroed(words, alloc.clone());
+    let mut named = zeroed(words, alloc);
     for row in flow.stmts.iter() {
         if let StmtKind::StorageLive(l) | StmtKind::StorageDead(l) = row.kind {
             bits::put(&mut named, l.index(), true);
         }
     }
-    let mut entry = zeroed(words, alloc.clone());
+    let mut entry = zeroed(words, alloc);
     for l in 1..locals {
         if l <= flow.args as usize || !bits::test(&named, l) {
             bits::put(&mut entry, l, true);
         }
     }
-    let storage = forward(flow, &entry, storage_step, limit, "maybe storage-live passes", alloc.clone())?;
-    let none = zeroed(words, alloc.clone());
-    let borrowed = forward(flow, &none, borrow_step, limit, "maybe borrowed passes", alloc.clone())?;
-    let init = inits(flow, Plant::None, alloc.clone())?;
-    let live = live_by_use(flow, &init, limit, alloc.clone())?;
+    let storage = forward(flow, &entry, storage_step, limit, "maybe storage-live passes", alloc)?;
+    let none = zeroed(words, alloc);
+    let borrowed = forward(flow, &none, borrow_step, limit, "maybe borrowed passes", alloc)?;
+    let init = inits(flow, Plant::None, alloc)?;
+    let live = live_by_use(flow, &init, limit, alloc)?;
 
-    let mut st = zeroed(words, alloc.clone());
-    let mut bo = zeroed(words, alloc.clone());
+    let mut st = zeroed(words, alloc);
+    let mut bo = zeroed(words, alloc);
     let mut keep = zeroed(words, alloc);
     for (s, row) in flow.stmts.iter().enumerate() {
         let StmtKind::Suspend { resume, cancel } = row.kind else {
@@ -168,7 +168,7 @@ fn borrow_step<A: Allocator>(flow: &Flow<A>, s: Stmt, row: &mut [u64]) {
 }
 
 /// A forward union problem at block grain: row `b` is the state on entry to block `b`.
-fn forward<A: Allocator + Clone>(
+fn forward<A: Allocator + Copy>(
     flow: &Flow<A>,
     entry: &[u64],
     step: fn(&Flow<A>, Stmt, &mut [u64]),
@@ -177,7 +177,7 @@ fn forward<A: Allocator + Clone>(
     alloc: A,
 ) -> Result<Bits<A>, Bound> {
     let blocks = flow.blocks.len();
-    let mut rows = Bits::new_in(blocks, flow.locals as usize, alloc.clone());
+    let mut rows = Bits::new_in(blocks, flow.locals as usize, alloc);
     if blocks == 0 {
         return Ok(rows);
     }
@@ -266,14 +266,14 @@ fn live_step<A: Allocator>(flow: &Flow<A>, init: &Inits<A>, s: Stmt, row: &mut [
 }
 
 /// Live by use on entry to each block, backward, passes in reverse block order.
-fn live_by_use<A: Allocator + Clone>(
+fn live_by_use<A: Allocator + Copy>(
     flow: &Flow<A>,
     init: &Inits<A>,
     limit: u64,
     alloc: A,
 ) -> Result<Bits<A>, Bound> {
     let blocks = flow.blocks.len();
-    let mut rows = Bits::new_in(blocks, flow.locals as usize, alloc.clone());
+    let mut rows = Bits::new_in(blocks, flow.locals as usize, alloc);
     let mut cur = zeroed(rows.words(), alloc);
     let mut passes = 0u64;
     loop {

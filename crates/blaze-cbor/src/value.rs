@@ -17,8 +17,8 @@ use crate::{CborPlant, Decoder, Error, Event, Limits, wide, why, write};
 const MOST_RESERVED: usize = 4096;
 
 /// `value`'s deterministic CBOR in `alloc`.
-pub fn to_vec_in<A: Allocator, B: Allocator + Clone>(value: &Value<A>, alloc: B) -> Vec<u8, B> {
-    let mut out = Vec::new_in(alloc.clone());
+pub fn to_vec_in<A: Allocator, B: Allocator + Copy>(value: &Value<A>, alloc: B) -> Vec<u8, B> {
+    let mut out = Vec::new_in(alloc);
     write_into(value, &mut out, alloc);
     out
 }
@@ -63,9 +63,9 @@ pub fn write_into_planted<A: Allocator, B: Allocator, S: Allocator + Clone>(
 /// One value read from `bytes` in `alloc`, within `limits`; every rule in the crate's docs
 /// held (a key twice among them), and nothing after the value. The decoder's and the build's
 /// stacks are in `alloc` too.
-pub fn read_in<A: Allocator + Clone>(bytes: &[u8], limits: Limits, alloc: A) -> Result<Value<A>, Error> {
-    let mut decoder = Decoder::new_in(bytes, limits, alloc.clone())?;
-    let mut build = Build::new_in(alloc.clone(), alloc.clone());
+pub fn read_in<A: Allocator + Copy>(bytes: &[u8], limits: Limits, alloc: A) -> Result<Value<A>, Error> {
+    let mut decoder = Decoder::new_in(bytes, limits, alloc)?;
+    let mut build = Build::new_in(alloc, alloc);
     while !build.is_whole() {
         let Some(item) = decoder.next()? else { unreachable!("the decoder ends only after a whole value") };
         match item.event {
@@ -73,16 +73,16 @@ pub fn read_in<A: Allocator + Clone>(bytes: &[u8], limits: Limits, alloc: A) -> 
             Event::Bool(b) => build.value(Value::Bool(b)),
             Event::Int(n) => build.value(Value::Int(n)),
             Event::Float(x) => build.value(Value::Float(x)),
-            Event::Text(text) => build.value(Value::Text(String::from_str_in(text, alloc.clone()))),
+            Event::Text(text) => build.value(Value::Text(String::from_str_in(text, alloc))),
             Event::Bytes(bytes) => {
-                let mut out = Vec::with_capacity_in(bytes.len(), alloc.clone());
+                let mut out = Vec::with_capacity_in(bytes.len(), alloc);
                 out.extend_from_slice(bytes);
                 build.value(Value::Bytes(out));
             }
             Event::StartList { len } => build.start_list(len.min(MOST_RESERVED)),
             Event::StartMap { len } => build.start_map(len.min(MOST_RESERVED)),
             Event::Key(key) => {
-                if build.key(String::from_str_in(key, alloc.clone())).is_err() {
+                if build.key(String::from_str_in(key, alloc)).is_err() {
                     unreachable!("the decoder refuses a key twice by the key order");
                 }
             }

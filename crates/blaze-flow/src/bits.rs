@@ -107,9 +107,9 @@ pub(crate) struct BitWorklist<A: Allocator> {
     bits: Vec<u64, A>,
 }
 
-impl<A: Allocator + Clone> BitWorklist<A> {
+impl<A: Allocator + Copy> BitWorklist<A> {
     pub(crate) fn new_in(len: usize, alloc: A) -> Self {
-        let mut levels = Vec::new_in(alloc.clone());
+        let mut levels = Vec::new_in(alloc);
         let mut bits = Vec::new_in(alloc);
         if len == 0 {
             return Self { levels, bits };

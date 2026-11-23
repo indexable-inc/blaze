@@ -29,13 +29,13 @@ use blaze_body::NONE;
 use blaze_flow::{Block, BorrowKind, Flow, Operand, Origin, Place, Proj, StmtKind, Value};
 
 /// Writes `flow`'s canonical text (the module doc says what is kept) to `out`.
-pub fn canon<A: Allocator + Clone>(flow: &Flow<A>, out: &mut impl Write, alloc: A) -> fmt::Result {
+pub fn canon<A: Allocator + Copy>(flow: &Flow<A>, out: &mut impl Write, alloc: A) -> fmt::Result {
     let nb = flow.blocks.len();
-    let mut preds = Vec::with_capacity_in(nb, alloc.clone());
+    let mut preds = Vec::with_capacity_in(nb, alloc);
     preds.resize(nb, 0u32);
-    let mut reached = Vec::with_capacity_in(nb, alloc.clone());
+    let mut reached = Vec::with_capacity_in(nb, alloc);
     reached.resize(nb, false);
-    let mut stack: Vec<Block, A> = Vec::new_in(alloc.clone());
+    let mut stack: Vec<Block, A> = Vec::new_in(alloc);
     if nb > 0 {
         stack.push(Block(0));
     }
@@ -50,7 +50,7 @@ pub fn canon<A: Allocator + Clone>(flow: &Flow<A>, out: &mut impl Write, alloc: 
         });
     }
     // The block a goto may join: the only edge into it is that goto.
-    let mut joined = Vec::with_capacity_in(nb, alloc.clone());
+    let mut joined = Vec::with_capacity_in(nb, alloc);
     joined.resize(nb, false);
     for b in 0..nb {
         if reached[b]
@@ -63,10 +63,10 @@ pub fn canon<A: Allocator + Clone>(flow: &Flow<A>, out: &mut impl Write, alloc: 
     }
 
     // Heads in preorder; a head's number is its index here.
-    let mut order: Vec<Block, A> = Vec::new_in(alloc.clone());
-    let mut number = Vec::with_capacity_in(nb, alloc.clone());
+    let mut order: Vec<Block, A> = Vec::new_in(alloc);
+    let mut number = Vec::with_capacity_in(nb, alloc);
     number.resize(nb, NONE);
-    let mut succs: Vec<Block, A> = Vec::new_in(alloc.clone());
+    let mut succs: Vec<Block, A> = Vec::new_in(alloc);
     if nb > 0 {
         stack.push(Block(0));
     }
@@ -86,11 +86,11 @@ pub fn canon<A: Allocator + Clone>(flow: &Flow<A>, out: &mut impl Write, alloc: 
 
     let mut p = Printer {
         flow,
-        local: filled(flow.local_places.len(), alloc.clone()),
+        local: filled(flow.local_places.len(), alloc),
         next_local: flow.args + 1,
-        loan: filled(flow.loans.len(), alloc.clone()),
+        loan: filled(flow.loans.len(), alloc),
         next_loan: 0,
-        origin: filled(flow.origins as usize, alloc.clone()),
+        origin: filled(flow.origins as usize, alloc),
         next_origin: 0,
         number: &number,
     };
@@ -156,7 +156,7 @@ pub fn canon<A: Allocator + Clone>(flow: &Flow<A>, out: &mut impl Write, alloc: 
             p.next_local += 1;
         }
     }
-    let mut pairs: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
+    let mut pairs: Vec<(u32, u32), A> = Vec::new_in(alloc);
     for &(l, o) in flow.local_origins.iter() {
         pairs.push((p.local[l.index()], p.origin_number(o)));
     }

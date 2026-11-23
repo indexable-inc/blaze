@@ -28,7 +28,7 @@ use core::alloc::Allocator;
 
 use crate::{At, Facts, Form, Lower, Plant, Refusal, Val};
 
-impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
+impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
     /// When the callee `vs[0]` is a closure value (or a reference to one, as `call_done` leaves
     /// an `Fn`/`FnMut` callee): relates the value's positions with `dest`'s (the module doc)
     /// and answers `true`; any other callee answers `false`, untouched.

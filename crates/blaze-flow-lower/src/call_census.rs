@@ -85,7 +85,7 @@ impl<A: Allocator> CallLog<A> {
 
 /// The owner's flow of `body` under `rule` (a fn's, or an `async fn`'s with its suspensions:
 /// front2 borrows_nested.rs `flow_of`'s `FlowOf::Owner`), logged.
-pub fn lower_owner_logged<A: Allocator + Clone, F: Facts>(
+pub fn lower_owner_logged<A: Allocator + Copy, F: Facts>(
     rule: CensusRule,
     body: &BodyView<'_>,
     ck: &Checked<'_>,
@@ -110,7 +110,7 @@ pub fn lower_owner_logged<A: Allocator + Clone, F: Facts>(
 }
 
 /// The body of closure `closure` under `rule` ([`crate::lower_closure_external`]), logged.
-pub fn lower_closure_logged<A: Allocator + Clone, F: Facts>(
+pub fn lower_closure_logged<A: Allocator + Copy, F: Facts>(
     rule: CensusRule,
     body: &BodyView<'_>,
     ck: &Checked<'_>,
@@ -128,7 +128,7 @@ pub fn lower_closure_logged<A: Allocator + Clone, F: Facts>(
 }
 
 /// Async block `block` under `rule` ([`crate::lower_async`]), logged.
-pub fn lower_async_logged<A: Allocator + Clone, F: Facts>(
+pub fn lower_async_logged<A: Allocator + Copy, F: Facts>(
     rule: CensusRule,
     body: &BodyView<'_>,
     ck: &Checked<'_>,
@@ -679,14 +679,14 @@ fn awaited_of<A: Allocator>(body: &BodyView<'_>, alloc: A) -> Vec<ExprId, A> {
 /// and a spread pair `(x, y)` for a `y` only one walk has would read as one rule's "fewer"
 /// (census 03:03, the five (b): every one at a call whose argument reaches `'static`; that
 /// this was their cause is a guess, the census rerun tells). [`derives`] closes it instead.
-fn pairs<A: Allocator + Clone>(log: &Log<A>, s: &Site<A>, alloc: A) -> Result<Vec<(Label, Label), A>, CensusBound> {
+fn pairs<A: Allocator + Copy>(log: &Log<A>, s: &Site<A>, alloc: A) -> Result<Vec<(Label, Label), A>, CensusBound> {
     let edges = log.edges.get(s.first as usize..s.end as usize).unwrap_or(&[]);
-    let mut next: Vec<(Origin, Origin), A> = Vec::with_capacity_in(edges.len(), alloc.clone());
+    let mut next: Vec<(Origin, Origin), A> = Vec::with_capacity_in(edges.len(), alloc);
     next.extend_from_slice(edges);
     next.sort_unstable();
     next.dedup();
-    let mut out: Vec<(Label, Label), A> = Vec::new_in(alloc.clone());
-    let mut reached: Vec<Origin, A> = Vec::new_in(alloc.clone());
+    let mut out: Vec<(Label, Label), A> = Vec::new_in(alloc);
+    let mut reached: Vec<Origin, A> = Vec::new_in(alloc);
     let mut stack: Vec<Origin, A> = Vec::new_in(alloc);
     for &(from, x) in s.labels.iter() {
         if x == Label::Uni(Region::Static) {
@@ -739,7 +739,7 @@ fn first_missing(one: &[(Label, Label)], old: &[(Label, Label)]) -> (Option<(Lab
 /// The two logs of one flow compared site by site (oracle.rs `compare`: paired by expression
 /// and occurrence), each call's row pushed to `out` in the old log's order, then the one
 /// log's calls the old lacks. `ck` reads a `PositionsNotSlots` node's head.
-pub fn compare_calls<A: Allocator + Clone, B: Allocator>(
+pub fn compare_calls<A: Allocator + Copy, B: Allocator>(
     old: &CallLog<A>,
     one: &CallLog<A>,
     body: &BodyView<'_>,
@@ -747,7 +747,7 @@ pub fn compare_calls<A: Allocator + Clone, B: Allocator>(
     out: &mut Vec<CallRow, B>,
     alloc: A,
 ) -> Result<(), CensusBound> {
-    let awaited = awaited_of(body, alloc.clone());
+    let awaited = awaited_of(body, alloc);
     let empty_sites: &[Site<A>] = &[];
     let old_sites = old.log.as_ref().map_or(empty_sites, |l| &l.sites[..]);
     let one_sites = one.log.as_ref().map_or(empty_sites, |l| &l.sites[..]);
@@ -757,7 +757,7 @@ pub fn compare_calls<A: Allocator + Clone, B: Allocator>(
         _ => None,
     };
     // Which of the one log's sites were paired.
-    let mut paired: Vec<bool, A> = Vec::with_capacity_in(one_sites.len(), alloc.clone());
+    let mut paired: Vec<bool, A> = Vec::with_capacity_in(one_sites.len(), alloc);
     paired.resize(one_sites.len(), false);
     for (i, o) in old_sites.iter().enumerate() {
         let k = old_sites[..i].iter().filter(|s| s.e == o.e).count();
@@ -787,8 +787,8 @@ pub fn compare_calls<A: Allocator + Clone, B: Allocator>(
             (Ok(()), Err(_)) => CallClass::OneRefuses,
             (Ok(()), Ok(())) => {
                 let (Some(lo), Some(ln)) = (old.log.as_ref(), one.log.as_ref()) else { return Err(CensusBound { e: o.e }) };
-                let a = pairs(lo, o, alloc.clone())?;
-                let b = pairs(ln, n, alloc.clone())?;
+                let a = pairs(lo, o, alloc)?;
+                let b = pairs(ln, n, alloc)?;
                 missing = first_missing(&b, &a);
                 match (missing.1 == 0, o.hub) {
                     (true, _) => CallClass::Same,

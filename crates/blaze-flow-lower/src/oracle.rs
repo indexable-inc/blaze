@@ -105,7 +105,7 @@ fn allowed(form: Form) -> bool {
 /// THE ENTRY: `body` lowered under both rules and compared ([`compare`]); a failing finding
 /// panics with the message ([`describe`]), a reported one is printed. Production's lowering is
 /// the answer. A planted lowering (`plant` not `None`) is production's alone.
-pub(crate) fn lower_checked<A: Allocator + Clone, F: Facts>(
+pub(crate) fn lower_checked<A: Allocator + Copy, F: Facts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     facts: &F,
@@ -122,7 +122,7 @@ pub(crate) fn lower_checked<A: Allocator + Clone, F: Facts>(
 
 /// [`lower_checked`] for the body of closure `closure` ([`crate::lower_closure_external`]).
 #[allow(dead_code, reason = "no fixture helper lowers a closure's own body yet (oracle test the_oracle_sees_a_closure_bodys_calls compares one through closure_against)")]
-pub(crate) fn lower_closure_checked<A: Allocator + Clone, F: Facts>(
+pub(crate) fn lower_closure_checked<A: Allocator + Copy, F: Facts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     closure: ExprId,
@@ -136,21 +136,21 @@ pub(crate) fn lower_closure_checked<A: Allocator + Clone, F: Facts>(
 
 /// [`lower_checked`] for an `async fn`'s body ([`crate::lower_async_fn`]).
 #[allow(dead_code, reason = "no fixture lowers an async fn's own body yet; the entry its first one calls")]
-pub(crate) fn lower_async_fn_checked<A: Allocator + Clone, F: Facts>(
+pub(crate) fn lower_async_fn_checked<A: Allocator + Copy, F: Facts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     facts: &F,
     alloc: A,
 ) -> Result<Lowered<A>, Refusal> {
     let (mut lo, mut ln) = (None, None);
-    let old = lower_async_fn_with::<A, F, OldPaths>(body, ck, facts, true, alloc.clone(), &mut lo);
+    let old = lower_async_fn_with::<A, F, OldPaths>(body, ck, facts, true, alloc, &mut lo);
     let one = lower_async_fn_with::<A, F, OneRule>(body, ck, facts, true, alloc, &mut ln);
     judge(&logs(&lo, &ln));
     if Production::ONE { one } else { old }
 }
 
 /// [`lower_checked`] for async block `block` ([`crate::lower_async`]).
-pub(crate) fn lower_async_checked<A: Allocator + Clone, F: Facts>(
+pub(crate) fn lower_async_checked<A: Allocator + Copy, F: Facts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     block: ExprId,
@@ -158,14 +158,14 @@ pub(crate) fn lower_async_checked<A: Allocator + Clone, F: Facts>(
     alloc: A,
 ) -> Result<LoweredAsync<A>, Refusal> {
     let (mut lo, mut ln) = (None, None);
-    let old = lower_async_with::<A, F, OldPaths>(body, ck, block, facts, true, alloc.clone(), &mut lo);
-    let one = lower_async_with::<A, F, OneRule>(body, ck, block, facts, true, alloc.clone(), &mut ln);
+    let old = lower_async_with::<A, F, OldPaths>(body, ck, block, facts, true, alloc, &mut lo);
+    let one = lower_async_with::<A, F, OneRule>(body, ck, block, facts, true, alloc, &mut ln);
     judge(&logs(&lo, &ln));
     let production = if Production::ONE { one } else { old };
     // W1's oracle (typeck.md "Witness records"): wherever production's lowering succeeds, the
     // witness lowering succeeds too, with equal statements and equal saved locals.
     if let Ok(p) = &production {
-        let w = match crate::coroutine::lower_async_witness(body, ck, block, facts, alloc.clone()) {
+        let w = match crate::coroutine::lower_async_witness(body, ck, block, facts, alloc) {
             Ok(w) => w,
             Err(r) => panic!("the witness lowering refused {r:?} where production's lowered async block {block:?}"),
         };
@@ -180,7 +180,7 @@ pub(crate) fn lower_async_checked<A: Allocator + Clone, F: Facts>(
 /// block, origins dropped: the locals and their types, wraps and identities, the statements,
 /// blocks, operands, successors, places, loans (place, kind, statement) and suspensions, and
 /// the saved bits. `None`: equal.
-pub(crate) fn witness_differs<A: Allocator + Clone>(p: &LoweredAsync<A>, w: &LoweredAsync<A>, alloc: A) -> Option<String> {
+pub(crate) fn witness_differs<A: Allocator + Copy>(p: &LoweredAsync<A>, w: &LoweredAsync<A>, alloc: A) -> Option<String> {
     let (pf, wf) = (&p.flow, &w.flow);
     if (pf.locals, pf.args) != (wf.locals, wf.args) {
         return Some(std::format!("locals/args {:?} vs {:?}", (pf.locals, pf.args), (wf.locals, wf.args)));
@@ -208,7 +208,7 @@ pub(crate) fn witness_differs<A: Allocator + Clone>(p: &LoweredAsync<A>, w: &Low
     {
         return Some(String::from("the loans"));
     }
-    let (ps, ws) = match (blaze_flow::saved(pf, alloc.clone()), blaze_flow::saved(wf, alloc)) {
+    let (ps, ws) = match (blaze_flow::saved(pf, alloc), blaze_flow::saved(wf, alloc)) {
         (Ok(a), Ok(b)) => (a, b),
         _ => return Some(String::from("the saved analysis past its bound")),
     };
@@ -243,7 +243,7 @@ fn logs<A: Allocator>(old: &Option<Log<A>>, one: &Option<Log<A>>) -> vec::Vec<Fi
 }
 
 /// [`against`] for the body of closure `closure`.
-pub(crate) fn closure_against<A: Allocator + Clone, F: Facts, R: CallRule>(
+pub(crate) fn closure_against<A: Allocator + Copy, F: Facts, R: CallRule>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     closure: ExprId,
@@ -251,20 +251,20 @@ pub(crate) fn closure_against<A: Allocator + Clone, F: Facts, R: CallRule>(
     alloc: A,
 ) -> (Result<ClosureFlow<A>, Refusal>, Result<ClosureFlow<A>, Refusal>, vec::Vec<Finding>) {
     let (mut lo, mut ln) = (None, None);
-    let old = lower_closure_with::<A, F, OldPaths>(body, ck, closure, facts, true, alloc.clone(), &mut lo);
+    let old = lower_closure_with::<A, F, OldPaths>(body, ck, closure, facts, true, alloc, &mut lo);
     let one = lower_closure_with::<A, F, R>(body, ck, closure, facts, true, alloc, &mut ln);
     let findings = logs(&lo, &ln);
     (old, one, findings)
 }
 
 /// `body` lowered under the old paths and under `R`, both logged, and their findings.
-pub(crate) fn against<A: Allocator + Clone, F: Facts, R: CallRule>(
+pub(crate) fn against<A: Allocator + Copy, F: Facts, R: CallRule>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     facts: &F,
     alloc: A,
 ) -> (Result<Lowered<A>, Refusal>, Result<Lowered<A>, Refusal>, vec::Vec<Finding>) {
-    let (old, old_log) = lower_with::<A, F, OldPaths>(body, ck, facts, Plant::None, true, alloc.clone());
+    let (old, old_log) = lower_with::<A, F, OldPaths>(body, ck, facts, Plant::None, true, alloc);
     let (one, one_log) = lower_with::<A, F, R>(body, ck, facts, Plant::None, true, alloc);
     let findings = logs(&old_log, &one_log);
     (old, one, findings)

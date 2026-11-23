@@ -46,13 +46,13 @@ pub(crate) trait Grain {
     /// `true` for [`RegionSlots`].
     const SLOTS: bool;
     /// How many origins a value of type `t` has.
-    fn count<F: Facts, A: Allocator + Clone, R: CallRule>(l: &Lower<'_, '_, F, A, R>, t: PTy, e: ExprId) -> Result<u32, Refusal>;
+    fn count<F: Facts, A: Allocator + Copy, R: CallRule>(l: &Lower<'_, '_, F, A, R>, t: PTy, e: ExprId) -> Result<u32, Refusal>;
     /// The variance of each origin of `t`, in its order, relative to the whole at covariant.
-    fn variances<F: Facts, A: Allocator + Clone, R: CallRule>(l: &Lower<'_, '_, F, A, R>, t: TyD, out: &mut Vec<Variance, A>, e: ExprId) -> Result<(), Refusal>;
+    fn variances<F: Facts, A: Allocator + Copy, R: CallRule>(l: &Lower<'_, '_, F, A, R>, t: TyD, out: &mut Vec<Variance, A>, e: ExprId) -> Result<(), Refusal>;
     /// The column `slots` of the body's own declared type `declared` laid over the body's type
     /// `body_t` of the same value: one entry per origin of `body_t`, its region, or `None` for a
     /// placeholder. `false` where the two do not walk in step (the caller refuses by name).
-    fn lay<F: Facts, A: Allocator + Clone, R: CallRule>(
+    fn lay<F: Facts, A: Allocator + Copy, R: CallRule>(
         l: &Lower<'_, '_, F, A, R>,
         declared: PTy,
         body_t: PTy,
@@ -61,7 +61,7 @@ pub(crate) trait Grain {
         e: ExprId,
     ) -> Result<bool, Refusal>;
     /// The knowns of the body's own signature's open projections, once it is laid.
-    fn own_known<F: Facts, A: Allocator + Clone, R: CallRule>(l: &mut Lower<'_, '_, F, A, R>, nparams: u32, root: ExprId) -> Result<(), Refusal>;
+    fn own_known<F: Facts, A: Allocator + Copy, R: CallRule>(l: &mut Lower<'_, '_, F, A, R>, nparams: u32, root: ExprId) -> Result<(), Refusal>;
 }
 
 /// The flow's positions (the old paths' grain, the module doc).
@@ -69,13 +69,13 @@ pub(crate) struct Positions;
 
 impl Grain for Positions {
     const SLOTS: bool = false;
-    fn count<F: Facts, A: Allocator + Clone, R: CallRule>(l: &Lower<'_, '_, F, A, R>, t: PTy, e: ExprId) -> Result<u32, Refusal> {
+    fn count<F: Facts, A: Allocator + Copy, R: CallRule>(l: &Lower<'_, '_, F, A, R>, t: PTy, e: ExprId) -> Result<u32, Refusal> {
         l.npos_positions(t, e)
     }
-    fn variances<F: Facts, A: Allocator + Clone, R: CallRule>(l: &Lower<'_, '_, F, A, R>, t: TyD, out: &mut Vec<Variance, A>, e: ExprId) -> Result<(), Refusal> {
+    fn variances<F: Facts, A: Allocator + Copy, R: CallRule>(l: &Lower<'_, '_, F, A, R>, t: TyD, out: &mut Vec<Variance, A>, e: ExprId) -> Result<(), Refusal> {
         l.variances_by_positions(t, out, e)
     }
-    fn lay<F: Facts, A: Allocator + Clone, R: CallRule>(
+    fn lay<F: Facts, A: Allocator + Copy, R: CallRule>(
         l: &Lower<'_, '_, F, A, R>,
         declared: PTy,
         body_t: PTy,
@@ -85,7 +85,7 @@ impl Grain for Positions {
     ) -> Result<bool, Refusal> {
         l.lay_over_in(declared, body_t, slots, out, true, e)
     }
-    fn own_known<F: Facts, A: Allocator + Clone, R: CallRule>(l: &mut Lower<'_, '_, F, A, R>, nparams: u32, root: ExprId) -> Result<(), Refusal> {
+    fn own_known<F: Facts, A: Allocator + Copy, R: CallRule>(l: &mut Lower<'_, '_, F, A, R>, nparams: u32, root: ExprId) -> Result<(), Refusal> {
         l.own_alias_known(nparams, root)
     }
 }
@@ -95,13 +95,13 @@ pub(crate) struct RegionSlots;
 
 impl Grain for RegionSlots {
     const SLOTS: bool = true;
-    fn count<F: Facts, A: Allocator + Clone, R: CallRule>(l: &Lower<'_, '_, F, A, R>, t: PTy, e: ExprId) -> Result<u32, Refusal> {
+    fn count<F: Facts, A: Allocator + Copy, R: CallRule>(l: &Lower<'_, '_, F, A, R>, t: PTy, e: ExprId) -> Result<u32, Refusal> {
         l.region_slots(t, e)
     }
-    fn variances<F: Facts, A: Allocator + Clone, R: CallRule>(l: &Lower<'_, '_, F, A, R>, t: TyD, out: &mut Vec<Variance, A>, e: ExprId) -> Result<(), Refusal> {
+    fn variances<F: Facts, A: Allocator + Copy, R: CallRule>(l: &Lower<'_, '_, F, A, R>, t: TyD, out: &mut Vec<Variance, A>, e: ExprId) -> Result<(), Refusal> {
         l.variances_by_slots(t, out, e)
     }
-    fn lay<F: Facts, A: Allocator + Clone, R: CallRule>(
+    fn lay<F: Facts, A: Allocator + Copy, R: CallRule>(
         l: &Lower<'_, '_, F, A, R>,
         declared: PTy,
         body_t: PTy,
@@ -114,7 +114,7 @@ impl Grain for RegionSlots {
     /// A projection's slots are its trait's lifetimes and its arguments' (rustc: an alias's
     /// regions are its arguments'): no origin stands for "the projection" to know a meet of,
     /// as the position grain's one position did. Its outlives are by components at each use.
-    fn own_known<F: Facts, A: Allocator + Clone, R: CallRule>(_: &mut Lower<'_, '_, F, A, R>, _: u32, _: ExprId) -> Result<(), Refusal> {
+    fn own_known<F: Facts, A: Allocator + Copy, R: CallRule>(_: &mut Lower<'_, '_, F, A, R>, _: u32, _: ExprId) -> Result<(), Refusal> {
         Ok(())
     }
 }
@@ -176,17 +176,17 @@ fn bound_region(binds: Option<&[Option<Region>]>, r: Region) -> Option<Region> {
 /// the impl's value, its column, and its lifetimes' bindings.
 type ThroughImpl<'b, A> = Option<(PTy, &'b [Region], Vec<Option<Region>, A>)>;
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R> {
+impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> {
     /// The region slots of `t` (the module doc), bounded.
     pub(crate) fn region_slots(&self, t: PTy, e: ExprId) -> Result<u32, Refusal> {
-        let mut path: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
+        let mut path: Vec<ExprId, A> = Vec::new_in(self.alloc);
         self.region_slots_in(t, &mut path, e)
     }
 
     /// [`Lower::region_slots`] inside the bodies `path` (the body expressions whose captures
     /// are being counted, outermost first).
     fn region_slots_in(&self, t: PTy, path: &mut Vec<ExprId, A>, e: ExprId) -> Result<u32, Refusal> {
-        let mut table: Vec<(PTy, SlotCount), A> = Vec::new_in(self.alloc.clone());
+        let mut table: Vec<(PTy, SlotCount), A> = Vec::new_in(self.alloc);
         self.body_slots_in(t, &mut table, path, e)?;
         let facts: &'b F = self.facts;
         let arity = FactsArity { facts };
@@ -202,7 +202,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
     /// slots ([`BodyTypes`]). A node whose children are not known is left to the count, which
     /// names it.
     pub(crate) fn body_slots(&self, t: PTy, table: &mut Vec<(PTy, SlotCount), A>, e: ExprId) -> Result<(), Refusal> {
-        let mut path: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
+        let mut path: Vec<ExprId, A> = Vec::new_in(self.alloc);
         self.body_slots_in(t, table, &mut path, e)
     }
 
@@ -216,7 +216,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
         let facts: &'b F = self.facts;
         let arity = FactsArity { facts };
         let cols = Columns::new(self.tys, &arity, &arity);
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
         stack.push(t);
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
@@ -336,10 +336,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
         let facts: &'b F = self.facts;
         let arity = FactsArity { facts };
         let heads = Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
-        let mut table: Vec<(PTy, SlotCount), A> = Vec::new_in(self.alloc.clone());
+        let mut table: Vec<(PTy, SlotCount), A> = Vec::new_in(self.alloc);
         self.body_slots(body_t, &mut table, e)?;
         let body = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &table);
-        let mut stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
         stack.push((declared, body_t));
         // The cursor into `slots`: the column's pre-order, as this walk visits it.
         let mut at = 0usize;
@@ -446,7 +446,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
         if self_col.as_slice().len() != decl_self.len() {
             return note(differ);
         }
-        let mut bind: Vec<Option<Region>, A> = Vec::new_in(self.alloc.clone());
+        let mut bind: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         bind.resize(params.count() as usize, None);
         for (&ir, &dr) in self_col.as_slice().iter().zip(decl_self.iter()) {
             match ir {

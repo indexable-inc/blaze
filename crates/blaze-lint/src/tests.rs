@@ -2165,3 +2165,22 @@ fn mut_ref_deprecated_with_autofix() {
         "fn f(r#mut: i32) { let _ = &r#mut; }",
     ]);
 }
+
+#[test]
+fn clone_handle_autofixes_rc_to_local_share_and_arc_to_share() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let only = RuleSet::only(&[Rule::Clones]);
+    let src = "fn f(a: &Arc<u8>, r: &Rc<u8>) {\n    let a2 = a.clone();\n    let r2 = r.clone();\n    let r3 = Rc::new_in(1, alloc);\n    let r4 = r3.clone();\n}\n";
+    let mut out = Findings::new_in(alloc);
+    assert!(lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 3);
+    let fixed = apply_all(src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(
+        fixed.as_str(),
+        "fn f(a: &Arc<u8>, r: &Rc<u8>) {\n    let a2 = a.share();\n    let r2 = r.local_share();\n    let r3 = Rc::new_in(1, alloc);\n    let r4 = r3.local_share();\n}\n"
+    );
+    // Re-linting the fixed code produces zero CloneHandle findings!
+    out.clear();
+    assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert!(out.list.is_empty(), "fixed code must have zero clone findings");
+}

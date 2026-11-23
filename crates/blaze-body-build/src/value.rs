@@ -1,7 +1,7 @@
 //! Operands, places and the `Value` variants of an assignment. Overflow is already an `Assert`
 //! row of the body, so every operation here is the plain one.
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 use core::alloc::Allocator;
 
 use blaze_body::{AggregateKind, BinOp, CastKind, Const, ConstKind, Local, Operand, Place, Proj, UnOp, Value as BodyValue};

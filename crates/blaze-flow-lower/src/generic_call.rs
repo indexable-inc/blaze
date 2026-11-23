@@ -232,16 +232,16 @@ pub struct Shape<'s> {
 }
 
 /// The owned form [`read_shape`] fills.
-pub struct ShapeBuf<A: Allocator + Clone> {
+pub struct ShapeBuf<A: Allocator + Copy> {
     pub marks: Vec<Mark, A>,
     pub ends: Vec<u32, A>,
     pub joins: Vec<u32, A>,
     pub skel: Vec<Skel, A>,
 }
 
-impl<A: Allocator + Clone> ShapeBuf<A> {
+impl<A: Allocator + Copy> ShapeBuf<A> {
     pub fn new_in(alloc: A) -> ShapeBuf<A> {
-        ShapeBuf { marks: Vec::new_in(alloc.clone()), ends: Vec::new_in(alloc.clone()), joins: Vec::new_in(alloc.clone()), skel: Vec::new_in(alloc) }
+        ShapeBuf { marks: Vec::new_in(alloc), ends: Vec::new_in(alloc), joins: Vec::new_in(alloc), skel: Vec::new_in(alloc) }
     }
 
     pub fn shape(&self) -> Shape<'_> {
@@ -412,7 +412,7 @@ const MOST: u32 = 4096;
 /// trait object (their slots of the head's column, counted by the one counter through
 /// `arity`), with every head parameter they name pushed to `joins`. `steps` is the walk's
 /// shared budget ([`MOST`]).
-fn under<A: Allocator + Clone>(
+fn under<A: Allocator + Copy>(
     tys: PTys<'_>,
     args: List,
     arity: &dyn Arity,
@@ -483,7 +483,7 @@ fn dedup_from<A: Allocator>(joins: &mut Vec<u32, A>, lo: usize) -> u32 {
 /// consume the column slot for slot. Refused: a closure or coroutine node, a count the facts
 /// do not know ([`ShapeRefusal::AdtUnknown`], [`ShapeRefusal::CountUnknown`]). The output's
 /// nodes go to `out.skel` when it holds a projection or an opaque type.
-pub fn read_shape<A: Allocator + Clone>(
+pub fn read_shape<A: Allocator + Copy>(
     tys: PTys<'_>,
     inputs: &[PTy],
     output: PTy,
@@ -497,7 +497,7 @@ pub fn read_shape<A: Allocator + Clone>(
     out.skel.clear();
     let mut projections = false;
     // The work list of [`under`], whose order does not matter (a count and a set).
-    let mut scratch: Vec<PTy, A> = Vec::new_in(alloc.clone());
+    let mut scratch: Vec<PTy, A> = Vec::new_in(alloc);
     // A work list in the lowering's order: popped last first, so children go in reversed.
     let mut stack: Vec<PTy, A> = Vec::new_in(alloc);
     for (j, &top) in inputs.iter().chain(core::iter::once(&output)).enumerate() {
@@ -582,7 +582,7 @@ pub fn read_shape<A: Allocator + Clone>(
 }
 
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
+impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
     /// Notes why this call was not lined up ([`Misfit`]) and relates nothing (`Ok(false)`).
     fn misfit(&mut self, why: Misfit) -> Result<bool, Refusal> {
         self.misfit = why;
@@ -618,7 +618,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         if dest_ty.wrap.is_some() {
             return Ok(false);
         }
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
         stack.push(dest_ty.ty);
         for &s in skel {
             let Some(t) = stack.pop() else { return Ok(false) };
@@ -668,8 +668,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         let facts: &'b F = self.facts;
         let Ok(sig) = facts.sig(self.body.owner) else { return Ok(()) };
         let own = facts.ties(self.body.owner);
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
-        let mut held: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
+        let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
         for l in 0..=nparams as usize {
             if l == 0 && !matches!(sig.body(), BodyOut::Output) {
                 continue;
@@ -783,7 +783,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         let facts: &'b F = self.facts;
         let tys = facts.region_tys().unwrap_or(self.tys);
         let arity = crate::one_call::FactsArity { facts };
-        Ok(read_shape(tys, inputs, written, &arity, out, self.alloc.clone()).is_ok())
+        Ok(read_shape(tys, inputs, written, &arity, out, self.alloc).is_ok())
     }
 
     /// [`Self::call_by_generic_signature`] with the destination holding the call's `value`
@@ -814,7 +814,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         // The column's slots, every part's in order (`SigLife::slots`: the inputs', then the
         // output's; the root has none of its own), and where each input's end.
         let column: &[Region] = life.slots();
-        let mut life_ends: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut life_ends: Vec<u32, A> = Vec::new_in(self.alloc);
         let mut at = 0u32;
         for k in 0..life.inputs() {
             let Some(s) = life.input(k) else { return self.misfit(Misfit::Malformed { part: k }) };
@@ -826,7 +826,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         }
         // The slots the destination's part reads after the inputs': the output's, or an
         // awaited call's written return type's (`CallValue::Awaited`).
-        let mut joined: Vec<Region, A> = Vec::new_in(self.alloc.clone());
+        let mut joined: Vec<Region, A> = Vec::new_in(self.alloc);
         let all: &[Region] = match value {
             CallValue::Returned => column,
             CallValue::Awaited { slots, .. } => {
@@ -837,14 +837,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         };
         let args: &'c [PTy] = self.list(g, e)?;
         // Each type argument's position count; where its origins start once made.
-        let mut arg_at: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+        let mut arg_at: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
         for &a in args {
             arg_at.push((u32::MAX, self.npos(a, e)?));
         }
         // The bounds this does not relate: refused where they could matter. A type parameter
         // of the body is related by its placeholder (param_outlives.rs); any other type
         // without positions is refused.
-        let mut held: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
         for i in 0..(bounds.unread_below as usize).min(args.len()) {
             held.clear();
             let positions = arg_at[i].1;
@@ -854,7 +854,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
                 return self.refuse(Form::CallOutlivesUnread { callee, param: i as u32, why }, e);
             }
         }
-        let mut param_bounds: Vec<(u32, Region), A> = Vec::new_in(self.alloc.clone());
+        let mut param_bounds: Vec<(u32, Region), A> = Vec::new_in(self.alloc);
         for &(subject, region) in bounds.outlives {
             let p = subject.param();
             let Some(&t) = args.get(p as usize) else {
@@ -891,13 +891,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         }
         // First pass: what stands at every position of every operand, then the destination,
         // each part's count checked against its place before any origin is made.
-        let mut seq: Vec<Slot, A> = Vec::new_in(self.alloc.clone());
-        let mut map_ends: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut seq: Vec<Slot, A> = Vec::new_in(self.alloc);
+        let mut map_ends: Vec<u32, A> = Vec::new_in(self.alloc);
         // The projections, opaque types and trait objects the parts hold, in the marks' order
         // (`Slot::Joined`); the output's projections' and opaque types' destination counts
         // (`proj_counts`), taken in order (`pk`).
-        let mut counts: Vec<(u32, bool, Option<ItemKey>), A> = Vec::new_in(self.alloc.clone());
-        let mut projs: Vec<Proj, A> = Vec::new_in(self.alloc.clone());
+        let mut counts: Vec<(u32, bool, Option<ItemKey>), A> = Vec::new_in(self.alloc);
+        let mut projs: Vec<Proj, A> = Vec::new_in(self.alloc);
         let mut pk = 0usize;
         // The type check's selections at this call (`Checked::selected_at`) are one per
         // projection of the callee's signature, in its walk order, which is the marks' order;
@@ -1091,12 +1091,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         // The instantiated origin of every position: each signature region once per call
         // (`instance`), each type argument's positions one set per call, shared by every place
         // its parameter stands.
-        let mut arg_origs: Vec<Origin, A> = Vec::new_in(self.alloc.clone());
-        let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc.clone());
+        let mut arg_origs: Vec<Origin, A> = Vec::new_in(self.alloc);
+        let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc);
         // The trait lifetimes the call's bounds fix are the caller's, never fresh (trait_ties.rs):
         // a projection's trait lifetime arguments are regions of the column like any other, so
         // the tie meets them as it meets every region the signature writes.
-        let mut impl_ties = crate::trait_ties::ImplTies::new_in(self.alloc.clone());
+        let mut impl_ties = crate::trait_ties::ImplTies::new_in(self.alloc);
         self.tie_bounds(callee, life, args, &mut inst, &mut impl_ties, e)?;
         // What an impl answering a bound over a concrete argument says (trait_ties.rs rule
         // (d)): its trait lifetimes are that argument's positions, made here as the slots below
@@ -1110,7 +1110,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
             },
             e,
         )?;
-        let mut map: Vec<Origin, A> = Vec::new_in(self.alloc.clone());
+        let mut map: Vec<Origin, A> = Vec::new_in(self.alloc);
         // The destination's first position, and whether it is a reference's (then only flowed
         // into, as every other path relates a destination).
         let dest_lo = map_ends.get(vs.len().wrapping_sub(1)).copied().unwrap_or(0) as usize;
@@ -1203,8 +1203,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
             };
             map.push(o);
         }
-        let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
-        let mut vars: Vec<crate::Variance, A> = Vec::new_in(self.alloc.clone());
+        let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
+        let mut vars: Vec<crate::Variance, A> = Vec::new_in(self.alloc);
         lo = 0;
         for i in 0..=vs.len() {
             let hi = map_ends[i];

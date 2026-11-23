@@ -77,7 +77,7 @@ use crate::identity::{Identity, Role};
 use crate::{At, AwaitUnrelated, BodyOut, External, Facts, Form, Lower, MOST_POSITIONS, Refusal, Region, Task, TyD, range_of};
 
 /// An async block's body lowered as its own flow.
-pub struct LoweredAsync<A: Allocator + Clone> {
+pub struct LoweredAsync<A: Allocator + Copy> {
     pub flow: Flow<A>,
     /// Per local of `flow`, its type in `ck.types` (`PTy`).
     pub local_ty: Vec<PTy, A>,
@@ -110,7 +110,7 @@ pub struct LoweredAsync<A: Allocator + Clone> {
 }
 
 /// The body of async block `block` (an `Expr::AsyncBlock` of `body`) as its own flow.
-pub fn lower_async<A: Allocator + Clone, F: Facts>(
+pub fn lower_async<A: Allocator + Copy, F: Facts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     block: ExprId,
@@ -122,7 +122,7 @@ pub fn lower_async<A: Allocator + Clone, F: Facts>(
 
 /// [`lower_async`] under the call rule `R`; with `logged` (the oracle's comparing lowering,
 /// lib.rs `lower_with`) each call's record into `log`, kept on a refusal too.
-pub(crate) fn lower_async_with<A: Allocator + Clone, F: Facts, R: crate::one_call::CallRule>(
+pub(crate) fn lower_async_with<A: Allocator + Copy, F: Facts, R: crate::one_call::CallRule>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     block: ExprId,
@@ -138,13 +138,13 @@ pub(crate) fn lower_async_with<A: Allocator + Clone, F: Facts, R: crate::one_cal
     };
     // Only expressions evaluated by this block contribute suspension points. Evaluating a
     // closure or nested async block constructs its captures; its body has a flow of its own.
-    let mut l: Lower<'_, '_, F, A, R> = Lower::new(body, ck, facts, alloc.clone())?;
+    let mut l: Lower<'_, '_, F, A, R> = Lower::new(body, ck, facts, alloc)?;
     if logged {
-        l.b.start_log(alloc.clone());
+        l.b.start_log(alloc);
         l.per_call = true;
     }
     l.async_root = Some(block);
-    let mut externals: Vec<(blaze_flow::Origin, External), A> = Vec::new_in(alloc.clone());
+    let mut externals: Vec<(blaze_flow::Origin, External), A> = Vec::new_in(alloc);
     let ran = l.run_async(block, inner, &mut externals);
     let ran = l.finish_held(ran);
     *log = l.b.take_log();
@@ -157,7 +157,7 @@ pub(crate) fn lower_async_with<A: Allocator + Clone, F: Facts, R: crate::one_cal
     if l.local_ty.len() != flow.locals as usize {
         return Err(Refusal { form: Form::Malformed, range });
     }
-    let mut local_ty = Vec::new_in(alloc.clone());
+    let mut local_ty = Vec::new_in(alloc);
     let mut local_wrap = Vec::new_in(alloc);
     for t in l.local_ty.iter() {
         local_ty.push(t.ty);
@@ -183,11 +183,11 @@ pub(crate) fn lower_async_with<A: Allocator + Clone, F: Facts, R: crate::one_cal
 /// related, so a borrow check over it would pass what it must refuse. Only the facts a witness
 /// is read for leave it: [`AsyncWitness::interior_parts`], [`AsyncWitness::state_recipe`],
 /// [`AsyncWitness::saved`] and the per-local columns.
-pub struct AsyncWitness<A: Allocator + Clone> {
+pub struct AsyncWitness<A: Allocator + Copy> {
     lowered: LoweredAsync<A>,
 }
 
-impl<A: Allocator + Clone> AsyncWitness<A> {
+impl<A: Allocator + Copy> AsyncWitness<A> {
     /// Per local, its type in `ck.types` ([`LoweredAsync::local_ty`]).
     pub fn local_ty(&self) -> &[PTy] {
         &self.lowered.local_ty
@@ -243,7 +243,7 @@ impl<A: Allocator + Clone> AsyncWitness<A> {
 /// not know (`InlineAsm`, `UnknownAdt`, `TypeNode`, `Bound`, `Malformed`), each by name; never a
 /// region reason (`CallHiddenInput`, `CallOutlivesUnread`, `RegionsUnread`, a `OneRule` count,
 /// `ClosureSigUnaligned`). The borrow check keeps [`lower_async`].
-pub fn lower_async_witness<A: Allocator + Clone, F: Facts>(
+pub fn lower_async_witness<A: Allocator + Copy, F: Facts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     block: ExprId,
@@ -273,7 +273,7 @@ pub(crate) enum InteriorPlant {
 /// `out` does not hold as the record does is refused by name ([`Form::InteriorTable`]). The
 /// Reference's rule (typeck's rules/coroutine.rs doc lines 11-12): "Its auto traits (`Send`,
 /// `Sync`) are its interior's: its captures and every value live across an `.await`."
-pub fn interior<A: Allocator + Clone>(
+pub fn interior<A: Allocator + Copy>(
     lowered: &LoweredAsync<A>,
     ck: &Checked<'_>,
     block: ExprId,
@@ -284,7 +284,7 @@ pub fn interior<A: Allocator + Clone>(
 }
 
 #[cfg(test)]
-pub(crate) fn interior_planted<A: Allocator + Clone>(
+pub(crate) fn interior_planted<A: Allocator + Copy>(
     lowered: &LoweredAsync<A>,
     ck: &Checked<'_>,
     block: ExprId,
@@ -310,11 +310,11 @@ pub struct InteriorPart {
 /// with a table of its own (front2 opaque_auto.rs) copies each `ty` and makes the wraps there.
 /// A local or capture whose type the record does not hold is refused by name
 /// ([`Form::Malformed`]).
-pub fn interior_parts<A: Allocator + Clone>(lowered: &LoweredAsync<A>, ck: &Checked<'_>, block: ExprId, alloc: A) -> Result<Vec<InteriorPart, A>, Refusal> {
+pub fn interior_parts<A: Allocator + Copy>(lowered: &LoweredAsync<A>, ck: &Checked<'_>, block: ExprId, alloc: A) -> Result<Vec<InteriorPart, A>, Refusal> {
     parts_with(lowered, ck, block, false, alloc)
 }
 
-fn parts_with<A: Allocator + Clone>(
+fn parts_with<A: Allocator + Copy>(
     lowered: &LoweredAsync<A>,
     ck: &Checked<'_>,
     block: ExprId,
@@ -327,9 +327,9 @@ fn parts_with<A: Allocator + Clone>(
     if lowered.local_ty.len() != flow.locals as usize || lowered.local_wrap.len() != flow.locals as usize {
         return Err(refuse(Form::Malformed));
     }
-    let saved = blaze_flow::suspend::saved(flow, alloc.clone()).map_err(|_| refuse(Form::Bound))?;
+    let saved = blaze_flow::suspend::saved(flow, alloc).map_err(|_| refuse(Form::Bound))?;
     let record = ck.types.view();
-    let mut parts: Vec<InteriorPart, A> = Vec::new_in(alloc.clone());
+    let mut parts: Vec<InteriorPart, A> = Vec::new_in(alloc);
     // The saved locals; the arguments are the captures, taken below by their kind.
     for l in flow.args + 1..flow.locals {
         if !every_local && !saved.is_saved(Local(l)) {
@@ -372,7 +372,7 @@ fn parts_with<A: Allocator + Clone>(
     Ok(unique)
 }
 
-fn interior_with<A: Allocator + Clone>(
+fn interior_with<A: Allocator + Copy>(
     lowered: &LoweredAsync<A>,
     ck: &Checked<'_>,
     block: ExprId,
@@ -382,12 +382,12 @@ fn interior_with<A: Allocator + Clone>(
 ) -> Result<PTy, Refusal> {
     let range = lowered.range;
     let refuse = |form: Form| Refusal { form, range };
-    let parts = parts_with(lowered, ck, block, every_local, alloc.clone())?;
+    let parts = parts_with(lowered, ck, block, every_local, alloc)?;
     let record = ck.types.view();
     if out.view().len() < record.len() {
         return Err(refuse(Form::InteriorTable));
     }
-    let mut tys: Vec<PTy, A> = Vec::new_in(alloc.clone());
+    let mut tys: Vec<PTy, A> = Vec::new_in(alloc);
     for p in parts.iter() {
         same_in(record.get(p.ty), out.view().get(p.ty)).ok_or(refuse(Form::InteriorTable))?;
         let t = match p.wrap {
@@ -415,14 +415,14 @@ fn same_in(record: Option<&PNode>, out: Option<&PNode>) -> Option<()> {
     }
 }
 
-impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
+impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
     /// The walk of an async block's body `inner`: as `run`, with the block's captures as the
     /// arguments and its output as the return place. `externals` receives what each capture's
     /// and the output's placeholder stands for in the block's maker ([`LoweredAsync::externals`]).
     fn run_async(&mut self, block: ExprId, inner: ExprId, externals: &mut Vec<(blaze_flow::Origin, External), A>) -> Result<(), Refusal> {
         let ck = self.ck;
         // The block's captures, in row order: argument `1 + k` is row `k`.
-        let mut rows: Vec<(PatId, CaptureKind), A> = Vec::new_in(self.alloc.clone());
+        let mut rows: Vec<(PatId, CaptureKind), A> = Vec::new_in(self.alloc);
         {
             let firsts = ck.captures.column::<0>();
             let pats = ck.captures.column::<1>();
@@ -434,7 +434,7 @@ impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_,
             }
         }
         let nu = rows.len() as u32;
-        self.b.replace(blaze_flow::FlowBuilder::new_in(1 + nu, nu, self.alloc.clone()));
+        self.b.replace(blaze_flow::FlowBuilder::new_in(1 + nu, nu, self.alloc));
         self.nargs = nu;
         let entry = self.b.block();
         self.ret_block = self.b.block();
@@ -680,7 +680,7 @@ impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_,
     }
 }
 
-impl<'b, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b, '_, F, A, R> {
+impl<'b, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, '_, F, A, R> {
     /// The root block of an `async fn`, its captures (`rows`, arguments `1..`) and return place
     /// (its value) laid: the Reference, "Async functions": `async fn f(x: &u8) -> T` is "roughly
     /// equivalent to" `fn f<'a>(x: &'a u8) -> impl Future<Output = T> + 'a`, its body an `async
@@ -719,10 +719,10 @@ impl<'b, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b,
         if !sig.well_formed() || sig.inputs() as usize != body.params.len() {
             return self.refuse(Form::SigUnaligned, block);
         }
-        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc.clone());
+        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         // The written return type's column over the block's value's own type (`lay_over`); a
         // hidden position is a placeholder of its own below.
-        let mut written: Vec<Option<Region>, A> = Vec::new_in(self.alloc.clone());
+        let mut written: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         let out_ty = self.local_ty[0].ty;
         if !self.lay_over(written_col.ty(), out_ty, written_col.as_slice(), &mut written, block)? {
             return self.refuse(Form::SigUnaligned, block);
@@ -778,7 +778,7 @@ impl<'b, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b,
             self.b.known(u, o);
         }
         // The implied bounds of the captures' and the value's types (`&'a T`: `T: 'a`).
-        let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+        let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
         for l in 0..=rows.len() {
             let (start, _) = self.local_origs[l];
             let t = self.local_ty[l];
