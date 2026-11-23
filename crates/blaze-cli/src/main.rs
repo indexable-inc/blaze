@@ -403,8 +403,8 @@ struct Flags<'a> {
     /// `--names-oracle`: `check` decides every crate's names twice and compares them (D158 step
     /// 1, engine_names.rs `NamesOracle`).
     names_oracle: engine_names::NamesOracle,
-    /// `--driver=ready|phases`: which driver `check` runs an edit on (D187; engine_ready_edit.rs
-    /// `Driver`). `phases` until the two give byte-equal stored answers on tempo.
+    /// `--driver=auto|ready|phases`: which driver `check` runs an edit on (D187; engine_ready_edit.rs
+    /// `Driver`). `auto` (the default) uses `ready` for eligible edits and falls back to `phases`.
     driver: engine_ready_edit::Driver,
     /// `--block-scopes=bodies|modules` (D189 step 4, rule 78): whether a body's blocks are
     /// modules of the crate solve (`modules`, the default) or each body's own `BodyScope`
@@ -430,7 +430,7 @@ impl<'a> Flags<'a> {
             status_every: None,
             select: run_package::Select::NONE,
             names_oracle: engine_names::NamesOracle::Off,
-            driver: engine_ready_edit::Driver::Phases,
+            driver: engine_ready_edit::Driver::Auto,
             block_scopes: blaze_scope::surface::BlockScopes::Modules,
         }
     }
@@ -485,7 +485,7 @@ fn parse_flags<'a>(args: &'a Args, mut package: impl FnMut(&'a str)) -> Result<F
             "--stats" => flags.stats = true,
             "--each" => flags.each = true,
             "--names-oracle" => flags.names_oracle = engine_names::NamesOracle::On,
-            _ if arg.starts_with("--driver=") => flags.driver = engine_ready_edit::Driver::parse(&arg["--driver=".len()..]).ok_or(CliError::Usage("--driver is ready or phases"))?,
+            _ if let Some(word) = arg.strip_prefix("--driver=") => flags.driver = engine_ready_edit::Driver::parse(word).ok_or(CliError::Usage("--driver is auto, ready or phases"))?,
             _ if arg.starts_with("--block-scopes=") => {
                 flags.block_scopes = blaze_scope::surface::BlockScopes::parse(&arg["--block-scopes=".len()..]).ok_or(CliError::Usage("--block-scopes is bodies or modules"))?
             }

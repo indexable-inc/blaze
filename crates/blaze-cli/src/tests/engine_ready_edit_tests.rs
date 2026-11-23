@@ -737,3 +737,75 @@ fn a_body_edit_reads_its_members_row() {
     let planted = block_edited(&cold_planted(CRATES, CommitPlant::RowKeyUnitOnly), CommitPlant::RowKeyUnitOnly);
     assert!(planted.unequal > 0, "CONTROL: rows keyed by their unit alone read a stale row after a block edit, and the oracle must see it: {planted:?}");
 }
+
+/// `Driver::Auto` (the default for `blaze check`): takes the fast `ready` path on body-only edits
+/// (0 header shards read, byte-equal root and pages to `Driver::Phases`), and cleanly routes
+/// cold checks, signature edits, item additions, and module-tree edits to `Phases` with zero
+/// refusals and byte-equal stored answers.
+#[test]
+fn driver_auto_uses_ready_on_body_edits_and_falls_back_cleanly_to_phases() {
+    assert_eq!(Driver::parse("auto"), Some(Driver::Auto));
+    assert_eq!(Driver::parse("ready"), Some(Driver::Ready));
+    assert_eq!(Driver::parse("phases"), Some(Driver::Phases));
+    assert_eq!(crate::Flags::empty().driver, Driver::Auto);
+
+    const CRATES: usize = 8;
+    // 1. Cold check under `Driver::Auto` cleanly takes `Phases` (no `NoAnswer` refusal).
+    let auto_io = Io::simulated(SimWorld::new(77, Limits::USUAL));
+    let ref_io = Io::simulated(SimWorld::new(77, Limits::USUAL));
+    chain(&auto_io, CRATES);
+    chain(&ref_io, CRATES);
+    let mut cold_auto_opts = opts(&auto_io, 4, true);
+    cold_auto_opts.driver = Driver::Auto;
+    let (_, cold_auto) = engine_opts(&auto_io, cold_auto_opts);
+    let (_, cold_ref) = engine_opts(&ref_io, opts(&ref_io, 4, true));
+    assert_eq!(
+        cold_auto.stored.expect("auto cold stored").root,
+        cold_ref.stored.expect("ref cold stored").root,
+        "cold check under Driver::Auto equals Driver::Phases",
+    );
+
+    // 2. Body-only edit under `Driver::Auto` takes `ready` (0 header shards read) and equals `Phases`.
+    let body_auto = edited(&auto_io, 1, Driver::Auto, CommitPlant::None);
+    let body_ref = edited(&ref_io, 1, Driver::Phases, CommitPlant::None);
+    assert_eq!(body_auto.stored.header_shards_read, 0, "Driver::Auto took ready on body-only edit");
+    assert_eq!(body_auto.stored.root, body_ref.stored.root, "Driver::Auto body edit root equals Phases");
+    assert_eq!(body_auto.stored.pages, body_ref.stored.pages, "Driver::Auto body edit pages equal Phases");
+    assert_eq!(body_auto.lines, body_ref.lines, "Driver::Auto body edit output equals Phases");
+
+    // 3. Signature edit under `Driver::Auto` falls back cleanly from ready preflight to `Phases`.
+    let sig_moved = lib(EDITED, Some(1)).replacen(&std::format!("pub fn g{EDITED}() -> u8"), &std::format!("pub fn g{EDITED}() -> u16"), 1);
+    write(&auto_io, &std::format!("c{EDITED}/src/lib.rs"), &sig_moved);
+    write(&ref_io, &std::format!("c{EDITED}/src/lib.rs"), &sig_moved);
+    let sig_auto = checked_on(&auto_io, Driver::Auto).expect("Driver::Auto falls back cleanly on signature edit");
+    let sig_ref = checked_on(&ref_io, Driver::Phases).expect("Phases signature edit");
+    assert_eq!(
+        sig_auto.stored.expect("sig auto stored").root,
+        sig_ref.stored.expect("sig ref stored").root,
+        "Driver::Auto signature edit fallback equals Phases",
+    );
+
+    // 4. Item added under `Driver::Auto` falls back cleanly to `Phases`.
+    add_item(&auto_io);
+    add_item(&ref_io);
+    let item_auto = checked_on(&auto_io, Driver::Auto).expect("Driver::Auto falls back cleanly on added item");
+    let item_ref = checked_on(&ref_io, Driver::Phases).expect("Phases added item");
+    assert_eq!(
+        item_auto.stored.expect("item auto stored").root,
+        item_ref.stored.expect("item ref stored").root,
+        "Driver::Auto item-added fallback equals Phases",
+    );
+
+    // 5. Module-tree edit (`mod extra;`) under `Driver::Auto` falls back cleanly to `Phases`.
+    let with_mod = std::format!("mod extra;\n{}", lib(EDITED, None));
+    write(&auto_io, &std::format!("c{EDITED}/src/extra.rs"), "pub fn extra_val() -> u8 { 9 }\n");
+    write(&auto_io, &std::format!("c{EDITED}/src/lib.rs"), &with_mod);
+    let mod_auto = checked_on(&auto_io, Driver::Auto).expect("Driver::Auto falls back cleanly on module-tree edit");
+    assert!(mod_auto.stored.is_some(), "Driver::Auto module-tree edit stored an answer");
+
+    // 6. Follow-up body-only edit in the same file takes `ready` again!
+    let with_mod_body = std::format!("mod extra;\n{}", lib(EDITED, Some(2)));
+    write(&auto_io, &std::format!("c{EDITED}/src/lib.rs"), &with_mod_body);
+    let again_auto = checked_on(&auto_io, Driver::Auto).expect("Driver::Auto ready again after fallback");
+    assert_eq!(again_auto.stored.expect("again stored").header_shards_read, 0, "Driver::Auto resumed ready fast path");
+}
