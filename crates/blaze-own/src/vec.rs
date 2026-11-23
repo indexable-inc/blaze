@@ -188,6 +188,17 @@ impl<T, A: Allocator> Vec<T, A> {
         // SAFETY: slots `len..capacity` are in the buffer; `MaybeUninit` needs no value there.
         unsafe { slice::from_raw_parts_mut(self.buf.ptr().add(self.len).cast(), spare) }
     }
+}
+
+impl<A: Allocator> Vec<u8, A> {
+    /// Open a zero-pre-zeroing [`crate::ByteCursor`] appending into this vector's spare capacity.
+    #[inline]
+    pub fn byte_cursor(&mut self) -> crate::ByteCursor<'_, A> {
+        crate::ByteCursor::new(self)
+    }
+}
+
+impl<T, A: Allocator> Vec<T, A> {
 
     /// Room for at least `additional` more values, growing by at least twice its capacity.
     #[inline]
