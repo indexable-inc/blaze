@@ -15,8 +15,7 @@
 //! shim, never xcrun), `hostname` and `uname`; sh's `runs` are the programs its configure and
 //! make's recipes start. A row's `runs_out_dir` ([`HostTool::runs_out_dir`], [`runs_out_dir`])
 //! says the tool starts what the script wrote under OUT_DIR (configure's test programs): only
-//! then may the script's sandbox start programs there (native.rs `seatbelt_with`'s
-//! `exec_under`).
+//! then may the script's sandbox start programs there (`bstd::procs::hermetic::HermeticOpts::helper_folders`).
 //!
 //! nm-row: a row's program is on the machine (`path`, its resolved real path) or on the pinned
 //! toolchain's shelf (`shelf`, the name of its row in the table's `shelf_programs`, which pins
@@ -277,7 +276,6 @@ mod tests {
     use blaze_own::Alloc;
 
     use super::{HostToolError, MARK, RUN_KIND, RUN_KIND_HOST_TOOL, granted, host_tools, marked, run_kind, runs_out_dir};
-    use crate::native::{Grant, seatbelt_with};
     use blaze_pins::CLANG_JSON as PIN;
 
     /// The checked-in table grants perl, at its real path with the system's Perl folders, to
@@ -399,50 +397,5 @@ mod tests {
         assert_eq!(sha3.iter().map(|t| t.name).collect::<std::vec::Vec<_>>(), ["perl"]);
         assert!(!runs_out_dir(&sha3));
         println!("jemalloc tools: {}; runs out dir: {}", names.join(" "), out_dir.join(" "));
-    }
-
-    /// D112: the Seatbelt profile of tikv-jemalloc-sys's grant, made as blaze-proc-macro's
-    /// `native_script` makes it (each tool's programs executed; OUT_DIR in `exec_under` when
-    /// [`runs_out_dir`]), lets the script start sh, make, hostname, uname, bash and sed, and
-    /// anything under its OUT_DIR; it never names the `/usr/bin/make` shim. sha3-asm's profile
-    /// does not let it start what is under its OUT_DIR. A wrong fix (no rows, or the OUT_DIR grant
-    /// for every script) fails here. Prints "jemalloc profile: exec grants and out dir; sha3-asm:
-    /// perl, no out dir".
-    #[test]
-    fn the_jemalloc_profile_holds_the_exec_grants() {
-        let alloc = blaze_own::testing::heap().alloc();
-        let mac = host_tools(PIN, "aarch64-apple-darwin", alloc).expect("the macOS row");
-        let out = "/w/out";
-        let exec_section = |package: &str| -> std::string::String {
-            let tools = granted(&mac, package, alloc);
-            let owned: std::vec::Vec<blaze_own::AString<'_>> = tools.iter().flat_map(|t| t.programs_in("/shelf", alloc)).collect();
-            let exec: std::vec::Vec<&str> = owned.iter().map(|p| p.as_str()).collect();
-            let writes = [out];
-            let grant = Grant { program: "/w/script", exec: &exec, read: &[], write: &writes };
-            let out_only = [out];
-            let exec_under: &[&str] = if runs_out_dir(&tools) { &out_only } else { &[] };
-            let profile = seatbelt_with(&grant, exec_under, alloc).expect("a sayable grant");
-            let start = profile.find("(allow process-exec").expect("the exec section");
-            let end = profile[start..].find(")\n").expect("its end") + start;
-            profile[start..end].to_owned()
-        };
-        let jemalloc = exec_section("tikv-jemalloc-sys");
-        let programs = [
-            "/bin/sh",
-            "/Applications/Xcode.app/Contents/Developer/usr/bin/make",
-            "/bin/hostname",
-            "/usr/bin/uname",
-            "/bin/bash",
-            "/usr/bin/sed",
-        ];
-        for program in programs {
-            assert!(jemalloc.contains(&format!("(literal \"{program}\")")), "{program} in {jemalloc}");
-        }
-        assert!(jemalloc.contains("(subpath \"/w/out\")"), "OUT_DIR started from: {jemalloc}");
-        assert!(!jemalloc.contains("(literal \"/usr/bin/make\")"), "the shim: {jemalloc}");
-        let sha3 = exec_section("sha3-asm");
-        assert!(sha3.contains("(literal \"/usr/bin/perl\")"), "{sha3}");
-        assert!(!sha3.contains("/w/out"), "sha3-asm starts nothing under OUT_DIR: {sha3}");
-        println!("jemalloc profile: exec grants and out dir; sha3-asm: perl, no out dir");
     }
 }

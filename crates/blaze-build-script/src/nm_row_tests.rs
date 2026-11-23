@@ -9,10 +9,7 @@
 //! `host_tools::tool_env`, and `the_script_env_has_nm_from_the_table` fails; drop `bin/llvm-nm`
 //! from `toolchain::SHELF_MEMBERS` and `the_shelf_holds_llvm_nm` and the table's parse fail.
 
-use blaze_own::AString;
-
 use crate::host_tools::{HostToolError, Place, granted, host_tools, path_folders, tool_env};
-use crate::native::{Grant, seatbelt_with};
 use crate::toolchain::{SHELF_MEMBERS, clang_major, shelf_missing};
 use blaze_pins::CLANG_JSON as PIN;
 
@@ -122,23 +119,4 @@ fn a_shelf_row_is_refused_unless_whole() {
     twice.push_str(r#""host_tools": {"t": {"ar": {"shelf": "llvm-ar", "env": "NM", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "no"}, "nm": {"shelf": "llvm-nm", "env": "NM", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "no"}, "names": "ar nm"}}}"#);
     assert_eq!(host_tools(twice.as_str(), "t", alloc).err(), refused("env"));
     println!("shelf rows refused: no row, no env, both, lower case, twice");
-}
-
-/// tikv-jemalloc-sys's Seatbelt profile, made as `native_script` makes it, lets it start the
-/// shelf's llvm-nm and never the machine's `/usr/bin/nm`. Prints "jemalloc profile: the shelf's
-/// llvm-nm, no /usr/bin/nm".
-#[test]
-fn the_jemalloc_profile_starts_the_shelf_nm() {
-    let alloc = blaze_own::testing::heap().alloc();
-    let mac = host_tools(PIN, MAC, alloc).expect("the macOS row");
-    let jemalloc = granted(&mac, "tikv-jemalloc-sys", alloc);
-    let owned: std::vec::Vec<AString<'_>> = jemalloc.iter().flat_map(|t| t.programs_in(SHELF, alloc)).collect();
-    let exec: std::vec::Vec<&str> = owned.iter().map(|p| p.as_str()).collect();
-    let writes = ["/w/out"];
-    let grant = Grant { program: "/w/script", exec: &exec, read: &[], write: &writes };
-    let profile = seatbelt_with(&grant, &writes, alloc).expect("a sayable grant");
-    let profile = profile.as_str();
-    assert!(profile.contains("(literal \"/h/.blaze/v2/toolchain/clang/5d3179db/bin/llvm-nm\")"), "{profile}");
-    assert!(!profile.contains("\"/usr/bin/nm\""), "{profile}");
-    println!("jemalloc profile: the shelf's llvm-nm, no /usr/bin/nm");
 }

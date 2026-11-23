@@ -16,6 +16,8 @@
 //! - `proc_pid_rusage` (public, libproc.h): another process's `rusage_info_v4`, the budget's
 //!   meter on macOS, which has no kernel CPU or memory cap a parent can set on a child
 //!   (`RLIMIT_AS` is not enforced by xnu; `RLIMIT_CPU` is, but only once set in the child).
+//! - `proc_listpgrppids` (public, libproc.h): enumerates live PIDs in a process group so the
+//!   meter covers helpers spawned by the confined program as well as the group leader.
 
 use core::ffi::{CStr, c_char, c_int, c_void};
 
@@ -33,6 +35,11 @@ pub const SYMBOLS: &[(&CStr, crate::macos::Api, &str)] = &[
     (c"sandbox_free_error", crate::macos::Api::Private, "frees sandbox_init_with_parameters' error text"),
     (c"killpg", crate::macos::Api::Public, "a hermetic run's deadline or budget stop sent to its whole group"),
     (c"proc_pid_rusage", crate::macos::Api::Public, "a hermetic child's CPU time and footprint, its budget's meter"),
+    (
+        c"proc_listpgrppids",
+        crate::macos::Api::Public,
+        "enumerates live PIDs in a hermetic child's process group so metering covers helpers too",
+    ),
 ];
 
 mod ffi {
@@ -80,6 +87,27 @@ pub fn child_usage(pid: i32) -> Result<RusageInfoV4, Errno> {
         return Err(last_errno());
     }
     Ok(info)
+}
+
+/// `proc_listpgrppids(group, out, size_of_val(out))`: fills `out` with the live PIDs in process
+/// group `group` and returns how many PIDs were written (`0` when no process remains in `group`).
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn group_pids(group: i32, out: &mut [i32]) -> Result<usize, Errno> {
+    if out.is_empty() {
+        return Ok(0);
+    }
+    // `proc_listpgrppids` takes the buffer length in bytes and returns a count of PIDs (or -1).
+    let bytes = c_int::try_from(core::mem::size_of_val(out)).unwrap_or(c_int::MAX & !3);
+    // SAFETY: `out` is a live writable slice of `pid_t` (`i32`) of at least `bytes` bytes;
+    // `proc_listpgrppids` writes at most `bytes / size_of::<i32>()` PIDs into `out` and returns
+    // the count written, or -1 on error with `errno` set.
+    let count = unsafe { crate::macos::cold::proc_listpgrppids(group, out.as_mut_ptr().cast::<c_void>(), bytes) };
+    if count < 0 {
+        return Err(last_errno());
+    }
+    let written = usize::try_from(count).unwrap_or(0);
+    Ok(written.min(out.len()))
 }
 
 /// Why Seatbelt refused a profile: its compiler's first line, copied into the caller's buffer
@@ -140,5 +168,29 @@ mod tests {
             let found = unsafe { dlsym(DEFAULT, name.as_ptr()) };
             assert!(!found.is_null(), "libSystem has no `{name:?}` ({api:?}); blaze uses it for: {why}");
         }
+    }
+
+    #[test]
+    fn group_pids_lists_current_process_and_rusage_accessors_sum_self_and_children() {
+        // SAFETY: `getpid` and `getpgrp` take no pointers and cannot fail.
+        let (pid, pgrp) = unsafe { (libc::getpid(), libc::getpgrp()) };
+        let mut buf = [0i32; 64];
+        let count = super::group_pids(pgrp, &mut buf).expect("proc_listpgrppids for own group");
+        assert!(count >= 1, "expected at least one PID in own process group {pgrp}");
+        assert!(buf[..count].contains(&pid), "expected own pid {pid} in {:?}", &buf[..count]);
+
+        let empty = super::group_pids(i32::MAX, &mut buf).expect("missing group returns 0");
+        assert_eq!(empty, 0);
+
+        let mut info = crate::macos::RusageInfoV4 { uuid: [0; 16], words: [0; 35] };
+        info.words[crate::macos::RusageInfoV4::USER] = 10;
+        info.words[crate::macos::RusageInfoV4::SYSTEM] = 20;
+        info.words[crate::macos::RusageInfoV4::CHILD_USER] = 30;
+        info.words[crate::macos::RusageInfoV4::CHILD_SYSTEM] = 40;
+        info.words[crate::macos::RusageInfoV4::FOOTPRINT] = 4096;
+        assert_eq!(info.self_cpu_ticks(), 30);
+        assert_eq!(info.child_cpu_ticks(), 70);
+        assert_eq!(info.total_cpu_ticks(), 100);
+        assert_eq!(info.footprint(), 4096);
     }
 }
