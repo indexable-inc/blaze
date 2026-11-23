@@ -148,3 +148,11 @@ fn the_helper_place_is_asked_from_only_with_its_pair() {
     let none = encoded(&[(checkout, "", cursor)], None);
     assert_eq!(paired_place(Stored::of(&none).expect("whole")), None, "no helper place kept");
 }
+
+/// The detached helper is invoked with `journal-helper` alone (cwd is set to the checkout root),
+/// never with an absolute path argument (which `bstd::path::Path` refuses).
+#[cfg(unix)]
+#[test]
+fn detached_helper_args_use_cwd_not_absolute_path() {
+    assert_eq!(HELPER_ARGS, ["journal-helper"]);
+}

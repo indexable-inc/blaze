@@ -268,6 +268,7 @@ blaze-body-lower = { path = "crates/blaze-body-lower" }
 blaze-bstd-convert = { path = "crates/blaze-bstd-convert" }
 blaze-build-script = { path = "crates/blaze-build-script" }
 blaze-cad = { path = "crates/blaze-cad" }
+blaze-cad-cloth = { path = "crates/blaze-cad-cloth" }
 blaze-cad-field = { path = "crates/blaze-cad-field" }
 blaze-cad-mesh = { path = "crates/blaze-cad-mesh" }
 blaze-cad-out = { path = "crates/blaze-cad-out" }

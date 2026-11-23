@@ -498,6 +498,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-cad-cloth"
+version = "0.0.0"
+dependencies = [
+ "blaze-cad-field",
+ "blaze-cad-mesh",
+ "blaze-cad-out",
+ "blaze-cad-picture",
+ "blaze-data",
+ "blaze-deflate",
+ "blaze-int",
+ "blaze-json",
+ "blaze-math",
+ "blaze-own",
+ "blaze-text",
+ "blaze-units",
+]
+
+[[package]]
 name = "blaze-cad-field"
 version = "0.0.0"
 dependencies = [

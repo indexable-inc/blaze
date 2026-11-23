@@ -233,7 +233,7 @@ pub(crate) fn test_root() -> blaze_mem::Frame {
 
 pub use self::core::{
     Batch, CACHEDIR_SIGNATURE, CACHEDIR_TAG, CARRY_ROUNDS, Committed, Found, GRACE_NS, Got, INDEX_KEYS_MOST, LEASE_NS, LentRecord, Liveness, LockStep, LockWaited, Lost, Named, POINTER_LEN,
-    Placed, Plain, PlainConfig, Probe, Probes, PutError, PutPath, ROOT_INDEXES_MOST, ROOT_LIFE_NS, Report, SEGMENTS_MOST, SLICE_BYTES, SWEEP_BYTES, Scrubbed, Sliced, TAGS, TOUCH_NS, WINDOW,
+    Placed, Plain, PlainConfig, Probe, Probes, PutError, PutPath, ROOT_INDEXES_MOST, ROOT_LIFE_NS, Renewed, Report, SEGMENTS_MOST, SLICE_BYTES, SWEEP_BYTES, Scrubbed, Sliced, TAGS, TOUCH_NS, WINDOW,
     beside_key, store_leaf,
 };
 pub use self::arena::Visibility;
