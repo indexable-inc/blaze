@@ -641,7 +641,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
                 return Ok(Put::Same);
             }
             let held = Held { namespace: at.namespace, tag: at.tag, bytes: kept, own: true };
-            return Err(held.against(key, namespace, tag, &joined(parts, self.alloc.clone())));
+            return Err(held.against(key, namespace, tag, &joined(parts, &self.alloc)));
         }
         if let Some(found) = inner.store.get(key).map_err(stopped("checking a put against the store"))? {
             let got = inner.store.got(found);
@@ -650,7 +650,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
                 return Ok(Put::Same);
             }
             let held = Held { namespace: got.namespace, tag: got.tag, bytes: got.bytes, own: false };
-            return Err(held.against(key, namespace, tag, &joined(parts, self.alloc.clone())));
+            return Err(held.against(key, namespace, tag, &joined(parts, &self.alloc)));
         }
         let (place, block, len) = self.copy_in(inner, key, tag, parts)?;
         let at = PutAt { place, block, len, tag, namespace, order: inner.order.len() as u32 };
@@ -866,9 +866,9 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         let (committed, batch_bytes) = if matches!(self.visibility, Visibility::InArena { .. }) {
             (self.commit_shared(inner, upto)?, 0)
         } else {
-            let mut writes: Vec<Namespace, A> = Vec::with_capacity_in(inner.store.core().writes().len(), self.alloc.clone());
+            let mut writes: Vec<Namespace, &A> = Vec::with_capacity_in(inner.store.core().writes().len(), &self.alloc);
             writes.extend_from_slice(inner.store.core().writes());
-            let mut batches: Vec<Batch, A> = Vec::with_capacity_in(writes.len(), self.alloc.clone());
+            let mut batches: Vec<Batch, &A> = Vec::with_capacity_in(writes.len(), &self.alloc);
             batches.extend(writes.iter().map(|namespace| Batch::new(*namespace)));
             let mut first = Batch::new(Namespace::LOCAL);
             for key in &inner.order[inner.committed..upto] {
@@ -888,7 +888,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
             if !first.is_empty() {
                 inner.store.commit_with(&[&first]).map_err(stopped("committing the pointers first (planted)"))?;
             }
-            let mut refs: Vec<&Batch, A> = Vec::with_capacity_in(batches.len(), self.alloc.clone());
+            let mut refs: Vec<&Batch, &A> = Vec::with_capacity_in(batches.len(), &self.alloc);
             refs.extend(batches.iter().filter(|batch| !batch.is_empty()));
             (inner.store.commit_with(&refs).map_err(stopped("committing"))?, batch_bytes)
         };
@@ -945,7 +945,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     fn commit_shared(&self, inner: &mut Inner<D, A>, upto: usize) -> Result<Committed<A>, LentError> {
         let Inner { store, shared, puts, order, committed, .. } = inner;
         let from = (*committed).min(upto);
-        let mut records: Vec<LentRecord<'_>, A> = Vec::new_in(self.alloc.clone());
+        let mut records: Vec<LentRecord<'_>, &A> = Vec::new_in(&self.alloc);
         records.try_reserve_exact(upto - from).map_err(|_| LentError::Arena { bytes: (upto - from) * core::mem::size_of::<LentRecord<'_>>() })?;
         for key in &order[from..upto] {
             let Some(at) = puts.get(key) else { continue };
@@ -962,7 +962,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         }
         if self.plant == LentPlant::PointerFirst && records.iter().any(|it| it.tag == ReservedTag::Pointer.tag()) {
             // The planted bug: the pointers laid apart, for a commit before their targets'.
-            let mut first: Vec<LentRecord<'_>, A> = Vec::new_in(self.alloc.clone());
+            let mut first: Vec<LentRecord<'_>, &A> = Vec::new_in(&self.alloc);
             first.extend(records.iter().filter(|it| it.tag == ReservedTag::Pointer.tag()).copied());
             records.retain(|it| it.tag != ReservedTag::Pointer.tag());
             store.commit_records(&[], &first).map_err(stopped("committing the pointers first (planted)"))?;
@@ -980,7 +980,7 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         let inner = &mut *inner;
         let Some(arena) = inner.shared.as_ref() else { return Ok(None) };
         let from = inner.sealed.max(inner.committed);
-        let mut run: Vec<RunEntry, A> = Vec::new_in(self.alloc.clone());
+        let mut run: Vec<RunEntry, &A> = Vec::new_in(&self.alloc);
         let count = inner.order.len().saturating_sub(from);
         run.try_reserve_exact(count).map_err(|_| LentError::Arena { bytes: count * core::mem::size_of::<RunEntry>() })?;
         for key in &inner.order[from.min(inner.order.len())..] {

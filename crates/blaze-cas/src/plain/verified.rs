@@ -31,6 +31,7 @@
 use std::alloc::Allocator;
 
 use blaze_core::{FileName, Mapping};
+use blaze_own::Share;
 use blaze_keyed::store::{ENTRY, Generation, SegmentId, SegmentProof, StoreError};
 
 use super::format::{self, Entry, Segment, record_crc};
@@ -247,7 +248,7 @@ impl Verified {
         let entry = match Entry::decode(&run[i * ENTRY..(i + 1) * ENTRY]) {
             Ok(entry) => entry,
             Err(what) => {
-                out.push(Corrupt { key: Key(blaze_ids::ContentId(run[i * ENTRY..i * ENTRY + 32].try_into().expect("32 bytes"))), pack: self.file.clone(), what: what.to_owned() });
+                out.push(Corrupt { key: Key(blaze_ids::ContentId(run[i * ENTRY..i * ENTRY + 32].try_into().expect("32 bytes"))), pack: self.file.share(), what: what.to_owned() });
                 return;
             }
         };
@@ -255,7 +256,7 @@ impl Verified {
         if end > self.seg.index_at || record_crc(&entry.key, entry.tag, self.payload(&entry)) != entry.crc {
             out.push(Corrupt {
                 key: Key(entry.key),
-                pack: self.file.clone(),
+                pack: self.file.share(),
                 what: format!("its {} bytes at {} fail their CRC-32C {:08x}: changed on the disk after the segment was proved", entry.len, entry.at, entry.crc),
             });
         }

@@ -295,6 +295,8 @@ impl fmt::Display for FileName {
     }
 }
 
+impl blaze_own::Share for FileName {}
+
 impl FileName {
     /// The name as a path under `root`, the root of the driver that carries out its effects:
     /// how a driver writes a name for a person. A core prints its names as they are, relative
@@ -383,6 +385,8 @@ impl fmt::Display for DirName {
         }
     }
 }
+
+impl blaze_own::Share for DirName {}
 
 /// A [`FileName`] written as a path under a root ([`FileName::under`]).
 #[derive(Clone, Copy, Debug)]
@@ -1601,6 +1605,8 @@ pub struct Exit {
 /// or replace it by renaming another over it, never write its bytes in place or cut it).
 #[derive(Clone)]
 pub struct Mapping(std::sync::Arc<Held>);
+
+impl blaze_own::Share for Mapping {}
 
 /// Who keeps a [`Mapping`]'s bytes, dropped with its last clone.
 enum Held {

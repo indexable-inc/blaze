@@ -351,23 +351,24 @@ fn split_inner<A: Allocator + Clone>(
     alloc: A,
 ) -> Result<Split<A>, CoroutineError> {
     verify(view).map_err(CoroutineError::Verify)?;
-    let body = read(view, shape, panics, &alloc)?;
-    let live = overlap::addressed(&body, &alloc);
-    let lir_kept = kept_slots(&body, &live, plant, &alloc);
+    let scratch = &alloc;
+    let body = read(view, shape, panics, &scratch)?;
+    let live = overlap::addressed(&body, &scratch);
+    let lir_kept = kept_slots(&body, &live, plant, &scratch);
     // In a laid state the names decide what is kept, and an unnamed slot the pass would keep
     // that code after a suspension reaches is refused (coroutine_region.rs `kept_by_name`).
     let (kept, at) = match region {
         Some((r, names)) => {
-            let (kept, at) = region::kept_by_name(&body, &lir_kept, r, names, &alloc)?;
+            let (kept, at) = region::kept_by_name(&body, &lir_kept, r, names, &scratch)?;
             (kept, Some((r, at)))
         }
         None => (lir_kept, None),
     };
-    let conflicts = overlap::conflicts(&body, &live, &kept, plant, &alloc);
-    let crossing = crossing_values(&body, &alloc);
-    let plan = plan(&body, &kept, &conflicts, &crossing, at.as_ref().map(|(r, at)| (*r, &at[..])), &alloc)?;
-    let poll = emit(&body, &plan, Which::Poll, plant, &alloc)?;
-    let drop = emit(&body, &plan, Which::Drop, plant, &alloc)?;
+    let conflicts = overlap::conflicts(&body, &live, &kept, plant, &scratch);
+    let crossing = crossing_values(&body, &scratch);
+    let plan = plan(&body, &kept, &conflicts, &crossing, at.as_ref().map(|(r, at)| (*r, &at[..])), &scratch, alloc.clone())?;
+    let poll = emit(&body, &plan, Which::Poll, plant, &scratch, alloc.clone())?;
+    let drop = emit(&body, &plan, Which::Drop, plant, &scratch, alloc.clone())?;
     Ok(Split { poll, drop, layout: plan.layout })
 }
 
@@ -406,8 +407,8 @@ struct Body<'a, A: Allocator> {
     invoked: Vec<u32, A>,
 }
 
-fn filled<T: Clone, A: Allocator + Clone>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
-    let mut all = Vec::with_capacity_in(len, alloc.clone());
+fn filled<T: Clone, A: Allocator + Copy>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
+    let mut all = Vec::with_capacity_in(len, *alloc);
     all.resize(len, item);
     all
 }
@@ -472,9 +473,9 @@ fn each_value(view: &View<'_>, at: usize, mut f: impl FnMut(u32)) {
 }
 
 /// The blocks reached from `roots`, with or without suspends' cancel edges.
-fn reach<A: Allocator + Clone>(view: &View<'_>, roots: &[u32], cancel_edges: bool, alloc: &A) -> Vec<bool, A> {
+fn reach<A: Allocator + Copy>(view: &View<'_>, roots: &[u32], cancel_edges: bool, alloc: &A) -> Vec<bool, A> {
     let mut seen = filled(view.blocks(), false, alloc);
-    let mut work = Vec::new_in(alloc.clone());
+    let mut work = Vec::new_in(*alloc);
     for &root in roots {
         if !seen[root as usize] {
             seen[root as usize] = true;
@@ -492,7 +493,7 @@ fn reach<A: Allocator + Clone>(view: &View<'_>, roots: &[u32], cancel_edges: boo
     seen
 }
 
-fn read<'a, A: Allocator + Clone>(
+fn read<'a, A: Allocator + Copy>(
     view: View<'a>,
     shape: Shape,
     panics: Panics,
@@ -529,7 +530,7 @@ fn read<'a, A: Allocator + Clone>(
     // `poll` holds what the entry and the finished-state blocks reach.
     let (roots, n) = unwind::poll_roots(panics);
     let in_poll = reach(&view, &roots[..n], false, alloc);
-    let mut suspends = Vec::new_in(alloc.clone());
+    let mut suspends = Vec::new_in(*alloc);
     for b in 0..blocks {
         if !in_poll[b] {
             continue;
@@ -553,7 +554,7 @@ fn read<'a, A: Allocator + Clone>(
     if let Some(pair) = suspends.windows(2).find(|pair| pair[0].point == pair[1].point) {
         return Err(CoroutineError::PointTwice { point: pair[1].point, inst: pair[1].inst });
     }
-    let mut roots = Vec::with_capacity_in(suspends.len() + 1, alloc.clone());
+    let mut roots = Vec::with_capacity_in(suspends.len() + 1, *alloc);
     roots.push(shape.unresumed.0);
     roots.extend(suspends.iter().map(|it| it.cancel));
     let in_drop = reach(&view, &roots, true, alloc);
@@ -573,7 +574,7 @@ fn read<'a, A: Allocator + Clone>(
 /// Per slot, whether the state keeps it: whether at some suspend its address may have been
 /// taken and its storage not ended (the module's first rule; `live` is that analysis,
 /// coroutine_overlap.rs `addressed`).
-fn kept_slots<A: Allocator + Clone>(
+fn kept_slots<A: Allocator + Copy>(
     body: &Body<'_, A>,
     live: &overlap::Addressed<A>,
     plant: Plant,
@@ -598,7 +599,7 @@ fn kept_slots<A: Allocator + Clone>(
 /// Per value, whether it is live into the resume or the cancel block of some suspend. Each
 /// value is walked back from the blocks that use it to the block that makes it; the blocks
 /// passed are those it is live into.
-fn crossing_values<A: Allocator + Clone>(body: &Body<'_, A>, alloc: &A) -> Vec<bool, A> {
+fn crossing_values<A: Allocator + Copy>(body: &Body<'_, A>, alloc: &A) -> Vec<bool, A> {
     let view = &body.view;
     let blocks = view.blocks();
     let held = |b: usize| body.in_poll[b] || body.in_drop[b];
@@ -631,7 +632,7 @@ fn crossing_values<A: Allocator + Clone>(body: &Body<'_, A>, alloc: &A) -> Vec<b
     }
     // Each use of a value in another block than the one that makes it, once per block. An
     // entry parameter is each poll's own and is never kept.
-    let mut uses: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
+    let mut uses: Vec<(u32, u32), A> = Vec::new_in(*alloc);
     for b in (0..blocks).filter(|&b| held(b)) {
         for at in view.block(Block(b as u32)) {
             each_value(view, at, |value| {
@@ -646,7 +647,7 @@ fn crossing_values<A: Allocator + Clone>(body: &Body<'_, A>, alloc: &A) -> Vec<b
     let mut crossing = filled(view.len(), false, alloc);
     // Per block, the last value whose walk passed it.
     let mut passed = filled(blocks, NONE, alloc);
-    let mut work = Vec::new_in(alloc.clone());
+    let mut work = Vec::new_in(*alloc);
     let mut i = 0;
     while i < uses.len() {
         let value = uses[i].0;
@@ -682,13 +683,13 @@ const DIRECT: u32 = NONE;
 const REMADE: u32 = NONE - 1;
 
 /// Where everything lives.
-struct Plan<A: Allocator> {
+struct Plan<S: Allocator, A: Allocator> {
     /// Per slot of the body: its offset in the state, [`NONE`] for a slot that stays.
-    slot_offset: Vec<u32, A>,
+    slot_offset: Vec<u32, S>,
     /// Per slot of the body: its row in the outputs' `slots`, [`NONE`] for a kept one.
-    slot_row: Vec<u32, A>,
+    slot_row: Vec<u32, S>,
     /// Per value of the body: [`DIRECT`], [`REMADE`], or its field's offset.
-    home: Vec<u32, A>,
+    home: Vec<u32, S>,
     layout: StateLayout<A>,
 }
 
@@ -712,21 +713,22 @@ fn align_up(at: u64, align: u8) -> u64 {
     (at + mask) & !mask
 }
 
-fn plan<A: Allocator + Clone>(
-    body: &Body<'_, A>,
+fn plan<S: Allocator + Copy, A: Allocator>(
+    body: &Body<'_, S>,
     kept: &[bool],
     conflicts: &[u64],
     crossing: &[bool],
     region: Option<(Region, &[u32])>,
-    alloc: &A,
-) -> Result<Plan<A>, CoroutineError> {
+    alloc: &S,
+    out_alloc: A,
+) -> Result<Plan<S, A>, CoroutineError> {
     let view = &body.view;
     let ptr_bits = view.head.ptr_bits;
     let mut slot_offset = filled(kept.len(), NONE, alloc);
     let mut slot_row = filled(kept.len(), NONE, alloc);
     let mut home = filled(view.len(), DIRECT, alloc);
-    let mut fields = Vec::new_in(alloc.clone());
-    let mut sizes = Vec::new_in(alloc.clone());
+    let mut fields = Vec::new_in(out_alloc);
+    let mut sizes = Vec::new_in(*alloc);
     let mut rows = 0u32;
     for (slot, &keep) in kept.iter().enumerate() {
         let rec = view.slots[slot];
@@ -852,32 +854,32 @@ fn plan<A: Allocator + Clone>(
 }
 
 /// One output being made.
-struct Emit<'p, 'a, A: Allocator + Clone> {
-    body: &'p Body<'a, A>,
-    plan: &'p Plan<A>,
+struct Emit<'p, 'a, S: Allocator + Copy, A: Allocator> {
+    body: &'p Body<'a, S>,
+    plan: &'p Plan<S, A>,
     which: Which,
     plant: Plant,
     func: Func<A>,
     /// Per value of the body: its value here, [`NONE`] if nothing here makes it.
-    map: Vec<u32, A>,
+    map: Vec<u32, S>,
     /// Per block of the body: its block here, [`NONE`] if this output has it not.
-    block_map: Vec<u32, A>,
+    block_map: Vec<u32, S>,
     /// The state pointer here.
     state: u32,
     /// The body's block being copied.
     current: u32,
     /// Per value of the body: what stands for it in the block `fetched_in` names (a load
     /// from the state, or the value made again).
-    fetched: Vec<u32, A>,
-    fetched_in: Vec<u32, A>,
+    fetched: Vec<u32, S>,
+    fetched_in: Vec<u32, S>,
     /// The places that hold a value of the body, to be its value here once every block is
     /// copied (a use may come before its value in layout order): an index of `data` if the
     /// flag is set, else of `extra`.
-    fixups: Vec<(u32, bool), A>,
+    fixups: Vec<(u32, bool), S>,
     ptr_int: Ty,
 }
 
-impl<A: Allocator + Clone> Emit<'_, '_, A> {
+impl<S: Allocator + Copy, A: Allocator> Emit<'_, '_, S, A> {
     fn begin(&mut self, kind: BlockKind) {
         self.func.block_starts.push(self.func.ops.len() as u32);
         self.func.block_kinds.push(kind as u8);
@@ -1173,17 +1175,18 @@ impl<A: Allocator + Clone> Emit<'_, '_, A> {
 }
 
 /// Makes `which` of the two functions.
-fn emit<A: Allocator + Clone>(
-    body: &Body<'_, A>,
-    plan: &Plan<A>,
+fn emit<S: Allocator + Copy, A: Allocator + Clone>(
+    body: &Body<'_, S>,
+    plan: &Plan<S, A>,
     which: Which,
     plant: Plant,
-    alloc: &A,
+    alloc: &S,
+    out_alloc: A,
 ) -> Result<Func<A>, CoroutineError> {
     let view = body.view;
     let blocks = view.blocks();
     // The body's tables; the instructions and blocks are made below.
-    let mut func = view.to_func_in(alloc.clone());
+    let mut func = view.to_func_in(out_alloc);
     func.ops.clear();
     func.flags.clear();
     func.tys.clear();
@@ -1252,7 +1255,7 @@ fn emit<A: Allocator + Clone>(
         current: NONE,
         fetched: filled(view.len(), NONE, alloc),
         fetched_in: filled(view.len(), NONE, alloc),
-        fixups: Vec::new_in(alloc.clone()),
+        fixups: Vec::new_in(*alloc),
         ptr_int,
     };
     // The head: the parameters, the tag, the switch.
@@ -1270,8 +1273,8 @@ fn emit<A: Allocator + Clone>(
     let (tag_ty, tag_offset, state) = (plan.layout.tag_ty, plan.layout.tag_offset, e.state);
     let tag = e.push(Op::Load, tag_ty, &[state, tag_offset], 0);
     // The switch's words: the scrutinee, the default target, the cases by rising tag.
-    let mut words = Vec::new_in(alloc.clone());
-    let case = |words: &mut Vec<u32, A>, tag: u32, to: u32| words.extend_from_slice(&[tag, to, 0]);
+    let mut words = Vec::new_in(*alloc);
+    let case = |words: &mut Vec<u32, S>, tag: u32, to: u32| words.extend_from_slice(&[tag, to, 0]);
     match which {
         Which::Poll => {
             // A finished state goes to its block of `Panics` when the builder passed one; it
@@ -1313,10 +1316,10 @@ fn emit<A: Allocator + Clone>(
         let params = view.params(Block(b as u32));
         // The entry's parameters are the head's.
         if b != 0 {
-            for at in params.clone() {
+            for at in params.start..params.end {
                 e.map[at] = e.raw(Op::Param, view.flags[at], Ty(view.tys[at]), 0, view.attrs[at], view.locs[at]);
             }
-            for at in params.clone() {
+            for at in params.start..params.end {
                 e.spill(at);
             }
         }

@@ -20,6 +20,7 @@
 
 use std::{io, path::Path};
 
+use blaze_own::Share;
 use blaze_sys::{Errno, posix::proc};
 use crate::{DirName, FileName, Meta, Stamp};
 
@@ -156,7 +157,7 @@ fn entry(entry: &[u8]) -> Option<(&[u8], Result<Stamp, &'static str>, Option<u64
 pub(crate) fn entries(dir: &Path, name: &DirName) -> io::Result<crate::Listing> {
     use std::os::unix::ffi::OsStrExt as _;
     // clone: the listing's directory, a refcount.
-    let mut found = crate::ListingBuilder::new(name.clone());
+    let mut found = crate::ListingBuilder::new(name.share());
     each(dir, |leaf, stamp, _| Ok(found.push(leaf.as_bytes(), stamp)?))?;
     Ok(found.finish()?)
 }

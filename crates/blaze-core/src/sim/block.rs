@@ -501,7 +501,7 @@ impl fmt::Display for Seen {
 /// The oracle: per atomic unit, its durable bytes and each version written since, oldest
 /// first. Writes it is told of are whole atomic units (a write of part of a unit is not a
 /// version of the unit and the oracle refuses it: [`History::write`]).
-pub struct History<A: Allocator + Clone> {
+pub struct History<A: Allocator + Copy> {
     unit: usize,
     /// For each unit, its versions: the first durable, the rest since.
     units: Vec<Vec<Vec<u8, A>, A>, A>,
@@ -516,15 +516,15 @@ pub struct NotWholeUnits {
     pub unit: u64,
 }
 
-impl<A: Allocator + Clone> History<A> {
+impl<A: Allocator + Copy> History<A> {
     /// The oracle of a device of `bytes` bytes, all zeros, torn at most by `unit` bytes.
     pub fn new(bytes: u64, unit: u64, alloc: A) -> History<A> {
         let count = (bytes / unit) as usize;
-        let mut units = Vec::with_capacity_in(count, alloc.clone());
+        let mut units = Vec::with_capacity_in(count, alloc);
         for _ in 0..count {
-            let mut zero = Vec::with_capacity_in(unit as usize, alloc.clone());
+            let mut zero = Vec::with_capacity_in(unit as usize, alloc);
             zero.resize(unit as usize, 0);
-            let mut versions = Vec::new_in(alloc.clone());
+            let mut versions = Vec::new_in(alloc);
             versions.push(zero);
             units.push(versions);
         }
@@ -540,7 +540,7 @@ impl<A: Allocator + Clone> History<A> {
         }
         for (n, chunk) in bytes.chunks(self.unit).enumerate() {
             let versions = &mut self.units[(at / unit) as usize + n];
-            let mut version = Vec::with_capacity_in(self.unit, self.alloc.clone());
+            let mut version = Vec::with_capacity_in(self.unit, self.alloc);
             version.extend_from_slice(chunk);
             if durable {
                 versions.clear();
@@ -584,7 +584,7 @@ impl<A: Allocator + Clone> History<A> {
                 continue;
             }
             if versions.iter().any(|version| version.as_slice() == got) {
-                let mut kept = Vec::with_capacity_in(self.unit, self.alloc.clone());
+                let mut kept = Vec::with_capacity_in(self.unit, self.alloc);
                 kept.extend_from_slice(got);
                 versions.clear();
                 versions.push(kept);

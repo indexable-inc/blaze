@@ -138,7 +138,7 @@ impl core::error::Error for LoopEntryError {}
 
 /// The variant of `view` entered at `header` with the words of `live` (the module's "The
 /// convention"), every buffer in `alloc`. `view` must be verified (`crate::verify`).
-pub fn entry_variant<A: Allocator + Clone>(
+pub fn entry_variant<A: Allocator + Copy>(
     view: View<'_>,
     header: Block,
     live: &[LiveKey],
@@ -148,7 +148,7 @@ pub fn entry_variant<A: Allocator + Clone>(
 }
 
 /// [`entry_variant`] with a planted bug, which only test builds act on.
-pub fn entry_variant_planted<A: Allocator + Clone>(
+pub fn entry_variant_planted<A: Allocator + Copy>(
     view: View<'_>,
     header: Block,
     live: &[LiveKey],
@@ -204,7 +204,7 @@ pub fn entry_variant_planted<A: Allocator + Clone>(
         }
     }
 
-    let mut func = view.to_func_in(alloc.clone());
+    let mut func = view.to_func_in(alloc);
     func.ops.clear();
     func.flags.clear();
     func.tys.clear();
@@ -275,7 +275,7 @@ pub fn entry_variant_planted<A: Allocator + Clone>(
         current: NONE,
         fetched: filled(values, NONE, &alloc),
         fetched_in: filled(values, NONE, &alloc),
-        fixups: Vec::new_in(alloc.clone()),
+        fixups: Vec::new_in(alloc),
     };
     for at in 0..values {
         e.def_block[at] = block_of[at];
@@ -288,7 +288,7 @@ pub fn entry_variant_planted<A: Allocator + Clone>(
 
     // ---- the head ----
     e.begin(BlockKind::Normal);
-    let mut words = Vec::with_capacity_in(rows.len(), alloc.clone());
+    let mut words = Vec::with_capacity_in(rows.len(), alloc);
     for _ in 0..rows.len() {
         words.push(e.raw(Op::Param, 0, word, 0, 0, 0));
     }
@@ -313,8 +313,8 @@ pub fn entry_variant_planted<A: Allocator + Clone>(
         }
     }
     // The header's parameters: the head's value of each listed one, `uninit` for another.
-    let mut args = Vec::with_capacity_in(header_params.len(), alloc.clone());
-    for at in header_params.clone() {
+    let mut args = Vec::with_capacity_in(header_params.len(), alloc);
+    for at in header_params.start..header_params.end {
         let arg = match listed[at] {
             true => e.map[at],
             false => e.push(Op::Uninit, Ty(view.tys[at]), &[]),
@@ -327,7 +327,7 @@ pub fn entry_variant_planted<A: Allocator + Clone>(
     e.func.extra.extend_from_slice(&args[..]);
     e.raw(Op::Jump, 0, Ty::NONE, start, 0, 0);
     // The header's parameters are the header's own from here on.
-    for at in header_params.clone() {
+    for at in header_params.start..header_params.end {
         e.map[at] = NONE;
     }
 
@@ -337,10 +337,10 @@ pub fn entry_variant_planted<A: Allocator + Clone>(
         e.begin(view.block_kind(block));
         e.current = b as u32;
         let params = view.params(block);
-        for at in params.clone() {
+        for at in params.start..params.end {
             e.map[at] = e.raw(Op::Param, view.flags[at], Ty(view.tys[at]), 0, view.attrs[at], view.locs[at]);
         }
-        for at in params.clone() {
+        for at in params.start..params.end {
             e.spill(at);
         }
         if invoked[b] != NONE {
@@ -380,14 +380,14 @@ enum Row {
     Slot(u32),
 }
 
-fn filled<T: Clone, A: Allocator + Clone>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
-    Vec::from_elem_in(item, len, alloc.clone())
+fn filled<T: Clone, A: Allocator + Copy>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
+    Vec::from_elem_in(item, len, *alloc)
 }
 
 /// The keys read into rows: sorted, each once, each a value of a type with a word or a slot.
-fn rows<A: Allocator + Clone>(view: &View<'_>, live: &[LiveKey], alloc: &A) -> Result<Vec<Row, A>, LoopEntryError> {
+fn rows<A: Allocator + Copy>(view: &View<'_>, live: &[LiveKey], alloc: &A) -> Result<Vec<Row, A>, LoopEntryError> {
     let values = view.len();
-    let mut rows = Vec::with_capacity_in(live.len(), alloc.clone());
+    let mut rows = Vec::with_capacity_in(live.len(), *alloc);
     let mut last: Option<u32> = None;
     for &LiveKey(key) in live {
         if last.is_some_and(|it| it >= key) {
@@ -441,7 +441,7 @@ fn word_form(ty: Ty, ptr_bits: u32) -> Option<WordForm> {
 }
 
 /// Per instruction, its block.
-fn block_of<A: Allocator + Clone>(view: &View<'_>, alloc: &A) -> Vec<u32, A> {
+fn block_of<A: Allocator + Copy>(view: &View<'_>, alloc: &A) -> Vec<u32, A> {
     let mut of = filled(view.len(), NONE, alloc);
     for b in 0..view.blocks() {
         for at in view.block(Block(b as u32)) {
@@ -466,9 +466,9 @@ fn successors(view: &View<'_>, at: usize, mut f: impl FnMut(u32)) {
 }
 
 /// The blocks reached from `from`, itself included.
-fn reach<A: Allocator + Clone>(view: &View<'_>, from: u32, alloc: &A) -> Vec<bool, A> {
+fn reach<A: Allocator + Copy>(view: &View<'_>, from: u32, alloc: &A) -> Vec<bool, A> {
     let mut seen = filled(view.blocks(), false, alloc);
-    let mut work = Vec::new_in(alloc.clone());
+    let mut work = Vec::new_in(*alloc);
     seen[from as usize] = true;
     work.push(from);
     while let Some(b) = work.pop() {
@@ -486,7 +486,7 @@ fn reach<A: Allocator + Clone>(view: &View<'_>, from: u32, alloc: &A) -> Vec<boo
     seen
 }
 
-struct Emit<'v, A: Allocator + Clone> {
+struct Emit<'v, A: Allocator + Copy> {
     view: View<'v>,
     plant: Plant,
     func: Func<A>,
@@ -513,7 +513,7 @@ struct Emit<'v, A: Allocator + Clone> {
     fixups: Vec<(u32, bool), A>,
 }
 
-impl<A: Allocator + Clone> Emit<'_, A> {
+impl<A: Allocator + Copy> Emit<'_, A> {
     fn begin(&mut self, kind: BlockKind) {
         self.func.block_starts.push(self.func.ops.len() as u32);
         self.func.block_kinds.push(kind as u8);

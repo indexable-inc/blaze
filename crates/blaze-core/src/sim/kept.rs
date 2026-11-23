@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use blaze_own::Share;
+
 use crate::{Cache, FileName, Opens};
 
 /// The table: at most `bound` descriptors, past which the least recently read closes. A read
@@ -63,7 +65,7 @@ impl Descriptors {
         }
         self.clock += 1;
         // clone: a refcount, the key it is kept under.
-        self.entries.push(Entry { name: name.clone(), cache, used: self.clock, orphan: None });
+        self.entries.push(Entry { name: name.share(), cache, used: self.clock, orphan: None });
         self.opened += 1;
     }
 
@@ -95,7 +97,7 @@ impl Descriptors {
             .entries
             .iter()
             .filter(|it| it.orphan.is_none() && it.name.is_under(name))
-            .map(|it| it.name.clone()) // clone: a refcount
+            .map(|it| it.name.share()) // clone: a refcount
             .collect();
         names.sort_unstable();
         names.dedup();

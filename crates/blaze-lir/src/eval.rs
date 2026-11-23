@@ -411,7 +411,7 @@ impl<A: Allocator + Clone> Run<'_, A> {
                 what: "a target given another number of arguments than its parameters",
             });
         }
-        let mut args = Vec::with_capacity_in(to.args.len(), self.alloc.clone());
+        let mut args = Vec::with_capacity_in(to.args.len(), &self.alloc);
         for value in to.args.iter() {
             args.push(self.get(inst, value)?);
         }

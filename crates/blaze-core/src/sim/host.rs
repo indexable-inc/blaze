@@ -40,6 +40,8 @@ use std::{
     time::Duration,
 };
 
+use blaze_own::Share;
+
 use super::{Of, Rng, Sim, Told};
 use crate::{
     Completion, Dgram, Done, Effect, FileName, IoError, RANDOM_MOST, RECV_MOST, Stream, Tag,
@@ -811,7 +813,7 @@ impl Sim {
             };
             let dir = FileName::new(dir).expect("a part of a name is a name");
             // clone: the journal's own name of it, a refcount.
-            self.host.made.insert(slot, dir.clone());
+            self.host.made.insert(slot, dir.share());
             match maker {
                 Maker::Effect => {
                     self.dir_named(super::Named::MadeDir { dir });
@@ -834,7 +836,7 @@ impl Sim {
         self.make_parents(dir, Maker::Outside);
         if let Err(slot) = self.host.made.binary_search(dir) {
             // clone: the disk's own name of it, a refcount.
-            self.host.made.insert(slot, dir.clone());
+            self.host.made.insert(slot, dir.share());
             self.names.retain(|change| !change.named.touches(dir));
         }
     }
@@ -949,7 +951,7 @@ impl Sim {
         }
         let at = self.host.made.binary_search(&dir).expect_err("not made, looked up above");
         // clone: the journal's own name of it, a refcount.
-        self.host.made.insert(at, dir.clone());
+        self.host.made.insert(at, dir.share());
         self.dir_named(super::Named::MadeDir { dir });
         Done::MadeDir
     }
@@ -980,7 +982,7 @@ impl Sim {
             self.host.made.retain(|it| !it.is_under(dir));
             self.disk.dir_gone(dir);
             // clone: the journal's own name of it, a refcount.
-            self.dir_named(super::Named::RemovedDir { dir: dir.clone() });
+            self.dir_named(super::Named::RemovedDir { dir: dir.share() });
             return Done::RemovedDir;
         }
         match self.host.made.binary_search(dir) {
@@ -988,7 +990,7 @@ impl Sim {
                 self.host.made.remove(at);
                 self.disk.dir_gone(dir);
                 // clone: the journal's own name of it, a refcount.
-                self.dir_named(super::Named::RemovedDir { dir: dir.clone() });
+                self.dir_named(super::Named::RemovedDir { dir: dir.share() });
                 Done::RemovedDir
             }
             // alloc: an error's message.

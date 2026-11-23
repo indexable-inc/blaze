@@ -512,6 +512,8 @@ impl<T> Clone for Sender<T> {
     }
 }
 
+impl<T> blaze_own::Share for Sender<T> {}
+
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         self.drop_with(Plant::None);
@@ -632,6 +634,8 @@ impl<T> Clone for Receiver<T> {
         Receiver { shared: Arc::clone(&self.shared) }
     }
 }
+
+impl<T> blaze_own::Share for Receiver<T> {}
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {

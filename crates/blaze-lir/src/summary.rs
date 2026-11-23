@@ -76,12 +76,12 @@ impl FnSummary {
     ///
     /// Expects a verified LIR [`View`]. If an unverified view has malformed operands or block
     /// edges, conservatively treats those edges as cyclic/open rather than panicking.
-    pub fn compute<A: Allocator + Clone>(view: View<'_>, alloc: &A) -> FnSummary {
+    pub fn compute<A: Allocator>(view: View<'_>, alloc: &A) -> FnSummary {
         compute_impl(view, false, alloc).expect("unchecked compute never returns Err")
     }
 
     /// Checked variant for callers that refuse malformed unverified callees by error.
-    pub(crate) fn try_compute<A: Allocator + Clone>(
+    pub(crate) fn try_compute<A: Allocator>(
         view: View<'_>,
         alloc: &A,
     ) -> Result<FnSummary, MalformedView> {
@@ -172,7 +172,7 @@ fn propagates_const_dep(op: Op) -> bool {
     )
 }
 
-fn compute_impl<A: Allocator + Clone>(
+fn compute_impl<A: Allocator>(
     view: View<'_>,
     strict: bool,
     alloc: &A,
@@ -189,10 +189,10 @@ fn compute_impl<A: Allocator + Clone>(
     let tracked_params = entry_params.len().min(64);
 
     // Per-instruction dependency bitmasks (only allocated when entry has tracked params).
-    let mut const_dep: Vec<u64, A> = if tracked_params > 0 {
-        Vec::from_elem_in(0u64, len, alloc.clone())
+    let mut const_dep: Vec<u64, &A> = if tracked_params > 0 {
+        Vec::from_elem_in(0u64, len, alloc)
     } else {
-        Vec::new_in(alloc.clone())
+        Vec::new_in(alloc)
     };
 
     let mut ptr_candidate = 0u64;
@@ -204,8 +204,8 @@ fn compute_impl<A: Allocator + Clone>(
         }
     }
 
-    let mut ptr_origin: Vec<u64, A> = if ptr_candidate != 0 {
-        let mut v = Vec::from_elem_in(0u64, len, alloc.clone());
+    let mut ptr_origin: Vec<u64, &A> = if ptr_candidate != 0 {
+        let mut v = Vec::from_elem_in(0u64, len, alloc);
         for i in 0..tracked_params {
             let p = entry_params.start + i;
             if (ptr_candidate & (1u64 << i)) != 0 {
@@ -214,7 +214,7 @@ fn compute_impl<A: Allocator + Clone>(
         }
         v
     } else {
-        Vec::new_in(alloc.clone())
+        Vec::new_in(alloc)
     };
 
     let mut const_param_mask = 0u64;
@@ -517,14 +517,14 @@ fn mark_escaped_values(view: &View<'_>, at: usize, ptr_origin: &[u64], ptr_escap
 }
 
 /// Kahn's topological order over `view`'s block graph: `true` iff acyclic.
-fn is_acyclic_kahn<A: Allocator + Clone>(
+fn is_acyclic_kahn<A: Allocator>(
     view: View<'_>,
     strict: bool,
     alloc: &A,
 ) -> Result<bool, MalformedView> {
     let blocks = view.blocks();
-    let mut edges: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
-    let mut starts = Vec::from_elem_in(0usize, blocks + 1, alloc.clone());
+    let mut edges: Vec<(u32, u32), &A> = Vec::new_in(alloc);
+    let mut starts = Vec::from_elem_in(0usize, blocks + 1, alloc);
     for b in 0..blocks {
         starts[b] = edges.len();
         let from = b as u32;
@@ -550,7 +550,7 @@ fn is_acyclic_kahn<A: Allocator + Clone>(
         }
     }
     starts[blocks] = edges.len();
-    let mut incoming = Vec::from_elem_in(0u32, blocks, alloc.clone());
+    let mut incoming = Vec::from_elem_in(0u32, blocks, alloc);
     for &(_, to) in edges.iter() {
         match incoming.get_mut(to as usize) {
             Some(count) => *count += 1,
@@ -565,7 +565,7 @@ fn is_acyclic_kahn<A: Allocator + Clone>(
             }
         }
     }
-    let mut ready: Vec<u32, A> = Vec::with_capacity_in(blocks, alloc.clone());
+    let mut ready: Vec<u32, &A> = Vec::with_capacity_in(blocks, alloc);
     for b in 0..blocks as u32 {
         if incoming[b as usize] == 0 {
             ready.push(b);

@@ -6,6 +6,7 @@
 //! again only where it was.
 
 use blaze_hash::{FixedState, Map};
+use blaze_own::Share;
 use std::alloc::Global;
 
 use super::SimFile;
@@ -155,7 +156,7 @@ impl Disk {
             (true, None) => {
                 let inode = self.new_inode();
                 // clone: the simulated disk's name of a new file.
-                self.inodes.insert(file.clone(), inode);
+                self.inodes.insert(file.share(), inode);
                 self.entered(file);
             }
             (false, Some(_)) => {
@@ -165,7 +166,7 @@ impl Disk {
             (false, None) => self.left(file),
         }
         // clone: the simulated journal's entry, kept across crashes.
-        let named = file.clone();
+        let named = file.share();
         self.log.push(if renamed { Entry::Moved(named) } else { Entry::Changed(named) });
         self.cursor()
     }
@@ -174,7 +175,7 @@ impl Disk {
     /// has a name more; those that were not are made.
     fn entered(&mut self, name: &FileName) {
         // clone: a name of the simulated disk's, walked up.
-        let mut at = name.clone();
+        let mut at = name.share();
         while let Some(up) = parent(&at) {
             let now = self.tick();
             match self.inodes.get_mut(&up) {
@@ -185,9 +186,9 @@ impl Disk {
                 None => {
                     let inode = self.new_inode();
                     // clone: the simulated disk's name of a new directory.
-                    self.inodes.insert(up.clone(), inode);
+                    self.inodes.insert(up.share(), inode);
                     // clone: the simulated journal's entry.
-                    self.log.push(Entry::Changed(up.clone()));
+                    self.log.push(Entry::Changed(up.share()));
                 }
             }
             at = up;
@@ -211,7 +212,7 @@ impl Disk {
         self.inodes.retain(|name, _| !name.is_under(dir));
         self.left(dir);
         // clone: the simulated journal's entry.
-        self.log.push(Entry::Changed(dir.clone()));
+        self.log.push(Entry::Changed(dir.share()));
     }
 
     /// `from` is renamed `to`, keeping its inode and mtime; called before the two are told as
@@ -219,10 +220,10 @@ impl Disk {
     pub(super) fn renamed(&mut self, from: &FileName, to: &FileName) {
         if let Some(inode) = self.inodes.remove(from) {
             // clone: the simulated disk's new name of the file.
-            self.inodes.insert(to.clone(), inode);
+            self.inodes.insert(to.share(), inode);
             self.entered(to);
             // clone: as above, until its touch.
-            self.renamed_to = Some(to.clone());
+            self.renamed_to = Some(to.share());
         }
     }
 
@@ -237,11 +238,11 @@ impl Disk {
         let mut inode = self.inodes[from];
         inode.ctime = self.tick();
         // clone: the simulated disk's second name of the file.
-        self.inodes.insert(to.clone(), inode);
+        self.inodes.insert(to.share(), inode);
         self.entered(to);
         self.share(to);
         // clone: as a rename's, until its touch.
-        self.renamed_to = Some(to.clone());
+        self.renamed_to = Some(to.share());
     }
 
     /// Every other name of `name`'s inode (a hard link, [`Disk::linked`]) takes its times:
@@ -263,7 +264,7 @@ impl Disk {
             self.share(file);
         }
         // clone: the simulated journal's entry.
-        self.log.push(Entry::Changed(file.clone()));
+        self.log.push(Entry::Changed(file.share()));
         self.cursor()
     }
 
@@ -278,7 +279,7 @@ impl Disk {
         (inode.mtime, inode.ctime) = (modified_ns, now);
         self.share(name);
         // clone: the simulated journal's entry.
-        self.log.push(Entry::Changed(name.clone()));
+        self.log.push(Entry::Changed(name.share()));
         true
     }
 
@@ -289,7 +290,7 @@ impl Disk {
         if !self.inodes.contains_key(name) {
             let inode = self.new_inode();
             // clone: the simulated disk's name of a file or directory first seen.
-            self.inodes.insert(name.clone(), inode);
+            self.inodes.insert(name.share(), inode);
         }
         let inode = self.inodes[name];
         crate::Meta {
@@ -308,7 +309,7 @@ impl Disk {
             if !self.inodes.contains_key(name) {
                 let inode = self.new_inode();
                 // clone: the simulated disk's name of a file first stamped.
-                self.inodes.insert(name.clone(), inode);
+                self.inodes.insert(name.share(), inode);
             }
             let inode = self.inodes[name];
             return Stamp {
@@ -324,7 +325,7 @@ impl Disk {
             if !self.inodes.contains_key(name) {
                 let inode = self.new_inode();
                 // clone: the simulated disk's name of a directory first stamped.
-                self.inodes.insert(name.clone(), inode);
+                self.inodes.insert(name.share(), inode);
             }
             let inode = self.inodes[name];
             return Stamp {
@@ -356,7 +357,7 @@ impl Disk {
         firsts.sort_unstable();
         firsts.dedup();
         // clone: the listing's directory, a refcount.
-        let mut listing = crate::ListingBuilder::new(dir.clone());
+        let mut listing = crate::ListingBuilder::new(dir.share());
         for first in firsts {
             let name = dir.child(first).expect("a directory's name and one part are a name");
             let stamp = self.stamp(&name, tree);
@@ -445,7 +446,7 @@ impl Disk {
                     batch.whole = batch.whole.or(Some(*why));
                 } else if dir.holds(under) {
                     // clone: the batch's payload, a name of it.
-                    batch.lost.push((under.clone(), *why));
+                    batch.lost.push((under.share(), *why));
                 }
                 return;
             }
@@ -464,7 +465,7 @@ impl Disk {
             RootPlant::None | RootPlant::RootNamesDropped | RootPlant::RenameIntoRootAtSourceOnly => {}
         }
         // clone: the batch's payload, a name of it.
-        batch.files.push(file.clone());
+        batch.files.push(file.share());
     }
 
     /// The live batch of the change just recorded, for a journal of `dir`; `None` when the
@@ -502,7 +503,7 @@ impl Disk {
     /// The system loses the changes under `dir` (FSEvents' `MustScanSubDirs`).
     pub(super) fn lose(&mut self, dir: &FileName, why: Lost) {
         // clone: the simulated journal's entry.
-        self.log.push(Entry::Lost(dir.clone(), why));
+        self.log.push(Entry::Lost(dir.share(), why));
     }
 }
 

@@ -118,7 +118,7 @@ impl<A: Allocator> ClaimWatch<A> {
     /// again.
     pub fn new_in(cap: u32, alloc: A) -> Result<ClaimWatch<A>, WatchError>
     where
-        A: Clone,
+        A: Copy,
     {
         Self::planted_in(cap, WatchPlant::None, alloc)
     }
@@ -126,11 +126,11 @@ impl<A: Allocator> ClaimWatch<A> {
     /// [`ClaimWatch::new_in`] with a plant (the tests' controls).
     pub fn planted_in(cap: u32, plant: WatchPlant, alloc: A) -> Result<ClaimWatch<A>, WatchError>
     where
-        A: Clone,
+        A: Copy,
     {
         let refused = WatchError::Memory { wanted: cap };
         let buckets = cap.max(1).checked_mul(2).and_then(u32::checked_next_power_of_two).ok_or(refused)?;
-        let live = Vec::try_with_capacity_in(cap as usize, alloc.clone()).map_err(|_| refused)?;
+        let live = Vec::try_with_capacity_in(cap as usize, alloc).map_err(|_| refused)?;
         let mut index = Vec::try_with_capacity_in(buckets as usize, alloc).map_err(|_| refused)?;
         for _ in 0..buckets {
             index.try_push(NO_ENTRY).map_err(|_| refused)?;

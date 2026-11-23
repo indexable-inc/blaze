@@ -58,12 +58,12 @@ pub enum Plant {
 /// Replaces every slot of `view` whose address does not escape by values, every buffer in
 /// `alloc`. `view` must be verified (`crate::verify`): the stage's inliner hands on a verified
 /// function, and the pass relies on its dominance. The output is verified in debug builds.
-pub fn scalar_replace<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
+pub fn scalar_replace<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
     scalar_replace_planted(view, Plant::None, alloc)
 }
 
 /// [`scalar_replace`] with a planted bug, which only test builds act on.
-pub fn scalar_replace_planted<A: Allocator + Clone>(
+pub fn scalar_replace_planted<A: Allocator + Copy>(
     view: View<'_>,
     plant: Plant,
     alloc: A,
@@ -97,8 +97,8 @@ pub fn scalar_replace_planted<A: Allocator + Clone>(
     emit(&view, &found, &phis, &renamed, alloc)
 }
 
-fn filled<T: Clone, A: Allocator + Clone>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
-    Vec::from_elem_in(item, len, alloc.clone())
+fn filled<T: Clone, A: Allocator + Copy>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
+    Vec::from_elem_in(item, len, *alloc)
 }
 
 fn layout_error(inst: usize) -> SimplifyError {
@@ -206,14 +206,14 @@ struct Cfg<A: Allocator> {
     children: Vec<u32, A>,
 }
 
-impl<A: Allocator + Clone> Cfg<A> {
+impl<A: Allocator + Copy> Cfg<A> {
     fn of(view: &View<'_>, alloc: &A) -> Result<Cfg<A>, SimplifyError> {
         let blocks = view.blocks();
-        let mut succ_start = Vec::with_capacity_in(blocks + 1, alloc.clone());
-        let mut succs = Vec::new_in(alloc.clone());
+        let mut succ_start = Vec::with_capacity_in(blocks + 1, *alloc);
+        let mut succs = Vec::new_in(*alloc);
         let mut plain_only = filled(blocks, true, alloc);
         // (to, from), one per edge.
-        let mut edges: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
+        let mut edges: Vec<(u32, u32), A> = Vec::new_in(*alloc);
         for b in 0..blocks {
             succ_start.push(succs.len() as u32);
             each_edge(view, view.terminator(Block(b as u32)), |to, plain| {
@@ -233,14 +233,14 @@ impl<A: Allocator + Clone> Cfg<A> {
         for b in 0..blocks {
             pred_start[b + 1] += pred_start[b];
         }
-        let mut preds = Vec::with_capacity_in(edges.len(), alloc.clone());
+        let mut preds = Vec::with_capacity_in(edges.len(), *alloc);
         for &(_, from) in edges.iter() {
             preds.push(from);
         }
         // Reverse postorder from the entry, by an explicit stack.
-        let mut post = Vec::with_capacity_in(blocks, alloc.clone());
+        let mut post = Vec::with_capacity_in(blocks, *alloc);
         let mut seen = filled(blocks, false, alloc);
-        let mut stack: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
+        let mut stack: Vec<(u32, u32), A> = Vec::new_in(*alloc);
         if blocks > 0 {
             seen[0] = true;
             stack.push((0, succ_start[0]));
@@ -259,7 +259,7 @@ impl<A: Allocator + Clone> Cfg<A> {
                 stack.pop();
             }
         }
-        let mut rpo = Vec::with_capacity_in(post.len(), alloc.clone());
+        let mut rpo = Vec::with_capacity_in(post.len(), *alloc);
         rpo.extend_from_slice(&post);
         rpo.reverse();
         let mut order = filled(blocks, NONE, alloc);
@@ -300,7 +300,7 @@ impl<A: Allocator + Clone> Cfg<A> {
             return Err(SimplifyError::Refused { inst: 0, what: "a block graph whose dominators did not settle" });
         }
         // The dominator tree's children, by block.
-        let mut tree: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
+        let mut tree: Vec<(u32, u32), A> = Vec::new_in(*alloc);
         for &b in rpo.iter().skip(1) {
             tree.push((idom[b as usize], b));
         }
@@ -312,7 +312,7 @@ impl<A: Allocator + Clone> Cfg<A> {
         for b in 0..blocks {
             child_start[b + 1] += child_start[b];
         }
-        let mut children = Vec::with_capacity_in(tree.len(), alloc.clone());
+        let mut children = Vec::with_capacity_in(tree.len(), *alloc);
         for &(_, child) in tree.iter() {
             children.push(child);
         }
@@ -403,7 +403,7 @@ struct Walk<'v, A: Allocator> {
     access_of: Vec<u32, A>,
 }
 
-impl<A: Allocator + Clone> Walk<'_, A> {
+impl<A: Allocator + Copy> Walk<'_, A> {
     fn inst(&mut self, at: usize, reachable: bool) -> Result<(), SimplifyError> {
         let view = self.view;
         let op = view.op(at);
@@ -494,14 +494,14 @@ impl<A: Allocator + Clone> Walk<'_, A> {
 
 /// The first walk: every reachable block in reverse postorder (a value's definition before
 /// its uses), then the unreachable ones; then the fields of the slots not kept.
-fn find<A: Allocator + Clone>(view: &View<'_>, cfg: &Cfg<A>, alloc: &A) -> Result<Found<A>, SimplifyError> {
+fn find<A: Allocator + Copy>(view: &View<'_>, cfg: &Cfg<A>, alloc: &A) -> Result<Found<A>, SimplifyError> {
     let (n, blocks, slots) = (view.len(), view.blocks(), view.slots.len());
     let mut w = Walk {
         view: *view,
         kept: filled(slots, false, alloc),
         ptr_at: filled(n, NONE, alloc),
-        ptrs: Vec::new_in(alloc.clone()),
-        accesses: Vec::new_in(alloc.clone()),
+        ptrs: Vec::new_in(*alloc),
+        accesses: Vec::new_in(*alloc),
         access_of: filled(n, NONE, alloc),
     };
     let mut block_acc = filled(blocks, (0u32, 0u32), alloc);
@@ -519,7 +519,7 @@ fn find<A: Allocator + Clone>(view: &View<'_>, cfg: &Cfg<A>, alloc: &A) -> Resul
     }
     let Walk { mut kept, mut accesses, access_of, .. } = w;
     // The loads and stores of slots not kept, by slot, offset and type.
-    let mut order = Vec::new_in(alloc.clone());
+    let mut order = Vec::new_in(*alloc);
     for (i, access) in accesses.iter().enumerate() {
         if access.kind != Kind::Reset && !kept[access.slot as usize] {
             order.push(i as u32);
@@ -549,7 +549,7 @@ fn find<A: Allocator + Clone>(view: &View<'_>, cfg: &Cfg<A>, alloc: &A) -> Resul
         };
     }
     // The fields of the slots not kept, in (slot, offset, type) order.
-    let mut fields = Vec::new_in(alloc.clone());
+    let mut fields = Vec::new_in(*alloc);
     let mut slot_fields = filled(slots, (0u32, 0u32), alloc);
     let mut last: Option<(u32, i128, u16)> = None;
     for &i in order.iter() {
@@ -586,12 +586,12 @@ impl<A: Allocator> Phis<A> {
 /// Places each field's parameters at the iterated dominance frontier of its defining blocks,
 /// where the field is live; keeps the slot of a field that would need one where an edge
 /// carries no arguments.
-fn place<A: Allocator + Clone>(view: &View<'_>, cfg: &Cfg<A>, found: &mut Found<A>, alloc: &A) -> Phis<A> {
+fn place<A: Allocator + Copy>(view: &View<'_>, cfg: &Cfg<A>, found: &mut Found<A>, alloc: &A) -> Phis<A> {
     let blocks = view.blocks();
     let nfields = found.fields.len();
     // Defining blocks and blocks reading a field before writing it, as (field, block).
-    let mut defs: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
-    let mut uses: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
+    let mut defs: Vec<(u32, u32), A> = Vec::new_in(*alloc);
+    let mut uses: Vec<(u32, u32), A> = Vec::new_in(*alloc);
     let mut stamp = filled(nfields, NONE, alloc);
     for &b in cfg.rpo.iter() {
         let (start, end) = found.block_acc[b as usize];
@@ -623,7 +623,7 @@ fn place<A: Allocator + Clone>(view: &View<'_>, cfg: &Cfg<A>, found: &mut Found<
     uses.sort_unstable();
     uses.dedup();
     // The dominance frontier, as (block, frontier block), sorted.
-    let mut df: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
+    let mut df: Vec<(u32, u32), A> = Vec::new_in(*alloc);
     for &b in cfg.rpo.iter().skip(1) {
         let preds = cfg.preds_of(b);
         if preds.iter().filter(|&&p| cfg.reachable(p)).count() < 2 {
@@ -653,8 +653,8 @@ fn place<A: Allocator + Clone>(view: &View<'_>, cfg: &Cfg<A>, found: &mut Found<
     // Per field: liveness backward from its reads, then the frontier forward from its writes.
     let (mut def_mark, mut live_mark) = (filled(blocks, NONE, alloc), filled(blocks, NONE, alloc));
     let (mut work_mark, mut phi_mark) = (filled(blocks, NONE, alloc), filled(blocks, NONE, alloc));
-    let mut work = Vec::new_in(alloc.clone());
-    let mut placed: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
+    let mut work = Vec::new_in(*alloc);
+    let mut placed: Vec<(u32, u32), A> = Vec::new_in(*alloc);
     let (mut d, mut u) = (0, 0);
     for f in 0..nfields as u32 {
         let d_start = d;
@@ -718,7 +718,7 @@ fn place<A: Allocator + Clone>(view: &View<'_>, cfg: &Cfg<A>, found: &mut Found<
     for b in 0..blocks {
         start[b + 1] += start[b];
     }
-    let mut field = Vec::with_capacity_in(placed.len(), alloc.clone());
+    let mut field = Vec::with_capacity_in(placed.len(), *alloc);
     for &(_, f) in placed.iter() {
         field.push(f);
     }
@@ -744,7 +744,7 @@ struct Renamed<A: Allocator> {
 }
 
 /// One walk down the dominator tree, an explicit stack and an undo log of field values.
-fn rename<A: Allocator + Clone>(
+fn rename<A: Allocator + Copy>(
     view: &View<'_>,
     cfg: &Cfg<A>,
     found: &Found<A>,
@@ -754,12 +754,12 @@ fn rename<A: Allocator + Clone>(
 ) -> Result<Renamed<A>, SimplifyError> {
     let blocks = view.blocks();
     let mut cur = filled(found.fields.len(), Def::Undef, alloc);
-    let mut undo: Vec<(u32, Def), A> = Vec::new_in(alloc.clone());
+    let mut undo: Vec<(u32, Def), A> = Vec::new_in(*alloc);
     let mut load_def = filled(found.accesses.len(), Def::Undef, alloc);
-    let mut edge_args = Vec::new_in(alloc.clone());
+    let mut edge_args = Vec::new_in(*alloc);
     let mut edge_at = filled(blocks, NONE, alloc);
     // (block, undo length at its entry, its next child).
-    let mut stack: Vec<(u32, u32, u32), A> = Vec::new_in(alloc.clone());
+    let mut stack: Vec<(u32, u32, u32), A> = Vec::new_in(*alloc);
     let mut enter = if blocks > 0 { Some(0u32) } else { None };
     loop {
         if let Some(b) = enter.take() {
@@ -830,7 +830,7 @@ struct Out<A: Allocator> {
     fixups: Vec<(u32, bool, u32), A>,
 }
 
-impl<A: Allocator + Clone> Out<A> {
+impl<A: Allocator + Copy> Out<A> {
     fn raw(&mut self, op: Op, flags: u8, ty: u16, data: u32, attrs: u32, loc: u32) -> u32 {
         let at = self.func.ops.len() as u32;
         self.func.ops.push(op as u8);
@@ -989,7 +989,7 @@ impl<A: Allocator + Clone> Out<A> {
 /// The last walk: the input in layout order, the replaced slots' instructions dropped, each
 /// load of a field replaced by what reaches it, each block given its new parameters and each
 /// plain edge its new arguments.
-fn emit<A: Allocator + Clone>(
+fn emit<A: Allocator + Copy>(
     view: &View<'_>,
     found: &Found<A>,
     phis: &Phis<A>,
@@ -997,7 +997,7 @@ fn emit<A: Allocator + Clone>(
     alloc: A,
 ) -> Result<Func<A>, SimplifyError> {
     let (n, blocks) = (view.len(), view.blocks());
-    let mut func = view.to_func_in(alloc.clone());
+    let mut func = view.to_func_in(alloc);
     func.ops.clear();
     func.flags.clear();
     func.tys.clear();
@@ -1025,19 +1025,19 @@ fn emit<A: Allocator + Clone>(
         }
     }
     let replaced = |slot: u32| slot_row[slot as usize] == NONE;
-    let mut out = Out { func, fixups: Vec::new_in(alloc.clone()) };
+    let mut out = Out { func, fixups: Vec::new_in(alloc) };
     // Per input value (and `n + k` for new parameter `k`): its number here.
     let mut map = filled(n + phis.field.len(), NONE, &alloc);
     // Per input value: the value a replaced load stands for, to follow before `map`.
     let mut redirect = filled(n, NONE, &alloc);
-    let mut cache: Vec<(u16, u32), A> = Vec::new_in(alloc.clone());
-    let mut extras: Vec<(u32, bool), A> = Vec::new_in(alloc.clone());
+    let mut cache: Vec<(u16, u32), A> = Vec::new_in(alloc);
+    let mut extras: Vec<(u32, bool), A> = Vec::new_in(alloc);
     for b in 0..blocks as u32 {
         out.func.block_starts.push(out.func.ops.len() as u32);
         out.func.block_kinds.push(view.block_kinds[b as usize]);
         cache.clear();
         let params = view.params(Block(b));
-        for at in params.clone() {
+        for at in params.start..params.end {
             map[at] = out.raw(Op::Param, view.flags[at], view.tys[at], view.data[at], view.attrs[at], view.locs[at]);
         }
         for k in phis.of(b) {

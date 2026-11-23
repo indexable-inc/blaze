@@ -12,13 +12,13 @@ blaze-bstd-convert	102
 blaze-build	286
 blaze-build-script	22
 blaze-c	2
-blaze-cas	233
+blaze-cas	122
 blaze-check	7
 blaze-cli	76
 blaze-columns	29
 blaze-cond	3
 blaze-consteval	47
-blaze-core	213
+blaze-core	99
 blaze-data	49
 blaze-dbsp	1
 blaze-deflate	5
@@ -43,7 +43,7 @@ blaze-http	39
 blaze-ids	3
 blaze-inproc	3
 blaze-json	9
-blaze-keyed	222
+blaze-keyed	4
 blaze-kit	15
 blaze-ladder	144
 blaze-launch	4
@@ -51,7 +51,7 @@ blaze-launch-rt	5
 blaze-launcher	2
 blaze-lint	6
 blaze-lint-defs	1
-blaze-lir	210
+blaze-lir	29
 blaze-lower	20
 blaze-manifest	298
 blaze-mem	5

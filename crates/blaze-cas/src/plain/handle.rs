@@ -26,6 +26,7 @@ use std::{
 };
 
 use blaze_core::{Driver, Mapping, Native, SharedMap, lock::Lock};
+use blaze_own::Share;
 use blaze_keyed::{
     kind::{Key as KeyOf, Kind, Namespace, Tag},
     store::{Compacted, ENTRY, Generation, Holder, Put, Read, RootRef, Store, StoreError, TwoValues},
@@ -171,7 +172,7 @@ impl<D: Driver, S: Allocator + Clone> PlainStore<D, S> {
         let table = self.table.pin();
         for at in from..core.mapped_count() {
             let proved = core.mapped_at(at);
-            let replaced = table.insert(at, Mapped { seg: *proved.seg(), map: proved.mapping().clone(), proof: proved.proof(generation) });
+            let replaced = table.insert(at, Mapped { seg: *proved.seg(), map: proved.mapping().share(), proof: proved.proof(generation) });
             assert!(replaced.is_none(), "the table is insert-only: index {at} is inserted once");
         }
         self.generation.store(core.generation(), Ordering::Relaxed);

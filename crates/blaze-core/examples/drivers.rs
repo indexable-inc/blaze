@@ -18,6 +18,7 @@ use blaze_core::{
     Completion, Done, Driver, Effect, FileName, Tag, run_until_idle, threads::Threads,
 };
 use blaze_ids::rng::SplitMix64;
+use blaze_own::Share;
 
 fn percentile(values: &mut [f64], p: f64) -> f64 {
     values.sort_by(f64::total_cmp);
@@ -35,11 +36,11 @@ fn commit(driver: &mut impl Driver) -> Vec<f64> {
         .map(|n| {
             let began = Instant::now();
             let mut effects =
-                vec![Effect::Append { file: file.clone(), bytes: bytes.clone(), tag: Tag(n) }];
+                vec![Effect::Append { file: file.share(), bytes: bytes.clone(), tag: Tag(n) }];
             run_until_idle(driver, &mut effects, |done, effects| {
                 check(&done);
                 if done.done == Done::Appended {
-                    effects.push(Effect::Sync { file: file.clone(), tag: done.tag });
+                    effects.push(Effect::Sync { file: file.share(), tag: done.tag });
                 }
             }).expect("the effects end");
             began.elapsed().as_secs_f64() * 1e6
@@ -56,7 +57,7 @@ fn batch(driver: &mut impl Driver) -> Vec<f64> {
             let began = Instant::now();
             let mut effects: Vec<Effect> = (0..64)
                 .map(|n| Effect::Append {
-                    file: files[n % 8].clone(),
+                    file: files[n % 8].share(),
                     bytes: bytes.clone(),
                     tag: Tag(n as u64),
                 })
@@ -69,7 +70,7 @@ fn batch(driver: &mut impl Driver) -> Vec<f64> {
                     left[at] -= 1;
                     if left[at] == 0 {
                         effects.push(Effect::Sync {
-                            file: files[at].clone(),
+                            file: files[at].share(),
                             tag: Tag(100 + at as u64),
                         });
                     }
@@ -93,7 +94,7 @@ fn reads(driver: &mut impl Driver, dir: &std::path::Path) -> Vec<f64> {
             let mut effects: Vec<Effect> = (0..4096)
                 .map(|n| {
                     let at = rng.below((64 << 20) - (4 << 10));
-                    Effect::Read { file: file.clone(), at, len: 4 << 10, tag: Tag(n) }
+                    Effect::Read { file: file.share(), at, len: 4 << 10, tag: Tag(n) }
                 })
                 .collect();
             let began = Instant::now();
