@@ -1195,13 +1195,13 @@ fn build_spacefarer_patterns<'a>(
 }
 
 fn main() {
-    let args: std::vec::Vec<_> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    let [spacer, boots, wrist, output] = args.as_slice() else {
+    let mut args = std::env::args_os().skip(1).map(PathBuf::from);
+    let [Some(spacer), Some(boots), Some(wrist), Some(output), None] = core::array::from_fn(|_| args.next()) else {
         eprintln!("usage: tailor_astra SPACER.glb BOOTS.glb WRIST.glb OUTPUT_DIRECTORY");
         std::process::exit(2);
     };
     let t_start = Instant::now();
-    let heap = blaze_own::testing::heap();
+    let heap = blaze_own::Heap::process();
     let alloc = heap.alloc();
 
     println!("=== blaze-cad-cloth SOTA: A-Pose Conformal Garment CAD & Physics ===");
@@ -1209,10 +1209,10 @@ fn main() {
     let read_glb = |path: &PathBuf| {
         std::fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
     };
-    let spacer_bytes = read_glb(spacer);
-    let boots_bytes = read_glb(boots);
-    let wrist_bytes = read_glb(wrist);
-    std::fs::create_dir_all(output).unwrap_or_else(|error| panic!("create {}: {error}", output.display()));
+    let spacer_bytes = read_glb(&spacer);
+    let boots_bytes = read_glb(&boots);
+    let wrist_bytes = read_glb(&wrist);
+    std::fs::create_dir_all(&output).unwrap_or_else(|error| panic!("create {}: {error}", output.display()));
 
     let head_glb = read_glb_skeleton_mesh(&spacer_bytes, Some(0), alloc, alloc).expect("parse head");
     let body_glb = read_glb_skeleton_mesh(&spacer_bytes, Some(1), alloc, alloc).expect("parse body");

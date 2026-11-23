@@ -27,9 +27,6 @@
 #![deny(blaze::process_static)]
 #![forbid(unsafe_code)]
 
-#[cfg(test)]
-extern crate std;
-
 pub mod cad_gear;
 pub mod collider;
 pub mod detail;

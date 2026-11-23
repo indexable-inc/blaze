@@ -71,26 +71,17 @@ fn push<T>(v: &mut Vec<T, Alloc<'_>>, x: T) -> Result<(), GltfIoError> {
 
 #[inline]
 fn read_u32_le(bytes: &[u8], off: usize) -> Result<u32, GltfIoError> {
-    if off + 4 > bytes.len() {
-        return Err(GltfIoError::OutOfBounds);
-    }
-    Ok(u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]))
+    bytes.get(off..).and_then(<[u8]>::first_chunk).copied().map(u32::from_le_bytes).ok_or(GltfIoError::OutOfBounds)
 }
 
 #[inline]
 fn read_u16_le(bytes: &[u8], off: usize) -> Result<u16, GltfIoError> {
-    if off + 2 > bytes.len() {
-        return Err(GltfIoError::OutOfBounds);
-    }
-    Ok(u16::from_le_bytes([bytes[off], bytes[off + 1]]))
+    bytes.get(off..).and_then(<[u8]>::first_chunk).copied().map(u16::from_le_bytes).ok_or(GltfIoError::OutOfBounds)
 }
 
 #[inline]
 fn read_f32_le(bytes: &[u8], off: usize) -> Result<f32, GltfIoError> {
-    if off + 4 > bytes.len() {
-        return Err(GltfIoError::OutOfBounds);
-    }
-    Ok(f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]))
+    read_u32_le(bytes, off).map(f32::from_bits)
 }
 
 fn val_u64<A: core::alloc::Allocator>(v: &Value<A>) -> Option<u64> {
@@ -137,6 +128,34 @@ struct AccessorSlice<'a> {
     components: usize,
 }
 
+fn accessor_size(count: usize, stride: usize, element_bytes: usize) -> Result<usize, GltfIoError> {
+    if stride < element_bytes || count == 0 {
+        return Err(GltfIoError::UnsupportedAccessor);
+    }
+    (count - 1).checked_mul(stride).and_then(|offset| offset.checked_add(element_bytes))
+        .ok_or(GltfIoError::OutOfBounds)
+}
+
+#[cfg(test)]
+mod accessor_tests {
+    use super::{accessor_size, GltfIoError};
+
+    #[test]
+    fn strided_extent_ends_after_the_last_element() {
+        for count in 1..8 {
+            for size in 1..17 {
+                for padding in 0..4 {
+                    let stride = size + padding;
+                    let end = (0..count).map(|i| i * stride + size).max();
+                    assert_eq!(accessor_size(count, stride, size).ok(), end);
+                }
+            }
+        }
+        assert_eq!(accessor_size(2, usize::MAX, 4), Err(GltfIoError::OutOfBounds));
+        assert_eq!(accessor_size(3, 2, 4), Err(GltfIoError::UnsupportedAccessor));
+    }
+}
+
 fn resolve_accessor<'a, A: core::alloc::Allocator>(
     root: &Value<A>,
     bin: &'a [u8],
@@ -170,12 +189,14 @@ fn resolve_accessor<'a, A: core::alloc::Allocator>(
     let bv_len = val_map_get(bv, "byteLength").and_then(val_u64).ok_or(GltfIoError::UnsupportedAccessor)? as usize;
     let stride = val_map_get(bv, "byteStride").and_then(val_u64).unwrap_or((components * comp_bytes) as u64) as usize;
 
-    let start = bv_off + acc_off;
-    let end = bv_off + bv_len;
-    if start > bin.len() || end > bin.len() || start > end {
+    let data = bin.get(bv_off..).and_then(|b| b.get(..bv_len)).and_then(|b| b.get(acc_off..))
+        .ok_or(GltfIoError::OutOfBounds)?;
+    let element_bytes = components * comp_bytes;
+    let last_end = accessor_size(count, stride, element_bytes)?;
+    if last_end > data.len() {
         return Err(GltfIoError::OutOfBounds);
     }
-    Ok(AccessorSlice { data: &bin[start..end], count, stride, component_type, components })
+    Ok(AccessorSlice { data, count, stride, component_type, components })
 }
 
 /// Parse a binary `.glb` file in memory, extracting mesh `mesh_index` (or all meshes if
@@ -186,23 +207,23 @@ pub fn read_glb_skeleton_mesh<'a>(
     alloc: Alloc<'a>,
     scratch: Alloc<'_>,
 ) -> Result<LoadedGlb<'a>, GltfIoError> {
-    if glb_bytes.len() < 12 || &glb_bytes[0..4] != b"glTF" || read_u32_le(glb_bytes, 4)? != 2 {
+    if glb_bytes.len() < 12 || !glb_bytes.starts_with(b"glTF") || read_u32_le(glb_bytes, 4)? != 2
+        || usize::try_from(read_u32_le(glb_bytes, 8)?).ok() != Some(glb_bytes.len()) {
         return Err(GltfIoError::BadHeader);
     }
     let mut off = 12usize;
     let mut json_chunk: Option<&[u8]> = None;
     let mut bin_chunk: Option<&[u8]> = None;
-    while off + 8 <= glb_bytes.len() {
+    while off < glb_bytes.len() {
         let len = read_u32_le(glb_bytes, off)? as usize;
-        let typ = &glb_bytes[off + 4..off + 8];
-        off += 8;
-        if off + len > glb_bytes.len() {
-            return Err(GltfIoError::OutOfBounds);
-        }
+        let header = glb_bytes.get(off..).and_then(<[u8]>::first_chunk::<8>).ok_or(GltfIoError::OutOfBounds)?;
+        let typ = &header[4..];
+        off += header.len();
+        let chunk = glb_bytes[off..].get(..len).ok_or(GltfIoError::OutOfBounds)?;
         if typ == b"JSON" {
-            json_chunk = Some(&glb_bytes[off..off + len]);
+            json_chunk = Some(chunk);
         } else if typ == b"BIN\0" {
-            bin_chunk = Some(&glb_bytes[off..off + len]);
+            bin_chunk = Some(chunk);
         }
         off += len;
     }
@@ -238,7 +259,9 @@ pub fn read_glb_skeleton_mesh<'a>(
             if pos_acc.component_type != 5126 || pos_acc.components != 3 {
                 return Err(GltfIoError::UnsupportedAccessor);
             }
-            let base_vert = positions.len() as u32;
+            let base_vert = u32::try_from(positions.len()).map_err(|_| GltfIoError::OutOfBounds)?;
+            let vertex_count = u32::try_from(pos_acc.count).map_err(|_| GltfIoError::OutOfBounds)?;
+            base_vert.checked_add(vertex_count).ok_or(GltfIoError::OutOfBounds)?;
             for i in 0..pos_acc.count {
                 let o = i * pos_acc.stride;
                 let x = read_f32_le(pos_acc.data, o)? as f64;
@@ -247,12 +270,20 @@ pub fn read_glb_skeleton_mesh<'a>(
                 push(&mut positions, Vec3::new(x, y, z))?;
             }
 
-            if let (Some(j_idx), Some(w_idx)) = (
-                val_map_get(attrs, "JOINTS_0").and_then(val_u64),
-                val_map_get(attrs, "WEIGHTS_0").and_then(val_u64),
-            ) {
+            let joints_attribute = val_map_get(attrs, "JOINTS_0");
+            let weights_attribute = val_map_get(attrs, "WEIGHTS_0");
+            if joints_attribute.is_some() != weights_attribute.is_some() {
+                return Err(GltfIoError::UnsupportedAccessor);
+            }
+            if let (Some(joints_attribute), Some(weights_attribute)) = (joints_attribute, weights_attribute) {
+                let j_idx = val_u64(joints_attribute).ok_or(GltfIoError::UnsupportedAccessor)?;
+                let w_idx = val_u64(weights_attribute).ok_or(GltfIoError::UnsupportedAccessor)?;
                 let j_acc = resolve_accessor(&root, bin, j_idx as usize)?;
                 let w_acc = resolve_accessor(&root, bin, w_idx as usize)?;
+                if j_acc.components != 4 || w_acc.components != 4
+                    || j_acc.count != pos_acc.count || w_acc.count != pos_acc.count {
+                    return Err(GltfIoError::UnsupportedAccessor);
+                }
                 for i in 0..pos_acc.count {
                     let jo = i * j_acc.stride;
                     let jv = match j_acc.component_type {
@@ -299,6 +330,9 @@ pub fn read_glb_skeleton_mesh<'a>(
 
             if let Some(ind_idx) = val_map_get(prim, "indices").and_then(val_u64) {
                 let i_acc = resolve_accessor(&root, bin, ind_idx as usize)?;
+                if i_acc.components != 1 {
+                    return Err(GltfIoError::UnsupportedAccessor);
+                }
                 let n_tris = i_acc.count / 3;
                 for t in 0..n_tris {
                     let mut tri = [0u32; 3];
@@ -310,6 +344,9 @@ pub fn read_glb_skeleton_mesh<'a>(
                             5125 => read_u32_le(i_acc.data, o)?,
                             _ => return Err(GltfIoError::UnsupportedAccessor),
                         };
+                        if idx >= vertex_count {
+                            return Err(GltfIoError::OutOfBounds);
+                        }
                         tri[c] = base_vert + idx;
                     }
                     push(&mut triangles, tri)?;
@@ -367,6 +404,11 @@ pub fn read_glb_skeleton_mesh<'a>(
                     .and_then(val_u64)
                     .map(|idx| resolve_accessor(&root, bin, idx as usize))
                     .transpose()?;
+                if let Some(acc) = &ibm_acc {
+                    if acc.components != 16 || acc.component_type != 5126 || acc.count < joint_nodes.len() {
+                        return Err(GltfIoError::UnsupportedAccessor);
+                    }
+                }
 
                 for (ji, jv) in joint_nodes.iter().enumerate() {
                     let ni = val_u64(jv).ok_or(GltfIoError::UnsupportedAccessor)? as usize;
@@ -417,6 +459,10 @@ pub fn read_glb_skeleton_mesh<'a>(
         }
     }
 
+    if !joints_0.is_empty() && (joints_0.len() != positions.len()
+        || joints_0.iter().flatten().any(|joint| usize::from(*joint) >= joints.len())) {
+        return Err(GltfIoError::OutOfBounds);
+    }
     Ok(LoadedGlb { positions, triangles, joints_0, weights_0, joints })
 }
 
