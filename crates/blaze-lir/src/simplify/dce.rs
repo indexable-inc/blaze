@@ -265,6 +265,9 @@ pub(super) struct Edit<A: Allocator> {
     /// Per block: [`NONE`], or the sole-predecessor block `B` coalesced into this block across
     /// its `jump` terminator (dropping this block's `jump` and `B`'s parameters).
     pub(super) merge_next: Vec<u32, A>,
+    /// Per instruction: `Some([a, b, c])` when an `fadd(fmul(a, b), c)` with `Flags::CONTRACT`
+    /// is fused into a single hardware `Op::Fma(a, b, c)`.
+    pub(super) fma_fuse: Vec<Option<[u32; 3]>, A>,
 }
 
 /// The function `view` with `edit` made, in `alloc`, verified.
@@ -563,9 +566,25 @@ impl<A: Allocator + Copy> Out<'_, '_, A> {
         Ok(())
     }
 
-    /// An integer constant `value` of scalar type `ty`, as [`crate::Builder::iconst`] encodes
-    /// one: in `data` when it fits `Op::Iconst`'s rule, else `iconst_wide`.
+    /// A scalar integer or float constant `value` of type `ty`, encoded as [`crate::Builder::iconst`]
+    /// / [`crate::Builder::fconst`] encode one.
     fn constant(&mut self, ty: Ty, value: u128, loc: u32) {
+        if ty.is_float() {
+            let bits = ty.bits(self.view.head.ptr_bits);
+            let le = value.to_le_bytes();
+            let word0 = u32::from_le_bytes([le[0], le[1], le[2], le[3]]);
+            if bits <= 32 {
+                return self.raw(Op::Fconst, 0, ty.0, word0, 0, loc);
+            }
+            let start = u32::try_from(self.func.extra.len()).unwrap_or(u32::MAX);
+            let words = usize::try_from(ty.const_words()).unwrap_or(0);
+            for chunk in le.chunks_exact(4).take(words) {
+                if let [b0, b1, b2, b3] = *chunk {
+                    self.func.extra.push(u32::from_le_bytes([b0, b1, b2, b3]));
+                }
+            }
+            return self.raw(Op::FconstWide, 0, ty.0, start, 0, loc);
+        }
         let bits = ty.bits(self.view.head.ptr_bits);
         if bits <= 32 {
             return self.raw(Op::Iconst, 0, ty.0, value as u32, 0, loc);
@@ -589,6 +608,19 @@ impl<A: Allocator + Copy> Out<'_, '_, A> {
         let (flags, ty, attrs, loc) = (view.flags[inst], view.tys[inst], view.attrs[inst], view.locs[inst]);
         if let Some(value) = self.edit.constant[inst] {
             self.constant(Ty(ty), value, loc);
+            return Ok(());
+        }
+        if let Some(&Some([a, b, c])) = self.edit.fma_fuse.get(inst) {
+            let va = self.value(inst, a)?;
+            let vb = self.value(inst, b)?;
+            let vc = self.value(inst, c)?;
+            let start = u32::try_from(self.func.extra.len()).unwrap_or(u32::MAX);
+            self.func.extra.push(va);
+            self.func.extra.push(vb);
+            self.func.extra.push(vc);
+            // `Flags::CONTRACT` has been consumed by emitting `Op::Fma`; dropping a promise refines the IR.
+            let fma_flags = Flags(flags).without(Flags::CONTRACT).bits();
+            self.raw(Op::Fma, fma_flags, ty, start, 0, loc);
             return Ok(());
         }
         let target_ref = self.edit.devirt[inst];
@@ -867,6 +899,7 @@ pub fn dead<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, Si
         jump,
         devirt: filled(len, NONE, &alloc),
         merge_next,
+        fma_fuse: filled(len, None, &alloc),
     };
     rebuild(view, &edit, alloc)
 }
@@ -921,6 +954,7 @@ pub fn coalesce_cfg<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Fun
         jump: no_jumps,
         devirt: filled(len, NONE, &alloc),
         merge_next,
+        fma_fuse: filled(len, None, &alloc),
     };
     rebuild(view, &edit, alloc)
 }

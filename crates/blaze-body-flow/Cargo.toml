@@ -42,6 +42,7 @@ oracle = ["dep:blaze-flow-lower", "dep:blaze-body-lower"]
 blaze-body-build.workspace = true
 blaze-body-lower.workspace = true
 blaze-build.workspace = true
+blaze-emit.workspace = true
 blaze-flow-lower.workspace = true
 blaze-lir = { workspace = true, features = ["eval"] }
 # The fixture world and the type checker the oracle's bodies are checked by.

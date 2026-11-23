@@ -387,6 +387,7 @@ dependencies = [
  "blaze-body-build",
  "blaze-body-lower",
  "blaze-build",
+ "blaze-emit",
  "blaze-flow",
  "blaze-flow-lower",
  "blaze-lir",
