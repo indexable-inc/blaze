@@ -13,6 +13,7 @@ use std::{
 
 use blaze_core::{Completion, Driver, Done, Effect, FileName, Native, Tag as EffectTag, wait::Deadline};
 use blaze_ids::ContentId;
+use blaze_own::Share;
 use blaze_keyed::{
     exec::RecordRef,
     kind::{Namespace, Tag},
@@ -256,7 +257,7 @@ impl<A: Allocator + Clone> Driven<Native, A> {
             }
             let path = self.root.join(file.as_str());
             let opened = std::fs::File::open(&path).map_err(|e| os("open", "a mapped segment, for pread", &e))?;
-            self.files.insert(file.clone(), opened);
+            self.files.insert(file.share(), opened);
         }
         Ok(())
     }
@@ -744,20 +745,22 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         // What is held is asked of every row, not of the mapped ones alone.
         self.map_all()?;
         let alloc = self.core.alloc().clone();
-        let mut missing: Vec<RecordRef, A> = Vec::with_capacity_in(keys.len(), alloc.clone());
+        let mut missing: Vec<RecordRef, &A> = Vec::with_capacity_in(keys.len(), &alloc);
         missing.extend(keys.iter().filter(|it| self.core.get_in(&[namespace], &Key(it.key)).is_none()).copied());
         missing.sort_unstable_by(|a, b| a.key.cmp(&b.key));
         missing.dedup_by(|a, b| a.key == b.key);
         if missing.is_empty() {
+            drop(missing);
             return Ok(Vec::new_in(alloc));
         }
-        let mut found: Vec<Option<Located>, A> = Vec::with_capacity_in(missing.len(), alloc.clone());
+        let mut found: Vec<Option<Located>, &A> = Vec::with_capacity_in(missing.len(), &alloc);
         found.resize(missing.len(), None);
         source.find(namespace, &missing, &mut found)?;
         let mut segments: BTreeMap<SegmentId, SegmentRef> = BTreeMap::new();
         for it in found.into_iter().flatten() {
             segments.insert(it.segment.digest(), it.segment);
         }
+        drop(missing);
         let mut wanted = Vec::with_capacity_in(segments.len(), alloc);
         wanted.extend(segments.into_values());
         self.pull(source, verifier, namespace, &wanted)
@@ -791,7 +794,7 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
             }
             let seg = Segment::of(&described, want.size());
             let file = FileName::new(&format!("{}/seg-{:016x}", self.core.dir().as_str(), seg.id)).expect("a store's file");
-            self.effects.push(Effect::WriteUnsynced { file: file.clone(), bytes, tag: EffectTag(OWN_TAGS + i as u64) });
+            self.effects.push(Effect::WriteUnsynced { file: file.share(), bytes, tag: EffectTag(OWN_TAGS + i as u64) });
             self.run("writing a fetched segment")?;
             for completion in self.own.drain(..) {
                 if let Done::Failed(error) = completion.done {

@@ -40,6 +40,8 @@
 use core::alloc::Allocator;
 use std::{io, path::Path, sync::Arc};
 
+use blaze_own::Share;
+
 use crate::{Done, Effect, FileName, IoError, descriptors::Descriptors, fs::beneath::RootDir};
 
 /// What a driver lets its asker do on the asker's own thread: the file calls of the table in
@@ -123,7 +125,7 @@ fn named(effect: &Effect) -> Option<FileName> {
         | Effect::Read { file, .. }
         | Effect::ReadAll { file, .. }
         | Effect::Append { file, .. }
-        | Effect::WriteAt { file, .. } => Some(file.clone()),
+        | Effect::WriteAt { file, .. } => Some(file.share()),
         Effect::Entries { dir, .. } => dir.name().cloned(),
         _ => None,
     }

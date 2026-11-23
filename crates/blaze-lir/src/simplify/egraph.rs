@@ -143,13 +143,13 @@ struct ScopedENodes<A: Allocator> {
     mask: usize,
 }
 
-impl<A: Allocator + Clone> ScopedENodes<A> {
+impl<A: Allocator + Copy> ScopedENodes<A> {
     fn new(expected: usize, alloc: &A) -> Self {
         let cap = (expected.saturating_mul(2).max(16)).next_power_of_two();
         Self {
             keys: filled(cap, None, alloc),
             vals: filled(cap, NONE, alloc),
-            undo: Vec::with_capacity_in(expected, alloc.clone()),
+            undo: Vec::with_capacity_in(expected, *alloc),
             mask: cap - 1,
         }
     }
@@ -208,18 +208,18 @@ fn is_power_of_two_gt1(v: u128) -> bool {
 }
 
 /// Computes immediate dominators for all reachable blocks using Cooper-Harvey-Kennedy in RPO.
-fn compute_dom_tree<A: Allocator + Clone>(
+fn compute_dom_tree<A: Allocator + Copy>(
     view: &View<'_>,
     reached: &[bool],
     alloc: &A,
 ) -> (Vec<u32, A>, Vec<Vec<u32, A>, A>) {
     let blocks = view.blocks();
     // Build predecessor lists and DFS postorder from entry block 0.
-    let mut preds: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(blocks, alloc.clone());
-    let mut succs: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(blocks, alloc.clone());
+    let mut preds: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(blocks, *alloc);
+    let mut succs: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(blocks, *alloc);
     for _ in 0..blocks {
-        preds.push(Vec::new_in(alloc.clone()));
-        succs.push(Vec::new_in(alloc.clone()));
+        preds.push(Vec::new_in(*alloc));
+        succs.push(Vec::new_in(*alloc));
     }
     for b in 0..blocks {
         if !reached[b] {
@@ -239,8 +239,8 @@ fn compute_dom_tree<A: Allocator + Clone>(
 
     // Iterative DFS for RPO numbering.
     let mut visited = filled(blocks, false, alloc);
-    let mut postorder: Vec<u32, A> = Vec::with_capacity_in(blocks, alloc.clone());
-    let mut stack: Vec<(u32, usize), A> = Vec::with_capacity_in(blocks, alloc.clone());
+    let mut postorder: Vec<u32, A> = Vec::with_capacity_in(blocks, *alloc);
+    let mut stack: Vec<(u32, usize), A> = Vec::with_capacity_in(blocks, *alloc);
     if blocks > 0 && reached[0] {
         visited[0] = true;
         stack.push((0, 0));
@@ -302,9 +302,9 @@ fn compute_dom_tree<A: Allocator + Clone>(
         }
     }
 
-    let mut children: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(blocks, alloc.clone());
+    let mut children: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(blocks, *alloc);
     for _ in 0..blocks {
-        children.push(Vec::new_in(alloc.clone()));
+        children.push(Vec::new_in(*alloc));
     }
     for &b in postorder.iter().skip(1) {
         let d = idom[b as usize];
@@ -317,7 +317,7 @@ fn compute_dom_tree<A: Allocator + Clone>(
 
 /// Runs the single-pass dominator-scoped Acyclic E-Graph (`aegraph`) optimizer over `view`,
 /// followed by dead-code elimination, returning a verified [`Func`] and optimization telemetry.
-pub fn aegraph_optimize<A: Allocator + Clone>(
+pub fn aegraph_optimize<A: Allocator + Copy>(
     view: View<'_>,
     alloc: A,
 ) -> Result<AegraphOutput<A>, SimplifyError> {
@@ -333,7 +333,7 @@ pub fn aegraph_optimize<A: Allocator + Clone>(
     let (idom, dom_children) = compute_dom_tree(&view, &reached, &alloc);
     let (loop_summary, _block_depths) = analyze_loops(&view, &reached, &idom, &alloc);
 
-    let mut stands: Vec<u32, A> = Vec::with_capacity_in(len, alloc.clone());
+    let mut stands: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     for i in 0..len {
         stands.push(i as u32);
     }
@@ -352,7 +352,7 @@ pub fn aegraph_optimize<A: Allocator + Clone>(
         Enter(u32),
         Exit(usize),
     }
-    let mut dfs: Vec<Frame, A> = Vec::with_capacity_in(blocks * 2, alloc.clone());
+    let mut dfs: Vec<Frame, A> = Vec::with_capacity_in(blocks * 2, alloc);
     if reached[0] {
         dfs.push(Frame::Enter(0));
     }
@@ -670,7 +670,7 @@ pub fn aegraph_optimize<A: Allocator + Clone>(
         devirt: filled(len, NONE, &alloc),
         merge_next: filled(blocks, NONE, &alloc),
     };
-    let rewritten = rebuild(view, &edit, alloc.clone())?;
+    let rewritten = rebuild(view, &edit, alloc)?;
     let cleaned = dead(rewritten.view(), alloc)?;
     stats.insts_after = cleaned.ops.len() as u32;
     Ok(AegraphOutput { func: cleaned, stats })
@@ -701,7 +701,7 @@ pub const fn op_latency_cycles(op: Op) -> u32 {
 }
 
 /// Computes exact SSA liveness and chordal-graph register pressure across `view`.
-pub fn plan_ssa_regalloc<A: Allocator + Clone>(
+pub fn plan_ssa_regalloc<A: Allocator + Copy>(
     view: View<'_>,
     budget: RegBudget,
     alloc: A,
@@ -713,7 +713,7 @@ pub fn plan_ssa_regalloc<A: Allocator + Clone>(
 
     // Approximate conservative SSA intervals `[def, last_use]` per value across layout order,
     // extending intervals across backward branches so loop-carried values stay live through the loop.
-    let mut last_use = Vec::with_capacity_in(len, alloc.clone());
+    let mut last_use = Vec::with_capacity_in(len, alloc);
     for i in 0..len {
         last_use.push(i);
     }
@@ -721,7 +721,7 @@ pub fn plan_ssa_regalloc<A: Allocator + Clone>(
     let mut total_cycles = 0u32;
     for b in 0..view.blocks() {
         let range = view.block(Block(b as u32));
-        for inst in range.clone() {
+        for inst in range.start..range.end {
             total_cycles = total_cycles.saturating_add(op_latency_cycles(view.op(inst)));
             each(&view, inst, |item| match item {
                 Item::Value(v) => {
@@ -839,7 +839,7 @@ const fn is_licm_pure(op: Op) -> bool {
 
 /// Discovers natural loops, per-block nesting depth, LICM-hoistable pure instructions, and basic
 /// induction variables (`header_param` incremented by a loop-invariant stride on the back-edge).
-fn analyze_loops<A: Allocator + Clone>(
+fn analyze_loops<A: Allocator + Copy>(
     view: &View<'_>,
     reached: &[bool],
     idom: &[u32],
@@ -854,12 +854,12 @@ fn analyze_loops<A: Allocator + Clone>(
     }
 
     // Build reverse edges and map each instruction -> owning block.
-    let mut preds: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(blocks, alloc.clone());
+    let mut preds: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(blocks, *alloc);
     for _ in 0..blocks {
-        preds.push(Vec::new_in(alloc.clone()));
+        preds.push(Vec::new_in(*alloc));
     }
     let mut inst_block = filled(len, 0u32, alloc);
-    let mut back_edges: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
+    let mut back_edges: Vec<(u32, u32), A> = Vec::new_in(*alloc);
 
     for b in 0..blocks {
         let range = view.block(Block(b as u32));
@@ -885,8 +885,8 @@ fn analyze_loops<A: Allocator + Clone>(
 
     // For each natural loop (latch -> header), collect loop body via backward DFS from latch.
     let mut in_loop = filled(blocks, false, alloc);
-    let mut work: Vec<u32, A> = Vec::new_in(alloc.clone());
-    let mut body_blocks: Vec<u32, A> = Vec::new_in(alloc.clone());
+    let mut work: Vec<u32, A> = Vec::new_in(*alloc);
+    let mut body_blocks: Vec<u32, A> = Vec::new_in(*alloc);
 
     for &(latch, header) in &back_edges {
         summary.natural_loops += 1;
@@ -990,7 +990,7 @@ fn analyze_loops<A: Allocator + Clone>(
 ///   for instruction index `inst`, or `1` when cold/unprofiled.
 /// - `reg_plan` + `budget`: feeds back remaining GPR headroom so we aggressively inline inside hot
 ///   loops when registers are available, and throttle back before introducing hot-loop spills.
-pub fn plan_opportunistic_inlining<A: Allocator + Clone>(
+pub fn plan_opportunistic_inlining<A: Allocator + Copy>(
     view: View<'_>,
     reg_plan: SsaRegPlan,
     budget: RegBudget,
@@ -999,7 +999,7 @@ pub fn plan_opportunistic_inlining<A: Allocator + Clone>(
 ) -> Vec<OpportunisticInlineSite, A> {
     let blocks = view.blocks();
     let len = view.len();
-    let mut sites = Vec::new_in(alloc.clone());
+    let mut sites = Vec::new_in(alloc);
     if blocks == 0 {
         return sites;
     }
@@ -1076,7 +1076,7 @@ pub struct SotaFeedbackOutput<A: Allocator> {
 }
 
 /// Copies one instruction from `view` into `func`, remapping all value operands through `val_map`.
-fn copy_inst_remapped<A: Allocator + Clone>(
+fn copy_inst_remapped<A: Allocator + Copy>(
     view: &View<'_>,
     inst: usize,
     val_map: &[u32],
@@ -1194,7 +1194,7 @@ fn copy_inst_remapped<A: Allocator + Clone>(
 }
 
 /// Emits an integer constant (`Iconst` or `IconstWide`) of scalar type `ty` into `func`.
-fn push_const_inst<A: Allocator + Clone>(
+fn push_const_inst<A: Allocator + Copy>(
     func: &mut Func<A>,
     ty: Ty,
     ptr_bits: u32,
@@ -1238,7 +1238,7 @@ fn push_const_inst<A: Allocator + Clone>(
 }
 
 /// Emits a binary scalar instruction `op(lhs, rhs)` into `func`.
-fn push_binary_inst<A: Allocator + Clone>(
+fn push_binary_inst<A: Allocator + Copy>(
     func: &mut Func<A>,
     op: Op,
     ty: Ty,
@@ -1266,7 +1266,7 @@ fn push_binary_inst<A: Allocator + Clone>(
 /// - `add x, x` -> `shl x, 1`
 ///
 /// Returns `(rewritten_func, count_rewritten)`.
-pub fn materialize_strength_reduction<A: Allocator + Clone>(
+pub fn materialize_strength_reduction<A: Allocator + Copy>(
     view: View<'_>,
     alloc: A,
 ) -> Result<(Func<A>, u32), SimplifyError> {
@@ -1291,7 +1291,7 @@ pub fn materialize_strength_reduction<A: Allocator + Clone>(
         }
     }
 
-    let mut func = view.to_func_in(alloc.clone());
+    let mut func = view.to_func_in(alloc);
     func.ops.clear();
     func.flags.clear();
     func.tys.clear();
@@ -1387,7 +1387,7 @@ pub fn materialize_strength_reduction<A: Allocator + Clone>(
 /// instructions out of natural loop bodies into the loop's single dominating `Jump` preheader.
 ///
 /// Returns `(rewritten_func, hoisted_count)`.
-pub fn hoist_loop_invariants<A: Allocator + Clone>(
+pub fn hoist_loop_invariants<A: Allocator + Copy>(
     view: View<'_>,
     alloc: A,
 ) -> Result<(Func<A>, u32), SimplifyError> {
@@ -1401,12 +1401,12 @@ pub fn hoist_loop_invariants<A: Allocator + Clone>(
     let reached = reachable(&view, &no_jumps, &alloc);
     let (idom, _) = compute_dom_tree(&view, &reached, &alloc);
 
-    let mut preds: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(blocks, alloc.clone());
+    let mut preds: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(blocks, alloc);
     for _ in 0..blocks {
-        preds.push(Vec::new_in(alloc.clone()));
+        preds.push(Vec::new_in(alloc));
     }
     let mut inst_block = filled(len, 0u32, &alloc);
-    let mut back_edges: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
+    let mut back_edges: Vec<(u32, u32), A> = Vec::new_in(alloc);
 
     for b in 0..blocks {
         for inst in view.block(Block(b as u32)) {
@@ -1435,15 +1435,15 @@ pub fn hoist_loop_invariants<A: Allocator + Clone>(
 
     // `hoist_to[inst]` = target preheader block index, or `NONE`.
     let mut hoist_to = filled(len, NONE, &alloc);
-    let mut hoisted_by_preheader: Vec<Vec<usize, A>, A> = Vec::with_capacity_in(blocks, alloc.clone());
+    let mut hoisted_by_preheader: Vec<Vec<usize, A>, A> = Vec::with_capacity_in(blocks, alloc);
     for _ in 0..blocks {
-        hoisted_by_preheader.push(Vec::new_in(alloc.clone()));
+        hoisted_by_preheader.push(Vec::new_in(alloc));
     }
     let mut total_hoisted = 0u32;
 
     let mut in_loop = filled(blocks, false, &alloc);
-    let mut work: Vec<u32, A> = Vec::new_in(alloc.clone());
-    let mut body_blocks: Vec<u32, A> = Vec::new_in(alloc.clone());
+    let mut work: Vec<u32, A> = Vec::new_in(alloc);
+    let mut body_blocks: Vec<u32, A> = Vec::new_in(alloc);
 
     for &(latch, header) in &back_edges {
         body_blocks.clear();
@@ -1530,7 +1530,7 @@ pub fn hoist_loop_invariants<A: Allocator + Clone>(
         return Ok((view.to_func_in(alloc), 0));
     }
 
-    let mut func = view.to_func_in(alloc.clone());
+    let mut func = view.to_func_in(alloc);
     func.ops.clear();
     func.flags.clear();
     func.tys.clear();
@@ -1571,7 +1571,7 @@ pub fn hoist_loop_invariants<A: Allocator + Clone>(
 /// `[aegraph (GVN + identities + const-fold)] -> [strength reduction] -> [LICM hoist] ->
 /// [propagate] -> [dead]` up to `max_rounds` until fixed point, then computes chordal-SSA register
 /// pressure and feeds that back into PGO + loop-guided opportunistic JIT inlining decisions.
-pub fn sota_optimize_fixpoint<A: Allocator + Clone>(
+pub fn sota_optimize_fixpoint<A: Allocator + Copy>(
     view: View<'_>,
     budget: RegBudget,
     max_rounds: u32,
@@ -1579,17 +1579,17 @@ pub fn sota_optimize_fixpoint<A: Allocator + Clone>(
     alloc: A,
 ) -> Result<SotaFeedbackOutput<A>, SimplifyError> {
     let rounds = max_rounds.max(1);
-    let mut cur = view.to_func_in(alloc.clone());
+    let mut cur = view.to_func_in(alloc);
     let mut total_stats = AegraphStats { insts_before: view.len() as u32, ..AegraphStats::default() };
     let mut rounds_run = 0u32;
 
     for _ in 0..rounds {
         rounds_run += 1;
-        let step = aegraph_optimize(cur.view(), alloc.clone())?;
-        let (sr_func, sr_count) = materialize_strength_reduction(step.func.view(), alloc.clone())?;
-        let (licm_func, hoisted_count) = hoist_loop_invariants(sr_func.view(), alloc.clone())?;
-        let prop = super::propagate(licm_func.view(), alloc.clone())?;
-        let cleaned = dead(prop.view(), alloc.clone())?;
+        let step = aegraph_optimize(cur.view(), alloc)?;
+        let (sr_func, sr_count) = materialize_strength_reduction(step.func.view(), alloc)?;
+        let (licm_func, hoisted_count) = hoist_loop_invariants(sr_func.view(), alloc)?;
+        let prop = super::propagate(licm_func.view(), alloc)?;
+        let cleaned = dead(prop.view(), alloc)?;
 
         total_stats.gvn_hits += step.stats.gvn_hits;
         total_stats.identities_folded += step.stats.identities_folded;
@@ -1612,7 +1612,7 @@ pub fn sota_optimize_fixpoint<A: Allocator + Clone>(
     }
     total_stats.insts_after = cur.ops.len() as u32;
 
-    let reg_plan = plan_ssa_regalloc(cur.view(), budget, alloc.clone());
+    let reg_plan = plan_ssa_regalloc(cur.view(), budget, alloc);
     let inline_sites = plan_opportunistic_inlining(
         cur.view(),
         reg_plan,

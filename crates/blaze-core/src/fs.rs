@@ -41,6 +41,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use blaze_own::Share;
 use crate::{FileName, Meta};
 #[cfg(unix)]
 use crate::{Names, Stamp};
@@ -1004,8 +1005,8 @@ pub(crate) fn list(dir: &Path, name: &crate::DirName) -> io::Result<Vec<(FileNam
     while let Some(at) = todo.pop() {
         let parent = match at {
             // clone: the directory's name, a refcount: `found` grows under it.
-            Some(at) => crate::DirName::Named(found[at].0.clone()),
-            None => name.clone(),
+            Some(at) => crate::DirName::Named(found[at].0.share()),
+            None => name.share(),
         };
         let first = found.len();
         blaze_mem::scratch::with_path(|path| {
@@ -1669,7 +1670,7 @@ pub(crate) fn entries(dir: &Path, name: &crate::DirName) -> io::Result<crate::Li
     use std::os::{fd::AsFd as _, unix::ffi::OsStrExt as _};
     let fd = open_dir(dir)?;
     // clone: the listing's directory, a refcount.
-    let mut found = crate::ListingBuilder::new(name.clone());
+    let mut found = crate::ListingBuilder::new(name.share());
     // alloc: once per listing, std's handle of the directory.
     let read = std::fs::read_dir(dir)
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", dir.display())));

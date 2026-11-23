@@ -39,6 +39,7 @@ use std::{
 
 use blaze_core::{Completion, Done, Effect, Extent, FileName, LockMode, Tag as EffectTag};
 use blaze_ids::{ContentId, crc32c};
+use blaze_own::Share;
 use blaze_keyed::{
     kind::{Namespace, ReservedTag, Tag, TagReach, reach_of},
     store::{ALIGN, ENTRY, FOOTER, HEADER, Holder, Put, RowRefused, SEGMENT_MOST, SegmentId, StoreError, StoreFile, TwoValues},
@@ -647,7 +648,7 @@ pub struct PlainConfig<A: Allocator + Clone> {
 impl<A: Allocator + Clone> Clone for PlainConfig<A> {
     fn clone(&self) -> PlainConfig<A> {
         PlainConfig {
-            dir: self.dir.clone(),
+            dir: self.dir.share(),
             tags: self.tags,
             cap_bytes: self.cap_bytes,
             boot: self.boot,
@@ -2011,7 +2012,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// (the invariant's bound at [`NAMESPACE_BYTES_STATED`]) for each namespace it names. What
     /// blaze-cli's "its compaction is behind" line counts against.
     pub fn named_most(&self) -> u32 {
-        let mut namespaces: Vec<Namespace, A> = Vec::new_in(self.alloc.clone());
+        let mut namespaces: Vec<Namespace, &A> = Vec::new_in(&self.alloc);
         for seg in &self.manifest.segments {
             if !namespaces.contains(&seg.namespace) {
                 namespaces.push(seg.namespace);
@@ -2290,7 +2291,7 @@ impl<A: Allocator + Clone> Plain<A> {
     pub fn open(&mut self, effects: &mut Vec<Effect>) {
         assert!(matches!(self.phase, Phase::New), "a plain store is opened once");
         self.phase = Phase::ReadHead(Ctx::Open);
-        effects.push(Effect::ReadAll { file: self.head.clone(), tag: self.tag(HEAD_READ, 0) });
+        effects.push(Effect::ReadAll { file: self.head.share(), tag: self.tag(HEAD_READ, 0) });
     }
 
     // ---- reads: no lock, no write to anything shared ----
@@ -2437,7 +2438,7 @@ impl<A: Allocator + Clone> Plain<A> {
             checks.reads += 1;
             self.checks.set(checks);
             let mapped = &self.maps[at];
-            Placed { key: *key, tag: entry.tag, namespace: mapped.seg().namespace, segment: mapped.seg().digest, file: mapped.file().clone(), at: entry.at, len: entry.len }
+            Placed { key: *key, tag: entry.tag, namespace: mapped.seg().namespace, segment: mapped.seg().digest, file: mapped.file().share(), at: entry.at, len: entry.len }
         })
     }
 
@@ -2737,13 +2738,13 @@ impl<A: Allocator + Clone> Plain<A> {
             // Every record of the namespace, the store's own batch's, each worker's and each
             // lent one's (where it lies: no copy before this layout's one): in the store's
             // allocator, freed when the commit's layout is made.
-            let mut all: Vec<(Entry, &[u8]), A> = Vec::new_in(self.alloc.clone());
+            let mut all: Vec<(Entry, &[u8]), &A> = Vec::new_in(&self.alloc);
             for batch in own.into_iter().chain(batches.iter().copied().filter(|it| it.namespace == namespace)) {
                 all.extend(batch.entries.iter().map(|it| (*it, batch.payload(it))));
             }
             all.extend(records.iter().filter(|it| it.namespace == namespace).map(|it| (it.entry(), it.bytes)));
             all.sort_unstable_by(|a, b| a.0.key.cmp(&b.0.key));
-            let mut entries: Vec<Entry, A> = Vec::with_capacity_in(all.len(), self.alloc.clone());
+            let mut entries: Vec<Entry, &A> = Vec::with_capacity_in(all.len(), &self.alloc);
             // The payloads from [`HEADER`] on, each at a multiple of [`ALIGN`] of the segment:
             // the process heap, as the segment's write takes it whole (blaze-core's effect).
             let mut bytes: Vec<u8> = Vec::new_in(Global);
@@ -2865,13 +2866,13 @@ impl<A: Allocator + Clone> Plain<A> {
         let whole_index = self.plant() == Plant::MergeWholeIndex;
         let Phase::Writing(writing, _) = &mut self.phase else { return };
         let Some(mut stream) = writing.stream.take() else { return };
-        let file = writing.file.clone();
+        let file = writing.file.share();
         let (mut asked, mut built) = (0u32, 0u64);
         loop {
             match stream.leg {
                 Leg::Payloads if stream.flying < MERGE_CHUNKS_IN_FLIGHT => match stream.next_chunk(self) {
                     Some((at, bytes)) => {
-                        effects.push(Effect::WriteAt { file: file.clone(), at, bytes, tag: tag_of(tags, SEG_PIECE, stream.asked) });
+                        effects.push(Effect::WriteAt { file: file.share(), at, bytes, tag: tag_of(tags, SEG_PIECE, stream.asked) });
                         stream.flying += 1;
                         asked += 1;
                     }
@@ -2883,13 +2884,13 @@ impl<A: Allocator + Clone> Plain<A> {
                 Leg::Index if !stream.index_flying => match stream.next_index(self, whole_index) {
                     Some((at, bytes)) => {
                         built = built.max(bytes.len() as u64);
-                        effects.push(Effect::WriteAt { file: file.clone(), at, bytes, tag: tag_of(tags, SEG_PIECE, INDEX_PIECE + stream.index_asked) });
+                        effects.push(Effect::WriteAt { file: file.share(), at, bytes, tag: tag_of(tags, SEG_PIECE, INDEX_PIECE + stream.index_asked) });
                         stream.index_flying = true;
                         asked += 1;
                     }
                     None => {
                         let (at, bytes) = stream.seal();
-                        effects.push(Effect::WriteAt { file: file.clone(), at, bytes, tag: tag_of(tags, SEG_PIECE, FOOTER_PIECE) });
+                        effects.push(Effect::WriteAt { file: file.share(), at, bytes, tag: tag_of(tags, SEG_PIECE, FOOTER_PIECE) });
                         asked += 1;
                     }
                 },
@@ -2970,7 +2971,7 @@ impl<A: Allocator + Clone> Plain<A> {
         head.extend_from_slice(&header);
         let mut pieces = Vec::with_capacity_in(1, self.alloc.clone());
         pieces.push((0, head));
-        effects.push(Effect::Truncate { file: file.clone(), len, tag: self.tag(SEG_TRUNCATE, 0) });
+        effects.push(Effect::Truncate { file: file.share(), len, tag: self.tag(SEG_TRUNCATE, 0) });
         self.phase = Phase::Writing(Box::new(Writing { seg, file, pieces, left: 0, stream: Some(stream) }), Box::new(why));
     }
 
@@ -2987,9 +2988,9 @@ impl<A: Allocator + Clone> Plain<A> {
         seg.boot = self.cfg.boot;
         let file = self.segment_file(seg.id);
         let back = matches!(&why, Why::Compact { candidates, .. } if candidates.contains(&seg.id));
-        let named = Writing { seg, file: file.clone(), pieces: Vec::new_in(self.alloc.clone()), left: 0, stream: None };
+        let named = Writing { seg, file: file.share(), pieces: Vec::new_in(self.alloc.clone()), left: 0, stream: None };
         if back || self.by_id.contains_key(&seg.id) {
-            effects.push(Effect::Remove { file: temp.clone(), tag: self.tag(SEG_UNWRITE, 0) });
+            effects.push(Effect::Remove { file: temp.share(), tag: self.tag(SEG_UNWRITE, 0) });
             self.phase = Phase::Unwriting { writing: Box::new(named), why: Box::new(why), temp };
             return;
         }
@@ -3012,13 +3013,13 @@ impl<A: Allocator + Clone> Plain<A> {
             Ok(synced) => synced,
             Err(writing) if planted => {
                 if self.plant() != Plant::SkipDataSync {
-                    self.late_sync.push(writing.file.clone());
+                    self.late_sync.push(writing.file.share());
                 }
                 Synced::for_a_plant(writing)
             }
             Err(writing) => {
                 self.put_path.syncs += 1;
-                effects.push(Effect::Sync { file: writing.file.clone(), tag: self.tag(SEG_SYNC, 0) });
+                effects.push(Effect::Sync { file: writing.file.share(), tag: self.tag(SEG_SYNC, 0) });
                 self.phase = Phase::SyncingSegment(Box::new(writing), Box::new(why));
                 return;
             }
@@ -3059,7 +3060,7 @@ impl<A: Allocator + Clone> Plain<A> {
         let footer_at = index_at + u64::from(count) * ENTRY as u64;
         pieces.push((index_at, run));
         pieces.push((footer_at, footer));
-        effects.push(Effect::Truncate { file: file.clone(), len, tag: self.tag(SEG_TRUNCATE, 0) });
+        effects.push(Effect::Truncate { file: file.share(), len, tag: self.tag(SEG_TRUNCATE, 0) });
         self.phase = Phase::Writing(Box::new(Writing { seg, file, pieces, left: 0, stream: None }), Box::new(why));
     }
 
@@ -3103,7 +3104,7 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         assert!(self.eager, "Plain::compact copies from a whole store: Plain::map_all first");
         self.phase = Phase::Listing;
-        effects.push(Effect::List { dir: self.cfg.dir.clone().into(), tag: self.tag(LIST, 0) });
+        effects.push(Effect::List { dir: self.cfg.dir.share().into(), tag: self.tag(LIST, 0) });
         true
     }
 
@@ -3183,20 +3184,20 @@ impl<A: Allocator + Clone> Plain<A> {
         let segs = &self.manifest.segments;
         let mut out = Vec::new_in(self.alloc.clone());
         let mut oldest = usize::MAX;
-        let mut looked: Vec<Namespace, A> = Vec::new_in(self.alloc.clone());
+        let mut looked: Vec<Namespace, &A> = Vec::new_in(&self.alloc);
         for first in segs {
             if looked.contains(&first.namespace) {
                 continue;
             }
             looked.push(first.namespace);
             let namespace = first.namespace;
-            let mut rows: Vec<TierRow, A> = Vec::new_in(self.alloc.clone());
-            let mut at: Vec<usize, A> = Vec::new_in(self.alloc.clone());
+            let mut rows: Vec<TierRow, &A> = Vec::new_in(&self.alloc);
+            let mut at: Vec<usize, &A> = Vec::new_in(&self.alloc);
             for (i, seg) in segs.iter().enumerate().filter(|(_, it)| it.namespace == namespace) {
                 rows.push(TierRow { len: seg.file_len(), mergeable: mergeable(seg) });
                 at.push(i);
             }
-            let merge = tiers.merge(&rows, self.alloc.clone());
+            let merge = tiers.merge(&rows, &self.alloc);
             let Some(&start) = merge.rows.first() else { continue };
             if at[start] < oldest {
                 oldest = at[start];
@@ -3555,7 +3556,7 @@ impl<A: Allocator + Clone> Plain<A> {
             let run = self.maps[at].run();
             (0..seg.count as usize).any(|i| keep.keeps(&self.maps, &format::key_at(run, i), false))
         };
-        let mut kept_candidates = Vec::with_capacity_in(candidates.len(), self.alloc.clone());
+        let mut kept_candidates = Vec::with_capacity_in(candidates.len(), &self.alloc);
         kept_candidates.extend(candidates.into_iter().filter(|seg| !seg.published || !holds_live(seg)));
         let candidates = kept_candidates;
         let namespace = candidates.first().map_or(Namespace::LOCAL, |it| it.namespace);
@@ -3619,7 +3620,7 @@ impl<A: Allocator + Clone> Plain<A> {
             next: None,
             fresh: false,
             new_log: false,
-            log: self.head.clone(),
+            log: self.head.share(),
             manifest_bytes: Vec::new_in(Global),
             removals: Vec::new_in(self.alloc.clone()),
             refused: None,
@@ -3628,7 +3629,7 @@ impl<A: Allocator + Clone> Plain<A> {
             early: 0,
             deferred: None,
         }));
-        effects.push(Effect::Lock { file: self.flip.clone(), mode: LockMode::Exclusive, tag: self.tag(LOCK, 0) });
+        effects.push(Effect::Lock { file: self.flip.share(), mode: LockMode::Exclusive, tag: self.tag(LOCK, 0) });
     }
 
     /// A built generation whose manifest would not encode (`why`: a row `format::Row::new`
@@ -3914,7 +3915,7 @@ impl<A: Allocator + Clone> Plain<A> {
             && let Some((_, file)) = slice.seg.as_ref()
         {
             // The slice did not land: its copy, named by no generation, is this process's own.
-            removals.push(file.clone());
+            removals.push(file.share());
         }
         m.retired.retain(|it| {
             let held = holders.iter().any(|opened| *opened < it.since_ns.saturating_add(GRACE_NS));
@@ -3960,9 +3961,9 @@ impl<A: Allocator + Clone> Plain<A> {
         flip.next = Some((slot, m));
         let first = if flip.new_log {
             flip.manifest_bytes = bytes;
-            Effect::Truncate { file: flip.log.clone(), len: 0, tag: self.tag(LOG_TRUNCATE, 0) }
+            Effect::Truncate { file: flip.log.share(), len: 0, tag: self.tag(LOG_TRUNCATE, 0) }
         } else {
-            Effect::WriteAt { file: flip.log.clone(), at, bytes, tag: self.tag(LOG_WRITE, 0) }
+            Effect::WriteAt { file: flip.log.share(), at, bytes, tag: self.tag(LOG_WRITE, 0) }
         };
         if early.is_empty() {
             effects.push(first);
@@ -4004,7 +4005,7 @@ impl<A: Allocator + Clone> Plain<A> {
         let Phase::Flipping(flip) = &self.phase else { unreachable!("a slot is a flip's") };
         let slot = flip.next.as_ref().expect("built").0;
         let other = SLOT_AT[((slot.generation + 1) % 2) as usize];
-        effects.push(Effect::WriteAt { file: self.head.clone(), at: other, bytes: vec![0u8; format::SLOT], tag: self.tag(SLOT_WRITE, 2) });
+        effects.push(Effect::WriteAt { file: self.head.share(), at: other, bytes: vec![0u8; format::SLOT], tag: self.tag(SLOT_WRITE, 2) });
     }
 
     /// The commit point. Every flip, the first included, writes one 64-byte slot in place in
@@ -4016,7 +4017,7 @@ impl<A: Allocator + Clone> Plain<A> {
         let Phase::Flipping(flip) = &self.phase else { unreachable!("a slot is a flip's") };
         let slot = flip.next.as_ref().expect("built").0;
         let at = SLOT_AT[(slot.generation % 2) as usize];
-        effects.push(Effect::WriteAt { file: self.head.clone(), at, bytes: slot.encode().to_vec(), tag: self.tag(SLOT_WRITE, 0) });
+        effects.push(Effect::WriteAt { file: self.head.share(), at, bytes: slot.encode().to_vec(), tag: self.tag(SLOT_WRITE, 0) });
     }
 
     /// The flip's writes are done (or it was refused): let go of the lock.
@@ -4057,7 +4058,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 Some((_, file)) => {
                     // Never named: this process's own, removed now.
                     self.removing.clear();
-                    self.removing.push(file.clone());
+                    self.removing.push(file.share());
                     effects.push(Effect::Remove { file, tag: self.tag(REMOVE, 0) });
                     self.phase = Phase::Removing { left: 1, then: Then::Compact(stats) };
                 }
@@ -4096,7 +4097,7 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         let left = flip.removals.len() as u32;
         for (i, file) in flip.removals.iter().enumerate() {
-            effects.push(Effect::Remove { file: file.clone(), tag: self.tag(REMOVE, i as u32) });
+            effects.push(Effect::Remove { file: file.share(), tag: self.tag(REMOVE, i as u32) });
         }
         self.removing = flip.removals;
         if left == 0 {
@@ -4398,7 +4399,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// The sealed segments of an earlier boot this boot has not walked yet: what the
     /// background pass has left ([`Plain::scrub_next`]), oldest generation first.
     pub fn unscrubbed(&self) -> Vec<u64, A> {
-        let mut left: Vec<&Segment, A> = Vec::new_in(self.alloc.clone());
+        let mut left: Vec<&Segment, &A> = Vec::new_in(&self.alloc);
         // Walked whole or lost by this process, its flip not landed yet: not walked again.
         let pending = |id: u64| self.checked.contains(&id) || self.dropped.contains(&id);
         left.extend(self.manifest.segments.iter().filter(|it| it.local && it.sealed && it.boot != self.cfg.boot && self.by_id.contains_key(&it.id) && !pending(it.id)));
@@ -4591,7 +4592,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 {
                     self.torn_stamp = true;
                     self.report.lost.push(Lost {
-                        file: self.head.clone(),
+                        file: self.head.share(),
                         segment: None,
                         records: None,
                         why: format!("its slot {at} is torn: a flip a power cut cut short; what no whole generation names is read from the segments' own footers and reported"),
@@ -4630,7 +4631,7 @@ impl<A: Allocator + Clone> Plain<A> {
                         // directory still holds failed to read (an error); one a power cut took
                         // is the same as torn.
                         let why = fail("reading a manifest", &log, &done).unwrap_or_else(|| unexpected("reading a manifest"));
-                        effects.push(Effect::List { dir: self.cfg.dir.clone().into(), tag: self.tag(LIST, 0) });
+                        effects.push(Effect::List { dir: self.cfg.dir.share().into(), tag: self.tag(LIST, 0) });
                         self.phase = Phase::CheckLog { ctx, slots, at, why };
                         return Ok(());
                     }
@@ -4668,18 +4669,18 @@ impl<A: Allocator + Clone> Plain<A> {
                     // head holds and extends it with zeros (never a whole-file write: another
                     // process may have made the head and flipped since this one read it short,
                     // and a Truncate to the length it has is no change).
-                    effects.push(Effect::Truncate { file: self.head.clone(), len: HEAD_LEN as u64, tag: self.tag(HEAD_MAKE, 1) });
+                    effects.push(Effect::Truncate { file: self.head.share(), len: HEAD_LEN as u64, tag: self.tag(HEAD_MAKE, 1) });
                 } else if index == 1 {
                     // Synced once in the store's life, before its first segment: so an empty or
                     // short head never stands beside segments a power cut kept.
-                    effects.push(Effect::Sync { file: self.head.clone(), tag: self.tag(HEAD_MAKE, 2) });
+                    effects.push(Effect::Sync { file: self.head.share(), tag: self.tag(HEAD_MAKE, 2) });
                 } else if index == 2 {
                     // And its name with it: a power cut never keeps a segment's name and loses
                     // the head's.
-                    effects.push(Effect::SyncDir { dir: self.cfg.dir.clone().into(), tag: self.tag(HEAD_MAKE, 3) });
+                    effects.push(Effect::SyncDir { dir: self.cfg.dir.share().into(), tag: self.tag(HEAD_MAKE, 3) });
                 } else {
                     self.phase = Phase::ReadHead(Ctx::Open);
-                    effects.push(Effect::ReadAll { file: self.head.clone(), tag: self.tag(HEAD_READ, 0) });
+                    effects.push(Effect::ReadAll { file: self.head.share(), tag: self.tag(HEAD_READ, 0) });
                 }
                 Ok(())
             }
@@ -4718,7 +4719,7 @@ impl<A: Allocator + Clone> Plain<A> {
                         self.lose_orphan(file, id, None);
                         continue;
                     }
-                    effects.push(Effect::Read { file: file.clone(), at: meta.len - FOOTER as u64, len: FOOTER, tag: self.tag(FOOTER_READ, self.listed.len() as u32) });
+                    effects.push(Effect::Read { file: file.share(), at: meta.len - FOOTER as u64, len: FOOTER, tag: self.tag(FOOTER_READ, self.listed.len() as u32) });
                     self.listed.push((file, id));
                     left += 1;
                 }
@@ -4732,7 +4733,8 @@ impl<A: Allocator + Clone> Plain<A> {
             (FOOTER_READ, Phase::Orphans { left }) => {
                 *left -= 1;
                 let left = *left;
-                let (file, id) = self.listed[index as usize].clone();
+                let (ref file, id) = self.listed[index as usize];
+                let file = file.share();
                 let records = match &done {
                     Done::Read(bytes) => format::footer_count(bytes).map(u64::from),
                     _ => None,
@@ -4751,7 +4753,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     if self.unopened.is_empty() {
                         self.mapped(then, effects);
                     } else {
-                        effects.push(Effect::List { dir: self.cfg.dir.clone().into(), tag: self.tag(LIST, 0) });
+                        effects.push(Effect::List { dir: self.cfg.dir.share().into(), tag: self.tag(LIST, 0) });
                         self.phase = Phase::CheckMaps { then };
                     }
                 }
@@ -4821,9 +4823,9 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
                 let pieces = std::mem::replace(&mut writing.pieces, Vec::new_in(self.alloc.clone()));
                 writing.left = pieces.len() as u32;
-                let file = writing.file.clone();
+                let file = writing.file.share();
                 for (i, (at, bytes)) in pieces.into_iter().enumerate() {
-                    effects.push(Effect::WriteAt { file: file.clone(), at, bytes, tag: self.tag(SEG_PIECE, i as u32) });
+                    effects.push(Effect::WriteAt { file: file.share(), at, bytes, tag: self.tag(SEG_PIECE, i as u32) });
                 }
                 // A streamed copy's first chunks, behind its header.
                 self.stream_on(effects);
@@ -4921,7 +4923,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 done => Err(fail("taking the flip lock", &self.flip, &done).unwrap_or_else(|| unexpected("taking the flip lock"))),
             },
             (LOCK_WAIT, Phase::Flipping(_)) => {
-                effects.push(Effect::Lock { file: self.flip.clone(), mode: LockMode::Exclusive, tag: self.tag(LOCK, 0) });
+                effects.push(Effect::Lock { file: self.flip.share(), mode: LockMode::Exclusive, tag: self.tag(LOCK, 0) });
                 Ok(())
             }
             (LOG_TRUNCATE, Phase::Flipping(flip)) => {
@@ -4929,7 +4931,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     return Err(why);
                 }
                 let bytes = std::mem::take(&mut flip.manifest_bytes);
-                effects.push(Effect::WriteAt { file: flip.log.clone(), at: 0, bytes, tag: self.tag(LOG_WRITE, 0) });
+                effects.push(Effect::WriteAt { file: flip.log.share(), at: 0, bytes, tag: self.tag(LOG_WRITE, 0) });
                 Ok(())
             }
             (LOG_WRITE, Phase::Flipping(flip)) => {
@@ -4937,7 +4939,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     return Err(why);
                 }
                 if self.cfg.durable {
-                    effects.push(Effect::Sync { file: flip.log.clone(), tag: self.tag(LOG_SYNC, 0) });
+                    effects.push(Effect::Sync { file: flip.log.share(), tag: self.tag(LOG_SYNC, 0) });
                 } else {
                     self.write_slot(effects);
                 }
@@ -4952,7 +4954,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 } else {
                     // Durable: the names of the segments and the log made for this generation
                     // are made durable before the slot that names them.
-                    effects.push(Effect::SyncDir { dir: self.cfg.dir.clone().into(), tag: self.tag(DIR_SYNC, 0) });
+                    effects.push(Effect::SyncDir { dir: self.cfg.dir.share().into(), tag: self.tag(DIR_SYNC, 0) });
                 }
                 Ok(())
             }
@@ -4972,7 +4974,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     2 => "blanking the head's other slot",
                     _ => "writing the head",
                 };
-                let file = if index == 1 { self.name(CACHEDIR_TAG) } else { self.head.clone() };
+                let file = if index == 1 { self.name(CACHEDIR_TAG) } else { self.head.share() };
                 if let Some(why) = fail(what, &file, &done) {
                     return Err(why);
                 }
@@ -4988,7 +4990,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     _ => {}
                 }
                 if self.cfg.durable {
-                    effects.push(Effect::Sync { file: self.head.clone(), tag: self.tag(HEAD_SYNC, 0) });
+                    effects.push(Effect::Sync { file: self.head.share(), tag: self.tag(HEAD_SYNC, 0) });
                 } else {
                     self.unlock(effects);
                 }
@@ -5017,7 +5019,7 @@ impl<A: Allocator + Clone> Plain<A> {
         let Phase::Flipping(flip) = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!() };
         self.flip_parked = Some(flip);
         self.phase = Phase::ReadHead(Ctx::Flip);
-        effects.push(Effect::ReadAll { file: self.head.clone(), tag: self.tag(HEAD_READ, 0) });
+        effects.push(Effect::ReadAll { file: self.head.share(), tag: self.tag(HEAD_READ, 0) });
     }
 
     fn read_manifest(&mut self, ctx: Ctx, slots: [Option<Slot>; 2], at: usize, fell_back: bool, effects: &mut Vec<Effect>) {
@@ -5074,7 +5076,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
                 if fell_back {
                     self.phase = Phase::Orphans { left: 0 };
-                    effects.push(Effect::List { dir: self.cfg.dir.clone().into(), tag: self.tag(LIST, 0) });
+                    effects.push(Effect::List { dir: self.cfg.dir.share().into(), tag: self.tag(LIST, 0) });
                 } else {
                     self.map_new(Then::Open, effects);
                 }
@@ -5130,15 +5132,21 @@ fn laid_of<A: Allocator + Clone>(mut out: Batch, alloc: A) -> Result<Laid<A>, St
 
 /// `keys` sorted and each once, as the 32-byte array a root's or an index's record holds: in
 /// `alloc`, scratch of the one put that copies it into its batch.
-fn sorted_keys<A: Allocator + Clone>(keys: &[Key], alloc: A) -> Vec<u8, A> {
-    let mut sorted = Vec::with_capacity_in(keys.len(), alloc.clone());
-    sorted.extend_from_slice(keys);
-    sorted.sort_unstable();
-    sorted.dedup();
-    let mut bytes = Vec::with_capacity_in(sorted.len() * 32, alloc);
-    for key in &sorted {
+fn sorted_keys<A: Allocator>(keys: &[Key], alloc: A) -> Vec<u8, A> {
+    let mut bytes = Vec::with_capacity_in(keys.len() * 32, alloc);
+    for key in keys {
         bytes.extend_from_slice(&key.0.0);
     }
+    let (chunks, _) = bytes.as_chunks_mut::<32>();
+    chunks.sort_unstable();
+    let mut kept = 0usize;
+    for i in 0..chunks.len() {
+        if kept == 0 || chunks[i] != chunks[kept - 1] {
+            chunks[kept] = chunks[i];
+            kept += 1;
+        }
+    }
+    bytes.truncate(kept * 32);
     bytes
 }
 

@@ -411,28 +411,28 @@ pub(super) struct Progs<A: Allocator> {
     chunks: Vec<((u32, u32), Holding), A>,
 }
 
-impl<A: Allocator + Clone> Progs<A> {
+impl<A: Allocator + Copy> Progs<A> {
     pub(super) fn new(programs: &[ProgramPlan], alloc: A) -> Progs<A> {
-        let mut list = Vec::with_capacity_in(programs.len(), alloc.clone());
+        let mut list = Vec::with_capacity_in(programs.len(), alloc);
         for plan in programs {
             list.push(Prog {
                 plan: *plan,
                 state: PState::Waiting,
                 kept: None,
-                rows_ord: Vec::new_in(alloc.clone()),
-                rows_ids: Vec::new_in(alloc.clone()),
+                rows_ord: Vec::new_in(alloc),
+                rows_ids: Vec::new_in(alloc),
                 rows_out: false,
-                changed: Vec::new_in(alloc.clone()),
-                insts: Vec::new_in(alloc.clone()),
-                index: Vec::new_in(alloc.clone()),
+                changed: Vec::new_in(alloc),
+                insts: Vec::new_in(alloc),
+                index: Vec::new_in(alloc),
                 ended: false,
-                rows: Vec::new_in(alloc.clone()),
-                gone: Vec::new_in(alloc.clone()),
-                changes: Vec::new_in(alloc.clone()),
-                link_plans: Vec::new_in(alloc.clone()),
-                spans: Vec::new_in(alloc.clone()),
-                owners: Vec::new_in(alloc.clone()),
-                link_spans: Vec::new_in(alloc.clone()),
+                rows: Vec::new_in(alloc),
+                gone: Vec::new_in(alloc),
+                changes: Vec::new_in(alloc),
+                link_plans: Vec::new_in(alloc),
+                spans: Vec::new_in(alloc),
+                owners: Vec::new_in(alloc),
+                link_spans: Vec::new_in(alloc),
                 key: None,
                 out: None,
                 patched: false,
@@ -440,9 +440,9 @@ impl<A: Allocator + Clone> Progs<A> {
         }
         Progs {
             list,
-            every: Vec::new_in(alloc.clone()),
-            owners: Vec::new_in(alloc.clone()),
-            roots: Vec::new_in(alloc.clone()),
+            every: Vec::new_in(alloc),
+            owners: Vec::new_in(alloc),
+            roots: Vec::new_in(alloc),
             chunks: Vec::new_in(alloc),
         }
     }
@@ -495,7 +495,7 @@ enum Text {
     Is(StableId),
 }
 
-impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, 'm, M, X, A, W> {
+impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Copy, W: Walker> Driver<'s, 'm, M, X, A, W> {
     /// A run of the phase starts: counted in [`super::Ran`].
     pub(super) fn counted(&mut self, step: Step) {
         match step {
@@ -508,8 +508,8 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
 
     /// Every unit is complete: each program starts from its kept manifest, or walks from none.
     pub(super) fn programs_start(&mut self) {
-        let alloc = self.alloc.clone();
-        let mut every = Vec::with_capacity_in(self.units.len(), alloc.clone());
+        let alloc = self.alloc;
+        let mut every = Vec::with_capacity_in(self.units.len(), alloc);
         let mut owners = Vec::with_capacity_in(self.units.len(), alloc);
         for (u, unit) in self.units.iter().enumerate() {
             if let Some(own) = unit.closure.iter().find(|table| table.owner == unit.owner) {
@@ -828,7 +828,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         if let Err(why) = record::read_kept(&payload) {
             return self.fail(Failure::Record { tag: ProgramManifest::TAG, key: key.id(), why });
         }
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let prog = &mut self.progs.list[p as usize];
         prog.kept = Some(payload);
         prog.key = Some(key);
@@ -914,11 +914,11 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// `examine` (one slot's record against its read list): a kept row is an instance whose
     /// plan is looked up again at its address, which a unit slot has no notion of.
     fn examine_kept_rows(&mut self, p: u32) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let prog = &mut self.progs.list[p as usize];
         prog.state = PState::Examining;
         let Some(parts) = kept_parts(&prog.kept) else { return };
-        let mut rows = Vec::new_in(alloc.clone());
+        let mut rows = Vec::new_in(alloc);
         for (ord, &moved) in prog.changed.iter().enumerate() {
             if moved {
                 rows.extend_from_slice(&parts.postings[parts.posting_at[ord] as usize..parts.posting_at[ord + 1] as usize]);
@@ -926,10 +926,10 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         }
         rows.sort_unstable();
         rows.dedup();
-        let mut fresh = Vec::with_capacity_in(rows.len(), alloc.clone());
+        let mut fresh = Vec::with_capacity_in(rows.len(), alloc);
         for &r in rows.iter() {
             let row = parts.rows[r as usize];
-            let mut old = Vec::with_capacity_in(row.shape_len as usize, alloc.clone());
+            let mut old = Vec::with_capacity_in(row.shape_len as usize, alloc);
             let ords = &parts.shapes[row.shape_at as usize..(row.shape_at + row.shape_len) as usize];
             old.extend(ords.iter().map(|&ord| parts.dictionary[ord as usize].id));
             fresh.push((r, row, old));
@@ -957,7 +957,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     // ---- the walk ----
 
     fn walk_begin(&mut self, p: u32) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let prog = &mut self.progs.list[p as usize];
         prog.state = PState::Walking;
         let mut moved = Vec::new_in(alloc);
@@ -1021,12 +1021,12 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             let ask = match self.walker.ask(p) {
                 None => break,
                 Some(WalkAsk::Plan { ask, instance, bytes, body }) => {
-                    Ok((ask, instance, bytes.map(|bytes| copy_in(bytes, self.alloc.clone())), body))
+                    Ok((ask, instance, bytes.map(|bytes| copy_in(bytes, self.alloc)), body))
                 }
                 Some(WalkAsk::Code { ask, instance, key, tier, callees, statics, spans }) => {
                     let code = CodeAsk { ask, instance, key, tier };
-                    let alloc = self.alloc.clone();
-                    Err((code, copy_in(callees, alloc.clone()), copy_in(statics, alloc.clone()), copy_in(spans, alloc)))
+                    let alloc = self.alloc;
+                    Err((code, copy_in(callees, alloc), copy_in(statics, alloc), copy_in(spans, alloc)))
                 }
             };
             match ask {
@@ -1050,7 +1050,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
                 let prog = &self.progs.list[p as usize];
                 let kept = kept_of(&prog.kept);
                 match kept.row(&key.id()) {
-                    Some(row) => copy_in(kept.ask_of(row), self.alloc.clone()),
+                    Some(row) => copy_in(kept.ask_of(row), self.alloc),
                     None => {
                         let failed = TaskFailed::Refused { what: "a plan asked with no ask bytes of an instance no kept row holds" };
                         return self.program_failed(p, Failure::Task { tag: PlanRecord::TAG, unit: NO_UNIT, failed });
@@ -1126,7 +1126,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         statics.sort_unstable_by_key(|key| key.id());
         statics.dedup();
         // The plans the code task reads: of both, sorted by instance, each once.
-        let mut read = Vec::with_capacity_in(callees.len() + statics.len(), self.alloc.clone());
+        let mut read = Vec::with_capacity_in(callees.len() + statics.len(), self.alloc);
         read.extend_from_slice(&callees);
         read.extend_from_slice(&statics);
         read.sort_unstable_by_key(|key| key.id());
@@ -1160,7 +1160,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     fn plans_at(&self, p: u32, instances: &[Key<PlanRecord>]) -> Option<Vec<PlanAt, A>> {
         let prog = &self.progs.list[p as usize];
         let parts = kept_parts(&prog.kept);
-        let mut out = Vec::with_capacity_in(instances.len(), self.alloc.clone());
+        let mut out = Vec::with_capacity_in(instances.len(), self.alloc);
         for instance in instances {
             let inst = prog.index.binary_search_by_key(&instance.id(), |(id, _)| *id).ok().map(|at| &prog.insts[prog.index[at].1 as usize]);
             let address = match inst {
@@ -1182,9 +1182,9 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             return;
         }
         self.progs.list[p as usize].ended = true;
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let (rows, gone) = match self.walker.end(p) {
-            Ok(end) => (copy_in(end.rows, alloc.clone()), copy_in(end.gone, alloc.clone())),
+            Ok(end) => (copy_in(end.rows, alloc), copy_in(end.gone, alloc)),
             Err(failed) => return self.program_failed(p, Failure::Task { tag: ProgramManifest::TAG, unit: NO_UNIT, failed }),
         };
         if rows.windows(2).any(|pair| pair[0].instance.id() >= pair[1].instance.id()) || gone.windows(2).any(|pair| pair[0].id() >= pair[1].id()) {
@@ -1202,12 +1202,12 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// Every span table settled: the link step, if a row or a table moved; else the kept
     /// manifest filed again, if a plan's or a table's address moved; else it stands.
     fn spans_end(&mut self, p: u32) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let prog = &mut self.progs.list[p as usize];
         // The tables the link step is given: each that came, or whose bytes moved. One whose
         // reads moved and whose bytes did not (a table above a comment) is not: its address
         // moves, which a refiled kept manifest records.
-        let mut link_spans = Vec::new_in(alloc.clone());
+        let mut link_spans = Vec::new_in(alloc);
         let mut span_moved = false;
         for span in prog.spans.iter() {
             match span.kept {
@@ -1271,11 +1271,11 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// makes the image from the kept one; else the image is the kept one's, cloned under the
     /// new manifest's key.
     fn linked(&mut self, p: u32, linker: &[u8], wrote: bool) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let prog = &self.progs.list[p as usize];
         // Each new row with the facts its plan read, what it refers to (its callees, then its
         // statics: `row.call_len` says where they part) and its ask.
-        let mut rows: Vec<(KeptRow, Vec<Fact, A>, Vec<ContentId, A>, Vec<u8, A>), A> = Vec::new_in(alloc.clone());
+        let mut rows: Vec<(KeptRow, Vec<Fact, A>, Vec<ContentId, A>, Vec<u8, A>), A> = Vec::new_in(alloc);
         if let Some(parts) = kept_parts(&prog.kept) {
             for row in parts.rows {
                 let walked = prog.rows.binary_search_by(|walked| walked.instance.id().cmp(&row.instance)).is_ok();
@@ -1286,7 +1286,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
                 // An examined plan whose result stood is still this row, at the address and with
                 // the reads it has now.
                 let examined = prog.index.binary_search_by_key(&row.instance, |(id, _)| *id).ok().map(|at| &prog.insts[prog.index[at].1 as usize]);
-                let mut reads = Vec::new_in(alloc.clone());
+                let mut reads = Vec::new_in(alloc);
                 let mut kept = *row;
                 match examined.filter(|inst| inst.state == IState::Settled) {
                     Some(inst) => {
@@ -1299,7 +1299,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
                     }
                 }
                 let view = Kept::of(&parts);
-                rows.push((kept, reads, copy_in(view.targets_of(row), alloc.clone()), copy_in(view.ask_of(row), alloc.clone())));
+                rows.push((kept, reads, copy_in(view.targets_of(row), alloc), copy_in(view.ask_of(row), alloc)));
             }
         }
         for walked in prog.rows.iter() {
@@ -1310,7 +1310,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             if inst.state != IState::Settled {
                 return self.fail(Failure::Misused("a walk's row of an instance whose plan was not answered"));
             }
-            let mut targets = Vec::with_capacity_in(inst.callees.len() + inst.statics.len(), alloc.clone());
+            let mut targets = Vec::with_capacity_in(inst.callees.len() + inst.statics.len(), alloc);
             targets.extend(inst.callees.iter().chain(inst.statics.iter()).map(|key| key.id()));
             let row = KeptRow {
                 instance: inst.key.id(),
@@ -1327,19 +1327,19 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
                 ask_at: 0,
                 ask_len: 0,
             };
-            rows.push((row, copy_in(&inst.reads, alloc.clone()), targets, copy_in(&inst.ask, alloc.clone())));
+            rows.push((row, copy_in(&inst.reads, alloc), targets, copy_in(&inst.ask, alloc)));
         }
         rows.sort_unstable_by_key(|(row, _, _, _)| row.instance);
         // The dictionary: every fact a row's plan read, with the digest it saw.
-        let mut dictionary = Vec::new_in(alloc.clone());
+        let mut dictionary = Vec::new_in(alloc);
         for (_, reads, _, _) in rows.iter() {
             dictionary.extend_from_slice(reads);
         }
         dictionary.sort_unstable_by_key(|fact: &Fact| fact.id);
         dictionary.dedup_by_key(|fact| fact.id);
-        let mut out_rows = Vec::with_capacity_in(rows.len(), alloc.clone());
-        let (mut targets, mut shapes, mut asks) = (Vec::new_in(alloc.clone()), Vec::new_in(alloc.clone()), Vec::new_in(alloc.clone()));
-        let mut posted: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
+        let mut out_rows = Vec::with_capacity_in(rows.len(), alloc);
+        let (mut targets, mut shapes, mut asks) = (Vec::new_in(alloc), Vec::new_in(alloc), Vec::new_in(alloc));
+        let mut posted: Vec<(u32, u32), A> = Vec::new_in(alloc);
         for (r, (row, reads, row_targets, ask)) in rows.iter().enumerate() {
             let mut row = *row;
             row.shape_at = shapes.len() as u32;
@@ -1358,7 +1358,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             out_rows.push(row);
         }
         posted.sort_unstable();
-        let mut postings = Vec::with_capacity_in(posted.len(), alloc.clone());
+        let mut postings = Vec::with_capacity_in(posted.len(), alloc);
         let mut posting_at = Vec::with_capacity_in(dictionary.len() + 1, alloc);
         let mut at = 0;
         for ord in 0..dictionary.len() as u32 {
@@ -1371,12 +1371,12 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         posting_at.push(postings.len() as u32);
         // The span tables, as settled this request (every one the rows name), their reads
         // shared by the tables of one owner that read the same files.
-        let mut by_owner = Vec::with_capacity_in(prog.spans.len(), self.alloc.clone());
+        let mut by_owner = Vec::with_capacity_in(prog.spans.len(), self.alloc);
         by_owner.extend(prog.spans.iter().enumerate().map(|(s, span)| (span.owner, s as u32)));
         by_owner.sort_unstable();
-        let mut ranges = Vec::with_capacity_in(prog.spans.len(), self.alloc.clone());
+        let mut ranges = Vec::with_capacity_in(prog.spans.len(), self.alloc);
         ranges.resize(prog.spans.len(), (0u32, 0u32));
-        let mut span_reads: Vec<Fact, A> = Vec::new_in(self.alloc.clone());
+        let mut span_reads: Vec<Fact, A> = Vec::new_in(self.alloc);
         let mut last: Option<(StableId, u32)> = None;
         for &(owner, s) in by_owner.iter() {
             let reads = &prog.spans[s as usize].reads;
@@ -1391,7 +1391,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
                 }
             };
         }
-        let mut spans = Vec::with_capacity_in(prog.spans.len(), self.alloc.clone());
+        let mut spans = Vec::with_capacity_in(prog.spans.len(), self.alloc);
         for (span, &(read_at, read_len)) in prog.spans.iter().zip(ranges.iter()) {
             spans.push(KeptSpan {
                 anchor: span.anchor,
@@ -1406,13 +1406,13 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         // Each row's tables, as ordinals into `spans`: a walked row's from its code ask, a kept
         // row's from the kept manifest.
         let kept = kept_parts(&prog.kept);
-        let (mut row_spans, mut row_span_at) = (Vec::new_in(self.alloc.clone()), Vec::with_capacity_in(out_rows.len() + 1, self.alloc.clone()));
+        let (mut row_spans, mut row_span_at) = (Vec::new_in(self.alloc), Vec::with_capacity_in(out_rows.len() + 1, self.alloc));
         for row in out_rows.iter() {
             row_span_at.push(row_spans.len() as u32);
             let start = row_spans.len();
             let walked = prog.rows.binary_search_by(|walked| walked.instance.id().cmp(&row.instance)).is_ok();
             let inst = prog.index.binary_search_by_key(&row.instance, |(id, _)| *id).ok().map(|at| &prog.insts[prog.index[at].1 as usize]);
-            let mut anchors = Vec::new_in(self.alloc.clone());
+            let mut anchors = Vec::new_in(self.alloc);
             match (walked, inst, kept.as_ref()) {
                 (true, Some(inst), _) => anchors.extend(inst.spans.iter().map(|span| span.anchor)),
                 (false, _, Some(parts)) => {
@@ -1434,7 +1434,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         row_span_at.push(row_spans.len() as u32);
         // The unit manifests every body read was answered against now: each unit's, as this
         // request settled or marked it (every unit is complete in this phase).
-        let mut manifests = Vec::with_capacity_in(self.units.len(), self.alloc.clone());
+        let mut manifests = Vec::with_capacity_in(self.units.len(), self.alloc);
         manifests.extend(self.units.iter().filter_map(|unit| unit.manifest.map(|key| key.id())));
         manifests.sort_unstable();
         manifests.dedup();
@@ -1454,7 +1454,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             row_spans: &row_spans,
             row_span_at: &row_span_at,
             linker,
-        }, self.alloc.clone());
+        }, self.alloc);
         let key = ProgramManifest::key(&ProgramInputs { program, header: &payload, chunks: &[] });
         let bytes = record::write_opaque(&key, &payload);
         let prog = &mut self.progs.list[p as usize];
@@ -1471,10 +1471,10 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// The walk ended: every span table the final rows name is found or made. A walked row names
     /// its code ask's; a kept row neither walked nor gone the kept manifest's.
     fn spans_begin(&mut self, p: u32) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let prog = &self.progs.list[p as usize];
         let parts = kept_parts(&prog.kept);
-        let mut wanted: Vec<SpanAt, A> = Vec::new_in(alloc.clone());
+        let mut wanted: Vec<SpanAt, A> = Vec::new_in(alloc);
         for row in prog.rows.iter() {
             if let Ok(at) = prog.index.binary_search_by_key(&row.instance.id(), |(id, _)| *id) {
                 wanted.extend_from_slice(&prog.insts[prog.index[at].1 as usize].spans);
@@ -1499,7 +1499,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             let failed = TaskFailed::Refused { what: "one span anchor named under two keys or two owners (rule keys-cover-every-input)" };
             return self.program_failed(p, Failure::Task { tag: SpanTable::TAG, unit: NO_UNIT, failed });
         }
-        let mut spans = Vec::with_capacity_in(wanted.len(), alloc.clone());
+        let mut spans = Vec::with_capacity_in(wanted.len(), alloc);
         for at in wanted.iter() {
             let Some(unit) = self.unit_of_item(&at.owner) else {
                 let failed = TaskFailed::Refused { what: "a span table whose owner no unit of the request owns" };
@@ -1514,7 +1514,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
                 unit,
                 kept: kept.copied(),
                 state: SState::Getting,
-                reads: Vec::new_in(alloc.clone()),
+                reads: Vec::new_in(alloc),
                 node: record::shape_root::<SpanTable>(at.key),
                 address: Key::from_id(ZERO),
                 digest: ZERO,
@@ -1557,7 +1557,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
 
     /// Each of `ids` with its digest now; `None` if one is not a [`FactKind::SpanFile`] fact.
     fn span_reads_now(&self, ids: impl Iterator<Item = ContentId>) -> Option<Vec<Fact, A>> {
-        let mut now = Vec::new_in(self.alloc.clone());
+        let mut now = Vec::new_in(self.alloc);
         for id in ids {
             now.push(Fact { id, digest: self.span_file_now(&id)? });
         }
@@ -1657,7 +1657,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
 
     /// Span table `s` is not found: its owner's task makes it, run once a request per owner.
     fn span_needs_owner(&mut self, p: u32, s: u32) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let prog = &mut self.progs.list[p as usize];
         let (owner, unit) = (prog.spans[s as usize].owner, prog.spans[s as usize].unit);
         prog.spans[s as usize].state = SState::Owner;
@@ -1666,7 +1666,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
             Some(_) => {}
             None => {
                 let o = prog.owners.len() as u32;
-                prog.owners.push(SpanOwner { owner, unit, ran: false, reads: Vec::new_in(alloc.clone()), tables: Vec::new_in(alloc) });
+                prog.owners.push(SpanOwner { owner, unit, ran: false, reads: Vec::new_in(alloc), tables: Vec::new_in(alloc) });
                 self.runs.push_back(Work::Program(Step::SpanRun(p, o)));
             }
         }
@@ -1676,7 +1676,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// answer now (the front end hashed the file as the driver does, or the record would be
     /// filed at an address no lookup makes), and every table waiting for it is filed.
     fn span_owner_ran(&mut self, p: u32, o: u32, reads: &[Fact], tables: &[(ContentId, &[u8])]) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let unit = self.progs.list[p as usize].owners[o as usize].unit;
         let refuse = |what| Failure::Task { tag: SpanTable::TAG, unit, failed: TaskFailed::Refused { what } };
         if reads.windows(2).any(|pair| pair[0].id >= pair[1].id) || tables.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
@@ -1685,7 +1685,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         if reads.iter().any(|read| self.span_file_now(&read.id) != Some(read.digest)) {
             return self.program_failed(p, refuse("a span task read a file other than as the driver answers it now (its printed name or its image key)"));
         }
-        let mut held = Vec::with_capacity_in(tables.len(), alloc.clone());
+        let mut held = Vec::with_capacity_in(tables.len(), alloc);
         held.extend(tables.iter().map(|(anchor, bytes)| (*anchor, Aligned::copy_from(bytes))));
         let owner = &mut self.progs.list[p as usize].owners[o as usize];
         owner.ran = true;
@@ -1715,10 +1715,10 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
         let table = &owner.tables[at].1;
         let (address, bytes) = record::write_read::<SpanTable>(span.key, &owner.reads, &[], table);
         let digest = record::result_of(&[], table);
-        let mut ids = Vec::with_capacity_in(owner.reads.len(), self.alloc.clone());
+        let mut ids = Vec::with_capacity_in(owner.reads.len(), self.alloc);
         ids.extend(owner.reads.iter().map(|read| read.id));
         let node = record::write_shape(&span.node, &ids);
-        let reads = copy_in(&owner.reads, self.alloc.clone());
+        let reads = copy_in(&owner.reads, self.alloc);
         let span = &mut self.progs.list[p as usize].spans[s as usize];
         if let Some(found) = span.audit.take() {
             if *found != *bytes {
@@ -1738,40 +1738,40 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     // ---- an instance's plan ----
 
     fn new_inst(&mut self, p: u32, key: Key<PlanRecord>, unit: u32, item: Option<StableId>, ask: &[u8], kept: Option<u32>) -> u32 {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let prog = &mut self.progs.list[p as usize];
         let i = prog.insts.len() as u32;
         prog.insts.push(Inst {
             key,
             unit,
             item,
-            ask: copy_in(ask, alloc.clone()),
+            ask: copy_in(ask, alloc),
             walked: false,
             kept,
             examined: false,
             state: IState::Idle,
             after: After::Probe,
             probing: Probing::Old,
-            old: Vec::new_in(alloc.clone()),
-            probe: Vec::new_in(alloc.clone()),
-            host_asks: Vec::new_in(alloc.clone()),
-            now: Vec::new_in(alloc.clone()),
+            old: Vec::new_in(alloc),
+            probe: Vec::new_in(alloc),
+            host_asks: Vec::new_in(alloc),
+            now: Vec::new_in(alloc),
             asked: ZERO,
             node: None,
             depth: 0,
-            also: Vec::new_in(alloc.clone()),
-            given: Vec::new_in(alloc.clone()),
+            also: Vec::new_in(alloc),
+            given: Vec::new_in(alloc),
             address: ZERO,
             result: ZERO,
-            reads: Vec::new_in(alloc.clone()),
+            reads: Vec::new_in(alloc),
             bytes: None,
             node_bytes: None,
             audit: None,
-            callees: Vec::new_in(alloc.clone()),
-            statics: Vec::new_in(alloc.clone()),
+            callees: Vec::new_in(alloc),
+            statics: Vec::new_in(alloc),
             tier: 0,
-            spans: Vec::new_in(alloc.clone()),
-            callee_plans: Vec::new_in(alloc.clone()),
+            spans: Vec::new_in(alloc),
+            callee_plans: Vec::new_in(alloc),
             asks: Vec::new_in(alloc),
             code_ask: None,
             code: Key::from_id(ZERO),
@@ -1791,7 +1791,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
 
     /// Starts an instance's lookup: its kept shape, else its key's shape trie.
     fn try_plan(&mut self, p: u32, i: u32) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let inst = &mut self.progs.list[p as usize].insts[i as usize];
         if inst.old.is_empty() {
             return self.plan_root(p, i);
@@ -1811,9 +1811,9 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
 
     /// Answers the instance's candidate shape: its bodies here, the rest by the host.
     fn plan_probe(&mut self, p: u32, i: u32) {
-        let alloc = self.alloc.clone();
-        let probe = copy_in(&self.progs.list[p as usize].insts[i as usize].probe, alloc.clone());
-        let mut now = Vec::with_capacity_in(probe.len(), alloc.clone());
+        let alloc = self.alloc;
+        let probe = copy_in(&self.progs.list[p as usize].insts[i as usize].probe, alloc);
+        let mut now = Vec::with_capacity_in(probe.len(), alloc);
         let mut host = Vec::new_in(alloc);
         for id in probe.iter() {
             if matches!(record::route(id), Ok(Route::Asker | Route::Outside) | Err(_)) {
@@ -1847,7 +1847,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     }
 
     fn plan_probed(&mut self, p: u32, i: u32, answers: &[ContentId]) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let inst = &mut self.progs.list[p as usize].insts[i as usize];
         if answers.len() != inst.host_asks.len() {
             return self.fail(Failure::Misused("a plan's shape answered with another number of facts than asked"));
@@ -1909,7 +1909,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     }
 
     fn plan_got_node(&mut self, p: u32, i: u32, record: Option<&[u8]>) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let Some(node) = self.progs.list[p as usize].insts[i as usize].node else {
             return self.fail(Failure::Misused("a plan's shape node read with no node asked"));
         };
@@ -1960,9 +1960,9 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// each in `also`, each where [`Driver::mir_now`] finds it. `None` while one is pending (the
     /// instance is woken by [`Driver::plan_resumed`]) or once the request failed.
     fn bodies_given(&mut self, p: u32, i: u32) -> Option<Vec<BodyAt, A>> {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let inst = &self.progs.list[p as usize].insts[i as usize];
-        let mut items = Vec::with_capacity_in(inst.also.len() + 1, alloc.clone());
+        let mut items = Vec::with_capacity_in(inst.also.len() + 1, alloc);
         items.extend(inst.item);
         items.extend_from_slice(&inst.also);
         let mut given = Vec::with_capacity_in(items.len(), alloc);
@@ -2035,7 +2035,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     }
 
     fn plan_ran(&mut self, p: u32, i: u32, record: &[u8]) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         // The `Copy` fields a failure names are copied out first: `inst` borrows `self.progs`,
         // and `fail` takes all of `self`.
         let inst = &mut self.progs.list[p as usize].insts[i as usize];
@@ -2099,7 +2099,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
     /// The instance holds the plan at `address`: its reads and result. Its payload is the
     /// front end's, handed to the walker unread.
     fn plan_settle(&mut self, p: u32, i: u32, address: ContentId, bytes: &[u8]) {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let root = match blaze_format::open::<Traced>(bytes) {
             Ok(root) => root,
             Err(error) => return self.fail(Failure::Record { tag: PlanRecord::TAG, key: address, why: RecordError::Format(error) }),
@@ -2123,7 +2123,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone, W: Walker> Driver<'s, '
 
     /// Gives the walker the plan for each of its asks this instance answers.
     fn answer_plan(&mut self, p: u32, i: u32) {
-        let asks = core::mem::replace(&mut self.progs.list[p as usize].insts[i as usize].asks, Vec::new_in(self.alloc.clone()));
+        let asks = core::mem::replace(&mut self.progs.list[p as usize].insts[i as usize].asks, Vec::new_in(self.alloc));
         let mut failed = None;
         {
             // `inst` borrows `self.progs` and the walker `self.walker`: disjoint fields, so the

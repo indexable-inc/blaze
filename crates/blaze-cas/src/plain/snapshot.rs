@@ -68,6 +68,7 @@ use core::fmt;
 use std::alloc::Allocator;
 
 use blaze_core::{Driver, Mapping};
+use blaze_own::Share;
 use blaze_ids::ContentId;
 use blaze_keyed::kind::{Namespace, ReservedTag};
 use blaze_keyed::store::{ENTRY, Generation};
@@ -222,7 +223,7 @@ impl<A: Allocator> Snapshot<A> {
             for at in in_space(plain, *space) {
                 let verified = plain.mapped_at(at);
                 // Within the reserve: no reallocation.
-                listed.push(Listed { seg: *verified.seg(), map: verified.mapping().clone(), proof: verified.proof(branded) });
+                listed.push(Listed { seg: *verified.seg(), map: verified.mapping().share(), proof: verified.proof(branded) });
             }
         }
         Ok(Snapshot { listed, generation, plant, arena: None })

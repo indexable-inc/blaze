@@ -82,13 +82,13 @@ pub(super) struct Unwinds<A: Allocator> {
 /// Reads the body's `invoke`s: their landing blocks, and per normal block its `invoke`. An
 /// invoke's value is defined at the head of its normal block, so `defined_in` (per
 /// instruction, the block its value is defined in) names that block for it.
-pub(super) fn unwinds<A: Allocator + Clone>(
+pub(super) fn unwinds<A: Allocator + Copy>(
     view: &View<'_>,
     defined_in: &mut [u32],
     alloc: &A,
 ) -> Result<Unwinds<A>, CoroutineError> {
     let blocks = view.blocks();
-    let mut landings = Vec::new_in(alloc.clone());
+    let mut landings = Vec::new_in(*alloc);
     let mut invoked = filled(blocks, NONE, alloc);
     for b in 0..blocks {
         let at = view.terminator(Block(b as u32));
@@ -148,7 +148,7 @@ pub(super) fn no_suspend_in_cleanup(view: &View<'_>, cleanup: &[bool]) -> Result
     Ok(())
 }
 
-impl<A: Allocator + Clone> Emit<'_, '_, A> {
+impl<S: Allocator + Copy, A: Allocator> Emit<'_, '_, S, A> {
     /// Stores the body's `invoke` value `invoke` to its field, if it has one, at the head of
     /// the invoke's normal block (the current one). The stored word names the body's value
     /// and is fixed up once every block is copied: the normal block may come before the

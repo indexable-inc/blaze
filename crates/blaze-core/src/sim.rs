@@ -95,6 +95,7 @@ use std::{cell::Cell, mem, path::PathBuf, time::Duration};
 
 use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_mem::{Slab, Tag as MemTag};
+use blaze_own::Share;
 use std::alloc::Global;
 
 pub use self::{host::Datagrams, journal::Journal, wake::Landed};
@@ -811,7 +812,7 @@ fn file_mut<'a>(
 ) -> &'a mut SimFile {
     if !files.contains_key(name) {
         // clone: once per file new to the simulated disk, its key.
-        files.insert(name.clone(), SimFile::default());
+        files.insert(name.share(), SimFile::default());
     }
     files.get_mut(name).expect("there now")
 }
@@ -1152,7 +1153,7 @@ impl Sim {
         let mut cuts: Vec<Cut> = Vec::with_capacity_in(files.len(), Global);
         for ((name, _), (kept, upto)) in files.iter().zip(&drawn) {
             // clone: a crash, not an op: the name the cut is of.
-            cuts.push(Cut { name: (*name).clone(), kept: *kept, upto: *upto, torn: crate::world::disk::Torn::Nothing });
+            cuts.push(Cut { name: (*name).share(), kept: *kept, upto: *upto, torn: crate::world::disk::Torn::Nothing });
         }
         // The tears, drawn last, file by file in the order of the names: of the changes after
         // those kept whole, up to `upto`, the file's length between the two files they leave
@@ -1277,7 +1278,7 @@ impl Sim {
         }
         let dirs = self.make_parents(file, host::Maker::Effect);
         // clone: the log's own name of the file, a refcount.
-        self.named(Named::Put { file: file.clone(), was: None });
+        self.named(Named::Put { file: file.share(), was: None });
         dirs
     }
 
@@ -1397,7 +1398,7 @@ impl Sim {
     /// own locks of it are, as a test plays another process that got there first.
     pub fn hold_lock(&mut self, file: &FileName, mode: LockMode) {
         // clone: the world changed by the test, not an op.
-        self.outside.insert(file.clone(), mode);
+        self.outside.insert(file.share(), mode);
     }
 
     /// Another process lets go of `file`'s lock ([`Sim::hold_lock`]).
@@ -1581,7 +1582,7 @@ impl Sim {
             return Ok(None);
         }
         // clone: the name of the file a read ends at.
-        let mut at = file.clone();
+        let mut at = file.share();
         for _ in 0..40 {
             let Some(sim) = self.files.get(&at).filter(|it| it.link) else {
                 return Ok(Some(at));
@@ -1743,7 +1744,7 @@ impl Sim {
                 names.push((inner, 0, true));
             }
             // clone: a name of the listing.
-            names.push((file.clone(), sim.len(), false));
+            names.push((file.share(), sim.len(), false));
         }
         // A directory made is listed as a file's directories are, with those it is under.
         for made in self.made_under(dir) {
@@ -1752,7 +1753,7 @@ impl Sim {
                 names.push((inner, 0, true));
             }
             // clone: a name of the listing.
-            names.push((made.clone(), 0, true));
+            names.push((made.share(), 0, true));
         }
         // Every directory is in `host.made` (`sim/host.rs`): one not there fails, empty or not.
         if !dir.name().is_none_or(|name| self.is_dir(name)) {
@@ -1782,7 +1783,7 @@ impl Sim {
     fn private(&self, dir: &FileName) -> Done {
         if let Some(&access) = self.access.get(dir) {
             // clone: the refusal names the directory
-            return Done::Private(Some((dir.clone(), access)));
+            return Done::Private(Some((dir.share(), access)));
         }
         // What a test set of a file comes before what its mode says.
         let given = self
@@ -1797,7 +1798,7 @@ impl Sim {
             .map(|(it, _)| (it, 1, Access::OthersWrite));
         let first = given.chain(moded).min_by_key(|&(file, rank, _)| (file, rank));
         // clone: the refusal names the file
-        Done::Private(first.map(|(file, _, access)| (file.clone(), access)))
+        Done::Private(first.map(|(file, _, access)| (file.share(), access)))
     }
 
     /// The file removed by something outside the state machine.
@@ -1860,7 +1861,7 @@ impl Sim {
                 // alloc: none, an empty list.
                 true => Done::Changed { files: Vec::new(), lost: true },
                 // alloc: the change's payload, the one name it tells.
-                false => Done::Changed { files: vec![file.clone()], lost: false },
+                false => Done::Changed { files: vec![file.share()], lost: false },
             };
             let at = self.now + latency(&mut self.rng, &self.faults);
             self.told.push(Told { at, completion: Completion { tag, done }, of: Of::Change(id) });
@@ -1941,7 +1942,7 @@ impl Sim {
         match access {
             Access::Alone => self.access.remove(file),
             // clone: the world changed by the test, not an op.
-            access => self.access.insert(file.clone(), access),
+            access => self.access.insert(file.share(), access),
         };
     }
 
@@ -1956,7 +1957,7 @@ impl Sim {
         if let Some(sim) = self.files.remove(from) {
             self.make_parents(to, host::Maker::Outside);
             // clone: the world changed by the test, not an op.
-            self.files.insert(to.clone(), sim);
+            self.files.insert(to.share(), sim);
             self.outside_named(from);
             self.outside_named(to);
             self.disk.renamed(from, to);
@@ -2005,7 +2006,7 @@ impl Sim {
             None => {
                 // clone: once per file locked while no one held it, its key.
                 // alloc: the file's holders, kept while any hold it.
-                self.locks.insert(file.clone(), vec![(tag, mode)]);
+                self.locks.insert(file.share(), vec![(tag, mode)]);
             }
         }
         Done::Locked
@@ -2022,7 +2023,7 @@ impl Sim {
             .iter()
             .find(|(_, holders)| holders.iter().any(|&(it, _)| it == lock))
             // clone: the name of the file let go of, a refcount.
-            .map(|(file, _)| file.clone())
+            .map(|(file, _)| file.share())
         else {
             return false;
         };
@@ -2048,7 +2049,7 @@ impl Sim {
         self.unlink_locks(to);
         if let Some(holders) = self.locks.remove(from) {
             // clone: the name the locked file has now, a refcount.
-            self.locks.insert(to.clone(), holders);
+            self.locks.insert(to.share(), holders);
         }
     }
 
@@ -2608,7 +2609,7 @@ impl Sim {
                 // own name and bytes are not synced.
                 self.make_parents(&file, host::Maker::Effect);
                 // clone: the log's own name of the file, a refcount.
-                self.named(Named::Put { file: file.clone(), was });
+                self.named(Named::Put { file: file.share(), was });
                 *file_mut(&mut self.files, &file) = new;
                 self.unlink_locks(&file);
                 self.changed(&file);
@@ -2633,7 +2634,7 @@ impl Sim {
                     self.make_parents(&to, host::Maker::Effect);
                     let was = self.files.remove(&to);
                     // clone: the log's own names of the files, refcounts.
-                    self.named(Named::Moved { from: from.clone(), to: to.clone(), was });
+                    self.named(Named::Moved { from: from.share(), to: to.share(), was });
                     *file_mut(&mut self.files, &to) = sim;
                     self.disk.renamed(&from, &to);
                     self.move_locks(&from, &to);
@@ -2839,7 +2840,7 @@ impl Sim {
             Effect::Remove { file, .. } => {
                 if let Some(was) = self.files.remove(&file) {
                     // clone: the log's own name of the file, a refcount.
-                    self.named(Named::Gone { file: file.clone(), was });
+                    self.named(Named::Gone { file: file.share(), was });
                     self.unlink_locks(&file);
                     self.changed(&file);
                 }
@@ -3342,7 +3343,7 @@ impl Driver for Sim {
                 && dir.name() == Some(held)
             {
                 // clone: the held list keeps its directory's name
-                self.held_lists.push((dir.clone(), *tag));
+                self.held_lists.push((dir.share(), *tag));
                 continue;
             }
             // A directory the user may not read fails both listings: names alone, and names
@@ -3557,7 +3558,7 @@ impl Sim {
                     && self.recording.iter().any(|dir| file.is_under(dir))
                 {
                     // clone: a test's record, once a completion recorded
-                    self.recorded.push((self.now, file.clone(), sync));
+                    self.recorded.push((self.now, file.share(), sync));
                 }
             }
             let completion = self.complete(pending);

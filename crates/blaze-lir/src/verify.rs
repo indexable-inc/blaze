@@ -839,7 +839,7 @@ fn semantics(view: &View<'_>) -> Result {
         let range = view.block(Block(b as u32));
         let params = view.params(Block(b as u32));
         let kind = view.block_kind(Block(b as u32));
-        for at in range.clone() {
+        for at in range.start..range.end {
             let op = view.op(at);
             if op == Op::Param && at >= params.end {
                 return Err(inst(view, at, "a parameter after an instruction of its block"));
@@ -858,7 +858,7 @@ fn semantics(view: &View<'_>) -> Result {
             if kind.is_landing() {
                 return Err(block(0, "an entry block that is a landing block"));
             }
-            let tys = params.clone().map(|at| view.tys[at]);
+            let tys = (params.start..params.end).map(|at| view.tys[at]);
             if !tys.eq(own.params.iter().map(|it| it.ty)) {
                 return Err(block(0, "entry parameters that are not the signature's"));
             }

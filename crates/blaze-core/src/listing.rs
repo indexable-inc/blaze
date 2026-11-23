@@ -23,7 +23,7 @@
 
 use std::{alloc::Global, fmt};
 
-use blaze_own::{SortedTexts, Texts};
+use blaze_own::{Share, SortedTexts, Texts};
 
 use crate::{DirName, FileName, Stamp};
 
@@ -171,20 +171,20 @@ impl ListingBuilder {
         if name.is_empty() || name.contains(&b'/') || name.contains(&0) {
             // alloc: an error path.
             let name = name.escape_ascii().to_string();
-            return Err(ListingError::NotAName { dir: dir.clone(), name });
+            return Err(ListingError::NotAName { dir: dir.share(), name });
         }
         let Ok(text) = std::str::from_utf8(name) else {
             // alloc: an error path.
             let name = name.escape_ascii().to_string();
-            return Err(ListingError::NotUtf8 { dir: dir.clone(), name });
+            return Err(ListingError::NotUtf8 { dir: dir.share(), name });
         };
         if self.names.len() >= MOST_ENTRIES {
-            return Err(ListingError::TooManyEntries { dir: dir.clone(), most: MOST_ENTRIES });
+            return Err(ListingError::TooManyEntries { dir: dir.share(), most: MOST_ENTRIES });
         }
         if self.names.bytes_len() + text.len() > MOST_NAME_BYTES {
-            return Err(ListingError::TooManyNameBytes { dir: dir.clone(), most: MOST_NAME_BYTES });
+            return Err(ListingError::TooManyNameBytes { dir: dir.share(), most: MOST_NAME_BYTES });
         }
-        let refused = |bytes| ListingError::OutOfMemory { dir: dir.clone(), bytes };
+        let refused = |bytes| ListingError::OutOfMemory { dir: dir.share(), bytes };
         self.stamps.try_reserve(1).map_err(|_| refused(size_of::<Stamp>()))?;
         self.names.try_push(text).map_err(|_| refused(text.len()))?;
         self.stamps.push(stamp);
@@ -199,7 +199,7 @@ impl ListingBuilder {
         let (names, stamps) = match SortedTexts::try_from_sorted(names) {
             Ok(sorted) => (sorted, stamps),
             Err(names) => {
-                let refused = |bytes| ListingError::OutOfMemory { dir: dir.clone(), bytes };
+                let refused = |bytes| ListingError::OutOfMemory { dir: dir.share(), bytes };
                 let n = names.len();
                 let mut order: Vec<u32, Global> = Vec::new_in(Global);
                 order.try_reserve_exact(n).map_err(|_| refused(n * size_of::<u32>()))?;
@@ -231,7 +231,7 @@ impl ListingBuilder {
         let mut kinds: Vec<Kind, Global> = Vec::new_in(Global);
         kinds
             .try_reserve_exact(stamps.len())
-            .map_err(|_| ListingError::OutOfMemory { dir: dir.clone(), bytes: stamps.len() })?;
+            .map_err(|_| ListingError::OutOfMemory { dir: dir.share(), bytes: stamps.len() })?;
         kinds.extend(stamps.iter().map(Kind::of));
         Ok(Listing { dir, names, stamps, kinds })
     }
@@ -389,7 +389,7 @@ impl Clone for Listing {
             names.push(name);
         }
         Listing {
-            dir: self.dir.clone(),
+            dir: self.dir.share(),
             names: SortedTexts::try_from_sorted(names)
                 .unwrap_or_else(|_| unreachable!("a copy of sorted names is sorted")),
             stamps: self.stamps.clone(),

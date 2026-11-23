@@ -46,7 +46,7 @@ pub(super) struct Addressed<A: Allocator> {
 /// The pass's may-analysis of slot storage (the module's first rule): the one place it is
 /// computed, read by `kept_slots` (which slots a suspend sees) and by [`conflicts`] (which
 /// pairs share a point).
-pub(super) fn addressed<A: Allocator + Clone>(body: &Body<'_, A>, alloc: &A) -> Addressed<A> {
+pub(super) fn addressed<A: Allocator + Copy>(body: &Body<'_, A>, alloc: &A) -> Addressed<A> {
     let view = &body.view;
     let (blocks, slots) = (view.blocks(), view.slots.len());
     let words = slots.div_ceil(64);
@@ -76,7 +76,7 @@ pub(super) fn addressed<A: Allocator + Clone>(body: &Body<'_, A>, alloc: &A) -> 
     }
     // The least fixed point, by a work list: a block is done again when its start grew.
     let mut queued = filled(blocks, false, alloc);
-    let mut work = Vec::with_capacity_in(blocks, alloc.clone());
+    let mut work = Vec::with_capacity_in(blocks, *alloc);
     for b in (0..blocks).rev().filter(|&b| held(b)) {
         queued[b] = true;
         work.push(b as u32);
@@ -119,7 +119,7 @@ fn each_bit(bits: &[u64], mut f: impl FnMut(usize)) {
 /// The conflict matrix of the kept slots (those `kept` marks, numbered by rising slot): row
 /// `i` (`kept_count.div_ceil(64)` words) holds bit `j` when some instruction of a held block
 /// has both storage-live. A row may hold its own bit; [`offsets`] ignores it.
-pub(super) fn conflicts<A: Allocator + Clone>(
+pub(super) fn conflicts<A: Allocator + Copy>(
     body: &Body<'_, A>,
     live: &Addressed<A>,
     kept: &[bool],
@@ -203,7 +203,7 @@ pub(super) fn conflicts<A: Allocator + Clone>(
 /// numbering of [`conflicts`]), every one at or past `start`: greedy by falling size then
 /// index, each at the lowest aligned offset overlapping no conflicting slot placed before it.
 /// Refused: an end past what a 32-bit offset names.
-pub(super) fn offsets<A: Allocator + Clone>(
+pub(super) fn offsets<A: Allocator + Copy>(
     sizes: &[(u32, u8)],
     conflicts: &[u64],
     start: u32,
@@ -211,13 +211,13 @@ pub(super) fn offsets<A: Allocator + Clone>(
 ) -> Result<Vec<u32, A>, CoroutineError> {
     let n = sizes.len();
     let rw = n.div_ceil(64);
-    let mut order = Vec::with_capacity_in(n, alloc.clone());
+    let mut order = Vec::with_capacity_in(n, *alloc);
     order.extend(0..n);
     order.sort_unstable_by_key(|&i| (Reverse(sizes[i].0), i));
     let mut offset = filled(n, 0u32, alloc);
     let mut placed = filled(n, false, alloc);
     // The placed slots `i` conflicts with, as byte ranges, by rising start.
-    let mut taken: Vec<(u64, u64), A> = Vec::with_capacity_in(n, alloc.clone());
+    let mut taken: Vec<(u64, u64), A> = Vec::with_capacity_in(n, *alloc);
     for &i in order.iter() {
         let (size, align) = sizes[i];
         taken.clear();

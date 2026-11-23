@@ -531,7 +531,7 @@ mod unix {
             };
             let queue = match queue {
                 // clone: a channel's handle.
-                Some(queue) => queue.clone(),
+                Some(queue) => blaze_own::Share::share(queue),
                 None => match self.stream_thread(stream) {
                     Ok(queue) => queue,
                     Err(error) => {
@@ -568,7 +568,7 @@ mod unix {
                 Stream::Stderr => &mut self.stderr,
             };
             // clone: a channel's handle, kept.
-            *kept = Some(send.clone());
+            *kept = Some(blaze_own::Share::share(&send));
             Ok(send)
         }
 

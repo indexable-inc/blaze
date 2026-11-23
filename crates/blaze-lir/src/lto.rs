@@ -106,28 +106,28 @@ impl<A: Allocator> SccOrder<A> {
 ///
 /// Emits components in **reverse topological order** (sink/leaf SCCs first, root callers last),
 /// with nodes inside each SCC sorted ascending by node index.
-pub fn tarjan_sccs<A: Allocator + Clone>(
+pub fn tarjan_sccs<A: Allocator + Copy>(
     node_count: usize,
     adj_offsets: &[u32],
     adj: &[u32],
     alloc: A,
 ) -> SccOrder<A> {
     const UNVISITED: u32 = u32::MAX;
-    let mut index = OwnVec::with_capacity_in(node_count, alloc.clone());
+    let mut index = OwnVec::with_capacity_in(node_count, alloc);
     index.resize(node_count, UNVISITED);
-    let mut lowlink = OwnVec::with_capacity_in(node_count, alloc.clone());
+    let mut lowlink = OwnVec::with_capacity_in(node_count, alloc);
     lowlink.resize(node_count, 0u32);
-    let mut on_stack = OwnVec::with_capacity_in(node_count, alloc.clone());
+    let mut on_stack = OwnVec::with_capacity_in(node_count, alloc);
     on_stack.resize(node_count, false);
 
-    let mut tarjan_stack: OwnVec<u32, A> = OwnVec::with_capacity_in(node_count, alloc.clone());
+    let mut tarjan_stack: OwnVec<u32, A> = OwnVec::with_capacity_in(node_count, alloc);
     struct Frame {
         v: u32,
         edge_pos: u32,
     }
-    let mut dfs: OwnVec<Frame, A> = OwnVec::with_capacity_in(node_count, alloc.clone());
+    let mut dfs: OwnVec<Frame, A> = OwnVec::with_capacity_in(node_count, alloc);
 
-    let mut out_nodes: OwnVec<u32, A> = OwnVec::with_capacity_in(node_count, alloc.clone());
+    let mut out_nodes: OwnVec<u32, A> = OwnVec::with_capacity_in(node_count, alloc);
     let mut out_offsets: OwnVec<u32, A> = OwnVec::with_capacity_in(node_count + 1, alloc);
     out_offsets.push(0);
 
@@ -228,9 +228,9 @@ impl<A: Allocator> Bodies for ModuleBodies<'_, A> {
 }
 
 /// Runs `scalar_replace -> propagate -> dead` on `view` in `alloc`.
-fn simplify_body<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
-    let sroa = scalar_replace(view, alloc.clone())?;
-    let prop = propagate(sroa.view(), alloc.clone())?;
+fn simplify_body<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
+    let sroa = scalar_replace(view, alloc)?;
+    let prop = propagate(sroa.view(), alloc)?;
     dead(prop.view(), alloc)
 }
 
@@ -246,7 +246,7 @@ fn from_inline(error: InlineError) -> SimplifyError {
 ///
 /// Every callee SCC is simplified and summarized before its callers run PGO-guided inlining
 /// (`inline_guided_with_cache`), followed by post-inline SROA + constant/copy propagation + DCE.
-pub fn lto_optimize_module<A: Allocator + Clone>(
+pub fn lto_optimize_module<A: Allocator + Copy>(
     mut module: OwnVec<ModuleBody<A>, A>,
     external: &dyn Bodies,
     weights: &dyn SiteWeights,
@@ -256,7 +256,7 @@ pub fn lto_optimize_module<A: Allocator + Clone>(
     let n = module.len();
     let mut id_to_index: Map<BodyId, usize, FixedState, A> = Map::new(MapOpts {
         hasher: FixedState,
-        alloc: alloc.clone(),
+        alloc: alloc,
         capacity: Some(n),
     });
     for (idx, mb) in module.iter().enumerate() {
@@ -264,8 +264,8 @@ pub fn lto_optimize_module<A: Allocator + Clone>(
     }
 
     // Build intra-module direct call graph in CSR form.
-    let mut adj_offsets: OwnVec<u32, A> = OwnVec::with_capacity_in(n + 1, alloc.clone());
-    let mut adj: OwnVec<u32, A> = OwnVec::with_capacity_in(n * 2, alloc.clone());
+    let mut adj_offsets: OwnVec<u32, A> = OwnVec::with_capacity_in(n + 1, alloc);
+    let mut adj: OwnVec<u32, A> = OwnVec::with_capacity_in(n * 2, alloc);
     adj_offsets.push(0);
     for mb in module.iter() {
         let view = mb.func.view();
@@ -295,13 +295,13 @@ pub fn lto_optimize_module<A: Allocator + Clone>(
     }
 
     // Condense call graph into reverse-topological SCCs (callees before callers).
-    let sccs = tarjan_sccs(n, &adj_offsets, &adj, alloc.clone());
+    let sccs = tarjan_sccs(n, &adj_offsets, &adj, alloc);
 
     // Compute initial summaries for early-cutoff comparison.
-    let mut prev_summaries: OwnVec<FnSummary, A> = OwnVec::with_capacity_in(n, alloc.clone());
+    let mut prev_summaries: OwnVec<FnSummary, A> = OwnVec::with_capacity_in(n, alloc);
     let mut summaries: Map<BodyId, FnSummary, FixedState, A> = Map::new(MapOpts {
         hasher: FixedState,
-        alloc: alloc.clone(),
+        alloc: alloc,
         capacity: Some(n),
     });
     for mb in module.iter() {
@@ -310,11 +310,11 @@ pub fn lto_optimize_module<A: Allocator + Clone>(
         summaries.insert(mb.id, s);
     }
 
-    let mut reads: OwnVec<Vec<BodyId, A>, A> = OwnVec::with_capacity_in(n, alloc.clone());
-    let mut imports: OwnVec<Vec<ImportedRef, A>, A> = OwnVec::with_capacity_in(n, alloc.clone());
+    let mut reads: OwnVec<Vec<BodyId, A>, A> = OwnVec::with_capacity_in(n, alloc);
+    let mut imports: OwnVec<Vec<ImportedRef, A>, A> = OwnVec::with_capacity_in(n, alloc);
     for _ in 0..n {
-        reads.push(Vec::new_in(alloc.clone()));
-        imports.push(Vec::new_in(alloc.clone()));
+        reads.push(Vec::new_in(alloc));
+        imports.push(Vec::new_in(alloc));
     }
 
     let mut total_inlined_bodies = 0usize;
@@ -326,7 +326,7 @@ pub fn lto_optimize_module<A: Allocator + Clone>(
         // Phase 1: pre-inline simplify each body in the SCC and refresh its summary.
         for &node in comp {
             let idx = node as usize;
-            let simplified = simplify_body(module[idx].func.view(), alloc.clone())?;
+            let simplified = simplify_body(module[idx].func.view(), alloc)?;
             let sum = FnSummary::compute(simplified.view(), &alloc);
             summaries.insert(module[idx].id, sum);
             module[idx].func = simplified;
@@ -345,7 +345,7 @@ pub fn lto_optimize_module<A: Allocator + Clone>(
                     weights,
                     policy,
                     &mut summaries,
-                    alloc.clone(),
+                    alloc,
                 )
                 .map_err(from_inline)?
             };
@@ -353,7 +353,7 @@ pub fn lto_optimize_module<A: Allocator + Clone>(
             let spliced_count = inlined.read.len();
             total_inlined_bodies += spliced_count;
             let final_func = if spliced_count > 0 {
-                simplify_body(inlined.func.view(), alloc.clone())?
+                simplify_body(inlined.func.view(), alloc)?
             } else {
                 inlined.func
             };
@@ -365,7 +365,7 @@ pub fn lto_optimize_module<A: Allocator + Clone>(
         }
     }
 
-    let mut out_bodies: OwnVec<OptimizedBody<A>, A> = OwnVec::with_capacity_in(n, alloc.clone());
+    let mut out_bodies: OwnVec<OptimizedBody<A>, A> = OwnVec::with_capacity_in(n, alloc);
     let mut mod_iter = module.into_iter();
     let mut read_iter = reads.into_iter();
     let mut imp_iter = imports.into_iter();
@@ -399,7 +399,7 @@ pub fn lto_optimize_module<A: Allocator + Clone>(
 ///
 /// Cold functions (`summary.is_cold`) and bodies below `min_weight` are excluded. Functions with
 /// loops receive a `4x` priority boost because loop bodies amortize JIT compile time fastest.
-pub fn advise_jit_tier_up<A: Allocator + Clone>(
+pub fn advise_jit_tier_up<A: Allocator + Copy>(
     bodies: &[OptimizedBody<A>],
     pgo: &PgoSiteTable<A>,
     min_weight: u64,

@@ -41,7 +41,7 @@
 
 use blaze_keyed::kind::{Namespace, Tag};
 use blaze_mem::{AppendVec, Kept, Tag as MemTag};
-use blaze_own::Arc;
+use blaze_own::{Arc, Share};
 
 use super::lent::LentError;
 
@@ -211,7 +211,7 @@ impl ArenaView {
         // The runs first: a run's records' blocks were published before it was sealed.
         let runs = arena.runs();
         let blocks = arena.blocks();
-        ArenaView { arena: arena.clone(), runs, blocks }
+        ArenaView { arena: arena.share(), runs, blocks }
     }
 
     /// The planted bug `SnapshotPlant::ShortWatermark`: the block watermark one block short, as

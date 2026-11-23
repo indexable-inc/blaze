@@ -49,12 +49,12 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 
 /// Adds each certificate of `text` to `out`; how many blocks it held (a root already held is
 /// counted, not added twice). `scratch` holds one block's symbols and bytes at a time.
-pub fn certificates<A: Allocator, S: Allocator + Clone>(text: &[u8], out: &mut Roots<A>, scratch: S) -> Result<u32, PemError> {
+pub fn certificates<A: Allocator, S: Allocator>(text: &[u8], out: &mut Roots<A>, scratch: S) -> Result<u32, PemError> {
     // The base64 of MOST_DER bytes, padded.
     const MOST_SYMBOLS: usize = MOST_DER.div_ceil(3) * 4;
-    let mut symbols: Vec<u8, S> = Vec::new_in(scratch.clone());
+    let mut symbols: Vec<u8, &S> = Vec::new_in(&scratch);
     // On the heap: a fiber's stack is small.
-    let mut der: Vec<u8, S> = Vec::new_in(scratch);
+    let mut der: Vec<u8, &S> = Vec::new_in(&scratch);
     der.resize(MOST_DER, 0);
     let mut found = 0u32;
     let mut at = 0usize;

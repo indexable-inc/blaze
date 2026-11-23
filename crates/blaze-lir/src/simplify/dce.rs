@@ -128,15 +128,15 @@ pub(super) fn each(view: &View<'_>, inst: usize, mut f: impl FnMut(Item)) {
 }
 
 /// `len` copies of `item` in `alloc`.
-pub(super) fn filled<T: Clone, A: Allocator + Clone>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
-    Vec::from_elem_in(item, len, alloc.clone())
+pub(super) fn filled<T: Clone, A: Allocator + Copy>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
+    Vec::from_elem_in(item, len, *alloc)
 }
 
 /// Per block, whether an edge path from the entry reaches it; a terminator with a `jump`
 /// choice (`jump[inst] != NONE`) has only that target as an edge. A work list.
-pub(super) fn reachable<A: Allocator + Clone>(view: &View<'_>, jump: &[u32], alloc: &A) -> Vec<bool, A> {
+pub(super) fn reachable<A: Allocator + Copy>(view: &View<'_>, jump: &[u32], alloc: &A) -> Vec<bool, A> {
     let mut seen = filled(view.blocks(), false, alloc);
-    let mut work: Vec<u32, A> = Vec::with_capacity_in(view.blocks(), alloc.clone());
+    let mut work: Vec<u32, A> = Vec::with_capacity_in(view.blocks(), *alloc);
     seen[0] = true;
     work.push(0);
     while let Some(b) = work.pop() {
@@ -171,7 +171,7 @@ impl<A: Allocator> Incoming<A> {
     }
 }
 
-pub(super) fn incoming<A: Allocator + Clone>(
+pub(super) fn incoming<A: Allocator + Copy>(
     view: &View<'_>,
     reached: &[bool],
     jump: &[u32],
@@ -216,7 +216,7 @@ pub(super) fn incoming<A: Allocator + Clone>(
 }
 
 /// Per instruction, its block.
-pub(super) fn owners<A: Allocator + Clone>(view: &View<'_>, alloc: &A) -> Vec<u32, A> {
+pub(super) fn owners<A: Allocator + Copy>(view: &View<'_>, alloc: &A) -> Vec<u32, A> {
     let mut owner = filled(view.len(), NONE, alloc);
     for b in 0..view.blocks() {
         for inst in view.block(Block(b as u32)) {
@@ -268,13 +268,13 @@ pub(super) struct Edit<A: Allocator> {
 }
 
 /// The function `view` with `edit` made, in `alloc`, verified.
-pub(super) fn rebuild<A: Allocator + Clone>(view: View<'_>, edit: &Edit<A>, alloc: A) -> Result<Func<A>, SimplifyError> {
+pub(super) fn rebuild<A: Allocator + Copy>(view: View<'_>, edit: &Edit<A>, alloc: A) -> Result<Func<A>, SimplifyError> {
     if !edit.block_kept[0] {
         return Err(SimplifyError::Refused { inst: 0, what: "a rewrite without the entry block" });
     }
     let blocks = view.blocks();
     let len = view.len();
-    let mut func = view.to_func_in(alloc.clone());
+    let mut func = view.to_func_in(alloc);
     func.ops.clear();
     func.flags.clear();
     func.tys.clear();
@@ -319,7 +319,7 @@ pub(super) fn rebuild<A: Allocator + Clone>(view: View<'_>, edit: &Edit<A>, allo
 
     // Coalescing path: merge `A -> Jump(B, args)` chains into single blocks.
     let mut merged_into_pred = filled(blocks, false, &alloc);
-    let mut resolved_stands = Vec::with_capacity_in(len, alloc.clone());
+    let mut resolved_stands = Vec::with_capacity_in(len, alloc);
     resolved_stands.extend_from_slice(&edit.stands);
 
     for a in 0..blocks {
@@ -420,7 +420,7 @@ pub(super) fn rebuild<A: Allocator + Clone>(view: View<'_>, edit: &Edit<A>, allo
 }
 
 /// The output being made by [`rebuild`].
-struct Out<'v, 'e, A: Allocator + Clone> {
+struct Out<'v, 'e, A: Allocator + Copy> {
     view: View<'v>,
     edit: &'e Edit<A>,
     stands: &'e [u32],
@@ -429,7 +429,7 @@ struct Out<'v, 'e, A: Allocator + Clone> {
     func: Func<A>,
 }
 
-impl<A: Allocator + Clone> Out<'_, '_, A> {
+impl<A: Allocator + Copy> Out<'_, '_, A> {
     fn raw(&mut self, op: Op, flags: u8, ty: u16, data: u32, attrs: u32, loc: u32) {
         self.func.ops.push(op as u8);
         self.func.flags.push(flags);
@@ -765,7 +765,7 @@ fn trivial(view: &View<'_>, inst: usize) -> u32 {
 
 /// The function `view` without its dead code and trivial branches, in `alloc`, verified:
 /// the module's [`dead`] pass.
-pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
+pub fn dead<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
     if view.blocks() == 0 {
         return Err(SimplifyError::Refused { inst: 0, what: "a function with no blocks" });
     }
@@ -785,7 +785,7 @@ pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, S
     let owner = owners(&view, &alloc);
     let mut live = filled(len, false, &alloc);
     let mut live_count = 0usize;
-    let mut work: Vec<u32, A> = Vec::with_capacity_in(len, alloc.clone());
+    let mut work: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     let mark = |live: &mut Vec<bool, A>, work: &mut Vec<u32, A>, live_count: &mut usize, value: u32| {
         if !live[value as usize] {
             live[value as usize] = true;
@@ -855,7 +855,7 @@ pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, S
         verify(view).map_err(SimplifyError::Verify)?;
         return Ok(view.to_func_in(alloc));
     }
-    let mut stands = Vec::with_capacity_in(len, alloc.clone());
+    let mut stands = Vec::with_capacity_in(len, alloc);
     for value in 0..len as u32 {
         stands.push(value);
     }
@@ -873,7 +873,7 @@ pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, S
 
 /// Coalesces single-predecessor `jump` chains (`A -> Jump(B, args)` when `B` has `A` as its
 /// sole reached predecessor) without altering any live computation, in `alloc`, verified.
-pub fn coalesce_cfg<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
+pub fn coalesce_cfg<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
     if view.blocks() == 0 {
         return Err(SimplifyError::Refused { inst: 0, what: "a function with no blocks" });
     }
@@ -909,7 +909,7 @@ pub fn coalesce_cfg<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Fu
         verify(view).map_err(SimplifyError::Verify)?;
         return Ok(view.to_func_in(alloc));
     }
-    let mut stands = Vec::with_capacity_in(len, alloc.clone());
+    let mut stands = Vec::with_capacity_in(len, alloc);
     for value in 0..len as u32 {
         stands.push(value);
     }
