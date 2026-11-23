@@ -7551,11 +7551,15 @@ fn data_read<R: ?Sized + CellDigests>(reads: &R, path: &str, bytes: Option<&[u8]
     let planned = || bytes.map_or_else(crate::data_include::absent_out, crate::data_include::data_out);
     if reads.row_failed(file.of) == Some(false) {
         let seen = planned();
-        // Only bind to the `FileItems` task when its `WHOLE` cell IS a `data_include` digest;
-        // an outlined `.rs` source file included via `include_str!` defines an outline digest on
-        // `FileItems::WHOLE` (not `data_out(bytes)`), so fall through to its raw-bytes `Given` cell.
+        // Only bind to the `FileItems` task when its `WHOLE` cell IS a `data_include` digest
+        // (pure `DATA_FILE`) or its `DATA` cell holds the raw bytes digest (a Rust source file
+        // also read via `include_str!` / `include_bytes!`); otherwise fall through to its `Given` cell.
         if reads.cell(&file) == seen {
             return DataRead { id: file, seen, cell: DataCell::Planned };
+        }
+        let data = CellId { of: file.of, cell: crate::engine_tasks::DATA };
+        if reads.cell(&data) == seen {
+            return DataRead { id: data, seen, cell: DataCell::Planned };
         }
     }
     match crate::engine_script_reads::file_read(path, bytes) {

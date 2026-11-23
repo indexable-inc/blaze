@@ -34,6 +34,10 @@ const RUSAGE_BYTES: usize = 144;
 
 const WNOHANG: i32 = 1;
 const SIGKILL: i32 = 9;
+const SIGTERM: i32 = 15;
+
+/// Maximum grace window after `SIGTERM` before escalating to `SIGKILL` on the process group.
+const KILL_GRACE: Duration = Duration::from_secs(30);
 
 unsafe extern "C" {
     fn wait4(pid: i32, status: *mut i32, options: i32, rusage: *mut Rusage) -> i32;
@@ -90,27 +94,60 @@ pub fn run_logged<E: AsRef<OsStr>>(argv: &[String], cwd: &Path, env: &[(&str, E)
     let deadline = began + limit;
     let mut status = 0i32;
     let mut usage = Rusage { utime: [0; 2], stime: [0; 2], maxrss: 0, rest: [0; 13] };
-    // Bounded: it ends at the deadline at the latest, asking every `POLL`.
+    // Bounded: at `deadline`, send SIGTERM to the child's process group, then escalate to
+    // SIGKILL after `limit.min(KILL_GRACE)` so a process ignoring SIGTERM can never hang.
+    let mut kill_at: Option<Instant> = None;
+    let mut reaped = false;
     loop {
         // SAFETY: `pid` is this process's unreaped child (`Child` never waits on drop); both
         // pointers are to locals that live across the call.
-        let got = unsafe { wait4(pid, &mut status, WNOHANG, &mut usage) };
+        let got = if reaped { 0 } else { unsafe { wait4(pid, &mut status, WNOHANG, &mut usage) } };
         match got {
-            0 if Instant::now() >= deadline => {
-                // SAFETY: as above; the child is not reaped yet, so its pid is still its own
-                // and still names its process group (`process_group(0)`: the group's id is
-                // the child's pid), which the negative pid kills whole.
-                unsafe {
-                    kill(-pid, SIGKILL);
-                    wait4(pid, &mut status, 0, &mut usage);
-                }
-                return Ok(Ended::TimedOut { after: limit });
-            }
             0 => {
+                // SAFETY: signal 0 delivers nothing; checks if any member remains in pgid `pid`.
+                if reaped && unsafe { kill(-pid, 0) != 0 } {
+                    return Ok(Ended::TimedOut { after: limit });
+                }
+                let now = Instant::now();
+                match kill_at {
+                    None if now >= deadline => {
+                        // SAFETY: `pid` is unreaped and leads its process group (`process_group(0)`).
+                        unsafe {
+                            kill(-pid, SIGTERM);
+                        }
+                        kill_at = Some(now + limit.min(KILL_GRACE));
+                    }
+                    Some(at) if now >= at => {
+                        if !reaped {
+                            // SAFETY: `pid` is still unreaped, so `-pid` still names its group.
+                            unsafe {
+                                kill(-pid, SIGKILL);
+                                wait4(pid, &mut status, 0, &mut usage);
+                            }
+                        } else if unsafe { kill(-pid, 0) == 0 } {
+                            // SAFETY: a descendant still belongs to pgid `pid`, so `pid` cannot
+                            // have been recycled as another process group's id.
+                            unsafe {
+                                kill(-pid, SIGKILL);
+                            }
+                        }
+                        return Ok(Ended::TimedOut { after: limit });
+                    }
+                    _ => {}
+                }
                 #[allow(clippy::disallowed_methods, reason = "a script polls its child; it is on no pool")]
                 std::thread::sleep(POLL);
             }
-            it if it == pid => break,
+            it if it == pid => {
+                if kill_at.is_some() {
+                    reaped = true;
+                } else {
+                    break;
+                }
+            }
+            _ if kill_at.is_some() => {
+                reaped = true;
+            }
             _ => return Err(format!("wait4({pid}): {}", std::io::Error::last_os_error())),
         }
     }
@@ -150,20 +187,25 @@ mod tests {
 
     #[test]
     fn the_deadline_kills_the_whole_group() {
-        let dir = crate::TempDir::new("blaze-script-child-").unwrap();
-        let log = dir.path().join("slow");
-        // The grandchild holds the group; killing only the child would leave it.
-        let argv = ["/bin/sh".to_owned(), "-c".to_owned(), "sleep 30 & echo $! > pid; wait".to_owned()];
-        let started = Instant::now();
-        let ran = run_logged(&argv, dir.path(), &[] as &[(&str, &Path)], &log, Duration::from_millis(500)).unwrap();
-        assert_eq!(ran, Ended::TimedOut { after: Duration::from_millis(500) });
-        assert!(started.elapsed() < Duration::from_secs(10));
-        let grandchild: i32 = std::fs::read_to_string(dir.path().join("pid")).unwrap().trim().parse().unwrap();
-        let gone = Instant::now() + Duration::from_secs(5);
-        // Bounded: five seconds for the kernel to deliver the kill.
-        while alive(grandchild) && Instant::now() < gone {
-            std::thread::sleep(Duration::from_millis(10));
+        for (name, script) in [
+            ("slow", "sleep 30 & echo $! > pid; wait"),
+            ("ignore-term", "trap '' TERM; sleep 30 & echo $! > pid; wait"),
+        ] {
+            let dir = crate::TempDir::new("blaze-script-child-").unwrap();
+            let log = dir.path().join(name);
+            // The grandchild holds the group; killing only the child or only sending SIGTERM would leave it.
+            let argv = ["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()];
+            let started = Instant::now();
+            let ran = run_logged(&argv, dir.path(), &[] as &[(&str, &Path)], &log, Duration::from_millis(300)).unwrap();
+            assert_eq!(ran, Ended::TimedOut { after: Duration::from_millis(300) }, "{name}");
+            assert!(started.elapsed() < Duration::from_secs(10), "{name}");
+            let grandchild: i32 = std::fs::read_to_string(dir.path().join("pid")).unwrap().trim().parse().unwrap();
+            let gone = Instant::now() + Duration::from_secs(5);
+            // Bounded: five seconds for the kernel to deliver the kill.
+            while alive(grandchild) && Instant::now() < gone {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!alive(grandchild), "{name}: the grandchild {grandchild} outlived the kill of its group");
         }
-        assert!(!alive(grandchild), "the grandchild {grandchild} outlived the kill of its group");
     }
 }

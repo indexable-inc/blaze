@@ -6,6 +6,7 @@
 #![cfg(target_arch = "aarch64")]
 
 use std::alloc::Global;
+use std::arch::is_aarch64_feature_detected;
 
 use blaze_lir::{
     AtomicRmw, Builder, Flags, Full, IntCond, Op, Ordering, Ty, Value,
@@ -22,6 +23,13 @@ const SIZES: [Ty; 4] = [Ty::I8, Ty::I16, Ty::I32, Ty::I64];
 
 fn isa(lse: bool) -> Isa {
     Isa { lse, os: crate::tests::HOST_OS }
+}
+
+/// Whether the host AArch64 CPU implements FEAT_LSE (`cas`/`ldadd`/`swp`/etc.). Emitting LSE
+/// code is always tested, but executing it is skipped on ARMv8.0 hosts lacking LSE to avoid
+/// `SIGILL`.
+fn host_lse() -> bool {
+    is_aarch64_feature_detected!("lse")
 }
 
 /// `f(params) = body(params)`, returning the values `body` gives, of types `rets`.
@@ -80,6 +88,9 @@ fn every_rmw_kind_stores_what_rust_computes() {
                         vec![b.atomic_rmw(rmw, Flags::NONE.with_ordering(ordering), v[0], v[1], attrs(ty))]
                     });
                     let code = emitted_for(func.view(), &[], isa(lse)).expect("emits");
+                    if lse && !host_lse() {
+                        continue;
+                    }
                     let exec = run::place(&code, |_| unreachable!());
                     for &old in &values {
                         for &v in &values {
@@ -126,11 +137,14 @@ fn cmpxchg_succeeds_and_fails() {
                         vec![b.project(pair, 0), b.project(pair, 1)]
                     });
                     let code = emitted_for(func.view(), &[], isa(lse)).expect("emits");
+                    if lse && !host_lse() {
+                        continue;
+                    }
                     let exec = run::place(&code, |_| unreachable!());
                     // SAFETY: an emitted C function of a pointer and two integers returning two
                     // integers, which AAPCS64 returns in x0 and x1 as it does this struct.
                     let f = unsafe {
-                        std::mem::transmute::<usize, extern "C" fn(u64, u64, u64) -> Two>(exec.code_address() as usize)
+                        core::mem::transmute::<usize, extern "C" fn(u64, u64, u64) -> Two>(exec.code_address() as usize)
                     };
                     let top = mask(width);
                     for (old, expected, new) in [(5u64, 5u64, 9u64), (5, 6, 9), (top, top, 0), (top, top - 1, 1), (0, 0, top)] {
@@ -171,6 +185,9 @@ fn far_cells_keep_cmpxchg_old_values() {
                 vec![b.project(pair, 0), b.project(pair, 1)]
             });
             let code = emitted_for(func.view(), &[], isa(lse)).expect("emits");
+            if lse && !host_lse() {
+                continue;
+            }
             let exec = run::place(&code, |_| unreachable!());
             // SAFETY: an emitted C function of a pointer and two integers returning two
             // integers, which AAPCS64 returns in x0 and x1 as it does this struct.
@@ -194,13 +211,14 @@ struct Two(u64, u64);
 /// `atomic_load` and `atomic_store` at every size and ordering they may take, and every fence.
 #[test]
 fn ordered_loads_stores_and_fences_run() {
+    let lse = host_lse();
     for ty in SIZES {
         let width = ty.bits(64);
         for ordering in [Ordering::Relaxed, Ordering::Acquire, Ordering::SeqCst] {
             let load = function(&[Ty::PTR], &[ty], |b, v| {
                 vec![b.atomic_load(ty, Flags::NONE.with_ordering(ordering), v[0], attrs(ty))]
             });
-            let exec = run::place(&emitted_for(load.view(), &[], isa(true)).expect("emits"), |_| unreachable!());
+            let exec = run::place(&emitted_for(load.view(), &[], isa(lse)).expect("emits"), |_| unreachable!());
             let cell = Box::new(0x0102_0304_0506_0708u64);
             let got = run::call(&exec, [&*cell as *const u64 as u64, 0, 0, 0]) & mask(width);
             assert_eq!(got, *cell & mask(width), "a {ordering:?} load of i{width}");
@@ -210,7 +228,7 @@ fn ordered_loads_stores_and_fences_run() {
                 b.atomic_store(Flags::NONE.with_ordering(ordering), v[1], v[0], attrs(ty));
                 vec![b.iconst(Ty::I64, 0)]
             });
-            let exec = run::place(&emitted_for(store.view(), &[], isa(true)).expect("emits"), |_| unreachable!());
+            let exec = run::place(&emitted_for(store.view(), &[], isa(lse)).expect("emits"), |_| unreachable!());
             let mut cell = Box::new(u64::MAX);
             run::call(&exec, [&mut *cell as *mut u64 as u64, 0x1122_3344_5566_7788, 0, 0]);
             assert_eq!(*cell, (0x1122_3344_5566_7788 & mask(width)) | !mask(width), "a {ordering:?} store of i{width}");
@@ -227,7 +245,7 @@ fn ordered_loads_stores_and_fences_run() {
                 b.fence(flags);
                 vec![v[0]]
             });
-            let exec = run::place(&emitted_for(fence.view(), &[], isa(true)).expect("emits"), |_| unreachable!());
+            let exec = run::place(&emitted_for(fence.view(), &[], isa(lse)).expect("emits"), |_| unreachable!());
             assert_eq!(run::call(&exec, [7, 0, 0, 0]), 7, "a {ordering:?} fence (single thread {single})");
         }
     }
@@ -273,6 +291,9 @@ fn two_threads_racing_fetch_adds_reach_two_n() {
         for (ty, ordering) in [(Ty::I64, Ordering::Relaxed), (Ty::I64, Ordering::SeqCst), (Ty::I16, Ordering::AcqRel)] {
             let func = adder(ty, ordering);
             let code = emitted_for(func.view(), &[], isa(lse)).expect("emits");
+            if lse && !host_lse() {
+                continue;
+            }
             let exec = run::place(&code, |_| unreachable!());
             let entry = exec.code_address() as usize;
             let counter = std::sync::atomic::AtomicU64::new(0);

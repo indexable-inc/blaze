@@ -124,6 +124,13 @@ pub(crate) const CELLS: Cell = Cell([3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 /// so no downstream `Names` task re-enters.
 pub(crate) const EXPORTS: Cell = Cell([4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
+/// An outline's raw-bytes cell (`data_include::data_out(bytes)`, from `FileItemsView::file`): what
+/// a data-include reader (`include_str!`, `include_bytes!`, body `include!`) reads when its target
+/// file is ALSO outlined as a Rust source module. A comment or whitespace edit leaves [`WHOLE`],
+/// [`SURFACE`] and [`HEADS`] unchanged while moving [`DATA`], so data-include readers re-enter
+/// without unnecessarily invalidating Rust-module readers.
+pub(crate) const DATA: Cell = Cell([5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
 /// The surface digest an outline record lists (its `Surface` part's source), or `None` for a
 /// record with no surface (a data file).
 pub(crate) fn surface_of<A: core::alloc::Allocator + Copy>(record: &Record<A>) -> Option<ContentId> {
@@ -131,6 +138,16 @@ pub(crate) fn surface_of<A: core::alloc::Allocator + Copy>(record: &Record<A>) -
         (blaze_drive::Kind::Surface, blaze_drive::Locate::Source(source)) => Some(source),
         _ => None,
     })
+}
+
+/// The raw-bytes digest of a Rust outline record (`FileItemsView::file`, equal to
+/// `data_include::data_out`), or `None` for a non-Rust record (such as a pure `DATA_FILE`, whose
+/// [`WHOLE`] cell already holds `data_out` or `absent_out`).
+pub(crate) fn data_digest_of<A: core::alloc::Allocator + Copy>(record: &Record<A>) -> Option<ContentId> {
+    surface_of(record)?;
+    let payload = record.payload_bytes().ok()?;
+    let view = blaze_surface::FileItemsView::read(payload).ok()?;
+    Some(view.file())
 }
 
 const EDITION_DOMAIN: &str = "blaze-cli engine source with edition 1";
@@ -207,6 +224,7 @@ impl Tasks<'_, '_> {
             defines.push((SURFACE, surface));
             let payload = record.payload_bytes().unwrap_or_else(|error| panic!("outline {:?} has no item payload: {error:?}", record.name));
             let view = blaze_surface::FileItemsView::read(payload).unwrap_or_else(|error| panic!("outline {:?} has an invalid item payload: {error:?}", record.name));
+            defines.push((DATA, view.file()));
             item_cells(crate::signature::SignatureFile::new(&self.outlined[at].path), view, &mut defines, alloc);
         }
         defines.push((HEADS, heads_of(record)));

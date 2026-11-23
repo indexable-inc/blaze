@@ -246,19 +246,42 @@ fn main_with(args: &Args) {
     );
 
     if args.doc {
-        let mut doc = Command::new("cargo");
-        doc.arg(format!("+{tc}"))
-            .args(["test", "--locked", "--workspace", "--doc", "--no-fail-fast"])
-            .current_dir(&root)
-            .env("TMPDIR", &tmp.0)
-            .env("BLAZE_NO_DAEMON", "1");
+        let mut doc_argv = vec![
+            "cargo".to_owned(),
+            format!("+{tc}"),
+            "test".to_owned(),
+            "--locked".to_owned(),
+            "--workspace".to_owned(),
+            "--doc".to_owned(),
+            "--no-fail-fast".to_owned(),
+        ];
         for pkg in &args.exclude {
-            doc.args(["--exclude", pkg]);
+            doc_argv.push("--exclude".to_owned());
+            doc_argv.push(pkg.clone());
         }
-        let status = doc.status().unwrap_or_else(|e| fail(SCRIPT, &format!("cargo test --doc did not start: {e}")));
-        if !status.success() {
-            failed.push("doctests".to_owned());
+        let doc_env: Vec<(&str, String)> = base_env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        let doc_log = log_dir.join("doctests");
+        let doc_out = doc_log.with_extension("out");
+        let doc_err = doc_log.with_extension("err");
+        match run_logged(&doc_argv, &root, &doc_env, &doc_log, limit) {
+            Ok(Ended::Exited(m)) if m.status == 0 => {}
+            Ok(Ended::Exited(m)) => {
+                println!("::error::FAIL doctests (exit {})", m.status);
+                print!("{}{}", read_lossy(&doc_out), read_lossy(&doc_err));
+                failed.push("doctests".to_owned());
+            }
+            Ok(Ended::TimedOut { after }) => {
+                println!("::error::FAIL doctests (timeout after {}s)", after.as_secs());
+                print!("{}{}", read_lossy(&doc_out), read_lossy(&doc_err));
+                failed.push("doctests".to_owned());
+            }
+            Err(why) => {
+                println!("::error::FAIL doctests (did not start: {why})");
+                failed.push("doctests".to_owned());
+            }
         }
+        let _ = std::fs::remove_file(&doc_out);
+        let _ = std::fs::remove_file(&doc_err);
     }
 
     println!("{SCRIPT}: {passed} passed, {} failed (jobs={jobs})", failed.len());
