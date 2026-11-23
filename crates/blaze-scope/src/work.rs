@@ -267,15 +267,15 @@ fn set_via_glob<N>(r: &mut Resolver<'_, N>, item: Item, to: bool) {
 fn components<'a>(starts: &[usize], edges: &[u32], a: Alloc<'a>) -> AVec<'a, u32> {
     const UNSEEN: u32 = u32::MAX;
     let n = starts.len().saturating_sub(1);
-    let mut index: AVec<'a, u32> = Vec::with_capacity_in(n, a.clone());
+    let mut index: AVec<'a, u32> = Vec::with_capacity_in(n, a);
     index.resize(n, UNSEEN);
-    let mut low: AVec<'a, u32> = Vec::with_capacity_in(n, a.clone());
+    let mut low: AVec<'a, u32> = Vec::with_capacity_in(n, a);
     low.resize(n, 0);
-    let mut on: AVec<'a, bool> = Vec::with_capacity_in(n, a.clone());
+    let mut on: AVec<'a, bool> = Vec::with_capacity_in(n, a);
     on.resize(n, false);
-    let mut comp: AVec<'a, u32> = Vec::with_capacity_in(n, a.clone());
+    let mut comp: AVec<'a, u32> = Vec::with_capacity_in(n, a);
     comp.resize(n, UNSEEN);
-    let mut stack: AVec<'a, u32> = Vec::new_in(a.clone());
+    let mut stack: AVec<'a, u32> = Vec::new_in(a);
     let mut calls: AVec<'a, (u32, usize)> = Vec::new_in(a);
     let mut next = 0u32;
     let mut comps = 0u32;
@@ -374,22 +374,22 @@ impl<'a, N: Name> Work<'a, N> {
     /// The state of a group about to run, every pending item queued.
     pub(crate) fn new_in(ms: &[Resolver<'a, N>], alloc: Alloc<'a>) -> Work<'a, N> {
         let mut w = Work {
-            queue: Vec::new_in(alloc.clone()),
-            marks: Vec::with_capacity_in(ms.len(), alloc.clone()),
-            lists: Lists { heads: HashMap::new_in(alloc.clone()), nodes: Vec::new_in(alloc.clone()), free: NONE },
-            sink: Sink::new_in(alloc.clone(), Scan::Early),
-            needs: Vec::new_in(alloc.clone()),
-            waits: Vec::new_in(alloc.clone()),
-            pairs: Vec::with_capacity_in(ms.len(), alloc.clone()),
-            resolved: Vec::new_in(alloc.clone()),
+            queue: Vec::new_in(alloc),
+            marks: Vec::with_capacity_in(ms.len(), alloc),
+            lists: Lists { heads: HashMap::new_in(alloc), nodes: Vec::new_in(alloc), free: NONE },
+            sink: Sink::new_in(alloc, Scan::Early),
+            needs: Vec::new_in(alloc),
+            waits: Vec::new_in(alloc),
+            pairs: Vec::with_capacity_in(ms.len(), alloc),
+            resolved: Vec::new_in(alloc),
             relaxed: true,
             relaxing: false,
             first_round: false,
-            raised: Vec::new_in(alloc.clone()),
-            outcomes: HashMap::new_in(alloc.clone()),
+            raised: Vec::new_in(alloc),
+            outcomes: HashMap::new_in(alloc),
             compact_at: 4096,
             era: 0,
-            alloc: alloc.clone(),
+            alloc,
             stats: FillStats::default(),
             #[cfg(test)]
             plant: ms.first().map_or(Plant::None, |r| r.plant),
@@ -403,7 +403,7 @@ impl<'a, N: Name> Work<'a, N> {
             w.rng = seed | 1;
         }
         for (m, r) in ms.iter().enumerate() {
-            w.marks.push([Vec::new_in(alloc.clone()), Vec::new_in(alloc.clone()), Vec::new_in(alloc.clone())]);
+            w.marks.push([Vec::new_in(alloc), Vec::new_in(alloc), Vec::new_in(alloc)]);
             w.pairs.push(r.calls_state());
             for (c, call) in r.calls.iter().enumerate() {
                 if matches!(call.state, CallState::Resolved(_)) {
@@ -550,7 +550,7 @@ impl<'a, N: Name> Work<'a, N> {
     /// Drops the stale waiters from the parked lists.
     fn compact(&mut self) {
         let Work { lists, marks, alloc, .. } = self;
-        lists.compact(alloc.clone(), |w| match *w {
+        lists.compact(*alloc, |w| match *w {
             Waiter::Item { m, item, era } => {
                 let (kind, i) = idx(item);
                 marks[m as usize][kind].get(i).is_some_and(|mk| mk.era == era)
@@ -712,8 +712,8 @@ impl<'a, N: Name> Work<'a, N> {
     /// usual. Sinks are a property of the graph, so the answer is one in any order. Whether
     /// any failed.
     fn stall<F: ScopeFacts<Name = N>>(&mut self, ms: &mut [Resolver<'a, N>], facts: &F) -> Result<bool, ResolveError> {
-        let a = self.alloc.clone();
-        let mut items: AVec<'a, (u32, Item)> = Vec::new_in(a.clone());
+        let a = self.alloc;
+        let mut items: AVec<'a, (u32, Item)> = Vec::new_in(a);
         for (m, r) in ms.iter().enumerate() {
             let m = u32_of(m);
             for (i, imp) in r.imports.iter().enumerate() {
@@ -738,13 +738,13 @@ impl<'a, N: Name> Work<'a, N> {
         items.sort_unstable();
         let n = items.len();
         // The edges: item k waits on `edges[starts[k]..starts[k + 1]]`.
-        let mut starts: AVec<'a, usize> = Vec::with_capacity_in(n + 1, a.clone());
-        let mut edges: AVec<'a, u32> = Vec::new_in(a.clone());
-        let mut blames: AVec<'a, Blame> = Vec::new_in(a.clone());
+        let mut starts: AVec<'a, usize> = Vec::with_capacity_in(n + 1, a);
+        let mut edges: AVec<'a, u32> = Vec::new_in(a);
+        let mut blames: AVec<'a, Blame> = Vec::new_in(a);
         // The waits on one call, as `(waiter, call)`: a textual read past it or a derive before
         // it (what that call may define), as opposed to a module's calls as a whole.
-        let mut ones: AVec<'a, (u32, u32)> = Vec::new_in(a.clone());
-        let mut sink = Sink::new_in(a.clone(), Scan::Stall);
+        let mut ones: AVec<'a, (u32, u32)> = Vec::new_in(a);
+        let mut sink = Sink::new_in(a, Scan::Stall);
         for (v, &(m, item)) in items.iter().enumerate() {
             starts.push(edges.len());
             sink.blame.clear();
@@ -788,9 +788,9 @@ impl<'a, N: Name> Work<'a, N> {
         sink.stats.stall_edges += edges.len() as u64;
         self.stats.add(&sink.stats);
         sink.check(ms[0].module)?;
-        let comp = components(&starts, &edges, a.clone());
+        let comp = components(&starts, &edges, a);
         let comps = comp.iter().map(|&c| c as usize + 1).max().unwrap_or(0);
-        let mut leaves: AVec<'a, bool> = Vec::with_capacity_in(comps, a.clone());
+        let mut leaves: AVec<'a, bool> = Vec::with_capacity_in(comps, a);
         leaves.resize(comps, true);
         for v in 0..n {
             for &w in edges[starts[v]..starts[v + 1]].iter() {
@@ -804,7 +804,7 @@ impl<'a, N: Name> Work<'a, N> {
         // what it held is solved again (the Reference's textual scope: a failed call defines
         // no `macro_rules!`). Text order makes these waits acyclic, so every sink keeps a member
         // to fail.
-        let mut spared: AVec<'a, bool> = Vec::with_capacity_in(n, a.clone());
+        let mut spared: AVec<'a, bool> = Vec::with_capacity_in(n, a);
         spared.resize(n, false);
         for &(v, w) in ones.iter() {
             if comp[v as usize] == comp[w as usize] {
@@ -847,7 +847,7 @@ impl<'a, N: Name> Work<'a, N> {
     /// missed.
     #[cfg(test)]
     fn verify_quiet<F: ScopeFacts<Name = N>>(&self, ms: &[Resolver<'a, N>], facts: &F) -> Result<(), ResolveError> {
-        let mut sink = Sink::new_in(self.alloc.clone(), Scan::Early);
+        let mut sink = Sink::new_in(self.alloc, Scan::Early);
         for (m, r) in ms.iter().enumerate() {
             let items = (0..r.imports.len())
                 .map(|i| Item::Import(u32_of(i)))
@@ -1122,7 +1122,7 @@ impl<'a, N: Name> Work<'a, N> {
         self.relaxing = false;
         self.raised.clear();
         drained?;
-        let mut all: AVec<'a, ((u32, Item), Outcome)> = Vec::with_capacity_in(self.outcomes.len(), self.alloc.clone());
+        let mut all: AVec<'a, ((u32, Item), Outcome)> = Vec::with_capacity_in(self.outcomes.len(), self.alloc);
         all.extend(self.outcomes.iter().map(|(k, o)| (*k, *o)));
         self.outcomes.clear();
         all.sort_unstable_by_key(|(k, _)| *k);
@@ -1157,7 +1157,7 @@ impl<'a, N: Name> Work<'a, N> {
         self.take_expansions(ms, facts)?;
         let bound = ms.iter().map(|m| m.pass_bound()).fold(4u32, |a, b| a.saturating_add(b.saturating_mul(2)));
         let mut rounds = 0u32;
-        let mut reads: AVec<'a, Read<N>> = Vec::new_in(alloc.clone());
+        let mut reads: AVec<'a, Read<N>> = Vec::new_in(alloc);
         loop {
             rounds += 1;
             if rounds > bound {
@@ -1215,7 +1215,7 @@ pub(crate) fn run<'a, N: Name, F: ScopeFacts<Name = N>>(
 ) -> Result<Ran<'a, N>, ResolveError> {
     let mut work = match out.work.take() {
         Some(w) => w,
-        None => Work::new_in(ms, alloc.clone()),
+        None => Work::new_in(ms, alloc),
     };
     let ran = work.run(ms, facts, replies, out, alloc);
     work.stats.lookups += work.sink.stats.lookups;

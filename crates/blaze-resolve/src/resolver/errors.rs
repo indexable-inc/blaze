@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use blaze_ids::radix;
+use blaze_own::Share;
 
 use crate::edit_distance::{closest, edit_distance};
 use crate::interning::InternedString;
@@ -401,7 +402,7 @@ pub(super) fn activation_error(
 // was meant. So we re-query the registry with `dep="*"` so we can
 // list a few versions that were actually found.
 fn alt_versions(registry: &impl Registry, dep: &Dependency) -> Option<CargoResult<Vec<Summary>>> {
-    let mut wild_dep = dep.clone();
+    let mut wild_dep = dep.share();
     wild_dep.set_version_req(OptVersionReq::Any);
 
     // Unknown: no hint this round, which the resolve machine throws away once it is answered.
@@ -442,7 +443,7 @@ fn alt_names(
     registry: &impl Registry,
     dep: &Dependency,
 ) -> Option<CargoResult<Vec<(usize, Summary)>>> {
-    let mut wild_dep = dep.clone();
+    let mut wild_dep = dep.share();
     wild_dep.set_version_req(OptVersionReq::Any);
 
     let name_candidates = match registry.query_vec(&wild_dep, QueryKind::AlternativeNames) {

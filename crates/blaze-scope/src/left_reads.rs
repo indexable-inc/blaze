@@ -54,7 +54,7 @@ pub fn file_left_reads<'a, S: SourceTexts<'a> + ?Sized>(sources: &S, krate: usiz
     let list = reads.list();
     let span = span.start.min(list.len())..span.end.min(list.len());
     let mut filed = 0u32;
-    for (index, read) in list[span.clone()].iter().enumerate() {
+    for (index, read) in list[span.start..span.end].iter().enumerate() {
         if read.kind != ReadKind::ProcMacro {
             continue;
         }

@@ -9,6 +9,7 @@ use crate::resolver::{FixedState, Map, Set};
 use crate::{Dependency, PackageId, Registry, Summary};
 use std::alloc::Global;
 use std::collections::BTreeSet;
+use blaze_own::Share;
 use blaze_trace::debug;
 
 // A `Context` is basically a bunch of local resolution information which is
@@ -83,7 +84,7 @@ impl ResolverContext {
                 {
                     return Err(crate::ResolveError::LinksTwice { links: link }.into());
                 }
-                v.insert((summary.clone(), age));
+                v.insert((summary.share(), age));
 
                 // If we've got a parent dependency which activated us, *and*
                 // the dependency has a different source id listed than the
@@ -104,7 +105,7 @@ impl ResolverContext {
                     && dep.source_id() != id.source_id()
                 {
                     let key = ActivationsKey::new(id.name(), id.version().into(), dep.source_id());
-                    let prev = self.activations.insert(key, (summary.clone(), age));
+                    let prev = self.activations.insert(key, (summary.share(), age));
                     if let Some((previous_summary, _)) = prev {
                         return Err((previous_summary.package_id(), ConflictReason::Semver).into());
                     }

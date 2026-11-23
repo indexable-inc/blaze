@@ -104,7 +104,13 @@ pub struct RefusedTarget<'a> {
 impl<'a> RefusedTarget<'a> {
     /// The same refusal as an error of the package `package`, for a caller that stops on it.
     pub fn error(&self, package: &str, alloc: Alloc<'a>) -> LayoutError<'a> {
-        LayoutError::Target { package: String::from_str_in(package, alloc), kind: self.kind, target: self.target.clone(), at: self.at, why: self.why.clone() }
+        LayoutError::Target {
+            package: String::from_str_in(package, alloc),
+            kind: self.kind,
+            target: self.target.clone_in(alloc),
+            at: self.at,
+            why: self.why.clone_in(alloc),
+        }
     }
 }
 
@@ -124,6 +130,17 @@ pub enum TargetRefused<'a> {
     NoFile { path: Text<'a> },
     /// A second target of this kind and name; the first's line.
     Duplicate { first: Span },
+}
+
+impl<'a> TargetRefused<'a> {
+    fn clone_in(&self, alloc: Alloc<'a>) -> TargetRefused<'a> {
+        match self {
+            TargetRefused::NoName => TargetRefused::NoName,
+            TargetRefused::OutsidePackage { path } => TargetRefused::OutsidePackage { path: path.clone_in(alloc) },
+            TargetRefused::NoFile { path } => TargetRefused::NoFile { path: path.clone_in(alloc) },
+            TargetRefused::Duplicate { first } => TargetRefused::Duplicate { first: *first },
+        }
+    }
 }
 
 impl fmt::Display for TargetRefused<'_> {
@@ -213,8 +230,8 @@ impl<'l, 'a> Passing<'l, 'a> {
                     if !taken {
                         out.push(ExtraTarget {
                             kind,
-                            name: name.clone(),
-                            root: root.clone(),
+                            name: name.clone_in(alloc),
+                            root: root.clone_in(alloc),
                             span: package.span,
                             found: true,
                             harness: true,
@@ -271,7 +288,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                 None => pending = true,
                 Some(sub_entries) => {
                     if sub_entries.is_some_and(|sub_entries| sub_entries.iter().any(|(n, d)| n.as_str() == "main.rs" && !*d)) {
-                        inferred.push((name.clone(), file(&sub, "main.rs", alloc)));
+                        inferred.push((name.clone_in(alloc), file(&sub, "main.rs", alloc)));
                     }
                 }
             }
@@ -304,7 +321,7 @@ impl<'l, 'a> Passing<'l, 'a> {
         // examples and benches are never built, so its tables are read for shape only.
         let root = match &raw.path {
             None => match inferred.iter().find(|(n, _)| n == name) {
-                Some((_, root)) => root.clone(),
+                Some((_, root)) => root.clone_in(alloc),
                 None => {
                     let mut path = file(&file(dir, raw.kind.dir(), alloc), name, alloc);
                     path.push_str(".rs");
@@ -322,18 +339,18 @@ impl<'l, 'a> Passing<'l, 'a> {
             // `regression_tests.rs` was refused "no file" while there (turso: eight tests).
             Some(path) => match join(dir, path, alloc) {
                 Some(root) if within(&root, dir) && root.as_str() != dir => root,
-                _ => return refuse(name, TargetRefused::OutsidePackage { path: path.clone() }),
+                _ => return refuse(name, TargetRefused::OutsidePackage { path: path.clone_in(alloc) }),
             },
         };
         Ok(ExtraTarget {
             kind: raw.kind,
-            name: name.clone(),
+            name: name.clone_in(alloc),
             root,
             span: raw.span,
             found: false,
             harness: raw.harness.unwrap_or(true),
             test: raw.test.unwrap_or(raw.kind.tested_by_default()),
-            required_features: raw.required_features.clone(),
+            required_features: raw.required_features.clone_in(alloc),
         })
     }
 }

@@ -447,10 +447,10 @@ fn toolchain_crates<'a>(
     out: &mut AVec<'a, UnitCrate<'a>>,
     alloc: Alloc<'a>,
 ) -> Result<Sysroot, UnitsError<'a>> {
-    let no_target = UnitsError::NoTarget { triple };
-    let sys = blaze_toolchain::sysroot(&view, triple, false).ok_or(no_target.clone())?;
+    let no_target = || UnitsError::NoTarget { triple };
+    let sys = blaze_toolchain::sysroot(&view, triple, false).ok_or_else(no_target)?;
     let mut all = AVec::new_in(alloc);
-    all.extend(view.units(triple).ok_or(no_target.clone())?);
+    all.extend(view.units(triple).ok_or_else(no_target)?);
     let mut keep: AVec<'a, bool> = AVec::new_in(alloc);
     keep.resize(all.len(), false);
     let mut todo: AVec<'a, usize> = AVec::new_in(alloc);
@@ -481,7 +481,7 @@ fn toolchain_crates<'a>(
             n += 1;
         }
     }
-    let target_cfg = view.cfg(triple).ok_or(no_target)?;
+    let target_cfg = view.cfg(triple).ok_or_else(no_target)?;
     let mut cfg_base: AVec<'a, (&'a str, Option<&'a str>)> = AVec::new_in(alloc);
     cfg_base.extend(target_cfg);
     cfg_base.extend(PROFILE.iter().copied());

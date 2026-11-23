@@ -28,6 +28,7 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
+use blaze_own::Share;
 
 use crate::dependency::Dependency;
 use crate::error::ResolveError;
@@ -48,6 +49,8 @@ pub struct Ask {
     pub dep: Dependency,
     pub kind: QueryKind,
 }
+
+impl Share for Ask {}
 
 /// What the driver tells the machine.
 #[derive(Debug)]
@@ -126,14 +129,14 @@ impl<R, F, T, A> Resolving<R, F, T, A>
 where
     R: Registry,
     F: Fn(&Asking<'_, R, A>) -> Result<T, ResolveError>,
-    A: Allocator + Clone,
+    A: Allocator + Copy,
 {
     pub fn new(sources: R, run: F, alloc: A) -> Self {
         Resolving {
             sources,
             run,
-            answers: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
-            asked: Set::new(SetOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            answers: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            asked: Set::new(SetOpts { hasher: FixedState, alloc, capacity: None }),
             phase: Phase::New,
             rounds: 0,
             alloc,
@@ -191,8 +194,8 @@ where
             sources: &self.sources,
             answers: &self.answers,
             noted: RefCell::new(Noted {
-                order: Vec::new_in(self.alloc.clone()),
-                seen: Set::new(SetOpts { hasher: FixedState, alloc: self.alloc.clone(), capacity: None }),
+                order: Vec::new_in(self.alloc),
+                seen: Set::new(SetOpts { hasher: FixedState, alloc: self.alloc, capacity: None }),
             }),
         };
         let result = (self.run)(&asking);
@@ -209,7 +212,7 @@ where
             return;
         }
         for ask in &asks {
-            self.asked.insert(ask.clone());
+            self.asked.insert(ask.share());
         }
         self.phase = Phase::Asking;
         out.push(Effect::Query { asks });
@@ -235,7 +238,7 @@ pub fn resolving_ws<'w, R, A>(
 >
 where
     R: Registry,
-    A: Allocator + Clone + 'w,
+    A: Allocator + Copy + 'w,
 {
     let run = move |asking: &Asking<'_, R, A>| {
         let mut registry = PackageRegistry::new(asking);
@@ -265,10 +268,10 @@ impl<R: Registry, A: Allocator + Clone> Registry for Asking<'_, R, A> {
         kind: QueryKind,
         f: &mut impl FnMut(IndexSummary),
     ) -> Result<Lookup, ResolveError> {
-        let ask = Ask { dep: dep.clone(), kind };
+        let ask = Ask { dep: dep.share(), kind };
         if let Some(found) = self.answers.get(&ask) {
             for summary in found {
-                f(summary.clone());
+                f(summary.share());
             }
             return Ok(Lookup::Answered(()));
         }
@@ -276,7 +279,7 @@ impl<R: Registry, A: Allocator + Clone> Registry for Asking<'_, R, A> {
             Lookup::Answered(()) => Ok(Lookup::Answered(())),
             Lookup::Unknown => {
                 let mut noted = self.noted.borrow_mut();
-                if noted.seen.insert(ask.clone()) {
+                if noted.seen.insert(ask.share()) {
                     noted.order.push(ask);
                 }
                 Ok(Lookup::Unknown)

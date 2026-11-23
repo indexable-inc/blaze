@@ -1,8 +1,8 @@
 //! smoke: the proof that a built blaze does its job, quoted by every merge to main (AGENTS.md
 //! rule proof-before-merge). `DOC` below is what its usage error prints.
 //!
-//!     blaze run -q -p scripts --bin smoke -- '{"blaze": "/root/inst/blaze", "work": "/root/smoke-1113"}' > quote.txt
-//!     blaze run -q -p scripts --bin smoke -- '{"verify": {"quote": "<text>", "tree": "<git tree hash>"}}'
+//!     cargo +$(cat pins/toolchain) run --locked -q -p scripts --bin smoke -- '{"blaze": "/root/inst/blaze", "work": "/root/smoke-1113"}' > quote.txt
+//!     cargo +$(cat pins/toolchain) run --locked -q -p scripts --bin smoke -- '{"verify": {"quote": "<text>", "tree": "<git tree hash>"}}'
 //!
 //! The class it closes (2026-11-13): a check that the code compiles stood in for a check that
 //! the tool works. Three pull requests were merged on compile checks; the merged blaze
@@ -24,8 +24,8 @@
 /// What the usage error prints.
 const DOC: &str = r#"smoke: a built blaze doing its job on hello-world, as the quote a merge to main carries (rule proof-before-merge).
 
-    blaze run -q -p scripts --bin smoke -- '{"blaze": "<release blaze>", "work": "<empty dir>"}' > quote.txt
-    blaze run -q -p scripts --bin smoke -- '{"verify": {"quote": "<text>", "tree": "<git tree hash>"}}'
+    cargo +$(cat pins/toolchain) run --locked -q -p scripts --bin smoke -- '{"blaze": "<release blaze>", "work": "<empty dir>"}' > quote.txt
+    cargo +$(cat pins/toolchain) run --locked -q -p scripts --bin smoke -- '{"verify": {"quote": "<text>", "tree": "<git tree hash>"}}'
 
 A run (the quote on standard output and in <work>/quote.txt; what went wrong on standard error):
 
@@ -44,10 +44,10 @@ and BLAZE_HOME set:
     comment    a comment line added at the top, `blaze run`: the line of the body edit
     check      `blaze check`: exit 3 and its "incomplete" closing line while a stage `check` is
                defined to run is not built (blaze-cli work.rs `CHECK_STAGES`); exit 0 once all are
-    stop       `blaze stop`: exit 0 (it exits 0 saying "no daemon is running" when none is)
+    test       `blaze test`: exit 0 and a summary reporting one test ran and passed
 
 The four `run` steps are a chain: after one fails, the rest of the chain is skipped (each is an
-edit from the state the one before leaves). `check` and `stop` always run. Exit 0 only for
+edit from the state the one before leaves). `check` and `test` always run. Exit 0 only for
 `verdict ok`.
 
 A verify: `quote` is any text holding exactly one quote (a pull request's body), `tree` the git
@@ -56,7 +56,7 @@ clean, with every step ok; else prints why and exits 1. `.github/scripts/land.py
 
 The quote:
 
-    blaze-smoke 1
+    blaze-smoke 2
     tree <git tree hash of HEAD>[ +dirty <sha256 of `git diff HEAD --binary` and the untracked files>]
     binary <sha256 of the blaze binary>
     host <os>-<arch> <cores this process may use>
@@ -86,7 +86,7 @@ use blaze_sha256::Sha256;
 
 const SCRIPT: &str = "smoke";
 /// The quote's first line; the number is its format's version, raised on any change to it.
-const HEADER: &str = "blaze-smoke 1";
+const HEADER: &str = "blaze-smoke 2";
 /// The fixtures a run may smoke, each a directory of [`FIXTURES`].
 const PROJECTS: [&str; 2] = ["hello", "six"];
 /// Where the fixtures' manifests and lock files are, in the checkout (shared with versus.py).
@@ -98,9 +98,7 @@ const FIXTURE_FILES: [&str; 3] = ["Cargo.toml", "Cargo.lock", "blaze.lock"];
 /// 128-core build VM a cold hello-world took 28 to 43 s on the last working builds
 /// (2026-11-13); 180 s is a ceiling for "something is wrong", not a performance bar.
 const COLD: Duration = Duration::from_secs(180);
-/// Every other step's deadline: a no-op, an edit, a check and a stop each took far under 10 s
-/// on the last working builds; 60 s is a ceiling for "something is wrong", not a performance
-/// bar.
+/// The ceiling for each subsequent run, check or test of the fixture.
 const WARM: Duration = Duration::from_secs(60);
 /// `blaze debug sql`'s deadline when a step failed: a query of one build's spans answers in
 /// well under a second; past 20 s the blaze under test is not answering, which is said.
@@ -125,7 +123,7 @@ enum Step {
     BodyEdit,
     Comment,
     Check,
-    Stop,
+    Test,
 }
 
 /// Every step, in the order each project runs them and its quote lists them.
@@ -137,7 +135,7 @@ const CHECK_STATUS: i32 = 3;
 /// The word of `check`'s closing line while stages are missing ("incomplete · NOT checked: ..").
 const CHECK_SAYS: &str = "incomplete";
 
-const STEPS: [Step; 6] = [Step::Cold, Step::NoOp, Step::BodyEdit, Step::Comment, Step::Check, Step::Stop];
+const STEPS: [Step; 6] = [Step::Cold, Step::NoOp, Step::BodyEdit, Step::Comment, Step::Check, Step::Test];
 
 impl Step {
     /// The step's name in the quote.
@@ -148,7 +146,7 @@ impl Step {
             Step::BodyEdit => "body-edit",
             Step::Comment => "comment",
             Step::Check => "check",
-            Step::Stop => "stop",
+            Step::Test => "test",
         }
     }
 
@@ -169,7 +167,7 @@ impl Step {
     /// comment line is there.
     fn source_state(self) -> (u32, bool) {
         match self {
-            Step::Cold | Step::NoOp | Step::Check | Step::Stop => (0, false),
+            Step::Cold | Step::NoOp | Step::Check | Step::Test => (0, false),
             Step::BodyEdit => (1, false),
             Step::Comment => (1, true),
         }
@@ -534,6 +532,7 @@ fn source(project: &str, body: u32, comment: bool) -> String {
         text.push_str(COMMENT_LINE);
     }
     text.push_str(&template.replace("@BODY@", &body.to_string()));
+    text.push_str("\n#[test]\nfn edited_sum_is_fifty_six() {\n    assert_eq!(value(), 56);\n}\n");
     text
 }
 
@@ -543,6 +542,11 @@ fn expected(project: &str, body: u32) -> String {
         "six" => format!("six: {} 8", 55 + body),
         _ => format!("hello: {}", 55 + body),
     }
+}
+
+/// A zero-test or reused-only run cannot prove that the edited function executed.
+fn one_test_passed(output: &str) -> bool {
+    output.lines().any(|line| line.starts_with("test result: ok. ran 1: 1 passed, 0 failed; 0 reused from kept results;"))
 }
 
 /// What every step of the run shares.
@@ -600,7 +604,7 @@ impl Smoke {
     fn step(&self, project: &str, step: Step, dir: &Path, home: &Path) -> (Outcome, Option<Duration>) {
         let words: &[&str] = match step {
             Step::Check => &["check"],
-            Step::Stop => &["stop"],
+            Step::Test => &["test"],
             _ => &["run"],
         };
         let log = self.log(project, step.word());
@@ -618,7 +622,10 @@ impl Smoke {
             (_, -1) => Outcome::Failed("was ended by a signal".to_owned()),
             (_, status) => Outcome::Failed(format!("exited {status}")),
         };
-        if matches!(outcome, Outcome::Ok) && step == Step::Check {
+        if !matches!(outcome, Outcome::Ok) {
+            return (outcome, Some(wall));
+        }
+        if step == Step::Check {
             let out = log.with_extension("out");
             let outcome = match read_text_lossy(&out) {
                 Err(e) => Outcome::Failed(format!("its output {}: {e}", out.display())),
@@ -630,7 +637,13 @@ impl Smoke {
             };
             return (outcome, Some(wall));
         }
-        if !matches!(outcome, Outcome::Ok) || !step.in_chain() {
+        if step == Step::Test {
+            let out = log.with_extension("out");
+            let outcome = match read_text_lossy(&out) {
+                Err(e) => Outcome::Failed(format!("its output {}: {e}", out.display())),
+                Ok(text) if one_test_passed(&text) => Outcome::Ok,
+                Ok(_) => Outcome::Failed("exited 0 without reporting one executed and passing test".to_owned()),
+            };
             return (outcome, Some(wall));
         }
         let line = expected(project, step.source_state().0);
@@ -929,7 +942,7 @@ mod tests {
 
     #[test]
     fn the_quote_is_formatted_one_fact_a_line() {
-        let want = "blaze-smoke 1\n\
+        let want = "blaze-smoke 2\n\
                     tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
                     binary e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\
                     host linux-aarch64 128\n\
@@ -938,7 +951,7 @@ mod tests {
                     hello body-edit ok      1.1s\n\
                     hello comment   ok      0.3s\n\
                     hello check     ok      0.9s\n\
-                    hello stop      ok      0.1s\n\
+                    hello test      ok      0.1s\n\
                     verdict ok\n";
         assert_eq!(all_ok().text(), want);
     }
@@ -964,7 +977,9 @@ mod tests {
         let text = all_ok().text();
         let twice = format!("{text}{text}");
         let ok_over_a_failure = text.replace("hello check     ok      0.9s", "hello check     FAILED  0.9s");
-        let missing_step = text.replace("hello stop      ok      0.1s\n", "");
+        let missing_step = text.replace("hello test      ok      0.1s\n", "");
+        assert!(parse_quote(&text.replace("hello test", "hello stop")).is_err());
+        assert!(parse_quote(&text.replace(HEADER, "blaze-smoke 1")).is_err());
         let no_verdict = text.replace("verdict ok\n", "");
         for bad in ["no quote here", twice.as_str(), ok_over_a_failure.as_str(), missing_step.as_str(), no_verdict.as_str()] {
             assert!(parse_quote(bad).is_err(), "parsed: {bad}");
@@ -984,6 +999,15 @@ mod tests {
             Verdict::Failed("hello no-op: exited 101".to_owned()),
         );
         assert!(verify(&failed.text(), TREE).is_err_and(|why| why.contains("exited 101")));
+    }
+
+    #[test]
+    fn the_test_step_requires_an_executed_passing_test() {
+        let summary = "test result: ok. ran 1: 1 passed, 0 failed; 0 reused from kept results; 0 ignored";
+        assert!(one_test_passed(summary));
+        assert!(!one_test_passed(&summary.replace("ran 1: 1 passed", "ran 0: 0 passed")));
+        assert!(!one_test_passed(&summary.replace("0 reused", "1 reused")));
+        assert!(!one_test_passed(&summary.replace("ok.", "FAILED.")));
     }
 
     #[test]

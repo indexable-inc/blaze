@@ -62,22 +62,22 @@ impl<'a, N: Name> Resolver<'a, N> {
         env: Env<'_, 'a, N>,
         stats: &mut crate::resolver::FillStats,
     ) -> Result<Finish<'a, N>, ResolveError> {
-        let a = self.alloc.clone();
+        let a = self.alloc;
         let mut sink = Sink::new_in(a, Scan::Final);
         #[cfg(test)]
         {
             sink.forget_negative = self.plant == Plant::ForgetNegativeReads;
             sink.forget_probes = self.plant == Plant::ForgetGlobProbes;
         }
-        let mut errors = Errors { list: Vec::new_in(a.clone()), seen: HashMap::new_in(a.clone()) };
+        let mut errors = Errors { list: Vec::new_in(a), seen: HashMap::new_in(a) };
         self.finish_frag(0, facts, env, &mut sink, &mut errors)?;
 
-        let mut names = Vec::new_in(a.clone());
+        let mut names = Vec::new_in(a);
         self.own_names(&mut names);
         names.sort_unstable();
         names.dedup();
         let q = Query { asker: self.asker(), restricted: false, ignore: None };
-        let mut bindings = Vec::with_capacity_in(names.len(), a.clone());
+        let mut bindings = Vec::with_capacity_in(names.len(), a);
         for &(ns, name) in names.iter() {
             sink.undet_glob = None;
             match self.lookup_module(ns, name, q, env, &mut sink) {
@@ -140,17 +140,17 @@ impl<'a, N: Name> Resolver<'a, N> {
                             }
                         }
                     }
-                    None => errors.list.push(ScopeError::RestrictedNotAncestor { path: path.copy_in(a.clone()) }),
+                    None => errors.list.push(ScopeError::RestrictedNotAncestor { path: path.copy_in(a) }),
                 }
             }
         }
 
-        let mut textual = Vec::new_in(a.clone());
-        let mut marks = Vec::new_in(a.clone());
+        let mut textual = Vec::new_in(a);
+        let mut marks = Vec::new_in(a);
         self.flatten(0, &mut textual, Some(&mut marks), env, &mut sink);
         marks.sort_unstable_by_key(|m: &TextualMark| m.child);
-        let mut traits = Vec::new_in(a.clone());
-        let mut macro_exports = Vec::new_in(a.clone());
+        let mut traits = Vec::new_in(a);
+        let mut macro_exports = Vec::new_in(a);
         self.anon_and_exports(0, &mut traits, &mut macro_exports);
 
         if !sink.need.is_empty() || !sink.waits.is_empty() {
@@ -197,7 +197,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                     errors.bind(ns, name, e.def);
                 }
                 for path in f.bad_vis.iter() {
-                    errors.list.push(ScopeError::RestrictedNotAncestor { path: path.copy_in(self.alloc.clone()) });
+                    errors.list.push(ScopeError::RestrictedNotAncestor { path: path.copy_in(self.alloc) });
                 }
                 for &name in f.bad_extern.iter() {
                     errors.list.push(ScopeError::ExternCrate { name });
@@ -231,7 +231,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         let last = len32(n.saturating_sub(1));
         let fail = |segment: u32, why: Unresolved| ScopeError::Import {
             site,
-            path: imp.path.copy_in(self.alloc.clone()),
+            path: imp.path.copy_in(self.alloc),
             segment,
             why,
         };
@@ -333,7 +333,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         let site = glob.site;
         let fail = |segment: u32, why: Unresolved| ScopeError::Import {
             site,
-            path: glob.path.copy_in(self.alloc.clone()),
+            path: glob.path.copy_in(self.alloc),
             segment,
             why,
         };
@@ -397,7 +397,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         let call = &self.calls[c];
         let fail = |segment: u32, why: Unresolved| ScopeError::Macro {
             call: call.key,
-            path: call.path.copy_in(self.alloc.clone()),
+            path: call.path.copy_in(self.alloc),
             segment,
             why,
         };
@@ -474,7 +474,7 @@ impl<'a, N: Name> Resolver<'a, N> {
     /// it and as shallow as the shallowest; an enum's narrowed by the enum's own visibility.
     pub(crate) fn glob_edges(&self) -> AVec<'a, GlobEdge> {
         let importer = self.asker();
-        let mut out: AVec<'a, GlobEdge> = Vec::new_in(self.alloc.clone());
+        let mut out: AVec<'a, GlobEdge> = Vec::new_in(self.alloc);
         for g in self.globs.iter() {
             let Source::Resolved { def, clamp } = g.source else { continue };
             let vis = match clamp {
@@ -623,9 +623,9 @@ pub(crate) fn settle_reads<'a, N: Name, F: ScopeFacts<Name = N>>(
     stats: &mut crate::resolver::FillStats,
     alloc: Alloc<'a>,
 ) -> Result<Settled<'a, N>, ResolveError> {
-    let mut out = Vec::with_capacity_in(ms.len(), alloc.clone());
-    let mut asks = Vec::new_in(alloc.clone());
-    let mut waits = Vec::new_in(alloc.clone());
+    let mut out = Vec::with_capacity_in(ms.len(), alloc);
+    let mut asks = Vec::new_in(alloc);
+    let mut waits = Vec::new_in(alloc);
     for i in 0..ms.len() {
         // Each round gives the member at least one answer it lacked, of finitely many: bounded.
         loop {
@@ -641,10 +641,10 @@ pub(crate) fn settle_reads<'a, N: Name, F: ScopeFacts<Name = N>>(
                 }
                 Finish::Need { asks: need, waits: wait } => (need, wait),
             };
-            let mut given: AVec<'a, (Read<N>, Cached<'a, N>)> = Vec::new_in(alloc.clone());
+            let mut given: AVec<'a, (Read<N>, Cached<'a, N>)> = Vec::new_in(alloc);
             let mut outside = false;
             for (&read, waited) in need.iter().map(|r| (r, false)).chain(wait.iter().map(|r| (r, true))) {
-                match member_answer(ms, &group, read, &mut given, alloc.clone())? {
+                match member_answer(ms, &group, read, &mut given, alloc)? {
                     Given::Yes => {}
                     Given::Ask(other) => {
                         outside = true;
@@ -699,7 +699,7 @@ fn copy_cached<'a, N: Copy>(c: &Cached<'a, N>, alloc: Alloc<'a>) -> Cached<'a, N
     match c {
         Cached::Name(a) => Cached::Name(*a),
         Cached::Globs { edges, krate, chain, digest } => Cached::Globs {
-            edges: copy(edges, alloc.clone()),
+            edges: copy(edges, alloc),
             krate: *krate,
             chain: copy(chain, alloc),
             digest: *digest,
@@ -748,8 +748,8 @@ fn member_answer<'a, N: Name>(
     match read {
         Read::Name { ns, name, .. } => {
             // The walk a lookup makes: a member's own binding, else its edges' sources.
-            let mut stack = Vec::new_in(alloc.clone());
-            let mut seen = Vec::new_in(alloc.clone());
+            let mut stack = Vec::new_in(alloc);
+            let mut seen = Vec::new_in(alloc);
             stack.push(at);
             while let Some(f) = stack.pop() {
                 if seen.contains(&f) {
@@ -763,14 +763,14 @@ fn member_answer<'a, N: Name>(
                 if found.is_some() {
                     continue;
                 }
-                given.push((Read::Globs { module }, globs_answer(ms, group, f, alloc.clone())));
+                given.push((Read::Globs { module }, globs_answer(ms, group, f, alloc)));
                 stack.extend(scope.globs.iter().filter_map(|e| member_at(ms, e.source.key)));
             }
         }
         Read::Globs { .. } => given.push((read, globs_answer(ms, group, at, alloc))),
         Read::TextualOut { .. } => {
             let defs = &group[at].scope.textual;
-            let mut v = Vec::with_capacity_in(defs.len(), alloc.clone());
+            let mut v = Vec::with_capacity_in(defs.len(), alloc);
             v.extend_from_slice(defs);
             given.push((read, Cached::Textual { digest: textual_digest(defs, alloc), defs: v }));
         }
@@ -778,7 +778,7 @@ fn member_answer<'a, N: Name>(
             // One level: the member parent's own definitions before the `mod module` line.
             let scope = &group[at].scope;
             let len = scope.mark(module).ok_or(ResolveError::NoMark { module: scope.module, child: module })? as usize;
-            let mut defs = Vec::new_in(alloc.clone());
+            let mut defs = Vec::new_in(alloc);
             defs.extend_from_slice(&scope.textual[..len.min(scope.textual.len())]);
             given.push((read, Cached::Textual { digest: textual_digest(&defs, alloc), defs }));
         }
@@ -791,9 +791,9 @@ fn member_answer<'a, N: Name>(
 /// The `Globs` answer of member `at`'s record: its edges, its crate, its chain.
 fn globs_answer<'a, N: Name>(ms: &[Resolver<'a, N>], group: &[Resolved<'a, N>], at: usize, alloc: Alloc<'a>) -> Cached<'a, N> {
     let scope = &group[at].scope;
-    let mut edges = Vec::with_capacity_in(scope.globs.len(), alloc.clone());
+    let mut edges = Vec::with_capacity_in(scope.globs.len(), alloc);
     edges.extend_from_slice(&scope.globs);
-    let mut chain = Vec::with_capacity_in(ms[at].chain.len(), alloc.clone());
+    let mut chain = Vec::with_capacity_in(ms[at].chain.len(), alloc);
     chain.extend_from_slice(&ms[at].chain);
     let digest = globs_digest(&edges, ms[at].krate, &chain, alloc);
     Cached::Globs { edges, krate: ms[at].krate, chain, digest }

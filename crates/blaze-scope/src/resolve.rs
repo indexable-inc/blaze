@@ -1601,7 +1601,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     tables_all.merge(held(tables.into_inner(), "tables"));
     let made = held(made.into_inner(), "made modules");
     for (&m, module) in made.iter() {
-        chains.insert(m, module.chain.clone());
+        chains.insert(m, module.chain.clone_in(alloc));
     }
     notes.extend(held(run_notes.into_inner(), "notes"));
     let mut names = CrateNames {
@@ -3531,7 +3531,7 @@ fn expand_call<'a, S: SourceTexts<'a>>(
                 match walk.next(atom) {
                     Ok(NextAttr::Call { path, attr })
                         if match plant {
-                            AttrPlant::None => walk.attr_is(attr.clone(), &named),
+                            AttrPlant::None => walk.attr_is(attr.start..attr.end, &named),
                             AttrPlant::Spelling => same_spelling(&path, src.name),
                         } =>
                     {
@@ -4464,10 +4464,10 @@ fn place_of<'a, S>(base: &Base<'_, 'a, S>, run: &Run<'a>, module: ItemKey) -> Op
         return Some((keep(&m.dir, alloc), keep(&m.path_dir, alloc), chain, keep(&m.path, alloc)));
     }
     if let Some(it) = base.made_before.and_then(|m| m.get(&module)) {
-        return Some((it.dir, it.path_dir, it.chain.clone(), it.path));
+        return Some((it.dir, it.path_dir, it.chain.clone_in(alloc), it.path));
     }
     let made = held(run.made.read(), "made modules");
-    made.get(&module).map(|it| (it.dir, it.path_dir, it.chain.clone(), it.path))
+    made.get(&module).map(|it| (it.dir, it.path_dir, it.chain.clone_in(alloc), it.path))
 }
 
 /// The file at `path`, read and outlined the first time a module names it.
@@ -4532,7 +4532,7 @@ fn make_modules<'a, S: SourceTexts<'a>>(
             let sub = keep(&joined(dir, &[m.name], alloc), alloc);
             let (file, mdir, mpdir) = if let Some(p) = m.path_attr {
                 let target = joined(path_dir, &[p], alloc);
-                let mut parent_dir = target.clone();
+                let mut parent_dir = target.clone_in(alloc);
                 pop_dir(&mut parent_dir);
                 let parent_dir = keep(&parent_dir, alloc);
                 let Some(file) = file_at(base, run, &target) else {

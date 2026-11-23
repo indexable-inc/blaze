@@ -61,7 +61,7 @@ const NOT_GROUNDED: BuildError = BuildError::NoCleanup {
     what: "an owned operand evaluated before this call waits on the value stack and its type has no layout row, so the unwind path cannot drop it exactly",
 };
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Pushes `v`; `ty` is `Some(g)` only for a value the walk owns whose ground type `g` needs
     /// drop, else `None`.
     pub(super) fn push_val(&mut self, v: V, ty: Option<PTy>) {

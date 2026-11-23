@@ -270,9 +270,9 @@ pub fn check_scope_in<'n, 'a, G: CrateGraph<'n>>(graph: &G, owner: usize, no_cor
     // By index, how each crate is seen (`None`: not seen); the work list in the order reached,
     // which holds each crate at most once, so `n` slots and no growth (the pushes below and
     // this `extend` stay within the capacity reserved here, so they allocate nothing).
-    let mut seen: AVec<'a, Option<Seen>> = AVec::try_with_capacity_in(n, alloc.clone()).map_err(memory)?;
+    let mut seen: AVec<'a, Option<Seen>> = AVec::try_with_capacity_in(n, alloc).map_err(memory)?;
     seen.extend((0..n).map(|_| None));
-    let mut order: AVec<'a, usize> = AVec::try_with_capacity_in(n, alloc.clone()).map_err(memory)?;
+    let mut order: AVec<'a, usize> = AVec::try_with_capacity_in(n, alloc).map_err(memory)?;
     seen[owner] = Some(Seen::Owner);
     order.push(owner);
     // The target side's sysroot, which the extern prelude adds (unless `#![no_core]`); the
