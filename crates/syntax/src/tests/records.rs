@@ -31,6 +31,8 @@ fn values(x: i32, old: { x: i32, y: i32 }) {
     let d: { x: i32, y: i32 } = { y: 2, x: 1, };
     let e = { x: 5, ..old };
     let f = open("p", { create: true, .. });
+    let f2 = open("p", { create: true });
+    let f3 = open("p", { .. });
     let g = { at: { x: 1, y: 2 }, name: "n" };
     let h = { x: 1, y: 2 }.x;
     let i = [{ x: 1 }, { x: 2 }];
@@ -52,13 +54,13 @@ fn patterns(p: { x: i32, y: i32 }, q: Option<{ x: i32, y: i32 }>) {
 "#;
 
 /// A record value's near misses, each the block it is in Rust: one shorthand name, nothing, a
-/// range from nothing, the full range, a path, a labeled loop, statements, a field access, an
-/// assignment, a range from a name, a call, a macro call and a struct literal.
-const BLOCKS: [&str; 13] = [
+/// range from nothing, a path, a labeled loop, statements, a field access, an assignment, a range
+/// from a name, a call, a macro call and a struct literal. (`{ .. }` is the all-defaults record
+/// literal under `#![blaze::records]`.)
+const BLOCKS: [&str; 12] = [
     "{ a }",
     "{}",
     "{ ..a }",
-    "{ .. }",
     "{ a::b }",
     "{ 'l: loop { break 'l } }",
     "{ a; b }",
@@ -130,9 +132,9 @@ fn every_form_parses_and_prints_back() {
     assert_eq!(parse.errors(), Vec::<SyntaxError>::new(), "{}", tree(&parse));
     assert_eq!(parse.extensions(), Extensions::RECORDS);
     assert_eq!(parse.syntax_node().to_string(), FORMS);
-    // Written above: 18 record types, 15 record values, 10 record patterns.
+    // Written above: 18 record types, 17 record values, 10 record patterns.
     assert_eq!(count(&parse, SyntaxKind::RECORD_TYPE), 18, "{}", tree(&parse));
-    assert_eq!(pathless(&parse, SyntaxKind::RECORD_EXPR), 15, "{}", tree(&parse));
+    assert_eq!(pathless(&parse, SyntaxKind::RECORD_EXPR), 17, "{}", tree(&parse));
     assert_eq!(pathless(&parse, SyntaxKind::RECORD_PAT), 10, "{}", tree(&parse));
     // A parameter's defaults are the fields' own nodes, as a struct's default field values.
     assert_eq!(count(&parse, SyntaxKind::CONST_ARG), 2, "{}", tree(&parse));

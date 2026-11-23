@@ -1720,7 +1720,13 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let t = self.put_type(TypeRef::Record(fields), r);
                 self.push(V::Type, t.0, r);
             }
-            UNSAFE_BINDER_TYPE | UNION_TYPE => {
+            UNION_TYPE => {
+                let members = self.put_ids(f, V::Type);
+                self.done(f);
+                let t = self.put_type(TypeRef::Union(members), r);
+                self.push(V::Type, t.0, r);
+            }
+            UNSAFE_BINDER_TYPE => {
                 self.done(f);
                 self.unhandled(f.kind, r, Why::Kind);
                 let t = self.put_type(TypeRef::Error, r);
@@ -2514,6 +2520,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let mutable = self.has_tok(f, MUT_KW) || (by_ref && self.has_tok(f, UNIQ_KW));
                 let name = self.first(f, V::Name);
                 let sub = self.first(f, V::Pat).map(|v| PatId(v.id));
+                let has_typed_ascription = self.first(f, V::Type).is_some();
                 self.done(f);
                 let Some(name) = name else { return };
                 let ann = BindAnn { by_ref: by_ref.then_some(if mutable { Mutbl::Mut } else { Mutbl::Not }), mutable: mutable && !by_ref };
@@ -2521,7 +2528,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let p = self.put_pat(Pat::Bind { ann, name, sub, shadows: None }, r);
                 // Settled at the end, when every block's items are known: a bare name that
                 // is a constant, a unit struct or a unit variant becomes a path pattern.
-                let bare = !by_ref && !mutable && sub.is_none();
+                let bare = !by_ref && !mutable && sub.is_none() && !has_typed_ascription;
                 self.idents.push(Ident { pat: p.0, scope: self.scope().0, bare });
                 let hash = self.local_key(name);
                 self.push_pending(hash, p);
