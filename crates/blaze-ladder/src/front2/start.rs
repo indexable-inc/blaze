@@ -230,7 +230,8 @@ pub fn rust_start<'n, S: NamesSource<'n>>(names: S, lang_start: LibKey, main: Li
     if !matches!(head.header.safety, tc::Safety::Safe) {
         return Err(refuse("is `unsafe`; `lang_start` takes a safe `fn() -> T`"));
     }
-    Ok(RustStart { lang_start, main, returns: head.output })
+    let returns = store.fn_output(checker_of(main)).unwrap_or(head.output);
+    Ok(RustStart { lang_start, main, returns })
 }
 
 /// `lib` for a message: front2 item_shown.rs `ItemShown`, the one printer of an item in a

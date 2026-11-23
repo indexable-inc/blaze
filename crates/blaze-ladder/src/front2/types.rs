@@ -1132,14 +1132,6 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 let l = intern_list(tys, kids)?;
                 intern(tys, PNode::Tuple(l))
             }
-            lf::TypeRef::Fallible { .. } => {
-                let l = intern_list(tys, kids)?;
-                if let Some(result_key) = self.resolve_result_adt(env)? {
-                    intern(tys, PNode::Adt(result_key, l))
-                } else {
-                    intern(tys, PNode::Union(l))
-                }
-            }
             lf::TypeRef::Record(fields) => {
                 let rows = v.rows(fields)?;
                 let alloc = tys.alloc();
@@ -1250,28 +1242,6 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             },
             _ => Err(Why::Unsupported("this type", r)),
         }
-    }
-
-    /// Resolves `Result<T, E>` (an enum with 2 generic parameters) for `T ! E` fallible types,
-    /// trying `::core::result::Result`, `core::result::Result`, and `Result` in scope.
-    fn resolve_result_adt(&self, env: &Env<'_>) -> Result<Option<ItemKey>, Why> {
-        const CANDIDATES: [(bool, &[&str]); 3] = [
-            (true, &["core", "result", "Result"]),
-            (false, &["core", "result", "Result"]),
-            (false, &["Result"]),
-        ];
-        for (abs, segs) in CANDIDATES {
-            if let Ok(found) = self.resolver.path(env.module, abs, segs, Ns::Type)
-                && usize::try_from(found.consumed).ok() == Some(segs.len())
-                && found.kind == Kind::Enum
-            {
-                let (g, _) = self.heads.adt_generics(found.key).ok_or(Why::Need(found.key))?;
-                if g == 2 {
-                    return Ok(Some(self.heads.checker(found.key)));
-                }
-            }
-        }
-        Ok(None)
     }
 
     /// Resolves a written path in `ns` by the block and first-token rule in
@@ -1905,10 +1875,6 @@ pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Gl
         lf::TypeRef::Ref { inner, .. } | lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::Slice(inner) => out.push(inner),
         lf::TypeRef::Array { elem, .. } => out.push(elem),
         lf::TypeRef::Tuple(l) | lf::TypeRef::Union(l) => out.extend(v.ids(l)?.iter().map(|&i| lf::TypeId(i))),
-        lf::TypeRef::Fallible { ok, err } => {
-            out.push(ok);
-            out.push(err);
-        }
         lf::TypeRef::Path(p) => {
             let path = v.path(p)?;
             for &n in v.segments(path)? {
@@ -2900,7 +2866,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     let own = lifetime_kind(v, lifetime, r, s)?;
                     s.wrap(n, Some(own))
                 }
-                lf::TypeRef::Ptr { .. } | lf::TypeRef::Slice(_) | lf::TypeRef::Array { .. } | lf::TypeRef::Pat { .. } | lf::TypeRef::Tuple(_) | lf::TypeRef::Record(_) | lf::TypeRef::Fallible { .. } | lf::TypeRef::Never => s.wrap(n, None),
+                lf::TypeRef::Ptr { .. } | lf::TypeRef::Slice(_) | lf::TypeRef::Array { .. } | lf::TypeRef::Pat { .. } | lf::TypeRef::Tuple(_) | lf::TypeRef::Record(_) | lf::TypeRef::Never => s.wrap(n, None),
                 lf::TypeRef::Union(_) => {
                     let raw_count: u32 = kids
                         .iter()

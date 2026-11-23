@@ -95,6 +95,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         // Per input: `HasType(t)` binds the formal to `t`; `RvalueLikeUnsized(t)` is the
         // argument's hint only (`rvalue_hint`: `str`, a slice, a trait object).
         let mut hints: Vec<Option<Expectation>, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
+        let outer_ev = self.active_inferred_err_var();
         let fits = self.probe(|m| -> Result<bool, Stop> {
             // The variables that outlive the probe: those that exist before it.
             let mark = m.ty.var_mark();
@@ -104,6 +105,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             for i in 0..n {
                 let formal = m.ty.list_get(inputs, i);
                 let resolved = m.ty.resolve(formal)?;
+                if let Some(ev) = outer_ev
+                    && m.ty.shallow_resolve(ev) == resolved
+                {
+                    hints.push(Some(Expectation::HasType(ev)));
+                    continue;
+                }
                 let one = m.mk_list(&[resolved])?;
                 let says_nothing = m.ty.list_has_infer_since(one, mark) || matches!(m.ty.view(resolved), TyView::Error);
                 hints.push(if says_nothing { None } else { Some(m.rvalue_hint(resolved)?) });

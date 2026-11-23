@@ -843,11 +843,7 @@ pub const FLOAT_TYS: [(FloatTy, &str); 4] = [(FloatTy::F16, "f16"), (FloatTy::F3
 
 /// The index of `x` in a table of numbered forms; every form is in its table.
 fn code_in<T: PartialEq + Copy>(table: &[(T, &str)], x: T) -> u32 {
-    let mut i = 0;
-    while i < table.len() && table[i].0 != x {
-        i += 1;
-    }
-    i as u32
+    table.iter().position(|&(t, _)| t == x).unwrap_or(table.len()) as u32
 }
 
 fn form_of<T: Copy>(table: &[(T, &str)], code: u32) -> Option<T> {
@@ -855,27 +851,42 @@ fn form_of<T: Copy>(table: &[(T, &str)], code: u32) -> Option<T> {
 }
 
 fn put_key(w: &mut [u32; 9], at: usize, k: ItemKey) {
-    w[at..at + 4].copy_from_slice(&split(k.0));
+    if let Some(dst) = w.get_mut(at..at + 4) {
+        dst.copy_from_slice(&split(k.0));
+    }
 }
 
 fn put_list(w: &mut [u32; 9], at: usize, l: List) {
-    (w[at], w[at + 1]) = (l.start, l.len);
+    if let Some([a, b]) = w.get_mut(at..at + 2) {
+        (*a, *b) = (l.start, l.len);
+    }
 }
 
 fn put_name(w: &mut [u32; 9], at: usize, n: Name) {
-    (w[at], w[at + 1]) = (n.0 as u32, (n.0 >> 32) as u32);
+    if let Some([a, b]) = w.get_mut(at..at + 2) {
+        (*a, *b) = (n.0 as u32, (n.0 >> 32) as u32);
+    }
 }
 
 fn key_at(w: &[u32; 9], at: usize) -> ItemKey {
-    ItemKey(join([w[at], w[at + 1], w[at + 2], w[at + 3]]))
+    match w.get(at..at + 4) {
+        Some(&[a, b, c, d]) => ItemKey(join([a, b, c, d])),
+        _ => ItemKey(0),
+    }
 }
 
 fn list_at(w: &[u32; 9], at: usize) -> List {
-    List { start: w[at], len: w[at + 1] }
+    match w.get(at..at + 2) {
+        Some(&[start, len]) => List { start, len },
+        _ => List { start: 0, len: 0 },
+    }
 }
 
 fn name_at(w: &[u32; 9], at: usize) -> Name {
-    Name(u64::from(w[at]) | (u64::from(w[at + 1]) << 32))
+    match w.get(at..at + 2) {
+        Some(&[lo, hi]) => Name(u64::from(lo) | (u64::from(hi) << 32)),
+        _ => Name(0),
+    }
 }
 
 /// An overlay type as its row.

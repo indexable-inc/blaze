@@ -165,84 +165,136 @@ pub fn eval_dual<A: Allocator + Copy>(
     for _ in 0..n {
         cache.push(None);
     }
-    eval_dual_memo(g, root, env, wrt, &mut cache)
-}
-
-fn eval_dual_memo<A: Allocator + Copy>(
-    g: &ExprGraph<A>,
-    id: ExprId,
-    env: &[f64],
-    wrt: VarId,
-    cache: &mut OwnVec<Option<Dual>, A>,
-) -> Result<Dual, AlgebraError> {
-    let idx = u32_to_usize(id.0);
-    if let Some(hit) = cache.get(idx).copied().flatten() {
-        return Ok(hit);
-    }
-    let d = match g.node(id)? {
-        Op::Const(bits) => Dual::constant(f64::from_bits(bits)),
-        Op::Var(v) => {
-            let val = *env
-                .get(u32_to_usize(v.0))
-                .ok_or(AlgebraError::UnknownVar { var: v, env_len: env.len() })?;
-            Dual::var(val, if v == wrt { 1.0 } else { 0.0 })
-        }
-        Op::Neg(a) => eval_dual_memo(g, a, env, wrt, cache)?.neg(),
-        Op::Add(a, b) => {
-            let da = eval_dual_memo(g, a, env, wrt, cache)?;
-            let db = eval_dual_memo(g, b, env, wrt, cache)?;
-            da.add(db)
-        }
-        Op::Sub(a, b) => {
-            let da = eval_dual_memo(g, a, env, wrt, cache)?;
-            let db = eval_dual_memo(g, b, env, wrt, cache)?;
-            da.sub(db)
-        }
-        Op::Mul(a, b) => {
-            let da = eval_dual_memo(g, a, env, wrt, cache)?;
-            let db = eval_dual_memo(g, b, env, wrt, cache)?;
-            da.mul(db)
-        }
-        Op::Div(a, b) => {
-            let da = eval_dual_memo(g, a, env, wrt, cache)?;
-            let db = eval_dual_memo(g, b, env, wrt, cache)?;
-            da.div(db)
-        }
-        Op::Pow(a, b) => {
-            let da = eval_dual_memo(g, a, env, wrt, cache)?;
-            let db = eval_dual_memo(g, b, env, wrt, cache)?;
-            da.pow(db)
-        }
-        Op::Sin(a) => eval_dual_memo(g, a, env, wrt, cache)?.sin(),
-        Op::Cos(a) => eval_dual_memo(g, a, env, wrt, cache)?.cos(),
-        Op::Tan(a) => eval_dual_memo(g, a, env, wrt, cache)?.tan(),
-        Op::Exp(a) => eval_dual_memo(g, a, env, wrt, cache)?.exp(),
-        Op::Ln(a) => eval_dual_memo(g, a, env, wrt, cache)?.ln(),
-        Op::Sqrt(a) => eval_dual_memo(g, a, env, wrt, cache)?.sqrt(),
-        Op::Tanh(a) => eval_dual_memo(g, a, env, wrt, cache)?.tanh(),
-        Op::Abs(a) => eval_dual_memo(g, a, env, wrt, cache)?.abs(),
-        Op::Select(c, t, e) => {
-            let dc = eval_dual_memo(g, c, env, wrt, cache)?;
-            if dc.val > 0.0 {
-                eval_dual_memo(g, t, env, wrt, cache)?
-            } else {
-                eval_dual_memo(g, e, env, wrt, cache)?
-            }
-        }
-        Op::Fma(a, b, c) => {
-            let da = eval_dual_memo(g, a, env, wrt, cache)?;
-            let db = eval_dual_memo(g, b, env, wrt, cache)?;
-            let dc = eval_dual_memo(g, c, env, wrt, cache)?;
-            Dual {
-                val: blaze_math::mul_add(da.val, db.val, dc.val),
-                deriv: blaze_math::mul_add(da.deriv, db.val, blaze_math::mul_add(da.val, db.deriv, dc.deriv)),
-            }
-        }
+    let get_d = |cache: &[Option<Dual>], e: ExprId| -> Dual {
+        cache
+            .get(u32_to_usize(e.0))
+            .copied()
+            .flatten()
+            .unwrap_or(Dual::constant(f64::NAN))
     };
-    if let Some(slot) = cache.get_mut(idx) {
-        *slot = Some(d);
+    // State: 0 = visit, 1 = evaluate op (or select condition), 2 = finalize select branch.
+    let mut stack: OwnVec<(ExprId, u8), A> = OwnVec::new_in(g.alloc());
+    stack.push((root, 0));
+    while let Some((id, state)) = stack.pop() {
+        let idx = u32_to_usize(id.0);
+        if cache.get(idx).copied().flatten().is_some() {
+            continue;
+        }
+        let op = g.node(id)?;
+        if state == 0 {
+            match op {
+                Op::Const(bits) => {
+                    if let Some(slot) = cache.get_mut(idx) {
+                        *slot = Some(Dual::constant(f64::from_bits(bits)));
+                    }
+                }
+                Op::Var(v) => {
+                    let val = *env
+                        .get(u32_to_usize(v.0))
+                        .ok_or(AlgebraError::UnknownVar { var: v, env_len: env.len() })?;
+                    if let Some(slot) = cache.get_mut(idx) {
+                        *slot = Some(Dual::var(val, if v == wrt { 1.0 } else { 0.0 }));
+                    }
+                }
+                Op::Neg(a)
+                | Op::Sin(a)
+                | Op::Cos(a)
+                | Op::Tan(a)
+                | Op::Exp(a)
+                | Op::Ln(a)
+                | Op::Sqrt(a)
+                | Op::Tanh(a)
+                | Op::Abs(a) => {
+                    stack.push((id, 1));
+                    stack.push((a, 0));
+                }
+                Op::Add(a, b)
+                | Op::Sub(a, b)
+                | Op::Mul(a, b)
+                | Op::Div(a, b)
+                | Op::Pow(a, b) => {
+                    stack.push((id, 1));
+                    stack.push((b, 0));
+                    stack.push((a, 0));
+                }
+                Op::Select(c, _, _) => {
+                    stack.push((id, 1));
+                    stack.push((c, 0));
+                }
+                Op::Fma(a, b, c) => {
+                    stack.push((id, 1));
+                    stack.push((c, 0));
+                    stack.push((b, 0));
+                    stack.push((a, 0));
+                }
+            }
+            continue;
+        }
+        if state == 1 {
+            if let Op::Select(c, t, e) = op {
+                let dc = get_d(&cache, c);
+                let branch = if dc.val > 0.0 { t } else { e };
+                if let Some(hit) = cache.get(u32_to_usize(branch.0)).copied().flatten() {
+                    if let Some(slot) = cache.get_mut(idx) {
+                        *slot = Some(hit);
+                    }
+                } else {
+                    stack.push((id, 2));
+                    stack.push((branch, 0));
+                }
+                continue;
+            }
+        }
+        let d = match op {
+            Op::Const(bits) => Dual::constant(f64::from_bits(bits)),
+            Op::Var(v) => {
+                let val = *env
+                    .get(u32_to_usize(v.0))
+                    .ok_or(AlgebraError::UnknownVar { var: v, env_len: env.len() })?;
+                Dual::var(val, if v == wrt { 1.0 } else { 0.0 })
+            }
+            Op::Neg(a) => get_d(&cache, a).neg(),
+            Op::Add(a, b) => get_d(&cache, a).add(get_d(&cache, b)),
+            Op::Sub(a, b) => get_d(&cache, a).sub(get_d(&cache, b)),
+            Op::Mul(a, b) => get_d(&cache, a).mul(get_d(&cache, b)),
+            Op::Div(a, b) => get_d(&cache, a).div(get_d(&cache, b)),
+            Op::Pow(a, b) => get_d(&cache, a).pow(get_d(&cache, b)),
+            Op::Sin(a) => get_d(&cache, a).sin(),
+            Op::Cos(a) => get_d(&cache, a).cos(),
+            Op::Tan(a) => get_d(&cache, a).tan(),
+            Op::Exp(a) => get_d(&cache, a).exp(),
+            Op::Ln(a) => get_d(&cache, a).ln(),
+            Op::Sqrt(a) => get_d(&cache, a).sqrt(),
+            Op::Tanh(a) => get_d(&cache, a).tanh(),
+            Op::Abs(a) => get_d(&cache, a).abs(),
+            Op::Select(c, t, e) => {
+                let dc = get_d(&cache, c);
+                let branch = if dc.val > 0.0 { t } else { e };
+                get_d(&cache, branch)
+            }
+            Op::Fma(a, b, c) => {
+                let da = get_d(&cache, a);
+                let db = get_d(&cache, b);
+                let dc = get_d(&cache, c);
+                Dual {
+                    val: blaze_math::mul_add(da.val, db.val, dc.val),
+                    deriv: blaze_math::mul_add(
+                        da.deriv,
+                        db.val,
+                        blaze_math::mul_add(da.val, db.deriv, dc.deriv),
+                    ),
+                }
+            }
+        };
+        if let Some(slot) = cache.get_mut(idx) {
+            *slot = Some(d);
+        }
     }
-    Ok(d)
+    cache
+        .get(u32_to_usize(root.0))
+        .copied()
+        .flatten()
+        .ok_or(AlgebraError::InvalidExpr { expr: root, node_count: n })
 }
 
 /// Compute the symbolic partial derivative `∂(root) / ∂(wrt)` over the shared DAG (memoized O(|V|)).

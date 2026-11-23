@@ -426,3 +426,259 @@ fn one_verdict_two_bodies_keep_two_records() {
     assert!(one[..] == one_again[..], "control: one body keeps one record (rule 25)");
     assert!(one[..] != two[..], "`1` and `2` keep two records");
 }
+
+fn empty_body_view<'b>(owner: ItemKey, types: blaze_typeck::PTys<'b>, root: ExprId) -> blaze_typeck::BodyView<'b> {
+    blaze_typeck::BodyView {
+        owner,
+        types,
+        root,
+        params: &[],
+        exprs: &[],
+        expr_ranges: &[],
+        pats: &[],
+        pat_ranges: &[],
+        stmts: &[],
+        expr_lists: &[],
+        pat_lists: &[],
+        stmt_lists: &[],
+        paths: &[],
+        segments: &[],
+        opt_types: &[],
+        type_lists: &[],
+        type_list_ranges: &[],
+        segment_ranges: &[],
+        method_name_ranges: &[],
+        arms: &[],
+        field_inits: &[],
+        field_pats: &[],
+        fmt_uses: &[],
+        coroutine: None,
+        asm_pieces: &[],
+        asm_operands: &[],
+        asm_clobbers: &[],
+        asm_text: "",
+        call_arg_ints: &[],
+        legacy_args: &[],
+        super_lets: &[],
+        unsafe_blocks: &[],
+        edition: blaze_typeck::Edition::E2021,
+        expr_editions: &[],
+        pat_editions: &[],
+        record_expr_schemas: &[],
+    }
+}
+
+fn lowered_view(fx: &Fx, bv: &blaze_typeck::BodyView<'_>) -> String {
+    let mut cx = InferCtx::new_in(heap());
+    let c = match blaze_typeck::check(bv, fx, &mut cx, &Needs::new_in(heap()), heap()) {
+        Ok(Outcome::Done(c)) => {
+            assert!(c.diags.is_empty(), "fixture type-checks clean: {:?}", c.diags);
+            c
+        }
+        Ok(Outcome::Need(n)) => panic!("world missed {:?}", n.questions),
+        Err(e) => panic!("{e:?}"),
+    };
+    let body = match lower(bv, &c, &Plain, heap()) {
+        Ok(x) => x,
+        Err(r) => panic!("refused: {r:?}"),
+    };
+    let mut text = String::new();
+    blaze_body::print(&body.view(), &mut text).expect("a lowered body prints");
+    if let Err(e) = blaze_body::verify(&body) {
+        panic!("verify refused {e:?}:\n{text}");
+    }
+    normalize(&text)
+}
+
+/// Lowers structural records: `Expr::Record` literal (non-canonical field order -> canonical
+/// `AggregateKind::Tuple`), `Pat::Record` destructuring (`let { a, .. } = r;` and `match`),
+/// `Expr::Record` functional update (`{ a: a, ..r }`), and width-subtyping coercion
+/// (`AdjustKind::RecordProject`).
+#[test]
+fn structural_record_literal_update_project_and_pattern() {
+    use blaze_typeck::{
+        Arm, BindAnn, FieldInit, FieldPat, IntSuffix, List, Lit, PNode, Pat, PatId, PortableTys, Range, RecordSchema,
+        ScopeId, Stmt, StmtId, StructBase, UintTy,
+    };
+
+    let mut fx = Fx::new();
+    let u32_t = fx.u32();
+    let owner = fx.func("rec_fn", 0, &[], u32_t, Vec::new());
+    fx.finish();
+
+    let mut body_tys = PortableTys::new_in(heap());
+    let b_u8 = body_tys.intern(PNode::Uint(UintTy::U8)).expect("u8");
+    let b_u32 = body_tys.intern(PNode::Uint(UintTy::U32)).expect("u32");
+    let wide_names = [Name::of("a"), Name::of("b")];
+    let wide_schema = RecordSchema::of_sorted_names(&wide_names);
+    body_tys.register_record_schema(wide_schema, &wide_names).expect("wide schema");
+
+    let narrow_names = [Name::of("a")];
+    let narrow_schema = RecordSchema::of_sorted_names(&narrow_names);
+    body_tys.register_record_schema(narrow_schema, &narrow_names).expect("narrow schema");
+    let narrow_list = body_tys.intern_list(&[b_u32]).expect("narrow list");
+    let narrow_ty = body_tys.intern(PNode::Record(narrow_schema, narrow_list)).expect("narrow ty");
+
+    let mk_bind = |name: &str| Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None, ty: None };
+    let pats = [
+        mk_bind("r"),                                                  // 0
+        mk_bind("a"),                                                  // 1
+        Pat::Record { fields: List { start: 0, len: 1 }, rest: true }, // 2: { a, .. }
+        mk_bind("r2"),                                                 // 3
+        mk_bind("narrow"),                                             // 4
+        mk_bind("m"),                                                  // 5
+        Pat::Record { fields: List { start: 1, len: 1 }, rest: false }, // 6: { a: m }
+    ];
+    let field_pats = [
+        FieldPat { name: Name::of("a"), pat: PatId(1) },
+        FieldPat { name: Name::of("a"), pat: PatId(5) },
+    ];
+    let mut pat_ranges = blaze_own::Vec::with_capacity_in(pats.len(), heap());
+    for i in 0..pats.len() {
+        let s = u32::try_from(i).unwrap_or(0);
+        pat_ranges.push(Range { start: s, end: s + 1 });
+    }
+
+    let exprs = [
+        Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U8)))),                                 // 0: 1u8
+        Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U32)))),                                // 1: 2u32
+        Expr::Record { fields: List { start: 0, len: 2 }, base: StructBase::None },             // 2: { b: 1u8, a: 2u32 }
+        Expr::Local(PatId(0)),                                                                  // 3: r
+        Expr::Local(PatId(1)),                                                                  // 4: a
+        Expr::Local(PatId(0)),                                                                  // 5: r
+        Expr::Record { fields: List { start: 2, len: 1 }, base: StructBase::Expr(ExprId(5)) },  // 6: { a: a, ..r }
+        Expr::Local(PatId(3)),                                                                  // 7: r2 (RecordProject -> { a: u32 })
+        Expr::Local(PatId(4)),                                                                  // 8: narrow
+        Expr::Local(PatId(5)),                                                                  // 9: m
+        Expr::Match { scrutinee: ExprId(8), arms: List { start: 0, len: 1 } },                  // 10: match narrow { { a: m } => m }
+        Expr::Block { stmts: List { start: 0, len: 4 }, tail: Some(ExprId(10)), scope: ScopeId(0) }, // 11
+    ];
+    let mut expr_ranges = blaze_own::Vec::with_capacity_in(exprs.len(), heap());
+    for i in 0..exprs.len() {
+        let s = u32::try_from(i).unwrap_or(0);
+        expr_ranges.push(Range { start: s, end: s + 1 });
+    }
+    let field_inits = [
+        FieldInit { name: Name::of("b"), expr: ExprId(0) },
+        FieldInit { name: Name::of("a"), expr: ExprId(1) },
+        FieldInit { name: Name::of("a"), expr: ExprId(4) },
+    ];
+    let arms = [Arm { pat: PatId(6), guard: None, body: ExprId(9) }];
+    let stmts = [
+        Stmt::Let { pat: PatId(0), ty: None, init: Some(ExprId(2)), else_: None },
+        Stmt::Let { pat: PatId(2), ty: None, init: Some(ExprId(3)), else_: None },
+        Stmt::Let { pat: PatId(3), ty: None, init: Some(ExprId(6)), else_: None },
+        Stmt::Let { pat: PatId(4), ty: Some(narrow_ty), init: Some(ExprId(7)), else_: None },
+    ];
+    let stmt_lists = [StmtId(0), StmtId(1), StmtId(2), StmtId(3)];
+    let call_arg_ints = [(ExprId(0), 1u128), (ExprId(1), 2u128)];
+    let record_expr_schemas = [(ExprId(2), wide_schema)];
+
+    let mut bv = empty_body_view(owner, body_tys.view(), ExprId(11));
+    bv.pats = &pats;
+    bv.pat_ranges = &pat_ranges;
+    bv.field_pats = &field_pats;
+    bv.exprs = &exprs;
+    bv.expr_ranges = &expr_ranges;
+    bv.field_inits = &field_inits;
+    bv.arms = &arms;
+    bv.stmts = &stmts;
+    bv.stmt_lists = &stmt_lists;
+    bv.call_arg_ints = &call_arg_ints;
+    bv.record_expr_schemas = &record_expr_schemas;
+
+    let text = lowered_view(&fx, &bv);
+    assert!(text.contains("tuple "), "record literal/update/projection lowers via AggregateKind::Tuple:\n{text}");
+    assert!(text.contains("(const c1, const c0)"), "non-canonical record fields sorted canonically:\n{text}");
+    assert!(text.contains(".0:"), "canonical field projection emitted:\n{text}");
+    assert!(text.contains(".1:"), "functional update copies unwritten field from base:\n{text}");
+    let _ = b_u8;
+}
+
+/// Lowers structural unions: `AdjustKind::UnionInject`, `AdjustKind::UnionWiden`,
+/// `UnionPat::Variant`, and `UnionPat::Residual`.
+#[test]
+fn structural_union_inject_widen_and_match_patterns() {
+    use blaze_typeck::{
+        Arm, BindAnn, IntSuffix, List, Lit, PNode, Pat, PatId, PortableTys, Range, ScopeId, Stmt, StmtId, UintTy,
+    };
+
+    let mut fx = Fx::new();
+    let u32_t = fx.u32();
+    let owner = fx.func("union_fn", 0, &[], u32_t, Vec::new());
+    fx.finish();
+
+    let mut body_tys = PortableTys::new_in(heap());
+    let b_u32 = body_tys.intern(PNode::Uint(UintTy::U32)).expect("u32");
+    let b_bool = body_tys.intern(PNode::Bool).expect("bool");
+    let b_u16 = body_tys.intern(PNode::Uint(UintTy::U16)).expect("u16");
+    let u2_l = body_tys.intern_list(&[b_u32, b_bool]).expect("u2");
+    let u2_ty = body_tys.intern(PNode::Union(u2_l)).expect("u32 | bool");
+    let u3_l = body_tys.intern_list(&[b_u32, b_bool, b_u16]).expect("u3");
+    let u3_ty = body_tys.intern(PNode::Union(u3_l)).expect("u32 | bool | u16");
+
+    let mk_bind = |name: &str, ty: Option<blaze_typeck::PTy>| Pat::Bind {
+        ann: BindAnn { by_ref: None, mutable: false },
+        name: Name::of(name),
+        sub: None,
+        ty,
+    };
+    let pats = [
+        mk_bind("u", None),          // 0
+        mk_bind("w", None),          // 1
+        mk_bind("n", Some(b_u32)),   // 2: Variant(0)
+        mk_bind("rest", None),       // 3: Residual (bool | u16)
+        mk_bind("b", Some(b_bool)),  // 4: Variant(0) on bool | u16
+        mk_bind("s", Some(b_u16)),   // 5: Variant(1) on bool | u16
+    ];
+    let mut pat_ranges = blaze_own::Vec::with_capacity_in(pats.len(), heap());
+    for i in 0..pats.len() {
+        let s = u32::try_from(i).unwrap_or(0);
+        pat_ranges.push(Range { start: s, end: s + 1 });
+    }
+
+    let exprs = [
+        Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U32)))),                // 0: 42u32 (UnionInject -> u2)
+        Expr::Local(PatId(0)),                                                  // 1: u (UnionWiden -> u3)
+        Expr::Local(PatId(1)),                                                  // 2: w
+        Expr::Local(PatId(2)),                                                  // 3: n
+        Expr::Local(PatId(3)),                                                  // 4: rest
+        Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U32)))),                // 5: 1u32
+        Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U32)))),                // 6: 2u32
+        Expr::Match { scrutinee: ExprId(4), arms: List { start: 0, len: 2 } },  // 7: match rest { b => 1, s => 2 }
+        Expr::Match { scrutinee: ExprId(2), arms: List { start: 2, len: 2 } },  // 8: match w { n => n, rest => ... }
+        Expr::Block { stmts: List { start: 0, len: 2 }, tail: Some(ExprId(8)), scope: ScopeId(0) }, // 9
+    ];
+    let mut expr_ranges = blaze_own::Vec::with_capacity_in(exprs.len(), heap());
+    for i in 0..exprs.len() {
+        let s = u32::try_from(i).unwrap_or(0);
+        expr_ranges.push(Range { start: s, end: s + 1 });
+    }
+    let arms = [
+        Arm { pat: PatId(4), guard: None, body: ExprId(5) },
+        Arm { pat: PatId(5), guard: None, body: ExprId(6) },
+        Arm { pat: PatId(2), guard: None, body: ExprId(3) },
+        Arm { pat: PatId(3), guard: None, body: ExprId(7) },
+    ];
+    let stmts = [
+        Stmt::Let { pat: PatId(0), ty: Some(u2_ty), init: Some(ExprId(0)), else_: None },
+        Stmt::Let { pat: PatId(1), ty: Some(u3_ty), init: Some(ExprId(1)), else_: None },
+    ];
+    let stmt_lists = [StmtId(0), StmtId(1)];
+    let call_arg_ints = [(ExprId(0), 42u128), (ExprId(5), 1u128), (ExprId(6), 2u128)];
+
+    let mut bv = empty_body_view(owner, body_tys.view(), ExprId(9));
+    bv.pats = &pats;
+    bv.pat_ranges = &pat_ranges;
+    bv.exprs = &exprs;
+    bv.expr_ranges = &expr_ranges;
+    bv.arms = &arms;
+    bv.stmts = &stmts;
+    bv.stmt_lists = &stmt_lists;
+    bv.call_arg_ints = &call_arg_ints;
+
+    let text = lowered_view(&fx, &bv);
+    assert!(text.contains("adt "), "union injection/widening/narrowing lowers via AggregateKind::Adt:\n{text}");
+    assert!(text.contains("discr "), "union widening and matching emit Value::Discriminant:\n{text}");
+    assert!(text.contains("#0.0"), "union downcast + payload field projection emitted:\n{text}");
+}

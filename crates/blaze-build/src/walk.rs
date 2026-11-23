@@ -5664,7 +5664,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             // constant pulled before the walk by front2 const_at.rs `needs_of`).
             Expr::Struct { fields, base: base @ (blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults), .. }
             | Expr::Record { fields, base: base @ (blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults) } => {
-                let defaults = base == blaze_typeck::StructBase::Defaults;
+                let defaults = base == blaze_typeck::StructBase::Defaults
+                    || !self.checked.default_fields_of(e).0.is_empty();
                 let is_record = matches!(self.expr(e)?, Expr::Record { .. });
                 let repr = self.expr_repr(e)?;
                 let inits = self.body.field_inits.get(fields.range()).ok_or(malformed("a struct literal's fields past `field_inits`"))?;

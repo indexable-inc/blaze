@@ -110,6 +110,7 @@ mod toolchain;
 mod units;
 mod work;
 mod check_command;
+mod inspect_command;
 mod engine_answer;
 mod engine_answer_rows;
 mod engine_check;
@@ -262,6 +263,8 @@ pub enum CliError {
     Peer(peer::PeerError),
     /// `run` or `test` could not start from the engine's answer (engine_start.rs).
     Start(engine_start::StartError),
+    /// `blaze inspect` failed (inspect_command.rs). Boxed in the process heap (`CliError`'s size).
+    Inspect(blaze_own::Box<blaze_ladder::front2::inspect::InspectError, blaze_own::Alloc<'static>>),
 }
 
 // THE ERROR IS SMALL: a debug build reserves a `Result<_, CliError>` and its `?` residual for
@@ -302,7 +305,7 @@ impl fmt::Display for CliError {
         match self {
             CliError::Usage(what) => write!(
                 f,
-                "usage: blaze check [dir] [--color=auto|always|never] [--view person|agent|json] [--each] [--workers N] [--status-every S], blaze <run|test> [dir] [--stats] [--workers N], blaze clean [dir] [--store], blaze gc [--max-gb N] [--dry-run] [--all-formats], blaze explain [status]: {what}"
+                "usage: blaze check [dir] [--color=auto|always|never] [--view person|agent|json] [--each] [--workers N] [--status-every S], blaze inspect <file.rs[::fn]> [--json] [--all-exprs] [--no-coercions] [--no-defaults], blaze <run|test> [dir] [--stats] [--workers N], blaze clean [dir] [--store], blaze gc [--max-gb N] [--dry-run] [--all-formats], blaze explain [status]: {what}"
             ),
             CliError::NotOnEngine { flag, why } => write!(f, "`blaze check {flag}`: the engine's check does not take {flag} yet ({why}; check_command.rs)"),
             CliError::NotBuilt { command } => write!(f, "`blaze {command}` is not built on the new item layer yet (drive.md)"),
@@ -340,6 +343,7 @@ impl fmt::Display for CliError {
             CliError::TestArgs => write!(f, "`blaze test`'s words after `--` were refused (the line above, test_args.rs)"),
             CliError::TestPool(error) => write!(f, "`blaze test`'s pool: {error}"),
             CliError::Start(error) => write!(f, "{error}"),
+            CliError::Inspect(error) => write!(f, "{error}"),
             CliError::RunLine(error) => write!(f, "{error}"),
             CliError::Peer(error) => write!(f, "{error}"),
         }
@@ -644,6 +648,7 @@ fn command(
         // (rule 30). `engine-check` is its old name, an alias until the scripts that type it
         // are moved.
         Some("check" | "engine-check") => check_command::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap, spawn_daemon),
+        Some("inspect") => inspect_command::run(cx, args, fs, out, err, heap),
         Some("why") => engine_check::why(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
         // Hidden: the edit path's forward wake over the stored answer, dry (D187; engine_dry.rs).
         Some("engine-dry") => engine_dry::run(cx, args, fs, env, host, rng, out, err, phases, heap, engine_dry::Mode::Dry),
@@ -680,7 +685,7 @@ fn command(
         Some("warm-toolchain") => engine_check::warm_toolchain(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
         Some("store") => store::publish_command::run(cx, args, fs, env, clock, host, rng, out, err, heap),
         Some("peer") => peer::run(cx, args, fs, env, net, clock, rng, out),
-        Some(_) | None => Err(CliError::Usage("the command is check, run, test, peer, clean, gc, warm-toolchain or explain")),
+        Some(_) | None => Err(CliError::Usage("the command is check, inspect, run, test, peer, clean, gc, warm-toolchain or explain")),
     }
 }
 

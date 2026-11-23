@@ -594,49 +594,47 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             self.fru_fields.push((e, idx, t));
                         }
                     }
-                } else if base == StructBase::Defaults {
-                    let n = self.ty.list_len(field_tys);
-                    let mut missing: Option<Name> = None;
-                    let mut unwritten: blaze_own::Vec<(u32, ItemKey), Alloc<'a>> = blaze_own::Vec::new_in(self.alloc);
-                    {
-                        let defaults = self.reads.field_defaults(schema.defaults_key())?;
-                        if let Some(names) = self.record_names(schema) {
-                            for (i, &nm) in names.iter().enumerate() {
-                                if inits.iter().any(|w| w.name == nm) {
-                                    continue;
-                                }
-                                match defaults.get(i).copied().flatten() {
-                                    Some(key) => {
-                                        if let Ok(idx) = u32::try_from(i) {
-                                            unwritten.push((idx, key));
-                                        }
-                                    }
-                                    None => {
-                                        if missing.is_none() {
-                                            missing = Some(nm);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(nm) = missing {
-                        self.diag(DiagCode::MissingFields, At::Expr(e), About::found_named(f.t, nm));
-                    } else {
-                        for (idx, key) in unwritten {
-                            if idx < n {
-                                let t = self.ty.list_get(field_tys, idx);
-                                self.fru_fields.push((e, idx, t));
-                                self.default_fields.push((e, idx, key));
-                            }
-                        }
-                    }
                 } else {
-                    let missing = self.record_names(schema).and_then(|names| {
-                        names.iter().copied().find(|&nm| !inits.iter().any(|i| i.name == nm))
+                    let has_omitted = self.record_names(schema).is_some_and(|names| {
+                        names.iter().any(|&nm| !inits.iter().any(|w| w.name == nm))
                     });
-                    if let Some(nm) = missing {
-                        self.diag(DiagCode::MissingFields, At::Expr(e), About::found_named(f.t, nm));
+                    if has_omitted {
+                        let n = self.ty.list_len(field_tys);
+                        let mut missing: Option<Name> = None;
+                        let mut unwritten: blaze_own::Vec<(u32, ItemKey), Alloc<'a>> = blaze_own::Vec::new_in(self.alloc);
+                        {
+                            let defaults = self.reads.field_defaults(schema.defaults_key())?;
+                            if let Some(names) = self.record_names(schema) {
+                                for (i, &nm) in names.iter().enumerate() {
+                                    if inits.iter().any(|w| w.name == nm) {
+                                        continue;
+                                    }
+                                    match defaults.get(i).copied().flatten() {
+                                        Some(key) => {
+                                            if let Ok(idx) = u32::try_from(i) {
+                                                unwritten.push((idx, key));
+                                            }
+                                        }
+                                        None => {
+                                            if missing.is_none() {
+                                                missing = Some(nm);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(nm) = missing {
+                            self.diag(DiagCode::MissingFields, At::Expr(e), About::found_named(f.t, nm));
+                        } else {
+                            for (idx, key) in unwritten {
+                                if idx < n {
+                                    let t = self.ty.list_get(field_tys, idx);
+                                    self.fru_fields.push((e, idx, t));
+                                    self.default_fields.push((e, idx, key));
+                                }
+                            }
+                        }
                     }
                 }
             }

@@ -2115,6 +2115,17 @@ pub struct Store<'n> {
     /// The needs a step met beside the one it stopped at (`trait_members`), taken by the
     /// next step of [`Store::ensure_noting`].
     more_needs: Vec<LibKey, Global>,
+    /// Resolved concrete return types (in `self.tys`) for functions whose written return
+    /// signature contained one or more `_` placeholders (`-> _`, `-> Option<_>`, `-> Result<T, _>`),
+    /// populated once each function's body has been checked.
+    pub inferred_outputs: HashMap<ItemKey, PTy, Alloc<'static>>,
+    /// Active worklist stack of functions whose return-type `_` placeholders are currently being
+    /// inferred (used to detect mutual recursion cycles without native recursion).
+    pub(crate) inferring_output_stack: blaze_own::Vec<ItemKey, Alloc<'static>>,
+    /// Next unresolved `_`-returning callee discovered while inferring a function on the worklist.
+    pub(crate) inferred_output_wanted: Option<ItemKey>,
+    /// Mutual recursion cycle `(caller, callee)` discovered while inferring `_`-returning functions.
+    pub(crate) inferred_output_cycle: Option<(ItemKey, ItemKey)>,
     /// How a trait's members' needs are met: the seam the cost test proves equal.
     pub needs: NeedsMet,
     /// A body task's frozen heads (front2 tables/seeds.rs): with one, every head
@@ -2491,6 +2502,10 @@ impl<'n> Store<'n> {
             trace: None,
             traced: None,
             more_needs: Vec::new_in(Global),
+            inferred_outputs: HashMap::new_in(alloc),
+            inferring_output_stack: blaze_own::Vec::new_in(alloc),
+            inferred_output_wanted: None,
+            inferred_output_cycle: None,
             seeds: None,
             seed_error: None,
             // `First` until `All` is proven on clap-root: under `All`, clap's `Cmd` was refused
@@ -2511,6 +2526,141 @@ impl<'n> Store<'n> {
     /// records carry it, form 9).
     pub fn member_frame(&self, ck: ItemKey) -> Option<&MemberFrame> {
         self.member_frames.get(&ck)
+    }
+
+    /// The resolved return type of `key` in `self.tys`: for a function whose signature wrote `_`
+    /// (`-> _`, `-> Option<_>`, `-> Result<T, _>`) and whose body has been checked, the concrete
+    /// inferred return type; otherwise the head's written `output`.
+    pub fn fn_output(&self, key: ItemKey) -> Option<PTy> {
+        if let Some(&out) = self.inferred_outputs.get(&key) {
+            return Some(out);
+        }
+        self.fns.get(&key).map(|f| f.output)
+    }
+
+    /// The concrete inferred return type (in `self.tys`) for a function whose return signature
+    /// contained `_`, once its body has been checked (for callers and `blaze inspect` inlay hints).
+    pub fn inferred_return_type(&self, key: ItemKey) -> Option<PTy> {
+        self.inferred_outputs.get(&key).copied()
+    }
+
+    /// The inferred error type (in `self.tys`) for a `Result<T, _>` function, once its
+    /// body has been checked (for `blaze inspect` inlay hints).
+    pub fn inferred_error_set(&self, key: ItemKey) -> Option<PTy> {
+        let out = self.inferred_outputs.get(&key).copied()?;
+        let view = self.tys.view();
+        match view.node(out).ok()? {
+            PNode::Adt(_, args) | PNode::Union(args) => {
+                let list = view.list(args).ok()?;
+                (list.len() == 2).then_some(list[1])
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `key` has a return-type `_` placeholder whose concrete type has not been inferred yet.
+    pub fn has_unresolved_inferred_output(&self, key: ItemKey) -> bool {
+        if self.inferred_outputs.contains_key(&key) {
+            return false;
+        }
+        self.fns.get(&key).is_some_and(|f| has_infer_hole(self.tys.view(), f.output, self.tys.alloc()))
+    }
+
+    /// Copies a checked body's finalized return type `root` from `from` into `self.tys` and
+    /// records it under `owner` in `self.inferred_outputs`. Returns `None` if `root` cannot be
+    /// copied cleanly (unresolved hole/error type or full table).
+    pub(crate) fn file_inferred_output(&mut self, owner: ItemKey, from: tc::PTys<'_>, root: PTy) -> Option<PTy> {
+        let alloc = self.tys.alloc();
+        let n = from.len();
+        let mut seen: blaze_own::Vec<bool, Alloc<'static>> = blaze_own::Vec::with_capacity_in(n, alloc);
+        seen.resize(n, false);
+        let mut work: blaze_own::Vec<PTy, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        work.push(root);
+        let mut steps = 0u32;
+        while let Some(t) = work.pop() {
+            steps += 1;
+            if steps > 1 << 16 {
+                return None;
+            }
+            let at = usize::try_from(t.0).ok()?;
+            let slot = seen.get_mut(at)?;
+            if *slot {
+                continue;
+            }
+            *slot = true;
+            let node = from.node(t).ok()?;
+            from.children_of(node, &mut work).ok()?;
+        }
+        let mut mapped: blaze_own::Vec<Option<PTy>, Alloc<'static>> = blaze_own::Vec::with_capacity_in(n, alloc);
+        mapped.resize(n, None);
+        let mut kids: blaze_own::Vec<PTy, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        for i in 0..n {
+            if !seen.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let idx = u32::try_from(i).ok()?;
+            let node = from.node(PTy(idx)).ok()?;
+            let m = |c: PTy, mapped: &[Option<PTy>]| -> Option<PTy> {
+                usize::try_from(c.0)
+                    .ok()
+                    .and_then(|at| mapped.get(at).copied().flatten())
+            };
+            let mut l = |list: List, mapped: &[Option<PTy>], out: &mut PortableTys<'static>| -> Option<List> {
+                kids.clear();
+                for &c in from.list(list).ok()? {
+                    kids.push(m(c, mapped)?);
+                }
+                out.intern_list(&kids).ok()
+            };
+            let copied = match node {
+                PNode::Infer | PNode::Error | PNode::Future(..) => return None,
+                p @ (PNode::Bool
+                | PNode::Char
+                | PNode::Int(_)
+                | PNode::Uint(_)
+                | PNode::Float(_)
+                | PNode::Str
+                | PNode::Never
+                | PNode::Param(_)
+                | PNode::ConstParam(_)
+                | PNode::ExAuto(_)
+                | PNode::Foreign(_)) => p,
+                PNode::ConstValue { ty, bits } => PNode::ConstValue { ty: m(ty, &mapped)?, bits },
+                PNode::Tuple(a) => PNode::Tuple(l(a, &mapped, &mut self.tys)?),
+                PNode::Record(s, a) => {
+                    if let Some(names) = from.record_names(s) {
+                        self.tys.register_record_schema(s, names).ok()?;
+                    }
+                    PNode::Record(s, l(a, &mapped, &mut self.tys)?)
+                }
+                PNode::Union(a) => PNode::Union(l(a, &mapped, &mut self.tys)?),
+                PNode::Ref(mu, a) => PNode::Ref(mu, m(a, &mapped)?),
+                PNode::Ptr(mu, a) => PNode::Ptr(mu, m(a, &mapped)?),
+                PNode::Array(a, len) => PNode::Array(m(a, &mapped)?, m(len, &mapped)?),
+                PNode::Slice(a) => PNode::Slice(m(a, &mapped)?),
+                PNode::Pat(a, r) => PNode::Pat(m(a, &mapped)?, l(r, &mapped, &mut self.tys)?),
+                PNode::Adt(k, a) => PNode::Adt(k, l(a, &mapped, &mut self.tys)?),
+                PNode::FnDef(k, a) => PNode::FnDef(k, l(a, &mapped, &mut self.tys)?),
+                PNode::FnPtr(a, h) => PNode::FnPtr(l(a, &mapped, &mut self.tys)?, h),
+                PNode::Closure { owner: o, ordinal, args } => PNode::Closure { owner: o, ordinal, args: l(args, &mapped, &mut self.tys)? },
+                PNode::Coroutine { owner: o, ordinal, args } => PNode::Coroutine { owner: o, ordinal, args: l(args, &mapped, &mut self.tys)? },
+                PNode::Alias { trait_, name, args } => PNode::Alias { trait_, name, args: l(args, &mapped, &mut self.tys)? },
+                PNode::Opaque(k, a) => PNode::Opaque(k, l(a, &mapped, &mut self.tys)?),
+                PNode::Dynamic(a) => PNode::Dynamic(l(a, &mapped, &mut self.tys)?),
+                PNode::ExTrait(k, a) => PNode::ExTrait(k, l(a, &mapped, &mut self.tys)?),
+                PNode::ExProj { trait_, name, args, term } => {
+                    PNode::ExProj { trait_, name, args: l(args, &mapped, &mut self.tys)?, term: m(term, &mapped)? }
+                }
+            };
+            if let Some(slot) = mapped.get_mut(i) {
+                *slot = Some(self.tys.intern(copied).ok()?);
+            }
+        }
+        let copied = usize::try_from(root.0)
+            .ok()
+            .and_then(|at| mapped.get(at).copied().flatten())?;
+        self.inferred_outputs.insert(owner, copied);
+        Some(copied)
     }
 
     /// What a [`Why::Need`] of `k` asks for: its head, or, for a trait whose head is made,
@@ -4853,6 +5003,9 @@ impl<'n> Store<'n> {
             return Err(Why::Unsupported("`...` on a fn of an ABI other than \"C\" or \"system\" (the Reference, [items.extern.variadic.conventions])", whole));
         }
         let has_body = flags & sig::HAS_BODY != 0;
+        if !has_body && has_infer_hole(self.tys.view(), written, alloc) {
+            return Err(Why::Program("inferred return/error type `_` requires a function body".into(), whole));
+        }
         let mut preds = Preds::new_in(fn_scope.clone_in(alloc));
         preds.inherit(inherited);
         if says_misses {
@@ -4988,6 +5141,27 @@ impl<'n> Store<'n> {
         self.fns.insert(key, FnHead { lib, text, text_prefix, container, parent, own, declared, self_param, header, c_variadic, qualifiers, legacy_const_generics, inputs, output, has_body, module, params: ps, consts: cs, bounds, self_, self_assoc });
         Ok(())
     }
+}
+
+/// Whether any type node reachable from `root` in `tys` is `PNode::Infer` (`_`).
+pub(crate) fn has_infer_hole(tys: tc::PTys<'_>, root: PTy, alloc: Alloc<'_>) -> bool {
+    let mut work: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+    work.push(root);
+    let mut steps = 0u32;
+    while let Some(t) = work.pop() {
+        steps += 1;
+        if steps > 1 << 16 {
+            return false;
+        }
+        let Ok(node) = tys.node(t) else { return false };
+        if matches!(node, PNode::Infer) {
+            return true;
+        }
+        if tys.children_of(node, &mut work).is_err() {
+            return false;
+        }
+    }
+    false
 }
 
 /// A fn head's regions as the walk lays them (D148, piece L1a): numbering by declaration,
@@ -5660,7 +5834,6 @@ pub struct B;
         let rec_ab_ty = lower_param_ty(&mut store, "pub fn f(x: { a: i32, b: u8 });");
         let rec_xy_ty = lower_param_ty(&mut store, "pub fn f(x: { x: i32, y: u8 });");
         let uni_ty = lower_param_ty(&mut store, "pub fn f(x: A | (B | A));");
-        let fall_ty = lower_param_ty(&mut store, "pub fn f(x: i32 ! u8);");
 
         let tys = store.tys.view();
         assert_eq!(rec_ba_ty, rec_ab_ty, "`{{ b: u8, a: i32 }}` and `{{ a: i32, b: u8 }}` must lower to identical PTy");
@@ -5693,44 +5866,5 @@ pub struct B;
         assert!(matches!(tys.node(members[0]), Ok(PNode::Adt(k, _)) if k == a_key));
         assert!(matches!(tys.node(members[1]), Ok(PNode::Adt(k, _)) if k == b_key));
         assert_eq!(buckets::shape_of(tys, uni_ty), Some(Shape::Union(2)));
-
-        // 4. `i32 ! u8` without `Result` in scope lowers to `PNode::Union([i32, u8])` (NEVER `PNode::Tuple`).
-        let fall_node = tys.node(fall_ty).expect("fallible node");
-        assert!(!matches!(fall_node, PNode::Tuple(_)), "`T ! E` must NEVER lower to PNode::Tuple");
-        let PNode::Union(fall_members) = fall_node else {
-            panic!("expected PNode::Union when no Result ADT in scope, got {fall_node:?}");
-        };
-        let fl = tys.list(fall_members).expect("fallible members");
-        assert_eq!(fl.len(), 2);
-        assert_eq!(tys.node(fl[0]).expect("ok"), PNode::Int(IntTy::I32));
-        assert_eq!(tys.node(fl[1]).expect("err"), PNode::Uint(UintTy::U8));
-
-        // 5. `i32 ! u8` WITH `enum Result<T, E>` in scope lowers to `PNode::Adt(Result, [i32, u8])`.
-        const WITH_RESULT: &str = "
-pub enum Result<T, E> { Ok(T), Err(E) }
-";
-        let (r_names, r_sized, r_frame) = world_of(WITH_RESULT);
-        let mut r_store = Store::new(r_sized, r_frame, a());
-        let mut r_keys = Keys::new();
-        let res_lib = item(r_names, "Result");
-        r_store.ensure(r_names, &mut r_keys, Want::Adt(res_lib)).expect("ensure Result");
-        let r_root = NamesSource::root_module(r_names, 0).expect("r root");
-        let r_env = Env { module: r_root, ..env };
-        let low = blaze_lower::lower_signature_with_extensions("pub fn f(x: i32 ! u8);", blaze_scope::Edition::E2024, exts, &mut NoCfg, alloc)
-            .expect("lower fallible with Result");
-        let rv = low.view();
-        let rp = lf::Param::decode(rv.rows(rv.list(head::PARAMS)).expect("params")[0]).expect("param");
-        let rb = Builder { resolver: Paths { names: r_names }, heads: &r_store.maps, marks: None };
-        let r_ty = rb.ty(&mut r_store.tys, &r_env, &rv, rp.ty.expect("param ty")).expect("Builder::ty with Result");
-        let r_tys = r_store.tys.view();
-        let result_key = checker_of(res_lib);
-        let PNode::Adt(adt_k, adt_args) = r_tys.node(r_ty).expect("fallible_with_result node") else {
-            panic!("expected PNode::Adt(Result, [i32, u8]), got {:?}", r_tys.node(r_ty));
-        };
-        assert_eq!(adt_k, result_key);
-        let r_args = r_tys.list(adt_args).expect("result args");
-        assert_eq!(r_args.len(), 2);
-        assert_eq!(r_tys.node(r_args[0]).expect("ok"), PNode::Int(IntTy::I32));
-        assert_eq!(r_tys.node(r_args[1]).expect("err"), PNode::Uint(UintTy::U8));
     }
 }

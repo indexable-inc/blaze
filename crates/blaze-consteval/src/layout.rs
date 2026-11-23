@@ -147,6 +147,17 @@ impl Tag {
             }
         }
     }
+
+    /// The variant when the tag slot holds a non-null pointer with provenance (only a single
+    /// variant or a null-pointer niche `start == 0 && first == last` is certain without knowing
+    /// the address).
+    pub fn ptr_variant(&self) -> Option<u32> {
+        match self.decode {
+            Decode::Single(v) => Some(v),
+            Decode::Niche { untagged, first, last, start: 0, .. } if first == last => Some(untagged),
+            _ => None,
+        }
+    }
 }
 
 /// How a tag's bits name a variant (blaze-build's `TagEncoding`, its mask resolved).

@@ -420,6 +420,9 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
                 return Err(said(r, owner, diags, alloc));
             }
             Outcome::Done(done) if !round_gaps => {
+                if let Some(inferred_out) = done.inferred_output {
+                    let _ = r.store.file_inferred_output(owner, done.types.view(), inferred_out);
+                }
                 // The shared goals the finished round took (blaze-solve share.rs `GoalHit`): the
                 // one read each, which the body's result names (tables/task.rs).
                 let mut hits = Vec::with_capacity_in(cx.goal_hits().len(), Global);
@@ -429,6 +432,14 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             }
             // A gap answered `Missing`, so a finished check past one is no answer.
             Outcome::Done(done) => {
+                if !r.store.inferring_output_stack.is_empty() {
+                    for g in all_gaps.iter() {
+                        if let Gap::InferredOutputCycle { owner: a, callee: b } = *g {
+                            r.store.inferred_output_cycle = Some((a, b));
+                            break;
+                        }
+                    }
+                }
                 if let Some(asked) = asked.as_deref_mut() {
                     asked.finished = Some(done.reads.clone());
                 }
@@ -445,6 +456,14 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             asked.questions.extend_from_slice(&needs.questions);
         }
         if fills.is_empty() && !all_gaps.is_empty() {
+            if !r.store.inferring_output_stack.is_empty() {
+                for g in all_gaps.iter() {
+                    if let Gap::InferredOutputCycle { owner: a, callee: b } = *g {
+                        r.store.inferred_output_cycle = Some((a, b));
+                        break;
+                    }
+                }
+            }
             return Err(CheckFail::Gap { owner, gaps: all_gaps });
         }
         // A question that met more than `MOST_IMPORTS_A_QUESTION` heads stands `Missing` with
@@ -458,11 +477,42 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             questions.extend_from_slice(&needs.questions);
             return Err(CheckFail::NothingToFill { owner, questions });
         }
-        let filling = fills.len() as u64;
+        let mut inferred_targets: blaze_own::Vec<ItemKey, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        fills.retain(|fill| match *fill {
+            Fill::InferredOutput(target) => {
+                if inferred_targets.scan_for(&target).is_none() {
+                    inferred_targets.push(target);
+                }
+                false
+            }
+            _ => true,
+        });
+        if !inferred_targets.is_empty() && !r.store.inferring_output_stack.is_empty() {
+            r.store.inferred_output_wanted = inferred_targets.first().copied();
+            return Err(CheckFail::Gap { owner, gaps: all_gaps });
+        }
+        let filling = u64::try_from(fills.len() + inferred_targets.len()).unwrap_or(u64::MAX);
         // Under the one ask over frozen heads the run stopped at its first hole
         // (`World::stops_at_holes`, world_items.rs): no fill is speculative, so every one is
         // made and a refusal is the body's (`make_all`), never dropped as `make_round` drops one.
-        let dropped = if stops_at_holes { make_all(r, fills, owner).map(|()| 0)? } else { make_round(r, fills, owner)? };
+        let dropped = if fills.is_empty() {
+            0
+        } else if stops_at_holes {
+            make_all(r, fills, owner).map(|()| 0)?
+        } else {
+            make_round(r, fills, owner)?
+        };
+        if !inferred_targets.is_empty()
+            && let Err(fail) = resolve_inferred_outputs(r, owner, &inferred_targets)
+        {
+            return match fail {
+                InferredErr::Gap(g) => {
+                    all_gaps.push(g);
+                    Err(CheckFail::Gap { owner, gaps: all_gaps })
+                }
+                InferredErr::Fail(e) => Err(e),
+            };
+        }
         made += filling - dropped;
         if let Some((tally, _)) = &mut count {
             tally.dropped += dropped;
@@ -2062,7 +2112,95 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
                 Made::Later(never) => match never {},
             }
         }
+        Fill::InferredOutput(_) => Ok(()),
     }
+}
+
+enum InferredErr {
+    Gap(Gap),
+    Fail(CheckFail),
+}
+
+/// Resolves one or more `_`-returning callees (`targets`) in demand order using an explicit
+/// iterative worklist (zero recursion) and detects mutual recursion cycles cleanly.
+fn resolve_inferred_outputs<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    caller: ItemKey,
+    targets: &[ItemKey],
+) -> Result<(), InferredErr> {
+    const MOST_INFER_OUTPUTS: u32 = 256;
+    let alloc = r.store.tys.alloc();
+    let base_caller = r.store.has_unresolved_inferred_output(caller).then_some(caller);
+    let mut stack: blaze_own::Vec<ItemKey, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+    for &t in targets.iter().rev() {
+        if stack.scan_for(&t).is_none() {
+            stack.push(t);
+        }
+    }
+    let result = (|| -> Result<(), InferredErr> {
+        for _ in 0..MOST_INFER_OUTPUTS {
+            let Some(&cur) = stack.last() else { return Ok(()) };
+            if !r.store.has_unresolved_inferred_output(cur) {
+                stack.pop();
+                continue;
+            }
+            r.store.inferring_output_stack.clear();
+            if let Some(bc) = base_caller {
+                r.store.inferring_output_stack.push(bc);
+            }
+            r.store.inferring_output_stack.extend_from_slice(&stack);
+            r.store.inferred_output_wanted = None;
+            r.store.inferred_output_cycle = None;
+            let Some(prepared) = r.consts.as_ref().map(|c| c.1) else {
+                return Err(InferredErr::Gap(Gap::BodyRecord(tc::Question::FnSig(cur))));
+            };
+            let target = match r.keys.library_in(r.names, cur) {
+                Some(lib) => super::lower_made::LowerTarget::Free(lib),
+                None => super::lower_made::LowerTarget::Member(cur),
+            };
+            let lowered = match super::lower_made::lower_made(r, prepared, target) {
+                Ok(l) => l,
+                Err(_) => {
+                    return Err(InferredErr::Gap(Gap::InferredOutputFailed { item: cur, why: "body could not be lowered" }));
+                }
+            };
+            let view = lowered.lowered.view();
+            let spell = match Spelling::of(&view) {
+                Ok(s) => s,
+                Err(_) => {
+                    return Err(InferredErr::Gap(Gap::InferredOutputFailed { item: cur, why: "body names could not be spelled" }));
+                }
+            };
+            let scope = lowered.scope(&spell);
+            match check_rounds_as(r, &lowered, &scope, None, None, super::stalled_goals::Stalls::Gap, None) {
+                Ok(_done) => {
+                    if r.store.has_unresolved_inferred_output(cur) {
+                        return Err(InferredErr::Gap(Gap::InferredOutputFailed { item: cur, why: "body check did not finalize return type" }));
+                    }
+                    stack.pop();
+                }
+                Err(fail) => {
+                    if let Some((a, b)) = r.store.inferred_output_cycle.take() {
+                        return Err(InferredErr::Gap(Gap::InferredOutputCycle { owner: a, callee: b }));
+                    }
+                    if let Some(next) = r.store.inferred_output_wanted.take() {
+                        if base_caller == Some(next) || stack.scan_for(&next).is_some() {
+                            return Err(InferredErr::Gap(Gap::InferredOutputCycle { owner: cur, callee: next }));
+                        }
+                        stack.push(next);
+                        continue;
+                    }
+                    return Err(InferredErr::Fail(fail));
+                }
+            }
+        }
+        let cur = stack.last().copied().unwrap_or(caller);
+        Err(InferredErr::Gap(Gap::InferredOutputCycle { owner: caller, callee: cur }))
+    })();
+    r.store.inferring_output_stack.clear();
+    r.store.inferred_output_wanted = None;
+    r.store.inferred_output_cycle = None;
+    result
 }
 
 /// What making a head, or answering an impl question, came to: made, or left to a later
