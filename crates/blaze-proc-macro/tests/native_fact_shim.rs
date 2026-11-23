@@ -119,6 +119,7 @@ fn run_once(name: &str, pins: Option<&FactPins>) -> Run {
         host_tools: &[],
         facts: Some(&facts),
         jobs: None,
+        confined: None,
         limits: RunLimits::STANDARD,
         deadline: Duration::from_secs(60),
         files: &files,

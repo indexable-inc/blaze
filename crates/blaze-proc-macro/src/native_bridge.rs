@@ -1125,7 +1125,7 @@ pub fn run_native_build_script(
     .map_err(|e| NativeBridgeError::Failed(format!("hermetic spec refused: {:?}", e.fault)))?;
 
     let hermetic = Hermetic::new(HermeticCapOpts { spawner, clock });
-    let files = OutDir { root: output_id, folder: out_str };
+    let files = OutDir { root: output_id, folder: out_str, package_root: None };
     let ran = hermetic
         .run(&cx, &spec, &files, alloc)
         .map_err(|e| NativeBridgeError::Failed(format!("hermetic run failed: {:?}", e.fault)))?;
