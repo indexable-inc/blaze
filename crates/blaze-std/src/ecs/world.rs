@@ -5,15 +5,21 @@ use core::alloc::Allocator;
 use core::any::TypeId;
 use core::fmt::Write as _;
 
-use blaze_own::{String as OwnString, Vec as OwnVec};
+use blaze_own::{AllocFailure, String as OwnString, Vec as OwnVec};
 
-use super::column::{ComponentMeta, downcast_typed_mut, make_column_copy, make_column_plain};
+use crate::data::{Int, Map, Value};
+
+use super::column::{
+    AnyColumn, ComponentMeta, downcast_typed_mut, enable_copy_any, enable_reflect_any,
+    make_column_plain, validate_reflected_value,
+};
 use super::error::EcsError;
 use super::fetch::{QueryFetch, TypedQuery};
 use super::id::{Builtins, ComponentId, Entity, Id, TableId, u32_to_usize, usize_to_u32};
 use super::map::{FlatMap, FlatSet};
 use super::observer::{DEFAULT_OBSERVER_CAP, Event, EventKind, Observer, ObserverCallback, ObserverId};
 use super::query::{CachedQuery, QuerySpec};
+use super::reflect::{ReflectComponent, ReflectError};
 use super::table::{ArchetypeKey, Table, move_row_between_tables};
 use super::typed::{
     Bundle, ChildOf, EntityMut, IsA, MAX_PREFAB_DEPTH, Prefab, PrefabInit, Relation,
@@ -238,6 +244,56 @@ impl<A: Allocator + Copy + 'static> World<A> {
         self.register_copy_component::<T>(short_type_name::<T>())
     }
 
+    /// Register a live-reflected component type `T` using its auto-shortened Rust type name.
+    #[inline]
+    pub fn register_reflected<T: ReflectComponent + 'static>(
+        &mut self,
+    ) -> Result<ComponentId, EcsError> {
+        self.register_reflected_named::<T>(short_type_name::<T>())
+    }
+
+    /// Register a live-reflected component type `T` under an explicit `name`.
+    pub fn register_reflected_named<T: ReflectComponent + 'static>(
+        &mut self,
+        name: &str,
+    ) -> Result<ComponentId, EcsError> {
+        self.register_component_inner::<T>(
+            name,
+            None,
+            None,
+            Some(enable_reflect_any::<T, A>),
+            false,
+            true,
+            Some(T::schema::<A>),
+            Some(validate_reflected_value::<T, A>),
+        )
+    }
+
+    /// Register a live-reflected `Copy` component type `T` using its auto-shortened Rust type name.
+    #[inline]
+    pub fn register_reflected_copy<T: ReflectComponent + Copy + 'static>(
+        &mut self,
+    ) -> Result<ComponentId, EcsError> {
+        self.register_reflected_copy_named::<T>(short_type_name::<T>())
+    }
+
+    /// Register a live-reflected `Copy` component type `T` under an explicit `name`.
+    pub fn register_reflected_copy_named<T: ReflectComponent + Copy + 'static>(
+        &mut self,
+        name: &str,
+    ) -> Result<ComponentId, EcsError> {
+        self.register_component_inner::<T>(
+            name,
+            None,
+            Some(enable_copy_any::<T, A>),
+            Some(enable_reflect_any::<T, A>),
+            true,
+            true,
+            Some(T::schema::<A>),
+            Some(validate_reflected_value::<T, A>),
+        )
+    }
+
     /// Return the [`ComponentId`] for `T`, lazily registering `T` under [`short_type_name::<T>()`]
     /// if not yet registered.
     pub fn component<T: 'static>(&mut self) -> Result<ComponentId, EcsError> {
@@ -249,7 +305,7 @@ impl<A: Allocator + Copy + 'static> World<A> {
 
     /// Return the [`ComponentId`] for `Copy` type `T`, lazily registering `T` as copyable under
     /// [`short_type_name::<T>()`] if not yet registered (and upgrading existing non-copyable
-    /// metadata/columns so prefab instantiation copies `T` seamlessly).
+    /// metadata/columns so prefab instantiation copies `T` seamlessly without losing reflection).
     pub fn component_copy<T: Copy + 'static>(&mut self) -> Result<ComponentId, EcsError> {
         if let Some(cid) = self.component_id::<T>() {
             let needs_upgrade = self
@@ -258,7 +314,7 @@ impl<A: Allocator + Copy + 'static> World<A> {
                 .is_some_and(|meta| !meta.can_copy);
             if needs_upgrade {
                 if let Some(meta) = self.components.get_mut(u32_to_usize(cid.0)) {
-                    meta.make_column = make_column_copy::<T, A>;
+                    meta.enable_copy_col = Some(enable_copy_any::<T, A>);
                     meta.can_copy = true;
                 }
                 for table in self.tables.as_mut_slice() {
@@ -275,9 +331,50 @@ impl<A: Allocator + Copy + 'static> World<A> {
         self.register_copy_component::<T>(short_type_name::<T>())
     }
 
+    /// Return the [`ComponentId`] for reflected type `T`, lazily registering or upgrading `T` with
+    /// live reflection enabled.
+    pub fn component_reflected<T: ReflectComponent + 'static>(
+        &mut self,
+    ) -> Result<ComponentId, EcsError> {
+        if let Some(cid) = self.component_id::<T>() {
+            let needs_upgrade = self
+                .components
+                .get(u32_to_usize(cid.0))
+                .is_some_and(|meta| !meta.reflected);
+            if needs_upgrade {
+                if let Some(meta) = self.components.get_mut(u32_to_usize(cid.0)) {
+                    meta.enable_reflect_col = Some(enable_reflect_any::<T, A>);
+                    meta.reflected = true;
+                    meta.schema_fn = Some(T::schema::<A>);
+                    meta.validate_value_fn = Some(validate_reflected_value::<T, A>);
+                }
+                for table in self.tables.as_mut_slice() {
+                    if let Some(idx) = table.column_index(cid) {
+                        if let Some(entry) = table.columns.get_mut(idx) {
+                            let typed = downcast_typed_mut::<T, A>(entry.col.as_mut(), cid)?;
+                            typed.enable_reflect();
+                        }
+                    }
+                }
+            }
+            return Ok(cid);
+        }
+        self.register_reflected::<T>()
+    }
+
+    /// Return the [`ComponentId`] for reflected `Copy` type `T`, lazily registering or upgrading
+    /// `T` with both copyability and live reflection enabled.
+    pub fn component_reflected_copy<T: ReflectComponent + Copy + 'static>(
+        &mut self,
+    ) -> Result<ComponentId, EcsError> {
+        let cid = self.component_reflected::<T>()?;
+        let _ = self.component_copy::<T>()?;
+        Ok(cid)
+    }
+
     /// Register a non-copyable component type `T`.
     pub fn register_component<T: 'static>(&mut self, name: &str) -> Result<ComponentId, EcsError> {
-        self.register_component_inner::<T>(name, None, make_column_plain::<T, A>, false)
+        self.register_component_inner::<T>(name, None, None, None, false, false, None, None)
     }
 
     /// Register a non-copyable component type `T` with an optional Blaze record schema ID hook.
@@ -286,7 +383,16 @@ impl<A: Allocator + Copy + 'static> World<A> {
         name: &str,
         schema_id: u64,
     ) -> Result<ComponentId, EcsError> {
-        self.register_component_inner::<T>(name, Some(schema_id), make_column_plain::<T, A>, false)
+        self.register_component_inner::<T>(
+            name,
+            Some(schema_id),
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+        )
     }
 
     /// Register a `Copy` component type `T` (enables value duplication during `instantiate`).
@@ -294,7 +400,16 @@ impl<A: Allocator + Copy + 'static> World<A> {
         &mut self,
         name: &str,
     ) -> Result<ComponentId, EcsError> {
-        self.register_component_inner::<T>(name, None, make_column_copy::<T, A>, true)
+        self.register_component_inner::<T>(
+            name,
+            None,
+            Some(enable_copy_any::<T, A>),
+            None,
+            true,
+            false,
+            None,
+            None,
+        )
     }
 
     /// Register a `Copy` component type `T` with an optional Blaze record schema ID hook.
@@ -303,15 +418,29 @@ impl<A: Allocator + Copy + 'static> World<A> {
         name: &str,
         schema_id: u64,
     ) -> Result<ComponentId, EcsError> {
-        self.register_component_inner::<T>(name, Some(schema_id), make_column_copy::<T, A>, true)
+        self.register_component_inner::<T>(
+            name,
+            Some(schema_id),
+            Some(enable_copy_any::<T, A>),
+            None,
+            true,
+            false,
+            None,
+            None,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_component_inner<T: 'static>(
         &mut self,
         name: &str,
         schema_id: Option<u64>,
-        make_column: fn(A) -> blaze_own::Box<dyn super::column::AnyColumn<A>, A>,
+        enable_copy_col: Option<fn(&mut dyn AnyColumn<A>)>,
+        enable_reflect_col: Option<fn(&mut dyn AnyColumn<A>)>,
         can_copy: bool,
+        reflected: bool,
+        schema_fn: Option<fn(A) -> Result<Value<A>, AllocFailure>>,
+        validate_value_fn: Option<fn(&Value<A>, A) -> Result<(), ReflectError>>,
     ) -> Result<ComponentId, EcsError> {
         let tid = TypeId::of::<T>();
         if let Some(&existing) = self.component_by_type.get(&tid) {
@@ -325,9 +454,15 @@ impl<A: Allocator + Copy + 'static> World<A> {
                 id: cid,
                 name: owned_name,
                 type_id: tid,
+                size: core::mem::size_of::<T>(),
                 schema_id,
-                make_column,
+                make_column: make_column_plain::<T, A>,
+                enable_copy_col,
+                enable_reflect_col,
                 can_copy,
+                reflected,
+                schema_fn,
+                validate_value_fn,
             })
             .map_err(|r| EcsError::Alloc(r.why))?;
         let _ = self.component_by_type.insert(tid, cid)?;
@@ -340,10 +475,33 @@ impl<A: Allocator + Copy + 'static> World<A> {
         self.component_by_type.get(&TypeId::of::<T>()).copied()
     }
 
+    /// Look up a registered [`ComponentId`] by its human-readable component name.
+    pub fn component_id_by_name(&self, name: &str) -> Option<ComponentId> {
+        for meta in self.components.as_slice() {
+            if meta.name() == name {
+                return Some(meta.id);
+            }
+        }
+        None
+    }
+
     /// Inspect metadata for a registered [`ComponentId`].
     #[inline]
     pub fn component_meta(&self, cid: ComponentId) -> Option<&ComponentMeta<A>> {
         self.components.get(u32_to_usize(cid.0))
+    }
+
+    /// Read-only slice of all registered component metadata entries.
+    #[inline]
+    pub fn components(&self) -> &[ComponentMeta<A>] {
+        self.components.as_slice()
+    }
+
+    /// Look up the currently live [`Entity`] occupying `slot`, if any.
+    #[inline]
+    pub fn entity_by_slot(&self, slot: u32) -> Option<Entity> {
+        let entry = self.slots.get(u32_to_usize(slot))?;
+        if entry.alive { Some(Entity::from_parts(slot, entry.generation)) } else { None }
     }
 
     // -------------------------------------------------------------------------
@@ -804,6 +962,30 @@ impl<A: Allocator + Copy + 'static> World<A> {
     ) -> Result<(), EcsError> {
         let _ = self.live_slot(entity)?;
         let cid = self.component_copy::<T>()?;
+        self.set_by_id(entity, cid, value)
+    }
+
+    /// Set (insert or overwrite) reflected component `T` on `entity`, lazily registering `T` with
+    /// live reflection enabled.
+    pub fn set_reflected<T: ReflectComponent + 'static>(
+        &mut self,
+        entity: Entity,
+        value: T,
+    ) -> Result<(), EcsError> {
+        let _ = self.live_slot(entity)?;
+        let cid = self.component_reflected::<T>()?;
+        self.set_by_id(entity, cid, value)
+    }
+
+    /// Set (insert or overwrite) reflected `Copy` component `T` on `entity`, lazily registering `T`
+    /// with both copyability and live reflection enabled.
+    pub fn set_reflected_copy<T: ReflectComponent + Copy + 'static>(
+        &mut self,
+        entity: Entity,
+        value: T,
+    ) -> Result<(), EcsError> {
+        let _ = self.live_slot(entity)?;
+        let cid = self.component_reflected_copy::<T>()?;
         self.set_by_id(entity, cid, value)
     }
 
@@ -1835,6 +2017,385 @@ impl<A: Allocator + Copy + 'static> World<A> {
             let dst = left.get_mut(dst_idx).ok_or(EcsError::InvalidTable(dst_tid))?;
             let src = right.get_mut(0).ok_or(EcsError::InvalidTable(src_tid))?;
             move_row_between_tables(src, src_row, dst)
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Live Reflection, Inspection, Patching & World Snapshots (`bstd::data::Value`)
+    // -------------------------------------------------------------------------
+
+    /// Inspect component `comp` on live `entity` as a [`Value`].
+    ///
+    /// Returns `Ok(None)` if `entity` does not possess `comp`, `Err(ReflectError::NotReflected)`
+    /// if `entity` owns `comp` but `comp` was registered without reflection, or `Ok(Some(value))`.
+    pub fn inspect_component_value(
+        &self,
+        entity: Entity,
+        comp: ComponentId,
+        alloc: A,
+    ) -> Result<Option<Value<A>>, ReflectError> {
+        let slot = self.live_slot(entity).map_err(|_| ReflectError::EntityNotFound(entity))?;
+        let meta = self
+            .component_meta(comp)
+            .ok_or(ReflectError::Ecs(EcsError::UnknownComponent(comp)))?;
+        let table = self.table(slot.table_id)?;
+        if !table.has_id(Id::Component(comp)) {
+            return Ok(None);
+        }
+        if !meta.reflected {
+            return Err(ReflectError::NotReflected(comp));
+        }
+        table.row_to_value(comp, slot.row, alloc)
+    }
+
+    /// Patch an existing reflected component `comp` on `entity` in-place in its SoA column from
+    /// `patch` (supporting partial map patches) and fire [`EventKind::OnSet`] observers.
+    pub fn patch_component_value(
+        &mut self,
+        entity: Entity,
+        comp: ComponentId,
+        patch: &Value<A>,
+        alloc: A,
+    ) -> Result<(), ReflectError> {
+        let slot = self.live_slot(entity).map_err(|_| ReflectError::EntityNotFound(entity))?;
+        let tid = slot.table_id;
+        let row = slot.row;
+        let meta = self
+            .component_meta(comp)
+            .ok_or(ReflectError::Ecs(EcsError::UnknownComponent(comp)))?;
+        if !meta.reflected {
+            return Err(ReflectError::NotReflected(comp));
+        }
+        if !self.table(tid)?.has_id(Id::Component(comp)) {
+            return Err(ReflectError::MissingComponent(comp));
+        }
+        self.table_mut(tid)?.patch_row_from_value(comp, row, patch, alloc)?;
+        self.emit_event(EventKind::OnSet, entity, Id::Component(comp))?;
+        Ok(())
+    }
+
+    /// Patch an existing reflected component identified by registered `comp_name` on `entity`
+    /// in-place and fire [`EventKind::OnSet`] observers.
+    pub fn patch_component_by_name(
+        &mut self,
+        entity: Entity,
+        comp_name: &str,
+        patch: &Value<A>,
+        alloc: A,
+    ) -> Result<(), ReflectError> {
+        let _ = self.live_slot(entity).map_err(|_| ReflectError::EntityNotFound(entity))?;
+        let cid = self.component_id_by_name(comp_name).ok_or(ReflectError::ComponentNotFound)?;
+        self.patch_component_value(entity, cid, patch, alloc)
+    }
+
+    /// Attach or update reflected component `comp_name` on `entity` from `val`, firing
+    /// [`EventKind::OnAdd`] (if newly added) and [`EventKind::OnSet`] observers.
+    ///
+    /// Validates `val` before transitioning archetypes so invalid input never leaves the world in
+    /// a partially mutated state.
+    pub fn set_component_from_value(
+        &mut self,
+        entity: Entity,
+        comp_name: &str,
+        val: &Value<A>,
+        alloc: A,
+    ) -> Result<(), ReflectError> {
+        let slot = self.live_slot(entity).map_err(|_| ReflectError::EntityNotFound(entity))?;
+        let src_tid = slot.table_id;
+        let src_row = slot.row;
+        let cid = self.component_id_by_name(comp_name).ok_or(ReflectError::ComponentNotFound)?;
+        let meta = self
+            .component_meta(cid)
+            .ok_or(ReflectError::Ecs(EcsError::UnknownComponent(cid)))?;
+        if !meta.reflected {
+            return Err(ReflectError::NotReflected(cid));
+        }
+        let id = Id::Component(cid);
+        if self.table(src_tid)?.has_id(id) {
+            self.table_mut(src_tid)?.patch_row_from_value(cid, src_row, val, alloc)?;
+            self.emit_event(EventKind::OnSet, entity, id)?;
+            return Ok(());
+        }
+
+        // Validate full decode BEFORE moving the entity to a new archetype table.
+        meta.validate_value(val, alloc)?;
+
+        let dst_tid = self.get_or_create_add_edge(src_tid, id)?;
+        let (dst_row, moved_in_src) = self.move_entity_tables(src_tid, src_row, dst_tid)?;
+        self.table_mut(dst_tid)?.push_component_from_value(cid, val, alloc)?;
+
+        if let Some(s) = self.slots.get_mut(u32_to_usize(entity.slot())) {
+            s.table_id = dst_tid;
+            s.row = dst_row;
+        }
+        if let Some(moved) = moved_in_src {
+            self.update_moved_row(moved, src_row);
+        }
+
+        self.emit_event(EventKind::OnAdd, entity, id)?;
+        self.emit_event(EventKind::OnSet, entity, id)?;
+        Ok(())
+    }
+
+    /// Snapshot a single live entity into a structured [`Value`] containing `id`, `slot`, `gen`,
+    /// `table_id`, `name`, `is_prefab`, `parents`, `children`, `prefabs`, `tags`, `relations`,
+    /// and `components` (with live reflected values or `"<opaque>"`).
+    pub fn entity_to_value(&self, entity: Entity, alloc: A) -> Result<Value<A>, ReflectError> {
+        let slot = self.live_slot(entity).map_err(|_| ReflectError::EntityNotFound(entity))?;
+        let table = self.table(slot.table_id)?;
+
+        let mut root = Map::new_in(alloc);
+        let _ = root.insert(
+            OwnString::try_from_str_in("id", alloc)?,
+            Value::Int(Int::from_u64(entity.raw())),
+        );
+        let _ = root.insert(
+            OwnString::try_from_str_in("slot", alloc)?,
+            Value::Int(Int::from_u64(u64::from(entity.slot()))),
+        );
+        let _ = root.insert(
+            OwnString::try_from_str_in("gen", alloc)?,
+            Value::Int(Int::from_u64(u64::from(entity.generation()))),
+        );
+        let _ = root.insert(
+            OwnString::try_from_str_in("table_id", alloc)?,
+            Value::Int(Int::from_u64(u64::from(slot.table_id.0))),
+        );
+        let name_val = match slot.name.as_ref() {
+            Some(n) => Value::Text(OwnString::try_from_str_in(n.as_str(), alloc)?),
+            None => Value::Null,
+        };
+        let _ = root.insert(OwnString::try_from_str_in("name", alloc)?, name_val);
+
+        let is_prefab = table.has_id(Id::Tag(self.builtins.prefab));
+        let _ = root.insert(
+            OwnString::try_from_str_in("is_prefab", alloc)?,
+            Value::Bool(is_prefab),
+        );
+
+        let mut parents = OwnVec::new_in(alloc);
+        let mut prefabs = OwnVec::new_in(alloc);
+        let mut tags = OwnVec::new_in(alloc);
+        let mut relations = OwnVec::new_in(alloc);
+        let mut comps = Map::new_in(alloc);
+
+        for &id in table.archetype() {
+            match id {
+                Id::Component(cid) => {
+                    let comp_name = match self.component_meta(cid) {
+                        Some(m) => OwnString::try_from_str_in(m.name(), alloc)?,
+                        None => {
+                            let mut fallback = OwnString::new_in(alloc);
+                            let _ = write!(fallback, "Comp#{}", cid.0);
+                            fallback
+                        }
+                    };
+                    let val = match table.row_to_value(cid, slot.row, alloc)? {
+                        Some(v) => v,
+                        None => Value::Text(OwnString::try_from_str_in("<opaque>", alloc)?),
+                    };
+                    let _ = comps.insert(comp_name, val);
+                }
+                Id::Tag(tag_ent) => {
+                    let label = self.format_entity_label(tag_ent, alloc)?;
+                    tags.try_push(Value::Text(label)).map_err(|r| ReflectError::Alloc(r.why))?;
+                }
+                Id::Pair(rel, target) => {
+                    if rel == self.builtins.child_of {
+                        parents
+                            .try_push(Value::Int(Int::from_u64(u64::from(target.slot()))))
+                            .map_err(|r| ReflectError::Alloc(r.why))?;
+                    } else if rel == self.builtins.is_a {
+                        prefabs
+                            .try_push(Value::Int(Int::from_u64(u64::from(target.slot()))))
+                            .map_err(|r| ReflectError::Alloc(r.why))?;
+                    }
+                    let mut rel_obj = Map::new_in(alloc);
+                    let _ = rel_obj.insert(
+                        OwnString::try_from_str_in("relation", alloc)?,
+                        Value::Text(self.format_entity_label(rel, alloc)?),
+                    );
+                    let _ = rel_obj.insert(
+                        OwnString::try_from_str_in("relation_slot", alloc)?,
+                        Value::Int(Int::from_u64(u64::from(rel.slot()))),
+                    );
+                    let _ = rel_obj.insert(
+                        OwnString::try_from_str_in("target", alloc)?,
+                        Value::Text(self.format_entity_label(target, alloc)?),
+                    );
+                    let _ = rel_obj.insert(
+                        OwnString::try_from_str_in("target_slot", alloc)?,
+                        Value::Int(Int::from_u64(u64::from(target.slot()))),
+                    );
+                    relations
+                        .try_push(Value::Map(rel_obj))
+                        .map_err(|r| ReflectError::Alloc(r.why))?;
+                }
+            }
+        }
+
+        let child_entities = self.children_of(entity)?;
+        let mut children = OwnVec::try_with_capacity_in(child_entities.len(), alloc)?;
+        for &c in child_entities.as_slice() {
+            children
+                .try_push(Value::Int(Int::from_u64(u64::from(c.slot()))))
+                .map_err(|r| ReflectError::Alloc(r.why))?;
+        }
+
+        let _ = root.insert(OwnString::try_from_str_in("parents", alloc)?, Value::List(parents));
+        let _ = root.insert(OwnString::try_from_str_in("children", alloc)?, Value::List(children));
+        let _ = root.insert(OwnString::try_from_str_in("prefabs", alloc)?, Value::List(prefabs));
+        let _ = root.insert(OwnString::try_from_str_in("tags", alloc)?, Value::List(tags));
+        let _ = root.insert(
+            OwnString::try_from_str_in("relations", alloc)?,
+            Value::List(relations),
+        );
+        let _ = root.insert(OwnString::try_from_str_in("components", alloc)?, Value::Map(comps));
+        Ok(Value::Map(root))
+    }
+
+    /// Snapshot the entire world into a deterministic [`Value`] containing `stats`, `components`
+    /// (with `id`, `name`, `size`, `can_copy`, `reflected`, `schema`), `archetypes` (with `id`,
+    /// `components`, `entity_count`, `column_count`, `add_edges`, `remove_edges`), `entities`,
+    /// and `prefabs`.
+    pub fn world_to_value(&self, alloc: A) -> Result<Value<A>, ReflectError> {
+        let mut entities = OwnVec::new_in(alloc);
+        let mut prefabs = OwnVec::new_in(alloc);
+        let mut prefab_count = 0usize;
+
+        for (slot_idx, slot) in self.slots.as_slice().iter().enumerate() {
+            if !slot.alive {
+                continue;
+            }
+            let Some(raw_slot) = usize_to_u32(slot_idx) else {
+                continue;
+            };
+            let ent = Entity::from_parts(raw_slot, slot.generation);
+            let ent_val = self.entity_to_value(ent, alloc)?;
+            let is_prefab = self
+                .table(slot.table_id)
+                .is_ok_and(|t| t.has_id(Id::Tag(self.builtins.prefab)));
+            if is_prefab {
+                prefab_count = prefab_count.saturating_add(1);
+                prefabs
+                    .try_push(ent_val.copy_in(alloc))
+                    .map_err(|r| ReflectError::Alloc(r.why))?;
+            }
+            entities.try_push(ent_val).map_err(|r| ReflectError::Alloc(r.why))?;
+        }
+
+        let mut stats = Map::new_in(alloc);
+        let _ = stats.insert(
+            OwnString::try_from_str_in("entities", alloc)?,
+            Value::Int(Int::from_u64(u64::try_from(self.live_count).unwrap_or(u64::MAX))),
+        );
+        let _ = stats.insert(
+            OwnString::try_from_str_in("archetypes", alloc)?,
+            Value::Int(Int::from_u64(u64::try_from(self.tables.len()).unwrap_or(u64::MAX))),
+        );
+        let _ = stats.insert(
+            OwnString::try_from_str_in("components", alloc)?,
+            Value::Int(Int::from_u64(u64::try_from(self.components.len()).unwrap_or(u64::MAX))),
+        );
+        let _ = stats.insert(
+            OwnString::try_from_str_in("prefabs", alloc)?,
+            Value::Int(Int::from_u64(u64::try_from(prefab_count).unwrap_or(u64::MAX))),
+        );
+        let _ = stats.insert(
+            OwnString::try_from_str_in("observers", alloc)?,
+            Value::Int(Int::from_u64(u64::try_from(self.observers.len()).unwrap_or(u64::MAX))),
+        );
+
+        let mut comps = OwnVec::try_with_capacity_in(self.components.len(), alloc)?;
+        for meta in self.components.as_slice() {
+            let mut cobj = Map::new_in(alloc);
+            let _ = cobj.insert(
+                OwnString::try_from_str_in("id", alloc)?,
+                Value::Int(Int::from_u64(u64::from(meta.id.0))),
+            );
+            let _ = cobj.insert(
+                OwnString::try_from_str_in("name", alloc)?,
+                Value::Text(OwnString::try_from_str_in(meta.name(), alloc)?),
+            );
+            let _ = cobj.insert(
+                OwnString::try_from_str_in("size", alloc)?,
+                Value::Int(Int::from_u64(u64::try_from(meta.size).unwrap_or(u64::MAX))),
+            );
+            let _ = cobj.insert(
+                OwnString::try_from_str_in("can_copy", alloc)?,
+                Value::Bool(meta.can_copy),
+            );
+            let _ = cobj.insert(
+                OwnString::try_from_str_in("reflected", alloc)?,
+                Value::Bool(meta.reflected),
+            );
+            let schema_val = match meta.schema(alloc)? {
+                Some(s) => s,
+                None => Value::Null,
+            };
+            let _ = cobj.insert(OwnString::try_from_str_in("schema", alloc)?, schema_val);
+            comps.try_push(Value::Map(cobj)).map_err(|r| ReflectError::Alloc(r.why))?;
+        }
+
+        let mut archetypes = OwnVec::try_with_capacity_in(self.tables.len(), alloc)?;
+        for table in self.tables.as_slice() {
+            let mut aobj = Map::new_in(alloc);
+            let _ = aobj.insert(
+                OwnString::try_from_str_in("id", alloc)?,
+                Value::Int(Int::from_u64(u64::from(table.id().0))),
+            );
+            let mut id_labels = OwnVec::try_with_capacity_in(table.archetype().len(), alloc)?;
+            for &id in table.archetype() {
+                let mut label = OwnString::new_in(alloc);
+                self.write_id_label(&mut label, id);
+                id_labels
+                    .try_push(Value::Text(label))
+                    .map_err(|r| ReflectError::Alloc(r.why))?;
+            }
+            let _ = aobj.insert(
+                OwnString::try_from_str_in("components", alloc)?,
+                Value::List(id_labels),
+            );
+            let _ = aobj.insert(
+                OwnString::try_from_str_in("entity_count", alloc)?,
+                Value::Int(Int::from_u64(u64::try_from(table.len()).unwrap_or(u64::MAX))),
+            );
+            let _ = aobj.insert(
+                OwnString::try_from_str_in("column_count", alloc)?,
+                Value::Int(Int::from_u64(u64::try_from(table.column_count()).unwrap_or(u64::MAX))),
+            );
+            let _ = aobj.insert(
+                OwnString::try_from_str_in("add_edges", alloc)?,
+                Value::Int(Int::from_u64(u64::try_from(table.add_edge_count()).unwrap_or(u64::MAX))),
+            );
+            let _ = aobj.insert(
+                OwnString::try_from_str_in("remove_edges", alloc)?,
+                Value::Int(Int::from_u64(
+                    u64::try_from(table.remove_edge_count()).unwrap_or(u64::MAX),
+                )),
+            );
+            archetypes.try_push(Value::Map(aobj)).map_err(|r| ReflectError::Alloc(r.why))?;
+        }
+
+        let mut root = Map::new_in(alloc);
+        let _ = root.insert(OwnString::try_from_str_in("stats", alloc)?, Value::Map(stats));
+        let _ = root.insert(OwnString::try_from_str_in("components", alloc)?, Value::List(comps));
+        let _ = root.insert(
+            OwnString::try_from_str_in("archetypes", alloc)?,
+            Value::List(archetypes),
+        );
+        let _ = root.insert(OwnString::try_from_str_in("entities", alloc)?, Value::List(entities));
+        let _ = root.insert(OwnString::try_from_str_in("prefabs", alloc)?, Value::List(prefabs));
+        Ok(Value::Map(root))
+    }
+
+    fn format_entity_label(&self, entity: Entity, alloc: A) -> Result<OwnString<A>, AllocFailure> {
+        if let Some(name) = self.entity_name(entity) {
+            OwnString::try_from_str_in(name, alloc)
+        } else {
+            let mut out = OwnString::new_in(alloc);
+            let _ = write!(out, "{entity}");
+            Ok(out)
         }
     }
 

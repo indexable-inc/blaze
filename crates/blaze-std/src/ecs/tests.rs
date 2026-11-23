@@ -1437,3 +1437,471 @@ fn typed_pipeline_add_query_automatic_disjoint_batching() {
     assert_eq!(w.get::<Health>(e).expect("hp"), Some(&Health(25)));
     assert_eq!(w.get::<Damage>(sink).expect("checksum"), Some(&Damage(5 + 8 + 25)));
 }
+
+// -----------------------------------------------------------------------------
+// Live `bstd::data` Reflection & Sans-IO Flecs Explorer HTTP/JSON/TAB Tests
+// -----------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Transform2D {
+    x: f32,
+    y: f32,
+    active: bool,
+}
+super::reflect_struct!(Transform2D { x: f32, y: f32, active: bool });
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Velocity2D {
+    vx: i32,
+    vy: i32,
+}
+super::reflect_struct!(Velocity2D { vx: i32, vy: i32 });
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Score(u32);
+super::reflect_struct!(Score(u32));
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct OpaqueSecret(u64);
+
+fn parse_json_body(body: &[u8]) -> crate::data::Value<Alloc<'static>> {
+    crate::json::read_in(body, crate::json::Limits::SHIPPED, alloc()).expect("valid json body")
+}
+
+#[test]
+fn reflect_struct_to_from_value_schema_and_partial_patch() {
+    use crate::data::{Cursor, FromValue, ToValue};
+    use super::{ReflectComponent, ReflectError};
+
+    let a = alloc();
+
+    // Schema check for named struct, newtype struct, and primitives.
+    let schema = Transform2D::schema(a).expect("schema");
+    assert_eq!(schema.get("kind").and_then(|v| v.as_str()), Some("struct"));
+    assert_eq!(schema.get("name").and_then(|v| v.as_str()), Some("Transform2D"));
+    let fields = schema.get("fields").and_then(|v| v.as_list()).expect("fields");
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields.get(0).and_then(|f| f.get("name")).and_then(|v| v.as_str()), Some("x"));
+    assert_eq!(fields.get(0).and_then(|f| f.get("type")).and_then(|v| v.as_str()), Some("f32"));
+    assert_eq!(fields.get(2).and_then(|f| f.get("name")).and_then(|v| v.as_str()), Some("active"));
+    assert_eq!(fields.get(2).and_then(|f| f.get("type")).and_then(|v| v.as_str()), Some("bool"));
+
+    let prim_schema = i32::schema(a).expect("i32 schema");
+    assert_eq!(prim_schema.get("kind").and_then(|v| v.as_str()), Some("primitive"));
+    assert_eq!(prim_schema.get("type").and_then(|v| v.as_str()), Some("i32"));
+
+    let score_schema = Score::schema(a).expect("Score schema");
+    assert_eq!(score_schema.get("kind").and_then(|v| v.as_str()), Some("newtype"));
+    assert_eq!(score_schema.get("type").and_then(|v| v.as_str()), Some("u32"));
+
+    // ToValue -> FromValue round-trip.
+    let mut tf = Transform2D { x: 1.5, y: -2.25, active: true };
+    let val = tf.to_value(a);
+    let cursor = Cursor::root(&val, a);
+    let decoded = Transform2D::from_value(&cursor).expect("decode");
+    assert_eq!(decoded, tf);
+
+    // Partial map patch preserves untouched fields and accepts JSON int for f32!
+    let patch = parse_json_body(br#"{"x": 42}"#);
+    tf.patch_value(&patch, a).expect("partial patch");
+    assert_eq!(tf, Transform2D { x: 42.0, y: -2.25, active: true });
+
+    let patch_bool = parse_json_body(br#"{"active": false}"#);
+    tf.patch_value(&patch_bool, a).expect("patch bool");
+    assert_eq!(tf, Transform2D { x: 42.0, y: -2.25, active: false });
+
+    // Unknown field is strictly rejected.
+    let bad_field = parse_json_body(br#"{"nope": 1}"#);
+    assert!(matches!(tf.patch_value(&bad_field, a), Err(ReflectError::Shape(_))));
+
+    // Wrong field type is strictly rejected.
+    let bad_type = parse_json_body(br#"{"x": "not-a-number"}"#);
+    assert!(matches!(tf.patch_value(&bad_type, a), Err(ReflectError::Shape(_))));
+
+    // Primitives (including isize/f32/f64) patch directly.
+    let mut isz: isize = 5;
+    let isz_patch = parse_json_body(b"-17");
+    isz.patch_value(&isz_patch, a).expect("patch isize");
+    assert_eq!(isz, -17);
+
+    let mut score = Score(10);
+    score.patch_value(&parse_json_body(b"99"), a).expect("patch score");
+    assert_eq!(score, Score(99));
+}
+
+#[test]
+fn world_reflection_patch_fires_on_set_and_snapshots_full_graph() {
+    use super::ReflectError;
+
+    let a = alloc();
+    let mut w = World::new_in(a).expect("world");
+
+    let tf_id = w.register_reflected_copy::<Transform2D>().expect("reg Transform2D");
+    let _vel_id = w.register_reflected_copy::<Velocity2D>().expect("reg Velocity2D");
+    let opaque_id = w.register_copy::<OpaqueSecret>().expect("reg OpaqueSecret");
+
+    let obs_set = w.observe(EventKind::OnSet, Id::Component(tf_id)).expect("obs set");
+    let obs_add = w.observe(EventKind::OnAdd, Id::Component(tf_id)).expect("obs add");
+
+    let ship_prefab = w.spawn_prefab("ShipPrefab").expect("prefab");
+    w.set_reflected_copy(ship_prefab, Transform2D { x: 0.0, y: 0.0, active: true })
+        .expect("prefab tf");
+    w.set_reflected_copy(ship_prefab, Velocity2D { vx: 5, vy: -3 }).expect("prefab vel");
+
+    let fleet = w.spawn_named("Fleet").expect("fleet");
+    let ship = w.instantiate(ship_prefab).expect("instantiate");
+    w.set_name(ship, "Enterprise").expect("name ship");
+    let child_of = w.child_of();
+    w.add_pair(ship, child_of, fleet).expect("child_of fleet");
+    let hero_tag = w.spawn_named("Hero").expect("Hero tag");
+    w.add_tag(ship, hero_tag).expect("tag Hero");
+    w.set_copy(ship, OpaqueSecret(0xDEAD)).expect("opaque");
+
+    assert_eq!(w.observer_events(obs_add).expect("add").len(), 2);
+    let sets_before = w.observer_events(obs_set).expect("set").len();
+
+    // In-place partial patch via `patch_component_value` mutates SoA column & fires `OnSet`.
+    let patch = parse_json_body(br#"{"x": 12.5}"#);
+    w.patch_component_value(ship, tf_id, &patch, a).expect("patch tf");
+    assert_eq!(
+        w.get::<Transform2D>(ship).expect("get"),
+        Some(&Transform2D { x: 12.5, y: 0.0, active: true })
+    );
+    assert_eq!(w.observer_events(obs_set).expect("set").len(), sets_before + 1);
+    assert_eq!(
+        w.observer_events(obs_set).expect("set").last().copied(),
+        Some(Event { kind: EventKind::OnSet, entity: ship, id: Id::Component(tf_id) })
+    );
+
+    // Inspect reflected vs non-reflected component.
+    let inspected = w.inspect_component_value(ship, tf_id, a).expect("inspect").expect("some");
+    assert_eq!(inspected.get("x").and_then(|v| v.as_f64()), Some(12.5));
+    assert_eq!(
+        w.inspect_component_value(ship, opaque_id, a),
+        Err(ReflectError::NotReflected(opaque_id))
+    );
+    assert_eq!(w.inspect_component_value(fleet, tf_id, a), Ok(None));
+
+    // `entity_to_value` captures hierarchy, prefabs, tags, relations, reflected values & `<opaque>`.
+    let ship_val = w.entity_to_value(ship, a).expect("entity_to_value");
+    assert_eq!(ship_val.get("name").and_then(|v| v.as_str()), Some("Enterprise"));
+    assert_eq!(ship_val.get("slot").and_then(|v| v.as_u64()), Some(u64::from(ship.slot())));
+    assert_eq!(ship_val.get("is_prefab").and_then(|v| v.as_bool()), Some(false));
+    let parents = ship_val.get("parents").and_then(|v| v.as_list()).expect("parents");
+    assert_eq!(parents.len(), 1);
+    assert_eq!(parents.get(0).and_then(|v| v.as_u64()), Some(u64::from(fleet.slot())));
+    let prefabs = ship_val.get("prefabs").and_then(|v| v.as_list()).expect("prefabs");
+    assert_eq!(prefabs.len(), 1);
+    assert_eq!(prefabs.get(0).and_then(|v| v.as_u64()), Some(u64::from(ship_prefab.slot())));
+    let tags = ship_val.get("tags").and_then(|v| v.as_list()).expect("tags");
+    assert!(tags.iter().any(|t| t.as_str() == Some("Hero")));
+    let comps = ship_val.get("components").and_then(|v| v.as_map()).expect("components");
+    assert_eq!(
+        comps.get("Transform2D").and_then(|c| c.get("x")).and_then(|v| v.as_f64()),
+        Some(12.5)
+    );
+    assert_eq!(
+        comps.get("Velocity2D").and_then(|c| c.get("vx")).and_then(|v| v.as_i64()),
+        Some(5)
+    );
+    assert_eq!(comps.get("OpaqueSecret").and_then(|v| v.as_str()), Some("<opaque>"));
+
+    // `world_to_value` captures stats, component schemas, archetypes, entities, and prefabs.
+    let world_val = w.world_to_value(a).expect("world_to_value");
+    let stats = world_val.get("stats").and_then(|v| v.as_map()).expect("stats");
+    assert_eq!(stats.get("prefabs").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(stats.get("components").and_then(|v| v.as_u64()), Some(3));
+    let w_comps = world_val.get("components").and_then(|v| v.as_list()).expect("comps");
+    assert_eq!(w_comps.len(), 3);
+    assert_eq!(
+        w_comps.get(0).and_then(|c| c.get("reflected")).and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        w_comps.get(2).and_then(|c| c.get("reflected")).and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    let w_prefabs = world_val.get("prefabs").and_then(|v| v.as_list()).expect("prefabs");
+    assert_eq!(w_prefabs.len(), 1);
+    w.verify_invariants().expect("invariants");
+}
+
+#[test]
+fn explorer_api_all_endpoints_and_error_cases() {
+    use super::{EXPLORER_HTML, handle_request};
+
+    let a = alloc();
+    let mut w = World::new_in(a).expect("world");
+    let tf_id = w.register_reflected_copy::<Transform2D>().expect("reg tf");
+    let _vel_id = w.register_reflected_copy::<Velocity2D>().expect("reg vel");
+    let _score_id = w.register_reflected_copy::<Score>().expect("reg score");
+    let obs_set = w.observe(EventKind::OnSet, Id::Component(tf_id)).expect("obs set");
+
+    // 1. GET / -> embedded HTML UI
+    let res_ui = handle_request(&mut w, "GET", "/", b"", a).expect("GET /");
+    assert_eq!(res_ui.status, 200);
+    assert_eq!(res_ui.content_type, "text/html; charset=utf-8");
+    assert_eq!(res_ui.body.as_slice(), EXPLORER_HTML.as_bytes());
+
+    // 2. OPTIONS -> 204
+    let res_opt = handle_request(&mut w, "OPTIONS", "/api/world", b"", a).expect("OPTIONS");
+    assert_eq!(res_opt.status, 204);
+    assert!(res_opt.body.is_empty());
+
+    // 3. Unknown route -> 404
+    let res_404 = handle_request(&mut w, "GET", "/api/does-not-exist", b"", a).expect("404");
+    assert_eq!(res_404.status, 404);
+
+    // Create a parent + prefab to test POST /api/entity with prefab + parent + tags + components.
+    let root = w.spawn_named("SceneRoot").expect("root");
+    let unit_prefab = w.spawn_prefab("UnitPrefab").expect("prefab");
+    w.set_reflected_copy(unit_prefab, Velocity2D { vx: 2, vy: 3 }).expect("prefab vel");
+
+    let post_body = format_in!(
+        a,
+        r#"{{"name":"Drone1","parent":{},"prefab":{},"tags":["Active","Scout"],"components":{{"Transform2D":{{"x":10.0,"y":20.0,"active":true}},"Score":50}}}}"#,
+        root.slot(),
+        unit_prefab.slot(),
+    );
+    let res_post = handle_request(&mut w, "POST", "/api/entity", post_body.as_str().as_bytes(), a)
+        .expect("POST /api/entity");
+    assert_eq!(res_post.status, 201);
+    let created = parse_json_body(res_post.body.as_slice());
+    let drone_slot = u32::try_from(created.get("slot").and_then(|v| v.as_u64()).expect("slot"))
+        .expect("u32");
+    assert_eq!(created.get("name").and_then(|v| v.as_str()), Some("Drone1"));
+    assert_eq!(
+        created
+            .get("components")
+            .and_then(|c| c.get("Velocity2D"))
+            .and_then(|v| v.get("vx"))
+            .and_then(|v| v.as_i64()),
+        Some(2)
+    );
+    assert_eq!(
+        created.get("components").and_then(|c| c.get("Score")).and_then(|v| v.as_u64()),
+        Some(50)
+    );
+
+    // Invalid POST /api/entity returns 400 and does NOT leak an entity!
+    let live_before_bad_post = w.live_count();
+    let res_bad_post = handle_request(
+        &mut w,
+        "POST",
+        "/api/entity",
+        br#"{"name":"Broken","components":{"Transform2D":{"x":"bad"}}}"#,
+        a,
+    )
+    .expect("bad POST");
+    assert_eq!(res_bad_post.status, 400);
+    assert_eq!(w.live_count(), live_before_bad_post);
+
+    // 4. GET /api/entity/<slot> (200 and 404)
+    let ent_path = format_in!(a, "/api/entity/{drone_slot}");
+    let res_get = handle_request(&mut w, "GET", ent_path.as_str(), b"", a).expect("GET entity");
+    assert_eq!(res_get.status, 200);
+    assert_eq!(parse_json_body(res_get.body.as_slice()).get("name").and_then(|v| v.as_str()), Some("Drone1"));
+    assert_eq!(handle_request(&mut w, "GET", "/api/entity/99999", b"", a).expect("404").status, 404);
+
+    // 5. PATCH /api/entity/<slot>/component/<name>: partial edit + OnSet + 400 + 404
+    let sets_before = w.observer_events(obs_set).expect("obs").len();
+    let patch_path = format_in!(a, "/api/entity/{drone_slot}/component/Transform2D");
+    let res_patch =
+        handle_request(&mut w, "PATCH", patch_path.as_str(), br#"{"y": 99.5}"#, a).expect("PATCH");
+    assert_eq!(res_patch.status, 200);
+    let patched = parse_json_body(res_patch.body.as_slice());
+    assert_eq!(
+        patched
+            .get("components")
+            .and_then(|c| c.get("Transform2D"))
+            .and_then(|v| v.get("x"))
+            .and_then(|v| v.as_f64()),
+        Some(10.0)
+    );
+    assert_eq!(
+        patched
+            .get("components")
+            .and_then(|c| c.get("Transform2D"))
+            .and_then(|v| v.get("y"))
+            .and_then(|v| v.as_f64()),
+        Some(99.5)
+    );
+    assert_eq!(w.observer_events(obs_set).expect("obs").len(), sets_before + 1);
+
+    // PATCH 400 invalid value / invalid JSON
+    assert_eq!(
+        handle_request(&mut w, "PATCH", patch_path.as_str(), br#"{"x": "oops"}"#, a).expect("400").status,
+        400
+    );
+    assert_eq!(
+        handle_request(&mut w, "PATCH", patch_path.as_str(), b"{broken", a).expect("400").status,
+        400
+    );
+    // PATCH 404 missing component / missing entity
+    let missing_comp = format_in!(a, "/api/entity/{drone_slot}/component/NoSuchComp");
+    assert_eq!(handle_request(&mut w, "PATCH", missing_comp.as_str(), b"{}", a).expect("404").status, 404);
+    assert_eq!(
+        handle_request(&mut w, "PATCH", "/api/entity/99999/component/Transform2D", b"{}", a)
+            .expect("404")
+            .status,
+        404
+    );
+
+    // 6. POST / DELETE tags
+    let tag_path = format_in!(a, "/api/entity/{drone_slot}/tag/Selected");
+    let res_tag = handle_request(&mut w, "POST", tag_path.as_str(), b"", a).expect("POST tag");
+    assert_eq!(res_tag.status, 200);
+    assert!(
+        parse_json_body(res_tag.body.as_slice())
+            .get("tags")
+            .and_then(|v| v.as_list())
+            .expect("tags")
+            .iter()
+            .any(|t| t.as_str() == Some("Selected"))
+    );
+    let res_untag =
+        handle_request(&mut w, "DELETE", tag_path.as_str(), b"", a).expect("DELETE tag");
+    assert_eq!(res_untag.status, 200);
+    assert!(
+        !parse_json_body(res_untag.body.as_slice())
+            .get("tags")
+            .and_then(|v| v.as_list())
+            .expect("tags")
+            .iter()
+            .any(|t| t.as_str() == Some("Selected"))
+    );
+
+    // 7. POST / DELETE parent + 400 cycle rejection
+    let child_post = format_in!(a, r#"{{"name":"SubDrone","parent":{drone_slot}}}"#);
+    let res_child = handle_request(&mut w, "POST", "/api/entity", child_post.as_str().as_bytes(), a)
+        .expect("spawn child");
+    assert_eq!(res_child.status, 201);
+    let child_slot = u32::try_from(
+        parse_json_body(res_child.body.as_slice()).get("slot").and_then(|v| v.as_u64()).expect("slot"),
+    )
+    .expect("u32");
+
+    // Cycle: trying to make `root` a child of `child_slot` must fail with 400!
+    let cycle_path = format_in!(a, "/api/entity/{}/parent/{child_slot}", root.slot());
+    let res_cycle = handle_request(&mut w, "POST", cycle_path.as_str(), b"", a).expect("cycle");
+    assert_eq!(res_cycle.status, 400);
+
+    // Clear parent on `drone_slot`, then re-attach to `root`.
+    let clear_parent = format_in!(a, "/api/entity/{drone_slot}/parent");
+    let res_clear = handle_request(&mut w, "DELETE", clear_parent.as_str(), b"", a).expect("clear");
+    assert_eq!(res_clear.status, 200);
+    assert_eq!(
+        parse_json_body(res_clear.body.as_slice())
+            .get("parents")
+            .and_then(|v| v.as_list())
+            .expect("parents")
+            .len(),
+        0
+    );
+    let reparent = format_in!(a, "/api/entity/{drone_slot}/parent/{}", root.slot());
+    assert_eq!(handle_request(&mut w, "POST", reparent.as_str(), b"", a).expect("reparent").status, 200);
+
+    // 8. GET /api/query?with=...&without=...
+    let res_q1 = handle_request(
+        &mut w,
+        "GET",
+        "/api/query?with=Transform2D,Velocity2D&without=Dead",
+        b"",
+        a,
+    )
+    .expect("query 1");
+    assert_eq!(res_q1.status, 200);
+    let q1 = parse_json_body(res_q1.body.as_slice());
+    assert_eq!(q1.get("count").and_then(|v| v.as_u64()), Some(1));
+
+    let res_q2 = handle_request(
+        &mut w,
+        "GET",
+        "/api/query?with=Transform2D&without=Scout",
+        b"",
+        a,
+    )
+    .expect("query 2");
+    assert_eq!(res_q2.status, 200);
+    assert_eq!(parse_json_body(res_q2.body.as_slice()).get("count").and_then(|v| v.as_u64()), Some(0));
+
+    // 9. GET /api/world and GET /api/world.tab (TAB round-trips losslessly!)
+    let res_world = handle_request(&mut w, "GET", "/api/world", b"", a).expect("GET world");
+    assert_eq!(res_world.status, 200);
+    let world_json = parse_json_body(res_world.body.as_slice());
+
+    let res_tab = handle_request(&mut w, "GET", "/api/world.tab", b"", a).expect("GET world.tab");
+    assert_eq!(res_tab.status, 200);
+    assert_eq!(res_tab.content_type, "text/plain; charset=utf-8");
+    let tab_parsed =
+        crate::tab::read(res_tab.body.as_slice(), crate::tab::Limits::SHIPPED, a).expect("parse tab");
+    assert_eq!(tab_parsed, world_json);
+
+    // 10. DELETE /api/entity/<root_slot> cascades to Drone1 and SubDrone!
+    let del_root = format_in!(a, "/api/entity/{}", root.slot());
+    let res_del = handle_request(&mut w, "DELETE", del_root.as_str(), b"", a).expect("DELETE");
+    assert_eq!(res_del.status, 200);
+    assert_eq!(
+        parse_json_body(res_del.body.as_slice()).get("deleted").and_then(|v| v.as_u64()),
+        Some(u64::from(root.slot()))
+    );
+    assert_eq!(handle_request(&mut w, "GET", ent_path.as_str(), b"", a).expect("dead").status, 404);
+    let child_path = format_in!(a, "/api/entity/{child_slot}");
+    assert_eq!(handle_request(&mut w, "GET", child_path.as_str(), b"", a).expect("dead child").status, 404);
+    assert_eq!(handle_request(&mut w, "DELETE", del_root.as_str(), b"", a).expect("404 del").status, 404);
+    w.verify_invariants().expect("invariants");
+}
+
+#[test]
+fn explorer_http_1_1_wire_framing_round_trip() {
+    use super::handle_http_request;
+
+    let a = alloc();
+    let mut w = World::new_in(a).expect("world");
+    let _ = w.register_reflected_copy::<Transform2D>().expect("reg");
+    let e = w.spawn_named("Beacon").expect("beacon");
+    w.set_reflected_copy(e, Transform2D { x: 1.0, y: 2.0, active: true }).expect("set tf");
+
+    // 1. Raw HTTP/1.1 PATCH request with Content-Length header & JSON body.
+    let patch_body = br#"{"x":7.5,"active":false}"#;
+    let raw_patch = format_in!(
+        a,
+        "PATCH /api/entity/{}/component/Transform2D HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        e.slot(),
+        patch_body.len(),
+        core::str::from_utf8(patch_body).expect("utf8"),
+    );
+    let raw_resp =
+        handle_http_request(&mut w, raw_patch.as_str().as_bytes(), a).expect("http patch");
+    let resp_str = core::str::from_utf8(raw_resp.as_slice()).expect("utf8 resp");
+    assert!(resp_str.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(resp_str.contains("Content-Type: application/json\r\n"));
+    assert!(resp_str.contains("Access-Control-Allow-Origin: *\r\n"));
+    let (_, resp_body) = resp_str.split_once("\r\n\r\n").expect("header/body split");
+    let parsed = parse_json_body(resp_body.as_bytes());
+    assert_eq!(
+        parsed
+            .get("components")
+            .and_then(|c| c.get("Transform2D"))
+            .and_then(|t| t.get("x"))
+            .and_then(|v| v.as_f64()),
+        Some(7.5)
+    );
+    assert_eq!(
+        w.get::<Transform2D>(e).expect("get"),
+        Some(&Transform2D { x: 7.5, y: 2.0, active: false })
+    );
+
+    // 2. Raw HTTP/1.1 GET / serves HTML UI with accurate Content-Length.
+    let raw_get = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let html_resp = handle_http_request(&mut w, raw_get, a).expect("http get /");
+    let html_str = core::str::from_utf8(html_resp.as_slice()).expect("utf8 html");
+    assert!(html_str.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(html_str.contains("Content-Type: text/html; charset=utf-8\r\n"));
+    assert!(html_str.contains("Blaze ECS Explorer"));
+
+    // 3. Malformed HTTP returns 400 Bad Request cleanly.
+    let bad_resp = handle_http_request(&mut w, b"NOT_HTTP", a).expect("bad http");
+    let bad_str = core::str::from_utf8(bad_resp.as_slice()).expect("utf8 bad");
+    assert!(bad_str.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+}
