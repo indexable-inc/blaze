@@ -58,7 +58,7 @@ impl DelimIndex {
                     Delimited {
                         dspan: *dspan,
                         delim: *delim,
-                        tokens: inner.clone(),
+                        tokens: blaze_own::Share::share(inner),
                     },
                 );
                 self.add(inner);
@@ -386,7 +386,7 @@ impl<'a> Lower<'a> {
                 ast::AttrArgs::Delimited(ast::DelimArgs {
                     dspan: *dspan,
                     delim: *delim,
-                    tokens: stream.clone(),
+                    tokens: blaze_own::Share::share(stream),
                 })
             }
             Some(TokenTree::Token(t, _)) if t.kind == token::Eq => {

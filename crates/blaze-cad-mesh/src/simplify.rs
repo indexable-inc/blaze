@@ -1392,6 +1392,46 @@ fn remap(
     if !(max_base <= limit) {
         return Ok(Some(max_base));
     }
+    // Preserve material-role and part boundary curves within `limit`: a collapse that slides a
+    // role-border corner along a flat plane has zero geometric Hausdorff error but drags the
+    // material seam sideways across the face.
+    if limit.is_finite() {
+        let np = wide(plan.p);
+        let mut border_shift = 0.0f64;
+        for (v, star) in [(plan.keep, &lists.star_a), (plan.gone, &lists.star_b)] {
+            let pv = wide(w.pos[at(v)]);
+            let moved = sub(pv, np);
+            if dot(moved, moved) == 0.0 {
+                continue;
+            }
+            for group in star.chunk_by(|x, y| x.0 == y.0) {
+                let nb = group[0].0;
+                if nb == plan.keep || nb == plan.gone || group.len() != 2 {
+                    continue;
+                }
+                let role_or_part = w.roles[at(group[0].1)] != w.roles[at(group[1].1)]
+                    || w.parts[at(group[0].1)] != w.parts[at(group[1].1)];
+                if !role_or_part {
+                    continue;
+                }
+                let pn = wide(w.pos[at(nb)]);
+                let seg = sub(pn, np);
+                let seg_len = length(seg);
+                let mut shift = if seg_len > 1e-12 {
+                    length(cross(moved, seg)) / seg_len
+                } else {
+                    length(moved)
+                };
+                if dot(sub(pn, pv), seg) < 0.0 {
+                    shift = shift.max(length(moved));
+                }
+                border_shift = worst(border_shift, shift);
+            }
+        }
+        if !(border_shift <= limit) {
+            return Ok(Some(border_shift));
+        }
+    }
     if plant.has(DecimatePlant::MeasuresEverything) {
         // Planted: the map looks through every live triangle's pieces, not the region's slots.
         for slot in 0..len32(w.own.len()) {

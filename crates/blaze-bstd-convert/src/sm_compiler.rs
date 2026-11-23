@@ -305,8 +305,13 @@ impl<'a> CfgBuilder<'a> {
     }
 
     fn finish_with(&mut self, term: Terminator) {
-        if let Terminator::Suspend { bind: Some(b), bind_mut: true, .. } = &term {
-            self.mut_vars.insert(b.clone());
+        if let Terminator::Suspend { bind: Some(b), bind_mut, bind_type, .. } = &term {
+            if *bind_mut {
+                self.mut_vars.insert(b.clone());
+            }
+            if let Some(ty) = bind_type {
+                self.local_types.insert(b.clone(), ty.clone());
+            }
         }
         self.blocks[self.cur.0].term = term;
     }
@@ -359,25 +364,24 @@ impl<'a> CfgBuilder<'a> {
                                 UnwrapMode::Raw => effect.kind.event_payload_type().to_owned(),
                                 _ => effect.kind.ok_payload_type().to_owned(),
                             };
-                            self.local_types.insert(tmp.clone(), tmp_ty.clone());
+                            let else_blk = let_else
+                                .block_expr()
+                                .map(|b| b.syntax().text().to_string())
+                                .unwrap_or_else(|| "{ return; }".to_owned());
+                            let code = format!("let {pat_txt} = {tmp} else {else_blk};");
                             let resume = self.new_block();
                             let sidx = self.suspend_count;
                             self.suspend_count += 1;
                             self.finish_with(Terminator::Suspend {
                                 suspend_index: sidx,
                                 effect,
-                                bind: Some(tmp.clone()),
+                                bind: Some(tmp),
                                 bind_mut: false,
                                 bind_type: Some(tmp_ty),
                                 unwrap_mode,
                                 resume,
                             });
                             self.cur = resume;
-                            let else_blk = let_else
-                                .block_expr()
-                                .map(|b| b.syntax().text().to_string())
-                                .unwrap_or_else(|| "{ return; }".to_owned());
-                            let code = format!("let {pat_txt} = {tmp} else {else_blk};");
                             let ty = explicit_ty.or_else(|| Some(effect_ok_inner_type(&pat_txt)));
                             self.push_stmt(PureStmt { code, defined_var: simple_var, is_mut, var_type: ty });
                             return;
@@ -385,18 +389,12 @@ impl<'a> CfgBuilder<'a> {
                     }
 
                     if let Some((effect, unwrap_mode)) = extract_effect_expr(self.source, &init) {
-                        let inferred_ty = explicit_ty.clone().unwrap_or_else(|| match unwrap_mode {
+                        let inferred_ty = explicit_ty.unwrap_or_else(|| match unwrap_mode {
                             UnwrapMode::Raw => effect.kind.event_payload_type().to_owned(),
                             UnwrapMode::TryPropagate | UnwrapMode::UnwrapOrPanic | UnwrapMode::UnwrapOrDefault => {
                                 effect.kind.ok_payload_type().to_owned()
                             }
                         });
-                        if let Some(ref v) = simple_var {
-                            self.local_types.insert(v.clone(), inferred_ty.clone());
-                            if is_mut {
-                                self.mut_vars.insert(v.clone());
-                            }
-                        }
                         let resume = self.new_block();
                         let sidx = self.suspend_count;
                         self.suspend_count += 1;
@@ -422,21 +420,6 @@ impl<'a> CfgBuilder<'a> {
                                 effect.kind.ok_payload_type().to_owned()
                             }
                         };
-                        self.local_types.insert(tmp.clone(), tmp_ty.clone());
-                        let resume = self.new_block();
-                        let sidx = self.suspend_count;
-                        self.suspend_count += 1;
-                        self.finish_with(Terminator::Suspend {
-                            suspend_index: sidx,
-                            effect,
-                            bind: Some(tmp.clone()),
-                            bind_mut: false,
-                            bind_type: Some(tmp_ty),
-                            unwrap_mode,
-                            resume,
-                        });
-                        self.cur = resume;
-
                         let stmt_range = stmt.syntax().text_range();
                         let stmt_start: usize = stmt_range.start().into();
                         let inner_start: usize = inner_range.start().into();
@@ -448,6 +431,20 @@ impl<'a> CfgBuilder<'a> {
                         spliced.push_str(&stmt_txt[..rel_s]);
                         spliced.push_str(&tmp);
                         spliced.push_str(&stmt_txt[rel_e..]);
+
+                        let resume = self.new_block();
+                        let sidx = self.suspend_count;
+                        self.suspend_count += 1;
+                        self.finish_with(Terminator::Suspend {
+                            suspend_index: sidx,
+                            effect,
+                            bind: Some(tmp),
+                            bind_mut: false,
+                            bind_type: Some(tmp_ty),
+                            unwrap_mode,
+                            resume,
+                        });
+                        self.cur = resume;
                         let ty = explicit_ty.or_else(|| infer_expr_type(&init, &self.local_types, self.fn_sigs));
                         self.push_stmt(PureStmt {
                             code: spliced.trim().to_owned(),
@@ -537,25 +534,25 @@ impl<'a> CfgBuilder<'a> {
                                     UnwrapMode::Raw => effect.kind.event_payload_type().to_owned(),
                                     _ => effect.kind.ok_payload_type().to_owned(),
                                 };
-                                self.local_types.insert(tmp.clone(), tmp_ty.clone());
+                                let pat = let_expr
+                                    .pat()
+                                    .map(|p| p.syntax().text().to_string().trim().to_owned())
+                                    .unwrap_or_else(|| "_".to_owned());
+                                let cond_txt = format!("let {pat} = {tmp}");
                                 let resume = self.new_block();
                                 let sidx = self.suspend_count;
                                 self.suspend_count += 1;
                                 self.finish_with(Terminator::Suspend {
                                     suspend_index: sidx,
                                     effect,
-                                    bind: Some(tmp.clone()),
+                                    bind: Some(tmp),
                                     bind_mut: false,
                                     bind_type: Some(tmp_ty),
                                     unwrap_mode,
                                     resume,
                                 });
                                 self.cur = resume;
-                                let pat = let_expr
-                                    .pat()
-                                    .map(|p| p.syntax().text().to_string().trim().to_owned())
-                                    .unwrap_or_else(|| "_".to_owned());
-                                format!("let {pat} = {tmp}")
+                                cond_txt
                             } else {
                                 cond_expr.syntax().text().to_string().trim().to_owned()
                             }
@@ -610,7 +607,6 @@ impl<'a> CfgBuilder<'a> {
                             UnwrapMode::Raw => effect.kind.event_payload_type().to_owned(),
                             _ => effect.kind.ok_payload_type().to_owned(),
                         };
-                        self.local_types.insert(tmp.clone(), tmp_ty.clone());
                         let resume = self.new_block();
                         let sidx = self.suspend_count;
                         self.suspend_count += 1;
@@ -734,16 +730,21 @@ impl<'a> CfgBuilder<'a> {
                 self.iter_counter += 1;
                 let items_var = format!("__for_items_{idx}");
                 let pos_var = format!("__for_idx_{idx}");
+                let items_init = format!("let {items_var} = ({iter_expr}).into_iter().collect::<Vec<_>>();");
+                let pos_init = format!("let mut {pos_var}: usize = 0;");
+                let loop_cond = format!("{pos_var} < {items_var}.len()");
+                let elem_bind = format!("let {pat} = {items_var}[{pos_var}].clone();");
+                let pos_inc = format!("{pos_var} += 1;");
 
                 self.push_stmt(PureStmt {
-                    code: format!("let {items_var} = ({iter_expr}).into_iter().collect::<Vec<_>>();"),
-                    defined_var: Some(items_var.clone()),
+                    code: items_init,
+                    defined_var: Some(items_var),
                     is_mut: false,
                     var_type: Some("Vec<String>".to_owned()),
                 });
                 self.push_stmt(PureStmt {
-                    code: format!("let mut {pos_var}: usize = 0;"),
-                    defined_var: Some(pos_var.clone()),
+                    code: pos_init,
+                    defined_var: Some(pos_var),
                     is_mut: true,
                     var_type: Some("usize".to_owned()),
                 });
@@ -755,7 +756,7 @@ impl<'a> CfgBuilder<'a> {
                 self.finish_with(Terminator::Goto(header_bb));
                 self.cur = header_bb;
                 self.finish_with(Terminator::Branch {
-                    cond: format!("{pos_var} < {items_var}.len()"),
+                    cond: loop_cond,
                     then_bb: body_bb,
                     else_bb: exit_bb,
                 });
@@ -764,13 +765,13 @@ impl<'a> CfgBuilder<'a> {
                 self.cur = body_bb;
                 let simple_pat = extract_simple_ident(&pat);
                 self.push_stmt(PureStmt {
-                    code: format!("let {pat} = {items_var}[{pos_var}].clone();"),
+                    code: elem_bind,
                     defined_var: simple_pat,
                     is_mut: false,
                     var_type: Some("String".to_owned()),
                 });
                 self.push_stmt(PureStmt {
-                    code: format!("{pos_var} += 1;"),
+                    code: pos_inc,
                     defined_var: None,
                     is_mut: false,
                     var_type: None,
@@ -796,21 +797,6 @@ impl<'a> CfgBuilder<'a> {
                         UnwrapMode::Raw => effect.kind.event_payload_type().to_owned(),
                         _ => effect.kind.ok_payload_type().to_owned(),
                     };
-                    self.local_types.insert(tmp.clone(), tmp_ty.clone());
-                    let resume = self.new_block();
-                    let sidx = self.suspend_count;
-                    self.suspend_count += 1;
-                    self.finish_with(Terminator::Suspend {
-                        suspend_index: sidx,
-                        effect,
-                        bind: Some(tmp.clone()),
-                        bind_mut: false,
-                        bind_type: Some(tmp_ty),
-                        unwrap_mode,
-                        resume,
-                    });
-                    self.cur = resume;
-
                     let erange = expr.syntax().text_range();
                     let es: usize = erange.start().into();
                     let is: usize = inner_range.start().into();
@@ -823,6 +809,20 @@ impl<'a> CfgBuilder<'a> {
                     spliced.push_str(&tmp);
                     spliced.push_str(&txt[re..]);
                     spliced.push(';');
+
+                    let resume = self.new_block();
+                    let sidx = self.suspend_count;
+                    self.suspend_count += 1;
+                    self.finish_with(Terminator::Suspend {
+                        suspend_index: sidx,
+                        effect,
+                        bind: Some(tmp),
+                        bind_mut: false,
+                        bind_type: Some(tmp_ty),
+                        unwrap_mode,
+                        resume,
+                    });
+                    self.cur = resume;
                     self.push_stmt(PureStmt { code: spliced, defined_var: None, is_mut: false, var_type: None });
                 } else {
                     let code = format!("{};", expr.syntax().text().to_string().trim());
@@ -839,7 +839,6 @@ impl<'a> CfgBuilder<'a> {
                 UnwrapMode::Raw => effect.kind.event_payload_type().to_owned(),
                 _ => effect.kind.ok_payload_type().to_owned(),
             };
-            self.local_types.insert(tmp.clone(), ty.clone());
             let resume = self.new_block();
             let sidx = self.suspend_count;
             self.suspend_count += 1;
@@ -1094,13 +1093,14 @@ fn contains_effect(node: &syntax::SyntaxNode) -> bool {
 
 fn extract_effect_expr(source: &str, expr: &ast::Expr) -> Option<(EffectCall, UnwrapMode)> {
     let mut mode = UnwrapMode::Raw;
-    let mut cur = expr.clone();
+    let mut owned: Option<ast::Expr> = None;
 
     for _ in 0..8 {
-        match &cur {
+        let cur = owned.as_ref().unwrap_or(expr);
+        match cur {
             ast::Expr::TryExpr(t) => {
                 mode = UnwrapMode::TryPropagate;
-                cur = t.expr()?;
+                owned = Some(t.expr()?);
             }
             ast::Expr::AwaitExpr(a) => {
                 let inner_txt = a
@@ -1125,16 +1125,16 @@ fn extract_effect_expr(source: &str, expr: &ast::Expr) -> Option<(EffectCall, Un
                         if mode == UnwrapMode::Raw {
                             mode = UnwrapMode::UnwrapOrPanic;
                         }
-                        cur = mc.receiver()?;
+                        owned = Some(mc.receiver()?);
                     }
                     "unwrap_or_default" => {
                         if mode == UnwrapMode::Raw {
                             mode = UnwrapMode::UnwrapOrDefault;
                         }
-                        cur = mc.receiver()?;
+                        owned = Some(mc.receiver()?);
                     }
                     "map_err" | "context" | "with_context" | "ok" | "send_json" | "call" | "output" => {
-                        cur = mc.receiver()?;
+                        owned = Some(mc.receiver()?);
                     }
                     _ => break,
                 }
@@ -1208,7 +1208,7 @@ fn extract_effect_expr(source: &str, expr: &ast::Expr) -> Option<(EffectCall, Un
                 break;
             }
             ast::Expr::ParenExpr(p) => {
-                cur = p.expr()?;
+                owned = Some(p.expr()?);
             }
             _ => break,
         }
@@ -1227,7 +1227,7 @@ fn find_nested_effect(
         if node.ancestors().any(|a| a.kind() == SyntaxKind::CLOSURE_EXPR) {
             continue;
         }
-        if let Some(sub) = ast::Expr::cast(node.clone()) {
+        if let Some(sub) = ast::Expr::cast(node) {
             if let Some((eff, mode)) = extract_effect_expr(source, &sub) {
                 return Some((sub.syntax().text_range(), eff, mode));
             }
@@ -1391,44 +1391,47 @@ fn unwrap_result_or_option(ty: &str) -> Option<String> {
 /// - dead variables are pruned immediately, and
 /// - variables declared only in later/disjoint blocks can NEVER leak into earlier states!
 pub fn compute_liveness(cfg: &SmCfg) -> LivenessInfo {
+    type NameSet<'a> = BTreeSet<&'a str>;
     let n = cfg.blocks.len();
-    let mut all_locals: BTreeSet<String> = cfg
+    let mut all_locals: NameSet<'_> = cfg
         .local_types
         .keys()
-        .cloned()
-        .chain(cfg.params.iter().map(|(p, _)| p.clone()))
+        .map(String::as_str)
+        .chain(cfg.params.iter().map(|(p, _)| p.as_str()))
         .collect();
     for bb in &cfg.blocks {
         for stmt in &bb.stmts {
             if let Some(v) = &stmt.defined_var {
-                all_locals.insert(v.clone());
+                all_locals.insert(v.as_str());
             }
         }
         if let Terminator::Suspend { bind: Some(b), .. } = &bb.term {
-            all_locals.insert(b.clone());
+            all_locals.insert(b.as_str());
         }
     }
 
-    let mut block_uses: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
-    let mut block_defs: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
+    let mut block_uses = vec![NameSet::new(); n];
+    let mut block_defs = vec![NameSet::new(); n];
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut resume_bound: BTreeMap<usize, String> = BTreeMap::new();
+    let mut resume_bound: BTreeMap<usize, &str> = BTreeMap::new();
 
     for (idx, bb) in cfg.blocks.iter().enumerate() {
-        let mut defined_so_far = BTreeSet::new();
+        let mut defined_so_far = NameSet::new();
         for stmt in &bb.stmts {
             let rhs = match stmt.code.split_once('=') {
                 Some((_, r)) if stmt.defined_var.is_some() => r,
                 _ => stmt.code.as_str(),
             };
             for ident in scan_identifiers(rhs) {
-                if all_locals.contains(&ident) && !defined_so_far.contains(&ident) {
-                    block_uses[idx].insert(ident);
+                if let Some(&loc) = all_locals.get(ident.as_str()) {
+                    if !defined_so_far.contains(loc) {
+                        block_uses[idx].insert(loc);
+                    }
                 }
             }
             if let Some(v) = &stmt.defined_var {
-                defined_so_far.insert(v.clone());
-                block_defs[idx].insert(v.clone());
+                defined_so_far.insert(v.as_str());
+                block_defs[idx].insert(v.as_str());
             }
         }
 
@@ -1436,12 +1439,14 @@ pub fn compute_liveness(cfg: &SmCfg) -> LivenessInfo {
             Terminator::Suspend { effect, bind, resume, .. } => {
                 preds[resume.0].push(idx);
                 if let Some(b) = bind {
-                    resume_bound.insert(resume.0, b.clone());
+                    resume_bound.insert(resume.0, b.as_str());
                 }
                 for arg in &effect.args {
                     for ident in scan_identifiers(arg) {
-                        if all_locals.contains(&ident) && !defined_so_far.contains(&ident) {
-                            block_uses[idx].insert(ident);
+                        if let Some(&loc) = all_locals.get(ident.as_str()) {
+                            if !defined_so_far.contains(loc) {
+                                block_uses[idx].insert(loc);
+                            }
                         }
                     }
                 }
@@ -1450,8 +1455,10 @@ pub fn compute_liveness(cfg: &SmCfg) -> LivenessInfo {
                 preds[then_bb.0].push(idx);
                 preds[else_bb.0].push(idx);
                 for ident in scan_identifiers(cond) {
-                    if all_locals.contains(&ident) && !defined_so_far.contains(&ident) {
-                        block_uses[idx].insert(ident);
+                    if let Some(&loc) = all_locals.get(ident.as_str()) {
+                        if !defined_so_far.contains(loc) {
+                            block_uses[idx].insert(loc);
+                        }
                     }
                 }
             }
@@ -1460,8 +1467,10 @@ pub fn compute_liveness(cfg: &SmCfg) -> LivenessInfo {
                     preds[target.0].push(idx);
                 }
                 for ident in scan_identifiers(scrutinee) {
-                    if all_locals.contains(&ident) && !defined_so_far.contains(&ident) {
-                        block_uses[idx].insert(ident);
+                    if let Some(&loc) = all_locals.get(ident.as_str()) {
+                        if !defined_so_far.contains(loc) {
+                            block_uses[idx].insert(loc);
+                        }
                     }
                 }
             }
@@ -1470,8 +1479,10 @@ pub fn compute_liveness(cfg: &SmCfg) -> LivenessInfo {
             }
             Terminator::Return(expr) => {
                 for ident in scan_identifiers(expr) {
-                    if all_locals.contains(&ident) && !defined_so_far.contains(&ident) {
-                        block_uses[idx].insert(ident);
+                    if let Some(&loc) = all_locals.get(ident.as_str()) {
+                        if !defined_so_far.contains(loc) {
+                            block_uses[idx].insert(loc);
+                        }
                     }
                 }
             }
@@ -1480,9 +1491,9 @@ pub fn compute_liveness(cfg: &SmCfg) -> LivenessInfo {
     }
 
     // 2a. Forward definite-availability fixpoint (`avail_in`, `avail_out`).
-    let entry_params: BTreeSet<String> = cfg.params.iter().map(|(p, _)| p.clone()).collect();
-    let mut avail_in: Vec<BTreeSet<String>> = vec![all_locals.clone(); n];
-    let mut avail_out: Vec<BTreeSet<String>> = vec![all_locals.clone(); n];
+    let entry_params: NameSet<'_> = cfg.params.iter().map(|(p, _)| p.as_str()).collect();
+    let mut avail_in: Vec<NameSet<'_>> = (0..n).map(|_| all_locals.iter().copied().collect()).collect();
+    let mut avail_out: Vec<NameSet<'_>> = (0..n).map(|_| all_locals.iter().copied().collect()).collect();
     avail_in[cfg.entry.0] = entry_params;
 
     let mut iter = 0;
@@ -1492,24 +1503,24 @@ pub fn compute_liveness(cfg: &SmCfg) -> LivenessInfo {
         for idx in 0..n {
             if idx != cfg.entry.0 {
                 let mut new_in = if preds[idx].is_empty() {
-                    BTreeSet::new()
+                    NameSet::new()
                 } else {
-                    let mut acc = avail_out[preds[idx][0]].clone();
+                    let mut acc: NameSet<'_> = avail_out[preds[idx][0]].iter().copied().collect();
                     for &p in &preds[idx][1..] {
                         acc.retain(|v| avail_out[p].contains(v));
                     }
                     acc
                 };
-                if let Some(b) = resume_bound.get(&idx) {
-                    new_in.insert(b.clone());
+                if let Some(&b) = resume_bound.get(&idx) {
+                    new_in.insert(b);
                 }
                 if new_in != avail_in[idx] {
                     avail_in[idx] = new_in;
                     changed = true;
                 }
             }
-            let mut new_out = avail_in[idx].clone();
-            new_out.extend(block_defs[idx].iter().cloned());
+            let mut new_out: NameSet<'_> = avail_in[idx].iter().copied().collect();
+            new_out.extend(block_defs[idx].iter().copied());
             if new_out != avail_out[idx] {
                 avail_out[idx] = new_out;
                 changed = true;
@@ -1521,45 +1532,45 @@ pub fn compute_liveness(cfg: &SmCfg) -> LivenessInfo {
     }
 
     // 2b. Backward liveness fixpoint (`live_in`, `live_out`).
-    let mut live_in: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
-    let mut live_out: Vec<BTreeSet<String>> = vec![BTreeSet::new(); n];
+    let mut live_in = vec![NameSet::new(); n];
+    let mut live_out = vec![NameSet::new(); n];
 
     iter = 0;
     while iter < MAX_DATAFLOW_ITERS {
         iter += 1;
         let mut changed = false;
         for idx in (0..n).rev() {
-            let mut out = BTreeSet::new();
+            let mut out = NameSet::new();
             match &cfg.blocks[idx].term {
                 Terminator::Suspend { resume, bind, .. } => {
-                    for v in &live_in[resume.0] {
-                        if bind.as_ref() != Some(v) {
-                            out.insert(v.clone());
+                    for &v in &live_in[resume.0] {
+                        if bind.as_deref() != Some(v) {
+                            out.insert(v);
                         }
                     }
                 }
                 Terminator::Branch { then_bb, else_bb, .. } => {
-                    out.extend(live_in[then_bb.0].iter().cloned());
-                    out.extend(live_in[else_bb.0].iter().cloned());
+                    out.extend(live_in[then_bb.0].iter().copied());
+                    out.extend(live_in[else_bb.0].iter().copied());
                 }
                 Terminator::Match { arms, .. } => {
                     for (_, target) in arms {
-                        out.extend(live_in[target.0].iter().cloned());
+                        out.extend(live_in[target.0].iter().copied());
                     }
                 }
                 Terminator::Goto(target) => {
-                    out.extend(live_in[target.0].iter().cloned());
+                    out.extend(live_in[target.0].iter().copied());
                 }
                 Terminator::Return(_) | Terminator::Open => {}
             }
 
-            let mut inp = block_uses[idx].clone();
-            for v in &out {
+            let mut inp: BTreeSet<&str> = block_uses[idx].iter().copied().collect();
+            for &v in &out {
                 if !block_defs[idx].contains(v) {
-                    inp.insert(v.clone());
+                    inp.insert(v);
                 }
             }
-            if let Some(bound) = resume_bound.get(&idx) {
+            if let Some(&bound) = resume_bound.get(&idx) {
                 inp.remove(bound);
             }
 
@@ -1581,8 +1592,8 @@ pub fn compute_liveness(cfg: &SmCfg) -> LivenessInfo {
         if let Terminator::Suspend { suspend_index, bind, resume, .. } = &bb.term {
             let mut vars: Vec<String> = live_in[resume.0]
                 .iter()
-                .filter(|v| bind.as_ref() != Some(*v) && avail_out[idx].contains(*v))
-                .cloned()
+                .filter(|&&v| bind.as_deref() != Some(v) && avail_out[idx].contains(v))
+                .map(|&v| v.to_owned())
                 .collect();
             vars.sort();
             max_live = max_live.max(vars.len());
@@ -1590,11 +1601,15 @@ pub fn compute_liveness(cfg: &SmCfg) -> LivenessInfo {
         }
     }
 
+    let own_sets = |sets: Vec<BTreeSet<&str>>| -> Vec<BTreeSet<String>> {
+        sets.into_iter().map(|s| s.into_iter().map(str::to_owned).collect()).collect()
+    };
+
     LivenessInfo {
-        live_in,
-        live_out,
-        avail_in,
-        avail_out,
+        live_in: own_sets(live_in),
+        live_out: own_sets(live_out),
+        avail_in: own_sets(avail_in),
+        avail_out: own_sets(avail_out),
         saved_at_suspend,
         total_locals: all_locals.len(),
         max_live_at_suspend: max_live,

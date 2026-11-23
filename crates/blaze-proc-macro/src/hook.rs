@@ -23,9 +23,13 @@
     reason = "a std Mutex holds the findings across the expansion's threads; blaze_core::lock is not a dependency of this crate"
 )]
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use std::{
+    fs,
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use blaze_expand::{
@@ -299,8 +303,8 @@ impl<'r> ProcMacros<'r> {
     pub fn keep_all(&self) -> Result<KeptAll, RecordError> {
         let mut mark = self.runtime.parts().start();
         // clone: the slots and tables, a refcount each: no table is written under a lock.
-        let slots: Vec<Arc<CrateSlot>> = crate::host::lock(&self.slots).clone();
-        let tables: Vec<Arc<CrateResults>> = crate::host::lock(&self.tables).clone();
+        use crate::ShareArc;
+        let (slots, tables): (Vec<_>, Vec<_>) = (crate::host::lock(&self.slots).iter().map(ShareArc::share_arc).collect(), crate::host::lock(&self.tables).iter().map(ShareArc::share_arc).collect());
         let mut kept = KeptAll::default();
         for results in &tables {
             let verdicts: Vec<&Verdicts> = slots.iter().filter(|slot| Arc::ptr_eq(&slot.results, results)).map(|slot| &slot.verdicts).collect();
@@ -523,16 +527,28 @@ impl<'r> ProcMacros<'r> {
         if let Some(ref dylib) = module.native_dylib {
             let real_dir: Option<String> = match &package.files {
                 crate::sandbox::Files::Folder(dir) => {
-                    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
-                    Some(canon.to_string_lossy().into_owned())
+                    let canon = fs::canonicalize(dir);
+                    let resolved = canon.as_deref().unwrap_or(dir.as_path());
+                    Some(resolved.to_string_lossy().into_owned())
                 }
                 crate::sandbox::Files::Member { workspace, root } => {
                     let seen = root.seen().to_string();
                     let rel = seen.strip_prefix("/workspace").unwrap_or("").trim_start_matches('/');
-                    let base = if workspace.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { workspace.clone() };
-                    let full = if rel.is_empty() { base } else { base.join(rel) };
-                    let canon = std::fs::canonicalize(&full).unwrap_or(full);
-                    Some(canon.to_string_lossy().into_owned())
+                    let base = if workspace.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        workspace.as_path()
+                    };
+                    let joined;
+                    let full = if rel.is_empty() {
+                        base
+                    } else {
+                        joined = base.join(rel);
+                        joined.as_path()
+                    };
+                    let canon = fs::canonicalize(full);
+                    let resolved = canon.as_deref().unwrap_or(full);
+                    Some(resolved.to_string_lossy().into_owned())
                 }
                 crate::sandbox::Files::Listed(files) => {
                     // Materialize `Cargo.toml` once by content digest so fetched-crate proc macros
@@ -547,45 +563,53 @@ impl<'r> ProcMacros<'r> {
                         let dir = std::env::temp_dir().join("blaze-pm-manifests").join(&hex);
                         let manifest = dir.join("Cargo.toml");
                         if !manifest.is_file() {
-                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = fs::create_dir_all(&dir);
                             let tmp = dir.join(format!(".Cargo.toml.{}", std::process::id()));
-                            if std::fs::write(&tmp, bytes).is_ok() {
-                                let _ = std::fs::rename(&tmp, &manifest);
+                            if fs::write(&tmp, bytes).is_ok() {
+                                let _ = fs::rename(&tmp, &manifest);
                             }
                         }
-                        let canon = std::fs::canonicalize(&dir).unwrap_or(dir);
+                        let canon = fs::canonicalize(&dir).unwrap_or(dir);
                         Some(canon.to_string_lossy().into_owned())
                     })
                 }
             };
-            let mut env_owned: Vec<(String, String)> = package
-                .env
-                .vars()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect();
+            let manifest_path = real_dir
+                .as_deref()
+                .map(|dir| Path::new(dir).join("Cargo.toml").to_string_lossy().into_owned());
             let mut orig_manifest_dir = None;
-            if let Some(ref dir) = real_dir {
-                let manifest_path = std::path::Path::new(dir).join("Cargo.toml").to_string_lossy().into_owned();
-                let mut had_dir = false;
-                let mut had_path = false;
-                for (k, v) in &mut env_owned {
+            let mut env_refs: Vec<(&str, &str)> = Vec::new();
+            let mut had_dir = false;
+            let mut had_path = false;
+            for (k, v) in package.env.vars() {
+                if let Some(dir) = real_dir.as_deref() {
                     if k == "CARGO_MANIFEST_DIR" {
-                        orig_manifest_dir = Some(core::mem::replace(v, dir.clone()));
+                        orig_manifest_dir = Some(v);
+                        env_refs.push((k, dir));
                         had_dir = true;
-                    } else if k == "CARGO_MANIFEST_PATH" {
-                        *v = manifest_path.clone();
+                        continue;
+                    }
+                    if k == "CARGO_MANIFEST_PATH"
+                        && let Some(mp) = manifest_path.as_deref()
+                    {
+                        env_refs.push((k, mp));
                         had_path = true;
+                        continue;
                     }
                 }
+                env_refs.push((k, v));
+            }
+            if let Some(dir) = real_dir.as_deref() {
                 if !had_dir {
-                    env_owned.push(("CARGO_MANIFEST_DIR".to_owned(), dir.clone()));
+                    env_refs.push(("CARGO_MANIFEST_DIR", dir));
                 }
-                if !had_path {
-                    env_owned.push(("CARGO_MANIFEST_PATH".to_owned(), manifest_path));
+                if !had_path
+                    && let Some(mp) = manifest_path.as_deref()
+                {
+                    env_refs.push(("CARGO_MANIFEST_PATH", mp));
                 }
             }
-            let path_remap = real_dir.as_deref().zip(orig_manifest_dir.as_deref());
-            let env_refs: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let path_remap = real_dir.as_deref().zip(orig_manifest_dir);
             match self.native_pool.expand_macro(dylib, &export.name, call, edition, &env_refs, real_dir.as_deref(), path_remap, alloc) {
                 Ok(produced) => {
                     let mut mark = parts.start();
@@ -619,7 +643,8 @@ impl<'r> ProcMacros<'r> {
                 return Err(failed);
             }
         };
-        match self.runtime.expand(&loaded, export, call, edition, package.clone(), self.limits, alloc) {
+        use crate::ShareArc as _;
+        match self.runtime.expand(&loaded, export, call, edition, package.share_arc(), self.limits, alloc) {
             Ok(ran) => {
                 let mut mark = parts.start();
                 let kept = slot.results.insert(self.store, base, &ran.produced);

@@ -210,6 +210,16 @@ impl Env {
     fn new(module: u32) -> Env {
         Env { module, params: Vec::new_in(Global), self_: SelfTy::None, self_assoc: Vec::new_in(Global) }
     }
+
+    fn copy_in(&self) -> Env {
+        let alloc = *self.params.allocator();
+        Env {
+            module: self.module,
+            params: self.params.to_vec_in(alloc),
+            self_: self.self_,
+            self_assoc: self.self_assoc.to_vec_in(alloc),
+        }
+    }
 }
 
 struct AdtHead {
@@ -1639,7 +1649,7 @@ impl<'f> Front<'f> {
                                     let ckey = member_key(key, 1, cname);
                                     let csig = lower_sig(ctext, cat, cwhole, alloc)?;
                                     let path = self.item_path(m, &format!("{name}::{cname}"));
-                                    let row = self.fn_row(ckey, cname, path, cat, ctext, FnKind::Trait(ti), Some(key), env.clone(), own + 1, csig)?;
+                                    let row = self.fn_row(ckey, cname, path, cat, ctext, FnKind::Trait(ti), Some(key), env.copy_in(), own + 1, csig)?;
                                     head_.fns.push((Name::of(cname), ckey));
                                     let i = self.fns.len() as u32;
                                     self.fns.push(row);
@@ -1689,7 +1699,7 @@ impl<'f> Front<'f> {
                                 ItemDetail::Fn { .. } => {
                                     let ckey = member_key(key, 1, cname);
                                     let csig = lower_sig(ctext, cat, cwhole, alloc)?;
-                                    let row = self.fn_row(ckey, cname, cname.into(), cat, ctext, FnKind::Impl(ii), Some(key), env.clone(), generics, csig)?;
+                                    let row = self.fn_row(ckey, cname, cname.into(), cat, ctext, FnKind::Impl(ii), Some(key), env.copy_in(), generics, csig)?;
                                     let i = self.fns.len() as u32;
                                     fns.push(i);
                                     self.fns.push(row);
@@ -2191,13 +2201,13 @@ impl<'f> Front<'f> {
                     text: p.text,
                     kind: FnKind::Ctor,
                     container: None,
-                    env: env.clone(),
+                    env: env.copy_in(),
                     parent: 0,
                     own: generics,
                     self_param: false,
                     inputs: tys_,
                     output: self_ty,
-                    clauses: sized.clone(),
+                    clauses: sized.to_vec_in(*sized.allocator()),
                     abi: Abi::Rust,
                     header: tc::FnPtrHeader::RUST,
                     symbol: "".into(),
@@ -2264,13 +2274,13 @@ impl<'f> Front<'f> {
                 text,
                 kind: FnKind::Const,
                 container: None,
-                env: env.clone(),
+                env: env.copy_in(),
                 parent: count,
                 own: 0,
                 self_param: false,
                 inputs: Vec::new_in(Global),
                 output: bool_,
-                clauses: clauses.clone(),
+                clauses: clauses.to_vec_in(*clauses.allocator()),
                 abi: Abi::Rust,
                 header: tc::FnPtrHeader::RUST,
                 symbol: "".into(),
@@ -2290,7 +2300,7 @@ impl<'f> Front<'f> {
         let p = &imp.item;
         let at = p.at;
         let v = p.sig.view();
-        let mut env = imp.env.clone();
+        let mut env = imp.env.copy_in();
         let self_t = v.head_opt(head::SELF_TY).ok_or(Why::Unsupported("an impl with no self type", Range::new(0, 0))).map_err(|w| w.at(at))?;
         let self_ty = self.names.ty(&mut self.tys, &env, &v, lf::TypeId(self_t)).map_err(|w| w.at(at))?;
         env.self_ = SelfTy::Ty(self_ty);
@@ -2323,17 +2333,18 @@ impl<'f> Front<'f> {
             let t = self.names.ty(&mut self.tys, &env, &av, lf::TypeId(t)).map_err(|w| w.at(ap.at))?;
             assoc.push((*name, t));
         }
-        env.self_assoc = assoc.clone();
+        let alloc = *assoc.allocator();
+        env.self_assoc = assoc.to_vec_in(alloc);
         for &f in &imp.fns {
             let row = &mut self.fns[f as usize];
             row.env.self_ = SelfTy::Ty(self_ty);
-            row.env.self_assoc = assoc.clone();
-            let name = self.names.modules[p.module as usize].path.clone();
+            row.env.self_assoc = assoc.to_vec_in(alloc);
+            let name = &*self.names.modules[p.module as usize].path;
             let shown = format!("{}<{}>::{}", if name.is_empty() { "" } else { "::" }, imp.generics, "");
             let _ = shown;
             let self_text = v.text_at(v.type_range(lf::TypeId(self_t)).map_err(|b| Why::from(b).at(at))?).map_err(|t| Why::from(t).at(at))?;
-            let fname = self.fns[f as usize].path.clone();
-            self.fns[f as usize].path = self.item_path(p.module, &format!("{self_text}::{fname}"));
+            let full = format!("{self_text}::{}", self.fns[f as usize].path);
+            self.fns[f as usize].path = self.item_path(p.module, &full);
         }
         self.index.insert(imp.key, ItemRef::Impl(self.impls.len() as u32));
         self.impls.push(ImplRow {
@@ -2344,7 +2355,7 @@ impl<'f> Front<'f> {
             trait_args,
             assoc,
             clauses,
-            fns: imp.fns.clone(),
+            fns: imp.fns.to_vec_in(*imp.fns.allocator()),
         });
         Ok(())
     }
@@ -2355,7 +2366,7 @@ impl<'f> Front<'f> {
         let v = sig.view();
         let row = &self.fns[i];
         let (at, text, parent, kind) = (row.at, row.text, row.parent, row.kind);
-        let mut env = row.env.clone();
+        let mut env = row.env.copy_in();
         let mut clauses = Vec::new_in(Global);
         match kind {
             FnKind::Trait(ti) => {
@@ -2553,15 +2564,9 @@ impl<'f> Front<'f> {
                 (None, None) => {}
             }
         }
-        let mut extra = Vec::new_in(Global);
-        for (&(tr, s), _) in self.buckets.iter() {
+        for (&(tr, _), v) in self.buckets.iter_mut() {
             if let Some(b) = self.blankets.get(&tr) {
-                extra.push(((tr, s), b.clone()));
-            }
-        }
-        for (k, b) in extra {
-            if let Some(v) = self.buckets.get_mut(&k) {
-                v.extend_from_slice(&b);
+                v.extend_from_slice(b);
             }
         }
     }

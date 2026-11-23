@@ -77,7 +77,10 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let checked = match typer {
             Typer::Check => {
                 let view = made.lowered.view();
-                let spell = Spelling::of(&view).map_err(|_| LazyRefusal::Spell { function: function.clone() })?;
+                let spell = match Spelling::of(&view) {
+                    Ok(spell) => spell,
+                    Err(_) => return Err(LazyRefusal::Spell { function }),
+                };
                 let scope = made.scope(&spell);
                 let checked = {
                     let mut r = self.records(true);
@@ -90,7 +93,10 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             // Read, not checked: `counts.checked` stays as it is (a run from records checks no
             // body, and the count says so).
             Typer::Record(records) => {
-                let checked = records.typed(key).map_err(|gap| LazyRefusal::Typed { function: function.clone(), gap })?;
+                let checked = match records.typed(key) {
+                    Ok(checked) => checked,
+                    Err(gap) => return Err(LazyRefusal::Typed { function, gap }),
+                };
                 self.file_read_check(key, want, &made, &checked, &function)?;
                 checked
             }
@@ -461,11 +467,24 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             // A diagnostic: its words and its `file:line` (rule 19: the checker's range is
             // relative to the body's own item, rule 71; a body of an item declared in a body is
             // placed through the items around it, as a gap is below).
-            if let CheckFail::Diags { owner, diags, .. } = &error
-                && let Some((code, range, about)) = diags.first()
-                && let Some((at, _)) = self.file_line(*owner, range.start, range.end.saturating_sub(range.start))
-            {
-                return LazyRefusal::Diagnostic { function: Box::from(function), code: code.code(), about: about.clone(), at: at.into_boxed_str(), others: diags.len() - 1 };
+            let placed = match &error {
+                CheckFail::Diags { owner, diags, .. } => diags
+                    .first()
+                    .and_then(|(_, range, _)| self.file_line(*owner, range.start, range.end.saturating_sub(range.start))),
+                _ => None,
+            };
+            if let Some((at, _)) = placed {
+                let function = Box::from(function);
+                return match error {
+                    CheckFail::Diags { diags, .. } => {
+                        let others = diags.len().saturating_sub(1);
+                        match diags.into_iter().next() {
+                            Some((code, _, about)) => LazyRefusal::Diagnostic { function, code: code.code(), about, at: at.into_boxed_str(), others },
+                            None => LazyRefusal::Diagnostic { function, code: "", about: Box::from(""), at: at.into_boxed_str(), others: 0 },
+                        }
+                    }
+                    error => LazyRefusal::Check { function, error },
+                };
             }
             return LazyRefusal::Check { function: Box::from(function), error };
         };

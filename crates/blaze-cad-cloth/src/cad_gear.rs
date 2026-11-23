@@ -27,7 +27,7 @@ use blaze_math::{Vec2, Vec3};
 use blaze_own::{Alloc, AllocFailure, Vec};
 use blaze_units::{Angle, Length};
 
-use crate::detail::GarmentMesh;
+use crate::detail::{GarmentMesh, PanelKind};
 
 /// Default `[width, height, thickness]` for the Tactical Cobra Belt Buckle (`54 × 42 × 10 mm`).
 pub const COBRA_BUCKLE_DEFAULT: [Length; 3] = [
@@ -647,6 +647,8 @@ pub fn append_cad_solid_to_garment(
     let span_x = (max_x - min_x).max(1e-6);
     let span_y = (max_y - min_y).max(1e-6);
 
+    let cad_panel_id = garment.register_panel("cad_hardware", PanelKind::Hardware, 3, fabric_idx, None)?;
+
     let base_v = garment.positions.len() as u32;
     for (p, n) in src_pos.iter().zip(src_nrm.iter()) {
         let lx = f64::from(p[0]);
@@ -662,6 +664,7 @@ pub fn append_cad_solid_to_garment(
         push(&mut garment.positions, world_p)?;
         push(&mut garment.normals, world_n)?;
         push(&mut garment.uvs, uv)?;
+        push(&mut garment.rest_pos_m, Vec2::new(lx, ly))?;
         push(&mut garment.colors, [70, 235, 0, 0])?;
         push(&mut garment.rigid_anchor, Some(anchor))?;
         push(&mut garment.weld_rep, vi)?;
@@ -676,6 +679,7 @@ pub fn append_cad_solid_to_garment(
         push(&mut garment.triangles, tri)?;
         push(&mut garment.tri_fabric, fabric_idx)?;
         push(&mut garment.tri_layer, 3)?;
+        push(&mut garment.tri_panel, cad_panel_id)?;
     }
 
     Ok(src_tris.len() as u32)

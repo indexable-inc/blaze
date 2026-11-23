@@ -18,6 +18,7 @@ use blaze_text::{Put, Writes};
 use blaze_units::Length;
 
 use crate::fabric::Fabric;
+use crate::grain::FabricGrain;
 
 /// Identifies one of the four topological sides of a curvilinear Coons pattern panel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -350,6 +351,8 @@ pub struct PanelSpec<'a> {
     pub wrap: Wrap3D,
     /// Whether this panel's outer surface normal should be flipped (`false` = `du x dv` points outward).
     pub flip_normal: bool,
+    /// Physical fabric grain orientation & independent texture UV transform (default straight grain).
+    pub grain: FabricGrain = FabricGrain::STRAIGHT,
 }
 
 impl<'a> PanelSpec<'a> {

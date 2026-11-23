@@ -298,16 +298,16 @@ pub fn native_outputs<'a>(
 ) -> Result<ScriptRun<'a>, NativeUnitError> {
     let unit = &graph.units[script.index()];
     let (name, version) = (unit.name.as_str(), unit.version.as_str());
-    let package = format!("{name} {version}");
+    let pkg = || format!("{name} {version}");
     let Some(native) = setting.native else {
         let because = &graph.units[because.index()];
-        return Err(NativeUnitError::NoNativeSetting { package, because: format!("{} {}", because.name.as_str(), because.version.as_str()) });
+        return Err(NativeUnitError::NoNativeSetting { package: pkg(), because: format!("{} {}", because.name.as_str(), because.version.as_str()) });
     };
 
     // The host binary the interim builder made with exactly the unit's features.
     let features: std::vec::Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
     let module = module_of_native(setting.store, name, version, &features, setting.host).map_err(NativeUnitError::Lookup)?.ok_or_else(|| NativeUnitError::NoModule {
-        package: package.clone(),
+        package: pkg(),
         features: features.iter().map(|f| (*f).to_owned()).collect(),
         store: setting.store.display().to_string(),
     })?;
@@ -324,7 +324,7 @@ pub fn native_outputs<'a>(
     // function of the producers' records alone) and what the producers serve (`views.key`
     // below), as a wasm reader's key does; the run is given the values as IT sees them (laid
     // below). A value under neither of a producer's trees is refused here, naming it.
-    let dep_error = |why: LayError| NativeUnitError::DepLinks { package: package.clone(), why };
+    let dep_error = |why: LayError| NativeUnitError::DepLinks { package: pkg(), why };
     let viewed = dep_mount::view_with_stored(&tree, producers, deps, alloc).map_err(|e| dep_error(LayError::View(e)))?;
     let mut keyed: AVec<'a, DepMetadata<'_>> = Vec::new_in(alloc);
     for (dep, value) in deps.iter().zip(viewed.values.iter()) {
@@ -334,7 +334,7 @@ pub fn native_outputs<'a>(
     let env = blaze_build_script::env(&given, alloc);
 
     // D71: the host tools the table grants this package, each at its real path, by digest.
-    let pin = |why: String| NativeUnitError::PinTable { package: package.clone(), why };
+    let pin = |why: String| NativeUnitError::PinTable { package: pkg(), why };
     let table = host_tools::host_tools(CLANG_JSON, setting.host, alloc).map_err(|e| pin(e.to_string()))?;
     let tools: AVec<'a, HostTool<'_>> = host_tools::granted(&table, name, alloc);
     // Every granted program is keyed at its real path: the tool under its name, then each
@@ -356,7 +356,7 @@ pub fn native_outputs<'a>(
         let program = program.as_str();
         let real = std::fs::canonicalize(program).map_err(|e| NativeUnitError::Read { path: program.to_owned(), why: e.to_string() })?;
         if real.as_os_str() != program {
-            return Err(NativeUnitError::ToolNotReal { package: package.clone(), tool: tool.name.to_owned(), path: program.to_owned(), real: real.display().to_string() });
+            return Err(NativeUnitError::ToolNotReal { package: pkg(), tool: tool.name.to_owned(), path: program.to_owned(), real: real.display().to_string() });
         }
         let (dir, file) = program.rsplit_once('/').unwrap_or(("/", program));
         let digest = blaze_sha256::digest(&read_file(if dir.is_empty() { "/" } else { dir }, file)?);
@@ -397,35 +397,38 @@ pub fn native_outputs<'a>(
         // `package_dir` (CARGO_MANIFEST_DIR + cwd) is `<workspace>/<rel>`, while the workspace
         // root itself remains granted read-only so workspace-relative reads still succeed.
         Tree::Dir(dir) => {
-            let ws_real = dir.path().to_str().ok_or_else(|| NativeUnitError::Files { package: package.clone(), folder: dir.path().display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
+            let ws_real = dir.path().to_str().ok_or_else(|| NativeUnitError::Files { package: pkg(), folder: dir.path().display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
             let seen_str = root.seen().to_string();
             let rel = seen_str.strip_prefix("/workspace").unwrap_or("").trim_start_matches('/');
             let pkg_path = if rel.is_empty() { dir.path().to_path_buf() } else { std::fs::canonicalize(dir.path().join(rel)).unwrap_or_else(|_| dir.path().join(rel)) };
-            let pkg_real = pkg_path.to_str().ok_or_else(|| NativeUnitError::Files { package: package.clone(), folder: pkg_path.display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
-            let names = listed_under(&ws_real).map_err(|e| NativeUnitError::Files { package: package.clone(), folder: ws_real.clone(), why: e.to_string() })?;
+            let pkg_real = pkg_path.to_str().ok_or_else(|| NativeUnitError::Files { package: pkg(), folder: pkg_path.display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
+            let names = match listed_under(&ws_real) {
+                Ok(names) => names,
+                Err(e) => return Err(NativeUnitError::Files { package: pkg(), folder: ws_real, why: e.to_string() }),
+            };
             let names = names.into_iter().map(|listed| listed.name).collect();
             let extra_read = (pkg_real != ws_real).then_some(ws_real);
             (pkg_real, extra_read, names)
         }
         Tree::Mem { files, .. } => {
-            let dir = fresh_folder(native.work, &format!("pkg/{key_hex}"), files, &package)?;
+            let dir = fresh_folder(native.work, &format!("pkg/{key_hex}"), files, &pkg())?;
             (dir, None, files.iter().map(|(n, _)| n.clone()).collect())
         }
     };
-    let out_dir = fresh_folder(native.work, &format!("out/{key_hex}"), &[], &package)?;
+    let out_dir = fresh_folder(native.work, &format!("out/{key_hex}"), &[], &pkg())?;
     let clang_major = toolchain::clang_major(CLANG_JSON).map_err(|e| pin(e.to_string()))?;
     let c = CInputs { shelf: Shelf { dir: native.shelf, clang_major }, sysroot: native.sdk, out_dir: &out_dir, package: &package_dir, seen: root.seen(), macos_min: MACOS_MIN };
     // N7: the fact shim the command placed in its work folder, and this run's facts folder.
     // A native run's probes are answered from the pins through the fact shim; the questions
     // asked become reads in the wasm path's fact form (native_facts::reads).
     let pins = setting.spawn_setting.pins.as_ref();
-    let facts_error = |e: native_facts::NativeFactsError| NativeUnitError::Facts { package: package.clone(), why: e.to_string() };
+    let facts_error = |e: native_facts::NativeFactsError| NativeUnitError::Facts { package: pkg(), why: e.to_string() };
     let shim = native_facts::placed_shim(native.work).map_err(facts_error)?;
     let facts = native_facts::prepare(&shim, native.work, &key_hex, pins, alloc).map_err(facts_error)?;
     // The home's file area: each file the script leaves goes there by digest, renamed, never
     // read whole (librocksdb-sys's 810 MB archive); made once, canonical as Seatbelt's paths.
     let area = setting.store.join(blaze_build_script::outputs::FILE_AREA);
-    let area_failed = |why: String| NativeUnitError::Files { package: package.clone(), folder: area.display().to_string(), why };
+    let area_failed = |why: String| NativeUnitError::Files { package: pkg(), folder: area.display().to_string(), why };
     std::fs::create_dir_all(&area).map_err(|e| area_failed(e.to_string()))?;
     let area = std::fs::canonicalize(&area).map_err(|e| area_failed(e.to_string()))?;
     let area = area.to_str().ok_or_else(|| area_failed("not UTF-8".to_owned()))?.to_owned();
@@ -466,7 +469,7 @@ pub fn native_outputs<'a>(
     let asked = native_facts::reads(&facts, pins, alloc).map_err(facts_error)?;
     let ran = match ran {
         Ok(ran) => ran,
-        Err(run) if !asked.refused.is_empty() => return Err(NativeUnitError::FactRefused { package: package.clone(), refused: asked.refused, run }),
+        Err(run) if !asked.refused.is_empty() => return Err(NativeUnitError::FactRefused { package: pkg(), refused: asked.refused, run }),
         Err(run) => return Err(NativeUnitError::Run(run)),
     };
 
@@ -475,7 +478,10 @@ pub fn native_outputs<'a>(
     let mut reads: std::vec::Vec<Read> = std::vec::Vec::with_capacity(listed.len());
     for rel in listed {
         let subject = format!("file:{rel}");
-        let digest = answer_now(&tree, &subject).map_err(|e| NativeUnitError::Files { package: package.clone(), folder: package_dir.clone(), why: e.0 })?;
+        let digest = match answer_now(&tree, &subject) {
+            Ok(digest) => digest,
+            Err(e) => return Err(NativeUnitError::Files { package: pkg(), folder: package_dir, why: e.0 }),
+        };
         reads.push(Read { subject, digest });
     }
     // The facts the script asked (N7), each with the pins' answer now (`None` where refused).

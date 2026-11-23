@@ -38,6 +38,8 @@ pub struct ScriptProbes {
     pub records: Arc<dyn ProbeStore + Send + Sync>,
 }
 
+impl blaze_own::Share for ScriptProbes {}
+
 impl ScriptProbes {
     /// The checker's identity: what the run's key holds in place of the pinned table's.
     pub fn id(&self) -> CheckerId {
@@ -158,26 +160,36 @@ impl ScriptSandbox {
             Ok(line) => line,
             Err(refused) => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::ProbeLine { args: args.to_vec(), at: refused.at, why: refused.why }))),
         };
-        let source: Vec<u8> = match &line {
+        let owned_source;
+        let source: &[u8] = match &line {
             Line::Compile(compile) => match compile.input {
-                Snippet::Stdin => spawned.stdin.clone(),
+                Snippet::Stdin => spawned.stdin.as_slice(),
                 Snippet::File(path) => {
-                    let cwd = spawned.cwd.clone().unwrap_or_else(|| self.script.cwd());
-                    match self.snippet_file(&cwd, path)? {
-                        Some(bytes) => bytes,
+                    let script_cwd;
+                    let cwd = match spawned.cwd.as_deref() {
+                        Some(cwd) => cwd,
+                        None => {
+                            script_cwd = self.script.cwd();
+                            &script_cwd
+                        }
+                    };
+                    match self.snippet_file(cwd, path)? {
+                        Some(bytes) => {
+                            owned_source = bytes;
+                            &owned_source
+                        }
                         // Not in the script's view: as the table's arm refuses it.
                         None => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::RustcArgs { args: args.to_vec() }))),
                     }
                 }
             },
-            Line::Version { .. } | Line::Print { .. } => Vec::new(),
+            Line::Version { .. } | Line::Print { .. } => &[],
         };
         let env = child_env(&self.script.env, spawned);
         let env_refs: Vec<(&str, &str)> = env.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
-        let host = self.script.host.clone();
         // Mode 2: the child's standard output is piped to the script, which can read it.
-        let child = Child { host: &host, env: &env_refs, stdout_read: spawned.modes[0] == 2 };
-        let probe = match probe_check::probe(line, args_text, &source, &child, alloc) {
+        let child = Child { host: &self.script.host, env: &env_refs, stdout_read: spawned.modes[0] == 2 };
+        let probe = match probe_check::probe(line, args_text, source, &child, alloc) {
             Ok(probe) => probe,
             Err(refused) => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::ProbeLine { args: args.to_vec(), at: refused.at, why: refused.why }))),
         };

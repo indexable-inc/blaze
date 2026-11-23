@@ -262,12 +262,17 @@ fn flatten_use_trees(
 ) -> Vec<UseTree> {
     // Return non-sorted single occurrence of the use-trees text string;
     // order is by first occurrence of the use-tree.
-    let mut seen = std::collections::HashSet::new();
-    use_trees
+    let all = use_trees
         .into_iter()
         .flat_map(|tree| tree.flatten(import_granularity))
         .map(UseTree::nest_trailing_self)
-        .filter(|tree| seen.insert(tree.clone()))
+        .collect::<Vec<_>>();
+    let mut seen = std::collections::HashSet::with_capacity(all.len());
+    let keep = all.iter().map(|tree| seen.insert(tree)).collect::<Vec<_>>();
+    drop(seen);
+    all.into_iter()
+        .zip(keep)
+        .filter_map(|(tree, keep)| keep.then_some(tree))
         .collect()
 }
 
@@ -603,8 +608,8 @@ impl UseTree {
                     ..
                 }) => {
                     assert!(old_rename.is_none());
-                    if let UseSegmentKind::Slf(Some(rename)) = last.clone().kind {
-                        *old_rename = Some(rename);
+                    if let UseSegmentKind::Slf(Some(ref mut rename)) = last.kind {
+                        *old_rename = Some(core::mem::take(rename));
                         done = true;
                     }
                 }
@@ -625,10 +630,8 @@ impl UseTree {
 
         if normalize_sole_list {
             match last.kind {
-                UseSegmentKind::List(list) => {
-                    for seg in &list[0].path {
-                        self.path.push(seg.clone());
-                    }
+                UseSegmentKind::List(mut list) => {
+                    self.path.append(&mut list[0].path);
                     return self.normalize();
                 }
                 _ => unreachable!(),
@@ -697,21 +700,26 @@ impl UseTree {
         }
     }
 
-    fn flatten(self, import_granularity: ImportGranularity) -> Vec<UseTree> {
+    fn flatten(mut self, import_granularity: ImportGranularity) -> Vec<UseTree> {
         if self.path.is_empty() || self.contains_comment() {
             return vec![self];
         }
-        match &self.path.clone().last().unwrap().kind {
+        let last = self.path.pop().unwrap();
+        match last.kind {
             UseSegmentKind::List(list) => {
                 if list.len() == 1 && list[0].path.len() == 1 {
                     if let UseSegmentKind::Slf(..) = list[0].path[0].kind {
+                        self.path.push(UseSegment {
+                            kind: UseSegmentKind::List(list),
+                            style_edition: last.style_edition,
+                        });
                         return vec![self];
                     };
                 }
-                let prefix = &self.path[..self.path.len() - 1];
+                let prefix = &self.path;
                 let mut result = vec![];
                 for nested_use_tree in list {
-                    for flattened in &mut nested_use_tree.clone().flatten(import_granularity) {
+                    for mut flattened in nested_use_tree.flatten(import_granularity) {
                         let mut new_path = prefix.to_vec();
                         new_path.append(&mut flattened.path);
                         result.push(UseTree {
@@ -730,7 +738,10 @@ impl UseTree {
 
                 result
             }
-            _ => vec![self],
+            _ => {
+                self.path.push(last);
+                vec![self]
+            }
         }
     }
 
@@ -816,7 +827,7 @@ fn merge_rest(
                     kind: UseSegmentKind::List(rest_list),
                     ..
                 },
-            ] => list.extend(rest_list.clone()),
+            ] => list.extend_from_slice(rest_list),
             _ => list.push(UseTree::from_path(rest.to_vec(), DUMMY_SP)),
         }
         return Some(vec![

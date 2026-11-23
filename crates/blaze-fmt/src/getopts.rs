@@ -18,8 +18,8 @@ enum Occur {
 }
 
 struct Opt {
-    short: String,
-    long: String,
+    short: &'static str,
+    long: &'static str,
     hint: String,
     desc: String,
     hasarg: HasArg,
@@ -58,7 +58,7 @@ enum Val {
 }
 
 pub(crate) struct Matches {
-    names: Vec<(String, String)>,
+    names: Vec<(&'static str, &'static str)>,
     vals: Vec<Vec<Val>>,
     pub(crate) free: Vec<String>,
 }
@@ -70,16 +70,16 @@ impl Options {
 
     fn push(
         &mut self,
-        short: &str,
-        long: &str,
+        short: &'static str,
+        long: &'static str,
         desc: &str,
         hint: &str,
         hasarg: HasArg,
         occur: Occur,
     ) {
         self.opts.push(Opt {
-            short: short.to_owned(),
-            long: long.to_owned(),
+            short,
+            long,
             hint: hint.to_owned(),
             desc: desc.to_owned(),
             hasarg,
@@ -87,15 +87,20 @@ impl Options {
         });
     }
 
-    pub(crate) fn optflag(&mut self, short: &str, long: &str, desc: &str) -> &mut Options {
+    pub(crate) fn optflag(
+        &mut self,
+        short: &'static str,
+        long: &'static str,
+        desc: &str,
+    ) -> &mut Options {
         self.push(short, long, desc, "", HasArg::No, Occur::Optional);
         self
     }
 
     pub(crate) fn optopt(
         &mut self,
-        short: &str,
-        long: &str,
+        short: &'static str,
+        long: &'static str,
         desc: &str,
         hint: &str,
     ) -> &mut Options {
@@ -105,8 +110,8 @@ impl Options {
 
     pub(crate) fn optmulti(
         &mut self,
-        short: &str,
-        long: &str,
+        short: &'static str,
+        long: &'static str,
         desc: &str,
         hint: &str,
     ) -> &mut Options {
@@ -116,8 +121,8 @@ impl Options {
 
     pub(crate) fn optflagopt(
         &mut self,
-        short: &str,
-        long: &str,
+        short: &'static str,
+        long: &'static str,
         desc: &str,
         hint: &str,
     ) -> &mut Options {
@@ -171,9 +176,9 @@ impl Options {
                 }
             }
             for (name, attached, was_long) in names {
-                let id = self
-                    .find(&name)
-                    .ok_or_else(|| Fail::UnrecognizedOption(name.clone()))?;
+                let Some(id) = self.find(&name) else {
+                    return Err(Fail::UnrecognizedOption(name));
+                };
                 let opt = &self.opts[id];
                 match opt.hasarg {
                     HasArg::No => {
@@ -204,11 +209,7 @@ impl Options {
             }
         }
         Ok(Matches {
-            names: self
-                .opts
-                .iter()
-                .map(|o| (o.short.clone(), o.long.clone()))
-                .collect(),
+            names: self.opts.iter().map(|o| (o.short, o.long)).collect(),
             vals,
             free,
         })
@@ -282,7 +283,7 @@ impl Matches {
     fn vals(&self, name: &str) -> &[Val] {
         self.names
             .iter()
-            .position(|(s, l)| l == name || s == name)
+            .position(|&(s, l)| l == name || s == name)
             .map_or(&[], |id| &self.vals[id])
     }
 

@@ -60,7 +60,7 @@ blaze-fetch	175
 blaze-file-items	277
 blaze-flow	284
 blaze-flow-lower	287
-blaze-fmt	354
+blaze-fmt	352
 blaze-format	24
 blaze-format-core	103
 blaze-format-tiers	44
@@ -107,7 +107,7 @@ blaze-parquet	114
 blaze-pg	10
 blaze-phf	40
 blaze-pins	1
-blaze-proc-macro	499
+blaze-proc-macro	495
 blaze-producers	24
 blaze-profile	737
 blaze-protocol	134

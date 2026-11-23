@@ -248,10 +248,15 @@ impl Scope {
         Scope { names: Vec::new_in(alloc), params: 0, elided: None }
     }
 
+    /// A copy of this scope in `alloc`.
+    pub fn clone_in(&self, alloc: Mem) -> Scope {
+        Scope { names: self.names.clone_in(alloc), params: self.params, elided: self.elided }
+    }
+
     /// This scope, with `'_` naming `elided` (the position's elision rule's answer, or why
     /// it has none): a return opaque's bounds' scope.
     pub fn with_elided(&self, elided: Result<Region, RegionRefusal>) -> Scope {
-        let mut s = self.clone();
+        let mut s = self.clone_in(self.alloc());
         s.elided = Some(elided);
         s
     }
@@ -262,7 +267,7 @@ impl Scope {
     /// `HeadRegions::params.count()`), a trait's own.
     pub fn item(v: &View<'_>, container: Option<&Scope>, base: u32, alloc: Mem) -> Result<Scope, RegionsRefusal> {
         let mut s = match container {
-            Some(c) => c.clone(),
+            Some(c) => c.clone_in(alloc),
             None => Scope::new_in(alloc),
         };
         s.params = base;
@@ -318,6 +323,10 @@ struct ClauseBinder {
 impl ClauseBinder {
     fn none(alloc: Mem) -> ClauseBinder {
         ClauseBinder { names: Vec::new_in(alloc), vars: 0 }
+    }
+
+    fn clone_in(&self, alloc: Mem) -> ClauseBinder {
+        ClauseBinder { names: self.names.clone_in(alloc), vars: self.vars }
     }
 
     fn of(v: &View<'_>, b: Binders, alloc: Mem) -> Result<ClauseBinder, RegionsRefusal> {
@@ -959,7 +968,7 @@ fn binding(
 ) -> Result<(RegionCol<Mem>, u32), RegionsRefusal> {
     let node_ty = intern(tys, PNode::ExProj { trait_: owner, name, args: oargs, term })?;
     let view = tys.view();
-    let mut st = St { binder: parent.binder.clone(), anon: 0, next_binder: parent.next_binder };
+    let mut st = St { binder: parent.binder.clone_in(cx.alloc), anon: 0, next_binder: parent.next_binder };
     let mut out: Vec<Region, Mem> = Vec::new_in(cx.alloc);
     // The owner's lifetimes are the bound's when the owner is the bound's trait at the same
     // arguments; else (`Fn(..)`'s `Output` is `FnOnce`'s) the owner's arguments must carry none

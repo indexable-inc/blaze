@@ -130,6 +130,23 @@ pub struct FeatureTarget {
     pub protect: FeatureProtect,
 }
 
+/// Authored physical feature dimensions (Priority 11): automatically derive tight local octree
+/// `min_feature`, geometric `max_error`, and normal tolerance from a groove's width, a bevel's
+/// radius, a panel seam's gap, a slot's width, or a stencil's stroke width.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FeatureSpec {
+    /// Narrow groove or gasket channel authored with physical `width` and `depth`.
+    Groove { width: Length, depth: Length },
+    /// Filleted or chamfered highlight edge authored with physical `radius`.
+    Bevel { radius: Length },
+    /// Narrow panel perimeter gap / cover seam authored with physical `gap` and `depth`.
+    PanelSeam { gap: Length, depth: Length },
+    /// Surface-conforming stencil or decal authored with physical `stroke_width`.
+    Stencil { stroke_width: Length },
+    /// Narrow slot or keyhole authored with physical `width`.
+    Slot { width: Length },
+}
+
 impl FeatureTarget {
     /// Construct a [`FeatureTarget`] from [`FeatureTargetOpts`].
     pub fn new(o: FeatureTargetOpts<'_>) -> FeatureTarget {
@@ -141,6 +158,80 @@ impl FeatureTarget {
             max_normal_error: o.max_normal_error,
             min_feature: o.min_feature,
             protect: o.protect,
+        }
+    }
+
+    /// Construct a [`FeatureTarget`] directly from authored physical dimensions ([`FeatureSpec`]),
+    /// carrying groove width, bevel radius, seam gap, slot width, or stencil stroke width straight
+    /// into local octree refinement and protected QEM budgets without manual guesswork.
+    pub fn from_spec(name: &str, region: FeatureRegion, spec: FeatureSpec) -> FeatureTarget {
+        match spec {
+            FeatureSpec::Groove { width, depth } => {
+                let min_f = Length::m((width.as_m() / 3.0).max(1e-4));
+                let max_e = Length::m((width.as_m() / 8.0).min(depth.as_m() / 5.0).max(5e-5));
+                FeatureTarget::new(FeatureTargetOpts {
+                    name,
+                    kind: FeatureKind::Detail,
+                    region,
+                    max_error: Some(max_e),
+                    max_normal_error: Some(Angle::degrees(12.0)),
+                    min_feature: Some(min_f),
+                    protect: FeatureProtect::Critical,
+                })
+            }
+            FeatureSpec::Bevel { radius } => {
+                let min_f = Length::m((radius.as_m() * 0.5).max(1e-4));
+                // 15° chord sagitta `r * (1 - cos(15°)) ≈ 0.0341 * r`.
+                let max_e = Length::m((radius.as_m() * 0.035).max(5e-5));
+                FeatureTarget::new(FeatureTargetOpts {
+                    name,
+                    kind: FeatureKind::Bevel,
+                    region,
+                    max_error: Some(max_e),
+                    max_normal_error: Some(Angle::degrees(10.0)),
+                    min_feature: Some(min_f),
+                    protect: FeatureProtect::Critical,
+                })
+            }
+            FeatureSpec::PanelSeam { gap, depth } => {
+                let min_f = Length::m((gap.as_m() / 2.5).max(1e-4));
+                let max_e = Length::m((gap.as_m() / 6.0).min(depth.as_m() / 4.0).max(5e-5));
+                FeatureTarget::new(FeatureTargetOpts {
+                    name,
+                    kind: FeatureKind::MatingSurface,
+                    region,
+                    max_error: Some(max_e),
+                    max_normal_error: Some(Angle::degrees(12.0)),
+                    min_feature: Some(min_f),
+                    protect: FeatureProtect::Pinned,
+                })
+            }
+            FeatureSpec::Stencil { stroke_width } => {
+                let min_f = Length::m((stroke_width.as_m() * 0.5).max(1e-4));
+                let max_e = Length::m((stroke_width.as_m() / 8.0).max(5e-5));
+                FeatureTarget::new(FeatureTargetOpts {
+                    name,
+                    kind: FeatureKind::Detail,
+                    region,
+                    max_error: Some(max_e),
+                    max_normal_error: Some(Angle::degrees(14.0)),
+                    min_feature: Some(min_f),
+                    protect: FeatureProtect::Critical,
+                })
+            }
+            FeatureSpec::Slot { width } => {
+                let min_f = Length::m((width.as_m() / 3.0).max(1e-4));
+                let max_e = Length::m((width.as_m() / 8.0).max(5e-5));
+                FeatureTarget::new(FeatureTargetOpts {
+                    name,
+                    kind: FeatureKind::Keyhole,
+                    region,
+                    max_error: Some(max_e),
+                    max_normal_error: Some(Angle::degrees(16.0)),
+                    min_feature: Some(min_f),
+                    protect: FeatureProtect::Pinned,
+                })
+            }
         }
     }
 

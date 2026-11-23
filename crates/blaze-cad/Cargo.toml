@@ -31,12 +31,12 @@ blaze-units.workspace = true
 blaze-own.workspace = true
 # `Show`: findings and verdicts as sentences, printed by integer arithmetic (`Shown` for `{}`).
 blaze-text.workspace = true
+# PNG compression levels for baked textures and saved GLB previews.
+blaze-deflate.workspace = true
 
 [dev-dependencies]
 # Property tests and typed planted-bug controls (D165).
 blaze-sim.workspace = true
-# The PNG's compression level in the hull example.
-blaze-deflate.workspace = true
 # `testing::heap()`: a test's root allocator (D170 C1: no `Global` in tests either).
 blaze-own = { workspace = true, features = ["testing"] }
 

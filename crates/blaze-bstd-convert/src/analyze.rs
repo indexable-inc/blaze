@@ -394,12 +394,12 @@ pub fn analyze_workspace(snapshot: &WorkspaceSnapshot) -> WorkspaceAnalysis {
     }
 
     // Sort longest directory prefix first so nested crates claim their own `.rs` files.
-    let mut dirs_for_match: Vec<(String, usize)> = crate_manifests
+    let mut dirs_for_match: Vec<(&str, usize)> = crate_manifests
         .iter()
         .enumerate()
-        .map(|(idx, (_, dir, _, _, _))| (dir.clone(), idx))
+        .map(|(idx, (_, dir, _, _, _))| (dir.as_str(), idx))
         .collect();
-    dirs_for_match.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+    dirs_for_match.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(b.0)));
 
     let mut crate_rs_files: Vec<Vec<String>> = vec![Vec::new(); crate_manifests.len()];
     for path in snapshot.files.keys() {
@@ -691,7 +691,7 @@ fn analyze_rs_file(
                 }
             }
             SyntaxKind::MACRO_CALL => {
-                if let Some(mc) = ast::MacroCall::cast(node.clone()) {
+                if let Some(mc) = ast::MacroCall::cast(node) {
                     let mname = mc.path().map(|p| p.syntax().text().to_string()).unwrap_or_default();
                     let leaf = mname.rsplit("::").next().unwrap_or(&mname).trim();
                     match leaf {
@@ -705,7 +705,7 @@ fn analyze_rs_file(
                             *fmt_macro_sites += 1;
                         }
                         "thread_local" => {
-                            let off: usize = node.text_range().start().into();
+                            let off: usize = mc.syntax().text_range().start().into();
                             walls.push(Wall {
                                 file: file_path.to_owned(),
                                 line: line_of_offset(src, off),
@@ -718,7 +718,7 @@ fn analyze_rs_file(
                 }
             }
             SyntaxKind::ATTR => {
-                if let Some(attr) = ast::Attr::cast(node.clone()) {
+                if let Some(attr) = ast::Attr::cast(node) {
                     let txt = attr.syntax().text().to_string();
                     if txt.contains("derive(") {
                         for derive_name in [
@@ -765,14 +765,14 @@ fn analyze_rs_file(
                 }
             }
             SyntaxKind::STRUCT => {
-                if let Some(st) = ast::Struct::cast(node.clone()) {
+                if let Some(st) = ast::Struct::cast(node) {
                     if let Some(cand) = inspect_struct_for_sm(file_path, src, &st) {
                         struct_sm_candidates.push(cand);
                     }
                 }
             }
             SyntaxKind::FN => {
-                if let Some(func) = ast::Fn::cast(node.clone()) {
+                if let Some(func) = ast::Fn::cast(node) {
                     // Check if this function is a custom proc-macro entry point.
                     if let Some(pm) = inspect_fn_for_proc_macro(file_path, src, &func) {
                         proc_macro_entries.push(pm);
@@ -937,7 +937,7 @@ fn analyze_fn(file_path: &str, src: &str, func: &ast::Fn) -> Option<FnAnalysis> 
                 has_control_flow = true;
             }
             SyntaxKind::CALL_EXPR => {
-                if let Some(call) = ast::CallExpr::cast(node.clone()) {
+                if let Some(call) = ast::CallExpr::cast(node) {
                     if let Some(callee_expr) = call.expr() {
                         let callee_txt: String = callee_expr
                             .syntax()
@@ -947,11 +947,11 @@ fn analyze_fn(file_path: &str, src: &str, func: &ast::Fn) -> Option<FnAnalysis> 
                             .filter(|c| !c.is_whitespace())
                             .collect();
                         if let Some(eff) = classify_call_effect(&callee_txt) {
-                            let coff: usize = node.text_range().start().into();
+                            let coff: usize = call.syntax().text_range().start().into();
                             direct_effects.push(EffectSite {
                                 kind: eff,
                                 line: line_of_offset(src, coff),
-                                snippet: truncate_snippet(&node.text().to_string(), 96),
+                                snippet: truncate_snippet(&call.syntax().text().to_string(), 96),
                             });
                         } else {
                             let leaf = callee_txt.rsplit("::").next().unwrap_or(&callee_txt);
@@ -969,26 +969,26 @@ fn analyze_fn(file_path: &str, src: &str, func: &ast::Fn) -> Option<FnAnalysis> 
                 }
             }
             SyntaxKind::METHOD_CALL_EXPR => {
-                if let Some(mc) = ast::MethodCallExpr::cast(node.clone()) {
+                if let Some(mc) = ast::MethodCallExpr::cast(node) {
                     let mname = mc.name_ref().map(|n| n.text().to_string()).unwrap_or_default();
                     let recv_txt = mc.receiver().map(|r| r.syntax().text().to_string()).unwrap_or_default();
                     if matches!(mname.as_str(), "read_to_end" | "read_exact" | "read_to_string")
                         && (recv_txt.contains("sock") || recv_txt.contains("stream") || recv_txt.contains("conn"))
                     {
-                        let coff: usize = node.text_range().start().into();
+                        let coff: usize = mc.syntax().text_range().start().into();
                         direct_effects.push(EffectSite {
                             kind: EffectKind::NetRead,
                             line: line_of_offset(src, coff),
-                            snippet: truncate_snippet(&node.text().to_string(), 96),
+                            snippet: truncate_snippet(&mc.syntax().text().to_string(), 96),
                         });
                     } else if matches!(mname.as_str(), "write" | "write_all")
                         && (recv_txt.contains("sock") || recv_txt.contains("stream") || recv_txt.contains("conn"))
                     {
-                        let coff: usize = node.text_range().start().into();
+                        let coff: usize = mc.syntax().text_range().start().into();
                         direct_effects.push(EffectSite {
                             kind: EffectKind::NetWrite,
                             line: line_of_offset(src, coff),
-                            snippet: truncate_snippet(&node.text().to_string(), 96),
+                            snippet: truncate_snippet(&mc.syntax().text().to_string(), 96),
                         });
                     } else if matches!(mname.as_str(), "to_string" | "to_owned" | "to_vec") {
                         alloc_sites += 1;
@@ -996,15 +996,15 @@ fn analyze_fn(file_path: &str, src: &str, func: &ast::Fn) -> Option<FnAnalysis> 
                 }
             }
             SyntaxKind::MACRO_CALL => {
-                if let Some(mc) = ast::MacroCall::cast(node.clone()) {
+                if let Some(mc) = ast::MacroCall::cast(node) {
                     let mname = mc.path().map(|p| p.syntax().text().to_string()).unwrap_or_default();
                     let leaf = mname.rsplit("::").next().unwrap_or(&mname).trim();
                     if let Some(eff) = classify_macro_effect(leaf) {
-                        let coff: usize = node.text_range().start().into();
+                        let coff: usize = mc.syntax().text_range().start().into();
                         direct_effects.push(EffectSite {
                             kind: eff,
                             line: line_of_offset(src, coff),
-                            snippet: truncate_snippet(&node.text().to_string(), 96),
+                            snippet: truncate_snippet(&mc.syntax().text().to_string(), 96),
                         });
                     } else if matches!(leaf, "format" | "vec") {
                         alloc_sites += 1;
@@ -1263,7 +1263,7 @@ fn analyze_c_interop_src_markers(file_path: &str, src: &str, info: &mut CInterop
                 }
             }
             SyntaxKind::MACRO_CALL => {
-                let Some(mc) = ast::MacroCall::cast(node.clone()) else { continue };
+                let Some(mc) = ast::MacroCall::cast(node) else { continue };
                 let mpath = mc
                     .path()
                     .map(|p| p.syntax().text().to_string().chars().filter(|c| !c.is_whitespace()).collect::<String>())
@@ -1271,7 +1271,7 @@ fn analyze_c_interop_src_markers(file_path: &str, src: &str, info: &mut CInterop
                 if mpath == "include" || mpath.ends_with("::include") {
                     let body = mc.token_tree().map(|t| t.syntax().text().to_string()).unwrap_or_default();
                     if body.contains("OUT_DIR") {
-                        let line = line_of_offset(src, node.text_range().start().into());
+                        let line = line_of_offset(src, mc.syntax().text_range().start().into());
                         push_unique(&mut info.out_dir_includes, format!("{file_path}:{line}"));
                     } else if info.tools.contains("cxx") {
                         // Inside `#[cxx::bridge]`, `include!("path/to/header.h")` names a C++ header.
@@ -1304,10 +1304,10 @@ fn analyze_newtype_candidates_in_file(
     for node in root.syntax().descendants() {
         match node.kind() {
             SyntaxKind::FN => {
-                let Some(func) = ast::Fn::cast(node.clone()) else { continue };
+                let Some(func) = ast::Fn::cast(node) else { continue };
                 let Some(fname) = func.name() else { continue };
                 let owner = format!("fn {}", fname.text());
-                let line = line_of_offset(src, node.text_range().start().into());
+                let line = line_of_offset(src, func.syntax().text_range().start().into());
                 let Some(plist) = func.param_list() else { continue };
                 let mut owned_pairs: Vec<(String, String)> = Vec::new();
                 for p in plist.params() {
@@ -1325,10 +1325,10 @@ fn analyze_newtype_candidates_in_file(
                 classify_primitive_pairs(file_path, line, &owner, &borrowed, emit);
             }
             SyntaxKind::STRUCT => {
-                let Some(st) = ast::Struct::cast(node.clone()) else { continue };
+                let Some(st) = ast::Struct::cast(node) else { continue };
                 let Some(sname) = st.name() else { continue };
                 let owner = format!("struct {}", sname.text());
-                let line = line_of_offset(src, node.text_range().start().into());
+                let line = line_of_offset(src, st.syntax().text_range().start().into());
                 let Some(ast::FieldList::RecordFieldList(rfl)) = st.field_list() else { continue };
                 let mut owned_pairs: Vec<(String, String)> = Vec::new();
                 for f in rfl.fields() {

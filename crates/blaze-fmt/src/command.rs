@@ -41,16 +41,16 @@ pub fn main(args: Vec<String>) -> i32 {
     // The words that are not files, then each edition's files: one rustfmt run per edition, as
     // cargo-fmt runs one per edition of the targets. The first failing run's code is the exit
     // code, and every run happens.
-    let rest: Vec<&String> = args // alloc: the command line without its files
+    let rest: Vec<&str> = args // alloc: the command line without its files
         .iter()
         .enumerate()
         .filter(|(at, _)| !is_file_at(&args, *at))
-        .map(|(_, it)| it)
+        .map(|(_, it)| it.as_str())
         .collect();
     let mut code = 0;
     for (edition, files) in groups {
         // alloc: one command line per edition
-        let mut words: Vec<String> = rest.iter().map(|it| (*it).clone()).collect();
+        let mut words: Vec<String> = rest.iter().map(|&it| it.to_owned()).collect();
         words.extend(files);
         if let Some(edition) = edition {
             words.extend(["--edition".to_owned(), edition.rust_syntax()]);
@@ -151,20 +151,17 @@ impl Packages {
 
     /// The members of the workspace `manifest` is in, each workspace read once.
     fn members(&mut self, manifest: &Path) -> Result<&[Member], FmtError> {
-        let root = match self.roots.get(manifest) {
-            Some(root) => root.clone(),
-            None => {
-                let (root, members) =
-                    read_members(manifest).map_err(|error| FmtError::Workspace {
-                        manifest: manifest.to_owned(),
-                        error: Box::new(error),
-                    })?;
-                self.roots.insert(manifest.to_owned(), root.clone());
-                self.read.entry(root.clone()).or_insert(members);
-                root
-            }
-        };
-        Ok(self.read[&root].as_slice())
+        if !self.roots.contains_key(manifest) {
+            let (root, members) =
+                read_members(manifest).map_err(|error| FmtError::Workspace {
+                    manifest: manifest.to_owned(),
+                    error: Box::new(error),
+                })?;
+            self.read.entry(root.to_path_buf()).or_insert(members);
+            self.roots.insert(manifest.to_owned(), root);
+        }
+        let root = self.roots.get(manifest).map(PathBuf::as_path).unwrap_or(manifest);
+        Ok(self.read[root].as_slice())
     }
 }
 

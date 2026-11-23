@@ -9,12 +9,14 @@
 use blaze_cad_field::{CadPlant, Detail, Graph, Name, Placement};
 use blaze_cad_mesh::{
     COS_32_DEGREES, DecimateOpts, Decimated, DecomposeOpts, FeatureProtect, FeatureRegion, FeatureZone, GridSizing, HullOpts,
-    LodOpts, MaterialRole, Mesh, MeshLimits, MeshOpts, MeshView, Meshed, PieceCache, Source, Stop, Target, auto_grid,
-    convex_hull, decimate, decompose, lod_chain, mesh, mesh_cached, topology,
+    LodOpts, MaterialRole, Mesh, MeshLimits, MeshOpts, MeshView, Meshed, PieceCache, Source, Stop, Target, UvOpts, auto_grid,
+    convex_hull, decimate, decompose, lod_chain, mesh, mesh_cached, topology, unwrap_uvs,
 };
-use blaze_cad_out::{Collider, Encoding, GlbOpts, Limits, Lod, MassFacts, Material, Up, glb};
+use blaze_cad_out::{
+    Collider, Encoding, GlbOpts, Limits, Lod, MassFacts, Material, MaterialTextures, TexturePack, Up, glb, glb_textured,
+};
 use blaze_cad_picture::{
-    HighlightStyle, MeshHighlight, MeshPictureOpts, MeshScenePart, Picture, View, Wireframe, render_mesh_scene,
+    HighlightStyle, MaterialMaps, MeshHighlight, MeshPictureOpts, MeshScenePart, Picture, View, Wireframe, render_mesh_scene,
 };
 use blaze_math::Aabb3;
 use blaze_own::planted::{NoPlant, Planted, Plants};
@@ -24,6 +26,9 @@ use blaze_units::{Angle, Density, Length};
 
 use crate::check::{put_deg, put_mm};
 use crate::export::{hull_to_mesh, prepare_gpu_mesh};
+use crate::surface::{
+    BakeOpts, BakedMaps, Decal, FinishAssignment, MaterialRegion, assign_material_regions, bake_surface_maps, baked_material,
+};
 use crate::{
     ColliderMode, ExportLodOpts, FeatureKind, FeatureReport, FeatureTarget, FidelityChecked, FidelityFinding, FidelityOpts,
     ModelError, Part, PartBudget, PartId, STEEL_ONLY, TriangleBudget, Unsettled, Verdict, check_mesh_fidelity_report,
@@ -152,6 +157,61 @@ pub struct PartFeatureReport {
     pub report: FeatureReport,
 }
 
+/// A [`MaterialRegion`] attached to a named part in a [`build_game_asset`] call (Priority 7:
+/// multi-material continuous shells that survive booleans and simplification).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PartMaterialRegion {
+    pub part: Name,
+    pub region: MaterialRegion,
+}
+
+impl PartMaterialRegion {
+    /// Attach `region` to the part named `part`.
+    #[inline]
+    pub fn new(part: &str, region: MaterialRegion) -> PartMaterialRegion {
+        PartMaterialRegion { part: Name::new(part), region }
+    }
+}
+
+/// A surface-conforming [`Decal`] attached to a named part in a [`build_game_asset`] call
+/// (Priority 3: vector lettering, stripes, and SVG marks baked directly onto curved shells).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PartDecal<'d> {
+    pub part: Name,
+    pub decal: Decal<'d>,
+}
+
+impl<'d> PartDecal<'d> {
+    /// Attach `decal` to the part named `part`.
+    #[inline]
+    pub fn new(part: &str, decal: Decal<'d>) -> PartDecal<'d> {
+        PartDecal { part: Name::new(part), decal }
+    }
+}
+
+/// UV unwrapping and PBR texture baking settings for [`GameAssetOpts::bake`] (Priority 9).
+#[blaze::args]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct AssetBakeOpts {
+    /// Square texture atlas resolution in pixels per baked part (e.g. `512` or `1024`).
+    pub size: u32 = 512,
+    /// Conservative gutter dilation radius in texels to prevent mipmap/bilinear seam bleeding.
+    pub gutter_px: u32 = 4,
+    /// Bake high-resolution CAD field gradients into the tangent-space normal map.
+    pub bake_cad_normals: bool = true,
+    /// Normal map scale written to glTF `normalTexture.scale` and applied in preview renders.
+    pub normal_strength: f64 = 1.0,
+}
+
+impl AssetBakeOpts {
+    pub const DEFAULT: AssetBakeOpts = AssetBakeOpts {
+        size: 512,
+        gutter_px: 4,
+        bake_cad_normals: true,
+        normal_strength: 1.0,
+    };
+}
+
 /// Options for [`build_game_asset`].
 #[blaze::args]
 #[derive(Clone, Copy, Debug)]
@@ -175,6 +235,17 @@ pub struct GameAssetOpts<'a, 's, 'm, 'f> {
     /// name: preserved with extra geometry during meshing & decimation, checked per feature, and
     /// highlighted in the export preview when any misses tolerance.
     pub features: &'f [PartFeature] = &[],
+    /// Optional per-part multi-material regions applied before decimation so material boundaries
+    /// survive simplification on one continuous shell.
+    pub material_regions: &'f [PartMaterialRegion] = &[],
+    /// Optional surface-conforming vector decals attached by part name (automatically triggers UV
+    /// unwrapping and PBR texture baking on those parts).
+    pub decals: &'f [PartDecal<'f>] = &[],
+    /// Optional physically-scaled directional finishes and edge wear masks by [`MaterialRole`].
+    pub finishes: &'f [FinishAssignment] = &[],
+    /// Optional explicit UV + PBR detail baking configuration (`None` bakes only parts that carry
+    /// decals or matching finishes; `Some(opts)` bakes every part at `opts.size`).
+    pub bake: Option<AssetBakeOpts> = None,
     /// Optional uniform density for mass facts in the GLB.
     pub density: Option<Density> = None,
     /// Coordinate convention of the model (`Up::Z` turned to glTF's Y-up).
@@ -737,6 +808,13 @@ pub struct ExportedPart<'a> {
     pub placement: Placement,
     pub material: MaterialRole,
     pub mesh: Mesh<'a>,
+    /// Optional baked PBR texture atlas (`base_colour`, `metallic_roughness`, `normal`) when UV
+    /// unwrapping + detail baking ran for this part.
+    pub baked: Option<BakedMaps<'a>>,
+    /// Dedicated baked material role slot in the exported GLB (when `baked.is_some()`).
+    pub baked_role: Option<MaterialRole>,
+    /// UV atlas physical density (`texels / metre`) when UVs were unwrapped for this part.
+    pub texels_per_metre: Option<f64>,
 }
 
 /// Vivid crimson highlight colour for features that missed their fidelity target.
@@ -817,6 +895,40 @@ impl GameAsset<'_> {
                     tint_override: None,
                 })
                 .map_err(|_| ModelError::Alloc { what: "asset preview parts" })?;
+        }
+        let has_baked = self.parts.iter().any(|p| p.baked.is_some());
+        if has_baked && opts.material_maps.is_empty() {
+            let mut ext_mats: Vec<Material<'_>, Alloc<'_>> = Vec::new_in(opts.scratch);
+            let mut ext_maps: Vec<MaterialMaps<'_>, Alloc<'_>> = Vec::new_in(opts.scratch);
+            for &m in materials {
+                ext_mats.try_push(m).map_err(|_| ModelError::Alloc { what: "preview materials" })?;
+                ext_maps.try_push(MaterialMaps::NONE).map_err(|_| ModelError::Alloc { what: "preview material maps" })?;
+            }
+            for p in self.parts.iter() {
+                if let (Some(baked), Some(role)) = (&p.baked, p.baked_role) {
+                    let want = (role.0 as usize) + 1;
+                    while ext_mats.len() < want {
+                        ext_mats
+                            .try_push(baked_material(p.name.as_str()))
+                            .map_err(|_| ModelError::Alloc { what: "preview baked materials" })?;
+                        ext_maps
+                            .try_push(MaterialMaps::NONE)
+                            .map_err(|_| ModelError::Alloc { what: "preview baked maps" })?;
+                    }
+                    ext_mats[role.0 as usize] = baked_material(p.name.as_str());
+                    ext_maps[role.0 as usize] = baked.as_material_maps(1.0);
+                }
+            }
+            let eff_opts = MeshPictureOpts {
+                highlights: if opts.highlights.is_empty() && !self.missed_highlights.is_empty() {
+                    &self.missed_highlights
+                } else {
+                    opts.highlights
+                },
+                material_maps: &ext_maps,
+                ..opts
+            };
+            return render_mesh_scene(&scene_parts, &ext_mats, view, eff_opts).map_err(ModelError::Picture);
         }
         let eff_opts = if opts.highlights.is_empty() && !self.missed_highlights.is_empty() {
             MeshPictureOpts { highlights: &self.missed_highlights, ..opts }
@@ -1152,13 +1264,17 @@ pub fn build_game_asset_planted<'a, P: Planted<CadPlant>>(
         meshes.try_push(meshed).map_err(|_| ModelError::Alloc { what: "asset meshes" })?;
     }
 
-    // Stage 2: Phase-1 decimation (honor explicit per-part cap, preserve marked feature zones,
-    // and eliminate flat/coplanar redundancy).
+    // Stage 2: Phase-1 decimation (assign per-part multi-material regions first so role borders
+    // survive simplification, honor explicit per-part cap, preserve marked feature zones, and
+    // eliminate flat/coplanar redundancy).
     let mut decimated: Vec<Decimated<'_>, Alloc<'_>> = Vec::new_in(s);
     let mut budget_inputs: Vec<BudgetInput, Alloc<'_>> = Vec::new_in(s);
+    let mut part_has_regions: Vec<bool, Alloc<'_>> = Vec::new_in(s);
     decimated.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset phase-1 decimation" })?;
     budget_inputs.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset budget inputs" })?;
+    part_has_regions.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset region flags" })?;
 
+    let mut reg_buf: Vec<MaterialRegion, Alloc<'_>> = Vec::new_in(s);
     for (i, (part, m)) in parts.iter().zip(meshes.iter()).enumerate() {
         let tol = part_tols[i];
         let cap = part.budget.explicit_cap();
@@ -1167,10 +1283,36 @@ pub fn build_game_asset_planted<'a, P: Planted<CadPlant>>(
             Some(max_t) => Target::Budget { error: tol, max_triangles: max_t, max_error: part_max_errs[i] },
             None => Target::Error(tol),
         };
-        let d = decimate(
-            Source::Verified(m.verified()),
-            DecimateOpts { target, cos_crease, zones: &part_zones[fs..fe], limits: MeshLimits::SHIPPED, alloc: s, scratch: s },
-        )?;
+        reg_buf.clear();
+        for pm in o.material_regions {
+            if pm.part == part.name {
+                reg_buf.try_push(pm.region).map_err(|_| ModelError::Alloc { what: "asset part material regions" })?;
+            }
+        }
+        let has_regs = !reg_buf.is_empty();
+        part_has_regions.try_push(has_regs).map_err(|_| ModelError::Alloc { what: "asset region flags" })?;
+        let d = if has_regs {
+            let tape = part_tape(g, part, Detail::Full, s)?;
+            let assigned = assign_material_regions(g, &m.mesh.view(), part.material, Some(&tape), &reg_buf, s, s)?;
+            let checked_assigned = blaze_cad_mesh::check(
+                assigned.view(),
+                blaze_cad_mesh::CheckOpts { limits: MeshLimits::SHIPPED, scratch: s },
+            )
+            .ok();
+            let src = match checked_assigned {
+                Some(v) => Source::Verified(v),
+                None => Source::Open(assigned.view()),
+            };
+            decimate(
+                src,
+                DecimateOpts { target, cos_crease, zones: &part_zones[fs..fe], limits: MeshLimits::SHIPPED, alloc: s, scratch: s },
+            )?
+        } else {
+            decimate(
+                Source::Verified(m.verified()),
+                DecimateOpts { target, cos_crease, zones: &part_zones[fs..fe], limits: MeshLimits::SHIPPED, alloc: s, scratch: s },
+            )?
+        };
         let nat = d.mesh.view().triangle_count();
         budget_inputs
             .try_push(BudgetInput { natural_triangles: nat, explicit_cap: cap, weight: part.budget.weight() })
@@ -1251,13 +1393,74 @@ pub fn build_game_asset_planted<'a, P: Planted<CadPlant>>(
     let mut all_budgets_ok = true;
     let mut all_fidelity_ok = true;
 
+    let mut next_baked_role: u32 = u32::try_from(o.materials.len()).unwrap_or(0);
+    let mut part_decals_buf: Vec<Decal<'_>, Alloc<'_>> = Vec::new_in(s);
+
     for (i, (part, m)) in parts.iter().zip(meshes.iter()).enumerate() {
         let d = &decimated[i];
         let base_view = d.mesh.view();
         let verified_base = d.verified().unwrap_or_else(|| m.verified());
         let written_tris = base_view.triangle_count();
 
-        let opt_mesh = prepare_gpu_mesh(&base_view, part.material, o.optimize_gpu, o.vertex_cache_size, o.alloc, s)?;
+        let stamp_role = if part_has_regions[i] { None } else { Some(part.material) };
+        part_decals_buf.clear();
+        for pd in o.decals {
+            if pd.part == part.name {
+                part_decals_buf.try_push(pd.decal).map_err(|_| ModelError::Alloc { what: "asset part decals" })?;
+            }
+        }
+        let has_matching_finish = o.finishes.iter().any(|fa| {
+            if part_has_regions[i] {
+                base_view.roles().contains(&fa.role)
+            } else {
+                fa.role == part.material
+            }
+        });
+        let should_bake = o.bake.is_some() || !part_decals_buf.is_empty() || has_matching_finish;
+
+        let (opt_mesh, baked, baked_role, texels_per_metre) = if should_bake {
+            let bake_cfg = o.bake.unwrap_or(AssetBakeOpts::DEFAULT);
+            let pre = prepare_gpu_mesh(&base_view, stamp_role, false, o.vertex_cache_size, s, s)?;
+            let unwrapped = unwrap_uvs(
+                &pre.view(),
+                UvOpts {
+                    alloc: s,
+                    scratch: s,
+                    gutter_px: bake_cfg.gutter_px,
+                    atlas_size: bake_cfg.size,
+                    limits: MeshLimits::SHIPPED,
+                    ..
+                },
+            )?;
+            let hi_tape = if bake_cfg.bake_cad_normals {
+                Some(part_tape(g, part, Detail::Full, s)?)
+            } else {
+                None
+            };
+            let maps = bake_surface_maps(
+                &unwrapped.mesh.view(),
+                o.materials,
+                hi_tape.as_ref(),
+                &part_decals_buf,
+                o.finishes,
+                BakeOpts {
+                    size: bake_cfg.size,
+                    gutter_px: bake_cfg.gutter_px,
+                    bake_cad_normals: bake_cfg.bake_cad_normals,
+                    normal_strength: bake_cfg.normal_strength,
+                    limits: o.limits,
+                    alloc: o.alloc,
+                    scratch: s,
+                },
+            )?;
+            let brole = MaterialRole(next_baked_role);
+            next_baked_role += 1;
+            let opt = prepare_gpu_mesh(&unwrapped.mesh.view(), Some(brole), o.optimize_gpu, o.vertex_cache_size, o.alloc, s)?;
+            (opt, Some(maps), Some(brole), Some(unwrapped.texels_per_metre))
+        } else {
+            let opt = prepare_gpu_mesh(&base_view, stamp_role, o.optimize_gpu, o.vertex_cache_size, o.alloc, s)?;
+            (opt, None, None, None)
+        };
         let written_verts = opt_mesh.view().vertex_count();
 
         let lod_start = ready_lods.len();
@@ -1275,7 +1478,7 @@ pub fn build_game_asset_planted<'a, P: Planted<CadPlant>>(
                 },
             )?;
             for level in chain.levels.iter().skip(1) {
-                let lv_mesh = prepare_gpu_mesh(&level.mesh.view(), part.material, o.optimize_gpu, o.vertex_cache_size, s, s)?;
+                let lv_mesh = prepare_gpu_mesh(&level.mesh.view(), stamp_role, o.optimize_gpu, o.vertex_cache_size, s, s)?;
                 ready_lods
                     .try_push(ReadyLod { mesh: lv_mesh, error: level.error, switch_distance: level.switch_distance })
                     .map_err(|_| ModelError::Alloc { what: "asset lod meshes" })?;
@@ -1432,11 +1635,15 @@ pub fn build_game_asset_planted<'a, P: Planted<CadPlant>>(
                 placement: part.placement,
                 material: part.material,
                 mesh: opt_mesh,
+                baked,
+                baked_role,
+                texels_per_metre,
             })
             .map_err(|_| ModelError::Alloc { what: "asset exported parts" })?;
     }
 
-    // Stage 6: Build GLB scene from the exact retained exported meshes.
+    // Stage 6: Build GLB scene from the exact retained exported meshes (using `glb_textured` when
+    // any part baked PBR maps, otherwise byte-identical `glb`).
     let mut lod_views: Vec<Lod<'_>, Alloc<'_>> = Vec::new_in(s);
     lod_views.try_reserve(ready_lods.len()).map_err(|_| ModelError::Alloc { what: "asset lod views" })?;
     for lv in ready_lods.iter() {
@@ -1479,9 +1686,44 @@ pub fn build_game_asset_planted<'a, P: Planted<CadPlant>>(
             .map_err(|_| ModelError::Alloc { what: "asset glb nodes" })?;
     }
 
-    let scene = blaze_cad_out::Scene { parts: &nodes, materials: o.materials };
-    let glb_bytes = glb(&scene, GlbOpts { encoding: o.encoding, up: o.up, limits: o.limits, alloc: o.alloc, scratch: s })
-        .map_err(ModelError::Glb)?;
+    let has_any_baked = exported_parts.iter().any(|ep| ep.baked.is_some());
+    let glb_bytes = if has_any_baked {
+        let normal_scale = o.bake.map_or(1.0, |b| b.normal_strength);
+        let mut all_mats: Vec<Material<'_>, Alloc<'_>> = Vec::new_in(s);
+        let mut mat_tex: Vec<MaterialTextures, Alloc<'_>> = Vec::new_in(s);
+        let mut png_images: Vec<&'_ [u8], Alloc<'_>> = Vec::new_in(s);
+        for &mat in o.materials {
+            all_mats.try_push(mat).map_err(|_| ModelError::Alloc { what: "asset materials" })?;
+            mat_tex.try_push(MaterialTextures::NONE).map_err(|_| ModelError::Alloc { what: "asset material textures" })?;
+        }
+        for ep in exported_parts.iter() {
+            if let Some(ref baked) = ep.baked {
+                let idx_base = u32::try_from(png_images.len()).unwrap_or(0);
+                png_images.try_push(&baked.base_colour.png).map_err(|_| ModelError::Alloc { what: "asset pngs" })?;
+                png_images.try_push(&baked.metallic_roughness.png).map_err(|_| ModelError::Alloc { what: "asset pngs" })?;
+                png_images.try_push(&baked.normal.png).map_err(|_| ModelError::Alloc { what: "asset pngs" })?;
+                all_mats
+                    .try_push(baked_material(ep.name.as_str()))
+                    .map_err(|_| ModelError::Alloc { what: "asset baked materials" })?;
+                mat_tex
+                    .try_push(MaterialTextures {
+                        base_colour: Some(idx_base),
+                        metallic_roughness: Some(idx_base + 1),
+                        normal: Some(idx_base + 2),
+                        normal_scale,
+                    })
+                    .map_err(|_| ModelError::Alloc { what: "asset material textures" })?;
+            }
+        }
+        let scene = blaze_cad_out::Scene { parts: &nodes, materials: &all_mats };
+        let pack = TexturePack { png_images: &png_images, material_textures: &mat_tex };
+        glb_textured(&scene, &pack, GlbOpts { encoding: o.encoding, up: o.up, limits: o.limits, alloc: o.alloc, scratch: s })
+            .map_err(ModelError::Glb)?
+    } else {
+        let scene = blaze_cad_out::Scene { parts: &nodes, materials: o.materials };
+        glb(&scene, GlbOpts { encoding: o.encoding, up: o.up, limits: o.limits, alloc: o.alloc, scratch: s })
+            .map_err(ModelError::Glb)?
+    };
 
     let total_budget_u32 = o.total_budget.map(|b| b.0);
     if let Some(tb) = total_budget_u32

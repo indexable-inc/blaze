@@ -30,7 +30,7 @@ impl<T: Rewrite> Rewrite for Box<T> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum MacroErrorKind {
     ParseFailure,
     ReplaceMacroVariable,
@@ -47,7 +47,7 @@ impl std::fmt::Display for MacroErrorKind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum RewriteError {
     SkipFormatting,
 
@@ -186,7 +186,7 @@ impl<'a> RewriteContext<'a> {
         let is_nested_macro_context = self.inside_macro.replace(true);
         InsideMacroGuard {
             is_nested_macro_context,
-            inside_macro_ref: self.inside_macro.clone(),
+            inside_macro_ref: Rc::clone(&self.inside_macro),
         }
     }
 

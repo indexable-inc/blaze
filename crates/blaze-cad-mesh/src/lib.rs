@@ -25,6 +25,7 @@
 //! | [`canon`] | the canonical triangle order the order-independent algorithms start from |
 //! | [`weld`] | [`weld()`]: triangle soup to an indexed mesh by exact positions, degenerate, duplicate and twin triangles removed |
 //! | [`shade`] | [`vertex_normals`] and [`shade()`]: normals split at a crease angle, at crease marks and at material borders |
+//! | [`uv`] | [`unwrap_uvs`] and [`compute_tangents`]: deterministic chart UV unwrapping, shelf atlas packing with gutter, and MikkTSpace-compatible vertex tangents |
 //! | [`simplify`] | [`decimate()`]: quadric error metrics by edge collapse, creases and borders kept, the error reported (named `decimate` so it is never confused with the kernel's `simplify` of a tape) |
 //! | [`lod`] | [`lod_chain`]: levels of detail with each level's error and its switch distance |
 //! | [`cache`] | [`optimize_vertex_cache`] (Tipsify), [`optimize_vertex_fetch`], [`acmr`] |
@@ -82,6 +83,7 @@ mod plant;
 pub mod quant;
 pub mod shade;
 pub mod simplify;
+pub mod uv;
 mod vecs;
 pub mod weld;
 
@@ -108,7 +110,7 @@ pub use measure::{
     topology,
 };
 pub use mesh::{Column, Columns, Mesh, MeshVecs, MeshView, ShapeError};
-pub use plant::{ClusterPlant, ContourPlant, DecimatePlant, HullPlant, QuantPlant, RedistancePlant};
+pub use plant::{ClusterPlant, ContourPlant, DecimatePlant, HullPlant, QuantPlant, RedistancePlant, UvPlant};
 pub use quant::{
     Dequantize, OCT8_BOUND, OCT16_BOUND, OctBits, OctNormals, QuantError, QuantNormalsOpts, QuantOpts, QuantizedPositions,
     Within, decode_oct8, decode_oct16, encode_oct8, encode_oct16, quantize_normals, quantize_positions,
@@ -116,6 +118,7 @@ pub use quant::{
 };
 pub use shade::{COS_32_DEGREES, ShadeError, ShadeOpts, shade, vertex_normals};
 pub use simplify::{DecimateError, DecimateOpts, DecimateStats, Decimated, Source, Stop, Target, decimate, decimate_planted};
+pub use uv::{UvError, UvMapped, UvOpts, compute_tangents, compute_tangents_planted, unwrap_uvs, unwrap_uvs_planted};
 pub use weld::{Soup, Twins, WeldError, WeldOpts, Welded, weld};
 
 /// The caps of every algorithm here (D165: a field each, the shipped values one constant, drawn
