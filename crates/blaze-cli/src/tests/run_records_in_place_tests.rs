@@ -307,27 +307,28 @@ impl OpenTree for Counted {
 /// job_texts.rs `Packs`, the one interface a job reads trees by.
 #[test]
 fn a_tree_opens_at_the_first_read_of_a_text_from_it() {
+    let (_io, cx) = root_cx(46);
     let frame = Frame::new(bstd::mem::Tag::Other).expect("a frame");
     let opener = Counted { packs: [pack(1), pack(2)], opens: core::cell::Cell::new(0) };
     let seen = TreesSeen::default();
     let lazy = LazyTrees::new(&opener, 3, &seen, &frame);
     let packs: Packs<'_> = Packs::from(&lazy);
     assert_eq!(seen.opened(), (0, 3), "a tree was opened before any read");
-    let text = packs.tree(1).and_then(|view| view.find("src/lib.rs")).map(|file| file.bytes);
+    let text = packs.tree(&cx, &frame, 1).and_then(|view| view.find("src/lib.rs")).map(|file| file.bytes);
     assert_eq!(text, Some(&b"pub fn tree_1() {}\n"[..]), "tree 1's text");
     assert_eq!(seen.opened(), (1, 3), "one read of tree 1 opened other trees");
-    assert!(packs.tree(1).is_some() && packs.tree(0).is_none(), "tree 1 again, and tree 0 is the checkout");
+    assert!(packs.tree(&cx, &frame, 1).is_some() && packs.tree(&cx, &frame, 0).is_none(), "tree 1 again, and tree 0 is the checkout");
     assert_eq!((opener.opens.get(), seen.opened()), (1, (1, 3)), "a second read of tree 1 opened it again");
     assert!(seen.refused().is_none(), "a refusal before any failed open");
-    assert!(packs.tree(3).is_none() && packs.tree(3).is_none(), "a tree that could not be opened was served");
+    assert!(packs.tree(&cx, &frame, 3).is_none() && packs.tree(&cx, &frame, 3).is_none(), "a tree that could not be opened was served");
     assert_eq!(opener.opens.get(), 2, "a refused tree was opened again at its second read");
     assert!(seen.refused().is_some_and(|why| why.starts_with("tree 3 of the crate list")), "the refusal was not kept: {:?}", seen.refused());
-    assert!(packs.tree(4).is_none(), "a tree past the list's");
+    assert!(packs.tree(&cx, &frame, 4).is_none(), "a tree past the list's");
     assert_eq!(seen.opened(), (2, 3));
     // CONTROL: the opened slice, every tree before any read, serves the same text.
     let views = [pack(1), pack(2)];
     let open: Packs<'_> = Packs::from(&views[..]);
-    assert_eq!(open.tree(1).and_then(|view| view.find("src/lib.rs")).map(|file| file.bytes), text, "the two schedules serve other texts");
+    assert_eq!(open.tree(&cx, &frame, 1).and_then(|view| view.find("src/lib.rs")).map(|file| file.bytes), text, "the two schedules serve other texts");
 }
 
 #[test]

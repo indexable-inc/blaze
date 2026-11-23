@@ -351,6 +351,20 @@ impl<'a> Make<'a> for Kept<'_> {
             if want.of == blaze_drive::key::crate_scope_name(&c.key) && want.cell.0 == items.key() {
                 return Ok(blaze_scope::names_cells::whole_digest(Section::Items, c.items));
             }
+            let syms = NameCell::InternalSymbols { krate: c.key.prefix() };
+            if want.of == blaze_drive::key::crate_scope_name(&c.key) && want.cell.0 == syms.key() {
+                let record = blaze_scope::names_record::NamesRecord::open(blaze_scope::names_record::Verified::check(c.names).expect("names record"));
+                let text = c.text;
+                let items_rec = blaze_scope::items_record::ItemsRecord::open_with_files(c.items, blaze_own::testing::heap().alloc(), move |index, _, _, edition| {
+                    if index != 0 { return Ok(None); }
+                    blaze_scope::items_record::CurrentFile::from_text(index, text, edition, blaze_own::testing::bump()).map(Some)
+                }).expect("items record");
+                let read = |of: blaze_scope::items_record::TextOf<'_>| match of {
+                    blaze_scope::items_record::TextOf::File { index: 0, .. } => Some(text),
+                    _ => None,
+                };
+                return Ok(blaze_scope::names_cells::seen_by_record(&record, Some((&items_rec, &read)), &[], syms).expect("internal symbols cell").unwrap_or(ABSENT));
+            }
         }
         Ok(ContentId::of("internal binding fixture cell", &want.cell.0))
     }
@@ -426,10 +440,11 @@ fn compare_binding(provider: &'static str, plant: bool) {
             .expect("the caller's BodyCheck read list");
         let reads = recorder.finish().expect("binding reads");
         for c in crates {
+            let syms = TableRead::Names(NameCell::InternalSymbols { krate: c.key.prefix() });
             let items = TableRead::Names(NameCell::Whole { krate: c.key.prefix(), section: Section::Items });
-            assert!(lazy.internal_binding_reads(entry).contains(&items), "lazy main must record its lookup in {}", c.name);
+            assert!(lazy.internal_binding_reads(entry).contains(&syms), "lazy main must record its internal-symbol lookup in {}", c.name);
             assert!(reads.contains(&items), "lookup read {}'s items", c.name);
-            assert!(filed.reads.contains(&items), "the caller must retain the lookup's read of {}'s items", c.name);
+            assert!(filed.reads.contains(&syms), "the caller must retain the lookup's read of {}'s internal symbols", c.name);
         }
         assert!(records.errors().is_empty(), "record reads: {:?}", records.errors());
         if provider == DECOY {
@@ -453,12 +468,25 @@ fn compare_binding(provider: &'static str, plant: bool) {
         assert_eq!(l, (checker_of(target.expect("record definition")), List::EMPTY));
         if plant {
             assert_ne!(w, l, "the comparison must catch the other module's definition");
-            let original = items_record::encode_with(names.krate(1), &names, a).expect("original provider items");
-            let before = blaze_scope::names_cells::whole_digest(Section::Items, &original);
-            let after = blaze_scope::names_cells::whole_digest(Section::Items, kept.0[1].items);
-            assert_ne!(before, after, "moving the definition must change the recorded input");
-            let cell = NameCell::Whole { krate: crates[1].key.prefix(), section: Section::Items };
-            let id = CellId { of: blaze_drive::key::crate_scope_name(&crates[1].key), cell: blaze_drive::cells::Cell(cell.key()) };
+            let syms = NameCell::InternalSymbols { krate: crates[1].key.prefix() };
+            let orig_names = blaze_scope::names_record::encode(names.krate(1), a).expect("original provider names");
+            let orig_items = items_record::encode_with(names.krate(1), &names, a).expect("original provider items");
+            let digest_of = |n_bytes: &[u8], i_bytes: &[u8], text: &'static str| {
+                let record = blaze_scope::names_record::NamesRecord::open(blaze_scope::names_record::Verified::check(n_bytes).expect("names record"));
+                let items_rec = blaze_scope::items_record::ItemsRecord::open_with_files(i_bytes, blaze_own::testing::heap().alloc(), move |index, _, _, edition| {
+                    if index != 0 { return Ok(None); }
+                    blaze_scope::items_record::CurrentFile::from_text(index, text, edition, blaze_own::testing::bump()).map(Some)
+                }).expect("items record");
+                let read = |of: blaze_scope::items_record::TextOf<'_>| match of {
+                    blaze_scope::items_record::TextOf::File { index: 0, .. } => Some(text),
+                    _ => None,
+                };
+                blaze_scope::names_cells::seen_by_record(&record, Some((&items_rec, &read)), &[], syms).expect("internal symbols").unwrap_or(ABSENT)
+            };
+            let before = digest_of(&orig_names, &orig_items, provider);
+            let after = digest_of(kept.0[1].names, kept.0[1].items, kept.0[1].text);
+            assert_ne!(before, after, "moving the definition must change the recorded internal-symbol cell");
+            let id = CellId { of: blaze_drive::key::crate_scope_name(&crates[1].key), cell: blaze_drive::cells::Cell(syms.key()) };
             assert!(filed.done.reads.contains(&(id, after)), "the body record must carry the changed provider digest");
         } else {
             assert_eq!(w, l);

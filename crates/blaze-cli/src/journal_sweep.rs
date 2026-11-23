@@ -1002,7 +1002,8 @@ impl<'t> Taken<'t> {
             let path = last.path(i);
             // The fact mount's files are the runner's, absolute, in no unit: as `marks` has them.
             let fact_file = row.kind == LeafKind::ScriptFile && path.starts_with(sweep::FACT_MOUNT);
-            if row.kind.by_script() && !fact_file {
+            let script_asks = script_row_uses_asks(row.kind, row.flags, path, self.target_tagged);
+            if script_asks {
                 *mark = reach.asks();
             }
             if !*mark || row.kind == LeafKind::MacroFiles {
@@ -1013,7 +1014,7 @@ impl<'t> Taken<'t> {
                 // No stream replays the home (the module's rule): its listings, on every request.
                 LeafKind::HomeListing => &mut parts.home,
                 LeafKind::ScriptGit => &mut parts.git,
-                kind if kind.by_script() && !fact_file => &mut parts.scripts,
+                _ if script_asks && !fact_file => &mut parts.scripts,
                 kind => match unit_of(&views, kind, path) {
                     None => &mut parts.unwatched,
                     Some((UnitView { index: None, .. }, _)) => &mut parts.refused,
@@ -1040,6 +1041,21 @@ impl<'t> Taken<'t> {
         // clone: the request's one count of its journal, kept for its tests.
         SweepCounts { journal: self.journal.clone(), events: self.events, statted, leaves, settled: 0, since: self.since, streams: self.streams, replays: self.replays, parts: None, status: None, helper: self.helper, looks: None }
     }
+}
+
+/// Whether a script sweep row must fall back to `reach.asks()` (re-statted whenever any
+/// checkout file changed) rather than relying on `Index::reaches` alone. Direct non-symlink
+/// checkout paths outside `.git`/`.blaze`/`target` can only move when the journal reaches them
+/// or an ancestor folder; symlinks, own-folder paths, and `ScriptGit` keep `reach.asks()`.
+pub(crate) fn script_row_uses_asks(kind: LeafKind, flags: u8, path: &str, target_tagged: bool) -> bool {
+    let fact_file = kind == LeafKind::ScriptFile && path.starts_with(sweep::FACT_MOUNT);
+    if !kind.by_script() || fact_file {
+        return false;
+    }
+    let direct_script = matches!(kind, LeafKind::ScriptFile | LeafKind::ScriptStat | LeafKind::ScriptListing)
+        && !own(path, target_tagged)
+        && flags & sweep::DIRECT_PATH != 0;
+    !direct_script
 }
 
 /// One replayed unit as [`marks`] reads it.

@@ -53,7 +53,7 @@ pub(crate) fn today(cells: &[(CellId, ContentId)], id: &CellId) -> Option<Conten
     cells.binary_search_by_key(id, |(cell, _)| *cell).ok().map(|at| cells[at].1)
 }
 
-use crate::engine_tasks::{CELLS, HEADS, SURFACE, WHOLE};
+use crate::engine_tasks::{CELLS, EXPORTS, HEADS, SURFACE, WHOLE};
 
 #[cfg(test)]
 thread_local! {
@@ -382,6 +382,8 @@ pub(crate) enum CellKind {
     HeadsDigest,
     /// A crate's mark that it defines its cell table ([`CELLS`]).
     CellTable,
+    /// A crate's exports section ([`EXPORTS`]).
+    Exports,
     /// One cell of a crate's names (a `CrateScope` cell but the above).
     NamesCell,
     /// One head task's cell (a `Signature` cell).
@@ -404,6 +406,7 @@ impl CellKind {
             (cell, Kind::FileItems) if cell == SURFACE => CellKind::Surface,
             (cell, Kind::FileItems) if cell == HEADS => CellKind::HeadsDigest,
             (cell, Kind::CrateScope) if cell == CELLS => CellKind::CellTable,
+            (cell, Kind::CrateScope) if cell == EXPORTS => CellKind::Exports,
             (_, Kind::CrateScope) => CellKind::NamesCell,
             (_, Kind::Signature) => CellKind::HeadCell,
             (_, Kind::ImplBucket) => CellKind::BucketCell,
@@ -419,6 +422,7 @@ impl CellKind {
             CellKind::Surface => "surface",
             CellKind::HeadsDigest => "heads digest",
             CellKind::CellTable => "cell table mark",
+            CellKind::Exports => "exports",
             CellKind::NamesCell => "names cell",
             CellKind::HeadCell => "head cell",
             CellKind::BucketCell => "bucket cell",
@@ -443,9 +447,9 @@ pub(crate) enum ScopeReadsAs {
 }
 
 impl ScopeReadsAs {
-    /// The command's default, the one constant the next piece flips to `Cells` once its
-    /// tests, the engine tests and the 500-module crate's answers are equal under it.
-    pub(crate) const DEFAULT: ScopeReadsAs = ScopeReadsAs::Whole;
+    /// The command's default: cell-grain scope reads and impl tables, so an unrelated item
+    /// added to a crate does not wake bodies or impl tables that never read it.
+    pub(crate) const DEFAULT: ScopeReadsAs = ScopeReadsAs::Cells;
 }
 
 /// The strategy of one seam: what a body's coarse reads widen to.

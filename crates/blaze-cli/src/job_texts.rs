@@ -16,27 +16,29 @@ use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::{Bytes, Frame};
 use bstd::path::Path;
 
-use crate::body_types::LazyTrees;
+use crate::body_types::{LazyTrees, SyncLazyTrees};
 use crate::work::held_str;
 
 /// The packs of a crate list's trees as a job reads them, tree `k` (1-based; tree 0 is the
 /// checkout) by [`Packs::tree`]: every tree opened before the job ([`Packs::Open`]: a check's
 /// stages, whose pool jobs share one slice), or each opened on the first read of a text from it
-/// ([`Packs::OnFirstRead`]: `blaze run`'s parent, which reads the trees its walk touches).
+/// ([`Packs::OnFirstRead`]: `blaze run`'s parent; [`Packs::SyncLazy`]: `Bodies` pool workers).
 #[derive(Clone, Copy)]
 pub(crate) enum Packs<'n> {
     Open(&'n [PackView<'n>]),
     OnFirstRead(&'n LazyTrees<'n>),
+    SyncLazy(&'n SyncLazyTrees<'n>, &'n bstd::fs::Fs),
 }
 
 impl<'n> Packs<'n> {
     /// Tree `k`'s pack; `None` past the list's trees, or (on first read) a tree that could not
-    /// be opened, which `TreesSeen::refused` (body_types.rs) names for the caller to stop on
-    /// (rule 3).
-    pub(crate) fn tree(&self, k: usize) -> Option<PackView<'n>> {
+    /// be opened, which `TreesSeen::refused` / `SyncLazyTrees::refused` (body_types.rs) names for
+    /// the caller to stop on (rule 3).
+    pub(crate) fn tree(&self, cx: &Cx, frame: &Frame, k: usize) -> Option<PackView<'n>> {
         match self {
             Packs::Open(views) => views.get(k.checked_sub(1)?).copied(),
             Packs::OnFirstRead(lazy) => lazy.tree(k),
+            Packs::SyncLazy(lazy, fs) => lazy.tree(cx, fs, frame, k),
         }
     }
 }
@@ -50,6 +52,12 @@ impl<'a: 'n, 'p: 'a, 'n> From<&'a [PackView<'p>]> for Packs<'n> {
 impl<'n> From<&'n LazyTrees<'n>> for Packs<'n> {
     fn from(lazy: &'n LazyTrees<'n>) -> Packs<'n> {
         Packs::OnFirstRead(lazy)
+    }
+}
+
+impl<'a: 'n, 'f: 'a, 'n> From<(&'a SyncLazyTrees<'f>, &'a bstd::fs::Fs)> for Packs<'n> {
+    fn from((lazy, fs): (&'a SyncLazyTrees<'f>, &'a bstd::fs::Fs)) -> Packs<'n> {
+        Packs::SyncLazy(lazy, fs)
     }
 }
 
@@ -280,7 +288,7 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
             return Some(text);
         }
         if tree != 0 {
-            return core::str::from_utf8(self.packs.tree(tree)?.find(inner)?.bytes).ok();
+            return core::str::from_utf8(self.packs.tree(self.cx, self.frame, tree)?.find(inner)?.bytes).ok();
         }
         if let Some((_, text)) = self.read.borrow().iter().find(|(p, _)| *p == inner) {
             return *text;
@@ -338,7 +346,7 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         let (tree, inner) = rest.split_once('/')?;
         let tree: usize = tree.parse().ok()?;
         if tree != 0 {
-            return Some(self.packs.tree(tree)?.find(inner)?.bytes);
+            return Some(self.packs.tree(self.cx, self.frame, tree)?.find(inner)?.bytes);
         }
         let bytes = self.checkout_bytes(inner);
         let from = from.strip_prefix("/0/").unwrap_or(from);

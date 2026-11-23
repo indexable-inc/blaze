@@ -710,7 +710,7 @@ const MEM_PARTS: usize = 23;
 
 /// The first representative of each retained recorder cell, before row placement.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct KeptKinds([u32; 18]);
+struct KeptKinds([u32; 20]);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TopKept {
@@ -719,9 +719,9 @@ pub(crate) struct TopKept {
 }
 
 impl KeptKinds {
-    const NAMES: [&'static str; 18] = [
+    const NAMES: [&'static str; 20] = [
         "Binding", "Module", "Root", "Variants", "Item", "Members", "Expansion", "MemberOf",
-        "VariantOf", "Beginning", "Lang", "Incoherent", "Textual", "Whole", "Signature", "Text", "Head", "Impls",
+        "VariantOf", "Beginning", "Lang", "Incoherent", "InternalSymbols", "Links", "Textual", "Whole", "Signature", "Text", "Head", "Impls",
     ];
 
     fn add(&mut self, key: TableRead) {
@@ -731,12 +731,12 @@ impl KeptKinds {
                 Binding { .. } => 0, Module { .. } => 1, Root { .. } => 2, Variants { .. } => 3,
                 Item { .. } => 4, Members { .. } => 5, Expansion { .. } => 6, MemberOf { .. } => 7,
                 VariantOf { .. } => 8, Beginning { .. } => 9, Lang { .. } => 10, Incoherent { .. } => 11,
-                Textual { .. } => 12, Whole { .. } => 13,
+                InternalSymbols { .. } => 12, Links { .. } => 13, Textual { .. } => 14, Whole { .. } => 15,
             },
-            TableRead::Signature { .. } => 14,
-            TableRead::Text { .. } => 15,
-            TableRead::Head { .. } => 16,
-            TableRead::Impls { .. } => 17,
+            TableRead::Signature { .. } => 16,
+            TableRead::Text { .. } => 17,
+            TableRead::Head { .. } => 18,
+            TableRead::Impls { .. } => 19,
         };
         self.0[at] += 1;
     }
@@ -2017,8 +2017,8 @@ pub(crate) struct Handles<'h, 'e, 'n, 'o> {
 /// (plan row A8; none: owed), from [`BodiesStage::groups`].
 type Stop<'f> = (&'static str, &'f [CellId]);
 
-/// The packs of the crate list's trees and its corrected files (body_types.rs `Kept::trees`).
-type Trees = (&'static [blaze_fetch::PackView<'static>], &'static [(u32, &'static str, &'static str)]);
+/// The on-demand packs of the crate list's trees and its corrected files (body_types.rs `Kept::lazy_trees`).
+type Trees<'f> = (blaze_own::Box<crate::body_types::SyncLazyTrees<'f>, blaze_own::Alloc<'static>>, &'static [(u32, &'static str, &'static str)]);
 
 /// What [`BodiesStage::groups`] found: each member's group, each body's place, the files of
 /// member crates, and the members' names.
@@ -2041,7 +2041,7 @@ struct Found<'f, 'r> {
     /// Each member crate's outlined files by its key's prefix and its items record's file
     /// index, sorted: where a head read finds its head task (engine_heads.rs `Owners`, [`widen`]).
     heads: SVec<'f, crate::engine_heads::Subject>,
-    trees: Trees,
+    trees: Trees<'f>,
 }
 
 /// The stage: the crates' records read once a command, and every body's result.
@@ -2140,11 +2140,12 @@ pub(crate) struct BodiesStage<'f> {
     /// answer this request starts from, set by the driver before the first Bodies phase
     /// ([`BodiesStage::members_from`]). `None`: none named.
     members_last: Option<(Option<Key>, u64)>,
-    /// The outlines this request moved (`FileItems` names, sorted, each once), set by the ready
-    /// driver before its setup ([`BodiesStage::stand_members`]): its setup then takes a member
-    /// none of whose files moved from the record ([`StandingMembers`]). `None`: the phase path,
-    /// every member visited ([`EveryMember`]).
+    /// The outlines this request moved (`FileItems` names, sorted, each once), set before its
+    /// setup ([`BodiesStage::stand_members`]): its setup then takes a member none of whose files
+    /// moved from the record ([`StandingMembers`]). `None`: every member visited ([`EveryMember`]).
     outlines_moved: Option<Vec<Name, blaze_own::Alloc<'static>>>,
+    /// The `FileItems` tasks entered in earlier phases of this request (`note_entered`), sorted.
+    outlines_entered: Option<Vec<Name, blaze_own::Alloc<'static>>>,
     /// The files the request has an outline of (a place in the stored answer's root) and did not
     /// read back (the ready setup's, sorted: [`BodiesStage::unread_outlines`]). A visited
     /// member's held file among them is the setup's typed refusal (`groups`), never a
@@ -2383,6 +2384,7 @@ pub(crate) struct Prepared<'s, 'f, 'r> {
     ones: &'f [One<'f>],
     outlined: &'s [Outlined<'s>],
     root: &'s Dir<ReadWrite>,
+    fs: &'s bstd::fs::Fs,
     board: &'s crate::engine_status::Board<'s>,
     clock: &'s Clock,
     listings: &'s crate::engine_heads::Listings,
@@ -2436,7 +2438,8 @@ pub(crate) struct BodyRunner<'v, 'f, 'r> {
     outlined: &'v [Outlined<'v>],
     listings: &'v crate::engine_heads::Listings,
     root: &'v Dir<ReadWrite>,
-    packs: &'v [blaze_fetch::PackView<'static>],
+    fs: &'v bstd::fs::Fs,
+    packs: &'v crate::body_types::SyncLazyTrees<'f>,
     corrected: &'v [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     groups: &'v [Group<'f, 'r>],
@@ -2483,6 +2486,7 @@ impl<'v, 'f, 'r> BodyRunner<'v, 'f, 'r> {
             outlined: self.outlined,
             listings: self.listings,
             root: self.root,
+            fs: self.fs,
             packs: self.packs,
             corrected: self.corrected,
             procs: self.procs,
@@ -2522,12 +2526,13 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
     /// This setup's runner over `found` (this setup's, `Prepared::found`) and the stage's view
     /// `stage` ([`BodiesStage::reads_view`]).
     fn runner_of<'v>(&'v self, found: &'v Found<'f, 'r>, stage: StageReads<'v>, by_need: &'v dyn crate::front_load::OpenByNeed) -> BodyRunner<'v, 'f, 'r> {
-        let (packs, corrected) = found.trees;
+        let (packs, corrected) = (&*found.trees.0, found.trees.1);
         BodyRunner {
             grains: &found.grains,
             outlined: self.outlined,
             listings: self.listings,
             root: self.root,
+            fs: self.fs,
             packs,
             corrected,
             procs: self.procs,
@@ -2663,6 +2668,7 @@ impl<'f> BodiesStage<'f> {
             grains_line: None,
             members_last: None,
             outlines_moved: None,
+            outlines_entered: None,
             unread: None,
             members_key: None,
             standing_drops_heads: false,
@@ -2892,13 +2898,32 @@ impl<'f> BodiesStage<'f> {
         self.grains_last = Some((record, last_serial));
     }
 
-    /// One phase's entered tasks: its `CrateScope` and `ImplBucket` ones are kept, sorted, in
-    /// `heap`, the request's.
+    /// One phase's entered tasks: its `CrateScope` and `ImplBucket` ones are kept for read
+    /// grains, and its `FileItems` ones for standing-member invalidation, sorted, in `heap`.
     pub(crate) fn note_entered(&mut self, names: impl Iterator<Item = Name>, heap: blaze_own::Alloc<'static>) {
-        let kept = self.grains_entered.get_or_insert_with(|| Vec::new_in(heap));
-        kept.extend(names.filter(|name| matches!(name.kind, Kind::CrateScope | Kind::ImplBucket)));
-        kept.sort_unstable();
-        kept.dedup();
+        let grains = self.grains_entered.get_or_insert_with(|| Vec::new_in(heap));
+        let outlines = self.outlines_entered.get_or_insert_with(|| Vec::new_in(heap));
+        for name in names {
+            match name.kind {
+                Kind::CrateScope | Kind::ImplBucket => grains.push(name),
+                Kind::FileItems => outlines.push(name),
+                _ => {}
+            }
+        }
+        grains.sort_unstable();
+        grains.dedup();
+        outlines.sort_unstable();
+        outlines.dedup();
+    }
+
+    /// Whether the last request's members record was loaded and is available to stand members from.
+    pub(crate) fn has_members_record(&self) -> bool {
+        self.members_last.and_then(|(record, _)| record).is_some()
+    }
+
+    /// The `FileItems` tasks entered in earlier phases of this request, sorted.
+    pub(crate) fn outlines_entered(&self) -> &[Name] {
+        self.outlines_entered.as_deref().unwrap_or(&[])
     }
 
     /// The grains record this request put: the key the checkout's grains root names from the
@@ -3232,6 +3257,7 @@ impl<'f> BodiesStage<'f> {
             ones,
             outlined: handles.outlined,
             root: handles.root,
+            fs: &handles.env.fs,
             board: handles.board,
             clock: handles.clock,
             listings,
@@ -3259,6 +3285,7 @@ impl<'f> BodiesStage<'f> {
         frame: &'f Frame,
         request_heads: Option<&crate::engine_seeds::RequestTable<'_>>,
         listings: &crate::engine_heads::Listings,
+        paged_shelf: Option<&dyn blaze_ladder::front2::buckets::ShelfSource>,
         at_phase: SharedAlloc<'p>,
     ) -> Result<MadeFacts<'p>, CliError> {
         let cx = cx.span("engine: one bodies phase");
@@ -3350,7 +3377,11 @@ impl<'f> BodiesStage<'f> {
         // once whichever run asks it first); its counts read after the runs end.
         let by_need = prepared.scope_records();
         {
-            let shared = prepared.shared(found, self.reads_view(), &view, &by_need);
+            let stage_reads = match paged_shelf {
+                Some(source) => self.reads_paged(source),
+                None => self.reads_view(),
+            };
+            let shared = prepared.shared(found, stage_reads, &view, &by_need);
             let scope = cx.scope();
             scope.narrow_workers(handles.workers, Class::Foreground);
             // Each run started the most predicted first (ties in plan order), so the longest work
@@ -3623,8 +3654,9 @@ impl<'f> BodiesStage<'f> {
         // `open_trees`): a refusal there is of the machine's files, not of a cell (a pack missing
         // or not the one the list's world read), so it reads nothing and is owed, entered again
         // each request (rule 3: no invented read to make it stand).
-        let (packs, corrected) = match self.kept.trees(cx, handles.env, graph.out, &list, frame) {
-            Ok(trees) => trees,
+        let packs = blaze_own::Box::new_in(crate::body_types::SyncLazyTrees::new(handles.env.home, handles.env.heap, list, frame), handles.env.heap.alloc());
+        let corrected = match crate::body_types::corrected_of(&list, handles.env.heap) {
+            Ok(corrected) => corrected,
             Err(why) => return Ok(Err((why, &[]))),
         };
         // The setup's laps ([`SetupParts`]): from its start to here, the list and the trees.
@@ -4113,7 +4145,7 @@ impl<'f> BodiesStage<'f> {
             // is opened only if they ask it.
             let opened = match (open_records, group.as_ref()) {
                 (true, Some(group)) => {
-                    let record_files = (packs, Some(handles.outlined));
+                    let record_files = ((&*packs, &handles.env.fs), Some(handles.outlined));
                     Some(crate::run_names::names_records_over(cx, handles.root, group.crates.scope(&setup_records), record_files, corrected, procs, std::vec::Vec::new_in(Global), env_in(group.env, frame).ok().flatten(), Some(snapshot), Some(expansion_keys), frame, g))
                 }
                 _ => None,
@@ -5098,7 +5130,8 @@ struct Shared<'s, 'a, 'f, 'r, R: ?Sized + CellDigests> {
     /// `Listings`, lane OW1): every stretch's `Owners` places its reads in them.
     listings: &'s crate::engine_heads::Listings,
     root: &'s Dir<ReadWrite>,
-    packs: &'s [blaze_fetch::PackView<'static>],
+    fs: &'s bstd::fs::Fs,
+    packs: &'s crate::body_types::SyncLazyTrees<'f>,
     corrected: &'s [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     groups: &'s [Group<'f, 'r>],
@@ -5564,7 +5597,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
         Ok(env) => env,
         Err(error) => return refuse(run, leak(g, format_args!("its member's environment did not copy into the run: {error:?} (blaze-scope crate_env.rs `EnvLent::copy_in`)")), scope, out, ran, run_out, alloc),
     };
-    let files = (shared.packs, Some(shared.outlined));
+    let files = ((shared.packs, shared.fs), Some(shared.outlined));
     // Its scope crates past the member opened by need, at their first question, through the
     // request's memo (`shared.by_need`, piece C (a)); the oracle arm's all opened at the setup.
     let Ok(opened) = crate::run_names::names_records_over(cx, shared.root, group.crates.scope(shared.by_need), files, shared.corrected, shared.procs, std::vec::Vec::new_in(Global), env, Some(shared.snapshot), Some(shared.expansion_keys), frame, g) else {
@@ -6766,7 +6799,13 @@ fn data_read<R: ?Sized + CellDigests>(reads: &R, path: &str, bytes: Option<&[u8]
     let file = CellId { of: Name::file(path.as_bytes()), cell: WHOLE };
     let planned = || bytes.map_or_else(crate::data_include::absent_out, crate::data_include::data_out);
     if reads.row_failed(file.of) == Some(false) {
-        return DataRead { id: file, seen: planned(), cell: DataCell::Planned };
+        let seen = planned();
+        // Only bind to the `FileItems` task when its `WHOLE` cell IS a `data_include` digest;
+        // an outlined `.rs` source file included via `include_str!` defines an outline digest on
+        // `FileItems::WHOLE` (not `data_out(bytes)`), so fall through to its raw-bytes `Given` cell.
+        if reads.cell(&file) == seen {
+            return DataRead { id: file, seen, cell: DataCell::Planned };
+        }
     }
     match crate::engine_script_reads::file_read(path, bytes) {
         Some((given, answer)) => DataRead { id: CellId { of: given, cell: WHOLE }, seen: answer, cell: DataCell::Followed },

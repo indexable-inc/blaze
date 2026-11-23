@@ -132,6 +132,57 @@ impl Kept {
         self.trees = Some((graph, trees));
         trees
     }
+
+}
+
+/// Thread-safe, lock-free on-demand pack opener for `Bodies`: each tree `k` (1-based) is
+/// mapped and verified on first read and published via `PublishOnce`.
+pub(crate) struct SyncLazyTrees<'f> {
+    home: Option<&'f str>,
+    heap: &'static blaze_own::Heap,
+    list: CrateList<'static>,
+    slots: &'f [bstd::sync::PublishOnce<Result<PackView<'static>, &'static str>>],
+    refused: bstd::sync::PublishOnce<&'static str>,
+}
+
+impl<'f> SyncLazyTrees<'f> {
+    pub(crate) fn new(home: Option<&str>, heap: &'static blaze_own::Heap, list: CrateList<'static>, frame: &'f Frame) -> SyncLazyTrees<'f> {
+        let mut slots: Vec<bstd::sync::PublishOnce<Result<PackView<'static>, &'static str>>, &'f Frame> = Vec::with_capacity_in(list.trees(), frame);
+        slots.extend((0..list.trees()).map(|_| bstd::sync::PublishOnce::new()));
+        let home = home.map(|h| crate::work::held_str(h, frame));
+        SyncLazyTrees {
+            home,
+            heap,
+            list,
+            slots: slots.into_bump_slice(),
+            refused: bstd::sync::PublishOnce::new(),
+        }
+    }
+
+    pub(crate) fn tree(&self, cx: &Cx, fs: &bstd::fs::Fs, scratch: &Frame, k: usize) -> Option<PackView<'static>> {
+        let slot = self.slots.get(k.checked_sub(1)?)?;
+        let got = match slot.get() {
+            Some(got) => got,
+            None => {
+                let from = PackHome { home: self.home, fs, heap: self.heap };
+                let mut dirs = PackDirs::default();
+                let opened = open_tree(cx, from, &self.list, k, &mut dirs, scratch);
+                let _ = slot.set(opened);
+                slot.get()?
+            }
+        };
+        match got {
+            Ok(view) => Some(*view),
+            Err(why) => {
+                let _ = self.refused.set(*why);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn refused(&self) -> Option<&'static str> {
+        self.refused.get().copied()
+    }
 }
 
 /// Each tree of `list` opened from where the table names it (blaze-world crate_list.rs, the

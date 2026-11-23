@@ -148,7 +148,7 @@ fn at_size(crates: usize) -> (crate::engine_answer::AskedByKind, u32, (u32, u32)
     // oracle above is then the two strategies' equality.
     let (stood, visited) = ready.checked.members_stood;
     assert!(stood > 0, "{crates} crates: the ready setup took no member from the members record (visited {visited})");
-    assert_eq!(phases.checked.members_stood.0, 0, "{crates} crates: the phase path visits every member");
+    assert_eq!(phases.checked.members_stood, (stood, visited), "{crates} crates: the phase path stands the same unchanged members as ready");
     standing_control(crates, &phases.stored);
     (ready.stored.asked, visited, ready.stored.changed)
 }

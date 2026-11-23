@@ -287,7 +287,11 @@ pub const ABSENT: u8 = 4;
 /// Both `x.rs` and `x/mod.rs` are there (rustc's E0761): a finding whatever they hold, so
 /// neither is read; the id is of the slot's path, the stamp none.
 pub const BOTH: u8 = 8;
-const FLAGS: u8 = MODULE | AT_MOD_RS | ABSENT | BOTH;
+/// Set on a `ScriptFile` / `ScriptStat` / `ScriptListing` row when every path component from
+/// the checkout root to this path was verified not to be a symlink, so the journal's own reach
+/// (`Index::reaches`) suffices instead of re-reading every script file on unrelated edits.
+pub const DIRECT_PATH: u8 = 16;
+const FLAGS: u8 = MODULE | AT_MOD_RS | ABSENT | BOTH | DIRECT_PATH;
 
 /// One row: what was read (or probed) at a path, and how it was.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

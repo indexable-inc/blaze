@@ -118,6 +118,12 @@ pub(crate) fn heads_of<A: core::alloc::Allocator + Copy>(record: &Record<A>) -> 
 /// outline's: its byte is not [`HEADS`]'s so the two are not read as one.)
 pub(crate) const CELLS: Cell = Cell([3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
+/// A `CrateScope` task's exports section digest (`names/sections.rs` `Sections::exports`): what
+/// downstream `CrateScope` tasks read from a dependency. An edit inside a crate that leaves its
+/// exports unchanged (e.g. adding a private function) moves [`WHOLE`] without moving [`EXPORTS`],
+/// so no downstream `Names` task re-enters.
+pub(crate) const EXPORTS: Cell = Cell([4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
 /// The surface digest an outline record lists (its `Surface` part's source), or `None` for a
 /// record with no surface (a data file).
 pub(crate) fn surface_of<A: core::alloc::Allocator + Copy>(record: &Record<A>) -> Option<ContentId> {

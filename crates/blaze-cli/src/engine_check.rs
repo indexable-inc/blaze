@@ -1953,7 +1953,7 @@ fn checking<'f>(
         found_served: false,
     });
     let drove = match driving.parts() {
-        Ok((mut engine, why)) => drive(rq, &mut *engine, &mut store, &mut read, &mut records, &mut pipeline, last_lines.as_ref()).map(|()| Drove::Phases(engine, why)),
+        Ok((mut engine, why)) => drive(rq, &mut *engine, &mut store, &mut read, &mut records, &mut pipeline, last_lines.as_ref(), stored.as_ref(), &files).map(|()| Drove::Phases(engine, why)),
         Err(start) => match (stored.as_ref(), woke, entering) {
             (Some(last), Some(woke), Some(entering)) => ready_drive(rq, start, &files, (woken.as_slice(), entering, woke, entering_tasks.as_slice()), last, &mut store, &mut read, &mut records, last_lines.as_ref(), ready_plant).map(Drove::Ready),
             _ => Err(EngineCheckError::ReadyRefused(crate::engine_ready_edit::ReadyRefused::Root(crate::engine_ready_edit::PhasesWhy::NoAnswer)).into()),
@@ -2064,8 +2064,12 @@ fn checking<'f>(
         // one, so a read no row makes any more would be followed forever (rule 18). One lookup
         // of the cell's readers a followed or fresh read (its readers page).
         let refused = core::cell::Cell::new(None);
-        scripts.script_rows(followed_kept.as_ref().map(|followed| &followed.now), bodies.data_files(), |name| {
+        let followed_all_kept = !finished.answer.any_reader_removed_of(Kind::Given);
+        scripts.script_rows(followed_kept.as_ref().map(|followed| &followed.now), bodies.data_files(), followed_all_kept, |name, from_followed| {
             let cell = CellId { of: name, cell: WHOLE };
+            if from_followed && !finished.answer.reader_removed(cell) {
+                return true;
+            }
             match blaze_engine::LastAnswer::readers(&finished.answer, cell, blaze_own::Alloc::from(alloc)) {
                 Ok(readers) => readers.iter().any(|reader| *reader != name),
                 Err(error) => {
@@ -2073,7 +2077,7 @@ fn checking<'f>(
                     false
                 }
             }
-        }, &mut rows);
+        }, |kind, path| script_sweep.as_ref().is_some_and(|sweep| sweep.is_direct(kind, path)), &mut rows);
         if let Some(error) = refused.into_inner() {
             return Err(EngineError::from(error).into());
         }
@@ -2646,15 +2650,15 @@ fn print_answer<'m, 'f, 'a>(
 /// so its temporaries (the coverage, the tally, the formatted names) are never in
 /// [`checking`]'s frame (rule 54, bt4 2026-11-20). The store is committed by the caller after.
 #[inline(never)]
-fn certified<'f, D: blaze_core::Driver, S: crate::store::Sharing>(
+fn certified<'m, 'f, D: blaze_core::Driver, S: crate::store::Sharing>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
-    view_slot: &crate::engine_lines::ViewSlot<'_, 'f>,
+    view_slot: &crate::engine_lines::ViewSlot<'m, 'f>,
     pointer: &crate::engine_answer::Pointer<'_>,
     lines: &crate::engine_lines::Last<'_, '_>,
     answer_root: &str,
     journal: (&crate::journal_checkpoint::Chosen<'_>, &crate::journal_checkpoint::Places<'_>, &mut crate::journal_checkpoint::Counts),
-    store: &mut crate::store::CommandStore<'_, '_, D, S>,
+    store: &mut crate::store::CommandStore<'m, '_, D, S>,
     (tools, toolchain): (&blaze_engine::Tools, blaze_toolchain::ToolchainId),
     shown: &mut print::Shown<'f>,
     phases: &mut Phases,
@@ -2669,13 +2673,9 @@ fn certified<'f, D: blaze_core::Driver, S: crate::store::Sharing>(
     // transfers the stored stream in one write, avoiding a re-render of every note and finding.
     // Older answers, a different view, or a caller needing a listing take the ordinary semantic
     // printer below and publish a view on the next edit.
-    let tally = match view_slot.certified(cx, pointer.lines, shown, frame, out)? {
-        Some(tally) => tally,
-        None => {
-            let tally = crate::engine_lines::print_all(cx, root, lines.blocks(), shown, request, frame, out)?;
-            crate::engine_head_notes::print_grouped(cx, lines.blocks(), shown, frame, out)?;
-            tally
-        }
+    let (tally, view_hit) = match view_slot.certified(cx, pointer.lines, shown, frame, out)? {
+        Some(tally) => (tally, true),
+        None => (view_slot.new_view(cx, root, store, pointer.lines, lines, shown, request, frame, out)?, false),
     };
     let whole = facts.printed.bodies_whole;
     let (ran_stages, not_stages) = crate::check_coverage(facts.printed.names, whole, whole && tally.borrows == 0, frame);
@@ -2703,7 +2703,12 @@ fn certified<'f, D: blaze_core::Driver, S: crate::store::Sharing>(
     // The certificate stood on this pointer at this replay's places: when due, they are kept as
     // its journal checkpoint, riding the commit after (journal_checkpoint.rs).
     journal_counts.written = crate::journal_checkpoint::after_certificate(cx, store, answer_root, pointer.key, chosen, now_places.stored(), crate::journal_checkpoint::DUE_EVENTS, frame)?;
-    store.renew(&[answer_root, reach.as_str(), answer_index.as_str(), crate::engine_seeds::root_name(tools, frame).as_str()], toolchain)?;
+    let seeds_root = crate::engine_seeds::root_name(tools, frame);
+    if view_hit {
+        store.renew(&[answer_root, reach.as_str(), answer_index.as_str(), view_slot.name.as_str(), seeds_root.as_str()], toolchain)?;
+    } else {
+        store.renew(&[answer_root, reach.as_str(), answer_index.as_str(), seeds_root.as_str()], toolchain)?;
+    }
     crate::store::Store::after_answer(store, cx, &mut blaze_drive::profile::Profile::default())?;
     Ok((status, tally))
 }
@@ -2866,6 +2871,7 @@ const _: () = assert!(core::mem::size_of::<Drive<'static, 'static, 'static, 'sta
 
 /// 2. Drive: each phase run, merged, its records put, until no phase is left.
 #[inline(never)]
+#[expect(clippy::too_many_arguments, reason = "drive handles, each named")]
 fn drive<'d, 'f, 'r, 's, 'w, 'm>(
     rq: &mut Drive<'d, 'f, 'r, 's, 'w>,
     engine: &mut Engine<'r, Everything>,
@@ -2874,13 +2880,15 @@ fn drive<'d, 'f, 'r, 's, 'w, 'm>(
     records: &mut RecordKeys<'_>,
     pipeline: &mut crate::engine_scripts::Pipeline<'s, 'r>,
     last_lines: Option<&crate::engine_lines::Last<'_, '_>>,
+    stored: Option<&crate::engine_answer::Stored<'_>>,
+    files: &[(Name, &[Planned])],
 ) -> Result<(), CliError>
 where
     'r: 's,
     'f: 's,
     'm: 's,
 {
-    while one_phase(rq, engine, store, read, records, pipeline, last_lines)? {}
+    while one_phase(rq, engine, store, read, records, pipeline, last_lines, stored, files)? {}
     Ok(())
 }
 
@@ -2895,6 +2903,7 @@ fn stop_point(rq: &Drive<'_, '_, '_, '_, '_>) -> Result<(), CliError> {
 /// One phase: picked, run in its own arena, merged, its records put and committed, its arena
 /// ended. `false` when no phase is left.
 #[inline(never)]
+#[expect(clippy::too_many_arguments, reason = "phase handles, each named")]
 fn one_phase<'d, 'f, 'r, 's, 'w, 'm>(
     rq: &mut Drive<'d, 'f, 'r, 's, 'w>,
     engine: &mut Engine<'r, Everything>,
@@ -2903,6 +2912,8 @@ fn one_phase<'d, 'f, 'r, 's, 'w, 'm>(
     records: &mut RecordKeys<'_>,
     pipeline: &mut crate::engine_scripts::Pipeline<'s, 'r>,
     last_lines: Option<&crate::engine_lines::Last<'_, '_>>,
+    stored: Option<&crate::engine_answer::Stored<'_>>,
+    files: &[(Name, &[Planned])],
 ) -> Result<bool, CliError>
 where
     'r: 's,
@@ -2965,7 +2976,7 @@ where
     rq.times.coordinator(Coordinator::Planning, ns(planning.since_start()), ns(began.since_start()));
     // The Bodies phase's run facts, in this phase's arena: made by `run_phase`, copied into the
     // put below, dropped with the phase's other buffers.
-    let phase_facts = run_stage(rq, engine, store, read, records, pipeline, last_lines, phase, mixed, &mut entered, at_phase)?;
+    let phase_facts = run_stage(rq, engine, store, read, records, pipeline, last_lines, stored, files, phase, mixed, &mut entered, at_phase)?;
     // Pipelined: the coordinator filed finished Scripts and Names tasks in order; else it ran
     // the phase whole (its pool joined).
     let what = if mixed.is_some() { Coordinator::Filing } else { Coordinator::Phase };
@@ -3328,6 +3339,7 @@ fn outline_copy<'r>(one: &Outlined<'_>, alloc: SharedAlloc<'r>) -> Result<Outlin
 /// The phase's tasks run by their stage: filed from the pipeline, on the pool, or by the
 /// stage's own driver. The Bodies phase hands back its run facts, in the phase's arena.
 #[inline(never)]
+#[expect(clippy::too_many_arguments, reason = "stage dispatch handles, each named")]
 fn run_stage<'d, 'f, 'r, 's, 'w, 'm, 'p>(
     rq: &mut Drive<'d, 'f, 'r, 's, 'w>,
     engine: &mut Engine<'r, Everything>,
@@ -3336,6 +3348,8 @@ fn run_stage<'d, 'f, 'r, 's, 'w, 'm, 'p>(
     records: &RecordKeys<'_>,
     pipeline: &mut crate::engine_scripts::Pipeline<'s, 'r>,
     last_lines: Option<&crate::engine_lines::Last<'_, '_>>,
+    stored: Option<&crate::engine_answer::Stored<'_>>,
+    files: &[(Name, &[Planned])],
     phase: Phase,
     mixed: Option<Task>,
     entered: &mut SVec<'_, Task>,
@@ -3375,10 +3389,10 @@ where
         // `at_phase: SharedAlloc<'p>` for all but its `Done`s, and read its findings back from
         // the lines record.
         (None, Stage::Names) => match rq.names.as_mut() {
-            Some(stage) => stage.run_phase(cx, &mut *store, &mut *read, rq.handles, &entered[..], &mut rq.buffers[0], &mut *rq.times, alloc, frame)?,
+            Some(stage) => stage.run_phase(cx, &mut *store, &mut *read, engine.view(), rq.handles, &entered[..], &mut rq.buffers[0], &mut *rq.times, alloc, frame)?,
             None => rq.buffers[0].done.extend(entered.iter().map(|task| crate::engine_tasks::failed(task, alloc))),
         },
-        (None, Stage::Bodies) => return bodies_phase(rq, engine, store, read, records, last_lines, &entered[..], at_phase).map(Some),
+        (None, Stage::Bodies) => return bodies_phase(rq, engine, store, read, records, last_lines, stored, files, &entered[..], at_phase).map(Some),
         // PHASE-MEM-DEBT(Scripts): as Names': `ScriptsStage::results` on the request frame and
         // the process heap, kept to the command's end; to take `at_phase`.
         (None, Stage::Scripts) => rq.buffers[0].done.extend(entered.iter().map(|task| crate::engine_tasks::failed(task, alloc))),
@@ -3446,6 +3460,7 @@ fn outlines_phase<'r>(rq: &mut Drive<'_, '_, 'r, '_, '_>, engine: &Engine<'r, Ev
 /// A Bodies phase: the crates' tables and frozen heads made ready, then the bodies checked;
 /// its run facts, in the phase's arena.
 #[inline(never)]
+#[expect(clippy::too_many_arguments, reason = "bodies phase handles, each named")]
 fn bodies_phase<'r, 'm, 'p>(
     rq: &mut Drive<'_, '_, 'r, '_, '_>,
     engine: &Engine<'r, Everything>,
@@ -3453,15 +3468,25 @@ fn bodies_phase<'r, 'm, 'p>(
     read: &mut crate::engine_records::EngineRecords<'m>,
     records: &RecordKeys<'_>,
     last_lines: Option<&crate::engine_lines::Last<'_, '_>>,
+    stored: Option<&crate::engine_answer::Stored<'_>>,
+    files: &[(Name, &[Planned])],
     entered: &[Task],
     at_phase: SharedAlloc<'p>,
 ) -> Result<crate::engine_bodies::MadeFacts<'p>, CliError> {
     #[cfg(test)]
     stack_probe::at("bodies_phase");
-    let (cx, frame, alloc, heap, tools, planned) =(rq.cx, rq.frame, rq.alloc, rq.heap, rq.tools, rq.planned);
+    let (cx, frame, alloc, heap, tools, planned) = (rq.cx, rq.frame, rq.alloc, rq.heap, rq.tools, rq.planned);
     let handles = crate::engine_bodies::Handles { root: rq.root, env: rq.env, graph: rq.graph, names: rq.names.as_ref().map(crate::engine_names::NamesInputs::ran), outlined: rq.outlined, workers: rq.workers, clock: rq.phases.clock(), board: rq.board, tool: tools.0[blaze_drive::Kind::BodyCheck.index()] };
-    // The tables of crates whose Heads task stands, from the store: one shelf of all.
-    if let Some(stage) = rq.names.as_ref() {
+    // When no Units/Names/Heads task ran and no found files moved, every standing crate's impl
+    // tables and frozen heads stand in `stored`, so read them lazily by need (as `ready_drive`
+    // does) instead of eagerly scanning all 1,206 impl tables and 19,000 head headers.
+    let prior_moved = rq.ran.iter().any(|(phase, _, count)| matches!(phase.stage, Stage::Units | Stage::Names | Stage::Heads) && *count > 0);
+    let lazy_stored = stored.filter(|_| !rq.fresh && !prior_moved && rq.serve.served.get().is_none());
+    let stored_shelf = lazy_stored.map(|stored| crate::engine_shelf_pages::StoredShelf::new(stored, heap));
+    // The tables of crates whose Heads task stands, from the store: one shelf of all when not paged.
+    if stored_shelf.is_none()
+        && let Some(stage) = rq.names.as_ref()
+    {
         let shelf = &mut rq.bodies.shelf;
         rq.heads.read_back += records.lookup(|record| crate::engine_heads::complete(cx, &mut *store, stage, shelf, record, engine.view(), frame))?;
     }
@@ -3476,14 +3501,22 @@ fn bodies_phase<'r, 'm, 'p>(
     let seed_tool = crate::engine_seeds::tool_of(tools);
     let mut request_heads = match (rq.heads_from, rq.names.as_ref(), rq.graph) {
         (crate::engine_seeds::HeadsFrom::Frozen, Some(stage), Some(graph)) => match rq.bodies.kept.list(cx, &mut *store, &graph, frame)? {
-            Some(list) => {
-                let crates = crate::engine_seeds::crates_of(&list, crate::engine_names::NamesInputs::ran(stage));
-                // PHASE-MEM-DEBT(Bodies): the table lives to this phase's end alone and is
-                // built on the process heap (engine_seeds.rs `RequestTable::build`, `heap:
-                // &'static Heap`): to take `&mem`'s `SharedAlloc<'p>`, when its growth is freed
-                // at the phase's end.
-                Some(records.lookup(|record| crate::engine_seeds::RequestTable::build(cx, &mut *store, planned, engine.view(), record, crates, &seed_root, seed_tool, heap))?)
-            }
+            Some(list) => match lazy_stored {
+                Some(stored) => {
+                    let crates = crate::engine_seeds::crates_unasked(&list);
+                    let paged = crate::engine_seeds::PagedHeads::new(stored, files, crate::engine_seeds::PagedPlant::None, heap);
+                    let inputs = crate::engine_names::NamesInputs::ran(stage);
+                    Some(crate::engine_seeds::RequestTable::paged(cx, &mut *store, paged, (crates, inputs.keys()), &seed_root, seed_tool, heap)?)
+                }
+                None => {
+                    let crates = crate::engine_seeds::crates_of(&list, crate::engine_names::NamesInputs::ran(stage));
+                    // PHASE-MEM-DEBT(Bodies): the table lives to this phase's end alone and is
+                    // built on the process heap (engine_seeds.rs `RequestTable::build`, `heap:
+                    // &'static Heap`): to take `&mem`'s `SharedAlloc<'p>`, when its growth is freed
+                    // at the phase's end.
+                    Some(records.lookup(|record| crate::engine_seeds::RequestTable::build(cx, &mut *store, planned, engine.view(), record, crates, &seed_root, seed_tool, heap))?)
+                }
+            },
             // No crate list: no body is checked, each says why (engine_bodies.rs `groups`).
             None => None,
         },
@@ -3497,6 +3530,17 @@ fn bodies_phase<'r, 'm, 'p>(
     if let (Some(table), Some(once)) = (request_heads.as_mut(), rq.heads.once.as_ref()) {
         table.list_too(once.put_keys());
     }
+    // Stand unchanged members from the last request's members record (StandingMembers) on the
+    // phase path too: every outline entered earlier (plus any found file affected by serve_found)
+    // is passed as moved, and `stands()` verifies each member's names input/out and graph_out.
+    if !rq.fresh && rq.bodies.has_members_record() {
+        let mut moved = blaze_own::Vec::new_in(frame);
+        moved.extend_from_slice(rq.bodies.outlines_entered());
+        if let Some(served) = rq.serve.served.get() {
+            moved.extend(served.places.iter().map(|(file, _)| *file));
+        }
+        rq.bodies.stand_members(&moved, crate::engine_ready_edit::CommitPlant::None, heap.alloc());
+    }
     // PHASE-MEM-DEBT(Bodies): the stage's packs, groups and notes on the process heap
     // (`handles.env.heap`, engine_bodies.rs `run_phase`), its notes kept to the command's end
     // for the print. To take `at_phase` for what lives to the phase's end. (A run's frames are
@@ -3505,7 +3549,19 @@ fn bodies_phase<'r, 'm, 'p>(
     // from the committed snapshot (engine_listing_record.rs): a one-body edit makes none.
     let listing_snapshot = crate::store::Store::snapshot(&*store)?;
     let listings = rq.heads.listings(heap, listing_snapshot.as_ref(), handles.tool);
-    let facts = rq.bodies.run_phase(cx, &mut *store, &mut *read, &handles, entered, engine.view(), &mut rq.buffers[0], &mut *rq.times, alloc, frame, request_heads.as_ref(), listings, at_phase)?;
+    let paged_source = stored_shelf.as_ref().map(|shelf| shelf as &dyn blaze_ladder::front2::buckets::ShelfSource);
+    let facts = rq.bodies.run_phase(cx, &mut *store, &mut *read, &handles, entered, engine.view(), &mut rq.buffers[0], &mut *rq.times, alloc, frame, request_heads.as_ref(), listings, paged_source, at_phase)?;
+    if let Some(stored) = lazy_stored {
+        if let Some(error) = StoredPages::refusal(stored) {
+            return Err(crate::engine_answer::page_error(error));
+        }
+        if let Some(what) = request_heads.as_ref().and_then(|table| table.fault()).or_else(|| stored_shelf.as_ref().and_then(|shelf| shelf.fault())) {
+            return Err(CliError::Text { what });
+        }
+        if let Some(shelf) = stored_shelf.as_ref() {
+            rq.heads.read_back += shelf.read();
+        }
+    }
     // The dependency heads frozen now, put sorted by key and listed by the root.
     if let Some(table) = &request_heads {
         *rq.seed_counts = table.merge(cx, &mut *store, &seed_root, &mut *rq.ledger, rq.bodies.seeds)?;

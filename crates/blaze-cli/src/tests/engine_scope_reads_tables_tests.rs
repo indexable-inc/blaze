@@ -72,4 +72,52 @@ fn a_private_fn_added_to_a_dependency_member_enters_no_other_crates_impl_tables(
     }
     let (cells, whole) = (heads_for_whole_records(&answers[0].1), heads_for_whole_records(&answers[1].1));
     assert!(cells < whole, "Heads tasks entered for a record read whole: Cells {cells}, Whole {whole}: under Whole `b`'s impl tables read `a`'s record whole, under Cells `a::Measure`'s head cell");
+    // Adding a private fn leaves `a`'s EXPORTS cell unchanged, so no downstream `b` Names task
+    // enters (only `a`'s own lib + test units enter on `a/src/lib.rs`'s surface).
+    let downstream_names: u32 = answers[0].1.because.iter()
+        .filter(|(group, _)| group.stage == blaze_engine::Stage::Names && group.cause == "read moved" && group.cell == Some(crate::engine_scope_reads::CellKind::Exports))
+        .map(|(_, count)| *count)
+        .sum();
+    assert_eq!(downstream_names, 0, "private fn must not wake downstream Names via EXPORTS");
+    assert_eq!(answers[0].1.stages[blaze_engine::Stage::Names.index()].entered, 2, "only `a`'s lib and test Names tasks enter on a private fn edit");
+}
+
+/// Adding a `pub` item or `#[macro_export]` macro moves `a`'s `EXPORTS` cell and wakes `b`'s
+/// `Names` tasks, producing the exact same answer as a fresh run.
+#[test]
+fn a_pub_item_or_macro_export_added_to_a_dependency_wakes_downstream_names() {
+    let io_inc = Io::simulated(SimWorld::new(42, Limits::USUAL));
+    let io_fresh = Io::simulated(SimWorld::new(42, Limits::USUAL));
+    two_members(&io_inc, A_LIB);
+    two_members(&io_fresh, A_LIB);
+    let run = |io: &Io, fresh: bool| {
+        let (ids, checked) = engine_opts(io, opts(io, 2, fresh));
+        (placed_ids(&ids), checked)
+    };
+    let (ids0, c0) = run(&io_inc, false);
+    assert!(ids0.is_empty() && c0.status.0 != Status::FAILED.0);
+    // 1. Add a private fn -> only `a`'s lib + test Names enter (2), `b` stands.
+    let with_priv = format!("{A_LIB}\nfn hidden() -> u8 {{ 2 }}\n");
+    write(&io_inc, "a/src/lib.rs", &with_priv);
+    write(&io_fresh, "a/src/lib.rs", &with_priv);
+    let (ids1, c1) = run(&io_inc, false);
+    let (f1, cf1) = run(&io_fresh, true);
+    assert_eq!((ids1, c1.status.0), (f1, cf1.status.0));
+    assert_eq!(c1.stages[blaze_engine::Stage::Names.index()].entered, 2, "private fn must not wake `b`'s Names");
+    // 2. Add a `pub fn` -> `EXPORTS` moves -> `a` (2) and `b` (2) enter Names (4).
+    let with_pub = format!("{with_priv}\npub fn exposed() -> u8 {{ 3 }}\n");
+    write(&io_inc, "a/src/lib.rs", &with_pub);
+    write(&io_fresh, "a/src/lib.rs", &with_pub);
+    let (ids2, c2) = run(&io_inc, false);
+    let (f2, cf2) = run(&io_fresh, true);
+    assert_eq!((ids2, c2.status.0), (f2, cf2.status.0));
+    assert_eq!(c2.stages[blaze_engine::Stage::Names.index()].entered, 4, "pub fn must wake `b`'s Names");
+    // 3. Add a `#[macro_export]` macro -> `EXPORTS` moves -> `a` (2) and `b` (2) enter Names (4).
+    let with_macro = format!("{with_pub}\n#[macro_export]\nmacro_rules! exported_mac {{ () => {{ 4u8 }}; }}\n");
+    write(&io_inc, "a/src/lib.rs", &with_macro);
+    write(&io_fresh, "a/src/lib.rs", &with_macro);
+    let (ids3, c3) = run(&io_inc, false);
+    let (f3, cf3) = run(&io_fresh, true);
+    assert_eq!((ids3, c3.status.0), (f3, cf3.status.0));
+    assert_eq!(c3.stages[blaze_engine::Stage::Names.index()].entered, 4, "#[macro_export] macro must wake `b`'s Names");
 }
