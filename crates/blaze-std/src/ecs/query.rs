@@ -4,9 +4,9 @@ use core::alloc::Allocator;
 
 use blaze_own::Vec as OwnVec;
 
-use crate::error::EcsError;
-use crate::id::{ComponentId, Entity, Id, TableId};
-use crate::table::Table;
+use super::error::EcsError;
+use super::id::{ComponentId, Entity, Id, TableId};
+use super::table::Table;
 
 /// Single filter term in a [`QuerySpec`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

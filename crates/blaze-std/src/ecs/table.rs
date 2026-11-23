@@ -10,13 +10,13 @@ use core::cmp::Ordering;
 
 use blaze_own::{Box as OwnBox, Vec as OwnVec};
 
-use crate::column::{
+use super::column::{
     AnyColumn, ComponentMeta, downcast_slice, downcast_slice_mut, downcast_typed,
     downcast_typed_mut,
 };
-use crate::error::EcsError;
-use crate::id::{ComponentId, Entity, Id, TableId, u32_to_usize};
-use crate::map::FlatMap;
+use super::error::EcsError;
+use super::id::{ComponentId, Entity, Id, TableId, u32_to_usize};
+use super::map::FlatMap;
 
 /// Canonical sorted archetype key usable for zero-allocation `&[Id]` lookups in [`FlatMap`].
 pub(crate) struct ArchetypeKey<A: Allocator + Copy>(pub(crate) OwnVec<Id, A>);

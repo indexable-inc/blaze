@@ -6,7 +6,7 @@ use core::borrow::Borrow;
 
 use blaze_own::Vec as OwnVec;
 
-use crate::error::EcsError;
+use super::error::EcsError;
 
 /// Deterministic sorted key-value map over a contiguous `blaze_own::Vec<(K, V), A>`.
 pub(crate) struct FlatMap<K, V, A: Allocator + Copy> {

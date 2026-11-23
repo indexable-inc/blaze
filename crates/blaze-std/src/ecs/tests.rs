@@ -3,8 +3,8 @@ use core::cell::Cell;
 use blaze_own::{Alloc, Box as OwnBox, Vec as OwnVec, format_in, testing::heap};
 use blaze_sim::{Broke, Config};
 
-use crate::map::FlatMap;
-use crate::{
+use super::map::FlatMap;
+use super::{
     CachedQuery, EcsError, Entity, Event, EventKind, Id, Phase, Pipeline, QuerySpec, SystemDesc,
     World,
 };
@@ -94,7 +94,7 @@ fn archetype_transitions_edges_swap_remove_and_stale_entities() {
     assert_eq!(t2, t3);
 
     // Verify table-graph edges are populated.
-    let empty_tbl = w.table(crate::TableId(0)).expect("empty");
+    let empty_tbl = w.table(super::TableId(0)).expect("empty");
     assert!(empty_tbl.add_edge_count() >= 1);
 
     // Safe disjoint SoA column borrowing (`columns_1_mut_1_ref` and `columns_2_mut`).
@@ -424,7 +424,7 @@ fn observer_callback_invoked_synchronously() {
 
     let hit = OwnRc::new_in(Cell::new(0u32), a);
     let hit_cb = hit.share();
-    let cb: crate::ObserverCallback<Alloc<'static>> = OwnBox::new_in(
+    let cb: super::ObserverCallback<Alloc<'static>> = OwnBox::new_in(
         move |_ev: Event| {
             hit_cb.set(hit_cb.get().saturating_add(1));
         },
@@ -450,8 +450,8 @@ fn sys_load(world: &mut World<Alloc<'static>>) -> Result<(), EcsError> {
 }
 
 fn sys_integrate_pos(world: &mut World<Alloc<'static>>) -> Result<(), EcsError> {
-    let pos_id = world.component_id::<Pos>().ok_or(EcsError::UnknownComponent(crate::ComponentId(0)))?;
-    let vel_id = world.component_id::<Vel>().ok_or(EcsError::UnknownComponent(crate::ComponentId(1)))?;
+    let pos_id = world.component_id::<Pos>().ok_or(EcsError::UnknownComponent(super::ComponentId(0)))?;
+    let vel_id = world.component_id::<Vel>().ok_or(EcsError::UnknownComponent(super::ComponentId(1)))?;
     let spec = QuerySpec::new_in(world.alloc())
         .with_component(pos_id)?
         .with_component(vel_id)?;
@@ -474,7 +474,7 @@ fn sys_integrate_pos(world: &mut World<Alloc<'static>>) -> Result<(), EcsError> 
 }
 
 fn sys_regen_health(world: &mut World<Alloc<'static>>) -> Result<(), EcsError> {
-    let hp_id = world.component_id::<Health>().ok_or(EcsError::UnknownComponent(crate::ComponentId(2)))?;
+    let hp_id = world.component_id::<Health>().ok_or(EcsError::UnknownComponent(super::ComponentId(2)))?;
     let spec = QuerySpec::new_in(world.alloc()).with_component(hp_id)?;
     let mut cached = CachedQuery::new(spec, world.alloc());
     let tids = world.query_tables(&mut cached)?;

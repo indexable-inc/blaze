@@ -8,10 +8,10 @@ use core::any::{Any, TypeId};
 
 use blaze_own::{Box as OwnBox, String as OwnString, Vec as OwnVec};
 
-use crate::error::EcsError;
-use crate::id::{ComponentId, TableId};
+use super::error::EcsError;
+use super::id::{ComponentId, TableId};
 
-/// Type-erased contiguous SoA column stored inside an archetype [`crate::table::Table`].
+/// Type-erased contiguous SoA column stored inside an archetype [`super::table::Table`].
 pub trait AnyColumn<A: Allocator + Copy> {
     /// Number of stored component values (matches the owning table's entity count).
     fn len(&self) -> usize;

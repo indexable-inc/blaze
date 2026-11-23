@@ -7,13 +7,13 @@ use core::fmt::Write as _;
 
 use blaze_own::{String as OwnString, Vec as OwnVec};
 
-use crate::column::{ComponentMeta, make_column_copy, make_column_plain};
-use crate::error::EcsError;
-use crate::id::{Builtins, ComponentId, Entity, Id, TableId, u32_to_usize, usize_to_u32};
-use crate::map::{FlatMap, FlatSet};
-use crate::observer::{DEFAULT_OBSERVER_CAP, Event, EventKind, Observer, ObserverCallback, ObserverId};
-use crate::query::{CachedQuery, QuerySpec};
-use crate::table::{ArchetypeKey, Table, move_row_between_tables};
+use super::column::{ComponentMeta, make_column_copy, make_column_plain};
+use super::error::EcsError;
+use super::id::{Builtins, ComponentId, Entity, Id, TableId, u32_to_usize, usize_to_u32};
+use super::map::{FlatMap, FlatSet};
+use super::observer::{DEFAULT_OBSERVER_CAP, Event, EventKind, Observer, ObserverCallback, ObserverId};
+use super::query::{CachedQuery, QuerySpec};
+use super::table::{ArchetypeKey, Table, move_row_between_tables};
 
 struct EntitySlot<A: Allocator + Copy> {
     generation: u32,
@@ -250,7 +250,7 @@ impl<A: Allocator + Copy + 'static> World<A> {
         &mut self,
         name: &str,
         schema_id: Option<u64>,
-        make_column: fn(A) -> blaze_own::Box<dyn crate::column::AnyColumn<A>, A>,
+        make_column: fn(A) -> blaze_own::Box<dyn super::column::AnyColumn<A>, A>,
         can_copy: bool,
     ) -> Result<ComponentId, EcsError> {
         let tid = TypeId::of::<T>();

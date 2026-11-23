@@ -1,4 +1,4 @@
-//! `blaze-ecs`: zero-dependency, `#![no_std]`, `#![forbid(unsafe_code)]`, `#![blaze::sans_io]`
+//! `bstd::ecs`: zero-dependency, `#![no_std]`, `#![forbid(unsafe_code)]`, `#![blaze::sans_io]`
 //! Flecs 4.2-equivalent archetype Entity-Component-System library.
 //!
 //! - [`id`]: 64-bit generational [`Entity`] handles, typed [`ComponentId`] / [`TableId`],
@@ -18,11 +18,6 @@
 //! - [`world`]: Core [`World`] API with prefab inheritance (`IsA`), hierarchy cascade (`ChildOf`),
 //!   arbitrary relations, and deterministic [`World::snapshot_tab`] summaries.
 
-#![no_std]
-#![forbid(unsafe_code)]
-#![feature(register_tool, custom_inner_attributes)]
-#![register_tool(blaze)]
-#![blaze::sans_io]
 
 pub mod column;
 pub mod error;

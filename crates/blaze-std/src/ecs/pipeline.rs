@@ -4,9 +4,9 @@ use core::alloc::Allocator;
 
 use blaze_own::Vec as OwnVec;
 
-use crate::error::EcsError;
-use crate::id::Id;
-use crate::world::World;
+use super::error::EcsError;
+use super::id::Id;
+use super::world::World;
 
 /// Canonical Flecs 4.2 execution phases in deterministic tick order.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]

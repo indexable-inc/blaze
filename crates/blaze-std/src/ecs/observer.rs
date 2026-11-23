@@ -9,8 +9,8 @@ use core::fmt;
 
 use blaze_own::{Box as OwnBox, Vec as OwnVec};
 
-use crate::error::EcsError;
-use crate::id::{Entity, Id};
+use super::error::EcsError;
+use super::id::{Entity, Id};
 
 /// Default per-observer bounded event buffer capacity (`bounded-progress`).
 pub const DEFAULT_OBSERVER_CAP: usize = 4096;

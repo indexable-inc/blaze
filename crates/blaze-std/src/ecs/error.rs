@@ -4,7 +4,7 @@ use core::fmt;
 
 use blaze_own::AllocFailure;
 
-use crate::id::{ComponentId, Entity, Id, TableId};
+use super::id::{ComponentId, Entity, Id, TableId};
 
 /// Typed error returned by `blaze-ecs` operations.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
