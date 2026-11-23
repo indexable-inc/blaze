@@ -67,9 +67,10 @@ pub(crate) fn run(
         }
         #[cfg(any(test, feature = "publish"))]
         Builder::Trusted => {
-            // The home, read here at the edge (rule 75).
+            // The home and store budget, read here at the edge (rule 75).
             let home = env.and_then(|env| env.get(&bstd::env::VarName::new("HOME").ok()?).ok().flatten());
-            let opened = super::open_for_command(cx, fs, host, rng, home, &fs.root(), "", clock, err, heap)?;
+            let max_store_bytes = crate::gc::budget_from_env(env)?;
+            let opened = super::open_for_command(cx, fs, host, rng, home, max_store_bytes, &fs.root(), "", clock, err, heap)?;
             trusted::publish(cx, fs, out, &words, &opened.lent, blaze_toolchain::PINNED)
         }
     }

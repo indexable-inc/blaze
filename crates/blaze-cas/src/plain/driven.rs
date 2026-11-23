@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use blaze_core::{Completion, Driver, Done, Effect, FileName, Native, Tag as EffectTag, wait::Deadline};
+use blaze_core::{Completion, Driver, Done, Effect, FileName, LockMode, Native, Tag as EffectTag, wait::Deadline};
 use blaze_ids::ContentId;
 use blaze_own::Share;
 use blaze_keyed::{
@@ -21,7 +21,7 @@ use blaze_keyed::{
 };
 
 use super::{
-    core::{Batch, Committed, Found, Got, LentRecord, Liveness, Plain, PlainConfig, Probe, Probes, PutError, Renewed, Report, Scrubbed, Sliced, TAGS},
+    core::{Batch, Committed, Found, GcPlan, Got, LentRecord, Liveness, Plain, PlainConfig, Probe, Probes, PutError, Renewed, Report, Scrubbed, Sliced, TAGS},
     format::{self, Segment},
     settings::Settings,
 };
@@ -641,11 +641,38 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
             self.run("compacting")?;
             let sliced = self.core.take_sliced().ok_or(StoreError::Unfinished { what: "a compaction slice" })?;
             out.push(sliced);
-            if !sliced.more || sliced.aborted || sliced.segments == 0 {
+            if !sliced.more || sliced.aborted || (sliced.segments == 0 && sliced.evicted_roots == 0 && sliced.removed == 0) {
                 break;
             }
         }
         Ok(out)
+    }
+
+    /// Read-only inspection of what a GC pass would reclaim now ([`Plain::plan_gc`]).
+    pub fn plan_gc(&mut self) -> Result<GcPlan, StoreError> {
+        self.map_all()?;
+        let now = self.driver.wall_ns();
+        self.core.plan_gc(now)
+    }
+
+    /// Whether total committed segment bytes exceed the high watermark of a finite budget.
+    pub fn over_budget(&self) -> bool {
+        self.core.over_budget()
+    }
+
+    /// Total committed segment bytes.
+    pub fn total_bytes(&self) -> u64 {
+        self.core.bytes()
+    }
+
+    /// Configured store byte budget (`u64::MAX` = unlimited).
+    pub fn cap_bytes(&self) -> u64 {
+        self.core.cap_bytes()
+    }
+
+    /// Overrides the store byte budget for this open handle (e.g. `blaze gc --max-gb`).
+    pub fn set_cap(&mut self, cap_bytes: u64) {
+        self.core.set_cap(cap_bytes);
     }
 
     /// After the answer: one cleanup slice written with no lock, for the next commit's flip to
@@ -833,12 +860,88 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     }
 }
 
-/// Lowers the calling thread for background work: utility QoS on macOS
-/// (`pthread_set_qos_class_self_np`); nice 19 and the idle IO class on Linux, both per thread
-/// there. One way: an unprivileged thread cannot raise itself again.
+/// Non-blocking exclusive advisory file lock (`Effect::Lock` / `Effect::Unlock`) over any
+/// [`Driver`] (native or simulated), automatically released on drop. Used by `blaze gc` so
+/// at most one background GC process runs against a store root at a time without blocking.
+pub struct ExclusiveLock<D: Driver> {
+    driver: D,
+    lock_tag: EffectTag,
+    unlock_tag: EffectTag,
+    held: bool,
+}
+
+impl<D: Driver> ExclusiveLock<D> {
+    /// Attempts to acquire an exclusive lock on `file` without waiting. Returns `Ok(Some(lock))`
+    /// when acquired, `Ok(None)` when another process already holds it (`Done::Contended`), or
+    /// `Err(StoreError)` on I/O failure or stall.
+    pub fn try_acquire(mut driver: D, file: FileName) -> Result<Option<ExclusiveLock<D>>, StoreError> {
+        let lock_tag = EffectTag(1u64 << 58);
+        let unlock_tag = EffectTag((1u64 << 58) + 1);
+        let mut effects = core::iter::once(Effect::Lock { file, mode: LockMode::Exclusive, tag: lock_tag }).collect();
+        let mut done = core::default::Default::default();
+        let mut acquired = None;
+        driver.submit(&mut effects);
+        let start = driver.now();
+        let deadline = Deadline::after(start, Duration::from_secs(5));
+        while driver.in_flight() > 0 {
+            driver.poll(&mut done, deadline);
+            for completion in done.drain(..) {
+                if completion.tag != lock_tag {
+                    continue;
+                }
+                match completion.done {
+                    Done::Locked => acquired = Some(true),
+                    Done::Contended => acquired = Some(false),
+                    Done::Failed(error) => {
+                        return Err(StoreError::Io { doing: "acquiring exclusive gc lock", file: StoreFile::FlipLock, error: error.0 });
+                    }
+                    Done::Broken { error, .. } => {
+                        return Err(StoreError::Io { doing: "acquiring exclusive gc lock", file: StoreFile::FlipLock, error: error.0 });
+                    }
+                    _ => return Err(StoreError::Other { what: "unexpected completion while acquiring exclusive gc lock" }),
+                }
+            }
+            if acquired.is_some() || deadline.passed(driver.now()) {
+                break;
+            }
+        }
+        match acquired {
+            Some(true) => Ok(Some(ExclusiveLock { driver, lock_tag, unlock_tag, held: true })),
+            Some(false) => Ok(None),
+            None => Err(StoreError::Stalled { waited_for: "acquiring exclusive gc lock" }),
+        }
+    }
+}
+
+impl<D: Driver> Drop for ExclusiveLock<D> {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        self.held = false;
+        let mut effects = core::iter::once(Effect::Unlock { lock: self.lock_tag, tag: self.unlock_tag }).collect();
+        let mut done = core::default::Default::default();
+        self.driver.submit(&mut effects);
+        let deadline = Deadline::after(self.driver.now(), Duration::from_secs(1));
+        while self.driver.in_flight() > 0 && !deadline.passed(self.driver.now()) {
+            self.driver.poll(&mut done, deadline);
+            done.clear();
+        }
+    }
+}
+
+/// Lowers the calling thread for background work: at most utility QoS on macOS
+/// (`pthread_set_qos_class_self_np`, preserving `QOS_CLASS_BACKGROUND` if already lower);
+/// nice 19 and the idle IO class on Linux, both per thread there. One way: an unprivileged
+/// thread cannot raise itself again.
 pub fn lower_this_thread() -> Result<(), StoreError> {
     #[cfg(target_vendor = "apple")]
     {
+        if let Ok((current, _)) = blaze_core::threads::qos::this_thread()
+            && !current.above(blaze_core::threads::qos::Qos::Utility)
+        {
+            return Ok(());
+        }
         // SAFETY: one call about the calling thread, no memory passed.
         let rc = unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
         if rc != 0 {

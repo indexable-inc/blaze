@@ -181,7 +181,8 @@ pub(crate) fn run(
     let tools = crate::engine_store::tools(&crate::home::tools(&producers, crate::lints::Lints::NONE.rules));
     let var = |name: &str| -> Option<&str> { env?.get(&VarName::new(name).ok()?).ok().flatten() };
     let setup = phases.now();
-    let opened = crate::store::open_for_command(cx, fs, host, rng, var("HOME"), &root, located.at, phases.clock(), err, heap)?;
+    let max_store_bytes = crate::gc::budget_from_env(env)?;
+    let opened = crate::store::open_for_command(cx, fs, host, rng, var("HOME"), max_store_bytes, &root, located.at, phases.clock(), err, heap)?;
     let erased = blaze_own::Erased::new(frame);
     let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
     let request_mem = crate::engine_phase_mem::RequestMem::new()?;
