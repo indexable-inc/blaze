@@ -24,9 +24,10 @@
 //!   `#[no_mangle]` and `#[export_name]` items) and `Laid::placed`. No launcher writes anything.
 //! - The initializers (`Inits`) are `__mod_init_func`: dyld runs them before `main`, after the
 //!   libraries' own (the order of a normal executable, NATIVE.md 3.4).
-//! - Thread-locals keep Mach-O's own form: `__thread_vars` (descriptors whose thunk binds
-//!   `__tlv_bootstrap`), `__thread_data`, `__thread_bss`, and `MH_HAS_TLV_DESCRIPTORS`; the
-//!   program's own code has none (export refuses Rust thread-locals by name).
+//! - Thread-locals keep Mach-O's own form for the native C image: `__thread_vars` (descriptors
+//!   whose thunk binds `__tlv_bootstrap`), `__thread_data`, `__thread_bss`, and
+//!   `MH_HAS_TLV_DESCRIPTORS`; Rust `Space::Tls` uses its own indexed descriptor initialized in
+//!   `__DATA_CONST,__mod_init_func` before `__NATIVE_DATA,__mod_init_func`, so both coexist.
 //! - Imports bind by flat lookup (`BIND_SPECIAL_DYLIB_FLAT_LOOKUP`, NATIVE.md 3.5) among the
 //!   file's libraries: libSystem first (the program's own ordinal 1), then one `LC_LOAD_DYLIB` per
 //!   distinct install name of `Image::libraries`, in the image's order.
@@ -495,6 +496,9 @@ mod tests {
             entry: START,
             placed: homes,
             tables_room: 0x8000 - START,
+            mod_init_at: None,
+            has_tls: false,
+            tls_count: 0,
         }
     }
 

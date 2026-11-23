@@ -367,15 +367,15 @@ mod tests {
     }
 
     /// The executable's room is its writer's list at its largest (macho.rs `command_room`):
-    /// with no native image, five segments at their most sections (1000 bytes) and the ten
-    /// commands after them (312), the code at 0x540 as under the hand table this replaced; a
-    /// native image adds its two segments at their most sections and one `dylib_command` per
-    /// library, by that library's name.
+    /// with no native image, five segments at their most sections (1080 bytes: `__DATA_CONST`
+    /// keeps room for `__got`, `__mod_init_func`, and `__const`) and the ten commands after them
+    /// (312), the code at 0x590; a native image adds its two segments at their most sections and
+    /// one `dylib_command` per library, by that library's name.
     #[test]
     fn the_executables_room_is_its_commands_at_their_largest() {
         let none = macho::command_room(None);
-        assert_eq!(none, HEADER + 1000 + 312);
-        assert_eq!(macho::plan().text_at, 0x540);
+        assert_eq!(none, HEADER + 1080 + 312);
+        assert_eq!(macho::plan().text_at, 0x590);
         let mut install: blaze_own::AString<'static> = blaze_own::String::new_in(Alloc::global());
         install.push_str(&"/".repeat(300));
         let libraries = [install];

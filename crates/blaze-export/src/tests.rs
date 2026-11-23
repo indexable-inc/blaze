@@ -11,8 +11,8 @@ use blaze_own::{AVec, Alloc, Vec};
 use crate::check::{self, CheckError};
 use crate::error::ExportError;
 use crate::export::export;
-use crate::input::{Data, DataPlace, DataWord, Entry, Function, Panic, Platform, Profile, ProgramIn, Tier};
-use crate::layout::{FixTo, Member, lay_out};
+use crate::input::{Data, DataPlace, DataWord, Entry, Function, Panic, Platform, Profile, ProgramIn, Tier, TlsRuntime};
+use crate::layout::{FixTo, Member, TlsPlan, lay_out, lay_out_with_tls};
 use crate::plant::{self, Plant};
 use crate::{elf, macho};
 
@@ -69,7 +69,7 @@ fn tiny() -> (AVec<'static, u8>, AVec<'static, u8>) {
 }
 
 fn program<'r>(functions: &'r [Function<'r>], data: &'r [Data<'r>], profile: Option<Profile<'r>>) -> ProgramIn<'r> {
-    ProgramIn { name: "tiny", functions, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, profile, natives: None, exports: &[] }
+    ProgramIn { name: "tiny", functions, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, tls: None, profile, natives: None, exports: &[] }
 }
 
 fn functions<'r>(main: &'r [u8], second: &'r [u8]) -> [Function<'r>; 2] {
@@ -298,4 +298,224 @@ fn wasm64_export_is_deterministic_and_valid_memory64() {
         bad[p] = 0x01; // clear memory64 bit 0x04
         assert!(matches!(check_wasm64(&bad), Err(Wasm64Error::NotMemory64 { .. })));
     }
+}
+
+/// Rust `Space::Tls` layout and format checks on both Mach-O arm64 and ELF arm64:
+/// initialized TLS (`ReadOnly`), zero-initialized TLS (`Zeroed`), TLS with a relocated pointer
+/// (`DataWord` to a regular static), and a relro `Word` naming a `Space::Tls` index plus addend.
+#[test]
+fn rust_tls_macho_and_elf_layout_and_determinism() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let desc_sym = sym("TLS_DESC");
+    let ender_sym = sym("tls_ender");
+    let desc_target = Target { space: Space::Static, symbol: desc_sym };
+    let st_target = Target { space: Space::Static, symbol: sym("SHARED_VAL") };
+    let tls_init = Target { space: Space::Tls, symbol: sym("TLS_INIT") };
+    let tls_zero = Target { space: Space::Tls, symbol: sym("TLS_ZERO") };
+    let tls_ptr = Target { space: Space::Tls, symbol: sym("TLS_PTR") };
+
+    // Build `main`: loads DESC, TLS_INIT, TLS_ZERO, TLS_PTR; also has a relro word naming
+    // TLS_ZERO with addend +5 (must fold to integer index + 5, not a rebase).
+    let main_bytes = {
+        let mut r = CodeRecord::new_in(alloc);
+        let code = [
+            ADRP_X0, LDR_X0, // 0: DESC
+            ADRP_X0, LDR_X0, // 8: TLS_INIT
+            ADRP_X0, LDR_X0, // 16: TLS_ZERO
+            ADRP_X0, LDR_X0, // 24: TLS_PTR
+            MOV_W0_42, RET,  // 32, 36
+        ];
+        for inst in code {
+            r.code.extend_from_slice(&inst.to_le_bytes());
+        }
+        r.relro.resize(8, 0);
+        let i_desc = r.target(desc_target);
+        let i_init = r.target(tls_init);
+        let i_zero = r.target(tls_zero);
+        let i_ptr = r.target(tls_ptr);
+        r.sites.push(Site { at: 0, kind: SiteKind::Load, target: i_desc, addend: 0 });
+        r.sites.push(Site { at: 8, kind: SiteKind::Load, target: i_init, addend: 0 });
+        r.sites.push(Site { at: 16, kind: SiteKind::Load, target: i_zero, addend: 0 });
+        r.sites.push(Site { at: 24, kind: SiteKind::Load, target: i_ptr, addend: 0 });
+        r.words.push(blaze_code::record::Word { at: 0, target: i_zero, addend: 5 });
+        let mut out = Vec::new_in(alloc);
+        r.seal().unwrap().encode(&mut out);
+        out
+    };
+    let ender_bytes = rec(&[RET], &[], &[]);
+    let shared_bytes = 99u64.to_le_bytes();
+    let init_bytes = 40u64.to_le_bytes();
+    let ptr_bytes = [0u8; 8];
+    let ptr_words = [DataWord { at: 0, target: Some(st_target), addend: 0 }];
+    let data = [
+        Data { target: st_target, bytes: &shared_bytes, align: 8, words: &[], place: DataPlace::ReadOnly },
+        Data { target: tls_init, bytes: &init_bytes, align: 8, words: &[], place: DataPlace::ReadOnly },
+        Data { target: tls_zero, bytes: &[], align: 16, words: &[], place: DataPlace::Zeroed { len: 16 } },
+        Data { target: tls_ptr, bytes: &ptr_bytes, align: 8, words: &ptr_words, place: DataPlace::ReadOnly },
+    ];
+    let data_rev = [data[3], data[2], data[1], data[0]];
+    let fs = [
+        Function { symbol: sym("main"), record: CodeView::read(&main_bytes).unwrap(), tier: Tier::Fast },
+        Function { symbol: ender_sym, record: CodeView::read(&ender_bytes).unwrap(), tier: Tier::Fast },
+    ];
+    let fs_rev = [fs[1], fs[0]];
+    let tls_rt = Some(TlsRuntime { descriptor: desc_sym, ender: ender_sym });
+
+    // Check layout internals on macOS plan directly.
+    let members = [
+        Member { symbol: sym("main"), record: CodeView::read(&main_bytes).unwrap(), tier: Some(Tier::Fast) },
+        Member { symbol: ender_sym, record: CodeView::read(&ender_bytes).unwrap(), tier: Some(Tier::Fast) },
+    ];
+    let laid = lay_out_with_tls(
+        &members,
+        &data,
+        sym("main"),
+        None,
+        macho::plan(),
+        0,
+        Some(TlsPlan { descriptor: desc_sym, mod_init_fn: None, initial_root: 0 }),
+        alloc,
+    )
+    .unwrap();
+    assert!(laid.has_tls);
+    assert_eq!(laid.tls_count, 3);
+    let m = laid.entry;
+    let at = |pc: u64| read32(&laid.text, pc - laid.text_at);
+    // DESC is relaxed to adrp+add into writable data; check header fields (key=0, root=0, count=3, cap=3).
+    let desc_at = adrp_add_target(at(m), at(m + 4), m).unwrap();
+    let desc_off = usize::try_from(desc_at - laid.data_at).unwrap();
+    let read_u64 = |buf: &[u8], off: usize| u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+    assert_eq!(read_u64(&laid.data, desc_off), 0);
+    assert_eq!(read_u64(&laid.data, desc_off + 8), 0);
+    assert_eq!(read_u64(&laid.data, desc_off + 16), 3);
+    assert_eq!(read_u64(&laid.data, desc_off + 24), 3);
+    // All three Space::Tls sites keep `adrp; ldr` pointing to distinct index words holding 0, 1, 2.
+    let mut loaded = [0u64; 3];
+    for (idx, site_off) in [8u64, 16, 24].into_iter().enumerate() {
+        let word_at = adrp_ldr_target(at(m + site_off), at(m + site_off + 4), m + site_off).unwrap();
+        let off = usize::try_from(word_at - laid.const_at).unwrap();
+        loaded[idx] = read_u64(&laid.konst, off);
+    }
+    let zero_idx = loaded[1];
+    loaded.sort_unstable();
+    assert_eq!(loaded, [0, 1, 2]);
+    // Relro word for TLS_ZERO + 5 holds integer `zero_idx + 5`, NOT a fixup.
+    let relro_at = laid.const_at + u64::try_from(laid.konst.len()).unwrap();
+    let found_relro = laid.konst.windows(8).any(|w| u64::from_le_bytes(w.try_into().unwrap()) == zero_idx + 5);
+    assert!(found_relro && relro_at > laid.const_at);
+
+    // Full export on macOS arm64: deterministic across reversed input order, valid Mach-O with `__mod_init_func`.
+    let prog_a = ProgramIn {
+        name: "tls-test",
+        functions: &fs,
+        data: &data,
+        entry: Entry::CMain { main: sym("main") },
+        panic: Panic::Unwind,
+        personality: None,
+        tls: tls_rt,
+        profile: None,
+        natives: None,
+        exports: &[],
+    };
+    let prog_b = ProgramIn { functions: &fs_rev, data: &data_rev, ..prog_a };
+    let mut mac_a = Vec::new_in(alloc);
+    let mut mac_b = Vec::new_in(alloc);
+    export(&prog_a, Platform::MacosArm64, &mut mac_a, alloc).unwrap();
+    export(&prog_b, Platform::MacosArm64, &mut mac_b, alloc).unwrap();
+    assert_eq!(&mac_a[..], &mac_b[..], "Mach-O TLS export must be deterministic");
+    let mac_facts = check::macho(&mac_a).unwrap();
+    assert!(matches!(mac_facts.mod_init, Some((_, 8))), "Mach-O TLS export must emit 8-byte __mod_init_func");
+    assert_eq!(mac_facts.binds, 1, "Mach-O TLS export binds pthread_key_create");
+    // Rebases: __mod_init_func (1) + DESC.vars (1) + 3 VarRow.init (3) + TLS_PTR DataWord (1) = 6.
+    assert_eq!(mac_facts.rebases, 6);
+
+    // Full export on Linux arm64: deterministic across reversed input order, valid ELF with PT_TLS.
+    let mut elf_a = Vec::new_in(alloc);
+    let mut elf_b = Vec::new_in(alloc);
+    export(&prog_a, Platform::LinuxArm64, &mut elf_a, alloc).unwrap();
+    export(&prog_b, Platform::LinuxArm64, &mut elf_b, alloc).unwrap();
+    assert_eq!(&elf_a[..], &elf_b[..], "ELF TLS export must be deterministic");
+    let elf_facts = check::elf(&elf_a).unwrap();
+    assert_eq!(elf_facts.tls, Some((0, 8, 16)), "ELF TLS export must emit PT_TLS (filesz=0, memsz=8, align=16)");
+    assert_eq!(elf_facts.binds, 2, "ELF TLS export binds __libc_start_main and pthread_key_create");
+    // Rebases: DESC.vars (1) + 3 VarRow.init (3) + TLS_PTR DataWord (1) = 5.
+    assert_eq!(elf_facts.relative, 5);
+}
+
+/// Every Rust `Space::Tls` refusal names the offending item and rule.
+#[test]
+fn rust_tls_refusals_are_named() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let desc_sym = sym("TLS_DESC");
+    let ender_sym = sym("tls_ender");
+    let tls_a = Target { space: Space::Tls, symbol: sym("TLS_A") };
+    let val = 7u64.to_le_bytes();
+    let main_tls = rec(&[ADRP_X0, LDR_X0, MOV_W0_42, RET], &[(0, SiteKind::Load, tls_a)], &[]);
+    let main_plain = rec(&[MOV_W0_42, RET], &[], &[]);
+    let ender = rec(&[RET], &[], &[]);
+    let tls_datum = [Data { target: tls_a, bytes: &val, align: 8, words: &[], place: DataPlace::ReadOnly }];
+    let mut out = Vec::new_in(alloc);
+
+    // 1. Space::Tls datum without TlsRuntime -> NoTlsRuntime.
+    let fs_plain = [Function { symbol: sym("main"), record: CodeView::read(&main_plain).unwrap(), tier: Tier::Fast }];
+    let p = ProgramIn {
+        name: "t",
+        functions: &fs_plain,
+        data: &tls_datum,
+        entry: Entry::CMain { main: sym("main") },
+        panic: Panic::Unwind,
+        personality: None,
+        tls: None,
+        profile: None,
+        natives: None,
+        exports: &[],
+    };
+    assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::NoTlsRuntime { target: tls_a }));
+
+    // 2. Space::Tls target in code without TlsRuntime -> NoTlsRuntime.
+    let fs_tls = [Function { symbol: sym("main"), record: CodeView::read(&main_tls).unwrap(), tier: Tier::Fast }];
+    let p = ProgramIn { functions: &fs_tls, data: &[], tls: None, ..p };
+    assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::NoTlsRuntime { target: tls_a }));
+
+    // 3. TlsRuntime whose ender is not placed -> TlsEnderNotPlaced.
+    let rt = Some(TlsRuntime { descriptor: desc_sym, ender: ender_sym });
+    let p = ProgramIn { functions: &fs_tls, data: &tls_datum, tls: rt, ..p };
+    assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::TlsEnderNotPlaced { ender: ender_sym }));
+
+    // 4. Space::Tls target in code with no datum -> OutOfReach.
+    let fs_both = [
+        Function { symbol: sym("main"), record: CodeView::read(&main_tls).unwrap(), tier: Tier::Fast },
+        Function { symbol: ender_sym, record: CodeView::read(&ender).unwrap(), tier: Tier::Fast },
+    ];
+    let p = ProgramIn { functions: &fs_both, data: &[], tls: rt, ..p };
+    assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::OutOfReach { from: sym("main"), target: tls_a }));
+
+    // 5. DataWord pointing at Space::Tls -> DataTlsTarget.
+    let bad_words = [DataWord { at: 0, target: Some(tls_a), addend: 0 }];
+    let bad_st = Target { space: Space::Static, symbol: sym("BAD_ST") };
+    let data_bad_word = [
+        Data { target: tls_a, bytes: &val, align: 8, words: &[], place: DataPlace::ReadOnly },
+        Data { target: bad_st, bytes: &val, align: 8, words: &bad_words, place: DataPlace::ReadOnly },
+    ];
+    let p = ProgramIn { functions: &fs_both, data: &data_bad_word, tls: rt, ..p };
+    assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::DataTlsTarget { from: bad_st, target: tls_a }));
+
+    // 6. SiteKind::Call on Space::Tls -> CallOfData.
+    let main_call = rec(&[ADRP_X16, LDR_X16, BLR_X16, RET], &[(0, SiteKind::Call, tls_a)], &[]);
+    let fs_call = [
+        Function { symbol: sym("main"), record: CodeView::read(&main_call).unwrap(), tier: Tier::Fast },
+        Function { symbol: ender_sym, record: CodeView::read(&ender).unwrap(), tier: Tier::Fast },
+    ];
+    let p = ProgramIn { functions: &fs_call, data: &tls_datum, tls: rt, ..p };
+    assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::CallOfData { from: sym("main"), at: 0 }));
+
+    // 7. User static colliding with TlsRuntime::descriptor -> TwoData.
+    let desc_target = Target { space: Space::Static, symbol: desc_sym };
+    let collide_data = [Data { target: desc_target, bytes: &val, align: 8, words: &[], place: DataPlace::ReadOnly }];
+    let fs_plain_ender = [
+        Function { symbol: sym("main"), record: CodeView::read(&main_plain).unwrap(), tier: Tier::Fast },
+        Function { symbol: ender_sym, record: CodeView::read(&ender).unwrap(), tier: Tier::Fast },
+    ];
+    let p = ProgramIn { functions: &fs_plain_ender, data: &collide_data, tls: rt, ..p };
+    assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::TwoData { target: desc_target }));
 }
