@@ -6,7 +6,8 @@
 //!   sequence tables, repeat-offset history (`[1, 4, 8]`), `Frame_Content_Size`, and 32-bit
 //!   `XXH64` content checksum verification via [`crate::digest::xxh64`].
 //! - Valid RFC 8878 compressor: single-segment or windowed frames, RLE blocks for constant runs,
-//!   fast LZ77 match finding with repeat-offset preference, Predefined-mode FSE sequence encoding,
+//!   SWAR LZ77 match finding with repeat-offset preference, 1-stream and 4-stream Huffman literals
+//!   (direct 4-bit and FSE-compressed weights), O(1) Predefined/Repeat-mode FSE sequence encoding,
 //!   Raw fallback per block when incompressible, and optional `XXH64` content checksum.
 //! - Caller-supplied [`ZstdLimits`] bound output size, window size, and frame count against
 //!   decompression bombs.
@@ -34,9 +35,9 @@ pub(crate) const MAX_BLOCK_SIZE: usize = 128 * 1024;
 /// Compression effort level for [`compress_in`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
-    /// Faster match search with a smaller hash table.
+    /// Faster single-probe match search with a 16K-entry hash table.
     Fast,
-    /// Balanced match search with a 16 KiB hash table and lazy probing.
+    /// Balanced match search with a 32K-entry hash table and one-step lazy probing.
     Default,
 }
 

@@ -152,6 +152,16 @@ fn compression_ratio_and_multiblock_round_trip() {
     );
     let big_dec = decompress_in(big_comp.as_slice(), ZstdLimits::SHIPPED, alloc).expect("big dec");
     assert_eq!(big_dec.as_slice(), big.as_slice());
+
+    // UTF-8 prose with bytes > 128 exercises FSE-compressed Huffman weight descriptions.
+    let utf8_line = "§4.2.1 — Huffman weights with UTF-8 symbols: αβγδ, ≤ ≥ ≠, café résumé naïve!\n".as_bytes();
+    let utf8_payload = repeat_bytes(utf8_line, b"varied_token_0123456789 ", 64, alloc);
+    for opts in [CompressOpts::DEFAULT, CompressOpts::FAST] {
+        let comp = compress_in(utf8_payload.as_slice(), opts, alloc).expect("utf8 comp");
+        assert!(comp.len() < utf8_payload.len() / 2);
+        let dec = decompress_in(comp.as_slice(), ZstdLimits::SHIPPED, alloc).expect("utf8 dec");
+        assert_eq!(dec.as_slice(), utf8_payload.as_slice());
+    }
 }
 
 #[test]

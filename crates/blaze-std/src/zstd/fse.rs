@@ -51,6 +51,13 @@ const LL_BITS: [u8; 36] = [
     12, 13, 14, 15, 16,
 ];
 
+/// Direct LUT mapping `lit_len` (`0..64`) to its Literals_Length code.
+const LL_CODE_LUT: [u8; 64] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20,
+    20, 20, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23, 24, 24,
+    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+];
+
 /// RFC 8878 §3.1.1.3.2.1.1 Match_Length baselines for codes 0..=52.
 const ML_BASE: [u32; 53] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
@@ -64,63 +71,67 @@ const ML_BITS: [u8; 53] = [
     1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
 ];
 
-#[inline]
-pub(crate) fn ll_base_and_bits(code: u8) -> Option<(usize, u8)> {
-    let idx = usize::from(code);
-    let base = *LL_BASE.get(idx)?;
-    let bits = *LL_BITS.get(idx)?;
-    let base_usize = usize::try_from(base).ok()?;
-    Some((base_usize, bits))
-}
+/// Direct LUT mapping `match_len - 3` (`0..128`) to its Match_Length code.
+const ML_CODE_LUT: [u8; 128] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31, 32, 32, 33, 33, 34, 34, 35, 35, 36, 36, 36, 36, 37, 37, 37, 37, 38, 38,
+    38, 38, 38, 38, 38, 38, 39, 39, 39, 39, 39, 39, 39, 39, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40,
+    40, 40, 40, 40, 40, 40, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 42, 42,
+    42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42,
+    42, 42, 42, 42, 42, 42,
+];
 
-#[inline]
-pub(crate) fn ml_base_and_bits(code: u8) -> Option<(usize, u8)> {
-    let idx = usize::from(code);
-    let base = *ML_BASE.get(idx)?;
-    let bits = *ML_BITS.get(idx)?;
-    let base_usize = usize::try_from(base).ok()?;
-    Some((base_usize, bits))
-}
-
-/// Encode a literal length (`0..=131_071`) into `(ll_code, extra_val, extra_bits)`.
+/// Encode a literal length (`0..=131_071`) into `(ll_code, extra_val, extra_bits)` in O(1).
+#[inline(always)]
 pub(crate) fn encode_ll(lit_len: usize) -> Option<(u8, u32, u32)> {
-    let len_u32 = u32::try_from(lit_len).ok()?;
-    if len_u32 < 16 {
-        let code = u8::try_from(len_u32).ok()?;
-        return Some((code, 0, 0));
+    if lit_len < 64 {
+        let code = *LL_CODE_LUT.get(lit_len)?;
+        let code_idx = usize::from(code);
+        let base = *LL_BASE.get(code_idx)?;
+        let bits = u32::from(*LL_BITS.get(code_idx)?);
+        let len_u32 = u32::try_from(lit_len).ok()?;
+        return Some((code, len_u32 - base, bits));
     }
-    for (idx, (&base, &bits)) in LL_BASE.iter().zip(LL_BITS.iter()).enumerate().skip(16) {
-        let span = 1u32 << u32::from(bits);
-        if len_u32 >= base && len_u32 - base < span {
-            let code = u8::try_from(idx).ok()?;
-            return Some((code, len_u32 - base, u32::from(bits)));
-        }
+    let len_u32 = u32::try_from(lit_len).ok()?;
+    if len_u32 < 128 {
+        return Some((25, len_u32 - 64, 6));
+    }
+    if len_u32 < 131_072 {
+        let bits = 31u32 - len_u32.leading_zeros();
+        let code = u8::try_from(bits + 19).ok()?;
+        let base = 1u32 << bits;
+        return Some((code, len_u32 - base, bits));
     }
     None
 }
 
-/// Encode a match length (`3..=131_074`) into `(ml_code, extra_val, extra_bits)`.
+/// Encode a match length (`3..=131_074`) into `(ml_code, extra_val, extra_bits)` in O(1).
+#[inline(always)]
 pub(crate) fn encode_ml(match_len: usize) -> Option<(u8, u32, u32)> {
-    let len_u32 = u32::try_from(match_len).ok()?;
-    if len_u32 < 3 {
-        return None;
+    let m = match_len.checked_sub(3)?;
+    if m < 128 {
+        let code = *ML_CODE_LUT.get(m)?;
+        let code_idx = usize::from(code);
+        let base = *ML_BASE.get(code_idx)?;
+        let bits = u32::from(*ML_BITS.get(code_idx)?);
+        let len_u32 = u32::try_from(match_len).ok()?;
+        return Some((code, len_u32 - base, bits));
     }
-    if len_u32 <= 34 {
-        let code = u8::try_from(len_u32 - 3).ok()?;
-        return Some((code, 0, 0));
+    let m_u32 = u32::try_from(m).ok()?;
+    if m_u32 < 256 {
+        return Some((43, m_u32 - 128, 7));
     }
-    for (idx, (&base, &bits)) in ML_BASE.iter().zip(ML_BITS.iter()).enumerate().skip(32) {
-        let span = 1u32 << u32::from(bits);
-        if len_u32 >= base && len_u32 - base < span {
-            let code = u8::try_from(idx).ok()?;
-            return Some((code, len_u32 - base, u32::from(bits)));
-        }
+    if m_u32 < 131_072 {
+        let bits = 31u32 - m_u32.leading_zeros();
+        let code = u8::try_from(bits + 36).ok()?;
+        let base = 1u32 << bits;
+        return Some((code, m_u32 - base, bits));
     }
     None
 }
 
 /// Encode an `Offset_Value` (`>= 1`) into `(of_code, extra_val, extra_bits)`.
-#[inline]
+#[inline(always)]
 pub(crate) fn encode_of(offset_value: u32) -> Option<(u8, u32, u32)> {
     if offset_value == 0 {
         return None;
@@ -135,53 +146,124 @@ pub(crate) fn encode_of(offset_value: u32) -> Option<(u8, u32, u32)> {
 }
 
 // ---------------------------------------------------------------------------
-// Reverse bitstream reader (RFC 8878 §4.1 / §4.2) and writer
+// Reverse bitstream reader (RFC 8878 §4.1 / §4.2, bulk 8-byte reload) and writer
 // ---------------------------------------------------------------------------
 
 /// Reads a Zstandard reverse bitstream from MSB (just below the trailing sentinel `1` bit) down to
-/// bit 0 of byte 0.
+/// bit 0 of byte 0 using C-zstd's bulk 64-bit `container` + `bits_consumed` window.
 pub(crate) struct RevBitReader<'a> {
     bytes: &'a [u8],
     byte_pos: usize,
     container: u64,
-    bits_in_buf: u32,
+    bits_consumed: u32,
 }
 
 impl<'a> RevBitReader<'a> {
     /// Open a reverse bitstream, stripping the high padding zeros and sentinel `1` bit in the
     /// final byte. Returns `None` if `bytes` is empty or its final byte is `0`.
+    #[inline]
     pub(crate) fn new(bytes: &'a [u8]) -> Option<Self> {
         let &last = bytes.last()?;
         if last == 0 {
             return None;
         }
         let leading = last.leading_zeros();
-        let valid_in_last = 7u32.checked_sub(leading)?;
-        let mask = (1u64 << valid_in_last) - 1;
-        let container = u64::from(last) & mask;
-        let mut reader = Self {
-            bytes,
-            byte_pos: bytes.len().saturating_sub(1),
-            container,
-            bits_in_buf: valid_in_last,
-        };
-        reader.refill();
-        Some(reader)
-    }
-
-    #[inline]
-    fn refill(&mut self) {
-        while self.bits_in_buf <= 56 && self.byte_pos > 0 {
-            self.byte_pos -= 1;
-            let b = self.bytes.get(self.byte_pos).copied().unwrap_or(0);
-            self.container = (self.container << 8) | u64::from(b);
-            self.bits_in_buf += 8;
+        let n = bytes.len();
+        if n >= 8 {
+            let start = n - 8;
+            let chunk = bytes.get(start..n)?;
+            let arr = <[u8; 8]>::try_from(chunk).ok()?;
+            Some(Self {
+                bytes,
+                byte_pos: start,
+                container: u64::from_le_bytes(arr),
+                bits_consumed: leading + 1,
+            })
+        } else {
+            let mut buf = [0u8; 8];
+            if let Some(dst) = buf.get_mut(..n) {
+                dst.copy_from_slice(bytes);
+            }
+            let unused_high = u32::try_from(8 - n).ok()?;
+            Some(Self {
+                bytes,
+                byte_pos: 0,
+                container: u64::from_le_bytes(buf),
+                bits_consumed: unused_high * 8 + leading + 1,
+            })
         }
     }
 
-    /// Read exactly `n` bits (`0..=32`) from the stream, returning `None` if fewer than `n` bits
-    /// remain.
-    #[inline]
+    /// Bulk-refill `container` with up to 8 bytes from `bytes` in a single 64-bit load.
+    /// After `reload()`, whenever `byte_pos > 0`, `bits_consumed <= 7` (at least 57 bits live).
+    #[inline(always)]
+    pub(crate) fn reload(&mut self) {
+        if self.byte_pos == 0 {
+            return;
+        }
+        let [lo, ..] = self.bits_consumed.to_le_bytes();
+        let bytes_consumed = usize::from(lo >> 3);
+        if self.byte_pos >= bytes_consumed {
+            self.byte_pos -= bytes_consumed;
+            self.bits_consumed &= 7;
+        } else {
+            let step = u32::try_from(self.byte_pos).unwrap_or(0);
+            self.bits_consumed -= step * 8;
+            self.byte_pos = 0;
+        }
+        if let Some(chunk) = self.bytes.get(self.byte_pos..self.byte_pos + 8)
+            && let Ok(arr) = <[u8; 8]>::try_from(chunk)
+        {
+            self.container = u64::from_le_bytes(arr);
+        }
+    }
+
+    /// Current unread byte index (`> 0` guarantees `reload()` leaves `bits_consumed <= 7`).
+    #[inline(always)]
+    pub(crate) const fn byte_pos(&self) -> usize {
+        self.byte_pos
+    }
+
+    /// Number of top bits already consumed from `container` (`0..=64`).
+    #[inline(always)]
+    pub(crate) const fn bits_consumed(&self) -> u32 {
+        self.bits_consumed
+    }
+
+    /// Returns `true` when at least 44 bits remain in `container` without another reload
+    /// (enough for 4 consecutive 11-bit Huffman lookups).
+    #[inline(always)]
+    pub(crate) const fn has_44_bits(&self) -> bool {
+        self.bits_consumed <= 20
+    }
+
+    /// Branchless peek of `64 - shift_r` bits (`1..=16`). Caller MUST ensure
+    /// `self.bits_consumed < 64` (e.g. `has_44_bits()` before a 4-symbol unroll).
+    #[inline(always)]
+    pub(crate) fn peek_fast(&self, shift_r: u32) -> usize {
+        let shifted = (self.container << self.bits_consumed) >> shift_r;
+        let [b0, b1, ..] = shifted.to_le_bytes();
+        usize::from(u16::from_le_bytes([b0, b1]))
+    }
+
+    /// Branchless advance of `n` bits after a verified fast peek.
+    #[inline(always)]
+    pub(crate) const fn advance_fast(&mut self, n: u32) {
+        self.bits_consumed += n;
+    }
+
+    /// Branchless read of `n` bits (`0..=32`). Caller MUST ensure `self.bits_consumed < 64`
+    /// and `self.bits_consumed + n <= 64`.
+    #[inline(always)]
+    pub(crate) fn read_bits_branchless(&mut self, n: u32) -> u32 {
+        let shifted = ((self.container << self.bits_consumed) >> 1) >> (63 - n);
+        self.bits_consumed += n;
+        let [b0, b1, b2, b3, ..] = shifted.to_le_bytes();
+        u32::from_le_bytes([b0, b1, b2, b3])
+    }
+
+    /// Read exactly `n` bits (`0..=32`) from the stream, reloading if needed.
+    #[inline(always)]
     pub(crate) fn read_bits(&mut self, n: u32) -> Option<u32> {
         if n == 0 {
             return Some(0);
@@ -189,68 +271,60 @@ impl<'a> RevBitReader<'a> {
         if n > 32 {
             return None;
         }
-        if self.bits_in_buf < n {
-            self.refill();
+        if self.bits_consumed + n > 64 {
+            self.reload();
         }
-        if self.bits_in_buf < n {
+        let next = self.bits_consumed + n;
+        if next > 64 {
             return None;
         }
-        let shift = self.bits_in_buf - n;
-        let val = self.container >> shift;
-        self.bits_in_buf = shift;
-        if shift == 0 {
-            self.container = 0;
-        } else {
-            self.container &= (1u64 << shift) - 1;
-        }
-        u32::try_from(val).ok()
+        let shifted = (self.container << self.bits_consumed) >> (64 - n);
+        self.bits_consumed = next;
+        let [b0, b1, b2, b3, ..] = shifted.to_le_bytes();
+        Some(u32::from_le_bytes([b0, b1, b2, b3]))
     }
 
     /// Peek `n` bits (`1..=11`) for Huffman lookup, right-padding with zeros when fewer than `n`
     /// bits remain at the tail of the stream.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn peek_bits_padded(&mut self, n: u32) -> u32 {
-        if self.bits_in_buf < n && self.byte_pos > 0 {
-            self.refill();
+        if self.bits_consumed + n > 64 && self.byte_pos > 0 {
+            self.reload();
         }
-        if self.bits_in_buf >= n {
-            u32::try_from(self.container >> (self.bits_in_buf - n)).unwrap_or(0)
-        } else {
-            u32::try_from(self.container << (n - self.bits_in_buf)).unwrap_or(0)
+        if self.bits_consumed >= 64 {
+            return 0;
         }
+        let shifted = (self.container << self.bits_consumed) >> (64 - n);
+        let [b0, b1, ..] = shifted.to_le_bytes();
+        u32::from(u16::from_le_bytes([b0, b1]))
     }
 
     /// Consume `n` bits (`0..=32`), returning `false` if fewer than `n` bits remain.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn consume_bits(&mut self, n: u32) -> bool {
         if n == 0 {
             return true;
         }
-        if self.bits_in_buf < n {
-            self.refill();
+        if self.bits_consumed + n > 64 {
+            self.reload();
         }
-        if self.bits_in_buf < n {
+        let next = self.bits_consumed + n;
+        if next > 64 {
             return false;
         }
-        let shift = self.bits_in_buf - n;
-        self.bits_in_buf = shift;
-        if shift == 0 {
-            self.container = 0;
-        } else {
-            self.container &= (1u64 << shift) - 1;
-        }
+        self.bits_consumed = next;
         true
     }
 
     /// Returns `true` when every bit in the reverse bitstream has been consumed.
-    #[inline]
+    #[inline(always)]
     pub(crate) const fn is_empty(&self) -> bool {
-        self.byte_pos == 0 && self.bits_in_buf == 0
+        self.byte_pos == 0 && self.bits_consumed == 64
     }
 }
 
-/// Writes bits LSB-first and appends the RFC 8878 terminating `1` sentinel bit so that
-/// [`RevBitReader`] pops fields in the exact reverse order they were written.
+/// Writes bits LSB-first in bulk 4-byte flushes and appends the RFC 8878 terminating `1` sentinel
+/// bit so that [`RevBitReader`] pops fields in the exact reverse order they were written.
 pub(crate) struct BitWriter<A: Allocator> {
     out: Vec<u8, A>,
     buf: u64,
@@ -262,7 +336,7 @@ impl<A: Allocator> BitWriter<A> {
         Ok(Self { out: Vec::try_with_capacity_in(cap, alloc)?, buf: 0, bits: 0 })
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn write_bits(&mut self, val: u32, n: u32) -> Result<(), AllocFailure> {
         if n == 0 {
             return Ok(());
@@ -270,26 +344,32 @@ impl<A: Allocator> BitWriter<A> {
         let masked = if n >= 32 { u64::from(val) } else { u64::from(val) & ((1u64 << n) - 1) };
         self.buf |= masked << self.bits;
         self.bits += n;
+        if self.bits >= 32 {
+            let [b0, b1, b2, b3, ..] = self.buf.to_le_bytes();
+            self.out.try_extend_from_slice(&[b0, b1, b2, b3])?;
+            self.buf >>= 32;
+            self.bits -= 32;
+        }
+        Ok(())
+    }
+
+    /// Flush into an existing `Vec<u8, A>` (appending the finished reverse bitstream).
+    pub(crate) fn finish_into(mut self, dst: &mut Vec<u8, A>) -> Result<(), AllocFailure> {
         while self.bits >= 8 {
             let [b0, ..] = self.buf.to_le_bytes();
             self.out.try_push(b0).map_err(|r| r.why)?;
             self.buf >>= 8;
             self.bits -= 8;
         }
-        Ok(())
-    }
-
-    /// Write the sentinel `1` bit and flush the final byte.
-    pub(crate) fn finish(mut self) -> Result<Vec<u8, A>, AllocFailure> {
         self.buf |= 1u64 << self.bits;
         let [b0, ..] = self.buf.to_le_bytes();
         self.out.try_push(b0).map_err(|r| r.why)?;
-        Ok(self.out)
+        dst.try_extend_from_slice(self.out.as_slice())
     }
 }
 
 // ---------------------------------------------------------------------------
-// Forward bitstream reader for FSE table headers (RFC 8878 §4.1.1)
+// Forward bitstream reader & writer for FSE table headers (RFC 8878 §4.1.1)
 // ---------------------------------------------------------------------------
 
 struct FwdBitReader<'a> {
@@ -336,6 +416,115 @@ impl<'a> FwdBitReader<'a> {
     }
 }
 
+/// Forward LSB-first bit writer for RFC 8878 §4.1.1 FSE distribution headers.
+pub(crate) struct FwdBitWriter<'a, A: Allocator> {
+    out: &'a mut Vec<u8, A>,
+    buf: u64,
+    bits: u32,
+}
+
+impl<'a, A: Allocator> FwdBitWriter<'a, A> {
+    pub(crate) fn new(out: &'a mut Vec<u8, A>) -> Self {
+        Self { out, buf: 0, bits: 0 }
+    }
+
+    #[inline]
+    pub(crate) fn write(&mut self, val: u32, n: u32) -> Result<(), AllocFailure> {
+        if n == 0 {
+            return Ok(());
+        }
+        let masked = if n >= 32 { u64::from(val) } else { u64::from(val) & ((1u64 << n) - 1) };
+        self.buf |= masked << self.bits;
+        self.bits += n;
+        while self.bits >= 8 {
+            let [b0, ..] = self.buf.to_le_bytes();
+            self.out.try_push(b0).map_err(|r| r.why)?;
+            self.buf >>= 8;
+            self.bits -= 8;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<(), AllocFailure> {
+        if self.bits > 0 {
+            let [b0, ..] = self.buf.to_le_bytes();
+            self.out.try_push(b0).map_err(|r| r.why)?;
+        }
+        Ok(())
+    }
+}
+
+/// Write an RFC 8878 §4.1.1 FSE distribution header for `norm` (`accuracy_log` in `5..=9`) into
+/// `out`. Exact inverse of [`FseDecTable::decode_header_and_build`].
+pub(crate) fn write_fse_header<A: Allocator>(
+    norm: &[i16],
+    accuracy_log: u8,
+    out: &mut Vec<u8, A>,
+) -> Result<(), ZstdError> {
+    if !(5..=MAX_FSE_LOG).contains(&accuracy_log) || norm.len() > MAX_FSE_SYMBOLS {
+        return Err(ZstdError::CorruptFse);
+    }
+    let mut bw = FwdBitWriter::new(out);
+    bw.write(u32::from(accuracy_log - 5), 4)?;
+
+    let mut remaining: i32 = (1i32 << u32::from(accuracy_log)) + 1;
+    let mut threshold: i32 = 1i32 << u32::from(accuracy_log);
+    let mut nb_bits: u32 = u32::from(accuracy_log) + 1;
+    let mut idx: usize = 0;
+
+    while remaining > 1 && idx < norm.len() {
+        let prob = i32::from(*norm.get(idx).ok_or(ZstdError::CorruptFse)?);
+        let max: i32 = (2 * threshold - 1) - remaining;
+        let count: i32 = prob + 1;
+        let small_bits = nb_bits.checked_sub(1).ok_or(ZstdError::CorruptFse)?;
+
+        if count < max {
+            let val = u32::try_from(count).map_err(|_| ZstdError::CorruptFse)?;
+            bw.write(val, small_bits)?;
+        } else if count < threshold {
+            let val = u32::try_from(count).map_err(|_| ZstdError::CorruptFse)?;
+            bw.write(val, nb_bits)?;
+        } else {
+            let val = u32::try_from(count + max).map_err(|_| ZstdError::CorruptFse)?;
+            bw.write(val, nb_bits)?;
+        }
+
+        if prob == -1 {
+            remaining -= 1;
+        } else if prob > 0 {
+            remaining -= prob;
+        }
+        idx += 1;
+
+        while remaining < threshold && nb_bits > 1 {
+            nb_bits -= 1;
+            threshold >>= 1;
+        }
+
+        if prob == 0 && remaining > 1 {
+            let mut zeros: usize = 0;
+            while let Some(&next_p) = norm.get(idx)
+                && next_p == 0
+            {
+                zeros += 1;
+                idx += 1;
+            }
+            while zeros >= 3 {
+                bw.write(3, 2)?;
+                zeros -= 3;
+            }
+            let rem_u32 = u32::try_from(zeros).map_err(|_| ZstdError::CorruptFse)?;
+            bw.write(rem_u32, 2)?;
+        }
+    }
+
+    if remaining != 1 {
+        return Err(ZstdError::CorruptFse);
+    }
+    bw.finish()?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // FSE Decoding Table (RFC 8878 §4.1.1)
 // ---------------------------------------------------------------------------
@@ -349,7 +538,98 @@ pub(crate) struct FseDecEntry {
 }
 
 impl FseDecEntry {
-    const ZERO: Self = Self { symbol: 0, num_bits: 0, baseline: 0 };
+    pub(crate) const ZERO: Self = Self { symbol: 0, num_bits: 0, baseline: 0 };
+}
+
+/// Pre-resolved sequence FSE decoding entry (exact C zstd `ZSTD_seqSymbol` layout): stores
+/// the resolved baseline value (`LL_BASE`, `ML_BASE`, or `1 << of_code`) and `extra_bits`
+/// directly in the FSE table so the inner sequence loop does zero secondary LUT lookups.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SeqDecEntry {
+    pub(crate) base: u32,
+    pub(crate) extra_bits: u8,
+    pub(crate) num_bits: u8,
+    pub(crate) baseline: u16,
+}
+
+impl SeqDecEntry {
+    pub(crate) const ZERO: Self = Self { base: 0, extra_bits: 0, num_bits: 0, baseline: 0 };
+}
+
+/// Which sequence field a [`SeqDecTable`] resolves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeqKind {
+    Ll,
+    Of,
+    Ml,
+}
+
+/// Fixed-capacity pre-resolved sequence FSE decoding table (512 entries = 4 KiB in L1D).
+pub(crate) struct SeqDecTable {
+    entries: [SeqDecEntry; MAX_FSE_TABLE_SIZE],
+    accuracy_log: u8,
+}
+
+impl SeqDecTable {
+    pub(crate) const fn new_empty() -> Self {
+        Self { entries: [SeqDecEntry::ZERO; MAX_FSE_TABLE_SIZE], accuracy_log: 0 }
+    }
+
+    #[inline(always)]
+    pub(crate) const fn accuracy_log(&self) -> u8 {
+        self.accuracy_log
+    }
+
+    #[inline(always)]
+    pub(crate) fn entry_fast(&self, state: usize) -> SeqDecEntry {
+        self.entries
+            .get(state & (MAX_FSE_TABLE_SIZE - 1))
+            .copied()
+            .unwrap_or(SeqDecEntry::ZERO)
+    }
+
+    /// Compile an [`FseDecTable`] into pre-resolved [`SeqDecEntry`] values, validating every
+    /// symbol code once up front.
+    pub(crate) fn compile_from(&mut self, dec: &FseDecTable, kind: SeqKind) -> Result<(), ZstdError> {
+        let log = dec.accuracy_log();
+        if log > MAX_FSE_LOG {
+            return Err(ZstdError::CorruptFse);
+        }
+        let table_size = 1usize << u32::from(log);
+        for state in 0..table_size {
+            let e = dec.entry(state).ok_or(ZstdError::CorruptFse)?;
+            let (base, extra_bits) = match kind {
+                SeqKind::Ll => {
+                    let idx = usize::from(e.symbol);
+                    let b = *LL_BASE.get(idx).ok_or(ZstdError::CorruptSequences)?;
+                    let eb = *LL_BITS.get(idx).ok_or(ZstdError::CorruptSequences)?;
+                    (b, eb)
+                }
+                SeqKind::Of => {
+                    if usize::from(e.symbol) > OF_MAX_CODE {
+                        return Err(ZstdError::CorruptSequences);
+                    }
+                    (1u32 << u32::from(e.symbol), e.symbol)
+                }
+                SeqKind::Ml => {
+                    let idx = usize::from(e.symbol);
+                    let b = *ML_BASE.get(idx).ok_or(ZstdError::CorruptSequences)?;
+                    let eb = *ML_BITS.get(idx).ok_or(ZstdError::CorruptSequences)?;
+                    (b, eb)
+                }
+            };
+            if let Some(slot) = self.entries.get_mut(state) {
+                *slot = SeqDecEntry {
+                    base,
+                    extra_bits,
+                    num_bits: e.num_bits,
+                    baseline: e.baseline,
+                };
+            }
+        }
+        self.accuracy_log = log;
+        Ok(())
+    }
 }
 
 /// Fixed-capacity FSE decoding table (up to `1 << 9 = 512` states, zero heap allocation).
@@ -363,12 +643,12 @@ impl FseDecTable {
         Self { entries: [FseDecEntry::ZERO; MAX_FSE_TABLE_SIZE], accuracy_log: 0 }
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) const fn accuracy_log(&self) -> u8 {
         self.accuracy_log
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn entry(&self, state: usize) -> Option<FseDecEntry> {
         let size = 1usize << u32::from(self.accuracy_log);
         if state >= size {
@@ -468,7 +748,8 @@ impl FseDecTable {
             }
             *next_ref = next_state.checked_add(1).ok_or(ZstdError::CorruptFse)?;
 
-            let high_bit = 15u32.checked_sub(next_state.leading_zeros()).ok_or(ZstdError::CorruptFse)?;
+            let high_bit =
+                15u32.checked_sub(next_state.leading_zeros()).ok_or(ZstdError::CorruptFse)?;
             let nb = u32::from(accuracy_log).checked_sub(high_bit).ok_or(ZstdError::CorruptFse)?;
             let shifted = usize::from(next_state).checked_shl(nb).ok_or(ZstdError::CorruptFse)?;
             let base = shifted.checked_sub(table_size).ok_or(ZstdError::CorruptFse)?;
@@ -533,12 +814,14 @@ impl FseDecTable {
 
             let max: i32 = (2 * threshold - 1) - remaining;
             let small_bits = nb_bits.checked_sub(1).ok_or(ZstdError::CorruptFse)?;
-            let small = i32::try_from(reader.peek(small_bits)).map_err(|_| ZstdError::CorruptFse)?;
+            let small =
+                i32::try_from(reader.peek(small_bits)).map_err(|_| ZstdError::CorruptFse)?;
             let count: i32 = if small < max {
                 reader.consume(small_bits)?;
                 small
             } else {
-                let full = i32::try_from(reader.peek(nb_bits)).map_err(|_| ZstdError::CorruptFse)?;
+                let full =
+                    i32::try_from(reader.peek(nb_bits)).map_err(|_| ZstdError::CorruptFse)?;
                 reader.consume(nb_bits)?;
                 if full >= threshold { full - max } else { full }
             };
@@ -580,29 +863,32 @@ impl FseDecTable {
 }
 
 // ---------------------------------------------------------------------------
-// FSE Encoding Table (exact inverse of Predefined_Mode FseDecTable)
+// O(1) FSE Encoding Table (exact inverse of any FseDecTable with log <= 6)
 // ---------------------------------------------------------------------------
 
-const MAX_PREDEF_STATES_PER_SYM: usize = 4;
+const MAX_ENC_TABLE_SIZE: usize = 1 << 6;
 
 #[derive(Clone, Copy)]
-struct EncState {
-    state: u8,
-    num_bits: u8,
-    baseline: u16,
-    end: u16,
+struct FseSymMeta {
+    /// Start index of this symbol's states in `state_table`.
+    offset: u8,
+    /// Number of states assigned to this symbol (`0` if unused).
+    count: u8,
+    /// `target < split` uses `max_nb - 1` bits; `target >= split` uses `max_nb` bits.
+    split: u8,
+    max_nb: u8,
 }
 
-impl EncState {
-    const ZERO: Self = Self { state: 0, num_bits: 0, baseline: 0, end: 0 };
+impl FseSymMeta {
+    const ZERO: Self = Self { offset: 0, count: 0, split: 0, max_nb: 0 };
 }
 
-/// Exact inverse of a predefined [`FseDecTable`] (`accuracy_log <= 6`, at most 4 states per
-/// symbol). Every transition produced by [`Self::encode_step`] is guaranteed by construction to
-/// invert [`FseDecTable::entry`].
+/// O(1) exact inverse of any [`FseDecTable`] with `accuracy_log <= 6` (used for predefined
+/// sequence tables and for Huffman-weight FSE compression).
 pub(crate) struct FseEncTable {
-    by_sym: [[EncState; MAX_PREDEF_STATES_PER_SYM]; MAX_FSE_SYMBOLS],
-    sym_len: [u8; MAX_FSE_SYMBOLS],
+    state_table: [u8; MAX_ENC_TABLE_SIZE],
+    meta: [FseSymMeta; MAX_FSE_SYMBOLS],
+    table_size: u16,
 }
 
 impl FseEncTable {
@@ -612,58 +898,89 @@ impl FseEncTable {
             return Err(ZstdError::CorruptFse);
         }
         let table_size = 1usize << u32::from(log);
-        let mut table = Self {
-            by_sym: [[EncState::ZERO; MAX_PREDEF_STATES_PER_SYM]; MAX_FSE_SYMBOLS],
-            sym_len: [0u8; MAX_FSE_SYMBOLS],
-        };
+        let mut counts = [0u8; MAX_FSE_SYMBOLS];
+        for state in 0..table_size {
+            let entry = dec.entry(state).ok_or(ZstdError::CorruptFse)?;
+            let c = counts.get_mut(usize::from(entry.symbol)).ok_or(ZstdError::CorruptFse)?;
+            *c = c.checked_add(1).ok_or(ZstdError::CorruptFse)?;
+        }
 
+        let mut meta = [FseSymMeta::ZERO; MAX_FSE_SYMBOLS];
+        let mut cursor: usize = 0;
+        for sym in 0..MAX_FSE_SYMBOLS {
+            let count = *counts.get(sym).ok_or(ZstdError::CorruptFse)?;
+            if count == 0 {
+                continue;
+            }
+            let p = u32::from(count);
+            let high_bit = 31u32 - p.leading_zeros();
+            let max_nb = u32::from(log).checked_sub(high_bit).ok_or(ZstdError::CorruptFse)?;
+            let next_pow2 = 1u32 << (high_bit + 1);
+            let split_u32 = if max_nb == 0 {
+                0
+            } else {
+                (2u32 * p).saturating_sub(next_pow2) << (max_nb - 1)
+            };
+            let slot = meta.get_mut(sym).ok_or(ZstdError::CorruptFse)?;
+            *slot = FseSymMeta {
+                offset: u8::try_from(cursor).map_err(|_| ZstdError::CorruptFse)?,
+                count,
+                split: u8::try_from(split_u32).map_err(|_| ZstdError::CorruptFse)?,
+                max_nb: u8::try_from(max_nb).map_err(|_| ZstdError::CorruptFse)?,
+            };
+            cursor += usize::from(count);
+        }
+
+        let mut write_pos = [0u8; MAX_FSE_SYMBOLS];
+        for sym in 0..MAX_FSE_SYMBOLS {
+            let dst = write_pos.get_mut(sym).ok_or(ZstdError::CorruptFse)?;
+            let m = *meta.get(sym).ok_or(ZstdError::CorruptFse)?;
+            *dst = m.offset;
+        }
+
+        let mut state_table = [0u8; MAX_ENC_TABLE_SIZE];
         for state in 0..table_size {
             let entry = dec.entry(state).ok_or(ZstdError::CorruptFse)?;
             let sym = usize::from(entry.symbol);
-            let len_slot = table.sym_len.get_mut(sym).ok_or(ZstdError::CorruptFse)?;
-            let idx = usize::from(*len_slot);
-            if idx >= MAX_PREDEF_STATES_PER_SYM {
-                return Err(ZstdError::CorruptFse);
-            }
-            let span = 1u16.checked_shl(u32::from(entry.num_bits)).ok_or(ZstdError::CorruptFse)?;
-            let end = entry.baseline.checked_add(span).ok_or(ZstdError::CorruptFse)?;
-            let state_u8 = u8::try_from(state).map_err(|_| ZstdError::CorruptFse)?;
-            let row = table.by_sym.get_mut(sym).ok_or(ZstdError::CorruptFse)?;
-            let dst = row.get_mut(idx).ok_or(ZstdError::CorruptFse)?;
-            *dst = EncState { state: state_u8, num_bits: entry.num_bits, baseline: entry.baseline, end };
-            *len_slot += 1;
+            let pos_ref = write_pos.get_mut(sym).ok_or(ZstdError::CorruptFse)?;
+            let idx = usize::from(*pos_ref);
+            let slot = state_table.get_mut(idx).ok_or(ZstdError::CorruptFse)?;
+            *slot = u8::try_from(state).map_err(|_| ZstdError::CorruptFse)?;
+            *pos_ref = pos_ref.checked_add(1).ok_or(ZstdError::CorruptFse)?;
         }
 
-        Ok(table)
+        let table_size_u16 = u16::try_from(table_size).map_err(|_| ZstdError::CorruptFse)?;
+        Ok(Self { state_table, meta, table_size: table_size_u16 })
     }
 
-    /// Choose a valid decoder state for the last sequence's symbol `sym`.
-    #[inline]
+    /// Choose a valid decoder state for the last symbol `sym`.
+    #[inline(always)]
     pub(crate) fn init_state(&self, sym: u8) -> Option<u8> {
-        let sym_idx = usize::from(sym);
-        let count = *self.sym_len.get(sym_idx)?;
-        if count == 0 {
+        let m = *self.meta.get(usize::from(sym))?;
+        if m.count == 0 {
             return None;
         }
-        let first = self.by_sym.get(sym_idx)?.first()?;
-        Some(first.state)
+        self.state_table.get(usize::from(m.offset)).copied()
     }
 
-    /// Find the unique `(prev_state, bits_val, num_bits)` whose decoder transition from
-    /// `prev_state` emits `sym` and lands on `target_state`.
-    #[inline]
+    /// O(1) branch-minimal inverse transition: find the unique `(prev_state, bits_val, num_bits)`
+    /// whose decoder transition from `prev_state` emits `sym` and lands on `target_state`.
+    #[inline(always)]
     pub(crate) fn encode_step(&self, sym: u8, target_state: u8) -> Option<(u8, u32, u32)> {
-        let sym_idx = usize::from(sym);
-        let count = usize::from(*self.sym_len.get(sym_idx)?);
-        let row = self.by_sym.get(sym_idx)?;
-        let active = row.get(..count)?;
-        let target = u16::from(target_state);
-        for e in active {
-            if target >= e.baseline && target < e.end {
-                let bits = u32::from(target - e.baseline);
-                return Some((e.state, bits, u32::from(e.num_bits)));
-            }
+        let m = *self.meta.get(usize::from(sym))?;
+        if m.count == 0 {
+            return None;
         }
-        None
+        let nb = if target_state < m.split {
+            u32::from(m.max_nb - 1)
+        } else {
+            u32::from(m.max_nb)
+        };
+        let target = u32::from(target_state);
+        let bits = target & ((1u32 << nb) - 1);
+        let u = (target + u32::from(self.table_size)) >> nb;
+        let rel = usize::try_from(u.checked_sub(u32::from(m.count))?).ok()?;
+        let prev_state = *self.state_table.get(usize::from(m.offset) + rel)?;
+        Some((prev_state, bits, nb))
     }
 }
