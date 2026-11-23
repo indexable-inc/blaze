@@ -1150,15 +1150,12 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 }
                 named.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
                 let mut sorted_names = blaze_own::Vec::with_capacity_in(named.len(), alloc);
-                let mut sorted_tys = blaze_own::Vec::with_capacity_in(kids.len(), alloc);
-                for &(_, i, nm) in named.iter() {
+                for &(_, _, nm) in named.iter() {
                     sorted_names.push(nm);
-                    if let Some(&k) = kids.get(i) {
-                        sorted_tys.push(k);
-                    }
                 }
                 let schema = tc::RecordSchema::of_sorted_names(&sorted_names);
-                let l = intern_list(tys, &sorted_tys)?;
+                // `children()` already yields `kids` in canonical sorted field-name order.
+                let l = intern_list(tys, kids)?;
                 intern(tys, PNode::Record(schema, l))
             }
             lf::TypeRef::Union(_) => {
