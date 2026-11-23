@@ -94,9 +94,9 @@ enum Piece {
 }
 
 /// `ty` (of ground table `tys`) printed as `type_name` prints it, in `alloc`.
-pub fn type_name_text<A: Allocator + Clone>(tys: PTys<'_>, ty: PTy, names: &dyn TypeNames, alloc: A) -> Result<String<A>, TypeNameError> {
-    let mut out = String::new_in(alloc.clone());
-    let mut stack: Vec<Piece, A> = Vec::new_in(alloc.clone());
+pub fn type_name_text<A: Allocator + Copy>(tys: PTys<'_>, ty: PTy, names: &dyn TypeNames, alloc: A) -> Result<String<A>, TypeNameError> {
+    let mut out = String::new_in(alloc);
+    let mut stack: Vec<Piece, A> = Vec::new_in(alloc);
     // One node's pieces in reading order, pushed onto `stack` reversed.
     let mut seq: Vec<Piece, A> = Vec::new_in(alloc);
     stack.push(Piece::Ty(ty));

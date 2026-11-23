@@ -75,9 +75,9 @@ impl<A: Allocator> Resolved<A> {
     }
 }
 
-impl<A: Allocator + Clone> Imports<A> {
+impl<A: Allocator + Copy> Imports<A> {
     pub fn new_in(alloc: A) -> Imports<A> {
-        Imports { text: Vec::new_in(alloc.clone()), rows: Vec::new_in(alloc.clone()), sorted: Vec::new_in(alloc) }
+        Imports { text: Vec::new_in(alloc), rows: Vec::new_in(alloc), sorted: Vec::new_in(alloc) }
     }
 
     pub fn len(&self) -> usize {

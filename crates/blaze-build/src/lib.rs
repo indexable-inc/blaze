@@ -1210,7 +1210,7 @@ impl core::error::Error for BuildError {}
 /// any body that holds it by value is built; a body that asks a state not laid is refused with
 /// [`BuildError::MissingRecord`] naming the owner (never built late). `plan` is `None` only in
 /// this crate's unit tests.
-pub fn build_coroutine<A: Allocator + Clone>(
+pub fn build_coroutine<A: Allocator + Copy>(
     body: &BodyView<'_>,
     checked: &Checked<'_>,
     ordinal: u32,
@@ -1227,7 +1227,7 @@ pub fn build_coroutine<A: Allocator + Clone>(
 
 /// Builds the instance `subst` names of `body`, checked once generically as `checked`, of a fn
 /// whose signature is `sig`, in `alloc`.
-pub fn build<A: Allocator + Clone>(
+pub fn build<A: Allocator + Copy>(
     body: &BodyView<'_>,
     checked: &Checked<'_>,
     sig: &FnSig<'_>,
@@ -1251,7 +1251,7 @@ pub fn build<A: Allocator + Clone>(
 /// and the Fn traits"): the closure's body when `which` is its kind, a thin entry over the body
 /// when weaker. The caller finds the owner, its arguments and the ordinal from the closure's
 /// ground type ([`closure_of`]) and `which` from the instance's item.
-pub fn build_closure<A: Allocator + Clone>(
+pub fn build_closure<A: Allocator + Copy>(
     body: &BodyView<'_>,
     checked: &Checked<'_>,
     ordinal: u32,
@@ -1284,7 +1284,7 @@ pub fn build_closure<A: Allocator + Clone>(
 /// `item`'s signature and `subst.args` the list `args` names; for a fn pointer `sig` is `None`
 /// and `subst.args` empty. The caller picks this for an `Fn*` method's instance whose first
 /// argument [`closure_of`] does not read as a closure.
-pub fn build_fn_shim<A: Allocator + Clone>(
+pub fn build_fn_shim<A: Allocator + Copy>(
     callee: PTy,
     tuple: PTy,
     which: FnTrait,
@@ -1303,7 +1303,7 @@ pub fn build_fn_shim<A: Allocator + Clone>(
 /// result the value. `sig` is the ctor's signature. A call written with the ctor's path as its
 /// callee is built in place and never calls this; a call through a parenthesized path, a fn
 /// item value, a fn pointer or a `Fn*` shim does (ctor_fn.rs).
-pub fn build_ctor_fn<A: Allocator + Clone>(
+pub fn build_ctor_fn<A: Allocator + Copy>(
     ctor: ItemKey,
     variant: u32,
     sig: &FnSig<'_>,
@@ -1320,7 +1320,7 @@ pub fn build_ctor_fn<A: Allocator + Clone>(
 /// checker's answer to `Self: Copy` (the seam's `holds`): when it holds, the bytes are copied
 /// and no field's `clone` runs; else each field (a closure's captures in order) is cloned by
 /// its own `clone`, in order, the clones made dropped if a later one unwinds.
-pub fn build_builtin_clone<A: Allocator + Clone>(
+pub fn build_builtin_clone<A: Allocator + Copy>(
     clone: ItemKey,
     copy: bool,
     subst: &mut Subst<'_, '_>,
@@ -1335,7 +1335,7 @@ pub fn build_builtin_clone<A: Allocator + Clone>(
 /// [`InstanceKey`] it makes the record's key ([`vtable::record_key`]; codegen.md, "Trait
 /// objects: vtables and dynamic calls"): an edit to a trait changes the key of exactly the
 /// functions whose slot or word moved.
-pub fn object_reads<A: Allocator + Clone>(
+pub fn object_reads<A: Allocator + Copy>(
     body: &BodyView<'_>,
     checked: &Checked<'_>,
     subst: &mut Subst<'_, '_>,
@@ -1352,7 +1352,7 @@ pub fn object_reads<A: Allocator + Clone>(
 /// one type argument (module doc, "Drops"): `body`, `checked` and `sig` are that fn's, whose
 /// written body is not built. The caller picks this for every instance of
 /// `Adts::lang_fn("drop_in_place")`.
-pub fn build_drop_glue<A: Allocator + Clone>(
+pub fn build_drop_glue<A: Allocator + Copy>(
     body: &BodyView<'_>,
     checked: &Checked<'_>,
     sig: &FnSig<'_>,

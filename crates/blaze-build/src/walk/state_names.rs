@@ -56,14 +56,14 @@ pub(super) struct Names<'n, A: Allocator> {
     plant: StatePlant,
 }
 
-impl<'n, A: Allocator + Clone> Names<'n, A> {
+impl<'n, A: Allocator + Copy> Names<'n, A> {
     pub(super) fn new(table: StateNames<'n>, plant: StatePlant, root: ExprId, alloc: A) -> Self {
         Names {
             table,
-            named: Vec::new_in(alloc.clone()),
-            val_at: Vec::new_in(alloc.clone()),
+            named: Vec::new_in(alloc),
+            val_at: Vec::new_in(alloc),
             at: root,
-            epochs: Vec::new_in(alloc.clone()),
+            epochs: Vec::new_in(alloc),
             spills: Vec::new_in(alloc),
             plant,
         }
@@ -163,7 +163,7 @@ pub(super) fn task_expr(t: &Task) -> Option<ExprId> {
     }
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Before task `t` runs: its expression is the one the slots and values it makes come from.
     pub(super) fn note_task(&mut self, t: &Task) {
         let Some(x) = task_expr(t) else { return };

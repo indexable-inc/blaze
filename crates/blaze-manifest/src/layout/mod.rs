@@ -191,6 +191,12 @@ pub struct Feature<'a> {
     pub span: Span,
 }
 
+impl<'a> Feature<'a> {
+    fn clone_in(&self, alloc: Alloc<'a>) -> Feature<'a> {
+        Feature { name: self.name.clone_in(alloc), enables: self.enables.clone_in(alloc), span: self.span }
+    }
+}
+
 /// A member package.
 pub struct Member<'a> {
     /// Its directory, anchor-relative.
@@ -428,7 +434,7 @@ impl<'a> Layout<'a> {
             None => Answer::Missing,
         };
         let path = String::from_str_in(path, self.alloc);
-        self.by_path.insert(path.clone(), id.0);
+        self.by_path.insert(path.clone_in(self.alloc), id.0);
         self.manifests.push((path, answer));
         Ok(())
     }
@@ -553,7 +559,7 @@ impl<'l, 'a> Passing<'l, 'a> {
     /// `None` when some answer is still to come.
     fn run(&mut self) -> Result<Option<Units<'a>>, LayoutError<'a>> {
         let alloc = self.alloc();
-        let start = self.layout.start.clone();
+        let start = self.layout.start.clone_in(alloc);
         let start_manifest = self.manifest_of(&start);
         self.prefetch(&start);
         let (start_id, start_raw) = match self.look(&start_manifest) {
@@ -568,7 +574,7 @@ impl<'l, 'a> Passing<'l, 'a> {
         let mut complete = true;
         match root_ws {
             None => match &start_raw.package {
-                Some(package) => members.push(Found { dir: start.clone(), id: start_id, package }),
+                Some(package) => members.push(Found { dir: start.clone_in(alloc), id: start_id, package }),
                 None => return Err(LayoutError::NotAPackage { manifest: start_manifest }),
             },
             Some(ws) => {
@@ -583,14 +589,14 @@ impl<'l, 'a> Passing<'l, 'a> {
                 }
                 let mut visit = Vec::new_in(alloc);
                 for dir in dirs.iter().rev() {
-                    visit.push((dir.clone(), false));
+                    visit.push((dir.clone_in(alloc), false));
                 }
                 let mut seen: SortedMap<Text<'a>, (), Alloc<'a>> = SortedMap::with_capacity_in(0, alloc);
                 // The members, then the root's own package, each depth first through its path
                 // dependencies.
                 for round in 0..2 {
                     if round == 1 {
-                        visit.push((root_dir.clone(), false));
+                        visit.push((root_dir.clone_in(alloc), false));
                     }
                     while let Some((dir, is_path_dep)) = visit.pop() {
                         if seen.contains_key(dir.as_str()) {
@@ -612,7 +618,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                             Look::Missing => return Err(self.missing(&manifest)),
                             Look::Read(id, raw) => (id, raw),
                         };
-                        seen.insert(dir.clone(), ());
+                        seen.insert(dir.clone_in(alloc), ());
                         let Some(package) = &raw.package else {
                             if dir == root_dir {
                                 continue;
@@ -653,14 +659,14 @@ impl<'l, 'a> Passing<'l, 'a> {
         }
         let mut manifests = Vec::with_capacity_in(self.layout.manifests.len(), alloc);
         for (path, _) in self.layout.manifests.iter() {
-            manifests.push(path.clone());
+            manifests.push(path.clone_in(alloc));
         }
         let root_package = match &self.layout.manifests[root_id.0 as usize].1 {
             Answer::Read(raw) => raw.package.as_ref(),
             Answer::Missing => None,
         };
         let resolver = match (root_ws.and_then(|ws| ws.resolver.as_ref()), root_package.and_then(|p| p.resolver.as_ref())) {
-            (Some(written), _) | (None, Some(written)) => Some(written.clone()),
+            (Some(written), _) | (None, Some(written)) => Some((written.0.clone_in(alloc), written.1)),
             (None, None) => None,
         };
         let root_edition = out.iter().find(|member| member.manifest == root_id).map(|member| member.edition);
@@ -678,7 +684,7 @@ impl<'l, 'a> Passing<'l, 'a> {
     ) -> Result<Option<(Text<'a>, ManifestId, Option<&'l RawWorkspace<'a>>)>, LayoutError<'a>> {
         let alloc = self.alloc();
         if let Some(ws) = &start_raw.workspace {
-            return Ok(Some((start.clone(), start_id, Some(ws))));
+            return Ok(Some((start.clone_in(alloc), start_id, Some(ws))));
         }
         if let Some(package) = &start_raw.package
             && let Some((rel, span)) = &package.workspace
@@ -697,7 +703,7 @@ impl<'l, 'a> Passing<'l, 'a> {
         // Every directory above, nearest first, asked at once.
         let mut found = None;
         let mut waiting = false;
-        let mut dir = start.clone();
+        let mut dir = start.clone_in(alloc);
         while let Some(up) = parent(&dir, alloc) {
             dir = up;
             let manifest = self.manifest_of(&dir);
@@ -710,7 +716,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                         && let Some(ws) = &raw.workspace
                         && !excluded(ws, &dir, start)
                     {
-                        found = Some((dir.clone(), id, Some(ws)));
+                        found = Some((dir.clone_in(alloc), id, Some(ws)));
                     }
                 }
             }
@@ -718,7 +724,7 @@ impl<'l, 'a> Passing<'l, 'a> {
         match (found, waiting) {
             (Some(found), _) => Ok(Some(found)),
             (None, true) => Ok(None),
-            (None, false) => Ok(Some((start.clone(), start_id, None))),
+            (None, false) => Ok(Some((start.clone_in(alloc), start_id, None))),
         }
     }
 
@@ -789,7 +795,7 @@ impl<'l, 'a> Passing<'l, 'a> {
             return Ok(false);
         }
         for dir in dirs.iter() {
-            out.push(dir.clone());
+            out.push(dir.clone_in(alloc));
         }
         Ok(true)
     }
@@ -847,9 +853,9 @@ impl<'l, 'a> Passing<'l, 'a> {
         };
         let version = match &package.version {
             RawVersion::Absent => None,
-            RawVersion::Written(version) => Some(version.clone()),
+            RawVersion::Written(version) => Some(version.clone_in(alloc)),
             RawVersion::Inherited(span) => match ws.and_then(|ws| ws.version.as_ref()) {
-                Some(version) => Some(version.clone()),
+                Some(version) => Some(version.clone_in(alloc)),
                 None => return Err(LayoutError::NotInherited { at: *span, key: "version" }),
             },
         };
@@ -857,7 +863,7 @@ impl<'l, 'a> Passing<'l, 'a> {
         let mut values: [Text<'a>; 8] = core::array::from_fn(|_| String::new_in(alloc));
         for (at, raw) in package.meta.iter().enumerate() {
             values[at] = match raw {
-                RawMeta::Written(value) => value.clone(),
+                RawMeta::Written(value) => value.clone_in(alloc),
                 RawMeta::Inherited(span) => match ws.and_then(|ws| ws.meta[at].as_ref()) {
                     None => return Err(LayoutError::NotInherited { at: *span, key: META_KEYS[at] }),
                     // A path the root states is the root's: made relative to this package's
@@ -866,7 +872,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                         let from_anchor = self.rooted(root_dir, value, *span)?;
                         meta::relative_to(&from_anchor, &found.dir, alloc)
                     }
-                    Some(value) => value.clone(),
+                    Some(value) => value.clone_in(alloc),
                 },
                 // Unstated: the first default readme that is a file in the package's directory.
                 RawMeta::Absent if at == meta::README => match self.list(&found.dir) {
@@ -895,7 +901,10 @@ impl<'l, 'a> Passing<'l, 'a> {
         // Cargo Book, "Features", "Optional dependencies"). Every edition has them: the
         // proposed 2024 removal did not ship, and tempo (edition 2024) asks for one
         // (`tempo-dkg-onchain-artifacts`'s `commonware-consensus`).
-        let mut features = package.features.clone();
+        let mut features = Vec::with_capacity_in(package.features.len(), alloc);
+        for feature in package.features.iter() {
+            features.push(feature.clone_in(alloc));
+        }
         for dep in dependencies.iter().filter(|dep| dep.optional) {
             let named = package.features.iter().any(|feature| {
                 feature.enables.iter().any(|enables| enables.strip_prefix("dep:") == Some(dep.name.as_str()))
@@ -906,13 +915,13 @@ impl<'l, 'a> Passing<'l, 'a> {
                 let mut turn_on = String::from_str_in("dep:", alloc);
                 turn_on.push_str(&dep.name);
                 enables.push(turn_on);
-                features.push(Feature { name: dep.name.clone(), enables, span: dep.span });
+                features.push(Feature { name: dep.name.clone_in(alloc), enables, span: dep.span });
             }
         }
         Ok(Some(Member {
-            dir: found.dir.clone(),
+            dir: found.dir.clone_in(alloc),
             manifest: found.id,
-            name: package.name.clone(),
+            name: package.name.clone_in(alloc),
             span: package.span,
             edition,
             edition_span,
@@ -923,7 +932,7 @@ impl<'l, 'a> Passing<'l, 'a> {
             dependencies,
             features,
             build,
-            links: package.links.clone(),
+            links: package.links.as_ref().map(|s| s.clone_in(alloc)),
             version,
             meta,
         }))
@@ -949,7 +958,7 @@ impl<'l, 'a> Passing<'l, 'a> {
         // `src/bin/<name>/main.rs`, each (name, root).
         let mut inferred: Vec<(Text<'a>, Text<'a>), Alloc<'a>> = Vec::new_in(alloc);
         if has(src_entries, "main.rs", false) {
-            inferred.push((package.name.clone(), file(&src, "main.rs", alloc)));
+            inferred.push((package.name.clone_in(alloc), file(&src, "main.rs", alloc)));
         }
         if has(src_entries, "bin", true) {
             let bin = file(&src, "bin", alloc);
@@ -973,7 +982,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                             None => return Ok(None),
                             Some(sub_entries) => {
                                 if has(sub_entries, "main.rs", false) {
-                                    inferred.push((name.clone(), file(&sub, "main.rs", alloc)));
+                                    inferred.push((name.clone_in(alloc), file(&sub, "main.rs", alloc)));
                                 }
                             }
                         }
@@ -1017,8 +1026,8 @@ impl<'l, 'a> Passing<'l, 'a> {
                 if !taken {
                     // A binary found by its file has no table, so no `required-features`.
                     bins.push(Target {
-                        name: name.clone(),
-                        root: root.clone(),
+                        name: name.clone_in(alloc),
+                        root: root.clone_in(alloc),
                         span: package.span,
                         found: true,
                         proc_macro: false,
@@ -1036,21 +1045,22 @@ impl<'l, 'a> Passing<'l, 'a> {
         dir: &str,
         inferred: &[(Text<'a>, Text<'a>)],
     ) -> Result<Target<'a>, LayoutError<'a>> {
+        let alloc = self.alloc();
         let Some(name) = &bin.name else { return Err(LayoutError::NoTargetFile { at: bin.span }) };
         let root = match &bin.path {
             Some(path) => self.rooted(dir, path, bin.span)?,
             None => match inferred.iter().find(|(n, _)| n == name) {
-                Some((_, root)) => root.clone(),
+                Some((_, root)) => root.clone_in(alloc),
                 None => return Err(LayoutError::NoTargetFile { at: bin.span }),
             },
         };
         Ok(Target {
-            name: name.clone(),
+            name: name.clone_in(alloc),
             root,
             span: bin.span,
             found: false,
             proc_macro: false,
-            required_features: bin.required_features.clone(),
+            required_features: bin.required_features.clone_in(alloc),
         })
     }
 
@@ -1086,31 +1096,34 @@ impl<'l, 'a> Passing<'l, 'a> {
                         Some(index) => Source::Member(index),
                         None => Source::Path(joined),
                     },
-                    None => Source::Outside(path.clone()),
+                    None => Source::Outside(path.clone_in(alloc)),
                 }
             }
-            (None, Some((url, reference))) => Source::Git { url: url.clone(), reference: reference.clone() },
-            (None, None) => Source::Registry { req: from.version.clone(), registry: from.registry.clone() },
+            (None, Some((url, reference))) => Source::Git { url: url.clone_in(alloc), reference: reference.clone_in(alloc) },
+            (None, None) => Source::Registry {
+                req: from.version.as_ref().map(|s| s.clone_in(alloc)),
+                registry: from.registry.as_ref().map(|s| s.clone_in(alloc)),
+            },
         };
-        let mut features = from.features.clone();
+        let mut features = from.features.clone_in(alloc);
         if dep.workspace {
             for feature in dep.features.iter() {
-                features.push(feature.clone());
+                features.push(feature.clone_in(alloc));
             }
         }
         let package = match &from.package {
-            Some(package) => package.clone(),
-            None => dep.key.clone(),
+            Some(package) => package.clone_in(alloc),
+            None => dep.key.clone_in(alloc),
         };
         let default_features = match dep.workspace {
             true => from.default_features.unwrap_or(true),
             false => dep.default_features.unwrap_or(true),
         };
         Ok(Dependency {
-            name: dep.key.clone(),
+            name: dep.key.clone_in(alloc),
             package,
             kind: dep.kind,
-            target: dep.target.clone(),
+            target: dep.target.as_ref().map(|s| s.clone_in(alloc)),
             source,
             optional: dep.optional,
             default_features,
@@ -1149,7 +1162,7 @@ fn dep_path<'a>(
 /// The library's name: `[lib] name`, else the package's with `-` as `_`.
 fn lib_name<'a>(written: Option<&Text<'a>>, package: &str, alloc: Alloc<'a>) -> Text<'a> {
     if let Some(name) = written {
-        return name.clone();
+        return name.clone_in(alloc);
     }
     let mut name = String::new_in(alloc);
     for ch in package.chars() {

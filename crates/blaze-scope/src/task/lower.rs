@@ -1561,7 +1561,7 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
         name: None,
         file: root,
         item: None,
-        dir: root_dir.clone(),
+        dir: root_dir.clone_in(alloc),
         path_dir: root_dir,
         no_implicit_prelude: root_attrs.no_implicit_prelude,
         path: copied(name, alloc),
@@ -1574,7 +1574,7 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
     while at < tree.modules.len() {
         let m = &tree.modules[at];
         let (file, item, key) = (m.file, m.item, m.key);
-        let (dir, path_dir, mpath) = (m.dir.clone(), m.path_dir.clone(), m.path.clone());
+        let (dir, path_dir, mpath) = (m.dir.clone_in(alloc), m.path_dir.clone_in(alloc), m.path.clone_in(alloc));
         let o = files.outline(file);
         let text = files.text(file);
         for (idx, child) in o.children(item) {
@@ -1599,7 +1599,7 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
                 break;
             }
             let ckey = key_of(krate, key, "mod", name, 0);
-            let mut cpath = mpath.clone();
+            let mut cpath = mpath.clone_in(alloc);
             cpath.push_str("::");
             cpath.push_str(name);
             if inline {
@@ -1617,7 +1617,7 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
                     name: Some(name),
                     file,
                     item: Some(idx),
-                    dir: d.clone(),
+                    dir: d.clone_in(alloc),
                     path_dir: d,
                     no_implicit_prelude: attrs.no_implicit_prelude,
                     path: cpath,
@@ -1626,9 +1626,9 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
             }
             let (target, cdir, cpdir) = if let Some(p) = attrs.path {
                 let target = joined(&path_dir, &[p], alloc);
-                let mut parent = target.clone();
+                let mut parent = target.clone_in(alloc);
                 pop_dir(&mut parent);
-                (target, parent.clone(), parent)
+                (target, parent.clone_in(alloc), parent)
             } else {
                 let mut file_name = AString::new_in(alloc);
                 file_name.push_str(name);
@@ -1639,18 +1639,18 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
                 match (files.find(&a).is_some(), files.find(&b).is_some()) {
                     (true, true) => {
                         tree.notes.push(WalkNote::BothFiles { at: loc });
-                        (a, sub, dir.clone())
+                        (a, sub, dir.clone_in(alloc))
                     }
                     (true, false) => {
                         tree.missing.push(b);
-                        (a, sub, dir.clone())
+                        (a, sub, dir.clone_in(alloc))
                     }
                     (false, true) => {
                         tree.missing.push(a);
-                        (b, sub.clone(), sub)
+                        (b, sub.clone_in(alloc), sub)
                     }
                     (false, false) => {
-                        tree.notes.push(WalkNote::NeitherFile { at: loc, name, rs: a.clone(), mod_rs: b.clone() });
+                        tree.notes.push(WalkNote::NeitherFile { at: loc, name, rs: a.clone_in(alloc), mod_rs: b.clone_in(alloc) });
                         tree.missing.push(a);
                         tree.missing.push(b);
                         continue;
@@ -1658,7 +1658,7 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
                 }
             };
             let Some(cfile) = files.find(&target) else {
-                tree.missing.push(target.clone());
+                tree.missing.push(target.clone_in(alloc));
                 tree.notes.push(WalkNote::PathFileNotFound { at: loc, path: target });
                 continue;
             };
@@ -2730,7 +2730,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                     match leaves.as_slice() {
                         [UseLeaf { abs, segments, form: UseForm::Glob }] => {
                             let loc = self.loc(at);
-                            self.out.prelude = Some(PreludeImport { abs: *abs, segments: segments.clone(), loc });
+                            self.out.prelude = Some(PreludeImport { abs: *abs, segments: segments.clone_in(self.alloc), loc });
                         }
                         _ => self.note(LowerNoteKind::PreludeImportNotOneGlob, at, tree_text),
                     }

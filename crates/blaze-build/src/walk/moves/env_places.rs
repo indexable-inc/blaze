@@ -89,9 +89,9 @@ pub(in crate::walk) struct EnvPlaces<A: Allocator> {
     owned: Vec<Option<EnvOwned>, A>,
 }
 
-impl<A: Allocator + Clone> EnvPlaces<A> {
+impl<A: Allocator + Copy> EnvPlaces<A> {
     pub(in crate::walk) fn new_in(alloc: A) -> Self {
-        EnvPlaces { env: Vec::new_in(alloc.clone()), at: Vec::new_in(alloc.clone()), owned: Vec::new_in(alloc) }
+        EnvPlaces { env: Vec::new_in(alloc), at: Vec::new_in(alloc), owned: Vec::new_in(alloc) }
     }
 }
 
@@ -103,7 +103,7 @@ fn path_error(e: ExprId, error: PathError) -> BuildError {
     }
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The offset of field `field` of variant `variant` of a value of ground type `g`, its row,
     /// and whether `g` implements `Drop`: walk.rs `decl_field`, the one lookup by declaration
     /// index (closure.rs `field_offset` is it too). Refused: a union's field and an enum

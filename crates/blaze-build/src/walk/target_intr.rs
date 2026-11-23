@@ -55,7 +55,7 @@ enum Operand {
     At(Value),
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Target intrinsic call `e` of `t`, its arguments `list` on top of the value stack.
     pub(super) fn target_intrinsic(&mut self, e: ExprId, list: &[ExprId], t: Target) -> Result<(), BuildError> {
         match t {

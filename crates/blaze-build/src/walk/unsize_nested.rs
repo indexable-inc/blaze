@@ -76,7 +76,7 @@ fn offset_by((p, off): (Value, i32), by: u32) -> Result<(Value, i32), BuildError
     Ok((p, off))
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Adjustment `n` of `e`, an unsizing of the value on top (a thin or wide pointer, or a
     /// struct holding one, any depth): the target value is built in a fresh temporary: the
     /// other fields moved to their offsets in the target, then the pointer's two words.
@@ -260,7 +260,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             };
             let (types, last_ty) = (adt.types, last.ty);
             let full = || malformed("a struct's arguments past the ground table");
-            let mut args: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc.clone());
+            let mut args: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc);
             args.extend_from_slice(self.ground.view().list(lf).map_err(|_| full())?);
             let tf = ground(types, last_ty, &args, self.ground, self.scratch, self.adts.facts())?;
             args.clear();
@@ -292,7 +292,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     (_, None) => return Err(refused(e, None, "an unsizing to a trait object of auto traits alone (no principal trait)")),
                     (Some((a, _)), Some((b, _))) if a == b => vt,
                     (Some((a, _)), Some((b, _))) => {
-                        let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.alloc.clone())
+                        let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.alloc)
                             .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
                         match shape.upcast(b) {
                             Some(crate::vtable::Upcast::Prefix) => vt,

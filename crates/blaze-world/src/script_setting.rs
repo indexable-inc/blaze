@@ -44,13 +44,13 @@ pub(crate) fn toolchain_of(krate: &Crate<'_>, side: Side) -> bool {
 /// The pinned rows whose `needs` `shipped` holds, keyed for `triple`, and one ships fact per
 /// shipped crate, unsorted.
 pub fn pinned_table<'a, 's>(triple: &str, shipped: impl Iterator<Item = &'s str> + Clone, alloc: Alloc<'a>) -> AVec<'a, Row> {
-    let mut known = AVec::new_in(alloc.clone());
+    let mut known = AVec::new_in(alloc);
     for row in blaze_build_script::pinned::TEMPO {
         if row.needs.iter().all(|needed| shipped.clone().any(|name| name == *needed)) {
             known.push(*row);
         }
     }
-    let mut rows = blaze_build_script::probe::pinned_rows(triple, &known, alloc.clone());
+    let mut rows = blaze_build_script::probe::pinned_rows(triple, &known, alloc);
     rows.extend_from_slice(&ships_rows(triple, shipped, alloc));
     rows
 }
@@ -127,14 +127,14 @@ pub(crate) fn feature_table_by<'w, 'a, S: FeatureRecords>(
     alloc: Alloc<'a>,
     scan: impl FnOnce(&[Phase<'a>], Alloc<'a>) -> Result<AVec<'a, PhaseListing<'w, 'a>>, ProbeTableError<'w, 'a>>,
 ) -> Result<AVec<'a, Row>, FeatureTableError<'w, 'a, S::Error>> {
-    let phases = lib_features_record::phases(world, side, alloc.clone());
-    let key = features_key(world, &phases, triple, tool, alloc.clone()).map_err(FeatureTableError::Key)?;
+    let phases = lib_features_record::phases(world, side, alloc);
+    let key = features_key(world, &phases, triple, tool, alloc).map_err(FeatureTableError::Key)?;
     if let Some(bytes) = records.get(key).map_err(|why| FeatureTableError::Store { key, why })? {
-        let listed = lib_features_record::decode(key, bytes, alloc.clone()).map_err(FeatureTableError::Record)?;
+        let listed = lib_features_record::decode(key, bytes, alloc).map_err(FeatureTableError::Record)?;
         return Ok(rows_of(triple, &listed, alloc));
     }
-    let listed = scan(&phases, alloc.clone()).map_err(FeatureTableError::Scan)?;
-    let bytes = lib_features_record::encode(key, &listed, alloc.clone()).map_err(FeatureTableError::Record)?;
+    let listed = scan(&phases, alloc).map_err(FeatureTableError::Scan)?;
+    let bytes = lib_features_record::encode(key, &listed, alloc).map_err(FeatureTableError::Record)?;
     records.put(key, &bytes).map_err(|why| FeatureTableError::Store { key, why })?;
     Ok(rows_of(triple, &listed, alloc))
 }
@@ -143,8 +143,8 @@ pub(crate) fn feature_table_by<'w, 'a, S: FeatureRecords>(
 /// read from the shelf's trees alone (`ShelfTexts`, the trees the key covers).
 pub(crate) fn scan_phases<'w, 'a>(world: &World<'w>, phases: &[Phase<'_>], triple: &'w str, alloc: Alloc<'a>) -> Result<AVec<'a, PhaseListing<'w, 'a>>, ProbeTableError<'w, 'a>> {
     let texts = ShelfTexts::new(&world.texts);
-    let mut features = LibFeatures::new(LibFeaturesOpts { alloc: alloc.clone() });
-    let mut out = AVec::with_capacity_in(phases.len(), alloc.clone());
+    let mut features = LibFeatures::new(LibFeaturesOpts { alloc });
+    let mut out = AVec::with_capacity_in(phases.len(), alloc);
     for phase in phases {
         for &at in phase.crates.iter() {
             let krate = &world.crates[at];
@@ -155,15 +155,15 @@ pub(crate) fn scan_phases<'w, 'a>(world: &World<'w>, phases: &[Phase<'_>], tripl
             if !staged {
                 continue;
             }
-            let mut atoms = AVec::new_in(alloc.clone());
+            let mut atoms = AVec::new_in(alloc);
             atoms.extend_from_slice(krate.input.cfg);
             atoms.extend(krate.input.features.iter().map(|feature| ("feature", Some(*feature))));
-            let cfg = blaze_scope::task::Cfg::from_atoms(&atoms, alloc.clone());
+            let cfg = blaze_scope::task::Cfg::from_atoms(&atoms, alloc);
             if let Err(why) = features.scan(&texts, at, krate.input.root, &cfg) {
                 return Err(ProbeTableError { triple, krate: krate.input.name, why });
             }
         }
-        let listed = features.listed(alloc.clone());
+        let listed = features.listed(alloc);
         out.push(PhaseListing { needs: phase.needs, declared: listed.declared, mentioned: listed.mentioned });
     }
     Ok(out)
@@ -171,9 +171,9 @@ pub(crate) fn scan_phases<'w, 'a>(world: &World<'w>, phases: &[Phase<'_>], tripl
 
 /// Each phase's rows (`probe_ask::feature_rows`), in phase order.
 fn rows_of<'a>(triple: &str, listed: &[PhaseListing<'_, '_>], alloc: Alloc<'a>) -> AVec<'a, Row> {
-    let mut rows = AVec::new_in(alloc.clone());
+    let mut rows = AVec::new_in(alloc);
     for phase in listed {
-        rows.extend_from_slice(&feature_rows(triple, phase.needs, &phase.declared, &phase.mentioned, alloc.clone()));
+        rows.extend_from_slice(&feature_rows(triple, phase.needs, &phase.declared, &phase.mentioned, alloc));
     }
     rows
 }
@@ -188,7 +188,7 @@ pub fn probe_table<'w, 'a, S: FeatureRecords>(
     records: &mut S,
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, Row>, FeatureTableError<'w, 'a, S::Error>> {
-    let mut rows = pinned_table(triple, shipped(world, side), alloc.clone());
+    let mut rows = pinned_table(triple, shipped(world, side), alloc);
     rows.extend_from_slice(&feature_table(world, side, triple, tool, records, alloc)?);
     rows.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(rows)
@@ -287,8 +287,8 @@ mod setup {
             records: &mut S,
         ) -> Result<ScriptSetup<'a, R>, ScriptSetupError<'w, 'a, S::Error>> {
             let ScriptSetupOpts { world, target, macro_target, native, alloc } = opts;
-            let table = probe_table(world, Side::Target, target, tool, records, alloc.clone()).map_err(ScriptSetupError::Table)?;
-            let macro_table = probe_table(world, Side::Macro, macro_target, tool, records, alloc.clone()).map_err(ScriptSetupError::Table)?;
+            let table = probe_table(world, Side::Target, target, tool, records, alloc).map_err(ScriptSetupError::Table)?;
+            let macro_table = probe_table(world, Side::Macro, macro_target, tool, records, alloc).map_err(ScriptSetupError::Table)?;
             let spawn = command_spawn_setting(target, alloc).map_err(ScriptSetupError::Spawn)?;
             let native = match native {
                 Ok(opts) => NativeRun::new(opts).map_err(NativeRefused::Open),

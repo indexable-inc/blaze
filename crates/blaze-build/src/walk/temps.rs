@@ -56,7 +56,7 @@ const SCOPE: u8 = 1;
 /// Such a scope, entered: its walk is under way or done (each expression is walked once).
 const OPENED: u8 = 2;
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Temporary `e` (its value at `at`, held as `repr`, which needs drop), borrowed: an
     /// extended one joins its `let`'s block (`extended_by`), any other its temporary scope
     /// (`temp_anchor`); each is dropped at that scope's end.
@@ -273,7 +273,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             return Ok(());
         }
         let body = self.body;
-        let mut todo: Vec<(ExprId, bool), A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<(ExprId, bool), A> = Vec::new_in(self.alloc);
         todo.push((init, false));
         while let Some((x, under)) = todo.pop() {
             match self.expr(x)? {

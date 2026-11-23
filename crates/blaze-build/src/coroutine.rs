@@ -204,7 +204,7 @@ pub(super) fn own_block(types: PTys<'_>, t: PTy) -> Option<ExprId> {
 
 use super::signature_error as co_err;
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The ground type of `async` block `e` of this body: its identity at this instance's
     /// arguments ([`identity`]). Its output is the world's fact of that identity
     /// ([`Self::coroutine_parts`]).
@@ -226,7 +226,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let c = facts
             .coroutine(of.owner, of.ordinal)
             .ok_or(TyErr::Unsupported("a coroutine whose facts the world did not answer (`LayoutFacts::coroutine`)"))?;
-        let mut a: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut a: Vec<PTy, A> = Vec::new_in(self.alloc);
         a.extend_from_slice(self.ground.view().list(of.owner_args).map_err(|_| TyErr::Malformed("a list past the ground table"))?);
         let env = crate::instance::ground(c.types, c.env, &a, self.ground, self.scratch, facts).map_err(TyErr::Other)?;
         let output = crate::instance::ground(c.types, c.output, &a, self.ground, self.scratch, facts).map_err(TyErr::Other)?;
@@ -323,9 +323,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let n = self.body.exprs.len();
         // Per expression: 0 not known yet, 1 inside the block, 2 outside it. Each expression's
         // side is found once, walking up its parents to one whose side is known.
-        let mut side: Vec<u8, A> = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut side: Vec<u8, A> = Vec::with_capacity_in(n, self.alloc);
         side.resize(n, 0);
-        let mut path: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut path: Vec<u32, A> = Vec::new_in(self.alloc);
         for (i, x) in self.body.exprs.iter().enumerate() {
             let Expr::Local(p) = *x else { continue };
             path.clear();
@@ -386,8 +386,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         // holding a place below its binding (`x.a`, `(*r).b`: RFC 2229, "Async blocks capture
         // variables from their environment using the same capture modes as closures") is the
         // place's address or value (walk/moves/env_places.rs `store_env_place`), as a closure's.
-        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc.clone());
-        let mut caps = Vec::new_in(self.alloc.clone());
+        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc);
+        let mut caps = Vec::new_in(self.alloc);
         for f in self.checked.env_fields(e) {
             fields.push(f);
             caps.push((f.base, f.how));
@@ -482,7 +482,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let entry = self.create();
         self.reached[entry.index()] = true;
         self.begin(entry);
-        let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc);
         for p in params.iter() {
             values.push(self.b.param(p.ty));
         }
@@ -523,7 +523,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         // suspension unless moved out (`Held::EnvPlace`); a whole binding is noted beside them
         // for `cover`. A drop flag (a move under a branch) is no saved local: read after a
         // suspension it is refused by name (`UNNAMED_ACROSS`), as a whole binding's field word.
-        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc.clone());
+        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc);
         for f in self.checked.env_fields(block) {
             fields.push(f);
         }
@@ -603,7 +603,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let reference = self.b.reference(RefKind::Func, place);
         let resume = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR); 3], &[]);
         self.b.call(Flags::NONE, reference, resume, &[result, state, cx]);
-        let mut returned = Vec::with_capacity_in(2, self.alloc.clone());
+        let mut returned = Vec::with_capacity_in(2, self.alloc);
         if self.ret_pass != Pass::Ref {
             self.pass_arg(V::Place(result, 0), self.ret, self.ret_pass, &mut returned)?;
         }
@@ -874,7 +874,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 /// shape and niche are the laid ones; with `None` (this crate's unit tests, which have no
 /// recipe) the split lays the state itself. The split functions name their callees by the
 /// body's reference places, so each carries the body's tables.
-pub(crate) fn build<A: Allocator + Clone>(
+pub(crate) fn build<A: Allocator + Copy>(
     body: &BodyView<'_>,
     checked: &Checked<'_>,
     ordinal: u32,
@@ -895,8 +895,8 @@ pub(crate) fn build<A: Allocator + Clone>(
         other => BuildError::Lir(other),
     };
     let (func, shape, refs, statics, thread_locals, vtables, names, copy_insts) = {
-        let mut w = Walk::new(&view, checked, &mut *subst, adts, alloc.clone());
-        w.names = plan.map(|p| super::state_names::Names::new(p.names, p.plant, root, alloc.clone()));
+        let mut w = Walk::new(&view, checked, &mut *subst, adts, alloc);
+        w.names = plan.map(|p| super::state_names::Names::new(p.names, p.plant, root, alloc));
         w.scan_flags()?;
         let shape = w.run_coroutine(block)?;
         // `poll` on a finished state: the library's two panics, when it declares them.
@@ -916,10 +916,10 @@ pub(crate) fn build<A: Allocator + Clone>(
                 size: l.shape.size,
                 align: l.shape.align,
             };
-            let slot_names = n.slot_names(alloc.clone());
-            blaze_lir::coroutine::split_in(func.view(), shape, panics, region, &slot_names, alloc.clone()).map_err(|error| n.split_err(error))?
+            let slot_names = n.slot_names(alloc);
+            blaze_lir::coroutine::split_in(func.view(), shape, panics, region, &slot_names, alloc).map_err(|error| n.split_err(error))?
         }
-        (None, None) => blaze_lir::coroutine::split_with(func.view(), shape, panics, alloc.clone()).map_err(BuildError::Coroutine)?,
+        (None, None) => blaze_lir::coroutine::split_with(func.view(), shape, panics, alloc).map_err(BuildError::Coroutine)?,
         _ => return Err(malformed("a coroutine's state plan and its walk's names out of step")),
     };
     let (state, niche) = match plan {
@@ -927,7 +927,7 @@ pub(crate) fn build<A: Allocator + Clone>(
         None => (StateShape::of(&split.layout), crate::niche_of(&split.layout)),
     };
     let poll = {
-        let mut w = Walk::new(&view, checked, &mut *subst, adts, alloc.clone());
+        let mut w = Walk::new(&view, checked, &mut *subst, adts, alloc);
         w.run_poll_entry(block)?;
         w.into_built()?
     };
@@ -935,13 +935,18 @@ pub(crate) fn build<A: Allocator + Clone>(
     // the walk's one for one, so they carry no trap table (a fault there names no construct).
     // The split's two functions verified here, once (D163): blaze-lir's split checks its output
     // in debug builds only, and the emitter takes nothing unproven.
+    fn copy_slice<T: Copy, A: Allocator>(slice: &[T], alloc: A) -> Vec<T, A> {
+        let mut out = Vec::with_capacity_in(slice.len(), alloc);
+        out.extend_from_slice(slice);
+        out
+    }
     let resume = Built {
         func: blaze_lir::VerifiedFunc::new(split.poll).map_err(BuildError::Verify)?,
-        refs: refs.clone(),
-        statics: statics.clone(),
-        thread_locals: thread_locals.clone(),
-        vtables: vtables.clone(),
-        traps: Vec::new_in(alloc.clone()),
+        refs: copy_slice(&refs, alloc),
+        statics: copy_slice(&statics, alloc),
+        thread_locals: copy_slice(&thread_locals, alloc),
+        vtables: copy_slice(&vtables, alloc),
+        traps: Vec::new_in(alloc),
         copy_insts,
     };
     let drop = Built { func: blaze_lir::VerifiedFunc::new(split.drop).map_err(BuildError::Verify)?, refs, statics, thread_locals, vtables, traps: Vec::new_in(alloc), copy_insts };

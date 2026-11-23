@@ -2,6 +2,7 @@ use crate::resolver::{FixedState, Map, MapOpts, Set};
 use std::alloc::Global;
 use std::collections::BTreeMap;
 
+use blaze_own::Share;
 use blaze_trace::trace;
 
 use super::context::ResolverContext;
@@ -198,14 +199,14 @@ impl ConflictCache {
     /// all the `PackageId` entries are activated.
     pub(super) fn insert(&mut self, dep: &Dependency, con: &ConflictMap) {
         self.con_from_dep
-            .entry(dep.clone())
+            .entry(dep.share())
             .or_insert_with(|| ConflictStoreTrie::Node(BTreeMap::new()))
             .insert(con.keys().cloned(), con.clone());
 
         trace!("{} = \"{}\" adding a skip {:?}", dep.package_name(), dep.version_req(), con);
 
         for c in con.keys() {
-            self.dep_from_pid.entry(*c).or_default().insert(dep.clone());
+            self.dep_from_pid.entry(*c).or_default().insert(dep.share());
         }
     }
 

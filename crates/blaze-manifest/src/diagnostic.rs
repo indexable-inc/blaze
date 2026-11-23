@@ -55,7 +55,7 @@ impl ManifestDiagnostic {
     /// `contents`, the manifest at `path`, does not fit the schema.
     pub(crate) fn schema(error: SchemaError, contents: &str, path: &Path) -> ManifestError {
         ManifestDiagnostic {
-            span: error.span.clone(),
+            span: error.span.start..error.span.end,
             what: DiagnosticWhat::Schema(error),
             path: path.to_owned(),
             contents: contents.to_owned(),
@@ -76,7 +76,7 @@ impl ManifestDiagnostic {
         let path = crate::paths::relative_to(&self.path, cwd).unwrap_or_else(|| self.path.clone());
         let message = self.what.to_string();
         let path = path.display().to_string();
-        snippet::with_span(snippet::Level::Error, &message, &path, &self.contents, self.span.clone())
+        snippet::with_span(snippet::Level::Error, &message, &path, &self.contents, self.span.start..self.span.end)
     }
 }
 
