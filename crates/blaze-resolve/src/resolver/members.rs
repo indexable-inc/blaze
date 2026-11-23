@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::rc::Rc;
 
+use blaze_own::LocalShare;
+
 use super::features::CliFeatures;
 use super::{CargoResult, FixedState, Map, MapOpts, Set};
 use crate::dependency::Dependency;
@@ -62,7 +64,7 @@ fn collect_matching_features(
     found_features: &mut BTreeSet<FeatureValue>,
 ) -> CliFeatures {
     if cli_features.features.is_empty() {
-        return cli_features.clone();
+        return cli_features.local_share();
     }
 
     // Features defined in the manifest
@@ -93,8 +95,8 @@ fn collect_matching_features(
             FeatureValue::Feature(f) => {
                 if summary_or_opt_dependency_feature(f) {
                     // feature exists in this member.
-                    features.insert(feature.clone());
-                    found_features.insert(feature.clone());
+                    features.insert(*feature);
+                    found_features.insert(*feature);
                 }
             }
             // This should be enforced by CliFeatures.
@@ -103,8 +105,8 @@ fn collect_matching_features(
                 if dependencies.contains_key(dep_name) {
                     // pkg/feat for a dependency.
                     // Will rely on the dependency resolver to validate `dep_feature`.
-                    features.insert(feature.clone());
-                    found_features.insert(feature.clone());
+                    features.insert(*feature);
+                    found_features.insert(*feature);
                 } else if *dep_name == member.name()
                     && summary_or_opt_dependency_feature(dep_feature)
                 {
@@ -113,7 +115,7 @@ fn collect_matching_features(
                     // `weak` can be ignored here, because the member
                     // either is or isn't being built.
                     features.insert(FeatureValue::Feature(*dep_feature));
-                    found_features.insert(feature.clone());
+                    found_features.insert(*feature);
                 }
             }
         }
@@ -392,7 +394,7 @@ fn members_with_features_old<'a>(
     for feature in cli_features.features.iter() {
         match feature {
             FeatureValue::Feature(_) => {
-                cwd_features.insert(feature.clone());
+                cwd_features.insert(*feature);
             }
             // This should be enforced by CliFeatures.
             FeatureValue::Dep { .. } => panic!("unexpected dep: syntax {}", feature),
@@ -412,7 +414,7 @@ fn members_with_features_old<'a>(
                         .or_default()
                         .insert(FeatureValue::Feature(*dep_feature));
                 } else {
-                    cwd_features.insert(feature.clone());
+                    cwd_features.insert(*feature);
                 }
             }
         }

@@ -263,7 +263,7 @@ impl<'a> Lock<'a> {
                     Some(id) => found.push(id),
                     None => {
                         let package = &lock.packages[at];
-                        return Err(LockRefused::Dangling { line: package.line, package: package.name.clone(), dep: text_in(entry) });
+                        return Err(LockRefused::Dangling { line: package.line, package: package.name.clone_in(alloc), dep: text_in(entry) });
                     }
                 }
             }

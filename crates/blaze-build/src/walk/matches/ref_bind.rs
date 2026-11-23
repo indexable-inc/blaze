@@ -37,7 +37,7 @@ use super::super::{V, Walk, malformed};
 use super::At;
 use crate::BuildError;
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether `let pat = init;` binds at `init`'s place: `pat` holds an explicit `ref` or
     /// `ref mut` binding and `init` is a place expression with no adjustment. A pure fact of the
     /// body, asked twice (walk.rs `stmt`, which then builds `init` by `Task::Place`, and
@@ -46,7 +46,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         if !self.adjust_rows(init).is_empty() || !self.is_place_expr(init)? {
             return Ok(false);
         }
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(pat);
         while let Some(p) = todo.pop() {
             match self.pat(p)? {
@@ -76,7 +76,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// place is not the binder's own, so nothing in it moves or is dropped here.
     pub(in crate::walk) fn bind_let_place(&mut self, pat: PatId, v: V) -> Result<(), BuildError> {
         // A by-value binding of a part that needs drop: a move out of the place.
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(pat);
         while let Some(p) = todo.pop() {
             match self.pat(p)? {

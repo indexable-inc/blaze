@@ -105,7 +105,7 @@ fn float_size(p: Prim) -> Option<u8> {
 }
 
 /// The class of ground type `ty`.
-pub fn class_of<A: Allocator + Clone>(ls: &mut Layouts<A>, ty: PTy, cx: &mut LayoutCx<'_, '_>, scratch: A) -> Result<Class, CAbiError> {
+pub fn class_of<A: Allocator + Copy>(ls: &mut Layouts<A>, ty: PTy, cx: &mut LayoutCx<'_, '_>, scratch: A) -> Result<Class, CAbiError> {
     let id = ls.of(ty, cx)?;
     let l = *ls.get(id);
     let refused = |why| CAbiError::Refused { ty, why };
@@ -117,7 +117,7 @@ pub fn class_of<A: Allocator + Clone>(ls: &mut Layouts<A>, ty: PTy, cx: &mut Lay
     }
     // Every type met by value, by an explicit stack: unions and enums of fields refused; the
     // fundamental members counted, each a scalar layout (a newtype of one included).
-    let mut stack: Vec<PTy, A> = Vec::new_in(scratch.clone());
+    let mut stack: Vec<PTy, A> = Vec::new_in(scratch);
     let mut parts: Vec<PTy, A> = Vec::new_in(scratch);
     stack.push(ty);
     let mut float: Option<u8> = None;

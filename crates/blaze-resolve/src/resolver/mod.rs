@@ -68,6 +68,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use std::alloc::Global;
+use blaze_own::{LocalShare, Share};
 use blaze_trace::{debug, trace};
 
 use crate::interning::InternedString;
@@ -224,7 +225,7 @@ fn activate_deps_loop(
     // Activate all the initial summaries to kick off some work.
     for (summary, opts) in summaries {
         debug!("initial activation: {}", summary.package_id());
-        let res = activate(&mut resolver_ctx, registry, None, summary.clone(), first_version, opts);
+        let res = activate(&mut resolver_ctx, registry, None, summary.share(), first_version, opts);
         match res {
             Ok(Some((frame, _))) => remaining_deps.push(frame),
             Ok(None) => (),
@@ -388,7 +389,7 @@ fn activate_deps_loop(
                 Some(BacktrackFrame {
                     context: ResolverContext::clone(&resolver_ctx),
                     remaining_deps: remaining_deps.clone(),
-                    remaining_candidates: remaining_candidates.clone(),
+                    remaining_candidates: remaining_candidates.local_share(),
                     parent: Summary::clone(&parent),
                     dep: Dependency::clone(&dep),
                     features: Rc::clone(&features),
@@ -463,7 +464,7 @@ fn activate_deps_loop(
                             conflicting
                                 .iter()
                                 .filter(|&(p, _)| p != &pid)
-                                .map(|(&p, r)| (p, r.clone())),
+                                .map(|(&p, &r)| (p, r)),
                         );
 
                         has_past_conflicting_dep = true;
@@ -489,7 +490,7 @@ fn activate_deps_loop(
                             })
                             .next()
                     {
-                        let rel = conflict.get(&pid).unwrap().clone();
+                        let rel = *conflict.get(&pid).unwrap();
 
                         // The conflict we found is
                         // "other dep will not succeed if we are activated."
@@ -502,7 +503,7 @@ fn activate_deps_loop(
                             conflict
                                 .iter()
                                 .filter(|&(p, _)| p != &pid)
-                                .map(|(&p, r)| (p, r.clone())),
+                                .map(|(&p, &r)| (p, r)),
                         );
                         conflicting_activations.insert(other_parent, rel);
                         has_past_conflicting_dep = true;
@@ -635,7 +636,7 @@ fn activate(
         cx.parents
             .link(candidate_pid, parent_pid)
             // and associate dep with that edge
-            .insert(dep.clone());
+            .insert(dep.share());
     }
 
     let activated = cx.flag_activated(&candidate, opts, parent)?;
@@ -651,7 +652,7 @@ fn activate(
                 return Ok(None);
             }
             trace!("activating {} (replacing {})", replace.package_id(), candidate_pid);
-            replace.clone()
+            replace.share()
         }
         None => {
             if activated {
@@ -714,6 +715,9 @@ struct RemainingCandidates {
     has_another: Option<Summary>,
 }
 
+impl Share for RemainingCandidates {}
+impl LocalShare for RemainingCandidates {}
+
 impl RemainingCandidates {
     fn new(candidates: &Rc<[Summary]>) -> RemainingCandidates {
         RemainingCandidates { remaining: RcVecIter::new(Rc::clone(candidates)), has_another: None }
@@ -775,7 +779,7 @@ impl RemainingCandidates {
             // necessarily return the item just yet. Instead we stash it away to
             // get returned later, and if we replaced something then that was
             // actually the candidate to try first so we return that.
-            if let Some(r) = self.has_another.replace(b.clone()) {
+            if let Some(r) = self.has_another.replace(b.share()) {
                 return Some((r, true));
             }
         }
@@ -801,7 +805,7 @@ fn generalize_conflicting(
     let (backtrack_critical_age, backtrack_critical_id) =
         shortcircuit_max(conflicting_activations.keys().map(|&c| cx.is_active(c).map(|a| (a, c))))?;
     let backtrack_critical_reason: ConflictReason =
-        conflicting_activations[&backtrack_critical_id].clone();
+        conflicting_activations[&backtrack_critical_id];
 
     if cx.parents.is_path_from_to(&parent.package_id(), &backtrack_critical_id) {
         // We are a descendant of the trigger of the problem.
@@ -858,7 +862,7 @@ fn generalize_conflicting(
                 // A + B is redundant but can't be activated, as if
                 // A + B is active then A is active and we know that is not ok.
                 for (_, other) in &others {
-                    con.extend(other.iter().map(|(&id, re)| (id, re.clone())));
+                    con.extend(other.iter().map(|(&id, &re)| (id, re)));
                 }
                 // Now that we have this combined conflict, we can do a substitution:
                 // A dep is equivalent to one of the things it can resolve to.

@@ -33,7 +33,7 @@ use blaze_typeck::{Expr, ExprId, PatId, Stmt, StmtId};
 use super::{Held, Walk, malformed, unsupported};
 use crate::BuildError;
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The `super let` statement whose pattern is `pat` (`BodyView::super_lets`), if any.
     fn super_let_of(&self, pat: PatId) -> Result<Option<StmtId>, BuildError> {
         for &s in self.body.super_lets {

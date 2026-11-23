@@ -20,6 +20,8 @@ pub struct Dependency {
     inner: Arc<Inner>,
 }
 
+impl blaze_own::Share for Dependency {}
+
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 struct Inner {
     /// The name of the package depended on (the `package` key if renamed).

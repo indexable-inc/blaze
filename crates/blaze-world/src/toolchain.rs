@@ -111,13 +111,13 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
         let view = ToolchainView::open(manifest.as_ref(), id).expect("open_manifest checked it");
         let sys = blaze_toolchain::sysroot(&view, triple, false).ok_or(WorldError::NoTarget { triple })?;
         let all: AVec<'w, _> = {
-            let mut v = AVec::new_in(alloc.clone());
+            let mut v = AVec::new_in(alloc);
             v.extend(view.units(triple).ok_or(WorldError::NoTarget { triple })?);
             v
         };
-        let mut keep_unit: AVec<'w, bool> = AVec::with_capacity_in(all.len(), alloc.clone());
+        let mut keep_unit: AVec<'w, bool> = AVec::with_capacity_in(all.len(), alloc);
         keep_unit.extend(all.iter().map(|_| false));
-        let mut todo: AVec<'w, usize> = AVec::new_in(alloc.clone());
+        let mut todo: AVec<'w, usize> = AVec::new_in(alloc);
         // core and alloc; std for the program's own need. Every other toolchain crate comes in
         // by an edge: a row's deps hold the sysroot crates its root names (the cutter's
         // implied edges), so std is opened iff a crate of the closure names it.
@@ -140,52 +140,52 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
                 todo.extend(all[u].deps().map(|(_, d)| d as usize));
             }
         }
-        let mut at: AVec<'w, usize> = AVec::with_capacity_in(all.len(), alloc.clone());
+        let mut at: AVec<'w, usize> = AVec::with_capacity_in(all.len(), alloc);
         at.extend(all.iter().map(|_| usize::MAX));
-        let mut crates: AVec<'w, ToolchainCrate<'w>> = AVec::new_in(alloc.clone());
-        let mut packs: AVec<'w, B> = AVec::new_in(alloc.clone());
+        let mut crates: AVec<'w, ToolchainCrate<'w>> = AVec::new_in(alloc);
+        let mut packs: AVec<'w, B> = AVec::new_in(alloc);
         let cfg_target: AVec<'w, (&'w str, Option<&'w str>)> = {
-            let mut v = AVec::new_in(alloc.clone());
+            let mut v = AVec::new_in(alloc);
             for (name, value) in view.cfg(triple).ok_or(WorldError::NoTarget { triple })? {
-                v.push((keep(name, alloc.clone()), value.map(|v| keep(v, alloc.clone()))));
+                v.push((keep(name, alloc), value.map(|v| keep(v, alloc))));
             }
             v
         };
         // First the rows, then their dependencies by index among the kept.
-        let mut raw_deps: AVec<'w, AVec<'w, (&'w str, usize)>> = AVec::new_in(alloc.clone());
+        let mut raw_deps: AVec<'w, AVec<'w, (&'w str, usize)>> = AVec::new_in(alloc);
         for (u, row) in all.iter().enumerate() {
             let proc_macro = row.kind == UnitKind::ProcMacro;
             if !keep_unit[u] || !(proc_macro || (row.kind == UnitKind::Lib && !row.for_host)) {
                 continue;
             }
             let krate = view.krate(row.krate);
-            let name = keep(krate.lib, alloc.clone());
-            let edition = edition_of(krate.edition).ok_or(WorldError::ToolchainEdition { krate: name, written: keep(krate.edition, alloc.clone()) })?;
+            let name = keep(krate.lib, alloc);
+            let edition = edition_of(krate.edition).ok_or(WorldError::ToolchainEdition { krate: name, written: keep(krate.edition, alloc) })?;
             // Its implicit is its own, from its row: its crate's edition (the prelude's
             // `rust_20xx`), never one uniform Rust 2024; what it is given from the sysroot is
             // its row's value and edges (`row.sysroot`, `row.deps()`).
-            let own = PackageEdition::of_manifest(krate.edition).map_err(|_| WorldError::ToolchainEdition { krate: name, written: keep(krate.edition, alloc.clone()) })?;
+            let own = PackageEdition::of_manifest(krate.edition).map_err(|_| WorldError::ToolchainEdition { krate: name, written: keep(krate.edition, alloc) })?;
             let own_implicit = implicit(own, if proc_macro { &blaze_unit_graph::UnitKind::ProcMacro } else { &blaze_unit_graph::UnitKind::Lib });
             let pack = blaze_toolchain::shelf::open_pack(shelf, id, &krate).map_err(WorldError::Toolchain)?;
             let index = crates.len();
-            let mut base = blaze_own::AString::with_capacity_in(16, alloc.clone());
+            let mut base = blaze_own::AString::with_capacity_in(16, alloc);
             base.push_str("/");
             crate::push_u32(&mut base, index as u32 + 1);
             base.push_str("/");
             let root = if krate.dir.is_empty() || row.root.starts_with(krate.dir) {
-                join(&base, row.root, alloc.clone())
+                join(&base, row.root, alloc)
             } else {
-                join(&join(&base, krate.dir, alloc.clone()), row.root, alloc.clone())
+                join(&join(&base, krate.dir, alloc), row.root, alloc)
             };
-            let mut features: AVec<'w, &'w str> = AVec::new_in(alloc.clone());
-            features.extend(row.features().map(|f| keep(f, alloc.clone())));
-            let mut cfg: AVec<'w, (&'w str, Option<&'w str>)> = AVec::with_capacity_in(cfg_target.len() + features.len() + 1, alloc.clone());
+            let mut features: AVec<'w, &'w str> = AVec::new_in(alloc);
+            features.extend(row.features().map(|f| keep(f, alloc)));
+            let mut cfg: AVec<'w, (&'w str, Option<&'w str>)> = AVec::with_capacity_in(cfg_target.len() + features.len() + 1, alloc);
             cfg.extend_from_slice(&cfg_target);
             cfg.extend_from_slice(PROFILE);
             cfg.extend(features.iter().map(|f| ("feature", Some(*f))));
             let script = if krate.role == Role::Std { std_script_cfg(triple)? } else { &[] };
             cfg.extend(script.iter().map(|atom| (*atom, None)));
-            let mut key_bytes: AVec<'w, u8> = AVec::new_in(alloc.clone());
+            let mut key_bytes: AVec<'w, u8> = AVec::new_in(alloc);
             key_bytes.extend_from_slice(&krate.pack);
             for f in row.features() {
                 key_bytes.extend_from_slice(f.as_bytes());
@@ -196,22 +196,22 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
                 key_bytes.extend_from_slice(atom.as_bytes());
                 key_bytes.push(0);
             }
-            let mut deps: AVec<'w, (&'w str, usize)> = AVec::new_in(alloc.clone());
+            let mut deps: AVec<'w, (&'w str, usize)> = AVec::new_in(alloc);
             if !proc_macro {
-                deps.extend(row.deps().map(|(n, d)| (keep(n, alloc.clone()), d as usize)));
+                deps.extend(row.deps().map(|(n, d)| (keep(n, alloc), d as usize)));
             }
             raw_deps.push(deps);
             at[u] = index;
             crates.push(ToolchainCrate {
                 name,
-                version: keep(krate.version, alloc.clone()),
+                version: keep(krate.version, alloc),
                 unit: u as u32,
                 key: CrateItemKey(ContentId::of("blaze toolchain unit", &key_bytes)),
                 edition,
                 implicit: own_implicit,
                 sysroot: row.sysroot,
-                root: keep(&root, alloc.clone()),
-                shown_from: keep(&base, alloc.clone()),
+                root: keep(&root, alloc),
+                shown_from: keep(&base, alloc),
                 features: features.leak(),
                 deps: &[],
                 cfg: cfg.leak(),
@@ -229,14 +229,14 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
                 }
                 dep.1 = kept;
             }
-            c.deps = keep_slice(deps, alloc.clone());
+            c.deps = keep_slice(deps, alloc);
         }
         // A crate's key is its identity: its pack's digest and features (set above), the
         // target's cfg (the same pack is another crate on another target), and its dependencies'
         // keys by name. Dependencies first, by passes over the kept crates (no recursion): a
         // toolchain is a DAG, so each pass keys at least one crate; past `crates.len()` passes
         // a dependency cycle is a typed refusal.
-        let mut keyed: AVec<'w, bool> = AVec::with_capacity_in(crates.len(), alloc.clone());
+        let mut keyed: AVec<'w, bool> = AVec::with_capacity_in(crates.len(), alloc);
         keyed.extend(crates.iter().map(|_| false));
         let mut left = crates.len();
         let mut passes = 0;
@@ -250,7 +250,7 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
                 if keyed[c] || crates[c].deps.iter().any(|(_, d)| !keyed[*d]) {
                     continue;
                 }
-                let mut bytes: AVec<'_, u8> = AVec::new_in(alloc.clone());
+                let mut bytes: AVec<'_, u8> = AVec::new_in(alloc);
                 bytes.extend_from_slice(&crates[c].key.0.0);
                 bytes.extend_from_slice(b"\0cfg");
                 for (name, value) in cfg_target.iter() {

@@ -29,6 +29,8 @@ pub enum QueryKind {
     Normalized,
 }
 
+use blaze_own::Share;
+
 /// One version a source has for a name, and whether it may be chosen.
 #[derive(Debug, Clone)]
 pub enum IndexSummary {
@@ -43,6 +45,8 @@ pub enum IndexSummary {
     /// A supported schema with an error in the entry.
     Invalid(Summary),
 }
+
+impl Share for IndexSummary {}
 
 impl IndexSummary {
     pub fn summary(&self) -> &Summary {
@@ -186,8 +190,8 @@ impl MemRegistry {
                     continue;
                 }
                 match s {
-                    IndexSummary::Candidate(_) | IndexSummary::Yanked(_) => f(s.clone()),
-                    _ if kind == QueryKind::RejectedVersions => f(s.clone()),
+                    IndexSummary::Candidate(_) | IndexSummary::Yanked(_) => f(s.share()),
+                    _ if kind == QueryKind::RejectedVersions => f(s.share()),
                     _ => {}
                 }
             }

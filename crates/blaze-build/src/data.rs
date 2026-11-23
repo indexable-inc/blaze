@@ -122,12 +122,12 @@ impl fmt::Display for DataError {
 
 impl core::error::Error for DataError {}
 
-impl<A: Allocator + Clone> DataRecord<A> {
+impl<A: Allocator + Copy> DataRecord<A> {
     /// A literal's bytes: one allocation, alignment 1, immutable, no relocation.
     pub fn literal(bytes: &[u8], alloc: A) -> DataRecord<A> {
-        let mut b = Vec::with_capacity_in(bytes.len(), alloc.clone());
+        let mut b = Vec::with_capacity_in(bytes.len(), alloc);
         b.extend_from_slice(bytes);
-        let mut allocs = Vec::with_capacity_in(1, alloc.clone());
+        let mut allocs = Vec::with_capacity_in(1, alloc);
         allocs.push(DataAlloc { bytes: b, align: 0, mutable: false, relocs: Vec::new_in(alloc) });
         DataRecord { allocs }
     }
@@ -195,10 +195,10 @@ fn align_up(at: u64, align: u8) -> u64 {
     (at + a - 1) & !(a - 1)
 }
 
-impl<A: Allocator + Clone> StaticImage<A> {
+impl<A: Allocator + Copy> StaticImage<A> {
     /// Lays out `statics` (each a static item and its checked record).
     pub fn new<B: Allocator>(statics: &[(ItemKey, &DataRecord<B>)], alloc: A) -> Result<StaticImage<A>, DataError> {
-        let mut order: Vec<usize, A> = Vec::with_capacity_in(statics.len(), alloc.clone());
+        let mut order: Vec<usize, A> = Vec::with_capacity_in(statics.len(), alloc);
         order.extend(0..statics.len());
         order.sort_by_key(|&i| statics[i].0);
         for w in order.windows(2) {
@@ -207,9 +207,9 @@ impl<A: Allocator + Clone> StaticImage<A> {
             }
         }
         // Pass 1: every allocation's offset; the statics' roots.
-        let mut at_of: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(statics.len(), alloc.clone());
-        at_of.resize_with(statics.len(), || Vec::new_in(alloc.clone()));
-        let mut roots: Vec<(ItemKey, u32), A> = Vec::with_capacity_in(statics.len(), alloc.clone());
+        let mut at_of: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(statics.len(), alloc);
+        at_of.resize_with(statics.len(), || Vec::new_in(alloc));
+        let mut roots: Vec<(ItemKey, u32), A> = Vec::with_capacity_in(statics.len(), alloc);
         let mut end = 0u64;
         let mut align = 0u8;
         for &i in order.iter() {
@@ -228,9 +228,9 @@ impl<A: Allocator + Clone> StaticImage<A> {
         }
         let root_of = |key: ItemKey| roots.binary_search_by_key(&key, |r| r.0).ok().map(|k| roots[k].1);
         // Pass 2: the bytes and the relocations.
-        let mut bytes = Vec::with_capacity_in(end as usize, alloc.clone());
+        let mut bytes = Vec::with_capacity_in(end as usize, alloc);
         bytes.resize(end as usize, 0);
-        let mut relocs = Vec::new_in(alloc.clone());
+        let mut relocs = Vec::new_in(alloc);
         for &i in order.iter() {
             let record = statics[i].1;
             for (k, a) in record.allocs.iter().enumerate() {

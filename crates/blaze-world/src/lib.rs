@@ -486,7 +486,7 @@ fn correct_pack<'w>(
     alloc: Alloc<'w>,
 ) -> Result<(), WorldError<'w>> {
     let path_of = |file: &str| -> AString<'w> {
-        let mut path = AString::with_capacity_in(dir.len() + file.len() + 1, alloc.clone());
+        let mut path = AString::with_capacity_in(dir.len() + file.len() + 1, alloc);
         if !dir.is_empty() {
             path.push_str(dir);
             path.push_str("/");
@@ -495,23 +495,23 @@ fn correct_pack<'w>(
         path
     };
     let files = row
-        .correct_crate(&unit.version, |file| view.find(&path_of(file)).map(|f| f.bytes), blaze_lex::Cpu::BASELINE, alloc.clone())
+        .correct_crate(&unit.version, |file| view.find(&path_of(file)).map(|f| f.bytes), blaze_lex::Cpu::BASELINE, alloc)
         .map_err(|why| {
-            let mut words = AString::new_in(alloc.clone());
+            let mut words = AString::new_in(alloc);
             let _ = fmt::write(&mut Words(&mut words), format_args!("{why}"));
-            WorldError::Correction { package: &unit.name, version: &unit.version, why: keep(&words, alloc.clone()) }
+            WorldError::Correction { package: &unit.name, version: &unit.version, why: keep(&words, alloc) }
         })?;
     let mut predicates = 0;
     for (file, fixed) in files.iter() {
         predicates += fixed.replaced.len();
-        corrected.push((tree, keep(&path_of(file), alloc.clone()), keep(fixed.text.as_str(), alloc.clone())));
+        corrected.push((tree, keep(&path_of(file), alloc), keep(fixed.text.as_str(), alloc)));
     }
     used.push(Corrected {
         package: &unit.name,
         version: &unit.version,
         files: files.len(),
         predicates,
-        decision: keep(&row.decision, alloc.clone()),
+        decision: keep(&row.decision, alloc),
     });
     Ok(())
 }

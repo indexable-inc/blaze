@@ -98,7 +98,7 @@ pub struct Listed<'t, 'a> {
 impl<'t, 'a> LibFeatures<'t, 'a> {
     pub fn new(opts: LibFeaturesOpts<'a>) -> LibFeatures<'t, 'a> {
         let alloc = opts.alloc;
-        LibFeatures { declared: AVec::new_in(alloc.clone()), mentioned: AVec::new_in(alloc.clone()), pending: AVec::new_in(alloc.clone()), alloc, files: 0 }
+        LibFeatures { declared: AVec::new_in(alloc), mentioned: AVec::new_in(alloc), pending: AVec::new_in(alloc), alloc, files: 0 }
     }
 
     /// Reads the crate at `krate` (its index for `texts`), whose root file is `root`, under
@@ -110,18 +110,18 @@ impl<'t, 'a> LibFeatures<'t, 'a> {
     /// [`LibFeatures::scan`] crossing comments and strings by `J`: the one seam of the
     /// strategy, every `J` reading the same listing and the same errors (`jump_tests`).
     pub fn scan_by<J: Jump, T: SourceTexts<'t> + ?Sized>(&mut self, texts: &T, krate: usize, root: &str, cfg: &Cfg<'_, '_>) -> Result<(), ScanError<'a>> {
-        let alloc = self.alloc.clone();
-        let file = joined(root, &[], alloc.clone());
-        let mut dir = file.clone();
+        let alloc = self.alloc;
+        let file = joined(root, &[], alloc);
+        let mut dir = file.clone_in(alloc);
         pop_dir(&mut dir);
-        let dirs = Dirs { dir: dir.clone(), path_dir: dir, file };
+        let dirs = Dirs { dir: dir.clone_in(alloc), path_dir: dir, file };
         let mut walk = Walk { texts, krate, cfg, out: self, alloc, jump: PhantomData::<J> };
         walk.file(dirs, 0)
     }
 
     /// What was read so far, as a listing in `alloc`.
     pub fn listed(&self, alloc: Alloc<'a>) -> Listed<'t, 'a> {
-        let mut declared = AVec::from_slice_in(&self.declared, alloc.clone());
+        let mut declared = AVec::from_slice_in(&self.declared, alloc);
         declared.sort_unstable();
         declared.dedup();
         let mut mentioned = AVec::from_slice_in(&self.mentioned, alloc);
@@ -424,13 +424,13 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
     }
 
     fn next(&self, lex: &mut Lex<'t, J>, d: &Dirs<'a>) -> R<'a, Option<(usize, Tok<'t>)>> {
-        lex.next().map_err(|at| ScanError::Text { file: d.file.clone(), at })
+        lex.next().map_err(|at| ScanError::Text { file: d.file.clone_in(self.alloc), at })
     }
 
     fn want(&self, lex: &mut Lex<'t, J>, d: &Dirs<'a>) -> R<'a, (usize, Tok<'t>)> {
         match self.next(lex, d)? {
             Some(it) => Ok(it),
-            None => Err(ScanError::Text { file: d.file.clone(), at: lex.at }),
+            None => Err(ScanError::Text { file: d.file.clone_in(self.alloc), at: lex.at }),
         }
     }
 
@@ -451,7 +451,7 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
 
     fn deeper(&self, d: &Dirs<'a>, at: usize, depth: usize) -> R<'a, usize> {
         if depth >= MOST_DEPTH {
-            return Err(ScanError::TooDeep { file: d.file.clone(), at });
+            return Err(ScanError::TooDeep { file: d.file.clone_in(self.alloc), at });
         }
         Ok(depth + 1)
     }
@@ -473,7 +473,7 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
                 }
                 Tok::Str(name) if mention && last == [Tok::Ident("feature"), Tok::Punct(b'=')] => self.out.mentioned.push(name),
                 Tok::Punct(b';') if mention && matches!(last, [Tok::Ident("mod"), Tok::Ident(_)]) => {
-                    return Err(ScanError::Unfollowed { file: d.file.clone(), at });
+                    return Err(ScanError::Unfollowed { file: d.file.clone_in(self.alloc), at });
                 }
                 _ => {}
             }
@@ -529,7 +529,7 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
                     let (at, value) = self.want(lex, d)?;
                     match value {
                         Tok::Str(path) => st.path = Some(path),
-                        _ => return Err(ScanError::Unfollowed { file: d.file.clone(), at }),
+                        _ => return Err(ScanError::Unfollowed { file: d.file.clone_in(self.alloc), at }),
                     }
                 }
                 self.rest_of_meta(lex, d)
@@ -540,7 +540,7 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
                         let close = self.group(lex, d, false)?;
                         match self.cfg.eval(&lex.text[open + 1..close]) {
                             Some(on) => st.on &= on,
-                            None => return Err(ScanError::Cfg { file: d.file.clone(), at: open }),
+                            None => return Err(ScanError::Cfg { file: d.file.clone_in(self.alloc), at: open }),
                         }
                     }
                     "cfg_attr" => self.cfg_attr(lex, d, open, st)?,
@@ -584,7 +584,7 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
             let (at, tok) = self.want(lex, d)?;
             match tok {
                 Tok::Open(_) => depth += 1,
-                Tok::Close(_) if depth == 0 => return Err(ScanError::Text { file: d.file.clone(), at }),
+                Tok::Close(_) if depth == 0 => return Err(ScanError::Text { file: d.file.clone_in(self.alloc), at }),
                 Tok::Close(_) => depth -= 1,
                 Tok::Punct(b',') if depth == 0 => break at,
                 _ => {}
@@ -600,7 +600,7 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
                 self.group(lex, d, false)?;
                 Ok(())
             }
-            None => Err(ScanError::Cfg { file: d.file.clone(), at: open }),
+            None => Err(ScanError::Cfg { file: d.file.clone_in(self.alloc), at: open }),
         }
     }
 
@@ -617,7 +617,7 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
             let Some((at, Tok::Open(b'['))) = self.next(&mut l, d)? else { return Ok(()) };
             *lex = l;
             if let End::Comma = self.meta(lex, d, st)? {
-                return Err(ScanError::Text { file: d.file.clone(), at });
+                return Err(ScanError::Text { file: d.file.clone_in(self.alloc), at });
             }
         }
     }
@@ -693,15 +693,15 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
                     }
                     Tok::Open(b'{') => {
                         let child = match path {
-                            Some(p) => joined(&d.path_dir, &[p], self.alloc.clone()),
-                            None => joined(&d.dir, &[name], self.alloc.clone()),
+                            Some(p) => joined(&d.path_dir, &[p], self.alloc),
+                            None => joined(&d.dir, &[name], self.alloc),
                         };
-                        let dirs = Dirs { dir: child.clone(), path_dir: child, file: d.file.clone() };
+                        let dirs = Dirs { dir: child.clone_in(self.alloc), path_dir: child, file: d.file.clone_in(self.alloc) };
                         let depth = self.deeper(d, open, depth)?;
                         self.items(lex, &dirs, on, depth)?;
                         Ok(Step::More)
                     }
-                    _ => Err(ScanError::Text { file: d.file.clone(), at: open }),
+                    _ => Err(ScanError::Text { file: d.file.clone_in(self.alloc), at: open }),
                 }
             }
             Tok::Ident("impl" | "trait") => loop {
@@ -809,7 +809,7 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
                     (_, Tok::Open(_)) => {
                         self.group(lex, d, on)?;
                     }
-                    _ => return Err(ScanError::Text { file: d.file.clone(), at: open }),
+                    _ => return Err(ScanError::Text { file: d.file.clone_in(self.alloc), at: open }),
                 }
                 self.eat(lex, d, Tok::Punct(b';'))?;
                 Ok(Step::More)
@@ -907,7 +907,7 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
                     Tok::Open(_) => {
                         self.group(lex, d, false)?;
                     }
-                    Tok::Close(_) => return Err(ScanError::Text { file: d.file.clone(), at }),
+                    Tok::Close(_) => return Err(ScanError::Text { file: d.file.clone_in(self.alloc), at }),
                     _ => {}
                 }
                 (at, tok) = self.want(lex, d)?;
@@ -917,12 +917,12 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
                 "_" => true,
                 predicate => match self.cfg.eval(predicate) {
                     Some(holds) => holds,
-                    None => return Err(ScanError::Cfg { file: d.file.clone(), at: start }),
+                    None => return Err(ScanError::Cfg { file: d.file.clone_in(self.alloc), at: start }),
                 },
             };
             let (open, body) = self.want(lex, d)?;
             if body != Tok::Open(b'{') {
-                return Err(ScanError::Unfollowed { file: d.file.clone(), at: open });
+                return Err(ScanError::Unfollowed { file: d.file.clone_in(self.alloc), at: open });
             }
             if on && holds && !chosen {
                 chosen = true;
@@ -944,7 +944,7 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
             match tok {
                 Tok::Close(_) => return Ok(()),
                 Tok::Ident("if") => {}
-                _ => return Err(ScanError::Unfollowed { file: d.file.clone(), at }),
+                _ => return Err(ScanError::Unfollowed { file: d.file.clone_in(self.alloc), at }),
             }
             let mut chosen = false;
             loop {
@@ -967,21 +967,21 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
         for want in [Tok::Punct(b'#'), Tok::Open(b'['), Tok::Ident("cfg")] {
             let (at, got) = self.want(lex, d)?;
             if got != want {
-                return Err(ScanError::Unfollowed { file: d.file.clone(), at });
+                return Err(ScanError::Unfollowed { file: d.file.clone_in(self.alloc), at });
             }
         }
         let (open, paren) = self.want(lex, d)?;
         if paren != Tok::Open(b'(') {
-            return Err(ScanError::Unfollowed { file: d.file.clone(), at: open });
+            return Err(ScanError::Unfollowed { file: d.file.clone_in(self.alloc), at: open });
         }
         let close = self.group(lex, d, false)?;
         let (end, bracket) = self.want(lex, d)?;
         if !matches!(bracket, Tok::Close(_)) {
-            return Err(ScanError::Unfollowed { file: d.file.clone(), at: end });
+            return Err(ScanError::Unfollowed { file: d.file.clone_in(self.alloc), at: end });
         }
         match self.cfg.eval(lex.text[open + 1..close].trim()) {
             Some(holds) => Ok(holds),
-            None => Err(ScanError::Cfg { file: d.file.clone(), at: open }),
+            None => Err(ScanError::Cfg { file: d.file.clone_in(self.alloc), at: open }),
         }
     }
 
@@ -989,7 +989,7 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
     fn cfg_if_branch(&mut self, lex: &mut Lex<'t, J>, d: &Dirs<'a>, on: bool, depth: usize) -> R<'a, ()> {
         let (open, body) = self.want(lex, d)?;
         if body != Tok::Open(b'{') {
-            return Err(ScanError::Unfollowed { file: d.file.clone(), at: open });
+            return Err(ScanError::Unfollowed { file: d.file.clone_in(self.alloc), at: open });
         }
         if on {
             let depth = self.deeper(d, open, depth)?;
@@ -1002,35 +1002,35 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
     /// `include!("file")` after its `(` at `open`: the file's items, in this module.
     fn include(&mut self, lex: &mut Lex<'t, J>, d: &Dirs<'a>, open: usize, depth: usize) -> R<'a, ()> {
         let (Tok::Str(file), Tok::Close(_)) = (self.want(lex, d)?.1, self.want(lex, d)?.1) else {
-            return Err(ScanError::Unfollowed { file: d.file.clone(), at: open });
+            return Err(ScanError::Unfollowed { file: d.file.clone_in(self.alloc), at: open });
         };
-        let mut from = d.file.clone();
+        let mut from = d.file.clone_in(self.alloc);
         pop_dir(&mut from);
-        let target = joined(&from, &[file], self.alloc.clone());
-        let dirs = Dirs { dir: d.dir.clone(), path_dir: d.path_dir.clone(), file: target };
+        let target = joined(&from, &[file], self.alloc);
+        let dirs = Dirs { dir: d.dir.clone_in(self.alloc), path_dir: d.path_dir.clone_in(self.alloc), file: target };
         let depth = self.deeper(d, open, depth)?;
         self.file(dirs, depth)
     }
 
     /// `mod name;` (on, at `at`): its file, by `#[path]` or the Reference's rules.
     fn file_mod(&mut self, d: &Dirs<'a>, name: &str, path: Option<&str>, at: usize, depth: usize) -> R<'a, ()> {
-        let alloc = self.alloc.clone();
+        let alloc = self.alloc;
         let dirs = if let Some(p) = path {
             let target = joined(&d.path_dir, &[p], alloc);
-            let mut parent = target.clone();
+            let mut parent = target.clone_in(alloc);
             pop_dir(&mut parent);
-            Dirs { dir: parent.clone(), path_dir: parent, file: target }
+            Dirs { dir: parent.clone_in(alloc), path_dir: parent, file: target }
         } else {
-            let mut file_name = AString::new_in(alloc.clone());
+            let mut file_name = AString::new_in(alloc);
             file_name.push_str(name);
             file_name.push_str(".rs");
-            let a = joined(&d.dir, &[&file_name], alloc.clone());
-            let sub = joined(&d.dir, &[name], alloc.clone());
+            let a = joined(&d.dir, &[&file_name], alloc);
+            let sub = joined(&d.dir, &[name], alloc);
             if self.texts.read(self.krate, &a).is_some() {
-                Dirs { dir: sub, path_dir: d.dir.clone(), file: a }
+                Dirs { dir: sub, path_dir: d.dir.clone_in(alloc), file: a }
             } else {
                 let b = joined(&d.dir, &[name, "mod.rs"], alloc);
-                Dirs { dir: sub.clone(), path_dir: sub, file: b }
+                Dirs { dir: sub.clone_in(alloc), path_dir: sub, file: b }
             }
         };
         let depth = self.deeper(d, at, depth)?;
@@ -1154,8 +1154,8 @@ mod jump_tests {
 
     fn same_tokens(tape: &Tape, plant: JumpPlant) -> Result<(), Broken<LexBroken>> {
         let alloc = heap().alloc();
-        let text = drawn_text(tape, alloc.clone());
-        let want = steps::<Scalar>(text.as_str(), alloc.clone());
+        let text = drawn_text(tape, alloc);
+        let want = steps::<Scalar>(text.as_str(), alloc);
         let got = match plant {
             JumpPlant::None => steps::<Vector>(text.as_str(), alloc),
             JumpPlant::MissesLast => steps::<MissesLast>(text.as_str(), alloc),
@@ -1231,8 +1231,8 @@ mod jump_tests {
     }
 
     fn scan_one<'t, 'a, J: Jump>(text: &'t str, alloc: Alloc<'a>) -> Seen<'t, 'a> {
-        let cfg = Cfg::from_atoms(&[], alloc.clone());
-        let mut features = LibFeatures::new(LibFeaturesOpts { alloc: alloc.clone() });
+        let cfg = Cfg::from_atoms(&[], alloc);
+        let mut features = LibFeatures::new(LibFeaturesOpts { alloc: alloc });
         seen(features.scan_by::<J, _>(&One(text), 0, ROOT, &cfg).map(|()| features.listed(alloc)))
     }
 
@@ -1242,7 +1242,7 @@ mod jump_tests {
     fn vector_scans_as_scalar() {
         check(Config::cases(512), |tape: &Tape| {
             let alloc = heap().alloc();
-            let mut text = AString::new_in(alloc.clone());
+            let mut text = AString::new_in(alloc);
             let items = tape.int_in(0..=12usize, "items");
             for _ in 0..items {
                 let doc = tape.int_in(0..=200usize, "doc bytes");
@@ -1255,7 +1255,7 @@ mod jump_tests {
                 }
                 text.push_str(tape.one_of(ITEMS, "item"));
             }
-            let want = scan_one::<Scalar>(text.as_str(), alloc.clone());
+            let want = scan_one::<Scalar>(text.as_str(), alloc);
             let got = scan_one::<Vector>(text.as_str(), alloc);
             assert_eq!(got, want, "the crate:\n{}", text.as_str());
         });
@@ -1278,14 +1278,14 @@ mod jump_tests {
         let alloc = heap().alloc();
         let library = StdString::leak(std::format!("{}/../../library", env!("CARGO_MANIFEST_DIR")));
         let atoms: &[(&str, Option<&str>)] = &[("target_arch", Some("aarch64")), ("target_os", Some("macos")), ("target_family", Some("unix")), ("unix", None), ("target_pointer_width", Some("64")), ("target_endian", Some("little")), ("panic", Some("unwind"))];
-        let cfg = Cfg::from_atoms(atoms, alloc.clone());
-        let mut by_scalar = LibFeatures::new(LibFeaturesOpts { alloc: alloc.clone() });
-        let mut by_vector = LibFeatures::new(LibFeaturesOpts { alloc: alloc.clone() });
+        let cfg = Cfg::from_atoms(atoms, alloc);
+        let mut by_scalar = LibFeatures::new(LibFeaturesOpts { alloc: alloc });
+        let mut by_vector = LibFeatures::new(LibFeaturesOpts { alloc: alloc });
         for krate in ["core", "alloc", "std", "std_detect", "unwind", "panic_unwind", "panic_abort"] {
             let root = StdString::leak(std::format!("{library}/{krate}/src/lib.rs"));
             let scalar = by_scalar.scan_by::<Scalar, _>(&Disk, 0, root, &cfg);
             let vector = by_vector.scan_by::<Vector, _>(&Disk, 0, root, &cfg);
-            assert_eq!(seen(vector.map(|()| by_vector.listed(alloc.clone()))), seen(scalar.map(|()| by_scalar.listed(alloc.clone()))), "{krate}");
+            assert_eq!(seen(vector.map(|()| by_vector.listed(alloc))), seen(scalar.map(|()| by_scalar.listed(alloc))), "{krate}");
         }
         println!("lib_features: library/ lists the same by both searches, {} files", by_vector.listed(alloc).files);
     }

@@ -76,7 +76,7 @@ const NO_DEF_SITE: &str =
 const VTABLE: &str =
     "a `#[track_caller]` method called through a trait object: its vtable shim, which passes the method's definition site, is not built yet";
 
-impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
+impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// The world's answer for the fn `instance` resolves to.
     fn tracked(&mut self, instance: Instance) -> Option<bool> {
         let adts = self.adts;
@@ -216,10 +216,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             // E0737: "`#[track_caller]` requires Rust ABI"; a C-variadic fn is never of it.
             return Err(malformed("a C-variadic fn that is `#[track_caller]` (E0737)"));
         }
-        let mut r = Vec::with_capacity_in(reprs.len() + 1, self.alloc.clone());
+        let mut r = Vec::with_capacity_in(reprs.len() + 1, self.alloc);
         r.extend_from_slice(reprs);
         r.push(Repr::Ptr);
-        let mut p = Vec::with_capacity_in(passes.len() + 1, self.alloc.clone());
+        let mut p = Vec::with_capacity_in(passes.len() + 1, self.alloc);
         p.extend_from_slice(passes);
         p.push(PASS);
         self.push_val(V::Scalar(loc), None);
@@ -237,9 +237,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         values: &[Value],
     ) -> Result<(SigId, Vec<Value, A>), BuildError> {
         let loc = self.caller_arg(at, callee)?;
-        let mut ps = Vec::with_capacity_in(params.len() + 1, self.alloc.clone());
+        let mut ps = Vec::with_capacity_in(params.len() + 1, self.alloc);
         ps.extend_from_slice(params);
-        let mut vs = Vec::with_capacity_in(values.len() + 1, self.alloc.clone());
+        let mut vs = Vec::with_capacity_in(values.len() + 1, self.alloc);
         vs.extend_from_slice(values);
         if let Some(loc) = loc {
             ps.push(Param::of(Ty::PTR));

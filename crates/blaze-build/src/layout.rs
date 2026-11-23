@@ -989,20 +989,23 @@ fn better(a: Option<Niche>, b: Option<Niche>) -> Option<Niche> {
     }
 }
 
-impl<A: Allocator + Clone> Layouts<A> {
+impl<A: Allocator + Copy> Layouts<A> {
     pub fn new_in(alloc: A) -> Layouts<A> {
         Layouts {
-            rows: Vec::new_in(alloc.clone()),
-            by_ty: Vec::new_in(alloc.clone()),
-            offsets: Vec::new_in(alloc.clone()),
-            variant_rows: Vec::new_in(alloc.clone()),
-            discrs: Vec::new_in(alloc.clone()),
-            dyn_inner: Vec::new_in(alloc.clone()),
+            rows: Vec::new_in(alloc),
+            by_ty: Vec::new_in(alloc),
+            offsets: Vec::new_in(alloc),
+            variant_rows: Vec::new_in(alloc),
+            discrs: Vec::new_in(alloc),
+            dyn_inner: Vec::new_in(alloc),
             alloc,
             #[cfg(test)]
             niche_off: false,
         }
     }
+}
+
+impl<A: Allocator + Clone> Layouts<A> {
 
     /// The allocator the table's columns are in.
     pub fn alloc(&self) -> A {
@@ -1173,7 +1176,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         if let Some(id) = self.done(ty) {
             return Ok(id);
         }
-        let mut todo: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PTy, Alloc<'_>> = Vec::new_in(cx.scratch);
         todo.push(ty);
         let walked = self.of_stack(&mut todo, cx);
         if walked.is_err() {
@@ -1191,8 +1194,8 @@ impl<A: Allocator + Clone> Layouts<A> {
 
     /// `of`'s work stack: lays out the top of `todo` until it is empty, or stops at a refusal
     /// with the types being laid out still on it.
-    fn of_stack(&mut self, todo: &mut Vec<PTy, A>, cx: &mut LayoutCx<'_, '_>) -> Result<(), LayoutError> {
-        let mut parts: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+    fn of_stack(&mut self, todo: &mut Vec<PTy, Alloc<'_>>, cx: &mut LayoutCx<'_, '_>) -> Result<(), LayoutError> {
+        let mut parts: Vec<PTy, Alloc<'_>> = Vec::new_in(cx.scratch);
         while let Some(&t) = todo.last() {
             if self.done(t).is_some() {
                 todo.pop();
@@ -1237,8 +1240,8 @@ impl<A: Allocator + Clone> Layouts<A> {
     pub fn interior_mut(&mut self, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<bool, LayoutError> {
         /// The most types one decision visits (rule 18).
         const MOST: usize = 1 << 16;
-        let mut todo: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
-        let mut seen: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PTy, Alloc<'_>> = Vec::new_in(cx.scratch);
+        let mut seen: Vec<PTy, Alloc<'_>> = Vec::new_in(cx.scratch);
         todo.push(ty);
         while let Some(t) = todo.pop() {
             match seen.binary_search(&t) {
@@ -1273,7 +1276,7 @@ impl<A: Allocator + Clone> Layouts<A> {
 
     /// The types `t` holds by value, whose layouts its own needs: in declaration order, an
     /// enum's variants one after another.
-    fn parts(&mut self, t: PTy, cx: &mut LayoutCx<'_, '_>, out: &mut Vec<PTy, A>) -> Result<(), Refusal> {
+    fn parts<B: Allocator>(&mut self, t: PTy, cx: &mut LayoutCx<'_, '_>, out: &mut Vec<PTy, B>) -> Result<(), Refusal> {
         let view = cx.ground.view();
         let node = view.node(t).map_err(|_| Refusal::Malformed("a type past the ground table"))?;
         match node {
@@ -1284,7 +1287,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             PNode::Closure { owner, ordinal, args: l } => {
                 let facts = cx.facts;
                 let c = facts.closure(owner, ordinal).ok_or(Refusal::Unsupported("a closure whose facts the world did not answer"))?;
-                let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+                let mut args: blaze_own::AVec<'_, PTy> = blaze_own::AVec::new_in(cx.scratch);
                 args.extend_from_slice(view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?);
                 out.push(ground(c.types, c.env, &args, cx.ground, cx.scratch, facts).map_err(Refusal::Ground)?);
             }
@@ -1294,14 +1297,14 @@ impl<A: Allocator + Clone> Layouts<A> {
                 let facts = cx.facts;
                 let of = crate::coroutine_of(view, t).ok_or(Refusal::Malformed("a coroutine node `coroutine_of` does not read"))?;
                 let c = facts.coroutine(of.owner, of.ordinal).ok_or(Refusal::Unsupported("a coroutine whose facts the world did not answer"))?;
-                let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+                let mut args: blaze_own::AVec<'_, PTy> = blaze_own::AVec::new_in(cx.scratch);
                 args.extend_from_slice(view.list(of.owner_args).map_err(|_| Refusal::Malformed("a list past the ground table"))?);
                 out.push(ground(c.types, c.env, &args, cx.ground, cx.scratch, facts).map_err(Refusal::Ground)?);
             }
             PNode::Adt(key, l) => {
                 let facts = cx.facts;
                 let adt = facts.adt(key).ok_or(Refusal::NoAdt(key))?;
-                let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+                let mut args: Vec<PTy, Alloc<'_>> = Vec::new_in(cx.scratch);
                 args.extend_from_slice(view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?);
                 if adt.generics as usize != args.len() {
                     return Err(Refusal::Malformed("an ADT type whose argument count is not its generic count"));
@@ -1495,7 +1498,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 }
             }
             PNode::Tuple(_) | PNode::Closure { .. } => {
-                let u = self.univariant(parts, Order::Decreasing, ReprAttrs::RUST, 0, 0)?;
+                let u = self.univariant(parts, Order::Decreasing, ReprAttrs::RUST, 0, 0, cx.scratch)?;
                 self.struct_row(t, u)
             }
             PNode::Adt(key, _) => return self.adt(t, key, cx, parts),
@@ -1512,7 +1515,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                     Ok(None) => return Err(Refusal::Unsupported("a coroutine whose state the world did not answer")),
                     Ok(Some(state)) => state,
                 };
-                let u = self.univariant(parts, Order::Decreasing, ReprAttrs::RUST, 0, 0)?;
+                let u = self.univariant(parts, Order::Decreasing, ReprAttrs::RUST, 0, 0, cx.scratch)?;
                 if u64::from(state.size) < u.size || state.align < u.align || u64::from(state.tag_offset) < u.size {
                     return Err(Refusal::Malformed("a coroutine's state smaller than its upvars"));
                 }
@@ -1600,7 +1603,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                         return Ok(None);
                     }
                     let Some(last) = adt.fields.last() else { return Ok(None) };
-                    let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+                    let mut args: Vec<PTy, Alloc<'_>> = Vec::new_in(cx.scratch);
                     args.extend_from_slice(view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?);
                     let field = adt.fields.len() as u32 - 1;
                     let named = |error| Refusal::FieldGround { adt: key, field, name: last.name, error };
@@ -1618,8 +1621,8 @@ impl<A: Allocator + Clone> Layouts<A> {
     /// Fields `parts` (by declaration) placed in `order` from offset `start`, the alignment at
     /// least `min_align`, with `attrs`' packing and alignment. A sized result's size is rounded
     /// up to the alignment; an unsized one's is its tail's offset, unrounded.
-    fn univariant(&mut self, parts: &[PTy], order: Order, attrs: ReprAttrs, start: u64, min_align: u8) -> Result<Uni, Refusal> {
-        let mut ids: Vec<LayoutId, A> = Vec::with_capacity_in(parts.len(), self.alloc.clone());
+    fn univariant(&mut self, parts: &[PTy], order: Order, attrs: ReprAttrs, start: u64, min_align: u8, scratch: Alloc<'_>) -> Result<Uni, Refusal> {
+        let mut ids: Vec<LayoutId, Alloc<'_>> = Vec::with_capacity_in(parts.len(), scratch);
         for &p in parts {
             ids.push(self.done(p).ok_or(Refusal::Malformed("a field not laid out"))?);
         }
@@ -1633,7 +1636,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             None => l.align,
         };
         // The placement order: the unsized tail, if any, stays last.
-        let mut place: Vec<u32, A> = Vec::with_capacity_in(ids.len(), self.alloc.clone());
+        let mut place: Vec<u32, Alloc<'_>> = Vec::with_capacity_in(ids.len(), scratch);
         place.extend(0..ids.len() as u32);
         let sortable = match ids.last() {
             Some(last) if self.get(*last).tail != Tail::Sized => ids.len() - 1,
@@ -1702,8 +1705,8 @@ impl<A: Allocator + Clone> Layouts<A> {
         // field's scalar or pair.
         let mut scalar = None;
         let mut pair = None;
-        let big: Vec<u32, A> = {
-            let mut v = Vec::new_in(self.alloc.clone());
+        let big: Vec<u32, Alloc<'_>> = {
+            let mut v = Vec::new_in(scratch);
             v.extend((0..ids.len() as u32).filter(|&i| !self.get(ids[i as usize]).is_zst()));
             v
         };
@@ -1729,7 +1732,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             AdtKind::Struct => {
                 let [variant] = adt.variants else { return Err(Refusal::Malformed("a struct without exactly one variant")) };
                 let fields = parts.get(variant.fields.range()).ok_or(Refusal::Malformed("a struct's fields past their column"))?;
-                let mut u = if attrs.transparent { self.transparent(fields)? } else { self.univariant(fields, Order::Decreasing, attrs, 0, 0)? };
+                let mut u = if attrs.transparent { self.transparent(fields)? } else { self.univariant(fields, Order::Decreasing, attrs, 0, 0, cx.scratch)? };
                 let range = facts.valid_range(key).map_err(Missing::head)?;
                 if range.start.is_some() || range.end.is_some() {
                     let narrow = |s: Scalar| {
@@ -1759,7 +1762,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             AdtKind::Union => {
                 let mut size = 0u64;
                 let mut align = 0u8;
-                let mut ids: Vec<LayoutId, A> = Vec::new_in(self.alloc.clone());
+                let mut ids: Vec<LayoutId, Alloc<'_>> = Vec::new_in(cx.scratch);
                 for &p in parts {
                     ids.push(self.done(p).ok_or(Refusal::Malformed("a field not laid out"))?);
                 }
@@ -1796,7 +1799,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                     discrs: (0, 0),
                 })
             }
-            AdtKind::Enum => self.enum_(t, key, &adt, attrs, facts, parts),
+            AdtKind::Enum => self.enum_(t, key, &adt, attrs, facts, parts, cx.scratch),
         }
     }
 
@@ -1848,7 +1851,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         })
     }
 
-    fn enum_(&mut self, t: PTy, key: ItemKey, adt: &Adt<'_>, attrs: ReprAttrs, facts: &dyn LayoutFacts, parts: &[PTy]) -> Result<LayoutId, Refusal> {
+    fn enum_(&mut self, t: PTy, key: ItemKey, adt: &Adt<'_>, attrs: ReprAttrs, facts: &dyn LayoutFacts, parts: &[PTy], scratch: Alloc<'_>) -> Result<LayoutId, Refusal> {
         let n = adt.variants.len();
         let count = u32::try_from(n).map_err(|_| Refusal::TooLarge)?;
         // Discriminants: explicit, or one more than the previous.
@@ -1913,7 +1916,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             let start = if attrs.c {
                 let mut union_align = 0u8;
                 for v in 0..n {
-                    let u = self.univariant(fields_of(v)?, Order::Declaration, ReprAttrs { c: true, ..ReprAttrs::RUST }, 0, 0)?;
+                    let u = self.univariant(fields_of(v)?, Order::Declaration, ReprAttrs { c: true, ..ReprAttrs::RUST }, 0, 0, scratch)?;
                     union_align = union_align.max(u.align);
                     self.offsets.truncate(u.first as usize);
                 }
@@ -1922,12 +1925,12 @@ impl<A: Allocator + Clone> Layouts<A> {
                 tag_size
             };
             let c_attrs = ReprAttrs { c: true, align: attrs.align, ..ReprAttrs::RUST };
-            return self.tagged(t, n, tag, 0, start, c_attrs, Order::Declaration, &fields_of, discrs);
+            return self.tagged(t, n, tag, 0, start, c_attrs, Order::Declaration, &fields_of, discrs, scratch);
         }
 
         // repr(Rust): rustc's `layout_of_enum` (crates/rustc_abi/src/layout.rs, the pinned
         // toolchain's), each step named there. Each variant alone, as a struct.
-        let mut probes: Vec<Probe, A> = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut probes: Vec<Probe, Alloc<'_>> = Vec::with_capacity_in(n, scratch);
         for v in 0..n {
             let fs = fields_of(v)?;
             let mut one_zst = true;
@@ -1935,7 +1938,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 let l = self.get(self.done(p).ok_or(Refusal::Malformed("a field not laid out"))?);
                 one_zst &= l.is_zst() && l.align == 0;
             }
-            let u = self.univariant(fs, Order::Decreasing, attrs, 0, 0)?;
+            let u = self.univariant(fs, Order::Decreasing, attrs, 0, 0, scratch)?;
             self.offsets.truncate(u.first as usize);
             // `absent`: uninhabited and every field a 1-ZST (size 0 AND alignment 1: a variant
             // holding `([u64; 0], !)` keeps the enum's alignment, so it is laid out).
@@ -1950,7 +1953,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         }
         if present_count == 1 {
             let v = probes.iter().position(|p| !p.absent).ok_or(Refusal::Malformed("an enum's one present variant not found"))?;
-            let u = self.univariant(fields_of(v)?, Order::Decreasing, attrs, 0, 0)?;
+            let u = self.univariant(fields_of(v)?, Order::Decreasing, attrs, 0, 0, scratch)?;
             let mut l = self.struct_row(t, u);
             l.variants = Variants::Single { index: v as u32 };
             l.discrs = discrs;
@@ -1961,7 +1964,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         // uninhabited field (`necessary_discriminants`; the others are never built): the
         // smallest integer of at least 8 bits holding `min(0, ..)..=max(0, ..)` of them, signed
         // when one is negative (`discr_range_of_repr`).
-        let mut necessary: Vec<i128, A> = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut necessary: Vec<i128, Alloc<'_>> = Vec::with_capacity_in(n, scratch);
         for (v, p) in probes.iter().enumerate() {
             if !p.uninhabited {
                 necessary.push(self.discrs[discr_first as usize + v]);
@@ -1979,7 +1982,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         let mut start_align: Option<u8> = None;
         for v in 0..n {
             let fs = fields_of(v)?;
-            let u = self.univariant(fs, Order::Increasing, ReprAttrs { align: None, ..attrs }, min_prim.size(), min_prim.align())?;
+            let u = self.univariant(fs, Order::Increasing, ReprAttrs { align: None, ..attrs }, min_prim.size(), min_prim.align(), scratch)?;
             let mut lowest: Option<(u64, u8)> = None;
             for (i, &p) in fs.iter().enumerate() {
                 let l = *self.get(self.done(p).ok_or(Refusal::Malformed("a field not laid out"))?);
@@ -2003,11 +2006,11 @@ impl<A: Allocator + Clone> Layouts<A> {
         // Its valid values: the smallest wrapping range holding every necessary discriminant at
         // the tag's width (`WrappingRange::smallest_range_containing`).
         let tag_bits = tag_prim.bits();
-        let mut values: Vec<u128, A> = Vec::with_capacity_in(necessary.len(), self.alloc.clone());
+        let mut values: Vec<u128, Alloc<'_>> = Vec::with_capacity_in(necessary.len(), scratch);
         values.extend(necessary.iter().map(|&d| (d as u128) & mask(tag_bits)));
         let tag = Scalar { prim: tag_prim, valid: smallest_range(&mut values, tag_bits) };
         let mark = (self.offsets.len(), self.variant_rows.len(), self.rows.len());
-        let tagged = self.tagged(t, n, tag, 0, tag_prim.size(), attrs, Order::Increasing, &fields_of, discrs)?;
+        let tagged = self.tagged(t, n, tag, 0, tag_prim.size(), attrs, Order::Increasing, &fields_of, discrs, scratch)?;
         #[cfg(test)]
         if self.niche_off {
             return Ok(tagged);
@@ -2035,7 +2038,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         // after it (from the niche's end rounded up to its own alignment), or there is no niche
         // layout; one placed after has all its fields moved by that offset.
         let niche_end = niche.offset + reserved.prim.size();
-        let mut shift: Vec<u64, A> = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut shift: Vec<u64, Alloc<'_>> = Vec::with_capacity_in(n, scratch);
         for (v, p) in probes.iter().enumerate() {
             if v == largest || p.size <= niche.offset {
                 shift.push(0);
@@ -2060,9 +2063,9 @@ impl<A: Allocator + Clone> Layouts<A> {
         self.offsets.truncate(mark.0);
         self.variant_rows.truncate(mark.1);
         self.rows.truncate(mark.2);
-        let mut variant_ids: Vec<LayoutId, A> = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut variant_ids: Vec<LayoutId, Alloc<'_>> = Vec::with_capacity_in(n, scratch);
         for v in 0..n {
-            let u = self.univariant(fields_of(v)?, Order::Decreasing, attrs, 0, 0)?;
+            let u = self.univariant(fields_of(v)?, Order::Decreasing, attrs, 0, 0, scratch)?;
             for off in &mut self.offsets[u.first as usize..(u.first + u.len) as usize] {
                 *off += shift[v];
             }
@@ -2146,6 +2149,7 @@ impl<A: Allocator + Clone> Layouts<A> {
     /// A tagged layout: the tag at `tag_offset`, each variant's fields placed from `start` in
     /// `order`.
     #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "tagged enum layout takes tag, start, attrs, order, fields and scratch")]
     fn tagged<'p>(
         &mut self,
         t: PTy,
@@ -2157,14 +2161,15 @@ impl<A: Allocator + Clone> Layouts<A> {
         order: Order,
         fields_of: &dyn Fn(usize) -> Result<&'p [PTy], Refusal>,
         discrs: (u32, u32),
+        scratch: Alloc<'_>,
     ) -> Result<LayoutId, Refusal> {
         let tag_align = tag.prim.align();
-        let mut unis: Vec<Uni, A> = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut unis: Vec<Uni, Alloc<'_>> = Vec::with_capacity_in(n, scratch);
         let mut size = 0u64;
         let mut align = tag_align;
         let mut uninhabited = true;
         for v in 0..n {
-            let u = self.univariant(fields_of(v)?, order, ReprAttrs { align: None, ..attrs }, start, tag_align)?;
+            let u = self.univariant(fields_of(v)?, order, ReprAttrs { align: None, ..attrs }, start, tag_align, scratch)?;
             size = size.max(u.size);
             align = align.max(u.align);
             uninhabited &= u.uninhabited;
@@ -2175,7 +2180,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         }
         let size = align_up(size, align)?;
         let first = self.variant_rows.len() as u32;
-        let mut ids: Vec<LayoutId, A> = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut ids: Vec<LayoutId, Alloc<'_>> = Vec::with_capacity_in(n, scratch);
         for (v, u) in unis.iter().enumerate() {
             let id = self.push(Layout {
                 ty: t,
