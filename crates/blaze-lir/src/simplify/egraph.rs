@@ -20,7 +20,7 @@ use super::{
     dce::{Edit, Item, NONE, dead, each, filled, rebuild, reachable},
 };
 use crate::{
-    Block, Flags, Func, IntCond, Op, Ty, View,
+    Block, Flags, FloatCond, Func, IntCond, Op, Scalar, Ty, View,
     arith::{binary, compare, iconst_value, sext, unary, wide_value},
     op::{Field, Layout},
     verify,
@@ -151,6 +151,125 @@ fn fmul_operands(view: &View<'_>, stands: &[u32], v: u32, ty: Ty) -> Option<[u32
     let ma = stand_of(stands, view.extra.get(mat).copied()?)?;
     let mb = stand_of(stands, view.extra.get(mat.checked_add(1)?).copied()?)?;
     Some([ma, mb])
+}
+
+#[inline]
+fn low_u32(v: u128) -> u32 {
+    let b = v.to_le_bytes();
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+#[inline]
+fn low_u64(v: u128) -> u64 {
+    let b = v.to_le_bytes();
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+/// Bit-exact IEEE-754 unary float constant folding (`Fneg`, `Fabs`) for `f32` and `f64`.
+#[inline]
+fn fold_float_unary(op: Op, ty: Ty, bits: u128) -> Option<u128> {
+    if !ty.is_scalar() {
+        return None;
+    }
+    match (ty.elem(), op) {
+        (Scalar::F32, Op::Fneg) => Some(u128::from(low_u32(bits) ^ (1u32 << 31))),
+        (Scalar::F32, Op::Fabs) => Some(u128::from(low_u32(bits) & !(1u32 << 31))),
+        (Scalar::F64, Op::Fneg) => Some(u128::from(low_u64(bits) ^ (1u64 << 63))),
+        (Scalar::F64, Op::Fabs) => Some(u128::from(low_u64(bits) & !(1u64 << 63))),
+        _ => None,
+    }
+}
+
+/// Deterministic IEEE-754 binary float constant folding for `f32` and `f64`.
+/// Skips NaN-producing ops so NaN payload conventions remain 100% target- and eval-identical.
+#[inline]
+fn fold_float_binary(op: Op, ty: Ty, a_bits: u128, b_bits: u128) -> Option<u128> {
+    if !ty.is_scalar() {
+        return None;
+    }
+    match ty.elem() {
+        Scalar::F32 => {
+            let (au, bu) = (low_u32(a_bits), low_u32(b_bits));
+            if op == Op::Fcopysign {
+                let sign = 1u32 << 31;
+                return Some(u128::from((au & !sign) | (bu & sign)));
+            }
+            let (fa, fb) = (f32::from_bits(au), f32::from_bits(bu));
+            if fa.is_nan() || fb.is_nan() {
+                return None;
+            }
+            let r = match op {
+                Op::Fadd => fa + fb,
+                Op::Fsub => fa - fb,
+                Op::Fmul => fa * fb,
+                Op::Fdiv => fa / fb,
+                Op::FminNum | Op::Fminimum if fa != 0.0 || fb != 0.0 => fa.min(fb),
+                Op::FmaxNum | Op::Fmaximum if fa != 0.0 || fb != 0.0 => fa.max(fb),
+                _ => return None,
+            };
+            (!r.is_nan()).then(|| u128::from(r.to_bits()))
+        }
+        Scalar::F64 => {
+            let (au, bu) = (low_u64(a_bits), low_u64(b_bits));
+            if op == Op::Fcopysign {
+                let sign = 1u64 << 63;
+                return Some(u128::from((au & !sign) | (bu & sign)));
+            }
+            let (fa, fb) = (f64::from_bits(au), f64::from_bits(bu));
+            if fa.is_nan() || fb.is_nan() {
+                return None;
+            }
+            let r = match op {
+                Op::Fadd => fa + fb,
+                Op::Fsub => fa - fb,
+                Op::Fmul => fa * fb,
+                Op::Fdiv => fa / fb,
+                Op::FminNum | Op::Fminimum if fa != 0.0 || fb != 0.0 => fa.min(fb),
+                Op::FmaxNum | Op::Fmaximum if fa != 0.0 || fb != 0.0 => fa.max(fb),
+                _ => return None,
+            };
+            (!r.is_nan()).then(|| u128::from(r.to_bits()))
+        }
+        _ => None,
+    }
+}
+
+/// Bit-exact IEEE-754 float comparison constant folding across all 16 [`FloatCond`] predicates
+/// (including `NaN`, `-0.0`, `+0.0`, and `±Inf`).
+#[inline]
+fn fold_float_cmp(cond: FloatCond, ty: Ty, a_bits: u128, b_bits: u128) -> Option<bool> {
+    if !ty.is_scalar() {
+        return None;
+    }
+    let (unordered, ord_eq, ord_lt, ord_gt) = match ty.elem() {
+        Scalar::F32 => {
+            let (fa, fb) = (f32::from_bits(low_u32(a_bits)), f32::from_bits(low_u32(b_bits)));
+            (fa.is_nan() || fb.is_nan(), fa == fb, fa < fb, fa > fb)
+        }
+        Scalar::F64 => {
+            let (fa, fb) = (f64::from_bits(low_u64(a_bits)), f64::from_bits(low_u64(b_bits)));
+            (fa.is_nan() || fb.is_nan(), fa == fb, fa < fb, fa > fb)
+        }
+        _ => return None,
+    };
+    Some(match cond {
+        FloatCond::False => false,
+        FloatCond::True => true,
+        FloatCond::Ord => !unordered,
+        FloatCond::Uno => unordered,
+        FloatCond::Oeq => !unordered && ord_eq,
+        FloatCond::Ogt => !unordered && ord_gt,
+        FloatCond::Oge => !unordered && (ord_gt || ord_eq),
+        FloatCond::Olt => !unordered && ord_lt,
+        FloatCond::Ole => !unordered && (ord_lt || ord_eq),
+        FloatCond::One => !unordered && !ord_eq,
+        FloatCond::Ueq => unordered || ord_eq,
+        FloatCond::Ugt => unordered || ord_gt,
+        FloatCond::Uge => unordered || ord_gt || ord_eq,
+        FloatCond::Ult => unordered || ord_lt,
+        FloatCond::Ule => unordered || ord_lt || ord_eq,
+        FloatCond::Une => unordered || !ord_eq,
+    })
 }
 
 impl ENodeKey {
@@ -765,6 +884,19 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                             let Some(&raw_a) = view.data.get(inst) else { continue };
                             let Some(a) = stand_of(&stands, raw_a) else { continue };
                             let ai = u32_ix(a);
+                            // Exact IEEE-754 constant folding for unary float ops (`fneg`, `fabs`).
+                            if let Some(ca) = known_const.get(ai).copied().flatten()
+                                && let Some(res) = fold_float_unary(op, ty, ca)
+                            {
+                                if let Some(slot) = known_const.get_mut(inst) {
+                                    *slot = Some(res);
+                                }
+                                if let Some(slot) = edit_const.get_mut(inst) {
+                                    *slot = Some(res);
+                                }
+                                stats.constants_folded += 1;
+                                continue;
+                            }
                             let a_op = view.op(ai);
                             let a_plain = view.flags.get(ai).copied().unwrap_or(1) == 0;
                             // `fneg(fneg(x)) == x` (IEEE-754 bit-exact sign-bit involution).
@@ -845,6 +977,21 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                                 )
                                 && let (Some(a), Some(b)) = (stand_of(&stands, ra), stand_of(&stands, rb))
                             {
+                                // Exact IEEE-754 constant folding for binary float ops.
+                                if let (Some(ca), Some(cb)) = (
+                                    known_const.get(u32_ix(a)).copied().flatten(),
+                                    known_const.get(u32_ix(b)).copied().flatten(),
+                                ) && let Some(res) = fold_float_binary(op, ty, ca, cb)
+                                {
+                                    if let Some(slot) = known_const.get_mut(inst) {
+                                        *slot = Some(res);
+                                    }
+                                    if let Some(slot) = edit_const.get_mut(inst) {
+                                        *slot = Some(res);
+                                    }
+                                    stats.constants_folded += 1;
+                                    continue;
+                                }
                                 let key = ENodeKey { op: inst_op_byte(&view, inst), ty: ty.0, cond: 0, a, b, c: 0 };
                                 if let Some(prev) = table.get_or_insert(key, inst_id) {
                                     if let Some(st) = stands.get_mut(inst) {
@@ -892,6 +1039,24 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                                 && let (Some(cond_u8), Some(a), Some(b)) =
                                     (u8::try_from(cond_raw).ok(), stand_of(&stands, ra), stand_of(&stands, rb))
                             {
+                                // Exact IEEE-754 constant folding for `fcmp` (feeds `select` folding!).
+                                if let (Some(cond), Some(&raw_op_ty), Some(ca), Some(cb)) = (
+                                    FloatCond::from_word(cond_raw),
+                                    view.tys.get(u32_ix(a)),
+                                    known_const.get(u32_ix(a)).copied().flatten(),
+                                    known_const.get(u32_ix(b)).copied().flatten(),
+                                ) && let Some(truth) = fold_float_cmp(cond, Ty(raw_op_ty), ca, cb)
+                                {
+                                    let cval = u128::from(truth);
+                                    if let Some(slot) = known_const.get_mut(inst) {
+                                        *slot = Some(cval);
+                                    }
+                                    if let Some(slot) = edit_const.get_mut(inst) {
+                                        *slot = Some(cval);
+                                    }
+                                    stats.constants_folded += 1;
+                                    continue;
+                                }
                                 let key = ENodeKey { op: inst_op_byte(&view, inst), ty: ty.0, cond: cond_u8, a, b, c: 0 };
                                 if let Some(prev) = table.get_or_insert(key, inst_id) {
                                     if let Some(st) = stands.get_mut(inst) {
@@ -2205,6 +2370,70 @@ mod tests {
         assert_eq!(
             eval::run_in(contract_opt.func.view(), &args, 10_000, alloc).unwrap(),
             eval::run_in(exact.view(), &args, 10_000, alloc).unwrap(),
+        );
+    }
+
+    #[test]
+    fn aegraph_folds_constant_floats_and_fcmp_select_bit_exact() {
+        let alloc = Global;
+        let mut b = Builder::<Global, Full>::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::F64)], &[Param::of(Ty::F64)]);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let x = b.param(Ty::F64);
+        // Constant float chain: `((-3.5) * (-2.0) + 1.0) / 2.0 == 4.0`, then `fcmp ogt 4.0, 3.0 == true`,
+        // then `select(true, x + 4.0, x - 99.0) -> x + 4.0`!
+        let c_neg35 = b.fconst(Ty::F64, u128::from((-3.5_f64).to_bits()));
+        let c_pos35 = b.unary(Op::Fabs, Flags::NONE, c_neg35); // 3.5
+        let c_2 = b.fconst(Ty::F64, u128::from(2.0_f64.to_bits()));
+        let c_neg2 = b.unary(Op::Fneg, Flags::NONE, c_2); // -2.0
+        let prod = b.binary(Op::Fmul, Flags::NONE, c_neg35, c_neg2); // 7.0
+        let c_1 = b.fconst(Ty::F64, u128::from(1.0_f64.to_bits()));
+        let sum = b.binary(Op::Fadd, Flags::NONE, prod, c_1); // 8.0
+        let quot = b.binary(Op::Fdiv, Flags::NONE, sum, c_2); // 4.0
+        let cmp = b.fcmp(FloatCond::Ogt, quot, c_pos35); // 4.0 > 3.5 -> true!
+        let then_v = b.binary(Op::Fadd, Flags::NONE, x, quot);
+        let c_99 = b.fconst(Ty::F64, u128::from(99.0_f64.to_bits()));
+        let else_v = b.binary(Op::Fsub, Flags::NONE, x, c_99);
+        let picked = b.select(Flags::NONE, cmp, then_v, else_v);
+        b.ret(&[picked]);
+        let func = b.finish_checked().unwrap();
+
+        let out = aegraph_optimize(func.view(), alloc).unwrap();
+        assert!(out.stats.constants_folded >= 6, "stats={:?}", out.stats);
+        assert!(out.stats.identities_folded >= 1, "expected select to fold: stats={:?}", out.stats);
+        // Dead `Fsub`, `Fcmp`, `Select`, `Fdiv`, `Fmul` must all be swept away!
+        let ops: std::vec::Vec<Op> = (0..out.func.ops.len()).map(|i| out.func.view().op(i)).collect();
+        assert!(!ops.contains(&Op::Select), "select should fold away: {ops:?}");
+        assert!(!ops.contains(&Op::Fcmp), "fcmp should fold away: {ops:?}");
+        assert!(!ops.contains(&Op::Fsub), "dead else branch fsub should be swept: {ops:?}");
+        assert!(!ops.contains(&Op::Fdiv), "constant fdiv should fold: {ops:?}");
+        assert!(!ops.contains(&Op::Fmul), "constant fmul should fold: {ops:?}");
+
+        for &xv in &[1.25_f64, -4.0, 0.0, -0.0, f64::INFINITY] {
+            let args = [Val::Int(u128::from(xv.to_bits()))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(out.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "constant float folding mismatch on {xv:?}");
+        }
+
+        // Also test NaN `fcmp` (`Oeq` false, `Une` true) folds bit-exact!
+        let mut bn = Builder::<Global, Full>::new_in(64, alloc);
+        let sign = bn.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I1)]);
+        bn.set_signature(sign);
+        let e = bn.create_block(BlockKind::Normal);
+        bn.begin(e);
+        let nan = bn.fconst(Ty::F64, u128::from(f64::NAN.to_bits()));
+        let one = bn.fconst(Ty::F64, u128::from(1.0_f64.to_bits()));
+        let une = bn.fcmp(FloatCond::Une, nan, one);
+        bn.ret(&[une]);
+        let fn_nan = bn.finish_checked().unwrap();
+        let opt_nan = aegraph_optimize(fn_nan.view(), alloc).unwrap();
+        assert_eq!(opt_nan.stats.constants_folded, 1);
+        assert_eq!(
+            eval::run_in(fn_nan.view(), &[], 10_000, alloc).unwrap(),
+            eval::run_in(opt_nan.func.view(), &[], 10_000, alloc).unwrap(),
         );
     }
 }
