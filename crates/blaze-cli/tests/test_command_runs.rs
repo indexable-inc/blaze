@@ -105,7 +105,15 @@ fn fixture<T>(name: &str, files: &[(&str, &str)], check: impl FnOnce(&Path, &Pat
         write_source(&path, source, name);
     }
     let result = check(&dir, &home);
-    std::fs::remove_dir_all(&base).expect("remove the scratch command fixture");
+    // A detached `blaze gc --background` child may still be unlinking its lock file inside `home`.
+    for attempt in 0..20 {
+        match std::fs::remove_dir_all(&base) {
+            Ok(()) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) if attempt + 1 < 20 => std::thread::sleep(Duration::from_millis(50)),
+            Err(err) => panic!("remove the scratch command fixture: {err}"),
+        }
+    }
     result
 }
 
