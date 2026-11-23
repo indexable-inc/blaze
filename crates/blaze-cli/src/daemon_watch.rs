@@ -40,6 +40,11 @@ use crate::sweep::{ABSENT, AT_MOD_RS, BOTH, DIRECT_PATH, FACT_MOUNT, LeafKind, L
 /// switching to [`WatchBackend::FsEventsHeld`].
 pub(crate) const KQUEUE_CAP: usize = 32_768;
 
+/// Maximum total Phase-1 directory probes (real dirs + optional `MODULE` stem dirs) before
+/// switching to [`WatchBackend::FsEventsHeld`] so monorepo-scale absent `MODULE` stems cannot
+/// cause unbounded synchronous `openat` probes.
+const MAX_DIR_PROBES: usize = KQUEUE_CAP * 2;
+
 /// Deadline for starting the passive in-process FSEvents stream at daemon startup.
 const HOLD_START_WAIT: Duration = Duration::from_secs(5);
 
@@ -200,7 +205,7 @@ impl<'d> CheckoutWatcher<'d> {
         self.has_unwatched_scripts = has_unwatched_script_leaf(leaves);
         #[cfg(target_os = "macos")]
         {
-            let tags_has_subdirs = git_tags_has_subdirs(cx, root, leaves);
+            let tags_has_subdirs = git_tags_has_subdirs(cx, root, leaves, frame);
             match KqueueVnode::arm_with_env(
                 self.checkout_root.as_str(),
                 self.home_blaze_root.as_deref(),
@@ -343,34 +348,61 @@ fn has_unwatched_script_leaf(leaves: &Leaves<'_>) -> bool {
     false
 }
 
-/// If any `ScriptGit` leaf runs `describe`, checks whether `.git/refs/tags` contains nested
-/// subdirectories (in which case watching `.git/refs/tags` alone wouldn't see writes in subdirs).
+/// If any `ScriptGit` leaf runs `describe`, checks whether `<repo>/.git/refs/tags` for the
+/// nearest enclosing repository of that leaf's folder contains nested subdirectories (in which
+/// case watching `refs/tags` alone wouldn't see writes in subdirs).
 #[cfg(target_os = "macos")]
-fn git_tags_has_subdirs(cx: &Cx, root: &Dir<ReadWrite>, leaves: &Leaves<'_>) -> bool {
-    let mut needs_tags = false;
+fn git_tags_has_subdirs(cx: &Cx, root: &Dir<ReadWrite>, leaves: &Leaves<'_>, frame: &Frame) -> bool {
     for i in 0..leaves.len() {
         let row = leaves.row(i);
-        if row.kind == LeafKind::ScriptGit {
-            let path = leaves.path(i);
-            if let Some((_, cmd)) = path.split_once('\n')
-                && cmd.starts_with("describe ")
+        if row.kind != LeafKind::ScriptGit {
+            continue;
+        }
+        let path = leaves.path(i);
+        let Some((folder, cmd)) = path.split_once('\n') else {
+            return true;
+        };
+        if !cmd.starts_with("describe ") {
+            continue;
+        }
+        // Walk up from `folder` to checkout root `""` to locate the enclosing `.git` directory.
+        let mut cur = folder.trim_matches('/');
+        let mut found_repo = false;
+        for _ in 0..64 {
+            let dot_git = if cur.is_empty() {
+                bstd::mem::format_in!(frame, ".git")
+            } else {
+                bstd::mem::format_in!(frame, "{cur}/.git")
+            };
+            if let Ok(gp) = bstd::path::Path::new(dot_git.as_str())
+                && matches!(root.stat(cx, &gp), Ok(Some(_)))
             {
-                needs_tags = true;
+                found_repo = true;
+                let tags_rel = bstd::mem::format_in!(frame, "{}/refs/tags", dot_git.as_str());
+                let Ok(tp) = bstd::path::Path::new(tags_rel.as_str()) else {
+                    return true;
+                };
+                match root.entries(cx, &tp) {
+                    Ok(Some(listed)) => {
+                        if (0..listed.len()).any(|j| listed.kind(j) == bstd::fs::EntryKind::Dir) {
+                            return true;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => return true,
+                }
                 break;
             }
+            if cur.is_empty() {
+                break;
+            }
+            cur = cur.rsplit_once('/').map_or("", |(parent, _)| parent);
+        }
+        if !found_repo {
+            return true;
         }
     }
-    if !needs_tags {
-        return false;
-    }
-    let Ok(p) = bstd::path::Path::new(".git/refs/tags") else {
-        return true;
-    };
-    match root.entries(cx, &p) {
-        Ok(Some(listed)) => (0..listed.len()).any(|i| listed.kind(i) == bstd::fs::EntryKind::Dir),
-        Ok(None) => false,
-        Err(_) => true,
-    }
+    false
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -387,6 +419,10 @@ pub(crate) struct KqueueVnode {
     /// Leaves whose direct parent dir did not exist at arm time (so creation of an intermediate
     /// directory under root or an ancestor must dirty them).
     orphan_leaves: Vec<AString<'static>, Alloc<'static>>,
+    /// Root-level watched directories that are symlinks (e.g. `member -> target-a`): atomic
+    /// retargeting fires `NOTE_WRITE` on the checkout root without touching the old target inode,
+    /// so `root_dir_wrote` must dirty every leaf beneath these prefixes.
+    root_symlink_dirs: Vec<AString<'static>, Alloc<'static>>,
     /// Dirty paths discovered during zero-TOCTOU post-`EV_ADD` verification.
     initial_dirty: Vec<AString<'static>, Alloc<'static>>,
     /// True only when a structural/inode mismatch or absent-file appearance during `arm` requires
@@ -529,10 +565,15 @@ fn cpath_of<'a>(abs: &str, buf: &'a mut [u8; 4096]) -> Option<blaze_sys::Path<'a
 }
 
 #[cfg(target_os = "macos")]
-fn read_git_head_ref<'a>(checkout_root: &str, out: &'a mut [u8; 512]) -> Option<&'a str> {
+fn read_git_head_ref<'a>(checkout_root: &str, repo_rel: &str, out: &'a mut [u8; 512], frame: &Frame) -> Option<&'a str> {
     use blaze_sys::posix::io::{CWD, OpenFlags, openat, read};
     let mut path_buf = [0u8; 4096];
-    let cpath = join_abs(checkout_root, ".git/HEAD", &mut path_buf)?;
+    let head_rel = if repo_rel.is_empty() {
+        bstd::mem::format_in!(frame, ".git/HEAD")
+    } else {
+        bstd::mem::format_in!(frame, "{repo_rel}/.git/HEAD")
+    };
+    let cpath = join_abs(checkout_root, head_rel.as_str(), &mut path_buf)?;
     let fd = openat(CWD, cpath, OpenFlags::READ.with(OpenFlags::CLOSE_ON_EXEC), 0).ok()?;
     let mut filled = 0usize;
     while filled < out.len() {
@@ -604,7 +645,7 @@ impl KqueueVnode {
     ) -> Option<KqueueVnode> {
         use blaze_sys::Errno;
         use blaze_sys::posix::io::{CWD, Filter, Kevent, KeventFlags, OpenFlags, kqueue, kevent, openat, set_close_on_exec};
-        use blaze_sys::posix::proc::{AT_SYMLINK_NOFOLLOW, S_IFDIR, S_IFMT, stat_at, stat_fd};
+        use blaze_sys::posix::proc::{AT_SYMLINK_NOFOLLOW, S_IFDIR, S_IFLNK, S_IFMT, stat_at, stat_fd};
 
         let mut dir_set: BTreeSet<AString<'static>, Alloc<'static>> = BTreeSet::new_in(heap);
         dir_set.insert(AString::from_str_in("", heap));
@@ -617,6 +658,7 @@ impl KqueueVnode {
         let mut watch_files: Vec<(AString<'static>, Option<Stamp>, bool), Alloc<'static>> = Vec::new_in(heap);
         let mut absent_checks: Vec<(AString<'static>, bool), Alloc<'static>> = Vec::new_in(heap);
         let mut home_leaves: Vec<(AString<'static>, Option<Stamp>, bool), Alloc<'static>> = Vec::new_in(heap);
+        let mut git_folders: BTreeSet<AString<'static>, Alloc<'static>> = BTreeSet::new_in(heap);
         let mut saw_git = false;
         let mut has_status_git = false;
         let mut saw_facts = false;
@@ -634,6 +676,10 @@ impl KqueueVnode {
                 LeafKind::ScriptGit => {
                     saw_git = true;
                     if is_status_git_leaf(path) {
+                        has_status_git = true;
+                    } else if let Some((folder, _)) = path.split_once('\n') {
+                        git_folders.insert(AString::from_str_in(folder.trim_matches('/'), heap));
+                    } else {
                         has_status_git = true;
                     }
                     continue;
@@ -744,18 +790,19 @@ impl KqueueVnode {
             }
         });
 
-        let git_count = if saw_git { GIT_WATCH_PATHS.len() + 8 } else { 0 };
+        let git_count = if saw_git { git_folders.len().max(1).saturating_mul(GIT_WATCH_PATHS.len() + 8) } else { 0 };
         let fact_count = if saw_facts { 2 } else { 0 };
         // Pre-reject only on real directories + files + home/git/fact watches (NOT nonexistent
         // `MODULE` stem directories); actual opened FDs are still hard-capped at `KQUEUE_CAP`
-        // inside every registration loop below.
+        // inside every registration loop below, and total Phase-1 probes (including optional
+        // `MODULE` stem dirs) are bounded by `MAX_DIR_PROBES`.
         let estimated = dir_set
             .len()
             .saturating_add(watch_files.len())
             .saturating_add(home_leaves.len())
             .saturating_add(git_count)
             .saturating_add(fact_count);
-        if estimated > KQUEUE_CAP {
+        if estimated > KQUEUE_CAP || dir_set.len().saturating_add(stem_dirs.len()) > MAX_DIR_PROBES {
             return None;
         }
 
@@ -775,6 +822,7 @@ impl KqueueVnode {
 
         let mut entries: Vec<WatchEntry, Alloc<'static>> = Vec::with_capacity_in(estimated.min(KQUEUE_CAP), heap);
         let mut watched_dirs: BTreeSet<AString<'static>, Alloc<'static>> = BTreeSet::new_in(heap);
+        let mut root_symlink_dirs: Vec<AString<'static>, Alloc<'static>> = Vec::new_in(heap);
         let mut initial_dirty: Vec<AString<'static>, Alloc<'static>> = Vec::new_in(heap);
         let mut initial_needs_refresh = false;
         let mut initial_home_dirty = false;
@@ -857,6 +905,12 @@ impl KqueueVnode {
                 // Live dir inode IS watched on `kq`; mark dirty for the next poll without
                 // triggering a full kqueue rebuild.
                 initial_dirty.push(AString::from_str_in(dir_rel.as_str(), heap));
+            }
+            if !dir_rel.is_empty()
+                && !dir_rel.as_str().contains('/')
+                && stat_at(CWD, cpath, AT_SYMLINK_NOFOLLOW).is_ok_and(|l| (l.st_mode & S_IFMT) == S_IFLNK)
+            {
+                root_symlink_dirs.push(AString::from_str_in(dir_rel.as_str(), heap));
             }
             watched_dirs.insert(AString::from_str_in(dir_rel.as_str(), heap));
             entries.push(WatchEntry { _fd: fd, kind: EntryKind::CheckoutDir, rel: dir_rel });
@@ -1027,23 +1081,64 @@ impl KqueueVnode {
             initial_home_dirty = true;
         }
 
-        // PHASE 3b: Watch `.git` files/dirs + resolved HEAD ref if any non-status `ScriptGit` leaf exists.
+        // PHASE 3b: Resolve and watch each `ScriptGit` leaf folder's enclosing `.git` repository
+        // (including nested repos and intermediate directories where a new `.git` could appear).
         let mut git_watched = !saw_git;
-        if saw_git && !has_status_git && git_tags_flat {
-            // Confirm `.git` is a real directory (not a worktree file or symlink).
-            let git_is_dir = join_abs(checkout_root, ".git", &mut path_buf)
-                .and_then(|cpath| stat_at(CWD, cpath, AT_SYMLINK_NOFOLLOW).ok())
-                .is_some_and(|st| (st.st_mode & S_IFMT) == S_IFDIR);
-            if git_is_dir {
-                let mut git_paths: BTreeSet<AString<'static>, Alloc<'static>> = BTreeSet::new_in(heap);
-                for p in GIT_WATCH_PATHS {
-                    git_paths.insert(AString::from_str_in(p, heap));
+        if saw_git && !has_status_git && git_tags_flat && !git_folders.is_empty() {
+            let mut git_paths: BTreeSet<AString<'static>, Alloc<'static>> = BTreeSet::new_in(heap);
+            let mut required_git_paths: Vec<AString<'static>, Alloc<'static>> = Vec::new_in(heap);
+            let mut repos_ok = true;
+            for folder in git_folders.iter() {
+                let mut cur = folder.as_str();
+                let mut found_repo: Option<&str> = None;
+                for _ in 0..64 {
+                    let dot_git = if cur.is_empty() {
+                        bstd::mem::format_in!(frame, ".git")
+                    } else {
+                        bstd::mem::format_in!(frame, "{cur}/.git")
+                    };
+                    if let Some(cpath) = join_abs(checkout_root, dot_git.as_str(), &mut path_buf)
+                        && let Ok(st) = stat_at(CWD, cpath, AT_SYMLINK_NOFOLLOW)
+                    {
+                        if (st.st_mode & S_IFMT) == S_IFDIR {
+                            found_repo = Some(cur);
+                        } else {
+                            // Gitlink file or symlink `.git` -> keep on safe re-ask path.
+                            repos_ok = false;
+                        }
+                        break;
+                    }
+                    // Watch this intermediate directory so creating a closer `.git` invalidates.
+                    git_paths.insert(AString::from_str_in(cur, heap));
+                    if cur.is_empty() {
+                        break;
+                    }
+                    cur = cur.rsplit_once('/').map_or("", |(parent, _)| parent);
                 }
+                let Some(repo) = found_repo else {
+                    repos_ok = false;
+                    break;
+                };
+                let prefix_path = |sub: &str| -> AString<'static> {
+                    if repo.is_empty() {
+                        AString::from_str_in(sub, heap)
+                    } else {
+                        let mut s = AString::from_str_in(repo, heap);
+                        s.push_str("/");
+                        s.push_str(sub);
+                        s
+                    }
+                };
+                for p in GIT_WATCH_PATHS {
+                    git_paths.insert(prefix_path(p));
+                }
+                required_git_paths.push(prefix_path(".git"));
+                required_git_paths.push(prefix_path(".git/HEAD"));
                 let mut head_buf = [0u8; 512];
-                if let Some(ref_rel) = read_git_head_ref(checkout_root, &mut head_buf) {
-                    let mut full = AString::from_str_in(".git/", heap);
+                if let Some(ref_rel) = read_git_head_ref(checkout_root, repo, &mut head_buf, frame) {
+                    let mut full = prefix_path(".git/");
                     full.push_str(ref_rel);
-                    // Add all ancestor directories under `.git/` (e.g. `.git/refs/heads/fix` for `fix/foo`).
+                    // Add all ancestor directories under `<repo>/.git/`.
                     let mut at = 0usize;
                     for (idx, byte) in full.as_str().bytes().enumerate() {
                         if byte == b'/' && idx > at {
@@ -1055,8 +1150,9 @@ impl KqueueVnode {
                     }
                     git_paths.insert(full);
                 }
-                let mut watched_dot_git = false;
-                let mut watched_head = false;
+            }
+            if repos_ok {
+                let mut watched_git_set: BTreeSet<AString<'static>, Alloc<'static>> = BTreeSet::new_in(heap);
                 for git_rel in git_paths {
                     if entries.len() >= KQUEUE_CAP {
                         return None;
@@ -1085,14 +1181,10 @@ impl KqueueVnode {
                     if kevent(kq.fd(), &[ev], &mut [], None).is_err() {
                         return None;
                     }
-                    if git_rel.as_str() == ".git" {
-                        watched_dot_git = true;
-                    } else if git_rel.as_str() == ".git/HEAD" {
-                        watched_head = true;
-                    }
+                    watched_git_set.insert(AString::from_str_in(git_rel.as_str(), heap));
                     entries.push(WatchEntry { _fd: fd, kind: EntryKind::GitPath, rel: git_rel });
                 }
-                if watched_dot_git && watched_head {
+                if required_git_paths.iter().all(|req| watched_git_set.contains(req.as_str())) {
                     git_watched = true;
                     // Drain once on the next poll so `CheckoutSweep` proves the post-EV_ADD git
                     // answers match the stored Pointer without rebuilding `KqueueVnode`.
@@ -1203,6 +1295,7 @@ impl KqueueVnode {
             entries,
             leaf_paths,
             orphan_leaves,
+            root_symlink_dirs,
             initial_dirty,
             initial_needs_refresh,
             initial_home_dirty,
@@ -1401,12 +1494,21 @@ impl KqueueVnode {
                 paths.push("");
                 for leaf in self.leaf_paths.iter() {
                     let rel = leaf.as_str();
-                    // Root-level file or root-level `MODULE` slot (`foo.rs` / `foo/mod.rs`).
+                    // Root-level file or root-level `MODULE` slot (`foo.rs` / `foo/mod.rs`), or
+                    // any leaf beneath a root-level symlinked directory (whose atomic retarget
+                    // only fires `NOTE_WRITE` on the checkout root).
                     let is_root_child = !rel.contains('/')
                         || rel.strip_suffix("/mod.rs").is_some_and(|stem| !stem.contains('/'));
-                    if is_root_child {
+                    let under_root_symlink = self.root_symlink_dirs.iter().any(|sym| {
+                        let s = sym.as_str();
+                        rel == s || rel.strip_prefix(s).is_some_and(|rest| rest.starts_with('/'))
+                    });
+                    if is_root_child || under_root_symlink {
                         paths.push(frame.alloc_str(rel));
                     }
+                }
+                for sym in self.root_symlink_dirs.iter() {
+                    paths.push(frame.alloc_str(sym.as_str()));
                 }
                 for orphan in self.orphan_leaves.iter() {
                     paths.push(frame.alloc_str(orphan.as_str()));

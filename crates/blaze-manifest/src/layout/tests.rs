@@ -409,3 +409,37 @@ missing-dev = { path = \"../../../does-not-exist\" }
     let (without, _) = tree.read_opts("", true, false).expect("layout without path packages");
     assert!(without.path_packages.is_empty());
 }
+
+#[test]
+fn unused_patch_with_missing_transitive_path_dep_does_not_fail_layout() {
+    const ROOT_TOML: &str = r#"[workspace]
+members = ["app"]
+
+[patch.crates-io]
+unused-patch = { path = "vendor/unused" }
+"#;
+    const APP_TOML: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    const UNUSED_TOML: &str = r#"[package]
+name = "unused-patch"
+version = "0.3.0"
+edition = "2021"
+
+[dependencies]
+absent-dep = { path = "../does-not-exist" }
+"#;
+    let tree = Tree {
+        files: &[
+            ("Cargo.toml", ROOT_TOML),
+            ("app/Cargo.toml", APP_TOML),
+            ("app/src/lib.rs", ""),
+            ("vendor/unused/Cargo.toml", UNUSED_TOML),
+            ("vendor/unused/src/lib.rs", ""),
+        ],
+    };
+    let (units, _) = tree.read_opts("", true, true).expect("unused patch with missing transitive dep succeeds");
+    assert_eq!(units.members.len(), 1);
+    assert_eq!(units.path_packages.len(), 1);
+    assert_eq!(units.path_packages[0].name.as_str(), "unused-patch");
+    assert_eq!(units.path_packages[0].patched_from.len(), 1);
+    assert_eq!(units.path_packages[0].patched_from[0].as_str(), "crates-io");
+}

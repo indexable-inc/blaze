@@ -585,6 +585,12 @@ pub(crate) fn wake<'a>(
         // waking its stored readers (bodies reading an `include_str!` data file stay on `ready`;
         // any woken `Script` task is refused by `admit` with `PhasesWhy::ScriptRead`).
         if file.kind == blaze_drive::Kind::Given {
+            if group.is_empty() {
+                if let Some(row) = page_for(stored, file, blaze_engine::Ask::Row)?.and_then(|page| page.row(file)) {
+                    moved_cells(file, row.defines(), &[], &mut moved);
+                }
+                continue;
+            }
             let answer = given
                 .binary_search_by_key(&file, |(name, _)| *name)
                 .ok()

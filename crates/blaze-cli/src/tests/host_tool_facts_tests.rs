@@ -51,7 +51,7 @@ impl ScriptRunner for UsbScript {
         let mut checkout = ReadList::new_in(blaze_own::testing::heap().shared());
         // The simulated graph supplies the task. Admit its package reads under the fetched
         // tree contract, exactly as the libusb1-sys unit in tempo is admitted.
-        let unkept = admit_reads(&[observed], RanAs::Wasm, &SpawnSetting::facts_only(pins), false, plant, status, &mut checkout, alloc).err();
+        let unkept = admit_reads(&[observed], RanAs::Wasm, &SpawnSetting::facts_only(pins), None, plant, status, &mut checkout, alloc).err();
         let cells: std::vec::Vec<_> = checkout.iter().map(|read| (read.name(), read.answer)).collect();
         let outputs = Outputs::read(b"cargo::rustc-cfg=vendored\n", "/out", OutputLimits::DEFAULT, alloc).expect("the script's cfg");
         let did = outputs_record(name, &cells, RanAs::Wasm, &outputs, "libusb1-sys 0.7.0");
@@ -134,7 +134,7 @@ impl ScriptRunner for CcScript {
         let observed = cc_version_read(&pins, alloc);
         let (plant, status) = kept.expect("the engine plans script reads");
         let mut checkout = ReadList::new_in(blaze_own::testing::heap().shared());
-        let unkept = admit_reads(&[observed], RanAs::Wasm, &SpawnSetting::facts_only(pins), false, plant, status, &mut checkout, alloc).err();
+        let unkept = admit_reads(&[observed], RanAs::Wasm, &SpawnSetting::facts_only(pins), None, plant, status, &mut checkout, alloc).err();
         let cells: std::vec::Vec<_> = checkout.iter().map(|read| (read.name(), read.answer)).collect();
         let outputs = Outputs::read(b"cargo::rustc-cfg=vendored\n", "/out", OutputLimits::DEFAULT, alloc).expect("the script's cfg");
         let did = outputs_record(name, &cells, RanAs::Wasm, &outputs, "zstd-sys 2.0.16");
@@ -201,7 +201,7 @@ fn incomplete_or_mismatched_pkg_config_observations_stay_unkept() {
         ("some-other-tool\n--version", good.digest),
     ] {
         let observed = Read { subject: subject.into(), digest };
-        for member in [false, true] {
+        for member in [None, Some("")] {
             let mut cells = ReadList::new_in(heap.shared());
             let why = admit_reads(core::slice::from_ref(&observed), RanAs::Wasm, &setting, member, ReadsPlant::None, None, &mut cells, heap.alloc())
                 .expect_err("an incomplete or unsupported observation cannot keep the script");
@@ -291,7 +291,7 @@ exit 1
             let alloc = erased.handle();
             let (plant, status) = kept.expect("the request keeps reads");
             let mut checkout = ReadList::new_in(blaze_own::testing::heap().shared());
-            let unkept = admit_reads(&observed, RanAs::Native, &SpawnSetting::facts_only(pins()), true, plant, status, &mut checkout, alloc).err();
+            let unkept = admit_reads(&observed, RanAs::Native, &SpawnSetting::facts_only(pins()), Some(""), plant, status, &mut checkout, alloc).err();
             assert!(unkept.is_none(), "the registered grant accounts for each read: {unkept:?}");
             let cells: std::vec::Vec<_> = checkout.iter().map(|read| (read.name(), read.answer)).collect();
             let outputs = Outputs::read(&process.stdout, "/out", OutputLimits::DEFAULT, alloc).expect("use what pkg-config printed");
@@ -428,14 +428,14 @@ exit 1
         // Old question-only logs did not record the bytes the child actually received.
         fs::write(&log, format!("a{SUBJECT}\0")).unwrap();
         let old = native_facts::reads(&run, Some(&pins), alloc).unwrap();
-        let rejected = admit_reads(&old.reads, RanAs::Native, &setting, false, ReadsPlant::None, None, &mut cells, alloc).unwrap_err();
+        let rejected = admit_reads(&old.reads, RanAs::Native, &setting, None, ReadsPlant::None, None, &mut cells, alloc).unwrap_err();
         assert_eq!(rejected.first_rejected().1, SUBJECT);
 
         let hex: std::string::String = read.digest.unwrap().0.iter().map(|byte| format!("{byte:02x}")).collect();
         fs::write(&log, format!("apkg-config-reply-v1\n{hex}\n{SUBJECT}\0")).unwrap();
         let receipt = native_facts::reads(&run, Some(&pins), alloc).unwrap();
         cells.clear();
-        admit_reads(&receipt.reads, RanAs::Native, &setting, false, ReadsPlant::None, None, &mut cells, alloc).expect("image and observed reply");
+        admit_reads(&receipt.reads, RanAs::Native, &setting, None, ReadsPlant::None, None, &mut cells, alloc).expect("image and observed reply");
         assert_eq!(cells.len(), 3, "the reply, the pins and the image");
         let bytes = saved_rows(&io, &cells);
         assert!(changed(&io, &bytes, &pins, &exe).is_empty());
@@ -458,7 +458,7 @@ exit 1
         let empty = native_facts::reads(&run, Some(&pins), alloc).unwrap();
         let setting = SpawnSetting::facts_only(pins.clone());
         let mut cells = ReadList::new_in(heap.shared());
-        admit_reads(&empty.reads, RanAs::Native, &setting, false, ReadsPlant::None, None, &mut cells, alloc).unwrap();
+        admit_reads(&empty.reads, RanAs::Native, &setting, None, ReadsPlant::None, None, &mut cells, alloc).unwrap();
         assert_eq!(cells.len(), 2, "even a truncated log retains the image and its configuration");
         let pins_cell = cells.iter().find(|cell| cell.path.as_str() != crate::sweep::SHIM_FILE).expect("the pins cell").path.as_str();
         let bytes = saved_rows(&io, &cells);

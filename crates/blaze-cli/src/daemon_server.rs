@@ -19,12 +19,13 @@
 //!   `.blaze/v2/profile.txt`, then runs `reclaim_between_requests()`, watch refresh, and detached
 //!   background GC AFTER the client has exited.
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 
 use blaze_drive::Key;
 use blaze_own::{AString, Alloc, Arc, Share, SharedAlloc, Vec};
 use blaze_watch::Nanos;
-use blaze_watch::daemon::{self, CheckReq, ClientFrame, DaemonConfig, DaemonCore, Death, MOST_CHUNK, ServerFrame};
+use blaze_watch::daemon::{self, CannotServe, CheckReq, ClientFrame, DaemonConfig, DaemonCore, Death, Hello, MOST_CHUNK, ServerFrame};
 use blaze_watch::helper::{CheckoutKey, Version};
 use bstd::args::{ArgList, Args};
 use bstd::clock::{Clock, Instant};
@@ -38,6 +39,7 @@ use bstd::mem::{Bytes, Frame, Tag};
 use bstd::net::{Conn, Listener, Net, NetKind};
 use bstd::out::{Out, OutSink, Stream};
 use bstd::path::Path;
+use bstd::procs::{By, Requests};
 use bstd::term::{Size, Tty};
 use bstd::Stopped;
 
@@ -52,6 +54,13 @@ const TICK: Duration = Duration::from_secs(1);
 
 /// Deadline for reading a request frame or sending a short control frame (`Hello`/`Refused`/`Done`).
 const CTRL_WAIT: Duration = Duration::from_secs(5);
+
+/// Per-chunk deadline for streaming stdout/stderr to a connected client so a wedged reader cannot
+/// stall the resident daemon indefinitely.
+const WRITE_WAIT: Duration = Duration::from_secs(10);
+
+/// Poll interval for the concurrent busy-reject and client-signal watcher tasks during a build.
+const WATCH_POLL: Duration = Duration::from_millis(50);
 
 /// Deadline for closing the socket cleanly on shutdown.
 const END_WAIT: Duration = Duration::from_secs(2);
@@ -89,7 +98,7 @@ pub(crate) fn run(
     env: Option<&Env>,
     net: Option<&Net>,
     host: &Host,
-    clock: &Clock,
+    clock: Clock,
     rng: &mut bstd::rng::Rng,
     out: &Out,
     err: &Out,
@@ -137,6 +146,7 @@ pub(crate) fn run(
         .map_err(|_| CliError::Text { what: "`blaze daemon`: socket folder is not private (0700)" })?;
 
     let born = clock.now();
+    let clock = Arc::new_in(clock, heap.shared());
     let mut core = DaemonCore::new(DaemonConfig::SHIPPED, version, checkout_key, instance, Nanos(0));
 
     let max_store_bytes = crate::gc::budget_from_env(env)?;
@@ -149,15 +159,15 @@ pub(crate) fn run(
         max_store_bytes,
         &located.root,
         root_abs,
-        clock,
+        &clock,
         err,
         heap,
     )?;
-    let store_gen = opened.lent.generation();
+    let store_head = opened.lent.head_identity_on_disk().ok().flatten();
 
     let alloc = heap.alloc();
     let home_blaze_abs = bstd::mem::format_in!(frame, "{}/{}", home_str.trim_end_matches('/'), crate::store::HOME_FOLDER);
-    let watcher = CheckoutWatcher::new(cx, &located.root, clock, root_abs, Some(home_blaze_abs.as_str()), exe_dir, alloc);
+    let watcher = CheckoutWatcher::new(cx, &located.root, &clock, root_abs, Some(home_blaze_abs.as_str()), exe_dir, alloc);
 
     let producers = crate::producers::table(build.as_bytes());
     let tools = crate::engine_store::tools(&crate::home::tools(&producers, crate::lints::Lints::NONE.rules));
@@ -165,7 +175,8 @@ pub(crate) fn run(
 
     let mut state = CheckoutState {
         opened,
-        store_gen,
+        store_head,
+        clock: clock.share(),
         checkout_root_abs: AString::from_str_in(root_abs, alloc),
         checkout_dir_rel: AString::from_str_in(located.at, alloc),
         home_str: AString::from_str_in(home_str, alloc),
@@ -196,7 +207,7 @@ pub(crate) fn run(
         fs,
         net,
         host,
-        clock,
+        &clock,
         rng,
         born,
         &mut core,
@@ -208,7 +219,7 @@ pub(crate) fn run(
     );
 
     let _ = listener.close(&cx.until(clock.after(END_WAIT)));
-    state.watcher.shutdown(cx, clock);
+    state.watcher.shutdown(cx, &clock);
 
     let death = lived?;
     let _ = out.line(cx, format_args!("blaze daemon: exited: {death}"));
@@ -220,6 +231,9 @@ pub(crate) fn run(
 #[derive(PartialEq, Eq)]
 struct EnvFingerprint {
     sdkroot: Option<AString<'static>>,
+    path: Option<AString<'static>>,
+    developer_dir: Option<AString<'static>>,
+    toolchains: Option<AString<'static>>,
     encoded_rustflags: Option<AString<'static>>,
     rustflags: Option<AString<'static>>,
     build_rustflags: Option<AString<'static>>,
@@ -243,6 +257,9 @@ impl EnvFingerprint {
         let target_var = blaze_manifest::rustflags::target_variable(crate::graph::TRIPLE, alloc);
         EnvFingerprint {
             sdkroot: get("SDKROOT"),
+            path: get("PATH"),
+            developer_dir: get("DEVELOPER_DIR"),
+            toolchains: get("TOOLCHAINS"),
             encoded_rustflags: get("CARGO_ENCODED_RUSTFLAGS"),
             rustflags: get("RUSTFLAGS"),
             build_rustflags: get("CARGO_BUILD_RUSTFLAGS"),
@@ -314,7 +331,8 @@ struct HotAnswer {
 /// Persistent checkout state held in the resident daemon across requests.
 struct CheckoutState<'d> {
     opened: crate::store::Opened,
-    store_gen: u64,
+    store_head: Option<blaze_cas::plain::HeadIdentity>,
+    clock: Arc<Clock, SharedAlloc<'static>>,
     checkout_root_abs: AString<'static>,
     checkout_dir_rel: AString<'static>,
     home_str: AString<'static>,
@@ -330,9 +348,12 @@ struct CheckoutState<'d> {
 }
 
 impl CheckoutState<'_> {
-    /// Checks `head_generation_on_disk()` (~2 µs); if an external writer, `blaze gc`, or
-    /// `blaze clean --store` changed the store generation, drops all cached state and reopens
-    /// the store fresh.
+    /// Checks `head_identity_on_disk()` (~2 µs) and per-request store budget; if an external
+    /// writer, `blaze gc`, `blaze clean --store` + recreate, or a changed `BLAZE_STORE_MAX_*`
+    /// budget differs from the currently open store, drops cached answer/watch state and reopens
+    /// the store fresh. Keeps the content-keyed `hot_graph` so reopens do not re-leak the same
+    /// immutable crate list.
+    #[expect(clippy::too_many_arguments, reason = "store freshness check: explicit capabilities")]
     fn ensure_store_fresh(
         &mut self,
         cx: &Cx,
@@ -340,16 +361,18 @@ impl CheckoutState<'_> {
         host: &Host,
         rng: &mut bstd::rng::Rng,
         root: &Dir<ReadWrite>,
+        req_max_store_bytes: Option<u64>,
         clock: &Clock,
         err: &Out,
     ) -> Result<bool, CliError> {
-        let disk_gen = self.opened.lent.head_generation_on_disk().ok();
-        if disk_gen == Some(self.store_gen) {
+        let budget_changed = req_max_store_bytes != self.max_store_bytes;
+        let disk_head = self.opened.lent.head_identity_on_disk().ok().flatten();
+        if !budget_changed && disk_head.is_some() && disk_head == self.store_head {
             return Ok(false);
         }
-        // External write, GC compaction, or store wipe detected -> invalidate everything and reopen.
+        // External write, GC compaction, store wipe/recreate, or budget change -> reopen fresh.
+        self.max_store_bytes = req_max_store_bytes;
         self.hot_answer = None;
-        self.hot_graph = None;
         self.watcher.disarm();
         self.opened = crate::store::open_for_command(
             cx,
@@ -364,7 +387,7 @@ impl CheckoutState<'_> {
             err,
             self.heap,
         )?;
-        self.store_gen = self.opened.lent.generation();
+        self.store_head = self.opened.lent.head_identity_on_disk().ok().flatten();
         Ok(true)
     }
 
@@ -473,6 +496,7 @@ impl CheckoutState<'_> {
 /// client's Unix socket using `Conn::send_vectored` (zero intermediate frame buffer allocation).
 struct ConnOutSink {
     conn: Arc<Conn, SharedAlloc<'static>>,
+    clock: Arc<Clock, SharedAlloc<'static>>,
     stream: Stream,
 }
 
@@ -482,8 +506,9 @@ impl OutSink for ConnOutSink {
         for chunk in bytes.chunks(MOST_CHUNK) {
             let (head, head_len) = daemon::encode_chunk_header(is_err, chunk.len());
             let head_slice = head.get(..head_len).unwrap_or(&[]);
+            let write_cx = cx.until(self.clock.after(WRITE_WAIT));
             self.conn
-                .send_vectored(cx, &[head_slice, chunk])
+                .send_vectored(&write_cx, &[head_slice, chunk])
                 .map_err(|_| "daemon client socket write failed")?;
         }
         Ok(())
@@ -545,7 +570,7 @@ fn serve_loop(
         };
 
         let post = conns.scope(|frame| {
-            handle_connection(cx, conn, checkout_root, fs, net, host, clock, rng, born, core, state, phases, frame)
+            handle_connection(cx, listener, conn, checkout_root, fs, net, host, clock, rng, born, core, state, phases, frame)
         })?;
 
         // POST-DONE work: client has ALREADY received `ServerFrame::Done` and closed!
@@ -553,7 +578,7 @@ fn serve_loop(
         // can never race an edit into an unarmed `kqueue`.
         if let Some(post) = post {
             crate::store::post_done_for_daemon(cx, &mut state.opened.lent, &state.opened.home, post.spawn_bg, daemon_err);
-            state.store_gen = state.opened.lent.generation();
+            state.store_head = state.opened.lent.head_identity_on_disk().ok().flatten();
             if let Some(death) = core.on_request_done(nanos(clock, born), post.was_phase_rebuild) {
                 return Ok(death);
             }
@@ -574,6 +599,7 @@ struct PostDone {
 #[expect(clippy::too_many_arguments, reason = "one client connection: each capability passed explicitly")]
 fn handle_connection(
     cx: &Cx,
+    listener: &mut Listener,
     conn: Conn,
     checkout_root: &Dir<ReadWrite>,
     fs: &Fs,
@@ -635,10 +661,17 @@ fn handle_connection(
                 return Ok(None);
             }
             core.on_request_start(nanos(clock, born));
+            let hello = core.hello();
+            let saw_shutdown = AtomicBool::new(false);
+            let saw_replaced = AtomicBool::new(false);
             let shared = state.heap.shared();
             let conn_arc = Arc::new_in(conn, shared);
             let (status, post) = execute_check_request(
                 cx,
+                listener,
+                hello,
+                &saw_shutdown,
+                &saw_replaced,
                 &conn_arc,
                 &req,
                 checkout_root,
@@ -658,6 +691,11 @@ fn handle_connection(
             if let Ok(conn) = Arc::try_unwrap(conn_arc) {
                 let _ = conn.finish(&cx.until(clock.after(END_WAIT)));
             }
+            if saw_shutdown.load(Ordering::Acquire) {
+                core.on_shutdown();
+            } else if saw_replaced.load(Ordering::Acquire) {
+                let _ = core.on_tick(nanos(clock, born), true, false);
+            }
             Ok(Some(post))
         }
     }
@@ -667,6 +705,10 @@ fn handle_connection(
 #[expect(clippy::too_many_arguments, reason = "one check request: each capability passed explicitly")]
 fn execute_check_request(
     cx: &Cx,
+    listener: &mut Listener,
+    hello: Hello,
+    saw_shutdown: &AtomicBool,
+    saw_replaced: &AtomicBool,
     conn_arc: &Arc<Conn, SharedAlloc<'static>>,
     req: &CheckReq<'_, &Frame>,
     checkout_root: &Dir<ReadWrite>,
@@ -686,17 +728,17 @@ fn execute_check_request(
     let out = Out::with_sink_in(
         Stream::Out,
         out_tty,
-        ConnOutSink { conn: conn_arc.share(), stream: Stream::Out },
+        ConnOutSink { conn: conn_arc.share(), clock: state.clock.share(), stream: Stream::Out },
         shared,
     );
     let err = Out::with_sink_in(
         Stream::Err,
         err_tty,
-        ConnOutSink { conn: conn_arc.share(), stream: Stream::Err },
+        ConnOutSink { conn: conn_arc.share(), clock: state.clock.share(), stream: Stream::Err },
         shared,
     );
 
-    let (args, env) = match build_args_env(req, shared, frame) {
+    let (args, env) = match build_args_env(req, state.checkout_root_abs.as_str(), state.checkout_dir_rel.as_str(), shared, frame) {
         Ok(pair) => pair,
         Err(msg) => {
             let _ = err.line(cx, format_args!("error: {msg}"));
@@ -713,12 +755,19 @@ fn execute_check_request(
             return (Status::FAILED, PostDone { was_phase_rebuild: false, spawn_bg: false });
         }
     };
+    let req_max_store_bytes = match crate::gc::budget_from_env(Some(&env)) {
+        Ok(budget) => budget,
+        Err(error) => {
+            let _ = err.line(cx, format_args!("error: {error}"));
+            return (Status::FAILED, PostDone { was_phase_rebuild: false, spawn_bg: false });
+        }
+    };
 
     phases.reset();
     let began = phases.now();
 
-    // 1. O(1) external-writer / GC / wipe check (~2 µs).
-    let reopened = match state.ensure_store_fresh(cx, fs, host, rng, checkout_root, clock, &err) {
+    // 1. O(1) external-writer / GC / wipe / budget check (~2 µs).
+    let reopened = match state.ensure_store_fresh(cx, fs, host, rng, checkout_root, req_max_store_bytes, clock, &err) {
         Ok(r) => r,
         Err(error) => {
             let _ = err.line(cx, format_args!("error: {error}"));
@@ -729,6 +778,7 @@ fn execute_check_request(
 
     // 2. Synchronous kernel vnode poll (~10 µs when clean!).
     let poll = state.watcher.poll(cx, clock, frame);
+    let poll_was_clean = matches!(poll, PollOutcome::Clean { .. });
     let poll_needs_refresh = match &poll {
         PollOutcome::Clean { .. } => false,
         PollOutcome::Dirty { needs_refresh, .. } | PollOutcome::FullRescan { needs_refresh, .. } => *needs_refresh,
@@ -739,10 +789,11 @@ fn execute_check_request(
 
     // 3. ULTRA-FAST CERTIFIED WARM HIT (< 0.2 ms daemon time!).
     let eligible_fast = !reopened
-        && matches!(poll, PollOutcome::Clean { .. })
+        && poll_was_clean
         && flags.fix.is_none()
         && !flags.names_oracle.on()
         && flags.origin.is_none()
+        && flags.origin_key.is_none()
         && flags.status_every.is_none()
         && flags.block_scopes == blaze_scope::surface::BlockScopes::Modules;
 
@@ -766,7 +817,7 @@ fn execute_check_request(
             began,
             frame,
         ) {
-            state.store_gen = state.opened.lent.generation();
+            state.store_head = state.opened.lent.head_identity_on_disk().ok().flatten();
             return (
                 status,
                 PostDone {
@@ -809,11 +860,26 @@ fn execute_check_request(
         }
     };
 
+    let prev_hot_graph = state.hot_graph.as_ref().map(|g| (g.key, g.out));
+    let requests = Requests::new();
     let (status, dout) = {
+        let bg_scope = cx.scope();
+        let busy_task = bg_scope.must_overlap("daemon busy rejector", 64 << 10, move |bg_cx| {
+            reject_concurrent_clients(bg_cx, listener, hello, saw_shutdown, saw_replaced, clock);
+            Ok::<(), core::convert::Infallible>(())
+        });
+        let sig_conn = conn_arc.share();
+        let requests_ref = &requests;
+        let sig_task = bg_scope.must_overlap("daemon client signal watch", 64 << 10, move |bg_cx| {
+            watch_client_signals(bg_cx, &sig_conn, requests_ref, saw_shutdown, clock);
+            Ok::<(), core::convert::Infallible>(())
+        });
+
         let mut dctx = DaemonCheckCtx {
             opened: &state.opened,
             watch: Some(poll),
             hot_graph: &mut state.hot_graph,
+            requests: Some(&requests),
             out: DaemonCheckOut::default(),
         };
         let status = match crate::engine_check::check_in_daemon(
@@ -835,14 +901,26 @@ fn execute_check_request(
             &mut dctx,
         ) {
             Ok(status) => status,
+            Err(CliError::EngineCheck(crate::engine_check::EngineCheckError::Stopped { by, .. })) => Status(128 + by.number()),
             Err(error) => {
                 let _ = err.line(cx, format_args!("error: {error}"));
                 Status::FAILED
             }
         };
+        bg_scope.cancel();
+        if let Ok(task) = busy_task {
+            let _ = task.join(cx);
+        }
+        if let Ok(task) = sig_task {
+            let _ = task.join(cx);
+        }
+        let _ = bg_scope.join(cx);
         (status, dctx.out)
     };
-    state.store_gen = state.opened.lent.generation();
+    state.store_head = state.opened.lent.head_identity_on_disk().ok().flatten();
+
+    let replaced_hot_graph = prev_hot_graph.is_some()
+        && state.hot_graph.as_ref().map(|g| (g.key, g.out)) != prev_hot_graph;
 
     let certified_update = dout
         .certified_facts
@@ -858,7 +936,13 @@ fn execute_check_request(
         || dout.leaf_set_changed
         || !state.watcher.is_armed();
 
-    if needs_watch_refresh {
+    if certified_update.is_none() && !poll_was_clean {
+        // Consumed dirty/rescan events without producing a new certified Pointer: clear
+        // `hot_answer` AND disarm the watcher so the next request cannot treat the drained
+        // kqueue as clean against the stale pre-edit Pointer.
+        state.hot_answer = None;
+        state.watcher.disarm();
+    } else if needs_watch_refresh {
         state.try_arm_from_store(cx, checkout_root, Some(env_fp), frame);
     } else if let Some((pkey, lkey, facts, lint_step)) = certified_update {
         state.watcher.set_armed_pointer(pkey);
@@ -870,14 +954,14 @@ fn execute_check_request(
             env_fp: Some(env_fp),
         });
     } else {
-        // Request errored without producing a pointer: clear `hot_answer` while keeping the live watcher.
+        // Clean request errored without producing a pointer: clear `hot_answer` while keeping the live watcher.
         state.hot_answer = None;
     }
 
     (
         status,
         PostDone {
-            was_phase_rebuild: dout.was_phase_rebuild,
+            was_phase_rebuild: dout.was_phase_rebuild || replaced_hot_graph,
             spawn_bg: dout.spawn_bg,
         },
     )
@@ -1014,20 +1098,102 @@ fn tty_of(is_tty: bool, cols: Option<u16>) -> Tty {
 }
 
 #[derive(Debug)]
-struct ArgvNotUtf8 {
-    index: usize,
+enum ReqInputError {
+    ArgvNotUtf8 { index: usize },
+    CwdNotUtf8,
 }
 
-impl core::fmt::Display for ArgvNotUtf8 {
+impl core::fmt::Display for ReqInputError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "client argv[{}] is not UTF-8", self.index)
+        match self {
+            ReqInputError::ArgvNotUtf8 { index } => write!(f, "client argv[{index}] is not UTF-8"),
+            ReqInputError::CwdNotUtf8 => f.write_str("client cwd is not UTF-8"),
+        }
     }
 }
 
-fn build_args_env(req: &CheckReq<'_, &Frame>, alloc: SharedAlloc<'static>, frame: &Frame) -> Result<(Args, Env), ArgvNotUtf8> {
+fn daemon_fs_root_abs<'a>(checkout_root_abs: &'a str, checkout_dir_rel: &str) -> &'a str {
+    if checkout_dir_rel.is_empty() {
+        return checkout_root_abs;
+    }
+    let trimmed_root = checkout_root_abs.trim_end_matches('/');
+    let trimmed_rel = checkout_dir_rel.trim_matches('/');
+    if let Some(prefix) = trimmed_root.strip_suffix(trimmed_rel)
+        && let Some(parent) = prefix.strip_suffix('/')
+    {
+        return if parent.is_empty() { "/" } else { parent };
+    }
+    checkout_root_abs
+}
+
+fn rebase_relative_path<'f>(req_cwd: &str, raw: &str, fs_root_abs: &str, frame: &'f Frame) -> Option<&'f str> {
+    if raw.starts_with("http://") || raw.starts_with("https://") || raw.starts_with('/') {
+        return None;
+    }
+    let mut parts: Vec<&str, &Frame> = Vec::new_in(frame);
+    for seg in req_cwd.split('/').chain(raw.split('/')) {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                let _ = parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let mut root_parts: Vec<&str, &Frame> = Vec::new_in(frame);
+    for seg in fs_root_abs.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                let _ = root_parts.pop();
+            }
+            other => root_parts.push(other),
+        }
+    }
+    if parts.len() < root_parts.len() {
+        return None;
+    }
+    for (r, p) in root_parts.iter().zip(parts.iter()) {
+        if r != p {
+            return None;
+        }
+    }
+    let tail = parts.get(root_parts.len()..)?;
+    if tail.is_empty() {
+        return Some(".");
+    }
+    let mut out = blaze_own::String::new_in(frame);
+    for (i, seg) in tail.iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(seg);
+    }
+    Some(frame.alloc_str(out.as_str()))
+}
+
+fn build_args_env(
+    req: &CheckReq<'_, &Frame>,
+    checkout_root_abs: &str,
+    checkout_dir_rel: &str,
+    alloc: SharedAlloc<'static>,
+    frame: &Frame,
+) -> Result<(Args, Env), ReqInputError> {
+    let req_cwd = core::str::from_utf8(req.cwd).map_err(|_| ReqInputError::CwdNotUtf8)?;
+    let fs_root_abs = daemon_fs_root_abs(checkout_root_abs, checkout_dir_rel);
     let mut argv: Vec<&str, &Frame> = Vec::with_capacity_in(req.argv.len(), frame);
+    let mut next_is_origin = false;
     for (index, raw) in req.argv.iter().enumerate() {
-        let s = core::str::from_utf8(raw).map_err(|_| ArgvNotUtf8 { index })?;
+        let s = core::str::from_utf8(raw).map_err(|_| ReqInputError::ArgvNotUtf8 { index })?;
+        if next_is_origin {
+            next_is_origin = false;
+            if let Some(rebased) = rebase_relative_path(req_cwd, s, fs_root_abs, frame) {
+                argv.push(rebased);
+                continue;
+            }
+        } else if s == "--origin" {
+            next_is_origin = true;
+        }
         argv.push(s);
     }
     let mut vars: Vec<(&str, &str), &Frame> = Vec::with_capacity_in(req.env.len(), frame);
@@ -1037,6 +1203,173 @@ fn build_args_env(req: &CheckReq<'_, &Frame>, alloc: SharedAlloc<'static>, frame
         }
     }
     Ok((Args::from_list(ArgList::from_slices_in(&argv, alloc)), Env::from_vars(Vars::from_pairs_in(&vars, alloc))))
+}
+
+/// Accepts queued clients while a check is running and rejects them promptly with
+/// `CannotServe::Busy` (or `OtherVersion`/`OtherCheckout`), or records `Shutdown`, so concurrent
+/// clients fall through to standalone immediately instead of blocking in the socket backlog.
+fn reject_concurrent_clients(
+    cx: &Cx,
+    listener: &mut Listener,
+    hello: Hello,
+    saw_shutdown: &AtomicBool,
+    saw_replaced: &AtomicBool,
+    clock: &Clock,
+) {
+    let mut scratch = match Frame::new(Tag::Other) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let mut accept_errs = 0u32;
+    while !cx.cancelled() {
+        let accepted = listener.accept(&cx.until(clock.after(WATCH_POLL)));
+        let conn = match accepted {
+            Ok(conn) => {
+                accept_errs = 0;
+                conn
+            }
+            Err(error) if matches!(error.kind, NetKind::Stopped(Stopped::Deadline { .. })) => {
+                accept_errs = 0;
+                continue;
+            }
+            Err(error) if matches!(error.kind, NetKind::Stopped(Stopped::Cancelled { .. })) => break,
+            Err(error) if matches!(error.kind, NetKind::Driver(_)) && accept_errs < 16 => {
+                accept_errs += 1;
+                continue;
+            }
+            Err(_) => break,
+        };
+        scratch.scope(|frame| {
+            let ctrl_cx = cx.until(clock.after(CTRL_WAIT));
+            let mut hello_bytes = Vec::new_in(frame);
+            hello.encode(&mut hello_bytes);
+            if conn.send_all(&ctrl_cx, &hello_bytes).is_err() {
+                let _ = conn.finish(&cx.until(clock.after(END_WAIT)));
+                return;
+            }
+            let mut req_buf = Bytes::new_in(frame, "daemon busy client frame");
+            let Ok(body) = read_daemon_frame(&ctrl_cx, &conn, &mut req_buf) else {
+                let _ = conn.finish(&cx.until(clock.after(END_WAIT)));
+                return;
+            };
+            if let Ok(client_frame) = ClientFrame::decode_in(body, frame) {
+                match client_frame {
+                    ClientFrame::Shutdown => {
+                        saw_shutdown.store(true, Ordering::Release);
+                        let mut done = Vec::new_in(frame);
+                        ServerFrame::Done { status: 0 }.encode(&mut done);
+                        let _ = conn.send_all(&ctrl_cx, &done);
+                    }
+                    ClientFrame::Check(other_req) => {
+                        let why = if other_req.version != hello.version {
+                            saw_replaced.store(true, Ordering::Release);
+                            CannotServe::OtherVersion
+                        } else if other_req.checkout != hello.checkout {
+                            CannotServe::OtherCheckout
+                        } else {
+                            CannotServe::Busy
+                        };
+                        let mut refused = Vec::new_in(frame);
+                        ServerFrame::Refused { why }.encode(&mut refused);
+                        let _ = conn.send_all(&ctrl_cx, &refused);
+                    }
+                    ClientFrame::Signal(_) => {}
+                }
+            }
+            let _ = conn.finish(&cx.until(clock.after(END_WAIT)));
+        });
+    }
+}
+
+/// Watches the active client's connection for `ClientFrame::Signal` or peer disconnect (EOF)
+/// while a check is running, forwarding stop/status requests into `requests` so Ctrl-C or
+/// client termination stops the active check cleanly.
+fn watch_client_signals(
+    cx: &Cx,
+    conn: &Conn,
+    requests: &Requests,
+    saw_shutdown: &AtomicBool,
+    clock: &Clock,
+) {
+    let scratch = match Frame::new(Tag::Other) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let mut decode_scratch = match Frame::new(Tag::Other) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let mut buf = Bytes::new_in(&scratch, "daemon signal frame");
+    let mut want = 4usize;
+    let mut have_len = false;
+    while !cx.cancelled() {
+        if !have_len && let Some(res) = daemon::frame_len(buf.as_slice()) {
+            match res {
+                Ok(body_len) => match 4usize.checked_add(body_len) {
+                    Some(total) => {
+                        want = total;
+                        have_len = true;
+                    }
+                    None => break,
+                },
+                Err(_) => break,
+            }
+        }
+        if have_len && buf.len() >= want {
+            let body = buf.as_slice().get(4..want).unwrap_or(&[]);
+            decode_scratch.scope(|frame| {
+                if let Ok(client_frame) = ClientFrame::decode_in(body, frame) {
+                    match client_frame {
+                        ClientFrame::Signal(sig) => {
+                            if sig == By::Interrupt.number() {
+                                requests.ask_stop(By::Interrupt);
+                            } else if sig == By::Terminate.number() {
+                                requests.ask_stop(By::Terminate);
+                            } else if sig == By::Info.number() {
+                                requests.ask_status(By::Info);
+                            } else if sig == By::User1.number() {
+                                requests.ask_status(By::User1);
+                            }
+                        }
+                        ClientFrame::Shutdown => {
+                            saw_shutdown.store(true, Ordering::Release);
+                            requests.ask_stop(By::Terminate);
+                        }
+                        ClientFrame::Check(_) => {}
+                    }
+                }
+            });
+            let remaining = buf.len().saturating_sub(want);
+            if remaining == 0 {
+                buf.clear();
+            } else {
+                let tail = buf.as_slice().get(want..).unwrap_or(&[]);
+                let mut shifted = Vec::with_capacity_in(tail.len(), &scratch);
+                shifted.extend_from_slice(tail);
+                buf.clear();
+                let _ = buf.try_extend(shifted.as_slice());
+            }
+            want = 4;
+            have_len = false;
+            continue;
+        }
+        let need = want.saturating_sub(buf.len()).max(RECV_STEP);
+        let recv_cx = cx.until(clock.after(WATCH_POLL));
+        match conn.recv(&recv_cx, need, &mut buf) {
+            Ok(0) => {
+                // Client disconnected mid-request -> treat as SIGINT stop.
+                requests.ask_stop(By::Interrupt);
+                break;
+            }
+            Ok(_) => {}
+            Err(error) if matches!(error.kind, NetKind::Stopped(Stopped::Deadline { .. })) => continue,
+            Err(error) if matches!(error.kind, NetKind::Stopped(Stopped::Cancelled { .. })) => break,
+            Err(_) => {
+                requests.ask_stop(By::Interrupt);
+                break;
+            }
+        }
+    }
 }
 
 /// Reads one length-prefixed daemon frame (4-byte LE len + CBOR body, capped at `daemon::MOST_FRAME`).

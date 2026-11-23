@@ -3,6 +3,19 @@
 
 use std::path::{Path, PathBuf};
 
+fn dev_of(path: &Path) -> Option<blaze_sys::posix::types::dev_t> {
+    let bytes = path.to_str()?.as_bytes();
+    let mut buf = [0u8; 4096];
+    if bytes.is_empty() || bytes.len() >= buf.len() {
+        return None;
+    }
+    buf[..bytes.len()].copy_from_slice(bytes);
+    buf[bytes.len()] = 0;
+    let cstr = core::ffi::CStr::from_bytes_with_nul(&buf[..=bytes.len()]).ok()?;
+    let st = blaze_sys::posix::proc::stat_at(blaze_sys::posix::io::CWD, blaze_sys::Path::new(cstr), 0).ok()?;
+    Some(st.st_dev)
+}
+
 /// A fresh folder for one test, outside the owner's home, holding `home/` (the `HOME` the
 /// process is given) and whatever the test copies beside it. Nothing a test starts reads or
 /// writes the real `~/.blaze` (2026-11-16: this test wrote a 24 MB pack into the owner's
@@ -12,12 +25,19 @@ use std::path::{Path, PathBuf};
 /// `EXDEV` because Linux `openat2(RESOLVE_NO_SYMLINKS)` refuses symlinks; the shelf is only ever
 /// read): `<home>/.blaze/v2/toolchain`.
 pub fn fresh_home(test: &str, with_shelf: bool) -> PathBuf {
-    let base = std::env::temp_dir().join(format!("blaze-cli-{test}-{}", std::process::id()));
+    let (tmp, owner_home) = (std::env::temp_dir(), with_shelf.then(|| PathBuf::from(std::env::var_os("HOME").expect("the owner's HOME, to find the toolchain's shelf"))));
+    let real = owner_home.as_ref().map(|h| h.join(".blaze/v2/toolchain"));
+    let parent = match (&owner_home, &real) {
+        (Some(home_root), Some(shelf)) if dev_of(shelf).is_some() && dev_of(shelf) != dev_of(&tmp) => {
+            home_root.join(".blaze/v2/test-tmp")
+        }
+        _ => tmp,
+    };
+    let base = parent.join(format!("blaze-cli-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let home = base.join("home");
     std::fs::create_dir_all(&home).expect("the temporary home");
-    if with_shelf {
-        let real = Path::new(&std::env::var_os("HOME").expect("the owner's HOME, to find the toolchain's shelf")).join(".blaze/v2/toolchain");
+    if let Some(real) = real {
         let shelf = home.join(".blaze/v2/toolchain");
         // A work list of folders, not recursion: each folder made, its files linked.
         let mut folders = vec![(real.clone(), shelf)];

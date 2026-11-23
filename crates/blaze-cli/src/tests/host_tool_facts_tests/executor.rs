@@ -12,7 +12,7 @@ fn observed(subject: &str, digest: ContentId) -> Read {
 fn admit(observed: &[Read], setting: &SpawnSetting) -> Result<ReadList, NoCell> {
     let heap = blaze_own::testing::heap();
     let mut cells = ReadList::new_in(heap.shared());
-    admit_reads(observed, RanAs::Wasm, setting, false, ReadsPlant::None, None, &mut cells, heap.alloc())?;
+    admit_reads(observed, RanAs::Wasm, setting, None, ReadsPlant::None, None, &mut cells, heap.alloc())?;
     Ok(cells)
 }
 

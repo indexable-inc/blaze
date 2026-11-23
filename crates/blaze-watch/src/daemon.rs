@@ -52,17 +52,18 @@ pub const MOST_FRAME: usize = 4 << 20;
 /// Maximum bytes of a `cwd` byte string in [`CheckReq`].
 pub const MOST_CWD: usize = 4096;
 
-/// Maximum number of `argv` elements in [`CheckReq`].
-pub const MOST_ARGV: usize = 4096;
+/// Maximum number of `argv` elements in [`CheckReq`] (bounded by [`MOST_FRAME`]).
+pub const MOST_ARGV: usize = MOST_FRAME;
 
-/// Maximum bytes of one `argv` element in [`CheckReq`].
-pub const MOST_ARG_BYTES: usize = 64 << 10;
+/// Maximum bytes of one `argv` element in [`CheckReq`] (bounded by [`MOST_FRAME`], preserving
+/// Linux's 128 KiB+ `MAX_ARG_STRLEN`).
+pub const MOST_ARG_BYTES: usize = MOST_FRAME;
 
-/// Maximum number of `env` `(key, value)` pairs in [`CheckReq`].
-pub const MOST_ENV: usize = 4096;
+/// Maximum number of `env` `(key, value)` pairs in [`CheckReq`] (bounded by [`MOST_FRAME`]).
+pub const MOST_ENV: usize = MOST_FRAME;
 
-/// Maximum bytes of one `env` key or value in [`CheckReq`].
-pub const MOST_ENV_BYTES: usize = 64 << 10;
+/// Maximum bytes of one `env` key or value in [`CheckReq`] (bounded by [`MOST_FRAME`]).
+pub const MOST_ENV_BYTES: usize = MOST_FRAME;
 
 /// Maximum bytes of one [`ServerFrame::Out`] or [`ServerFrame::Err`] payload chunk.
 pub const MOST_CHUNK: usize = 1 << 20;
@@ -414,10 +415,10 @@ impl<'a, A: Allocator + Copy> ClientFrame<'a, A> {
                 let version = read_version(&mut reader)?;
                 let checkout = CheckoutKey(reader.fixed::<32>()?);
                 let cwd = reader.bytes(MOST_CWD, "cwd past cap")?;
-                let argc = reader.array(MOST_ARGV, "argv count past cap")?;
+                let argc = reader.array(body.len(), "argv count past frame size")?;
                 let mut argv = Vec::try_with_capacity_in(argc, alloc)?;
                 for _ in 0..argc {
-                    argv.push(reader.bytes(MOST_ARG_BYTES, "argv item past cap")?);
+                    argv.push(reader.bytes(body.len(), "argv item past frame size")?);
                 }
                 let stdout_tty = reader.boolean()?;
                 let stderr_tty = reader.boolean()?;
@@ -426,12 +427,12 @@ impl<'a, A: Allocator + Copy> ClientFrame<'a, A> {
                     None => None,
                     Some(n) => Some(u16::try_from(n).map_err(|_| WireError::Field("cols past u16::MAX"))?),
                 };
-                let envc = reader.array(MOST_ENV, "env count past cap")?;
+                let envc = reader.array(body.len(), "env count past frame size")?;
                 let mut env = Vec::try_with_capacity_in(envc, alloc)?;
                 for _ in 0..envc {
                     reader.array_of(2)?;
-                    let k = reader.bytes(MOST_ENV_BYTES, "env key past cap")?;
-                    let v = reader.bytes(MOST_ENV_BYTES, "env value past cap")?;
+                    let k = reader.bytes(body.len(), "env key past frame size")?;
+                    let v = reader.bytes(body.len(), "env value past frame size")?;
                     env.push((k, v));
                 }
                 let client_start_mono_ns = reader.uint()?;
@@ -658,6 +659,9 @@ pub struct DaemonCore {
     requests_served: u64,
     busy: bool,
     death: Option<Death>,
+    /// Deferred replacement reason observed while `busy == true`, promoted to `death` once the
+    /// active request completes (`on_request_done`) so an in-flight build is never aborted mid-run.
+    pending_death: Option<Death>,
     plant: DaemonPlant,
 }
 
@@ -690,6 +694,7 @@ impl DaemonCore {
             requests_served: 0,
             busy: false,
             death: None,
+            pending_death: None,
             plant,
         }
     }
@@ -761,7 +766,11 @@ impl DaemonCore {
             return Err(CannotServe::OtherCheckout);
         }
         if req_version != self.hello.version && self.plant != DaemonPlant::SurvivesReplace {
-            self.death = Some(Death::Replaced);
+            if self.busy {
+                self.pending_death.get_or_insert(Death::Replaced);
+            } else {
+                self.death = Some(Death::Replaced);
+            }
             return Err(CannotServe::OtherVersion);
         }
         if self.busy {
@@ -784,6 +793,10 @@ impl DaemonCore {
             return self.death;
         }
         if own_exe_replaced && self.plant != DaemonPlant::SurvivesReplace {
+            if self.busy {
+                self.pending_death.get_or_insert(Death::Replaced);
+                return None;
+            }
             self.death = Some(Death::Replaced);
             return self.death;
         }
@@ -807,7 +820,7 @@ impl DaemonCore {
 
     /// Records completion of one request. Updates `last_active`, increments `phase_rebuilds` when
     /// `was_phase_rebuild` is true, and transitions to [`Death::PhaseLimit`] once
-    /// `phase_rebuilds >= config.max_phase_rebuilds`.
+    /// `phase_rebuilds >= config.max_phase_rebuilds` (or promotes a deferred [`Death::Replaced`]).
     pub fn on_request_done(&mut self, now: Nanos, was_phase_rebuild: bool) -> Option<Death> {
         self.busy = false;
         self.last_active = now;
@@ -820,6 +833,11 @@ impl DaemonCore {
             {
                 self.death = Some(Death::PhaseLimit);
             }
+        }
+        if self.death.is_none()
+            && let Some(pending) = self.pending_death.take()
+        {
+            self.death = Some(pending);
         }
         self.death
     }
@@ -1126,6 +1144,71 @@ mod tests {
                 vectored.extend_from_slice(&payload);
                 assert_eq!(vectored.as_slice(), expected.as_slice(), "mismatch for is_err={is_err} len={len}");
             }
+        }
+    }
+
+    #[test]
+    fn busy_request_defers_replacement_until_request_done() {
+        let mut core = DaemonCore::new(DaemonConfig::SHIPPED, ver(b"v1"), key(7), 9, Nanos(0));
+        core.on_request_start(Nanos::secs(1));
+        assert!(core.is_busy());
+        // Newer client connects while busy: refused with OtherVersion, daemon stays alive until done.
+        assert_eq!(core.on_hello_check(ver(b"v2"), key(7)), Err(CannotServe::OtherVersion));
+        assert!(!core.is_dead(), "replacement must be deferred while a request is active");
+        // Executable replaced tick while busy also defers death.
+        assert_eq!(core.on_tick(Nanos::secs(2), true, false), None);
+        assert!(!core.is_dead(), "exe-replaced tick must defer death while busy");
+        // Completing the active request promotes deferred Death::Replaced.
+        assert_eq!(core.on_request_done(Nanos::secs(3), false), Some(Death::Replaced));
+        assert_eq!(core.death(), Some(Death::Replaced));
+    }
+
+    #[test]
+    fn host_valid_large_arg_and_many_args_round_trip_within_frame_cap() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut big_arg = Vec::with_capacity_in(128 << 10, alloc);
+        big_arg.resize(128 << 10, b'x'); // > 64 KiB, well within MOST_FRAME
+        let mut wire = Vec::new_in(alloc);
+        let argv_large: [&[u8]; 2] = [b"blaze", big_arg.as_slice()];
+        let req_large = CheckReqRef {
+            version: ver(b"v1"),
+            checkout: key(8),
+            cwd: b"/ws",
+            argv: &argv_large,
+            stdout_tty: false,
+            stderr_tty: false,
+            cols: None,
+            env: &[],
+            client_start_mono_ns: 1,
+        };
+        req_large.encode(&mut wire);
+        let body = &wire[4..];
+        let decoded = ClientFrame::decode_in(body, alloc).expect("128 KiB arg must decode");
+        match decoded {
+            ClientFrame::Check(c) => assert_eq!(c.argv[1].len(), 128 << 10),
+            _ => panic!("expected Check"),
+        }
+
+        // > 4096 short args (5000 args) within MOST_FRAME.
+        let mut many_args: Vec<&[u8], _> = Vec::with_capacity_in(5000, alloc);
+        many_args.resize(5000, b"a".as_slice());
+        let mut wire2 = Vec::new_in(alloc);
+        let req_many = CheckReqRef {
+            version: ver(b"v1"),
+            checkout: key(8),
+            cwd: b"/ws",
+            argv: many_args.as_slice(),
+            stdout_tty: false,
+            stderr_tty: false,
+            cols: None,
+            env: &[],
+            client_start_mono_ns: 2,
+        };
+        req_many.encode(&mut wire2);
+        let decoded2 = ClientFrame::decode_in(&wire2[4..], alloc).expect("5000 args must decode");
+        match decoded2 {
+            ClientFrame::Check(c) => assert_eq!(c.argv.len(), 5000),
+            _ => panic!("expected Check"),
         }
     }
 }

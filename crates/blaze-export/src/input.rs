@@ -65,6 +65,8 @@ pub struct Data<'r> {
     pub align: u32,
     /// Sorted by `at`, not overlapping.
     pub words: &'r [DataWord],
+    /// C symbol names for any `Space::Outside` targets named by `words`.
+    pub outside: &'r [(Symbol, &'r str)],
     pub place: DataPlace,
 }
 
