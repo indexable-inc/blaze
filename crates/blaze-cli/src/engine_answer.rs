@@ -1545,12 +1545,33 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
     alloc: SharedAlloc<'_>,
     frame: &Frame,
 ) -> Result<(), CliError> {
+    let row_of = |name: &Name| -> Option<&blaze_engine::Row<'_>> {
+        if let Some(work) = kept.answer.work()
+            && let Some(slot) = work.rows.get(name)
+        {
+            return slot.as_ref();
+        }
+        kept.answer.rows.get(name)
+    };
     let mut fresh_names: blaze_own::Vec<Name, &Frame> = blaze_own::Vec::new_in(frame);
     for (&name, row) in kept.answer.rows.iter() {
         if !row.failed && store.is_toolchain(name) && kept.records.contains_key(&name) {
             fresh_names.push(name);
         }
     }
+    if let Some(work) = kept.answer.work() {
+        for (&name, slot) in work.rows.iter() {
+            if let Some(row) = slot
+                && !row.failed
+                && store.is_toolchain(name)
+                && kept.records.contains_key(&name)
+            {
+                fresh_names.push(name);
+            }
+        }
+    }
+    fresh_names.sort_unstable();
+    fresh_names.dedup();
     if fresh_names.is_empty() {
         return Ok(());
     }
@@ -1582,15 +1603,23 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
         }
         _ => None,
     };
-    // Skip rewriting when every fresh toolchain row already stands identically in `tool-base`.
+    // Skip rewriting when every fresh toolchain row already stands identically in `tool-base`
+    // AND its defined cells are already present in `existing.answer.cells`.
     if let Some(existing) = &prev {
         let unchanged = fresh_names.iter().all(|name| {
-            let Some(new_row) = kept.answer.rows.get(name) else { return false };
+            let Some(new_row) = row_of(name) else { return false };
             let Some(old_row) = existing.answer.rows.get(name) else { return false };
             !old_row.failed
                 && old_row.key == new_row.key
                 && old_row.out == new_row.out
                 && existing.records.get(name) == kept.records.get(name)
+                && old_row.defines.iter().all(|&(cell, digest)| {
+                    existing
+                        .answer
+                        .cells
+                        .get(&blaze_engine::CellId { of: *name, cell })
+                        .is_some_and(|&(stored_digest, _)| stored_digest == digest)
+                })
         });
         if unchanged {
             return Ok(());
@@ -1607,7 +1636,7 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
         tc_kept.answer.serial = kept.answer.serial;
     }
     for &name in fresh_names.iter() {
-        if let Some(row) = kept.answer.rows.get(&name) {
+        if let Some(row) = row_of(&name) {
             tc_kept.answer.rows.insert(name, copy_row(row, alloc));
         }
         if let Some(&record) = kept.records.get(&name) {
@@ -1615,6 +1644,19 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
         }
         if let Some(&cause) = kept.causes.get(&name) {
             tc_kept.causes.insert(name, cause);
+        }
+    }
+    // Rebuild `cells` and `readers` from all standing toolchain rows so downstream crates
+    // (`alloc` reading `core`, `std` reading `alloc`, `ImplBucket` reading `CrateScope`, etc.)
+    // see every toolchain cell's digest instead of `ABSENT`.
+    tc_kept.answer.cells = blaze_engine::Answer::new_in(alloc).cells;
+    tc_kept.answer.readers = blaze_own::BTreeMap::new_in(alloc);
+    for (&name, row) in tc_kept.answer.rows.iter() {
+        for &(cell, digest) in row.defines.iter() {
+            tc_kept.answer.cells.insert(blaze_engine::CellId { of: name, cell }, (digest, row.serial));
+        }
+        for &(id, _) in row.reads.iter() {
+            tc_kept.answer.readers.entry(id).or_insert_with(|| blaze_own::BTreeSet::new_in(alloc)).insert(name);
         }
     }
     let encoded = pages::encode(&tc_kept, None, alloc);

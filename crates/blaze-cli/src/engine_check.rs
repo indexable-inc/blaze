@@ -352,13 +352,15 @@ pub(crate) fn why(
     serve(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap, Some(target))
 }
 
-const WARM_TOOLCHAIN_USAGE: &str = "blaze warm-toolchain [--workers N] [--origin <url|folder>] [--origin-key <hex>] [--fresh] [--stats]: warm core/alloc/std (edition 2024) and bstd (edition blaze-2026.11) into the shared home store";
+const WARM_TOOLCHAIN_USAGE: &str = "blaze warm-toolchain [--workers N] [--origin <url|folder>] [--origin-key <hex>] [--fresh] [--stats]: warm core/alloc/std/proc_macro (target and wasm32-wasip1 macro side, edition 2024) and bstd (edition blaze-2026.11) into the shared home store";
 
-const WARM_WORKSPACE_TOML: &[u8] = b"[workspace]\nmembers = [\"std_probe\", \"bstd_probe\"]\nresolver = \"2\"\n";
+const WARM_WORKSPACE_TOML: &[u8] = b"[workspace]\nmembers = [\"std_probe\", \"bstd_probe\", \"pm_probe\"]\nresolver = \"2\"\n";
 const WARM_STD_TOML: &[u8] = b"[package]\nname = \"std_probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
 const WARM_STD_LIB: &[u8] = b"pub fn warm_std() -> usize {\n    std::vec::Vec::<u8>::new().len()\n}\n";
 const WARM_BSTD_TOML: &[u8] = b"[package]\nname = \"bstd_probe\"\nversion = \"0.1.0\"\nedition = \"blaze-2026.11\"\n";
 const WARM_BSTD_LIB: &[u8] = b"pub fn warm_bstd() -> usize {\n    0\n}\n";
+const WARM_PM_TOML: &[u8] = b"[package]\nname = \"pm_probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\nproc-macro = true\n";
+const WARM_PM_LIB: &[u8] = b"extern crate proc_macro;\n\n#[proc_macro]\npub fn warm_pm(input: proc_macro::TokenStream) -> proc_macro::TokenStream {\n    input\n}\n";
 
 fn write_warm_file(cx: &Cx, dir: &Dir<ReadWrite>, path: &str, bytes: &[u8], frame: &Frame) -> Result<(), CliError> {
     let p = Path::new(path)?;
@@ -438,6 +440,8 @@ pub(crate) fn warm_toolchain(
     write_warm_file(cx, home.dir(), "v2/warm-toolchain/std_probe/src/lib.rs", WARM_STD_LIB, &request)?;
     write_warm_file(cx, home.dir(), "v2/warm-toolchain/bstd_probe/Cargo.toml", WARM_BSTD_TOML, &request)?;
     write_warm_file(cx, home.dir(), "v2/warm-toolchain/bstd_probe/src/lib.rs", WARM_BSTD_LIB, &request)?;
+    write_warm_file(cx, home.dir(), "v2/warm-toolchain/pm_probe/Cargo.toml", WARM_PM_TOML, &request)?;
+    write_warm_file(cx, home.dir(), "v2/warm-toolchain/pm_probe/src/lib.rs", WARM_PM_LIB, &request)?;
     let ws_dir = home.dir().subdir(&Path::new(rel_ws)?);
     let abs_at = match home_var {
         Some(h) => bstd::mem::format_in!(&request, "{}/.blaze/{rel_ws}", h.trim_end_matches('/')),

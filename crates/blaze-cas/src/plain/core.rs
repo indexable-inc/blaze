@@ -3050,10 +3050,11 @@ impl<A: Allocator + Clone> Plain<A> {
             all.extend(records.iter().filter(|it| it.namespace == namespace).map(|it| (it.entry(), it.bytes)));
             all.sort_unstable_by(|a, b| a.0.key.cmp(&b.0.key));
             let mut entries: Vec<Entry, &A> = Vec::with_capacity_in(all.len(), &self.alloc);
-            // The payloads from [`HEADER`] on, each at a multiple of [`ALIGN`] of the segment:
-            // the process heap, as the segment's write takes it whole (blaze-core's effect).
-            let mut bytes: Vec<u8> = Vec::new_in(Global);
+            let mut kept_payloads: blaze_own::Vec<(&[u8], usize), &A> = blaze_own::Vec::with_capacity_in(all.len(), &self.alloc);
+            let mut payload_bytes: u64 = 0;
             let mut last: Option<(Entry, &[u8])> = None;
+            let unpadded = self.plant() == Plant::Unpadded;
+            let off_by_one = self.plant() == Plant::IndexOffByOne;
             for (entry, payload) in all {
                 if let Some((kept, kept_payload)) = last
                     && kept.key == entry.key
@@ -3086,26 +3087,27 @@ impl<A: Allocator + Clone> Plain<A> {
                     let kept_payload = self.maps[mapped].payload(&kept);
                     return Err(StoreError::TwoValues(two_values(&Key(entry.key), Holder::Committed, kept.tag, kept_payload, entry.tag, payload)));
                 }
-                let at = HEADER as u64 + bytes.len() as u64;
+                let at = HEADER as u64 + payload_bytes;
                 let end = at + u64::from(entry.len);
                 if end > OFFSET_MOST {
                     return Err(StoreError::TooLong { tag: entry.tag, key: entry.key, len: end });
                 }
-                bytes.extend_from_slice(payload);
-                let padded = if self.plant() == Plant::Unpadded { end } else { aligned(end) };
-                bytes.resize((padded - HEADER as u64) as usize, 0);
+                let padded = if unpadded { end } else { aligned(end) };
+                let pad_len = usize::try_from(padded - end).unwrap_or(0);
+                payload_bytes = padded - HEADER as u64;
                 let mut placed = entry;
                 placed.at = at;
-                if self.plant() == Plant::IndexOffByOne {
+                if off_by_one {
                     placed.at += ALIGN;
                 }
                 entries.push(placed);
+                kept_payloads.push((payload, pad_len));
             }
             if entries.is_empty() {
                 continue;
             }
-            let index_at = HEADER as u64 + bytes.len() as u64;
-            // THE CAP, before a byte is written: a commit's segment past it would be a row
+            let index_at = HEADER as u64 + payload_bytes;
+            // THE CAP, before a byte is allocated or written: a commit's segment past it would be a row
             // every later open refuses (`format::Row`), so the commit is refused here, naming
             // its namespace and the lengths. (Alignment and the index's end are the layout's
             // own, `seal_parts`; the row's whole check is at the flip, `Manifest::encode`.)
@@ -3113,6 +3115,16 @@ impl<A: Allocator + Clone> Plain<A> {
             let most = self.tiers().segment_most();
             if len > most {
                 return Err(StoreError::Shape { namespace, why: RowRefused::TooLong { len, most } });
+            }
+            // The payloads from [`HEADER`] on, each at a multiple of [`ALIGN`] of the segment:
+            // exact single allocation on the process heap (no doubling reallocs / full memcpys).
+            let cap = usize::try_from(payload_bytes).unwrap_or(usize::MAX);
+            let mut bytes: Vec<u8> = Vec::with_capacity_in(cap, Global);
+            for (payload, pad_len) in kept_payloads {
+                bytes.extend_from_slice(payload);
+                if pad_len > 0 {
+                    bytes.resize(bytes.len() + pad_len, 0);
+                }
             }
             let mut pieces: Vec<(u64, Vec<u8>), A> = Vec::with_capacity_in(1, self.alloc.clone());
             if !bytes.is_empty() {
