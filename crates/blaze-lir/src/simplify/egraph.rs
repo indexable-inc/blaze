@@ -2375,8 +2375,9 @@ mod tests {
 
     #[test]
     fn aegraph_folds_constant_floats_and_fcmp_select_bit_exact() {
-        let alloc = Global;
-        let mut b = Builder::<Global, Full>::new_in(64, alloc);
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
         let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::F64)], &[Param::of(Ty::F64)]);
         b.set_signature(sig);
         let entry = b.create_block(BlockKind::Normal);
@@ -2404,12 +2405,12 @@ mod tests {
         assert!(out.stats.constants_folded >= 6, "stats={:?}", out.stats);
         assert!(out.stats.identities_folded >= 1, "expected select to fold: stats={:?}", out.stats);
         // Dead `Fsub`, `Fcmp`, `Select`, `Fdiv`, `Fmul` must all be swept away!
-        let ops: std::vec::Vec<Op> = (0..out.func.ops.len()).map(|i| out.func.view().op(i)).collect();
-        assert!(!ops.contains(&Op::Select), "select should fold away: {ops:?}");
-        assert!(!ops.contains(&Op::Fcmp), "fcmp should fold away: {ops:?}");
-        assert!(!ops.contains(&Op::Fsub), "dead else branch fsub should be swept: {ops:?}");
-        assert!(!ops.contains(&Op::Fdiv), "constant fdiv should fold: {ops:?}");
-        assert!(!ops.contains(&Op::Fmul), "constant fmul should fold: {ops:?}");
+        let has_op = |op: Op| (0..out.func.ops.len()).any(|i| out.func.view().op(i) == op);
+        assert!(!has_op(Op::Select), "select should fold away");
+        assert!(!has_op(Op::Fcmp), "fcmp should fold away");
+        assert!(!has_op(Op::Fsub), "dead else branch fsub should be swept");
+        assert!(!has_op(Op::Fdiv), "constant fdiv should fold");
+        assert!(!has_op(Op::Fmul), "constant fmul should fold");
 
         for &xv in &[1.25_f64, -4.0, 0.0, -0.0, f64::INFINITY] {
             let args = [Val::Int(u128::from(xv.to_bits()))];
@@ -2419,7 +2420,7 @@ mod tests {
         }
 
         // Also test NaN `fcmp` (`Oeq` false, `Une` true) folds bit-exact!
-        let mut bn = Builder::<Global, Full>::new_in(64, alloc);
+        let mut bn = Builder::<_, Full>::new_in(64, alloc);
         let sign = bn.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I1)]);
         bn.set_signature(sign);
         let e = bn.create_block(BlockKind::Normal);
