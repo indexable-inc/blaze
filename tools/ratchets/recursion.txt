@@ -8,6 +8,7 @@ blaze-algebra	9
 blaze-bench	1
 blaze-blake3	2
 blaze-body	1
+blaze-body-build	1
 blaze-body-eval	1
 blaze-body-flow	1
 blaze-body-lower	2
@@ -48,7 +49,7 @@ blaze-solve	5
 blaze-sql	4
 blaze-squeeze	1
 blaze-std	5
-gpu	6
+gpu	5
 ix-prof	2
 parser	7
 stdx	4
