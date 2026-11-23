@@ -2215,6 +2215,9 @@ pub(crate) struct BodiesStage<'f> {
     /// member's held file among them is the setup's typed refusal (`groups`), never a
     /// `NotOutlined` head. `None`: every outline was read (the phase path).
     unread: Option<Vec<Name, blaze_own::Alloc<'static>>>,
+    /// Full-file `FILE_DOMAIN` digests from the request's initial sweep for unread `/0/` checkout
+    /// files, sorted by path: verifies lazy disk reads stay on the request snapshot.
+    unread_digests: Option<blaze_own::Arc<blaze_own::Vec<(blaze_own::String<SharedAlloc<'static>>, ContentId), SharedAlloc<'static>>, SharedAlloc<'static>>>,
     /// The members record this request put, for the driver to name under the checkout's
     /// members root ([`BodiesStage::members_record`]).
     members_key: Option<Key>,
@@ -2440,6 +2443,7 @@ struct CachedDepFile {
     index: u32,
     edition: u8,
     text_len: usize,
+    text_digest: ContentId,
     surface: ContentId,
     bytes: Vec<u8, SharedAlloc<'static>>,
 }
@@ -2470,6 +2474,7 @@ impl DependencyFiles {
         world_at: usize,
         index: u32,
         text: &'n str,
+        digest: ContentId,
         edition: blaze_surface::Edition,
         bump: blaze_own::Bump<'n>,
     ) -> Result<blaze_scope::items_record::CurrentFile<'n>, blaze_scope::items_record::ItemsRecordError> {
@@ -2481,6 +2486,7 @@ impl DependencyFiles {
             && cached.index == index
             && cached.edition == ed
             && cached.text_len == text.len()
+            && cached.text_digest == digest
         {
             let view = blaze_surface::FileItemsView::read(blaze_scope::resolve::aligned(&cached.bytes, bump))
                 .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsRead { file: index, why })?;
@@ -2488,7 +2494,6 @@ impl DependencyFiles {
         }
         let alloc = self.heap.alloc();
         let outline = blaze_file_items::outline(text, edition, alloc);
-        let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
         let raw = outline.to_file_items(text, digest, alloc)
             .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsBuild { file: index, why })?;
         let surface = outline.surface();
@@ -2505,7 +2510,7 @@ impl DependencyFiles {
             }
         };
         if let Some(slot) = slots.and_then(|slots| slots.get(at)) {
-            let _ = slot.set(CachedDepFile { world_at, index, edition: ed, text_len: text.len(), surface, bytes });
+            let _ = slot.set(CachedDepFile { world_at, index, edition: ed, text_len: text.len(), text_digest: digest, surface, bytes });
         }
         Ok(blaze_scope::items_record::CurrentFile { view, text, surface })
     }
@@ -2544,6 +2549,7 @@ struct BodiesLoad<'n> {
     list: &'n blaze_world::crate_list::CrateList<'static>,
     outlines: &'n [Outlined<'n>],
     has_unread_outlines: bool,
+    unread_digests: Option<&'n [(blaze_own::String<SharedAlloc<'static>>, ContentId)]>,
     dep_files: &'n DependencyFiles,
     alloc: blaze_own::Alloc<'n>,
 }
@@ -2590,10 +2596,37 @@ impl<'n> blaze_ladder::front2::source::Load<'n> for BodiesLoad<'n> {
         let Some(text) = blaze_scope::resolve::SourceTexts::read(self.texts, krate, &full) else {
             return Ok(None);
         };
+        let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
+        // If this is an unread checkout file (`/0/...`), verify its full-text digest against the
+        // request's initial sweep so concurrent post-sweep edits (e.g. body/const edits that keep
+        // `Outline::surface` identical) are refused as stale rather than mixing snapshots.
+        if let Some(real) = full.strip_prefix("/0/")
+            && let Some(digests) = self.unread_digests
+        {
+            let find = |path: &str| digests.binary_search_by(|(p, _)| p.as_str().cmp(path)).ok().and_then(|i| digests.get(i)).map(|row| row.1);
+            let expected = find(real).or_else(|| {
+                let stem = real.strip_suffix("/mod.rs")?;
+                let mut slot = blaze_own::AString::from_str_in(stem, self.alloc);
+                slot.push_str(".rs");
+                find(slot.as_str())
+            });
+            if let Some(saw) = expected
+                && saw != digest
+                && let Some(key) = self.crates.key(krate)
+            {
+                return Err(blaze_scope::items_record::ItemsRecordError::Stale {
+                    krate: key,
+                    file: Some(index),
+                    call: None,
+                    saw,
+                    found: digest,
+                });
+            }
+        }
         let Some(&world_at) = self.world_ats.get(krate) else {
             return blaze_scope::items_record::CurrentFile::from_text(index, text, edition, bump).map(Some);
         };
-        self.dep_files.get_or_outline(world_at, index, text, edition, bump).map(Some)
+        self.dep_files.get_or_outline(world_at, index, text, digest, edition, bump).map(Some)
     }
 
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<blaze_ladder::front2::source::LoadedExpansion<'n>> {
@@ -2614,6 +2647,7 @@ fn open_stretch_records<'n>(
     packs: crate::job_texts::Packs<'n>,
     outlines: &'n [Outlined<'n>],
     has_unread_outlines: bool,
+    unread_digests: Option<&'n [(blaze_own::String<SharedAlloc<'static>>, ContentId)]>,
     dep_files: &'n DependencyFiles,
     corrected: &'n [(u32, &'n str, &'n str)],
     procs: Option<&'n crate::proc_runner::ProcRunner<'static>>,
@@ -2689,7 +2723,7 @@ fn open_stretch_records<'n>(
         frame,
     ));
     let bodies_load: &'n BodiesLoad<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
-        BodiesLoad { inner: load, crates: from, texts, world_ats, packages, list, outlines, has_unread_outlines, dep_files, alloc },
+        BodiesLoad { inner: load, crates: from, texts, world_ats, packages, list, outlines, has_unread_outlines, unread_digests, dep_files, alloc },
         frame,
     ));
     let log: &'n blaze_ladder::front2::source::Log<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
@@ -2734,6 +2768,7 @@ pub(crate) struct Prepared<'s, 'f, 'r> {
     heap: &'static blaze_own::Heap,
     keep_scratch: bool,
     has_unread_outlines: bool,
+    unread_digests: Option<blaze_own::Arc<blaze_own::Vec<(blaze_own::String<SharedAlloc<'static>>, ContentId), SharedAlloc<'static>>, SharedAlloc<'static>>>,
     plants: RowPlants,
 }
 
@@ -2843,6 +2878,7 @@ pub(crate) struct BodyRunner<'v, 'f, 'r> {
     board: &'v crate::engine_status::Board<'v>,
     keep_scratch: bool,
     has_unread_outlines: bool,
+    unread_digests: Option<&'v [(blaze_own::String<SharedAlloc<'static>>, ContentId)]>,
     plants: RowPlants,
     /// The bodies this setup left to check, by (member, file, name).
     ones: &'v [One<'f>],
@@ -2899,6 +2935,7 @@ impl<'v, 'f, 'r> BodyRunner<'v, 'f, 'r> {
             board: self.board,
             keep_scratch: self.keep_scratch,
             has_unread_outlines: self.has_unread_outlines,
+            unread_digests: self.unread_digests,
             plants: self.plants,
             by_need: self.by_need,
             dep_files: self.dep_files,
@@ -2953,6 +2990,7 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
             board: self.board,
             keep_scratch: self.keep_scratch,
             has_unread_outlines: self.has_unread_outlines,
+            unread_digests: self.unread_digests.as_deref().map(blaze_own::Vec::as_slice),
             plants: self.plants,
             ones: self.ones,
             clock: self.clock,
@@ -2988,16 +3026,16 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
     /// Pre-opens the distinct lang crates (`core`, `alloc`, `std`, `bstd`) of active groups (those
     /// referenced by `self.ones`) ONCE in parallel across `workers` before body stretches begin,
     /// avoiding redundant nested spawns and `OnceLock` contention across concurrent stretches.
-    pub(crate) fn pre_open_lang(&self, cx: &Cx, by_need: &LazyScopeRecords<'_>, workers: NonZeroU32) {
-        self.pre_open_lang_with(cx, by_need, workers, |_| ());
+    pub(crate) fn pre_open_lang(&self, cx: &Cx, by_need: &LazyScopeRecords<'_>, workers: NonZeroU32) -> Result<(), CliError> {
+        self.pre_open_lang_with(cx, by_need, workers, |_| ())
     }
 
     /// Runs `work` on the current thread while pre-opening the distinct lang crates (`core`,
     /// `alloc`, `std`, `bstd`) of active groups in parallel on `workers`.
-    pub(crate) fn pre_open_lang_with<T>(&self, cx: &Cx, by_need: &LazyScopeRecords<'_>, workers: NonZeroU32, work: impl FnOnce(&Cx) -> T) -> T {
-        let Some(found) = self.found.as_ref() else { return work(cx) };
+    pub(crate) fn pre_open_lang_with<T>(&self, cx: &Cx, by_need: &LazyScopeRecords<'_>, workers: NonZeroU32, work: impl FnOnce(&Cx) -> T) -> Result<T, CliError> {
+        let Some(found) = self.found.as_ref() else { return Ok(work(cx)) };
         if self.ones.is_empty() || workers.get() <= 1 {
-            return work(cx);
+            return Ok(work(cx));
         }
         let mut to_open: [Option<&crate::front_load::Unopened>; 8] = [None; 8];
         let mut count = 0usize;
@@ -3028,7 +3066,7 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
             }
         }
         if count < 2 {
-            return work(cx);
+            return Ok(work(cx));
         }
         let pre_cx = cx.span("engine: pre-open lang crates");
         let scope = pre_cx.scope();
@@ -3041,11 +3079,19 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
             }));
         }
         let out = work(cx);
+        let mut first_err: Option<CliError> = None;
         for handle in handles.into_iter() {
-            let _ = handle.join(&pre_cx);
+            if let Err(err) = handle.join(&pre_cx) {
+                first_err.get_or_insert_with(|| CliError::Pool(err));
+            }
         }
-        let _ = scope.join(&pre_cx);
-        out
+        if let Err(err) = scope.join(&pre_cx) {
+            first_err.get_or_insert_with(|| CliError::Pool(err));
+        }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        Ok(out)
     }
 
     /// The `Ready` driver's bodies joined into `stage` (D187): the runs its `BodyCheck` kind
@@ -3143,6 +3189,7 @@ impl<'f> BodiesStage<'f> {
             outlines_moved: None,
             outlines_entered: None,
             unread: None,
+            unread_digests: None,
             members_key: None,
             standing_drops_heads: false,
             row_key_unit_only: false,
@@ -3265,8 +3312,13 @@ impl<'f> BodiesStage<'f> {
     /// The ready setup's: the files it has an outline of and did not read back (sorted, each
     /// once). Under [`StandingMembers`] a visited member's held file among them is refused by
     /// name in `groups` (it would key the member's row apart from the phase path's).
-    pub(crate) fn unread_outlines(&mut self, unread: Vec<Name, blaze_own::Alloc<'static>>) {
+    pub(crate) fn unread_outlines(
+        &mut self,
+        unread: Vec<Name, blaze_own::Alloc<'static>>,
+        digests: Option<blaze_own::Arc<blaze_own::Vec<(blaze_own::String<SharedAlloc<'static>>, ContentId), SharedAlloc<'static>>, SharedAlloc<'static>>>,
+    ) {
         self.unread = Some(unread);
+        self.unread_digests = digests;
     }
 
     /// THE READY SETUP'S READS (piece B2): which outlines the bodies' setup will need, before any
@@ -3737,6 +3789,7 @@ impl<'f> BodiesStage<'f> {
             heap,
             keep_scratch: planted_keep_scratch(),
             has_unread_outlines: self.unread.as_ref().is_some_and(|unread| !unread.is_empty()),
+            unread_digests: self.unread_digests.as_ref().map(blaze_own::Share::share),
             plants,
         })
     }
@@ -3854,7 +3907,7 @@ impl<'f> BodiesStage<'f> {
         // The phase's scope records opened by need, one for all its runs (each crate opened
         // once whichever run asks it first); its counts read after the runs end.
         let by_need = prepared.scope_records();
-        prepared.pre_open_lang(&cx, &by_need, handles.workers);
+        prepared.pre_open_lang(&cx, &by_need, handles.workers)?;
         {
             let stage_reads = match paged_shelf {
                 Some(source) => self.reads_paged(source),
@@ -5736,6 +5789,7 @@ struct Shared<'s, 'a, 'f, 'r, R: ?Sized + CellDigests> {
     /// so `run_stretch` passes `None` for outlines and lets `StoreLoad::file_items` outline any
     /// dependency file actually queried on demand (`CurrentFile::from_text`).
     has_unread_outlines: bool,
+    unread_digests: Option<&'s [(blaze_own::String<SharedAlloc<'static>>, ContentId)]>,
     /// PLANTED BUGS, tests only ([`RowPlants`]): the old row's capacity, or the coarse step off.
     plants: RowPlants,
     /// The request's scope records opened by need ([`BodyRunner::by_need`]).
@@ -6301,6 +6355,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
         (shared.packs, shared.fs).into(),
         shared.outlined,
         shared.has_unread_outlines,
+        shared.unread_digests,
         shared.dep_files,
         shared.corrected,
         shared.procs,

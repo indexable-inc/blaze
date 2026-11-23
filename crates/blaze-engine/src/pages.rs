@@ -92,7 +92,7 @@ mod view;
 mod changes;
 mod headers;
 pub use headers::{Header, HeaderPages, HeaderShardBuilt, HeaderShardJob, Headers, HeadersPlant, IndexedHeaders, Writer};
-pub use changes::{PageBuilt, PageJob, encode_changes, encode_changes_radix, encode_changes_with, plan_digest};
+pub use changes::{PageBuilt, PageJob, encode_changes, encode_changes_radix, plan_digest};
 pub use view::{StoredDefines, StoredNames, StoredReads, StoredRow, VerifiedPage};
 
 /// A page's form. A page of another form is never read: it is a [`PagesError::Magic`]. `BEP3`
@@ -805,19 +805,63 @@ fn encode_inner<'a>(kept: &Kept<'_>, last: Option<&Root<'_>>, forced_bits: Optio
     let mut records = Vec::new_in(alloc);
     let mut bytes = 0u64;
     let mut live_pages = 0u32;
-    for (index, buf) in bufs.into_iter().enumerate() {
-        let index32 = u32::try_from(index).expect("a root's pages are 1 << bits, bits at most MOST_BITS");
-        let Some(page) = buf.finish(bits, index32, alloc) else {
-            pages.push(Key::default());
-            continue;
-        };
-        bytes += page.len() as u64;
-        live_pages = live_pages.saturating_add(1);
-        let key = content_key(&page);
-        pages.push(key);
-        if same_paging.is_none_or(|root| root.is_radix() || root.pages.get(index) != Some(&key)) {
-            records.push((key, view::page_records(&buf.parts[RECORDS], alloc)));
-            puts.push((key, page));
+    if bits > RADIX_FLAT_MAX_BITS && same_paging.is_some() {
+        // Radix whole encode against a same-bits root: build one 256-page shard at a time and
+        // skip emitting page puts/records for any shard whose combined shard key matches `last`.
+        let mut shard_keys: [Key; RADIX_LEAF_PAGES] = [Key::default(); RADIX_LEAF_PAGES];
+        let mut shard_built: SVec<'a, (Key, SVec<'a, u8>, SVec<'a, u8>)> = Vec::with_capacity_in(RADIX_LEAF_PAGES, alloc);
+        let mut bufs_iter = bufs.into_iter();
+        let shard_count = 1usize << (bits - RADIX_LEAF_BITS);
+        for shard_idx in 0..shard_count {
+            shard_keys.fill(Key::default());
+            shard_built.clear();
+            for offset in 0..RADIX_LEAF_PAGES {
+                let index = shard_idx * RADIX_LEAF_PAGES + offset;
+                let index32 = u32::try_from(index).unwrap_or(u32::MAX);
+                let Some(mut buf) = bufs_iter.next() else { break };
+                let Some(page) = buf.finish(bits, index32, alloc) else {
+                    pages.push(Key::default());
+                    continue;
+                };
+                bytes += u64::try_from(page.len()).unwrap_or(u64::MAX);
+                live_pages = live_pages.saturating_add(1);
+                let key = content_key(&page);
+                pages.push(key);
+                if let Some(slot) = shard_keys.get_mut(offset) {
+                    *slot = key;
+                }
+                let rec_part = match buf.parts.get_mut(RECORDS) {
+                    Some(part) => core::mem::replace(part, Vec::new_in(alloc)),
+                    None => Vec::new_in(alloc),
+                };
+                shard_built.push((key, page, rec_part));
+            }
+            let shard_u32 = u32::try_from(shard_idx).unwrap_or(u32::MAX);
+            let unchanged = changes::encode_radix_shard(bits, shard_u32, &shard_keys, alloc)
+                .is_some_and(|(shard_key, _)| same_paging.is_some_and(|r| r.page_shards.get(shard_idx) == Some(&shard_key)));
+            if !unchanged {
+                for (key, page, rec_part) in shard_built.drain(..) {
+                    records.push((key, view::page_records(&rec_part, alloc)));
+                    puts.push((key, page));
+                }
+            }
+        }
+    } else {
+        for (index, buf) in bufs.into_iter().enumerate() {
+            let index32 = u32::try_from(index).unwrap_or(u32::MAX);
+            let Some(page) = buf.finish(bits, index32, alloc) else {
+                pages.push(Key::default());
+                continue;
+            };
+            bytes += u64::try_from(page.len()).unwrap_or(u64::MAX);
+            live_pages = live_pages.saturating_add(1);
+            let key = content_key(&page);
+            pages.push(key);
+            if same_paging.is_none_or(|root| root.pages.get(index) != Some(&key)) {
+                let rec_bytes = buf.parts.get(RECORDS).map_or(&[][..], Vec::as_slice);
+                records.push((key, view::page_records(rec_bytes, alloc)));
+                puts.push((key, page));
+            }
         }
     }
     directory.serial = answer.serial;
@@ -953,6 +997,10 @@ pub fn decode_root_with<'a, 'g>(root: Sealed<'_>, get: impl FnMut(Key) -> Got<'g
     if bits > blaze_drive::answers::MOST_BITS {
         return Err(PagesError::Count { page: ROOT_PAGE, count: u32::from(bits) });
     }
+    let max_pages = 1u32 << bits;
+    if live_pages > max_pages {
+        return Err(PagesError::Count { page: ROOT_PAGE, count: live_pages });
+    }
     match flags {
         ROOT_FLAG_FLAT => {
             if bits > RADIX_FLAT_MAX_BITS {
@@ -963,8 +1011,16 @@ pub fn decode_root_with<'a, 'g>(root: Sealed<'_>, get: impl FnMut(Key) -> Got<'g
                 return Err(PagesError::Count { page: ROOT_PAGE, count: count as u32 });
             }
             let mut pages = Vec::with_capacity_in(count, alloc);
+            let mut nonzero = 0u32;
             for _ in 0..count {
-                pages.push(Key(r.id()?));
+                let key = Key(r.id()?);
+                if key != Key::default() {
+                    nonzero = nonzero.saturating_add(1);
+                }
+                pages.push(key);
+            }
+            if live_pages != nonzero {
+                return Err(PagesError::Count { page: ROOT_PAGE, count: live_pages });
             }
             changes::read_flat_directory(r, serial, bits, total, live_pages, outlines, pages, alloc)
         }
@@ -978,8 +1034,17 @@ pub fn decode_root_with<'a, 'g>(root: Sealed<'_>, get: impl FnMut(Key) -> Got<'g
                 return Err(PagesError::Count { page: ROOT_PAGE, count: shard_count as u32 });
             }
             let mut page_shards = Vec::with_capacity_in(shard_count, alloc);
+            let mut nonempty_shards = 0u32;
             for _ in 0..shard_count {
-                page_shards.push(Key(r.id()?));
+                let key = Key(r.id()?);
+                if key != Key::default() {
+                    nonempty_shards = nonempty_shards.saturating_add(1);
+                }
+                page_shards.push(key);
+            }
+            let radix_cap = nonempty_shards.saturating_mul(u32::try_from(RADIX_LEAF_PAGES).unwrap_or(u32::MAX));
+            if live_pages > radix_cap {
+                return Err(PagesError::Count { page: ROOT_PAGE, count: live_pages });
             }
             changes::read_radix_directory(r, serial, bits, total, live_pages, outlines, page_shards, get, alloc)
         }
@@ -1046,4 +1111,44 @@ pub(crate) fn decode_root_hashed<'a>(key: Key, bytes: &[u8], alloc: SharedAlloc<
 pub(crate) fn decode_page_for_test(bytes: &[u8], page: u32, bits: u8) -> Result<(), PagesError> {
     let sealed = Sealed { key: content_key(bytes), bytes, check: Check::Hashed };
     VerifiedPage::open_whole(sealed, page, bits).map(|_| ())
+}
+
+#[cfg(test)]
+mod codex_regression_tests {
+    use super::*;
+
+    #[test]
+    fn decode_root_rejects_unbounded_live_pages() {
+        let alloc = blaze_own::testing::heap().shared();
+        let make_flat = |bits: u8, live_pages: u32| {
+            let mut flat = Vec::new_in(alloc);
+            flat.extend_from_slice(ROOT_MAGIC);
+            flat.extend_from_slice(&0u64.to_le_bytes()); // serial
+            flat.push(bits);
+            flat.extend_from_slice(&0u64.to_le_bytes()); // total
+            flat.push(ROOT_FLAG_FLAT);
+            flat.extend_from_slice(&live_pages.to_le_bytes());
+            flat.extend_from_slice(&0u32.to_le_bytes()); // outlines
+            let n = 1u32 << bits;
+            flat.extend_from_slice(&n.to_le_bytes()); // count
+            for _ in 0..n {
+                flat.extend_from_slice(&[0u8; 32]);
+            }
+            flat
+        };
+
+        let flat = make_flat(2, 999_999);
+        let key = content_key(&flat);
+        assert!(
+            matches!(decode_root_hashed(key, &flat, alloc), Err(PagesError::Count { page: ROOT_PAGE, .. })),
+            "flat root with live_pages > 1 << bits must be rejected"
+        );
+
+        let flat_mismatch = make_flat(2, 2);
+        let key2 = content_key(&flat_mismatch);
+        assert!(
+            matches!(decode_root_hashed(key2, &flat_mismatch, alloc), Err(PagesError::Count { page: ROOT_PAGE, .. })),
+            "flat root whose live_pages disagrees with nonzero page keys must be rejected"
+        );
+    }
 }

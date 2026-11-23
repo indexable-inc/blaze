@@ -240,7 +240,8 @@ impl History {
         let entered: StdVec<Name> = ours.entered.iter().copied().collect();
         let kept = Kept::after(crate::SMap::new_in(alloc()), ours.answer, &ours.causes, crate::SMap::new_in(alloc()));
         let encoded = match reader {
-            Some(reader) => encode_changes(&kept, &reader.root, alloc()).map_err(|error| Broke::Oracle(format!("request {serial}: the pages' commit: {error}")))?,
+            Some(reader) => encode_changes(&kept, &reader.root, alloc(), |k| self.store.records.get(&k).map(|b| Sealed::hashed(k, b)))
+                .map_err(|error| Broke::Oracle(format!("request {serial}: the pages' commit: {error}")))?,
             None => encode(&kept, None, alloc()),
         };
         let (headers, shard_puts) = Headers::after(

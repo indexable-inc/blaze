@@ -228,8 +228,13 @@ impl BgGc {
             BgGc::Detached { spawner, exe, home, max_store_bytes } => {
                 // Fast non-blocking probe of `gc.lock`: skip spawning a duplicate `blaze gc`
                 // process on every rapid edit while an existing background GC is already running.
-                if !gc_lock_is_free(cx, blaze_dir) {
-                    return false;
+                match gc_lock_is_free(cx, blaze_dir) {
+                    Ok(true) => {}
+                    Ok(false) => return false,
+                    Err(error) => {
+                        let _ = err.line(cx, format_args!("blaze: warning: failed to probe background gc lock: {error}"));
+                        return false;
+                    }
                 }
                 let frame = cx.frame();
                 let budget_text = max_store_bytes.map(|b| bstd::mem::format_in!(frame, "{b}"));
@@ -252,9 +257,10 @@ impl BgGc {
 
 /// Non-blocking check of whether `v2/store/gc.lock` is currently unheld by another GC process.
 /// Immediately releases the probe lock if free so a newly spawned `blaze gc --background` can
-/// acquire it; returns `false` when contended (another GC is already running).
-pub(crate) fn gc_lock_is_free(cx: &Cx, blaze_dir: &Dir<ReadWrite>) -> bool {
-    matches!(try_acquire_gc_lock(cx, blaze_dir), Ok(Some(_)))
+/// acquire it; returns `Ok(false)` when contended (another GC is already running), or `Err` on
+/// lock-path/I/O failure.
+pub(crate) fn gc_lock_is_free(cx: &Cx, blaze_dir: &Dir<ReadWrite>) -> Result<bool, CliError> {
+    Ok(try_acquire_gc_lock(cx, blaze_dir)?.is_some())
 }
 
 /// Acquires the non-blocking exclusive GC lock at `<HOME>/.blaze/v2/store/gc.lock`.

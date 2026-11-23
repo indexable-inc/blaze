@@ -205,6 +205,7 @@ impl Phases {
         self.meter = blaze_meter::Meter::now();
         self.waits_at = blaze_meter::Waited::ZERO;
         self.last_row_waits_from = blaze_meter::Waited::ZERO;
+        self.beside = [("", blaze_meter::Spread::NONE); MOST_BESIDE];
         self.beside_len = 0;
     }
 
@@ -215,7 +216,9 @@ impl Phases {
         let at = match self.beside[..self.beside_len].iter().position(|row| row.0 == kind) {
             Some(at) => at,
             None if self.beside_len < MOST_BESIDE => {
-                self.beside[self.beside_len].0 = kind;
+                if let Some(slot) = self.beside.get_mut(self.beside_len) {
+                    *slot = (kind, blaze_meter::Spread::NONE);
+                }
                 self.beside_len += 1;
                 self.beside_len - 1
             }
@@ -638,5 +641,22 @@ mod tests {
         // A fresh reader: the first one's borrow of `phases` ended at its last call, before the mark.
         let waited = |row: usize| phases.used[row].as_ref().map(|used| used.waited.total()).expect("one thread's marks pair");
         assert_eq!(waited(3), (0, 0), "the control: the thread's meter alone cannot see a worker's wait");
+    }
+
+    #[test]
+    fn reset_clears_beside_slots() {
+        let io = Io::simulated(SimWorld::new(1, Limits::USUAL));
+        let mut p = Phases::new(io.need_clock().expect("clock"));
+        let mut spread = blaze_meter::Spread::NONE;
+        spread.n = 1;
+        p.worked_used("bodies", &spread);
+        assert_eq!(p.beside_len, 1);
+        assert_eq!(p.beside[0].1.n, 1);
+        p.reset();
+        assert_eq!(p.beside_len, 0);
+        assert_eq!(p.beside[0].1.n, 0);
+        p.worked_used("bodies", &spread);
+        assert_eq!(p.beside_len, 1);
+        assert_eq!(p.beside[0].1.n, 1);
     }
 }

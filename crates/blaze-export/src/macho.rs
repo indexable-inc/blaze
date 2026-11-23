@@ -653,11 +653,12 @@ pub fn write_native<'a>(
                     cursor = at + 8;
                     section("__mod_init_func", "__DATA_CONST", at, 8, at, 3, S_MOD_INIT_FUNC_POINTERS)
                 });
-                let rest = laid.const_end() - cursor;
+                let const_start = up(cursor, 16);
+                let rest = laid.const_end().saturating_sub(const_start);
                 let sections: [Option<Section<'_>>; DATA_CONST_SECTIONS] = [
                     (n > 0).then(|| section("__got", "__DATA_CONST", laid.got_at, got_size, laid.got_at, 3, S_NON_LAZY_SYMBOL_POINTERS)),
                     mod_init,
-                    (rest > 0).then(|| section("__const", "__DATA_CONST", cursor, rest, cursor, 4, S_REGULAR)),
+                    (rest > 0).then(|| section("__const", "__DATA_CONST", const_start, rest, const_start, 4, S_REGULAR)),
                 ];
                 cmds.segment(segment(seg), sections.into_iter().flatten());
             }

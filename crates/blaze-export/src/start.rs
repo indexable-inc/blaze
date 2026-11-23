@@ -40,7 +40,8 @@ const RET: u32 = 0xD65F_03C0;
 const MOV_W0_0: u32 = 0x5280_0000; // mov w0, #0
 const MOV_W3_0: u32 = 0x5280_0003; // mov w3, #0
 const MOV_X2_X1: u32 = 0xAA01_03E2; // mov x2, x1
-const MOV_X1_X0: u32 = 0xAA00_03E1; // mov x1, x0
+const SXTW_X1_W0: u32 = 0x9340_7C01; // sxtw x1, w0 (sign-extend C `int argc` to `isize`)
+const SXTW_X1_W1: u32 = 0x9340_7C21; // sxtw x1, w1 (sign-extend C `int argc` to `isize`)
 const ADRP_X0: u32 = 0x9000_0000; // adrp x0, _
 const LDR_X0: u32 = 0xF940_0000; // ldr x0, [x0, _]
 const ADRP_X1: u32 = 0x9000_0001; // adrp x1, _
@@ -49,7 +50,7 @@ const LDR_X1_X0: u32 = 0xF940_0001; // ldr x1, [x0]
 const LSL_X1_3: u32 = 0xD37D_F021; // lsl x1, x1, #3 (ubfm x1, x1, #61, #60)
 const STR_X1_X0_8: u32 = 0xF900_0401; // str x1, [x0, #8]
 const CBZ_W0_8: u32 = 0x3400_0040; // cbz w0, +8
-const BRK_SET_FAILED: u32 = 0xD420_0000 | (blaze_code::trap::SET_FAILED << 5);
+const BRK_KEY_CREATE_FAILED: u32 = 0xD420_0000 | (blaze_code::trap::KEY_CREATE_FAILED << 5);
 const ADRP_X16: u32 = 0x9000_0010; // adrp x16, _
 const LDR_X16: u32 = 0xF940_0210; // ldr x16, [x16, _]
 const BLR_X16: u32 = 0xD63F_0200; // blr x16
@@ -120,51 +121,51 @@ fn static_target(symbol: Symbol) -> Target {
 }
 
 /// The thread-local startup initializer: calls `pthread_key_create(&DESC.key, ender)`, traps on
-/// failure (`SET_FAILED`), and on macOS writes `DESC.root = DESC.key * 8` (on Linux, `DESC.root`
-/// is statically initialized to the `PT_TLS` root offset with `ROOT_OWN` set).
+/// failure (`KEY_CREATE_FAILED`), and on macOS writes `DESC.root = DESC.key * 8` (on Linux,
+/// `DESC.root` is statically initialized to the `PT_TLS` root offset with `ROOT_OWN` set).
 fn tls_init_record<'a>(tls: TlsRuntime, platform: Platform, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, ExportError> {
     let desc = static_target(tls.descriptor);
     let ender = func(tls.ender);
     match platform {
         Platform::MacosArm64 => {
             let code = [
-                STP_FP_LR,      // 0
-                MOV_FP_SP,      // 4
-                ADRP_X0,        // 8: &DESC
-                LDR_X0,         // 12
-                ADRP_X1,        // 16: &ender
-                LDR_X1,         // 20
-                ADRP_X16,       // 24: pthread_key_create
-                LDR_X16,        // 28
-                BLR_X16,        // 32
-                CBZ_W0_8,       // 36
-                BRK_SET_FAILED, // 40
-                ADRP_X0,        // 44: &DESC
-                LDR_X0,         // 48
-                LDR_X1_X0,      // 52: x1 = DESC.key
-                LSL_X1_3,       // 56: x1 = key * 8
-                STR_X1_X0_8,    // 60: DESC.root = key * 8
-                LDP_FP_LR,      // 64
-                RET,            // 68
+                STP_FP_LR,             // 0
+                MOV_FP_SP,             // 4
+                ADRP_X0,               // 8: &DESC
+                LDR_X0,                // 12
+                ADRP_X1,               // 16: &ender
+                LDR_X1,                // 20
+                ADRP_X16,              // 24: pthread_key_create
+                LDR_X16,               // 28
+                BLR_X16,               // 32
+                CBZ_W0_8,              // 36
+                BRK_KEY_CREATE_FAILED, // 40
+                ADRP_X0,               // 44: &DESC
+                LDR_X0,                // 48
+                LDR_X1_X0,             // 52: x1 = DESC.key
+                LSL_X1_3,              // 56: x1 = key * 8
+                STR_X1_X0_8,           // 60: DESC.root = key * 8
+                LDP_FP_LR,             // 64
+                RET,                   // 68
             ];
             let sites = [(8, SiteKind::Load, desc), (16, SiteKind::Load, ender), (44, SiteKind::Load, desc)];
             made(&code, &sites, Some((24, "pthread_key_create")), alloc)
         }
         Platform::LinuxArm64 => {
             let code = [
-                STP_FP_LR,      // 0
-                MOV_FP_SP,      // 4
-                ADRP_X0,        // 8: &DESC
-                LDR_X0,         // 12
-                ADRP_X1,        // 16: &ender
-                LDR_X1,         // 20
-                ADRP_X16,       // 24: pthread_key_create
-                LDR_X16,        // 28
-                BLR_X16,        // 32
-                CBZ_W0_8,       // 36
-                BRK_SET_FAILED, // 40
-                LDP_FP_LR,      // 44
-                RET,            // 48
+                STP_FP_LR,             // 0
+                MOV_FP_SP,             // 4
+                ADRP_X0,               // 8: &DESC
+                LDR_X0,                // 12
+                ADRP_X1,               // 16: &ender
+                LDR_X1,                // 20
+                ADRP_X16,              // 24: pthread_key_create
+                LDR_X16,               // 28
+                BLR_X16,               // 32
+                CBZ_W0_8,              // 36
+                BRK_KEY_CREATE_FAILED, // 40
+                LDP_FP_LR,             // 44
+                RET,                   // 48
             ];
             let sites = [(8, SiteKind::Load, desc), (16, SiteKind::Load, ender)];
             made(&code, &sites, Some((24, "pthread_key_create")), alloc)
@@ -222,7 +223,7 @@ fn wrapper<'a>(entry: Entry, init: Option<Symbol>, alloc: Alloc<'a>) -> Result<O
         }
         (Entry::LangStart { lang_start, main }, None) => {
             let code = [
-                STP_FP_LR, MOV_FP_SP, MOV_X2_X1, MOV_X1_X0, ADRP_X0, LDR_X0, MOV_W3_0, ADRP_X16, LDR_X16, BLR_X16, LDP_FP_LR, RET,
+                STP_FP_LR, MOV_FP_SP, MOV_X2_X1, SXTW_X1_W0, ADRP_X0, LDR_X0, MOV_W3_0, ADRP_X16, LDR_X16, BLR_X16, LDP_FP_LR, RET,
             ];
             let sites = [(16, SiteKind::Load, func(main)), (28, SiteKind::Call, func(lang_start))];
             made(&code, &sites, None, alloc).map(Some)
@@ -235,17 +236,18 @@ fn wrapper<'a>(entry: Entry, init: Option<Symbol>, alloc: Alloc<'a>) -> Result<O
                 ADRP_X16,        // 12: init
                 LDR_X16,         // 16
                 BLR_X16,         // 20
-                LDP_X1_X2_SP_16, // 24: x1 = argc, x2 = argv
-                ADRP_X0,         // 28: main
-                LDR_X0,          // 32
-                MOV_W3_0,        // 36: sigpipe = 0
-                ADRP_X16,        // 40: lang_start
-                LDR_X16,         // 44
-                BLR_X16,         // 48
-                LDP_FP_LR_32,    // 52
-                RET,             // 56
+                LDP_X1_X2_SP_16, // 24: x1 = argc (w1 valid), x2 = argv
+                SXTW_X1_W1,      // 28: sign-extend C `int argc` to `isize`
+                ADRP_X0,         // 32: main
+                LDR_X0,          // 36
+                MOV_W3_0,        // 40: sigpipe = 0
+                ADRP_X16,        // 44: lang_start
+                LDR_X16,         // 48
+                BLR_X16,         // 52
+                LDP_FP_LR_32,    // 56
+                RET,             // 60
             ];
-            let sites = [(12, SiteKind::Call, func(init)), (28, SiteKind::Load, func(main)), (40, SiteKind::Call, func(lang_start))];
+            let sites = [(12, SiteKind::Call, func(init)), (32, SiteKind::Load, func(main)), (44, SiteKind::Call, func(lang_start))];
             made(&code, &sites, None, alloc).map(Some)
         }
     }

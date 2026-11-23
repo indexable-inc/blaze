@@ -773,21 +773,29 @@ fn incremental_heads_opens_only_active_member_scopes_and_wakes_moved_readers() {
     assert_eq!(cold.checked.seeds.bodies.refused, 0, "{:?}", cold.checked.bodies.0);
     assert!(cold.checked.bodies.0.is_empty(), "{:?}", cold.checked.bodies.0);
 
+    let cold_reads = cold.checked.records.reads[Stage::Heads.index()];
+    assert!(
+        cold_reads.records >= 11,
+        "cold Heads opens all 4 members' units plus the 3 lang crates: {cold_reads:?}"
+    );
+
     // 1. Add an unused private fn in `a`: only 1 new Signature task enters in `Heads`,
-    //    and `Heads` opens only `a`'s 2 units (lib + test) — not `b`, `c`, `d`, or toolchain crates.
+    //    and `Heads` opens only `a`'s 2 units (lib + test) plus the 3 lazily queried lang crates
+    //    (`core`, `alloc`, `std`) — NOT standing members `b`, `c`, `d`.
     write(&io, "a/src/lib.rs", A_PRIVATE);
     let private = run_with_shelf(&io, false);
     assert_eq!(private.heads(), 1, "only the new private fn's Signature enters Heads");
     let heads_reads = private.checked.records.reads[Stage::Heads.index()];
     assert!(
-        heads_reads.records <= 2,
-        "Heads must open only a's own units (<= 2), not standing members or toolchain crates: {heads_reads:?}"
+        heads_reads.records <= 5 && heads_reads.records < cold_reads.records,
+        "Heads must open only a's 2 units plus queried lang crates (<= 5), not standing members b/c/d: {heads_reads:?} (cold={cold_reads:?})"
     );
     let fresh_private = run_with_shelf(&build_world(A_PRIVATE), true);
     assert!(private.same_answer(&fresh_private), "incremental private-fn edit must match fresh oracle");
 
     // 2. Change `a::Num` from `u32` to `u16`: `a::Num` AND `b::take`'s downstream Signature task
-    //    wake up via read-moved edges, while unrelated `c` and `d` stay unopened (<= 4 units: a + b).
+    //    wake up via read-moved edges, while unrelated `c` and `d` stay unopened (<= 7: a + b's 4
+    //    units + 3 queried lang crates).
     write(&io, "a/src/lib.rs", A_MOVED);
     let moved = run_with_shelf(&io, false);
     let num = fixture_signature("a/src/lib.rs", A_MOVED, "Num");
@@ -804,8 +812,8 @@ fn incremental_heads_opens_only_active_member_scopes_and_wakes_moved_readers() {
     );
     let moved_reads = moved.checked.records.reads[Stage::Heads.index()];
     assert!(
-        moved_reads.records <= 4,
-        "Heads must open only a and b's units (<= 4), leaving c, d, and toolchain crates unopened: {moved_reads:?}"
+        moved_reads.records <= 7 && moved_reads.records < cold_reads.records,
+        "Heads must open only a and b's 4 units plus queried lang crates (<= 7), leaving c and d unopened: {moved_reads:?} (cold={cold_reads:?})"
     );
     let fresh_moved = run_with_shelf(&build_world(A_MOVED), true);
     assert!(moved.same_answer(&fresh_moved), "incremental cross-crate head edit must match fresh oracle");

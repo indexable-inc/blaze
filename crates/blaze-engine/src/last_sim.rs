@@ -725,7 +725,10 @@ fn paged_dag(tape: &Tape) -> Result<(), Broke> {
                 format!("DAG mask {mask:#b}: memory {:?}, page {:?}", &eager.causes[..], &view.causes[..])
             })?;
             let changed = Kept::after(crate::SMap::new_in(alloc()), view.answer, &view.causes, crate::SMap::new_in(alloc()));
-            let next = encode_changes(&changed, &root, alloc()).map_err(|e| Broke::Oracle(format!("publish DAG step {step}: {e}")))?;
+            let next = encode_changes(&changed, &root, alloc(), |k| {
+                encoded.puts.iter().find(|(pk, _)| *pk == k).map(|(_, b)| Sealed::hashed(k, b))
+            })
+            .map_err(|e| Broke::Oracle(format!("publish DAG step {step}: {e}")))?;
             let headers = HeaderPages::encode(&changed, Some(&header_keys), |slot| Ok(stored.headers.get(&slot)), alloc())
                 .map_err(|e| Broke::Oracle(format!("publish DAG headers at step {step}: {e}")))?;
             (next, headers)
@@ -852,7 +855,7 @@ fn encode_changes_repages_when_growing_from_small_base() {
         let paged = dag_request(Answer::from_pages(&stored, base_root.serial, alloc()), &big_files, outline, scope, &values, &big_readers).expect("paged big");
         assert_eq!(&eager.entered[..], &paged.entered[..], "same tasks entered on paged vs in-memory base");
         let paged_kept = Kept::after(crate::SMap::new_in(alloc()), paged.answer, &paged.causes, crate::SMap::new_in(alloc()));
-        encode_changes(&paged_kept, &base_root, alloc()).expect("repage encode_changes")
+        encode_changes(&paged_kept, &base_root, alloc(), |k| base_bytes.get(&k).map(|b| Sealed::hashed(k, b))).expect("repage encode_changes")
     };
     let mem_kept = Kept::after(base_kept.causes, eager.answer, &eager.causes, base_kept.records);
     let expected = encode(&mem_kept, Some(&base_root), alloc());

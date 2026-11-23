@@ -212,7 +212,7 @@ pub fn lay<'f, 'l>(
             // track proc-macro source trees in the sweep leaf table (rule 21).
             for pkg in units.path_packages.iter() {
                 let edition = syntax_of(pkg.edition.syntax).byte();
-                for target in pkg.lib.iter().chain(pkg.bins.iter()) {
+                for target in pkg.lib.iter().chain(pkg.bins.iter()).chain(pkg.build.iter()) {
                     path_roots.push((frame.alloc_str(target.root.as_str()), edition));
                 }
                 if pkg.lib.iter().any(|lib| lib.proc_macro) {

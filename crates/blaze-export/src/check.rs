@@ -172,7 +172,8 @@ pub fn macho(file: &[u8]) -> Result<MachoFacts, CheckError> {
                     }
                     if flags & 0xFF == 0x9 {
                         field(len % 8 == 0, "__mod_init_func's size", len)?;
-                        if let Some(s_idx) = usize::try_from(s).ok()
+                        if seg.name.starts_with(b"__DATA_CONST\0")
+                            && let Some(s_idx) = usize::try_from(s).ok()
                             && file.get(s_idx..s_idx + 15) == Some(b"__mod_init_func".as_slice())
                         {
                             mod_init = Some((offset, len));
