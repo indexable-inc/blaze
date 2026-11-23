@@ -32,7 +32,7 @@ use blaze_surface::ItemIndex;
 
 use crate::front2::links::{CrateExport, CrateLinks, LinkDecl, LinkKind, LinksError, Modifiers, scope_links};
 pub use crate::natives::Asked;
-use crate::natives::{CrateNative, NativeError, NativeInputs, NativeSummary, asked, native_key, native_library};
+use crate::natives::{CrateNative, NativeError, NativeInputs, NativeSummary, asked, native_key, native_layout, native_library};
 pub use blaze_native::libraries::{Library, LibraryKind, Linked, Source};
 pub use blaze_native::tbd::TbdError;
 
@@ -209,6 +209,20 @@ pub fn program_image<'a>(
 ) -> Result<NativeSummary, NativeError<'a>> {
     let natives = as_natives(crates, bump.alloc())?;
     native_library(&NativeInputs { platform, producer, crates: &natives, installs }, seed, out, bump)
+}
+
+/// The laid-out native image at image-relative addresses (base 0) for `blaze export`'s native
+/// merge (`blaze_export::ProgramIn::natives`).
+pub fn program_layout<'a>(
+    crates: &'a [ProgramCrate<'a>],
+    installs: &'a [Linked<'a>],
+    platform: Platform,
+    producer: &'a ProducerId<Whole>,
+    seed: FixedState,
+    bump: Bump<'a>,
+) -> Result<blaze_native::image::Image<'a>, NativeError<'a>> {
+    let natives = as_natives(crates, bump.alloc())?;
+    native_layout(&NativeInputs { platform, producer, crates: &natives, installs }, seed, bump)
 }
 
 fn as_natives<'a>(crates: &'a [ProgramCrate<'a>], alloc: Alloc<'a>) -> Result<AVec<'a, CrateNative<'a>>, NativeError<'a>> {

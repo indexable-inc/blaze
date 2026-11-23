@@ -519,3 +519,39 @@ fn rust_tls_refusals_are_named() {
     let p = ProgramIn { functions: &fs_plain_ender, data: &collide_data, tls: rt, ..p };
     assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::TwoData { target: desc_target }));
 }
+
+/// Regression: when `eh_room` reserves more pages after `__text` than `eh_sections` actually
+/// needs (`up(eh.end(), PAGE) < laid.const_at`), Mach-O must still place `__DATA_CONST`'s bytes
+/// at `laid.const_at` rather than right after `text_size`.
+#[test]
+fn macho_const_segment_lands_at_const_at_when_eh_leaves_page_gap() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let magic = 0xCAFE_BABE_1234_5678u64.to_le_bytes();
+    let ro = Target { space: Space::Static, symbol: sym("RO_MAGIC") };
+    let main = rec(&[ADRP_X0, LDR_X0, MOV_W0_42, RET], &[(0, SiteKind::Load, ro)], &[]);
+    let members = [Member { symbol: sym("main"), record: CodeView::read(&main).unwrap(), tier: Some(Tier::Fast) }];
+    let data = [Data { target: ro, bytes: &magic, align: 8, words: &[], place: DataPlace::ReadOnly }];
+    let tail = 0x8000u64;
+    let laid = lay_out(&members, &data, sym("main"), None, macho::plan_for(None), tail, alloc).unwrap();
+    let eh = crate::eh_out::eh_sections(&laid, &members, None, Platform::MacosArm64, alloc).unwrap();
+    let text_size = (eh.end() + 0x3FFF) & !0x3FFF;
+    assert!(
+        laid.const_at > text_size,
+        "test setup must leave at least one page gap between text_size ({text_size:#x}) and const_at ({:#x})",
+        laid.const_at
+    );
+
+    let mut out = Vec::new_in(alloc);
+    macho::write(&laid, &eh, "const-gap", &[0u8; 32], &mut out, alloc).unwrap();
+    check::macho(&out).unwrap();
+    let const_at = laid.const_at as usize;
+    assert_eq!(
+        &out[const_at..const_at + laid.konst.len()],
+        &laid.konst[..],
+        "__DATA_CONST bytes must be written at laid.const_at, not text_size"
+    );
+    assert!(
+        out[const_at..const_at + laid.konst.len()].windows(magic.len()).any(|w| w == magic),
+        "RO_MAGIC payload must be present inside __DATA_CONST at laid.const_at"
+    );
+}
