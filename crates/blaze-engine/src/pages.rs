@@ -8,9 +8,18 @@
 //! Every field little-endian and fixed-width; a name is its kind byte and its 32-byte subject.
 //!
 //! ```text
-//! root = "BER3" | serial u64 | bits u8 | bytes u64 | pages u32 (= 1 << bits) | pages x key [32]
-//!        | outline count | file plan digests | file places | units | findings | owed tasks
-//!        | owed cells
+//! root = "BER4" | serial u64 | bits u8 | bytes u64 | flags u8 | live_pages u32 | outlines u32
+//!        if flags == 0 (flat, bits <= RADIX_FLAT_MAX_BITS):
+//!          | pages u32 (= 1 << bits) | pages x key [32]
+//!          | files | places | units | findings | owed tasks | owed cells
+//!        if flags == 1 (2-level radix, bits > RADIX_FLAT_MAX_BITS):
+//!          | shards u32 (= 1 << (bits - RADIX_LEAF_BITS)) | shards x key [32]
+//!          | 16 x file_shard_key [32] | places_key [32] | summary_key [32]
+//!          | owed tasks | owed cells
+//! radix shard  = "BEX1" | bits u8 | shard u32 | 256 x key [32]  (all-zero shard = zero key)
+//! file shard   = "BEF1" | shard u8 | count u32 | count x (file | has u8 | [digest [32]])
+//! places rec   = "BEPL" | count u32 | count x (file | unit | edition u8 | flags u8)
+//! summary rec  = "BES1" | units u32 | units x Name | findings u32 | findings x (Name | u32)
 //! file places = count u32 | count x (file | unit | edition u8 | flags u8), by file, strictly
 //!        ([`FilePlace`]: one a source file the driver planned, each file of the plan digests)
 //! page = "BEP5" | bits u8 | index u32 | 8 x count u32 | (n + 1) x start u32 | the eight
@@ -83,7 +92,7 @@ mod view;
 mod changes;
 mod headers;
 pub use headers::{Header, HeaderPages, HeaderShardBuilt, HeaderShardJob, Headers, HeadersPlant, IndexedHeaders, Writer};
-pub use changes::{PageBuilt, PageJob, encode_changes, encode_changes_with, plan_digest};
+pub use changes::{PageBuilt, PageJob, encode_changes, encode_changes_radix, encode_changes_with, plan_digest};
 pub use view::{StoredDefines, StoredNames, StoredReads, StoredRow, VerifiedPage};
 
 /// A page's form. A page of another form is never read: it is a [`PagesError::Magic`]. `BEP3`
@@ -114,9 +123,35 @@ pub fn readers_slot(id: &CellId) -> Name {
     subject[..8].copy_from_slice(&h.to_be_bytes());
     Name::new(id.of.kind, ContentId(subject))
 }
-/// The root's form. `BER2` had no file places ([`FilePlace`]): a root of it is a
+/// The root's form. `BER3` stored a flat array of up to 65,536 page keys (2 MiB) plus all
+/// directory sections inline; `BER4` keeps small answers (`bits <= RADIX_FLAT_MAX_BITS`) inline
+/// and stores large answers (`bits > RADIX_FLAT_MAX_BITS`) as a 2-level 256-way radix tree with
+/// sharded file directory and immutable `places`/`summary` sub-records. A `BER3` root is a
 /// [`PagesError::Magic`], reported, and the answer made again (D160), never read as this one.
-pub const ROOT_MAGIC: &[u8; 4] = b"BER3";
+pub const ROOT_MAGIC: &[u8; 4] = b"BER4";
+/// Leaf-shard form of a 2-level radix answer root: 256 page keys (8,192 bytes + 9-byte header).
+pub const RADIX_SHARD_MAGIC: &[u8; 4] = b"BEX1";
+/// File-directory shard form of a radix answer root (16 shards by subject's leading nibble).
+pub const FILE_SHARD_MAGIC: &[u8; 4] = b"BEF1";
+/// File-places sub-record form of a radix answer root.
+pub const PLACES_MAGIC: &[u8; 4] = b"BEPL";
+/// Units-and-findings summary sub-record form of a radix answer root.
+pub const SUMMARY_MAGIC: &[u8; 4] = b"BES1";
+
+/// Bits addressed inside one radix leaf shard (`1 << 8 = 256` page keys = 8 KiB).
+pub const RADIX_LEAF_BITS: u8 = 8;
+/// Number of page slots per radix leaf shard (`256`).
+pub const RADIX_LEAF_PAGES: usize = 1 << RADIX_LEAF_BITS;
+/// Maximum `bits` kept inline as a flat root (`<= 512` pages = `<= 16 KiB`); above this
+/// (`bits >= 10`, `1,024..=65,536` pages), the root uses the 2-level 256-way radix tree.
+pub const RADIX_FLAT_MAX_BITS: u8 = 9;
+/// Number of file-directory shards in a radix root (`file.subject.0[0] >> 4`).
+pub const FILE_SHARDS: usize = 16;
+
+const ROOT_FLAG_FLAT: u8 = 0;
+const ROOT_FLAG_RADIX: u8 = 1;
+const RADIX_SHARD_HEAD: usize = 4 + 1 + 4;
+const RADIX_SHARD_BYTES: usize = RADIX_SHARD_HEAD + RADIX_LEAF_PAGES * ID;
 
 /// Where the driver found a source file of its plan, kept beside the file's plan digest in the
 /// root ([`Root::places`]) so an edit of the file re-plans it alone (D187): the file's own walk
@@ -157,7 +192,7 @@ const OWED_CELL: usize = CELL_ID + 8;
 const OWED_TASK: usize = NAME + 1 + 2 + ID + NAME;
 const FILE_MEMBER: usize = NAME + 1 + ID + 3 + ID;
 const CAUSE: usize = NAME + 8 + 1 + CELL_ID + ID + ID;
-const ROOT_HEAD: usize = 4 + 8 + 1 + 8 + 4;
+const ROOT_HEAD: usize = 4 + 8 + 1 + 8 + 1 + 4 + 4;
 /// The page index a root's own errors name.
 pub const ROOT_PAGE: u32 = u32::MAX;
 
@@ -382,6 +417,20 @@ impl fmt::Display for PagesError {
     }
 }
 
+/// One page slot whose key moved between the previous root and this commit (used by reach-shard
+/// publication without scanning all `1 << bits` slots).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PageDelta {
+    pub index: u32,
+    pub old: Key,
+    pub new: Key,
+}
+
+/// One decoded 256-page leaf shard of a 2-level radix answer root (`BEX1`).
+pub struct RadixShard<'a> {
+    pub keys: blaze_own::Box<[Key; RADIX_LEAF_PAGES], SharedAlloc<'a>>,
+}
+
 /// A [`Kept`] as records: what to put, in order, and what the checkout's root names.
 pub struct Encoded<'a> {
     pub serial: Gen,
@@ -389,10 +438,24 @@ pub struct Encoded<'a> {
     /// The pages' bytes in all.
     pub bytes: u64,
     pub root: Key,
-    /// Each page's key by index; the zero key for a page with nothing on it.
+    /// Flat page keys when `bits <= RADIX_FLAT_MAX_BITS` (`1 << bits` entries); empty in radix mode.
     pub pages: SVec<'a, Key>,
-    /// The records not under the last root, every page before the root (the durable order).
+    /// Leaf-shard keys when `bits > RADIX_FLAT_MAX_BITS` (`1 << (bits - RADIX_LEAF_BITS)` entries); empty in flat mode.
+    pub page_shards: SVec<'a, Key>,
+    /// Number of non-zero task pages in this answer.
+    pub live_pages: u32,
+    /// The records not under the last root, ordered durably: task pages first (`puts[..task_puts]`),
+    /// then radix leaf shards and directory sub-records, then the top root last.
     pub puts: SVec<'a, (Key, SVec<'a, u8>)>,
+    /// Prefix length of [`Encoded::puts`] that are new task pages (excluding radix shards, directory
+    /// sub-records, and the top root).
+    pub task_puts: u32,
+    /// Non-zero auxiliary records owned by the root (radix page leaf shards, file directory shards,
+    /// places record, and summary record) that GC reachability MUST pin alongside [`Encoded::root`].
+    pub tree_keys: SVec<'a, Key>,
+    /// On an incremental commit without repaging: the exact `(index, old, new)` page transitions.
+    /// `None` on a cold encode or repage.
+    pub page_deltas: Option<SVec<'a, PageDelta>>,
     pub files: u32,
     pub findings: u32,
     pub owed: u32,
@@ -409,29 +472,53 @@ pub struct Encoded<'a> {
 }
 
 impl<'a> Encoded<'a> {
+    /// Whether this answer root uses the 2-level 256-way radix tree (`bits > RADIX_FLAT_MAX_BITS`).
+    pub fn is_radix(&self) -> bool {
+        self.bits > RADIX_FLAT_MAX_BITS
+    }
+
+    /// Total page slots (`1 << bits`).
+    pub fn page_count(&self) -> usize {
+        1usize << self.bits
+    }
+
     /// The complete payload index of each newly written page, for CAS reach.
     pub fn page_records(&self) -> impl Iterator<Item = (Key, &[(Name, Key)])> {
         self.records.iter().map(|(key, rows)| (*key, rows.as_slice()))
     }
-    /// The keys the checkout's root names after the puts: the root, then every page with
-    /// anything on it, so compaction keeps the whole answer the root reaches.
+
+    /// All non-zero auxiliary sub-records referenced by the root (leaf shards, file shards,
+    /// places, summary), to be pinned in `{name}.answer` alongside [`Encoded::root`].
+    pub fn tree_keys(&self) -> &[Key] {
+        &self.tree_keys
+    }
+
+    /// The keys the checkout's root names after the puts: the root, then its auxiliary tree
+    /// records and (for flat roots) every non-zero page, so compaction keeps the whole answer.
     pub fn pins(&self, alloc: SharedAlloc<'a>) -> SVec<'a, Key> {
-        let mut pins = Vec::with_capacity_in(1 + self.pages.len(), alloc);
+        let mut pins = Vec::with_capacity_in(1 + self.tree_keys.len() + self.pages.len(), alloc);
         pins.push(self.root);
         if self.plant == PagesPlant::PagesNotPinned {
             return pins;
         }
+        pins.extend(self.tree_keys.iter().copied());
         pins.extend(self.pages.iter().copied().filter(|key| *key != Key::default()));
         pins
     }
 }
 
-/// The root as stored: its serial, its paging and each page's key.
+/// The root as stored: its serial, its paging, and either inline page keys (flat, `bits <= 9`) or
+/// 256-way radix leaf-shard keys (`bits > 9`).
 pub struct Root<'a> {
     pub serial: Gen,
     pub bits: u8,
     pub bytes: u64,
+    /// Flat page keys when `bits <= RADIX_FLAT_MAX_BITS`; empty in radix mode (`bits > RADIX_FLAT_MAX_BITS`).
     pub pages: SVec<'a, Key>,
+    /// Leaf-shard keys when `bits > RADIX_FLAT_MAX_BITS` (`1 << (bits - RADIX_LEAF_BITS)` entries); empty in flat mode.
+    pub page_shards: SVec<'a, Key>,
+    /// Exact count of non-zero pages across this root.
+    pub live_pages: u32,
     /// File membership and the digest of its standing plan, when every member has a row.
     pub files: SMap<'a, Name, Option<ContentId>>,
     /// The place of each source file of `files` the driver planned ([`FilePlace`]).
@@ -441,6 +528,27 @@ pub struct Root<'a> {
     pub owed_tasks: SMap<'a, Name, Planned>,
     pub owed_cells: SMap<'a, CellId, Gen>,
     pub outlines: u32,
+    /// Cached radix directory sub-record keys so incremental edits skip serializing unchanged sub-records.
+    pub(crate) file_shards: [Key; FILE_SHARDS],
+    pub(crate) places_key: Key,
+    pub(crate) summary_key: Key,
+}
+
+impl Root<'_> {
+    /// Whether this root uses the 2-level 256-way radix tree (`bits > RADIX_FLAT_MAX_BITS`).
+    pub fn is_radix(&self) -> bool {
+        self.bits > RADIX_FLAT_MAX_BITS
+    }
+
+    /// Total page slots (`1 << bits`).
+    pub fn page_count(&self) -> usize {
+        1usize << self.bits
+    }
+
+    /// The `(shard_index, slot_in_shard)` pair for page index `index` in radix mode.
+    pub fn shard_of(index: usize) -> (usize, usize) {
+        (index >> RADIX_LEAF_BITS, index & (RADIX_LEAF_PAGES - 1))
+    }
 }
 
 fn put_id(out: &mut SVec<'_, u8>, id: &ContentId) {
@@ -588,26 +696,41 @@ pub fn encode<'a>(kept: &Kept<'_>, last: Option<&Root<'_>>, alloc: SharedAlloc<'
     encode_planted(kept, last, PagesPlant::None, alloc)
 }
 
+/// `kept` encoded at an explicit `bits` count (clamped to `MOST_BITS`), primarily for testing
+/// large-paging radix trees (`bits = 10..=16`) without allocating gigabytes of synthetic rows.
+pub fn encode_at_bits<'a>(kept: &Kept<'_>, bits: u8, alloc: SharedAlloc<'a>) -> Encoded<'a> {
+    encode_inner(kept, None, Some(bits.min(blaze_drive::answers::MOST_BITS)), PagesPlant::None, alloc)
+}
+
 /// [`encode`] with a planted bug ([`PagesPlant`]).
 pub fn encode_planted<'a>(kept: &Kept<'_>, last: Option<&Root<'_>>, plant: PagesPlant, alloc: SharedAlloc<'a>) -> Encoded<'a> {
+    encode_inner(kept, last, None, plant, alloc)
+}
+
+fn encode_inner<'a>(kept: &Kept<'_>, last: Option<&Root<'_>>, forced_bits: Option<u8>, plant: PagesPlant, alloc: SharedAlloc<'a>) -> Encoded<'a> {
     let answer = &kept.answer;
     let files_kept = plant != PagesPlant::FilesDropped;
     let has_row = |name: &Name| answer.rows.contains_key(name);
-    // The bytes in all, which size the paging.
-    let mut total = 0u64;
-    for row in answer.rows.values() {
-        total += (ROW_FIXED + DEFINE * row.defines.len() + READ * row.reads.len()) as u64;
-    }
-    total += (CELL_ENTRY * answer.cells.len() + OWED_CELL * answer.owed_cells.len() + OWED_TASK * answer.owed_tasks.len()) as u64;
-    for names in answer.by_file.values().filter(|_| files_kept) {
-        total += (NAME + 4 + FILE_MEMBER * names.len()) as u64;
-    }
-    for names in answer.readers.values() {
-        total += (CELL_ID + 4 + NAME * names.len()) as u64;
-    }
-    total += (CAUSE * kept.causes.keys().filter(|name| has_row(*name)).count()) as u64;
-    total += ((NAME + ID) * kept.records.keys().filter(|name| has_row(*name)).count()) as u64;
-    let bits = bits_kept(total, last.map(|root| root.bits));
+    let bits = match forced_bits {
+        Some(bits) => bits,
+        None => {
+            // The bytes in all, which size the paging.
+            let mut total = 0u64;
+            for row in answer.rows.values() {
+                total += (ROW_FIXED + DEFINE * row.defines.len() + READ * row.reads.len()) as u64;
+            }
+            total += (CELL_ENTRY * answer.cells.len() + OWED_CELL * answer.owed_cells.len() + OWED_TASK * answer.owed_tasks.len()) as u64;
+            for names in answer.by_file.values().filter(|_| files_kept) {
+                total += (NAME + 4 + FILE_MEMBER * names.len()) as u64;
+            }
+            for names in answer.readers.values() {
+                total += (CELL_ID + 4 + NAME * names.len()) as u64;
+            }
+            total += (CAUSE * kept.causes.keys().filter(|name| has_row(*name)).count()) as u64;
+            total += ((NAME + ID) * kept.records.keys().filter(|name| has_row(*name)).count()) as u64;
+            bits_kept(total, last.map(|root| root.bits))
+        }
+    };
     let count = 1usize << bits;
     let mut bufs: SVec<'a, PageBuf<'a>> = Vec::with_capacity_in(count, alloc);
     for _ in 0..count {
@@ -681,6 +804,7 @@ pub fn encode_planted<'a>(kept: &Kept<'_>, last: Option<&Root<'_>>, plant: Pages
     let mut puts: SVec<'a, (Key, SVec<'a, u8>)> = Vec::new_in(alloc);
     let mut records = Vec::new_in(alloc);
     let mut bytes = 0u64;
+    let mut live_pages = 0u32;
     for (index, buf) in bufs.into_iter().enumerate() {
         let index32 = u32::try_from(index).expect("a root's pages are 1 << bits, bits at most MOST_BITS");
         let Some(page) = buf.finish(bits, index32, alloc) else {
@@ -688,9 +812,10 @@ pub fn encode_planted<'a>(kept: &Kept<'_>, last: Option<&Root<'_>>, plant: Pages
             continue;
         };
         bytes += page.len() as u64;
+        live_pages = live_pages.saturating_add(1);
         let key = content_key(&page);
         pages.push(key);
-        if same_paging.is_none_or(|root| root.pages.get(index) != Some(&key)) {
+        if same_paging.is_none_or(|root| root.is_radix() || root.pages.get(index) != Some(&key)) {
             records.push((key, view::page_records(&buf.parts[RECORDS], alloc)));
             puts.push((key, page));
         }
@@ -698,8 +823,8 @@ pub fn encode_planted<'a>(kept: &Kept<'_>, last: Option<&Root<'_>>, plant: Pages
     directory.serial = answer.serial;
     directory.bits = bits;
     directory.bytes = bytes;
-    directory.pages = pages;
-    directory.finish(puts, records, plant, alloc)
+    directory.live_pages = live_pages;
+    directory.finish_whole(pages, same_paging, puts, records, plant, alloc)
 }
 
 
@@ -783,9 +908,38 @@ impl<'b> Rd<'b> {
     }
 }
 
-/// The root's bytes, known to be its key's ([`Sealed`]), read whole: a root is one small
-/// record whose every field the request uses, so it is walked, never hashed here.
+/// Decodes one 256-page radix leaf shard (`BEX1`) whose bytes are proved by `sealed`.
+pub fn decode_radix_shard<'a>(sealed: Sealed<'_>, shard: u32, bits: u8, alloc: SharedAlloc<'a>) -> Result<RadixShard<'a>, PagesError> {
+    let bytes = sealed.bytes();
+    let mut r = Rd { bytes, at: 0, page: ROOT_PAGE };
+    if r.take(4)? != RADIX_SHARD_MAGIC || r.u8()? != bits || r.u32()? != shard {
+        return Err(PagesError::Magic { page: ROOT_PAGE });
+    }
+    if bytes.len() != RADIX_SHARD_BYTES {
+        return Err(if bytes.len() < RADIX_SHARD_BYTES {
+            PagesError::Short { page: ROOT_PAGE, at: bytes.len() as u32 }
+        } else {
+            PagesError::Trailing { page: ROOT_PAGE, at: RADIX_SHARD_BYTES as u32 }
+        });
+    }
+    let mut keys = blaze_own::Box::new_in([Key::default(); RADIX_LEAF_PAGES], alloc);
+    for slot in keys.iter_mut() {
+        *slot = Key(r.id()?);
+    }
+    Ok(RadixShard { keys })
+}
+
+/// The root's bytes, known to be its key's ([`Sealed`]), read whole for inline flat roots
+/// (`bits <= RADIX_FLAT_MAX_BITS`). Radix roots (`bits > RADIX_FLAT_MAX_BITS`) require
+/// [`decode_root_with`] so their directory sub-records can be read from the store.
 pub fn decode_root<'a>(root: Sealed<'_>, alloc: SharedAlloc<'a>) -> Result<Root<'a>, PagesError> {
+    decode_root_with(root, |_| None, alloc)
+}
+
+/// Decodes a flat (`flags == 0`) or 2-level radix (`flags == 1`) answer root. In radix mode, reads
+/// only the top root and its directory sub-records (`places`, `summary`, non-empty `file_shards`)
+/// through `get` — ZERO page leaf shards are fetched upfront.
+pub fn decode_root_with<'a, 'g>(root: Sealed<'_>, get: impl FnMut(Key) -> Got<'g>, alloc: SharedAlloc<'a>) -> Result<Root<'a>, PagesError> {
     let mut r = Rd { bytes: root.bytes(), at: 0, page: ROOT_PAGE };
     if r.take(4)? != ROOT_MAGIC {
         return Err(PagesError::Magic { page: ROOT_PAGE });
@@ -793,15 +947,44 @@ pub fn decode_root<'a>(root: Sealed<'_>, alloc: SharedAlloc<'a>) -> Result<Root<
     let serial = Gen(r.u64()?);
     let bits = r.u8()?;
     let total = r.u64()?;
-    let count = r.count(ID)?;
-    if bits > blaze_drive::answers::MOST_BITS || count != 1 << bits {
-        return Err(PagesError::Count { page: ROOT_PAGE, count: count as u32 });
+    let flags = r.u8()?;
+    let live_pages = r.u32()?;
+    let outlines = r.u32()?;
+    if bits > blaze_drive::answers::MOST_BITS {
+        return Err(PagesError::Count { page: ROOT_PAGE, count: u32::from(bits) });
     }
-    let mut pages = Vec::with_capacity_in(count, alloc);
-    for _ in 0..count {
-        pages.push(Key(r.id()?));
+    match flags {
+        ROOT_FLAG_FLAT => {
+            if bits > RADIX_FLAT_MAX_BITS {
+                return Err(PagesError::Tag { page: ROOT_PAGE, at: 21, byte: flags });
+            }
+            let count = r.count(ID)?;
+            if count != 1usize << bits {
+                return Err(PagesError::Count { page: ROOT_PAGE, count: count as u32 });
+            }
+            let mut pages = Vec::with_capacity_in(count, alloc);
+            for _ in 0..count {
+                pages.push(Key(r.id()?));
+            }
+            changes::read_flat_directory(r, serial, bits, total, live_pages, outlines, pages, alloc)
+        }
+        ROOT_FLAG_RADIX => {
+            if bits <= RADIX_FLAT_MAX_BITS {
+                return Err(PagesError::Tag { page: ROOT_PAGE, at: 21, byte: flags });
+            }
+            let expected_shards = 1usize << (bits - RADIX_LEAF_BITS);
+            let shard_count = r.count(ID)?;
+            if shard_count != expected_shards {
+                return Err(PagesError::Count { page: ROOT_PAGE, count: shard_count as u32 });
+            }
+            let mut page_shards = Vec::with_capacity_in(shard_count, alloc);
+            for _ in 0..shard_count {
+                page_shards.push(Key(r.id()?));
+            }
+            changes::read_radix_directory(r, serial, bits, total, live_pages, outlines, page_shards, get, alloc)
+        }
+        other => Err(PagesError::Tag { page: ROOT_PAGE, at: 21, byte: other }),
     }
-    changes::read_directory(r, serial, bits, total, pages, alloc)
 }
 
 
@@ -813,7 +996,7 @@ pub type Got<'g> = Option<Result<Sealed<'g>, Torn>>;
 /// key's ([`Sealed`]), then walked whole (the module docs, "Checked once").
 pub fn decode<'a, 'g>(key: Key, mut get: impl FnMut(Key) -> Got<'g>, alloc: SharedAlloc<'a>) -> Result<Kept<'a>, PagesError> {
     let root = get(key).ok_or(PagesError::Missing { page: ROOT_PAGE, key })?.map_err(|torn| torn.at(ROOT_PAGE))?;
-    let root = decode_root(root, alloc)?;
+    let root = decode_root_with(root, &mut get, alloc)?;
     decode_at(&root, get, alloc)
 }
 
@@ -823,12 +1006,29 @@ pub fn decode_at<'a, 'g>(root: &Root<'_>, mut get: impl FnMut(Key) -> Got<'g>, a
     let mut kept = Kept::new_in(alloc);
     kept.answer.serial = root.serial;
     kept.places.extend(root.places.iter().map(|(&file, &place)| (file, place)));
-    for (index, &key) in root.pages.iter().enumerate() {
-        if key == Key::default() { continue; }
-        let index = index as u32;
-        let sealed = get(key).ok_or(PagesError::Missing { page: index, key })?.map_err(|torn| torn.at(index))?;
-        let page = VerifiedPage::open_whole(sealed, index, root.bits)?;
-        page.restore(&mut kept, alloc);
+    if !root.is_radix() {
+        for (index, &key) in root.pages.iter().enumerate() {
+            if key == Key::default() { continue; }
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
+            let sealed = get(key).ok_or(PagesError::Missing { page: index, key })?.map_err(|torn| torn.at(index))?;
+            let page = VerifiedPage::open_whole(sealed, index, root.bits)?;
+            page.restore(&mut kept, alloc);
+        }
+    } else {
+        for (shard_idx, &shard_key) in root.page_shards.iter().enumerate() {
+            if shard_key == Key::default() { continue; }
+            let shard_u32 = u32::try_from(shard_idx).unwrap_or(u32::MAX);
+            let sealed_shard = get(shard_key).ok_or(PagesError::Missing { page: ROOT_PAGE, key: shard_key })?.map_err(|torn| torn.at(ROOT_PAGE))?;
+            let shard = decode_radix_shard(sealed_shard, shard_u32, root.bits, alloc)?;
+            let base_index = shard_idx << RADIX_LEAF_BITS;
+            for (slot, &key) in shard.keys.iter().enumerate() {
+                if key == Key::default() { continue; }
+                let index = u32::try_from(base_index + slot).unwrap_or(u32::MAX);
+                let sealed = get(key).ok_or(PagesError::Missing { page: index, key })?.map_err(|torn| torn.at(index))?;
+                let page = VerifiedPage::open_whole(sealed, index, root.bits)?;
+                page.restore(&mut kept, alloc);
+            }
+        }
     }
     Ok(kept)
 }

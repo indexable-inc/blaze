@@ -589,3 +589,240 @@ fn a_flipped_or_cut_page_is_refused_by_name() {
         other => panic!("a missing page read as {:?}", other.map(|_| ())),
     }
 }
+
+/// Previous persisted root layout (`BER3`) is rejected cleanly by magic (rule 26 / `layouts.txt`).
+#[test]
+fn previous_root_magic_ber3_is_rejected() {
+    let mut ber3 = StdVec::from(&b"BER3"[..]);
+    ber3.extend_from_slice(&[0u8; 64]);
+    let key = content_key(&ber3);
+    let err = crate::pages::decode_root_hashed(key, &ber3, alloc())
+        .err()
+        .expect("previous BER3 root magic must be rejected");
+    assert_eq!(err, PagesError::Magic { page: crate::pages::ROOT_PAGE });
+}
+
+/// A 65,536-page (`bits = 16`) 2-level 256×256 radix answer round-trips deterministically,
+/// `decode_root_with` reads zero page leaf shards, and an incremental 4-page edit reads at most 4
+/// leaf shards and writes `<= 45 KiB` of root+leaf+directory metadata (instead of 2.1 MiB flat).
+#[test]
+fn radix_65536_page_root_round_trips_and_four_page_edit_writes_under_45kb_metadata() {
+    // Build a clean 4-page incremental edit using the real `Engine` over `StoredPages`:
+    // edit 4 tasks belonging to 4 distinct files (1 task changed per file), each on its own
+    // page across 4 distinct leaf shards, with zero changes to `places`, `units`, or `findings`.
+    let tools = crate::Tools([blaze_drive::key::Tool(ContentId([7; 32])); blaze_drive::key::KINDS]);
+    let mut cold = Kept::new_in(alloc());
+    cold.answer.serial = Gen(1);
+    let phase = Phase::new(Stage::Bodies, 0);
+    let old_source = ContentId([1; 32]);
+    let old_rec = Key(ContentId([11; 32]));
+    let mut all_files: StdVec<Name> = StdVec::new();
+    let mut file_tasks: BTreeMap<Name, StdVec<Name>> = BTreeMap::new();
+    for f in 0..32u64 {
+        let fl = name(Kind::FileItems, 99, f);
+        all_files.push(fl);
+        cold.places.insert(fl, crate::pages::FilePlace { unit: name(Kind::Units, 99, 0), edition: 3, flags: 1 });
+    }
+    for i in 0..320u64 {
+        let fl = all_files[(i as usize) % all_files.len()];
+        let tn = name(Kind::BodyCheck, 99, i);
+        file_tasks.entry(fl).or_default().push(tn);
+        cold.answer.rows.insert(tn, Row {
+            key: tools.key(tn, &old_source), phase, file: fl, source: old_source, out: old_rec.0, serial: Gen(1),
+            defines: blaze_own::Vec::new_in(alloc()), reads: blaze_own::Vec::new_in(alloc()), by_cell: blaze_own::Vec::new_in(alloc()),
+            findings: 0, inline: false, failed: false,
+        });
+        cold.causes.insert(tn, (Gen(1), Cause::New));
+        cold.records.insert(tn, old_rec);
+    }
+    for (fl, mut members) in file_tasks {
+        members.sort_unstable();
+        cold.answer.by_file.insert(fl, blaze_own::Vec::from_slice_in(&members, alloc()));
+    }
+    let encoded = crate::pages::encode_at_bits(&cold, 16, alloc());
+    assert!(encoded.is_radix(), "bits = 16 must use the 2-level radix root");
+    assert_eq!(encoded.bits, 16);
+    assert!(encoded.pages.is_empty(), "radix encoded keeps flat pages empty (0 bytes)");
+    assert_eq!(encoded.page_shards.len(), 256, "65,536 / 256 = 256 leaf shards");
+    assert!(!encoded.tree_keys().is_empty(), "tree_keys pins all non-zero shards and dir sub-records");
+
+    let mut store: BTreeMap<Key, StdVec<u8>> = encoded.puts.iter().map(|(k, b)| (*k, b.iter().copied().collect())).collect();
+
+    // Full decode round-trip matches cold encode bit-for-bit.
+    let decoded = decode(encoded.root, |key| store.get(&key).map(|bytes| Sealed::hashed(key, bytes)), alloc()).expect("radix decode");
+    assert_eq!(
+        crate::pages::encode_at_bits(&decoded, 16, alloc()).root,
+        encoded.root,
+        "radix answer round-trips identically (rule 26)"
+    );
+
+    // `decode_root_with` reads ONLY the top root + directory sub-records, ZERO `BEX1` leaf shards.
+    let mut leaf_reads_at_open = 0usize;
+    let root_v1 = crate::pages::decode_root_with(
+        Sealed::hashed(encoded.root, &store[&encoded.root]).expect("root sealed"),
+        |key| {
+            let bytes = store.get(&key)?;
+            if bytes.starts_with(crate::pages::RADIX_SHARD_MAGIC) {
+                leaf_reads_at_open += 1;
+            }
+            Some(Sealed::hashed(key, bytes))
+        },
+        alloc(),
+    )
+    .expect("decode radix root");
+    assert_eq!(leaf_reads_at_open, 0, "opening radix root must read 0 page leaf shards");
+    assert!(root_v1.pages.is_empty(), "radix Root does not materialize 65,536 flat keys");
+    assert_eq!(root_v1.page_shards.len(), 256);
+
+    // Pick 3 tasks in one file whose pages + the file's own page are 4 distinct pages across 4
+    // distinct leaf shards -> editing those 3 tasks touches EXACTLY 4 task pages (3 task pages + 1
+    // file page) in 4 distinct leaf shards, and 1 file-directory shard (places & summary unchanged)!
+    let chosen_file = all_files[0];
+    let mut picked_tasks: StdVec<Name> = StdVec::new();
+    let mut used_shards: BTreeSet<usize> = BTreeSet::new();
+    let file_page = blaze_drive::answers::page_of(chosen_file, 16);
+    used_shards.insert(crate::pages::Root::shard_of(file_page as usize).0);
+    for &tn in cold.answer.by_file[&chosen_file].iter() {
+        let p = blaze_drive::answers::page_of(tn, 16);
+        let (s, _) = crate::pages::Root::shard_of(p as usize);
+        if used_shards.insert(s) {
+            picked_tasks.push(tn);
+            if picked_tasks.len() == 3 {
+                break;
+            }
+        }
+    }
+    assert_eq!(picked_tasks.len(), 3, "must find 3 tasks in chosen_file across 3 distinct leaf shards");
+
+    // Pre-open ONLY the pages for our chosen file + its members.
+    let mut preloaded_pages: BTreeMap<u32, crate::pages::VerifiedPage<'_>> = BTreeMap::new();
+    let mut preload = |p_idx: u32| {
+        if preloaded_pages.contains_key(&p_idx) {
+            return;
+        }
+        let (shard_idx, slot_idx) = crate::pages::Root::shard_of(p_idx as usize);
+        let shard_key = root_v1.page_shards[shard_idx];
+        if shard_key == Key::default() {
+            return;
+        }
+        let shard = crate::pages::decode_radix_shard(
+            Sealed::hashed(shard_key, &store[&shard_key]).expect("shard"),
+            shard_idx as u32,
+            root_v1.bits,
+            alloc(),
+        )
+        .expect("decode shard");
+        let page_key = shard.keys[slot_idx];
+        if page_key != Key::default() {
+            let vp = crate::pages::VerifiedPage::open(
+                Sealed::hashed(page_key, &store[&page_key]).expect("page"),
+                p_idx,
+                root_v1.bits,
+            )
+            .expect("open page");
+            preloaded_pages.insert(p_idx, vp);
+        }
+    };
+    preload(file_page);
+    for &tn in cold.answer.by_file[&chosen_file].iter() {
+        preload(blaze_drive::answers::page_of(tn, 16));
+    }
+
+    struct MapStored<'a> {
+        bits: u8,
+        pages: &'a BTreeMap<u32, crate::pages::VerifiedPage<'a>>,
+    }
+    impl crate::StoredPages for MapStored<'_> {
+        fn page(&self, name: Name) -> Result<Option<&crate::pages::VerifiedPage<'_>>, PagesError> {
+            Ok(self.pages.get(&blaze_drive::answers::page_of(name, self.bits)))
+        }
+        fn finding(&self, _: Name) -> Option<u32> { None }
+        fn refusal(&self) -> Option<PagesError> { None }
+        fn visit_rows(&self, visit: &mut dyn FnMut(Name) -> Result<(), crate::LastError>) -> Result<(), crate::LastError> {
+            for page in self.pages.values() {
+                for n in page.row_names() {
+                    visit(n)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let stored_view = MapStored { bits: 16, pages: &preloaded_pages };
+    let new_source = ContentId([2; 32]);
+    let new_rec = Key(ContentId([22; 32]));
+    let mut members: StdVec<crate::Planned> = StdVec::new();
+    for &tn in cold.answer.by_file[&chosen_file].iter() {
+        let src = if picked_tasks.contains(&tn) { new_source } else { old_source };
+        members.push(crate::Planned { name: tn, phase, file: chosen_file, source: src });
+    }
+    members.sort_unstable_by_key(|p| p.name);
+    let edit = crate::Edit { files: &[(chosen_file, &members)] };
+    let mut eng = crate::Engine::new_in(tools, crate::Answer::from_pages(&stored_view, Gen(1), alloc()), &edit, crate::Everything, crate::Plant::None, alloc()).expect("engine");
+    assert_eq!(eng.next_phase().expect("phase"), Some(phase));
+    assert_eq!(eng.tasks().len(), 3);
+    let mut batch = crate::Buffer::new_in(alloc());
+    let mut payloads = blaze_own::BTreeMap::new_in(alloc());
+    for task in eng.tasks() {
+        batch.done.push(crate::Done {
+            name: task.planned.name, key: task.key, out: new_rec.0,
+            defines: blaze_own::Vec::new_in(alloc()), reads: blaze_own::Vec::new_in(alloc()),
+            findings: 0, failed: false,
+        });
+        payloads.insert(task.planned.name, new_rec);
+    }
+    eng.merge(core::slice::from_mut(&mut batch)).expect("merge");
+    assert_eq!(eng.next_phase().expect("settled"), None);
+    let crate::Finished { answer: edit_answer, causes: edit_causes, .. } = eng.finish().expect("finish");
+    let edit_kept = Kept::after(blaze_own::BTreeMap::new_in(alloc()), edit_answer, &edit_causes, payloads);
+
+    let mut shards_fetched = 0usize;
+    let edited = crate::pages::encode_changes_radix(
+        &edit_kept,
+        &root_v1,
+        alloc(),
+        |key| {
+            let bytes = store.get(&key)?;
+            if bytes.starts_with(crate::pages::RADIX_SHARD_MAGIC) {
+                shards_fetched += 1;
+            }
+            Some(Sealed::hashed(key, bytes))
+        },
+        |jobs| {
+            let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc());
+            for job in jobs {
+                out.push(job.run(alloc()));
+            }
+            out
+        },
+    )
+    .expect("incremental radix encode");
+
+    assert_eq!(shards_fetched, 4, "4-page edit across 4 shards must fetch only those 4 leaf shards");
+    assert_eq!(edited.task_puts, 4, "only the 4 changed task pages (3 tasks + 1 file) were written");
+    let task_puts = edited.task_puts as usize;
+    let meta_bytes: usize = edited.puts[task_puts..].iter().map(|(_, b)| b.len()).sum();
+    // 4 leaf shards (4 * 8,201 = 32,804 B) + 1 file shard (~300 B) + 1 top root (~8,814 B) = ~41.9 KiB <= 45 KiB!
+    // (places, summary, and the other 15 file shards were UNCHANGED -> 0 bytes written!)
+    assert!(
+        meta_bytes <= 45 * 1024,
+        "4-page edit metadata must be <= 45 KiB (got {meta_bytes} bytes; flat was 2,097+ KiB)"
+    );
+    assert_eq!(edited.page_deltas.as_ref().map(|d| d.len()), Some(4), "exact 4 page deltas reported");
+
+    // Release borrows of `store` from `preloaded_pages` / `edit_kept`, then insert the new puts
+    // and assert full decode round-trips to the exact same root key as a cold `encode_at_bits`.
+    drop(edit_kept);
+    drop(edit_causes);
+    drop(stored_view);
+    drop(preloaded_pages);
+    for (k, b) in edited.puts.iter() {
+        store.insert(*k, b.iter().copied().collect());
+    }
+    let restored = decode(edited.root, |key| store.get(&key).map(|bytes| Sealed::hashed(key, bytes)), alloc()).expect("decode edited radix answer");
+    assert_eq!(
+        crate::pages::encode_at_bits(&restored, 16, alloc()).root,
+        edited.root,
+        "incremental radix edit produces the exact same root key as a cold encode"
+    );
+}

@@ -52,11 +52,17 @@ pub fn plan_digest(file: Name, plans: &[Planned], tools: &crate::Tools, alloc: S
 }
 
 
+fn file_shard_of(file: Name) -> usize {
+    usize::from(file.subject.0[0] >> 4)
+}
+
 fn empty_directory(alloc: SharedAlloc<'_>) -> Root<'_> {
     Root {
-        serial: Gen(0), bits: 0, bytes: 0, pages: Vec::new_in(alloc), files: BTreeMap::new_in(alloc),
-        places: BTreeMap::new_in(alloc), units: Vec::new_in(alloc), findings: BTreeMap::new_in(alloc), owed_tasks: BTreeMap::new_in(alloc),
-        owed_cells: BTreeMap::new_in(alloc), outlines: 0,
+        serial: Gen(0), bits: 0, bytes: 0, pages: SVec::new_in(alloc), page_shards: SVec::new_in(alloc),
+        live_pages: 0, files: SMap::new_in(alloc), places: SMap::new_in(alloc),
+        units: SVec::new_in(alloc), findings: SMap::new_in(alloc), owed_tasks: SMap::new_in(alloc),
+        owed_cells: SMap::new_in(alloc), outlines: 0,
+        file_shards: [Key::default(); FILE_SHARDS], places_key: Key::default(), summary_key: Key::default(),
     }
 }
 
@@ -74,16 +80,112 @@ pub(super) fn directory<'a>(kept: &Kept<'_>, alloc: SharedAlloc<'a>) -> Root<'a>
     root
 }
 
+fn encode_radix_shard<'a>(bits: u8, shard: u32, keys: &[Key], alloc: SharedAlloc<'a>) -> Option<(Key, SVec<'a, u8>)> {
+    if keys.iter().all(|k| *k == Key::default()) {
+        return None;
+    }
+    let mut bytes = SVec::with_capacity_in(RADIX_SHARD_BYTES, alloc);
+    bytes.extend_from_slice(RADIX_SHARD_MAGIC);
+    bytes.push(bits);
+    bytes.extend_from_slice(&shard.to_le_bytes());
+    for key in keys {
+        put_id(&mut bytes, &key.0);
+    }
+    debug_assert_eq!(bytes.len(), RADIX_SHARD_BYTES, "a radix leaf shard has fixed size");
+    let key = content_key(&bytes);
+    Some((key, bytes))
+}
+
+fn encode_file_shard<'a>(shard: usize, files: &SMap<'_, Name, Option<ContentId>>, alloc: SharedAlloc<'a>) -> Option<(Key, SVec<'a, u8>)> {
+    let count = files.keys().filter(|file| file_shard_of(**file) == shard).count();
+    if count == 0 {
+        return None;
+    }
+    let mut bytes = SVec::with_capacity_in(4 + 1 + 4 + count * (NAME + 1 + ID), alloc);
+    bytes.extend_from_slice(FILE_SHARD_MAGIC);
+    bytes.push(u8::try_from(shard).unwrap_or(0));
+    put_u32(&mut bytes, count);
+    for (&name, digest) in files.iter() {
+        if file_shard_of(name) != shard {
+            continue;
+        }
+        put_name(&mut bytes, name);
+        bytes.push(u8::from(digest.is_some()));
+        if let Some(digest) = digest {
+            put_id(&mut bytes, digest);
+        }
+    }
+    let key = content_key(&bytes);
+    Some((key, bytes))
+}
+
+fn encode_places<'a>(places: &SMap<'_, Name, FilePlace>, alloc: SharedAlloc<'a>) -> Option<(Key, SVec<'a, u8>)> {
+    if places.is_empty() {
+        return None;
+    }
+    let mut bytes = SVec::with_capacity_in(4 + 4 + places.len() * FILE_PLACE, alloc);
+    bytes.extend_from_slice(PLACES_MAGIC);
+    put_u32(&mut bytes, places.len());
+    for (&file, place) in places.iter() {
+        put_name(&mut bytes, file);
+        put_name(&mut bytes, place.unit);
+        bytes.push(place.edition);
+        bytes.push(place.flags);
+    }
+    let key = content_key(&bytes);
+    Some((key, bytes))
+}
+
+fn encode_summary<'a>(units: &[Name], findings: &SMap<'_, Name, u32>, alloc: SharedAlloc<'a>) -> Option<(Key, SVec<'a, u8>)> {
+    if units.is_empty() && findings.is_empty() {
+        return None;
+    }
+    let mut bytes = SVec::with_capacity_in(4 + 4 + units.len() * NAME + 4 + findings.len() * (NAME + 4), alloc);
+    bytes.extend_from_slice(SUMMARY_MAGIC);
+    put_u32(&mut bytes, units.len());
+    for &name in units.iter() {
+        put_name(&mut bytes, name);
+    }
+    put_u32(&mut bytes, findings.len());
+    for (&name, &count) in findings.iter() {
+        put_name(&mut bytes, name);
+        bytes.extend_from_slice(&count.to_le_bytes());
+    }
+    let key = content_key(&bytes);
+    Some((key, bytes))
+}
+
 impl<'a> Root<'a> {
-    pub(super) fn finish(self, mut puts: SVec<'a, (Key, SVec<'a, u8>)>, records: SVec<'a, (Key, SVec<'a, (Name, Key)>)>, plant: PagesPlant, alloc: SharedAlloc<'a>) -> Encoded<'a> {
-        let mut bytes = Vec::with_capacity_in(ROOT_HEAD + ID * self.pages.len(), alloc);
+    fn write_header(&self, flags: u8, bytes: &mut SVec<'a, u8>) {
         bytes.extend_from_slice(ROOT_MAGIC);
         bytes.extend_from_slice(&self.serial.0.to_le_bytes());
         bytes.push(self.bits);
         bytes.extend_from_slice(&self.bytes.to_le_bytes());
+        bytes.push(flags);
+        bytes.extend_from_slice(&self.live_pages.to_le_bytes());
+        bytes.extend_from_slice(&self.outlines.to_le_bytes());
+    }
+
+    fn write_owed(&self, bytes: &mut SVec<'a, u8>) {
+        put_u32(bytes, self.owed_tasks.len());
+        for plan in self.owed_tasks.values() { put_plan(bytes, plan); }
+        put_u32(bytes, self.owed_cells.len());
+        for (id, &at) in self.owed_cells.iter() { put_cell_id(bytes, id); bytes.extend_from_slice(&at.0.to_le_bytes()); }
+    }
+
+    fn finish_flat(
+        self,
+        mut puts: SVec<'a, (Key, SVec<'a, u8>)>,
+        records: SVec<'a, (Key, SVec<'a, (Name, Key)>)>,
+        page_deltas: Option<SVec<'a, PageDelta>>,
+        plant: PagesPlant,
+        alloc: SharedAlloc<'a>,
+    ) -> Encoded<'a> {
+        let task_puts = u32::try_from(puts.len()).unwrap_or(u32::MAX);
+        let mut bytes = SVec::with_capacity_in(ROOT_HEAD + 4 + ID * self.pages.len(), alloc);
+        self.write_header(ROOT_FLAG_FLAT, &mut bytes);
         put_u32(&mut bytes, self.pages.len());
         for key in self.pages.iter() { put_id(&mut bytes, &key.0); }
-        bytes.extend_from_slice(&self.outlines.to_le_bytes());
         put_u32(&mut bytes, self.files.len());
         for (&name, digest) in self.files.iter() {
             put_name(&mut bytes, name);
@@ -101,17 +203,172 @@ impl<'a> Root<'a> {
         for &name in self.units.iter() { put_name(&mut bytes, name); }
         put_u32(&mut bytes, self.findings.len());
         for (&name, &count) in self.findings.iter() { put_name(&mut bytes, name); bytes.extend_from_slice(&count.to_le_bytes()); }
-        put_u32(&mut bytes, self.owed_tasks.len());
-        for plan in self.owed_tasks.values() { put_plan(&mut bytes, plan); }
-        put_u32(&mut bytes, self.owed_cells.len());
-        for (id, &at) in self.owed_cells.iter() { put_cell_id(&mut bytes, id); bytes.extend_from_slice(&at.0.to_le_bytes()); }
+        self.write_owed(&mut bytes);
         let root = content_key(&bytes);
         puts.push((root, bytes));
         Encoded {
-            serial: self.serial, bits: self.bits, bytes: self.bytes, root, pages: self.pages, puts, plant, records,
-            files: self.outlines, findings: self.findings.len() as u32, owed: u32::try_from(self.owed_tasks.len() + self.owed_cells.len()).unwrap_or(u32::MAX),
+            serial: self.serial, bits: self.bits, bytes: self.bytes, root, pages: self.pages,
+            page_shards: SVec::new_in(alloc), live_pages: self.live_pages, puts, task_puts,
+            tree_keys: SVec::new_in(alloc), page_deltas, plant, records,
+            files: self.outlines, findings: u32::try_from(self.findings.len()).unwrap_or(u32::MAX),
+            owed: u32::try_from(self.owed_tasks.len() + self.owed_cells.len()).unwrap_or(u32::MAX),
             changed_entries: 0, changed_pages: 0,
         }
+    }
+
+    fn finish_radix_top(
+        self,
+        mut puts: SVec<'a, (Key, SVec<'a, u8>)>,
+        task_puts: u32,
+        records: SVec<'a, (Key, SVec<'a, (Name, Key)>)>,
+        page_deltas: Option<SVec<'a, PageDelta>>,
+        plant: PagesPlant,
+        alloc: SharedAlloc<'a>,
+    ) -> Encoded<'a> {
+        let mut tree_keys: SVec<'a, Key> = SVec::with_capacity_in(self.page_shards.len() + FILE_SHARDS + 2, alloc);
+        for &key in self.page_shards.iter() {
+            if key != Key::default() { tree_keys.push(key); }
+        }
+        for &key in self.file_shards.iter() {
+            if key != Key::default() { tree_keys.push(key); }
+        }
+        if self.places_key != Key::default() { tree_keys.push(self.places_key); }
+        if self.summary_key != Key::default() { tree_keys.push(self.summary_key); }
+
+        let cap = ROOT_HEAD + 4 + ID * (self.page_shards.len() + FILE_SHARDS + 2) + 8;
+        let mut bytes = SVec::with_capacity_in(cap, alloc);
+        self.write_header(ROOT_FLAG_RADIX, &mut bytes);
+        put_u32(&mut bytes, self.page_shards.len());
+        for key in self.page_shards.iter() { put_id(&mut bytes, &key.0); }
+        for key in self.file_shards.iter() { put_id(&mut bytes, &key.0); }
+        put_id(&mut bytes, &self.places_key.0);
+        put_id(&mut bytes, &self.summary_key.0);
+        self.write_owed(&mut bytes);
+        let root = content_key(&bytes);
+        puts.push((root, bytes));
+        Encoded {
+            serial: self.serial, bits: self.bits, bytes: self.bytes, root, pages: SVec::new_in(alloc),
+            page_shards: self.page_shards, live_pages: self.live_pages, puts, task_puts,
+            tree_keys, page_deltas, plant, records,
+            files: self.outlines, findings: u32::try_from(self.findings.len()).unwrap_or(u32::MAX),
+            owed: u32::try_from(self.owed_tasks.len() + self.owed_cells.len()).unwrap_or(u32::MAX),
+            changed_entries: 0, changed_pages: 0,
+        }
+    }
+
+    pub(super) fn finish_whole(
+        mut self,
+        flat_pages: SVec<'a, Key>,
+        same_paging: Option<&Root<'_>>,
+        mut puts: SVec<'a, (Key, SVec<'a, u8>)>,
+        records: SVec<'a, (Key, SVec<'a, (Name, Key)>)>,
+        plant: PagesPlant,
+        alloc: SharedAlloc<'a>,
+    ) -> Encoded<'a> {
+        if self.bits <= RADIX_FLAT_MAX_BITS {
+            self.pages = flat_pages;
+            return self.finish_flat(puts, records, None, plant, alloc);
+        }
+        let task_puts = u32::try_from(puts.len()).unwrap_or(u32::MAX);
+        let shard_count = 1usize << (self.bits - RADIX_LEAF_BITS);
+        let mut page_shards = SVec::with_capacity_in(shard_count, alloc);
+        for (shard_idx, chunk) in flat_pages.chunks_exact(RADIX_LEAF_PAGES).enumerate() {
+            let shard_u32 = u32::try_from(shard_idx).unwrap_or(u32::MAX);
+            match encode_radix_shard(self.bits, shard_u32, chunk, alloc) {
+                Some((key, bytes)) => {
+                    page_shards.push(key);
+                    if same_paging.is_none_or(|r| r.page_shards.get(shard_idx) != Some(&key)) {
+                        puts.push((key, bytes));
+                    }
+                }
+                None => page_shards.push(Key::default()),
+            }
+        }
+        self.page_shards = page_shards;
+        for (s, slot) in self.file_shards.iter_mut().enumerate() {
+            match encode_file_shard(s, &self.files, alloc) {
+                Some((key, bytes)) => {
+                    *slot = key;
+                    if same_paging.is_none_or(|r| r.file_shards.get(s) != Some(&key)) {
+                        puts.push((key, bytes));
+                    }
+                }
+                None => *slot = Key::default(),
+            }
+        }
+        match encode_places(&self.places, alloc) {
+            Some((key, bytes)) => {
+                self.places_key = key;
+                if same_paging.is_none_or(|r| r.places_key != key) {
+                    puts.push((key, bytes));
+                }
+            }
+            None => self.places_key = Key::default(),
+        }
+        match encode_summary(&self.units, &self.findings, alloc) {
+            Some((key, bytes)) => {
+                self.summary_key = key;
+                if same_paging.is_none_or(|r| r.summary_key != key) {
+                    puts.push((key, bytes));
+                }
+            }
+            None => self.summary_key = Key::default(),
+        }
+        self.finish_radix_top(puts, task_puts, records, None, plant, alloc)
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "incremental radix finish: each argument one dirty mask or output list")]
+    fn finish_incremental_radix(
+        mut self,
+        mut puts: SVec<'a, (Key, SVec<'a, u8>)>,
+        task_puts: u32,
+        records: SVec<'a, (Key, SVec<'a, (Name, Key)>)>,
+        page_deltas: SVec<'a, PageDelta>,
+        changed_file_shards: u16,
+        places_changed: bool,
+        summary_changed: bool,
+        alloc: SharedAlloc<'a>,
+    ) -> Encoded<'a> {
+        for (s, slot) in self.file_shards.iter_mut().enumerate() {
+            if (changed_file_shards & (1u16 << s)) == 0 {
+                continue;
+            }
+            let old_key = *slot;
+            match encode_file_shard(s, &self.files, alloc) {
+                Some((key, bytes)) => {
+                    *slot = key;
+                    if key != old_key {
+                        puts.push((key, bytes));
+                    }
+                }
+                None => *slot = Key::default(),
+            }
+        }
+        if places_changed {
+            let old_key = self.places_key;
+            match encode_places(&self.places, alloc) {
+                Some((key, bytes)) => {
+                    self.places_key = key;
+                    if key != old_key {
+                        puts.push((key, bytes));
+                    }
+                }
+                None => self.places_key = Key::default(),
+            }
+        }
+        if summary_changed {
+            let old_key = self.summary_key;
+            match encode_summary(&self.units, &self.findings, alloc) {
+                Some((key, bytes)) => {
+                    self.summary_key = key;
+                    if key != old_key {
+                        puts.push((key, bytes));
+                    }
+                }
+                None => self.summary_key = Key::default(),
+            }
+        }
+        self.finish_radix_top(puts, task_puts, records, Some(page_deltas), PagesPlant::None, alloc)
     }
 }
 
@@ -123,13 +380,40 @@ fn ordered<T: Copy + Ord>(prev: &mut Option<T>, value: T, at: usize, section: &'
     Ok(())
 }
 
-pub(super) fn read_directory<'a>(mut r: Rd<'_>, serial: Gen, bits: u8, total: u64, pages: SVec<'a, Key>, alloc: SharedAlloc<'a>) -> Result<Root<'a>, PagesError> {
+fn read_owed(r: &mut Rd<'_>, root: &mut Root<'_>) -> Result<(), PagesError> {
+    let mut prev = None;
+    for _ in 0..r.count(OWED_TASK)? {
+        let name = r.name()?;
+        ordered(&mut prev, name, r.at - NAME, "owed tasks directory")?;
+        root.owed_tasks.insert(name, Planned { name, phase: r.phase()?, source: r.id()?, file: r.name()? });
+    }
+    let mut prev = None;
+    for _ in 0..r.count(OWED_CELL)? {
+        let id = r.cell_id()?;
+        ordered(&mut prev, id, r.at - CELL_ID, "owed cells directory")?;
+        root.owed_cells.insert(id, Gen(r.u64()?));
+    }
+    if r.at != r.bytes.len() { return Err(PagesError::Trailing { page: ROOT_PAGE, at: u32::try_from(r.at).unwrap_or(u32::MAX) }); }
+    Ok(())
+}
+
+pub(super) fn read_flat_directory<'a>(
+    mut r: Rd<'_>,
+    serial: Gen,
+    bits: u8,
+    total: u64,
+    live_pages: u32,
+    outlines: u32,
+    pages: SVec<'a, Key>,
+    alloc: SharedAlloc<'a>,
+) -> Result<Root<'a>, PagesError> {
     let mut root = empty_directory(alloc);
     root.serial = serial;
     root.bits = bits;
     root.bytes = total;
+    root.live_pages = live_pages;
     root.pages = pages;
-    root.outlines = r.u32()?;
+    root.outlines = outlines;
     let mut prev = None;
     for _ in 0..r.count(NAME + 1)? {
         let at = r.at;
@@ -163,19 +447,108 @@ pub(super) fn read_directory<'a>(mut r: Rd<'_>, serial: Gen, bits: u8, total: u6
         ordered(&mut prev, n, r.at - NAME, "findings directory")?;
         root.findings.insert(n, r.u32()?);
     }
-    prev = None;
-    for _ in 0..r.count(OWED_TASK)? {
-        let name = r.name()?;
-        ordered(&mut prev, name, r.at - NAME, "owed tasks directory")?;
-        root.owed_tasks.insert(name, Planned { name, phase: r.phase()?, source: r.id()?, file: r.name()? });
+    read_owed(&mut r, &mut root)?;
+    Ok(root)
+}
+
+#[expect(clippy::too_many_arguments, reason = "radix root decode: each argument one parsed header field")]
+pub(super) fn read_radix_directory<'a, 'g>(
+    mut r: Rd<'_>,
+    serial: Gen,
+    bits: u8,
+    total: u64,
+    live_pages: u32,
+    outlines: u32,
+    page_shards: SVec<'a, Key>,
+    mut get: impl FnMut(Key) -> Got<'g>,
+    alloc: SharedAlloc<'a>,
+) -> Result<Root<'a>, PagesError> {
+    let mut root = empty_directory(alloc);
+    root.serial = serial;
+    root.bits = bits;
+    root.bytes = total;
+    root.live_pages = live_pages;
+    root.page_shards = page_shards;
+    root.outlines = outlines;
+    for slot in root.file_shards.iter_mut() {
+        *slot = Key(r.id()?);
     }
-    let mut prev = None;
-    for _ in 0..r.count(OWED_CELL)? {
-        let id = r.cell_id()?;
-        ordered(&mut prev, id, r.at - CELL_ID, "owed cells directory")?;
-        root.owed_cells.insert(id, Gen(r.u64()?));
+    root.places_key = Key(r.id()?);
+    root.summary_key = Key(r.id()?);
+    read_owed(&mut r, &mut root)?;
+
+    for (shard, &key) in root.file_shards.iter().enumerate() {
+        if key == Key::default() {
+            continue;
+        }
+        let sealed = get(key).ok_or(PagesError::Missing { page: ROOT_PAGE, key })?.map_err(|torn| torn.at(ROOT_PAGE))?;
+        let mut sr = Rd { bytes: sealed.bytes(), at: 0, page: ROOT_PAGE };
+        if sr.take(4)? != FILE_SHARD_MAGIC || usize::from(sr.u8()?) != shard {
+            return Err(PagesError::Magic { page: ROOT_PAGE });
+        }
+        let mut prev = None;
+        for _ in 0..sr.count(NAME + 1)? {
+            let at = sr.at;
+            let name = sr.name()?;
+            if file_shard_of(name) != shard {
+                return Err(PagesError::Misplaced { page: ROOT_PAGE, section: "file directory shard", name });
+            }
+            ordered(&mut prev, name, at, "file directory")?;
+            let value = match sr.u8()? { 0 => None, 1 => Some(sr.id()?), tag => return Err(sr.tag(tag)) };
+            root.files.insert(name, value);
+        }
+        if sr.at != sr.bytes.len() {
+            return Err(PagesError::Trailing { page: ROOT_PAGE, at: u32::try_from(sr.at).unwrap_or(u32::MAX) });
+        }
     }
-    if r.at != r.bytes.len() { return Err(PagesError::Trailing { page: ROOT_PAGE, at: r.at as u32 }); }
+
+    if root.places_key != Key::default() {
+        let key = root.places_key;
+        let sealed = get(key).ok_or(PagesError::Missing { page: ROOT_PAGE, key })?.map_err(|torn| torn.at(ROOT_PAGE))?;
+        let mut pr = Rd { bytes: sealed.bytes(), at: 0, page: ROOT_PAGE };
+        if pr.take(4)? != PLACES_MAGIC {
+            return Err(PagesError::Magic { page: ROOT_PAGE });
+        }
+        let mut prev = None;
+        for _ in 0..pr.count(FILE_PLACE)? {
+            let at = pr.at;
+            let file = pr.name()?;
+            ordered(&mut prev, file, at, "file places directory")?;
+            let place = FilePlace { unit: pr.name()?, edition: pr.u8()?, flags: pr.u8()? };
+            if !root.files.contains_key(&file) {
+                return Err(PagesError::Unsorted { page: ROOT_PAGE, section: "file places directory (a place of no planned file)", at: u32::try_from(at).unwrap_or(u32::MAX) });
+            }
+            root.places.insert(file, place);
+        }
+        if pr.at != pr.bytes.len() {
+            return Err(PagesError::Trailing { page: ROOT_PAGE, at: u32::try_from(pr.at).unwrap_or(u32::MAX) });
+        }
+    }
+
+    if root.summary_key != Key::default() {
+        let key = root.summary_key;
+        let sealed = get(key).ok_or(PagesError::Missing { page: ROOT_PAGE, key })?.map_err(|torn| torn.at(ROOT_PAGE))?;
+        let mut sr = Rd { bytes: sealed.bytes(), at: 0, page: ROOT_PAGE };
+        if sr.take(4)? != SUMMARY_MAGIC {
+            return Err(PagesError::Magic { page: ROOT_PAGE });
+        }
+        let mut prev = None;
+        for _ in 0..sr.count(NAME)? {
+            let n = sr.name()?;
+            ordered(&mut prev, n, sr.at - NAME, "units directory")?;
+            root.units.push(n);
+        }
+        prev = None;
+        for _ in 0..sr.count(NAME + 4)? {
+            let n = sr.name()?;
+            ordered(&mut prev, n, sr.at - NAME, "findings directory")?;
+            root.findings.insert(n, sr.u32()?);
+        }
+        if sr.at != sr.bytes.len() {
+            return Err(PagesError::Trailing { page: ROOT_PAGE, at: u32::try_from(sr.at).unwrap_or(u32::MAX) });
+        }
+    }
+
     Ok(root)
 }
 
@@ -275,17 +648,49 @@ fn write_at<'a>(bufs: &mut [PageBuf<'a>], bits: u8, name: Name, section: usize, 
 /// (for example, a cold workspace starting from a tiny `tool-base` with `bits = 0..2`). Writes
 /// directly into `1 << new_bits` [`PageBuf`]s via sorted 2-way merges without allocating
 /// per-entry intermediate `SVec`s. Returns `Ok(None)` if exact merged sizing still fits `last.bits`.
-fn try_repage<'a>(kept: &Kept<'_>, last: &Root<'_>, source: &dyn StoredPages, work: &Work<'_>, alloc: SharedAlloc<'a>) -> Result<Option<Encoded<'a>>, PagesError> {
-    let mut old_pages: SVec<'a, &VerifiedPage<'_>> = SVec::with_capacity_in(last.pages.len(), alloc);
-    for (idx, &last_key) in last.pages.iter().enumerate() {
-        if last_key == Key::default() {
-            continue;
+fn try_repage<'a, 'g>(
+    kept: &Kept<'_>,
+    last: &Root<'_>,
+    source: &dyn StoredPages,
+    work: &Work<'_>,
+    get_record: &mut impl FnMut(Key) -> Got<'g>,
+    alloc: SharedAlloc<'a>,
+) -> Result<Option<Encoded<'a>>, PagesError> {
+    let mut old_pages: SVec<'a, &VerifiedPage<'_>> = SVec::with_capacity_in(usize::try_from(last.live_pages).unwrap_or(0), alloc);
+    if !last.is_radix() {
+        for (idx, &last_key) in last.pages.iter().enumerate() {
+            if last_key == Key::default() {
+                continue;
+            }
+            let witness = page_witness(idx, last.bits);
+            let Some(page) = source.page_for(witness, Ask::Witness)? else {
+                return Err(PagesError::Missing { page: u32::try_from(idx).unwrap_or(u32::MAX), key: last_key });
+            };
+            old_pages.push(page);
         }
-        let witness = page_witness(idx, last.bits);
-        let Some(page) = source.page_for(witness, Ask::Witness)? else {
-            return Err(PagesError::Missing { page: u32::try_from(idx).unwrap_or(u32::MAX), key: last_key });
-        };
-        old_pages.push(page);
+    } else {
+        for (shard_idx, &shard_key) in last.page_shards.iter().enumerate() {
+            if shard_key == Key::default() {
+                continue;
+            }
+            let shard_u32 = u32::try_from(shard_idx).unwrap_or(u32::MAX);
+            let sealed = get_record(shard_key)
+                .ok_or(PagesError::Missing { page: ROOT_PAGE, key: shard_key })?
+                .map_err(|torn| torn.at(ROOT_PAGE))?;
+            let shard = decode_radix_shard(sealed, shard_u32, last.bits, alloc)?;
+            let base_idx = shard_idx << RADIX_LEAF_BITS;
+            for (slot, &last_key) in shard.keys.iter().enumerate() {
+                if last_key == Key::default() {
+                    continue;
+                }
+                let idx = base_idx + slot;
+                let witness = page_witness(idx, last.bits);
+                let Some(page) = source.page_for(witness, Ask::Witness)? else {
+                    return Err(PagesError::Missing { page: u32::try_from(idx).unwrap_or(u32::MAX), key: last_key });
+                };
+                old_pages.push(page);
+            }
+        }
     }
 
     let mut root = empty_directory(alloc);
@@ -683,26 +1088,29 @@ fn try_repage<'a>(kept: &Kept<'_>, last: &Root<'_>, source: &dyn StoredPages, wo
 
     root.bits = new_bits;
     root.bytes = 0;
-    root.pages = SVec::with_capacity_in(count, alloc);
+    let mut flat_pages = SVec::with_capacity_in(count, alloc);
     let mut puts = SVec::new_in(alloc);
     let mut records = SVec::new_in(alloc);
+    let mut live_pages = 0u32;
     for (index, buf) in bufs.iter().enumerate() {
         let idx_u32 = u32::try_from(index).unwrap_or(u32::MAX);
         match buf.finish(new_bits, idx_u32, alloc) {
             Some(bytes) => {
                 let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                 root.bytes = root.bytes.checked_add(len).ok_or(PagesError::Total { page: idx_u32, field: "page byte count" })?;
+                live_pages = live_pages.saturating_add(1);
                 let key = content_key(&bytes);
-                root.pages.push(key);
+                flat_pages.push(key);
                 let rec_bytes = buf.parts.get(RECORDS).map_or(&[][..], |part| part.as_slice());
                 let page_records = view::page_records(rec_bytes, alloc);
                 puts.push((key, bytes));
                 records.push((key, page_records));
             }
-            None => root.pages.push(Key::default()),
+            None => flat_pages.push(Key::default()),
         }
     }
-    Ok(Some(root.finish(puts, records, PagesPlant::None, alloc)))
+    root.live_pages = live_pages;
+    Ok(Some(root.finish_whole(flat_pages, None, puts, records, PagesPlant::None, alloc)))
 }
 
 fn key_of_entry(bytes: &[u8], section: usize) -> CellId {
@@ -893,11 +1301,16 @@ fn obligations<'a>(root: &mut Root<'a>, last: &Root<'_>, work: &Work<'_>, source
 
 /// Copy unchanged member claims from the file's page. Only an added member or a
 /// changed row/obligation needs to consult the row under its own name.
-fn file_changes<'a>(root: &mut Root<'a>, last: &Root<'_>, work: &Work<'_>, source: &dyn StoredPages, delta: &mut Changed<'a>, files: &crate::SSet<'a, Name>) -> Result<(), PagesError> {
+/// Returns the bitmask of `FILE_SHARDS` (0..16) whose entries changed in `root.files`.
+fn file_changes<'a>(root: &mut Root<'a>, last: &Root<'_>, work: &Work<'_>, source: &dyn StoredPages, delta: &mut Changed<'a>, files: &crate::SSet<'a, Name>) -> Result<u16, PagesError> {
+    let mut changed_shards = 0u16;
     for &file in files.iter() {
         let replacement = work.by_file.get(&file);
         if matches!(replacement, Some(None)) {
-            if root.files.remove(&file).is_some() { delta.set(FILES, named(file), None); }
+            if root.files.remove(&file).is_some() {
+                changed_shards |= 1u16 << file_shard_of(file);
+                delta.set(FILES, named(file), None);
+            }
             continue;
         }
         if replacement.is_none() && !last.files.contains_key(&file) { continue; }
@@ -933,12 +1346,15 @@ fn file_changes<'a>(root: &mut Root<'a>, last: &Root<'_>, work: &Work<'_>, sourc
         } else if let Some(base) = base {
             for name in base.file_tasks(file) { member(name)?; }
         }
-        root.files.insert(file, all_stand.then(|| file_digest(&record)));
+        let next_digest = all_stand.then(|| file_digest(&record));
+        if root.files.insert(file, next_digest) != Some(next_digest) {
+            changed_shards |= 1u16 << file_shard_of(file);
+        }
         if !last.files.contains_key(&file) || old_members != &record[NAME + 4..] {
             delta.set(FILES, named(file), Some(record));
         }
     }
-    Ok(())
+    Ok(changed_shards)
 }
 
 fn reader_changes<'a>(work: &Work<'_>, source: &dyn StoredPages, delta: &mut Changed<'a>) -> Result<(), PagesError> {
@@ -994,9 +1410,28 @@ pub fn encode_changes<'a>(kept: &Kept<'_>, last: &Root<'_>, alloc: SharedAlloc<'
 
 /// [`encode_changes`] with a caller-supplied executor for independent [`PageJob`]s, letting a
 /// multi-threaded driver merge and BLAKE3-hash changed pages in parallel while keeping this crate
-/// sans-IO and deterministic.
+/// sans-IO and deterministic. For radix roots (`bits > RADIX_FLAT_MAX_BITS`), use
+/// [`encode_changes_radix`] so touched leaf shards can be fetched on demand.
 pub fn encode_changes_with<'a, F>(kept: &Kept<'_>, last: &Root<'_>, alloc: SharedAlloc<'a>, run_pages: F) -> Result<Encoded<'a>, PagesError>
 where
+    F: FnOnce(&[PageJob<'_, '_>]) -> SVec<'a, PageBuilt<'a>>,
+{
+    encode_changes_radix(kept, last, alloc, |_| None, run_pages)
+}
+
+/// [`encode_changes_with`] supporting both flat (`bits <= RADIX_FLAT_MAX_BITS`) and 2-level
+/// 256-way radix (`bits > RADIX_FLAT_MAX_BITS`) roots. Only the `<= changed_pages` touched leaf
+/// shards are fetched through `get_record`, updated, and hashed; untouched shards and unchanged
+/// directory sub-records carry their keys forward with zero reads and zero hashing.
+pub fn encode_changes_radix<'a, 'g, G, F>(
+    kept: &Kept<'_>,
+    last: &Root<'_>,
+    alloc: SharedAlloc<'a>,
+    mut get_record: G,
+    run_pages: F,
+) -> Result<Encoded<'a>, PagesError>
+where
+    G: FnMut(Key) -> Got<'g>,
     F: FnOnce(&[PageJob<'_, '_>]) -> SVec<'a, PageBuilt<'a>>,
 {
     let answer = &kept.answer;
@@ -1006,7 +1441,7 @@ where
     let page_budget = blaze_drive::answers::PAGE_BYTES << last.bits.min(blaze_drive::answers::MOST_BITS);
     if added > page_budget / 2
         && blaze_drive::answers::bits_for(last.bytes.saturating_add(added)) > last.bits
-        && let Some(encoded) = try_repage(kept, last, source, work, alloc)?
+        && let Some(encoded) = try_repage(kept, last, source, work, &mut get_record, alloc)?
     {
         return Ok(encoded);
     }
@@ -1015,7 +1450,15 @@ where
     root.serial = work.serial();
     root.bits = last.bits;
     root.bytes = last.bytes;
-    root.pages.extend_from_slice(&last.pages);
+    root.live_pages = last.live_pages;
+    if !last.is_radix() {
+        root.pages.extend_from_slice(&last.pages);
+    } else {
+        root.page_shards.extend_from_slice(&last.page_shards);
+        root.file_shards = last.file_shards;
+        root.places_key = last.places_key;
+        root.summary_key = last.summary_key;
+    }
     root.outlines = last.outlines;
     root.files.extend(last.files.iter().map(|(&name, &digest)| (name, digest)));
     root.places.extend(last.places.iter().map(|(&name, &place)| (name, place)));
@@ -1024,6 +1467,7 @@ where
     units.extend(last.units.iter().copied());
     let mut files = BTreeSet::new_in(alloc);
     files.extend(work.by_file.keys().copied());
+    let mut summary_changed = false;
     for (&name, value) in work.rows.iter() {
         let old = previous(source, name)?;
         let next = value.as_ref();
@@ -1037,10 +1481,22 @@ where
         }
         root.outlines = root.outlines.checked_add(u32::from(next.is_some_and(|r| r.phase.stage == Stage::Outlines)))
             .ok_or(PagesError::Total { page: page_of(name, last.bits), field: "outline count" })?;
-        if next.is_some_and(|r| r.phase.stage == Stage::Units) { units.insert(name); } else { units.remove(&name); }
+        if next.is_some_and(|r| r.phase.stage == Stage::Units) {
+            if units.insert(name) { summary_changed = true; }
+        } else if units.remove(&name) {
+            summary_changed = true;
+        }
         match next.filter(|r| r.failed || r.findings > 0) {
-            Some(r) => { root.findings.insert(name, r.findings); }
-            None => { root.findings.remove(&name); }
+            Some(r) => {
+                if root.findings.insert(name, r.findings) != Some(r.findings) {
+                    summary_changed = true;
+                }
+            }
+            None => {
+                if root.findings.remove(&name).is_some() {
+                    summary_changed = true;
+                }
+            }
         }
         let k = named(name);
         delta.set(ROWS, k, next.map(|row| bytes_of_cap(alloc, row_byte_len(row), |b| put_row(b, name, row))));
@@ -1067,37 +1523,138 @@ where
     }
     obligations(&mut root, last, work, source, &mut delta, &mut files)?;
     reader_changes(work, source, &mut delta)?;
-    file_changes(&mut root, last, work, source, &mut delta, &files)?;
+    let changed_file_shards = file_changes(&mut root, last, work, source, &mut delta, &files)?;
     // This request's places over the last root's, and none of a file the root no longer plans:
     // the root [`encode`] would write for the same plan.
-    root.places.extend(kept.places.iter().map(|(&name, &place)| (name, place)));
+    let mut places_changed = false;
+    for (&name, &place) in kept.places.iter() {
+        if root.files.contains_key(&name) && root.places.insert(name, place) != Some(place) {
+            places_changed = true;
+        }
+    }
+    let places_before_retain = root.places.len();
     let planned = &root.files;
     root.places.retain(|file, _| planned.contains_key(file));
+    if root.places.len() != places_before_retain {
+        places_changed = true;
+    }
+
     let changed_pages = u32::try_from(delta.pages.len()).unwrap_or(u32::MAX);
     let changed_entries = delta.pages.values().map(|page| page.sections.iter().map(BTreeMap::len).sum::<usize>()).sum::<usize>();
     let changed_entries = u32::try_from(changed_entries).unwrap_or(u32::MAX);
-    let mut jobs: SVec<'_, PageJob<'_, '_>> = SVec::with_capacity_in(delta.pages.len(), alloc);
-    for (&index, change) in delta.pages.iter() {
-        let base = source.page_for(change.witness, Ask::Witness)?;
-        let last_key = last.pages.get(usize::try_from(index).unwrap_or(usize::MAX)).copied().unwrap_or_default();
-        if base.is_none() && last_key != Key::default() { return Err(PagesError::Missing { page: index, key: last_key }); }
-        jobs.push(PageJob { index, base, change, bits: last.bits, last_key });
-    }
-    let built = run_pages(&jobs);
-    let mut puts = SVec::with_capacity_in(built.len(), alloc);
-    let mut records = SVec::with_capacity_in(built.len(), alloc);
-    for one in built {
-        root.bytes = root.bytes.checked_sub(one.base_len)
-            .and_then(|n| n.checked_add(one.new_len)).ok_or(PagesError::Total { page: one.index, field: "page byte count" })?;
-        if let Some(slot) = root.pages.get_mut(usize::try_from(one.index).unwrap_or(usize::MAX)) {
-            *slot = one.key;
+
+    let mut encoded = if !last.is_radix() {
+        let mut jobs: SVec<'_, PageJob<'_, '_>> = SVec::with_capacity_in(delta.pages.len(), alloc);
+        for (&index, change) in delta.pages.iter() {
+            let base = source.page_for(change.witness, Ask::Witness)?;
+            let last_key = last.pages.get(usize::try_from(index).unwrap_or(usize::MAX)).copied().unwrap_or_default();
+            if base.is_none() && last_key != Key::default() { return Err(PagesError::Missing { page: index, key: last_key }); }
+            jobs.push(PageJob { index, base, change, bits: last.bits, last_key });
         }
-        if one.changed {
-            puts.push((one.key, one.bytes));
-            records.push((one.key, one.records));
+        let built = run_pages(&jobs);
+        let mut puts = SVec::with_capacity_in(built.len() + 1, alloc);
+        let mut records = SVec::with_capacity_in(built.len(), alloc);
+        let mut page_deltas = SVec::with_capacity_in(built.len(), alloc);
+        for one in built {
+            root.bytes = root.bytes.checked_sub(one.base_len)
+                .and_then(|n| n.checked_add(one.new_len)).ok_or(PagesError::Total { page: one.index, field: "page byte count" })?;
+            if let Some(slot) = root.pages.get_mut(usize::try_from(one.index).unwrap_or(usize::MAX)) {
+                let old = *slot;
+                if old != one.key {
+                    if old == Key::default() && one.key != Key::default() {
+                        root.live_pages = root.live_pages.saturating_add(1);
+                    } else if old != Key::default() && one.key == Key::default() {
+                        root.live_pages = root.live_pages.saturating_sub(1);
+                    }
+                    page_deltas.push(PageDelta { index: one.index, old, new: one.key });
+                    *slot = one.key;
+                }
+            }
+            if one.changed {
+                puts.push((one.key, one.bytes));
+                records.push((one.key, one.records));
+            }
         }
-    }
-    let mut encoded = root.finish(puts, records, PagesPlant::None, alloc);
+        root.finish_flat(puts, records, Some(page_deltas), PagesPlant::None, alloc)
+    } else {
+        // Fetch ONLY the `<= changed_pages` touched radix leaf shards.
+        let mut touched_shards: SMap<'a, usize, RadixShard<'a>> = SMap::new_in(alloc);
+        for &index in delta.pages.keys() {
+            let (shard_idx, _) = Root::shard_of(usize::try_from(index).unwrap_or(usize::MAX));
+            if touched_shards.contains_key(&shard_idx) {
+                continue;
+            }
+            let Some(&shard_key) = last.page_shards.get(shard_idx) else {
+                return Err(PagesError::Count { page: ROOT_PAGE, count: index });
+            };
+            let shard = if shard_key == Key::default() {
+                RadixShard { keys: blaze_own::Box::new_in([Key::default(); RADIX_LEAF_PAGES], alloc) }
+            } else {
+                let shard_u32 = u32::try_from(shard_idx).unwrap_or(u32::MAX);
+                let sealed = get_record(shard_key)
+                    .ok_or(PagesError::Missing { page: ROOT_PAGE, key: shard_key })?
+                    .map_err(|torn| torn.at(ROOT_PAGE))?;
+                decode_radix_shard(sealed, shard_u32, last.bits, alloc)?
+            };
+            touched_shards.insert(shard_idx, shard);
+        }
+        let mut jobs: SVec<'_, PageJob<'_, '_>> = SVec::with_capacity_in(delta.pages.len(), alloc);
+        for (&index, change) in delta.pages.iter() {
+            let base = source.page_for(change.witness, Ask::Witness)?;
+            let (shard_idx, slot_idx) = Root::shard_of(usize::try_from(index).unwrap_or(usize::MAX));
+            let last_key = touched_shards.get(&shard_idx).and_then(|s| s.keys.get(slot_idx)).copied().unwrap_or_default();
+            if base.is_none() && last_key != Key::default() { return Err(PagesError::Missing { page: index, key: last_key }); }
+            jobs.push(PageJob { index, base, change, bits: last.bits, last_key });
+        }
+        let built = run_pages(&jobs);
+        let mut puts = SVec::with_capacity_in(built.len() + touched_shards.len() + 4, alloc);
+        let mut records = SVec::with_capacity_in(built.len(), alloc);
+        let mut page_deltas = SVec::with_capacity_in(built.len(), alloc);
+        for one in built {
+            root.bytes = root.bytes.checked_sub(one.base_len)
+                .and_then(|n| n.checked_add(one.new_len)).ok_or(PagesError::Total { page: one.index, field: "page byte count" })?;
+            let (shard_idx, slot_idx) = Root::shard_of(usize::try_from(one.index).unwrap_or(usize::MAX));
+            if let Some(shard) = touched_shards.get_mut(&shard_idx)
+                && let Some(slot) = shard.keys.get_mut(slot_idx)
+            {
+                let old = *slot;
+                if old != one.key {
+                    if old == Key::default() && one.key != Key::default() {
+                        root.live_pages = root.live_pages.saturating_add(1);
+                    } else if old != Key::default() && one.key == Key::default() {
+                        root.live_pages = root.live_pages.saturating_sub(1);
+                    }
+                    page_deltas.push(PageDelta { index: one.index, old, new: one.key });
+                    *slot = one.key;
+                }
+            }
+            if one.changed {
+                puts.push((one.key, one.bytes));
+                records.push((one.key, one.records));
+            }
+        }
+        let task_puts = u32::try_from(puts.len()).unwrap_or(u32::MAX);
+        for (shard_idx, shard) in touched_shards.into_iter() {
+            let shard_u32 = u32::try_from(shard_idx).unwrap_or(u32::MAX);
+            let old_shard_key = root.page_shards.get(shard_idx).copied().unwrap_or_default();
+            match encode_radix_shard(last.bits, shard_u32, shard.keys.as_slice(), alloc) {
+                Some((new_key, bytes)) => {
+                    if let Some(slot) = root.page_shards.get_mut(shard_idx) {
+                        *slot = new_key;
+                    }
+                    if new_key != old_shard_key {
+                        puts.push((new_key, bytes));
+                    }
+                }
+                None => {
+                    if let Some(slot) = root.page_shards.get_mut(shard_idx) {
+                        *slot = Key::default();
+                    }
+                }
+            }
+        }
+        root.finish_incremental_radix(puts, task_puts, records, page_deltas, changed_file_shards, places_changed, summary_changed, alloc)
+    };
     encoded.changed_entries = changed_entries;
     encoded.changed_pages = changed_pages;
     Ok(encoded)

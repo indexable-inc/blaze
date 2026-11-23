@@ -850,11 +850,12 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
     let bg_detached = home.bg_gc.is_detached();
     // Warm no-op fast path: when needs_housekeeping is false, 0 slices and 0 spawns.
     // On a native host when housekeeping is needed (over budget, tiers over K, expired roots,
-    // or retired files ready), commit + seal immediately with 0 foreground slices and spawn
-    // detached `blaze gc --background` (QOS_CLASS_BACKGROUND + non-blocking gc.lock) so CLI
-    // exit is never delayed. In simulated worlds without a spawner, run inline slices.
+    // or retired files ready), commit immediately with 0 foreground slices (1 flip, 0 seal
+    // barriers, full foreground QoS) and spawn detached `blaze gc --background`
+    // (QOS_CLASS_BACKGROUND + non-blocking gc.lock) so CLI exit is never delayed. In simulated
+    // worlds without a spawner, run inline slices (including exit-tail seal).
     let slices = if needs_hk && !bg_detached { AFTER_ANSWER_SLICES } else { 0 };
-    let has_work = slices > 0 || lent.needs_commit() || lent.needs_seal();
+    let has_work = slices > 0 || lent.needs_commit();
     let (after, commit_ns, spawn_bg) = if !has_work {
         let named = lent.named();
         let before = lent.put_tally();
@@ -874,15 +875,19 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
         drop(lent);
         (after, commit_ns, spawn_bg)
     } else {
-        // The whole stretch after the answer at the after-answer class (plain_place
-        // `AFTER_ANSWER_QOS`): the commit and the sweep below, given back at the return. The
-        // commit's own scope then finds the thread there already and changes nothing.
+        // Only lower to the after-answer utility class when running inline cleanup/seal slices
+        // (`slices > 0`). When `slices == 0`, the foreground CLI is waiting to exit after one
+        // commit flip and must not be throttled onto slow E-cores or behind background GC.
         #[cfg(target_os = "macos")]
-        let _held = match plain_place::AFTER_ANSWER_QOS {
-            plain_place::AfterAnswerQos::Scoped => Some(
-                blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?,
-            ),
-            plain_place::AfterAnswerQos::AsCalled => None,
+        let _held = if slices > 0 {
+            match plain_place::AFTER_ANSWER_QOS {
+                plain_place::AfterAnswerQos::Scoped => Some(
+                    blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?,
+                ),
+                plain_place::AfterAnswerQos::AsCalled => None,
+            }
+        } else {
+            None
         };
         let after = plain_place::after_answer(cx, &lent, slices)?;
         let commit_ns = ns(clock).saturating_sub(answered);
@@ -893,7 +898,7 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
     };
     if spawn_bg {
         let cx = cx.span("store after answer: spawn detached background gc");
-        home.bg_gc.spawn(&cx, err);
+        let _ = home.bg_gc.spawn(&cx, home.dir(), err);
     } else if !bg_detached {
         let cx = cx.span("store after answer: sweep of other forms' stores (a listing of the store root)");
         crate::clean::sweep_other_forms(&cx, &home.dir, clock.wall().as_ns(), err, crate::clean::SweepPlant::None)?;
@@ -1542,3 +1547,54 @@ mod published_e2e_tests;
 #[cfg(test)]
 #[path = "store/reach_tests.rs"]
 mod reach_tests;
+
+#[cfg(test)]
+mod after_answer_commit_tests {
+    use super::*;
+    use bstd::io::{Io, Limits, SimWorld};
+    use bstd::mem::TASK_FRAME;
+    use bstd::test::BUDGET;
+
+    /// Foreground zero-slice `after_answer_printed` commits in 1 flip with 0 seal barriers,
+    /// and `gc::gc_lock_is_free` detects an active GC lock so `BgGc::spawn` skips redundant spawns.
+    #[test]
+    fn after_answer_zero_slice_commits_without_seal_barrier_and_gc_lock_check_skips_active_gc() {
+        let io = Io::simulated(SimWorld::new(83, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("err");
+        let heap = blaze_own::testing::heap();
+        let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+
+        // 1. Put a record and run `after_answer_printed`: housekeeping is not due, so `slices == 0`
+        //    -> commits in 1 flip with 0 barriers/seals!
+        let lent = home.open_store(&Settings::default(), Facts { boot: Some(1), nonce: 83 }, heap.alloc()).expect("open");
+        let k = Key(ContentId::of("after answer zero slice key", b"v1"));
+        lent.put(&blaze_cas::Key(k.0), blaze_keyed::kind::Namespace::LOCAL, blaze_keyed::kind::ReservedTag::Drive.tag(), b"hello")
+            .expect("put");
+        let cleanup = after_answer_printed(&cx, lent, &home, false, &clock, &err).expect("after answer printed");
+        assert_eq!(cleanup.put.after_answer.commits, 1, "one foreground commit");
+        assert_eq!(cleanup.put.after_answer.disk.barriers, 0, "zero foreground seal barriers on slices == 0");
+        assert_eq!(cleanup.put.after_answer.disk.syncs, 0, "zero foreground syncs on slices == 0");
+        assert_eq!(cleanup.slices, 0, "zero inline compaction slices");
+
+        // Reopen in the same boot: committed record is readable immediately.
+        let lent2 = home.open_store(&Settings::default(), Facts { boot: Some(1), nonce: 84 }, heap.alloc()).expect("reopen");
+        let held = lent2.get(&blaze_cas::Key(k.0)).expect("get").expect("committed record readable");
+        assert_eq!(held.bytes, b"hello");
+        // No uncommitted puts -> `after_answer_printed` is a 0-commit, 0-barrier no-op even though
+        // the previous segment is unsealed!
+        let noop = after_answer_printed(&cx, lent2, &home, false, &clock, &err).expect("noop after answer");
+        assert_eq!(noop.put.after_answer.commits, 0, "no-op command does not commit or seal");
+        assert_eq!(noop.put.after_answer.disk.barriers, 0, "no-op command does 0 barriers");
+
+        // 2. `gc_lock_is_free` returns true when unlocked, false while `gc.lock` is held, and true
+        //    again after release — ensuring `BgGc::spawn` never spawns duplicate GC processes.
+        assert!(crate::gc::gc_lock_is_free(&cx, home.dir()), "gc.lock starts free");
+        let held_lock = crate::gc::try_acquire_gc_lock(&cx, home.dir()).expect("acquire").expect("lock acquired");
+        assert!(!crate::gc::gc_lock_is_free(&cx, home.dir()), "gc_lock_is_free returns false while GC holds gc.lock");
+        drop(held_lock);
+        assert!(crate::gc::gc_lock_is_free(&cx, home.dir()), "gc.lock free again after drop");
+    }
+}

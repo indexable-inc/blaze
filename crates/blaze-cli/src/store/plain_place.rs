@@ -588,14 +588,25 @@ pub fn after_answer<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32)
 }
 
 /// [`after_answer`] at the class choice `qos`: the seam's two sides, for its test.
+///
+/// When `slices == 0` (foreground CLI commit-and-exit where background `blaze gc --background`
+/// handles compaction and exit-tail sealing asynchronously), the calling thread stays at its
+/// foreground QoS class (never throttled onto E-cores or behind background GC) and performs ONE
+/// commit flip with ZERO redundant `F_BARRIERFSYNC` / second flip. When `slices > 0` (inline
+/// compaction + seal), `qos` scopes the lowering to `AFTER_ANSWER` (`utility`) and restores the
+/// caller's class on every exit.
 pub(crate) fn after_answer_at<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32, qos: AfterAnswerQos) -> Result<AfterAnswer, PlaceError> {
     let called_at = qos_now()?;
     #[cfg(target_os = "macos")]
-    let _held = match qos {
-        AfterAnswerQos::Scoped => {
-            Some(blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?)
+    let _held = if slices > 0 {
+        match qos {
+            AfterAnswerQos::Scoped => {
+                Some(blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?)
+            }
+            AfterAnswerQos::AsCalled => None,
         }
-        AfterAnswerQos::AsCalled => None,
+    } else {
+        None
     };
     #[cfg(not(target_os = "macos"))]
     let (AfterAnswerQos::AsCalled | AfterAnswerQos::Scoped) = qos;
@@ -625,9 +636,17 @@ fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u3
     } else {
         (first, 0)
     };
-    let sealed = {
+    // Only run the exit-tail barrier + second manifest flip (`lent.seal()`) when running inline
+    // maintenance (`slices > 0`). On the foreground exit path (`slices == 0`), `lent.commit()`
+    // already persisted the new segment atomically with this boot's id (`proved == boot`, zero
+    // re-hashing on subsequent same-boot reads), while `blaze gc --background` seals segments
+    // asynchronously for cross-reboot fast-open (and across a power cut, blaze-cas verifies any
+    // unsealed segment whole on first read, preserving 100% crash durability).
+    let sealed = if slices > 0 {
         let _cx = cx.span("store after answer: seal (a barrier a segment of this boot unsealed, a flip)");
         lent.seal()?
+    } else {
+        false
     };
     let mut cleanup = {
         let _cx = cx.span("store after answer: the cleanup line");
@@ -676,9 +695,10 @@ mod checkpoint_tests {
     }
 }
 
-/// The after-answer class's seam, on the simulation's store: scoped, the steps run at `utility`
-/// and the caller's class comes back; the control (as called, the cause removed) leaves the
-/// caller lowered after, blaze-cas's `lower_this_thread` never giving it back.
+/// The after-answer class's seam, on the simulation's store: with `slices > 0` (inline cleanup +
+/// seal), scoped runs at `utility` and restores the caller's class while `AsCalled` leaves it
+/// lowered; with `slices == 0` (foreground CLI commit-and-exit), it runs at full foreground QoS
+/// (`UserInitiated`) with 1 commit and 0 seal barriers/flips.
 #[cfg(all(test, target_os = "macos"))]
 mod qos_tests {
     use blaze_cas::plain::Settings;
@@ -687,10 +707,12 @@ mod qos_tests {
         sim::{Faults, Sim},
         threads::qos::{self, Qos},
     };
+    use blaze_drive::Key;
+    use blaze_ids::ContentId;
 
-    use super::{AfterAnswerQos, Facts, after_answer_at, config, open, test_cx};
+    use super::{AfterAnswerQos, Facts, PlainPlace, after_answer_at, config, open, test_cx};
 
-    fn at(choice: AfterAnswerQos) -> (super::QosSeen, Qos) {
+    fn at(slices: u32, choice: AfterAnswerQos) -> (super::AfterAnswer, Qos) {
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
@@ -698,8 +720,11 @@ mod qos_tests {
                     let alloc = blaze_own::testing::heap().alloc();
                     let cfg = config(FileName::new("store").expect("a name"), &Settings::default(), Facts { boot: Some(1), nonce: 4242 }, alloc);
                     let lent = open(Sim::new(1, Faults::default()), cfg, alloc).expect("the store opens");
-                    let done = after_answer_at(&test_cx(), &lent, 0, choice).expect("the work after the answer");
-                    (done.qos, qos::this_thread().expect("the class after").0)
+                    let mut place = PlainPlace::new(&lent, false);
+                    place.put(Key(ContentId::of("qos test key", b"v1")), false, b"payload").expect("put");
+                    drop(place);
+                    let done = after_answer_at(&test_cx(), &lent, slices, choice).expect("the work after the answer");
+                    (done, qos::this_thread().expect("the class after").0)
                 })
                 .join()
                 .expect("the caller's thread")
@@ -708,11 +733,22 @@ mod qos_tests {
 
     #[test]
     fn scoped_the_work_after_the_answer_runs_at_utility_and_the_caller_gets_its_class_back() {
-        let (seen, after) = at(AfterAnswerQos::Scoped);
-        assert_eq!(seen, super::QosSeen { called_at: Qos::UserInitiated.raw(), ran_at: qos::AFTER_ANSWER.raw() });
+        let (done, after) = at(1, AfterAnswerQos::Scoped);
+        assert_eq!(done.qos, super::QosSeen { called_at: Qos::UserInitiated.raw(), ran_at: qos::AFTER_ANSWER.raw() });
         assert_eq!(after, Qos::UserInitiated, "the caller's class given back");
-        let (seen, after) = at(AfterAnswerQos::AsCalled);
-        assert_eq!(seen.called_at, Qos::UserInitiated.raw());
-        assert_eq!(after, Qos::Utility, "as called, blaze-cas's lowering stays");
+        assert!(done.sealed, "inline maintenance (`slices > 0`) seals the exit tail");
+        let (done, after) = at(1, AfterAnswerQos::AsCalled);
+        assert_eq!(done.qos.called_at, Qos::UserInitiated.raw());
+        assert_eq!(after, Qos::Utility, "as called with inline maintenance, blaze-cas's lowering stays");
+    }
+
+    #[test]
+    fn foreground_zero_slice_commit_keeps_foreground_qos_and_skips_second_seal_barrier() {
+        let (done, after) = at(0, AfterAnswerQos::Scoped);
+        assert_eq!(done.segments_written, 1, "one segment committed");
+        assert!(!done.sealed, "zero-slice foreground commit does not run a redundant second seal flip");
+        assert_eq!(done.cleanup.put.after_answer.disk.barriers, 0, "zero foreground barriers on commit");
+        assert_eq!(done.qos, super::QosSeen { called_at: Qos::UserInitiated.raw(), ran_at: Qos::UserInitiated.raw() });
+        assert_eq!(after, Qos::UserInitiated, "foreground commit never throttles the calling thread onto E-cores");
     }
 }
