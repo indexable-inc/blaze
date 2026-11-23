@@ -232,6 +232,7 @@ pub fn propagate_planted<A: Allocator + Copy>(view: View<'_>, plant: Plant, allo
         jump: no_jumps,
         devirt,
         merge_next: filled(view.blocks(), NONE, &alloc),
+        fma_fuse: filled(len, None, &alloc),
     };
     rebuild(view, &edit, alloc)
 }

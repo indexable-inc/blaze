@@ -66,6 +66,8 @@ pub struct AegraphStats {
     pub constants_folded: u32,
     /// Strength-reduction candidates identified (`x * 2^k`, `udiv x, 2^k`, `urem x, 2^k`, `x + x`).
     pub strength_reductions: u32,
+    /// Floating-point `fadd(fmul(a, b), c)` sequences with `Flags::CONTRACT` fused into hardware `Op::Fma`.
+    pub fma_fusions: u32,
     /// Loop analysis findings (natural loops, nesting depth, LICM candidates, induction variables).
     pub loops: LoopSummary,
     /// Instructions in input vs output (after dead-code sweep).
@@ -118,6 +120,37 @@ struct ENodeKey {
     a: u32,
     b: u32,
     c: u32,
+}
+
+#[inline]
+fn u32_ix(v: u32) -> usize {
+    usize::try_from(v).unwrap_or(usize::MAX)
+}
+
+#[inline]
+fn stand_of(stands: &[u32], v: u32) -> Option<u32> {
+    stands.get(u32_ix(v)).copied()
+}
+
+#[inline]
+fn inst_op_byte(view: &View<'_>, inst: usize) -> u8 {
+    view.ops.get(inst).copied().unwrap_or(0)
+}
+
+#[inline]
+fn fmul_operands(view: &View<'_>, stands: &[u32], v: u32, ty: Ty) -> Option<[u32; 2]> {
+    let vi = u32_ix(v);
+    if view.op(vi) != Op::Fmul || view.tys.get(vi).copied().map(Ty) != Some(ty) {
+        return None;
+    }
+    let mf = Flags(view.flags.get(vi).copied().unwrap_or(0));
+    if mf.0 != 0 && !mf.contains(Flags::CONTRACT) {
+        return None;
+    }
+    let mat = u32_ix(view.data.get(vi).copied()?);
+    let ma = stand_of(stands, view.extra.get(mat).copied()?)?;
+    let mb = stand_of(stands, view.extra.get(mat.checked_add(1)?).copied()?)?;
+    Some([ma, mb])
 }
 
 impl ENodeKey {
@@ -339,6 +372,7 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
     }
     let mut known_const: Vec<Option<u128>, A> = filled(len, None, &alloc);
     let mut edit_const: Vec<Option<u128>, A> = filled(len, None, &alloc);
+    let mut fma_fuse: Vec<Option<[u32; 3]>, A> = filled(len, None, &alloc);
     let mut stats = AegraphStats {
         insts_before: len as u32,
         loops: loop_summary,
@@ -404,6 +438,77 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                             known_const[inst] = Some(v);
                         }
                         continue;
+                    }
+                    // Bit-exact float constant deduplication (`Fconst` f16/f32 and `FconstWide` f64).
+                    if op == Op::Fconst && ty.is_scalar() && ty.is_float() {
+                        if let (Some(&bits), Some(inst_id)) = (view.data.get(inst), u32::try_from(inst).ok()) {
+                            if let Some(slot) = known_const.get_mut(inst) {
+                                *slot = Some(u128::from(bits));
+                            }
+                            let key = ENodeKey { op: inst_op_byte(&view, inst), ty: ty.0, cond: 0, a: bits, b: 0, c: 0 };
+                            if let Some(prev) = table.get_or_insert(key, inst_id) {
+                                if let Some(st) = stands.get_mut(inst) {
+                                    *st = prev;
+                                }
+                                stats.gvn_hits += 1;
+                            }
+                        }
+                        continue;
+                    }
+                    if op == Op::FconstWide && ty.is_scalar() && ty.is_float() {
+                        if ty.const_words() == 2
+                            && let Some(&raw_at) = view.data.get(inst)
+                            && let Some(at) = usize::try_from(raw_at).ok()
+                            && let (Some(&lo), Some(&hi), Some(inst_id)) = (
+                                view.extra.get(at),
+                                at.checked_add(1).and_then(|i| view.extra.get(i)),
+                                u32::try_from(inst).ok(),
+                            )
+                        {
+                            if let Some(slot) = known_const.get_mut(inst) {
+                                *slot = Some(u128::from(lo) | (u128::from(hi) << 32));
+                            }
+                            let key = ENodeKey { op: inst_op_byte(&view, inst), ty: ty.0, cond: 0, a: lo, b: hi, c: 0 };
+                            if let Some(prev) = table.get_or_insert(key, inst_id) {
+                                if let Some(st) = stands.get_mut(inst) {
+                                    *st = prev;
+                                }
+                                stats.gvn_hits += 1;
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Contract `fadd(fmul(a, b), c)` / `fadd(c, fmul(a, b))` into native hardware
+                    // `Op::Fma(a, b, c)` ONLY when `Flags::CONTRACT` explicitly permits contraction.
+                    if op == Op::Fadd && ty.is_scalar() && ty.is_float() && flags.contains(Flags::CONTRACT) {
+                        if let Some(&raw_at) = view.data.get(inst)
+                            && let Some(at) = usize::try_from(raw_at).ok()
+                            && let (Some(&raw_l), Some(&raw_r), Some(inst_id)) = (
+                                view.extra.get(at),
+                                at.checked_add(1).and_then(|i| view.extra.get(i)),
+                                u32::try_from(inst).ok(),
+                            )
+                            && let (Some(lhs), Some(rhs)) = (stand_of(&stands, raw_l), stand_of(&stands, raw_r))
+                        {
+                            let fused = fmul_operands(&view, &stands, lhs, ty)
+                                .map(|[ma, mb]| [ma, mb, rhs])
+                                .or_else(|| fmul_operands(&view, &stands, rhs, ty).map(|[ma, mb]| [ma, mb, lhs]));
+                            if let Some([fa, fb, fc]) = fused {
+                                // Use a distinct synthetic key tag (`0xFE`) for contracted FMA nodes.
+                                let key = ENodeKey { op: 0xFE, ty: ty.0, cond: flags.0, a: fa, b: fb, c: fc };
+                                if let Some(prev) = table.get_or_insert(key, inst_id) {
+                                    if let Some(st) = stands.get_mut(inst) {
+                                        *st = prev;
+                                    }
+                                    stats.gvn_hits += 1;
+                                } else if let Some(ff) = fma_fuse.get_mut(inst) {
+                                    *ff = Some([fa, fb, fc]);
+                                    stats.fma_fusions += 1;
+                                }
+                                continue;
+                            }
+                        }
                     }
 
                     // Only rewrite flag-free pure scalar ops (preserves every promise/UB/effect).
@@ -645,6 +750,158 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
                             }
                         }
 
+                        // IEEE-754 bit-exact scalar float unary identities + dominator-scoped GVN.
+                        Op::Fneg
+                        | Op::Fabs
+                        | Op::Sqrt
+                        | Op::Floor
+                        | Op::Ceil
+                        | Op::Ftrunc
+                        | Op::Nearest
+                        | Op::Fround => {
+                            if !(ty.is_scalar() && ty.is_float()) {
+                                continue;
+                            }
+                            let Some(&raw_a) = view.data.get(inst) else { continue };
+                            let Some(a) = stand_of(&stands, raw_a) else { continue };
+                            let ai = u32_ix(a);
+                            let a_op = view.op(ai);
+                            let a_plain = view.flags.get(ai).copied().unwrap_or(1) == 0;
+                            // `fneg(fneg(x)) == x` (IEEE-754 bit-exact sign-bit involution).
+                            if op == Op::Fneg && a_op == Op::Fneg && a_plain {
+                                if let Some(&raw_inner) = view.data.get(ai)
+                                    && let Some(inner) = stand_of(&stands, raw_inner)
+                                {
+                                    if let Some(st) = stands.get_mut(inst) {
+                                        *st = inner;
+                                    }
+                                    let kc = known_const.get(u32_ix(inner)).copied().flatten();
+                                    if let Some(slot) = known_const.get_mut(inst) {
+                                        *slot = kc;
+                                    }
+                                    stats.identities_folded += 1;
+                                    continue;
+                                }
+                            }
+                            // `fabs(fabs(x)) == fabs(x)` (IEEE-754 bit-exact idempotence).
+                            if op == Op::Fabs && a_op == Op::Fabs && a_plain {
+                                if let Some(st) = stands.get_mut(inst) {
+                                    *st = a;
+                                }
+                                let kc = known_const.get(ai).copied().flatten();
+                                if let Some(slot) = known_const.get_mut(inst) {
+                                    *slot = kc;
+                                }
+                                stats.identities_folded += 1;
+                                continue;
+                            }
+                            // `fabs(fneg(x))` canonicalizes to `fabs(x)` via GVN lookup (bit-exact).
+                            let canon_a = if op == Op::Fabs && a_op == Op::Fneg && a_plain {
+                                view.data
+                                    .get(ai)
+                                    .copied()
+                                    .and_then(|ri| stand_of(&stands, ri))
+                                    .unwrap_or(a)
+                            } else {
+                                a
+                            };
+                            let Some(inst_id) = u32::try_from(inst).ok() else { continue };
+                            let key = ENodeKey { op: inst_op_byte(&view, inst), ty: ty.0, cond: 0, a: canon_a, b: 0, c: 0 };
+                            if let Some(prev) = table.get_or_insert(key, inst_id) {
+                                if let Some(st) = stands.get_mut(inst) {
+                                    *st = prev;
+                                }
+                                let kc = known_const.get(u32_ix(prev)).copied().flatten();
+                                if let Some(slot) = known_const.get_mut(inst) {
+                                    *slot = kc;
+                                }
+                                if canon_a != a {
+                                    stats.identities_folded += 1;
+                                } else {
+                                    stats.gvn_hits += 1;
+                                }
+                            }
+                        }
+
+                        // IEEE-754 bit-exact scalar float binary dominator-scoped GVN.
+                        Op::Fadd
+                        | Op::Fsub
+                        | Op::Fmul
+                        | Op::Fdiv
+                        | Op::FminNum
+                        | Op::FmaxNum
+                        | Op::Fminimum
+                        | Op::Fmaximum
+                        | Op::Fcopysign => {
+                            if !(ty.is_scalar() && ty.is_float()) {
+                                continue;
+                            }
+                            if let Some(&raw_at) = view.data.get(inst)
+                                && let Some(at) = usize::try_from(raw_at).ok()
+                                && let (Some(&ra), Some(&rb), Some(inst_id)) = (
+                                    view.extra.get(at),
+                                    at.checked_add(1).and_then(|i| view.extra.get(i)),
+                                    u32::try_from(inst).ok(),
+                                )
+                                && let (Some(a), Some(b)) = (stand_of(&stands, ra), stand_of(&stands, rb))
+                            {
+                                let key = ENodeKey { op: inst_op_byte(&view, inst), ty: ty.0, cond: 0, a, b, c: 0 };
+                                if let Some(prev) = table.get_or_insert(key, inst_id) {
+                                    if let Some(st) = stands.get_mut(inst) {
+                                        *st = prev;
+                                    }
+                                    stats.gvn_hits += 1;
+                                }
+                            }
+                        }
+
+                        Op::Fma => {
+                            if !(ty.is_scalar() && ty.is_float()) {
+                                continue;
+                            }
+                            if let Some(&raw_at) = view.data.get(inst)
+                                && let Some(at) = usize::try_from(raw_at).ok()
+                                && let (Some(&ra), Some(&rb), Some(&rc), Some(inst_id)) = (
+                                    view.extra.get(at),
+                                    at.checked_add(1).and_then(|i| view.extra.get(i)),
+                                    at.checked_add(2).and_then(|i| view.extra.get(i)),
+                                    u32::try_from(inst).ok(),
+                                )
+                                && let (Some(a), Some(b), Some(c)) =
+                                    (stand_of(&stands, ra), stand_of(&stands, rb), stand_of(&stands, rc))
+                            {
+                                let key = ENodeKey { op: inst_op_byte(&view, inst), ty: ty.0, cond: 0, a, b, c };
+                                if let Some(prev) = table.get_or_insert(key, inst_id) {
+                                    if let Some(st) = stands.get_mut(inst) {
+                                        *st = prev;
+                                    }
+                                    stats.gvn_hits += 1;
+                                }
+                            }
+                        }
+
+                        Op::Fcmp => {
+                            if let Some(&raw_at) = view.data.get(inst)
+                                && let Some(at) = usize::try_from(raw_at).ok()
+                                && let (Some(&cond_raw), Some(&ra), Some(&rb), Some(inst_id)) = (
+                                    view.extra.get(at),
+                                    at.checked_add(1).and_then(|i| view.extra.get(i)),
+                                    at.checked_add(2).and_then(|i| view.extra.get(i)),
+                                    u32::try_from(inst).ok(),
+                                )
+                                && let (Some(cond_u8), Some(a), Some(b)) =
+                                    (u8::try_from(cond_raw).ok(), stand_of(&stands, ra), stand_of(&stands, rb))
+                            {
+                                let key = ENodeKey { op: inst_op_byte(&view, inst), ty: ty.0, cond: cond_u8, a, b, c: 0 };
+                                if let Some(prev) = table.get_or_insert(key, inst_id) {
+                                    if let Some(st) = stands.get_mut(inst) {
+                                        *st = prev;
+                                    }
+                                    stats.gvn_hits += 1;
+                                }
+                            }
+                        }
+
                         _ => {}
                     }
                 }
@@ -669,6 +926,7 @@ pub fn aegraph_optimize<A: Allocator + Copy>(
         jump: filled(len, NONE, &alloc),
         devirt: filled(len, NONE, &alloc),
         merge_next: filled(blocks, NONE, &alloc),
+        fma_fuse,
     };
     let rewritten = rebuild(view, &edit, alloc)?;
     let cleaned = dead(rewritten.view(), alloc)?;
@@ -694,7 +952,22 @@ pub const fn op_latency_cycles(op: Op) -> u32 {
         | Op::Icmp
         | Op::Select => 1,
         Op::Mul | Op::Umulhi | Op::Smulhi => 3,
-        Op::Udiv | Op::Sdiv | Op::Urem | Op::Srem => 12,
+        Op::Fneg | Op::Fabs | Op::Fcopysign | Op::Fcmp => 1,
+        Op::Fadd
+        | Op::Fsub
+        | Op::Fmul
+        | Op::Fma
+        | Op::Fmuladd
+        | Op::Floor
+        | Op::Ceil
+        | Op::Ftrunc
+        | Op::Nearest
+        | Op::Fround
+        | Op::FminNum
+        | Op::FmaxNum
+        | Op::Fminimum
+        | Op::Fmaximum => 3,
+        Op::Udiv | Op::Sdiv | Op::Urem | Op::Srem | Op::Fdiv | Op::Sqrt => 12,
         Op::Call | Op::CallIndirect | Op::Invoke | Op::InvokeIndirect => 10,
         _ => 2,
     }
@@ -833,6 +1106,25 @@ const fn is_licm_pure(op: Op) -> bool {
             | Op::Lshr
             | Op::Ashr
             | Op::Icmp
+            | Op::Fcmp
+            | Op::Fadd
+            | Op::Fsub
+            | Op::Fmul
+            | Op::Fdiv
+            | Op::Fneg
+            | Op::Fabs
+            | Op::Sqrt
+            | Op::Floor
+            | Op::Ceil
+            | Op::Ftrunc
+            | Op::Nearest
+            | Op::Fround
+            | Op::FminNum
+            | Op::FmaxNum
+            | Op::Fminimum
+            | Op::Fmaximum
+            | Op::Fcopysign
+            | Op::Fma
             | Op::Select
     )
 }
@@ -1831,5 +2123,88 @@ mod tests {
             let after = eval::run_in(res.func.view(), &args, 100_000, alloc).unwrap();
             assert_eq!(before, after, "SOTA fixpoint changed semantics on ({nv}, {av})");
         }
+    }
+
+    #[test]
+    fn aegraph_float_identities_gvn_and_contract_fma_fusion() {
+        let alloc = Global;
+
+        // 1. IEEE-754 bit-exact identities + GVN (`fneg(fneg(x)) == x`, `fabs(fabs(x)) == fabs(x)`,
+        //    `fabs(fneg(x))` GVN with `fabs(x)`, duplicate `fconst` & `fadd` GVN).
+        let mut b = Builder::<Global, Full>::new_in(64, alloc);
+        let sig1 = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::F64)], &[Param::of(Ty::F64)]);
+        b.set_signature(sig1);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let x = b.param(Ty::F64);
+        let n1 = b.unary(Op::Fneg, Flags::NONE, x);
+        let n2 = b.unary(Op::Fneg, Flags::NONE, n1); // -> x
+        let a1 = b.unary(Op::Fabs, Flags::NONE, x);
+        let a2 = b.unary(Op::Fabs, Flags::NONE, a1); // -> a1
+        let a3 = b.unary(Op::Fabs, Flags::NONE, n1); // -> a1 (via fabs(fneg(x)) == fabs(x))
+        let k1 = b.fconst(Ty::F64, u128::from(2.5_f64.to_bits()));
+        let k2 = b.fconst(Ty::F64, u128::from(2.5_f64.to_bits())); // -> k1
+        let s1 = b.binary(Op::Fadd, Flags::NONE, n2, k1);
+        let s2 = b.binary(Op::Fadd, Flags::NONE, x, k2); // -> s1 (GVN!)
+        let sum1 = b.binary(Op::Fadd, Flags::NONE, a2, a3);
+        let res = b.binary(Op::Fadd, Flags::NONE, sum1, s2);
+        let total = b.binary(Op::Fadd, Flags::NONE, res, s1);
+        b.ret(&[total]);
+        let func = b.finish_checked().unwrap();
+
+        let out = aegraph_optimize(func.view(), alloc).unwrap();
+        assert!(out.stats.identities_folded >= 3, "stats={:?}", out.stats);
+        assert!(out.stats.gvn_hits >= 2, "stats={:?}", out.stats);
+        assert!(out.stats.insts_after < out.stats.insts_before);
+
+        // Bit-for-bit identical across positive, negative, -0.0, +0.0, and NaN!
+        for &xv in &[3.25_f64, -7.5, 0.0, -0.0, f64::NAN] {
+            let args = [Val::Int(u128::from(xv.to_bits()))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(out.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "float aegraph changed bits on {xv:?}");
+        }
+
+        // 2. `Flags::CONTRACT` fuses `fadd(fmul(a, b), c)` into native hardware `Op::Fma(a, b, c)`
+        //    and sweeps dead `fmul`, while `Flags::NONE` leaves it strictly unfused!
+        let build_mac = |flags: Flags| {
+            let mut b = Builder::<Global, Full>::new_in(64, alloc);
+            let sig3 = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::F64), Param::of(Ty::F64), Param::of(Ty::F64)],
+                &[Param::of(Ty::F64)],
+            );
+            b.set_signature(sig3);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::F64);
+            let bv = b.param(Ty::F64);
+            let c = b.param(Ty::F64);
+            let m = b.binary(Op::Fmul, flags, a, bv);
+            let r = b.binary(Op::Fadd, flags, m, c);
+            b.ret(&[r]);
+            b.finish_checked().unwrap()
+        };
+
+        let exact = build_mac(Flags::NONE);
+        let exact_opt = aegraph_optimize(exact.view(), alloc).unwrap();
+        assert_eq!(exact_opt.stats.fma_fusions, 0);
+        assert!(!(0..exact_opt.func.ops.len()).any(|i| exact_opt.func.view().op(i) == Op::Fma));
+
+        let contract = build_mac(Flags::CONTRACT);
+        let contract_opt = aegraph_optimize(contract.view(), alloc).unwrap();
+        assert_eq!(contract_opt.stats.fma_fusions, 1);
+        assert!((0..contract_opt.func.ops.len()).any(|i| contract_opt.func.view().op(i) == Op::Fma));
+        assert!(!(0..contract_opt.func.ops.len()).any(|i| contract_opt.func.view().op(i) == Op::Fmul));
+        let args = [
+            Val::Int(u128::from(3.0_f64.to_bits())),
+            Val::Int(u128::from(4.0_f64.to_bits())),
+            Val::Int(u128::from(5.0_f64.to_bits())),
+        ];
+        assert_eq!(
+            eval::run_in(contract_opt.func.view(), &args, 10_000, alloc).unwrap(),
+            eval::run_in(exact.view(), &args, 10_000, alloc).unwrap(),
+        );
     }
 }

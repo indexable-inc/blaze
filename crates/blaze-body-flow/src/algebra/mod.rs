@@ -737,7 +737,7 @@ fn lift_region<'b, A: Allocator + Copy, R: MathResolver, H: CalleeBodyResolver>(
                             (
                                 PlaceTarget::Bare(local),
                                 Value::Aggregate {
-                                    kind: AggregateKind::Array | AggregateKind::Tuple,
+                                    kind: AggregateKind::Array | AggregateKind::Tuple | AggregateKind::Adt(0),
                                     operands,
                                     ..
                                 },
