@@ -224,16 +224,19 @@ fn the_runs_reader_reads_each_crates_sections_in_place() {
     println!("run records: 3 crates read in place ({} section bytes, 0 copied), a second ask a hit", after.sections);
 }
 
-/// (d) A record this command put and did not commit is lent from the arena: the reader refuses
-/// it BY NAME (`ReadError::NotInPlace`, the arena), never copies it to an aligned place (rule
-/// 3). This is why main.rs commits the request's puts before the run reads its names.
+/// (d) Under `Visibility::AfterCommit`, a record this command put and did not commit is lent from
+/// the unshared arena: the reader refuses it BY NAME (`ReadError::NotInPlace`, the arena), never
+/// copies it to an aligned place (rule 3). Under the live `Visibility::InArena` default, the same
+/// uncommitted record lives in the 16-byte-aligned shared arena and reads in place with 0 copies.
 /// CONTROL: the same record after the commit reads (the test above).
 #[test]
 fn a_record_still_in_the_arena_is_refused_by_name() {
     let (_io, cx) = root_cx(43);
     let g: Alloc<'static> = blaze_own::testing::heap().alloc();
     let crates = stored();
-    let lent = process(Sim::new(43, Faults::default()), 1);
+    let cfg = config(FileName::new("store").expect("a name"), &StoreSettings::default(), Facts { boot: Some(1), nonce: 9101 }, g);
+    let driven = blaze_cas::plain::Driven::with(Sim::new(43, Faults::default()), std::path::Path::new("/"), cfg, g).expect("the store opens");
+    let lent = Lent::with_visibility(driven, g, blaze_cas::plain::Visibility::AfterCommit);
     let mut store = Placed { place: PlainPlace::new(&lent, false), gets: 0 };
     let one = &crates[2];
     store.put(&cx, one.input.at, &one.whole).unwrap_or_else(|e| panic!("the put: {e}"));
@@ -248,6 +251,15 @@ fn a_record_still_in_the_arena_is_refused_by_name() {
         Ok(_) => panic!("an uncommitted record was read: from the arena, not the mapping"),
     }
     assert_eq!(read.counts().copied, 0, "the refusal copied");
+
+    // Companion check under the live `Visibility::InArena` default: the uncommitted put is read
+    // directly from the 16-byte-aligned shared arena with zero copies.
+    let live = process(Sim::new(43, Faults::default()), 2);
+    let mut live_store = Placed { place: PlainPlace::new(&live, false), gets: 0 };
+    live_store.put(&cx, one.input.at, &one.whole).unwrap_or_else(|e| panic!("the put: {e}"));
+    let mut live_read = EngineRecords::new(g);
+    let _ = live_read.records(&cx, &mut live_store, &one.input, one.key, g).unwrap_or_else(|e| panic!("InArena read: {e}"));
+    assert_eq!(live_read.counts().copied, 0, "InArena read copied");
 }
 
 /// (d) A section that does not start at a multiple of sixteen is the typed refusal naming the

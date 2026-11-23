@@ -218,6 +218,17 @@ pub fn start_in<C: Clock + Send + 'static>(
     if let Err(io) = fs::create_dir_all(&config.runs_dir) {
         return Err(ViewerError::RunsDir { path: config.runs_dir, io });
     }
+    // Hold a shared advisory lock (`LOCK_SH`) on `<runs_dir>/viewer.lock` for the viewer's exact
+    // lifetime so `blaze run` and `blaze gc` can probe non-blocking `LOCK_EX` to detect a live
+    // viewer without racing a fast-exiting child's `.telem`/`.meta` cleanup.
+    let viewer_lock_path = config.runs_dir.join(blaze_launch::telemetry::VIEWER_LOCK_LEAF);
+    let viewer_lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&viewer_lock_path)
+        .ok()
+        .and_then(|file| file.try_lock_shared().ok().map(|()| file));
     let bind_addr = SocketAddr::from(([127, 0, 0, 1], config.port));
     let listener = TcpListener::bind(bind_addr).map_err(|io| ViewerError::Bind { addr: bind_addr, io })?;
     let addr = listener.local_addr().map_err(|io| ViewerError::Bind { addr: bind_addr, io })?;
@@ -241,7 +252,7 @@ pub fn start_in<C: Clock + Send + 'static>(
     let thread = thread::Builder::new()
         .name(String::from("blaze-viewer"))
         .spawn(move || {
-            let mut served = Loop::new(&config, listener, watch, alloc.local(), clock.now());
+            let mut served = Loop::new(&config, listener, watch, viewer_lock, alloc.local(), clock.now());
             let ended = served.run(&theirs, &clock);
             drop(served);
             theirs.active_viewers.store(0, Ordering::Release);
@@ -343,6 +354,8 @@ struct Loop<'a> {
     runs_dir: AVec<'a, u8>,
     listener: TcpListener,
     watch: Watch,
+    /// Shared advisory flock on `<runs_dir>/viewer.lock` held for the viewer's lifetime.
+    _viewer_lock: Option<fs::File>,
     pump: Pump<'a, Mapped>,
     conns: AVec<'a, Conn<'a>>,
     next_conn: u64,
@@ -351,13 +364,14 @@ struct Loop<'a> {
 }
 
 impl<'a> Loop<'a> {
-    fn new(config: &ViewerConfig, listener: TcpListener, watch: Watch, alloc: Alloc<'a>, now: Duration) -> Loop<'a> {
+    fn new(config: &ViewerConfig, listener: TcpListener, watch: Watch, viewer_lock: Option<fs::File>, alloc: Alloc<'a>, now: Duration) -> Loop<'a> {
         Loop {
             alloc,
             idle_expiry: config.idle_expiry,
             runs_dir: AVec::from_slice_in(config.runs_dir.as_os_str().as_bytes(), alloc),
             listener,
             watch,
+            _viewer_lock: viewer_lock,
             pump: Pump::new(pump::Config::new(config.idle_expiry), now, alloc),
             conns: AVec::new_in(alloc),
             next_conn: 0,

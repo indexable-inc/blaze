@@ -2189,14 +2189,27 @@ fn checking<'f, 'd>(
         own_frame(|| -> Result<(), CliError> {
             for task in planned.iter().filter(|one| matches!(one.phase.stage, Stage::Scripts | Stage::Names)) {
                 let name = task.name;
-                let Some(row) = start.row_facts(name).map_err(EngineError::from)? else { continue };
+                // One header lookup gives both `facts` and `record` when backed by `stored`
+                // (records.changes is empty here before any stage runs), avoiding a second
+                // `Stored::header(name)` probe per planned Scripts/Names task.
+                let (row, record) = match stored.as_ref() {
+                    Some(last) if records.changes.is_empty() => {
+                        let Some(header) = last.header(name).map_err(crate::engine_answer::page_error)? else { continue };
+                        (header.facts, header.record)
+                    }
+                    _ => {
+                        let Some(row) = start.row_facts(name).map_err(EngineError::from)? else { continue };
+                        let record = if row.failed || name.kind == Kind::Given { None } else { records.get(name)? };
+                        (row, record)
+                    }
+                };
                 if row.phase.stage != task.phase.stage {
                     continue;
                 }
                 let made = if row.failed || name.kind == Kind::Given {
                     None
                 } else {
-                    Some((records.get(name)?.ok_or(EngineCheckError::MissingRecord { name })?, row.out))
+                    Some((record.ok_or(EngineCheckError::MissingRecord { name })?, row.out))
                 };
                 if row.phase.stage == Stage::Scripts {
                     if name.kind == Kind::Script {

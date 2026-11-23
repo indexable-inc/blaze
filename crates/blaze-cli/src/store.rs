@@ -967,6 +967,12 @@ pub(crate) fn post_done_for_daemon(
     err: &Out,
 ) {
     let _ = lent.reclaim_between_requests();
+    // Return idle worker frame shelves, pooled large spans, and warm chunk caches to the OS
+    // (`MADV_FREE_REUSABLE` on macOS, `MADV_DONTNEED` on Linux) after the client has been answered.
+    blaze_mem::frame::ask_spare_trim();
+    let _ = blaze_mem::frame::trim_spare(0);
+    let _ = blaze_mem::frame::trim_span_pool();
+    let _ = blaze_mem::chunks::trim();
     if spawn_bg {
         let cx = cx.span("daemon post-done: spawn detached background gc");
         let _ = home.bg_gc.spawn(&cx, home.dir(), err);

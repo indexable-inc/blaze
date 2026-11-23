@@ -112,6 +112,10 @@ pub struct BodyFrame<'n> {
     /// checks is checked again under both call rules and counted into the cell (one per
     /// worker's stretch). `None`: no census, the path unchanged.
     pub census: Option<&'n super::super::call_census::CensusCell>,
+    /// Stretch-scoped declarative macro preparation table shared across bodies in a stretch so
+    /// each body allocates 0 bytes in `frame` for `Prepares`. `None`: `ProjectWorld::over`
+    /// allocates a fresh one in `frame`.
+    pub prepared: Option<&'n blaze_lower::scoped::Prepares<'n>>,
 }
 
 /// The ask a failed cell belonged to. At import time the checker may have made several
@@ -589,7 +593,7 @@ fn asks_agree(a: &BodyReads<'_>, o: &BodyReads<'_>) -> bool {
 pub fn compare_asks<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, plant: super::super::asks::AsksPlant) -> Result<(), AsksDiffer<'w>> {
     use super::super::asks::AsksMet;
     let run = |met: AsksMet, heads: Option<&'n dyn HeadSeed<'n>>| {
-        let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads, sources: frame.sources, goals: None, census: None };
+        let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads, sources: frame.sources, goals: None, census: None, prepared: frame.prepared };
         let mut recorder = Recorder::new(RecorderOpts { alloc: work });
         record_body_as(tables, task, &shadow, work, &mut recorder, None, Coverage::WithLocals, ReadReport::Sorted, met)
     };
@@ -814,7 +818,7 @@ impl core::fmt::Debug for RepeatsDiffer<'_> {
 /// two sides' tallies, `Offer`'s then `Quiet`'s (zero for two equal refusals).
 pub fn compare_repeats<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, plant: RepeatsPlant) -> Result<(super::recorder::ReadTally, super::recorder::ReadTally), RepeatsDiffer<'w>> {
     use super::recorder::Repeats;
-    let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads: frame.heads, sources: frame.sources, goals: None, census: None };
+    let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads: frame.heads, sources: frame.sources, goals: None, census: None, prepared: frame.prepared };
     let run = |repeats: Repeats, drop: Option<NameCell>| {
         let mut recorder = Recorder::new(RecorderOpts { alloc: work });
         recorder.set_repeats(repeats);
@@ -862,7 +866,11 @@ fn body_world<'v, 'n, 'w>(view: Tables<'v, 'n>, name: Name, frame: &BodyFrame<'n
     let index = Index::from_source(view, lang_crates).map_err(TaskError::Lang)?;
     view.records().name_lang_crates(lang_crates);
     let front = Front2 { names: view, resolver: crate::resolve::Paths { names: view }, texts: Texts::empty(), keys: Keys::new(), index, frame: frame.frame };
-    let mut world = blaze_own::Box::new_in(ProjectWorld::over(front, frame.alloc), alloc);
+    let world = match frame.prepared {
+        Some(prepared) => ProjectWorld::over_prepared(front, prepared, frame.alloc),
+        None => ProjectWorld::over(front, frame.alloc),
+    };
+    let mut world = blaze_own::Box::new_in(world, alloc);
     world.record_const_texts();
     world.set_cost(frame.cost);
     world.set_needs(frame.needs);
@@ -1742,7 +1750,7 @@ mod read_id_tests {
         let (records, _, frame) = world_of("#![no_std]\npub fn base() -> u8 { 1u8 }\npub fn left() -> u8 { base() }\npub fn right() -> u16 { base() }");
         let unused = Recorder::new(RecorderOpts { alloc: a() });
         let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[CORE_AT], reads: &unused });
-        let frame = BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: None, census: None };
+        let frame = BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: None, census: None, prepared: None };
         let heads = cells(records);
         let mut entry = Recorder::new(RecorderOpts { alloc: a() });
         let mut encoding = AString::new_in(a());

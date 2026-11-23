@@ -102,7 +102,9 @@ impl Joined {
 const STORE_TAGS: u64 = 1 << 50;
 
 /// Past this many uncommitted bytes in the arena, a put commits first.
-pub(crate) const COMMIT_BYTES: u64 = 256 << 20;
+/// 64 MiB bounds the transient `Arena + lay_out` commit spike to ~128 MiB on large cold builds
+/// while incremental edits (a few KB to a few MB) still commit once after the answer.
+pub(crate) const COMMIT_BYTES: u64 = 64 << 20;
 
 /// THE PUT PATH'S SEAM (blaze-cas plain/arena.rs, rule 78): where a reader finds a record this
 /// command put and has not committed. `AfterCommit` (today's): each phase commits its puts

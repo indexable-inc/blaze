@@ -21,7 +21,7 @@ use super::engine_check_tests::{engine_opts, opts, profile};
 /// The member's bodies, `std`'s types, and how many of them each body calls.
 const BODIES: usize = 300;
 const TYPES: usize = 64;
-const PER: usize = 40;
+const PER: usize = 60;
 
 /// The most a body's row may hold in the request's arena on this fixture. Its floor: `Done`
 /// (about 180 bytes) and its cells at their length (about 81 bytes each): `std`'s and core's
@@ -444,13 +444,21 @@ fn crate_archive(name: &str, source: &str) -> ([u8; 32], blaze_own::Vec<u8, blaz
 }
 
 /// Two registry dependencies, `dep` of `dep_source` and `pin` of [`BYTE`], both in cargo's cache
-/// and both pinned by the lock.
+/// and both pinned by the lock for a 2-member workspace (`a` -> `dep`, `b` -> `pin`).
 fn two_registry(io: &Io, dep_source: &str) {
     let (dep_sum, dep) = crate_archive("dep", dep_source);
     let (pin_sum, pin) = crate_archive("pin", BYTE);
     let hex = |sum: [u8; 32]| std::string::String::from(core::str::from_utf8(&crate::fetch::key_hex(&blaze_ids::ContentId(sum))).expect("hex digits"));
     let entry = |name: &str, sum: [u8; 32]| format!("[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{}\"\n", hex(sum));
-    write(io, "Cargo.lock", &format!("version = 4\n\n[[package]]\nname = \"wide\"\nversion = \"0.1.0\"\ndependencies = [\n \"dep\",\n \"pin\",\n]\n\n{}\n{}", entry("dep", dep_sum), entry("pin", pin_sum)));
+    write(
+        io,
+        "Cargo.lock",
+        &format!(
+            "version = 4\n\n[[package]]\nname = \"a\"\nversion = \"0.1.0\"\ndependencies = [\n \"dep\",\n]\n\n[[package]]\nname = \"b\"\nversion = \"0.1.0\"\ndependencies = [\n \"pin\",\n]\n\n{}\n{}",
+            entry("dep", dep_sum),
+            entry("pin", pin_sum)
+        ),
+    );
     let cx = io.cx(BUDGET, TASK_FRAME).expect("simulated filesystem");
     let fs = io.need_fs().expect("files");
     for (name, archive) in [("dep", &dep), ("pin", &pin)] {
@@ -465,18 +473,21 @@ fn bodies_entered(answer: &Answer) -> u32 {
 }
 
 /// A DEPENDENCY BUMPED ENTERS ONLY THE BODIES THAT READ IT (D187: the graph's crate cells,
-/// engine_units.rs `crate_cell`). Two registry dependencies, `dep` and `pin`, and two bodies,
-/// `caller` reading `dep` and `pinned` reading `pin`. `dep`'s archive is replaced (its checksum,
-/// so its crate key, moves); `pin` and both callers' text stand. Only `caller` enters, on a
-/// graph crate cell, and its answer equals a fresh check's. CONTROL (the cause removed, rule 23):
-/// with the graph's whole cell read for every settled crate (`PLANT_WHOLE_GRAPH`, the grain
-/// before D187), the same bump enters both bodies.
+/// engine_units.rs `crate_cell`). Two workspace members (`a` depending on `dep`, `b` depending on
+/// `pin`) and two bodies, `a::caller` reading `dep` and `b::pinned` reading `pin`. `dep`'s archive
+/// is replaced (its checksum, so its crate key and `a`'s key, move); `pin`, `b`, and both callers'
+/// text stand. Only `a::caller` enters, on a graph crate cell, and its answer equals a fresh
+/// check's. CONTROL (the cause removed, rule 23): with the graph's whole cell read for every
+/// settled crate (`PLANT_WHOLE_GRAPH`, the grain before D187), the same bump enters both bodies.
 #[test]
 fn a_dependency_bumped_enters_only_the_bodies_that_read_it() {
     for plant in [false, true] {
         let io = Io::simulated(SimWorld::new(73, Limits::USUAL));
-        write(&io, "Cargo.toml", &format!("{MANIFEST}\n[dependencies]\ndep = \"1\"\npin = \"1\"\n"));
-        write(&io, "src/lib.rs", "pub fn caller() -> u8 {\n    dep::value()\n}\n\npub fn pinned() -> u8 {\n    pin::value()\n}\n");
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n");
+        write(&io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ndep = \"1\"\n");
+        write(&io, "a/src/lib.rs", "pub fn caller() -> u8 {\n    dep::value()\n}\n");
+        write(&io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\npin = \"1\"\n");
+        write(&io, "b/src/lib.rs", "pub fn pinned() -> u8 {\n    pin::value()\n}\n");
         crate::engine_scope_reads::PLANT_WHOLE_GRAPH.with(|p| p.set(plant));
         two_registry(&io, BYTE);
         let cold = dependency_answer(&io, false);
@@ -495,7 +506,7 @@ fn a_dependency_bumped_enters_only_the_bodies_that_read_it() {
             assert_eq!(entered, 4, "CONTROL: the whole graph's cell read by both bodies enters both, 2 rows each (D191)");
             continue;
         }
-        assert_eq!(entered, 2, "only `caller` reads `dep`, in its 2 units' rows (D191): {:?}", edited.checked.because);
+        assert_eq!(entered, 2, "only `a::caller` reads `dep`, in its 2 units' rows (D191): {:?}", edited.checked.because);
         assert!(edited.checked.because.iter().any(|(group, count)| group.stage == blaze_engine::Stage::Bodies && group.cell == Some(crate::engine_scope_reads::CellKind::GraphCrate) && *count == 2), "entered on `dep`'s graph crate cell, both of caller's rows (D191): {:?}", edited.checked.because);
     }
 }

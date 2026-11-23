@@ -1257,6 +1257,9 @@ impl Pool {
             let woke = if self.visible(at) || shared.stop.0.load(Ordering::Acquire) {
                 shared.idle.back(&worker.mark)
             } else {
+                // Honor any pending cross-thread spare-frame trim request before parking idle
+                // (`blaze_mem::frame::ask_spare_trim`): 1 relaxed atomic load on the fast path.
+                let _ = blaze_mem::frame::settle_spare();
                 let clock = &self.0.clock;
                 let parked = worker.parker.park("bstd.task.worker.idle", Some(Deadline::after(clock.now(), PARK_SLICE)), clock);
                 let woke = shared.idle.back(&worker.mark);
