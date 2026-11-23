@@ -4396,7 +4396,7 @@ impl<'n> Store<'n> {
             let schema = tc::RecordSchema::of_sorted_names(&sorted_names);
             let rk = schema.defaults_key();
             let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
-            let mut defaults = Default::default();
+            let mut defaults = blaze_own::Vec::with_capacity_in(named.len(), alloc);
             for (j, &(_, _, _, fty, fdefault)) in named.iter().enumerate() {
                 let Some(c) = fdefault else {
                     defaults.push(None);
@@ -4447,7 +4447,7 @@ impl<'n> Store<'n> {
                 self.fns.insert(dk, row);
                 defaults.push(Some(dk));
             }
-            self.field_defaults.insert(rk, defaults);
+            self.field_defaults.insert(rk, defaults.into_iter().collect());
         }
         Ok(())
     }
