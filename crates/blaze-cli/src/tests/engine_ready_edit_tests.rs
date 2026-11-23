@@ -37,7 +37,7 @@
 
 use super::*;
 
-use super::engine_check_tests::{engine_opts, opts};
+use super::engine_check_tests::{engine_opts, opts, profile};
 use crate::engine_answer::StoredKeys;
 use crate::engine_ready_edit::{CommitPlant, Driver};
 
@@ -549,11 +549,11 @@ fn the_ready_setup_reads_back_only_the_visited_members_outlines() {
         assert_eq!(ready_keys.root, phases_keys.root, "{crates} crates: the ready edit's root is the phase path's");
         assert_eq!(ready_keys.pages, phases_keys.pages, "{crates} crates: every page key equal");
         assert_eq!(ready_lines, phases_lines, "{crates} crates: one print");
-        // The visited member's submodule, and the root of each member it depends on,
-        // transitively (`c0` to `c{EDITED - 1}`: a body may read their items' text, engine_bodies.rs
-        // `ready_reads`); never the members past it.
-        let expected = u32::try_from(EDITED).unwrap_or(u32::MAX) + 1;
-        assert_eq!(ready.files.read_back, expected, "{crates} crates: the ready setup reads back the visited member's submodule and its member dependencies' trees alone (outlined {}, rows read {})", ready.files.outlined, ready.plan.files_read);
+        // Only the visited member's submodule (`m.rs`) is read back: transitive member
+        // dependencies (`c0` to `c{EDITED - 1}`) are never eagerly read back upfront (any file
+        // text a checked body actually asks is outlined lazily on demand).
+        let expected = 1u32;
+        assert_eq!(ready.files.read_back, expected, "{crates} crates: the ready setup reads back the visited member's submodule alone (outlined {}, rows read {})", ready.files.outlined, ready.plan.files_read);
         assert_eq!(ready.files.outlined, 1, "{crates} crates: the ready setup outlines the edited file alone");
         assert!(phases.files.read_back >= u32::try_from(crates).unwrap_or(u32::MAX), "{crates} crates: the phase path's setup reads back every unedited file ({})", phases.files.read_back);
         bars.push((ready.files.read_back, ready.plan.files_read));
@@ -808,4 +808,207 @@ fn driver_auto_uses_ready_on_body_edits_and_falls_back_cleanly_to_phases() {
     write(&auto_io, &std::format!("c{EDITED}/src/lib.rs"), &with_mod_body);
     let again_auto = checked_on(&auto_io, Driver::Auto).expect("Driver::Auto ready again after fallback");
     assert_eq!(again_auto.stored.expect("again stored").header_shards_read, 0, "Driver::Auto resumed ready fast path");
+}
+
+/// Static `ScriptRunner` that records a `file:pkg/data/in.txt` checkout read without leaking memory.
+struct StaticScriptReadRunner;
+
+struct ReadyTestNoStamps;
+
+impl crate::sweep::Stamps for ReadyTestNoStamps {
+    fn stamp(&self, _: &str, _: &bstd::fs::Meta) -> Option<crate::sweep::Stamp> {
+        None
+    }
+
+    fn swept_at_ns(&self) -> u64 {
+        0
+    }
+
+    fn granularity_ns(&self) -> u64 {
+        1
+    }
+}
+
+impl crate::engine_scripts::ScriptRunner for StaticScriptReadRunner {
+    fn run(
+        &self,
+        cx: &bstd::Cx,
+        root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
+        name: blaze_drive::Name,
+        kept: Option<crate::engine_scripts::KeptReads>,
+        _: &[(blaze_drive::Input, &[u8])],
+    ) -> crate::scripts::PooledScript {
+        use crate::engine_script_reads::{self as reads, ReadKind};
+        let frame = cx.frame();
+        let (_, _, answer) = reads::now(cx, root, &ReadyTestNoStamps, crate::sweep::Plant::None, ReadKind::File, "pkg/data/in.txt", None, frame)
+            .expect("script read answered");
+        let pooled = |did: crate::scripts::Ran, checkout| crate::scripts::PooledScript { did: Ok(did), used: 0, ns: 0, checkout, unkept: None };
+        let (stage_plant, _) = kept.expect("script runner has kept reads");
+        let subject = "file:pkg/data/in.txt";
+        let digest = (answer != reads::NONE).then_some(answer);
+        let cells = reads::cells_of(core::iter::once((subject, digest)), stage_plant).expect("cell made");
+        let read_rows: std::vec::Vec<_> = cells.iter().map(|read| (read.name(), read.answer)).collect();
+        let erased = blaze_own::Erased::new(blaze_own::testing::heap().alloc());
+        let printed = if answer == blaze_proc_macro::script_sandbox::file_answer(b"one\n") {
+            &b"cargo::rustc-cfg=pkg_flag\n"[..]
+        } else {
+            &b""[..]
+        };
+        let outputs = blaze_build_script::outputs::Outputs::read(printed, "/out", blaze_build_script::instr::OutputLimits::DEFAULT, erased.handle())
+            .expect("script output reads");
+        match crate::scripts::outputs_record(name, &read_rows[..], crate::scripts::RanAs::Wasm, &outputs, "pkg") {
+            made @ crate::scripts::Ran::Made(_) => pooled(made, cells),
+            failed => pooled(failed, reads::ReadList::new_in(blaze_own::testing::heap().shared())),
+        }
+    }
+}
+
+static SCRIPT_READ_RUNNER: StaticScriptReadRunner = StaticScriptReadRunner;
+
+/// Monster #3: a moved `Given` checkout read (e.g. a computed `include_str!`) whose woken readers
+/// contain 0 `Script` tasks stays on `Driver::Ready` and matches `Driver::Phases` byte-for-byte
+/// (both for a pure data-file edit and for a `.rs` body edit of a file that is ALSO read via
+/// `include_str!`, like Tempo's `crates/chainspec/src/spec.rs`). When a `Script` task wakes from
+/// the `Given`, `Driver::Ready` refuses with `PhasesWhy::ScriptRead` and `Driver::Auto` falls back
+/// cleanly to `Phases`.
+#[test]
+fn given_edit_with_body_readers_stays_on_ready_and_script_reader_refuses_to_phases() {
+    use crate::engine_ready_edit::{PhasesWhy, ReadyRefused};
+
+    // Part A: `Given` read only by `BodyCheck` (0 `Script` readers).
+    let setup_body_given = |seed: u64| -> Io {
+        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\"]\nresolver = \"2\"\n");
+        write(&io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        write(&io, "a/assets/g.json", "{\"v\":1}\n");
+        write(&io, "a/src/spec.rs", "pub fn spec_val() -> u32 {\n    1\n}\n");
+        write(
+            &io,
+            "a/src/lib.rs",
+            "#[rustc_builtin_macro]\nmacro_rules! include_str { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! concat { () => {} }\nmod spec;\npub fn read_data() -> usize {\n    let _a = include_str!(concat!(\"../assets/\", \"g.json\"));\n    let _b = include_str!(concat!(\"\", \"spec.rs\"));\n    spec::spec_val() as usize\n}\n",
+        );
+        let (_, cold) = engine_opts(&io, opts(&io, 2, true));
+        assert!(cold.stored.is_some(), "cold stored");
+        io
+    };
+
+    let ready_io = setup_body_given(91);
+    let phases_io = setup_body_given(91);
+
+    // 1. Pure `Given` data-file edit (`a/assets/g.json`): stays on `ready` and equals `Phases`.
+    write(&ready_io, "a/assets/g.json", "{\"v\":2}\n");
+    write(&phases_io, "a/assets/g.json", "{\"v\":2}\n");
+    let r1 = checked_on(&ready_io, Driver::Ready).expect("pure Given edit stays on ready");
+    let p1 = checked_on(&phases_io, Driver::Phases).expect("pure Given edit on phases");
+    let r1_stored = r1.stored.expect("r1 stored");
+    let p1_stored = p1.stored.expect("p1 stored");
+    assert_eq!(r1_stored.header_shards_read, 0, "pure Given edit took ready");
+    assert_eq!(r1_stored.root, p1_stored.root, "pure Given edit root equals Phases");
+    assert_eq!(r1_stored.pages, p1_stored.pages, "pure Given edit pages equal Phases");
+    let r1_prof = profile(&ready_io);
+    assert!(r1_prof.contains("driver: ready"), "profile names ready:\n{r1_prof}");
+    assert!(r1_prof.contains("2 Given"), "profile counts both discovered Given tasks on first edit after cold:\n{r1_prof}");
+    assert!(r1_prof.contains("bodies memory: 2 bodies"), "each woken body ran once (Tick-1 Given peek):\n{r1_prof}");
+
+    // 2. `.rs` body edit in `a/src/spec.rs` (both `Slot` AND `Given` move): stays on `ready`!
+    write(&ready_io, "a/src/spec.rs", "pub fn spec_val() -> u32 {\n    2\n}\n");
+    write(&phases_io, "a/src/spec.rs", "pub fn spec_val() -> u32 {\n    2\n}\n");
+    let r2 = checked_on(&ready_io, Driver::Ready).expect("Slot+Given body edit stays on ready");
+    let p2 = checked_on(&phases_io, Driver::Phases).expect("Slot+Given body edit on phases");
+    let r2_stored = r2.stored.expect("r2 stored");
+    let p2_stored = p2.stored.expect("p2 stored");
+    assert_eq!(r2_stored.header_shards_read, 0, "Slot+Given body edit took ready");
+    assert_eq!(r2_stored.root, p2_stored.root, "Slot+Given body edit root equals Phases");
+    assert_eq!(r2_stored.pages, p2_stored.pages, "Slot+Given body edit pages equal Phases");
+    let r2_prof = profile(&ready_io);
+    assert!(r2_prof.contains("driver: ready"), "Slot+Given profile names ready:\n{r2_prof}");
+    assert!(r2_prof.contains("1 Given"), "only the edited spec.rs Given entered:\n{r2_prof}");
+
+    // Part B: `Given` read by a `Script` (build.rs) refuses `ready` with `PhasesWhy::ScriptRead`
+    // and falls back cleanly on `Driver::Auto`.
+    let setup_script_given = |seed: u64| -> Io {
+        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"pkg\", \"app\"]\nresolver = \"2\"\n");
+        write(&io, "pkg/Cargo.toml", "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n");
+        write(&io, "pkg/build.rs", "fn main() {}\n");
+        write(&io, "pkg/src/lib.rs", "#[cfg(pkg_flag)]\npub fn f() -> u8 { 1 }\n#[cfg(not(pkg_flag))]\npub fn f() -> u8 { 2 }\n");
+        write(&io, "pkg/data/in.txt", "one\n");
+        write(&io, "app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\npkg = { path = \"../pkg\" }\n");
+        write(&io, "app/src/lib.rs", "pub fn g() -> u8 { pkg::f() }\n");
+        let (_, cold) = crate::engine_scripts::with_runner(&SCRIPT_READ_RUNNER, || engine_opts(&io, opts(&io, 2, true)));
+        assert!(cold.stored.is_some(), "script cold stored");
+        io
+    };
+
+    let strict_io = setup_script_given(92);
+    let auto_io = setup_script_given(92);
+    let ref_io = setup_script_given(92);
+    write(&strict_io, "pkg/data/in.txt", "two\n");
+    write(&auto_io, "pkg/data/in.txt", "two\n");
+    write(&ref_io, "pkg/data/in.txt", "two\n");
+
+    let refused = crate::engine_scripts::with_runner(&SCRIPT_READ_RUNNER, || checked_on(&strict_io, Driver::Ready));
+    match refused {
+        Err(CliError::EngineCheck(engine_check::EngineCheckError::ReadyRefused(ReadyRefused::Root(PhasesWhy::ScriptRead)))) => {}
+        Ok(_) => panic!("expected ReadyRefused::Root(PhasesWhy::ScriptRead) when Script reads Given, got Ok"),
+        Err(other) => panic!("expected ReadyRefused::Root(PhasesWhy::ScriptRead) when Script reads Given, got Err: {other}"),
+    }
+
+    let auto = crate::engine_scripts::with_runner(&SCRIPT_READ_RUNNER, || checked_on(&auto_io, Driver::Auto))
+        .expect("Driver::Auto falls back cleanly when Script reads Given");
+    let phases = crate::engine_scripts::with_runner(&SCRIPT_READ_RUNNER, || checked_on(&ref_io, Driver::Phases))
+        .expect("Driver::Phases on Script-read Given");
+    assert_eq!(
+        auto.stored.expect("auto stored").root,
+        phases.stored.expect("phases stored").root,
+        "Driver::Auto ScriptRead fallback equals Phases",
+    );
+    let auto_prof = profile(&auto_io);
+    assert!(auto_prof.contains("driver: phases (a build script's read of the checkout moved"), "profile explains ScriptRead fallback:\n{auto_prof}");
+}
+
+/// Monsters #1 & #2: multiple ready `BodyCheck` tasks execute cleanly with `workers > 1`, use
+/// lazy seeding (`LazyBodySeed`), lazily outline any transitive member dependency file actually
+/// queried (`const` in `c0`) without reading back unused transitive outlines upfront, and match
+/// `Driver::Phases` byte-for-byte.
+#[test]
+fn multiple_ready_bodies_execute_cleanly_in_parallel_and_match_phases() {
+    let setup = |seed: u64| -> Io {
+        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+        chain(&io, 8);
+        // Add a `const` in `c0` (a transitive dependency of `c5`) and 4 functions in `c5`.
+        write(&io, "c0/src/lib.rs", &std::format!("pub const C0_VAL: u8 = 7;\n{}", lib(0, None)));
+        write(
+            &io,
+            "c5/src/lib.rs",
+            "pub fn f5() -> u8 { c4::g4() + 1 }\npub fn g5() -> u8 { c3::g3() + 2 }\npub fn h5() -> u8 { c2::g2() + 3 }\npub fn k5() -> u8 { c0::C0_VAL + 4 }\n",
+        );
+        // Let `c5` also depend directly on `c0` so `k5` evaluates `c0::C0_VAL`.
+        write(
+            &io,
+            "c5/Cargo.toml",
+            "[package]\nname = \"c5\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nc0 = { path = \"../c0\" }\nc2 = { path = \"../c2\" }\nc3 = { path = \"../c3\" }\nc4 = { path = \"../c4\" }\n",
+        );
+        let (_, cold) = engine_opts(&io, opts(&io, 4, true));
+        assert!(cold.stored.is_some(), "cold stored");
+        io
+    };
+
+    let ready_io = setup(93);
+    let phases_io = setup(93);
+    let edited_src = "pub fn f5() -> u8 { c4::g4() + 10 }\npub fn g5() -> u8 { c3::g3() + 20 }\npub fn h5() -> u8 { c2::g2() + 30 }\npub fn k5() -> u8 { c0::C0_VAL + 40 }\n";
+    write(&ready_io, "c5/src/lib.rs", edited_src);
+    write(&phases_io, "c5/src/lib.rs", edited_src);
+
+    let ready = checked_on(&ready_io, Driver::Ready).expect("parallel ready bodies check cleanly");
+    let phases = checked_on(&phases_io, Driver::Phases).expect("phases reference");
+    let ready_stored = ready.stored.expect("ready stored");
+    let phases_stored = phases.stored.expect("phases stored");
+    assert_eq!(ready_stored.header_shards_read, 0, "took ready path");
+    assert_eq!(ready.files.read_back, 0, "no transitive member dep outlines read back upfront");
+    assert_eq!(ready.stages[blaze_engine::Stage::Bodies.index()].entered, 8, "4 edited functions x 2 units = 8 BodyCheck tasks");
+    assert_eq!(ready_stored.root, phases_stored.root, "parallel ready bodies root equals Phases");
+    assert_eq!(ready_stored.pages, phases_stored.pages, "parallel ready bodies pages equal Phases");
+    let prof = profile(&ready_io);
+    assert!(prof.contains("bodies memory: 8 bodies"), "every body ran exactly once:\n{prof}");
 }

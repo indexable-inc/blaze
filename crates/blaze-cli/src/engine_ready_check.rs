@@ -319,6 +319,33 @@ impl<'a> TaskKind<'a, Cx> for FileItemsKind<'_, '_> {
     }
 }
 
+/// `Given`: one checkout read (planned by `engine_script_reads::plan` from today's leaf rows,
+/// e.g. a data file read by a body via `include_str!`). Defines its `WHOLE` cell as today's
+/// answer digest, reading nothing: stands by its key, identical to the phase path's `ScriptsStage`.
+pub(crate) struct GivenKind<'p, 'a, 'f> {
+    pub(crate) given: &'p [(Name, ContentId)],
+    pub(crate) sink: &'p Sink<'a, 'f>,
+}
+
+impl<'a> TaskKind<'a, Cx> for GivenKind<'_, 'a, '_> {
+    fn facts(&self) -> KindFacts {
+        KindFacts { kind: Kind::Given, stage: Stage::Scripts, grows_into: None }
+    }
+
+    fn plan(&self, ask: Ask, _out: &mut SVec<'a, Planned>) -> Result<(), Refusal> {
+        Err(Refusal::CannotPlan { kind: Kind::Given, ask })
+    }
+
+    fn run(&self, _cx: &Cx, src: &Recorded<'_, 'a>, task: &Task, out: &mut Out<'a>) -> Ran<'a> {
+        let name = task.planned.name;
+        let Some(&(_, answer)) = self.given.binary_search_by_key(&name, |(one, _)| *one).ok().and_then(|at| self.given.get(at)) else {
+            return self.sink.fail(name, KindError::Host { task: name, what: "a `Given` task whose answer is not in today's planned checkout reads (engine_ready_check.rs `GivenKind`)" });
+        };
+        let done = crate::engine_script_reads::given_done(task, answer, out.alloc());
+        ran_of(src, done, Standing::As(Stands::ByKey), out)
+    }
+}
+
 /// `Lint`: one lint unit of an edited file (planned by `file_tasks`, engine_lints.rs `plan`).
 /// Its row was made by its file's one walk before the drive ([`walk_lints`]) and parked in the
 /// [`Sink`]; the run takes it (a kind answers one name a run, shell.rs `TaskKind::run`, so the
@@ -379,6 +406,7 @@ impl CellDigests for HostCells<'_, '_, '_> {
 pub(crate) struct BodyKind<'p, 'f, 'r, 'a> {
     pub(crate) runner: Option<BodyRunner<'p, 'f, 'r>>,
     pub(crate) sink: &'p Sink<'a, 'f>,
+    pub(crate) given_entering: &'p [Name],
 }
 
 impl<'a> TaskKind<'a, Cx> for BodyKind<'_, '_, '_, 'a> {
@@ -399,12 +427,16 @@ impl<'a> TaskKind<'a, Cx> for BodyKind<'_, '_, '_, 'a> {
         let Some(runner) = self.runner.as_ref() else {
             return self.sink.fail(name, KindError::Host { task: name, what: "a body to check, but its setup stopped before any crate was read and decided every row (engine_bodies.rs `groups`)" });
         };
-        // Check whether the body's own `FileItems` (`task.planned.file`) and member `CrateScope`
-        // are final before opening scope crates or typechecking: when an edited file's `FileItems`
-        // is still running in the same tick, every `BodyCheck` would otherwise open its scope
-        // crates, typecheck, and discard all work with `Ran::Need` at `ran_of`. Peeking finality
-        // up front fails in O(1) and parks the body until `FileItems` merges so each body runs once.
+        // Check whether the body's own `FileItems` (`task.planned.file`), any entering `Given`
+        // cells, and the member's `CrateScope` are final before opening scope crates or
+        // typechecking: when an edited file's `FileItems` or `Given` is still running in Tick 1,
+        // every `BodyCheck` would otherwise open its scope crates, typecheck, and discard all work
+        // with `Ran::Need` at `ran_of`. Peeking finality up front fails in O(1) and parks the body
+        // until Tick 1 merges so each body runs once.
         let _ = src.row(task.planned.file);
+        for &given in self.given_entering {
+            let _ = src.peek(&CellId { of: given, cell: crate::engine_tasks::WHOLE });
+        }
         if let Some(own) = runner.own_scope_cell(name) {
             let _ = src.peek(&own);
         }
@@ -469,6 +501,8 @@ pub(crate) fn drive_edit<'a, 'f>(
     cx: &Cx,
     engine: blaze_engine::Engine<'a, crate::engine_ready_edit::Entering<'_>>,
     lint_tasks: &[Task],
+    given_answers: &[(Name, ContentId)],
+    given_entering: &[Name],
     outlined: &[Outlined<'_>],
     root: &Dir<ReadWrite>,
     stages: Stages<'_, 'f, '_, 'a>,
@@ -481,9 +515,10 @@ pub(crate) fn drive_edit<'a, 'f>(
     // The kinds borrow the sink for the drive alone: it is taken whole after it.
     let drove = {
         let outlines = FileItemsKind { outlined };
+        let given = GivenKind { given: given_answers, sink: &sink };
         let lint = LintKind { sink: &sink };
-        let body = BodyKind { runner: stages.runner, sink: &sink };
-        let list: [&dyn TaskKind<'a, Cx>; 3] = [&outlines, &lint, &body];
+        let body = BodyKind { runner: stages.runner, sink: &sink, given_entering };
+        let list: [&dyn TaskKind<'a, Cx>; 4] = [&outlines, &given, &lint, &body];
         let kinds = blaze_engine::kinds::Kinds::new(&list).map_err(EngineCheckError::ReadyKinds)?;
         // Every other kind is the plan's and stood (kinds.rs `KindTable::stood`): its rows served
         // as stored, and a name of it with no row that nothing plans or owes read as absent, as
@@ -507,8 +542,12 @@ pub(crate) fn drive_edit<'a, 'f>(
     Ok(Driven { finished, sunk, panicked })
 }
 
-/// A body run's frame, as the phase path's (engine_bodies.rs): one task a job.
+/// A lint walk's frame, as the phase path's: one file a job.
 const READY_FRAME: usize = 1 << 28;
+/// A ready engine task's frame: `FileItems`, `Given`, and `Lint` use almost none, and `BodyCheck`
+/// reserves its own stretch/scratch frames (`BODIES_FRAME`/`BODY_SCRATCH`), so a 4 MiB reserve
+/// avoids 256 MiB mmap/munmap churn on every tick's jobs.
+const READY_TASK_FRAME: usize = 4 << 20;
 
 /// The command's workers as the shell's pool (blaze-engine shell.rs `Pool`): each job of a
 /// batch spawned on the request's scope with its own frame, its run timed on the command's
@@ -535,15 +574,28 @@ impl<'a> blaze_engine::shell::Pool<'a> for Workers<'_> {
     }
 
     fn run(&mut self, jobs: &mut [blaze_engine::shell::Job<'a>], until: blaze_engine::code_pool::Time, work: &(dyn Fn(&Cx, &mut blaze_engine::shell::Job<'a>) + Sync)) {
+        let start = self.start;
+        if jobs.len() <= 1 || self.workers.get() <= 1 {
+            for job in jobs.iter_mut() {
+                let began = at(start, self.clock.now());
+                if began.0 > until.0 {
+                    continue;
+                }
+                if crate::work::unwinding(|| work(self.cx, job)).is_err() {
+                    job.panicked();
+                }
+                job.timed(began, at(start, self.clock.now()));
+            }
+            return;
+        }
         let cx = self.cx.span("engine: a ready batch");
         let scope = cx.scope();
         scope.narrow_workers(self.workers, bstd::task::Class::Foreground);
-        let start = self.start;
         // The handles live in the batch's span frame (rule 11), not a global heap.
         let mut running = blaze_own::Vec::with_capacity_in(jobs.len(), cx.frame());
         for job in jobs.iter_mut() {
             let clock = self.clock.clone();
-            running.push(scope.may_overlap("engine ready task", READY_FRAME, move |cx: &Cx| {
+            running.push(scope.may_overlap("engine ready task", READY_TASK_FRAME, move |cx: &Cx| {
                 let began = at(start, clock.now());
                 // A job not started by the deadline is left unrun (shell.rs `Pool::run`).
                 if began.0 > until.0 {
