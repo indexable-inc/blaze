@@ -439,6 +439,41 @@ impl<'a> Lines<'a> {
         Ok(kept)
     }
 
+    /// Of a standing row's block as the last record holds it, keep only entries whose finding
+    /// rule equals `rule` (`matching == true`) or every other entry (`matching == false`), in
+    /// order. Used to keep manifest task findings separate from tail-computed `UNUSED_DEPENDENCY`
+    /// warnings across incremental runs.
+    pub(crate) fn keep_split_rule(&mut self, name: Name, entries: &'a [u8], rule: u16, matching: bool) -> Result<usize, LinesError> {
+        let mut reader = Reader { bytes: entries, at: 0 };
+        let mut kept = 0usize;
+        let mut total = 0usize;
+        while reader.at < entries.len() {
+            let is_rule = matches!(entry(&mut reader)?, Entry::Finding { rule: r, .. } if r == rule);
+            total += 1;
+            if is_rule == matching {
+                kept += 1;
+            }
+        }
+        if kept == 0 {
+            return Ok(0);
+        }
+        if kept == total {
+            self.keep(name, entries);
+            return Ok(kept);
+        }
+        let mut reader = Reader { bytes: entries, at: 0 };
+        while reader.at < entries.len() {
+            let from = reader.at;
+            let is_rule = matches!(entry(&mut reader)?, Entry::Finding { rule: r, .. } if r == rule);
+            if is_rule == matching
+                && let Some(slice) = entries.get(from..reader.at)
+            {
+                self.block(name).extend_from_slice(slice);
+            }
+        }
+        Ok(kept)
+    }
+
     /// The blocks in name order.
     pub(crate) fn blocks(&self) -> impl Iterator<Item = (Name, &[u8])> + Clone {
         self.blocks.iter().map(|(name, block)| (*name, block.as_slice()))

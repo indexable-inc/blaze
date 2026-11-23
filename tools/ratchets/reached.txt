@@ -12,6 +12,7 @@ crates/blaze-apple-sdk	0	-
 crates/blaze-ask	0	crates/blaze-core,crates/blaze-ids,crates/blaze-own
 crates/blaze-base-tools	0	crates/blaze-blake3,crates/blaze-data,crates/blaze-json,crates/blaze-own,crates/blaze-pins
 crates/blaze-base64	0	crates/blaze-own
+crates/blaze-bitflags	0	-
 crates/blaze-blake3	0	crates/blaze-int
 crates/blaze-body	0	crates/blaze-format-core,crates/blaze-hash,crates/blaze-own,crates/blaze-typeck
 crates/blaze-body-lower	0	crates/blaze-body,crates/blaze-flow-lower,crates/blaze-own,crates/blaze-typeck
@@ -96,7 +97,7 @@ crates/blaze-solve	0	crates/blaze-hash,crates/blaze-own
 crates/blaze-source	3	crates/blaze-hash,crates/blaze-ids,crates/blaze-own,crates/blaze-semver
 crates/blaze-spawn	0	crates/blaze-ids,crates/blaze-own
 crates/blaze-spin	0	crates/blaze-check
-crates/blaze-std	4	crates/blaze-algebra,crates/blaze-alloc-count,crates/blaze-bytes,crates/blaze-cbor,crates/blaze-check,crates/blaze-core,crates/blaze-data,crates/blaze-deflate,crates/blaze-format,crates/blaze-h1,crates/blaze-hash,crates/blaze-hashcons,crates/blaze-http,crates/blaze-ids,crates/blaze-json,crates/blaze-kit,crates/blaze-mem,crates/blaze-meter,crates/blaze-own,crates/blaze-phf,crates/blaze-radix,crates/blaze-reclaim,crates/blaze-report,crates/blaze-rng,crates/blaze-roots,crates/blaze-sha256,crates/blaze-sim,crates/blaze-spin,crates/blaze-sys,crates/blaze-text,crates/blaze-url
+crates/blaze-std	4	crates/blaze-algebra,crates/blaze-alloc-count,crates/blaze-base64,crates/blaze-bitflags,crates/blaze-bytes,crates/blaze-cbor,crates/blaze-check,crates/blaze-core,crates/blaze-data,crates/blaze-deflate,crates/blaze-format,crates/blaze-h1,crates/blaze-hash,crates/blaze-hashcons,crates/blaze-http,crates/blaze-ids,crates/blaze-json,crates/blaze-kit,crates/blaze-mem,crates/blaze-memchr,crates/blaze-meter,crates/blaze-own,crates/blaze-phf,crates/blaze-radix,crates/blaze-reclaim,crates/blaze-report,crates/blaze-rng,crates/blaze-roots,crates/blaze-semver,crates/blaze-sha256,crates/blaze-sim,crates/blaze-spin,crates/blaze-sys,crates/blaze-tar,crates/blaze-text,crates/blaze-toml,crates/blaze-url
 crates/blaze-surface	0	crates/blaze-format,crates/blaze-hash,crates/blaze-id,crates/blaze-own
 crates/blaze-swiss	0	crates/blaze-check,crates/blaze-int,crates/blaze-own
 crates/blaze-sys	0	-

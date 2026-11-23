@@ -228,3 +228,94 @@ fn a_function_takes_the_allocator_as_one_word() {
     assert_eq!(made.as_slice(), &[0, 1, 4, 9][..]);
     assert_eq!(size_of::<Alloc<'_>>(), size_of::<usize>());
 }
+
+#[test]
+fn batteries_are_exposed_and_work_in_a_frame() {
+    let (_io, cx) = task();
+    let alloc = cx.frame();
+
+    // bstd::diff
+    let patch = crate::diff::create_patch(
+        "a\nb\n",
+        "a\nc\n",
+        crate::diff::PatchOpts {
+            algorithm: crate::diff::Algorithm::Myers,
+            context: 1,
+            old_name: None,
+            new_name: None,
+            budget: crate::diff::DEFAULT_BUDGET,
+            alloc,
+        },
+    )
+    .expect("patch");
+    let applied = crate::diff::apply_patch_text(
+        "a\nb\n",
+        patch.as_str(),
+        crate::diff::ParsePatchLimits::USUAL,
+        crate::diff::ApplyOpts { max_offset: 0, alloc },
+    )
+    .expect("apply");
+    assert_eq!(applied.as_str(), "a\nc\n");
+
+    // bstd::hex + bstd::digest (HMAC-SHA256 + CRC32)
+    let mac = crate::digest::hmac_sha256(b"key", b"msg");
+    let mac_hex = crate::hex::encode_in(&mac, alloc).expect("hex");
+    assert_eq!(crate::hex::decode_array::<32>(mac_hex.as_bytes()).expect("dec"), mac);
+    let mut crc = crate::digest::Crc32::new();
+    crc.update(b"123456789");
+    assert_eq!(crc.finish(), 0xcbf4_3926);
+
+    // bstd::ansi
+    let painted = blaze_own::format_in!(
+        alloc,
+        "{}",
+        crate::ansi::Style::new().fg(crate::ansi::Color::Green).paint("ok")
+    );
+    assert_eq!(crate::ansi::strip_in(painted.as_str(), alloc).expect("strip").as_str(), "ok");
+    assert_eq!(crate::ansi::visible_width(painted.as_str()), 2);
+
+    // bstd::uuid
+    let u = crate::uuid::Uuid::v7(1_700_000_000_000, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(u.timestamp_ms(), Some(1_700_000_000_000));
+
+    // bstd::csv
+    let tbl = crate::csv::parse_in(
+        "k,v\nx,1\n",
+        crate::csv::CsvOpts {
+            delimiter: b',',
+            shape: crate::csv::RowShape::Rectangular,
+            limits: crate::csv::CsvLimits::USUAL,
+            alloc,
+        },
+    )
+    .expect("csv");
+    assert_eq!(tbl.row_count(), 2);
+
+    // Facade re-exports: base64, json, cbor, toml, semver, compress, search, bitflags, tar
+    let b64 = crate::base64::STANDARD.encode_in(b"blaze", alloc);
+    assert_eq!(b64.as_str(), "YmxhemU=");
+
+    let val = crate::json::read_in(b"{\"ok\":true}", crate::json::Limits::SHIPPED, alloc).expect("json");
+    let cbor_bytes = crate::cbor::to_vec_in(&val, alloc);
+    assert!(!cbor_bytes.is_empty());
+
+    let toml_doc =
+        crate::toml::Document::parse_in("name = \"blaze\"\n", crate::toml::Limits::SHIPPED, alloc)
+            .expect("toml");
+    assert_eq!(toml_doc.root().get("name").and_then(|v| v.as_str()), Some("blaze"));
+
+    let ver = crate::semver::Version::parse_in("1.2.3", crate::semver::Limits::SHIPPED, alloc)
+        .expect("semver");
+    assert_eq!((ver.major, ver.minor, ver.patch), (1, 2, 3));
+
+    let mut gz = crate::vec::Vec::new_in(alloc);
+    crate::compress::gzip(b"hello blaze", crate::compress::Level::Fast, alloc, &mut gz)
+        .expect("gzip");
+    assert!(!gz.is_empty());
+
+    assert_eq!(crate::search::memchr(b'z', b"blaze"), Some(3));
+    let mut tar_buf = crate::vec::Vec::new_in(alloc);
+    let mut writer = crate::tar::Writer::new();
+    writer.finish(&mut tar_buf).expect("finish tar");
+    assert!(!tar_buf.is_empty());
+}

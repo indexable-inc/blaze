@@ -404,7 +404,7 @@ fn suite_closure<'a>(list: &blaze_world::crate_list::CrateList<'_>, test: usize,
 #[expect(clippy::too_many_arguments, reason = "the test runner's edge: each argument one specific capability or record")]
 pub(crate) fn run_tests(
     cx: &Cx,
-    mut standing: Standing<'_, '_>,
+    standing: Standing<'_, '_>,
     packages: &[&str],
     bin: Option<&str>,
     launch: &program::Launch<'_>,
@@ -413,6 +413,24 @@ pub(crate) fn run_tests(
     phases: &mut Phases,
     watch: &dyn blaze_screen::Watch,
 ) -> Result<Status, CliError> {
+    let status = run_tests_status(cx, standing, packages, bin, launch, clock, rng, phases, watch)?;
+    Ok(if status.passed() { Status::OK } else { Status::FAILED })
+}
+
+/// [`run_tests`], returning the structured [`crate::test_loop::Status`] (passed/failed/ignored/not_run
+/// counts) for `blaze ci` without duplicating the suite runner.
+#[expect(clippy::too_many_arguments, reason = "the test runner's edge: each argument one specific capability or record")]
+pub(crate) fn run_tests_status(
+    cx: &Cx,
+    mut standing: Standing<'_, '_>,
+    packages: &[&str],
+    bin: Option<&str>,
+    launch: &program::Launch<'_>,
+    clock: &bstd::clock::Clock,
+    rng: &mut bstd::rng::Rng,
+    phases: &mut Phases,
+    watch: &dyn blaze_screen::Watch,
+) -> Result<crate::test_loop::Status, CliError> {
     let (frame, heap) = (standing.frame, standing.heap);
     let erased = blaze_own::Erased::new(frame);
     let bump = erased.bump();
@@ -554,7 +572,7 @@ pub(crate) fn run_tests(
     if let Some(why) = seen.refused() {
         return Err(CliError::RunNames(run_names::RunNamesError::Trees { why }));
     }
-    Ok(if status.passed() { Status::OK } else { Status::FAILED })
+    Ok(status)
 }
 
 #[cfg(test)]

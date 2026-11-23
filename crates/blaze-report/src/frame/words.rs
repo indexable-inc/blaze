@@ -549,6 +549,17 @@ pub const WORDINGS: &[Wording] = &[
         args: 1,
         kind: Kind::Told,
     },
+    // A dependency declared in a member's `Cargo.toml` that none of that member's checked targets
+    // reference (blaze-cli unused_deps.rs `UNUSED_DEPENDENCY`).
+    Wording {
+        area: Area::Cli,
+        number: 48,
+        name: "unused-dependency",
+        headline: "dependency {code:0} is declared in {code:1} of {code:2} but never referenced",
+        label: "unused dependency; remove this line",
+        args: 3,
+        kind: Kind::Warning,
+    },
     Wording {
         area: Area::Drive,
         number: 0xC0F6,
@@ -637,6 +648,8 @@ pub enum HelpKind {
     ToolchainLine,
     /// A mechanical fix from a lint rule: `{0}` names the rule.
     LintFix,
+    /// A manifest line naming an unused dependency, deleted: `{0}` the dependency key.
+    UnusedDependencyLine,
 }
 
 /// One help's words.
@@ -678,6 +691,12 @@ pub const HELPS: &[HelpWording] = &[
         kind: HelpKind::LintFix,
         name: "help-lint-fix",
         template: "mechanical fix for lint {code:0}",
+        args: 1,
+    },
+    HelpWording {
+        kind: HelpKind::UnusedDependencyLine,
+        name: "help-unused-dependency-line",
+        template: "remove unused dependency {code:0}",
         args: 1,
     },
 ];

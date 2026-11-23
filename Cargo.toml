@@ -461,9 +461,10 @@ blaze-cbor = { path = "crates/blaze-cbor" } # Deterministic CBOR (RFC 8949 4.2.1
 blaze-comptime = { path = "crates/blaze-comptime" }
 # The C-name table a compile-time child's code is bound to, and its system layer (D175).
 blaze-comptime-sys = { path = "crates/blaze-comptime-sys" }
-blaze-data = { path = "crates/blaze-data" } # The one format-neutral value (CBOR, JSON, TOML) and `value!`.
+blaze-data = { path = "crates/blaze-data" } # The one format-neutral value (CBOR, JSON, TOML, TAB) and `value!`.
 blaze-json = { path = "crates/blaze-json" }
 blaze-semver = { path = "crates/blaze-semver" }
+blaze-tab = { path = "crates/blaze-tab" } # Blaze's LLM-first tabular data format inspired by NUON (sparse schemas, lossless Value).
 blaze-toml = { path = "crates/blaze-toml" }
 blaze-v2-proof = { path = "crates/blaze-v2-proof" }
 # WASI preview 1 for wasm guests at both pointer widths.

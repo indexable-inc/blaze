@@ -2092,6 +2092,8 @@ version = "0.0.0"
 dependencies = [
  "blaze-algebra",
  "blaze-alloc-count",
+ "blaze-base64",
+ "blaze-bitflags",
  "blaze-bytes",
  "blaze-cbor",
  "blaze-check",
@@ -2107,6 +2109,7 @@ dependencies = [
  "blaze-json",
  "blaze-kit",
  "blaze-mem",
+ "blaze-memchr",
  "blaze-meter",
  "blaze-own",
  "blaze-phf",
@@ -2115,11 +2118,14 @@ dependencies = [
  "blaze-report",
  "blaze-rng",
  "blaze-roots",
+ "blaze-semver",
  "blaze-sha256",
  "blaze-sim",
  "blaze-spin",
  "blaze-sys",
+ "blaze-tar",
  "blaze-text",
+ "blaze-toml",
  "blaze-url",
  "objc2-core-foundation",
  "objc2-core-media",
@@ -2165,6 +2171,15 @@ name = "blaze-sys"
 version = "0.0.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "blaze-tab"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-json",
+ "blaze-own",
 ]
 
 [[package]]

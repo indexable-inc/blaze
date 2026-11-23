@@ -76,7 +76,7 @@ const BORROWS_COUNT: &str = "type-checked whole had the move and borrow check re
 /// prints it now.
 const OLD_FIRST: &str = "note: check-old: the OLD checker";
 /// The usage line of a word that is no command (main.rs `command`'s last arm).
-const NO_COMMAND: &str = "the command is check, inspect, run, test, peer, clean, gc, warm-toolchain or explain";
+const NO_COMMAND: &str = "the command is check, ci, inspect, run, test, peer, clean, gc, warm-toolchain or explain";
 
 fn write(path: &Path, text: &str) {
     if let Some(dir) = path.parent() {
@@ -125,24 +125,42 @@ impl Said {
     }
 }
 
+fn read_text(path: &Path) -> impl core::ops::Deref<Target = str> + core::fmt::Display + use<> {
+    std::fs::read_to_string(path).unwrap_or_else(|error| panic!("reading {}: {error}", path.display()))
+}
+
+fn cleanup(path: &Path) {
+    let _ = std::fs::remove_dir_all(path);
+}
+
 /// `blaze <args>` in `ws` with the home `home`; its streams kept as `<ws>.<what>.out|err`.
 fn blaze(ws: &Path, home: &Path, args: &[&str], what: &str) -> Said {
+    blaze_env(ws, home, args, &[], what)
+}
+
+/// [`blaze`] with additional environment variables (clearing `GITHUB_ACTIONS` and
+/// `GITHUB_STEP_SUMMARY` unless supplied in `extra_env`).
+fn blaze_env(ws: &Path, home: &Path, args: &[&str], extra_env: &[(&str, &str)], what: &str) -> Said {
     let out_path = ws.with_extension(format!("{what}.out"));
     let err_path = ws.with_extension(format!("{what}.err"));
     let out = File::create(&out_path).unwrap_or_else(|error| panic!("making {}: {error}", out_path.display()));
     let err = File::create(&err_path).unwrap_or_else(|error| panic!("making {}: {error}", err_path.display()));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_blaze"))
-        .args(args)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_blaze"));
+    cmd.args(args)
         .current_dir(ws)
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))
         .env("PWD", ws)
         .env_remove("SDKROOT")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("GITHUB_STEP_SUMMARY")
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
-        .spawn()
-        .expect("blaze starts");
+        .stderr(Stdio::from(err));
+    for &(k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("blaze starts");
     let started = Instant::now();
     // Waiting for: `blaze <args>` of two small packages, at most DEADLINE.
     let status = loop {
@@ -165,8 +183,7 @@ fn blaze(ws: &Path, home: &Path, args: &[&str], what: &str) -> Said {
             }
         }
     };
-    let read = |path: &Path| std::fs::read_to_string(path).unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
-    Said { status: status.code(), out: read(&out_path), err: read(&err_path) }
+    Said { status: status.code(), out: read_text(&out_path).to_owned(), err: read_text(&err_path).to_owned() }
 }
 
 #[test]
@@ -236,7 +253,7 @@ fn check_is_the_engine_and_names_exactly_the_stage_not_checked() {
     assert!(line.starts_with("blaze: 0 of "), "--stats: nothing was entered over a standing certificate: {line}");
     assert!(!plain.err.lines().any(|line| line.starts_with("blaze: ")), "--stats CONTROL: the plain check printed a stats line:\n{}", plain.all());
 
-    let _ = std::fs::remove_dir_all(&base);
+    cleanup(&base);
     println!(
         "CHECK COMMAND: clean {:?}, type error {:?} at {finding}, borrows-only {:?}, check-old refused {first:?}, --stats {:?}",
         clean.status, typed.status, counted.status, stats.status
@@ -411,4 +428,182 @@ fn inspect_command_emits_annotated_hints_and_json() {
 
     println!("=== ANNOTATED SAMPLE (demo + load) ===\n{}", ann.out);
     println!("=== JSON SAMPLE (load) ===\n{}", json.out);
+}
+
+/// Multi-crate fixture exercising unused-dependency soundness rules:
+/// `used_use` (`use`), `used_path` (qualified path), `used_mac` (macro call), `used_ext`
+/// (`extern crate ... as _`), `opt_dep` (optional/feature), `native-sys` (`links`), and
+/// optionally `ghost` (genuinely unused).
+fn build_udeps_workspace(ws: &Path, include_ghost: bool) {
+    let ghost_member = if include_ghost { ", \"ghost\"" } else { "" };
+    write(
+        &ws.join("Cargo.toml"),
+        &format!(
+            "[workspace]\nmembers = [\"app\", \"used_use\", \"used_path\", \"used_mac\", \"used_ext\", \"opt_dep\", \"native-sys\"{ghost_member}]\nresolver = \"2\"\n"
+        ),
+    );
+    let ghost_line = if include_ghost { "ghost = { path = \"../ghost\" }\n" } else { "" };
+    write(
+        &ws.join("app/Cargo.toml"),
+        &format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[features]\nwith_opt = [\"dep:opt_dep\"]\n\n[dependencies]\nused_use = {{ path = \"../used_use\" }}\nused_path = {{ path = \"../used_path\" }}\nused_mac = {{ path = \"../used_mac\" }}\nused_ext = {{ path = \"../used_ext\" }}\nopt_dep = {{ path = \"../opt_dep\", optional = true }}\nnative-sys = {{ path = \"../native-sys\" }}\n{ghost_line}"
+        ),
+    );
+    write(
+        &ws.join("app/src/lib.rs"),
+        "#![no_std]\nuse used_use::val;\nextern crate used_ext as _;\n\n// ghost::comment_mention_must_not_count();\npub const S: &str = \"ghost::string_must_not_count\";\n\npub fn compute() -> u32 {\n    val() + used_path::one() + used_mac::emit!()\n}\n",
+    );
+    write(&ws.join("used_use/Cargo.toml"), "[package]\nname = \"used_use\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write(&ws.join("used_use/src/lib.rs"), "#![no_std]\npub fn val() -> u32 { 1 }\n");
+    write(&ws.join("used_path/Cargo.toml"), "[package]\nname = \"used_path\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write(&ws.join("used_path/src/lib.rs"), "#![no_std]\npub fn one() -> u32 { 2 }\n");
+    write(&ws.join("used_mac/Cargo.toml"), "[package]\nname = \"used_mac\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write(&ws.join("used_mac/src/lib.rs"), "#![no_std]\n#[macro_export]\nmacro_rules! emit { () => { 3u32 }; }\n");
+    write(&ws.join("used_ext/Cargo.toml"), "[package]\nname = \"used_ext\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write(&ws.join("used_ext/src/lib.rs"), "#![no_std]\npub fn init() {}\n");
+    write(&ws.join("opt_dep/Cargo.toml"), "[package]\nname = \"opt_dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write(&ws.join("opt_dep/src/lib.rs"), "#![no_std]\npub fn opt() -> u32 { 4 }\n");
+    write(
+        &ws.join("native-sys/Cargo.toml"),
+        "[package]\nname = \"native-sys\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"native\"\n",
+    );
+    write(&ws.join("native-sys/src/lib.rs"), "#![no_std]\npub fn link_only() {}\n");
+    if include_ghost {
+        write(&ws.join("ghost/Cargo.toml"), "[package]\nname = \"ghost\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+        write(&ws.join("ghost/src/lib.rs"), "#![no_std]\npub fn unused() -> u32 { 99 }\n");
+    }
+}
+
+#[test]
+fn check_detects_unused_dependency_with_zero_false_positives_and_fixes_it() {
+    let base = fresh_home("unused_deps_e2e", true);
+    let home = base.join("home");
+    let ws = base.join("ws");
+    build_udeps_workspace(&ws, true);
+
+    let check = blaze_env(&ws, &home, &["check"], &[("BLAZE_NO_DAEMON", "1")], "check");
+    assert!(
+        check.out.contains("warning[unused-dependency]") && check.out.contains("app/Cargo.toml:") && check.out.contains("`ghost`"),
+        "expected unused-dependency warning for `ghost` at app/Cargo.toml:\n{}",
+        check.all()
+    );
+    for allowed in ["used_use", "used_path", "used_mac", "used_ext", "opt_dep", "native-sys"] {
+        assert!(
+            !check.out.lines().any(|l| l.contains("unused-dependency") && l.contains(allowed)),
+            "false positive unused-dependency for `{allowed}`:\n{}",
+            check.all()
+        );
+    }
+
+    let fixed = blaze_env(&ws, &home, &["check", "--fix", "all"], &[("BLAZE_NO_DAEMON", "1")], "fix");
+    assert!(
+        !fixed.out.contains("unused-dependency"),
+        "after `--fix all`, no unused-dependency warning should remain:\n{}",
+        fixed.all()
+    );
+    let manifest_after = read_text(&ws.join("app/Cargo.toml"));
+    assert!(!manifest_after.contains("ghost ="), "ghost line should be deleted:\n{manifest_after}");
+
+    cleanup(&base);
+}
+
+#[test]
+fn blaze_ci_passes_on_clean_fails_on_errors_and_unused_deps_and_emits_github_and_nuon() {
+    let base = fresh_home("ci_command_e2e", true);
+    let home = base.join("home");
+
+    // 1. Clean workspace -> exit 0, NUON todo with `status: passed` and `todo: []`.
+    let clean_ws = base.join("clean");
+    build_udeps_workspace(&clean_ws, false);
+    let clean = blaze_env(&clean_ws, &home, &["ci", "--no-test"], &[("BLAZE_NO_DAEMON", "1")], "ci_clean");
+    assert_eq!(clean.status, Some(0), "clean ci should exit 0:\n{}", clean.all());
+    assert!(clean.out.contains("blaze ci: PASSED"), "expected PASSED verdict:\n{}", clean.all());
+    let todo_nuon = read_text(&clean_ws.join(".blaze/ci/todo.nuon"));
+    assert!(todo_nuon.contains("schema: 1") && todo_nuon.contains("status: passed") && todo_nuon.contains("todo: []"), "unexpected todo.nuon:\n{todo_nuon}");
+
+    // 2. Unused dependency -> exit 1, NUON + JSON todo with suggestion, `--fix` repairs and passes.
+    let udep_ws = base.join("udep");
+    build_udeps_workspace(&udep_ws, true);
+    let udep = blaze_env(&udep_ws, &home, &["ci", "--no-test"], &[("BLAZE_NO_DAEMON", "1")], "ci_udep");
+    assert_eq!(udep.status, Some(1), "ci with unused dep must fail (exit 1):\n{}", udep.all());
+    assert!(udep.out.contains("blaze ci: FAILED") && udep.out.contains("1 unused dep(s)"), "expected FAILED naming unused dep:\n{}", udep.all());
+    let udep_nuon = read_text(&udep_ws.join(".blaze/ci/todo.nuon"));
+    assert!(
+        udep_nuon.contains("status: failed")
+            && udep_nuon.contains("unused_deps: 1")
+            && udep_nuon.contains("[kind file line col code message suggestion command];")
+            && udep_nuon.contains("unused_dependency \"app/Cargo.toml\"")
+            && udep_nuon.contains("replacement: \"\""),
+        "unexpected udep todo.nuon:\n{udep_nuon}"
+    );
+
+    let udep_json_run = blaze_env(&udep_ws, &home, &["ci", "--no-test", "--todo-format=json"], &[("BLAZE_NO_DAEMON", "1")], "ci_udep_json");
+    assert_eq!(udep_json_run.status, Some(1), "ci json run fails:\n{}", udep_json_run.all());
+    let udep_json = read_text(&udep_ws.join(".blaze/ci/todo.json"));
+    assert!(
+        udep_json.contains("\"schema\": 1")
+            && udep_json.contains("\"status\": \"failed\"")
+            && udep_json.contains("\"unused_deps\": 1")
+            && udep_json.contains("\"kind\":\"unused_dependency\""),
+        "unexpected udep todo.json:\n{udep_json}"
+    );
+
+    let udep_fixed = blaze_env(&udep_ws, &home, &["ci", "--no-test", "--fix"], &[("BLAZE_NO_DAEMON", "1")], "ci_udep_fix");
+    assert_eq!(udep_fixed.status, Some(0), "ci --fix should fix unused dep and pass:\n{}", udep_fixed.all());
+    assert!(udep_fixed.out.contains("blaze ci: PASSED"), "expected PASSED after --fix:\n{}", udep_fixed.all());
+
+    // 3. GitHub Actions mode (`GITHUB_ACTIONS=true`, `GITHUB_STEP_SUMMARY`) with type error + unused dep.
+    let gh_ws = base.join("gh");
+    build_udeps_workspace(&gh_ws, true);
+    write(
+        &gh_ws.join("app/src/lib.rs"),
+        "#![no_std]\nuse used_use::val;\nextern crate used_ext as _;\npub struct T;\npub fn compute() -> u32 {\n    let _bad: u32 = T;\n    val() + used_path::one() + used_mac::emit!()\n}\n",
+    );
+    let summary_file = base.join("step_summary.md");
+    let summary_str = summary_file.to_string_lossy().into_owned();
+    let gh = blaze_env(
+        &gh_ws,
+        &home,
+        &["ci", "--no-test"],
+        &[("BLAZE_NO_DAEMON", "1"), ("GITHUB_ACTIONS", "true"), ("GITHUB_STEP_SUMMARY", &summary_str)],
+        "ci_gh",
+    );
+    assert_eq!(gh.status, Some(1), "github ci with type error + unused dep must fail:\n{}", gh.all());
+    assert!(gh.out.contains("::group::blaze check"), "missing ::group::blaze check:\n{}", gh.all());
+    assert!(gh.out.contains("::endgroup::"), "missing ::endgroup:::\n{}", gh.all());
+    assert!(gh.out.contains("::error file=app/src/lib.rs,line=6,col="), "missing ::error annotation:\n{}", gh.all());
+    assert!(
+        gh.out.contains("::warning file=app/Cargo.toml,line=") && gh.out.contains("title=unused-dependency::"),
+        "missing ::warning annotation for unused-dependency:\n{}",
+        gh.all()
+    );
+    let review_json = read_text(&gh_ws.join(".blaze/ci/github-review.json"));
+    assert!(
+        review_json.contains("\"path\":\"app/Cargo.toml\"") && review_json.contains("```suggestion"),
+        "expected PR suggestion comment in github-review.json:\n{review_json}"
+    );
+    let step_md = read_text(&summary_file);
+    assert!(
+        step_md.contains("## blaze ci: FAILED")
+            && step_md.contains("| `check` | fail |")
+            && step_md.contains("| `unused-deps` | fail | 1 unused dependency(ies) |"),
+        "unexpected GITHUB_STEP_SUMMARY:\n{step_md}"
+    );
+
+    // 4. Full `blaze ci` with passing `#[test]` when `blaze-launcher` is present beside `blaze`.
+    let launcher_beside = Path::new(env!("CARGO_BIN_EXE_blaze")).with_file_name("blaze-launcher");
+    if cfg!(target_os = "macos") && launcher_beside.exists() {
+        let test_ws = base.join("with_test");
+        write(&test_ws.join("Cargo.toml"), "[package]\nname = \"clean_test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        write(&test_ws.join("src/lib.rs"), "pub fn add(a: u32, b: u32) -> u32 { a + b }\n#[test]\nfn adds() { assert_eq!(add(2, 3), 5); }\n");
+        let ran = blaze_env(&test_ws, &home, &["ci"], &[("BLAZE_NO_DAEMON", "1")], "ci_with_test");
+        assert_eq!(ran.status, Some(0), "full blaze ci with passing test must exit 0:\n{}", ran.all());
+        assert!(
+            ran.out.contains("blaze ci: PASSED") && ran.out.contains("1 test(s) passed"),
+            "expected PASSED with 1 test passed:\n{}",
+            ran.all()
+        );
+    }
+
+    cleanup(&base);
 }

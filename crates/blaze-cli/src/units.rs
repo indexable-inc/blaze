@@ -67,6 +67,9 @@ pub struct Laid<'f> {
     /// The `rustflags` of the checkout's cargo config (graph.rs `rustflags_config`), each file a
     /// row the layout read: what `graph::target_of` gives the units' cfg.
     pub rustflags: blaze_manifest::rustflags::RustflagsConfig<'static>,
+    /// Candidate declared dependencies of each workspace member, for unused-dependency detection
+    /// (unused_deps.rs).
+    pub(crate) member_deps: Vec<crate::unused_deps::MemberDeps<'f>, &'f Frame>,
 }
 
 impl Laid<'_> {
@@ -163,10 +166,12 @@ pub fn lay<'f, 'l>(
     })()?;
     let mut members = Vec::new_in(frame);
     let mut path_roots: Vec<(&'f str, u8), &'f Frame> = Vec::new_in(frame);
+    let mut member_deps: Vec<crate::unused_deps::MemberDeps<'f>, &'f Frame> = Vec::new_in(frame);
     let mut root_made = Made::new_in(Name::units(), frame);
     let mut facts = None;
     match laid {
         Ok(units) => {
+            member_deps = crate::unused_deps::extract_from_layout(&units, &paths, frame);
             // With no dependency outside the workspace and the toolchain there is no graph:
             // the lock is not read (nothing in it can change the answer), so a stale one costs
             // nothing and a lock edit moves no key.
@@ -277,7 +282,7 @@ pub fn lay<'f, 'l>(
     root_made.parts.sort_unstable_by_key(|part| part.name);
     root_made.parts.dedup_by_key(|part| part.name);
     root_made.out = parts_out(&root_made.parts);
-    Ok(Laid { root: root_made, members, path_roots, lock, parts, graph: None, rustflags })
+    Ok(Laid { root: root_made, members, path_roots, lock, parts, graph: None, rustflags, member_deps })
 }
 
 /// Where a refusal is: the manifest's id and the span, when it names one.
