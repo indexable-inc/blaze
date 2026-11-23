@@ -126,10 +126,11 @@ impl fmt::Display for SentWhy {
 /// How a run's records reach the program: what a caller names at its seam line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Delivery {
-    /// One file a record under the home's `run/records` ([`RecordsDir`]), read by the launcher.
+    /// One file a record under the home's `run/records` ([`RecordsDir`]), kept as the tested
+    /// control behind the seam (rule 78).
+    #[cfg_attr(not(test), expect(dead_code, reason = "kept as the tested control in run_bytes_tests.rs (rule 78); live callers use Delivery::Inline"))]
     Files,
-    /// Inline over descriptor 3 ([`RunBytes`]).
-    #[cfg_attr(not(test), expect(dead_code, reason = "the inline delivery: the default once run_bytes_tests.rs and received_tests.rs pass (own_process.rs and test_drive.rs seam lines); the tests construct it"))]
+    /// Inline over descriptor 3 ([`RunBytes`]): sends each record once per run, writes no file.
     Inline,
 }
 

@@ -215,7 +215,7 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     let mut codes = HomeCodeStore::new(lent);
     // THE SEAM LINE: how the records reach the program (run_bytes.rs `Delivery`; `Inline` sends
     // them over descriptor 3 and files none).
-    let mut lazy = Lazy::new(cx, front, Chosen::of(Delivery::Files, RecordsDir { cx, dir: &folder }, alloc), &mut codes, builder, alloc);
+    let mut lazy = Lazy::new(cx, front, Chosen::of(Delivery::Inline, RecordsDir { cx, dir: &folder }, alloc), &mut codes, builder, alloc);
     let store = bstd::mem::format_in!(frame, "{}/{RECORDS}", home.trim_end_matches('/'));
     // 2. The start list held for this (program, request shape), read before the spawn; its
     // rows placed, and the entry line.
