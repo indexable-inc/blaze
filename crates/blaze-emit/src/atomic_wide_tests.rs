@@ -19,7 +19,7 @@ use crate::{
 };
 
 fn isa(lse: bool) -> Isa {
-    Isa { lse, os: Os::MacOs }
+    Isa { lse, os: crate::tests::HOST_OS }
 }
 
 /// 16-byte aligned, as `AtomicU128` is (an exclusive pair access faults otherwise).

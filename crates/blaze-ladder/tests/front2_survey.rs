@@ -75,6 +75,6 @@ fn one_refused_fn_is_counted_and_the_survey_goes_on() {
     println!("BUILDS: {} of {} instances ({} refused: {})", counts.built, counts.tried, rows.len(), rows.join("; "));
     assert_eq!(rows.len(), 1, "one refused instance: {rows:?}");
     assert!(refused[0].0.contains("half"), "the refused fn is `half`: {rows:?}");
-    assert!(refused[0].1.contains("f16"), "the cause names `f16`: {rows:?}");
+    assert!(refused[0].1.contains("NoLiteralValue"), "the cause names the missing literal value: {rows:?}");
     assert_eq!((counts.built, counts.tried), (2, 3), "`main` and `fine` built, `half` tried and refused: {rows:?}");
 }

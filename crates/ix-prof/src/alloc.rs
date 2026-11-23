@@ -71,6 +71,7 @@ struct Local {
     rng: Cell<u64>,
     /// Inside the profiler's own bookkeeping: its allocations are not counted.
     busy: Cell<bool>,
+    stack_low: Cell<u64>,
     stack_high: Cell<u64>,
 }
 
@@ -83,6 +84,7 @@ thread_local! {
             left: Cell::new(0),
             rng: Cell::new(0),
             busy: Cell::new(false),
+            stack_low: Cell::new(0),
             stack_high: Cell::new(0),
         }
     };
@@ -388,23 +390,24 @@ fn push(r: Record) {
 #[inline(always)]
 fn walk(l: &Local, r: &mut Record) {
     let Some(mut fp) = frame_pointer() else { return };
-    let low = fp;
-    let high = match l.stack_high.get() {
+    let (stack_low, high) = match l.stack_high.get() {
         0 => {
-            let high = stack_high().unwrap_or(0);
+            let (low, high) = stack_bounds().unwrap_or((0, 0));
+            l.stack_low.set(low);
             l.stack_high.set(high);
-            high
+            (low, high)
         }
-        it => it,
+        high => (l.stack_low.get(), high),
     };
-    if high == 0 {
+    if high == 0 || fp < stack_low || fp >= high {
         return;
     }
+    let low = fp;
     while fp >= low && fp % 8 == 0 && fp.saturating_add(16) <= high && usize::from(r.depth) < DEPTH
     {
         let record = fp as *const u64;
         // SAFETY: `fp` is 8-aligned and its 16 bytes lie between this frame and the top of this
-        // thread's stack, which is mapped while the thread runs.
+        // thread's stack `[stack_low, high)`, which is mapped while the thread runs.
         let next = unsafe { record.read_volatile() };
         // SAFETY: as above, the second word.
         let ret = unsafe { record.wrapping_add(1).read_volatile() };
@@ -425,11 +428,13 @@ fn frame_pointer() -> Option<u64> {
     #[cfg(target_arch = "aarch64")]
     {
         let fp: u64;
-        // SAFETY: reads a register.
+        // SAFETY: reads a register. `x29` is a plain stack address (never PAC-signed; on
+        // Linux aarch64 48-bit/52-bit user VAs set bit 47, so masking to 47 bits would corrupt
+        // the pointer into unmapped memory).
         unsafe {
             std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags))
         };
-        Some(fp & ((1 << 47) - 1))
+        Some(fp)
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -446,20 +451,20 @@ fn frame_pointer() -> Option<u64> {
     }
 }
 
-/// The top of this thread's stack. May allocate (glibc reads /proc for the main thread); the
-/// caller is marked busy, so that goes straight to the inner allocator.
-fn stack_high() -> Option<u64> {
-    #[cfg(target_vendor = "apple")]
+/// The `[low, high)` bounds of this thread's stack. May allocate (glibc reads /proc for the main
+/// thread); the caller is marked busy, so that goes straight to the inner allocator.
+fn stack_bounds() -> Option<(u64, u64)> {
+    #[cfg(target_os = "macos")]
     {
-        #[cfg(target_os = "macos")]
-        use blaze_sys::posix::thread::{pthread_get_stackaddr_np, pthread_self};
-        #[cfg(target_os = "macos")]
-        // SAFETY: the calling thread's own pthread, alive.
-        let high = unsafe { pthread_get_stackaddr_np(pthread_self()) } as u64;
-        #[cfg(not(target_os = "macos"))]
+        let range = blaze_sys::posix::thread::this_thread_stack().ok()?;
+        let (low, high) = (range.low as u64, range.high as u64);
+        (high != 0).then_some((low, high))
+    }
+    #[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
+    {
         // SAFETY: the calling thread's own pthread, alive.
         let high = unsafe { libc::pthread_get_stackaddr_np(libc::pthread_self()) } as u64;
-        (high != 0).then_some(high)
+        (high != 0).then_some((0, high))
     }
     #[cfg(target_os = "linux")]
     {
@@ -475,7 +480,9 @@ fn stack_high() -> Option<u64> {
         let ok = unsafe { libc::pthread_attr_getstack(&attr, &mut addr, &mut size) } == 0;
         // SAFETY: filled by `pthread_getattr_np`, destroyed once.
         unsafe { libc::pthread_attr_destroy(&mut attr) };
-        ok.then(|| addr as u64 + size as u64)
+        let low = addr as u64;
+        let len = u64::try_from(size).ok()?;
+        (ok && low != 0 && len != 0).then(|| (low, low.saturating_add(len)))
     }
     #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     {

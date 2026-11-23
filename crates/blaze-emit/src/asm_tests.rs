@@ -181,7 +181,7 @@ fn barrier_returns_input_unchanged() {
         [(Ty::I64, "reg", &block), (Ty::PTR, "reg", &hash), (Ty::I64, "vreg", &tight), (Ty::I32, "reg", &w), (Ty::I8, "vreg_low16", &block)];
     let xs = [0u64, 1, 0x8000_0000_0000_0000, 0xdead_beef_cafe_f00d, u64::MAX];
     for (ty, class, template) in forms {
-        for isa in [ISA, Isa { lse: true, os: Os::Linux }] {
+        for isa in [Isa { lse: true, os: Os::MacOs }, Isa { lse: true, os: Os::Linux }] {
             assert_eq!(template_bytes(ty, class, template, isa), 0, "{class} {ty:?}: a comment is no instruction");
         }
         let code = emitted_for(barrier(ty, class, template).view(), &[], ISA).expect("the barrier emits");

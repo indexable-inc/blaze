@@ -53,7 +53,7 @@ pub(crate) fn static_shown_in<'n, S: NamesSource<'n>>(names: S, keys: &Keys, sto
 /// however the text is spaced: an expansion's text is printed token by token on one line
 /// (`# [doc = ".."] static MANIFEST : $crate :: grant :: Manifest = ..`). A loop over bytes; the
 /// slices end at ASCII bytes only, so they are on char boundaries.
-fn static_name(text: &str) -> Option<&str> {
+pub(super) fn static_name(text: &str) -> Option<&str> {
     let bytes = text.as_bytes();
     let mut at = 0usize;
     let mut after_static = false;

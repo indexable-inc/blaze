@@ -177,6 +177,7 @@ mod platform {
     const PT_LOAD: u32 = 1;
     const PT_NOTE: u32 = 4;
     const PF_X: u32 = 1;
+    const PF_R: u32 = 4;
     const NT_GNU_BUILD_ID: u32 = 3;
 
     pub(super) fn loaded() -> Vec<Image> {
@@ -217,7 +218,9 @@ mod platform {
         let mut loads: Vec<(u64, u64)> = Vec::new();
         for it in phdrs.iter().filter(|it| it.p_type == PT_LOAD) {
             let start = bias.wrapping_add(it.p_vaddr);
-            loads.push((start, start.saturating_add(it.p_memsz)));
+            if it.p_flags & PF_R != 0 {
+                loads.push((start, start.saturating_add(it.p_filesz)));
+            }
             if it.p_flags & PF_X != 0 {
                 low = low.min(start);
                 high = high.max(start.saturating_add(it.p_memsz));

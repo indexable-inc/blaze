@@ -853,13 +853,20 @@ impl TreeRunner for ShelfTree<'_> {
         // the tree built (D112), each granted tool and what it starts; read the roots; write
         // the tree's folder alone.
         let runs_out_dir = host_tools::runs_out_dir(self.tools.tools);
-        let linker: &[&str] = if runs_out_dir { &["bin/ld64.lld", "bin/lld"] } else { &[] };
+        let linker: &[&str] = if runs_out_dir { &["bin/ld64.lld", "bin/ld.lld", "bin/lld"] } else { &[] };
         let mut held: AVec<'a, AString<'a>> = Vec::new_in(alloc);
         for name in ["bin/clang-23", "bin/clang", "bin/clang++", "bin/llvm-ar"].iter().chain(linker) {
-            held.push(joined(&[shelf, "/", name], alloc));
+            let path = joined(&[shelf, "/", name], alloc);
+            if Path::new(path.as_str()).exists() {
+                held.push(path);
+            }
         }
         for tool in self.tools.tools {
-            held.extend(tool.programs_in(shelf, alloc));
+            for program in tool.programs_in(shelf, alloc) {
+                if Path::new(program.as_str()).exists() {
+                    held.push(program);
+                }
+            }
         }
         let mut exec: AVec<'a, &str> = Vec::with_capacity_in(held.len(), alloc);
         exec.extend(held.iter().map(|program| program.as_str()));
