@@ -247,6 +247,21 @@ impl Facts for NestedFacts<'_, '_> {
     fn trait_relates_nothing(&self, trait_: tc::ItemKey) -> bool {
         self.facts.trait_relates_nothing(trait_)
     }
+    fn is_fn_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.is_fn_trait(trait_)
+    }
+    fn assoc_item(&self, trait_: tc::ItemKey, name: tc::Name) -> Option<tc::ItemKey> {
+        self.facts.assoc_item(trait_, name)
+    }
+    fn owner_trait_impl(&self) -> Option<(tc::ItemKey, tc::ItemKey, u32, tc::ItemKey)> {
+        self.facts.owner_trait_impl()
+    }
+    fn deref_impl(&self, adt: tc::ItemKey) -> Option<tc::ItemKey> {
+        self.facts.deref_impl(adt)
+    }
+    fn is_zero_slot_builtin_assoc(&self, trait_: tc::ItemKey, name: tc::Name) -> bool {
+        self.facts.is_zero_slot_builtin_assoc(trait_, name)
+    }
     // Every fact the body's facts answer, forwarded (a nested flow asks what the owner's does).
     fn ties(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::Ties<'_>> {
         self.facts.ties(item)

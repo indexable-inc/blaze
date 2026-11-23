@@ -268,6 +268,9 @@ pub struct Flow<A: Allocator> {
     pub placeholder: Vec<bool, A>,
     /// `(local, origin)`: the local's type mentions the origin. Sorted.
     pub local_origins: Vec<(Local, Origin), A>,
+    /// Subset of `local_origins` whose positions do NOT run a destructor on `StmtKind::Drop`
+    /// (RFC 1327 / dropck: e.g. `&'a mut U` inside `Result<&'a mut U, E>`). Sorted.
+    pub local_no_drop_origins: Vec<(Local, Origin), A>,
     /// Known `from: into` between placeholders (the signature's bounds).
     pub known: Vec<(Origin, Origin), A>,
     /// Each local's own place: `Place(l)` for the locals the builder was made with, a later row
@@ -544,6 +547,7 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
                 origins: 0,
                 placeholder: Vec::new_in(alloc),
                 local_origins: Vec::new_in(alloc),
+                local_no_drop_origins: Vec::new_in(alloc),
                 known: Vec::new_in(alloc),
                 local_places,
             },
@@ -620,7 +624,7 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
         Origin(self.flow.origins - 1)
     }
 
-    /// The type of `local` mentions `origin`.
+    /// The type of `local` mentions `origin`, which is drop-live at `StmtKind::Drop`.
     pub fn mentions(&mut self, local: u32, origin: Origin) {
         let row = (Local(local), origin);
         if let Some(&last) = self.flow.local_origins.last() {
@@ -632,6 +636,13 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
             }
         }
         self.flow.local_origins.push(row);
+    }
+
+    /// The type of `local` mentions `origin`, but dropping `local` cannot touch `origin`
+    /// (trivial-drop position such as `&mut U` inside `Result<&mut U, E>`).
+    pub fn mentions_no_drop(&mut self, local: u32, origin: Origin) {
+        self.mentions(local, origin);
+        self.flow.local_no_drop_origins.push((Local(local), origin));
     }
 
     /// The signature says `from: into` between two placeholders.
@@ -763,6 +774,10 @@ impl<A: Allocator + Copy> FlowBuilder<A> {
         if self.local_origins_dirty {
             self.flow.local_origins.sort_unstable();
             self.flow.local_origins.dedup();
+        }
+        if !self.flow.local_no_drop_origins.is_empty() {
+            self.flow.local_no_drop_origins.sort_unstable();
+            self.flow.local_no_drop_origins.dedup();
         }
         Ok(self.flow)
     }

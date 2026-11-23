@@ -153,10 +153,6 @@ sandbox = ["blaze-proc-macro/runtime"]
 # set to a folder, and the command's store writes the toolchain's public records `PUBLIC`. Off by
 # default: a developer's blaze refuses `blaze store publish` by name and writes only `LOCAL`.
 publish = ["blaze-remote/sign"]
-# The call census (D190 step 2): `check` checks each body a second time under both call rules
-# and prints the comparison at the end of the bodies' profile lines. A measuring build only:
-# the census's own type check doubles the bodies' time.
-call-census = []
 
 [dev-dependencies]
 # `blaze_meter::testing::stop`: the meter's readers off, for the on/off byte-equality test.

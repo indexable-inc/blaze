@@ -33,8 +33,6 @@ pub mod borrow_reads;
 pub mod borrows;
 pub mod borrows_print;
 pub mod borrows_nested;
-/// The call census (D190 step 2): each body checked under both call rules, its calls compared.
-pub mod call_census;
 pub mod borrows_unmade;
 mod bound_kids;
 pub mod buckets;

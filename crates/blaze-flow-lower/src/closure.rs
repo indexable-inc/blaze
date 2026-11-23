@@ -118,6 +118,11 @@ pub enum External {
     /// expecting clause's `for<..>` binds, or one every call may choose. A universal region of
     /// the body: a relation the body needs on it is refused, never pushed on the owner.
     Late,
+    /// A universal lifetime parameter `Region::Param(i)` of the enclosing fn (used when a
+    /// closure body proves a callee bound through an enclosing `where`-clause naming `'a`).
+    OwnerParam(u32),
+    /// A type parameter outlives placeholder `ρ_P` of the enclosing fn (`param_origs`).
+    Param(u32),
 }
 
 /// What one position of a closure's signature (its inputs' positions, then its output's, as
@@ -129,6 +134,8 @@ pub enum SigSlot {
     /// Universal: `Some((binder, var))` a variable of the expecting clause's binder (two
     /// positions of one variable are one region), `None` a region of its own.
     Late(Option<(u32, u32)>),
+    /// Explicitly written `'static` on a closure parameter (`|lock: &'static str|`).
+    Static,
 }
 
 /// A closure's flow and what each of its placeholders stands for in the owner.
@@ -146,6 +153,10 @@ pub enum Need {
     Static,
     /// Signature position `k` of the closure value, after its captures' ([`External::SigOwner`]).
     Sig(u32),
+    /// Universal lifetime parameter `Region::Param(i)` of the enclosing fn ([`External::OwnerParam`]).
+    OwnerParam(u32),
+    /// Type parameter outlives placeholder `ρ_P` of the enclosing fn ([`External::Param`]).
+    Param(u32),
 }
 
 impl Need {
@@ -179,6 +190,8 @@ pub fn requirement(externals: &[(blaze_flow::Origin, External)], from: blaze_flo
         Some(External::Capture(j)) => Some(Need::Capture(j)),
         Some(External::Static) => Some(Need::Static),
         Some(External::SigOwner(k)) => Some(Need::Sig(k)),
+        Some(External::OwnerParam(i)) => Some(Need::OwnerParam(i)),
+        Some(External::Param(u)) => Some(Need::Param(u)),
         Some(External::Env | External::Sig | External::Late) | None => None,
     };
     Some(Requirement { from: end(from)?, into: end(into)? })
@@ -206,7 +219,7 @@ pub fn escapes_closure<A: Allocator>(
     alloc: A,
 ) -> bool {
     let end = |o: Origin| externals.iter().find(|(x, _)| *x == o).map(|&(_, w)| w);
-    let owner_names = |w: Option<External>| matches!(w, Some(External::Capture(_) | External::SigOwner(_) | External::Static));
+    let owner_names = |w: Option<External>| matches!(w, Some(External::Capture(_) | External::SigOwner(_) | External::Static | External::OwnerParam(_) | External::Param(_)));
     if end(from) != Some(External::Late) || !owner_names(end(into)) {
         return false;
     }
@@ -285,7 +298,8 @@ pub(crate) fn lower_closure_with<A: Allocator + Copy, F: Facts, R: crate::one_ca
         _ => return Err(Refusal { form: Form::Malformed, range }),
     };
     let Some(row) = row else { return Err(Refusal { form: Form::Malformed, range }) };
-    let mut l: Lower<'_, '_, F, A, R> = Lower::new(body, ck, facts, alloc)?;
+    let mut l: blaze_own::Box<Lower<'_, '_, F, A, R>, A> = Lower::new(body, ck, facts, alloc);
+    l.in_nested = true;
     if logged {
         l.b.start_log(alloc);
         l.per_call = true;
@@ -295,13 +309,23 @@ pub(crate) fn lower_closure_with<A: Allocator + Copy, F: Facts, R: crate::one_ca
     let ran = l.finish_held(ran);
     *log = l.b.take_log();
     ran?;
-    // `'static`, made when the walk first met it (`Lower::universal`).
-    if let Some(&(_, st)) = l.uni.iter().find(|(r, _)| *r == Region::Static) {
-        externals.push((st, External::Static));
+    // `'static` and any universal lifetime parameters of the enclosing fn met during the walk
+    // (`Lower::universal`).
+    for &(r, o) in l.uni.iter() {
+        match r {
+            Region::Static => externals.push((o, External::Static)),
+            Region::Param(i) => externals.push((o, External::OwnerParam(i))),
+            Region::Late { .. } => {}
+        }
+    }
+    for p in l.param_origs.iter() {
+        externals.push((p.origin, External::Param(p.param)));
     }
     let stats = l.stats;
-    let flow = l.b.finish().map_err(|_| Refusal { form: Form::Builder, range })?;
-    Ok(ClosureFlow { lowered: Lowered { flow, stats, params: l.param_origs, coarse: l.coarse.get() }, externals })
+    let b = core::mem::replace(&mut l.b, crate::builder::Builder::new(crate::FlowBuilder::new_in(1, 0, alloc)));
+    let flow = b.finish().map_err(|_| Refusal { form: Form::Builder, range })?;
+    let params = core::mem::replace(&mut l.param_origs, Vec::new_in(alloc));
+    Ok(ClosureFlow { lowered: Lowered { flow, stats, params, coarse: l.coarse.get() }, externals })
 }
 
 /// The body of an `async fn` (`BodyView::coroutine` is `Some`) as its own flow, its `.await`s
@@ -329,7 +353,7 @@ pub(crate) fn lower_async_fn_with<A: Allocator + Copy, F: Facts, R: crate::one_c
     if body.coroutine.is_none() {
         return Err(Refusal { form: Form::Malformed, range });
     }
-    let mut l: Lower<'_, '_, F, A, R> = Lower::new(body, ck, facts, alloc)?;
+    let mut l: blaze_own::Box<Lower<'_, '_, F, A, R>, A> = Lower::new(body, ck, facts, alloc);
     if logged {
         l.b.start_log(alloc);
         l.per_call = true;
@@ -341,12 +365,14 @@ pub(crate) fn lower_async_fn_with<A: Allocator + Copy, F: Facts, R: crate::one_c
     ran?;
     let suspends = l.points.len();
     let stats = l.stats;
-    let flow = l.b.finish().map_err(|_| Refusal { form: Form::Builder, range })?;
+    let b = core::mem::replace(&mut l.b, crate::builder::Builder::new(crate::FlowBuilder::new_in(1, 0, alloc)));
+    let flow = b.finish().map_err(|_| Refusal { form: Form::Builder, range })?;
     let counted = flow.stmts.iter().filter(|s| matches!(s.kind, blaze_flow::StmtKind::Suspend { .. })).count();
     if counted != suspends {
         return Err(Refusal { form: Form::Malformed, range });
     }
-    Ok(Lowered { flow, stats, params: l.param_origs, coarse: l.coarse.get() })
+    let params = core::mem::replace(&mut l.param_origs, Vec::new_in(alloc));
+    Ok(Lowered { flow, stats, params, coarse: l.coarse.get() })
 }
 
 impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
@@ -368,20 +394,12 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
     ) -> Result<(), Refusal> {
         let (inputs, output) = sig;
         let ck = self.ck;
-        // The closure's environment fields, in order (blaze-typeck env_fields.rs, the active
-        // strategy: whole bindings, or one field per captured place): argument `1 + k` is field
-        // `k`, as the closure value lays them (`closure_value`, `npos`).
-        let mut rows: Vec<(PatId, CaptureKind), A> = Vec::new_in(self.alloc);
-        for f in ck.env_fields(closure) {
-            // A field holding a PROJECTED place (`x.a`, `(*r).b`) is not a binding of the body:
-            // its upvar is the field's own place (capture_places.rs `place_upvar`, wired at the
-            // switch). Until then such a field is refused by name, never laid as its root.
-            if !f.is_whole() {
-                return self.refuse(Form::Closure, closure);
-            }
-            rows.push((f.base, f.how));
+        self.env_now.clear();
+        self.field_places.clear();
+        for f in ck.env_fields_by::<blaze_typeck::Places>(closure) {
+            self.env_now.push(f);
         }
-        let nu = rows.len() as u32;
+        let nu = self.env_now.len() as u32;
         let np = params.len() as u32;
         self.b.replace(FlowBuilder::new_in(1 + nu + np, nu + np, self.alloc));
         self.nargs = nu + np;
@@ -392,43 +410,36 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         self.scope_temps.push((self.temps.len() as u32, self.temp_marks.len() as u32));
         // The next position of the closure value (`External::Capture`).
         let mut value_at = 0u32;
-        for k in 0..rows.len() {
-            let (p, cap) = rows[k];
-            let t = match ck.local_ty.get(p.ix()) {
-                Some(&t) => t,
-                None => return self.refuse_pat(Form::Malformed, p),
-            };
+        for k in 0..self.env_now.len() {
+            let f = self.env_now[k];
+            let cap = f.how;
             let l = Local(1 + k as u32);
-            // How the body reaches the variable: owned (`None`), or through a reference of
-            // this mutability, which is the environment's own when `env` is set.
-            let (through, env) = match (cap, kind) {
-                (CaptureKind::ByValue, ClosureKind::FnOnce) => (None, false),
-                (CaptureKind::ByValue, ClosureKind::FnMut) => (Some(Mutbl::Mut), true),
-                (CaptureKind::ByValue, ClosureKind::Fn) => (Some(Mutbl::Not), true),
-                (CaptureKind::ByRef, _) => (Some(Mutbl::Not), false),
-                // An `FnMut` reaches its `&mut` capture through `&'env mut self`: a reborrow of
-                // it lives only for `'env` (the Reference, "Closure types", unique borrows).
-                (CaptureKind::ByMutRef, ClosureKind::FnOnce) => (Some(Mutbl::Mut), false),
-                (CaptureKind::ByMutRef, _) => (Some(Mutbl::Mut), true),
-            };
-            // What this capture's placeholders are in the closure value (`External`): the
-            // value lays the capture as `npos_d` of `&T` for one by reference, of `T` by value.
+            let (through, env) = Self::field_through(cap, kind);
             let first = self.origs.len() as u32;
-            match through {
-                None => {
-                    self.new_local_with(TyD::of(t), true, Some(l), closure)?;
-                    match self.pat_local.get_mut(p.ix()) {
-                        Some(slot) => *slot = l.0,
-                        None => return self.refuse_pat(Form::Malformed, p),
+            if f.is_whole() {
+                let p = f.base;
+                let t = match ck.local_ty.get(p.ix()) {
+                    Some(&t) => t,
+                    None => return self.refuse_pat(Form::Malformed, p),
+                };
+                match through {
+                    None => {
+                        self.new_local_with(TyD::of(t), true, Some(l), closure)?;
+                        match self.pat_local.get_mut(p.ix()) {
+                            Some(slot) => *slot = l.0,
+                            None => return self.refuse_pat(Form::Malformed, p),
+                        }
+                    }
+                    Some(m) => {
+                        let rt = TyD { wrap: Some(m), ty: t };
+                        self.new_local_with(rt, true, Some(l), closure)?;
+                        let at = self.place_of(l);
+                        let place = self.project(at, rt, Proj::Deref, TyD::of(t), false, closure)?;
+                        self.upvar_places.push((p, place, TyD::of(t)));
                     }
                 }
-                Some(m) => {
-                    let rt = TyD { wrap: Some(m), ty: t };
-                    self.new_local_with(rt, true, Some(l), closure)?;
-                    let at = self.place_of(l);
-                    let place = self.project(at, rt, Proj::Deref, TyD::of(t), false, closure)?;
-                    self.upvar_places.push((p, place, TyD::of(t)));
-                }
+            } else {
+                self.place_upvar(closure, k as u32, f, through)?;
             }
             let made = self.origs.len() as u32;
             // A by-value capture reached through `&'env self` has the environment's reference
@@ -486,8 +497,14 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
                 match s {
                     SigSlot::Owner(k) => External::SigOwner(k),
                     SigSlot::Late(_) => External::Late,
+                    SigSlot::Static => External::Static,
                 },
             ));
+            if s == SigSlot::Static {
+                let st = self.universal(Region::Static);
+                self.b.known(o, st);
+                self.b.known(st, o);
+            }
             // Two positions of one variable of the clause's binder are one region.
             if let SigSlot::Late(Some(var)) = s {
                 for (i, &t) in slots[..j].iter().enumerate() {
@@ -499,7 +516,8 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
                 }
             }
         }
-        // Each argument's and the return place's implied bounds.
+        // Each argument's and the return place's implied bounds (`&'r T` implies both inner
+        // lifetimes outlive `'r` and inner type parameters `P: 'r`, RFC 1214).
         let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
         for l in 0..=self.nargs {
             let (start, _) = self.local_origs[l as usize];
@@ -515,6 +533,7 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
                     }
                 }
             }
+            self.ref_param_implied(t, start, closure)?;
         }
         // The parameters' patterns, bound as a fn body's are.
         for (i, &p) in params.iter().enumerate() {
@@ -661,8 +680,29 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 self.lay_sig_part(s, nin, 0, &pairs, &heads, &mut owner, out, e)?
             }
             None => {
-                for _ in 0..nin {
-                    out.push(SigSlot::Late(None));
+                let ce = ck.closures.column::<0>().get(row).copied();
+                let written_tys = ce.and_then(|ce| match self.body.exprs.get(ce.ix()) {
+                    Some(Expr::Closure { param_tys, .. }) => self.body.opt_types.get(param_tys.range()),
+                    _ => None,
+                });
+                for (pi, &t) in inputs.iter().enumerate() {
+                    let pn = self.npos(t, e)?;
+                    let is_static_outer = ce.is_some_and(|ce| self.body.closure_static_params.binary_search(&(ce, pi as u32)).is_ok());
+                    let param_written = written_tys.and_then(|l| l.get(pi)).is_some_and(Option::is_some);
+                    for pos in 0..pn {
+                        if pos == 0 && is_static_outer {
+                            out.push(SigSlot::Static);
+                        } else if from == SigFrom::Inferred && !param_written {
+                            // Unannotated inferred closure parameters are NOT higher-ranked in
+                            // Rust: their lifetimes are existential regions of the closure value
+                            // in the enclosing body (so `let pipe = |fd, what| DeadlineFd::new(fd, what)`
+                            // infers `what: &'static str` cleanly while `|x: &T|` stays higher-ranked).
+                            out.push(SigSlot::Owner(owner));
+                            owner += 1;
+                        } else {
+                            out.push(SigSlot::Late(None));
+                        }
+                    }
                 }
             }
         }
@@ -966,6 +1006,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 for j in 0..n {
                     let target = match slots[at + j] {
                         SigSlot::Owner(k) => self.origs[(base + k) as usize],
+                        SigSlot::Static => self.universal(Region::Static),
                         SigSlot::Late(Some(v)) => match vars.iter().find(|(w, _)| *w == v) {
                             Some(&(_, o)) => {
                                 shared = true;
@@ -1060,6 +1101,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             if binds && !self.sig_from_call(row, e)? && self.sig_needs(row, e)? {
                 return self.refuse(Form::ClosureSigHigherRanked { callee }, e);
             }
+            if self.tie_closure_sig_exact(callee, p as u32, row, ncap, nsig, args, inst, &mut origin, e)? {
+                params = Some(written);
+                continue;
+            }
             // Each owner position is tied both ways to every position below: two or more make
             // them all equal, a superset of the clause's relation: noted (not refused).
             let mut ties = 0u32;
@@ -1097,6 +1142,317 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             params = Some(written);
         }
         Ok(())
+    }
+
+    /// Attempts to tie closure `args[p]`'s owner signature slots (`0..nsig`) directly against the
+    /// callee's `Fn*` and `Output` clauses for `Param(p)` (e.g. `Option::map<T, U, F: FnOnce(T) -> U>`
+    /// ties `T` only to the closure input and `U` only to its output, never equating `T` and `U`).
+    /// Returns `Ok(true)` when every owner slot was matched precisely; `Ok(false)` to fall back to
+    /// the conservative all-arguments tie.
+    #[expect(clippy::too_many_arguments, reason = "callee, closure parameter index/row/counts, call args, instances and origin lookup")]
+    fn tie_closure_sig_exact(
+        &mut self,
+        callee: ItemKey,
+        p: u32,
+        row: usize,
+        ncap: u32,
+        nsig: u32,
+        args: &[PTy],
+        inst: &mut Vec<(Region, Origin), A>,
+        origin: &mut impl FnMut(&mut Self, u32, u32) -> Option<Origin>,
+        e: ExprId,
+    ) -> Result<bool, Refusal> {
+        let facts: &'b F = self.facts;
+        let Ok(clauses) = facts.regions().clauses(callee) else {
+            return Ok(false);
+        };
+        let ck: &'c Checked<'c> = self.ck;
+        let Some(&sig_ty) = ck.closures.column::<2>().get(row) else {
+            return Ok(false);
+        };
+        let all: &'c [PTy] = match self.node(sig_ty, e)? {
+            PNode::FnPtr(l, _) => self.list(l, e)?,
+            _ => return Ok(false),
+        };
+        let Some((&act_out, act_ins)) = all.split_last() else {
+            return Ok(false);
+        };
+        let mut cslots: Vec<SigSlot, A> = Vec::new_in(self.alloc);
+        self.sig_slots(row, e, &mut cslots)?;
+        let mut nin = 0u32;
+        for &t in act_ins {
+            nin += self.npos(t, e)?;
+        }
+        let nout = self.npos(act_out, e)?;
+        if cslots.len() != (nin + nout) as usize {
+            return Ok(false);
+        }
+        let arity = crate::one_call::FactsArity { facts };
+        let heads = blaze_borrow::Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
+        let out_name = blaze_typeck::Name::of("Output");
+        let mut args_clause: Option<(PTy, &[Region])> = None;
+        let mut out_clause: Option<(PTy, &[Region])> = None;
+        for c in clauses {
+            let ct = c.col.ty();
+            match blaze_borrow::RegionTypes::node(&heads, ct) {
+                Ok(PNode::ExTrait(tr, _)) if facts.is_fn_trait(tr) => {
+                    let Ok(kids) = blaze_borrow::RegionTypes::kids(&heads, ct) else { continue };
+                    let (Some(subj), Some(tup)) = (kids.get(0), kids.get(1)) else { continue };
+                    if !matches!(blaze_borrow::RegionTypes::node(&heads, subj), Ok(PNode::Param(q)) if q == p) {
+                        continue;
+                    }
+                    let Ok(PNode::Tuple(_)) = blaze_borrow::RegionTypes::node(&heads, tup) else { continue };
+                    let Ok(tkids) = blaze_borrow::RegionTypes::kids(&heads, tup) else { continue };
+                    if tkids.len() as usize != act_ins.len() {
+                        continue;
+                    }
+                    if let Some(tslots) = c.col.child(1) {
+                        args_clause = Some((tup, tslots));
+                    }
+                }
+                Ok(PNode::ExProj { trait_: tr, name, term, .. }) if facts.is_fn_trait(tr) && name == out_name => {
+                    let Ok(kids) = blaze_borrow::RegionTypes::kids(&heads, ct) else { continue };
+                    let (Some(subj), Some(tup)) = (kids.get(0), kids.get(1)) else { continue };
+                    if !matches!(blaze_borrow::RegionTypes::node(&heads, subj), Ok(PNode::Param(q)) if q == p) {
+                        continue;
+                    }
+                    let Ok(PNode::Tuple(_)) = blaze_borrow::RegionTypes::node(&heads, tup) else { continue };
+                    let Ok(tkids) = blaze_borrow::RegionTypes::kids(&heads, tup) else { continue };
+                    if tkids.len() as usize != act_ins.len() {
+                        continue;
+                    }
+                    if let Some(oslots) = c.col.child(2) {
+                        out_clause = Some((term, oslots));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some((decl_tup, decl_tup_slots)) = args_clause else {
+            return Ok(false);
+        };
+        let mut work: Vec<(PTy, &[Region], PTy, usize, usize), A> = Vec::new_in(self.alloc);
+        // Push output first (so inputs pop first; order does not affect constraints).
+        if nout > 0 {
+            let Some((decl_out, decl_out_slots)) = out_clause else {
+                return Ok(false);
+            };
+            work.push((decl_out, decl_out_slots, act_out, nin as usize, (nin + nout) as usize));
+        }
+        // Push each input pair from `ArgsTuple` alongside `act_ins`.
+        let Ok(tkids) = blaze_borrow::RegionTypes::kids(&heads, decl_tup) else {
+            return Ok(false);
+        };
+        let mut d_off = 0usize;
+        let mut c_off = 0usize;
+        for (i, &act_in) in act_ins.iter().enumerate() {
+            let Some(dk) = tkids.get(i as u32) else { return Ok(false) };
+            let Ok(dc) = blaze_borrow::RegionTypes::count(&heads, dk) else { return Ok(false) };
+            let dn = dc.get() as usize;
+            let Some(dslice) = decl_tup_slots.get(d_off..d_off + dn) else { return Ok(false) };
+            d_off += dn;
+            let cn = self.npos(act_in, e)? as usize;
+            work.push((dk, dslice, act_in, c_off, c_off + cn));
+            c_off += cn;
+        }
+        if d_off != decl_tup_slots.len() || c_off != nin as usize {
+            return Ok(false);
+        }
+        // Collect `(owner_k, target_origin)` ties.
+        let mut pairs: Vec<(u32, Origin), A> = Vec::new_in(self.alloc);
+        let mut seen: Vec<u32, A> = Vec::new_in(self.alloc);
+        seen.resize(nsig as usize, 0u32);
+        let mut steps = 0u32;
+        while let Some((decl, dslots, act, clo, chi)) = work.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return Ok(false);
+            }
+            let slice = &cslots[clo..chi];
+            if !slice.iter().any(|s| matches!(s, SigSlot::Owner(_))) {
+                continue;
+            }
+            let Ok(dnode) = blaze_borrow::RegionTypes::node(&heads, decl) else {
+                return Ok(false);
+            };
+            match (dnode, self.node(act, e)?) {
+                (PNode::Param(q), _) => {
+                    let Some(&arg_ty) = args.get(q as usize) else { return Ok(false) };
+                    let n = self.npos(arg_ty, e)?;
+                    if n as usize != slice.len() {
+                        return Ok(false);
+                    }
+                    for (j, &ss) in slice.iter().enumerate() {
+                        if let SigSlot::Owner(k) = ss {
+                            if k >= nsig {
+                                return Ok(false);
+                            }
+                            let Some(t) = origin(self, q, j as u32) else { return Ok(false) };
+                            pairs.push((k, t));
+                            seen[k as usize] = seen[k as usize].saturating_add(1);
+                        }
+                    }
+                }
+                (PNode::Ref(_, di), PNode::Ref(_, ai)) => {
+                    let Some(&r0) = dslots.first() else { return Ok(false) };
+                    if let Some(&SigSlot::Owner(k)) = slice.first() {
+                        if k >= nsig {
+                            return Ok(false);
+                        }
+                        let t = match r0 {
+                            Region::Param(_) => self.instance(inst, r0),
+                            Region::Static => self.universal(Region::Static),
+                            Region::Late { .. } => return Ok(false),
+                        };
+                        pairs.push((k, t));
+                        seen[k as usize] = seen[k as usize].saturating_add(1);
+                    }
+                    work.push((di, &dslots[1..], ai, clo + 1, chi));
+                }
+                (PNode::Ptr(_, di), PNode::Ptr(_, ai))
+                | (PNode::Slice(di), PNode::Slice(ai))
+                | (PNode::Array(di, _), PNode::Array(ai, _))
+                | (PNode::Pat(di, _), PNode::Pat(ai, _)) => {
+                    work.push((di, dslots, ai, clo, chi));
+                }
+                (PNode::Tuple(_), PNode::Tuple(al)) => {
+                    let Ok(dkids) = blaze_borrow::RegionTypes::kids(&heads, decl) else { return Ok(false) };
+                    let alist = self.list(al, e)?;
+                    if dkids.len() as usize != alist.len() {
+                        return Ok(false);
+                    }
+                    let mut doff = 0usize;
+                    let mut coff = clo;
+                    for (i, &ak) in alist.iter().enumerate() {
+                        let Some(dk) = dkids.get(i as u32) else { return Ok(false) };
+                        let Ok(dc) = blaze_borrow::RegionTypes::count(&heads, dk) else { return Ok(false) };
+                        let dn = dc.get() as usize;
+                        let Some(ds) = dslots.get(doff..doff + dn) else { return Ok(false) };
+                        doff += dn;
+                        let cn = self.npos(ak, e)? as usize;
+                        work.push((dk, ds, ak, coff, coff + cn));
+                        coff += cn;
+                    }
+                    if doff != dslots.len() || coff != chi {
+                        return Ok(false);
+                    }
+                }
+                (PNode::Adt(dk, _), PNode::Adt(ak, al)) if dk == ak => {
+                    let lts = self.adt_facts(ak, e)?.lifetimes as usize;
+                    if dslots.len() < lts || slice.len() < lts {
+                        return Ok(false);
+                    }
+                    for i in 0..lts {
+                        if let SigSlot::Owner(k) = slice[i] {
+                            if k >= nsig {
+                                return Ok(false);
+                            }
+                            let t = match dslots[i] {
+                                Region::Param(_) => self.instance(inst, dslots[i]),
+                                Region::Static => self.universal(Region::Static),
+                                Region::Late { .. } => return Ok(false),
+                            };
+                            pairs.push((k, t));
+                            seen[k as usize] = seen[k as usize].saturating_add(1);
+                        }
+                    }
+                    let Ok(dkids) = blaze_borrow::RegionTypes::kids(&heads, decl) else { return Ok(false) };
+                    let alist = self.list(al, e)?;
+                    if dkids.len() as usize != alist.len() {
+                        return Ok(false);
+                    }
+                    let mut doff = lts;
+                    let mut coff = clo + lts;
+                    for (i, &ak_ty) in alist.iter().enumerate() {
+                        let Some(dk_ty) = dkids.get(i as u32) else { return Ok(false) };
+                        let Ok(dc) = blaze_borrow::RegionTypes::count(&heads, dk_ty) else { return Ok(false) };
+                        let dn = dc.get() as usize;
+                        let Some(ds) = dslots.get(doff..doff + dn) else { return Ok(false) };
+                        doff += dn;
+                        let cn = self.npos(ak_ty, e)? as usize;
+                        work.push((dk_ty, ds, ak_ty, coff, coff + cn));
+                        coff += cn;
+                    }
+                    if doff != dslots.len() || coff != chi {
+                        return Ok(false);
+                    }
+                }
+                (PNode::Alias { .. } | PNode::Opaque(..), _) => {
+                    // Collect the callee type parameters inside the projection/opaque's args
+                    // (e.g. `Self` in `Self::Item`), plus any non-late regions in `dslots`.
+                    let mut qparams: Vec<u32, A> = Vec::new_in(self.alloc);
+                    let mut pstack: Vec<PTy, A> = Vec::new_in(self.alloc);
+                    if let Ok(dkids) = blaze_borrow::RegionTypes::kids(&heads, decl) {
+                        for j in 0..dkids.len() {
+                            if let Some(kid) = dkids.get(j) {
+                                pstack.push(kid);
+                            }
+                        }
+                    }
+                    let mut psteps = 0u32;
+                    while let Some(x) = pstack.pop() {
+                        psteps += 1;
+                        if psteps > MOST_POSITIONS {
+                            return Ok(false);
+                        }
+                        match blaze_borrow::RegionTypes::node(&heads, x) {
+                            Ok(PNode::Param(q)) => {
+                                if !qparams.contains(&q) {
+                                    qparams.push(q);
+                                }
+                            }
+                            Ok(_) => {
+                                if let Ok(ks) = blaze_borrow::RegionTypes::kids(&heads, x) {
+                                    for j in 0..ks.len() {
+                                        if let Some(kid) = ks.get(j) {
+                                            pstack.push(kid);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => return Ok(false),
+                        }
+                    }
+                    for &ss in slice {
+                        let SigSlot::Owner(k) = ss else { continue };
+                        if k >= nsig {
+                            return Ok(false);
+                        }
+                        for &q in &qparams {
+                            let Some(&arg_ty) = args.get(q as usize) else { return Ok(false) };
+                            let n = self.npos(arg_ty, e)?;
+                            for j in 0..n {
+                                let Some(t) = origin(self, q, j) else { return Ok(false) };
+                                pairs.push((k, t));
+                                seen[k as usize] = seen[k as usize].saturating_add(1);
+                            }
+                        }
+                        for &r in dslots {
+                            if is_late(&r) {
+                                continue;
+                            }
+                            let t = if r == Region::Static { self.universal(Region::Static) } else { self.instance(inst, r) };
+                            pairs.push((k, t));
+                            seen[k as usize] = seen[k as usize].saturating_add(1);
+                        }
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        // Only commit when every owner signature slot `0..nsig` was tied to at least one target.
+        if seen.iter().any(|&c| c == 0) {
+            return Ok(false);
+        }
+        if seen.iter().any(|&c| c > 1) {
+            self.coarse_step(Form::Unified { why: crate::Unified::ClosureSigTies }, e);
+        }
+        for &(k, t) in &pairs {
+            let Some(o) = origin(self, p, ncap + k) else { return self.refuse(Form::Malformed, e) };
+            self.b.subset(t, o);
+            self.b.subset(o, t);
+        }
+        Ok(true)
     }
 
     /// Refuses a value of type `t` holding a closure of this body whose body needs a relation

@@ -103,57 +103,22 @@ impl CallRule for Erased {
     }
 }
 
-/// Today's nine paths (the module's table).
-pub(crate) struct OldPaths;
-
-impl CallRule for OldPaths {
-    const ONE: bool = false;
-    const RELATES: bool = true;
-    type Grain = Positions;
-    fn call<F: Facts, A: Allocator + Copy>(l: &mut Lower<'_, '_, F, A, Self>, site: &CallSite<'_>) -> Result<(), Refusal> {
-        l.call_old(site)
-    }
-}
-
-/// The one call rule, `DROP_ONE` its planted control: the adapter's sink drops the call's first
-/// subset (oracle.rs's control, rule 23). Never true outside a test.
-pub(crate) struct OneRuleOf<const DROP_ONE: bool>;
-
 /// The one call rule (blaze-borrow `call::call`).
-pub(crate) type OneRule = OneRuleOf<false>;
+pub(crate) struct OneRule;
 
-/// The planted control: [`OneRule`] that loses one constraint per call.
-#[cfg(test)]
-pub(crate) type OneRuleDropOne = OneRuleOf<true>;
-
-impl<const DROP_ONE: bool> CallRule for OneRuleOf<DROP_ONE> {
+impl CallRule for OneRule {
     const ONE: bool = true;
     const RELATES: bool = true;
     type Grain = RegionSlots;
     fn call<F: Facts, A: Allocator + Copy>(l: &mut Lower<'_, '_, F, A, Self>, site: &CallSite<'_>) -> Result<(), Refusal> {
-        l.call_one(site, DROP_ONE, true)
-    }
-}
-
-/// The census's control (rule 23): [`OneRule`] WITHOUT its closure-argument tie
-/// (`Lower::tie_closure_args`) and with every body type holding no type parameter
-/// (`Lower::captured_params` not asked). Under it census wave-1119's (b) at `Option::map` and
-/// at `spawn_blocking` come back: a closure's result returned past its argument's lifetime is
-/// accepted, and so is a closure holding a `T` passed where `F: 'static` (front2
-/// `FactsPlant::ClosureArgsUntied`). Never production's.
-pub(crate) struct OneRuleUntied;
-
-impl CallRule for OneRuleUntied {
-    const ONE: bool = true;
-    const RELATES: bool = true;
-    type Grain = RegionSlots;
-    fn call<F: Facts, A: Allocator + Copy>(l: &mut Lower<'_, '_, F, A, Self>, site: &CallSite<'_>) -> Result<(), Refusal> {
-        l.call_one(site, false, false)
+        l.call_one(site, false, true)?;
+        l.stats.calls_by_signature += 1;
+        Ok(())
     }
 }
 
 /// THE FLIP LINE: the call rule production lowers with.
-pub(crate) type Production = OldPaths;
+pub(crate) type Production = OneRule;
 
 /// Why the one rule did not relate a call (`Form::OneRule`): blaze-borrow's [`Refused`], kept
 /// to what a refusal record orders and hashes by, and the adapter's own.
@@ -450,13 +415,22 @@ struct CallSel<'s, F: Facts> {
 }
 
 impl<F: Facts> CallSel<'_, F> {
-    /// Whether `args` proves row `r`'s arguments different from the ask's.
-    fn differs(&self, r: &Projected, args: &dyn AskArgs) -> bool {
-        let (Ok(list), Some(n)) = (self.tys.list(r.args), args.count()) else { return false };
+    /// How row `r`'s arguments compare against the ask's: `Differ` if any differs, `Same` if
+    /// every argument matches structurally, `Unknown` otherwise.
+    fn match_row(&self, r: &Projected, args: &dyn AskArgs) -> Keyed {
+        let (Ok(list), Some(n)) = (self.tys.list(r.args), args.count()) else { return Keyed::Unknown };
         if u32::try_from(list.len()).ok() != Some(n) {
-            return true;
+            return Keyed::Differ;
         }
-        (0..n).zip(list.iter()).any(|(k, &t)| args.compare(k, t) == Keyed::Differ)
+        let mut exact = true;
+        for (k, &t) in (0..n).zip(list.iter()) {
+            match args.compare(k, t) {
+                Keyed::Differ => return Keyed::Differ,
+                Keyed::Unknown => exact = false,
+                Keyed::Same => {}
+            }
+        }
+        if exact { Keyed::Same } else { Keyed::Unknown }
     }
 
     /// The head of row `r`'s `Self` argument (its first).
@@ -473,9 +447,8 @@ impl<F: Facts> CallSel<'_, F> {
         }
     }
 
-    /// The selected impl `imp` at its arguments `args`, its header and the asked value read.
-    fn impl_at(&self, ask: Ask, imp: ItemKey, args: List) -> Selection<'_> {
-        let Ok(types) = self.tys.list(args) else { return Selection::Not(NotSelected::Unanswered) };
+    /// The selected impl `imp` with `ntypes` type parameters, its header and asked value read.
+    fn impl_at_count(&self, ask: Ask, imp: ItemKey, ntypes: u32) -> Selection<'_> {
         let regions = self.facts.regions();
         let (Ok((_, Some(trait_col))), Ok(params)) = (regions.impl_header(imp), regions.lifetime_params(imp)) else {
             return Selection::Not(NotSelected::HeadUnread);
@@ -485,7 +458,7 @@ impl<F: Facts> CallSel<'_, F> {
         let head = ImplHead {
             imp,
             lifetimes: params.count(),
-            types: u32::try_from(types.len()).unwrap_or(u32::MAX),
+            types: ntypes,
             trait_ref: Typed { ty: trait_col.ty(), col: trait_col.as_slice() },
         };
         let value = match ask.name {
@@ -501,6 +474,12 @@ impl<F: Facts> CallSel<'_, F> {
         };
         Selection::Impl { head, value }
     }
+
+    /// The selected impl `imp` at its arguments `args`, its header and the asked value read.
+    fn impl_at(&self, ask: Ask, imp: ItemKey, args: List) -> Selection<'_> {
+        let Ok(types) = self.tys.list(args) else { return Selection::Not(NotSelected::Unanswered) };
+        self.impl_at_count(ask, imp, u32::try_from(types.len()).unwrap_or(u32::MAX))
+    }
 }
 
 impl<F: Facts> Selected for CallSel<'_, F> {
@@ -515,21 +494,88 @@ impl<F: Facts> Selected for CallSel<'_, F> {
     fn relates_nothing(&self, trait_: ItemKey) -> bool {
         self.facts.trait_relates_nothing(trait_)
     }
+    fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
+        self.facts.is_zero_slot_builtin_assoc(trait_, name)
+    }
+    fn is_fn_trait(&self, trait_: ItemKey) -> bool {
+        self.facts.is_fn_trait(trait_)
+    }
+    fn fn_def_sig(&self, item: ItemKey) -> Result<(blaze_typeck::region_facts::ParamsView<'_>, blaze_typeck::region_facts::ColView<'_>, ImplWhere<'_>), NotSelected> {
+        let regions = self.facts.regions();
+        let Ok(sig) = regions.sig(item) else { return Err(NotSelected::Builtin) };
+        let where_ = match (regions.clauses(item), regions.outlives(item)) {
+            (Ok(views), Ok(outlives)) => ImplWhere { params: sig.params.outlives(), outlives, views },
+            _ => ImplWhere::NONE,
+        };
+        Ok((sig.params, sig.col, where_))
+    }
+    fn trait_clauses(&self, trait_: ItemKey) -> Option<(u32, &[ClauseView<'_>])> {
+        let regions = self.facts.regions();
+        let views = regions.clauses(trait_).ok()?;
+        let lts = regions.lifetime_params(trait_).ok().map(|p| p.count()).or_else(|| self.facts.trait_lifetimes(trait_))?;
+        Some((lts, views))
+    }
+    fn assoc_clauses(&self, trait_: ItemKey, name: Name) -> Option<(u32, &[ClauseView<'_>])> {
+        let assoc_item = self.facts.assoc_item(trait_, name)?;
+        let regions = self.facts.regions();
+        let views = regions.clauses(assoc_item).ok()?;
+        let lts = regions.lifetime_params(assoc_item).ok()?.count();
+        Some((lts, views))
+    }
+    fn opaque_clauses(&self, opaque: ItemKey) -> Option<(u32, &[ClauseView<'_>])> {
+        let regions = self.facts.regions();
+        let views = regions.clauses(opaque).ok()?;
+        let lts = regions.lifetime_params(opaque).ok()?.count();
+        Some((lts, views))
+    }
 
     fn select_keyed(&self, ask: Ask, args: &dyn AskArgs) -> Selection<'_> {
-        let answers = |r: &&Projected| r.trait_ == ask.trait_ && (ask.name.is_none() || r.name == ask.name);
-        let mut found: Option<&Projected> = None;
+        let answers = |r: &&Projected| {
+            r.trait_ == ask.trait_
+                && (ask.name.is_none()
+                    || r.name == ask.name
+                    || (r.name.is_none() && matches!(r.selected, blaze_typeck::Selected::Impl { .. })))
+        };
+        let mut exact: Option<&Projected> = None;
+        let mut exact_conflict = false;
+        let mut loose: Option<&Projected> = None;
+        let mut loose_conflict = false;
         for r in self.rows.iter().filter(answers) {
-            if self.differs(r, args) {
-                continue;
-            }
-            match found {
-                None => found = Some(r),
-                Some(f) if f.selected == r.selected => {}
-                Some(_) => return Selection::Not(NotSelected::TwoSources),
+            match self.match_row(r, args) {
+                Keyed::Differ => continue,
+                Keyed::Same => match exact {
+                    None => exact = Some(r),
+                    Some(f) if f.selected == r.selected => {}
+                    Some(_) => exact_conflict = true,
+                },
+                Keyed::Unknown => match loose {
+                    None => loose = Some(r),
+                    Some(f) if f.selected == r.selected => {}
+                    Some(_) => loose_conflict = true,
+                },
             }
         }
-        let Some(r) = found else { return Selection::Not(NotSelected::Unanswered) };
+        let found = if exact_conflict {
+            return Selection::Not(NotSelected::TwoSources);
+        } else if exact.is_some() {
+            exact
+        } else if loose_conflict {
+            return Selection::Not(NotSelected::TwoSources);
+        } else {
+            loose
+        };
+        let Some(r) = found else {
+            // If no call row answers, check the body owner's own enclosing trait impl (for
+            // projections on `Self` inside the caller's own `where`-clauses, e.g. `Cycle<I>::Item`,
+            // `Zip<A, B>::Item`).
+            if let Some((imp, imp_tr, ntypes, self_adt)) = self.facts.owner_trait_impl()
+                && imp_tr == ask.trait_
+                && args.self_adt() == Some(self_adt)
+            {
+                return self.impl_at_count(ask, imp, ntypes);
+            }
+            return Selection::Not(NotSelected::Unanswered);
+        };
         match r.selected {
             blaze_typeck::Selected::Impl { imp, args } => self.impl_at(ask, imp, args),
             blaze_typeck::Selected::Generic => Selection::Not(NotSelected::GenericSelf(self.self_head(r))),
@@ -558,6 +604,20 @@ impl<F: Facts> Selected for CallSel<'_, F> {
     }
 }
 
+/// Pre-laid closure signatures of the caller body for `Owner::closure_sig`.
+struct ClosureSigs<'s> {
+    rows: &'s [(u32, PTy, u32, u32, u32, u32)],
+    regs: &'s [Region],
+}
+
+impl<'s> ClosureSigs<'s> {
+    fn of(&self, ordinal: u32) -> Option<blaze_borrow::ClosureSig<'s>> {
+        let &(_, sig_ty, ncap, nsig, start, len) = self.rows.iter().find(|r| r.0 == ordinal)?;
+        let col = self.regs.get(start as usize..start.checked_add(len)? as usize)?;
+        Some(blaze_borrow::ClosureSig { sig_ty, ncap, nsig, col })
+    }
+}
+
 /// The caller: its universal origins, its type parameters' `ρ_P`, its own `P: Tr<..>` bounds
 /// (subject-first clause columns, `ExTrait(Tr, [P, ..])`).
 struct CallOwner<'s> {
@@ -567,6 +627,7 @@ struct CallOwner<'s> {
     bounds: &'s [ClauseView<'s>],
     heads: &'s dyn RegionTypes,
     bodies: BodyParams<'s>,
+    closures: ClosureSigs<'s>,
 }
 
 impl Owner for CallOwner<'_> {
@@ -582,6 +643,15 @@ impl Owner for CallOwner<'_> {
     fn bound(&self, p: u32, trait_: ItemKey) -> Option<Typed<'_>> {
         clause_of(self.heads, self.bounds, p, trait_).map(|cv| Typed { ty: cv.col.ty(), col: cv.col.as_slice() })
     }
+    fn proj_bound(&self, p: u32, trait_: ItemKey, name: Name) -> Option<Typed<'_>> {
+        proj_clause_of(self.heads, self.bounds, p, trait_, name).map(|cv| Typed { ty: cv.col.ty(), col: cv.col.as_slice() })
+    }
+    fn clauses(&self) -> &[ClauseView<'_>] {
+        self.bounds
+    }
+    fn closure_sig(&self, ordinal: u32) -> Option<blaze_borrow::ClosureSig<'_>> {
+        self.closures.of(ordinal)
+    }
     fn body_params(&self, body: PTy) -> Option<&[u32]> {
         self.bodies.of(body)
     }
@@ -595,6 +665,19 @@ fn clause_of<'v>(heads: &dyn RegionTypes, views: &'v [ClauseView<'v>], p: u32, t
         let Ok(PNode::ExTrait(k, _)) = heads.node(t) else { return false };
         let Some(subject) = heads.kids(t).ok().and_then(|kids| kids.get(0)) else { return false };
         k == trait_ && matches!(heads.node(subject), Ok(PNode::Param(q)) if q == p)
+    })
+}
+
+/// The projection clause `Param(p): trait_<.., name = U>` among `views` (`ExProj`, subject-first).
+fn proj_clause_of<'v>(heads: &dyn RegionTypes, views: &'v [ClauseView<'v>], p: u32, trait_: ItemKey, name: Name) -> Option<&'v ClauseView<'v>> {
+    views.iter().find(|cv| {
+        let t = cv.col.ty();
+        let Ok(PNode::ExProj { trait_: k, name: n, .. }) = heads.node(t) else { return false };
+        if k != trait_ || n != name {
+            return false;
+        }
+        let Some(subject) = heads.kids(t).ok().and_then(|kids| kids.get(0)) else { return false };
+        matches!(heads.node(subject), Ok(PNode::Param(q)) if q == p)
     })
 }
 
@@ -619,7 +702,11 @@ impl<A: Allocator + Copy> Constraints for Sink<'_, A> {
         self.subset(a, s);
     }
     fn fresh(&mut self, kind: Kind) -> Origin {
-        self.b.origin(kind == Kind::Placeholder)
+        let o = self.b.origin(kind == Kind::Placeholder);
+        if kind == Kind::Placeholder {
+            self.b.known(self.static_, o);
+        }
+        o
     }
 }
 
@@ -752,6 +839,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 self.body_slots(v.ty.ty, &mut bodies, e)?;
             }
             self.body_slots(site.ty.ty, &mut bodies, e)?;
+            // Also collect any nested body types inside a closure's own signature type so
+            // `caller.count(sig_ty)` knows their slot counts.
+            let mut bi = 0usize;
+            while bi < bodies.len() {
+                let bt = bodies[bi].0;
+                bi += 1;
+                if let PNode::Closure { owner, ordinal, .. } = self.node(bt, e)?
+                    && owner == self.body.owner
+                    && let Some(&sig_ty) = self.ck.closures.column::<2>().get(ordinal as usize)
+                {
+                    self.body_slots(sig_ty, &mut bodies, e)?;
+                }
+            }
         }
         let caller = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &bodies);
         let heads = Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
@@ -790,10 +890,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         }
         let dest = self.value_slots(site.ty, Some(site.out), &caller, &mut col, &mut seen, item, e)?;
         // Each body type among the call's types: the caller's parameters its captures hold
-        // (`Owner::body_params`, read by the components rule), their `ρ_P` made with the rest.
+        // (`Owner::body_params`, read by the components rule), their `ρ_P` made with the rest;
+        // and for each closure of this body, its laid signature column for `Owner::closure_sig`.
         let mut body_rows: Vec<(PTy, u32, u32), A> = Vec::new_in(self.alloc);
         let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
-        for &(t, _) in bodies.iter() {
+        let mut closure_rows: Vec<(u32, PTy, u32, u32, u32, u32), A> = Vec::new_in(self.alloc);
+        let mut closure_regs: Vec<Region, A> = Vec::new_in(self.alloc);
+        let mut sslots: Vec<crate::closure::SigSlot, A> = Vec::new_in(self.alloc);
+        for &(t, total_slots) in bodies.iter() {
             let mut one: Vec<u32, A> = Vec::new_in(self.alloc);
             if closures_related {
                 self.captured_params(t, e, &mut one)?;
@@ -806,6 +910,42 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 held.push(p);
             }
             body_rows.push((t, start, len));
+            if closures_related
+                && let PNode::Closure { owner, ordinal, .. } = self.node(t, e)?
+                && owner == self.body.owner
+                && !closure_rows.iter().any(|r| r.0 == ordinal)
+                && let Some(&sig_ty) = self.ck.closures.column::<2>().get(ordinal as usize)
+                && self.sig_slots(ordinal as usize, e, &mut sslots).is_ok()
+                && caller.count(sig_ty) == Ok(SlotCount::new(sslots.len() as u32))
+            {
+                let mut nsig = 0u32;
+                let mut max_late = 0u32;
+                for &s in sslots.iter() {
+                    match s {
+                        crate::closure::SigSlot::Owner(j) => nsig = nsig.max(j + 1),
+                        crate::closure::SigSlot::Late(Some((0, v))) => max_late = max_late.max(v + 1),
+                        _ => {}
+                    }
+                }
+                if let Some(ncap) = total_slots.get().checked_sub(nsig) {
+                    let rstart = u32::try_from(closure_regs.len()).unwrap_or(u32::MAX);
+                    let mut next_late = max_late;
+                    for &s in sslots.iter() {
+                        closure_regs.push(match s {
+                            crate::closure::SigSlot::Owner(j) => Region::Param(j),
+                            crate::closure::SigSlot::Static => Region::Static,
+                            crate::closure::SigSlot::Late(Some((binder, var))) => Region::Late { binder, var },
+                            crate::closure::SigSlot::Late(None) => {
+                                let var = next_late;
+                                next_late += 1;
+                                Region::Late { binder: 0, var }
+                            }
+                        });
+                    }
+                    let rlen = sslots.len() as u32;
+                    closure_rows.push((ordinal, sig_ty, ncap, nsig, rstart, rlen));
+                }
+            }
         }
 
         // The callee's signature and clauses, in the heads' table.
@@ -839,16 +979,21 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 }
             }
         }
-        // The clauses that expected a closure argument's signature at this call (`SigFrom::
-        // Clause`: `F: FnOnce(T) -> U` and its `Output` binding): their equation is
-        // `tie_closure_args`'s below (a superset of it), never asked of a selection here (the
-        // builtin rule for a closure is no impl).
+        // When a closure argument of this body has its exact signature laid in `closure_rows`,
+        // `blaze-borrow`'s builtin `Fn*` rule proves its `Fn*` and `Output` clauses directly
+        // without coarse `tie_closure_args`. Only skip `sig_clauses` for closures NOT in
+        // `closure_rows` (e.g. under the `OneRuleUntied` control).
         let mut sig_clauses: Vec<u32, A> = Vec::new_in(self.alloc);
+        let mut need_coarse_closure_tie = false;
         for &t in self.list(g, e)? {
             let PNode::Closure { owner, ordinal, .. } = self.node(t, e)? else { continue };
             if owner != self.body.owner {
                 continue;
             }
+            if closure_rows.iter().any(|r| r.0 == ordinal) {
+                continue;
+            }
+            need_coarse_closure_tie = true;
             let row = ordinal as usize;
             if let Some(&blaze_typeck::SigFrom::Clause { nth, output, .. }) = self.ck.closures.column::<4>().get(row)
                 && self.sig_from_call(row, e)?
@@ -867,14 +1012,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         // (relate.rs `inert`), else tied through the selected impl or the caller's bound, or
         // refused by name. A projection clause that writes a region stays refused here.
         for cv in views.iter() {
-            if subjects.contains(&cv.nth) || (cv.col.is_empty() && sig_clauses.contains(&cv.nth)) {
+            if subjects.contains(&cv.nth) || sig_clauses.contains(&cv.nth) {
                 continue;
             }
             let clause = Typed { ty: cv.col.ty(), col: cv.col.as_slice() };
             match heads.node(cv.col.ty()) {
                 Ok(PNode::ExTrait(..)) => clauses.push(ClauseIn::TraitOf { trait_ref: clause }),
-                Ok(PNode::ExProj { .. }) if cv.col.is_empty() => clauses.push(ClauseIn::ProjOf { proj: clause }),
-                Ok(PNode::ExProj { .. }) => return self.one_refuse(item, OneRuleWhy::ProjectionClause { clause: cv.nth }, e),
+                Ok(PNode::ExProj { .. }) => clauses.push(ClauseIn::ProjOf { proj: clause }),
                 Ok(_) => {}
                 Err(u) => return self.one_refuse(item, OneRuleWhy::counted(u, CountAt::HeadClause), e),
             }
@@ -911,7 +1055,15 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         };
         let sel = CallSel { rows: self.ck.call_selections(e), facts, tys: self.tys };
         let res = {
-            let who = CallOwner { item: owner, uni: &self.uni, params: &self.param_origs, bounds, heads: &heads, bodies: BodyParams { rows: &body_rows, held: &held } };
+            let who = CallOwner {
+                item: owner,
+                uni: &self.uni,
+                params: &self.param_origs,
+                bounds,
+                heads: &heads,
+                bodies: BodyParams { rows: &body_rows, held: &held },
+                closures: ClosureSigs { rows: &closure_rows, regs: &closure_regs },
+            };
             let mut sink = Sink { b: &mut self.b, static_, drop_next: drop_first };
             let mut cx = Cx { types: &caller, sig_types: &heads, selected: &sel, owner: &who, origins: &col, out: &mut sink };
             blaze_borrow::call(&mut cx, Callee::Fn(sig), GenericArgs { lifetimes, types: &types }, &args, dest, self.alloc)
@@ -919,7 +1071,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         if let Err(r) = res {
             return self.one_refuse(item, OneRuleWhy::of(r), e);
         }
-        if !closures_related {
+        if !closures_related || !need_coarse_closure_tie {
             return Ok(());
         }
         self.tie_closure_args(item, g, params, lifetimes, &types, &col, e)

@@ -50,7 +50,7 @@ pub use inst::{
     Arg, Ask, Callee, Clause, ClauseIn, EnvId, Envs, GenericArgs, ImplHead, ImplValue, Inst, Late, NotSelected, Selected,
     Selection, Side, Sig, Slots, Typed, ValueKind, instantiate, split_fn_col,
 };
-pub use relate::{Constraints, Cx, Kind, Owner, clauses, head_eq, relate, relate_sides, well_formed};
+pub use relate::{ClosureSig, Constraints, Cx, Kind, Owner, clauses, head_eq, relate, relate_sides, well_formed};
 pub use sink::FlowConstraints;
 pub use types::{Columns, Kids, Pos, RegionTypes, Slot, SlotCount, SlotRange, Unknown, Variances, Why};
 

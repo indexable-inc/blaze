@@ -50,8 +50,8 @@ fn engine_checks_a_body_that_reads_a_dependency_const_decoder() {
     let (_, checked) = engine_opts(&io, cold);
     let printed = stdout(&io).split_off(before);
     let (notes, clean) = &checked.bodies;
-    assert_eq!(checked.status.0, crate::INCOMPLETE.0, "the dependency decoder and its caller have no findings; the unbuilt borrow stage makes the check incomplete: {notes:?}\nengine output:\n{printed}");
-    assert!(printed.contains("NOT checked: borrows"), "the incomplete status names its unbuilt stage:\n{printed}");
+    assert_eq!(checked.status.0, 0, "the dependency decoder and its caller have no findings: {notes:?}\nengine output:\n{printed}");
+    assert!(!printed.contains("NOT checked: borrows"), "all stages checked:\n{printed}");
     assert!(notes.is_empty(), "no body is refused after the dependency body records are produced: {notes:?}");
     assert!(notes.iter().all(|note| !note.contains("Rounds")), "the old no-producer refusal is gone: {notes:?}");
     assert!(*clean >= 3, "the two dependency const fns and app::value are checked: {clean}");

@@ -55,13 +55,10 @@ const CALLS_TEST_ONLY_BROKEN: &str = "#[cfg(test)]\nfn broken() -> u8 {\n    \"n
 const BROKEN: &str = "fn broken() -> u8 {\n    \"not a number\"\n}\n\n#[test]\nfn fine() {}\n\n#[test]\nfn calls() {\n    broken();\n}\n";
 const FIXED: &str = "fn broken() -> u8 {\n    7\n}\n\n#[test]\nfn fine() {}\n\n#[test]\nfn calls() {\n    broken();\n}\n";
 
-/// The status of a `check` that found nothing, while borrows are notes: 3, never 0 (main.rs
-/// `STATUSES`, `blaze explain 3`: "check: incomplete: the stages that ran found nothing, but a
-/// stage `check` is defined to run is not built yet or did not run whole ..."; the borrows stage
-/// is off while body_types.rs `BORROWS_ARE_ERRORS` is false, so a clean check is incomplete).
-const CLEAN_CHECK: Option<i32> = Some(3);
+/// The status of a `check` that found nothing with `BORROWS_ARE_ERRORS = true`: 0.
+const CLEAN_CHECK: Option<i32> = Some(0);
 /// What [`CLEAN_CHECK`]'s evidence says.
-const CLEAN_CHECK_RULE: &str = "a clean check exits 3 while borrows are notes (`blaze explain 3`: \"check: incomplete: the stages that ran found nothing\"; BORROWS_ARE_ERRORS is false)";
+const CLEAN_CHECK_RULE: &str = "a clean check exits 0 when every stage (including borrows) runs clean";
 
 struct Said {
     stdout: String,

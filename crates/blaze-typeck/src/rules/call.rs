@@ -63,19 +63,21 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     fn record_lifetime_impls(&mut self, call: ExprId, item: ItemKey, args: TyList, first: usize) -> Result<(), Stop> {
         let preds = self.reads.predicates(item)?;
         for &clause in preds.clauses {
-            let crate::world::PClause::Trait { trait_, args: formal } = clause else { continue };
-            if crate::selected::holds_alias(preds.types, formal, self.alloc)? {
-                continue;
-            }
+            let (trait_, name, formal) = match clause {
+                crate::world::PClause::Trait { trait_, args: formal } => (trait_, None, formal),
+                crate::world::PClause::Projection { trait_, args: formal, name, .. } => (trait_, Some(name), formal),
+                _ => continue,
+            };
             let actual = self.lower_list(preds.types, formal, args, Cause::Expr(call))?;
-            // One row per trait reference at a call: a projection row of the same trait at the
-            // same arguments (`T: Tr` beside `T::Out`) is this bound's row too, since a
-            // projection is proven through its trait reference's source (rustc's next solver:
-            // `NormalizesTo` merges by the trait goal's `TraitGoalProvenVia`), and the borrow
-            // check reads a bound from any row of its trait and self type (blaze-flow-lower
-            // trait_ties.rs `tie_by_impl`). Selecting it twice is work done twice (rule 77).
-            if !self.projected[first..].iter().any(|&(e, tr, _, a)| e == call && tr == trait_ && a == actual) {
-                self.projected.push((call, trait_, None, actual));
+            // One row per trait reference (or projection) at a call: a projection row of the
+            // same trait at the same arguments (`T: Tr` beside `T::Out`) is this bound's row too,
+            // since a projection is proven through its trait reference's source.
+            let dup = match name {
+                None => self.projected[first..].iter().any(|&(e, tr, _, a)| e == call && tr == trait_ && a == actual),
+                Some(n) => self.projected[first..].iter().any(|&(e, tr, m, a)| e == call && tr == trait_ && m == Some(n) && a == actual),
+            };
+            if !dup {
+                self.projected.push((call, trait_, name, actual));
             }
         }
         Ok(())

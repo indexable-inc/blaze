@@ -109,6 +109,9 @@ pub enum AliasSlot {
     /// Bound inside the aliased type (`for<'a> fn(&'a S)`): `binder` the binding node's index
     /// among the aliased type's binder nodes in pre-order.
     Late { binder: u32, var: u32 },
+    /// A trait object's elided default lifetime (`type H = dyn Fn(..) + Send + Sync`), resolved
+    /// by the use site's context (RFC 599: `'static` in `Arc<H>`, `'a` in `&'a H`).
+    ObjectDefault,
 }
 
 /// A type alias's laid regions ([`Heads::alias_slots`]): its declared lifetime count and its
@@ -294,6 +297,8 @@ pub trait Heads {
     fn trait_supers(&self, trait_: LibKey) -> Option<&[(LibKey, List)]>;
     /// Whether the trait is an `auto trait` (from its own head).
     fn trait_auto(&self, trait_: LibKey) -> Option<bool>;
+    /// Whether the trait declares a `Self: 'static` bound (e.g. `core::any::Any`).
+    fn trait_self_static(&self, trait_: LibKey) -> Option<bool>;
     /// A type alias's generic count and its aliased type over them (`Param(i)` the alias's
     /// i-th parameter): a path to it means the aliased type with its arguments substituted.
     /// `Some(None)`: its head was tried and refused (the why is in the store's `alias_gaps`).
@@ -2525,27 +2530,40 @@ impl<'c> Captures<'c> {
 }
 
 /// What a walk in a container's member is given for `Self` (D148): `Self`'s regions (the impl's
-/// self type's column) and, in a trait impl's member, the impl's trait reference's column, for
-/// `Self::Name` (`projection_slots`, `Through::SelfImpl`). Either `None`: not known, and a use
-/// needing it is refused by name. Made from the container's filed regions by
-/// `SelfGiven::of` (heads.rs), so every member walk (a fn's signature, its clauses and opaque
-/// bounds, a constant's type) is given the same two.
+/// A non-higher-ranked trait bound on a container's own type parameter (`PNode::Param(param)`
+/// bounded by `trait_` with `regions` = the trait clause column's slots, numbered in the
+/// container's lifetime group).
+#[derive(Clone, Debug)]
+pub struct ContainerParamBound {
+    pub param: u32,
+    pub trait_: ItemKey,
+    pub regions: Vec<Region, Alloc<'static>>,
+}
+
+/// What a container's member's region walk is given for `Self` and for bounds on the container's
+/// own type parameters: in an impl's member, `Self`'s regions (the impl's self type's column),
+/// in a trait impl's member the impl's trait reference's column (`projection_slots`,
+/// `Through::SelfImpl`), and in any trait or impl member the container's non-higher-ranked trait
+/// bounds on its type parameters (`Through::Param`). Made from the container's filed regions by
+/// `ContainerRegions::given` (heads.rs), so every member walk (a fn's signature, its clauses and
+/// opaque bounds, a constant's type) is given the same context.
 #[derive(Clone, Copy, Debug)]
 pub struct SelfGiven<'a> {
     pub self_: Option<&'a [Region]>,
     pub impl_trait: Option<&'a [Region]>,
+    pub param_bounds: &'a [ContainerParamBound],
 }
 
 impl SelfGiven<'_> {
-    /// Nothing given: outside an impl, or where the container's regions are not filed yet.
-    pub const NONE: SelfGiven<'static> = SelfGiven { self_: None, impl_trait: None };
+    /// Nothing given: outside an impl/trait, or where the container's regions are not filed yet.
+    pub const NONE: SelfGiven<'static> = SelfGiven { self_: None, impl_trait: None, param_bounds: &[] };
 }
 
-/// `Self`'s regions alone (no trait column): a header's own walk, where the trait column is
-/// what is being laid.
+/// `Self`'s regions alone (no trait column or param bounds): a header's own walk, where the
+/// trait column and clauses are what is being laid.
 impl<'a> From<Option<&'a [Region]>> for SelfGiven<'a> {
     fn from(self_: Option<&'a [Region]>) -> SelfGiven<'a> {
-        SelfGiven { self_, impl_trait: None }
+        SelfGiven { self_, impl_trait: None, param_bounds: &[] }
     }
 }
 
@@ -2565,6 +2583,10 @@ pub struct RegionSink<'s> {
     /// the header writes them first, `heads_regions.rs` `header_trait`), numbered as `Self`'s;
     /// `None` where there is none or it is not known.
     impl_trait: Option<Vec<Region, Alloc<'s>>>,
+    /// The container's non-higher-ranked trait bounds on its type parameters: `(param, trait_,
+    /// start, len)` indexing `param_bound_regions`.
+    param_bounds: Vec<(u32, ItemKey, u32, u32), Alloc<'s>>,
+    param_bound_regions: Vec<Region, Alloc<'s>>,
     /// The captured lifetime count of each opaque type of the item being made.
     opaques: Vec<(ItemKey, u32), Alloc<'s>>,
     /// The regions each of `opaques` captures, one run per opaque ([`Captures`]).
@@ -2586,6 +2608,8 @@ impl<'s> RegionSink<'s> {
             elided: Vec::new_in(alloc),
             self_slots: None,
             impl_trait: None,
+            param_bounds: Vec::new_in(alloc),
+            param_bound_regions: Vec::new_in(alloc),
             opaques: Vec::new_in(alloc),
             captured: Vec::new_in(alloc),
             scratch: Vec::new_in(alloc),
@@ -2622,11 +2646,24 @@ impl<'s> RegionSink<'s> {
         });
     }
 
-    /// Both of what a container's member's walk is given for `Self` ([`SelfGiven`]): `Self`'s
-    /// regions ([`Self::set_self`]) and the impl's trait column ([`Self::set_impl_trait`]).
+    /// The container's non-higher-ranked trait bounds on its type parameters.
+    pub fn set_param_bounds(&mut self, bounds: &[ContainerParamBound]) {
+        self.param_bounds.clear();
+        self.param_bound_regions.clear();
+        for b in bounds {
+            let start = self.param_bound_regions.len() as u32;
+            self.param_bound_regions.extend_from_slice(&b.regions);
+            self.param_bounds.push((b.param, b.trait_, start, b.regions.len() as u32));
+        }
+    }
+
+    /// What a container's member's walk is given ([`SelfGiven`]): `Self`'s regions
+    /// ([`Self::set_self`]), the impl's trait column ([`Self::set_impl_trait`]), and the
+    /// container's parameter bounds ([`Self::set_param_bounds`]).
     pub fn set_given(&mut self, given: SelfGiven<'_>) {
         self.set_self(given.self_);
         self.set_impl_trait(given.impl_trait);
+        self.set_param_bounds(given.param_bounds);
     }
 
     /// The captured lifetimes of the opaques of the item being made.
@@ -3275,24 +3312,25 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                         };
                         next += own as usize;
                         for &a in col {
-                            let kind = match a {
-                                AliasSlot::Static => SlotKind::Static,
+                            let slot = match a {
+                                AliasSlot::Static => Slot::written(SlotKind::Static),
+                                AliasSlot::ObjectDefault => Slot::quiet(SlotKind::ObjectDefault(r)),
                                 AliasSlot::Late { binder, var } => match binder_at.get(binder as usize) {
-                                    Some(&b) => SlotKind::Late { binder: b, var },
+                                    Some(&b) => Slot::written(SlotKind::Late { binder: b, var }),
                                     None => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::AliasRegions, r))),
                                 },
                                 AliasSlot::Lifetime(i) => match given.get_mut(i as usize) {
-                                    Some(Some(k)) => *k,
+                                    Some(Some(k)) => Slot::written(*k),
                                     Some(g @ None) => {
                                         let id = s.elided.len() as u32;
                                         s.elided.push(r);
                                         *g = Some(SlotKind::Elided(id));
-                                        SlotKind::Elided(id)
+                                        Slot::written(SlotKind::Elided(id))
                                     }
                                     None => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r))),
                                 },
                             };
-                            s.scratch.push(Slot::written(kind));
+                            s.scratch.push(slot);
                         }
                     }
                     if is_binder(node) {
@@ -3362,6 +3400,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // (alloy-sol-types' `trait SolTypeValue<T: SolType> { fn stv_to_tokens(&self) ->
         // T::Token<'_>; }`) and `Self::Name` of a supertrait without lifetimes are laid
         // exactly; only a trait WITH lifetimes needs the one bound that writes them.
+        let mut param_bound_col: Option<(usize, usize)> = None;
         match through {
             Through::SelfTrait(tr) => {
                 if self.heads.checker(tr) != trait_ && trait_count != 0 {
@@ -3379,7 +3418,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             // They are the first `trait_count` regions of the header's trait column
             // (heads_regions.rs `header_trait`: the trait's lifetimes, each elided one a fresh
             // parameter of the impl, then `Self`'s, then the arguments'), numbered as `Self`'s
-            // (the members' container group); `Self`'s slots are put with the arguments below.
+            // (the members' container group); `Self`'s and the arguments' slots are put below.
             Through::SelfImpl(tr) => {
                 if self.heads.checker(tr) != trait_ && trait_count != 0 {
                     return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::SelfSupertrait, r)));
@@ -3394,48 +3433,96 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     slots.extend(lead.iter().map(|&g| Slot::quiet(SlotKind::Given(g))));
                 }
             }
-            Through::Param(_) if trait_count == 0 => {}
             Through::Param(t) => {
-                let mut found = 0u32;
-                for &n in v.rows(v.list(blaze_lower::head::GENERICS))? {
-                    if let lf::GenericParam::Type { name: pn, bounds, .. } = lf::GenericParam::decode(n)?
-                        && v.name_text(pn)? == t
-                        && let Err(why) = self.bound_lifetimes(env, v, bounds, trait_, &mut found, &mut slots, r)?
-                    {
-                        return Ok(Err(why));
+                let container_match = env
+                    .params
+                    .iter()
+                    .find(|&&(pn, _)| pn == Name::of(t))
+                    .map(|&(_, pidx)| {
+                        let mut matched: Option<(usize, usize)> = None;
+                        let mut conflict = false;
+                        for &(bp, btr, bstart, blen) in &s.param_bounds {
+                            if bp != pidx || btr != trait_ {
+                                continue;
+                            }
+                            let bs = bstart as usize;
+                            let be = bs.saturating_add(blen as usize);
+                            if let Some((ms, me)) = matched {
+                                if s.param_bound_regions.get(ms..me) != s.param_bound_regions.get(bs..be) {
+                                    conflict = true;
+                                }
+                            } else {
+                                matched = Some((bs, be));
+                            }
+                        }
+                        (matched, conflict)
+                    });
+                if trait_count == 0 {
+                    if let Some((Some(m), false)) = container_match {
+                        param_bound_col = Some(m);
                     }
-                }
-                for &n in v.rows(v.list(blaze_lower::head::WHERE))? {
-                    let lf::WherePred::Type { binder, ty, bounds } = lf::WherePred::decode(n)? else { continue };
-                    let lf::TypeRef::Path(p) = v.ty(ty)? else { continue };
-                    let (pabs, ptexts, _, _) = path_texts(v, p)?;
-                    if pabs || !matches!(ptexts.as_slice(), [only] if *only == t) {
-                        continue;
+                } else {
+                    let mut found = 0u32;
+                    for &n in v.rows(v.list(blaze_lower::head::GENERICS))? {
+                        if let lf::GenericParam::Type { name: pn, bounds, .. } = lf::GenericParam::decode(n)?
+                            && v.name_text(pn)? == t
+                            && let Err(why) = self.bound_lifetimes(env, v, bounds, trait_, &mut found, &mut slots, r)?
+                        {
+                            return Ok(Err(why));
+                        }
                     }
-                    if !v.rows(binder)?.is_empty() {
-                        return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionHigherRanked, r)));
+                    for &n in v.rows(v.list(blaze_lower::head::WHERE))? {
+                        let lf::WherePred::Type { binder, ty, bounds } = lf::WherePred::decode(n)? else { continue };
+                        let lf::TypeRef::Path(p) = v.ty(ty)? else { continue };
+                        let (pabs, ptexts, _, _) = path_texts(v, p)?;
+                        if pabs || !matches!(ptexts.as_slice(), [only] if *only == t) {
+                            continue;
+                        }
+                        if !v.rows(binder)?.is_empty() {
+                            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionHigherRanked, r)));
+                        }
+                        if let Err(why) = self.bound_lifetimes(env, v, bounds, trait_, &mut found, &mut slots, r)? {
+                            return Ok(Err(why));
+                        }
                     }
-                    if let Err(why) = self.bound_lifetimes(env, v, bounds, trait_, &mut found, &mut slots, r)? {
-                        return Ok(Err(why));
+                    if found == 0 {
+                        match container_match {
+                            Some((_, true)) => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionTwoBounds, r))),
+                            Some((Some((bs, be)), false)) => {
+                                let Some(col) = s.param_bound_regions.get(bs..be) else {
+                                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+                                };
+                                let Some(lead) = col.get(..trait_count as usize) else {
+                                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+                                };
+                                if lead.iter().any(|g| matches!(g, Region::Late { .. })) {
+                                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionHigherRanked, r)));
+                                }
+                                slots.extend(lead.iter().map(|&g| Slot::quiet(SlotKind::Given(g))));
+                                param_bound_col = Some((bs, be));
+                                found = 1;
+                            }
+                            _ => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionBoundElsewhere, r))),
+                        }
                     }
-                }
-                if found == 0 {
-                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionBoundElsewhere, r)));
-                }
-                if slots.len() as u32 != trait_count {
-                    return Ok(Err(RegionRefusal::LifetimeArgs { at: r, want: trait_count, got: slots.len() as u32 }));
+                    if slots.len() as u32 != trait_count {
+                        return Ok(Err(RegionRefusal::LifetimeArgs { at: r, want: trait_count, got: slots.len() as u32 }));
+                    }
                 }
             }
         }
         slots.extend(own_written.iter().map(|&k| Slot::written(k)));
-        // The alias's arguments: `Self` and the trait's (from the bound, not written here: they
-        // must hold no lifetime), then those written on `Name` (`index`, from the stack).
+        // The alias's arguments: `Self` and the trait's (from the impl's trait column or
+        // container's clause column when available; otherwise they must hold no lifetime), then
+        // those written on `Name` (`index`, from the stack).
         let list = soft!(tys.view().list(args).map_err(RegionError::Table));
         let Some(lead) = list.len().checked_sub(index.len()) else {
             return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
         };
         let arity = HeadsArity { heads: self.heads, opaques: &s.opaques, names: self.resolver.names };
         let mut binders = 0u32;
+        let impl_trait_own = matches!(through, Through::SelfImpl(tr) if self.heads.checker(tr) == trait_);
+        let mut col_off = trait_count as usize;
         for (i, &a) in list[..lead].iter().enumerate() {
             let sub = soft!(subtree(tys.view(), a, &arity, alloc));
             // In an impl the first is `Self`, the impl's self type: its slots are the regions
@@ -3448,10 +3535,26 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
                 }
                 slots.extend(given.iter().map(|&g| Slot::quiet(SlotKind::Given(g))));
+                col_off += sub.slots as usize;
                 binders += sub.binders;
                 continue;
             }
             if sub.slots != 0 {
+                let from_col = if impl_trait_own {
+                    s.impl_trait.as_deref().and_then(|col| col.get(col_off..col_off + sub.slots as usize))
+                } else if let Some((bs, be)) = param_bound_col {
+                    s.param_bound_regions.get(bs..be).and_then(|col| col.get(col_off..col_off + sub.slots as usize))
+                } else {
+                    None
+                };
+                if let Some(given) = from_col
+                    && !given.iter().any(|g| matches!(g, Region::Late { .. }))
+                {
+                    slots.extend(given.iter().map(|&g| Slot::quiet(SlotKind::Given(g))));
+                    col_off += sub.slots as usize;
+                    binders += sub.binders;
+                    continue;
+                }
                 return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionBoundArgs, r)));
             }
             binders += sub.binders;
@@ -3678,8 +3781,39 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         if written > 1 {
             return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynLifetimes, r)));
         }
+        let mut static_bound = false;
+        if object.is_none() {
+            for &b in v.rows(bounds)? {
+                let Some((p, _)) = super::dyn_ty::dyn_bound(v, lf::Bound::decode(b)?, r)? else { continue };
+                let (abs, texts, _, pr) = path_texts_of(v, p, true)?;
+                if let Ok(Bounded::Trait(key)) = self.bound_target(env, v, p, abs, &texts, pr) {
+                    let mut work: Vec<LibKey, Alloc<'_>> = Vec::new_in(alloc);
+                    work.push(key);
+                    let mut next = 0usize;
+                    while next < work.len() && work.len() < 64 {
+                        let k = work[next];
+                        next += 1;
+                        if self.heads.trait_self_static(k) == Some(true) {
+                            static_bound = true;
+                            break;
+                        }
+                        if let Some(supers) = self.heads.trait_supers(k) {
+                            for &(sk, _) in supers {
+                                if !work.contains(&sk) {
+                                    work.push(sk);
+                                }
+                            }
+                        }
+                    }
+                    if static_bound {
+                        break;
+                    }
+                }
+            }
+        }
         let own = match object {
             Some(k) => Slot::written(k),
+            None if static_bound => Slot::quiet(SlotKind::Static),
             None => Slot::quiet(SlotKind::ObjectDefault(r)),
         };
         let arity = HeadsArity { heads: self.heads, opaques: &s.opaques, names: self.resolver.names };

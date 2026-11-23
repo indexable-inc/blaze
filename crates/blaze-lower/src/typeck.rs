@@ -414,6 +414,9 @@ pub struct TypeckBody<'a> {
     /// Canonical lexicographically-sorted [`tc::RecordSchema`] for each anonymous `Expr::Record`,
     /// ascending by [`ExprId`].
     pub record_expr_schemas: AVec<'a, (ExprId, tc::RecordSchema)>,
+    /// Closure parameter annotations whose outer reference explicitly writes `'static`
+    /// (`|lock: &'static str|`): `(closure_expr, param_index)`, ascending.
+    pub closure_static_params: AVec<'a, (ExprId, u32)>,
 }
 
 impl<'a> TypeckBody<'a> {
@@ -456,6 +459,7 @@ impl<'a> TypeckBody<'a> {
             expr_editions: &self.expr_editions,
             pat_editions: &self.pat_editions,
             record_expr_schemas: &self.record_expr_schemas,
+            closure_static_params: &self.closure_static_params,
         }
     }
 }
@@ -1243,9 +1247,15 @@ impl Conv<'_, '_, '_, '_, '_> {
                 };
                 let pstart = len(self.out.pat_lists.len());
                 let tstart = len(self.out.opt_types.len());
-                for &n in self.v.rows(c.params)? {
+                for (pi, &n) in self.v.rows(c.params)?.iter().enumerate() {
                     let p = Param::decode(n)?;
                     let Some(pat) = p.pat else { return self.refuse("a closure parameter with no pattern", r) };
+                    if let Some(tid) = p.ty
+                        && let TypeRef::Ref { lifetime: Some(nm), .. } = self.v.ty(tid)?
+                        && self.v.name_text(nm)? == "'static"
+                    {
+                        self.out.closure_static_params.push((e, pi as u32));
+                    }
                     let ty = self.opt_ty(p.ty)?;
                     self.out.pat_lists.push(pat);
                     self.out.opt_types.push(ty);
@@ -1464,6 +1474,7 @@ pub fn to_typeck<'a>(
         super_lets: crate::super_let::super_lets(view, alloc),
         const_gaps: Vec::new_in(alloc),
         record_expr_schemas: Vec::new_in(alloc),
+        closure_static_params: Vec::new_in(alloc),
     };
     let mut slice_rest: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(view.pats.len(), alloc);
     slice_rest.resize(view.pats.len(), false);

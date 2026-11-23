@@ -108,10 +108,6 @@ pub struct BodyFrame<'n> {
     /// one for the request's workers): each root goal the body asks is looked up there first.
     /// `None`: every goal is solved in the body.
     pub goals: Option<&'n dyn blaze_solve::share::GoalShare>,
-    /// The call census (D190 step 2, front2 call_census.rs), when asked: each body this frame
-    /// checks is checked again under both call rules and counted into the cell (one per
-    /// worker's stretch). `None`: no census, the path unchanged.
-    pub census: Option<&'n super::super::call_census::CensusCell>,
 }
 
 /// The ask a failed cell belonged to. At import time the checker may have made several
@@ -589,7 +585,7 @@ fn asks_agree(a: &BodyReads<'_>, o: &BodyReads<'_>) -> bool {
 pub fn compare_asks<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, plant: super::super::asks::AsksPlant) -> Result<(), AsksDiffer<'w>> {
     use super::super::asks::AsksMet;
     let run = |met: AsksMet, heads: Option<&'n dyn HeadSeed<'n>>| {
-        let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads, sources: frame.sources, goals: None, census: None };
+        let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads, sources: frame.sources, goals: None };
         let mut recorder = Recorder::new(RecorderOpts { alloc: work });
         record_body_as(tables, task, &shadow, work, &mut recorder, None, Coverage::WithLocals, ReadReport::Sorted, met)
     };
@@ -814,7 +810,7 @@ impl core::fmt::Debug for RepeatsDiffer<'_> {
 /// two sides' tallies, `Offer`'s then `Quiet`'s (zero for two equal refusals).
 pub fn compare_repeats<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, plant: RepeatsPlant) -> Result<(super::recorder::ReadTally, super::recorder::ReadTally), RepeatsDiffer<'w>> {
     use super::recorder::Repeats;
-    let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads: frame.heads, sources: frame.sources, goals: None, census: None };
+    let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads: frame.heads, sources: frame.sources, goals: None };
     let run = |repeats: Repeats, drop: Option<NameCell>| {
         let mut recorder = Recorder::new(RecorderOpts { alloc: work });
         recorder.set_repeats(repeats);
@@ -921,13 +917,6 @@ fn record_body_as<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
         }
         recorder.checking(Some("the body's shared goal hit list"));
         goal_hits.extend_from_slice(w.goal_hits());
-        // The call census (D190 step 2), when asked: the body checked again under both call
-        // rules and counted. It runs after the goal hits were taken, because its check clears
-        // them. Its verdict is dropped: the body's verdict is `pair`.
-        if let Some(census) = frame.census {
-            recorder.checking(Some("the body's call census"));
-            census.census_of(w, b, frame.alloc);
-        }
         recorder.checking(Some("the body's reached verdict and local function lists"));
         pair
     };
@@ -1742,7 +1731,7 @@ mod read_id_tests {
         let (records, _, frame) = world_of("#![no_std]\npub fn base() -> u8 { 1u8 }\npub fn left() -> u8 { base() }\npub fn right() -> u16 { base() }");
         let unused = Recorder::new(RecorderOpts { alloc: a() });
         let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[CORE_AT], reads: &unused });
-        let frame = BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: None, census: None };
+        let frame = BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: None };
         let heads = cells(records);
         let mut entry = Recorder::new(RecorderOpts { alloc: a() });
         let mut encoding = AString::new_in(a());
