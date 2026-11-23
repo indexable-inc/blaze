@@ -461,4 +461,48 @@ fn batteries_are_exposed_and_work_in_a_frame() {
     let safe_html = crate::html::sanitize_html_in("<b>ok</b><script>bad()</script>", crate::html::HtmlLimits::USUAL, alloc)
         .expect("html");
     assert_eq!(safe_html.as_str(), "<b>ok</b>");
+
+    // Batch 4 batteries: X25519, XChaCha20-Poly1305, router, pointer, dns, cidr, rate, xml, otp/base32/pem, strx
+    let xa = crate::crypto::x25519_public_key([1u8; 32]);
+    let xb = crate::crypto::x25519_public_key([2u8; 32]);
+    assert_eq!(crate::crypto::x25519([1u8; 32], xb), crate::crypto::x25519([2u8; 32], xa));
+    let xchacha = crate::crypto::XChaCha20Poly1305::new([9u8; 32]);
+    let xct = xchacha.encrypt_in([3u8; 24], b"ad", b"hi", alloc).expect("xseal");
+    assert_eq!(xchacha.decrypt_in([3u8; 24], b"ad", xct.as_slice(), alloc).expect("xopen").as_slice(), b"hi");
+
+    let mut router = crate::router::Router::new_in(alloc);
+    router.insert(crate::router::Method::Get, "/users/:id", "user").expect("route");
+    assert!(matches!(
+        router.resolve(crate::router::Method::Get, "/users/42", alloc).expect("resolve"),
+        crate::router::RouteOutcome::Matched { handler: &"user", .. }
+    ));
+
+    let sub_val = crate::pointer::get(&claims, "/sub").expect("ptr");
+    assert!(matches!(sub_val, Some(crate::data::Value::Text(s)) if s.as_str() == "u1"));
+
+    let mut dns_pkt = crate::vec::Vec::new_in(alloc);
+    crate::dns::encode_query_into(0x1234, "example.com", crate::dns::RecordType::A, true, &mut dns_pkt)
+        .expect("dns enc");
+    let dns_msg = crate::dns::decode_message_in(dns_pkt.as_slice(), crate::dns::DnsLimits::USUAL, alloc)
+        .expect("dns dec");
+    assert_eq!(dns_msg.header.id, 0x1234);
+
+    let net = crate::cidr::Ipv4Net::parse("10.0.0.0/8").expect("cidr");
+    assert!(net.contains_ip(core::net::Ipv4Addr::new(10, 1, 2, 3)));
+    assert!(!crate::cidr::is_globally_routable_v4(core::net::Ipv4Addr::new(169, 254, 169, 254)));
+
+    let mut gcra = crate::rate::Gcra::from_rate_per_sec(10, 2).expect("gcra");
+    assert!(gcra.check(0).is_allowed());
+
+    let mut xw = crate::xml::XmlWriter::new_in(alloc);
+    xw.empty_element("ping", &[("ok", "1")]).expect("xml w");
+    let xml_doc = xw.finish().expect("xml finish");
+    let mut xr = crate::xml::XmlReader::new_in(xml_doc.as_str(), crate::xml::XmlLimits::USUAL, alloc)
+        .expect("xml r");
+    assert!(matches!(xr.next_event().expect("ev"), Some(crate::xml::XmlEvent::StartElement { name: "ping", empty: true, .. })));
+
+    assert_eq!(crate::otp::hotp(b"12345678901234567890", 0, crate::otp::OtpAlgorithm::Sha1, 6).expect("hotp"), 755_224);
+    assert_eq!(crate::base32::encode_rfc4648_in(b"foo", true, alloc).expect("b32").as_str(), "MZXW6===");
+    assert_eq!(crate::strx::to_snake_case_in("HTTPServer", alloc).expect("snake").as_str(), "http_server");
+    assert_eq!(crate::strx::slugify_in("Café & Bar!", '-', alloc).expect("slug").as_str(), "cafe-bar");
 }
