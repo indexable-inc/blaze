@@ -1194,6 +1194,7 @@ mod tests {
         out
     }
 
+    /// The invariant: Store and Deflate ZIP archives round-trip with verified CRC-32 and hostile archive bytes never panic.
     #[test]
     fn property_zip_round_trip_and_hostile_bytes_never_panic() {
         let h = heap();

@@ -1033,6 +1033,7 @@ mod tests {
         Ok(())
     }
 
+    /// The invariant: `next_after` returns the strictly earliest future timestamp matching the schedule under Vixie DOM/DOW semantics.
     #[test]
     fn property_next_after_is_strictly_minimal_match() {
         let h = heap();

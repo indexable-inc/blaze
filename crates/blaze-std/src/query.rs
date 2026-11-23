@@ -1274,6 +1274,7 @@ mod tests {
         });
     }
 
+    /// The invariant: `format_query_in` and `parse_query_in` round-trip arbitrary key/value pairs including spaces encoded as `+`.
     #[test]
     fn property_query_round_trip() {
         let h = heap();

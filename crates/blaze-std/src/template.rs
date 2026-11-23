@@ -968,6 +968,7 @@ mod tests {
         Ok(())
     }
 
+    /// The invariant: escaped template interpolation `{{var}}` never emits unescaped `<script` into rendered output.
     #[test]
     fn property_xss_safety_escaped_var() {
         let h = heap();

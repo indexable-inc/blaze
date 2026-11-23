@@ -1389,6 +1389,7 @@ mod tests {
         argv
     }
 
+    /// The invariant: random argv never panics and every token after `--` is preserved verbatim as a positional argument.
     #[test]
     fn property_random_argv_never_panics_and_double_dash_preserves_tail() {
         let h = heap();

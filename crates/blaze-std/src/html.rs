@@ -1303,6 +1303,7 @@ mod tests {
         Ok(())
     }
 
+    /// The invariant: HTML entity escaping round-trips arbitrary UTF-8 and `sanitize_html_in` never emits `<script`, `onerror=`, or `javascript:`.
     #[test]
     fn property_escape_round_trip_and_sanitizer_never_leaks_xss() {
         let h = heap();
