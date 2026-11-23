@@ -7,7 +7,7 @@ use super::*;
 
 /// `ref name`.
 fn ref_bind(b: &mut BodyBuf, name: &str) -> PatId {
-    b.pat(Pat::Bind { ann: BindAnn { by_ref: Some(Mutbl::Not), mutable: false }, name: Name::of(name), sub: None })
+    b.pat(Pat::Bind { ann: BindAnn { by_ref: Some(Mutbl::Not), mutable: false }, name: Name::of(name), sub: None, ty: None })
 }
 
 fn let_stmt(pat: PatId, init: ExprId) -> Stmt {

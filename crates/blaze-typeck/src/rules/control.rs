@@ -19,12 +19,13 @@
 
 use blaze_own::Alloc;
 
+use crate::body::{CoroutineKind, Pat};
+use crate::columns::UnionPat;
 use crate::diag::{About, At, DiagCode};
-use crate::body::CoroutineKind;
 use crate::error::{CheckError, Malformed, Stop};
-use crate::ids::{ExprId, LangItem, List, PatId};
-use crate::machine::{BreakCtx, Expectation, Flow, Frame, Lower, Machine, Source, Then};
-use crate::ty::{Cause, Goal, Ty, TypeCtx};
+use crate::ids::{ExprId, LangItem, List, Mutbl, PatId};
+use crate::machine::{BreakCtx, Expectation, Flow, Frame, Lower, Machine, MatchNarrow, Source, Then};
+use crate::ty::{Cause, Goal, Ty, TyView, TypeCtx};
 use crate::world::{PClause, World};
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
@@ -306,9 +307,31 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 f.c = u32::from(self.diverges) | 2;
                 self.diverges = false;
                 f.a = 0;
+                if self.push_match_narrow(f.t)? {
+                    f.c |= 4;
+                }
                 self.match_pats(f, arm_list)
             }
-            2 => self.match_pats(f, arm_list),
+            2 => {
+                if f.c & 4 != 0
+                    && let Some(prev_idx) = f.a.checked_sub(1)
+                    && let Some(prev_arm) = arm_list.get(prev_idx as usize)
+                    && prev_arm.guard.is_none()
+                {
+                    let matched = self
+                        .union_pats
+                        .iter()
+                        .rev()
+                        .find(|&&(p, _)| p == prev_arm.pat)
+                        .map(|&(_, kind)| kind);
+                    if let Some(UnionPat::Variant(v)) = matched
+                        && let Some(narrow) = self.match_narrow.last_mut()
+                    {
+                        narrow.remaining.retain(|&idx| idx != v);
+                    }
+                }
+                self.match_pats(f, arm_list)
+            }
             3 => {
                 // The arm's guard is done (or there was none): its body.
                 let arm = arm_list[f.a as usize];
@@ -327,13 +350,79 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
     }
 
+    /// Pushes per-match union narrowing state if `scrutinee_ty` (after optional ref-peeling)
+    /// resolves to a structural union.
+    fn push_match_narrow(&mut self, scrutinee_ty: Ty) -> Result<bool, Stop> {
+        let mut cur = scrutinee_ty;
+        let mut peeled_mode = 0u32;
+        for _ in 0..crate::machine::RECURSION_LIMIT {
+            let r = self.try_structurally_resolve(cur)?;
+            match self.view(r) {
+                TyView::Ref(m, inner) => {
+                    peeled_mode = match (m, peeled_mode) {
+                        (Mutbl::Not, _) => 1,
+                        (Mutbl::Mut, 0) => 2,
+                        (Mutbl::Mut, other) => other,
+                    };
+                    cur = inner;
+                }
+                TyView::Union(orig_members) => {
+                    let n = self.ty.list_len(orig_members);
+                    let mut remaining = blaze_own::Vec::with_capacity_in(n as usize, self.alloc);
+                    for i in 0..n {
+                        remaining.push(i);
+                    }
+                    self.match_narrow.push(MatchNarrow { orig_members, remaining, peeled_mode });
+                    return Ok(true);
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(false)
+    }
+
     /// The patterns of every arm, in order, then the first arm.
     fn match_pats(&mut self, mut f: Frame, arms: &[crate::body::Arm]) -> Result<Flow, Stop> {
         if let Some(arm) = arms.get(f.a as usize) {
             f.a += 1;
             self.resume(f, 2)?;
+            if f.c & 4 != 0
+                && matches!(self.body.pat(arm.pat)?, Pat::Bind { ty: None, .. })
+                && let Some(narrow) = self.match_narrow.last()
+            {
+                let orig_members = narrow.orig_members;
+                let orig_len = self.ty.list_len(orig_members) as usize;
+                let rem_len = narrow.remaining.len();
+                let mode = narrow.peeled_mode;
+                if rem_len < orig_len {
+                    if rem_len == 0 {
+                        self.push_pat(arm.pat, self.common.never, mode)?;
+                        return Ok(Flow::Wait);
+                    } else if rem_len == 1 {
+                        let rem_v = narrow.remaining[0];
+                        let member_ty = self.ty.list_get(orig_members, rem_v);
+                        self.union_pats.push((arm.pat, UnionPat::Variant(rem_v)));
+                        self.push_pat(arm.pat, member_ty, mode)?;
+                        return Ok(Flow::Wait);
+                    } else {
+                        let mut rem_tys: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::with_capacity_in(rem_len, self.alloc);
+                        for &idx in narrow.remaining.iter() {
+                            rem_tys.push(self.ty.list_get(orig_members, idx));
+                        }
+                        let rem_list = self.mk_list(&rem_tys)?;
+                        let sub_union = self.mk(TyView::Union(rem_list))?;
+                        self.union_pats.push((arm.pat, UnionPat::Residual));
+                        self.push_pat(arm.pat, sub_union, mode)?;
+                        return Ok(Flow::Wait);
+                    }
+                }
+            }
             self.push_pat(arm.pat, f.t, 0)?;
             return Ok(Flow::Wait);
+        }
+        if f.c & 4 != 0 {
+            self.match_narrow.pop();
+            f.c &= !4;
         }
         f.expect = self.adjust_for_branches(f.expect);
         let first = match f.expect {

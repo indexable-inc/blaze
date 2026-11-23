@@ -782,7 +782,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                     cp.tasks.push(Task::Consume(x));
                 }
             }
-            Expr::Struct { fields, base, .. } => {
+            Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
                 if let Some(base) = base.expr() {
                     cp.tasks.push(Task::Walk(base, Mutbl::Not));
                     cp.tasks.push(Task::Fru { expr: e, base });
@@ -1059,7 +1059,9 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 | AdjustKind::ClosureFnPointer
                 | AdjustKind::UnsafeFnPointer
                 | AdjustKind::MutToConstPointer
-                | AdjustKind::Unsize => {
+                | AdjustKind::Unsize
+                | AdjustKind::UnionInject { .. }
+                | AdjustKind::UnionWiden => {
                     // Creating a fn pointer or unsizing consumes the value into an rvalue.
                     self.consume_or_copy(cp, place, At::Expr(e))?;
                     place = None;
@@ -1317,6 +1319,20 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                         };
                         let ty = self.variant_field_ty(adt, variant, at, args, fp.pat)?;
                         let sub = cp.extend(place, ProjKind::Field { variant, field: at as u32 }, ty, limit)?;
+                        cp.pat_stack.push((fp.pat, sub, mode));
+                    }
+                }
+                Pat::Record { fields, .. } => {
+                    let TyView::Record(schema, field_tys) = self.view(t) else {
+                        return Err(gap(At::Pat(p), CaptureGapKind::PatternType));
+                    };
+                    let n = self.ty.list_len(field_tys);
+                    for fp in self.body.field_pat_list(fields)?.iter().rev() {
+                        let Some(at) = self.record_field_index(schema, fp.name).filter(|&i| i < n) else {
+                            return Err(gap(At::Pat(fp.pat), CaptureGapKind::PatternField));
+                        };
+                        let ty = self.ty.resolve(self.ty.list_get(field_tys, at))?;
+                        let sub = cp.extend(place, ProjKind::Field { variant: 0, field: at }, ty, limit)?;
                         cp.pat_stack.push((fp.pat, sub, mode));
                     }
                 }

@@ -31,6 +31,7 @@ fn differs(a: &Checked<'_>, b: &Checked<'_>) -> Option<&'static str> {
         ("const_args", a.const_args.column::<0>() == b.const_args.column::<0>() && a.const_args.column::<1>() == b.const_args.column::<1>()),
         ("pat_const_args", a.pat_const_args.column::<0>() == b.pat_const_args.column::<0>() && a.pat_const_args.column::<1>() == b.pat_const_args.column::<1>()),
         ("pat_defs", a.pat_defs.column::<0>() == b.pat_defs.column::<0>() && a.pat_defs.column::<1>() == b.pat_defs.column::<1>()),
+        ("union_pats", a.union_pats.column::<0>() == b.union_pats.column::<0>() && a.union_pats.column::<1>() == b.union_pats.column::<1>()),
         ("fields", a.fields.column::<0>() == b.fields.column::<0>() && a.fields.column::<1>() == b.fields.column::<1>() && a.fields.column::<2>() == b.fields.column::<2>()),
         ("captures", a.captures.column::<0>() == b.captures.column::<0>() && a.captures.column::<1>() == b.captures.column::<1>() && a.captures.column::<2>() == b.captures.column::<2>()),
         (

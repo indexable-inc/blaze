@@ -458,7 +458,9 @@ fn add_bindings<'a>(
                     stack.extend(f.body.pat_list(elems)?.iter().rev());
                 }
                 Pat::Ref { inner, .. } => stack.push(inner),
-                Pat::Struct { fields, .. } => stack.extend(f.body.field_pat_list(fields)?.iter().rev().map(|fp| fp.pat)),
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                    stack.extend(f.body.field_pat_list(fields)?.iter().rev().map(|fp| fp.pat))
+                }
                 // Every alternative binds the same names: the first says them.
                 Pat::Or { alts } => stack.extend(f.body.pat_list(alts)?.first()),
                 Pat::Missing | Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } => {}

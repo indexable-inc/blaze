@@ -6,7 +6,7 @@ use super::*;
 
 /// A binding with no annotation.
 fn plain(b: &mut BodyBuf, name: &str) -> PatId {
-    b.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None })
+    b.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None, ty: None })
 }
 
 fn let_stmt(pat: PatId, init: ExprId) -> Stmt {

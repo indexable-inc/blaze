@@ -10,12 +10,12 @@ use super::*;
 
 /// `ref name`.
 fn ref_bind(b: &mut BodyBuf, name: &str) -> PatId {
-    b.pat(Pat::Bind { ann: BindAnn { by_ref: Some(Mutbl::Not), mutable: false }, name: Name::of(name), sub: None })
+    b.pat(Pat::Bind { ann: BindAnn { by_ref: Some(Mutbl::Not), mutable: false }, name: Name::of(name), sub: None, ty: None })
 }
 
 /// A by-value binding with no annotation.
 fn plain_bind(b: &mut BodyBuf, name: &str) -> PatId {
-    b.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None })
+    b.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None, ty: None })
 }
 
 fn tuple_pat(b: &mut BodyBuf, elems: &[PatId]) -> PatId {

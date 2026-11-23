@@ -455,6 +455,14 @@ fn map_tree(
         if !reached[at] {
             continue;
         }
+        let raw_node = from.node(PTy(at as u32)).map_err(malformed)?;
+        if let PNode::Record(s, _) = raw_node
+            && let Some(names) = from.record_names(s)
+        {
+            ground
+                .register_record_schema(s, names)
+                .map_err(|_| BuildError::Malformed { what: "the ground table is full" })?;
+        }
         let mut map_list = |l: List, list: &mut Vec<PTy, Alloc<'_>>| -> Result<List, BuildError> {
             list.clear();
             for t in from.list(l).map_err(malformed)? {
@@ -462,7 +470,7 @@ fn map_tree(
             }
             ground.intern_list(list).map_err(|_| BuildError::Malformed { what: "the ground table is full" })
         };
-        let node = match from.node(PTy(at as u32)).map_err(malformed)? {
+        let node = match raw_node {
             PNode::Param(i) | PNode::ConstParam(i) => {
                 mapped[at] = *args.get(i as usize).ok_or(BuildError::UnsupportedSig { what: "a generic parameter with no argument" })?;
                 continue;

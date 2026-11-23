@@ -502,7 +502,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         while let Some((p, at)) = todo.pop() {
             let pat = self.pat(p)?;
             match pat {
-                Pat::Bind { ann, name, sub } => {
+                Pat::Bind { ann, name, sub, .. } => {
                     if at.copy && ann.by_ref == Some(Mutbl::Mut) {
                         return Err(BuildError::UnsupportedPat { pat: p, what: "a `ref mut` binding of a scrutinee held as a value (a copy)" });
                     }

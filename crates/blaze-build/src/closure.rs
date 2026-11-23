@@ -701,6 +701,7 @@ pub(crate) fn empty_record(a: Alloc<'_>) -> Checked<'_> {
         const_args: blaze_own::Soa::new_in(a),
         pat_const_args: blaze_own::Soa::new_in(a),
         pat_defs: blaze_own::Soa::new_in(a),
+        union_pats: blaze_own::Soa::new_in(a),
         fields: blaze_own::Soa::new_in(a),
         captures: blaze_own::Soa::new_in(a),
         capture_places: blaze_own::Soa::new_in(a),
@@ -784,5 +785,6 @@ pub(crate) fn empty_view(owner: ItemKey, types: PTys<'_>) -> BodyView<'_> {
         unsafe_blocks: &[],
         expr_editions: &[],
         pat_editions: &[],
+        record_expr_schemas: &[],
     }
 }

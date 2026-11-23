@@ -148,6 +148,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     a.by_ref = false;
                     todo.push((inner, a, false));
                 }
+                Pat::Record { .. } => {
+                    return Err(BuildError::UnsupportedPat { pat: p, what: "a structural record pattern" });
+                }
                 Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. } | Pat::Path(_) => {
                     let behind = matches!(self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))?, PNode::Ref(..));
                     let a = self.peel(p, at)?;
@@ -308,6 +311,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     let g = self.pat_ground(p)?;
                     self.only_variant(p, g)?;
                     continue;
+                }
+                Pat::Record { .. } => {
+                    return Err(BuildError::UnsupportedPat { pat: p, what: "a structural record pattern" });
                 }
                 Pat::Or { .. } => {
                     return Err(BuildError::UnsupportedPat { pat: p, what: "an or-pattern in a `let` or parameter pattern" });

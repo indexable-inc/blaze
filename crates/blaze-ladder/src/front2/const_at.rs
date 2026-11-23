@@ -417,6 +417,12 @@ pub fn copy_ground(from: PTys<'_>, args: &[PTy], into: &mut PortableTys<'_>, scr
             if !reached[at] {
                 continue;
             }
+            let raw_node = from.node(PTy(at as u32)).map_err(|_| CopyFail::Malformed)?;
+            if let PNode::Record(s, _) = raw_node
+                && let Some(names) = from.record_names(s)
+            {
+                into.register_record_schema(s, names).map_err(|_| CopyFail::Full)?;
+            }
             let mut map_list = |l: List, list: &mut Vec<PTy, Alloc<'_>>| -> Result<List, CopyFail> {
                 list.clear();
                 for t in from.list(l).map_err(|_| CopyFail::Malformed)? {
@@ -425,7 +431,7 @@ pub fn copy_ground(from: PTys<'_>, args: &[PTy], into: &mut PortableTys<'_>, scr
                 into.intern_list(list).map_err(|_| CopyFail::Full)
             };
             let m = |t: PTy| mapped.get(t.0 as usize).copied().ok_or(CopyFail::Malformed);
-            let node = match from.node(PTy(at as u32)).map_err(|_| CopyFail::Malformed)? {
+            let node = match raw_node {
                 PNode::Param(_) | PNode::ConstParam(_) => return Err(CopyFail::NotGround { what: "a generic parameter" }),
                 PNode::Alias { .. } => return Err(CopyFail::NotGround { what: "a projection" }),
                 PNode::Opaque(..) => return Err(CopyFail::NotGround { what: "an `impl Trait` type" }),

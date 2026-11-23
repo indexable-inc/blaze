@@ -1154,6 +1154,8 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     sorted_names.push(nm);
                 }
                 let schema = tc::RecordSchema::of_sorted_names(&sorted_names);
+                tys.register_record_schema(schema, &sorted_names)
+                    .map_err(|_| program(format!("the type table is full"), Range::new(0, 0)))?;
                 // `children()` already yields `kids` in canonical sorted field-name order.
                 let l = intern_list(tys, kids)?;
                 intern(tys, PNode::Record(schema, l))

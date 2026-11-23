@@ -117,6 +117,8 @@ pub enum PNode {
 pub struct PTys<'a> {
     nodes: Col<'a, PNode>,
     lists: Col<'a, PTy>,
+    record_schemas: Col<'a, (RecordSchema, List)>,
+    record_names: Col<'a, Name>,
 }
 
 /// One column of a [`PTys`]: the base's part and the own part as they stood (one numbering),
@@ -206,25 +208,75 @@ impl<'a> PTys<'a> {
     }
 
     /// The empty table.
-    pub const EMPTY: PTys<'static> = PTys { nodes: Col::EMPTY, lists: Col::EMPTY };
+    pub const EMPTY: PTys<'static> = PTys {
+        nodes: Col::EMPTY,
+        lists: Col::EMPTY,
+        record_schemas: Col::EMPTY,
+        record_names: Col::EMPTY,
+    };
 
     /// A table held in two columns, nodes and list entries.
     pub const fn flat(nodes: &'a [PNode], lists: &'a [PTy]) -> PTys<'a> {
-        PTys { nodes: Col { base: nodes, own: &[], live: None }, lists: Col { base: lists, own: &[], live: None } }
+        PTys {
+            nodes: Col { base: nodes, own: &[], live: None },
+            lists: Col { base: lists, own: &[], live: None },
+            record_schemas: Col::EMPTY,
+            record_names: Col::EMPTY,
+        }
+    }
+
+    /// A table held in all four columns, including structural record schemas and field names.
+    pub(crate) const fn flat_with_records(
+        nodes: &'a [PNode],
+        lists: &'a [PTy],
+        record_schemas: &'a [(RecordSchema, List)],
+        record_names: &'a [Name],
+    ) -> PTys<'a> {
+        PTys {
+            nodes: Col { base: nodes, own: &[], live: None },
+            lists: Col { base: lists, own: &[], live: None },
+            record_schemas: Col { base: record_schemas, own: &[], live: None },
+            record_names: Col { base: record_names, own: &[], live: None },
+        }
     }
 
     /// The base `base` with `own_nodes` and `own_lists` numbered on after it. The base's
     /// snapshot only: a base under an overlay does not grow while the overlay lives.
-    pub(crate) const fn overlay(base: PTys<'a>, own_nodes: &'a [PNode], own_lists: &'a [PTy]) -> PTys<'a> {
-        PTys { nodes: Col { base: base.nodes.base, own: own_nodes, live: None }, lists: Col { base: base.lists.base, own: own_lists, live: None } }
+    pub(crate) const fn overlay(
+        base: PTys<'a>,
+        own_nodes: &'a [PNode],
+        own_lists: &'a [PTy],
+        own_record_schemas: &'a [(RecordSchema, List)],
+        own_record_names: &'a [Name],
+    ) -> PTys<'a> {
+        PTys {
+            nodes: Col { base: base.nodes.base, own: own_nodes, live: None },
+            lists: Col { base: base.lists.base, own: own_lists, live: None },
+            record_schemas: Col { base: base.record_schemas.base, own: own_record_schemas, live: None },
+            record_names: Col { base: base.record_names.base, own: own_record_names, live: None },
+        }
     }
 
-    /// This view reading on past its snapshot in `nodes` and `lists`, the columns its last
-    /// part is a prefix of: the own part of an overlay (`over`), else the whole table.
-    fn with_live(mut self, over: bool, nodes: &'a dyn Stable<PNode>, lists: &'a dyn Stable<PTy>) -> PTys<'a> {
-        let (nf, lf) = if over { (self.nodes.base.len(), self.lists.base.len()) } else { (0, 0) };
+    /// This view reading on past its snapshot in `nodes`, `lists`, `record_schemas` and
+    /// `record_names`, the columns its last part is a prefix of: the own part of an overlay
+    /// (`over`), else the whole table.
+    fn with_live(
+        mut self,
+        over: bool,
+        nodes: &'a dyn Stable<PNode>,
+        lists: &'a dyn Stable<PTy>,
+        record_schemas: &'a dyn Stable<(RecordSchema, List)>,
+        record_names: &'a dyn Stable<Name>,
+    ) -> PTys<'a> {
+        let (nf, lf, rsf, rnf) = if over {
+            (self.nodes.base.len(), self.lists.base.len(), self.record_schemas.base.len(), self.record_names.base.len())
+        } else {
+            (0, 0, 0, 0)
+        };
         self.nodes.live = Some(Live { col: nodes, from: nf });
         self.lists.live = Some(Live { col: lists, from: lf });
+        self.record_schemas.live = Some(Live { col: record_schemas, from: rsf });
+        self.record_names.live = Some(Live { col: record_names, from: rnf });
         self
     }
 
@@ -325,6 +377,65 @@ impl<'a> PTys<'a> {
                 len: l.len,
             })),
         }
+    }
+
+    fn find_record_schema_list(&self, schema: RecordSchema) -> Option<List> {
+        if let Some(&(_, list)) = self.record_schemas.own.iter().find(|&&(s, _)| s == schema) {
+            return Some(list);
+        }
+        if let Some(live) = self.record_schemas.live
+            && let Some(&(_, list)) = live.col.as_slice().iter().find(|&&(s, _)| s == schema)
+        {
+            return Some(list);
+        }
+        if let Some(&(_, list)) = self.record_schemas.base.iter().find(|&&(s, _)| s == schema) {
+            return Some(list);
+        }
+        None
+    }
+
+    /// Canonical sorted field names registered for `schema`, if present in this table.
+    pub fn record_names(&self, schema: RecordSchema) -> Option<&'a [Name]> {
+        let list = self.find_record_schema_list(schema)?;
+        if list.len == 0 {
+            return Some(&[]);
+        }
+        self.record_names.at(list.range())
+    }
+
+    /// Canonical field index of `name` in `schema`, if registered.
+    pub fn record_field_index(&self, schema: RecordSchema, name: Name) -> Option<u32> {
+        let names = self.record_names(schema)?;
+        names.iter().position(|&n| n == name).and_then(|i| u32::try_from(i).ok())
+    }
+
+    /// Every registered `(RecordSchema, &[Name])` in this view (base then own).
+    pub fn record_schemas(&self) -> impl Iterator<Item = (RecordSchema, &'a [Name])> + 'a {
+        let this = *self;
+        self.record_schemas.base.iter().chain(self.record_schemas.own.iter()).filter_map(move |&(s, l)| {
+            let names = if l.len == 0 { &[][..] } else { this.record_names.at(l.range())? };
+            Some((s, names))
+        })
+    }
+
+    /// Number of record schema rows in the snapshot.
+    pub fn record_schemas_len(&self) -> usize {
+        self.record_schemas.len()
+    }
+
+    /// Number of record field name entries in the snapshot.
+    pub fn record_names_len(&self) -> usize {
+        self.record_names.len()
+    }
+
+    /// Every `(RecordSchema, List)` row in the snapshot (base then own).
+    pub fn record_schema_rows(&self) -> impl Iterator<Item = &'a (RecordSchema, List)> + Clone + 'a {
+        self.record_schemas.base.iter().chain(self.record_schemas.own.iter())
+    }
+
+    /// Every record field name entry in the snapshot (base then own).
+    pub fn record_names_iter(&self) -> impl Iterator<Item = &'a Name> + Clone + 'a {
+        self.record_names.base.iter().chain(self.record_names.own.iter())
     }
 }
 
@@ -694,7 +805,13 @@ pub struct Full;
 
 /// A table's own nodes and list entries in one of its two forms.
 enum Own<'a> {
-    Owned { nodes: Vec<PNode, Alloc<'a>>, lists: Vec<PTy, Alloc<'a>>, index: OwnIndex<'a> },
+    Owned {
+        nodes: Vec<PNode, Alloc<'a>>,
+        lists: Vec<PTy, Alloc<'a>>,
+        record_schemas: Vec<(RecordSchema, List), Alloc<'a>>,
+        record_names: Vec<Name, Alloc<'a>>,
+        index: OwnIndex<'a>,
+    },
     /// Behind a box of a trait object: the index's cell is invariant in its lifetime, and the
     /// object keeps the table covariant (the check below).
     Stable(Box<dyn StableOwn + 'a, Alloc<'a>>),
@@ -728,6 +845,8 @@ impl<'a> OwnIndex<'a> {
 struct StableCols<'a> {
     nodes: Box<dyn Stable<PNode> + 'a, Alloc<'a>>,
     lists: Box<dyn Stable<PTy> + 'a, Alloc<'a>>,
+    record_schemas: Box<dyn Stable<(RecordSchema, List)> + 'a, Alloc<'a>>,
+    record_names: Box<dyn Stable<Name> + 'a, Alloc<'a>>,
     index: RefCell<OwnIndex<'a>>,
 }
 
@@ -735,14 +854,19 @@ struct StableCols<'a> {
 trait StableOwn {
     fn nodes(&self) -> &[PNode];
     fn lists(&self) -> &[PTy];
+    fn record_schemas(&self) -> &[(RecordSchema, List)];
+    fn record_names(&self) -> &[Name];
     fn find_node(&self, n: &PNode) -> Option<u32>;
     fn find_list(&self, offset: usize, hash: u64, tys: &[PTy]) -> Option<List>;
     fn intern(&self, base: Option<&PortableTys<'_>>, n: PNode) -> Result<PTy, CheckError>;
     fn intern_list(&self, base: Option<&PortableTys<'_>>, hash: u64, tys: &[PTy]) -> Result<List, CheckError>;
+    fn register_record_schema(&self, base: Option<&PortableTys<'_>>, schema: RecordSchema, sorted_names: &[Name]) -> Result<(), Full>;
     fn list_rows(&self, each: &mut dyn FnMut(List) -> Result<(), CheckError>) -> Result<(), CheckError>;
     /// The columns themselves, for a live view ([`PTys`]).
     fn node_col(&self) -> &dyn Stable<PNode>;
     fn list_col(&self) -> &dyn Stable<PTy>;
+    fn record_schema_col(&self) -> &dyn Stable<(RecordSchema, List)>;
+    fn record_name_col(&self) -> &dyn Stable<Name>;
 }
 
 fn table_full(_: Full) -> CheckError {
@@ -756,6 +880,14 @@ impl StableOwn for StableCols<'_> {
 
     fn lists(&self) -> &[PTy] {
         self.lists.as_slice()
+    }
+
+    fn record_schemas(&self) -> &[(RecordSchema, List)] {
+        self.record_schemas.as_slice()
+    }
+
+    fn record_names(&self) -> &[Name] {
+        self.record_names.as_slice()
     }
 
     fn find_node(&self, n: &PNode) -> Option<u32> {
@@ -782,6 +914,29 @@ impl StableOwn for StableCols<'_> {
         }
     }
 
+    fn register_record_schema(&self, base: Option<&PortableTys<'_>>, schema: RecordSchema, sorted_names: &[Name]) -> Result<(), Full> {
+        let _guard = self.index.borrow_mut();
+        if let Some(b) = base
+            && b.has_record_schema(schema)
+        {
+            return Ok(());
+        }
+        if self.record_schemas.as_slice().iter().any(|&(s, _)| s == schema) {
+            return Ok(());
+        }
+        let base_n = base.map_or(0, |b| b.own.record_names().len());
+        let len = u32::try_from(sorted_names.len()).map_err(|_| Full)?;
+        let list = if sorted_names.is_empty() {
+            List::EMPTY
+        } else {
+            let start = u32::try_from(base_n + self.record_names.as_slice().len()).map_err(|_| Full)?;
+            self.record_names.extend(sorted_names)?;
+            List { start, len }
+        };
+        self.record_schemas.extend(&[(schema, list)])?;
+        Ok(())
+    }
+
     fn list_rows(&self, each: &mut dyn FnMut(List) -> Result<(), CheckError>) -> Result<(), CheckError> {
         self.index.borrow().list_rows.iter().try_for_each(|&l| each(l))
     }
@@ -792,6 +947,14 @@ impl StableOwn for StableCols<'_> {
 
     fn list_col(&self) -> &dyn Stable<PTy> {
         &*self.lists
+    }
+
+    fn record_schema_col(&self) -> &dyn Stable<(RecordSchema, List)> {
+        &*self.record_schemas
+    }
+
+    fn record_name_col(&self) -> &dyn Stable<Name> {
+        &*self.record_names
     }
 }
 
@@ -862,6 +1025,20 @@ impl<'a> Own<'a> {
         match self {
             Own::Owned { lists, .. } => lists,
             Own::Stable(s) => s.lists(),
+        }
+    }
+
+    fn record_schemas(&self) -> &[(RecordSchema, List)] {
+        match self {
+            Own::Owned { record_schemas, .. } => record_schemas,
+            Own::Stable(s) => s.record_schemas(),
+        }
+    }
+
+    fn record_names(&self) -> &[Name] {
+        match self {
+            Own::Owned { record_names, .. } => record_names,
+            Own::Stable(s) => s.record_names(),
         }
     }
 }
@@ -969,23 +1146,53 @@ impl<'a> PortableTys<'a> {
 
     /// An empty table, interned through `&mut`.
     pub fn new_in(alloc: Alloc<'a>) -> PortableTys<'a> {
-        PortableTys { base: None, alloc, own: Own::Owned { nodes: Vec::new_in(alloc), lists: Vec::new_in(alloc), index: OwnIndex::new_in(alloc) } }
+        PortableTys {
+            base: None,
+            alloc,
+            own: Own::Owned {
+                nodes: Vec::new_in(alloc),
+                lists: Vec::new_in(alloc),
+                record_schemas: Vec::new_in(alloc),
+                record_names: Vec::new_in(alloc),
+                index: OwnIndex::new_in(alloc),
+            },
+        }
     }
 
     /// An empty table over the caller's [`Stable`] columns (empty when handed in), interned
     /// through `&self` too ([`PortableTys::intern_shared`]); its index in `alloc`.
-    pub fn new_stable(alloc: Alloc<'a>, nodes: Box<dyn Stable<PNode> + 'a, Alloc<'a>>, lists: Box<dyn Stable<PTy> + 'a, Alloc<'a>>) -> Result<PortableTys<'a>, CheckError> {
-        if !nodes.as_slice().is_empty() || !lists.as_slice().is_empty() {
+    pub fn new_stable(
+        alloc: Alloc<'a>,
+        nodes: Box<dyn Stable<PNode> + 'a, Alloc<'a>>,
+        lists: Box<dyn Stable<PTy> + 'a, Alloc<'a>>,
+        record_schemas: Box<dyn Stable<(RecordSchema, List)> + 'a, Alloc<'a>>,
+        record_names: Box<dyn Stable<Name> + 'a, Alloc<'a>>,
+    ) -> Result<PortableTys<'a>, CheckError> {
+        if !nodes.as_slice().is_empty()
+            || !lists.as_slice().is_empty()
+            || !record_schemas.as_slice().is_empty()
+            || !record_names.as_slice().is_empty()
+        {
             let n = u32::try_from(nodes.as_slice().len()).unwrap_or(u32::MAX);
             return Err(CheckError::Malformed(Malformed::Overlay { base: 0, have: n }));
         }
-        let cols: Box<dyn StableOwn + 'a, Alloc<'a>> = Box::new_in(StableCols { nodes, lists, index: RefCell::new(OwnIndex::new_in(alloc)) }, alloc);
+        let cols: Box<dyn StableOwn + 'a, Alloc<'a>> = Box::new_in(
+            StableCols { nodes, lists, record_schemas, record_names, index: RefCell::new(OwnIndex::new_in(alloc)) },
+            alloc,
+        );
         Ok(PortableTys { base: None, alloc, own: Own::Stable(cols) })
     }
 
     /// [`PortableTys::over`] with the own part in [`Stable`] columns ([`PortableTys::new_stable`]).
-    pub fn over_stable(base: &'a PortableTys<'a>, alloc: Alloc<'a>, nodes: Box<dyn Stable<PNode> + 'a, Alloc<'a>>, lists: Box<dyn Stable<PTy> + 'a, Alloc<'a>>) -> Result<PortableTys<'a>, CheckError> {
-        let mut t = PortableTys::new_stable(alloc, nodes, lists)?;
+    pub fn over_stable(
+        base: &'a PortableTys<'a>,
+        alloc: Alloc<'a>,
+        nodes: Box<dyn Stable<PNode> + 'a, Alloc<'a>>,
+        lists: Box<dyn Stable<PTy> + 'a, Alloc<'a>>,
+        record_schemas: Box<dyn Stable<(RecordSchema, List)> + 'a, Alloc<'a>>,
+        record_names: Box<dyn Stable<Name> + 'a, Alloc<'a>>,
+    ) -> Result<PortableTys<'a>, CheckError> {
+        let mut t = PortableTys::new_stable(alloc, nodes, lists, record_schemas, record_names)?;
         t.set_base(base)?;
         Ok(t)
     }
@@ -1062,13 +1269,92 @@ impl<'a> PortableTys<'a> {
     /// interned through `&self` after it is readable through it by id.
     pub fn view(&self) -> PTys<'_> {
         let snap = match self.base {
-            Some(b) => PTys::overlay(b.view(), self.own.nodes(), self.own.lists()),
-            None => PTys::flat(self.own.nodes(), self.own.lists()),
+            Some(b) => PTys::overlay(
+                b.view(),
+                self.own.nodes(),
+                self.own.lists(),
+                self.own.record_schemas(),
+                self.own.record_names(),
+            ),
+            None => PTys::flat_with_records(
+                self.own.nodes(),
+                self.own.lists(),
+                self.own.record_schemas(),
+                self.own.record_names(),
+            ),
         };
         match &self.own {
             Own::Owned { .. } => snap,
-            Own::Stable(s) => snap.with_live(self.base.is_some(), s.node_col(), s.list_col()),
+            Own::Stable(s) => snap.with_live(
+                self.base.is_some(),
+                s.node_col(),
+                s.list_col(),
+                s.record_schema_col(),
+                s.record_name_col(),
+            ),
         }
+    }
+
+    fn has_record_schema(&self, schema: RecordSchema) -> bool {
+        if let Some(b) = self.base
+            && b.has_record_schema(schema)
+        {
+            return true;
+        }
+        self.own.record_schemas().iter().any(|&(s, _)| s == schema)
+    }
+
+    /// Registers `schema -> sorted_names` in this table (idempotent across base and own).
+    pub fn register_record_schema(&mut self, schema: RecordSchema, sorted_names: &[Name]) -> Result<(), Full> {
+        match &mut self.own {
+            Own::Owned { record_schemas, record_names, .. } => {
+                if let Some(b) = self.base
+                    && b.has_record_schema(schema)
+                {
+                    return Ok(());
+                }
+                if record_schemas.iter().any(|&(s, _)| s == schema) {
+                    return Ok(());
+                }
+                let base_n = self.base.map_or(0, |b| b.own.record_names().len());
+                let len = u32::try_from(sorted_names.len()).map_err(|_| Full)?;
+                let list = if sorted_names.is_empty() {
+                    List::EMPTY
+                } else {
+                    let start = u32::try_from(base_n + record_names.len()).map_err(|_| Full)?;
+                    record_names.extend_from_slice(sorted_names);
+                    List { start, len }
+                };
+                record_schemas.push((schema, list));
+                Ok(())
+            }
+            Own::Stable(s) => s.register_record_schema(self.base, schema, sorted_names),
+        }
+    }
+
+    /// Registers `schema -> sorted_names` through a shared borrow, for a table over [`Stable`]
+    /// columns.
+    pub fn register_record_schema_shared(&self, schema: RecordSchema, sorted_names: &[Name]) -> Result<(), CheckError> {
+        match &self.own {
+            Own::Owned { .. } => Err(CheckError::Malformed(Malformed::SharedIntern)),
+            Own::Stable(s) => s.register_record_schema(self.base, schema, sorted_names).map_err(table_full),
+        }
+    }
+
+    /// Copies every registered record schema from `src` into this table.
+    pub fn copy_record_schemas_from(&mut self, src: PTys<'_>) -> Result<(), Full> {
+        for (schema, names) in src.record_schemas() {
+            self.register_record_schema(schema, names)?;
+        }
+        Ok(())
+    }
+
+    /// Copies every registered record schema from `src` through a shared borrow.
+    pub fn copy_record_schemas_from_shared(&self, src: PTys<'_>) -> Result<(), CheckError> {
+        for (schema, names) in src.record_schemas() {
+            self.register_record_schema_shared(schema, names)?;
+        }
+        Ok(())
     }
 
     /// The own part (the whole table when it has no base) copied into `alloc`, with the base's
@@ -1076,12 +1362,30 @@ impl<'a> PortableTys<'a> {
     /// is not kept: a kept table is read, never interned into.
     pub fn keep_in<'k>(&self, alloc: Alloc<'k>) -> Result<OwnTys<'k>, CheckError> {
         let (bn, bl) = self.base_lens();
+        let (brs, brn) = match self.base {
+            Some(b) => (b.own.record_schemas().len(), b.own.record_names().len()),
+            None => (0, 0),
+        };
         let limit = |_| CheckError::Limit(crate::error::Limit::Table);
         let mut nodes = Vec::with_capacity_in(self.own.nodes().len(), alloc);
         nodes.extend_from_slice(self.own.nodes());
         let mut lists = Vec::with_capacity_in(self.own.lists().len(), alloc);
         lists.extend_from_slice(self.own.lists());
-        Ok(OwnTys { base_nodes: u32::try_from(bn).map_err(limit)?, base_lists: u32::try_from(bl).map_err(limit)?, nodes, lists, whole: false })
+        let mut record_schemas = Vec::with_capacity_in(self.own.record_schemas().len(), alloc);
+        record_schemas.extend_from_slice(self.own.record_schemas());
+        let mut record_names = Vec::with_capacity_in(self.own.record_names().len(), alloc);
+        record_names.extend_from_slice(self.own.record_names());
+        Ok(OwnTys {
+            base_nodes: u32::try_from(bn).map_err(limit)?,
+            base_lists: u32::try_from(bl).map_err(limit)?,
+            base_record_schemas: u32::try_from(brs).map_err(limit)?,
+            base_record_names: u32::try_from(brn).map_err(limit)?,
+            nodes,
+            lists,
+            record_schemas,
+            record_names,
+            whole: false,
+        })
     }
 
     /// The node `n`, interned. Its children must already be in the table.
@@ -1264,14 +1568,15 @@ impl<'a> PortableTys<'a> {
     /// back half's one table starts as a copy of the records' table (program.rs), once.
     pub fn fork_in<'b>(&self, alloc: Alloc<'b>) -> Result<PortableTys<'b>, CheckError> {
         let mut out = PortableTys::new_in(alloc);
-        for &n in self.view().nodes() {
+        let view = self.view();
+        for &n in view.nodes() {
             out.intern(n)?;
         }
-        let view = self.view();
         if let Some(b) = self.base {
             b.each_list_row(&mut |l| out.intern_list(view.list(l)?).map(drop))?;
         }
         self.each_list_row(&mut |l| out.intern_list(view.list(l)?).map(drop))?;
+        out.copy_record_schemas_from(view).map_err(table_full)?;
         Ok(out)
     }
 }
@@ -1279,7 +1584,14 @@ impl<'a> PortableTys<'a> {
 impl<'a> PartialEq for PortableTys<'a> {
     fn eq(&self, other: &PortableTys<'a>) -> bool {
         let (a, b) = (self.view(), other.view());
-        a.len() == b.len() && a.lists_len() == b.lists_len() && a.nodes().eq(b.nodes()) && a.lists().eq(b.lists())
+        a.len() == b.len()
+            && a.lists_len() == b.lists_len()
+            && a.record_schemas_len() == b.record_schemas_len()
+            && a.record_names_len() == b.record_names_len()
+            && a.nodes().eq(b.nodes())
+            && a.lists().eq(b.lists())
+            && a.record_schema_rows().eq(b.record_schema_rows())
+            && a.record_names_iter().eq(b.record_names_iter())
     }
 }
 
@@ -1293,6 +1605,8 @@ impl<'a> core::fmt::Debug for PortableTys<'a> {
             .field("base_lists", &bl)
             .field("nodes", &self.own.nodes())
             .field("lists", &self.own.lists())
+            .field("record_schemas", &self.own.record_schemas())
+            .field("record_names", &self.own.record_names())
             .finish()
     }
 }
@@ -1305,8 +1619,12 @@ impl<'a> core::fmt::Debug for PortableTys<'a> {
 pub struct OwnTys<'a> {
     base_nodes: u32,
     base_lists: u32,
+    base_record_schemas: u32,
+    base_record_names: u32,
     nodes: Vec<PNode, Alloc<'a>>,
     lists: Vec<PTy, Alloc<'a>>,
+    record_schemas: Vec<(RecordSchema, List), Alloc<'a>>,
+    record_names: Vec<Name, Alloc<'a>>,
     /// The body's types are the base's own (lowered straight into it): read it whole.
     whole: bool,
 }
@@ -1314,7 +1632,17 @@ pub struct OwnTys<'a> {
 impl<'a> OwnTys<'a> {
     /// No types: a body whose types went into another table (`lower_again`).
     pub fn none(alloc: Alloc<'a>) -> OwnTys<'a> {
-        OwnTys { base_nodes: 0, base_lists: 0, nodes: Vec::new_in(alloc), lists: Vec::new_in(alloc), whole: false }
+        OwnTys {
+            base_nodes: 0,
+            base_lists: 0,
+            base_record_schemas: 0,
+            base_record_names: 0,
+            nodes: Vec::new_in(alloc),
+            lists: Vec::new_in(alloc),
+            record_schemas: Vec::new_in(alloc),
+            record_names: Vec::new_in(alloc),
+            whole: false,
+        }
     }
 
     /// A body lowered straight into the table it is read over (the seeded path: one body's
@@ -1353,12 +1681,37 @@ impl<'a> OwnTys<'a> {
             return Ok(base.view());
         }
         let (bn, bl) = (self.base_nodes as usize, self.base_lists as usize);
+        let (brs, brn) = (self.base_record_schemas as usize, self.base_record_names as usize);
         let (base_nodes, base_lists) = (base.own.nodes(), base.own.lists());
-        let (Some(nodes), Some(lists)) = (base_nodes.get(..bn), base_lists.get(..bl)) else {
-            let (want, got) = if base_nodes.len() < bn { (self.base_nodes, base_nodes.len()) } else { (self.base_lists, base_lists.len()) };
+        let (base_record_schemas, base_record_names) = (base.own.record_schemas(), base.own.record_names());
+        let (Some(nodes), Some(lists), Some(rs), Some(rn)) = (
+            base_nodes.get(..bn),
+            base_lists.get(..bl),
+            base_record_schemas.get(..brs),
+            base_record_names.get(..brn),
+        ) else {
+            let (want, got) = if base_nodes.len() < bn {
+                (self.base_nodes, base_nodes.len())
+            } else if base_lists.len() < bl {
+                (self.base_lists, base_lists.len())
+            } else if base_record_schemas.len() < brs {
+                (self.base_record_schemas, base_record_schemas.len())
+            } else {
+                (self.base_record_names, base_record_names.len())
+            };
             return Err(CheckError::Malformed(Malformed::Overlay { base: want, have: have(got) }));
         };
-        let (nodes, lists) = if truncate { (nodes, lists) } else { (base_nodes, base_lists) };
-        Ok(PTys::overlay(PTys::flat(nodes, lists), &self.nodes, &self.lists))
+        let (nodes, lists, rs, rn) = if truncate {
+            (nodes, lists, rs, rn)
+        } else {
+            (base_nodes, base_lists, base_record_schemas, base_record_names)
+        };
+        Ok(PTys::overlay(
+            PTys::flat_with_records(nodes, lists, rs, rn),
+            &self.nodes,
+            &self.lists,
+            &self.record_schemas,
+            &self.record_names,
+        ))
     }
 }

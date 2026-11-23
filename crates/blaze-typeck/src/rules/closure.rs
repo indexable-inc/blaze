@@ -830,7 +830,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
             }
             Expr::Repeat { elem, .. } => exprs.push((elem, 0)),
-            Expr::Struct { fields, base, .. } => {
+            Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
                 for fi in self.body.field_init_list(fields)? {
                     exprs.push((fi.expr, USE_MOVE));
                 }
@@ -948,7 +948,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Or { alts: elems } | Pat::Slice { elems, .. } => {
                     stack.extend_from_slice(self.body.pat_list(elems)?);
                 }
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     for fp in self.body.field_pat_list(fields)? {
                         stack.push(fp.pat);
                     }

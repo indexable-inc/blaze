@@ -216,6 +216,7 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
             Pat::Or { .. } => self.refuse_pat(Construct::OrPattern, p),
             Pat::Slice { .. } => self.refuse_pat(Construct::SlicePattern, p),
             Pat::Range { .. } => self.refuse_pat(Construct::RangePattern, p),
+            Pat::Record { .. } => self.refuse_pat(Construct::Union, p),
         }
     }
 
@@ -287,6 +288,11 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
                     let (adt, _) = self.ctor_of(q)?;
                     if self.adt_facts(adt, At::Pat(q))?.is_enum {
                         return Ok(false);
+                    }
+                }
+                Pat::Record { fields, .. } => {
+                    for fp in self.field_pats_in(fields, q)? {
+                        work.push(fp.pat);
                     }
                 }
                 Pat::Lit(_) | Pat::NegLit(_) | Pat::Range { .. } | Pat::Slice { .. } | Pat::Or { .. } => return Ok(false),
@@ -370,6 +376,7 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
             }
             Pat::Or { .. } => self.refuse_pat(Construct::OrPattern, p),
             Pat::Slice { .. } => self.refuse_pat(Construct::SlicePattern, p),
+            Pat::Record { .. } => self.refuse_pat(Construct::Union, p),
         }
     }
 

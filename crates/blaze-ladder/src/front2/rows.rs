@@ -260,7 +260,11 @@ impl<T: Copy, A: Allocator> Drop for StableColumn<T, A> {
 pub fn stable_tys(alloc: blaze_own::Alloc<'_>) -> Result<blaze_typeck::PortableTys<'_>, blaze_typeck::CheckError> {
     let nodes: blaze_own::Box<dyn blaze_typeck::Stable<blaze_typeck::PNode>, blaze_own::Alloc<'_>> = blaze_own::Box::new_in(StableColumn::new_in(alloc), alloc);
     let lists: blaze_own::Box<dyn blaze_typeck::Stable<blaze_typeck::PTy>, blaze_own::Alloc<'_>> = blaze_own::Box::new_in(StableColumn::new_in(alloc), alloc);
-    blaze_typeck::PortableTys::new_stable(alloc, nodes, lists)
+    let record_schemas: blaze_own::Box<dyn blaze_typeck::Stable<(blaze_typeck::RecordSchema, blaze_typeck::List)>, blaze_own::Alloc<'_>> =
+        blaze_own::Box::new_in(StableColumn::new_in(alloc), alloc);
+    let record_names: blaze_own::Box<dyn blaze_typeck::Stable<blaze_typeck::Name>, blaze_own::Alloc<'_>> =
+        blaze_own::Box::new_in(StableColumn::new_in(alloc), alloc);
+    blaze_typeck::PortableTys::new_stable(alloc, nodes, lists, record_schemas, record_names)
 }
 
 #[cfg(test)]

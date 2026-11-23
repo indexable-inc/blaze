@@ -2678,7 +2678,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     kids.push((rhs, false));
                 }
                 Expr::Tuple { elems } | Expr::Array { elems } => kids.extend(list(elems)?.iter().map(|&c| (c, false))),
-                Expr::Struct { fields, base, .. } => {
+                Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
                     let inits = body.field_inits.get(fields.range()).ok_or(malformed("a struct literal's fields past `field_inits`"))?;
                     kids.extend(inits.iter().map(|f| (f.expr, false)));
                     kids.extend(base.expr().map(|c| (c, false)));
@@ -2791,7 +2791,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     continue;
                 }
                 Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => elems,
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                     todo.extend(fps.iter().map(|f| f.pat));
                     continue;
@@ -4139,6 +4139,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 AdjustKind::Deref { .. } | AdjustKind::Borrow { .. } => {
                     return Err(malformed("a dereference or a borrow among the value adjustments"));
                 }
+                AdjustKind::UnionInject { .. } | AdjustKind::UnionWiden => {
+                    return Err(unsupported(e, "a structural union coercion"));
+                }
             }
         }
         Ok(())
@@ -5378,6 +5381,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     _ => return Err(unsupported(e, "a struct literal of other than a struct")),
                 }
             }
+            Expr::Record { .. } => return Err(unsupported(e, "a structural record literal")),
             Expr::Tuple { elems } | Expr::Array { elems } => {
                 let list = self.body.expr_lists.get(elems.range()).ok_or(malformed("a literal's elements past `expr_lists`"))?;
                 let repr = self.expr_repr(e)?;

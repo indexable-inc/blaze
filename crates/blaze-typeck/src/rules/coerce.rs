@@ -95,6 +95,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         match self.view(b) {
             TyView::Ptr(mb, _) => return self.coerce_raw_ptr(a, b, mb),
             TyView::Ref(mb, _) => return self.coerce_borrowed(a, b, mb, two_phase),
+            TyView::Union(lb) => return self.coerce_to_union(a, b, lb),
             _ => {}
         }
         match (self.view(a), self.view(b)) {
@@ -432,5 +433,69 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             self.adj_scratch.push((AdjustKind::MutToConstPointer, b));
         }
         Ok(Some(()))
+    }
+
+    /// Coercion into a structural union `b = Union(lb)`:
+    /// 1. If `a` is `Union(la)`: exact unification when arities match; otherwise sub-union
+    ///    widening (`A | B -> A | B | C`) when every member of `la` unifies with a unique member
+    ///    of `lb` (`AdjustKind::UnionWiden`).
+    /// 2. If `a` is not a union: member injection (`A -> A | B`) when `a` unifies with a unique
+    ///    member `v` of `lb` (`AdjustKind::UnionInject { variant: v }`).
+    fn coerce_to_union(&mut self, a: Ty, b: Ty, lb: TyList) -> Result<Option<()>, Stop> {
+        let nb = self.ty.list_len(lb);
+        if let TyView::Union(la) = self.view(a) {
+            let na = self.ty.list_len(la);
+            if na == nb && self.commit_if(|m| m.unify_some(a, b))?.is_some() {
+                return Ok(Some(()));
+            }
+            let widened = self.commit_if(|m| -> Result<Option<()>, Stop> {
+                for i in 0..na {
+                    let ma = m.ty.list_get(la, i);
+                    let mut matched: Option<u32> = None;
+                    let mut count = 0u32;
+                    for j in 0..nb {
+                        let mb = m.ty.list_get(lb, j);
+                        if m.probe(|m2| m2.unify(ma, mb))? {
+                            matched = Some(j);
+                            count += 1;
+                            if count > 1 {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                    let Some(j) = matched else { return Ok(None) };
+                    let mb = m.ty.list_get(lb, j);
+                    if !m.unify(ma, mb)? {
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(()))
+            })?;
+            if widened.is_some() {
+                self.adj_scratch.push((AdjustKind::UnionWiden, b));
+                return Ok(Some(()));
+            }
+            return Ok(None);
+        }
+        let mut matched: Option<u32> = None;
+        let mut count = 0u32;
+        for j in 0..nb {
+            let mb = self.ty.list_get(lb, j);
+            if self.probe(|m| m.unify(a, mb))? {
+                matched = Some(j);
+                count += 1;
+                if count > 1 {
+                    return Ok(None);
+                }
+            }
+        }
+        if let Some(variant) = matched {
+            let mb = self.ty.list_get(lb, variant);
+            if self.unify(a, mb)? {
+                self.adj_scratch.push((AdjustKind::UnionInject { variant }, b));
+                return Ok(Some(()));
+            }
+        }
+        Ok(None)
     }
 }

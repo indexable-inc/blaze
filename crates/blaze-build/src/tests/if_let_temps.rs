@@ -44,7 +44,7 @@ fn let_g(b: &mut BodyBuf, name: &str, v: u128) -> Stmt {
 
 /// A mutable binding.
 fn bind_mut(b: &mut BodyBuf, name: &str) -> PatId {
-    b.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: true }, name: Name::of(name), sub: None })
+    b.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: true }, name: Name::of(name), sub: None, ty: None })
 }
 
 /// `A(<name>, _)` as a pattern.

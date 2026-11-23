@@ -33,7 +33,23 @@ pub enum AdjustKind {
     MutToConstPointer,
     /// An unsizing coercion (`&[T; N]` to `&[T]`).
     Unsize,
+    /// Member injection into a structural union (`A -> A | B`).
+    UnionInject { variant: u32 },
+    /// Sub-union widening (`A | B -> A | B | C`).
+    UnionWiden,
 }
+
+/// How a pattern binds or narrows a structural union (`PNode::Union`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnionPat {
+    /// Matches member `variant` of the scrutinee's union and extracts its payload.
+    Variant(u32),
+    /// Catch-all residual arm narrowed to a multi-member sub-union of the scrutinee.
+    Residual,
+}
+
+/// Structural union pattern bindings, sorted by pattern id.
+pub type UnionPats<'a> = Soa<(PatId, UnionPat), Alloc<'a>>;
 
 /// How a closure captures a local.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -149,6 +165,9 @@ pub struct Checked<'a> {
     /// Sorted by pattern; read with [`Checked::pat_const_args_of`].
     pub pat_const_args: PatConstArgs<'a>,
     pub pat_defs: PatDefs<'a>,
+    /// Structural union pattern match/narrowing records, sorted by pattern; read with
+    /// [`Checked::union_pat_of`].
+    pub union_pats: UnionPats<'a>,
     pub fields: Fields<'a>,
     pub captures: Captures<'a>,
     /// The captured places of each decided closure ([`CapturePlaceRows`]).
@@ -335,6 +354,12 @@ impl<'a> Checked<'a> {
         self.index_mut.binary_search(&e).is_ok()
     }
 
+    /// How pattern `p` matches or narrows a structural union, if applicable.
+    pub fn union_pat_of(&self, p: PatId) -> Option<UnionPat> {
+        let at = self.union_pats.column::<0>().binary_search(&p).ok()?;
+        Some(self.union_pats.column::<1>()[at])
+    }
+
     /// Equal results ignoring the read list and needs: what the read-list property compares.
     pub fn same_result(&self, other: &Checked<'a>) -> bool {
         self.types == other.types
@@ -347,6 +372,7 @@ impl<'a> Checked<'a> {
             && soa2_eq(&self.const_args, &other.const_args)
             && soa2_eq(&self.pat_const_args, &other.pat_const_args)
             && soa2_eq(&self.pat_defs, &other.pat_defs)
+            && soa2_eq(&self.union_pats, &other.union_pats)
             && soa3_eq(&self.fields, &other.fields)
             && soa3_eq(&self.captures, &other.captures)
             && self.capture_places.column::<0>() == other.capture_places.column::<0>()
@@ -397,6 +423,7 @@ impl<'a> core::fmt::Debug for Checked<'a> {
             .field("local_ty", &self.local_ty)
             .field("adjusts", &self.adjusts)
             .field("callees", &self.callees)
+            .field("union_pats", &self.union_pats)
             .field("fields", &self.fields)
             .field("captures", &self.captures)
             .field("capture_places", &self.capture_places)

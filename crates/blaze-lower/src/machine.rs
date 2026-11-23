@@ -849,10 +849,10 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             }
         }
         for p in self.out.pats.iter_mut() {
-            if let Ok(Pat::Bind { ann, name, sub, shadows: Some(s) }) = Pat::decode(*p)
+            if let Ok(Pat::Bind { ann, name, sub, shadows: Some(s), ty }) = Pat::decode(*p)
                 && let Some(hid) = find(s)
             {
-                *p = Pat::Bind { ann, name, sub, shadows: hid }.encode();
+                *p = Pat::Bind { ann, name, sub, shadows: hid, ty }.encode();
             }
         }
     }
@@ -2535,15 +2535,15 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let mutable = self.has_tok(f, MUT_KW) || (by_ref && self.has_tok(f, UNIQ_KW));
                 let name = self.first(f, V::Name);
                 let sub = self.first(f, V::Pat).map(|v| PatId(v.id));
-                let has_typed_ascription = self.first(f, V::Type).is_some();
+                let ty = self.first(f, V::Type).map(|v| TypeId(v.id));
                 self.done(f);
                 let Some(name) = name else { return };
                 let ann = BindAnn { by_ref: by_ref.then_some(if mutable { Mutbl::Mut } else { Mutbl::Not }), mutable: mutable && !by_ref };
                 let name = NameIdx(name.id);
-                let p = self.put_pat(Pat::Bind { ann, name, sub, shadows: None }, r);
+                let p = self.put_pat(Pat::Bind { ann, name, sub, shadows: None, ty }, r);
                 // Settled at the end, when every block's items are known: a bare name that
                 // is a constant, a unit struct or a unit variant becomes a path pattern.
-                let bare = !by_ref && !mutable && sub.is_none() && !has_typed_ascription;
+                let bare = !by_ref && !mutable && sub.is_none() && ty.is_none();
                 self.idents.push(Ident { pat: p.0, scope: self.scope().0, bare });
                 let hash = self.local_key(name);
                 self.push_pending(hash, p);
@@ -3036,7 +3036,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             None => self.synth_name("self", r),
         };
         let ann = BindAnn { by_ref: None, mutable: mutable && !amp };
-        let pat = self.put_pat(Pat::Bind { ann, name, sub: None, shadows: None }, r);
+        let pat = self.put_pat(Pat::Bind { ann, name, sub: None, shadows: None, ty: None }, r);
         let hash = self.local_key(name);
         self.push_pending(hash, pat);
         let p = Param { pat: Some(pat), ty, self_kind, lifetime, variadic: false, attrs: List { start: 0, len: 0 } };

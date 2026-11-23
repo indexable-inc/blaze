@@ -1091,7 +1091,7 @@ pub enum Pat {
     /// `shadows` is the binding of the same name this one hides where it comes into scope. A
     /// bare name that is a constant, a unit struct or a unit variant is never one: the
     /// lowering writes it as a [`Pat::Path`] (machine.rs `settle_patterns`).
-    Bind { ann: BindAnn, name: NameIdx, sub: Option<PatId>, shadows: Option<PatId> },
+    Bind { ann: BindAnn, name: NameIdx, sub: Option<PatId>, shadows: Option<PatId>, ty: Option<TypeId> },
     /// `rest` the position of `..`, if any; `elems` in `ids`.
     Tuple { elems: List, rest: Option<u32> },
     Ref { mutbl: Mutbl, inner: PatId },
@@ -1144,10 +1144,11 @@ impl Pat {
         match self {
             P::Missing => n(0),
             P::Wild => n(1),
-            P::Bind { ann, name, sub, shadows } => Node {
+            P::Bind { ann, name, sub, shadows, ty } => Node {
                 a: name.0,
                 b: opt(sub.map(|p| p.0)),
                 c: opt(shadows.map(|p| p.0)),
+                d: opt(ty.map(|t| t.0)),
                 ..n(2).with(ann_bits(ann))
             },
             P::Tuple { elems, rest } => Node { a: elems.start, b: elems.len, c: opt(rest), ..n(3) },
@@ -1190,6 +1191,7 @@ impl Pat {
                 name: NameIdx(n.a),
                 sub: unopt(n.b).map(PatId),
                 shadows: unopt(n.c).map(PatId),
+                ty: unopt(n.d).map(TypeId),
             },
             3 => P::Tuple { elems: list(n.a, n.b), rest: unopt(n.c) },
             4 => P::Ref { mutbl: mutbl(n.flags & 1 != 0), inner: PatId(n.a) },

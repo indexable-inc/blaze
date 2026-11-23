@@ -236,7 +236,7 @@ fn a_mutable_overloaded_index_calls_index_mut_once_per_use() {
     let w2 = index_of(&mut b, wp, 2);
     let five = b.int(5, None);
     let add = b.e(Expr::AssignOp { op: BinOp::Add, lhs: w2, rhs: five });
-    let (r, s) = (b.bind("r"), b.pat(Pat::Bind { ann: BindAnn { by_ref: Some(Mutbl::Mut), mutable: false }, name: Name::of("s"), sub: None }));
+    let (r, s) = (b.bind("r"), b.pat(Pat::Bind { ann: BindAnn { by_ref: Some(Mutbl::Mut), mutable: false }, name: Name::of("s"), sub: None, ty: None }));
     let w3 = index_of(&mut b, wp, 3);
     let r_init = b.e(Expr::Ref { mutbl: Mutbl::Mut, operand: w3 });
     let r_e = b.local(r);

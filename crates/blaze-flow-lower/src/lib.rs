@@ -4989,7 +4989,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 self.tasks.push(Task::AggDone(e, 1));
                 self.tasks.push(Task::Eval(elem, false));
             }
-            Expr::Struct { fields, base, .. } => {
+            Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
                 let fs = match body.field_inits.get(fields.range()) {
                     Some(a) => a,
                     None => return self.refuse(Form::Malformed, e),
@@ -5173,7 +5173,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     Some(l) => stack.extend_from_slice(l),
                     None => return self.refuse_pat(Form::Malformed, p),
                 },
-                Pat::Struct { fields, .. } => match self.body.field_pats.get(fields.range()) {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => match self.body.field_pats.get(fields.range()) {
                     Some(fs) => {
                         for f in fs {
                             stack.push(f.pat);
@@ -5282,6 +5282,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     {
                         self.relate(p, tp, out, e)?;
                     }
+                    Val { at: At::Place(tp), ty: out }
+                }
+                AdjustKind::UnionInject { .. } | AdjustKind::UnionWiden => {
+                    let op = self.operand(v, e)?;
+                    let t = self.temp(out, e)?;
+                    let tp = self.place_of(t);
+                    self.b.aggregate(tp, &[op], self.span(e));
                     Val { at: At::Place(tp), ty: out }
                 }
             };
@@ -5878,7 +5885,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 }
                 (adt, variant)
             }
-            Expr::Struct { fields, base, .. } => {
+            Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
                 let (adt, variant) = match self.expr_def(e) {
                     Some(Def::Ctor { adt, variant, .. }) => (adt, variant),
                     Some(Def::Adt(adt)) if !self.adt_facts(adt, e)?.is_enum => (adt, 0),
@@ -6618,7 +6625,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } => out.extend_from_slice(list(elems)),
             Pat::Or { alts } => out.extend_from_slice(list(alts)),
             Pat::Ref { inner, .. } => out.push(inner),
-            Pat::Struct { fields, .. } => {
+            Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                 for f in b.field_pats.get(fields.range()).unwrap_or(&[]) {
                     out.push(f.pat);
                 }
@@ -6700,7 +6707,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 Some(x) => *x,
                 None => return self.refuse_pat(Form::Malformed, p),
             };
-            let peel = matches!(pat, Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. } | Pat::Path(_) | Pat::Range { .. });
+            let peel = matches!(pat, Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. } | Pat::Path(_) | Pat::Range { .. });
             if peel {
                 for _ in 0..MOST_POSITIONS {
                     let (m, inner) = match (ty.wrap, self.node(ty.ty, root)?) {
@@ -6720,7 +6727,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             match pat {
                 Pat::Missing => return self.refuse_pat(Form::Missing, p),
                 Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } => {}
-                Pat::Bind { ann, sub, name } => {
+                Pat::Bind { ann, sub, name, .. } => {
                     let lt = match self.ck.local_ty.get(p.ix()) {
                         Some(&t) => TyD::of(t),
                         None => return self.refuse_pat(Form::Malformed, p),
@@ -6837,6 +6844,33 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     }
                     self.bind_fields(p, place, ty, mode, adt, variant, &subs, &mut stack)?;
                 }
+                Pat::Record { fields, .. } => {
+                    let types = self.ck.types.view();
+                    let Ok(PNode::Record(schema, flist)) = types.node(ty.ty) else {
+                        return self.refuse_pat(Form::Malformed, p);
+                    };
+                    let Ok(field_tys) = types.list(flist) else {
+                        return self.refuse_pat(Form::Malformed, p);
+                    };
+                    let mut subs: Vec<(u32, PTy, PatId), A> = Vec::new_in(self.alloc);
+                    for f in self.body.field_pats.get(fields.range()).unwrap_or(&[]) {
+                        let Some(i) = types.record_field_index(schema, f.name) else {
+                            return self.refuse_pat(Form::UnknownField, f.pat);
+                        };
+                        let Some(&ft) = field_tys.get(i as usize) else {
+                            return self.refuse_pat(Form::Malformed, f.pat);
+                        };
+                        subs.push((i, ft, f.pat));
+                    }
+                    for (fi, ft, sp) in subs {
+                        if !self.binds(sp)? {
+                            continue;
+                        }
+                        let ft = TyD::of(ft);
+                        let q = self.project(place, ty, Proj::Field(fi), ft, false, root)?;
+                        stack.push(BindItem::Pat(sp, q, ft, mode));
+                    }
+                }
             }
         }
         Ok(())
@@ -6888,7 +6922,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 Some(x) => *x,
                 None => return self.refuse_pat(Form::Malformed, sp),
             };
-            let peels = matches!(spat, Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. });
+            let peels = matches!(spat, Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. });
             let own = match self.ck.pat_ty.get(sp.ix()) {
                 Some(&t) => t,
                 None => return self.refuse_pat(Form::Malformed, sp),
@@ -7064,7 +7098,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 Expr::Tuple { elems } | Expr::Array { elems } => {
                     stack.extend_from_slice(self.body.expr_lists.get(elems.range()).unwrap_or(&[]));
                 }
-                Expr::Struct { fields, .. } => {
+                Expr::Struct { fields, .. } | Expr::Record { fields, .. } => {
                     for f in self.body.field_inits.get(fields.range()).unwrap_or(&[]) {
                         stack.push(f.expr);
                     }

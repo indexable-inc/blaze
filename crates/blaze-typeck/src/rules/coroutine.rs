@@ -656,7 +656,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
             }
             Expr::Repeat { elem, .. } => exprs.push(elem),
-            Expr::Struct { fields, base, .. } => {
+            Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
                 for fi in b.field_init_list(fields)? {
                     exprs.push(fi.expr);
                 }
@@ -684,7 +684,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Or { alts: elems } | Pat::Slice { elems, .. } => {
                 pats.extend_from_slice(b.pat_list(elems)?);
             }
-            Pat::Struct { fields, .. } => {
+            Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                 for fp in b.field_pat_list(fields)? {
                     pats.push(fp.pat);
                 }

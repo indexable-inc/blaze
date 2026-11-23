@@ -6,7 +6,7 @@ use super::*;
 
 /// A binding with no annotation: the default binding mode applies.
 fn plain(b: &mut BodyBuf, name: &str) -> PatId {
-    b.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None })
+    b.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None, ty: None })
 }
 
 fn char_pat(b: &mut BodyBuf, c: char) -> PatId {

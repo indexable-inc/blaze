@@ -335,7 +335,7 @@ fn a_volatile_store_and_load_of_an_aggregate_move_every_byte() {
 
 /// A binding with no annotation, immutable: the default binding mode applies.
 fn plain(b: &mut BodyBuf, name: &str) -> PatId {
-    b.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None })
+    b.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None, ty: None })
 }
 
 fn tuple_pat(b: &mut BodyBuf, elems: &[PatId]) -> PatId {

@@ -13,11 +13,11 @@ use blaze_own::{Alloc, Soa, Vec};
 use core::mem::DropGuard;
 
 use crate::body::BodyView;
-use crate::columns::{AdjustKind, CaptureKind};
+use crate::columns::{AdjustKind, CaptureKind, UnionPat};
 use crate::diag::{About, At, Because, DiagCode, PendingDiag, PendingGoal};
 use crate::error::{CheckError, Limit, Malformed, Stop};
 use crate::ids::{
-    ExprId, FloatTy, IntTy, ItemKey, LangItem, Mutbl, Name, PatId, StmtId, UintTy,
+    ExprId, FloatTy, IntTy, ItemKey, LangItem, List, Mutbl, Name, PatId, RecordSchema, StmtId, UintTy,
 };
 use crate::portable::{PNode, PTy, PTys};
 use crate::rules::async_fn::Witness;
@@ -254,6 +254,17 @@ pub(crate) struct MachineSnapshot<S> {
     fru_fields: usize,
     default_fields: usize,
     union_fields: usize,
+    union_pats: usize,
+}
+
+/// Per-match narrowing state for a structural union scrutinee (`rules/control.rs`).
+pub(crate) struct MatchNarrow<'a> {
+    /// Original union member list of the scrutinee (after optional ref-peeling).
+    pub orig_members: TyList,
+    /// Uncovered indices into `orig_members`, in original order.
+    pub remaining: Vec<u32, Alloc<'a>>,
+    /// Default binding mode accumulated from peeling references off the scrutinee.
+    pub peeled_mode: u32,
 }
 
 /// Where an overloaded dereference is asked ([`Machine::overloaded_deref_at`]).
@@ -420,6 +431,15 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     /// Each field expression whose field is a union's (rules/field.rs), in walk order: read by
     /// the unsafety pass (rules/unsafety.rs), which sorts it.
     pub union_fields: Vec<ExprId, Alloc<'a>>,
+    /// Structural union pattern bindings/narrowings (rules/pat.rs, rules/control.rs); rolled back
+    /// with a probe and written back sorted as `Checked::union_pats`.
+    pub union_pats: Vec<(PatId, UnionPat), Alloc<'a>>,
+    /// Per-match narrowing stack for structural union scrutinees (`rules/control.rs`).
+    pub match_narrow: Vec<MatchNarrow<'a>, Alloc<'a>>,
+    /// Registered structural record schemas -> ranges into `record_names`.
+    pub record_schemas: Vec<(RecordSchema, List), Alloc<'a>>,
+    /// Canonical sorted field names referenced by `record_schemas`.
+    pub record_names: Vec<Name, Alloc<'a>>,
     /// What the unsafety pass could not decide (rules/unsafety.rs): written back as
     /// `Checked::undecided`, never a pass and never an error.
     pub undecided: Vec<crate::rules::unsafety::Undecided, Alloc<'a>>,
@@ -553,6 +573,39 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             index_mut: Vec::new_in(alloc),
             typed_findings: Vec::new_in(alloc),
             union_fields: Vec::new_in(alloc),
+            union_pats: Vec::new_in(alloc),
+            match_narrow: Vec::new_in(alloc),
+            record_schemas: {
+                let mut rs = Vec::new_in(alloc);
+                let mut rn_len = 0u32;
+                for (schema, names) in body.types.record_schemas() {
+                    if rs.iter().any(|&(s, _)| s == schema) {
+                        continue;
+                    }
+                    let len = u32::try_from(names.len()).map_err(|_| CheckError::Limit(Limit::Table))?;
+                    let list = if len == 0 {
+                        List::EMPTY
+                    } else {
+                        let start = rn_len;
+                        rn_len = rn_len.checked_add(len).ok_or(CheckError::Limit(Limit::Table))?;
+                        List { start, len }
+                    };
+                    rs.push((schema, list));
+                }
+                rs
+            },
+            record_names: {
+                let mut rn = Vec::new_in(alloc);
+                let mut seen: Vec<RecordSchema, Alloc<'a>> = Vec::new_in(alloc);
+                for (schema, names) in body.types.record_schemas() {
+                    if seen.contains(&schema) {
+                        continue;
+                    }
+                    seen.push(schema);
+                    rn.extend_from_slice(names);
+                }
+                rn
+            },
             undecided: Vec::new_in(alloc),
             coerce_many: Vec::new_in(alloc),
             coerce_sources: Vec::new_in(alloc),
@@ -1813,6 +1866,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             fru_fields: self.fru_fields.len(),
             default_fields: self.default_fields.len(),
             union_fields: self.union_fields.len(),
+            union_pats: self.union_pats.len(),
         }
     }
 
@@ -1842,6 +1896,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.fru_fields.truncate(s.fru_fields);
         self.default_fields.truncate(s.default_fields);
         self.union_fields.truncate(s.union_fields);
+        self.union_pats.truncate(s.union_pats);
     }
 
     /// Runs `f` in a snapshot that is always rolled back (`probe`).
@@ -2075,7 +2130,12 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             PNode::Str => TyView::Str,
             PNode::Never => TyView::Never,
             PNode::Tuple(l) => TyView::Tuple(self.lowered_list(memo, types, l)?),
-            PNode::Record(s, l) => TyView::Record(s, self.lowered_list(memo, types, l)?),
+            PNode::Record(s, l) => {
+                if let Some(names) = types.record_names(s) {
+                    self.register_record_schema(s, names)?;
+                }
+                TyView::Record(s, self.lowered_list(memo, types, l)?)
+            }
             PNode::Union(l) => TyView::Union(self.lowered_list(memo, types, l)?),
             PNode::Ref(m, t) => TyView::Ref(m, Self::lowered(memo, t)?),
             PNode::Ptr(m, t) => TyView::Ptr(m, Self::lowered(memo, t)?),
@@ -2198,6 +2258,38 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             PNode::Error => TyView::Error,
         };
         self.mk(view)
+    }
+
+    /// Registers `schema -> sorted_names` on this machine (idempotent).
+    pub(crate) fn register_record_schema(&mut self, schema: RecordSchema, sorted_names: &[Name]) -> Result<(), Stop> {
+        if self.record_schemas.iter().any(|&(s, _)| s == schema) {
+            return Ok(());
+        }
+        let len = u32::try_from(sorted_names.len()).map_err(|_| CheckError::Limit(Limit::Table))?;
+        let list = if len == 0 {
+            List::EMPTY
+        } else {
+            let start = u32::try_from(self.record_names.len()).map_err(|_| CheckError::Limit(Limit::Table))?;
+            self.record_names.extend_from_slice(sorted_names);
+            List { start, len }
+        };
+        self.record_schemas.push((schema, list));
+        Ok(())
+    }
+
+    /// Canonical sorted field names for `schema`, if known to this machine.
+    pub(crate) fn record_names(&self, schema: RecordSchema) -> Option<&[Name]> {
+        let &(_, list) = self.record_schemas.iter().find(|&&(s, _)| s == schema)?;
+        if list.len == 0 {
+            return Some(&[]);
+        }
+        self.record_names.get(list.range())
+    }
+
+    /// Canonical field index of `name` in `schema`, if known.
+    pub(crate) fn record_field_index(&self, schema: RecordSchema, name: Name) -> Option<u32> {
+        let names = self.record_names(schema)?;
+        names.iter().position(|&n| n == name).and_then(|i| u32::try_from(i).ok())
     }
 
     /// A written type of the body.

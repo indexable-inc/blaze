@@ -70,7 +70,7 @@ fn p_pat(b: &mut BodyBuf, field: &str, pat: PatId) -> PatId {
 /// A by-value binding (`a`), or `ref a`.
 fn bind_a(b: &mut BodyBuf, by_ref: bool) -> PatId {
     let by_ref = if by_ref { Some(Mutbl::Not) } else { None };
-    b.pat(Pat::Bind { ann: BindAnn { by_ref, mutable: false }, name: Name::of("a"), sub: None })
+    b.pat(Pat::Bind { ann: BindAnn { by_ref, mutable: false }, name: Name::of("a"), sub: None, ty: None })
 }
 
 /// `match <scrutinee> { P { a, .. } [if <guard>] => a.x, [_ => 0] }` (the wildcard arm only
