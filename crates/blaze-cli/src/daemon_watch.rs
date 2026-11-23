@@ -38,7 +38,7 @@ use crate::sweep::{ABSENT, AT_MOD_RS, BOTH, DIRECT_PATH, FACT_MOUNT, LeafKind, L
 
 /// Maximum total `O_EVTONLY` descriptors held by one checkout's `KqueueVnode` watcher before
 /// switching to [`WatchBackend::FsEventsHeld`].
-pub(crate) const KQUEUE_CAP: usize = 8_192;
+pub(crate) const KQUEUE_CAP: usize = 32_768;
 
 /// Deadline for starting the passive in-process FSEvents stream at daemon startup.
 const HOLD_START_WAIT: Duration = Duration::from_secs(5);
@@ -65,7 +65,9 @@ pub(crate) enum PollOutcome<'f> {
     /// Full sweep needed (watcher unarmed, checkout root moved/deleted, or backend fault).
     FullRescan { crash_cursor: Option<Cursor>, needs_refresh: bool },
     /// Fallback in-process FSEvents flush result (when `> KQUEUE_CAP` or non-macOS).
-    FsEvents { changes: Changes, cursor: Cursor },
+    /// `valid_since` is the cursor of the previous un-drained flush on this same `HeldChanges`
+    /// stream (`None` if the stream was just created or drained by `take()`).
+    FsEvents { changes: Changes, cursor: Cursor, valid_since: Option<Cursor> },
 }
 
 /// Active watching strategy for one checkout (rule 78).
@@ -92,6 +94,9 @@ pub(crate) struct CheckoutWatcher<'d> {
     home_blaze_root: Option<AString<'static>>,
     exe_dir: Option<AString<'static>>,
     held: Option<HeldChanges<'d, ReadWrite>>,
+    /// The cursor returned by the last `held.flush()` when no `held.take()` has drained events
+    /// since: `FsEventsHeld` may only vouch for a stored pointer whose cursor equals this one.
+    held_valid_since: Option<Cursor>,
     backend: WatchBackend,
     armed_pointer: Option<Key>,
     /// True when any `ScriptFile`/`ScriptStat`/`ScriptListing` leaf lacks `DIRECT_PATH` (e.g.
@@ -125,6 +130,7 @@ impl<'d> CheckoutWatcher<'d> {
             home_blaze_root,
             exe_dir,
             held,
+            held_valid_since: None,
             backend: WatchBackend::FsEventsHeld,
             armed_pointer: None,
             has_unwatched_scripts: false,
@@ -181,6 +187,7 @@ impl<'d> CheckoutWatcher<'d> {
     pub(crate) fn disarm(&mut self) {
         self.backend = WatchBackend::FsEventsHeld;
         self.armed_pointer = None;
+        self.held_valid_since = None;
         self.has_unwatched_scripts = false;
         self.facts_watched = false;
         self.git_watched = false;
@@ -232,6 +239,7 @@ impl<'d> CheckoutWatcher<'d> {
     /// batch via `held.take()` without ever calling `held.flush()`.
     pub(crate) fn take_crash_cursor(&mut self, cx: &Cx) -> Option<Cursor> {
         let held = self.held.as_mut()?;
+        self.held_valid_since = None;
         let _ = held.take(cx);
         let cursor = held.cursor();
         (!matches!(cursor, Cursor::None)).then_some(cursor)
@@ -249,6 +257,7 @@ impl<'d> CheckoutWatcher<'d> {
                 let held = self.held.as_mut();
                 match held {
                     Some(held) => {
+                        self.held_valid_since = None;
                         let _ = held.take(cx);
                         let cursor = held.cursor();
                         (!matches!(cursor, Cursor::None)).then_some(cursor)
@@ -282,11 +291,14 @@ impl<'d> CheckoutWatcher<'d> {
 
         // Fallback: in-process HeldChanges flush (no separate journal-helper socket hop).
         if let Some(held) = self.held.as_mut() {
+            let valid_since = self.held_valid_since;
             let flush_cx = cx.until(clock.after(HOLD_FLUSH_WAIT));
             if let Ok(changes) = held.flush(&flush_cx) {
                 let cursor = held.cursor();
-                return PollOutcome::FsEvents { changes, cursor };
+                self.held_valid_since = (!matches!(cursor, Cursor::None)).then_some(cursor);
+                return PollOutcome::FsEvents { changes, cursor, valid_since };
             }
+            self.held_valid_since = None;
         }
         let crash_cursor = self.take_crash_cursor(cx);
         PollOutcome::FullRescan { crash_cursor, needs_refresh: true }
@@ -574,6 +586,9 @@ impl KqueueVnode {
 
         let mut dir_set: BTreeSet<AString<'static>, Alloc<'static>> = BTreeSet::new_in(heap);
         dir_set.insert(AString::from_str_in("", heap));
+        // Optional `x/` stem directories for `MODULE` slots (`x.rs`): most do not exist on disk,
+        // so track them apart from `dir_set` until after the pre-open `KQUEUE_CAP` estimate.
+        let mut stem_dirs: BTreeSet<AString<'static>, Alloc<'static>> = BTreeSet::new_in(heap);
 
         let mut leaf_paths: Vec<AString<'static>, Alloc<'static>> = Vec::new_in(heap);
         let mut dir_stamps: blaze_own::BTreeMap<AString<'static>, Option<Stamp>, Alloc<'static>> = blaze_own::BTreeMap::new_in(heap);
@@ -622,7 +637,8 @@ impl KqueueVnode {
             if is_module {
                 let stem = path.strip_suffix(".rs").unwrap_or(path);
                 // Watch `x/` directory if it exists so creating `x/mod.rs` fires NOTE_WRITE on `x/`.
-                dir_set.insert(AString::from_str_in(stem, heap));
+                // Kept in `stem_dirs` so nonexistent stem dirs do not double-count against `KQUEUE_CAP`.
+                stem_dirs.insert(AString::from_str_in(stem, heap));
             }
 
             match row.kind {
@@ -687,13 +703,6 @@ impl KqueueVnode {
             }
         }
 
-        // Sort dirs shallowest-first so parents are ALWAYS registered before children.
-        let mut sorted_dirs: Vec<AString<'static>, Alloc<'static>> = Vec::with_capacity_in(dir_set.len(), heap);
-        for d in dir_set {
-            sorted_dirs.push(d);
-        }
-        sorted_dirs.sort_unstable_by(|a, b| depth_of(a.as_str()).cmp(&depth_of(b.as_str())).then_with(|| a.as_str().cmp(b.as_str())));
-
         // Deduplicate file watches soundly: if ANY row for a path has `None` or a different stamp,
         // merge to `None` (never let `Some(stamp)` hide an unsettled/unstamped `None` row!).
         watch_files.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
@@ -711,7 +720,10 @@ impl KqueueVnode {
 
         let git_count = if saw_git { GIT_WATCH_PATHS.len() + 8 } else { 0 };
         let fact_count = if saw_facts { 2 } else { 0 };
-        let estimated = sorted_dirs
+        // Pre-reject only on real directories + files + home/git/fact watches (NOT nonexistent
+        // `MODULE` stem directories); actual opened FDs are still hard-capped at `KQUEUE_CAP`
+        // inside every registration loop below.
+        let estimated = dir_set
             .len()
             .saturating_add(watch_files.len())
             .saturating_add(home_leaves.len())
@@ -720,6 +732,17 @@ impl KqueueVnode {
         if estimated > KQUEUE_CAP {
             return None;
         }
+
+        // Merge optional `MODULE` stem directories into `dir_set` and sort shallowest-first so
+        // every existing directory (including existing stem dirs) is registered BEFORE Phase 2.
+        for stem in stem_dirs {
+            dir_set.insert(stem);
+        }
+        let mut sorted_dirs: Vec<AString<'static>, Alloc<'static>> = Vec::with_capacity_in(dir_set.len(), heap);
+        for d in dir_set {
+            sorted_dirs.push(d);
+        }
+        sorted_dirs.sort_unstable_by(|a, b| depth_of(a.as_str()).cmp(&depth_of(b.as_str())).then_with(|| a.as_str().cmp(b.as_str())));
 
         let kq = kqueue().ok()?;
         set_close_on_exec(kq.fd(), true).ok()?;
@@ -1250,14 +1273,20 @@ impl KqueueVnode {
         let mut dirty_dirs: Vec<usize, &'f Frame> = Vec::new_in(frame);
         let mut root_dir_wrote = false;
 
-        // Bounded drain loop: each iteration drains up to 256 events; capped at 64 iterations
-        // (16,384 events, well above KQUEUE_CAP) to guarantee bounded progress (rule 18).
-        for _ in 0..64 {
+        // Bounded drain loop: each iteration drains up to 256 events; capped at 256 iterations
+        // (65,536 events, well above KQUEUE_CAP) to guarantee bounded progress (rule 18). If all
+        // iterations fill `buf`, fall back to a full rescan so no pending event is missed.
+        let mut drained = false;
+        for _ in 0..256 {
             let n = match kevent(self.kq.fd(), &[], &mut buf, Some(Timespec::ZERO)) {
-                Ok(0) => break,
+                Ok(0) => {
+                    drained = true;
+                    break;
+                }
                 Ok(n) => n,
                 Err(_) => {
                     full_rescan = true;
+                    drained = true;
                     break;
                 }
             };
@@ -1308,8 +1337,12 @@ impl KqueueVnode {
                 }
             }
             if n < buf.len() {
+                drained = true;
                 break;
             }
+        }
+        if !drained {
+            full_rescan = true;
         }
 
         // Expand directory events into all leaves in/under the mutated dir so atomic renames

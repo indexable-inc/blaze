@@ -131,6 +131,8 @@ impl fmt::Display for Refused {
 pub(crate) enum JournalUse {
     /// Every unit replayed from its saved place.
     Used,
+    /// The resident daemon's synchronous `kqueue` vnode watcher vouched for the checkout.
+    Kqueue,
     /// At least one unit's rows were all statted: the first one's why.
     Refused(Refused),
     /// The system keeps no journal across a restart: every row is statted.
@@ -141,6 +143,7 @@ impl fmt::Display for JournalUse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             JournalUse::Used => f.write_str("used"),
+            JournalUse::Kqueue => f.write_str("kqueue"),
             JournalUse::Refused(why) => write!(f, "refused: {why}"),
             JournalUse::NoneOnThisOs => f.write_str("none on this OS"),
         }
@@ -371,6 +374,7 @@ impl fmt::Display for SweepCounts {
             (JournalUse::NoneOnThisOs, _) => f.write_str(
                 "full: none on this OS: the system keeps no journal of changes across a restart, so every row is statted until a helper with an expiry carries an inotify set",
             )?,
+            (JournalUse::Kqueue, _) => write!(f, "by kqueue vnode; {} event(s) in {} folder(s)", self.events, self.streams)?,
             (JournalUse::Used, Some(id)) => write!(f, "by events since id {id}; {} event(s) in {} folder(s)", self.events, self.streams)?,
             (JournalUse::Used, None) => f.write_str("full: the checkout's journal was not replayed")?,
             (JournalUse::Refused(why), Some(id)) => write!(f, "by events since id {id}; {} event(s) in {} folder(s); a folder full, refused: {why}", self.events, self.streams)?,
@@ -844,6 +848,7 @@ impl<'t> Taken<'t> {
         let name_at = self.names.push("");
         let target_tagged = self.target_tagged;
         let told = dirty_paths.iter().filter(|it| !own(it, target_tagged)).count();
+        self.journal = JournalUse::Kqueue;
         self.events = self.events.saturating_add(u64::try_from(told).unwrap_or(u64::MAX));
         self.streams = self.streams.saturating_add(1);
         self.force_script_asks = force_script_asks;
@@ -861,11 +866,17 @@ impl<'t> Taken<'t> {
     }
 
     /// The resident daemon's `FsEventsHeld` fallback backend: an in-process `HeldChanges::flush`
-    /// result judged by the same [`judge`] rule as [`Taken::replay_checkout`].
-    pub(crate) fn in_process_fsevents(&mut self, stored: Stored<'_>, changes: Changes, cursor: Cursor) {
+    /// result judged by the same [`judge`] rule as [`Taken::replay_checkout`], and accepted only
+    /// when `valid_since` proves this stream's previous flush matches the stored cursor (never
+    /// missing edits made before the daemon started or drained by `take()`).
+    pub(crate) fn in_process_fsevents(&mut self, stored: Stored<'_>, valid_since: Option<Cursor>, changes: Changes, cursor: Cursor) {
         let name_at = self.names.push("");
         let since = stored.cursor_of(Where::Checkout, "");
-        let whole = changes.lost().find(|(under, _)| under.is_empty()).map(|(_, why)| why);
+        let whole = if since.is_some() && valid_since != since {
+            Some(Lost::Reset)
+        } else {
+            changes.lost().find(|(under, _)| under.is_empty()).map(|(_, why)| why)
+        };
         self.heard(Where::Checkout, "", name_at, since, cursor, whole, Heard::replayed(changes));
     }
 

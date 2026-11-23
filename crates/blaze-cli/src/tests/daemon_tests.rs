@@ -1110,3 +1110,69 @@ fn daemon_end_to_end_fast_path_with_direct_script_file_leaf() {
         "expected warm no-op after ScriptFile edit to hit fast path again, got:\n{prof5}",
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn kqueue_vnode_does_not_double_count_nonexistent_module_stems() {
+    use crate::daemon_watch::{KQUEUE_CAP, KqueueVnode};
+    use crate::sweep::{ABSENT, LeafKind, Leaves, MODULE, Rows, Stamp};
+    use blaze_ids::ContentId;
+    use std::os::unix::fs::MetadataExt;
+
+    let mut scratch = Scratch::new("kqstem");
+    let (_home, proj) = scratch.lane("p", true);
+    write_file(&proj, "Cargo.toml", "[package]\nname = \"kqstem\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write_file(&proj, "src/lib.rs", "pub mod m0;\n");
+    write_file(&proj, "src/m0.rs", "pub fn x() -> u8 { 1 }\n");
+    // Create ONE existing stem directory `src/m0/` so we also prove Phase 1 still registers
+    // existing `MODULE` stem directories before Phase 2.
+    std::fs::create_dir_all(proj.join("src/m0")).expect("mkdir src/m0");
+
+    let stat_of = |rel: &str| -> Stamp {
+        let md = std::fs::symlink_metadata(proj.join(rel)).expect("stat");
+        Stamp {
+            len: md.len(),
+            mtime_ns: md.mtime().cast_unsigned().wrapping_mul(1_000_000_000).wrapping_add(md.mtime_nsec().cast_unsigned()),
+            ctime_ns: md.ctime().cast_unsigned().wrapping_mul(1_000_000_000).wrapping_add(md.ctime_nsec().cast_unsigned()),
+            ino: md.ino(),
+            dev: md.dev(),
+        }
+    };
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let frame = bstd::mem::Frame::with_reserve(16 << 20, bstd::mem::Tag::Other).expect("frame");
+    let root_s = proj.to_string_lossy();
+    let zero_id = ContentId([0; 32]);
+
+    // Add `KQUEUE_CAP + 256` absent `MODULE` slots whose `src/ghost_N/` stem directories do NOT
+    // exist on disk. Before Wave 8, inserting every `MODULE` stem into `dir_set` inflated
+    // `estimated > KQUEUE_CAP` and caused `KqueueVnode::arm_with_env` to bail out before opening
+    // a single FD; with stem dirs tracked separately, only real existing dirs + files count.
+    let mut rows = Rows::new_in(&frame);
+    rows.push(LeafKind::Manifest, 0, "Cargo.toml", Some(stat_of("Cargo.toml")), zero_id);
+    rows.push(LeafKind::Slot, 0, "src/lib.rs", Some(stat_of("src/lib.rs")), zero_id);
+    rows.push(LeafKind::Slot, MODULE, "src/m0.rs", Some(stat_of("src/m0.rs")), zero_id);
+    for i in 0..(KQUEUE_CAP + 256) {
+        let rel = std::format!("src/ghost_{i}.rs");
+        rows.push(LeafKind::Slot, MODULE | ABSENT, &rel, None, zero_id);
+    }
+    let bytes = Leaves::bytes_in(&rows, &frame).expect("encode leaves");
+    let (leaves, _) = Leaves::of(&bytes).expect("decode leaves");
+
+    let mut kq = KqueueVnode::arm_with_env(&root_s, None, None, &leaves, true, &frame, alloc)
+        .expect("nonexistent MODULE stem dirs must NOT blow KQUEUE_CAP");
+    // Only `""`, `"src"`, `"src/m0"`, `"Cargo.toml"`, `"src/lib.rs"`, `"src/m0.rs"` = 6 FDs!
+    assert_eq!(kq.watched_count(), 6, "expected exactly 6 open FDs (3 real dirs + 3 real files)");
+
+    let clean = kq.poll_dirty(&frame);
+    assert!(clean.paths.is_empty() && !clean.needs_refresh && !clean.full_rescan, "initial poll must be clean");
+
+    // Existing stem dir `src/m0/` MUST still be watched so creating `src/m0/mod.rs` fires immediately.
+    write_file(&proj, "src/m0/mod.rs", "pub fn y() -> u8 { 2 }\n");
+    let dirty = kq.poll_dirty(&frame);
+    assert!(
+        dirty.paths.iter().any(|&p| p == "src/m0.rs" || p == "src/m0"),
+        "creating src/m0/mod.rs inside existing stem dir must be caught: {:?}",
+        dirty.paths.as_slice(),
+    );
+}
