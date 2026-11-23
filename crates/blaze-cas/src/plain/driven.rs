@@ -389,36 +389,41 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
                 break;
             }
             let stall = Deadline::after(since, STALL);
-            if self.driver.poll(&mut self.done, stall) > 0 {
-                since = self.driver.now();
-            } else if stall.passed(self.driver.now()) {
+            let got = self.driver.poll(&mut self.done, stall);
+            if got == 0 && stall.passed(self.driver.now()) {
                 // Effects in flight and no completion for [`STALL`].
                 return Err(StoreError::Stalled { waited_for: what });
             }
-            let wall = self.driver.wall_ns();
-            for completion in self.done.drain(..) {
-                #[cfg(test)]
-                {
-                    let now = match &mut self.cut {
-                        Some(Cut::After(0)) => true,
-                        Some(Cut::After(left)) => {
-                            *left -= 1;
-                            false
+            if got > 0 {
+                let wall = self.driver.wall_ns();
+                for completion in self.done.drain(..) {
+                    #[cfg(test)]
+                    {
+                        let now = match &mut self.cut {
+                            Some(Cut::After(0)) => true,
+                            Some(Cut::After(left)) => {
+                                *left -= 1;
+                                false
+                            }
+                            Some(Cut::AtFlip) => self.core.generation() != flipped_from,
+                            None => false,
+                        };
+                        if now {
+                            // The power cut: this completion and the rest, of every run, reach nothing.
+                            self.cut = Some(Cut::After(0));
+                            return Err(StoreError::Unfinished { what: "a run the test's power cut stopped" });
                         }
-                        Some(Cut::AtFlip) => self.core.generation() != flipped_from,
-                        None => false,
-                    };
-                    if now {
-                        // The power cut: this completion and the rest, of every run, reach nothing.
-                        self.cut = Some(Cut::After(0));
-                        return Err(StoreError::Unfinished { what: "a run the test's power cut stopped" });
+                    }
+                    if self.core.owns(completion.tag) {
+                        self.core.complete(completion, wall, &mut self.effects);
+                    } else {
+                        self.own.push(completion);
                     }
                 }
-                if self.core.owns(completion.tag) {
-                    self.core.complete(completion, wall, &mut self.effects);
-                } else {
-                    self.own.push(completion);
-                }
+                // Refresh AFTER processing completions so CPU work inside `Plain::complete`
+                // (e.g. compaction planning/copying on huge stores) never causes the next newly
+                // submitted I/O to start with an already-expired stall deadline.
+                since = self.driver.now();
             }
         }
         match self.core.broken() {
@@ -526,12 +531,17 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     /// The command asks it once, when the request's first pool task is about to start (the
     /// handle cannot map); a commit, a compaction slice, a scrub and a fetch ask it first.
     pub fn map_all(&mut self) -> Result<(), StoreError> {
+        if self.core.whole() && self.core.broken().is_none() && self.core.ready() {
+            return Ok(());
+        }
         let lost = self.core.report().lost.len();
         let now = self.driver.wall_ns();
         if !self.core.map_all(now, &mut self.effects)? {
             return Ok(());
         }
-        self.run("mapping every segment named")?;
+        if !self.effects.is_empty() {
+            self.run("mapping every segment named")?;
+        }
         if !self.core.whole() {
             return Err(StoreError::Unfinished { what: "mapping every segment named" });
         }
@@ -647,15 +657,15 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
 
     /// Up to `slices` compaction slices until one says there is no more: a pruning or sweeping
     /// slice bounded by [`super::SLICE_BYTES`], a tiered merge by the amortisation (module doc). Lowers the calling thread first ([`lower_this_thread`]): call it after
-    /// the command has answered, or from its own invocation, never before a build's first read.
+    /// the command has answered, or from a background helper, never before a build's first read.
     pub fn compact(&mut self, slices: u32) -> Result<Vec<Sliced, A>, StoreError> {
         lower_this_thread()?;
-        self.slices(slices)
+        self.compact_foreground(slices)
     }
 
-    /// [`Driven::compact`] on the calling thread as it is: for a caller that runs it beside
-    /// builds on a thread it lowered itself.
-    pub(crate) fn slices(&mut self, slices: u32) -> Result<Vec<Sliced, A>, StoreError> {
+    /// [`Driven::compact`] at the calling thread's current priority (no [`lower_this_thread`]):
+    /// for foreground `blaze gc` or a caller that already manages thread QoS itself.
+    pub fn compact_foreground(&mut self, slices: u32) -> Result<Vec<Sliced, A>, StoreError> {
         self.map_all()?;
         let mut out = Vec::new_in(self.core.alloc().clone());
         for _ in 0..slices {
@@ -760,6 +770,12 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     /// Whether anything was sealed.
     pub fn seal(&mut self) -> Result<bool, StoreError> {
         lower_this_thread()?;
+        self.seal_foreground()
+    }
+
+    /// [`Driven::seal`] at the calling thread's current priority (no [`lower_this_thread`]):
+    /// for foreground `blaze gc`.
+    pub fn seal_foreground(&mut self) -> Result<bool, StoreError> {
         if !self.core.seal(&mut self.effects) {
             return Ok(false);
         }

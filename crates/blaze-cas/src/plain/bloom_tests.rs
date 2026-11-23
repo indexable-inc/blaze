@@ -228,34 +228,49 @@ fn corrupt_or_truncated_bloom_is_never_trusted_and_plant_is_caught() {
         at = body_end;
     }
 
-    let check_all = |sim: Sim, plant: Plant, bloom_bytes: &[u8]| -> (Sim, usize) {
+    let check_all = |sim: Sim, plant: Plant, bloom_bytes: &[u8]| -> (Sim, usize, usize) {
         let mut s = sim;
         s.change(&bloom_file, bloom_bytes);
-        let mut r = Driven::planted(s, "/sim".as_ref(), cfg(1, 1, &root), &root, plant).expect("reader opens");
+        let lent = Lent::new(Driven::planted(s, "/sim".as_ref(), cfg(1, 1, &root), &root, plant).expect("reader opens"), &root);
+        // Take Snapshot first on a fresh open so `Snapshot::get` hits `STATE_UNVERIFIED` directly.
+        let snap = lent.snapshot_in(&root).expect("snapshot opens");
+        let mut snap_misses = 0usize;
+        for seg in 0..6u32 {
+            for j in 0..8u32 {
+                let id = seg * 10 + j + 1;
+                if snap.get(&key(id)).expect("snap get") != Some(value(id).as_slice()) {
+                    snap_misses += 1;
+                }
+            }
+        }
+        drop(snap);
         let mut misses = 0usize;
         for seg in 0..6u32 {
             for j in 0..8u32 {
                 let id = seg * 10 + j + 1;
-                if read_bytes(&mut r, &key(id)) != Some(value(id)) {
+                if lent.get(&key(id)).expect("lent get").map(|g| g.bytes) != Some(value(id).as_slice()) {
                     misses += 1;
                 }
             }
         }
-        (r.into_driver(), misses)
+        (lent.into_store().into_driver(), misses, snap_misses)
     };
 
-    let misses;
-    (sim, misses) = check_all(sim, Plant::None, &zeroed);
-    assert_eq!(misses, 0, "corrupt bloom caused a false negative");
-    let planted_misses;
-    (sim, planted_misses) = check_all(sim, Plant::TrustsCorruptBloom, &zeroed);
-    assert!(planted_misses > 0, "planted TrustsCorruptBloom went uncaught");
+    let (misses, snap_misses);
+    (sim, misses, snap_misses) = check_all(sim, Plant::None, &zeroed);
+    assert_eq!(misses, 0, "corrupt bloom caused a false negative in Lent");
+    assert_eq!(snap_misses, 0, "corrupt bloom caused a false negative in Snapshot");
+    let (planted_misses, planted_snap_misses);
+    (sim, planted_misses, planted_snap_misses) = check_all(sim, Plant::TrustsCorruptBloom, &zeroed);
+    assert!(planted_misses > 0, "planted TrustsCorruptBloom went uncaught in Lent");
+    assert!(planted_snap_misses > 0, "planted TrustsCorruptBloom went uncaught in Snapshot");
 
     // Truncating `bloom` at various offsets (mid-header, mid-body, empty) -> 0 false negatives.
     for cut in [0, 1, 16, 47, 48, 60, original.len() / 2, original.len().saturating_sub(1)] {
-        let cut_misses;
-        (sim, cut_misses) = check_all(sim, Plant::None, &original[..cut]);
-        assert_eq!(cut_misses, 0, "truncated bloom at {cut} caused a false negative");
+        let (cut_misses, cut_snap_misses);
+        (sim, cut_misses, cut_snap_misses) = check_all(sim, Plant::None, &original[..cut]);
+        assert_eq!(cut_misses, 0, "truncated bloom at {cut} caused a false negative in Lent");
+        assert_eq!(cut_snap_misses, 0, "truncated bloom at {cut} caused a false negative in Snapshot");
     }
 }
 

@@ -90,6 +90,10 @@ impl Unverified {
         &self.seg
     }
 
+    pub(crate) fn into_file(self) -> FileName {
+        self.file
+    }
+
     /// Its length on the disk (from the mapping, not a byte of it): what its row names, or the
     /// file is not the one named.
     pub(crate) fn len(&self) -> u64 {

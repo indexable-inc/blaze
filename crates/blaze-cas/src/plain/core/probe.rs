@@ -40,7 +40,7 @@
 
 use std::alloc::Allocator;
 
-use blaze_core::{Effect, Extent};
+use blaze_core::Effect;
 use blaze_own::Share;
 use blaze_keyed::{
     kind::{Namespace, ReservedTag, Tag},
@@ -49,7 +49,7 @@ use blaze_keyed::{
 
 use super::super::format::{Entry, LostKind};
 use super::super::verified::{Unverified, Verified};
-use super::{GRACE_NS, Got, MAP, Phase, Placed, Plain, Plant, Then};
+use super::{GRACE_NS, Got, Phase, Placed, Plain, Plant, Then};
 use crate::Key;
 
 /// Why a map asked late is refused ([`StoreError::Lost`]'s words).
@@ -410,7 +410,7 @@ impl<A: Allocator + Clone> Plain<A> {
         if now_ns.saturating_sub(self.opened_ns) > GRACE_NS {
             return Err(StoreError::Lost { segment: seg.id, generation: self.manifest.generation, what: LATE_MAP });
         }
-        effects.push(Effect::Map { file: self.segment_file(seg.id), extent: Extent::Whole, tag: self.tag(MAP, row as u32) });
+        self.queue_map(row, seg.id, effects);
         self.phase = Phase::Mapping { left: 1, then: Then::Probe };
         Ok(())
     }
@@ -484,16 +484,35 @@ impl<A: Allocator + Clone> Plain<A> {
         if self.eager {
             return Ok(false);
         }
-        let mut left = 0u32;
-        for (row, seg) in self.manifest.segments.iter().enumerate() {
+        let late = now_ns.saturating_sub(self.opened_ns) > GRACE_NS;
+        let mut to_map = 0usize;
+        let mut sealed_to_map = 0usize;
+        for seg in &self.manifest.segments {
             if !seg.local || self.by_id.contains_key(&seg.id) || self.dropped.contains(&seg.id) || self.unchecked.contains_key(&seg.id) {
                 continue;
             }
-            if now_ns.saturating_sub(self.opened_ns) > GRACE_NS {
+            if late {
                 return Err(StoreError::Lost { segment: seg.id, generation: self.manifest.generation, what: LATE_MAP });
             }
-            effects.push(Effect::Map { file: self.segment_file(seg.id), extent: Extent::Whole, tag: self.tag(MAP, row as u32) });
-            left += 1;
+            to_map = to_map.saturating_add(1);
+            if seg.boot != self.cfg.boot && seg.sealed {
+                sealed_to_map = sealed_to_map.saturating_add(1);
+            }
+        }
+        if to_map == 0 {
+            self.mapped(Then::All, effects);
+            return Ok(true);
+        }
+        self.reserve_maps(to_map, sealed_to_map, effects);
+        let mut left = 0u32;
+        let len = self.manifest.segments.len();
+        for row in 0..len {
+            let Some(seg) = self.manifest.segments.get(row).copied() else { continue };
+            if !seg.local || self.by_id.contains_key(&seg.id) || self.dropped.contains(&seg.id) || self.unchecked.contains_key(&seg.id) {
+                continue;
+            }
+            self.queue_map(row, seg.id, effects);
+            left = left.saturating_add(1);
         }
         if left == 0 {
             self.mapped(Then::All, effects);
