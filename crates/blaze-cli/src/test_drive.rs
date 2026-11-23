@@ -53,10 +53,10 @@ use blaze_ladder::run::special::Roots;
 use blaze_ladder::run::special::test_roots::test_roots;
 use blaze_launch::wire::run::Symbol;
 use blaze_own::{AString, AVec, Alloc, String, Vec};
-use blaze_run::head::ReadDigest;
+use blaze_run::head::{Head, ReadDigest};
 use blaze_run::plan::{Address, NotKept};
-use blaze_run::postings::{FnName, ReadName};
-use blaze_run::result::{AtAddress, Captured, OUTPUT_CAP};
+use blaze_run::postings::{Ask, FnName, Postings, ReadName};
+use blaze_run::result::{AtAddress, Captured, OUTPUT_CAP, Slot};
 use blaze_run::zygote::{How, Said, Status as ZygoteExit};
 use blaze_run::{Nanos, TestId};
 use blaze_scope::tests_record::TestsRecordError;
@@ -109,8 +109,6 @@ const KEEP: usize = 2 * OUTPUT_CAP;
 /// bound (rule 18; a step is one batch of effects).
 const STEPS_PER_TEST: usize = 64;
 const STEPS_FIXED: usize = 256;
-/// A test's address while it is not traced: H(test) alone (no asks are known).
-const ADDRESS_DOMAIN: &str = "blaze test address of an untraced run 1";
 /// The domain of a test output's digest.
 const OUTPUT_DOMAIN: &str = "blaze test output 1";
 /// Beneath `<HOME>`: the parent of each command's suite and row folders (layout.rs's row).
@@ -150,6 +148,8 @@ pub(crate) enum DriveError {
     Relay(RelayError),
     /// A code worker failed, or did not end by [`END_WAIT`] after the run (D194).
     CodeWorkers(bstd::task::TaskError),
+    /// The CAS store refused reading or writing incremental test cache records.
+    CacheStore { what: &'static str, why: crate::test_cache::CacheError },
 }
 
 impl fmt::Display for DriveError {
@@ -171,6 +171,7 @@ impl fmt::Display for DriveError {
             DriveError::NoCodeWorkers { have } => write!(f, "blaze test: code made by the command's workers (test_drive.rs `CODES` = `Pooled`, D194) needs at least one worker beside the command thread, and the command's pool of {have} gave none (bstd task.rs `must_overlap`)"),
             DriveError::Relay(error) => write!(f, "blaze test: {error}"),
             DriveError::CodeWorkers(error) => write!(f, "blaze test: the command's code workers (D194): {error}"),
+            DriveError::CacheStore { what, why } => write!(f, "blaze test: {what}: {why}"),
         }
     }
 }
@@ -542,66 +543,25 @@ pub(crate) mod refusal_tests {
 
 /// What the loop files: blaze-run result.rs records, the head and the postings.
 pub(crate) trait Filed {
-    fn file(&mut self, suite: SuiteId, test: TestId, address: Address, bytes: &[u8]) -> Result<(), DriveError>;
+    fn file(&mut self, suite: SuiteId, test: TestId, address: Address, slot: Slot, bytes: &[u8]) -> Result<(), DriveError>;
     fn flaky(&mut self, suite: SuiteId, test: TestId) -> Result<(), DriveError>;
     fn head(&mut self, suite: SuiteId, bytes: &[u8]) -> Result<(), DriveError>;
     fn postings(&mut self, suite: SuiteId, bytes: &[u8]) -> Result<(), DriveError>;
 }
 
-/// This build's [`Filed`]: nothing is written (the store's test records and their roots are a
-/// next piece); each record asked is counted, and the driver says so in one closing line.
-#[derive(Default, Debug, PartialEq, Eq)]
-pub(crate) struct Unkept {
-    pub results: u32,
-    pub flaky: u32,
-    pub heads: u32,
-    pub postings: u32,
+fn asked<'s>(unit: TestUnit<'s>, row: blaze_scope::tests_record::TestRow<'s>, builder: &Builder, args: &[&str]) -> blaze_run::plan::Asked<'s> {
+    let test = crate::test_cache::test_id(unit, row, builder, args);
+    asked_with_id(row, test)
 }
 
-impl Filed for Unkept {
-    fn file(&mut self, _suite: SuiteId, _test: TestId, _address: Address, _bytes: &[u8]) -> Result<(), DriveError> {
-        self.results += 1;
-        Ok(())
-    }
-    fn flaky(&mut self, _suite: SuiteId, _test: TestId) -> Result<(), DriveError> {
-        self.flaky += 1;
-        Ok(())
-    }
-    fn head(&mut self, _suite: SuiteId, _bytes: &[u8]) -> Result<(), DriveError> {
-        self.heads += 1;
-        Ok(())
-    }
-    fn postings(&mut self, _suite: SuiteId, _bytes: &[u8]) -> Result<(), DriveError> {
-        self.postings += 1;
-        Ok(())
-    }
-}
-
-impl fmt::Display for Unkept {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "blaze test: nothing of this run is kept yet ({} results, {} flaky findings, {} heads, {} postings not written; test.md, the store's test records)",
-            self.results, self.flaky, self.heads, self.postings
-        )
-    }
-}
-
-fn asked<'s>(unit: TestUnit<'s>, row: blaze_scope::tests_record::TestRow<'s>, args: &[&str]) -> blaze_run::plan::Asked<'s> {
+fn asked_with_id<'s>(row: blaze_scope::tests_record::TestRow<'s>, test: TestId) -> blaze_run::plan::Asked<'s> {
     use blaze_scope::tests_record::ShouldPanic;
-    let mut id = Hasher::new("blaze test: package target and test 1");
-    id.part(unit.package.as_bytes()).part(unit.target.as_bytes()).id(&unit.key.0).id(&row.key.0);
-    if !unit.tests.harnessed() {
-        for arg in args {
-            id.part(arg.as_bytes());
-        }
-    }
     let should_panic = match row.should_panic {
         ShouldPanic::No => blaze_run::plan::ShouldPanic::No,
         ShouldPanic::Yes => blaze_run::plan::ShouldPanic::Yes,
         ShouldPanic::WithMessage(text) => blaze_run::plan::ShouldPanic::WithText(text),
     };
-    blaze_run::plan::Asked { test: TestId(id.finish().0), path: row.path, ignore: row.ignore, bench: row.bench, should_panic }
+    blaze_run::plan::Asked { test, path: row.path, ignore: row.ignore, bench: row.bench, should_panic }
 }
 
 fn record_row<'s>(tests: TestRows<'s>, at: usize) -> Result<blaze_scope::tests_record::TestRow<'s>, DriveError> {
@@ -614,16 +574,43 @@ pub(crate) trait Refuse {
     fn refusal(&mut self, row: u32) -> Result<Option<&str>, OneError>;
 }
 
+/// Bridges `TestCache` with the command-thread `entered_sink` so newly resolved function metadata
+/// is flushed into `TestCache` before `Answers::answer` computes the run's address.
+struct CacheAnswers<'a, 'c, 'm, D: blaze_core::Driver> {
+    cache: &'c mut crate::test_cache::TestCache<'a, 'm, D>,
+    sink: &'c RefCell<AVec<'a, (SuiteId, crate::test_cache::EnteredFn<'a>)>>,
+}
+
+impl<'a, D: blaze_core::Driver> CacheAnswers<'a, '_, '_, D> {
+    fn drain_sink(&mut self) {
+        let mut drained = self.sink.borrow_mut();
+        for (suite, entry) in drained.drain(..) {
+            self.cache.record_entered(suite, core::slice::from_ref(&entry));
+        }
+    }
+}
+
+impl<D: blaze_core::Driver> Answers for CacheAnswers<'_, '_, '_, D> {
+    fn answer<'s>(&'s mut self, suite: SuiteId, test: TestId, entered: &[FnName], reads: &[ReadName], digests: &mut AVec<'_, (ReadName, ReadDigest)>) -> Result<(Address, AtAddress<'s>), RunError> {
+        self.drain_sink();
+        self.cache.answer(suite, test, entered, reads, digests)
+    }
+}
+
 /// Drive the selected rows through one bounded pool, retaining their owning suites.
 #[expect(clippy::too_many_arguments, reason = "the driver's edge: each argument one seam of it")]
-fn drive<'a, 'r, Z: Zygotes>(
+fn drive<'a, 'r, 'm, Z: Zygotes, D: blaze_core::Driver>(
     config: LoopConfig<'r>,
     asked: AVec<'a, blaze_run::plan::Asked<'r>>,
     owners: &'r [SuiteId],
+    suite_heads: &'r [Head<'r>],
+    postings: Postings<'r>,
+    moved: &[Ask],
     filtered: u32,
     runner: &mut Runner<'a, Z>,
     refuse: &mut dyn Refuse,
-    filed: &mut dyn Filed,
+    cache: &mut crate::test_cache::TestCache<'a, 'm, D>,
+    entered_sink: &RefCell<AVec<'a, (SuiteId, crate::test_cache::EnteredFn<'a>)>>,
     print: &mut dyn FnMut(&[u8]) -> Result<(), DriveError>,
     alloc: Alloc<'a>,
 ) -> Result<Status, DriveError> {
@@ -631,9 +618,8 @@ fn drive<'a, 'r, Z: Zygotes>(
     let mut machine = TestLoop::new(config, alloc)?;
     let mut out: AVec<'a, Effect<'a>> = Vec::new_in(alloc);
     let mut effects: AVec<'a, Effect<'a>> = Vec::new_in(alloc);
-    machine.begin_inventory(asked, owners, filtered, runner.zygotes().now(), &mut out)?;
+    machine.begin_inventory(asked, owners, suite_heads, postings, moved, filtered, runner.zygotes().now(), &mut out)?;
     machine.step(Event::Checked { errors: 0 }, runner.zygotes().now(), &mut out)?;
-    let mut answers = Untraced;
     for _ in 0..most {
         core::mem::swap(&mut out, &mut effects);
         let mut done = None;
@@ -641,7 +627,10 @@ fn drive<'a, 'r, Z: Zygotes>(
             match &effect {
                 Effect::Open { suite } => return Err(DriveError::NoSuite { suite: *suite }),
                 Effect::Moved { .. } => return Err(DriveError::NoHead { effect: "the moved asks" }),
-                Effect::Look { .. } => return Err(DriveError::NoHead { effect: "a look-up of a kept pass" }),
+                Effect::Look { suite, test, .. } => {
+                    let found = cache.look(*suite, *test)?;
+                    machine.step(Event::Looked { test: *test, found }, runner.zygotes().now(), &mut out)?;
+                }
                 Effect::Run { test, row, .. } => match refuse.refusal(*row).map_err(DriveError::One)? {
                     Some(why) => {
                         let mut line = String::new_in(alloc);
@@ -652,10 +641,10 @@ fn drive<'a, 'r, Z: Zygotes>(
                     None => runner.effect(&effect)?,
                 },
                 Effect::Kill { .. } => runner.effect(&effect)?,
-                Effect::File { suite, test, address, bytes, .. } => filed.file(*suite, *test, *address, bytes.as_slice())?,
-                Effect::Flaky { suite, finding } => filed.flaky(*suite, finding.flaky.test)?,
-                Effect::WriteHead { suite, bytes } => filed.head(*suite, bytes.as_slice())?,
-                Effect::WritePostings { suite, bytes } => filed.postings(*suite, bytes.as_slice())?,
+                Effect::File { suite, test, address, slot, bytes } => cache.file(*suite, *test, *address, *slot, bytes.as_slice())?,
+                Effect::Flaky { suite, finding } => cache.flaky(*suite, finding.flaky.test)?,
+                Effect::WriteHead { suite, bytes } => cache.head(*suite, bytes.as_slice())?,
+                Effect::WritePostings { suite, bytes } => cache.postings(*suite, bytes.as_slice())?,
                 Effect::Print { text } => print(text.as_slice())?,
                 Effect::Done { status } => done = Some(*status),
             }
@@ -670,18 +659,10 @@ fn drive<'a, 'r, Z: Zygotes>(
         if !runner.busy() {
             return Err(DriveError::Stalled);
         }
+        let mut answers = CacheAnswers { cache, sink: entered_sink };
         runner.step(&mut machine, &mut answers, &mut out)?;
     }
     Err(DriveError::Steps { most })
-}
-
-/// The answers of an untraced run: no asks, so the address is H(test) and holds nothing.
-struct Untraced;
-
-impl Answers for Untraced {
-    fn answer<'s>(&'s mut self, _suite: SuiteId, test: TestId, _entered: &[FnName], _reads: &[ReadName], _digests: &mut AVec<'_, (ReadName, ReadDigest)>) -> Result<(Address, AtAddress<'s>), RunError> {
-        Ok((Address(ContentId::of(ADDRESS_DOMAIN, &test.0).0), AtAddress::EMPTY))
-    }
 }
 
 /// A test's output: the last [`KEEP`] bytes of its standard output and error (the two
@@ -714,10 +695,18 @@ impl<'o> Output<'o> {
 }
 
 /// One test's run to its end: [`OneEach`]'s seam.
+/// What one child's run produced: its exit, whether its pass is provably pure/kept, and the
+/// sorted list of walked Rust functions/statics it entered.
+pub(crate) struct RunOutcome {
+    pub how: How,
+    pub keep: Result<(), NotKept>,
+    pub entered: AVec<'static, FnName>,
+}
+
 pub(crate) trait RunOne {
     /// Runs row `row` in a process of its own, killed `budget` after its start: how it ended,
-    /// its output into `output`.
-    async fn run(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<How, OneError>;
+    /// its purity verdict, its entered functions, and its output into `output`.
+    async fn run(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError>;
 }
 
 /// Process-wide dispositions belong to the pool. A SIGTERM is observed by every child,
@@ -818,7 +807,7 @@ async fn next_turn() {
 /// What [`OneEach`] heard, kept until the runner reads it.
 enum Item {
     Ready,
-    Ended { row: u32, test: TestId, micros: u64, how: How, output: Output<'static> },
+    Ended { row: u32, test: TestId, micros: u64, how: How, keep: Result<(), NotKept>, entered: AVec<'static, FnName>, output: Output<'static> },
     CannotBuild { row: u32, test: TestId, why: InstanceRefusal },
     Closed,
     Exited(ZygoteExit),
@@ -831,7 +820,7 @@ struct Running<'a> {
     /// How long its run was parked waiting for its code so far, as its last poll said
     /// ([`Signals::parked`]): the runner's allowance does not count it (test_run.rs `answer_due`).
     parked: Nanos,
-    child:Pin<std::boxed::Box<dyn Future<Output = Result<(How, Output<'static>), OneError>> + 'a>>,
+    child: Pin<std::boxed::Box<dyn Future<Output = Result<(RunOutcome, Output<'static>), OneError>> + 'a>>,
 }
 
 /// One pinned parent per sandbox process. The command thread owns the front end, the lazy
@@ -926,7 +915,15 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
                 let Poll::Ready(result) = polled else { at += 1; continue };
                 let Running { row, test, began, .. } = self.running.swap_remove(at);
                 let item = match result {
-                    Ok((how, output)) => Item::Ended { row, test, micros: (self.now)().0.saturating_sub(began.0) / 1_000, how, output },
+                    Ok((outcome, output)) => Item::Ended {
+                        row,
+                        test,
+                        micros: (self.now)().0.saturating_sub(began.0) / 1_000,
+                        how: outcome.how,
+                        keep: outcome.keep,
+                        entered: outcome.entered,
+                        output,
+                    },
                     Err(OneError::CannotBuild(why)) => Item::CannotBuild { row, test, why },
                     Err(error) => {
                         self.failed = Some((row, error));
@@ -947,15 +944,14 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
     fn heard(&self, at: usize) -> Option<Heard<'_>> {
         Some(match self.batch.get(at)? {
             Item::Ready => Heard::Ready,
-            Item::Ended { row, test, micros, how, output } => Heard::Ended(ChildEnd {
+            Item::Ended { row, test, micros, how, keep, entered, output } => Heard::Ended(ChildEnd {
                 row: *row,
                 test: *test,
                 micros: *micros,
                 how: *how,
-                // Nothing it entered or read was seen: its pass is never kept.
-                keep: Err(NotKept::Untraced),
+                keep: *keep,
                 text: "",
-                entered: &[],
+                entered: entered.as_slice(),
                 reads: &[],
                 output: output.captured(),
             }),
@@ -994,14 +990,14 @@ mod pool_tests {
     }
 
     impl RunOne for Children {
-        async fn run(&self, row: u32, _: Nanos, output: &mut Output<'_>, _: &Signals) -> Result<How, OneError> {
+        async fn run(&self, row: u32, _: Nanos, output: &mut Output<'_>, _: &Signals) -> Result<RunOutcome, OneError> {
             self.started.set(self.started.get() + 1);
             self.live.set(self.live.get() + 1);
             self.peak.set(self.peak.get().max(self.live.get()));
             output.push(&row.to_le_bytes());
             next_turn().await;
             self.live.set(self.live.get() - 1);
-            Ok(How::Reported(Said::Returned))
+            Ok(RunOutcome { how: How::Reported(Said::Returned), keep: Err(NotKept::Untraced), entered: Vec::new_in(blaze_own::testing::heap().alloc()) })
         }
     }
 
@@ -1044,7 +1040,7 @@ mod pool_tests {
     }
 
     impl RunOne for Slow<'_> {
-        async fn run(&self, row: u32, _: Nanos, _: &mut Output<'_>, signals: &Signals) -> Result<How, OneError> {
+        async fn run(&self, row: u32, _: Nanos, _: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError> {
             if row == 5 {
                 signals.begin(Doing::Roots);
                 self.tick.set(self.tick.get() + 5_000);
@@ -1052,7 +1048,7 @@ mod pool_tests {
             }
             signals.begin(Doing::Relaying);
             next_turn().await;
-            Ok(How::Reported(Said::Returned))
+            Ok(RunOutcome { how: How::Reported(Said::Returned), keep: Err(NotKept::Untraced), entered: Vec::new_in(blaze_own::testing::heap().alloc()) })
         }
     }
 
@@ -1882,7 +1878,7 @@ enum Came {
 
 /// A test's run under the lazy parent, as `blaze run`'s program runs (own_process.rs
 /// `run_own`), with the test's roots, its own folder and profile, piped output and a deadline.
-pub(crate) struct Launched<'c, 'h> {
+pub(crate) struct Launched<'c, 'h, 'a> {
     pub cx: &'c Cx,
     pub err: &'c bstd::out::Out,
     pub package: &'c str,
@@ -1926,6 +1922,11 @@ pub(crate) struct Launched<'c, 'h> {
     pub suite: SuiteId,
     /// Its suite's first child id in the relay: row `n`'s test is child `child_base + n`.
     pub child_base: usize,
+    /// Command-thread sink for walked function metadata observed during runs; borrowed only at
+    /// run completion, never across an `.await` (rule 27).
+    pub entered_sink: &'c RefCell<AVec<'a, (SuiteId, crate::test_cache::EnteredFn<'a>)>>,
+    /// Allocator matching `entered_sink`'s lifetime.
+    pub cache_alloc: Alloc<'a>,
 }
 
 /// The test profile with the one grant a native image needs: `dlopen` maps `<store>/<64 hex>`
@@ -1944,8 +1945,8 @@ fn with_native<'a>(mut profile: AString<'a>, store: &str, native: Option<crate::
     Ok(profile)
 }
 
-impl RunOne for Launched<'_, '_> {
-    async fn run(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<How, OneError> {
+impl RunOne for Launched<'_, '_, '_> {
+    async fn run(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError> {
         let frame = Frame::new(bstd::mem::Tag::Other).map_err(OneError::Frame)?;
         let name = bstd::mem::format_in!(&frame, "stderr-{row}");
         let path = Path::new(name.as_str()).map_err(OneError::Path)?;
@@ -2019,7 +2020,7 @@ struct TestResolve<'r, R> {
 }
 
 enum TestAnswer {
-    Ready(Symbol),
+    Ready { symbol: Symbol, record: blaze_launch::wire::RecordId },
     Unresolved(Symbol),
     /// Its row waits for its code, made by a worker (run_parent.rs `Codes::Pooled`, D194): the
     /// need is not taken, and the run parks until the relay answers it.
@@ -2035,7 +2036,7 @@ impl<R: Resolve> Resolve for TestResolve<'_, R> {
     fn publication(&mut self, symbol: &Symbol, values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {
         let answer = self.parent.publication(symbol, values)?;
         self.requested = Some(match answer {
-            Resolved::Record { .. } => TestAnswer::Ready(*symbol),
+            Resolved::Record { record, .. } => TestAnswer::Ready { symbol: *symbol, record },
             Resolved::Unknown => TestAnswer::Unresolved(*symbol),
             Resolved::Waiting => TestAnswer::Waiting(*symbol),
         });
@@ -2052,7 +2053,7 @@ struct FirstCall {
     unkeyed: usize,
 }
 
-impl<'c> Launched<'c, '_> {
+impl<'c> Launched<'c, '_, '_> {
     /// The make `lazy`'s waiting row asked for, handed to the relay as child `child`'s ask: its
     /// order, name and proof, and the maker its roots make ([`TestFront::maker`]).
     fn ask_code<'r, D: run_parent::Folder>(&self, code: &'c CodeRelay<'c>, child: Child, lazy: &Lazy<'_, '_, TestFront<'_, '_, 'r>, D>) -> Result<(), OneError> {
@@ -2064,7 +2065,7 @@ impl<'c> Launched<'c, '_> {
         code.ask(child, ask.key, job)
     }
 
-    async fn run_captured(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals, stderr: &mut StderrCapture<'_>, frame: &Frame) -> Result<How, OneError> {
+    async fn run_captured(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals, stderr: &mut StderrCapture<'_>, frame: &Frame) -> Result<RunOutcome, OneError> {
         let cx = self.cx;
         let test = key_of(&self.tests, row)?;
         // The test's own frame: everything of its run, dropped with it.
@@ -2143,6 +2144,15 @@ impl<'c> Launched<'c, '_> {
         let mut published = 0;
         let mut service_time = Duration::ZERO;
         let mut torn = None;
+        let mut keep: Result<(), NotKept> = if !self.tests.harnessed() {
+            Err(NotKept::Untraced)
+        } else if self.native.is_some() {
+            Err(NotKept::Foreign)
+        } else {
+            Ok(())
+        };
+        let mut entered_fns: AVec<'_, crate::test_cache::EnteredFn<'_>> = Vec::new_in(self.cache_alloc);
+        let mut rec_bytes = bstd::mem::Bytes::new_in(frame, "the code record inspected for test purity");
         let child_error = |error| OneError::Loop(RunLoopError::Child(error));
         // Start the other ready children before building any first-call answer. The loop ends
         // with the child's end and what it left (its channel, still read for what it wrote).
@@ -2258,11 +2268,57 @@ impl<'c> Launched<'c, '_> {
                                     instance: lazy.name_of(symbol), symbol, site: None, cause: RefusalCause::Unresolved,
                                 }));
                             }
-                            Some(TestAnswer::Ready(symbol)) => {
+                            Some(TestAnswer::Ready { symbol, record }) => {
                                 let after = lazy.tally();
+                                let unkeyed = after.unkeyed - before.unkeyed;
+                                if keep.is_ok() {
+                                    if unkeyed > 0 {
+                                        keep = Err(NotKept::Untraced);
+                                    } else {
+                                        rec_bytes.clear();
+                                        match lazy.read_record(&record, &mut rec_bytes) {
+                                            Ok(()) => {
+                                                if let Err(why) = crate::test_cache::check_record_purity(rec_bytes.as_slice()) {
+                                                    keep = Err(why);
+                                                }
+                                            }
+                                            Err(_) => keep = Err(NotKept::Untraced),
+                                        }
+                                    }
+                                    if keep.is_ok() {
+                                        let cache_alloc = self.cache_alloc;
+                                        lazy.walked_entered(&symbol, |sym, tabled, name, key| {
+                                            if key.is_none() {
+                                                keep = Err(NotKept::Untraced);
+                                                return;
+                                            }
+                                            match blaze_ladder::body_ids::instance_key(
+                                                blaze_code::record::Symbol(sym.0),
+                                                tabled,
+                                                name,
+                                                self.ids,
+                                                &self.builder,
+                                                &self.builder.producer,
+                                                cache_alloc,
+                                            ) {
+                                                Some(inst_key) => {
+                                                    let mut name_copy = Vec::with_capacity_in(name.len(), cache_alloc);
+                                                    name_copy.extend_from_slice(name);
+                                                    entered_fns.push(crate::test_cache::EnteredFn {
+                                                        symbol: FnName(sym.0),
+                                                        code_key: inst_key.0.0,
+                                                        tabled,
+                                                        name: name_copy,
+                                                    });
+                                                }
+                                                None => keep = Err(NotKept::Untraced),
+                                            }
+                                        });
+                                    }
+                                }
                                 calls.push(FirstCall {
                                     symbol, elapsed, made: after.made - before.made,
-                                    found: after.found - before.found, unkeyed: after.unkeyed - before.unkeyed,
+                                    found: after.found - before.found, unkeyed,
                                 });
                             }
                             // Its row waits for its code, made by a worker (D194): the run parks.
@@ -2416,7 +2472,22 @@ impl<'c> Launched<'c, '_> {
         } else if let Some(error) = torn {
             return Err(child_error(error));
         }
-        Ok(ended)
+        if entered_fns.is_empty() && keep.is_ok() {
+            keep = Err(NotKept::Untraced);
+        }
+        entered_fns.sort_unstable_by_key(|e| e.symbol);
+        entered_fns.dedup_by_key(|e| e.symbol);
+        let mut entered = Vec::with_capacity_in(entered_fns.len(), self.tables);
+        for e in entered_fns.iter() {
+            entered.push(e.symbol);
+        }
+        if !entered_fns.is_empty() {
+            let mut sink = self.entered_sink.borrow_mut();
+            for e in entered_fns {
+                sink.push((self.suite, e));
+            }
+        }
+        Ok(RunOutcome { how: ended, keep, entered })
     }
 }
 
@@ -2597,7 +2668,7 @@ pub(crate) fn list(cx: &Cx, suites: &[(Found<'_>, TestUnit<'_>)], config: LoopCo
             }.map_err(|_| DriveError::Print)?;
         }
         for at in 0..record.len() {
-            let row = asked(*unit, record_row(record, at)?, &[]);
+            let row = asked_with_id(record_row(record, at)?, TestId([0; 32]));
             if record.harnessed() && !plan.lets_through(&row) {
                 continue;
             }
@@ -2721,8 +2792,8 @@ impl Refuse for Selected<'_, EntryCheck<'_, '_>> {
     }
 }
 
-impl RunOne for Selected<'_, Launched<'_, '_>> {
-    async fn run(&self, flat: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<How, OneError> {
+impl RunOne for Selected<'_, Launched<'_, '_, '_>> {
+    async fn run(&self, flat: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError> {
         let loc = self.rows.get(flat as usize).ok_or(OneError::NoRow { row: flat })?;
         self.suites[loc.suite.0 as usize].run(loc.row, budget, output, signals).await
     }
@@ -2887,6 +2958,35 @@ fn run_selected<'h>(
     // command's relay over its code workers ([`pooled`]), which lives in the caller's frame and
     // outlives every run borrowing it (`Launched::codes`; E0597 when it was owned here, a1850).
     let mut child_base = 0usize;
+    let entered_sink: RefCell<AVec<'_, (SuiteId, crate::test_cache::EnteredFn<'_>)>> = RefCell::new(Vec::new_in(alloc));
+    let mut suite_specs = Vec::with_capacity_in(suites.len(), alloc);
+    for suite in suites {
+        suite_specs.push((suite.unit, suite.builder));
+    }
+    let (mut cache, heads, postings_list, moved) = crate::test_cache::TestCache::open(lent, suite_specs.as_slice(), ids, alloc);
+    let merged_postings_bytes: AVec<'_, u8>;
+    let postings = if postings_list.len() == 1 {
+        postings_list[0]
+    } else if postings_list.is_empty() {
+        Postings::EMPTY
+    } else {
+        let mut pairs: AVec<'_, (Ask, TestId)> = Vec::new_in(alloc);
+        for head in heads.iter() {
+            for row in head.rows() {
+                for ask in head.asks(row) {
+                    pairs.push((ask, row.kept.test));
+                }
+            }
+        }
+        if pairs.is_empty() {
+            Postings::EMPTY
+        } else {
+            merged_postings_bytes = blaze_run::postings::encode(pairs.as_slice(), alloc)
+                .map_err(|error| LoopError::Postings { suite: SuiteId(u32::MAX), error })?;
+            Postings::open(merged_postings_bytes.as_slice())
+                .map_err(|error| LoopError::Postings { suite: SuiteId(u32::MAX), error })?
+        }
+    };
     let mut launches = Vec::with_capacity_in(suites.len(), alloc);
     let mut checks = Vec::with_capacity_in(suites.len(), alloc);
     let mut locations = Vec::new_in(alloc);
@@ -2908,11 +3008,13 @@ fn run_selected<'h>(
             codes: relay,
             suite: suite_id,
             child_base,
+            entered_sink: &entered_sink,
+            cache_alloc: alloc,
         });
         child_base += tests.len();
         checks.push(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, image: suite.native.map(|native| native.map_or(&[][..], |send| send.items)), said: String::new_in(alloc) });
         for at in 0..tests.len() {
-            let mut row = asked(unit, record_row(tests, at)?, args);
+            let mut row = asked(unit, record_row(tests, at)?, &suite.builder, args);
             // Custom harnesses receive the raw arguments themselves.
             if tests.harnessed() && !select.lets_through(&row) {
                 filtered = filtered.checked_add(1).ok_or(DriveError::TooManyRows { count: u32::MAX as usize + 1 })?;
@@ -2927,13 +3029,13 @@ fn run_selected<'h>(
             locations.push(Location { suite: suite_id, row: u32::try_from(at).map_err(|_| DriveError::TooManyRows { count: tests.len() })? });
         }
     }
+    cache.set_owners(rows.as_slice(), owners.as_slice());
     let now = || Nanos(u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX));
     let launched = Selected { suites: launches.as_mut_slice(), rows: &locations };
     let mut refuse = Selected { suites: checks.as_mut_slice(), rows: &locations };
     let signals = Signals::default();
     let zygotes = OneEach::new(&launched, &signals, now, alloc, tables)?;
     let mut runner = Runner::new(zygotes, &config.plan, TestHost::THIS, alloc);
-    let mut unkept = Unkept::default();
     let mut print = |bytes: &[u8]| -> Result<(), DriveError> {
         watch.see(blaze_screen::Step::Says);
         for chunk in bytes.utf8_chunks() {
@@ -2945,7 +3047,21 @@ fn run_selected<'h>(
         Ok(())
     };
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Testing));
-    let status = drive(config, rows, &owners, filtered, &mut runner, &mut refuse, &mut unkept, &mut print, alloc);
+    let status = drive(
+        config,
+        rows,
+        &owners,
+        heads.as_slice(),
+        postings,
+        moved.as_slice(),
+        filtered,
+        &mut runner,
+        &mut refuse,
+        &mut cache,
+        &entered_sink,
+        &mut print,
+        alloc,
+    );
     watch.see(blaze_screen::Step::Says);
     // A run that stopped in blaze: ONE line naming the test, what failed and its cause, then
     // the command's own error (`OneStopped`) says the line above is why (rule 19). The
@@ -2972,9 +3088,7 @@ fn run_selected<'h>(
         )).map_err(|_| DriveError::Print)?;
     }
     let status = status?;
-    if unkept != Unkept::default() {
-        err.line(&cx, format_args!("{unkept}")).map_err(|_| DriveError::Print)?;
-    }
+    cache.commit()?;
     Ok(status)
 }
 

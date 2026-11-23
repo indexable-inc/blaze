@@ -96,6 +96,7 @@ mod journal_helper;
 mod graph;
 mod graph_payload;
 mod test_args;
+mod test_cache;
 mod test_drive;
 mod test_loop;
 mod test_run;
