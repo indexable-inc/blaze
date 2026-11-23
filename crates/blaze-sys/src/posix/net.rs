@@ -1239,6 +1239,62 @@ pub fn connect(socket: Fd, at: &sockaddr_storage, len: socklen_t) -> Result<(), 
     }
 }
 
+/// Opens an `AF_UNIX` `SOCK_STREAM` socket with `FD_CLOEXEC` and connects it to `path`.
+///
+/// Refuses empty paths, NUL bytes inside `path`, or paths that do not fit `sockaddr_un::sun_path`
+/// with [`Errno::Inval`] / [`Errno::NameTooLong`] before any syscall. The returned [`super::io::OwnedFd`]
+/// closes automatically on drop.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn connect_unix(path: &[u8]) -> Result<super::io::OwnedFd, Errno> {
+    if path.is_empty() {
+        return Err(Errno::Inval);
+    }
+    let mut un = sockaddr_un::ZERO;
+    if path.len() >= un.sun_path.len() {
+        return Err(Errno::NameTooLong);
+    }
+    let mut i = 0usize;
+    while let Some(&byte) = path.get(i) {
+        if byte == 0 {
+            return Err(Errno::Inval);
+        }
+        if let Some(slot) = un.sun_path.get_mut(i) {
+            *slot = byte.cast_signed();
+        }
+        i = i.wrapping_add(1);
+    }
+    un.sun_family = AF_UNIX as sa_family_t;
+    let addr_len = core::mem::offset_of!(sockaddr_un, sun_path).wrapping_add(path.len()).wrapping_add(1);
+    #[cfg(target_os = "macos")]
+    {
+        un.sun_len = match u8::try_from(addr_len) {
+            Ok(len) => len,
+            Err(_) => return Err(Errno::NameTooLong),
+        };
+    }
+    let mut storage = sockaddr_storage::ZERO;
+    // SAFETY: `sockaddr_storage` is strictly larger and at least as aligned as `sockaddr_un`,
+    // and both are plain-old-data C structs.
+    unsafe {
+        ptr::copy_nonoverlapping(ptr::from_ref(&un).cast::<u8>(), ptr::from_mut(&mut storage).cast::<u8>(), size_of::<sockaddr_un>());
+    }
+    #[cfg(target_os = "linux")]
+    let raw = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)?;
+    #[cfg(target_os = "macos")]
+    let raw = socket(AF_UNIX, SOCK_STREAM, 0)?;
+    // SAFETY: `socket` just returned a newly owned open file descriptor.
+    let owned = unsafe { super::io::OwnedFd::from_raw(raw.raw()) };
+    #[cfg(target_os = "macos")]
+    super::io::set_close_on_exec(owned.fd(), true)?;
+    let socklen = match socklen_t::try_from(addr_len) {
+        Ok(len) => len,
+        Err(_) => return Err(Errno::NameTooLong),
+    };
+    connect(owned.fd(), &storage, socklen)?;
+    Ok(owned)
+}
+
 /// `listen`: the socket takes connections, up to `backlog` waiting ([`SOMAXCONN`] at most).
 /// [`Errno::Inval`] for a negative backlog.
 /// replaces libc::listen

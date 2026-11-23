@@ -19,6 +19,12 @@ use crate::{
 /// the file at an entry's path is still the binary it names (remote-read.md section 3).
 pub use crate::rt::image::build_id_in;
 
+/// This running image's linker id, read in place from its mapped header (`LC_UUID` on macOS,
+/// GNU build-id note on Linux) without starting a bstd runtime.
+pub fn build_id_self() -> Option<BuildId> {
+    crate::rt::image::build_id()
+}
+
 /// What a native world offers: everything its target's driver has an effect for
 /// ([`Offers::NATIVE`]). The wasi driver keeps no sockets (blaze-core's `threads` driver runs
 /// them on unix only), so there `net` is `None`.

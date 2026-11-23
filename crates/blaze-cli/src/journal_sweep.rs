@@ -816,6 +816,38 @@ impl<'t> Taken<'t> {
         self.replay(cx, clock, root, Where::Checkout, "", stored);
     }
 
+    /// The checkout's own folder answered by the resident daemon's synchronous `kqueue` vnode
+    /// watcher: `dirty_paths` is the exact proven dirty set (possibly empty), and `crash_cursor`
+    /// is the passive in-process FSEvents cursor (`<=` edit time) persisted for `SIGKILL` recovery
+    /// (rule 70). Because `kqueue` proves the dirty set directly from the kernel without relying on
+    /// FSEvents ordering, `judge` is not invoked to reject on FSEvents lag.
+    pub(crate) fn vouched_kqueue(&mut self, dirty_paths: &'t [&'t str], crash_cursor: Option<Cursor>) {
+        let name_at = self.names.push("");
+        let target_tagged = self.target_tagged;
+        let told = dirty_paths.iter().filter(|it| !own(it, target_tagged)).count();
+        self.events = self.events.saturating_add(u64::try_from(told).unwrap_or(u64::MAX));
+        self.streams = self.streams.saturating_add(1);
+        let heard = Heard { replayed: None, asked: dirty_paths };
+        self.units.push(Unit { at: Where::Checkout, name: name_at, cursor: crash_cursor, since: None, heard: Some(heard) });
+    }
+
+    /// The resident daemon's watcher requested a full sweep (unarmed watcher or root change),
+    /// while still persisting `crash_cursor` when available.
+    pub(crate) fn full_rescan_daemon(&mut self, crash_cursor: Option<Cursor>) {
+        let name_at = self.names.push("");
+        self.refuse(Refused::NoCursor);
+        self.units.push(Unit { at: Where::Checkout, name: name_at, cursor: crash_cursor, since: None, heard: None });
+    }
+
+    /// The resident daemon's `FsEventsHeld` fallback backend: an in-process `HeldChanges::flush`
+    /// result judged by the same [`judge`] rule as [`Taken::replay_checkout`].
+    pub(crate) fn in_process_fsevents(&mut self, stored: Stored<'_>, changes: Changes, cursor: Cursor) {
+        let name_at = self.names.push("");
+        let since = stored.cursor_of(Where::Checkout, "");
+        let whole = changes.lost().find(|(under, _)| under.is_empty()).map(|(_, why)| why);
+        self.heard(Where::Checkout, "", name_at, since, cursor, whole, Heard::replayed(changes));
+    }
+
     /// The checkout's own folder answered by the journal helper (journal_ask.rs `Asked`): it
     /// vouched for `names` since the place `stored` kept beside the unit's (its pair), and its
     /// new place is one moment with the journal's `journal`. Judged as a replay's answer is

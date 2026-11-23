@@ -50,7 +50,6 @@ use blaze_watch::helper::{self, AskAnswer, AskNext, AskStep, Asking, CheckoutKey
 use blaze_watch::since::{self, Place};
 use bstd::clock::{Clock, Instant};
 use bstd::cx::Cx;
-use bstd::digest::blake3;
 use bstd::fs::{Cursor, Dir, FsError, PrivateError, ReadWrite};
 use bstd::local::Local;
 use bstd::mem::{Bytes, Frame};
@@ -237,13 +236,22 @@ impl core::fmt::Display for SocketFits {
     }
 }
 
+/// Allocation-free checkout key computation matching [`checkout_key`], shared by the pre-runtime
+/// daemon client (`daemon_client.rs`), resident daemon (`daemon_server.rs`), and `clean.rs`.
+pub(crate) fn checkout_key_of(root: &str) -> CheckoutKey {
+    let mut hasher = blaze_blake3::Hasher::new();
+    hasher.update(CHECKOUT_DOMAIN.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(root.as_bytes());
+    CheckoutKey(hasher.finalize())
+}
+
 /// The key a helper and a command both compute for one checkout: the digest of its root as one
 /// `realpath` resolved it (the helper's edge and the command's make the same call), so a socket
 /// reached through a link to another checkout is refused by its hello. `None` (a simulated
 /// world, or a root that is not UTF-8): the key of no root.
-pub(crate) fn checkout_key(root: Option<&str>, frame: &Frame) -> CheckoutKey {
-    let text = bstd::mem::format_in!(frame, "{CHECKOUT_DOMAIN}\n{}", root.unwrap_or(""));
-    CheckoutKey(blake3(text.as_bytes()))
+pub(crate) fn checkout_key(root: Option<&str>, _frame: &Frame) -> CheckoutKey {
+    checkout_key_of(root.unwrap_or(""))
 }
 
 /// The helper's place the stored answer kept, when it kept the journal place it pairs with

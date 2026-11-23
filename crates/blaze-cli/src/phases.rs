@@ -182,6 +182,32 @@ impl Phases {
         }
     }
 
+    /// Resets the phase ledger for the next request in a resident daemon without cloning `Clock`.
+    pub fn reset(&mut self) {
+        let now = self.clock.now();
+        self.began = now;
+        self.last = now;
+        self.before_runtime = None;
+        self.before_main = 0;
+        self.before_main_used = blaze_meter::Process::now().system;
+        self.len = 0;
+        self.request = Effects::default();
+        self.first_chunk = None;
+        self.at_main = blaze_mem::syscalls::snapshot();
+        self.frames = None;
+        self.worlds = 0;
+        self.records = byte_rows::Records::new();
+        self.code_records = None;
+        self.run_names = None;
+        self.cleanup = None;
+        self.published = None;
+        self.held = Held { phase_at: 0, kind_at: 0, kind_since: None, phases: [0; MOST], kinds: [("", 0, 0, 0); MOST_KINDS], len: 0, seen: (0, 0) };
+        self.meter = blaze_meter::Meter::now();
+        self.waits_at = blaze_meter::Waited::ZERO;
+        self.last_row_waits_from = blaze_meter::Waited::ZERO;
+        self.beside_len = 0;
+    }
+
     /// Stretches of `kind` that ran on threads other than this one (a pool's tasks on its
     /// workers), their spread: counted beside the phases when the profile reconciles against
     /// the process. A stretch on this thread is inside a phase already and is never given here.

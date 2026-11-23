@@ -315,6 +315,22 @@ pub fn run_with<'w>(cx: &Cx, fs: &bstd::fs::Fs, words: impl Iterator<Item = &'w 
     }
     let frame = cx.frame();
     let checkout = crate::checkout::checkout(dir, frame)?;
+    // Best-effort non-blocking shutdown of any resident daemon serving this checkout before
+    // removing checkout or store state (Wave 7, rule 70).
+    #[cfg(unix)]
+    if !cx.is_simulated()
+        && let Some(home_text) = home
+    {
+        let checkout_rel = match &checkout {
+            crate::checkout::Checkout::Under(under) => under.as_str(),
+            crate::checkout::Checkout::Here => "",
+        };
+        if let Ok(served) = crate::engine_script_reads::Served::at_edge(false, checkout_rel, frame)
+            && let Some(root_abs) = served.root_text()
+        {
+            crate::daemon_client::send_shutdown(home_text, root_abs);
+        }
+    }
     let (root, lead) = match &checkout {
         crate::checkout::Checkout::Under(under) => (fs.open_dir(cx, under)?, bstd::mem::format_in!(frame, "{under}/")),
         crate::checkout::Checkout::Here => (fs.root(), bstd::mem::format_in!(frame, "")),

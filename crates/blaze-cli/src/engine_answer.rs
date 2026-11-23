@@ -1071,7 +1071,12 @@ pub(crate) fn load_pointer<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut Comma
 /// The pointer record `first`, read in place (a root's one key, or a base's, [`load_base`]).
 fn pointer_at<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'m, '_, D, S>, first: Key) -> Result<Result<Pointer<'m>, Unreadable>, CliError> {
     let Some(held) = store.get(cx, first)? else { return Ok(Err(Unreadable::Missing { key: first })) };
-    let sealed: &'m [u8] = held.bytes;
+    decode_pointer_bytes(first, held.bytes)
+}
+
+/// Decodes a sealed pointer record `sealed` at key `first` in place (shared by [`load_pointer`]
+/// and `daemon_server.rs` when arming `KqueueVnode` directly from the open store mmap).
+pub(crate) fn decode_pointer_bytes<'m>(first: Key, sealed: &'m [u8]) -> Result<Result<Pointer<'m>, Unreadable>, CliError> {
     if !sealed.starts_with(seal::SEAL_MAGIC) {
         return Ok(Err(Unreadable::Older));
     }

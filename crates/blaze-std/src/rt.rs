@@ -751,6 +751,21 @@ pub(crate) fn start_dir() -> &'static RootPath {
     RootPath::new(".")
 }
 
+/// Read-only view of the process's start block (arguments and raw environment entries), readable
+/// before [`run_with_heap_at`] initializes the runtime (e.g. a thin Unix-socket daemon client).
+#[derive(Clone, Copy)]
+pub struct StartBlock {
+    pub args: &'static [&'static str],
+    pub env: &'static [&'static core::ffi::CStr],
+}
+
+/// Returns the process's start block without starting the bstd runtime (`None` if non-UTF-8 args
+/// or unsupported platform).
+pub fn start_block() -> Option<StartBlock> {
+    let block = process_start().ok()?;
+    Some(StartBlock { args: &block.args, env: &block.env })
+}
+
 /// What the process was started with: its command line (each argument UTF-8, or a refusal
 /// naming it) and its environment, borrowed where the kernel left them (`block`).
 pub(crate) fn process_start() -> Result<&'static block::Block, String> {

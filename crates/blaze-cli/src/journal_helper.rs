@@ -541,7 +541,7 @@ pub(crate) fn look_at<E>(own: BuildId, was: Stamp, now: Option<Stamp>, read: imp
 impl OwnExe {
     /// The executable at `exe` (absolute, from `Host::exe`), this process's build `build`:
     /// its folder opened as a second tree (`Fs::home`, as the roster does) and its stamp taken.
-    fn open(cx: &Cx, fs: &Fs, exe: &str, build: BuildId) -> Result<OwnExe, OwnExeWhy> {
+    pub(crate) fn open(cx: &Cx, fs: &Fs, exe: &str, build: BuildId) -> Result<OwnExe, OwnExeWhy> {
         let (folder, leaf) = exe.strip_prefix('/').and_then(|rest| rest.rsplit_once('/')).ok_or(OwnExeWhy::NotAPath)?;
         let folder = Path::new(folder).map_err(OwnExeWhy::Path)?;
         let leaf = Path::new(leaf).map_err(OwnExeWhy::Path)?;
@@ -551,7 +551,7 @@ impl OwnExe {
     }
 
     /// One look ([`look_at`]): `None` while it is this build (a moved stamp kept), else why not.
-    fn look(&mut self, cx: &Cx, frame: &Frame) -> Option<ExeChange> {
+    pub(crate) fn look(&mut self, cx: &Cx, frame: &Frame) -> Option<ExeChange> {
         let cx = cx.span("journal helper: its own executable looked at (a stat; its head read when the stat moved)");
         let now = match self.folder.stat(&cx, &self.leaf) {
             Ok(meta) => meta.map(|meta| meta.stamp),

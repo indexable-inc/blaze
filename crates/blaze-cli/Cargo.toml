@@ -38,9 +38,12 @@ blaze-answer.workspace = true
 blaze-cas.workspace = true
 blaze-keyed.workspace = true
 blaze-hash.workspace = true
-# The checkout's journal helper (journal_ask.rs, journal_helper.rs): its session, its wire and
-# its places (blaze-watch helper.rs, since.rs).
+# The checkout's journal helper (journal_ask.rs, journal_helper.rs) and resident daemon
+# (daemon_client.rs, daemon_server.rs): wire, lifecycle core, and places.
 blaze-watch.workspace = true
+# Safe POSIX syscalls for the resident daemon's pre-runtime Unix socket client (daemon_client.rs)
+# and macOS kqueue vnode watcher (daemon_watch.rs).
+blaze-sys.workspace = true
 # The system, reached only through bstd: the files, the output, the host's core count, frames.
 # `requests`: bstd's `Http` alone (blaze-h1 over `Net`), for the shared cache's http origin.
 blaze-std = { workspace = true, features = ["requests"] }

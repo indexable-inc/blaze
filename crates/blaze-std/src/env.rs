@@ -161,6 +161,15 @@ enum Source {
     /// `NAME=value` entries, as the process was started with them ([`crate::rt::block`]).
     Process(&'static [&'static core::ffi::CStr]),
     Given(Arc<[(String, String)]>),
+    Owned(
+        blaze_own::Arc<
+            blaze_own::Vec<
+                (blaze_own::String<blaze_own::SharedAlloc<'static>>, blaze_own::String<blaze_own::SharedAlloc<'static>>),
+                blaze_own::SharedAlloc<'static>,
+            >,
+            blaze_own::SharedAlloc<'static>,
+        >,
+    ),
 }
 
 impl Vars {
@@ -168,6 +177,16 @@ impl Vars {
     pub fn given(vars: alloc::vec::Vec<(String, String)>) -> Vars {
         // alloc: once per world, its environment.
         Vars(Source::Given(vars.into()))
+    }
+
+    /// An environment built from borrowed `(key, value)` slices in an explicit shared allocator
+    /// (e.g. a resident daemon request).
+    pub fn from_pairs_in(vars: &[(&str, &str)], alloc: blaze_own::SharedAlloc<'static>) -> Vars {
+        let mut owned = blaze_own::Vec::with_capacity_in(vars.len(), alloc);
+        for &(k, v) in vars {
+            owned.push((blaze_own::String::from_str_in(k, alloc), blaze_own::String::from_str_in(v, alloc)));
+        }
+        Vars(Source::Owned(blaze_own::Arc::new_in(owned, alloc)))
     }
 
     /// The process's own, borrowed from its start block.
@@ -186,11 +205,12 @@ impl Vars {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     fn each(&self) -> impl Iterator<Item = (&str, &str)> {
-        let (process, given) = match &self.0 {
-            Source::Process(entries) => (Some(entries.iter().filter_map(|entry| split(entry.to_bytes()))), None),
-            Source::Given(vars) => (None, Some(vars.iter().map(|(name, value)| (name.as_str(), value.as_str())))),
+        let (process, given, owned) = match &self.0 {
+            Source::Process(entries) => (Some(entries.iter().filter_map(|entry| split(entry.to_bytes()))), None, None),
+            Source::Given(vars) => (None, Some(vars.iter().map(|(name, value)| (name.as_str(), value.as_str()))), None),
+            Source::Owned(vars) => (None, None, Some(vars.iter().map(|(name, value)| (name.as_str(), value.as_str())))),
         };
-        process.into_iter().flatten().chain(given.into_iter().flatten())
+        process.into_iter().flatten().chain(given.into_iter().flatten()).chain(owned.into_iter().flatten())
     }
 }
 
@@ -225,6 +245,15 @@ impl Env {
     #[blaze::nonblocking]
     pub(crate) fn new(vars: Vars, plant: Plant) -> Env {
         Env { vars, allowed: None, plant }
+    }
+
+    /// Wraps [`Vars`] as an unrestricted [`Env`] capability (e.g. a resident daemon serving a
+    /// client request's environment without mutating process state).
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn from_vars(vars: Vars) -> Env {
+        Env { vars, allowed: None, plant: Plant::None }
     }
 
     /// The variable `name`: its value, `None` when it is not set, or [`NotAllowed`] when
