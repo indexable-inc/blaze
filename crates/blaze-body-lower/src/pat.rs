@@ -14,9 +14,9 @@
 
 use core::alloc::Allocator;
 
-use blaze_body::{Block, BlockKind, BorrowKind, LocalDecl, LocalKind, Local, Operand, Place, Proj, Span, StmtKind, Value};
+use blaze_body::{Block, BlockKind, BorrowKind, LocalDecl, LocalKind, Local, Operand, Place, Proj, Role, Span, StmtKind, Value};
 use blaze_own::Vec;
-use blaze_typeck::{Def, ExprId, ItemKey, Lit, List, Mutbl, PNode, PTy, Pat, PatId};
+use blaze_typeck::{Def, ExprId, IntTy, ItemKey, Lit, List, Mutbl, PNode, PTy, Pat, PatId, UnionPat};
 
 use crate::scope::Binding;
 use crate::{At, BodyFacts, Construct, DiscrInt, Lower, LowerError, MOST_POSITIONS};
@@ -41,7 +41,11 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
     /// Whether `p` is a pattern that matches a value: not a plain binding, wildcard or
     /// reference pattern, which take their place as it is.
     fn structural(&self, p: PatId) -> Result<bool, LowerError> {
-        Ok(!matches!(self.pat(p)?, Pat::Bind { .. } | Pat::Wild | Pat::Missing | Pat::Ref { .. }))
+        Ok(match self.pat(p)? {
+            Pat::Wild | Pat::Missing | Pat::Ref { .. } => false,
+            Pat::Bind { .. } => self.ck.union_pat_of(p).is_some(),
+            _ => true,
+        })
     }
 
     /// The place and type structural pattern `p` matches: `place` dereferenced while its type
@@ -145,6 +149,21 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
                 }
                 Ok((base, marked, out))
             }
+            Pat::Record { fields, .. } => {
+                let PNode::Record(schema, flist) = self.node(ty, At::Pat(p))? else {
+                    return self.refuse_pat(Construct::Malformed, p);
+                };
+                let tys = self.list(flist, At::Pat(p))?;
+                for fp in self.field_pats_in(fields, p)? {
+                    let Some(i) = self.tys.record_field_index(schema, fp.name) else {
+                        return self.refuse_pat(Construct::UnknownField, fp.pat);
+                    };
+                    let Ok(ix) = usize::try_from(i) else { return self.refuse_pat(Construct::Malformed, fp.pat) };
+                    let Some(&ft) = tys.get(ix) else { return self.refuse_pat(Construct::Malformed, fp.pat) };
+                    out.push((i, fp.pat, ft));
+                }
+                Ok((place, false, out))
+            }
             _ => Ok((place, false, out)),
         }
     }
@@ -175,9 +194,88 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
         match self.pat(p)? {
             Pat::Missing => self.refuse_pat(Construct::Malformed, p),
             Pat::Wild => Ok(()),
-            Pat::Bind { sub, .. } => match sub {
-                Some(s) => self.test_pat(s, place, ty, fail, e),
-                None => Ok(()),
+            Pat::Bind { sub, .. } => match self.ck.union_pat_of(p) {
+                None => match sub {
+                    Some(s) => self.test_pat(s, place, ty, fail, e),
+                    None => Ok(()),
+                },
+                Some(UnionPat::Variant(v)) => {
+                    let PNode::Union(ul) = self.node(ty, At::Pat(p))? else {
+                        return self.refuse_pat(Construct::Malformed, p);
+                    };
+                    if v >= ul.len {
+                        return self.refuse_pat(Construct::Malformed, p);
+                    }
+                    if ul.len > 1 {
+                        let dty = self.find_ty(PNode::Int(IntTy::Isize), At::Pat(p))?;
+                        let discr = self.scratch(e, dty);
+                        self.b.assign(discr, Value::Discriminant(place), span);
+                        self.switch_eq(Operand::Move(discr), u128::from(v), fail, span);
+                    }
+                    match sub {
+                        Some(s) => {
+                            let Ok(v_idx) = usize::try_from(v) else { return self.refuse_pat(Construct::Malformed, p) };
+                            let Some(&member_ty) = self.list(ul, At::Pat(p))?.get(v_idx) else {
+                                return self.refuse_pat(Construct::Malformed, p);
+                            };
+                            let dp = self.b.project(place, Proj::Downcast(v));
+                            let fp = self.b.project(dp, Proj::Field { index: 0, ty: member_ty });
+                            self.test_pat(s, fp, member_ty, fail, e)
+                        }
+                        None => Ok(()),
+                    }
+                }
+                Some(UnionPat::Residual) => {
+                    let lt = self.local_ty(p)?;
+                    let dst_ty = match self.node(lt, At::Pat(p))? {
+                        PNode::Ref(_, inner) if matches!(self.node(inner, At::Pat(p))?, PNode::Union(_)) => inner,
+                        PNode::Union(_) => lt,
+                        _ => return self.refuse_pat(Construct::Malformed, p),
+                    };
+                    let PNode::Union(src_l) = self.node(ty, At::Pat(p))? else {
+                        return self.refuse_pat(Construct::Malformed, p);
+                    };
+                    let PNode::Union(dst_l) = self.node(dst_ty, At::Pat(p))? else {
+                        return self.refuse_pat(Construct::Malformed, p);
+                    };
+                    let mut src_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+                    src_members.extend_from_slice(self.list(src_l, At::Pat(p))?);
+                    let mut dst_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+                    dst_members.extend_from_slice(self.list(dst_l, At::Pat(p))?);
+                    let mut matching: Vec<u32, A> = Vec::new_in(self.alloc);
+                    for (i_idx, &sm) in src_members.iter().enumerate() {
+                        if dst_members.scan_for(&sm).is_some() {
+                            let Ok(i) = u32::try_from(i_idx) else { return self.refuse_pat(Construct::Malformed, p) };
+                            matching.push(i);
+                        }
+                    }
+                    if matching.is_empty() {
+                        self.goto(fail, span);
+                        self.dead_block();
+                        return Ok(());
+                    }
+                    if matching.len() < src_members.len() {
+                        let dty = self.find_ty(PNode::Int(IntTy::Isize), At::Pat(p))?;
+                        let discr = self.scratch(e, dty);
+                        self.b.assign(discr, Value::Discriminant(place), span);
+                        let ok = self.b.new_block(BlockKind::Normal);
+                        let mut cases_vec: Vec<(u128, Block), A> = Vec::new_in(self.alloc);
+                        for &i in matching.iter() {
+                            cases_vec.push((u128::from(i), ok));
+                        }
+                        let cases = self.b.cases(&cases_vec);
+                        self.b.terminate(StmtKind::Switch { on: Operand::Move(discr), cases, otherwise: fail }, span);
+                        self.b.start(ok);
+                    }
+                    match sub {
+                        Some(s) => {
+                            let tp = self.temp(e, dst_ty, Role::Value)?;
+                            self.remap_union(place, ty, dst_ty, tp, e, span, At::Pat(p))?;
+                            self.test_pat(s, tp, dst_ty, fail, e)
+                        }
+                        None => Ok(()),
+                    }
+                }
             },
             Pat::Ref { inner, .. } => {
                 let it = self.pointee(ty, At::Pat(p))?;
@@ -201,7 +299,7 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
                 Some(Def::Const(_)) => self.refuse_pat(Construct::ValuePattern, p),
                 _ => self.refuse_pat(Construct::Malformed, p),
             },
-            Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } => {
+            Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } => {
                 if let Pat::TupleStruct { .. } | Pat::Struct { .. } = self.pat(p)? {
                     let (adt, variant) = self.ctor_of(p)?;
                     self.variant_test(adt, variant, place, fail, p, e)?;
@@ -216,7 +314,6 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
             Pat::Or { .. } => self.refuse_pat(Construct::OrPattern, p),
             Pat::Slice { .. } => self.refuse_pat(Construct::SlicePattern, p),
             Pat::Range { .. } => self.refuse_pat(Construct::RangePattern, p),
-            Pat::Record { .. } => self.refuse_pat(Construct::Union, p),
         }
     }
 
@@ -262,6 +359,9 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
                 Pat::Missing => return self.refuse_pat(Construct::Malformed, q),
                 Pat::Wild => {}
                 Pat::Bind { sub, .. } => {
+                    if self.ck.union_pat_of(q).is_some() {
+                        return Ok(false);
+                    }
                     if let Some(s) = sub {
                         work.push(s);
                     }
@@ -330,35 +430,80 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
             Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } => Ok(()),
             Pat::Bind { ann, sub, .. } => {
                 let lt = self.local_ty(p)?;
-                let by_ref = match ann.by_ref {
-                    Some(m) => Some(m),
-                    None if lt != ty => match self.node(lt, At::Pat(p))? {
-                        PNode::Ref(m, inner) if inner == ty => Some(m),
-                        _ => return self.refuse_pat(Construct::Malformed, p),
-                    },
-                    None => None,
-                };
-                let (local, lp) = self.binding_local(p, lt)?;
-                match by_ref {
-                    Some(m) => {
-                        let kind = match m {
-                            Mutbl::Not => BorrowKind::Shared,
-                            Mutbl::Mut => BorrowKind::Mut,
-                        };
-                        let o = self.b.origin(false);
-                        self.b.borrow(lp, kind, place, o, span);
-                    }
+                match self.ck.union_pat_of(p) {
                     None => {
-                        let op = if self.is_copy(lt, At::Pat(p))? { Operand::Copy(place) } else { Operand::Move(place) };
-                        self.b.assign(lp, Value::Use(op), span);
+                        let by_ref = match ann.by_ref {
+                            Some(m) => Some(m),
+                            None if lt != ty => match self.node(lt, At::Pat(p))? {
+                                PNode::Ref(m, inner) if inner == ty => Some(m),
+                                _ => return self.refuse_pat(Construct::Malformed, p),
+                            },
+                            None => None,
+                        };
+                        self.bind_value(p, place, lt, by_ref, span, out)?;
+                        match sub {
+                            Some(s) => self.bind_pat(s, place, ty, out),
+                            None => Ok(()),
+                        }
                     }
-                }
-                let drops = self.needs_drop(lt, At::Pat(p))?;
-                out.push(Binding { local, place: lp, ty: lt, drops });
-                self.bind(p, lp);
-                match sub {
-                    Some(s) => self.bind_pat(s, place, ty, out),
-                    None => Ok(()),
+                    Some(UnionPat::Variant(v)) => {
+                        let PNode::Union(ul) = self.node(ty, At::Pat(p))? else {
+                            return self.refuse_pat(Construct::Malformed, p);
+                        };
+                        let Ok(v_idx) = usize::try_from(v) else { return self.refuse_pat(Construct::Malformed, p) };
+                        let Some(&member_ty) = self.list(ul, At::Pat(p))?.get(v_idx) else {
+                            return self.refuse_pat(Construct::Malformed, p);
+                        };
+                        let dp = self.b.project(place, Proj::Downcast(v));
+                        let fp = self.b.project(dp, Proj::Field { index: 0, ty: member_ty });
+                        let by_ref = match ann.by_ref {
+                            Some(m) => Some(m),
+                            None if lt != member_ty => match self.node(lt, At::Pat(p))? {
+                                PNode::Ref(m, inner) if inner == member_ty => Some(m),
+                                _ => return self.refuse_pat(Construct::Malformed, p),
+                            },
+                            None => None,
+                        };
+                        self.bind_value(p, fp, lt, by_ref, span, out)?;
+                        match sub {
+                            Some(s) => self.bind_pat(s, fp, member_ty, out),
+                            None => Ok(()),
+                        }
+                    }
+                    Some(UnionPat::Residual) => {
+                        let (by_ref, dst_ty) = match ann.by_ref {
+                            Some(m) => match self.node(lt, At::Pat(p))? {
+                                PNode::Ref(_, inner) if matches!(self.node(inner, At::Pat(p))?, PNode::Union(_)) => (Some(m), inner),
+                                _ => return self.refuse_pat(Construct::Malformed, p),
+                            },
+                            None => match self.node(lt, At::Pat(p))? {
+                                PNode::Ref(m, inner) if matches!(self.node(inner, At::Pat(p))?, PNode::Union(_)) => (Some(m), inner),
+                                PNode::Union(_) => (None, lt),
+                                _ => return self.refuse_pat(Construct::Malformed, p),
+                            },
+                        };
+                        let root = self.body.root;
+                        let narrowed_place = match by_ref {
+                            Some(m) => {
+                                let tp = self.temp(root, dst_ty, Role::Value)?;
+                                self.remap_union(place, ty, dst_ty, tp, root, span, At::Pat(p))?;
+                                self.bind_value(p, tp, lt, Some(m), span, out)?;
+                                tp
+                            }
+                            None => {
+                                let (local, lp) = self.binding_local(p, lt)?;
+                                self.remap_union(place, ty, dst_ty, lp, root, span, At::Pat(p))?;
+                                let drops = self.needs_drop(lt, At::Pat(p))?;
+                                out.push(Binding { local, place: lp, ty: lt, drops });
+                                self.bind(p, lp);
+                                lp
+                            }
+                        };
+                        match sub {
+                            Some(s) => self.bind_pat(s, narrowed_place, dst_ty, out),
+                            None => Ok(()),
+                        }
+                    }
                 }
             }
             Pat::Ref { inner, .. } => {
@@ -366,7 +511,7 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
                 let ip = self.b.project(place, Proj::Deref);
                 self.bind_pat(inner, ip, it, out)
             }
-            Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } => {
+            Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } => {
                 let (base, marked, subs) = self.sub_fields(p, place, ty)?;
                 for &(index, s, fty) in subs.iter() {
                     let fp = self.b.project_marked(base, Proj::Field { index, ty: fty }, marked);
@@ -376,8 +521,38 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
             }
             Pat::Or { .. } => self.refuse_pat(Construct::OrPattern, p),
             Pat::Slice { .. } => self.refuse_pat(Construct::SlicePattern, p),
-            Pat::Record { .. } => self.refuse_pat(Construct::Union, p),
         }
+    }
+
+    /// Creates binding `p`'s local of type `lt` and assigns or borrows `source` into it.
+    fn bind_value(
+        &mut self,
+        p: PatId,
+        source: Place,
+        lt: PTy,
+        by_ref: Option<Mutbl>,
+        span: Span,
+        out: &mut Vec<Binding, A>,
+    ) -> Result<(), LowerError> {
+        let (local, lp) = self.binding_local(p, lt)?;
+        match by_ref {
+            Some(m) => {
+                let kind = match m {
+                    Mutbl::Not => BorrowKind::Shared,
+                    Mutbl::Mut => BorrowKind::Mut,
+                };
+                let o = self.b.origin(false);
+                self.b.borrow(lp, kind, source, o, span);
+            }
+            None => {
+                let op = if self.is_copy(lt, At::Pat(p))? { Operand::Copy(source) } else { Operand::Move(source) };
+                self.b.assign(lp, Value::Use(op), span);
+            }
+        }
+        let drops = self.needs_drop(lt, At::Pat(p))?;
+        out.push(Binding { local, place: lp, ty: lt, drops });
+        self.bind(p, lp);
+        Ok(())
     }
 
     /// `let p;`: each binding's storage begun, nothing written.
@@ -402,6 +577,11 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
                 Pat::Tuple { elems, .. } => {
                     for &s in self.pats_in(elems, cur)?.iter().rev() {
                         work.push(s);
+                    }
+                }
+                Pat::Record { fields, .. } => {
+                    for fp in self.field_pats_in(fields, cur)?.iter().rev() {
+                        work.push(fp.pat);
                     }
                 }
                 _ => return self.refuse_pat(Construct::Refutable, cur),

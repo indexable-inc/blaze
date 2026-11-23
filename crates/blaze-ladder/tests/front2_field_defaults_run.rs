@@ -359,9 +359,9 @@ pub extern \"C\" fn main() -> i32 {{
     assert_eq!(got_unit, Ok(7));
 }
 
-/// Fallible `T ! E` (`Result<T, E>`) with automatic error injection `ErrA -> ErrA | ErrB`.
+/// `Result<T, ErrA | ErrB>` with automatic error injection `ErrA -> ErrA | ErrB`.
 #[test]
-fn union_fallible_result_sugar() {
+fn union_result_auto_injection() {
     let defs = "
 enum Result<T, E> {
     Ok(T),
@@ -371,7 +371,7 @@ enum Result<T, E> {
 struct ErrA(u32);
 struct ErrB(u32);
 
-fn check(x: u32) -> u32 ! ErrA | ErrB {
+fn check(x: u32) -> Result<u32, ErrA | ErrB> {
     if x == 0 {
         Result::Err(ErrA(10))
     } else if x == 1 {
@@ -470,7 +470,7 @@ struct ErrA(u32);
 struct ErrB(u32);
 struct ErrC(u32);
 
-fn read(mode: u32) -> u32 ! ErrA {
+fn read(mode: u32) -> Result<u32, ErrA> {
     if mode == 1 {
         Result::Err(ErrA(10))
     } else {
@@ -478,7 +478,7 @@ fn read(mode: u32) -> u32 ! ErrA {
     }
 }
 
-fn parse(x: u32) -> u32 ! ErrB {
+fn parse(x: u32) -> Result<u32, ErrB> {
     if x == 2 {
         Result::Err(ErrB(20))
     } else {
@@ -486,13 +486,13 @@ fn parse(x: u32) -> u32 ! ErrB {
     }
 }
 
-fn load(mode: u32) -> u32 ! ErrA | ErrB {
+fn load(mode: u32) -> Result<u32, ErrA | ErrB> {
     let a = read(mode)?;
     let b = parse(a)?;
     Result::Ok(b)
 }
 
-fn outer(mode: u32) -> u32 ! ErrA | ErrB | ErrC {
+fn outer(mode: u32) -> Result<u32, ErrA | ErrB | ErrC> {
     if mode == 3 {
         return Result::Err(ErrC(30));
     }
@@ -557,4 +557,241 @@ pub extern \"C\" fn main() -> i32 {
 }
 ");
     assert_eq!(got, Ok(42));
+}
+
+/// Anonymous record default elision without `, ..` (`{ a: 10u32 }`) and all-defaults `{ .. }`.
+#[test]
+fn record_default_elision_without_dots_and_all_defaults() {
+    let elided = run_head(RECORDS_HEAD, "
+fn sum(r: { a: u32, b: u32 = 32 }) -> u32 {
+    r.a + r.b
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    sum({ a: 10u32 }) as i32
+}
+");
+    assert_eq!(elided, Ok(42));
+
+    let all_def = run_head(RECORDS_HEAD, "
+fn all_def(r: { a: u32 = 10, b: u32 = 32 }) -> u32 {
+    r.a + r.b
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    all_def({ .. }) as i32
+}
+");
+    assert_eq!(all_def, Ok(42));
+}
+
+/// Inferred `Result<T, _>` error unions across private and `pub fn` with `?` call chains.
+#[test]
+fn inferred_result_error_union_and_try_chain() {
+    let defs = "
+enum Infallible {}
+
+enum ControlFlow<B, C> {
+    #[lang = \"Continue\"]
+    Continue(C),
+    #[lang = \"Break\"]
+    Break(B),
+}
+
+#[lang = \"from\"]
+trait From<T> {
+    fn from(value: T) -> Self;
+}
+
+impl<T> From<T> for T {
+    fn from(value: T) -> Self {
+        value
+    }
+}
+
+trait FromResidual<R = <Self as Try>::Residual> {
+    #[lang = \"from_residual\"]
+    fn from_residual(residual: R) -> Self;
+}
+
+trait Try: FromResidual {
+    type Output;
+    type Residual;
+    #[lang = \"branch\"]
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output>;
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+impl<T, E> Try for Result<T, E> {
+    type Output = T;
+    type Residual = Result<Infallible, E>;
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output> {
+        match self {
+            Result::Ok(v) => ControlFlow::Continue(v),
+            Result::Err(e) => ControlFlow::Break(Result::Err(e)),
+        }
+    }
+}
+
+impl<T, E, F: From<E>> FromResidual<Result<Infallible, E>> for Result<T, F> {
+    fn from_residual(residual: Result<Infallible, E>) -> Self {
+        match residual {
+            Result::Err(e) => Result::Err(From::from(e)),
+            Result::Ok(x) => match x {},
+        }
+    }
+}
+
+struct ErrA(u32);
+struct ErrB(u32);
+struct ErrC(u32);
+
+fn read(mode: u32) -> Result<u32, _> {
+    if mode == 1 {
+        Result::Err(ErrA(10))
+    } else {
+        Result::Ok(mode)
+    }
+}
+
+fn parse(x: u32) -> Result<u32, _> {
+    if x == 2 {
+        Result::Err(ErrB(20))
+    } else {
+        Result::Ok(x + 42)
+    }
+}
+
+pub fn load(mode: u32) -> Result<u32, _> {
+    if mode == 3 {
+        return Result::Err(ErrC(30));
+    }
+    let a = read(mode)?;
+    let b = parse(a)?;
+    Result::Ok(b)
+}
+
+fn dispatch(mode: u32) -> u32 {
+    match load(mode) {
+        Result::Ok(v) => v,
+        Result::Err(e) => match e {
+            c: ErrC => c.0 + 3,
+            a: ErrA => a.0 + 1,
+            b => b.0 + 2,
+        },
+    }
+}
+";
+    for (mode, expected) in [(0u32, 42u8), (1, 11), (2, 22), (3, 33)] {
+        let got = run_head(UNIONS_HEAD, &format!(
+            "{defs}
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {{
+    dispatch({mode}) as i32
+}}
+"
+        ));
+        assert_eq!(got, Ok(expected), "mode {mode}");
+    }
+}
+
+/// General return-type `_` holes: `-> _`, `-> Option<_>`, and `-> (_, u32)` on private and `pub fn`.
+#[test]
+fn inferred_general_return_type_holes() {
+    let got = run_head(RECORDS_HEAD, "
+enum Option<T> {
+    Some(T),
+    None,
+}
+
+fn make_rec() -> _ {
+    { a: 10u32, b: 20u32 }
+}
+
+pub fn wrap() -> Option<_> {
+    Option::Some(5u32)
+}
+
+fn pair() -> (_, u32) {
+    (true, 7u32)
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let r = make_rec();
+    let w = match wrap() {
+        Option::Some(v) => v,
+        Option::None => 0,
+    };
+    let (flag, p) = pair();
+    let extra = if flag { p } else { 0 };
+    (r.a + r.b + w + extra) as i32
+}
+");
+    assert_eq!(got, Ok(42));
+}
+
+/// Mutually recursive `_`-returning functions are rejected cleanly with a cycle error.
+#[test]
+fn inferred_return_type_cycle_rejected() {
+    let got = run_head(UNIONS_HEAD, "
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+fn ping(n: u32) -> Result<u32, _> {
+    pong(n)
+}
+
+fn pong(n: u32) -> Result<u32, _> {
+    ping(n)
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    match ping(0) {
+        Result::Ok(v) => v as i32,
+        Result::Err(_) => 1,
+    }
+}
+");
+    assert!(
+        got.as_ref().is_err_and(|msg| msg.contains("Cycle") || msg.contains("cycle")),
+        "expected cycle error, got: {got:?}"
+    );
+}
+
+/// Compile-time `const` structural records and error unions evaluated via `blaze-consteval`
+/// and linked into native machine code.
+#[test]
+fn const_record_and_union_eval() {
+    let got_rec = run_head(RECORDS_HEAD, "
+const REC: { a: u32, b: u32 } = { b: 10u32, a: 32u32 };
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    (REC.a + REC.b) as i32
+}
+");
+    assert_eq!(got_rec, Ok(42));
+
+    let got_uni = run_head(UNIONS_HEAD, "
+const UNI: u32 | bool = 40u32;
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    match UNI {
+        n: u32 => (n + 2u32) as i32,
+        _: bool => 0,
+    }
+}
+");
+    assert_eq!(got_uni, Ok(42));
 }

@@ -271,6 +271,7 @@ mod tests {
         );
     }
 
+    /// The invariant: hex encoding and decoding round-trip arbitrary byte slices exactly.
     #[test]
     fn property_hex_round_trip() {
         let h = heap();

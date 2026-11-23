@@ -526,6 +526,7 @@ mod tests {
         Ok(())
     }
 
+    /// The invariant: chunked SSE parsing matches whole-buffer parsing and strips leading event field spaces.
     #[test]
     fn property_sse_chunked_round_trip() {
         let h = heap();

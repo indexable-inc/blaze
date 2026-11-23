@@ -731,6 +731,7 @@ mod tests {
         Ok(())
     }
 
+    /// The invariant: dotenv formatting and parsing round-trip arbitrary keys and escaped values without loss.
     #[test]
     fn property_dotenv_round_trip() {
         let h = heap();

@@ -112,6 +112,7 @@ mod unused_deps;
 mod work;
 mod check_command;
 mod ci_command;
+mod inspect_command;
 mod engine_answer;
 mod engine_answer_rows;
 mod engine_check;
@@ -263,6 +264,8 @@ pub enum CliError {
     Peer(peer::PeerError),
     /// `run` or `test` could not start from the engine's answer (engine_start.rs).
     Start(engine_start::StartError),
+    /// `blaze inspect` failed (inspect_command.rs). Boxed in the process heap (`CliError`'s size).
+    Inspect(blaze_own::Box<blaze_ladder::front2::inspect::InspectError, blaze_own::Alloc<'static>>),
     /// `blaze export` failed to build or write the standalone executable (engine_export.rs).
     /// Boxed in the process heap (`CliError`'s size cap).
     Export(blaze_own::Box<engine_export::ExportCliError, blaze_own::Alloc<'static>>),
@@ -306,7 +309,7 @@ impl fmt::Display for CliError {
         match self {
             CliError::Usage(what) => write!(
                 f,
-                "usage: blaze check [dir] [--color ...] [--view ...] [--each] [--workers N] [--status-every S], blaze ci [dir] [--format ...] [--todo ...], blaze run [dir] [--open] [--stats] [--workers N], blaze test [dir] [--stats] [--workers N], blaze export [dir] [-p pkg] [--bin name] [-o path] [--workers N] [--stats], blaze clean|gc|explain: {what}"
+                "usage: blaze check [dir] [--color ...] [--view ...] [--each] [--workers N] [--status-every S], blaze ci [dir] [--format ...] [--todo ...], blaze inspect <file.rs[::fn]> [--json] [--all-exprs], blaze run [dir] [--open] [--stats] [--workers N], blaze test [dir] [--stats] [--workers N], blaze export [dir] [-p pkg] [--bin name] [-o path] [--workers N] [--stats], blaze clean|gc|explain: {what}"
             ),
             CliError::NotOnEngine { flag, why } => write!(f, "`blaze check {flag}`: the engine's check does not take {flag} yet ({why}; check_command.rs)"),
             CliError::NoSuchCommand { command, instead } => write!(f, "blaze has no `{command}` command: {instead}"),
@@ -343,6 +346,7 @@ impl fmt::Display for CliError {
             CliError::TestArgs => write!(f, "`blaze test`'s words after `--` were refused (the line above, test_args.rs)"),
             CliError::TestPool(error) => write!(f, "`blaze test`'s pool: {error}"),
             CliError::Start(error) => write!(f, "{error}"),
+            CliError::Inspect(error) => write!(f, "{error}"),
             CliError::Export(error) => write!(f, "{error}"),
             CliError::RunLine(error) => write!(f, "{error}"),
             CliError::Peer(error) => write!(f, "{error}"),
@@ -659,6 +663,7 @@ fn command(
         // are moved.
         Some("check" | "engine-check") => check_command::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap, spawn_daemon),
         Some("ci") => ci_command::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
+        Some("inspect") => inspect_command::run(cx, args, fs, out, err, heap),
         Some("why") => engine_check::why(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
         // Hidden: the edit path's forward wake over the stored answer, dry (D187; engine_dry.rs).
         Some("engine-dry") => engine_dry::run(cx, args, fs, env, host, rng, out, err, phases, heap, engine_dry::Mode::Dry),
@@ -695,7 +700,7 @@ fn command(
         Some("warm-toolchain") => engine_check::warm_toolchain(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
         Some("store") => store::publish_command::run(cx, args, fs, env, clock, host, rng, out, err, heap),
         Some("peer") => peer::run(cx, args, fs, env, net, clock, rng, out),
-        Some(_) | None => Err(CliError::Usage("the command is check, ci, run, test, export, peer, clean, gc, warm-toolchain or explain")),
+        Some(_) | None => Err(CliError::Usage("the command is check, ci, inspect, run, test, export, peer, clean, gc, warm-toolchain or explain")),
     }
 }
 
@@ -1733,7 +1738,7 @@ mod tests {
         use blaze_run::viewer::OpenExplore;
         let args_of = |words: &[&str]| {
             let mut world = SimWorld::new(1, Limits::USUAL);
-            world.args = words.iter().map(|s| std::string::String::from(*s)).collect();
+            world.args = words.iter().map(|&s| s.into()).collect();
             Io::simulated(world).need_args().expect("args")
         };
         let default_run = args_of(&["blaze", "run"]);

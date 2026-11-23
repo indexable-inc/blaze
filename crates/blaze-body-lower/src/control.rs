@@ -162,7 +162,7 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
                 }
                 Expr::Paren(y) | Expr::Cast { operand: y, .. } => work.push(y),
                 Expr::Tuple { elems } | Expr::Array { elems } => work.extend_from_slice(self.exprs_in(elems, x)?),
-                Expr::Struct { fields, .. } => {
+                Expr::Struct { fields, .. } | Expr::Record { fields, .. } => {
                     for fi in self.field_inits_in(fields, x)? {
                         work.push(fi.expr);
                     }

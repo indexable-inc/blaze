@@ -459,6 +459,7 @@ mod tests {
         );
     }
 
+    /// The invariant: UUID v7 encoding, parsing, and version/variant bits round-trip and preserve timestamp ordering.
     #[test]
     fn property_uuid_v7_round_trip_and_monotonic_time() {
         let h = heap();

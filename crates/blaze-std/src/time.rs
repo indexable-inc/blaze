@@ -1037,6 +1037,7 @@ mod tests {
         assert_eq!(parse_duration("18446744073709551616s"), Err(TimeError::DurationOverflow));
     }
 
+    /// The invariant: datetime epoch and RFC3339 conversions round-trip accurately including century leap-year rules.
     #[test]
     fn property_datetime_epoch_and_rfc3339_round_trip() {
         let h = heap();

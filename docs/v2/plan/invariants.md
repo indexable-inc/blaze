@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-283 invariants, 44 refinements, 12 reference models.
-By level: 224 tested, 87 simulated, 1 model-checked, 15 proved.
+297 invariants, 44 refinements, 12 reference models.
+By level: 238 tested, 87 simulated, 1 model-checked, 15 proved.
 
 ## Invariants
 
@@ -463,6 +463,26 @@ By level: 224 tested, 87 simulated, 1 model-checked, 15 proved.
 
 ### blaze-std
 
+- **`property_strip_inverts_styled_and_preserves_width`** *tested* (`crates/blaze-std/src/ansi.rs`): stripping ANSI styling recovers the original text and preserves visible width.
+  Controls: `unstripped_osc`.
+- **`property_aead_round_trip_and_single_bit_tamper_rejection`** *tested* (`crates/blaze-std/src/crypto.rs`): AEAD seal/open round-trips arbitrary plaintext and rejects any single-bit tamper in ciphertext or AAD.
+  Controls: `unauthenticated_aad`.
+- **`property_csv_round_trip`** *tested* (`crates/blaze-std/src/csv.rs`): CSV formatting and parsing round-trip arbitrary cell values without loss.
+  Controls: `unescaped_quotes`.
+- **`property_patch_and_text_diffs_round_trip`** *tested* (`crates/blaze-std/src/diff/tests.rs`): unified diff patches and text diffs reconstruct the exact original and target texts.
+  Controls: `skipped_no_newline_marker`, `off_by_one_hunk_count`.
+- **`property_dotenv_round_trip`** *tested* (`crates/blaze-std/src/dotenv.rs`): dotenv formatting and parsing round-trip arbitrary keys and escaped values without loss.
+  Controls: `skipped_escapes`.
+- **`property_hex_round_trip`** *tested* (`crates/blaze-std/src/hex.rs`): hex encoding and decoding round-trip arbitrary byte slices exactly.
+  Controls: `swapped_nibbles`.
+- **`property_hostile_markdown_obeys_limits_escapes_script_and_strips_ansi`** *tested* (`crates/blaze-std/src/markdown/tests.rs`): hostile markdown respects depth/size limits, escapes HTML script tags, and strips ANSI escapes.
+  Controls: `unescaped_html_script_tag`.
+- **`property_literals_match_substring_search_and_split_reconstructs`** *tested* (`crates/blaze-std/src/regex/tests.rs`): compiled literal patterns match substring search and split reconstructs the exact input.
+  Controls: `inverted_greediness`, `ignored_case_flag`.
+- **`property_sse_chunked_round_trip`** *tested* (`crates/blaze-std/src/sse.rs`): chunked SSE parsing matches whole-buffer parsing and strips leading event field spaces.
+  Controls: `missing_space_strip`.
+- **`property_wrap_ansi_matches_plain_and_respects_width`** *tested* (`crates/blaze-std/src/table.rs`): ANSI-styled line wrapping matches plain wrapping and respects visible column width.
+  Controls: `byte_len_table_misalignment_and_lost_wrap_style`.
 - **`model_lazy_pool_runs_every_task_and_stops_after_every_start`** *model-checked* (`crates/blaze-std/src/task/idle.rs`): the lazy pool idle protocol starts each worker thread at most once, counts starts before threads exit, loses no wake-up including for unstarted workers, and runs every spawned task.
   Controls: `a_wake_that_skips_an_unstarted_worker`, `a_start_counted_after_its_thread`.
 - **`ancestors_are_the_granted_folders_and_only_read`** *simulated* (`crates/blaze-std/src/tests/ancestors.rs`): exactly the granted folders above, each reading what is there; a step past the top and a name back into the start are typed refusals.
@@ -539,6 +559,14 @@ By level: 224 tested, 87 simulated, 1 model-checked, 15 proved.
   Controls: `a_swap_that_frees_at_once`.
 - **`each_call_asks_the_device_for_exactly_what_its_durability_says`** *simulated* (`crates/blaze-std/src/tests/syncs.rs`): an unsynced call asks nothing of the device (`Started` only begins a write-back and a name sync), and a synced one asks exactly its contract's syncs, in order.
   Controls: `an_unsynced_rename_that_syncs`, `a_synced_call_that_skips_the_directory_sync`.
+- **`property_datetime_epoch_and_rfc3339_round_trip`** *tested* (`crates/blaze-std/src/time.rs`): datetime epoch and RFC3339 conversions round-trip accurately including century leap-year rules.
+  Controls: `missing_century_leap_rule`.
+- **`property_uuid_v7_round_trip_and_monotonic_time`** *tested* (`crates/blaze-std/src/uuid.rs`): UUID v7 encoding, parsing, and version/variant bits round-trip and preserve timestamp ordering.
+  Controls: `bad_v7_version`.
+- **`property_ws_chunked_round_trip`** *tested* (`crates/blaze-std/src/ws.rs`): chunked WebSocket frame encode/decode round-trips masked and unmasked frames accurately.
+  Controls: `unmasked_decode_bug`.
+- **`property_yaml_round_trip`** *tested* (`crates/blaze-std/src/yaml.rs`): YAML serialization and parsing round-trip structured values including quoted keyword strings.
+  Controls: `unquoted_keyword_strings`.
 
 ### blaze-surface
 

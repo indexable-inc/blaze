@@ -1285,7 +1285,8 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         Ok(TyInfo { repr, size, align, valid })
     }
 
-    /// The ground type of field `field` (of the variant's own numbering) of ADT or tuple `t`.
+    /// The ground type of field `field` (of the variant's own numbering) of ADT, tuple, record or
+    /// structural union `t`.
     fn field_ty(&mut self, t: PTy, variant: u32, field: u32) -> R<'a, PTy> {
         match self.node(t)? {
             PNode::Tuple(l) | PNode::Record(_, l) => self
@@ -1295,6 +1296,17 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 .ok()
                 .and_then(|l| usize::try_from(field).ok().and_then(|i| l.get(i).copied()))
                 .ok_or(malformed("a tuple field past its tuple")),
+            PNode::Union(l) => {
+                if field != 0 {
+                    return Err(malformed("a union variant field other than 0"));
+                }
+                self.ground
+                    .view()
+                    .list(l)
+                    .ok()
+                    .and_then(|l| usize::try_from(variant).ok().and_then(|i| l.get(i).copied()))
+                    .ok_or(malformed("a union variant past its union"))
+            }
             PNode::Adt(key, args) => {
                 let adt = self.world.adt(key).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: key }))?;
                 let v = adt.variants.get(variant as usize).ok_or(malformed("a variant past its ADT"))?;
@@ -1575,7 +1587,16 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         let bits = match facts.tag_at() {
             Some((off, size)) => match self.read(pl.ptr.at(off), size)? {
                 Scalar::Int(bits) => bits,
-                _ => return Err(Stop::Refused(Refusal::PointerAsInt)),
+                Scalar::Ptr(p) => {
+                    self.ensure_loaded(p.alloc)?;
+                    let len = self.work.mem.get(p.alloc)?.len();
+                    if p.offset <= len
+                        && let Some(v) = facts.ptr_variant()
+                    {
+                        return Ok(v);
+                    }
+                    return Err(Stop::Refused(Refusal::PointerAsInt));
+                }
             },
             None => 0,
         };
@@ -2177,6 +2198,23 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     let len = self.ground.view().list(l).map_err(|_| malformed("a list past the ground table"))?.len() as u32;
                     for f in 0..len {
                         let (off, ft) = (self.field_offset(ty, 0, f)?, self.field_ty(ty, 0, f)?);
+                        todo.push((i, base + off, ft));
+                    }
+                }
+                PNode::Union(l) => {
+                    let variants = l.len;
+                    let (mut cx, lay) = self.cx();
+                    let tag = lay.tag(ty, &mut cx)?;
+                    let live = match tag.at {
+                        None if variants == 0 => 0..0,
+                        None => {
+                            let index = tag.variant(0, &[])?;
+                            index..index + 1
+                        }
+                        Some(_) => 0..variants,
+                    };
+                    for v in live {
+                        let (off, ft) = (self.field_offset(ty, v, 0)?, self.field_ty(ty, v, 0)?);
                         todo.push((i, base + off, ft));
                     }
                 }

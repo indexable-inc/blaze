@@ -774,10 +774,15 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut coroutine_witnesses = Vec::with_capacity_in(self.futures.len(), alloc);
         coroutine_witnesses.extend(self.futures.iter().map(|f| (f.expr, f.witness)));
         coroutine_witnesses.sort_unstable_by_key(|r| r.0);
+        let inferred_output = match self.inferred_output_ty {
+            Some(t) => Some(self.export(&mut ex, t, At::Expr(self.body.root))?),
+            None => None,
+        };
         let (reads, needs) = self.reads.finish(alloc);
         Ok(crate::Outcome::Done(Checked {
             findings,
             undecided,
+            inferred_output,
             index_mut,
             suggests,
             hidden,

@@ -557,6 +557,7 @@ mod tests {
         rows
     }
 
+    /// The invariant: CSV formatting and parsing round-trip arbitrary cell values without loss.
     #[test]
     fn property_csv_round_trip() {
         let h = heap();

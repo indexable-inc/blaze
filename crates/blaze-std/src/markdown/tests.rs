@@ -215,6 +215,7 @@ fn enforces_markdown_limits() {
     ));
 }
 
+/// The invariant: hostile markdown respects depth/size limits, escapes HTML script tags, and strips ANSI escapes.
 #[test]
 fn property_hostile_markdown_obeys_limits_escapes_script_and_strips_ansi() {
     let h = heap();

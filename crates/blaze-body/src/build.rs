@@ -508,10 +508,11 @@ impl<A: Allocator + Copy> BodyBuilder<A> {
         let h = FixedState.hash_one((bytes, ty.0));
         let mut k = 0u32;
         while let Some(c) = self.bytes_index.get(&(h, k)).copied() {
-            let w = self.body.consts[c as usize];
-            let (start, len) = (w.a as usize, w.b as usize);
-            if w.ty == ty.0 && self.body.data.get(start..start + len) == Some(bytes) {
-                return Const(c);
+            if let Some(&w) = self.body.consts.get(c as usize) {
+                let (start, len) = (w.a as usize, w.b as usize);
+                if w.ty == ty.0 && self.body.data.get(start..start + len) == Some(bytes) {
+                    return Const(c);
+                }
             }
             k += 1;
         }
@@ -612,7 +613,9 @@ impl<A: Allocator + Copy> BodyBuilder<A> {
             }
             self.body.cases.push(encode_case(value, b));
         }
-        self.body.cases[start..].sort_unstable_by_key(|c| join(c.value));
+        if let Some(slice) = self.body.cases.get_mut(start..) {
+            slice.sort_unstable_by_key(|c| join(c.value));
+        }
         if next(self.body.cases.len(), Table::Cases).is_err() {
             self.fail(BuildError::Full(Table::Cases));
         }
@@ -692,8 +695,10 @@ impl<A: Allocator + Copy> BodyBuilder<A> {
         }
         self.open = Some(b);
         let at = self.body.stmts.len() as u32;
-        self.body.blocks[b.index()].start = at;
-        self.body.blocks[b.index()].end = at;
+        if let Some(slot) = self.body.blocks.get_mut(b.index()) {
+            slot.start = at;
+            slot.end = at;
+        }
     }
 
     fn row(&mut self, kind: StmtKind, span: Span) -> Stmt {
@@ -712,9 +717,13 @@ impl<A: Allocator + Copy> BodyBuilder<A> {
         self.body.stmts.push(encode_stmt(kind));
         self.body.spans.push(span);
         self.body.stmt_block.push(b.0);
-        self.body.blocks[b.index()].end = at.0 + 1;
+        if let Some(slot) = self.body.blocks.get_mut(b.index()) {
+            slot.end = at.0 + 1;
+        }
         if kind.is_terminator() {
-            self.filled[b.index()] = true;
+            if let Some(slot) = self.filled.get_mut(b.index()) {
+                *slot = true;
+            }
             self.open = None;
         }
         at

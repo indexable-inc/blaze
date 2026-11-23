@@ -80,12 +80,18 @@ impl From<FormatError> for OpenError {
     }
 }
 
-/// Writes `body` as a record in `alloc`. Panics when the record would pass 2 GiB;
+/// Writes `body` as a record in `alloc`. Returns an empty buffer if the record would pass 2 GiB;
 /// [`try_encode`] refuses that with a typed error.
 pub fn encode<A: Allocator>(body: &BodyRef<'_>, alloc: A) -> Vec<u8, A> {
-    match try_encode(body, alloc) {
-        Ok(bytes) => bytes,
-        Err(e) => panic!("a body record past the i32 offset's reach: {e:?}"),
+    let mut out = Writer::new(WriterOpts { schema: <BodyRoot as Record>::SCHEMA, alloc: Own(alloc), capacity: None });
+    match write_root(&mut out, body) {
+        Ok(at) => out.finish(at),
+        Err(_) => {
+            let at = out.push(&0u8);
+            let mut bytes = out.finish(at);
+            bytes.clear();
+            bytes
+        }
     }
 }
 

@@ -313,8 +313,155 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
                 self.b.assign(t, Value::Cast { kind, operand: op, ty: to }, span);
                 Ok(Val::Place(t, to))
             }
-            AdjustKind::UnionInject { .. } | AdjustKind::UnionWiden | AdjustKind::RecordProject => self.refuse(Construct::Union, e),
+            AdjustKind::UnionInject { variant } => {
+                let PNode::Union(ul) = self.node(to, At::Expr(e))? else {
+                    return self.refuse(Construct::Malformed, e);
+                };
+                if variant >= ul.len {
+                    return self.refuse(Construct::Malformed, e);
+                }
+                let op = self.use_val(v, e)?;
+                let t = self.temp(e, to, Role::Value)?;
+                let operands = self.b.operands(&[op]);
+                self.b.assign(t, Value::Aggregate { kind: AggregateKind::Adt(variant), ty: to, operands }, span);
+                Ok(Val::Place(t, to))
+            }
+            AdjustKind::UnionWiden => {
+                let from = match v {
+                    Val::Place(_, t) | Val::Op(_, t) => t,
+                };
+                if from == to {
+                    return Ok(v);
+                }
+                let sp = self.to_place(v, e)?;
+                let t = self.temp(e, to, Role::Value)?;
+                self.remap_union(sp, from, to, t, e, span, At::Expr(e))?;
+                Ok(Val::Place(t, to))
+            }
+            AdjustKind::RecordProject => {
+                let from = match v {
+                    Val::Place(_, t) | Val::Op(_, t) => t,
+                };
+                if from == to {
+                    return Ok(v);
+                }
+                let at = At::Expr(e);
+                let PNode::Record(src_schema, _) = self.node(from, at)? else {
+                    return self.refuse(Construct::Malformed, e);
+                };
+                let PNode::Record(dst_schema, dst_list) = self.node(to, at)? else {
+                    return self.refuse(Construct::Malformed, e);
+                };
+                let Some(src_names) = self.tys.record_names(src_schema) else {
+                    return self.refuse(Construct::UnknownField, e);
+                };
+                let Some(dst_names) = self.tys.record_names(dst_schema) else {
+                    return self.refuse(Construct::UnknownField, e);
+                };
+                let dst_tys = self.list(dst_list, at)?;
+                let mut plan: Vec<(u32, PTy), A> = Vec::new_in(self.alloc);
+                for (di, &nm) in dst_names.iter().enumerate() {
+                    let Some(si_usize) = src_names.iter().position(|&sn| sn == nm) else {
+                        return self.refuse(Construct::UnknownField, e);
+                    };
+                    let Ok(si) = u32::try_from(si_usize) else {
+                        return self.refuse(Construct::Malformed, e);
+                    };
+                    let Some(&fty) = dst_tys.get(di) else {
+                        return self.refuse(Construct::Malformed, e);
+                    };
+                    plan.push((si, fty));
+                }
+                let sp = self.to_place(v, e)?;
+                let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc);
+                for &(si, fty) in plan.iter() {
+                    let fp = self.b.project(sp, Proj::Field { index: si, ty: fty });
+                    let op = if self.is_copy(fty, at)? { Operand::Copy(fp) } else { Operand::Move(fp) };
+                    ops.push(op);
+                }
+                let operands = self.b.operands(&ops);
+                let t = self.temp(e, to, Role::Value)?;
+                self.b.assign(t, Value::Aggregate { kind: AggregateKind::Tuple, ty: to, operands }, span);
+                Ok(Val::Place(t, to))
+            }
         }
+    }
+
+    /// Remaps structural union value at `src_place` (of type `src_ty`) into target structural union
+    /// `dst_ty` at `dest`, switching on the source discriminant across members present in both
+    /// (shared by `AdjustKind::UnionWiden` and `UnionPat::Residual`).
+    pub(crate) fn remap_union(
+        &mut self,
+        src_place: Place,
+        src_ty: PTy,
+        dst_ty: PTy,
+        dest: Place,
+        e: ExprId,
+        span: Span,
+        at: At,
+    ) -> Result<(), LowerError> {
+        if src_ty == dst_ty {
+            let op = if self.is_copy(src_ty, at)? { Operand::Copy(src_place) } else { Operand::Move(src_place) };
+            self.b.assign(dest, Value::Use(op), span);
+            return Ok(());
+        }
+        let PNode::Union(src_l) = self.node(src_ty, at)? else {
+            return self.refuse_at(Construct::Malformed, at);
+        };
+        let PNode::Union(dst_l) = self.node(dst_ty, at)? else {
+            return self.refuse_at(Construct::Malformed, at);
+        };
+        let mut src_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        src_members.extend_from_slice(self.list(src_l, at)?);
+        let mut dst_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        dst_members.extend_from_slice(self.list(dst_l, at)?);
+        let mut arms: Vec<(u32, u32, PTy), A> = Vec::new_in(self.alloc);
+        for (i_idx, &sm) in src_members.iter().enumerate() {
+            let Some(j_idx) = dst_members.iter().position(|&dm| dm == sm) else { continue };
+            let Ok(i) = u32::try_from(i_idx) else { return self.refuse_at(Construct::Malformed, at) };
+            let Ok(j) = u32::try_from(j_idx) else { return self.refuse_at(Construct::Malformed, at) };
+            arms.push((i, j, sm));
+        }
+        if src_members.len() == 1 {
+            let Some(&(i, j, sm)) = arms.first() else {
+                self.b.terminate(StmtKind::Unreachable, span);
+                self.dead_block();
+                return Ok(());
+            };
+            let dp = self.b.project(src_place, Proj::Downcast(i));
+            let fp = self.b.project(dp, Proj::Field { index: 0, ty: sm });
+            let op = if self.is_copy(sm, at)? { Operand::Copy(fp) } else { Operand::Move(fp) };
+            let operands = self.b.operands(&[op]);
+            self.b.assign(dest, Value::Aggregate { kind: AggregateKind::Adt(j), ty: dst_ty, operands }, span);
+            return Ok(());
+        }
+        let dty = self.find_ty(PNode::Int(IntTy::Isize), at)?;
+        let discr = self.scratch(e, dty);
+        self.b.assign(discr, Value::Discriminant(src_place), span);
+        let join = self.b.new_block(BlockKind::Normal);
+        let none = self.b.new_block(BlockKind::Normal);
+        let mut cases_vec: Vec<(u128, blaze_body::Block), A> = Vec::new_in(self.alloc);
+        let mut blocks_vec: Vec<(blaze_body::Block, u32, u32, PTy), A> = Vec::new_in(self.alloc);
+        for &(i, j, sm) in arms.iter() {
+            let blk = self.b.new_block(BlockKind::Normal);
+            cases_vec.push((u128::from(i), blk));
+            blocks_vec.push((blk, i, j, sm));
+        }
+        let cases = self.b.cases(&cases_vec);
+        self.b.terminate(StmtKind::Switch { on: Operand::Move(discr), cases, otherwise: none }, span);
+        for &(blk, i, j, sm) in blocks_vec.iter() {
+            self.b.start(blk);
+            let dp = self.b.project(src_place, Proj::Downcast(i));
+            let fp = self.b.project(dp, Proj::Field { index: 0, ty: sm });
+            let op = if self.is_copy(sm, at)? { Operand::Copy(fp) } else { Operand::Move(fp) };
+            let operands = self.b.operands(&[op]);
+            self.b.assign(dest, Value::Aggregate { kind: AggregateKind::Adt(j), ty: dst_ty, operands }, span);
+            self.goto(join, span);
+        }
+        self.b.start(none);
+        self.b.terminate(StmtKind::Unreachable, span);
+        self.b.start(join);
+        Ok(())
     }
 
     /// `*p` for `p` of type `ty`: a reference's or raw pointer's deref, or a `Box`'s.
@@ -549,6 +696,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             Expr::Array { elems } => self.aggregate_into(dest, e, AggregateKind::Array, elems),
             Expr::Repeat { elem, .. } => self.repeat_into(dest, e, elem),
             Expr::Struct { fields, base, .. } => self.struct_into(dest, e, fields, base),
+            Expr::Record { fields, base } => self.record_into(dest, e, fields, base),
             Expr::Closure { .. } => self.closure_into(dest, e),
             Expr::FormatArgs { .. } => self.refuse(Construct::FormatArgs, e),
             Expr::Await(_) => self.refuse(Construct::Await, e),
@@ -1098,6 +1246,71 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         }
         let operands = self.b.operands(&ops);
         self.b.assign(dest, Value::Aggregate { kind: AggregateKind::Adt(variant), ty, operands }, span);
+        Ok(())
+    }
+
+    /// `{ f: x, .. }`: structural record literal / functional update / defaults, lowered as
+    /// `AggregateKind::Tuple` with operands in canonical sorted field order.
+    fn record_into(&mut self, dest: Place, e: ExprId, fields: List, base: blaze_typeck::StructBase) -> Result<(), LowerError> {
+        let span = self.span(e);
+        let at = At::Expr(e);
+        let ty = self.expr_ty(e)?;
+        let PNode::Record(schema, flist) = self.node(ty, at)? else {
+            return self.refuse(Construct::Malformed, e);
+        };
+        let mut slots: Vec<Option<Operand>, A> = Vec::new_in(self.alloc);
+        for _ in 0..flist.len {
+            slots.push(None);
+        }
+        for fi in self.field_inits_in(fields, e)? {
+            let Some(i) = self.tys.record_field_index(schema, fi.name) else {
+                return self.refuse(Construct::UnknownField, fi.expr);
+            };
+            let o = self.operand(fi.expr)?;
+            let Ok(ix) = usize::try_from(i) else { return self.refuse(Construct::UnknownField, fi.expr) };
+            match slots.get_mut(ix) {
+                Some(s) => *s = Some(o),
+                None => return self.refuse(Construct::UnknownField, fi.expr),
+            }
+        }
+        if base == blaze_typeck::StructBase::Defaults {
+            let ck: &'b blaze_typeck::Checked<'c> = self.ck;
+            let (idx, keys) = ck.default_fields_of(e);
+            let (_, tys) = ck.fru_fields_of(e);
+            for (k, (&i, &key)) in idx.iter().zip(keys.iter()).enumerate() {
+                let Some(&fty) = tys.get(k) else { return self.refuse(Construct::Malformed, e) };
+                let o = Operand::Const(self.b.new_const(ConstDecl { kind: ConstKind::Item { key, args: EMPTY }, ty: fty }));
+                let Ok(ix) = usize::try_from(i) else { return self.refuse(Construct::Malformed, e) };
+                match slots.get_mut(ix) {
+                    Some(s) => *s = Some(o),
+                    None => return self.refuse(Construct::Malformed, e),
+                }
+            }
+        }
+        if let Some(b) = base.expr() {
+            let bp = self.place(b)?;
+            let ck: &'b blaze_typeck::Checked<'c> = self.ck;
+            let (idx, tys) = ck.fru_fields_of(e);
+            for (k, &i) in idx.iter().enumerate() {
+                let Some(&fty) = tys.get(k) else { return self.refuse(Construct::Malformed, e) };
+                let fp = self.b.project(bp, Proj::Field { index: i, ty: fty });
+                let o = if self.is_copy(fty, at)? { Operand::Copy(fp) } else { Operand::Move(fp) };
+                let Ok(ix) = usize::try_from(i) else { return self.refuse(Construct::Malformed, e) };
+                match slots.get_mut(ix) {
+                    Some(s) => *s = Some(o),
+                    None => return self.refuse(Construct::Malformed, e),
+                }
+            }
+        }
+        let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc);
+        for s in slots.iter() {
+            match s {
+                Some(o) => ops.push(*o),
+                None => return self.refuse(Construct::UnknownField, e),
+            }
+        }
+        let operands = self.b.operands(&ops);
+        self.b.assign(dest, Value::Aggregate { kind: AggregateKind::Tuple, ty, operands }, span);
         Ok(())
     }
 }
