@@ -485,7 +485,7 @@ fn self_shape(shape: Shape, lib: &dyn Fn(ItemKey) -> Option<LibKey>) -> Result<S
         Shape::Closure => S::Closure,
         Shape::Dynamic(None) => S::DynMarker,
         Shape::Adt(k) | Shape::Foreign(k) | Shape::Dynamic(Some(k)) => S::Def(lib(k)?),
-        Shape::FnDef(_) | Shape::Param | Shape::Opaque(_) | Shape::AnyInt | Shape::AnyFloat => return Err(Unwritten::Shape),
+        Shape::FnDef(_) | Shape::Param | Shape::Opaque(_) | Shape::AnyInt | Shape::AnyFloat | Shape::Record(..) | Shape::Union(_) => return Err(Unwritten::Shape),
     };
     SelfShape::new(written).map_err(Unwritten::Refused)
 }
@@ -604,7 +604,7 @@ fn asked_shapes<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> 
                 put(Shape::Float(x))?;
             }
         }
-        Shape::FnDef(_) | Shape::Param | Shape::Opaque(_) => out.push(SelfShape::PLACEHOLDER),
+        Shape::FnDef(_) | Shape::Param | Shape::Opaque(_) | Shape::Record(..) | Shape::Union(_) => out.push(SelfShape::PLACEHOLDER),
         other => put(other)?,
     }
     Ok(out)

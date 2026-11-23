@@ -866,7 +866,7 @@ pub(super) fn ty_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::
                 }
                 seq.push(Step::Lit(")"));
             }
-            Ok(tc::PNode::Record(l)) => {
+            Ok(tc::PNode::Record(_, l)) => {
                 let kids = list(l);
                 seq.push(Step::Lit("record("));
                 joined(&mut seq, kids, ", ");
@@ -1626,7 +1626,7 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
     let builtin = match self_ty {
         Some(t) => matches!(
             ground.view().node(t).map_err(|error| CheckFail::Check { owner, error })?,
-            tc::PNode::Tuple(_) | tc::PNode::Record(_) | tc::PNode::Closure { .. } | tc::PNode::FnDef(..) | tc::PNode::FnPtr(..)
+            tc::PNode::Tuple(_) | tc::PNode::Record(..) | tc::PNode::Closure { .. } | tc::PNode::FnDef(..) | tc::PNode::FnPtr(..)
         ),
         None => false,
     };
@@ -1799,7 +1799,7 @@ fn holds_param(v: tc::PTys<'_>, args: tc::List) -> Result<bool, tc::CheckError> 
                 work.push(term);
                 Some(l)
             }
-            tc::PNode::Tuple(l) | tc::PNode::Record(l) | tc::PNode::Union(l) | tc::PNode::Adt(_, l) | tc::PNode::FnDef(_, l) | tc::PNode::FnPtr(l, _) | tc::PNode::Dynamic(l) | tc::PNode::ExTrait(_, l) => Some(l),
+            tc::PNode::Tuple(l) | tc::PNode::Record(_, l) | tc::PNode::Union(l) | tc::PNode::Adt(_, l) | tc::PNode::FnDef(_, l) | tc::PNode::FnPtr(l, _) | tc::PNode::Dynamic(l) | tc::PNode::ExTrait(_, l) => Some(l),
         };
         if let Some(l) = lists {
             work.extend_from_slice(v.list(l)?);

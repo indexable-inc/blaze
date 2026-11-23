@@ -362,12 +362,12 @@ impl World {
             PNode::Array(i, k) => PNode::Array(self.import(from, i), self.import(from, k)),
             PNode::ConstValue { ty, bits } => PNode::ConstValue { ty: self.import(from, ty), bits },
             PNode::Slice(i) => PNode::Slice(self.import(from, i)),
-            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => {
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
                 let ts: StdVec<PTy> = from.list(l).expect("list").to_vec();
                 let ts: StdVec<PTy> = ts.into_iter().map(|x| self.import(from, x)).collect();
                 let list = self.fx.list(&ts);
                 match n {
-                    PNode::Record(_) => PNode::Record(list),
+                    PNode::Record(s, _) => PNode::Record(s, list),
                     PNode::Union(_) => PNode::Union(list),
                     _ => PNode::Tuple(list),
                 }

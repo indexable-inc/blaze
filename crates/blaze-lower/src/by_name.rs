@@ -13,7 +13,7 @@
 
 use blaze_expand::{
     BuiltinDerive, BuiltinFn, Call, CallSite, Ctx, DefAt, DefSite, DeriveFacts, Eager, ExpandCx, Expanded, Export, Inside, LocalInner,
-    LexError, MacroDefinition, NestedKind, Prepared, ProcKind, Reads, StreamError, TokenKind, TokenStream, call_key, expand, expand_prepared, lex, prepare,
+    LexError, MacroDefinition, NestedCall, NestedKind, Prepared, ProcKind, Reads, StreamError, TokenKind, TokenStream, call_key, expand, expand_prepared, lex, prepare,
 };
 use blaze_ids::ContentId;
 use blaze_own::{AString, AVec, Alloc, Vec};
@@ -556,19 +556,18 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
         }
     }
 
-    /// Expands `name!(input)`: its key and its expansion's tokens.
-    fn call(
-        &mut self,
+    /// One frame on [`ByName::call`]'s explicit eager-expansion stack.
+    fn call_frame(
+        &self,
         path: &str,
         at: PathAt,
-        input: &TokenStream<'_>,
+        input: TokenStream<'a>,
         edition: Edition,
         inside: Inside,
         depth: u32,
         locals: &[LocalMacro<'_>],
-        mut cfg: Option<&mut (dyn crate::Cfg + '_)>,
         written: Option<u32>,
-    ) -> Result<(ContentId, TokenStream<'a>), Refused<'a>> {
+    ) -> Result<CallFrame<'d, 'a>, Refused<'a>> {
         // `panic!` takes the edition of the code that writes it: a path a macro wrote carries
         // its definition's mark, whose edition is the defining crate's (the token was read in
         // it). Gap: rustc's `use_panic_2021` skips macros under
@@ -583,29 +582,83 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
             Some(def) => Resolved::Def(def?),
             None => self.resolve(path, at, ProcKind::FnLike).map_err(Refused::Unknown)?,
         };
-        let (def, prepared) = match &resolved {
-            Resolved::Def(def) => (def, None),
-            Resolved::Prepared(prepared) => (prepared.def(), Some(*prepared)),
-        };
-        let mut answers: AVec<'a, TokenStream<'a>> = Vec::new_in(self.alloc);
+        Ok(CallFrame {
+            input,
+            site,
+            resolved,
+            inside,
+            depth,
+            written,
+            answers: Vec::new_in(self.alloc),
+            pending: Vec::new_in(self.alloc),
+        })
+    }
+
+    /// Expands `name!(input)`: its key and its expansion's tokens.
+    fn call(
+        &mut self,
+        path: &str,
+        at: PathAt,
+        input: TokenStream<'a>,
+        edition: Edition,
+        inside: Inside,
+        depth: u32,
+        locals: &[LocalMacro<'_>],
+        mut cfg: Option<&mut (dyn crate::Cfg + '_)>,
+        written: Option<u32>,
+    ) -> Result<(ContentId, TokenStream<'a>), Refused<'a>> {
+        let mut parents: AVec<'a, CallFrame<'d, 'a>> = Vec::new_in(self.alloc);
+        let mut current = self.call_frame(path, at, input, edition, inside, depth, locals, written)?;
         loop {
-            let refs: AVec<'_, &TokenStream<'_>> = {
-                let mut refs = Vec::with_capacity_in(answers.len(), self.alloc);
-                refs.extend(answers.iter());
-                refs
-            };
-            let call = Call {
-                kind: blaze_expand::CallKind::FnLike { args: input },
-                site,
-                eager: Eager { inside, answers: &refs },
-            };
-            let key = call_key(def, &call).0;
-            let result = match cfg.as_deref_mut() {
-                Some(cfg) => {
-                    let cx = BodyCx { host: &self.cx, cfg: core::cell::RefCell::new(cfg), alloc: self.alloc, written };
-                    expand_with(def, prepared, &call, &cx, self.alloc)
+            if let Some(n) = current.pending.pop() {
+                if n.kind != NestedKind::FnLike {
+                    return Err(Refused::Failed(Failure::EagerNotFnLike { kind: n.kind }));
                 }
-                None => expand_with(def, prepared, &call, &self.cx, self.alloc),
+                let child_path = path_text(&current.input, n.path.start, n.path.end, self.alloc);
+                let inner = n.inner();
+                let args = current
+                    .input
+                    .copy_in(inner.start as usize..inner.end as usize, self.alloc)
+                    .map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                let child_at = PathAt::of(&current.input, n.path.start);
+                let child = self.call_frame(
+                    &child_path,
+                    child_at,
+                    args,
+                    edition,
+                    Inside::EagerInput,
+                    current.depth + 1,
+                    locals,
+                    current.written,
+                )?;
+                parents.push(current);
+                current = child;
+                continue;
+            }
+            let (key, result) = {
+                let (def, prepared) = match &current.resolved {
+                    Resolved::Def(def) => (def, None),
+                    Resolved::Prepared(prepared) => (prepared.def(), Some(*prepared)),
+                };
+                let refs: AVec<'_, &TokenStream<'_>> = {
+                    let mut refs = Vec::with_capacity_in(current.answers.len(), self.alloc);
+                    refs.extend(current.answers.iter());
+                    refs
+                };
+                let call = Call {
+                    kind: blaze_expand::CallKind::FnLike { args: &current.input },
+                    site: current.site,
+                    eager: Eager { inside: current.inside, answers: &refs },
+                };
+                let key = call_key(def, &call).0;
+                let result = match cfg.as_deref_mut() {
+                    Some(cfg) => {
+                        let cx = BodyCx { host: &self.cx, cfg: core::cell::RefCell::new(cfg), alloc: self.alloc, written: current.written };
+                        expand_with(def, prepared, &call, &cx, self.alloc)
+                    }
+                    None => expand_with(def, prepared, &call, &self.cx, self.alloc),
+                };
+                (key, result)
             };
             match result {
                 // An expansion's reads join the body's list whether it succeeded or ended in
@@ -617,30 +670,37 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                         let text = diagnostic_text(diagnostic, &exp.notes, self.alloc);
                         return Err(Refused::Failed(Failure::Diagnostic { diagnostic: *diagnostic, text }));
                     }
-                    return Ok((key, exp.tokens));
-                }
-                Ok(Expanded::NeedsExpanded(nested)) if answers.is_empty() && depth < EAGER_DEPTH => {
-                    for n in nested.iter() {
-                        if n.kind != NestedKind::FnLike {
-                            return Err(Refused::Failed(Failure::EagerNotFnLike { kind: n.kind }));
+                    match parents.pop() {
+                        Some(mut parent) => {
+                            let mut tokens = exp.tokens;
+                            tokens.seal(key);
+                            parent.answers.push(tokens);
+                            current = parent;
                         }
-                        let path = path_text(input, n.path.start, n.path.end, self.alloc);
-                        let inner = n.inner();
-                        let args = input
-                            .copy_in(inner.start as usize..inner.end as usize, self.alloc)
-                            .map_err(|e| Refused::Failed(Failure::Stream(e)))?;
-                        let at = PathAt::of(input, n.path.start);
-                        let (key, mut tokens) =
-                            self.call(&path, at, &args, edition, Inside::EagerInput, depth + 1, locals, cfg.as_deref_mut(), written)?;
-                        tokens.seal(key);
-                        answers.push(tokens);
+                        None => return Ok((key, exp.tokens)),
                     }
                 }
-                Ok(Expanded::NeedsExpanded(_)) => return Err(Refused::Failed(Failure::EagerAgain { depth })),
+                Ok(Expanded::NeedsExpanded(mut nested)) if current.answers.is_empty() && current.depth < EAGER_DEPTH => {
+                    nested.reverse();
+                    current.pending = nested;
+                }
+                Ok(Expanded::NeedsExpanded(_)) => return Err(Refused::Failed(Failure::EagerAgain { depth: current.depth })),
                 Err(e) => return Err(Refused::Failed(Failure::Expand(e))),
             }
         }
     }
+}
+
+/// One frame on [`ByName::call`]'s eager-input stack.
+struct CallFrame<'d, 'a> {
+    input: TokenStream<'a>,
+    site: CallSite,
+    resolved: Resolved<'d, 'a>,
+    inside: Inside,
+    depth: u32,
+    written: Option<u32>,
+    answers: AVec<'a, TokenStream<'a>>,
+    pending: AVec<'a, NestedCall>,
 }
 
 /// The body's `macro` whose trees after its name are `trees`, defined `at`: `(params) { body }`
@@ -759,7 +819,7 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         let at = PathAt { mark: path_mark, written: None, block: None };
         let result = self
             .input(CallInput::Text(input), input_marks, edition)
-            .and_then(|input| self.call(path, at, &input, edition, Inside::Plain, 0, &[], Some(cfg), None));
+            .and_then(|input| self.call(path, at, input, edition, Inside::Plain, 0, &[], Some(cfg), None));
         match result {
             Ok((key, tokens)) => {
                 out.key = key;
@@ -797,7 +857,7 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         let before = self.reads.list().len();
         let result = self
             .input(call.input, call.input_marks, call.edition)
-            .and_then(|input| self.call(call.path, at, &input, call.edition, Inside::Plain, 0, call.locals, Some(cfg), None));
+            .and_then(|input| self.call(call.path, at, input, call.edition, Inside::Plain, 0, call.locals, Some(cfg), None));
         // Its reads (an eager input's nested calls' included) joined on success and on the
         // call's error alike (`call`): placed at this call.
         self.note_reads(Some(call.range), call.path, blaze_surface::CallShape::FnLike, before);

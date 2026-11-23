@@ -401,7 +401,10 @@ fn head(node: PNode, out: &mut AVec<'_, u8>) -> Result<(), SymbolError> {
         PNode::Str => out.push(5),
         PNode::Never => out.push(6),
         PNode::Tuple(_) => out.push(7),
-        PNode::Record(_) => out.push(25),
+        PNode::Record(s, _) => {
+            out.push(25);
+            out.extend_from_slice(&s.0.to_le_bytes());
+        }
         PNode::Union(_) => out.push(26),
         PNode::Ref(m, _) => out.extend_from_slice(&[8, m as u8]),
         PNode::Ptr(m, _) => out.extend_from_slice(&[9, m as u8]),
@@ -546,7 +549,7 @@ fn decode_forest(r: &mut Reader<'_>, ground: &mut PortableTys<'_>, scratch: Allo
         let tag = r.u8()?;
         let (mut wide, mut name_part, mut ordinal) = (0u128, 0u64, 0u32);
         match tag {
-            0 | 1 | 5 | 6 | 7 | 10 | 11 | 15 | 16 | 25 | 26 => {}
+            0 | 1 | 5 | 6 | 7 | 10 | 11 | 15 | 16 | 26 => {}
             2 | 3 | 4 | 8 | 9 | 21 => wide = u128::from(r.u8()?),
             12 | 13 | 14 | 17 | 19 | 24 => wide = r.u128()?,
             18 => {
@@ -557,6 +560,7 @@ fn decode_forest(r: &mut Reader<'_>, ground: &mut PortableTys<'_>, scratch: Allo
                 wide = r.u128()?;
                 ordinal = r.u32()?;
             }
+            25 => name_part = r.u64()?,
             _ => return Err(SymbolError::UnknownTag { tag, at }),
         }
         let want = r.count(REF)?;
@@ -645,7 +649,7 @@ fn intern_node(o: Open, kids: &[PTy], ground: &mut PortableTys<'_>) -> Result<PT
         }
         23 => PNode::Coroutine { owner: ItemKey(o.wide), ordinal: o.ordinal, args: list(ground, kids)? },
         24 => exactly(0).map(|()| PNode::Foreign(ItemKey(o.wide)))?,
-        25 => PNode::Record(list(ground, kids)?),
+        25 => PNode::Record(blaze_typeck::RecordSchema(o.name), list(ground, kids)?),
         26 => PNode::Union(list(ground, kids)?),
         tag => return Err(SymbolError::UnknownTag { tag, at: 0 }),
     };

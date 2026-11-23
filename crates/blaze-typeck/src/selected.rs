@@ -142,7 +142,7 @@ pub(crate) fn may_relate(tys: PTys<'_>, roots: &[PTy], alloc: Alloc<'_>) -> Resu
             | PNode::ConstParam(_) | PNode::ConstValue { .. } | PNode::ExAuto(_) => {}
             // An extern type has no generics, so no region.
             PNode::Foreign(_) => {}
-            PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Array(..) | PNode::Slice(_) | PNode::Ptr(..) | PNode::Pat(..) => tys.children_of(node, &mut stack)?,
+            PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Array(..) | PNode::Slice(_) | PNode::Ptr(..) | PNode::Pat(..) => tys.children_of(node, &mut stack)?,
             PNode::Ref(..) | PNode::Dynamic(_) | PNode::Param(_) | PNode::Adt(..) | PNode::FnDef(..) | PNode::FnPtr(..)
             | PNode::Closure { .. } | PNode::Coroutine { .. } | PNode::Future(..) | PNode::Opaque(..) | PNode::Alias { .. }
             | PNode::ExTrait(..) | PNode::ExProj { .. } | PNode::Infer | PNode::Error => return Ok(true),

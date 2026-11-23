@@ -1022,7 +1022,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             PNode::Int(i) => Repr::Int { ty: int_ty(i)?, signed: true },
             PNode::Uint(u) => Repr::Int { ty: uint_ty(u)?, signed: false },
             PNode::Never | PNode::FnDef(..) => Repr::None,
-            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) if l.len == 0 => Repr::None,
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) if l.len == 0 => Repr::None,
             PNode::Future(..) => {
                 return Err(TyErr::Unsupported(
                     "an async block's future named by its expression in a ground type (only its identity, `PNode::Coroutine`, crosses a body: coroutine.rs)",
@@ -1030,7 +1030,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             }
             // A closure: a struct of one field, its environment (closure.rs). A coroutine: its
             // state, whose first bytes are its upvars (coroutine.rs).
-            PNode::Adt(..) | PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Array(..) | PNode::Closure { .. } | PNode::Coroutine { .. } => {
+            PNode::Adt(..) | PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Array(..) | PNode::Closure { .. } | PNode::Coroutine { .. } => {
                 let l = self.layout(g)?;
                 // An unsized tail's struct is only ever behind a pointer (walk/unsized_tail.rs).
                 if self.has_unsized_tail(l) {
@@ -1130,7 +1130,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         Ok(match node {
             // A coroutine's state holds its tag at least (coroutine.rs).
             PNode::Adt(..) | PNode::Array(..) | PNode::Coroutine { .. } => true,
-            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => l.len > 0,
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => l.len > 0,
             // Its environment is a tuple: an aggregate when it captures something.
             PNode::Closure { .. } => {
                 let env = self.closure_parts(g)?.env;
@@ -1312,7 +1312,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     parts.push((Name(0), ptr));
                     parts.push((Name(1), len));
                 }
-                PNode::Tuple(l) | PNode::Record(l) => {
+                PNode::Tuple(l) | PNode::Record(_, l) => {
                     let elems = self.ground.view().list(l).map_err(|_| TyErr::Malformed("a list past the ground table"))?;
                     for (i, &et) in elems.iter().enumerate() {
                         parts.push((Name(u64::try_from(i).map_err(|_| TyErr::Malformed("too many fields"))?), et));

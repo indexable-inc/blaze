@@ -1280,7 +1280,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         let view = cx.ground.view();
         let node = view.node(t).map_err(|_| Refusal::Malformed("a type past the ground table"))?;
         match node {
-            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => out.extend_from_slice(view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?),
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => out.extend_from_slice(view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?),
             PNode::Array(e, _) | PNode::Slice(e) | PNode::Pat(e, _) => out.push(e),
             // A closure (codegen.md, "Closures and the Fn traits"): a struct of one field, its
             // environment, a fact of its identity grounded at the owner's arguments.
@@ -1497,7 +1497,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                     discrs: (0, 0),
                 }
             }
-            PNode::Tuple(_) | PNode::Record(_) | PNode::Closure { .. } => {
+            PNode::Tuple(_) | PNode::Record(..) | PNode::Closure { .. } => {
                 let u = self.univariant(parts, Order::Decreasing, ReprAttrs::RUST, 0, 0, cx.scratch)?;
                 self.struct_row(t, u)
             }
@@ -1678,7 +1678,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 PNode::Str => return Ok(Some(Tail::Slice { stride: 1 })),
                 PNode::Slice(_) => return Ok(Some(Tail::Slice { stride: 0 })),
                 PNode::Dynamic(_) => return Ok(Some(Tail::Dyn)),
-                PNode::Tuple(l) | PNode::Record(l) => match view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?.last() {
+                PNode::Tuple(l) | PNode::Record(_, l) => match view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?.last() {
                     Some(&last) => p = last,
                     None => return Ok(None),
                 },

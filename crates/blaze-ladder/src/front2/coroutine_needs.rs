@@ -79,7 +79,7 @@ pub(crate) fn held_coroutines<'a>(
             // An extern type: no fields, and never held by value (it has no size).
             | PNode::Foreign(_)
             | PNode::ConstValue { .. } => {}
-            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => todo.extend_from_slice(ground.view().list(l).map_err(past)?),
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => todo.extend_from_slice(ground.view().list(l).map_err(past)?),
             // The element; the length is a constant.
             PNode::Array(element, _) => todo.push(element),
             // A pattern type is held as its base.

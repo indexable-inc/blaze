@@ -433,7 +433,7 @@ pub fn copy_ground(from: PTys<'_>, args: &[PTy], into: &mut PortableTys<'_>, scr
                 PNode::ConstValue { ty, bits } => PNode::ConstValue { ty: m(ty)?, bits },
                 n @ (PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str | PNode::Never) => n,
                 PNode::Tuple(l) => PNode::Tuple(map_list(l, &mut list)?),
-                PNode::Record(l) => PNode::Record(map_list(l, &mut list)?),
+                PNode::Record(s, l) => PNode::Record(s, map_list(l, &mut list)?),
                 PNode::Union(l) => PNode::Union(map_list(l, &mut list)?),
                 PNode::Ref(mu, t) => PNode::Ref(mu, m(t)?),
                 PNode::Ptr(mu, t) => PNode::Ptr(mu, m(t)?),

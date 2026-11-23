@@ -232,7 +232,7 @@ fn field_row<'a, F: Arity + ?Sized>(tys: tc::PTys<'_>, root: tc::PTy, arity: &F,
         match node {
             tc::PNode::Ref(_, inner) | tc::PNode::Ptr(_, inner) | tc::PNode::Slice(inner) | tc::PNode::Pat(inner, _) | tc::PNode::Array(inner, _) => stack.push(inner),
             // A fn pointer's positions are its inputs' then its output's (lane B15), as a tuple's.
-            tc::PNode::Tuple(l) | tc::PNode::Record(l) | tc::PNode::Union(l) | tc::PNode::FnPtr(l, _) | tc::PNode::Adt(_, l) => {
+            tc::PNode::Tuple(l) | tc::PNode::Record(_, l) | tc::PNode::Union(l) | tc::PNode::FnPtr(l, _) | tc::PNode::Adt(_, l) => {
                 for &a in tys.list(l).map_err(table)?.iter().rev() {
                     stack.push(a);
                 }

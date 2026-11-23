@@ -630,7 +630,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             Resolved::Unbound { param, .. } => return Err(self.malformed(s.ty, Bad::Unconstrained { index: param })),
         };
         let n = self.node(s)?;
-        let descend = matches!(n, PNode::Ref(..) | PNode::Ptr(..) | PNode::Slice(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Adt(..));
+        let descend = matches!(n, PNode::Ref(..) | PNode::Ptr(..) | PNode::Slice(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Adt(..));
         if !descend {
             return Ok(());
         }
@@ -991,7 +991,8 @@ pub fn head_eq(a: PNode, b: PNode) -> bool {
         (PNode::Int(x), PNode::Int(y)) => x == y,
         (PNode::Uint(x), PNode::Uint(y)) => x == y,
         (PNode::Float(x), PNode::Float(y)) => x == y,
-        (PNode::Tuple(_), PNode::Tuple(_)) | (PNode::Record(_), PNode::Record(_)) | (PNode::Union(_), PNode::Union(_)) | (PNode::Slice(_), PNode::Slice(_)) | (PNode::Dynamic(_), PNode::Dynamic(_)) => true,
+        (PNode::Tuple(_), PNode::Tuple(_)) | (PNode::Union(_), PNode::Union(_)) | (PNode::Slice(_), PNode::Slice(_)) | (PNode::Dynamic(_), PNode::Dynamic(_)) => true,
+        (PNode::Record(s1, _), PNode::Record(s2, _)) => s1 == s2,
         (PNode::Ref(m, _), PNode::Ref(n, _)) | (PNode::Ptr(m, _), PNode::Ptr(n, _)) => m == n,
         // The length is a const: equal by the type checker.
         (PNode::Array(..), PNode::Array(..)) | (PNode::Pat(..), PNode::Pat(..)) => true,

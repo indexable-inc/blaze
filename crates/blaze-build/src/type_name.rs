@@ -154,7 +154,7 @@ fn node<A: Allocator>(tys: PTys<'_>, t: PTy, out: &mut String<A>, seq: &mut Vec<
             // A one-tuple keeps its comma: `(u8,)`.
             text(seq, if parts.len() == 1 { ",)" } else { ")" });
         }
-        PNode::Record(l) => {
+        PNode::Record(_, l) => {
             let parts = list(l)?;
             text(seq, "record(");
             for (k, &p) in parts.iter().enumerate() {

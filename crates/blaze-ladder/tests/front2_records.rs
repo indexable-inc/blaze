@@ -378,7 +378,7 @@ fn terms(t: blaze_typeck::PTys<'_>, roots: &[blaze_typeck::PTy]) -> String {
         let list = |l| t.list(l).map(|s| s.to_vec()).unwrap_or_default();
         let (shown, kids): (String, Vec<blaze_typeck::PTy>) = match node {
             PNode::Tuple(l) => ("Tuple".to_string(), list(l)),
-            PNode::Record(l) => ("Record".to_string(), list(l)),
+            PNode::Record(s, l) => (format!("Record({s:?})"), list(l)),
             PNode::Union(l) => ("Union".to_string(), list(l)),
             PNode::Ref(m, x) => (format!("Ref({m:?})"), vec![x]),
             PNode::Ptr(m, x) => (format!("Ptr({m:?})"), vec![x]),

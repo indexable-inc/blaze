@@ -125,6 +125,10 @@ pub mod ty {
     pub const EX_PROJECTION: u8 = 41;
     /// `a`: the auto trait.
     pub const EX_AUTO: u8 = 42;
+    /// A structural record: `a` the sorted field types (a list); `b` the schema hash (a scalar).
+    pub const RECORD: u8 = 43;
+    /// A structural tagged union: `a` the canonical member types (a list).
+    pub const UNION: u8 = 44;
 
     /// Predicates. `a`: the trait; `b`: its arguments, `Self` first.
     pub const P_TRAIT: u8 = 48;
@@ -203,14 +207,15 @@ pub mod ct {
 }
 
 const fn ty_desc(kind: u8) -> Desc {
-    use Role::{Child, Def, None, Raw};
+    use Role::{Child, Def, None, Raw, Scalar};
     match kind {
         ty::BOOL | ty::CHAR | ty::STR | ty::NEVER => Desc::new(None, None, false, 0),
         ty::INT | ty::UINT | ty::FLOAT => Desc::new(Raw, None, false, 0),
         ty::ADT | ty::FN_DEF => Desc::new(Def, Child, false, 0),
         ty::FOREIGN => Desc::new(Def, None, false, 0),
         ty::ARRAY | ty::REF | ty::REF_MUT => Desc::new(Child, Child, false, 0),
-        ty::SLICE | ty::PTR | ty::PTR_MUT | ty::TUPLE => Desc::new(Child, None, false, 0),
+        ty::SLICE | ty::PTR | ty::PTR_MUT | ty::TUPLE | ty::UNION => Desc::new(Child, None, false, 0),
+        ty::RECORD => Desc::new(Child, Scalar, false, 0),
         ty::FN_PTR => Desc::new(Child, Raw, true, 0),
         ty::DYNAMIC | ty::PAT => Desc::new(Child, Child, false, 0),
         ty::CLOSURE => Desc::new(Def, Child, false, 0),
@@ -301,7 +306,7 @@ pub(crate) fn valid(tag: u32, kind: u8) -> bool {
     match tag {
         crate::ids::TAG_TY => {
             kind <= ty::PAT
-                || (kind >= ty::EX_TRAIT && kind <= ty::EX_AUTO)
+                || (kind >= ty::EX_TRAIT && kind <= ty::UNION)
                 || (kind >= ty::P_TRAIT && kind <= ty::P_AMBIGUOUS)
         }
         crate::ids::TAG_REGION => ix8(kind) < re::COUNT,
@@ -330,7 +335,7 @@ pub(crate) const fn child_classes(tag: u32, kind: u8, b: bool) -> u8 {
         (ty::PAT, false) => T,
         (ty::PAT, true) => L,
         (ty::REF | ty::REF_MUT | ty::DYNAMIC, true) => R,
-        (ty::FN_PTR | ty::DYNAMIC | ty::TUPLE, false) => L,
+        (ty::FN_PTR | ty::DYNAMIC | ty::TUPLE | ty::RECORD | ty::UNION, false) => L,
         (ty::P_PROJECTION | ty::P_ALIAS_EQ | ty::P_NORMALIZES_TO, _) => T | C,
         (ty::P_WELL_FORMED, false) => ARG,
         (ty::P_REGION_OUTLIVES, _) => R,

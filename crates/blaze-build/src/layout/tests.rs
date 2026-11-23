@@ -915,7 +915,7 @@ fn record_and_union_layouts() {
 
     // PNode::Record([u64, u8]) -> size 16, align 8
     let rec_list = g.t.intern_list(&[u64_t, u8_t]).unwrap();
-    let rec_ty = g.n(PNode::Record(rec_list));
+    let rec_ty = g.n(PNode::Record(blaze_typeck::RecordSchema::EMPTY, rec_list));
     let rec_id = lay(&w, &mut g, &mut ls, rec_ty).unwrap();
     assert_eq!(size_align(&ls, rec_id), (16, 8));
     assert!(!ls.get(rec_id).uninhabited);

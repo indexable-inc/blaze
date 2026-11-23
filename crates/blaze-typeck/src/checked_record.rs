@@ -36,7 +36,7 @@ use blaze_own::{Alloc, Soa, Vec};
 
 use crate::columns::{AdjustKind, CaptureKind, Checked, CoroutineWitness, SigFrom};
 use crate::error::CheckError;
-use crate::ids::{ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, LangItem, List, Mutbl, Name, PatId, PathIdx, ScopeId, UintTy};
+use crate::ids::{ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, LangItem, List, Mutbl, Name, PatId, PathIdx, RecordSchema, ScopeId, UintTy};
 use crate::portable::{PNode, PTy, PortableTys};
 use crate::rules::suggest::Suggests;
 use crate::selected::{Projected, Selected};
@@ -578,8 +578,9 @@ fn put_node(p: &mut Put, n: PNode) {
             p.u8(30);
             p.key(k);
         }
-        PNode::Record(l) => {
+        PNode::Record(s, l) => {
             p.u8(31);
+            p.u64(s.0);
             p.list(l);
         }
         PNode::Union(l) => {
@@ -675,7 +676,7 @@ fn get_node(g: &mut Get<'_>, b: Bounds) -> Result<PNode, E> {
         28 => PNode::ExProj { trait_: g.key()?, name: Name(g.u64()?), args: b.list(g)?, term: b.ty(g, me)? },
         29 => PNode::ExAuto(g.key()?),
         30 => PNode::Foreign(g.key()?),
-        31 => PNode::Record(b.list(g)?),
+        31 => PNode::Record(RecordSchema(g.u64()?), b.list(g)?),
         32 => PNode::Union(b.list(g)?),
         _ => return Err(g.bad(tag)),
     })
@@ -878,6 +879,17 @@ fn put_shape(p: &mut Put, s: Shape) {
         }
         Shape::AnyInt => p.u8(21),
         Shape::AnyFloat => p.u8(22),
+        Shape::Record(s, n) => {
+            p.u8(23);
+            p.u8(0);
+            p.u64(s);
+            p.u32(n);
+        }
+        Shape::Union(n) => {
+            p.u8(24);
+            p.u8(0);
+            p.u32(n);
+        }
     }
     p.to(start + SHAPE);
 }
@@ -914,6 +926,8 @@ fn get_shape(g: &mut Get<'_>) -> Result<Shape, E> {
         }
         21 => Shape::AnyInt,
         22 => Shape::AnyFloat,
+        23 => Shape::Record(g.u64()?, g.u32()?),
+        24 => Shape::Union(g.u32()?),
         _ => return Err(g.bad(tag)),
     };
     g.to(start + SHAPE);

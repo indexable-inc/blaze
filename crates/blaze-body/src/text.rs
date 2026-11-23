@@ -266,8 +266,8 @@ fn ty_node<W: Write>(w: &mut W, n: PNode) -> fmt::Result {
             w.write_str("tuple ")?;
             list(w, l)
         }
-        PNode::Record(l) => {
-            w.write_str("record ")?;
+        PNode::Record(s, l) => {
+            write!(w, "record s{:x} ", s.0)?;
             list(w, l)
         }
         PNode::Union(l) => {
@@ -810,7 +810,10 @@ impl<A: Allocator + Copy> Parser<A> {
             "infer" => PNode::Infer,
             "error" => PNode::Error,
             "tuple" => PNode::Tuple(Self::list(c)?),
-            "record" => PNode::Record(Self::list(c)?),
+            "record" => {
+                let s = blaze_typeck::RecordSchema(u64::try_from(Self::hex(c, "s")?).map_err(|_| c.err(ParseWhat::Number))?);
+                PNode::Record(s, Self::list(c)?)
+            }
             "union" => PNode::Union(Self::list(c)?),
             "ref" => {
                 let m = match c.keyword("mut") {

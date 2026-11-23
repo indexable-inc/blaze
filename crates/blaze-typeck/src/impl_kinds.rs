@@ -68,7 +68,7 @@ pub(crate) fn impl_var_kinds<'a>(h: &ImplHeader<'_>, alloc: Alloc<'a>) -> Result
                 None => return Err(CheckError::Malformed(Malformed::Sort { node: t.0 })),
             },
             PNode::Tuple(l)
-            | PNode::Record(l)
+            | PNode::Record(_, l)
             | PNode::Union(l)
             | PNode::Adt(_, l)
             | PNode::FnDef(_, l)

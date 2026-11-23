@@ -127,7 +127,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut t = t;
         for _ in 0..Self::TAIL_DEPTH {
             let next = match self.view(t) {
-                TyView::Tuple(l) | TyView::Record(l) => match self.ty.list_len(l) {
+                TyView::Tuple(l) | TyView::Record(_, l) => match self.ty.list_len(l) {
                     0 => return Ok(t),
                     n => self.ty.list_get(l, n - 1),
                 },

@@ -188,6 +188,16 @@ impl Printer<'_, '_> {
                 self.list(l, 0, len, ", ");
                 self.push(Text("("));
             }
+            TyKind::Record(_, l) => {
+                let len = self.tys.list_len(l);
+                self.push(Text("}"));
+                self.list(l, 0, len, ", ");
+                self.push(Text("{"));
+            }
+            TyKind::Union(l) => {
+                let len = self.tys.list_len(l);
+                self.list(l, 0, len, " | ");
+            }
             // Rigid aliases print as the others: rigidness is the solver's knowledge.
             TyKind::Alias { kind, rigid: _, def, args } => {
                 match kind {

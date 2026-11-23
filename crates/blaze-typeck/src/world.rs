@@ -48,6 +48,8 @@ pub enum Shape {
     Str,
     Never,
     Tuple(u32),
+    Record(u64, u32),
+    Union(u32),
     Ref(Mutbl),
     Ptr(Mutbl),
     Array,

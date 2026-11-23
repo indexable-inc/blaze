@@ -281,6 +281,8 @@ pub enum TyKind {
     Coroutine(Def, List),
     CoroutineWitness(Def, List),
     Tuple(List),
+    Record(u64, List),
+    Union(List),
     Alias { kind: AliasKind, rigid: bool, def: Def, args: List },
     Param(u32),
     Bound(u32, u32),
@@ -836,6 +838,11 @@ impl<'a> Tys<'a> {
             ty::COROUTINE => TyKind::Coroutine(Def(a), nb.list()),
             ty::CORO_WITNESS => TyKind::CoroutineWitness(Def(a), nb.list()),
             ty::TUPLE => TyKind::Tuple(na.list()),
+            ty::RECORD => {
+                let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = self.scalar_value(b).to_le_bytes();
+                TyKind::Record(u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]), na.list())
+            }
+            ty::UNION => TyKind::Union(na.list()),
             ty::PARAM => TyKind::Param(a),
             ty::BOUND => TyKind::Bound(a, b),
             ty::CANONICAL => TyKind::Canonical(a),
@@ -1001,6 +1008,17 @@ impl<'a> Tys<'a> {
     /// A tuple of the list's types (the list must hold types only).
     pub fn tuple(&mut self, fields: List) -> Ty {
         self.intern_ty(ty::TUPLE, fields.node().bits(), 0)
+    }
+
+    /// A structural record of canonical schema hash `schema` and sorted field types `fields`.
+    pub fn record(&mut self, schema: u64, fields: List) -> Ty {
+        let s = self.scalar(u128::from(schema));
+        self.intern_ty(ty::RECORD, fields.node().bits(), s)
+    }
+
+    /// A structural tagged union of canonical member types `members`.
+    pub fn union(&mut self, members: List) -> Ty {
+        self.intern_ty(ty::UNION, members.node().bits(), 0)
     }
 
     pub fn tuple_of(&mut self, fields: &[Ty]) -> Ty {

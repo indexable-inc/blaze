@@ -36,7 +36,7 @@
 //! length), every word a form leaves unused [`NONE`].
 #![blaze::sans_io]
 
-use blaze_typeck::{FloatTy, FnPtrHeader, IntTy, Name, PNode, UintTy};
+use blaze_typeck::{FloatTy, FnPtrHeader, IntTy, Name, PNode, RecordSchema, UintTy};
 
 use crate::body::{
     AggregateKind, AssertKind, BinOp, BlockKind, BlockRow, BorrowKind, Block, Callee, CalleeId,
@@ -902,8 +902,9 @@ pub fn encode_ty(n: PNode) -> TyWords {
             put_list(&mut w, 0, l);
             ty_tag::TUPLE
         }
-        PNode::Record(l) => {
-            put_list(&mut w, 0, l);
+        PNode::Record(s, l) => {
+            put_name(&mut w, 0, Name(s.0));
+            put_list(&mut w, 2, l);
             ty_tag::RECORD
         }
         PNode::Union(l) => {
@@ -1014,7 +1015,7 @@ pub fn decode_ty(r: TyWords) -> Option<PNode> {
         ty_tag::STR => PNode::Str,
         ty_tag::NEVER => PNode::Never,
         ty_tag::TUPLE => PNode::Tuple(list_at(w, 0)),
-        ty_tag::RECORD => PNode::Record(list_at(w, 0)),
+        ty_tag::RECORD => PNode::Record(RecordSchema(name_at(w, 0).0), list_at(w, 2)),
         ty_tag::UNION => PNode::Union(list_at(w, 0)),
         ty_tag::REF => PNode::Ref(mutbl_of(w[0])?, PTy(w[1])),
         ty_tag::PTR => PNode::Ptr(mutbl_of(w[0])?, PTy(w[1])),
@@ -1060,7 +1061,7 @@ pub fn ty_children(n: PNode, mut ty: impl FnMut(PTy), mut list: impl FnMut(List)
             list(l);
         }
         PNode::Tuple(l)
-        | PNode::Record(l)
+        | PNode::Record(_, l)
         | PNode::Union(l)
         | PNode::Adt(_, l)
         | PNode::FnDef(_, l)
@@ -1092,7 +1093,7 @@ pub fn ty_children(n: PNode, mut ty: impl FnMut(PTy), mut list: impl FnMut(List)
 pub fn map_ty_lists(n: PNode, mut f: impl FnMut(List) -> List) -> PNode {
     match n {
         PNode::Tuple(l) => PNode::Tuple(f(l)),
-        PNode::Record(l) => PNode::Record(f(l)),
+        PNode::Record(s, l) => PNode::Record(s, f(l)),
         PNode::Union(l) => PNode::Union(f(l)),
         PNode::Pat(t, l) => PNode::Pat(t, f(l)),
         PNode::Adt(k, l) => PNode::Adt(k, f(l)),

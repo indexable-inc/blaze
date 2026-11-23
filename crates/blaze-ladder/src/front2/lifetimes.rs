@@ -476,7 +476,7 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
                     stack.push(i);
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => stack.extend_from_slice(self.list(l)?),
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => stack.extend_from_slice(self.list(l)?),
                 PNode::Adt(k, l) => {
                     n += self.adt_positions(k)?;
                     stack.extend_from_slice(self.list(l)?);

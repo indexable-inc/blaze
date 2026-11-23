@@ -153,7 +153,7 @@ fn filled<A: Allocator + Clone>(check: Check, ty: PTy, layouts: &mut Layouts<A>,
                 Fields::Array { count: 0, .. } => continue,
                 _ => None,
             },
-            PNode::Tuple(_) | PNode::Record(_) | PNode::Closure { .. } => None,
+            PNode::Tuple(_) | PNode::Record(..) | PNode::Closure { .. } => None,
             PNode::Union(ul) => {
                 if ul.len == 0 {
                     return Ok(false);
@@ -242,7 +242,7 @@ fn inhabited<A: Allocator + Clone>(ty: PTy, layouts: &mut Layouts<A>, cx: &mut L
                 Fields::Array { count: 0, .. } => Form::Yes,
                 _ => Form::All,
             },
-            PNode::Tuple(_) | PNode::Record(_) | PNode::Closure { .. } | PNode::Coroutine { .. } | PNode::Pat(..) => Form::All,
+            PNode::Tuple(_) | PNode::Record(..) | PNode::Closure { .. } | PNode::Coroutine { .. } | PNode::Pat(..) => Form::All,
             PNode::Union(_) => Form::Record,
             PNode::Bool
             | PNode::Char

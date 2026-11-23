@@ -5497,4 +5497,136 @@ impl<T> r#return<T> {
         assert!(paths.path(root, false, &["return"], Ns::Type).is_ok(), "ORACLE: `return` names the struct");
         assert!(paths.path(root, false, &["r#return"], Ns::Type).is_err(), "CONTROL: the raw text resolved; the test does not see the cause");
     }
+
+    #[test]
+    fn record_sorting_union_flatten_dedup_and_fallible_lowering() {
+        use crate::front2::buckets;
+        use crate::front2::types::{Bounds, Builder, Env, SelfTy};
+        use crate::resolve::Paths;
+        use blaze_lower::{Cfg, CfgAnswer, form as lf, head};
+        use blaze_typeck::{IntTy, Name, PNode, RecordSchema, Shape, UintTy};
+
+        struct NoCfg;
+        impl Cfg for NoCfg {
+            fn atom(&mut self, name: &str, _value: Option<&str>) -> CfgAnswer {
+                panic!("unexpected cfg atom `{name}`")
+            }
+        }
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let exts = parser::Extensions::RECORDS.with(parser::Extensions::ERROR_UNIONS);
+
+        const SRC: &str = "
+pub struct A;
+pub struct B;
+";
+        let (names, sized, frame) = world_of(SRC);
+        let mut store = Store::new(sized, frame, a());
+        let mut keys = Keys::new();
+        for name in ["A", "B"] {
+            let lib = item(names, name);
+            store.ensure(names, &mut keys, Want::Adt(lib)).unwrap_or_else(|e| panic!("ensure `{name}`: {e:?}"));
+        }
+        let root = NamesSource::root_module(names, 0).expect("root module");
+        let env = Env {
+            module: root,
+            params: &[],
+            bounds: Bounds::Done(&[]),
+            self_: SelfTy::None,
+            self_assoc: &[],
+            anon: &[],
+            consts: &[],
+            body: None,
+        };
+
+        let lower_param_ty = |store: &mut Store<'_>, sig_text: &str| -> blaze_typeck::PTy {
+            let low = blaze_lower::lower_signature_with_extensions(sig_text, blaze_scope::Edition::E2024, exts, &mut NoCfg, alloc)
+                .unwrap_or_else(|e| panic!("lower `{sig_text}`: {e:?}"));
+            let v = low.view();
+            assert!(v.diags.is_empty(), "diags for `{sig_text}`: {:?}", v.diags);
+            let row = v.rows(v.list(head::PARAMS)).expect("params")[0];
+            let p = lf::Param::decode(row).expect("param");
+            let ty_id = p.ty.expect("param type");
+            let b = Builder { resolver: Paths { names }, heads: &store.maps, marks: None };
+            b.ty(&mut store.tys, &env, &v, ty_id).unwrap_or_else(|e| panic!("Builder::ty `{sig_text}`: {e:?}"))
+        };
+
+        // 1. `{ b: u8, a: i32 }` and `{ a: i32, b: u8 }` lower to identical `PNode::Record`.
+        let rec_ba_ty = lower_param_ty(&mut store, "pub fn f(x: { b: u8, a: i32 });");
+        let rec_ab_ty = lower_param_ty(&mut store, "pub fn f(x: { a: i32, b: u8 });");
+        let rec_xy_ty = lower_param_ty(&mut store, "pub fn f(x: { x: i32, y: u8 });");
+        let uni_ty = lower_param_ty(&mut store, "pub fn f(x: A | (B | A));");
+        let fall_ty = lower_param_ty(&mut store, "pub fn f(x: i32 ! u8);");
+
+        let tys = store.tys.view();
+        assert_eq!(rec_ba_ty, rec_ab_ty, "`{{ b: u8, a: i32 }}` and `{{ a: i32, b: u8 }}` must lower to identical PTy");
+        let expected_ab_schema = RecordSchema::of_sorted_names(&[Name::of("a"), Name::of("b")]);
+        let PNode::Record(ab_schema, ab_fields) = tys.node(rec_ba_ty).expect("rec_ba node") else {
+            panic!("expected PNode::Record, got {:?}", tys.node(rec_ba_ty));
+        };
+        assert_eq!(ab_schema, expected_ab_schema);
+        let ab_list = tys.list(ab_fields).expect("ab fields");
+        assert_eq!(ab_list.len(), 2);
+        assert_eq!(tys.node(ab_list[0]).expect("a field"), PNode::Int(IntTy::I32));
+        assert_eq!(tys.node(ab_list[1]).expect("b field"), PNode::Uint(UintTy::U8));
+        assert_eq!(buckets::shape_of(tys, rec_ba_ty), Some(Shape::Record(expected_ab_schema.0, 2)));
+
+        // 2. `{ x: i32, y: u8 }` and `{ a: i32, b: u8 }` lower to distinct `PNode::Record` (different RecordSchema).
+        let PNode::Record(xy_schema, _) = tys.node(rec_xy_ty).expect("rec_xy node") else {
+            panic!("expected PNode::Record for rec_xy");
+        };
+        assert_ne!(xy_schema, ab_schema, "distinct field names must yield distinct RecordSchema");
+        assert_ne!(rec_xy_ty, rec_ba_ty, "`{{ x: i32, y: u8 }}` must be distinct from `{{ a: i32, b: u8 }}`");
+
+        // 3. `A | (B | A)` flattens and deduplicates cleanly to `PNode::Union([A, B])`.
+        let PNode::Union(uni_members) = tys.node(uni_ty).expect("uni node") else {
+            panic!("expected PNode::Union, got {:?}", tys.node(uni_ty));
+        };
+        let members = tys.list(uni_members).expect("uni members");
+        assert_eq!(members.len(), 2, "`A | (B | A)` must flatten and deduplicate to 2 members");
+        let a_key = checker_of(item(names, "A"));
+        let b_key = checker_of(item(names, "B"));
+        assert!(matches!(tys.node(members[0]), Ok(PNode::Adt(k, _)) if k == a_key));
+        assert!(matches!(tys.node(members[1]), Ok(PNode::Adt(k, _)) if k == b_key));
+        assert_eq!(buckets::shape_of(tys, uni_ty), Some(Shape::Union(2)));
+
+        // 4. `i32 ! u8` without `Result` in scope lowers to `PNode::Union([i32, u8])` (NEVER `PNode::Tuple`).
+        let fall_node = tys.node(fall_ty).expect("fallible node");
+        assert!(!matches!(fall_node, PNode::Tuple(_)), "`T ! E` must NEVER lower to PNode::Tuple");
+        let PNode::Union(fall_members) = fall_node else {
+            panic!("expected PNode::Union when no Result ADT in scope, got {fall_node:?}");
+        };
+        let fl = tys.list(fall_members).expect("fallible members");
+        assert_eq!(fl.len(), 2);
+        assert_eq!(tys.node(fl[0]).expect("ok"), PNode::Int(IntTy::I32));
+        assert_eq!(tys.node(fl[1]).expect("err"), PNode::Uint(UintTy::U8));
+
+        // 5. `i32 ! u8` WITH `enum Result<T, E>` in scope lowers to `PNode::Adt(Result, [i32, u8])`.
+        const WITH_RESULT: &str = "
+pub enum Result<T, E> { Ok(T), Err(E) }
+";
+        let (r_names, r_sized, r_frame) = world_of(WITH_RESULT);
+        let mut r_store = Store::new(r_sized, r_frame, a());
+        let mut r_keys = Keys::new();
+        let res_lib = item(r_names, "Result");
+        r_store.ensure(r_names, &mut r_keys, Want::Adt(res_lib)).expect("ensure Result");
+        let r_root = NamesSource::root_module(r_names, 0).expect("r root");
+        let r_env = Env { module: r_root, ..env };
+        let low = blaze_lower::lower_signature_with_extensions("pub fn f(x: i32 ! u8);", blaze_scope::Edition::E2024, exts, &mut NoCfg, alloc)
+            .expect("lower fallible with Result");
+        let rv = low.view();
+        let rp = lf::Param::decode(rv.rows(rv.list(head::PARAMS)).expect("params")[0]).expect("param");
+        let rb = Builder { resolver: Paths { names: r_names }, heads: &r_store.maps, marks: None };
+        let r_ty = rb.ty(&mut r_store.tys, &r_env, &rv, rp.ty.expect("param ty")).expect("Builder::ty with Result");
+        let r_tys = r_store.tys.view();
+        let result_key = checker_of(res_lib);
+        let PNode::Adt(adt_k, adt_args) = r_tys.node(r_ty).expect("fallible_with_result node") else {
+            panic!("expected PNode::Adt(Result, [i32, u8]), got {:?}", r_tys.node(r_ty));
+        };
+        assert_eq!(adt_k, result_key);
+        let r_args = r_tys.list(adt_args).expect("result args");
+        assert_eq!(r_args.len(), 2);
+        assert_eq!(r_tys.node(r_args[0]).expect("ok"), PNode::Int(IntTy::I32));
+        assert_eq!(r_tys.node(r_args[1]).expect("err"), PNode::Uint(UintTy::U8));
+    }
 }

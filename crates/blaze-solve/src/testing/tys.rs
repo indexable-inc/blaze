@@ -153,6 +153,8 @@ impl TestTys {
         };
         let k2 = match k {
             TyKind::Tuple(l) => TyKind::Tuple(list(self, l)?),
+            TyKind::Record(s, l) => TyKind::Record(s, list(self, l)?),
+            TyKind::Union(l) => TyKind::Union(list(self, l)?),
             TyKind::Ref(r, x, m) => TyKind::Ref(sub(self, r)?, sub(self, x)?, m),
             TyKind::RawPtr(x, m) => TyKind::RawPtr(sub(self, x)?, m),
             TyKind::Array(x, n) => TyKind::Array(sub(self, x)?, sub(self, n)?),
@@ -178,7 +180,8 @@ fn same_head(a: TyKind, b: TyKind) -> bool {
         (Int(x), Int(y)) => x == y,
         (Uint(x), Uint(y)) => x == y,
         (Float(x), Float(y)) => x == y,
-        (Tuple(x), Tuple(y)) => x.len == y.len,
+        (Tuple(x), Tuple(y)) | (Union(x), Union(y)) => x.len == y.len,
+        (Record(s1, x), Record(s2, y)) => s1 == s2 && x.len == y.len,
         (Ref(_, _, m), Ref(_, _, n)) | (RawPtr(_, m), RawPtr(_, n)) => m == n,
         (Adt(d, _), Adt(e, _))
         | (FnDef(d, _), FnDef(e, _))
