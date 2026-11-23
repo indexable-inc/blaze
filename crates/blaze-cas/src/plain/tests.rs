@@ -4141,3 +4141,165 @@ fn a_startup_image_round_trips_and_reads_in_place_order() {
     let segments: BTreeSet<[u8; 32]> = reads.iter().map(|it| it.1.segment.0).collect();
     assert_eq!(segments.len(), 2, "two commits, two segments");
 }
+
+/// Resident daemon lease lifecycle: `release_lease` drops the lease to 0 while idle (never
+/// blocking `blaze gc`), and `rearm_lease` lets the next request acquire a fresh lease.
+#[test]
+fn daemon_rearm_lease_reacquires_after_idle_zero_leases() {
+    use super::lent::Lent;
+    let root = test_root();
+    let mut c = cfg(0, 1, false, &root);
+    c.liveness = super::core::Liveness::Reached;
+    let store = super::driven::Driven::with(Sim::new(71, Faults::default()), Path::new("/sim"), c, &root).unwrap();
+    let lent = Lent::new(store, &root);
+    lent.map_all().unwrap();
+
+    // Request 1: multi-phase write acquires a lease on its first segment commit.
+    lent.put(&key(1), Namespace::LOCAL, TAG, &value(1)).unwrap();
+    lent.commit().unwrap();
+    assert_eq!(lent.leases_len(), 1, "active request must hold a lease");
+
+    // Request 1 finishes: releases lease and commits final root -> 0 leases while idle.
+    lent.root("ans.req1", &[key(1)]).unwrap();
+    lent.release_lease();
+    lent.commit().unwrap();
+    assert_eq!(lent.leases_len(), 0, "idle daemon must hold 0 leases");
+
+    // Without rearm_lease, subsequent writes stay unleased (legacy one-shot command behavior).
+    lent.put(&key(2), Namespace::LOCAL, TAG, &value(2)).unwrap();
+    lent.commit().unwrap();
+    assert_eq!(lent.leases_len(), 0, "without rearm_lease, released stays true");
+
+    // Request 2 starts: rearm_lease re-enables lease acquisition for the new request.
+    let gen_before_req2 = lent.generation();
+    lent.rearm_lease();
+    lent.put(&key(3), Namespace::LOCAL, TAG, &value(3)).unwrap();
+    lent.commit().unwrap();
+    assert_eq!(lent.leases_len(), 1, "rearm_lease must allow Request 2 to acquire a fresh lease");
+
+    // Calling rearm_lease while a lease is already held is a no-op and keeps the lease intact.
+    lent.rearm_lease();
+    assert_eq!(lent.leases_len(), 1);
+    assert!(lent.generation() > gen_before_req2);
+
+    // Request 2 finishes: releases lease -> back to 0 leases while idle.
+    lent.root("ans.req2", &[key(3)]).unwrap();
+    lent.release_lease();
+    lent.commit().unwrap();
+    assert_eq!(lent.leases_len(), 0, "idle daemon after Request 2 must hold 0 leases");
+}
+
+/// Resident daemon arena reclamation: `reclaim_between_requests(&mut lent)` drops `kept_arenas`
+/// (in `InArena` mode) and kept lent chunks (in `AfterCommit` mode) once all `Lend` borrows end,
+/// while keeping mapped segments warm and all committed records readable.
+#[test]
+fn daemon_reclaim_between_requests_drops_kept_arenas_and_preserves_mapped_segments() {
+    use super::arena::Visibility;
+    use super::lent::Lent;
+
+    // 1. Visibility::InArena (shared arenas accumulated in kept_arenas).
+    let root = test_root();
+    let store = super::driven::Driven::with(Sim::new(72, Faults::default()), Path::new("/sim"), cfg(0, 1, false, &root), &root).unwrap();
+    let mut lent = Lent::with_visibility(store, &root, Visibility::InArena { shared: blaze_mem::Kept(blaze_mem::Tag::Store) });
+    lent.map_all().unwrap();
+
+    // Two commits where own puts are borrowed via `get` before commit -> 2 kept_arenas.
+    lent.put(&key(10), Namespace::LOCAL, TAG, &value(10)).unwrap();
+    {
+        let lend = lent.get(&key(10)).unwrap().expect("own put readable");
+        assert!(lend.own && lend.shared);
+        assert_eq!(lend.bytes, value(10).as_slice());
+        lent.commit().unwrap();
+    }
+    lent.put(&key(11), Namespace::LOCAL, TAG, &value(11)).unwrap();
+    {
+        let lend = lent.get(&key(11)).unwrap().expect("own put readable");
+        assert_eq!(lend.bytes, value(11).as_slice());
+        lent.commit().unwrap();
+    }
+    assert!(lent.counts().held_bytes > 0, "lent shared arenas stay held until reclaim");
+
+    // Uncommitted put prevents reclamation so live uncommitted data is never dropped.
+    lent.put(&key(12), Namespace::LOCAL, TAG, &value(12)).unwrap();
+    assert_eq!(lent.reclaim_between_requests(), 0, "must not reclaim while uncommitted puts exist");
+    assert_eq!(lent.get(&key(12)).unwrap().expect("uncommitted put intact").bytes, value(12).as_slice());
+    lent.commit().unwrap();
+
+    // All borrows ended and uncommitted_bytes == 0 -> reclaim drops all 3 kept_arenas.
+    let (mapped_before, named_before) = lent.mapped_of_named();
+    assert_eq!((mapped_before, named_before), (3, 3));
+    let reclaimed = lent.reclaim_between_requests();
+    assert_eq!(reclaimed, 3, "expected 3 kept shared arenas reclaimed");
+    assert_eq!(lent.counts().held_bytes, 0, "held_bytes must be 0 after reclaim");
+    assert_eq!(lent.reclaim_between_requests(), 0, "second reclaim is a no-op");
+
+    // Mapped segments stayed open and all committed records remain readable in place.
+    assert_eq!(lent.mapped_of_named(), (3, 3));
+    for n in [10u32, 11, 12] {
+        let lend = lent.get(&key(n)).unwrap().expect("committed record readable after reclaim");
+        assert!(!lend.own);
+        assert_eq!(lend.bytes, value(n).as_slice());
+    }
+
+    // 2. Visibility::AfterCommit (private lent chunks).
+    let store2 = super::driven::Driven::with(Sim::new(73, Faults::default()), Path::new("/sim"), cfg(1, 1, false, &root), &root).unwrap();
+    let mut lent2 = Lent::new(store2, &root);
+    lent2.map_all().unwrap();
+    lent2.put(&key(20), Namespace::LOCAL, TAG, &value(20)).unwrap();
+    {
+        let lend = lent2.get(&key(20)).unwrap().expect("own private put readable");
+        assert!(lend.own && !lend.shared);
+        lent2.commit().unwrap();
+    }
+    assert!(lent2.counts().held_bytes > 0);
+    assert_eq!(lent2.reclaim_between_requests(), 1, "expected 1 private lent chunk reclaimed");
+    assert_eq!(lent2.counts().held_bytes, 0);
+    assert_eq!(lent2.get(&key(20)).unwrap().expect("committed record readable").bytes, value(20).as_slice());
+}
+
+/// `head_generation_on_disk` reads only the head file in O(1), matching `generation()` before
+/// external writes and immediately detecting external commits and store wipes.
+#[test]
+fn daemon_head_generation_on_disk_catches_external_commits() {
+    use super::lent::Lent;
+    use super::settings::Settings;
+
+    let dir = std::env::temp_dir().join(format!("blaze-cas-daemon-head-gen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let root = test_root();
+    let settings = Settings { durable: false, ..Settings::default() };
+
+    let store1 = super::driven::Driven::open(&dir, &settings, &root).unwrap();
+    let lent = Lent::new(store1, &root);
+    lent.map_all().unwrap();
+    assert_eq!(lent.generation(), 0);
+    assert_eq!(lent.head_generation_on_disk().unwrap(), 0);
+
+    // Actor 1 commits generation 1.
+    lent.put(&key(100), Namespace::LOCAL, TAG, &value(100)).unwrap();
+    lent.commit().unwrap();
+    assert_eq!(lent.generation(), 1);
+    assert_eq!(lent.head_generation_on_disk().unwrap(), 1);
+
+    // Actor 2 opens the same store externally and commits generation 2.
+    let mut actor2 = super::driven::Driven::open(&dir, &settings, &root).unwrap();
+    actor2.put(key(101), Namespace::LOCAL, TAG, &value(101)).unwrap();
+    actor2.commit(&[]).unwrap();
+    assert_eq!(actor2.core().generation(), 2);
+
+    // Actor 1 still holds generation 1 in memory, but head_generation_on_disk sees 2 immediately!
+    let (mapped_before, named_before) = lent.mapped_of_named();
+    assert_eq!(lent.generation(), 1);
+    assert_eq!(lent.head_generation_on_disk().unwrap(), 2);
+    assert_eq!(lent.mapped_of_named(), (mapped_before, named_before), "head check must not map new segments");
+
+    // External wipe (`blaze clean --store` deleting head) reports generation 0 != 1.
+    std::fs::remove_file(dir.join("plain/head")).unwrap();
+    assert_eq!(lent.head_generation_on_disk().unwrap(), 0);
+
+    drop(actor2);
+    drop(lent);
+    let _ = std::fs::remove_dir_all(&dir);
+}

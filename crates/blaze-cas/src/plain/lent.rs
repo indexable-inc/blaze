@@ -1194,6 +1194,72 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         self.inner.borrow_mut().store.release_lease()
     }
 
+    /// Re-enables automatic lease acquisition for the next request after [`Lent::release_lease`]
+    /// (`Plain::rearm_lease`), so a resident daemon holds zero leases while idle yet acquires
+    /// fresh lease protection on the next multi-phase request.
+    pub fn rearm_lease(&self) {
+        self.inner.borrow_mut().store.rearm_lease()
+    }
+
+    /// The generation this open store holds (`Plain::generation`).
+    pub fn generation(&self) -> u64 {
+        self.inner.borrow().store.core().generation()
+    }
+
+    /// Reads only the fixed head file on disk (`Driven::head_generation_on_disk`, zero segment
+    /// opens or mmaps) and returns the committed generation on disk so a resident daemon can
+    /// detect external commits or store wipes in O(1) and reopen only when
+    /// `disk_gen != self.generation()`.
+    pub fn head_generation_on_disk(&self) -> Result<u64, LentError> {
+        self.inner.borrow_mut().store.head_generation_on_disk().map_err(stopped("reading the head generation"))
+    }
+
+    /// Reclaims arenas and lent private chunks held past commit once all [`Lend`] borrows have
+    /// ended (proven statically by `&mut self`) and no uncommitted puts remain. Mapped segments
+    /// stay open and warm inside the underlying store. Returns the number of arenas/chunks
+    /// reclaimed so long-lived resident daemons maintain flat memory across requests.
+    pub fn reclaim_between_requests(&mut self) -> usize {
+        let inner = self.inner.get_mut();
+        if inner.uncommitted_bytes > 0 || inner.committed < inner.order.len() || !inner.puts.is_empty() {
+            return 0;
+        }
+        let mut reclaimed = 0usize;
+        while let Some(arena) = inner.kept_arenas.pop() {
+            inner.counts.held_bytes = inner.counts.held_bytes.saturating_sub(u64::from(arena.blocks()) * 16);
+            inner.counts.freed_chunks = inner.counts.freed_chunks.saturating_add(1);
+            reclaimed += 1;
+        }
+        if inner.kept_arenas.capacity() > 16 {
+            inner.kept_arenas.shrink_to_fit();
+        }
+        if let Some(arena) = inner.shared.take() {
+            inner.counts.held_bytes = inner.counts.held_bytes.saturating_sub(u64::from(arena.blocks()) * 16);
+            inner.counts.freed_chunks = inner.counts.freed_chunks.saturating_add(1);
+            inner.shared_lent = false;
+            reclaimed += 1;
+        }
+        while let Some(chunk) = inner.chunks.pop() {
+            if chunk.capacity() > 0 {
+                let bytes = u64::try_from(chunk.len()).unwrap_or(u64::MAX).saturating_mul(16);
+                inner.counts.held_bytes = inner.counts.held_bytes.saturating_sub(bytes);
+                inner.counts.freed_chunks = inner.counts.freed_chunks.saturating_add(1);
+                reclaimed += 1;
+            }
+        }
+        inner.lent.clear();
+        if inner.chunks.capacity() > 16 {
+            inner.chunks.shrink_to_fit();
+            inner.lent.shrink_to_fit();
+        }
+        inner.order.clear();
+        if inner.order.capacity() > 1024 {
+            inner.order.shrink_to_fit();
+        }
+        inner.committed = 0;
+        inner.sealed = 0;
+        reclaimed
+    }
+
     /// Adds what names this machine to the scan of every put into a shared namespace.
     pub fn machine(&self, paths: &[&std::path::Path]) {
         self.inner.borrow_mut().store.machine(paths);

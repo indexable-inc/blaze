@@ -2518,6 +2518,10 @@ impl<A: Allocator + Clone> Plain<A> {
         &self.cfg.dir
     }
 
+    pub(crate) fn head_file(&self) -> &FileName {
+        &self.head
+    }
+
     /// The last commit's outcome, once.
     pub fn take_committed(&mut self) -> Option<Result<Committed<A>, StoreError>> {
         self.committed.take()
@@ -3210,6 +3214,19 @@ impl<A: Allocator + Clone> Plain<A> {
         self.released = true;
         if self.leased && !self.roots_pending.iter().any(|it| matches!(it, RootEdit::Release)) {
             self.roots_pending.push(RootEdit::Release);
+        }
+    }
+
+    /// Re-enables automatic lease acquisition on the next commit that writes segments, after a
+    /// previous request released its lease ([`Plain::release_lease`]).
+    ///
+    /// Only takes effect when no lease for this process is currently held (`!self.leased`), so a
+    /// resident daemon holds zero leases while idle (never blocking `blaze gc`) yet acquires fresh
+    /// lease protection starting from the current generation on the next multi-phase request.
+    pub fn rearm_lease(&mut self) {
+        if !self.leased && self.released {
+            self.released = false;
+            self.opened_generation = self.manifest.generation;
         }
     }
 

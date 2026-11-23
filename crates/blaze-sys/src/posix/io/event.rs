@@ -212,9 +212,21 @@ mod kq {
             /// `NOTE_WRITE` ([`Filter::VNODE`]): the file was written; of a directory, an entry
             /// was added, removed or renamed in it. replaces libc::NOTE_WRITE.
             WRITE = 0x0000_0002;
+            /// `NOTE_EXTEND` ([`Filter::VNODE`]): the file was extended in size. replaces
+            /// libc::NOTE_EXTEND.
+            EXTEND = 0x0000_0004;
+            /// `NOTE_ATTRIB` ([`Filter::VNODE`]): the file's attributes (chmod, utimes, etc.)
+            /// changed. replaces libc::NOTE_ATTRIB.
+            ATTRIB = 0x0000_0008;
+            /// `NOTE_LINK` ([`Filter::VNODE`]): the file's link count changed. replaces
+            /// libc::NOTE_LINK.
+            LINK = 0x0000_0010;
             /// `NOTE_RENAME` ([`Filter::VNODE`]): the file was renamed. replaces
             /// libc::NOTE_RENAME.
             RENAME = 0x0000_0020;
+            /// `NOTE_REVOKE` ([`Filter::VNODE`]): access to the file was revoked (revoke or
+            /// unmount). replaces libc::NOTE_REVOKE.
+            REVOKE = 0x0000_0040;
             /// `NOTE_TRIGGER` ([`Filter::USER`]): fire the event. replaces libc::NOTE_TRIGGER.
             TRIGGER = 0x0100_0000;
             /// `NOTE_EXITSTATUS` ([`Filter::PROC`]): `data` holds the exit's wait status.
