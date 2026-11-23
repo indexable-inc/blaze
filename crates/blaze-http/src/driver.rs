@@ -63,9 +63,12 @@ use std::{
 };
 
 use blaze_core::{
-    self as effects, Address, Conn, Done, Driver, Effect, Tag,
+    self as effects, Address, Conn, Dgram, Done, Driver, Effect, Tag,
     chan::{self, Receiver, Sender},
+    dgram::{Batch, Ecn, Options as DgramOptions, Slots},
+    sockopt::{Ask as SockAsk, UdpOptions},
 };
+use blaze_own::{Alloc, Heap, SortedMap, Vec as OwnVec};
 
 use crate::{
     Client, Completion, ConnId, Error, Event, Io, Kind, Request, RequestId,
@@ -577,6 +580,18 @@ fn unexpected(what: &str, done: &Done) -> ! {
     panic!("blaze-http's driver: {what} completed with {done:?}, which blaze-core's effect never gives")
 }
 
+/// Maximum payload size accepted by [`Handle::send_udp`] (fits a `BLZP` `HAVE` datagram).
+pub const MAX_UDP_PAYLOAD: usize = 1040;
+/// Fixed byte size forwarded as [`FetchEvent::Datagram`] (matches a `BLZP` `HAS` datagram).
+pub const MAX_UDP_REPLY: usize = 24;
+
+/// Tag space for the shared UDP probe socket on the fetch driver thread (disjoint from the WAN
+/// loop at `0..TAGS` and the optional LAN peer loop at `TAGS..2*TAGS`).
+const UDP_BASE: u64 = 2 * TAGS;
+const TAG_UDP_BIND: Tag = Tag(UDP_BASE);
+const TAG_UDP_RECV: Tag = Tag(UDP_BASE + 1);
+const TAG_UDP_SEND_BASE: u64 = UDP_BASE + 2;
+
 /// One request's answer, collected whole on the driver's thread ([`Handle::fetch`]).
 #[derive(Debug)]
 pub enum Fetched {
@@ -587,23 +602,63 @@ pub enum Fetched {
     TimedOut,
 }
 
+/// Unified event delivered by a [`Handle`] spawned with [`Handle::spawn_with_peer`].
+#[derive(Debug)]
+pub enum FetchEvent {
+    /// An HTTP answer (from either WAN or LAN peer) for `key`.
+    Http { key: u64, fetched: Fetched },
+    /// A fixed-size UDP reply datagram received on the shared probe socket.
+    Datagram { from: SocketAddr, bytes: [u8; MAX_UDP_REPLY] },
+}
+
+/// Optional LAN peer HTTP client + shared UDP probe socket driven on the same `blaze-core`
+/// native driver thread as the primary WAN [`Loop`].
+pub struct PeerDriver {
+    /// Plain-HTTP LAN peer client (caller configures `redirects: 0` and `Proxies::none()`).
+    pub client: Client,
+    /// Local UDP address to bind for non-blocking peer probes (`None` disables UDP probing).
+    pub udp_bind: Option<SocketAddr>,
+    /// Unified unbounded channel receiving both WAN/peer HTTP answers and UDP datagrams.
+    pub events: Sender<FetchEvent>,
+    /// Explicit heap capability for the peer driver's internal tables (no global heap).
+    pub heap: &'static Heap,
+}
+
+/// Inline UDP send packet (no heap allocation per probe).
+struct UdpOut {
+    targets: [Option<SocketAddr>; 2],
+    len: u16,
+    bytes: [u8; MAX_UDP_PAYLOAD],
+}
+
+/// Where a collected request's [`Fetched`] answer goes.
+enum CollectTo {
+    Direct(Sender<(u64, Fetched)>),
+    Unified,
+}
+
 /// What an asker of a [`Handle`] gets its request's events by.
 enum Asker {
     Events(Sender<Event>),
-    Collect { key: u64, to: Sender<(u64, Fetched)>, head: Option<(String, u16, Vec<(String, String)>)>, body: Vec<u8> },
+    Collect { key: u64, to: CollectTo, head: Option<(String, u16, Vec<(String, String)>)>, body: Vec<u8> },
 }
 
 /// What a [`Handle`]'s askers post to its thread.
 enum Message {
     /// `within`: from when the thread takes it, on the driver's clock, so it is never early.
     Ask { id: RequestId, request: Request, within: Option<Duration>, asker: Asker },
+    /// Unified WAN or LAN peer fetch tracked by `key` so it can be cancelled via [`Message::CancelKey`].
+    AskPeer { id: RequestId, key: u64, peer: bool, request: Request, within: Duration },
     Consumed { id: RequestId, bytes: usize },
     Cancel { id: RequestId },
+    CancelKey { key: u64 },
+    SendUdp(UdpOut),
     Sleep { after: Duration, woke: Sender<()> },
     Stop,
 }
 
 type Inbox = mailbox::Inbox<Message>;
+type SpawnResult = std::io::Result<Handle>;
 
 /// The askers' side of a [`Handle`]; its drop stops the thread.
 struct Owner {
@@ -626,7 +681,17 @@ pub struct Handle {
 
 impl Handle {
     /// Starts the thread driving `client`, at most `most` requests in it at once.
-    pub fn spawn(client: Client, most: usize) -> std::io::Result<Handle> {
+    pub fn spawn(client: Client, most: usize) -> SpawnResult {
+        Self::spawn_inner(client, most, None)
+    }
+
+    /// Starts the thread driving `wan`, a second LAN peer [`Loop`], and an optional non-blocking
+    /// UDP probe socket on the same single `blaze-core` native driver.
+    pub fn spawn_with_peer(wan: Client, most: usize, peer: PeerDriver) -> SpawnResult {
+        Self::spawn_inner(wan, most, Some(peer))
+    }
+
+    fn spawn_inner(client: Client, most: usize, peer: Option<PeerDriver>) -> SpawnResult {
         let (ready_to, ready) = chan::bounded::<std::io::Result<Arc<Inbox, Global>>>(1);
         std::thread::Builder::new().name("blaze-http h1".to_owned()).spawn(move || {
             // No file effect is asked: the root is never read.
@@ -646,7 +711,8 @@ impl Handle {
                 return;
             }
             drop(ready_to);
-            serve(&mut driver, Loop::new(client, 0, most), &inbox);
+            let peer_state = peer.map(|cfg| PeerState::new(cfg, most));
+            serve_with_peer(&mut driver, Loop::new(client, 0, most), peer_state, &inbox);
         })?;
         let inbox = match mailbox::answer("blaze-http's driver thread to make its driver", &ready, START_WAIT) {
             Ok(Some(made)) => made?,
@@ -676,8 +742,40 @@ impl Handle {
     /// channel (`blaze_core::chan::unbounded`): the driver's thread never waits to hand over.
     pub fn fetch(&self, request: Request, within: Duration, key: u64, to: &Sender<(u64, Fetched)>) {
         let id = self.id();
-        let asker = Asker::Collect { key, to: to.clone(), head: None, body: Vec::new_in(Global) };
+        let asker = Asker::Collect { key, to: CollectTo::Direct(to.clone()), head: None, body: Vec::new_in(Global) };
         self.owner.inbox.post(Message::Ask { id, request, within: Some(within), asker });
+    }
+
+    /// Starts a WAN or LAN peer request on a [`Handle`] spawned with [`Handle::spawn_with_peer`],
+    /// delivering [`FetchEvent::Http`] to the unified event channel and enabling cancellation via
+    /// [`Handle::cancel_fetch`].
+    pub fn fetch_for_race(&self, request: Request, within: Duration, key: u64, peer: bool) {
+        let id = self.id();
+        self.owner.inbox.post(Message::AskPeer { id, key, peer, request, within });
+    }
+
+    /// Cancels an in-flight request previously started with [`Handle::fetch_for_race`].
+    pub fn cancel_fetch(&self, key: u64) {
+        self.owner.inbox.post(Message::CancelKey { key });
+    }
+
+    /// Sends `payload` (at most [`MAX_UDP_PAYLOAD`] bytes) to up to two UDP destinations on the
+    /// shared probe socket. Silently ignored if UDP probing is disabled or unavailable.
+    pub fn send_udp(&self, targets: &[SocketAddr], payload: &[u8]) {
+        let Ok(len) = u16::try_from(payload.len()) else { return };
+        if payload.is_empty() || payload.len() > MAX_UDP_PAYLOAD {
+            return;
+        }
+        let mut bytes = [0u8; MAX_UDP_PAYLOAD];
+        if let Some(dst) = bytes.get_mut(..payload.len()) {
+            dst.copy_from_slice(payload);
+        }
+        let t0 = targets.first().copied();
+        let t1 = targets.get(1).copied();
+        if t0.is_none() {
+            return;
+        }
+        self.owner.inbox.post(Message::SendUdp(UdpOut { targets: [t0, t1], len, bytes }));
     }
 
     /// A timer on the driver's clock: the receiver gets `()` once `after` has passed there, and
@@ -729,15 +827,84 @@ impl Drop for Answer {
     }
 }
 
+enum UdpState {
+    Disabled,
+    Binding { at: SocketAddr, pending: OwnVec<UdpOut, Alloc<'static>> },
+    Ready { sock: Dgram },
+}
+
+struct PeerState {
+    peer_loop: Loop,
+    events: Sender<FetchEvent>,
+    key_to_req: SortedMap<u64, (bool, RequestId), Alloc<'static>>,
+    udp: UdpState,
+    udp_bind_sent: bool,
+    next_send_tag: u64,
+}
+
+impl PeerState {
+    fn new(cfg: PeerDriver, most: usize) -> PeerState {
+        let alloc = cfg.heap.alloc();
+        let udp = match cfg.udp_bind {
+            Some(at) => UdpState::Binding { at, pending: OwnVec::new_in(alloc) },
+            None => UdpState::Disabled,
+        };
+        PeerState {
+            peer_loop: Loop::new(cfg.client, TAGS, most),
+            events: cfg.events,
+            key_to_req: SortedMap::new_in(alloc),
+            udp,
+            udp_bind_sent: false,
+            next_send_tag: TAG_UDP_SEND_BASE,
+        }
+    }
+
+    fn push_udp_sends(sock: Dgram, out: &UdpOut, next_send_tag: &mut u64, effects: &mut impl Extend<Effect>) {
+        let len = usize::from(out.len);
+        let Some(payload) = out.bytes.get(..len) else { return };
+        for dest in out.targets.into_iter().flatten() {
+            let mut batch = Batch::new();
+            batch.push(dest, Ecn::NotEct, payload);
+            let tag = Tag(*next_send_tag);
+            *next_send_tag = next_send_tag.saturating_add(1);
+            effects.extend([Effect::SendTo { sock, batch, tag }]);
+        }
+    }
+}
+
+fn udp_probe_options() -> DgramOptions {
+    DgramOptions {
+        tuning: UdpOptions {
+            broadcast: SockAsk::WhereAvailable(true),
+            multicast_ttl: SockAsk::WhereAvailable(1),
+            multicast_loop: SockAsk::WhereAvailable(true),
+            ..UdpOptions::DEFAULT
+        },
+        ..DgramOptions::default()
+    }
+}
+
 /// The thread's loop: the askers' messages in, the loop's effects out, its tellings to their
 /// askers, until the handle is dropped.
-fn serve(driver: &mut impl Driver, mut core: Loop, inbox: &Inbox) {
+#[cfg(test)]
+fn serve(driver: &mut impl Driver, core: Loop, inbox: &Inbox) {
+    serve_with_peer(driver, core, None, inbox);
+}
+
+fn serve_with_peer(driver: &mut impl Driver, mut core: Loop, mut peer: Option<PeerState>, inbox: &Inbox) {
     let mut askers: BTreeMap<RequestId, Asker> = BTreeMap::new_in(Global);
     let mut sleeps: BTreeMap<u64, Sender<()>> = BTreeMap::new_in(Global);
     let mut next_sleep = 0u64;
     let mut messages = Vec::new_in(Global);
     let mut effects = Vec::new_in(Global);
     let mut done = Vec::new_in(Global);
+    if let Some(ps) = peer.as_mut()
+        && let UdpState::Binding { at, .. } = ps.udp
+        && !ps.udp_bind_sent
+    {
+        ps.udp_bind_sent = true;
+        effects.push(Effect::Bind { at, options: udp_probe_options(), tag: TAG_UDP_BIND });
+    }
     loop {
         inbox.take(&mut messages);
         for message in messages.drain(..) {
@@ -746,25 +913,85 @@ fn serve(driver: &mut impl Driver, mut core: Loop, inbox: &Inbox) {
                     askers.insert(id, asker);
                     core.ask(id, request, within.map(|it| driver.now().saturating_add(it)));
                 }
+                Message::AskPeer { id, key, peer: is_peer, request, within } => {
+                    let until = Some(driver.now().saturating_add(within));
+                    askers.insert(id, Asker::Collect { key, to: CollectTo::Unified, head: None, body: Default::default() });
+                    if let Some(ps) = peer.as_mut() {
+                        ps.key_to_req.insert(key, (is_peer, id));
+                        if is_peer {
+                            ps.peer_loop.ask(id, request, until);
+                        } else {
+                            core.ask(id, request, until);
+                        }
+                    } else {
+                        core.ask(id, request, until);
+                    }
+                }
                 Message::Consumed { id, bytes } => core.consumed(id, bytes),
                 Message::Cancel { id } => {
                     askers.remove(&id);
                     core.cancel(id);
+                }
+                Message::CancelKey { key } => {
+                    if let Some(ps) = peer.as_mut()
+                        && let Some((is_peer, id)) = ps.key_to_req.remove(&key)
+                    {
+                        askers.remove(&id);
+                        if is_peer {
+                            ps.peer_loop.cancel(id);
+                        } else {
+                            core.cancel(id);
+                        }
+                    }
+                }
+                Message::SendUdp(out) => {
+                    if let Some(ps) = peer.as_mut() {
+                        match &mut ps.udp {
+                            UdpState::Disabled => {}
+                            UdpState::Binding { pending, .. } => pending.push(out),
+                            UdpState::Ready { sock } => {
+                                PeerState::push_udp_sends(*sock, &out, &mut ps.next_send_tag, &mut effects);
+                            }
+                        }
+                    }
                 }
                 Message::Sleep { after, woke } => {
                     sleeps.insert(next_sleep, woke);
                     core.sleep(next_sleep, after);
                     next_sleep += 1;
                 }
-                Message::Stop => return,
+                Message::Stop => {
+                    if let Some(ps) = peer.as_ref()
+                        && let UdpState::Ready { sock } = ps.udp
+                    {
+                        effects.push(Effect::Unbind { sock, tag: Tag(ps.next_send_tag) });
+                        driver.submit(&mut effects);
+                    }
+                    return;
+                }
             }
         }
-        core.step(driver.now(), &mut effects);
+        let now = driver.now();
+        core.step(now, &mut effects);
         while let Some(told) = core.next_told() {
-            tell(&mut core, &mut askers, &mut sleeps, told);
+            let (unified, keys) = match peer.as_mut() {
+                Some(ps) => (Some(&ps.events), Some(&mut ps.key_to_req)),
+                None => (None, None),
+            };
+            tell(&mut core, &mut askers, &mut sleeps, unified, keys, told);
+        }
+        if let Some(ps) = peer.as_mut() {
+            ps.peer_loop.step(now, &mut effects);
+            while let Some(told) = ps.peer_loop.next_told() {
+                tell(&mut ps.peer_loop, &mut askers, &mut sleeps, Some(&ps.events), Some(&mut ps.key_to_req), told);
+            }
         }
         driver.submit(&mut effects);
-        driver.poll(&mut done, core.deadline());
+        let deadline = match peer.as_ref() {
+            Some(ps) => core.deadline().min(ps.peer_loop.deadline()),
+            None => core.deadline(),
+        };
+        driver.poll(&mut done, deadline);
         // The wait just ended: what came in during it (these completions, then the messages at
         // the top of the next turn) is timed from now.
         #[cfg(test)]
@@ -772,16 +999,75 @@ fn serve(driver: &mut impl Driver, mut core: Loop, inbox: &Inbox) {
         #[cfg(not(test))]
         let advance = true;
         if advance {
-            core.advance(driver.now());
+            let after = driver.now();
+            core.advance(after);
+            if let Some(ps) = peer.as_mut() {
+                ps.peer_loop.advance(after);
+            }
         }
         for completion in done.drain(..) {
-            core.complete(completion);
+            if core.owns(completion.tag) {
+                core.complete(completion);
+            } else if let Some(ps) = peer.as_mut() {
+                if ps.peer_loop.owns(completion.tag) {
+                    ps.peer_loop.complete(completion);
+                } else if completion.tag == TAG_UDP_BIND {
+                    match completion.done {
+                        Done::Bound { sock, .. } => {
+                            let prev = core::mem::replace(&mut ps.udp, UdpState::Ready { sock });
+                            effects.push(Effect::RecvFrom {
+                                sock,
+                                into: Batch::new(),
+                                slots: Slots { most: 16, size: 64 },
+                                tag: TAG_UDP_RECV,
+                            });
+                            if let UdpState::Binding { pending, .. } = prev {
+                                for out in pending.iter() {
+                                    PeerState::push_udp_sends(sock, out, &mut ps.next_send_tag, &mut effects);
+                                }
+                            }
+                        }
+                        _ => {
+                            // Restricted sandbox or network without UDP: silently disable LAN probing.
+                            ps.udp = UdpState::Disabled;
+                        }
+                    }
+                } else if completion.tag == TAG_UDP_RECV {
+                    match completion.done {
+                        Done::Datagrams(mut batch) => {
+                            for (head, raw) in batch.each() {
+                                if let Ok(arr) = <&[u8; MAX_UDP_REPLY]>::try_from(raw) {
+                                    _ = ps.events.try_send(FetchEvent::Datagram { from: head.peer, bytes: *arr });
+                                }
+                            }
+                            batch.clear();
+                            if let UdpState::Ready { sock } = ps.udp {
+                                effects.push(Effect::RecvFrom {
+                                    sock,
+                                    into: batch,
+                                    slots: Slots { most: 16, size: 64 },
+                                    tag: TAG_UDP_RECV,
+                                });
+                            }
+                        }
+                        _ => {
+                            ps.udp = UdpState::Disabled;
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
 /// Hands `told` to whoever waits for it.
-fn tell(core: &mut Loop, askers: &mut BTreeMap<RequestId, Asker>, sleeps: &mut BTreeMap<u64, Sender<()>>, told: Told) {
+fn tell(
+    core: &mut Loop,
+    askers: &mut BTreeMap<RequestId, Asker>, sleeps: &mut BTreeMap<u64, Sender<()>>,
+    unified: Option<&Sender<FetchEvent>>,
+    key_to_req: Option<&mut SortedMap<u64, (bool, RequestId), Alloc<'static>>>,
+    told: Told,
+) {
     let id = match &told {
         Told::Event(event) => event.request(),
         Told::TimedOut(id) => *id,
@@ -796,6 +1082,7 @@ fn tell(core: &mut Loop, askers: &mut BTreeMap<RequestId, Asker>, sleeps: &mut B
     };
     let ends = !matches!(&told, Told::Event(event) if !event.ends());
     let Some(asker) = askers.get_mut(&id) else { return };
+    let mut ended_key = None;
     match (asker, told) {
         // An asker that went away has posted its cancel, which the loop reads next.
         (Asker::Events(events), Told::Event(event)) => _ = events.send(event),
@@ -820,18 +1107,31 @@ fn tell(core: &mut Loop, askers: &mut BTreeMap<RequestId, Asker>, sleeps: &mut B
                 Told::Woke(_) => None,
             };
             if let Some(fetched) = fetched {
-                match to.try_send((*key, fetched)) {
-                    // A reader that is gone wants nothing more.
-                    Ok(()) | Err(chan::TrySendError::Disconnected(_)) => {}
-                    Err(chan::TrySendError::Full(_)) => panic!(
-                        "blaze-http's driver: the channel {id:?}'s answer goes to is full; `Handle::fetch` takes an unbounded one (`chan::unbounded`), so the driver's thread never waits on an asker"
-                    ),
+                match to {
+                    CollectTo::Direct(to) => match to.try_send((*key, fetched)) {
+                        // A reader that is gone wants nothing more.
+                        Ok(()) | Err(chan::TrySendError::Disconnected(_)) => {}
+                        Err(chan::TrySendError::Full(_)) => panic!(
+                            "blaze-http's driver: the channel {id:?}'s answer goes to is full; `Handle::fetch` takes an unbounded one (`chan::unbounded`), so the driver's thread never waits on an asker"
+                        ),
+                    },
+                    CollectTo::Unified => {
+                        if let Some(events) = unified {
+                            _ = events.try_send(FetchEvent::Http { key: *key, fetched });
+                        }
+                    }
                 }
+            }
+            if ends {
+                ended_key = Some(*key);
             }
         }
     }
     if ends {
         askers.remove(&id);
+        if let (Some(key), Some(map)) = (ended_key, key_to_req) {
+            map.remove(&key);
+        }
     }
 }
 

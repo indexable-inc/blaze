@@ -649,3 +649,97 @@ fn a_black_hole_drops_every_datagram_and_codepoints_cross() {
     });
     assert_eq!(got, Some((b"kept".to_vec(), Ecn::Ect1)), "only the datagram after the heal");
 }
+
+#[test]
+fn broadcast_and_multicast_fan_out_in_sim() {
+    use crate::sockopt::{Ask, MulticastV4, UdpOptions};
+    use core::net::Ipv4Addr;
+
+    let mut sim = Sim::new(42, Faults::default());
+    let group = Ipv4Addr::new(239, 255, 77, 77);
+    let port = 41729u16;
+    let mcast_opts = Options {
+        tuning: UdpOptions {
+            reuse_address: Ask::Must(true),
+            reuse_port: Ask::Must(true),
+            multicast_join: Ask::Must(MulticastV4 { group, interface: Ipv4Addr::UNSPECIFIED }),
+            ..UdpOptions::DEFAULT
+        },
+        ..Options::default()
+    };
+    let sender_opts = Options {
+        tuning: UdpOptions {
+            broadcast: Ask::Must(true),
+            multicast_ttl: Ask::Must(1),
+            ..UdpOptions::DEFAULT
+        },
+        ..Options::default()
+    };
+    let mut effects = [
+        Effect::Bind { at: SocketAddr::from(([10, 0, 0, 2], port)), options: mcast_opts, tag: Tag(1) },
+        Effect::Bind { at: SocketAddr::from(([10, 0, 0, 3], port)), options: mcast_opts, tag: Tag(2) },
+        Effect::Bind { at: SocketAddr::from(([10, 0, 0, 4], port)), options: Options::default(), tag: Tag(3) },
+        Effect::Bind { at: SocketAddr::from(([10, 0, 0, 1], 0)), options: sender_opts, tag: Tag(4) },
+    ]
+    .into_iter()
+    .collect();
+    let mut socks = [None; 4];
+    run_until_idle(&mut sim, &mut effects, |done, _| {
+        let idx = usize::try_from(done.tag.0.saturating_sub(1)).expect("tag");
+        match done.done {
+            Done::Bound { sock, .. } => socks[idx] = Some(sock),
+            other => panic!("bound {idx}: {other:?}"),
+        }
+    })
+    .unwrap();
+    let [Some(peer1), Some(peer2), Some(non_member), Some(client)] = socks else {
+        panic!("all four sockets bound");
+    };
+
+    // Multicast reaches peer1 and peer2 (joined), not non_member.
+    let mut mcast_batch = Batch::new();
+    mcast_batch.push(SocketAddr::from((group, port)), Ecn::NotEct, b"mcast-probe");
+    effects.extend([
+        Effect::RecvFrom { sock: peer1, into: Batch::new(), slots: Slots::ONE, tag: Tag(10) },
+        Effect::RecvFrom { sock: peer2, into: Batch::new(), slots: Slots::ONE, tag: Tag(11) },
+        Effect::SendTo { sock: client, batch: mcast_batch, tag: Tag(12) },
+    ]);
+    let mut mcast_hits = [false; 2];
+    drive(&mut sim, &mut effects, |_, Completion { tag, done }, _| {
+        if let Done::Datagrams(batch) = done {
+            let (_, bytes) = batch.each().next().expect("mcast datagram");
+            assert_eq!(bytes, b"mcast-probe");
+            if tag == Tag(10) {
+                mcast_hits[0] = true;
+            } else if tag == Tag(11) {
+                mcast_hits[1] = true;
+            }
+        }
+    });
+    assert_eq!(mcast_hits, [true, true]);
+
+    // Broadcast reaches all three sockets bound on `port`, including non_member.
+    let mut bcast_batch = Batch::new();
+    bcast_batch.push(SocketAddr::from((Ipv4Addr::BROADCAST, port)), Ecn::NotEct, b"bcast-probe");
+    effects.extend([
+        Effect::RecvFrom { sock: peer1, into: Batch::new(), slots: Slots::ONE, tag: Tag(20) },
+        Effect::RecvFrom { sock: peer2, into: Batch::new(), slots: Slots::ONE, tag: Tag(21) },
+        Effect::RecvFrom { sock: non_member, into: Batch::new(), slots: Slots::ONE, tag: Tag(22) },
+        Effect::SendTo { sock: client, batch: bcast_batch, tag: Tag(23) },
+    ]);
+    let mut bcast_hits = [false; 3];
+    drive(&mut sim, &mut effects, |_, Completion { tag, done }, _| {
+        if let Done::Datagrams(batch) = done {
+            let (_, bytes) = batch.each().next().expect("bcast datagram");
+            assert_eq!(bytes, b"bcast-probe");
+            if tag == Tag(20) {
+                bcast_hits[0] = true;
+            } else if tag == Tag(21) {
+                bcast_hits[1] = true;
+            } else if tag == Tag(22) {
+                bcast_hits[2] = true;
+            }
+        }
+    });
+    assert_eq!(bcast_hits, [true, true, true]);
+}

@@ -69,6 +69,12 @@ pub fn with_der<'d>(ders: impl Iterator<Item = &'d [u8]>) -> Result<Arc<rustls::
     with_roots(roots)
 }
 
+/// An empty root store for plain-HTTP-only clients (such as LAN peer fetches) that must refuse
+/// any accidental TLS handshake.
+pub fn empty_roots() -> rustls::RootCertStore {
+    rustls::RootCertStore::empty()
+}
+
 /// rustls on ring at its safe default versions, checking servers against `roots`, with no
 /// client certificate and no ALPN.
 pub fn with_roots(roots: rustls::RootCertStore) -> Result<Arc<rustls::ClientConfig>, TlsSetup> {

@@ -83,7 +83,7 @@ blaze-sort	3
 blaze-source	6
 blaze-sql	3
 blaze-squeeze	3
-blaze-std	410
+blaze-std	406
 blaze-surface	1
 blaze-swiss	3
 blaze-tar	13

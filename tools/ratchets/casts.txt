@@ -52,7 +52,7 @@ blaze-engine	129
 blaze-expand	284
 blaze-export	486
 blaze-facts	12
-blaze-fetch	219
+blaze-fetch	213
 blaze-file-items	94
 blaze-flow	144
 blaze-flow-lower	454
@@ -114,7 +114,7 @@ blaze-sort	14
 blaze-spawn	2
 blaze-sql	4
 blaze-squeeze	13
-blaze-std	425
+blaze-std	424
 blaze-store-check	15
 blaze-surface	73
 blaze-swiss	13

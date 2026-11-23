@@ -378,5 +378,34 @@ fn datagram_options_that_contradict_are_refused() {
     options.tuning.dscp = Ask::Must(Dscp::new(46).expect("EF"));
     let refused = check_udp(&options, Platform::Simulated).unwrap_err();
     assert_eq!(refused.option, Opt::Dscp);
+    options.ecn = false;
+    options.tuning.dscp = Ask::Leave;
+    options.tuning.multicast_join = Ask::Must(MulticastV4 {
+        group: core::net::Ipv4Addr::new(10, 0, 0, 1),
+        interface: core::net::Ipv4Addr::UNSPECIFIED,
+    });
+    let refused = check_udp(&options, Platform::Simulated).unwrap_err();
+    assert_eq!(refused.option, Opt::MulticastJoin);
+    assert!(matches!(refused.why, Why::Form(_)));
     println!("sockopt: datagram conflicts refused by name");
+}
+
+#[test]
+fn udp_broadcast_and_multicast_options_apply_and_read_back() {
+    let at: SocketAddr = "0.0.0.0:0".parse().expect("bind address");
+    let mut options = crate::dgram::Options::default();
+    options.tuning.reuse_address = Ask::Must(true);
+    options.tuning.reuse_port = Ask::Must(true);
+    options.tuning.broadcast = Ask::Must(true);
+    options.tuning.multicast_ttl = Ask::Must(1);
+    options.tuning.multicast_loop = Ask::Must(true);
+    options.tuning.multicast_join = Ask::WhereAvailable(MulticastV4 {
+        group: core::net::Ipv4Addr::new(239, 255, 77, 77),
+        interface: core::net::Ipv4Addr::UNSPECIFIED,
+    });
+    let sock = crate::net::udp::bind(at, options).expect("bind udp with broadcast+multicast");
+    let fd = sock.as_raw_fd();
+    assert_ne!(get_int(fd, knob_of(Call::Broadcast, false)).expect("SO_BROADCAST"), 0);
+    assert_eq!(get_multicast_u8(fd, knob_of(Call::MulticastTtl, false)).expect("IP_MULTICAST_TTL"), 1);
+    assert_ne!(get_multicast_u8(fd, knob_of(Call::MulticastLoop, false)).expect("IP_MULTICAST_LOOP"), 0);
 }

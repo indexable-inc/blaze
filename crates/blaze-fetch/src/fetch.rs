@@ -39,6 +39,8 @@
 
 #![blaze::sans_io]
 
+use core::net::{IpAddr, SocketAddr};
+
 use blaze_git_fetch::PktWhy;
 use blaze_ids::ContentId;
 use blaze_own::{Alloc, String, Vec, VecDeque};
@@ -46,6 +48,7 @@ use blaze_text::{Put, Show, Writes as _};
 
 use crate::local::{self, AdoptRefused, Miss, Try};
 use crate::pack::{Fixed, Sink};
+use crate::peer::{self, HAVE_MAX_HASHES, HasPacket};
 use crate::plan::Unit;
 use crate::unpack::{self, Made, UnpackError};
 use crate::{Plant, planted};
@@ -88,6 +91,10 @@ pub struct Limits {
     /// ([`Effect::Reserve`]); below it, in the heap and put. Every git commit is made in
     /// place: its size is known only once its pack is indexed.
     pub reserve_from: u64,
+    /// Whether to emit LAN UDP `PeerProbe`s in parallel with `static.crates.io` at `t = 0`.
+    pub peer_race: bool,
+    /// Per-request deadline for a LAN peer HTTP fetch, in nanoseconds.
+    pub peer_ask_ns: u64,
     pub unpack: unpack::Limits,
 }
 
@@ -108,6 +115,8 @@ impl Limits {
         // reservation costs a `Put` of the same bytes, 0.88 to 1.01 of it, from 16 KiB to 16 MiB
         // (the two syncs dominate both), so from 16 KiB a record is never whole in the heap.
         reserve_from: 16 << 10,
+        peer_race: true,
+        peer_ask_ns: 15_000_000_000,
         unpack: unpack::Limits::REAL,
     };
 }
@@ -131,8 +140,10 @@ pub enum Method {
 pub enum Effect<'a> {
     /// Whether the store holds `key`: answer with [`Machine::looked`].
     Lookup { unit: u32, key: ContentId },
-    /// An HTTPS request: answer with [`Machine::answered`]. A body past `most` bytes is not
+    /// An HTTP/HTTPS request: answer with [`Machine::answered`]. A body past `most` bytes is not
     /// read ([`NetFailure::TooBig`]); `deadline_ns` is on the clock the machine is given.
+    /// `https_only` is `true` for WAN origins and `false` for plain-HTTP LAN peers; `redirects`
+    /// is `0` for LAN peers so a rogue peer cannot redirect to SSRF targets.
     Http {
         ask: Ask,
         method: Method,
@@ -141,7 +152,16 @@ pub enum Effect<'a> {
         body: Vec<u8, Alloc<'a>>,
         most: u64,
         deadline_ns: u64,
+        https_only: bool,
+        redirects: u8,
     },
+    /// Broadcast/multicast a `BLZP` `HAVE` datagram asking LAN peers which of `hashes`
+    /// (at most 32 SHA-256 digests) they hold, tagged with `nonce`. Fire-and-forget at `t = 0`:
+    /// never delays `static.crates.io`, and a driver without UDP simply ignores it.
+    PeerProbe { nonce: u64, hashes: Vec<[u8; 32], Alloc<'a>> },
+    /// Cancel a losing in-flight HTTP request (`ask`) once its racing counterpart won with a
+    /// verified SHA-256, or once its peer was banned/timed out.
+    Cancel { ask: Ask },
     /// Keep `record` at `key`, whole or not at all: answer with [`Machine::stored`].
     Put { unit: u32, key: ContentId, record: Vec<u8, Alloc<'a>> },
     /// Reserve `room` bytes in place for `unit`'s record at `key` (a writable mapping of a
@@ -340,10 +360,33 @@ enum Phase {
     Adopting,
     Ready(Step),
     Asked { step: Step, seq: u32, deadline: u64 },
+    /// WAN request failed (deferred in `wan_deferred`), waiting on an in-flight LAN peer request.
+    WaitingPeer,
     /// A reservation asked: the driver keeps the answer's body until [`Machine::reserved`].
     Reserving(Step),
     Storing(Made),
     Done,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PeerFlight {
+    seq: u32,
+    peer: SocketAddr,
+    most: u64,
+    deadline: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PendingPeer {
+    unit: u32,
+    peer: SocketAddr,
+    most: u64,
+    active_transfers: u32,
+}
+
+struct ProbeBatch<'a> {
+    nonce: u64,
+    units: Vec<u32, Alloc<'a>>,
 }
 
 #[derive(Clone, Copy)]
@@ -357,6 +400,10 @@ struct State {
     held: u64,
     /// The record was made from an archive found on the machine, not downloaded.
     adopted: bool,
+    /// Whether this crate unit was already included in a LAN `PeerProbe`.
+    probed: bool,
+    /// Active LAN peer HTTP request racing WAN for this unit.
+    peer: Option<PeerFlight>,
 }
 
 /// The machine: see the module.
@@ -371,8 +418,23 @@ pub struct Machine<'p, 'l, 'a> {
     locals: VecDeque<u32, Alloc<'a>>,
     /// A unit's local try, once its local step gave nothing adopted.
     tried: Vec<Option<LocalTry>, Alloc<'a>>,
+    /// Deferred WAN failure while a LAN peer request is still in flight for the unit.
+    wan_deferred: Vec<Option<Why>, Alloc<'a>>,
     ready: VecDeque<u32, Alloc<'a>>,
     asked: Vec<u32, Alloc<'a>>,
+    /// Units with an active LAN peer HTTP request in flight.
+    peer_asked: Vec<u32, Alloc<'a>>,
+    /// Queued LAN peer HTTP requests waiting for an in-flight slot / budget.
+    peer_ready: VecDeque<PendingPeer, Alloc<'a>>,
+    /// In-flight cancellation effects waiting to be emitted.
+    cancels: VecDeque<Ask, Alloc<'a>>,
+    /// Sent UDP `HAVE` probe batches, mapping `nonce` -> probed unit indices.
+    probes: Vec<ProbeBatch<'a>, Alloc<'a>>,
+    next_probe_nonce: u64,
+    /// Peer IPs permanently banned for this command (SHA-256 mismatch, redirect, or refusal).
+    banned_peers: Vec<IpAddr, Alloc<'a>>,
+    peer_wins: u64,
+    rejected_peers: u64,
     puts: VecDeque<(u32, ContentId, Vec<u8, Alloc<'a>>), Alloc<'a>>,
     reserves: VecDeque<(u32, ContentId, u64), Alloc<'a>>,
     left: usize,
@@ -401,10 +463,21 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
         let mut states = Vec::with_capacity_in(units.len(), alloc);
         let mut outcomes = Vec::with_capacity_in(units.len(), alloc);
         let mut tried = Vec::with_capacity_in(units.len(), alloc);
+        let mut wan_deferred = Vec::with_capacity_in(units.len(), alloc);
         for _ in units {
-            states.push(State { phase: Phase::Idle, seq: 0, down: 0, most: 0, held: 0, adopted: false });
+            states.push(State {
+                phase: Phase::Idle,
+                seq: 0,
+                down: 0,
+                most: 0,
+                held: 0,
+                adopted: false,
+                probed: false,
+                peer: None,
+            });
             outcomes.push(Outcome::Pending);
             tried.push(None);
+            wan_deferred.push(None);
         }
         Machine {
             units,
@@ -414,8 +487,17 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
             lookups: VecDeque::new_in(alloc),
             locals: VecDeque::new_in(alloc),
             tried,
+            wan_deferred,
             ready: VecDeque::new_in(alloc),
             asked: Vec::new_in(alloc),
+            peer_asked: Vec::new_in(alloc),
+            peer_ready: VecDeque::new_in(alloc),
+            cancels: VecDeque::new_in(alloc),
+            probes: Vec::new_in(alloc),
+            next_probe_nonce: 1,
+            banned_peers: Vec::new_in(alloc),
+            peer_wins: 0,
+            rejected_peers: 0,
             puts: VecDeque::new_in(alloc),
             reserves: VecDeque::new_in(alloc),
             left: 0,
@@ -430,6 +512,9 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
     /// [`Machine::next_deadline`] passes.
     pub fn poll(&mut self, now: u64) -> Option<Effect<'a>> {
         self.expire(now);
+        if let Some(ask) = self.cancels.pop_front() {
+            return Some(Effect::Cancel { ask });
+        }
         if let Some(unit) = self.lookups.pop_front() {
             self.states[unit as usize].phase = Phase::Looking;
             return Some(Effect::Lookup { unit, key: self.units[unit as usize].key() });
@@ -443,6 +528,18 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
         if let Some((unit, key, room)) = self.reserves.pop_front() {
             return Some(Effect::Reserve { unit, key, room });
         }
+        // Emit a fire-and-forget LAN UDP `HAVE` probe batch (at most 32 hashes) at `t = 0`
+        // before draining `ready`, so LAN discovery runs strictly in parallel with WAN and
+        // never delays `static.crates.io`.
+        if self.limits.peer_race
+            && let Some(probe) = self.next_peer_probe()
+        {
+            return Some(probe);
+        }
+        // Launch queued LAN peer HTTP races while a peer slot and byte budget permit.
+        if let Some(effect) = self.next_peer_http(now) {
+            return Some(effect);
+        }
         // In order: the first ready unit waits for its bytes to fit, and none passes it.
         if self.asked.len() < self.limits.in_flight_most as usize
             && let Some(&unit) = self.ready.front()
@@ -454,6 +551,227 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
             }
         }
         None
+    }
+
+    /// Batches up to [`HAVE_MAX_HASHES`] unprobed `Unit::Crate` units currently in `ready`
+    /// into one [`Effect::PeerProbe`].
+    fn next_peer_probe(&mut self) -> Option<Effect<'a>> {
+        let mut probe_units = Vec::new_in(self.alloc);
+        let mut hashes = Vec::new_in(self.alloc);
+        for &unit in self.ready.iter() {
+            if hashes.len() >= HAVE_MAX_HASHES {
+                break;
+            }
+            let Ok(idx) = usize::try_from(unit) else { continue };
+            let Some(st) = self.states.get_mut(idx) else { continue };
+            if st.probed {
+                continue;
+            }
+            if let Some(&Unit::Crate { sha256, .. }) = self.units.get(idx) {
+                st.probed = true;
+                probe_units.push(unit);
+                hashes.push(sha256);
+            }
+        }
+        if hashes.is_empty() {
+            return None;
+        }
+        let nonce = self.next_probe_nonce;
+        self.next_probe_nonce = self.next_probe_nonce.wrapping_add(1).max(1);
+        self.probes.push(ProbeBatch { nonce, units: probe_units });
+        Some(Effect::PeerProbe { nonce, hashes })
+    }
+
+    /// Launches the next eligible LAN peer HTTP request from `peer_ready`, if slots and byte
+    /// budget allow.
+    fn next_peer_http(&mut self, now: u64) -> Option<Effect<'a>> {
+        let cap = usize::try_from(self.limits.in_flight_most).unwrap_or(usize::MAX);
+        while self.peer_asked.len() < cap {
+            let Some(&pending) = self.peer_ready.front() else {
+                break;
+            };
+            let Ok(idx) = usize::try_from(pending.unit) else {
+                self.peer_ready.pop_front();
+                continue;
+            };
+            let Some(&state) = self.states.get(idx) else {
+                self.peer_ready.pop_front();
+                continue;
+            };
+            let eligible = matches!(
+                state.phase,
+                Phase::Ready(Step::Crate) | Phase::Asked { step: Step::Crate, .. } | Phase::WaitingPeer
+            ) && state.peer.is_none()
+                && !self.is_peer_banned(pending.peer.ip());
+            if !eligible {
+                self.peer_ready.pop_front();
+                continue;
+            }
+            let most = if pending.most != 0 { pending.most } else { self.first_most(Step::Crate) };
+            let alone = self.in_flight == 0;
+            if !alone && self.in_flight.saturating_add(most) > self.limits.bytes_most {
+                // Byte budget tight right now; wait without blocking WAN.
+                break;
+            }
+            self.peer_ready.pop_front();
+            let Some(&Unit::Crate { sha256, .. }) = self.units.get(idx) else { continue };
+            let mut url = String::new_in(self.alloc);
+            peer::format_crate_url(pending.peer, &sha256, &mut url);
+            let deadline = now.saturating_add(self.limits.peer_ask_ns.min(self.limits.ask_ns));
+            self.hold(most);
+            let Some(st) = self.states.get_mut(idx) else { continue };
+            st.seq = st.seq.saturating_add(1);
+            let seq = st.seq;
+            st.peer = Some(PeerFlight { seq, peer: pending.peer, most, deadline });
+            self.peer_asked.push(pending.unit);
+            return Some(Effect::Http {
+                ask: Ask { unit: pending.unit, seq },
+                method: Method::Get,
+                url,
+                headers: &[],
+                body: Vec::new_in(self.alloc),
+                most,
+                deadline_ns: deadline,
+                https_only: false,
+                redirects: 0,
+            });
+        }
+        None
+    }
+
+    /// Processes a unicast `HAS` reply from `peer_addr`: validates LAN-only SSRF filter,
+    /// ban list, and probe `nonce`, then queues plain-HTTP `GET /v1/crate/<sha256>` races
+    /// against `SocketAddr::new(peer_addr.ip(), has.tcp_port)` for matching still-in-flight
+    /// crate units.
+    pub fn peer_replied(&mut self, peer_addr: SocketAddr, has: HasPacket, _now: u64) {
+        if !self.limits.peer_race {
+            return;
+        }
+        let ip = peer_addr.ip();
+        if !peer::is_lan_ip(ip) {
+            self.rejected_peers = self.rejected_peers.saturating_add(1);
+            return;
+        }
+        if has.tcp_port == 0 || has.mask == 0 || self.is_peer_banned(ip) {
+            return;
+        }
+        let Some(probe_idx) = self.probes.iter().position(|p| p.nonce == has.nonce) else {
+            self.stale = self.stale.saturating_add(1);
+            return;
+        };
+        let peer_http = SocketAddr::new(ip, has.tcp_port);
+        let Some(probe) = self.probes.get(probe_idx) else { return };
+        for (bit, &unit) in probe.units.iter().enumerate() {
+            let Ok(shift) = u32::try_from(bit) else { break };
+            if shift >= 32 || (has.mask & (1u32 << shift)) == 0 {
+                continue;
+            }
+            let Ok(idx) = usize::try_from(unit) else { continue };
+            let Some(&state) = self.states.get(idx) else { continue };
+            let eligible = matches!(
+                state.phase,
+                Phase::Ready(Step::Crate) | Phase::Asked { step: Step::Crate, .. } | Phase::WaitingPeer
+            ) && state.peer.is_none();
+            if !eligible {
+                continue;
+            }
+            if let Some(existing) = self.peer_ready.iter_mut().find(|p| p.unit == unit) {
+                if has.active_transfers < existing.active_transfers {
+                    existing.peer = peer_http;
+                    existing.active_transfers = has.active_transfers;
+                }
+            } else {
+                self.peer_ready.push_back(PendingPeer {
+                    unit,
+                    peer: peer_http,
+                    most: 0,
+                    active_transfers: has.active_transfers,
+                });
+            }
+        }
+    }
+
+    /// Number of units won by a SHA-256-verified LAN peer.
+    pub fn peer_wins(&self) -> u64 {
+        self.peer_wins
+    }
+
+    /// Number of peer replies rejected by the LAN/SSRF IP filter.
+    pub fn rejected_peers(&self) -> u64 {
+        self.rejected_peers
+    }
+
+    /// Whether `ip` has been permanently banned for this command (mismatch, redirect, or refusal).
+    pub fn is_peer_banned(&self, ip: IpAddr) -> bool {
+        self.banned_peers.iter().any(|&banned| banned == ip)
+    }
+
+    fn ban_peer(&mut self, ip: IpAddr) {
+        if !self.is_peer_banned(ip) {
+            self.banned_peers.push(ip);
+        }
+        self.peer_ready.retain(|p| p.peer.ip() != ip);
+        let mut at = 0;
+        while let Some(&unit) = self.peer_asked.get(at) {
+            let Ok(idx) = usize::try_from(unit) else {
+                at += 1;
+                continue;
+            };
+            if let Some(st) = self.states.get_mut(idx)
+                && let Some(pf) = st.peer
+                && pf.peer.ip() == ip
+            {
+                st.peer = None;
+                self.peer_asked.remove_swap(at);
+                self.in_flight -= pf.most;
+                self.cancels.push_back(Ask { unit, seq: pf.seq });
+                self.finish_peer_failure(unit);
+            } else {
+                at += 1;
+            }
+        }
+    }
+
+    fn cancel_peer_flight(&mut self, unit: u32) {
+        let Ok(idx) = usize::try_from(unit) else { return };
+        self.peer_ready.retain(|p| p.unit != unit);
+        if let Some(st) = self.states.get_mut(idx)
+            && let Some(pf) = st.peer.take()
+        {
+            self.peer_asked.retain(|&u| u != unit);
+            self.in_flight -= pf.most;
+            self.cancels.push_back(Ask { unit, seq: pf.seq });
+        }
+    }
+
+    fn finish_peer_failure(&mut self, unit: u32) {
+        let Ok(idx) = usize::try_from(unit) else { return };
+        let Some(&st) = self.states.get(idx) else { return };
+        if st.phase == Phase::WaitingPeer
+            && st.peer.is_none()
+            && !self.peer_ready.iter().any(|p| p.unit == unit)
+        {
+            let why = self
+                .wan_deferred
+                .get_mut(idx)
+                .and_then(Option::take)
+                .unwrap_or(Why::Net { failure: NetFailure::Reset });
+            self.fail(unit, why);
+        }
+    }
+
+    fn wan_fail_or_wait(&mut self, unit: u32, why: Why) {
+        let Ok(idx) = usize::try_from(unit) else { return };
+        if let Some(st) = self.states.get_mut(idx)
+            && st.peer.is_some()
+        {
+            if let Some(slot) = self.wan_deferred.get_mut(idx) {
+                *slot = Some(why);
+            }
+            st.phase = Phase::WaitingPeer;
+        } else {
+            self.fail(unit, why);
+        }
     }
 
     /// The `most` of `unit`'s next request.
@@ -653,7 +971,14 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
     /// The answer to `ask`. No time is taken: nothing waits on an answer (no backoff, D172), and
     /// a deadline is checked at the next [`Machine::poll`].
     pub fn answered(&mut self, ask: Ask, reply: Reply<'_>) {
-        let Some(state) = self.states.get(ask.unit as usize).copied() else { return };
+        let Ok(idx) = usize::try_from(ask.unit) else { return };
+        let Some(state) = self.states.get(idx).copied() else { return };
+        if let Some(pf) = state.peer
+            && pf.seq == ask.seq
+        {
+            self.peer_answered(ask.unit, pf, reply);
+            return;
+        }
         let Phase::Asked { step, seq, .. } = state.phase else {
             self.stale += 1;
             return;
@@ -675,34 +1000,147 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
                 let first = state.most == self.first_most(step);
                 let most = match said {
                     Some(said) if said > limit => {
-                        self.fail(unit, Why::TooBig { most: limit, got: said });
+                        self.wan_fail_or_wait(unit, Why::TooBig { most: limit, got: said });
                         return;
                     }
                     Some(said) if first && said > state.most => said,
                     _ if limit.min(self.limits.bytes_most) > state.most => limit.min(self.limits.bytes_most),
                     _ => {
-                        self.fail(unit, Why::Net { failure: NetFailure::TooBig { said } });
+                        self.wan_fail_or_wait(unit, Why::Net { failure: NetFailure::TooBig { said } });
                         return;
                     }
                 };
-                let state = &mut self.states[unit as usize];
+                let state = &mut self.states[idx];
                 state.most = most;
                 state.phase = Phase::Ready(step);
                 self.ready.push_back(unit);
             }
             // One try (D172): every other failure, the network's or the server's, is the unit's
             // outcome now, never a backoff and a second ask.
-            Reply::Failed(failure) => self.fail(unit, Why::Net { failure }),
-            Reply::Body { status, .. } if status != 200 => self.fail(unit, Why::Status { status }),
+            Reply::Failed(failure) => self.wan_fail_or_wait(unit, Why::Net { failure }),
+            Reply::Body { status, .. } if status != 200 => self.wan_fail_or_wait(unit, Why::Status { status }),
             Reply::Body { bytes, .. } => {
                 let most = self.most(step);
-                if bytes.len() as u64 > most {
-                    self.fail(unit, Why::TooBig { most, got: bytes.len() as u64 });
+                let got_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                if got_len > most {
+                    self.wan_fail_or_wait(unit, Why::TooBig { most, got: got_len });
                     return;
                 }
-                self.states[unit as usize].down += bytes.len() as u64;
+                self.states[idx].down += got_len;
                 self.take(unit, step, bytes);
             }
+        }
+    }
+
+    /// Handles a reply to a LAN peer HTTP request. Never fails the unit on peer errors,
+    /// timeouts, redirects, or SHA-256 mismatches; bans malicious/corrupted peers permanently
+    /// for the command and lets `static.crates.io` win.
+    fn peer_answered(&mut self, unit: u32, pf: PeerFlight, reply: Reply<'_>) {
+        let Ok(idx) = usize::try_from(unit) else { return };
+        self.peer_asked.retain(|&u| u != unit);
+        self.in_flight -= pf.most;
+        if let Some(st) = self.states.get_mut(idx) {
+            st.peer = None;
+        }
+        match reply {
+            Reply::Body { status: 200, bytes } => {
+                let got_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                if got_len > self.limits.crate_most {
+                    self.ban_peer(pf.peer.ip());
+                    self.finish_peer_failure(unit);
+                    return;
+                }
+                let Some(&Unit::Crate { sha256, .. }) = self.units.get(idx) else {
+                    self.finish_peer_failure(unit);
+                    return;
+                };
+                let got = blaze_sha256::digest(bytes);
+                if got != sha256 && !planted(Plant::StoreBeforeChecksum) {
+                    self.ban_peer(pf.peer.ip());
+                    self.finish_peer_failure(unit);
+                    return;
+                }
+                // SHA-256 verified! Cancel the racing WAN request and unpack this `.crate`.
+                let Some(st) = self.states.get_mut(idx) else { return };
+                match st.phase {
+                    Phase::Asked { seq: wan_seq, .. } => {
+                        let wan_most = st.most;
+                        self.asked.retain(|&u| u != unit);
+                        self.in_flight -= wan_most;
+                        self.cancels.push_back(Ask { unit, seq: wan_seq });
+                    }
+                    Phase::Ready(Step::Crate) => {
+                        self.ready.retain(|&u| u != unit);
+                    }
+                    Phase::WaitingPeer => {}
+                    _ => {
+                        self.stale += 1;
+                        return;
+                    }
+                }
+                self.peer_ready.retain(|p| p.unit != unit);
+                if let Some(slot) = self.wan_deferred.get_mut(idx) {
+                    *slot = None;
+                }
+                self.peer_wins = self.peer_wins.saturating_add(1);
+                if let Some(st) = self.states.get_mut(idx) {
+                    st.down += got_len;
+                }
+                self.unpack_verified_crate(unit, bytes);
+            }
+            Reply::Body { status, .. } if (300..400).contains(&status) => {
+                // Redirects from a LAN peer are forbidden (SSRF vector) -> permanent ban.
+                self.ban_peer(pf.peer.ip());
+                self.finish_peer_failure(unit);
+            }
+            Reply::Failed(NetFailure::Refused) => {
+                // Redirect refused (`redirects: 0`) or malformed peer HTTP -> permanent ban.
+                self.ban_peer(pf.peer.ip());
+                self.finish_peer_failure(unit);
+            }
+            Reply::Failed(NetFailure::TooBig { said: Some(said) })
+                if pf.most < self.limits.crate_most && said > pf.most && said <= self.limits.crate_most =>
+            {
+                if !self.is_peer_banned(pf.peer.ip()) {
+                    self.peer_ready.push_back(PendingPeer {
+                        unit,
+                        peer: pf.peer,
+                        most: said,
+                        active_transfers: 0,
+                    });
+                }
+                self.finish_peer_failure(unit);
+            }
+            Reply::Body { .. } | Reply::Failed(_) => {
+                self.finish_peer_failure(unit);
+            }
+        }
+    }
+
+    /// Unpacks a `.crate` whose SHA-256 has ALREADY been verified against the lock.
+    fn unpack_verified_crate(&mut self, unit: u32, bytes: &[u8]) {
+        let Ok(idx) = usize::try_from(unit) else { return };
+        let limits = self.limits.unpack;
+        let Some(Unit::Crate { name, version, sha256, .. }) = self.units.get(idx) else { return };
+        let room = unpack::crate_room(bytes, &limits);
+        if room.stated >= self.limits.reserve_from {
+            let body_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            self.reserve(unit, Step::Crate, body_len, room.most);
+            return;
+        }
+        match unpack::crate_record(name, version, *sha256, bytes, &limits, self.alloc) {
+            Ok((record, made)) => {
+                let Some(u) = self.units.get(idx) else { return };
+                let key = u.key();
+                let rec_len = u64::try_from(record.len()).unwrap_or(u64::MAX);
+                self.hold(rec_len);
+                if let Some(st) = self.states.get_mut(idx) {
+                    st.held = rec_len;
+                    st.phase = Phase::Storing(made);
+                }
+                self.puts.push_back((unit, key, record));
+            }
+            Err(why) => self.fail(unit, Why::Unpack(why)),
         }
     }
 
@@ -726,13 +1164,15 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
     /// The earliest time something is due without a completion: a request's deadline (there is
     /// no backoff: one try, D172).
     pub fn next_deadline(&self) -> Option<u64> {
-        self.asked
-            .iter()
-            .filter_map(|unit| match self.states[*unit as usize].phase {
-                Phase::Asked { deadline, .. } => Some(deadline),
-                _ => None,
-            })
-            .min()
+        let wan = self.asked.iter().filter_map(|unit| match self.states[*unit as usize].phase {
+            Phase::Asked { deadline, .. } => Some(deadline),
+            _ => None,
+        });
+        let peer = self.peer_asked.iter().filter_map(|unit| {
+            let idx = usize::try_from(*unit).ok()?;
+            self.states.get(idx)?.peer.map(|pf| pf.deadline)
+        });
+        wan.chain(peer).min()
     }
 
     /// Every unit wanted has its outcome.
@@ -771,9 +1211,28 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
                 Phase::Asked { deadline, .. } if deadline <= now => {
                     self.asked.swap_remove(at);
                     self.in_flight -= state.most;
-                    self.fail(unit, Why::Net { failure: NetFailure::Timeout });
+                    self.wan_fail_or_wait(unit, Why::Net { failure: NetFailure::Timeout });
                 }
                 _ => at += 1,
+            }
+        }
+        let mut pat = 0;
+        while let Some(&unit) = self.peer_asked.get(pat) {
+            let Ok(idx) = usize::try_from(unit) else {
+                pat += 1;
+                continue;
+            };
+            if let Some(st) = self.states.get_mut(idx)
+                && let Some(pf) = st.peer
+                && pf.deadline <= now
+            {
+                st.peer = None;
+                self.peer_asked.remove_swap(pat);
+                self.in_flight -= pf.most;
+                self.cancels.push_back(Ask { unit, seq: pf.seq });
+                self.finish_peer_failure(unit);
+            } else {
+                pat += 1;
             }
         }
     }
@@ -809,7 +1268,17 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
         state.phase = Phase::Asked { step, seq: state.seq, deadline };
         let ask = Ask { unit, seq: state.seq };
         self.asked.push(unit);
-        Effect::Http { ask, method, url, headers, body, most, deadline_ns: deadline }
+        Effect::Http {
+            ask,
+            method,
+            url,
+            headers,
+            body,
+            most,
+            deadline_ns: deadline,
+            https_only: true,
+            redirects: 10,
+        }
     }
 
     /// A whole answer of `step`, its length checked: verified, then unpacked or followed.
@@ -819,9 +1288,11 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
             (Unit::Crate { name, version, sha256, .. }, _) => {
                 let got = blaze_sha256::digest(bytes);
                 if got != *sha256 && !planted(Plant::StoreBeforeChecksum) {
-                    self.fail(unit, Why::Mismatch { want: *sha256, got });
+                    self.wan_fail_or_wait(unit, Why::Mismatch { want: *sha256, got });
                     return;
                 }
+                // WAN succeeded with verified SHA-256: cancel any racing LAN peer request.
+                self.cancel_peer_flight(unit);
                 let room = unpack::crate_room(bytes, &limits);
                 if room.stated >= self.limits.reserve_from {
                     self.reserve(unit, step, bytes.len() as u64, room.most);

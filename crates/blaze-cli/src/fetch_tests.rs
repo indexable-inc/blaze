@@ -80,6 +80,7 @@ fn env(io: &Io, checkout: &'static str) -> FetchEnv<'static> {
         fs: io.need_fs().expect("files"),
         sdk: crate::sdk::NONE_IN_TESTS,
         exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
+        lan_peer: crate::fetch::LanPeerConfig::DISABLED,
         heap: blaze_own::testing::heap(),
     }
 }

@@ -92,6 +92,7 @@ mod chan;
 mod close;
 mod contexts;
 mod crash;
+mod datagrams;
 mod deadlines;
 mod dirs;
 mod durable;
@@ -172,9 +173,11 @@ const CONTROL_SEEDS: u32 = 256;
 /// end them.
 const BUDGET: Duration = Duration::from_secs(3600);
 
+type Outcome<T = ()> = Result<T, String>;
+
 /// One case of a `blaze_sim::check`: `plan`, drawn from the case's tape, run with no plant; a
 /// broken invariant fails it with the plan (the tape that replays it is in the report).
-fn check<P: fmt::Debug>(plan: P, run: impl Fn(&P, Plant) -> Result<(), String>) {
+fn check<P: fmt::Debug>(plan: P, run: impl Fn(&P, Plant) -> Outcome) {
     if let Err(why) = run(&plan, Plant::None) {
         panic!("{why}\nreplay: plan {plan:?}");
     }
@@ -187,7 +190,7 @@ fn check<P: fmt::Debug>(plan: P, run: impl Fn(&P, Plant) -> Result<(), String>) 
 fn control<P: fmt::Debug>(
     plant: Plant,
     plan: impl Fn(&Tape) -> P,
-    run: impl Fn(&P, Plant) -> Result<(), String>,
+    run: impl Fn(&P, Plant) -> Outcome,
 ) {
     blaze_sim::control(Config::cases(CONTROL_SEEDS), Plant::None, plant, "", |tape, plant| {
         let plan = plan(tape);
