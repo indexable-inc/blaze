@@ -1,14 +1,15 @@
-//! RFC 8878 Zstandard frame, block, literals, and sequence decoder.
+//! RFC 8878 Zstandard frame, block, literals, and sequence decoder powered by zero-pre-zeroing
+//! [`blaze_own::ByteCursor`], pre-resolved [`SeqDecTable`], and `HUF_4X2` Huffman decoding.
 
 use core::alloc::Allocator;
 
-use blaze_own::Vec;
+use blaze_own::{ByteCursor, RevBitCursor, Vec};
 
 use crate::digest::xxh64;
 use crate::zstd::fse::{
     FseDecTable, LL_DEFAULT_LOG, LL_DEFAULT_NORM, LL_MAX_CODE, LL_MAX_LOG, ML_DEFAULT_LOG,
     ML_DEFAULT_NORM, ML_MAX_CODE, ML_MAX_LOG, OF_DEFAULT_LOG, OF_DEFAULT_NORM, OF_MAX_CODE,
-    OF_MAX_LOG, RevBitReader, SeqDecTable, SeqKind,
+    OF_MAX_LOG, SeqDecTable, SeqKind,
 };
 use crate::zstd::huffman::HuffTable;
 use crate::zstd::{
@@ -18,22 +19,22 @@ use crate::zstd::{
 const MAX_PREALLOC_HINT: usize = 16 << 20;
 const ZERO_PAGE: [u8; 4096] = [0u8; 4096];
 
-/// Extend `out` by `extra` zero bytes using 4 KiB bulk `memcpy` chunks instead of scalar byte push.
+/// Grow `lit_buf` (reused across blocks and calls) via 4 KiB bulk `memcpy` chunks.
 #[inline]
-fn grow_zeroed<A: Allocator>(out: &mut Vec<u8, A>, extra: usize) -> Result<(), ZstdError> {
-    if extra == 0 {
+fn grow_lit_buf<A: Allocator>(buf: &mut Vec<u8, A>, target: usize) -> Result<(), ZstdError> {
+    if buf.len() >= target {
         return Ok(());
     }
-    out.try_reserve(extra)?;
-    let mut rem = extra;
+    let mut rem = target - buf.len();
+    buf.try_reserve(rem)?;
     while rem >= ZERO_PAGE.len() {
-        out.try_extend_from_slice(&ZERO_PAGE)?;
+        buf.try_extend_from_slice(&ZERO_PAGE)?;
         rem -= ZERO_PAGE.len();
     }
     if rem > 0
         && let Some(tail) = ZERO_PAGE.get(..rem)
     {
-        out.try_extend_from_slice(tail)?;
+        buf.try_extend_from_slice(tail)?;
     }
     Ok(())
 }
@@ -238,6 +239,192 @@ impl FrameState {
     }
 }
 
+/// Reusable RFC 8878 Zstandard decoder context.
+///
+/// Reuses decoded Huffman/FSE table buffers and the literals scratch buffer across calls,
+/// eliminating per-frame table/scratch allocations.
+pub struct ZstdDecoder<A: Allocator + Copy> {
+    state: FrameState,
+    lit_buf: Vec<u8, A>,
+    alloc: A,
+}
+
+impl<A: Allocator + Copy> ZstdDecoder<A> {
+    /// Create a new reusable Zstandard decoder backed by `alloc`.
+    #[inline]
+    pub fn new_in(alloc: A) -> Self {
+        Self { state: FrameState::new(), lit_buf: Vec::new_in(alloc), alloc }
+    }
+
+    /// Decompress `input` into a freshly allocated `Vec<u8, A>` in this decoder's allocator.
+    pub fn decompress(&mut self, input: &[u8], limits: ZstdLimits) -> Result<Vec<u8, A>, ZstdError> {
+        let mut out = Vec::new_in(self.alloc);
+        self.decompress_into_inner(input, limits, &mut out, false)?;
+        Ok(out)
+    }
+
+    /// Decompress `input`, appending decoded bytes into `out` without pre-zeroing `out`'s spare
+    /// capacity. Callers reusing `out` across frames pay zero allocations after warmup.
+    pub fn decompress_into(
+        &mut self,
+        input: &[u8],
+        limits: ZstdLimits,
+        out: &mut Vec<u8, A>,
+    ) -> Result<(), ZstdError> {
+        self.decompress_into_inner(input, limits, out, false)
+    }
+
+    pub(crate) fn decompress_into_inner(
+        &mut self,
+        input: &[u8],
+        limits: ZstdLimits,
+        out: &mut Vec<u8, A>,
+        skip_checksum: bool,
+    ) -> Result<(), ZstdError> {
+        if input.is_empty() {
+            return Err(ZstdError::Truncated);
+        }
+
+        let start_out_len = out.len();
+        let mut cur = Cursor::new(input);
+        let mut frames: usize = 0;
+
+        while !cur.is_empty() {
+            frames = frames
+                .checked_add(1)
+                .ok_or(ZstdError::TooManyFrames { limit: limits.most_frames })?;
+            if frames > limits.most_frames {
+                return Err(ZstdError::TooManyFrames { limit: limits.most_frames });
+            }
+
+            let magic = cur.read_u32_le()?;
+            if (SKIPPABLE_MAGIC_MIN..=SKIPPABLE_MAGIC_MAX).contains(&magic) {
+                let skip_u32 = cur.read_u32_le()?;
+                let skip_len = usize::try_from(skip_u32).map_err(|_| ZstdError::Truncated)?;
+                cur.skip(skip_len)?;
+                continue;
+            }
+            if magic != ZSTD_MAGIC {
+                return Err(ZstdError::BadMagic);
+            }
+
+            let hdr = parse_frame_header(&mut cur)?;
+            let produced_so_far = out.len().saturating_sub(start_out_len);
+            if let Some(cs) = hdr.content_size {
+                let rem_cap = limits.most_output_bytes.saturating_sub(produced_so_far);
+                let rem_cap_u64 = u64::try_from(rem_cap).unwrap_or(u64::MAX);
+                if cs > rem_cap_u64 {
+                    return Err(ZstdError::OutputTooLarge { limit: limits.most_output_bytes });
+                }
+            }
+            let win_limit_u64 = u64::try_from(limits.most_window_bytes).unwrap_or(u64::MAX);
+            if hdr.window_bytes > win_limit_u64 {
+                return Err(ZstdError::WindowTooLarge {
+                    window_bytes: hdr.window_bytes,
+                    limit: limits.most_window_bytes,
+                });
+            }
+
+            let frame_start = out.len();
+            let total_output_cap = start_out_len.saturating_add(limits.most_output_bytes);
+            self.state.reset_frame();
+
+            {
+                let mut writer = out.byte_cursor();
+                // Reserve the entire frame once without zeroing (plus 32B slack for NEON wildcopy).
+                if let Some(cs) = hdr.content_size {
+                    let safe_cap = input.len().saturating_mul(16).max(65_536).min(MAX_PREALLOC_HINT);
+                    let hint = usize::try_from(cs).unwrap_or(safe_cap).min(safe_cap);
+                    writer.try_reserve(hint.saturating_add(32))?;
+                }
+
+                loop {
+                    let bh = cur.read_slice(3)?;
+                    let [b0, b1, b2] = *bh else {
+                        return Err(ZstdError::Truncated);
+                    };
+                    let hdr_u32 = u32::from_le_bytes([b0, b1, b2, 0]);
+                    let last_block = (hdr_u32 & 1) != 0;
+                    let block_type = (hdr_u32 >> 1) & 0x03;
+                    let block_size =
+                        usize::try_from(hdr_u32 >> 3).map_err(|_| ZstdError::Truncated)?;
+
+                    match block_type {
+                        0 => {
+                            if block_size > MAX_BLOCK_SIZE {
+                                return Err(ZstdError::BlockTooLarge { size: block_size });
+                            }
+                            check_output_budget(
+                                writer.len(),
+                                block_size,
+                                total_output_cap,
+                                limits.most_output_bytes,
+                            )?;
+                            let raw = cur.read_slice(block_size)?;
+                            writer.try_write_slice(raw)?;
+                        }
+                        1 => {
+                            if block_size > MAX_BLOCK_SIZE {
+                                return Err(ZstdError::BlockTooLarge { size: block_size });
+                            }
+                            check_output_budget(
+                                writer.len(),
+                                block_size,
+                                total_output_cap,
+                                limits.most_output_bytes,
+                            )?;
+                            let val = cur.read_u8()?;
+                            writer.try_fill_bytes(val, block_size)?;
+                        }
+                        2 => {
+                            if block_size > MAX_BLOCK_SIZE {
+                                return Err(ZstdError::BlockTooLarge { size: block_size });
+                            }
+                            let block_bytes = cur.read_slice(block_size)?;
+                            decode_compressed_block(
+                                block_bytes,
+                                &mut self.state,
+                                &mut self.lit_buf,
+                                &mut writer,
+                                frame_start,
+                                hdr.window_bytes,
+                                total_output_cap,
+                                limits.most_output_bytes,
+                            )?;
+                        }
+                        _ => return Err(ZstdError::BadBlockType),
+                    }
+
+                    if last_block {
+                        break;
+                    }
+                }
+                writer.finish();
+            }
+
+            if hdr.checksum_flag {
+                let expected = cur.read_u32_le()?;
+                let frame_slice = out.get(frame_start..).ok_or(ZstdError::CorruptSequences)?;
+                let hash = xxh64(frame_slice, 0);
+                let [c0, c1, c2, c3, ..] = hash.to_le_bytes();
+                let actual = u32::from_le_bytes([c0, c1, c2, c3]);
+                if !skip_checksum && actual != expected {
+                    return Err(ZstdError::ChecksumMismatch { expected, actual });
+                }
+            }
+
+            if let Some(expected) = hdr.content_size {
+                let actual = out.len().saturating_sub(frame_start);
+                if u64::try_from(actual).ok() != Some(expected) {
+                    return Err(ZstdError::ContentSizeMismatch { expected, actual });
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 enum LiteralsRef<'a> {
     Borrowed(&'a [u8]),
     Buffered(usize),
@@ -254,7 +441,6 @@ fn decode_literals<'a, A: Allocator>(
 
     match lit_type {
         0 | 1 => {
-            // Raw_Literals_Block (0) or RLE_Literals_Block (1)
             let regen_size: usize = match size_format {
                 0 | 2 => usize::from(b0 >> 3),
                 1 => {
@@ -275,10 +461,7 @@ fn decode_literals<'a, A: Allocator>(
                 Ok(LiteralsRef::Borrowed(raw))
             } else {
                 let val = cur.read_u8().map_err(|_| ZstdError::CorruptLiterals)?;
-                if lit_buf.len() < regen_size {
-                    let add = regen_size - lit_buf.len();
-                    grow_zeroed(lit_buf, add)?;
-                }
+                grow_lit_buf(lit_buf, regen_size)?;
                 if let Some(dst) = lit_buf.as_mut_slice().get_mut(..regen_size) {
                     dst.fill(val);
                 }
@@ -286,7 +469,6 @@ fn decode_literals<'a, A: Allocator>(
             }
         }
         _ => {
-            // Compressed_Literals_Block (2) or Treeless_Literals_Block (3)
             let (num_streams, regen_size, comp_size) = match size_format {
                 0 | 1 => {
                     let b1 = cur.read_u8().map_err(|_| ZstdError::CorruptLiterals)?;
@@ -340,11 +522,7 @@ fn decode_literals<'a, A: Allocator>(
                 comp_data
             };
 
-            // Reuse `lit_buf` across blocks without zeroing already-allocated bytes.
-            if lit_buf.len() < regen_size {
-                let add = regen_size - lit_buf.len();
-                grow_zeroed(lit_buf, add)?;
-            }
+            grow_lit_buf(lit_buf, regen_size)?;
             let dst = lit_buf.as_mut_slice().get_mut(..regen_size).ok_or(ZstdError::CorruptHuffman)?;
             if num_streams == 1 {
                 state.huff.decode_1_stream_into_slice(stream_data, dst)?;
@@ -407,7 +585,8 @@ fn load_seq_table(
     }
 }
 
-#[inline(always)]
+#[cold]
+#[inline(never)]
 fn resolve_offset(
     rep: &mut [usize; 3],
     offset_value: u32,
@@ -463,382 +642,150 @@ fn resolve_offset(
 fn check_output_budget(
     current_len: usize,
     add: usize,
-    most_output_bytes: usize,
+    total_output_cap: usize,
+    limit: usize,
 ) -> Result<(), ZstdError> {
-    let next = current_len.checked_add(add).ok_or(ZstdError::OutputTooLarge {
-        limit: most_output_bytes,
-    })?;
-    if next > most_output_bytes {
-        return Err(ZstdError::OutputTooLarge { limit: most_output_bytes });
+    let next = current_len.checked_add(add).ok_or(ZstdError::OutputTooLarge { limit })?;
+    if next > total_output_cap {
+        return Err(ZstdError::OutputTooLarge { limit });
     }
     Ok(())
 }
 
-#[inline(always)]
-fn copy_lits_fast(literals: &[u8], lit_pos: usize, lit_len: usize, buf: &mut [u8], out_pos: usize) {
-    if lit_len <= 16
-        && let Some(s16) = literals.get(lit_pos..).and_then(|s| s.first_chunk::<16>())
-        && let Some(d16) = buf.get_mut(out_pos..).and_then(|s| s.first_chunk_mut::<16>())
-    {
-        *d16 = *s16;
-        return;
-    }
-    if lit_len <= 32
-        && let Some(s32) = literals.get(lit_pos..).and_then(|s| s.first_chunk::<32>())
-        && let Some(d32) = buf.get_mut(out_pos..).and_then(|s| s.first_chunk_mut::<32>())
-    {
-        *d32 = *s32;
-        return;
-    }
-    copy_lits_exact(literals, lit_pos, lit_len, buf, out_pos);
-}
-
-#[cold]
-#[inline(never)]
-fn copy_lits_exact(literals: &[u8], lit_pos: usize, lit_len: usize, buf: &mut [u8], out_pos: usize) {
-    if let (Some(src), Some(dst)) = (
-        literals.get(lit_pos..lit_pos + lit_len),
-        buf.get_mut(out_pos..out_pos + lit_len),
-    ) {
-        dst.copy_from_slice(src);
-    }
-}
-
-/// Fast inline 128-bit/64-bit wild copy for common Zstandard matches (`<= 32` bytes),
-/// deferring long or overlapping matches to a `#[cold]` helper so the sequence loop keeps
-/// all state in registers.
-#[inline(always)]
-fn copy_match_in_slice(buf: &mut [u8], out_pos: usize, offset: usize, match_len: usize) {
-    let src = out_pos - offset;
-
-    if offset >= 16
-        && match_len <= 16
-        && let Some(s16) = buf.get(src..).and_then(|s| s.first_chunk::<16>())
-    {
-        let v0 = *s16;
-        if let Some(d16) = buf.get_mut(out_pos..).and_then(|s| s.first_chunk_mut::<16>()) {
-            *d16 = v0;
-            return;
-        }
-    }
-
-    if offset >= 16 && match_len <= 32 && out_pos.saturating_add(32) <= buf.len() {
-        if let Some(s16) = buf.get(src..).and_then(|s| s.first_chunk::<16>()) {
-            let v0 = *s16;
-            if let Some(d16) = buf.get_mut(out_pos..).and_then(|s| s.first_chunk_mut::<16>()) {
-                *d16 = v0;
-            }
-        }
-        if let Some(s16) = buf.get(src + 16..).and_then(|s| s.first_chunk::<16>()) {
-            let v1 = *s16;
-            if let Some(d16) = buf.get_mut(out_pos + 16..).and_then(|s| s.first_chunk_mut::<16>()) {
-                *d16 = v1;
-            }
-        }
-        return;
-    }
-
-    if offset >= 8 && match_len <= 16 && out_pos.saturating_add(16) <= buf.len() {
-        if let Some(s8) = buf.get(src..).and_then(|s| s.first_chunk::<8>()) {
-            let v0 = *s8;
-            if let Some(d8) = buf.get_mut(out_pos..).and_then(|s| s.first_chunk_mut::<8>()) {
-                *d8 = v0;
-            }
-        }
-        if match_len > 8
-            && let Some(s8) = buf.get(src + 8..).and_then(|s| s.first_chunk::<8>())
-        {
-            let v1 = *s8;
-            if let Some(d8) = buf.get_mut(out_pos + 8..).and_then(|s| s.first_chunk_mut::<8>()) {
-                *d8 = v1;
-            }
-        }
-        return;
-    }
-
-    if offset == 1
-        && match_len <= 16
-        && let Some(&byte) = buf.get(src)
-        && let Some(d16) = buf.get_mut(out_pos..).and_then(|s| s.first_chunk_mut::<16>())
-    {
-        *d16 = [byte; 16];
-        return;
-    }
-
-    copy_match_slow(buf, out_pos, src, offset, match_len);
-}
-
-#[cold]
-#[inline(never)]
-fn copy_match_slow(buf: &mut [u8], out_pos: usize, src: usize, offset: usize, match_len: usize) {
-    if offset == 1 {
-        let byte = buf.get(src).copied().unwrap_or(0);
-        if let Some(dst) = buf.get_mut(out_pos..out_pos + match_len) {
-            dst.fill(byte);
-        }
-        return;
-    }
-    if offset >= match_len {
-        if let Some((left, right)) = buf.split_at_mut_checked(out_pos)
-            && let (Some(src_s), Some(dst_s)) =
-                (left.get(src..src + match_len), right.get_mut(..match_len))
-        {
-            dst_s.copy_from_slice(src_s);
-        }
-        return;
-    }
-    // Overlapping repeat (`1 < offset < match_len`): seed `offset` bytes then double.
-    if let Some((left, right)) = buf.split_at_mut_checked(out_pos)
-        && let (Some(src_s), Some(dst_s)) = (left.get(src..out_pos), right.get_mut(..offset))
-    {
-        dst_s.copy_from_slice(src_s);
-    }
-    let mut copied = offset;
-    while copied < match_len {
-        let chunk = copied.min(match_len - copied);
-        if let Some((head, tail)) = buf.split_at_mut_checked(out_pos + copied)
-            && let (Some(src_s), Some(dst_s)) =
-                (head.get(out_pos..out_pos + chunk), tail.get_mut(..chunk))
-        {
-            dst_s.copy_from_slice(src_s);
-        }
-        copied += chunk;
-    }
-}
-
-struct SeqLoopCtx {
-    seq_idx: usize,
+struct FastSeqOut<'a> {
+    br: RevBitCursor<'a>,
     ll_state: usize,
     of_state: usize,
     ml_state: usize,
+    rep: [usize; 3],
     lit_pos: usize,
-    block_regen: usize,
+    seq_idx: usize,
 }
 
-enum SeqLoopOutcome {
-    Done,
-    NeedRoom,
-}
-
-/// Tight register-resident sequence execution loop operating directly on `&mut [u8]`.
-fn run_sequences_slice(
-    buf: &mut [u8],
-    out_pos: &mut usize,
-    literals: &[u8],
-    br: &mut RevBitReader<'_>,
+/// Dedicated zero-spill leaf loop for the fast 99.9% of Zstandard sequences (`avail >= 16`).
+/// Takes `RevBitCursor` and FSE/rep state by value so LLVM promotes every hot cursor field into
+/// AArch64 GPRs without stack spills.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn decode_sequences_fast<'a, A: Allocator>(
     ll_table: &SeqDecTable,
     of_table: &SeqDecTable,
     ml_table: &SeqDecTable,
-    rep: &mut [usize; 3],
-    ctx: &mut SeqLoopCtx,
-    num_seq: usize,
+    literals: &[u8],
+    writer: &mut ByteCursor<'_, A>,
+    mut br: RevBitCursor<'a>,
+    mut ll_state: usize,
+    mut of_state: usize,
+    mut ml_state: usize,
+    rep_in: [usize; 3],
+    last_idx: usize,
     frame_start: usize,
     win_usize: usize,
-    most_output_bytes: usize,
-) -> Result<SeqLoopOutcome, ZstdError> {
-    let buf_len = buf.len();
+    block_start_out: usize,
+    block_out_limit: usize,
+    limit: usize,
+) -> Result<FastSeqOut<'a>, ZstdError> {
     let lit_total = literals.len();
-    let mut cur_out = *out_pos;
-    let mut lit_pos = ctx.lit_pos;
-    let mut block_regen = ctx.block_regen;
-    let mut ll_state = ctx.ll_state;
-    let mut of_state = ctx.of_state;
-    let mut ml_state = ctx.ml_state;
-    let mut seq_idx = ctx.seq_idx;
-    let last_idx = num_seq - 1;
+    let mut lit_pos: usize = 0;
+    let [mut r0, mut r1, mut r2] = rep_in;
+    let mut seq_idx: usize = 0;
 
-    while seq_idx < num_seq {
+    while seq_idx < last_idx && br.avail_bytes() >= 16 {
         let ll_e = ll_table.entry_fast(ll_state);
         let of_e = of_table.entry_fast(of_state);
         let ml_e = ml_table.entry_fast(ml_state);
 
-        // Save pre-step state in case a corrupt frame exceeds preallocated `buf_len`.
-        let saved_ll = ll_state;
-        let saved_of = of_state;
-        let saved_ml = ml_state;
-
-        let (of_extra, ml_extra, ll_extra);
-        if seq_idx < last_idx && br.byte_pos() > 0 {
-            br.reload();
-            if br.byte_pos() > 0 {
-                // Fast branchless path: `bits_consumed <= 7` (57+ bits guaranteed live).
-                of_extra = br.read_bits_branchless(u32::from(of_e.extra_bits));
-                ml_extra = br.read_bits_branchless(u32::from(ml_e.extra_bits));
-                if br.bits_consumed() > 48 {
-                    br.reload();
-                    ll_extra = br
-                        .read_bits(u32::from(ll_e.extra_bits))
-                        .ok_or(ZstdError::CorruptSequences)?;
-                } else {
-                    ll_extra = br.read_bits_branchless(u32::from(ll_e.extra_bits));
-                }
-
-                if br.bits_consumed() > 38 {
-                    br.reload();
-                }
-                if br.bits_consumed() <= 38 {
-                    let ll_add = usize::try_from(br.read_bits_branchless(u32::from(ll_e.num_bits)))
-                        .map_err(|_| ZstdError::CorruptSequences)?;
-                    let ml_add = usize::try_from(br.read_bits_branchless(u32::from(ml_e.num_bits)))
-                        .map_err(|_| ZstdError::CorruptSequences)?;
-                    let of_add = usize::try_from(br.read_bits_branchless(u32::from(of_e.num_bits)))
-                        .map_err(|_| ZstdError::CorruptSequences)?;
-                    ll_state = usize::from(ll_e.baseline) + ll_add;
-                    ml_state = usize::from(ml_e.baseline) + ml_add;
-                    of_state = usize::from(of_e.baseline) + of_add;
-                } else {
-                    let ll_add = usize::try_from(
-                        br.read_bits(u32::from(ll_e.num_bits))
-                            .ok_or(ZstdError::CorruptSequences)?,
-                    )
-                    .map_err(|_| ZstdError::CorruptSequences)?;
-                    let ml_add = usize::try_from(
-                        br.read_bits(u32::from(ml_e.num_bits))
-                            .ok_or(ZstdError::CorruptSequences)?,
-                    )
-                    .map_err(|_| ZstdError::CorruptSequences)?;
-                    let of_add = usize::try_from(
-                        br.read_bits(u32::from(of_e.num_bits))
-                            .ok_or(ZstdError::CorruptSequences)?,
-                    )
-                    .map_err(|_| ZstdError::CorruptSequences)?;
-                    ll_state = usize::from(ll_e.baseline) + ll_add;
-                    ml_state = usize::from(ml_e.baseline) + ml_add;
-                    of_state = usize::from(of_e.baseline) + of_add;
-                }
-            } else {
-                // Just crossed `byte_pos == 0`: exact checked reads for final ~10 sequences.
-                of_extra = br
-                    .read_bits(u32::from(of_e.extra_bits))
-                    .ok_or(ZstdError::CorruptSequences)?;
-                ml_extra = br
-                    .read_bits(u32::from(ml_e.extra_bits))
-                    .ok_or(ZstdError::CorruptSequences)?;
-                ll_extra = br
-                    .read_bits(u32::from(ll_e.extra_bits))
-                    .ok_or(ZstdError::CorruptSequences)?;
-                let ll_add = usize::try_from(
-                    br.read_bits(u32::from(ll_e.num_bits))
-                        .ok_or(ZstdError::CorruptSequences)?,
-                )
-                .map_err(|_| ZstdError::CorruptSequences)?;
-                let ml_add = usize::try_from(
-                    br.read_bits(u32::from(ml_e.num_bits))
-                        .ok_or(ZstdError::CorruptSequences)?,
-                )
-                .map_err(|_| ZstdError::CorruptSequences)?;
-                let of_add = usize::try_from(
-                    br.read_bits(u32::from(of_e.num_bits))
-                        .ok_or(ZstdError::CorruptSequences)?,
-                )
-                .map_err(|_| ZstdError::CorruptSequences)?;
-                ll_state = usize::from(ll_e.baseline) + ll_add;
-                ml_state = usize::from(ml_e.baseline) + ml_add;
-                of_state = usize::from(of_e.baseline) + of_add;
-            }
-        } else {
-            of_extra = br
-                .read_bits(u32::from(of_e.extra_bits))
-                .ok_or(ZstdError::CorruptSequences)?;
-            ml_extra = br
-                .read_bits(u32::from(ml_e.extra_bits))
-                .ok_or(ZstdError::CorruptSequences)?;
-            ll_extra = br
-                .read_bits(u32::from(ll_e.extra_bits))
-                .ok_or(ZstdError::CorruptSequences)?;
-            if seq_idx < last_idx {
-                let ll_add = usize::try_from(
-                    br.read_bits(u32::from(ll_e.num_bits))
-                        .ok_or(ZstdError::CorruptSequences)?,
-                )
-                .map_err(|_| ZstdError::CorruptSequences)?;
-                let ml_add = usize::try_from(
-                    br.read_bits(u32::from(ml_e.num_bits))
-                        .ok_or(ZstdError::CorruptSequences)?,
-                )
-                .map_err(|_| ZstdError::CorruptSequences)?;
-                let of_add = usize::try_from(
-                    br.read_bits(u32::from(of_e.num_bits))
-                        .ok_or(ZstdError::CorruptSequences)?,
-                )
-                .map_err(|_| ZstdError::CorruptSequences)?;
-                ll_state = usize::from(ll_e.baseline) + ll_add;
-                ml_state = usize::from(ml_e.baseline) + ml_add;
-                of_state = usize::from(of_e.baseline) + of_add;
-            }
-        }
-
+        let _ = br.reload();
+        // `bits_consumed <= 7` (57 bits live): `of_extra (<=31) + ml_extra (<=16) <= 47 <= 57`.
+        let of_extra = br.read_bits_branchless(u32::from(of_e.extra_bits));
+        let ml_extra = br.read_bits_branchless(u32::from(ml_e.extra_bits));
         let offset_value = of_e.base.wrapping_add(of_extra);
         let match_len = usize::try_from(ml_e.base.wrapping_add(ml_extra))
             .map_err(|_| ZstdError::CorruptSequences)?;
+
+        // Single conditional reload before `ll_extra (<=16) + states (<=26) = 42` bits:
+        // if `bits_consumed <= 22`, all 42 bits fit without reloading; else reload leaves `<= 7`.
+        if br.bits_consumed() > 22 {
+            let _ = br.reload();
+        }
+        let ll_extra = br.read_bits_branchless(u32::from(ll_e.extra_bits));
         let lit_len = usize::try_from(ll_e.base.wrapping_add(ll_extra))
             .map_err(|_| ZstdError::CorruptSequences)?;
 
-        let lit_end = lit_pos.checked_add(lit_len).ok_or(ZstdError::CorruptSequences)?;
+        let ll_add = usize::try_from(br.read_bits_branchless(u32::from(ll_e.num_bits)))
+            .map_err(|_| ZstdError::CorruptSequences)?;
+        let ml_add = usize::try_from(br.read_bits_branchless(u32::from(ml_e.num_bits)))
+            .map_err(|_| ZstdError::CorruptSequences)?;
+        let of_add = usize::try_from(br.read_bits_branchless(u32::from(of_e.num_bits)))
+            .map_err(|_| ZstdError::CorruptSequences)?;
+        ll_state = usize::from(ll_e.baseline) + ll_add;
+        ml_state = usize::from(ml_e.baseline) + ml_add;
+        of_state = usize::from(of_e.baseline) + of_add;
+
+        let lit_end = lit_pos + lit_len;
         if lit_end > lit_total {
             return Err(ZstdError::CorruptSequences);
         }
-
-        let seq_out = lit_len.checked_add(match_len).ok_or(ZstdError::CorruptSequences)?;
-        let next_regen = block_regen.checked_add(seq_out).ok_or(ZstdError::CorruptSequences)?;
-        if next_regen > MAX_BLOCK_SIZE {
-            return Err(ZstdError::BlockTooLarge { size: next_regen });
-        }
-        check_output_budget(cur_out, seq_out, most_output_bytes)?;
-
-        let needed = cur_out + seq_out;
-        if needed > buf_len {
-            // Cold path: grow buffer and execute this single sequence in the caller.
-            *out_pos = cur_out;
-            ctx.seq_idx = seq_idx;
-            ctx.ll_state = saved_ll;
-            ctx.of_state = saved_of;
-            ctx.ml_state = saved_ml;
-            ctx.lit_pos = lit_pos;
-            ctx.block_regen = block_regen;
-            // Execute the already-decoded sequence right after caller grows `out`.
-            let _ = (offset_value, match_len, lit_len);
-            return Ok(SeqLoopOutcome::NeedRoom);
+        let next_out = writer.len() + lit_len + match_len;
+        if next_out > block_out_limit {
+            let regen = next_out - block_start_out;
+            if regen > MAX_BLOCK_SIZE {
+                return Err(ZstdError::BlockTooLarge { size: regen });
+            }
+            return Err(ZstdError::OutputTooLarge { limit });
         }
 
-        block_regen = next_regen;
-        if lit_len > 0 {
-            copy_lits_fast(literals, lit_pos, lit_len, buf, cur_out);
-            cur_out += lit_len;
-        }
-        lit_pos = lit_end;
-
-        let available = cur_out.saturating_sub(frame_start);
-        let actual_offset = resolve_offset(rep, offset_value, lit_len, available)?;
+        let available = (writer.len() + lit_len).saturating_sub(frame_start);
+        let actual_offset = if offset_value > 3 {
+            let off = usize::try_from(offset_value - 3).map_err(|_| ZstdError::CorruptSequences)?;
+            r2 = r1;
+            r1 = r0;
+            r0 = off;
+            off
+        } else if offset_value == 1 && lit_len > 0 {
+            r0
+        } else if offset_value == 2 && lit_len > 0 {
+            core::mem::swap(&mut r0, &mut r1);
+            r0
+        } else {
+            let mut rep_tmp = [r0, r1, r2];
+            let off = resolve_offset(&mut rep_tmp, offset_value, lit_len, available)?;
+            [r0, r1, r2] = rep_tmp;
+            off
+        };
         let max_off = available.min(win_usize);
         if actual_offset == 0 || actual_offset > max_off {
             return Err(ZstdError::BadOffset { offset: actual_offset, available });
         }
 
-        copy_match_in_slice(buf, cur_out, actual_offset, match_len);
-        cur_out += match_len;
+        if !writer.exec_seq_within_cap(literals, lit_pos, lit_len, actual_offset, match_len) {
+            return Err(ZstdError::OutputTooLarge { limit });
+        }
+        lit_pos = lit_end;
         seq_idx += 1;
     }
 
-    *out_pos = cur_out;
-    ctx.seq_idx = seq_idx;
-    ctx.ll_state = ll_state;
-    ctx.of_state = of_state;
-    ctx.ml_state = ml_state;
-    ctx.lit_pos = lit_pos;
-    ctx.block_regen = block_regen;
-    Ok(SeqLoopOutcome::Done)
+    Ok(FastSeqOut {
+        br,
+        ll_state,
+        of_state,
+        ml_state,
+        rep: [r0, r1, r2],
+        lit_pos,
+        seq_idx,
+    })
 }
 
+#[inline(never)]
 fn decode_compressed_block<A: Allocator>(
     block_bytes: &[u8],
     state: &mut FrameState,
     lit_buf: &mut Vec<u8, A>,
-    out: &mut Vec<u8, A>,
-    out_pos: &mut usize,
+    writer: &mut ByteCursor<'_, A>,
     frame_start: usize,
     window_bytes: u64,
-    most_output_bytes: usize,
+    total_output_cap: usize,
+    limit: usize,
 ) -> Result<(), ZstdError> {
     let mut cur = Cursor::new(block_bytes);
     let lit_ref = decode_literals(&mut cur, state, lit_buf)?;
@@ -866,16 +813,8 @@ fn decode_compressed_block<A: Allocator>(
         if !cur.is_empty() {
             return Err(ZstdError::CorruptSequences);
         }
-        check_output_budget(*out_pos, literals.len(), most_output_bytes)?;
-        let needed = *out_pos + literals.len();
-        if needed > out.len() {
-            let add = needed - out.len();
-            grow_zeroed(out, add)?;
-        }
-        if let Some(dst) = out.as_mut_slice().get_mut(*out_pos..needed) {
-            dst.copy_from_slice(literals);
-        }
-        *out_pos = needed;
+        check_output_budget(writer.len(), literals.len(), total_output_cap, limit)?;
+        writer.try_write_slice(literals)?;
         return Ok(());
     }
 
@@ -927,7 +866,7 @@ fn decode_compressed_block<A: Allocator>(
         ML_MAX_LOG,
     )?;
 
-    let mut br = RevBitReader::new(cur.rest()).ok_or(ZstdError::CorruptSequences)?;
+    let mut br = RevBitCursor::new(cur.rest()).ok_or(ZstdError::CorruptSequences)?;
     let ll_log = u32::from(state.ll_table.accuracy_log());
     let of_log = u32::from(state.of_table.accuracy_log());
     let ml_log = u32::from(state.ml_table.accuracy_log());
@@ -946,71 +885,123 @@ fn decode_compressed_block<A: Allocator>(
         return Err(ZstdError::CorruptSequences);
     }
 
-    // Ensure enough room for a full 128 KiB block (with 32 bytes slack for wild copies) so
-    // `run_sequences_slice` completes in a single zero-allocation pass.
-    let block_need = *out_pos + MAX_BLOCK_SIZE.min(most_output_bytes.saturating_sub(*out_pos));
-    if out.len() < block_need {
-        let add = block_need - out.len();
-        grow_zeroed(out, add)?;
-    }
+    // Reserve room for up to one full block (+ 48B wildcopy slack) once, with ZERO zeroing.
+    let block_start_out = writer.len();
+    let block_out_limit = block_start_out.saturating_add(MAX_BLOCK_SIZE).min(total_output_cap);
+    let block_reserve = block_out_limit.saturating_sub(block_start_out).saturating_add(48);
+    writer.try_reserve(block_reserve)?;
 
     let win_usize = usize::try_from(window_bytes).unwrap_or(usize::MAX);
-    let mut ctx = SeqLoopCtx {
-        seq_idx: 0,
-        ll_state,
-        of_state,
-        ml_state,
-        lit_pos: 0,
-        block_regen: 0,
-    };
+    let lit_total = literals.len();
+    let last_idx = num_seq - 1;
 
-    // Since `out.len() >= *out_pos + min(MAX_BLOCK_SIZE, most_output_bytes - *out_pos)`,
-    // any valid block finishes in a single call without ever returning `NeedRoom`.
-    match run_sequences_slice(
-        out.as_mut_slice(),
-        out_pos,
-        literals,
-        &mut br,
+    let FastSeqOut {
+        mut br,
+        mut ll_state,
+        mut of_state,
+        mut ml_state,
+        rep,
+        mut lit_pos,
+        mut seq_idx,
+    } = decode_sequences_fast(
         &state.ll_table,
         &state.of_table,
         &state.ml_table,
-        &mut state.rep,
-        &mut ctx,
-        num_seq,
+        literals,
+        writer,
+        br,
+        ll_state,
+        of_state,
+        ml_state,
+        state.rep,
+        last_idx,
         frame_start,
         win_usize,
-        most_output_bytes,
-    )? {
-        SeqLoopOutcome::Done => {}
-        SeqLoopOutcome::NeedRoom => return Err(ZstdError::OutputTooLarge { limit: most_output_bytes }),
+        block_start_out,
+        block_out_limit,
+        limit,
+    )?;
+
+    // Exact tail loop for the final ~10 sequences (`br.avail_bytes() < 16` or `seq_idx == last_idx`).
+    let mut block_regen = writer.len().saturating_sub(block_start_out);
+    state.rep = rep;
+    while seq_idx < num_seq {
+        let ll_e = state.ll_table.entry_fast(ll_state);
+        let of_e = state.of_table.entry_fast(of_state);
+        let ml_e = state.ml_table.entry_fast(ml_state);
+
+        let of_extra = br
+            .read_bits(u32::from(of_e.extra_bits))
+            .ok_or(ZstdError::CorruptSequences)?;
+        let ml_extra = br
+            .read_bits(u32::from(ml_e.extra_bits))
+            .ok_or(ZstdError::CorruptSequences)?;
+        let ll_extra = br
+            .read_bits(u32::from(ll_e.extra_bits))
+            .ok_or(ZstdError::CorruptSequences)?;
+        if seq_idx < last_idx {
+            let ll_add = usize::try_from(
+                br.read_bits(u32::from(ll_e.num_bits)).ok_or(ZstdError::CorruptSequences)?,
+            )
+            .map_err(|_| ZstdError::CorruptSequences)?;
+            let ml_add = usize::try_from(
+                br.read_bits(u32::from(ml_e.num_bits)).ok_or(ZstdError::CorruptSequences)?,
+            )
+            .map_err(|_| ZstdError::CorruptSequences)?;
+            let of_add = usize::try_from(
+                br.read_bits(u32::from(of_e.num_bits)).ok_or(ZstdError::CorruptSequences)?,
+            )
+            .map_err(|_| ZstdError::CorruptSequences)?;
+            ll_state = usize::from(ll_e.baseline) + ll_add;
+            ml_state = usize::from(ml_e.baseline) + ml_add;
+            of_state = usize::from(of_e.baseline) + of_add;
+        }
+
+        let offset_value = of_e.base.wrapping_add(of_extra);
+        let match_len = usize::try_from(ml_e.base.wrapping_add(ml_extra))
+            .map_err(|_| ZstdError::CorruptSequences)?;
+        let lit_len = usize::try_from(ll_e.base.wrapping_add(ll_extra))
+            .map_err(|_| ZstdError::CorruptSequences)?;
+
+        let lit_end = lit_pos.checked_add(lit_len).ok_or(ZstdError::CorruptSequences)?;
+        if lit_end > lit_total {
+            return Err(ZstdError::CorruptSequences);
+        }
+        let seq_out = lit_len.checked_add(match_len).ok_or(ZstdError::CorruptSequences)?;
+        block_regen = block_regen.checked_add(seq_out).ok_or(ZstdError::CorruptSequences)?;
+        if block_regen > MAX_BLOCK_SIZE {
+            return Err(ZstdError::BlockTooLarge { size: block_regen });
+        }
+        check_output_budget(writer.len(), seq_out, total_output_cap, limit)?;
+
+        let available = (writer.len() + lit_len).saturating_sub(frame_start);
+        let actual_offset = resolve_offset(&mut state.rep, offset_value, lit_len, available)?;
+        let max_off = available.min(win_usize);
+        if actual_offset == 0 || actual_offset > max_off {
+            return Err(ZstdError::BadOffset { offset: actual_offset, available });
+        }
+
+        if !writer.exec_seq_within_cap(literals, lit_pos, lit_len, actual_offset, match_len) {
+            return Err(ZstdError::OutputTooLarge { limit });
+        }
+        lit_pos = lit_end;
+        seq_idx += 1;
     }
 
     if !br.is_empty() {
         return Err(ZstdError::CorruptSequences);
     }
 
-    // Copy trailing literals after the final sequence.
-    let trailing = literals.get(ctx.lit_pos..).ok_or(ZstdError::CorruptSequences)?;
+    let trailing = literals.get(lit_pos..).ok_or(ZstdError::CorruptSequences)?;
     if !trailing.is_empty() {
-        let next_regen = ctx
-            .block_regen
+        block_regen = block_regen
             .checked_add(trailing.len())
             .ok_or(ZstdError::CorruptSequences)?;
-        if next_regen > MAX_BLOCK_SIZE {
-            return Err(ZstdError::BlockTooLarge { size: next_regen });
+        if block_regen > MAX_BLOCK_SIZE {
+            return Err(ZstdError::BlockTooLarge { size: block_regen });
         }
-        check_output_budget(*out_pos, trailing.len(), most_output_bytes)?;
-        let needed = *out_pos + trailing.len();
-        if needed > out.len() {
-            let add = needed - out.len();
-            grow_zeroed(out, add)?;
-        }
-        if let Some(dst) = out.as_mut_slice().get_mut(*out_pos..needed) {
-            dst.copy_from_slice(trailing);
-        } else {
-            return Err(ZstdError::CorruptSequences);
-        }
-        *out_pos = needed;
+        check_output_budget(writer.len(), trailing.len(), total_output_cap, limit)?;
+        writer.try_write_slice(trailing)?;
     }
 
     Ok(())
@@ -1022,153 +1013,8 @@ pub(crate) fn decompress_in_inner<A: Allocator + Copy>(
     alloc: A,
     skip_checksum: bool,
 ) -> Result<Vec<u8, A>, ZstdError> {
-    if input.is_empty() {
-        return Err(ZstdError::Truncated);
-    }
-
-    let mut cur = Cursor::new(input);
+    let mut dec = ZstdDecoder::new_in(alloc);
     let mut out = Vec::new_in(alloc);
-    let mut lit_buf = Vec::new_in(alloc);
-    let mut state = FrameState::new();
-    let mut frames: usize = 0;
-
-    while !cur.is_empty() {
-        frames = frames
-            .checked_add(1)
-            .ok_or(ZstdError::TooManyFrames { limit: limits.most_frames })?;
-        if frames > limits.most_frames {
-            return Err(ZstdError::TooManyFrames { limit: limits.most_frames });
-        }
-
-        let magic = cur.read_u32_le()?;
-        if (SKIPPABLE_MAGIC_MIN..=SKIPPABLE_MAGIC_MAX).contains(&magic) {
-            let skip_u32 = cur.read_u32_le()?;
-            let skip_len = usize::try_from(skip_u32).map_err(|_| ZstdError::Truncated)?;
-            cur.skip(skip_len)?;
-            continue;
-        }
-        if magic != ZSTD_MAGIC {
-            return Err(ZstdError::BadMagic);
-        }
-
-        let hdr = parse_frame_header(&mut cur)?;
-        if let Some(cs) = hdr.content_size {
-            let rem_cap = limits.most_output_bytes.saturating_sub(out.len());
-            let rem_cap_u64 = u64::try_from(rem_cap).unwrap_or(u64::MAX);
-            if cs > rem_cap_u64 {
-                return Err(ZstdError::OutputTooLarge { limit: limits.most_output_bytes });
-            }
-        }
-        let win_limit_u64 = u64::try_from(limits.most_window_bytes).unwrap_or(u64::MAX);
-        if hdr.window_bytes > win_limit_u64 {
-            return Err(ZstdError::WindowTooLarge {
-                window_bytes: hdr.window_bytes,
-                limit: limits.most_window_bytes,
-            });
-        }
-
-        let frame_start = out.len();
-        let mut out_pos = frame_start;
-
-        // Pre-stage the entire frame once using bulk NEON zeroing (plus 32B slack for wild copies).
-        if let Some(cs) = hdr.content_size {
-            let safe_cap = input.len().saturating_mul(16).max(65_536).min(MAX_PREALLOC_HINT);
-            let hint = usize::try_from(cs).unwrap_or(safe_cap).min(safe_cap);
-            grow_zeroed(&mut out, hint.saturating_add(32))?;
-        }
-
-        state.reset_frame();
-
-        loop {
-            let bh = cur.read_slice(3)?;
-            let [b0, b1, b2] = *bh else {
-                return Err(ZstdError::Truncated);
-            };
-            let hdr_u32 = u32::from_le_bytes([b0, b1, b2, 0]);
-            let last_block = (hdr_u32 & 1) != 0;
-            let block_type = (hdr_u32 >> 1) & 0x03;
-            let block_size = usize::try_from(hdr_u32 >> 3).map_err(|_| ZstdError::Truncated)?;
-
-            match block_type {
-                0 => {
-                    // Raw_Block
-                    if block_size > MAX_BLOCK_SIZE {
-                        return Err(ZstdError::BlockTooLarge { size: block_size });
-                    }
-                    check_output_budget(out_pos, block_size, limits.most_output_bytes)?;
-                    let raw = cur.read_slice(block_size)?;
-                    let needed = out_pos + block_size;
-                    if needed > out.len() {
-                        let add = needed - out.len();
-                        grow_zeroed(&mut out, add)?;
-                    }
-                    if let Some(dst) = out.as_mut_slice().get_mut(out_pos..needed) {
-                        dst.copy_from_slice(raw);
-                    }
-                    out_pos = needed;
-                }
-                1 => {
-                    // RLE_Block
-                    if block_size > MAX_BLOCK_SIZE {
-                        return Err(ZstdError::BlockTooLarge { size: block_size });
-                    }
-                    check_output_budget(out_pos, block_size, limits.most_output_bytes)?;
-                    let val = cur.read_u8()?;
-                    let needed = out_pos + block_size;
-                    if needed > out.len() {
-                        let add = needed - out.len();
-                        grow_zeroed(&mut out, add)?;
-                    }
-                    if let Some(dst) = out.as_mut_slice().get_mut(out_pos..needed) {
-                        dst.fill(val);
-                    }
-                    out_pos = needed;
-                }
-                2 => {
-                    // Compressed_Block
-                    if block_size > MAX_BLOCK_SIZE {
-                        return Err(ZstdError::BlockTooLarge { size: block_size });
-                    }
-                    let block_bytes = cur.read_slice(block_size)?;
-                    decode_compressed_block(
-                        block_bytes,
-                        &mut state,
-                        &mut lit_buf,
-                        &mut out,
-                        &mut out_pos,
-                        frame_start,
-                        hdr.window_bytes,
-                        limits.most_output_bytes,
-                    )?;
-                }
-                _ => return Err(ZstdError::BadBlockType),
-            }
-
-            if last_block {
-                break;
-            }
-        }
-
-        out.truncate(out_pos);
-
-        if hdr.checksum_flag {
-            let expected = cur.read_u32_le()?;
-            let frame_slice = out.get(frame_start..).ok_or(ZstdError::CorruptSequences)?;
-            let hash = xxh64(frame_slice, 0);
-            let [c0, c1, c2, c3, ..] = hash.to_le_bytes();
-            let actual = u32::from_le_bytes([c0, c1, c2, c3]);
-            if !skip_checksum && actual != expected {
-                return Err(ZstdError::ChecksumMismatch { expected, actual });
-            }
-        }
-
-        if let Some(expected) = hdr.content_size {
-            let actual = out.len().saturating_sub(frame_start);
-            if u64::try_from(actual).ok() != Some(expected) {
-                return Err(ZstdError::ContentSizeMismatch { expected, actual });
-            }
-        }
-    }
-
+    dec.decompress_into_inner(input, limits, &mut out, skip_checksum)?;
     Ok(out)
 }
