@@ -720,6 +720,97 @@ fn the_cutoff_oracle_catches_a_dropped_expansion_read() {
     }
 }
 
+/// When one member adds a private `fn`, `Heads` opens only that member's units (not unrelated
+/// standing members or non-member toolchain crates) and runs only its new `Signature` task.
+/// When a public struct gains a field, `Heads` still wakes downstream `Signature` tasks whose
+/// read cell moved while leaving unrelated standing members unopened, matching a fresh oracle.
+#[test]
+fn incremental_heads_opens_only_active_member_scopes_and_wakes_moved_readers() {
+    const FOUR_WORKSPACE: &str = "[workspace]\nmembers = [\"a\", \"b\", \"c\", \"d\"]\nresolver = \"2\"\n";
+    const C_MANIFEST: &str = "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+    const D_MANIFEST: &str = "[package]\nname = \"d\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nc = { path = \"../c\" }\n";
+    const C_LIB: &str = "pub struct Tag {\n    pub n: u32,\n}\n\npub fn tag(n: u32) -> Tag {\n    Tag { n }\n}\n";
+    const D_LIB: &str = "pub struct Boxed {\n    pub t: c::Tag,\n}\n\npub fn keep(t: c::Tag) -> Boxed {\n    Boxed { t }\n}\n";
+    const A_BASE: &str = "pub type Num = u32;\npub struct Point {\n    pub x: u32,\n}\n\npub fn make(p: Point) -> Point {\n    p\n}\n";
+    const A_PRIVATE: &str = "pub type Num = u32;\npub struct Point {\n    pub x: u32,\n}\n\npub fn make(p: Point) -> Point {\n    p\n}\n\nfn _private_helper() -> u32 {\n    1\n}\n";
+    const A_MOVED: &str = "pub type Num = u16;\npub struct Point {\n    pub x: u32,\n}\n\npub fn make(p: Point) -> Point {\n    p\n}\n";
+    const B_READER: &str = "pub fn take(n: a::Num) -> u32 {\n    n\n}\n\npub fn again(p: a::Point) -> a::Point {\n    a::make(p)\n}\n";
+
+    let build_world = |a_lib: &str| {
+        let io = Io::simulated(SimWorld::new(71, Limits::USUAL));
+        write(&io, "Cargo.toml", FOUR_WORKSPACE);
+        write(&io, "a/Cargo.toml", A_MANIFEST);
+        write(&io, "a/src/lib.rs", a_lib);
+        write(&io, "b/Cargo.toml", B_MANIFEST);
+        write(&io, "b/src/lib.rs", B_READER);
+        write(&io, "c/Cargo.toml", C_MANIFEST);
+        write(&io, "c/src/lib.rs", C_LIB);
+        write(&io, "d/Cargo.toml", D_MANIFEST);
+        write(&io, "d/src/lib.rs", D_LIB);
+        io
+    };
+    let run_with_shelf = |io: &Io, fresh: bool| {
+        let mut o = opts(io, 2, fresh);
+        let (id, files) = blaze_world::fixture::shelf_with_langs(graph::TRIPLE, blaze_world::fixture::STD, SHELF_CFG, o.heap.alloc());
+        for (name, bytes) in files {
+            let cx = io.cx(BUDGET, TASK_FRAME).expect("fixture shelf write context");
+            let path = Path::new(&format!("h/{}/{name}", toolchain::SHELF)).expect("fixture shelf path");
+            io.need_fs().expect("files").root().publish(&cx, &path, Content::bytes(&bytes), Durable::No).expect("write fixture shelf");
+        }
+        o.toolchain = id;
+        o.head_sources = Sources::Job;
+        o.head_units = HeadUnits::Each;
+        let before = stdout(io).len();
+        let (ids, checked) = engine_opts(io, o);
+        let text = stdout(io).split_off(before);
+        let mut lines: std::vec::Vec<std::string::String> = text.lines().filter(|l| l.contains("error[") || l.contains("warning[") || l.starts_with("note:")).map(str::to_owned).collect();
+        lines.sort_unstable();
+        Said { ids, lines, checked }
+    };
+
+    let io = build_world(A_BASE);
+    let cold = run_with_shelf(&io, false);
+    assert_eq!(cold.checked.seeds.bodies.refused, 0, "{:?}", cold.checked.bodies.0);
+    assert!(cold.checked.bodies.0.is_empty(), "{:?}", cold.checked.bodies.0);
+
+    // 1. Add an unused private fn in `a`: only 1 new Signature task enters in `Heads`,
+    //    and `Heads` opens only `a`'s 2 units (lib + test) — not `b`, `c`, `d`, or toolchain crates.
+    write(&io, "a/src/lib.rs", A_PRIVATE);
+    let private = run_with_shelf(&io, false);
+    assert_eq!(private.heads(), 1, "only the new private fn's Signature enters Heads");
+    let heads_reads = private.checked.records.reads[Stage::Heads.index()];
+    assert!(
+        heads_reads.records <= 2,
+        "Heads must open only a's own units (<= 2), not standing members or toolchain crates: {heads_reads:?}"
+    );
+    let fresh_private = run_with_shelf(&build_world(A_PRIVATE), true);
+    assert!(private.same_answer(&fresh_private), "incremental private-fn edit must match fresh oracle");
+
+    // 2. Change `a::Num` from `u32` to `u16`: `a::Num` AND `b::take`'s downstream Signature task
+    //    wake up via read-moved edges, while unrelated `c` and `d` stay unopened (<= 4 units: a + b).
+    write(&io, "a/src/lib.rs", A_MOVED);
+    let moved = run_with_shelf(&io, false);
+    let num = fixture_signature("a/src/lib.rs", A_MOVED, "Num");
+    assert!(moved.heads() >= 2, "a::Num and b::take must enter Heads ({} entered)", moved.heads());
+    assert!(
+        moved.checked.because.iter().any(|(g, _)| g.stage == Stage::Heads && g.cause == "read moved" && g.definer == Some(num)),
+        "b::take must wake in Heads with read moved on a::Num: {:?}",
+        moved.checked.because
+    );
+    assert!(
+        moved.lines.iter().any(|line| line.contains("b/src/lib.rs:") && line.contains("error[types]")),
+        "b::take must report the type mismatch after a::Num changed to u16: {:?}",
+        moved.lines
+    );
+    let moved_reads = moved.checked.records.reads[Stage::Heads.index()];
+    assert!(
+        moved_reads.records <= 4,
+        "Heads must open only a and b's units (<= 4), leaving c, d, and toolchain crates unopened: {moved_reads:?}"
+    );
+    let fresh_moved = run_with_shelf(&build_world(A_MOVED), true);
+    assert!(moved.same_answer(&fresh_moved), "incremental cross-crate head edit must match fresh oracle");
+}
+
 // THE RACE.
 
 /// One cell of the race, and its two freezes' bytes.
