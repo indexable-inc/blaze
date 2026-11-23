@@ -121,7 +121,7 @@ struct BoundAt {
     var: u32,
 }
 
-struct Walk<'w, 'c, A: Allocator + Clone> {
+struct Walk<'w, 'c, A: Allocator + Copy> {
     types: &'c dyn RegionTypes,
     sig_types: &'c dyn RegionTypes,
     selected: &'c dyn Selected,
@@ -150,13 +150,13 @@ enum AskAt<'c> {
 
 /// [`AskArgs`] over a walk: each argument followed through its environment and compared with a
 /// row's type erased (`Walk::erased`), within one step budget for the whole ask.
-struct Keyer<'k, 'w, 'c, A: Allocator + Clone> {
+struct Keyer<'k, 'w, 'c, A: Allocator + Copy> {
     walk: &'k Walk<'w, 'c, A>,
     at: AskAt<'c>,
     budget: Cell<u32>,
 }
 
-impl<'c, A: Allocator + Clone> Keyer<'_, '_, 'c, A> {
+impl<'c, A: Allocator + Copy> Keyer<'_, '_, 'c, A> {
     /// The `k`-th argument.
     fn arg(&self, k: u32) -> Option<Side<'c>> {
         match self.at {
@@ -167,7 +167,7 @@ impl<'c, A: Allocator + Clone> Keyer<'_, '_, 'c, A> {
     }
 }
 
-impl<A: Allocator + Clone> AskArgs for Keyer<'_, '_, '_, A> {
+impl<A: Allocator + Copy> AskArgs for Keyer<'_, '_, '_, A> {
     fn count(&self) -> Option<u32> {
         match self.at {
             AskAt::Kids(s) => self.walk.kids_of(s).ok().map(|k| k.len()),
@@ -191,7 +191,7 @@ enum Resolved<'c> {
     Unbound { env: crate::inst::EnvId, param: u32 },
 }
 
-impl<'w, 'c, A: Allocator + Clone> Walk<'w, 'c, A> {
+impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     fn malformed(&self, node: PTy, what: Bad) -> Refused {
         Refused::Malformed { item: self.item, node, what }
     }
@@ -1013,7 +1013,7 @@ fn is_const(n: PNode) -> bool {
     matches!(n, PNode::ConstValue { .. } | PNode::ConstParam(_))
 }
 
-fn walker<'w, 'c, 'k: 'c, A: Allocator + Clone>(cx: &'w mut Cx<'k, '_>, envs: &'w mut Envs<'c, A>, item: ItemKey) -> Walk<'w, 'c, A> {
+fn walker<'w, 'c, 'k: 'c, A: Allocator + Copy>(cx: &'w mut Cx<'k, '_>, envs: &'w mut Envs<'c, A>, item: ItemKey) -> Walk<'w, 'c, A> {
     Walk {
         types: cx.types,
         sig_types: cx.sig_types,
@@ -1032,7 +1032,7 @@ fn walker<'w, 'c, 'k: 'c, A: Allocator + Clone>(cx: &'w mut Cx<'k, '_>, envs: &'
 
 /// `a` flows where `b` is wanted, under `v`, over the call's environments `envs`; `item` the
 /// item a refusal names.
-pub fn relate_sides<'c, 'k: 'c, A: Allocator + Clone>(
+pub fn relate_sides<'c, 'k: 'c, A: Allocator + Copy>(
     cx: &mut Cx<'k, '_>,
     envs: &mut Envs<'c, A>,
     item: ItemKey,
@@ -1044,7 +1044,7 @@ pub fn relate_sides<'c, 'k: 'c, A: Allocator + Clone>(
 }
 
 /// Two of the caller's values related under `v` (an assignment, a coercion site's subtyping).
-pub fn relate<A: Allocator + Clone>(cx: &mut Cx<'_, '_>, a: Arg, b: Arg, v: Variance, item: ItemKey, alloc: A) -> Result<(), Refused> {
+pub fn relate<A: Allocator + Copy>(cx: &mut Cx<'_, '_>, a: Arg, b: Arg, v: Variance, item: ItemKey, alloc: A) -> Result<(), Refused> {
     let mut envs: Envs<'_, A> = Envs::new_in(alloc);
     relate_sides(cx, &mut envs, item, Side::caller(a), Side::caller(b), v)
 }
@@ -1052,7 +1052,7 @@ pub fn relate<A: Allocator + Clone>(cx: &mut Cx<'_, '_>, a: Arg, b: Arg, v: Vari
 /// The well-formedness of each of `inst`'s inputs and its output at the call ([`Walk::wf`]):
 /// a call's instance of `&'a &'b T` makes `'b: 'a` hold, as the declaration's implied bound
 /// promised the callee.
-pub fn well_formed<'c, 'k: 'c, A: Allocator + Clone>(cx: &mut Cx<'k, '_>, inst: &mut Inst<'c, A>) -> Result<(), Refused> {
+pub fn well_formed<'c, 'k: 'c, A: Allocator + Copy>(cx: &mut Cx<'k, '_>, inst: &mut Inst<'c, A>) -> Result<(), Refused> {
     let item = inst.item;
     let mut w = walker(cx, &mut inst.envs, item);
     for &input in inst.inputs.iter() {
@@ -1062,7 +1062,7 @@ pub fn well_formed<'c, 'k: 'c, A: Allocator + Clone>(cx: &mut Cx<'k, '_>, inst: 
 }
 
 /// The instantiated clauses of `inst` turned into outlives constraints.
-pub fn clauses<'c, 'k: 'c, A: Allocator + Clone>(cx: &mut Cx<'k, '_>, inst: &mut Inst<'c, A>) -> Result<(), Refused> {
+pub fn clauses<'c, 'k: 'c, A: Allocator + Copy>(cx: &mut Cx<'k, '_>, inst: &mut Inst<'c, A>) -> Result<(), Refused> {
     let item = inst.item;
     let mut w = walker(cx, &mut inst.envs, item);
     for c in inst.clauses.iter() {

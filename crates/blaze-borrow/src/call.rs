@@ -24,7 +24,7 @@ use crate::{Bad, Refused, Variance};
 /// The call of `callee` with `generics`, the values `args` (in input order: a method's
 /// receiver first) and the destination `dest`; its constraints go to `cx.out`. The caller has
 /// pushed the call's statement to the flow first (the constraints hold at its Mid).
-pub fn call<'c, 'k: 'c, A: Allocator + Clone>(
+pub fn call<'c, 'k: 'c, A: Allocator + Copy>(
     cx: &mut Cx<'k, '_>,
     callee: Callee<'c>,
     generics: GenericArgs<'_>,

@@ -68,11 +68,11 @@ pub struct StateRecipe<A: Allocator> {
 /// Refused by name: the saved set past its bound (`Form::Bound`), a local with no type or
 /// identity row (`Form::Malformed`), two saved locals of one identity (`Form::IdentityTwice`,
 /// at the expression: the builder could not tell which one a slot holds).
-pub fn state_recipe<A: Allocator + Clone, B: Allocator + Clone>(body: &BodyView<'_>, lowered: &LoweredAsync<A>, alloc: B) -> Result<StateRecipe<B>, Refusal> {
+pub fn state_recipe<A: Allocator + Copy, B: Allocator + Clone>(body: &BodyView<'_>, lowered: &LoweredAsync<A>, alloc: B) -> Result<StateRecipe<B>, Refusal> {
     let range = lowered.range;
     let flow = &lowered.flow;
     // `saved` takes the flow's own allocator `A` (its answer is read here and dropped).
-    let saved = blaze_flow::saved(flow, flow.stmts.allocator().clone()).map_err(|_| Refusal { form: Form::Bound, range })?;
+    let saved = blaze_flow::saved(flow, *flow.stmts.allocator()).map_err(|_| Refusal { form: Form::Bound, range })?;
     let mut out = Vec::new_in(alloc);
     for l in (flow.args + 1)..flow.locals {
         if !saved.is_saved(Local(l)) {

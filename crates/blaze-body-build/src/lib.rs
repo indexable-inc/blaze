@@ -35,7 +35,8 @@
 
 
 extern crate alloc;
-use alloc::vec::Vec;
+use alloc::vec::Vec as AllocVec;
+use blaze_own::Vec;
 mod frame;
 mod term;
 mod value;
@@ -164,7 +165,7 @@ pub(crate) struct Cx<'a, 'g, 't, A: Allocator + Copy> {
     /// How the result leaves: `_0`'s pass.
     pub(crate) ret: Pass,
     /// By function reference place: the instance, and the reference made for it.
-    pub(crate) refs: Vec<Instance, A>,
+    pub(crate) refs: AllocVec<Instance, A>,
     pub(crate) ref_ids: Vec<RefId, A>,
     /// The row being built, which every error names.
     pub(crate) stmt: Option<Stmt>,
@@ -206,7 +207,7 @@ pub fn build<A: Allocator + Copy>(
         blocks: Vec::new_in(alloc),
         exn: None,
         ret: Pass::Ignore,
-        refs: Vec::new_in(alloc),
+        refs: AllocVec::new_in(alloc),
         ref_ids: Vec::new_in(alloc),
         stmt: None,
     };
@@ -216,12 +217,12 @@ pub fn build<A: Allocator + Copy>(
     Ok(Built {
         func,
         refs: cx.refs,
-        statics: Vec::new_in(alloc),
-        thread_locals: Vec::new_in(alloc),
+        statics: AllocVec::new_in(alloc),
+        thread_locals: AllocVec::new_in(alloc),
         // This builder marks no `unreachable` with its construct yet: its records carry no trap
         // rows (blaze-code record.rs `TrapSource`), so a fault in them is said by its code alone.
-        traps: Vec::new_in(alloc),
-        vtables: Vec::new_in(alloc),
+        traps: AllocVec::new_in(alloc),
+        vtables: AllocVec::new_in(alloc),
         // This builder has no `copy` of its own (blaze-build walk.rs): none counted.
         copy_insts: 0,
     })

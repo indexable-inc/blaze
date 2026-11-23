@@ -81,7 +81,7 @@ pub(crate) trait CallRule: Sized {
     /// THE GRAIN of a place's origins (grain.rs): the flow's positions under the old paths
     /// (and the witness), the type's region slots under the one rule (D156, D190 step 3).
     type Grain: Grain;
-    fn call<F: Facts, A: Allocator + Clone>(l: &mut Lower<'_, '_, F, A, Self>, site: &CallSite<'_>) -> Result<(), Refusal>;
+    fn call<F: Facts, A: Allocator + Copy>(l: &mut Lower<'_, '_, F, A, Self>, site: &CallSite<'_>) -> Result<(), Refusal>;
 }
 
 /// The WITNESS lowering's rule (typeck.md "Witness records", W1): a call's statements (operands
@@ -98,7 +98,7 @@ impl CallRule for Erased {
     const ONE: bool = false;
     const RELATES: bool = false;
     type Grain = Positions;
-    fn call<F: Facts, A: Allocator + Clone>(_: &mut Lower<'_, '_, F, A, Self>, _: &CallSite<'_>) -> Result<(), Refusal> {
+    fn call<F: Facts, A: Allocator + Copy>(_: &mut Lower<'_, '_, F, A, Self>, _: &CallSite<'_>) -> Result<(), Refusal> {
         Ok(())
     }
 }
@@ -110,7 +110,7 @@ impl CallRule for OldPaths {
     const ONE: bool = false;
     const RELATES: bool = true;
     type Grain = Positions;
-    fn call<F: Facts, A: Allocator + Clone>(l: &mut Lower<'_, '_, F, A, Self>, site: &CallSite<'_>) -> Result<(), Refusal> {
+    fn call<F: Facts, A: Allocator + Copy>(l: &mut Lower<'_, '_, F, A, Self>, site: &CallSite<'_>) -> Result<(), Refusal> {
         l.call_old(site)
     }
 }
@@ -130,7 +130,7 @@ impl<const DROP_ONE: bool> CallRule for OneRuleOf<DROP_ONE> {
     const ONE: bool = true;
     const RELATES: bool = true;
     type Grain = RegionSlots;
-    fn call<F: Facts, A: Allocator + Clone>(l: &mut Lower<'_, '_, F, A, Self>, site: &CallSite<'_>) -> Result<(), Refusal> {
+    fn call<F: Facts, A: Allocator + Copy>(l: &mut Lower<'_, '_, F, A, Self>, site: &CallSite<'_>) -> Result<(), Refusal> {
         l.call_one(site, DROP_ONE, true)
     }
 }
@@ -147,7 +147,7 @@ impl CallRule for OneRuleUntied {
     const ONE: bool = true;
     const RELATES: bool = true;
     type Grain = RegionSlots;
-    fn call<F: Facts, A: Allocator + Clone>(l: &mut Lower<'_, '_, F, A, Self>, site: &CallSite<'_>) -> Result<(), Refusal> {
+    fn call<F: Facts, A: Allocator + Copy>(l: &mut Lower<'_, '_, F, A, Self>, site: &CallSite<'_>) -> Result<(), Refusal> {
         l.call_one(site, false, false)
     }
 }
@@ -599,14 +599,14 @@ fn clause_of<'v>(heads: &dyn RegionTypes, views: &'v [ClauseView<'v>], p: u32, t
 }
 
 /// The one rule's constraints into the lowering's builder, at the call statement it pushed.
-struct Sink<'s, A: Allocator + Clone> {
+struct Sink<'s, A: Allocator + Copy> {
     b: &'s mut Builder<A>,
     static_: Origin,
     /// The planted control: drop the next subset.
     drop_next: bool,
 }
 
-impl<A: Allocator + Clone> Constraints for Sink<'_, A> {
+impl<A: Allocator + Copy> Constraints for Sink<'_, A> {
     fn subset(&mut self, a: Origin, b: Origin) {
         if self.drop_next {
             self.drop_next = false;
@@ -623,7 +623,7 @@ impl<A: Allocator + Clone> Constraints for Sink<'_, A> {
     }
 }
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R> {
+impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> {
     /// The call `site` related by the rule `R`; with a log kept (oracle.rs), the call's record:
     /// its subsets' extent, its endpoints' labels and the rule's answer.
     pub(crate) fn call_by_rule(&mut self, site: &CallSite<'_>) -> Result<(), Refusal> {
@@ -669,7 +669,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
     /// silent. Before the slot grain the one rule refused every such call
     /// (`PositionsNotSlots`), so no comparison made before is lost.
     fn site_labels(&self, site: &CallSite<'_>) -> (Vec<(Origin, Label), A>, u32) {
-        let mut out: Vec<(Origin, Label), A> = Vec::new_in(self.alloc.clone());
+        let mut out: Vec<(Origin, Label), A> = Vec::new_in(self.alloc);
         let facts: &'b F = self.facts;
         let arity = FactsArity { facts };
         let types = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &[]);
@@ -743,7 +743,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
         // The caller's types counted in the rule's grain: under the slot grain each body type
         // of this body (a closure, an async block) its own slots (grain.rs `BodyTypes`), as its
         // value was laid; under the positions none, so the table is `Columns` alone.
-        let mut bodies: Vec<(PTy, SlotCount), A> = Vec::new_in(self.alloc.clone());
+        let mut bodies: Vec<(PTy, SlotCount), A> = Vec::new_in(self.alloc);
         if <R::Grain as Grain>::SLOTS {
             for &t in self.list(g, e)? {
                 self.body_slots(t, &mut bodies, e)?;
@@ -760,8 +760,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
 
         // The origin column: the early-bound lifetimes', each type argument's, each value's,
         // the destination's.
-        let mut col: Vec<Origin, A> = Vec::new_in(self.alloc.clone());
-        let mut seen: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut col: Vec<Origin, A> = Vec::new_in(self.alloc);
+        let mut seen: Vec<u32, A> = Vec::new_in(self.alloc);
         let mut early = 0u32;
         for i in 0..params.count() {
             if params.is_late(i) == Ok(false) {
@@ -769,7 +769,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
             }
         }
         let lifetimes = self.fresh_slots(&mut col, early, item, e)?;
-        let mut types: Vec<Arg, A> = Vec::new_in(self.alloc.clone());
+        let mut types: Vec<Arg, A> = Vec::new_in(self.alloc);
         for &t in self.list(g, e)? {
             let n = match caller.count(t) {
                 Ok(n) => n.get(),
@@ -779,7 +779,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
             let at = self.fresh_slots(&mut col, n, item, e)?;
             types.push(Arg { ty: t, at });
         }
-        let mut args: Vec<Arg, A> = Vec::new_in(self.alloc.clone());
+        let mut args: Vec<Arg, A> = Vec::new_in(self.alloc);
         for v in site.vs.iter() {
             let at = match v.at {
                 At::Place(p) => Some(self.info(p)),
@@ -791,10 +791,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
         let dest = self.value_slots(site.ty, Some(site.out), &caller, &mut col, &mut seen, item, e)?;
         // Each body type among the call's types: the caller's parameters its captures hold
         // (`Owner::body_params`, read by the components rule), their `ρ_P` made with the rest.
-        let mut body_rows: Vec<(PTy, u32, u32), A> = Vec::new_in(self.alloc.clone());
-        let mut held: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut body_rows: Vec<(PTy, u32, u32), A> = Vec::new_in(self.alloc);
+        let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
         for &(t, _) in bodies.iter() {
-            let mut one: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+            let mut one: Vec<u32, A> = Vec::new_in(self.alloc);
             if closures_related {
                 self.captured_params(t, e, &mut one)?;
             }
@@ -809,7 +809,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
         }
 
         // The callee's signature and clauses, in the heads' table.
-        let (inputs, output) = match blaze_borrow::split_fn_col(&heads, item, life.regions().col, self.alloc.clone()) {
+        let (inputs, output) = match blaze_borrow::split_fn_col(&heads, item, life.regions().col, self.alloc) {
             Ok(io) => io,
             Err(r) => return self.one_refuse(item, OneRuleWhy::of(r), e),
         };
@@ -821,8 +821,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
             Ok(o) => o,
             Err(unread) => return self.refuse(Form::RegionsUnread { item: unread.item, why: unread.why }, e),
         };
-        let mut clauses: Vec<ClauseIn<'_>, A> = Vec::new_in(self.alloc.clone());
-        let mut subjects: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut clauses: Vec<ClauseIn<'_>, A> = Vec::new_in(self.alloc);
+        let mut subjects: Vec<u32, A> = Vec::new_in(self.alloc);
         for o in outs.iter() {
             match *o {
                 Outlives::Type { clause, region } => {
@@ -843,7 +843,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
         // Clause`: `F: FnOnce(T) -> U` and its `Output` binding): their equation is
         // `tie_closure_args`'s below (a superset of it), never asked of a selection here (the
         // builtin rule for a closure is no impl).
-        let mut sig_clauses: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut sig_clauses: Vec<u32, A> = Vec::new_in(self.alloc);
         for &t in self.list(g, e)? {
             let PNode::Closure { owner, ordinal, .. } = self.node(t, e)? else { continue };
             if owner != self.body.owner {
@@ -914,7 +914,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
             let who = CallOwner { item: owner, uni: &self.uni, params: &self.param_origs, bounds, heads: &heads, bodies: BodyParams { rows: &body_rows, held: &held } };
             let mut sink = Sink { b: &mut self.b, static_, drop_next: drop_first };
             let mut cx = Cx { types: &caller, sig_types: &heads, selected: &sel, owner: &who, origins: &col, out: &mut sink };
-            blaze_borrow::call(&mut cx, Callee::Fn(sig), GenericArgs { lifetimes, types: &types }, &args, dest, self.alloc.clone())
+            blaze_borrow::call(&mut cx, Callee::Fn(sig), GenericArgs { lifetimes, types: &types }, &args, dest, self.alloc)
         };
         if let Err(r) = res {
             return self.one_refuse(item, OneRuleWhy::of(r), e);
@@ -965,7 +965,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
         // the column, in parameter order). A lifetime written in a where-clause is early-bound
         // (the Reference, "Generic parameters": late-bound only when it appears in no bound);
         // a `Late` one asked is the old paths' fresh origin (`Lower::instance`).
-        let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc.clone());
+        let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc);
         let mut j = 0u32;
         for i in 0..params.count() {
             if params.is_late(i) != Ok(false) {
@@ -1035,7 +1035,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
     /// (`Columns`) part: an opaque type, an alias, a fn item with argument slots, a trait
     /// object with predicate slots, a body's type, an inference leftover.
     fn positions_differ(&self, t: PTy, caller: &BodyTypes<'_>, e: ExprId) -> Result<Option<PTy>, Refusal> {
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
         stack.push(t);
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
@@ -1080,7 +1080,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
     /// Each type parameter of the caller `t` holds, into `seen` (their `ρ_P` are made before
     /// the call: `Owner::param` only reads).
     fn note_params(&self, t: PTy, e: ExprId, seen: &mut Vec<u32, A>) -> Result<(), Refusal> {
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
         stack.push(t);
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
@@ -1142,7 +1142,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
     /// `compute_components`), so `F: 'static` of a closure holding a `P` asks `P: 'static`.
     fn captured_params(&self, t: PTy, e: ExprId, out: &mut Vec<u32, A>) -> Result<(), Refusal> {
         let ck = self.ck;
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
         stack.push(t);
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {

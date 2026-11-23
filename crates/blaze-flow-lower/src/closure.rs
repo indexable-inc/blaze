@@ -83,7 +83,7 @@ use crate::{At, ClosureSigWhy, Facts, Form, Lower, Lowered, MOST_POSITIONS, Refu
 
 /// The body of closure `closure` (an `Expr::Closure` of `body`, not `async`) as its own flow:
 /// its captures, then its parameters, as the arguments (the module doc).
-pub fn lower_closure<A: Allocator + Clone, F: Facts>(
+pub fn lower_closure<A: Allocator + Copy, F: Facts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     closure: ExprId,
@@ -132,7 +132,7 @@ pub enum SigSlot {
 }
 
 /// A closure's flow and what each of its placeholders stands for in the owner.
-pub struct ClosureFlow<A: Allocator + Clone> {
+pub struct ClosureFlow<A: Allocator + Copy> {
     pub lowered: Lowered<A>,
     /// `(placeholder, what it stands for)`, one row per placeholder the walk made.
     pub externals: Vec<(blaze_flow::Origin, External), A>,
@@ -231,7 +231,7 @@ pub fn escapes_closure<A: Allocator>(
 /// [`lower_closure`], with what each placeholder of the flow stands for in the owner
 /// ([`ClosureFlow::externals`]), so the flow's outlives results among its captures become the
 /// owner's requirements ([`requirement`]).
-pub fn lower_closure_external<A: Allocator + Clone, F: Facts>(
+pub fn lower_closure_external<A: Allocator + Copy, F: Facts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     closure: ExprId,
@@ -243,7 +243,7 @@ pub fn lower_closure_external<A: Allocator + Clone, F: Facts>(
 
 /// [`lower_closure_external`] under the call rule `R`; with `logged` (the oracle's comparing
 /// lowering, lib.rs `lower_with`) each call's record into `log`, kept on a refusal too.
-pub(crate) fn lower_closure_with<A: Allocator + Clone, F: Facts, R: crate::one_call::CallRule>(
+pub(crate) fn lower_closure_with<A: Allocator + Copy, F: Facts, R: crate::one_call::CallRule>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     closure: ExprId,
@@ -285,9 +285,9 @@ pub(crate) fn lower_closure_with<A: Allocator + Clone, F: Facts, R: crate::one_c
         _ => return Err(Refusal { form: Form::Malformed, range }),
     };
     let Some(row) = row else { return Err(Refusal { form: Form::Malformed, range }) };
-    let mut l: Lower<'_, '_, F, A, R> = Lower::new(body, ck, facts, alloc.clone())?;
+    let mut l: Lower<'_, '_, F, A, R> = Lower::new(body, ck, facts, alloc)?;
     if logged {
-        l.b.start_log(alloc.clone());
+        l.b.start_log(alloc);
         l.per_call = true;
     }
     let mut externals: Vec<(Origin, External), A> = Vec::new_in(alloc);
@@ -307,7 +307,7 @@ pub(crate) fn lower_closure_with<A: Allocator + Clone, F: Facts, R: crate::one_c
 /// The body of an `async fn` (`BodyView::coroutine` is `Some`) as its own flow, its `.await`s
 /// suspensions (the module doc). A body that is not an `async fn`'s is refused as malformed:
 /// [`crate::lower`] takes it.
-pub fn lower_async_fn<A: Allocator + Clone, F: Facts>(
+pub fn lower_async_fn<A: Allocator + Copy, F: Facts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     facts: &F,
@@ -317,7 +317,7 @@ pub fn lower_async_fn<A: Allocator + Clone, F: Facts>(
 }
 
 /// [`lower_async_fn`] under the call rule `R`, logged as [`lower_closure_with`].
-pub(crate) fn lower_async_fn_with<A: Allocator + Clone, F: Facts, R: crate::one_call::CallRule>(
+pub(crate) fn lower_async_fn_with<A: Allocator + Copy, F: Facts, R: crate::one_call::CallRule>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     facts: &F,
@@ -329,7 +329,7 @@ pub(crate) fn lower_async_fn_with<A: Allocator + Clone, F: Facts, R: crate::one_
     if body.coroutine.is_none() {
         return Err(Refusal { form: Form::Malformed, range });
     }
-    let mut l: Lower<'_, '_, F, A, R> = Lower::new(body, ck, facts, alloc.clone())?;
+    let mut l: Lower<'_, '_, F, A, R> = Lower::new(body, ck, facts, alloc)?;
     if logged {
         l.b.start_log(alloc);
         l.per_call = true;
@@ -349,7 +349,7 @@ pub(crate) fn lower_async_fn_with<A: Allocator + Clone, F: Facts, R: crate::one_
     Ok(Lowered { flow, stats, params: l.param_origs, coarse: l.coarse.get() })
 }
 
-impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
+impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
     /// The walk of closure `closure`'s body `inner`: as `run`, with the captures then the
     /// parameters as the arguments and the signature's output as the return place.
     /// `row`: the closure's row of `Checked::closures`; `sig`: the parameters' types and the
@@ -371,7 +371,7 @@ impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_,
         // The closure's environment fields, in order (blaze-typeck env_fields.rs, the active
         // strategy: whole bindings, or one field per captured place): argument `1 + k` is field
         // `k`, as the closure value lays them (`closure_value`, `npos`).
-        let mut rows: Vec<(PatId, CaptureKind), A> = Vec::new_in(self.alloc.clone());
+        let mut rows: Vec<(PatId, CaptureKind), A> = Vec::new_in(self.alloc);
         for f in ck.env_fields(closure) {
             // A field holding a PROJECTED place (`x.a`, `(*r).b`) is not a binding of the body:
             // its upvar is the field's own place (capture_places.rs `place_upvar`, wired at the
@@ -383,7 +383,7 @@ impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_,
         }
         let nu = rows.len() as u32;
         let np = params.len() as u32;
-        self.b.replace(FlowBuilder::new_in(1 + nu + np, nu + np, self.alloc.clone()));
+        self.b.replace(FlowBuilder::new_in(1 + nu + np, nu + np, self.alloc));
         self.nargs = nu + np;
         let entry = self.b.block();
         self.ret_block = self.b.block();
@@ -471,7 +471,7 @@ impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_,
         // (`Need::Sig`) and a refusal when it is universal. (The known `capture: return place`
         // the walk once assumed held only for a covariant output bound to the value; it is
         // gone with the positions that make the relation the owner's.)
-        let mut slots: Vec<SigSlot, A> = Vec::new_in(self.alloc.clone());
+        let mut slots: Vec<SigSlot, A> = Vec::new_in(self.alloc);
         self.sig_slots(row, closure, &mut slots)?;
         if slots.len() != all - upvar_origins {
             return self.refuse(Form::SigPositionsUnaligned { positions: all - upvar_origins, regions: slots.len(), site: crate::SigSite::ClosureSlots }, closure);
@@ -500,7 +500,7 @@ impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_,
             }
         }
         // Each argument's and the return place's implied bounds.
-        let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+        let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
         for l in 0..=self.nargs {
             let (start, _) = self.local_origs[l as usize];
             let t = self.local_ty[l as usize];
@@ -576,7 +576,7 @@ pub(crate) fn node_kind(n: PNode) -> &'static str {
     }
 }
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
+impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
     /// What each position of the signature of closure row `row` (`Checked::closures`) is, into
     /// `out`: its inputs' positions, then its output's, each as `npos` counts it (the module
     /// doc, THE SIGNATURE'S REGIONS).
@@ -642,7 +642,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
             SigFrom::Written | SigFrom::Inferred | SigFrom::Object | SigFrom::FnPtr => (None, None),
         };
         let mut owner = 0u32;
-        let mut pairs: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc.clone());
+        let mut pairs: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
         match ins {
             Some((s, declared)) => {
                 // The declared `Args` tuple's elements beside the closure's inputs.
@@ -754,7 +754,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         }
         let first = out.len();
         let mut at = 0usize;
-        let mut stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
         for &p in pairs.iter().rev() {
             stack.push(p);
         }
@@ -880,7 +880,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         if !R::RELATES {
             return Ok(0);
         }
-        let mut slots: Vec<SigSlot, A> = Vec::new_in(self.alloc.clone());
+        let mut slots: Vec<SigSlot, A> = Vec::new_in(self.alloc);
         self.sig_slots(row, e, &mut slots)?;
         Ok(slots.iter().filter(|s| matches!(s, SigSlot::Owner(_))).count() as u32)
     }
@@ -924,7 +924,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         if inputs.len() != args.len() {
             return self.refuse(Form::ClosureCallUnaligned { arg: args.len() as u32 }, e);
         }
-        let mut slots: Vec<SigSlot, A> = Vec::new_in(self.alloc.clone());
+        let mut slots: Vec<SigSlot, A> = Vec::new_in(self.alloc);
         self.sig_slots(row, e, &mut slots)?;
         let nsig = slots.iter().filter(|s| matches!(s, SigSlot::Owner(_))).count() as u32;
         let ci = self.info(cp);
@@ -933,7 +933,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         }
         // The owner positions are the value's last (`closure_value`).
         let base = ci.start + ci.len - nsig;
-        let mut vars: Vec<((u32, u32), Origin), A> = Vec::new_in(self.alloc.clone());
+        let mut vars: Vec<((u32, u32), Origin), A> = Vec::new_in(self.alloc);
         let mut shared = false;
         let mut at = 0usize;
         for i in 0..=args.len() {
@@ -1029,7 +1029,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
                         Ok(c) => c,
                         Err(u) => return self.refuse(Form::RegionsUnread { item: u.item, why: u.why }, e),
                     };
-                    let mut w: Vec<Region, A> = Vec::new_in(self.alloc.clone());
+                    let mut w: Vec<Region, A> = Vec::new_in(self.alloc);
                     let mut binds = false;
                     for c in clauses {
                         for &r in c.col.as_slice() {
@@ -1095,7 +1095,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
     /// other type's, whose signature may bind a region per call that no owner region stands
     /// for (`Form::ClosureSigErased`). A bounded walk of `t`'s parts.
     pub(crate) fn closure_sig_kept(&self, t: PTy, e: ExprId) -> Result<(), Refusal> {
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
         stack.push(t);
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {

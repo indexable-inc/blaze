@@ -79,12 +79,12 @@ pub(crate) enum BindItem {
     Goto(Block, PatId),
 }
 
-impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
+impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
     /// Each name `root` binds with its first binding pattern in source order (pre-order, left to
     /// right): the variable every or-alternative's binding of that name binds.
     pub(crate) fn first_binds(&self, root: PatId, out: &mut Vec<(Name, PatId), A>) -> Result<(), Refusal> {
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
-        let mut subs: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
+        let mut subs: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(root);
         let mut steps = 0usize;
         while let Some(q) = todo.pop() {
@@ -187,7 +187,7 @@ impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_,
         if pass != BindPass::Whole {
             return self.refuse_pat(Form::OrPatternBinding, p);
         }
-        let mut blocks: Vec<Block, A> = Vec::new_in(self.alloc.clone());
+        let mut blocks: Vec<Block, A> = Vec::new_in(self.alloc);
         for _ in list {
             blocks.push(self.b.block());
         }

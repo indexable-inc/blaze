@@ -900,7 +900,7 @@ pub enum AwaitUnrelated {
     GenericUnaligned(Misfit),
 }
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c, F, A, R> {
+impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c, F, A, R> {
     /// Which row a call of `item`, whose head writes lifetimes, lacked to be related by its
     /// signature (its [`Facts::sig`] read): the first of [`Facts::shape`],
     /// [`Facts::call_bounds`] that is `None`, else [`CallLacks::Unaligned`] with why the last
@@ -958,7 +958,7 @@ pub struct Stats {
     pub sig_writes_lifetimes: bool,
 }
 
-pub struct Lowered<A: Allocator + Clone> {
+pub struct Lowered<A: Allocator + Copy> {
     pub flow: Flow<A>,
     pub stats: Stats,
     /// The placeholders standing for the body's type parameters (param_outlives.rs): an
@@ -1059,7 +1059,7 @@ pub enum Plant {
 }
 
 /// Lowers one checked body.
-pub fn lower<A: Allocator + Clone, F: Facts>(
+pub fn lower<A: Allocator + Copy, F: Facts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     facts: &F,
@@ -1069,7 +1069,7 @@ pub fn lower<A: Allocator + Clone, F: Facts>(
 }
 
 #[doc(hidden)]
-pub fn lower_planted<A: Allocator + Clone, F: Facts>(
+pub fn lower_planted<A: Allocator + Copy, F: Facts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     facts: &F,
@@ -1084,7 +1084,7 @@ pub fn lower_planted<A: Allocator + Clone, F: Facts>(
 /// endpoints and the subsets it emitted), and a refusal of the call rule is per call: the walk
 /// goes on past it so the body's later calls are compared too, and the first refusal is the
 /// answer (`Lower::finish_held`), the same answer as a walk that stops there.
-pub(crate) fn lower_with<A: Allocator + Clone, F: Facts, R: one_call::CallRule>(
+pub(crate) fn lower_with<A: Allocator + Copy, F: Facts, R: one_call::CallRule>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     facts: &F,
@@ -1095,7 +1095,7 @@ pub(crate) fn lower_with<A: Allocator + Clone, F: Facts, R: one_call::CallRule>(
     if body.coroutine.is_some() {
         return (Err(Refusal { form: Form::Coroutine, range: range_of(body, body.root) }), None);
     }
-    let mut l: Lower<'_, '_, F, A, R> = match Lower::new(body, ck, facts, alloc.clone()) {
+    let mut l: Lower<'_, '_, F, A, R> = match Lower::new(body, ck, facts, alloc) {
         Ok(l) => l,
         Err(r) => return (Err(r), None),
     };
@@ -1364,11 +1364,11 @@ fn index_pat_rows<A: Allocator>(col: &[PatId], n_pats: usize, alloc: A) -> Vec<u
 }
 
 /// Builds a CSR index over `ck.captures.column::<0>()` keyed by `ExprId`, preserving exact row order.
-fn build_capture_csr<A: Allocator + Clone>(col: &[ExprId], n_exprs: usize, alloc: A) -> (Vec<u32, A>, Vec<u32, A>) {
+fn build_capture_csr<A: Allocator + Copy>(col: &[ExprId], n_exprs: usize, alloc: A) -> (Vec<u32, A>, Vec<u32, A>) {
     if col.is_empty() || n_exprs == 0 {
-        return (Vec::new_in(alloc.clone()), Vec::new_in(alloc));
+        return (Vec::new_in(alloc), Vec::new_in(alloc));
     }
-    let mut offsets = Vec::from_elem_in(0u32, n_exprs + 1, alloc.clone());
+    let mut offsets = Vec::from_elem_in(0u32, n_exprs + 1, alloc);
     for &ce in col {
         let i = ce.ix();
         if i < n_exprs {
@@ -1395,7 +1395,7 @@ fn build_capture_csr<A: Allocator + Clone>(col: &[ExprId], n_exprs: usize, alloc
 
 /// One body's lowering. `R` is the call rule (rule 78, D156: one_call.rs); a lowering named
 /// without it is production's ([`one_call::Production`]).
-struct Lower<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule = one_call::Production> {
+struct Lower<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule = one_call::Production> {
     body: &'b BodyView<'b>,
     ck: &'c Checked<'c>,
     tys: PTys<'c>,
@@ -1506,15 +1506,15 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule = one
 /// Every type walk visits each node at most once per position: bounded by the table's size.
 const MOST_POSITIONS: u32 = 4096;
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c, F, A, R> {
+impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c, F, A, R> {
     fn new(body: &'b BodyView<'b>, ck: &'c Checked<'c>, facts: &'b F, alloc: A) -> Result<Self, Refusal> {
         let n = body.params.len() as u32;
-        let b = builder::Builder::new(FlowBuilder::new_in(1 + n, n, alloc.clone()));
-        let mut pat_local = Vec::new_in(alloc.clone());
+        let b = builder::Builder::new(FlowBuilder::new_in(1 + n, n, alloc));
+        let mut pat_local = Vec::new_in(alloc);
         pat_local.resize(body.pats.len(), u32::MAX);
-        let mut extended = Vec::new_in(alloc.clone());
+        let mut extended = Vec::new_in(alloc);
         extended.resize(body.exprs.len(), NOT_EXTENDED);
-        let mut is_target = Vec::new_in(alloc.clone());
+        let mut is_target = Vec::new_in(alloc);
         is_target.resize(body.exprs.len(), false);
         for e in body.exprs {
             if let Expr::Break { target, .. } = *e
@@ -1527,12 +1527,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         let n_exprs = body.exprs.len();
         let n_pats = body.pats.len();
         let n_tys = tys.len();
-        let expr_def_row = index_expr_rows(ck.expr_defs.column::<0>(), n_exprs, alloc.clone());
-        let pat_def_row = index_pat_rows(ck.pat_defs.column::<0>(), n_pats, alloc.clone());
-        let callee_row = index_expr_rows(ck.callees.column::<0>(), n_exprs, alloc.clone());
-        let field_row = index_expr_rows(ck.fields.column::<0>(), n_exprs, alloc.clone());
-        let closure_ordinal = index_expr_rows(ck.closures.column::<0>(), n_exprs, alloc.clone());
-        let (cap_offsets, cap_rows) = build_capture_csr(ck.captures.column::<0>(), n_exprs, alloc.clone());
+        let expr_def_row = index_expr_rows(ck.expr_defs.column::<0>(), n_exprs, alloc);
+        let pat_def_row = index_pat_rows(ck.pat_defs.column::<0>(), n_pats, alloc);
+        let callee_row = index_expr_rows(ck.callees.column::<0>(), n_exprs, alloc);
+        let field_row = index_expr_rows(ck.fields.column::<0>(), n_exprs, alloc);
+        let closure_ordinal = index_expr_rows(ck.closures.column::<0>(), n_exprs, alloc);
+        let (cap_offsets, cap_rows) = build_capture_csr(ck.captures.column::<0>(), n_exprs, alloc);
         let mut l = Lower {
             body,
             ck,
@@ -1540,7 +1540,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             facts,
             b,
             rule: core::marker::PhantomData,
-            alloc: alloc.clone(),
+            alloc: alloc,
             expr_def_row,
             pat_def_row,
             callee_row,
@@ -1548,33 +1548,33 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             closure_ordinal,
             cap_offsets,
             cap_rows,
-            copy_memo: Vec::from_elem_in(core::cell::Cell::new(0u8), n_tys, alloc.clone()),
-            drop_memo: Vec::from_elem_in(core::cell::Cell::new(0u8), n_tys, alloc.clone()),
-            all_opaque_memo: Vec::from_elem_in(core::cell::Cell::new(0u8), n_tys, alloc.clone()),
-            npos_memo: Vec::from_elem_in(core::cell::Cell::new(u32::MAX), n_tys, alloc.clone()),
+            copy_memo: Vec::from_elem_in(core::cell::Cell::new(0u8), n_tys, alloc),
+            drop_memo: Vec::from_elem_in(core::cell::Cell::new(0u8), n_tys, alloc),
+            all_opaque_memo: Vec::from_elem_in(core::cell::Cell::new(0u8), n_tys, alloc),
+            npos_memo: Vec::from_elem_in(core::cell::Cell::new(u32::MAX), n_tys, alloc),
             pat_local,
-            local_ty: Vec::new_in(alloc.clone()),
-            local_origs: Vec::new_in(alloc.clone()),
-            origs: Vec::new_in(alloc.clone()),
-            pinfo: Vec::new_in(alloc.clone()),
-            vals: Vec::new_in(alloc.clone()),
-            tasks: Vec::new_in(alloc.clone()),
-            vars: Vec::new_in(alloc.clone()),
-            scope_marks: Vec::new_in(alloc.clone()),
-            scope_temps: Vec::new_in(alloc.clone()),
-            temps: Vec::new_in(alloc.clone()),
-            temp_marks: Vec::new_in(alloc.clone()),
-            cond_temps: Vec::new_in(alloc.clone()),
-            held_marks: Vec::new_in(alloc.clone()),
-            targets: Vec::new_in(alloc.clone()),
-            two_phase: Vec::new_in(alloc.clone()),
+            local_ty: Vec::new_in(alloc),
+            local_origs: Vec::new_in(alloc),
+            origs: Vec::new_in(alloc),
+            pinfo: Vec::new_in(alloc),
+            vals: Vec::new_in(alloc),
+            tasks: Vec::new_in(alloc),
+            vars: Vec::new_in(alloc),
+            scope_marks: Vec::new_in(alloc),
+            scope_temps: Vec::new_in(alloc),
+            temps: Vec::new_in(alloc),
+            temp_marks: Vec::new_in(alloc),
+            cond_temps: Vec::new_in(alloc),
+            held_marks: Vec::new_in(alloc),
+            targets: Vec::new_in(alloc),
+            two_phase: Vec::new_in(alloc),
             extended,
-            super_ext: Vec::new_in(alloc.clone()),
+            super_ext: Vec::new_in(alloc),
             is_target,
-            uni: Vec::new_in(alloc.clone()),
-            param_origs: Vec::new_in(alloc.clone()),
-            param_implied: Vec::new_in(alloc.clone()),
-            param_unsure: Vec::new_in(alloc.clone()),
+            uni: Vec::new_in(alloc),
+            param_origs: Vec::new_in(alloc),
+            param_implied: Vec::new_in(alloc),
+            param_unsure: Vec::new_in(alloc),
             param_all_unsure: true,
             implied_given: false,
             ret_block: Block(0),
@@ -1584,12 +1584,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             held: None,
             nargs: n,
             async_root: None,
-            upvar_places: Vec::new_in(alloc.clone()),
-            points: Vec::new_in(alloc.clone()),
-            identity: Vec::new_in(alloc.clone()),
+            upvar_places: Vec::new_in(alloc),
+            points: Vec::new_in(alloc),
+            identity: Vec::new_in(alloc),
             misfit: Misfit::NotTried,
-            awaiting: Vec::new_in(alloc.clone()),
-            awaited: Vec::new_in(alloc.clone()),
+            awaiting: Vec::new_in(alloc),
+            awaited: Vec::new_in(alloc),
             coarse: core::cell::Cell::new(None),
         };
         Ok(l)
@@ -1807,7 +1807,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             }
         }
         let arity = ByFacts(self.facts);
-        let mut stack = TyStack::new(root, self.alloc.clone());
+        let mut stack = TyStack::new(root, self.alloc);
         let mut n = 0u32;
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
@@ -1930,7 +1930,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             }
             return Ok(ans);
         }
-        let mut stack = TyStack::new(root, self.alloc.clone());
+        let mut stack = TyStack::new(root, self.alloc);
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
             steps += 1;
@@ -2003,14 +2003,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             Some(k) => self.facts.sig(k).ok().filter(|l| l.well_formed() && l.inputs() as usize == vs.len()),
             None => None,
         };
-        let mut live: Vec<Region, A> = Vec::new_in(self.alloc.clone());
+        let mut live: Vec<Region, A> = Vec::new_in(self.alloc);
         let bounded = self.opaques_live(out_ty, &mut live, e)?;
         let all_static = bounded && live.is_empty();
         let captured: &[Region] = match life {
             Some(l) => l.output().unwrap_or(&[]),
             None => &[],
         };
-        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc.clone());
+        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         for (k, v) in vs.iter().enumerate() {
             let At::Place(p) = v.at else { continue };
             let n = self.info(p).len as usize;
@@ -2052,7 +2052,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
     /// keeps `x`'s loan live through the result, never `y`'s.
     fn opaques_live(&self, t: PTy, live: &mut Vec<Region, A>, e: ExprId) -> Result<bool, Refusal> {
         live.clear();
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
         stack.push(t);
         let mut any = false;
         let mut steps = 0u32;
@@ -2121,10 +2121,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         let cp = self.place_of(c);
         let ci = self.info(cp);
         let ck: &'c Checked<'c> = self.ck;
-        let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc.clone());
+        let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc);
         // What each capture relates once the aggregate is made: its place, where its positions
         // start in the closure's, how many, and its type.
-        let mut rel: Vec<(Place, u32, u32, TyD), A> = Vec::new_in(self.alloc.clone());
+        let mut rel: Vec<(Place, u32, u32, TyD), A> = Vec::new_in(self.alloc);
         let mut at = ci.start;
         let (cap_lo, cap_hi) = self.capture_range(e);
         for idx in cap_lo..cap_hi {
@@ -2241,7 +2241,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             }
             return Ok(ans);
         }
-        let mut stack = TyStack::new(root, self.alloc.clone());
+        let mut stack = TyStack::new(root, self.alloc);
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
             steps += 1;
@@ -2395,7 +2395,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             }
             return Ok(ans);
         }
-        let mut stack = TyStack::new(root, self.alloc.clone());
+        let mut stack = TyStack::new(root, self.alloc);
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
             steps += 1;
@@ -2627,7 +2627,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         let args = self.list(l, e)?;
         // Where each argument's positions begin among the value's: its lifetimes, then each
         // argument's, in order (`npos`).
-        let mut at: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+        let mut at: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
         let mut total = lifetimes;
         for &a in args {
             let n = self.npos(a, e)?;
@@ -2640,7 +2640,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         }
         let want = self.npos_d(field_ty, e)?;
         let start = self.origs.len() as u32;
-        let mut bound: Vec<(u32, Origin), A> = Vec::new_in(self.alloc.clone());
+        let mut bound: Vec<(u32, Origin), A> = Vec::new_in(self.alloc);
         for &r in regions {
             if self.origs.len() as u32 - start > MOST_POSITIONS {
                 return self.refuse(Form::Bound, e);
@@ -2760,7 +2760,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             return Ok(());
         }
         if s.exact && d.exact && s.len == d.len {
-            let mut vs: Vec<Variance, A> = Vec::new_in(self.alloc.clone());
+            let mut vs: Vec<Variance, A> = Vec::new_in(self.alloc);
             self.position_variances(dst_ty, &mut vs, e)?;
             if vs.len() as u32 != s.len {
                 return self.refuse(Form::Malformed, e);
@@ -2866,7 +2866,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
                     // `&'r P` is covariant in `P` and `&'r mut P` invariant (the Reference,
                     // "Subtyping and Variance"): a shared borrow's referent positions are
                     // related by their variance in `P` (variance.rs), a mutable one's both ways.
-                    let mut vs: Vec<Variance, A> = Vec::new_in(self.alloc.clone());
+                    let mut vs: Vec<Variance, A> = Vec::new_in(self.alloc);
                     self.position_variances(pty, &mut vs, e)?;
                     if vs.len() as u32 != pi.len {
                         return self.refuse(Form::Malformed, e);
@@ -3169,7 +3169,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
     /// formed by assumption in its body (an implied bound) and by proof at each call.
     fn ref_ranges(&self, t: TyD, e: ExprId, out: &mut Vec<(u32, u32), A>) -> Result<(), Refusal> {
         out.clear();
-        let mut stack: Vec<(PTy, u32), A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<(PTy, u32), A> = Vec::new_in(self.alloc);
         if t.wrap.is_some() {
             out.push((0, self.npos(t.ty, e)?));
             stack.push((t.ty, 1));
@@ -3251,8 +3251,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             }
             self.implied_given = true;
         }
-        let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
-        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc.clone());
+        let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
+        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         for i in 0..=nparams {
             let is_out = i == nparams;
             let (l, t) = if is_out {
@@ -3419,7 +3419,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
     /// demands for a region the caller chose).
     fn lay_positions(&self, t: PTy, slots: &[Region], out: &mut Vec<Option<Region>, A>, e: ExprId) -> Result<bool, Refusal> {
         out.clear();
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
         // Pass 1: the slots the flow's walk accounts for, and the subtrees it does not.
         let mut regular = 0u32;
         let mut apart = 0u32;
@@ -3557,7 +3557,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
     /// is refused, `ProjectionUnbound::InsideImplValue`).
     fn lay_over_in(&self, declared: PTy, body_t: PTy, slots: &[Region], out: &mut Vec<Option<Region>, A>, through_impls: bool, e: ExprId) -> Result<bool, Refusal> {
         use blaze_borrow::RegionTypes;
-        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc.clone());
+        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         if !self.lay_positions(declared, slots, &mut laid, e)? {
             return Ok(false);
         }
@@ -3570,7 +3570,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         // then no projection after it is laid through its impl (placeholders noted
         // `SlotsUncounted { why }`).
         let mut sc: Result<usize, Uncounted> = Ok(0);
-        let mut stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
         stack.push((declared, body_t));
         let mut at = 0usize;
         let mut steps = 0u32;
@@ -3788,7 +3788,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         if self_col.as_slice().len() != decl_self.len() {
             return Ok(self.unbound(trait_, differ, e));
         }
-        let mut bind: Vec<Option<Region>, A> = Vec::new_in(self.alloc.clone());
+        let mut bind: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         bind.resize(params.count() as usize, None);
         for (&ir, &dr) in self_col.as_slice().iter().zip(decl_self.iter()) {
             match ir {
@@ -3805,7 +3805,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
                 Region::Late { .. } => return Ok(self.unbound(trait_, ProjectionUnbound::SelfRegionUnnumbered, e)),
             }
         }
-        let mut vlaid: Vec<Option<Region>, A> = Vec::new_in(self.alloc.clone());
+        let mut vlaid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         if !self.lay_over_in(value.ty(), b, value.as_slice(), &mut vlaid, false, e)? {
             return Ok(self.unbound(trait_, ProjectionUnbound::ValueUnaligned, e));
         }
@@ -3900,9 +3900,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         if !life.well_formed() || life.inputs() as usize != vs.len() {
             return Ok(false);
         }
-        let mut regions: Vec<Region, A> = Vec::new_in(self.alloc.clone());
-        let mut ends: Vec<u32, A> = Vec::new_in(self.alloc.clone());
-        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc.clone());
+        let mut regions: Vec<Region, A> = Vec::new_in(self.alloc);
+        let mut ends: Vec<u32, A> = Vec::new_in(self.alloc);
+        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         for k in 0..=life.inputs() {
             let slots = if k < life.inputs() { life.input(k) } else { life.value(value) };
             let Some(slots) = slots else { return Ok(false) };
@@ -3960,18 +3960,18 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             return Ok(false);
         }
         let out_at = lo;
-        let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc.clone());
+        let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc);
         inst.extend_from_slice(seed);
         if let Some((item, g, life)) = tie {
             let args: &'c [PTy] = self.list(g, e)?;
-            let mut impl_ties = trait_ties::ImplTies::new_in(self.alloc.clone());
+            let mut impl_ties = trait_ties::ImplTies::new_in(self.alloc);
             self.tie_bounds(item, life, args, &mut inst, &mut impl_ties, e)?;
             // No type argument here holds a position (the caller's condition for this path),
             // so an impl's answer names none: a row that does is malformed.
             self.tie_impl_relations(&impl_ties, &mut inst, |_, _, _| None, e)?;
         }
-        let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
-        let mut vars: Vec<Variance, A> = Vec::new_in(self.alloc.clone());
+        let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
+        let mut vars: Vec<Variance, A> = Vec::new_in(self.alloc);
         lo = 0;
         for i in 0..=vs.len() {
             // The operands, then the destination.
@@ -4051,7 +4051,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         if !life.well_formed() {
             return Ok(false);
         }
-        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc.clone());
+        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         for k in 0..=life.inputs() {
             let slots = if k < life.inputs() { life.input(k) } else { life.output() };
             let Some(slots) = slots else { return Ok(false) };
@@ -4943,7 +4943,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
     /// match ergonomics chose binds a part of a reference, not of a temporary. An `|` pattern, a
     /// `&` pattern and every other form do not extend.
     fn pat_extends(&self, p: PatId) -> Result<bool, Refusal> {
-        let mut stack: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<PatId, A> = Vec::new_in(self.alloc);
         stack.push(p);
         let mut steps = 0usize;
         while let Some(p) = stack.pop() {
@@ -4990,7 +4990,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
     }
 
     fn binds_nothing(&self, p: PatId) -> Result<bool, Refusal> {
-        let mut stack: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<PatId, A> = Vec::new_in(self.alloc);
         stack.push(p);
         let mut steps = 0usize;
         while let Some(p) = stack.pop() {
@@ -5173,7 +5173,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             return Ok(false);
         };
         let facts: &'b F = self.facts;
-        let mut held: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
         for &p in self.list(preds, e)? {
             let (args, term) = match self.node(p, e)? {
                 PNode::ExTrait(k, args) => {
@@ -5451,7 +5451,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         // them). On any other operand the impl's signature is not read here: the hub below.
         let prim = self.prim_operand(lhs.ty, e)? && self.prim_operand(rhs.ty, e)?;
         if !cmp && !prim {
-            let mut ps: Vec<Place, A> = Vec::new_in(self.alloc.clone());
+            let mut ps: Vec<Place, A> = Vec::new_in(self.alloc);
             for v in [lhs, rhs] {
                 if let At::Place(p) = v.at {
                     ps.push(p);
@@ -5494,17 +5494,17 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             Some(a) => a,
             None => return self.refuse(Form::Malformed, e),
         };
-        let mut vs: Vec<Val, A> = Vec::new_in(self.alloc.clone());
+        let mut vs: Vec<Val, A> = Vec::new_in(self.alloc);
         vs.extend_from_slice(&self.vals[at..]);
         self.vals.truncate(at);
         if n == 0 && !fmt {
             self.vals.push(Val { at: At::Const, ty });
             return Ok(());
         }
-        let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc.clone());
-        let mut ps: Vec<Place, A> = Vec::new_in(self.alloc.clone());
+        let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc);
+        let mut ps: Vec<Place, A> = Vec::new_in(self.alloc);
         // The values as they go into the aggregate (for `format_args!`, the borrows).
-        let mut parts: Vec<Val, A> = Vec::new_in(self.alloc.clone());
+        let mut parts: Vec<Val, A> = Vec::new_in(self.alloc);
         for v in vs.iter().copied() {
             if fmt {
                 // `format_args!` borrows each argument.
@@ -5570,7 +5570,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             && self.plant != Plant::TupleUnified
             && let Some((variant, fields)) = self.literal_fields(e, ty, vs.len())?
         {
-            let mut slots: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+            let mut slots: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
             for (j, v) in vs.iter().enumerate() {
                 let held = match v.at {
                     At::Place(p) => self.info(p).len > 0,
@@ -5664,7 +5664,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
     /// pushes them. `None`: not such an aggregate, or a field the facts do not name.
     fn literal_fields(&self, e: ExprId, ty: TyD, n: usize) -> Result<Option<(u32, Vec<u32, A>)>, Refusal> {
         let (None, PNode::Adt(k, _)) = (ty.wrap, self.node(ty.ty, e)?) else { return Ok(None) };
-        let mut out: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut out: Vec<u32, A> = Vec::new_in(self.alloc);
         let (adt, variant) = match self.expr(e)? {
             Expr::Call { callee, .. } => {
                 let Some(Def::Ctor { adt, variant, .. }) = self.expr_def(callee) else { return Ok(None) };
@@ -5722,7 +5722,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         if total != len {
             return Ok(None);
         }
-        let mut spots: Vec<(u32, u32, PTy), A> = Vec::new_in(self.alloc.clone());
+        let mut spots: Vec<(u32, u32, PTy), A> = Vec::new_in(self.alloc);
         for (j, v) in vs.iter().enumerate() {
             let held = match v.at {
                 At::Place(p) => self.info(p).len > 0,
@@ -5754,7 +5754,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         }
         if s.exact && s.len == n {
             // Each position by its variance in the destination's type (variance.rs).
-            let mut vs: Vec<Variance, A> = Vec::new_in(self.alloc.clone());
+            let mut vs: Vec<Variance, A> = Vec::new_in(self.alloc);
             self.position_variances(dst_ty, &mut vs, e)?;
             if vs.len() as u32 != n {
                 return self.refuse(Form::Malformed, e);
@@ -5849,11 +5849,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
                 }
             }
         }
-        let mut vs: Vec<Val, A> = Vec::new_in(self.alloc.clone());
+        let mut vs: Vec<Val, A> = Vec::new_in(self.alloc);
         vs.extend_from_slice(&self.vals[at + usize::from(by_type.is_some())..]);
         self.vals.truncate(at);
-        let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc.clone());
-        let mut ins: Vec<Place, A> = Vec::new_in(self.alloc.clone());
+        let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc);
+        let mut ins: Vec<Place, A> = Vec::new_in(self.alloc);
         for v in vs.iter().copied() {
             ops.push(self.operand(v, e)?);
             if let At::Place(p) = v.at {
@@ -6012,7 +6012,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
                 // `opaque_output_ties` says which input positions flow into the output. With no
                 // input origin (`add_slowly(seed, 10)`), nothing is related.
                 if out.len > 0 && ty.wrap.is_none() && self.positions_all_opaque(ty.ty, e)? {
-                    let mut tied: Vec<bool, A> = Vec::new_in(self.alloc.clone());
+                    let mut tied: Vec<bool, A> = Vec::new_in(self.alloc);
                     self.opaque_output_ties(callee.map(|(k, _)| k), vs, ty.ty, &mut tied, e)?;
                     // One entry per position of each place operand, in `vs` order.
                     let mut at = 0usize;
@@ -6176,7 +6176,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         // The column indexes the enclosing fn's parameters. A nested flow indexes its
         // captures first and can reach the callable through a borrowed environment.
         let (own, own_ty) = self.binding_place(self.body.params[param], e)?;
-        let mut held: Vec<Option<Region>, A> = Vec::new_in(self.alloc.clone());
+        let mut held: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         if own_ty.wrap.is_some() || !self.lay_positions(declared, slots, &mut held, e)? || held.iter().any(Option::is_none) {
             return self.refuse(Form::CalleeValueUnknown, e);
         }
@@ -6188,11 +6188,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         // none of its own): split by each argument's count, in the body's own table (the
         // declared kids are the columns' table's: never counted here); `call_laid` checks
         // each argument's and the destination's place against these ends.
-        let mut regions: Vec<Region, A> = Vec::new_in(self.alloc.clone());
+        let mut regions: Vec<Region, A> = Vec::new_in(self.alloc);
         for r in held.iter().flatten() {
             regions.push(*r);
         }
-        let mut ends: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut ends: Vec<u32, A> = Vec::new_in(self.alloc);
         let mut at = 0u32;
         for v in args.iter() {
             at += self.npos_d(v.ty, e)?;
@@ -6205,7 +6205,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         // (`Facts::fn_binders` false) a bound one is taken as free too: one region for every
         // call, the parameter's own.
         let binders = facts.fn_binders();
-        let mut seed: Vec<(Region, Origin), A> = Vec::new_in(self.alloc.clone());
+        let mut seed: Vec<(Region, Origin), A> = Vec::new_in(self.alloc);
         for (j, &r) in regions.iter().enumerate() {
             let free = matches!(r, Region::Param(_)) || (!binders && matches!(r, Region::Late { .. }));
             if free && !seed.iter().any(|(x, _)| *x == r) {
@@ -6248,7 +6248,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
     /// Whether the `if` condition `e` is pattern-matching: a `let`, or a `&&` chain holding one
     /// (through parentheses), as `branch` lowers it. Bounded by the chain's length (rule 18).
     fn cond_has_let(&self, e: ExprId) -> Result<bool, Refusal> {
-        let mut stack: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<ExprId, A> = Vec::new_in(self.alloc);
         stack.push(e);
         let mut steps = 0u32;
         while let Some(x) = stack.pop() {
@@ -6319,7 +6319,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             self.vals.push(Val { at: At::Const, ty });
             return Ok(());
         }
-        let mut binds: Vec<Block, A> = Vec::new_in(self.alloc.clone());
+        let mut binds: Vec<Block, A> = Vec::new_in(self.alloc);
         for _ in arms {
             binds.push(self.b.block());
         }
@@ -6373,7 +6373,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
 
     /// Whether a pattern binds a non-`Copy` value by value (its guard would see it moved).
     fn guard_moves(&self, p: PatId) -> Result<bool, Refusal> {
-        let mut stack: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<PatId, A> = Vec::new_in(self.alloc);
         stack.push(p);
         let mut steps = 0usize;
         while let Some(p) = stack.pop() {
@@ -6424,7 +6424,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
     }
 
     fn binds(&self, p: PatId) -> Result<bool, Refusal> {
-        let mut stack: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<PatId, A> = Vec::new_in(self.alloc);
         stack.push(p);
         let mut steps = 0usize;
         while let Some(p) = stack.pop() {
@@ -6469,9 +6469,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         let root = self.body.root;
         let place = self.as_place(v, root)?;
         // Each name's first binding (an or-pattern's alternatives bind one variable).
-        let mut alias: Vec<(Name, PatId), A> = Vec::new_in(self.alloc.clone());
+        let mut alias: Vec<(Name, PatId), A> = Vec::new_in(self.alloc);
         self.first_binds(p, &mut alias)?;
-        let mut stack: Vec<BindItem, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<BindItem, A> = Vec::new_in(self.alloc);
         stack.push(BindItem::Pat(p, place, v.ty, 0));
         let mut steps = 0usize;
         while let Some(item) = stack.pop() {
@@ -6610,7 +6610,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
                 }
                 Pat::TupleStruct { elems, rest, .. } => {
                     let es = self.body.pat_lists.get(elems.range()).unwrap_or(&[]);
-                    let mut subs: Vec<(u32, PatId), A> = Vec::new_in(self.alloc.clone());
+                    let mut subs: Vec<(u32, PatId), A> = Vec::new_in(self.alloc);
                     let (adt, variant) = self.variant_of(p)?;
                     let n = match self.facts.field_count(adt, variant) {
                         Some(n) => n as usize,
@@ -6623,7 +6623,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
                 }
                 Pat::Struct { fields, .. } => {
                     let (adt, variant) = self.variant_of(p)?;
-                    let mut subs: Vec<(u32, PatId), A> = Vec::new_in(self.alloc.clone());
+                    let mut subs: Vec<(u32, PatId), A> = Vec::new_in(self.alloc);
                     for f in self.body.field_pats.get(fields.range()).unwrap_or(&[]) {
                         match self.facts.field(adt, variant, f.name) {
                             Some(i) => subs.push((i, f.pat)),
@@ -6760,7 +6760,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             TStmt::Let { pat, init: None, .. } => {
                 // Declared, not initialized: each binding's storage is live, its value not.
                 let from = self.vars.len();
-                let mut stack: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+                let mut stack: Vec<PatId, A> = Vec::new_in(self.alloc);
                 stack.push(pat);
                 let mut steps = 0usize;
                 while let Some(p) = stack.pop() {
@@ -6806,7 +6806,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
     /// the innermost), where an extended temporary goes (`extend_temp`), or
     /// [`STATIC_EXTENDED`] for a constant initializer's.
     fn mark_extended(&mut self, init: ExprId, depth: u32) -> Result<(), Refusal> {
-        let mut stack: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
+        let mut stack: Vec<ExprId, A> = Vec::new_in(self.alloc);
         stack.push(init);
         let mut steps = 0usize;
         while let Some(e) = stack.pop() {
