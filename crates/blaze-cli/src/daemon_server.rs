@@ -1013,10 +1013,21 @@ fn tty_of(is_tty: bool, cols: Option<u16>) -> Tty {
     Tty::Terminal(cols.map(|c| Size { cols: c, rows: 24 }))
 }
 
-fn build_args_env(req: &CheckReq<'_, &Frame>, alloc: SharedAlloc<'static>, frame: &Frame) -> Result<(Args, Env), &'static str> {
+#[derive(Debug)]
+struct ArgvNotUtf8 {
+    index: usize,
+}
+
+impl core::fmt::Display for ArgvNotUtf8 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "client argv[{}] is not UTF-8", self.index)
+    }
+}
+
+fn build_args_env(req: &CheckReq<'_, &Frame>, alloc: SharedAlloc<'static>, frame: &Frame) -> Result<(Args, Env), ArgvNotUtf8> {
     let mut argv: Vec<&str, &Frame> = Vec::with_capacity_in(req.argv.len(), frame);
-    for raw in req.argv.iter() {
-        let s = core::str::from_utf8(raw).map_err(|_| "client argv is not UTF-8")?;
+    for (index, raw) in req.argv.iter().enumerate() {
+        let s = core::str::from_utf8(raw).map_err(|_| ArgvNotUtf8 { index })?;
         argv.push(s);
     }
     let mut vars: Vec<(&str, &str), &Frame> = Vec::with_capacity_in(req.env.len(), frame);

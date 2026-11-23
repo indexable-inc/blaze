@@ -6015,6 +6015,15 @@ fn join_slices<'a, 'f>(
     Ok((buffer, ran, joined))
 }
 
+#[derive(Debug)]
+struct LangIndexRefused(&'static str);
+
+impl core::fmt::Display for LangIndexRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
 /// Per-stretch lazy wrapper over `BodySeed`: serves all already-frozen member and dependency heads
 /// (`Known::Bytes`) and member refusals (`Known::Refused`) directly in O(1) without constructing
 /// `lang_index`, `Pointers`, `HeadConsts`, or `SeededHeads`. Only on a cold dependency head miss
@@ -6032,7 +6041,7 @@ struct LazyBodySeed<'k, 'n, 't> {
     body_locals: blaze_ladder::front2::tables::seeds::BodyLocals,
     index_reads: core::cell::Cell<u64>,
     lang_refused: core::cell::Cell<Option<&'static str>>,
-    inner: core::cell::OnceCell<Result<&'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>>, &'static str>>,
+    inner: core::cell::OnceCell<Result<&'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>>, LangIndexRefused>>,
 }
 
 impl<'k, 'n, 't> LazyBodySeed<'k, 'n, 't> {
@@ -6049,13 +6058,13 @@ impl<'k, 'n, 't> LazyBodySeed<'k, 'n, 't> {
     }
 
     #[inline(never)]
-    fn build_lang_index(&self) -> Result<&'n blaze_ladder::front2::index::Index<'n>, &'static str> {
+    fn build_lang_index(&self) -> Result<&'n blaze_ladder::front2::index::Index<'n>, LangIndexRefused> {
         match crate::engine_head_consts::lang_index(self.tables, self.evaluated, self.lang_crates) {
             Ok(index) => Ok(self.frame.alloc(index)),
             Err(twice) => {
                 let words = crate::engine_head_notes::leak(self.g, format_args!("its scope's constants have no lang index: {twice} (front2 index.rs `LangTwice`)"));
                 self.lang_refused.set(Some(words));
-                Err(words)
+                Err(LangIndexRefused(words))
             }
         }
     }
@@ -6081,7 +6090,7 @@ impl<'k, 'n, 't> LazyBodySeed<'k, 'n, 't> {
     }
 
     #[inline(never)]
-    fn build_freezer(&self) -> Result<&'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>>, &'static str> {
+    fn build_freezer(&self) -> Result<&'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>>, LangIndexRefused> {
         let index = self.build_lang_index()?;
         self.index_reads.set(self.evaluated.tally().offered);
         let consts = Some(self.build_head_consts(index));
@@ -6113,9 +6122,9 @@ impl<'n> HeadSeed<'n> for LazyBodySeed<'_, 'n, '_> {
         let inner = self.inner.get_or_init(|| self.build_freezer());
         match inner {
             Ok(body_seed) => body_seed.seed(store, keys, need, scratch),
-            Err(words) => Err(SeedError::of_freeze(FreezeError::NotTheirs {
+            Err(refused) => Err(SeedError::of_freeze(FreezeError::NotTheirs {
                 want: cell,
-                why: NotTheirs::Failed { said: words },
+                why: NotTheirs::Failed { said: refused.0 },
             })),
         }
     }
