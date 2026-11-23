@@ -53,15 +53,17 @@
 #[cfg(test)]
 extern crate std;
 
+mod compare;
 mod mesh;
 mod shade;
 
 #[cfg(test)]
 mod tests;
 
+pub use compare::{PANEL_BORDER_PX, PictureDiff, compose_grid, compose_side_by_side, diff_pictures};
 pub use mesh::{
-    HighlightStyle, MeshHighlight, MeshNormalSource, MeshPictureOpts, MeshPicturePlant, MeshScenePart, Wireframe, render_mesh,
-    render_mesh_scene, render_mesh_scene_planted,
+    HighlightStyle, MaterialMaps, MeshHighlight, MeshNormalSource, MeshPictureOpts, MeshPicturePlant, MeshScenePart, TextureMap,
+    Wireframe, render_mesh, render_mesh_scene, render_mesh_scene_planted,
 };
 
 use blaze_cad_field::{Lanes, Points, Scratch, Tape, eval_box, eval_grad, eval_point, eval_points, simplify};
@@ -122,7 +124,62 @@ pub struct View {
     pub height: u32,
 }
 
-/// Studio CAD lighting, material, AO, and soft-shadow settings for [`Shading::Studio`].
+/// Rectangular studio softbox / strip light for sweeping crisp grazing highlight ribbons across
+/// curved housings and revealing brushed finishes in [`Shading::Studio`].
+///
+/// `direction` and `tangent` are given in camera space (`+X` right, `+Y` up, `+Z` toward the
+/// viewer) so moving a strip light sweeps predictably across the current inspection view.
+#[blaze::args]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct StripLight {
+    /// Direction toward the strip centre in camera space (`+X` right, `+Y` up, `+Z` toward viewer).
+    pub direction: [f64; 3],
+    /// Strip length axis in camera space (orthonormalized perpendicular to `direction`).
+    pub tangent: [f64; 3],
+    /// Half-length of the rectangular strip at unit distance along `tangent`.
+    pub half_length: f64 = 0.55,
+    /// Half-width of the rectangular strip at unit distance perpendicular to `tangent`.
+    pub half_width: f64 = 0.08,
+    /// Radiance / intensity multiplier.
+    pub intensity: f64 = 1.1,
+    /// Linear RGB colour tint of the strip light.
+    pub colour: [f64; 3] = [1.0, 0.99, 0.97],
+}
+
+impl StripLight {
+    /// Wide horizontal overhead strip light (classic automotive / industrial design studio sweep).
+    pub const OVERHEAD_HORIZONTAL: StripLight = StripLight {
+        direction: [0.0, 0.78, 0.62],
+        tangent: [1.0, 0.0, 0.0],
+        half_length: 0.70,
+        half_width: 0.07,
+        intensity: 1.15,
+        colour: [1.0, 0.99, 0.97],
+    };
+
+    /// Tall vertical overhead-side strip light for revealing horizontal contour transitions.
+    pub const OVERHEAD_VERTICAL: StripLight = StripLight {
+        direction: [0.35, 0.65, 0.67],
+        tangent: [0.0, 1.0, 0.0],
+        half_length: 0.65,
+        half_width: 0.07,
+        intensity: 1.15,
+        colour: [0.97, 0.99, 1.02],
+    };
+
+    /// Low grazing side strip light that rakes across surfaces to expose brushed finishes & ripples.
+    pub const GRAZING_SIDE: StripLight = StripLight {
+        direction: [0.88, 0.22, 0.42],
+        tangent: [0.0, 1.0, 0.0],
+        half_length: 0.60,
+        half_width: 0.06,
+        intensity: 1.25,
+        colour: [1.02, 0.98, 0.94],
+    };
+}
+
+/// Studio CAD lighting, material, AO, soft-shadow, and movable strip-light settings for
+/// [`Shading::Studio`].
 #[blaze::args]
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct StudioOpts {
@@ -150,6 +207,8 @@ pub struct StudioOpts {
     pub shadow_steps: u8 = 48,
     /// Encode shaded linear light to sRGB before 8-bit quantization.
     pub srgb: bool = true,
+    /// Up to four movable studio strip lights (`None` slots are inactive).
+    pub strip_lights: [Option<StripLight>; 4] = [None; 4],
 }
 
 impl StudioOpts {
@@ -167,6 +226,7 @@ impl StudioOpts {
         shadow_softness: 12.0,
         shadow_steps: 48,
         srgb: true,
+        strip_lights: [None; 4],
     };
 }
 
@@ -176,18 +236,57 @@ impl Default for StudioOpts {
     }
 }
 
+/// Configuration for [`RenderMode::Zebra`] Class-A reflection-line surface inspection.
+#[blaze::args]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ZebraOpts {
+    /// Number of full dark-light stripe cycles across the reflection hemisphere.
+    pub stripes: f64 = 16.0,
+    /// Stripe-band normal axis (camera space by default, or world space when `world_space` is true).
+    pub axis: [f64; 3] = [0.0, 0.0, 1.0],
+    /// Phase offset in stripe cycles (sweep `0.0..1.0` to roll stripes across a surface).
+    pub phase: f64 = 0.0,
+    /// When `true`, project the reflected ray onto `axis` in world coordinates instead of camera space.
+    pub world_space: bool = false,
+    /// Anti-aliased contrast sharpness of stripe edges (larger gives crisper band transitions).
+    pub sharpness: f64 = 8.0,
+    /// Dark stripe RGB colour.
+    pub dark: [u8; 3] = [18, 22, 28],
+    /// Light stripe RGB colour.
+    pub light: [u8; 3] = [245, 247, 250],
+}
+
+impl ZebraOpts {
+    /// Default Class-A CAD zebra reflection-stripe settings.
+    pub const DEFAULT: ZebraOpts = ZebraOpts {
+        stripes: 16.0,
+        axis: [0.0, 0.0, 1.0],
+        phase: 0.0,
+        world_space: false,
+        sharpness: 8.0,
+        dark: [18, 22, 28],
+        light: [245, 247, 250],
+    };
+}
+
+impl Default for ZebraOpts {
+    fn default() -> ZebraOpts {
+        ZebraOpts::DEFAULT
+    }
+}
+
 /// How lit surfaces are shaded when [`RenderMode::Shaded`] is selected.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Shading {
     /// Classic single-light Lambertian shading (`0.22 + 0.78 * max(0, n·l)`).
     Classic,
     /// Three-point CAD studio lighting with Blinn-Phong specular, hemisphere fill, Fresnel rim,
-    /// SDF ambient occlusion, and soft SDF shadows.
+    /// SDF ambient occlusion, soft SDF shadows, and optional movable strip lights.
     Studio(StudioOpts),
 }
 
 /// What each hit pixel visualizes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum RenderMode {
     /// Lit surface shaded according to [`PictureOpts::shading`].
     Shaded,
@@ -197,6 +296,8 @@ pub enum RenderMode {
     Depth,
     /// Analytical studio ceramic/metallic CAD matcap derived from the camera-space normal.
     Matcap,
+    /// Class-A reflection-line zebra stripes revealing dents, creases, and C1/C2 curvature breaks.
+    Zebra(ZebraOpts),
 }
 
 #[blaze::args]
@@ -242,6 +343,8 @@ pub enum PictureError {
     Unbounded,
     /// The ray of pixel (`x`, `y`) took `most` steps without settling.
     TooManySteps { x: u32, y: u32, most: u32 },
+    /// Two pictures passed to [`diff_pictures`] have different dimensions.
+    DimensionMismatch { left: (u32, u32), right: (u32, u32) },
     Alloc(AllocFailure),
 }
 

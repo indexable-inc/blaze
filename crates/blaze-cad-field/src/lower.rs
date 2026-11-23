@@ -22,8 +22,8 @@ use blaze_units::{Angle, Plain};
 
 use crate::Limits;
 use crate::error::CompileError;
-use crate::graph::{Graph, m, margin_of};
-use crate::node::{Boolean, Detail, Edge, Node, NodeId, ProfileId, Shape};
+use crate::graph::{CanonProfile, CanonSelect, Graph, SplineSpan, m, margin_of};
+use crate::node::{Boolean, Detail, Edge, LoftContinuity, Node, NodeId, ProfileId, Shape};
 use crate::placement::LINEAR_GRID;
 use crate::plant::CadPlant;
 use crate::profile::Closed;
@@ -354,7 +354,13 @@ fn pre<P: Planted<CadPlant>>(g: &Graph<'_, P>, e: &mut Emit<'_>, f: &mut Frame, 
         f.n = 1;
     };
     match *g.node(f.id) {
-        Node::Empty | Node::Primitive { .. } | Node::Extrude { .. } | Node::Revolve { .. } | Node::Loft { .. } | Node::Redistance { .. } => {
+        Node::Empty
+        | Node::Primitive { .. }
+        | Node::Extrude { .. }
+        | Node::Revolve { .. }
+        | Node::Loft { .. }
+        | Node::GuidedLoft { .. }
+        | Node::Redistance { .. } => {
             f.n = 0;
         }
         Node::Placed { inner, placement } => {
@@ -407,11 +413,15 @@ fn pre<P: Planted<CadPlant>>(g: &Graph<'_, P>, e: &mut Emit<'_>, f: &mut Frame, 
             f.n = 2;
             f.aux = far;
         }
-        Node::Boolean { a, b, .. } => {
+        Node::Boolean { a, b, .. } | Node::VariableBoolean { a, b, .. } => {
             f.kids = [(a, at), (b, at)];
             f.n = 2;
         }
-        Node::Grow { inner, .. } | Node::Erode { inner, .. } | Node::Shell { inner, .. } | Node::Detail { inner, .. } => one(f, inner, at),
+        Node::Grow { inner, .. }
+        | Node::Erode { inner, .. }
+        | Node::VariableOffset { inner, .. }
+        | Node::Shell { inner, .. }
+        | Node::Detail { inner, .. } => one(f, inner, at),
         Node::Twist { inner, rate, .. } => {
             let w = Angle::<Plain>::microarcsec(rate).as_radians();
             let th = e.mulk(z, w)?;
@@ -525,6 +535,7 @@ fn post<P: Planted<CadPlant>>(g: &Graph<'_, P>, e: &mut Emit<'_>, f: &Frame, v: 
             let slab = e.bin(Op::Max, below, above)?;
             e.bin(Op::Max, v, slab)
         }
+        Node::GuidedLoft { idx } => lower_guided_loft(g, e, f.id, at, idx),
         Node::Placed { .. } | Node::MirrorFold { .. } => Ok(v[0]),
         Node::Scale { factor_pp12, .. } => e.mulk(v[0], factor_pp12 as f64 / 1e12),
         Node::Affine { lipschitz_ppm, .. } => e.divk(v[0], lipschitz_ppm as f64 / 1e6),
@@ -543,7 +554,10 @@ fn post<P: Planted<CadPlant>>(g: &Graph<'_, P>, e: &mut Emit<'_>, f: &Frame, v: 
                 Edge::Sharp => Ok(sharp),
                 Edge::Round { r } => {
                     let r = m(r);
-                    let d = e.bin(Op::Sub, a, b)?;
+                    // Order `b - a` for `Min` (union) and `a - b` for `Max` (intersect/difference)
+                    // so `Abs(0.0)`'s `+1` subgradient matches the tie-break branch of `Min`/`Max`
+                    // and yields the exact C1 analytical gradient even on the symmetry surface `a == b`.
+                    let d = if union { e.bin(Op::Sub, b, a)? } else { e.bin(Op::Sub, a, b)? };
                     let d = e.un(Op::Abs, d)?;
                     let rk = e.k(r)?;
                     let h = e.bin(Op::Sub, rk, d)?;
@@ -562,8 +576,42 @@ fn post<P: Planted<CadPlant>>(g: &Graph<'_, P>, e: &mut Emit<'_>, f: &Frame, v: 
                 }
             }
         }
+        Node::VariableBoolean { op, chamfer, field, .. } => {
+            let (a, b) = match op {
+                Boolean::Difference => (v[0], e.un(Op::Neg, v[1])?),
+                _ => (v[0], v[1]),
+            };
+            let union = op == Boolean::Union;
+            let sharp = e.bin(if union { Op::Min } else { Op::Max }, a, b)?;
+            let (r_eff, l_r) = lower_var_radius(g, e, at, field)?;
+            if chamfer {
+                let sum = e.bin(Op::Add, a, b)?;
+                let shifted = if union { e.bin(Op::Sub, sum, r_eff)? } else { e.bin(Op::Add, sum, r_eff)? };
+                let diag = e.mulk(shifted, 0.5)?;
+                let raw = e.bin(if union { Op::Min } else { Op::Max }, sharp, diag)?;
+                e.divk(raw, 1.0 + 0.5 * l_r)
+            } else {
+                let d = if union { e.bin(Op::Sub, b, a)? } else { e.bin(Op::Sub, a, b)? };
+                let d = e.un(Op::Abs, d)?;
+                let r_safe = e.maxk(r_eff, 1e-12)?;
+                let num = e.bin(Op::Sub, r_eff, d)?;
+                let h = e.bin(Op::Div, num, r_safe)?;
+                let h = e.clampk(h, 0.0, 1.0)?;
+                let h2 = e.un(Op::Square, h)?;
+                let bump = e.bin(Op::Mul, r_eff, h2)?;
+                let bump = e.mulk(bump, 0.25)?;
+                let down = union != plant.has(CadPlant::SmoothUnionWrongSign);
+                let raw = e.bin(if down { Op::Sub } else { Op::Add }, sharp, bump)?;
+                e.divk(raw, 1.0 + 0.25 * l_r)
+            }
+        }
         Node::Grow { r, .. } => e.subk(v[0], m(r)),
         Node::Erode { r, .. } => e.addk(v[0], m(r)),
+        Node::VariableOffset { erode, field, .. } => {
+            let (r_eff, l_r) = lower_var_radius(g, e, at, field)?;
+            let raw = if erode { e.bin(Op::Add, v[0], r_eff)? } else { e.bin(Op::Sub, v[0], r_eff)? };
+            e.divk(raw, 1.0 + l_r)
+        }
         Node::Shell { t, .. } => {
             let n = e.un(Op::Neg, v[0])?;
             let n = e.subk(n, m(t))?;
@@ -615,4 +663,317 @@ fn post<P: Planted<CadPlant>>(g: &Graph<'_, P>, e: &mut Emit<'_>, f: &Frame, v: 
             e.push(Instr { op: Op::Grid3, args: [x, y, z, 0], extra: t })
         }
     }
+}
+
+/// Lowers a quantized piecewise-cubic spline at `z_reg` (already clamped to `[z_lo, z_hi]`)
+/// using only existing tape ops (`Const`, `Add`, `Sub`, `Mul`, `Div`, `Min`, `Max`, `Select`).
+fn lower_spline(e: &mut Emit<'_>, spans: &[SplineSpan], z_reg: u32, z_lo: f64, z_hi: f64, default_val: f64) -> R {
+    if spans.is_empty() {
+        return e.k(default_val);
+    }
+    if spans.len() == 1 && spans[0].c_pp12[1] == 0 && spans[0].c_pp12[2] == 0 && spans[0].c_pp12[3] == 0 {
+        return e.k(spans[0].c_pp12[0] as f64 / 1e12);
+    }
+    let rz0 = m(spans[0].z0_nm);
+    let rzn = m(spans[spans.len() - 1].z1_nm);
+    let zs = if rz0 <= z_lo && rzn >= z_hi {
+        z_reg
+    } else {
+        e.clampk(z_reg, rz0, rzn)?
+    };
+    let mut acc = None;
+    for sp in spans {
+        let za = m(sp.z0_nm);
+        let zb = m(sp.z1_nm);
+        let h = zb - za;
+        let u = e.subk(zs, za)?;
+        let u = e.divk(u, h)?;
+        let u = e.clampk(u, 0.0, 1.0)?;
+        let c0 = sp.c_pp12[0] as f64 / 1e12;
+        let c1 = sp.c_pp12[1] as f64 / 1e12;
+        let c2 = sp.c_pp12[2] as f64 / 1e12;
+        let c3 = sp.c_pp12[3] as f64 / 1e12;
+        let v = if sp.c_pp12[3] == 0 && sp.c_pp12[2] == 0 {
+            let t1 = e.mulk(u, c1)?;
+            e.addk(t1, c0)?
+        } else if sp.c_pp12[3] == 0 {
+            let t2 = e.mulk(u, c2)?;
+            let t2 = e.addk(t2, c1)?;
+            let t2 = e.bin(Op::Mul, t2, u)?;
+            e.addk(t2, c0)?
+        } else {
+            let v = e.mulk(u, c3)?;
+            let v = e.addk(v, c2)?;
+            let v = e.bin(Op::Mul, v, u)?;
+            let v = e.addk(v, c1)?;
+            let v = e.bin(Op::Mul, v, u)?;
+            e.addk(v, c0)?
+        };
+        acc = Some(match acc {
+            None => v,
+            Some(prev) => {
+                let ka = e.k(za)?;
+                e.sel(zs, ka, prev, v)?
+            }
+        });
+    }
+    let Some(res) = acc else { unreachable!("non-empty spline spans") };
+    Ok(res)
+}
+
+/// Lowers [`Node::GuidedLoft`] to existing tape ops.
+fn lower_guided_loft<P: Planted<CadPlant>>(g: &Graph<'_, P>, e: &mut Emit<'_>, id: NodeId, at: [u32; 3], idx: u32) -> R {
+    let gl = *g.guided_loft_rec(idx);
+    let [x, y, z] = at;
+    let (z0_nm, _) = g.station(gl.stations_start);
+    let (zn_nm, _) = g.station(gl.stations_start + gl.stations_len - 1);
+    let (z0, zn) = (m(z0_nm), m(zn_nm));
+    let zc = e.clampk(z, z0, zn)?;
+
+    // Center offset `(cx(zc), cy(zc))`.
+    let dx = if gl.splines[2].1 == 0 {
+        x
+    } else {
+        let cx = lower_spline(e, g.spline_slice(gl.splines[2]), zc, z0, zn, 0.0)?;
+        e.bin(Op::Sub, x, cx)?
+    };
+    let dy = if gl.splines[3].1 == 0 {
+        y
+    } else {
+        let cy = lower_spline(e, g.spline_slice(gl.splines[3]), zc, z0, zn, 0.0)?;
+        e.bin(Op::Sub, y, cy)?
+    };
+
+    // Un-twist by `-theta(zc)`.
+    let (rx, ry) = if gl.splines[4].1 == 0 {
+        (dx, dy)
+    } else {
+        let th = lower_spline(e, g.spline_slice(gl.splines[4]), zc, z0, zn, 0.0)?;
+        let (cs, sn) = (e.un(Op::Cos, th)?, e.un(Op::Sin, th)?);
+        let (xc, ys, yc, xs) = (
+            e.bin(Op::Mul, dx, cs)?,
+            e.bin(Op::Mul, dy, sn)?,
+            e.bin(Op::Mul, dy, cs)?,
+            e.bin(Op::Mul, dx, sn)?,
+        );
+        (e.bin(Op::Add, xc, ys)?, e.bin(Op::Sub, yc, xs)?)
+    };
+
+    // Scale `(sx(zc), sy(zc))` with safe lower clamp `0.5 * s_min` (no-op for all points,
+    // keeps denominator intervals strictly positive).
+    let sx = if gl.splines[0].1 == 0 {
+        e.k(1.0)?
+    } else {
+        let raw = lower_spline(e, g.spline_slice(gl.splines[0]), zc, z0, zn, 1.0)?;
+        e.maxk(raw, 0.5 * (gl.s_min_pp12[0] as f64 / 1e12))?
+    };
+    let sy = if gl.splines[1].1 == 0 {
+        e.k(1.0)?
+    } else {
+        let raw = lower_spline(e, g.spline_slice(gl.splines[1]), zc, z0, zn, 1.0)?;
+        e.maxk(raw, 0.5 * (gl.s_min_pp12[1] as f64 / 1e12))?
+    };
+    let u = if gl.splines[0].1 == 0 { rx } else { e.bin(Op::Div, rx, sx)? };
+    let v = if gl.splines[1].1 == 0 { ry } else { e.bin(Op::Div, ry, sy)? };
+
+    // Blend station profile fields across each span with requested continuity.
+    let mut fields: [u32; 2] = [0, 0];
+    let mut acc = None;
+    for i in 0..gl.stations_len - 1 {
+        let (za, pa) = g.station(gl.stations_start + i);
+        let (zb, pb) = g.station(gl.stations_start + i + 1);
+        fields[0] = if i == 0 { profile2d(g, e, pa, u, v)? } else { fields[1] };
+        fields[1] = profile2d(g, e, pb, u, v)?;
+        let t = e.subk(zc, m(za))?;
+        let t = e.divk(t, m(zb - za))?;
+        let t = e.clampk(t, 0.0, 1.0)?;
+        let w = match gl.continuity {
+            LoftContinuity::Linear => t,
+            LoftContinuity::SmoothC1 => {
+                let t2 = e.un(Op::Square, t)?;
+                let c = e.mulk(t, -2.0)?;
+                let c = e.addk(c, 3.0)?;
+                e.bin(Op::Mul, t2, c)?
+            }
+            LoftContinuity::CurvatureC2 => {
+                let t2 = e.un(Op::Square, t)?;
+                let t3 = e.bin(Op::Mul, t2, t)?;
+                let p = e.mulk(t, 6.0)?;
+                let p = e.addk(p, -15.0)?;
+                let p = e.bin(Op::Mul, p, t)?;
+                let p = e.addk(p, 10.0)?;
+                e.bin(Op::Mul, t3, p)?
+            }
+        };
+        let dfd = e.bin(Op::Sub, fields[1], fields[0])?;
+        let dt = e.bin(Op::Mul, dfd, w)?;
+        let b = e.bin(Op::Add, fields[0], dt)?;
+        acc = Some(match acc {
+            None => b,
+            Some(prev) => {
+                let ka = e.k(m(za))?;
+                e.sel(zc, ka, prev, b)?
+            }
+        });
+    }
+    let Some(d) = acc else { unreachable!("a guided loft has at least two stations") };
+
+    // Geometric distance preservation by `min(sx, sy)` and division by sound Lipschitz bound.
+    let ms = e.bin(Op::Min, sx, sy)?;
+    let scaled = e.bin(Op::Mul, d, ms)?;
+    let body = e.divk(scaled, gl.lipschitz_ppm as f64 / 1e6)?;
+
+    // Cap at `[z0, zn]`, optionally smooth round-intersected with `cap_round`.
+    let below = e.k(z0)?;
+    let below = e.bin(Op::Sub, below, z)?;
+    let above = e.subk(z, zn)?;
+    let slab = e.bin(Op::Max, below, above)?;
+    let capped = if gl.cap_round == 0 {
+        e.bin(Op::Max, body, slab)?
+    } else {
+        let r = m(gl.cap_round);
+        let sharp = e.bin(Op::Max, body, slab)?;
+        let diff = e.bin(Op::Sub, body, slab)?;
+        let diff = e.un(Op::Abs, diff)?;
+        let rk = e.k(r)?;
+        let h = e.bin(Op::Sub, rk, diff)?;
+        let h = e.maxk(h, 0.0)?;
+        let h = e.divk(h, r)?;
+        let h2 = e.un(Op::Square, h)?;
+        let bump = e.mulk(h2, r * 0.25)?;
+        e.bin(Op::Add, sharp, bump)?
+    };
+
+    if gl.guarded {
+        let c = g.aabb(id);
+        let cg = c.grow(margin_of(&c));
+        let near = e.bbox(at, &cg)?;
+        let far = e.bbox(at, &c)?;
+        let zero = e.k(0.0)?;
+        e.sel(near, zero, capped, far)
+    } else {
+        Ok(capped)
+    }
+}
+
+/// Lowers `r_eff(p) = profile(p) * mask(p)` and returns `(r_eff_reg, L_r)`.
+fn lower_var_radius<P: Planted<CadPlant>>(g: &Graph<'_, P>, e: &mut Emit<'_>, at: [u32; 3], field: u32) -> Result<(u32, f64), CompileError> {
+    let vf = *g.var_field_rec(field);
+    let prof_r = match vf.profile {
+        CanonProfile::Constant { r_nm } => e.k(m(r_nm))?,
+        CanonProfile::Linear { from_nm, to_nm, r0_nm, r1_nm } => {
+            let (fx, fy, fz) = (m(from_nm[0]), m(from_nm[1]), m(from_nm[2]));
+            let (dx, dy, dz) = (m(to_nm[0] - from_nm[0]), m(to_nm[1] - from_nm[1]), m(to_nm[2] - from_nm[2]));
+            let len2 = dx * dx + dy * dy + dz * dz;
+            let inv = 1.0 / len2;
+            let t = e.row(at, [dx * inv, dy * inv, dz * inv, -(dx * fx + dy * fy + dz * fz) * inv])?;
+            let t = e.clampk(t, 0.0, 1.0)?;
+            let dr = e.mulk(t, m(r1_nm - r0_nm))?;
+            e.addk(dr, m(r0_nm))?
+        }
+        CanonProfile::Curve { origin_nm, axis_pp12, start, len } => {
+            let (ox, oy, oz) = (m(origin_nm[0]), m(origin_nm[1]), m(origin_nm[2]));
+            let (ax, ay, az) = (
+                axis_pp12[0] as f64 / 1e12,
+                axis_pp12[1] as f64 / 1e12,
+                axis_pp12[2] as f64 / 1e12,
+            );
+            let alen = blaze_math::sqrt(ax * ax + ay * ay + az * az);
+            let (ux, uy, uz) = (ax / alen, ay / alen, az / alen);
+            let s = e.row(at, [ux, uy, uz, -(ux * ox + uy * oy + uz * oz)])?;
+            let stops = g.radius_stops_slice(start, len);
+            let sc = e.clampk(s, m(stops[0].0), m(stops[stops.len() - 1].0))?;
+            let mut acc = None;
+            for i in 0..stops.len() - 1 {
+                let (at0, r0) = stops[i];
+                let (at1, r1) = stops[i + 1];
+                let t = e.subk(sc, m(at0))?;
+                let t = e.divk(t, m(at1 - at0))?;
+                let t = e.clampk(t, 0.0, 1.0)?;
+                let t2 = e.un(Op::Square, t)?;
+                let tw = e.mulk(t, -2.0)?;
+                let tw = e.addk(tw, 3.0)?;
+                let w = e.bin(Op::Mul, t2, tw)?;
+                let dr = e.mulk(w, m(r1 - r0))?;
+                let val = e.addk(dr, m(r0))?;
+                acc = Some(match acc {
+                    None => val,
+                    Some(prev) => {
+                        let ka = e.k(m(at0))?;
+                        e.sel(sc, ka, prev, val)?
+                    }
+                });
+            }
+            let Some(res) = acc else { unreachable!("curve profile has at least two stops") };
+            res
+        }
+    };
+
+    let r_eff = match vf.select {
+        CanonSelect::All => prof_r,
+        CanonSelect::Box { lo_nm, hi_nm, fade_nm } => {
+            let mut q = [0u32; 3];
+            for i in 0..3 {
+                let c = 0.5 * (m(lo_nm[i]) + m(hi_nm[i]));
+                let h = 0.5 * (m(hi_nm[i]) - m(lo_nm[i]));
+                let d = e.subk(at[i], c)?;
+                let a = e.un(Op::Abs, d)?;
+                q[i] = e.subk(a, h)?;
+            }
+            let (ox, oy, oz) = (e.maxk(q[0], 0.0)?, e.maxk(q[1], 0.0)?, e.maxk(q[2], 0.0)?);
+            let out = e.len3(ox, oy, oz)?;
+            let inn = e.bin(Op::Max, q[1], q[2])?;
+            let inn = e.bin(Op::Max, q[0], inn)?;
+            let inn = e.mink(inn, 0.0)?;
+            let sd = e.bin(Op::Add, out, inn)?;
+            apply_fade_mask(e, prof_r, sd, m(fade_nm))?
+        }
+        CanonSelect::Ball { center_nm, radius_nm, fade_nm } => {
+            let dx = e.subk(at[0], m(center_nm[0]))?;
+            let dy = e.subk(at[1], m(center_nm[1]))?;
+            let dz = e.subk(at[2], m(center_nm[2]))?;
+            let dist = e.len3(dx, dy, dz)?;
+            let sd = e.subk(dist, m(radius_nm))?;
+            apply_fade_mask(e, prof_r, sd, m(fade_nm))?
+        }
+        CanonSelect::Capsule { a_nm, b_nm, radius_nm, fade_nm } => {
+            let (ax, ay, az) = (m(a_nm[0]), m(a_nm[1]), m(a_nm[2]));
+            let (abx, aby, abz) = (m(b_nm[0] - a_nm[0]), m(b_nm[1] - a_nm[1]), m(b_nm[2] - a_nm[2]));
+            let ab2 = abx * abx + aby * aby + abz * abz;
+            let dist = if ab2 > 0.0 {
+                let inv = 1.0 / ab2;
+                let t = e.row(at, [abx * inv, aby * inv, abz * inv, -(abx * ax + aby * ay + abz * az) * inv])?;
+                let t = e.clampk(t, 0.0, 1.0)?;
+                let pax = e.subk(at[0], ax)?;
+                let pay = e.subk(at[1], ay)?;
+                let paz = e.subk(at[2], az)?;
+                let tx = e.mulk(t, abx)?;
+                let ty = e.mulk(t, aby)?;
+                let tz = e.mulk(t, abz)?;
+                let px = e.bin(Op::Sub, pax, tx)?;
+                let py = e.bin(Op::Sub, pay, ty)?;
+                let pz = e.bin(Op::Sub, paz, tz)?;
+                e.len3(px, py, pz)?
+            } else {
+                let dx = e.subk(at[0], ax)?;
+                let dy = e.subk(at[1], ay)?;
+                let dz = e.subk(at[2], az)?;
+                e.len3(dx, dy, dz)?
+            };
+            let sd = e.subk(dist, m(radius_nm))?;
+            apply_fade_mask(e, prof_r, sd, m(fade_nm))?
+        }
+    };
+    Ok((r_eff, vf.l_r_ppm as f64 / 1e6))
+}
+
+fn apply_fade_mask(e: &mut Emit<'_>, prof_r: u32, sd: u32, fade: f64) -> R {
+    let u = e.mulk(sd, -1.0 / fade)?;
+    let u = e.addk(u, 1.0)?;
+    let u = e.clampk(u, 0.0, 1.0)?;
+    let u2 = e.un(Op::Square, u)?;
+    let w = e.mulk(u, -2.0)?;
+    let w = e.addk(w, 3.0)?;
+    let mask = e.bin(Op::Mul, u2, w)?;
+    e.bin(Op::Mul, prof_r, mask)
 }

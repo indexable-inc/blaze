@@ -79,3 +79,16 @@ pub enum QuantPlant {
 }
 
 impl Plants for QuantPlant {}
+
+/// UV unwrapping and tangent generation's planted bugs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UvPlant {
+    None,
+    /// Places all charts at `(0, 0)` without packing, caught by the non-overlap oracle.
+    OverlapCharts,
+    /// Outputs raw un-orthogonalized tangent and wrong handedness, caught by the tangent-frame
+    /// oracle.
+    SkipTangentOrtho,
+}
+
+impl Plants for UvPlant {}

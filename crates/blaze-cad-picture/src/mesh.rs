@@ -17,7 +17,9 @@ use blaze_math::{Aabb3, Vec3};
 use blaze_own::planted::{NoPlant, Planted, Plants};
 use blaze_own::{Alloc, AllocFailure, Vec};
 
-use crate::shade::{RGSS_2X2, ShadeContext, linear_to_srgb, quantize, resolve_samples, srgb_to_linear};
+use crate::shade::{
+    RGSS_2X2, ShadeContext, eval_strip_lights, linear_to_srgb, quantize, resolve_samples, shade_zebra, srgb_to_linear,
+};
 use crate::{Camera, LEAST_STEP, Picture, PictureError, PictureOpts, PictureStats, RenderMode, Shading, StudioOpts, View, slab};
 
 /// Maximum triangles stored in a single BVH leaf.
@@ -41,6 +43,9 @@ pub enum MeshPicturePlant {
     FlatOnly,
     /// Ignores [`MeshPictureOpts::highlights`] (never draws missed-feature callouts on the preview).
     IgnoreHighlights,
+    /// Ignores [`MeshPictureOpts::material_maps`] (never samples baked base-colour,
+    /// metallic-roughness, or tangent-space normal maps).
+    IgnoreTextures,
 }
 
 impl Plants for MeshPicturePlant {}
@@ -111,6 +116,124 @@ pub struct MeshHighlight {
     pub style: HighlightStyle,
 }
 
+/// Borrowed RGBA8 texture image sampled by [`render_mesh_scene`] (`width × height × 4` bytes,
+/// row-major from the top).
+#[derive(Clone, Copy, Debug)]
+pub struct TextureMap<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: &'a [u8],
+}
+
+impl TextureMap<'_> {
+    /// Deterministic clamp-to-edge bilinear sample returning normalized `[r, g, b, a]` in `0.0..=1.0`.
+    pub fn sample_bilinear(&self, u: f64, v: f64) -> [f64; 4] {
+        let Some((x0, y0, x1, y1, tx, ty)) = self.bilinear_coords(u, v) else {
+            return [1.0, 1.0, 1.0, 1.0];
+        };
+        let p00 = self.texel(x0, y0);
+        let p10 = self.texel(x1, y0);
+        let p01 = self.texel(x0, y1);
+        let p11 = self.texel(x1, y1);
+        let wx0 = 1.0 - tx;
+        let wy0 = 1.0 - ty;
+        let mut out = [0.0f64; 4];
+        for c in 0..4 {
+            let top = f64::from(p00[c]) * wx0 + f64::from(p10[c]) * tx;
+            let bot = f64::from(p01[c]) * wx0 + f64::from(p11[c]) * tx;
+            out[c] = ((top * wy0 + bot * ty) / 255.0).clamp(0.0, 1.0);
+        }
+        out
+    }
+
+    /// Deterministic clamp-to-edge bilinear sample decoding sRGB RGB texels to linear light before
+    /// filtering (alpha stays linear).
+    pub(crate) fn sample_srgb_linear_bilinear(&self, u: f64, v: f64) -> [f64; 4] {
+        let Some((x0, y0, x1, y1, tx, ty)) = self.bilinear_coords(u, v) else {
+            return [1.0, 1.0, 1.0, 1.0];
+        };
+        let p00 = self.texel(x0, y0);
+        let p10 = self.texel(x1, y0);
+        let p01 = self.texel(x0, y1);
+        let p11 = self.texel(x1, y1);
+        let wx0 = 1.0 - tx;
+        let wy0 = 1.0 - ty;
+        let mut out = [0.0f64; 4];
+        for c in 0..3 {
+            let top = srgb_to_linear(p00[c]) * wx0 + srgb_to_linear(p10[c]) * tx;
+            let bot = srgb_to_linear(p01[c]) * wx0 + srgb_to_linear(p11[c]) * tx;
+            out[c] = (top * wy0 + bot * ty).clamp(0.0, 1.0);
+        }
+        let a_top = f64::from(p00[3]) * wx0 + f64::from(p10[3]) * tx;
+        let a_bot = f64::from(p01[3]) * wx0 + f64::from(p11[3]) * tx;
+        out[3] = ((a_top * wy0 + a_bot * ty) / 255.0).clamp(0.0, 1.0);
+        out
+    }
+
+    #[inline]
+    fn bilinear_coords(&self, u: f64, v: f64) -> Option<(u32, u32, u32, u32, f64, f64)> {
+        if self.width == 0 || self.height == 0 {
+            return None;
+        }
+        let needed = usize::try_from(self.width)
+            .ok()?
+            .checked_mul(usize::try_from(self.height).ok()?)?
+            .checked_mul(4)?;
+        if self.rgba.len() < needed {
+            return None;
+        }
+        let uc = if u.is_finite() { u.clamp(0.0, 1.0) } else { 0.0 };
+        let vc = if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+        let wf = f64::from(self.width);
+        let hf = f64::from(self.height);
+        let fx = (uc * wf - 0.5).clamp(0.0, (wf - 1.0).max(0.0));
+        let fy = (vc * hf - 0.5).clamp(0.0, (hf - 1.0).max(0.0));
+        let x0 = (blaze_math::floor(fx) as u32).min(self.width - 1);
+        let y0 = (blaze_math::floor(fy) as u32).min(self.height - 1);
+        let x1 = (x0 + 1).min(self.width - 1);
+        let y1 = (y0 + 1).min(self.height - 1);
+        let tx = (fx - f64::from(x0)).clamp(0.0, 1.0);
+        let ty = (fy - f64::from(y0)).clamp(0.0, 1.0);
+        Some((x0, y0, x1, y1, tx, ty))
+    }
+
+    #[inline]
+    fn texel(&self, x: u32, y: u32) -> [u8; 4] {
+        let off = ((y as usize) * (self.width as usize) + (x as usize)) * 4;
+        [self.rgba[off], self.rgba[off + 1], self.rgba[off + 2], self.rgba[off + 3]]
+    }
+}
+
+/// Baked PBR texture maps for one material role, indexed in parallel with `materials: &[Material]`
+/// in [`MeshPictureOpts::material_maps`].
+#[derive(Clone, Copy, Debug)]
+pub struct MaterialMaps<'a> {
+    /// Base-colour / albedo RGBA8 map (sRGB-encoded RGB, multiplied with `Material::base_colour`).
+    pub base_colour: Option<TextureMap<'a>>,
+    /// glTF-convention metallic-roughness RGBA8 map (G = roughness factor, B = metallic factor).
+    pub metallic_roughness: Option<TextureMap<'a>>,
+    /// Tangent-space normal map RGBA8 texture (RGB unpacked from `[0, 1]` to `[-1, 1]`).
+    pub normal: Option<TextureMap<'a>>,
+    /// Tangent-space XY perturbation scale (typically `1.0`).
+    pub normal_scale: f64,
+}
+
+impl MaterialMaps<'_> {
+    /// Empty material map set with no textures bound.
+    pub const NONE: MaterialMaps<'static> = MaterialMaps {
+        base_colour: None,
+        metallic_roughness: None,
+        normal: None,
+        normal_scale: 1.0,
+    };
+}
+
+impl Default for MaterialMaps<'_> {
+    fn default() -> MaterialMaps<'static> {
+        MaterialMaps::NONE
+    }
+}
+
 /// Options for [`render_mesh`] and [`render_mesh_scene`].
 #[blaze::args]
 #[derive(Clone, Copy, Debug)]
@@ -126,7 +249,7 @@ pub struct MeshPictureOpts<'a, 's, 'h> {
     pub fallback_colour: [u8; 3] = [168, 178, 192],
     /// Lighting model in [`RenderMode::Shaded`].
     pub shading: Shading = Shading::Studio(StudioOpts::DEFAULT),
-    /// Visualization mode (`Shaded`, `Normals`, `Depth`, `Matcap`).
+    /// Visualization mode (`Shaded`, `Normals`, `Depth`, `Matcap`, `Zebra`).
     pub mode: RenderMode = RenderMode::Shaded,
     /// Whether to shade with exported interpolated normals or flat geometric normals.
     pub normal_source: MeshNormalSource = MeshNormalSource::Shading,
@@ -135,6 +258,8 @@ pub struct MeshPictureOpts<'a, 's, 'h> {
     /// Optional spatial feature highlights (e.g. missed fidelity targets) rendered directly on
     /// the exported triangles in part-local coordinates.
     pub highlights: &'h [MeshHighlight] = &[],
+    /// Optional baked PBR texture & tangent-space normal maps indexed in parallel with `materials`.
+    pub material_maps: &'h [MaterialMaps<'h>] = &[],
     /// Deterministic supersampling per axis: `1` or `2` (2×2 RGSS).
     pub supersample: u8 = 1,
 }
@@ -198,6 +323,7 @@ pub fn render_mesh_scene_planted<'a>(
     let mut stats = PictureStats::default();
     let use_shading_normals = matches!(o.normal_source, MeshNormalSource::Shading) && !plant.has(MeshPicturePlant::FlatOnly);
     let active_highlights: &[MeshHighlight] = if plant.has(MeshPicturePlant::IgnoreHighlights) { &[] } else { o.highlights };
+    let active_maps: &[MaterialMaps<'_>] = if plant.has(MeshPicturePlant::IgnoreTextures) { &[] } else { o.material_maps };
 
     for y in 0..view.height {
         for x in 0..view.width {
@@ -212,6 +338,7 @@ pub fn render_mesh_scene_planted<'a>(
                         &ctx,
                         &o,
                         active_highlights,
+                        active_maps,
                         f64::from(x) + 0.5,
                         f64::from(y) + 0.5,
                         origin,
@@ -245,6 +372,7 @@ pub fn render_mesh_scene_planted<'a>(
                             &ctx,
                             &o,
                             active_highlights,
+                            active_maps,
                             sx,
                             sy,
                             origin,
@@ -438,6 +566,11 @@ struct WorldTri {
     n1: Vec3,
     n2: Vec3,
     ng: Vec3,
+    /// Optional per-vertex UV coordinates `(u, v)` copied from the exported mesh's `uvs` column.
+    uvs: Option<[[f64; 2]; 3]>,
+    /// Optional world-space unit vertex tangents `[tx, ty, tz, handedness]` transformed by the
+    /// part's linear matrix and orthonormalized against the vertex normals.
+    tangents: Option<[[f64; 4]; 3]>,
     /// `2 * area / edge_len` for each of the 3 opposite edges (used for exact screen-space
     /// pixel distance to the nearest triangle edge in wireframe mode).
     alt_scale: [f64; 3],
@@ -448,6 +581,8 @@ struct WorldTri {
     metallic: f64,
     roughness: f64,
     emissive: [f64; 3],
+    role: u32,
+    has_tint_override: bool,
     part_idx: u32,
     bounds: Aabb3,
     centroid: Vec3,
@@ -519,8 +654,11 @@ fn build_bvh<'s>(
         let view = &part.mesh;
         let pos = view.positions();
         let nrms = view.normals();
+        let uvs_col = view.uvs();
+        let tans_col = view.tangents();
         let roles = view.roles();
         let has_nrms = nrms.len() == pos.len();
+        let has_tint_override = part.tint_override.is_some();
 
         for (ti, tri) in view.triangles().iter().enumerate() {
             let (i0, i1, i2) = if mirrored {
@@ -550,11 +688,34 @@ fn build_bvh<'s>(
                 (ng, ng, ng)
             };
 
+            let uvs = uvs_col.map(|col| {
+                [
+                    [f64::from(col[i0][0]), f64::from(col[i0][1])],
+                    [f64::from(col[i1][0]), f64::from(col[i1][1])],
+                    [f64::from(col[i2][0]), f64::from(col[i2][1])],
+                ]
+            });
+
+            let tangents = tans_col.map(|col| {
+                let xf_tan = |raw: [f32; 4], nv: Vec3| -> [f64; 4] {
+                    let tw = mul_mat3(&xf.m, [raw[0], raw[1], raw[2]]);
+                    let t_ortho = (tw - nv * tw.dot(nv)).normalized().unwrap_or_else(|| {
+                        let helper = if nv.z.abs() < 0.9 { Vec3::new(0.0, 0.0, 1.0) } else { Vec3::new(1.0, 0.0, 0.0) };
+                        helper.cross(nv).normalized().unwrap_or(Vec3::new(1.0, 0.0, 0.0))
+                    });
+                    let w_raw = if raw[3] < 0.0 { -1.0 } else { 1.0 };
+                    let w_sign = if mirrored { -w_raw } else { w_raw };
+                    [t_ortho.x, t_ortho.y, t_ortho.z, w_sign]
+                };
+                [xf_tan(col[i0], n0), xf_tan(col[i1], n1), xf_tan(col[i2], n2)]
+            });
+
             let len_bc = (c - b).length().max(LEAST_STEP);
             let len_ca = e2.length().max(LEAST_STEP);
             let len_ab = e1.length().max(LEAST_STEP);
             let alt_scale = [twice_area / len_bc, twice_area / len_ca, twice_area / len_ab];
 
+            let role = roles.get(ti).map_or(0u32, |r| r.0);
             let (albedo_linear, albedo_srgb, metallic, roughness, emissive) = if let Some(rgb) = part.tint_override {
                 let srgb = [f64::from(rgb[0]) / 255.0, f64::from(rgb[1]) / 255.0, f64::from(rgb[2]) / 255.0];
                 let lin = [srgb_to_linear(rgb[0]), srgb_to_linear(rgb[1]), srgb_to_linear(rgb[2])];
@@ -584,12 +745,16 @@ fn build_bvh<'s>(
                 n1,
                 n2,
                 ng,
+                uvs,
+                tangents,
                 alt_scale,
                 albedo_linear,
                 albedo_srgb,
                 metallic,
                 roughness,
                 emissive,
+                role,
+                has_tint_override,
                 part_idx: part_idx as u32,
                 bounds: Aabb3::new(lo, hi),
                 centroid,
@@ -923,6 +1088,15 @@ fn mesh_ao(
     (1.0 - strength) + strength * open
 }
 
+/// Effective per-hit PBR material parameters after optional baked texture sampling.
+#[derive(Clone, Copy)]
+struct SampledSurface {
+    albedo_linear: [f64; 3],
+    albedo_srgb: [f64; 3],
+    metallic: f64,
+    roughness: f64,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn shade_mesh_hit(
     bvh: &MeshBvh<'_>,
@@ -930,6 +1104,7 @@ fn shade_mesh_hit(
     ctx: &ShadeContext,
     o: &MeshPictureOpts<'_, '_, '_>,
     highlights: &[MeshHighlight],
+    material_maps: &[MaterialMaps<'_>],
     sx: f64,
     sy: f64,
     origin: Vec3,
@@ -952,6 +1127,58 @@ fn shade_mesh_hit(
     }
     let ng_face = if tri.ng.dot(dir) > 0.0 { tri.ng * -1.0 } else { tri.ng };
 
+    let mut surface = SampledSurface {
+        albedo_linear: tri.albedo_linear,
+        albedo_srgb: tri.albedo_srgb,
+        metallic: tri.metallic,
+        roughness: tri.roughness,
+    };
+
+    if let Some(uvs) = tri.uvs
+        && let Some(maps) = material_maps.get(tri.role as usize)
+    {
+        let uv_u = uvs[0][0] * w + uvs[1][0] * hit.u + uvs[2][0] * hit.v;
+        let uv_v = uvs[0][1] * w + uvs[1][1] * hit.u + uvs[2][1] * hit.v;
+
+        if !tri.has_tint_override
+            && let Some(tex) = maps.base_colour
+        {
+            let s_lin = tex.sample_srgb_linear_bilinear(uv_u, uv_v);
+            let s_raw = tex.sample_bilinear(uv_u, uv_v);
+            for c in 0..3 {
+                surface.albedo_linear[c] = (surface.albedo_linear[c] * s_lin[c]).clamp(0.0, 1.0);
+                surface.albedo_srgb[c] = (surface.albedo_srgb[c] * s_raw[c]).clamp(0.0, 1.0);
+            }
+        }
+
+        if let Some(tex) = maps.metallic_roughness {
+            let mr = tex.sample_bilinear(uv_u, uv_v);
+            surface.roughness = (surface.roughness * mr[1]).clamp(0.04, 1.0);
+            surface.metallic = (surface.metallic * mr[2]).clamp(0.0, 1.0);
+        }
+
+        if let Some(tex) = maps.normal
+            && let Some(tans) = tri.tangents
+        {
+            let tx = tans[0][0] * w + tans[1][0] * hit.u + tans[2][0] * hit.v;
+            let ty = tans[0][1] * w + tans[1][1] * hit.u + tans[2][1] * hit.v;
+            let tz = tans[0][2] * w + tans[1][2] * hit.u + tans[2][2] * hit.v;
+            let tw = if tans[0][3] * w + tans[1][3] * hit.u + tans[2][3] * hit.v < 0.0 { -1.0 } else { 1.0 };
+            let t_raw = Vec3::new(tx, ty, tz);
+            if let Some(t_dir) = (t_raw - n * t_raw.dot(n)).normalized() {
+                let b_dir = n.cross(t_dir) * tw;
+                let nm = tex.sample_bilinear(uv_u, uv_v);
+                let scale = if maps.normal_scale.is_finite() { maps.normal_scale } else { 1.0 };
+                let nx = (nm[0] * 2.0 - 1.0) * scale;
+                let ny = (nm[1] * 2.0 - 1.0) * scale;
+                let nz = nm[2] * 2.0 - 1.0;
+                if let Some(perturbed) = (t_dir * nx + b_dir * ny + n * nz).normalized() {
+                    n = perturbed;
+                }
+            }
+        }
+    }
+
     let mut colour = match o.mode {
         RenderMode::Normals => [(n.x * 0.5 + 0.5).clamp(0.0, 1.0), (n.y * 0.5 + 0.5).clamp(0.0, 1.0), (n.z * 0.5 + 0.5).clamp(0.0, 1.0), 1.0],
         RenderMode::Depth => {
@@ -971,7 +1198,7 @@ fn shade_mesh_hit(
             let d1 = nv.dot(l1).max(0.0);
             let lobe1 = blaze_math::pow(d1, 24.0) * 0.55 + d1 * 0.25;
             let rim = blaze_math::pow((1.0 - nz).clamp(0.0, 1.0), 3.0) * 0.28;
-            let base = tri.albedo_srgb;
+            let base = surface.albedo_srgb;
             [
                 (dome[0] * (0.35 + 0.65 * base[0]) + lobe1 + rim * 0.95).clamp(0.0, 1.0),
                 (dome[1] * (0.35 + 0.65 * base[1]) + lobe1 + rim * 0.95).clamp(0.0, 1.0),
@@ -979,6 +1206,7 @@ fn shade_mesh_hit(
                 1.0,
             ]
         }
+        RenderMode::Zebra(zebra) => shade_zebra(cam, dir, n, &zebra),
         RenderMode::Shaded => match o.wireframe {
             Wireframe::Only { .. } => {
                 // Clean matte surface under wireframe-only inspection.
@@ -995,13 +1223,13 @@ fn shade_mesh_hit(
                 Shading::Classic => {
                     let s = 0.22 + 0.78 * n.dot(ctx.classic_light).max(0.0);
                     [
-                        (tri.albedo_srgb[0] * s).clamp(0.0, 1.0),
-                        (tri.albedo_srgb[1] * s).clamp(0.0, 1.0),
-                        (tri.albedo_srgb[2] * s).clamp(0.0, 1.0),
+                        (surface.albedo_srgb[0] * s).clamp(0.0, 1.0),
+                        (surface.albedo_srgb[1] * s).clamp(0.0, 1.0),
+                        (surface.albedo_srgb[2] * s).clamp(0.0, 1.0),
                         1.0,
                     ]
                 }
-                Shading::Studio(studio) => shade_mesh_studio(bvh, cam, ctx, &studio, p, dir, n, ng_face, tri, stats),
+                Shading::Studio(studio) => shade_mesh_studio(bvh, cam, ctx, &studio, p, dir, n, ng_face, tri, &surface, stats),
             },
         },
     };
@@ -1098,6 +1326,7 @@ fn shade_mesh_studio(
     n: Vec3,
     ng: Vec3,
     tri: &WorldTri,
+    surface: &SampledSurface,
     stats: &mut PictureStats,
 ) -> [f64; 4] {
     let v = dir * -1.0;
@@ -1113,11 +1342,11 @@ fn shade_mesh_studio(
         1.0
     };
 
-    let albedo = if studio.srgb { tri.albedo_linear } else { tri.albedo_srgb };
+    let albedo = if studio.srgb { surface.albedo_linear } else { surface.albedo_srgb };
     // Metallic surfaces reflect tinted specular and attenuate diffuse; rough surfaces broaden highlights.
-    let diff_weight = 1.0 - 0.65 * tri.metallic;
-    let spec_weight = studio.specular * (0.4 + 1.2 * (1.0 - tri.roughness) + 0.6 * tri.metallic);
-    let shininess = (studio.shininess * (1.15 - tri.roughness).max(0.15)).clamp(4.0, 256.0);
+    let diff_weight = 1.0 - 0.65 * surface.metallic;
+    let spec_weight = studio.specular * (0.4 + 1.2 * (1.0 - surface.roughness) + 0.6 * surface.metallic);
+    let shininess = (studio.shininess * (1.15 - surface.roughness).max(0.15)).clamp(4.0, 256.0);
 
     let key_ao = 0.65 + 0.35 * ao;
     let ndotl_key = n.dot(ctx.key_dir).max(0.0) * studio.key * shadow * key_ao;
@@ -1153,11 +1382,18 @@ fn shade_mesh_studio(
     };
     let rim_tint = [0.95, 0.98, 1.04];
 
+    // Optional movable studio strip lights (exact no-op when all slots are `None`).
+    let strip_contrib = eval_strip_lights(cam, &studio.strip_lights, n, v, surface.roughness, ao);
+
     let mut out = [0.0f64; 4];
     for c in 0..3 {
         let diff = albedo[c] * diff_weight * (ndotl_key * key_tint[c] + ndotl_fill * fill_tint[c] + hemi_rgb[c]);
-        let spec_tint = (1.0 - tri.metallic) * key_tint[c] + tri.metallic * albedo[c];
-        let col = diff + spec * spec_tint + rim * rim_tint[c] + tri.emissive[c];
+        let spec_tint = (1.0 - surface.metallic) * key_tint[c] + surface.metallic * albedo[c];
+        let mut col = diff + spec * spec_tint + rim * rim_tint[c] + tri.emissive[c];
+        if let Some((s_diff, s_spec)) = strip_contrib {
+            let strip_spec_tint = (1.0 - surface.metallic) + surface.metallic * albedo[c];
+            col += albedo[c] * diff_weight * s_diff[c] + s_spec[c] * strip_spec_tint;
+        }
         out[c] = col.clamp(0.0, 1.0);
     }
     out[3] = 1.0;

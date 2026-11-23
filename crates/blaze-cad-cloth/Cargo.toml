@@ -1,0 +1,42 @@
+[package]
+name = "blaze-cad-cloth"
+description = "SOTA parametric garment CAD, 2D pattern drafting, deterministic XPBD/isometric-bending shell physics, unified body + Blaze-CAD solid collision, Blender-free tailoring details, smooth skinning, verification checks, studio previews, and skinned glTF 2.0 export; no_std core, zero third-party deps"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+default = []
+std = []
+
+[dependencies]
+blaze-cad-field.workspace = true
+blaze-cad-mesh.workspace = true
+blaze-cad-out.workspace = true
+blaze-cad-picture.workspace = true
+blaze-data.workspace = true
+blaze-deflate.workspace = true
+blaze-int.workspace = true
+blaze-json.workspace = true
+blaze-math.workspace = true
+blaze-own.workspace = true
+blaze-text.workspace = true
+blaze-units.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["testing"] }
+
+[[example]]
+name = "tailor_astra"
+path = "examples/tailor_astra.rs"
+
+[lints]
+workspace = true

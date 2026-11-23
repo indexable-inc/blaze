@@ -73,6 +73,9 @@ enum MeshBroken {
     FarVertex { vertex: usize, value: f64, bound: f64 },
     TooDense { what: &'static str, got: u64, bound: u64 },
     GridWrong { at: D3, got: f64, want: f64, bound: f64 },
+    UvChartsOverlap { chart_a: usize, chart_b: usize, gap: f64, want: f64 },
+    UvTangentWrong { vertex: usize, why: String },
+    UvWrong { why: String },
 }
 
 impl fmt::Display for MeshBroken {
@@ -124,6 +127,14 @@ blaze_sim::plants! {
     impl QuantPlant breaks MeshBroken {
         None,
         TowardZero => MeshBroken::QuantOutOfBound { .. },
+    }
+}
+
+blaze_sim::plants! {
+    impl UvPlant breaks MeshBroken {
+        None,
+        OverlapCharts => MeshBroken::UvChartsOverlap { .. },
+        SkipTangentOrtho => MeshBroken::UvTangentWrong { .. },
     }
 }
 
@@ -1924,4 +1935,471 @@ fn feature_zone_refines_locally_updates_cache_keys_and_protects_decimation() {
         right_tris > left_tris * 2,
         "pinned +X zone ({right_tris} tris) must retain >2x geometry of unprotected -X end ({left_tris} tris)"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// UV unwrapping, tangent frames, multi-material shell simplification, and authored feature helpers.
+
+fn find_root(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        let up = parent[parent[x]];
+        parent[x] = up;
+        x = up;
+    }
+    x
+}
+
+fn check_uv_and_tangents(mapped: &UvMapped<'_>, gutter_px: u32, atlas_size: u32) -> Result<(), Broken<MeshBroken>> {
+    let view = mapped.mesh.view();
+    let Some(uvs) = view.uvs() else {
+        return Err(Broken::Oracle(MeshBroken::UvWrong { why: String::from("missing uvs") }));
+    };
+    let Some(tangents) = view.tangents() else {
+        return Err(Broken::Oracle(MeshBroken::UvTangentWrong { vertex: 0, why: String::from("missing tangents") }));
+    };
+    if mapped.chart_count == 0
+        || !(mapped.texels_per_metre > 0.0)
+        || !mapped.texels_per_metre.is_finite()
+        || !(mapped.atlas_utilization > 0.0)
+        || !mapped.atlas_utilization.is_finite()
+    {
+        return Err(Broken::Oracle(MeshBroken::UvWrong {
+            why: format!(
+                "invalid uv stats: charts={}, tpm={}, util={}",
+                mapped.chart_count, mapped.texels_per_metre, mapped.atlas_utilization
+            ),
+        }));
+    }
+
+    for (v, &uv) in uvs.iter().enumerate() {
+        if !uv[0].is_finite() || !uv[1].is_finite() || uv[0] < 0.0 || uv[0] > 1.0 || uv[1] < 0.0 || uv[1] > 1.0 {
+            return Err(Broken::Oracle(MeshBroken::UvWrong {
+                why: format!("vertex {v} uv out of [0, 1]^2: {uv:?}"),
+            }));
+        }
+    }
+
+    // Charts are vertex-disjoint in the output mesh, so triangle connected components over output
+    // vertex indices recover the exact charts.
+    let tris = view.triangles();
+    let n_verts = view.positions().len();
+    let mut parent: StdVec<usize> = (0..tris.len()).collect();
+    let mut first_tri = vec![usize::MAX; n_verts];
+    for (t, tri) in tris.iter().enumerate() {
+        for &v in tri {
+            let vi = v as usize;
+            if first_tri[vi] == usize::MAX {
+                first_tri[vi] = t;
+            } else {
+                let ra = find_root(&mut parent, first_tri[vi]);
+                let rb = find_root(&mut parent, t);
+                if ra < rb {
+                    parent[rb] = ra;
+                } else if rb < ra {
+                    parent[ra] = rb;
+                }
+            }
+        }
+    }
+    let mut chart_boxes: BTreeMap<usize, [f64; 4]> = BTreeMap::new();
+    for (t, tri) in tris.iter().enumerate() {
+        let root = find_root(&mut parent, t);
+        let entry = chart_boxes.entry(root).or_insert([f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY]);
+        for &v in tri {
+            let uv = uvs[v as usize];
+            let u = f64::from(uv[0]);
+            let vc = f64::from(uv[1]);
+            entry[0] = entry[0].min(u);
+            entry[1] = entry[1].max(u);
+            entry[2] = entry[2].min(vc);
+            entry[3] = entry[3].max(vc);
+        }
+    }
+    if chart_boxes.len() != mapped.chart_count as usize {
+        return Err(Broken::Oracle(MeshBroken::UvWrong {
+            why: format!("recovered {} chart components, expected {}", chart_boxes.len(), mapped.chart_count),
+        }));
+    }
+    let boxes: StdVec<[f64; 4]> = chart_boxes.values().copied().collect();
+    let want_gap = f64::from(gutter_px) / f64::from(atlas_size) - 1e-5;
+    for i in 0..boxes.len() {
+        for j in (i + 1)..boxes.len() {
+            let a = boxes[i];
+            let b = boxes[j];
+            let sep_u = (b[0] - a[1]).max(a[0] - b[1]);
+            let sep_v = (b[2] - a[3]).max(a[2] - b[3]);
+            let gap = sep_u.max(sep_v);
+            if gap < want_gap {
+                return Err(Broken::Oracle(MeshBroken::UvChartsOverlap { chart_a: i, chart_b: j, gap, want: want_gap }));
+            }
+        }
+    }
+
+    // Verify orthonormal MikkTSpace tangent frame and handedness at every vertex.
+    let mut expected_tan2 = vec![[0.0f64; 3]; n_verts];
+    let positions = view.positions();
+    for tri in tris {
+        let i0 = tri[0] as usize;
+        let i1 = tri[1] as usize;
+        let i2 = tri[2] as usize;
+        let p0 = wide(positions[i0]);
+        let p1 = wide(positions[i1]);
+        let p2 = wide(positions[i2]);
+        let dp1 = sub(p1, p0);
+        let dp2 = sub(p2, p0);
+        let area = 0.5 * length(crate::geom::cross(dp1, dp2));
+        if !(area > 0.0) {
+            continue;
+        }
+        let du1 = f64::from(uvs[i1][0]) - f64::from(uvs[i0][0]);
+        let dv1 = f64::from(uvs[i1][1]) - f64::from(uvs[i0][1]);
+        let du2 = f64::from(uvs[i2][0]) - f64::from(uvs[i0][0]);
+        let dv2 = f64::from(uvs[i2][1]) - f64::from(uvs[i0][1]);
+        let det = du1 * dv2 - du2 * dv1;
+        if det.abs() > 1e-16 {
+            let b_dir = scale(sub(scale(dp2, du1), scale(dp1, du2)), area / det);
+            for idx in [i0, i1, i2] {
+                expected_tan2[idx] = add(expected_tan2[idx], b_dir);
+            }
+        }
+    }
+
+    let normals = view.normals();
+    for v in 0..n_verts {
+        let t = tangents[v];
+        if !t.iter().all(|x| x.is_finite()) {
+            return Err(Broken::Oracle(MeshBroken::UvTangentWrong {
+                vertex: v,
+                why: format!("non-finite tangent {t:?}"),
+            }));
+        }
+        let t3 = [f64::from(t[0]), f64::from(t[1]), f64::from(t[2])];
+        let t_len = length(t3);
+        if (t_len - 1.0).abs() > 1e-4 {
+            return Err(Broken::Oracle(MeshBroken::UvTangentWrong {
+                vertex: v,
+                why: format!("tangent not unit length: |T| = {t_len}"),
+            }));
+        }
+        if t[3] != 1.0 && t[3] != -1.0 {
+            return Err(Broken::Oracle(MeshBroken::UvTangentWrong {
+                vertex: v,
+                why: format!("tangent handedness w must be +-1, got {}", t[3]),
+            }));
+        }
+        if let Some(n) = unit(wide(normals[v])) {
+            let ndott = dot(n, t3).abs();
+            if ndott > 1e-4 {
+                return Err(Broken::Oracle(MeshBroken::UvTangentWrong {
+                    vertex: v,
+                    why: format!("tangent not orthogonal to normal: |T.N| = {ndott}"),
+                }));
+            }
+            let b_len = length(expected_tan2[v]);
+            if b_len > 1e-10 {
+                let signed = dot(crate::geom::cross(n, t3), expected_tan2[v]);
+                if signed.abs() > 1e-6 * b_len && signed * f64::from(t[3]) <= 0.0 {
+                    return Err(Broken::Oracle(MeshBroken::UvTangentWrong {
+                        vertex: v,
+                        why: format!("wrong tangent handedness: signed={signed}, w={}", t[3]),
+                    }));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn uv_case(tape: &Tape, plant: impl Planted<UvPlant> + Copy) -> Result<(), Broken<MeshBroken>> {
+    let (mesh, _) = if tape.coin("uv shape: cube vs icosphere") { cube(tape)? } else { icosphere(tape)? };
+    let gutter_px = 4u32;
+    let atlas_size = 1024u32;
+    let mapped = unwrap_uvs_planted(
+        &mesh.view()?,
+        UvOpts { alloc: heap(), scratch: heap(), gutter_px, atlas_size, .. },
+        plant,
+    )
+    .map_err(harness)?;
+    check_uv_and_tangents(&mapped, gutter_px, atlas_size)
+}
+
+#[test]
+fn uv_unwrap_and_tangents_are_valid_non_overlapping_and_deterministic() {
+    use blaze_cad_field::{CompileOpts, CylinderOpts, Graph, GraphOpts, SphereOpts, compile};
+    use blaze_units::Length;
+
+    // 1) Subdivided box with marked creases.
+    let mut box_soup_buf = SoupBuf::default();
+    box_soup(&mut box_soup_buf, &BoxSpec { lo: [-0.5; 3], hi: [0.5; 3], n: 4, part: 0, split_top: false });
+    let mut box_mesh = box_soup_buf.weld(Twins::Keep).expect("weld box");
+    mark_box_edges(&mut box_mesh, [-0.5; 3], [0.5; 3]);
+
+    // 2) Curved contoured cylinder.
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let cyl = g
+        .cylinder(CylinderOpts { radius: Length::mm(30.0), height: Length::mm(80.0), .. })
+        .expect("cylinder");
+    let cyl_tape = compile(&g, cyl.id(), CompileOpts { alloc: heap(), .. }).expect("compile cyl");
+    let cyl_meshed = mesh(&cyl_tape, MeshOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(1.2), .. }).expect("mesh cyl");
+
+    // 3) Curved contoured sphere.
+    let sph = g.sphere(SphereOpts { radius: Length::mm(40.0), .. }).expect("sphere");
+    let sph_tape = compile(&g, sph.id(), CompileOpts { alloc: heap(), .. }).expect("compile sph");
+    let sph_meshed = mesh(&sph_tape, MeshOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(1.2), .. }).expect("mesh sph");
+
+    // 4) Multi-material box with per-vertex colours.
+    let mut mm_soup = SoupBuf::default();
+    box_soup(&mut mm_soup, &BoxSpec { lo: [-1.0; 3], hi: [1.0; 3], n: 4, part: 0, split_top: true });
+    let mm_mesh = mm_soup.weld(Twins::Keep).expect("weld multi-material box");
+    let mm_colours: StdVec<[u8; 4]> = (0..mm_mesh.positions.len())
+        .map(|i| [(i % 251) as u8, ((i * 7) % 251) as u8, ((i * 13) % 251) as u8, 255])
+        .collect();
+    let mm_view = MeshView::new(Columns {
+        positions: &mm_mesh.positions,
+        normals: &mm_mesh.normals,
+        tangents: &[],
+        uvs: &[],
+        colours: &mm_colours,
+        triangles: &mm_mesh.triangles,
+        parts: &mm_mesh.parts,
+        roles: &mm_mesh.roles,
+        creases: &mm_mesh.creases,
+    })
+    .expect("mm_view");
+
+    let box_v = box_mesh.view().expect("box_v");
+    let cyl_v = cyl_meshed.mesh.view();
+    let sph_v = sph_meshed.mesh.view();
+    let cases: [(&str, MeshView<'_>, bool); 4] = [
+        ("box", box_v, false),
+        ("cylinder", cyl_v, false),
+        ("sphere", sph_v, false),
+        ("multi_material_coloured", mm_view, true),
+    ];
+
+    for (name, view, has_colours) in cases {
+        let m1 = unwrap_uvs(&view, UvOpts { alloc: heap(), scratch: heap(), .. }).expect(name);
+        let m2 = unwrap_uvs(&view, UvOpts { alloc: heap(), scratch: heap(), .. }).expect(name);
+
+        // Non-overlap, UV bounds, and orthonormal tangent frame invariants.
+        check_uv_and_tangents(&m1, 4, 1024).unwrap_or_else(|e| panic!("{name} uv oracle failed: {e:?}"));
+
+        // Exact bit-for-bit determinism across two independent runs.
+        assert_eq!(MeshDigest::of(&m1.mesh.view()), MeshDigest::of(&m2.mesh.view()), "{name} digest must be bit-identical");
+        assert_eq!(m1.texels_per_metre.to_bits(), m2.texels_per_metre.to_bits(), "{name} scale must be bit-identical");
+        assert_eq!(m1.chart_count, m2.chart_count, "{name} chart count must be identical");
+        assert_eq!(m1.atlas_utilization.to_bits(), m2.atlas_utilization.to_bits(), "{name} utilization must be identical");
+
+        // Standalone compute_tangents agrees bit-for-bit with unwrap_uvs's tangents.
+        let standalone = compute_tangents(&m1.mesh.view(), heap(), heap()).expect("compute_tangents");
+        let embedded = m1.mesh.view().tangents().expect("embedded tangents");
+        assert_eq!(standalone.len(), embedded.len());
+        for (i, (a, b)) in standalone.iter().zip(embedded.iter()).enumerate() {
+            for k in 0..4 {
+                assert_eq!(a[k].to_bits(), b[k].to_bits(), "{name} tangent[{i}][{k}] mismatch");
+            }
+        }
+
+        // Topology remains Verified and optional vertex colours survive seam splitting.
+        verify(m1.mesh.view()).unwrap_or_else(|e| panic!("{name} lost Verified after unwrap_uvs: {e:?}"));
+        if has_colours {
+            assert_eq!(m1.mesh.view().colours().map(<[_]>::len), Some(m1.mesh.view().positions().len()));
+        }
+
+        // UVs, tangents, colours, roles, parts, and creases survive vertex-cache + vertex-fetch opt.
+        let before_unordered = MeshDigest::of_unordered(&m1.mesh.view(), heap()).expect("unordered before");
+        let cached = optimize_vertex_cache(&m1.mesh.view(), CacheOpts { cache_size: 32, alloc: heap(), scratch: heap() })
+            .expect("optimize_vertex_cache");
+        let fetched = optimize_vertex_fetch(&cached.view(), FetchOpts { alloc: heap(), scratch: heap() })
+            .expect("optimize_vertex_fetch");
+        assert!(fetched.view().uvs().is_some(), "{name} lost uvs in optimize_vertex_fetch");
+        assert!(fetched.view().tangents().is_some(), "{name} lost tangents in optimize_vertex_fetch");
+        if has_colours {
+            assert!(fetched.view().colours().is_some(), "{name} lost colours in optimize_vertex_fetch");
+        }
+        let after_unordered = MeshDigest::of_unordered(&fetched.view(), heap()).expect("unordered after");
+        assert_eq!(before_unordered, after_unordered, "{name} attributes/roles drifted across cache+fetch opt");
+    }
+
+    // Error paths: empty mesh and bad atlas size.
+    let empty_v = MeshView::new(Columns {
+        positions: &[],
+        normals: &[],
+        tangents: &[],
+        uvs: &[],
+        colours: &[],
+        triangles: &[],
+        parts: &[],
+        roles: &[],
+        creases: &[],
+    })
+    .expect("empty view");
+    assert_eq!(unwrap_uvs(&empty_v, UvOpts { alloc: heap(), scratch: heap(), .. }).unwrap_err(), UvError::EmptyMesh);
+    assert_eq!(
+        unwrap_uvs(&box_v, UvOpts { alloc: heap(), scratch: heap(), atlas_size: 0, .. }).unwrap_err(),
+        UvError::BadAtlasSize { size: 0 }
+    );
+}
+
+#[test]
+fn uv_plants_are_caught() {
+    controls(Config::cases(40), |tape, plant: UvPlant| uv_case(tape, plant));
+}
+
+#[test]
+fn multi_material_shell_roles_survive_simplification_and_cache_opt() {
+    use blaze_math::{Aabb3, Vec3};
+    use blaze_units::Length;
+
+    // Build a single continuous closed 2m x 2m x 2m box shell (`n = 8` grid per face) with 3
+    // distinct material roles on the `+z` face:
+    // - Role 1: x in [-1.0, -0.25] (3 cells wide -> area 1.5 m^2)
+    // - Role 2: x in [-0.25, 0.25] (2 cells wide -> area 1.0 m^2)
+    // - Role 0: x in [0.25, 1.0] on +z (1.5 m^2) + all other 5 faces (20.0 m^2) = 21.5 m^2
+    let mut soup = SoupBuf::default();
+    let n = 8u32;
+    let lo = [-1.0f64; 3];
+    let hi = [1.0f64; 3];
+    let coord = |axis: usize, i: u32| -> f64 {
+        if i == 0 {
+            lo[axis]
+        } else if i == n {
+            hi[axis]
+        } else {
+            lo[axis] + (hi[axis] - lo[axis]) * f64::from(i) / f64::from(n)
+        }
+    };
+    for a in 0..3 {
+        for side in 0..2 {
+            let (u, v) = ((a + 1) % 3, (a + 2) % 3);
+            let plane = if side == 0 { lo[a] } else { hi[a] };
+            let point = |i: u32, j: u32| -> P3 {
+                let mut p = [0.0f64; 3];
+                p[a] = plane;
+                p[u] = coord(u, i);
+                p[v] = coord(v, j);
+                f32s(p)
+            };
+            for i in 0..n {
+                for j in 0..n {
+                    let (p00, p10, p01, p11) = (point(i, j), point(i + 1, j), point(i, j + 1), point(i + 1, j + 1));
+                    let tris = if (i + j) % 2 == 0 { [[p00, p10, p11], [p00, p11, p01]] } else { [[p00, p10, p01], [p10, p11, p01]] };
+                    let role = if a == 2 && side == 1 {
+                        if i < 3 {
+                            1
+                        } else if i < 5 {
+                            2
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    for t in tris {
+                        let t = if side == 1 { t } else { [t[0], t[2], t[1]] };
+                        soup.push(t, 0, role);
+                    }
+                }
+            }
+        }
+    }
+    let shell = soup.weld(Twins::Keep).expect("weld shell");
+    let shell_view = shell.view().expect("shell_view");
+    let verified = verify(shell_view).expect("shell verified");
+    assert_eq!(verified.proof().components(), 1, "must be one continuous shell");
+
+    let role_areas = |v: &MeshView<'_>| -> [f64; 3] {
+        let mut areas = [0.0f64; 3];
+        for t in 0..v.triangle_count() {
+            let c = v.corners(TriId(t));
+            let a = 0.5 * length(tri_normal(wide(c[0]), wide(c[1]), wide(c[2])));
+            let r = v.roles()[t as usize].0 as usize;
+            areas[r] += a;
+        }
+        areas
+    };
+
+    // 1) Decimate the continuous shell aggressively: flat interiors collapse while role borders stay sharp!
+    let dec = decimate(
+        Source::Verified(verified),
+        DecimateOpts {
+            target: Target::Error(Length::mm(1.0)),
+            cos_crease: COS_32_DEGREES,
+            limits: MeshLimits::SHIPPED,
+            alloc: heap(),
+            scratch: heap(),
+            ..
+        },
+    )
+    .expect("decimate multi-material shell");
+    assert!(dec.verified().is_some(), "decimated multi-material shell must remain Verified");
+    assert!(
+        dec.mesh.view().triangle_count() < shell_view.triangle_count() / 4,
+        "flat shell should simplify substantially: {} -> {}",
+        shell_view.triangle_count(),
+        dec.mesh.view().triangle_count()
+    );
+    let dec_areas = role_areas(&dec.mesh.view());
+    assert!((dec_areas[0] - 21.5).abs() < 1e-4, "role 0 area drifted: {}", dec_areas[0]);
+    assert!((dec_areas[1] - 1.5).abs() < 1e-4, "role 1 area drifted: {}", dec_areas[1]);
+    assert!((dec_areas[2] - 1.0).abs() < 1e-4, "role 2 area drifted: {}", dec_areas[2]);
+
+    // Verify sharp straight role boundaries on the +z face: every role-1 triangle stays in x <= -0.25,
+    // every role-2 triangle stays in [-0.25, 0.25].
+    let dv = dec.mesh.view();
+    for t in 0..dv.triangle_count() {
+        let role = dv.roles()[t as usize];
+        let c = dv.corners(TriId(t));
+        for p in c {
+            if role == MaterialRole(1) {
+                assert!(p[0] <= -0.25 + 1e-5, "role 1 bled past x = -0.25: {p:?}");
+            } else if role == MaterialRole(2) {
+                assert!(p[0] >= -0.25 - 1e-5 && p[0] <= 0.25 + 1e-5, "role 2 bled outside [-0.25, 0.25]: {p:?}");
+            }
+        }
+    }
+
+    // 2) Pass through shade -> unwrap_uvs -> optimize_vertex_cache -> optimize_vertex_fetch.
+    let shaded = shade(&dv, ShadeOpts { cos_crease: COS_32_DEGREES, alloc: heap(), scratch: heap() }).expect("shade");
+    let unwrapped = unwrap_uvs(&shaded.view(), UvOpts { alloc: heap(), scratch: heap(), .. }).expect("unwrap_uvs");
+    check_uv_and_tangents(&unwrapped, 4, 1024).expect("uv oracle on multi-material shell");
+    assert!(unwrapped.chart_count >= 8, "6 faces with 3 bands on +z must produce >= 8 charts, got {}", unwrapped.chart_count);
+
+    let cached = optimize_vertex_cache(&unwrapped.mesh.view(), CacheOpts { cache_size: 24, alloc: heap(), scratch: heap() })
+        .expect("optimize_vertex_cache");
+    let fetched = optimize_vertex_fetch(&cached.view(), FetchOpts { alloc: heap(), scratch: heap() })
+        .expect("optimize_vertex_fetch");
+
+    let final_areas = role_areas(&fetched.view());
+    assert!((final_areas[0] - 21.5).abs() < 1e-4, "final role 0 area drifted: {}", final_areas[0]);
+    assert!((final_areas[1] - 1.5).abs() < 1e-4, "final role 1 area drifted: {}", final_areas[1]);
+    assert!((final_areas[2] - 1.0).abs() < 1e-4, "final role 2 area drifted: {}", final_areas[2]);
+    assert_eq!(
+        MeshDigest::of_unordered(&unwrapped.mesh.view(), heap()).expect("digest before"),
+        MeshDigest::of_unordered(&fetched.view(), heap()).expect("digest after"),
+        "cache + fetch optimization must preserve roles, UVs, and tangents exactly"
+    );
+
+    // 3) Verify authored-feature physical sizing constructors on FeatureZone.
+    let region = FeatureRegion::Box(Aabb3::new(Vec3::new(-0.01, -0.01, -0.01), Vec3::new(0.01, 0.01, 0.01)));
+    let groove = FeatureZone::for_groove(region, Length::mm(6.0), Length::mm(2.0), FeatureProtect::Critical);
+    assert_eq!(groove.min_feature, Some(Length::mm(2.0)));
+    assert_eq!(groove.max_error, Some(Length::mm(0.4)));
+    assert!((groove.min_cos_sq.expect("groove min_cos_sq") - 0.956_772_728_821_300_4).abs() < 1e-12);
+    assert_eq!(groove.protect, FeatureProtect::Critical);
+
+    let bevel = FeatureZone::for_bevel(region, Length::mm(4.0), FeatureProtect::Pinned);
+    assert_eq!(bevel.min_feature, Some(Length::mm(2.0)));
+    assert_eq!(bevel.max_error, Some(Length::mm(0.14)));
+    assert!((bevel.min_cos_sq.expect("bevel min_cos_sq") - 0.969_846_310_392_954_2).abs() < 1e-12);
+    assert_eq!(bevel.protect, FeatureProtect::Pinned);
+
+    let seam = FeatureZone::for_seam(region, Length::mm(5.0), Length::mm(2.0));
+    assert_eq!(seam.protect, FeatureProtect::Pinned);
+    assert_eq!(seam.min_feature, Some(Length::mm(2.0)));
+    assert_eq!(seam.max_error, Some(Length::mm(0.5)));
+
+    let stencil = FeatureZone::for_stencil(region, Length::mm(4.0));
+    assert_eq!(stencil.min_feature, Some(Length::mm(2.0)));
+    assert_eq!(stencil.max_error, Some(Length::mm(0.5)));
 }

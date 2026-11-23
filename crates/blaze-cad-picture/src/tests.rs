@@ -609,6 +609,7 @@ blaze_sim::plants! {
         IgnoreTransform => PictureBroken::Wrong { .. },
         FlatOnly => PictureBroken::Wrong { .. },
         IgnoreHighlights => PictureBroken::Wrong { .. },
+        IgnoreTextures => PictureBroken::Wrong { .. },
     }
 }
 
@@ -734,6 +735,78 @@ fn mesh_preview_case(tape: &Tape, plant: impl Planted<MeshPicturePlant> + Copy) 
             why: String::from("missed-feature highlight left rendered pixels unchanged"),
         }));
     }
+
+    // Baked PBR base-colour texture on a UV-mapped quad must visibly alter rendered pixels
+    // (catches `MeshPicturePlant::IgnoreTextures`).
+    let quad_pos: [[f32; 3]; 4] = [[-0.05, 0.05, 0.0], [-0.05, -0.05, 0.0], [0.05, -0.05, 0.0], [0.05, 0.05, 0.0]];
+    let quad_nrm: [[f32; 3]; 4] = [[0.0, 0.0, 1.0]; 4];
+    let quad_uvs: [[f32; 2]; 4] = [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]];
+    let quad_tris: [[u32; 3]; 2] = [[0, 1, 2], [0, 2, 3]];
+    let quad_parts = [blaze_cad_mesh::PartId(0); 2];
+    let quad_roles = [blaze_cad_mesh::MaterialRole(0); 2];
+    let quad_view = blaze_cad_mesh::MeshView::new(blaze_cad_mesh::Columns {
+        positions: &quad_pos,
+        normals: &quad_nrm,
+        tangents: &[],
+        uvs: &quad_uvs,
+        colours: &[],
+        triangles: &quad_tris,
+        parts: &quad_parts,
+        roles: &quad_roles,
+        creases: &[],
+    })
+    .map_err(harness)?;
+    let quad_part = [MeshScenePart { mesh: quad_view, parent: None, transform: Transform::IDENTITY, tint_override: None }];
+    const WHITE_MAT: [Material<'static>; 1] = [Material {
+        name: "white",
+        base_colour: [1.0, 1.0, 1.0, 1.0],
+        metallic: 0.0,
+        roughness: 0.6,
+        emissive: [0.0; 3],
+        emissive_strength: None,
+        clearcoat: None,
+        double_sided: false,
+    }];
+    let tex_rgba: [u8; 16] = [
+        240, 20, 20, 255, 20, 40, 240, 255,
+        240, 20, 20, 255, 20, 40, 240, 255,
+    ];
+    let maps = [MaterialMaps {
+        base_colour: Some(TextureMap { width: 2, height: 2, rgba: &tex_rgba }),
+        metallic_roughness: None,
+        normal: None,
+        normal_scale: 1.0,
+    }];
+    let qv = View {
+        eye: [Length::ZERO, Length::ZERO, Length::mm(180.0)],
+        target: [Length::ZERO; 3],
+        up: [0.0, 1.0, 0.0],
+        projection: Projection::Orthographic { height: Length::mm(80.0) },
+        width: 16,
+        height: 16,
+        ..
+    };
+    let untextured = render_mesh_scene_planted(
+        &quad_part,
+        &WHITE_MAT,
+        qv,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), shading: Shading::Classic, .. },
+        plant,
+    )
+    .map_err(harness)?;
+    let textured = render_mesh_scene_planted(
+        &quad_part,
+        &WHITE_MAT,
+        qv,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), shading: Shading::Classic, material_maps: &maps, .. },
+        plant,
+    )
+    .map_err(harness)?;
+    if textured.pixels[..] == untextured.pixels[..] {
+        return Err(Broken::Oracle(PictureBroken::Wrong {
+            why: String::from("material_maps left rendered pixels unchanged"),
+        }));
+    }
     Ok(())
 }
 
@@ -821,4 +894,596 @@ fn mesh_preview_matches_sdf_silhouette_and_draws_wireframe() {
     )
     .expect("solid 1x");
     assert_ne!(wire_pic.pixels[..], solid_1x.pixels[..], "wireframe overlay must draw visible triangle edges");
+}
+
+/// Zebra reflection stripes produce smooth alternating bands on a curved sphere, shift with phase,
+/// match deterministically on both SDF and mesh tracers, and exhibit a sharp step kink across a
+/// 90° creased box edge.
+#[test]
+fn zebra_mode_shows_smooth_stripes_on_sphere_and_kink_on_creased_box() {
+    use blaze_cad_mesh::{MeshOpts, ShadeOpts, mesh, shade};
+    use blaze_cad_out::Material;
+
+    let mut gs = Graph::new(GraphOpts { alloc: heap(), .. });
+    let ball = gs.sphere(SphereOpts { radius: Length::mm(45.0), .. }).expect("sphere");
+    let sphere_tape = compile(&gs, ball.id(), CompileOpts { alloc: heap(), .. }).expect("sphere tape");
+
+    let mut gb = Graph::new(GraphOpts { alloc: heap(), .. });
+    let cube = gb.cuboid(BoxOpts { size: [Length::mm(80.0); 3], .. }).expect("box");
+    let box_tape = compile(&gb, cube.id(), CompileOpts { alloc: heap(), .. }).expect("box tape");
+
+    // Oblique view looking directly across the sharp 90° vertical edge between the -Y and +X faces.
+    let v = View {
+        eye: [Length::mm(160.0), Length::mm(-160.0), Length::mm(40.0)],
+        target: [Length::ZERO; 3],
+        projection: Projection::Orthographic { height: Length::mm(120.0) },
+        width: 48,
+        height: 48,
+        ..
+    };
+
+    let zebra = ZebraOpts { stripes: 12.0, axis: [1.0, 0.0, 0.0], phase: 0.0, .. };
+    let z_sphere_1 = render(
+        &sphere_tape,
+        v,
+        PictureOpts { alloc: heap(), scratch: heap(), mode: RenderMode::Zebra(zebra), .. },
+    )
+    .expect("zebra sphere 1");
+    let z_sphere_2 = render(
+        &sphere_tape,
+        v,
+        PictureOpts { alloc: heap(), scratch: heap(), mode: RenderMode::Zebra(zebra), .. },
+    )
+    .expect("zebra sphere 2");
+    assert_eq!(z_sphere_1.pixels[..], z_sphere_2.pixels[..], "SDF zebra render must be bit-deterministic");
+
+    // Across the sphere's centre row, reflection stripes must alternate between dark and light bands.
+    let row_y = v.height / 2;
+    let mut transitions = 0u32;
+    let mut prev_bright: Option<bool> = None;
+    let mut min_luma = f64::INFINITY;
+    let mut max_luma = 0.0f64;
+    for x in 0..v.width {
+        let idx = (row_y * v.width + x) as usize;
+        if !z_sphere_1.depth[idx].is_finite() {
+            continue;
+        }
+        let l = luma(&z_sphere_1.pixels[idx * 4..idx * 4 + 4]);
+        min_luma = min_luma.min(l);
+        max_luma = max_luma.max(l);
+        let bright = l > 128.0;
+        if let Some(pb) = prev_bright
+            && pb != bright
+        {
+            transitions += 1;
+        }
+        prev_bright = Some(bright);
+    }
+    assert!(max_luma - min_luma > 180.0, "sphere zebra stripes should span dark to light: min={min_luma}, max={max_luma}");
+    assert!(transitions >= 6, "sphere centre scanline should show multiple zebra bands, got {transitions}");
+
+    // Shifting phase or switching to world space must visibly move the reflected stripes.
+    let z_shifted = render(
+        &sphere_tape,
+        v,
+        PictureOpts {
+            alloc: heap(),
+            scratch: heap(),
+            mode: RenderMode::Zebra(ZebraOpts { stripes: 12.0, axis: [1.0, 0.0, 0.0], phase: 0.35, .. }),
+            ..
+        },
+    )
+    .expect("zebra shifted");
+    assert_ne!(z_shifted.pixels[..], z_sphere_1.pixels[..], "zebra phase shift must roll stripes");
+
+    let z_world = render(
+        &sphere_tape,
+        v,
+        PictureOpts {
+            alloc: heap(),
+            scratch: heap(),
+            mode: RenderMode::Zebra(ZebraOpts { stripes: 12.0, axis: [0.0, 0.0, 1.0], world_space: true, .. }),
+            ..
+        },
+    )
+    .expect("zebra world");
+    assert_ne!(z_world.pixels[..], z_sphere_1.pixels[..], "world-space zebra axis must differ from camera-space");
+
+    // Creased sharp box: the -Y face (left of centre) and +X face (right of centre) have opposite
+    // reflection projections along camera-right, creating a sharp 1-pixel discontinuity at the crease.
+    let z_box = render(
+        &box_tape,
+        v,
+        PictureOpts { alloc: heap(), scratch: heap(), mode: RenderMode::Zebra(zebra), .. },
+    )
+    .expect("zebra box");
+    let mut max_crease_jump = 0.0f64;
+    let mut prev_hit_luma: Option<f64> = None;
+    for x in 0..v.width {
+        let idx = (row_y * v.width + x) as usize;
+        if z_box.depth[idx].is_finite() {
+            let l = luma(&z_box.pixels[idx * 4..idx * 4 + 4]);
+            if let Some(pl) = prev_hit_luma {
+                max_crease_jump = max_crease_jump.max((l - pl).abs());
+            }
+            prev_hit_luma = Some(l);
+        } else {
+            prev_hit_luma = None;
+        }
+    }
+    assert!(
+        max_crease_jump > 180.0,
+        "sharp 90° box crease must create a discontinuous zebra stripe kink/jump, got {max_crease_jump}"
+    );
+
+    // Exported mesh tracer also supports deterministic zebra reflection mode.
+    let meshed = mesh(&sphere_tape, MeshOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(1.5), .. }).expect("mesh");
+    let smooth = shade(&meshed.mesh.view(), ShadeOpts { cos_crease: 0.0, alloc: heap(), scratch: heap() }).expect("shade");
+    const MAT: [Material<'static>; 1] = [Material {
+        name: "body",
+        base_colour: [0.6, 0.6, 0.6, 1.0],
+        metallic: 0.5,
+        roughness: 0.3,
+        emissive: [0.0; 3],
+        emissive_strength: None,
+        clearcoat: None,
+        double_sided: false,
+    }];
+    let mesh_z1 = render_mesh(
+        smooth.view(),
+        &MAT,
+        v,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), mode: RenderMode::Zebra(zebra), .. },
+    )
+    .expect("mesh zebra 1");
+    let mesh_z2 = render_mesh(
+        smooth.view(),
+        &MAT,
+        v,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), mode: RenderMode::Zebra(zebra), .. },
+    )
+    .expect("mesh zebra 2");
+    assert_eq!(mesh_z1.pixels[..], mesh_z2.pixels[..], "mesh zebra render must be bit-deterministic");
+
+    let mut mesh_min = f64::INFINITY;
+    let mut mesh_max = 0.0f64;
+    for i in 0..(v.width * v.height) as usize {
+        if mesh_z1.depth[i].is_finite() {
+            let l = luma(&mesh_z1.pixels[i * 4..i * 4 + 4]);
+            mesh_min = mesh_min.min(l);
+            mesh_max = mesh_max.max(l);
+        }
+    }
+    assert!(mesh_max - mesh_min > 180.0, "mesh zebra must show high-contrast bands: min={mesh_min}, max={mesh_max}");
+}
+
+/// Movable studio strip lights add deterministic specular reflection ribbons on both SDF and mesh
+/// studio renders, move when repositioned, and leave default `StudioOpts::DEFAULT` bit-identical.
+#[test]
+fn strip_lights_add_grazing_reflection_ribbons_deterministically() {
+    use blaze_cad_mesh::{MeshOpts, ShadeOpts, mesh, shade};
+    use blaze_cad_out::Material;
+
+    assert_eq!(StudioOpts::DEFAULT.strip_lights, [None; 4]);
+
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let ball = g.sphere(SphereOpts { radius: Length::mm(42.0), .. }).expect("sphere");
+    let tape = compile(&g, ball.id(), CompileOpts { alloc: heap(), .. }).expect("tape");
+
+    let v = View {
+        eye: [Length::mm(180.0), Length::ZERO, Length::ZERO],
+        target: [Length::ZERO; 3],
+        projection: Projection::Perspective { fov: Angle::degrees(38.0) },
+        width: 48,
+        height: 48,
+        ..
+    };
+
+    // Baseline StudioOpts::DEFAULT (no strip lights).
+    let base_sdf = render(
+        &tape,
+        v,
+        PictureOpts {
+            alloc: heap(),
+            scratch: heap(),
+            colour: [80, 90, 105],
+            shading: Shading::Studio(StudioOpts::DEFAULT),
+            ..
+        },
+    )
+    .expect("base sdf");
+    let explicit_none = render(
+        &tape,
+        v,
+        PictureOpts {
+            alloc: heap(),
+            scratch: heap(),
+            colour: [80, 90, 105],
+            shading: Shading::Studio(StudioOpts { strip_lights: [None; 4], .. }),
+            ..
+        },
+    )
+    .expect("explicit none");
+    assert_eq!(base_sdf.pixels[..], explicit_none.pixels[..], "all-None strip lights must be bit-identical to default");
+
+    // Overhead horizontal strip light vs grazing side strip light on SDF.
+    let strip_horiz_opts = StudioOpts {
+        strip_lights: [Some(StripLight::OVERHEAD_HORIZONTAL), None, None, None],
+        ..
+    };
+    let strip_side_opts = StudioOpts {
+        strip_lights: [Some(StripLight::GRAZING_SIDE), None, None, None],
+        ..
+    };
+
+    let horiz_1 = render(
+        &tape,
+        v,
+        PictureOpts { alloc: heap(), scratch: heap(), colour: [80, 90, 105], shading: Shading::Studio(strip_horiz_opts), .. },
+    )
+    .expect("horiz 1");
+    let horiz_2 = render(
+        &tape,
+        v,
+        PictureOpts { alloc: heap(), scratch: heap(), colour: [80, 90, 105], shading: Shading::Studio(strip_horiz_opts), .. },
+    )
+    .expect("horiz 2");
+    assert_eq!(horiz_1.pixels[..], horiz_2.pixels[..], "strip light render must be bit-deterministic");
+
+    let side_sdf = render(
+        &tape,
+        v,
+        PictureOpts { alloc: heap(), scratch: heap(), colour: [80, 90, 105], shading: Shading::Studio(strip_side_opts), .. },
+    )
+    .expect("side sdf");
+    assert_ne!(horiz_1.pixels[..], side_sdf.pixels[..], "repositioning strip light must move the reflection ribbon");
+
+    let max_hit_delta = |a: &Picture<'_>, b: &Picture<'_>| -> f64 {
+        let mut best = 0.0f64;
+        for i in 0..(v.width * v.height) as usize {
+            if a.depth[i].is_finite() {
+                let d = luma(&b.pixels[i * 4..i * 4 + 4]) - luma(&a.pixels[i * 4..i * 4 + 4]);
+                best = best.max(d);
+            }
+        }
+        best
+    };
+    let sdf_boost = max_hit_delta(&base_sdf, &horiz_1);
+    assert!(sdf_boost > 35.0, "strip light should add bright specular ribbon on SDF sphere, got max delta={sdf_boost}");
+
+    // Same verification on exported mesh studio PBR path.
+    let meshed = mesh(&tape, MeshOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(1.5), .. }).expect("mesh");
+    let smooth = shade(&meshed.mesh.view(), ShadeOpts { cos_crease: 0.0, alloc: heap(), scratch: heap() }).expect("shade");
+    const MAT: [Material<'static>; 1] = [Material {
+        name: "brushed_metal",
+        base_colour: [0.22, 0.25, 0.30, 1.0],
+        metallic: 0.75,
+        roughness: 0.22,
+        emissive: [0.0; 3],
+        emissive_strength: None,
+        clearcoat: None,
+        double_sided: false,
+    }];
+    let base_mesh = render_mesh(
+        smooth.view(),
+        &MAT,
+        v,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), shading: Shading::Studio(StudioOpts::DEFAULT), .. },
+    )
+    .expect("base mesh");
+    let strip_mesh_1 = render_mesh(
+        smooth.view(),
+        &MAT,
+        v,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), shading: Shading::Studio(strip_side_opts), .. },
+    )
+    .expect("strip mesh 1");
+    let strip_mesh_2 = render_mesh(
+        smooth.view(),
+        &MAT,
+        v,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), shading: Shading::Studio(strip_side_opts), .. },
+    )
+    .expect("strip mesh 2");
+    assert_eq!(strip_mesh_1.pixels[..], strip_mesh_2.pixels[..], "mesh strip light render must be bit-deterministic");
+
+    let mesh_boost = max_hit_delta(&base_mesh, &strip_mesh_1);
+    assert!(mesh_boost > 30.0, "grazing strip light should create bright ribbon on metallic mesh, got max delta={mesh_boost}");
+}
+
+/// Exported mesh renderer samples baked base-colour, metallic-roughness, and tangent-space normal
+/// maps deterministically and catches `MeshPicturePlant::IgnoreTextures`.
+#[test]
+fn mesh_renderer_samples_baked_base_roughness_and_normal_maps_and_catches_plant() {
+    use blaze_cad_mesh::{Columns, MaterialRole, MeshView, PartId};
+    use blaze_cad_out::{Material, Transform};
+
+    // Front-facing 100×100 mm quad in the z = 0 plane with unit +Z normals, +X tangents (w = +1),
+    // and [0, 1]² UVs.
+    let positions: [[f32; 3]; 4] = [[-0.05, 0.05, 0.0], [-0.05, -0.05, 0.0], [0.05, -0.05, 0.0], [0.05, 0.05, 0.0]];
+    let normals: [[f32; 3]; 4] = [[0.0, 0.0, 1.0]; 4];
+    let tangents: [[f32; 4]; 4] = [[1.0, 0.0, 0.0, 1.0]; 4];
+    let uvs: [[f32; 2]; 4] = [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]];
+    let triangles: [[u32; 3]; 2] = [[0, 1, 2], [0, 2, 3]];
+    let parts_col = [PartId(0); 2];
+    let roles_col = [MaterialRole(0); 2];
+
+    let quad = MeshView::new(Columns {
+        positions: &positions,
+        normals: &normals,
+        tangents: &tangents,
+        uvs: &uvs,
+        colours: &[],
+        triangles: &triangles,
+        parts: &parts_col,
+        roles: &roles_col,
+        creases: &[],
+    })
+    .expect("quad view");
+    let scene_parts = [MeshScenePart { mesh: quad, parent: None, transform: Transform::IDENTITY, tint_override: None }];
+
+    const MAT: [Material<'static>; 1] = [Material {
+        name: "baked_pbr",
+        base_colour: [0.95, 0.95, 0.95, 1.0],
+        metallic: 1.0,
+        roughness: 1.0,
+        emissive: [0.0; 3],
+        emissive_strength: None,
+        clearcoat: None,
+        double_sided: false,
+    }];
+
+    // 4×4 base-colour map: left 2 columns vivid red, right 2 columns vivid blue.
+    let mut base_rgba = [0u8; 4 * 4 * 4];
+    // 4×4 metallic-roughness map: top 2 rows smooth metallic (G=25, B=230), bottom 2 rows rough dielectric (G=240, B=10).
+    let mut mr_rgba = [0u8; 4 * 4 * 4];
+    // 4×4 tangent-space normal map: left 2 columns tilted -X (R=35, G=128, B=220), right 2 columns tilted +X (R=220, G=128, B=220).
+    let mut normal_rgba = [0u8; 4 * 4 * 4];
+
+    for y in 0..4usize {
+        for x in 0..4usize {
+            let off = (y * 4 + x) * 4;
+            let bc = if x < 2 { [240, 28, 28, 255] } else { [28, 52, 240, 255] };
+            base_rgba[off..off + 4].copy_from_slice(&bc);
+
+            let mr = if y < 2 { [0, 25, 230, 255] } else { [0, 240, 10, 255] };
+            mr_rgba[off..off + 4].copy_from_slice(&mr);
+
+            let nm = if x < 2 { [35, 128, 220, 255] } else { [220, 128, 220, 255] };
+            normal_rgba[off..off + 4].copy_from_slice(&nm);
+        }
+    }
+
+    let v = View {
+        eye: [Length::ZERO, Length::ZERO, Length::mm(200.0)],
+        target: [Length::ZERO; 3],
+        up: [0.0, 1.0, 0.0],
+        projection: Projection::Orthographic { height: Length::mm(80.0) },
+        width: 32,
+        height: 32,
+        ..
+    };
+
+    // 1. Base-colour map sampling (left red, right blue).
+    let base_maps = [MaterialMaps {
+        base_colour: Some(TextureMap { width: 4, height: 4, rgba: &base_rgba }),
+        metallic_roughness: None,
+        normal: None,
+        normal_scale: 1.0,
+    }];
+    let pic_base = render_mesh_scene(
+        &scene_parts,
+        &MAT,
+        v,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), shading: Shading::Classic, material_maps: &base_maps, .. },
+    )
+    .expect("base map render");
+    let left_idx = (16 * 32 + 6) * 4;
+    let right_idx = (16 * 32 + 25) * 4;
+    assert!(
+        pic_base.pixels[left_idx] > pic_base.pixels[left_idx + 2] + 80,
+        "left half should sample red texels, got {:?}",
+        &pic_base.pixels[left_idx..left_idx + 4]
+    );
+    assert!(
+        pic_base.pixels[right_idx + 2] > pic_base.pixels[right_idx] + 80,
+        "right half should sample blue texels, got {:?}",
+        &pic_base.pixels[right_idx..right_idx + 4]
+    );
+
+    // 2. Tangent-space normal map sampling (visualized directly via RenderMode::Normals).
+    let normal_maps = [MaterialMaps {
+        base_colour: None,
+        metallic_roughness: None,
+        normal: Some(TextureMap { width: 4, height: 4, rgba: &normal_rgba }),
+        normal_scale: 1.0,
+    }];
+    let pic_norm = render_mesh_scene(
+        &scene_parts,
+        &MAT,
+        v,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), mode: RenderMode::Normals, material_maps: &normal_maps, .. },
+    )
+    .expect("normal map render");
+    let left_nx = pic_norm.pixels[left_idx];
+    let right_nx = pic_norm.pixels[right_idx];
+    assert!(
+        right_nx > left_nx + 80,
+        "tangent-space normal map should tilt left normal -X ({left_nx}) and right normal +X ({right_nx})"
+    );
+
+    // 3. Metallic-roughness map sampling (top smooth metallic vs bottom rough dielectric under studio + strip light).
+    let mr_maps = [MaterialMaps {
+        base_colour: None,
+        metallic_roughness: Some(TextureMap { width: 4, height: 4, rgba: &mr_rgba }),
+        normal: None,
+        normal_scale: 1.0,
+    }];
+    let mr_studio = StudioOpts {
+        ao_strength: 0.0,
+        shadow_strength: 0.0,
+        strip_lights: [
+            Some(StripLight {
+                direction: [0.0, 0.35, 0.94],
+                tangent: [1.0, 0.0, 0.0],
+                half_length: 0.12,
+                half_width: 0.05,
+                intensity: 1.8,
+                ..
+            }),
+            None,
+            None,
+            None,
+        ],
+        ..
+    };
+    let pic_mr = render_mesh_scene(
+        &scene_parts,
+        &MAT,
+        v,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), shading: Shading::Studio(mr_studio), material_maps: &mr_maps, .. },
+    )
+    .expect("metallic_roughness render");
+    let top_luma = luma(&pic_mr.pixels[(6 * 32 + 16) * 4..(6 * 32 + 16) * 4 + 4]);
+    let bot_luma = luma(&pic_mr.pixels[(25 * 32 + 16) * 4..(25 * 32 + 16) * 4 + 4]);
+    assert!(
+        (bot_luma - top_luma).abs() > 25.0,
+        "metallic-roughness map must produce distinct shading on top ({top_luma}) vs bottom ({bot_luma})"
+    );
+
+    // 4. Planted bug `MeshPicturePlant::IgnoreTextures` suppresses all baked maps and is caught.
+    let full_maps = [MaterialMaps {
+        base_colour: Some(TextureMap { width: 4, height: 4, rgba: &base_rgba }),
+        metallic_roughness: Some(TextureMap { width: 4, height: 4, rgba: &mr_rgba }),
+        normal: Some(TextureMap { width: 4, height: 4, rgba: &normal_rgba }),
+        normal_scale: 1.0,
+    }];
+    let unplanted = render_mesh_scene_planted(
+        &scene_parts,
+        &MAT,
+        v,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), material_maps: &full_maps, .. },
+        NoPlant,
+    )
+    .expect("unplanted");
+    let planted = render_mesh_scene_planted(
+        &scene_parts,
+        &MAT,
+        v,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), material_maps: &full_maps, .. },
+        MeshPicturePlant::IgnoreTextures,
+    )
+    .expect("planted");
+    let no_maps = render_mesh_scene(
+        &scene_parts,
+        &MAT,
+        v,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), .. },
+    )
+    .expect("no maps");
+    assert_eq!(planted.pixels[..], no_maps.pixels[..], "IgnoreTextures plant should match untextured render");
+    assert_ne!(unplanted.pixels[..], planted.pixels[..], "baked PBR maps must alter output vs IgnoreTextures plant");
+}
+
+/// Revision diff computes exact zero/non-zero metrics and heatmap, rejects mismatched sizes, and
+/// `compose_side_by_side` / `compose_grid` place panels verbatim inside 1 px border frames.
+#[test]
+fn compare_diff_and_compose_side_by_side_and_grid() {
+    let mut g1 = Graph::new(GraphOpts { alloc: heap(), .. });
+    let s1 = g1.sphere(SphereOpts { radius: Length::mm(32.0), .. }).expect("s1");
+    let t1 = compile(&g1, s1.id(), CompileOpts { alloc: heap(), .. }).expect("t1");
+
+    let mut g2 = Graph::new(GraphOpts { alloc: heap(), .. });
+    let s2 = g2.sphere(SphereOpts { radius: Length::mm(44.0), .. }).expect("s2");
+    let t2 = compile(&g2, s2.id(), CompileOpts { alloc: heap(), .. }).expect("t2");
+
+    let v = View {
+        eye: [Length::mm(180.0), Length::ZERO, Length::ZERO],
+        target: [Length::ZERO; 3],
+        projection: Projection::Perspective { fov: Angle::degrees(38.0) },
+        width: 24,
+        height: 24,
+        ..
+    };
+    let pic_a = render(&t1, v, PictureOpts { alloc: heap(), scratch: heap(), .. }).expect("pic_a");
+    let pic_b = render(&t2, v, PictureOpts { alloc: heap(), scratch: heap(), .. }).expect("pic_b");
+    let v_small = View { eye: v.eye, target: v.target, projection: v.projection, width: 16, height: 16, .. };
+    let pic_small = render(&t1, v_small, PictureOpts { alloc: heap(), scratch: heap(), .. }).expect("small");
+
+    // Identical pictures produce exact zero diff.
+    let same = diff_pictures(&pic_a, &pic_a, 0, 4.0, heap()).expect("same diff");
+    assert_eq!(same.rms_error, 0.0);
+    assert_eq!(same.max_channel_delta, 0);
+    assert_eq!(same.changed_pixels, 0);
+    assert_eq!(same.total_pixels, 24 * 24);
+    assert_eq!(same.changed_fraction, 0.0);
+    assert_eq!((same.heatmap.width, same.heatmap.height), (24, 24));
+
+    // Edited radius produces positive RMS, changed pixel count, and warm amber/crimson heatmap pixels.
+    let edited = diff_pictures(&pic_a, &pic_b, 2, 4.0, heap()).expect("edited diff");
+    assert!(edited.rms_error > 0.01, "expected non-zero RMS error, got {}", edited.rms_error);
+    assert!(edited.max_channel_delta > 20, "expected large channel delta, got {}", edited.max_channel_delta);
+    assert!(edited.changed_pixels > 20, "expected many changed pixels, got {}", edited.changed_pixels);
+    assert!(edited.changed_fraction > 0.03 && edited.changed_fraction < 1.0);
+    // Corner (0, 0) is background in both renders -> muted dark slate in heatmap.
+    let bg_hm = &edited.heatmap.pixels[0..4];
+    assert!(bg_hm[0] < 60 && bg_hm[1] < 70 && bg_hm[2] < 85 && bg_hm[3] == 255, "unchanged pixel should be dark slate: {bg_hm:?}");
+    let hot_pixels = edited
+        .heatmap
+        .pixels
+        .chunks_exact(4)
+        .filter(|px| px[0] > 150 && px[0] > px[2] + 80)
+        .count();
+    assert_eq!(hot_pixels as u64, edited.changed_pixels, "every changed pixel should be highlighted in amber/crimson");
+
+    // Dimension mismatch returns typed error.
+    assert_eq!(
+        diff_pictures(&pic_a, &pic_small, 0, 1.0, heap()).unwrap_err(),
+        PictureError::DimensionMismatch { left: (24, 24), right: (16, 16) }
+    );
+
+    // Empty panel slice returns typed Empty error.
+    assert_eq!(
+        compose_side_by_side(&[], 4, [20, 20, 24, 255], heap()).unwrap_err(),
+        PictureError::Empty { width: 0, height: 0 }
+    );
+
+    // Side-by-side composition places panels verbatim inside 1 px border frames with exact dimensions.
+    let gap = 6u32;
+    let bg = [240, 242, 244, 255];
+    let sbs = compose_side_by_side(&[&pic_a, &pic_b], gap, bg, heap()).expect("sbs");
+    let cell_w = 24 + 2 * PANEL_BORDER_PX;
+    let cell_h = 24 + 2 * PANEL_BORDER_PX;
+    assert_eq!(sbs.width, 2 * cell_w + gap);
+    assert_eq!(sbs.height, cell_h);
+
+    let px_at = |pic: &Picture<'_>, x: u32, y: u32| -> [u8; 4] {
+        let off = ((y * pic.width + x) * 4) as usize;
+        [pic.pixels[off], pic.pixels[off + 1], pic.pixels[off + 2], pic.pixels[off + 3]]
+    };
+    for y in 0..24 {
+        for x in 0..24 {
+            assert_eq!(px_at(&sbs, PANEL_BORDER_PX + x, PANEL_BORDER_PX + y), px_at(&pic_a, x, y));
+            assert_eq!(px_at(&sbs, cell_w + gap + PANEL_BORDER_PX + x, PANEL_BORDER_PX + y), px_at(&pic_b, x, y));
+        }
+    }
+    // Gutter pixel equals background.
+    assert_eq!(px_at(&sbs, cell_w + 2, cell_h / 2), bg);
+
+    // 2×2 contact sheet grid places all four panels at exact grid coordinates.
+    let grid_gap = 4u32;
+    let grid_bg = [24, 26, 30, 255];
+    let grid = compose_grid(&[&pic_a, &pic_b, &edited.heatmap, &pic_a], 2, grid_gap, grid_bg, heap()).expect("grid");
+    assert_eq!(grid.width, 2 * cell_w + grid_gap);
+    assert_eq!(grid.height, 2 * cell_h + grid_gap);
+    // Panel 2 (`edited.heatmap`) sits at row 1, col 0.
+    let p2_x0 = PANEL_BORDER_PX;
+    let p2_y0 = cell_h + grid_gap + PANEL_BORDER_PX;
+    for y in 0..24 {
+        for x in 0..24 {
+            assert_eq!(px_at(&grid, p2_x0 + x, p2_y0 + y), px_at(&edited.heatmap, x, y));
+        }
+    }
+    // Centre cross-gutter pixel equals grid background.
+    assert_eq!(px_at(&grid, cell_w + 1, cell_h + 1), grid_bg);
 }

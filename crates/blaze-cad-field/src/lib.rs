@@ -52,13 +52,14 @@ pub use inspect::{
 pub use lower::{CompileOpts, compile};
 pub use tape::{INSTR_BYTES, Instr, Op, Tape, schema_digest};
 pub use graph::{
-    AffineOpts, BendOpts, BlendOpts, BoxOpts, CapsuleOpts, CircularOpts, ConeOpts, CylinderOpts, DetailOpts, EllipsoidOpts, ExtrudeOpts,
-    Graph, GraphOpts, GridOpts, GyroidOpts, HalfSpaceOpts, LoftOpts, MirrorOpts, OffsetOpts, Prof, ProfileOpts, RepeatOpts, RevolveOpts,
-    RevolvePartOpts, RoundOpts, ScaleOpts, ShellOpts, Solid, SphereOpts, Station, SuperellipsoidOpts, SweepArcOpts, SweepPolylineOpts,
-    TaperOpts, TorusOpts, TwistOpts,
+    AffineOpts, BendOpts, BlendOpts, BoxOpts, CapsuleOpts, CircularOpts, ConeOpts, CylinderOpts, DetailOpts, EdgeSelect, EllipsoidOpts,
+    ExtrudeOpts, Graph, GraphOpts, GridOpts, GuideRail, GuidedLoftOpts, GuidedStation, GyroidOpts, HalfSpaceOpts, LoftOpts, MirrorOpts,
+    OffsetOpts, Prof, ProfileOpts, RadiusProfile, RadiusStop, RailPoint, RepeatOpts, RevolveOpts, RevolvePartOpts, RoundOpts, ScaleOpts,
+    ShellOpts, Solid, SphereOpts, Station, SuperellipsoidOpts, SweepArcOpts, SweepCrossSection, SweepFrame, SweepFramesOpts,
+    SweepPolylineOpts, TaperOpts, TorusOpts, TwistOpts, VariableBlendOpts, VariableOffsetOpts,
 };
 pub use level::{AtLeastInside, AtLeastOutside, Bound, Ex, Exact, Inside, Join, Level, Lipschitz, Outside, Weakens};
-pub use node::{Boolean, Detail, Digest, Edge, Node, NodeId, ProfileId, Shape};
+pub use node::{Boolean, Detail, Digest, Edge, LoftContinuity, Node, NodeId, ProfileId, Shape};
 pub use placement::{Axis, LINEAR_GRID, Placement};
 pub use plant::CadPlant;
 pub use profile::{Cubic, Point2, Profile, Segment};
