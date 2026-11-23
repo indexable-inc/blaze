@@ -433,6 +433,7 @@ fn verify_find_all_invariants<A: Allocator>(
     Ok(())
 }
 
+/// The invariant: compiled literal patterns match substring search and split reconstructs the exact input.
 #[test]
 fn property_literals_match_substring_search_and_split_reconstructs() {
     let h = heap();

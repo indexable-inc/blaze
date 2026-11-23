@@ -66,7 +66,7 @@ blaze-kit	12	0	13	30
 blaze-ladder	309	1	2	1730
 blaze-launch	0	0	15	58
 blaze-launch-rt	92	1	1	159
-blaze-launcher	61	1	0	13
+blaze-launcher	60	1	0	13
 blaze-lex	14	0	0	16
 blaze-lint	17	0	0	31
 blaze-lint-defs	0	0	3	16

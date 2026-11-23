@@ -1347,6 +1347,7 @@ mod tests {
         }
     }
 
+    /// The invariant: ANSI-styled line wrapping matches plain wrapping and respects visible column width.
     #[test]
     fn property_wrap_ansi_matches_plain_and_respects_width() {
         let h = heap();

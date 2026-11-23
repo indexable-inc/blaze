@@ -897,6 +897,7 @@ mod tests {
         assert!(ed25519::verify(&[0u8; 32], b"blaze", &[0u8; 64]).is_err());
     }
 
+    /// The invariant: AEAD seal/open round-trips arbitrary plaintext and rejects any single-bit tamper in ciphertext or AAD.
     #[test]
     fn property_aead_round_trip_and_single_bit_tamper_rejection() {
         let h = heap();

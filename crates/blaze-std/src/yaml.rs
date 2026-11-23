@@ -2338,6 +2338,7 @@ mod tests {
         Ok(())
     }
 
+    /// The invariant: YAML serialization and parsing round-trip structured values including quoted keyword strings.
     #[test]
     fn property_yaml_round_trip() {
         let h = heap();

@@ -600,19 +600,25 @@ mod tests {
     fn explore_opens_only_when_requested_and_refuses_without_telemetry() {
         use blaze_run::viewer::OpenExplore;
         let frame = Frame::new(bstd::mem::Tag::Other).expect("a frame");
-        fn var<'a>(vars: &[(&str, &'a str)], name: &str) -> std::vec::Vec<&'a str> {
-            vars.iter().filter(|(n, _)| *n == name).map(|(_, v)| *v).collect()
+        fn var<'a, 'f>(vars: &[(&str, &'a str)], name: &str, frame: &'f Frame) -> Vec<&'a str, &'f Frame> {
+            let mut out = Vec::new_in(frame);
+            for &(n, v) in vars {
+                if n == name {
+                    out.push(v);
+                }
+            }
+            out
         }
 
         let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(&frame);
         explore_env(OpenExplore::No, Telemetry::On("/h/.blaze/v2/runs/app.telem"), &mut vars).expect("default run");
-        assert_eq!(var(&vars, blaze_launch::telemetry::VAR), ["/h/.blaze/v2/runs/app.telem"]);
-        assert!(var(&vars, "BLAZE_LAUNCH_EXPLORE").is_empty(), "default `blaze run` must not set BLAZE_LAUNCH_EXPLORE");
+        assert_eq!(var(&vars, blaze_launch::telemetry::VAR, &frame).as_slice(), ["/h/.blaze/v2/runs/app.telem"]);
+        assert!(var(&vars, "BLAZE_LAUNCH_EXPLORE", &frame).is_empty(), "default `blaze run` must not set BLAZE_LAUNCH_EXPLORE");
 
         let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(&frame);
         explore_env(OpenExplore::Open, Telemetry::On("/h/.blaze/v2/runs/app.telem"), &mut vars).expect("--open run");
-        assert_eq!(var(&vars, blaze_launch::telemetry::VAR), ["/h/.blaze/v2/runs/app.telem"]);
-        assert_eq!(var(&vars, "BLAZE_LAUNCH_EXPLORE"), ["1"]);
+        assert_eq!(var(&vars, blaze_launch::telemetry::VAR, &frame).as_slice(), ["/h/.blaze/v2/runs/app.telem"]);
+        assert_eq!(var(&vars, "BLAZE_LAUNCH_EXPLORE", &frame).as_slice(), ["1"]);
 
         let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(&frame);
         assert!(matches!(

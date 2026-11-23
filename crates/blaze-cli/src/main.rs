@@ -1731,7 +1731,7 @@ mod tests {
         use blaze_run::viewer::OpenExplore;
         let args_of = |words: &[&str]| {
             let mut world = SimWorld::new(1, Limits::USUAL);
-            world.args = words.iter().map(|s| std::string::String::from(*s)).collect();
+            world.args = words.iter().map(|&s| s.into()).collect();
             Io::simulated(world).need_args().expect("args")
         };
         let default_run = args_of(&["blaze", "run"]);
