@@ -362,18 +362,18 @@ fn reused_dedups_shared_indexes_across_many_roots() {
     let sim = Sim::new(404, Faults::default());
     let mut store = Driven::with(sim, Path::new("/sim"), reached_cfg(1, u64::MAX, &root), &root).expect("open");
 
-    const INDEXES: u32 = 32;
-    const KEYS_PER_INDEX: u32 = 64;
-    let mut shared_indexes = Vec::with_capacity(INDEXES as usize);
-    for idx_i in 0..INDEXES {
-        let mut keys = Vec::with_capacity(KEYS_PER_INDEX as usize);
-        for key_j in 0..KEYS_PER_INDEX {
-            let id = 10_000 + idx_i * KEYS_PER_INDEX + key_j;
+    const INDEXES: usize = 32;
+    const KEYS_PER_INDEX: usize = 64;
+    let mut shared_indexes = [key(0); INDEXES];
+    for (idx_i, slot) in shared_indexes.iter_mut().enumerate() {
+        let mut keys = [key(0); KEYS_PER_INDEX];
+        for (key_j, key_slot) in keys.iter_mut().enumerate() {
+            let id = 10_000 + (idx_i * KEYS_PER_INDEX + key_j) as u32;
             let k = key(id);
             store.put(k, Namespace::LOCAL, TAG, &value(id)).expect("put");
-            keys.push(k);
+            *key_slot = k;
         }
-        shared_indexes.push(store.index(&keys).expect("index"));
+        *slot = store.index(&keys).expect("index");
     }
     let unrooted_k = key(99_999);
     store.put(unrooted_k, Namespace::LOCAL, TAG, &value(99_999)).expect("put unrooted");
@@ -387,8 +387,9 @@ fn reused_dedups_shared_indexes_across_many_roots() {
     let sim = store.into_driver();
     let mut store = Driven::with(sim, Path::new("/sim"), reached_cfg(2, u64::MAX, &root), &root).expect("reopen");
     let extra_idx = store.index(&[unrooted_k]).expect("extra index");
-    let mut new_indexes = shared_indexes.clone();
-    new_indexes.push(extra_idx);
+    let mut new_indexes = [key(0); INDEXES + 1];
+    new_indexes[..INDEXES].copy_from_slice(&shared_indexes);
+    new_indexes[INDEXES] = extra_idx;
     store.root_through("new-shared", &new_indexes, ROOT_LIFE_NS).expect("root_through new");
     store.commit_with(&[]).expect("commit new");
 
