@@ -11,6 +11,7 @@
 #![blaze::sans_io]
 
 use blaze_cad_field::{Scratch, Tape, eval_grad, eval_point};
+use blaze_cad_mesh::{TriangleRegion, closest_point_on_triangle};
 use blaze_math::{Aabb3, Vec3, acos, sqrt};
 use blaze_own::{Alloc, AllocFailure, Vec};
 
@@ -221,20 +222,21 @@ impl<'a> MeshCollider<'a> {
                         let a = self.positions[ia as usize];
                         let b = self.positions[ib as usize];
                         let c = self.positions[ic as usize];
-                        let (cp, region) = closest_point_on_tri(p, a, b, c);
+                        let hit = closest_point_on_triangle(p, a, b, c);
+                        let cp = hit.point;
                         let diff = p - cp;
                         let d2 = diff.dot(diff);
                         if d2 < best_d2 {
                             best_d2 = d2;
                             best_closest = cp;
-                            best_pseudo = match region {
-                                TriRegion::Face => self.face_normals[ti as usize],
-                                TriRegion::VertA => self.vert_normals[ia as usize],
-                                TriRegion::VertB => self.vert_normals[ib as usize],
-                                TriRegion::VertC => self.vert_normals[ic as usize],
-                                TriRegion::EdgeAB => (self.vert_normals[ia as usize] + self.vert_normals[ib as usize]).normalized().unwrap_or(self.face_normals[ti as usize]),
-                                TriRegion::EdgeBC => (self.vert_normals[ib as usize] + self.vert_normals[ic as usize]).normalized().unwrap_or(self.face_normals[ti as usize]),
-                                TriRegion::EdgeCA => (self.vert_normals[ic as usize] + self.vert_normals[ia as usize]).normalized().unwrap_or(self.face_normals[ti as usize]),
+                            best_pseudo = match hit.region {
+                                TriangleRegion::Face => self.face_normals[ti as usize],
+                                TriangleRegion::VertA => self.vert_normals[ia as usize],
+                                TriangleRegion::VertB => self.vert_normals[ib as usize],
+                                TriangleRegion::VertC => self.vert_normals[ic as usize],
+                                TriangleRegion::EdgeAB => (self.vert_normals[ia as usize] + self.vert_normals[ib as usize]).normalized().unwrap_or(self.face_normals[ti as usize]),
+                                TriangleRegion::EdgeBC => (self.vert_normals[ib as usize] + self.vert_normals[ic as usize]).normalized().unwrap_or(self.face_normals[ti as usize]),
+                                TriangleRegion::EdgeCA => (self.vert_normals[ic as usize] + self.vert_normals[ia as usize]).normalized().unwrap_or(self.face_normals[ti as usize]),
                             };
                         }
                     }
@@ -336,7 +338,7 @@ impl<'a> MeshCollider<'a> {
                     let a = self.positions[ia as usize];
                     let b = self.positions[ib as usize];
                     let c = self.positions[ic as usize];
-                    let (cp, _) = closest_point_on_tri(p, a, b, c);
+                    let cp = closest_point_on_triangle(p, a, b, c).point;
                     let diff = p - cp;
                     let d2 = diff.dot(diff);
                     if count < cap || d2 < worst_d2 {
@@ -507,61 +509,6 @@ fn box_dist_sq(b: Aabb3, p: Vec3) -> f64 {
     let dy = if p.y < b.lo.y { b.lo.y - p.y } else if p.y > b.hi.y { p.y - b.hi.y } else { 0.0 };
     let dz = if p.z < b.lo.z { b.lo.z - p.z } else if p.z > b.hi.z { p.z - b.hi.z } else { 0.0 };
     dx * dx + dy * dy + dz * dz
-}
-
-#[derive(Clone, Copy)]
-enum TriRegion {
-    Face,
-    VertA,
-    VertB,
-    VertC,
-    EdgeAB,
-    EdgeBC,
-    EdgeCA,
-}
-
-/// Exact Voronoi-region closest point on triangle `(a, b, c)` (Ericson, *Real-Time Collision
-/// Detection*, §5.1.5).
-fn closest_point_on_tri(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> (Vec3, TriRegion) {
-    let ab = b - a;
-    let ac = c - a;
-    let ap = p - a;
-    let d1 = ab.dot(ap);
-    let d2 = ac.dot(ap);
-    if d1 <= 0.0 && d2 <= 0.0 {
-        return (a, TriRegion::VertA);
-    }
-    let bp = p - b;
-    let d3 = ab.dot(bp);
-    let d4 = ac.dot(bp);
-    if d3 >= 0.0 && d4 <= d3 {
-        return (b, TriRegion::VertB);
-    }
-    let vc = d1 * d4 - d3 * d2;
-    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
-        let v = d1 / (d1 - d3);
-        return (a + ab * v, TriRegion::EdgeAB);
-    }
-    let cp = p - c;
-    let d5 = ab.dot(cp);
-    let d6 = ac.dot(cp);
-    if d6 >= 0.0 && d5 <= d6 {
-        return (c, TriRegion::VertC);
-    }
-    let vb = d5 * d2 - d1 * d6;
-    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
-        let w = d2 / (d2 - d6);
-        return (a + ac * w, TriRegion::EdgeCA);
-    }
-    let va = d3 * d6 - d5 * d4;
-    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
-        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        return (b + (c - b) * w, TriRegion::EdgeBC);
-    }
-    let denom = 1.0 / (va + vb + vc).max(1e-18);
-    let v = vb * denom;
-    let w = vc * denom;
-    (a + ab * v + ac * w, TriRegion::Face)
 }
 
 fn barycentric(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> [f64; 3] {

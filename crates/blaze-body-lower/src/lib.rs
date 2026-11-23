@@ -39,7 +39,10 @@ use core::alloc::Allocator;
 use core::cell::Cell;
 
 use blaze_body::{Block, BlockKind, Body, BodyBuilder, BuildError, Local, LocalDecl, LocalKind, Loan, NONE, Place, Span, StmtKind};
-use blaze_flow_lower::{ClosureDrop, DropWalk, DropWalkError, Facts, TyStack, index_rows, pty_needs_drop};
+use blaze_flow_lower::{
+    AdtCopyArgs, ClosureCopy, ClosureDrop, CopyWalk, CopyWalkError, DropWalk, DropWalkError, Facts, index_rows,
+    pty_is_copy, pty_needs_drop,
+};
 use blaze_own::Vec;
 use blaze_typeck::{
     AdjustKind, BodyView, Checked, Def, Expr, ExprId, IntTy, ItemKey, List, Mutbl, PNode, PTy, PTys, Pat, PatId, Range,
@@ -570,106 +573,24 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
 
     /// Whether a value of `t` is `Copy` (a use copies it rather than moving it).
     pub(crate) fn is_copy(&self, root: PTy, at: At) -> Result<bool, LowerError> {
-        if let Some(cell) = self.copy_memo.get(root.0 as usize) {
-            let v = cell.get();
-            if v != 0 {
-                return Ok(v == 2);
-            }
-        }
-        let quick = match self.node(root, at)? {
-            PNode::Bool
-            | PNode::Char
-            | PNode::Int(_)
-            | PNode::Uint(_)
-            | PNode::Float(_)
-            | PNode::Never
-            | PNode::Ptr(..)
-            | PNode::FnDef(..)
-            | PNode::FnPtr(..)
-            | PNode::ConstValue { .. }
-            | PNode::ConstParam(_)
-            | PNode::Ref(Mutbl::Not, _) => Some(true),
-            PNode::Ref(Mutbl::Mut, _) => Some(false),
-            PNode::Param(i) => Some(self.facts.param_copy(i)),
-            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) if l.len == 0 => Some(true),
-            PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
-            _ => Some(false),
-        };
-        if let Some(ans) = quick {
-            if let Some(cell) = self.copy_memo.get(root.0 as usize) {
-                cell.set(if ans { 2 } else { 1 });
-            }
-            return Ok(ans);
-        }
-        let mut stack = TyStack::new(root, self.alloc);
-        let mut steps = 0u32;
-        while let Some(t) = stack.pop() {
-            steps += 1;
-            if steps > MOST_POSITIONS {
-                return self.refuse_at(Construct::Bound, at);
-            }
-            if let Some(cell) = self.copy_memo.get(t.0 as usize) {
-                let v = cell.get();
-                if v == 1 {
-                    if let Some(rc) = self.copy_memo.get(root.0 as usize) {
-                        rc.set(1);
-                    }
-                    return Ok(false);
-                }
-                if v == 2 {
-                    continue;
-                }
-            }
-            match self.node(t, at)? {
-                PNode::Bool
-                | PNode::Char
-                | PNode::Int(_)
-                | PNode::Uint(_)
-                | PNode::Float(_)
-                | PNode::Never
-                | PNode::Ptr(..)
-                | PNode::FnDef(..)
-                | PNode::FnPtr(..)
-                | PNode::ConstValue { .. }
-                | PNode::ConstParam(_)
-                | PNode::Ref(Mutbl::Not, _) => {}
-                PNode::Ref(Mutbl::Mut, _) => {
-                    if let Some(rc) = self.copy_memo.get(root.0 as usize) {
-                        rc.set(1);
-                    }
-                    return Ok(false);
-                }
-                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => stack.extend_from_slice(self.list(l, at)?),
-                PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
-                PNode::Adt(k, l) => {
-                    if !self.adt_facts(k, at)?.copy {
-                        if let Some(rc) = self.copy_memo.get(root.0 as usize) {
-                            rc.set(1);
-                        }
-                        return Ok(false);
-                    }
-                    stack.extend_from_slice(self.list(l, at)?);
-                }
-                PNode::Param(i) => {
-                    if !self.facts.param_copy(i) {
-                        if let Some(rc) = self.copy_memo.get(root.0 as usize) {
-                            rc.set(1);
-                        }
-                        return Ok(false);
-                    }
-                }
-                _ => {
-                    if let Some(rc) = self.copy_memo.get(root.0 as usize) {
-                        rc.set(1);
-                    }
-                    return Ok(false);
-                }
-            }
-        }
-        if let Some(rc) = self.copy_memo.get(root.0 as usize) {
-            rc.set(2);
-        }
-        Ok(true)
+        pty_is_copy(
+            CopyWalk {
+                facts: self.facts,
+                copy_memo: &self.copy_memo,
+                adt_args: AdtCopyArgs::All,
+                closures: ClosureCopy::Never,
+                alloc: self.alloc,
+            },
+            root,
+            |t| self.node(t, at).ok(),
+            |l| self.b.list_entries(l),
+            |err| match err {
+                CopyWalkError::Malformed
+                | CopyWalkError::UnknownAdt
+                | CopyWalkError::CopyArgsUnaligned { .. } => self.error_at(Construct::Malformed, at),
+                CopyWalkError::Bound => self.error_at(Construct::Bound, at),
+            },
+        )
     }
 
     /// Whether dropping a value of `t` may run code: its `Drop` row is written, and drop

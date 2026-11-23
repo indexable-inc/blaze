@@ -369,6 +369,17 @@ impl Budget {
     }
 }
 
+/// De Bruijn expression transformation dispatched by [`KernelEnv::subst_expr_rec`].
+#[derive(Clone, Copy)]
+enum SubstOp {
+    /// Lift `BVar(i)` with `i >= bvar_depth` by `amount` (saturating).
+    Lift { amount: u32 },
+    /// Substitute `BVar(bvar_depth)` with `arg` (lifted by `bvar_depth`), shifting higher `BVar`s down by `1`.
+    Instantiate { arg: ExprId },
+    /// Abstract `FVar { id == target_fvar }` to `BVar(bvar_depth)`, shifting `BVar(i >= bvar_depth)` up by `1`.
+    AbstractFVar { target_fvar: u32 },
+}
+
 /// Self-contained Lean 4 Dependent Type Theory kernel environment and arena.
 pub struct KernelEnv<'a> {
     alloc: Alloc<'a>,
@@ -983,7 +994,7 @@ impl<'a> KernelEnv<'a> {
     /// Construct a non-dependent arrow `dom → cod` (lifts loose `BVar`s in `cod` by `1`).
     pub fn mk_arrow(&mut self, dom: ExprId, cod: ExprId) -> Result<ExprId, KernelError> {
         let mut budget = self.budget();
-        let lifted = self.lift_rec(cod, 0, 1, 0, &mut budget)?;
+        let lifted = self.subst_expr_rec(cod, SubstOp::Lift { amount: 1 }, 0, 0, &mut budget)?;
         Ok(self.mk_forall(dom, lifted))
     }
 
@@ -1011,56 +1022,91 @@ impl<'a> KernelEnv<'a> {
     // De Bruijn Substitution, Lifting, Abstraction & Level Instantiation
     // -------------------------------------------------------------------------
 
-    /// Lift de Bruijn indices `>= cutoff` in `e` by `amount`.
-    fn lift_rec(
+    /// Shared binder-depth-tracking traversal for [`SubstOp::Lift`], [`SubstOp::Instantiate`],
+    /// and [`SubstOp::AbstractFVar`].
+    fn subst_expr_rec(
         &mut self,
-        e: ExprId,
-        cutoff: u32,
-        amount: u32,
+        expr: ExprId,
+        op: SubstOp,
+        bvar_depth: u32,
         depth: u32,
         budget: &mut Budget,
     ) -> Result<ExprId, KernelError> {
-        if amount == 0 {
-            return Ok(e);
+        if let SubstOp::Lift { amount: 0 } = op {
+            return Ok(expr);
         }
         budget.tick(depth)?;
-        match self.expr(e) {
-            Expr::BVar(i) => {
-                if i >= cutoff {
-                    Ok(self.mk_bvar(i.saturating_add(amount)))
-                } else {
-                    Ok(e)
+        match self.expr(expr) {
+            Expr::BVar(i) => match op {
+                SubstOp::Lift { amount } => {
+                    if i >= bvar_depth {
+                        Ok(self.mk_bvar(i.saturating_add(amount)))
+                    } else {
+                        Ok(expr)
+                    }
                 }
-            }
-            Expr::FVar { .. } | Expr::Sort(_) | Expr::Const { .. } | Expr::Lit(_) => Ok(e),
+                SubstOp::Instantiate { arg } => {
+                    if i == bvar_depth {
+                        if bvar_depth == 0 {
+                            Ok(arg)
+                        } else {
+                            self.subst_expr_rec(
+                                arg,
+                                SubstOp::Lift { amount: bvar_depth },
+                                0,
+                                depth + 1,
+                                budget,
+                            )
+                        }
+                    } else if i > bvar_depth {
+                        Ok(self.mk_bvar(i - 1))
+                    } else {
+                        Ok(expr)
+                    }
+                }
+                SubstOp::AbstractFVar { .. } => {
+                    if i >= bvar_depth {
+                        Ok(self.mk_bvar(i + 1))
+                    } else {
+                        Ok(expr)
+                    }
+                }
+            },
+            Expr::FVar { id, .. } => match op {
+                SubstOp::AbstractFVar { target_fvar } if id == target_fvar => {
+                    Ok(self.mk_bvar(bvar_depth))
+                }
+                _ => Ok(expr),
+            },
+            Expr::Sort(_) | Expr::Const { .. } | Expr::Lit(_) => Ok(expr),
             Expr::App(f, a) => {
-                let f2 = self.lift_rec(f, cutoff, amount, depth + 1, budget)?;
-                let a2 = self.lift_rec(a, cutoff, amount, depth + 1, budget)?;
-                if f2 == f && a2 == a { Ok(e) } else { Ok(self.mk_app(f2, a2)) }
+                let f2 = self.subst_expr_rec(f, op, bvar_depth, depth + 1, budget)?;
+                let a2 = self.subst_expr_rec(a, op, bvar_depth, depth + 1, budget)?;
+                if f2 == f && a2 == a { Ok(expr) } else { Ok(self.mk_app(f2, a2)) }
             }
             Expr::Lam { binder_ty, body } => {
-                let t2 = self.lift_rec(binder_ty, cutoff, amount, depth + 1, budget)?;
-                let b2 = self.lift_rec(body, cutoff + 1, amount, depth + 1, budget)?;
-                if t2 == binder_ty && b2 == body { Ok(e) } else { Ok(self.mk_lam(t2, b2)) }
+                let t2 = self.subst_expr_rec(binder_ty, op, bvar_depth, depth + 1, budget)?;
+                let b2 = self.subst_expr_rec(body, op, bvar_depth + 1, depth + 1, budget)?;
+                if t2 == binder_ty && b2 == body { Ok(expr) } else { Ok(self.mk_lam(t2, b2)) }
             }
             Expr::ForallE { binder_ty, body } => {
-                let t2 = self.lift_rec(binder_ty, cutoff, amount, depth + 1, budget)?;
-                let b2 = self.lift_rec(body, cutoff + 1, amount, depth + 1, budget)?;
-                if t2 == binder_ty && b2 == body { Ok(e) } else { Ok(self.mk_forall(t2, b2)) }
+                let t2 = self.subst_expr_rec(binder_ty, op, bvar_depth, depth + 1, budget)?;
+                let b2 = self.subst_expr_rec(body, op, bvar_depth + 1, depth + 1, budget)?;
+                if t2 == binder_ty && b2 == body { Ok(expr) } else { Ok(self.mk_forall(t2, b2)) }
             }
             Expr::LetE { ty, val, body } => {
-                let t2 = self.lift_rec(ty, cutoff, amount, depth + 1, budget)?;
-                let v2 = self.lift_rec(val, cutoff, amount, depth + 1, budget)?;
-                let b2 = self.lift_rec(body, cutoff + 1, amount, depth + 1, budget)?;
+                let t2 = self.subst_expr_rec(ty, op, bvar_depth, depth + 1, budget)?;
+                let v2 = self.subst_expr_rec(val, op, bvar_depth, depth + 1, budget)?;
+                let b2 = self.subst_expr_rec(body, op, bvar_depth + 1, depth + 1, budget)?;
                 if t2 == ty && v2 == val && b2 == body {
-                    Ok(e)
+                    Ok(expr)
                 } else {
                     Ok(self.mk_let(t2, v2, b2))
                 }
             }
-            Expr::Proj { struct_name, field_idx, expr } => {
-                let x2 = self.lift_rec(expr, cutoff, amount, depth + 1, budget)?;
-                if x2 == expr { Ok(e) } else { Ok(self.mk_proj(struct_name, field_idx, x2)) }
+            Expr::Proj { struct_name, field_idx, expr: inner } => {
+                let x2 = self.subst_expr_rec(inner, op, bvar_depth, depth + 1, budget)?;
+                if x2 == inner { Ok(expr) } else { Ok(self.mk_proj(struct_name, field_idx, x2)) }
             }
         }
     }
@@ -1068,132 +1114,24 @@ impl<'a> KernelEnv<'a> {
     /// Substitute `BVar(0)` with `arg` in `expr`, shifting outer de Bruijn indices down by `1`.
     pub fn instantiate(&mut self, expr: ExprId, arg: ExprId) -> Result<ExprId, KernelError> {
         let mut budget = self.budget();
-        self.instantiate_rec(expr, 0, arg, 0, &mut budget)
+        self.instantiate_impl(expr, arg, 0, &mut budget)
     }
 
-    fn instantiate_rec(
+    #[inline]
+    fn instantiate_impl(
         &mut self,
         expr: ExprId,
-        bvar_depth: u32,
         arg: ExprId,
         depth: u32,
         budget: &mut Budget,
     ) -> Result<ExprId, KernelError> {
-        budget.tick(depth)?;
-        match self.expr(expr) {
-            Expr::BVar(i) => {
-                if i == bvar_depth {
-                    if bvar_depth == 0 {
-                        Ok(arg)
-                    } else {
-                        self.lift_rec(arg, 0, bvar_depth, depth + 1, budget)
-                    }
-                } else if i > bvar_depth {
-                    Ok(self.mk_bvar(i - 1))
-                } else {
-                    Ok(expr)
-                }
-            }
-            Expr::FVar { .. } | Expr::Sort(_) | Expr::Const { .. } | Expr::Lit(_) => Ok(expr),
-            Expr::App(f, a) => {
-                let f2 = self.instantiate_rec(f, bvar_depth, arg, depth + 1, budget)?;
-                let a2 = self.instantiate_rec(a, bvar_depth, arg, depth + 1, budget)?;
-                if f2 == f && a2 == a { Ok(expr) } else { Ok(self.mk_app(f2, a2)) }
-            }
-            Expr::Lam { binder_ty, body } => {
-                let t2 = self.instantiate_rec(binder_ty, bvar_depth, arg, depth + 1, budget)?;
-                let b2 = self.instantiate_rec(body, bvar_depth + 1, arg, depth + 1, budget)?;
-                if t2 == binder_ty && b2 == body { Ok(expr) } else { Ok(self.mk_lam(t2, b2)) }
-            }
-            Expr::ForallE { binder_ty, body } => {
-                let t2 = self.instantiate_rec(binder_ty, bvar_depth, arg, depth + 1, budget)?;
-                let b2 = self.instantiate_rec(body, bvar_depth + 1, arg, depth + 1, budget)?;
-                if t2 == binder_ty && b2 == body { Ok(expr) } else { Ok(self.mk_forall(t2, b2)) }
-            }
-            Expr::LetE { ty, val, body } => {
-                let t2 = self.instantiate_rec(ty, bvar_depth, arg, depth + 1, budget)?;
-                let v2 = self.instantiate_rec(val, bvar_depth, arg, depth + 1, budget)?;
-                let b2 = self.instantiate_rec(body, bvar_depth + 1, arg, depth + 1, budget)?;
-                if t2 == ty && v2 == val && b2 == body {
-                    Ok(expr)
-                } else {
-                    Ok(self.mk_let(t2, v2, b2))
-                }
-            }
-            Expr::Proj { struct_name, field_idx, expr: inner } => {
-                let x2 = self.instantiate_rec(inner, bvar_depth, arg, depth + 1, budget)?;
-                if x2 == inner { Ok(expr) } else { Ok(self.mk_proj(struct_name, field_idx, x2)) }
-            }
-        }
+        self.subst_expr_rec(expr, SubstOp::Instantiate { arg }, 0, depth, budget)
     }
 
     /// Abstract free variable `target_fvar` into `BVar(0)` (shifting existing `BVar`s up).
     pub fn abstract_fvar(&mut self, expr: ExprId, target_fvar: u32) -> Result<ExprId, KernelError> {
         let mut budget = self.budget();
-        self.abstract_fvar_rec(expr, target_fvar, 0, 0, &mut budget)
-    }
-
-    fn abstract_fvar_rec(
-        &mut self,
-        expr: ExprId,
-        target_fvar: u32,
-        bvar_depth: u32,
-        depth: u32,
-        budget: &mut Budget,
-    ) -> Result<ExprId, KernelError> {
-        budget.tick(depth)?;
-        match self.expr(expr) {
-            Expr::BVar(i) => {
-                if i >= bvar_depth {
-                    Ok(self.mk_bvar(i + 1))
-                } else {
-                    Ok(expr)
-                }
-            }
-            Expr::FVar { id, .. } => {
-                if id == target_fvar {
-                    Ok(self.mk_bvar(bvar_depth))
-                } else {
-                    Ok(expr)
-                }
-            }
-            Expr::Sort(_) | Expr::Const { .. } | Expr::Lit(_) => Ok(expr),
-            Expr::App(f, a) => {
-                let f2 = self.abstract_fvar_rec(f, target_fvar, bvar_depth, depth + 1, budget)?;
-                let a2 = self.abstract_fvar_rec(a, target_fvar, bvar_depth, depth + 1, budget)?;
-                if f2 == f && a2 == a { Ok(expr) } else { Ok(self.mk_app(f2, a2)) }
-            }
-            Expr::Lam { binder_ty, body } => {
-                let t2 =
-                    self.abstract_fvar_rec(binder_ty, target_fvar, bvar_depth, depth + 1, budget)?;
-                let b2 =
-                    self.abstract_fvar_rec(body, target_fvar, bvar_depth + 1, depth + 1, budget)?;
-                if t2 == binder_ty && b2 == body { Ok(expr) } else { Ok(self.mk_lam(t2, b2)) }
-            }
-            Expr::ForallE { binder_ty, body } => {
-                let t2 =
-                    self.abstract_fvar_rec(binder_ty, target_fvar, bvar_depth, depth + 1, budget)?;
-                let b2 =
-                    self.abstract_fvar_rec(body, target_fvar, bvar_depth + 1, depth + 1, budget)?;
-                if t2 == binder_ty && b2 == body { Ok(expr) } else { Ok(self.mk_forall(t2, b2)) }
-            }
-            Expr::LetE { ty, val, body } => {
-                let t2 = self.abstract_fvar_rec(ty, target_fvar, bvar_depth, depth + 1, budget)?;
-                let v2 = self.abstract_fvar_rec(val, target_fvar, bvar_depth, depth + 1, budget)?;
-                let b2 =
-                    self.abstract_fvar_rec(body, target_fvar, bvar_depth + 1, depth + 1, budget)?;
-                if t2 == ty && v2 == val && b2 == body {
-                    Ok(expr)
-                } else {
-                    Ok(self.mk_let(t2, v2, b2))
-                }
-            }
-            Expr::Proj { struct_name, field_idx, expr: inner } => {
-                let x2 =
-                    self.abstract_fvar_rec(inner, target_fvar, bvar_depth, depth + 1, budget)?;
-                if x2 == inner { Ok(expr) } else { Ok(self.mk_proj(struct_name, field_idx, x2)) }
-            }
-        }
+        self.subst_expr_rec(expr, SubstOp::AbstractFVar { target_fvar }, 0, 0, &mut budget)
     }
 
     /// Instantiate universe level parameters `params` with `args` throughout `expr`.
@@ -1429,12 +1367,12 @@ impl<'a> KernelEnv<'a> {
             match self.expr(head) {
                 Expr::Lam { body, .. } if !args.is_empty() => {
                     // Beta-reduction.
-                    let reduced = self.instantiate_rec(body, 0, args[0], depth + 1, budget)?;
+                    let reduced = self.instantiate_impl(body, args[0], depth + 1, budget)?;
                     e = self.mk_apps(reduced, &args[1..]);
                 }
                 Expr::LetE { val, body, .. } => {
                     // Zeta-reduction.
-                    let reduced = self.instantiate_rec(body, 0, val, depth + 1, budget)?;
+                    let reduced = self.instantiate_impl(body, val, depth + 1, budget)?;
                     e = self.mk_apps(reduced, args.as_slice());
                 }
                 Expr::Proj { struct_name, field_idx, expr: target } => {
@@ -1696,8 +1634,8 @@ impl<'a> KernelEnv<'a> {
                     return Ok(false);
                 }
                 let (_, x) = self.mk_fresh_fvar(t1);
-                let e1_x = self.instantiate_rec(e1, 0, x, depth + 1, budget)?;
-                let e2_x = self.instantiate_rec(e2, 0, x, depth + 1, budget)?;
+                let e1_x = self.instantiate_impl(e1, x, depth + 1, budget)?;
+                let e2_x = self.instantiate_impl(e2, x, depth + 1, budget)?;
                 return self.is_def_eq_impl(e1_x, e2_x, depth + 1, budget);
             }
             _ => {}
@@ -1802,7 +1740,7 @@ impl<'a> KernelEnv<'a> {
             return Ok(false);
         }
         let (_, x) = self.mk_fresh_fvar(binder_ty);
-        let lhs = self.instantiate_rec(body, 0, x, depth + 1, budget)?;
+        let lhs = self.instantiate_impl(body, x, depth + 1, budget)?;
         let rhs = self.mk_app(other, x);
         self.is_def_eq_impl(lhs, rhs, depth + 1, budget)
     }
@@ -2017,23 +1955,28 @@ impl<'a> KernelEnv<'a> {
                         return Err(KernelError::TypeMismatch { expected: binder_ty, got: a_ty });
                     }
                 }
-                self.instantiate_rec(body, 0, a, depth + 1, budget)
+                self.instantiate_impl(body, a, depth + 1, budget)
             }
             Expr::Lam { binder_ty, body } => {
                 if !infer_only {
                     let _u = self.infer_sort_impl(binder_ty, false, depth + 1, budget)?;
                 }
                 let (x_id, x) = self.mk_fresh_fvar(binder_ty);
-                let body_open = self.instantiate_rec(body, 0, x, depth + 1, budget)?;
+                let body_open = self.instantiate_impl(body, x, depth + 1, budget)?;
                 let body_ty = self.infer_type_impl(body_open, infer_only, depth + 1, budget)?;
-                let body_ty_abs =
-                    self.abstract_fvar_rec(body_ty, x_id, 0, depth + 1, budget)?;
+                let body_ty_abs = self.subst_expr_rec(
+                    body_ty,
+                    SubstOp::AbstractFVar { target_fvar: x_id },
+                    0,
+                    depth + 1,
+                    budget,
+                )?;
                 Ok(self.mk_forall(binder_ty, body_ty_abs))
             }
             Expr::ForallE { binder_ty, body } => {
                 let u = self.infer_sort_impl(binder_ty, infer_only, depth + 1, budget)?;
                 let (_, x) = self.mk_fresh_fvar(binder_ty);
-                let body_open = self.instantiate_rec(body, 0, x, depth + 1, budget)?;
+                let body_open = self.instantiate_impl(body, x, depth + 1, budget)?;
                 let v = self.infer_sort_impl(body_open, infer_only, depth + 1, budget)?;
                 // Impredicative Prop: Sort(IMax(u, v)) yields Prop whenever v == 0.
                 let imax_raw = self.mk_level_imax(u, v);
@@ -2048,7 +1991,7 @@ impl<'a> KernelEnv<'a> {
                         return Err(KernelError::TypeMismatch { expected: ty, got: val_ty });
                     }
                 }
-                let body_inst = self.instantiate_rec(body, 0, val, depth + 1, budget)?;
+                let body_inst = self.instantiate_impl(body, val, depth + 1, budget)?;
                 self.infer_type_impl(body_inst, infer_only, depth + 1, budget)
             }
             Expr::Lit(Literal::Nat(_)) => {
@@ -2138,7 +2081,7 @@ impl<'a> KernelEnv<'a> {
             let Expr::ForallE { body, .. } = self.expr(cur_whnf) else {
                 return Err(KernelError::InvalidProjection { struct_name, field_idx });
             };
-            cur_ty = self.instantiate_rec(body, 0, ind_args[p], depth + 1, budget)?;
+            cur_ty = self.instantiate_impl(body, ind_args[p], depth + 1, budget)?;
         }
 
         // Instantiate preceding dependent fields via `Proj(struct_name, i, inner)`.
@@ -2148,7 +2091,7 @@ impl<'a> KernelEnv<'a> {
                 return Err(KernelError::InvalidProjection { struct_name, field_idx });
             };
             let prev_proj = self.mk_proj(struct_name, i, inner);
-            cur_ty = self.instantiate_rec(body, 0, prev_proj, depth + 1, budget)?;
+            cur_ty = self.instantiate_impl(body, prev_proj, depth + 1, budget)?;
         }
 
         let cur_whnf = self.whnf_impl(cur_ty, true, depth + 1, budget)?;

@@ -49,15 +49,15 @@ blaze-dbsp	55
 blaze-deflate	228
 blaze-drive	157
 blaze-ed25519	58
-blaze-emit	1003
+blaze-emit	1000
 blaze-engine	268
 blaze-expand	469
-blaze-export	273
+blaze-export	248
 blaze-facts	2
 blaze-fetch	175
 blaze-file-items	277
 blaze-flow	284
-blaze-flow-lower	290
+blaze-flow-lower	287
 blaze-fmt	352
 blaze-format	24
 blaze-format-core	103
@@ -134,7 +134,7 @@ blaze-spawn	9
 blaze-sqlite	1
 blaze-squeeze	112
 blaze-stage	39
-blaze-std	626
+blaze-std	622
 blaze-store-check	9
 blaze-surface	205
 blaze-swiss	38

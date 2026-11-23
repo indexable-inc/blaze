@@ -110,10 +110,9 @@ use blaze_script::{
     git,
     input::{self, Fields, Input, InputError},
     ratchet::{
-        Hit, added_lines, comment_end, crate_of, ident_len, item_end, module_files, quote_end, rust_files, string_end, test_path,
-        word_end,
+        self, CrateScope, FileTests, Hit, Tests, added_lines, comment_end, ident_len, item_end, module_files, quote_end, string_end, word_end,
     },
-    read_text, read_text_lossy,
+    read_text,
     regex::Regex,
 };
 
@@ -242,23 +241,16 @@ fn tally(sites: &[Hit<Kind>]) -> Row {
 }
 
 struct Patterns {
-    cfg_test: Regex,
-    inner_cfg_test: Regex,
-    /// `mod <name>;`, attributes before it on the line allowed.
-    module: Regex,
+    tests: Tests,
     /// An `allow` or `expect` of `blaze::implicit_allocator`, at the line's start.
     allowed: Regex,
 }
 
 impl Patterns {
     fn new() -> Patterns {
-        let re = |pattern: &str| Regex::new(pattern).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
-        Patterns {
-            cfg_test: re(r"\A\s*#\[cfg\((?:test|all\(test\b[^\]]*)\)\]"),
-            inner_cfg_test: re(r"\A\s*#!\[cfg\((?:test|all\(test\b[^\]]*)\)\]"),
-            module: re(r"\A\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?(\w+)\s*;"),
-            allowed: re(r"\A\s*#!?\[[^\]]*\b(?:allow|expect)\([^\]]*\bblaze::implicit_allocator\b"),
-        }
+        let allowed = Regex::new(r"\A\s*#!?\[[^\]]*\b(?:allow|expect)\([^\]]*\bblaze::implicit_allocator\b")
+            .unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
+        Patterns { tests: Tests::cfg_test_only(SCRIPT), allowed }
     }
 }
 
@@ -275,48 +267,16 @@ fn keeps(line: &str) -> bool {
     false
 }
 
-/// What one file holds.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Scanned {
-    /// The lines (from 1) that are sites outside its test code, each with what it is, by line
-    /// and then by kind (a line can be more than one).
-    sites: Vec<(usize, Kind)>,
-    /// Each `mod <name>;` it declares, and whether test code declares it.
-    mods: Vec<(String, bool)>,
-    /// `#![cfg(test)]`: the whole file is test code.
-    test: bool,
-}
-
-/// The sites of one file's text and the modules it declares out of line.
-fn scan_file(p: &Patterns, text: &str) -> Scanned {
-    let lines: Vec<&str> = text.split('\n').collect();
-    let mut test = vec![false; lines.len()];
-    let mut out = Scanned::default();
+/// Emits every site in `text`, in line and kind order, test code included (`walk_with` drops
+/// test lines and test files).
+fn scan_sites(p: &Patterns, text: &str, emit: &mut dyn FnMut(usize, Kind)) {
     let global = global_lines(text);
     let mut global = global.iter().peekable();
     let mut signatures = Vec::new_in(Global);
     signature_lines(text, &mut signatures);
     let mut signatures = signatures.iter().peekable();
-    // The byte where line `at` starts.
-    let mut start = 0;
-    for (at, line) in lines.iter().enumerate() {
-        if p.inner_cfg_test.is_match(line) {
-            out.test = true;
-        }
-        if let Some(found) = p.cfg_test.find(line) {
-            // The item runs from after the attribute to its `}` or `;`, on the line of that byte.
-            let last = match item_end(text, start + found.end()) {
-                Some(end) => at + text[start..end - 1].matches('\n').count(),
-                None => at,
-            };
-            for it in &mut test[at..=last] {
-                *it = true;
-            }
-        }
-        if let Some(found) = p.module.captures(line) {
-            out.mods.push((found[1].to_owned(), test[at]));
-        }
-        // `global` is in line order: take this line's entry, if it has one, test code or not.
+    for (at, line) in text.split('\n').enumerate() {
+        // `global` is in line order: take this line's entry, if it has one.
         let names_global = global.next_if(|it| **it == at + 1).is_some();
         // `signatures` likewise, each signature whose `fn` is on this line (two can share one).
         let mut signed: usize = 0;
@@ -324,20 +284,29 @@ fn scan_file(p: &Patterns, text: &str) -> Scanned {
         while signatures.next_if(|it| **it == at + 1).is_some() {
             signed += 1;
         }
-        if !test[at] {
-            let kinds = [(keeps(line), Kind::Comment), (p.allowed.is_match(line), Kind::Expect), (names_global, Kind::Global)];
-            out.sites.extend(kinds.iter().filter(|(is, _)| *is).map(|(_, kind)| (at + 1, *kind)));
-            out.sites.extend(std::iter::repeat_n((at + 1, Kind::Signature), signed));
+        for (is, kind) in [(keeps(line), Kind::Comment), (p.allowed.is_match(line), Kind::Expect), (names_global, Kind::Global)] {
+            if is {
+                emit(at + 1, kind);
+            }
         }
-        start += line.len() + 1;
-    }
-    if out.test {
-        out.sites.clear();
-        for it in &mut out.mods {
-            it.1 = true;
+        for _ in 0..signed {
+            emit(at + 1, Kind::Signature);
         }
     }
-    out
+}
+
+/// The test code and sites of one file's text outside test code (for selftest).
+fn scan_file(p: &Patterns, text: &str) -> (FileTests, Vec<(usize, Kind)>) {
+    let found = p.tests.of(text);
+    let mut sites = Vec::new();
+    if !found.whole {
+        scan_sites(p, text, &mut |line, kind| {
+            if !found.test.get(line - 1).copied().unwrap_or(false) {
+                sites.push((line, kind));
+            }
+        });
+    }
+    (found, sites)
 }
 
 /// The lines (from 1, ascending, each once) whose code has the word `Global`: comments, strings
@@ -560,55 +529,9 @@ fn type_args(text: &str) -> Option<(usize, &str)> {
 
 /// Each crate's sites outside test code, in file and line order; a crate with none is absent.
 fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Hit<Kind>>> {
-    let files = rust_files(root);
-    let known: BTreeSet<String> = files.iter().map(|it| it.join("/")).collect();
-    let mut scanned: Vec<(Vec<String>, Scanned)> = Vec::new();
-    let mut test: BTreeSet<String> = BTreeSet::new();
-    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for parts in files {
-        let path = parts.join("/");
-        let full = parts.iter().fold(root.to_path_buf(), |path, part| path.join(part));
-        let Ok(text) = read_text_lossy(&full) else { fail(SCRIPT, &format!("{} could not be read", full.display())) };
-        let found = scan_file(p, &text);
-        if test_path(&parts) || found.test {
-            test.insert(path.clone());
-        }
-        for (name, in_test) in &found.mods {
-            for file in module_files(&parts, name) {
-                if !known.contains(&file) {
-                    continue;
-                }
-                if *in_test {
-                    test.insert(file.clone());
-                }
-                children.entry(path.clone()).or_default().push(file);
-            }
-        }
-        scanned.push((parts, found));
-    }
-    // A module that test code declares is test code, and so is every module it declares.
-    let mut todo: Vec<String> = test.iter().cloned().collect();
-    // Bounded: a file enters `test` once, and only a file that entered is taken again.
-    while let Some(path) = todo.pop() {
-        for child in children.get(&path).into_iter().flatten() {
-            if test.insert(child.clone()) {
-                todo.push(child.clone());
-            }
-        }
-    }
-    let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
-    let mut out: BTreeMap<String, Vec<Hit<Kind>>> = BTreeMap::new();
-    for (parts, found) in scanned {
-        let path = parts.join("/");
-        if found.sites.is_empty() || test.contains(&path) {
-            continue;
-        }
-        let krate = crate_of(root, &parts, &mut manifests);
-        out.entry(krate)
-            .or_default()
-            .extend(found.sites.iter().map(|(line, what)| Hit { path: path.clone(), line: *line, what: *what }));
-    }
-    out
+    ratchet::walk_with(SCRIPT, root, CrateScope::AllDirs, &p.tests, |_| false, |file, emit| {
+        scan_sites(p, file.text, emit);
+    })
 }
 
 /// The list as `write` writes it: the header, then `<crate><TAB><comments><TAB><expects><TAB>
@@ -928,7 +851,7 @@ fn selftest(p: &Patterns) {
     // `Global` in code, once a line: not in a `use` item, a string, a comment, or a longer word.
     let global = global_lines(text);
     expect(global == [18, 24, 29, 33], &format!("the lines that name `Global`: {global:?}"));
-    let found = scan_file(p, text);
+    let (found, sites) = scan_file(p, text);
     let want = [
         (3, Kind::Comment),
         (20, Kind::Comment),
@@ -938,18 +861,18 @@ fn selftest(p: &Patterns) {
         (29, Kind::Global),
         (33, Kind::Global),
     ];
-    expect(found.sites == want, &format!("the sites outside test code (line 18 is a test's): {:?}", found.sites));
+    expect(sites == want, &format!("the sites outside test code (line 18 is a test's): {sites:?}"));
     expect(
         found.mods == [("t".to_owned(), true), ("live".to_owned(), false)],
         &format!("the modules declared out of line: {:?}", found.mods),
     );
-    let inner = scan_file(p, "#![cfg(test)]\nmod deep;\nfn x() { Vec::new_in(Global) } // alloc: a test file's\n");
-    expect(inner.test && inner.sites.is_empty() && inner.mods == [("deep".to_owned(), true)], &format!("{inner:?}"));
+    let (inner, inner_sites) = scan_file(p, "#![cfg(test)]\nmod deep;\nfn x() { Vec::new_in(Global) } // alloc: a test file's\n");
+    expect(inner.whole && inner_sites.is_empty() && inner.mods == [("deep".to_owned(), true)], &format!("{inner:?}"));
     // A field's attribute: the item ends with its struct, so the attribute's line alone is test.
-    let field = scan_file(p, "struct S {\n    #[cfg(test)]\n    a: Vec<u8, Global>, // alloc: counted\n}\n");
+    let (_, field_sites) = scan_file(p, "struct S {\n    #[cfg(test)]\n    a: Vec<u8, Global>, // alloc: counted\n}\n");
     expect(
-        field.sites == [(3, Kind::Comment), (3, Kind::Global)],
-        &format!("a field under cfg(test) is counted: {:?}", field.sites),
+        field_sites == [(3, Kind::Comment), (3, Kind::Global)],
+        &format!("a field under cfg(test) is counted: {field_sites:?}"),
     );
     expect(item_end("{ \"\\\"}\" }", 0) == Some(9), "an escaped quote does not end a string");
     expect(item_end("br##\"}\"#\"##;", 0) == Some(12), "a raw byte string with hashes");
@@ -1175,8 +1098,8 @@ fn signatures_of<A: Allocator>(text: &str, alloc: A) -> Vec<usize, A> {
 fn signatures_selftest(p: &Patterns) {
     let lines = signatures_of(SIGNATURES, Global);
     expect(lines == [2, 8, 9, 14, 17, 28], &format!("the signatures that fix the allocator: {lines:?}"));
-    let found = scan_file(p, SIGNATURES);
-    let sites: Vec<usize> = found.sites.iter().filter(|(_, kind)| *kind == Kind::Signature).map(|(line, _)| *line).collect();
+    let (_, found_sites) = scan_file(p, SIGNATURES);
+    let sites: Vec<usize> = found_sites.iter().filter(|(_, kind)| *kind == Kind::Signature).map(|(line, _)| *line).collect();
     expect(sites == [2, 8, 9, 14, 17], &format!("the sites outside test code (28 is a test's): {sites:?}"));
 
     // Planted: `Global` where `handed` takes `A` is counted, at line 7.
@@ -1193,8 +1116,8 @@ fn signatures_selftest(p: &Patterns) {
     expect(lines == [2, 8, 9, 14, 17, 24, 28], &format!("an inherent impl's `from` is counted: {lines:?}"));
     // Planted: the test module's attribute removed, `helper` is a site.
     let planted = SIGNATURES.replace("#[cfg(test)]\n", "\n");
-    let found = scan_file(p, &planted);
-    let sites: Vec<usize> = found.sites.iter().filter(|(_, kind)| *kind == Kind::Signature).map(|(line, _)| *line).collect();
+    let (_, found_sites) = scan_file(p, &planted);
+    let sites: Vec<usize> = found_sites.iter().filter(|(_, kind)| *kind == Kind::Signature).map(|(line, _)| *line).collect();
     expect(sites == [2, 8, 9, 14, 17, 28], &format!("`helper` outside test code is a site: {sites:?}"));
     // `String` with no `<..>`, and one fewer argument than the allocator's form, at any depth.
     expect(fixes_allocator("f(x: &[Rc<u8>])") && fixes_allocator("f() -> Option<(u8, Box<dyn Fn(u8) -> u8>)>"), "at depth");
@@ -1204,9 +1127,9 @@ fn signatures_selftest(p: &Patterns) {
 
     // The ratchet: a rise over the row is refused, with the new site named from the base's diff.
     let path = "crates/s/src/lib.rs";
-    let found = scan_file(p, SIGNATURES);
+    let (_, found_sites) = scan_file(p, SIGNATURES);
     let sites: Vec<Hit<Kind>> =
-        found.sites.iter().map(|(line, what)| Hit { path: path.to_owned(), line: *line, what: *what }).collect();
+        found_sites.iter().map(|(line, what)| Hit { path: path.to_owned(), line: *line, what: *what }).collect();
     let counts = BTreeMap::from([("s".to_owned(), sites)]);
     let row = tally(&counts["s"]);
     expect(row == [0, 0, 1, 5], &format!("crate `s`'s row: {row:?}"));
@@ -1287,7 +1210,7 @@ mod tests {
         // Test code is not a site; the same file without its attribute is.
         let p = Patterns::new();
         let in_test = "#[cfg(test)]\nmod tests {\n    fn helper() -> Vec<u8> { loop {} }\n}\n";
-        let signed = |text: &str| -> usize { scan_file(&p, text).sites.iter().filter(|(_, kind)| *kind == Kind::Signature).count() };
+        let signed = |text: &str| -> usize { scan_file(&p, text).1.iter().filter(|(_, kind)| *kind == Kind::Signature).count() };
         assert_eq!(signed(in_test), 0);
         assert_eq!(signed(&in_test.replace("#[cfg(test)]\n", "\n")), 1);
     }

@@ -24,6 +24,7 @@ use blaze_own::{Alloc, Vec};
 use blaze_text::{Put, Show, Writes};
 use blaze_units::{Angle, Density, Length};
 
+use crate::check::{put_deg, put_mm};
 use crate::export::{hull_to_mesh, prepare_gpu_mesh};
 use crate::surface::{
     BakeOpts, BakedMaps, Decal, FinishAssignment, MaterialRegion, assign_material_regions, bake_surface_maps, baked_material,
@@ -796,49 +797,6 @@ impl Show for AssetReport<'_> {
                 out.put_byte(b'\n');
             }
         }
-    }
-}
-
-fn put_mm<P: Put + ?Sized>(out: &mut P, nm: i64, places: u32) {
-    let places = places.min(6);
-    let unit = 10u128.pow(6 - places);
-    let scale = 10u128.pow(places);
-    let q = (i128::from(nm).unsigned_abs() + unit / 2) / unit;
-    let (whole, mut frac) = (q / scale, q % scale);
-    if nm < 0 && q != 0 {
-        out.put_byte(b'-');
-    }
-    out.int(whole);
-    if frac != 0 {
-        let mut digits = places as usize;
-        while frac % 10 == 0 {
-            frac /= 10;
-            digits -= 1;
-        }
-        out.put_byte(b'.');
-        out.int_zeros(frac, digits);
-    }
-}
-
-fn put_deg<P: Put + ?Sized>(out: &mut P, uas: i64, places: u32) {
-    const UAS_PER_DEGREE: u128 = 3_600_000_000;
-    let places = places.min(6);
-    let scale = 10u128.pow(places);
-    let mag = i128::from(uas).unsigned_abs();
-    let q = (mag * scale + UAS_PER_DEGREE / 2) / UAS_PER_DEGREE;
-    let (whole, mut frac) = (q / scale, q % scale);
-    if uas < 0 && q != 0 {
-        out.put_byte(b'-');
-    }
-    out.int(whole);
-    if frac != 0 {
-        let mut digits = places as usize;
-        while frac % 10 == 0 {
-            frac /= 10;
-            digits -= 1;
-        }
-        out.put_byte(b'.');
-        out.int_zeros(frac, digits);
     }
 }
 

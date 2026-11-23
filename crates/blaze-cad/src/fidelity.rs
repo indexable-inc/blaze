@@ -38,6 +38,7 @@ use blaze_own::{Alloc, Vec};
 use blaze_text::{Put, Show, Writes};
 use blaze_units::{Angle, Length};
 
+use crate::check::{UAS_PER_DEGREE, put_deg, put_mm, put_point};
 use crate::{ModelError, Part, Unsettled, Verdict, part_tape};
 
 /// Semantic kind of a user-marked critical CAD feature (used for sensible tolerance defaults,
@@ -329,8 +330,6 @@ pub enum FidelityPlant {
 
 impl Plants for FidelityPlant {}
 
-const UAS_PER_DEGREE_I64: i64 = 3_600_000_000;
-
 /// Options for [`check_mesh_fidelity`] and [`check_mesh_fidelity_report`].
 #[blaze::args]
 #[derive(Clone, Copy, Debug)]
@@ -346,7 +345,7 @@ pub struct FidelityOpts<'s, 'f> {
     pub bevel_probe_tolerance: Option<Length> = None,
     /// Maximum allowed angular deviation between the exported triangle normal and the exact CAD
     /// field gradient `eval_grad` before flagging [`FidelityFinding::LostBevel`].
-    pub max_normal_error: Angle = Angle::microarcsec(18 * UAS_PER_DEGREE_I64),
+    pub max_normal_error: Angle = Angle::microarcsec(18 * UAS_PER_DEGREE),
     /// Smallest hole or bevel feature size to resolve during triangle subdivision (holes wider
     /// than this are guaranteed to be sampled).
     pub min_hole_feature: Length = Length::nm(4_000_000),
@@ -466,60 +465,6 @@ pub struct FidelityReport<'a> {
 
 // ---- blaze_text::Show formatting ---------------------------------------------------------
 
-fn put_mm<P: Put + ?Sized>(out: &mut P, nm: i64, places: u32) {
-    let places = places.min(6);
-    let unit = 10u128.pow(6 - places);
-    let scale = 10u128.pow(places);
-    let q = (i128::from(nm).unsigned_abs() + unit / 2) / unit;
-    let (whole, mut frac) = (q / scale, q % scale);
-    if nm < 0 && q != 0 {
-        out.put_byte(b'-');
-    }
-    out.int(whole);
-    if frac != 0 {
-        let mut digits = places as usize;
-        while frac % 10 == 0 {
-            frac /= 10;
-            digits -= 1;
-        }
-        out.put_byte(b'.');
-        out.int_zeros(frac, digits);
-    }
-}
-
-fn put_deg<P: Put + ?Sized>(out: &mut P, uas: i64, places: u32) {
-    const UAS_PER_DEGREE: u128 = 3_600_000_000;
-    let places = places.min(6);
-    let scale = 10u128.pow(places);
-    let mag = i128::from(uas).unsigned_abs();
-    let q = (mag * scale + UAS_PER_DEGREE / 2) / UAS_PER_DEGREE;
-    let (whole, mut frac) = (q / scale, q % scale);
-    if uas < 0 && q != 0 {
-        out.put_byte(b'-');
-    }
-    out.int(whole);
-    if frac != 0 {
-        let mut digits = places as usize;
-        while frac % 10 == 0 {
-            frac /= 10;
-            digits -= 1;
-        }
-        out.put_byte(b'.');
-        out.int_zeros(frac, digits);
-    }
-}
-
-fn put_point<P: Put + ?Sized>(out: &mut P, at: &[Length; 3]) {
-    out.put_byte(b'(');
-    for (k, c) in at.iter().enumerate() {
-        if k > 0 {
-            out.put_str(", ");
-        }
-        put_mm(out, c.as_nm(), 2);
-    }
-    out.put_str(") mm");
-}
-
 impl Show for FidelityFinding {
     fn show<P: Put + ?Sized>(&self, out: &mut P) {
         match *self {
@@ -529,7 +474,7 @@ impl Show for FidelityFinding {
                 out.put_str(" mm into empty space (limit ");
                 put_mm(out, tolerance.as_nm(), 2);
                 out.put_str(" mm) at ");
-                put_point(out, &at);
+                put_point(out, &at, 2);
             }
             FidelityFinding::TopologyHoleLost { expected_holes, actual_holes } => {
                 out.put_str("lost through-hole: expected ");
@@ -558,7 +503,7 @@ impl Show for FidelityFinding {
                     out.put_byte(b'%');
                 }
                 out.put_str(" at ");
-                put_point(out, &at);
+                put_point(out, &at, 2);
             }
             FidelityFinding::SurfaceClipped { at, depth, tolerance } => {
                 out.put_str("surface clipped ");
@@ -566,7 +511,7 @@ impl Show for FidelityFinding {
                 out.put_str(" mm inside solid (limit ");
                 put_mm(out, tolerance.as_nm(), 2);
                 out.put_str(" mm) at ");
-                put_point(out, &at);
+                put_point(out, &at, 2);
             }
             FidelityFinding::FeatureMissed {
                 feature,
@@ -590,7 +535,7 @@ impl Show for FidelityFinding {
                 out.put_str("/");
                 put_deg(out, max_normal_error.as_microarcsec(), 1);
                 out.put_str(" deg at ");
-                put_point(out, &at);
+                put_point(out, &at, 2);
             }
         }
     }

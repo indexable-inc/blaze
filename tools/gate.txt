@@ -98,6 +98,7 @@ casts selftest | 120 | - | "$BLAZE_SCRIPTS/casts" selftest
 casts | 300 | base | "$BLAZE_SCRIPTS/casts" '{"command": "check"}'
 recursion selftest | 120 | - | "$BLAZE_SCRIPTS/recursion" selftest
 recursion | 300 | base | "$BLAZE_SCRIPTS/recursion" '{"command": "check"}'
+dups selftest | 120 | - | "$BLAZE_SCRIPTS/dups" selftest
 # Every SCHEMA/LAYOUT/FORMAT/MAGIC/VERSION constant under crates/ has a row of
 # scripts/layouts.txt, and a persisted one whose value changed against the base names its crate's
 # test of the previous layout (rule persisted-state-round-trips).

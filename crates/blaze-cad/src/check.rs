@@ -75,7 +75,7 @@ pub const CHECK_SCHEMA: u32 = 3;
 const MIN_SIMPLIFY_INSTRS: usize = 16;
 
 /// Micro-arcseconds in one degree (`3600 * 10^6`).
-const UAS_PER_DEGREE: i64 = 3_600_000_000;
+pub(crate) const UAS_PER_DEGREE: i64 = 3_600_000_000;
 
 /// Which check a key is of.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -215,20 +215,15 @@ pub struct DraftFace {
 // A finding prints as one sentence, millimetres and degrees throughout, by integer arithmetic
 // from the nanometres / micro-arcseconds: never rounded through a float to be shown.
 
-/// `nm` in millimetres to `places` decimals (at most 6), halves away from zero, trailing zeros
-/// dropped; no minus sign on a value that prints as zero.
-fn put_mm<P: Put + ?Sized>(out: &mut P, nm: i64, places: u32) {
-    let places = places.min(6);
-    let unit = 10u128.pow(6 - places);
-    let scale = 10u128.pow(places);
-    let q = (i128::from(nm).unsigned_abs() + unit / 2) / unit;
+/// Write `q / scale` with up to `places` decimals, dropping trailing zeros and omitting `-` on zero.
+fn put_fixed<P: Put + ?Sized>(out: &mut P, negative: bool, q: u128, scale: u128, places: u8) {
     let (whole, mut frac) = (q / scale, q % scale);
-    if nm < 0 && q != 0 {
+    if negative && q != 0 {
         out.put_byte(b'-');
     }
     out.int(whole);
     if frac != 0 {
-        let mut digits = places as usize;
+        let mut digits = usize::from(places);
         while frac % 10 == 0 {
             frac /= 10;
             digits -= 1;
@@ -236,40 +231,37 @@ fn put_mm<P: Put + ?Sized>(out: &mut P, nm: i64, places: u32) {
         out.put_byte(b'.');
         out.int_zeros(frac, digits);
     }
+}
+
+/// `nm` in millimetres to `places` decimals (at most 6), halves away from zero, trailing zeros
+/// dropped; no minus sign on a value that prints as zero.
+pub(crate) fn put_mm<P: Put + ?Sized>(out: &mut P, nm: i64, places: u8) {
+    let places = places.min(6);
+    let unit = 10u128.pow(u32::from(6 - places));
+    let scale = 10u128.pow(u32::from(places));
+    let q = (i128::from(nm).unsigned_abs() + unit / 2) / unit;
+    put_fixed(out, nm < 0, q, scale, places);
 }
 
 /// `uas` (micro-arcseconds) in degrees to `places` decimals (at most 6), halves away from zero,
 /// trailing zeros dropped; no minus sign on a value that prints as zero.
-fn put_deg<P: Put + ?Sized>(out: &mut P, uas: i64, places: u32) {
+pub(crate) fn put_deg<P: Put + ?Sized>(out: &mut P, uas: i64, places: u8) {
+    const PER_DEG: u128 = 3_600_000_000;
     let places = places.min(6);
-    let scale = 10u128.pow(places);
-    let per_deg = UAS_PER_DEGREE as u128;
+    let scale = 10u128.pow(u32::from(places));
     let mag = i128::from(uas).unsigned_abs();
-    let q = (mag * scale + per_deg / 2) / per_deg;
-    let (whole, mut frac) = (q / scale, q % scale);
-    if uas < 0 && q != 0 {
-        out.put_byte(b'-');
-    }
-    out.int(whole);
-    if frac != 0 {
-        let mut digits = places as usize;
-        while frac % 10 == 0 {
-            frac /= 10;
-            digits -= 1;
-        }
-        out.put_byte(b'.');
-        out.int_zeros(frac, digits);
-    }
+    let q = (mag * scale + PER_DEG / 2) / PER_DEG;
+    put_fixed(out, uas < 0, q, scale, places);
 }
 
-/// `(x, y, z) mm` to the micrometre.
-fn put_point<P: Put + ?Sized>(out: &mut P, at: &[Length; 3]) {
+/// `(x, y, z) mm` to `places` decimals.
+pub(crate) fn put_point<P: Put + ?Sized>(out: &mut P, at: &[Length; 3], places: u8) {
     out.put_byte(b'(');
     for (k, c) in at.iter().enumerate() {
         if k > 0 {
             out.put_str(", ");
         }
-        put_mm(out, c.as_nm(), 3);
+        put_mm(out, c.as_nm(), places);
     }
     out.put_str(") mm");
 }
@@ -280,7 +272,7 @@ impl Show for ThinWall {
         out.put_str("thin wall of about ");
         put_mm(out, self.thickness.as_nm(), 1);
         out.put_str(" mm at ");
-        put_point(out, &self.at);
+        put_point(out, &self.at, 3);
     }
 }
 
@@ -319,7 +311,7 @@ impl Show for Overhang {
         out.put_str("sticks out of the envelope by about ");
         put_mm(out, self.depth.as_nm(), 1);
         out.put_str(" mm at ");
-        put_point(out, &self.at);
+        put_point(out, &self.at, 3);
     }
 }
 
@@ -331,7 +323,7 @@ impl Show for OverhangFace {
         out.put_str(" deg (limit ");
         put_deg(out, self.max_angle.as_microarcsec(), 1);
         out.put_str(" deg) at ");
-        put_point(out, &self.at);
+        put_point(out, &self.at, 3);
     }
 }
 
@@ -352,7 +344,7 @@ impl Show for DraftFace {
             put_deg(out, self.min_draft.as_microarcsec(), 1);
             out.put_str(" deg) at ");
         }
-        put_point(out, &self.at);
+        put_point(out, &self.at, 3);
     }
 }
 
@@ -368,7 +360,7 @@ impl Show for Unsettled {
                 out.put_str("not settled: ");
                 out.int(*cells);
                 out.put_str(" places, the first near ");
-                put_point(out, near);
+                put_point(out, near, 3);
             }
             Unsettled::Straddles { lo, hi } => {
                 out.put_str("not settled: the gap is ");
@@ -1350,61 +1342,111 @@ fn normalize_dir(dir: [f64; 3], function: &'static str, arg: &'static str) -> Re
     v.normalized().ok_or(ModelError::Argument { function, arg, accepted: "a finite non-zero direction" })
 }
 
-/// Shared configuration for the verified surface-normal DFM traversal used by
-/// [`overhang_check_planted`] and [`draft_angle_check_planted`].
-struct SurfaceWalk<'a, 's> {
-    s_tape: &'a Tape<'s>,
-    key: CheckKey,
-    lin: Mat3,
-    shift: Vec3,
-    local_dir: Vec3,
-    eval_dir: Vec3,
+/// Shared configuration for the verified surface-normal DFM checks ([`overhang_check_planted`]
+/// and [`draft_angle_check_planted`]).
+struct SurfaceCheck<'s> {
+    function: &'static str,
+    check: CheckKind,
+    angle: Angle,
+    dir: [f64; 3],
+    dir_arg: &'static str,
+    flip_eval_dir: bool,
     sample_size: Length,
     base_tolerance: Length,
+    base_tol_arg: &'static str,
     tolerance: Length,
     most_boxes: u64,
     most_steps_per_point: u32,
     scratch: Alloc<'s>,
 }
 
-/// Verified octree, hierarchical tape simplification, surface projection, and outward normal walk
-/// shared by [`overhang_check_planted`] and [`draft_angle_check_planted`]. Excludes cells and
-/// samples within `base_tolerance` above `z_min` along `local_dir`, invoking `check` on every
-/// remaining `(sample, n_local, eval_dir)` to return the first violating witness face.
-fn check_surface_normals<W, F>(w: SurfaceWalk<'_, '_>, mut check: F) -> Result<Checked<W>, ModelError>
+/// Deferred local-to-world transform for a surface violation witness.
+struct SurfaceHit {
+    lin: Mat3,
+    shift: Vec3,
+    p_local: Vec3,
+    n_local: Vec3,
+}
+
+impl SurfaceHit {
+    fn world(self) -> ([Length; 3], [f64; 3]) {
+        let at_world = self.lin.apply(self.p_local) + self.shift;
+        let n_world = self.lin.apply(self.n_local).normalized().unwrap_or(self.n_local);
+        (lengths(at_world), n_world.to_array())
+    }
+}
+
+/// Validated setup, key derivation, verified octree, hierarchical tape simplification, surface
+/// projection, and outward normal walk shared by [`overhang_check_planted`] and
+/// [`draft_angle_check_planted`]. Excludes cells and samples within `base_tolerance` above `z_min`
+/// along `local_dir`, invoking `check` on `(n_local · eval_dir, hit)` to return the first
+/// violating witness face.
+fn check_surface_normals<K: Ex, P: Planted<CadPlant>, W, F>(
+    g: &Graph<'_, P>,
+    part: &Part<K>,
+    cfg: SurfaceCheck<'_>,
+    mut check: F,
+) -> Result<Checked<W>, ModelError>
 where
-    F: FnMut(&OnSurface, Vec3, Vec3) -> Option<W>,
+    F: FnMut(f64, SurfaceHit) -> Option<W>,
 {
-    let root = w.s_tape.aabb();
+    if cfg.sample_size <= Length::ZERO {
+        return Err(ModelError::Argument { function: cfg.function, arg: "sample_size", accepted: "a length above zero" });
+    }
+    if cfg.base_tolerance < Length::ZERO {
+        return Err(ModelError::Argument { function: cfg.function, arg: cfg.base_tol_arg, accepted: "a length at least zero" });
+    }
+    if cfg.tolerance < Length::ZERO {
+        return Err(ModelError::Argument { function: cfg.function, arg: "tolerance", accepted: "a length at least zero" });
+    }
+    if cfg.most_steps_per_point == 0 {
+        return Err(ModelError::Argument { function: cfg.function, arg: "most_steps_per_point", accepted: "at least one" });
+    }
+    let world_dir = normalize_dir(cfg.dir, cfg.function, cfg.dir_arg)?;
+    let lin = part.placement.linear();
+    let shift = part.placement.shift_m();
+    let local_dir = lin.transpose().apply(world_dir).normalized().unwrap_or(world_dir);
+
+    let s_tape = compile(g, part.solid.id(), CompileOpts { alloc: cfg.scratch, detail: Detail::Shape, .. })
+        .map_err(ModelError::Compile)?;
+    let key = CheckKey {
+        check: cfg.check,
+        tapes: [s_tape.digest(), [0; 32]],
+        args: [cfg.angle.as_microarcsec(), cfg.sample_size.as_nm(), dir_tol_key(local_dir, cfg.base_tolerance.as_nm())],
+        schema: CHECK_SCHEMA,
+    };
+    let eval_dir = if cfg.flip_eval_dir { -local_dir } else { local_dir };
+
+    let root = s_tape.aabb();
     if root.is_empty() {
-        return Ok(Checked { verdict: Verdict::Pass, key: w.key, boxes: 0, samples: 0, points: 0 });
+        return Ok(Checked { verdict: Verdict::Pass, key, boxes: 0, samples: 0, points: 0 });
     }
     if !finite(&root) {
         return Err(ModelError::Inspect(InspectError::Unbounded { what: "the part's box" }));
     }
 
-    let leaf = w.sample_size.as_m();
+    let leaf = cfg.sample_size.as_m();
     let floor = leaf / f64::from(1u32 << SPLIT_LEVELS);
-    let tol = w.tolerance.as_m().max(1e-9);
-    let base_tol = w.base_tolerance.as_m();
+    let tol = cfg.tolerance.as_m().max(1e-9);
+    let base_tol = cfg.base_tolerance.as_m();
     let z_tol = (base_tol * 0.25).max(tol);
 
-    let mut sc = Scratch::new(w.scratch);
+    let mut sc = Scratch::new(cfg.scratch);
     let mut boxes: u64 = 0;
     let mut samples: u64 = 0;
     let mut points: u64 = 0;
 
-    let z_min = match min_along(w.s_tape, root, w.local_dir, z_tol, w.most_boxes, &mut boxes, &mut points, &mut sc, w.scratch)? {
+    let z_min = match min_along(&s_tape, root, local_dir, z_tol, cfg.most_boxes, &mut boxes, &mut points, &mut sc, cfg.scratch)? {
         MinExtent::Found(z) => z,
-        MinExtent::Empty => return Ok(Checked { verdict: Verdict::Pass, key: w.key, boxes, samples, points }),
+        MinExtent::Empty => return Ok(Checked { verdict: Verdict::Pass, key, boxes, samples, points }),
         MinExtent::Budget => {
-            return Ok(Checked { verdict: Verdict::Unknown(Unsettled::Budget { boxes }), key: w.key, boxes, samples, points });
+            return Ok(Checked { verdict: Verdict::Unknown(Unsettled::Budget { boxes }), key, boxes, samples, points });
         }
     };
     let base_cut = z_min + base_tol;
 
-    let mut frames: Vec<TapeFrame<'_>, Alloc<'_>> = Vec::new_in(w.scratch);
-    let mut stack: Vec<(Aabb3, bool), Alloc<'_>> = Vec::new_in(w.scratch);
+    let mut frames: Vec<TapeFrame<'_>, Alloc<'_>> = Vec::new_in(cfg.scratch);
+    let mut stack: Vec<(Aabb3, bool), Alloc<'_>> = Vec::new_in(cfg.scratch);
     stack.try_push((root, false)).map_err(|_| ModelError::Alloc { what: "a check's box stack" })?;
     let mut open: u64 = 0;
     let mut near: Option<Vec3> = None;
@@ -1416,8 +1458,8 @@ where
         }
         let Some((c, center_tested)) = stack.pop() else { break };
         boxes += 1;
-        if boxes > w.most_boxes {
-            return Ok(Checked { verdict: Verdict::Unknown(Unsettled::Budget { boxes }), key: w.key, boxes, samples, points });
+        if boxes > cfg.most_boxes {
+            return Ok(Checked { verdict: Verdict::Unknown(Unsettled::Budget { boxes }), key, boxes, samples, points });
         }
         let side = c.longest_side();
         let sampling = side <= leaf;
@@ -1428,10 +1470,10 @@ where
         // Prune cells wholly inside the base contact band along `local_dir` (even when a planted
         // bug flips `eval_dir`, base exclusion stays along `local_dir` so the bottom remains
         // excluded).
-        if box_max_dot(&c, w.local_dir) + reach <= base_cut {
+        if box_max_dot(&c, local_dir) + reach <= base_cut {
             continue;
         }
-        let cur_tape = active_tape(w.s_tape, &frames);
+        let cur_tape = active_tape(&s_tape, &frames);
         if !center_tested {
             points += 1;
             if eval_point(cur_tape, c.center(), &mut sc).abs() > reach / 2.0 {
@@ -1444,15 +1486,15 @@ where
                 continue;
             }
             if !sampling {
-                let sub = if side > leaf * 2.0 { try_simplify(cur_tape, choices, w.scratch)? } else { None };
+                let sub = if side > leaf * 2.0 { try_simplify(cur_tape, choices, cfg.scratch)? } else { None };
                 if let Some(tape) = sub {
                     frames
                         .try_push(TapeFrame { tape, region: c, stack_base: stack.len() })
                         .map_err(|_| ModelError::Alloc { what: "a check's tape stack" })?;
                 }
-                let child_tape = active_tape(w.s_tape, &frames);
+                let child_tape = active_tape(&s_tape, &frames);
                 let (kids, n) = split(&c);
-                if boxes + (n as u64) <= w.most_boxes {
+                if boxes + (n as u64) <= cfg.most_boxes {
                     batch_eval_centers(child_tape, &kids[..n], &mut vals, &mut sc)?;
                     points += n as u64;
                     for i in 0..n {
@@ -1476,24 +1518,24 @@ where
             }
         }
         let eps = (4.0 * tol).min(leaf * 0.05);
-        let proj_tape = tape_for_box(w.s_tape, &frames, &Aabb3::around(c.center(), Vec3::splat(reach + eps)));
-        let mut pr = Probe { t: proj_tape, sc: &mut sc, points, used: 0, most: w.most_steps_per_point };
+        let proj_tape = tape_for_box(&s_tape, &frames, &Aabb3::around(c.center(), Vec3::splat(reach + eps)));
+        let mut pr = Probe { t: proj_tape, sc: &mut sc, points, used: 0, most: cfg.most_steps_per_point };
         let res = project(&mut pr, &c, tol, false);
         match res {
             Projected::At(s) => {
-                if s.p.dot(w.local_dir) <= base_cut {
+                if s.p.dot(local_dir) <= base_cut {
                     points = pr.points;
                     continue;
                 }
                 let Some(n_local) = surface_normal(&mut pr, &s, eps) else {
                     points = pr.points;
                     open += 1;
-                    near.get_or_insert(w.lin.apply(c.center()) + w.shift);
+                    near.get_or_insert(lin.apply(c.center()) + shift);
                     continue;
                 };
                 points = pr.points;
-                if let Some(found) = check(&s, n_local, w.eval_dir) {
-                    return Ok(Checked { verdict: Verdict::Found(found), key: w.key, boxes, samples, points });
+                if let Some(found) = check(n_local.dot(eval_dir), SurfaceHit { lin, shift, p_local: s.p, n_local }) {
+                    return Ok(Checked { verdict: Verdict::Found(found), key, boxes, samples, points });
                 }
             }
             Projected::NoBracket if side > floor => {
@@ -1506,7 +1548,7 @@ where
             Projected::NoBracket | Projected::Spent => {
                 points = pr.points;
                 open += 1;
-                near.get_or_insert(w.lin.apply(c.center()) + w.shift);
+                near.get_or_insert(lin.apply(c.center()) + shift);
             }
         }
     }
@@ -1515,7 +1557,7 @@ where
         Some(p) => Verdict::Unknown(Unsettled::Open { cells: open, near: lengths(p) }),
         None => Verdict::Pass,
     };
-    Ok(Checked { verdict, key: w.key, boxes, samples, points })
+    Ok(Checked { verdict, key, boxes, samples, points })
 }
 
 /// What [`overhang_check`] takes.
@@ -1569,68 +1611,30 @@ pub fn overhang_check_planted<K: Ex, P: Planted<CadPlant>>(
             accepted: "an angle strictly between 0 and 90 degrees",
         });
     }
-    if o.sample_size <= Length::ZERO {
-        return Err(ModelError::Argument { function: "overhang_check", arg: "sample_size", accepted: "a length above zero" });
-    }
-    if o.plate_tolerance < Length::ZERO {
-        return Err(ModelError::Argument {
-            function: "overhang_check",
-            arg: "plate_tolerance",
-            accepted: "a length at least zero",
-        });
-    }
-    if o.tolerance < Length::ZERO {
-        return Err(ModelError::Argument { function: "overhang_check", arg: "tolerance", accepted: "a length at least zero" });
-    }
-    if o.most_steps_per_point == 0 {
-        return Err(ModelError::Argument {
-            function: "overhang_check",
-            arg: "most_steps_per_point",
-            accepted: "at least one",
-        });
-    }
-    let world_dir = normalize_dir(o.build_dir, "overhang_check", "build_dir")?;
-    let lin = part.placement.linear();
-    let shift = part.placement.shift_m();
-    let local_dir = lin.transpose().apply(world_dir).normalized().unwrap_or(world_dir);
-
-    let s_tape = compile(g, part.solid.id(), CompileOpts { alloc: o.scratch, detail: Detail::Shape, .. }).map_err(ModelError::Compile)?;
-    let key = CheckKey {
-        check: CheckKind::Overhang,
-        tapes: [s_tape.digest(), [0; 32]],
-        args: [o.max_angle.as_microarcsec(), o.sample_size.as_nm(), dir_tol_key(local_dir, o.plate_tolerance.as_nm())],
-        schema: CHECK_SCHEMA,
-    };
     let sin_max = blaze_math::sin(o.max_angle.as_radians());
-    let eval_dir = if plant.has(OverhangPlant::FlippedBuildDir) { -local_dir } else { local_dir };
-
     check_surface_normals(
-        SurfaceWalk {
-            s_tape: &s_tape,
-            key,
-            lin,
-            shift,
-            local_dir,
-            eval_dir,
+        g,
+        part,
+        SurfaceCheck {
+            function: "overhang_check",
+            check: CheckKind::Overhang,
+            angle: o.max_angle,
+            dir: o.build_dir,
+            dir_arg: "build_dir",
+            flip_eval_dir: plant.has(OverhangPlant::FlippedBuildDir),
             sample_size: o.sample_size,
             base_tolerance: o.plate_tolerance,
+            base_tol_arg: "plate_tolerance",
             tolerance: o.tolerance,
             most_boxes: o.most_boxes,
             most_steps_per_point: o.most_steps_per_point,
             scratch: o.scratch,
         },
-        |s, n_local, dir| {
-            let d = n_local.dot(dir);
+        |d, hit| {
             if d < -sin_max - 1e-9 {
+                let (at, normal) = hit.world();
                 let angle = Angle::radians(blaze_math::asin((-d).clamp(0.0, 1.0)));
-                let at_world = lin.apply(s.p) + shift;
-                let n_world = lin.apply(n_local).normalized().unwrap_or(n_local);
-                Some(OverhangFace {
-                    at: lengths(at_world),
-                    normal: n_world.to_array(),
-                    angle,
-                    max_angle: o.max_angle,
-                })
+                Some(OverhangFace { at, normal, angle, max_angle: o.max_angle })
             } else {
                 None
             }
@@ -1690,70 +1694,32 @@ pub fn draft_angle_check_planted<K: Ex, P: Planted<CadPlant>>(
             accepted: "an angle from 0 up to (not including) 90 degrees",
         });
     }
-    if o.sample_size <= Length::ZERO {
-        return Err(ModelError::Argument { function: "draft_angle_check", arg: "sample_size", accepted: "a length above zero" });
-    }
-    if o.parting_tolerance < Length::ZERO {
-        return Err(ModelError::Argument {
-            function: "draft_angle_check",
-            arg: "parting_tolerance",
-            accepted: "a length at least zero",
-        });
-    }
-    if o.tolerance < Length::ZERO {
-        return Err(ModelError::Argument { function: "draft_angle_check", arg: "tolerance", accepted: "a length at least zero" });
-    }
-    if o.most_steps_per_point == 0 {
-        return Err(ModelError::Argument {
-            function: "draft_angle_check",
-            arg: "most_steps_per_point",
-            accepted: "at least one",
-        });
-    }
-    let world_dir = normalize_dir(o.pull_dir, "draft_angle_check", "pull_dir")?;
-    let lin = part.placement.linear();
-    let shift = part.placement.shift_m();
-    let local_dir = lin.transpose().apply(world_dir).normalized().unwrap_or(world_dir);
-
-    let s_tape = compile(g, part.solid.id(), CompileOpts { alloc: o.scratch, detail: Detail::Shape, .. }).map_err(ModelError::Compile)?;
-    let key = CheckKey {
-        check: CheckKind::DraftAngle,
-        tapes: [s_tape.digest(), [0; 32]],
-        args: [o.min_draft.as_microarcsec(), o.sample_size.as_nm(), dir_tol_key(local_dir, o.parting_tolerance.as_nm())],
-        schema: CHECK_SCHEMA,
-    };
     let sin_min = blaze_math::sin(o.min_draft.as_radians());
     let ignore_sign = plant.has(DraftPlant::IgnoreUndercutSign);
-
     check_surface_normals(
-        SurfaceWalk {
-            s_tape: &s_tape,
-            key,
-            lin,
-            shift,
-            local_dir,
-            eval_dir: local_dir,
+        g,
+        part,
+        SurfaceCheck {
+            function: "draft_angle_check",
+            check: CheckKind::DraftAngle,
+            angle: o.min_draft,
+            dir: o.pull_dir,
+            dir_arg: "pull_dir",
+            flip_eval_dir: false,
             sample_size: o.sample_size,
             base_tolerance: o.parting_tolerance,
+            base_tol_arg: "parting_tolerance",
             tolerance: o.tolerance,
             most_boxes: o.most_boxes,
             most_steps_per_point: o.most_steps_per_point,
             scratch: o.scratch,
         },
-        |s, n_local, dir| {
-            let d_raw = n_local.dot(dir);
+        |d_raw, hit| {
             let d = if ignore_sign { d_raw.abs() } else { d_raw };
             if d < sin_min - 1e-9 {
+                let (at, normal) = hit.world();
                 let angle = Angle::radians(blaze_math::asin(d_raw.clamp(-1.0, 1.0)));
-                let at_world = lin.apply(s.p) + shift;
-                let n_world = lin.apply(n_local).normalized().unwrap_or(n_local);
-                Some(DraftFace {
-                    at: lengths(at_world),
-                    normal: n_world.to_array(),
-                    angle,
-                    min_draft: o.min_draft,
-                    undercut: d_raw < -1e-9,
-                })
+                Some(DraftFace { at, normal, angle, min_draft: o.min_draft, undercut: d_raw < -1e-9 })
             } else {
                 None
             }

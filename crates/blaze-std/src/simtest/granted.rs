@@ -52,7 +52,7 @@ use blaze_text::Writes as _;
 
 use super::{BUDGET, Outcome, listed};
 use crate::{
-    grant::{Given, Kind, LaunchAlloc, Manifest, Param, Problem, Refused, Spec, Started, Want},
+    grant::{Given, Kind, LaunchAlloc, Manifest, Param, Problem, Refused, Spec, Started, Want, same},
     host::Exit,
     io::{Io, Limits, SimWorld},
     mem::TASK_FRAME,
@@ -1143,21 +1143,6 @@ const fn has_class(params: &[Param], class: KindClass) -> bool {
         i += 1;
     }
     false
-}
-
-const fn same(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut at = 0;
-    while at < a.len() {
-        if a[at] != b[at] {
-            return false;
-        }
-        at += 1;
-    }
-    true
 }
 
 /// A path beneath a folder: not empty, not absolute, no empty, `.` or `..` part.

@@ -441,6 +441,25 @@ impl Gpu {
         })
     }
 
+    fn alloc_buffer_in<T, A: Allocator>(
+        &self,
+        len: usize,
+        alloc: A,
+        init: impl FnOnce(&mut OwnVec<T, A>, u64) -> Result<(), GpuError>,
+    ) -> Result<Buffer<T, A>, GpuError> {
+        let byte_len = checked_byte_len::<T>(len)?;
+        let lease = BudgetLease::acquire(&self.budget, byte_len)?;
+        let mut data = OwnVec::try_with_capacity_in(len, alloc)
+            .map_err(|_| GpuError::OutOfMemory { asked: byte_len })?;
+        init(&mut data, byte_len)?;
+        Ok(Buffer {
+            data,
+            memory_kind: self.memory_kind,
+            dirty: None,
+            _lease: lease,
+        })
+    }
+
     /// Allocates a host-accessible [`Buffer`] of `len` elements initialized to clones of `fill`
     /// inside `alloc`, counted against this device's budget.
     pub fn buffer_in<T: Clone, A: Allocator>(
@@ -449,16 +468,9 @@ impl Gpu {
         fill: T,
         alloc: A,
     ) -> Result<Buffer<T, A>, GpuError> {
-        let byte_len = checked_byte_len::<T>(len)?;
-        let lease = BudgetLease::acquire(&self.budget, byte_len)?;
-        let mut data = OwnVec::try_with_capacity_in(len, alloc)
-            .map_err(|_| GpuError::OutOfMemory { asked: byte_len })?;
-        data.resize(len, fill);
-        Ok(Buffer {
-            data,
-            memory_kind: self.memory_kind,
-            dirty: None,
-            _lease: lease,
+        self.alloc_buffer_in(len, alloc, |data, _| {
+            data.resize(len, fill);
+            Ok(())
         })
     }
 
@@ -469,16 +481,9 @@ impl Gpu {
         len: usize,
         alloc: A,
     ) -> Result<Buffer<T, A>, GpuError> {
-        let byte_len = checked_byte_len::<T>(len)?;
-        let lease = BudgetLease::acquire(&self.budget, byte_len)?;
-        let mut data = OwnVec::try_with_capacity_in(len, alloc)
-            .map_err(|_| GpuError::OutOfMemory { asked: byte_len })?;
-        data.resize_with(len, T::default);
-        Ok(Buffer {
-            data,
-            memory_kind: self.memory_kind,
-            dirty: None,
-            _lease: lease,
+        self.alloc_buffer_in(len, alloc, |data, _| {
+            data.resize_with(len, T::default);
+            Ok(())
         })
     }
 
@@ -489,17 +494,9 @@ impl Gpu {
         src: &[T],
         alloc: A,
     ) -> Result<Buffer<T, A>, GpuError> {
-        let byte_len = checked_byte_len::<T>(src.len())?;
-        let lease = BudgetLease::acquire(&self.budget, byte_len)?;
-        let mut data = OwnVec::try_with_capacity_in(src.len(), alloc)
-            .map_err(|_| GpuError::OutOfMemory { asked: byte_len })?;
-        data.try_extend_from_slice(src)
-            .map_err(|_| GpuError::OutOfMemory { asked: byte_len })?;
-        Ok(Buffer {
-            data,
-            memory_kind: self.memory_kind,
-            dirty: None,
-            _lease: lease,
+        self.alloc_buffer_in(src.len(), alloc, |data, byte_len| {
+            data.try_extend_from_slice(src)
+                .map_err(|_| GpuError::OutOfMemory { asked: byte_len })
         })
     }
 
@@ -511,16 +508,7 @@ impl Gpu {
         fill: T,
         alloc: A,
     ) -> Result<DeviceBuffer<T, A>, GpuError> {
-        let byte_len = checked_byte_len::<T>(len)?;
-        let lease = BudgetLease::acquire(&self.budget, byte_len)?;
-        let mut data = OwnVec::try_with_capacity_in(len, alloc)
-            .map_err(|_| GpuError::OutOfMemory { asked: byte_len })?;
-        data.resize(len, fill);
-        Ok(DeviceBuffer {
-            data,
-            memory_kind: self.memory_kind,
-            _lease: lease,
-        })
+        self.buffer_in(len, fill, alloc).map(Buffer::into_device)
     }
 
     /// Allocates a device-only [`DeviceBuffer`] of `len` default/zeroed elements inside `alloc`,
@@ -530,16 +518,7 @@ impl Gpu {
         len: usize,
         alloc: A,
     ) -> Result<DeviceBuffer<T, A>, GpuError> {
-        let byte_len = checked_byte_len::<T>(len)?;
-        let lease = BudgetLease::acquire(&self.budget, byte_len)?;
-        let mut data = OwnVec::try_with_capacity_in(len, alloc)
-            .map_err(|_| GpuError::OutOfMemory { asked: byte_len })?;
-        data.resize_with(len, T::default);
-        Ok(DeviceBuffer {
-            data,
-            memory_kind: self.memory_kind,
-            _lease: lease,
-        })
+        self.buffer_zeroed_in(len, alloc).map(Buffer::into_device)
     }
 
     /// Allocates a device-only [`DeviceBuffer`] initialized from `src` inside `alloc`, counted
@@ -549,17 +528,7 @@ impl Gpu {
         src: &[T],
         alloc: A,
     ) -> Result<DeviceBuffer<T, A>, GpuError> {
-        let byte_len = checked_byte_len::<T>(src.len())?;
-        let lease = BudgetLease::acquire(&self.budget, byte_len)?;
-        let mut data = OwnVec::try_with_capacity_in(src.len(), alloc)
-            .map_err(|_| GpuError::OutOfMemory { asked: byte_len })?;
-        data.try_extend_from_slice(src)
-            .map_err(|_| GpuError::OutOfMemory { asked: byte_len })?;
-        Ok(DeviceBuffer {
-            data,
-            memory_kind: self.memory_kind,
-            _lease: lease,
-        })
+        self.buffer_from_slice_in(src, alloc).map(Buffer::into_device)
     }
 
     /// Allocates an offscreen RGBA8 [`RenderTarget`] of `width` × `height` pixels in `alloc`,
@@ -732,6 +701,17 @@ impl<T, A: Allocator> Buffer<T, A> {
             Some((prev_lo, prev_hi)) => (prev_lo.min(lo), prev_hi.max(hi)),
             None => (lo, hi),
         });
+    }
+
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn into_device(self) -> DeviceBuffer<T, A> {
+        DeviceBuffer {
+            data: self.data,
+            memory_kind: self.memory_kind,
+            _lease: self._lease,
+        }
     }
 }
 
