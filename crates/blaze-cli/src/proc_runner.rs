@@ -217,6 +217,11 @@ mod with_sandbox {
                             Some(why) => fail(format_args!("{why}")),
                             None => fail(format_args!("tree {tree} is not in the crate list")),
                         })?,
+                    crate::job_texts::Packs::Shared(shared) => shared.tree(cx, &frame, tree)
+                        .ok_or_else(|| match shared.refused() {
+                            Some(why) => fail(format_args!("{why}")),
+                            None => fail(format_args!("tree {tree} is not in the crate list")),
+                        })?,
                     crate::job_texts::Packs::Open(_) | crate::job_texts::Packs::OnFirstRead(_) => {
                         return Err(fail(format_args!("the names world never placed its package, so a proc macro called in it cannot be shown its files")));
                     }

@@ -21,7 +21,7 @@ blaze-cli	1	0	324	103
 blaze-columns	0	0	0	3
 blaze-cond	0	0	0	2
 blaze-consteval	0	0	0	4
-blaze-core	831	0	241	239
+blaze-core	829	0	241	239
 blaze-cunit	0	0	9	0
 blaze-dbsp	12	0	12	4
 blaze-deflate	0	0	0	1

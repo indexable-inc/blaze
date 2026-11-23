@@ -378,13 +378,18 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open(path: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
-    // SAFETY: a NUL-terminated path.
-    let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
-    if fd < 0 {
+    let fd = loop {
+        // SAFETY: a NUL-terminated path.
+        let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
+        if fd >= 0 {
+            break fd;
+        }
         let error = io::Error::last_os_error();
-        // alloc: an error path.
-        return Err(io::Error::new(error.kind(), format!("{}: {error}", path.to_string_lossy())));
-    }
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    };
     // SAFETY: the call returned a descriptor of its own.
     above_stdio(unsafe { OwnedFd::from_raw_fd(fd) })
 }
@@ -781,18 +786,24 @@ fn posix_spawn(
         check(unsafe { libc::posix_spawnattr_setflags(&mut attr, flags) })?;
         let mut pid = 0;
         while_busy(|| {
-            // SAFETY: a NUL-terminated path, the actions and attributes made above, and two
-            // NULL-terminated arrays of NUL-terminated strings kept by `plan`.
-            check(unsafe {
-                libc::posix_spawn(
-                    &mut pid,
-                    plan.program,
-                    &actions,
-                    &attr,
-                    plan.argv.as_ptr().cast(),
-                    plan.envp.as_ptr().cast(),
-                )
-            })
+            loop {
+                // SAFETY: a NUL-terminated path, the actions and attributes made above, and two
+                // NULL-terminated arrays of NUL-terminated strings kept by `plan`.
+                let result = check(unsafe {
+                    libc::posix_spawn(
+                        &mut pid,
+                        plan.program,
+                        &actions,
+                        &attr,
+                        plan.argv.as_ptr().cast(),
+                        plan.envp.as_ptr().cast(),
+                    )
+                });
+                if result.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::Interrupted) {
+                    continue;
+                }
+                return result;
+            }
         })?;
         Ok(pid)
     })();
