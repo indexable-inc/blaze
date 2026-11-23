@@ -425,25 +425,45 @@ impl Val {
     }
 }
 
-/// A place: an address, and a length for a slice's or `str`'s.
+/// A place: an address (an allocation and offset, or an integer address with `alloc == NO_ALLOC`
+/// when formed by dereferencing a provenance-free raw pointer), and a length for a slice's or
+/// `str`'s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Place {
-    ptr: Pointer,
-    meta: u64,
+    alloc: u32,
     has_meta: bool,
+    offset: u64,
+    meta: u64,
 }
 
 impl Place {
     #[inline(always)]
     fn of(ptr: Pointer) -> Place {
-        Place { ptr, meta: 0, has_meta: false }
+        Place { alloc: ptr.alloc.0, has_meta: false, offset: ptr.offset, meta: 0 }
     }
 
     #[inline(always)]
     fn with_meta(ptr: Pointer, meta: Option<u64>) -> Place {
         match meta {
-            Some(m) => Place { ptr, meta: m, has_meta: true },
-            None => Place { ptr, meta: 0, has_meta: false },
+            Some(m) => Place { alloc: ptr.alloc.0, has_meta: true, offset: ptr.offset, meta: m },
+            None => Place { alloc: ptr.alloc.0, has_meta: false, offset: ptr.offset, meta: 0 },
+        }
+    }
+
+    #[inline(always)]
+    fn from_int(addr: u64, meta: Option<u64>) -> Place {
+        match meta {
+            Some(m) => Place { alloc: NO_ALLOC, has_meta: true, offset: addr, meta: m },
+            None => Place { alloc: NO_ALLOC, has_meta: false, offset: addr, meta: 0 },
+        }
+    }
+
+    #[inline(always)]
+    fn ptr(self) -> Result<Pointer, Refusal<'static>> {
+        if self.alloc == NO_ALLOC {
+            Err(Refusal::IntAsPointer)
+        } else {
+            Ok(Pointer { alloc: AllocId(self.alloc), offset: self.offset })
         }
     }
 
@@ -878,8 +898,8 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 self.set(b, dst, Out::Place(pl));
             }
             Op::Static { dst, k } => {
-                let item = code.statics[k as usize];
-                let id = try_step!(self.static_alloc(item));
+                let (item, mutable) = code.statics[k as usize];
+                let id = try_step!(self.static_alloc(item, mutable));
                 self.set(b, dst, Out::Place(Place::of(Pointer { alloc: id, offset: 0 })));
             }
             Op::Load { dst, src, ty } => {
@@ -910,16 +930,21 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             }
             Op::Borrow { dst, src, meta } => {
                 let mut pl = try_step!(self.place(b, src));
-                match meta {
-                    Meta::Keep => {}
-                    Meta::Drop => pl.has_meta = false,
+                let raw = match meta {
+                    Meta::Keep => false,
+                    Meta::Drop => {
+                        pl.has_meta = false;
+                        false
+                    }
                     Meta::Need => {
                         if !pl.has_meta {
                             return self.fail(malformed("an unsized place with no length"));
                         }
+                        false
                     }
-                }
-                let v = try_step!(self.borrow(pl));
+                    Meta::Raw => true,
+                };
+                let v = try_step!(self.borrow(pl, raw));
                 self.set(b, dst, Out::val(v));
             }
             Op::Unsize { dst, src, n } => match try_step!(self.val(b, src)).as_scalar() {
@@ -981,13 +1006,15 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             Op::Field { dst, src, off, tail } => {
                 let pl = try_step!(self.place(b, src));
                 let meta = if tail { pl.meta() } else { None };
-                self.set(b, dst, Out::Place(Place::with_meta(pl.ptr.at(u64::from(off)), meta)));
+                let next = try_step!(self.place_offset(pl, u64::from(off), meta));
+                self.set(b, dst, Out::Place(next));
             }
             Op::FieldWide { dst, src, k, tail } => {
                 let pl = try_step!(self.place(b, src));
                 let off = code.u64s[k as usize];
                 let meta = if tail { pl.meta() } else { None };
-                self.set(b, dst, Out::Place(Place::with_meta(pl.ptr.at(off), meta)));
+                let next = try_step!(self.place_offset(pl, off, meta));
+                self.set(b, dst, Out::Place(next));
             }
             Op::Index { dst, k } => {
                 let idx = code.indexes[k as usize];
@@ -1001,21 +1028,27 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 if i >= u128::from(len) {
                     return self.fail(Stop::Refused(Refusal::IndexOutOfBounds { index: i as u64, len }));
                 }
-                self.set(b, dst, Out::Place(Place::of(pl.ptr.at(idx.size * i as u64))));
+                let Some(off) = idx.size.checked_mul(i as u64) else {
+                    return self.fail(Stop::Refused(Refusal::OutOfBounds { offset: u64::MAX, size: 0, len }));
+                };
+                let next = try_step!(self.place_offset(pl, off, None));
+                self.set(b, dst, Out::Place(next));
             }
             Op::FromEnd { dst, src, k } => {
                 let s = code.slice_ops[k as usize];
                 let pl = try_step!(self.place(b, src));
                 let len = try_step!(pl.meta().ok_or(malformed("a slice place with no length")));
                 let i = try_step!(len.checked_sub(s.back).ok_or(malformed("a slice pattern's element past a slice its length test let through")));
-                self.set(b, dst, Out::Place(Place::of(pl.ptr.at(s.size * i))));
+                let next = try_step!(self.place_offset(pl, s.size * i, None));
+                self.set(b, dst, Out::Place(next));
             }
             Op::Subslice { dst, src, k } => {
                 let s = code.slice_ops[k as usize];
                 let pl = try_step!(self.place(b, src));
                 let len = try_step!(pl.meta().ok_or(malformed("a slice place with no length")));
                 let left = try_step!(len.checked_sub(s.from + s.back).ok_or(malformed("a slice pattern's `..` past a slice its length test let through")));
-                self.set(b, dst, Out::Place(Place::with_meta(pl.ptr.at(s.size * s.from), Some(left))));
+                let next = try_step!(self.place_offset(pl, s.size * s.from, Some(left)));
+                self.set(b, dst, Out::Place(next));
             }
             Op::Build { dst, k } => {
                 let build = code.builds[k as usize];
@@ -1170,14 +1203,18 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             }
             Op::Copy { dst, src, size } => {
                 let (d, s) = (try_step!(self.place(b, dst)), try_step!(self.place(b, src)));
-                try_step!(self.ensure_loaded(s.ptr.alloc));
-                try_step!(self.work.mem.copy(s.ptr, d.ptr, u64::from(size)));
+                let (dp, sp) = (try_step!(d.ptr()), try_step!(s.ptr()));
+                try_step!(self.ensure_loaded(sp.alloc));
+                try_step!(self.ensure_loaded(dp.alloc));
+                try_step!(self.work.mem.copy(sp, dp, u64::from(size)));
             }
             Op::CopyWide { dst, src, k } => {
                 let size = code.u64s[k as usize];
                 let (d, s) = (try_step!(self.place(b, dst)), try_step!(self.place(b, src)));
-                try_step!(self.ensure_loaded(s.ptr.alloc));
-                try_step!(self.work.mem.copy(s.ptr, d.ptr, size));
+                let (dp, sp) = (try_step!(d.ptr()), try_step!(s.ptr()));
+                try_step!(self.ensure_loaded(sp.alloc));
+                try_step!(self.ensure_loaded(dp.alloc));
+                try_step!(self.work.mem.copy(sp, dp, size));
             }
             Op::Late { k } => {
                 // A pending stop made this code incomplete when it was compiled
@@ -1346,6 +1383,10 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     /// A static's or decoded record's allocation, its bytes loaded.
     fn ensure_loaded(&mut self, id: AllocId) -> R<'a, ()> {
         let a = self.work.mem.get(id)?;
+        if a.mut_static {
+            let Origin::Static(item) = a.origin else { return Err(malformed("a mutable static with no item")) };
+            return Err(Stop::Refused(Refusal::MutableStatic { item }));
+        }
         if a.loaded {
             return Ok(());
         }
@@ -1364,21 +1405,22 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     }
 
     fn load_i(&mut self, pl: Place, t: TyInfo) -> R<'a, Val> {
-        self.ensure_loaded(pl.ptr.alloc)?;
+        let ptr = pl.ptr()?;
+        self.ensure_loaded(ptr.alloc)?;
         Ok(match t.repr {
             Repr::Zst => {
-                self.work.mem.check_access(pl.ptr, 0)?;
+                self.work.mem.check_access(ptr, 0)?;
                 Val::Zst
             }
             Repr::Scalar(n) => {
-                let s = self.work.mem.read(pl.ptr, n)?;
+                let s = self.work.mem.read(ptr, n)?;
                 valid(s, t.valid)?;
                 Val::scalar(s)
             }
-            Repr::Pair => Val::pair(self.work.mem.read(pl.ptr, PTR)?, self.work.mem.read(pl.ptr.at(PTR), PTR)?),
+            Repr::Pair => Val::pair(self.work.mem.read(ptr, PTR)?, self.work.mem.read(ptr.at(PTR), PTR)?),
             Repr::Mem(n) => {
                 let to = self.temp_i(t)?;
-                self.work.mem.copy(pl.ptr, to, n)?;
+                self.work.mem.copy(ptr, to, n)?;
                 Val::Mem(to)
             }
         })
@@ -1390,19 +1432,21 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     }
 
     fn store_i(&mut self, pl: Place, t: TyInfo, v: Val) -> R<'a, ()> {
+        let ptr = pl.ptr()?;
+        self.ensure_loaded(ptr.alloc)?;
         match (t.repr, v) {
             (Repr::Zst, _) => Ok(()),
             (Repr::Scalar(n), v) => {
                 let Some(s) = v.as_scalar() else { return Err(malformed("a value of another shape than its type")) };
-                Ok(self.work.mem.write(pl.ptr, n, s)?)
+                Ok(self.work.mem.write(ptr, n, s)?)
             }
             (Repr::Pair, Val::Pair(pair)) => {
-                self.work.mem.write(pl.ptr, PTR, pair.first())?;
-                Ok(self.work.mem.write(pl.ptr.at(PTR), PTR, pair.second())?)
+                self.work.mem.write(ptr, PTR, pair.first())?;
+                Ok(self.work.mem.write(ptr.at(PTR), PTR, pair.second())?)
             }
             (Repr::Mem(n), Val::Mem(src)) => {
                 self.ensure_loaded(src.alloc)?;
-                Ok(self.work.mem.copy(src, pl.ptr, n)?)
+                Ok(self.work.mem.copy(src, ptr, n)?)
             }
             _ => Err(malformed("a value of another shape than its type")),
         }
@@ -1423,44 +1467,90 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         Ok(pl)
     }
 
-    /// The place a pointer value points to; checks the allocation is live.
-    fn deref(&mut self, v: Val) -> R<'a, Place> {
-        let (ptr, meta) = match v {
-            Val::Ptr(p) => (p, None),
-            Val::Pair(pair) => match (pair.first(), pair.second()) {
-                (Scalar::Ptr(p), Scalar::Int(n)) => (p, Some(n as u64)),
-                (Scalar::Int(_), _) => return Err(Stop::Refused(Refusal::IntAsPointer)),
-                _ => return Err(malformed("a dereference of a value that is not a pointer")),
-            },
-            Val::Int(_) | Val::Int128(_) => return Err(Stop::Refused(Refusal::IntAsPointer)),
+    /// The place a pointer value points to. Does not load or read the pointee: `&raw const *p`
+    /// may form a place from a null, integer, uninitialized, or dangling pointer without
+    /// dereferencing it; reads, writes, non-zero projections, and safe references check
+    /// provenance, liveness, and bounds.
+    fn deref(&self, v: Val) -> R<'a, Place> {
+        Ok(match v {
+            Val::Ptr(p) => Place::of(p),
+            Val::Int(addr) => Place::from_int(addr, None),
+            Val::Pair(pair) => {
+                let Scalar::Int(n) = pair.second() else {
+                    return Err(malformed("a dereference of a value that is not a pointer"));
+                };
+                let meta = Some(u64::try_from(n).map_err(|_| malformed("a wide pointer's length past `u64`"))?);
+                match pair.first() {
+                    Scalar::Ptr(p) => Place::with_meta(p, meta),
+                    Scalar::Int(addr) => {
+                        let addr = u64::try_from(addr).map_err(|_| Stop::Refused(Refusal::IntAsPointer))?;
+                        Place::from_int(addr, meta)
+                    }
+                }
+            }
+            Val::Int128(_) => return Err(Stop::Refused(Refusal::IntAsPointer)),
             _ => return Err(malformed("a dereference of a value that is not a pointer")),
-        };
-        self.ensure_loaded(ptr.alloc)?;
-        if !self.work.mem.get(ptr.alloc)?.live {
-            return Err(Stop::Refused(Refusal::Dangling));
-        }
-        Ok(Place::with_meta(ptr, meta))
+        })
     }
 
-    /// A reference to `pl`. A constant's value used as a place is a fresh temporary at each use
-    /// (the Reference, "Constant items": "constants are essentially inlined wherever they are
-    /// used"; "Temporaries"): borrowing it copies its decoded record into a temporary of its own,
-    /// so two borrows of one constant are two allocations, as two uses may be in the program,
-    /// and a write through `&mut` reaches only its own copy. Reads take the record in place.
-    fn borrow(&mut self, mut pl: Place) -> R<'a, Val> {
-        if self.work.decoded.iter().any(|&(_, id)| id == pl.ptr.alloc) {
+    /// Offsets a place by `off` bytes (field or index projection), replacing its metadata with
+    /// `meta`. A zero-byte projection preserves provenance-free and dangling places as Rust's
+    /// `&raw const (*p).first_field` allows; a non-zero projection requires a live allocation
+    /// and (when its size is loaded) stays within `0..=len`.
+    fn place_offset(&self, pl: Place, off: u64, meta: Option<u64>) -> R<'a, Place> {
+        if off == 0 {
+            return Ok(Place { alloc: pl.alloc, has_meta: meta.is_some(), offset: pl.offset, meta: meta.unwrap_or(0) });
+        }
+        let ptr = pl.ptr()?;
+        let a = self.work.mem.get(ptr.alloc)?;
+        if !a.live {
+            return Err(Stop::Refused(Refusal::Dangling));
+        }
+        let new_off = ptr.offset.checked_add(off).ok_or(Stop::Refused(Refusal::OutOfBounds {
+            offset: u64::MAX,
+            size: 0,
+            len: a.len(),
+        }))?;
+        if a.loaded && new_off > a.len() {
+            return Err(Stop::Refused(Refusal::OutOfBounds { offset: new_off, size: 0, len: a.len() }));
+        }
+        Ok(Place::with_meta(Pointer { alloc: ptr.alloc, offset: new_off }, meta))
+    }
+
+    /// A reference (`!raw`) or raw pointer (`raw`) to `pl`. A constant's value used as a place
+    /// is a fresh temporary at each use (the Reference, "Constant items": "constants are
+    /// essentially inlined wherever they are used"; "Temporaries"): borrowing it copies its
+    /// decoded record into a temporary of its own, so two borrows of one constant are two
+    /// allocations, as two uses may be in the program, and a write through `&mut` or `*mut`
+    /// reaches only its own copy. Reads take the record in place.
+    fn borrow(&mut self, mut pl: Place, raw: bool) -> R<'a, Val> {
+        if pl.alloc == NO_ALLOC {
+            if !raw {
+                return Err(Stop::Refused(Refusal::IntAsPointer));
+            }
+            return Ok(match pl.meta() {
+                Some(n) => Val::pair(Scalar::Int(u128::from(pl.offset)), Scalar::Int(u128::from(n))),
+                None => Val::Int(pl.offset),
+            });
+        }
+        let id = AllocId(pl.alloc);
+        if !raw && !self.work.mem.get(id)?.live {
+            return Err(Stop::Refused(Refusal::Dangling));
+        }
+        if self.work.decoded.iter().any(|&(_, d)| d == id) {
             let (size, align) = {
-                let a = self.work.mem.get(pl.ptr.alloc)?;
+                let a = self.work.mem.get(id)?;
                 (a.len(), a.align_log2)
             };
-            let id = self.work.mem.allocate(size, align, true, Origin::Data)?;
-            self.work.temps.push(id);
-            self.work.mem.copy(Pointer { alloc: pl.ptr.alloc, offset: 0 }, Pointer { alloc: id, offset: 0 }, size)?;
-            pl.ptr.alloc = id;
+            let copy = self.work.mem.allocate(size, align, true, Origin::Data)?;
+            self.work.temps.push(copy);
+            self.work.mem.copy(Pointer { alloc: id, offset: 0 }, Pointer { alloc: copy, offset: 0 }, size)?;
+            pl.alloc = copy.0;
         }
+        let ptr = Pointer { alloc: AllocId(pl.alloc), offset: pl.offset };
         Ok(match pl.meta() {
-            Some(n) => Val::pair(Scalar::Ptr(pl.ptr), Scalar::Int(u128::from(n))),
-            None => Val::Ptr(pl.ptr),
+            Some(n) => Val::pair(Scalar::Ptr(ptr), Scalar::Int(u128::from(n))),
+            None => Val::Ptr(ptr),
         })
     }
 
@@ -1478,12 +1568,17 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         Ok(Pointer { alloc: id, offset: 0 })
     }
 
-    fn static_alloc(&mut self, item: ItemKey) -> R<'a, AllocId> {
+    fn static_alloc(&mut self, item: ItemKey, mutable: bool) -> R<'a, AllocId> {
         if let Some(&(_, id)) = self.work.statics.iter().find(|(k, _)| *k == item) {
+            if mutable {
+                self.work.mem.get_mut(id)?.mut_static = true;
+            }
             return Ok(id);
         }
         let id = self.work.mem.allocate(0, 0, false, Origin::Static(item))?;
-        self.work.mem.get_mut(id)?.loaded = false;
+        let a = self.work.mem.get_mut(id)?;
+        a.loaded = false;
+        a.mut_static = mutable;
         self.work.statics.push((item, id));
         Ok(id)
     }
@@ -1513,7 +1608,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             for r in a.relocs.iter() {
                 let target = match r.target {
                     DataTarget::Local(j) => *ids.get(j as usize).ok_or(malformed("a relocation past its record"))?,
-                    DataTarget::Static(k) => self.static_alloc(k)?,
+                    DataTarget::Static(k) => self.static_alloc(k, false)?,
                     DataTarget::Fn(key) => {
                         let named = record.fn_named(key).ok_or(malformed("a record's fn word whose instance the record does not name"))?;
                         self.fn_ptr(named)?.alloc
@@ -1554,9 +1649,13 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             // No allocation is at address 0, so a pointer into one or one past its end is not
             // null; past that, its address is not known.
             (Scalar::Ptr(p), Scalar::Int(i)) | (Scalar::Int(i), Scalar::Ptr(p)) => {
-                self.ensure_loaded(p.alloc)?;
-                let len = self.work.mem.get(p.alloc)?.len();
-                if i == 0 && p.offset <= len { 0 } else { 2 }
+                if self.work.mem.get(p.alloc)?.mut_static {
+                    if i == 0 && p.offset == 0 { 0 } else { 2 }
+                } else {
+                    self.ensure_loaded(p.alloc)?;
+                    let len = self.work.mem.get(p.alloc)?.len();
+                    if i == 0 && p.offset <= len { 0 } else { 2 }
+                }
             }
             // One allocation: one base, so the addresses differ exactly when the offsets do.
             (Scalar::Ptr(p), Scalar::Ptr(q)) if p.alloc == q.alloc => u128::from(p.offset == q.offset),
@@ -1567,6 +1666,9 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             // with an equal fn, and one past the end of one may be the start of another: not
             // known.
             (Scalar::Ptr(p), Scalar::Ptr(q)) => {
+                if self.work.mem.get(p.alloc)?.mut_static || self.work.mem.get(q.alloc)?.mut_static {
+                    return Ok(2);
+                }
                 self.ensure_loaded(p.alloc)?;
                 self.ensure_loaded(q.alloc)?;
                 let (pa, qa) = (self.work.mem.get(p.alloc)?, self.work.mem.get(q.alloc)?);
@@ -1584,21 +1686,28 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     /// The variant of the enum value at `pl`, its tag read and decoded by `facts`: no layout
     /// lookup.
     fn variant_of(&mut self, pl: Place, facts: &EnumFacts, discrs: &[i128]) -> R<'a, u32> {
+        let ptr = pl.ptr()?;
         let bits = match facts.tag_at() {
-            Some((off, size)) => match self.read(pl.ptr.at(off), size)? {
+            Some((off, size)) => match self.read(ptr.at(off), size)? {
                 Scalar::Int(bits) => bits,
                 Scalar::Ptr(p) => {
-                    self.ensure_loaded(p.alloc)?;
-                    let len = self.work.mem.get(p.alloc)?.len();
-                    if p.offset <= len
-                        && let Some(v) = facts.ptr_variant()
-                    {
+                    let in_bounds = if self.work.mem.get(p.alloc)?.mut_static {
+                        p.offset == 0
+                    } else {
+                        self.ensure_loaded(p.alloc)?;
+                        p.offset <= self.work.mem.get(p.alloc)?.len()
+                    };
+                    if in_bounds && let Some(v) = facts.ptr_variant() {
                         return Ok(v);
                     }
                     return Err(Stop::Refused(Refusal::PointerAsInt));
                 }
             },
-            None => 0,
+            None => {
+                self.ensure_loaded(ptr.alloc)?;
+                self.work.mem.check_access(ptr, 0)?;
+                0
+            }
         };
         Ok(facts.variant(bits, discrs)?)
     }
@@ -1701,8 +1810,9 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         Ok(match (node, v) {
             (PNode::Ref(_, s), Val::Pair(pair)) if self.node(s)? == PNode::Str => {
                 let Scalar::Int(n) = pair.second() else { return Ok(PanicPart::Other) };
-                let pl = self.deref(Val::Pair(pair))?;
-                let slice = self.work.mem.read_bytes(pl.ptr, n as u64)?;
+                let ptr = self.deref(Val::Pair(pair))?.ptr()?;
+                self.ensure_loaded(ptr.alloc)?;
+                let slice = self.work.mem.read_bytes(ptr, n as u64)?;
                 let mut bytes = Vec::with_capacity_in(slice.len(), self.alloc);
                 bytes.extend_from_slice(slice);
                 PanicPart::Str(bytes)
@@ -1855,13 +1965,16 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 let (PNode::Ptr(_, pointee) | PNode::Ref(_, pointee)) = self.node(pt)? else { return Err(malformed("`offset` of a value that is not a pointer")) };
                 let (size, _) = self.size_align(pointee)?;
                 let Val::Ptr(p) = pv else { return Err(Stop::Refused(Refusal::IntAsPointer)) };
-                self.ensure_loaded(p.alloc)?;
-                let len = self.work.mem.get(p.alloc)?.len();
                 let count_signed = if csigned {
                     sext(count, ctbits)
                 } else {
-                    i128::try_from(count).map_err(|_| Stop::Refused(Refusal::OutOfBounds { offset: u64::MAX, size: 0, len }))?
+                    i128::try_from(count).map_err(|_| Stop::Refused(Refusal::OutOfBounds { offset: u64::MAX, size: 0, len: 0 }))?
                 };
+                if count_signed == 0 && self.work.mem.get(p.alloc)?.mut_static {
+                    return Ok(Val::Ptr(p));
+                }
+                self.ensure_loaded(p.alloc)?;
+                let len = self.work.mem.get(p.alloc)?.len();
                 let Some(delta) = count_signed.checked_mul(i128::from(size)) else {
                     return Err(Stop::Refused(Refusal::OutOfBounds { offset: u64::MAX, size: 0, len }));
                 };
@@ -2016,7 +2129,9 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     Intrinsic::RawEq => self.size_align(t0.ok_or(malformed("`raw_eq` with no type"))?)?.0,
                     _ => u64::try_from(int(2)?).map_err(|_| malformed("a `usize` past 64 bits"))?,
                 };
-                let (pa, pb) = (self.deref(a)?.ptr, self.deref(b)?.ptr);
+                let (pa, pb) = (self.deref(a)?.ptr()?, self.deref(b)?.ptr()?);
+                self.ensure_loaded(pa.alloc)?;
+                self.ensure_loaded(pb.alloc)?;
                 let left = self.work.mem.read_bytes(pa, n)?;
                 let right = self.work.mem.read_bytes(pb, n)?;
                 let order = blaze_build::intrinsics::byte_order(left, right);
@@ -2058,9 +2173,11 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 if n != m {
                     return Ok(false);
                 }
-                let (pa, pb) = (self.deref(Val::Pair(p))?, self.deref(Val::Pair(q))?);
-                let left = self.work.mem.read_bytes(pa.ptr, n as u64)?;
-                let right = self.work.mem.read_bytes(pb.ptr, m as u64)?;
+                let (pa, pb) = (self.deref(Val::Pair(p))?.ptr()?, self.deref(Val::Pair(q))?.ptr()?);
+                self.ensure_loaded(pa.alloc)?;
+                self.ensure_loaded(pb.alloc)?;
+                let left = self.work.mem.read_bytes(pa, n as u64)?;
+                let right = self.work.mem.read_bytes(pb, m as u64)?;
                 left == right
             }
             (Val::Zst, Val::Zst) => true,

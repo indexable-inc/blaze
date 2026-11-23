@@ -113,15 +113,18 @@ impl Num {
     }
 }
 
-/// How a borrow treats a place's length.
+/// How a borrow treats a place's length and validity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Meta {
-    /// `&x`: the place as it is.
+    /// `&x`: a safe reference, keeping the place's length as it is.
     Keep,
     /// An autoref to a sized pointee: no length.
     Drop,
     /// An autoref of an unsized place: it must have its length.
     Need,
+    /// `&raw const x` / `&raw mut x`: a raw pointer, keeping the place's length without
+    /// requiring provenance or a live allocation.
+    Raw,
 }
 
 /// One operation, packed to 16 bytes for L1 cache density. Wide immediates and rarely-used
@@ -319,7 +322,7 @@ pub(super) struct Code<A: Allocator + Clone> {
     pub(super) if_lens: Vec<(u64, bool), A>,
     pub(super) slice_ops: Vec<SliceOp, A>,
     pub(super) u64s: Vec<u64, A>,
-    pub(super) statics: Vec<ItemKey, A>,
+    pub(super) statics: Vec<(ItemKey, bool), A>,
     /// The constants it reads: item, arguments, record key.
     pub(super) consts: Vec<(ItemKey, List, RecordKey), A>,
     /// The fn pointers it makes: each one's key and the instance it was made from.
@@ -470,6 +473,7 @@ enum C {
     Binary(ExprId),
     Cast(ExprId),
     Ref(ExprId),
+    RawRef(ExprId),
     Deref(ExprId),
     Field(ExprId),
     Index(ExprId),
@@ -517,6 +521,7 @@ impl C {
             | C::Binary(e)
             | C::Cast(e)
             | C::Ref(e)
+            | C::RawRef(e)
             | C::Deref(e)
             | C::Field(e)
             | C::Index(e)
@@ -1616,6 +1621,12 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 self.emit(code, cc, Op::Borrow { dst, src, meta: Meta::Keep });
                 cc.rs.push(dst);
             }
+            C::RawRef(_) => {
+                let src = self.pop_r(cc)?;
+                let dst = self.reg(cc, Kind::V);
+                self.emit(code, cc, Op::Borrow { dst, src, meta: Meta::Raw });
+                cc.rs.push(dst);
+            }
             C::Deref(e) => {
                 let Expr::Unary { operand, .. } = self.expr_c(cc, e)? else { return Err(malformed("a deref task")) };
                 let t = self.final_ty_c(cc, operand)?;
@@ -2091,11 +2102,8 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                         cc.rs.push(dst);
                     }
                     Some(Def::Static(k, m)) => {
-                        if m == Mutbl::Mut {
-                            return Err(Stop::Refused(Refusal::MutableStatic { item: k }));
-                        }
                         let sk = code.statics.len() as u32;
-                        code.statics.push(k);
+                        code.statics.push((k, m == Mutbl::Mut));
                         let dst = self.reg(cc, Kind::P);
                         self.emit(code, cc, Op::Static { dst, k: sk });
                         cc.rs.push(dst);
@@ -2315,7 +2323,10 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             Expr::Underscore => return Err(unsupported("`_` (`_ = e`) in a constant")),
             // The Reference, inline-assembly: "asm! ... cannot be used in const contexts".
             Expr::Asm { .. } => return Err(unsupported("inline assembly in a constant")),
-            Expr::RawRef { .. } => return Err(unsupported("a raw borrow in a constant")),
+            Expr::RawRef { operand, .. } => {
+                cc.tasks.push(C::RawRef(e));
+                cc.tasks.push(C::Eval(operand, Mode::Place));
+            }
             // `offset_of!(T, a.0.b)`: a `usize`, the sum of each step's offset in the layout
             // ([`Self::offset_of`]). core's `ptr::read_unaligned` asserts
             // `mem::offset_of!(Unaligned::<T>, 0) == 0` in a `const { .. }` block at every `T`.
@@ -3088,6 +3099,7 @@ fn shape<'a>(task: C, typed: &Typed<'_>) -> R<'a, (u32, bool)> {
         | C::Unary(_)
         | C::Cast(_)
         | C::Ref(_)
+        | C::RawRef(_)
         | C::Deref(_)
         | C::Field(_)
         | C::Repeat(_)
