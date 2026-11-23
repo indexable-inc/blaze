@@ -221,10 +221,46 @@ pub struct FetchEnv<'f> {
     /// the fact shim (`blaze-fact-shim`) is looked for beside it (scripts.rs). A native script
     /// is refused naming why when it is not known.
     pub exe_dir: Result<&'f str, ExeDirWhy>,
+    /// Optional LAN UDP peer-to-peer `.crate` fetch configuration, read at the edge (rule 75:
+    /// `BLAZE_NO_LAN_PEER=1` disables it; disabled in offline unit tests).
+    pub lan_peer: LanPeerConfig,
     /// The process's heap, handed from `main` (D102, D120; never reached for deeper): what the
     /// command keeps beyond a task's frame (the lock, its plan, the fetch machine) and what a
     /// task hands to the store is made on it.
     pub heap: &'static blaze_own::Heap,
+}
+
+/// Configuration for optional parallel LAN UDP peer-to-peer `.crate` racing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LanPeerConfig {
+    /// Whether LAN UDP peer discovery is enabled.
+    pub enabled: bool,
+    /// UDP discovery port (default `blaze_fetch::peer::DEFAULT_UDP_PORT` = 41729).
+    pub udp_port: u16,
+    /// Optional direct unicast probe target (for deterministic loopback integration tests).
+    pub unicast_target: Option<core::net::SocketAddr>,
+}
+
+impl LanPeerConfig {
+    /// Default enabled configuration on port 41729.
+    pub const DEFAULT: LanPeerConfig = LanPeerConfig {
+        enabled: true,
+        udp_port: blaze_fetch::peer::DEFAULT_UDP_PORT,
+        unicast_target: None,
+    };
+
+    /// Disabled configuration (no UDP socket opened).
+    pub const DISABLED: LanPeerConfig = LanPeerConfig {
+        enabled: false,
+        udp_port: blaze_fetch::peer::DEFAULT_UDP_PORT,
+        unicast_target: None,
+    };
+
+    /// Parses `BLAZE_NO_LAN_PEER`: `"1"`, `"true"`, or `"yes"` disables LAN peer probing.
+    pub fn from_env(no_lan_peer: Option<&str>) -> LanPeerConfig {
+        let disabled = matches!(no_lan_peer, Some("1" | "true" | "TRUE" | "yes" | "YES"));
+        LanPeerConfig { enabled: !disabled, ..LanPeerConfig::DEFAULT }
+    }
 }
 
 /// Why the running blaze's own folder is not known (FetchEnv::exe_dir).
@@ -571,9 +607,10 @@ thread_local! {
 
 #[cfg(feature = "fetch")]
 mod net {
-    //! The machine and its IO: blaze-http's driver thread for HTTPS, the records' files, the
-    //! command's clock.
+    //! The machine and its IO: blaze-http's driver thread for HTTPS + optional parallel LAN peer
+    //! HTTP/UDP race, the records' files, the command's clock.
 
+    use core::net::{Ipv4Addr, SocketAddr};
     use std::collections::HashMap;
     use std::time::Duration;
 
@@ -582,10 +619,11 @@ mod net {
     use blaze_drive::fetch_task;
     use blaze_drive::{Kind as TaskKind, Name};
     use blaze_fetch::fetch::{Ask, Outcome};
+    use blaze_fetch::peer::{HAVE_MAX_BYTES, MULTICAST_GROUP, decode_has, encode_have};
     use blaze_fetch::plan::Unit;
     use blaze_fetch::{FetchIo, Limits, Machine, Method, NetFailure, Reply, Reserved, StoreFailure, Woke};
-    use blaze_http::driver::{Fetched, Handle};
-    use blaze_http::{Kind, Request, Step, mailbox};
+    use blaze_http::driver::{FetchEvent, Fetched, Handle, PeerDriver};
+    use blaze_http::{Kind, Proxies, Request, Step, mailbox};
     use blaze_ids::ContentId;
     use blaze_own::Alloc;
     use bstd::cx::Cx;
@@ -593,7 +631,7 @@ mod net {
 
     use blaze_fetch::local::{Miss, Tried, Try};
 
-    use super::{CargoCache, FetchEnv, STORE_PLACE, SOURCES, adopt_local, held_record, record_path, write_record};
+    use super::{CargoCache, FetchEnv, LanPeerConfig, STORE_PLACE, SOURCES, adopt_local, held_record, record_path, write_record};
     use crate::CliError;
 
     const USER_AGENT: &str = concat!("blaze/", env!("CARGO_PKG_VERSION"));
@@ -637,8 +675,16 @@ mod net {
         /// graph reaches it ([`Lockfile::want_ahead`]) or its task asks ([`Net::outcome`]), so
         /// a lock entry nothing reaches is never looked up or fetched.
         pub(super) fn new(units: &'f [Unit<'f, 'static>], env: &FetchEnv<'_>) -> Net<'f> {
-            let machine = Machine::wanting(units, Limits::REAL, env.heap.alloc());
-            let (to, answers) = blaze_core::chan::unbounded::<(u64, Fetched)>();
+            let mut lan = env.lan_peer;
+            #[cfg(test)]
+            if !super::NETWORK.get() {
+                lan.enabled = false;
+            }
+            let mut limits = Limits::REAL;
+            limits.peer_race = lan.enabled;
+            let alloc = env.heap.alloc();
+            let machine = Machine::wanting(units, limits, alloc);
+            let (to, answers) = blaze_core::chan::unbounded::<FetchEvent>();
             // The sources store beneath the home (`sources_native`). Empty with no home: then
             // every reservation fails as the store's, though `run` has stopped the command
             // first (`sources_dir` refuses no home).
@@ -653,15 +699,17 @@ mod net {
                 io: Io {
                     clock: env.clock.clone(),
                     client: None,
-                    to,
+                    to: Some(to),
                     answers,
+                    lan,
+                    heap: env.heap,
                     last: None,
                     kept: HashMap::new(),
                     disk: None,
                     sources,
                     cert_file: env.cert_file.map(std::ffi::OsString::from),
                     cert_dir: env.cert_dir.map(std::ffi::OsString::from),
-                    tried: blaze_own::Vec::new_in(env.heap.alloc()),
+                    tried: blaze_own::Vec::new_in(alloc),
                 },
                 steps: 0,
             }
@@ -717,8 +765,10 @@ mod net {
         clock: bstd::clock::Clock,
         /// Made at the first request, never when every unit's record stands.
         client: Option<Result<Handle, Untrusted>>,
-        to: blaze_core::chan::Sender<(u64, Fetched)>,
-        answers: blaze_core::chan::Receiver<(u64, Fetched)>,
+        to: Option<blaze_core::chan::Sender<FetchEvent>>,
+        answers: blaze_core::chan::Receiver<FetchEvent>,
+        lan: LanPeerConfig,
+        heap: &'static blaze_own::Heap,
         /// The answer the last wait gave: its unit and body.
         last: Option<(u32, std::vec::Vec<u8>)>,
         /// Answers kept for a reservation, by unit, until it is made.
@@ -733,6 +783,25 @@ mod net {
         /// For each unit whose `lookup` found it on no place of this machine: the places tried
         /// and what each gave, in words, for its finding if the network does not give it either.
         tried: blaze_own::Vec<(u32, blaze_own::String<Alloc<'static>>), Alloc<'static>>,
+    }
+
+    impl Io {
+        fn ensure_client(&mut self) -> Option<&Handle> {
+            if self.client.is_none() {
+                let to = self.to.take();
+                let made = match to {
+                    Some(events) => client(
+                        blaze_http::roots::Places { cert_file: self.cert_file.as_deref(), cert_dir: self.cert_dir.as_deref() },
+                        self.lan,
+                        events,
+                        self.heap,
+                    ),
+                    None => Err(Untrusted::Driver("fetch event sender already taken".into())),
+                };
+                self.client = Some(made);
+            }
+            self.client.as_ref().and_then(|res| res.as_ref().ok())
+        }
     }
 
     /// The IO for one task's steps: what the machine's effects need of this task's context.
@@ -804,11 +873,7 @@ mod net {
 
         fn send(&mut self, ask: Ask, method: Method, url: &str, headers: &[(&str, &str)], body: &[u8], most: u64, deadline_ns: u64) {
             let within = Duration::from_nanos(deadline_ns.saturating_sub(self.now()));
-            let (cert_file, cert_dir) = (self.io.cert_file.as_deref(), self.io.cert_dir.as_deref());
-            let client = self.io.client.get_or_insert_with(|| client(cert_file, cert_dir));
-            // No client: nothing is sent, and `Net::outcome` answers every unit still pending
-            // with why (not lasting: no record, so the next command asks again).
-            let Ok(handle) = client else { return };
+            let Some(handle) = self.io.ensure_client() else { return };
             let request = Request {
                 method: match method {
                     Method::Get => blaze_http::Method::Get,
@@ -822,7 +887,52 @@ mod net {
                 https_only: true,
                 range: None,
             };
-            handle.fetch(request, within, key_of(ask), &self.io.to);
+            handle.fetch_for_race(request, within, key_of(ask), false);
+        }
+
+        fn peer_probe(&mut self, nonce: u64, hashes: &[[u8; 32]]) {
+            if !self.io.lan.enabled {
+                return;
+            }
+            let lan = self.io.lan;
+            let Some(handle) = self.io.ensure_client() else { return };
+            let mut wire = [0u8; HAVE_MAX_BYTES];
+            let Some(len) = encode_have(nonce, hashes, &mut wire) else { return };
+            let Some(payload) = wire.get(..len) else { return };
+            if let Some(target) = lan.unicast_target {
+                handle.send_udp(&[target], payload);
+            } else {
+                let targets = [
+                    SocketAddr::from((MULTICAST_GROUP, lan.udp_port)),
+                    SocketAddr::from((Ipv4Addr::BROADCAST, lan.udp_port)),
+                ];
+                handle.send_udp(&targets, payload);
+            }
+        }
+
+        fn send_peer(&mut self, ask: Ask, url: &str, most: u64, deadline_ns: u64) {
+            if !self.io.lan.enabled {
+                return;
+            }
+            let within = Duration::from_nanos(deadline_ns.saturating_sub(self.now()));
+            let Some(handle) = self.io.ensure_client() else { return };
+            let request = Request {
+                method: blaze_http::Method::Get,
+                url: url.into(),
+                headers: Default::default(),
+                body: Default::default(),
+                gzip: false,
+                most,
+                https_only: false,
+                range: None,
+            };
+            handle.fetch_for_race(request, within, key_of(ask), true);
+        }
+
+        fn cancel(&mut self, ask: Ask) {
+            if let Some(Ok(handle)) = self.io.client.as_ref() {
+                handle.cancel_fetch(key_of(ask));
+            }
         }
 
         fn wait(&mut self, until_ns: Option<u64>) -> Woke<'_> {
@@ -832,7 +942,7 @@ mod net {
             }
             let wait = Duration::from_nanos(until_ns.map_or(STEP_MOST_NS, |at| at.saturating_sub(self.now())));
             match mailbox::answer("a dependency's HTTPS answer", &self.io.answers, wait) {
-                Ok(Some((key, fetched))) => {
+                Ok(Some(FetchEvent::Http { key, fetched })) => {
                     let ask = Ask { unit: (key >> 32) as u32, seq: key as u32 };
                     let reply = match fetched {
                         Fetched::Answered { status, body, .. } => {
@@ -844,7 +954,11 @@ mod net {
                     };
                     Woke::Answer { ask, reply }
                 }
-                // The channel's sender is held here, so it never closes while this waits.
+                Ok(Some(FetchEvent::Datagram { from, bytes })) => match decode_has(&bytes) {
+                    Some(has) => Woke::PeerReply { peer: from, has },
+                    None => Woke::Other,
+                },
+                // The channel's sender is held here or by the driver thread.
                 Ok(None) => Woke::Other,
                 Err(_due) => Woke::Due,
             }
@@ -925,16 +1039,46 @@ mod net {
         }
     }
 
-    /// The HTTPS client, made at the first request (never at start, and never when every
-    /// unit's record stands): the machine's roots read now, from where the environment points.
-    fn client(cert_file: Option<&std::ffi::OsStr>, cert_dir: Option<&std::ffi::OsStr>) -> Result<Handle, Untrusted> {
+    /// The HTTPS + optional LAN peer client, made at the first request (never at start, and never
+    /// when every unit's record stands): reads the machine's roots once and shares the single
+    /// `blaze_http::driver::Handle` driver thread with the non-blocking UDP probe socket.
+    fn client(
+        places: blaze_http::roots::Places<'_>,
+        lan: LanPeerConfig,
+        events: blaze_core::chan::Sender<FetchEvent>,
+        heap: &'static blaze_own::Heap,
+    ) -> Result<Handle, Untrusted> {
         #[cfg(test)]
         if !super::NETWORK.get() {
             return Err(Untrusted::Driver(std::string::String::from("no network in this test (fetch.rs `NETWORK`)")));
         }
-        let tls = blaze_http::roots::system(blaze_http::roots::Places { cert_file, cert_dir }).map_err(|setup| Untrusted::Tls(setup.to_string()))?;
-        let client = blaze_http::Client::new(blaze_http::Config::new(tls, USER_AGENT, Duration::from_secs(60)));
-        Handle::spawn(client, Limits::REAL.in_flight_most as usize).map_err(|error| Untrusted::Driver(error.to_string()))
+        fn tls_err(setup: impl core::fmt::Display) -> Untrusted {
+            Untrusted::Tls(setup.to_string())
+        }
+        let tls = blaze_http::roots::system(places).map_err(tls_err)?;
+        let wan = blaze_http::Client::new(blaze_http::Config::new(tls, USER_AGENT, Duration::from_secs(60)));
+        // LAN peer client: empty root store (plain HTTP only), 0 redirects (SSRF protection),
+        // no HTTP/SOCKS proxies, shorter stall timeout.
+        let peer_tls = blaze_http::roots::with_roots(blaze_http::roots::empty_roots()).map_err(tls_err)?;
+        let mut peer_cfg = blaze_http::Config::new(peer_tls, USER_AGENT, Duration::from_secs(15));
+        peer_cfg.redirects = 0;
+        peer_cfg.proxies = Proxies::none();
+        let peer_client = blaze_http::Client::new(peer_cfg);
+        let udp_bind = if lan.enabled {
+            let bind_ip = match lan.unicast_target {
+                Some(SocketAddr::V4(v4)) if v4.ip().is_loopback() => Ipv4Addr::LOCALHOST,
+                _ => Ipv4Addr::UNSPECIFIED,
+            };
+            Some(SocketAddr::from((bind_ip, 0)))
+        } else {
+            None
+        };
+        Handle::spawn_with_peer(
+            wan,
+            Limits::REAL.in_flight_most as usize,
+            PeerDriver { client: peer_client, udp_bind, events, heap },
+        )
+        .map_err(|error| Untrusted::Driver(error.to_string()))
     }
 
     fn key_of(ask: Ask) -> u64 {

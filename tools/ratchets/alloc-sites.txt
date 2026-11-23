@@ -83,7 +83,7 @@ blaze-source	2	0	4	8
 blaze-sql	0	0	1	0
 blaze-sqlite	0	0	15	5
 blaze-squeeze	0	0	10	16
-blaze-std	202	0	43	80
+blaze-std	200	0	43	80
 blaze-store-check	6	0	2	3
 blaze-text	0	0	0	1
 blaze-trace	0	0	0	2

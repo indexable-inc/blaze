@@ -579,7 +579,7 @@ fn served_run(tape: &Tape, fault: Fault) -> Result<(), Broke> {
         let (inbox, to, asking) = (Arc::clone(&inbox), to.clone(), url.clone());
         let key = i as u64;
         sim.wake_at(at, move || {
-            let asker = Asker::Collect { key, to, head: None, body: Vec::new_in(Global) };
+            let asker = Asker::Collect { key, to: super::CollectTo::Direct(to), head: None, body: Vec::new_in(Global) };
             inbox.post(Message::Ask { id: RequestId(key), request: Request::get(asking), within: None, asker });
         });
         posted.push((at, *what, url));
@@ -714,7 +714,7 @@ fn silent_run(seed: u64, plant: Plant) -> Option<(Duration, Fetched)> {
     let mut sim = Sim::new(seed, faults(0));
     let inbox = served(&mut sim, TIMEOUT * 3, TIMEOUT * 4);
     let (to, from) = chan::unbounded::<(u64, Fetched)>();
-    let asker = Asker::Collect { key: 0, to, head: None, body: Vec::new_in(Global) };
+    let asker = Asker::Collect { key: 0, to: super::CollectTo::Direct(to), head: None, body: Vec::new_in(Global) };
     inbox.post(Message::Ask { id: RequestId(0), request: Request::get("http://127.0.0.1:8080/silent/0"), within: None, asker });
     let mut core = Loop::new(client(), 0, IN_FLIGHT_MOST);
     core.plant(plant);

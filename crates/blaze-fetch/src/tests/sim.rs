@@ -506,6 +506,7 @@ fn run(
                     };
                     wire.push((now.saturating_add(latency), ask, fate, most, advert));
                 }
+                Effect::PeerProbe { .. } | Effect::Cancel { .. } => {}
             }
         }
         if machine.is_done() && !unwanted.is_empty() {

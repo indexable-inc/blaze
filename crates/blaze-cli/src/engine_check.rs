@@ -695,6 +695,7 @@ fn edge_at<'l, R>(
         start: served.root_text(),
         sdk,
         exe_dir: exe_dir.as_ref().map(|dir| dir.as_str()).map_err(|why| *why),
+        lan_peer: crate::fetch::LanPeerConfig::from_env(var("BLAZE_NO_LAN_PEER")),
     };
     let terminal = out.is_terminal();
     let caps = blaze_report::frame::detect(&var, terminal, out.size().map(|size| size.cols), flags.color);
@@ -988,6 +989,7 @@ pub(crate) struct Place<'f> {
     pub(crate) start: Option<&'f str>,
     pub(crate) sdk: Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>>,
     pub(crate) exe_dir: Result<&'f str, crate::fetch::ExeDirWhy>,
+    pub(crate) lan_peer: crate::fetch::LanPeerConfig,
 }
 
 impl<'f> Place<'f> {
@@ -1008,6 +1010,7 @@ impl<'f> Place<'f> {
             fs,
             sdk: self.sdk,
             exe_dir: self.exe_dir,
+            lan_peer: self.lan_peer,
             // PHASE-MEM-DEBT(Units): the fetches' and every stage's `handles.env.heap` (fetch.rs
             // `FetchEnv::heap`, `&'static Heap`): the stages put what they make on the process
             // heap through it; each becomes the phase's handle when its stage takes one (`kept

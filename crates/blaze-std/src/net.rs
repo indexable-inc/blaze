@@ -17,6 +17,9 @@
 //! There is no UDP socket ([`Net`]'s `Datagrams`) yet: blaze-core's `Effect` has no datagram
 //! effects (a bind of a UDP socket, a send to an address, a receive with its sender).
 
+mod datagrams;
+pub mod options;
+
 use alloc::{alloc::Global, boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::fmt;
 
@@ -24,7 +27,9 @@ use blaze_core::{
     Address, Done, Effect, Tag,
     trust::{Roots, TrustError},
 };
-pub use blaze_core::sockopt::{Ask, Linger, Tcp, TcpOptions};
+pub use blaze_core::dgram::{Batch, DgramError, Ecn, Head, Options as DgramOptions, Slots};
+pub use blaze_core::sockopt::{Ask, Linger, MulticastV4, Tcp, TcpOptions, UdpOptions};
+pub use datagrams::{Datagrams, DatagramsOrAccept, RecvArm};
 
 use crate::{
     Plant, Stopped,
@@ -46,6 +51,8 @@ pub enum Addr {
     Tcp(HostPort),
     /// A Unix socket beneath the driver's root.
     Unix(Path),
+    /// A UDP host and port.
+    Udp(HostPort),
 }
 
 impl Addr {
@@ -55,11 +62,15 @@ impl Addr {
             Addr::Tcp(at) => at.socket_addr().map(Address::Tcp),
             // clone: the socket's name, a refcount.
             Addr::Unix(path) => Some(Address::Unix(path.name().clone())),
+            Addr::Udp(_) => None,
         }
     }
 
-    /// The driver's address, or the error of `op` that it needs a name lookup.
+    /// The driver's address, or the error of `op` that it needs a name lookup or is not a stream.
     fn reach(&self, op: NetOp) -> Result<Address, NetError> {
+        if matches!(self, Addr::Udp(_)) {
+            return Err(error(op, self, NetKind::NotStream));
+        }
         self.address().ok_or_else(|| error(op, self, NetKind::NoLookup))
     }
 }
@@ -69,6 +80,7 @@ impl fmt::Display for Addr {
         match self {
             Addr::Tcp(at) => write!(f, "tcp:{at}"),
             Addr::Unix(path) => write!(f, "unix:{path}"),
+            Addr::Udp(at) => write!(f, "udp:{at}"),
         }
     }
 }
@@ -103,7 +115,7 @@ impl Allowed {
         match self {
             Allowed::Any => Allowed::Only(at.clone()),
             Allowed::Only(only) if only == at => Allowed::Only(at.clone()),
-            Allowed::Only(Addr::Tcp(..) | Addr::Unix(..)) | Allowed::Nothing => Allowed::Nothing,
+            Allowed::Only(Addr::Tcp(..) | Addr::Unix(..) | Addr::Udp(..)) | Allowed::Nothing => Allowed::Nothing,
         }
     }
 
@@ -125,9 +137,10 @@ pub enum NetOp {
     Connect,
     Listen,
     Accept,
+    Bind,
     Send,
     Recv,
-    /// [`Listener::close`].
+    /// [`Listener::close`] or [`Datagrams::close`].
     Close,
     /// [`Conn::finish`].
     Finish,
@@ -139,6 +152,14 @@ pub enum NetOp {
 pub enum NetKind {
     /// The capability does not reach the address (rule: narrowing never widens).
     NotAllowed,
+    /// A batch contained a datagram to a peer this `Net` does not reach.
+    PeerNotAllowed { peer: core::net::SocketAddr },
+    /// A UDP address was passed to a stream (`connect`/`listen`) operation.
+    NotStream,
+    /// A socket option was refused before the socket was made.
+    Unavailable(blaze_core::sockopt::Unavailable),
+    /// A datagram socket effect failed.
+    Datagrams(DgramError),
     /// The host is a DNS name, and blaze-core has no effect that looks one up yet.
     NoLookup,
     /// The name service has no such name.
@@ -169,6 +190,18 @@ impl fmt::Display for NetError {
         match &self.kind {
             NetKind::NotAllowed => {
                 write!(f, "bstd::net {op:?} to {addr}: this Net does not reach it (it was narrowed)")
+            }
+            NetKind::PeerNotAllowed { peer } => {
+                write!(f, "bstd::net {op:?} from {addr}: this Net does not reach peer {peer} (it was narrowed)")
+            }
+            NetKind::NotStream => {
+                write!(f, "bstd::net {op:?} to {addr}: a UDP address cannot be used for a stream socket")
+            }
+            NetKind::Unavailable(refused) => {
+                write!(f, "bstd::net {op:?} at {addr}: {refused}")
+            }
+            NetKind::Datagrams(failed) => {
+                write!(f, "bstd::net {op:?} at {addr}: {failed}")
             }
             NetKind::NoLookup => write!(
                 f,
@@ -218,6 +251,7 @@ pub struct Net {
     io: Io,
     connect: Allowed,
     listen: Allowed,
+    bind: Allowed,
     /// The bytes its connections may still send and receive, if it has a limit.
     budget: Option<Arc<Budget>>,
 }
@@ -227,7 +261,7 @@ impl Net {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub(crate) fn new(io: Io) -> Net {
-        Net { io, connect: Allowed::Any, listen: Allowed::Any, budget: None }
+        Net { io, connect: Allowed::Any, listen: Allowed::Any, bind: Allowed::Any, budget: None }
     }
 
     /// The world it is in.
@@ -248,13 +282,25 @@ impl Net {
     /// Connects only to `at`, of what this connects to, and listens nowhere.
     pub fn connect_only(&self, at: &Addr) -> Net {
         // clone: the budget shared, a refcount.
-        Net { io: self.io.clone(), connect: self.connect.narrowed(at), listen: Allowed::Nothing, budget: self.budget.clone() }
+        Net {
+            io: self.io.clone(),
+            connect: self.connect.narrowed(at),
+            listen: Allowed::Nothing,
+            bind: Allowed::Nothing,
+            budget: self.budget.clone(),
+        }
     }
 
     /// Listens only on `at`, of what this listens on, and connects nowhere.
     pub fn listen_only(&self, at: &Addr) -> Net {
         // clone: the budget shared, a refcount.
-        Net { io: self.io.clone(), connect: Allowed::Nothing, listen: self.listen.narrowed(at), budget: self.budget.clone() }
+        Net {
+            io: self.io.clone(),
+            connect: Allowed::Nothing,
+            listen: self.listen.narrowed(at),
+            bind: Allowed::Nothing,
+            budget: self.budget.clone(),
+        }
     }
 
     /// The same reach with a byte limit: every connection made from the `Net` this returns,
@@ -265,9 +311,9 @@ impl Net {
     /// way"). A rate limit is not written yet.
     pub fn limit(&self, bytes: u64) -> Net {
         // clone: authority held, narrowed: refcounts or copies.
-        let (connect, listen) = (self.connect.clone(), self.listen.clone());
+        let (connect, listen, bind) = (self.connect.clone(), self.listen.clone(), self.bind.clone());
         // clone: the budget this one is inside, a refcount.
-        Net { io: self.io.clone(), connect, listen, budget: Some(Budget::new(bytes, self.budget.clone())) }
+        Net { io: self.io.clone(), connect, listen, bind, budget: Some(Budget::new(bytes, self.budget.clone())) }
     }
 
     /// The bytes its connections may still send and receive; `None` with no limit.
@@ -412,10 +458,18 @@ impl Listener {
     /// The next connection made to it: finished with [`Conn::finish`].
     #[track_caller]
     pub fn accept(&mut self, cx: &Cx) -> Result<Conn, NetError> {
-        let listening = &mut self.listening;
         let done = cx
-            .wait(&listening.io, listening.tag, Ends::Stream)
+            .wait(&self.listening.io, self.listening.tag, Ends::Stream)
             .map_err(|stopped| error(NetOp::Accept, &self.at, NetKind::Stopped(stopped)))?;
+        self.accept_done(done)
+    }
+
+    pub(super) fn accept_tag(&self) -> Tag {
+        self.listening.tag
+    }
+
+    pub(super) fn accept_done(&mut self, done: Done) -> Result<Conn, NetError> {
+        let listening = &mut self.listening;
         match done {
             // clone: the connection's address, for its errors.
             Done::Accepted { conn } => Ok(Conn::new(&listening.io, conn, self.at.clone(), self.budget.clone())),

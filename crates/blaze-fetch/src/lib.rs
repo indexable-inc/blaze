@@ -41,6 +41,7 @@ pub mod fetch;
 pub mod index;
 pub mod local;
 pub mod pack;
+pub mod peer;
 pub mod plan;
 pub mod tree;
 pub mod unpack;

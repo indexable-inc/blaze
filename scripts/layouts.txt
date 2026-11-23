@@ -101,6 +101,8 @@ crates/blaze-fetch/src/index/record.rs	FORMAT	none
 crates/blaze-fetch/src/index/record.rs	MAGIC	none
 crates/blaze-fetch/src/index/record.rs	VERSION_ROW	none
 crates/blaze-fetch/src/pack.rs	MAGIC	none
+crates/blaze-fetch/src/peer.rs	MAGIC	not persisted: LAN UDP peer probe wire magic
+crates/blaze-fetch/src/peer.rs	VERSION	not persisted: LAN UDP peer probe wire version
 crates/blaze-fmt/src/cargo_fmt.rs	MESSAGE_FORMATS	not persisted: the values a flag takes
 crates/blaze-fmt/src/lib.rs	RUSTFMT_VERSION	not persisted: the rustfmt release followed
 crates/blaze-format-core/src/declared.rs	SCHEMA	none

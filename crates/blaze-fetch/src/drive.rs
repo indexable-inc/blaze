@@ -6,10 +6,13 @@
 
 #![blaze::sans_io]
 
+use core::net::SocketAddr;
+
 use blaze_ids::ContentId;
 use blaze_own::{AVec, Vec};
 
 use crate::fetch::{Adopt, Ask, Effect, LocalArchive, Machine, Method, Reply, StoreFailure};
+use crate::peer::HasPacket;
 use crate::plan::Unit;
 
 /// What became of a reservation ([`FetchIo::reserve`]).
@@ -30,6 +33,8 @@ pub enum Woke<'b> {
     /// An answer to `ask`, its body the IO's until its next wait. No time with it: the machine
     /// tries once (D172), so nothing it does waits on when an answer came.
     Answer { ask: Ask, reply: Reply<'b> },
+    /// A unicast UDP `HAS` reply from a LAN peer (`peer` is the packet source address).
+    PeerReply { peer: SocketAddr, has: HasPacket },
     /// The time given passed with no answer.
     Due,
     /// Something of the caller's (a unit wanted): no answer.
@@ -75,6 +80,15 @@ pub trait FetchIo {
     fn local_archive(&mut self, _name: &str, _version: &str, _out: &mut AVec<'_, u8>) -> LocalArchive {
         LocalArchive::Absent
     }
+    /// Fire-and-forget LAN UDP `HAVE` probe for up to 32 crate SHA-256 digests. Drivers without
+    /// LAN peer discovery do nothing (zero overhead).
+    fn peer_probe(&mut self, _nonce: u64, _hashes: &[[u8; 32]]) {}
+    /// Plain-HTTP `GET` to a LAN peer (`https_only: false`, `redirects: 0`). Drivers without
+    /// LAN peer support do nothing.
+    fn send_peer(&mut self, _ask: Ask, _url: &str, _most: u64, _deadline_ns: u64) {}
+    /// Cancels an in-flight HTTP request (`ask`) once its racing counterpart won or its peer
+    /// was banned/timed out.
+    fn cancel(&mut self, _ask: Ask) {}
 }
 
 /// Carries out every effect `machine` has now, then, unless it is done, waits once: for an
@@ -102,8 +116,18 @@ pub fn step<I: FetchIo + ?Sized>(machine: &mut Machine<'_, '_, '_>, io: &mut I, 
                     Reserved::Unkept(failure) => machine.stored(unit, Err(failure)),
                 }
             }
-            Effect::Http { ask, method, url, headers, body, most, deadline_ns } => {
-                io.send(ask, method, url.as_str(), headers, body.as_slice(), most, deadline_ns);
+            Effect::Http { ask, method, url, headers, body, most, deadline_ns, https_only, .. } => {
+                if https_only {
+                    io.send(ask, method, url.as_str(), headers, body.as_slice(), most, deadline_ns);
+                } else {
+                    io.send_peer(ask, url.as_str(), most, deadline_ns);
+                }
+            }
+            Effect::PeerProbe { nonce, hashes } => {
+                io.peer_probe(nonce, hashes.as_slice());
+            }
+            Effect::Cancel { ask } => {
+                io.cancel(ask);
             }
             Effect::Local { unit } => {
                 let mut archive = Vec::new_in(machine.alloc());
@@ -132,10 +156,16 @@ pub fn step<I: FetchIo + ?Sized>(machine: &mut Machine<'_, '_, '_>, io: &mut I, 
         return;
     }
     let until = Some(machine.next_deadline().unwrap_or_else(|| io.now().saturating_add(wait_most_ns)));
-    if let Woke::Answer { ask, reply } = io.wait(until) {
-        machine.answered(ask, reply);
-        if machine.reserving(ask.unit) {
-            io.keep(ask.unit);
+    match io.wait(until) {
+        Woke::Answer { ask, reply } => {
+            machine.answered(ask, reply);
+            if machine.reserving(ask.unit) {
+                io.keep(ask.unit);
+            }
         }
+        Woke::PeerReply { peer, has } => {
+            machine.peer_replied(peer, has, io.now());
+        }
+        Woke::Due | Woke::Other => {}
     }
 }

@@ -29,7 +29,7 @@ use blaze_core::{
 };
 
 // `Arc` is net.rs's import: the budget's shared form there.
-use super::{Addr, Allowed, Arc, HostPort, Net, NetError, NetKind, NetOp, error, options, unexpected};
+use super::{Addr, Allowed, Arc, Conn, HostPort, Listener, Net, NetError, NetKind, NetOp, error, options, unexpected};
 use crate::{
     Plant,
     budget::Budget,
@@ -225,7 +225,7 @@ impl Datagrams {
                 _ => Ok(batch),
             },
             Done::DatagramsFailed { error: failed, .. } => {
-                Err(error(NetOp::Send, &self.addr, NetKind::Datagrams(failed)))
+                Err(error(NetOp::Send, &self.addr, NetKind::Datagrams(*failed)))
             }
             done => Err(unexpected(NetOp::Send, &self.addr, done)),
         }
@@ -253,7 +253,7 @@ impl Datagrams {
                 return Err(error(NetOp::Recv, &self.addr, NetKind::OverLimit(over)));
             }
             // Below `slots.most`, so it fits a u16.
-            slots.most = fit.min(u64::from(slots.most)) as u16;
+            slots.most = u16::try_from(fit.min(u64::from(slots.most))).unwrap_or(slots.most);
             taken = u64::from(slots.most) * u64::from(slots.size);
             budget.take(taken).map_err(|over| error(NetOp::Recv, &self.addr, NetKind::OverLimit(over)))?;
         }
@@ -282,7 +282,7 @@ impl Datagrams {
             }
             Done::DatagramsFailed { error: failed, .. } => {
                 unused(0);
-                Err(error(NetOp::Recv, &self.addr, NetKind::Datagrams(failed)))
+                Err(error(NetOp::Recv, &self.addr, NetKind::Datagrams(*failed)))
             }
             done => {
                 unused(0);
@@ -307,6 +307,111 @@ impl Datagrams {
             Done::Unbound => Ok(()),
             done => Err(unexpected(NetOp::Close, &self.addr, done)),
         }
+    }
+}
+
+/// Outcome of waiting simultaneously on a UDP socket and a TCP listener ([`RecvArm::wait_or_accept`]).
+pub enum DatagramsOrAccept {
+    /// One or more UDP datagrams arrived.
+    Datagrams(Batch),
+    /// A TCP client connected to the listener.
+    Accepted(Conn),
+}
+
+/// Keeps a single `Effect::RecvFrom` armed across TCP accepts and poll deadlines so no UDP
+/// datagram is ever forgotten or dropped between iterations on a single-driver event loop.
+pub struct RecvArm {
+    tag: Option<Tag>,
+    taken: u64,
+}
+
+impl RecvArm {
+    pub const fn new() -> RecvArm {
+        RecvArm { tag: None, taken: 0 }
+    }
+
+    /// Waits for either a UDP datagram on `udp` or an incoming TCP connection on `listener`,
+    /// reusing the same in-flight `Effect::RecvFrom` tag whenever `listener` fires or `cx`
+    /// hits a deadline.
+    pub fn wait_or_accept(
+        &mut self,
+        cx: &Cx,
+        udp: &Datagrams,
+        listener: &mut Listener,
+        into: &mut Option<Batch>,
+        slots: Slots,
+    ) -> Result<DatagramsOrAccept, NetError> {
+        let io = &udp.socket.io;
+        cx.stopped_by(io.now()).map_err(|stopped| error(NetOp::Recv, &udp.addr, NetKind::Stopped(stopped)))?;
+        let udp_tag = match self.tag {
+            Some(tag) => tag,
+            None => {
+                let budget = udp.budget.as_deref();
+                let mut slots = slots;
+                let mut taken = 0u64;
+                if let Some(budget) = budget {
+                    let fit = budget.left() / u64::from(slots.size.max(1));
+                    if fit == 0 {
+                        let over = budget.over(u64::from(slots.size));
+                        return Err(error(NetOp::Recv, &udp.addr, NetKind::OverLimit(over)));
+                    }
+                    slots.most = u16::try_from(fit.min(u64::from(slots.most))).unwrap_or(slots.most);
+                    taken = u64::from(slots.most) * u64::from(slots.size);
+                    budget.take(taken).map_err(|over| error(NetOp::Recv, &udp.addr, NetKind::OverLimit(over)))?;
+                }
+                let batch = into.take().unwrap_or_else(Batch::new);
+                let sock = udp.socket.sock;
+                let tag = io.submit(|tag| Effect::RecvFrom { sock, into: batch, slots, tag });
+                self.tag = Some(tag);
+                self.taken = taken;
+                tag
+            }
+        };
+        let tags = [udp_tag, listener.accept_tag()];
+        match cx.wait_any(io, &tags) {
+            Ok((0, done)) => {
+                self.tag = None;
+                let taken = core::mem::replace(&mut self.taken, 0);
+                let unused = |came: u64| {
+                    if let Some(budget) = udp.budget.as_deref() {
+                        budget.give_back(taken - came.min(taken));
+                    }
+                };
+                match done {
+                    Done::Datagrams(batch) => {
+                        unused(carried(&batch));
+                        Ok(DatagramsOrAccept::Datagrams(batch))
+                    }
+                    Done::DatagramsFailed { error: failed, .. } => {
+                        unused(0);
+                        Err(error(NetOp::Recv, &udp.addr, NetKind::Datagrams(*failed)))
+                    }
+                    done => {
+                        unused(0);
+                        Err(unexpected(NetOp::Recv, &udp.addr, done))
+                    }
+                }
+            }
+            Ok((_, done)) => listener.accept_done(done).map(DatagramsOrAccept::Accepted),
+            Err(stopped) => Err(error(NetOp::Recv, &udp.addr, NetKind::Stopped(stopped))),
+        }
+    }
+
+    /// Forgets any armed `Effect::RecvFrom` before closing `udp`.
+    pub fn disarm(&mut self, udp: &Datagrams) {
+        if let Some(tag) = self.tag.take() {
+            udp.socket.io.forget(tag, Ends::Once);
+            let taken = core::mem::replace(&mut self.taken, 0);
+            if let Some(budget) = udp.budget.as_deref() {
+                budget.give_back(taken);
+            }
+        }
+    }
+}
+
+impl Default for RecvArm {
+    fn default() -> RecvArm {
+        RecvArm::new()
     }
 }
 

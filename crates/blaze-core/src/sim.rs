@@ -3464,17 +3464,25 @@ impl Sim {
         first.into_iter().chain(self.first_landing()).chain(self.told.iter().map(|it| it.at)).min()
     }
 
-    /// The poll of a simulation that keeps no waker: as it always was.
+    /// The poll of a simulation that keeps no waker: advances until at least one completion is
+    /// delivered, nothing more is due, or `until` is reached (a datagram landing at `first`
+    /// queues a `RecvFrom` completion at `first + delay`, which the next turn collects).
     fn poll_without_wakes(&mut self, out: &mut Vec<Completion>, until: Deadline) {
-        let Some(first) = self.first_due() else { return };
-        if first > self.now {
-            self.now = self.wait(first, until);
-            self.disk.at(self.wall_ns());
-            if self.now < first {
+        let before = out.len();
+        for _ in 0..POLL_TURNS_MOST {
+            let Some(first) = self.first_due() else { return };
+            if first > self.now {
+                self.now = self.wait(first, until);
+                self.disk.at(self.wall_ns());
+                if self.now < first {
+                    return;
+                }
+            }
+            self.collect(out);
+            if out.len() > before {
                 return;
             }
         }
-        self.collect(out);
     }
 
     /// The poll of a simulation whose waker may be handed out: the look, the park and the

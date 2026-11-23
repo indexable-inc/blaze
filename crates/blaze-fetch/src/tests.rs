@@ -6,6 +6,7 @@ use crate::tree::{self, Entry, Kind};
 
 mod index;
 mod local_step;
+mod peer_race;
 mod sim;
 
 #[test]

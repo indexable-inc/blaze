@@ -253,6 +253,18 @@ pub struct linger {
     pub l_linger: c_int,
 }
 
+/// `struct ip_mreq` (netinet/in.h): `IP_ADD_MEMBERSHIP`'s value — an IPv4 multicast group and
+/// the local interface address to join it on.
+/// replaces libc::ip_mreq
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(C)]
+pub struct ip_mreq {
+    /// IPv4 multicast group address, network byte order.
+    pub imr_multiaddr: in_addr,
+    /// Local interface IPv4 address (`INADDR_ANY` = 0 for default), network byte order.
+    pub imr_interface: in_addr,
+}
+
 // ---------------------------------------------------------------------------------------------
 // Messages and control messages.
 // ---------------------------------------------------------------------------------------------
@@ -518,6 +530,7 @@ mod sol {
     pub const SO_REUSEADDR: c_int = 2;
     pub const SO_TYPE: c_int = 3;
     pub const SO_ERROR: c_int = 4;
+    pub const SO_BROADCAST: c_int = 6;
     pub const SO_SNDBUF: c_int = 7;
     pub const SO_RCVBUF: c_int = 8;
     pub const SO_KEEPALIVE: c_int = 9;
@@ -532,6 +545,7 @@ mod sol {
     pub const SO_ACCEPTCONN: c_int = 0x0002;
     pub const SO_REUSEADDR: c_int = 0x0004;
     pub const SO_KEEPALIVE: c_int = 0x0008;
+    pub const SO_BROADCAST: c_int = 0x0020;
     pub const SO_LINGER: c_int = 0x0080;
     pub const SO_REUSEPORT: c_int = 0x0200;
     pub const SO_SNDBUF: c_int = 0x1001;
@@ -554,6 +568,9 @@ pub const SO_TYPE: c_int = sol::SO_TYPE;
 /// `SO_ERROR`: the pending error, cleared by the read ([`pending_error`]).
 /// replaces libc::SO_ERROR
 pub const SO_ERROR: c_int = sol::SO_ERROR;
+/// `SO_BROADCAST`: permit sending broadcast datagrams on a datagram socket.
+/// replaces libc::SO_BROADCAST
+pub const SO_BROADCAST: c_int = sol::SO_BROADCAST;
 /// `SO_SNDBUF`.
 /// replaces libc::SO_SNDBUF
 pub const SO_SNDBUF: c_int = sol::SO_SNDBUF;
@@ -677,6 +694,30 @@ pub const IP_RECVTOS: c_int = 27;
 /// replaces libc::IP_DONTFRAG
 #[cfg(target_os = "macos")]
 pub const IP_DONTFRAG: c_int = 28;
+/// `IP_MULTICAST_TTL` (netinet/in.h): hop limit for outgoing IPv4 multicast datagrams.
+/// replaces libc::IP_MULTICAST_TTL
+#[cfg(target_os = "linux")]
+pub const IP_MULTICAST_TTL: c_int = 33;
+/// `IP_MULTICAST_TTL` (netinet/in.h): hop limit for outgoing IPv4 multicast datagrams.
+/// replaces libc::IP_MULTICAST_TTL
+#[cfg(target_os = "macos")]
+pub const IP_MULTICAST_TTL: c_int = 10;
+/// `IP_MULTICAST_LOOP` (netinet/in.h): whether outgoing IPv4 multicast datagrams loop back to local sockets.
+/// replaces libc::IP_MULTICAST_LOOP
+#[cfg(target_os = "linux")]
+pub const IP_MULTICAST_LOOP: c_int = 34;
+/// `IP_MULTICAST_LOOP` (netinet/in.h): whether outgoing IPv4 multicast datagrams loop back to local sockets.
+/// replaces libc::IP_MULTICAST_LOOP
+#[cfg(target_os = "macos")]
+pub const IP_MULTICAST_LOOP: c_int = 11;
+/// `IP_ADD_MEMBERSHIP` (netinet/in.h): join an IPv4 multicast group ([`ip_mreq`]).
+/// replaces libc::IP_ADD_MEMBERSHIP
+#[cfg(target_os = "linux")]
+pub const IP_ADD_MEMBERSHIP: c_int = 35;
+/// `IP_ADD_MEMBERSHIP` (netinet/in.h): join an IPv4 multicast group ([`ip_mreq`]).
+/// replaces libc::IP_ADD_MEMBERSHIP
+#[cfg(target_os = "macos")]
+pub const IP_ADD_MEMBERSHIP: c_int = 12;
 
 /// `IP_PMTUDISC_DONT` (bits/in.h, Linux).
 /// replaces libc::IP_PMTUDISC_DONT
@@ -1621,6 +1662,7 @@ mod tests {
         same_layout!(in_pktinfo: ipi_ifindex, ipi_spec_dst, ipi_addr);
         same_layout!(in6_pktinfo: ipi6_addr, ipi6_ifindex);
         same_layout!(linger: l_onoff, l_linger);
+        same_layout!(ip_mreq: imr_multiaddr, imr_interface);
         same_layout!(msghdr: msg_name, msg_namelen, msg_iov, msg_iovlen, msg_control, msg_controllen, msg_flags);
         same_layout!(cmsghdr: cmsg_len, cmsg_level, cmsg_type);
         #[cfg(target_os = "linux")]
@@ -1641,11 +1683,12 @@ mod tests {
     fn constants_are_libc_s() {
         same_value!(
             AF_UNIX, AF_INET, AF_INET6, SOCK_STREAM, SOCK_DGRAM, SOMAXCONN, SHUT_RDWR, IPPROTO_IP,
-            IPPROTO_TCP, IPPROTO_IPV6, SOL_SOCKET, SO_REUSEADDR, SO_TYPE, SO_ERROR, SO_SNDBUF,
-            SO_RCVBUF, SO_KEEPALIVE, SO_LINGER, SO_REUSEPORT, SO_ACCEPTCONN, TCP_NODELAY,
-            TCP_KEEPINTVL, TCP_KEEPCNT, TCP_FASTOPEN, IP_TOS, IP_PKTINFO, IP_RECVTOS, IPV6_TCLASS,
-            IPV6_RECVTCLASS, IPV6_PKTINFO, IPV6_RECVPKTINFO, IPV6_DONTFRAG, MSG_TRUNC, MSG_NOSIGNAL,
-            MSG_CTRUNC, SCM_RIGHTS, SO_RCVTIMEO, SO_SNDTIMEO,
+            IPPROTO_TCP, IPPROTO_IPV6, SOL_SOCKET, SO_REUSEADDR, SO_TYPE, SO_ERROR, SO_BROADCAST,
+            SO_SNDBUF, SO_RCVBUF, SO_KEEPALIVE, SO_LINGER, SO_REUSEPORT, SO_ACCEPTCONN,
+            TCP_NODELAY, TCP_KEEPINTVL, TCP_KEEPCNT, TCP_FASTOPEN, IP_TOS, IP_PKTINFO, IP_RECVTOS,
+            IP_MULTICAST_TTL, IP_MULTICAST_LOOP, IP_ADD_MEMBERSHIP, IPV6_TCLASS, IPV6_RECVTCLASS,
+            IPV6_PKTINFO, IPV6_RECVPKTINFO, IPV6_DONTFRAG, MSG_TRUNC, MSG_NOSIGNAL, MSG_CTRUNC,
+            SCM_RIGHTS, SO_RCVTIMEO, SO_SNDTIMEO,
         );
         // Lane D2's rows.
         same_value!(IPV6_V6ONLY);

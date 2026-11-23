@@ -17,12 +17,12 @@
 //!
 //! Prints "datagrams: narrowing and the byte limit held over 150 plans" from the property.
 
-use std::{collections::BTreeSet, net::SocketAddr, time::Duration};
+use core::{net::SocketAddr, time::Duration};
 
 use blaze_core::dgram::{Batch, Ecn, Options, Slots};
 use blaze_sim::{Config, Tape};
 
-use super::{check, control, root, world};
+use super::{Outcome, check, control, root, world};
 use crate::{
     Cx, Plant,
     io::Io,
@@ -40,6 +40,32 @@ const MARKER: &str = "127.0.0.1:7003";
 const SLOTS: Slots = Slots { most: 4, size: 64 };
 /// The first byte of an end marker: no send has this index.
 const END: u8 = 0xFF;
+const MAX_STEPS: usize = 24;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Bits(u32);
+
+impl Bits {
+    const EMPTY: Bits = Bits(0);
+
+    fn insert(&mut self, idx: u8) {
+        if idx < 32 {
+            self.0 |= 1u32 << idx;
+        }
+    }
+
+    fn contains(&self, idx: u8) -> bool {
+        idx < 32 && (self.0 & (1u32 << idx)) != 0
+    }
+
+    fn is_subset(&self, other: Bits) -> bool {
+        (self.0 & other.0) == self.0
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum Step {
@@ -58,14 +84,17 @@ enum Step {
 struct Plan {
     seed: u64,
     limit: u64,
-    steps: Vec<Step>,
+    steps: [Step; MAX_STEPS],
+    len: usize,
 }
 
 fn plan(tape: &Tape) -> Plan {
     let seed = tape.next_u64("sim seed");
     let limit = tape.int_in(0..=400u64, "limit");
-    let steps = (0..tape.int_in(1..=24u64, "steps"))
-        .map(|_| match tape.int_in(0..=5u64, "step") {
+    let len = usize::try_from(tape.int_in(1..=MAX_STEPS as u64, "steps")).unwrap_or(1);
+    let mut steps = [Step::Recv; MAX_STEPS];
+    for slot in &mut steps[..len] {
+        *slot = match tape.int_in(0..=5u64, "step") {
             0 | 1 => Step::Send {
                 lens: [
                     tape.int_in(1..=48u64, "len a") as u8,
@@ -78,9 +107,9 @@ fn plan(tape: &Tape) -> Plan {
             2 | 3 => Step::PeerSends(tape.int_in(1..=48u64, "peer len") as u8),
             4 => Step::Recv,
             _ => Step::BindElsewhere,
-        })
-        .collect();
-    Plan { seed, limit, steps }
+        };
+    }
+    Plan { seed, limit, steps, len }
 }
 
 fn host(raw: &str) -> HostPort {
@@ -94,19 +123,17 @@ fn socket(raw: &str) -> SocketAddr {
 /// Datagrams `ours` receives until an end marker came and every index of `want` was seen:
 /// the indices seen, each once. A receive that stops (the deadline: something never came)
 /// is the oracle's finding.
-fn drain(cx: &Cx, ours: &Datagrams, want: &BTreeSet<u8>, who: &str) -> Result<BTreeSet<u8>, String> {
-    let (mut seen, mut ended) = (BTreeSet::new(), false);
+fn drain(cx: &Cx, ours: &Datagrams, want: Bits, who: &str) -> Outcome<Bits> {
+    let (mut seen, mut ended) = (Bits::EMPTY, false);
     let mut into = Batch::new();
-    while !(ended && want.is_subset(&seen)) {
+    while !(ended && want.is_subset(seen)) {
         let batch = ours.recv(cx, into, SLOTS).map_err(|error| {
             format!("{who} waited for sends {want:?} and saw {seen:?} (end marker {ended}): {error}")
         })?;
         for (_, datagram) in batch.each() {
             match datagram.first() {
                 Some(&END) => ended = true,
-                Some(&index) => {
-                    seen.insert(index);
-                }
+                Some(&index) => seen.insert(index),
                 None => return Err(format!("{who} received an empty datagram")),
             }
         }
@@ -117,11 +144,13 @@ fn drain(cx: &Cx, ours: &Datagrams, want: &BTreeSet<u8>, who: &str) -> Result<BT
 
 /// The steps on `mine` (the limited, narrowed socket) and `peer`; then the oracle against
 /// what `peer` and `other` received.
-fn steps(plan: &Plan, cx: &Cx, net: &Net, mine: &Datagrams, peer: &Datagrams, other: &Datagrams, marker: &Datagrams) -> Result<(), String> {
-    let (mut used, mut let_through, mut refused) = (0u64, BTreeSet::new(), BTreeSet::new());
+fn steps(plan: &Plan, cx: &Cx, net: &Net, mine: &Datagrams, peer: &Datagrams, other: &Datagrams, marker: &Datagrams) -> Outcome {
+    let (mut used, mut let_through, mut refused) = (0u64, Bits::EMPTY, Bits::EMPTY);
     // The lengths the peer sent the limited socket and it has not received yet, in order.
-    let mut queued: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
-    for (index, step) in plan.steps.iter().enumerate() {
+    let mut queued = [0u64; MAX_STEPS];
+    let mut q_head = 0usize;
+    let mut q_tail = 0usize;
+    for (index, step) in plan.steps[..plan.len].iter().enumerate() {
         let index = index as u8;
         match *step {
             Step::Send { lens, count, to_other } => {
@@ -159,20 +188,33 @@ fn steps(plan: &Plan, cx: &Cx, net: &Net, mine: &Datagrams, peer: &Datagrams, ot
                 let mut batch = Batch::new();
                 batch.push(socket(MINE), Ecn::NotEct, &[index; 48][..len as usize]);
                 peer.send(cx, batch).map_err(|error| format!("harness: the peer's send: {error}"))?;
-                queued.push_back(u64::from(len));
+                queued[q_tail] = u64::from(len);
+                q_tail += 1;
             }
-            Step::Recv if queued.is_empty() => {}
+            Step::Recv if q_head == q_tail => {}
             Step::Recv => {
                 let left = plan.limit - used;
                 let room = left / u64::from(SLOTS.size);
                 match mine.recv(cx, Batch::new(), SLOTS) {
                     Ok(batch) => {
-                        let came: Vec<u64> = batch.runs().map(|(head, _)| u64::from(head.len)).collect();
-                        let want: Vec<u64> = queued.iter().take(came.len()).copied().collect();
-                        if room == 0 || came.is_empty() || came.len() as u64 > room.min(4) || came != want {
+                        let mut came = [0u64; 4];
+                        let mut came_len = 0usize;
+                        for (head, _) in batch.runs() {
+                            if came_len < came.len() {
+                                came[came_len] = u64::from(head.len);
+                            }
+                            came_len += 1;
+                        }
+                        let q_len = q_tail - q_head;
+                        let matches_queued = came_len <= came.len()
+                            && came_len <= q_len
+                            && came[..came_len] == queued[q_head..q_head + came_len];
+                        if room == 0 || came_len == 0 || came_len as u64 > room.min(4) || !matches_queued {
                             return Err(format!(
-                                "a receive with {left} of the limit left (room for {room} slots) got {came:?}; \
-                                 queued {queued:?}"
+                                "a receive with {left} of the limit left (room for {room} slots) got {:?}; \
+                                 queued {:?}",
+                                &came[..came_len.min(came.len())],
+                                &queued[q_head..q_tail]
                             ));
                         }
                         for (head, _) in batch.runs() {
@@ -180,8 +222,8 @@ fn steps(plan: &Plan, cx: &Cx, net: &Net, mine: &Datagrams, peer: &Datagrams, ot
                                 return Err(format!("a datagram said from {}, sent from {PEER}", head.peer));
                             }
                         }
-                        used += came.iter().sum::<u64>();
-                        queued.drain(..came.len());
+                        used += came[..came_len].iter().sum::<u64>();
+                        q_head += came_len;
                     }
                     Err(error) if room == 0 && matches!(error.kind, NetKind::OverLimit(_)) => {}
                     Err(error) => {
@@ -211,9 +253,11 @@ fn steps(plan: &Plan, cx: &Cx, net: &Net, mine: &Datagrams, peer: &Datagrams, ot
     ends.push(socket(PEER), Ecn::NotEct, &[END]);
     ends.push(socket(OTHER), Ecn::NotEct, &[END]);
     marker.send(cx, ends).map_err(|error| format!("harness: the end markers: {error}"))?;
-    let at_peer = drain(cx, peer, &let_through, "the peer")?;
-    let at_other = drain(cx, other, &BTreeSet::new(), "the other peer")?;
-    if let Some(moved) = refused.iter().find(|index| at_peer.contains(index) || at_other.contains(index)) {
+    let at_peer = drain(cx, peer, let_through, "the peer")?;
+    let at_other = drain(cx, other, Bits::EMPTY, "the other peer")?;
+    if let Some(moved) = (0..u8::try_from(plan.len).unwrap_or(0))
+        .find(|&idx| refused.contains(idx) && (at_peer.contains(idx) || at_other.contains(idx)))
+    {
         return Err(format!("send {moved} was refused, and its datagrams arrived"));
     }
     if !at_other.is_empty() {
@@ -225,7 +269,7 @@ fn steps(plan: &Plan, cx: &Cx, net: &Net, mine: &Datagrams, peer: &Datagrams, ot
     Ok(())
 }
 
-fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
+fn run(plan: &Plan, plant: Plant) -> Outcome {
     let io: Io = world(plan.seed, plant);
     io.with_sim(|sim| {
         sim.datagrams(blaze_core::sim::Datagrams {
@@ -290,8 +334,8 @@ fn one_datagram_crosses_the_simulation() {
     }
     match got {
         Some(Ok(batch)) => {
-            let first = batch.each().next().map(|(head, bytes)| (head.peer, bytes.to_vec()));
-            assert_eq!(first.map(|it| it.1), Some(b"one".to_vec()), "what arrived");
+            let first = batch.each().next().map(|(_head, bytes)| bytes);
+            assert_eq!(first, Some(&b"one"[..]), "what arrived");
         }
         Some(Err(error)) => panic!("the receive (clock {after_send:?} -> {after_recv:?}): {error}"),
         None => unreachable!("the send failed above"),

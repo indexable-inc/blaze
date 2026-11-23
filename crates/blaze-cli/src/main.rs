@@ -51,6 +51,7 @@ mod script_modules;
 mod scripts;
 mod sdk;
 mod not_checked;
+mod peer;
 mod phases;
 mod print;
 mod producers;
@@ -253,6 +254,8 @@ pub enum CliError {
     TestPool(blaze_run::zygote::PoolError),
     /// `blaze run`'s live status line failed (run_line.rs): its thread, or a write of it.
     RunLine(run_line::RunLineError),
+    /// `blaze peer` failed (peer.rs).
+    Peer(peer::PeerError),
     /// `run` or `test` could not start from the engine's answer (engine_start.rs).
     Start(engine_start::StartError),
 }
@@ -334,6 +337,7 @@ impl fmt::Display for CliError {
             CliError::TestPool(error) => write!(f, "`blaze test`'s pool: {error}"),
             CliError::Start(error) => write!(f, "{error}"),
             CliError::RunLine(error) => write!(f, "{error}"),
+            CliError::Peer(error) => write!(f, "{error}"),
         }
     }
 }
@@ -662,7 +666,8 @@ fn command(
         }
         Some("warm-toolchain") => engine_check::warm_toolchain(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
         Some("store") => store::publish_command::run(cx, args, fs, env, clock, host, rng, out, err, heap),
-        Some(_) | None => Err(CliError::Usage("the command is check, run, test, clean, gc, warm-toolchain or explain")),
+        Some("peer") => peer::run(cx, args, fs, env, net, clock, rng, out),
+        Some(_) | None => Err(CliError::Usage("the command is check, run, test, peer, clean, gc, warm-toolchain or explain")),
     }
 }
 
