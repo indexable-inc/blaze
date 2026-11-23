@@ -396,4 +396,69 @@ fn batteries_are_exposed_and_work_in_a_frame() {
     let tab_heap = blaze_own::testing::heap();
     let tab_doc = crate::tab::read(b"[[a b]; [1 2]]", crate::tab::Limits::SHIPPED, tab_heap.alloc()).expect("tab");
     assert!(matches!(tab_doc, crate::data::Value::List(_)));
+
+    // Batch 3 batteries: unicode, math, units, int, sort, jwt, cookie, cron, zip, query, template, cli, html
+    assert_eq!(crate::unicode::char_width('日'), Some(2));
+    assert_eq!(crate::ansi::char_width('日'), 2);
+    assert!((crate::math::sin(0.0f64)).abs() < 1e-12);
+    assert_eq!(crate::units::Length::<crate::units::Plain>::mm(1000.0), crate::units::Length::<crate::units::Plain>::m(1.0));
+    assert_eq!(crate::int::Int::widen_to::<u64>(42u32), 42u64);
+    let mut nums = [3u32, 1, 2];
+    crate::sort::sort_unstable(&mut nums);
+    assert_eq!(nums, [1, 2, 3]);
+
+    let claims = crate::json::read_in(b"{\"sub\":\"u1\"}", crate::json::Limits::SHIPPED, alloc).expect("claims");
+    let tok = crate::jwt::sign_hs256_in(&claims, Some("k1"), b"secret", alloc).expect("sign");
+    let verified = crate::jwt::verify_hs256_in(
+        tok.as_str(),
+        b"secret",
+        crate::jwt::VerifyOpts {
+            alg: crate::jwt::Alg::Hs256,
+            now_unix_secs: None,
+            leeway_secs: 0,
+            require_exp: false,
+            limits: crate::jwt::JwtLimits::USUAL,
+        },
+        alloc,
+    )
+    .expect("verify");
+    assert_eq!(verified.sub(), Some("u1"));
+
+    let sc = crate::cookie::parse_set_cookie("sid=abc; Secure; HttpOnly; SameSite=Strict", crate::cookie::CookieLimits::USUAL)
+        .expect("cookie");
+    assert!(sc.secure && sc.http_only);
+
+    let sched = crate::cron::Schedule::parse("*/15 * * * *").expect("cron");
+    let next = sched.next_after(dt).expect("next");
+    assert!(sched.matches(next));
+    assert_eq!(next.time.minute(), 45);
+
+    let mut zw = crate::zip::ZipWriter::new_in(alloc);
+    zw.add_file("hi.txt", b"blaze", crate::zip::Compression::Deflate).expect("zip add");
+    let zbytes = zw.finish().expect("zip finish");
+    let zr = crate::zip::ZipReader::open_in(zbytes.as_slice(), crate::zip::ZipLimits::USUAL, alloc).expect("zip open");
+    assert_eq!(zr.read_entry_in(0, alloc).expect("zip read").as_slice(), b"blaze");
+
+    let q = crate::query::parse_query_in("?a=hello+world&b=2", crate::query::QueryLimits::USUAL, alloc).expect("query");
+    assert_eq!(q[0].value.as_str(), "hello world");
+
+    let tpl_out = crate::template::render_in("hi {{sub}}", &claims, crate::template::TemplateLimits::USUAL, alloc)
+        .expect("template");
+    assert_eq!(tpl_out.as_str(), "hi u1");
+
+    let spec = crate::cli::CommandSpec {
+        name: "app",
+        about: "demo",
+        version: Some("1.0"),
+        flags: &[crate::cli::FlagSpec { long: "verbose", short: Some('v'), help: "verbose" }],
+        opts: &[],
+        positionals: &[],
+        subcommands: &[],
+    };
+    let parsed = spec.parse_in(&["-vv"], alloc).expect("cli");
+    assert!(matches!(parsed, crate::cli::ParseOutcome::Matched(ref m) if m.flag_count("verbose") == 2));
+
+    let safe_html = crate::html::sanitize_html_in("<b>ok</b><script>bad()</script>", crate::html::HtmlLimits::USUAL, alloc)
+        .expect("html");
+    assert_eq!(safe_html.as_str(), "<b>ok</b>");
 }

@@ -177,14 +177,20 @@ pub mod budget;
     reason = "a token cell's two views of its value and its `Sync`, each with its SAFETY"
 )]
 pub mod cell;
+/// Declarative sans-IO CLI argument parser, subcommand router, and ANSI-styled `--help` formatter.
+pub mod cli;
 pub mod clock;
 /// Turning data into instructions: `Code`, executable memory and native modules.
 pub mod code;
+/// Strict RFC 6265 HTTP `Cookie` and `Set-Cookie` parser, validator, formatter, and matcher.
+pub mod cookie;
 /// Strict, bounded, zero-dependency RFC 4180 CSV / TSV reader and writer.
 pub mod csv;
 /// Authenticated encryption (ChaCha20-Poly1305 RFC 8439), key derivation (HKDF-SHA256 RFC 5869,
 /// PBKDF2-HMAC-SHA256 RFC 2898), and strict Ed25519 verification (`blaze-ed25519`).
 pub mod crypto;
+/// Standard 5-field cron schedule parser and next-occurrence iterator over [`time::DateTime`].
+pub mod cron;
 pub mod cx;
 /// The device capabilities: `Camera`, `Screen`, `Location`, `Bluetooth`, `Usb`, `Serial`,
 /// `Clipboard`, `Notify`.
@@ -214,6 +220,8 @@ pub mod glob;
 pub mod gpu;
 /// Strict, zero-dependency RFC 4648 §8 hexadecimal encoding and decoding.
 pub mod hex;
+/// HTML/XML entity codec, zero-alloc streaming tokenizer, tag stripper, and allowlist XSS sanitizer.
+pub mod html;
 pub mod host;
 // The heavy areas, each behind its feature (Cargo.toml, "[features]"; std.md, "What a program
 // pays for at start"): a program that turns none on links none of their dependencies.
@@ -225,6 +233,8 @@ pub mod hosted;
 /// Standard input: `In`, the byte stream a program was started with.
 pub mod input;
 pub mod io;
+/// RFC 7519 JWT and RFC 7515 JWS (`HS256` & `EdDSA`) signing and verification with explicit clock.
+pub mod jwt;
 /// The keychain: `Keys`, by named key, and the `Secret` a fetch gives.
 pub mod keys;
 /// A key-value store beneath a directory: `Kv`, by typed `Key`.
@@ -301,6 +311,9 @@ pub mod power;
 pub mod procs;
 #[cfg(feature = "net")]
 pub mod quic;
+/// RFC 3986 percent-encoding, WHATWG `application/x-www-form-urlencoded` query strings, and sans-IO
+/// RFC 7578 `multipart/form-data` parsing and formatting.
+pub mod query;
 /// Linear-time Thompson NFA / PikeVM regular expression engine with bounded step budgets.
 pub mod regex;
 /// Making requests: `Http`, one type over a `Net`, the host or a handler. Behind `requests`.
@@ -331,6 +344,8 @@ pub mod task;
 // What a run used and where its time went, kept per worker and merged into one `Report` at
 // exit (D178): spans, distributions, effects by kind, the pool, the longest chain.
 pub mod telemetry;
+/// Bounded, iterative (zero-recursion) Mustache-style template engine over `blaze_data::Value`.
+pub mod template;
 /// The terminal as a device: `Term`, its size, raw mode, styled text and keys.
 pub mod term;
 /// Civil calendar dates, Unix epoch conversions, strict RFC 3339 parsing/formatting, and human durations.
@@ -353,6 +368,8 @@ pub mod window;
 pub mod ws;
 /// Strict, bounded, non-recursive YAML 1.2 Core Schema parser and emitter over `blaze_data::Value`.
 pub mod yaml;
+/// Bounded, traversal-safe Store/Deflate ZIP archive reader and writer over [`compress`] and [`digest::Crc32`].
+pub mod zip;
 /// A worker's state as a value the pool owns, in typed columns (D171): `Workers`, `Slot<T>`,
 /// `cx.on_worker`.
 #[expect(
@@ -597,12 +614,17 @@ pub mod algebra {
 }
 
 /// The stable radix sort (blaze-radix), on workers named at the call ([`sort::on`], with
-/// [`sort::Serial`] for the calling thread alone). The free functions that sort on the
-/// thread's ambient workers are left out.
+/// [`sort::Serial`] for the calling thread alone) and type-selected sorting/searching/comparing
+/// (`blaze-sort`). The free functions that sort on the thread's ambient workers are left out.
 pub mod sort {
     pub use blaze_radix::{
         Csr, Key, PARALLEL, Radix, SMALL, Serial, WIDE, Workers, on, pack_32, pack_64, signed_32,
         signed_64,
+    };
+    pub use blaze_sort::{
+        LSD_FROM, RadixKey, TINY, binary_search, cmp, contains, dedup, eq, is_sorted, kernels,
+        lower_bound, lsd_from, max, min, position, sort, sort_by_key_in, sort_in,
+        sort_stable_by_in, sort_stable_in, sort_unstable, sort_unstable_by,
     };
 }
 
@@ -669,6 +691,43 @@ pub mod search {
 /// Zero-dependency typed bitflags macro and `Flags` trait (`blaze-bitflags`).
 pub mod bitflags {
     pub use blaze_bitflags::*;
+}
+
+/// Official UCD Unicode tables: `char_width`, `str_width`, `graphemes`, `nfd_chars`, `is_xid_start`,
+/// `is_xid_continue`, `is_emoji` (`blaze-unicode`).
+pub mod unicode {
+    pub use blaze_unicode::*;
+}
+
+/// Deterministic scalar & SIMD floating-point math (fdlibm/musl `sin`/`cos`/`exp`/`ln`/`pow`/...)
+/// and 3D geometry (`Vec2`, `Vec3`, `Mat3`, `Affine3`, `Aabb3`, `Interval`; `blaze-math`).
+pub mod math {
+    pub use blaze_math::*;
+}
+
+/// Typed quantities (lengths, angles, areas, volumes, masses, `Nanos`, `Bytes`, `Count`; `blaze-units`).
+pub mod units {
+    pub use blaze_units::*;
+}
+
+/// Named integer conversions (`widen_to`, `narrow`, `truncate_to`, `saturate`; `blaze-int`).
+pub mod int {
+    pub use blaze_int::*;
+}
+
+/// Sans-IO RFC 9113 HTTP/2 with RFC 7541 HPACK (`blaze-h2`).
+pub mod h2 {
+    pub use blaze_h2::*;
+}
+
+/// Columnar in-memory tables and typed batches (`blaze-columns`).
+pub mod columns {
+    pub use blaze_columns::*;
+}
+
+/// Zero-dependency Apache Arrow IPC stream and file reader/writer over [`columns`] (`blaze-arrow-ipc`).
+pub mod arrow {
+    pub use blaze_arrow_ipc::*;
 }
 
 /// Zero-copy records: the bytes in memory are the bytes on disk (blaze-format).
