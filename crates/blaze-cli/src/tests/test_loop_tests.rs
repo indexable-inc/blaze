@@ -231,7 +231,7 @@ fn request(tape: &Tape, world: &mut World, plant: Plant) -> Result<Seen, Broke> 
         not_run: Vec::new_in(g),
         flaky: Vec::new_in(g),
         text: Vec::new_in(g),
-        status: Status { failed: 0, not_run: 0, check_errors: 0 },
+        status: Status { passed: 0, failed: 0, ignored: 0, not_run: 0, check_errors: 0 },
     };
     let mut status = None;
     {
@@ -405,7 +405,7 @@ fn request(tape: &Tape, world: &mut World, plant: Plant) -> Result<Seen, Broke> 
         world.head = head;
     }
     world.postings = new_postings.or(postings);
-    seen.status = status.unwrap_or(Status { failed: 0, not_run: 0, check_errors: 0 });
+    seen.status = status.unwrap_or(Status { passed: 0, failed: 0, ignored: 0, not_run: 0, check_errors: 0 });
     Ok(seen)
 }
 

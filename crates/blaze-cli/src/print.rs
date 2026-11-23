@@ -197,6 +197,11 @@ fn placed_in<'f>(path: &'f str, text: &str, read: blaze_ids::ContentId, grammar:
             let name = core::str::from_utf8(message).map_err(|_| CliError::Text { what: "a finding's message is not UTF-8" })?;
             Some(Change { start, end, insert: "", reason: HelpKind::ToolchainLine, args: [name, ""], given: 1 })
         }
+        (Area::Cli, crate::unused_deps::UNUSED_DEPENDENCY) => {
+            crate::unused_deps::line_deletion_fix(text, start, end, message).map(|(line_start, line_end, dep_key)| {
+                Change { start: line_start, end: line_end, insert: "", reason: HelpKind::UnusedDependencyLine, args: [dep_key, ""], given: 1 }
+            })
+        }
         (Area::Cli, rule) => crate::lints::rule_of(rule).and_then(|lint| crate::lints::fix_at(lint, text, start, end, frame, scratch)),
         _ => None,
     };
@@ -1172,6 +1177,7 @@ mod tests {
             (Area::Cli, crate::units::TARGET_REFUSED),
             (Area::Cli, crate::graph::TARGET_SKIPPED),
             (Area::Cli, crate::graph::RUSTFLAGS_NOT_APPLIED),
+            (Area::Cli, crate::unused_deps::UNUSED_DEPENDENCY),
             (Area::Cli, crate::work::MODULE_AT_BOTH),
             (Area::Cli, crate::work::FILE_NOT_TEXT),
             (Area::Cli, crate::names::UNRESOLVED),
