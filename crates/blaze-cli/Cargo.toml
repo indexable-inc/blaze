@@ -78,6 +78,9 @@ blaze-meter.workspace = true
 # `blaze run`'s program after its check: the walking skeleton's straight line, lower to call
 # (tests/ladder/README.md).
 blaze-ladder.workspace = true
+# `blaze export` (engine_export.rs): standalone native AArch64 executable writer (Mach-O on macOS,
+# ELF PIE on Linux), pure `#![no_std]` with zero third-party deps.
+blaze-export.workspace = true
 # The run parent (run_parent.rs): the run wire to the launcher's run mode, the records' ISA, and
 # the BLAKE3 a record's file is named by (blaze-launch-rt `run_mode::Folder`).
 blaze-launch.workspace = true

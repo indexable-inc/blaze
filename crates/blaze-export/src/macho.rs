@@ -717,6 +717,8 @@ pub fn write_native<'a>(
     out.extend_from_slice(&eh.unwind_info);
     out.resize(text_size as usize, 0);
     if has_const {
+        let const_at = usize::try_from(laid.const_at).map_err(|_| ExportError::TooLarge { what: "__DATA_CONST offset", len: laid.const_at })?;
+        out.resize(const_at, 0);
         out.extend_from_slice(&laid.konst);
         out.resize((laid.const_at + const_size) as usize, 0);
     }
