@@ -710,7 +710,7 @@ const MEM_PARTS: usize = 23;
 
 /// The first representative of each retained recorder cell, before row placement.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct KeptKinds([u32; 20]);
+struct KeptKinds([u32; 22]);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TopKept {
@@ -719,9 +719,9 @@ pub(crate) struct TopKept {
 }
 
 impl KeptKinds {
-    const NAMES: [&'static str; 20] = [
+    const NAMES: [&'static str; 22] = [
         "Binding", "Module", "Root", "Variants", "Item", "Members", "Expansion", "MemberOf",
-        "VariantOf", "Beginning", "Lang", "Incoherent", "InternalSymbols", "Links", "Textual", "Whole", "Signature", "Text", "Head", "Impls",
+        "VariantOf", "Beginning", "Lang", "Incoherent", "InternalSymbols", "Links", "ImplRows", "Files", "Textual", "Whole", "Signature", "Text", "Head", "Impls",
     ];
 
     fn add(&mut self, key: TableRead) {
@@ -731,12 +731,12 @@ impl KeptKinds {
                 Binding { .. } => 0, Module { .. } => 1, Root { .. } => 2, Variants { .. } => 3,
                 Item { .. } => 4, Members { .. } => 5, Expansion { .. } => 6, MemberOf { .. } => 7,
                 VariantOf { .. } => 8, Beginning { .. } => 9, Lang { .. } => 10, Incoherent { .. } => 11,
-                InternalSymbols { .. } => 12, Links { .. } => 13, Textual { .. } => 14, Whole { .. } => 15,
+                InternalSymbols { .. } => 12, Links { .. } => 13, ImplRows { .. } => 14, Files { .. } => 15, Textual { .. } => 16, Whole { .. } => 17,
             },
-            TableRead::Signature { .. } => 16,
-            TableRead::Text { .. } => 17,
-            TableRead::Head { .. } => 18,
-            TableRead::Impls { .. } => 19,
+            TableRead::Signature { .. } => 18,
+            TableRead::Text { .. } => 19,
+            TableRead::Head { .. } => 20,
+            TableRead::Impls { .. } => 21,
         };
         self.0[at] += 1;
     }
@@ -3143,7 +3143,7 @@ impl<'f> BodiesStage<'f> {
                         (_, None) => Decision::Refused { why: NO_CLAIM, took: None },
                     };
                     let label_of = |took: Option<u32>| took.and_then(|at| found.took.get(at as usize)).map_or("", |one| one.label);
-                    let plan_cells = || crate::engine_body_plan::Holders::cells(unit_cells.as_deref().expect("a found plan has its unit cells"), &passed, &met, frame);
+                    let plan_cells = || crate::engine_body_plan::Holders::cells(unit_cells.as_deref().expect("a found plan has its unit cells"), decided, &passed, &met, frame);
                     let ordered = || -> &'f [CellId] {
                         let mut ids = plan_cells();
                         ids.sort_unstable();
@@ -3336,12 +3336,18 @@ impl<'f> BodiesStage<'f> {
         for part in parts.iter() {
             runs.push(core::slice::from_ref(part));
         }
+        // Adaptive run size: when only a small batch of bodies is dirty (e.g. an incremental edit),
+        // split finely across available workers so independent bodies run in parallel instead of
+        // bunching into 1-3 serial runs of up to `RUN` (32) entries.
+        let workers = usize::try_from(handles.workers.get()).unwrap_or(1).max(1);
+        let target_runs = workers.saturating_mul(2);
+        let max_run = if ones.len() <= target_runs { 1 } else { ones.len().div_ceil(target_runs).min(RUN) };
         let mut from = 0;
         while from < ones.len() {
             let group = ones[from].group;
             let mut to = from;
             let mut cost = 0u64;
-            while to < ones.len() && ones[to].group == group && to - from < RUN {
+            while to < ones.len() && ones[to].group == group && to - from < max_run {
                 let next = predicted(ones[to].costs, 0, ones[to].items.len());
                 if to > from && cost + next > SLICE_BYTES {
                     break;

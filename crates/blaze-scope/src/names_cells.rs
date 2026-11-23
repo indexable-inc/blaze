@@ -121,6 +121,16 @@ pub enum NameCell {
     /// each crate reached by the link closure, instead of recording both `Names` and `Items`
     /// whole for every crate in the scope.
     Links { krate: [u8; 8] },
+    /// The crate's impl rows, in record order ([`ItemsRecord::impl_at`]): what an `ImplBucket`
+    /// task and `NamesSource::each_impl_row` read of a crate's own items record. Absent when the
+    /// crate declares no impls, so adding a private `fn` or other non-impl item never wakes the
+    /// crate's `ImplBucket` task.
+    ImplRows { krate: [u8; 8] },
+    /// The crate's held file paths, in file-index order ([`ItemsRecord::file_surface`]'s `path`
+    /// and `shown`, without each file's `surface` digest): what `NamesSource::file_paths`,
+    /// `FileIs::NotHeld`, and `Heads` no-member / not-held checks read. Absent when the crate
+    /// holds no files, so adding an item to an existing file never wakes readers of file paths.
+    Files { krate: [u8; 8] },
     /// A module's `macro_rules!` sequence and its `mod` lines' marks in it: what a textual
     /// macro lookup reads of the module, and no other walk; absent for a module the record does
     /// not hold a scope of.
@@ -160,6 +170,8 @@ impl NameCell {
             NameCell::Textual { module } => h.update(&[14]).id(&module.0),
             NameCell::InternalSymbols { krate } => h.update(&[15]).update(&krate),
             NameCell::Links { krate } => h.update(&[16]).update(&krate),
+            NameCell::ImplRows { krate } => h.update(&[17]).update(&krate),
+            NameCell::Files { krate } => h.update(&[18]).update(&krate),
         };
         let mut key = [0; 16];
         key.copy_from_slice(&h.finish().0[..16]);
@@ -170,7 +182,14 @@ impl NameCell {
     pub fn crate_prefix(self) -> [u8; 8] {
         match self {
             NameCell::Binding { module, .. } | NameCell::Module { module } | NameCell::Textual { module } => module.crate_prefix(),
-            NameCell::Root { krate } | NameCell::Whole { krate, .. } | NameCell::Lang { krate } | NameCell::Incoherent { krate } | NameCell::InternalSymbols { krate } | NameCell::Links { krate } => krate,
+            NameCell::Root { krate }
+            | NameCell::Whole { krate, .. }
+            | NameCell::Lang { krate }
+            | NameCell::Incoherent { krate }
+            | NameCell::InternalSymbols { krate }
+            | NameCell::Links { krate }
+            | NameCell::ImplRows { krate }
+            | NameCell::Files { krate } => krate,
             NameCell::Variants { owner } | NameCell::Members { owner } => owner.crate_prefix(),
             NameCell::Item { key } => key.crate_prefix(),
             NameCell::Expansion { call } => call.crate_prefix(),
@@ -461,6 +480,67 @@ fn links_digest(record: &NamesRecord<'_>, items: &ItemsRecord<'_>) -> Result<Con
     }
     h.update(&count.to_le_bytes());
     Ok(h.finish())
+}
+
+/// What `ImplRows(krate)` holds: every impl row of the crate in record order (every field of
+/// [`crate::items_record::ImplRow`]); `None` for a crate that declares no impls.
+fn impl_rows_digest(items: &ItemsRecord<'_>) -> Result<Option<ContentId>, ItemsRecordError> {
+    if items.impls() == 0 {
+        return Ok(None);
+    }
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[17]).update(&u64::try_from(items.impls()).unwrap_or(u64::MAX).to_le_bytes());
+    for i in 0..items.impls() {
+        let crate::items_record::ImplRow {
+            key,
+            module,
+            trait_path,
+            has_trait,
+            bare,
+            flags,
+            head,
+            self_path,
+            header_unread,
+            trait_unread,
+            refused_call,
+            trait_root,
+            self_root,
+        } = items.impl_at(i)?.ok_or(ItemsRecordError::Short { what: "the impl rows", at: i })?;
+        h.id(&key.0)
+            .id(&module.0)
+            .std(&trait_path)
+            .update(&[u8::from(has_trait), u8::from(bare), u8::from(header_unread), u8::from(trait_unread), u8::from(refused_call)])
+            .std(&flags)
+            .std(&head)
+            .std(&self_path);
+        match trait_root {
+            Some(k) => h.update(&[1]).id(&k.0),
+            None => h.update(&[0]),
+        };
+        match self_root {
+            Some(k) => h.update(&[1]).id(&k.0),
+            None => h.update(&[0]),
+        };
+    }
+    Ok(Some(h.finish()))
+}
+
+/// What `Files(krate)` holds: every file row's package path and shown path, in file-index order
+/// (leaving out each file's `surface` digest, which moves on every surface edit); `None` when the
+/// crate holds no files.
+fn files_digest(items: &ItemsRecord<'_>) -> Result<Option<ContentId>, ItemsRecordError> {
+    if items.files() == 0 {
+        return Ok(None);
+    }
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[18]).update(&u64::try_from(items.files()).unwrap_or(u64::MAX).to_le_bytes());
+    for i in 0..items.files() {
+        let row = items
+            .file_surface(u32::try_from(i).unwrap_or(u32::MAX))?
+            .ok_or(ItemsRecordError::Short { what: "the file rows", at: i })?;
+        h.part(row.path.as_str().as_bytes()).part(row.shown.as_bytes());
+    }
+    Ok(Some(h.finish()))
 }
 
 /// The first 16 bytes of a key: what [`NameCell::Beginning`] is keyed by (`key_beginning`'s
@@ -829,6 +909,12 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
             rows.push((NameCell::InternalSymbols { krate }.key(), digest));
         }
         rows.push((NameCell::Links { krate }.key(), links_digest(record, items).map_err(CellsError::Items)?));
+        if let Some(digest) = impl_rows_digest(items).map_err(CellsError::Items)? {
+            rows.push((NameCell::ImplRows { krate }.key(), digest));
+        }
+        if let Some(digest) = files_digest(items).map_err(CellsError::Items)? {
+            rows.push((NameCell::Files { krate }.key(), digest));
+        }
     }
     for module in record.modules() {
         if let Some(digest) = module_digest(record, module) {
@@ -1129,6 +1215,10 @@ pub fn seen_by_record<'a>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<
         NameCell::InternalSymbols { .. } => None,
         NameCell::Links { krate } if krate == record.key().prefix() => Some(links_digest(record, items_of()?).map_err(CellsError::Items)?),
         NameCell::Links { .. } => None,
+        NameCell::ImplRows { krate } if krate == record.key().prefix() => impl_rows_digest(items_of()?).map_err(CellsError::Items)?,
+        NameCell::ImplRows { .. } => None,
+        NameCell::Files { krate } if krate == record.key().prefix() => files_digest(items_of()?).map_err(CellsError::Items)?,
+        NameCell::Files { .. } => None,
     })
 }
 

@@ -67,14 +67,19 @@ pub struct Listed<'w, B> {
     /// The target side's toolchain crates, their packs read and verified once.
     pub toolchain: Toolchain<'w, B>,
     /// Each macro-side toolchain crate's pack: (its index in [`Self::list`], its version, the
-    /// pack's bytes).
-    side_packs: AVec<'w, (usize, &'w str, B)>,
+    /// pack's bytes when loaded; `None` under [`open_list_light`]).
+    side_packs: AVec<'w, (usize, &'w str, Option<B>)>,
 }
 
 impl<'w, B: AsRef<[u8]>> Listed<'w, B> {
     /// The pack and version of the macro-side toolchain crate at `at` in the list.
     fn side_pack(&self, at: usize) -> Option<(&[u8], &'w str)> {
-        self.side_packs.iter().find(|(i, _, _)| *i == at).map(|(_, version, bytes)| (bytes.as_ref(), *version))
+        self.side_packs.iter().find(|(i, _, _)| *i == at).and_then(|(_, version, bytes)| bytes.as_ref().map(|b| (b.as_ref(), *version)))
+    }
+
+    /// The version of the macro-side toolchain crate at `at` in the list (available even without packs).
+    fn side_version(&self, at: usize) -> Option<&'w str> {
+        self.side_packs.iter().find(|(i, _, _)| *i == at).map(|(_, version, _)| *version)
     }
 }
 
@@ -93,6 +98,41 @@ pub fn open_list<'w, S: Shelf, P: Packages<'w>>(
 where
     S::Bytes: AsRef<[u8]>,
 {
+    open_list_inner(shelf, id, triple, graph, lock, packages, true, alloc)
+}
+
+/// Opens toolchain `id`'s manifest on `shelf` and makes `graph`'s crate list without reading
+/// or hashing any toolchain pack from the shelf. Paired with [`world_from_list`] so incremental
+/// `Names` runs do not stat, read, or BLAKE3-hash unused toolchain packs.
+pub fn open_list_light<'w, S: Shelf, P: Packages<'w>>(
+    shelf: &mut S,
+    id: ToolchainId,
+    triple: &'w str,
+    graph: &'w UnitGraph<'w>,
+    lock: &'w Lock<'w>,
+    packages: &mut P,
+    alloc: Bump<'w>,
+) -> Result<Listed<'w, S::Bytes>, WorldError<'w>>
+where
+    S::Bytes: AsRef<[u8]>,
+{
+    open_list_inner(shelf, id, triple, graph, lock, packages, false, alloc)
+}
+
+#[expect(clippy::too_many_arguments, reason = "shared open_list implementation for eager and manifest-only modes")]
+fn open_list_inner<'w, S: Shelf, P: Packages<'w>>(
+    shelf: &mut S,
+    id: ToolchainId,
+    triple: &'w str,
+    graph: &'w UnitGraph<'w>,
+    lock: &'w Lock<'w>,
+    packages: &mut P,
+    load_packs: bool,
+    alloc: Bump<'w>,
+) -> Result<Listed<'w, S::Bytes>, WorldError<'w>>
+where
+    S::Bytes: AsRef<[u8]>,
+{
     let bump = alloc;
     let alloc = bump.alloc();
     let manifest = blaze_toolchain::shelf::open_manifest(shelf, id).map_err(WorldError::Toolchain)?;
@@ -100,12 +140,21 @@ where
     let bytes: &'w [u8] = bump.alloc_slice_copy(manifest.as_ref());
     let view = ToolchainView::open(bytes, id).expect("open_manifest checked it");
     let list = crate_list(graph, lock, view, triple, packages, alloc)?;
-    let toolchain = Toolchain::open(shelf, id, triple, needs(&list), bump)?;
+    let toolchain = if load_packs {
+        Toolchain::open(shelf, id, triple, needs(&list), bump)?
+    } else {
+        Toolchain::open_manifest_only(shelf, id, triple, needs(&list), bump)?
+    };
     let mut side_packs = AVec::new_in(alloc);
     for (at, c) in list.crates.iter().enumerate().skip(list.macro_from) {
         if let ListOrigin::Toolchain { krate, .. } = c.origin {
             let row = view.krate(krate);
-            side_packs.push((at, row.version, blaze_toolchain::shelf::open_pack(shelf, id, &row).map_err(WorldError::Toolchain)?));
+            let pack = if load_packs {
+                Some(blaze_toolchain::shelf::open_pack(shelf, id, &row).map_err(WorldError::Toolchain)?)
+            } else {
+                None
+            };
+            side_packs.push((at, row.version, pack));
         }
     }
     Ok(Listed { list, toolchain, side_packs })
@@ -174,35 +223,33 @@ struct Pending<'w> {
     units: u32,
 }
 
-/// The names library's inputs for every crate of `listed`'s list: see the module's
-/// documentation.
-pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
+/// Keyed crate order produced from `listed`, shared by [`world`] and [`world_from_list`].
+struct Keyed<'w> {
+    opened: AVec<'w, u32>,
+    crate_of: AVec<'w, Option<u32>>,
+    pending: AVec<'w, Pending<'w>>,
+    order: AVec<'w, u32>,
+    rank: AVec<'w, u32>,
+    early: BTreeMap<u32, Place<'w>, Alloc<'w>>,
+    corrections: blaze_fetch::correct::Table<Alloc<'w>>,
+}
+
+fn key_list<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     graph: &'w UnitGraph<'w>,
     lock: &'w Lock<'w>,
     listed: &'w Listed<'w, B>,
     packages: &mut P,
-    checkout: &'w dyn Tree,
-    alloc: Bump<'w>,
-) -> Result<World<'w>, WorldError<'w>> {
-    let bump = alloc;
+    bump: Bump<'w>,
+) -> Result<Keyed<'w>, WorldError<'w>> {
     let alloc = bump.alloc();
     let list = &listed.list;
     let toolchain = &listed.toolchain;
     let units = &graph.units;
-    // The source corrections (D58): checked-in data; a package a row names is read corrected.
     let corrections = blaze_fetch::correct::Table::checked_in(alloc);
-    let mut corrected: AVec<'w, (u32, &'w str, &'w str)> = AVec::new_in(alloc);
-    let mut used: AVec<'w, Corrected<'w>> = AVec::new_in(alloc);
     let tc = toolchain.crates();
-    let t = u32::try_from(tc.len()).unwrap_or(u32::MAX);
-    let proc_macro_crate = toolchain.proc_macro().map(|i| i as u32);
     let n = list.crates.len();
     let first = list.toolchain;
 
-    // The list's target-side toolchain crates are the opened toolchain's, matched by unit. The
-    // two sets are chosen alike (core, alloc and Rust's std always; bstd for a blaze edition;
-    // proc_macro as reached), and this match is the check that they agree: a crate of the list
-    // not opened is refused by name, never left out.
     let mut opened: AVec<'w, u32> = AVec::with_capacity_in(first, alloc);
     for c in list.crates[..first].iter() {
         let not_opened = WorldError::ToolchainCrateNotOpened { krate: c.name };
@@ -211,8 +258,6 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
         opened.push(at as u32);
     }
 
-    // Keys: dependencies first, by a work list (Kahn's) over the list past its target-side
-    // toolchain crates (those are keyed by the toolchain).
     let mut waiting: AVec<'w, u32> = AVec::with_capacity_in(n, alloc);
     let mut dependents: AVec<'w, AVec<'w, u32>> = AVec::with_capacity_in(n, alloc);
     for _ in 0..n {
@@ -232,23 +277,19 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     }
     let mut ready: AVec<'w, u32> = AVec::new_in(alloc);
     ready.extend((first as u32..n as u32).filter(|at| waiting[*at as usize] == 0));
-    // Ready crates in the list's order, so the first crate of a key is the lowest index.
     ready.reverse();
 
     let mut key_of: AVec<'w, Option<CrateItemKey>> = AVec::with_capacity_in(n, alloc);
     key_of.extend((0..n).map(|at| if at < first { Some(tc[opened[at] as usize].key) } else { None }));
-    // Each crate's pending crate (an index into `pending`), one per key.
     let mut crate_of: AVec<'w, Option<u32>> = AVec::with_capacity_in(n, alloc);
     crate_of.extend((0..n).map(|_| None));
     let mut pending: AVec<'w, Pending<'w>> = AVec::new_in(alloc);
     let mut by_key: BTreeMap<[u8; 32], u32, Alloc<'w>> = BTreeMap::new_in(alloc);
-    // Path packages placed while keying (by lock index), each asked of `packages` once.
     let mut early: BTreeMap<u32, Place<'w>, Alloc<'w>> = BTreeMap::new_in(alloc);
     let mut keyed = 0usize;
     while let Some(at) = ready.pop() {
         let at = at as usize;
         let c = &list.crates[at];
-        // The list's one answer (a member's proc macro and its harness are the macro side's too).
         let side = if list.macro_side(at) { Side::Macro } else { Side::Target };
         let mut deps: AVec<'w, (&'w str, CrateItemKey)> = AVec::with_capacity_in(c.deps.len(), alloc);
         for &(name, d) in c.deps.iter() {
@@ -258,15 +299,10 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
         let (key, cfg, script) = match c.origin {
             ListOrigin::Unit(id) => {
                 let unit = &units[id.index()];
-                // Each crate reads the run of ITS side (ruling D115 (2)): a macro-side copy's is
-                // run for wasm32-wasip1, never the target side's facts (rule 21). One subject
-                // function, from the parts of the crate's list key ([`crate::script_subject`]).
                 let script = match unit.build_script {
                     Some(_) => Script::Read { subject: crate::script_subject(unit.name.as_str(), unit.version.as_str(), side, &c.features, alloc) },
                     None => Script::None,
                 };
-                // A path package is placed now: a member's directory is what it sees as its
-                // root (`/workspace/<dir>`, D96 (3)), so it is in its key (rule 21).
                 let member = if lock.package(unit.package).source_text.is_empty() {
                     let place = match early.get(&unit.package.0) {
                         Some(&place) => place,
@@ -299,9 +335,6 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
         keyed += 1;
         match by_key.get(&key.0.0) {
             Some(&p) => {
-                // Two units under one crate key read one build-script run (rule 21: the fix is
-                // the key). Unreachable by construction: the subject is made of the list key's
-                // parts; refused by name if it ever is not.
                 let first = &pending[p as usize];
                 one_script((list.crates[first.at].name, first.script), (c.name, script))?;
                 crate_of[at] = Some(p);
@@ -326,7 +359,6 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
         return Err(WorldError::Cycle { krate: list.crates[stuck].name });
     }
 
-    // The order: by key. `rank[p]` is pending crate p's place among the graph's crates.
     let mut order: AVec<'w, u32> = AVec::with_capacity_in(pending.len(), alloc);
     order.extend(0..pending.len() as u32);
     order.sort_unstable_by(|a, b| pending[*a as usize].key.0.0.cmp(&pending[*b as usize].key.0.0));
@@ -335,18 +367,78 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     for (at, p) in order.iter().enumerate() {
         rank[*p as usize] = at as u32;
     }
+    Ok(Keyed { opened, crate_of, pending, order, rank, early, corrections })
+}
+
+/// The names library's inputs for every crate of `listed`'s list: see the module's
+/// documentation.
+pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
+    graph: &'w UnitGraph<'w>,
+    lock: &'w Lock<'w>,
+    listed: &'w Listed<'w, B>,
+    packages: &mut P,
+    checkout: &'w dyn Tree,
+    alloc: Bump<'w>,
+) -> Result<World<'w>, WorldError<'w>> {
+    world_inner(graph, lock, listed, None, packages, checkout, alloc)
+}
+
+/// Builds a [`World`] from `listed` (opened via [`open_list_light`] with zero pack opens) and an
+/// existing standing [`crate::crate_list::CrateList`]: computes every crate's key, order, cfg,
+/// deps, script, environment and sysroot identically to [`world`], taking non-member tree paths
+/// and source corrections from `stored_list` without stat-ing, mapping, or hashing any fetched or
+/// toolchain pack. `World::texts.packs()` is left empty; callers open packs lazily on demand.
+#[expect(clippy::too_many_arguments, reason = "mirrors world() plus the standing CrateList for lazy pack resolution")]
+pub fn world_from_list<'w, P: Packages<'w>, B: AsRef<[u8]>>(
+    graph: &'w UnitGraph<'w>,
+    lock: &'w Lock<'w>,
+    listed: &'w Listed<'w, B>,
+    stored_list: &crate::crate_list::CrateList<'w>,
+    packages: &mut P,
+    checkout: &'w dyn Tree,
+    alloc: Bump<'w>,
+) -> Result<World<'w>, WorldError<'w>> {
+    world_inner(graph, lock, listed, Some(stored_list), packages, checkout, alloc)
+}
+
+#[expect(clippy::too_many_arguments, reason = "shared world builder for eager and lazy standing-list modes")]
+fn world_inner<'w, P: Packages<'w>, B: AsRef<[u8]>>(
+    graph: &'w UnitGraph<'w>,
+    lock: &'w Lock<'w>,
+    listed: &'w Listed<'w, B>,
+    stored_list: Option<&crate::crate_list::CrateList<'w>>,
+    packages: &mut P,
+    checkout: &'w dyn Tree,
+    alloc: Bump<'w>,
+) -> Result<World<'w>, WorldError<'w>> {
+    let bump = alloc;
+    let alloc = bump.alloc();
+    let list = &listed.list;
+    let toolchain = &listed.toolchain;
+    let units = &graph.units;
+    let Keyed { opened, crate_of, pending, order, rank, early, corrections } = key_list(graph, lock, listed, packages, bump)?;
+    let mut corrected: AVec<'w, (u32, &'w str, &'w str)> = AVec::new_in(alloc);
+    let mut used: AVec<'w, Corrected<'w>> = AVec::new_in(alloc);
+    let tc = toolchain.crates();
+    let t = u32::try_from(tc.len()).unwrap_or(u32::MAX);
+    let proc_macro_crate = toolchain.proc_macro().map(|i| i as u32);
+    let first = list.toolchain;
     // A crate of the list (past the target's toolchain) to its index in the world.
     let world_at = |d: usize| -> Option<u32> { if d < first { Some(opened[d]) } else { crate_of[d].map(|p| t + rank[p as usize]) } };
 
     // The trees: the toolchain's packs (1..=t), then each fetched package's record and each
-    // macro-side toolchain pack in the order its first crate is placed.
-    // Beside each pack, where it is kept (the crate list's tree table, crate_list.rs).
-    let mut packs: AVec<'w, PackView<'w>> = AVec::with_capacity_in(tc.len(), alloc);
-    let mut origins: AVec<'w, PackOrigin> = AVec::with_capacity_in(tc.len(), alloc);
-    for c in tc {
-        let bytes = toolchain.pack(c);
-        packs.push(PackView::open_verified(bytes).map_err(|_| WorldError::Pack { krate: c.name })?);
-        origins.push(PackOrigin::Shelf { digest: footer(bytes).ok_or(WorldError::Pack { krate: c.name })? });
+    // macro-side toolchain pack in the order its first crate is placed. Under `stored_list`
+    // (lazy mode), packs are left empty and opened on demand by callers.
+    let mut packs: AVec<'w, PackView<'w>> = AVec::with_capacity_in(if stored_list.is_some() { 0 } else { tc.len() }, alloc);
+    let mut origins: AVec<'w, PackOrigin> = AVec::with_capacity_in(if stored_list.is_some() { 0 } else { tc.len() }, alloc);
+    if let Some(stored) = stored_list {
+        corrected.extend(stored.corrected());
+    } else {
+        for c in tc {
+            let bytes = toolchain.pack(c);
+            packs.push(PackView::open_verified(bytes).map_err(|_| WorldError::Pack { krate: c.name })?);
+            origins.push(PackOrigin::Shelf { digest: footer(bytes).ok_or(WorldError::Pack { krate: c.name })? });
+        }
     }
     // The lock's fetch plan, made at the first fetched package placed: which record holds it.
     let mut fetch_plan: Option<blaze_fetch::Plan<'w, 'w>> = None;
@@ -397,44 +489,61 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
         let (root, shown_from, facts, origin, proc_macro, package, version) = match c.origin {
             ListOrigin::Unit(id) => {
                 let unit = &units[id.index()];
-                let (tree, dir) = match placed.get(&unit.package.0) {
-                    Some(&it) => it,
-                    None => {
-                        let place = match early.get(&unit.package.0) {
-                            Some(&place) => place,
-                            None => packages.place(unit.package)?,
-                        };
-                        let it = match place {
-                            Place::Checkout { dir } => (0, dir),
-                            Place::Pack { view, dir } => {
-                                let key = source_key(&mut fetch_plan, view, lock, unit.package, &unit.name, alloc)?;
-                                packs.push(view);
-                                origins.push(PackOrigin::Source { key });
-                                let tree = packs.len() as u32;
-                                if let Some(row) = corrections.find_text(&unit.name, &unit.version) {
-                                    correct_pack(row, view, tree, dir, unit, &mut corrected, &mut used, bump)?;
-                                }
-                                (tree, dir)
+                let (root, shown_from, seen): (&'w str, &'w str, SeenRoot<'w>) = if let Some(stored) = stored_list {
+                    match early.get(&unit.package.0) {
+                        Some(Place::Checkout { dir }) => {
+                            let shown = join("/0/", dir, alloc);
+                            let root: &'w str = bump.alloc_str(&join(&shown, &unit.root, alloc));
+                            let mut shown_from = shown;
+                            if !shown_from.ends_with('/') {
+                                shown_from.push_str("/");
                             }
-                        };
-                        placed.insert(unit.package.0, it);
-                        it
+                            let seen = SeenRoot::member(dir).map_err(|error| WorldError::MemberDir { package: &unit.name, error })?;
+                            (root, bump.alloc_str(&shown_from), seen)
+                        }
+                        _ => match stored.find(pend.key) {
+                            Some(row) => (stored.root(row), stored.shown_from(row), SeenRoot::Package),
+                            None => ("", "", SeenRoot::Package),
+                        },
                     }
+                } else {
+                    let (tree, dir) = match placed.get(&unit.package.0) {
+                        Some(&it) => it,
+                        None => {
+                            let place = match early.get(&unit.package.0) {
+                                Some(&place) => place,
+                                None => packages.place(unit.package)?,
+                            };
+                            let it = match place {
+                                Place::Checkout { dir } => (0, dir),
+                                Place::Pack { view, dir } => {
+                                    let key = source_key(&mut fetch_plan, view, lock, unit.package, &unit.name, alloc)?;
+                                    packs.push(view);
+                                    origins.push(PackOrigin::Source { key });
+                                    let tree = packs.len() as u32;
+                                    if let Some(row) = corrections.find_text(&unit.name, &unit.version) {
+                                        correct_pack(row, view, tree, dir, unit, &mut corrected, &mut used, bump)?;
+                                    }
+                                    (tree, dir)
+                                }
+                            };
+                            placed.insert(unit.package.0, it);
+                            it
+                        }
+                    };
+                    let mut base = AString::with_capacity_in(dir.len() + 12, alloc);
+                    base.push_str("/");
+                    push_u32(&mut base, tree);
+                    base.push_str("/");
+                    let shown = join(&base, dir, alloc);
+                    let root: &'w str = bump.alloc_str(&join(&shown, &unit.root, alloc));
+                    let mut shown_from = shown;
+                    if !shown_from.ends_with('/') {
+                        shown_from.push_str("/");
+                    }
+                    let seen = if tree == 0 { SeenRoot::member(dir).map_err(|error| WorldError::MemberDir { package: &unit.name, error })? } else { SeenRoot::Package };
+                    (root, bump.alloc_str(&shown_from), seen)
                 };
-                let mut base = AString::with_capacity_in(dir.len() + 12, alloc);
-                base.push_str("/");
-                push_u32(&mut base, tree);
-                base.push_str("/");
-                let shown = join(&base, dir, alloc);
-                let root = bump.alloc_str(&join(&shown, &unit.root, alloc));
-                let mut shown_from = shown;
-                if !shown_from.ends_with('/') {
-                    shown_from.push_str("/");
-                }
-                // What the crate sees as its root (D96): a member (placed in the checkout, tree
-                // 0) its directory under the workspace, every fetched package `/package`.
-                let seen = if tree == 0 { SeenRoot::member(dir).map_err(|error| WorldError::MemberDir { package: &unit.name, error })? } else { SeenRoot::Package };
-                let shown_from: &'w str = bump.alloc_str(&shown_from);
                 let test_or_bench = matches!(unit.kind, UnitKind::IntegrationTest(_) | UnitKind::Bench(_));
                 let bin_exes = match test_or_bench {
                     true => blaze_scope::crate_env::package_bins(graph, unit.package, unit.crate_name.as_str(), bump).map_err(WorldError::Env)?,
@@ -458,18 +567,28 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                 (root, shown_from, facts, Origin::Unit(id), unit.kind == UnitKind::ProcMacro, unit.name.as_str(), unit.version.as_str())
             }
             ListOrigin::Toolchain { unit, .. } => {
-                // A macro-side toolchain crate: a tree of its own, its pack read by `open_list`.
-                let (bytes, version) = listed.side_pack(pend.at).ok_or(WorldError::ToolchainCrateNotOpened { krate: c.name })?;
-                packs.push(PackView::open_verified(bytes).map_err(|_| WorldError::Pack { krate: c.name })?);
-                origins.push(PackOrigin::Shelf { digest: footer(bytes).ok_or(WorldError::Pack { krate: c.name })? });
-                let tree = packs.len() as u32;
-                let inner = c.root.as_str().strip_prefix(c.shown_from.as_str()).ok_or(WorldError::ToolchainRoot { krate: c.name, root: c.root.as_str() })?;
-                let mut base = AString::with_capacity_in(12, alloc);
-                base.push_str("/");
-                push_u32(&mut base, tree);
-                base.push_str("/");
-                let root = bump.alloc_str(&join(&base, inner, alloc));
-                let shown_from: &'w str = bump.alloc_str(&base);
+                let (root, shown_from, version): (&'w str, &'w str, &'w str) = if let Some(stored) = stored_list {
+                    let version = listed.side_version(pend.at).ok_or(WorldError::ToolchainCrateNotOpened { krate: c.name })?;
+                    let (root, shown_from) = match stored.find(pend.key) {
+                        Some(row) => (stored.root(row), stored.shown_from(row)),
+                        None => ("", ""),
+                    };
+                    (root, shown_from, version)
+                } else {
+                    // A macro-side toolchain crate: a tree of its own, its pack read by `open_list`.
+                    let (bytes, version) = listed.side_pack(pend.at).ok_or(WorldError::ToolchainCrateNotOpened { krate: c.name })?;
+                    packs.push(PackView::open_verified(bytes).map_err(|_| WorldError::Pack { krate: c.name })?);
+                    origins.push(PackOrigin::Shelf { digest: footer(bytes).ok_or(WorldError::Pack { krate: c.name })? });
+                    let tree = packs.len() as u32;
+                    let inner = c.root.as_str().strip_prefix(c.shown_from.as_str()).ok_or(WorldError::ToolchainRoot { krate: c.name, root: c.root.as_str() })?;
+                    let mut base = AString::with_capacity_in(12, alloc);
+                    base.push_str("/");
+                    push_u32(&mut base, tree);
+                    base.push_str("/");
+                    let root: &'w str = bump.alloc_str(&join(&base, inner, alloc));
+                    let shown_from: &'w str = bump.alloc_str(&base);
+                    (root, shown_from, version)
+                };
                 let facts = EnvFacts {
                     crate_name: c.name,
                     package: None,

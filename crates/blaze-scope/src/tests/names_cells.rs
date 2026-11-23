@@ -542,3 +542,53 @@ fn a_foreign_items_block_abi_is_in_its_row() {
     assert_eq!(digest(names_before, items_before, FOREIGN, own_key), digest(names_after, items_after, FOREIGN_EDITED, own_key_after), "an edit of another item's block moved `own`'s `Item` cell");
     std::println!("FOREIGN ROWS: abs {abs:?} (expansion), environ {environ:?} (nested expansion), sys {sys:?} then {sys_after:?}, own {own:?}; sys key same across the edit: {}", sys_key == sys_key_after);
 }
+
+#[test]
+fn impl_rows_and_files_cells_stand_on_private_fn_and_move_on_own_change() {
+    const BASE: &str = "#![no_core]\npub struct S;\nimpl S { pub fn a() {} }\n";
+    const WITH_PRIV_FN: &str = "#![no_core]\npub struct S;\nimpl S { pub fn a() {} }\nfn __priv() {}\n";
+    const WITH_IMPL: &str = "#![no_core]\npub struct S;\nimpl S { pub fn a() {} }\nimpl S { pub fn b() {} }\n";
+    const WITH_FILE: &str = "#![no_core]\npub struct S;\nimpl S { pub fn a() {} }\nmod extra;\n";
+    const DEP: &str = "#![no_core]\npub fn dep() {}\n";
+
+    static T_BASE: Texts = Texts(&[&[("/k0/lib.rs", BASE)], &[("/k1/lib.rs", DEP)]]);
+    static T_PRIV: Texts = Texts(&[&[("/k0/lib.rs", WITH_PRIV_FN)], &[("/k1/lib.rs", DEP)]]);
+    static T_IMPL: Texts = Texts(&[&[("/k0/lib.rs", WITH_IMPL)], &[("/k1/lib.rs", DEP)]]);
+    static T_FILE: Texts = Texts(&[&[("/k0/lib.rs", WITH_FILE), ("/k0/extra.rs", "")], &[("/k1/lib.rs", DEP)]]);
+
+    let base = Side::solve(&T_BASE);
+    let priv_fn = Side::solve(&T_PRIV);
+    let with_impl = Side::solve(&T_IMPL);
+    let with_file = Side::solve(&T_FILE);
+
+    let krate = base.keys[0].prefix();
+    let impl_cell = NameCell::ImplRows { krate };
+    let files_cell = NameCell::Files { krate };
+
+    let lookup = |side: &Side, cell: NameCell| -> Option<ContentId> {
+        let table_val = seen_in(&side.with_items[0], cell.key()).expect("seen_in");
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let items = super::items_record::one_file(side.items[0], "", erased.bump());
+        let record = side.record(0);
+        let read = |_: TextOf<'_>| -> Option<&str> { None };
+        let wholes = [(Section::Items, side.items[0])];
+        let rec_val = seen_by_record(&record, Some((&items, &read)), &wholes, cell).expect("seen_by_record");
+        assert_eq!(table_val, rec_val, "table and seen_by_record disagree on {cell:?}");
+        table_val
+    };
+
+    let base_impl = lookup(&base, impl_cell);
+    let base_files = lookup(&base, files_cell);
+    assert!(base_impl.is_some(), "crate with an impl has an ImplRows cell");
+    assert!(base_files.is_some(), "crate with a file has a Files cell");
+
+    assert_eq!(lookup(&priv_fn, impl_cell), base_impl, "adding a private fn must not move ImplRows");
+    assert_eq!(lookup(&priv_fn, files_cell), base_files, "adding a private fn must not move Files");
+
+    assert_ne!(lookup(&with_impl, impl_cell), base_impl, "adding an impl must move ImplRows");
+    assert_eq!(lookup(&with_impl, files_cell), base_files, "adding an impl must not move Files");
+
+    assert_eq!(lookup(&with_file, impl_cell), base_impl, "adding an empty module file must not move ImplRows");
+    assert_ne!(lookup(&with_file, files_cell), base_files, "adding a module file must move Files");
+}

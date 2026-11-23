@@ -636,9 +636,10 @@ fn r6_a_private_fn_added_enters_its_head_and_body() {
     // loosened again without a reason written here.
     assert_eq!((from_base, total, existing), (Seen::Earlier, Seen::Earlier, 0), "R6: floor no existing body of a, b or c entered: {FLOOR}");
     // D191: the new body is 2 rows (`a`'s library's and its test build's): the floor in rows is
-    // (1, 1, 2); the bodies are at it (2 rows), the heads not.
-    assert_eq!((row.outlines, row.heads, row.bodies), (1, 3, 2), "R6: floor 1 outline, 1 head, 1 body (its 2 units' rows, D191): {PINNED}");
-    assert_eq!(row.names, 6, "R6: floor at most `a`'s two units' names (1 names group a unit): {PINNED}");
+    // (1, 1, 2). With `NameCell::ImplRows`, adding a private fn no longer wakes `ImplBucket`, so
+    // heads are at the exact floor too.
+    assert_eq!((row.outlines, row.heads, row.bodies), (1, 1, 2), "R6: floor 1 outline, 1 head, 1 body (its 2 units' rows, D191): {FLOOR}");
+    assert_eq!(row.names, 2, "R6: floor at most `a`'s two units' names (1 names group a unit): {FLOOR}");
 }
 
 /// R7, A PUB FN'S PARAMETER TYPE CHANGED IN `a` (row "A fn's parameter type changed": that fn
@@ -689,8 +690,9 @@ fn r8_an_unused_pub_fn_added_enters_its_head_and_body() {
     // reason written here.
     assert_eq!((doubled, total, existing), (Seen::Earlier, Seen::Earlier, 0), "R8: floor no existing body entered: {FLOOR}");
     // D191: the new body is 2 rows (`a`'s library's and its test build's): the floor in rows is
-    // (1, 2); the bodies are at it, the heads not.
-    assert_eq!((row.heads, row.bodies), (3, 2), "R8: floor its head and its body (1, 1; its body's 2 units' rows, D191): {PINNED}");
+    // (1, 2). With `NameCell::ImplRows`, adding an unused pub fn no longer wakes `ImplBucket`, so
+    // heads are at the exact floor too.
+    assert_eq!((row.heads, row.bodies), (1, 2), "R8: floor its head and its body (1, 1; its body's 2 units' rows, D191): {FLOOR}");
 }
 
 /// R9, A GENERIC FN'S BODY EDITED (row "A generic fn's body edited": at check time no caller is

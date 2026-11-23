@@ -358,9 +358,12 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.item_start(key)
     }
 
-    /// WHOLE: the items record's file rows have no cell.
+    /// The crate's file paths cell ([`NameCell::Files`]): only the package and shown paths, never
+    /// the items or surfaces.
     fn file_paths(self, krate: usize, file: u32) -> Option<source::FilePaths<'n>> {
-        self.whole(krate, Section::Items);
+        if let Some(prefix) = self.prefix(krate) {
+            self.cell(NameCell::Files { krate: prefix });
+        }
         self.records.file_paths(krate, file)
     }
 
@@ -461,9 +464,11 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.each_impl(krate, each)
     }
 
-    /// WHOLE: every impl row of the crate.
+    /// The crate's impl rows cell ([`NameCell::ImplRows`]).
     fn each_impl_row(self, krate: usize, each: &mut dyn FnMut(blaze_scope::items_record::ImplRow<'n>)) -> bool {
-        self.whole(krate, Section::Items);
+        if let Some(prefix) = self.prefix(krate) {
+            self.cell(NameCell::ImplRows { krate: prefix });
+        }
         self.records.each_impl_row(krate, each)
     }
 

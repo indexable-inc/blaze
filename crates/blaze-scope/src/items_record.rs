@@ -433,7 +433,7 @@ fn body_holds_items(detail: ItemDetail) -> bool {
 /// The head of an impl's self type AS WRITTEN: what an impl index files the impl under without
 /// reading more of the type. A path is not resolved here: the reader resolves it in the impl's
 /// module ([`ImplRow::self_path`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum SelfHead {
     /// A path (`S<T>`, `a::S`, `u32`): [`ImplRow::self_path`] holds it without its arguments.
     Path,
