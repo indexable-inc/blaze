@@ -76,7 +76,7 @@ blaze-keyed	677
 blaze-kit	2
 blaze-ladder	1228
 blaze-launch	174
-blaze-launch-rt	467
+blaze-launch-rt	461
 blaze-launcher	6
 blaze-lint	187
 blaze-lint-defs	21

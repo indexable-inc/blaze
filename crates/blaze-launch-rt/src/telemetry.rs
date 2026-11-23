@@ -178,15 +178,9 @@ impl<'r> Telemetry<'r> {
         (h + a - 1) & !(a - 1)
     }
 
-    /// Initializes a fresh ring in `base..base + bytes` before any producer or consumer
-    /// attaches.
-    ///
-    /// # Safety
-    ///
-    /// `base..base + bytes` must be a live, writable, exclusively-owned memory region for `'r`.
-    pub unsafe fn init(base: NonNull<u8>, bytes: usize, cap: u32) -> Result<Telemetry<'r>, TelemetryError> {
+    fn check_region(base: NonNull<u8>, bytes: usize, cap: u32) -> Result<usize, TelemetryError> {
         let need = Self::bytes_for(cap)?;
-        let addr = base.as_ptr() as usize;
+        let addr = base.as_ptr().addr();
         let align = core::mem::align_of::<Cell>();
         if addr % align != 0 {
             return Err(TelemetryError::Unaligned { addr, align });
@@ -194,10 +188,21 @@ impl<'r> Telemetry<'r> {
         if bytes < need {
             return Err(TelemetryError::TooSmall { have: bytes, need });
         }
+        Ok(need)
+    }
+
+    /// Initializes a fresh ring in `base..base + bytes` before any producer or consumer
+    /// attaches.
+    ///
+    /// # Safety
+    ///
+    /// `base..base + bytes` must be a live, writable, exclusively-owned memory region for `'r`.
+    pub unsafe fn init(base: NonNull<u8>, bytes: usize, cap: u32) -> Result<Telemetry<'r>, TelemetryError> {
+        let _ = Self::check_region(base, bytes, cap)?;
         let cells = unsafe { NonNull::new_unchecked(base.as_ptr().add(Self::cells_offset()).cast::<Cell>()) };
-        for i in 0..cap as usize {
-            // SAFETY: `i < cap`, within the initialized region.
-            let cell = unsafe { &*cells.as_ptr().add(i) };
+        for i in 0..cap {
+            // SAFETY: `i < cap`, within the initialized region (`bytes >= need` checked above).
+            let cell = unsafe { &*cells.as_ptr().add(usize::try_from(i).unwrap_or(usize::MAX)) };
             cell.seq.store(0, Ordering::Relaxed);
             unsafe { ptr::write(cell.event.get(), Event::EMPTY) };
         }
@@ -214,15 +219,7 @@ impl<'r> Telemetry<'r> {
     /// `base..base + bytes` must be live, writable, exclusively-owned for `'r`, and every byte
     /// from `Self::cells_offset()` through `Self::bytes_for(cap)` must be zero.
     pub unsafe fn init_zeroed(base: NonNull<u8>, bytes: usize, cap: u32) -> Result<Telemetry<'r>, TelemetryError> {
-        let need = Self::bytes_for(cap)?;
-        let addr = base.as_ptr() as usize;
-        let align = core::mem::align_of::<Cell>();
-        if addr % align != 0 {
-            return Err(TelemetryError::Unaligned { addr, align });
-        }
-        if bytes < need {
-            return Err(TelemetryError::TooSmall { have: bytes, need });
-        }
+        let _ = Self::check_region(base, bytes, cap)?;
         let header = base.cast::<Header>();
         // SAFETY: `base` is aligned to `Cell` (128 >= 64) and `bytes >= need` covers both the
         // header and all `cap` cells. Exclusive access is guaranteed by the caller.
@@ -316,9 +313,9 @@ impl<'r> Telemetry<'r> {
         for _ in 0..MAX_CAS_TRIES {
             let idx = pos & self.mask;
             let expected = pos.wrapping_sub(idx);
-            let cell = self.cell(idx as usize);
+            let cell = self.cell(usize::try_from(idx).unwrap_or(0));
             let turn = cell.seq.load(Ordering::Acquire);
-            let diff = turn.wrapping_sub(expected) as i64;
+            let diff = turn.wrapping_sub(expected).cast_signed();
             if diff == 0 || matches!(plant, RingPlant::SkipTurnCheck) {
                 match h.tail.compare_exchange_weak(
                     pos,
@@ -354,9 +351,9 @@ impl<'r> Telemetry<'r> {
         let pos = h.head.load(Ordering::Relaxed);
         let idx = pos & self.mask;
         let expected = pos.wrapping_sub(idx);
-        let cell = self.cell(idx as usize);
+        let cell = self.cell(usize::try_from(idx).unwrap_or(0));
         let turn = cell.seq.load(Ordering::Acquire);
-        let diff = turn.wrapping_sub(expected.wrapping_add(1)) as i64;
+        let diff = turn.wrapping_sub(expected.wrapping_add(1)).cast_signed();
         if diff != 0 {
             return None;
         }
@@ -950,20 +947,43 @@ mod tests {
 
     #[test]
     fn mapped_ring_create_bounds_disk_and_round_trips_zeroed_init() {
-        use std::os::unix::fs::MetadataExt;
-        let path = std::env::temp_dir().join(format!("blaze-telem-sparse-{}.ring", std::process::id()));
-        let cpath = std::ffi::CString::new(path.to_str().expect("utf8 path")).expect("cstr");
-        let writer = MappedRing::create(&cpath, DEFAULT_CAP).expect("create default telemetry ring");
+        let mut buf = [0u8; 64];
+        let prefix = b"/tmp/blaze-telem-sparse-";
+        buf[..prefix.len()].copy_from_slice(prefix);
+        let mut len = prefix.len();
+        let mut pid = unsafe { libc::getpid() }.cast_unsigned();
+        let mut digits = [0u8; 16];
+        let mut n = 0;
+        loop {
+            digits[n] = b'0' + u8::try_from(pid % 10).unwrap_or(0);
+            n += 1;
+            pid /= 10;
+            if pid == 0 {
+                break;
+            }
+        }
+        while n > 0 {
+            n -= 1;
+            buf[len] = digits[n];
+            len += 1;
+        }
+        let suffix = b".ring\0";
+        buf[len..len + suffix.len()].copy_from_slice(suffix);
+        let cpath = core::ffi::CStr::from_bytes_with_nul(&buf[..len + suffix.len()]).expect("cstr");
+
+        let writer = MappedRing::create(cpath, DEFAULT_CAP).expect("create default telemetry ring");
         let ev = Event::span_enter(1, Slot(3), 42, 0x99, SpanId(1), SpanId::NONE);
         assert!(writer.ring().try_push(ev));
-        let reader = MappedRing::attach_file(&cpath).expect("attach telemetry ring");
+        let reader = MappedRing::attach_file(cpath).expect("attach telemetry ring");
         assert_eq!(reader.ring().pop(), Some(ev));
         assert_eq!(reader.ring().pop(), None);
         drop(reader);
         drop(writer);
-        let meta = std::fs::metadata(&path).expect("stat telemetry ring");
-        let allocated = meta.blocks() * 512;
-        let _ = std::fs::remove_file(&path);
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        let rc = unsafe { libc::stat(cpath.as_ptr(), &mut st) };
+        unsafe { libc::unlink(cpath.as_ptr()) };
+        assert_eq!(rc, 0, "stat telemetry ring");
+        let allocated = u64::try_from(st.st_blocks).unwrap_or(u64::MAX).saturating_mul(512);
         // Linux keeps untouched pages sparse (<= 64 KiB); macOS APFS materializes the full
         // MAP_SHARED file on first dirty page, bounded by DEFAULT_CAP (256 KiB + header).
         let cap_bytes = if cfg!(target_os = "macos") { 320 * 1024 } else { 64 * 1024 };
