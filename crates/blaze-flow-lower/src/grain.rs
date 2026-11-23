@@ -327,75 +327,100 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
     /// pre-order.
     pub(crate) fn lay_slots(&self, declared: PTy, body_t: PTy, slots: &[Region], out: &mut Vec<Option<Region>, A>, e: ExprId) -> Result<bool, Refusal> {
         out.clear();
-        self.lay_slots_in(declared, body_t, slots, None, out, e)
-    }
-
-    /// [`Lower::lay_slots`] appending to `out`, the column's regions read through `binds` (an
-    /// impl value's lifetime bindings, [`bound_region`]; `None` for the signature's own).
-    fn lay_slots_in(&self, declared: PTy, body_t: PTy, slots: &[Region], binds: Option<&[Option<Region>]>, out: &mut Vec<Option<Region>, A>, e: ExprId) -> Result<bool, Refusal> {
         let facts: &'b F = self.facts;
         let arity = FactsArity { facts };
         let heads = Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
         let mut table: Vec<(PTy, SlotCount), A> = Vec::new_in(self.alloc);
         self.body_slots(body_t, &mut table, e)?;
         let body = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &table);
-        let mut stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
-        stack.push((declared, body_t));
-        // The cursor into `slots`: the column's pre-order, as this walk visits it.
-        let mut at = 0usize;
-        let mut steps = 0u32;
-        while let Some((d, b)) = stack.pop() {
-            steps += 1;
-            if steps > MOST_POSITIONS || out.len() as u32 > MOST_POSITIONS {
-                return self.refuse(Form::Bound, e);
-            }
-            let (dn, bn) = (self.head_node(d, e)?, self.node(b, e)?);
-            // A const argument holds no slot: equal by the type checker.
-            if matches!(dn, PNode::ConstValue { .. } | PNode::ConstParam(_)) && matches!(bn, PNode::ConstValue { .. } | PNode::ConstParam(_)) {
-                continue;
-            }
-            if blaze_borrow::head_eq(dn, bn) {
-                let (Ok(own), Ok(dk), Ok(bo), Ok(bk)) = (heads.own(d), heads.kids(d), body.own(b), body.kids(b)) else { return Ok(false) };
-                if own != bo || dk.len() != bk.len() {
-                    return Ok(false);
+
+        struct Frame<'s, Al: Allocator> {
+            slots: &'s [Region],
+            at: usize,
+            binds: Option<Vec<Option<Region>, Al>>,
+            stack: Vec<(PTy, PTy), Al>,
+            steps: u32,
+            /// `Some((trait_, body_ty, before))` for an impl value laid through a projection.
+            impl_ctx: Option<(ItemKey, PTy, usize)>,
+        }
+
+        let mut root_stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
+        root_stack.push((declared, body_t));
+        let mut frames: Vec<Frame<'_, A>, A> = Vec::new_in(self.alloc);
+        frames.push(Frame { slots, at: 0, binds: None, stack: root_stack, steps: 0, impl_ctx: None });
+
+        'frames: while let Some(mut frame) = frames.pop() {
+            let mut aligned = true;
+            while let Some((d, b)) = frame.stack.pop() {
+                frame.steps += 1;
+                if frame.steps > MOST_POSITIONS || out.len() as u32 > MOST_POSITIONS {
+                    return self.refuse(Form::Bound, e);
                 }
-                let Some(mine) = slots.get(at..at + own.len()) else { return Ok(false) };
-                at += own.len();
-                for &r in mine {
-                    out.push(bound_region(binds, r));
+                let (dn, bn) = (self.head_node(d, e)?, self.node(b, e)?);
+                // A const argument holds no slot: equal by the type checker.
+                if matches!(dn, PNode::ConstValue { .. } | PNode::ConstParam(_)) && matches!(bn, PNode::ConstValue { .. } | PNode::ConstParam(_)) {
+                    continue;
                 }
-                for k in (0..dk.len()).rev() {
-                    let (Some(x), Some(y)) = (dk.get(k), bk.get(k)) else { return self.refuse(Form::Malformed, e) };
-                    stack.push((x, y));
+                if blaze_borrow::head_eq(dn, bn) {
+                    let (Ok(own), Ok(dk), Ok(bo), Ok(bk)) = (heads.own(d), heads.kids(d), body.own(b), body.kids(b)) else {
+                        aligned = false;
+                        break;
+                    };
+                    if own != bo || dk.len() != bk.len() {
+                        aligned = false;
+                        break;
+                    }
+                    let Some(mine) = frame.slots.get(frame.at..frame.at + own.len()) else {
+                        aligned = false;
+                        break;
+                    };
+                    frame.at += own.len();
+                    for &r in mine {
+                        out.push(bound_region(frame.binds.as_deref(), r));
+                    }
+                    for k in (0..dk.len()).rev() {
+                        let (Some(x), Some(y)) = (dk.get(k), bk.get(k)) else { return self.refuse(Form::Malformed, e) };
+                        frame.stack.push((x, y));
+                    }
+                    continue;
                 }
-                continue;
-            }
-            // The two part: the declared subtree's slots are read past, whole.
-            let Ok(dc) = heads.count(d) else { return Ok(false) };
-            let Some(mine) = slots.get(at..at + dc.len()) else { return Ok(false) };
-            at += dc.len();
-            let laid = match dn {
-                PNode::Alias { trait_, .. } if binds.is_some() => {
-                    self.coarse_step(Form::ProjectionUnbound { trait_, why: ProjectionUnbound::InsideImplValue }, e);
-                    false
-                }
-                PNode::Alias { trait_, name, .. } => match self.through_impl(&heads, trait_, name, d, mine, e)? {
-                    None => false,
-                    Some((vty, vslots, bound)) => {
-                        let before = out.len();
-                        if self.lay_slots_in(vty, b, vslots, Some(&bound), out, e)? {
-                            true
-                        } else {
-                            out.truncate(before);
-                            self.coarse_step(Form::ProjectionUnbound { trait_, why: ProjectionUnbound::ValueUnaligned }, e);
-                            false
+                // The two part: the declared subtree's slots are read past, whole.
+                let Ok(dc) = heads.count(d) else {
+                    aligned = false;
+                    break;
+                };
+                let Some(mine) = frame.slots.get(frame.at..frame.at + dc.len()) else {
+                    aligned = false;
+                    break;
+                };
+                frame.at += dc.len();
+                match dn {
+                    PNode::Alias { trait_, .. } if frame.binds.is_some() => {
+                        self.coarse_step(Form::ProjectionUnbound { trait_, why: ProjectionUnbound::InsideImplValue }, e);
+                    }
+                    PNode::Alias { trait_, name, .. } => {
+                        if let Some((vty, vslots, bound)) = self.through_impl(&heads, trait_, name, d, mine, e)? {
+                            let before = out.len();
+                            let mut child_stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
+                            child_stack.push((vty, b));
+                            frames.push(frame);
+                            frames.push(Frame {
+                                slots: vslots,
+                                at: 0,
+                                binds: Some(bound),
+                                stack: child_stack,
+                                steps: 0,
+                                impl_ctx: Some((trait_, b, before)),
+                            });
+                            continue 'frames;
                         }
                     }
-                },
-                PNode::Opaque(..) | PNode::FnDef(..) | PNode::Param(_) => false,
-                _ => return Ok(false),
-            };
-            if !laid {
+                    PNode::Opaque(..) | PNode::FnDef(..) | PNode::Param(_) => {}
+                    _ => {
+                        aligned = false;
+                        break;
+                    }
+                }
                 let n = match body.count(b) {
                     Ok(n) => n.get(),
                     Err(u) => return self.uncounted(u, e),
@@ -404,8 +429,25 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                     out.push(None);
                 }
             }
+            let ok = aligned && frame.at == frame.slots.len();
+            match frame.impl_ctx {
+                None => return Ok(ok),
+                Some((trait_, b, before)) => {
+                    if !ok {
+                        out.truncate(before);
+                        self.coarse_step(Form::ProjectionUnbound { trait_, why: ProjectionUnbound::ValueUnaligned }, e);
+                        let n = match body.count(b) {
+                            Ok(n) => n.get(),
+                            Err(u) => return self.uncounted(u, e),
+                        };
+                        for _ in 0..n {
+                            out.push(None);
+                        }
+                    }
+                }
+            }
         }
-        Ok(at == slots.len())
+        Ok(false)
     }
 
     /// The declared projection `d` (`<S as trait_>::name`, `mine` its slots in the signature's

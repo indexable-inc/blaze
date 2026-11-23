@@ -97,7 +97,7 @@ pub(crate) const fn position(tag: u32, k: u8, b: bool) -> (Variance, u8) {
     match k {
         ty::ADT | ty::FN_DEF | ty::OPAQUE | ty::RIGID_OPAQUE => (Co, RULE_ITEM),
         ty::FN_PTR => (Co, RULE_SIG),
-        ty::TUPLE | ty::ARRAY | ty::SLICE | ty::PTR | ty::REF => (Co, RULE_SAME),
+        ty::TUPLE | ty::RECORD | ty::UNION | ty::ARRAY | ty::SLICE | ty::PTR | ty::REF => (Co, RULE_SAME),
         ty::REF_MUT | ty::DYNAMIC => {
             if b {
                 (Co, RULE_SAME)

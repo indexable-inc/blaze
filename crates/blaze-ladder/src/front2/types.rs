@@ -1124,16 +1124,56 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             lf::TypeRef::Ref { mutbl, .. } => intern(tys, PNode::Ref(mutbl, kids[0])),
             lf::TypeRef::Ptr { mutbl, .. } => intern(tys, PNode::Ptr(mutbl, kids[0])),
             lf::TypeRef::Slice(_) => intern(tys, PNode::Slice(kids[0])),
-            lf::TypeRef::Tuple(_) | lf::TypeRef::Fallible { .. } => {
+            lf::TypeRef::Tuple(_) => {
                 let l = intern_list(tys, kids)?;
                 intern(tys, PNode::Tuple(l))
             }
-            lf::TypeRef::Record(_) => {
+            lf::TypeRef::Fallible { .. } => {
                 let l = intern_list(tys, kids)?;
-                intern(tys, PNode::Record(l))
+                if let Some(result_key) = self.resolve_result_adt(env)? {
+                    intern(tys, PNode::Adt(result_key, l))
+                } else {
+                    intern(tys, PNode::Union(l))
+                }
+            }
+            lf::TypeRef::Record(fields) => {
+                let rows = v.rows(fields)?;
+                let alloc = tys.alloc();
+                let mut named = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
+                for (i, &n) in rows.iter().enumerate() {
+                    let f = lf::Field::decode(n)?;
+                    let text = match f.name {
+                        Some(nm) => v.name_text(nm)?,
+                        None => "",
+                    };
+                    named.push((text, i, Name::of(text)));
+                }
+                named.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+                let mut sorted_names = blaze_own::Vec::with_capacity_in(named.len(), alloc);
+                for &(_, _, nm) in named.iter() {
+                    sorted_names.push(nm);
+                }
+                let schema = tc::RecordSchema::of_sorted_names(&sorted_names);
+                // `children()` already yields `kids` in canonical sorted field-name order.
+                let l = intern_list(tys, kids)?;
+                intern(tys, PNode::Record(schema, l))
             }
             lf::TypeRef::Union(_) => {
-                let l = intern_list(tys, kids)?;
+                let mut flat = blaze_own::Vec::with_capacity_in(kids.len(), tys.alloc());
+                for &kid in kids {
+                    if let Some(PNode::Union(inner)) = tys.view().get(kid).copied() {
+                        if let Ok(slice) = tys.view().list(inner) {
+                            for &member in slice {
+                                if !flat.iter().any(|&seen| seen == member) {
+                                    flat.push(member);
+                                }
+                            }
+                        }
+                    } else if !flat.iter().any(|&seen| seen == kid) {
+                        flat.push(kid);
+                    }
+                }
+                let l = intern_list(tys, &flat)?;
                 intern(tys, PNode::Union(l))
             }
             lf::TypeRef::Never => intern(tys, PNode::Never),
@@ -1205,6 +1245,28 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             },
             _ => Err(Why::Unsupported("this type", r)),
         }
+    }
+
+    /// Resolves `Result<T, E>` (an enum with 2 generic parameters) for `T ! E` fallible types,
+    /// trying `::core::result::Result`, `core::result::Result`, and `Result` in scope.
+    fn resolve_result_adt(&self, env: &Env<'_>) -> Result<Option<ItemKey>, Why> {
+        const CANDIDATES: [(bool, &[&str]); 3] = [
+            (true, &["core", "result", "Result"]),
+            (false, &["core", "result", "Result"]),
+            (false, &["Result"]),
+        ];
+        for (abs, segs) in CANDIDATES {
+            if let Ok(found) = self.resolver.path(env.module, abs, segs, Ns::Type)
+                && usize::try_from(found.consumed).ok() == Some(segs.len())
+                && found.kind == Kind::Enum
+            {
+                let (g, _) = self.heads.adt_generics(found.key).ok_or(Why::Need(found.key))?;
+                if g == 2 {
+                    return Ok(Some(self.heads.checker(found.key)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Resolves a written path in `ns` by the block and first-token rule in
@@ -2833,7 +2895,26 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     let own = lifetime_kind(v, lifetime, r, s)?;
                     s.wrap(n, Some(own))
                 }
-                lf::TypeRef::Ptr { .. } | lf::TypeRef::Slice(_) | lf::TypeRef::Array { .. } | lf::TypeRef::Pat { .. } | lf::TypeRef::Tuple(_) | lf::TypeRef::Record(_) | lf::TypeRef::Union(_) | lf::TypeRef::Fallible { .. } | lf::TypeRef::Never => s.wrap(n, None),
+                lf::TypeRef::Ptr { .. } | lf::TypeRef::Slice(_) | lf::TypeRef::Array { .. } | lf::TypeRef::Pat { .. } | lf::TypeRef::Tuple(_) | lf::TypeRef::Record(_) | lf::TypeRef::Fallible { .. } | lf::TypeRef::Never => s.wrap(n, None),
+                lf::TypeRef::Union(_) => {
+                    let raw_count: u32 = kids
+                        .iter()
+                        .map(|&kid| match tys.view().get(kid).copied() {
+                            Some(PNode::Union(inner)) => inner.len,
+                            _ => 1,
+                        })
+                        .sum();
+                    let kept_count = match tys.view().get(made).copied() {
+                        Some(PNode::Union(l)) => l.len,
+                        _ => raw_count,
+                    };
+                    let kid_slots: u32 = (0..n).filter_map(|k| s.kid(n, k).map(|f| f.len)).sum();
+                    if kid_slots == 0 || raw_count == kept_count {
+                        s.wrap(n, None)
+                    } else {
+                        Err(RegionRefusal::not_laid(NotLaidWhy::OtherForm, r))
+                    }
+                }
                 lf::TypeRef::FnPtr { ret, .. } => s.fn_ptr(n, ret.is_some(), r)?,
                 lf::TypeRef::For { binder, .. } => s.for_binder(tys.view(), v, binder, made, r)?,
                 lf::TypeRef::Path(p) => self.path_regions(tys, env, v, p, made, args, n, s, r)?,

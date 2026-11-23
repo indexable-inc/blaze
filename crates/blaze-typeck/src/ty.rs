@@ -3,7 +3,7 @@
 //! The tests implement them over a toy type language (`crate::toy`).
 
 use crate::error::{CheckError, Stop};
-use crate::ids::{ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, Mutbl, Name, PatId, UintTy};
+use crate::ids::{ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, Mutbl, Name, PatId, RecordSchema, UintTy};
 use crate::world::{Reads, World};
 
 /// A type: a 4-byte handle into the context's tables. Becomes blaze-ty's `Ty`.
@@ -70,7 +70,7 @@ pub enum TyView {
     Str,
     Never,
     Tuple(TyList),
-    Record(TyList),
+    Record(RecordSchema, TyList),
     Union(TyList),
     Ref(Mutbl, Ty),
     Ptr(Mutbl, Ty),

@@ -16,7 +16,7 @@ blaze-blake3	17
 blaze-body	66
 blaze-body-build	22
 blaze-body-drops	16
-blaze-body-eval	58
+blaze-body-eval	57
 blaze-body-flow	25
 blaze-body-lower	33
 blaze-borrow	25

@@ -238,7 +238,9 @@ pub(crate) fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::Float(f) => Shape::Float(f),
         PNode::Str => Shape::Str,
         PNode::Never => Shape::Never,
-        PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => Shape::Tuple(l.len),
+        PNode::Tuple(l) => Shape::Tuple(l.len),
+        PNode::Record(s, l) => Shape::Record(s.0, l.len),
+        PNode::Union(l) => Shape::Union(l.len),
         PNode::Ref(m, _) => Shape::Ref(m),
         PNode::Ptr(m, _) => Shape::Ptr(m),
         PNode::Array(..) => Shape::Array,
@@ -1016,6 +1018,8 @@ fn trait_local<'s, 'n, S: NamesSource<'n>>(facts: BodyHeadFacts<'_, 's, S>, keys
         | Shape::Str
         | Shape::Never
         | Shape::Tuple(_)
+        | Shape::Record(..)
+        | Shape::Union(_)
         | Shape::Slice
         | Shape::Array
         | Shape::Ptr(_)
@@ -1045,6 +1049,8 @@ fn inherent_local<'s, 'n, S: NamesSource<'n>>(facts: BodyHeadFacts<'_, 's, S>, k
         | Shape::Str
         | Shape::Never
         | Shape::Tuple(_)
+        | Shape::Record(..)
+        | Shape::Union(_)
         | Shape::Slice
         | Shape::Array
         | Shape::Ref(_)
@@ -1145,7 +1151,7 @@ fn trait_crates(home: Option<usize>, shape: Shape, local_type: Local, parameters
             Some(c)
         }
         // Never a local type of any crate (no fundamental type is built in but references).
-        Shape::Bool | Shape::Char | Shape::Int(_) | Shape::Uint(_) | Shape::Float(_) | Shape::AnyInt | Shape::AnyFloat | Shape::Str | Shape::Never | Shape::Tuple(_) | Shape::Slice | Shape::Array | Shape::Ptr(_) | Shape::FnPtr(_) => None,
+        Shape::Bool | Shape::Char | Shape::Int(_) | Shape::Uint(_) | Shape::Float(_) | Shape::AnyInt | Shape::AnyFloat | Shape::Str | Shape::Never | Shape::Tuple(_) | Shape::Record(..) | Shape::Union(_) | Shape::Slice | Shape::Array | Shape::Ptr(_) | Shape::FnPtr(_) => None,
         _ => return wide,
     };
     let by_self = Home::In(home, local);
@@ -1176,7 +1182,7 @@ pub fn inherent_home<'s, 'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &
 fn inherent_crates<'s, 'n, S: NamesSource<'n>>(facts: BodyHeadFacts<'_, 's, S>, keys: &Keys, shape: Shape, marks: Option<CoherenceMarks>) -> Homes {
     let nominal = match shape {
         Shape::Adt(k) | Shape::Dynamic(Some(k)) => k,
-        Shape::Bool | Shape::Char | Shape::Int(_) | Shape::Uint(_) | Shape::Float(_) | Shape::AnyInt | Shape::AnyFloat | Shape::Str | Shape::Never | Shape::Tuple(_) | Shape::Slice | Shape::Array | Shape::Ptr(_) | Shape::Ref(_) | Shape::FnPtr(_) => {
+        Shape::Bool | Shape::Char | Shape::Int(_) | Shape::Uint(_) | Shape::Float(_) | Shape::AnyInt | Shape::AnyFloat | Shape::Str | Shape::Never | Shape::Tuple(_) | Shape::Record(..) | Shape::Union(_) | Shape::Slice | Shape::Array | Shape::Ptr(_) | Shape::Ref(_) | Shape::FnPtr(_) => {
             return Homes::one(Home::Incoherent);
         }
         _ => return Homes::ANY,

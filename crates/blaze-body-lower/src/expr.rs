@@ -337,14 +337,16 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         }
     }
 
-    pub(crate) fn is_place_expr(&self, e: ExprId) -> Result<bool, LowerError> {
-        Ok(match self.expr(e)? {
-            Expr::Local(_) | Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } => true,
-            Expr::Unary { op: UnOp::Deref, .. } => true,
-            Expr::Paren(x) => self.is_place_expr(x)?,
-            Expr::Path(_) => matches!(self.expr_def(e), Some(Def::Static(..))),
-            _ => false,
-        })
+    pub(crate) fn is_place_expr(&self, mut e: ExprId) -> Result<bool, LowerError> {
+        loop {
+            match self.expr(e)? {
+                Expr::Local(_) | Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } => return Ok(true),
+                Expr::Unary { op: UnOp::Deref, .. } => return Ok(true),
+                Expr::Paren(x) => e = x,
+                Expr::Path(_) => return Ok(matches!(self.expr_def(e), Some(Def::Static(..)))),
+                _ => return Ok(false),
+            }
+        }
     }
 
     /// The place place expression `e` names, before `e`'s own adjustments.
@@ -623,8 +625,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     pub(crate) fn emit_call(&mut self, c: Callee, ops: &[Operand], dest: Place, e: ExprId, act: usize) -> Result<(), LowerError> {
         let span = self.span(e);
         let mut i = act;
-        while i < self.activate.len() {
-            let loan = self.activate[i];
+        while let Some(&loan) = self.activate.get(i) {
             self.b.push(StmtKind::Activate(loan), span);
             i += 1;
         }

@@ -253,7 +253,7 @@ impl Head {
             N::Str => Head::Str,
             N::Never => Head::Never,
             N::Tuple(_) => Head::Tuple,
-            N::Record(_) => Head::Record,
+            N::Record(..) => Head::Record,
             N::Union(_) => Head::Union,
             N::Ref(..) => Head::Ref,
             N::Ptr(..) => Head::Ptr,

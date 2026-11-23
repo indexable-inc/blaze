@@ -79,6 +79,8 @@ fn head(k: TyKind, impl_side: bool) -> Option<u64> {
         TyKind::Str => (6, 0, 0),
         TyKind::Never => (7, 0, 0),
         TyKind::Tuple(l) => (8, u64::from(l.len), 0),
+        TyKind::Record(s, l) => (35, s, u64::from(l.len)),
+        TyKind::Union(l) => (36, u64::from(l.len), 0),
         TyKind::Ref(_, _, m) => (9, m as u64, 0),
         TyKind::RawPtr(_, m) => (10, m as u64, 0),
         TyKind::Array(..) => (11, 0, 0),

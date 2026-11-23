@@ -73,7 +73,7 @@ pub(crate) fn language_clone<P: FrontEnd>(program: &P, called: Instance, ground:
     let &[me] = view.list(called.args).ok()? else { return None };
     match view.node(me).ok()? {
         PNode::FnDef(..) | PNode::FnPtr(..) => Some(LanguageClone { clone, bytes: true }),
-        PNode::Tuple(_) | PNode::Record(_) | PNode::Closure { .. } => Some(LanguageClone { clone, bytes: false }),
+        PNode::Tuple(_) | PNode::Record(..) | PNode::Closure { .. } => Some(LanguageClone { clone, bytes: false }),
         _ => None,
     }
 }
@@ -125,7 +125,7 @@ impl Clones {
         let view = ground.view();
         let &[me] = view.list(called.args).ok()? else { return None };
         match view.node(me).ok()? {
-            PNode::Tuple(_) | PNode::Record(_) | PNode::Closure { .. } | PNode::FnDef(..) | PNode::FnPtr(..) => Some(CloneShim { clone, me }),
+            PNode::Tuple(_) | PNode::Record(..) | PNode::Closure { .. } | PNode::FnDef(..) | PNode::FnPtr(..) => Some(CloneShim { clone, me }),
             _ => None,
         }
     }

@@ -394,3 +394,67 @@ fn control_coinductive_cycle_as_inductive() {
         plant::with(p, || cycle_cases(t))
     });
 }
+
+#[test]
+fn record_union_tuple_distinct_unification_and_shapes() {
+    use crate::canon::{Canon, Decode};
+    use crate::term::{IntTy, Shape, UintTy, VarKind, shape_of_kind};
+    use crate::testing::tys::TestTys;
+    use crate::tys::Relate;
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut tys = TestTys::new();
+    let mut deferred = blaze_own::Vec::new_in(alloc);
+
+    let i32_ty = tys.mk(TyKind::Int(IntTy::I32)).expect("mk i32");
+    let u8_ty = tys.mk(TyKind::Uint(UintTy::U8)).expect("mk u8");
+    let elems = tys.mk_list(&[i32_ty, u8_ty]).expect("mk list");
+
+    let tup = tys.mk(TyKind::Tuple(elems)).expect("mk tuple");
+    let rec_a = tys.mk(TyKind::Record(0x1111_2222_3333_4444, elems)).expect("mk record a");
+    let rec_b = tys.mk(TyKind::Record(0x5555_6666_7777_8888, elems)).expect("mk record b");
+    let uni = tys.mk(TyKind::Union(elems)).expect("mk union");
+
+    // Distinct Shape buckets.
+    assert_eq!(shape_of_kind(tys.kind(tup)), Some(Shape::Tuple(2)));
+    assert_eq!(shape_of_kind(tys.kind(rec_a)), Some(Shape::Record(0x1111_2222_3333_4444, 2)));
+    assert_eq!(shape_of_kind(tys.kind(rec_b)), Some(Shape::Record(0x5555_6666_7777_8888, 2)));
+    assert_eq!(shape_of_kind(tys.kind(uni)), Some(Shape::Union(2)));
+    assert_ne!(shape_of_kind(tys.kind(tup)), shape_of_kind(tys.kind(rec_a)));
+    assert_ne!(shape_of_kind(tys.kind(tup)), shape_of_kind(tys.kind(uni)));
+    assert_ne!(shape_of_kind(tys.kind(rec_a)), shape_of_kind(tys.kind(uni)));
+    assert_ne!(shape_of_kind(tys.kind(rec_a)), shape_of_kind(tys.kind(rec_b)));
+
+    // Tuple, Record, Union NEVER unify with each other; distinct Record schemas NEVER unify.
+    assert!(!tys.unify(tup, rec_a, Relate::Lazy, &mut deferred).expect("unify"));
+    assert!(!tys.unify(tup, uni, Relate::Lazy, &mut deferred).expect("unify"));
+    assert!(!tys.unify(rec_a, uni, Relate::Lazy, &mut deferred).expect("unify"));
+    assert!(!tys.unify(rec_a, rec_b, Relate::Lazy, &mut deferred).expect("unify"));
+
+    // Same-schema Record unifies element-wise and binds variables.
+    let v1 = tys.fresh(VarKind::Ty).expect("fresh v1");
+    let rec_a_var_list = tys.mk_list(&[v1, u8_ty]).expect("mk list");
+    let rec_a_var = tys.mk(TyKind::Record(0x1111_2222_3333_4444, rec_a_var_list)).expect("mk rec var");
+    assert!(tys.unify(rec_a, rec_a_var, Relate::Lazy, &mut deferred).expect("unify same schema"));
+    assert_eq!(tys.shallow_resolve(v1), i32_ty);
+
+    // Union unifies element-wise and binds variables.
+    let v2 = tys.fresh(VarKind::Ty).expect("fresh v2");
+    let uni_var_list = tys.mk_list(&[i32_ty, v2]).expect("mk list");
+    let uni_var = tys.mk(TyKind::Union(uni_var_list)).expect("mk union var");
+    assert!(tys.unify(uni, uni_var, Relate::Lazy, &mut deferred).expect("unify union"));
+    assert_eq!(tys.shallow_resolve(v2), u8_ty);
+
+    // Canonicalization roundtrip preserves Record schema and Union identity.
+    let mut canon = Canon::new_in(alloc);
+    let mut words = blaze_own::Vec::new_in(alloc);
+    let mut dec = Decode::new_in(alloc);
+    canon.term(&tys, &mut words, rec_a).expect("canon rec");
+    dec.run(&mut tys, &words).expect("decode rec");
+    assert_eq!(tys.kind(rec_a), TyKind::Record(0x1111_2222_3333_4444, elems));
+    words.clear();
+    canon.clear();
+    canon.term(&tys, &mut words, uni).expect("canon uni");
+    let mut dec2 = Decode::new_in(alloc);
+    dec2.run(&mut tys, &words).expect("decode uni");
+}

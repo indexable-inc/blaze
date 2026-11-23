@@ -99,7 +99,7 @@ pub(crate) fn normalize_ground(
             let m = |t: PTy| mapped[t.0 as usize];
             let new = match node {
                 PNode::Tuple(l) => PNode::Tuple(remap_list(ground, l, &mapped, &mut list)?),
-                PNode::Record(l) => PNode::Record(remap_list(ground, l, &mapped, &mut list)?),
+                PNode::Record(s, l) => PNode::Record(s, remap_list(ground, l, &mapped, &mut list)?),
                 PNode::Union(l) => PNode::Union(remap_list(ground, l, &mapped, &mut list)?),
                 PNode::Adt(k, l) => PNode::Adt(k, remap_list(ground, l, &mapped, &mut list)?),
                 PNode::FnDef(k, l) => PNode::FnDef(k, remap_list(ground, l, &mapped, &mut list)?),

@@ -7,7 +7,7 @@ use blaze_own::{Alloc, Vec};
 
 use crate::error::{CheckError, Malformed};
 use crate::hash::{ContentHash, StableHasher};
-use crate::ids::{ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, List, Mutbl, Name, UintTy};
+use crate::ids::{ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, List, Mutbl, Name, RecordSchema, UintTy};
 use crate::intern::ListIndex;
 use blaze_hash::HashMap;
 use blaze_own::Box;
@@ -29,8 +29,8 @@ pub enum PNode {
     Never,
     /// Elements in the list column; `()` is the empty tuple.
     Tuple(List),
-    /// Structural record fields in canonical sorted name order.
-    Record(List),
+    /// Structural record: canonical schema hash and field types in sorted name order.
+    Record(RecordSchema, List),
     /// Structural union members in canonical order.
     Union(List),
     Ref(Mutbl, PTy),
@@ -183,7 +183,7 @@ impl<'a> PTys<'a> {
     /// Appends every child in declaration order. A projection's arguments precede its term.
     pub fn children_of(self, node: PNode, out: &mut impl Extend<PTy>) -> Result<(), CheckError> {
         match node {
-            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::Adt(_, l) | PNode::FnDef(_, l) | PNode::FnPtr(l, _)
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) | PNode::Adt(_, l) | PNode::FnDef(_, l) | PNode::FnPtr(l, _)
             | PNode::Opaque(_, l) | PNode::Closure { args: l, .. } | PNode::Coroutine { args: l, .. }
             | PNode::Alias { args: l, .. } | PNode::Dynamic(l) | PNode::ExTrait(_, l) => {
                 out.extend(self.list(l)?.iter().copied());
@@ -500,8 +500,9 @@ pub(crate) fn hash_node(n: &PNode, h: &mut StableHasher) {
             h.tag(30);
             h.u128(k.0);
         }
-        PNode::Record(l) => {
+        PNode::Record(s, l) => {
             h.tag(31);
+            h.u64(s.0);
             hash_list(l, h);
         }
         PNode::Union(l) => {
@@ -519,7 +520,7 @@ pub fn node_shape(n: PNode) -> PNode {
     let l = |l: List| List { start: 0, len: l.len };
     match n {
         PNode::Tuple(x) => PNode::Tuple(l(x)),
-        PNode::Record(x) => PNode::Record(l(x)),
+        PNode::Record(s, x) => PNode::Record(s, l(x)),
         PNode::Union(x) => PNode::Union(l(x)),
         PNode::Ref(m, _) => PNode::Ref(m, p),
         PNode::Ptr(m, _) => PNode::Ptr(m, p),
@@ -931,7 +932,7 @@ impl<'a> PortableTys<'a> {
         let node = match node {
             PNode::ConstValue { bits, .. } => PNode::ConstValue { ty: children[0], bits },
             PNode::Tuple(_) => PNode::Tuple(self.intern_list(children)?),
-            PNode::Record(_) => PNode::Record(self.intern_list(children)?),
+            PNode::Record(s, _) => PNode::Record(s, self.intern_list(children)?),
             PNode::Union(_) => PNode::Union(self.intern_list(children)?),
             PNode::Ref(m, _) => PNode::Ref(m, children[0]),
             PNode::Ptr(m, _) => PNode::Ptr(m, children[0]),

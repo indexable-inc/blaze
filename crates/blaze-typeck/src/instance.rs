@@ -216,7 +216,7 @@ impl<W: World> ClosureSource for OwnFirst<'_, '_, '_, '_, '_, W> {
 pub(crate) fn import<S: ClosureSource>(cx: &mut InferCtx<'_>, src: &mut S, types: PTys<'_>, t: PTy, subst: &[Ty], depth: u32) -> Result<Ty, S::Error> {
     enum Kind {
         Tuple,
-        Record,
+        Record(crate::ids::RecordSchema),
         Union,
         Ref(crate::ids::Mutbl),
         Ptr(crate::ids::Mutbl),
@@ -245,7 +245,7 @@ pub(crate) fn import<S: ClosureSource>(cx: &mut InferCtx<'_>, src: &mut S, types
     fn finish<S: ClosureSource>(cx: &mut InferCtx<'_>, src: &mut S, kind: Kind, slice: &[Ty], depth: u32) -> Result<Ty, S::Error> {
         let v = match kind {
             Kind::Tuple => TyView::Tuple(cx.mk_list(slice)?),
-            Kind::Record => TyView::Record(cx.mk_list(slice)?),
+            Kind::Record(s) => TyView::Record(s, cx.mk_list(slice)?),
             Kind::Union => TyView::Union(cx.mk_list(slice)?),
             Kind::Ref(m) => {
                 let Some(&p) = slice.first() else { return Ok(cx.mk(TyView::Error)?) };
@@ -386,7 +386,7 @@ pub(crate) fn import<S: ClosureSource>(cx: &mut InferCtx<'_>, src: &mut S, types
             node => {
                 let (kind, l) = match node {
                     PNode::Tuple(l) => (Kind::Tuple, l),
-                    PNode::Record(l) => (Kind::Record, l),
+                    PNode::Record(s, l) => (Kind::Record(s), l),
                     PNode::Union(l) => (Kind::Union, l),
                     PNode::Adt(k, l) => (Kind::Adt(k), l),
                     PNode::FnDef(k, l) => (Kind::FnDef(k), l),
@@ -481,7 +481,7 @@ pub(crate) fn export_as(cx: &mut Exporter<'_, '_>, t: Ty, ground: &mut PortableT
     enum Kind {
         Future(crate::ids::ExprId),
         Tuple,
-        Record,
+        Record(crate::ids::RecordSchema),
         Union,
         Ref(crate::ids::Mutbl),
         Ptr(crate::ids::Mutbl),
@@ -514,7 +514,7 @@ pub(crate) fn export_as(cx: &mut Exporter<'_, '_>, t: Ty, ground: &mut PortableT
                 PNode::Future(e, o, i)
             }
             Kind::Tuple => PNode::Tuple(ground.intern_list(slice)?),
-            Kind::Record => PNode::Record(ground.intern_list(slice)?),
+            Kind::Record(s) => PNode::Record(s, ground.intern_list(slice)?),
             Kind::Union => PNode::Union(ground.intern_list(slice)?),
             Kind::Ref(m) => {
                 let Some(&p) = slice.first() else { return Ok(None) };
@@ -635,7 +635,7 @@ pub(crate) fn export_as(cx: &mut Exporter<'_, '_>, t: Ty, ground: &mut PortableT
             view => {
                 let (kind, l) = match view {
                     TyView::Tuple(l) => (Kind::Tuple, l),
-                    TyView::Record(l) => (Kind::Record, l),
+                    TyView::Record(s, l) => (Kind::Record(s), l),
                     TyView::Union(l) => (Kind::Union, l),
                     TyView::Adt(k, l) => (Kind::Adt(k), l),
                     TyView::FnDef(k, l) => (Kind::FnDef(k), l),
@@ -746,7 +746,9 @@ pub(crate) fn shape_of(v: TyView, cx: &InferCtx<'_>) -> Option<Shape> {
         TyView::Float(f) => Shape::Float(f),
         TyView::Str => Shape::Str,
         TyView::Never => Shape::Never,
-        TyView::Tuple(l) | TyView::Record(l) | TyView::Union(l) => Shape::Tuple(cx.list_len(l)),
+        TyView::Tuple(l) => Shape::Tuple(cx.list_len(l)),
+        TyView::Record(s, l) => Shape::Record(s.0, cx.list_len(l)),
+        TyView::Union(l) => Shape::Union(cx.list_len(l)),
         TyView::Ref(m, _) => Shape::Ref(m),
         TyView::Ptr(m, _) => Shape::Ptr(m),
         TyView::Array(..) => Shape::Array,

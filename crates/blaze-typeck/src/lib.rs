@@ -109,7 +109,7 @@ pub use filed::Filed;
 pub use hash::{ContentHash, StableHasher};
 pub use ids::{
     Abi, Edition, ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, LangItem, List, Mutbl, Name, PatId, PathIdx, Range,
-    Safety, ScopeId, StmtId, UintTy,
+    RecordSchema, Safety, ScopeId, StmtId, UintTy,
 };
 pub use portable::{Full, MAX_OBJECT_PREDS, MAX_PATTERN_RANGES, OwnTys, PNode, PTy, PTys, PortableTys, Stable, canonical_ranges, node_shape, object_principal};
 pub use ty::{Cause, ClosureKind, FulfillError, FulfillErrorKind, Goal, Obligation, Ty, TyList, TyView, TypeCtx, Var, VarKind};

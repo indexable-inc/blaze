@@ -1858,7 +1858,7 @@ impl Out<'_, '_, '_> {
                 self.kid_list(ranges)?;
             }
             PNode::Tuple(l)
-            | PNode::Record(l)
+            | PNode::Record(_, l)
             | PNode::Union(l)
             | PNode::Adt(_, l)
             | PNode::FnDef(_, l)
@@ -1944,8 +1944,9 @@ impl Out<'_, '_, '_> {
                 self.t8(T_TUPLE);
                 self.tlist(l)?;
             }
-            PNode::Record(l) => {
+            PNode::Record(s, l) => {
                 self.t8(T_RECORD);
+                self.terms.extend_from_slice(&s.0.to_le_bytes());
                 self.tlist(l)?;
             }
             PNode::Union(l) => {
@@ -2497,7 +2498,10 @@ impl<'r> In<'r, '_, '_> {
             }
             T_EX_AUTO => PNode::ExAuto(self.key("a trait object's auto trait")?),
             T_FOREIGN => PNode::Foreign(self.key("an extern type")?),
-            T_RECORD => PNode::Record(self.list("a record's fields")?),
+            T_RECORD => {
+                let s = blaze_typeck::RecordSchema(self.u64("a record's schema")?);
+                PNode::Record(s, self.list("a record's fields")?)
+            }
             T_UNION => PNode::Union(self.list("a union's members")?),
             byte => return Err(E::Byte { what: "a term's tag", byte }),
         };

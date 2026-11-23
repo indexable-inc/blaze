@@ -434,7 +434,21 @@ pub fn may_overlap(
                 }
                 stack.push((t1, t2));
             }
-            (TyKind::Tuple(l1), TyKind::Tuple(l2)) => {
+            (TyKind::Tuple(l1), TyKind::Tuple(l2)) | (TyKind::Union(l1), TyKind::Union(l2)) => {
+                let (s1, s2) = (tys.list(l1), tys.list(l2));
+                if s1.len() != s2.len() {
+                    return false;
+                }
+                for (a1, a2) in s1.iter().zip(s2.iter()) {
+                    if let (Some(t1), Some(t2)) = (a1.ty(), a2.ty()) {
+                        stack.push((t1, t2));
+                    }
+                }
+            }
+            (TyKind::Record(h1, l1), TyKind::Record(h2, l2)) => {
+                if h1 != h2 {
+                    return false;
+                }
                 let (s1, s2) = (tys.list(l1), tys.list(l2));
                 if s1.len() != s2.len() {
                     return false;

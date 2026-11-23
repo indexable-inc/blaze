@@ -99,3 +99,57 @@ fn validity_is_exact_for_every_type() {
     }
     println!("validity exact: {n} decided");
 }
+
+#[test]
+fn union_validity_is_exact() {
+    let heap = blaze_own::testing::heap();
+    let w = World::default();
+    let mut g = G::new();
+    let u8_ = g.n(PNode::Uint(UintTy::U8));
+    let u64_ = g.n(PNode::Uint(UintTy::U64));
+    let bool_ = g.n(PNode::Bool);
+    let unit = g.tuple(&[]);
+    let never = g.n(PNode::Never);
+    let ref_u8 = g.r(u8_);
+    let ref_u64 = g.r(u64_);
+    let pair_never = g.tuple(&[u8_, never]);
+
+    let l_ref_unit = g.t.intern_list(&[ref_u64, unit]).unwrap();
+    let u_ref_unit = g.n(PNode::Union(l_ref_unit));
+    let l_refs = g.t.intern_list(&[ref_u64, ref_u8]).unwrap();
+    let u_refs = g.n(PNode::Union(l_refs));
+    let l_bool_unit = g.t.intern_list(&[bool_, unit]).unwrap();
+    let u_bool_unit = g.n(PNode::Union(l_bool_unit));
+    let l_u64_never = g.t.intern_list(&[u64_, never]).unwrap();
+    let u_u64_never = g.n(PNode::Union(l_u64_never));
+    let l_never_u64 = g.t.intern_list(&[never, u64_]).unwrap();
+    let u_never_u64 = g.n(PNode::Union(l_never_u64));
+    let l_never_ref = g.t.intern_list(&[never, ref_u64]).unwrap();
+    let u_never_ref = g.n(PNode::Union(l_never_ref));
+    let l_uninhab = g.t.intern_list(&[pair_never, never]).unwrap();
+    let u_uninhab = g.n(PNode::Union(l_uninhab));
+    let u_empty = g.n(PNode::Union(List::EMPTY));
+
+    let cases = [
+        (Check::Zero, u_ref_unit, true),
+        (Check::Ones, u_ref_unit, false),
+        (Check::Zero, u_refs, false),
+        (Check::Zero, u_bool_unit, true),
+        (Check::Ones, u_bool_unit, true),
+        (Check::Zero, u_u64_never, true),
+        (Check::Zero, u_never_u64, true),
+        (Check::Zero, u_never_ref, false),
+        (Check::Zero, u_uninhab, false),
+        (Check::Zero, u_empty, false),
+        (Check::Inhabited, u_ref_unit, true),
+        (Check::Inhabited, u_u64_never, true),
+        (Check::Inhabited, u_never_u64, true),
+        (Check::Inhabited, u_uninhab, false),
+        (Check::Inhabited, u_empty, false),
+    ];
+    let mut ls = Layouts::new_in(heap.alloc());
+    for (check, ty, want) in cases {
+        let mut cx = LayoutCx { ground: &mut g.t, facts: &w, scratch: heap.alloc() };
+        assert_eq!(permits(check, ty, &mut ls, &mut cx).unwrap(), want, "{check:?} of union {}", ty.0);
+    }
+}

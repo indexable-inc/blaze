@@ -266,8 +266,8 @@ fn ty_node<W: Write>(w: &mut W, n: PNode) -> fmt::Result {
             w.write_str("tuple ")?;
             list(w, l)
         }
-        PNode::Record(l) => {
-            w.write_str("record ")?;
+        PNode::Record(s, l) => {
+            write!(w, "record s{:x} ", s.0)?;
             list(w, l)
         }
         PNode::Union(l) => {
@@ -320,30 +320,91 @@ fn ty_node<W: Write>(w: &mut W, n: PNode) -> fmt::Result {
     }
 }
 
+fn write_proj<W: Write>(w: &mut W, proj: Proj, of_drop_type: bool) -> fmt::Result {
+    let minus = |from_end: bool| if from_end { "-" } else { "" };
+    match proj {
+        Proj::Field { index, ty } => write!(w, ".{index}:t{}", ty.0)?,
+        Proj::Deref => w.write_str(".*")?,
+        Proj::DerefBox => w.write_str(".box")?,
+        Proj::Index(l) => write!(w, "[{l}]")?,
+        Proj::ConstIndex { offset, min_length, from_end } => {
+            write!(w, "[{}{offset} of {min_length}]", minus(from_end))?;
+        }
+        Proj::Subslice { from, to, from_end } => write!(w, "[{from}..{}{to}]", minus(from_end))?,
+        Proj::Downcast(v) => write!(w, "#{v}")?,
+    }
+    if of_drop_type {
+        w.write_str("!")?;
+    }
+    Ok(())
+}
+
 fn place<W: Write>(b: &BodyRef<'_>, p: Place, w: &mut W) -> Result<(), PrintError> {
-    let row = b.place(p)?;
-    match (row.parent, row.proj) {
-        (None, None) => write!(w, "{}", row.local)?,
-        // A parent is an earlier row (verify's rule), which also ends this recursion.
-        (Some(up), Some(proj)) if up.0 < p.0 => {
-            place(b, up, w)?;
-            let minus = |from_end: bool| if from_end { "-" } else { "" };
-            match proj {
-                Proj::Field { index, ty } => write!(w, ".{index}:t{}", ty.0)?,
-                Proj::Deref => w.write_str(".*")?,
-                Proj::DerefBox => w.write_str(".box")?,
-                Proj::Index(l) => write!(w, "[{l}]")?,
-                Proj::ConstIndex { offset, min_length, from_end } => {
-                    write!(w, "[{}{offset} of {min_length}]", minus(from_end))?;
+    const BUF: usize = 64;
+    let mut projs: [Option<(Proj, bool)>; BUF] = [None; BUF];
+    let mut depth: usize = 0;
+    let mut cur = p;
+    let root_local = loop {
+        let row = b.place(cur)?;
+        match (row.parent, row.proj) {
+            (None, None) => break row.local,
+            // A parent is an earlier row (verify's rule), which also ends this walk.
+            (Some(up), Some(proj)) if up.0 < cur.0 => {
+                if let Some(slot) = projs.get_mut(depth) {
+                    *slot = Some((proj, row.of_drop_type));
                 }
-                Proj::Subslice { from, to, from_end } => write!(w, "[{from}..{}{to}]", minus(from_end))?,
-                Proj::Downcast(v) => write!(w, "#{v}")?,
+                depth += 1;
+                cur = up;
             }
-            if row.of_drop_type {
-                w.write_str("!")?;
+            _ => return Err(PrintError::Bad(BadRow { table: Table::Places, row: cur.0, code: NONE })),
+        }
+    };
+    write!(w, "{root_local}")?;
+    if depth <= BUF {
+        if let Some(slice) = projs.get(..depth) {
+            for entry in slice.iter().rev() {
+                if let Some((proj, of_drop_type)) = *entry {
+                    write_proj(w, proj, of_drop_type)?;
+                }
             }
         }
-        _ => return Err(PrintError::Bad(BadRow { table: Table::Places, row: p.0, code: NONE })),
+        return Ok(());
+    }
+    // Deep place (> BUF projections): emit in chunks from root to leaf without heap allocation.
+    let mut emitted: usize = 0;
+    while emitted < depth {
+        let chunk = (depth - emitted).min(BUF);
+        let skip = depth - emitted - chunk;
+        let mut cur = p;
+        for _ in 0..skip {
+            let row = b.place(cur)?;
+            let Some(up) = row.parent else {
+                return Err(PrintError::Bad(BadRow { table: Table::Places, row: cur.0, code: NONE }));
+            };
+            cur = up;
+        }
+        let mut filled: usize = 0;
+        for _ in 0..chunk {
+            let row = b.place(cur)?;
+            match (row.parent, row.proj) {
+                (Some(up), Some(proj)) => {
+                    if let Some(slot) = projs.get_mut(filled) {
+                        *slot = Some((proj, row.of_drop_type));
+                    }
+                    filled += 1;
+                    cur = up;
+                }
+                _ => return Err(PrintError::Bad(BadRow { table: Table::Places, row: cur.0, code: NONE })),
+            }
+        }
+        if let Some(slice) = projs.get(..filled) {
+            for entry in slice.iter().rev() {
+                if let Some((proj, of_drop_type)) = *entry {
+                    write_proj(w, proj, of_drop_type)?;
+                }
+            }
+        }
+        emitted += chunk;
     }
     Ok(())
 }
@@ -810,7 +871,10 @@ impl<A: Allocator + Copy> Parser<A> {
             "infer" => PNode::Infer,
             "error" => PNode::Error,
             "tuple" => PNode::Tuple(Self::list(c)?),
-            "record" => PNode::Record(Self::list(c)?),
+            "record" => {
+                let s = blaze_typeck::RecordSchema(u64::try_from(Self::hex(c, "s")?).map_err(|_| c.err(ParseWhat::Number))?);
+                PNode::Record(s, Self::list(c)?)
+            }
             "union" => PNode::Union(Self::list(c)?),
             "ref" => {
                 let m = match c.keyword("mut") {

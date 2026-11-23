@@ -869,9 +869,10 @@ fn reveal_one<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, t: Ty) -> Result<Ty, 
 /// children then related pairwise by [`eq_revealing`]); a childless kind is its own head.
 fn same_head(a: TyKind, b: TyKind) -> bool {
     match (a, b) {
-        (TyKind::Tuple(x), TyKind::Tuple(y)) | (TyKind::Dynamic(x, _), TyKind::Dynamic(y, _)) | (TyKind::Pat(_, x), TyKind::Pat(_, y)) => {
+        (TyKind::Tuple(x), TyKind::Tuple(y)) | (TyKind::Union(x), TyKind::Union(y)) | (TyKind::Dynamic(x, _), TyKind::Dynamic(y, _)) | (TyKind::Pat(_, x), TyKind::Pat(_, y)) => {
             x.len == y.len
         }
+        (TyKind::Record(s1, x), TyKind::Record(s2, y)) => s1 == s2 && x.len == y.len,
         (TyKind::Ref(_, _, m), TyKind::Ref(_, _, n)) | (TyKind::RawPtr(_, m), TyKind::RawPtr(_, n)) => m == n,
         (TyKind::Array(..), TyKind::Array(..)) | (TyKind::Slice(_), TyKind::Slice(_)) => true,
         (TyKind::Adt(d, x), TyKind::Adt(e, y))

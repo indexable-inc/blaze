@@ -111,7 +111,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 }
                 PNode::Ptr(m, i) => todo.push(Step::Ty(i, v.then(under_ref(m)))),
                 PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => todo.push(Step::Ty(i, v)),
-                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => {
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
                     for &x in self.list(l, e)?.iter().rev() {
                         todo.push(Step::Ty(x, v));
                     }

@@ -605,9 +605,9 @@ fn term(h: &mut Hasher, t: PTy, types: PTys<'_>) -> Result<(), Stop> {
             PNode::ExAuto(key) => (29u8, key).hash(f),
             // An extern type, by its item: a tag no earlier node had.
             PNode::Foreign(key) => (30u8, key).hash(f),
-            PNode::Record(l) => {
+            PNode::Record(s, l) => {
                 let n = kids(&mut stack, types, l)?;
-                (31u8, n).hash(&mut Fed(h));
+                (31u8, s.0, n).hash(&mut Fed(h));
             }
             PNode::Union(l) => {
                 let n = kids(&mut stack, types, l)?;

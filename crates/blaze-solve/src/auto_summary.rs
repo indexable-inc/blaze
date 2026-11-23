@@ -212,7 +212,7 @@ fn walk_field<T: Tys, F: Facts>(
                 }
                 work.push(e);
             }
-            TyKind::Tuple(l) => {
+            TyKind::Tuple(l) | TyKind::Record(_, l) | TyKind::Union(l) => {
                 if crate::structural::possible_impl(cx, trait_, shape, None)? {
                     return Ok(false);
                 }

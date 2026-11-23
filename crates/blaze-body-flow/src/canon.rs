@@ -93,6 +93,7 @@ pub fn canon<A: Allocator + Copy>(flow: &Flow<A>, out: &mut impl Write, alloc: A
         origin: filled(flow.origins as usize, alloc),
         next_origin: 0,
         number: &number,
+        projs: Vec::new_in(alloc),
     };
     for l in 0..=flow.args {
         if let Some(slot) = p.local.get_mut(l as usize) {
@@ -226,6 +227,7 @@ struct Printer<'f, A: Allocator> {
     origin: Vec<u32, A>,
     next_origin: u32,
     number: &'f [u32],
+    projs: Vec<(Proj, bool), A>,
 }
 
 impl<A: Allocator> Printer<'_, A> {
@@ -265,29 +267,36 @@ impl<A: Allocator> Printer<'_, A> {
         write!(out, "bb{}", self.number[b.index()])
     }
 
-    fn place(&mut self, p: Place, out: &mut impl Write) -> fmt::Result {
-        let row = self.flow.place(p);
-        match (row.parent, row.proj) {
-            (Some(up), Some(proj)) => {
-                self.place(up, out)?;
-                match proj {
-                    Proj::Field(i) => write!(out, ".{i}")?,
-                    Proj::Deref => out.write_str(".*")?,
-                    Proj::DerefBox => out.write_str(".box")?,
-                    Proj::Index => out.write_str("[]")?,
-                    Proj::ConstantIndex { offset, min_length, from_end: false } => write!(out, "[{offset} of {min_length}]")?,
-                    Proj::ConstantIndex { offset, min_length, from_end: true } => write!(out, "[-{offset} of {min_length}]")?,
-                    Proj::Subslice { from, to, from_end: false } => write!(out, "[{from}..{to}]")?,
-                    Proj::Subslice { from, to, from_end: true } => write!(out, "[{from}..-{to}]")?,
-                    Proj::Downcast(v) => write!(out, "#{v}")?,
+    fn place(&mut self, mut p: Place, out: &mut impl Write) -> fmt::Result {
+        self.projs.clear();
+        let root_local = loop {
+            let row = self.flow.place(p);
+            match (row.parent, row.proj) {
+                (Some(up), Some(proj)) => {
+                    self.projs.push((proj, row.of_drop_type));
+                    p = up;
                 }
-                if row.of_drop_type {
-                    out.write_str("!")?;
-                }
-                Ok(())
+                _ => break row.local.0,
             }
-            _ => self.local(row.local.0, out),
+        };
+        self.local(root_local, out)?;
+        while let Some((proj, of_drop_type)) = self.projs.pop() {
+            match proj {
+                Proj::Field(i) => write!(out, ".{i}")?,
+                Proj::Deref => out.write_str(".*")?,
+                Proj::DerefBox => out.write_str(".box")?,
+                Proj::Index => out.write_str("[]")?,
+                Proj::ConstantIndex { offset, min_length, from_end: false } => write!(out, "[{offset} of {min_length}]")?,
+                Proj::ConstantIndex { offset, min_length, from_end: true } => write!(out, "[-{offset} of {min_length}]")?,
+                Proj::Subslice { from, to, from_end: false } => write!(out, "[{from}..{to}]")?,
+                Proj::Subslice { from, to, from_end: true } => write!(out, "[{from}..-{to}]")?,
+                Proj::Downcast(v) => write!(out, "#{v}")?,
+            }
+            if of_drop_type {
+                out.write_str("!")?;
+            }
         }
+        Ok(())
     }
 
     fn operand(&mut self, o: Operand, out: &mut impl Write) -> fmt::Result {

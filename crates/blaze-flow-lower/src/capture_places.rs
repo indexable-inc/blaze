@@ -146,7 +146,7 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
                         return self.refuse(Form::Malformed, e);
                     }
                     let drop_type = match self.node(ty.ty, e)? {
-                        PNode::Tuple(_) | PNode::Record(_) if variant == 0 => false,
+                        PNode::Tuple(_) | PNode::Record(..) if variant == 0 => false,
                         PNode::Adt(k, _) => {
                             let facts = self.adt_facts(k, e)?;
                             if facts.union {

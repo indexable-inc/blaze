@@ -93,7 +93,7 @@ fn node_at(o: &mut AString<'_>, tys: PTys<'_>, t: PTy, left: &mut Budget) -> Res
             list(o, tys, l, left)?;
             o.write_str(")")
         }
-        PNode::Record(l) => {
+        PNode::Record(_, l) => {
             o.write_str("record(")?;
             list(o, tys, l, left)?;
             o.write_str(")")

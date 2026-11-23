@@ -174,7 +174,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 | TyView::FnPtr(..)
                 | TyView::Ptr(..)
                 | TyView::Ref(Mutbl::Not, _) => {}
-                TyView::Tuple(l) | TyView::Record(l) | TyView::Union(l) => {
+                TyView::Tuple(l) | TyView::Record(_, l) | TyView::Union(l) => {
                     for i in 0..self.ty.list_len(l) {
                         work.push(self.ty.list_get(l, i));
                     }

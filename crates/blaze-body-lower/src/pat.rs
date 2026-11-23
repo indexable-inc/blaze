@@ -375,24 +375,32 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
 
     /// `let p;`: each binding's storage begun, nothing written.
     pub(crate) fn declare_uninit(&mut self, p: PatId, out: &mut Vec<Binding, A>) -> Result<(), LowerError> {
-        match self.pat(p)? {
-            Pat::Wild => Ok(()),
-            Pat::Bind { sub: None, .. } => {
-                let lt = self.local_ty(p)?;
-                let (local, lp) = self.binding_local(p, lt)?;
-                let drops = self.needs_drop(lt, At::Pat(p))?;
-                out.push(Binding { local, place: lp, ty: lt, drops });
-                self.bind(p, lp);
-                Ok(())
+        let mut work: Vec<PatId, A> = Vec::new_in(self.alloc);
+        work.push(p);
+        let mut steps = 0u32;
+        while let Some(cur) = work.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse_pat(Construct::Bound, cur);
             }
-            Pat::Tuple { elems, .. } => {
-                for &s in self.pats_in(elems, p)? {
-                    self.declare_uninit(s, out)?;
+            match self.pat(cur)? {
+                Pat::Wild => {}
+                Pat::Bind { sub: None, .. } => {
+                    let lt = self.local_ty(cur)?;
+                    let (local, lp) = self.binding_local(cur, lt)?;
+                    let drops = self.needs_drop(lt, At::Pat(cur))?;
+                    out.push(Binding { local, place: lp, ty: lt, drops });
+                    self.bind(cur, lp);
                 }
-                Ok(())
+                Pat::Tuple { elems, .. } => {
+                    for &s in self.pats_in(elems, cur)?.iter().rev() {
+                        work.push(s);
+                    }
+                }
+                _ => return self.refuse_pat(Construct::Refutable, cur),
             }
-            _ => self.refuse_pat(Construct::Refutable, p),
         }
+        Ok(())
     }
 
     /// `match scrutinee { arms }` into `dest`, arm by arm (the module's rule). An arm's guard

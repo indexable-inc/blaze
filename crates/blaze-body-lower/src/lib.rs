@@ -591,8 +591,8 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             | PNode::Ref(Mutbl::Not, _) => Some(true),
             PNode::Ref(Mutbl::Mut, _) => Some(false),
             PNode::Param(i) => Some(self.facts.param_copy(i)),
-            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) if l.len == 0 => Some(true),
-            PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
+            PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) if l.len == 0 => Some(true),
+            PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
             _ => Some(false),
         };
         if let Some(ans) = quick {
@@ -639,7 +639,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
                     }
                     return Ok(false);
                 }
-                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => stack.extend_from_slice(self.list(l, at)?),
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => stack.extend_from_slice(self.list(l, at)?),
                 PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
                 PNode::Adt(k, l) => {
                     if !self.adt_facts(k, at)?.copy {
@@ -709,7 +709,9 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         if i >= self.pat_place.len() {
             self.pat_place.resize(i + 1, Place(NONE));
         }
-        self.pat_place[i] = place;
+        if let Some(slot) = self.pat_place.get_mut(i) {
+            *slot = place;
+        }
     }
 
     /// The place binding pattern `p` was given.
