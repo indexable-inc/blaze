@@ -1117,12 +1117,18 @@ impl fmt::Display for Rekeyed {
 pub(crate) const REACH_ROOT: &str = "reach";
 pub(crate) const ANSWER_ROOT: &str = "answer";
 /// Page slots per reach shard once an answer spans more than one shard (`> 512` pages):
-/// at Tempo's 65,536 pages, 128 shards (`{name}.reach.00`..`{name}.reach.7f`) let a 4-page edit
-/// renew 124 unchanged shards in O(1) (`Lent::renew_root`, 0 CAS probes) and write at most 4
-/// shards (<= 2,048 probes, <= 64 KiB) instead of probing and rewriting all 65,536 page indexes
-/// (2.1 MiB) on every edit. Small answers (`<= 512` pages) keep the single `{name}.reach` root.
+/// at Tempo's 65,536 pages, 128 base shards (`{name}.reach.00`..`{name}.reach.7f`) plus one
+/// bounded delta root (`{name}.reach.delta`, capped at [`REACH_DELTA_CAP`]) let incremental edits
+/// renew all 128 base shards in O(1) (`Lent::renew_root`, 0 CAS probes) and probe only the delta's
+/// changed page indexes (e.g. 4 probes for a 4-page edit, 82 for an 82-page edit) instead of
+/// probing `touched_shards * 512` keys. Once the delta would exceed [`REACH_DELTA_CAP`], changed
+/// shards are folded and `{name}.reach.delta` is reset to empty. Small answers (`<= 512` pages)
+/// keep the single `{name}.reach` root.
 pub(crate) const REACH_SHARD_PAGES: usize = 512;
 pub(crate) const REACH_SHARDS_MOST: usize = (1usize << blaze_drive::answers::MOST_BITS) / REACH_SHARD_PAGES;
+/// Maximum page indexes accumulated in `{name}.reach.delta` before folding into changed base shards.
+pub(crate) const REACH_DELTA_CAP: usize = 512;
+const REACH_DELTA_SUFFIX: &str = "delta";
 
 const PAGES_DOMAIN: &str = "blaze-cli engine-check page keys";
 
@@ -1389,8 +1395,12 @@ fn save<'m, D: Driver, S: Sharing>(
         saved.puts += 1;
     }
     // The printed lines, under the key of their bytes: equal lines are one record.
-    store.put(cx, lines.0, lines.1)?;
-    saved.puts += 1;
+    // Empty bytes signal that `ViewSlot::render` already proved `lines.0` is held in the store
+    // and skipped re-encoding it; `direct` below still pins `lines.0` under `{name}.answer`.
+    if !lines.1.is_empty() {
+        store.put(cx, lines.0, lines.1)?;
+        saved.puts += 1;
+    }
     let leaves = Leaves::bytes_in(rows, frame)?;
     let mut pointer: blaze_own::Vec<u8, &Frame> = blaze_own::Vec::with_capacity_in(POINTER_BYTES, frame);
     pointer.extend_from_slice(POINTER_MAGIC);
@@ -1996,10 +2006,58 @@ fn page_indexes<'h, D: Driver>(
     Ok((indexes, Rekeyed { pages, whole: None }))
 }
 
-/// Sharded reach roots (`{name}.reach.00`..`{name}.reach.ff`, [`REACH_SHARD_PAGES`] page slots per
-/// shard) for answers spanning more than [`REACH_SHARD_PAGES`] pages. Unchanged shards renew in
-/// O(1) via [`blaze_cas::plain::Lent::renew_root`] (0 CAS probes, 0 hashes, 0 writes); only shards
-/// containing a changed page call [`blaze_cas::plain::Lent::root_through`] on their <= 256 keys.
+/// Whether `keys` (sorted) has the exact same 32-byte key sequence as `bytes`.
+fn keys_equal_bytes(keys: &[blaze_cas::Key], bytes: &[u8]) -> bool {
+    keys.len().saturating_mul(32) == bytes.len()
+        && keys.iter().zip(bytes.chunks_exact(32)).all(|(key, chunk)| key.0.0 == chunk)
+}
+
+/// Merges sorted 32-byte keys from `carried` with sorted deduplicated `added` into one sorted
+/// deduplicated vector.
+fn merge_sorted_keys<'h>(carried: &[u8], added: &[blaze_cas::Key], alloc: SharedAlloc<'h>) -> blaze_own::Vec<blaze_cas::Key, SharedAlloc<'h>> {
+    let count = carried.len() / 32;
+    let mut out = blaze_own::Vec::with_capacity_in(count + added.len(), alloc);
+    let mut i = 0usize;
+    let mut added_iter = added.iter().copied().peekable();
+    while i < count {
+        let a = cas_key_at(carried, i);
+        let Some(&b) = added_iter.peek() else {
+            break;
+        };
+        match a.cmp(&b) {
+            core::cmp::Ordering::Less => {
+                out.push(a);
+                i += 1;
+            }
+            core::cmp::Ordering::Greater => {
+                out.push(b);
+                let _ = added_iter.next();
+            }
+            core::cmp::Ordering::Equal => {
+                out.push(a);
+                i += 1;
+                let _ = added_iter.next();
+            }
+        }
+    }
+    while i < count {
+        out.push(cas_key_at(carried, i));
+        i += 1;
+    }
+    out.extend(added_iter);
+    out
+}
+
+/// Sharded reach roots (`{name}.reach.00`..`{name}.reach.7f`, [`REACH_SHARD_PAGES`] page slots per
+/// shard) plus a bounded delta root (`{name}.reach.delta`, capped at [`REACH_DELTA_CAP`]) for
+/// answers spanning more than [`REACH_SHARD_PAGES`] pages.
+///
+/// On incremental edits whose accumulated delta fits within [`REACH_DELTA_CAP`], every base shard
+/// renews in O(1) via [`blaze_cas::plain::Lent::renew_root`] (0 CAS probes, 0 writes) and only
+/// `{name}.reach.delta` is published (probing only the delta keys, not `touched_shards * 512`).
+/// When the delta overflows [`REACH_DELTA_CAP`] (or a root is absent/expired), changed base shards
+/// fold in place (unchanged shards still renew with 0 probes) and `{name}.reach.delta` resets to
+/// empty, reclaiming superseded pages.
 #[expect(clippy::too_many_arguments, reason = "reach shard publisher: each argument one handle")]
 fn publish_reach_shards<D: Driver>(
     lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
@@ -2013,53 +2071,89 @@ fn publish_reach_shards<D: Driver>(
 ) -> Result<(u32, Rekeyed), CliError> {
     let index_of = |page: Key| blaze_cas::plain::beside_key(blaze_cas::Key(page.0));
     let proof = prove_last_reach(lent, answer_name, last, now.len(), rekey)?;
+    let total_live = u32::try_from(now.iter().filter(|page| **page != Key::default()).count()).unwrap_or(u32::MAX);
+    let num_shards = now.len().div_ceil(REACH_SHARD_PAGES);
     let mut shard_name = blaze_own::String::new_in(frame);
+    let delta_name = bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}.{REACH_DELTA_SUFFIX}");
+    let mut missing_root = false;
+
+    // Incremental delta fast path: renew all base shards in O(1) and publish only changed page
+    // indexes in `{name}.reach.delta` while the accumulated delta fits within REACH_DELTA_CAP.
+    if let Ok((old, _last_root)) = proof {
+        if let Some(carried_delta) = held_root_bytes(lent, delta_name.as_str())? {
+            let mut added: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
+            let mut moved = 0u32;
+            for (_was, is) in old.iter().zip(now.iter()).filter(|(was, is)| was != is) {
+                moved = moved.saturating_add(1);
+                if *is != Key::default() {
+                    added.push(index_of(*is));
+                }
+            }
+            added.sort_unstable();
+            added.dedup();
+            let next_delta = merge_sorted_keys(carried_delta, &added, alloc);
+            if next_delta.len() <= REACH_DELTA_CAP {
+                let mut all_shards_live = true;
+                for shard in 0..num_shards {
+                    shard_name.clear();
+                    let _ = write!(shard_name, "{name}.{REACH_ROOT}.{shard:02x}");
+                    if !lent.renew_root(shard_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
+                        all_shards_live = false;
+                        missing_root = true;
+                        break;
+                    }
+                }
+                if all_shards_live {
+                    let delta_unchanged = keys_equal_bytes(&next_delta, carried_delta);
+                    if delta_unchanged && lent.renew_root(delta_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
+                        return Ok((total_live, Rekeyed { pages: moved, whole: None }));
+                    }
+                    lent.root_through(delta_name.as_str(), &next_delta, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+                    return Ok((total_live, Rekeyed { pages: moved, whole: None }));
+                }
+            }
+        } else {
+            missing_root = true;
+        }
+    }
+
+    // Fold / cold path: write each base shard whose sorted indexes changed (renewing unchanged
+    // shards in O(1) with 0 probes when `proof` holds) and reset `{name}.reach.delta` to empty.
     let mut scratch: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::with_capacity_in(REACH_SHARD_PAGES, alloc);
-    let mut total_live = 0u32;
     let mut rekeyed_pages = 0u32;
-    let mut missing_shard = false;
     for (shard, now_slice) in now.chunks(REACH_SHARD_PAGES).enumerate() {
-        let start = shard * REACH_SHARD_PAGES;
-        let end = start + now_slice.len();
-        let live_here = u32::try_from(now_slice.iter().filter(|page| **page != Key::default()).count()).unwrap_or(u32::MAX);
-        total_live = total_live.saturating_add(live_here);
         shard_name.clear();
         let _ = write!(shard_name, "{name}.{REACH_ROOT}.{shard:02x}");
-        if let Ok((old, last_root)) = proof
-            && let Some(old_slice) = old.get(start..end)
-        {
-            if old_slice == now_slice {
-                if lent.renew_root(shard_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
-                    continue;
-                }
-                missing_shard = true;
-            } else if let Some(carried) = held_root_bytes(lent, shard_name.as_str())? {
-                let (indexes, moved) = merge_carried_indexes(carried, old_slice, now_slice, last_root, alloc)?;
-                rekeyed_pages = rekeyed_pages.saturating_add(moved);
-                lent.root_through(shard_name.as_str(), &indexes, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
-                continue;
-            } else {
-                missing_shard = true;
-            }
-        }
         scratch.clear();
         scratch.extend(now_slice.iter().filter(|page| **page != Key::default()).map(|page| index_of(*page)));
         scratch.sort_unstable();
+        if proof.is_ok() {
+            if let Some(existing) = held_root_bytes(lent, shard_name.as_str())? {
+                if keys_equal_bytes(&scratch, existing)
+                    && lent.renew_root(shard_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live()
+                {
+                    continue;
+                }
+            } else {
+                missing_root = true;
+            }
+        }
         rekeyed_pages = rekeyed_pages.saturating_add(u32::try_from(scratch.len()).unwrap_or(u32::MAX));
         lent.root_through(shard_name.as_str(), &scratch, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
     }
+    lent.root_through(delta_name.as_str(), &[], blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
     let whole = match proof {
         Err(why) => Some(why),
-        Ok(_) if missing_shard => Some(WhyWhole::NoRoot),
+        Ok(_) if missing_root => Some(WhyWhole::NoRoot),
         Ok(_) => None,
     };
     Ok((total_live, Rekeyed { pages: rekeyed_pages, whole }))
 }
 
-/// Appends any live sharded reach root names (`{name}.reach.00`..`{name}.reach.ff`) to `out` so a
-/// certified no-op check renews every live reach shard in O(1) alongside the single `{name}.reach`
-/// root. Small answers (`<= 256` pages) check shard `00` once (a manifest miss, 0 reads) and add
-/// nothing.
+/// Appends any live sharded reach root names (`{name}.reach.00`..`{name}.reach.7f` and
+/// `{name}.reach.delta`) to `out` so a certified no-op check renews every live reach root in O(1)
+/// alongside the single `{name}.reach` root. Small answers (`<= 512` pages) check shard `00` once
+/// (a manifest miss, 0 reads) and add nothing.
 pub(crate) fn push_reach_shards<'f, D: Driver, S: Sharing>(
     store: &mut CommandStore<'_, '_, D, S>,
     name: &str,
@@ -2074,6 +2168,7 @@ pub(crate) fn push_reach_shards<'f, D: Driver, S: Sharing>(
     for shard in 1..REACH_SHARDS_MOST {
         out.push(bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}.{shard:02x}"));
     }
+    out.push(bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}.{REACH_DELTA_SUFFIX}"));
     Ok(())
 }
 
@@ -2143,15 +2238,17 @@ mod reach_shard_tests {
         assert_eq!(rekeyed.whole, Some(WhyWhole::NoLast));
         lent.commit().expect("commit cold shards");
 
-        // `push_reach_shards` detects sharded answers and skips unsharded names.
+        // `push_reach_shards` detects sharded answers (shards + delta) and skips unsharded names.
         let mut shards_found = blaze_own::Vec::new_in(frame);
         push_reach_shards(&mut store, "small-absent", frame, &mut shards_found).expect("unsharded check");
         assert!(shards_found.is_empty(), "absent/unsharded root adds 0 shard names");
         push_reach_shards(&mut store, "big", frame, &mut shards_found).expect("sharded check");
-        assert_eq!(shards_found.len(), REACH_SHARDS_MOST);
+        assert_eq!(shards_found.len(), REACH_SHARDS_MOST + 1);
         assert_eq!(shards_found[0].as_str(), "big.reach.00");
+        assert_eq!(shards_found[REACH_SHARDS_MOST].as_str(), "big.reach.delta");
 
-        // Mutate ONLY 1 page in shard 0 (shards 1, 2, 3 remain untouched).
+        // Mutate ONLY 1 page in shard 0: all 4 base shards renew in O(1) (0 probes), and only
+        // `{name}.reach.delta` is published (1 probe, not 512!).
         let mut next_pages = blaze_own::Vec::with_capacity_in(total_pages, alloc);
         next_pages.extend_from_slice(&pages);
         let replaced_old = next_pages[7];
@@ -2166,22 +2263,149 @@ mod reach_shard_tests {
         let probes_delta = lent.put_tally().disk.root_probes - probes_before;
         assert_eq!(live2 as usize, total_pages);
         assert_eq!(rekeyed2, Rekeyed { pages: 1, whole: None }, "only the 1 edited page re-keyed");
-        assert!(
-            probes_delta <= REACH_SHARD_PAGES as u64,
-            "unchanged shards 1..3 renewed in O(1) with 0 CAS probes (got {probes_delta}, total pages {total_pages})",
-        );
+        assert_eq!(probes_delta, 1, "1-page edit probes only the 1 delta key, not all 512 keys of shard 0 (got {probes_delta})");
         lent.commit().expect("commit edited shards");
 
-        // Verify shard 0 has the replacement beside_key and dropped the old one, and shards 1..3 hold all theirs.
+        // Verify replacement is reachable via `big.reach.delta`, and all 4 base shards remain live.
         let old_beside = blaze_cas::plain::beside_key(blaze_cas::Key(replaced_old.0)).0.0;
         let new_beside = blaze_cas::plain::beside_key(rep_cas).0.0;
-        let shard0 = store.named("big.reach.00").expect("read shard 0").expect("shard 0 live");
-        assert!(shard0.chunks_exact(32).any(|k| k == &new_beside), "shard 0 holds replacement page index");
-        assert!(!shard0.chunks_exact(32).any(|k| k == &old_beside), "shard 0 dropped replaced page index");
-        for shard in 1..4usize {
+        let delta = store.named("big.reach.delta").expect("read delta").expect("delta live");
+        assert_eq!(delta.len(), 32, "delta holds the 1 replacement page index");
+        assert_eq!(&delta[..32], &new_beside, "delta holds replacement page index");
+        for shard in 0..4usize {
             let name = bstd::mem::format_in!(frame, "big.reach.{shard:02x}");
             let bytes = store.named(name.as_str()).expect("read shard").expect("shard live");
-            assert_eq!(bytes.len(), REACH_SHARD_PAGES * 32, "unchanged shard {shard} preserved all keys");
+            assert_eq!(bytes.len(), REACH_SHARD_PAGES * 32, "base shard {shard} preserved all keys");
+        }
+        let shard0 = store.named("big.reach.00").expect("read shard 0").expect("shard 0 live");
+        assert!(shard0.chunks_exact(32).any(|k| k == &old_beside), "base shard 0 stays untouched until fold");
+    }
+
+    /// Multi-page edit (82 changed pages spread across all 16 shards) probes only the 82 delta
+    /// keys (not `16 * 512 = 8,192` or `63,531`!), keeps 100% of live pages reachable, and folds
+    /// cleanly once accumulated edits exceed `REACH_DELTA_CAP`, reclaiming superseded pages.
+    #[test]
+    fn multi_page_edit_across_shards_probes_only_changed_pages_and_folds_cleanly() {
+        let io = Io::simulated(SimWorld::new(43, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let home = crate::store::Home::of(&cx, &io.need_fs().expect("filesystem"), Some("/h")).expect("home");
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("stderr");
+        let lent = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 43 }, heap.alloc()).expect("store");
+        let mut store = CommandStore::new(&cx, &lent, false, 0, None, clock.clone(), &err, erased.handle()).expect("command store");
+
+        let shard_count = 16usize;
+        let total_pages = REACH_SHARD_PAGES * shard_count;
+        let mut pages = blaze_own::Vec::with_capacity_in(total_pages, alloc);
+        for i in 0..total_pages {
+            let bytes = (i as u32).to_le_bytes();
+            let page_key = Key(ContentId::of("reach shard test page", &bytes));
+            store.put(&cx, page_key, &bytes).expect("put page");
+            let cas = blaze_cas::Key(page_key.0);
+            lent.index_beside(cas, &[cas]).expect("index beside");
+            pages.push(page_key);
+        }
+        let root_v1 = Key(ContentId::of("reach shard test root", b"multi-v1"));
+        store.put(&cx, root_v1, b"multi-v1").expect("put root v1");
+        let answer_idx1 = lent.index(&[blaze_cas::Key(root_v1.0)]).expect("answer idx 1");
+        let (live1, rekeyed1) = publish_reach_shards(&lent, "multi", "multi.answer", None, &pages, Rekey::Changed, alloc, frame).expect("cold publish");
+        lent.root_through("multi.answer", &[answer_idx1], blaze_cas::plain::ROOT_LIFE_NS).expect("pin answer 1");
+        assert_eq!(live1 as usize, total_pages);
+        assert_eq!(rekeyed1.whole, Some(WhyWhole::NoLast));
+        lent.commit().expect("commit cold");
+
+        // Edit 82 pages spread across ALL 16 shards (without delta, 16 * 512 = 8,192 probes).
+        let mut pages_v2 = blaze_own::Vec::with_capacity_in(total_pages, alloc);
+        pages_v2.extend_from_slice(&pages);
+        let mut old_7_beside = [0u8; 32];
+        for n in 0..82usize {
+            let slot = (n % shard_count) * REACH_SHARD_PAGES + (n / shard_count) * 7;
+            if n == 0 {
+                old_7_beside = blaze_cas::plain::beside_key(blaze_cas::Key(pages_v2[slot].0)).0.0;
+            }
+            let payload = format!("v2-edit-{n}");
+            let key = Key(ContentId::of("reach shard test page", payload.as_bytes()));
+            store.put(&cx, key, payload.as_bytes()).expect("put v2 page");
+            let cas = blaze_cas::Key(key.0);
+            lent.index_beside(cas, &[cas]).expect("index beside v2");
+            pages_v2[slot] = key;
+        }
+        let root_v2 = Key(ContentId::of("reach shard test root", b"multi-v2"));
+        store.put(&cx, root_v2, b"multi-v2").expect("put root v2");
+        let answer_idx2 = lent.index(&[blaze_cas::Key(root_v2.0)]).expect("answer idx 2");
+
+        let probes_before = lent.put_tally().disk.root_probes;
+        let (live2, rekeyed2) = publish_reach_shards(&lent, "multi", "multi.answer", Some((&pages, root_v1)), &pages_v2, Rekey::Changed, alloc, frame).expect("v2 publish");
+        let probes_v2 = lent.put_tally().disk.root_probes - probes_before;
+        lent.root_through("multi.answer", &[answer_idx2], blaze_cas::plain::ROOT_LIFE_NS).expect("pin answer 2");
+        assert_eq!(live2 as usize, total_pages);
+        assert_eq!(rekeyed2, Rekeyed { pages: 82, whole: None });
+        assert_eq!(probes_v2, 82, "82 changed pages across 16 shards must probe only 82 delta keys (got {probes_v2})");
+        lent.commit().expect("commit v2");
+
+        // Verify 100% of live pages in `pages_v2` are reachable across shards U delta.
+        let mut reachable = std::collections::BTreeSet::new();
+        for shard in 0..shard_count {
+            let name = bstd::mem::format_in!(frame, "multi.reach.{shard:02x}");
+            let bytes = store.named(name.as_str()).expect("read shard").expect("shard live");
+            for chunk in bytes.chunks_exact(32) {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(chunk);
+                reachable.insert(k);
+            }
+        }
+        let delta_v2 = store.named("multi.reach.delta").expect("read delta").expect("delta live");
+        assert_eq!(delta_v2.len(), 82 * 32, "delta holds all 82 new page indexes");
+        for chunk in delta_v2.chunks_exact(32) {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(chunk);
+            reachable.insert(k);
+        }
+        for page in pages_v2.iter() {
+            let beside = blaze_cas::plain::beside_key(blaze_cas::Key(page.0)).0.0;
+            assert!(reachable.contains(&beside), "every live page must be reachable after delta edit");
+        }
+
+        // Now push delta past REACH_DELTA_CAP by editing 450 pages in shard 0 & shard 1 alone:
+        // triggers a clean fold (only shards 0..16 that changed since cold rewrite; delta resets to 0).
+        let mut pages_v3 = blaze_own::Vec::with_capacity_in(total_pages, alloc);
+        pages_v3.extend_from_slice(&pages_v2);
+        for n in 0..450usize {
+            let slot = n;
+            let payload = format!("v3-fold-{n}");
+            let key = Key(ContentId::of("reach shard test page", payload.as_bytes()));
+            store.put(&cx, key, payload.as_bytes()).expect("put v3 page");
+            let cas = blaze_cas::Key(key.0);
+            lent.index_beside(cas, &[cas]).expect("index beside v3");
+            pages_v3[slot] = key;
+        }
+        let (live3, rekeyed3) = publish_reach_shards(&lent, "multi", "multi.answer", Some((&pages_v2, root_v2)), &pages_v3, Rekey::Changed, alloc, frame).expect("v3 fold publish");
+        assert_eq!(live3 as usize, total_pages);
+        assert_eq!(rekeyed3.whole, None, "bounded delta fold is incremental, not WhyWhole");
+        lent.commit().expect("commit v3");
+
+        let delta_v3 = store.named("multi.reach.delta").expect("read delta after fold").expect("delta root stays live");
+        assert_eq!(delta_v3.len(), 0, "delta is reset to empty after folding");
+        let shard0_v3 = store.named("multi.reach.00").expect("read shard 0").expect("shard 0 live");
+        assert!(!shard0_v3.chunks_exact(32).any(|k| k == &old_7_beside), "superseded old page index was dropped on fold");
+        for (shard, slice) in pages_v3.chunks(REACH_SHARD_PAGES).enumerate() {
+            let name = bstd::mem::format_in!(frame, "multi.reach.{shard:02x}");
+            let bytes = store.named(name.as_str()).expect("read shard").expect("shard live");
+            assert_eq!(bytes.len(), REACH_SHARD_PAGES * 32, "folded shard {shard} has exact live page count");
+            let mut set = std::collections::BTreeSet::new();
+            for chunk in bytes.chunks_exact(32) {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(chunk);
+                set.insert(k);
+            }
+            for page in slice {
+                let beside = blaze_cas::plain::beside_key(blaze_cas::Key(page.0)).0.0;
+                assert!(set.contains(&beside), "folded shard {shard} contains every live page");
+            }
         }
     }
 }
