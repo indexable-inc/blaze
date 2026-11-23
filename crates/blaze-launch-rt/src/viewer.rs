@@ -341,7 +341,7 @@ struct Conn<'a> {
 
 /// Advisory shared flock on `<runs_dir>/viewer.lock`, released automatically when `OwnedFd` drops.
 fn acquire_viewer_lock(runs_dir: &Path, alloc: Alloc<'_>) -> Option<blaze_sys::posix::io::OwnedFd> {
-    use blaze_sys::posix::io::fd::{FlockOp, OpenFlags, flock, open};
+    use blaze_sys::posix::io::{FlockOp, OpenFlags, flock, open};
     let dir_bytes = runs_dir.as_os_str().as_bytes();
     let leaf = blaze_launch::telemetry::VIEWER_LOCK_LEAF.as_bytes();
     let mut path = AVec::with_capacity_in(dir_bytes.len() + 1 + leaf.len() + 1, alloc);
@@ -349,7 +349,7 @@ fn acquire_viewer_lock(runs_dir: &Path, alloc: Alloc<'_>) -> Option<blaze_sys::p
     path.push(b'/');
     path.extend_from_slice(leaf);
     path.push(0);
-    let sys_path = blaze_sys::posix::Path::from_bytes_with_nul(&path).ok()?;
+    let sys_path = blaze_sys::Path::from_bytes_with_nul(&path).ok()?;
     let owned = open(sys_path, OpenFlags::RDWR | OpenFlags::CREAT | OpenFlags::CLOEXEC, 0o600).ok()?;
     flock(owned.fd(), FlockOp::SharedNonBlock).ok()?;
     Some(owned)
