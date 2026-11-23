@@ -111,6 +111,16 @@ pub enum NameCell {
     /// `incoherent_crates`). Absent: it may not (every crate but `core`, `alloc` and `std`), so
     /// an item added to a workspace crate never moves it.
     Incoherent { krate: [u8; 8] },
+    /// The crate's `#![panic_runtime]` flag and any `#[rustc_std_internal_symbol]` function items
+    /// (by key, name, and text): what `internal_symbol::record_search` reads of every crate in
+    /// the scope. Absent when the crate has neither (every normal workspace and registry crate),
+    /// so adding an ordinary private item to a dependency never wakes callers of internal symbols.
+    InternalSymbols { krate: [u8; 8] },
+    /// The crate's link facts: its `proc_macro` flag, its extern prelude crate roots, and every
+    /// `Origin::ExternCrate` binding target across its modules. What `front2::linked` reads of
+    /// each crate reached by the link closure, instead of recording both `Names` and `Items`
+    /// whole for every crate in the scope.
+    Links { krate: [u8; 8] },
     /// A module's `macro_rules!` sequence and its `mod` lines' marks in it: what a textual
     /// macro lookup reads of the module, and no other walk; absent for a module the record does
     /// not hold a scope of.
@@ -148,6 +158,8 @@ impl NameCell {
             NameCell::Lang { krate } => h.update(&[12]).update(&krate),
             NameCell::Incoherent { krate } => h.update(&[13]).update(&krate),
             NameCell::Textual { module } => h.update(&[14]).id(&module.0),
+            NameCell::InternalSymbols { krate } => h.update(&[15]).update(&krate),
+            NameCell::Links { krate } => h.update(&[16]).update(&krate),
         };
         let mut key = [0; 16];
         key.copy_from_slice(&h.finish().0[..16]);
@@ -158,7 +170,7 @@ impl NameCell {
     pub fn crate_prefix(self) -> [u8; 8] {
         match self {
             NameCell::Binding { module, .. } | NameCell::Module { module } | NameCell::Textual { module } => module.crate_prefix(),
-            NameCell::Root { krate } | NameCell::Whole { krate, .. } | NameCell::Lang { krate } | NameCell::Incoherent { krate } => krate,
+            NameCell::Root { krate } | NameCell::Whole { krate, .. } | NameCell::Lang { krate } | NameCell::Incoherent { krate } | NameCell::InternalSymbols { krate } | NameCell::Links { krate } => krate,
             NameCell::Variants { owner } | NameCell::Members { owner } => owner.crate_prefix(),
             NameCell::Item { key } => key.crate_prefix(),
             NameCell::Expansion { call } => call.crate_prefix(),
@@ -392,6 +404,63 @@ fn lang_digest(items: &ItemsRecord<'_>) -> Result<Option<ContentId>, ItemsRecord
 /// `incoherent_crates` reads of the crate, so the cell moves exactly when it flips.
 fn incoherent_digest(items: &ItemsRecord<'_>) -> Option<ContentId> {
     items.may_write_incoherent().then(|| Hasher::of(&DIGESTS).update(&[13]).finish())
+}
+
+/// What `InternalSymbols(krate)` holds: `None` (absent) when the crate's root file carries no
+/// `panic_runtime` and no function item carries `rustc_std_internal_symbol`; otherwise the digest
+/// of that flag and every such function's key, name, and text in key order.
+fn internal_symbols_digest<'a>(items: &ItemsRecord<'a>, read: ReadText<'_, 'a>) -> Result<Option<ContentId>, ItemsRecordError> {
+    let has_panic_runtime = match items.file_surface(0)? {
+        Some(file) => read(TextOf::File { index: 0, path: file.path }).is_some_and(|text| text.contains("panic_runtime")),
+        None => false,
+    };
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[15, u8::from(has_panic_runtime)]);
+    let mut count = 0u64;
+    for i in 0..items.items() {
+        let Some(row) = items.item_at(i)? else { continue };
+        if row.kind != ItemKind::Function {
+            continue;
+        }
+        let Some(span) = row.text else { continue };
+        let text = items.slice(span, read)?;
+        if text.contains("rustc_std_internal_symbol") {
+            h.id(&row.key.0).std(&row.name).part(text.as_bytes());
+            count = count.saturating_add(1);
+        }
+    }
+    if !has_panic_runtime && count == 0 {
+        return Ok(None);
+    }
+    h.update(&count.to_le_bytes());
+    Ok(Some(h.finish()))
+}
+
+/// What `Links(krate)` holds: the crate's `proc_macro` flag, its extern prelude crate roots,
+/// and every `Origin::ExternCrate` binding target across its modules (in deterministic module
+/// and binding order). Covers everything `front2::source::Records::linked_logged` reads.
+fn links_digest(record: &NamesRecord<'_>, items: &ItemsRecord<'_>) -> Result<ContentId, ItemsRecordError> {
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[16, u8::from(items.proc_macro())]);
+    let root = record.crate_root();
+    let extern_count = u64::try_from(root.externs().len()).unwrap_or(u64::MAX);
+    h.update(&extern_count.to_le_bytes());
+    for (_, dep_root) in root.externs() {
+        h.id(&dep_root.0);
+    }
+    let mut count = 0u64;
+    for m in 0..items.modules() {
+        let Some(row) = items.module_at(m)? else { break };
+        let Some(scope) = record.scope(row.key) else { continue };
+        for entry in scope.bindings() {
+            if matches!(entry.binding.origin, blaze_surface::Origin::ExternCrate) {
+                h.id(&entry.binding.def.key.0);
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    h.update(&count.to_le_bytes());
+    Ok(h.finish())
 }
 
 /// The first 16 bytes of a key: what [`NameCell::Beginning`] is keyed by (`key_beginning`'s
@@ -756,6 +825,10 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
         if let Some(digest) = incoherent_digest(items) {
             rows.push((NameCell::Incoherent { krate }.key(), digest));
         }
+        if let Some(digest) = internal_symbols_digest(items, read).map_err(CellsError::Items)? {
+            rows.push((NameCell::InternalSymbols { krate }.key(), digest));
+        }
+        rows.push((NameCell::Links { krate }.key(), links_digest(record, items).map_err(CellsError::Items)?));
     }
     for module in record.modules() {
         if let Some(digest) = module_digest(record, module) {
@@ -1052,6 +1125,10 @@ pub fn seen_by_record<'a>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<
         NameCell::Lang { .. } => None,
         NameCell::Incoherent { krate } if krate == record.key().prefix() => incoherent_digest(items_of()?),
         NameCell::Incoherent { .. } => None,
+        NameCell::InternalSymbols { krate } if krate == record.key().prefix() => internal_symbols_digest(items_of()?, read_of()?).map_err(CellsError::Items)?,
+        NameCell::InternalSymbols { .. } => None,
+        NameCell::Links { krate } if krate == record.key().prefix() => Some(links_digest(record, items_of()?).map_err(CellsError::Items)?),
+        NameCell::Links { .. } => None,
     })
 }
 

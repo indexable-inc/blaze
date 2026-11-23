@@ -42,10 +42,10 @@ const MAP_FROM: u64 = 64 * 1024;
 
 /// The shelf, opened once per command that needs it; a file of [`MAP_FROM`] bytes or more is
 /// mapped, a smaller one read into `frame`.
-pub struct HomeShelf<'f> {
+pub struct HomeShelf<'c, 'f> {
     place: String,
     dir: Dir<ReadOnly>,
-    cx: &'f Cx,
+    cx: &'c Cx,
     frame: &'f Frame,
 }
 
@@ -84,10 +84,10 @@ impl AsRef<[u8]> for Held<'_> {
     }
 }
 
-impl<'f> HomeShelf<'f> {
+impl<'c, 'f> HomeShelf<'c, 'f> {
     /// The shelf under `home` (absolute, as the driver gave it), through the effect layer's
     /// home capability (`Fs::home`): the one way a command reaches a folder outside its root.
-    pub fn open(cx: &'f Cx, fs: &Fs, home: &str, frame: &'f Frame) -> Result<HomeShelf<'f>, ShelfError> {
+    pub fn open(cx: &'c Cx, fs: &Fs, home: &str, frame: &'f Frame) -> Result<HomeShelf<'c, 'f>, ShelfError> {
         let place = format!("{}/{SHELF}", home.trim_end_matches('/'));
         let failed = |said: String| ShelfError { place: place.clone(), said };
         let folder = Path::new(SHELF).map_err(|e| failed(format!("{e}")))?;
@@ -100,7 +100,7 @@ impl<'f> HomeShelf<'f> {
     }
 }
 
-impl<'f> Shelf for HomeShelf<'f> {
+impl<'c, 'f> Shelf for HomeShelf<'c, 'f> {
     type Error = String;
     type Bytes = Held<'f>;
 

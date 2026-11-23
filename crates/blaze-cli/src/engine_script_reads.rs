@@ -427,22 +427,74 @@ pub(crate) fn file_read(path: &str, bytes: Option<&[u8]>) -> Option<(Name, Conte
 /// read no row reads any more leaves the table, so its task is no longer planned and is retired
 /// (rule 18: the followed set is bounded by the reads the answer holds).
 pub(crate) fn keep_rows<'r>(followed: Option<&Rows<'_>>, fresh: impl Iterator<Item = (ReadKind, &'r str, ContentId)>, kept_cells: impl Fn(Name) -> bool, out: &mut Rows<'_>) {
-    let mut seen = blaze_own::BTreeSet::new_in(*out.rows.allocator());
+    keep_rows_with(followed, core::iter::empty(), fresh, false, |name, _| kept_cells(name), |_, _| false, out);
+}
+
+/// Faster [`keep_rows`] for the command tail: `fresh_scripts` are reads recorded by kept,
+/// succeeded build scripts that ran in this request (so each is guaranteed to have a reader in
+/// `finished.answer` without querying `LastAnswer::readers`), deduplicated by `(kind, path)`
+/// before hashing. Preserves [`crate::sweep::DIRECT_PATH`] on followed rows and marks newly
+/// observed direct non-symlink paths via `is_direct`.
+pub(crate) fn keep_rows_with<'r>(
+    followed: Option<&Rows<'_>>,
+    fresh_scripts: impl Iterator<Item = (ReadKind, &'r str, ContentId)>,
+    more: impl Iterator<Item = (ReadKind, &'r str, ContentId)>,
+    followed_all_kept: bool,
+    kept_cells: impl Fn(Name, bool) -> bool,
+    is_direct: impl Fn(ReadKind, &str) -> bool,
+    out: &mut Rows<'_>,
+) {
+    let alloc = *out.rows.allocator();
+    let mut fresh_unique: blaze_own::BTreeMap<(ReadKind, &'r str), ContentId, _> = blaze_own::BTreeMap::new_in(alloc);
+    for (kind, path, answer) in fresh_scripts {
+        fresh_unique.entry((kind, path)).or_insert(answer);
+    }
+    let mut seen: blaze_own::BTreeSet<(ReadKind, &str), _> = blaze_own::BTreeSet::new_in(alloc);
+    let mut seen_more: blaze_own::BTreeSet<Name, _> = blaze_own::BTreeSet::new_in(alloc);
     for followed in followed.into_iter() {
         for leaf in followed.rows.iter() {
             let Some(kind) = ReadKind::of_leaf(leaf.kind) else { continue };
             let path = followed.path(leaf);
-            let name = cell_name(kind, path);
-            if kept_cells(name) && seen.insert(name) {
-                out.push(leaf.kind, 0, path, leaf.stamp, leaf.id);
+            if seen.contains(&(kind, path)) {
+                continue;
             }
+            let known = followed_all_kept || fresh_unique.contains_key(&(kind, path));
+            if !known {
+                let name = cell_name(kind, path);
+                if !kept_cells(name, true) {
+                    continue;
+                }
+                seen_more.insert(name);
+            }
+            seen.insert((kind, path));
+            let flags = if leaf.flags & crate::sweep::DIRECT_PATH == 0 && is_direct(kind, path) {
+                leaf.flags | crate::sweep::DIRECT_PATH
+            } else {
+                leaf.flags
+            };
+            out.push(leaf.kind, flags, path, leaf.stamp, leaf.id);
         }
     }
-    for (kind, path, answer) in fresh {
-        let name = cell_name(kind, path);
-        if kept_cells(name) && seen.insert(name) {
-            out.push(kind.leaf(), 0, path, None, answer);
+    for ((kind, path), answer) in fresh_unique.iter() {
+        if seen.contains(&(*kind, *path)) {
+            continue;
         }
+        seen.insert((*kind, *path));
+        let flags = if is_direct(*kind, *path) { crate::sweep::DIRECT_PATH } else { 0 };
+        out.push(kind.leaf(), flags, path, None, *answer);
+    }
+    for (kind, path, answer) in more {
+        if seen.contains(&(kind, path)) {
+            continue;
+        }
+        let name = cell_name(kind, path);
+        if seen_more.contains(&name) || !kept_cells(name, false) {
+            continue;
+        }
+        seen.insert((kind, path));
+        seen_more.insert(name);
+        let flags = if is_direct(kind, path) { crate::sweep::DIRECT_PATH } else { 0 };
+        out.push(kind.leaf(), flags, path, None, answer);
     }
 }
 
@@ -1147,6 +1199,10 @@ impl<'t, 'f> CheckoutSweep<'t, 'f> {
         StatusView(())
     }
 
+    pub(crate) fn is_direct(&self, kind: ReadKind, path: &str) -> bool {
+        matches!(kind, ReadKind::File | ReadKind::Stat | ReadKind::Listing) && relative(path) && self.tree.is_direct(path)
+    }
+
     pub(crate) fn row(&mut self, kind: ReadKind, path: &str) -> Result<(u8, Option<Stamp>, ContentId), CliError> {
         use script_sandbox::TreeRead;
         let op = match kind {
@@ -1162,7 +1218,8 @@ impl<'t, 'f> CheckoutSweep<'t, 'f> {
             Ok(answer) => answer.unwrap_or(NONE),
             Err(_) => DENIED,
         };
-        Ok((0, None, answer))
+        let flags = if self.tree.is_direct(path) { crate::sweep::DIRECT_PATH } else { 0 };
+        Ok((flags, None, answer))
     }
 
     #[cfg(test)]

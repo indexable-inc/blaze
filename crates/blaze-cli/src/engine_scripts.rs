@@ -685,11 +685,13 @@ impl<'f> ScriptsStage<'f> {
         &'r self,
         followed: Option<&crate::sweep::Rows<'_>>,
         more: impl Iterator<Item = (crate::engine_script_reads::ReadKind, &'r str, ContentId)>,
-        reads: impl Fn(Name) -> bool,
+        followed_all_kept: bool,
+        reads: impl Fn(Name, bool) -> bool,
+        is_direct: impl Fn(crate::engine_script_reads::ReadKind, &str) -> bool,
         out: &mut crate::sweep::Rows<'_>,
     ) {
         let fresh = self.fresh.iter().map(|(_, read)| (read.kind, read.path.as_str(), read.answer));
-        crate::engine_script_reads::keep_rows(followed, fresh.chain(more), reads, out);
+        crate::engine_script_reads::keep_rows_with(followed, fresh, more, followed_all_kept, reads, is_direct, out);
     }
 
     /// The result of `name`, if this stage entered it.
@@ -986,7 +988,9 @@ impl<'f> ScriptsStage<'f> {
     {
         // Limit native roots admitted to the pool independently of the command's jobserver.
         // A worker waiting for its native child occupies a pool slot and takes no FIFO token.
-        let max_native_roots = queue.width.div_ceil(8);
+        // Allow up to half the command's width (at least 4, capped by width) so independent
+        // workspace build scripts run concurrently in one wave instead of serializing past 3.
+        let max_native_roots = queue.width.div_ceil(2).max(4).min(queue.width);
         while queue.slots.free() {
             let next = queue.waiting.keys().find(|(lane, _, _)| match lane {
                 ScriptLane::Native => queue.native_running < max_native_roots,
@@ -1399,8 +1403,9 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
             })?;
             if phase.is_none() { break; }
             let mark = handles.board.phase_began(Stage::Names, engine.tasks().len() as u64, handles.board.now(&handles.env.clock));
+            let view = engine.view();
             for &task in engine.tasks() {
-                self.names.submit(self.scripts.scope, cx, names, store, read, handles, task, alloc, frame, self.scripts.waiter(), scripts_pending)?;
+                self.names.submit(self.scripts.scope, cx, names, store, read, view, handles, task, alloc, frame, self.scripts.waiter(), scripts_pending)?;
             }
             handles.board.phase_ended(mark, 0, handles.board.now(&handles.env.clock));
         }

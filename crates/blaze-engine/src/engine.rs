@@ -566,6 +566,22 @@ impl<'a> Answer<'a> {
         <Self as LastAnswer>::content(self, *id)
     }
 
+    /// Whether this request removed any reader from any cell of task kind `kind` (in the folded
+    /// incremental work delta). Returns `true` when there is no incremental base (`work` is `None`).
+    pub fn any_reader_removed_of(&self, kind: blaze_drive::Kind) -> bool {
+        let Some(work) = &self.work else { return true };
+        work.readers.edits.iter().any(|((id, _), added)| !*added && id.of.kind == kind)
+    }
+
+    /// Whether this request removed any reader from `cell` (in the folded incremental work delta).
+    /// Returns `true` when there is no incremental base (`work` is `None`).
+    pub fn reader_removed(&self, cell: CellId) -> bool {
+        let Some(work) = &self.work else { return true };
+        let edits = &work.readers.edits;
+        let from = edits.partition_point(|((id, _), _)| *id < cell);
+        edits.get(from..).into_iter().flatten().take_while(|((id, _), _)| *id == cell).any(|(_, added)| !*added)
+    }
+
     /// Establish the base proof once. An explicit audit of a paged answer visits its rows.
     pub fn certify_reads(&mut self, alloc: SharedAlloc<'a>) {
         if self.read_audit.is_none() {

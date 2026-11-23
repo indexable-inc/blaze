@@ -253,14 +253,15 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.has_feature(krate, name)
     }
 
-    /// WHOLE: the link closure walks every module's scope of every crate it reaches; every
-    /// crate's names and items are recorded whole (the closure does not say which it reached).
+    /// Each crate whose link facts (`proc_macro`, extern prelude, `Origin::ExternCrate` bindings)
+    /// are inspected by the link closure gets one [`NameCell::Links`] read, instead of recording
+    /// every crate's names and items sections whole.
     fn linked<'a>(self, roots: &[usize], alloc: Alloc<'a>) -> Option<Result<super::super::linked::Linked<'a>, super::super::linked::RootsError>> {
-        for krate in 0..self.records.crate_count() {
-            self.whole(krate, Section::Names);
-            self.whole(krate, Section::Items);
-        }
-        self.records.linked(roots, alloc)
+        self.records.linked_logged(roots, alloc, |krate| {
+            if let Some(prefix) = self.prefix(krate) {
+                self.cell(NameCell::Links { krate: prefix });
+            }
+        })
     }
 
     /// Reads every crate's name: every crate's root cell.

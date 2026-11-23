@@ -384,6 +384,8 @@ impl HeadRows {
         self.lang_by_unit.insert(krate, part(NameCell::Lang { krate }, "Lang".into()));
         part(NameCell::Root { krate }, "Root".into());
         part(NameCell::Incoherent { krate }, "Incoherent".into());
+        part(NameCell::InternalSymbols { krate }, "InternalSymbols".into());
+        part(NameCell::Links { krate }, "Links".into());
         part(NameCell::Module { module }, "Module(crate root)".into());
         part(NameCell::Item { key: module }, "Item(crate root)".into());
         part(NameCell::Textual { module }, "Textual(crate root)".into());

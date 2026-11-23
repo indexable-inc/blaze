@@ -30,7 +30,7 @@ use bstd::task::Class;
 
 use crate::engine_check::{EngineCheckError, Table};
 use crate::engine_records::{EngineRecords, InPlace, ReadError};
-use crate::engine_tasks::{CELLS, Outlined, WHOLE};
+use crate::engine_tasks::{CELLS, EXPORTS, Outlined, WHOLE};
 use crate::engine_units::{Failure, Published};
 use crate::fetch::FetchEnv;
 use crate::names::{DepExports, Names, Resolution, Resolved, ScopeJob};
@@ -490,6 +490,7 @@ impl<'f> NamesStage<'f> {
         cx: &Cx,
         store: &mut dyn crate::store::Store<'r>,
         read: &mut EngineRecords<'r>,
+        view: blaze_engine::View<'_, '_>,
         handles: &Handles<'_, 'f>,
         tasks: &[EngineTask],
         buffer: &mut Buffer<'a>,
@@ -583,7 +584,10 @@ impl<'f> NamesStage<'f> {
                             Mapped::Failed
                         } else {
                             match exports.exports(&cx, store, &input, crates[g].input.name, &own, wave) {
-                                Ok(bytes) => checked(bytes, crates[g].input.name, &own),
+                                Ok(bytes) => {
+                                    let has_exports = blaze_engine::CellDigests::cell(&view, &CellId { of: input.name, cell: EXPORTS }) != blaze_drive::key::ABSENT;
+                                    checked(bytes, crates[g].input.name, has_exports, &own)
+                                }
                                 Err(ReadError::Load(crate::front_load::LoadError::Store(error))) => return Err(error),
                                 Err(error) => Mapped::Unreadable(blaze_own::format_in!(&own, "{error}").into_bump_str()),
                             }
@@ -626,7 +630,10 @@ impl<'f> NamesStage<'f> {
                             for dep in &mut deps {
                                 let g = dep.index;
                                 match inputs.slots[g].get().ok_or(EngineCheckError::MissingEntry { task: name, table: Table::MappedExports, key: dep.input.name })? {
-                                    Mapped::Exports(proof) => dep.exports = Some(*proof),
+                                    Mapped::Exports(proof, has_exports) => {
+                                        dep.exports = Some(*proof);
+                                        dep.has_exports = *has_exports;
+                                    }
                                     Mapped::Failed => {}
                                     Mapped::Unreadable(why) => {
                                         let words = blaze_own::format_in!(alloc, "crate `{}`: the record of its dependency `{}`: {why}", crates[at].input.name, crates[g].input.name);
@@ -975,35 +982,43 @@ impl<'j, 'r: 'j> crate::names::DepExports<'j, 'r> for ReadExports<'_, 'r> {
 
 /// The domain of the [`CELLS`] mark's digest: the cell table's bytes.
 const CELLS_DOMAIN: &str = "blaze v2 engine names cell table 1";
+/// The domain of the [`EXPORTS`] cell's digest: the exports section's bytes.
+const EXPORTS_DOMAIN: &str = "blaze-cli engine names exports 1";
+
+fn exports_digest(bytes: &[u8]) -> ContentId {
+    ContentId::of(EXPORTS_DOMAIN, bytes)
+}
 
 /// What the crate `name`'s `CrateScope` task defines (engine.md E4): its record's [`WHOLE`]
-/// cell, and, for a crate whose names read a file of the checkout (a `Surface` read: the crates
-/// an edit can move), the [`CELLS`] mark and every row of its payload's cell table (names/
-/// sections.rs `cells`, blaze-scope names_cells.rs `crate_table`) as its own cell with its
-/// digest. The engine then moves only the cells whose digest changed (blaze-engine engine.rs
-/// `apply`), so a body that read none of them is not entered. A dependency's table is not
-/// defined: no edit of the checkout moves its names, and defining its rows would put every
-/// cell of `core` in the stored answer for nothing; its readers read it [`WHOLE`]. Sorted by
-/// cell, each once (the engine's merge walk; rule 25).
-fn cells_of<'a>(name: Name, record: &work::Record<SharedAlloc<'_>>, table: &[u8], alloc: SharedAlloc<'a>) -> Result<SVec<'a, (Cell, ContentId)>, EngineCheckError> {
+/// cell, its [`EXPORTS`] cell (what downstream `CrateScope` tasks read), and, for a crate whose
+/// names read a file of the checkout (a `Surface` read: the crates an edit can move), the
+/// [`CELLS`] mark and every row of its payload's cell table (names/sections.rs `cells`,
+/// blaze-scope names_cells.rs `crate_table`) as its own cell with its digest. The engine then
+/// moves only the cells whose digest changed (blaze-engine engine.rs `apply`), so a body that
+/// read none of them is not entered, and a downstream crate's names are not entered when the
+/// exports section is unchanged. Sorted by cell, each once (the engine's merge walk; rule 25).
+fn cells_of<'a>(name: Name, record: &work::Record<SharedAlloc<'_>>, exports: &[u8], table: &[u8], alloc: SharedAlloc<'a>) -> Result<SVec<'a, (Cell, ContentId)>, EngineCheckError> {
     const WHAT: &str = "the cells a `CrateScope` task defines (engine_names.rs `cells_of`)";
     // Each list sized once, to the cells it will hold, before its first push: the engine keeps
     // it for the rest of the command, so it is one block of its own length (rule 67's floor),
     // never a vector grown by doubling.
     let sized = |cells: usize| SVec::try_with_capacity_in(cells, alloc).map_err(|_| EngineCheckError::Grow { what: WHAT, had: 0 });
+    let exports_id = exports_digest(exports);
     if !record.reads.iter().any(|(read, _)| read.kind == Kind::Surface) {
-        let mut defines: SVec<'a, (Cell, ContentId)> = sized(1)?;
+        let mut defines: SVec<'a, (Cell, ContentId)> = sized(2)?;
         EngineCheckError::push(&mut defines, (WHOLE, record.out), WHAT)?;
+        EngineCheckError::push(&mut defines, (EXPORTS, exports_id), WHAT)?;
         return Ok(defines);
     }
     let row = blaze_scope::names_cells::TABLE_ROW;
     if table.len() % row != 0 {
         return Err(EngineCheckError::CellTable { task: name, what: "is not whole rows" });
     }
-    // WHOLE, CELLS, then one cell a row of the table.
-    let mut defines: SVec<'a, (Cell, ContentId)> = sized(2 + table.len() / row)?;
+    // WHOLE, CELLS, EXPORTS, then one cell a row of the table.
+    let mut defines: SVec<'a, (Cell, ContentId)> = sized(3 + table.len() / row)?;
     EngineCheckError::push(&mut defines, (WHOLE, record.out), WHAT)?;
     EngineCheckError::push(&mut defines, (CELLS, ContentId::of(CELLS_DOMAIN, table)), WHAT)?;
+    EngineCheckError::push(&mut defines, (EXPORTS, exports_id), WHAT)?;
     let mut last: Option<[u8; 16]> = None;
     for bytes in table.chunks_exact(row) {
         let mut key = [0u8; 16];
@@ -1034,6 +1049,7 @@ struct Dependency<'j> {
     index: usize,
     input: Input,
     absent: bool,
+    has_exports: bool,
     exports: Option<Verified<'j>>,
 }
 
@@ -1265,9 +1281,9 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
     #[expect(clippy::too_many_arguments, reason = "one worker scope and the request's store, names, and timing handles")]
     pub(crate) fn submit<'r: 'j, 'f: 'j>(
         &mut self, scope: &'j bstd::task::Scope<'j>, cx: &Cx, stage: &mut NamesStage<'f>,
-        store: &mut dyn crate::store::Store<'r>, read: &mut EngineRecords<'r>, handles: &Handles<'j, 'f>,
-        task: EngineTask, alloc: SharedAlloc<'a>, frame: &'f Frame, waiter: &'j blaze_core::wait::Parker,
-        scripts_pending: bool,
+        store: &mut dyn crate::store::Store<'r>, read: &mut EngineRecords<'r>, view: blaze_engine::View<'_, '_>,
+        handles: &Handles<'j, 'f>, task: EngineTask, alloc: SharedAlloc<'a>, frame: &'f Frame,
+        waiter: &'j blaze_core::wait::Parker, scripts_pending: bool,
     ) -> Result<(), CliError> {
         let name = task.planned.name;
         stage.admissions.admit(name)?;
@@ -1319,7 +1335,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
             self.walk.stack.extend(edges_of(&columns.crates[g], all, g));
             if g == at { continue; }
             let (input, absent) = lookup(&stage.made, name, stage.crate_names[g], stage.failed_out)?;
-            let mut dep = Dependency { index: g, input, absent, exports: None };
+            let mut dep = Dependency { index: g, input, absent, has_exports: false, exports: None };
             if gate.is_ok() {
                 let mapped = match self.mapped[g] {
                     Some((previous, mapped)) if previous == input => mapped,
@@ -1328,7 +1344,10 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
                             Mapped::Failed
                         } else {
                             match exports.exports(cx, store, &input, columns.crates[g].input.name, self.frame, self.local) {
-                                Ok(bytes) => checked(bytes, columns.crates[g].input.name, self.frame),
+                                Ok(bytes) => {
+                                    let has_exports = blaze_engine::CellDigests::cell(&view, &CellId { of: input.name, cell: EXPORTS }) != blaze_drive::key::ABSENT;
+                                    checked(bytes, columns.crates[g].input.name, has_exports, self.frame)
+                                }
                                 Err(ReadError::Load(crate::front_load::LoadError::Store(error))) => return Err(error),
                                 Err(error) => Mapped::Unreadable(blaze_own::format_in!(self.frame, "{error}").into_bump_str()),
                             }
@@ -1338,7 +1357,10 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
                     }
                 };
                 match mapped {
-                    Mapped::Exports(proof) => dep.exports = Some(proof),
+                    Mapped::Exports(proof, has_exports) => {
+                        dep.exports = Some(proof);
+                        dep.has_exports = has_exports;
+                    }
                     Mapped::Failed => {}
                     Mapped::Unreadable(why) => {
                         if unreadable.is_none_or(|(first, _)| g < first) {
@@ -1440,9 +1462,16 @@ fn input_cell(input: Input, absent: bool) -> (CellId, ContentId) {
     (CellId { of: input.name, cell: WHOLE }, if absent { blaze_drive::key::ABSENT } else { input.out })
 }
 
+fn dep_input_cell(dep: &Dependency<'_>) -> (CellId, ContentId) {
+    match (dep.absent, dep.has_exports, dep.exports) {
+        (false, true, Some(proof)) => (CellId { of: dep.input.name, cell: EXPORTS }, exports_digest(proof.bytes())),
+        _ => input_cell(dep.input, dep.absent),
+    }
+}
+
 fn failure_reads<'a>(deps: &[Dependency<'_>], script: Option<(Input, bool)>, alloc: SharedAlloc<'a>) -> SVec<'a, (CellId, ContentId)> {
     let mut reads = SVec::with_capacity_in(deps.len() + usize::from(script.is_some()), alloc);
-    reads.extend(deps.iter().map(|dep| input_cell(dep.input, dep.absent)));
+    reads.extend(deps.iter().map(dep_input_cell));
     reads.extend(script.map(|(input, absent)| input_cell(input, absent)));
     reads
 }
@@ -1787,7 +1816,7 @@ fn finish<'a>(task: &EngineTask, krate: &str, resolved: Resolved, ok: bool, unre
     }
     for dep in deps {
         record.reads.push((dep.input.name, dep.input.out));
-        reads.push(input_cell(dep.input, dep.absent));
+        reads.push(dep_input_cell(dep));
     }
     if let Some(input) = script {
         record.reads.push((input.name, input.out));
@@ -1798,7 +1827,7 @@ fn finish<'a>(task: &EngineTask, krate: &str, resolved: Resolved, ok: bool, unre
     let payload = resolved.payload();
     let parts = crate::names::sections::sections(payload).map_err(|_| EngineCheckError::CellTable { task: name, what: "is in a payload whose sections do not read" })?;
     record.parts.push(Part { name: Name::links_of(name), locate: Locate::Source(blaze_ladder::native_links::table_digest(parts.links)), place: 0 });
-    let defines = cells_of(name, &record, parts.cells, alloc)?;
+    let defines = cells_of(name, &record, parts.exports, parts.cells, alloc)?;
     let key = crate::engine_store::record_key(task.key, record.out, &record.reads, payload);
     let done = Done { name, key: task.key, out: record.out, defines, reads, findings: u32::try_from(record.findings.len()).unwrap_or(u32::MAX), failed: false };
     let header = blaze_drive::record::write_plain_head(name, task.planned.source, record.out, &record.reads, payload.len(), scratch);
@@ -1925,8 +1954,9 @@ fn edges_of<'w>(krate: &blaze_world::Crate<'w>, all: Sysroot, at: usize) -> impl
 #[derive(Clone, Copy)]
 enum Mapped<'w> {
     /// Its exports record, checked whole once as it was mapped ([`checked`]): every dependent
-    /// the slot serves opens the proof in O(1) and checks nothing again (rule 74).
-    Exports(Verified<'w>),
+    /// the slot serves opens the proof in O(1) and checks nothing again (rule 74). The boolean
+    /// records whether the dependency's `CrateScope` row defines the [`EXPORTS`] cell.
+    Exports(Verified<'w>, bool),
     Failed,
     Unreadable(&'w str),
 }
@@ -1935,7 +1965,7 @@ enum Mapped<'w> {
 /// crate of the phase (or the pipeline) that reads it, on the one thread that maps it and
 /// before any worker that reads it starts. A record that does not check is the dependency's
 /// unreadable record, named by its table and offset; each dependent fails on it alone.
-fn checked<'w>(bytes: &'w [u8], krate: &str, frame: &'w Frame) -> Mapped<'w> {
+fn checked<'w>(bytes: &'w [u8], krate: &str, has_exports: bool, frame: &'w Frame) -> Mapped<'w> {
     #[cfg(test)]
     {
         let mut checks = CHECKED.lock();
@@ -1946,7 +1976,7 @@ fn checked<'w>(bytes: &'w [u8], krate: &str, frame: &'w Frame) -> Mapped<'w> {
     #[cfg(not(test))]
     let _ = krate;
     match Verified::check(bytes) {
-        Ok(proof) => Mapped::Exports(proof),
+        Ok(proof) => Mapped::Exports(proof, has_exports),
         Err(error) => Mapped::Unreadable(blaze_own::format_in!(frame, "its exports record did not check: {error:?}").into_bump_str()),
     }
 }
@@ -1983,7 +2013,7 @@ impl WaveInputs<'_, '_> {
         while let Some(g) = stack.pop() {
             if core::mem::replace(&mut seen[g], true) { continue; }
             let (input, absent) = lookup(self.made, task, self.names[g], self.failed_out)?;
-            deps.push(Dependency { index: g, input, absent, exports: None });
+            deps.push(Dependency { index: g, input, absent, has_exports: false, exports: None });
             stack.extend(edges_of(&self.crates[g], self.all, g));
         }
         deps.sort_unstable_by_key(|dep| dep.index);

@@ -1444,6 +1444,53 @@ impl<'n> Records<'n> {
         let record = self.items_of(krate)?;
         Some(self.read(krate, record.identity(key))??.foreign)
     }
+
+    /// Link closure (same as [`NamesSource::linked`]) invoking `touch(krate)` for every crate
+    /// whose `NamesRecord` / `ItemsRecord` is inspected (both reached crates and `proc_macro`
+    /// checks on their targets), so [`super::tables::view::Tables::linked`] records exact
+    /// [`blaze_scope::names_cells::NameCell::Links`] cells instead of whole-crate sections.
+    pub(in crate::front2) fn linked_logged<'a>(
+        &'n self,
+        roots: &[usize],
+        alloc: Alloc<'a>,
+        touch: impl Fn(usize),
+    ) -> Option<Result<super::linked::Linked<'a>, super::linked::RootsError>> {
+        let closure = super::linked::Linked::closure(
+            self.keys.len(),
+            roots,
+            alloc,
+            |at, link| {
+                touch(at);
+                let names = self.names_of(at).ok_or(())?;
+                let crate_of = |root: ItemKey| match self.paths.crate_of(root) {
+                    Some(i) => Ok(i),
+                    None => {
+                        self.gap("linked: a crate's extern prelude or `extern crate` names a root module of no crate the records hold", Some(root));
+                        Err(())
+                    }
+                };
+                for (_, root) in names.crate_root().externs() {
+                    link(crate_of(root)?);
+                }
+                let items = self.items_of(at).ok_or(())?;
+                for m in 0..items.modules() {
+                    let Some(row) = self.read(at, items.module_at(m)).ok_or(())? else { break };
+                    let Some(scope) = names.scope(row.key) else { continue };
+                    for entry in scope.bindings() {
+                        if matches!(entry.binding.origin, blaze_surface::Origin::ExternCrate) {
+                            link(crate_of(entry.binding.def.key)?);
+                        }
+                    }
+                }
+                Ok(())
+            },
+            |i| {
+                touch(i);
+                self.items_of(i).map(|r| r.proc_macro()).ok_or(())
+            },
+        );
+        closure.ok()
+    }
 }
 
 /// The most changed files one command outlines to read their members at item grain (rule 18).
@@ -1537,37 +1584,7 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     /// name, so no scope holds it: such a crate is linked only if something else names it
     /// (the end form: the items record's `extern crate` row with its target crate).
     fn linked<'a>(self, roots: &[usize], alloc: Alloc<'a>) -> Option<Result<super::linked::Linked<'a>, super::linked::RootsError>> {
-        let closure = super::linked::Linked::closure(
-            self.keys.len(),
-            roots,
-            alloc,
-            |at, link| {
-                let names = self.names_of(at).ok_or(())?;
-                let crate_of = |root: ItemKey| match self.paths.crate_of(root) {
-                    Some(i) => Ok(i),
-                    None => {
-                        self.gap("linked: a crate's extern prelude or `extern crate` names a root module of no crate the records hold", Some(root));
-                        Err(())
-                    }
-                };
-                for (_, root) in names.crate_root().externs() {
-                    link(crate_of(root)?);
-                }
-                let items = self.items_of(at).ok_or(())?;
-                for m in 0..items.modules() {
-                    let Some(row) = self.read(at, items.module_at(m)).ok_or(())? else { break };
-                    let Some(scope) = names.scope(row.key) else { continue };
-                    for entry in scope.bindings() {
-                        if matches!(entry.binding.origin, blaze_surface::Origin::ExternCrate) {
-                            link(crate_of(entry.binding.def.key)?);
-                        }
-                    }
-                }
-                Ok(())
-            },
-            |i| self.items_of(i).map(|r| r.proc_macro()).ok_or(()),
-        );
-        closure.ok()
+        self.linked_logged(roots, alloc, |_| {})
     }
 
     /// Rust's `std` is the crate whose items record names it `std` (blaze-scope graph.rs

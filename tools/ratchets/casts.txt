@@ -133,7 +133,7 @@ blaze-url	3
 blaze-v2-proof	5
 blaze-wasi	34
 blaze-watch	103
-blaze-world	159
+blaze-world	158
 const-ast	27
 edition	1
 gpu	96

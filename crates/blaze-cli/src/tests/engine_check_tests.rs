@@ -1999,13 +1999,9 @@ fn an_unresolved_import_stops_only_what_reads_it() {
     let (fixed_ids, fixed, fixed_checked) = printed(&io, false);
     println!("fixed a: {}", entries(&fixed_checked));
     assert!(error_lines(&fixed).is_empty(), "fixed: no error:\n{fixed}");
-    // The `Names` entries, by cause, exactly (run 184110-RA8): `a`'s two units (its library and
-    // its test unit) by its edited file, and the four units of `b` and `c` by `a`'s record
-    // cell, which each reads (`c` too: a names task reads its whole closure, engine_names.rs
-    // `closure_of`), all four coming out identical. Those four are this design's cost, not the
-    // floor: the cell a dependent reads is `a`'s whole out (exports and inner records,
-    // names/scope.rs `OUT_DOMAIN`), and removing a private import moves only the inner one. The
-    // floor is 2 entries (ratio 6/2); the fix is a dependent reading an exports-only cell.
+    // The `Names` entries, by cause, at the floor (2/2): `a`'s two units (its library and its
+    // test unit) by its edited file; `b` and `c` read `a`'s `EXPORTS` cell, which does not move
+    // when a private import is fixed, so 0 downstream `Names` tasks enter.
     let mut names_because: std::vec::Vec<(std::string::String, std::string::String, u32)> = fixed_checked
         .because
         .iter()
@@ -2014,9 +2010,9 @@ fn an_unresolved_import_stops_only_what_reads_it() {
         .collect();
     names_because.sort();
     let expected: std::vec::Vec<(std::string::String, std::string::String, u32)> =
-        vec![("read moved".to_owned(), "Some(CrateScope)".to_owned(), 4), ("read moved".to_owned(), "Some(FileItems)".to_owned(), 2)];
-    assert_eq!(names_because, expected, "fixed: `a`'s two units by its file, `b`'s and `c`'s four by `a`'s cell: {}", entries(&fixed_checked));
-    assert_eq!(fixed_checked.stages[blaze_engine::Stage::Names.index()], blaze_engine::StageCount { entered: 6, identical: 4 }, "fixed: the four readers came out identical: {}", entries(&fixed_checked));
+        vec![("read moved".to_owned(), "Some(FileItems)".to_owned(), 2)];
+    assert_eq!(names_because, expected, "fixed: `a`'s two units by its file alone (downstream reads EXPORTS): {}", entries(&fixed_checked));
+    assert_eq!(fixed_checked.stages[blaze_engine::Stage::Names.index()], blaze_engine::StageCount { entered: 2, identical: 0 }, "fixed: only `a`'s two units entered: {}", entries(&fixed_checked));
     let (fresh_ids, fresh, _) = printed(&io, true);
     assert_eq!((placed_ids(&fixed_ids), error_lines(&fixed)), (placed_ids(&fresh_ids), error_lines(&fresh)), "fixed: the incremental answer is a fresh run's");
     let (_, _, settled) = printed(&io, false);

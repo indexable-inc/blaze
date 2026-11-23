@@ -515,3 +515,47 @@ fn the_places_keep_the_time_they_were_taken() {
     with.push(0);
     assert!(Stored::of(&with).is_none(), "a trailer of nine bytes is not this form");
 }
+
+/// Direct (symlink-free, non-own-folder) script read rows are only inspected when the journal
+/// reaches them or an ancestor folder, while non-direct rows (potential symlinks), own-folder
+/// rows (`.git`), and `ScriptGit` still fall back to `reach.asks()` on any edit.
+#[test]
+fn direct_script_rows_skip_unrelated_edits_while_symlinks_and_git_stay_inspected() {
+    let frame = frame();
+    let rows = [
+        (LeafKind::ScriptFile, crate::sweep::DIRECT_PATH, "bin/tempo/src/main.rs"),
+        (LeafKind::ScriptFile, crate::sweep::DIRECT_PATH, "crates/other/src/lib.rs"),
+        (LeafKind::ScriptFile, 0, "crates/linked/src/lib.rs"),
+        (LeafKind::ScriptFile, crate::sweep::DIRECT_PATH, ".git/HEAD"),
+        (LeafKind::ScriptGit, 0, ""),
+    ];
+    let bytes = table(&rows, &frame);
+    let (leaves, _) = Leaves::of(&bytes).expect("the leaf table");
+    let effective = |told: &'static [&'static str]| {
+        let index = Index::of(told.iter().copied(), core::iter::empty(), Some(OwnFolders { target_tagged: true }), JournalPlant::None, &frame);
+        let views = [UnitView { at: Where::Checkout, name: "", index }];
+        let m = marks(&leaves, &views, JournalPlant::None, &frame);
+        let mut by_path = std::vec::Vec::new();
+        for i in 0..leaves.len() {
+            let row = leaves.row(i);
+            let path = leaves.path(i);
+            let inspected = if script_row_uses_asks(row.kind, row.flags, path, true) { !told.is_empty() } else { m[i] };
+            by_path.push((path, inspected));
+        }
+        by_path
+    };
+    let on_edit = effective(&["bin/tempo/src/main.rs"]);
+    for (path, expected) in [
+        ("bin/tempo/src/main.rs", true),
+        ("crates/other/src/lib.rs", false),
+        ("crates/linked/src/lib.rs", true),
+        (".git/HEAD", true),
+        ("", true),
+    ] {
+        let got = on_edit.iter().find(|(p, _)| *p == path).map(|(_, v)| *v);
+        assert_eq!(got, Some(expected), "on unrelated edit, `{path}` inspected");
+    }
+    let on_dir = effective(&["crates/other"]);
+    let got_dir = on_dir.iter().find(|(p, _)| *p == "crates/other/src/lib.rs").map(|(_, v)| *v);
+    assert_eq!(got_dir, Some(true), "CONTROL: ancestor folder event still reaches the direct script row beneath it");
+}

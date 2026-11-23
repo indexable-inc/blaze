@@ -194,7 +194,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     let mut corrected: AVec<'w, (u32, &'w str, &'w str)> = AVec::new_in(alloc);
     let mut used: AVec<'w, Corrected<'w>> = AVec::new_in(alloc);
     let tc = toolchain.crates();
-    let t = tc.len() as u32;
+    let t = u32::try_from(tc.len()).unwrap_or(u32::MAX);
     let proc_macro_crate = toolchain.proc_macro().map(|i| i as u32);
     let n = list.crates.len();
     let first = list.toolchain;
@@ -538,6 +538,176 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     let role = |i: Option<usize>| i.map(|i| CrateId(i as u32));
     let sysroot = Sysroot { core: role(toolchain.core()), alloc: role(toolchain.alloc()), std: role(toolchain.std()), bstd: role(toolchain.bstd()) };
     Ok(World { crates, texts: Texts { checkout, packs, origins, corrected, envs }, sysroot, toolchain_crates: t, crate_of_unit, corrections: used, refused })
+}
+
+/// Lightweight world for build-script execution: holds only the toolchain crates (target and
+/// macro sides, for `script_setting::ScriptSetup::open_recorded`) plus each script-reading
+/// crate's `(script_subject, side, cfg)`, without opening or placing any fetched package.
+pub struct ScriptWorld<'w> {
+    pub world: World<'w>,
+    pub script_cfgs: AVec<'w, (ContentId, Side, &'w [(&'w str, Option<&'w str>)])>,
+}
+
+/// Builds a [`ScriptWorld`] from `listed` (already opened without touching any fetched package).
+pub fn script_world<'w, B: AsRef<[u8]>>(
+    graph: &'w UnitGraph<'w>,
+    listed: &'w Listed<'w, B>,
+    checkout: &'w dyn Tree,
+    alloc: Bump<'w>,
+) -> Result<ScriptWorld<'w>, WorldError<'w>> {
+    let bump = alloc;
+    let alloc = bump.alloc();
+    let list = &listed.list;
+    let toolchain = &listed.toolchain;
+    let units = &graph.units;
+    let tc = toolchain.crates();
+    let t = u32::try_from(tc.len()).unwrap_or(u32::MAX);
+
+    let mut packs: AVec<'w, PackView<'w>> = AVec::with_capacity_in(tc.len() + listed.side_packs.len(), alloc);
+    let mut origins: AVec<'w, PackOrigin> = AVec::with_capacity_in(tc.len() + listed.side_packs.len(), alloc);
+    for c in tc {
+        let bytes = toolchain.pack(c);
+        packs.push(PackView::open_verified(bytes).map_err(|_| WorldError::Pack { krate: c.name })?);
+        origins.push(PackOrigin::Shelf { digest: footer(bytes).ok_or(WorldError::Pack { krate: c.name })? });
+    }
+
+    let mut crates: AVec<'w, Crate<'w>> = AVec::with_capacity_in(tc.len() + listed.side_packs.len(), alloc);
+    let mut envs: AVec<'w, CrateEnv<'w>> = AVec::with_capacity_in(tc.len() + listed.side_packs.len(), alloc);
+    for c in tc.iter() {
+        let facts = EnvFacts {
+            crate_name: c.name,
+            package: None,
+            bin: None,
+            seen: SeenRoot::Package,
+            read_folder: c.shown_from,
+            build_script: false,
+            script: None,
+            test_or_bench: false,
+            bin_exes: blaze_scope::crate_env::BinNames::NONE,
+            meta: None,
+        };
+        envs.push(CrateEnv::of(facts, alloc).map_err(WorldError::Env)?);
+        crates.push(Crate {
+            input: CrateInput {
+                name: c.name,
+                key: c.key,
+                edition: c.edition,
+                implicit: c.implicit,
+                root: c.root,
+                shown_from: c.shown_from,
+                features: c.features,
+                deps: c.deps,
+                cfg: c.cfg,
+                script: None,
+            },
+            origin: Origin::Toolchain(c.unit),
+            units: 0,
+            script: Script::None,
+            proc_macro: c.proc_macro,
+            package: c.name,
+            version: c.version,
+            side: Side::Target,
+        });
+    }
+
+    // Macro-side toolchain crates: assign their world indices first so deps remap cleanly.
+    let mut side_index: AVec<'w, Option<usize>> = AVec::with_capacity_in(list.crates.len(), alloc);
+    side_index.resize(list.crates.len(), None);
+    let mut next_idx = tc.len();
+    for (at, c) in list.crates.iter().enumerate().skip(list.macro_from) {
+        if matches!(c.origin, ListOrigin::Toolchain { .. })
+            && let Some(slot) = side_index.get_mut(at)
+        {
+            *slot = Some(next_idx);
+            next_idx += 1;
+        }
+    }
+    for (at, c) in list.crates.iter().enumerate().skip(list.macro_from) {
+        let ListOrigin::Toolchain { unit, .. } = c.origin else { continue };
+        let (bytes, version) = listed.side_pack(at).ok_or(WorldError::ToolchainCrateNotOpened { krate: c.name })?;
+        packs.push(PackView::open_verified(bytes).map_err(|_| WorldError::Pack { krate: c.name })?);
+        origins.push(PackOrigin::Shelf { digest: footer(bytes).ok_or(WorldError::Pack { krate: c.name })? });
+        let tree = u32::try_from(packs.len()).unwrap_or(u32::MAX);
+        let inner = c.root.as_str().strip_prefix(c.shown_from.as_str()).ok_or(WorldError::ToolchainRoot { krate: c.name, root: c.root.as_str() })?;
+        let mut base = AString::with_capacity_in(12, alloc);
+        base.push_str("/");
+        push_u32(&mut base, tree);
+        base.push_str("/");
+        let root = bump.alloc_str(&join(&base, inner, alloc));
+        let shown_from: &'w str = bump.alloc_str(&base);
+        let facts = EnvFacts {
+            crate_name: c.name,
+            package: None,
+            bin: None,
+            seen: SeenRoot::Package,
+            read_folder: shown_from,
+            build_script: false,
+            script: None,
+            test_or_bench: false,
+            bin_exes: blaze_scope::crate_env::BinNames::NONE,
+            meta: None,
+        };
+        let mut deps: BVec<'w, (&'w str, usize)> = BVec::with_capacity_in(c.deps.len(), bump);
+        for &(name, d) in c.deps.iter() {
+            if let Some(target_idx) = side_index.get(d).copied().flatten() {
+                deps.push((name, target_idx));
+            }
+        }
+        envs.push(CrateEnv::of(facts, alloc).map_err(WorldError::Env)?);
+        crates.push(Crate {
+            input: CrateInput {
+                name: c.name,
+                key: c.key,
+                edition: c.edition,
+                implicit: c.implicit,
+                root,
+                shown_from,
+                features: &c.features,
+                deps: deps.into_bump_slice(),
+                cfg: &c.cfg,
+                script: None,
+            },
+            origin: Origin::Toolchain(unit),
+            units: 0,
+            script: Script::None,
+            proc_macro: false,
+            package: c.name,
+            version,
+            side: Side::Macro,
+        });
+    }
+
+    let mut script_cfgs: AVec<'w, (ContentId, Side, &'w [(&'w str, Option<&'w str>)])> = AVec::new_in(alloc);
+    for (at, c) in list.crates.iter().enumerate().skip(list.toolchain) {
+        let ListOrigin::Unit(id) = c.origin else { continue };
+        let Some(unit) = units.get(id.index()) else { continue };
+        if unit.build_script.is_none() {
+            continue;
+        }
+        let side = if list.macro_side(at) { Side::Macro } else { Side::Target };
+        let subject = crate::script_subject(unit.name.as_str(), unit.version.as_str(), side, &c.features, alloc);
+        if script_cfgs.iter().any(|(s, sd, _)| *s == subject && *sd == side) {
+            continue;
+        }
+        let mut cfg: BVec<'w, (&'w str, Option<&'w str>)> = BVec::with_capacity_in(c.cfg.len(), bump);
+        cfg.extend_from_slice(&c.cfg);
+        cfg.sort_unstable();
+        cfg.dedup();
+        script_cfgs.push((subject, side, cfg.into_bump_slice()));
+    }
+
+    let role = |i: Option<usize>| i.and_then(|i| u32::try_from(i).ok()).map(CrateId);
+    let sysroot = Sysroot { core: role(toolchain.core()), alloc: role(toolchain.alloc()), std: role(toolchain.std()), bstd: role(toolchain.bstd()) };
+    let world = World {
+        crates,
+        texts: Texts { checkout, packs, origins, corrected: AVec::new_in(alloc), envs },
+        sysroot,
+        toolchain_crates: t,
+        crate_of_unit: AVec::new_in(alloc),
+        corrections: AVec::new_in(alloc),
+        refused: AVec::new_in(alloc),
+    };
+    Ok(ScriptWorld { world, script_cfgs })
 }
 
 /// The BLAKE3 a toolchain pack is named by on the shelf: its 32-byte footer, which

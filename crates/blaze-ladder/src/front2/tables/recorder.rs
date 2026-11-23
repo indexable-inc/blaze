@@ -668,6 +668,8 @@ fn slot_of(key: ReadKey) -> usize {
             NameCell::Root { krate } => krate[7] ^ 0x33,
             NameCell::Lang { krate } => krate[7] ^ 0x44,
             NameCell::Incoherent { krate } => krate[7] ^ 0x55,
+            NameCell::InternalSymbols { krate } => krate[7] ^ 0x45,
+            NameCell::Links { krate } => krate[7] ^ 0x46,
             NameCell::Whole { krate, section } => krate[7] ^ (section as u8) ^ 0x66,
             NameCell::Variants { owner } => item(owner) ^ 0x77,
             NameCell::Members { owner } => item(owner) ^ 0x88,

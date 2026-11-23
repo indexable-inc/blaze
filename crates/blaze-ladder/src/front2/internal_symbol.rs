@@ -406,11 +406,12 @@ pub(crate) fn record_search<'n>(
     }
 }
 
-/// One covering read for all the facts the search can ask of this crate. Keeping it even
-/// for an empty or currently ineligible crate covers a new definition or runtime there.
+/// One covering read for all the facts the search can ask of this crate: its `#![panic_runtime]`
+/// flag and any `#[rustc_std_internal_symbol]` function items (`NameCell::InternalSymbols`), which
+/// is absent for every crate with neither so ordinary edits in unrelated crates wake no callers.
 pub(crate) fn search_read(key: blaze_id::CrateItemKey) -> super::tables::recorder::TableRead {
-    use blaze_scope::names_cells::{NameCell, Section};
-    super::tables::recorder::TableRead::Names(NameCell::Whole { krate: key.prefix(), section: Section::Items })
+    use blaze_scope::names_cells::NameCell;
+    super::tables::recorder::TableRead::Names(NameCell::InternalSymbols { krate: key.prefix() })
 }
 
 fn may_declare(head: &super::heads::FnHead<'_>) -> bool {

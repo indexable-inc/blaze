@@ -327,6 +327,27 @@ impl Tree {
         }
     }
 
+    /// Returns `true` when every component from the tree root to `rel` exists and is not a
+    /// symlink (always `true` for in-memory trees). A direct path's content/stat/listing can
+    /// only move when the checkout journal reports a change to `rel` or one of its ancestors.
+    pub fn is_direct(&self, rel: &str) -> bool {
+        match self {
+            Tree::Mem { .. } => true,
+            Tree::Dir(root) => {
+                if rel.is_empty() {
+                    return true;
+                }
+                if rel.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+                    return false;
+                }
+                match disk_node(root, rel, blaze_own::planted::NoPlant) {
+                    Ok(Some((real, _))) => real == root.path().join(rel),
+                    _ => false,
+                }
+            }
+        }
+    }
+
     /// The bytes of the file `rel` of the tree; `None` when it is absent, a folder or a link
     /// out of the tree.
     pub fn file(&self, rel: &str) -> Option<Vec<u8>> {
