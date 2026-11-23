@@ -29,6 +29,8 @@ pub(in crate::process) struct Start<'a> {
     /// Each `(source, target)`: as [`super::spawn_with`]'s `extra` says.
     pub(in crate::process) extra: &'a [(RawFd, RawFd)],
     pub(in crate::process) group: bool,
+    /// Starts the child in a new session (`setsid` on Linux, `POSIX_SPAWN_SETSID` on macOS).
+    pub(in crate::process) session: bool,
     /// Linux only: `PR_SET_PDEATHSIG(SIGKILL)` in the child; refused elsewhere.
     pub(in crate::process) parent_death: bool,
     /// The confinement the child enters last before `execve` (D177; `None` elsewhere than
@@ -61,7 +63,7 @@ pub(in crate::process) fn spawn_streams(program: &Program<'_>, start: &Start<'_>
         // The pid the child checks `getppid` against after arming; 0: not armed.
         // SAFETY: no arguments; always succeeds (getpid(2)).
         let parent = if start.parent_death { unsafe { libc::getpid() } } else { 0 };
-        let child = super::ChildAsk { procs: -1, extra: start.extra, group: start.group, parent, confine: start.confine };
+        let child = super::ChildAsk { procs: -1, extra: start.extra, group: start.group, session: start.session, parent, confine: start.confine };
         match while_busy(|| super::clone(&plan, fds, &child))? {
             super::Cloned::Started { pid, pidfd } => Ok(Started { pid, pidfd, stdout, stderr }),
             super::Cloned::ConfineRefused { step, errno } => Err(StartError::Confine { step, errno }),
@@ -77,7 +79,7 @@ pub(in crate::process) fn spawn_streams(program: &Program<'_>, start: &Start<'_>
             // No value of the type exists here (`linked::run::ChildConfine`); a second guard.
             return Err(io::Error::new(io::ErrorKind::Unsupported, "macOS: no confinement is entered by posix_spawn").into());
         }
-        let pid = super::posix_spawn(&plan, fds, start.extra, start.group)?;
+        let pid = super::posix_spawn(&plan, fds, start.extra, start.group, start.session)?;
         Ok(Started { pid, stdout, stderr })
     }
 }

@@ -18,7 +18,7 @@ use core::cell::Cell;
 use blaze_expand::{ExpandCx, HostAsk, HostError, IncludeAs, Included, MacroDefinition, Place, PlaceOf, ProcCall, Produced, TokenStream};
 use blaze_hash::HashMap;
 use blaze_id::ItemKey;
-use blaze_own::{AString, AVec, Alloc, Box};
+use blaze_own::{AVec, Alloc, Bump};
 use blaze_surface::{RefusedWhy, ScopeError};
 
 use crate::resolve::Expansion;
@@ -57,17 +57,17 @@ impl<'a> Refused<'a> {
 /// on), so it is that expansion's cause.
 pub(crate) struct EnvRefusal<'a> {
     first: Cell<Option<&'a str>>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 }
 
 impl<'a> EnvRefusal<'a> {
-    pub(crate) fn new_in(alloc: Alloc<'a>) -> EnvRefusal<'a> {
+    pub(crate) fn new_in(alloc: Bump<'a>) -> EnvRefusal<'a> {
         EnvRefusal { first: Cell::new(None), alloc }
     }
 
     fn note(&self, name: &str) {
         if self.first.get().is_none() {
-            let kept: &'a str = Box::leak(AString::from_str_in(name, self.alloc).into_boxed_str());
+            let kept: &'a str = self.alloc.alloc_str(name);
             self.first.set(Some(kept));
         }
     }

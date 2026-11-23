@@ -169,7 +169,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
 
     fn into_inner(&mut self, dest: Place, e: ExprId) -> Result<(), LowerError> {
         let (lo, hi) = self.adjust_rows(e);
-        if hi > lo && matches!(self.adjust(lo).0, AdjustKind::NeverToAny) {
+        if hi > lo && matches!(self.adjust(lo), Some((AdjustKind::NeverToAny, _))) {
             // A diverging expression: nothing is written; the code after it is not reached.
             let ty = self.expr_ty(e)?;
             let t = self.scratch(e, ty);
@@ -213,10 +213,12 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             Val::Place(self.place_unadjusted(e)?, ty)
         } else if let Some(c) = self.const_operand(e)? {
             Val::Op(c, ty)
-        } else if hi > lo && matches!(self.adjust(lo).0, AdjustKind::NeverToAny) {
+        } else if hi > lo && matches!(self.adjust(lo), Some((AdjustKind::NeverToAny, _))) {
             let t = self.scratch(e, ty);
             self.value_into(t, e)?;
-            let to = self.adjust(hi - 1).1;
+            let Some((_, to)) = self.adjust(hi - 1) else {
+                return self.refuse(Construct::Malformed, e);
+            };
             let u = self.scratch(e, to);
             return Ok(Val::Op(Operand::Move(u), to));
         } else {
@@ -225,7 +227,9 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             Val::Place(t, ty)
         };
         for i in lo..hi {
-            let (k, to) = self.adjust(i);
+            let Some((k, to)) = self.adjust(i) else {
+                return self.refuse(Construct::Malformed, e);
+            };
             v = self.apply(v, k, to, e)?;
         }
         Ok(v)

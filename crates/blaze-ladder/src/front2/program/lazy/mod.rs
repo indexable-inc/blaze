@@ -340,12 +340,13 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             let found = super::super::langs::find(&front.index, front.resolver, item).map_err(|why| Front2Refusal::Lang { item, why })?;
             *slot = (item, found.map(checker_of));
         }
+        let bump = front.frame.alloc(blaze_own::Erased::new(front.frame)).bump();
         Ok(LazyProgram {
             front,
             store,
             buckets: None,
             consts: Consts::default(),
-            prepared: Prepares::new_in(alloc),
+            prepared: Prepares::new_in(bump),
             lowerings: fill::Lowerings::default(),
             rows: Rows::new_in(alloc),
             live: AVec::new_in(alloc),

@@ -164,10 +164,10 @@ fn written_types_across_crates() {
         script: None,
     });
     let texts = WithDep { base: &inputs.texts, dep, files: &dep_files };
-    let names = resolve_crates(&crates, sysroot, &texts, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"));
+    let names = resolve_crates(&crates, sysroot, &texts, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: USER }];
     let mut front = Front2::new(&names, frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
-    let prepared = Prepares::new_in(alloc);
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
     let mut buckets = None;
 

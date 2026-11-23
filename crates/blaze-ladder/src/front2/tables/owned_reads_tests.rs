@@ -85,14 +85,14 @@ fn tool() -> blaze_drive::key::Tool {
 struct Counted<'r, S> {
     names: S,
     index: &'r Index<'static>,
-    alloc: Alloc<'static>,
+    bump: blaze_own::Bump<'static>,
     asked: AVec<'static, LibKey>,
 }
 
 impl<S: crate::front2::source::NamesSource<'static>> ConstValues<'static> for Counted<'_, S> {
     fn eval(&mut self, store: &mut Store<'static>, keys: &mut Keys, c: LibKey) -> Result<(), ConstFail> {
         self.asked.push(c);
-        let prepared = blaze_scope::prepares::Prepares::new_in(self.alloc);
+        let prepared = blaze_scope::prepares::Prepares::new_in(self.bump);
         StoreConsts { names: self.names, index: self.index, prepared }.eval(store, keys, c)
     }
 }
@@ -124,7 +124,8 @@ fn shared(names: Src, sized: Option<LibKey>, frame: &'static blaze_mem::Frame, o
     // a plain recorder of its own, or its reads would be no one's.
     let lang = Recorder::new(RecorderOpts { alloc: g });
     let index = Index::from_source(eval_view.reading_into(&lang), LANG).unwrap_or_else(|_| panic!("the fixture's lang index"));
-    let mut consts = Counted { names: eval_view, index: &index, alloc: g, asked: AVec::new_in(g) };
+    let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+    let mut consts = Counted { names: eval_view, index: &index, bump, asked: AVec::new_in(g) };
     // No receiver pointers looked up (as `plain`'s): the lookup's names reads are a job's, not a
     // cell's, and these runs compare cells' reads alone.
     let mut source = SeededHeads::new(SeededHeadsOpts { names: view, sized, pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP, frame, scratch: g, alloc: g, consts: Some(&mut consts), known: None, owners: Some(&both) });
@@ -177,7 +178,8 @@ fn plain(names: Src, sized: Option<LibKey>, frame: &'static blaze_mem::Frame, w:
     let view = Tables::new(TablesOpts { records: names, impls: None, lang_crates: LANG, reads: &rec });
     let eval_view = Tables::new(TablesOpts { records: names, impls: None, lang_crates: LANG, reads: &evals });
     let index = Index::from_source(eval_view, LANG).unwrap_or_else(|_| panic!("the fixture's lang index"));
-    let mut consts = Counted { names: eval_view, index: &index, alloc: g, asked: AVec::new_in(g) };
+    let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+    let mut consts = Counted { names: eval_view, index: &index, bump, asked: AVec::new_in(g) };
     let mut source = SeededHeads::new(SeededHeadsOpts { names: view, sized, pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP, frame, scratch: g, alloc: g, consts: Some(&mut consts), known: None, owners: None });
     let made = head_task(view, &mut source, w, tool(), g);
     assert!(made.failed.is_none(), "{w:?} alone failed");

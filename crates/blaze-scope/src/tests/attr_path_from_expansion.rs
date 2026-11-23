@@ -31,11 +31,21 @@ use crate::names::Written;
 use crate::resolve::{AttrPlant, CrateInput, ExpandNote, Names, NamesNote, SourceTexts, resolve_crates};
 use crate::task::Serial;
 
-/// The test's root heap, made at its top; the names resolved borrow it, and its drop checks
-/// nothing was leaked.
-fn root() -> Root {
-    // The names resolution keeps what it makes for its arena's life (`TEST_ARENA`).
-    Root::new(RootOpts::TEST_ARENA).unwrap_or_else(|e| panic!("the test's root: {e}"))
+/// The test's bump arena, made at its top; the names resolved borrow it.
+struct TestRoot(blaze_own::Erased<blaze_mem::Frame>);
+
+impl TestRoot {
+    fn alloc(&self) -> Alloc<'_> {
+        self.0.handle()
+    }
+
+    fn bump(&self) -> blaze_own::Bump<'_> {
+        self.0.bump()
+    }
+}
+
+fn root() -> TestRoot {
+    TestRoot(blaze_own::Erased::new(blaze_mem::Frame::new(blaze_mem::Tag::Nameres).unwrap_or_else(|e| panic!("the test's frame: {e:?}"))))
 }
 
 /// The proc-macro crate: one attribute macro, `mark`.
@@ -141,12 +151,12 @@ impl<'r> SourceTexts<'r> for World {
 }
 
 /// The three crates resolved under `plant` into `root`, and the world that ran `mark`.
-fn solve(root: &Root, plant: AttrPlant) -> (Names<'_>, World) {
+fn solve(root: &TestRoot, plant: AttrPlant) -> (Names<'_>, World) {
     let world = World { plant, ran: AtomicU32::new(0), clean: AtomicU32::new(0) };
     let macros = input("macros", "/macros/lib.rs", &[]);
     let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false };
     let crates = [input("user", "/user/lib.rs", &[("sdk", SDK_CRATE)]), input("sdk", "/sdk/lib.rs", &[("macros", MACROS_CRATE)]), CrateInput { implicit, ..macros }];
-    let names = resolve_crates(&crates, Sysroot::default(), &world, &Serial, root.alloc()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &world, &Serial, root.bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     (names, world)
 }
 

@@ -9,7 +9,7 @@ use std::vec::Vec;
 use std::{format, vec};
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-use blaze_own::{Alloc, Vec as OwnVec};
+use blaze_own::{Alloc, Bump, BumpAlloc, Erased, Vec as OwnVec};
 use blaze_sim::Tape;
 use blaze_surface::SurfaceError;
 
@@ -101,6 +101,57 @@ mod tests_record;
 mod waits_on;
 
 pub(crate) type N = &'static str;
+
+/// A thread-safe bump arena backed by a `blaze_mem::Frame`, for tests (including multi-threaded
+/// tests like `per_crate::Threads`). Reclaimed in bulk when dropped.
+pub(crate) struct SyncFrame(std::sync::Mutex<blaze_mem::Frame>);
+
+impl SyncFrame {
+    pub(crate) fn new() -> Erased<SyncFrame> {
+        Erased::new(SyncFrame(std::sync::Mutex::new(blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("test frame"))))
+    }
+
+    /// A `'static` bump arena for test fixtures that must return `'static` references.
+    pub(crate) fn leaked() -> Bump<'static> {
+        let erased: &'static Erased<SyncFrame> = std::boxed::Box::leak(std::boxed::Box::new(SyncFrame::new()));
+        erased.bump()
+    }
+}
+
+// SAFETY: every call locks the inner `blaze_mem::Frame` and delegates to its `Allocator` impl.
+unsafe impl core::alloc::Allocator for SyncFrame {
+    fn allocate(&self, layout: core::alloc::Layout) -> Result<core::ptr::NonNull<[u8]>, core::alloc::AllocError> {
+        self.0.lock().expect("test frame lock").allocate(layout)
+    }
+
+    fn allocate_zeroed(&self, layout: core::alloc::Layout) -> Result<core::ptr::NonNull<[u8]>, core::alloc::AllocError> {
+        self.0.lock().expect("test frame lock").allocate_zeroed(layout)
+    }
+
+    unsafe fn deallocate(&self, ptr: core::ptr::NonNull<u8>, layout: core::alloc::Layout) {
+        // SAFETY: caller's contract passed through to the inner `Frame`.
+        unsafe { self.0.lock().expect("test frame lock").deallocate(ptr, layout) }
+    }
+
+    unsafe fn grow(&self, ptr: core::ptr::NonNull<u8>, old: core::alloc::Layout, new: core::alloc::Layout) -> Result<core::ptr::NonNull<[u8]>, core::alloc::AllocError> {
+        // SAFETY: caller's contract passed through to the inner `Frame`.
+        unsafe { self.0.lock().expect("test frame lock").grow(ptr, old, new) }
+    }
+
+    unsafe fn grow_zeroed(&self, ptr: core::ptr::NonNull<u8>, old: core::alloc::Layout, new: core::alloc::Layout) -> Result<core::ptr::NonNull<[u8]>, core::alloc::AllocError> {
+        // SAFETY: caller's contract passed through to the inner `Frame`.
+        unsafe { self.0.lock().expect("test frame lock").grow_zeroed(ptr, old, new) }
+    }
+
+    unsafe fn shrink(&self, ptr: core::ptr::NonNull<u8>, old: core::alloc::Layout, new: core::alloc::Layout) -> Result<core::ptr::NonNull<[u8]>, core::alloc::AllocError> {
+        // SAFETY: caller's contract passed through to the inner `Frame`.
+        unsafe { self.0.lock().expect("test frame lock").shrink(ptr, old, new) }
+    }
+}
+
+// SAFETY: every allocation comes from the inner `blaze_mem::Frame`, which implements `BumpAlloc`
+// and reclaims all allocations in bulk on drop.
+unsafe impl BumpAlloc for SyncFrame {}
 
 /// A scope error as the machine makes it in the tests.
 pub(crate) type Error = ScopeError<N, Path<'static, N>>;

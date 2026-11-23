@@ -61,10 +61,10 @@ use blaze_units::{Angle, Length, Plain};
 use crate::Limits;
 use crate::error::{CadError, Name, NodeKind, Value};
 use crate::level::{AtLeastInside, AtLeastOutside, Bound, Ex, Exact, Inside, Join, Level, Lipschitz, Outside};
-use crate::node::{Boolean, Detail, Digest, Edge, Node, NodeId, ProfileId, Shape};
+use crate::node::{Boolean, Detail, Digest, Edge, LoftContinuity, Node, NodeId, ProfileId, Shape};
 use crate::placement::{ANGLE_UNIT, Axis, Placement};
 use crate::plant::CadPlant;
-use crate::profile::{self, Closed, Profile, SEG_WIDTH};
+use crate::profile::{self, Closed, Point2, Profile, SEG_WIDTH};
 
 /// A solid whose field is at level `K` (see `level.rs`): a node id with its exactness in its
 /// type.
@@ -140,6 +140,58 @@ pub(crate) struct GridRec {
     /// bound plus this.
     pub band: f64,
     pub start: u32,
+}
+
+/// One quantized cubic spline span on `[z0_nm, z1_nm]` (coefficients in units of 10^-12).
+/// Evaluated for `u = (z - z0) / (z1 - z0) in [0, 1]` as `c0 + u * (c1 + u * (c2 + u * c3))`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct SplineSpan {
+    pub z0_nm: i64,
+    pub z1_nm: i64,
+    pub c_pp12: [i64; 4],
+}
+
+/// What the graph keeps per [`Node::GuidedLoft`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct GuidedLoftRec {
+    pub stations_start: u32,
+    pub stations_len: u32,
+    /// `(start, len)` in `Graph::spline_spans` for `[sx, sy, cx, cy, twist]`.
+    /// `len == 0` denotes the constant identity (`1.0` for `sx`/`sy`, `0.0` for `cx`/`cy`/`twist`).
+    pub splines: [(u32, u32); 5],
+    /// Minimum of `sx(z)` and `sy(z)` over the loft z-range in units of `10^-12` (strictly > 0).
+    pub s_min_pp12: [i64; 2],
+    pub continuity: LoftContinuity,
+    pub cap_round: i64,
+    pub lipschitz_ppm: i64,
+    /// Whether any spline varies with `z` (requiring the grown-AABB box guard).
+    pub guarded: bool,
+}
+
+/// Canonical quantized [`RadiusProfile`] stored in `Graph::var_fields`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum CanonProfile {
+    Constant { r_nm: i64 },
+    Linear { from_nm: [i64; 3], to_nm: [i64; 3], r0_nm: i64, r1_nm: i64 },
+    Curve { origin_nm: [i64; 3], axis_pp12: [i64; 3], start: u32, len: u32 },
+}
+
+/// Canonical quantized [`EdgeSelect`] stored in `Graph::var_fields`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum CanonSelect {
+    All,
+    Box { lo_nm: [i64; 3], hi_nm: [i64; 3], fade_nm: i64 },
+    Ball { center_nm: [i64; 3], radius_nm: i64, fade_nm: i64 },
+    Capsule { a_nm: [i64; 3], b_nm: [i64; 3], radius_nm: i64, fade_nm: i64 },
+}
+
+/// What the graph keeps per variable-radius field (`Node::VariableBoolean`, `Node::VariableOffset`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct VarFieldRec {
+    pub profile: CanonProfile,
+    pub select: CanonSelect,
+    pub r_max_nm: i64,
+    pub l_r_ppm: i64,
 }
 
 /// The graph's construction arguments (rule 83).
@@ -237,6 +289,133 @@ opts! {
 pub struct Station {
     pub z: Length,
     pub profile: Prof<Exact>,
+}
+
+/// One knot of a [`GuideRail`]: height `z`, target `value`, and optional dimensionless tangent
+/// `d(value)/dz` (`None` solves the C2 natural cubic spline condition at this knot).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RailPoint {
+    pub z: Length,
+    pub value: Length,
+    pub tangent: Option<f64> = None,
+}
+
+/// A smooth 1-D guide rail along `z` for [`Graph::guided_loft`]: C2 natural cubic spline where
+/// tangents are `None`, clamped cubic Hermite where tangents are `Some`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct GuideRail<'s> {
+    pub points: &'s [RailPoint],
+}
+
+/// One station of a [`Graph::guided_loft`]: exact 2-D profile at height `z` with optional center
+/// offset, `(sx, sy)` scale, and twist angle (interpolated by C2 natural cubic spline when the
+/// corresponding guide rail is omitted).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct GuidedStation {
+    pub z: Length,
+    pub profile: Prof<Exact>,
+    pub center: [Length; 2] = [Length::ZERO; 2],
+    pub scale: [f64; 2] = [1.0, 1.0],
+    pub twist: Angle = Angle::ZERO,
+}
+
+/// Options for [`Graph::guided_loft`] (rule 83).
+#[blaze::args]
+#[derive(Clone, Copy, Debug)]
+pub struct GuidedLoftOpts<'s> {
+    pub stations: &'s [GuidedStation],
+    pub side_rail: Option<GuideRail<'s>> = None,
+    pub ridge_rail: Option<GuideRail<'s>> = None,
+    pub center_x_rail: Option<GuideRail<'s>> = None,
+    pub center_y_rail: Option<GuideRail<'s>> = None,
+    pub continuity: LoftContinuity = LoftContinuity::CurvatureC2,
+    pub cap_round: Length = Length::ZERO,
+    pub name: Option<&'s str> = None,
+}
+
+/// One knot of a [`RadiusProfile::Curve`]: parameter `at` along the axis and target `radius`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RadiusStop {
+    pub at: Length,
+    pub radius: Length,
+}
+
+/// Spatially varying radius profile for variable blends and variable offsets.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum RadiusProfile<'s> {
+    /// Constant radius everywhere.
+    Constant(Length),
+    /// Linearly ramps from `r0` at `from` to `r1` at `to`, clamped outside `[0, 1]`.
+    Linear { from: [Length; 3], to: [Length; 3], r0: Length, r1: Length },
+    /// Smooth C1 cubic Hermite interpolation between `stops` along `(p - origin) . unit(axis)`.
+    Curve { origin: [Length; 3], axis: [f64; 3], stops: &'s [RadiusStop] },
+}
+
+/// Spatial selection region for selective blends and offsets.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum EdgeSelect {
+    /// Full strength everywhere (`mask = 1`).
+    All,
+    /// Full strength inside `[lo, hi]`, smoothstep-faded to zero across `fade` outside.
+    Box { lo: [Length; 3], hi: [Length; 3], fade: Length },
+    /// Full strength inside the sphere `(center, radius)`, smoothstep-faded across `fade` outside.
+    Ball { center: [Length; 3], radius: Length, fade: Length },
+    /// Full strength inside the capsule `(a, b, radius)`, smoothstep-faded across `fade` outside.
+    Capsule { a: [Length; 3], b: [Length; 3], radius: Length, fade: Length },
+}
+
+/// Options for selective, variable-radius rounded and chamfered booleans (rule 83).
+#[blaze::args]
+#[derive(Clone, Copy, Debug)]
+pub struct VariableBlendOpts<'s> {
+    pub profile: RadiusProfile<'s>,
+    pub select: EdgeSelect = EdgeSelect::All,
+    pub name: Option<&'s str> = None,
+}
+
+/// Options for selective, variable-radius grow and erode (rule 83).
+#[blaze::args]
+#[derive(Clone, Copy, Debug)]
+pub struct VariableOffsetOpts<'s> {
+    pub profile: RadiusProfile<'s>,
+    pub select: EdgeSelect = EdgeSelect::All,
+    pub name: Option<&'s str> = None,
+}
+
+/// One oriented station along a 3-D surface curve for [`Graph::sweep_frames`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct SweepFrame {
+    pub point: [Length; 3],
+    pub tangent: [f64; 3],
+    pub normal: [f64; 3],
+    pub width: Length,
+    pub depth: Length,
+}
+
+/// Cross-section shape for [`Graph::sweep_frames`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SweepCrossSection {
+    /// Circular (or stadium when `width != depth`).
+    Circular,
+    /// D-shaped half-round arch of `width` and `depth`.
+    HalfRound,
+    /// Smoothly filleted groove channel of `width` and `depth`.
+    Channel,
+    /// V-shaped triangular groove of `width` and `depth`.
+    VGroove,
+    /// Rectangular section of `width` and `depth` with corner radius `round`.
+    Rectangular { round: Length },
+}
+
+/// Options for [`Graph::sweep_frames`] (rule 83).
+#[blaze::args]
+#[derive(Clone, Copy, Debug)]
+pub struct SweepFramesOpts<'s> {
+    pub frames: &'s [SweepFrame],
+    pub section: SweepCrossSection = SweepCrossSection::Channel,
+    pub closed: bool = false,
+    pub smooth_join: Length = Length::ZERO,
+    pub name: Option<&'s str> = None,
 }
 
 /// The fold, in nanometres, of a length to metres: the one fixed conversion.
@@ -408,6 +587,14 @@ pub struct Graph<'a, P: Planted<CadPlant> = NoPlant> {
     segs: AVec<'a, f64>,
     /// Loft stations: height in nanometres and profile.
     stations: AVec<'a, (i64, ProfileId)>,
+    /// Quantized piecewise-cubic spline spans for [`Node::GuidedLoft`].
+    spline_spans: AVec<'a, SplineSpan>,
+    /// Metadata records for [`Node::GuidedLoft`].
+    guided_lofts: AVec<'a, GuidedLoftRec>,
+    /// Quantized variable-radius fields for [`Node::VariableBoolean`] and [`Node::VariableOffset`].
+    var_fields: AVec<'a, VarFieldRec>,
+    /// Quantized `(at_nm, radius_nm)` stops for [`CanonProfile::Curve`].
+    radius_stops: AVec<'a, (i64, i64)>,
     names: Map<NodeId, Name, FixedState, Alloc<'a>>,
     grids: Map<NodeId, GridRec, FixedState, Alloc<'a>>,
     grid_values: AVec<'a, f64>,
@@ -436,6 +623,10 @@ impl<'a, P: Planted<CadPlant>> Graph<'a, P> {
             profile_by_digest: Map::new(map()),
             segs: Vec::new_in(alloc),
             stations: Vec::new_in(alloc),
+            spline_spans: Vec::new_in(alloc),
+            guided_lofts: Vec::new_in(alloc),
+            var_fields: Vec::new_in(alloc),
+            radius_stops: Vec::new_in(alloc),
             names: Map::new(map()),
             grids: Map::new(map()),
             grid_values: Vec::new_in(alloc),
@@ -520,6 +711,24 @@ impl<'a, P: Planted<CadPlant>> Graph<'a, P> {
 
     pub(crate) fn station(&self, i: u32) -> (i64, ProfileId) {
         self.stations[i as usize]
+    }
+
+    pub(crate) fn guided_loft_rec(&self, idx: u32) -> &GuidedLoftRec {
+        &self.guided_lofts[idx as usize]
+    }
+
+    pub(crate) fn spline_slice(&self, slice: (u32, u32)) -> &[SplineSpan] {
+        let (start, len) = (slice.0 as usize, slice.1 as usize);
+        &self.spline_spans[start..start + len]
+    }
+
+    pub(crate) fn var_field_rec(&self, idx: u32) -> &VarFieldRec {
+        &self.var_fields[idx as usize]
+    }
+
+    pub(crate) fn radius_stops_slice(&self, start: u32, len: u32) -> &[(i64, i64)] {
+        let (s, l) = (start as usize, len as usize);
+        &self.radius_stops[s..s + l]
     }
 
     pub(crate) fn grid(&self, id: NodeId) -> Option<(&GridRec, &[f64])> {
@@ -708,8 +917,121 @@ impl<'a, P: Planted<CadPlant>> Graph<'a, P> {
                 both!(u8(18));
                 kid(&mut f, &mut c, inner);
             }
+            Node::GuidedLoft { idx } => {
+                let gl = self.guided_lofts[idx as usize];
+                both!(u8(19));
+                both!(i64(i64::from(gl.stations_len)));
+                for i in gl.stations_start..gl.stations_start + gl.stations_len {
+                    let (z, p) = self.stations[i as usize];
+                    both!(i64(z));
+                    both!(d(&self.profile_rec(p).digest));
+                }
+                for (start, len) in gl.splines {
+                    both!(i64(i64::from(len)));
+                    for sp in &self.spline_spans[start as usize..(start + len) as usize] {
+                        both!(i64(sp.z0_nm));
+                        both!(i64(sp.z1_nm));
+                        for coeff in sp.c_pp12 {
+                            both!(i64(coeff));
+                        }
+                    }
+                }
+                both!(i64(gl.s_min_pp12[0]));
+                both!(i64(gl.s_min_pp12[1]));
+                both!(u8(gl.continuity.tag()));
+                both!(i64(gl.cap_round));
+                both!(i64(gl.lipschitz_ppm));
+                both!(u8(u8::from(gl.guarded)));
+            }
+            Node::VariableBoolean { op, chamfer, a, b, field } => {
+                let vf = self.var_fields[field as usize];
+                both!(u8(20));
+                both!(u8(op as u8));
+                both!(u8(u8::from(chamfer)));
+                self.hash_var_field(&mut f, &mut c, &vf);
+                kid(&mut f, &mut c, a);
+                kid(&mut f, &mut c, b);
+            }
+            Node::VariableOffset { inner, erode, field } => {
+                let vf = self.var_fields[field as usize];
+                both!(u8(21));
+                both!(u8(u8::from(erode)));
+                self.hash_var_field(&mut f, &mut c, &vf);
+                kid(&mut f, &mut c, inner);
+            }
         }
         (f.done(), c.done())
+    }
+
+    fn hash_var_field(&self, f: &mut H, c: &mut H, vf: &VarFieldRec) {
+        macro_rules! both {
+            ($($e:tt)*) => {{ { let h = &mut *f; h.$($e)*; } { let h = &mut *c; h.$($e)*; } }};
+        }
+        match vf.profile {
+            CanonProfile::Constant { r_nm } => {
+                both!(u8(0));
+                both!(i64(r_nm));
+            }
+            CanonProfile::Linear { from_nm, to_nm, r0_nm, r1_nm } => {
+                both!(u8(1));
+                for v in from_nm {
+                    both!(i64(v));
+                }
+                for v in to_nm {
+                    both!(i64(v));
+                }
+                both!(i64(r0_nm));
+                both!(i64(r1_nm));
+            }
+            CanonProfile::Curve { origin_nm, axis_pp12, start, len } => {
+                both!(u8(2));
+                for v in origin_nm {
+                    both!(i64(v));
+                }
+                for v in axis_pp12 {
+                    both!(i64(v));
+                }
+                both!(i64(i64::from(len)));
+                for &(at_nm, r_nm) in &self.radius_stops[start as usize..(start + len) as usize] {
+                    both!(i64(at_nm));
+                    both!(i64(r_nm));
+                }
+            }
+        }
+        match vf.select {
+            CanonSelect::All => both!(u8(0)),
+            CanonSelect::Box { lo_nm, hi_nm, fade_nm } => {
+                both!(u8(1));
+                for v in lo_nm {
+                    both!(i64(v));
+                }
+                for v in hi_nm {
+                    both!(i64(v));
+                }
+                both!(i64(fade_nm));
+            }
+            CanonSelect::Ball { center_nm, radius_nm, fade_nm } => {
+                both!(u8(2));
+                for v in center_nm {
+                    both!(i64(v));
+                }
+                both!(i64(radius_nm));
+                both!(i64(fade_nm));
+            }
+            CanonSelect::Capsule { a_nm, b_nm, radius_nm, fade_nm } => {
+                both!(u8(3));
+                for v in a_nm {
+                    both!(i64(v));
+                }
+                for v in b_nm {
+                    both!(i64(v));
+                }
+                both!(i64(radius_nm));
+                both!(i64(fade_nm));
+            }
+        }
+        both!(i64(vf.r_max_nm));
+        both!(i64(vf.l_r_ppm));
     }
 
     fn intern(&mut self, node: Node, level: Level, aabb: Aabb3, name: Option<&str>) -> Result<NodeId, CadError> {
@@ -1688,4 +2010,950 @@ impl<'a, P: Planted<CadPlant>> Graph<'a, P> {
             (Node::Detail { inner, amp, period }, Level::Bound, r.aabb.grow(m(amp)))
         })?))
     }
+
+    // ---- rail-guided lofts ----------------------------------------------------------------
+
+    /// A rail-guided loft through `o.stations` with smooth C2 cubic spline rails for width
+    /// (`side_rail`), height (`ridge_rail`), center (`center_x_rail`, `center_y_rail`), and
+    /// station `twist`, plus configurable cross-section blend continuity (`Linear`, `SmoothC1`,
+    /// `CurvatureC2`) and optional end-cap rounding (`cap_round`).
+    ///
+    /// When `side_rail` is provided, its value at `z` sets the loft's outer X half-width
+    /// relative to station 0's X half-extent (`sx(z) = side_rail(z) / ref_hx`); similarly
+    /// `ridge_rail` sets the outer Y half-height (`sy(z) = ridge_rail(z) / ref_hy`). When a
+    /// rail is `None`, the corresponding `GuidedStation` field (`scale[0]`, `scale[1]`,
+    /// `center[0]`, `center[1]`, `twist`) is interpolated across stations by a C2 natural
+    /// cubic spline.
+    pub fn guided_loft(&mut self, o: GuidedLoftOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        let kind = NodeKind::GuidedLoft;
+        let st = o.stations;
+        let alloc = self.alloc;
+        let most_stations = self.limits.most_stations;
+        let bad = |arg: &'static str, value: Value, accepted: &'static str| CadError::Argument {
+            kind,
+            name: o.name.map(Name::new),
+            arg,
+            value,
+            accepted,
+        };
+        if st.len() < 2 || st.len() as u64 > u64::from(most_stations) {
+            return Err(bad("stations", Value::Count(st.len() as u64), "2 to Limits::most_stations"));
+        }
+        for (i, s) in st.iter().enumerate() {
+            if (s.profile.id.0 as usize) >= self.profiles.len() {
+                return Err(CadError::Foreign { id: s.profile.id.0 });
+            }
+            if !(s.scale[0] > 0.0 && s.scale[0].is_finite()) {
+                return Err(bad("station scale x", Value::Ratio(s.scale[0]), "a finite scale above zero"));
+            }
+            if !(s.scale[1] > 0.0 && s.scale[1].is_finite()) {
+                return Err(bad("station scale y", Value::Ratio(s.scale[1]), "a finite scale above zero"));
+            }
+            if i > 0 && s.z.as_nm() <= st[i - 1].z.as_nm() {
+                return Err(bad("station height", Value::Length(s.z), "heights strictly increasing"));
+            }
+        }
+        let z0_nm = st[0].z.as_nm();
+        let zn_nm = st[st.len() - 1].z.as_nm();
+        let cap_nm = o.cap_round.as_nm();
+        if cap_nm < 0 || 2 * cap_nm > zn_nm - z0_nm {
+            return Err(bad("cap_round", Value::Length(o.cap_round), "from zero to half the loft height"));
+        }
+
+        let p0_bounds = self.profile_rec(st[0].profile.id).bounds;
+        let ref_hx = 0.5 * (p0_bounds[2] - p0_bounds[0]);
+        let ref_hy = 0.5 * (p0_bounds[3] - p0_bounds[1]);
+        if o.side_rail.is_some() && !(ref_hx > 0.0) {
+            return Err(bad("side_rail", Value::Ratio(ref_hx), "station 0 with positive X half-extent"));
+        }
+        if o.ridge_rail.is_some() && !(ref_hy > 0.0) {
+            return Err(bad("ridge_rail", Value::Ratio(ref_hy), "station 0 with positive Y half-extent"));
+        }
+
+        let spans_start = self.spline_spans.len();
+        let build_rail = |rail: GuideRail<'_>,
+                          arg: &'static str,
+                          require_positive: bool,
+                          inv_scale: f64,
+                          default_val: f64,
+                          out: &mut AVec<'a, SplineSpan>|
+         -> Result<(u32, u32), CadError> {
+            let pts = rail.points;
+            if pts.len() < 2 || pts.len() as u64 > u64::from(most_stations) {
+                return Err(bad(arg, Value::Count(pts.len() as u64), "2 to Limits::most_stations rail points"));
+            }
+            let mut zs: AVec<'a, i64> = Vec::with_capacity_in(pts.len(), alloc);
+            let mut ys: AVec<'a, f64> = Vec::with_capacity_in(pts.len(), alloc);
+            let mut ts: AVec<'a, Option<f64>> = Vec::with_capacity_in(pts.len(), alloc);
+            for (i, pt) in pts.iter().enumerate() {
+                let zn = pt.z.as_nm();
+                if i > 0 && zn <= zs[i - 1] {
+                    return Err(bad(arg, Value::Length(pt.z), "rail heights strictly increasing"));
+                }
+                if require_positive && pt.value.as_nm() <= 0 {
+                    return Err(bad(arg, Value::Length(pt.value), "rail values above zero"));
+                }
+                if let Some(tg) = pt.tangent
+                    && !tg.is_finite()
+                {
+                    return Err(bad(arg, Value::Ratio(tg), "finite rail tangents"));
+                }
+                zs.push(zn);
+                ys.push(pt.value.as_m() * inv_scale);
+                ts.push(pt.tangent.map(|tg| tg * inv_scale));
+            }
+            solve_cubic_spline(&zs, &ys, &ts, default_val, alloc, out, kind, o.name, arg)
+        };
+
+        let build_station_spline = |extract: fn(&GuidedStation) -> f64,
+                                    arg: &'static str,
+                                    default_val: f64,
+                                    out: &mut AVec<'a, SplineSpan>|
+         -> Result<(u32, u32), CadError> {
+            let mut zs: AVec<'a, i64> = Vec::with_capacity_in(st.len(), alloc);
+            let mut ys: AVec<'a, f64> = Vec::with_capacity_in(st.len(), alloc);
+            let mut ts: AVec<'a, Option<f64>> = Vec::with_capacity_in(st.len(), alloc);
+            for s in st {
+                zs.push(s.z.as_nm());
+                ys.push(extract(s));
+                ts.push(None);
+            }
+            solve_cubic_spline(&zs, &ys, &ts, default_val, alloc, out, kind, o.name, arg)
+        };
+
+        let splines_res: Result<[(u32, u32); 5], CadError> = (|| {
+            let sx = match o.side_rail {
+                Some(r) => build_rail(r, "side_rail", true, 1.0 / ref_hx, 1.0, &mut self.spline_spans)?,
+                None => build_station_spline(|s| s.scale[0], "station scale x", 1.0, &mut self.spline_spans)?,
+            };
+            let sy = match o.ridge_rail {
+                Some(r) => build_rail(r, "ridge_rail", true, 1.0 / ref_hy, 1.0, &mut self.spline_spans)?,
+                None => build_station_spline(|s| s.scale[1], "station scale y", 1.0, &mut self.spline_spans)?,
+            };
+            let cx = match o.center_x_rail {
+                Some(r) => build_rail(r, "center_x_rail", false, 1.0, 0.0, &mut self.spline_spans)?,
+                None => build_station_spline(|s| s.center[0].as_m(), "station center x", 0.0, &mut self.spline_spans)?,
+            };
+            let cy = match o.center_y_rail {
+                Some(r) => build_rail(r, "center_y_rail", false, 1.0, 0.0, &mut self.spline_spans)?,
+                None => build_station_spline(|s| s.center[1].as_m(), "station center y", 0.0, &mut self.spline_spans)?,
+            };
+            let tw = build_station_spline(|s| s.twist.as_radians(), "station twist", 0.0, &mut self.spline_spans)?;
+            Ok([sx, sy, cx, cy, tw])
+        })();
+
+        let splines = match splines_res {
+            Ok(sp) => sp,
+            Err(e) => {
+                self.spline_spans.truncate(spans_start);
+                return Err(e);
+            }
+        };
+
+        let z0 = m(z0_nm);
+        let zn = m(zn_nm);
+        let (sx_min, sx_max, sx_dmax) = spline_range_on(self.spline_slice(splines[0]), 1.0, z0, zn);
+        let (sy_min, sy_max, sy_dmax) = spline_range_on(self.spline_slice(splines[1]), 1.0, z0, zn);
+        let (cx_min, cx_max, cx_dmax) = spline_range_on(self.spline_slice(splines[2]), 0.0, z0, zn);
+        let (cy_min, cy_max, cy_dmax) = spline_range_on(self.spline_slice(splines[3]), 0.0, z0, zn);
+        let (_, _, tw_dmax) = spline_range_on(self.spline_slice(splines[4]), 0.0, z0, zn);
+
+        if !(sx_min > 1e-9 && sx_max.is_finite()) {
+            self.spline_spans.truncate(spans_start);
+            return Err(bad("side_rail", Value::Ratio(sx_min), "strictly positive X scale across the loft"));
+        }
+        if !(sy_min > 1e-9 && sy_max.is_finite()) {
+            self.spline_spans.truncate(spans_start);
+            return Err(bad("ridge_rail", Value::Ratio(sy_min), "strictly positive Y scale across the loft"));
+        }
+
+        // Tight conservative AABB across all station spans from exact cubic extrema.
+        let mut aabb = Aabb3::EMPTY;
+        let mut k_blend: f64 = 0.0;
+        let mut r_prof_max: f64 = 0.0;
+        let w_slope = o.continuity.max_slope();
+        for s in st {
+            let pb = self.profile_rec(s.profile.id).bounds;
+            let px = pb[0].abs().max(pb[2].abs());
+            let py = pb[1].abs().max(pb[3].abs());
+            r_prof_max = r_prof_max.max(blaze_math::hypot(px, py));
+        }
+        for i in 0..st.len() - 1 {
+            let za_nm = st[i].z.as_nm();
+            let zb_nm = st[i + 1].z.as_nm();
+            let (za, zb) = (m(za_nm), m(zb_nm));
+            let pa = self.profile_rec(st[i].profile.id).bounds;
+            let pb = self.profile_rec(st[i + 1].profile.id).bounds;
+            let (px0, py0) = (pa[0].min(pb[0]), pa[1].min(pb[1]));
+            let (px1, py1) = (pa[2].max(pb[2]), pa[3].max(pb[3]));
+            let diam = blaze_math::hypot(px1 - px0, py1 - py0);
+            k_blend = k_blend.max(w_slope * diam / m(zb_nm - za_nm));
+
+            let (sxa, sxb, _) = spline_range_on(self.spline_slice(splines[0]), 1.0, za, zb);
+            let (sya, syb, _) = spline_range_on(self.spline_slice(splines[1]), 1.0, za, zb);
+            let (cxa, cxb, _) = spline_range_on(self.spline_slice(splines[2]), 0.0, za, zb);
+            let (cya, cyb, _) = spline_range_on(self.spline_slice(splines[3]), 0.0, za, zb);
+            let (ta, tb, _) = spline_range_on(self.spline_slice(splines[4]), 0.0, za, zb);
+
+            let lx0 = (px0 * sxa).min(px0 * sxb);
+            let lx1 = (px1 * sxa).max(px1 * sxb);
+            let ly0 = (py0 * sya).min(py0 * syb);
+            let ly1 = (py1 * sya).max(py1 * syb);
+            let (rx0, ry0, rx1, ry1) = if ta == 0.0 && tb == 0.0 {
+                (lx0, ly0, lx1, ly1)
+            } else if (tb - ta).abs() <= 1e-12 {
+                let (sn, cs) = blaze_math::sin_cos(ta);
+                let mut xlo = f64::INFINITY;
+                let mut ylo = f64::INFINITY;
+                let mut xhi = f64::NEG_INFINITY;
+                let mut yhi = f64::NEG_INFINITY;
+                for x in [lx0, lx1] {
+                    for y in [ly0, ly1] {
+                        let rx = x * cs - y * sn;
+                        let ry = x * sn + y * cs;
+                        xlo = xlo.min(rx);
+                        xhi = xhi.max(rx);
+                        ylo = ylo.min(ry);
+                        yhi = yhi.max(ry);
+                    }
+                }
+                (xlo, ylo, xhi, yhi)
+            } else {
+                let mx = lx0.abs().max(lx1.abs());
+                let my = ly0.abs().max(ly1.abs());
+                let rho = blaze_math::hypot(mx, my);
+                (-rho, -rho, rho, rho)
+            };
+            let span_box = Aabb3::new(Vec3::new(rx0 + cxa, ry0 + cya, za), Vec3::new(rx1 + cxb, ry1 + cyb, zb));
+            aabb = aabb.union(&span_box);
+        }
+
+        // Sound analytical Lipschitz bound on `cg = aabb.grow(margin_of(&aabb))`.
+        let guarded = sx_dmax > 0.0 || sy_dmax > 0.0 || cx_dmax > 0.0 || cy_dmax > 0.0 || tw_dmax > 0.0;
+        let m_min = sx_min.min(sy_min);
+        let m_max = sx_max.min(sy_max);
+        let m_dmax = sx_dmax.max(sy_dmax);
+        let c_dmax = blaze_math::hypot(cx_dmax, cy_dmax);
+        let cg = aabb.grow(margin_of(&aabb));
+        let dx_max = (cg.lo.x - cx_max).abs().max((cg.hi.x - cx_min).abs());
+        let dy_max = (cg.lo.y - cy_max).abs().max((cg.hi.y - cy_min).abs());
+        let r_max = blaze_math::hypot(dx_max, dy_max);
+        let d_max = r_max / m_min + r_prof_max;
+        let scale_rel = (sx_dmax / sx_min).max(sy_dmax / sy_min);
+        let k_z = m_dmax * d_max + c_dmax + (tw_dmax + scale_rel) * r_max + m_max * k_blend;
+        let lip = blaze_math::sqrt(1.0 + k_z * k_z);
+        if !(lip.is_finite() && lip < 1e12) {
+            self.spline_spans.truncate(spans_start);
+            return Err(bad("stations", Value::Ratio(lip), "a finite Lipschitz bound"));
+        }
+
+        let s_min_pp12 = [
+            (core::f64::math::floor(sx_min * 1e12) as i64).max(1),
+            (core::f64::math::floor(sy_min * 1e12) as i64).max(1),
+        ];
+
+        let stations_start = self.stations.len() as u32;
+        for s in st {
+            self.stations.push((s.z.as_nm(), s.profile.id));
+        }
+        let idx = self.guided_lofts.len() as u32;
+        self.guided_lofts.push(GuidedLoftRec {
+            stations_start,
+            stations_len: st.len() as u32,
+            splines,
+            s_min_pp12,
+            continuity: o.continuity,
+            cap_round: cap_nm,
+            lipschitz_ppm: ppm_up(lip),
+            guarded,
+        });
+        let before = self.nodes.len();
+        let id = self.intern(Node::GuidedLoft { idx }, Level::Bound, aabb, o.name)?;
+        if self.nodes.len() == before {
+            self.stations.truncate(stations_start as usize);
+            self.spline_spans.truncate(spans_start);
+            self.guided_lofts.truncate(idx as usize);
+        }
+        Ok(Solid::new(id))
+    }
+
+    // ---- selective, variable-radius blends & offsets --------------------------------------
+
+    fn build_var_field(
+        &mut self,
+        kind: NodeKind,
+        name: Option<&str>,
+        profile: RadiusProfile<'_>,
+        select: EdgeSelect,
+    ) -> Result<(u32, i64, usize), CadError> {
+        let bad = |arg: &'static str, value: Value, accepted: &'static str| CadError::Argument {
+            kind,
+            name: name.map(Name::new),
+            arg,
+            value,
+            accepted,
+        };
+        let stops_start = self.radius_stops.len();
+        let (canon_prof, r_max_nm, l_prof) = match profile {
+            RadiusProfile::Constant(r) => {
+                let r_nm = r.as_nm();
+                if r_nm < 0 {
+                    return Err(bad("profile radius", Value::Length(r), "zero or more"));
+                }
+                (CanonProfile::Constant { r_nm }, r_nm, 0.0)
+            }
+            RadiusProfile::Linear { from, to, r0, r1 } => {
+                let (r0_nm, r1_nm) = (r0.as_nm(), r1.as_nm());
+                if r0_nm < 0 {
+                    return Err(bad("r0", Value::Length(r0), "zero or more"));
+                }
+                if r1_nm < 0 {
+                    return Err(bad("r1", Value::Length(r1), "zero or more"));
+                }
+                let from_nm = [from[0].as_nm(), from[1].as_nm(), from[2].as_nm()];
+                let to_nm = [to[0].as_nm(), to[1].as_nm(), to[2].as_nm()];
+                let dx = m(to_nm[0] - from_nm[0]);
+                let dy = m(to_nm[1] - from_nm[1]);
+                let dz = m(to_nm[2] - from_nm[2]);
+                let len = blaze_math::sqrt(dx * dx + dy * dy + dz * dz);
+                if !(len > 0.0 && len.is_finite()) {
+                    return Err(bad("to", Value::Length(Length::ZERO), "`from` and `to` must differ"));
+                }
+                let l_p = (m(r1_nm) - m(r0_nm)).abs() / len;
+                (CanonProfile::Linear { from_nm, to_nm, r0_nm, r1_nm }, r0_nm.max(r1_nm), l_p)
+            }
+            RadiusProfile::Curve { origin, axis, stops } => {
+                if !axis.iter().all(|v| v.is_finite()) {
+                    return Err(bad("axis", Value::Ratio(axis[0]), "a finite non-zero axis"));
+                }
+                let alen = blaze_math::sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+                if !(alen > 0.0 && alen.is_finite()) {
+                    return Err(bad("axis", Value::Ratio(alen), "a non-zero axis"));
+                }
+                let axis_pp12 = [
+                    core::f64::math::round((axis[0] / alen) * 1e12) as i64,
+                    core::f64::math::round((axis[1] / alen) * 1e12) as i64,
+                    core::f64::math::round((axis[2] / alen) * 1e12) as i64,
+                ];
+                if stops.len() < 2 || stops.len() as u64 > u64::from(self.limits.most_stations) {
+                    return Err(bad("stops", Value::Count(stops.len() as u64), "2 to Limits::most_stations"));
+                }
+                let mut r_max_nm = 0i64;
+                let mut l_p = 0.0f64;
+                let origin_nm = [origin[0].as_nm(), origin[1].as_nm(), origin[2].as_nm()];
+                for (i, s) in stops.iter().enumerate() {
+                    let at_nm = s.at.as_nm();
+                    let r_nm = s.radius.as_nm();
+                    if r_nm < 0 {
+                        self.radius_stops.truncate(stops_start);
+                        return Err(bad("stop radius", Value::Length(s.radius), "zero or more"));
+                    }
+                    if i > 0 {
+                        let prev = stops[i - 1];
+                        let gap = at_nm - prev.at.as_nm();
+                        if gap <= 0 {
+                            self.radius_stops.truncate(stops_start);
+                            return Err(bad("stop position", Value::Length(s.at), "strictly increasing stop positions"));
+                        }
+                        l_p = l_p.max(1.5 * (m(r_nm) - m(prev.radius.as_nm())).abs() / m(gap));
+                    }
+                    r_max_nm = r_max_nm.max(r_nm);
+                    self.radius_stops.push((at_nm, r_nm));
+                }
+                (
+                    CanonProfile::Curve { origin_nm, axis_pp12, start: stops_start as u32, len: stops.len() as u32 },
+                    r_max_nm,
+                    l_p,
+                )
+            }
+        };
+
+        const MIN_FADE_NM: i64 = 1_000;
+        let check_fade = |fade: Length| -> Result<i64, CadError> {
+            let f = fade.as_nm();
+            if f < MIN_FADE_NM {
+                Err(bad("fade", Value::Length(fade), "at least 1000 nm (1 micrometre)"))
+            } else {
+                Ok(f)
+            }
+        };
+
+        let select_res: Result<(CanonSelect, f64), CadError> = match select {
+            EdgeSelect::All => Ok((CanonSelect::All, 0.0)),
+            EdgeSelect::Box { lo, hi, fade } => {
+                let lo_nm = [lo[0].as_nm(), lo[1].as_nm(), lo[2].as_nm()];
+                let hi_nm = [hi[0].as_nm(), hi[1].as_nm(), hi[2].as_nm()];
+                for i in 0..3 {
+                    if lo_nm[i] > hi_nm[i] {
+                        self.radius_stops.truncate(stops_start);
+                        return Err(bad("select box", Value::Length(lo[i]), "lo <= hi on every axis"));
+                    }
+                }
+                match check_fade(fade) {
+                    Ok(fade_nm) => Ok((CanonSelect::Box { lo_nm, hi_nm, fade_nm }, 1.5 / m(fade_nm))),
+                    Err(e) => Err(e),
+                }
+            }
+            EdgeSelect::Ball { center, radius, fade } => match Self::positive(kind, name, "select radius", radius) {
+                Ok(radius_nm) => match check_fade(fade) {
+                    Ok(fade_nm) => {
+                        let center_nm = [center[0].as_nm(), center[1].as_nm(), center[2].as_nm()];
+                        Ok((CanonSelect::Ball { center_nm, radius_nm, fade_nm }, 1.5 / m(fade_nm)))
+                    }
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            },
+            EdgeSelect::Capsule { a, b, radius, fade } => {
+                let radius_nm = radius.as_nm();
+                if radius_nm < 0 {
+                    self.radius_stops.truncate(stops_start);
+                    return Err(bad("select radius", Value::Length(radius), "zero or more"));
+                }
+                match check_fade(fade) {
+                    Ok(fade_nm) => {
+                        let a_nm = [a[0].as_nm(), a[1].as_nm(), a[2].as_nm()];
+                        let b_nm = [b[0].as_nm(), b[1].as_nm(), b[2].as_nm()];
+                        Ok((CanonSelect::Capsule { a_nm, b_nm, radius_nm, fade_nm }, 1.5 / m(fade_nm)))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        };
+
+        let (canon_sel, l_mask) = match select_res {
+            Ok(v) => v,
+            Err(e) => {
+                self.radius_stops.truncate(stops_start);
+                return Err(e);
+            }
+        };
+
+        let l_r = l_prof + m(r_max_nm) * l_mask;
+        if !(l_r.is_finite() && l_r < 1e12) {
+            self.radius_stops.truncate(stops_start);
+            return Err(bad("profile", Value::Ratio(l_r), "a finite radius gradient"));
+        }
+        let idx = self.var_fields.len() as u32;
+        self.var_fields.push(VarFieldRec {
+            profile: canon_prof,
+            select: canon_sel,
+            r_max_nm,
+            l_r_ppm: ppm_up(l_r),
+        });
+        Ok((idx, r_max_nm, stops_start))
+    }
+
+    fn variable_boolean<A: Ex, B: Ex>(
+        &mut self,
+        op: Boolean,
+        chamfer: bool,
+        a: Solid<A>,
+        b: Solid<B>,
+        o: VariableBlendOpts<'_>,
+    ) -> Result<Solid<Bound>, CadError> {
+        self.check(a.id)?;
+        self.check(b.id)?;
+        let kind = if chamfer { NodeKind::VariableChamferBoolean } else { NodeKind::VariableSmoothBoolean };
+        let (field, r_max_nm, stops_start) = self.build_var_field(kind, o.name, o.profile, o.select)?;
+        let (mut a_id, mut b_id) = (a.id, b.id);
+        let (ea, eb) = (matches!(self.rec(a_id).node, Node::Empty), matches!(self.rec(b_id).node, Node::Empty));
+        let trivial = match op {
+            Boolean::Union if ea => Some(b_id),
+            Boolean::Union if eb => Some(a_id),
+            Boolean::Intersect if ea || eb => Some(if ea { a_id } else { b_id }),
+            Boolean::Difference if ea || eb => Some(a_id),
+            _ => None,
+        };
+        if let Some(id) = trivial {
+            self.var_fields.truncate(field as usize);
+            self.radius_stops.truncate(stops_start);
+            return Ok(Solid::new(id));
+        }
+        if op.commutes() && !self.plant.has(CadPlant::OperandsUnordered) && self.rec(b_id).full < self.rec(a_id).full {
+            core::mem::swap(&mut a_id, &mut b_id);
+        }
+        let (ra, rb) = (*self.rec(a_id), *self.rec(b_id));
+        let grow = if chamfer { m(r_max_nm) } else { m(r_max_nm) * 0.25 };
+        let aabb = match op {
+            Boolean::Union => ra.aabb.union(&rb.aabb).grow(grow),
+            Boolean::Intersect => ra.aabb.intersect(&rb.aabb),
+            Boolean::Difference => ra.aabb,
+        };
+        let before = self.nodes.len();
+        let id = self.intern(Node::VariableBoolean { op, chamfer, a: a_id, b: b_id, field }, Level::Bound, aabb, o.name)?;
+        if self.nodes.len() == before {
+            self.var_fields.truncate(field as usize);
+            self.radius_stops.truncate(stops_start);
+        }
+        Ok(Solid::new(id))
+    }
+
+    /// A union with a selective, spatially varying rounded fillet.
+    pub fn variable_round_union<A: Ex, B: Ex>(&mut self, a: Solid<A>, b: Solid<B>, o: VariableBlendOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        self.variable_boolean(Boolean::Union, false, a, b, o)
+    }
+
+    /// An intersection with a selective, spatially varying rounded edge.
+    pub fn variable_round_intersect<A: Ex, B: Ex>(&mut self, a: Solid<A>, b: Solid<B>, o: VariableBlendOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        self.variable_boolean(Boolean::Intersect, false, a, b, o)
+    }
+
+    /// A difference with a selective, spatially varying rounded edge.
+    pub fn variable_round_difference<A: Ex, B: Ex>(&mut self, a: Solid<A>, b: Solid<B>, o: VariableBlendOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        self.variable_boolean(Boolean::Difference, false, a, b, o)
+    }
+
+    /// A union with a selective, spatially varying chamfer.
+    pub fn variable_chamfer_union<A: Ex, B: Ex>(&mut self, a: Solid<A>, b: Solid<B>, o: VariableBlendOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        self.variable_boolean(Boolean::Union, true, a, b, o)
+    }
+
+    /// An intersection with a selective, spatially varying chamfer.
+    pub fn variable_chamfer_intersect<A: Ex, B: Ex>(&mut self, a: Solid<A>, b: Solid<B>, o: VariableBlendOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        self.variable_boolean(Boolean::Intersect, true, a, b, o)
+    }
+
+    /// A difference with a selective, spatially varying chamfer.
+    pub fn variable_chamfer_difference<A: Ex, B: Ex>(&mut self, a: Solid<A>, b: Solid<B>, o: VariableBlendOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        self.variable_boolean(Boolean::Difference, true, a, b, o)
+    }
+
+    fn variable_offset<K: Ex>(&mut self, s: Solid<K>, erode: bool, o: VariableOffsetOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        self.check(s.id)?;
+        let kind = if erode { NodeKind::VariableErode } else { NodeKind::VariableGrow };
+        let (field, r_max_nm, stops_start) = self.build_var_field(kind, o.name, o.profile, o.select)?;
+        if matches!(self.rec(s.id).node, Node::Empty) {
+            self.var_fields.truncate(field as usize);
+            self.radius_stops.truncate(stops_start);
+            return Ok(Solid::new(s.id));
+        }
+        let r = *self.rec(s.id);
+        let aabb = if erode { r.aabb } else { r.aabb.grow(m(r_max_nm)) };
+        let before = self.nodes.len();
+        let id = self.intern(Node::VariableOffset { inner: s.id, erode, field }, Level::Bound, aabb, o.name)?;
+        if self.nodes.len() == before {
+            self.var_fields.truncate(field as usize);
+            self.radius_stops.truncate(stops_start);
+        }
+        Ok(Solid::new(id))
+    }
+
+    /// Selective, spatially varying inward offset: `(inner(p) + r(p)) / (1 + L_r)` where
+    /// `r(p) = profile(p) * mask(p)`.
+    pub fn variable_erode<K: Ex>(&mut self, s: Solid<K>, o: VariableOffsetOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        self.variable_offset(s, true, o)
+    }
+
+    /// Selective, spatially varying outward offset: `(inner(p) - r(p)) / (1 + L_r)` where
+    /// `r(p) = profile(p) * mask(p)`.
+    pub fn variable_grow<K: Ex>(&mut self, s: Solid<K>, o: VariableOffsetOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        self.variable_offset(s, false, o)
+    }
+
+    // ---- surface curve frame sweep --------------------------------------------------------
+
+    fn sweep_section_profile(&mut self, section: SweepCrossSection, w_nm: i64, d_nm: i64) -> Result<Prof<Exact>, CadError> {
+        match section {
+            SweepCrossSection::Circular => {
+                if w_nm == d_nm {
+                    self.profile(ProfileOpts { profile: Profile::Circle { radius: Length::nm((w_nm / 2).max(1)) }, name: None })
+                } else {
+                    self.profile(ProfileOpts {
+                        profile: Profile::RoundedRect {
+                            width: Length::nm(w_nm),
+                            height: Length::nm(d_nm),
+                            radius: Length::nm(w_nm.min(d_nm) / 2),
+                        },
+                        name: None,
+                    })
+                }
+            }
+            SweepCrossSection::Channel => {
+                let r = w_nm.min(d_nm) / 4;
+                self.profile(ProfileOpts {
+                    profile: Profile::RoundedRect { width: Length::nm(w_nm), height: Length::nm(d_nm), radius: Length::nm(r) },
+                    name: None,
+                })
+            }
+            SweepCrossSection::Rectangular { round } => {
+                let r = round.as_nm();
+                if r == 0 {
+                    self.profile(ProfileOpts {
+                        profile: Profile::Rect { width: Length::nm(w_nm), height: Length::nm(d_nm) },
+                        name: None,
+                    })
+                } else {
+                    self.profile(ProfileOpts {
+                        profile: Profile::RoundedRect { width: Length::nm(w_nm), height: Length::nm(d_nm), radius: round },
+                        name: None,
+                    })
+                }
+            }
+            SweepCrossSection::VGroove => {
+                let hw = w_nm / 2;
+                let hd = d_nm / 2;
+                let pts: [Point2; 3] = [
+                    [Length::ZERO, Length::nm(-hd)],
+                    [Length::nm(hw), Length::nm(hd)],
+                    [Length::nm(-hw), Length::nm(hd)],
+                ];
+                self.profile(ProfileOpts { profile: Profile::Polygon { points: &pts }, name: None })
+            }
+            SweepCrossSection::HalfRound => {
+                let hw = 0.5 * m(w_nm);
+                let dm = m(d_nm);
+                let mut pts: [Point2; 13] = [[Length::ZERO; 2]; 13];
+                for (k, slot) in pts.iter_mut().enumerate() {
+                    let th = core::f64::consts::PI * (k as f64) / 12.0;
+                    let (s, c) = blaze_math::sin_cos(th);
+                    *slot = [
+                        Length::nm(core::f64::math::round(hw * c * 1e9) as i64),
+                        Length::nm(core::f64::math::round((-0.5 * dm + dm * s) * 1e9) as i64),
+                    ];
+                }
+                self.profile(ProfileOpts { profile: Profile::Polygon { points: &pts }, name: None })
+            }
+        }
+    }
+
+    /// Sweeps a variable-size cross-section along an oriented 3-D surface curve (`frames`),
+    /// orienting each segment along `(binormal = normal x tangent, normal, tangent)`, linearly
+    /// interpolating `width` and `depth` between consecutive frames, and joining segments in a
+    /// balanced union (or smooth union when `smooth_join > 0`).
+    pub fn sweep_frames(&mut self, o: SweepFramesOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        let kind = NodeKind::SweepFrames;
+        let frames = o.frames;
+        let bad = |arg: &'static str, value: Value, accepted: &'static str| CadError::Argument {
+            kind,
+            name: o.name.map(Name::new),
+            arg,
+            value,
+            accepted,
+        };
+        let min_frames = if o.closed { 3usize } else { 2usize };
+        if frames.len() < min_frames || frames.len() as u64 > u64::from(self.limits.most_copies) {
+            return Err(bad(
+                "frames",
+                Value::Count(frames.len() as u64),
+                if o.closed { "3 to Limits::most_copies for a closed sweep" } else { "2 to Limits::most_copies" },
+            ));
+        }
+        let join_nm = o.smooth_join.as_nm();
+        if join_nm < 0 {
+            return Err(bad("smooth_join", Value::Length(o.smooth_join), "zero or more"));
+        }
+        if let SweepCrossSection::Rectangular { round } = o.section
+            && round.as_nm() < 0
+        {
+            return Err(bad("round", Value::Length(round), "zero or more"));
+        }
+        for (i, fr) in frames.iter().enumerate() {
+            let w_nm = Self::positive(kind, o.name, "width", fr.width)?;
+            let d_nm = Self::positive(kind, o.name, "depth", fr.depth)?;
+            if let SweepCrossSection::Rectangular { round } = o.section
+                && 2 * round.as_nm() > w_nm.min(d_nm)
+            {
+                return Err(bad("round", Value::Length(round), "at most half of min(width, depth) at every frame"));
+            }
+            if !fr.tangent.iter().all(|v| v.is_finite()) {
+                return Err(bad("tangent", Value::Count(i as u64), "a finite non-zero tangent"));
+            }
+            if !fr.normal.iter().all(|v| v.is_finite()) {
+                return Err(bad("normal", Value::Count(i as u64), "a finite non-zero normal"));
+            }
+            let tv = Vec3::from_array(fr.tangent);
+            let nv = Vec3::from_array(fr.normal);
+            let Some(tn) = tv.normalized() else {
+                return Err(bad("tangent", Value::Count(i as u64), "a non-zero tangent"));
+            };
+            let Some(nn) = nv.normalized() else {
+                return Err(bad("normal", Value::Count(i as u64), "a non-zero normal"));
+            };
+            if nn.cross(tn).length() <= 1e-9 {
+                return Err(bad("normal", Value::Count(i as u64), "normal not parallel to tangent"));
+            }
+        }
+
+        let n = frames.len();
+        let seg_count = if o.closed { n } else { n - 1 };
+        let mut layer: AVec<'a, NodeId> = Vec::with_capacity_in(seg_count, self.alloc);
+        let pt_v = |p: [Length; 3]| Vec3::new(p[0].as_m(), p[1].as_m(), p[2].as_m());
+
+        for i in 0..seg_count {
+            let j = (i + 1) % n;
+            let (f0, f1) = (frames[i], frames[j]);
+            let (a, b) = (pt_v(f0.point), pt_v(f1.point));
+            let d = b - a;
+            let seg_len = d.length();
+            let Some(z_axis) = d.normalized() else {
+                return Err(bad("frames", Value::Count(i as u64), "consecutive frame points apart"));
+            };
+            let l_nm = core::f64::math::round(seg_len * 1e9) as i64;
+            if l_nm <= 0 {
+                return Err(bad("frames", Value::Count(i as u64), "consecutive frame points at least 1 nm apart"));
+            }
+            let n0 = Vec3::from_array(f0.normal).normalized().unwrap_or(Vec3::new(0.0, 1.0, 0.0));
+            let n1 = Vec3::from_array(f1.normal).normalized().unwrap_or(n0);
+            let n_avg = (n0 + n1).normalized().unwrap_or(n0);
+            let y_raw = n_avg - z_axis * n_avg.dot(z_axis);
+            let y_axis = y_raw
+                .normalized()
+                .or_else(|| (n0 - z_axis * n0.dot(z_axis)).normalized())
+                .or_else(|| {
+                    let up = if z_axis.z.abs() > 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 0.0, 1.0) };
+                    (up - z_axis * up.dot(z_axis)).normalized()
+                })
+                .unwrap_or(Vec3::new(0.0, 1.0, 0.0));
+            let x_axis = y_axis.cross(z_axis).normalized().unwrap_or(Vec3::new(1.0, 0.0, 0.0));
+
+            let (w0, d0) = (f0.width.as_nm(), f0.depth.as_nm());
+            let (w1, d1) = (f1.width.as_nm(), f1.depth.as_nm());
+            let p0 = self.sweep_section_profile(o.section, w0, d0)?;
+            let p1 = self.sweep_section_profile(o.section, w1, d1)?;
+
+            let ext0_nm = if o.closed || i > 0 { core::f64::math::round(0.15 * m(w0.min(d0)) * 1e9) as i64 } else { 0 };
+            let ext1_nm = if o.closed || i + 1 < seg_count { core::f64::math::round(0.15 * m(w1.min(d1)) * 1e9) as i64 } else { 0 };
+
+            let seg = if p0.id() == p1.id() {
+                let total_nm = (l_nm + ext0_nm + ext1_nm).max(2);
+                let piece = self.extrude(p0, ExtrudeOpts { height: Length::nm(total_nm), name: None })?;
+                let center = a + z_axis * (0.5 * m(l_nm + ext1_nm - ext0_nm));
+                let frame = Placement::from_axes(x_axis, y_axis, z_axis, center);
+                self.wrap(piece.id, frame, None)?
+            } else {
+                let mut st_buf = [Station { z: Length::ZERO, profile: p0 }; 4];
+                let mut k = 0usize;
+                if ext0_nm > 0 {
+                    st_buf[k] = Station { z: Length::nm(-ext0_nm), profile: p0 };
+                    k += 1;
+                }
+                st_buf[k] = Station { z: Length::ZERO, profile: p0 };
+                k += 1;
+                st_buf[k] = Station { z: Length::nm(l_nm), profile: p1 };
+                k += 1;
+                if ext1_nm > 0 {
+                    st_buf[k] = Station { z: Length::nm(l_nm + ext1_nm), profile: p1 };
+                    k += 1;
+                }
+                let piece = self.loft(LoftOpts { stations: &st_buf[..k], name: None })?;
+                let frame = Placement::from_axes(x_axis, y_axis, z_axis, a);
+                self.wrap(piece.id, frame, None)?
+            };
+            layer.push(seg);
+        }
+
+        let edge = if join_nm > 0 { Edge::Round { r: join_nm } } else { Edge::Sharp };
+        let id = self.balanced_boolean(Boolean::Union, edge, layer, o.name)?;
+        Ok(Solid::new(id))
+    }
+}
+
+// ---- cubic spline solver & exact cubic range analysis -----------------------------------------
+
+fn quant_pp12(v: f64, kind: NodeKind, name: Option<&str>, arg: &'static str) -> Result<i64, CadError> {
+    if !(v.is_finite() && v.abs() < 4e6) {
+        return Err(CadError::Argument {
+            kind,
+            name: name.map(Name::new),
+            arg,
+            value: Value::Ratio(v),
+            accepted: "a finite value within +-4e6",
+        });
+    }
+    Ok(core::f64::math::round(v * 1e12) as i64)
+}
+
+/// Solves a C2 natural / clamped / mixed-tangent cubic spline through `(zs_nm[i], ys[i])` with
+/// optional slopes `tangents[i] = dy/dz` using the exact O(n) Thomas tridiagonal solver,
+/// quantizes each span to `10^-12` integer coefficients with exact C0 endpoint continuity, and
+/// appends spans to `out`. Returns `(start, 0)` when the curve is identically `default_val`.
+#[allow(clippy::too_many_arguments)]
+fn solve_cubic_spline<'a>(
+    zs_nm: &[i64],
+    ys: &[f64],
+    tangents: &[Option<f64>],
+    default_val: f64,
+    alloc: Alloc<'a>,
+    out: &mut AVec<'a, SplineSpan>,
+    kind: NodeKind,
+    name: Option<&str>,
+    arg: &'static str,
+) -> Result<(u32, u32), CadError> {
+    let n = zs_nm.len();
+    let start = out.len() as u32;
+    let def_q = quant_pp12(default_val, kind, name, arg)?;
+    let y0_q = quant_pp12(ys[0], kind, name, arg)?;
+    let mut all_const = true;
+    for (&y, &t) in ys.iter().zip(tangents.iter()) {
+        let yq = quant_pp12(y, kind, name, arg)?;
+        if yq != y0_q {
+            all_const = false;
+            break;
+        }
+        if let Some(tg) = t
+            && quant_pp12(tg, kind, name, arg)? != 0
+        {
+            all_const = false;
+            break;
+        }
+    }
+    if all_const {
+        if y0_q == def_q {
+            return Ok((start, 0));
+        }
+        out.push(SplineSpan { z0_nm: zs_nm[0], z1_nm: zs_nm[n - 1], c_pp12: [y0_q, 0, 0, 0] });
+        return Ok((start, 1));
+    }
+
+    let mut a: AVec<'a, f64> = Vec::with_capacity_in(n, alloc);
+    let mut b: AVec<'a, f64> = Vec::with_capacity_in(n, alloc);
+    let mut c: AVec<'a, f64> = Vec::with_capacity_in(n, alloc);
+    let mut rhs: AVec<'a, f64> = Vec::with_capacity_in(n, alloc);
+    let mut d: AVec<'a, f64> = Vec::with_capacity_in(n, alloc);
+    for i in 0..n {
+        if let Some(tg) = tangents[i] {
+            a.push(0.0);
+            b.push(1.0);
+            c.push(0.0);
+            rhs.push(tg);
+        } else if i == 0 {
+            let h0 = m(zs_nm[1] - zs_nm[0]);
+            a.push(0.0);
+            b.push(2.0);
+            c.push(1.0);
+            rhs.push(3.0 * (ys[1] - ys[0]) / h0);
+        } else if i == n - 1 {
+            let hl = m(zs_nm[n - 1] - zs_nm[n - 2]);
+            a.push(1.0);
+            b.push(2.0);
+            c.push(0.0);
+            rhs.push(3.0 * (ys[n - 1] - ys[n - 2]) / hl);
+        } else {
+            let h0 = m(zs_nm[i] - zs_nm[i - 1]);
+            let h1 = m(zs_nm[i + 1] - zs_nm[i]);
+            let inv0 = 1.0 / h0;
+            let inv1 = 1.0 / h1;
+            a.push(inv0);
+            b.push(2.0 * (inv0 + inv1));
+            c.push(inv1);
+            rhs.push(3.0 * ((ys[i] - ys[i - 1]) * inv0 * inv0 + (ys[i + 1] - ys[i]) * inv1 * inv1));
+        }
+        d.push(0.0);
+    }
+
+    // Thomas tridiagonal forward elimination & back substitution (strictly diagonally dominant).
+    for i in 1..n {
+        let w = a[i] / b[i - 1];
+        b[i] -= w * c[i - 1];
+        rhs[i] -= w * rhs[i - 1];
+    }
+    d[n - 1] = rhs[n - 1] / b[n - 1];
+    for i in (0..n - 1).rev() {
+        d[i] = (rhs[i] - c[i] * d[i + 1]) / b[i];
+    }
+
+    let overflow = || CadError::Argument {
+        kind,
+        name: name.map(Name::new),
+        arg,
+        value: Value::Ratio(f64::INFINITY),
+        accepted: "spline coefficients within +-9e6",
+    };
+
+    for i in 0..n - 1 {
+        let h = m(zs_nm[i + 1] - zs_nm[i]);
+        let y0 = quant_pp12(ys[i], kind, name, arg)?;
+        let y1 = quant_pp12(ys[i + 1], kind, name, arg)?;
+        let m0 = quant_pp12(h * d[i], kind, name, arg)?;
+        let m1 = quant_pp12(h * d[i + 1], kind, name, arg)?;
+        let dy = i128::from(y1) - i128::from(y0);
+        let c2_128 = 3 * dy - 2 * i128::from(m0) - i128::from(m1);
+        let c3_128 = -2 * dy + i128::from(m0) + i128::from(m1);
+        let c2 = i64::try_from(c2_128).map_err(|_| overflow())?;
+        let c3 = i64::try_from(c3_128).map_err(|_| overflow())?;
+        out.push(SplineSpan { z0_nm: zs_nm[i], z1_nm: zs_nm[i + 1], c_pp12: [y0, m0, c2, c3] });
+    }
+    Ok((start, (n - 1) as u32))
+}
+
+fn span_coeffs(s: &SplineSpan) -> [f64; 4] {
+    [
+        s.c_pp12[0] as f64 / 1e12,
+        s.c_pp12[1] as f64 / 1e12,
+        s.c_pp12[2] as f64 / 1e12,
+        s.c_pp12[3] as f64 / 1e12,
+    ]
+}
+
+fn eval_cubic(c: &[f64; 4], u: f64) -> f64 {
+    c[0] + u * (c[1] + u * (c[2] + u * c[3]))
+}
+
+fn eval_cubic_du(c: &[f64; 4], u: f64) -> f64 {
+    c[1] + u * (2.0 * c[2] + 3.0 * c[3] * u)
+}
+
+/// Exact `(min_val, max_val, max_abs_deriv)` of a piecewise cubic spline over `[lo_z, hi_z]` (metres).
+fn spline_range_on(spans: &[SplineSpan], default_val: f64, lo_z: f64, hi_z: f64) -> (f64, f64, f64) {
+    if spans.is_empty() {
+        return (default_val, default_val, 0.0);
+    }
+    let mut vmin = f64::INFINITY;
+    let mut vmax = f64::NEG_INFINITY;
+    let mut dmax: f64 = 0.0;
+    let mut touch = |v: f64| {
+        vmin = vmin.min(v);
+        vmax = vmax.max(v);
+    };
+    let rz0 = m(spans[0].z0_nm);
+    let rzn = m(spans[spans.len() - 1].z1_nm);
+    if lo_z <= rz0 {
+        let c = span_coeffs(&spans[0]);
+        touch(eval_cubic(&c, 0.0));
+    }
+    if hi_z >= rzn {
+        let c = span_coeffs(&spans[spans.len() - 1]);
+        touch(eval_cubic(&c, 1.0));
+    }
+    for sp in spans {
+        let za = m(sp.z0_nm);
+        let zb = m(sp.z1_nm);
+        if zb < lo_z || za > hi_z {
+            continue;
+        }
+        let h = zb - za;
+        let u0 = ((lo_z.max(za) - za) / h).clamp(0.0, 1.0);
+        let u1 = ((hi_z.min(zb) - za) / h).clamp(0.0, 1.0);
+        let c = span_coeffs(sp);
+        touch(eval_cubic(&c, u0));
+        touch(eval_cubic(&c, u1));
+        if c[3].abs() > 1e-18 {
+            let disc = c[2] * c[2] - 3.0 * c[1] * c[3];
+            if disc >= 0.0 {
+                let sd = blaze_math::sqrt(disc);
+                let denom = 3.0 * c[3];
+                for r in [(-c[2] - sd) / denom, (-c[2] + sd) / denom] {
+                    if r > u0 && r < u1 {
+                        touch(eval_cubic(&c, r));
+                    }
+                }
+            }
+        } else if c[2].abs() > 1e-18 {
+            let r = -c[1] / (2.0 * c[2]);
+            if r > u0 && r < u1 {
+                touch(eval_cubic(&c, r));
+            }
+        }
+        let inv_h = 1.0 / h;
+        dmax = dmax.max(eval_cubic_du(&c, u0).abs() * inv_h);
+        dmax = dmax.max(eval_cubic_du(&c, u1).abs() * inv_h);
+        if c[3].abs() > 1e-18 {
+            let u_star = -c[2] / (3.0 * c[3]);
+            if u_star > u0 && u_star < u1 {
+                dmax = dmax.max(eval_cubic_du(&c, u_star).abs() * inv_h);
+            }
+        }
+    }
+    (vmin, vmax, dmax)
 }

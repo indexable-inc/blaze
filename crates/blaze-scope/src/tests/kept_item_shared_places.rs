@@ -79,11 +79,12 @@ static FILES: WithRunner = WithRunner(&[&[("/user/lib.rs", USER)], &[("/macros/l
 /// fails with that error.
 #[test]
 fn a_kept_item_with_a_doc_comment_and_a_lifetime_keeps_a_column_that_reads() {
-    let alloc = blaze_own::testing::heap().alloc();
+    let bump = super::SyncFrame::leaked();
+    let alloc = bump.alloc();
     let macros = input("macros", "/macros/lib.rs", &[]);
     let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false };
     let crates = [input("user", "/user/lib.rs", &[("macros", 1)]), CrateInput { implicit, ..macros }];
-    let names = resolve_crates(&crates, Sysroot::default(), &FILES, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &FILES, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let user = names.krate(0);
     let decls = &user.decls.get(&user.root).expect("the root is lowered").1;
     let keep = decls.calls.iter().find(|c| c.role == CallRole::Keep).unwrap_or_else(|| panic!("`Named` has a keep call: notes {:?}", names.notes(0)));

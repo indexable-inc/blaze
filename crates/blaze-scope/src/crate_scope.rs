@@ -22,7 +22,7 @@ use blaze_format::FormatError;
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ids::producer::{Expander, ProducerId};
-use blaze_own::{AVec, Alloc, Box};
+use blaze_own::{AVec, Alloc, BVec, Bump};
 use blaze_surface::{BuildError, Edition, GlobEdge, Namespace, RecordBytes, ScopeBuilder, Unresolved, Visibility};
 
 use crate::asked::{Asked, Question, ReadListError, Stale};
@@ -151,16 +151,16 @@ pub(crate) enum Form {
 
 /// The record `bytes` (16-aligned, living as long as `alloc`'s values) as a dependency read in
 /// `form`.
-pub(crate) fn hand<'a>(form: Form, bytes: &'a [u8], alloc: Alloc<'a>) -> Result<Dep<'a>, RecordRead> {
+pub(crate) fn hand<'a>(form: Form, bytes: &'a [u8], alloc: Bump<'a>) -> Result<Dep<'a>, RecordRead> {
     Ok(match form {
-        Form::InPlace => Dep::InPlace(Box::leak(Box::new_in(DepRecord::open(Verified::check(bytes)?), alloc))),
-        Form::Heap => Dep::Record(Box::leak(Box::new_in(read_record(bytes, alloc)?, alloc))),
+        Form::InPlace => Dep::InPlace(alloc.alloc_val(DepRecord::open(Verified::check(bytes)?))),
+        Form::Heap => Dep::Record(alloc.alloc_val(read_record(bytes, alloc.alloc())?)),
     })
 }
 
 /// Each of `deps` as [`hand`] reads it, in order.
-fn handed<'a>(form: Form, deps: &[&'a [u8]], alloc: Alloc<'a>) -> Result<AVec<'a, Dep<'a>>, CrateScopeError<'a>> {
-    let mut out = AVec::with_capacity_in(deps.len(), alloc);
+fn handed<'a>(form: Form, deps: &[&'a [u8]], alloc: Bump<'a>) -> Result<AVec<'a, Dep<'a>>, CrateScopeError<'a>> {
+    let mut out = AVec::with_capacity_in(deps.len(), alloc.alloc());
     for (at, bytes) in deps.iter().enumerate() {
         out.push(hand(form, bytes, alloc).map_err(|error| CrateScopeError::Record { at, error })?);
     }
@@ -374,7 +374,8 @@ pub fn why_reported<'a>(why: Unresolved, inner: &[u8], module: ItemKey, name: &s
     }
     // Only on a failure's report: the inner record checked whole, one module row found, its
     // bindings scanned in place (no decode).
-    let bound = crate::scope_record::inner_binds(crate::resolve::aligned(inner, alloc), module, name)?;
+    let aligned = crate::resolve::AlignedBuf::copy_from(inner, alloc);
+    let bound = crate::scope_record::inner_binds(aligned.as_slice(), module, name)?;
     Ok(if bound { Unresolved::Private } else { why })
 }
 
@@ -635,7 +636,7 @@ pub fn resolve_crate<'a, S: SourceTexts<'a>, P: Par>(
     source: usize,
     par: &P,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<CrateScope<'a>, CrateScopeError<'a>> {
     resolve_crate_with(input, deps, sysroot, sources, source, par, false, prepares, alloc)
 }
@@ -791,7 +792,7 @@ pub fn resolve_by_records<'a, S: SourceTexts<'a>, P: Par>(
     sources: &S,
     par: &P,
     ready: &Ready<'_>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<(AVec<'a, CrateScope<'a>>, usize), (usize, CrateScopeError<'a>)> {
     resolve_by_records_with(crates, sysroot, sources, par, ready, false, alloc)
 }
@@ -807,7 +808,7 @@ pub fn resolve_kept<'a, S: SourceTexts<'a>, P: Par>(
     par: &P,
     ready: &Ready<'_>,
     kept: &dyn Kept,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<(AVec<'a, Solved<'a>>, usize), (usize, CrateScopeError<'a>)> {
     resolve_queue(crates, sysroot, sources, par, ready, false, Some(kept), Form::InPlace, alloc)
 }
@@ -850,7 +851,7 @@ pub(crate) fn resolve_by_records_with<'a, S: SourceTexts<'a>, P: Par>(
     par: &P,
     ready: &Ready<'_>,
     leak_private: bool,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<(AVec<'a, CrateScope<'a>>, usize), (usize, CrateScopeError<'a>)> {
     resolve_by_records_in(crates, sysroot, sources, par, ready, leak_private, Form::InPlace, alloc)
 }
@@ -866,10 +867,10 @@ pub(crate) fn resolve_by_records_in<'a, S: SourceTexts<'a>, P: Par>(
     ready: &Ready<'_>,
     leak_private: bool,
     form: Form,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<(AVec<'a, CrateScope<'a>>, usize), (usize, CrateScopeError<'a>)> {
     let (solved, needs) = resolve_queue(crates, sysroot, sources, par, ready, leak_private, None, form, alloc)?;
-    let mut all = AVec::with_capacity_in(solved.len(), alloc);
+    let mut all = AVec::with_capacity_in(solved.len(), alloc.alloc());
     for (at, s) in solved.into_iter().enumerate() {
         match s {
             Solved::Solved(scope) => all.push(scope),
@@ -891,8 +892,9 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
     leak_private: bool,
     kept: Option<&dyn Kept>,
     form: Form,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<(AVec<'a, Solved<'a>>, usize), (usize, CrateScopeError<'a>)> {
+    let alloc = bump.alloc();
     let graph = crate::resolve::graph_of(crates, sysroot, alloc).map_err(|e| (0, CrateScopeError::Names(e)))?;
     let n = crates.len();
     let mut pos: AVec<'a, usize> = AVec::from_iter_in(crates.iter().map(|_| usize::MAX), alloc);
@@ -937,7 +939,7 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
         failed: None,
     });
     let woken = Condvar::new();
-    let prepares = Prepares::new_in(alloc);
+    let prepares = Prepares::new_in(bump);
     let rank_of = |at: usize| (ready.rank.map_or(0, |r| r[at]), pos[at]);
     let worker = |w: usize| {
         loop {
@@ -979,11 +981,11 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                     local.len() - 1
                 }
             };
-            let mut own_deps = AVec::with_capacity_in(input.deps.len(), alloc);
+            let mut own_deps = BVec::with_capacity_in(input.deps.len(), bump);
             for &(name, index) in input.deps {
                 own_deps.push((name, place(index, &mut local)));
             }
-            let own_deps: &'a [(&'a str, usize)] = AVec::leak(own_deps);
+            let own_deps: &'a [(&'a str, usize)] = own_deps.into_bump_slice();
             let mut mapped = [None; 4];
             for (slot, s) in mapped.iter_mut().zip(sysroot.all()) {
                 *slot = s.filter(|s| s.index() != at && pos[s.index()] < pos[at]).map(|s| place(s.index(), &mut local));
@@ -997,7 +999,7 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
             let found = match kept.and_then(|k| k.find(at).map(|f| (k, f))) {
                 None => Ok(None),
                 Some((k, (record, inner, read))) => {
-                    let read = crate::resolve::aligned(read, alloc);
+                    let read = crate::resolve::aligned(read, bump);
                     match crate::asked::check(read, &now, alloc) {
                         Err(error) => Err(CrateScopeError::ReadList { krate: input.name, error }),
                         Ok(Some(why)) => {
@@ -1005,7 +1007,7 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                             Ok(None)
                         }
                         Ok(None) => {
-                            let (r, i) = (crate::resolve::aligned(record, alloc), crate::resolve::aligned(inner, alloc));
+                            let (r, i) = (crate::resolve::aligned(record, bump), crate::resolve::aligned(inner, bump));
                             Ok(Some(Solved::Found { record: &r[..record.len()], inner: &i[..inner.len()] }))
                         }
                     }
@@ -1061,7 +1063,7 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                         .unwrap_or_else(|e| panic!("the kept expansions of `{}` did not open: {e}", input.name)),
                     None => crate::expansions::KeptExpansions::none(alloc),
                 };
-                match resolve_crate_decoded(&local_input, &deps, local_sysroot, sources, at, par, leak_private, prepares, &kept_expansions, alloc) {
+                match resolve_crate_decoded(&local_input, &deps, local_sysroot, sources, at, par, leak_private, prepares, &kept_expansions, bump) {
                     Ok(done) => {
                         if let Some((k, _)) = keeper {
                             par.stage(crate::task::Stage::ExpansionsRecord);
@@ -1123,8 +1125,8 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                 let digest = ContentId::of(EXPORTS_DOMAIN, own);
                 par.stage(crate::task::Stage::Decode);
                 ready.hooks.decoding(at);
-                let bytes = crate::resolve::aligned(own, alloc);
-                let record = hand(form, bytes, alloc).map_err(|error| CrateScopeError::OwnRecord { krate: input.name, error })?;
+                let bytes = crate::resolve::aligned(own, bump);
+                let record = hand(form, bytes, bump).map_err(|error| CrateScopeError::OwnRecord { krate: input.name, error })?;
                 ready.hooks.decoded(at, bytes.len());
                 Ok((done, record, digest))
             });
@@ -1175,10 +1177,10 @@ pub(crate) fn resolve_crate_with<'a, S: SourceTexts<'a>, P: Par>(
     par: &P,
     leak_private: bool,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<CrateScope<'a>, CrateScopeError<'a>> {
     let read = handed(Form::InPlace, deps, alloc)?;
-    resolve_crate_decoded(input, &read, sysroot, sources, source, par, leak_private, prepares, &crate::expansions::KeptExpansions::none(alloc), alloc)
+    resolve_crate_decoded(input, &read, sysroot, sources, source, par, leak_private, prepares, &crate::expansions::KeptExpansions::none(alloc.alloc()), alloc)
 }
 
 /// [`resolve_crate`] given its dependencies' exports records already checked, each proof made
@@ -1194,13 +1196,14 @@ pub fn resolve_crate_verified<'a, S: SourceTexts<'a>, P: Par>(
     source: usize,
     par: &P,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<CrateScope<'a>, CrateScopeError<'a>> {
-    let mut handed = AVec::with_capacity_in(deps.len(), alloc);
+    let a = alloc.alloc();
+    let mut handed = AVec::with_capacity_in(deps.len(), a);
     for proof in deps {
-        handed.push(Dep::InPlace(Box::leak(Box::new_in(DepRecord::open(*proof), alloc))));
+        handed.push(Dep::InPlace(alloc.alloc_val(DepRecord::open(*proof))));
     }
-    resolve_crate_decoded(input, &handed, sysroot, sources, source, par, false, prepares, &crate::expansions::KeptExpansions::none(alloc), alloc)
+    resolve_crate_decoded(input, &handed, sysroot, sources, source, par, false, prepares, &crate::expansions::KeptExpansions::none(a), alloc)
 }
 
 /// [`resolve_crate_with`] given its dependencies' records already handed: the ready queue
@@ -1216,15 +1219,16 @@ fn resolve_crate_decoded<'a, S: SourceTexts<'a>, P: Par>(
     leak_private: bool,
     prepares: &'a Prepares<'a>,
     kept: &crate::expansions::KeptExpansions<'_, 'a>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<CrateScope<'a>, CrateScopeError<'a>> {
+    let alloc = bump.alloc();
     let write = |names: CrateNames<'a>, built: &Built<'_, 'a>| -> Result<_, CrateScopeError<'a>> {
         par.stage(crate::task::Stage::Write);
         let Records { exports, inner } = write_records(&names, built, leak_private, alloc).map_err(|error| CrateScopeError::Write { krate: input.name, error })?;
         Ok((names, exports, inner))
     };
-    let ((names, record, inner), asked) = with_names(input, deps, sysroot, sources, source, par, prepares, kept, alloc, write)?;
-    let names: &'a CrateNames<'a> = Box::leak(Box::new_in(names, alloc));
+    let ((names, record, inner), asked) = with_names(input, deps, sysroot, sources, source, par, prepares, kept, bump, write)?;
+    let names: &'a CrateNames<'a> = bump.alloc_val(names);
     Ok(CrateScope { names, record, inner, asked })
 }
 
@@ -1244,10 +1248,11 @@ pub fn resolve_members<'a, S: SourceTexts<'a>, P: Par>(
     source: usize,
     par: &P,
     members: crate::cells::Members<'_>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<crate::cells::Solved<'a>, CrateScopeError<'a>> {
-    let decoded = handed(Form::InPlace, deps, alloc)?;
-    let prepares = Prepares::new_in(alloc);
+    let alloc = bump.alloc();
+    let decoded = handed(Form::InPlace, deps, bump)?;
+    let prepares = Prepares::new_in(bump);
     let par = OfMembers { par, members };
     let kept = crate::expansions::KeptExpansions::none(alloc);
     let members_of = |mut names: CrateNames<'a>, _: &Built<'_, 'a>| {
@@ -1260,7 +1265,7 @@ pub fn resolve_members<'a, S: SourceTexts<'a>, P: Par>(
         core::mem::forget(names);
         Ok(crate::cells::Solved { groups, tree })
     };
-    let (solved, _) = with_names(input, &decoded, sysroot, sources, source, &par, prepares, &kept, alloc, members_of)?;
+    let (solved, _) = with_names(input, &decoded, sysroot, sources, source, &par, prepares, &kept, bump, members_of)?;
     Ok(solved)
 }
 
@@ -1376,7 +1381,7 @@ pub fn block_scopes_differential<'a, S: SourceTexts<'a>, P: Par>(
     source: usize,
     par: &P,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<crate::body_scope::BlockScopesVerdict<'a>, crate::body_scope::DifferentialError<'a>> {
     let modules = block_scopes_modules_side(input, deps, sysroot, sources, source, par, prepares, alloc, alloc)?;
     block_scopes_bodies_side(&modules, input, deps, sysroot, sources, source, par, prepares, alloc)
@@ -1395,16 +1400,17 @@ pub fn block_scopes_modules_side<'a, 'o, S: SourceTexts<'a>, P: Par>(
     source: usize,
     par: &P,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
-    out: Alloc<'o>,
+    bump: Bump<'a>,
+    out: Bump<'o>,
 ) -> Result<crate::body_scope::ModulesSide<'o>, crate::body_scope::DifferentialError<'a>> {
     use crate::body_scope::{DifferentialError, ModulesSide};
     use crate::surface::BlockScopes;
 
-    let decoded = handed(Form::InPlace, deps, alloc).map_err(DifferentialError::Names)?;
+    let alloc = bump.alloc();
+    let decoded = handed(Form::InPlace, deps, bump).map_err(DifferentialError::Names)?;
     let kept = crate::expansions::KeptExpansions::none(alloc);
     let modules_par = Strategy { par, scopes: BlockScopes::Modules };
-    let (side, _) = with_names(input, &decoded, sysroot, sources, source, &modules_par, prepares, &kept, alloc, |names, _| Ok(ModulesSide::of(&names, alloc, out))).map_err(DifferentialError::Names)?;
+    let (side, _) = with_names(input, &decoded, sysroot, sources, source, &modules_par, prepares, &kept, bump, |names, _| Ok(ModulesSide::of(&names, alloc, out))).map_err(DifferentialError::Names)?;
     side.map_err(|error| DifferentialError::Rows { krate: input.name, error })
 }
 
@@ -1422,14 +1428,15 @@ pub fn block_scopes_bodies_side<'a, 'o: 'a, S: SourceTexts<'a>, P: Par>(
     source: usize,
     par: &P,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<crate::body_scope::BlockScopesVerdict<'a>, crate::body_scope::DifferentialError<'a>> {
     use crate::body_scope::{BodyScope, BodyScopeRefusal, DifferentialError};
     use crate::surface::BlockScopes;
 
-    let decoded = handed(Form::InPlace, deps, alloc).map_err(DifferentialError::Names)?;
+    let alloc = bump.alloc();
+    let decoded = handed(Form::InPlace, deps, bump).map_err(DifferentialError::Names)?;
     let kept = crate::expansions::KeptExpansions::none(alloc);
-    let leak = |names: CrateNames<'a>| -> &'a CrateNames<'a> { Box::leak(Box::new_in(names, alloc)) };
+    let leak = |names: CrateNames<'a>| -> &'a CrateNames<'a> { bump.alloc_val(names) };
 
     let bodies_par = Strategy { par, scopes: BlockScopes::Bodies };
     let solve = |names: CrateNames<'a>, built: &Built<'_, 'a>| -> Result<_, CrateScopeError<'a>> {
@@ -1441,7 +1448,7 @@ pub fn block_scopes_bodies_side<'a, 'o: 'a, S: SourceTexts<'a>, P: Par>(
         // missing from the `Bodies` table because of the refusal (the verdict says how many).
         let mut refused_blocks: AVec<'a, ItemKey> = AVec::new_in(alloc);
         // The crate's tree record read once for every held body (rule 74, D189's floor).
-        let tree = crate::resolve::ReadTree::of(c, alloc).map_err(|error| CrateScopeError::Names(NamesError::TreeRecord { krate: input.name, error }))?;
+        let tree = crate::resolve::ReadTree::of(c, bump).map_err(|error| CrateScopeError::Names(NamesError::TreeRecord { krate: input.name, error }))?;
         // Each body's work (its cells over its chain and the modules it reads, cells/mod.rs
         // `load_body`; the read list's scope bytes) in the driver's scratch, reset after it: tempo's `core` outgrew its 4 GiB
         // frame with every body's work kept (21 Nov 05:33). No macro call is open here (the
@@ -1449,7 +1456,7 @@ pub fn block_scopes_bodies_side<'a, 'o: 'a, S: SourceTexts<'a>, P: Par>(
         // `solve_held_body_scratch`), so the scratch is never asked twice at once.
         let hook = |work: &mut dyn FnMut(Alloc<'_>)| par.call_scratch(work);
         for held in c.bodies.iter() {
-            match crate::body_scope::body_scope_scratch(&tree, &body_deps, input, source, *held, sources, prepares, &hook, alloc) {
+            match crate::body_scope::body_scope_scratch(&tree, &body_deps, input, source, *held, sources, prepares, &hook, bump) {
                 Ok(scope) => scopes.push(scope),
                 Err(refusal) => {
                     let nested = blaze_file_items::nested::scan(held.src.text, alloc);
@@ -1462,7 +1469,7 @@ pub fn block_scopes_bodies_side<'a, 'o: 'a, S: SourceTexts<'a>, P: Par>(
         refused_blocks.dedup();
         Ok((c, scopes, refused, refused_blocks))
     };
-    let ((bodies, scopes, refused, refused_blocks), _) = with_names(input, &decoded, sysroot, sources, source, &bodies_par, prepares, &kept, alloc, solve).map_err(DifferentialError::Names)?;
+    let ((bodies, scopes, refused, refused_blocks), _) = with_names(input, &decoded, sysroot, sources, source, &bodies_par, prepares, &kept, bump, solve).map_err(DifferentialError::Names)?;
 
     let bodies_rows = crate::body_scope::bodies_impl_table(bodies, &scopes, alloc).map_err(|error| DifferentialError::Rows { krate: input.name, error })?;
     let diff = crate::body_scope::impl_diff(&modules.rows, &bodies_rows, alloc);
@@ -1499,9 +1506,10 @@ fn with_names<'a, S: SourceTexts<'a>, P: Par, R>(
     par: &P,
     prepares: &'a Prepares<'a>,
     kept: &crate::expansions::KeptExpansions<'_, 'a>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
     then: impl FnOnce(CrateNames<'a>, &Built<'_, 'a>) -> Result<R, CrateScopeError<'a>>,
 ) -> Result<(R, AVec<'a, Question<'a>>), CrateScopeError<'a>> {
+    let alloc = bump.alloc();
     let mut slots: AVec<'a, Option<Dep<'a>>> = AVec::with_capacity_in(deps.len() + 1, alloc);
     let mut by_prefix = HashMap::new_in(alloc);
     let mut graph_crates = AVec::with_capacity_in(deps.len() + 1, alloc);
@@ -1545,13 +1553,13 @@ fn with_names<'a, S: SourceTexts<'a>, P: Par, R>(
     slots.push(None);
     let graph = CrateGraph::new_in(graph_crates, sysroot, alloc).map_err(|e| CrateScopeError::Names(NamesError::Graph(e)))?;
     let id = CrateId(u32::try_from(deps.len()).map_err(|_| CrateScopeError::NoSuchDep { krate: input.name, name: input.name, index: deps.len() })?);
-    let asked = Asked::new_in(alloc);
+    let asked = Asked::new_in(bump);
     let built = Built { crates: &slots, by_prefix: &by_prefix, asked: Some(&asked) };
     // Each handed crate's facts decide what it reaches (`Need`) and the record's reach list.
     for d in slots.iter().flatten() {
         built.ask(|| Question::krate(*d, alloc));
     }
-    let names = resolve_one::<S, P>(&graph, input, id, source, &built, sources, par, First::Prefetch, prepares, kept, alloc).map_err(CrateScopeError::Names)?;
+    let names = resolve_one::<S, P>(&graph, input, id, source, &built, sources, par, First::Prefetch, prepares, kept, bump).map_err(CrateScopeError::Names)?;
     let answer = then(names, &built)?;
     Ok((answer, asked.take()))
 }

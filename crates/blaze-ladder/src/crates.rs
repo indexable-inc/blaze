@@ -14,7 +14,7 @@ use core::fmt;
 
 use blaze_fetch::PackView;
 use blaze_id::{ContentId, CrateItemKey};
-use blaze_own::Alloc;
+use blaze_own::{Alloc, Bump};
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::resolve::{CrateInput, Names, NamesError, SourceTexts, resolve_crates};
 use blaze_scope::task::Serial;
@@ -409,21 +409,21 @@ impl<'t> Inputs<'t> {
         out
     }
 
-    /// Every crate's names, resolved together, held in `alloc` (the caller's, alive as long as
+    /// Every crate's names, resolved together, held in `bump` (the caller's arena, alive as long as
     /// the names).
-    pub fn resolve(&'t self, crates: &[CrateInput<'t>], alloc: Alloc<'t>) -> Result<Names<'t>, NamesError<'t>> {
-        self.resolve_with(crates, &Serial, alloc)
+    pub fn resolve(&'t self, crates: &[CrateInput<'t>], bump: Bump<'t>) -> Result<Names<'t>, NamesError<'t>> {
+        self.resolve_with(crates, &Serial, bump)
     }
 
     /// [`Inputs::resolve`] under the caller's `par` (one that asks for each crate's names
     /// groups, `Par::names_groups`).
-    pub fn resolve_with<P: blaze_scope::task::Par>(&'t self, crates: &[CrateInput<'t>], par: &P, alloc: Alloc<'t>) -> Result<Names<'t>, NamesError<'t>> {
-        resolve_crates(crates, self.sysroot, &self.texts, par, alloc)
+    pub fn resolve_with<P: blaze_scope::task::Par>(&'t self, crates: &[CrateInput<'t>], par: &P, bump: Bump<'t>) -> Result<Names<'t>, NamesError<'t>> {
+        resolve_crates(crates, self.sysroot, &self.texts, par, bump)
     }
 
     /// The names with `roots` (crate indices) solved whole and every other crate's groups on
     /// demand (E13, blaze-scope cells/lazy_deps.rs).
-    pub fn names_on_demand(&'t self, crates: &[CrateInput<'t>], roots: &[usize], alloc: Alloc<'t>) -> Result<blaze_scope::NamesOnDemand<'t>, blaze_scope::NamesOnDemandError<'t>> {
-        blaze_scope::names_on_demand(crates, self.sysroot, &self.texts, roots, alloc)
+    pub fn names_on_demand(&'t self, crates: &[CrateInput<'t>], roots: &[usize], bump: Bump<'t>) -> Result<blaze_scope::NamesOnDemand<'t>, blaze_scope::NamesOnDemandError<'t>> {
+        blaze_scope::names_on_demand(crates, self.sysroot, &self.texts, roots, bump)
     }
 }

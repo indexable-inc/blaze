@@ -29,6 +29,10 @@ pub enum PNode {
     Never,
     /// Elements in the list column; `()` is the empty tuple.
     Tuple(List),
+    /// Structural record fields in canonical sorted name order.
+    Record(List),
+    /// Structural union members in canonical order.
+    Union(List),
     Ref(Mutbl, PTy),
     Ptr(Mutbl, PTy),
     /// `[elem; len]`: `len` a `ConstValue` of `usize`, a `ConstParam`, or (in a body's types
@@ -179,7 +183,7 @@ impl<'a> PTys<'a> {
     /// Appends every child in declaration order. A projection's arguments precede its term.
     pub fn children_of(self, node: PNode, out: &mut impl Extend<PTy>) -> Result<(), CheckError> {
         match node {
-            PNode::Tuple(l) | PNode::Adt(_, l) | PNode::FnDef(_, l) | PNode::FnPtr(l, _)
+            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::Adt(_, l) | PNode::FnDef(_, l) | PNode::FnPtr(l, _)
             | PNode::Opaque(_, l) | PNode::Closure { args: l, .. } | PNode::Coroutine { args: l, .. }
             | PNode::Alias { args: l, .. } | PNode::Dynamic(l) | PNode::ExTrait(_, l) => {
                 out.extend(self.list(l)?.iter().copied());
@@ -350,60 +354,20 @@ fn hash_list(l: List, h: &mut StableHasher) {
 }
 
 /// Pushes the children of `n` in `t` onto `out` in order (a list's terms in order; a
-/// `ConstValue`'s type too): the one walk order of a record's terms, for converting them
-/// (infer/facts.rs) and for hashing them (world.rs `Hashes`).
+/// `ConstValue`'s type too; a `Future` skipped, as record conversion refuses it): the one walk
+/// order of a record's terms, for converting them (infer/facts.rs) and for hashing them
+/// (world.rs `Hashes`).
 pub(crate) fn node_children(t: PTys<'_>, n: PNode, out: &mut blaze_own::Vec<u32, blaze_own::Alloc<'_>>) -> Result<(), CheckError> {
-    let list = |l: List, out: &mut blaze_own::Vec<u32, blaze_own::Alloc<'_>>| -> Result<(), CheckError> {
-        for i in l.range() {
-            let p = t.list_slot(i).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: i as u32, child: i as u32 }))?;
-            out.push(p.0);
-        }
-        Ok(())
-    };
-    match n {
-        PNode::Bool
-        | PNode::Char
-        | PNode::Int(_)
-        | PNode::Uint(_)
-        | PNode::Float(_)
-        | PNode::Str
-        | PNode::Never
-        | PNode::Param(_)
-        | PNode::ConstParam(_)
-        | PNode::Error
-        | PNode::ExAuto(_)
-        | PNode::Foreign(_)
-        | PNode::Future(..)
-        | PNode::Infer => Ok(()),
-        PNode::ConstValue { ty: p, .. } | PNode::Ref(_, p) | PNode::Ptr(_, p) | PNode::Slice(p) => {
-            out.push(p.0);
-            Ok(())
-        }
-        PNode::Array(e, len) => {
-            out.push(e.0);
-            out.push(len.0);
-            Ok(())
-        }
-        PNode::Pat(b, l) => {
-            out.push(b.0);
-            list(l, out)
-        }
-        PNode::Tuple(l)
-        | PNode::Adt(_, l)
-        | PNode::FnDef(_, l)
-        | PNode::FnPtr(l, _)
-        | PNode::Opaque(_, l)
-        | PNode::Dynamic(l)
-        | PNode::ExTrait(_, l)
-        | PNode::Closure { args: l, .. }
-        | PNode::Coroutine { args: l, .. }
-        | PNode::Alias { args: l, .. } => list(l, out),
-        PNode::ExProj { args, term, .. } => {
-            list(args, out)?;
-            out.push(term.0);
-            Ok(())
+    if matches!(n, PNode::Future(..)) {
+        return Ok(());
+    }
+    struct Ids<'a, 'b>(&'a mut Vec<u32, Alloc<'b>>);
+    impl Extend<PTy> for Ids<'_, '_> {
+        fn extend<I: IntoIterator<Item = PTy>>(&mut self, iter: I) {
+            self.0.extend(iter.into_iter().map(|p| p.0));
         }
     }
+    t.children_of(n, &mut Ids(out))
 }
 
 /// The content of one node, its children by index.
@@ -536,22 +500,27 @@ pub(crate) fn hash_node(n: &PNode, h: &mut StableHasher) {
             h.tag(30);
             h.u128(k.0);
         }
+        PNode::Record(l) => {
+            h.tag(31);
+            hash_list(l, h);
+        }
+        PNode::Union(l) => {
+            h.tag(32);
+            hash_list(l, h);
+        }
     }
 }
 
-/// The content of one node WITHOUT where its children sit in its table: every handle to a
-/// term is `PTy(0)` and every list starts at 0 (its length kept), so two tables that interned
-/// the same terms in different orders give one hash. The children's own digests are hashed
-/// after it, in [`node_children`]'s order (world.rs `Hashes::term`). A read-list digest takes
-/// this form, never [`hash_node`]'s: a store's table numbers terms in the order its run met
-/// them, which is not content (the `front2_records` test's body 1, 2026-11-16: `Box::leak`'s
-/// signature equal over records and over solved names, its input at `PTy(478)` in one store
-/// and `PTy(486)` in the other).
-pub(crate) fn hash_node_shape(n: &PNode, h: &mut StableHasher) {
+/// A node with its handles cleared: every handle to a term becomes `PTy(0)` and every list starts
+/// at 0 (its length kept), so the shape carries what the node is and not where its children sit
+/// in its table.
+pub fn node_shape(n: PNode) -> PNode {
     let p = PTy(0);
     let l = |l: List| List { start: 0, len: l.len };
-    let shape = match *n {
+    match n {
         PNode::Tuple(x) => PNode::Tuple(l(x)),
+        PNode::Record(x) => PNode::Record(l(x)),
+        PNode::Union(x) => PNode::Union(l(x)),
         PNode::Ref(m, _) => PNode::Ref(m, p),
         PNode::Ptr(m, _) => PNode::Ptr(m, p),
         PNode::Array(..) => PNode::Array(p, p),
@@ -582,8 +551,19 @@ pub(crate) fn hash_node_shape(n: &PNode, h: &mut StableHasher) {
         | PNode::ConstParam(_)
         | PNode::ExAuto(_)
         | PNode::Foreign(_)) => leaf,
-    };
-    hash_node(&shape, h);
+    }
+}
+
+/// The content of one node WITHOUT where its children sit in its table: every handle to a
+/// term is `PTy(0)` and every list starts at 0 (its length kept), so two tables that interned
+/// the same terms in different orders give one hash. The children's own digests are hashed
+/// after it, in [`node_children`]'s order (world.rs `Hashes::term`). A read-list digest takes
+/// this form, never [`hash_node`]'s: a store's table numbers terms in the order its run met
+/// them, which is not content (the `front2_records` test's body 1, 2026-11-16: `Box::leak`'s
+/// signature equal over records and over solved names, its input at `PTy(478)` in one store
+/// and `PTy(486)` in the other).
+pub(crate) fn hash_node_shape(n: &PNode, h: &mut StableHasher) {
+    hash_node(&node_shape(*n), h);
 }
 
 /// A trait object's impl-lookup shape key: its principal trait, from its rows `l` of `t`
@@ -951,6 +931,8 @@ impl<'a> PortableTys<'a> {
         let node = match node {
             PNode::ConstValue { bits, .. } => PNode::ConstValue { ty: children[0], bits },
             PNode::Tuple(_) => PNode::Tuple(self.intern_list(children)?),
+            PNode::Record(_) => PNode::Record(self.intern_list(children)?),
+            PNode::Union(_) => PNode::Union(self.intern_list(children)?),
             PNode::Ref(m, _) => PNode::Ref(m, children[0]),
             PNode::Ptr(m, _) => PNode::Ptr(m, children[0]),
             PNode::Array(..) => PNode::Array(children[0], children[1]),

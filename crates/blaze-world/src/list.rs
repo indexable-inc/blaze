@@ -33,7 +33,7 @@
 use blaze_fetch::PackView;
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_manifest::lock::Lock;
-use blaze_own::{AString, AVec, Alloc, BTreeMap};
+use blaze_own::{AString, AVec, Alloc, BTreeMap, BVec, Bump};
 use blaze_scope::crate_env::{CrateEnv, EnvFacts, SeenRoot};
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::resolve::CrateInput;
@@ -43,7 +43,7 @@ use blaze_unit_graph::{StdIs, Unit, UnitGraph, UnitKind};
 
 use crate::{
     Corrected, Crate, Needs, Origin, PackOrigin, Packages, Place, Script, Texts, Toolchain, Tree, World, WorldError, alloc_free_debug, correct_pack, implicit_key,
-    join, keep, keep_slice, push_u32,
+    join, push_u32,
 };
 
 #[cfg(test)]
@@ -88,17 +88,19 @@ pub fn open_list<'w, S: Shelf, P: Packages<'w>>(
     graph: &'w UnitGraph<'w>,
     lock: &'w Lock<'w>,
     packages: &mut P,
-    alloc: Alloc<'w>,
+    alloc: Bump<'w>,
 ) -> Result<Listed<'w, S::Bytes>, WorldError<'w>>
 where
     S::Bytes: AsRef<[u8]>,
 {
+    let bump = alloc;
+    let alloc = bump.alloc();
     let manifest = blaze_toolchain::shelf::open_manifest(shelf, id).map_err(WorldError::Toolchain)?;
-    // The manifest is small (rows, no packs): copied into `alloc` so the list may borrow it.
-    let bytes: &'w [u8] = keep_slice(manifest.as_ref(), alloc);
+    // The manifest is small (rows, no packs): copied into `bump` so the list may borrow it.
+    let bytes: &'w [u8] = bump.alloc_slice_copy(manifest.as_ref());
     let view = ToolchainView::open(bytes, id).expect("open_manifest checked it");
     let list = crate_list(graph, lock, view, triple, packages, alloc)?;
-    let toolchain = Toolchain::open(shelf, id, triple, needs(&list), alloc)?;
+    let toolchain = Toolchain::open(shelf, id, triple, needs(&list), bump)?;
     let mut side_packs = AVec::new_in(alloc);
     for (at, c) in list.crates.iter().enumerate().skip(list.macro_from) {
         if let ListOrigin::Toolchain { krate, .. } = c.origin {
@@ -123,7 +125,7 @@ pub fn crate_list<'w, P: Packages<'w>>(
     let mut members: AVec<'w, Member<'w>> = AVec::new_in(alloc);
     let mut asked: AVec<'w, u32> = AVec::new_in(alloc);
     for unit in graph.units.iter() {
-        if !lock.package(unit.package).source_text.is_empty() || asked.contains(&unit.package.0) {
+        if !lock.package(unit.package).source_text.is_empty() || asked.scan_for(&unit.package.0).is_some() {
             continue;
         }
         asked.push(unit.package.0);
@@ -180,8 +182,10 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     listed: &'w Listed<'w, B>,
     packages: &mut P,
     checkout: &'w dyn Tree,
-    alloc: Alloc<'w>,
+    alloc: Bump<'w>,
 ) -> Result<World<'w>, WorldError<'w>> {
+    let bump = alloc;
+    let alloc = bump.alloc();
     let list = &listed.list;
     let toolchain = &listed.toolchain;
     let units = &graph.units;
@@ -279,14 +283,14 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                 } else {
                     None
                 };
-                let mut cfg: AVec<'w, (&'w str, Option<&'w str>)> = AVec::with_capacity_in(c.cfg.len(), alloc);
+                let mut cfg: BVec<'w, (&'w str, Option<&'w str>)> = BVec::with_capacity_in(c.cfg.len(), bump);
                 cfg.extend_from_slice(&c.cfg);
                 cfg.sort_unstable();
                 cfg.dedup();
                 let implicit_extern = implicit_key(toolchain, c.implicit)?;
                 let parts = UnitKeyParts { cfg: &cfg, deps: &deps, implicit_extern, member };
                 let key = unit_crate_key(c, unit, lock, &parts, &corrections, alloc);
-                let cfg: &'w [(&'w str, Option<&'w str>)] = cfg.leak();
+                let cfg: &'w [(&'w str, Option<&'w str>)] = cfg.into_bump_slice();
                 (key, cfg, script)
             }
             ListOrigin::Toolchain { .. } => (side_toolchain_key(c, &deps, alloc), &c.cfg[..], Script::None),
@@ -408,7 +412,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                                 origins.push(PackOrigin::Source { key });
                                 let tree = packs.len() as u32;
                                 if let Some(row) = corrections.find_text(&unit.name, &unit.version) {
-                                    correct_pack(row, view, tree, dir, unit, &mut corrected, &mut used, alloc)?;
+                                    correct_pack(row, view, tree, dir, unit, &mut corrected, &mut used, bump)?;
                                 }
                                 (tree, dir)
                             }
@@ -422,7 +426,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                 push_u32(&mut base, tree);
                 base.push_str("/");
                 let shown = join(&base, dir, alloc);
-                let root = keep(&join(&shown, &unit.root, alloc), alloc);
+                let root = bump.alloc_str(&join(&shown, &unit.root, alloc));
                 let mut shown_from = shown;
                 if !shown_from.ends_with('/') {
                     shown_from.push_str("/");
@@ -430,10 +434,10 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                 // What the crate sees as its root (D96): a member (placed in the checkout, tree
                 // 0) its directory under the workspace, every fetched package `/package`.
                 let seen = if tree == 0 { SeenRoot::member(dir).map_err(|error| WorldError::MemberDir { package: &unit.name, error })? } else { SeenRoot::Package };
-                let shown_from: &'w str = keep(&shown_from, alloc);
+                let shown_from: &'w str = bump.alloc_str(&shown_from);
                 let test_or_bench = matches!(unit.kind, UnitKind::IntegrationTest(_) | UnitKind::Bench(_));
                 let bin_exes = match test_or_bench {
-                    true => blaze_scope::crate_env::package_bins(graph, unit.package, unit.crate_name.as_str(), alloc).map_err(WorldError::Env)?,
+                    true => blaze_scope::crate_env::package_bins(graph, unit.package, unit.crate_name.as_str(), bump).map_err(WorldError::Env)?,
                     false => blaze_scope::crate_env::BinNames::NONE,
                 };
                 let facts = EnvFacts {
@@ -464,8 +468,8 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                 base.push_str("/");
                 push_u32(&mut base, tree);
                 base.push_str("/");
-                let root = keep(&join(&base, inner, alloc), alloc);
-                let shown_from: &'w str = keep(&base, alloc);
+                let root = bump.alloc_str(&join(&base, inner, alloc));
+                let shown_from: &'w str = bump.alloc_str(&base);
                 let facts = EnvFacts {
                     crate_name: c.name,
                     package: None,
@@ -481,7 +485,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                 (root, shown_from, facts, Origin::Toolchain(unit), false, c.name, version)
             }
         };
-        let mut deps: AVec<'w, (&'w str, usize)> = AVec::with_capacity_in(c.deps.len() + 1, alloc);
+        let mut deps: BVec<'w, (&'w str, usize)> = BVec::with_capacity_in(c.deps.len() + 1, bump);
         for &(name, d) in c.deps.iter() {
             deps.push((name, world_at(d).ok_or(WorldError::Cycle { krate: c.name })? as usize));
         }
@@ -503,7 +507,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                 root,
                 shown_from,
                 features: &c.features,
-                deps: deps.leak(),
+                deps: deps.into_bump_slice(),
                 cfg: pend.cfg,
                 script: None,
             },

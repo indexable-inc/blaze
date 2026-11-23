@@ -126,11 +126,11 @@ fn errors(names: &CrateNames<'_>) -> Vec<String> {
 /// was filed 65 times, every other level called as the macro, down to two `RecursionLimit` errors, and `Handle` was NotFound.
 #[test]
 fn derive_where_s_struct_is_declared_through_its_two_expansions() {
-    let alloc = blaze_own::testing::heap().alloc();
+    let bump = super::SyncFrame::leaked();
     let macros = input("derive_where", "/derive_where/lib.rs", &[]);
     let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false };
     let crates = [input("user", "/user/lib.rs", &[("derive_where", 1)]), crate::resolve::CrateInput { implicit, ..macros }];
-    let names = resolve_crates(&crates, Sysroot::default(), &FILES, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &FILES, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let user = names.krate(0);
     // The calls the first expansion (the attribute macro's, one deep) files, in order.
     let first: Vec<(CallShape, String, CallRole)> = user
@@ -157,9 +157,9 @@ fn derive_where_s_struct_is_declared_through_its_two_expansions() {
         "the first output's calls; `derive_where` attribute calls filed in all: {attr_runs}; errors {:?}",
         errors(user)
     );
-    let at = |segments: &'static [&'static str]| names.item_at(names.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments }, alloc);
+    let at = |segments: &'static [&'static str]| names.item_at(names.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments }, bump.alloc());
     let account = at(&["account"]).unwrap_or_else(|e| panic!("`account`: {e}")).def.key;
-    let handle = names.path(account, Namespace::Types, Written { kind: PathKind::Plain, segments: &["Handle"] }, alloc);
+    let handle = names.path(account, Namespace::Types, Written { kind: PathKind::Plain, segments: &["Handle"] }, bump.alloc());
     assert!(handle.is_ok(), "`Handle` resolves in `account` (the impl header's path): {:?}; errors {:?}", handle.err(), errors(user));
     assert_eq!(attr_runs, 1, "the attribute macro `derive_where` runs once");
     assert_eq!(errors(user), Vec::<String>::new(), "no call in error");

@@ -476,7 +476,7 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
                     stack.push(i);
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) => stack.extend_from_slice(self.list(l)?),
+                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => stack.extend_from_slice(self.list(l)?),
                 PNode::Adt(k, l) => {
                     n += self.adt_positions(k)?;
                     stack.extend_from_slice(self.list(l)?);
@@ -857,7 +857,7 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
                 (lf::TypeRef::Pat { base, .. }, PNode::Pat(pi, _)) => {
                     work.push(Pair { syn: Syn::Ty(base), ty: pi, base: p.base, ctx: Ctx::Other });
                 }
-                (lf::TypeRef::Tuple(l), PNode::Tuple(pl)) => {
+                (lf::TypeRef::Tuple(l), PNode::Tuple(pl)) | (lf::TypeRef::Union(l), PNode::Union(pl)) => {
                     let ids = v.ids(l)?;
                     let elems = self.list(pl)?;
                     if ids.len() != elems.len() {

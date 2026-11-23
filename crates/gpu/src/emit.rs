@@ -302,7 +302,7 @@ pub fn emit_msl(module: &ShaderModule<'_>, out: &mut dyn Write) -> fmt::Result {
         }
         writeln!(out, ") {{")?;
         for stmt in helper.body {
-            write_msl_stmt(out, None, stmt, 1)?;
+            write_stmt(ShaderLang::Msl, out, None, stmt, 1)?;
         }
         writeln!(out, "}}\n")?;
     }
@@ -400,7 +400,7 @@ pub fn emit_msl(module: &ShaderModule<'_>, out: &mut dyn Write) -> fmt::Result {
 
         writeln!(out, ") {{")?;
         for stmt in entry.body {
-            write_msl_stmt(out, Some(d), stmt, 1)?;
+            write_stmt(ShaderLang::Msl, out, Some(d), stmt, 1)?;
         }
         writeln!(out, "}}\n")?;
     }
@@ -470,33 +470,66 @@ fn write_indent(out: &mut dyn Write, depth: usize) -> fmt::Result {
     Ok(())
 }
 
-fn write_msl_stmt(out: &mut dyn Write, desc: Option<&EntryDesc>, stmt: &IrStmt<'_>, depth: usize) -> fmt::Result {
+#[derive(Copy, Clone)]
+enum ShaderLang {
+    Msl,
+    Wgsl,
+}
+
+impl ShaderLang {
+    fn write_expr(self, out: &mut dyn Write, desc: Option<&EntryDesc>, expr: &IrExpr<'_>) -> fmt::Result {
+        match self {
+            Self::Msl => write_msl_expr(out, desc, expr),
+            Self::Wgsl => write_wgsl_expr(out, expr),
+        }
+    }
+}
+
+fn write_stmt(
+    lang: ShaderLang,
+    out: &mut dyn Write,
+    desc: Option<&EntryDesc>,
+    stmt: &IrStmt<'_>,
+    depth: usize,
+) -> fmt::Result {
     write_indent(out, depth)?;
     match stmt {
         IrStmt::Let { name, ty, mutable, init } => {
-            if !*mutable {
-                write!(out, "const ")?;
+            match lang {
+                ShaderLang::Msl => {
+                    if !*mutable {
+                        write!(out, "const ")?;
+                    }
+                    match ty {
+                        Some(t) => write_msl_ty(out, *t)?,
+                        None => write!(out, "auto")?,
+                    }
+                    write!(out, " {name}")?;
+                }
+                ShaderLang::Wgsl => {
+                    write!(out, "{} {name}", if *mutable { "var" } else { "let" })?;
+                    if let Some(t) = ty {
+                        write!(out, ": ")?;
+                        write_wgsl_ty(out, *t)?;
+                    }
+                }
             }
-            match ty {
-                Some(t) => write_msl_ty(out, *t)?,
-                None => write!(out, "auto")?,
-            }
-            write!(out, " {name} = ")?;
-            write_msl_expr(out, desc, init)?;
+            write!(out, " = ")?;
+            lang.write_expr(out, desc, init)?;
             writeln!(out, ";")
         }
         IrStmt::Assign { target, value } => {
-            write_msl_expr(out, desc, target)?;
+            lang.write_expr(out, desc, target)?;
             write!(out, " = ")?;
-            write_msl_expr(out, desc, value)?;
+            lang.write_expr(out, desc, value)?;
             writeln!(out, ";")
         }
         IrStmt::If { cond, then_body, else_body } => {
             write!(out, "if (")?;
-            write_msl_expr(out, desc, cond)?;
+            lang.write_expr(out, desc, cond)?;
             writeln!(out, ") {{")?;
             for s in *then_body {
-                write_msl_stmt(out, desc, s, depth + 1)?;
+                write_stmt(lang, out, desc, s, depth + 1)?;
             }
             write_indent(out, depth)?;
             if else_body.is_empty() {
@@ -504,44 +537,56 @@ fn write_msl_stmt(out: &mut dyn Write, desc: Option<&EntryDesc>, stmt: &IrStmt<'
             } else {
                 writeln!(out, "}} else {{")?;
                 for s in *else_body {
-                    write_msl_stmt(out, desc, s, depth + 1)?;
+                    write_stmt(lang, out, desc, s, depth + 1)?;
                 }
                 write_indent(out, depth)?;
                 writeln!(out, "}}")
             }
         }
         IrStmt::ForRange { var, start, end, body } => {
-            write!(out, "for (uint {var} = ")?;
-            write_msl_expr(out, desc, start)?;
+            match lang {
+                ShaderLang::Msl => write!(out, "for (uint {var} = ")?,
+                ShaderLang::Wgsl => write!(out, "for (var {var}: u32 = ")?,
+            }
+            lang.write_expr(out, desc, start)?;
             write!(out, "; {var} < ")?;
-            write_msl_expr(out, desc, end)?;
-            writeln!(out, "; {var} += 1u) {{")?;
+            lang.write_expr(out, desc, end)?;
+            match lang {
+                ShaderLang::Msl => writeln!(out, "; {var} += 1u) {{")?,
+                ShaderLang::Wgsl => writeln!(out, "; {var} = {var} + 1u) {{")?,
+            }
             for s in *body {
-                write_msl_stmt(out, desc, s, depth + 1)?;
+                write_stmt(lang, out, desc, s, depth + 1)?;
             }
             write_indent(out, depth)?;
             writeln!(out, "}}")
         }
         IrStmt::While { cond, body } => {
             write!(out, "while (")?;
-            write_msl_expr(out, desc, cond)?;
+            lang.write_expr(out, desc, cond)?;
             writeln!(out, ") {{")?;
             for s in *body {
-                write_msl_stmt(out, desc, s, depth + 1)?;
+                write_stmt(lang, out, desc, s, depth + 1)?;
             }
             write_indent(out, depth)?;
             writeln!(out, "}}")
         }
-        IrStmt::WorkgroupBarrier => writeln!(out, "threadgroup_barrier(mem_flags::mem_threadgroup);"),
-        IrStmt::Discard => writeln!(out, "discard_fragment();"),
+        IrStmt::WorkgroupBarrier => match lang {
+            ShaderLang::Msl => writeln!(out, "threadgroup_barrier(mem_flags::mem_threadgroup);"),
+            ShaderLang::Wgsl => writeln!(out, "workgroupBarrier();"),
+        },
+        IrStmt::Discard => match lang {
+            ShaderLang::Msl => writeln!(out, "discard_fragment();"),
+            ShaderLang::Wgsl => writeln!(out, "discard;"),
+        },
         IrStmt::Return(None) => writeln!(out, "return;"),
         IrStmt::Return(Some(e)) => {
             write!(out, "return ")?;
-            write_msl_expr(out, desc, e)?;
+            lang.write_expr(out, desc, e)?;
             writeln!(out, ";")
         }
         IrStmt::Expr(e) => {
-            write_msl_expr(out, desc, e)?;
+            lang.write_expr(out, desc, e)?;
             writeln!(out, ";")
         }
     }
@@ -781,7 +826,7 @@ pub fn emit_wgsl(module: &ShaderModule<'_>, out: &mut dyn Write) -> fmt::Result 
         }
         writeln!(out, " {{")?;
         for stmt in helper.body {
-            write_wgsl_stmt(out, stmt, 1)?;
+            write_stmt(ShaderLang::Wgsl, out, None, stmt, 1)?;
         }
         writeln!(out, "}}\n")?;
     }
@@ -837,7 +882,7 @@ pub fn emit_wgsl(module: &ShaderModule<'_>, out: &mut dyn Write) -> fmt::Result 
         }
         writeln!(out, " {{")?;
         for stmt in entry.body {
-            write_wgsl_stmt(out, stmt, 1)?;
+            write_stmt(ShaderLang::Wgsl, out, None, stmt, 1)?;
         }
         writeln!(out, "}}\n")?;
     }
@@ -893,81 +938,6 @@ fn write_wgsl_ty(out: &mut dyn Write, ty: IrTy) -> fmt::Result {
             write!(out, "array<")?;
             write_wgsl_ty(out, *elem)?;
             write!(out, ", {n}>")
-        }
-    }
-}
-
-fn write_wgsl_stmt(out: &mut dyn Write, stmt: &IrStmt<'_>, depth: usize) -> fmt::Result {
-    write_indent(out, depth)?;
-    match stmt {
-        IrStmt::Let { name, ty, mutable, init } => {
-            write!(out, "{} {name}", if *mutable { "var" } else { "let" })?;
-            if let Some(t) = ty {
-                write!(out, ": ")?;
-                write_wgsl_ty(out, *t)?;
-            }
-            write!(out, " = ")?;
-            write_wgsl_expr(out, init)?;
-            writeln!(out, ";")
-        }
-        IrStmt::Assign { target, value } => {
-            write_wgsl_expr(out, target)?;
-            write!(out, " = ")?;
-            write_wgsl_expr(out, value)?;
-            writeln!(out, ";")
-        }
-        IrStmt::If { cond, then_body, else_body } => {
-            write!(out, "if (")?;
-            write_wgsl_expr(out, cond)?;
-            writeln!(out, ") {{")?;
-            for s in *then_body {
-                write_wgsl_stmt(out, s, depth + 1)?;
-            }
-            write_indent(out, depth)?;
-            if else_body.is_empty() {
-                writeln!(out, "}}")
-            } else {
-                writeln!(out, "}} else {{")?;
-                for s in *else_body {
-                    write_wgsl_stmt(out, s, depth + 1)?;
-                }
-                write_indent(out, depth)?;
-                writeln!(out, "}}")
-            }
-        }
-        IrStmt::ForRange { var, start, end, body } => {
-            write!(out, "for (var {var}: u32 = ")?;
-            write_wgsl_expr(out, start)?;
-            write!(out, "; {var} < ")?;
-            write_wgsl_expr(out, end)?;
-            writeln!(out, "; {var} = {var} + 1u) {{")?;
-            for s in *body {
-                write_wgsl_stmt(out, s, depth + 1)?;
-            }
-            write_indent(out, depth)?;
-            writeln!(out, "}}")
-        }
-        IrStmt::While { cond, body } => {
-            write!(out, "while (")?;
-            write_wgsl_expr(out, cond)?;
-            writeln!(out, ") {{")?;
-            for s in *body {
-                write_wgsl_stmt(out, s, depth + 1)?;
-            }
-            write_indent(out, depth)?;
-            writeln!(out, "}}")
-        }
-        IrStmt::WorkgroupBarrier => writeln!(out, "workgroupBarrier();"),
-        IrStmt::Discard => writeln!(out, "discard;"),
-        IrStmt::Return(None) => writeln!(out, "return;"),
-        IrStmt::Return(Some(e)) => {
-            write!(out, "return ")?;
-            write_wgsl_expr(out, e)?;
-            writeln!(out, ";")
-        }
-        IrStmt::Expr(e) => {
-            write_wgsl_expr(out, e)?;
-            writeln!(out, ";")
         }
     }
 }

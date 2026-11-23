@@ -55,11 +55,36 @@ impl RootFiles for NoPackages {
     }
 }
 
-/// The child: when the attempt variable is set, read the file it names and say what the OS
-/// answered. Otherwise nothing (it is also run as an ordinary test).
+/// The child: when `ATTEMPT` is set, runs a special mode (`@burn`, `@spawn_burn`, `@noop`,
+/// `@rapid_children`) or reads the path it names and prints what the OS answered. Otherwise
+/// nothing (it is also run as an ordinary test).
 #[test]
 fn hostile_child() {
     let Ok(path) = std::env::var(ATTEMPT) else { return };
+    match path.as_str() {
+        "@burn" => {
+            let mut acc: u64 = 0;
+            loop {
+                acc = core::hint::black_box(acc.wrapping_add(1));
+            }
+        }
+        "@spawn_burn" => {
+            let exe = this_binary();
+            let mut child = Command::new(exe).args(CHILD_ARGS).env_clear().env(ATTEMPT, "@burn").spawn().unwrap();
+            let _ = child.wait();
+            return;
+        }
+        "@noop" => return,
+        "@rapid_children" => {
+            let exe = this_binary();
+            for _ in 0..24 {
+                let status = Command::new(&exe).args(CHILD_ARGS).env_clear().env(ATTEMPT, "@noop").status().unwrap();
+                assert!(status.success(), "noop child exited {status:?}");
+            }
+            return;
+        }
+        _ => {}
+    }
     let said = match std::fs::read(&path) {
         Ok(_) => String::from("D177 READ OK"),
         Err(error) => std::format!("D177 READ REFUSED {:?}", error.kind()),
@@ -155,6 +180,22 @@ fn said(output: &std::process::Output, confinement: &str) -> String {
     lines[0].into()
 }
 
+/// Native world helper shared by macOS process tests (no duplicated `std` / `Vec` sites).
+#[cfg(target_os = "macos")]
+fn native_io(out: &str) -> crate::io::Io {
+    crate::io::Io::native(crate::io::NativeWorld {
+        root: Path::new(out),
+        threads: 1,
+        env: crate::env::Vars::given(StdVec::new()),
+        args: crate::args::ArgList::given(StdVec::new()),
+        host_name: std::sync::Arc::from(""),
+        seed: Some(0),
+        above: 0,
+        limits: crate::io::Limits::USUAL,
+    })
+    .expect("a native world over the test's folder")
+}
+
 /// `program` run through the SHIPPED path, [`super::Hermetic::run`] (the plan, the profile,
 /// `sandbox-exec` started by blaze-core's linked start, the port's pipes, meter and wait), with
 /// `reads` each a tree root and the folder's `out/` the output root and working folder: its
@@ -171,17 +212,7 @@ fn run_shipped(folder: &Folder, program: &str, args: &[&str], env: &[(&str, &str
     let roots = Roots::new(&list).unwrap();
     let mut mounts: StdVec<Mount<'_>> = reads.iter().enumerate().map(|(at, path)| Mount { spelling: path.as_bytes(), root: RootId(at as u8) }).collect();
     mounts.push(Mount { spelling: out.as_bytes(), root: RootId(reads.len() as u8) });
-    let io = crate::io::Io::native(crate::io::NativeWorld {
-        root: Path::new(&out),
-        threads: 1,
-        env: crate::env::Vars::given(StdVec::new()),
-        args: crate::args::ArgList::given(StdVec::new()),
-        host_name: std::sync::Arc::from(""),
-        seed: Some(0),
-        above: 0,
-        limits: crate::io::Limits::USUAL,
-    })
-    .expect("a native world over the test's folder");
+    let io = native_io(&out);
     let spawner = io.need_host().and_then(|host| host.spawner()).expect("a native world's spawner");
     let clock = io.need_clock().expect("a native world's clock");
     let cx = io.cx(Duration::from_secs(120), crate::mem::TASK_FRAME).expect("a test's root frame");
@@ -236,6 +267,86 @@ blaze_sim::kind_test! {
         let said = run_shipped(&folder, &exe, &CHILD_ARGS, &[(ATTEMPT, inside.as_str())], &[], &[inside_folder.as_str()]);
         let words: StdVec<&str> = said.lines().filter_map(marked).collect();
         assert_eq!(words, ["D177 READ OK"], "this binary said {said:?}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+blaze_sim::kind_test! {
+    /// Process-group metering and `ESRCH` exit-race safety on macOS:
+    /// 1. An idle sandboxed parent spawning a CPU-burning child must be stopped by `Over::Cpu`
+    ///    (proving `proc_listpgrppids` + group rusage meters helpers, not only the leader).
+    /// 2. A sandboxed parent rapidly spawning and reaping short-lived children across many meter
+    ///    ticks must complete cleanly with exit 0 (proving `ESRCH` on exiting PIDs never aborts).
+    process fn seatbelt_meters_child_cpu_and_handles_rapid_exit() {
+        let folder = Folder::new("meter-group");
+        let out = folder.path("out");
+        let exe = this_binary();
+        let list = [Root { name: "out", kind: RootKind::Output }];
+        let roots = Roots::new(&list).unwrap();
+        let mounts = [Mount { spelling: out.as_bytes(), root: RootId(0) }];
+        let io = native_io(&out);
+        let spawner = io.need_host().and_then(|host| host.spawner()).expect("a native world's spawner");
+        let clock = io.need_clock().expect("a native world's clock");
+        let cx = io.cx(Duration::from_secs(60), crate::mem::TASK_FRAME).expect("a test's root frame");
+        let hermetic = super::Hermetic::new(super::HermeticCapOpts {
+            spawner,
+            clock: io.need_clock().expect("a native world's clock"),
+        });
+
+        // 1. Idle parent spawns a CPU-burning child: group metering stops it with Over::Cpu well
+        //    before the 10-second wall deadline.
+        let burn_env = [(ATTEMPT, "@spawn_burn")];
+        let burn_spec = HermeticSpec::new(HermeticOpts {
+            program: Program::Stored { name: &exe, digest: Digest([6; 32]), path: &exe },
+            args: &CHILD_ARGS,
+            env: &burn_env,
+            roots,
+            mounts: &mounts,
+            cwd: &out,
+            helpers: &[],
+            helper_folders: &[],
+            channels: &[],
+            clock: ClockSpec::NeverAsks,
+            seed: 0,
+            budget: Budget { cpu: Duration::from_millis(80), memory: 1 << 32, steps: None },
+            deadline: Deadline::after(clock.now().since_start(), Duration::from_secs(10)),
+            streams: HermeticStreams { stdout: Capture::Keep { most: 1 << 16 }, stderr: Capture::Keep { most: 1 << 16 } },
+            level: Level::Inputs,
+            report: ReportSpec::WholeRoots,
+        })
+        .unwrap();
+        let err = hermetic.run(&cx, &burn_spec, &NoPackages, heap()).err().expect("CPU-burning child must hit budget");
+        assert!(
+            matches!(err.fault, Fault::Stopped(super::Stop::Budget(super::Over::Cpu { .. }))),
+            "expected Over::Cpu from child CPU metering, got {err}"
+        );
+
+        // 2. Rapidly spawning/exiting short-lived children across many meter intervals must not
+        //    trip ESRCH errors.
+        let rapid_env = [(ATTEMPT, "@rapid_children")];
+        let rapid_spec = HermeticSpec::new(HermeticOpts {
+            program: Program::Stored { name: &exe, digest: Digest([7; 32]), path: &exe },
+            args: &CHILD_ARGS,
+            env: &rapid_env,
+            roots,
+            mounts: &mounts,
+            cwd: &out,
+            helpers: &[],
+            helper_folders: &[],
+            channels: &[],
+            clock: ClockSpec::NeverAsks,
+            seed: 0,
+            budget: Budget { cpu: Duration::from_secs(10), memory: 1 << 32, steps: None },
+            deadline: Deadline::after(clock.now().since_start(), Duration::from_secs(30)),
+            streams: HermeticStreams { stdout: Capture::Keep { most: 1 << 16 }, stderr: Capture::Keep { most: 1 << 16 } },
+            level: Level::Inputs,
+            report: ReportSpec::WholeRoots,
+        })
+        .unwrap();
+        let ran = hermetic
+            .run(&cx, &rapid_spec, &NoPackages, heap())
+            .unwrap_or_else(|error| panic!("rapid child exit must not fail metering: {error}"));
+        assert_eq!(ran.exit, crate::procs::Exit::Exited(0));
     }
 }
 

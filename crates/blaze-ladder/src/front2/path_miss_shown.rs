@@ -28,12 +28,17 @@ fn refused_call<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, call: blaze_id::
         tc::Refusal::UnknownEnv => "an `env!` of a variable this build could not answer".to_string(),
         tc::Refusal::BuildScriptOutputs => "`env!(\"OUT_DIR\")` of a package whose build script's outputs are missing (the build script has not run)".to_string(),
         tc::Refusal::Expansion => {
-            let alloc = blaze_own::Alloc::global();
-            match r.names.failed_call(call, alloc) {
-                Some(row) if row.implicit => format!("the implicit `#[{}]` over `fn main` in {} failed: {}", row.path, row.file, row.why),
-                Some(row) => format!("the call of `{}` ({}) in {} failed: {}", row.path, row.shape.name(), row.file, row.why),
-                None => format!("macro call {call:x} failed, and the records hold no row of it (blaze-scope names_record.rs `refused_row`)"),
-            }
+            let row = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).ok().and_then(|frame| {
+                let erased = blaze_own::Erased::new(&frame);
+                r.names.failed_call(call, erased.bump()).map(|row| {
+                    if row.implicit {
+                        format!("the implicit `#[{}]` over `fn main` in {} failed: {}", row.path, row.file, row.why)
+                    } else {
+                        format!("the call of `{}` ({}) in {} failed: {}", row.path, row.shape.name(), row.file, row.why)
+                    }
+                })
+            });
+            row.unwrap_or_else(|| format!("macro call {call:x} failed, and the records hold no row of it (blaze-scope names_record.rs `refused_row`)"))
         }
     }
 }

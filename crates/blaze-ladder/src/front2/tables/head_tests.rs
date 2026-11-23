@@ -216,17 +216,20 @@ fn world() -> (Src, Option<LibKey>, &'static blaze_mem::Frame) {
 
 /// [`world`] over `app` as the app's text.
 pub(crate) fn world_of(app: &'static str) -> (Src, Option<LibKey>, &'static blaze_mem::Frame) {
+    let g = a();
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the records reader's frame");
+    let frame: &'static blaze_mem::Frame = blaze_own::Box::leak_static(blaze_own::Box::new_in(frame, g));
+    let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
     let crates = [input("app", "/app/lib.rs", &[("core", CORE_AT)]), input("core", "/core/lib.rs", &[])];
     let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, bstd: None };
-    let solved = resolve_crates(&crates, sysroot, &Texts { app }, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
-    let solved: &'static Names<'static> = blaze_own::Box::leak(blaze_own::Box::new_in(solved, a()));
-    let g = a();
+    let solved = resolve_crates(&crates, sysroot, &Texts { app }, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let solved: &'static Names<'static> = blaze_own::Box::leak_static(blaze_own::Box::new_in(solved, g));
     let mut kept = Kept { names: AVec::new_in(g), items: AVec::new_in(g), files: AVec::new_in(g), expansions: AVec::new_in(g) };
     let mut crate_names: AVec<'static, &'static str> = AVec::new_in(g);
     let mut crate_keys: AVec<'static, CrateItemKey> = AVec::new_in(g);
     for c in solved.crates().iter() {
-        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));
-        kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
+        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), bump));
+        kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), bump));
         let mut files = AVec::new_in(g);
         files.extend(c.files.iter().map(|f| (f.package.as_str(), f.text)));
         kept.files.push(files);
@@ -237,11 +240,9 @@ pub(crate) fn world_of(app: &'static str) -> (Src, Option<LibKey>, &'static blaz
         crate_names.push(c.name);
         crate_keys.push(c.key);
     }
-    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the records reader's frame");
-    let frame: &'static blaze_mem::Frame = blaze_own::Box::leak(blaze_own::Box::new_in(frame, g));
-    let log: &'static Log<'static> = blaze_own::Box::leak(blaze_own::Box::new_in(Log::new(crate_names.leak(), g), g));
-    let load: &'static Kept = blaze_own::Box::leak(blaze_own::Box::new_in(kept, g));
-    let names: Src = blaze_own::Box::leak(blaze_own::Box::new_in(Records::new(crate_keys.leak(), load, log, frame, g), g));
+    let log: &'static Log<'static> = blaze_own::Box::leak_static(blaze_own::Box::new_in(Log::new(crate_names.leak_static(), g), g));
+    let load: &'static Kept = blaze_own::Box::leak_static(blaze_own::Box::new_in(kept, g));
+    let names: Src = blaze_own::Box::leak_static(blaze_own::Box::new_in(Records::new(crate_keys.leak_static(), load, log, frame, g), g));
     let mut sized = None;
     NamesSource::each_lang(names, CORE_AT, &mut |name, key| {
         if name == "sized" {
@@ -979,7 +980,7 @@ fn edited(from: &'static str, old: &str, new: &str) -> &'static str {
     v.extend_from_slice(from[..at].as_bytes());
     v.extend_from_slice(new.as_bytes());
     v.extend_from_slice(from[at + old.len()..].as_bytes());
-    core::str::from_utf8(v.leak()).expect("an edit of UTF-8 by UTF-8")
+    core::str::from_utf8(v.leak_static()).expect("an edit of UTF-8 by UTF-8")
 }
 
 /// D148 across stores (tempo: 9,115 bodies refused `[NoHead]`, every callee whose head came

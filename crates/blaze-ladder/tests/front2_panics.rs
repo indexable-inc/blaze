@@ -69,7 +69,7 @@ fn panics_through_front2() {
     let user = UserCrate { name: "pnc", dir: "/pnc/", root: "/pnc/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let core_ix = crates.iter().position(|c| c.name == "core").expect("core among the crates");
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
@@ -82,7 +82,7 @@ fn panics_through_front2() {
             .map(|d| d.key)
             .unwrap_or_else(|| panic!("`{segments:?}` from crate {krate}'s root"))
     };
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut buckets = None;
     let mut failed: Vec<String> = Vec::new();
     let mut clean: Vec<String> = Vec::new();

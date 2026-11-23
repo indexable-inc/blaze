@@ -2673,38 +2673,31 @@ impl fmt::Display for PackageRunError<'_> {
     }
 }
 
-/// `text` copied into `alloc`, borrowed for its life.
-fn kept<'a>(text: &str, alloc: Alloc<'a>) -> &'a str {
-    let bytes: &'a [u8] = Vec::from_slice_in(text.as_bytes(), alloc).leak();
-    // A copy of a `str`'s bytes is UTF-8: the check cannot fail.
-    core::str::from_utf8(bytes).unwrap_or_default()
-}
-
 /// The run place of the crate whose environment's facts are `facts` (the crate list's
-/// `env_facts` of its row) in the checkout whose absolute root is `checkout`, in `alloc`
+/// `env_facts` of its row) in the checkout whose absolute root is `checkout`, in `bump`
 /// ([`PackageRun`]). Sans-IO: the root is read at the edge (engine_check.rs `Served::root_text`).
-pub(crate) fn package_run<'a>(checkout: Option<&str>, facts: blaze_scope::crate_env::EnvFacts<'a>, alloc: Alloc<'a>) -> Result<PackageRun<'a>, PackageRunError<'a>> {
+pub(crate) fn package_run<'a>(checkout: Option<&str>, facts: blaze_scope::crate_env::EnvFacts<'a>, bump: blaze_own::Bump<'a>) -> Result<PackageRun<'a>, PackageRunError<'a>> {
     let krate = facts.crate_name;
     let blaze_scope::crate_env::SeenRoot::Member { dir: member } = facts.seen else { return Err(PackageRunError::NotMember { krate }) };
     let Some(root) = checkout else { return Err(PackageRunError::NoRoot { krate }) };
-    let mut dir: AString<'a> = AString::from_str_in(root.trim_end_matches('/'), alloc);
+    let mut dir: String<blaze_own::Bump<'a>> = String::from_str_in(root.trim_end_matches('/'), bump);
     if !member.is_empty() {
         dir.push_str("/");
         dir.push_str(member);
     }
-    let mut manifest: AString<'a> = AString::from_str_in(dir.as_str(), alloc);
+    let mut manifest: String<blaze_own::Bump<'a>> = String::from_str_in(dir.as_str(), bump);
     manifest.push_str("/Cargo.toml");
-    let env = blaze_scope::crate_env::CrateEnv::of(facts, alloc).map_err(PackageRunError::Env)?;
-    let dir = kept(dir.as_str(), alloc);
-    let mut vars: AVec<'a, (&'a str, &'a str)> = Vec::new_in(alloc);
+    let env = blaze_scope::crate_env::CrateEnv::of(facts, bump.alloc()).map_err(PackageRunError::Env)?;
+    let dir: &'a str = dir.into_bump_str();
+    let mut vars: Vec<(&'a str, &'a str), blaze_own::Bump<'a>> = Vec::new_in(bump);
     vars.push(("CARGO_MANIFEST_DIR", dir));
-    vars.push(("CARGO_MANIFEST_PATH", kept(manifest.as_str(), alloc)));
+    vars.push(("CARGO_MANIFEST_PATH", manifest.into_bump_str()));
     // The package's own facts; a build script's `rustc-env` pairs are the compile's alone.
     for (name, value) in env.vars().filter(|(name, _)| name.starts_with("CARGO_PKG_")) {
-        vars.push((kept(name, alloc), kept(value, alloc)));
+        vars.push((bump.alloc_str(name), bump.alloc_str(value)));
     }
     vars.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    let vars: &'a [(&'a str, &'a str)] = vars.leak();
+    let vars: &'a [(&'a str, &'a str)] = vars.into_bump_slice();
     Ok(PackageRun { dir, vars })
 }
 
@@ -2942,6 +2935,7 @@ fn run_selected<'h>(
     let mut runner = Runner::new(zygotes, &config.plan, TestHost::THIS, alloc);
     let mut unkept = Unkept::default();
     let mut print = |bytes: &[u8]| -> Result<(), DriveError> {
+        watch.see(blaze_screen::Step::Says);
         for chunk in bytes.utf8_chunks() {
             out.write(&cx, chunk.valid()).map_err(|_| DriveError::Print)?;
             if !chunk.invalid().is_empty() {
@@ -2950,7 +2944,9 @@ fn run_selected<'h>(
         }
         Ok(())
     };
+    watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Testing));
     let status = drive(config, rows, &owners, filtered, &mut runner, &mut refuse, &mut unkept, &mut print, alloc);
+    watch.see(blaze_screen::Step::Says);
     // A run that stopped in blaze: ONE line naming the test, what failed and its cause, then
     // the command's own error (`OneStopped`) says the line above is why (rule 19). The
     // runner's `Seam` error says only that one stopped, so it is not shown.
@@ -3015,9 +3011,12 @@ mod package_run_tests {
     /// are refused by name.
     #[test]
     fn a_members_tests_run_in_its_package_root_told_its_package() {
-        let alloc = blaze_own::testing::heap().alloc();
+        let frame = Frame::new(bstd::mem::Tag::Other).expect("a frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let alloc = bump.alloc();
         let member = SeenRoot::Member { dir: "crates/hardfork" };
-        let run = package_run(Some("/w/tempo/"), facts(member), alloc).unwrap_or_else(|why| panic!("{why}"));
+        let run = package_run(Some("/w/tempo/"), facts(member), bump).unwrap_or_else(|why| panic!("{why}"));
         assert_eq!(run.dir, "/w/tempo/crates/hardfork", "the package's root under the checkout");
         assert_eq!(get(&run, "CARGO_MANIFEST_DIR"), Some("/w/tempo/crates/hardfork"));
         assert_eq!(get(&run, "CARGO_MANIFEST_PATH"), Some("/w/tempo/crates/hardfork/Cargo.toml"));
@@ -3032,10 +3031,10 @@ mod package_run_tests {
         let seen = compiled.get("CARGO_MANIFEST_DIR").unwrap_or_else(|_| panic!("known")).unwrap_or_else(|| panic!("set"));
         assert_ne!(Some(seen), get(&run, "CARGO_MANIFEST_DIR"), "planted: the compile's value would send a test's reads to {seen}");
 
-        let root = package_run(Some("/w/one"), facts(SeenRoot::Member { dir: "" }), alloc).unwrap_or_else(|why| panic!("{why}"));
+        let root = package_run(Some("/w/one"), facts(SeenRoot::Member { dir: "" }), bump).unwrap_or_else(|why| panic!("{why}"));
         assert_eq!(root.dir, "/w/one", "the workspace's root package runs in the checkout's root");
-        assert!(matches!(package_run(Some("/w/one"), facts(SeenRoot::Package), alloc), Err(PackageRunError::NotMember { krate: "tempo_hardfork" })));
-        assert!(matches!(package_run(None, facts(member), alloc), Err(PackageRunError::NoRoot { krate: "tempo_hardfork" })));
+        assert!(matches!(package_run(Some("/w/one"), facts(SeenRoot::Package), bump), Err(PackageRunError::NotMember { krate: "tempo_hardfork" })));
+        assert!(matches!(package_run(None, facts(member), bump), Err(PackageRunError::NoRoot { krate: "tempo_hardfork" })));
     }
 }
 

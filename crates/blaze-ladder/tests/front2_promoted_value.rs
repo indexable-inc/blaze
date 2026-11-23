@@ -81,7 +81,7 @@ fn a_promoted_borrow_evaluates_to_its_operand() {
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
     let mut front = Front2::new(&names, &frame, &files, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
@@ -90,7 +90,7 @@ fn a_promoted_borrow_evaluates_to_its_operand() {
         .and_then(|f| f.whole(1))
         .map(|d| d.key)
         .unwrap_or_else(|| panic!("`pick` from the crate root"));
-    let prepared = Prepares::new_in(heap.alloc());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut buckets = None;
     store.ensure(&names, &mut front.keys, Want::Fn(pick)).unwrap_or_else(|e| panic!("pick's head: {e:?}"));
     let owner = front.keys.item(pick).unwrap_or_else(|_| panic!("pick's checker key"));

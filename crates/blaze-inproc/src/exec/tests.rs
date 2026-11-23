@@ -594,8 +594,7 @@ fn jit_pool_atomic_tier_up_trampoline_executes() {
 
 #[test]
 fn jit_pool_concurrent_tier_up_under_load() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     let mut pool = JitPool::new(64 * 1024).unwrap();
     let t0 = pool.emit(&emit_ret_u32(10)).unwrap();
@@ -605,14 +604,14 @@ fn jit_pool_concurrent_tier_up_under_load() {
 
     let slot = pool.alloc_tier_slot(t0).unwrap();
     let stub_addr = pool.tier_slot_address(slot);
-    let stop = Arc::new(AtomicBool::new(false));
-    let seen_mask = Arc::new(AtomicU64::new(0));
+    let stop = AtomicBool::new(false);
+    let seen_mask = AtomicU64::new(0);
+    let started = AtomicBool::new(false);
 
-    let reader = {
-        let stop = Arc::clone(&stop);
-        let seen_mask = Arc::clone(&seen_mask);
-        std::thread::spawn(move || {
+    let iters = std::thread::scope(|s| {
+        let reader = s.spawn(|| {
             let mut iters = 0u64;
+            started.store(true, Ordering::Release);
             while !stop.load(Ordering::Relaxed) || iters < 1000 {
                 let v = call(stub_addr);
                 let bit = match v {
@@ -626,21 +625,34 @@ fn jit_pool_concurrent_tier_up_under_load() {
                 iters += 1;
             }
             iters
-        })
-    };
+        });
 
-    let host_a = host_tier_fn_a as *const () as usize as u64;
-    for round in 0..200 {
-        match round % 4 {
-            0 => pool.retarget(slot, t1).unwrap(),
-            1 => pool.retarget(slot, t2).unwrap(),
-            2 => pool.retarget_address(slot, host_a).unwrap(),
-            _ => pool.retarget(slot, t0).unwrap(),
+        // Wait for the reader thread to enter its call loop before retargeting so on many-core
+        // hosts the 200 rounds don't all finish before the reader observes a single tier.
+        while !started.load(Ordering::Acquire) || seen_mask.load(Ordering::Relaxed) == 0 {
+            core::hint::spin_loop();
         }
-        std::thread::yield_now();
-    }
-    stop.store(true, Ordering::Relaxed);
-    let iters = reader.join().unwrap();
+        let host_a = host_tier_fn_a as *const () as usize as u64;
+        for round in 0..200 {
+            match round % 4 {
+                0 => pool.retarget(slot, t1).unwrap(),
+                1 => pool.retarget(slot, t2).unwrap(),
+                2 => pool.retarget_address(slot, host_a).unwrap(),
+                _ => pool.retarget(slot, t0).unwrap(),
+            }
+            if round == 0 {
+                let mut spins = 0u32;
+                while seen_mask.load(Ordering::Relaxed).count_ones() < 2 && spins < 1_000_000 {
+                    core::hint::spin_loop();
+                    spins += 1;
+                }
+            } else {
+                core::hint::spin_loop();
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap()
+    });
     assert!(iters >= 1000);
     // The reader must have observed at least two distinct tiers without any fault.
     assert!(seen_mask.load(Ordering::Relaxed).count_ones() >= 2);

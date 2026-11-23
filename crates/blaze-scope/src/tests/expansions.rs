@@ -118,7 +118,7 @@ impl Kept for Sets {
     }
 
     fn expansions_made(&self, krate: usize, set: &[u8]) {
-        self.sets.lock().unwrap_or_else(|p| panic!("sets: {p}"))[krate] = Some(aligned(set, Alloc::global()));
+        self.sets.lock().unwrap_or_else(|p| panic!("sets: {p}"))[krate] = Some(aligned(set, super::SyncFrame::leaked()));
     }
 
     fn expansions_planted(&self) -> Planted {
@@ -162,8 +162,10 @@ impl Par for Counting {
 /// One call of [`resolve_kept`] on `texts` with `sets`: what it ran, and each crate's two
 /// records.
 fn solve(crates: &[CrateInput<'static>], texts: &'static Texts, sets: &Sets) -> ((usize, usize, usize), Vec<(Vec<u8>, Vec<u8>)>) {
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
     let counting = Counting::default();
-    let (solved, _) = resolve_kept(crates, Sysroot::default(), texts, &counting, &Ready::serial(WAIT), sets, Alloc::global()).unwrap_or_else(|e| panic!("resolve_kept: {e:?}"));
+    let (solved, _) = resolve_kept(crates, Sysroot::default(), texts, &counting, &Ready::serial(WAIT), sets, erased.bump()).unwrap_or_else(|e| panic!("resolve_kept: {e:?}"));
     let records = solved
         .iter()
         .map(|s| match s {
@@ -175,7 +177,9 @@ fn solve(crates: &[CrateInput<'static>], texts: &'static Texts, sets: &Sets) -> 
 }
 
 fn cold(crates: &[CrateInput<'static>], texts: &'static Texts) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let (solved, _) = resolve_by_records(crates, Sysroot::default(), texts, &Counting::default(), &Ready::serial(WAIT), Alloc::global()).unwrap_or_else(|e| panic!("cold: {e:?}"));
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let (solved, _) = resolve_by_records(crates, Sysroot::default(), texts, &Counting::default(), &Ready::serial(WAIT), erased.bump()).unwrap_or_else(|e| panic!("cold: {e:?}"));
     solved.iter().map(|c| (c.record.to_vec(), c.inner.to_vec())).collect()
 }
 

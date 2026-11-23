@@ -61,7 +61,7 @@ use blaze_build_script::OutputsRef;
 /// The root a crate sees (D96): its home is blaze-expand's `seen`, re-exported for the crates
 /// that make environments.
 pub use blaze_expand::seen::{MemberDirError, SeenRoot};
-use blaze_own::{AString, AVec, Alloc};
+use blaze_own::{AString, AVec, Alloc, BString, Bump};
 use blaze_unit_graph::{PackageMetaVars, UnitGraph, UnitKind};
 
 use crate::units::{Origin, UnitCrates};
@@ -391,24 +391,21 @@ impl<'a> CrateEnv<'a> {
     /// from that second open says the record's bytes are not what opened before. The copy
     /// borrows nothing, so it has no file area (`OutputsRef::area`): [`EnvLent::copy_in`],
     /// whose copy lives inside the lender's borrow, attaches it again.
-    pub fn clone_in<'b>(&self, alloc: Alloc<'b>) -> Result<CrateEnv<'b>, blaze_build_script::outputs::RecordError> {
-        let text = |s: &str| AString::from_str_in(s, alloc);
-        let mut vars: AVec<'b, (AString<'b>, AString<'b>)> = AVec::with_capacity_in(self.vars.len(), alloc);
+    pub fn clone_in<'b>(&self, alloc: Bump<'b>) -> Result<CrateEnv<'b>, blaze_build_script::outputs::RecordError> {
+        let a = alloc.alloc();
+        let text = |s: &str| AString::from_str_in(s, a);
+        let mut vars: AVec<'b, (AString<'b>, AString<'b>)> = AVec::with_capacity_in(self.vars.len(), a);
         vars.extend(self.vars.iter().map(|(n, v)| (text(n.as_str()), text(v.as_str()))));
-        let mut unknown: AVec<'b, &'static str> = AVec::with_capacity_in(self.unknown.len(), alloc);
+        let mut unknown: AVec<'b, &'static str> = AVec::with_capacity_in(self.unknown.len(), a);
         unknown.extend(self.unknown.iter().copied());
         let seen = match self.seen {
             SeenRoot::Package => SeenRoot::Package,
-            SeenRoot::Member { dir } => SeenRoot::Member { dir: blaze_own::Box::leak(text(dir).into_boxed_str()) },
+            SeenRoot::Member { dir } => SeenRoot::Member { dir: alloc.alloc_str(dir) },
         };
         let package = self.package.as_ref().map(|(name, version)| (text(name.as_str()), text(version.as_str())));
         let script = match self.script {
             None => None,
-            Some(record) => {
-                let mut bytes: AVec<'b, u8> = AVec::with_capacity_in(record.bytes().len(), alloc);
-                bytes.extend_from_slice(record.bytes());
-                Some(OutputsRef::open(bytes.leak())?)
-            }
+            Some(record) => Some(OutputsRef::open(alloc.alloc_slice_copy(record.bytes()))?),
         };
         Ok(CrateEnv {
             vars,
@@ -422,7 +419,7 @@ impl<'a> CrateEnv<'a> {
             crate_name: text(self.crate_name.as_str()),
             bin: self.bin.as_ref().map(|bin| text(bin.as_str())),
             build_script: self.build_script,
-            meta: self.meta_in(alloc),
+            meta: self.meta_in(a),
         })
     }
 
@@ -432,10 +429,11 @@ impl<'a> CrateEnv<'a> {
     /// winning as in [`CrateEnv::of`] (so the result equals `of` with `script` in its facts);
     /// `OUT_DIR` no longer unknown; `script` the record its `OUT_DIR` files are read from.
     /// Copied whole into `alloc`, borrowing nothing of `self`.
-    pub fn joined<'b>(&self, script: OutputsRef<'b>, alloc: Alloc<'b>) -> CrateEnv<'b> {
-        let text = |s: &str| AString::from_str_in(s, alloc);
+    pub fn joined<'b>(&self, script: OutputsRef<'b>, alloc: Bump<'b>) -> CrateEnv<'b> {
+        let a = alloc.alloc();
+        let text = |s: &str| AString::from_str_in(s, a);
         // (name, value, the order it was given in): cargo's pairs first, then the script's.
-        let mut given: AVec<'b, (AString<'b>, AString<'b>, u32)> = AVec::with_capacity_in(self.vars.len() + 1, alloc);
+        let mut given: AVec<'b, (AString<'b>, AString<'b>, u32)> = AVec::with_capacity_in(self.vars.len() + 1, a);
         for (name, value) in self.vars.iter() {
             let order = given.len() as u32;
             given.push((text(name.as_str()), text(value.as_str()), order));
@@ -447,18 +445,18 @@ impl<'a> CrateEnv<'a> {
             given.push((text(name), text(value), order));
         }
         given.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()).then(a.2.cmp(&b.2)));
-        let mut vars: AVec<'b, (AString<'b>, AString<'b>)> = AVec::with_capacity_in(given.len(), alloc);
+        let mut vars: AVec<'b, (AString<'b>, AString<'b>)> = AVec::with_capacity_in(given.len(), a);
         for (name, value, _) in given {
             match vars.last_mut() {
                 Some(last) if last.0.as_str() == name.as_str() => last.1 = value,
                 _ => vars.push((name, value)),
             }
         }
-        let mut unknown: AVec<'b, &'static str> = AVec::with_capacity_in(self.unknown.len(), alloc);
+        let mut unknown: AVec<'b, &'static str> = AVec::with_capacity_in(self.unknown.len(), a);
         unknown.extend(self.unknown.iter().copied().filter(|name| *name != "OUT_DIR"));
         let seen = match self.seen {
             SeenRoot::Package => SeenRoot::Package,
-            SeenRoot::Member { dir } => SeenRoot::Member { dir: blaze_own::Box::leak(text(dir).into_boxed_str()) },
+            SeenRoot::Member { dir } => SeenRoot::Member { dir: alloc.alloc_str(dir) },
         };
         let package = self.package.as_ref().map(|(name, version)| (text(name.as_str()), text(version.as_str())));
         CrateEnv {
@@ -473,7 +471,7 @@ impl<'a> CrateEnv<'a> {
             crate_name: text(self.crate_name.as_str()),
             bin: self.bin.as_ref().map(|bin| text(bin.as_str())),
             build_script: self.build_script,
-            meta: self.meta_in(alloc),
+            meta: self.meta_in(a),
         }
     }
 
@@ -560,7 +558,7 @@ impl<'e, 'a> EnvLent<'e, 'a> {
     /// The lent environment copied whole into `alloc` ([`CrateEnv::clone_in`]), its script
     /// record's file area (where an `include!` of a stored file reads it) attached again: the
     /// copy lives inside the lend (`'a: 'b`).
-    pub fn copy_in<'b>(self, alloc: Alloc<'b>) -> Result<CrateEnv<'b>, blaze_build_script::outputs::RecordError>
+    pub fn copy_in<'b>(self, alloc: Bump<'b>) -> Result<CrateEnv<'b>, blaze_build_script::outputs::RecordError>
     where
         'a: 'b,
     {
@@ -579,7 +577,7 @@ impl<'a> UnitCrates<'a> {
     /// ([`crate::units::UnitCrate::shown_from`]) and its build script's joined record. Call it
     /// after `join_scripts`: a unit with a script and no record joined has `OUT_DIR` unknown.
     /// A toolchain crate's `CARGO_PKG_*` are unknown (it has no lock entry).
-    pub fn env_of(&'a self, at: usize, graph: &'a UnitGraph<'_>, alloc: Alloc<'a>) -> Result<CrateEnv<'a>, CrateEnvError<'a>> {
+    pub fn env_of(&'a self, at: usize, graph: &'a UnitGraph<'_>, alloc: Bump<'a>) -> Result<CrateEnv<'a>, CrateEnvError<'a>> {
         let c = self.crates.get(at).ok_or(CrateEnvError::NoCrate { at })?;
         let facts = match c.origin {
             Origin::Unit(id) => {
@@ -621,7 +619,7 @@ impl<'a> UnitCrates<'a> {
                 meta: None,
             },
         };
-        CrateEnv::of(facts, alloc)
+        CrateEnv::of(facts, alloc.alloc())
     }
 }
 
@@ -630,8 +628,8 @@ impl<'a> UnitCrates<'a> {
 /// it, as cargo builds it not), sorted, each once. `krate`: the test or bench asking, named
 /// by the refusal of a name that cannot be one of a list ([`CrateEnvError::BinName`]). The one
 /// source of [`EnvFacts::bin_exes`] for a unit (this file's `env_of`, blaze-world list.rs).
-pub fn package_bins<'a>(graph: &UnitGraph<'_>, package: blaze_manifest::lock::LockId, krate: &'a str, alloc: Alloc<'a>) -> Result<BinNames<'a>, CrateEnvError<'a>> {
-    let mut names: AVec<'_, &str> = AVec::new_in(alloc);
+pub fn package_bins<'a>(graph: &UnitGraph<'_>, package: blaze_manifest::lock::LockId, krate: &'a str, alloc: Bump<'a>) -> Result<BinNames<'a>, CrateEnvError<'a>> {
+    let mut names: AVec<'_, &str> = AVec::new_in(alloc.alloc());
     for unit in graph.units.iter().filter(|unit| unit.package == package && !unit.for_host) {
         if let UnitKind::Bin(name) = &unit.kind {
             names.push(name.as_str());
@@ -639,10 +637,10 @@ pub fn package_bins<'a>(graph: &UnitGraph<'_>, package: blaze_manifest::lock::Lo
     }
     names.sort_unstable();
     names.dedup();
-    let mut joined = AString::new_in(alloc);
+    let mut joined = BString::new_in(alloc);
     for name in names.iter() {
         if name.is_empty() || name.contains('\n') {
-            let name = blaze_own::Box::leak(AString::from_str_in(name, alloc).into_boxed_str());
+            let name = alloc.alloc_str(name);
             return Err(CrateEnvError::BinName { krate, name });
         }
         if !joined.is_empty() {
@@ -651,7 +649,7 @@ pub fn package_bins<'a>(graph: &UnitGraph<'_>, package: blaze_manifest::lock::Lo
         joined.push_str(name);
     }
     // Sorted, each once, none empty or holding a `\n`: `BinNames::new`'s form, checked above.
-    Ok(BinNames(blaze_own::Box::leak(joined.into_boxed_str())))
+    Ok(BinNames(joined.into_bump_str()))
 }
 
 /// `fmt::Write` into an arena string.
@@ -698,8 +696,10 @@ mod tests {
     /// test) has none, though its binaries are named.
     #[test]
     fn an_integration_test_is_told_where_each_binary_of_its_package_is() {
-        let heap = blaze_own::testing::heap();
-        let alloc = heap.alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let alloc = bump.alloc();
         let bins = BinNames::new("tursodb\ntursodb-mcp").expect("sorted names");
         let test = CrateEnv::of(EnvFacts { test_or_bench: true, bin_exes: bins, package: Some(("turso_cli", "0.4.0")), ..facts("0.4.0") }, alloc).expect("a SemVer version");
         assert_eq!(test.get("CARGO_BIN_EXE_tursodb"), Ok(Some("/target/debug/bin/turso_cli/tursodb")));
@@ -707,7 +707,7 @@ mod tests {
         assert_eq!(super::bin_exe("turso_cli", "tursodb", alloc).as_str(), "/target/debug/bin/turso_cli/tursodb", "the one spelling");
         let again = CrateEnv::of(test.facts(), alloc).expect("a SemVer version");
         assert_eq!(again.get("CARGO_BIN_EXE_tursodb"), test.get("CARGO_BIN_EXE_tursodb"), "TWIN: its facts answer it equal");
-        assert_eq!(test.clone_in(alloc).expect("no script record").get("CARGO_BIN_EXE_tursodb-mcp"), test.get("CARGO_BIN_EXE_tursodb-mcp"), "TWIN: a copy answers it equal");
+        assert_eq!(test.clone_in(bump).expect("no script record").get("CARGO_BIN_EXE_tursodb-mcp"), test.get("CARGO_BIN_EXE_tursodb-mcp"), "TWIN: a copy answers it equal");
         assert_eq!(test.get("CARGO_BIN_EXE_sqlite3"), Ok(None), "CONTROL: no binary of that name: unset, never unknown");
         let lib = CrateEnv::of(EnvFacts { bin_exes: bins, ..facts("0.4.0") }, alloc).expect("a SemVer version");
         assert_eq!(lib.get("CARGO_BIN_EXE_tursodb"), Ok(None), "CONTROL: a library is no test: none set");
@@ -801,15 +801,18 @@ mod tests {
     /// Control: keep "OUT_DIR" in `unknown` in `joined`: "OUT_DIR is still unknown after the join".
     #[test]
     fn a_joined_env_gives_the_scripts_pairs_after_cargos() {
-        let alloc = blaze_own::testing::heap().alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let alloc = bump.alloc();
         let printed = "cargo:rustc-env=VERSION=7\ncargo:rustc-env=CARGO_PKG_NAME=renamed\n";
         let out = blaze_build_script::Outputs::read(printed.as_bytes(), "/out", blaze_build_script::instr::OutputLimits::DEFAULT, alloc).expect("the instructions read");
         let mut bytes = blaze_own::AVec::new_in(alloc);
         out.encode(&mut bytes);
-        let record = blaze_build_script::OutputsRef::open(bytes.leak()).expect("an outputs record");
+        let record = blaze_build_script::OutputsRef::open(bump.alloc_slice_copy(&bytes)).expect("an outputs record");
         let bare = CrateEnv::of(EnvFacts { build_script: true, ..facts("1.0.0") }, alloc).expect("a SemVer version");
         assert_eq!(bare.get("OUT_DIR"), Err(EnvUnknown), "OUT_DIR is unknown before the join");
-        let joined = bare.joined(record, alloc);
+        let joined = bare.joined(record, bump);
         assert_eq!(joined.get("OUT_DIR"), Ok(Some("/out")), "OUT_DIR is still unknown after the join");
         assert_eq!(joined.get("VERSION"), Ok(Some("7")));
         assert_eq!(joined.get("CARGO_PKG_NAME"), Ok(Some("renamed")), "the script's pair is given after cargo's");
@@ -821,12 +824,15 @@ mod tests {
     /// Expected line: `test crate_env::tests::a_copied_environment_answers_alone ... ok`.
     #[test]
     fn a_copied_environment_answers_alone() {
-        let alloc = Alloc::global();
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let alloc = bump.alloc();
         let copy = {
             let dir = std::string::String::from("crates/node");
             let facts = EnvFacts { seen: SeenRoot::member(dir.as_str()).expect("a plain dir"), test_or_bench: true, bin_exes: BinNames::new("node").expect("one name"), ..facts("1.2.0") };
             let env = CrateEnv::of(facts, alloc).expect("a SemVer version");
-            env.clone_in(alloc).expect("no script record to open")
+            env.clone_in(bump).expect("no script record to open")
         };
         assert_eq!(copy.get("CARGO_MANIFEST_DIR"), Ok(Some("/workspace/crates/node")));
         assert_eq!(copy.get("CARGO_PKG_VERSION_MINOR"), Ok(Some("2")));

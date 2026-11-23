@@ -333,3 +333,26 @@ fn fix_after_an_edit(tape: &blaze_sim::Tape) -> Result<(), blaze_sim::Broke> {
 fn a_fix_after_drawn_edits_is_exact_or_refused_by_its_id() {
     blaze_sim::check(blaze_sim::Config::cases(24), fix_after_an_edit);
 }
+
+#[test]
+fn fix_minimizes_unused_imports_and_removes_unused_mut() {
+    let io = Io::simulated(SimWorld::new(7, Limits::USUAL));
+    write(
+        &io,
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace.metadata.blaze]\nlints = \"rust\"\nlints-add = [\"unused-import\", \"unused-mut\"]\n",
+    );
+    write(&io, "src/sub.rs", "pub struct Io;\npub struct Missing;\n");
+    write(
+        &io,
+        "src/lib.rs",
+        "mod sub;\n\nuse sub::{Io, Missing};\n\npub fn check(mut x: u32) -> (u32, Missing) {\n    let mut y = x + 1;\n    (y, Missing)\n}\n",
+    );
+    let (fixed, out) = agent(&io, Some(&["all"]));
+    assert!(!fixed.refused, "{out}");
+    assert_eq!(
+        read(&io, "src/lib.rs"),
+        "mod sub;\n\nuse sub::Missing;\n\npub fn check(x: u32) -> (u32, Missing) {\n    let y = x + 1;\n    (y, Missing)\n}\n",
+        "output was:\n{out}"
+    );
+}

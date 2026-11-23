@@ -48,7 +48,7 @@ fn dyn_types_through_front2() {
     let user = UserCrate { name: "dyns", dir: "/dyns/", root: "/dyns/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
         let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -138,7 +138,7 @@ fn dyn_types_through_front2() {
     }
 
     // A trait that is not dyn compatible (an associated const) in `dyn`: the checker's E0038.
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let user_fn = lib("not_dyn_user");
     let mut buckets = None;
     let body = lower_fn(&names, prepared, &mut front.keys, &mut store, user_fn).unwrap_or_else(|e| panic!("not_dyn_user lowers: {e}"));
@@ -229,7 +229,7 @@ fn typed_receivers_through_front2() {
     let user = UserCrate { name: "rcvs", dir: "/rcvs/", root: "/rcvs/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: RECEIVERS }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -251,7 +251,7 @@ fn typed_receivers_through_front2() {
             .map(|d| d.key)
             .unwrap_or_else(|| panic!("`{name}` from the crate root"))
     };
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut buckets = None;
     // (body, clean expected)
     let cases: [(&'static str, bool); 5] = [

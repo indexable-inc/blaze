@@ -135,14 +135,14 @@ fn names(prefix: &str, n: usize, g: Alloc<'static>) -> &'static [&'static str] {
         }
         ends.push(buf.len());
     }
-    let buf: &'static [u8] = AVec::leak(buf);
+    let buf: &'static [u8] = buf.leak_static();
     let mut out = AVec::with_capacity_in(n, g);
     let mut start = 0;
     for &end in ends.iter() {
         out.push(core::str::from_utf8(&buf[start..end]).unwrap_or_else(|e| panic!("a generated name is not UTF-8: {e}")));
         start = end;
     }
-    AVec::leak(out)
+    out.leak_static()
 }
 
 fn binding(def: ItemKey, i: usize) -> Binding {
@@ -163,11 +163,11 @@ fn scope_bytes(module: ItemKey, entries: &[(Namespace, &'static str, Binding)], 
     s.globs.extend_from_slice(globs);
     s.globs.sort_unstable();
     let bytes = s.write(g).unwrap_or_else(|e| panic!("a generated scope did not write: {e}"));
-    RecordBytes::leak(bytes)
+    bytes.leak()
 }
 
-fn record_of(parts: &Parts<'_>, g: Alloc<'static>) -> &'static [u8] {
-    let bytes = write(parts, g).unwrap_or_else(|e| panic!("a generated record did not write: {e}"));
+fn record_of(parts: &Parts<'_>, g: blaze_own::Bump<'static>) -> &'static [u8] {
+    let bytes = write(parts, g.alloc()).unwrap_or_else(|e| panic!("a generated record did not write: {e}"));
     aligned(&bytes, g)
 }
 
@@ -176,7 +176,8 @@ fn base<'p>(name: &'p str, root: ItemKey) -> Parts<'p> {
 }
 
 /// The generated records: (what each is, its bytes, 16-aligned).
-fn generated(g: Alloc<'static>) -> Vec<(&'static str, &'static [u8])> {
+fn generated(bump: blaze_own::Bump<'static>) -> Vec<(&'static str, &'static [u8])> {
+    let g = bump.alloc();
     let mut out = Vec::new();
     let root = key("root", 0);
 
@@ -190,7 +191,7 @@ fn generated(g: Alloc<'static>) -> Vec<(&'static str, &'static [u8])> {
     }
     entries.push((Namespace::Types, "é_ü", binding(key("def", 99_999), 0)));
     let modules = [Module { key: root, scope: scope_bytes(root, &entries, &[], g), chain: Some(&[]) }];
-    out.push(("many names", record_of(&Parts { modules: &modules, ..base("many", root) }, g)));
+    out.push(("many names", record_of(&Parts { modules: &modules, ..base("many", root) }, bump)));
 
     // A long chain: 200 modules nested, each with one binding and a glob of its parent.
     let keys: Vec<ItemKey> = (0..200).map(|i| key("chain", i)).collect();
@@ -204,7 +205,7 @@ fn generated(g: Alloc<'static>) -> Vec<(&'static str, &'static [u8])> {
         let scope = scope_bytes(*k, &[(Namespace::Types, "x", binding(key("x", i), i))], &globs, g);
         modules.push(Module { key: *k, scope, chain: (i % 7 != 3).then_some(chains[i].as_slice()) });
     }
-    out.push(("long chain", record_of(&Parts { modules: &modules, ..base("chain", keys[0]) }, g)));
+    out.push(("long chain", record_of(&Parts { modules: &modules, ..base("chain", keys[0]) }, bump)));
 
     // Many globs: one module with 400, and three names.
     let globs: Vec<GlobEdge> = (0..400)
@@ -212,7 +213,7 @@ fn generated(g: Alloc<'static>) -> Vec<(&'static str, &'static [u8])> {
         .collect();
     let entries = [("a", 0), ("b", 1), ("c", 2)].map(|(n, i)| (Namespace::Values, n, binding(key("g", i), i)));
     let modules = [Module { key: root, scope: scope_bytes(root, &entries, &globs, g), chain: None }];
-    out.push(("many globs", record_of(&Parts { modules: &modules, ..base("globs", root) }, g)));
+    out.push(("many globs", record_of(&Parts { modules: &modules, ..base("globs", root) }, bump)));
 
     // Many macros: 600, every body, every flag, empty and long texts.
     let texts = names("text_", 600, g);
@@ -233,25 +234,25 @@ fn generated(g: Alloc<'static>) -> Vec<(&'static str, &'static [u8])> {
         macros.push((key("macro", i), MacroSrc { name: texts[(i * 7) % 600], body, module: key("module", i % 5), export: i % 2 == 0, local_inner: i % 3 == 0 }));
     }
     let modules = [Module { key: root, scope: scope_bytes(root, &[], &[], g), chain: Some(&[]) }];
-    out.push(("many macros", record_of(&Parts { modules: &modules, macros: &macros, ..base("macros", root) }, g)));
+    out.push(("many macros", record_of(&Parts { modules: &modules, macros: &macros, ..base("macros", root) }, bump)));
 
     // Many enums: 300, of 0 to 8 variants, record ones among them.
     let vnames = names("V", 9, g);
     let variants: Vec<Vec<Variant<&'static str>>> =
         (0..300).map(|e| (0..e % 9).map(|v| Variant { name: vnames[v], key: key("variant", 9 * e + v), record: (e + v) % 2 == 1 }).collect()).collect();
     let enums: Vec<(ItemKey, &[Variant<&str>])> = variants.iter().enumerate().map(|(e, v)| (key("enum", e), v.as_slice())).collect();
-    out.push(("many enums", record_of(&Parts { enums: &enums, ..base("enums", root) }, g)));
+    out.push(("many enums", record_of(&Parts { enums: &enums, ..base("enums", root) }, bump)));
 
     // Many reaches, a proc key, another edition.
     let reaches: Vec<CrateItemKey> = (0..500).map(|i| crate_key(100 + i)).collect();
     let modules = [Module { key: root, scope: scope_bytes(root, &[], &[], g), chain: Some(&[]) }];
     out.push((
         "many reaches",
-        record_of(&Parts { reaches: &reaches, modules: &modules, proc_key: Some(crate_key(9)), edition: Edition::E2024, ..base("reaches", root) }, g),
+        record_of(&Parts { reaches: &reaches, modules: &modules, proc_key: Some(crate_key(9)), edition: Edition::E2024, ..base("reaches", root) }, bump),
     ));
 
     // All empty: no module, enum, macro or reach, and an empty name.
-    out.push(("empty", record_of(&base("", root), g)));
+    out.push(("empty", record_of(&base("", root), bump)));
     out
 }
 
@@ -294,9 +295,10 @@ fn reads<'d>(dep: Dep<'d>, modules: &[ItemKey], enums: &[ItemKey], macros: &[Ite
 }
 
 /// `bytes` read both ways, every read alike, and what it holds listed alike; `what` names it.
-fn both_ways(what: &str, bytes: &'static [u8], g: Alloc<'static>) {
+fn both_ways(what: &str, bytes: &'static [u8], bump: blaze_own::Bump<'static>) {
+    let g = bump.alloc();
     let heap = read_record(bytes, g).unwrap_or_else(|e| panic!("{what}: the control decode refused: {e:?}"));
-    let heap: &'static DepScope<'static> = Box::leak(Box::new_in(heap, g));
+    let heap: &'static DepScope<'static> = bump.alloc_val(heap);
     let place = DepRecord::open(Verified::check(bytes).unwrap_or_else(|e| panic!("{what}: the check refused: {e:?}")));
     let sorted = |keys: &mut Vec<ItemKey>| keys.sort_unstable();
     let mut modules: Vec<ItemKey> = heap.scopes.keys().copied().collect();
@@ -325,10 +327,11 @@ fn both_ways(what: &str, bytes: &'static [u8], g: Alloc<'static>) {
 
 #[test]
 fn the_in_place_record_answers_as_the_decode_on_real_solves_and_generated_records() {
-    let g = blaze_own::testing::heap().alloc();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let inputs = [input("k0", "/k0/lib.rs", &[]), input("k1", "/k1/lib.rs", &[("k0", 0)]), input("k2", "/k2/lib.rs", &[("k1", 1)])];
     let solve = |form: Form| {
-        resolve_by_records_in(&inputs, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), false, form, g)
+        resolve_by_records_in(&inputs, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), false, form, bump)
             .unwrap_or_else(|e| panic!("the solve with {form:?} records: {e:?}"))
             .0
     };
@@ -340,17 +343,17 @@ fn the_in_place_record_answers_as_the_decode_on_real_solves_and_generated_record
         assert_eq!(&h.inner[..], &p.inner[..], "crate {i}: the inner records of the two forms differ");
         let read = |s: &crate::crate_scope::CrateScope<'_>| crate::asked::encode(inputs[i].key, &[], &s.asked, g);
         assert_eq!(&read(h)[..], &read(p)[..], "crate {i}: the read lists of the two forms differ");
-        records.push((inputs[i].name, aligned(&p.record, g)));
+        records.push((inputs[i].name, aligned(&p.record, bump)));
     }
     // k2 reaches k0 (its `Z` is k0's) through k1: the reach list is read in place.
     let k2 = DepRecord::open(Verified::check(records[2].1).unwrap_or_else(|e| panic!("k2: {e:?}")));
     assert!(k2.reaches().iter().any(|k| k == inputs[0].key), "k2's record does not reach k0");
     let broken = error_record(crate_key(3), "broken", Edition::E2021, g).unwrap_or_else(|e| panic!("the error record: {e}"));
-    records.push(("an error crate", aligned(&broken, g)));
+    records.push(("an error crate", aligned(&broken, bump)));
     assert!(DepRecord::open(Verified::check(records[3].1).unwrap_or_else(|e| panic!("the error record: {e:?}"))).errored());
-    records.extend(generated(g));
+    records.extend(generated(bump));
     for (what, bytes) in records {
-        both_ways(what, bytes, g);
+        both_ways(what, bytes, bump);
     }
 }
 
@@ -410,8 +413,9 @@ fn table_of(e: &RecordRead) -> Option<&'static str> {
 }
 
 /// `bytes` as a record: refused, or every read answers (no panic either way).
-fn check_or_read(bytes: &[u8], g: Alloc<'static>) -> Result<(), RecordRead> {
-    let bytes = aligned(bytes, g);
+fn check_or_read(bytes: &[u8]) -> Result<(), RecordRead> {
+    let aligned_buf = crate::resolve::AlignedBuf::copy_from(bytes, Alloc::global());
+    let bytes = aligned_buf.as_slice();
     let record = DepRecord::open(Verified::check(bytes)?);
     let modules: Vec<ItemKey> = record.modules().collect();
     let enums: Vec<ItemKey> = record.enums().collect();
@@ -422,7 +426,7 @@ fn check_or_read(bytes: &[u8], g: Alloc<'static>) -> Result<(), RecordRead> {
 
 #[test]
 fn hostile_bytes_are_refused_by_table_and_offset_never_a_panic() {
-    let g = blaze_own::testing::heap().alloc();
+    let g = super::SyncFrame::leaked();
     let inputs = [input("k0", "/k0/lib.rs", &[])];
     let (solved, _) = resolve_by_records_in(&inputs, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), false, Form::InPlace, g)
         .unwrap_or_else(|e| panic!("k0: {e:?}"));
@@ -432,10 +436,10 @@ fn hostile_bytes_are_refused_by_table_and_offset_never_a_panic() {
     cases.extend(all.iter().map(|(what, b)| (*what, b.to_vec(), if b.len() > 8192 { 61 } else { 1 })));
 
     for (what, good, stride) in cases.iter() {
-        assert!(check_or_read(good, g).is_ok(), "{what}: the good record is refused");
+        assert!(check_or_read(good).is_ok(), "{what}: the good record is refused");
         // Every truncation (by `stride` in a large record, the last 256 always).
         for n in (0..good.len()).filter(|n| n % stride == 0 || good.len() - n <= 256) {
-            assert!(check_or_read(&good[..n], g).is_err(), "{what}: cut to {n} of {} bytes, accepted", good.len());
+            assert!(check_or_read(&good[..n]).is_err(), "{what}: cut to {n} of {} bytes, accepted", good.len());
         }
         for i in 0..8 {
             let (count, at) = (le32(good, field(i)), le32(good, field(i) + 4));
@@ -443,14 +447,14 @@ fn hostile_bytes_are_refused_by_table_and_offset_never_a_panic() {
             for c in [count.wrapping_add(1), good.len() as u32, u32::MAX] {
                 let mut bad = good.clone();
                 set32(&mut bad, field(i), c);
-                let e = check_or_read(&bad, g).err().unwrap_or_else(|| panic!("{what}: {} count {c} accepted", SECTIONS[i]));
+                let e = check_or_read(&bad).err().unwrap_or_else(|| panic!("{what}: {} count {c} accepted", SECTIONS[i]));
                 assert_eq!(table_of(&e), Some(SECTIONS[i]), "{what}: {} count {c}: {e:?}", SECTIONS[i]);
             }
             // An offset moved: refused, naming the section whose rows end there.
             for o in [at.wrapping_add(16), good.len() as u32 + 16, u32::MAX] {
                 let mut bad = good.clone();
                 set32(&mut bad, field(i) + 4, o);
-                let e = check_or_read(&bad, g).err().unwrap_or_else(|| panic!("{what}: {} offset {o} accepted", SECTIONS[i]));
+                let e = check_or_read(&bad).err().unwrap_or_else(|| panic!("{what}: {} offset {o} accepted", SECTIONS[i]));
                 let named = if i == 0 { "header" } else { SECTIONS[i - 1] };
                 assert_eq!(table_of(&e), Some(named), "{what}: {} offset {o}: {e:?}", SECTIONS[i]);
             }
@@ -458,32 +462,32 @@ fn hostile_bytes_are_refused_by_table_and_offset_never_a_panic() {
         // The name's range past the strings.
         let mut bad = good.clone();
         set32(&mut bad, 112, u32::MAX);
-        assert!(matches!(check_or_read(&bad, g), Err(RecordRead::Past { table: "crate name", at: 108 })), "{what}: a name past the strings");
+        assert!(matches!(check_or_read(&bad), Err(RecordRead::Past { table: "crate name", at: 108 })), "{what}: a name past the strings");
         // A row lying about its run: the first enum's count, the first module's scope length.
         if le32(good, field(3)) > 0 {
             let row = le32(good, field(3) + 4) as usize;
             let mut bad = good.clone();
             set32(&mut bad, row + 36, le32(good, row + 36) + 1);
-            let e = check_or_read(&bad, g).err().unwrap_or_else(|| panic!("{what}: an enum's count one too many, accepted"));
+            let e = check_or_read(&bad).err().unwrap_or_else(|| panic!("{what}: an enum's count one too many, accepted"));
             assert!(matches!(table_of(&e), Some("variant rows" | "enum rows")), "{what}: {e:?}");
         }
         if le32(good, field(1)) > 0 {
             let row = le32(good, field(1) + 4) as usize;
             let mut bad = good.clone();
             set32(&mut bad, row + 36, le32(good, row + 36) + 16);
-            assert!(check_or_read(&bad, g).is_err(), "{what}: a module scope 16 bytes long too many, accepted");
+            assert!(check_or_read(&bad).is_err(), "{what}: a module scope 16 bytes long too many, accepted");
         }
         // Every byte flipped (by `stride` in a large record): refused or read, never a panic.
         for at in (0..good.len()).step_by(*stride) {
             let mut bad = good.clone();
             bad[at] ^= 0xff;
-            let _ = check_or_read(&bad, g);
+            let _ = check_or_read(&bad);
         }
     }
     // Not this record: another version, or a v4 record's head.
     let mut old = cases[0].1.clone();
     set32(&mut old, 4, 4);
-    assert!(matches!(check_or_read(&old, g), Err(RecordRead::NotThisRecord)));
+    assert!(matches!(check_or_read(&old), Err(RecordRead::NotThisRecord)));
     // Unaligned bytes are refused before any is read: `aligned`'s copy starts on 16, so one
     // byte on does not.
     let a = aligned(&cases[0].1, g);
@@ -492,7 +496,31 @@ fn hostile_bytes_are_refused_by_table_and_offset_never_a_panic() {
 
 #[test]
 fn an_in_place_record_opens_and_answers_with_no_allocation() {
-    let g = blaze_own::testing::heap().alloc();
+    struct CountingBump<'a>(Counting<&'a blaze_mem::Frame>);
+    // SAFETY: delegates every call to the inner `Counting<&Frame>`.
+    unsafe impl core::alloc::Allocator for CountingBump<'_> {
+        fn allocate(&self, layout: core::alloc::Layout) -> Result<core::ptr::NonNull<[u8]>, core::alloc::AllocError> {
+            self.0.allocate(layout)
+        }
+        unsafe fn deallocate(&self, ptr: core::ptr::NonNull<u8>, layout: core::alloc::Layout) {
+            // SAFETY: caller's contract passed through.
+            unsafe { self.0.deallocate(ptr, layout) }
+        }
+        unsafe fn grow(&self, ptr: core::ptr::NonNull<u8>, old: core::alloc::Layout, new: core::alloc::Layout) -> Result<core::ptr::NonNull<[u8]>, core::alloc::AllocError> {
+            // SAFETY: caller's contract passed through.
+            unsafe { self.0.grow(ptr, old, new) }
+        }
+        unsafe fn shrink(&self, ptr: core::ptr::NonNull<u8>, old: core::alloc::Layout, new: core::alloc::Layout) -> Result<core::ptr::NonNull<[u8]>, core::alloc::AllocError> {
+            // SAFETY: caller's contract passed through.
+            unsafe { self.0.shrink(ptr, old, new) }
+        }
+    }
+    // SAFETY: backed by `blaze_mem::Frame`, which implements `BumpAlloc`.
+    unsafe impl blaze_own::BumpAlloc for CountingBump<'_> {}
+
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("test frame");
+    let erased = Erased::new(&frame);
+    let g = erased.bump();
     let inputs = [input("k0", "/k0/lib.rs", &[])];
     let (solved, _) = resolve_by_records_in(&inputs, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), false, Form::InPlace, g)
         .unwrap_or_else(|e| panic!("k0: {e:?}"));
@@ -500,17 +528,18 @@ fn an_in_place_record_opens_and_answers_with_no_allocation() {
     let root = DepRecord::open(Verified::check(bytes).unwrap_or_else(|e| panic!("k0: {e:?}"))).root();
     let enum_key = DepRecord::open(Verified::check(bytes).unwrap_or_else(|e| panic!("k0: {e:?}"))).enums().next().unwrap_or_else(|| panic!("k0's record holds no enum"));
 
-    let counting = Erased::new(Counting::new(g));
-    let c = counting.handle();
+    let count_frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("counting frame");
+    let counting = Erased::new(CountingBump(Counting::new(&count_frame)));
+    let c = counting.bump();
     // Handing it in place: one box, the `DepRecord`.
-    let before = counting.inner().allocations();
+    let before = counting.inner().0.allocations();
     let dep = hand(Form::InPlace, bytes, c).unwrap_or_else(|e| panic!("in place: {e:?}"));
-    let handed = counting.inner().allocations() - before;
+    let handed = counting.inner().0.allocations() - before;
     assert_eq!(handed, 1, "handing a record in place allocated {handed} blocks, not its one box");
 
     // The check, the open and 10,000 lookups: none takes an allocator, none allocates here.
     const ROUNDS: u32 = 10_000;
-    let before = counting.inner().allocations();
+    let before = counting.inner().0.allocations();
     let start = std::time::Instant::now();
     let proof = Verified::check(bytes).unwrap_or_else(|e| panic!("k0: {e:?}"));
     let checked = start.elapsed();
@@ -529,16 +558,16 @@ fn an_in_place_record_opens_and_answers_with_no_allocation() {
         }
     }
     let per = start.elapsed() / ROUNDS;
-    let looked = counting.inner().allocations() - before;
+    let looked = counting.inner().0.allocations() - before;
     assert_eq!(hits, ROUNDS, "a lookup in k0's record missed");
     assert_eq!(looked, 0, "the check, open and lookups allocated {looked} blocks");
 
     // Control: the decode it replaced allocates per table, module and name.
-    let before = counting.inner().allocations();
+    let before = counting.inner().0.allocations();
     let start = std::time::Instant::now();
-    let decoded = read_record(bytes, c).unwrap_or_else(|e| panic!("the control decode: {e:?}"));
+    let decoded = read_record(bytes, c.alloc()).unwrap_or_else(|e| panic!("the control decode: {e:?}"));
     let decode = start.elapsed();
-    let control = counting.inner().allocations() - before;
+    let control = counting.inner().0.allocations() - before;
     assert!(control > 1, "control: the decode allocated {control} blocks, so the counter does not see it");
     assert_eq!(decoded.root, root);
     std::println!(

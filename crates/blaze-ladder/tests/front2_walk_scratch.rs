@@ -216,10 +216,10 @@ fn records<'n>(frame: &'n Frame, a: Alloc<'n>) -> (&'n Names<'n>, &'n Records<'n
 /// [`records`], and the items record's bytes the records read.
 fn records_and_items<'n>(frame: &'n Frame, a: Alloc<'n>) -> (&'n Names<'n>, &'n Records<'n>, &'n [u8]) {
     let crates = [input()];
-    let names: &'n Names<'n> = frame.alloc(resolve_crates(&crates, Sysroot::default(), &Texts, &Serial, a).unwrap_or_else(|e| panic!("resolve_crates: {e}")));
+    let names: &'n Names<'n> = frame.alloc(resolve_crates(&crates, Sysroot::default(), &Texts, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}")));
     let c = &names.crates()[0];
-    let names_bytes = aligned(&names_record::encode(c, a).unwrap_or_else(|e| panic!("app's names record: {e:?}")), a);
-    let items_bytes = aligned(&items_record::encode(c, a).unwrap_or_else(|e| panic!("app's items record: {e:?}")), a);
+    let names_bytes = aligned(&names_record::encode(c, a).unwrap_or_else(|e| panic!("app's names record: {e:?}")), blaze_own::testing::bump());
+    let items_bytes = aligned(&items_record::encode(c, a).unwrap_or_else(|e| panic!("app's items record: {e:?}")), blaze_own::testing::bump());
     let kept: &'n Kept<'n> = frame.alloc(Kept { names: names_bytes, items: items_bytes });
     let keys: &'n [CrateItemKey] = frame.alloc_slice_copy(&[c.key]);
     let crate_names: &'n [&'n str] = frame.alloc_slice_copy(&["app"]);

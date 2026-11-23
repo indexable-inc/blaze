@@ -1284,7 +1284,7 @@ struct Target {
 /// Inline work stack for type walks (`npos_positions`, `positions_all_opaque`, `is_copy`,
 /// `needs_drop`): zero heap allocation up to depth 16, spilling to an explicit-allocator `Vec`
 /// only past 16.
-struct TyStack<A: Allocator> {
+pub struct TyStack<A: Allocator> {
     inline: [PTy; 16],
     len: usize,
     spill: Vec<PTy, A>,
@@ -1292,14 +1292,14 @@ struct TyStack<A: Allocator> {
 
 impl<A: Allocator> TyStack<A> {
     #[inline]
-    fn new(root: PTy, alloc: A) -> Self {
+    pub fn new(root: PTy, alloc: A) -> Self {
         let mut inline = [PTy(0); 16];
         inline[0] = root;
         Self { inline, len: 1, spill: Vec::new_in(alloc) }
     }
 
     #[inline]
-    fn push(&mut self, t: PTy) {
+    pub fn push(&mut self, t: PTy) {
         if self.spill.is_empty() && self.len < self.inline.len() {
             self.inline[self.len] = t;
             self.len += 1;
@@ -1309,7 +1309,7 @@ impl<A: Allocator> TyStack<A> {
     }
 
     #[inline]
-    fn extend_from_slice(&mut self, slice: &[PTy]) {
+    pub fn extend_from_slice(&mut self, slice: &[PTy]) {
         if self.spill.is_empty() && self.len + slice.len() <= self.inline.len() {
             self.inline[self.len..self.len + slice.len()].copy_from_slice(slice);
             self.len += slice.len();
@@ -1319,7 +1319,7 @@ impl<A: Allocator> TyStack<A> {
     }
 
     #[inline]
-    fn pop(&mut self) -> Option<PTy> {
+    pub fn pop(&mut self) -> Option<PTy> {
         if let Some(t) = self.spill.pop() {
             return Some(t);
         }
@@ -1331,14 +1331,14 @@ impl<A: Allocator> TyStack<A> {
     }
 }
 
-/// Builds a dense O(1) first-match index table (`u32::MAX` sentinel) from a column of `ExprId`s.
-fn index_expr_rows<A: Allocator>(col: &[ExprId], n_exprs: usize, alloc: A) -> Vec<u32, A> {
+/// Builds a dense O(1) first-match index table (`u32::MAX` sentinel) from a column of row ids.
+pub fn index_rows<T: Copy, A: Allocator>(col: &[T], len: usize, ix: impl Fn(T) -> usize, alloc: A) -> Vec<u32, A> {
     if col.is_empty() {
         return Vec::new_in(alloc);
     }
-    let mut table = Vec::from_elem_in(u32::MAX, n_exprs, alloc);
-    for (i, &e) in col.iter().enumerate() {
-        if let Some(slot) = table.get_mut(e.ix())
+    let mut table = Vec::from_elem_in(u32::MAX, len, alloc);
+    for (i, &k) in col.iter().enumerate() {
+        if let Some(slot) = table.get_mut(ix(k))
             && *slot == u32::MAX
         {
             *slot = i as u32;
@@ -1347,20 +1347,169 @@ fn index_expr_rows<A: Allocator>(col: &[ExprId], n_exprs: usize, alloc: A) -> Ve
     table
 }
 
-/// Builds a dense O(1) first-match index table (`u32::MAX` sentinel) from a column of `PatId`s.
-fn index_pat_rows<A: Allocator>(col: &[PatId], n_pats: usize, alloc: A) -> Vec<u32, A> {
-    if col.is_empty() {
-        return Vec::new_in(alloc);
-    }
-    let mut table = Vec::from_elem_in(u32::MAX, n_pats, alloc);
-    for (i, &p) in col.iter().enumerate() {
-        if let Some(slot) = table.get_mut(p.ix())
-            && *slot == u32::MAX
-        {
-            *slot = i as u32;
+/// Why a type walk in [`pty_needs_drop`] stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropWalkError {
+    /// A type id, list id, or closure capture record was out of range.
+    Malformed,
+    /// An ADT's [`AdtFacts`] were missing from [`Facts::adt`].
+    UnknownAdt,
+    /// The type walk passed `MOST_POSITIONS`.
+    Bound,
+}
+
+/// How [`pty_needs_drop`] treats `PNode::Closure` nodes.
+#[derive(Clone, Copy)]
+pub enum ClosureDrop<'a, 'c> {
+    /// Closures do not need drop (flow lowering).
+    Ignore,
+    /// A closure of `owner` needs drop if any of its by-value captures in `ck` does; a
+    /// closure of another body conservatively needs drop (body lowering).
+    ByValueCaptures { owner: ItemKey, ck: &'a Checked<'c> },
+}
+
+/// Memo tables, facts, and allocator for [`pty_needs_drop`].
+pub struct DropWalk<'a, 'c, F: Facts, A: Allocator + Copy> {
+    pub facts: &'a F,
+    pub copy_memo: &'a [core::cell::Cell<u8>],
+    pub drop_memo: &'a [core::cell::Cell<u8>],
+    pub closures: ClosureDrop<'a, 'c>,
+    pub alloc: A,
+}
+
+/// Whether dropping a value of `root` may run code, memoized in `walk.drop_memo`
+/// (`0` = unknown, `1` = false, `2` = true).
+pub fn pty_needs_drop<'a, 'c, F: Facts, A: Allocator + Copy, E>(
+    walk: DropWalk<'a, 'c, F, A>,
+    root: PTy,
+    is_copy: impl FnOnce() -> Result<bool, E>,
+    node: impl Fn(PTy) -> Option<PNode>,
+    list: impl Fn(List) -> Option<&'a [PTy]>,
+    on_err: impl Fn(DropWalkError) -> E,
+) -> Result<bool, E> {
+    let root_ix = root.0 as usize;
+    if let Some(cell) = walk.drop_memo.get(root_ix) {
+        let v = cell.get();
+        if v != 0 {
+            return Ok(v == 2);
         }
     }
-    table
+    if is_copy()? {
+        if let Some(cell) = walk.drop_memo.get(root_ix) {
+            cell.set(1);
+        }
+        return Ok(false);
+    }
+    let quick = match node(root).ok_or_else(|| on_err(DropWalkError::Malformed))? {
+        PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) if l.len == 0 => Some(false),
+        PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
+        PNode::Param(_)
+        | PNode::Alias { .. }
+        | PNode::Opaque(..)
+        | PNode::Dynamic(_)
+        | PNode::Future(..)
+        | PNode::Coroutine { .. } => Some(true),
+        PNode::Closure { owner, .. } => match walk.closures {
+            ClosureDrop::Ignore => Some(false),
+            ClosureDrop::ByValueCaptures { owner: body_owner, .. } => {
+                if owner != body_owner {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+        },
+        _ => Some(false),
+    };
+    if let Some(ans) = quick {
+        if let Some(cell) = walk.drop_memo.get(root_ix) {
+            cell.set(if ans { 2 } else { 1 });
+        }
+        return Ok(ans);
+    }
+    let mut stack = TyStack::new(root, walk.alloc);
+    let mut steps = 0u32;
+    while let Some(t) = stack.pop() {
+        steps += 1;
+        if steps > MOST_POSITIONS {
+            return Err(on_err(DropWalkError::Bound));
+        }
+        let t_ix = t.0 as usize;
+        if let Some(cell) = walk.drop_memo.get(t_ix) {
+            let v = cell.get();
+            if v == 2 {
+                if let Some(rc) = walk.drop_memo.get(root_ix) {
+                    rc.set(2);
+                }
+                return Ok(true);
+            }
+            if v == 1
+                && walk.copy_memo.get(t_ix).is_some_and(|c| c.get() == 1)
+            {
+                continue;
+            }
+        }
+        match node(t).ok_or_else(|| on_err(DropWalkError::Malformed))? {
+            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => {
+                let s = list(l).ok_or_else(|| on_err(DropWalkError::Malformed))?;
+                stack.extend_from_slice(s);
+            }
+            PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
+            PNode::Adt(k, l) => {
+                let f = walk.facts.adt(k).ok_or_else(|| on_err(DropWalkError::UnknownAdt))?;
+                if f.needs_drop {
+                    if let Some(rc) = walk.drop_memo.get(root_ix) {
+                        rc.set(2);
+                    }
+                    return Ok(true);
+                }
+                let s = list(l).ok_or_else(|| on_err(DropWalkError::Malformed))?;
+                stack.extend_from_slice(s);
+            }
+            // A future holds its captures and its saved values: dropping it may run code.
+            PNode::Param(_)
+            | PNode::Alias { .. }
+            | PNode::Opaque(..)
+            | PNode::Dynamic(_)
+            | PNode::Future(..)
+            | PNode::Coroutine { .. } => {
+                if let Some(rc) = walk.drop_memo.get(root_ix) {
+                    rc.set(2);
+                }
+                return Ok(true);
+            }
+            // A closure of this body holds its by-value captures; one of another body is
+            // not known here, and its `Drop` row stays for elaboration to judge.
+            PNode::Closure { owner, ordinal, .. } => {
+                if let ClosureDrop::ByValueCaptures { owner: body_owner, ck } = walk.closures {
+                    if owner != body_owner {
+                        if let Some(rc) = walk.drop_memo.get(root_ix) {
+                            rc.set(2);
+                        }
+                        return Ok(true);
+                    }
+                    let Some(&c) = ck.closures.column::<0>().get(ordinal as usize) else {
+                        return Err(on_err(DropWalkError::Malformed));
+                    };
+                    // Its by-value environment fields (blaze-typeck env_fields.rs): a whole
+                    // binding's type, or a captured place's (`x.a` by value holds `x.a` only).
+                    for f in ck.env_fields(c) {
+                        if f.how == blaze_typeck::CaptureKind::ByValue {
+                            match f.place_ty(ck) {
+                                Some(ct) => stack.push(ct),
+                                None => return Err(on_err(DropWalkError::Malformed)),
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(rc) = walk.drop_memo.get(root_ix) {
+        rc.set(1);
+    }
+    Ok(false)
 }
 
 /// Builds a CSR index over `ck.captures.column::<0>()` keyed by `ExprId`, preserving exact row order.
@@ -1527,11 +1676,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let n_exprs = body.exprs.len();
         let n_pats = body.pats.len();
         let n_tys = tys.len();
-        let expr_def_row = index_expr_rows(ck.expr_defs.column::<0>(), n_exprs, alloc);
-        let pat_def_row = index_pat_rows(ck.pat_defs.column::<0>(), n_pats, alloc);
-        let callee_row = index_expr_rows(ck.callees.column::<0>(), n_exprs, alloc);
-        let field_row = index_expr_rows(ck.fields.column::<0>(), n_exprs, alloc);
-        let closure_ordinal = index_expr_rows(ck.closures.column::<0>(), n_exprs, alloc);
+        let expr_def_row = index_rows(ck.expr_defs.column::<0>(), n_exprs, ExprId::ix, alloc);
+        let pat_def_row = index_rows(ck.pat_defs.column::<0>(), n_pats, PatId::ix, alloc);
+        let callee_row = index_rows(ck.callees.column::<0>(), n_exprs, ExprId::ix, alloc);
+        let field_row = index_rows(ck.fields.column::<0>(), n_exprs, ExprId::ix, alloc);
+        let closure_ordinal = index_rows(ck.closures.column::<0>(), n_exprs, ExprId::ix, alloc);
         let (cap_offsets, cap_rows) = build_capture_csr(ck.captures.column::<0>(), n_exprs, alloc);
         let mut l = Lower {
             body,
@@ -1773,7 +1922,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             | PNode::ConstParam(_)
             | PNode::ExAuto(_)
             | PNode::Foreign(_) => Some(0),
-            PNode::Tuple(l) if l.len == 0 => Some(0),
+            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) if l.len == 0 => Some(0),
             PNode::Opaque(_, _) | PNode::Alias { .. } | PNode::Dynamic(_) => Some(1),
             _ => None,
         };
@@ -1840,7 +1989,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 PNode::Ref(_, i) => stack.push(i),
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) => stack.push(i),
                 PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.list(l, e)?),
                 PNode::Adt(_, l) => stack.extend_from_slice(self.list(l, e)?),
                 // Not descended into (as before P0): one position each, counted above.
                 PNode::Opaque(_, _) | PNode::Alias { .. } | PNode::Dynamic(_) => {}
@@ -1915,7 +2064,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         }
         let quick = match self.node(root, e)? {
             PNode::Ptr(..) | PNode::Slice(_) | PNode::Pat(..) | PNode::Array(..) | PNode::FnPtr(..) | PNode::Adt(..) => None,
-            PNode::Tuple(l) if l.len > 0 => None,
+            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) if l.len > 0 => None,
             PNode::Ref(..)
             | PNode::Alias { .. }
             | PNode::Dynamic(_)
@@ -1952,7 +2101,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             match self.node(t, e)? {
                 PNode::Opaque(_, _) => {}
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.list(l, e)?),
                 PNode::Adt(k, l) => {
                     if self.adt_facts(k, e)?.lifetimes > 0 {
                         if let Some(rc) = self.all_opaque_memo.get(root.0 as usize) {
@@ -2075,7 +2224,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     any = true;
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) | PNode::Ref(_, i) => stack.push(i),
-                PNode::Tuple(l) | PNode::Adt(_, l) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::Adt(_, l) => stack.extend_from_slice(self.list(l, e)?),
                 _ => {}
             }
         }
@@ -2230,8 +2379,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             | PNode::Ref(Mutbl::Not, _) => Some(true),
             PNode::Ref(Mutbl::Mut, _) => Some(false),
             PNode::Param(i) => Some(self.facts.param_copy(i)),
-            PNode::Tuple(l) if l.len == 0 => Some(true),
-            PNode::Tuple(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
+            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) if l.len == 0 => Some(true),
+            PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
             PNode::Closure { owner, .. } if owner == self.body.owner => None,
             _ => Some(false),
         };
@@ -2279,7 +2428,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     }
                     return Ok(false);
                 }
-                PNode::Tuple(l) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => stack.extend_from_slice(self.list(l, e)?),
                 PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
                 PNode::Adt(k, l) => {
                     if !self.adt_facts(k, e)?.copy {
@@ -2366,94 +2515,30 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     }
 
     fn needs_drop_pty(&self, root: PTy, e: ExprId) -> Result<bool, Refusal> {
-        if let Some(cell) = self.drop_memo.get(root.0 as usize) {
-            let v = cell.get();
-            if v != 0 {
-                return Ok(v == 2);
-            }
-        }
-        if self.is_copy_pty(root, e)? {
-            if let Some(cell) = self.drop_memo.get(root.0 as usize) {
-                cell.set(1);
-            }
-            return Ok(false);
-        }
-        let quick = match self.node(root, e)? {
-            PNode::Tuple(l) if l.len == 0 => Some(false),
-            PNode::Tuple(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
-            PNode::Param(_)
-            | PNode::Alias { .. }
-            | PNode::Opaque(..)
-            | PNode::Dynamic(_)
-            | PNode::Future(..)
-            | PNode::Coroutine { .. } => Some(true),
-            _ => Some(false),
-        };
-        if let Some(ans) = quick {
-            if let Some(cell) = self.drop_memo.get(root.0 as usize) {
-                cell.set(if ans { 2 } else { 1 });
-            }
-            return Ok(ans);
-        }
-        let mut stack = TyStack::new(root, self.alloc);
-        let mut steps = 0u32;
-        while let Some(t) = stack.pop() {
-            steps += 1;
-            if steps > MOST_POSITIONS {
-                return self.refuse(Form::Bound, e);
-            }
-            if let Some(cell) = self.drop_memo.get(t.0 as usize) {
-                let v = cell.get();
-                if v == 2 {
-                    if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-                        rc.set(2);
-                    }
-                    return Ok(true);
-                }
-                if v == 1
-                    && self.copy_memo.get(t.0 as usize).is_some_and(|c| c.get() == 1)
-                {
-                    continue;
-                }
-            }
-            match self.node(t, e)? {
-                PNode::Tuple(l) => stack.extend_from_slice(self.list(l, e)?),
-                PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
-                PNode::Adt(k, l) => {
-                    if self.adt_facts(k, e)?.needs_drop {
-                        if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-                            rc.set(2);
-                        }
-                        return Ok(true);
-                    }
-                    stack.extend_from_slice(self.list(l, e)?);
-                }
-                PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Dynamic(_) => {
-                    if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-                        rc.set(2);
-                    }
-                    return Ok(true);
-                }
-                // A future holds its captures and its saved values: dropping it may run code.
-                PNode::Future(..) | PNode::Coroutine { .. } => {
-                    if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-                        rc.set(2);
-                    }
-                    return Ok(true);
-                }
-                _ => {}
-            }
-        }
-        if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-            rc.set(1);
-        }
-        Ok(false)
+        pty_needs_drop(
+            DropWalk {
+                facts: self.facts,
+                copy_memo: &self.copy_memo,
+                drop_memo: &self.drop_memo,
+                closures: ClosureDrop::Ignore,
+                alloc: self.alloc,
+            },
+            root,
+            || self.is_copy_pty(root, e),
+            |t| self.tys.node(t).ok(),
+            |l| self.tys.list(l).ok(),
+            |err| match err {
+                DropWalkError::Malformed => Refusal { form: Form::Malformed, range: range_of(self.body, e) },
+                DropWalkError::UnknownAdt => Refusal { form: Form::UnknownAdt, range: range_of(self.body, e) },
+                DropWalkError::Bound => Refusal { form: Form::Bound, range: range_of(self.body, e) },
+            },
+        )
     }
 
     fn is_unit_or_never(&self, t: PTy, e: ExprId) -> Result<bool, Refusal> {
         Ok(match self.node(t, e)? {
             PNode::Never => true,
-            PNode::Tuple(l) => l.len == 0,
+            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => l.len == 0,
             _ => false,
         })
     }
@@ -2560,7 +2645,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         let len = self.npos_d(child, e)?;
                         info = PInfo { start: pi.start, len, exact: true, ..info };
                     }
-                    (Proj::Field(i), PNode::Tuple(l)) => {
+                    (Proj::Field(i), PNode::Tuple(l) | PNode::Record(l)) => {
                         let elems = self.list(l, e)?;
                         let mut off = 0;
                         for &t in elems.iter().take(i as usize) {
@@ -3189,7 +3274,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) => stack.push((i, at)),
                 PNode::Array(i, _) => stack.push((i, at)),
-                PNode::Tuple(l) => {
+                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => {
                     let mut off = at;
                     for &x in self.list(l, e)? {
                         stack.push((x, off));
@@ -3436,7 +3521,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     stack.push(i);
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.head_list(l, e)?),
+                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.head_list(l, e)?),
                 PNode::Adt(k, l) => {
                     regular += self.adt_facts(k, e)?.lifetimes;
                     stack.extend_from_slice(self.head_list(l, e)?);
@@ -3488,7 +3573,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     stack.push(i);
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) | PNode::FnPtr(l, _) => {
+                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::FnPtr(l, _) => {
                     for &y in self.head_list(l, e)?.iter().rev() {
                         stack.push(y);
                     }
@@ -3591,6 +3676,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     | (PNode::Pat(..), PNode::Pat(..))
                     | (PNode::Array(..), PNode::Array(..))
                     | (PNode::Tuple(_), PNode::Tuple(_))
+                    | (PNode::Record(_), PNode::Record(_))
+                    | (PNode::Union(_), PNode::Union(_))
                     | (PNode::FnPtr(..), PNode::FnPtr(..))
                     | (PNode::Adt(..), PNode::Adt(..))
             );
@@ -3653,7 +3740,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 | (PNode::Slice(di), PNode::Slice(bi))
                 | (PNode::Pat(di, _), PNode::Pat(bi, _))
                 | (PNode::Array(di, _), PNode::Array(bi, _)) => stack.push((di, bi)),
-                (PNode::Tuple(dl), PNode::Tuple(bl)) | (PNode::FnPtr(dl, _), PNode::FnPtr(bl, _)) => {
+                (PNode::Tuple(dl), PNode::Tuple(bl))
+                | (PNode::Record(dl), PNode::Record(bl))
+                | (PNode::Union(dl), PNode::Union(bl))
+                | (PNode::FnPtr(dl, _), PNode::FnPtr(bl, _)) => {
                     let (ds, bs) = (self.head_list(dl, e)?, self.list(bl, e)?);
                     if ds.len() != bs.len() {
                         return Ok(false);
@@ -5537,7 +5627,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         // `B`'s). Every other aggregate (a struct or variant, whose field types the heads do not
         // give yet) is related as a call of unknown signature.
         let elems: Option<&'c [PTy]> = match (ty.wrap, self.node(ty.ty, e)?) {
-            (None, PNode::Tuple(l)) => Some(self.list(l, e)?),
+            (None, PNode::Tuple(l) | PNode::Record(l)) => Some(self.list(l, e)?),
             _ => None,
         };
         // A tuple-like constructor whose every field holding positions is declared as a bare

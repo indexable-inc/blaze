@@ -123,17 +123,21 @@ pub struct RunLink<'a> {
     pub confine: Option<&'a ChildConfine<'a>>,
 }
 
+fn refuse_command(command: &Command, op: LinkOp, os: i32) -> LinkError {
+    LinkError {
+        // clone: an error path, the program's path.
+        program: command.program.clone(),
+        op,
+        os,
+    }
+}
+
 /// `command` started linked as `link` says, listed until reaped, with the read ends of its
 /// piped streams. Refused by name: `Sandbox::On`, a memory limit, input bytes, a target below
 /// 3 or named twice, more than [`MOST_INHERITED`] descriptors, and [`ParentDeath::Kernel`]
 /// where the system has none.
 pub fn start_run(command: &Command, link: &RunLink<'_>) -> Result<Started, LinkError> {
-    let refuse = |op: LinkOp, os: i32| LinkError {
-        // clone: an error path, the program's path.
-        program: command.program.clone(),
-        op,
-        os,
-    };
+    let refuse = |op: LinkOp, os: i32| refuse_command(command, op, os);
     if !matches!(command.sandbox, Sandbox::Off) {
         return Err(refuse(LinkOp::SandboxNotJoined, 0));
     }
@@ -186,6 +190,7 @@ pub fn start_run(command: &Command, link: &RunLink<'_>) -> Result<Started, LinkE
         streams: link.streams,
         extra: &extra[..link.inherit.len()],
         group: link.own_group,
+        session: false,
         parent_death: link.parent_death == ParentDeath::Kernel,
         confine: link.confine,
     };
@@ -225,6 +230,44 @@ pub fn start_run(command: &Command, link: &RunLink<'_>) -> Result<Started, LinkE
         listed,
     };
     Ok(Started { child, stdout: spawned.stdout, stderr: spawned.stderr })
+}
+
+/// `command` started detached in a new session (`setsid` on Linux, `POSIX_SPAWN_SETSID` on macOS)
+/// with `/dev/null` for stdin, stdout and stderr and every other descriptor closed on exec, so the
+/// parent never blocks on inherited pipes or descriptors and the child outlives the parent. Not
+/// registered among linked/reaped children; returns the started process id.
+pub fn start_detached(command: &Command) -> Result<u32, LinkError> {
+    let refuse = |op: LinkOp, os: i32| refuse_command(command, op, os);
+    if !matches!(command.sandbox, Sandbox::Off) {
+        return Err(refuse(LinkOp::SandboxNotJoined, 0));
+    }
+    if command.memory.is_some() {
+        return Err(refuse(LinkOp::MemoryNotHeld, 0));
+    }
+    if !command.stdin.is_empty() {
+        return Err(refuse(LinkOp::InputNotWritten, 0));
+    }
+    let program = super::super::spawn::Program {
+        program: &command.program,
+        args: &command.args,
+        env: &command.env,
+        dir: &command.dir,
+    };
+    let start = super::super::spawn::streams::Start {
+        arg0: None,
+        streams: Streams { stdin: Input::Null, stdout: Output::Null, stderr: Output::Null },
+        extra: &[],
+        group: false,
+        session: true,
+        parent_death: false,
+        confine: None,
+    };
+    let spawned = super::super::spawn::streams::spawn_streams(&program, &start).map_err(|error| match error {
+        super::super::spawn::StartError::Io(error) => refuse(LinkOp::Spawn, os_of(&error)),
+        #[cfg(target_os = "linux")]
+        super::super::spawn::StartError::Confine { step, errno } => refuse(LinkOp::Confine(step), i32::from(errno.raw())),
+    })?;
+    Ok(u32::try_from(spawned.pid).unwrap_or(0))
 }
 
 impl LinkedChild {
@@ -349,6 +392,23 @@ mod tests {
         assert_eq!(read, channel::Read::Bytes(3));
         assert_eq!(&buf[..3], b"out");
         println!("linked run: exit 7, signal 9, deadline then killed, a message on 3, stdout piped");
+    }
+
+    #[test]
+    fn start_detached_starts_child_in_new_session_with_null_stdio() {
+        let pid = start_detached(&sh("exec sleep 30")).expect("detached child starts");
+        assert!(pid > 0, "detached child has a positive pid: {pid}");
+        let child_pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+        // SAFETY: POSIX `getsid(pid)` reads the session id of our live child process.
+        let sid = unsafe { libc::getsid(child_pid) };
+        // SAFETY: POSIX `getsid(0)` reads this process's own session id.
+        let own_sid = unsafe { libc::getsid(0) };
+        // Clean up the test child immediately before asserting so no process is leaked on failure.
+        // SAFETY: `child_pid` is our unreaped child process.
+        unsafe { libc::kill(child_pid, libc::SIGKILL) };
+        let _ = super::super::super::reap(child_pid);
+        assert_eq!(sid, child_pid, "detached child leads its own session (sid == pid)");
+        assert_ne!(sid, own_sid, "detached child is in a different session from its parent");
     }
 }
 

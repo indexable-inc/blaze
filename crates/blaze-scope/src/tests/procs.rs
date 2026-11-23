@@ -26,7 +26,7 @@ use crate::task::{ProcExport, Serial};
 
 /// Crates resolved with no sysroot, one thread, from `sources`.
 fn resolved<S: SourceTexts<'static>>(crates: &[CrateInput<'static>], sources: &'static S) -> Names<'static> {
-    resolve_crates(crates, Sysroot::default(), sources, &Serial, Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
+    resolve_crates(crates, Sysroot::default(), sources, &Serial, super::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
 }
 
 /// The proc-macro crate: one macro of each kind.

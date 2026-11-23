@@ -63,7 +63,7 @@ fn front2_eb4_projection_normalization() {
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).expect("fixture names");
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("fixture names");
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
     let mut world = ProjectWorld::new(&names, &frame, &files, alloc).expect("front2");
     for name in ["generic", "concrete", "arrays"] {

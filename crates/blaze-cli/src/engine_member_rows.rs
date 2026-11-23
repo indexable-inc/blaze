@@ -213,16 +213,16 @@ fn body_name<'n>(records: &'n Records<'n>, body: BodyRef<'n>) -> &'n str {
     }
 }
 
-/// `args` written once into `alloc`, kept for the alloc's life (the request's heap: the row's
-/// labels live as long as the phase's other labels).
-fn kept_text<'a>(alloc: Alloc<'a>, args: fmt::Arguments<'_>) -> &'a str {
-    blaze_own::Box::leak(blaze_own::text::format(alloc, args).into_boxed_str())
+/// `args` written once into `frame`, kept for the frame's life (the row's labels live as long as
+/// the phase's other labels).
+fn kept_text<'a>(frame: &'a bstd::mem::Frame, args: fmt::Arguments<'_>) -> &'a str {
+    blaze_own::text::format(frame, args).into_bump_str()
 }
 
 /// The row of the member whose own crate's records are `records` (crate 0) and whose expansion
 /// texts are `texts` (`None`: its crate has none), from its WHOLE listing: what the Bodies phase
 /// took from that listing each command (module doc, THE ROW), derived exactly as it was there.
-pub(crate) fn make<'n>(records: &'n Records<'n>, texts: Option<&ExpansionTexts<'n>>, alloc: Alloc<'n>) -> MemberRow<'n, 'n> {
+pub(crate) fn make<'n>(records: &'n Records<'n>, texts: Option<&ExpansionTexts<'n>>, frame: &'n bstd::mem::Frame, alloc: Alloc<'n>) -> MemberRow<'n, 'n> {
     let listed = list_with(records, Listing::FnsAndInitializers, alloc);
     let (written, blocks) = match texts {
         Some(texts) => (covered::written_by(records, texts, &listed, alloc), covered::in_blocks(records, texts, &listed, alloc)),
@@ -238,7 +238,7 @@ pub(crate) fn make<'n>(records: &'n Records<'n>, texts: Option<&ExpansionTexts<'
             if !key.is_some_and(|key| blocks.iter().any(|one| one.key == key)) {
                 uncovered = uncovered.saturating_add(1);
                 if named.len() < MOST_UNCOVERED_NAMED {
-                    named.push(kept_text(alloc, format_args!("{}", covered::written_label(records, w))));
+                    named.push(kept_text(frame, format_args!("{}", covered::written_label(records, w))));
                 }
             }
         }
@@ -246,7 +246,7 @@ pub(crate) fn make<'n>(records: &'n Records<'n>, texts: Option<&ExpansionTexts<'
     let mut placed: AVec<'n, Written<'n>> = AVec::with_capacity_in(written.len(), alloc);
     for w in written.iter() {
         let Ok(top) = w.top else { continue };
-        placed.push(Written { top, key: covered::body_key(records, w.listed.body), by: w.by, label: kept_text(alloc, format_args!("{}", covered::written_label(records, w))) });
+        placed.push(Written { top, key: covered::body_key(records, w.listed.body), by: w.by, label: kept_text(frame, format_args!("{}", covered::written_label(records, w))) });
     }
     let blocks = blocks.map(|blocks| {
         let mut out: AVec<'n, Block<'n>> = AVec::with_capacity_in(blocks.len(), alloc);

@@ -86,14 +86,15 @@ struct Ran<'o> {
 fn run<'o>(mode: Scratch, text: &str, out: Alloc<'o>) -> Ran<'o> {
     let home = Frame::new(Tag::Nameres).unwrap_or_else(|e| panic!("the crate's frame: {e:?}"));
     let erased = Erased::new(&home);
-    let g = erased.handle();
+    let bump = erased.bump();
+    let g = bump.alloc();
     let par = ScratchPar {
         mode,
         frame: RefCell::new(Frame::new(Tag::Expand).unwrap_or_else(|e| panic!("the call scratch: {e:?}"))),
         calls: Cell::new(0),
     };
     let crates = [input("fixture", ROOT, &[])];
-    let names = resolve_crates(&crates, Sysroot::default(), &Fixture(text), &par, g).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &Fixture(text), &par, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     // Measured before anything else is made in the frame.
     let peak = home.peak();
     let abandoned = home.abandoned().bytes;

@@ -67,7 +67,7 @@ use blaze_native::descriptor::{self, DescriptorError, Names};
 use blaze_native::layout::{self, LAYOUT_VERSION, Layout, LayoutError};
 use blaze_native::libraries::{self, Library, LibraryError, LibraryKind, Linked, Source};
 use blaze_native::resolve::{self, Input, InputKind, Origin, ResolveError, Wanted};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, BVec, Bump};
 
 use crate::front2::links::{CrateLinks, LinkKind};
 
@@ -89,15 +89,15 @@ const STATIC_ONLY: &str = "`whole-archive` and `bundle` are only compatible with
      (Reference, items.extern.attributes.link.modifiers)";
 
 /// What the program's native library is made from.
-pub(crate) struct NativeInputs<'a> {
+pub(crate) struct NativeInputs<'b, 'a> {
     pub platform: Platform,
     /// The producer's id (D105), handed down from the entry.
-    pub producer: &'a ProducerId<Whole>,
+    pub producer: &'b ProducerId<Whole>,
     /// Reverse topological order, the program's crate first.
-    pub crates: &'a [CrateNative<'a>],
+    pub crates: &'b [CrateNative<'a>],
     /// The libraries [`asked`] names by an SDK stub, each resolved from the stub's bytes the
     /// caller read (macOS); empty on Linux, whose libraries need no read.
-    pub installs: &'a [Linked<'a>],
+    pub installs: &'b [Linked<'a>],
 }
 
 /// One library the link line asks for, by where its install name comes from, with the first
@@ -168,7 +168,7 @@ pub struct NativeSummary {
 }
 
 /// The key of the program's native library (NATIVE.md 3.1), computed before any work.
-pub(crate) fn native_key<'a>(inputs: &NativeInputs<'a>, alloc: Alloc<'a>) -> Result<ContentId, NativeError<'a>> {
+pub(crate) fn native_key<'a>(inputs: &NativeInputs<'_, 'a>, alloc: Alloc<'a>) -> Result<ContentId, NativeError<'a>> {
     let line = link_line(inputs, alloc)?;
     let linked = bind(&line.libraries, inputs.installs, alloc)?;
     let roots = sorted_names(inputs.crates, |links| links.foreign.as_slice(), alloc)?;
@@ -179,7 +179,7 @@ pub(crate) fn native_key<'a>(inputs: &NativeInputs<'a>, alloc: Alloc<'a>) -> Res
 /// The libraries the program's link line asks for, in link order, each once, by where its
 /// install name comes from: the caller reads each SDK stub ([`Source::Stub`]) and hands the
 /// libraries back resolved in [`NativeInputs::installs`] (whose own value is not read here).
-pub(crate) fn asked<'a>(inputs: &NativeInputs<'a>, alloc: Alloc<'a>) -> Result<AVec<'a, Asked<'a>>, NativeError<'a>> {
+pub(crate) fn asked<'a>(inputs: &NativeInputs<'_, 'a>, alloc: Alloc<'a>) -> Result<AVec<'a, Asked<'a>>, NativeError<'a>> {
     link_line(inputs, alloc).map(|line| line.libraries)
 }
 
@@ -206,22 +206,23 @@ fn bind<'a>(asked: &[Asked<'a>], installs: &[Linked<'a>], alloc: Alloc<'a>) -> R
 /// [`native_key`] (a store write as run.rs does for code records) and never calls this when the
 /// store has the key. The word names are the record's own ([`word_names`]).
 pub(crate) fn native_library<'a>(
-    inputs: &NativeInputs<'a>,
+    inputs: &NativeInputs<'_, 'a>,
     seed: FixedState,
     out: &mut AVec<'_, u8>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<NativeSummary, NativeError<'a>> {
+    let alloc = bump.alloc();
     let platform = inputs.platform;
     let line = link_line(inputs, alloc)?;
     let linked = bind(&line.libraries, inputs.installs, alloc)?;
     let root_names = sorted_names(inputs.crates, |links| links.foreign.as_slice(), alloc)?;
     let rust_names = export_names(inputs.crates, alloc)?;
     let key = key_of(inputs, &line, &linked, &root_names, &rust_names);
-    let roots = mangled(platform, &root_names, alloc)?;
-    let rust = mangled(platform, &rust_names, alloc)?;
+    let roots = mangled(platform, &root_names, bump)?;
+    let rust = mangled(platform, &rust_names, bump)?;
+    let libraries: &'a [Linked<'a>] = bump.alloc_slice_copy(&linked);
 
     let LinkLine { inputs: listed, libraries: _ } = line;
-    let libraries: &'a [Linked<'a>] = linked.leak();
     let mut objects: AVec<'a, Input<'a>> = AVec::try_with_capacity_in(listed.len(), alloc).map_err(|_| NativeError::Alloc)?;
     for entry in listed.iter() {
         push(&mut objects, Input { from: entry.from, bytes: entry.bytes, kind: entry.kind() })?;
@@ -298,7 +299,7 @@ fn platform_code(platform: Platform) -> u8 {
 }
 
 /// The link line of the program (NATIVE.md 3.2).
-fn link_line<'a>(inputs: &NativeInputs<'a>, alloc: Alloc<'a>) -> Result<LinkLine<'a>, NativeError<'a>> {
+fn link_line<'a>(inputs: &NativeInputs<'_, 'a>, alloc: Alloc<'a>) -> Result<LinkLine<'a>, NativeError<'a>> {
     let platform = inputs.platform;
     let mut line = LinkLine { inputs: AVec::new_in(alloc), libraries: AVec::new_in(alloc) };
     // The C library, which every program's image loads: asked by the program's crate.
@@ -487,7 +488,7 @@ fn add_library<'a>(line: &mut LinkLine<'a>, platform: Platform, package: &'a str
 
 /// Every crate's names `pick` gives, sorted and unique.
 fn sorted_names<'a>(
-    crates: &'a [CrateNative<'a>],
+    crates: &[CrateNative<'a>],
     pick: impl Fn(&'a CrateLinks<'a>) -> &'a [&'a str],
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, &'a str>, NativeError<'a>> {
@@ -506,7 +507,7 @@ fn sorted_names<'a>(
 /// sorted, unique: the native library needs each Rust word once whichever crate exports it. Two
 /// crates exporting one name are refused where the program is assembled (blaze-export
 /// `MergeError::TwoExports`, from the exports' items), not here.
-fn export_names<'a>(crates: &'a [CrateNative<'a>], alloc: Alloc<'a>) -> Result<AVec<'a, &'a str>, NativeError<'a>> {
+fn export_names<'a>(crates: &[CrateNative<'a>], alloc: Alloc<'a>) -> Result<AVec<'a, &'a str>, NativeError<'a>> {
     let mut names = AVec::new_in(alloc);
     for krate in crates {
         for export in krate.links.exports.iter() {
@@ -518,29 +519,30 @@ fn export_names<'a>(crates: &'a [CrateNative<'a>], alloc: Alloc<'a>) -> Result<A
     Ok(names)
 }
 
-/// `names` as the platform's symbol tables write them, sorted and unique, given up into `alloc`
-/// for as long as it lives (the plan and the image borrow them). Sorted again AFTER mangling:
-/// a name marked exact (`\u{1}`, blaze-native `resolve::VERBATIM`) takes no prefix, so the
-/// prefix is not uniform, and `\u{1}_f` and `f` are one Mach-O symbol `_f`, one name.
-fn mangled<'a>(platform: Platform, names: &[&'a str], alloc: Alloc<'a>) -> Result<&'a [&'a [u8]], NativeError<'a>> {
-    let mut text: AVec<'a, u8> = AVec::new_in(alloc);
+/// `names` as the platform's symbol tables write them, sorted and unique, frozen into `bump` for
+/// as long as it lives (the plan and the image borrow them). Sorted again AFTER mangling: a name
+/// marked exact (`\u{1}`, blaze-native `resolve::VERBATIM`) takes no prefix, so the prefix is not
+/// uniform, and `\u{1}_f` and `f` are one Mach-O symbol `_f`, one name.
+fn mangled<'a>(platform: Platform, names: &[&'a str], bump: Bump<'a>) -> Result<&'a [&'a [u8]], NativeError<'a>> {
+    let alloc = bump.alloc();
+    let mut text: BVec<'a, u8> = BVec::new_in(bump);
     let mut ends: AVec<'a, usize> = AVec::try_with_capacity_in(names.len(), alloc).map_err(|_| NativeError::Alloc)?;
     for &name in names {
         let one = resolve::mangle(platform, name, alloc).map_err(NativeError::Resolve)?;
         text.try_extend_from_slice(&one).map_err(|_| NativeError::Alloc)?;
         push(&mut ends, text.len())?;
     }
-    let text: &'a [u8] = text.leak();
-    let mut out: AVec<'a, &'a [u8]> = AVec::try_with_capacity_in(ends.len(), alloc).map_err(|_| NativeError::Alloc)?;
+    let text: &'a [u8] = text.into_bump_slice();
+    let mut out: BVec<'a, &'a [u8]> = BVec::try_with_capacity_in(ends.len(), bump).map_err(|_| NativeError::Alloc)?;
     let mut start = 0;
     for &end in ends.iter() {
         let name = text.get(start..end).ok_or(NativeError::Alloc)?;
-        push(&mut out, name)?;
+        out.try_push(name).map_err(|_| NativeError::Alloc)?;
         start = end;
     }
     out.sort_unstable();
     out.dedup();
-    Ok(out.leak())
+    Ok(out.into_bump_slice())
 }
 
 fn count(h: &mut Hasher, len: usize) {
@@ -548,7 +550,7 @@ fn count(h: &mut Hasher, len: usize) {
 }
 
 /// The key over the link line and the names (NATIVE.md 3.1).
-fn key_of(inputs: &NativeInputs<'_>, line: &LinkLine<'_>, linked: &[Linked<'_>], roots: &[&str], rust: &[&str]) -> ContentId {
+fn key_of(inputs: &NativeInputs<'_, '_>, line: &LinkLine<'_>, linked: &[Linked<'_>], roots: &[&str], rust: &[&str]) -> ContentId {
     let mut h = Hasher::new(KEY_DOMAIN);
     h.update(&NATIVE_FORMAT.to_le_bytes())
         .update(&LAYOUT_VERSION.to_le_bytes())
@@ -612,8 +614,8 @@ mod tests {
         bytes
     }
 
-    fn links<'a>(text: &'a str, alloc: Alloc<'a>) -> CrateLinks<'a> {
-        text_links("t", text, MAC, alloc).unwrap_or_else(|e| panic!("links refused: {e:?}"))
+    fn links<'a>(text: &'a str, bump: Bump<'a>) -> CrateLinks<'a> {
+        text_links("t", text, MAC, bump).unwrap_or_else(|e| panic!("links refused: {e:?}"))
     }
 
     /// The first document of the macOS 27.2 SDK's `usr/lib/libSystem.B.tbd` (`libc.tbd` links
@@ -624,7 +626,7 @@ mod tests {
 
     /// Each `-l<name>` resolved for macOS from the stub text given: what the caller reads from
     /// the SDK and hands back as [`NativeInputs::installs`].
-    fn linked<'a>(stubs: &[(&'a str, &'a [u8])], alloc: Alloc<'a>) -> &'a [Linked<'a>] {
+    fn linked<'a>(stubs: &[(&'a str, &'a [u8])], alloc: Alloc<'a>) -> AVec<'a, Linked<'a>> {
         let mut out: AVec<'a, Linked<'a>> = AVec::new_in(alloc);
         for &(name, bytes) in stubs {
             let Ok(Source::Stub(at)) = libraries::source(Platform::MacosArm64, Library { kind: LibraryKind::Dylib, name }) else {
@@ -632,19 +634,18 @@ mod tests {
             };
             out.push(at.linked(bytes).unwrap_or_else(|e| panic!("the stub of `{name}`: {e}")));
         }
-        out.leak()
+        out
     }
 
-    fn key_with<'a>(text: &'a str, installs: &'a [Linked<'a>], producer: &'a ProducerId<Whole>, alloc: Alloc<'a>) -> Result<ContentId, NativeError<'a>> {
-        // Given up into `alloc` (the test's heap): the refusal returned borrows them.
-        let links: &'a CrateLinks<'a> = blaze_own::Box::leak(blaze_own::Box::new_in(links(text, alloc), alloc));
-        let crates: &'a [CrateNative<'a>] = blaze_own::Box::leak(blaze_own::Box::new_in([CrateNative { package: "t@0.1.0", outputs: None, links }], alloc));
-        native_key(&NativeInputs { platform: Platform::MacosArm64, producer, crates, installs }, alloc)
+    fn key_with<'a>(text: &'a str, installs: &[Linked<'a>], producer: &ProducerId<Whole>, bump: Bump<'a>) -> Result<ContentId, NativeError<'a>> {
+        let links: &'a CrateLinks<'a> = bump.alloc_val(links(text, bump));
+        let crates = [CrateNative { package: "t@0.1.0", outputs: None, links }];
+        native_key(&NativeInputs { platform: Platform::MacosArm64, producer, crates: &crates, installs }, bump.alloc())
     }
 
-    fn key_of_text<'a>(text: &'a str, producer: &'a ProducerId<Whole>, alloc: Alloc<'a>) -> ContentId {
-        let installs = linked(&[("c", LIBSYSTEM), ("z", LIBZ)], alloc);
-        key_with(text, installs, producer, alloc).unwrap_or_else(|e| panic!("key refused: {e:?}"))
+    fn key_of_text<'a>(text: &'a str, producer: &ProducerId<Whole>, bump: Bump<'a>) -> ContentId {
+        let installs = linked(&[("c", LIBSYSTEM), ("z", LIBZ)], bump.alloc());
+        key_with(text, &installs, producer, bump).unwrap_or_else(|e| panic!("key refused: {e:?}"))
     }
 
     /// The install name a library's load command carries is its SDK stub's, and the record's key
@@ -655,18 +656,21 @@ mod tests {
     /// Prints `natives: a stub's install name moves the key; an unread stub is refused`.
     #[test]
     fn the_key_holds_each_stubs_install_name() {
-        let alloc = blaze_own::testing::heap().alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let alloc = bump.alloc();
         let producers = Producers::for_tests(b"natives");
         let producer = producers.get::<Whole>();
         let text = "#[link(name = \"z\")]\nextern \"C\" { fn crc32(); }\n";
         let other: &[u8] = b"--- !tapi-tbd\ntbd-version: 4\ntargets: [ arm64e-macos ]\ninstall-name: '/usr/lib/libz.2.dylib'\n...\n";
-        let one = key_with(text, linked(&[("c", LIBSYSTEM), ("z", LIBZ)], alloc), &producer, alloc);
-        let two = key_with(text, linked(&[("c", LIBSYSTEM), ("z", other)], alloc), &producer, alloc);
+        let one = key_with(text, &linked(&[("c", LIBSYSTEM), ("z", LIBZ)], alloc), &producer, bump);
+        let two = key_with(text, &linked(&[("c", LIBSYSTEM), ("z", other)], alloc), &producer, bump);
         assert!(one.is_ok() && two.is_ok(), "{one:?} {two:?}");
         assert_ne!(one, two, "the key does not hold the stub's install name");
-        let again = key_with(text, linked(&[("c", LIBSYSTEM), ("z", LIBZ)], alloc), &producer, alloc);
+        let again = key_with(text, &linked(&[("c", LIBSYSTEM), ("z", LIBZ)], alloc), &producer, bump);
         assert_eq!(one, again, "one stub, two keys");
-        let unread = key_with(text, linked(&[("c", LIBSYSTEM)], alloc), &producer, alloc);
+        let unread = key_with(text, &linked(&[("c", LIBSYSTEM)], alloc), &producer, bump);
         assert_eq!(unread, Err(NativeError::Unread { package: "t@0.1.0", library: Library { kind: LibraryKind::Dylib, name: "z" } }));
         std::println!("natives: a stub's install name moves the key; an unread stub is refused");
     }
@@ -698,7 +702,7 @@ mod tests {
         // The test's one allocator, made at its top: a frame, its memory from the OS.
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
         let erased = blaze_own::Erased::new(&frame);
-        let alloc = erased.handle();
+        let bump = erased.bump();
         let producers = Producers::for_tests(b"natives");
         let producer = producers.get::<Whole>();
         let before = "#[link(name = \"z\")]\nextern \"C\" { fn crc32(); }\n\
@@ -707,8 +711,8 @@ mod tests {
                     #[unsafe(no_mangle)] pub extern \"C\" fn cb() -> i32 { let x = 2; x }\n";
         let renamed = "#[link(name = \"z\")]\nextern \"C\" { fn crc32(); }\n\
                        #[unsafe(no_mangle)] pub extern \"C\" fn cb2() -> i32 { 1 }\n";
-        assert_eq!(key_of_text(before, &producer, alloc), key_of_text(body, &producer, alloc));
-        assert_ne!(key_of_text(before, &producer, alloc), key_of_text(renamed, &producer, alloc));
+        assert_eq!(key_of_text(before, &producer, bump), key_of_text(body, &producer, bump));
+        assert_ne!(key_of_text(before, &producer, bump), key_of_text(renamed, &producer, bump));
     }
 
     /// LLVM's `\1` mark (blaze-native `resolve::VERBATIM`; bindgen writes it, libproc 0.14.11's
@@ -720,14 +724,16 @@ mod tests {
     /// Prints `natives: roots of exact and plain names: ["__ZL9UUID_NULL", "_a", "_f"]`.
     #[test]
     fn exact_names_are_mangled_as_is_sorted_and_unique() {
-        let alloc = blaze_own::testing::heap().alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
         let names = ["\u{1}_f", "\u{1}__ZL9UUID_NULL", "a", "f"];
         let mut sorted = names;
         sorted.sort_unstable();
-        let mac = mangled(Platform::MacosArm64, &sorted, alloc).unwrap_or_else(|e| panic!("{e:?}"));
+        let mac = mangled(Platform::MacosArm64, &sorted, bump).unwrap_or_else(|e| panic!("{e:?}"));
         let shown: std::vec::Vec<&str> = mac.iter().map(|n| core::str::from_utf8(n).expect("ASCII")).collect();
         assert_eq!(shown, ["__ZL9UUID_NULL", "_a", "_f"]);
-        let linux = mangled(Platform::LinuxArm64, &sorted, alloc).unwrap_or_else(|e| panic!("{e:?}"));
+        let linux = mangled(Platform::LinuxArm64, &sorted, bump).unwrap_or_else(|e| panic!("{e:?}"));
         let shown_linux: std::vec::Vec<&str> = linux.iter().map(|n| core::str::from_utf8(n).expect("ASCII")).collect();
         // An exact name is the symbol as written on every platform (bindgen writes the Mach-O
         // underscore into it for macOS and leaves it out for Linux): nothing is added or taken.
@@ -744,10 +750,13 @@ mod tests {
     /// Prints `natives: a record with deferred C requests is refused: 2 requests, first cc`.
     #[test]
     fn a_record_with_deferred_c_is_refused() {
-        let alloc = blaze_own::testing::heap().alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let alloc = bump.alloc();
         let producers = Producers::for_tests(b"natives");
         let producer = producers.get::<Whole>();
-        let links = links("", alloc);
+        let links = links("", bump);
         let installs = linked(&[("c", LIBSYSTEM)], alloc);
         let printed = "cargo:rustc-link-search=native=/out\ncargo:rustc-link-lib=static=ring_core_0_17_14_\n";
         let first = "cc\0-c\0/package/crypto/mem.c\0-o\0/out/mem.o";
@@ -759,12 +768,12 @@ mod tests {
         deferred.encode(&mut bytes);
         let outputs = OutputsRef::open(&bytes).unwrap_or_else(|e| panic!("{e:?}"));
         let crates = [CrateNative { package: "ring@0.17.14", outputs: Some((ContentId([3; 32]), outputs)), links: &links }];
-        let got = native_key(&NativeInputs { platform: Platform::MacosArm64, producer: &producer, crates: &crates, installs }, alloc);
+        let got = native_key(&NativeInputs { platform: Platform::MacosArm64, producer: &producer, crates: &crates, installs: &installs }, alloc);
         assert_eq!(got, Err(NativeError::DeferredC { package: "ring@0.17.14", requests: 2, first }));
         let built = record(printed, &[("libring_core_0_17_14_.a", ARCHIVE)], alloc);
         let outputs = OutputsRef::open(&built).unwrap_or_else(|e| panic!("{e:?}"));
         let crates = [CrateNative { package: "ring@0.17.14", outputs: Some((ContentId([3; 32]), outputs)), links: &links }];
-        let inputs = NativeInputs { platform: Platform::MacosArm64, producer: &producer, crates: &crates, installs };
+        let inputs = NativeInputs { platform: Platform::MacosArm64, producer: &producer, crates: &crates, installs: &installs };
         let line = link_line(&inputs, alloc).unwrap_or_else(|e| panic!("the built record refused: {e:?}"));
         assert_eq!(line.inputs.len(), 1);
         assert_eq!(line.inputs[0].from, Origin { package: "ring@0.17.14", file: "libring_core_0_17_14_.a" });
@@ -782,13 +791,14 @@ mod tests {
         // The test's one allocator, made at its top: a frame, its memory from the OS.
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
         let erased = blaze_own::Erased::new(&frame);
-        let alloc = erased.handle();
+        let bump = erased.bump();
+        let alloc = bump.alloc();
         let producers = Producers::for_tests(b"natives");
         let producer = producers.get::<Whole>();
         let printed = "cargo:rustc-link-lib=static=ckzg\ncargo:rustc-link-search=native=/out\ncargo:rustc-link-lib=ckzg\n";
         let bytes = record(printed, &[("libckzg.a", ARCHIVE)], alloc);
         let outputs = OutputsRef::open(&bytes).unwrap_or_else(|e| panic!("{e:?}"));
-        let links = links("", alloc);
+        let links = links("", bump);
         let crates = [CrateNative { package: "c-kzg@2.1.8", outputs: Some((ContentId([7; 32]), outputs)), links: &links }];
         let inputs = NativeInputs { platform: Platform::MacosArm64, producer: &producer, crates: &crates, installs: &[] };
         let line = link_line(&inputs, alloc).unwrap_or_else(|e| panic!("refused: {e:?}"));
@@ -810,10 +820,11 @@ mod tests {
         // The test's one allocator, made at its top: a frame, its memory from the OS.
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
         let erased = blaze_own::Erased::new(&frame);
-        let alloc = erased.handle();
+        let bump = erased.bump();
+        let alloc = bump.alloc();
         let producers = Producers::for_tests(b"natives");
         let producer = producers.get::<Whole>();
-        let links = links("", alloc);
+        let links = links("", bump);
         let installs = linked(&[("c", LIBSYSTEM)], alloc);
         let cases = [
             ("/usr/lib", "cargo:rustc-link-search=native=/usr/lib\ncargo:rustc-link-lib=static=z\n", true),
@@ -825,7 +836,7 @@ mod tests {
             let bytes = record(printed, &[("lib/libz.a", ARCHIVE)], alloc);
             let outputs = OutputsRef::open(&bytes).unwrap_or_else(|e| panic!("{e:?}"));
             let crates = [CrateNative { package: "libz-sys@1.1.22", outputs: Some((ContentId([1; 32]), outputs)), links: &links }];
-            let got = native_key(&NativeInputs { platform: Platform::MacosArm64, producer: &producer, crates: &crates, installs }, alloc);
+            let got = native_key(&NativeInputs { platform: Platform::MacosArm64, producer: &producer, crates: &crates, installs: &installs }, alloc);
             if refused {
                 assert_eq!(got, Err(NativeError::SearchOutsideOutDir { package: "libz-sys@1.1.22", path }), "{path}");
             } else {
@@ -845,10 +856,11 @@ mod tests {
         // The test's one allocator, made at its top: a frame, its memory from the OS.
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
         let erased = blaze_own::Erased::new(&frame);
-        let alloc = erased.handle();
+        let bump = erased.bump();
+        let alloc = bump.alloc();
         let producers = Producers::for_tests(b"natives");
         let producer = producers.get::<Whole>();
-        let links = links("", alloc);
+        let links = links("", bump);
         let pthread = record("cargo:rustc-link-arg=-pthread\n", &[], alloc);
         let rpath = record("cargo:rustc-link-arg=-Wl,-rpath,/x\n", &[], alloc);
         two_crates(&pthread, &pthread, &links, &producer, alloc, None);
@@ -873,7 +885,7 @@ mod tests {
             CrateNative { package: "dep@0.1.0", outputs: Some((ContentId([3; 32]), b)), links },
         ];
         let installs = linked(&[("c", LIBSYSTEM)], alloc);
-        let got = native_key(&NativeInputs { platform: Platform::MacosArm64, producer, crates: &crates, installs }, alloc).err();
+        let got = native_key(&NativeInputs { platform: Platform::MacosArm64, producer, crates: &crates, installs: &installs }, alloc).err();
         assert_eq!(got, expected);
     }
 }

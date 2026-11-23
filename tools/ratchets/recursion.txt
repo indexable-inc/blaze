@@ -48,7 +48,7 @@ blaze-solve	5
 blaze-sql	4
 blaze-squeeze	1
 blaze-std	5
-gpu	6
+gpu	5
 ix-prof	2
 parser	7
 stdx	4

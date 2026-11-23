@@ -60,7 +60,7 @@ fn a_rust_program_without_std_starts_at_main() {
     let user = UserCrate { name: "hello", dir: "/hello/", root: "/hello/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names: Names<'_> = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names: Names<'_> = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let linked = linked_lang_start(&names, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the start rule: {e}"));
     assert_eq!(linked, None, "a graph with no std links no `#[lang = \"start\"]`");
     let main = main_of(&names);
@@ -81,7 +81,7 @@ fn a_no_std_root_on_the_shelf_starts_at_main() {
     let user = UserCrate { name: "hello", dir: "/hello/", root: "/hello/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names: Names<'_> = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names: Names<'_> = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let linked = linked_lang_start(&names, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the start rule: {e}"));
     assert_eq!(linked, None, "a `#![no_std]` root links core only: no `#[lang = \"start\"]`");
 }
@@ -97,7 +97,7 @@ fn a_std_program_starts_through_lang_start() {
     let user = UserCrate { name: "hello", dir: "/hello/", root: "/hello/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names: Names<'_> = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names: Names<'_> = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let linked = linked_lang_start(&names, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the start rule: {e}"));
     let lib = linked.expect("a program with std links `#[lang = \"start\"]`");
     let name = names.item_text(lib).and_then(|t| t.name).expect("lang_start has a name");

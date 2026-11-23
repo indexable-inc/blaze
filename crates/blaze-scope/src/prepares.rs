@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use blaze_expand::{Call, ExpandCx, ExpandError, Expanded, MacroDefinition, Prepared, expand, expand_prepared, prepare};
 use blaze_hash::HashMap;
 use blaze_id::ItemKey;
-use blaze_own::{Alloc, Box};
+use blaze_own::{Alloc, Bump};
 
 /// Each declarative definition a call named, prepared once, by the key of its defining item:
 /// its definition does not depend on the call's shape or site, so the key covers every input
@@ -17,7 +17,7 @@ use blaze_own::{Alloc, Box};
 /// for a lookup or an insert, never across a prepare; two threads preparing one definition at
 /// once build equal values and the first kept is the one every call uses.
 pub struct Prepares<'d> {
-    alloc: Alloc<'d>,
+    alloc: Bump<'d>,
     by_item: Mutex<HashMap<ItemKey, Kept<'d>, Alloc<'d>>>,
     /// Per definition, by the same key: whether its text may write an item
     /// ([`Prepares::may_declare`]). A property of the definition alone (rule 65).
@@ -55,8 +55,9 @@ impl<'d> Kept<'d> {
 impl<'d> Prepares<'d> {
     /// An empty set, itself kept in `alloc` beside what it holds (it lives as long as they do,
     /// and every user borrows it for that long).
-    pub fn new_in(alloc: Alloc<'d>) -> &'d Prepares<'d> {
-        Box::leak(Box::new_in(Prepares { alloc, by_item: Mutex::new(HashMap::new_in(alloc)), declares: Mutex::new(HashMap::new_in(alloc)) }, alloc))
+    pub fn new_in(alloc: Bump<'d>) -> &'d Prepares<'d> {
+        let a = alloc.alloc();
+        alloc.alloc_val(Prepares { alloc, by_item: Mutex::new(HashMap::new_in(a)), declares: Mutex::new(HashMap::new_in(a)) })
     }
 
     /// Whether the definition kept under `item`, whose text `text` is (a `macro_rules!`'s
@@ -79,6 +80,11 @@ impl<'d> Prepares<'d> {
 
     /// The allocator the definitions are kept in.
     pub fn alloc(&self) -> Alloc<'d> {
+        self.alloc.alloc()
+    }
+
+    /// The bump arena the definitions are kept in.
+    pub fn bump(&self) -> Bump<'d> {
         self.alloc
     }
 
@@ -99,9 +105,9 @@ impl<'d> Prepares<'d> {
     /// `def` prepared and kept under `item`; the one kept first when another thread kept it
     /// meanwhile.
     pub fn keep(&self, item: ItemKey, def: MacroDefinition<'d>) -> Kept<'d> {
-        let def: &'d MacroDefinition<'d> = Box::leak(Box::new_in(def, self.alloc));
+        let def: &'d MacroDefinition<'d> = self.alloc.alloc_val(def);
         let kept = match prepare(def) {
-            Ok(prepared) => Kept::Prepared(Box::leak(Box::new_in(prepared, self.alloc))),
+            Ok(prepared) => Kept::Prepared(self.alloc.alloc_val(prepared)),
             Err(_) => Kept::Written(def),
         };
         *self.held().entry(item).or_insert(kept)

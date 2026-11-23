@@ -903,7 +903,7 @@ Every promise of a doc comment or an effect attribute and how it is held
 `Evidence:` or `Unverified:`, an effect attribute, a `# Safety` obligation, a proved contract.
 A checked attribute and an obligation are counted, not listed.
 
-4175 claims. By level: 31 none, 4 unverified, 384 obligation, 3716 checked, 0 tested, 2 simulated, 0 model-checked, 38 proved.
+4188 claims. By level: 31 none, 4 unverified, 385 obligation, 3728 checked, 0 tested, 2 simulated, 0 model-checked, 38 proved.
 
 ### Totals
 
@@ -931,7 +931,7 @@ A checked attribute and an obligation are counted, not listed.
 | blaze-malloc | 0 | 0 | 27 | 0 | 0 | 0 | 0 | 0 |
 | blaze-mem | 0 | 0 | 26 | 0 | 0 | 0 | 0 | 0 |
 | blaze-memo | 0 | 0 | 10 | 0 | 0 | 0 | 0 | 0 |
-| blaze-own | 21 | 0 | 46 | 8 | 0 | 0 | 0 | 0 |
+| blaze-own | 21 | 0 | 47 | 8 | 0 | 0 | 0 | 0 |
 | blaze-pg | 0 | 0 | 0 | 188 | 0 | 0 | 0 | 0 |
 | blaze-profile | 0 | 0 | 9 | 0 | 0 | 0 | 0 | 0 |
 | blaze-queue | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |
@@ -943,10 +943,10 @@ A checked attribute and an obligation are counted, not listed.
 | blaze-sort | 0 | 0 | 5 | 0 | 0 | 0 | 0 | 0 |
 | blaze-sql | 0 | 0 | 0 | 179 | 0 | 0 | 0 | 0 |
 | blaze-sqlite | 4 | 0 | 1 | 6 | 0 | 0 | 0 | 0 |
-| blaze-std | 0 | 0 | 19 | 1260 | 0 | 0 | 0 | 0 |
+| blaze-std | 0 | 0 | 19 | 1262 | 0 | 0 | 0 | 0 |
 | blaze-store-check | 0 | 0 | 8 | 0 | 0 | 0 | 0 | 0 |
 | blaze-surface | 0 | 0 | 3 | 0 | 0 | 0 | 0 | 0 |
-| blaze-sys | 0 | 4 | 86 | 1495 | 0 | 0 | 0 | 0 |
+| blaze-sys | 0 | 4 | 86 | 1505 | 0 | 0 | 0 | 0 |
 | blaze-text | 0 | 0 | 5 | 0 | 0 | 0 | 0 | 0 |
 | blaze-trace | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |
 | blaze-url | 0 | 0 | 0 | 58 | 0 | 0 | 0 | 0 |
@@ -1017,8 +1017,8 @@ A checked attribute and an obligation are counted, not listed.
 - **`blaze-own::thin_arc::ThinArc#2`** *none* none (`crates/blaze-own/src/thin_arc.rs:119`): For the private empty-string sentinel used exclusively by [`ThinStr`], `ptr` points to [`EMPTY_STR`] (`strong == u32::MAX`, `len == 0`) and only `HeaderPrefix` is ever read.
 - **`blaze-own::thin_vec::ThinVec#1`** *none* none (`crates/blaze-own/src/thin_vec.rs:85`): When `header().cap == 0`, `ptr` points to [`EMPTY_HEADER`] (`len == 0`) and nothing is allocated; [`EMPTY_HEADER`] is never mutated.
 - **`blaze-own::thin_vec::ThinVec#2`** *none* none (`crates/blaze-own/src/thin_vec.rs:87`): When `header().cap > 0`, `ptr` points to a mutable heap block allocated by `alloc` with `block_layout::<T>(cap)`, with full-block provenance; `len <= cap`, and the first `len` slots starting at `data_offset::<T>()` hold initialized `T` values.
-- **`blaze-own::vec::Drain#1`** *none* none (`crates/blaze-own/src/vec.rs:1212`): The vector's length is the range's start; slots `front..back` hold the values not yet given out, `tail_start..tail_start + tail_len` the values after the range, which the drop moves down to the length.
-- **`blaze-own::vec::IntoIter#1`** *none* none (`crates/blaze-own/src/vec.rs:1124`): Slots `front..back` of `buf` hold the values not yet given out.
+- **`blaze-own::vec::Drain#1`** *none* none (`crates/blaze-own/src/vec.rs:1233`): The vector's length is the range's start; slots `front..back` hold the values not yet given out, `tail_start..tail_start + tail_len` the values after the range, which the drop moves down to the length.
+- **`blaze-own::vec::IntoIter#1`** *none* none (`crates/blaze-own/src/vec.rs:1145`): Slots `front..back` of `buf` hold the values not yet given out.
 - **`blaze-own::vec::Vec#1`** *none* none (`crates/blaze-own/src/vec.rs:36`): The first `len` slots of `buf` hold values; `len <= buf.capacity()`.
 - **`blaze-shapes::hunts_find_the_hit#1`** *proved* proved (`lean/theorems.json`): The statement blaze generates from the fixture's theorem function hunts_find_the_hit holds of its model: a loop that returns, or breaks with, a field its match arm bound gives the Rust's values on the inputs it names. Evidence: Lean blaze_shapes.hunts_find_the_hit.spec.proof.
 - **`blaze-sqlite::CText#1`** *none* none (`crates/blaze-sqlite/src/lib.rs:470`): `CText::bytes` ends in a NUL and holds no other. Upheld by `nul_terminated`, its one constructor.

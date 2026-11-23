@@ -47,7 +47,7 @@ use core::cell::RefCell;
 use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ids::{Domain, Hasher};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, Bump};
 use blaze_surface::{Binding, CrateRootHead, CrateRootView, DefKind, Globs, ItemKind, MacroShapes, Namespace, RefusedWhy, ScopeView};
 
 use crate::cell_key::{BindingKey, BindingKeys, CellKey, cell_key};
@@ -654,10 +654,11 @@ pub const MAX_ROWS: usize = 1 << 24;
 /// The cell table of a crate just solved, from the two records written of it: what the crate's
 /// `CrateScope` record files beside them (blaze-cli names.rs). Item texts are read from the
 /// solve's own files and expansions; each of `wholes` is a [`NameCell::Whole`].
-pub fn crate_table<'a>(names: &CrateNames<'a>, names_record: &[u8], items_record: &[u8], wholes: &[(Section, &[u8])], alloc: Alloc<'a>) -> Result<AVec<'a, u8>, CellsError> {
-    let record = NamesRecord::open(Verified::check(aligned(names_record, alloc)).map_err(CellsError::Names)?);
-    let mut items = ItemsRecord::open(aligned(items_record, alloc), alloc).map_err(CellsError::Items)?;
-    items.use_solved_texts(names);
+pub fn crate_table<'a>(names: &CrateNames<'a>, names_record: &[u8], items_record: &[u8], wholes: &[(Section, &[u8])], bump: Bump<'a>) -> Result<AVec<'a, u8>, CellsError> {
+    let alloc = bump.alloc();
+    let record = NamesRecord::open(Verified::check(aligned(names_record, bump)).map_err(CellsError::Names)?);
+    let mut items = ItemsRecord::open(aligned(items_record, bump), alloc).map_err(CellsError::Items)?;
+    items.use_solved_texts(names, bump);
     let read = |of: TextOf<'_>| -> Option<&'a str> {
         match of {
             TextOf::File { index, .. } => names.files.get(index as usize).map(|file| file.text),

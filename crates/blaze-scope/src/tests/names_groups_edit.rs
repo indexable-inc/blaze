@@ -89,7 +89,7 @@ fn drive_marked(before: &Groups, after: &Groups, texts: &'static Texts, moved: &
     let edit = Edit { old: &old, own: &own, moved };
     let solve_crate = move |members: Members<'_>| -> Result<Solved<'static>, CrateScopeError<'static>> {
         mark(marks, String::from("graph"));
-        let g = blaze_own::testing::heap().alloc();
+        let g = super::SyncFrame::leaked();
         let solved = resolve_members(&input("k0", "/k0/lib.rs", &[]), &[], Sysroot::default(), texts, 0, &Only { marks }, members, g)?;
         mark(marks, String::from("driver.re_solve"));
         Ok(solved)
@@ -268,7 +268,7 @@ impl crate::cells::GroupRecords for FreshRecords<'_> {
 fn solve_alone(texts: &'static Texts, records: &Groups, paths: &[&str], tree: Option<&[u8]>) -> Vec<NameGroup<'static>> {
     let mut members: Vec<ItemKey> = records.groups.iter().flat_map(|(ps, g)| ps.iter().zip(g.members.iter()).filter(|(p, _)| paths.contains(&p.as_str())).map(|(_, k)| *k)).collect();
     members.sort();
-    let g = blaze_own::testing::heap().alloc();
+    let g = super::SyncFrame::leaked();
     let members = Members { members: &members, records: &FreshRecords(records), tree };
     resolve_members(&input("k0", "/k0/lib.rs", &[]), &[], Sysroot::default(), texts, 0, &Serial, members, g).unwrap_or_else(|e| panic!("solve alone: {e:?}")).groups.iter().cloned().collect()
 }

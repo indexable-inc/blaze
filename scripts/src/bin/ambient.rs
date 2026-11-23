@@ -15,12 +15,10 @@
 //! compiler, as `untyped` and `allocs` hold theirs: a gate step of the `scripts` job
 //! (.github/workflows/blaze.yaml), beside them. thirdparty.rs holds the third-party crates.
 //!
-//! The scanning is untyped.rs's (`item_end`, `comment_end`, `string_end`, `quote_end`,
-//! `word_end`, `raw_end`, `ident_len`, `test_path`, `module_files`, `crate_of`, `added_lines`,
-//! the file walk of `count`), kept self-contained as untyped.rs keeps its copy of allocs.rs's;
-//! the three go into one shared module of blaze-script together (AGENTS.md
-//! one-concept-one-home). The attribute matchers are written by hand, not with `regex`, and a
-//! manifest is read by the small TOML reader here, so this script needs no third-party crate.
+//! Test code, the text scanner primitives (`item_end`, `comment_end`, `string_end`, `quote_end`,
+//! `word_end`, `ident_len`, `is_ident`), path/crate helpers (`test_path`, `module_files`,
+//! `crate_of`, `Members`), `Hit`, `BaseError` and `added_lines` are `blaze_script::ratchet`'s
+//! (AGENTS.md one-concept-one-home). A manifest is read by the small TOML reader here.
 
 /// What the usage error prints.
 const DOC: &str = r#"ambient: what each crate takes from `std` and `alloc`, and from their collections, only goes down (docs/v2/plan/design/bottom.md; AGENTS.md nothing-ambient, rule 75).
@@ -122,7 +120,10 @@ use blaze_script::{
     finding::{self, Finding},
     git,
     input::{self, Fields, Input, InputError},
-    ratchet::Members,
+    ratchet::{
+        BaseError, Hit, Members, Tests, added_lines, comment_end, crate_of, ident_len, is_ident, item_end, module_files, quote_end,
+        string_end, test_path, word_end,
+    },
     read_text, universal_newlines,
 };
 
@@ -160,9 +161,6 @@ const SCRIPT: &str = "ambient";
 /// The list, from the root.
 const LIST: &str = "tools/ratchets/std-alloc.txt";
 const TEST_DIRS: [&str; 2] = ["tests", "benches"];
-const TEST_FILES: [&str; 2] = ["tests.rs", "test.rs"];
-/// The files whose out-of-line modules are beside them, not in a directory named for them.
-const ROOT_FILES: [&str; 4] = ["lib.rs", "main.rs", "mod.rs", "build.rs"];
 /// The crates whose collections are blaze's own: a name imported from one is not `std`'s.
 const OWN: [&str; 4] = ["blaze_own", "own", "blaze_mem", "blaze_hash"];
 /// The first segments of a path inside the crate: a name imported by one is the crate's.
@@ -312,19 +310,13 @@ impl Kind {
 /// A crate's counts, by [`Kind::column`].
 type Row = [usize; 4];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Site {
-    /// Relative to the root.
-    path: String,
-    line: usize,
-    kind: Kind,
-}
+type Site = Hit<Kind>;
 
 /// The counts of `sites`, by kind.
 fn tally(sites: &[Site]) -> Row {
     let mut row = [0; 4];
     for it in sites {
-        row[it.kind.column()] += 1;
+        row[it.what.column()] += 1;
     }
     row
 }
@@ -354,26 +346,18 @@ impl fmt::Display for ListError {
     }
 }
 
-/// The base could not be read: which base, and what of it.
+/// The base could not be read: a git/diff error, or the base's list did not read.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BaseError {
-    /// `base` names no commit of the checkout; `why` is git's message.
-    NoCommit { base: String, why: String },
-    /// A git command about `base` failed: `what` it was to do, and git's message.
-    Git { base: String, what: &'static str, why: String },
-    /// The base's list does not read.
+enum AtBaseError {
+    Base(BaseError),
     List { base: String, error: ListError },
-    /// A hunk header of git's diff that is not one.
-    Hunk { text: String },
 }
 
-impl fmt::Display for BaseError {
+impl fmt::Display for AtBaseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BaseError::NoCommit { base, why } => write!(f, "the base {base} is no commit here (fetch it): {why}"),
-            BaseError::Git { base, what, why } => write!(f, "git could not {what} at the base {base}: {why}"),
-            BaseError::List { base, error } => write!(f, "at the base {base}: {error}"),
-            BaseError::Hunk { text } => write!(f, "git diff's hunk {text:?} is not `@@ -<line>[,<n>] +<line>[,<n>] @@`"),
+            AtBaseError::Base(error) => write!(f, "{error}"),
+            AtBaseError::List { base, error } => write!(f, "at the base {base}: {error}"),
         }
     }
 }
@@ -409,27 +393,8 @@ impl fmt::Display for TreeError {
 }
 
 impl std::error::Error for ListError {}
-impl std::error::Error for BaseError {}
+impl std::error::Error for AtBaseError {}
 impl std::error::Error for TreeError {}
-
-/// The byte of `line` after the outer attribute it starts with (spaces before it allowed) when
-/// that attribute is `#[cfg(test)]` or `#[cfg(all(test, ..))]`: untyped.rs's `cfg_test`
-/// pattern, `\A\s*#\[cfg\((?:test|all\(test\b[^\]]*)\)\]`, read by hand.
-fn cfg_test_end(line: &str, inner: bool) -> Option<usize> {
-    let trimmed = line.trim_start();
-    let at = line.len() - trimmed.len();
-    let open = if inner { "#![cfg(" } else { "#[cfg(" };
-    let rest = trimmed.strip_prefix(open)?;
-    if rest.starts_with("test)]") {
-        return Some(at + open.len() + "test)]".len());
-    }
-    let inside = rest.strip_prefix("all(test")?;
-    if inside.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_') {
-        return None;
-    }
-    let close = inside.find(']')?;
-    (close > 0 && inside.as_bytes()[close - 1] == b')').then(|| at + open.len() + "all(test".len() + close + 1)
-}
 
 /// The byte of `line` after the attribute it starts with when that attribute is
 /// `#[cfg(any(test, feature = "testing"))]` (either order, any spacing): a module only tests
@@ -445,33 +410,6 @@ fn cfg_testing_end(line: &str, inner: bool) -> Option<usize> {
     let cond: String = rest[..close].chars().filter(|c| !c.is_whitespace()).collect();
     let testing = matches!(cond.as_str(), "any(test,feature=\"testing\"))" | "any(feature=\"testing\",test))");
     testing.then(|| at + open.len() + close + 1)
-}
-
-/// The byte of `line` after the attribute it starts with when its path ends in the word `test`
-/// (`#[test]`, `#[tokio::test(..)]`): untyped.rs's `test_fn`, `\A\s*#\[(?:\w+::)*test\b[^\]]*\]`.
-fn test_attr_end(line: &str) -> Option<usize> {
-    let trimmed = line.trim_start();
-    let at = line.len() - trimmed.len();
-    let rest = trimmed.strip_prefix("#[")?;
-    let mut from = 0;
-    // Bounded: each turn reads one word of the path and moves past it.
-    let last = loop {
-        let len = ident_len(&rest.as_bytes()[from..]);
-        if len == 0 {
-            return None;
-        }
-        let word = &rest[from..from + len];
-        from += len;
-        match rest[from..].strip_prefix("::") {
-            Some(_) => from += 2,
-            None => break word,
-        }
-    };
-    if last != "test" {
-        return None;
-    }
-    let close = rest[from..].find(']')?;
-    Some(at + 2 + from + close + 1)
 }
 
 /// The name of the module `line` declares out of line (`mod m;`, after attributes and `pub` or
@@ -567,29 +505,21 @@ fn path_attr(line: &str) -> Option<&str> {
 
 /// The sites of one file's text and the modules it declares out of line.
 fn scan_file(text: &str) -> Scanned {
+    scan_file_with(&Tests::new(SCRIPT), text)
+}
+
+fn scan_file_with(tests: &Tests, text: &str) -> Scanned {
+    let file_tests = tests.of(text);
     let lines: Vec<&str> = text.split('\n').collect();
-    let mut test = vec![false; lines.len()];
+    let test = file_tests.test;
     // The lines under `cfg(any(test, feature = "testing"))`: test code for the heap columns.
     let mut testing = vec![false; lines.len()];
-    let mut out = Scanned::default();
+    let mut out = Scanned { test: file_tests.whole, ..Scanned::default() };
     // A `#[path]` on an attribute line, waiting for the `mod` it is on.
     let mut path: Option<&str> = None;
     // The byte where line `at` starts.
     let mut start = 0;
     for (at, line) in lines.iter().enumerate() {
-        if cfg_test_end(line, true).is_some() {
-            out.test = true;
-        }
-        if let Some(end) = cfg_test_end(line, false).or_else(|| test_attr_end(line)) {
-            // The item runs from after the attribute to its `}` or `;`, on the line of that byte.
-            let last = match item_end(text, start + end) {
-                Some(end) => at + text[start..end - 1].matches('\n').count(),
-                None => at,
-            };
-            for it in &mut test[at..=last] {
-                *it = true;
-            }
-        }
         if cfg_testing_end(line, true).is_some() {
             out.testing = true;
         }
@@ -758,7 +688,7 @@ fn top_level(text: &str) -> Vec<&str> {
 /// The word that ends `text` after its trailing spaces, empty when it ends in no word.
 fn trailing_word(text: &str) -> &str {
     let text = text.trim_end();
-    let len = text.bytes().rev().take_while(|b| b.is_ascii_alphanumeric() || *b == b'_').count();
+    let len = text.bytes().rev().take_while(|b| is_ident(*b)).count();
     &text[text.len() - len..]
 }
 
@@ -882,136 +812,6 @@ fn all_sites(text: &str) -> (Vec<(usize, Kind)>, Vec<(usize, Effect)>) {
     (sites.into_iter().collect(), effects.into_iter().collect())
 }
 
-/// The byte after the `}` or `;` that ends the item starting at byte `from` of `text`: the
-/// first `;` outside brackets, or the `}` that closes its first brace; `None` when a closing
-/// bracket comes first (the item is part of a larger one) or the text ends. Comments, strings
-/// (raw and byte strings too) and character literals are skipped, so a brace in them counts not.
-fn item_end(text: &str, from: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut depth: usize = 0;
-    let mut at = from;
-    // Bounded: every turn moves `at` forward, to the end of the text at most.
-    while at < bytes.len() {
-        let byte = bytes[at];
-        let next = bytes.get(at + 1).copied();
-        at = match byte {
-            b'/' if next == Some(b'/') => text[at..].find('\n').map_or(bytes.len(), |n| at + n),
-            b'/' if next == Some(b'*') => comment_end(bytes, at),
-            b'"' => string_end(bytes, at + 1),
-            b'\'' => quote_end(text, at),
-            b'{' | b'(' | b'[' => {
-                depth += 1;
-                at + 1
-            }
-            b'}' | b')' | b']' => {
-                depth = depth.checked_sub(1)?;
-                if byte == b'}' && depth == 0 {
-                    return Some(at + 1);
-                }
-                at + 1
-            }
-            b';' if depth == 0 => return Some(at + 1),
-            b'_' | b'a'..=b'z' | b'A'..=b'Z' => word_end(text, at),
-            _ => at + 1,
-        };
-    }
-    None
-}
-
-/// The byte after the block comment that opens at `from`, comments nested in it included.
-fn comment_end(bytes: &[u8], from: usize) -> usize {
-    let mut depth: usize = 0;
-    let mut at = from;
-    while at + 1 < bytes.len() {
-        match (bytes[at], bytes[at + 1]) {
-            (b'/', b'*') => {
-                depth += 1;
-                at += 2;
-            }
-            (b'*', b'/') => {
-                depth = depth.saturating_sub(1);
-                at += 2;
-                if depth == 0 {
-                    return at;
-                }
-            }
-            _ => at += 1,
-        }
-    }
-    bytes.len()
-}
-
-/// The byte after the `"` that closes a string whose text starts at `from`.
-fn string_end(bytes: &[u8], from: usize) -> usize {
-    let mut at = from;
-    while at < bytes.len() {
-        match bytes[at] {
-            b'\\' => at += 2,
-            b'"' => return at + 1,
-            _ => at += 1,
-        }
-    }
-    bytes.len()
-}
-
-/// The byte after the character literal at the `'` at `at`, or after the `'` alone when it opens
-/// a lifetime or a label.
-fn quote_end(text: &str, at: usize) -> usize {
-    let rest = &text[at + 1..];
-    if rest.starts_with('\\') {
-        // An escape (`'\n'`, `'\''`, `'\u{7f}'`): closed by the next quote after the escaped one.
-        return rest.get(2..).and_then(|it| it.find('\'')).map_or(text.len(), |n| at + 3 + n + 1);
-    }
-    match rest.chars().next() {
-        Some(c) if rest[c.len_utf8()..].starts_with('\'') => at + 1 + c.len_utf8() + 1,
-        _ => at + 1,
-    }
-}
-
-/// The length of the identifier (or number) `bytes` starts with: ASCII letters, digits and `_`.
-fn ident_len(bytes: &[u8]) -> usize {
-    bytes.iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count()
-}
-
-/// The byte after the word at `at`, after the literal it prefixes (`r#"..."#`, `b"..."`,
-/// `br"..."`, `c"..."`, `b'x'`), or after the raw identifier it starts (`r#type`, read whole so
-/// that its word is no keyword).
-fn word_end(text: &str, at: usize) -> usize {
-    let bytes = text.as_bytes();
-    let end = at + ident_len(&bytes[at..]);
-    match (&text[at..end], bytes.get(end).copied()) {
-        ("r" | "br" | "cr", Some(b'#' | b'"')) => raw_end(bytes, end),
-        ("b" | "c", Some(b'"')) => string_end(bytes, end + 1),
-        ("b", Some(b'\'')) => quote_end(text, end),
-        _ => end,
-    }
-}
-
-/// The byte after the raw string whose `#`s or `"` start at `from`; for a raw identifier
-/// (`r#type`), the byte after its identifier.
-fn raw_end(bytes: &[u8], from: usize) -> usize {
-    let hashes = bytes[from..].iter().take_while(|b| **b == b'#').count();
-    let open = from + hashes;
-    if bytes.get(open) != Some(&b'"') {
-        return open + ident_len(&bytes[open..]);
-    }
-    let mut at = open + 1;
-    while at < bytes.len() {
-        if bytes[at] == b'"' && bytes[at + 1..].iter().take(hashes).filter(|b| **b == b'#').count() == hashes {
-            return at + 1 + hashes;
-        }
-        at += 1;
-    }
-    bytes.len()
-}
-
-/// Whether the file `parts` is test code by its path.
-fn test_path(parts: &[String]) -> bool {
-    let (name, dirs) = parts.split_last().map_or(("", &[][..]), |(name, dirs)| (name.as_str(), dirs));
-    dirs.iter().any(|part| TEST_DIRS.contains(&part.as_str())) || TEST_FILES.contains(&name)
-}
-
-/// The two files the module `name`, declared out of line in the file `parts`, can be.
 /// The file a `#[path = "<named>"]` on a module the file `parts` declares names: relative to
 /// that file's directory, `.` and `..` taken.
 fn path_file(parts: &[String], named: &str) -> String {
@@ -1026,17 +826,6 @@ fn path_file(parts: &[String], named: &str) -> String {
         }
     }
     out.join("/")
-}
-
-fn module_files(parts: &[String], name: &str) -> [String; 2] {
-    let Some((file, dirs)) = parts.split_last() else { return [String::new(), String::new()] };
-    let mut base: Vec<&str> = dirs.iter().map(String::as_str).collect();
-    let root = ROOT_FILES.contains(&file.as_str()) || dirs.last().is_some_and(|it| it == "bin");
-    if !root {
-        base.push(file.strip_suffix(".rs").unwrap_or(file));
-    }
-    let base = base.join("/");
-    [format!("{base}/{name}.rs"), format!("{base}/{name}/mod.rs")]
 }
 
 /// The `.rs` files and the manifests under crates/, each sorted part by part, each as its parts
@@ -1074,24 +863,6 @@ fn tree_files(root: &Path) -> Result<(Vec<Vec<String>>, Vec<Vec<String>>), TreeE
     sources.sort();
     manifests.sort();
     Ok((sources, manifests))
-}
-
-/// The crate of the file `parts`: the nearest directory above it, under crates/, with a
-/// Cargo.toml, by its path under crates/; the first directory under crates/ when none has one.
-fn crate_of(root: &Path, parts: &[String], manifests: &mut BTreeMap<Vec<String>, bool>) -> String {
-    for end in (2..parts.len()).rev() {
-        let dir = &parts[..end];
-        let has = *manifests.entry(dir.to_vec()).or_insert_with(|| {
-            dir.iter().fold(root.to_path_buf(), |path, part| path.join(part)).join("Cargo.toml").is_file()
-        });
-        if has {
-            return parts[1..end].join("/");
-        }
-    }
-    match parts {
-        [_, first, _, ..] => first.clone(),
-        _ => "crates".to_owned(),
-    }
 }
 
 /// What a manifest's text says of its crate's root, read by sections and `path = ".."` keys:
@@ -1176,7 +947,7 @@ fn count(root: &Path) -> Result<BTreeMap<String, Vec<Site>>, TreeError> {
         let text = std::fs::read(root.join(&path)).map_err(|e| TreeError::Unreadable { path: path.clone(), why: e.to_string() })?;
         if !declares_no_std(&universal_newlines(String::from_utf8_lossy(&text).into_owned())) {
             let krate = parts[1..parts.len() - 1].join("/");
-            out.entry(krate).or_default().push(Site { path, line: 1, kind: Kind::IsStd });
+            out.entry(krate).or_default().push(Site { path, line: 1, what: Kind::IsStd });
         }
     }
     let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
@@ -1188,13 +959,14 @@ fn count(root: &Path) -> Result<BTreeMap<String, Vec<Site>>, TreeError> {
         let krate = crate_of(root, &parts, &mut manifests);
         out.entry(krate)
             .or_default()
-            .extend(found.sites.iter().map(|(line, kind)| Site { path: path.clone(), line: *line, kind: *kind }));
+            .extend(found.sites.iter().map(|(line, kind)| Site { path: path.clone(), line: *line, what: *kind }));
     }
     Ok(out)
 }
 
 /// The tree's files scanned, and which are test code (see [`Walked`]).
 fn walk(root: &Path) -> Result<Walked, TreeError> {
+    let tests = Tests::new(SCRIPT);
     let (files, packages) = tree_files(root)?;
     let known: BTreeSet<String> = files.iter().map(|it| it.join("/")).collect();
     let mut scanned: Vec<(Vec<String>, Scanned)> = Vec::new();
@@ -1208,7 +980,7 @@ fn walk(root: &Path) -> Result<Walked, TreeError> {
         // What is not UTF-8 becomes U+FFFD, as untyped.rs reads it.
         let bytes = std::fs::read(&full).map_err(|e| TreeError::Unreadable { path: path.clone(), why: e.to_string() })?;
         let text = universal_newlines(String::from_utf8_lossy(&bytes).into_owned());
-        let found = scan_file(&text);
+        let found = scan_file_with(&tests, &text);
         if test_path(&parts) || found.test {
             skipped.insert(path.clone());
         }
@@ -1368,64 +1140,28 @@ fn parse_rows(text: &str) -> Result<BTreeMap<String, Row>, ListError> {
     Ok(rows)
 }
 
-/// The lines each file has that `base` did not, from `git diff --unified=0`'s hunks: by path
-/// from the root, the line numbers in the tree.
-fn added_lines(diff: &str) -> Result<BTreeMap<String, BTreeSet<usize>>, BaseError> {
-    let mut out: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
-    let mut file: Option<String> = None;
-    // The lines of the hunk being read, which are text, never a header (`+++ x` is a line `++ x`).
-    let mut skip: usize = 0;
-    for line in diff.split('\n') {
-        if skip > 0 {
-            skip -= 1;
-            continue;
-        }
-        if let Some(path) = line.strip_prefix("+++ ") {
-            // `/dev/null` for a file deleted: no line of it is in the tree.
-            file = path.strip_prefix("b/").map(str::to_owned);
-            continue;
-        }
-        let Some(hunk) = line.strip_prefix("@@ ") else { continue };
-        // `@@ -a,b +c,d @@`: `b` lines from `a` were the base's, `d` from `c` are the tree's
-        // (one when `,b` or `,d` is left out).
-        let range = |sign: char| -> Option<(usize, usize)> {
-            let it = hunk.split(' ').find_map(|it| it.strip_prefix(sign))?;
-            let (from, len) = it.split_once(',').unwrap_or((it, "1"));
-            Some((from.parse().ok()?, len.parse().ok()?))
-        };
-        let (Some((_, removed)), Some((from, len))) = (range('-'), range('+')) else {
-            return Err(BaseError::Hunk { text: line.to_owned() });
-        };
-        skip = removed + len;
-        if let Some(path) = &file {
-            out.entry(path.clone()).or_default().extend(from..from + len);
-        }
-    }
-    Ok(out)
-}
-
 /// What `base` says: its rows (none when it has no list, before the ratchet began), and the lines
 /// added since it under crates/.
 type AtBase = (Option<BTreeMap<String, Row>>, BTreeMap<String, BTreeSet<usize>>);
 
-fn at_base(root: &Path, base: &str) -> Result<AtBase, BaseError> {
+fn at_base(root: &Path, base: &str) -> Result<AtBase, AtBaseError> {
     let root_arg = root.to_string_lossy();
     let dir = root_arg.as_ref();
     let commit = format!("{base}^{{commit}}");
     git(root, &["-C", dir, "rev-parse", "--verify", "--quiet", commit.as_str()])
-        .map_err(|why| BaseError::NoCommit { base: base.to_owned(), why })?;
-    let failed = |what: &'static str| move |why: String| BaseError::Git { base: base.to_owned(), what, why };
+        .map_err(|why| AtBaseError::Base(BaseError::NoCommit { base: base.to_owned(), why }))?;
+    let failed = |what: &'static str| move |why: String| AtBaseError::Base(BaseError::Git { base: base.to_owned(), what, why });
     let listed = git(root, &["-C", dir, "ls-tree", "--name-only", base, "--", LIST]).map_err(failed("list its tree"))?;
     let rows = if listed.trim().is_empty() {
         None
     } else {
         let spec = format!("{base}:{LIST}");
         let text = git(root, &["-C", dir, "show", spec.as_str()]).map_err(failed("show the list"))?;
-        Some(parse_rows(&text).map_err(|error| BaseError::List { base: base.to_owned(), error })?)
+        Some(parse_rows(&text).map_err(|error| AtBaseError::List { base: base.to_owned(), error })?)
     };
     let diff = git(root, &["-C", dir, "diff", "--no-color", "--no-ext-diff", "--no-renames", "--unified=0", base, "--", "crates"])
         .map_err(failed("diff the tree"))?;
-    Ok((rows, added_lines(&diff)?))
+    Ok((rows, added_lines(&diff).map_err(AtBaseError::Base)?))
 }
 
 /// What is wrong: `counts` the tree's sites by crate, `rows` the list's, `base_rows` the base's
@@ -1452,7 +1188,7 @@ fn problems(
                     Some(_) => format!("its row's `{column}` {held}"),
                     None => "0, as a crate with no row is held".to_owned(),
                 };
-                let of_kind = sites.iter().filter(|it| it.kind == kind);
+                let of_kind = sites.iter().filter(|it| it.what == kind);
                 let new = match (kind, added) {
                     // The root is the site whatever the diff says: it is one line of one file.
                     (Kind::IsStd, _) => {
@@ -1556,7 +1292,7 @@ fn main_with(it: &Args) {
     let counts = count(&root).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
     if it.command == "findings" {
         let found = counts.iter().flat_map(|(krate, sites)| {
-            sites.iter().map(|it| Finding { krate: krate.clone(), file: it.path.clone(), line: it.line, kind: it.kind.name(), detail: None })
+            sites.iter().map(|it| Finding { krate: krate.clone(), file: it.path.clone(), line: it.line, kind: it.what.name(), detail: None })
         });
         finding::print(SCRIPT, &KINDS.map(Kind::finding), found.collect());
         return;
@@ -1618,7 +1354,7 @@ fn shown(counts: &BTreeMap<String, Vec<Site>>) -> String {
     let crates: Vec<String> = counts
         .iter()
         .map(|(krate, sites)| {
-            let at: Vec<String> = sites.iter().map(|it| format!("{}:{}:{}", it.path, it.line, it.kind.name())).collect();
+            let at: Vec<String> = sites.iter().map(|it| format!("{}:{}:{}", it.path, it.line, it.what.name())).collect();
             format!("{krate}: {}", at.join(", "))
         })
         .collect();
@@ -1627,7 +1363,7 @@ fn shown(counts: &BTreeMap<String, Vec<Site>>) -> String {
 
 /// One file's sites, for a selftest's expectation.
 fn sites_of(path: &str, lines: &[(usize, Kind)]) -> Vec<Site> {
-    lines.iter().map(|(line, kind)| Site { path: path.to_owned(), line: *line, kind: *kind }).collect()
+    lines.iter().map(|(line, kind)| Site { path: path.to_owned(), line: *line, what: *kind }).collect()
 }
 
 /// The selftest's file of crate `a`, which imports nothing of blaze's own. Line by line:
@@ -1722,15 +1458,24 @@ fn failed(e: &dyn fmt::Display) -> ! {
 }
 
 fn selftest() {
-    // The hand matchers, each against the pattern it reads.
-    expect(test_attr_end("#[test]").is_some() && test_attr_end("  #[tokio::test(flavor = \"x\")]").is_some(), "test attributes");
-    expect(test_attr_end("#[test_case(1)]").is_none() && test_attr_end("#[testing]").is_none(), "an attribute named for no test");
+    // Test attributes and `cfg(test)` matchers, through `blaze_script::ratchet::Tests`.
+    let tests = Tests::new(SCRIPT);
     expect(
-        cfg_test_end("#[cfg(test)]", false) == Some(12)
-            && cfg_test_end("#[cfg(all(test, feature = \"x\"))]", false).is_some()
-            && cfg_test_end("#[cfg(testing)]", false).is_none()
-            && cfg_test_end("#![cfg(test)]", true).is_some()
-            && cfg_test_end("#[cfg(not(test))]", false).is_none(),
+        tests.of("#[test]\nfn t() {}\n").test == [true, true, false]
+            && tests.of("  #[tokio::test(flavor = \"x\")]\nfn t() {}\n").test == [true, true, false],
+        "test attributes",
+    );
+    expect(
+        tests.of("#[test_case(1)]\nfn t() {}\n").test == [false, false, false]
+            && tests.of("#[testing]\nfn t() {}\n").test == [false, false, false],
+        "an attribute named for no test",
+    );
+    expect(
+        tests.of("#[cfg(test)]\nmod t {}\n").test == [true, true, false]
+            && tests.of("#[cfg(all(test, feature = \"x\"))]\nmod t {}\n").test == [true, true, false]
+            && tests.of("#[cfg(testing)]\nmod t {}\n").test == [false, false, false]
+            && tests.of("#![cfg(test)]\n").whole
+            && tests.of("#[cfg(not(test))]\nmod t {}\n").test == [false, false, false],
         "`cfg(test)` and `cfg(all(test, ..))`",
     );
     expect(

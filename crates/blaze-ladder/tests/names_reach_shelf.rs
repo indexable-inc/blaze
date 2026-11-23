@@ -31,7 +31,7 @@ use std::time::Instant;
 
 use blaze_id::ItemKey;
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
-use blaze_own::{AVec, Alloc};
+use blaze_own::AVec;
 use blaze_scope::GroupRead;
 use blaze_scope::task::{Par, Serial};
 
@@ -176,9 +176,8 @@ fn reach(label: &str, main: &str) {
     let user = UserCrate { name: "reach", dir: "/reach/", root: "/reach/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let g = Alloc::global();
     let t0 = Instant::now();
-    let names = inputs.resolve_with(&crates, &Grouped, g).unwrap_or_else(|e| panic!("resolve_crates with groups: {e}"));
+    let names = inputs.resolve_with(&crates, &Grouped, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates with groups: {e}"));
     let solve_s = t0.elapsed().as_secs_f64();
 
     let all = names.crates();
@@ -277,7 +276,7 @@ fn reach(label: &str, main: &str) {
     let t1 = Instant::now();
     // A refusal is printed, not hidden: the column then stays empty and its checks are not run
     // (2026-11-17: core's `MemberRefusal::Textual`, a `macro_rules!` walk out of the members).
-    let (lazy, refused) = match inputs.names_on_demand(&crates, &[root], g) {
+    let (lazy, refused) = match inputs.names_on_demand(&crates, &[root], blaze_own::testing::bump()) {
         Ok(l) => (Some(l), None),
         Err(e) => (None, Some(format!("{e:?}"))),
     };

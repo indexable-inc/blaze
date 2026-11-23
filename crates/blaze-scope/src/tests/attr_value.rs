@@ -51,7 +51,7 @@ use crate::task::{LowerNoteKind, Serial};
 const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn solve_one(text: &'static str) -> &'static CrateNames<'static> {
-    let g = Alloc::global();
+    let g = super::SyncFrame::leaked();
     let of_crate = vec![("/k0/lib.rs", text)];
     let texts: &'static Texts = std::boxed::Box::leak(std::boxed::Box::new(Texts(Vec::leak(vec![&*Vec::leak(of_crate)]))));
     let inputs = vec![input("k0", "/k0/lib.rs", &[])];

@@ -93,18 +93,19 @@ pub(super) struct Side {
 
 impl Side {
     pub(super) fn solve(texts: &'static Texts) -> Side {
-        let g = blaze_own::testing::heap().alloc();
+        let bump = super::SyncFrame::leaked();
+        let g = bump.alloc();
         let inputs = [input("k0", "/k0/lib.rs", &[]), input("k1", "/k1/lib.rs", &[("k0", 0)])];
-        let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
+        let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
         let mut side = Side { bytes: Vec::new(), keys: Vec::new(), tables: Vec::new(), with_items: Vec::new(), items: Vec::new() };
         for (i, s) in solved.iter().enumerate() {
             assert!(s.names.notes.is_empty(), "crate {i}: notes {:?}", s.names.notes);
-            let bytes = aligned(&encode(s.names, g).unwrap_or_else(|e| panic!("encode: {e:?}")), g);
+            let bytes = aligned(&encode(s.names, g).unwrap_or_else(|e| panic!("encode: {e:?}")), bump);
             let record = side.record_of(bytes);
             side.tables.push(table(&record, None, &[], g).unwrap_or_else(|e| panic!("crate {i}'s cell table: {e:?}")).to_vec());
-            let items_bytes = aligned(&items_encode(s.names, g).unwrap_or_else(|e| panic!("items encode: {e:?}")), g);
+            let items_bytes = aligned(&items_encode(s.names, g).unwrap_or_else(|e| panic!("items encode: {e:?}")), bump);
             let text: &'static str = texts.0[i][0].1;
-            let items = super::items_record::one_file(items_bytes, text, g);
+            let items = super::items_record::one_file(items_bytes, text, bump);
             side.items.push(items_bytes);
             let wholes = [(Section::Items, items_bytes)];
             let read = move |of: TextOf<'_>| -> Option<&'static str> { matches!(of, TextOf::File { index: 0, .. }).then_some(text) };
@@ -241,8 +242,9 @@ fn a_private_fn_added_moves_its_own_binding_cell_alone() {
     let z = z.ok().and_then(|r| r.whole(1)).unwrap_or_else(|| panic!("`added` does not resolve in `a`: {z:?}")).key;
     // `mod a { .. }` as an item of the items record: its row's key, not its scope's.
     let a_item = {
-        let g = blaze_own::testing::heap().alloc();
-        let items = super::items_record::one_file(after.items[0], K0_ADDED, g);
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let items = super::items_record::one_file(after.items[0], K0_ADDED, erased.bump());
         (0..items.items()).filter_map(|i| items.item_at(i).ok().flatten()).find(|row| row.kind == ItemKind::Module && row.name == Some("a")).map(|row| row.key)
     };
     let a_item = a_item.unwrap_or_else(|| panic!("k0's items record has no row of `mod a`"));
@@ -255,8 +257,9 @@ fn a_private_fn_added_moves_its_own_binding_cell_alone() {
     std::println!("NAMES CELLS: with the items record, {} cell(s) of k0 moved (floor 4: the binding, the item row, its prefix's beginning, the whole section)", items_moved.len());
     assert!(!items_moved.contains(&NameCell::Item { key: a_item }.key()), "the row of `mod a` moved with an item added inside it");
     let mut candidates: Vec<(std::string::String, [u8; 16])> = std::vec![("Item(added)".into(), NameCell::Item { key: z }.key()), ("Beginning(added)".into(), NameCell::Beginning { first: first_16(z) }.key())];
-    let g = blaze_own::testing::heap().alloc();
-    let items_after = super::items_record::one_file(after.items[0], K0_ADDED, g);
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let items_after = super::items_record::one_file(after.items[0], K0_ADDED, erased.bump());
     for i in 0..items_after.items() {
         if let Ok(Some(row)) = items_after.item_at(i) {
             candidates.push((format!("Item({:?} {:?})", row.kind, row.name), NameCell::Item { key: row.key }.key()));
@@ -373,11 +376,11 @@ static MEMBERS: Texts = Texts(&[&[("/k0/lib.rs", K0_MEMBERS)], &[("/k1/lib.rs", 
 #[test]
 fn the_items_search_cells_agree_with_the_record() {
     let side = Side::solve(&MEMBERS);
-    let g = blaze_own::testing::heap().alloc();
+    let bump = super::SyncFrame::leaked();
     let (mut members, mut variants, mut beginnings, mut absent) = (0usize, 0usize, 0usize, 0usize);
     for krate in 0..side.keys.len() {
         let text: &'static str = MEMBERS.0[krate][0].1;
-        let items = super::items_record::one_file(side.items[krate], text, g);
+        let items = super::items_record::one_file(side.items[krate], text, bump);
         let read = move |of: TextOf<'_>| -> Option<&'static str> { matches!(of, TextOf::File { index: 0, .. }).then_some(text) };
         let record = side.record(krate);
         let wholes = [(Section::Items, side.items[krate])];
@@ -460,13 +463,14 @@ static FOREIGN_AFTER: Texts = Texts(&[&[("/k0/lib.rs", FOREIGN_EDITED)]]);
 
 /// One crate solved: its names record's bytes and its items record's bytes.
 fn foreign_side(texts: &'static Texts) -> (&'static [u8], &'static [u8]) {
-    let g = blaze_own::testing::heap().alloc();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let inputs = [input("k0", "/k0/lib.rs", &[])];
-    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
     let s = &solved[0];
     assert!(s.names.notes.is_empty(), "notes {:?}", s.names.notes);
-    let names = aligned(&encode(s.names, g).unwrap_or_else(|e| panic!("encode: {e:?}")), g);
-    let items = aligned(&items_encode(s.names, g).unwrap_or_else(|e| panic!("items encode: {e:?}")), g);
+    let names = aligned(&encode(s.names, g).unwrap_or_else(|e| panic!("encode: {e:?}")), bump);
+    let items = aligned(&items_encode(s.names, g).unwrap_or_else(|e| panic!("items encode: {e:?}")), bump);
     (names, items)
 }
 
@@ -498,7 +502,7 @@ fn foreign_rows(items: &ItemsRecord<'static>) -> Vec<(&'static str, ItemKey, boo
 /// "C" for every block fails (c); an `Item` digest that left the field out fails (e).
 #[test]
 fn a_foreign_items_block_abi_is_in_its_row() {
-    let g = blaze_own::testing::heap().alloc();
+    let g = super::SyncFrame::leaked();
     let (names_before, items_before) = foreign_side(&FOREIGN_BEFORE);
     let (names_after, items_after) = foreign_side(&FOREIGN_AFTER);
     let before = super::items_record::one_file(items_before, FOREIGN, g);

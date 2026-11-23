@@ -84,11 +84,12 @@ fn with_programs(files: &[SourceFile<'_>], compare: impl for<'n> FnOnce(&'n Name
     let opts = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: OverflowChecks::Off };
     let texts = ProgramTexts::new(files, "src/main.rs", opts, &tc, Panic::Abort).unwrap();
     let user = texts.user();
+    let frame = Frame::new(Tag::Infer).unwrap();
+    let erased = blaze_own::Erased::new(&frame);
     let inputs = Inputs::new(&user, &tc).unwrap();
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).unwrap();
+    let names = inputs.resolve(&crates, erased.bump()).unwrap();
     let entry = checker_of(root_main(&names).unwrap());
-    let frame = Frame::new(Tag::Infer).unwrap();
     let old_frame = Frame::new(Tag::Infer).unwrap();
     let new = Side::new(LazyProgram::new(&names, &frame, files, Some(entry), alloc).unwrap(), entry, alloc);
     let mut old_program = LazyProgram::new(&names, &old_frame, files, Some(entry), alloc).unwrap();

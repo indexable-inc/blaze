@@ -132,8 +132,7 @@ fn token_mark_heads() {
             script: None,
         },
     ];
-    let alloc = blaze_own::testing::heap().alloc();
-    let names = resolve_crates(&crates, Sysroot::default(), &Files, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &Files, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: ROOT }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
     let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));

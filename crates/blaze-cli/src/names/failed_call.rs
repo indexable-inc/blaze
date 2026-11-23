@@ -39,7 +39,7 @@ pub(crate) const FAILED_CALL: u16 = 22;
 /// absent, an expansion that does not read as items) said nothing, and what it would have
 /// written was only "no `X` in `m`" further on (tempo: 28 "no `XApiServer`" behind
 /// jsonrpsee's `#[rpc]`, whose `proc-macro-crate` read of `CARGO` was refused).
-pub(super) fn findings<'n, 'b>(c: &CrateNames<'n>, alloc: blaze_own::Alloc<'b>) -> blaze_own::Vec<Unresolved, Global>
+pub(super) fn findings<'n, 'b>(c: &CrateNames<'n>, bump: blaze_own::Bump<'b>) -> blaze_own::Vec<Unresolved, Global>
 where
     'n: 'b,
 {
@@ -47,11 +47,11 @@ where
     if !c.files.iter().any(|file| file.path.starts_with("/0/")) {
         return own;
     }
-    let mut calls: blaze_own::AVec<'b, blaze_id::ItemKey> = blaze_own::AVec::new_in(alloc);
+    let mut calls: blaze_own::AVec<'b, blaze_id::ItemKey> = blaze_own::AVec::new_in(bump.alloc());
     calls.extend(c.expansions.iter().filter(|(_, e)| e.refused.is_some()).map(|(call, _)| *call));
     calls.sort_unstable();
     for call in calls.iter() {
-        let Some(row) = blaze_scope::names_record::refused_row(c, *call, alloc) else { continue };
+        let Some(row) = blaze_scope::names_record::refused_row(c, *call, bump) else { continue };
         let (path, implicit, failed) = (row.path, row.implicit, row.why);
         let at = c.tables.calls.get(call).map(|src| src.loc);
         let mut message = blaze_own::Vec::new_in(Global);

@@ -52,7 +52,7 @@ Not now:
 ## How work is done
 
 - Work in parallel: lanes write in one directory and never wait on a compile or on a yes (35, 48).
-- Until `blaze run` exists again, a merge's proof is the whole build and its tests, quoted (68).
+- A merge carries the run, check and test smoke of a release blaze built from its exact tree (68).
 - Every command has a timeout; a hang is a bug to report, never one to wait out (69, 18).
 - Facts come from tool output in this session (61); verdicts from real projects, run first (7, 82).
 - Build, test and land: docs/contributing.md. Every doc: docs/README.md.
@@ -63,7 +63,7 @@ One line per rule; the full text is in its heading's skill (.agents/skills/): lo
 covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it with `--write`.
 
 ### Memory and data (skill `memory-and-data`)
-- **11. bump-allocate**: Don't allocate where a borrow does; where you must, name the allocator in code (a frame, `Global`).
+- **11. bump-allocate**: Name the allocator (`Frame`/`Bump`, `Global`); use `into_bump_slice`, never general `.leak()`.
 - **50. one-memory-measure**: Footprint is the measure, the kernel's limit the ceiling; nothing admits work by memory.
 - **51. outputs-are-records**: What outlives a task is a record written once, read in place; no cache but the page cache.
 - **52. cache-by-code-id**: A function's results are cached by its code identity and arguments; nothing invalidates by hand.
@@ -121,7 +121,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 
 ### Design and changing code (skill `changing-code`)
 - **13. fix-through-blaze-lints**: Change many sites with an astlog rules file or a `.clippy.toml` ban: never by text.
-- **24. whole-ports**: A shared signature changes with all its callers in one batch; the tree compiles at every save.
+- **24. whole-ports**: Delete replaced APIs completely, never deprecate; port all callers in one batch so it builds.
 - **28. best-long-term-design**: Pick the best long-term design, not the least work; be proud of the first iteration, then prove it.
 - **29. spec-then-build**: A change that needs a design gets a short spec, then the same lane builds it at once.
 - **30. one-concept-one-home**: One type, one rule, one place per concept; merge duplicates and ban the removed name.
@@ -160,7 +160,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 - **37. land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`; never push to main.
 - **38. own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning lane what changed.
 - **40. credit-people**: Credit a suggestion, diagnosis or patch with a `Co-authored-by:` trailer.
-- **68. proof-before-merge**: Until `blaze run` exists again: the workspace compiles and its tests pass on the exact tree.
+- **68. proof-before-merge**: The PR quotes a release blaze running, checking and testing hello-world on the exact tree.
 
 ### Docs and scripts (skill `docs-and-scripts`)
 - **33. no-mcp**: Agent interfaces are a Unix socket or HTTP with one versioned schema in deterministic CBOR.

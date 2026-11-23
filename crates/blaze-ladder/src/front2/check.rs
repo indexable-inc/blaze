@@ -866,6 +866,18 @@ pub(super) fn ty_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::
                 }
                 seq.push(Step::Lit(")"));
             }
+            Ok(tc::PNode::Record(l)) => {
+                let kids = list(l);
+                seq.push(Step::Lit("record("));
+                joined(&mut seq, kids, ", ");
+                seq.push(Step::Lit(")"));
+            }
+            Ok(tc::PNode::Union(l)) => {
+                let kids = list(l);
+                seq.push(Step::Lit("union("));
+                joined(&mut seq, kids, " | ");
+                seq.push(Step::Lit(")"));
+            }
             Ok(tc::PNode::Ref(m, i)) => {
                 seq.push(Step::Lit(if m == tc::Mutbl::Mut { "&mut " } else { "&" }));
                 seq.push(Step::Ty(i));
@@ -1614,7 +1626,7 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
     let builtin = match self_ty {
         Some(t) => matches!(
             ground.view().node(t).map_err(|error| CheckFail::Check { owner, error })?,
-            tc::PNode::Tuple(_) | tc::PNode::Closure { .. } | tc::PNode::FnDef(..) | tc::PNode::FnPtr(..)
+            tc::PNode::Tuple(_) | tc::PNode::Record(_) | tc::PNode::Closure { .. } | tc::PNode::FnDef(..) | tc::PNode::FnPtr(..)
         ),
         None => false,
     };
@@ -1787,7 +1799,7 @@ fn holds_param(v: tc::PTys<'_>, args: tc::List) -> Result<bool, tc::CheckError> 
                 work.push(term);
                 Some(l)
             }
-            tc::PNode::Tuple(l) | tc::PNode::Adt(_, l) | tc::PNode::FnDef(_, l) | tc::PNode::FnPtr(l, _) | tc::PNode::Dynamic(l) | tc::PNode::ExTrait(_, l) => Some(l),
+            tc::PNode::Tuple(l) | tc::PNode::Record(l) | tc::PNode::Union(l) | tc::PNode::Adt(_, l) | tc::PNode::FnDef(_, l) | tc::PNode::FnPtr(l, _) | tc::PNode::Dynamic(l) | tc::PNode::ExTrait(_, l) => Some(l),
         };
         if let Some(l) = lists {
             work.extend_from_slice(v.list(l)?);
@@ -2219,10 +2231,13 @@ fn lower_heads<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H
         // words, never "no impl". Only an unread candidate can be one (its row's trait is
         // unread), and the names say which calls were refused.
         if b.is_unread(k)
-            && let Some(row) = names.failed_call(k, heads.store().tys.alloc())
+            && let Ok(frame) = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer)
         {
-            b.fail(k, refused_derive_words(&row));
-            continue;
+            let erased = blaze_own::Erased::new(&frame);
+            if let Some(row) = names.failed_call(k, erased.bump()) {
+                b.fail(k, refused_derive_words(&row));
+                continue;
+            }
         }
         let made = heads.make(Want::Impl(k));
         if !matches!(made, Ok(Made::Later(_))) {

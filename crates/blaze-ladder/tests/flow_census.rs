@@ -53,7 +53,7 @@ fn flow_census() {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc_).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let cname = if crates.iter().any(|c| c.name == "bstd") { "bstd" } else { "blaze_std" };
     let krate = crates.iter().position(|c| c.name == cname).expect("bstd is a crate");
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];

@@ -30,7 +30,7 @@ use core::cell::{Cell, Ref, RefCell};
 
 use blaze_hash::HashMap;
 use blaze_id::{CrateItemKey, ItemKey};
-use blaze_own::{ARc, AVec, Alloc, LocalShare};
+use blaze_own::{ARc, AVec, Alloc, Bump, Erased, LocalShare};
 use blaze_scope::attr_values::{RowRefusal, RowValue};
 use blaze_scope::items_record::{CurrentFile, ImplRow, ItemsDecoded, ItemsRecord, ItemsRecordError, LoadItems, RecordItems};
 use blaze_scope::names::{self, PathError, Resolved, Unheld, Why, Written};
@@ -385,10 +385,10 @@ pub trait NamesSource<'n>: Copy {
 
     /// Question 20b: the macro call `call` whose expansion failed (a [`Why::Refused`]'s `call`
     /// with `RefusedWhy::Expansion`): the macro's path as written, whether it is D104's implicit
-    /// `::std::main`, and the matcher's reason, decoded into `alloc`. `None`: no crate's notes
+    /// `::std::main`, and the matcher's reason, decoded into `bump`. `None`: no crate's notes
     /// hold a failure of that call (over records, a row that did not decode is filed in the
     /// log). Read only on an error's path, for its words (path_miss_shown.rs).
-    fn failed_call<'b>(self, call: ItemKey, alloc: Alloc<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
+    fn failed_call<'b>(self, call: ItemKey, bump: Bump<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
     where
         'n: 'b;
 
@@ -723,13 +723,13 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
         c.path_of(module)
     }
 
-    fn failed_call<'b>(self, call: ItemKey, alloc: Alloc<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
+    fn failed_call<'b>(self, call: ItemKey, bump: Bump<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
     where
         'n: 'b,
     {
         // The crate that stored the call refused, joined as its record's writer joins it
         // (blaze-scope names_record.rs `refused_row`, the one join).
-        (0..self.crates().len()).find_map(|krate| blaze_scope::names_record::refused_row(self.krate(krate), call, alloc))
+        (0..self.crates().len()).find_map(|krate| blaze_scope::names_record::refused_row(self.krate(krate), call, bump))
     }
 
     fn each_item(self, krate: usize, each: &mut dyn FnMut(ItemKey, ItemKey)) -> bool {
@@ -893,8 +893,8 @@ pub trait Load<'n> {
     /// the items memo that had the text already.
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<LoadedExpansion<'n>>;
     /// The current FileItems snapshot. Text-backed sources produce it once per file.
-    fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, _surface: blaze_id::ContentId, edition: Edition, alloc: Alloc<'n>) -> Result<Option<CurrentFile<'n>>, ItemsRecordError> {
-        self.file(krate, path).map(|text| CurrentFile::from_text(index, text, edition, alloc)).transpose()
+    fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, _surface: blaze_id::ContentId, edition: Edition, bump: Bump<'n>) -> Result<Option<CurrentFile<'n>>, ItemsRecordError> {
+        self.file(krate, path).map(|text| CurrentFile::from_text(index, text, edition, bump)).transpose()
     }
 }
 
@@ -962,8 +962,8 @@ impl<'n> LoadItems<'n> for Loader<'n> {
         Some(read.text)
     }
 
-    fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, surface: blaze_id::ContentId, edition: Edition, alloc: Alloc<'n>) -> Result<Option<CurrentFile<'n>>, ItemsRecordError> {
-        self.load.file_items(krate, index, path, surface, edition, alloc)
+    fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, surface: blaze_id::ContentId, edition: Edition, bump: Bump<'n>) -> Result<Option<CurrentFile<'n>>, ItemsRecordError> {
+        self.load.file_items(krate, index, path, surface, edition, bump)
     }
 }
 
@@ -1118,9 +1118,10 @@ impl<'n> Records<'n> {
     /// the crates. Nothing is read here.
     pub fn new(keys: &'n [CrateItemKey], load: &'n dyn Load<'n>, log: &'n Log<'n>, frame: &'n blaze_mem::Frame, alloc: Alloc<'n>) -> Records<'n> {
         let origin_parts: ARc<'n, OriginParts<'n>> = ARc::new_in(RefCell::new(HashMap::new_in(alloc)), alloc);
+        let bump = frame.alloc(Erased::new(frame)).bump();
         Records {
             paths: RecordNames::new(keys, Loader { load, log, origins: origin_parts.local_share() }, alloc),
-            items: RecordItems::new(keys, Loader { load, log, origins: origin_parts.local_share() }, alloc),
+            items: RecordItems::new(keys, Loader { load, log, origins: origin_parts.local_share() }, bump),
             keys,
             origin_parts,
             load,
@@ -2082,12 +2083,12 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     /// From the failed-calls section of the names record of the call's crate, by its key's
     /// prefix (blaze-scope names_record.rs `NamesRecord::failed`): no other crate's record is
     /// opened for it.
-    fn failed_call<'b>(self, call: ItemKey, alloc: Alloc<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
+    fn failed_call<'b>(self, call: ItemKey, bump: Bump<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
     where
         'n: 'b,
     {
         let names = self.names_of(self.items.crate_of(call)?)?;
-        match names.failed(call, alloc) {
+        match names.failed(call, bump) {
             Ok(row) => row,
             Err(_) => {
                 self.gap("failed_call: a names record's failed-call row did not decode", Some(call));

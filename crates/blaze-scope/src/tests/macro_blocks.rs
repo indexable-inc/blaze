@@ -181,8 +181,10 @@ fn f() {
     let sibling = constant(&names, *inner, alloc);
     assert_ne!(sibling, enclosing, "reading the enclosing module would select its bool instead");
     assert_eq!(constant(&names, *outer, alloc), enclosing, "the generated module is private to the inner block");
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
     let bytes = encode(names.krate(0), alloc).expect("encode both block scopes");
-    let records = NamesRecord::open(Verified::check(crate::resolve::aligned(&bytes, alloc)).expect("reopen both block scopes"));
+    let records = NamesRecord::open(Verified::check(crate::resolve::aligned(&bytes, erased.bump())).expect("reopen both block scopes"));
     assert_eq!(constant(&records, *inner, alloc), sibling);
     assert_eq!(constant(&records, *outer, alloc), enclosing);
     std::println!("slots::FIELD_A resolves to the attribute's sibling only inside its block, live and reopened");
@@ -305,12 +307,15 @@ fn dollar_crate_in_a_copied_field_names_the_defining_crate() {
     let planted = Err(OriginsError::Rewritten { what: "a block's module text" });
     assert_eq!(lookup(column_in(&planted)), caller_t);
 
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
     let keys = crates.each_ref().map(|c| c.key);
-    let loaded = Loaded([0, 1].map(|i| aligned(&names_record::encode(names.krate(i), alloc).expect("encode names"), alloc)));
+    let loaded = Loaded([0, 1].map(|i| aligned(&names_record::encode(names.krate(i), alloc).expect("encode names"), bump)));
     let records = RecordNames::new(&keys, loaded, alloc);
     let split = expansion_records::write(user, alloc).expect("encode expansions");
     let directory = Directory::open(&split.directory).expect("open expansion directory");
-    let items = ItemsRecord::open(aligned(&items_record::encode(user, alloc).expect("encode items"), alloc), alloc).expect("open items");
+    let items = ItemsRecord::open(aligned(&items_record::encode(user, alloc).expect("encode items"), bump), alloc).expect("open items");
     let row = items.item(local.key).expect("read item row").expect("recorded L");
     let span = row.text.expect("L's recorded text span");
     assert_eq!(span.at, At::Expansion(block));

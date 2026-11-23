@@ -186,7 +186,7 @@ macro_rules! with_program {
         });
     }
     let sources = Files { user: user.files, libs: &roots };
-    let names = resolve_crates(&crates, Sysroot::default(), &sources, &Serial, Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &sources, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let $names = &names;
     let $files = &files[..];
     $body

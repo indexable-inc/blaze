@@ -93,7 +93,7 @@ fn an_rc_across_an_await_is_not_send() {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
 
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
@@ -192,7 +192,7 @@ fn main() {}
     };
     let inputs = Inputs::new(&user, &tc).expect("toolchain and test crate");
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).expect("resolve names");
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("resolve names");
     let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("test frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front end");

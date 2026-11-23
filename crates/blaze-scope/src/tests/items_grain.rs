@@ -68,7 +68,7 @@ impl LoadItems<'static> for Now {
 
 /// `key`'s row against `text`, through a reader that has checked nothing yet.
 fn now(before: &ItemsRecord<'_>, record: &'static [u8], krate: CrateItemKey, text: &'static str, key: ItemKey) -> ItemNow<'static> {
-    let read = RecordItems::new(&[krate], Now { record, text }, Alloc::global());
+    let read = RecordItems::new(&[krate], Now { record, text }, super::SyncFrame::leaked());
     read.item_now_since(key, before).unwrap_or_else(|e| panic!("item {key:?} against today's text: {e:?}")).unwrap_or_else(|| panic!("no row for item {key:?}"))
 }
 
@@ -101,15 +101,16 @@ fn fresh(what: &str, got: ItemNow<'static>, was: &ItemRow<'static>, want: &str, 
 /// The property of the module docs, steps 1 to 4.
 #[test]
 fn an_edit_voids_only_the_items_it_touches() {
-    let g = Alloc::global();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let inputs = [input("k0", PATH, &[])];
-    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
     let names = solved[0].names;
     let a = encode(names, g).unwrap_or_else(|e| panic!("encode: {e:?}"));
     let b = encode(names, g).unwrap_or_else(|e| panic!("encode again: {e:?}"));
     assert!(a == b, "the record encodes to different bytes twice");
-    let bytes = aligned(&a, g);
-    let original = RecordItems::new(&[names.key], Now { record: bytes, text: BEFORE }, g);
+    let bytes = aligned(&a, bump);
+    let original = RecordItems::new(&[names.key], Now { record: bytes, text: BEFORE }, bump);
     let record = original.record(0).expect("the original items record");
     let (f, gk) = (key_of(record, "f"), key_of(record, "g"));
     let was_f = record.item(f).ok().flatten().unwrap_or_else(|| panic!("no row for `f`"));

@@ -143,7 +143,7 @@ fn scopes_of(c: &crate::resolve::CrateNames<'_>) -> Vec<String> {
 /// differs; the reporter tells "private" from that crate's inner record. The whole set's
 /// reasons are compared so on both sides (a private name kept because it may shadow a glob's
 /// still says "private").
-fn same_as_whole(whole: &Names<'static>, per: &[CrateScope<'static>]) -> Result<(), String> {
+fn same_as_whole(whole: &Names<'_>, per: &[CrateScope<'_>]) -> Result<(), String> {
     let plain = |s: &String| s.replace("why: Private", "why: NotFound");
     for (i, c) in whole.crates().iter().enumerate() {
         let w: Vec<String> = scopes_of(c).iter().map(plain).collect();
@@ -158,10 +158,13 @@ fn same_as_whole(whole: &Names<'static>, per: &[CrateScope<'static>]) -> Result<
 
 #[test]
 fn crate_by_crate_through_records_answers_as_the_whole_set_and_writes_equal_bytes() {
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
     let crates = crates();
-    let whole = resolve_crates(&crates, Sysroot::default(), &TEXTS, &Serial, Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
-    let (one, _) = resolve_by_records(&crates, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), Alloc::global()).unwrap_or_else(|e| panic!("by records: {e:?}"));
-    let (two, _) = resolve_by_records(&crates, Sysroot::default(), &TEXTS, &Reversed, &Ready::serial(WAIT), Alloc::global()).unwrap_or_else(|e| panic!("by records: {e:?}"));
+    let whole = resolve_crates(&crates, Sysroot::default(), &TEXTS, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let (one, _) = resolve_by_records(&crates, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("by records: {e:?}"));
+    let (two, _) = resolve_by_records(&crates, Sysroot::default(), &TEXTS, &Reversed, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("by records: {e:?}"));
     same_as_whole(&whole, &one).unwrap_or_else(|e| panic!("{e}"));
     for (x, y) in one.iter().zip(two.iter()) {
         assert!(x.record[..] == y.record[..], "crate `{}`: its record's bytes differ by fill order", x.names.name);
@@ -183,10 +186,12 @@ fn crate_by_crate_through_records_answers_as_the_whole_set_and_writes_equal_byte
 #[test]
 fn records_equal_across_workers_and_orders() {
     let crates = crates();
-    let g = Alloc::global();
+    let frame = super::SyncFrame::new();
+    let bump = frame.bump();
+    let g = bump.alloc();
     // The read list is a record too: its bytes are the same whatever order the fill asked in;
     // and so is the full-names record ([`crate::names_record`]).
-    let bytes = |all: &[CrateScope<'static>]| {
+    let bytes = |all: &[CrateScope<'_>]| {
         all.iter()
             .map(|c| {
                 let names = crate::names_record::encode(c.names, g).unwrap_or_else(|e| panic!("names record of `{}`: {e:?}", c.names.name));
@@ -196,13 +201,13 @@ fn records_equal_across_workers_and_orders() {
             .collect::<Vec<_>>()
     };
     for sysroot in [Sysroot::default(), Sysroot { core: Some(CrateId(2)), ..Sysroot::default() }] {
-        let (one, _) = resolve_by_records(&crates, sysroot, &TEXTS, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("one worker: {e:?}"));
+        let (one, _) = resolve_by_records(&crates, sysroot, &TEXTS, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("one worker: {e:?}"));
         let first = bytes(&one);
         // Ranks: the identity, reversed, and two fixed shuffles of the four crates.
         let ranks: [[u32; 4]; 4] = [[0, 1, 2, 3], [3, 2, 1, 0], [2, 0, 3, 1], [1, 3, 0, 2]];
         for rank in &ranks {
             let ready = Ready { workers: 4, rank: Some(rank), wait: WAIT, hooks: &crate::crate_scope::NoHooks };
-            let (many, _) = resolve_by_records(&crates, sysroot, &TEXTS, &Threads(4), &ready, g).unwrap_or_else(|e| panic!("four workers, ranks {rank:?}: {e:?}"));
+            let (many, _) = resolve_by_records(&crates, sysroot, &TEXTS, &Threads(4), &ready, bump).unwrap_or_else(|e| panic!("four workers, ranks {rank:?}: {e:?}"));
             let other = bytes(&many);
             for (i, (a, b)) in first.iter().zip(other.iter()).enumerate() {
                 assert!(a.0 == b.0, "crate `{}`: exports differ, 1 worker vs 4 with ranks {rank:?} (core {:?})", crates[i].name, sysroot.core);
@@ -261,9 +266,12 @@ static TEXTS_PRIV: Texts = Texts(&[&[("/a/lib.rs", A)], &[("/b/lib.rs", B)], &[(
 /// The names of the crates whose exports record (what a dependent keys on) and whose inner
 /// record differ between the unedited set and `edited`.
 fn changed_by(edited: &'static Texts) -> (Vec<&'static str>, Vec<&'static str>) {
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
     let crates = crates();
-    let (before, _) = resolve_by_records(&crates, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), Alloc::global()).unwrap_or_else(|e| panic!("by records: {e:?}"));
-    let (after, _) = resolve_by_records(&crates, Sysroot::default(), edited, &Serial, &Ready::serial(WAIT), Alloc::global()).unwrap_or_else(|e| panic!("by records: {e:?}"));
+    let (before, _) = resolve_by_records(&crates, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("by records: {e:?}"));
+    let (after, _) = resolve_by_records(&crates, Sysroot::default(), edited, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("by records: {e:?}"));
     let mut exports = Vec::new();
     let mut inner = Vec::new();
     for (i, (x, y)) in before.iter().zip(after.iter()).enumerate() {
@@ -302,9 +310,12 @@ fn an_added_private_item_changes_no_dependent_s_key() {
 
 #[test]
 fn a_record_that_shows_a_private_name_is_caught() {
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
     let crates = crates();
-    let whole = resolve_crates(&crates, Sysroot::default(), &TEXTS, &Serial, Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
-    let (leaky, _) = resolve_by_records_with(&crates, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), true, Alloc::global()).unwrap_or_else(|e| panic!("by records: {e:?}"));
+    let whole = resolve_crates(&crates, Sysroot::default(), &TEXTS, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let (leaky, _) = resolve_by_records_with(&crates, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), true, bump).unwrap_or_else(|e| panic!("by records: {e:?}"));
     let caught = same_as_whole(&whole, &leaky).expect_err("a record showing `secret` and `shut` as `pub` was not caught");
     assert!(caught.contains("crate `a`"), "{caught}");
 }
@@ -316,9 +327,12 @@ fn a_record_that_shows_a_private_name_is_caught() {
 /// `b::ungated` stay "not found".
 #[test]
 fn a_path_to_another_crate_s_private_name_is_reported_private() {
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
     let crates = crates();
-    let g = Alloc::global();
-    let (all, _) = resolve_by_records(&crates, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("by records: {e:?}"));
+    let g = bump.alloc();
+    let (all, _) = resolve_by_records(&crates, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("by records: {e:?}"));
     let each: Vec<_> = all.iter().map(|c| c.names).collect();
     let names = Names::of_crates(&crates, Sysroot::default(), &each, g).unwrap_or_else(|e| panic!("names: {e:?}"));
     let mut seen = Vec::new();
@@ -341,11 +355,14 @@ fn a_path_to_another_crate_s_private_name_is_reported_private() {
 
 #[test]
 fn a_dependency_s_reach_is_asked_for_by_key() {
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
+    let g = bump.alloc();
     let crates = crates();
-    let (all, _) = resolve_by_records(&crates, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), Alloc::global()).unwrap_or_else(|e| panic!("by records: {e:?}"));
-    let g = Alloc::global();
-    let prepares = Prepares::new_in(g);
-    let b_record = aligned(&all[1].record, g);
+    let (all, _) = resolve_by_records(&crates, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("by records: {e:?}"));
+    let prepares = Prepares::new_in(bump);
+    let b_record = aligned(&all[1].record, bump);
     let b = read_record(b_record, g).expect("b's record reads");
     let c_key: CrateItemKey = crates[2].key;
     assert!(b.reaches.contains(&c_key), "b re-exports c's items but its record does not reach c: {:?}", b.reaches);
@@ -353,19 +370,19 @@ fn a_dependency_s_reach_is_asked_for_by_key() {
     let d = CrateInput { key: CrateItemKey(ContentId::of("blaze-scope test crate", b"d")), ..input("d", "/d/lib.rs", &[("b", 0)]) };
     // The records' heads, read in place, ask for what the solve's `Need` asks for, before it.
     let unmet = crate::crate_scope::unmet_reaches(&[b_record], g).unwrap_or_else(|e| panic!("b's head: {e:?}"));
-    match resolve_crate(&d, &[b_record], Sysroot::default(), &TEXTS, 4, &Serial, prepares, g) {
+    match resolve_crate(&d, &[b_record], Sysroot::default(), &TEXTS, 4, &Serial, prepares, bump) {
         Err(CrateScopeError::Need(keys)) => {
             assert!(keys.contains(&c_key), "d's Need lacks c: {keys:?}");
             assert_eq!(&unmet[..], &keys[..], "the heads' unmet reaches are the solve's Need");
         }
         other => panic!("d without c's record: {other:?}"),
     }
-    let mut deps = vec![b_record, aligned(&all[2].record, g)];
+    let mut deps = vec![b_record, aligned(&all[2].record, bump)];
     if b.reaches.contains(&crates[3].key) {
-        deps.push(aligned(&all[3].record, g));
+        deps.push(aligned(&all[3].record, bump));
     }
     assert!(crate::crate_scope::unmet_reaches(&deps, g).expect("the heads").is_empty(), "every reach handed: nothing unmet");
-    let done = resolve_crate(&d, &deps, Sysroot::default(), &TEXTS, 4, &Serial, prepares, g).unwrap_or_else(|e| panic!("d with c's record: {e:?}"));
+    let done = resolve_crate(&d, &deps, Sysroot::default(), &TEXTS, 4, &Serial, prepares, bump).unwrap_or_else(|e| panic!("d with c's record: {e:?}"));
     let text = scopes_of(done.names).join("\n");
     assert!(text.contains("name: \"far\"") && !text.contains("Unresolved"), "d's `use b::far` through records:\n{text}");
 }
@@ -388,8 +405,10 @@ fn an_include_of_a_package_file_declares_its_items_relative_to_the_calling_file(
     ]);
     let mut kzg = input("kzg", "/kzg/src/lib.rs", &[]);
     kzg.shown_from = "/kzg/";
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
     let crates = [kzg, input("user", "/user/lib.rs", &[("kzg", 0)])];
-    let (done, _) = resolve_by_records(&crates, Sysroot::default(), &KZG, &Serial, &Ready::serial(WAIT), Alloc::global()).unwrap_or_else(|e| panic!("by records: {e:?}"));
+    let (done, _) = resolve_by_records(&crates, Sysroot::default(), &KZG, &Serial, &Ready::serial(WAIT), erased.bump()).unwrap_or_else(|e| panic!("by records: {e:?}"));
     for c in &done {
         let text = scopes_of(c.names).join("\n");
         assert!(text.contains("BYTES_PER_COMMITMENT") && !text.contains("Unresolved") && !text.contains("NotFound"), "crate `{}`: the included items resolve:\n{text}", c.names.name);
@@ -430,8 +449,10 @@ fn a_mod_in_an_included_file_is_found_from_the_included_file_s_folder() {
     ]]);
     let mut id = input("id", "/id/src/lib.rs", &[]);
     id.shown_from = "/id/";
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
     let crates = [id];
-    let (done, _) = resolve_by_records(&crates, Sysroot::default(), &ID, &Serial, &Ready::serial(WAIT), Alloc::global()).unwrap_or_else(|e| panic!("by records: {e:?}"));
+    let (done, _) = resolve_by_records(&crates, Sysroot::default(), &ID, &Serial, &Ready::serial(WAIT), erased.bump()).unwrap_or_else(|e| panic!("by records: {e:?}"));
     for c in &done {
         let text = scopes_of(c.names).join("\n");
         let notes = format!("{:?}", c.names.notes);
@@ -471,8 +492,10 @@ fn an_include_of_a_concat_of_env_out_dir_reads_the_build_script_s_file() {
     let mut serde = input("serde", "/serde/src/lib.rs", &[]);
     serde.shown_from = "/serde/";
     serde.script = Some(record);
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
     let crates = [serde, input("user", "/user/lib.rs", &[("serde", 0)])];
-    let (done, _) = resolve_by_records(&crates, Sysroot::default(), &SERDE, &Serial, &Ready::serial(WAIT), Alloc::global()).unwrap_or_else(|e| panic!("by records: {e:?}"));
+    let (done, _) = resolve_by_records(&crates, Sysroot::default(), &SERDE, &Serial, &Ready::serial(WAIT), erased.bump()).unwrap_or_else(|e| panic!("by records: {e:?}"));
     for c in &done {
         let text = scopes_of(c.names).join("\n");
         assert!(text.contains("Content") && !text.contains("Unresolved") && !text.contains("NotFound"), "crate `{}`: the included items resolve:\n{text}\nnotes: {:?}", c.names.name, c.names.notes);
@@ -500,8 +523,10 @@ fn an_inline_module_s_path_is_a_directory_relative_to_its_file_s_folder() {
     ]);
     let mut otel = input("otel", "/otel/src/lib.rs", &[]);
     otel.shown_from = "/otel/";
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
     let crates = [otel, input("user", "/user/lib.rs", &[("otel", 0)])];
-    let (done, _) = resolve_by_records(&crates, Sysroot::default(), &OTEL, &Serial, &Ready::serial(WAIT), Alloc::global()).unwrap_or_else(|e| panic!("by records: {e:?}"));
+    let (done, _) = resolve_by_records(&crates, Sysroot::default(), &OTEL, &Serial, &Ready::serial(WAIT), erased.bump()).unwrap_or_else(|e| panic!("by records: {e:?}"));
     for c in &done {
         let text = scopes_of(c.names).join("\n");
         assert!(text.contains("Exemplar") && !text.contains("Unresolved") && !text.contains("NotFound"), "crate `{}`: the module under the inline `#[path]` resolves:\n{text}", c.names.name);
@@ -563,8 +588,10 @@ impl crate::crate_scope::Kept for MemKept {
 fn kept_solves_are_found_only_when_their_reads_hold_and_equal_a_cold_solve() {
     use crate::crate_scope::{Solved, resolve_kept};
     let crates = crates();
-    let g = Alloc::global();
-    let bytes = |s: &Solved<'static>| match s {
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let g = erased.bump();
+    let bytes = |s: &Solved<'_>| match s {
         Solved::Solved(c) => (c.record.to_vec(), c.inner.to_vec()),
         Solved::Found { record, inner } => (record.to_vec(), inner.to_vec()),
     };

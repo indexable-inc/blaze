@@ -837,7 +837,7 @@ impl<'f> ScriptsStage<'f> {
     pub(crate) fn restore(&mut self, name: Name, made: Option<(Key, ContentId)>, row: &blaze_engine::Row<'_>, _owed: bool, frame: &'f Frame) {
         self.mark(name, made);
         if name.kind == Kind::Script {
-            self.previous.insert(name, Previous { reads: Vec::from_slice_in(&row.reads, frame).leak(), out: row.out });
+            self.previous.insert(name, Previous { reads: frame.alloc_slice_copy(&row.reads), out: row.out });
         }
     }
 
@@ -879,7 +879,7 @@ impl<'f> ScriptsStage<'f> {
                 let payload: &'j [u8] = jobs.alloc(work::payload(cx, store, input, jobs)?).payload();
                 given.push((*input, payload));
             }
-            return Ok(Dispatch::Run(ScriptWork::Double(runner, name, self.reads_planned.then_some((self.plant, self.status_view)), given.leak()), drive));
+            return Ok(Dispatch::Run(ScriptWork::Double(runner, name, self.reads_planned.then_some((self.plant, self.status_view)), given.into_bump_slice()), drive));
         }
         // The `Script` kind's tool keys the library-features records the shared setup reads
         // (scripts.rs `CommandFeatures`); the plan handed the tools with the unit graph.
@@ -941,6 +941,43 @@ impl<'f> ScriptsStage<'f> {
         self.dispatch(cx, store, handles, names, queue, frame)
     }
 
+    /// Human-readable task label and [`blaze_screen::WorkKind`] for the live inline status UI.
+    fn status_info(&self, name: Name, job: Option<&ScriptWork<'_>>) -> (blaze_screen::WorkKind, crate::engine_status::Label) {
+        use core::fmt::Write as _;
+        match name.kind {
+            Kind::Given => (blaze_screen::WorkKind::BuildScript, crate::engine_status::Label::of("script inputs")),
+            Kind::Script => {
+                let run = self.runs.binary_search_by_key(&name, |run| run.task.planned.name).ok().and_then(|at| self.runs.get(at));
+                let mut label = crate::engine_status::Label::EMPTY;
+                match run.and_then(|run| run.script.map(|(_, package, _, _)| (package, run.native))) {
+                    Some((package, true)) => {
+                        let _ = write!(label, "{package} · cc/c++");
+                    }
+                    Some((package, false)) => {
+                        let _ = label.write_str(package);
+                    }
+                    None => {
+                        let _ = label.write_str("build.rs");
+                    }
+                }
+                (blaze_screen::WorkKind::BuildScript, label)
+            }
+            Kind::MacroModule => match job {
+                Some(ScriptWork::Module(ModuleJob::Build { wanted, .. })) => {
+                    (blaze_screen::WorkKind::BuildScript, crate::engine_status::Label::of(wanted.package))
+                }
+                _ => {
+                    let label = self.macros.as_ref().and_then(|crates| {
+                        let at = crates.binary_search_by_key(&name.subject, |(subject, _)| *subject).ok()?;
+                        crates.get(at)?.1.as_ref().ok().map(|id| crate::engine_status::Label::of(id.package.as_str()))
+                    }).unwrap_or_else(|| crate::engine_status::Label::of("proc-macro"));
+                    (blaze_screen::WorkKind::ProcMacro, label)
+                }
+            },
+            _ => (blaze_screen::WorkKind::BuildScript, crate::engine_status::Label::debug(&name)),
+        }
+    }
+
     pub(crate) fn dispatch<'s>(
         &mut self, cx: &Cx, store: &mut dyn crate::store::Store<'_>, handles: &Handles<'s, 'f>,
         names: &mut NamesStage<'f>, queue: &mut ScriptQueue<'s>, frame: &'f Frame,
@@ -963,7 +1000,8 @@ impl<'f> ScriptsStage<'f> {
                 Kind::Given => {
                     let board = handles.board;
                     let clock = &handles.env.clock;
-                    board.show(Stage::Scripts, crate::engine_status::Label::debug(&name), 0, board.now(clock)).end(board.now(clock));
+                    let (kind, label) = self.status_info(name, None);
+                    board.show_kind(Stage::Scripts, kind, label, 0, board.now(clock)).end(board.now(clock));
                     queue.answered.insert(name, (task, began, began));
                     continue;
                 }
@@ -974,11 +1012,13 @@ impl<'f> ScriptsStage<'f> {
                 Dispatch::Answered(done) => {
                     let board = handles.board;
                     let clock = &handles.env.clock;
-                    board.show(Stage::Scripts, crate::engine_status::Label::debug(&name), 0, board.now(clock)).end(board.now(clock));
+                    let (kind, label) = self.status_info(name, None);
+                    board.show_kind(Stage::Scripts, kind, label, 0, board.now(clock)).end(board.now(clock));
                     self.completed.insert(name, done);
                     queue.answered.insert(name, (task, began, crate::engine_times::ns(handles.env.clock.now().since_start())));
                 }
                 Dispatch::Run(job, drive) => {
+                    let (work_kind, label) = self.status_info(name, Some(&job));
                     queue.slots.take();
                     let finished: &'s bstd::sync::Flag = queue.jobs.alloc(bstd::sync::Flag::new());
                     let notice = Notice { finished, waiter: queue.waiter };
@@ -999,7 +1039,7 @@ impl<'f> ScriptsStage<'f> {
                     let handle = scope.may_overlap("build script", crate::scripts::SCRIPT_FRAME, move |cx| {
                         let _notice = notice;
                         let began = crate::engine_times::ns(clock.now().since_start());
-                        let shown = board.show(Stage::Scripts, crate::engine_status::Label::debug(&name), 0, board.now(clock));
+                        let shown = board.show_kind(Stage::Scripts, work_kind, label, 0, board.now(clock));
                         let result = match job {
                             ScriptWork::Module(job) => match work::unwinding(|| job.run(cx, task, heap)) {
                                 Ok(result) => result?,
@@ -1265,7 +1305,7 @@ impl<'f> ScriptsStage<'f> {
                         members.push((*id, work::held_str(path, queue.jobs), leaf.id));
                     }
                 }
-                queue.macro_inputs = Some(MacroInputs { graph: queue.jobs.alloc(bytes).as_slice(), lock: side.lock.text, members: members.leak() });
+                queue.macro_inputs = Some(MacroInputs { graph: queue.jobs.alloc(bytes).as_slice(), lock: side.lock.text, members: members.into_bump_slice() });
             }
             queue.macro_inputs
         } else {
@@ -1343,6 +1383,8 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
         if runner_clock().is_some_and(|clock| clock.global_names_barrier()) && (!self.scripts.is_empty() || engine.has_pending_stage(Stage::Scripts)) {
             return Ok(());
         }
+        let scripts_pending = !self.scripts.is_empty() || engine.has_pending_stage(Stage::Scripts);
+        self.names.set_width(self.scripts.scope, handles, scripts_pending);
         loop {
             self.name_reads.clear();
             self.script_reads.clear();
@@ -1358,7 +1400,7 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
             if phase.is_none() { break; }
             let mark = handles.board.phase_began(Stage::Names, engine.tasks().len() as u64, handles.board.now(&handles.env.clock));
             for &task in engine.tasks() {
-                self.names.submit(self.scripts.scope, cx, names, store, read, handles, task, alloc, frame, self.scripts.waiter())?;
+                self.names.submit(self.scripts.scope, cx, names, store, read, handles, task, alloc, frame, self.scripts.waiter(), scripts_pending)?;
             }
             handles.board.phase_ended(mark, 0, handles.board.now(&handles.env.clock));
         }
@@ -1421,10 +1463,11 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
             }
             entered.push(task);
             // A script may immediately release a reader, including one in this
-            // same Names wave. Module lookups and ready crate peers file in bulk.
+            // same Names wave. Non-leaf Names tasks break before leaf tasks so
+            // downstream waves can be admitted without waiting on leaves.
             if name.kind == Kind::Script { break; }
             let Some(next) = self.first(names) else { break };
-            if next.planned.phase != first.planned.phase { break; }
+            if next.planned.phase != first.planned.phase || (!script && names.feeds_names(name) && !names.feeds_names(next.planned.name)) { break; }
             task = next;
         }
         Ok(())

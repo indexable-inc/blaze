@@ -90,7 +90,7 @@ fn a_projection_tied_to_two_joined_positions_is_a_recorded_stricter_step() {
     };
     let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).expect("fixture names");
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("fixture names");
     let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("body checker");

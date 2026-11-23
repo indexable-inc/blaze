@@ -372,7 +372,7 @@ fn main() {
     // The example is its own entry: its heap is the test capability (blaze-own's `testing`).
     let heap = blaze_own::testing::heap().shared();
     let rings: &'static Rings =
-        blaze_own::Box::leak(blaze_own::Box::new_in(Rings::new_in(64, 1 << 12, heap).expect("the rings"), heap));
+        blaze_own::Box::leak_static(blaze_own::Box::new_in(Rings::new_in(64, 1 << 12, heap).expect("the rings"), heap));
     blaze_trace::install_rings(blaze_trace::RingConfig {
         rings,
         wants: |_| true,

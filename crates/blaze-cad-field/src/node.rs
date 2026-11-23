@@ -99,6 +99,36 @@ pub enum Edge {
     Chamfer { r: i64 },
 }
 
+/// Blend continuity between consecutive stations of a guided loft.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum LoftContinuity {
+    /// Piecewise-linear profile blend (`w = t`).
+    Linear,
+    /// C1 Hermite smoothstep profile blend (`w = 3 t^2 - 2 t^3`).
+    SmoothC1,
+    /// C2 quintic smootherstep profile blend (`w = 10 t^3 - 15 t^4 + 6 t^5`).
+    CurvatureC2,
+}
+
+impl LoftContinuity {
+    pub(crate) const fn tag(self) -> u8 {
+        match self {
+            LoftContinuity::Linear => 0,
+            LoftContinuity::SmoothC1 => 1,
+            LoftContinuity::CurvatureC2 => 2,
+        }
+    }
+
+    /// Maximum derivative `max_{t in [0, 1]} |dw/dt|` of the blend polynomial.
+    pub(crate) const fn max_slope(self) -> f64 {
+        match self {
+            LoftContinuity::Linear => 1.0,
+            LoftContinuity::SmoothC1 => 1.5,
+            LoftContinuity::CurvatureC2 => 1.875,
+        }
+    }
+}
+
 /// The level of detail a compile includes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Detail {
@@ -124,6 +154,8 @@ pub enum Node {
     /// Stations `[start, start + len)` of the graph's station table; `lipschitz_ppm` is the
     /// stated Lipschitz factor in millionths, rounded up.
     Loft { start: u32, len: u32, lipschitz_ppm: i64 },
+    /// A rail-guided loft (`idx` into the graph's guided-loft table).
+    GuidedLoft { idx: u32 },
     /// `inner` in the frame `placement`, where it cannot be folded into leaves.
     Placed { inner: NodeId, placement: Placement },
     /// `factor * inner(p / factor)`, the factor in units of 10^-12.
@@ -137,10 +169,16 @@ pub enum Node {
     /// operand's half-width along the axis, checked below half a step.
     Repeat { inner: NodeId, axis: Axis, step: i64, count: u32, extent: i64 },
     Boolean { op: Boolean, edge: Edge, a: NodeId, b: NodeId },
+    /// A selective, spatially varying rounded or chamfered boolean (`field` indexes the graph's
+    /// variable-radius field table).
+    VariableBoolean { op: Boolean, chamfer: bool, a: NodeId, b: NodeId, field: u32 },
     /// `inner - r`.
     Grow { inner: NodeId, r: i64 },
     /// `inner + r`.
     Erode { inner: NodeId, r: i64 },
+    /// `(inner +/- r(p)) / (1 + L_r)`: spatially varying selective grow (`!erode`) or erode
+    /// (`erode`), with `field` indexing the graph's variable-radius field table.
+    VariableOffset { inner: NodeId, erode: bool, field: u32 },
     /// `max(inner, -inner - t)`: a wall of thickness `t` inside the surface.
     Shell { inner: NodeId, t: i64 },
     /// The `xy` plane turned by `rate * z` (micro-arcseconds per metre).
@@ -166,8 +204,9 @@ impl Node {
             | Node::Primitive { .. }
             | Node::Extrude { .. }
             | Node::Revolve { .. }
-            | Node::Loft { .. } => ([z, z], 0),
-            Node::Boolean { a, b, .. } => ([a, b], 2),
+            | Node::Loft { .. }
+            | Node::GuidedLoft { .. } => ([z, z], 0),
+            Node::Boolean { a, b, .. } | Node::VariableBoolean { a, b, .. } => ([a, b], 2),
             Node::Placed { inner, .. }
             | Node::Scale { inner, .. }
             | Node::Affine { inner, .. }
@@ -175,6 +214,7 @@ impl Node {
             | Node::Repeat { inner, .. }
             | Node::Grow { inner, .. }
             | Node::Erode { inner, .. }
+            | Node::VariableOffset { inner, .. }
             | Node::Shell { inner, .. }
             | Node::Twist { inner, .. }
             | Node::Bend { inner, .. }

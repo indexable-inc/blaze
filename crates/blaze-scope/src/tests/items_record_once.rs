@@ -18,10 +18,10 @@ extern "C-unwind" { fn zq_ext(); }
 
 /// The crate's items record's bytes, as written, aligned in `g`. The solve is the items record
 /// tests' own ([`solve_one`]).
-fn record_bytes(g: Alloc<'_>) -> &[u8] {
+fn record_bytes(g: blaze_own::Bump<'_>) -> &[u8] {
     let names = solve_one(TEXT, None);
     assert!(names.notes.is_empty(), "notes {:?}", names.notes);
-    aligned(&encode(names, g).unwrap_or_else(|e| panic!("items encode: {e:?}")), g)
+    aligned(&encode(names, g.alloc()).unwrap_or_else(|e| panic!("items encode: {e:?}")), g)
 }
 
 /// The test's allocator: a frame, named.
@@ -48,7 +48,7 @@ fn only_place(bytes: &[u8], needle: &[u8]) -> usize {
 fn a_row_read_checks_no_string_again() {
     let frame = frame();
     let erased = Erased::new(&frame);
-    let g = erased.handle();
+    let g = erased.bump();
     let record = one_file(record_bytes(g), TEXT, g);
     let (mut rows, mut named, mut foreign) = (0u64, 0u64, 0u64);
     for _ in 0..100 {
@@ -83,15 +83,16 @@ fn a_row_read_checks_no_string_again() {
 fn a_bad_byte_in_a_name_or_an_abi_is_refused_at_open() {
     let frame = frame();
     let erased = Erased::new(&frame);
-    let g = erased.handle();
-    let bytes = record_bytes(g);
+    let bump = erased.bump();
+    let g = bump.alloc();
+    let bytes = record_bytes(bump);
     assert!(ItemsRecord::open(bytes, g).is_ok(), "the unplanted record does not open");
     for needle in [&b"Zqname"[..], &b"C-unwind"[..]] {
         let at = only_place(bytes, needle);
         let mut raw: AVec<'_, u8> = AVec::new_in(g);
         raw.extend_from_slice(bytes);
         raw[at] = 0xff;
-        let planted = aligned(&raw, g);
+        let planted = aligned(&raw, bump);
         match ItemsRecord::open(planted, g) {
             Err(ItemsRecordError::Utf8 { what: "the record's strings", .. }) => {}
             Err(other) => panic!("{:?}: refused at open, but as {other:?}", core::str::from_utf8(needle)),

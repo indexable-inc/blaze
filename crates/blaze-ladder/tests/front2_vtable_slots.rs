@@ -117,7 +117,7 @@ fn every_slot_of_a_made_table_is_reached() {
     let user = UserCrate { name: "slots", dir, root, files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: SLOTS }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -133,7 +133,7 @@ fn every_slot_of_a_made_table_is_reached() {
     let key = |ns: Namespace, n: &'static str| -> (ItemKey, &'static str) { (front.keys.item(lib(ns, n)).unwrap_or_else(|e| panic!("{n}'s key: {e:?}")), n) };
     let types: Vec<(ItemKey, &'static str)> = ["A", "B", "C"].iter().map(|&t| key(Namespace::Types, t)).collect();
     let traits: Vec<(ItemKey, &'static str)> = ["Base", "Tr", "Other"].iter().map(|&t| key(Namespace::Types, t)).collect();
-    let prepared = Prepares::new_in(heap.alloc());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut buckets = None;
     store.ensure(&names, &mut front.keys, Want::Fn(run)).unwrap_or_else(|e| panic!("run's head: {e:?}"));
     let body = lower_fn(&names, prepared, &mut front.keys, &mut store, run).unwrap_or_else(|e| panic!("run lowers: {e}"));

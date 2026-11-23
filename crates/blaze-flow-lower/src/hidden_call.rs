@@ -172,7 +172,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             }
             match self.node(t, e)? {
                 PNode::Ref(_, i) | PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) | PNode::Adt(_, l) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::Adt(_, l) => stack.extend_from_slice(self.list(l, e)?),
                 PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_)
                 | PNode::Str | PNode::Never | PNode::ConstParam(_) | PNode::ConstValue { .. } => {}
                 // Function items can have erased lifetime arguments. A function

@@ -280,6 +280,18 @@ pub fn show_message<P: Put + ?Sized>(rules: &RuleSet, item: &str, findings: &Fin
         Template::MutForUniqBorrow => {
             out.str("`").str(range).str("` is never rebound and only uniquely borrowed: under Blaze's edition `let` allows `&uniq` directly and `mut` is only for local rebinding");
         }
+        Template::IoRef => {
+            out.str("`").str(range).str("` borrows the general `Io` capability bundle: take only the narrow capability needed (`&Out`, `&Fs`, `&Clock`, `&Host`, `&Args`, `CxSpawn`, ...)");
+        }
+        Template::UnusedImport => {
+            out.str("unused or non-minimal import `").str(span(0).unwrap_or(range)).str("`: remove unused entries and redundant braces (`blaze check --fix`)");
+        }
+        Template::UnusedMut => {
+            out.str("variable `").str(span(0).unwrap_or(range)).str("` does not need to be mutable: remove `mut` (`blaze check --fix`)");
+        }
+        Template::HeapLeak => {
+            out.str("`").str(range).str("` leaks allocations: for bump arenas use `.into_bump_slice()` / `.into_bump_str()` / `frame.alloc_str()`, or `ProgramArena` for intentional `'static` state");
+        }
         Template::VariantCount | Template::VariantCountMany => {
             let names = || {
                 args.iter().filter_map(|arg| match arg {

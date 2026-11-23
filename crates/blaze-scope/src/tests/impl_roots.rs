@@ -49,8 +49,10 @@ fn an_impl_of_another_crates_dollar_crate_trait_is_filed_under_it() {
             .key
     };
     let (a_tr, c_tr, s) = (key_of(0, "Tr"), key_of(1, "Tr"), key_of(1, "S"));
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
     let bytes = encode_with(names.krate(1), &names, alloc).unwrap_or_else(|e| panic!("c's items record: {e:?}"));
-    let record = ItemsRecord::open(aligned(&bytes, alloc), alloc).unwrap_or_else(|e| panic!("open c's record: {e:?}"));
+    let record = ItemsRecord::open(aligned(&bytes, erased.bump()), alloc).unwrap_or_else(|e| panic!("open c's record: {e:?}"));
     let row = (0..record.impls())
         .filter_map(|i| record.impl_at(i).unwrap_or_else(|e| panic!("impl row {i}: {e:?}")))
         .find(|row| row.has_trait)

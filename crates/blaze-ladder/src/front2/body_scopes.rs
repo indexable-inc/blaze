@@ -21,7 +21,7 @@ use core::cell::RefCell;
 
 use blaze_hash::HashMap;
 use blaze_id::ItemKey as LibKey;
-use blaze_own::{AVec, Alloc, Box};
+use blaze_own::{AVec, Alloc};
 use blaze_scope::body_scope::{BodyScopeRefusal, BodyScopeView, body_scope_scratch};
 use blaze_scope::prepares::Prepares;
 use blaze_scope::resolve::{BodyDeps, CrateInput, HeldBody, Names, ReadTree, SourceTexts, aligned};
@@ -80,7 +80,7 @@ pub struct Supplied<'n, S, T> {
     stored: &'n T,
     /// The driver's scratch for one body's solve, reset after it.
     hook: ScratchHook<'n>,
-    alloc: Alloc<'n>,
+    bump: blaze_own::Bump<'n>,
     by_prefix: HashMap<[u8; 8], usize, Alloc<'n>>,
     memo: RefCell<Memo<'n>>,
 }
@@ -89,13 +89,14 @@ impl<'n, S: SourceTexts<'n>, T: StoredBodyScopes<'n>> Supplied<'n, S, T> {
     /// `names` must be the solve of `crates`, crate `k` of one at index `k` of the other.
     /// `hook` is the driver's scratch for each body's solve (`Par::call_scratch`), never asked
     /// inside its own use: a body's solve asks the supplier nothing.
-    pub fn new(names: &'n Names<'n>, crates: &'n [CrateInput<'n>], sources: &'n S, prepares: &'n Prepares<'n>, stored: &'n T, hook: ScratchHook<'n>, alloc: Alloc<'n>) -> Supplied<'n, S, T> {
+    pub fn new(names: &'n Names<'n>, crates: &'n [CrateInput<'n>], sources: &'n S, prepares: &'n Prepares<'n>, stored: &'n T, hook: ScratchHook<'n>, bump: blaze_own::Bump<'n>) -> Supplied<'n, S, T> {
+        let alloc = bump.alloc();
         let mut by_prefix = HashMap::new_in(alloc);
         for (k, c) in crates.iter().enumerate() {
             by_prefix.insert(c.key.prefix(), k);
         }
         let memo = Memo { views: HashMap::new_in(alloc), crates: HashMap::new_in(alloc), refusals: AVec::new_in(alloc) };
-        Supplied { names, crates, sources, prepares, stored, hook, alloc, by_prefix, memo: RefCell::new(memo) }
+        Supplied { names, crates, sources, prepares, stored, hook, bump, by_prefix, memo: RefCell::new(memo) }
     }
 
     /// The bodies `body_scope` refused so far, with its words (rule 19), in the order asked.
@@ -116,7 +117,7 @@ impl<'n, S: SourceTexts<'n>, T: StoredBodyScopes<'n>> Supplied<'n, S, T> {
     }
 
     fn keep(&self, view: BodyScopeView<'n>) -> &'n BodyScopeView<'n> {
-        Box::leak(Box::new_in(view, self.alloc))
+        self.bump.alloc_val(view)
     }
 
     /// Crate `krate`'s tree record, dependencies and held bodies, made once.
@@ -124,12 +125,13 @@ impl<'n, S: SourceTexts<'n>, T: StoredBodyScopes<'n>> Supplied<'n, S, T> {
         if let Some(known) = self.memo.borrow().crates.get(&krate) {
             return known.as_ref().map(|_| ()).map_err(|e| *e);
         }
+        let alloc = self.bump.alloc();
         let c = *self.names.crates().get(krate).ok_or(NoBodyScope::NotHeld)?;
-        let made = match ReadTree::of(c, self.alloc) {
+        let made = match ReadTree::of(c, self.bump) {
             Ok(tree) => {
-                let tree: &'n ReadTree<'n> = Box::leak(Box::new_in(tree, self.alloc));
-                let deps: &'n BodyDeps<'n, 'n> = Box::leak(Box::new_in(BodyDeps::of_names(self.names, krate, self.alloc), self.alloc));
-                let mut held = HashMap::new_in(self.alloc);
+                let tree: &'n ReadTree<'n> = self.bump.alloc_val(tree);
+                let deps: &'n BodyDeps<'n, 'n> = self.bump.alloc_val(BodyDeps::of_names(self.names, krate, alloc));
+                let mut held = HashMap::new_in(alloc);
                 for h in c.bodies.iter() {
                     held.insert(h.src.key, *h);
                 }
@@ -144,8 +146,9 @@ impl<'n, S: SourceTexts<'n>, T: StoredBodyScopes<'n>> Supplied<'n, S, T> {
 
     /// The record of `body`, read from the store or made here.
     fn make(&self, body: LibKey) -> Result<&'n BodyScopeView<'n>, NoBodyScope> {
+        let alloc = self.bump.alloc();
         match self.stored.stored(body) {
-            Stored::Record(bytes) => return BodyScopeView::read(bytes, self.alloc).map(|v| self.keep(v)).map_err(|_| NoBodyScope::Unreadable),
+            Stored::Record(bytes) => return BodyScopeView::read(bytes, alloc).map(|v| self.keep(v)).map_err(|_| NoBodyScope::Unreadable),
             Stored::Missing => return Err(NoBodyScope::NotStored),
             Stored::NotSurface => {}
         }
@@ -158,11 +161,11 @@ impl<'n, S: SourceTexts<'n>, T: StoredBodyScopes<'n>> Supplied<'n, S, T> {
         };
         let held = held.ok_or(NoBodyScope::NotHeld)?;
         let input = self.crates.get(krate).ok_or(NoBodyScope::NotHeld)?;
-        match body_scope_scratch(tree, deps, input, krate, held, self.sources, self.prepares, self.hook, self.alloc) {
+        match body_scope_scratch(tree, deps, input, krate, held, self.sources, self.prepares, self.hook, self.bump) {
             Ok(scope) => {
-                let bytes = scope.write(self.alloc).map_err(|_| NoBodyScope::Unwritable)?;
-                let bytes = aligned(&bytes, self.alloc);
-                BodyScopeView::read(bytes, self.alloc).map(|v| self.keep(v)).map_err(|_| NoBodyScope::Unreadable)
+                let bytes = scope.write(alloc).map_err(|_| NoBodyScope::Unwritable)?;
+                let bytes = aligned(&bytes, self.bump);
+                BodyScopeView::read(bytes, alloc).map(|v| self.keep(v)).map_err(|_| NoBodyScope::Unreadable)
             }
             Err(refusal) => {
                 self.memo.borrow_mut().refusals.push(refusal);

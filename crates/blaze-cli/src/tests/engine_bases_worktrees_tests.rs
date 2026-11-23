@@ -73,3 +73,29 @@ fn control_one_pointer_for_the_home_starts_a_new_worktree_from_another_repositor
     let (a1, a2) = a_b_then_a_new_worktree(BasePlant::OnePointer);
     assert!(a2.entered(blaze_engine::Stage::Bodies) > 0, "the one home-wide pointer (B's answer) still gave A2 every body: the control proves nothing:\n{}\n--- A1's:\n{}", a2.profile, a1.profile);
 }
+
+#[test]
+fn unrelated_fresh_repo_reuses_toolchain_base_automatically() {
+    BASE_PLANT.set(BasePlant::None);
+    let io = Io::simulated(SimWorld::new(19, Limits::USUAL));
+    let shelf = lang_shelf(&io);
+    repository_a(&io, A1);
+    repository_b(&io, B);
+    let check_with_shelf = |checkout: Checkout| {
+        let opts = || {
+            let mut opts = engine_check_tests::opts(&io, 2, false);
+            opts.place.checkout = checkout.dir;
+            opts.toolchain = shelf;
+            opts
+        };
+        check_in::<fix::Atomic>(&io, checkout, &opts, View::Person, None)
+    };
+    let a1 = check_with_shelf(A1);
+    assert!(a1.entered(blaze_engine::Stage::Names) >= 5, "A1 cold check resolves 3 toolchain crates + alpha's units:\n{}", a1.profile);
+    let b = check_with_shelf(B);
+    assert!(b.engine().from_last, "unrelated repo B starts from `tool-base` fallback:\n{}", b.profile);
+    // B has lib + test units (2 crates); core/alloc/std all stand from `tool-base`!
+    assert_eq!(b.entered(blaze_engine::Stage::Names), 2, "B enters only its own 2 units (all 3 toolchain crates stand from `tool-base`):\n{}", b.profile);
+    assert!(b.entered(blaze_engine::Stage::Heads) < a1.entered(blaze_engine::Stage::Heads), "B reuses toolchain `ImplBucket`s from `tool-base`:\n{}", b.profile);
+    assert_eq!(b.errors, 0, "B checks cleanly:\n{}", b.profile);
+}

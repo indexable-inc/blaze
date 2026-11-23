@@ -165,6 +165,8 @@ fn ground_own(cx: &mut GroundCx<'_, '_, '_>, ty: PTy, depth: u32) -> Result<PTy,
         | PNode::Foreign(_) => node,
         PNode::Param(i) | PNode::ConstParam(i) => return arg(cx, i),
         PNode::Tuple(l) => PNode::Tuple(ground_own_list(cx, l, d)?),
+        PNode::Record(l) => PNode::Record(ground_own_list(cx, l, d)?),
+        PNode::Union(l) => PNode::Union(ground_own_list(cx, l, d)?),
         PNode::Ref(m, t) => PNode::Ref(m, ground_own(cx, t, d)?),
         PNode::Ptr(m, t) => PNode::Ptr(m, ground_own(cx, t, d)?),
         PNode::Array(e, n) => PNode::Array(ground_own(cx, e, d)?, ground_own(cx, n, d)?),
@@ -442,8 +444,10 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 let s = self.live_bits.len();
                 self.live_bits.resize(s + n, false);
                 for st in 0..b.body.stmts() {
-                    if let StmtKind::StorageLive(l) = b.body.stmt(Stmt(st)).kind {
-                        self.live_bits[s + l.0 as usize] = true;
+                    if let StmtKind::StorageLive(l) = b.body.stmt(Stmt(st)).kind
+                        && let Some(bit) = self.live_bits.get_mut(s + l.0 as usize)
+                    {
+                        *bit = true;
                     }
                 }
                 self.body_live.push((item, s as u32, n as u32));
@@ -466,8 +470,11 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         };
         let mut locals: Vec<Option<AllocId>, Alloc<'a>> = Vec::with_capacity_in(n, self.alloc);
         for l in 0..n {
-            if l < live_len && !self.live_bits[live_start + l] {
-                let ty = self.cached_tys[tys_start as usize + l];
+            let needs_live = l < live_len && self.live_bits.get(live_start + l).copied().unwrap_or(false);
+            if l < live_len && !needs_live {
+                let Some(&ty) = self.cached_tys.get(tys_start as usize + l) else {
+                    return Err(malformed("a local past the frame").into());
+                };
                 locals.push(Some(self.allocate_local(ty)?));
             } else {
                 locals.push(None);
@@ -480,7 +487,10 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         if i >= f.tys.1 as usize {
             return Err(malformed("a local past the frame").into());
         }
-        Ok(self.cached_tys[f.tys.0 as usize + i])
+        self.cached_tys
+            .get(f.tys.0 as usize + i)
+            .copied()
+            .ok_or_else(|| malformed("a local past the frame").into())
     }
 
     fn allocate_local(&mut self, ty: PTy) -> R<'a, AllocId> {
@@ -492,7 +502,12 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         let f = self.top()?;
         let ty = self.local_ty(f, l.0 as usize)?;
         let id = self.allocate_local(ty)?;
-        self.top_mut()?.locals[l.0 as usize] = Some(id);
+        let slot = self
+            .top_mut()?
+            .locals
+            .get_mut(l.0 as usize)
+            .ok_or(Stop::from(malformed("a local past the frame")))?;
+        *slot = Some(id);
         Ok(())
     }
 

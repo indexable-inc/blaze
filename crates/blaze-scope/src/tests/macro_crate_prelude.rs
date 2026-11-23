@@ -172,7 +172,7 @@ fn a_proc_macro_test_harness_has_proc_macro_in_its_extern_prelude() {
     {
         let texts = Texts::of(&crates);
         let inputs = crates.inputs();
-        let names = resolve_crates(&inputs, crates.sysroot, &texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = resolve_crates(&inputs, crates.sysroot, &texts, &Serial, crate::tests::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         assert_eq!(imported(&names, pm), Some(side_proc_macro), "`use proc_macro::TokenStream;` in the proc macro");
         assert_eq!(imported(&names, pm_test), Some(side_proc_macro), "the same head in its test harness: pm-small's error gone");
         assert_eq!(imported(&names, app), None, "a plain library has no `proc_macro` in its extern prelude");
@@ -187,7 +187,7 @@ fn a_proc_macro_test_harness_has_proc_macro_in_its_extern_prelude() {
     {
         let texts = Texts::of(&control);
         let inputs = control.inputs();
-        let names = resolve_crates(&inputs, control.sysroot, &texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = resolve_crates(&inputs, control.sysroot, &texts, &Serial, crate::tests::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         assert_eq!(imported(&names, pm_test), None, "today's error: no `proc_macro` in this scope");
         assert_eq!(imported(&names, pm), Some(side_proc_macro), "the proc macro itself was never the case");
     }

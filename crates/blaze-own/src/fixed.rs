@@ -637,6 +637,10 @@ impl<const BYTES: usize> fmt::Debug for Inline<BYTES> {
     }
 }
 
+// SAFETY: `&Inline<BYTES>` allocates from a fixed stack buffer reclaimed in bulk when `Inline`
+// drops; forgetting a handle never leaks memory past the `Inline`'s lifetime.
+unsafe impl<const BYTES: usize> crate::BumpAlloc for &Inline<BYTES> {}
+
 // SAFETY: a block is a range of the buffer below the top, handed out once; the top only moves
 // down over the newest block when that block is freed or shrunk, so no two live blocks overlap.
 // The buffer does not move while a block is live, because the allocator is this shared

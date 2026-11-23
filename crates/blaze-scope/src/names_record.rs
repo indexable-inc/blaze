@@ -35,7 +35,7 @@ use core::cell::OnceCell;
 use blaze_format::FormatError;
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, Bump};
 use blaze_surface::{BuildError, CrateRootView, RecordBytes, ScopeView};
 #[cfg(test)]
 use blaze_surface::ScopeBuilder;
@@ -134,7 +134,7 @@ pub struct FailedRow<'a> {
 /// ([`crate::resolve::Expansion::refused_by`]) for why. `None`: `call` is no refused call of it.
 /// The one join of the writer ([`failed_section`]) and of a reader of the solve's values (blaze-
 /// ladder's `NamesSource` over `Names`), so the two read alike (rule 30).
-pub fn refused_row<'n, 'b>(names: &CrateNames<'n>, call: ItemKey, alloc: Alloc<'b>) -> Option<FailedRow<'b>>
+pub fn refused_row<'n, 'b>(names: &CrateNames<'n>, call: ItemKey, alloc: Bump<'b>) -> Option<FailedRow<'b>>
 where
     'n: 'b,
 {
@@ -147,8 +147,8 @@ where
     let why = match expansion.refused_by {
         Some((ExpandNote::Failed { failed, .. }, _)) => CallRefusal::Failed(failed),
         Some((note, env)) => {
-            let (kind, words) = crate::call_refusal::words_of(&note, env, alloc);
-            CallRefusal::Refused { kind, words: blaze_own::Box::leak(words.into_boxed_str()) }
+            let (kind, words) = crate::call_refusal::words_of(&note, env, alloc.alloc());
+            CallRefusal::Refused { kind, words: alloc.alloc_str(&words) }
         }
         None => CallRefusal::Refused { kind: RefusalKind::Unnoted, words: "" },
     };
@@ -164,22 +164,31 @@ fn failed_section<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<Record
     keys.sort_unstable();
     let mut calls = AVec::with_capacity_in(keys.len(), alloc);
     for call in keys.iter() {
-        let Some(row) = refused_row(names, *call, alloc) else { continue };
-        let reason = match row.why {
-            CallRefusal::Failed(failed) => failed.write_record(alloc),
-            CallRefusal::Refused { words, .. } => {
+        let Some(expansion) = names.expansions.get(call) else { continue };
+        if expansion.refused.is_none() {
+            continue;
+        }
+        let src = names.tables.calls.get(call);
+        let (path, shape, implicit) = src.map_or(("", CallShape::FnLike, false), |s| (s.name, s.kind, s.implicit));
+        let file = src.and_then(|s| usize::try_from(s.loc.file).ok()).and_then(|idx| names.files.get(idx)).map_or("", |f| f.shown);
+        let on = src.and_then(|s| s.on).unwrap_or("");
+        let (kind, reason) = match expansion.refused_by {
+            Some((ExpandNote::Failed { failed, .. }, _)) => (RefusalKind::Failed, failed.write_record(alloc)),
+            Some((note, env)) => {
+                let (kind, words) = crate::call_refusal::words_of(&note, env, alloc);
                 let mut bytes = RecordBytes::new_in(alloc);
                 bytes.extend_from_slice(words.as_bytes());
-                bytes
+                (kind, bytes)
             }
+            None => (RefusalKind::Unnoted, RecordBytes::new_in(alloc)),
         };
-        calls.push((row, reason));
+        calls.push((*call, path, shape, implicit, file, on, kind, reason));
     }
     let mut texts = RecordBytes::new_in(alloc);
-    for (row, _) in calls.iter() {
-        texts.extend_from_slice(row.path.as_bytes());
-        texts.extend_from_slice(row.file.as_bytes());
-        texts.extend_from_slice(row.on.as_bytes());
+    for &(_, path, _, _, file, on, _, _) in calls.iter() {
+        texts.extend_from_slice(path.as_bytes());
+        texts.extend_from_slice(file.as_bytes());
+        texts.extend_from_slice(on.as_bytes());
     }
     pad(&mut texts);
     let records_at = ALIGN + calls.len() * FAILED_ROW + texts.len();
@@ -187,22 +196,22 @@ fn failed_section<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<Record
     out.extend_from_slice(&u32_of(calls.len(), "failed calls")?.to_le_bytes());
     out.resize(ALIGN, 0);
     let (mut text_at, mut record_at) = (0usize, records_at);
-    for (row, record) in calls.iter() {
-        let flags = u32::from_le_bytes([u8::from(row.implicit), row.shape.byte(), row.why.kind().byte(), 0]);
-        out.extend_from_slice(&row.call.0.0);
+    for (call, path, shape, implicit, file, on, kind, record) in calls.iter() {
+        let flags = u32::from_le_bytes([u8::from(*implicit), shape.byte(), kind.byte(), 0]);
+        out.extend_from_slice(&call.0.0);
         out.extend_from_slice(&u32_of(text_at, "failed call paths")?.to_le_bytes());
-        out.extend_from_slice(&u32_of(row.path.len(), "a failed call's path")?.to_le_bytes());
+        out.extend_from_slice(&u32_of(path.len(), "a failed call's path")?.to_le_bytes());
         out.extend_from_slice(&u32_of(record_at, "failed call records")?.to_le_bytes());
         out.extend_from_slice(&u32_of(record.len(), "a failed call's record")?.to_le_bytes());
         out.extend_from_slice(&flags.to_le_bytes());
-        out.extend_from_slice(&u32_of(text_at + row.path.len(), "failed call files")?.to_le_bytes());
-        out.extend_from_slice(&u32_of(row.file.len(), "a failed call's file")?.to_le_bytes());
-        out.extend_from_slice(&u32_of(row.on.len(), "a failed derive's item name")?.to_le_bytes());
-        text_at += row.path.len() + row.file.len() + row.on.len();
+        out.extend_from_slice(&u32_of(text_at + path.len(), "failed call files")?.to_le_bytes());
+        out.extend_from_slice(&u32_of(file.len(), "a failed call's file")?.to_le_bytes());
+        out.extend_from_slice(&u32_of(on.len(), "a failed derive's item name")?.to_le_bytes());
+        text_at += path.len() + file.len() + on.len();
         record_at = (record_at + record.len()).next_multiple_of(ALIGN);
     }
     out.extend_from_slice(&texts);
-    for (_, record) in calls.iter() {
+    for (_, _, _, _, _, _, _, record) in calls.iter() {
         out.extend_from_slice(record);
         pad(&mut out);
     }
@@ -731,7 +740,7 @@ impl<'m> NamesRecord<'m> {
     /// was refused under that key. Found by binary search in place; the path, file and words
     /// are slices of the bytes, and a failure's reason, the one part with a working form, is
     /// decoded into `alloc` (the caller's: the record holds no allocator).
-    pub fn failed<'b>(&self, call: ItemKey, alloc: Alloc<'b>) -> Result<Option<FailedRow<'b>>, NamesRecordError>
+    pub fn failed<'b>(&self, call: ItemKey, alloc: Bump<'b>) -> Result<Option<FailedRow<'b>>, NamesRecordError>
     where
         'm: 'b,
     {

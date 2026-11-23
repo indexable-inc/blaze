@@ -102,7 +102,7 @@ use blaze_id::CrateItemKey;
 use blaze_ids::{ContentId, Hasher};
 use blaze_ladder::body_ids::{BodyId, BodyIds, Read};
 use blaze_ladder::code_records::CodeClass;
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AVec, Alloc, Bump, Vec};
 use blaze_toolchain::ToolchainId;
 use blaze_typeck::ItemKey;
 use blaze_world::PackOrigin;
@@ -512,17 +512,17 @@ pub(crate) struct Slot {
     proof: core::cell::OnceCell<Result<Proof, Unread>>,
 }
 
-/// The slots of BODY_ROW-wide `bodies`: one a distinct check, sorted by its fact, in `alloc`.
+/// The slots of BODY_ROW-wide `bodies`: one a distinct check, sorted by its fact, in `bump`.
 /// O(bodies log bodies) hashes and compares; nothing of a body is read.
-fn slots_of<'a>(bodies: &[u8], alloc: Alloc<'a>) -> &'a [Slot] {
-    let mut slots: AVec<'a, Slot> = Vec::with_capacity_in(bodies.len() / BODY_ROW, alloc);
+fn slots_of<'a>(bodies: &[u8], bump: Bump<'a>) -> &'a [Slot] {
+    let mut slots: Vec<Slot, Bump<'a>> = Vec::with_capacity_in(bodies.len() / BODY_ROW, bump);
     for b in bodies.chunks_exact(BODY_ROW) {
         let check = row_check(b);
         slots.push(Slot { fact: body_fact(check), check, proof: core::cell::OnceCell::new() });
     }
     slots.sort_unstable_by(|a, b| a.fact.cmp(&b.fact));
     slots.dedup_by_key(|slot| slot.fact);
-    slots.leak()
+    slots.into_bump_slice()
 }
 
 /// The answer's records as the walk reads them, sans-IO (rule 14): the engine's stored answer
@@ -1477,7 +1477,7 @@ fn word_at(b: &[u8], at: usize) -> [u8; 32] {
     w
 }
 
-fn put_crate_row(out: &mut AVec<'_, u8>, row: &CrateRow) {
+fn put_crate_row<A: core::alloc::Allocator>(out: &mut Vec<u8, A>, row: &CrateRow) {
     out.extend_from_slice(&row.prefix);
     out.extend_from_slice(&row.key.0.0);
     let read = match row.grain {
@@ -1508,7 +1508,7 @@ fn crate_row(b: &[u8], tag: GrainTag) -> CrateRow {
     CrateRow { prefix, key, grain }
 }
 
-fn put_body_row(out: &mut AVec<'_, u8>, row: &BodyRow) {
+fn put_body_row<A: core::alloc::Allocator>(out: &mut Vec<u8, A>, row: &BodyRow) {
     out.extend_from_slice(&row.item.0.to_be_bytes());
     out.extend_from_slice(&row.key.0);
     out.push(row.check.kind as u8);
@@ -1677,9 +1677,10 @@ impl<'a> RunIds<'a> {
         answer: &mut dyn Answer,
         previous: Option<&RunIds<'_>>,
         most: Most,
-        alloc: Alloc<'a>,
+        bump: Bump<'a>,
     ) -> Result<RunIds<'a>, RunIdsError<'n>> {
         let _cx = cx.span("run ids: the body ids of the program's crates");
+        let alloc = bump.alloc();
         let producers = {
             let mut h = Hasher::new(PRODUCERS_DOMAIN);
             for kind in CHECK_KINDS {
@@ -1688,7 +1689,7 @@ impl<'a> RunIds<'a> {
             h.finish()
         };
         let toolchain_read = Read { fact: toolchain_fact(), digest: toolchain.0 };
-        let mut facts: AVec<'a, Read> = Vec::new_in(alloc);
+        let mut facts: Vec<Read, Bump<'a>> = Vec::new_in(bump);
         facts.push(toolchain_read);
 
         // The crates' grains, and each locked crate's closure digest.
@@ -1788,22 +1789,22 @@ impl<'a> RunIds<'a> {
 
         // Laid out as the record's rows (the one representation every lookup reads), in the
         // bodies' sorted order, so the caller's order of `workspace` reaches no byte (rule 25).
-        let mut crate_bytes: AVec<'a, u8> = Vec::with_capacity_in(rows.len() * CRATE_ROW, alloc);
-        let mut grains: AVec<'a, GrainTag> = Vec::with_capacity_in(rows.len(), alloc);
+        let mut crate_bytes: Vec<u8, Bump<'a>> = Vec::with_capacity_in(rows.len() * CRATE_ROW, bump);
+        let mut grains: Vec<GrainTag, Bump<'a>> = Vec::with_capacity_in(rows.len(), bump);
         for row in rows.iter() {
             put_crate_row(&mut crate_bytes, row);
             grains.push(GrainTag::of(row.grain));
         }
-        let mut body_bytes: AVec<'a, u8> = Vec::with_capacity_in(bodies.len() * BODY_ROW, alloc);
-        let mut verdicts: AVec<'a, Checked> = Vec::with_capacity_in(bodies.len(), alloc);
+        let mut body_bytes: Vec<u8, Bump<'a>> = Vec::with_capacity_in(bodies.len() * BODY_ROW, bump);
+        let mut verdicts: Vec<Checked, Bump<'a>> = Vec::with_capacity_in(bodies.len(), bump);
         for row in bodies.iter() {
             put_body_row(&mut body_bytes, row);
             verdicts.push(row.checked);
         }
-        let body_bytes: &'a [u8] = body_bytes.leak();
-        let slots = slots_of(body_bytes, alloc);
+        let body_bytes: &'a [u8] = body_bytes.into_bump_slice();
+        let slots = slots_of(body_bytes, bump);
         // The walked tree, sorted and one each whatever order the walk handed it in.
-        let mut tree: AVec<'a, Edge> = Vec::with_capacity_in(edges.len(), alloc);
+        let mut tree: Vec<Edge, Bump<'a>> = Vec::with_capacity_in(edges.len(), bump);
         tree.extend_from_slice(edges);
         tree.sort_unstable();
         tree.dedup();
@@ -1811,12 +1812,12 @@ impl<'a> RunIds<'a> {
             toolchain,
             toolchain_read,
             producers,
-            crates: crate_bytes.leak(),
-            grains: grains.leak(),
+            crates: crate_bytes.into_bump_slice(),
+            grains: grains.into_bump_slice(),
             bodies: body_bytes,
-            verdicts: verdicts.leak(),
-            edges: tree.leak(),
-            today: facts.leak(),
+            verdicts: verdicts.into_bump_slice(),
+            edges: tree.into_bump_slice(),
+            today: facts.into_bump_slice(),
             slots,
             from: None,
         })
@@ -1911,7 +1912,7 @@ impl<'a> RunIds<'a> {
     /// copied once into `alloc` (the struct's doc). Every count, size, order, tag and range is
     /// checked here, once (rule 74); nothing after it checks again. Its proofs have no source
     /// until [`RunIds::reading`].
-    pub(crate) fn read(bytes: &'a [u8], alloc: Alloc<'a>) -> Result<RunIds<'a>, TableError> {
+    pub(crate) fn read(bytes: &'a [u8], bump: Bump<'a>) -> Result<RunIds<'a>, TableError> {
         if bytes.len() < HEADER {
             return Err(TableError::Short { len: bytes.len() });
         }
@@ -1946,7 +1947,7 @@ impl<'a> RunIds<'a> {
         at += bodies.len();
         let edge_bytes = &bytes[at..at + n_edges * EDGE];
         at += edge_bytes.len();
-        let mut edges: AVec<'a, Edge> = Vec::with_capacity_in(n_edges, alloc);
+        let mut edges: Vec<Edge, Bump<'a>> = Vec::with_capacity_in(n_edges, bump);
         for (i, row) in edge_bytes.chunks_exact(EDGE).enumerate() {
             let edge = edge(row).ok_or(TableError::EdgeKind { at: i })?;
             if edges.last().is_some_and(|last| *last >= edge) {
@@ -1954,12 +1955,12 @@ impl<'a> RunIds<'a> {
             }
             edges.push(edge);
         }
-        let mut today: AVec<'a, Read> = Vec::with_capacity_in(n_today, alloc);
+        let mut today: Vec<Read, Bump<'a>> = Vec::with_capacity_in(n_today, bump);
         for row in bytes[at..].chunks_exact(READ) {
             today.push(read_at(row));
         }
 
-        let mut grains: AVec<'a, GrainTag> = Vec::with_capacity_in(n_crates, alloc);
+        let mut grains: Vec<GrainTag, Bump<'a>> = Vec::with_capacity_in(n_crates, bump);
         for (i, row) in crates.chunks_exact(CRATE_ROW).enumerate() {
             let grain = GrainTag::try_from(row[40]).map_err(|tag| TableError::Tag { what: "crate row", at: i, tag })?;
             if row[41..48] != [0; 7] {
@@ -1970,7 +1971,7 @@ impl<'a> RunIds<'a> {
             }
             grains.push(grain);
         }
-        let mut verdicts: AVec<'a, Checked> = Vec::with_capacity_in(n_bodies, alloc);
+        let mut verdicts: Vec<Checked, Bump<'a>> = Vec::with_capacity_in(n_bodies, bump);
         for (i, row) in bodies.chunks_exact(BODY_ROW).enumerate() {
             verdicts.push(verdict(row, i)?);
             if i > 0 && body_item(&bodies[(i - 1) * BODY_ROW..i * BODY_ROW]) >= body_item(row) {
@@ -1992,12 +1993,12 @@ impl<'a> RunIds<'a> {
             toolchain_read,
             producers,
             crates,
-            grains: grains.leak(),
+            grains: grains.into_bump_slice(),
             bodies,
-            verdicts: verdicts.leak(),
-            edges: edges.leak(),
-            today: today.leak(),
-            slots: slots_of(bodies, alloc),
+            verdicts: verdicts.into_bump_slice(),
+            edges: edges.into_bump_slice(),
+            today: today.into_bump_slice(),
+            slots: slots_of(bodies, bump),
             from: None,
         })
     }
@@ -2044,13 +2045,13 @@ impl<'a> RunIds<'a> {
         cert: Key,
         toolchain: ToolchainId,
         tools: &[Tool; blaze_drive::key::KINDS],
-        alloc: Alloc<'a>,
+        bump: Bump<'a>,
     ) -> Result<Option<RunIds<'a>>, RunIdsError<'static>> {
         let _cx = cx.span("run ids: read the body id table");
         let held = store.get(cx, table_key(cert, toolchain, tools)).map_err(|why| RunIdsError::TableStore { cert, why })?;
         let Some(held) = held else { return Ok(None) };
         let bytes: &'a [u8] = held.bytes;
-        let ids = RunIds::read(bytes, alloc).map_err(RunIdsError::Table)?;
+        let ids = RunIds::read(bytes, bump).map_err(RunIdsError::Table)?;
         if ids.toolchain != toolchain {
             // The key holds the toolchain: bytes of another toolchain under it are a store's bug.
             return Err(RunIdsError::Table(TableError::OtherToolchain));

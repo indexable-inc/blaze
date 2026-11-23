@@ -264,7 +264,7 @@ fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platfo
     let erased = blaze_own::Erased::new(scratch);
     let alloc = erased.handle();
     // Every crate's exports, each by its platform spelling (the names table's), read once.
-    let mut exports: Vec<(&[u8], blaze_id::ItemKey), &Frame> = Vec::new_in(scratch);
+    let mut exports: Vec<(AVec<'_, u8>, blaze_id::ItemKey), &Frame> = Vec::new_in(scratch);
     for c in crates.iter() {
         let links = match native_links::open_table(c.table, alloc) {
             Ok(Table::Links(links)) => links,
@@ -273,14 +273,14 @@ fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platfo
         };
         for export in links.exports.iter() {
             let mangled = blaze_native::resolve::mangle(platform, export.name, alloc).map_err(|why| refused(bstd::mem::format_in!(scratch, "the export `{}`: {why:?}", export.name).as_str()))?;
-            exports.push((mangled.leak(), export.item));
+            exports.push((mangled, export.item));
         }
     }
     let mut words: Vec<blaze_launch::wire::run::Symbol, &'w Frame> = Vec::with_capacity_in(names.len(), ask.words);
     let mut items: Vec<blaze_id::ItemKey, &'w Frame> = Vec::with_capacity_in(names.len(), ask.words);
     for i in 0..names.len() {
         let Some(name) = names.get(i) else { return Err(refused("a word's name is past its table")) };
-        let found = exports.iter().find(|(spelled, _)| *spelled == name).map(|(_, item)| *item);
+        let found = exports.iter().find(|(spelled, _)| spelled.as_slice() == name).map(|(_, item)| *item);
         let Some(item) = found else {
             return Err(refused(bstd::mem::format_in!(scratch, "word {i} `{}` is no crate's export", core::str::from_utf8(name).unwrap_or("(not UTF-8)")).as_str()));
         };
@@ -299,7 +299,7 @@ fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platfo
     if dir.stat(cx, &name).map_err(|why| refused(bstd::mem::format_in!(scratch, "{why}").as_str()))?.is_none() {
         dir.publish(cx, &name, bstd::fs::Content::bytes(payload), bstd::fs::Durable::No).map_err(|why| refused(bstd::mem::format_in!(scratch, "the library's file: {why}").as_str()))?;
     }
-    Ok(Some(NativeSend { library: blaze_launch::wire::RecordId(key.0.0), hex: held(hex.as_str(), ask), words: words.leak(), items: items.leak() }))
+    Ok(Some(NativeSend { library: blaze_launch::wire::RecordId(key.0.0), hex: held(hex.as_str(), ask), words: words.into_bump_slice(), items: items.into_bump_slice() }))
 }
 
 /// 32 bytes as 64 lowercase hex digits.
@@ -450,7 +450,12 @@ fn held<'w>(text: &str, ask: &NativeAsk<'w>) -> &'w str {
 /// graph's (native_image.rs `closure`), never the caller's, and a crate the program links that is
 /// not in `closure` is refused by name ([`NativeError::NotHanded`]). Each crate's records are
 /// read through `Standing::names`, the one reader of the check's records (rule 30).
-pub(crate) fn image_for<'r>(cx: &Cx, standing: &mut Standing<'r, '_>, closure: &[CrateAt]) -> Result<ProgramImage<'r>, NativeError<'r>> {
+pub(crate) fn image_for<'r>(
+    cx: &Cx,
+    standing: &mut Standing<'r, '_>,
+    closure: &[CrateAt],
+    watch: &dyn blaze_screen::Watch,
+) -> Result<ProgramImage<'r>, NativeError<'r>> {
     let cx = cx.span("native: the program's image by key");
     let Some(platform) = native_image::platform() else {
         return Err(NativeError::Platform { triple: crate::graph::TRIPLE });
@@ -530,6 +535,20 @@ pub(crate) fn image_for<'r>(cx: &Cx, standing: &mut Standing<'r, '_>, closure: &
     // (native_runner_c.rs `DepOut::Refused`).
     let mut done: Vec<(usize, ScriptIn<'_>), &Frame> = Vec::with_capacity_in(ran.len(), &scratch);
     let mut refused: Vec<usize, &Frame> = Vec::new_in(&scratch);
+    let deferred_total: u32 = if c_tasks.is_some() {
+        let count = ran
+            .iter()
+            .filter(|(_, script)| {
+                crate::scripts::payload_parts(script.payload)
+                    .and_then(|(_, record)| blaze_build_script::outputs::OutputsRef::open(record).ok())
+                    .is_some_and(|o| o.c_requests().next().is_some())
+            })
+            .count();
+        u32::try_from(count).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
+    let mut deferred_done = 0u32;
     for r in order.iter().rev().copied() {
         let Some(script) = ran.iter().find(|(at, _)| *at == r).map(|(_, script)| *script) else { continue };
         let script = match c_tasks.as_mut() {
@@ -538,20 +557,47 @@ pub(crate) fn image_for<'r>(cx: &Cx, standing: &mut Standing<'r, '_>, closure: &
                 let package = list.name(r);
                 let defers = crate::scripts::payload_parts(script.payload).and_then(|(_, record)| blaze_build_script::outputs::OutputsRef::open(record).ok()).is_some_and(|o| o.c_requests().next().is_some());
                 if defers && let Some(dep) = list.deps(r).find(|d| refused.contains(d)) {
+                    watch.see(blaze_screen::Step::Says);
                     err.line(&cx, format_args!("the C of {package}: not built, as the C of {} it depends on was refused (said above); a call into either stops naming its C name ({RULE} `image_for`)", list.name(dep)))
                         .map_err(|e| NativeError::Store(CliError::Out(e)))?;
                     refused.push(r);
+                    deferred_done = deferred_done.saturating_add(1);
                     continue;
                 }
+                if defers {
+                    use core::fmt::Write as _;
+                    let mut label = blaze_own::FixedString::<{ blaze_screen::ITEM_LABEL_BYTES }>::new();
+                    let _ = write!(label, "{package} · cc/c++");
+                    let items = [blaze_screen::ActiveItemRef { label: label.as_str(), elapsed_ms: 0 }];
+                    let remaining = deferred_total.saturating_sub(deferred_done).saturating_sub(1);
+                    let groups = [blaze_screen::ActiveGroupRef {
+                        kind: blaze_screen::WorkKind::BuildScript,
+                        items: &items,
+                        extra: u16::try_from(remaining).unwrap_or(u16::MAX),
+                    }];
+                    watch.see(blaze_screen::Step::Activity(blaze_screen::Activity {
+                        verb: "building",
+                        progress: (deferred_total > 0).then_some((deferred_done, deferred_total)),
+                        active: 1,
+                        hint: None,
+                        groups: &groups,
+                    }));
+                }
                 let producers = crate::native_runner_c::Producers { scripts: &ran, done: &done, refused: &refused, graph: sections.graph };
-                match crate::native_runner_c::built_for(&cx, c, store, &list, r, package, script, &producers, &scratch) {
+                let built = crate::native_runner_c::built_for(&cx, c, store, &list, r, package, script, &producers, &scratch);
+                if defers {
+                    deferred_done = deferred_done.saturating_add(1);
+                }
+                match built {
                     Ok((script, report)) => {
                         if let Some(report) = report {
+                            watch.see(blaze_screen::Step::Says);
                             err.line(&cx, format_args!("{}", crate::native_runner_c::Said { package, report: &report })).map_err(|e| NativeError::Store(CliError::Out(e)))?;
                         }
                         script
                     }
                     Err(why) => {
+                        watch.see(blaze_screen::Step::Says);
                         let refusal = NativeError::CTasks { package: held(package, ask), words: held(bstd::mem::format_in!(&scratch, "{why}").as_str(), ask) };
                         err.line(&cx, format_args!("{refusal}; its archives are left out of this image, and only code that calls one of its C names stops, naming it"))
                             .map_err(|e| NativeError::Store(CliError::Out(e)))?;
@@ -571,6 +617,22 @@ pub(crate) fn image_for<'r>(cx: &Cx, standing: &mut Standing<'r, '_>, closure: &
         let table = table_of(&cx, store, &scope_in, package, ask)?;
         let script = done.iter().find(|(at, _)| *at == r).map(|(_, script)| *script);
         crates.push(CrateIn { package, links: Name::links_of(scope), table, script });
+    }
+    {
+        let root_pkg = list.name(root);
+        let items = [blaze_screen::ActiveItemRef { label: root_pkg, elapsed_ms: 0 }];
+        let groups = [blaze_screen::ActiveGroupRef {
+            kind: blaze_screen::WorkKind::Blaze,
+            items: &items,
+            extra: 0,
+        }];
+        watch.see(blaze_screen::Step::Activity(blaze_screen::Activity {
+            verb: "linking",
+            progress: None,
+            active: 1,
+            hint: None,
+            groups: &groups,
+        }));
     }
     let image = image_in(&cx, &mut OnStore(store), program, &crates, platform, sdk, ask, &scratch)?;
     // Read back in place (found or just put: the store lends its own puts), for its start.
@@ -651,7 +713,7 @@ pub(crate) fn image_in<'w>(
             Some(script) => match native_image::script_outputs(script.payload, ask.home) {
                 Ok((opened, area)) => {
                     // Held in the scratch frame for as long as the link reads the outputs.
-                    let area: &blaze_world::StoredFiles = blaze_own::Box::leak(blaze_own::Box::new_in(area, scratch));
+                    let area: &blaze_world::StoredFiles = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(area, scratch));
                     outputs.push(Some((script.out, opened.with_area(area))));
                 }
                 Err(why) => return Err(NativeError::Script { package: held(c.package, ask), script: script.name, why }),
@@ -671,7 +733,7 @@ pub(crate) fn image_in<'w>(
         Err(error) => return Err(NativeError::Link { what: "the program's native key", words: held(bstd::mem::format_in!(scratch, "{error:?}").as_str(), ask) }),
     };
     let mut image = AVec::new_in(alloc);
-    if let Err(error) = native_links::program_image(&linked, &installs, platform, &ask.producer, blaze_hash::FixedState, &mut image, alloc) {
+    if let Err(error) = native_links::program_image(&linked, &installs, platform, &ask.producer, blaze_hash::FixedState, &mut image, erased.bump()) {
         return Err(NativeError::Link { what: "the program's native image", words: held(bstd::mem::format_in!(scratch, "{error:?}").as_str(), ask) });
     }
     // What it read, in link order: each crate's table (by its digest) and its script's run.
@@ -715,7 +777,7 @@ fn stubs_read<'s, 'w>(cx: &Cx, asked: &[Asked<'s>], sdk: Option<blaze_apple_sdk:
             Err(error) => return Err(unread(bstd::mem::format_in!(scratch, "{error}").as_str())),
         }
         // Held in the scratch frame for as long as the link reads the install name.
-        let bytes: &'s bstd::mem::Bytes<'s> = blaze_own::Box::leak(blaze_own::Box::new_in(bytes, scratch));
+        let bytes: &'s bstd::mem::Bytes<'s> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(bytes, scratch));
         installs.push(at.linked(bytes.as_slice()).map_err(|why| refused(StubWhy::Form(why)))?);
     }
     Ok(installs)

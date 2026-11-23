@@ -16,8 +16,8 @@ use crate::task::Serial;
 /// Each crate's files, by its index.
 pub(super) struct Texts(pub(super) &'static [&'static [(&'static str, &'static str)]]);
 
-impl SourceTexts<'static> for Texts {
-    fn read(&self, krate: usize, path: &str) -> Option<&'static str> {
+impl<'a> SourceTexts<'a> for Texts {
+    fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
         self.0.get(krate)?.iter().find(|(p, _)| *p == path).map(|(_, t)| *t)
     }
 }
@@ -41,7 +41,7 @@ pub(super) fn input(name: &'static str, root: &'static str, deps: &'static [(&'s
 
 /// Crates resolved with no sysroot (each root `#![no_core]`), one thread.
 pub(super) fn resolved(crates: &[CrateInput<'static>], texts: &'static Texts) -> Names<'static> {
-    resolve_crates(crates, Sysroot::default(), texts, &Serial, Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
+    resolve_crates(crates, Sysroot::default(), texts, &Serial, super::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
 }
 
 const DEP: &str = "#![no_core]
@@ -348,10 +348,13 @@ fn a_pub_use_of_a_crate_renamed_is_a_public_re_export() {
 #[test]
 fn a_dependency_not_finished_is_refused_by_name() {
     let crates = [input("user", "/user/lib.rs", &[("dep", 1)]), input("dep", "/dep/lib.rs", &[])];
-    let alloc = Alloc::global();
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
+    let alloc = bump.alloc();
     let graph = crate::resolve::graph_of(&crates, Sysroot::default(), alloc).unwrap_or_else(|e| panic!("the graph: {e}"));
     // Nothing finished: `dep` is not resolved before `user`.
-    let finished: [Option<crate::crate_scope::Dep<'static>>; 2] = [None, None];
+    let finished: [Option<crate::crate_scope::Dep<'_>>; 2] = [None, None];
     let by_prefix = blaze_hash::HashMap::new_in(alloc);
     let built = crate::resolve::Built { crates: &finished, by_prefix: &by_prefix, asked: None };
     let got = crate::resolve::resolve_one(
@@ -363,9 +366,9 @@ fn a_dependency_not_finished_is_refused_by_name() {
         &TEXTS,
         &Serial,
         crate::task::First::Prefetch,
-        crate::prepares::Prepares::new_in(alloc),
+        crate::prepares::Prepares::new_in(bump),
         &crate::expansions::KeptExpansions::none(alloc),
-        alloc,
+        bump,
     );
     match got {
         Err(crate::resolve::NamesError::DepNotFinished { krate, name, dep }) => assert_eq!((krate, name, dep), ("user", "dep", "dep")),

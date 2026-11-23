@@ -27,7 +27,6 @@ use blaze_build_script::{
     instr::OutputLimits,
     key::RunLimits,
     host_tools::{self, HostTool},
-    native::Grant,
     outputs::{FileLimits, FileMode, Outputs},
     toolchain::{CInputs, c_env, depfile_reads, headers_digest, map_paths},
 };
@@ -112,8 +111,6 @@ pub enum NativeScriptError {
     /// The hermetic run (bstd `procs::hermetic`, D177) refused it or failed: the fault names the
     /// rule ([`Fault::rule`]).
     Refused { program: std::string::String, fault: Fault },
-    /// The grant names a path no confinement can say (D65), refused before anything runs.
-    Grant { program: std::string::String, why: std::string::String },
     /// The world the run is started from offers no `capability` (a host, its spawner, a clock).
     NoHost { program: std::string::String, capability: &'static str },
     /// The script ran to an end that was not exit 0. `exit` is how it ended (a status, or the
@@ -152,7 +149,6 @@ impl std::fmt::Display for NativeScriptError {
             NativeScriptError::Refused { program, fault } => {
                 write!(f, "{program}: the native build script's hermetic run was refused by {:?}: {fault:?}", fault.rule())
             }
-            NativeScriptError::Grant { program, why } => write!(f, "{program}: {why}"),
             NativeScriptError::NoHost { program, capability } => {
                 write!(f, "{program}: the world a native build script is started from offers no `{capability}` (rule 9: nothing runs then)")
             }
@@ -878,23 +874,8 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
             reads.push(folder);
         }
     }
-    // The fact shim's folder: its links and pins read; only its log written (N7).
-    let mut writes: AVec<'a, &str> = Vec::new_in(alloc);
-    writes.push(c.out_dir);
-    if let Some(facts) = script.facts {
-        reads.push(facts.folder.as_str());
-        writes.push(facts.log_dir.as_str());
-    }
-    // The jobserver's fifo, read and written (a client opens it so: `jobserver`'s `fifo:`).
-    if let Some(server) = script.jobs {
-        writes.push(server.fifo());
-    }
     let out_only = [c.out_dir];
     let exec_under: &[&str] = if runs_out_dir { &out_only } else { &[] };
-    // The grant's paths are checked as the Seatbelt profile would say them (one check for both
-    // hosts: a grant refused on one is refused on both), before anything runs.
-    blaze_build_script::native::seatbelt_with(&Grant { program: script.program, exec: &exec, read: &reads, write: &writes }, exec_under, alloc)
-        .map_err(|why| NativeScriptError::Grant { program: program(), why: why.to_string() })?;
 
     // D177: the run is a hermetic spec at `Level::Inputs`. Each read folder is a tree root
     // named by the key; `OUT_DIR` the output root; the jobserver's fifo and the fact shim's

@@ -229,7 +229,7 @@ fn core_from_prim_the_walks_way() {
     let user = UserCrate { name: "probe", dir: "/probe/", root: "/probe/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let core = crates.iter().position(|c| c.name == "core").expect("the toolchain's `core`");
     let std_ = crates.iter().position(|c| c.name == "std").expect("the toolchain's `std`");
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
@@ -246,7 +246,7 @@ fn core_from_prim_the_walks_way() {
         Some(k) => println!("the caller found by its text: {}", names.item_text(k).map_or("?", |t| t.text.lines().next().unwrap_or("?"))),
         None => println!("no free fn of core or std calls `from_prim(` in its text: part 2 is skipped"),
     }
-    let prepared = Prepares::new_in(a);
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
 
     // 1. Fresh store; the impl's head made as an inherent lookup makes it; `from_prim` the
     //    walk's way; then its local items and the inner `const _` as its own body.
@@ -392,7 +392,7 @@ fn core_from_prim_in_the_walks_program() {
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     println!("3 the walk's program: {} crates", names.crates().len());
     let core = crates.iter().position(|c| c.name == "core").expect("the toolchain's `core`");
     let imp = names
@@ -400,7 +400,7 @@ fn core_from_prim_in_the_walks_program() {
         .map(|(k, _, _)| k)
         .find(|&k| names.item_text(k).is_some_and(|t| t.impl_header.is_some_and(|h| h.contains("ErrorKind") && !h.contains(" for ")) && t.text.contains("fn from_prim")))
         .expect("core's `impl ErrorKind` with `from_prim`");
-    let prepared = Prepares::new_in(a);
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
 
     // Every impl header of the program naming both `PartialEq` and `u32`, with its crate (a
     // header a macro wrote shows its expansion's text, `$t` replaced).

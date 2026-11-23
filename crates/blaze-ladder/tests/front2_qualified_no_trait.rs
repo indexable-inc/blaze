@@ -60,7 +60,7 @@ fn qualified_path_with_no_trait_is_type_relative() {
     let user = UserCrate { name: "qnt", dir: "/qnt/", root: "/qnt/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -114,7 +114,7 @@ fn qualified_path_with_no_trait_is_type_relative() {
 
     // The bodies: the macro-written form (the real site), the form written out, and the control
     // `V::Counter` (the shorthand that already checked): all three check clean.
-    let prepared = Prepares::new_in(alloc);
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut buckets = None;
     for name in ["width", "direct", "shorthand"] {
         let mk = member(&front.keys, name);

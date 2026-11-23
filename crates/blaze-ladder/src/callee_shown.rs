@@ -67,6 +67,8 @@ pub fn self_form(v: PTys<'_>, args: List) -> &'static str {
     match node {
         PNode::Adt(..) => "an ADT",
         PNode::Tuple(_) => "a tuple",
+        PNode::Record(_) => "a record",
+        PNode::Union(_) => "a union",
         PNode::FnDef(..) => "a fn item",
         PNode::FnPtr(..) => "a fn pointer",
         PNode::Closure { .. } => "a closure",
@@ -196,6 +198,22 @@ pub fn args_shown(v: PTys<'_>, args: List, name: &dyn Fn(ItemKey) -> Option<Box<
                     out.push('(');
                 }
                 Err(_) => out.push_str("(a list past the ground table)"),
+            },
+            PNode::Record(l) => match v.list(l) {
+                Ok(all) => {
+                    work.push(Step::Words(")"));
+                    push_list(&mut work, all, ", ");
+                    out.push_str("record(");
+                }
+                Err(_) => out.push_str("record(a list past the ground table)"),
+            },
+            PNode::Union(l) => match v.list(l) {
+                Ok(all) => {
+                    work.push(Step::Words(")"));
+                    push_list(&mut work, all, " | ");
+                    out.push_str("union(");
+                }
+                Err(_) => out.push_str("union(a list past the ground table)"),
             },
             PNode::Closure { owner, ordinal, .. } => match name(owner) {
                 Some(p) => {

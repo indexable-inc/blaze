@@ -817,7 +817,8 @@ impl<'n> Front2Program<'n> {
             }
         };
         let mut buckets = None;
-        let prepared = Prepares::new_in(alloc);
+        let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+        let prepared = Prepares::new_in(bump);
         let mut mains: Vec<Body<'n>, Global> = Vec::with_capacity_in(roots.len(), Global);
         let mut kept: Vec<LibKey, Global> = Vec::with_capacity_in(roots.len(), Global);
         // The records, with the program's one constant evaluator, are made BEFORE the roots
@@ -1433,9 +1434,9 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, valu
         // expanded once by its crate's solve: the link table's symbol, over records too.
         let value = |attr: &'static str| {
             let t = v.text_at(a.args).map_err(|e| refuse(format!("{e:?}")))?;
-            super::links::symbol_of(t, Some(values_at), |item| names.attr_value(item, attr), edition, Alloc::global())
-                .map(Box::<str>::from)
-                .map_err(|why| refuse(format!("`#[{attr} = {t}]`: {why:?}")))
+            super::links::with_symbol_of(t, Some(values_at), |item| names.attr_value(item, attr), edition, |res| {
+                res.map(Box::<str>::from).map_err(|why| refuse(format!("`#[{attr} = {t}]`: {why:?}")))
+            })
         };
         match v.text_at(a.path).map_err(|e| refuse(format!("{e:?}")))?.trim() {
             // The fn's own identifier, from its signature; never the shown `path`, which for a

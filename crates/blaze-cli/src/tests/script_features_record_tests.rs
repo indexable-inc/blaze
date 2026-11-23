@@ -109,9 +109,10 @@ fn hello() -> (World<'static>, ToolchainId) {
     let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()), left_out: AVec::new_in(a()) }));
     let (id, files) = blaze_world::fixture::shelf(TRIPLE, STAGED_STD, TARGET_CFG, a());
     let mut shelf = Memory(files.into_iter().collect());
-    let listed = blaze_world::open_list(&mut shelf, id, TRIPLE, graph, lock, &mut Member, a()).unwrap_or_else(|e| panic!("{e}"));
+    let b = blaze_own::testing::bump();
+    let listed = blaze_world::open_list(&mut shelf, id, TRIPLE, graph, lock, &mut Member, b).unwrap_or_else(|e| panic!("{e}"));
     let listed = StdBox::leak(StdBox::new(listed));
-    (blaze_world::world(graph, lock, listed, &mut Member, &NoFiles, a()).unwrap_or_else(|e| panic!("{e}")), id)
+    (blaze_world::world(graph, lock, listed, &mut Member, &NoFiles, b).unwrap_or_else(|e| panic!("{e}")), id)
 }
 
 /// [`crate::scripts::CommandFeatures`] counted: its hits and its puts (a put is a walk), and

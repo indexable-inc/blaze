@@ -63,7 +63,7 @@ fn with_names(text: &'static str, each: impl FnOnce(&blaze_scope::resolve::Names
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let written = Written { kind: PathKind::Plain, segments: &["main"] };
     let found = names::path(&names, names.root(0), Namespace::Values, written, Alloc::global()).unwrap_or_else(|e| panic!("`main` by path: {e:?}"));
     let main = found.whole(1).unwrap_or_else(|| panic!("`main` resolves whole")).key;

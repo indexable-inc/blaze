@@ -156,6 +156,9 @@ pub(crate) struct CrateAt {
     /// keys), so everything derived from it is valid by that key ([`dependency_key`]). A crate
     /// that depends on a member is not: the member's text moves under an equal key.
     pub(crate) closed: bool,
+    /// Whether this crate belongs to the toolchain (`core`/`alloc`/`std`/`bstd`/etc.): its closed
+    /// dependency head records are rooted under `tool.<id>` across all checkouts.
+    pub(crate) toolchain: bool,
 }
 
 /// Every crate of `list` by its key's prefix, sorted, with its names record's key, by the names
@@ -203,7 +206,8 @@ fn each_crate_by(list: &CrateList<'static>, names_at: &dyn Fn(Name) -> Option<Ke
         let key = list.key(at);
         let names_at = names_at(blaze_drive::key::crate_scope_name(&key));
         let member = list.member(at);
-        push(CrateAt { prefix: key.prefix(), key, names_at, member, closed: !member });
+        let toolchain = CrateGraph::toolchain(list, at);
+        push(CrateAt { prefix: key.prefix(), key, names_at, member, closed: !member, toolchain });
     }
 }
 
@@ -976,7 +980,7 @@ impl<'p> RequestTable<'p> {
             }
         }
         let fresh = self.fresh.pin();
-        let mut puts: std::vec::Vec<(Key, std::vec::Vec<u8, Global>), Global> = std::vec::Vec::new_in(Global);
+        let mut puts: std::vec::Vec<(Key, bool, std::vec::Vec<u8, Global>), Global> = std::vec::Vec::new_in(Global);
         let mut not_put = NotPut::default();
         for (_, one) in fresh.iter() {
             // Only a dependency's: a member's head moves with its crate's every edit, so it
@@ -999,14 +1003,17 @@ impl<'p> RequestTable<'p> {
             let mut payload = std::vec::Vec::with_capacity_in(KEY_BYTES + one.bytes.len(), Global);
             payload.extend_from_slice(&names_at.0.0);
             payload.extend_from_slice(one.bytes);
-            puts.push((dependency_key(names_at, one.cell, tool), payload));
+            puts.push((dependency_key(names_at, one.cell, tool), krate.toolchain, payload));
         }
-        puts.sort_unstable_by_key(|(key, _)| *key);
-        puts.dedup_by_key(|(key, _)| *key);
-        for (key, payload) in puts.iter() {
+        puts.sort_unstable_by_key(|(key, _, _)| *key);
+        puts.dedup_by_key(|(key, _, _)| *key);
+        for (key, is_toolchain, payload) in puts.iter() {
             // Its payload is this vector's, freed below: none held after the merge.
             ledger.put(Stage::Bodies, *key, &[&payload[..]], 0);
             store.put(&cx, *key, payload)?;
+            if *is_toolchain {
+                store.keep_with_toolchain(*key)?;
+            }
         }
         let mut unlisted = 0u32;
         // Set again by every request that lists heads, not only one that puts some: a root a
@@ -1015,7 +1022,7 @@ impl<'p> RequestTable<'p> {
         if !puts.is_empty() || !self.listed.is_empty() {
             let mut keys: std::vec::Vec<Key, Global> = std::vec::Vec::with_capacity_in(self.listed.len() + puts.len(), Global);
             keys.extend_from_slice(&self.listed);
-            keys.extend(puts.iter().map(|(key, _)| *key));
+            keys.extend(puts.iter().map(|(key, _, _)| *key));
             keys.sort_unstable();
             keys.dedup();
             // Rule 18: the root lists at most a table's cells; past it, counted and said.
@@ -1288,7 +1295,7 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
             "a member crate's head ({}); its head task could not freeze it: {why} (said at its head task; a body never freezes a member's head: engine_seeds.rs `StretchHeads::known`)",
             kind_words(cell)
         );
-        core::str::from_utf8(words.into_bytes().leak()).unwrap_or("a member's head its head task could not freeze (its words are not text)")
+        blaze_own::Box::leak_static(words.into_boxed_str())
     }
 
     /// Resolve the listing's logical file slot in the defining unit. For a macro-written
@@ -1332,7 +1339,7 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
             let _ = write!(words, " and {more} more");
         }
         let _ = write!(words, " and not under this body's unit for the referenced crate (requested defining unit {}): a head is frozen once a unit that holds its item (engine_heads.rs `head_cell`, `run_items`)", UnitWords(unit_of(cell)));
-        core::str::from_utf8(words.into_bytes().leak()).unwrap_or("a member's head frozen under other units only (its words are not text)")
+        blaze_own::Box::leak_static(words.into_boxed_str())
     }
 }
 
@@ -1445,7 +1452,7 @@ impl RequestTable<'_> {
         // retired by a replace never frees them: they are not its).
         let mut copy = blaze_own::Vec::with_capacity_in(bytes.len(), self.heap.alloc());
         copy.extend_from_slice(bytes);
-        let lent: &'static [u8] = copy.leak();
+        let lent: &'static [u8] = copy.leak_static();
         match fresh.try_insert(id, Fresh { cell, krate, bytes: lent }) {
             Ok(_) => Ok(()),
             Err(occupied) => self.again(cell, occupied.current.bytes, bytes),

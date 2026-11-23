@@ -79,13 +79,14 @@ enum Fact<'a> {
 
 /// The crate of one file solved over `texts`, its items record encoded and opened.
 fn record_of(texts: &'static Texts) -> (ItemsRecord<'static>, &'static [u8], CrateItemKey) {
-    let g = Alloc::global();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let inputs = [input("k0", PATH, &[])];
-    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
     let names = solved[0].names;
     let bytes = encode(names, g).unwrap_or_else(|e| panic!("encode: {e:?}"));
-    let bytes: &'static [u8] = aligned(&bytes, g);
-    (super::items_record::one_file(bytes, names.files[0].text, g), bytes, names.key)
+    let bytes: &'static [u8] = aligned(&bytes, bump);
+    (super::items_record::one_file(bytes, names.files[0].text, bump), bytes, names.key)
 }
 
 /// The record's facts (module docs), in row order.
@@ -187,7 +188,7 @@ fn a_type_only_edit_is_fresh_through_the_old_record() {
     static BASE_TEXTS: Texts = Texts(&BASE_CRATES);
     let (base, bytes, krate) = record_of(&BASE_TEXTS);
     for (what, _, text, touched) in VARIANTS.iter() {
-        let read = RecordItems::new(&[krate], Today { record: bytes, text }, Alloc::global());
+        let read = RecordItems::new(&[krate], Today { record: bytes, text }, super::SyncFrame::leaked());
         for name in touched.iter() {
             let key = (0..base.items())
                 .find_map(|i| base.item_at(i).ok().flatten().filter(|row| row.name == Some(*name)).map(|row| row.key))

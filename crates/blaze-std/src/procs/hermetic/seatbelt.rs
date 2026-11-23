@@ -26,10 +26,11 @@
 //! start runs a step in the child (a `fork` path of its own, decided against for now: the
 //! linked start stays `posix_spawn`).
 //!
-//! The budget is metered, not held: `proc_pid_rusage` of the child every
-//! [`super::machine::METER_EVERY`], its group killed (`killpg`) when a cap is passed. The meter
-//! reads the group's leader (the program; `sandbox-exec` became it by `execve`); a helper's use
-//! is not in it.
+//! The budget is metered, not held: `proc_listpgrppids` enumerates the live processes in the
+//! child's process group every [`super::machine::METER_EVERY`], `proc_pid_rusage` sums each
+//! member's self + reaped-child user/system CPU time and physical footprint (treating `ESRCH` on
+//! an individual PID as a benign exit race), and its group is killed (`killpg`) when a cap is
+//! passed.
 //!
 //! What this does not hold: the host's clock (a `gettimeofday` is the host's), metadata timing
 //! (an mtime it stats under a root is the host file's), the CPU's model (`sysctl`), the kernel's
@@ -50,28 +51,8 @@ use crate::{
     procs::{Run, Spawner, Started, Streams},
 };
 
-/// The loader and the system libraries, read whole: blaze-build-script's `MACOS_LOADER_READS`
-/// verbatim (found by narrowing a `(deny default)` profile on macOS 27, arm64; the profile the
-/// old native_sandbox.rs ran tempo's libproc, reth-mdbx-sys, sha3-asm and librocksdb-sys under).
-/// `/usr/lib` holds dyld and libSystem; `/System/Library` the frameworks and `dyld/`; the
-/// Cryptex the dyld shared cache.
-pub const SYSTEM: [&str; 3] = ["/usr/lib", "/System/Library", "/System/Volumes/Preboot/Cryptexes/OS"];
-
-/// What every profile allows before the plan's rules, each from the working profile
-/// (blaze-build-script `seatbelt_with`, D65/D69):
-/// - `process-fork`: a fork runs only the confined program again, under the same profile;
-///   what it may then `execve` is the plan's literals alone (`process-exec`), so a start is
-///   still limited to the program and the named helpers. (The working profile allowed it
-///   always; the D177 move allowed it only with helpers, untested: put back.)
-/// - `sysctl-read`: the C runtime asks the page size and the CPU count at start.
-/// - `signal (target same-sandbox)`: a program signals itself and its own helpers (`abort`,
-///   make's children); nothing outside the sandbox.
-/// - `file-read*` of the root folder ITSELF (a literal: not what is under it): the loader reads
-///   `/` before `main`. The D177 move allowed only its metadata; this is the one rule the
-///   working profile had that the moved one lacked, and the likely reason a confined test binary
-///   printed nothing at all (it never reached `main`).
-const PREAMBLE: &[u8] = b"(version 1)\n(deny default)\n(allow process-fork)\n(allow sysctl-read)\n\
-(allow signal (target same-sandbox))\n(allow file-read* (literal \"/\"))\n";
+/// The loader and the system libraries, read whole (from `blaze_roots::seatbelt::MACOS_SYSTEM`).
+pub const SYSTEM: [&str; 3] = blaze_roots::seatbelt::MACOS_SYSTEM;
 
 /// `sandbox-exec`, the OS's own.
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
@@ -85,49 +66,43 @@ pub(super) fn run<'a>(
     files: &dyn RootFiles,
     alloc: Alloc<'a>,
 ) -> Result<HermeticRun<'a>, HermeticError<'a>> {
-    let mut port = NativePort::new(spawner, clock, cx, alloc, Seatbelt { timebase: blaze_sys::macos::timebase() });
+    let mut port = NativePort::new(
+        spawner,
+        clock,
+        cx,
+        alloc,
+        Seatbelt { timebase: blaze_sys::macos::timebase(), peak_cpu: Duration::ZERO },
+    );
     run_through(spec, &mut port, files, &SYSTEM, alloc, NoPlant)
 }
 
 /// The SBPL profile of `plan` (module docs), NUL-ended text in `alloc`.
 pub fn profile<'a>(plan: &Plan<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, Fault> {
-    let mut out = AVec::new_in(alloc);
-    let mut put = |bytes: &[u8]| out.try_extend_from_slice(bytes).map_err(|_| Fault::OutOfMemory);
-    put(PREAMBLE)?;
-    for rule in plan.rules() {
-        let path = rule.path.as_bytes();
-        let filter: &[u8] = if rule.subtree { b"subpath" } else { b"literal" };
-        let ops: &[&[u8]] = match rule.access {
-            Access::Exec => &[b"process-exec", b"file-read*"],
-            Access::Read => &[b"file-read*"],
-            Access::Write => &[b"file-read*", b"file-write*"],
-        };
-        for op in ops {
-            put(b"(allow ")?;
-            put(op)?;
-            put(b" (")?;
-            put(filter)?;
-            put(b" \"")?;
-            put(path)?;
-            put(b"\"))\n")?;
-        }
-        // Each ancestor folder's metadata: resolving the path stats every folder above it.
-        let mut end = 0;
-        while let Some(at) = path[end + 1..].iter().position(|&b| b == b'/') {
-            end += 1 + at;
-            put(b"(allow file-read-metadata (literal \"")?;
-            put(&path[..end])?;
-            put(b"\"))\n")?;
-        }
-    }
-    put(&[0])?;
-    Ok(out)
+    use blaze_roots::seatbelt::{SbplAccess, SbplError, SbplRule, render_sbpl};
+    let rules = plan.rules().map(|rule| SbplRule {
+        path: rule.path,
+        subtree: rule.subtree,
+        access: match rule.access {
+            Access::Read => SbplAccess::Read,
+            Access::Write => SbplAccess::Write,
+            Access::Exec => SbplAccess::Exec,
+        },
+    });
+    render_sbpl(rules, alloc).map_err(|err| match err {
+        SbplError::OutOfMemory => Fault::OutOfMemory,
+        SbplError::BadPath { at } => Fault::PathRefused { at },
+    })
 }
 
-/// The macOS confiner: `sandbox-exec` with the plan's profile, and the rusage meter.
+/// The macOS confiner: `sandbox-exec` with the plan's profile, and the process-group rusage meter.
 struct Seatbelt {
     timebase: (u32, u32),
+    /// Highest group CPU time observed so far (monotonic even if a reparented helper exits).
+    peak_cpu: Duration,
 }
+
+/// Maximum live PIDs sampled per process group in one meter tick (bounded stack buffer, rule 18).
+const GROUP_PID_CAP: usize = 256;
 
 impl Confiner for Seatbelt {
     fn start(&mut self, spawner: &Spawner, cx: &Cx, start: &StartView<'_>, streams: Streams, alloc: Alloc<'_>) -> Result<Started<Run>, Fault> {
@@ -152,13 +127,48 @@ impl Confiner for Seatbelt {
     }
 
     fn meter(&mut self, pid: i32) -> Result<Option<Usage>, Fault> {
-        let info = blaze_sys::seatbelt::child_usage(pid).map_err(|errno| Fault::Host { call: "proc_pid_rusage", code: errno.raw() })?;
-        let ticks = info.words[blaze_sys::macos::RusageInfoV4::USER].saturating_add(info.words[blaze_sys::macos::RusageInfoV4::SYSTEM]);
+        let mut pids = [0i32; GROUP_PID_CAP];
+        let count = match blaze_sys::seatbelt::group_pids(pid, &mut pids) {
+            Ok(count) => count,
+            // Benign exit race: the process group disappeared before metering ran.
+            Err(blaze_sys::Errno::Srch) => 0,
+            Err(errno) => return Err(Fault::Host { call: "proc_listpgrppids", code: errno.raw() }),
+        };
+        let listed = &pids[..count];
+        let mut total_ticks: u64 = 0;
+        let mut total_memory: u64 = 0;
+        let mut leader_seen = false;
+
+        for &member in listed {
+            if member == pid {
+                leader_seen = true;
+            }
+            match blaze_sys::seatbelt::child_usage(member) {
+                Ok(info) => {
+                    total_ticks = total_ticks.saturating_add(info.total_cpu_ticks());
+                    total_memory = total_memory.saturating_add(info.footprint());
+                }
+                // Benign exit race: a process exited between enumeration and rusage query.
+                Err(blaze_sys::Errno::Srch) => continue,
+                Err(errno) => return Err(Fault::Host { call: "proc_pid_rusage", code: errno.raw() }),
+            }
+        }
+        if !leader_seen {
+            match blaze_sys::seatbelt::child_usage(pid) {
+                Ok(info) => {
+                    total_ticks = total_ticks.saturating_add(info.total_cpu_ticks());
+                    total_memory = total_memory.saturating_add(info.footprint());
+                }
+                Err(blaze_sys::Errno::Srch) => {}
+                Err(errno) => return Err(Fault::Host { call: "proc_pid_rusage", code: errno.raw() }),
+            }
+        }
+
         let (numer, denom) = self.timebase;
-        let nanos = u128::from(ticks) * u128::from(numer) / u128::from(denom.max(1));
+        let nanos = u128::from(total_ticks) * u128::from(numer) / u128::from(denom.max(1));
         // Saturated: a CPU time past u64 nanoseconds (584 years) is past every budget.
         let cpu = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
-        let memory = info.words[blaze_sys::macos::RusageInfoV4::FOOTPRINT];
-        Ok(Some(Usage { cpu, memory, steps: None }))
+        self.peak_cpu = self.peak_cpu.max(cpu);
+        Ok(Some(Usage { cpu: self.peak_cpu, memory: total_memory, steps: None }))
     }
 }

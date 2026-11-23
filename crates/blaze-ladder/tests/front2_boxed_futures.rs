@@ -90,7 +90,7 @@ fn check_future_imports(program: &str, cases: &[(&str, Option<&str>)]) {
     let user = UserCrate { name: "imports", dir: "/imports/", root: "/imports/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &toolchain).expect("fixture and toolchain");
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).expect("resolve the fixture");
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("resolve the fixture");
     let sources = [SourceFile { path: "src/main.rs", text: program }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("inference frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front end");
@@ -149,7 +149,7 @@ fn boxed_return_values_keep_the_future_output_and_stream_item() {
     let user = UserCrate { name: "boxed", dir: "/boxed/", root: "/boxed/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &toolchain).expect("toolchain and user crate");
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).expect("resolve the boxed-return crate");
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("resolve the boxed-return crate");
     let sources = [SourceFile { path: "src/main.rs", text: PROGRAM }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front end");

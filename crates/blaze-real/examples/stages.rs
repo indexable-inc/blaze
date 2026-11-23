@@ -1983,7 +1983,11 @@ fn bodies_named(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scri
     let mut off_modules = Causes::default();
     // `--tests`: the test units' own rows (bodies under `#[cfg(test)]` modules), and how many are clean.
     let (mut test_bodies, mut test_clean) = (0usize, 0usize);
-    let prepared = blaze_lower::scoped::Prepares::new_in(Alloc::global());
+    let Ok(prep_frame) = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer) else {
+        return;
+    };
+    let prep_erased = blaze_own::Erased::new(&prep_frame);
+    let prepared = blaze_lower::scoped::Prepares::new_in(prep_erased.bump());
     let procs_tally = ProcTally::default();
     let start = Instant::now();
     for (k, c) in names.crates().iter().enumerate() {

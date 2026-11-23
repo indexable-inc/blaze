@@ -31,7 +31,7 @@ fn check(source: &str, cases: &[(&str, &[&str])]) {
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).expect("fixture crates");
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).expect("fixture names");
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("fixture names");
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
     let mut world = ProjectWorld::new(&names, &frame, &files, alloc).expect("front2");
     let bodies = world.bodies(alloc);

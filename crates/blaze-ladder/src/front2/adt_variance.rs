@@ -153,7 +153,7 @@ pub fn children<'t>(tys: tc::PTys<'t>, t: tc::PTy, node: tc::PNode) -> Result<(&
     use tc::PNode as N;
     let list = |l| tys.list(l).map_err(LaidError::Table);
     Ok(match node {
-        N::Tuple(l) | N::Adt(_, l) | N::FnDef(_, l) | N::FnPtr(l, _) | N::Opaque(_, l) | N::Alias { args: l, .. } | N::Dynamic(l) | N::ExTrait(_, l) => (list(l)?, None),
+        N::Tuple(l) | N::Record(l) | N::Union(l) | N::Adt(_, l) | N::FnDef(_, l) | N::FnPtr(l, _) | N::Opaque(_, l) | N::Alias { args: l, .. } | N::Dynamic(l) | N::ExTrait(_, l) => (list(l)?, None),
         N::Ref(_, c) | N::Ptr(_, c) | N::Slice(c) | N::Array(c, _) | N::Pat(c, _) => (&[], Some(c)),
         N::ExProj { args, term, .. } => (list(args)?, Some(term)),
         N::Infer | N::Closure { .. } | N::Future(..) | N::Coroutine { .. } => return Err(LaidError::BodyType { node: t }),
@@ -325,7 +325,7 @@ fn child_variance(p: LaidNode, pv: Solving, nth: u32, of: &dyn VarianceOf) -> Re
             tc::Mutbl::Not => Solving::Co,
             tc::Mutbl::Mut => Solving::In,
         }),
-        N::Slice(_) | N::Array(..) | N::Pat(..) | N::Tuple(_) => pv,
+        N::Slice(_) | N::Array(..) | N::Pat(..) | N::Tuple(_) | N::Record(_) | N::Union(_) => pv,
         // Argument `nth` is the ADT's parameter `lifetimes + nth`: its lifetimes are its own
         // slots, laid before its children.
         N::Adt(k, _) => declared(pv, k.0, p.own + nth, of)?,

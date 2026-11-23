@@ -91,7 +91,7 @@ fn an_include_reads_a_module_and_include_str_and_include_bytes_read_data() {
     let asked = Asked::default();
     let texts: &'static Asked = std::boxed::Box::leak(std::boxed::Box::new(asked));
     let crates = [input("w", "/w/src/lib.rs", &[])];
-    let names = resolve_crates(&crates, Sysroot::default(), texts, &Serial, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), texts, &Serial, super::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let modules = texts.modules.lock().unwrap_or_else(|p| panic!("modules: {p}")).clone();
     let mut data = texts.data.lock().unwrap_or_else(|p| panic!("data: {p}")).clone();
     data.sort();

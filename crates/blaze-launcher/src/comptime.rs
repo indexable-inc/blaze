@@ -209,7 +209,7 @@ pub fn install(alloc: Alloc<'static>) -> Result<(), ComptimeError> {
     let real = real()?;
     let pipe = Pipe { fd: FD, pending: Vec::new_in(alloc), chunk: [0; CHUNK] };
     // The layer keeps its transport for the process's life: a box in `alloc`, never freed.
-    let transport: &'static mut dyn Transport = blaze_own::Box::leak(blaze_own::Box::new_in(pipe, alloc));
+    let transport: &'static mut dyn Transport = blaze_own::Box::leak_static(blaze_own::Box::new_in(pipe, alloc));
     let opts = ChildOpts { os: OS, limits: Limits { page, .. }, alloc, transport, real };
     child::install(opts).map_err(ComptimeError::Install)
 }

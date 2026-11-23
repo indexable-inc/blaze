@@ -108,7 +108,8 @@ impl<'a> Load<'a> for Kept<'a> {
 fn a_record_backed_body_reads_data_relative_to_its_calling_file() {
     let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("the records frame");
     let erased = blaze_own::Erased::new(&frame);
-    let alloc = erased.handle();
+    let bump = erased.bump();
+    let alloc = bump.alloc();
     let files = Files {
         env: CrateEnv::of(EnvFacts {
             crate_name: "pkg", package: Some(("pkg", "1.0.0")), bin: None,
@@ -124,7 +125,7 @@ fn a_record_backed_body_reads_data_relative_to_its_calling_file() {
         features: &[], deps: &[], cfg: &[], script: None,
     };
     let (kept, item, module, generated) = {
-        let solved = resolve_crates(&[input], Sysroot::default(), &Original, &Serial, alloc).expect("resolve the fixture");
+        let solved = resolve_crates(&[input], Sysroot::default(), &Original, &Serial, bump).expect("resolve the fixture");
         let (item, module, _) = solved.items(0)
             .find(|(key, _, _)| solved.item_text(*key).and_then(|row| row.name) == Some("f"))
             .expect("the function f");
@@ -149,8 +150,8 @@ fn a_record_backed_body_reads_data_relative_to_its_calling_file() {
             Err(e) => panic!("the origins of the `make!()` call: {e:?}"),
         };
         let kept = Kept {
-            names: aligned(&names_record::encode(krate, alloc).expect("names record"), alloc),
-            items: aligned(&items_record::encode(krate, alloc).expect("items record"), alloc),
+            names: aligned(&names_record::encode(krate, alloc).expect("names record"), bump),
+            items: aligned(&items_record::encode(krate, alloc).expect("items record"), bump),
             made: (call, made.text, origins),
         };
         (kept, item, module, generated)

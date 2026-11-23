@@ -76,13 +76,87 @@ const STEPS_MOST: u32 = 8;
 /// passed): a Unix socket's close is immediate.
 const HANGUP_WAIT: Duration = Duration::from_millis(10);
 
-/// Whether a command whose ask found no helper (or a dead one) starts one. One value until a
-/// helper has been run by hand on tempo (the module's doc): the detached start, with its expiry
-/// and its simulation, is the next piece, and it is a value of this type, chosen at the seam.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum HelperStart {
+/// Arguments passed to the detached `blaze` child: `journal-helper` alone (cwd is set to the
+/// checkout root, since `blaze journal-helper` takes a relative bstd `Path` or defaults to cwd).
+#[cfg(unix)]
+const HELPER_ARGS: [&str; 1] = ["journal-helper"];
+
+/// Whether a command whose ask found no helper (or a dead one) starts one.
+pub(crate) enum HelperStart<'a> {
     /// No helper is started: the line says one would be.
     None,
+    /// Starts `blaze journal-helper` (with cwd set to `root`) detached in its own session
+    /// (`/dev/null` stdio, zero inherited descriptors) when no live helper answered.
+    #[cfg(unix)]
+    Detached {
+        spawner: bstd::procs::Spawner,
+        exe: &'a str,
+        root: &'a str,
+        home: Option<&'a str>,
+    },
+}
+
+impl<'a> HelperStart<'a> {
+    /// Detached helper start when this host offers a native spawner and knows its own executable
+    /// and the checkout's resolved root; otherwise [`HelperStart::None`].
+    #[cfg(unix)]
+    pub(crate) fn detached(host: &bstd::host::Host, exe: Option<&'a str>, root: Option<&'a str>, home: Option<&'a str>) -> HelperStart<'a> {
+        match (host.spawner(), exe, root) {
+            (Ok(spawner), Some(exe), Some(root)) => HelperStart::Detached { spawner, exe, root, home },
+            _ => HelperStart::None,
+        }
+    }
+
+    /// Detached helper start is unavailable off Unix.
+    #[cfg(not(unix))]
+    pub(crate) fn detached(_host: &bstd::host::Host, _exe: Option<&'a str>, _root: Option<&'a str>, _home: Option<&'a str>) -> HelperStart<'a> {
+        HelperStart::None
+    }
+
+    /// Starts a detached helper if `outcome` indicates no live helper is serving this checkout.
+    fn maybe_start(&self, cx: &Cx, outcome: &Outcome<'_>) -> StartedHelper {
+        let wanted = match outcome {
+            Outcome::NotAsked { start: true, .. } => true,
+            Outcome::Answered { answer: AskAnswer::CannotVouch { why, .. }, .. } => {
+                matches!(why, since::CannotVouch::Dead(_) | since::CannotVouch::NoHelper)
+            }
+            _ => false,
+        };
+        if !wanted {
+            return StartedHelper::NotWanted;
+        }
+        match self {
+            HelperStart::None => StartedHelper::None,
+            #[cfg(unix)]
+            HelperStart::Detached { spawner, exe, root, home } => {
+                let env_pair = home.map(|home| [("HOME", home)]);
+                let env: &[(&str, &str)] = match &env_pair {
+                    Some(pair) => pair.as_slice(),
+                    None => &[],
+                };
+                let spec = bstd::procs::DetachedSpec {
+                    program: exe,
+                    args: &HELPER_ARGS,
+                    env,
+                    dir: root,
+                };
+                match spawner.start_detached(cx, &spec) {
+                    Ok(pid) => StartedHelper::Started(pid),
+                    Err(error) => StartedHelper::Failed(error),
+                }
+            }
+        }
+    }
+}
+
+/// Outcome of attempting to start a detached helper after an unanswered ask.
+enum StartedHelper {
+    NotWanted,
+    None,
+    #[cfg(unix)]
+    Started(bstd::procs::ProcId),
+    #[cfg(unix)]
+    Failed(bstd::procs::RunError),
 }
 
 /// This command as a helper sees it: its build and its checkout.
@@ -181,21 +255,23 @@ fn paired_place(stored: Stored<'_>) -> Option<Place> {
 }
 
 /// The command asks the helper ([`ChangedSince`]): the module's `Asked`.
-pub(crate) struct Asked {
+pub(crate) struct Asked<'a> {
     pub(crate) me: Me,
-    pub(crate) start: HelperStart,
+    pub(crate) start: HelperStart<'a>,
 }
 
 /// The command asks the helper, then replays, and compares: the module's `Both`.
-pub(crate) struct Both {
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Both<'a> {
     pub(crate) me: Me,
-    pub(crate) start: HelperStart,
+    pub(crate) start: HelperStart<'a>,
 }
 
-/// The strategy the command uses until the differential has held on tempo.
-pub(crate) type Shipped = Both;
+/// The strategy the command ships with: ask the detached helper directly, falling back to a
+/// replay only when no helper vouches.
+pub(crate) type Shipped<'a> = Asked<'a>;
 
-impl ChangedSince for Asked {
+impl ChangedSince for Asked<'_> {
     const NAME: &'static str = "asked";
 
     fn changed_since<'f>(
@@ -228,13 +304,14 @@ impl ChangedSince for Asked {
                 None
             }
         };
+        let started = self.start.maybe_start(&cx, &asked.outcome);
         let counted = names.map(|names| u32::try_from(names.len()).unwrap_or(u32::MAX));
-        taken.said(HelperRow { by: Self::NAME, ask_ns: asked.ns, names: counted, differ: None, said: said_of(&asked, self.start, None) });
+        taken.said(HelperRow { by: Self::NAME, ask_ns: asked.ns, names: counted, differ: None, said: said_of(&asked, &started, None) });
         Ok(taken)
     }
 }
 
-impl ChangedSince for Both {
+impl ChangedSince for Both<'_> {
     const NAME: &'static str = "both: asked, then replayed";
 
     fn changed_since<'f>(
@@ -247,6 +324,7 @@ impl ChangedSince for Both {
         // doc), so the union covers every write up to the place saved.
         let asked = ask(&cx, home, clock, self.me, paired_place(stored), frame)?;
         taken.replay_checkout(&cx, clock, root, stored);
+        let started = self.start.maybe_start(&cx, &asked.outcome);
         // The differential is read before the helper's names join the unit: it borrows the
         // replay's names from `taken`.
         let vouched = match asked.outcome {
@@ -256,7 +334,7 @@ impl ChangedSince for Both {
         let (differ_counts, said) = {
             let differs = vouched.zip(taken.replayed_names()).map(|(names, replayed)| differ(names, replayed, frame));
             let counts = differs.as_ref().map(|it| (u32::try_from(it.only_helper.len()).unwrap_or(u32::MAX), u32::try_from(it.only_replay.len()).unwrap_or(u32::MAX)));
-            (counts, said_of(&asked, self.start, differs.as_ref()))
+            (counts, said_of(&asked, &started, differs.as_ref()))
         };
         match asked.outcome {
             Outcome::Answered { answer: AskAnswer::Vouched { place, journal, .. }, names } => {
@@ -398,7 +476,7 @@ fn converse<'f>(cx: &Cx, conn: &Conn, asking: &mut Asking, clock: &Clock, born: 
                     let mut told = Vec::new_in(frame);
                     match helper::decode_answer(body, &mut told) {
                         Ok(answer) => {
-                            names = told.leak();
+                            names = told.into_bump_slice();
                             asking.answered(answer)
                         }
                         Err(error) => {
@@ -496,13 +574,16 @@ pub(crate) struct Differ<'a, 'f> {
 /// Names of blaze's own traffic, compared by neither side: the replay's and the helper's cookies
 /// (blaze-core fsevents.rs `COOKIE_AREA`). The helper's socket is under the home since
 /// 2026-11-21 (blaze-watch helper.rs `SOCKET_FOLDER`), no name of the checkout's.
+#[cfg_attr(not(test), allow(dead_code))]
 const OWN_TRAFFIC: [&str; 1] = [".blaze/v2/fsevents"];
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn compared(name: &str) -> bool {
     !name.is_empty() && !OWN_TRAFFIC.iter().any(|own| since::covers(own, name))
 }
 
 /// A bug planted in [`differ`] for its test's control (tests/journal_ask_tests.rs).
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DifferPlant {
     None,
@@ -511,10 +592,12 @@ pub(crate) enum DifferPlant {
 }
 
 /// [`Differ`] of the helper's `helper` and the replay's `replay` (sans-IO).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn differ<'a, 'f>(helper: &[&'a str], replay: impl Iterator<Item = &'a str>, frame: &'f Frame) -> Differ<'a, 'f> {
     differ_planted(helper, replay, frame, DifferPlant::None)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn differ_planted<'a, 'f>(helper: &[&'a str], replay: impl Iterator<Item = &'a str>, frame: &'f Frame, plant: DifferPlant) -> Differ<'a, 'f> {
     let is_covered = |sorted: &[&str], path: &str| match plant {
         DifferPlant::None => covered(sorted, path),
@@ -536,6 +619,7 @@ pub(crate) fn differ_planted<'a, 'f>(helper: &[&'a str], replay: impl Iterator<I
 }
 
 /// Whether `path`, or a folder above it, is in `sorted`.
+#[cfg_attr(not(test), allow(dead_code))]
 fn covered(sorted: &[&str], path: &str) -> bool {
     sorted.binary_search(&path).is_ok() || path.char_indices().filter(|(_, c)| *c == '/').any(|(at, _)| sorted.binary_search(&&path[..at]).is_ok())
 }
@@ -544,13 +628,13 @@ fn covered(sorted: &[&str], path: &str) -> bool {
 const SHOWN: usize = 3;
 
 /// What the line says of one ask.
-fn said_of(asked: &AskedOnce<'_>, start: HelperStart, differs: Option<&Differ<'_, '_>>) -> Said {
+fn said_of(asked: &AskedOnce<'_>, started: &StartedHelper, differs: Option<&Differ<'_, '_>>) -> Said {
     let mut said = Said::of(format_args!(""));
-    let _cut = write_said(&mut said, asked, start, differs);
+    let _cut = write_said(&mut said, asked, started, differs);
     said
 }
 
-fn write_said(out: &mut Said, asked: &AskedOnce<'_>, start: HelperStart, differs: Option<&Differ<'_, '_>>) -> core::fmt::Result {
+fn write_said(out: &mut Said, asked: &AskedOnce<'_>, started: &StartedHelper, differs: Option<&Differ<'_, '_>>) -> core::fmt::Result {
     use core::fmt::Write as _;
     match &asked.outcome {
         Outcome::Answered { answer: AskAnswer::Vouched { since: from, place, journal }, .. } => {
@@ -562,16 +646,19 @@ fn write_said(out: &mut Said, asked: &AskedOnce<'_>, start: HelperStart, differs
                 write!(out, "; saved its new place {place}")?;
             }
         }
-        Outcome::NotAsked { why, start: wanted } => {
+        Outcome::NotAsked { why, .. } => {
             write!(out, "not asked: {why}; replayed")?;
-            if *wanted {
-                match start {
-                    HelperStart::None => out.write_str("; a helper would be started (HelperStart::None: none is; `blaze journal-helper` runs one)")?,
-                }
-            }
         }
         Outcome::NotPrivate(why) => write!(out, "not asked: {why}; replayed")?,
         Outcome::TooLong(fits) => write!(out, "not asked: {fits}; replayed (no helper can listen there)")?,
+    }
+    match started {
+        StartedHelper::NotWanted => {}
+        StartedHelper::None => out.write_str("; a helper would be started (HelperStart::None: none is; `blaze journal-helper` runs one)")?,
+        #[cfg(unix)]
+        StartedHelper::Started(pid) => write!(out, "; started detached journal helper (pid {pid})")?,
+        #[cfg(unix)]
+        StartedHelper::Failed(error) => write!(out, "; starting detached journal helper failed: {error}")?,
     }
     match &asked.detail {
         Detail::None => {}

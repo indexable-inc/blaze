@@ -43,7 +43,6 @@ use blaze_ladder::program_texts::ProgramTexts;
 use blaze_ladder::refusal::SourceFile;
 use blaze_ladder::run::NewFront;
 use blaze_ladder::seam::FrontEnd;
-use blaze_own::Alloc;
 use blaze_scope::graph::Sysroot;
 use blaze_scope::resolve::{CrateInput, SourceTexts, resolve_crates};
 use blaze_scope::task::Serial;
@@ -130,7 +129,7 @@ fn derived(panic: Panic) -> (Vec<String>, Panic) {
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
     let atoms: Vec<String> = crates[0].cfg.iter().filter(|(n, _)| *n == "panic").map(|(n, v)| format!("{n}={v:?}")).collect();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
     let read = of_program(&names).unwrap_or_else(|e| panic!("read back: {e}"));
     (atoms, read)
 }
@@ -214,7 +213,7 @@ fn tabled_runtime(panic: Panic) -> String {
         });
     }
     let sources = Files { user: user.files, libs: &roots };
-    let names = resolve_crates(&crates, Sysroot::default(), &sources, &Serial, Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &sources, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     assert_eq!(of_program(&names), Ok(panic), "front2 reads the program's strategy");
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
     let mut left_out = Vec::new_in(Global);

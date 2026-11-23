@@ -18,7 +18,7 @@ use blaze_mem::tag::Tag;
 use blaze_names_demand::driver::resolve;
 use blaze_names_demand::{Answer, Anchor, Ask, Def, ModRef, Ns, Path, Resolver};
 use blaze_names_source::{CrateFacts, CrateSource, CrateSourceOpts, SourceCounts, Summaries, Texts};
-use blaze_own::{Alloc, Erased};
+use blaze_own::{Alloc, Bump, Erased};
 use blaze_scope::graph::{CrateId, Sysroot as ScopeSysroot};
 use blaze_scope::names::{PathError, Why, Written};
 use blaze_scope::resolve::{CrateInput, Names, SourceTexts, resolve_crates};
@@ -181,10 +181,11 @@ struct Asked {
 }
 
 /// One ask on a fresh resolver and a fresh source (so its counts are its own).
-fn ask_by_demand<'w>(world: &'w World, crates: &'w [CrateFacts<'w>], summaries: Summaries, from: ModRef, name: &'w str, ns: Ns, alloc: Alloc<'w>) -> Asked {
+fn ask_by_demand<'w>(world: &'w World, crates: &'w [CrateFacts<'w>], summaries: Summaries, from: ModRef, name: &'w str, ns: Ns, bump: Bump<'w>) -> Asked {
+    let alloc = bump.alloc();
     let absent = ToolchainUnit(u32::MAX);
     let sysroot = Sysroot { core: ToolchainUnit(0), alloc: absent, std: ToolchainUnit(0), proc_macro: absent, bstd: absent };
-    let mut source = CrateSource::new(CrateSourceOpts { texts: world, crates, sysroot, summaries, alloc });
+    let mut source = CrateSource::new(CrateSourceOpts { texts: world, crates, sysroot, summaries, alloc: bump });
     let mut resolver = Resolver::new(alloc);
     let ask = Ask { from, path: Path { anchor: Anchor::Lexical, segs: &[] }, name, ns };
     let answer = resolve(&mut resolver, &mut source, ask, alloc).unwrap_or_else(|e| panic!("the demand ask for `{name}`: {e}"));
@@ -225,7 +226,7 @@ fn crates() -> [CrateFacts<'static>; 3] {
     [facts(0), facts(1), facts(2)]
 }
 
-fn oracle<'a>(world: &World, alloc: Alloc<'a>) -> Names<'a> {
+fn oracle<'a>(world: &World, alloc: Bump<'a>) -> Names<'a> {
     let input = |index: usize, root: &'static str| CrateInput {
         name: NAMES[index],
         key: key(index),
@@ -254,13 +255,14 @@ fn oracle<'a>(world: &World, alloc: Alloc<'a>) -> Names<'a> {
 fn demand_answers_equal_the_whole_crate_names_at_the_floor() {
     let frame = Frame::new(Tag::Expand).unwrap_or_else(|e| panic!("the test's frame: {e:?}"));
     let erased = Erased::new(&frame);
-    let alloc = erased.handle();
+    let bump = erased.bump();
+    let alloc = bump.alloc();
     let world = World { keys: [key(0), key(1), key(2)] };
     let crates = crates();
-    let names = oracle(&world, alloc);
+    let names = oracle(&world, bump);
     assert_eq!(names.root(2), root_key(key(2)), "the oracle's root key is blaze-scope's `root_key`");
     for (from, name, ns, outline_floor, expansion_floor) in asks() {
-        let asked = ask_by_demand(&world, &crates, Summaries::Read, from, name, ns, alloc);
+        let asked = ask_by_demand(&world, &crates, Summaries::Read, from, name, ns, bump);
         let want = said_by_oracle(&names, from.key, ns, name, alloc);
         let c = asked.source;
         std::println!(
@@ -277,7 +279,7 @@ fn demand_answers_equal_the_whole_crate_names_at_the_floor() {
             std::println!("E0659: app::amb::{name} is ambiguous ({why:?})");
         }
     }
-    let dup = ask_by_demand(&world, &crates, Summaries::Read, asks()[5].0, "dup", Ns::Value, alloc);
+    let dup = ask_by_demand(&world, &crates, Summaries::Read, asks()[5].0, "dup", Ns::Value, bump);
     assert!(matches!(dup.answer, Answer::Ambiguous { .. }), "E0659: `dup` from app::amb is ambiguous, not {:?}", dup.answer);
 }
 
@@ -290,12 +292,13 @@ fn demand_answers_equal_the_whole_crate_names_at_the_floor() {
 fn control_every_summary_any_expands_every_call() {
     let frame = Frame::new(Tag::Expand).unwrap_or_else(|e| panic!("the test's frame: {e:?}"));
     let erased = Erased::new(&frame);
-    let alloc = erased.handle();
+    let bump = erased.bump();
+    let alloc = bump.alloc();
     let world = World { keys: [key(0), key(1), key(2)] };
     let crates = crates();
-    let names = oracle(&world, alloc);
+    let names = oracle(&world, bump);
     for (from, name, ns, _, _) in asks() {
-        let asked = ask_by_demand(&world, &crates, Summaries::AllAny, from, name, ns, alloc);
+        let asked = ask_by_demand(&world, &crates, Summaries::AllAny, from, name, ns, bump);
         let want = said_by_oracle(&names, from.key, ns, name, alloc);
         std::println!("control {name}: expansions {} (every call: {CALLS_IN_MACROS})", asked.source.expansions);
         assert_eq!(asked.said, want, "control: `{name}` from {from:?}: the demand answer {:?}", asked.answer);

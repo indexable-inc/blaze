@@ -93,16 +93,17 @@ impl LoadNames<'static> for Loaded {
 /// The three crates of `texts` solved: the fresh solve's names and the records' reader, and
 /// each crate's root module.
 fn solved(texts: &'static Texts) -> (Names<'static>, RecordNames<'static, Loaded>, [ItemKey; 3]) {
-    let g = blaze_own::testing::heap().alloc();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let inputs = [input("k0", "/k0/lib.rs", &[]), input("k1", "/k1/lib.rs", &[("k0", 0)]), input("k2", "/k2/lib.rs", &[("k1", 1)])];
-    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
     let all: Vec<&'static CrateNames<'static>> = solved.iter().map(|s| s.names).collect();
     for (i, c) in all.iter().enumerate() {
         // The names step resolved `k2`'s root calls through its own `#[macro_use]` layer.
         assert!(c.notes.is_empty(), "crate k{i}: notes {:?}", c.notes);
     }
     let fresh = Names::of_crates(&inputs, Sysroot::default(), &all, g).unwrap_or_else(|e| panic!("names: {e:?}"));
-    let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), g)).collect();
+    let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), bump)).collect();
     let keys: Vec<CrateItemKey> = all.iter().map(|n| n.key).collect();
     let read = RecordNames::new(&keys, Loaded(records), g);
     let roots = [fresh.root(0), fresh.root(1), fresh.root(2)];

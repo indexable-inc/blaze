@@ -148,7 +148,7 @@ fn check_bodies(user: &'static str, dep: Option<&'static str>, bodies: &[&str]) 
     let mut crates: Vec<CrateInput<'_>> = inputs.crates();
     let dep_files = [("/w3dep/src/lib.rs".to_owned(), dep.unwrap_or("").to_owned())];
     let names = match dep {
-        None => inputs.resolve(&crates, alloc).expect("fixture names"),
+        None => inputs.resolve(&crates, blaze_own::testing::bump()).expect("fixture names"),
         Some(_) => {
             let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(i as u32));
             let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
@@ -169,7 +169,7 @@ fn check_bodies(user: &'static str, dep: Option<&'static str>, bodies: &[&str]) 
                 script: None,
             });
             let texts = WithDep { base: &inputs.texts, dep: dep_at, files: &dep_files };
-            resolve_crates(&crates, sysroot, &texts, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"))
+            resolve_crates(&crates, sysroot, &texts, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"))
         }
     };
     let sources = [SourceFile { path: "src/main.rs", text: user }];

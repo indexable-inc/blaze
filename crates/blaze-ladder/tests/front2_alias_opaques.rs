@@ -132,14 +132,14 @@ impl Fixture {
             input("core", FILES[2].0, &[]),
         ];
         let sysroot = Sysroot { core: Some(CrateId(2)), alloc: None, std: None, bstd: None };
-        let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(&crates, sysroot, &Texts { dep }, &Serial, alloc()).expect("fixture names")));
+        let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(&crates, sysroot, &Texts { dep }, &Serial, blaze_own::testing::bump()).expect("fixture names")));
         let frame: &'static Frame = Box::leak(Box::new(Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame")));
         let mut kept = Kept { names: Vec::new(), items: Vec::new(), dep };
         let mut crate_keys = Vec::new();
         for c in names.crates() {
             crate_keys.push(c.key);
-            kept.names.push(aligned(&names_record::encode(c, alloc()).expect("names record"), alloc()));
-            kept.items.push(aligned(&items_record::encode(c, alloc()).expect("items record"), alloc()));
+            kept.names.push(aligned(&names_record::encode(c, alloc()).expect("names record"), blaze_own::testing::bump()));
+            kept.items.push(aligned(&items_record::encode(c, alloc()).expect("items record"), blaze_own::testing::bump()));
         }
         let log = Box::leak(Box::new(Log::new(&["user", "dep", "core"], alloc())));
         let records = Box::leak(Box::new(Records::new(crate_keys.leak(), Box::leak(Box::new(kept)), log, frame, alloc())));

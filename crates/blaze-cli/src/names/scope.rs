@@ -71,6 +71,8 @@ pub(crate) struct ScopeJob<'j> {
     /// compared; the clock the check is timed by.
     pub(crate) oracle: NamesOracle,
     pub(crate) clock: &'j bstd::clock::Clock,
+    /// Status board for reporting live proc-macro expansion activity.
+    pub(crate) board: Option<&'j crate::engine_status::Board<'j>>,
 }
 
 /// How a `CrateScope` job reads each dependency's exports section (rule 78: one seam). The
@@ -235,8 +237,8 @@ impl Par for FilePar<'_> {
         }
         let joined = scope.join(self.cx);
         if let Some((path, why)) = failed.or_else(|| joined.err().map(|why| (krate, why))) {
-            let words = blaze_own::format_in!(alloc, "{why}");
-            return Err(blaze_scope::resolve::NamesError::OutlineWorker { krate, path, why: blaze_own::Box::leak(words.into_boxed_str()) });
+            let words = blaze_own::format_in!(self.heap, "{why}");
+            return Err(blaze_scope::resolve::NamesError::OutlineWorker { krate, path, why: blaze_own::Box::leak_static(words.into_boxed_str()) });
         }
         Ok(())
     }
@@ -302,7 +304,7 @@ fn blocks_differential(
         Err(error) => return (BlocksTally::failed(), Some(blaze_own::format_in!(job.kept, "block scopes differential: crate `{crate_name}`: DID NOT RUN: the `Modules` side's frame ({SIDE_FRAME} bytes) could not be reserved: {error:?}"))),
     };
     let side_erased = Erased::new(&side_frame);
-    let out = side_erased.handle();
+    let out = side_erased.bump();
 
     // The `Modules` solve, in its own frame, dropped at the end of this block.
     let modules = {
@@ -313,7 +315,8 @@ fn blocks_differential(
         };
         let ran = crate::work::unwinding(|| {
             let erased = Erased::new(&own);
-            let alloc = erased.handle();
+            let bump = erased.bump();
+            let alloc = bump.alloc();
             let texts = JobTexts {
                 cx: &span,
                 root,
@@ -331,12 +334,13 @@ fn blocks_differential(
                 callers,
                 by_need: None,
                 run_stopped: core::cell::Cell::new(None),
+                activity: job.board.map(|board| (board, job.clock)),
             };
             let par = FilePar { cx: &span, meter: metered, heap: job.kept, workers: job.workers, oracle: NamesOracle::Off, now, seen: RefCell::new(None) };
             // The differential's two solves take bytes and check them again: an oracle's path,
             // off the command's (`--block-scopes=bodies` only).
             let deps = blaze_own::AVec::from_iter_in(job.deps.iter().map(|proof| proof.bytes()), alloc);
-            blaze_scope::crate_scope::block_scopes_modules_side(&job.input, &deps, job.sysroot, &texts, job.at, &par, Prepares::new_in(alloc), alloc, out)
+            blaze_scope::crate_scope::block_scopes_modules_side(&job.input, &deps, job.sysroot, &texts, job.at, &par, Prepares::new_in(bump), bump, out)
                 .map_err(|error| blaze_own::format_in!(job.kept, "block scopes differential: crate `{crate_name}`: DID NOT RUN: {error}"))
         });
         match ran {
@@ -359,7 +363,8 @@ fn blocks_differential(
     };
     let ran = crate::work::unwinding(|| {
         let erased = Erased::new(&own);
-        let alloc = erased.handle();
+        let bump = erased.bump();
+        let alloc = bump.alloc();
         let texts = JobTexts {
             cx: &span,
             root,
@@ -377,10 +382,11 @@ fn blocks_differential(
             callers,
             by_need: None,
             run_stopped: core::cell::Cell::new(None),
+            activity: job.board.map(|board| (board, job.clock)),
         };
         let par = FilePar { cx: &span, meter: metered, heap: job.kept, workers: job.workers, oracle: NamesOracle::Off, now, seen: RefCell::new(None) };
         let deps = blaze_own::AVec::from_iter_in(job.deps.iter().map(|proof| proof.bytes()), alloc);
-        match blaze_scope::crate_scope::block_scopes_bodies_side(&modules, &job.input, &deps, job.sysroot, &texts, job.at, &par, Prepares::new_in(alloc), alloc) {
+        match blaze_scope::crate_scope::block_scopes_bodies_side(&modules, &job.input, &deps, job.sysroot, &texts, job.at, &par, Prepares::new_in(bump), bump) {
             Ok(verdict) if verdict.agrees() => (BlocksTally::of(&verdict), None),
             Ok(verdict) => (BlocksTally::of(&verdict), Some(blaze_own::format_in!(job.kept, "{verdict}"))),
             Err(error) => (BlocksTally::failed(), Some(blaze_own::format_in!(job.kept, "block scopes differential: crate `{crate_name}`: DID NOT RUN: {error}"))),
@@ -399,16 +405,17 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
     let failed_with = |words| failed_scope(words, job.kept);
     let cx = cx.span("crate scope: resolve one crate's names");
     let erased = Erased::new(frame);
-    let alloc = erased.handle();
+    let bump = erased.bump();
+    let alloc = bump.alloc();
     let crate_name = job.input.name;
     let env = match job.env {
         None => None,
-        Some(lent) => match lent.copy_in(alloc) {
-            Ok(env) => Some(&*blaze_own::Box::leak(blaze_own::Box::new_in(env, alloc))),
+        Some(lent) => match lent.copy_in(bump) {
+            Ok(env) => Some(&*blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(env, frame))),
             Err(error) => return failed_with(std::format!("crate `{crate_name}`: its environment's build-script record did not open again: {error:?}")),
         },
     };
-    let callers: &[(usize, usize, blaze_expand::Edition)] = blaze_own::Box::leak(blaze_own::Box::new_in([(job.at, job.at, job.input.edition)], frame));
+    let callers: &[(usize, usize, blaze_expand::Edition)] = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in([(job.at, job.at, job.input.edition)], frame));
     let texts = JobTexts {
         cx: &cx,
         root,
@@ -426,13 +433,14 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         callers,
         by_need: None,
         run_stopped: core::cell::Cell::new(None),
+        activity: job.board.map(|board| (board, job.clock)),
     };
-    let prepares = Prepares::new_in(alloc);
+    let prepares = Prepares::new_in(bump);
     let now = || crate::engine_times::ns(job.clock.now().since_start());
     let (done, seen) = {
         let solve = cx.span("crate scope: resolve_crate");
         let par = FilePar { cx: &solve, meter: metered, heap: job.kept, workers: job.workers, oracle: job.oracle, now: &now, seen: RefCell::new(None) };
-        let done = resolve_crate_verified(&job.input, job.deps, job.sysroot, &texts, job.at, &par, prepares, alloc);
+        let done = resolve_crate_verified(&job.input, job.deps, job.sysroot, &texts, job.at, &par, prepares, bump);
         (done, par.seen.into_inner())
     };
     // The crate's comparison, its items named by path while its names are at hand.
@@ -467,7 +475,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
     // Each failed or refused macro call of the crate's own code (a `main` the implicit
     // `::std::main` did not write among them): an error finding at the call with its reason.
     let failed_calls = match &done {
-        Ok(done) => crate::names::failed_call::findings(done.names, alloc),
+        Ok(done) => crate::names::failed_call::findings(done.names, bump),
         Err(_) => blaze_own::Vec::new_in(Global),
     };
     // Each `mod` of the crate's own code whose file is at neither place (or whose `#[path]`
@@ -486,7 +494,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         Some(blaze_scope::waits_on::FailedDep { called: Some(*called), name, key })
     }));
     let (out, payload, findings, failed, ok, unresolved, test_marks, expansions) = match done {
-        Ok(done) => match scope_record(&done, crate_name, &blaze_scope::waits_on::WaitsOn::of(done.names, &failed_deps, alloc), alloc, job.kept) {
+        Ok(done) => match scope_record(&done, crate_name, &blaze_scope::waits_on::WaitsOn::of(done.names, &failed_deps, alloc), bump, job.kept) {
             Ok(record) => {
                 // Both records (rule 21): a dependent reads the exports, but the crate's own
                 // bodies read its inner names (front_load.rs), so an out over the exports alone

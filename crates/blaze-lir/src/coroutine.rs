@@ -70,12 +70,12 @@
 
 use alloc::vec::Vec;
 use alloc::alloc::Allocator;
-use core::fmt;
+use core::{convert::Infallible, fmt};
 
 use crate::{
     Block, Func, Op, Ty, Value, View,
     func::{BlockKind, Ext, NONE, ParamKind, ParamRec, SigRec, SlotId},
-    op::{Field, Layout, Word, walk},
+    op::{Field, Layout, RewriteSink, Word, rewrite_fields, walk},
     ty::Form,
     verify::{VerifyError, verify},
 };
@@ -976,110 +976,11 @@ impl<S: Allocator + Copy, A: Allocator> Emit<'_, '_, S, A> {
         self.push(Op::Store, Ty::NONE, &[stored, state, home], loc);
     }
 
-    /// Appends, to `extra`, the word that stands for the body's `value` in the current block.
-    fn put_value(&mut self, value: u32) {
-        if self.fetched_in[value as usize] == self.current {
-            self.func.extra.push(self.fetched[value as usize]);
-        } else {
-            self.fixups.push((self.func.extra.len() as u32, false));
-            self.func.extra.push(value);
-        }
-    }
-
-    fn put_block(&mut self, block: u32) {
-        let to = self.block_map[block as usize];
-        debug_assert!(to != NONE, "an edge of a held block leads to a held block");
-        self.func.extra.push(to);
-    }
-
-    /// Appends the target at `words[at..]`; where its words end.
-    fn put_target(&mut self, words: &[u32], mut at: usize) -> usize {
-        self.put_block(words[at]);
-        let n = words[at + 1] as usize;
-        self.func.extra.push(n as u32);
-        at += 2;
-        for _ in 0..n {
-            self.put_value(words[at]);
-            at += 1;
-        }
-        at
-    }
-
     /// Appends the operands `fields` at `words` to `extra`, each value, block and slot as
     /// this output names it. The mirror of [`walk`], on a verified function.
     fn rewrite(&mut self, words: &[u32], fields: &[Field], ty: Ty) {
         let tys = self.body.view.tys;
-        let mut at = 0;
-        let mut scrutinee = None;
-        for &field in fields {
-            match field {
-                Field::Value => {
-                    scrutinee = Some(words[at]);
-                    self.put_value(words[at]);
-                    at += 1;
-                }
-                Field::Block => {
-                    self.put_block(words[at]);
-                    at += 1;
-                }
-                Field::Slot => {
-                    self.func.extra.push(self.plan.slot_row[words[at] as usize]);
-                    at += 1;
-                }
-                Field::Imm
-                | Field::Offset
-                | Field::IntCond
-                | Field::FloatCond
-                | Field::Rmw
-                | Field::Ref
-                | Field::Sig
-                | Field::Intrinsic
-                | Field::Asm => {
-                    self.func.extra.push(words[at]);
-                    at += 1;
-                }
-                Field::Target => at = self.put_target(words, at),
-                Field::Values => {
-                    let n = words[at] as usize;
-                    self.func.extra.push(n as u32);
-                    at += 1;
-                    for _ in 0..n {
-                        self.put_value(words[at]);
-                        at += 1;
-                    }
-                }
-                Field::Blocks => {
-                    let n = words[at] as usize;
-                    self.func.extra.push(n as u32);
-                    at += 1;
-                    for _ in 0..n {
-                        self.put_block(words[at]);
-                        at += 1;
-                    }
-                }
-                Field::Mask => {
-                    let n = words[at] as usize;
-                    self.func.extra.extend_from_slice(&words[at..at + 1 + n]);
-                    at += 1 + n;
-                }
-                Field::Const => {
-                    let n = ty.const_words() as usize;
-                    self.func.extra.extend_from_slice(&words[at..at + n]);
-                    at += n;
-                }
-                Field::Cases => {
-                    let width = scrutinee.map_or(0, |it: u32| Ty(tys[it as usize]).const_words()) as usize;
-                    let n = words[at] as usize;
-                    self.func.extra.push(n as u32);
-                    at += 1;
-                    for _ in 0..n {
-                        self.func.extra.extend_from_slice(&words[at..at + width]);
-                        at += width;
-                        at = self.put_target(words, at);
-                    }
-                }
-            }
-        }
+        let Ok(()) = rewrite_fields(words, fields, ty, tys, self);
     }
 
     /// Copies the body's instruction `at`, its operands as this output names them.
@@ -1171,6 +1072,39 @@ impl<S: Allocator + Copy, A: Allocator> Emit<'_, '_, S, A> {
         if !matches!(op, Op::Invoke | Op::InvokeIndirect) {
             self.spill(at);
         }
+    }
+}
+
+impl<S: Allocator + Copy, A: Allocator> RewriteSink for Emit<'_, '_, S, A> {
+    type Error = Infallible;
+
+    /// Appends, to `extra`, the word that stands for the body's `value` in the current block.
+    fn put_value(&mut self, value: u32) {
+        if self.fetched_in[value as usize] == self.current {
+            self.func.extra.push(self.fetched[value as usize]);
+        } else {
+            self.fixups.push((self.func.extra.len() as u32, false));
+            self.func.extra.push(value);
+        }
+    }
+
+    fn put_block(&mut self, block: u32) {
+        let to = self.block_map[block as usize];
+        debug_assert!(to != NONE, "an edge of a held block leads to a held block");
+        self.func.extra.push(to);
+    }
+
+    fn put_slot(&mut self, slot: u32) -> Result<(), Infallible> {
+        self.func.extra.push(self.plan.slot_row[slot as usize]);
+        Ok(())
+    }
+
+    fn push_word(&mut self, word: u32) {
+        self.func.extra.push(word);
+    }
+
+    fn push_words(&mut self, words: &[u32]) {
+        self.func.extra.extend_from_slice(words);
     }
 }
 

@@ -226,7 +226,7 @@ fn a_member_proc_macro_names_its_dependency_on_the_macro_side() {
     {
         let texts = Texts::of(&crates);
         let inputs = crates.inputs();
-        let names = resolve_crates(&inputs, crates.sysroot, &texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = resolve_crates(&inputs, crates.sysroot, &texts, &Serial, crate::tests::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         assert_eq!(seen(&names, pm, "Expr"), Ok(side_dep), "`dep::Expr` in the proc macro: the macro side's dep");
         assert_eq!(seen(&names, pm, "OnWasm"), Ok(side_dep), "the macro side's cfg is wasm32-wasip1's");
         assert_eq!(seen(&names, pm, "OnHost"), Err(Why::NotFound), "`not(target_arch = \"wasm32\")` is false on the macro side");
@@ -241,7 +241,7 @@ fn a_member_proc_macro_names_its_dependency_on_the_macro_side() {
     {
         let texts = Texts::of(&control);
         let inputs = control.inputs();
-        let names = resolve_crates(&inputs, control.sysroot, &texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = resolve_crates(&inputs, control.sysroot, &texts, &Serial, crate::tests::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         assert_eq!(seen(&names, pm, "Expr"), Err(Why::NotFound), "with no deps, `dep` names nothing: tempo's NotFound at segment 0");
     }
 
