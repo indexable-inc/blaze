@@ -572,6 +572,7 @@ fn serve_loop(
         let post = conns.scope(|frame| {
             handle_connection(cx, listener, conn, checkout_root, fs, net, host, clock, rng, born, core, state, phases, frame)
         })?;
+        conns.trim(2 << 20);
 
         // POST-DONE work: client has ALREADY received `ServerFrame::Done` and closed!
         // Note: any required watcher re-arm ALREADY ran BEFORE `ServerFrame::Done` so the client

@@ -11,7 +11,11 @@ use bstd::mem::TASK_FRAME;
 use bstd::path::Path;
 use bstd::test::BUDGET;
 
-use super::{DEFAULT_BUDGET, GcError, GcOpts, parse_args, parse_budget_values, run_with, try_acquire_gc_lock};
+use super::{
+    AUX_EXPIRY_NS, AuxSweepPlant, DEFAULT_BUDGET, GcError, GcOpts, ORPHAN_GRACE_NS, PidProbe, PidState,
+    VIEWER_DEAD_GRACE_NS, parse_args, parse_budget_values, parse_meta_pid, parse_pid_prefix, run_with,
+    should_sweep_run, sweep_aux_with, try_acquire_gc_lock,
+};
 use crate::CliError;
 use crate::store::plain_place::{Facts, STORE_DIR, STORE_ROOT};
 use crate::store::Home;
@@ -266,4 +270,77 @@ fn background_gc_preserves_background_qos_and_restores_caller_class() {
     let _ = qos::set_this_thread(before_class.settable(), before_rel);
     assert!(!summary.skipped_locked);
     assert_eq!(restored, Qos::UserInitiated, "caller thread QoS must be restored after background gc");
+}
+
+struct FixedPids<'a>(&'a [u32]);
+
+impl PidProbe for FixedPids<'_> {
+    fn probe(&self, pid: u32) -> PidState {
+        if self.0.contains(&pid) { PidState::Alive } else { PidState::Dead }
+    }
+}
+
+#[test]
+fn gc_sweeps_dead_runs_keeps_live_and_viewer_protected_with_planted_control() {
+    use bstd::fs::{Content, Durable};
+
+    assert_eq!(parse_meta_pid(b"pid=4242\npackage=foo\n"), Some(4242));
+    assert_eq!(parse_meta_pid(b"pid=0\n"), None);
+    assert_eq!(parse_pid_prefix("999-123456789"), Some(999));
+    assert_eq!(parse_pid_prefix("notapid-1"), None);
+
+    let io = Io::simulated(SimWorld::new(74, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+    let fs = io.need_fs().expect("fs");
+    let clock = io.need_clock().expect("clock");
+    let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+    let now_ns = clock.wall().as_ns();
+
+    let put = |rel: &str, bytes: &[u8]| {
+        home.dir().publish(&cx, &Path::new(rel).expect("path"), Content::bytes(bytes), Durable::No).expect("publish");
+    };
+    put("v2/runs/live-1111.telem", &[1u8; 64]);
+    put("v2/runs/live-1111.meta", b"pid=1001\npackage=live\n");
+    put("v2/runs/dead-2222.telem", &[2u8; 128]);
+    put("v2/runs/dead-2222.meta", b"pid=2002\npackage=dead\n");
+    put("v2/runs/orphan-3333.telem", &[3u8; 32]);
+    put("v2/test/tmp/1001-100/0/a.txt", b"live");
+    put("v2/test/tmp/2002-100/0/b.txt", b"dead-test");
+    put("v2/run/records/oldrecord", &[9u8; 40]);
+
+    let probe = FixedPids(&[1001]);
+
+    // 1. Dry-run reports dead run + dead test tmp without deleting anything.
+    let dry = sweep_aux_with(&cx, home.dir(), now_ns, &probe, true, AuxSweepPlant::None);
+    assert_eq!(dry.files, 3, "dead .telem + dead .meta + dead test tmp file");
+    assert!(home.dir().stat(&cx, &Path::new("v2/runs/dead-2222.telem").expect("p")).expect("s").is_some());
+
+    // 2. Real sweep removes dead run + dead test tmp, keeps live run, live test tmp, fresh orphan, fresh record.
+    let gone = sweep_aux_with(&cx, home.dir(), now_ns, &probe, false, AuxSweepPlant::None);
+    assert_eq!(gone.files, 3);
+    assert!(home.dir().stat(&cx, &Path::new("v2/runs/live-1111.telem").expect("p")).expect("s").is_some(), "live telem kept");
+    assert!(home.dir().stat(&cx, &Path::new("v2/runs/live-1111.meta").expect("p")).expect("s").is_some(), "live meta kept");
+    assert!(home.dir().stat(&cx, &Path::new("v2/runs/dead-2222.telem").expect("p")).expect("s").is_none(), "dead telem swept");
+    assert!(home.dir().stat(&cx, &Path::new("v2/runs/dead-2222.meta").expect("p")).expect("s").is_none(), "dead meta swept");
+    assert!(home.dir().stat(&cx, &Path::new("v2/runs/orphan-3333.telem").expect("p")).expect("s").is_some(), "fresh orphan kept within grace");
+    assert!(home.dir().stat(&cx, &Path::new("v2/test/tmp/1001-100/0/a.txt").expect("p")).expect("s").is_some(), "live test tmp kept");
+    assert!(home.dir().stat(&cx, &Path::new("v2/test/tmp/2002-100").expect("p")).expect("s").is_none(), "dead test tmp dir swept");
+    assert!(home.dir().stat(&cx, &Path::new("v2/run/records/oldrecord").expect("p")).expect("s").is_some(), "fresh record kept");
+
+    // 3. Past orphan + expiry grace, orphan .telem and expired record are swept while live PID stays.
+    let later = now_ns.saturating_add(AUX_EXPIRY_NS).saturating_add(ORPHAN_GRACE_NS);
+    let gone_later = sweep_aux_with(&cx, home.dir(), later, &probe, false, AuxSweepPlant::None);
+    assert_eq!(gone_later.files, 2, "expired orphan .telem + expired run record");
+    assert!(home.dir().stat(&cx, &Path::new("v2/runs/orphan-3333.telem").expect("p")).expect("s").is_none());
+    assert!(home.dir().stat(&cx, &Path::new("v2/run/records/oldrecord").expect("p")).expect("s").is_none());
+    assert!(home.dir().stat(&cx, &Path::new("v2/runs/live-1111.telem").expect("p")).expect("s").is_some(), "live telem still kept");
+
+    // 4. Viewer-active grace check (pure decision): dead PID kept within VIEWER_DEAD_GRACE_NS when viewer holds lock, swept after.
+    assert!(!should_sweep_run(Some(PidState::Dead), true, now_ns, now_ns + VIEWER_DEAD_GRACE_NS - 1, AuxSweepPlant::None));
+    assert!(should_sweep_run(Some(PidState::Dead), true, now_ns, now_ns + VIEWER_DEAD_GRACE_NS, AuxSweepPlant::None));
+
+    // 5. Planted bug control (rule 43): ignoring PidState::Alive deletes the live run.
+    let planted = sweep_aux_with(&cx, home.dir(), later, &probe, false, AuxSweepPlant::IgnorePidAlive);
+    assert!(planted.files >= 2, "planted bug must delete live run to prove oracle");
+    assert!(home.dir().stat(&cx, &Path::new("v2/runs/live-1111.telem").expect("p")).expect("s").is_none());
 }

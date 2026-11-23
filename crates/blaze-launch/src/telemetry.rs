@@ -36,6 +36,11 @@ use crate::Slot;
 /// to `blaze-launcher`; stripped before the program's first instruction.
 pub const VAR: &str = "BLAZE_LAUNCH_TELEMETRY";
 
+/// Advisory lock file held shared (`LOCK_SH`) by any live telemetry viewer under `<runs_dir>`,
+/// probed non-blocking (`LOCK_EX | LOCK_NB`) by `blaze run` / `blaze gc` to decide whether a dead
+/// run's `.telem` and `.meta` files can be unlinked immediately without racing a live viewer.
+pub const VIEWER_LOCK_LEAF: &str = "viewer.lock";
+
 /// Header magic for a live run's shared-memory telemetry ring (not persisted across runs).
 pub const MAGIC: [u8; 8] = *b"bztelem1";
 

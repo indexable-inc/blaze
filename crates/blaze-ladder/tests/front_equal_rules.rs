@@ -434,7 +434,7 @@ fn compare_binding(provider: &'static str, plant: bool) {
         };
         let body = BodyFrame {
             frame, alloc: a, plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All,
-            heads: None, sources: None, goals: None, census: None,
+            heads: None, sources: None, goals: None, census: None, prepared: None,
         };
         let filed = check_body(view, &Task { planned, key: Key(ABSENT) }, &body, kept, blaze_own::testing::heap().shared())
             .expect("the caller's BodyCheck read list");
