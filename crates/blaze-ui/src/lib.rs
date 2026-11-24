@@ -36,6 +36,7 @@ pub mod shaders;
 pub mod style;
 pub mod types;
 pub mod ui;
+pub mod virtual_list;
 pub mod workbench;
 
 #[cfg(test)]
@@ -43,18 +44,21 @@ mod tests;
 
 pub use components::{
     ActionTag, Active, BadgeTone, CanvasBatch, ChildOrder, ComputedRect, Disabled, DockedIn,
-    Focusable, Focused, Hidden, Hovered, Inspects, Interactive, LabelText, ScrollOffset, Selected,
-    SliderState, SubText, TextInputState, ToggleState, TooltipFor, TreeRowState, WidgetKind,
-    register_ui_schema,
+    Focusable, Focused, FrameStats, GpuSlot, Hidden, Hovered, Inspects, Interactive, LabelText,
+    ScrollOffset, Selected, SliderState, SubText, TextInputState, ToggleState, TooltipFor,
+    TreeRowState, WidgetKind, register_ui_schema,
 };
 pub use dock::{
     DOCK_HEADER_H, DOCK_SPLIT_GAP, DockDrag, DockLeaf, DockLeafRect, DockSplit, DockSplitterRect,
     DockTab, DockWorkspace, DropZone, SplitDir,
 };
-pub use draw::{ATLAS_COLS, ATLAS_FIRST_CHAR, ATLAS_LAST_CHAR, ATLAS_ROWS, DrawList};
+pub use draw::{
+    ATLAS_COLS, ATLAS_FIRST_CHAR, ATLAS_LAST_CHAR, ATLAS_ROWS, DrawList, GpuPatch,
+    culled_glyph_inst, culled_rect_inst,
+};
 pub use error::UiError;
 pub use input::{CursorHint, InputEvent, InputState, Key, UiEvent};
-pub use layout::{LayoutEngine, LayoutNode};
+pub use layout::{LayoutEngine, LayoutNode, is_layout_boundary};
 pub use shaders::{
     ClipRectGpu, GlyphInst, GlyphVaryings, RectInst, SdfVaryings, ViewportUniform,
     emit_ui_glyph_msl, emit_ui_glyph_wgsl, emit_ui_sdf_msl, emit_ui_sdf_wgsl, prim_kind,
@@ -62,4 +66,5 @@ pub use shaders::{
 pub use style::{Align, Direction, Justify, LayoutStyle, PaintStyle, Sizing, StylePrefabs};
 pub use types::{Edges, Rect, Rgba, Theme, ThemeKind, Vec2};
 pub use ui::UiContext;
+pub use virtual_list::{VirtualList, VisibleRange};
 pub use workbench::WorkbenchApp;

@@ -42,6 +42,7 @@ pub(crate) mod map;
 pub mod observer;
 pub mod pipeline;
 pub mod query;
+pub mod reactive;
 pub mod reflect;
 pub mod table;
 pub mod typed;
@@ -61,6 +62,9 @@ pub use id::{Builtins, ComponentId, Entity, Id, TableId};
 pub use observer::{DEFAULT_OBSERVER_CAP, Event, EventKind, ObserverCallback, ObserverId};
 pub use pipeline::{Batch, Batches, Phase, PhaseSchedule, Pipeline, SystemDesc, SystemFn};
 pub use query::{CachedQuery, QuerySpec, QueryTerm};
+pub use reactive::{
+    EffectId, IncrementalCount, IncrementalFilter, Memo, NodeId, ReactiveGraph, ReadCx, Signal,
+};
 pub use reflect::{ReflectComponent, ReflectError};
 pub use table::Table;
 pub use typed::{

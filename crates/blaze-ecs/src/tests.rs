@@ -604,11 +604,11 @@ fn snapshot_tab_is_deterministic_and_complete() {
     assert_eq!(snap1.as_str(), snap2.as_str());
     let expected = "\
 # blaze-ecs snapshot
-entities_live\t10
-tables\t7
+entities_live\t14
+tables\t11
 components\t2
 observers\t0
-tags_attached\t3
+tags_attached\t7
 pairs_attached\t1
 
 ## components
@@ -618,13 +618,17 @@ id\tname\tschema_id\tcopyable
 
 ## archetypes
 table\tentities\tcolumns\tadd_edges\tremove_edges\tarchetype
-0\t7\t0\t2\t0\t[]
+0\t10\t0\t3\t0\t[]
 1\t0\t0\t1\t1\t[#Exclusive]
-2\t1\t0\t0\t1\t[#Exclusive, #OnDeleteCascade]
-3\t0\t0\t1\t1\t[#Prefab]
-4\t1\t1\t0\t1\t[Pos, #Prefab]
-5\t0\t1\t1\t0\t[Pos, (IsA, Ship)]
-6\t1\t2\t0\t1\t[Pos, Vel, (IsA, Ship)]
+2\t0\t0\t1\t1\t[#Exclusive, #OnDeleteCascade]
+3\t0\t0\t1\t1\t[#Exclusive, #OnDeleteCascade, #Traversable]
+4\t1\t0\t0\t1\t[#Exclusive, #OnDeleteCascade, #Traversable, #Acyclic]
+5\t0\t0\t1\t1\t[#Traversable]
+6\t1\t0\t0\t1\t[#Traversable, #Acyclic]
+7\t0\t0\t1\t1\t[#Prefab]
+8\t1\t1\t0\t1\t[Pos, #Prefab]
+9\t0\t1\t1\t0\t[Pos, (IsA, Ship)]
+10\t1\t2\t0\t1\t[Pos, Vel, (IsA, Ship)]
 ";
     assert_eq!(snap1.as_str(), expected);
 }
@@ -2050,4 +2054,175 @@ fn ui_relational_ecs_app_renders_compact_icons_and_packs_webgpu_buffers() {
     assert_eq!(app.gpu.edges.len() % 8, 0);
     assert!(app.gpu.edges.len() >= 16, "expected ChildOf and IsA edges packed for WebGPU");
     assert!(app.gpu.labels.as_str().contains("Flagship_Apollo"));
+}
+
+#[test]
+fn change_ticks_set_if_changed_and_reverse_relation_indices() {
+    let mut w = World::new_in(alloc()).expect("world");
+    let e1 = w.spawn_named("e1").expect("e1");
+    let e2 = w.spawn_named("e2").expect("e2");
+    let parent = w.spawn_named("parent").expect("parent");
+    let prefab = w.spawn_prefab("BtnStyle").expect("prefab");
+
+    w.set_copy(prefab, Health(100)).expect("pf");
+    w.add_pair(e1, w.child_of(), parent).expect("c1");
+    w.add_pair(e2, w.child_of(), parent).expect("c2");
+    w.add_pair(e1, w.is_a(), prefab).expect("isa1");
+    let e3 = w.instantiate(prefab).expect("inst");
+
+    assert_eq!(w.children_slice(parent), &[e1, e2]);
+    assert_eq!(w.isa_dependents_slice(prefab), &[e1, e3]);
+
+    let t0 = w.tick();
+    assert!(w.set_copy_if_changed(e1, Pos { x: 1, y: 2 }).expect("set1"));
+    assert!(w.set_copy_if_changed(e2, Pos { x: 3, y: 4 }).expect("set2"));
+    assert!(w.changed_since::<Pos>(e1, 0).expect("ch"));
+
+    // Advance tick: writing equal value returns false and does NOT bump row tick!
+    let t1 = w.advance_tick();
+    assert!(!w.set_copy_if_changed(e1, Pos { x: 1, y: 2 }).expect("noop"));
+    assert!(w.set_copy_if_changed(e2, Pos { x: 9, y: 4 }).expect("changed"));
+
+    let mut changed = OwnVec::new_in(alloc());
+    w.each_changed::<Pos>(t0, |e, _| {
+        let _ = changed.try_push(e);
+    })
+    .expect("each_changed");
+    assert_eq!(changed.as_slice(), &[e2], "only e2 changed after t0 (t1={t1})");
+
+    // Despawning e1 cleans both reverse indices automatically.
+    w.despawn(e1).expect("despawn");
+    assert_eq!(w.children_slice(parent), &[e2]);
+    assert_eq!(w.isa_dependents_slice(prefab), &[e3]);
+}
+
+#[test]
+fn glitch_free_push_pull_signals_memos_diamonds_and_incremental_aggregates() {
+    use crate::reactive::{IncrementalCount, IncrementalFilter, ReactiveGraph};
+
+    let mut g = ReactiveGraph::new_in(alloc());
+    let a = g.signal(2i32).expect("a");
+    let flag = g.signal(true).expect("flag");
+    let other = g.signal(100i32).expect("other");
+
+    // Diamond: a -> b (parity), a -> c (double), (b, c) -> d
+    let b = g.memo(move |cx| cx.val(a) % 2).expect("b");
+    let c = g.memo(move |cx| cx.val(a) * 2).expect("c");
+    let d = g
+        .memo(move |cx| {
+            if cx.val(flag) {
+                cx.memo_val(b) + cx.memo_val(c)
+            } else {
+                cx.val(other)
+            }
+        })
+        .expect("d");
+
+    // Parity-only downstream memo: checks Check->Clean short-circuit when `b` stays equal!
+    let parity_label_runs = Cell::new(0u32);
+    let parity_memo = g.memo(move |cx| cx.memo_val(b) == 0).expect("pm");
+    let _ = parity_label_runs.get();
+
+    assert_eq!(g.get_memo(d).expect("d").copied(), Some(4));
+    assert_eq!(g.get_memo(parity_memo).expect("pm").copied(), Some(true));
+
+    // Equal write: 0 propagation, 0 memo evals!
+    let evals_before = g.memo_evals;
+    assert!(!g.set(a, 2).expect("noop"));
+    assert_eq!(g.memo_evals, evals_before);
+
+    // Change a: 2 -> 4 (same parity! `b` stays 0 so `parity_memo` MUST short-circuit Clean!)
+    let evals_before_even = g.memo_evals;
+    assert!(g.set(a, 4).expect("set 4"));
+    assert_eq!(g.get_memo(parity_memo).expect("pm2").copied(), Some(true));
+    // Only `b` re-evaluated (1 eval), `parity_memo` short-circuited without recomputing!
+    assert_eq!(g.memo_evals - evals_before_even, 1);
+
+    // Diamond pull on `d`: `b` already clean, `c` and `d` evaluate once each with no glitch.
+    assert_eq!(g.get_memo(d).expect("d2").copied(), Some(8));
+
+    // Dynamic conditional branch switch: flip `flag` -> false; `d` now tracks `other` instead of `a`!
+    assert!(g.set(flag, false).expect("flag false"));
+    assert_eq!(g.get_memo(d).expect("d3").copied(), Some(100));
+    let evals_before_a = g.memo_evals;
+    assert!(g.set(a, 99).expect("a ignored"));
+    assert_eq!(g.get_memo(d).expect("d4").copied(), Some(100));
+    assert_eq!(g.memo_evals, evals_before_a, "unsubscribed branch must not recompute d");
+
+    // DBSP-style O(1) IncrementalCount + IncrementalFilter
+    let mut unread = IncrementalCount::<u32, _>::new_in(&mut g, alloc()).expect("cnt");
+    let mut filt = IncrementalFilter::<u32, _>::new_in(&mut g, alloc()).expect("filt");
+    let unread_sig = unread.signal();
+    let double_unread = g.memo(move |cx| cx.val(unread_sig) * 2).expect("du");
+
+    assert!(unread.upsert(&mut g, 1, true).expect("u1"));
+    assert!(unread.upsert(&mut g, 2, true).expect("u2"));
+    assert!(!unread.upsert(&mut g, 2, true).expect("u2 noop"));
+    assert_eq!(g.get_memo(double_unread).expect("du").copied(), Some(4));
+    assert!(unread.upsert(&mut g, 1, false).expect("u1 off"));
+    assert_eq!(unread.count(), 1);
+    assert_eq!(g.get_memo(double_unread).expect("du2").copied(), Some(2));
+
+    assert!(filt.set_match(&mut g, 10, true).expect("f10"));
+    assert!(filt.set_match(&mut g, 20, true).expect("f20"));
+    assert_eq!(filt.len(), 2);
+    assert!(filt.set_match(&mut g, 10, false).expect("f10 off"));
+    assert_eq!(filt.matched(), &[20]);
+}
+
+#[test]
+fn flecs_4_2_dont_fragment_ordered_children_and_traversable_traits() {
+    struct HoverTag;
+    struct InspectsRel;
+    impl crate::Relation for InspectsRel {
+        const EXCLUSIVE: bool = true;
+        const DONT_FRAGMENT: bool = true;
+    }
+    struct DependsRel;
+    impl crate::Relation for DependsRel {
+        const TRAVERSABLE: bool = true;
+        const DONT_FRAGMENT: bool = true;
+    }
+
+    let mut w = World::new_in(alloc()).expect("world");
+    let _ = w.mark_tag_dont_fragment::<HoverTag>().expect("df tag");
+
+    let e1 = w.spawn_named("row1").expect("e1");
+    let e2 = w.spawn_named("row2").expect("e2");
+    let e3 = w.spawn_named("row3").expect("e3");
+    let parent = w.spawn_named("list").expect("list");
+    w.set_copy(e1, Pos { x: 1, y: 1 }).expect("p1");
+    w.set_copy(e2, Pos { x: 2, y: 2 }).expect("p2");
+
+    let (t_before, row_before) = w.entity_table(e1).expect("tbl");
+    let tables_before = w.table_count();
+
+    // Attaching & removing a `DontFragment` tag MUST NOT change entity's archetype table!
+    w.add_tag_typed::<HoverTag>(e1).expect("hover on");
+    assert!(w.has_tag_typed::<HoverTag>(e1).expect("has hover"));
+    assert_eq!(w.entity_table(e1).expect("tbl2"), (t_before, row_before));
+    assert_eq!(w.table_count(), tables_before, "DontFragment tag creates 0 new tables");
+
+    // Attaching & replacing a `DontFragment` Exclusive relation MUST NOT move tables either!
+    w.relate::<InspectsRel>(e1, e2).expect("rel1");
+    assert!(w.has_relation::<InspectsRel>(e1, e2).expect("has1"));
+    w.relate::<InspectsRel>(e1, e3).expect("rel2");
+    assert!(!w.has_relation::<InspectsRel>(e1, e2).expect("replaced"));
+    assert!(w.has_relation::<InspectsRel>(e1, e3).expect("has2"));
+    assert_eq!(w.entity_table(e1).expect("tbl3"), (t_before, row_before));
+
+    // `Traversable` implies `Acyclic` cycle rejection and supports `traverse_up`!
+    w.relate::<DependsRel>(e1, e2).expect("d1");
+    w.relate::<DependsRel>(e2, e3).expect("d2");
+    assert!(w.relate::<DependsRel>(e3, e1).is_err(), "Traversable/Acyclic rejects cycle");
+    let chain = w.traverse_up::<DependsRel>(e1).expect("up");
+    assert_eq!(chain.as_slice(), &[e2, e3]);
+
+    // `OrderedChildren`: explicit child reordering preserved in `children_slice`.
+    w.relate::<crate::ChildOf>(e1, parent).expect("c1");
+    w.relate::<crate::ChildOf>(e2, parent).expect("c2");
+    w.relate::<crate::ChildOf>(e3, parent).expect("c3");
+    assert_eq!(w.children_slice(parent), &[e1, e2, e3]);
+    w.set_child_order(parent, &[e3, e1, e2]).expect("reorder");
+    assert_eq!(w.children_slice(parent), &[e3, e1, e2]);
 }

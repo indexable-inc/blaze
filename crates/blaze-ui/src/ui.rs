@@ -1,29 +1,56 @@
-//! Ergonomic high-level [`UiContext`] owning the relational ECS [`World`], `IsA` [`StylePrefabs`],
-//! [`LayoutEngine`], [`DockWorkspace`], [`InputState`], and [`DrawList`].
+//! Ergonomic high-level [`UiContext`] owning the relational ECS [`World`], glitch-free push-pull
+//! [`ReactiveGraph`], `IsA` [`StylePrefabs`], incremental [`LayoutEngine`], [`DockWorkspace`],
+//! [`InputState`], and retained [`DrawList`] with $O(\Delta)$ GPU slab patching.
 
 use core::alloc::Allocator;
 
-use blaze_ecs::{ChildOf, Entity, IsA, World};
-use blaze_own::String as OwnString;
+use blaze_ecs::{ChildOf, Entity, IsA, Memo, ReactiveGraph, ReadCx, Signal, World};
+use blaze_own::{Box as OwnBox, String as OwnString, Vec as OwnVec};
 
 use crate::components::{
-    ActionTag, BadgeTone, CanvasBatch, ChildOrder, Focusable, Interactive, LabelText, ScrollOffset,
-    SliderState, SubText, TextInputState, ToggleState, TreeRowState, WidgetKind,
-    register_ui_schema,
+    ActionTag, BadgeTone, CanvasBatch, ChildOrder, ComputedRect, Focusable, FrameStats,
+    Interactive, LabelText, ScrollOffset, SliderState, SubText, TextInputState, ToggleState,
+    TreeRowState, WidgetKind, register_ui_schema,
 };
 use crate::dock::{DockTab, DockWorkspace};
 use crate::draw::DrawList;
 use crate::error::UiError;
-use crate::extract::{extract_dock_chrome, extract_entities};
+use crate::extract::{extract_dock_chrome, extract_entities, patch_entity_gpu};
 use crate::input::{CursorHint, InputEvent, InputState, UiEvent};
-use crate::layout::LayoutEngine;
+use crate::layout::{LayoutEngine, is_layout_boundary};
 use crate::style::{Align, Direction, LayoutStyle, PaintStyle, Sizing, StylePrefabs};
 use crate::types::{Edges, Rect, Theme, ThemeKind};
 
-/// Complete `#![no_std]` relational ECS UI context.
+/// Kind of run-once reactive hole bound to an ECS widget entity.
+enum ReactiveBinding<A: Allocator + Copy + 'static> {
+    Label {
+        entity: Entity,
+        memo: Memo<OwnString<A>>,
+        last_epoch: u64,
+    },
+    SubText {
+        entity: Entity,
+        memo: Memo<OwnString<A>>,
+        last_epoch: u64,
+    },
+    Toggle {
+        entity: Entity,
+        memo: Memo<bool>,
+        last_epoch: u64,
+    },
+    BadgeTone {
+        entity: Entity,
+        memo: Memo<BadgeTone>,
+        last_epoch: u64,
+    },
+}
+
+/// Complete `#![no_std]` incremental relational ECS UI context.
 pub struct UiContext<A: Allocator + Copy + 'static> {
     alloc: A,
     pub world: World<A>,
+    /// Glitch-free push-pull reactive signal/memo graph (Solid / Svelte 5 Runes runtime).
+    pub reactive: ReactiveGraph<A>,
     pub theme: Theme,
     pub prefabs: StylePrefabs,
     pub root: Entity,
@@ -31,6 +58,17 @@ pub struct UiContext<A: Allocator + Copy + 'static> {
     pub layout: LayoutEngine<A>,
     pub input: InputState<A>,
     pub draw: DrawList<A>,
+    scratch_draw: OwnBox<DrawList<A>, A>,
+    bindings: OwnVec<ReactiveBinding<A>, A>,
+    dirty_layout_roots: OwnVec<Entity, A>,
+    dirty_paint: OwnVec<Entity, A>,
+    full_layout_dirty: bool,
+    full_extract_dirty: bool,
+    extract_epoch: u64,
+    last_vp: (f32, f32, f32),
+    last_dock_bounds: Option<Rect>,
+    /// Exact incremental execution stats for the most recently rendered frame.
+    pub last_stats: FrameStats,
     next_order: u32,
 }
 
@@ -47,9 +85,13 @@ impl<A: Allocator + Copy + 'static> UiContext<A> {
         world.set_copy(root, LayoutStyle::column().fill().gap(0.0))?;
         world.relate::<IsA>(root, prefabs.root)?;
 
+        let scratch_draw = OwnBox::try_new_in(DrawList::new_in(alloc), alloc)
+            .map_err(|r| UiError::Alloc(r.why))?;
+
         Ok(Self {
             alloc,
             world,
+            reactive: ReactiveGraph::new_in(alloc),
             theme,
             prefabs,
             root,
@@ -57,6 +99,16 @@ impl<A: Allocator + Copy + 'static> UiContext<A> {
             layout: LayoutEngine::new_in(alloc),
             input: InputState::new_in(alloc),
             draw: DrawList::new_in(alloc),
+            scratch_draw,
+            bindings: OwnVec::new_in(alloc),
+            dirty_layout_roots: OwnVec::new_in(alloc),
+            dirty_paint: OwnVec::new_in(alloc),
+            full_layout_dirty: true,
+            full_extract_dirty: true,
+            extract_epoch: 0,
+            last_vp: (0.0, 0.0, 0.0),
+            last_dock_bounds: None,
+            last_stats: FrameStats::default(),
             next_order: 1,
         })
     }
@@ -66,19 +118,368 @@ impl<A: Allocator + Copy + 'static> UiContext<A> {
         self.alloc
     }
 
+    /// Force a full layout & extract on the next frame (e.g. structural tree change).
+    #[inline]
+    pub fn mark_full_dirty(&mut self) {
+        self.full_layout_dirty = true;
+        self.full_extract_dirty = true;
+    }
+
+    /// Mark a single entity's visuals dirty (`0` layout nodes will run — patches GPU slab in-place!).
+    pub fn mark_paint_dirty(&mut self, entity: Entity) -> Result<(), UiError> {
+        if !self.dirty_paint.iter().any(|&e| e == entity) {
+            self.dirty_paint.try_push(entity).map_err(|r| UiError::Alloc(r.why))?;
+        }
+        Ok(())
+    }
+
+    /// Mark `entity`'s layout dirty, bubbling up `ChildOf` ONLY to the nearest layout containment
+    /// boundary (`Sizing::Fixed`, `clip`, `scrollable`, or pane root)!
+    pub fn mark_layout_dirty(&mut self, entity: Entity) -> Result<(), UiError> {
+        let mut cur = entity;
+        let mut steps = 0usize;
+        while steps < 64 {
+            steps += 1;
+            let style = self
+                .world
+                .get_inherited::<LayoutStyle>(cur)?
+                .copied()
+                .unwrap_or_default();
+            if cur == self.root || is_layout_boundary(style) {
+                break;
+            }
+            match self.world.parent_of(cur)? {
+                Some(parent) => cur = parent,
+                None => break,
+            }
+        }
+        if cur == self.root {
+            self.full_layout_dirty = true;
+            self.full_extract_dirty = true;
+        } else if !self.dirty_layout_roots.iter().any(|&e| e == cur) {
+            self.dirty_layout_roots.try_push(cur).map_err(|r| UiError::Alloc(r.why))?;
+        }
+        Ok(())
+    }
+
     /// Switch the active [`ThemeKind`] and cascade new [`PaintStyle`]s to every widget via `IsA`.
     pub fn set_theme(&mut self, kind: ThemeKind) -> Result<(), UiError> {
+        if self.theme.kind == kind {
+            return Ok(());
+        }
         self.theme = Theme::from_kind(kind);
         self.prefabs.apply_theme(&mut self.world, &self.theme)?;
+        self.full_extract_dirty = true;
         Ok(())
     }
 
     /// Apply a custom modified [`Theme`] and cascade via `IsA`.
     pub fn apply_custom_theme(&mut self, theme: Theme) -> Result<(), UiError> {
+        if self.theme == theme {
+            return Ok(());
+        }
         self.theme = theme;
         self.prefabs.apply_theme(&mut self.world, &self.theme)?;
+        self.full_extract_dirty = true;
         Ok(())
     }
+
+    /// Equality-guarded label update: returns `Ok(false)` in `< 1 µs` with **0 dirty work** if
+    /// `text` matches the current `LabelText`; otherwise marks ONLY `entity` `DirtyPaint` when
+    /// layout-contained (or nearest boundary `DirtyLayout` if `Auto`-sized).
+    pub fn set_label_text(&mut self, entity: Entity, text: &str) -> Result<bool, UiError> {
+        if !self.world.is_alive(entity) {
+            return Ok(false);
+        }
+        if let Some(existing) = self.world.get::<LabelText<A>>(entity)? {
+            if existing.0.as_str() == text {
+                return Ok(false);
+            }
+        }
+        if let Some(existing) = self.world.get_mut::<LabelText<A>>(entity)? {
+            existing.0.clear();
+            existing.0.try_push_str(text)?;
+        } else {
+            let mut s = OwnString::new_in(self.alloc);
+            s.try_push_str(text)?;
+            self.world.set(entity, LabelText(s))?;
+        }
+        let ls = self
+            .world
+            .get_inherited::<LayoutStyle>(entity)?
+            .copied()
+            .unwrap_or_default();
+        if matches!(ls.width, Sizing::Auto) {
+            self.mark_layout_dirty(entity)?;
+        } else {
+            self.mark_paint_dirty(entity)?;
+        }
+        Ok(true)
+    }
+
+    /// Equality-guarded secondary/value text update (always layout-contained → `DirtyPaint` only!).
+    pub fn set_sub_text(&mut self, entity: Entity, text: &str) -> Result<bool, UiError> {
+        if !self.world.is_alive(entity) {
+            return Ok(false);
+        }
+        if let Some(existing) = self.world.get::<SubText<A>>(entity)? {
+            if existing.0.as_str() == text {
+                return Ok(false);
+            }
+        }
+        if let Some(existing) = self.world.get_mut::<SubText<A>>(entity)? {
+            existing.0.clear();
+            existing.0.try_push_str(text)?;
+        } else {
+            let mut s = OwnString::new_in(self.alloc);
+            s.try_push_str(text)?;
+            self.world.set(entity, SubText(s))?;
+        }
+        self.mark_paint_dirty(entity)?;
+        Ok(true)
+    }
+
+    /// Equality-guarded `PaintStyle` override on `entity` → `DirtyPaint` only (`0` layout nodes!).
+    pub fn set_paint_style(&mut self, entity: Entity, style: PaintStyle) -> Result<bool, UiError> {
+        if !self.world.set_copy_if_changed(entity, style)? {
+            return Ok(false);
+        }
+        self.mark_paint_dirty(entity)?;
+        Ok(true)
+    }
+
+    /// Equality-guarded `IsA` style prefab update: uses $O(1)$ `world.isa_dependents_slice(prefab)`
+    /// to dirty ONLY the exact widgets inheriting from `prefab` (`0` layout nodes unless `text_size` changed!).
+    pub fn set_prefab_style(&mut self, prefab: Entity, style: PaintStyle) -> Result<bool, UiError> {
+        let prev_text_size = self.world.get::<PaintStyle>(prefab)?.map(|p| p.text_size);
+        if !self.world.set_copy_if_changed(prefab, style)? {
+            return Ok(false);
+        }
+        let text_resized = prev_text_size.is_some_and(|s| (s - style.text_size).abs() > 0.01);
+        let mut deps = OwnVec::new_in(self.alloc);
+        for &dep in self.world.isa_dependents_slice(prefab) {
+            deps.try_push(dep).map_err(|r| UiError::Alloc(r.why))?;
+        }
+        for &dep in deps.as_slice() {
+            if text_resized {
+                self.mark_layout_dirty(dep)?;
+            } else {
+                self.mark_paint_dirty(dep)?;
+            }
+        }
+        Ok(true)
+    }
+
+    // =========================================================================
+    // Run-Once Reactive Holes (Solid / Svelte 5 Runes Style over `ReactiveGraph`)
+    // =========================================================================
+
+    /// Create a fine-grained reactive [`Signal<T>`] owned by this UI context.
+    #[inline]
+    pub fn signal<T: 'static>(&mut self, initial: T) -> Result<Signal<T>, UiError> {
+        Ok(self.reactive.signal(initial)?)
+    }
+
+    /// Equality-guarded write to a reactive [`Signal<T>`].
+    #[inline]
+    pub fn set_signal<T: PartialEq + 'static>(
+        &mut self,
+        sig: Signal<T>,
+        value: T,
+    ) -> Result<bool, UiError> {
+        Ok(self.reactive.set(sig, value)?)
+    }
+
+    /// Bind a run-once reactive label hole to `entity`: `compute` runs ONLY when a tracked
+    /// signal/memo it reads changes, and writes via equality-guarded [`Self::set_label_text`].
+    pub fn bind_label<F>(&mut self, entity: Entity, mut compute: F) -> Result<(), UiError>
+    where
+        F: FnMut(&mut ReadCx<'_, A>, &mut OwnString<A>) + 'static,
+    {
+        let alloc = self.alloc;
+        let memo = self.reactive.memo(move |cx| {
+            let mut s = OwnString::new_in(alloc);
+            compute(cx, &mut s);
+            s
+        })?;
+        if let Some(val) = self.reactive.get_memo(memo)? {
+            let mut copy = OwnString::new_in(alloc);
+            copy.try_push_str(val.as_str())?;
+            let _ = self.set_label_text(entity, copy.as_str())?;
+        }
+        let ep = self.reactive.epoch();
+        self.bindings
+            .try_push(ReactiveBinding::Label { entity, memo, last_epoch: ep })
+            .map_err(|r| UiError::Alloc(r.why))?;
+        Ok(())
+    }
+
+    /// Bind a run-once reactive `SubText` hole to `entity`.
+    pub fn bind_sub_text<F>(&mut self, entity: Entity, mut compute: F) -> Result<(), UiError>
+    where
+        F: FnMut(&mut ReadCx<'_, A>, &mut OwnString<A>) + 'static,
+    {
+        let alloc = self.alloc;
+        let memo = self.reactive.memo(move |cx| {
+            let mut s = OwnString::new_in(alloc);
+            compute(cx, &mut s);
+            s
+        })?;
+        if let Some(val) = self.reactive.get_memo(memo)? {
+            let mut copy = OwnString::new_in(alloc);
+            copy.try_push_str(val.as_str())?;
+            let _ = self.set_sub_text(entity, copy.as_str())?;
+        }
+        let ep = self.reactive.epoch();
+        self.bindings
+            .try_push(ReactiveBinding::SubText { entity, memo, last_epoch: ep })
+            .map_err(|r| UiError::Alloc(r.why))?;
+        Ok(())
+    }
+
+    /// Bind a run-once reactive [`ToggleState`] hole to `entity`.
+    pub fn bind_toggle<F>(&mut self, entity: Entity, compute: F) -> Result<(), UiError>
+    where
+        F: FnMut(&mut ReadCx<'_, A>) -> bool + 'static,
+    {
+        let memo = self.reactive.memo(compute)?;
+        if let Some(&checked) = self.reactive.get_memo(memo)? {
+            if self.world.set_copy_if_changed(entity, ToggleState { checked })? {
+                self.mark_paint_dirty(entity)?;
+            }
+        }
+        let ep = self.reactive.epoch();
+        self.bindings
+            .try_push(ReactiveBinding::Toggle { entity, memo, last_epoch: ep })
+            .map_err(|r| UiError::Alloc(r.why))?;
+        Ok(())
+    }
+
+    /// Bind a run-once reactive [`BadgeTone`] hole to `entity`.
+    pub fn bind_badge_tone<F>(&mut self, entity: Entity, compute: F) -> Result<(), UiError>
+    where
+        F: FnMut(&mut ReadCx<'_, A>) -> BadgeTone + 'static,
+    {
+        let memo = self.reactive.memo(compute)?;
+        if let Some(&tone) = self.reactive.get_memo(memo)? {
+            if self.world.set_copy_if_changed(entity, tone)? {
+                self.mark_paint_dirty(entity)?;
+            }
+        }
+        let ep = self.reactive.epoch();
+        self.bindings
+            .try_push(ReactiveBinding::BadgeTone { entity, memo, last_epoch: ep })
+            .map_err(|r| UiError::Alloc(r.why))?;
+        Ok(())
+    }
+
+    /// Flush all dirty reactive holes into ECS components, returning how many memo evaluations ran.
+    pub fn flush_reactive(&mut self) -> Result<u32, UiError> {
+        let before = self.reactive.memo_evals;
+        let _ = self.reactive.flush()?;
+        let cur_epoch = self.reactive.epoch();
+        let alloc = self.alloc;
+        let mut scratch = OwnString::new_in(alloc);
+
+        let count = self.bindings.len();
+        for i in 0..count {
+            enum PendingUpdate {
+                None,
+                Label(Entity),
+                SubText(Entity),
+                Toggle(Entity, bool),
+                Badge(Entity, BadgeTone),
+            }
+            let upd = match self.bindings.get_mut(i) {
+                Some(ReactiveBinding::Label { entity, memo, last_epoch }) => {
+                    if *last_epoch == cur_epoch {
+                        PendingUpdate::None
+                    } else {
+                        let e = *entity;
+                        let m = *memo;
+                        *last_epoch = cur_epoch;
+                        if let Some(s) = self.reactive.get_memo(m)? {
+                            scratch.clear();
+                            scratch.try_push_str(s.as_str())?;
+                            PendingUpdate::Label(e)
+                        } else {
+                            PendingUpdate::None
+                        }
+                    }
+                }
+                Some(ReactiveBinding::SubText { entity, memo, last_epoch }) => {
+                    if *last_epoch == cur_epoch {
+                        PendingUpdate::None
+                    } else {
+                        let e = *entity;
+                        let m = *memo;
+                        *last_epoch = cur_epoch;
+                        if let Some(s) = self.reactive.get_memo(m)? {
+                            scratch.clear();
+                            scratch.try_push_str(s.as_str())?;
+                            PendingUpdate::SubText(e)
+                        } else {
+                            PendingUpdate::None
+                        }
+                    }
+                }
+                Some(ReactiveBinding::Toggle { entity, memo, last_epoch }) => {
+                    if *last_epoch == cur_epoch {
+                        PendingUpdate::None
+                    } else {
+                        let e = *entity;
+                        let m = *memo;
+                        *last_epoch = cur_epoch;
+                        if let Some(&b) = self.reactive.get_memo(m)? {
+                            PendingUpdate::Toggle(e, b)
+                        } else {
+                            PendingUpdate::None
+                        }
+                    }
+                }
+                Some(ReactiveBinding::BadgeTone { entity, memo, last_epoch }) => {
+                    if *last_epoch == cur_epoch {
+                        PendingUpdate::None
+                    } else {
+                        let e = *entity;
+                        let m = *memo;
+                        *last_epoch = cur_epoch;
+                        if let Some(&t) = self.reactive.get_memo(m)? {
+                            PendingUpdate::Badge(e, t)
+                        } else {
+                            PendingUpdate::None
+                        }
+                    }
+                }
+                None => PendingUpdate::None,
+            };
+
+            match upd {
+                PendingUpdate::None => {}
+                PendingUpdate::Label(e) => {
+                    let _ = self.set_label_text(e, scratch.as_str())?;
+                }
+                PendingUpdate::SubText(e) => {
+                    let _ = self.set_sub_text(e, scratch.as_str())?;
+                }
+                PendingUpdate::Toggle(e, checked) => {
+                    if self.world.set_copy_if_changed(e, ToggleState { checked })? {
+                        self.mark_paint_dirty(e)?;
+                    }
+                }
+                PendingUpdate::Badge(e, tone) => {
+                    if self.world.set_copy_if_changed(e, tone)? {
+                        self.mark_paint_dirty(e)?;
+                    }
+                }
+            }
+        }
+        Ok(u32::try_from(self.reactive.memo_evals.saturating_sub(before)).unwrap_or(u32::MAX))
+    }
+
+    // =========================================================================
+    // Widget Spawners
+    // =========================================================================
 
     #[inline]
     fn next_child_order(&mut self) -> ChildOrder {
@@ -90,10 +491,13 @@ impl<A: Allocator + Copy + 'static> UiContext<A> {
     /// Remove all `ChildOf` children of `parent` (cascading despawn cleanly).
     pub fn clear_children(&mut self, parent: Entity) -> Result<(), UiError> {
         let children = self.world.children_of(parent)?;
-        for &c in children.as_slice() {
-            if self.world.is_alive(c) {
-                self.world.despawn(c)?;
+        if !children.is_empty() {
+            for &c in children.as_slice() {
+                if self.world.is_alive(c) {
+                    self.world.despawn(c)?;
+                }
             }
+            self.mark_full_dirty();
         }
         Ok(())
     }
@@ -125,6 +529,7 @@ impl<A: Allocator + Copy + 'static> UiContext<A> {
         if let Some(prefab) = style_prefab {
             self.world.relate::<IsA>(e, prefab)?;
         }
+        self.mark_full_dirty();
         Ok(e)
     }
 
@@ -142,6 +547,7 @@ impl<A: Allocator + Copy + 'static> UiContext<A> {
             self.world.set_copy(e, ScrollOffset::default())?;
         }
         self.world.set_copy(e, ls)?;
+        self.mark_full_dirty();
         Ok(e)
     }
 
@@ -184,6 +590,23 @@ impl<A: Allocator + Copy + 'static> UiContext<A> {
             ps.text_size = self.theme.font_sm;
             self.world.set_copy(e, ps)?;
         }
+        Ok(e)
+    }
+
+    /// Spawn a layout-contained fixed-width label (edits NEVER trigger layout!).
+    pub fn spawn_fixed_label(
+        &mut self,
+        parent: Entity,
+        name: &str,
+        text: &str,
+        width: f32,
+        height: f32,
+    ) -> Result<Entity, UiError> {
+        let ls = LayoutStyle::row().width(Sizing::Fixed(width)).height(Sizing::Fixed(height));
+        let e = self.spawn_container(parent, name, WidgetKind::Label, ls, None)?;
+        let mut s = OwnString::new_in(self.alloc);
+        s.try_push_str(text)?;
+        self.world.set(e, LabelText(s))?;
         Ok(e)
     }
 
@@ -360,12 +783,32 @@ impl<A: Allocator + Copy + 'static> UiContext<A> {
 
     /// Feed a sans-IO [`InputEvent`] into the UI state machine.
     pub fn handle_input(&mut self, ev: InputEvent) -> Result<(), UiError> {
-        self.input
-            .handle_event(&mut self.world, self.layout.paint_order.as_slice(), &self.draw, &mut self.dock, ev)
+        self.input.handle_event(
+            &mut self.world,
+            self.layout.paint_order.as_slice(),
+            &self.draw,
+            &mut self.dock,
+            ev,
+        )?;
+        let mut idx = 0usize;
+        while idx < self.input.dirty_paint.len() {
+            if let Some(&e) = self.input.dirty_paint.get(idx) {
+                if !self.dirty_paint.as_slice().contains(&e) {
+                    self.dirty_paint.try_push(e).map_err(|r| UiError::Alloc(r.why))?;
+                }
+            }
+            idx += 1;
+        }
+        self.input.dirty_paint.clear();
+        if self.input.dirty_layout {
+            self.input.dirty_layout = false;
+            self.mark_full_dirty();
+        }
+        Ok(())
     }
 
     /// Drain all semantic [`UiEvent`]s produced since the last call.
-    pub fn drain_events(&mut self, out: &mut blaze_own::Vec<UiEvent, A>) -> Result<(), UiError> {
+    pub fn drain_events(&mut self, out: &mut OwnVec<UiEvent, A>) -> Result<(), UiError> {
         out.clear();
         for &ev in self.input.events.as_slice() {
             out.try_push(ev).map_err(|r| UiError::Alloc(r.why))?;
@@ -379,8 +822,13 @@ impl<A: Allocator + Copy + 'static> UiContext<A> {
         self.input.cursor
     }
 
-    /// Run full frame: layout root + docked panes, extract dock chrome + UI entities + hybrid
-    /// GPU `CanvasBatch` streams into `self.draw`.
+    /// Run one incremental frame:
+    /// 1. Flush dirty reactive holes (`Signal`/`Memo` -> ECS components).
+    /// 2. If nothing changed (`!full_layout_dirty && dirty_layout_roots.is_empty() && dirty_paint.is_empty()`),
+    ///    return immediately in **0 µs** with `0` layout nodes, `0` paint nodes, and `0` GPU bytes!
+    /// 3. If only `dirty_paint` (or localized `dirty_layout_roots`), re-layout ONLY dirty boundaries
+    ///    and patch ONLY dirty entities' retained [`GpuSlot`]s in place!
+    /// 4. Fall back seamlessly to full layout + retained extract on resize, dock change, or slab overflow.
     pub fn render_frame(
         &mut self,
         width: f32,
@@ -389,15 +837,156 @@ impl<A: Allocator + Copy + 'static> UiContext<A> {
         time: f32,
         dock_bounds: Option<Rect>,
     ) -> Result<(), UiError> {
-        let vp = Rect::new(0.0, 0.0, width.max(1.0), height.max(1.0));
-        self.draw.begin_frame(vp.w, vp.h, dpr, time)?;
+        let reactive_evals = self.flush_reactive()?;
 
-        // 1. Layout & extract root chrome (e.g. top toolbar + status bar).
-        self.layout.compute(&mut self.world, self.root, vp, &mut self.draw)?;
-        extract_entities(&self.world, self.layout.paint_order.as_slice(), &self.theme, time, &mut self.draw)?;
+        // Check if a focused TextInput needs blinking caret paint update.
+        if let Some(foc) = self.input.focused {
+            if self.world.is_alive(foc)
+                && self.world.get::<WidgetKind>(foc)? == Some(&WidgetKind::TextInput)
+            {
+                self.mark_paint_dirty(foc)?;
+            }
+        }
 
-        // 2. If a dock workspace is active, lay out its binary tree, draw chrome, and lay out &
-        //    extract every active tab's content subtree inside its leaf body rect.
+        let vp_key = (width.max(1.0), height.max(1.0), dpr.max(1.0));
+        if vp_key != self.last_vp || dock_bounds != self.last_dock_bounds {
+            self.last_vp = vp_key;
+            self.last_dock_bounds = dock_bounds;
+            self.full_layout_dirty = true;
+            self.full_extract_dirty = true;
+        }
+
+        // Fast path 0: 0 µs idle frame (nothing dirty at all!).
+        if !self.full_layout_dirty
+            && !self.full_extract_dirty
+            && self.dirty_layout_roots.is_empty()
+            && self.dirty_paint.is_empty()
+        {
+            self.draw.begin_incremental_frame(vp_key.0, vp_key.1, vp_key.2, time);
+            self.last_stats = FrameStats {
+                full_layout: false,
+                full_extract: false,
+                layout_nodes_visited: 0,
+                paint_nodes_visited: 0,
+                rect_patches: 0,
+                glyph_patches: 0,
+                gpu_bytes_patched: 0,
+                reactive_evals,
+            };
+            return Ok(());
+        }
+
+        // Fast path 1: Localized layout boundaries + in-place GPU slab patching!
+        if !self.full_layout_dirty && !self.full_extract_dirty {
+            self.draw.begin_incremental_frame(vp_key.0, vp_key.1, vp_key.2, time);
+            let mut layout_visited: u32 = 0;
+
+            if !self.dirty_layout_roots.is_empty() {
+                let mut saved_paint = OwnVec::new_in(self.alloc);
+                core::mem::swap(&mut saved_paint, &mut self.layout.paint_order);
+                let mut roots = OwnVec::new_in(self.alloc);
+                core::mem::swap(&mut roots, &mut self.dirty_layout_roots);
+
+                for &boundary in roots.as_slice() {
+                    if !self.world.is_alive(boundary) {
+                        continue;
+                    }
+                    let Some(cr) = self.world.get::<ComputedRect>(boundary)?.copied() else {
+                        self.full_layout_dirty = true;
+                        self.full_extract_dirty = true;
+                        break;
+                    };
+                    let n = self.layout.compute_with_clip(
+                        &mut self.world,
+                        boundary,
+                        cr.rect,
+                        cr.clip_id,
+                        &mut self.draw,
+                    )?;
+                    layout_visited = layout_visited.saturating_add(n);
+                    for &e in self.layout.paint_order.as_slice() {
+                        if !self.dirty_paint.iter().any(|&d| d == e) {
+                            self.dirty_paint.try_push(e).map_err(|r| UiError::Alloc(r.why))?;
+                        }
+                    }
+                }
+                self.layout.paint_order = saved_paint;
+            }
+
+            if !self.full_layout_dirty && !self.full_extract_dirty {
+                let mut paint_visited: u32 = 0;
+                let mut overflowed = false;
+                let mut pending = OwnVec::new_in(self.alloc);
+                core::mem::swap(&mut pending, &mut self.dirty_paint);
+
+                for &ent in pending.as_slice() {
+                    let ok = patch_entity_gpu(
+                        &mut self.world,
+                        ent,
+                        &self.theme,
+                        time,
+                        self.extract_epoch,
+                        &mut self.scratch_draw,
+                        &mut self.draw,
+                    )?;
+                    if !ok {
+                        overflowed = true;
+                        break;
+                    }
+                    paint_visited = paint_visited.saturating_add(1);
+                }
+
+                if !overflowed {
+                    let r_p = u32::try_from(
+                        self.draw.rect_patches.len().saturating_add(self.draw.ov_rect_patches.len()),
+                    )
+                    .unwrap_or(u32::MAX);
+                    let g_p = u32::try_from(
+                        self.draw.glyph_patches.len().saturating_add(self.draw.ov_glyph_patches.len()),
+                    )
+                    .unwrap_or(u32::MAX);
+                    self.last_stats = FrameStats {
+                        full_layout: false,
+                        full_extract: false,
+                        layout_nodes_visited: layout_visited,
+                        paint_nodes_visited: paint_visited,
+                        rect_patches: r_p,
+                        glyph_patches: g_p,
+                        gpu_bytes_patched: self.draw.patched_bytes(),
+                        reactive_evals,
+                    };
+                    return Ok(());
+                }
+                self.full_extract_dirty = true;
+            }
+        }
+
+        // Full layout + retained full extract pass.
+        self.extract_epoch = self.extract_epoch.saturating_add(1);
+        let ep = self.extract_epoch;
+        let vp = Rect::new(0.0, 0.0, vp_key.0, vp_key.1);
+        self.draw.begin_frame(vp.w, vp.h, vp_key.2, time)?;
+        self.dirty_layout_roots.clear();
+        self.dirty_paint.clear();
+
+        let mut total_layout: u32 = 0;
+        let mut total_paint: u32 = 0;
+
+        total_layout = total_layout.saturating_add(self.layout.compute(
+            &mut self.world,
+            self.root,
+            vp,
+            &mut self.draw,
+        )?);
+        total_paint = total_paint.saturating_add(extract_entities(
+            &mut self.world,
+            self.layout.paint_order.as_slice(),
+            &self.theme,
+            time,
+            ep,
+            &mut self.draw,
+        )?);
+
         if let Some(d_bounds) = dock_bounds {
             self.dock.compute_layout(&self.world, d_bounds)?;
             extract_dock_chrome(
@@ -409,9 +998,7 @@ impl<A: Allocator + Copy + 'static> UiContext<A> {
                 &mut self.draw,
             )?;
 
-            // Accumulate all paint-ordered entities (root + active pane subtrees) so hit-testing
-            // covers both chrome AND every docked pane seamlessly!
-            let mut combined_paint = blaze_own::Vec::new_in(self.alloc);
+            let mut combined_paint = OwnVec::new_in(self.alloc);
             for &e in self.layout.paint_order.as_slice() {
                 combined_paint.try_push(e).map_err(|r| UiError::Alloc(r.why))?;
             }
@@ -428,14 +1015,20 @@ impl<A: Allocator + Copy + 'static> UiContext<A> {
                 if !self.world.is_alive(tab_comp.content) {
                     continue;
                 }
-                self.layout.compute(&mut self.world, tab_comp.content, leaf_r.body, &mut self.draw)?;
-                extract_entities(
-                    &self.world,
+                total_layout = total_layout.saturating_add(self.layout.compute(
+                    &mut self.world,
+                    tab_comp.content,
+                    leaf_r.body,
+                    &mut self.draw,
+                )?);
+                total_paint = total_paint.saturating_add(extract_entities(
+                    &mut self.world,
                     self.layout.paint_order.as_slice(),
                     &self.theme,
                     time,
+                    ep,
                     &mut self.draw,
-                )?;
+                )?);
                 for &e in self.layout.paint_order.as_slice() {
                     combined_paint.try_push(e).map_err(|r| UiError::Alloc(r.why))?;
                 }
@@ -443,6 +1036,23 @@ impl<A: Allocator + Copy + 'static> UiContext<A> {
             self.layout.paint_order = combined_paint;
         }
 
+        self.full_layout_dirty = false;
+        self.full_extract_dirty = false;
+        let full_bytes = u32::try_from(
+            (self.draw.rects.len() + self.draw.overlay_rects.len()).saturating_mul(80)
+                + (self.draw.glyphs.len() + self.draw.overlay_glyphs.len()).saturating_mul(64),
+        )
+        .unwrap_or(u32::MAX);
+        self.last_stats = FrameStats {
+            full_layout: true,
+            full_extract: true,
+            layout_nodes_visited: total_layout,
+            paint_nodes_visited: total_paint,
+            rect_patches: 0,
+            glyph_patches: 0,
+            gpu_bytes_patched: full_bytes,
+            reactive_evals,
+        };
         Ok(())
     }
 }

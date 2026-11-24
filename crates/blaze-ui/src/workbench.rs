@@ -12,12 +12,12 @@
 use core::alloc::Allocator;
 use core::fmt::Write as _;
 
-use blaze_ecs::Entity;
+use blaze_ecs::{Entity, IncrementalCount, Signal};
 use blaze_own::{String as OwnString, Vec as OwnVec};
 
 use crate::components::{
     BadgeTone, CanvasBatch, ComputedRect, DockedIn, Focusable, Focused, Hovered, Inspects,
-    Interactive, LabelText, Selected, SliderState, TextInputState, TreeRowState, WidgetKind,
+    Interactive, Selected, SliderState, TextInputState, TreeRowState, WidgetKind,
 };
 use crate::dock::SplitDir;
 use crate::draw::DrawList;
@@ -29,6 +29,7 @@ use crate::shaders::{
 use crate::style::{Align, LayoutStyle, PaintStyle, Sizing};
 use crate::types::{Edges, Rect, Rgba, ThemeKind};
 use crate::ui::UiContext;
+use crate::virtual_list::VirtualList;
 
 const TOOLBAR_H: f32 = 38.0;
 const STATUSBAR_H: f32 = 24.0;
@@ -40,6 +41,10 @@ const ACT_THEME_EMBER: u32 = 102;
 const ACT_RESET_DOCK: u32 = 103;
 const ACT_SEARCH_INPUT: u32 = 110;
 const ACT_CANVAS: u32 = 120;
+const ACT_LAB_EDIT_ONE: u32 = 150;
+const ACT_LAB_NOOP_WRITE: u32 = 151;
+const ACT_LAB_TOGGLE_UNREAD: u32 = 152;
+const ACT_LAB_SCROLL_100K: u32 = 153;
 const ACT_PREFAB_PANEL_RADIUS: u32 = 200;
 const ACT_PREFAB_BTN_RADIUS: u32 = 201;
 const ACT_PREFAB_SHADOW: u32 = 202;
@@ -48,6 +53,7 @@ const ACT_TOGGLE_SHOW_PREFABS: u32 = 204;
 const ACT_INSP_RADIUS: u32 = 210;
 const ACT_INSP_BORDER: u32 = 211;
 const ACT_TREE_ROW_BASE: u32 = 10_000;
+const ACT_VLIST_ROW_BASE: u32 = 20_000;
 
 /// Live self-hosting Blaze UI + ECS Workbench application.
 pub struct WorkbenchApp<A: Allocator + Copy + 'static> {
@@ -72,8 +78,17 @@ pub struct WorkbenchApp<A: Allocator + Copy + 'static> {
     pane_hierarchy: Entity,
     pane_canvas: Entity,
     pane_shaders: Entity,
+    pane_lab: Entity,
     pane_inspector: Entity,
     pane_prefabs: Entity,
+    // Reactivity & 100k VirtualList Lab state (run-once reactive holes + O(1) IncrementalCount)
+    lab_vlist: VirtualList<A>,
+    lab_unread: IncrementalCount<u32, A>,
+    lab_edit_count: Signal<u32>,
+    lab_stat_row: Entity,
+    lab_scroll_row: Entity,
+    lab_toggle_cursor: u32,
+    lab_edit_seq: u32,
     // Interactive state
     animate_graph: bool,
     show_prefabs_in_tree: bool,
@@ -86,6 +101,7 @@ pub struct WorkbenchApp<A: Allocator + Copy + 'static> {
     last_time: f32,
     dirty_tree: bool,
     dirty_inspector: bool,
+    telemetry_syncing: bool,
 }
 
 impl<A: Allocator + Copy + 'static> WorkbenchApp<A> {
@@ -116,8 +132,11 @@ impl<A: Allocator + Copy + 'static> WorkbenchApp<A> {
         let _ = ui.spawn_button(toolbar, "BtnEmber", "Ember", ACT_THEME_EMBER, false)?;
         let _ = ui.spawn_spacer(toolbar)?;
         let badge_entities = ui.spawn_badge(toolbar, "StatEntities", "0 ent", BadgeTone::Neutral)?;
+        ui.world.set_copy(badge_entities, LayoutStyle::row().width(Sizing::Fixed(68.0)).height(Sizing::Fixed(20.0)))?;
         let badge_clips = ui.spawn_badge(toolbar, "StatClips", "0 clips", BadgeTone::Ok)?;
+        ui.world.set_copy(badge_clips, LayoutStyle::row().width(Sizing::Fixed(72.0)).height(Sizing::Fixed(20.0)))?;
         let badge_instances = ui.spawn_badge(toolbar, "StatInst", "0 inst", BadgeTone::Violet)?;
+        ui.world.set_copy(badge_instances, LayoutStyle::row().width(Sizing::Fixed(148.0)).height(Sizing::Fixed(20.0)))?;
         let _ = ui.spawn_button(toolbar, "BtnResetDock", "Reset Dock", ACT_RESET_DOCK, false)?;
 
         // Center placeholder flex region where DockWorkspace renders, then bottom StatusBar.
@@ -192,6 +211,76 @@ impl<A: Allocator + Copy + 'static> WorkbenchApp<A> {
             let _ = ui.spawn_label(shader_lines_box, nm.as_str(), line, false)?;
         }
 
+        // 4b. Pane 3b: Reactivity & 100K VirtualList Lab (run-once reactive holes + O(1) IncrementalCount)
+        let pane_lab = ui.spawn_pane_root("Pane::ReactivityLab", false)?;
+        let lab_bar = ui.spawn_container(
+            pane_lab,
+            "LabActionBar",
+            WidgetKind::Container,
+            LayoutStyle::row().width(Sizing::FILL).height(Sizing::Fixed(28.0)).gap(6.0).align(Align::Center),
+            None,
+        )?;
+        let _ = ui.spawn_button(lab_bar, "LabEditOne", "Edit 1 Label", ACT_LAB_EDIT_ONE, true)?;
+        let _ = ui.spawn_button(lab_bar, "LabNoop", "Equal Write (0B)", ACT_LAB_NOOP_WRITE, false)?;
+        let _ = ui.spawn_button(lab_bar, "LabToggleUnread", "Toggle Unread", ACT_LAB_TOGGLE_UNREAD, false)?;
+        let _ = ui.spawn_button(lab_bar, "LabScroll100k", "Scroll +500", ACT_LAB_SCROLL_100K, false)?;
+        let _ = ui.spawn_spacer(lab_bar)?;
+        let lab_unread_badge = ui.spawn_badge(lab_bar, "LabUnreadBadge", "0 unread", BadgeTone::Fire)?;
+        ui.world.set_copy(
+            lab_unread_badge,
+            LayoutStyle::row().width(Sizing::Fixed(86.0)).height(Sizing::Fixed(20.0)),
+        )?;
+
+        let lab_metrics = ui.spawn_card(
+            pane_lab,
+            "LabMetricsCard",
+            LayoutStyle::column().width(Sizing::FILL).pad(Edges::all(8.0)).gap(3.0),
+        )?;
+        let lab_stat_row = ui.spawn_property_row(
+            lab_metrics,
+            "LabStatRow",
+            "Last Frame Delta",
+            "layout: 0 · paint: 0 · patch: 0 B",
+        )?;
+        let lab_scroll_row = ui.spawn_property_row(
+            lab_metrics,
+            "LabScrollRow",
+            "100,000-Row Pool",
+            "24 pooled ECS entities · row 0..24",
+        )?;
+
+        let lab_edit_count = ui.signal(0u32)?;
+        let mut lab_unread = IncrementalCount::<u32, A>::new_in(&mut ui.reactive, alloc)?;
+        for i in 0u32..32u32 {
+            let _ = lab_unread.upsert(&mut ui.reactive, i, i % 3 == 0)?;
+        }
+        let unread_sig = lab_unread.signal();
+        // Run-once reactive hole: badge updates ONLY when `IncrementalCount`'s signal changes!
+        ui.bind_label(lab_unread_badge, move |cx, out| {
+            let n = cx.val(unread_sig);
+            let _ = write!(out, "{n} unread");
+        })?;
+        // Run-once reactive hole for edit counter row
+        let lab_edit_row = ui.spawn_property_row(lab_metrics, "LabEditRow", "Reactive Signal", "edits: 0")?;
+        ui.bind_sub_text(lab_edit_row, move |cx, out| {
+            let n = cx.val(lab_edit_count);
+            let _ = write!(out, "edits: {n} (run-once reactive hole)");
+        })?;
+
+        let lab_vlist_box = ui.spawn_container(
+            pane_lab,
+            "LabVirtualListBox",
+            WidgetKind::Card,
+            LayoutStyle::column().fill().pad(Edges::all(6.0)).gap(2.0).clip(true),
+            Some(ui.prefabs.panel),
+        )?;
+        let mut lab_vlist = VirtualList::new_fixed_in(100_000, 22.0, alloc);
+        lab_vlist.mount_pool(&mut ui, lab_vlist_box, "VRow", 24, ACT_VLIST_ROW_BASE)?;
+        let _ = lab_vlist.sync_visible(&mut ui, 24.0 * 22.0, |idx, lbl, sub| {
+            let _ = write!(lbl, "Row #{idx:06} · ECS Signal Entity");
+            let _ = write!(sub, "{}", if idx % 3 == 0 { "unread" } else { "read" });
+        })?;
+
         // 5. Pane 4: Live Entity Inspector (`Inspects` relation!)
         let pane_inspector = ui.spawn_pane_root("Pane::Inspector", true)?;
         let inspector_props = ui.spawn_container(
@@ -257,7 +346,7 @@ impl<A: Allocator + Copy + 'static> WorkbenchApp<A> {
             SliderState::new(6.0, 0.0, 22.0, 1.0, 0),
             ACT_PREFAB_SHADOW,
         )?;
-        let _ = ui.spawn_toggle(pf_card, "PfToggleAnim", "Animate Graph Pulse", true, ACT_TOGGLE_ANIMATE)?;
+        let _ = ui.spawn_toggle(pf_card, "PfToggleAnim", "Animate Graph Pulse", false, ACT_TOGGLE_ANIMATE)?;
         let _ = ui.spawn_toggle(
             pf_card,
             "PfTogglePrefabs",
@@ -290,9 +379,17 @@ impl<A: Allocator + Copy + 'static> WorkbenchApp<A> {
             pane_hierarchy,
             pane_canvas,
             pane_shaders,
+            pane_lab,
             pane_inspector,
             pane_prefabs,
-            animate_graph: true,
+            lab_vlist,
+            lab_unread,
+            lab_edit_count,
+            lab_stat_row,
+            lab_scroll_row,
+            lab_toggle_cursor: 0,
+            lab_edit_seq: 0,
+            animate_graph: false,
             show_prefabs_in_tree: true,
             canvas_zoom: 1.0,
             tree_entities: OwnVec::new_in(alloc),
@@ -303,6 +400,7 @@ impl<A: Allocator + Copy + 'static> WorkbenchApp<A> {
             last_time: 0.0,
             dirty_tree: true,
             dirty_inspector: true,
+            telemetry_syncing: false,
         };
 
         app.build_default_dock()?;
@@ -327,6 +425,7 @@ impl<A: Allocator + Copy + 'static> WorkbenchApp<A> {
         let _ = self.ui.dock.add_tab(&mut self.ui.world, leaf_left, "Hierarchy", 1, self.pane_hierarchy)?;
         let _ = self.ui.dock.add_tab(&mut self.ui.world, leaf_mid, "GPU Canvas", 2, self.pane_canvas)?;
         let _ = self.ui.dock.add_tab(&mut self.ui.world, leaf_mid, "Shader IR", 3, self.pane_shaders)?;
+        let _ = self.ui.dock.add_tab(&mut self.ui.world, leaf_mid, "100K Lab", 6, self.pane_lab)?;
         let _ = self.ui.dock.add_tab(&mut self.ui.world, leaf_right, "Inspector", 4, self.pane_inspector)?;
         let _ = self.ui.dock.add_tab(&mut self.ui.world, leaf_right, "Theme Prefabs", 5, self.pane_prefabs)?;
 
@@ -391,7 +490,42 @@ impl<A: Allocator + Copy + 'static> WorkbenchApp<A> {
                     ACT_RESET_DOCK => {
                         self.build_default_dock()?;
                     }
-                    a if a >= ACT_TREE_ROW_BASE => {
+                    ACT_LAB_EDIT_ONE => {
+                        self.lab_edit_seq = self.lab_edit_seq.saturating_add(1);
+                        let _ = self.ui.set_signal(self.lab_edit_count, self.lab_edit_seq)?;
+                        if let Some(&first_row) = self.lab_vlist.pool.first() {
+                            let mut txt = OwnString::new_in(self.ui.alloc());
+                            let _ = write!(txt, "Row #000000 · patched edit #{}", self.lab_edit_seq);
+                            let _ = self.ui.set_label_text(first_row, txt.as_str())?;
+                        }
+                    }
+                    ACT_LAB_NOOP_WRITE => {
+                        // Equality-guarded no-op write: 0 dirty entities, 0 layout, 0 GPU bytes!
+                        let _ = self.ui.set_signal(self.lab_edit_count, self.lab_edit_seq)?;
+                    }
+                    ACT_LAB_TOGGLE_UNREAD => {
+                        let k = self.lab_toggle_cursor % 32;
+                        self.lab_toggle_cursor = self.lab_toggle_cursor.saturating_add(1);
+                        let next_unread = !self.lab_unread.get(k);
+                        let _ = self.lab_unread.upsert(&mut self.ui.reactive, k, next_unread)?;
+                    }
+                    ACT_LAB_SCROLL_100K => {
+                        let _ = self.lab_vlist.scroll_by(500.0 * 22.0, 24.0 * 22.0);
+                        let _ = self.lab_vlist.sync_visible(&mut self.ui, 24.0 * 22.0, |idx, lbl, sub| {
+                            let _ = write!(lbl, "Row #{idx:06} · ECS Signal Entity");
+                            let _ = write!(sub, "{}", if idx % 3 == 0 { "unread" } else { "read" });
+                        })?;
+                        let vis = self.lab_vlist.visible_range(24.0 * 22.0, 0);
+                        let mut s = OwnString::new_in(self.ui.alloc());
+                        let _ = write!(
+                            s,
+                            "24 pooled ECS entities · row {}..{}",
+                            vis.first_row,
+                            vis.first_row + vis.count
+                        );
+                        let _ = self.ui.set_sub_text(self.lab_scroll_row, s.as_str())?;
+                    }
+                    a if a >= ACT_TREE_ROW_BASE && a < ACT_VLIST_ROW_BASE => {
                         let idx = usize::try_from(a - ACT_TREE_ROW_BASE).unwrap_or(usize::MAX);
                         if let Some(&target) = self.tree_entities.get(idx) {
                             self.select_entity(target)?;
@@ -428,7 +562,7 @@ impl<A: Allocator + Copy + 'static> WorkbenchApp<A> {
                             .copied()
                             .unwrap_or_else(|| PaintStyle::card(&self.ui.theme));
                         ps.shadow_blur = value;
-                        self.ui.world.set_copy(self.ui.prefabs.card, ps)?;
+                        let _ = self.ui.set_prefab_style(self.ui.prefabs.card, ps)?;
                     }
                     ACT_INSP_RADIUS => {
                         if self.ui.world.is_alive(self.inspected) {
@@ -439,7 +573,11 @@ impl<A: Allocator + Copy + 'static> WorkbenchApp<A> {
                                 .copied()
                                 .unwrap_or_else(|| PaintStyle::panel(&self.ui.theme));
                             ps.radius = value;
-                            self.ui.world.set_copy(self.inspected, ps)?;
+                            if self.ui.world.has_tag(self.inspected, self.ui.world.prefab())? {
+                                let _ = self.ui.set_prefab_style(self.inspected, ps)?;
+                            } else {
+                                let _ = self.ui.set_paint_style(self.inspected, ps)?;
+                            }
                             self.dirty_inspector = true;
                         }
                     }
@@ -452,7 +590,11 @@ impl<A: Allocator + Copy + 'static> WorkbenchApp<A> {
                                 .copied()
                                 .unwrap_or_else(|| PaintStyle::panel(&self.ui.theme));
                             ps.border_width = value;
-                            self.ui.world.set_copy(self.inspected, ps)?;
+                            if self.ui.world.has_tag(self.inspected, self.ui.world.prefab())? {
+                                let _ = self.ui.set_prefab_style(self.inspected, ps)?;
+                            } else {
+                                let _ = self.ui.set_paint_style(self.inspected, ps)?;
+                            }
                             self.dirty_inspector = true;
                         }
                     }
@@ -505,8 +647,16 @@ impl<A: Allocator + Copy + 'static> WorkbenchApp<A> {
             self.dirty_inspector = false;
         }
 
-        // Update hybrid GPU canvas batch using previous frame's measured canvas content rect.
-        self.populate_gpu_canvas(time)?;
+        // Only repopulate the hybrid GPU canvas when visible & animated/dirty (0 µs idle frames!).
+        let canvas_visible = self.is_pane_visible(self.pane_canvas)?;
+        if (canvas_visible && (self.animate_graph || self.ui.last_stats.full_layout))
+            || self.ui.draw.rects.is_empty()
+        {
+            self.populate_gpu_canvas(time)?;
+            if self.animate_graph && canvas_visible {
+                self.ui.mark_paint_dirty(self.canvas_ent)?;
+            }
+        }
 
         let dock_bounds = Rect::new(
             6.0,
@@ -516,7 +666,7 @@ impl<A: Allocator + Copy + 'static> WorkbenchApp<A> {
         );
         self.ui.render_frame(self.last_w, self.last_h, dpr, time, Some(dock_bounds))?;
 
-        // Refresh live toolbar telemetry badges for next frame.
+        // Refresh live toolbar telemetry badges only when values actually change (equality-guarded!).
         self.update_telemetry_badges()?;
         let _ = self.shader_lines_box;
         let _ = self.status_label;
@@ -543,26 +693,64 @@ impl<A: Allocator + Copy + 'static> WorkbenchApp<A> {
         Ok(())
     }
 
+    fn is_pane_visible(&self, pane: Entity) -> Result<bool, UiError> {
+        for leaf_r in self.ui.dock.leaves.as_slice() {
+            if let Some(active_tab) = self.ui.dock.active_tab_of(&self.ui.world, leaf_r.leaf)? {
+                if let Some(tab) = self.ui.world.get::<crate::dock::DockTab>(active_tab)? {
+                    if tab.content == pane {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn update_telemetry_badges(&mut self) -> Result<(), UiError> {
+        let st = self.ui.last_stats;
+        if st.layout_nodes_visited == 0
+            && st.paint_nodes_visited == 0
+            && st.reactive_evals == 0
+            && !st.full_extract
+        {
+            self.telemetry_syncing = false;
+            return Ok(());
+        }
+        if self.telemetry_syncing && !st.full_extract && st.layout_nodes_visited == 0 {
+            self.telemetry_syncing = false;
+            return Ok(());
+        }
         let alloc = self.ui.alloc();
         let ent_n = self.ui.world.live_count();
         let clip_n = self.ui.draw.clips.len();
-        let inst_n = self.ui.draw.rects.len()
-            + self.ui.draw.glyphs.len()
-            + self.ui.draw.overlay_rects.len()
-            + self.ui.draw.overlay_glyphs.len();
 
+        let mut any = false;
         let mut s = OwnString::new_in(alloc);
         let _ = write!(s, "{ent_n} ent");
-        self.ui.world.set(self.badge_entities, LabelText(s))?;
+        any |= self.ui.set_label_text(self.badge_entities, s.as_str())?;
 
         let mut c = OwnString::new_in(alloc);
         let _ = write!(c, "{clip_n} clips");
-        self.ui.world.set(self.badge_clips, LabelText(c))?;
+        any |= self.ui.set_label_text(self.badge_clips, c.as_str())?;
 
         let mut ins = OwnString::new_in(alloc);
-        let _ = write!(ins, "{inst_n} gpu");
-        self.ui.world.set(self.badge_instances, LabelText(ins))?;
+        if st.full_extract {
+            let _ = write!(ins, "full {}B", st.gpu_bytes_patched);
+        } else {
+            let _ = write!(ins, "Δ L:{} P:{} {}B", st.layout_nodes_visited, st.paint_nodes_visited, st.gpu_bytes_patched);
+        }
+        any |= self.ui.set_label_text(self.badge_instances, ins.as_str())?;
+
+        if st.layout_nodes_visited > 0 || st.paint_nodes_visited > 0 || st.reactive_evals > 0 {
+            let mut ls = OwnString::new_in(alloc);
+            let _ = write!(
+                ls,
+                "layout: {} · paint: {} · patch: {} B · evals: {}",
+                st.layout_nodes_visited, st.paint_nodes_visited, st.gpu_bytes_patched, st.reactive_evals
+            );
+            any |= self.ui.set_sub_text(self.lab_stat_row, ls.as_str())?;
+        }
+        self.telemetry_syncing = any;
         Ok(())
     }
 

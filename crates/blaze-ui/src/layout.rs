@@ -56,24 +56,38 @@ impl<A: Allocator + Copy> LayoutEngine<A> {
         }
     }
 
-    /// Run two-pass layout rooted at `root` inside `viewport`, populating GPU clips in `draw` and
-    /// writing [`ComputedRect`] components back into `world`.
+    /// Run two-pass layout rooted at `root` inside `viewport`, populating GPU clips in `draw`,
+    /// writing [`ComputedRect`] components back into `world`, and returning the number of visited
+    /// layout nodes.
     pub fn compute(
         &mut self,
         world: &mut World<A>,
         root: Entity,
         viewport: Rect,
         draw: &mut DrawList<A>,
-    ) -> Result<(), UiError> {
+    ) -> Result<u32, UiError> {
+        self.compute_with_clip(world, root, viewport, 0, draw)
+    }
+
+    /// Run localized two-pass layout on the subtree rooted at layout-boundary `root` inside
+    /// `bounds` inheriting `root_clip_id`. Leaves all outside entities untouched!
+    pub fn compute_with_clip(
+        &mut self,
+        world: &mut World<A>,
+        root: Entity,
+        bounds: Rect,
+        root_clip_id: u32,
+        draw: &mut DrawList<A>,
+    ) -> Result<u32, UiError> {
         self.nodes.clear();
         self.children_buf.clear();
         self.paint_order.clear();
 
         if !world.is_alive(root) || is_hidden(world, root) {
-            return Ok(());
+            return Ok(0);
         }
 
-        // Phase 0: BFS-style iterative tree flattening with explicit `ChildOrder` sorting.
+        // Phase 0: BFS-style iterative tree flattening using O(1) `world.children_slice`.
         let root_style = get_layout_style(world, root);
         self.nodes
             .try_push(LayoutNode {
@@ -83,10 +97,10 @@ impl<A: Allocator + Copy> LayoutEngine<A> {
                 child_count: 0,
                 style: root_style,
                 intrinsic: Vec2::ZERO,
-                rect: viewport,
-                content_rect: viewport.inset(root_style.padding),
-                clip_id: 0,
-                child_clip_id: 0,
+                rect: bounds,
+                content_rect: bounds.inset(root_style.padding),
+                clip_id: root_clip_id,
+                child_clip_id: root_clip_id,
                 layer: if root_style.overlay { 1 } else { 0 },
             })
             .map_err(|r| UiError::Alloc(r.why))?;
@@ -98,17 +112,23 @@ impl<A: Allocator + Copy> LayoutEngine<A> {
                 None => break,
             };
 
-            let raw_children = world.children_of(parent_entity)?;
             self.order_scratch.clear();
-            for &ch in raw_children.as_slice() {
+            let mut needs_sort = false;
+            let mut prev_ord: u32 = 0;
+            for &ch in world.children_slice(parent_entity) {
                 if !world.is_alive(ch) || is_hidden(world, ch) {
                     continue;
                 }
                 let ord = world.get::<ChildOrder>(ch)?.map_or(u32::MAX, |o| o.0);
+                if ord < prev_ord {
+                    needs_sort = true;
+                }
+                prev_ord = ord;
                 self.order_scratch.try_push((ord, ch)).map_err(|r| UiError::Alloc(r.why))?;
             }
-            // Insertion sort keeps determinism with zero recursion and zero alloc.
-            sort_order_pairs(self.order_scratch.as_mut_slice());
+            if needs_sort {
+                sort_order_pairs(self.order_scratch.as_mut_slice());
+            }
 
             let first_child = self.children_buf.len();
             let count = self.order_scratch.len();
@@ -506,8 +526,17 @@ impl<A: Allocator + Copy> LayoutEngine<A> {
             }
         }
 
-        Ok(())
+        Ok(u32::try_from(self.nodes.len()).unwrap_or(u32::MAX))
     }
+}
+
+/// Returns `true` when `style` establishes a layout containment boundary whose outer box cannot
+/// be affected by descendant intrinsic sizes.
+#[inline]
+pub const fn is_layout_boundary(style: LayoutStyle) -> bool {
+    (matches!(style.width, Sizing::Fixed(_)) && matches!(style.height, Sizing::Fixed(_)))
+        || style.scrollable
+        || style.clip
 }
 
 fn is_hidden<A: Allocator + Copy + 'static>(world: &World<A>, entity: Entity) -> bool {

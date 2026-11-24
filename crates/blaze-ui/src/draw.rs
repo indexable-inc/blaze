@@ -9,9 +9,45 @@ use core::alloc::Allocator;
 
 use blaze_own::Vec as OwnVec;
 
+use crate::components::GpuSlot;
 use crate::error::UiError;
 use crate::shaders::{ClipRectGpu, GlyphInst, RectInst, ViewportUniform, prim_kind};
 use crate::types::{Rect, Rgba};
+
+/// Contiguous instance patch range (`[start .. start + count)`) for partial WebGPU `writeBuffer`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuPatch {
+    pub start: u32,
+    pub count: u32,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<GpuPatch>() == 8);
+};
+
+/// Off-screen hardware-clipped `RectInst` sentinel used to pad retained slab slack with 0 fragments.
+#[inline]
+pub const fn culled_rect_inst() -> RectInst {
+    RectInst {
+        rect: [-1000.0, -1000.0, -1000.0, -1000.0],
+        color: [0.0, 0.0, 0.0, 0.0],
+        border_color: [0.0, 0.0, 0.0, 0.0],
+        params: [0.0, 0.0, 0.0, 0.0],
+        clip_info: [0, 0, 0, 0],
+    }
+}
+
+/// Off-screen hardware-clipped `GlyphInst` sentinel used to pad retained slab slack with 0 fragments.
+#[inline]
+pub const fn culled_glyph_inst() -> GlyphInst {
+    GlyphInst {
+        rect: [-1000.0, -1000.0, -1000.0, -1000.0],
+        uv: [0.0, 0.0, 0.0, 0.0],
+        color: [0.0, 0.0, 0.0, 0.0],
+        clip_info: [0, 0, 0, 0],
+    }
+}
 
 /// Atlas grid dimensions matching the WebGPU Berkeley Mono HiDPI font atlas (16×8 cells).
 pub const ATLAS_COLS: f32 = 16.0;
@@ -46,7 +82,8 @@ fn usize_to_u32_sat(v: usize) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
 }
 
-/// Draw list frame buffers for base UI (`layer 0`) and floating overlays (`layer 1`).
+/// Draw list frame buffers for base UI (`layer 0`) and floating overlays (`layer 1`), supporting
+/// both full-frame rebuilds and $O(\Delta)$ retained in-place GPU buffer patching.
 pub struct DrawList<A: Allocator + Copy> {
     pub viewport: ViewportUniform,
     /// Monospace advance width as fraction of font height (Berkeley Mono ≈ 0.60).
@@ -56,6 +93,12 @@ pub struct DrawList<A: Allocator + Copy> {
     pub glyphs: OwnVec<GlyphInst, A>,
     pub overlay_rects: OwnVec<RectInst, A>,
     pub overlay_glyphs: OwnVec<GlyphInst, A>,
+    /// When `true`, the host uploads the full buffers; when `false`, only `*_patches` ranges need upload.
+    pub full_upload: bool,
+    pub rect_patches: OwnVec<GpuPatch, A>,
+    pub glyph_patches: OwnVec<GpuPatch, A>,
+    pub ov_rect_patches: OwnVec<GpuPatch, A>,
+    pub ov_glyph_patches: OwnVec<GpuPatch, A>,
     clip_stack: OwnVec<u32, A>,
     overlay_mode: bool,
 }
@@ -71,12 +114,17 @@ impl<A: Allocator + Copy> DrawList<A> {
             glyphs: OwnVec::new_in(alloc),
             overlay_rects: OwnVec::new_in(alloc),
             overlay_glyphs: OwnVec::new_in(alloc),
+            full_upload: true,
+            rect_patches: OwnVec::new_in(alloc),
+            glyph_patches: OwnVec::new_in(alloc),
+            ov_rect_patches: OwnVec::new_in(alloc),
+            ov_glyph_patches: OwnVec::new_in(alloc),
             clip_stack: OwnVec::new_in(alloc),
             overlay_mode: false,
         }
     }
 
-    /// Reset buffers for a new frame and seed clip slot `0` with the full viewport rect.
+    /// Reset buffers for a full-rebuild frame and seed clip slot `0` with the full viewport rect.
     pub fn begin_frame(&mut self, width: f32, height: f32, dpr: f32, time: f32) -> Result<(), UiError> {
         let w = width.max(1.0);
         let h = height.max(1.0);
@@ -86,6 +134,11 @@ impl<A: Allocator + Copy> DrawList<A> {
         self.glyphs.clear();
         self.overlay_rects.clear();
         self.overlay_glyphs.clear();
+        self.rect_patches.clear();
+        self.glyph_patches.clear();
+        self.ov_rect_patches.clear();
+        self.ov_glyph_patches.clear();
+        self.full_upload = true;
         self.clip_stack.clear();
         self.overlay_mode = false;
         self.clips
@@ -93,6 +146,164 @@ impl<A: Allocator + Copy> DrawList<A> {
             .map_err(|r| UiError::Alloc(r.why))?;
         self.clip_stack.try_push(0).map_err(|r| UiError::Alloc(r.why))?;
         Ok(())
+    }
+
+    /// Begin an incremental patch frame preserving existing GPU buffers and clearing patch lists.
+    pub fn begin_incremental_frame(&mut self, width: f32, height: f32, dpr: f32, time: f32) {
+        self.viewport = ViewportUniform { size: [width.max(1.0), height.max(1.0)], dpr: dpr.max(1.0), time };
+        self.rect_patches.clear();
+        self.glyph_patches.clear();
+        self.ov_rect_patches.clear();
+        self.ov_glyph_patches.clear();
+        self.full_upload = false;
+        self.overlay_mode = false;
+    }
+
+    /// Current rect & glyph counts for `layer` (`0` = base, `1` = overlay).
+    #[inline]
+    pub fn layer_counts(&self, layer: u8) -> (u32, u32) {
+        if layer > 0 {
+            (usize_to_u32_sat(self.overlay_rects.len()), usize_to_u32_sat(self.overlay_glyphs.len()))
+        } else {
+            (usize_to_u32_sat(self.rects.len()), usize_to_u32_sat(self.glyphs.len()))
+        }
+    }
+
+    /// Append off-screen hardware-culled slack instances so future in-place edits avoid rebuilds.
+    pub fn reserve_slack(&mut self, layer: u8, rect_slack: u32, glyph_slack: u32) -> Result<(), UiError> {
+        let (rects, glyphs) = if layer > 0 {
+            (&mut self.overlay_rects, &mut self.overlay_glyphs)
+        } else {
+            (&mut self.rects, &mut self.glyphs)
+        };
+        for _ in 0..rect_slack {
+            rects.try_push(culled_rect_inst()).map_err(|r| UiError::Alloc(r.why))?;
+        }
+        for _ in 0..glyph_slack {
+            glyphs.try_push(culled_glyph_inst()).map_err(|r| UiError::Alloc(r.why))?;
+        }
+        Ok(())
+    }
+
+    /// Patch `slot` in place with `new_rects` and `new_glyphs`, recording compact [`GpuPatch`]es.
+    ///
+    /// Returns `Ok(true)` if the new geometry fit inside `slot`'s reserved capacity, or `Ok(false)`
+    /// if the entity overflowed its slack and requires a full extract pass.
+    pub fn patch_slot(
+        &mut self,
+        slot: &mut GpuSlot,
+        new_rects: &[RectInst],
+        new_glyphs: &[GlyphInst],
+    ) -> Result<bool, UiError> {
+        let new_r_len = usize_to_u32_sat(new_rects.len());
+        let new_g_len = usize_to_u32_sat(new_glyphs.len());
+        if new_r_len > slot.rect_cap || new_g_len > slot.glyph_cap {
+            return Ok(false);
+        }
+
+        let (rects, glyphs, r_patches, g_patches) = if slot.layer > 0 {
+            (
+                &mut self.overlay_rects,
+                &mut self.overlay_glyphs,
+                &mut self.ov_rect_patches,
+                &mut self.ov_glyph_patches,
+            )
+        } else {
+            (
+                &mut self.rects,
+                &mut self.glyphs,
+                &mut self.rect_patches,
+                &mut self.glyph_patches,
+            )
+        };
+
+        let r_start = usize::try_from(slot.rect_start).unwrap_or(0);
+        let r_cap = usize::try_from(slot.rect_cap).unwrap_or(0);
+        let old_r_len = usize::try_from(slot.rect_len).unwrap_or(0);
+        if r_cap > 0 {
+            let r_end = r_start.saturating_add(r_cap);
+            let Some(dst) = rects.as_mut_slice().get_mut(r_start..r_end) else {
+                return Ok(false);
+            };
+            let span = new_rects.len().max(old_r_len).min(r_cap);
+            let mut lo = span;
+            let mut hi = 0usize;
+            for i in 0..span {
+                let next_v = new_rects.get(i).copied().unwrap_or_else(culled_rect_inst);
+                if let Some(cell) = dst.get_mut(i) {
+                    if *cell != next_v {
+                        *cell = next_v;
+                        if i < lo {
+                            lo = i;
+                        }
+                        hi = i + 1;
+                    }
+                }
+            }
+            if lo < hi {
+                r_patches
+                    .try_push(GpuPatch {
+                        start: slot.rect_start.saturating_add(usize_to_u32_sat(lo)),
+                        count: usize_to_u32_sat(hi - lo),
+                    })
+                    .map_err(|r| UiError::Alloc(r.why))?;
+            }
+        }
+
+        let g_start = usize::try_from(slot.glyph_start).unwrap_or(0);
+        let g_cap = usize::try_from(slot.glyph_cap).unwrap_or(0);
+        let old_g_len = usize::try_from(slot.glyph_len).unwrap_or(0);
+        if g_cap > 0 {
+            let g_end = g_start.saturating_add(g_cap);
+            let Some(dst) = glyphs.as_mut_slice().get_mut(g_start..g_end) else {
+                return Ok(false);
+            };
+            let span = new_glyphs.len().max(old_g_len).min(g_cap);
+            let mut lo = span;
+            let mut hi = 0usize;
+            for i in 0..span {
+                let next_v = new_glyphs.get(i).copied().unwrap_or_else(culled_glyph_inst);
+                if let Some(cell) = dst.get_mut(i) {
+                    if *cell != next_v {
+                        *cell = next_v;
+                        if i < lo {
+                            lo = i;
+                        }
+                        hi = i + 1;
+                    }
+                }
+            }
+            if lo < hi {
+                g_patches
+                    .try_push(GpuPatch {
+                        start: slot.glyph_start.saturating_add(usize_to_u32_sat(lo)),
+                        count: usize_to_u32_sat(hi - lo),
+                    })
+                    .map_err(|r| UiError::Alloc(r.why))?;
+            }
+        }
+
+        slot.rect_len = new_r_len;
+        slot.glyph_len = new_g_len;
+        Ok(true)
+    }
+
+    /// Total GPU bytes scheduled for incremental patch upload in this frame.
+    pub fn patched_bytes(&self) -> u32 {
+        let mut total: u32 = 0;
+        for p in self.rect_patches.as_slice() {
+            total = total.saturating_add(p.count.saturating_mul(80));
+        }
+        for p in self.ov_rect_patches.as_slice() {
+            total = total.saturating_add(p.count.saturating_mul(80));
+        }
+        for p in self.glyph_patches.as_slice() {
+            total = total.saturating_add(p.count.saturating_mul(64));
+        }
+        for p in self.ov_glyph_patches.as_slice() {
+            total = total.saturating_add(p.count.saturating_mul(64));
+        }
+        total
     }
 
     #[inline]
