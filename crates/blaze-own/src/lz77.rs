@@ -532,13 +532,15 @@ pub fn lz77_scan_default<A: Allocator>(
             }
 
             if m_ml >= 4 {
-                // Double-Fast `m_pos + 1` long-table override when current match is short.
+                // Double-Fast `m_pos + 1` lazy override: check `ht_long` when `m_ml < 24`,
+                // and `ht_short` (2-way tagged) when `m_ml < 12` to beat C zstd `-3` ratio.
                 if m_ml < 24 && m_pos < match_limit {
                     let p1 = m_pos + 1;
                     let next8 = read_u64_unaligned(base.add(p1));
                     let (hl1, el1) = hash7_tagged(next8, p1, DFAST_LONG_LOG);
                     let pl1 = *ht_long.add(hl1);
                     *ht_long.add(hl1) = el1;
+                    let mut upgraded = false;
                     if tag_matches(pl1, el1) {
                         let off1 = offset_from_entry(p1, pl1);
                         if off1 != 0 && off1 <= p1 && off1 <= win {
@@ -559,6 +561,54 @@ pub fn lz77_scan_default<A: Allocator>(
                                     m_prev = prev1;
                                     m_off = off1;
                                     m_ml = ml1;
+                                    upgraded = true;
+                                }
+                            }
+                        }
+                    }
+                    if !upgraded && m_ml < 12 {
+                        let (bs1, es1) = hash4_tagged(next8, p1, DFAST_SHORT_LOG);
+                        let ps1 = *ht_short.add(bs1);
+                        let es1_u64 = u64::from(es1);
+                        *ht_short.add(bs1) = (ps1 << 32) | es1_u64;
+                        let tp1 = (es1_u64 << 32) | es1_u64;
+                        let x1 = (ps1 ^ tp1) & TAG_PAIR_MASK;
+                        let sh0 = (x1 & 0xFFFF_FFFF) == 0;
+                        let sh1 = (x1 >> 32) == 0;
+                        if sh0 || sh1 {
+                            let [a0, a1, a2, a3, b0, b1, b2, b3] = ps1.to_le_bytes();
+                            let cands = [
+                                (sh0, u32::from_le_bytes([a0, a1, a2, a3])),
+                                (sh1, u32::from_le_bytes([b0, b1, b2, b3])),
+                            ];
+                            for (hit, ent) in cands {
+                                if !hit {
+                                    continue;
+                                }
+                                let off1 = offset_from_entry(p1, ent);
+                                if off1 != 0 && off1 <= p1 && off1 <= win {
+                                    let prev1 = p1 - off1;
+                                    let diff1 = next8 ^ read_u64_unaligned(base.add(prev1));
+                                    let smask =
+                                        if off1 < 65_536 { MASK_4BYTES } else { MASK_5BYTES };
+                                    if (diff1 & smask) == 0 {
+                                        let ml1 = if diff1 != 0 {
+                                            usize::try_from(diff1.trailing_zeros() >> 3)
+                                                .unwrap_or(4)
+                                        } else {
+                                            8 + match_len_ptr(
+                                                base.add(prev1 + 8),
+                                                base.add(p1 + 8),
+                                                b_end,
+                                            )
+                                        };
+                                        if ml1 > m_ml + 1 {
+                                            m_pos = p1;
+                                            m_prev = prev1;
+                                            m_off = off1;
+                                            m_ml = ml1;
+                                        }
+                                    }
                                 }
                             }
                         }

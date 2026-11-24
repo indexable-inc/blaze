@@ -269,6 +269,82 @@ fn decompose_usub_sat_const(view: &View<'_>, val: u32) -> Option<(u32, u128)> {
     None
 }
 
+/// Returns `Some(max_val)` if `val` is statically proven to lie in `0..=max_val` (unsigned)
+/// purely from its defining operation (`Lshr` by constant, `And` with mask, or `Zext`),
+/// independent of control-flow facts.
+fn proven_unsigned_max(view: &View<'_>, val: u32, depth: u8) -> Option<u128> {
+    if depth >= 8 {
+        return None;
+    }
+    let vi = to_idx(val);
+    if vi >= view.len() {
+        return None;
+    }
+    let ty = Ty(*view.tys.get(vi)?);
+    if !ty.is_scalar() || !ty.is_int() {
+        return None;
+    }
+    let bits = ty.bits(view.head.ptr_bits);
+    if bits == 0 || bits > 128 {
+        return None;
+    }
+    match view.op(vi) {
+        Op::Lshr => {
+            let at = to_idx(*view.data.get(vi)?);
+            let l = *view.extra.get(at)?;
+            let r = *view.extra.get(at + 1)?;
+            let (c, _) = const_int(view, to_idx(r))?;
+            if c < 1 || c >= u128::from(bits) {
+                return None;
+            }
+            let c_u32 = u32::try_from(c).ok()?;
+            let rem = bits - c_u32;
+            let shift_max = u128::MAX >> (128 - rem);
+            let refined = proven_unsigned_max(view, l, depth + 1)
+                .map_or(shift_max, |lm| (lm >> c_u32).min(shift_max));
+            Some(refined)
+        }
+        Op::And => {
+            let at = to_idx(*view.data.get(vi)?);
+            let l = *view.extra.get(at)?;
+            let r = *view.extra.get(at + 1)?;
+            let lm = const_int(view, to_idx(l))
+                .map(|(c, _)| c)
+                .or_else(|| proven_unsigned_max(view, l, depth + 1));
+            let rm = const_int(view, to_idx(r))
+                .map(|(c, _)| c)
+                .or_else(|| proven_unsigned_max(view, r, depth + 1));
+            match (lm, rm) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            }
+        }
+        Op::Zext => {
+            let src = *view.data.get(vi)?;
+            let src_idx = to_idx(src);
+            if src_idx >= view.len() {
+                return None;
+            }
+            let src_ty = Ty(*view.tys.get(src_idx)?);
+            if !src_ty.is_scalar() || !src_ty.is_int() {
+                return None;
+            }
+            let src_bits = src_ty.bits(view.head.ptr_bits);
+            if src_bits == 0 || src_bits > 128 {
+                return None;
+            }
+            let src_type_max = u128::MAX >> (128 - src_bits);
+            let refined = const_int(view, src_idx)
+                .map(|(c, _)| c)
+                .or_else(|| proven_unsigned_max(view, src, depth + 1))
+                .map_or(src_type_max, |sm| sm.min(src_type_max));
+            Some(refined)
+        }
+        _ => None,
+    }
+}
+
 fn eval_fact(view: &View<'_>, facts: &[RelFact], q_cond: IntCond, q_a: u32, q_b: u32) -> Option<bool> {
     // 1. Direct & symmetric relational match.
     for &f in facts {
@@ -291,6 +367,13 @@ fn eval_fact(view: &View<'_>, facts: &[RelFact], q_cond: IntCond, q_a: u32, q_b:
         None
     };
     if let Some((qx, qc_cond, qc, qw)) = q_const {
+        // 2a. Range-proven unsigned upper bounds from `Lshr`, `And`, and `Zext`.
+        if let Some(max_val) = proven_unsigned_max(view, qx, 0) {
+            if let Some(res) = eval_const_range(IntCond::Ule, max_val, qc_cond, qc, qw) {
+                return Some(res);
+            }
+        }
+        // 2b. Constant-comparison range propagation from dominating facts.
         for &f in facts {
             if f.a == qx {
                 if let Some((fc, fw)) = const_int(view, to_idx(f.b)) {
@@ -399,7 +482,7 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
 ) -> Result<BceOutput<A>, SimplifyError> {
     let blocks = view.blocks();
     let len = view.len();
-    if blocks < 2 {
+    if blocks == 0 {
         return Ok(BceOutput { func: view.to_func_in(alloc), stats: BceStats::default() });
     }
 
@@ -528,9 +611,6 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
             Some(v) => v.as_slice(),
             None => &[],
         };
-        if b_facts.is_empty() && b_bools.is_empty() {
-            continue;
-        }
         for inst in view.block(Block(to_u32(b))) {
             let op = view.op(inst);
             if op == Op::Icmp {
@@ -1105,5 +1185,141 @@ mod tests {
             let Outcome::Returned(c) = eval::run_in(bce.func.view(), &[Val::Int(nv)], 10_000, TestHeap).unwrap() else { panic!() };
             assert_eq!(a, c, "UsubSat BCE mismatch at n={nv}");
         }
+    }
+
+    #[test]
+    fn bce_lshr_proves_pow2_table_in_bounds() {
+        let build = |limit: u128| {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, ok, oob] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+            b.begin(entry);
+            let hash = b.param(Ty::I64);
+            let sh = b.iconst(Ty::I64, 49);
+            let idx = b.binary(Op::Lshr, Flags::NONE, hash, sh);
+            let lim = b.iconst(Ty::I64, limit);
+            let in_bounds = b.icmp(IntCond::Ult, idx, lim);
+            b.br(Flags::NONE, in_bounds, (ok, &[]), (oob, &[]));
+            b.begin(ok);
+            b.ret(&[idx]);
+            b.begin(oob);
+            b.trap(1);
+            b.finish_checked().unwrap()
+        };
+
+        // Positive: `(hash >> 49) < 32768` is always true for 64-bit `hash`.
+        let func_ok = build(32768);
+        let bce_ok = eliminate_redundant_checks(func_ok.view(), TestHeap).unwrap();
+        assert!(bce_ok.stats.checks_eliminated >= 1);
+        assert!(
+            !(0..bce_ok.func.view().len()).any(|k| bce_ok.func.view().op(k) == Op::Trap),
+            "`(hash >> 49) < 32768` trap must be eliminated!"
+        );
+        for &hv in &[0u128, 1, 1 << 49, u64::MAX as u128] {
+            let Outcome::Returned(a) = eval::run_in(func_ok.view(), &[Val::Int(hv)], 10_000, TestHeap).unwrap() else { panic!() };
+            let Outcome::Returned(c) = eval::run_in(bce_ok.func.view(), &[Val::Int(hv)], 10_000, TestHeap).unwrap() else { panic!() };
+            assert_eq!(a, c, "lshr BCE mismatch at hash={hv}");
+        }
+
+        // Negative control: `(hash >> 49) < 32767` can be false (when `hash == u64::MAX`, `idx == 32767`).
+        let func_bad = build(32767);
+        let bce_bad = eliminate_redundant_checks(func_bad.view(), TestHeap).unwrap();
+        assert_eq!(bce_bad.stats.checks_eliminated, 0);
+        assert!(
+            (0..bce_bad.func.view().len()).any(|k| bce_bad.func.view().op(k) == Op::Trap),
+            "`(hash >> 49) < 32767` trap must NOT be eliminated!"
+        );
+    }
+
+    #[test]
+    fn bce_and_mask_proves_table_in_bounds() {
+        let build = |limit: u128| {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, ok, oob] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+            b.begin(entry);
+            let state = b.param(Ty::I64);
+            let mask = b.iconst(Ty::I64, 255);
+            let idx = b.binary(Op::And, Flags::NONE, state, mask);
+            let lim = b.iconst(Ty::I64, limit);
+            let in_bounds = b.icmp(IntCond::Ult, idx, lim);
+            b.br(Flags::NONE, in_bounds, (ok, &[]), (oob, &[]));
+            b.begin(ok);
+            b.ret(&[idx]);
+            b.begin(oob);
+            b.trap(1);
+            b.finish_checked().unwrap()
+        };
+
+        // Positive: `(state & 255) < 256` is always true.
+        let func_ok = build(256);
+        let bce_ok = eliminate_redundant_checks(func_ok.view(), TestHeap).unwrap();
+        assert!(bce_ok.stats.checks_eliminated >= 1);
+        assert!(
+            !(0..bce_ok.func.view().len()).any(|k| bce_ok.func.view().op(k) == Op::Trap),
+            "`(state & 255) < 256` trap must be eliminated!"
+        );
+        for &sv in &[0u128, 255, 256, 1024, u64::MAX as u128] {
+            let Outcome::Returned(a) = eval::run_in(func_ok.view(), &[Val::Int(sv)], 10_000, TestHeap).unwrap() else { panic!() };
+            let Outcome::Returned(c) = eval::run_in(bce_ok.func.view(), &[Val::Int(sv)], 10_000, TestHeap).unwrap() else { panic!() };
+            assert_eq!(a, c, "and-mask BCE mismatch at state={sv}");
+        }
+
+        // Negative control: `(state & 255) < 255` can be false (when `state & 255 == 255`).
+        let func_bad = build(255);
+        let bce_bad = eliminate_redundant_checks(func_bad.view(), TestHeap).unwrap();
+        assert_eq!(bce_bad.stats.checks_eliminated, 0);
+        assert!(
+            (0..bce_bad.func.view().len()).any(|k| bce_bad.func.view().op(k) == Op::Trap),
+            "`(state & 255) < 255` trap must NOT be eliminated!"
+        );
+    }
+
+    #[test]
+    fn bce_zext_masked_proves_in_bounds() {
+        let build = |limit: u128| {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I32)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, ok, oob] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+            b.begin(entry);
+            let x = b.param(Ty::I32);
+            let mask = b.iconst(Ty::I32, 63);
+            let masked = b.binary(Op::And, Flags::NONE, x, mask);
+            let wide = b.convert(Op::Zext, Flags::NONE, Ty::I64, masked);
+            let lim = b.iconst(Ty::I64, limit);
+            let in_bounds = b.icmp(IntCond::Ult, wide, lim);
+            b.br(Flags::NONE, in_bounds, (ok, &[]), (oob, &[]));
+            b.begin(ok);
+            b.ret(&[wide]);
+            b.begin(oob);
+            b.trap(1);
+            b.finish_checked().unwrap()
+        };
+
+        // Positive: `zext(u32 -> u64, x & 63) < 64` is always true.
+        let func_ok = build(64);
+        let bce_ok = eliminate_redundant_checks(func_ok.view(), TestHeap).unwrap();
+        assert!(bce_ok.stats.checks_eliminated >= 1);
+        assert!(
+            !(0..bce_ok.func.view().len()).any(|k| bce_ok.func.view().op(k) == Op::Trap),
+            "`zext(u32 -> u64, x & 63) < 64` trap must be eliminated!"
+        );
+        for &xv in &[0u128, 63, 64, 255, u32::MAX as u128] {
+            let Outcome::Returned(a) = eval::run_in(func_ok.view(), &[Val::Int(xv)], 10_000, TestHeap).unwrap() else { panic!() };
+            let Outcome::Returned(c) = eval::run_in(bce_ok.func.view(), &[Val::Int(xv)], 10_000, TestHeap).unwrap() else { panic!() };
+            assert_eq!(a, c, "zext-masked BCE mismatch at x={xv}");
+        }
+
+        // Negative control: `zext(u32 -> u64, x & 63) < 63` can be false.
+        let func_bad = build(63);
+        let bce_bad = eliminate_redundant_checks(func_bad.view(), TestHeap).unwrap();
+        assert_eq!(bce_bad.stats.checks_eliminated, 0);
+        assert!(
+            (0..bce_bad.func.view().len()).any(|k| bce_bad.func.view().op(k) == Op::Trap),
+            "`zext(u32 -> u64, x & 63) < 63` trap must NOT be eliminated!"
+        );
     }
 }

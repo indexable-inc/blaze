@@ -130,6 +130,7 @@ pub mod planted;
 /// conversions — `#![no_std]`, zero dependencies, zero `transmute`.
 #[macro_use]
 pub mod pod;
+pub mod pow2_table;
 pub mod raw;
 pub mod rc;
 pub mod segs;
@@ -176,6 +177,7 @@ pub use heap4::{Heap4, Heap4Plant};
 pub use make::{CloneIn, DefaultIn, FromIn, FromStrIn, IntoIn, LocalShare, ParseIn, Share};
 pub use packed::{Pack, Packed};
 pub use pod::{AnyBitPattern, CastError, CheckedBitPattern, NoUninit, Pod, TransparentWrapper, Zeroable};
+pub use pow2_table::{Pow2Table, SlackSlice, low_u32, top_bits};
 pub use raw::RawBuf;
 pub use rc::Rc;
 pub use soa::Soa;
