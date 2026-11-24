@@ -2,7 +2,8 @@
 
 use core::alloc::Allocator;
 
-use blaze_own::{AllocFailure, Vec};
+use blaze_own::blaze_int::Cast;
+use blaze_own::{AllocFailure, Int, Pow2Array, Vec};
 
 use crate::ZstdError;
 
@@ -39,49 +40,51 @@ pub(crate) const ML_DEFAULT_NORM: [i16; 53] = [
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
 ];
 
-/// RFC 8878 §3.1.1.3.2.1.1 Literals_Length baselines for codes 0..=35.
-const LL_BASE: [u32; 36] = [
+/// RFC 8878 §3.1.1.3.2.1.1 Literals_Length baselines for codes 0..=35 (padded to 64 for masked indexing).
+const LL_BASE: Pow2Array<u32, 64> = Pow2Array::new([
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64,
     128, 256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536,
-];
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]);
 
-/// RFC 8878 §3.1.1.3.2.1.1 Literals_Length extra bit counts for codes 0..=35.
-const LL_BITS: [u8; 36] = [
+/// RFC 8878 §3.1.1.3.2.1.1 Literals_Length extra bit counts for codes 0..=35 (padded to 64).
+const LL_BITS: Pow2Array<u8, 64> = Pow2Array::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11,
     12, 13, 14, 15, 16,
-];
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]);
 
-/// Direct LUT mapping `lit_len` (`0..64`) to its Literals_Length code.
-#[cfg(test)]
-const LL_CODE_LUT: [u8; 64] = [
+/// Direct power-of-two LUT mapping `lit_len` (`0..64`) to its Literals_Length code.
+const LL_CODE_LUT: Pow2Array<u8, 64> = Pow2Array::new([
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20,
     20, 20, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23, 24, 24,
     24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
-];
+]);
 
-/// RFC 8878 §3.1.1.3.2.1.1 Match_Length baselines for codes 0..=52.
-const ML_BASE: [u32; 53] = [
+/// RFC 8878 §3.1.1.3.2.1.1 Match_Length baselines for codes 0..=52 (padded to 64 for masked indexing).
+const ML_BASE: Pow2Array<u32, 64> = Pow2Array::new([
     3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
     28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1_027,
     2_051, 4_099, 8_195, 16_387, 32_771, 65_539,
-];
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]);
 
-/// RFC 8878 §3.1.1.3.2.1.1 Match_Length extra bit counts for codes 0..=52.
-const ML_BITS: [u8; 53] = [
+/// RFC 8878 §3.1.1.3.2.1.1 Match_Length extra bit counts for codes 0..=52 (padded to 64).
+const ML_BITS: Pow2Array<u8, 64> = Pow2Array::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-];
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]);
 
-/// Direct LUT mapping `match_len - 3` (`0..128`) to its Match_Length code.
-#[cfg(test)]
-const ML_CODE_LUT: [u8; 128] = [
+/// Direct power-of-two LUT mapping `match_len - 3` (`0..128`) to its Match_Length code.
+const ML_CODE_LUT: Pow2Array<u8, 128> = Pow2Array::new([
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
     26, 27, 28, 29, 30, 31, 32, 32, 33, 33, 34, 34, 35, 35, 36, 36, 36, 36, 37, 37, 37, 37, 38, 38,
     38, 38, 38, 38, 38, 38, 39, 39, 39, 39, 39, 39, 39, 39, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40,
     40, 40, 40, 40, 40, 40, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 42, 42,
     42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42,
     42, 42, 42, 42, 42, 42,
-];
+]);
 
 const fn pack_seq(code: u32, bits: u32, base: u32) -> u32 {
     code | (bits << 8) | (base << 16)
@@ -143,21 +146,50 @@ pub(crate) const ML_ENC_PACKED: [u32; 128] = [
     pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99), pack_seq(42, 5, 99),
 ];
 
+/// Code-only LL lookup (`0..=35`) for sequence histogramming (zero `Option`, zero extra-bits math).
+#[inline(always)]
+pub(crate) fn ll_code_raw(lit_len: u32) -> usize {
+    if lit_len < 64 {
+        return usize::from(LL_CODE_LUT.get_masked(lit_len.widen_to::<usize>()));
+    }
+    if lit_len < 128 {
+        return 25;
+    }
+    (50u32 - lit_len.leading_zeros()).widen_to::<usize>()
+}
+
+/// Code-only ML lookup (`0..=52`) for sequence histogramming (zero `Option`, zero extra-bits math).
+#[inline(always)]
+pub(crate) fn ml_code_raw(match_len: u32) -> usize {
+    let m = match_len.saturating_sub(3);
+    if m < 128 {
+        return usize::from(ML_CODE_LUT.get_masked(m.widen_to::<usize>()));
+    }
+    (67u32 - m.leading_zeros()).widen_to::<usize>()
+}
+
+/// Code-only OF lookup (`0..=31`) for sequence histogramming (zero `Option`, zero extra-bits math).
+#[inline(always)]
+pub(crate) fn of_code_raw(offset_value: u32) -> usize {
+    (31u32 - (offset_value | 1).leading_zeros()).widen_to::<usize>()
+}
+
 /// Branchless single-LUT LL encoder for valid `lit_len < 131_072` (no `Option` overhead).
 #[inline(always)]
 pub(crate) fn encode_ll_raw(lit_len: u32) -> (u8, u32, u32) {
     if lit_len < 64 {
-        let idx = usize::try_from(lit_len).unwrap_or(0) & 63;
+        let idx = lit_len.widen_to::<usize>() & 63;
         let packed = LL_ENC_PACKED.get(idx).copied().unwrap_or(0);
-        let [code, bits_b, ..] = packed.to_le_bytes();
+        let code = packed.truncate_to::<u8>();
+        let bits = (packed >> 8) & 0xFF;
         let base = packed >> 16;
-        return (code, lit_len - base, u32::from(bits_b));
+        return (code, lit_len - base, bits);
     }
     if lit_len < 128 {
         return (25, lit_len - 64, 6);
     }
     let bits = 31u32 - lit_len.leading_zeros();
-    let [code, ..] = (bits + 19).to_le_bytes();
+    let code = (bits + 19).truncate_to::<u8>();
     let base = 1u32 << bits;
     (code, lit_len - base, bits)
 }
@@ -167,14 +199,15 @@ pub(crate) fn encode_ll_raw(lit_len: u32) -> (u8, u32, u32) {
 pub(crate) fn encode_ml_raw(match_len: u32) -> (u8, u32, u32) {
     let m = match_len.saturating_sub(3);
     if m < 128 {
-        let idx = usize::try_from(m).unwrap_or(0) & 127;
+        let idx = m.widen_to::<usize>() & 127;
         let packed = ML_ENC_PACKED.get(idx).copied().unwrap_or(0);
-        let [code, bits_b, ..] = packed.to_le_bytes();
+        let code = packed.truncate_to::<u8>();
+        let bits = (packed >> 8) & 0xFF;
         let base = packed >> 16;
-        return (code, match_len - base, u32::from(bits_b));
+        return (code, match_len - base, bits);
     }
     let bits = 31u32 - m.leading_zeros();
-    let [code, ..] = (bits + 36).to_le_bytes();
+    let code = (bits + 36).truncate_to::<u8>();
     let base = (1u32 << bits) + 3;
     (code, match_len - base, bits)
 }
@@ -183,7 +216,7 @@ pub(crate) fn encode_ml_raw(match_len: u32) -> (u8, u32, u32) {
 #[inline(always)]
 pub(crate) fn encode_of_raw(offset_value: u32) -> (u8, u32, u32) {
     let bits = 31u32 - offset_value.leading_zeros();
-    let [code, ..] = bits.to_le_bytes();
+    let code = bits.truncate_to::<u8>();
     (code, offset_value - (1u32 << bits), bits)
 }
 
@@ -263,8 +296,7 @@ impl<A: Allocator> BitWriter<A> {
         self.buf |= masked << self.bits;
         self.bits += n;
         if self.bits >= 32 {
-            let [b0, b1, b2, b3, ..] = self.buf.to_le_bytes();
-            self.out.try_extend_from_slice(&[b0, b1, b2, b3])?;
+            self.out.try_extend_from_slice(&self.buf.truncate_to::<u32>().to_le_bytes())?;
             self.buf >>= 32;
             self.bits -= 32;
         }
@@ -274,14 +306,12 @@ impl<A: Allocator> BitWriter<A> {
     /// Flush into an existing `Vec<u8, A>` (appending the finished reverse bitstream).
     pub(crate) fn finish_into(mut self, dst: &mut Vec<u8, A>) -> Result<(), AllocFailure> {
         while self.bits >= 8 {
-            let [b0, ..] = self.buf.to_le_bytes();
-            self.out.try_push(b0).map_err(|r| r.why)?;
+            self.out.try_push(self.buf.truncate_to::<u8>()).map_err(|r| r.why)?;
             self.buf >>= 8;
             self.bits -= 8;
         }
         self.buf |= 1u64 << self.bits;
-        let [b0, ..] = self.buf.to_le_bytes();
-        self.out.try_push(b0).map_err(|r| r.why)?;
+        self.out.try_push(self.buf.truncate_to::<u8>()).map_err(|r| r.why)?;
         dst.try_extend_from_slice(self.out.as_slice())
     }
 }
@@ -308,7 +338,7 @@ impl<'a> FwdBitReader<'a> {
             return 0;
         }
         let byte_idx = self.bit_pos / 8;
-        let bit_off = u32::try_from(self.bit_pos % 8).unwrap_or(0);
+        let bit_off = (self.bit_pos & 7).truncate_to::<u32>();
         let b0 = self.bytes.get(byte_idx).copied().unwrap_or(0);
         let b1 = self.bytes.get(byte_idx + 1).copied().unwrap_or(0);
         let b2 = self.bytes.get(byte_idx + 2).copied().unwrap_or(0);
@@ -319,7 +349,7 @@ impl<'a> FwdBitReader<'a> {
 
     #[inline]
     fn consume(&mut self, n: u32) -> Result<(), ZstdError> {
-        let adv = usize::try_from(n).map_err(|_| ZstdError::CorruptFse)?;
+        let adv = n.widen_to::<usize>();
         let next = self.bit_pos.checked_add(adv).ok_or(ZstdError::CorruptFse)?;
         if next > self.total_bits {
             return Err(ZstdError::CorruptFse);
@@ -355,8 +385,7 @@ impl<'a, A: Allocator> FwdBitWriter<'a, A> {
         self.buf |= masked << self.bits;
         self.bits += n;
         while self.bits >= 8 {
-            let [b0, ..] = self.buf.to_le_bytes();
-            self.out.try_push(b0).map_err(|r| r.why)?;
+            self.out.try_push(self.buf.truncate_to::<u8>()).map_err(|r| r.why)?;
             self.buf >>= 8;
             self.bits -= 8;
         }
@@ -365,8 +394,7 @@ impl<'a, A: Allocator> FwdBitWriter<'a, A> {
 
     pub(crate) fn finish(self) -> Result<(), AllocFailure> {
         if self.bits > 0 {
-            let [b0, ..] = self.buf.to_le_bytes();
-            self.out.try_push(b0).map_err(|r| r.why)?;
+            self.out.try_push(self.buf.truncate_to::<u8>()).map_err(|r| r.why)?;
         }
         Ok(())
     }
@@ -459,36 +487,63 @@ impl FseDecEntry {
     pub(crate) const ZERO: Self = Self { symbol: 0, num_bits: 0, baseline: 0 };
 }
 
-/// Pre-resolved sequence FSE decoding entry packed into one `u64` (single `ldr x` per table
-/// lookup instead of 4 separate field loads):
+/// Pre-resolved sequence FSE decoding entry packed into a single `u64` (`#[repr(transparent)]`)
+/// so each table lookup is one 64-bit load and all three active entries occupy just 3 GPRs:
 /// - bits `0..32`: `base: u32` (`LL_BASE`, `ML_BASE`, or `1 << of_code`)
-/// - bits `32..48`: `baseline: u16` (FSE next-state baseline)
+/// - bits `32..48`: `baseline: u16` (FSE next-state baseline, pre-biased by `0` / `512` / `1024`)
 /// - bits `48..56`: `extra_bits: u8`
 /// - bits `56..64`: `num_bits: u8` (FSE state transition bits)
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct SeqDecEntry(u64);
+pub(crate) struct SeqDecEntry(pub(crate) u64);
 
 impl SeqDecEntry {
     pub(crate) const ZERO: Self = Self(0);
 
     #[inline(always)]
     pub(crate) const fn new(base: u32, extra_bits: u8, num_bits: u8, baseline: u16) -> Self {
-        let [b0, b1, b2, b3] = base.to_le_bytes();
-        let [bl0, bl1] = baseline.to_le_bytes();
-        Self(u64::from_le_bytes([b0, b1, b2, b3, bl0, bl1, extra_bits, num_bits]))
+        Self(
+            Cast::<u32, u64>::widen(base)
+                | (Cast::<u16, u64>::widen(baseline) << 32)
+                | (Cast::<u8, u64>::widen(extra_bits) << 48)
+                | (Cast::<u8, u64>::widen(num_bits) << 56),
+        )
     }
 
-    /// Unpack `(base, extra_bits, num_bits, baseline)` from a single register value.
+    #[inline(always)]
+    pub(crate) fn base(self) -> u32 {
+        self.0.truncate_to::<u32>()
+    }
+
+    #[inline(always)]
+    pub(crate) fn baseline(self) -> usize {
+        ((self.0 >> 32) & 0xFFFF).truncate_to::<usize>()
+    }
+
+    #[inline(always)]
+    pub(crate) fn extra_bits(self) -> u32 {
+        ((self.0 >> 48) & 0xFF).truncate_to::<u32>()
+    }
+
+    #[inline(always)]
+    pub(crate) fn num_bits(self) -> u32 {
+        (self.0 >> 56).truncate_to::<u32>()
+    }
+
+    #[inline(always)]
+    pub(crate) fn extra_bits_u64(self) -> u64 {
+        (self.0 >> 48) & 0xFF
+    }
+
+    #[inline(always)]
+    pub(crate) fn num_bits_u64(self) -> u64 {
+        self.0 >> 56
+    }
+
+    /// Unpack `(base, extra_bits, num_bits, baseline)` using pure bit shifts.
     #[inline(always)]
     pub(crate) fn unpack(self) -> (u32, u32, u32, usize) {
-        let [b0, b1, b2, b3, bl0, bl1, eb, nb] = self.0.to_le_bytes();
-        (
-            u32::from_le_bytes([b0, b1, b2, b3]),
-            u32::from(eb),
-            u32::from(nb),
-            usize::from(u16::from_le_bytes([bl0, bl1])),
-        )
+        (self.base(), self.extra_bits(), self.num_bits(), self.baseline())
     }
 }
 
@@ -509,7 +564,7 @@ pub(crate) const SEQ_ML_OFFSET: usize = 1024;
 /// Contiguous power-of-two flat table holding pre-resolved LL, OF, and ML sequence FSE entries
 /// under a single base pointer register (OF baselines pre-biased by `+512`, ML by `+1024`).
 pub(crate) struct SeqTables {
-    entries: [SeqDecEntry; SEQ_TABLES_FLAT_LEN],
+    entries: Pow2Array<SeqDecEntry, SEQ_TABLES_FLAT_LEN>,
     ll_log: u8,
     of_log: u8,
     ml_log: u8,
@@ -521,7 +576,7 @@ pub(crate) struct SeqTables {
 impl SeqTables {
     pub(crate) const fn new_empty() -> Self {
         Self {
-            entries: [SeqDecEntry::ZERO; SEQ_TABLES_FLAT_LEN],
+            entries: Pow2Array::splat(SeqDecEntry::ZERO),
             ll_log: 0,
             of_log: 0,
             ml_log: 0,
@@ -558,10 +613,7 @@ impl SeqTables {
 
     #[inline(always)]
     pub(crate) fn entry_flat(&self, state: usize) -> SeqDecEntry {
-        self.entries
-            .get(state & (SEQ_TABLES_FLAT_LEN - 1))
-            .copied()
-            .unwrap_or(SeqDecEntry::ZERO)
+        self.entries.get_masked(state)
     }
 
     /// Compile an [`FseDecTable`] into the corresponding flat slice of `self`, pre-biasing
@@ -572,52 +624,66 @@ impl SeqTables {
             return Err(ZstdError::CorruptFse);
         }
         let table_size = 1usize << u32::from(log);
-        let (base_off, bias_u16): (usize, u16) = match kind {
-            SeqKind::Ll => (0, 0),
-            SeqKind::Of => (SEQ_OF_OFFSET, 512),
-            SeqKind::Ml => (SEQ_ML_OFFSET, 1024),
-        };
         let mut max_eb: u8 = 0;
-        for state in 0..table_size {
-            let e = dec.entry(state).ok_or(ZstdError::CorruptFse)?;
-            let (base, extra_bits) = match kind {
-                SeqKind::Ll => {
-                    let idx = usize::from(e.symbol);
-                    let b = *LL_BASE.get(idx).ok_or(ZstdError::CorruptSequences)?;
-                    let eb = *LL_BITS.get(idx).ok_or(ZstdError::CorruptSequences)?;
-                    (b, eb)
-                }
-                SeqKind::Of => {
-                    if usize::from(e.symbol) > OF_MAX_CODE {
-                        return Err(ZstdError::CorruptSequences);
-                    }
-                    (1u32 << u32::from(e.symbol), e.symbol)
-                }
-                SeqKind::Ml => {
-                    let idx = usize::from(e.symbol);
-                    let b = *ML_BASE.get(idx).ok_or(ZstdError::CorruptSequences)?;
-                    let eb = *ML_BITS.get(idx).ok_or(ZstdError::CorruptSequences)?;
-                    (b, eb)
-                }
-            };
-            if extra_bits > max_eb {
-                max_eb = extra_bits;
-            }
-            let biased_bl = e.baseline.checked_add(bias_u16).ok_or(ZstdError::CorruptFse)?;
-            if let Some(slot) = self.entries.get_mut(base_off + state) {
-                *slot = SeqDecEntry::new(base, extra_bits, e.num_bits, biased_bl);
-            }
-        }
         match kind {
             SeqKind::Ll => {
+                for state in 0..table_size {
+                    let e = dec.entry_masked(state);
+                    let idx = usize::from(e.symbol);
+                    if idx > LL_MAX_CODE {
+                        return Err(ZstdError::CorruptSequences);
+                    }
+                    let base = LL_BASE.get_masked(idx);
+                    let extra_bits = LL_BITS.get_masked(idx);
+                    if extra_bits > max_eb {
+                        max_eb = extra_bits;
+                    }
+                    self.entries.set_masked(
+                        state,
+                        SeqDecEntry::new(base, extra_bits, e.num_bits, e.baseline),
+                    );
+                }
                 self.ll_log = log;
                 self.ll_max_eb = max_eb;
             }
             SeqKind::Of => {
+                for state in 0..table_size {
+                    let e = dec.entry_masked(state);
+                    if usize::from(e.symbol) > OF_MAX_CODE {
+                        return Err(ZstdError::CorruptSequences);
+                    }
+                    let base = 1u32 << u32::from(e.symbol);
+                    let extra_bits = e.symbol;
+                    if extra_bits > max_eb {
+                        max_eb = extra_bits;
+                    }
+                    let biased_bl = e.baseline + 512;
+                    self.entries.set_masked(
+                        SEQ_OF_OFFSET + state,
+                        SeqDecEntry::new(base, extra_bits, e.num_bits, biased_bl),
+                    );
+                }
                 self.of_log = log;
                 self.of_max_eb = max_eb;
             }
             SeqKind::Ml => {
+                for state in 0..table_size {
+                    let e = dec.entry_masked(state);
+                    let idx = usize::from(e.symbol);
+                    if idx > ML_MAX_CODE {
+                        return Err(ZstdError::CorruptSequences);
+                    }
+                    let base = ML_BASE.get_masked(idx);
+                    let extra_bits = ML_BITS.get_masked(idx);
+                    if extra_bits > max_eb {
+                        max_eb = extra_bits;
+                    }
+                    let biased_bl = e.baseline + 1024;
+                    self.entries.set_masked(
+                        SEQ_ML_OFFSET + state,
+                        SeqDecEntry::new(base, extra_bits, e.num_bits, biased_bl),
+                    );
+                }
                 self.ml_log = log;
                 self.ml_max_eb = max_eb;
             }
@@ -628,13 +694,13 @@ impl SeqTables {
 
 /// Fixed-capacity FSE decoding table (up to `1 << 9 = 512` states, zero heap allocation).
 pub(crate) struct FseDecTable {
-    entries: [FseDecEntry; MAX_FSE_TABLE_SIZE],
+    entries: Pow2Array<FseDecEntry, MAX_FSE_TABLE_SIZE>,
     accuracy_log: u8,
 }
 
 impl FseDecTable {
     pub(crate) const fn new_empty() -> Self {
-        Self { entries: [FseDecEntry::ZERO; MAX_FSE_TABLE_SIZE], accuracy_log: 0 }
+        Self { entries: Pow2Array::splat(FseDecEntry::ZERO), accuracy_log: 0 }
     }
 
     #[inline(always)]
@@ -648,15 +714,18 @@ impl FseDecTable {
         if state >= size {
             return None;
         }
-        self.entries.get(state).copied()
+        self.entries.as_slice().get(state).copied()
+    }
+
+    #[inline(always)]
+    pub(crate) fn entry_masked(&self, state: usize) -> FseDecEntry {
+        self.entries.get_masked(state)
     }
 
     /// Configure this table as an RLE-mode single-symbol table (`accuracy_log = 0`).
     pub(crate) fn set_rle(&mut self, symbol: u8) {
         self.accuracy_log = 0;
-        if let Some(first) = self.entries.first_mut() {
-            *first = FseDecEntry { symbol, num_bits: 0, baseline: 0 };
-        }
+        self.entries.set_masked(0, FseDecEntry { symbol, num_bits: 0, baseline: 0 });
     }
 
     /// Build the FSE decoding table from a slice of normalized probabilities (`-1`, `0`, or `> 0`)
@@ -682,7 +751,11 @@ impl FseDecTable {
             let sym_u8 = u8::try_from(sym_idx).map_err(|_| ZstdError::CorruptFse)?;
             if prob == -1 {
                 high_threshold = high_threshold.checked_sub(1).ok_or(ZstdError::CorruptFse)?;
-                let slot = self.entries.get_mut(high_threshold).ok_or(ZstdError::CorruptFse)?;
+                let slot = self
+                    .entries
+                    .as_mut_slice()
+                    .get_mut(high_threshold)
+                    .ok_or(ZstdError::CorruptFse)?;
                 slot.symbol = sym_u8;
                 let next_slot = symbol_next.get_mut(sym_idx).ok_or(ZstdError::CorruptFse)?;
                 *next_slot = 1;
@@ -711,7 +784,7 @@ impl FseDecTable {
             let count = usize::try_from(prob).map_err(|_| ZstdError::CorruptFse)?;
             let sym_u8 = u8::try_from(sym_idx).map_err(|_| ZstdError::CorruptFse)?;
             for _ in 0..count {
-                let slot = self.entries.get_mut(pos).ok_or(ZstdError::CorruptFse)?;
+                let slot = self.entries.as_mut_slice().get_mut(pos).ok_or(ZstdError::CorruptFse)?;
                 slot.symbol = sym_u8;
                 pos = (pos + step) & table_mask;
                 let mut guard = table_size;
@@ -728,7 +801,7 @@ impl FseDecTable {
 
         // Third pass: compute `num_bits` and `baseline` for every state `0..table_size`.
         for state in 0..table_size {
-            let slot = self.entries.get_mut(state).ok_or(ZstdError::CorruptFse)?;
+            let slot = self.entries.as_mut_slice().get_mut(state).ok_or(ZstdError::CorruptFse)?;
             let sym_idx = usize::from(slot.symbol);
             let next_ref = symbol_next.get_mut(sym_idx).ok_or(ZstdError::CorruptFse)?;
             let next_state = *next_ref;
@@ -787,8 +860,7 @@ impl FseDecTable {
                 for _ in 0..=MAX_FSE_SYMBOLS {
                     let rep = reader.peek(2);
                     reader.consume(2)?;
-                    let rep_usize = usize::try_from(rep).map_err(|_| ZstdError::CorruptFse)?;
-                    symbol = symbol.saturating_add(rep_usize);
+                    symbol = symbol.saturating_add(rep.widen_to::<usize>());
                     if rep < 3 {
                         break;
                     }
@@ -1036,7 +1108,7 @@ impl FseEncTable {
         let table_size = 1usize << u32::from(log);
         let mut counts = [0u16; MAX_FSE_SYMBOLS];
         for state in 0..table_size {
-            let entry = dec.entry(state).ok_or(ZstdError::CorruptFse)?;
+            let entry = dec.entry_masked(state);
             let c = counts.get_mut(usize::from(entry.symbol)).ok_or(ZstdError::CorruptFse)?;
             *c = c.checked_add(1).ok_or(ZstdError::CorruptFse)?;
         }
@@ -1085,7 +1157,7 @@ impl FseEncTable {
         }
 
         for state in 0..table_size {
-            let entry = dec.entry(state).ok_or(ZstdError::CorruptFse)?;
+            let entry = dec.entry_masked(state);
             let sym = usize::from(entry.symbol);
             let pos_ref = write_pos.get_mut(sym).ok_or(ZstdError::CorruptFse)?;
             let idx = usize::from(*pos_ref);
@@ -1124,7 +1196,7 @@ impl FseEncTable {
         let bits = target & ((1u32 << nb) - 1);
         let u = (target + u32::from(self.table_size)) >> nb;
         let idx = usize::from(m.offset)
-            .wrapping_add(usize::try_from(u).unwrap_or(0))
+            .wrapping_add(u.widen_to::<usize>())
             .wrapping_sub(usize::from(m.count))
             & (MAX_ENC_TABLE_SIZE - 1);
         let prev_state = self.state_table.get(idx).copied().unwrap_or(0);
@@ -1147,7 +1219,7 @@ impl FseEncTable {
         let target = u32::from(target_state);
         let bits = target & ((1u32 << nb) - 1);
         let u = (target + u32::from(self.table_size)) >> nb;
-        let rel = usize::try_from(u.checked_sub(u32::from(m.count))?).ok()?;
+        let rel = u.checked_sub(u32::from(m.count))?.widen_to::<usize>();
         let prev_state = *self.state_table.get(usize::from(m.offset) + rel)?;
         Some((prev_state, bits, nb))
     }

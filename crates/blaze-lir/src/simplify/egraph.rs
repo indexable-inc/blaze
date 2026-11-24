@@ -485,6 +485,20 @@ fn scalar_int_mask(ty: Ty, ptr_bits: u32) -> Option<(u32, u128)> {
     Some((bits, mask))
 }
 
+/// Returns `true` when `op` is a scalar integer division or remainder whose known constant
+/// divisor `cb` (masked to the type's width via `mask`) can never trap:
+/// - `Op::Udiv | Op::Urem`: `cb != 0`
+/// - `Op::Sdiv | Op::Srem`: `cb != 0 && cb != mask` (neither `0` nor `-1`)
+#[inline]
+fn is_trap_free_div_rem_const(op: Op, cb: Option<u128>, mask: u128) -> bool {
+    let Some(c) = cb else { return false };
+    match op {
+        Op::Udiv | Op::Urem => c != 0,
+        Op::Sdiv | Op::Srem => c != 0 && c != mask,
+        _ => false,
+    }
+}
+
 #[inline]
 fn is_power_of_two_gt1(v: u128) -> bool {
     v > 1 && (v & (v - 1)) == 0
@@ -1137,19 +1151,25 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                         | Op::Rotl
                         | Op::Rotr
                         | Op::Udiv
-                        | Op::Urem => {
+                        | Op::Urem
+                        | Op::Sdiv
+                        | Op::Srem => {
                             let Some((bits, mask)) = scalar_int_mask(ty, ptr_bits) else { continue };
-                            let at = view.data[inst] as usize;
-                            let a = stands[view.extra[at] as usize];
-                            let b = stands[view.extra[at + 1] as usize];
-                            let ca = known_const[a as usize];
-                            let cb = known_const[b as usize];
+                            let Some(at) = get_u32(view.data, inst).map(u32_ix) else { continue };
+                            let Some((raw_a, raw_b)) = extra_pair(&view, at) else { continue };
+                            let Some(a) = stand_of(&stands, raw_a) else { continue };
+                            let Some(b) = stand_of(&stands, raw_b) else { continue };
+                            let ca = get_const(&known_const, a);
+                            let cb = get_const(&known_const, b);
 
-                            // 1. Exact constant folding (trapping div/rem by zero returns Err -> skipped).
+                            // 1. Exact constant folding (trapping div/rem returns Err -> skipped;
+                            //    never drop `srem(_, -1)`).
                             if let (Some(va), Some(vb)) = (ca, cb) {
-                                if let Ok(res) = binary(op, va, vb, bits) {
-                                    known_const[inst] = Some(res);
-                                    edit_const[inst] = Some(res);
+                                if !(op == Op::Srem && vb == mask)
+                                    && let Ok(res) = binary(op, va, vb, bits)
+                                {
+                                    set_at(&mut known_const, inst, Some(res));
+                                    set_at(&mut edit_const, inst, Some(res));
                                     stats.constants_folded += 1;
                                     continue;
                                 }
@@ -1260,31 +1280,49 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                                         stats.strength_reductions += 1;
                                     }
                                 }
+                                Op::Sdiv => {
+                                    if cb == Some(1) && mask != 1 {
+                                        folded_val = Some(a);
+                                    }
+                                }
+                                Op::Srem => {
+                                    if cb == Some(1) && mask != 1 {
+                                        folded_const = Some(0);
+                                    }
+                                }
                                 _ => {}
                             }
 
                             if let Some(target) = folded_val {
-                                stands[inst] = target;
-                                known_const[inst] = known_const[target as usize];
+                                set_at(&mut stands, inst, target);
+                                copy_const(&mut known_const, inst, target);
+                                if is_trap_free_div_rem_const(op, cb, mask) {
+                                    set_at(&mut inst_kept, inst, false);
+                                }
                                 stats.identities_folded += 1;
                                 continue;
                             }
                             if let Some(cval) = folded_const {
-                                known_const[inst] = Some(cval);
-                                edit_const[inst] = Some(cval);
+                                set_at(&mut known_const, inst, Some(cval));
+                                set_at(&mut edit_const, inst, Some(cval));
                                 stats.identities_folded += 1;
                                 continue;
                             }
 
-                            // 3. Dominator-scoped GVN (skip potentially-trapping Udiv/Urem unless divisor known nonzero).
-                            if matches!(op, Op::Udiv | Op::Urem) && cb.map_or(true, |v| v == 0) {
+                            // 3. Dominator-scoped GVN (skip potentially-trapping div/rem unless divisor is proven trap-free).
+                            if matches!(op, Op::Udiv | Op::Urem | Op::Sdiv | Op::Srem)
+                                && !is_trap_free_div_rem_const(op, cb, mask)
+                            {
                                 continue;
                             }
                             let (ka, kb) = if is_commutative(op) && a > b { (b, a) } else { (a, b) };
-                            let key = ENodeKey { op: op as u8, ty: ty.0, cond: 0, a: ka, b: kb, c: 0 };
-                            if let Some(prev) = table.get_or_insert(key, inst as u32) {
-                                stands[inst] = prev;
-                                known_const[inst] = known_const[prev as usize];
+                            let key = ENodeKey { op: inst_op_byte(&view, inst), ty: ty.0, cond: 0, a: ka, b: kb, c: 0 };
+                            if let Some(prev) = table.get_or_insert(key, usize_u32(inst)) {
+                                set_at(&mut stands, inst, prev);
+                                copy_const(&mut known_const, inst, prev);
+                                if is_trap_free_div_rem_const(op, cb, mask) {
+                                    set_at(&mut inst_kept, inst, false);
+                                }
                                 stats.gvn_hits += 1;
                             }
                         }
@@ -4358,5 +4396,143 @@ mod tests {
                 other => panic!("expected Returned, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn aegraph_eliminates_folded_udiv_by_one_and_preserves_trapping_div_rem() {
+        use crate::eval::Trap;
+
+        let alloc = TestHeap;
+
+        // 1. Exact `offset_from_unsigned` pattern: `udiv (sub a, b), 1` plus folded-constant
+        //    divisor `sub(2, 1)`, `sdiv(_, 1)`, and `urem(_, 1)` -> folds to `sub a, b` with
+        //    ZERO `Op::Udiv` / `Op::Sdiv` / `Op::Urem` / `Op::Srem` remaining!
+        let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let a = b.param(Ty::I64);
+        let bv = b.param(Ty::I64);
+        let diff = b.binary(Op::Sub, Flags::NONE, a, bv);
+        let one = b.iconst(Ty::I64, 1);
+        let two = b.iconst(Ty::I64, 2);
+        let folded_one = b.binary(Op::Sub, Flags::NONE, two, one);
+        let q1 = b.binary(Op::Udiv, Flags::NONE, diff, one);
+        let q2 = b.binary(Op::Udiv, Flags::NONE, q1, folded_one);
+        let q3 = b.binary(Op::Sdiv, Flags::NONE, q2, one);
+        let r0 = b.binary(Op::Urem, Flags::NONE, a, one);
+        let sr0 = b.binary(Op::Srem, Flags::NONE, bv, one);
+        let s1 = b.binary(Op::Add, Flags::NONE, q3, r0);
+        let out_v = b.binary(Op::Add, Flags::NONE, s1, sr0);
+        b.ret(&[out_v]);
+        let func = b.finish_checked().unwrap();
+
+        let opt = aegraph_optimize(func.view(), alloc).unwrap();
+        let ov = opt.func.view();
+        for i in 0..ov.len() {
+            assert!(
+                !matches!(ov.op(i), Op::Udiv | Op::Sdiv | Op::Urem | Op::Srem),
+                "expected zero div/rem ops after folding by 1, found {:?} at {i}",
+                ov.op(i)
+            );
+        }
+        for &(av, bval) in &[(0u64, 0u64), (100, 42), (u64::MAX, 17), (i64::MIN.cast_unsigned(), 1)] {
+            let args = [Val::Int(u128::from(av)), Val::Int(u128::from(bval))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(ov, &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "div-by-1 fold mismatch on ({av}, {bval})");
+        }
+
+        // Also check `Flags::EXACT | Flags::NONZERO` (as emitted by `offset_from_unsigned` on `u8`).
+        let mut be = Builder::<TestHeap, Full>::new_in(64, alloc);
+        let sig_e = be.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        be.set_signature(sig_e);
+        let ee = be.create_block(BlockKind::Normal);
+        be.begin(ee);
+        let ea = be.param(Ty::I64);
+        let eb = be.param(Ty::I64);
+        let ediff = be.binary(Op::Sub, Flags::NONE, ea, eb);
+        let eone = be.iconst(Ty::I64, 1);
+        let eq = be.binary(Op::Udiv, Flags::EXACT | Flags::NONZERO, ediff, eone);
+        be.ret(&[eq]);
+        let func_e = be.finish_checked().unwrap();
+        let opt_e = aegraph_optimize(func_e.view(), alloc).unwrap();
+        assert!(
+            !(0..opt_e.func.view().len()).any(|i| opt_e.func.view().op(i) == Op::Udiv),
+            "expected `udiv exact nonzero (diff, 1)` to be completely eliminated"
+        );
+
+        // 2. Duplicate trap-free `udiv(x, 3)` GVN drops the redundant second `udiv`.
+        let mut bg = Builder::<TestHeap, Full>::new_in(64, alloc);
+        let sig_g = bg.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        bg.set_signature(sig_g);
+        let eg = bg.create_block(BlockKind::Normal);
+        bg.begin(eg);
+        let gx = bg.param(Ty::I64);
+        let c3 = bg.iconst(Ty::I64, 3);
+        let d1 = bg.binary(Op::Udiv, Flags::NONE, gx, c3);
+        let d2 = bg.binary(Op::Udiv, Flags::NONE, gx, c3);
+        let sum = bg.binary(Op::Add, Flags::NONE, d1, d2);
+        bg.ret(&[sum]);
+        let func_g = bg.finish_checked().unwrap();
+        let opt_g = aegraph_optimize(func_g.view(), alloc).unwrap();
+        let udiv_cnt = (0..opt_g.func.view().len())
+            .filter(|&i| opt_g.func.view().op(i) == Op::Udiv)
+            .count();
+        assert_eq!(udiv_cnt, 1, "expected duplicate trap-free `udiv(x, 3)` eliminated by GVN");
+
+        // 3. Potentially-trapping `udiv(x, 0)`, `sdiv(x, -1)`, `srem(x, -1)`, and `udiv(x, y)`
+        //    MUST be preserved even when their result is unused!
+        let check_kept = |op: Op, rhs_const: Option<u128>, test_x: u64, test_y: u64, expect_trap: Option<Trap>| {
+            let mut bt = Builder::<TestHeap, Full>::new_in(64, alloc);
+            let sig_t = bt.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            bt.set_signature(sig_t);
+            let et = bt.create_block(BlockKind::Normal);
+            bt.begin(et);
+            let tx = bt.param(Ty::I64);
+            let ty_p = bt.param(Ty::I64);
+            let rhs = match rhs_const {
+                Some(c) => bt.iconst(Ty::I64, c),
+                None => ty_p,
+            };
+            let _dead_trap = bt.binary(op, Flags::NONE, tx, rhs);
+            bt.ret(&[tx]);
+            let ft = bt.finish_checked().unwrap();
+
+            let ot = aegraph_optimize(ft.view(), alloc).unwrap();
+            let cnt = (0..ot.func.view().len()).filter(|&i| ot.func.view().op(i) == op).count();
+            assert_eq!(cnt, 1, "expected trapping {op:?} (rhs={rhs_const:?}) preserved by aegraph");
+
+            let args = [Val::Int(u128::from(test_x)), Val::Int(u128::from(test_y))];
+            let before = eval::run_in(ft.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(ot.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after);
+            if let Some(trap) = expect_trap {
+                assert_eq!(after, Outcome::<TestHeap>::Trapped(trap));
+            }
+        };
+
+        let neg1_u64 = u128::from(u64::MAX);
+        let smin_u64 = i64::MIN.cast_unsigned();
+        check_kept(Op::Udiv, Some(0), 10, 1, Some(Trap::DivByZero));
+        check_kept(Op::Sdiv, Some(neg1_u64), smin_u64, 1, Some(Trap::DivOverflow));
+        check_kept(Op::Srem, Some(neg1_u64), smin_u64, 1, None);
+        check_kept(Op::Udiv, None, 10, 0, Some(Trap::DivByZero));
     }
 }

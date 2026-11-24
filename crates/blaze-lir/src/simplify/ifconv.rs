@@ -144,6 +144,12 @@ struct SwitchPattern {
 
 #[derive(Clone, Copy)]
 enum IfPattern {
+    /// `head` branches on `cond` to the same block `(join, t_args)` / `(join, e_args)`.
+    DirectSelect {
+        head: u32,
+        cond: u32,
+        join: u32,
+    },
     /// `b` branches on `cond` to `(arm, [])` and `(join, direct_args)`; `arm` jumps to `(join, arm_args)`.
     /// `arm_is_then == true` means `arm` is the `then` branch; `false` means `arm` is the `else` branch.
     Triangle {
@@ -827,6 +833,16 @@ fn find_if_pattern<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Option<IfP
         let e_blk = at_u32(view.extra, e_at);
         let e_argc = to_idx(at_u32(view.extra, e_at + 1));
         if t_blk == e_blk {
+            let join = t_blk;
+            if join != head && view.block_kind(Block(join)) == BlockKind::Normal {
+                let params = view.params(Block(join));
+                if t_argc == params.len()
+                    && e_argc == params.len()
+                    && join_args_selectable(join, at + 3, e_at + 2)
+                {
+                    return Some(IfPattern::DirectSelect { head, cond, join });
+                }
+            }
             continue;
         }
 
@@ -1081,7 +1097,9 @@ fn apply_if_pattern<A: Allocator + Copy>(
     let mut canonicalized = 0u32;
 
     let head = match pat {
-        IfPattern::Triangle { head, .. } | IfPattern::Diamond { head, .. } => head,
+        IfPattern::DirectSelect { head, .. }
+        | IfPattern::Triangle { head, .. }
+        | IfPattern::Diamond { head, .. } => head,
         IfPattern::Switch(sw) => sw.head,
     };
 
@@ -1102,6 +1120,21 @@ fn apply_if_pattern<A: Allocator + Copy>(
                 IfPattern::Switch(sw) => {
                     emit_switch_head(view, sw, &mut val_map, &mut fixups, &mut func, alloc);
                     continue;
+                }
+                IfPattern::DirectSelect { cond, join, .. } => {
+                    let at = to_idx(at_u32(view.data, term));
+                    let t_argc = to_idx(at_u32(view.extra, at + 2));
+                    let e_at = at + 3 + t_argc;
+                    let e_argc = to_idx(at_u32(view.extra, e_at + 1));
+                    let mut t_args: Vec<u32, A> = Vec::with_capacity_in(t_argc, alloc);
+                    for k in 0..t_argc {
+                        t_args.push(at_u32(view.extra, at + 3 + k));
+                    }
+                    let mut e_args: Vec<u32, A> = Vec::with_capacity_in(e_argc, alloc);
+                    for k in 0..e_argc {
+                        e_args.push(at_u32(view.extra, e_at + 2 + k));
+                    }
+                    (cond, join, t_args, e_args)
                 }
                 IfPattern::Triangle { cond, arm, join, arm_is_then, .. } => {
                     let at = to_idx(at_u32(view.data, term));
@@ -1214,6 +1247,7 @@ fn apply_if_pattern<A: Allocator + Copy>(
                 //   `Select(c, acc + x, acc) -> acc + Select(c, x, 0)`
                 //   `Select(c, acc, acc + x) -> acc + Select(c, 0, x)`
                 if cond_new != NONE
+                    && fixups.is_empty()
                     && let Some((rop, x, id)) = match_reduction_on_acc(&func, tv, ev, pty)
                 {
                     let id_c = push_iconst(&mut func, pty, id);
@@ -1222,6 +1256,7 @@ fn apply_if_pattern<A: Allocator + Copy>(
                     merged_vals.push((upd, None));
                     canonicalized += 1;
                 } else if cond_new != NONE
+                    && fixups.is_empty()
                     && let Some((rop, x, id)) = match_reduction_on_acc(&func, ev, tv, pty)
                 {
                     let id_c = push_iconst(&mut func, pty, id);
@@ -1253,6 +1288,7 @@ fn apply_if_pattern<A: Allocator + Copy>(
             push_inst(&mut func, Op::Jump, Flags::NONE, Ty::NONE, jat);
         } else {
             let is_dead_arm = match pat {
+                IfPattern::DirectSelect { .. } => false,
                 IfPattern::Triangle { arm, .. } => b32 == arm,
                 IfPattern::Diamond { t_arm, e_arm, .. } => b32 == t_arm || b32 == e_arm,
                 IfPattern::Switch(sw) => {
@@ -1289,9 +1325,9 @@ fn apply_if_pattern<A: Allocator + Copy>(
     Ok((c, canonicalized))
 }
 
-/// Converts pure diamond/triangle branches and small pure `Op::Switch` dispatches into branchless
-/// `Op::Select`s (up to `max_converts`), canonicalizing conditional reductions and coalescing
-/// resulting straight-line blocks.
+/// Converts same-target branches (`Br(c, (join, t), (join, e))`), pure diamond/triangle branches,
+/// and small pure `Op::Switch` dispatches into branchless `Op::Select`s (up to `max_converts`),
+/// canonicalizing conditional reductions and coalescing resulting straight-line blocks.
 pub fn if_convert<A: Allocator + Copy>(
     view: View<'_>,
     max_converts: u32,
@@ -1819,6 +1855,174 @@ mod tests {
                     eval::run_in(func.view(), &args, 10_000, TestHeap).unwrap(),
                     eval::run_in(out.func.view(), &args, 10_000, TestHeap).unwrap(),
                     "sparse I64 mismatch at op={ov}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn if_convert_direct_select_same_target_branch_to_select() {
+        // 1. Six chained same-target branches (`Br(cond, (join, t_args), (join, e_args))`),
+        //    mirroring Zstd repeat-offset resolution after `thread_jumps` + `coalesce_cfg`
+        //    folds pure `if cond { a } else { b }` arms, including multi-arg joins with both
+        //    differing and identical parameters.
+        {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                ],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let [b0, b1, b2, b3, b4, b5, b6] = [(); 7].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(b0);
+            let raw_off = b.param(Ty::I64);
+            let ll = b.param(Ty::I64);
+            let r1 = b.param(Ty::I64);
+            let r2 = b.param(Ty::I64);
+            let r3 = b.param(Ty::I64);
+            let k0 = b.iconst(Ty::I64, 0);
+            let k1 = b.iconst(Ty::I64, 1);
+            let k2 = b.iconst(Ty::I64, 2);
+            let k3 = b.iconst(Ty::I64, 3);
+            let k7 = b.iconst(Ty::I64, 7);
+            let k13 = b.iconst(Ty::I64, 13);
+            let raw_m1 = b.binary(Op::Sub, Flags::NONE, raw_off, k1);
+            let c0 = b.icmp(IntCond::Eq, ll, k0);
+            b.br(Flags::NONE, c0, (b1, &[raw_off, r1]), (b1, &[raw_m1, r1]));
+
+            b.begin(b1);
+            let adj = b.param(Ty::I64);
+            let cur_r1 = b.param(Ty::I64);
+            let c1 = b.icmp(IntCond::Eq, adj, k0);
+            b.br(Flags::NONE, c1, (b2, &[cur_r1]), (b2, &[r2]));
+
+            b.begin(b2);
+            let cand1 = b.param(Ty::I64);
+            let c2 = b.icmp(IntCond::Eq, adj, k1);
+            b.br(Flags::NONE, c2, (b3, &[r2]), (b3, &[cand1]));
+
+            b.begin(b3);
+            let cand2 = b.param(Ty::I64);
+            let c3 = b.icmp(IntCond::Eq, adj, k2);
+            b.br(Flags::NONE, c3, (b4, &[r3, cur_r1]), (b4, &[cand2, r2]));
+
+            b.begin(b4);
+            let cand3 = b.param(Ty::I64);
+            let new_r2 = b.param(Ty::I64);
+            let r1_m1 = b.binary(Op::Sub, Flags::NONE, cur_r1, k1);
+            let c4 = b.icmp(IntCond::Eq, adj, k3);
+            b.br(Flags::NONE, c4, (b5, &[r1_m1, new_r2]), (b5, &[cand3, new_r2]));
+
+            b.begin(b5);
+            let rep_off = b.param(Ty::I64);
+            let final_r2 = b.param(Ty::I64);
+            let lit_off = b.binary(Op::Sub, Flags::NONE, raw_off, k3);
+            let c5 = b.icmp(IntCond::Ugt, raw_off, k3);
+            b.br(
+                Flags::NONE,
+                c5,
+                (b6, &[lit_off, lit_off, cur_r1, final_r2]),
+                (b6, &[rep_off, rep_off, cur_r1, r3]),
+            );
+
+            b.begin(b6);
+            let off = b.param(Ty::I64);
+            let new_r1 = b.param(Ty::I64);
+            let next_r2 = b.param(Ty::I64);
+            let next_r3 = b.param(Ty::I64);
+            let t0 = b.binary(Op::Mul, Flags::NONE, off, k7);
+            let t1 = b.binary(Op::Mul, Flags::NONE, new_r1, k13);
+            let t2 = b.binary(Op::Xor, Flags::NONE, t0, t1);
+            let t3 = b.binary(Op::Mul, Flags::NONE, next_r2, k3);
+            let t4 = b.binary(Op::Add, Flags::NONE, t2, t3);
+            let out_val = b.binary(Op::Add, Flags::NONE, t4, next_r3);
+            b.ret(&[out_val]);
+
+            let func = b.finish_checked().unwrap();
+            let out = if_convert(func.view(), 32, TestHeap).unwrap();
+            assert!(
+                out.stats.branches_converted >= 6,
+                "expected all 6 chained same-target branches converted: {:?}",
+                out.stats
+            );
+            assert!(verify(out.func.view()).is_ok());
+            let brs = (0..out.func.view().len()).filter(|&i| out.func.view().op(i) == Op::Br).count();
+            assert_eq!(brs, 0, "expected zero Op::Br remaining after DirectSelect if-conversion");
+            assert_eq!(out.func.view().blocks(), 1, "expected all 7 blocks coalesced into 1");
+            let selects = (0..out.func.view().len()).filter(|&i| out.func.view().op(i) == Op::Select).count();
+            assert_eq!(selects, 9, "expected 9 Op::Selects (skipping identical args)");
+
+            for &raw_v in &[0u128, 1, 2, 3, 4, 5, 100] {
+                for &ll_v in &[0u128, 1, 7] {
+                    let args = [Val::Int(raw_v), Val::Int(ll_v), Val::Int(11), Val::Int(29), Val::Int(71)];
+                    assert_eq!(
+                        eval::run_in(func.view(), &args, 10_000, TestHeap).unwrap(),
+                        eval::run_in(out.func.view(), &args, 10_000, TestHeap).unwrap(),
+                        "DirectSelect chain mismatch at raw_off={raw_v}, ll={ll_v}",
+                    );
+                }
+            }
+        }
+
+        // 2. Loop-latch same-target branch to a multi-predecessor loop header, also verifying
+        //    conditional reduction canonicalization (`Select(c, acc + i, acc) -> acc + Select(c, i, 0)`).
+        {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let n = b.param(Ty::I64);
+            let thresh = b.param(Ty::I64);
+            let z = b.iconst(Ty::I64, 0);
+            let c1 = b.iconst(Ty::I64, 1);
+            b.jump((hdr, &[z, z]));
+
+            b.begin(hdr);
+            let i = b.param(Ty::I64);
+            let acc = b.param(Ty::I64);
+            let keep = b.icmp(IntCond::Ult, i, n);
+            b.br(Flags::NONE, keep, (body, &[]), (exit, &[acc]));
+
+            b.begin(body);
+            let gt = b.icmp(IntCond::Ugt, i, thresh);
+            let acc_add = b.binary(Op::Add, Flags::NONE, acc, i);
+            let i2 = b.binary(Op::Add, Flags::NONE, i, c1);
+            b.br(Flags::NONE, gt, (hdr, &[i2, acc_add]), (hdr, &[i2, acc]));
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+            let func = b.finish_checked().unwrap();
+
+            let out = if_convert(func.view(), 32, TestHeap).unwrap();
+            assert_eq!(out.stats.branches_converted, 1);
+            assert_eq!(out.stats.reductions_canonicalized, 1);
+            assert!(verify(out.func.view()).is_ok());
+            assert_eq!(out.func.view().blocks(), 4);
+            let brs = (0..out.func.view().len()).filter(|&idx| out.func.view().op(idx) == Op::Br).count();
+            assert_eq!(brs, 1, "expected only the loop-exit Br to remain");
+            for &(nv, tv) in &[(0u128, 0u128), (10, 5), (20, 0), (20, 100), (17, 7)] {
+                let args = [Val::Int(nv), Val::Int(tv)];
+                assert_eq!(
+                    eval::run_in(func.view(), &args, 10_000, TestHeap).unwrap(),
+                    eval::run_in(out.func.view(), &args, 10_000, TestHeap).unwrap(),
+                    "loop-latch DirectSelect mismatch at n={nv}, thresh={tv}",
                 );
             }
         }

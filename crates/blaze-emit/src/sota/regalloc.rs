@@ -1191,6 +1191,53 @@ fn extract_remat_const(view: &View<'_>, inst: usize) -> Option<u64> {
     }
 }
 
+/// Number of AArch64 instructions (`1..=4`) required to materialize 64-bit integer constant `v`
+/// via `movz`/`movn` + `movk` or a single logical bitmask immediate.
+#[inline]
+fn const_mat_cost(v: u64) -> u32 {
+    if v == 0 || v == u64::MAX {
+        return 1;
+    }
+    let mut nz_chunks = 0u32;
+    let mut nf_chunks = 0u32;
+    for hw in 0..4u32 {
+        let chunk = (v >> (hw * 16)) & 0xffff;
+        if chunk != 0 {
+            nz_chunks += 1;
+        }
+        if chunk != 0xffff {
+            nf_chunks += 1;
+        }
+    }
+    let mov_cost = nz_chunks.min(nf_chunks).max(1);
+    if mov_cost == 1 || crate::enc::logical_imm(v, 64).is_some() {
+        1
+    } else {
+        mov_cost
+    }
+}
+
+/// Computes `(priority_weight, cheap_remat)` for register-allocation ordering and eviction cost.
+///
+/// Weights are in uniform instruction-cost units (`4 * uw` for a scalar stack spill, `2 * uw`
+/// for `adrp + add/ldr` global remat, and `const_mat_cost(v) * uw` for integer constants, with
+/// `5 * uw` for 4-inst 64-bit constants used inside loops so hot hash primes keep physical GPRs
+/// rather than rematerializing `movz + 3*movk` on every loop iteration).
+#[inline]
+fn candidate_priority(op: Op, remat_const: Option<u64>, uw: u32, in_loop: bool) -> (u32, bool) {
+    if let Some(cval) = remat_const {
+        let mat_cost = const_mat_cost(cval);
+        let scale = if mat_cost >= 4 && in_loop { 5 } else { mat_cost };
+        let weight = uw.saturating_mul(scale).max(1);
+        let cheap_remat = mat_cost <= 2 || !in_loop;
+        (weight, cheap_remat)
+    } else if matches!(op, Op::DataAddr | Op::FuncAddr) {
+        (uw.saturating_mul(2).max(1), true)
+    } else {
+        (uw.saturating_mul(4), false)
+    }
+}
+
 /// Seeds ABI register hints for entry parameters (including `sret` in `X8`), landing-pad
 /// exception parameters (`X0`), and `Op::Return` values (`X0`/`X1`/`V0`/`V1`).
 fn seed_abi_and_return_hints(view: &View<'_>, os: crate::Os, hint: &mut [u8]) {
@@ -1931,7 +1978,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
             continue;
         }
         if let Some(cval) = remat_val.get(inst).copied().flatten() {
-            let one_inst = cval <= 0xffff || (!cval) <= 0xffff;
+            let one_inst = const_mat_cost(cval) == 1;
             let crosses = val_crosses_call.get(inst).copied().unwrap_or(false);
             let depth = max_use_depth.get(inst).copied().unwrap_or(0);
             if crosses && one_inst && (depth == 0 || cval == 0) {
@@ -2136,10 +2183,10 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
         if vid_raw == NO_VAL {
             continue;
         }
-        let is_remat = remat_val.get(inst).copied().flatten().is_some()
-            || matches!(view.op(inst), Op::SlotAddr | Op::FuncAddr | Op::DataAddr);
+        let cval = remat_val.get(inst).copied().flatten();
         let uw = use_weight.get(inst).copied().unwrap_or(0);
-        let weight = if is_remat { (uw >> 2).max(1) } else { uw };
+        let in_loop = max_use_depth.get(inst).copied().unwrap_or(0) > 0;
+        let (weight, is_remat) = candidate_priority(view.op(inst), cval, uw, in_loop);
         prog_order.push(Candidate { inst, vid: idx(vid_raw), weight, is_remat });
     }
 
@@ -2278,7 +2325,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                     if let Some(slot) = loc_try.get_mut(inst) {
                         *slot = AllocLoc::GprPairSpill(s0, s1);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(8));
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(2));
                 }
             } else if is_vec128_ty(ty).is_some() || is_vec_mask_ty(ty).is_some() {
                 let vec_safe = |r: Reg| -> bool {
@@ -2342,7 +2389,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::VecSpill(slot);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(8));
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(2));
                 }
             } else if is_fp_ty(ty).is_some() {
                 let extract_lane0_hint = if view.op(inst) == Op::Extract {
@@ -2395,7 +2442,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::FpSpill(slot);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(4));
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
                 }
             } else {
                 let pair_trunc_hint = if view.op(inst) == Op::Trunc {
@@ -2460,13 +2507,13 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                         *slot = AllocLoc::RematGlobal(u32_of(inst));
                     }
                     remat_count += 1;
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(2));
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
                 } else {
                     let slot = alloc_spill_n(1, vid)?;
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::GprSpill(slot);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(4));
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
                 }
             }
         }
@@ -2651,6 +2698,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
     let mut last_use_pos: Vec<usize, A> = Vec::with_capacity_in(len, alloc);
     let mut has_any_use: Vec<bool, A> = Vec::with_capacity_in(len, alloc);
     let mut use_weight: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
+    let mut max_use_depth: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     let mut remat_val: Vec<Option<u64>, A> = Vec::with_capacity_in(len, alloc);
     let mut call_rpo_positions: Vec<(usize, usize), A> = Vec::new_in(alloc);
     let mut call_positions: Vec<usize, A> = Vec::new_in(alloc);
@@ -2658,11 +2706,13 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
         last_use_pos.push(rpo_pos.get(i).copied().unwrap_or(0));
         has_any_use.push(false);
         use_weight.push(0);
+        max_use_depth.push(0);
         remat_val.push(extract_remat_const(view, i));
     }
 
     for &b in &rpo_blocks {
-        let depth = block_depth.get(b).copied().unwrap_or(0).min(5);
+        let raw_depth = block_depth.get(b).copied().unwrap_or(0);
+        let depth = raw_depth.min(5);
         let b_weight = 1u32 << (depth * 4);
         let range = view.block(Block(u32_of(b)));
         for inst in range {
@@ -2685,6 +2735,11 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                     if let Some(w) = use_weight.get_mut(vi) {
                         *w = w.saturating_add(b_weight);
                     }
+                    if let Some(md) = max_use_depth.get_mut(vi) {
+                        if raw_depth > *md {
+                            *md = raw_depth;
+                        }
+                    }
                     if let Some(lu) = last_use_pos.get_mut(vi) {
                         if inst_pos > *lu {
                             *lu = inst_pos;
@@ -2700,6 +2755,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
         if skip_alloc.get(inst).copied().unwrap_or(false) {
             let consumer_end = last_use_pos.get(inst).copied().unwrap_or(0);
             let consumer_w = use_weight.get(inst).copied().unwrap_or(0);
+            let consumer_d = max_use_depth.get(inst).copied().unwrap_or(0);
             for_each_use(view, inst, |v| {
                 let vi = idx(v);
                 if let Some(lu) = last_use_pos.get_mut(vi) {
@@ -2710,6 +2766,11 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                 if let Some(w) = use_weight.get_mut(vi) {
                     if consumer_w > *w {
                         *w = consumer_w;
+                    }
+                }
+                if let Some(md) = max_use_depth.get_mut(vi) {
+                    if consumer_d > *md {
+                        *md = consumer_d;
                     }
                 }
             });
@@ -2936,10 +2997,10 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
         if ty == Ty::NONE || !has_any_use.get(inst).copied().unwrap_or(false) {
             continue;
         }
-        let is_remat = remat_val.get(inst).copied().flatten().is_some()
-            || matches!(view.op(inst), Op::SlotAddr | Op::FuncAddr | Op::DataAddr);
+        let cval = remat_val.get(inst).copied().flatten();
         let uw = use_weight.get(inst).copied().unwrap_or(0);
-        let weight = if is_remat { (uw >> 2).max(1) } else { uw };
+        let in_loop = max_use_depth.get(inst).copied().unwrap_or(0) > 0;
+        let (weight, is_remat) = candidate_priority(view.op(inst), cval, uw, in_loop);
         let end = last_use_pos.get(inst).copied().unwrap_or(pos).max(pos);
         prog_order.push(Candidate { inst, start: pos, end, weight, is_remat });
     }
@@ -3158,7 +3219,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                     if let Some(slot) = loc_try.get_mut(inst) {
                         *slot = AllocLoc::GprPairSpill(s0, s1);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(8));
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(2));
                 }
             } else if is_vec128_ty(ty).is_some() || is_vec_mask_ty(ty).is_some() {
                 // Under AAPCS64, callees preserve only the low 64 bits (`d8..d15`) of `v8..v15`.
@@ -3231,7 +3292,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::VecSpill(slot);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(8));
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(2));
                 }
             } else if is_fp_ty(ty).is_some() {
                 let extract_lane0_hint = if view.op(inst) == Op::Extract {
@@ -3292,7 +3353,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::FpSpill(slot);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(4));
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
                 }
             } else {
                 let pair_trunc_hint = if view.op(inst) == Op::Trunc {
@@ -3365,13 +3426,13 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                         *slot = AllocLoc::RematGlobal(u32_of(inst));
                     }
                     remat_count += 1;
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(2));
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
                 } else {
                     let slot = alloc_spill_n(1, start, end)?;
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::GprSpill(slot);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(4));
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
                 }
             }
         }
@@ -4391,6 +4452,116 @@ mod tests {
             assert!(
                 spill_count >= 3,
                 "{label}: expected at least 3 spilled i128 values across call, got {spill_count}"
+            );
+        }
+    }
+
+    #[test]
+    fn hot_loop_64bit_hash_primes_stay_in_gprs_under_pressure() {
+        // 1. Unit-check `const_mat_cost` across 1..=4 instruction constants.
+        assert_eq!(super::const_mat_cost(0), 1);
+        assert_eq!(super::const_mat_cost(u64::MAX), 1);
+        assert_eq!(super::const_mat_cost(0x1234), 1);
+        assert_eq!(super::const_mat_cost(0x1234_0000_0000_0000), 1);
+        assert_eq!(super::const_mat_cost(!0x1234u64), 1);
+        assert_eq!(super::const_mat_cost(0x00ff_00ff_00ff_00ff), 1);
+        assert_eq!(super::const_mat_cost(0x1234_5678), 2);
+        assert_eq!(super::const_mat_cost(0x0000_1234_5678_9abc), 3);
+        const HASH7_PRIME: u64 = 0x00cf_1bbc_dcb9_e377;
+        const HASH4_PRIME: u64 = 0x9e37_79b1_85eb_ca87;
+        assert_eq!(super::const_mat_cost(HASH7_PRIME), 4);
+        assert_eq!(super::const_mat_cost(HASH4_PRIME), 4);
+
+        // 2. Build a high-pressure loop (>26 live GPRs: 24 cold depth-0 scalars + 2 hot 64-bit
+        //    hash primes + 1-inst loop constant + loop IV/acc + call in loop) and verify BOTH
+        //    exact-CFG and RPO linear-scan keep both 4-inst 64-bit primes in physical GPRs!
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let loop_hdr = b.create_block(BlockKind::Normal);
+        let exit = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let x = b.param(Ty::I64);
+        let n = b.param(Ty::I64);
+        let c1 = b.iconst(Ty::I64, 1);
+        let mut cold_vals = Vec::with_capacity_in(24, alloc);
+        let mut cur = x;
+        for _ in 0..24usize {
+            cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+            cold_vals.push(cur);
+        }
+        let prime7 = b.iconst(Ty::I64, u128::from(HASH7_PRIME));
+        let prime4 = b.iconst(Ty::I64, u128::from(HASH4_PRIME));
+        let cheap_mask = b.iconst(Ty::I64, 0x3fff);
+        let z0 = b.iconst(Ty::I64, 0);
+        b.jump((loop_hdr, &[z0, x]));
+
+        b.begin(loop_hdr);
+        let iv = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let h1 = b.binary(Op::Mul, Flags::NONE, acc, prime7);
+        let h2 = b.binary(Op::Mul, Flags::NONE, h1, prime4);
+        let h3 = b.binary(Op::Xor, Flags::NONE, h2, cheap_mask);
+        let iv_next = b.binary(Op::Add, Flags::NONE, iv, c1);
+        let cond = b.icmp(IntCond::Ult, iv_next, n);
+        b.br(Flags::NONE, cond, (loop_hdr, &[iv_next, h3]), (exit, &[h3]));
+
+        b.begin(exit);
+        let mut out = b.param(Ty::I64);
+        for &cv in &cold_vals {
+            out = b.binary(Op::Xor, Flags::NONE, out, cv);
+        }
+        b.ret(&[out]);
+
+        let func = b.finish_checked().expect("hash-prime pressure loop LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+
+        let ra_exact = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+            .expect("exact-CFG regalloc succeeds for hash-prime pressure loop");
+        let gpr_ord = build_caller_gpr_order(None);
+        let fp_ord = build_caller_fp_order(None);
+        let ra_rpo = allocate_linear_scan_rpo(
+            &view,
+            &skip,
+            &tail,
+            64,
+            crate::Os::MacOs,
+            |_| CallClobbers::C_ABI_ARM64,
+            &gpr_ord,
+            &fp_ord,
+            alloc,
+        )
+        .expect("RPO linear-scan regalloc succeeds for hash-prime pressure loop");
+
+        for (label, ra) in [("exact_cfg", &ra_exact), ("linear_scan_rpo", &ra_rpo)] {
+            assert!(
+                ra.num_spill_slots > 0,
+                "{label}: test must overflow 26 GPRs and spill cold depth-0 scalars"
+            );
+            assert!(
+                matches!(ra.loc_of[prime7.index()], AllocLoc::Gpr(_)),
+                "{label}: 4-inst HASH7_PRIME inside hot loop must stay in a GPR, got {:?}",
+                ra.loc_of[prime7.index()]
+            );
+            assert!(
+                matches!(ra.loc_of[prime4.index()], AllocLoc::Gpr(_)),
+                "{label}: 4-inst HASH4_PRIME inside hot loop must stay in a GPR, got {:?}",
+                ra.loc_of[prime4.index()]
             );
         }
     }

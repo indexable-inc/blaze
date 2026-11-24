@@ -4,13 +4,17 @@
 //!   `try_from` panic paths.
 //! - [`Pow2Table`]: a heap-allocated power-of-two lookup table whose length is invariantly
 //!   `1 << LOG`, eliminating bounds checks on top-bit and masked accesses.
+//! - [`Pow2Array`]: an inline power-of-two array `[T; N]` with zero-bounds-check masked and
+//!   [`Idx<N>`] accesses.
+//! - [`FixedTable`]: an inline fixed-length array `[T; N]` with zero-bounds-check [`Idx<N>`]
+//!   accesses.
 //! - [`SlackSlice`]: a borrowed byte slice paired with an explicit `SLACK` margin so unaligned
 //!   little-endian reads at `pos <= self.limit()` are proven in-bounds.
 
 use core::alloc::Allocator;
 use core::ptr;
 
-use crate::{AllocFailure, Vec};
+use crate::{AllocFailure, Idx, Vec};
 
 /// Extract the low 32 bits of `v` without `as` casts or fallible conversions.
 ///
@@ -180,6 +184,188 @@ impl<T, const LOG: u32, A: Allocator> Pow2Table<T, LOG, A> {
         unsafe {
             *self.data.as_mut_ptr().add(masked) = val;
         }
+    }
+}
+
+/// An inline power-of-two lookup table of length `N` (`N > 0 && N.is_power_of_two()`).
+///
+/// Because `N` is a compile-time power of two, `index & Self::MASK` and [`Idx<N>`] accesses
+/// are statically proven in bounds with zero runtime bounds checks.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pow2Array<T, const N: usize>([T; N]);
+
+impl<T, const N: usize> Pow2Array<T, N> {
+    /// Bitmask for wrapping an arbitrary `usize` index into `0..N`.
+    pub const MASK: usize = {
+        assert!(N.is_power_of_two(), "Pow2Array length must be a non-zero power of two");
+        N - 1
+    };
+
+    /// Wrap an inline array of power-of-two length `N`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn new(data: [T; N]) -> Self {
+        const {
+            assert!(N.is_power_of_two(), "Pow2Array length must be a non-zero power of two");
+        }
+        Self(data)
+    }
+
+    /// Create a table with every slot initialized to `val`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn splat(val: T) -> Self
+    where
+        T: Copy,
+    {
+        const {
+            assert!(N.is_power_of_two(), "Pow2Array length must be a non-zero power of two");
+        }
+        Self([val; N])
+    }
+
+    /// Read the entry at `index & Self::MASK` with zero runtime bounds check.
+    #[inline(always)]
+    #[must_use]
+    pub fn get_masked(&self, index: usize) -> T
+    where
+        T: Copy,
+    {
+        let idx = index & Self::MASK;
+        // SAFETY: `Self::MASK == N - 1` where `N` is a non-zero power of two, so
+        // `idx = index & Self::MASK < N`, keeping `self.0.as_ptr().add(idx)` in bounds
+        // of the initialized `[T; N]` array.
+        unsafe { *self.0.as_ptr().add(idx) }
+    }
+
+    /// Write `value` to the entry at `index & Self::MASK` with zero runtime bounds check.
+    #[inline(always)]
+    pub fn set_masked(&mut self, index: usize, value: T) {
+        let idx = index & Self::MASK;
+        // SAFETY: `Self::MASK == N - 1` where `N` is a non-zero power of two, so
+        // `idx = index & Self::MASK < N`, and `&mut self` grants exclusive access to the
+        // initialized slot at `self.0.as_mut_ptr().add(idx)`.
+        unsafe {
+            *self.0.as_mut_ptr().add(idx) = value;
+        }
+    }
+
+    /// Read the entry at proven in-bounds `idx` with zero runtime bounds check.
+    #[inline(always)]
+    #[must_use]
+    pub fn get_idx(&self, idx: Idx<N>) -> T
+    where
+        T: Copy,
+    {
+        // SAFETY: `Idx<N>` statically proves `idx.get() < N`, so `self.0.as_ptr().add(idx.get())`
+        // points to an initialized element of `[T; N]`.
+        unsafe { *self.0.as_ptr().add(idx.get()) }
+    }
+
+    /// Write `value` to the entry at proven in-bounds `idx` with zero runtime bounds check.
+    #[inline(always)]
+    pub fn set_idx(&mut self, idx: Idx<N>, value: T) {
+        // SAFETY: `Idx<N>` statically proves `idx.get() < N`, and `&mut self` grants exclusive
+        // access to the initialized element at `self.0.as_mut_ptr().add(idx.get())`.
+        unsafe {
+            *self.0.as_mut_ptr().add(idx.get()) = value;
+        }
+    }
+
+    /// View the underlying table as a slice of length `N`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+
+    /// View the underlying table as a mutable slice of length `N`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.0
+    }
+
+    /// Overwrite every entry in the table with `val`.
+    #[inline(always)]
+    pub fn fill(&mut self, val: T)
+    where
+        T: Copy,
+    {
+        self.0.fill(val);
+    }
+}
+
+/// An inline fixed-size lookup table of length `N` indexed by [`Idx<N>`].
+///
+/// Because [`Idx<N>`] statically proves `idx.get() < N`, reads and writes compile with zero
+/// runtime bounds checks.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedTable<T, const N: usize>([T; N]);
+
+impl<T, const N: usize> FixedTable<T, N> {
+    /// Wrap an inline array of length `N`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn new(data: [T; N]) -> Self {
+        Self(data)
+    }
+
+    /// Create a table with every slot initialized to `val`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn splat(val: T) -> Self
+    where
+        T: Copy,
+    {
+        Self([val; N])
+    }
+
+    /// Read the entry at proven in-bounds `idx` with zero runtime bounds check.
+    #[inline(always)]
+    #[must_use]
+    pub fn get(&self, idx: Idx<N>) -> T
+    where
+        T: Copy,
+    {
+        // SAFETY: `Idx<N>` statically proves `idx.get() < N`, so `self.0.as_ptr().add(idx.get())`
+        // points to an initialized element of `[T; N]`.
+        unsafe { *self.0.as_ptr().add(idx.get()) }
+    }
+
+    /// Write `value` to the entry at proven in-bounds `idx` with zero runtime bounds check.
+    #[inline(always)]
+    pub fn set(&mut self, idx: Idx<N>, value: T) {
+        // SAFETY: `Idx<N>` statically proves `idx.get() < N`, and `&mut self` grants exclusive
+        // access to the initialized element at `self.0.as_mut_ptr().add(idx.get())`.
+        unsafe {
+            *self.0.as_mut_ptr().add(idx.get()) = value;
+        }
+    }
+
+    /// View the underlying table as a slice of length `N`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+
+    /// View the underlying table as a mutable slice of length `N`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.0
+    }
+
+    /// Overwrite every entry in the table with `val`.
+    #[inline(always)]
+    pub fn fill(&mut self, val: T)
+    where
+        T: Copy,
+    {
+        self.0.fill(val);
     }
 }
 
@@ -379,5 +565,48 @@ mod tests {
         assert_eq!(s4.read_u32_le(0), Some(0x0403_0201));
         assert_eq!(s4.read_u32_le(1), Some(0x0504_0302));
         assert_eq!(s4.read_u32_le(2), None);
+    }
+
+    #[test]
+    fn pow2_array_and_fixed_table_ops() {
+        use super::{FixedTable, Pow2Array};
+        use crate::Idx;
+
+        // Pow2Array: splat, masked wrapping, Idx access, slice views, fill.
+        let mut arr = Pow2Array::<u32, 8>::splat(11);
+        assert_eq!(Pow2Array::<u32, 8>::MASK, 7);
+        assert_eq!(arr.as_slice(), &[11; 8]);
+        arr.set_masked(8 + 3, 42);
+        assert_eq!(arr.get_masked(3), 42);
+        assert_eq!(arr.get_masked(24 + 3), 42);
+        let idx5 = Idx::<8>::new(5).expect("in bounds");
+        arr.set_idx(idx5, 99);
+        assert_eq!(arr.get_idx(idx5), 99);
+        arr.as_mut_slice()[0] = 7;
+        assert_eq!(arr.get_masked(0), 7);
+        arr.fill(0);
+        assert_eq!(arr.as_slice(), &[0; 8]);
+
+        let arr_new = Pow2Array::new([10u16, 20, 30, 40]);
+        assert_eq!(arr_new.get_masked(usize::MAX), 40);
+
+        // FixedTable: non-power-of-two length with Idx<N> and byte-indexed 256-entry table.
+        let mut fixed = FixedTable::<u32, 53>::splat(3);
+        let i52 = Idx::<53>::new(52).expect("in bounds");
+        fixed.set(i52, 520);
+        assert_eq!(fixed.get(i52), 520);
+        assert_eq!(fixed.as_slice().len(), 53);
+        fixed.as_mut_slice()[0] = 1;
+        assert_eq!(fixed.get(Idx::<53>::new(0).expect("in bounds")), 1);
+        fixed.fill(9);
+        assert_eq!(fixed.get(i52), 9);
+
+        let mut byte_tbl = FixedTable::<u8, 256>::new([0u8; 256]);
+        for b in 0u8..=u8::MAX {
+            byte_tbl.set(Idx::<256>::from_u8(b), b.wrapping_add(1));
+        }
+        for b in 0u8..=u8::MAX {
+            assert_eq!(byte_tbl.get(Idx::<256>::from_u8(b)), b.wrapping_add(1));
+        }
     }
 }

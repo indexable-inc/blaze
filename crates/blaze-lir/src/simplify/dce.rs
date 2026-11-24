@@ -761,6 +761,70 @@ fn removable(op: Op) -> bool {
     )
 }
 
+/// Extracts `(value, width)` when `rhs_inst` is a scalar integer `Iconst` or `IconstWide`,
+/// with `value` masked to `width` bits via [`iconst_value`] / [`wide_value`].
+fn const_rhs_int(view: &View<'_>, rhs_inst: u32) -> Option<(u128, u32)> {
+    let at = usize::try_from(rhs_inst).ok()?;
+    let ty = view.tys.get(at).copied().map(Ty)?;
+    if !ty.is_scalar() || !ty.is_int() || view.flags.get(at).copied()? != 0 {
+        return None;
+    }
+    let width = ty.bits(view.head.ptr_bits);
+    if width == 0 {
+        return None;
+    }
+    match view.ops.get(at).copied().and_then(Op::from_byte)? {
+        Op::Iconst => {
+            let word = view.data.get(at).copied()?;
+            Some((iconst_value(word, width), width))
+        }
+        Op::IconstWide => {
+            let start = view.data.get(at).copied().and_then(|d| usize::try_from(d).ok())?;
+            let words = usize::try_from(ty.const_words()).ok()?;
+            let end = start.checked_add(words)?;
+            let slice = view.extra.get(start..end)?;
+            Some((wide_value(slice, width), width))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `inst` is a scalar integer division or remainder whose compile-time constant divisor
+/// cannot trap:
+/// - `Op::Udiv | Op::Urem`: `rhs != 0` (masked to type width)
+/// - `Op::Sdiv | Op::Srem`: signed `rhs != 0 && rhs != -1` (neither div-by-zero nor `INT_MIN / -1`)
+fn is_trap_free_div_rem(view: &View<'_>, inst: usize) -> bool {
+    let Some(op) = view.ops.get(inst).copied().and_then(Op::from_byte) else {
+        return false;
+    };
+    if !matches!(op, Op::Udiv | Op::Urem | Op::Sdiv | Op::Srem) {
+        return false;
+    }
+    let Some(ty) = view.tys.get(inst).copied().map(Ty) else {
+        return false;
+    };
+    if !ty.is_scalar() || !ty.is_int() {
+        return false;
+    }
+    let Some(at) = view.data.get(inst).copied().and_then(|d| usize::try_from(d).ok()) else {
+        return false;
+    };
+    let Some(rhs_inst) = at.checked_add(1).and_then(|i| view.extra.get(i).copied()) else {
+        return false;
+    };
+    let Some((rhs, width)) = const_rhs_int(view, rhs_inst) else {
+        return false;
+    };
+    match op {
+        Op::Udiv | Op::Urem => rhs != 0,
+        Op::Sdiv | Op::Srem => {
+            let signed = sext(rhs, width);
+            signed != 0 && signed != -1
+        }
+        _ => false,
+    }
+}
+
 /// The target a trivial terminator becomes a `jump` to, [`NONE`] if it is not trivial: a
 /// `br` on a constant, a `br` whose two targets are the same block with the same arguments,
 /// a `switch` on a constant (its matching case, else its default).
@@ -831,7 +895,7 @@ pub fn dead<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, Si
         for inst in view.block(block) {
             let root = match view.op(inst) {
                 Op::Param => !into.targets_only[b],
-                op => !removable(op),
+                op => !removable(op) && !is_trap_free_div_rem(&view, inst),
             };
             if root {
                 mark(&mut live, &mut work, &mut live_count, inst as u32);
@@ -969,4 +1033,131 @@ pub fn coalesce_cfg<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Fun
         fma_fuse: filled(len, None, &alloc),
     };
     rebuild(view, &edit, alloc)
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_own::testing::TestHeap;
+
+    use super::*;
+    use crate::{
+        builder::{Builder, Full, Param, Variadic},
+        eval::{self, Outcome, Trap, Val},
+        func::{BlockKind, Conv},
+    };
+
+    #[test]
+    fn dead_eliminates_trap_free_const_div_rem_and_preserves_trapping_div_rem() {
+        let alloc = TestHeap;
+
+        // 1. Dead trap-free constant divisors (`Udiv(x, 1)`, wide `Udiv(x, 1<<32)`, `Urem(x, 8)`,
+        //    `Sdiv(x, 1)`, `Sdiv(x, -2)`, `Srem(x, 4)`, including `Flags::EXACT | Flags::NONZERO`)
+        //    must all be eliminated by `dead()`.
+        let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let x = b.param(Ty::I64);
+        let _y = b.param(Ty::I64);
+        let c1 = b.iconst(Ty::I64, 1);
+        let c4 = b.iconst(Ty::I64, 4);
+        let c8 = b.iconst(Ty::I64, 8);
+        let c_neg2 = b.iconst(Ty::I64, u128::from((-2_i64).cast_unsigned()));
+        let c_wide = b.iconst(Ty::I64, 1u128 << 32);
+        let _d1 = b.binary(Op::Udiv, Flags::EXACT | Flags::NONZERO, x, c1);
+        let _d2 = b.binary(Op::Udiv, Flags::NONE, x, c_wide);
+        let _d3 = b.binary(Op::Urem, Flags::NONE, x, c8);
+        let _d4 = b.binary(Op::Sdiv, Flags::NONE, x, c1);
+        let _d5 = b.binary(Op::Sdiv, Flags::NONE, x, c_neg2);
+        let _d6 = b.binary(Op::Srem, Flags::NONE, x, c4);
+        b.ret(&[x]);
+        let func = b.finish_checked().unwrap();
+
+        let cleaned = dead(func.view(), alloc).unwrap();
+        let v = cleaned.view();
+        for i in 0..v.len() {
+            assert!(
+                !matches!(v.op(i), Op::Udiv | Op::Urem | Op::Sdiv | Op::Srem),
+                "expected all dead trap-free div/rem removed, found {:?} at {i}",
+                v.op(i)
+            );
+        }
+        match eval::run_in(v, &[Val::Int(42), Val::Int(0)], 10_000, alloc).unwrap() {
+            Outcome::Returned(vals) => assert_eq!(vals.as_slice(), &[Val::Int(42)]),
+            other => panic!("expected Returned([42]), got {other:?}"),
+        }
+
+        // 2. Dead trapping or runtime-divisor ops MUST be preserved:
+        //    - `Udiv(x, 0)`, `Urem(x, 0)`, `Sdiv(x, 0)`, `Srem(x, 0)` (div-by-zero)
+        //    - `Sdiv(x, -1)`, `Srem(x, -1)` (signed MIN / -1 overflow hazard)
+        //    - `Udiv(x, y)` (unknown runtime divisor `y`)
+        let check_preserved = |op: Op, rhs_const: Option<u128>, test_x: u64, test_y: u64, expect_trap: Option<Trap>| {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let rhs = match rhs_const {
+                Some(c) => b.iconst(Ty::I64, c),
+                None => y,
+            };
+            let _dead_div = b.binary(op, Flags::NONE, x, rhs);
+            b.ret(&[x]);
+            let f = b.finish_checked().unwrap();
+
+            let out = dead(f.view(), alloc).unwrap();
+            let count = (0..out.view().len()).filter(|&i| out.view().op(i) == op).count();
+            assert_eq!(count, 1, "expected potentially-trapping dead {op:?} (rhs={rhs_const:?}) preserved");
+
+            let args = [Val::Int(u128::from(test_x)), Val::Int(u128::from(test_y))];
+            let before = eval::run_in(f.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(out.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after);
+            if let Some(trap) = expect_trap {
+                assert_eq!(after, Outcome::<TestHeap>::Trapped(trap));
+            }
+        };
+
+        let neg1_u64 = u128::from(u64::MAX);
+        let smin_u64 = i64::MIN.cast_unsigned();
+        check_preserved(Op::Udiv, Some(0), 10, 1, Some(Trap::DivByZero));
+        check_preserved(Op::Urem, Some(0), 10, 1, Some(Trap::DivByZero));
+        check_preserved(Op::Sdiv, Some(0), 10, 1, Some(Trap::DivByZero));
+        check_preserved(Op::Srem, Some(0), 10, 1, Some(Trap::DivByZero));
+        check_preserved(Op::Sdiv, Some(neg1_u64), smin_u64, 1, Some(Trap::DivOverflow));
+        check_preserved(Op::Srem, Some(neg1_u64), smin_u64, 1, None);
+        check_preserved(Op::Udiv, None, 10, 0, Some(Trap::DivByZero));
+
+        // 3. `i1` edge case: in `i1`, `1` is signed `-1` (`MIN / -1` overflows for `sdiv`),
+        //    so dead `sdiv i1 x, 1` is preserved while dead `udiv i1 x, 1` is removed.
+        let mut bi1 = Builder::<TestHeap, Full>::new_in(64, alloc);
+        let sig_i1 = bi1.sig(Conv::C, Variadic::No, &[Param::of(Ty::I1)], &[Param::of(Ty::I1)]);
+        bi1.set_signature(sig_i1);
+        let e = bi1.create_block(BlockKind::Normal);
+        bi1.begin(e);
+        let x1 = bi1.param(Ty::I1);
+        let one1 = bi1.iconst(Ty::I1, 1);
+        let _u1 = bi1.binary(Op::Udiv, Flags::NONE, x1, one1);
+        let _s1 = bi1.binary(Op::Sdiv, Flags::NONE, x1, one1);
+        bi1.ret(&[x1]);
+        let fi1 = bi1.finish_checked().unwrap();
+        let out_i1 = dead(fi1.view(), alloc).unwrap();
+        let udiv_cnt = (0..out_i1.view().len()).filter(|&i| out_i1.view().op(i) == Op::Udiv).count();
+        let sdiv_cnt = (0..out_i1.view().len()).filter(|&i| out_i1.view().op(i) == Op::Sdiv).count();
+        assert_eq!(udiv_cnt, 0, "expected dead `udiv i1 x, 1` removed");
+        assert_eq!(sdiv_cnt, 1, "expected dead `sdiv i1 x, 1` (signed -1) preserved");
+    }
 }

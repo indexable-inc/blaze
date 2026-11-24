@@ -553,7 +553,7 @@ fn sota_optimize_body<A: Allocator + Copy>(
     cur = bce.func;
     let unsw = unswitch_loops(cur.view(), 2, alloc)?;
     cur = unsw.func;
-    let ifc = if_convert(cur.view(), 8, alloc)?;
+    let ifc = if_convert(cur.view(), 32, alloc)?;
     cur = ifc.func;
     if bce.stats.checks_eliminated > 0 || unsw.stats.loops_unswitched > 0 || ifc.stats.branches_converted > 0 {
         cur = sota_optimize_fixpoint(cur.view(), opts.reg_budget, 2, |_| 1, alloc)?.func;

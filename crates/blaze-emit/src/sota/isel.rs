@@ -688,7 +688,7 @@ fn invert_cond(c: Cond) -> Cond {
     }
 }
 
-/// Emits a 64-bit constant into `rd` using minimal `movz`/`movn`/`movk` instructions.
+/// Emits a 64-bit constant into `rd` using minimal `movz`/`movn`/`orr`/`movk` instructions.
 fn emit_const_u64(words: &mut Vec<u32, Alloc<'_>>, rd: Reg, val: u64) {
     if val == 0 {
         words.push(enc::movz(rd, 0, 0));
@@ -701,6 +701,19 @@ fn emit_const_u64(words: &mut Vec<u32, Alloc<'_>>, rd: Reg, val: u64) {
             words.push(enc::movn(rd, chunk, hw));
             return;
         }
+    }
+    for hw in 0..4u32 {
+        let chunk = trunc_u32((val >> (hw * 16)) & 0xffff);
+        if val == (u64::from(chunk) << (hw * 16)) {
+            words.push(enc::movz(rd, chunk, hw));
+            return;
+        }
+    }
+    if rd != SP
+        && let Some(nrs) = enc::logical_imm(val, 64)
+    {
+        words.push(enc::orr_imm_nrs(rd, ZR, u32_of(nrs)));
+        return;
     }
     let mut first = true;
     for hw in 0..4u32 {
@@ -1022,12 +1035,11 @@ fn emit_parallel_moves<'a, const FP: bool>(
         }
     };
     let emit_one = |words: &mut Vec<u32, Alloc<'a>>, dst: CopyLoc<FP>, src: CopyLoc<FP>| -> Result<(), TierError> {
+        if dst == src {
+            return Ok(());
+        }
         match (dst, src) {
-            (CopyLoc::Reg(d), CopyLoc::Reg(s)) => {
-                if d != s {
-                    emit_mov(words, d, s);
-                }
-            }
+            (CopyLoc::Reg(d), CopyLoc::Reg(s)) => emit_mov(words, d, s),
             (CopyLoc::Reg(d), CopyLoc::Spill(s)) => emit_ld(words, d, s),
             (CopyLoc::Spill(d), CopyLoc::Reg(s)) => emit_st(words, s, d),
             (CopyLoc::Spill(d), CopyLoc::Spill(s)) => {
@@ -4696,6 +4708,50 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         }
     };
 
+    // Value-copy helpers that skip identical-location copies (including same-slot spills) and
+    // load/store directly without bouncing through a scratch register when one side is a GPR/FP reg.
+    let emit_gpr_copy = |words: &mut Vec<u32, Alloc<'a>>, dst_inst: usize, src_v: u32| {
+        let dst_loc = at_loc(&reg_alloc.loc_of, dst_inst);
+        if dst_loc == AllocLoc::None || at_loc(&reg_alloc.loc_of, to_idx(src_v)) == dst_loc {
+            return;
+        }
+        let (rd, sp) = dst_gpr(dst_inst);
+        let src = load_gpr(words, src_v, rd);
+        if let Some(s) = sp {
+            emit_st_spill_gpr(words, src, spill_base, s);
+        } else if rd != src {
+            words.push(enc::mov(rd, src));
+        }
+    };
+
+    let emit_fp_copy = |words: &mut Vec<u32, Alloc<'a>>, dst_inst: usize, src_v: u32, double: bool| {
+        let dst_loc = at_loc(&reg_alloc.loc_of, dst_inst);
+        if dst_loc == AllocLoc::None || at_loc(&reg_alloc.loc_of, to_idx(src_v)) == dst_loc {
+            return;
+        }
+        let (vd, sp) = dst_fp(dst_inst);
+        let vs = load_fp(words, src_v, vd);
+        if let Some(s) = sp {
+            emit_st_spill_fp(words, vs, spill_base, s);
+        } else if vd != vs {
+            words.push(enc::fmov_reg(double, vd, vs));
+        }
+    };
+
+    let emit_vec_copy = |words: &mut Vec<u32, Alloc<'a>>, dst_inst: usize, src_v: u32| {
+        let dst_loc = at_loc(&reg_alloc.loc_of, dst_inst);
+        if dst_loc == AllocLoc::None || at_loc(&reg_alloc.loc_of, to_idx(src_v)) == dst_loc {
+            return;
+        }
+        let (vd, sp) = dst_vec(dst_inst);
+        let vs = load_vec(words, src_v, vd);
+        if let Some(s) = sp {
+            emit_st_spill_vec(words, vs, spill_base, s);
+        } else if vd != vs {
+            words.push(enc::orr_v(vd, vs, vs));
+        }
+    };
+
     // 4. Emit AArch64 words!
     let mut words: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len * 2 + 16, alloc);
     let mut patches: Vec<BranchPatch, Alloc<'a>> = Vec::new_in(alloc);
@@ -5090,6 +5146,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 continue;
             }
             let src_v = at_u32(view.extra, args_start + k);
+            if at_loc(&reg_alloc.loc_of, to_idx(src_v)) == dst_loc {
+                continue;
+            }
             match dst_loc {
                 AllocLoc::Gpr(d) => {
                     let dst = GprCopyLoc::Reg(u32::from(d));
@@ -6245,14 +6304,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         }
                     }
                     Op::Freeze => {
-                        let (vd, sp) = dst_vec(inst);
-                        let vs = load_vec(&mut words, at_u32(view.data, inst), V30);
-                        if vd != vs {
-                            words.push(enc::orr_v(vd, vs, vs));
-                        }
-                        if let Some(s) = sp {
-                            emit_st_spill_vec(&mut words, vd, spill_base, s);
-                        }
+                        emit_vec_copy(&mut words, inst, at_u32(view.data, inst));
                     }
                     Op::Splat => {
                         let (vd, sp) = dst_vec(inst);
@@ -6322,14 +6374,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         }
                     }
                     Op::Bitcast => {
-                        let (vd, sp) = dst_vec(inst);
-                        let vs = load_vec(&mut words, at_u32(view.data, inst), V30);
-                        if vd != vs {
-                            words.push(enc::orr_v(vd, vs, vs));
-                        }
-                        if let Some(s) = sp {
-                            emit_st_spill_vec(&mut words, vd, spill_base, s);
-                        }
+                        emit_vec_copy(&mut words, inst, at_u32(view.data, inst));
                     }
                     Op::Umulhi => {
                         // `<4 x i32>` high-32-bit unsigned multiply: `umull.2d` + `umull2.2d` + `uzp2.4s`!
@@ -6354,23 +6399,23 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             inst: Some(u32_of(inst)),
                             what: "non-const NEON shift",
                         })?);
-                        let (vd, sp) = dst_vec(inst);
-                        let vs = load_vec(&mut words, src_v, V30);
                         if k == 0 {
-                            if vd != vs {
-                                words.push(enc::orr_v(vd, vs, vs));
-                            }
-                        } else if vsize == 1 {
-                            words.push(if op == Op::Shl { shl_8h_imm(vd, vs, k) } else { ushr_8h_imm(vd, vs, k) });
-                        } else if vsize == 2 {
-                            words.push(if op == Op::Shl { enc::shl_4s_imm(vd, vs, k) } else { enc::ushr_4s_imm(vd, vs, k) });
-                        } else if op == Op::Shl {
-                            words.push(enc::shl_2d_imm(vd, vs, k));
+                            emit_vec_copy(&mut words, inst, src_v);
                         } else {
-                            words.push(enc::ushr_2d_imm(vd, vs, k));
-                        }
-                        if let Some(s) = sp {
-                            emit_st_spill_vec(&mut words, vd, spill_base, s);
+                            let (vd, sp) = dst_vec(inst);
+                            let vs = load_vec(&mut words, src_v, V30);
+                            if vsize == 1 {
+                                words.push(if op == Op::Shl { shl_8h_imm(vd, vs, k) } else { ushr_8h_imm(vd, vs, k) });
+                            } else if vsize == 2 {
+                                words.push(if op == Op::Shl { enc::shl_4s_imm(vd, vs, k) } else { enc::ushr_4s_imm(vd, vs, k) });
+                            } else if op == Op::Shl {
+                                words.push(enc::shl_2d_imm(vd, vs, k));
+                            } else {
+                                words.push(enc::ushr_2d_imm(vd, vs, k));
+                            }
+                            if let Some(s) = sp {
+                                emit_st_spill_vec(&mut words, vd, spill_base, s);
+                            }
                         }
                     }
                     Op::Add
@@ -6624,7 +6669,6 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     Op::Select => {
                         let at = to_idx(at_u32(view.data, inst));
                         let (cv, tv, fv) = (at_u32(view.extra, at), at_u32(view.extra, at + 1), at_u32(view.extra, at + 2));
-                        let (vd, sp) = dst_vec(inst);
                         let is_zero_splat = |v: u32| {
                             view.op(to_idx(v)) == Op::Splat && at_opt(&const_u64, to_idx(at_u32(view.data, to_idx(v)))) == Some(0)
                         };
@@ -6638,32 +6682,32 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         };
                         if is_zero_splat(fv) && is_all_ones_splat(tv) {
                             // `Select(mask, all_ones, 0)` IS the NEON lane mask itself (0 ALU ops!).
-                            let vm = load_vec(&mut words, cv, V30);
-                            if vd != vm {
-                                words.push(enc::orr_v(vd, vm, vm));
-                            }
-                        } else if is_zero_splat(fv) {
-                            // `Select(mask, x, 0) -> and vd.16b, vx.16b, vmask.16b` (ONE instruction!)
-                            let vm = load_vec(&mut words, cv, V30);
-                            let vt = load_vec(&mut words, tv, V31);
-                            words.push(enc::and_v(true, vd, vt, vm));
+                            emit_vec_copy(&mut words, inst, cv);
                         } else {
-                            let vm = load_vec(&mut words, cv, V29);
-                            let vt = load_vec(&mut words, tv, V30);
-                            let vf = load_vec(&mut words, fv, V31);
-                            if vd == vm {
-                                words.push(enc::bsl_v(vd, vt, vf));
-                            } else if vd == vf {
-                                words.push(enc::bit_v(vd, vt, vm));
-                            } else if vd == vt {
-                                words.push(enc::bif_v(vd, vf, vm));
+                            let (vd, sp) = dst_vec(inst);
+                            if is_zero_splat(fv) {
+                                // `Select(mask, x, 0) -> and vd.16b, vx.16b, vmask.16b` (ONE instruction!)
+                                let vm = load_vec(&mut words, cv, V30);
+                                let vt = load_vec(&mut words, tv, V31);
+                                words.push(enc::and_v(true, vd, vt, vm));
                             } else {
-                                words.push(enc::orr_v(vd, vm, vm));
-                                words.push(enc::bsl_v(vd, vt, vf));
+                                let vm = load_vec(&mut words, cv, V29);
+                                let vt = load_vec(&mut words, tv, V30);
+                                let vf = load_vec(&mut words, fv, V31);
+                                if vd == vm {
+                                    words.push(enc::bsl_v(vd, vt, vf));
+                                } else if vd == vf {
+                                    words.push(enc::bit_v(vd, vt, vm));
+                                } else if vd == vt {
+                                    words.push(enc::bif_v(vd, vf, vm));
+                                } else {
+                                    words.push(enc::orr_v(vd, vm, vm));
+                                    words.push(enc::bsl_v(vd, vt, vf));
+                                }
                             }
-                        }
-                        if let Some(s) = sp {
-                            emit_st_spill_vec(&mut words, vd, spill_base, s);
+                            if let Some(s) = sp {
+                                emit_st_spill_vec(&mut words, vd, spill_base, s);
+                            }
                         }
                     }
                     Op::Not => {
@@ -6905,19 +6949,21 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     }
                     Op::Freeze => {
                         let a = at_u32(view.data, inst);
-                        let a0 = load_half(&mut words, a, false, X16);
-                        if dlo != a0 {
-                            words.push(enc::mov(dlo, a0));
-                        }
-                        if let Some((s0, _)) = sp_pair {
-                            emit_st_spill_gpr(&mut words, dlo, spill_base, s0);
-                        }
-                        let a1 = load_half(&mut words, a, true, X16);
-                        if dhi != a1 {
-                            words.push(enc::mov(dhi, a1));
-                        }
-                        if let Some((_, s1)) = sp_pair {
-                            emit_st_spill_gpr(&mut words, dhi, spill_base, s1);
+                        if at_loc(&reg_alloc.loc_of, to_idx(a)) != loc {
+                            let a0 = load_half(&mut words, a, false, X16);
+                            if dlo != a0 {
+                                words.push(enc::mov(dlo, a0));
+                            }
+                            if let Some((s0, _)) = sp_pair {
+                                emit_st_spill_gpr(&mut words, dlo, spill_base, s0);
+                            }
+                            let a1 = load_half(&mut words, a, true, X16);
+                            if dhi != a1 {
+                                words.push(enc::mov(dhi, a1));
+                            }
+                            if let Some((_, s1)) = sp_pair {
+                                emit_st_spill_gpr(&mut words, dhi, spill_base, s1);
+                            }
                         }
                     }
                     Op::Iconst => {
@@ -7132,19 +7178,21 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         };
                         if let Some(k) = const_sh {
                             if k == 0 {
-                                let a0 = load_half(&mut words, a, false, X16);
-                                if dlo != a0 {
-                                    words.push(enc::mov(dlo, a0));
-                                }
-                                if let Some((s0, _)) = sp_pair {
-                                    emit_st_spill_gpr(&mut words, dlo, spill_base, s0);
-                                }
-                                let a1 = load_half(&mut words, a, true, X16);
-                                if dhi != a1 {
-                                    words.push(enc::mov(dhi, a1));
-                                }
-                                if let Some((_, s1)) = sp_pair {
-                                    emit_st_spill_gpr(&mut words, dhi, spill_base, s1);
+                                if at_loc(&reg_alloc.loc_of, to_idx(a)) != loc {
+                                    let a0 = load_half(&mut words, a, false, X16);
+                                    if dlo != a0 {
+                                        words.push(enc::mov(dlo, a0));
+                                    }
+                                    if let Some((s0, _)) = sp_pair {
+                                        emit_st_spill_gpr(&mut words, dlo, spill_base, s0);
+                                    }
+                                    let a1 = load_half(&mut words, a, true, X16);
+                                    if dhi != a1 {
+                                        words.push(enc::mov(dhi, a1));
+                                    }
+                                    if let Some((_, s1)) = sp_pair {
+                                        emit_st_spill_gpr(&mut words, dhi, spill_base, s1);
+                                    }
                                 }
                             } else if op == Op::Shl {
                                 if k >= 64 {
@@ -7340,16 +7388,21 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     }
                     Op::Zext => {
                         let src_v = at_u32(view.data, inst);
-                        let rs = load_gpr(&mut words, src_v, X16);
-                        if dlo != rs {
-                            words.push(enc::mov(dlo, rs));
+                        let same_lo_spill = sp_pair.is_some_and(|(s0, _)| {
+                            at_loc(&reg_alloc.loc_of, to_idx(src_v)) == AllocLoc::GprSpill(s0)
+                        });
+                        if !same_lo_spill {
+                            let rs = load_gpr(&mut words, src_v, dlo);
+                            if let Some((s0, _)) = sp_pair {
+                                emit_st_spill_gpr(&mut words, rs, spill_base, s0);
+                            } else if dlo != rs {
+                                words.push(enc::mov(dlo, rs));
+                            }
                         }
-                        if let Some((s0, _)) = sp_pair {
-                            emit_st_spill_gpr(&mut words, dlo, spill_base, s0);
-                        }
-                        words.push(enc::mov(dhi, ZR));
                         if let Some((_, s1)) = sp_pair {
-                            emit_st_spill_gpr(&mut words, dhi, spill_base, s1);
+                            emit_st_spill_gpr(&mut words, ZR, spill_base, s1);
+                        } else {
+                            words.push(enc::mov(dhi, ZR));
                         }
                     }
                     Op::Sext => {
@@ -7564,17 +7617,24 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 })?;
                 if vfp {
                     let double = vsize == 3;
-                    let (vd, sp) = dst_fp(inst);
-                    let vs = load_vec(&mut words, vec_v, V30);
-                    if lane == 0 {
-                        if vd != vs {
-                            words.push(enc::fmov_reg(double, vd, vs));
+                    let same_lane0_spill = lane == 0
+                        && matches!(
+                            (at_loc(&reg_alloc.loc_of, to_idx(vec_v)), loc),
+                            (AllocLoc::VecSpill(s), AllocLoc::FpSpill(d)) if s == d
+                        );
+                    if !same_lane0_spill {
+                        let (vd, sp) = dst_fp(inst);
+                        let vs = load_vec(&mut words, vec_v, V30);
+                        if lane == 0 {
+                            if vd != vs {
+                                words.push(enc::fmov_reg(double, vd, vs));
+                            }
+                        } else {
+                            words.push(dup_scalar_elem(vsize, lane, vd, vs));
                         }
-                    } else {
-                        words.push(dup_scalar_elem(vsize, lane, vd, vs));
-                    }
-                    if let Some(s) = sp {
-                        emit_st_spill_fp(&mut words, vd, spill_base, s);
+                        if let Some(s) = sp {
+                            emit_st_spill_fp(&mut words, vd, spill_base, s);
+                        }
                     }
                 } else {
                     let (rd, sp) = dst_gpr(inst);
@@ -7648,47 +7708,20 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     }
                 }
                 Op::Freeze => {
+                    let src_v = at_u32(view.data, inst);
                     if let Some(double) = fp_ty {
-                        let (vd, sp) = dst_fp(inst);
-                        let vs = load_fp(&mut words, at_u32(view.data, inst), V30);
-                        if vd != vs {
-                            words.push(enc::fmov_reg(double, vd, vs));
-                        }
-                        if let Some(s) = sp {
-                            emit_st_spill_fp(&mut words, vd, spill_base, s);
-                        }
+                        emit_fp_copy(&mut words, inst, src_v, double);
                     } else {
-                        let (rd, sp) = dst_gpr(inst);
-                        let src = load_gpr(&mut words, at_u32(view.data, inst), X16);
-                        if rd != src {
-                            words.push(enc::mov(rd, src));
-                        }
-                        if let Some(s) = sp {
-                            emit_st_spill_gpr(&mut words, rd, spill_base, s);
-                        }
+                        emit_gpr_copy(&mut words, inst, src_v);
                     }
                 }
                 Op::PtrAddr | Op::Expose | Op::FromExposed => {
-                    let (rd, sp) = dst_gpr(inst);
-                    let src = load_gpr(&mut words, at_u32(view.data, inst), X16);
-                    if rd != src {
-                        words.push(enc::mov(rd, src));
-                    }
-                    if let Some(s) = sp {
-                        emit_st_spill_gpr(&mut words, rd, spill_base, s);
-                    }
+                    emit_gpr_copy(&mut words, inst, at_u32(view.data, inst));
                 }
                 Op::PtrWithAddr => {
                     let at = to_idx(at_u32(view.data, inst));
                     let addr = at_u32(view.extra, at + 1);
-                    let (rd, sp) = dst_gpr(inst);
-                    let src = load_gpr(&mut words, addr, X16);
-                    if rd != src {
-                        words.push(enc::mov(rd, src));
-                    }
-                    if let Some(s) = sp {
-                        emit_st_spill_gpr(&mut words, rd, spill_base, s);
-                    }
+                    emit_gpr_copy(&mut words, inst, addr);
                 }
                 Op::SlotAddr => {
                     let (rd, sp) = dst_gpr(inst);
@@ -8671,18 +8704,22 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     match at_loc(&reg_alloc.loc_of, src) {
                         AllocLoc::GprPair(lo, hi) => {
                             let sreg = u32::from(if field_idx == 0 { lo } else { hi });
-                            if rd != sreg {
+                            if let Some(s) = sp {
+                                emit_st_spill_gpr(&mut words, sreg, spill_base, s);
+                            } else if rd != sreg {
                                 words.push(enc::mov(rd, sreg));
                             }
                         }
                         AllocLoc::GprPairSpill(s0, s1) => {
                             let slot = if field_idx == 0 { s0 } else { s1 };
-                            emit_ld_spill_gpr(&mut words, rd, spill_base, slot);
+                            if sp != Some(slot) {
+                                emit_ld_spill_gpr(&mut words, rd, spill_base, slot);
+                                if let Some(s) = sp {
+                                    emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                                }
+                            }
                         }
                         _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected project source loc" }),
-                    }
-                    if let Some(s) = sp {
-                        emit_st_spill_gpr(&mut words, rd, spill_base, s);
                     }
                 }
                 Op::DataAddr => {
@@ -9168,225 +9205,199 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     let at = to_idx(at_u32(view.data, inst));
                     let lhs = at_u32(view.extra, at);
                     let rhs = at_u32(view.extra, at + 1);
-                    let (rd, sp) = dst_gpr(inst);
-                    let rl = load_gpr(&mut words, lhs, X16);
-                    if bits == 64 {
-                        if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
-                            let sh = trunc_u32(k & 63);
-                            if sh == 0 {
-                                if rd != rl {
-                                    words.push(enc::mov(rd, rl));
+                    if (bits == 64 && at_opt(&const_u64, to_idx(rhs)).is_some_and(|k| (k & 63) == 0))
+                        || (bits != 64 && bits != 32 && bits.trailing_zeros() == 0)
+                    {
+                        emit_gpr_copy(&mut words, inst, lhs);
+                    } else {
+                        let (rd, sp) = dst_gpr(inst);
+                        let rl = load_gpr(&mut words, lhs, X16);
+                        if bits == 64 {
+                            if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
+                                words.push(enc::lsl_imm(rd, rl, trunc_u32(k & 63)));
+                            } else {
+                                let rr = load_gpr(&mut words, rhs, X17);
+                                words.push(enc::lslv(rd, rl, rr));
+                            }
+                        } else if bits == 32 {
+                            if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
+                                let sh = trunc_u32(k & 31);
+                                if sh == 0 {
+                                    words.push(enc::sf(false, enc::mov(rd, rl)));
+                                } else {
+                                    words.push(enc::lsl_imm_w(rd, rl, sh));
                                 }
                             } else {
-                                words.push(enc::lsl_imm(rd, rl, sh));
+                                let rr = load_gpr(&mut words, rhs, X17);
+                                words.push(enc::sf(false, enc::lslv(rd, rl, rr)));
                             }
                         } else {
-                            let rr = load_gpr(&mut words, rhs, X17);
-                            words.push(enc::lslv(rd, rl, rr));
-                        }
-                    } else if bits == 32 {
-                        if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
-                            let sh = trunc_u32(k & 31);
-                            if sh == 0 {
-                                words.push(enc::sf(false, enc::mov(rd, rl)));
-                            } else {
-                                words.push(enc::lsl_imm_w(rd, rl, sh));
-                            }
-                        } else {
-                            let rr = load_gpr(&mut words, rhs, X17);
-                            words.push(enc::sf(false, enc::lslv(rd, rl, rr)));
-                        }
-                    } else {
-                        let mask_bits = bits.trailing_zeros();
-                        if mask_bits == 0 {
-                            if rd != rl {
-                                words.push(enc::mov(rd, rl));
-                            }
-                        } else {
+                            let mask_bits = bits.trailing_zeros();
                             let rr = load_gpr(&mut words, rhs, X17);
                             words.push(enc::ubfm(X17, rr, 0, mask_bits - 1));
                             words.push(enc::lslv(rd, rl, X17));
                             emit_narrow(&mut words, rd, bits);
                         }
-                    }
-                    if let Some(s) = sp {
-                        emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                        if let Some(s) = sp {
+                            emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                        }
                     }
                 }
                 Op::Lshr => {
                     let at = to_idx(at_u32(view.data, inst));
                     let lhs = at_u32(view.extra, at);
                     let rhs = at_u32(view.extra, at + 1);
-                    let (rd, sp) = dst_gpr(inst);
-                    let rl = load_gpr(&mut words, lhs, X16);
-                    if bits == 64 {
-                        if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
-                            let sh = trunc_u32(k & 63);
-                            if sh == 0 {
-                                if rd != rl {
-                                    words.push(enc::mov(rd, rl));
+                    if (bits == 64 && at_opt(&const_u64, to_idx(rhs)).is_some_and(|k| (k & 63) == 0))
+                        || (bits != 64 && bits != 32 && bits.trailing_zeros() == 0)
+                    {
+                        emit_gpr_copy(&mut words, inst, lhs);
+                    } else {
+                        let (rd, sp) = dst_gpr(inst);
+                        let rl = load_gpr(&mut words, lhs, X16);
+                        if bits == 64 {
+                            if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
+                                words.push(enc::lsr_imm(rd, rl, trunc_u32(k & 63)));
+                            } else {
+                                let rr = load_gpr(&mut words, rhs, X17);
+                                words.push(enc::lsrv(rd, rl, rr));
+                            }
+                        } else if bits == 32 {
+                            if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
+                                let sh = trunc_u32(k & 31);
+                                if sh == 0 {
+                                    words.push(enc::sf(false, enc::mov(rd, rl)));
+                                } else {
+                                    words.push(enc::lsr_imm_w(rd, rl, sh));
                                 }
                             } else {
-                                words.push(enc::lsr_imm(rd, rl, sh));
+                                let rr = load_gpr(&mut words, rhs, X17);
+                                words.push(enc::sf(false, enc::lsrv(rd, rl, rr)));
                             }
                         } else {
-                            let rr = load_gpr(&mut words, rhs, X17);
-                            words.push(enc::lsrv(rd, rl, rr));
-                        }
-                    } else if bits == 32 {
-                        if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
-                            let sh = trunc_u32(k & 31);
-                            if sh == 0 {
-                                words.push(enc::sf(false, enc::mov(rd, rl)));
-                            } else {
-                                words.push(enc::lsr_imm_w(rd, rl, sh));
-                            }
-                        } else {
-                            let rr = load_gpr(&mut words, rhs, X17);
-                            words.push(enc::sf(false, enc::lsrv(rd, rl, rr)));
-                        }
-                    } else {
-                        let mask_bits = bits.trailing_zeros();
-                        if mask_bits == 0 {
-                            if rd != rl {
-                                words.push(enc::mov(rd, rl));
-                            }
-                        } else {
+                            let mask_bits = bits.trailing_zeros();
                             let rr = load_gpr(&mut words, rhs, X17);
                             words.push(enc::ubfm(X17, rr, 0, mask_bits - 1));
                             words.push(enc::lsrv(rd, rl, X17));
                             emit_narrow(&mut words, rd, bits);
                         }
-                    }
-                    if let Some(s) = sp {
-                        emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                        if let Some(s) = sp {
+                            emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                        }
                     }
                 }
                 Op::Ashr => {
                     let at = to_idx(at_u32(view.data, inst));
                     let lhs = at_u32(view.extra, at);
                     let rhs = at_u32(view.extra, at + 1);
-                    let (rd, sp) = dst_gpr(inst);
-                    let rl = load_gpr(&mut words, lhs, X16);
-                    if bits == 64 {
-                        if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
-                            let sh = trunc_u32(k & 63);
-                            if sh == 0 {
-                                if rd != rl {
-                                    words.push(enc::mov(rd, rl));
+                    if (bits == 64 && at_opt(&const_u64, to_idx(rhs)).is_some_and(|k| (k & 63) == 0))
+                        || (bits != 64 && bits != 32 && bits.trailing_zeros() == 0)
+                    {
+                        emit_gpr_copy(&mut words, inst, lhs);
+                    } else {
+                        let (rd, sp) = dst_gpr(inst);
+                        let rl = load_gpr(&mut words, lhs, X16);
+                        if bits == 64 {
+                            if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
+                                words.push(enc::sbfm(rd, rl, trunc_u32(k & 63), 63));
+                            } else {
+                                let rr = load_gpr(&mut words, rhs, X17);
+                                words.push(enc::asrv(rd, rl, rr));
+                            }
+                        } else if bits == 32 {
+                            if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
+                                let sh = trunc_u32(k & 31);
+                                if sh == 0 {
+                                    words.push(enc::sf(false, enc::mov(rd, rl)));
+                                } else {
+                                    words.push(enc::asr_imm_w(rd, rl, sh));
                                 }
                             } else {
-                                words.push(enc::sbfm(rd, rl, sh, 63));
+                                let rr = load_gpr(&mut words, rhs, X17);
+                                words.push(enc::sf(false, enc::asrv(rd, rl, rr)));
                             }
                         } else {
-                            let rr = load_gpr(&mut words, rhs, X17);
-                            words.push(enc::asrv(rd, rl, rr));
-                        }
-                    } else if bits == 32 {
-                        if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
-                            let sh = trunc_u32(k & 31);
-                            if sh == 0 {
-                                words.push(enc::sf(false, enc::mov(rd, rl)));
-                            } else {
-                                words.push(enc::asr_imm_w(rd, rl, sh));
-                            }
-                        } else {
-                            let rr = load_gpr(&mut words, rhs, X17);
-                            words.push(enc::sf(false, enc::asrv(rd, rl, rr)));
-                        }
-                    } else {
-                        let mask_bits = bits.trailing_zeros();
-                        if mask_bits == 0 {
-                            if rd != rl {
-                                words.push(enc::mov(rd, rl));
-                            }
-                        } else {
+                            let mask_bits = bits.trailing_zeros();
                             let rr = load_gpr(&mut words, rhs, X17);
                             words.push(enc::sext(X16, rl, bits));
                             words.push(enc::ubfm(X17, rr, 0, mask_bits - 1));
                             words.push(enc::asrv(rd, X16, X17));
                             emit_narrow(&mut words, rd, bits);
                         }
-                    }
-                    if let Some(s) = sp {
-                        emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                        if let Some(s) = sp {
+                            emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                        }
                     }
                 }
                 Op::Rotl | Op::Rotr => {
                     let at = to_idx(at_u32(view.data, inst));
                     let lhs = at_u32(view.extra, at);
                     let rhs = at_u32(view.extra, at + 1);
-                    let (rd, sp) = dst_gpr(inst);
-                    let rl = load_gpr(&mut words, lhs, X16);
-                    match bits {
-                        1 => {
-                            if rd != rl {
-                                words.push(enc::mov(rd, rl));
+                    if bits == 1
+                        || (bits == 64 && at_opt(&const_u64, to_idx(rhs)).is_some_and(|k| (k & 63) == 0))
+                    {
+                        emit_gpr_copy(&mut words, inst, lhs);
+                    } else {
+                        let (rd, sp) = dst_gpr(inst);
+                        let rl = load_gpr(&mut words, lhs, X16);
+                        match bits {
+                            64 => {
+                                if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
+                                    let sh = trunc_u32(k & 63);
+                                    let ror_amt = if op == Op::Rotl { (64 - sh) & 63 } else { sh };
+                                    words.push(enc::extr(rd, rl, rl, ror_amt));
+                                } else {
+                                    let rr = load_gpr(&mut words, rhs, X17);
+                                    if op == Op::Rotl {
+                                        words.push(enc::neg(X17, rr));
+                                        words.push(enc::rorv(rd, rl, X17));
+                                    } else {
+                                        words.push(enc::rorv(rd, rl, rr));
+                                    }
+                                }
                             }
-                        }
-                        64 => {
-                            if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
-                                let sh = trunc_u32(k & 63);
-                                let ror_amt = if op == Op::Rotl { (64 - sh) & 63 } else { sh };
-                                if ror_amt == 0 {
-                                    if rd != rl {
-                                        words.push(enc::mov(rd, rl));
+                            32 => {
+                                if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
+                                    let sh = trunc_u32(k & 31);
+                                    let ror_amt = if op == Op::Rotl { (32 - sh) & 31 } else { sh };
+                                    if ror_amt == 0 {
+                                        words.push(enc::sf(false, enc::mov(rd, rl)));
+                                    } else {
+                                        words.push(enc::extr_w(rd, rl, rl, ror_amt));
                                     }
                                 } else {
-                                    words.push(enc::extr(rd, rl, rl, ror_amt));
+                                    let rr = load_gpr(&mut words, rhs, X17);
+                                    if op == Op::Rotl {
+                                        words.push(enc::neg(X17, rr));
+                                        words.push(enc::rorv_w(rd, rl, X17));
+                                    } else {
+                                        words.push(enc::rorv_w(rd, rl, rr));
+                                    }
                                 }
-                            } else {
+                            }
+                            _ => {
                                 let rr = load_gpr(&mut words, rhs, X17);
+                                words.push(enc::zext(X17, rr, bits.trailing_zeros()));
+                                words.push(enc::movz(X16, bits, 0));
+                                words.push(enc::sub(X16, X16, X17));
+                                let rl_copy = if rl == X16 {
+                                    load_gpr(&mut words, lhs, rd)
+                                } else {
+                                    rl
+                                };
                                 if op == Op::Rotl {
-                                    words.push(enc::neg(X17, rr));
-                                    words.push(enc::rorv(rd, rl, X17));
+                                    words.push(enc::lslv(X17, rl_copy, X17));
+                                    words.push(enc::lsrv(X16, rl_copy, X16));
                                 } else {
-                                    words.push(enc::rorv(rd, rl, rr));
+                                    words.push(enc::lsrv(X17, rl_copy, X17));
+                                    words.push(enc::lslv(X16, rl_copy, X16));
                                 }
+                                words.push(enc::orr(rd, X17, X16));
+                                emit_narrow(&mut words, rd, bits);
                             }
                         }
-                        32 => {
-                            if let Some(k) = at_opt(&const_u64, to_idx(rhs)) {
-                                let sh = trunc_u32(k & 31);
-                                let ror_amt = if op == Op::Rotl { (32 - sh) & 31 } else { sh };
-                                if ror_amt == 0 {
-                                    words.push(enc::sf(false, enc::mov(rd, rl)));
-                                } else {
-                                    words.push(enc::extr_w(rd, rl, rl, ror_amt));
-                                }
-                            } else {
-                                let rr = load_gpr(&mut words, rhs, X17);
-                                if op == Op::Rotl {
-                                    words.push(enc::neg(X17, rr));
-                                    words.push(enc::rorv_w(rd, rl, X17));
-                                } else {
-                                    words.push(enc::rorv_w(rd, rl, rr));
-                                }
-                            }
+                        if let Some(s) = sp {
+                            emit_st_spill_gpr(&mut words, rd, spill_base, s);
                         }
-                        _ => {
-                            let rr = load_gpr(&mut words, rhs, X17);
-                            words.push(enc::zext(X17, rr, bits.trailing_zeros()));
-                            words.push(enc::movz(X16, bits, 0));
-                            words.push(enc::sub(X16, X16, X17));
-                            let rl_copy = if rl == X16 {
-                                load_gpr(&mut words, lhs, rd)
-                            } else {
-                                rl
-                            };
-                            if op == Op::Rotl {
-                                words.push(enc::lslv(X17, rl_copy, X17));
-                                words.push(enc::lsrv(X16, rl_copy, X16));
-                            } else {
-                                words.push(enc::lsrv(X17, rl_copy, X17));
-                                words.push(enc::lslv(X16, rl_copy, X16));
-                            }
-                            words.push(enc::orr(rd, X17, X16));
-                            emit_narrow(&mut words, rd, bits);
-                        }
-                    }
-                    if let Some(s) = sp {
-                        emit_st_spill_gpr(&mut words, rd, spill_base, s);
                     }
                 }
                 Op::Umulhi | Op::Smulhi => {
@@ -9642,66 +9653,66 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     }
                 }
                 Op::Clz | Op::Ctz | Op::Popcnt | Op::Bswap | Op::Bitrev => {
-                    let (rd, sp) = dst_gpr(inst);
-                    let src = load_gpr(&mut words, at_u32(view.data, inst), X16);
-                    match op {
-                        Op::Clz => {
-                            if bits == 32 {
-                                words.push(enc::sf(false, enc::clz(rd, src)));
-                            } else {
-                                words.push(enc::clz(rd, src));
-                                if bits < 64 {
-                                    words.push(enc::sub_imm(rd, rd, 64 - bits, false));
+                    let src_v = at_u32(view.data, inst);
+                    if op == Op::Bswap && matches!(bits, 1 | 8) {
+                        emit_gpr_copy(&mut words, inst, src_v);
+                    } else {
+                        let (rd, sp) = dst_gpr(inst);
+                        let src = load_gpr(&mut words, src_v, X16);
+                        match op {
+                            Op::Clz => {
+                                if bits == 32 {
+                                    words.push(enc::sf(false, enc::clz(rd, src)));
+                                } else {
+                                    words.push(enc::clz(rd, src));
+                                    if bits < 64 {
+                                        words.push(enc::sub_imm(rd, rd, 64 - bits, false));
+                                    }
                                 }
                             }
-                        }
-                        Op::Ctz => {
-                            if bits == 64 {
-                                words.push(enc::rbit(rd, src));
-                                words.push(enc::clz(rd, rd));
-                            } else if bits == 32 {
-                                words.push(enc::sf(false, enc::rbit(rd, src)));
-                                words.push(enc::sf(false, enc::clz(rd, rd)));
-                            } else {
-                                words.push(enc::orr_bit(rd, src, bits));
-                                words.push(enc::rbit(rd, rd));
-                                words.push(enc::clz(rd, rd));
-                            }
-                        }
-                        Op::Popcnt => {
-                            if has_cssc {
-                                words.push(enc::cssc_cnt(rd, src));
-                            } else {
-                                words.push(enc::fmov_to_d(V30, src));
-                                words.push(enc::cnt_8b(V30, V30));
-                                words.push(enc::addv_8b(V30, V30));
-                                words.push(enc::fmov_from_d(rd, V30));
-                            }
-                        }
-                        Op::Bswap => match bits {
-                            1 | 8 => {
-                                if rd != src {
-                                    words.push(enc::mov(rd, src));
+                            Op::Ctz => {
+                                if bits == 64 {
+                                    words.push(enc::rbit(rd, src));
+                                    words.push(enc::clz(rd, rd));
+                                } else if bits == 32 {
+                                    words.push(enc::sf(false, enc::rbit(rd, src)));
+                                    words.push(enc::sf(false, enc::clz(rd, rd)));
+                                } else {
+                                    words.push(enc::orr_bit(rd, src, bits));
+                                    words.push(enc::rbit(rd, rd));
+                                    words.push(enc::clz(rd, rd));
                                 }
                             }
-                            16 => words.push(enc::rev16_w(rd, src)),
-                            32 => words.push(enc::rev_w(rd, src)),
-                            _ => words.push(enc::rev(rd, src)),
-                        },
-                        Op::Bitrev => {
-                            if bits == 32 {
-                                words.push(enc::sf(false, enc::rbit(rd, src)));
-                            } else {
-                                words.push(enc::rbit(rd, src));
-                                if bits < 64 {
-                                    words.push(enc::lsr_imm(rd, rd, 64 - bits));
+                            Op::Popcnt => {
+                                if has_cssc {
+                                    words.push(enc::cssc_cnt(rd, src));
+                                } else {
+                                    words.push(enc::fmov_to_d(V30, src));
+                                    words.push(enc::cnt_8b(V30, V30));
+                                    words.push(enc::addv_8b(V30, V30));
+                                    words.push(enc::fmov_from_d(rd, V30));
                                 }
                             }
+                            Op::Bswap => match bits {
+                                16 => words.push(enc::rev16_w(rd, src)),
+                                32 => words.push(enc::rev_w(rd, src)),
+                                _ => words.push(enc::rev(rd, src)),
+                            },
+                            Op::Bitrev => {
+                                if bits == 32 {
+                                    words.push(enc::sf(false, enc::rbit(rd, src)));
+                                } else {
+                                    words.push(enc::rbit(rd, src));
+                                    if bits < 64 {
+                                        words.push(enc::lsr_imm(rd, rd, 64 - bits));
+                                    }
+                                }
+                            }
+                            _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unsupported bit op" }),
                         }
-                        _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unsupported bit op" }),
-                    }
-                    if let Some(s) = sp {
-                        emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                        if let Some(s) = sp {
+                            emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                        }
                     }
                 }
                 Op::Udiv => {
@@ -10193,24 +10204,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             }
                         }
                         (Some(d), Some(_)) => {
-                            let (vd, sp) = dst_fp(inst);
-                            let va = load_fp(&mut words, src_v, V30);
-                            if vd != va {
-                                words.push(enc::fmov_reg(d, vd, va));
-                            }
-                            if let Some(s) = sp {
-                                emit_st_spill_fp(&mut words, vd, spill_base, s);
-                            }
+                            emit_fp_copy(&mut words, inst, src_v, d);
                         }
                         (None, None) => {
-                            let (rd, sp) = dst_gpr(inst);
-                            let ra = load_gpr(&mut words, src_v, X16);
-                            if rd != ra {
-                                words.push(enc::mov(rd, ra));
-                            }
-                            if let Some(s) = sp {
-                                emit_st_spill_gpr(&mut words, rd, spill_base, s);
-                            }
+                            emit_gpr_copy(&mut words, inst, src_v);
                         }
                     }
                 }
@@ -10449,29 +10446,25 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     }
                 }
                 Op::Zext => {
-                    let (rd, sp) = dst_gpr(inst);
-                    let src = load_gpr(&mut words, at_u32(view.data, inst), X16);
-                    if rd != src {
-                        words.push(enc::mov(rd, src));
-                    }
-                    emit_narrow(&mut words, rd, bits);
-                    if let Some(s) = sp {
-                        emit_st_spill_gpr(&mut words, rd, spill_base, s);
-                    }
+                    emit_gpr_copy(&mut words, inst, at_u32(view.data, inst));
                 }
                 Op::Sext => {
                     let src_v = at_u32(view.data, inst);
                     let src_bits = ty_at(view.tys, to_idx(src_v)).bits(64);
-                    let (rd, sp) = dst_gpr(inst);
-                    let src = load_gpr(&mut words, src_v, X16);
-                    if src_bits < 64 {
-                        words.push(enc::sext(rd, src, src_bits));
-                    } else if rd != src {
-                        words.push(enc::mov(rd, src));
-                    }
-                    emit_narrow(&mut words, rd, bits);
-                    if let Some(s) = sp {
-                        emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                    if src_bits == 64 && bits == 64 {
+                        emit_gpr_copy(&mut words, inst, src_v);
+                    } else {
+                        let (rd, sp) = dst_gpr(inst);
+                        let src = load_gpr(&mut words, src_v, X16);
+                        if src_bits < 64 {
+                            words.push(enc::sext(rd, src, src_bits));
+                        } else if rd != src {
+                            words.push(enc::mov(rd, src));
+                        }
+                        emit_narrow(&mut words, rd, bits);
+                        if let Some(s) = sp {
+                            emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                        }
                     }
                 }
                 Op::Trunc => {
@@ -10518,38 +10511,62 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         if let Some(s) = sp {
                             emit_st_spill_gpr(&mut words, rd, spill_base, s);
                         }
-                    } else {
-                        let src = if let Fusion::I128HiTrunc { src: x, .. } = at_fusion(&fusion, inst) {
-                            match at_loc(&reg_alloc.loc_of, to_idx(x)) {
+                    } else if let Fusion::I128HiTrunc { src: x, .. } = at_fusion(&fusion, inst) {
+                        let same_spill = bits == 64
+                            && sp.is_some_and(|s| matches!(at_loc(&reg_alloc.loc_of, to_idx(x)), AllocLoc::GprPairSpill(_, s1) if s1 == s));
+                        if !same_spill {
+                            let src = match at_loc(&reg_alloc.loc_of, to_idx(x)) {
                                 AllocLoc::GprPair(_, hi) => u32::from(hi),
                                 AllocLoc::GprPairSpill(_, s1) => {
-                                    emit_ld_spill_gpr(&mut words, X16, spill_base, s1);
-                                    X16
+                                    emit_ld_spill_gpr(&mut words, rd, spill_base, s1);
+                                    rd
                                 }
                                 _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected i128 hi trunc src loc" }),
+                            };
+                            if bits < 64 {
+                                words.push(enc::zext(rd, src, bits));
+                                if let Some(s) = sp {
+                                    emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                                }
+                            } else if let Some(s) = sp {
+                                emit_st_spill_gpr(&mut words, src, spill_base, s);
+                            } else if rd != src {
+                                words.push(enc::mov(rd, src));
                             }
-                        } else {
-                            let src_v = at_u32(view.data, inst);
-                            if ty_at(view.tys, to_idx(src_v)) == Ty::I128 {
-                                match at_loc(&reg_alloc.loc_of, to_idx(src_v)) {
+                        }
+                    } else {
+                        let src_v = at_u32(view.data, inst);
+                        if ty_at(view.tys, to_idx(src_v)) == Ty::I128 {
+                            let same_spill = bits == 64
+                                && sp.is_some_and(|s| matches!(at_loc(&reg_alloc.loc_of, to_idx(src_v)), AllocLoc::GprPairSpill(s0, _) if s0 == s));
+                            if !same_spill {
+                                let src = match at_loc(&reg_alloc.loc_of, to_idx(src_v)) {
                                     AllocLoc::GprPair(lo, _) => u32::from(lo),
                                     AllocLoc::GprPairSpill(s0, _) => {
-                                        emit_ld_spill_gpr(&mut words, X16, spill_base, s0);
-                                        X16
+                                        emit_ld_spill_gpr(&mut words, rd, spill_base, s0);
+                                        rd
                                     }
                                     _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected i128 trunc src loc" }),
+                                };
+                                if bits < 64 {
+                                    words.push(enc::zext(rd, src, bits));
+                                    if let Some(s) = sp {
+                                        emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                                    }
+                                } else if let Some(s) = sp {
+                                    emit_st_spill_gpr(&mut words, src, spill_base, s);
+                                } else if rd != src {
+                                    words.push(enc::mov(rd, src));
                                 }
-                            } else {
-                                load_gpr(&mut words, src_v, X16)
                             }
-                        };
-                        if bits < 64 {
+                        } else if bits == 64 {
+                            emit_gpr_copy(&mut words, inst, src_v);
+                        } else {
+                            let src = load_gpr(&mut words, src_v, X16);
                             words.push(enc::zext(rd, src, bits));
-                        } else if rd != src {
-                            words.push(enc::mov(rd, src));
-                        }
-                        if let Some(s) = sp {
-                            emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                            if let Some(s) = sp {
+                                emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                            }
                         }
                     }
                 }
@@ -13508,6 +13525,107 @@ mod tests {
                 0xe306_9283,
                 "Castagnoli CRC-32C(\"123456789\") via crc32cx + crc32cb"
             );
+        }
+    }
+
+    #[test]
+    fn same_slot_spill_moves_emit_zero_instructions() {
+        let alloc = test_alloc();
+
+        // 1. Direct `emit_parallel_moves` check: same-slot GPR, FP, and Vec128 spill self-moves
+        //    must emit ZERO AArch64 instructions!
+        let mut words: Vec<u32, Alloc<'static>> = Vec::new_in(alloc);
+        let mut gpr_self: Vec<(super::GprCopyLoc, super::GprCopyLoc), Alloc<'static>> = Vec::new_in(alloc);
+        gpr_self.push((super::GprCopyLoc::Spill(10), super::GprCopyLoc::Spill(10)));
+        gpr_self.push((super::GprCopyLoc::Reg(9), super::GprCopyLoc::Reg(9)));
+        super::emit_parallel_gpr_moves(&mut words, &mut gpr_self, 0)
+            .expect("same-slot GPR spill moves succeed");
+        assert!(
+            words.is_empty(),
+            "same-slot GPR spill/reg self-moves must emit 0 words, got {}",
+            words.len()
+        );
+
+        let mut fp_self: Vec<(super::FpCopyLoc, super::FpCopyLoc), Alloc<'static>> = Vec::new_in(alloc);
+        fp_self.push((super::FpCopyLoc::Spill(4), super::FpCopyLoc::Spill(4)));
+        fp_self.push((super::FpCopyLoc::VecSpill(6), super::FpCopyLoc::VecSpill(6)));
+        fp_self.push((super::FpCopyLoc::Reg(2), super::FpCopyLoc::Reg(2)));
+        super::emit_parallel_fp_moves(&mut words, &mut fp_self, 0)
+            .expect("same-slot FP/Vec spill moves succeed");
+        assert!(
+            words.is_empty(),
+            "same-slot FP/Vec spill/reg self-moves must emit 0 words, got {}",
+            words.len()
+        );
+
+        // 2. End-to-end high-pressure LIR (>26 simultaneously live GPRs forcing spills) where
+        //    spilled `i32` values flow through `Op::Zext (-> i64)` and `Op::PtrAddr`/`Op::FromExposed`
+        //    reusing the same spill slot: emitted machine code must contain ZERO no-op
+        //    `ldr xt, [sp, #off]; str xt, [sp, #off]` pairs!
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I32), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let x32 = b.param(Ty::I32);
+        let y64 = b.param(Ty::I64);
+        let c1_32 = b.iconst(Ty::I32, 1);
+        let c1_64 = b.iconst(Ty::I64, 1);
+        let mut spilled_i32s = Vec::with_capacity_in(30, alloc);
+        let mut cur32 = x32;
+        for _ in 0..30usize {
+            cur32 = b.binary(Op::Add, Flags::NONE, cur32, c1_32);
+            spilled_i32s.push(cur32);
+        }
+        let mut acc = y64;
+        for &v32 in &spilled_i32s {
+            let z64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, v32);
+            let p = b.convert(Op::FromExposed, Flags::NONE, Ty::PTR, z64);
+            let a = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, p);
+            acc = b.binary(Op::Xor, Flags::NONE, acc, a);
+        }
+        let out = b.binary(Op::Add, Flags::NONE, acc, c1_64);
+        b.ret(&[out]);
+
+        let func = b.finish_checked().expect("high-pressure spill-copy LIR builds");
+        let emitted = emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+            .expect("high-pressure spill-copy emits");
+        let code_words = decode_words(&emitted.code, alloc);
+
+        // Scan for any adjacent `ldr xt, [sp, #imm12*8]` immediately followed by
+        // `str xt, [sp, #imm12*8]` to the exact same register and stack slot!
+        let mut noop_spill_pairs = 0usize;
+        for pair in code_words.windows(2) {
+            let (w0, w1) = (pair[0], pair[1]);
+            let is_ldr_sp_x = (w0 & 0xffc0_03e0) == 0xf940_03e0;
+            if is_ldr_sp_x && w1 == (w0 ^ 0x0040_0000) {
+                noop_spill_pairs += 1;
+            }
+        }
+        assert_eq!(
+            noop_spill_pairs, 0,
+            "emitted high-pressure code must have ZERO no-op `ldr xt, [sp, #off]; str xt, [sp, #off]` pairs, got {noop_spill_pairs}"
+        );
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex = exec_leaf(emitted);
+            let f: extern "C" fn(u32, u64) -> u64 = unsafe { ex.as_fn() };
+            let x_in = 0x1234_5678u32;
+            let y_in = 0xdead_beef_cafe_babeu64;
+            let mut want = y_in;
+            let mut c = x_in;
+            for _ in 0..30usize {
+                c = c.wrapping_add(1);
+                want ^= u64::from(c);
+            }
+            want = want.wrapping_add(1);
+            assert_eq!(f(x_in, y_in), want, "high-pressure spill-copy runtime result mismatch");
         }
     }
 }

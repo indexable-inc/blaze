@@ -304,7 +304,7 @@ fn run_sota_loop_and_late_passes<'a>(
         Some(o) => o.func.view(),
         None => post_bce,
     };
-    let ifc_out = if_convert(post_unsw, 8, alloc).ok();
+    let ifc_out = if_convert(post_unsw, 32, alloc).ok();
     let post_ifc = match &ifc_out {
         Some(o) => o.func.view(),
         None => post_unsw,
