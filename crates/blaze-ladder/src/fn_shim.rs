@@ -76,19 +76,26 @@ pub(crate) fn fn_shim_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: I
 /// makes a ctor's row by `head_row`).
 pub(crate) fn untabled_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, ground: &PortableTys<'_>) -> Option<Instance> {
     let view = ground.view();
+    let (called, vtable_target) = match blaze_build::vtable_shim_of(called, view) {
+        Some(target) => (target, Some(target)),
+        None => (called, None),
+    };
     if let Some(target) = blaze_build::reify_shim_of(called, view) {
         return program.fn_index(target.item).is_none().then_some(target);
     }
-    let &first = view.list(called.args).ok()?.first()?;
-    if !METHODS.into_iter().any(|w| adts.fn_trait_method(w) == Some(called.item)) {
-        return None;
-    }
-    let owner = match view.node(first).ok()? {
-        PNode::FnDef(item, args) => Instance { item, args },
-        PNode::Closure { owner, args, .. } => Instance { item: owner, args },
-        _ => return None,
-    };
-    program.fn_index(owner.item).is_none().then_some(owner)
+    let fn_owner = (|| {
+        let &first = view.list(called.args).ok()?.first()?;
+        if !METHODS.into_iter().any(|w| adts.fn_trait_method(w) == Some(called.item)) {
+            return None;
+        }
+        let owner = match view.node(first).ok()? {
+            PNode::FnDef(item, args) => Instance { item, args },
+            PNode::Closure { owner, args, .. } => Instance { item: owner, args },
+            _ => return None,
+        };
+        program.fn_index(owner.item).is_none().then_some(owner)
+    })();
+    fn_owner.or_else(|| vtable_target.filter(|target| program.fn_index(target.item).is_none()))
 }
 
 /// The shape of an `Fn*` method call's `Self` that reached impl selection although the

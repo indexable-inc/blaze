@@ -486,6 +486,8 @@ blaze-comptime = { path = "crates/blaze-comptime" }
 # The C-name table a compile-time child's code is bound to, and its system layer (D175).
 blaze-comptime-sys = { path = "crates/blaze-comptime-sys" }
 blaze-data = { path = "crates/blaze-data" } # The one format-neutral value (CBOR, JSON, TOML, TAB) and `value!`.
+blaze-ecs = { path = "crates/blaze-ecs" } # Pure no_std, zero-unsafe, sans-IO relational ECS + Explorer API & WASM/WebGPU UI engine.
+blaze-ecs-wasm = { path = "crates/blaze-ecs-wasm" } # Zero-import no_std wasm32 C-ABI cdylib over blaze-ecs::ui.
 blaze-json = { path = "crates/blaze-json" }
 blaze-semver = { path = "crates/blaze-semver" }
 blaze-tab = { path = "crates/blaze-tab" } # Blaze's LLM-first tabular data format inspired by NUON (sparse schemas, lossless Value).

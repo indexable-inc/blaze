@@ -845,6 +845,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-ecs"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-int",
+ "blaze-json",
+ "blaze-math",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-tab",
+]
+
+[[package]]
+name = "blaze-ecs-wasm"
+version = "0.0.0"
+dependencies = [
+ "blaze-ecs",
+ "blaze-int",
+ "blaze-own",
+ "gpu",
+]
+
+[[package]]
 name = "blaze-ed25519"
 version = "0.0.0"
 dependencies = [
@@ -2104,6 +2127,7 @@ dependencies = [
  "blaze-core",
  "blaze-data",
  "blaze-deflate",
+ "blaze-ecs",
  "blaze-ed25519",
  "blaze-format",
  "blaze-glob",

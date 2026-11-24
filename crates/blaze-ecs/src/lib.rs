@@ -27,6 +27,12 @@
 //!   [`handle_http_request`], [`ExplorerResponse`]) and embedded Web UI ([`EXPLORER_HTML`]).
 
 
+#![no_std]
+#![forbid(unsafe_code)]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+
 pub mod column;
 pub mod error;
 pub mod explorer;
@@ -39,15 +45,17 @@ pub mod query;
 pub mod reflect;
 pub mod table;
 pub mod typed;
+pub mod ui;
 pub mod world;
 
 #[cfg(test)]
 mod tests;
 
-pub use crate::reflect_struct;
 pub use column::{AnyColumn, ComponentMeta, TypedColumn};
 pub use error::EcsError;
-pub use explorer::{EXPLORER_HTML, ExplorerResponse, handle_http_request, handle_request};
+pub use explorer::{
+    EXPLORER_HTML, ExplorerResponse, handle_http_request, handle_request, handle_request_with_wasm,
+};
 pub use fetch::{FetchIds, QueryFetch, TypedQuery};
 pub use id::{Builtins, ComponentId, Entity, Id, TableId};
 pub use observer::{DEFAULT_OBSERVER_CAP, Event, EventKind, ObserverCallback, ObserverId};

@@ -712,6 +712,9 @@ impl MakerState {
 /// Reification records a selected fn item. Closure coercion records `call_once` at the
 /// closure type, whose body belongs to the item that contains the closure expression.
 pub(super) fn static_fn_tabled<P: FrontEnd>(program: &P, instance: Instance, ground: blaze_typeck::PTys<'_>) -> ItemKey {
+    if let Some(target) = blaze_build::vtable_shim_of(instance, ground) {
+        return static_fn_tabled(program, target, ground);
+    }
     if let Some(target) = blaze_build::reify_shim_of(instance, ground) {
         return target.item;
     }
@@ -1052,6 +1055,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
         Some(of.owner_args)
     } else if crate::fn_shim::fn_shim_of(&facts, instance, &work.ground).is_some()
         || blaze_build::reify_shim_of(instance, work.ground.view()).is_some()
+        || blaze_build::vtable_shim_of(instance, work.ground.view()).is_some()
     {
         None
     } else {
@@ -1440,9 +1444,10 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         None if instance.item == function.key && builtin_clone.is_none() => crate::clone_shim::language_from(program, instance, &work.ground),
         _ => None,
     };
+    let is_vtable_shim = instance.item != function.key && blaze_build::vtable_shim_of(instance, work.ground.view()).is_some();
     let checked = match (function.body, bodies.checked.get(i).and_then(Option::as_ref)) {
         (Some((body, _)), Some(done)) => Some((body, done)),
-        _ if ctor_row.is_some() || builtin_clone.is_some() || builtin_from.is_some() => None,
+        _ if ctor_row.is_some() || builtin_clone.is_some() || builtin_from.is_some() || is_vtable_shim => None,
         _ => return Err(callee_refusal(program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, work.ground.view())),
     };
     let malformed = |_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
@@ -1452,10 +1457,15 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     work.reads.clear();
     let asking = Asking::new(program, i, &work.langs, bodies, &work.reads);
     let adts = asking.world();
-    let reify = if instance.item == function.key { None } else { blaze_build::reify_shim_of(instance, work.ground.view()) };
-    let coroutine = if instance.item == function.key || reify.is_some() { None } else { crate::front2::coroutines::part_of(&adts, instance, &work.ground) };
-    let shim = if instance.item == function.key || reify.is_some() || coroutine.is_some() { None } else { crate::fn_shim::fn_shim_of(&adts, instance, &work.ground) };
-    let closure = if instance.item == function.key || reify.is_some() || shim.is_some() || coroutine.is_some() {
+    let vtable_shim = if instance.item == function.key {
+        None
+    } else {
+        blaze_build::vtable_shim_of(instance, work.ground.view()).map(|target| super::vtable_shim_plan(&adts, target, &work.ground))
+    };
+    let reify = if instance.item == function.key || vtable_shim.is_some() { None } else { blaze_build::reify_shim_of(instance, work.ground.view()) };
+    let coroutine = if instance.item == function.key || vtable_shim.is_some() || reify.is_some() { None } else { crate::front2::coroutines::part_of(&adts, instance, &work.ground) };
+    let shim = if instance.item == function.key || vtable_shim.is_some() || reify.is_some() || coroutine.is_some() { None } else { crate::fn_shim::fn_shim_of(&adts, instance, &work.ground) };
+    let closure = if instance.item == function.key || vtable_shim.is_some() || reify.is_some() || shim.is_some() || coroutine.is_some() {
         None
     } else {
         let first = work.ground.view().list(instance.args).map_err(malformed)?.first().copied();
@@ -1468,7 +1478,9 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
             _ => return Err(callee_refusal(program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NotOwnInstance, work.ground.view())),
         }
     };
-    let owner_args = if let Some(target) = reify {
+    let owner_args = if let Some(plan) = vtable_shim {
+        plan.owner_args
+    } else if let Some(target) = reify {
         target.args
     } else {
         match shim {
@@ -1514,7 +1526,7 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     };
     // The states this instance's own types hold, laid out from types and each coroutine built
     // into its state BEFORE this build (lay_states.rs): the build never meets a state not laid.
-    if from_coroutine.is_none() && shim.is_none() {
+    if from_coroutine.is_none() && shim.is_none() && vtable_shim.is_none() {
         let roots = roots_of_instance(program, bodies, &adts, i, &args, &mut work.ground, work.alloc)?;
         if !roots.is_empty()
             && let Lay::Unchecked(owner) = lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &roots, work.alloc)?
@@ -1537,9 +1549,12 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, &adts, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, &adts, Global),
             }
-        } else if reify.is_some() || builtin_clone.is_some() || builtin_from.is_some() {
+        } else if vtable_shim.is_some() || reify.is_some() || builtin_clone.is_some() || builtin_from.is_some() {
             let g = Global;
-            if let Some(target) = reify {
+            if let Some(plan) = vtable_shim {
+                let sig = plan.needs_sig.then(|| program.sig(i));
+                blaze_build::build_vtable_shim(plan.target, sig.as_ref(), &mut subst, &adts, g)
+            } else if let Some(target) = reify {
                 blaze_build::build_reify_shim(target.item, &program.sig(i), &mut subst, &adts, g)
             } else if let Some(made) = builtin_clone {
                 // A fn item's and a fn pointer's clone is a copy of its bytes (`Copy` by the
@@ -1915,8 +1930,9 @@ fn vtable_rows<P: FrontEnd>(
         // this table's datum with it.
         let mut whole = true;
         for &(off, to) in table.relocs.iter() {
-            let f = match to {
-                VtableTarget::Fn(f) => f,
+            let (f, by_value_shim) = match to {
+                VtableTarget::Fn(f) => (f, false),
+                VtableTarget::ByValueShim(f) => (f, true),
                 VtableTarget::Super(sup) => {
                     todo.push(sup);
                     let symbol = vtable_symbol(sup, ground.view(), alloc).map_err(sym)?;
@@ -1939,7 +1955,11 @@ fn vtable_rows<P: FrontEnd>(
                 }
             };
             if let Some(c) = language_owner(program, adts, f, ground, i) {
-                word(reach.declare(program.function(c).key, f, ground, alloc).map_err(|e| named(e, f, &*ground))?);
+                let inst = match by_value_shim {
+                    true => blaze_build::vtable_shim_instance(f, ground).map_err(|e| fail(VtableFail::Build(e)))?,
+                    false => f,
+                };
+                word(reach.declare(program.function(c).key, inst, ground, alloc).map_err(|e| named(e, inst, &*ground))?);
                 continue;
             }
             // A `dyn Fn*` made from a fn item (or a closure) whose item no row tables yet: as
@@ -1973,7 +1993,12 @@ fn vtable_rows<P: FrontEnd>(
             if !bodied(program, asking.checked(), c) {
                 return Err(refusal());
             }
-            word(reach.declare(program.function(c).key, Instance { item, args }, ground, alloc).map_err(|e| named(e, Instance { item, args }, &*ground))?);
+            let target = Instance { item, args };
+            let inst = match by_value_shim {
+                true => blaze_build::vtable_shim_instance(target, ground).map_err(|e| fail(VtableFail::Build(e)))?,
+                false => target,
+            };
+            word(reach.declare(program.function(c).key, inst, ground, alloc).map_err(|e| named(e, inst, &*ground))?);
         }
         if whole {
             let symbol = vtable_symbol(t, ground.view(), alloc).map_err(sym)?;

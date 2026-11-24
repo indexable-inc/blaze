@@ -236,7 +236,8 @@ use blaze_lir::VerifyError;
 use blaze_typeck::{Adt, BodyView, Checked, Expr, ExprId, FmtTrait, FnSig, ItemKey, LangItem, List, Mutbl, PTy, PTys, PatId, PortableTys};
 
 pub use instance::{
-    Instance, InstanceKey, REIFY_SHIM_ITEM, closure_method_key_args, copy_written, ground, instance_key, instance_key_normalized, reify_shim_instance, reify_shim_key_args, reify_shim_of,
+    Instance, InstanceKey, REIFY_SHIM_ITEM, VTABLE_SHIM_ITEM, closure_method_key_args, copy_written, ground, instance_key, instance_key_normalized, reify_shim_instance, reify_shim_key_args,
+    reify_shim_of, vtable_shim_instance, vtable_shim_key_args, vtable_shim_of,
 };
 pub use walk::arith_checks::PanicConst;
 pub use walk::coroutine::{CoroutineFacts, CoroutineOf, StateShape, coroutine_facts, coroutine_of, coroutines_in, identity as coroutine_identity};
@@ -1318,6 +1319,24 @@ pub fn build_reify_shim<A: Allocator + Copy>(
     alloc: A,
 ) -> Result<Built<A>, BuildError> {
     walk::build_reify_shim(callee, sig, subst, adts, alloc)
+}
+
+/// Builds the by-value `self` `VTableShim` for `target` (named by [`VTABLE_SHIM_ITEM`]): takes
+/// `(data_ptr: *mut Self, args..)` where `data_ptr` points to the concrete receiver in memory
+/// (e.g. a `Box<dyn FnOnce>`'s heap allocation), moves `Self` out by value according to its Rust
+/// ABI, and calls `target` directly.
+///
+/// `sig` is `Some` for a concrete impl method (`subst.args == target.args`) or a fn item's
+/// `FnOnce::call_once` (`subst.args == fn_item_args`); `None` for a closure's `FnOnce::call_once`
+/// or a fn pointer's `FnOnce::call_once`.
+pub fn build_vtable_shim<A: Allocator + Copy>(
+    target: Instance,
+    sig: Option<&FnSig<'_>>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    walk::build_vtable_shim(target, sig, subst, adts, alloc)
 }
 
 /// Builds the CTOR FN `ctor` of variant `variant` (a struct's is 0) of a tuple struct or tuple

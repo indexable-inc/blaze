@@ -188,3 +188,22 @@ pub struct Builtins {
     /// Relation trait: despawning `target` cascades despawn to all entities with `(rel, target)`.
     pub on_delete_cascade: Entity,
 }
+
+impl Builtins {
+    /// Canonical names of the built-in relation/trait entities created by `World::new_in`.
+    pub const NAMES: &'static [&'static str] = &[
+        "ChildOf",
+        "IsA",
+        "Prefab",
+        "Exclusive",
+        "Symmetric",
+        "Transitive",
+        "OnDeleteCascade",
+    ];
+
+    /// Whether `name` matches one of the built-in ECS entities.
+    #[inline]
+    pub fn is_builtin_name(name: &str) -> bool {
+        Self::NAMES.iter().any(|&b| b == name)
+    }
+}

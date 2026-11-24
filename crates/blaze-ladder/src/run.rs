@@ -563,11 +563,39 @@ fn closure_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, gr
 /// for a vtable's method word (census g091226: 467 words "NoImpl at a closure" while calls
 /// found the closure's body).
 fn language_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, ground: &PortableTys<'_>, caller: usize) -> Option<usize> {
+    if let Some(target) = blaze_build::vtable_shim_of(called, ground.view()) {
+        return language_owner(program, adts, target, ground, caller).or_else(|| program.fn_index(target.item));
+    }
     crate::front2::coroutines::owner_of(program, adts, called, ground)
         .or_else(|| closure_owner(program, adts, called, ground))
         .or_else(|| crate::fn_shim::fn_shim_owner(program, adts, called, ground, caller))
         .or_else(|| blaze_build::reify_shim_of(called, ground.view()).and_then(|t| program.fn_index(t.item)))
         .or_else(|| crate::clone_shim::language_from(program, called, ground).and_then(|f| program.fn_index(f.from)))
+}
+
+/// What a by-value `self` `VTableShim` build needs from its tabled row (one home for `run.rs`
+/// and `run/make_one.rs`).
+#[derive(Clone, Copy)]
+struct VtableShimPlan {
+    target: Instance,
+    owner_args: List,
+    needs_sig: bool,
+}
+
+fn vtable_shim_plan(adts: &dyn Adts, target: Instance, ground: &PortableTys<'_>) -> VtableShimPlan {
+    if let Some(s) = crate::fn_shim::fn_shim_of(adts, target, ground) {
+        return match s.item {
+            Some((_, fn_args)) => VtableShimPlan { target, owner_args: fn_args, needs_sig: true },
+            None => VtableShimPlan { target, owner_args: List::EMPTY, needs_sig: false },
+        };
+    }
+    if adts.fn_trait_method(blaze_build::FnTrait::FnOnce) == Some(target.item)
+        && let Ok([first, _]) = ground.view().list(target.args)
+        && let Some(of) = blaze_build::closure_of(ground.view(), *first)
+    {
+        return VtableShimPlan { target, owner_args: of.owner_args, needs_sig: false };
+    }
+    VtableShimPlan { target, owner_args: target.args, needs_sig: true }
 }
 
 /// The refusal of `function`'s call of trait fn `called` when impl selection refused it: a
@@ -2180,6 +2208,10 @@ fn build_from<P: FrontEnd>(
             BuildError::Projection { .. } if let Some(why) = program.last_projection() => RunError::Projection { function: program.function(c).named(), why },
             error => RunError::Build { function: program.function(c).named(), error, range: None },
         };
+        if let Some(target) = blaze_build::vtable_shim_of(instance, ground.view()) {
+            let args = blaze_build::vtable_shim_key_args(target, ground, alloc).map_err(fail)?;
+            return blaze_build::instance_key_normalized(code, args, PTys::EMPTY, ground, facts, alloc).map_err(fail);
+        }
         let from = checked.get(c).and_then(Option::as_ref).map_or(PTys::EMPTY, |d| d.types.view());
         let args = if let Some(shim) = clones.shim_of(instance, ground) {
             // A builtin clone, keyed by `Self` and whether it is `Copy` (clone_shim.rs).
@@ -2455,7 +2487,12 @@ fn build_from<P: FrontEnd>(
         let function = program.function(i);
         let name = || function.named();
         let body = function.body.map(|(body, _)| body);
-        if body.is_none() && ctor_row.is_none() && clone_row.is_none() && from_row.is_none() {
+        if body.is_none()
+            && ctor_row.is_none()
+            && clone_row.is_none()
+            && from_row.is_none()
+            && blaze_build::vtable_shim_of(instance, ground.view()).is_none()
+        {
             return Err(callee_refusal(&*program, named, instance.args, instance, crate::callee_shown::CalleeGap::NoBody, ground.view()));
         }
         // The record walk: the entry its key's pointer names is used only when every row of its
@@ -2516,22 +2553,28 @@ fn build_from<P: FrontEnd>(
         // One of a coroutine's three functions (`Future::poll`, the resume fn, `drop_in_place`,
         // each at `[coroutine]`; tabled as the block's owner): taken from the one build of that
         // coroutine instance (front2/coroutines.rs, `build_coroutines`).
-        let reify = if is_own_instance {
+        let vtable_shim = if is_own_instance {
+            None
+        } else {
+            blaze_build::vtable_shim_of(instance, ground.view())
+                .map(|target| vtable_shim_plan(&FrontAdts(program, i, &consts, &langs, &checked_bodies), target, &ground))
+        };
+        let reify = if is_own_instance || vtable_shim.is_some() {
             None
         } else {
             blaze_build::reify_shim_of(instance, ground.view())
         };
-        let coroutine = if is_own_instance || reify.is_some() {
+        let coroutine = if is_own_instance || vtable_shim.is_some() || reify.is_some() {
             None
         } else {
             crate::front2::coroutines::part_of(&FrontAdts(program, i, &consts, &langs, &checked_bodies), instance, &ground)
         };
-        let shim = if is_own_instance || reify.is_some() || coroutine.is_some() {
+        let shim = if is_own_instance || vtable_shim.is_some() || reify.is_some() || coroutine.is_some() {
             None
         } else {
             crate::fn_shim::fn_shim_of(&FrontAdts(program, i, &consts, &langs, &checked_bodies), instance, &ground)
         };
-        let closure = if is_own_instance || reify.is_some() || shim.is_some() || coroutine.is_some() {
+        let closure = if is_own_instance || vtable_shim.is_some() || reify.is_some() || shim.is_some() || coroutine.is_some() {
             None
         } else {
             let first = ground.view().list(instance.args).map_err(malformed)?.first().copied();
@@ -2546,6 +2589,8 @@ fn build_from<P: FrontEnd>(
         };
         let owner_args = if spec_i.is_some() {
             List::EMPTY
+        } else if let Some(plan) = vtable_shim {
+            plan.owner_args
         } else if let Some(target) = reify {
             target.args
         } else {
@@ -2593,7 +2638,7 @@ fn build_from<P: FrontEnd>(
         // built into its state BEFORE this build (run/lay_states.rs): the build never meets a
         // state not laid. A coroutine's own function was built with its coroutine; a shim has
         // no body of its own.
-        if from_coroutine.is_none() && shim.is_none() && clone_row.is_none() && from_row.is_none() {
+        if from_coroutine.is_none() && shim.is_none() && vtable_shim.is_none() && clone_row.is_none() && from_row.is_none() {
             let adts = FrontAdts(&*program, i, &consts, &langs, &checked_bodies);
             let laid = match lay_states::roots_of_instance(&*program, &checked_bodies, &adts, i, &args, &mut ground, alloc) {
                 Ok(roots) if roots.is_empty() => Ok(lay_states::Lay::Done),
@@ -2630,9 +2675,12 @@ fn build_from<P: FrontEnd>(
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, world, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, world, Global),
             }
-        } else if reify.is_some() || clone_row.is_some() || from_row.is_some() {
+        } else if vtable_shim.is_some() || reify.is_some() || clone_row.is_some() || from_row.is_some() {
             let g = Global;
-            if let Some(target) = reify {
+            if let Some(plan) = vtable_shim {
+                let sig = plan.needs_sig.then(|| program.sig(i));
+                blaze_build::build_vtable_shim(plan.target, sig.as_ref(), &mut subst, world, g)
+            } else if let Some(target) = reify {
                 blaze_build::build_reify_shim(target.item, &program.sig(i), &mut subst, world, g)
             } else if let Some((s, copy)) = clone_row {
                 // A builtin clone: its bytes when `Self: Copy`, else each field's own `clone`.
@@ -2978,11 +3026,20 @@ fn build_from<P: FrontEnd>(
                     for &(offset, to) in table.relocs.iter() {
                         // A fn item of a trait's method as the word's self: the body that runs,
                         // as for a call (fn_item_resolve.rs).
-                        let to = match to {
-                            VtableTarget::Fn(f) => VtableTarget::Fn(crate::fn_item_resolve::resolved_shim_self(program, &adts, i, f, &mut ground).map_err(|error| {
-                                RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), at: crate::callee_shown::self_shown(program, ground.view(), f.args), error }
-                            })?),
-                            to => to,
+                        let (to, by_value_shim) = match to {
+                            VtableTarget::Fn(f) => {
+                                let f = crate::fn_item_resolve::resolved_shim_self(program, &adts, i, f, &mut ground).map_err(|error| {
+                                    RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), at: crate::callee_shown::self_shown(program, ground.view(), f.args), error }
+                                })?;
+                                (VtableTarget::Fn(f), false)
+                            }
+                            VtableTarget::ByValueShim(f) => {
+                                let f = crate::fn_item_resolve::resolved_shim_self(program, &adts, i, f, &mut ground).map_err(|error| {
+                                    RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), at: crate::callee_shown::self_shown(program, ground.view(), f.args), error }
+                                })?;
+                                (VtableTarget::Fn(f), true)
+                            }
+                            to => (to, false),
                         };
                         let word = match to {
                             // A coroutine's own `Future::poll` or drop (`dyn Future` of an async
@@ -2990,8 +3047,12 @@ fn build_from<P: FrontEnd>(
                             // item's or pointer's (its shim): what the language gives, as a
                             // call's callee (`language_owner`), never a selected impl.
                             VtableTarget::Fn(f) if let Some(c) = language_owner(program, &adts, f, &ground, i) => {
-                                let key = key_of(program, c, f, &mut ground, &adts)?;
-                                VtableWord::Slot(reached.slot(f, c, key)?)
+                                let inst = match by_value_shim {
+                                    true => blaze_build::vtable_shim_instance(f, &mut ground).map_err(|e| fail(VtableFail::Build(e)))?,
+                                    false => f,
+                                };
+                                let key = key_of(program, c, inst, &mut ground, &adts)?;
+                                VtableWord::Slot(reached.slot(inst, c, key)?)
                             }
                             VtableTarget::Fn(f) => {
                                 // A trait method runs as the selected impl's; the glue is itself.
@@ -3005,9 +3066,15 @@ fn build_from<P: FrontEnd>(
                                 let Some(c) = c else {
                                     return Err(callee_refusal(&*program, name(), instance.args, Instance { item, args }, crate::callee_shown::CalleeGap::VtableWord, ground.view()));
                                 };
-                                let key = key_of(program, c, Instance { item, args }, &mut ground, &adts)?;
-                                VtableWord::Slot(reached.slot(Instance { item, args }, c, key)?)
+                                let target = Instance { item, args };
+                                let inst = match by_value_shim {
+                                    true => blaze_build::vtable_shim_instance(target, &mut ground).map_err(|e| fail(VtableFail::Build(e)))?,
+                                    false => target,
+                                };
+                                let key = key_of(program, c, inst, &mut ground, &adts)?;
+                                VtableWord::Slot(reached.slot(inst, c, key)?)
                             }
+                            VtableTarget::ByValueShim(_) => unreachable!("normalized above"),
                             VtableTarget::Super(sup) => match tables.refs.iter().position(|r| *r == sup) {
                                 Some(n) => VtableWord::Table(u32::try_from(n).map_err(|_| RunError::TooManyInstances)?),
                                 None => return Err(fail(VtableFail::Shape(blaze_build::vtable::VtableError::NoTrait(sup.principal)))),
