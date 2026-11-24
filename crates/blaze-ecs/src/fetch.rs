@@ -1888,4 +1888,15 @@ impl<'w, Q: QueryFetch, A: Allocator + Copy + 'static> TypedQuery<'w, Q, A> {
     pub fn count(self) -> Result<usize, EcsError> {
         self.world.count_filtered::<Q>(&self.spec)
     }
+
+    /// Return the first matching [`Entity`] for this query, if any.
+    pub fn first_entity(self) -> Result<Option<Entity>, EcsError> {
+        let mut found: Option<Entity> = None;
+        self.world.each_with_entity_filtered::<Q>(&self.spec, |ent, _| {
+            if found.is_none() {
+                found = Some(ent);
+            }
+        })?;
+        Ok(found)
+    }
 }

@@ -202,6 +202,7 @@ pub struct SiteHandle {
     copy_buf: OwnString<WasmAlloc>,
     nav_buf: OwnString<WasmAlloc>,
     html_buf: OwnString<WasmAlloc>,
+    og_rgba: OwnVec<u8, WasmAlloc>,
     projected_entities: u32,
 }
 
@@ -232,6 +233,7 @@ pub extern "C" fn site_create() -> *mut SiteHandle {
             copy_buf: OwnString::new_in(alloc),
             nav_buf: OwnString::new_in(alloc),
             html_buf: OwnString::new_in(alloc),
+            og_rgba: OwnVec::new_in(alloc),
             projected_entities: 0,
         },
         alloc,
@@ -595,6 +597,34 @@ pub extern "C" fn site_project_html_ptr(h: *mut SiteHandle) -> *const u8 {
 #[unsafe(no_mangle)]
 pub extern "C" fn site_projected_entities(h: *mut SiteHandle) -> u32 {
     with_handle(h).map_or(0, |st| st.projected_entities)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn site_og_width() -> u32 {
+    blaze_site::OG_WIDTH
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn site_og_height() -> u32 {
+    blaze_site::OG_HEIGHT
+}
+
+/// Render a `1200×630` Open Graph RGBA8 image directly from the ECS via Rust GPU `slug_site_fs`.
+#[unsafe(no_mangle)]
+pub extern "C" fn site_render_og_rgba_len(h: *mut SiteHandle) -> usize {
+    let Some(st) = with_handle(h) else { return 0 };
+    match st.site.render_og_rgba(&mut st.og_rgba) {
+        Ok(_) => st.og_rgba.len(),
+        Err(_) => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn site_og_rgba_ptr(h: *mut SiteHandle) -> *const u8 {
+    match with_handle(h) {
+        Some(st) => st.og_rgba.as_ptr(),
+        None => ptr::null(),
+    }
 }
 
 #[cfg(test)]

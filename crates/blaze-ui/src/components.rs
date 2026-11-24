@@ -16,7 +16,7 @@ use blaze_own::{String as OwnString, Vec as OwnVec};
 use crate::error::UiError;
 use crate::shaders::{GlyphInst, RectInst};
 use crate::style::{LayoutStyle, PaintStyle};
-use crate::types::Rect;
+use crate::types::{Rect, Rgba, Vec2};
 
 // =============================================================================
 // Typed ECS Relations
@@ -196,6 +196,43 @@ pub struct LabelText<A: Allocator + Copy>(pub OwnString<A>);
 
 /// Secondary owned UTF-8 value / metadata / shortcut text component.
 pub struct SubText<A: Allocator + Copy>(pub OwnString<A>);
+
+/// Explicit intrinsic `(width, height)` override measured from Slug / HarfBuzz outlines so
+/// `LayoutEngine` sizes SwiftUI-style `Text` / `ShapedText` ECS leaves with sub-pixel accuracy.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct IntrinsicSize(pub Vec2);
+
+/// Typography parameters for a SwiftUI-style `Text` ECS entity rendered with `den` Slug outlines.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextStyle {
+    pub size: f32,
+    pub family: u32,
+    pub weight: u32,
+    pub opsz: f32,
+    pub color: Rgba,
+}
+
+impl Default for TextStyle {
+    fn default() -> Self {
+        Self { size: 16.0, family: 0, weight: 400, opsz: 14.0, color: Rgba::WHITE }
+    }
+}
+
+/// One pre-shaped HarfBuzz glyph inside a [`ShapedText`] ECS component.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShapedGlyph {
+    pub glyph_id: u32,
+    pub x_em: f32,
+    pub color: Rgba,
+}
+
+/// Pre-shaped vector text run stored directly as an ECS component (measured by `LayoutEngine` and
+/// rendered by the Rust GPU Slug fragment shader).
+pub struct ShapedText<A: Allocator + Copy> {
+    pub glyphs: OwnVec<ShapedGlyph, A>,
+    pub size: f32,
+    pub adv_em: f32,
+}
 
 /// Boolean toggle / checkbox state component.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

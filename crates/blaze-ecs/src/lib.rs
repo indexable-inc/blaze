@@ -46,6 +46,8 @@ pub mod query;
 pub mod query_macro;
 pub mod reactive;
 pub mod reflect;
+#[macro_use]
+pub mod scene_macro;
 pub mod table;
 pub mod typed;
 pub mod ui;

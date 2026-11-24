@@ -286,6 +286,31 @@ impl<'w, A: Allocator + Copy + 'static> EntityMut<'w, A> {
         self.entity
     }
 
+    /// Borrow the owning [`World`] mutably for nested child/relation builders.
+    #[inline]
+    pub fn world_mut(&mut self) -> &mut World<A> {
+        self.world
+    }
+
+    /// Mark this entity with Flecs 4.2 `OrderedChildren` so `children_slice` preserves insertion order.
+    #[inline]
+    pub fn ordered_children(self) -> Result<Self, EcsError> {
+        let tag = self.world.ordered_children();
+        self.world.add_tag(self.entity, tag)?;
+        Ok(self)
+    }
+
+    /// Scoped SwiftUI/Flecs-style child builder: invokes `f(world, self.id())` so nested children
+    /// can attach via `(ChildOf, parent)` cleanly without breaking fluent chaining.
+    #[inline]
+    pub fn with_children<F>(self, f: F) -> Result<Self, EcsError>
+    where
+        F: FnOnce(&mut World<A>, Entity) -> Result<(), EcsError>,
+    {
+        f(self.world, self.entity)?;
+        Ok(self)
+    }
+
     /// Set (insert or overwrite) component `T`, lazily registering `T` if needed.
     #[inline]
     pub fn with<T: 'static>(self, value: T) -> Result<Self, EcsError> {

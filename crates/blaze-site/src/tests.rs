@@ -369,3 +369,85 @@ fn flecs_style_ecs_query_macro_supports_fetches_filters_relations_dont_fragment_
     let matched_tables = w.query_tables(&mut cached).expect("sync");
     assert!(!matched_tables.is_empty());
 }
+
+#[test]
+fn renders_ecs_driven_open_graph_card_via_rust_gpu_slug_shader() {
+    use blaze_own::Vec as OwnVec;
+
+    let a = alloc();
+    let mut site = BlazeSite::new_in(a).expect("site");
+    site.load_page_json(SAMPLE_PAGE_JSON).expect("load");
+    let mut rgba: OwnVec<u8, _> = OwnVec::new_in(a);
+    let stats = site.render_og_rgba(&mut rgba).expect("render_og_rgba");
+    assert_eq!(stats.width, crate::OG_WIDTH);
+    assert_eq!(stats.height, crate::OG_HEIGHT);
+    assert_eq!(rgba.len(), 1200 * 630 * 4);
+    assert!(stats.ecs_entities_queried >= 4);
+    assert!(stats.inst_count >= 6);
+    // Verify the obsidian border card / ember accent actually painted non-uniform pixels
+    let first_px = rgba.as_slice().get(0..4).unwrap_or(&[]);
+    let mut diff_pixels = 0usize;
+    for chunk in rgba.as_slice().chunks_exact(4) {
+        if chunk != first_px {
+            diff_pixels += 1;
+        }
+    }
+    assert!(stats.view_entities_laid_out >= 10);
+    assert!(diff_pixels > 1000, "expected rendered SDF plates/rings/accent on OG card");
+}
+
+#[test]
+fn flecs_script_ecs_scene_macro_declares_prefabs_relations_tags_singletons_and_hierarchies() {
+    use blaze_ecs::{ChildOf, Relation, World, ecs_query, ecs_scene};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Mass(u32);
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Radius(u32);
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Gravity(u32);
+    struct Habitable;
+    struct Orbits;
+    impl Relation for Orbits {}
+
+    let a = alloc();
+    let mut w = World::new_in(a).expect("world");
+
+    ecs_scene!(&mut w, {
+        singleton Gravity = Gravity(98);
+
+        prefab Planet {
+            copy Mass = Mass(100);
+            copy Radius = Radius(64);
+        }
+
+        SolarSystem {
+            let earth = Earth : Planet {
+                #Habitable;
+                copy Radius = Radius(6371);
+                Moon {
+                    (Orbits, earth);
+                    copy Mass = Mass(1);
+                }
+            }
+        }
+    })
+    .expect("ecs_scene");
+
+    assert_eq!(w.singleton::<Gravity>().unwrap().copied(), Some(Gravity(98)));
+    let sys = w.entity_by_name("SolarSystem").expect("SolarSystem");
+    let earth = w.entity_by_name("Earth").expect("Earth");
+    let moon = w.entity_by_name("Moon").expect("Moon");
+    assert_eq!(w.parent_of(earth).unwrap(), Some(sys));
+    assert_eq!(w.parent_of(moon).unwrap(), Some(earth));
+    assert!(w.has_tag_typed::<Habitable>(earth).unwrap());
+    assert!(w.has_relation::<Orbits>(moon, earth).unwrap());
+    assert_eq!(w.get::<Mass>(earth).unwrap().copied(), Some(Mass(100)));
+    assert_eq!(w.get::<Radius>(earth).unwrap().copied(), Some(Radius(6371)));
+
+    let orbiters = ecs_query!(&mut w, &Mass, (Orbits, earth), (ChildOf, earth))
+        .expect("q")
+        .count()
+        .expect("c");
+    assert_eq!(orbiters, 1);
+}

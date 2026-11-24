@@ -285,6 +285,23 @@ impl<A: Allocator + Copy + 'static> BlazeSite<A> {
         crate::html::project_ecs_html(&self.world, handles, &self.model, self.is_dark(), out, self.alloc)
     }
 
+    /// Render a `1200×630` Open Graph RGBA8 image strictly from the live `blaze_ecs::World`
+    /// (`ecs_query!` + SwiftUI-style `blaze_ui::ViewScope` + `LayoutEngine` + Rust GPU `slug_site_fs`).
+    pub fn render_og_rgba(&mut self, rgba_out: &mut OwnVec<u8, A>) -> Result<crate::og::OgStats, SiteError> {
+        if !self.model_loaded {
+            rgba_out.clear();
+            return Ok(crate::og::OgStats::default());
+        }
+        let dark = self.is_dark();
+        crate::og::render_og_card_rgba(
+            &mut self.world,
+            &self.table,
+            dark,
+            rgba_out,
+            self.alloc,
+        )
+    }
+
     pub fn theme(&self) -> SiteTheme {
         if self.is_dark() { SiteTheme::dark() } else { SiteTheme::light() }
     }
