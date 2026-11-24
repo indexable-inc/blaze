@@ -80,21 +80,35 @@ pub enum TraitArgs {
     At(List),
 }
 
+/// How a trait method is dispatched in a vtable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MethodDispatch {
+    /// Not callable on the trait object: no vtable slot (`where Self: Sized`, generic, or a
+    /// non-dispatchable `self` receiver).
+    None,
+    /// Standard dispatchable receiver (`&self`, `&mut self`, `Box<Self>`, `Rc<Self>`, `Arc<Self>`,
+    /// `Pin<P>`): the vtable slot points directly to the concrete method.
+    Direct,
+    /// By-value `self` receiver (`FnOnce::call_once(self, args)`): the vtable slot holds a
+    /// [`crate::VTABLE_SHIM_ITEM`] shim taking `*mut Self` and moving `Self` out by value into
+    /// the concrete method.
+    ByValueShim,
+}
+
 /// One method of a trait.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ObjectMethod {
     pub item: ItemKey,
-    /// Whether it has a slot: false for a method with `where Self: Sized` or generic
-    /// parameters (the Reference, "Trait objects", dyn compatibility: such a method is not
-    /// callable on the object).
-    pub dispatch: bool,
+    /// How this method is dispatched in vtables ([`MethodDispatch`]).
+    pub dispatch: MethodDispatch,
 }
 
 /// A word after the header.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Word {
-    /// Method `item` of trait `trait_`, an instance at `args`.
-    Method { trait_: ItemKey, item: ItemKey, args: TraitArgs },
+    /// Method `item` of trait `trait_`, an instance at `args`. `by_value`: true when the slot
+    /// holds a [`crate::VTABLE_SHIM_ITEM`] shim (`MethodDispatch::ByValueShim`).
+    Method { trait_: ItemKey, item: ItemKey, args: TraitArgs, by_value: bool },
     /// The address of the same concrete type's table for supertrait `trait_` at `args`,
     /// off the first chain.
     Super { trait_: ItemKey, args: TraitArgs },
@@ -224,7 +238,11 @@ impl<'a> Shape<'a> {
                 continue;
             }
             stack.pop();
-            words.extend(o.methods.iter().filter(|m| m.dispatch).map(|m| Word::Method { trait_: t, item: m.item, args: at }));
+            words.extend(o.methods.iter().filter_map(|m| match m.dispatch {
+                MethodDispatch::None => None,
+                MethodDispatch::Direct => Some(Word::Method { trait_: t, item: m.item, args: at, by_value: false }),
+                MethodDispatch::ByValueShim => Some(Word::Method { trait_: t, item: m.item, args: at, by_value: true }),
+            }));
             match first {
                 true => prefix.push(t),
                 false => words.push(Word::Super { trait_: t, args: at }),
@@ -236,7 +254,16 @@ impl<'a> Shape<'a> {
 
     /// The slot (after the header) of method `item`, `None` when it has none.
     pub fn slot(&self, item: ItemKey) -> Option<u32> {
-        self.words.iter().position(|w| matches!(*w, Word::Method { item: i, .. } if i == item)).and_then(|at| u32::try_from(at).ok())
+        self.slot_info(item).map(|(slot, _)| slot)
+    }
+
+    /// The slot (after the header) of method `item` and whether it is a by-value `self` shim
+    /// (`MethodDispatch::ByValueShim`); `None` when the method has no slot.
+    pub fn slot_info(&self, item: ItemKey) -> Option<(u32, bool)> {
+        self.words.iter().enumerate().find_map(|(at, w)| match *w {
+            Word::Method { item: i, by_value, .. } if i == item => u32::try_from(at).ok().map(|s| (s, by_value)),
+            _ => None,
+        })
     }
 
     /// How to upcast to supertrait `to`; `None` when `to` is not the principal or above it.
@@ -329,6 +356,10 @@ pub enum VtableTarget {
     /// A fn instance's entry: the drop glue, or a trait method at `[T, trait args..]` (the
     /// world resolves it to the impl's, as for any trait method call).
     Fn(Instance),
+    /// A by-value `self` trait method (`FnOnce::call_once` at `[T, Args]`): the world resolves
+    /// `Instance` to the concrete callee (closure, fn shim, or impl method) and wraps it in a
+    /// [`crate::VTABLE_SHIM_ITEM`] shim taking `*mut T` as parameter 0.
+    ByValueShim(Instance),
     /// The same concrete type's table for a supertrait off the first chain, with its grounded
     /// arguments after `Self`.
     Super(VtableRef),
@@ -377,8 +408,11 @@ impl<A: Allocator + Copy> Vtable<A> {
             let word_idx = u32::try_from(i).map_err(|_| BuildError::Malformed { what: "a vtable past 2^32 words" })?;
             let offset = 8 * (HEADER_WORDS + word_idx);
             let to = match *w {
-                Word::Method { item, args: TraitArgs::Principal, .. } => VtableTarget::Fn(Instance { item, args: principal_args }),
-                Word::Method { item, args: TraitArgs::At(list), .. } => {
+                Word::Method { item, args: TraitArgs::Principal, by_value, .. } => {
+                    let inst = Instance { item, args: principal_args };
+                    if by_value { VtableTarget::ByValueShim(inst) } else { VtableTarget::Fn(inst) }
+                }
+                Word::Method { item, args: TraitArgs::At(list), by_value, .. } => {
                     let at = shape_view.list(list).map_err(|_| BuildError::Malformed { what: "a vtable word's arguments past its shape's table" })?;
                     picked.clear();
                     picked.push(concrete);
@@ -387,7 +421,8 @@ impl<A: Allocator + Copy> Vtable<A> {
                         picked.push(g);
                     }
                     let args: List = ground.intern_list(&picked).map_err(|_| full())?;
-                    VtableTarget::Fn(Instance { item, args })
+                    let inst = Instance { item, args };
+                    if by_value { VtableTarget::ByValueShim(inst) } else { VtableTarget::Fn(inst) }
                 }
                 Word::Super { trait_, args: TraitArgs::Principal } => {
                     let args: List = ground.intern_list(args).map_err(|_| full())?;
@@ -422,7 +457,7 @@ impl<A: Allocator + Copy> Vtable<A> {
         let mut relocs = Vec::with_capacity_in(self.relocs.len(), alloc);
         for &(offset, to) in self.relocs.iter() {
             let target = match to {
-                VtableTarget::Fn(i) => DataTarget::Fn(fn_key(i)?),
+                VtableTarget::Fn(i) | VtableTarget::ByValueShim(i) => DataTarget::Fn(fn_key(i)?),
                 VtableTarget::Super(s) => DataTarget::Vtable(super_key(s)?),
             };
             relocs.push(DataReloc { offset, target });
