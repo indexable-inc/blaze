@@ -253,6 +253,12 @@ impl Facts for NestedFacts<'_, '_> {
     fn is_fn_trait(&self, trait_: tc::ItemKey) -> bool {
         self.facts.is_fn_trait(trait_)
     }
+    fn is_future_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.is_future_trait(trait_)
+    }
+    fn is_into_future_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.is_into_future_trait(trait_)
+    }
     fn assoc_item(&self, trait_: tc::ItemKey, name: tc::Name) -> Option<tc::ItemKey> {
         self.facts.assoc_item(trait_, name)
     }

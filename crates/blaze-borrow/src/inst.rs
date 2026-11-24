@@ -162,6 +162,9 @@ pub enum Slots<'c> {
     /// A caller-table type (in `types`, e.g. a closure's `FnPtr` signature), its regions read
     /// through environment `env`.
     CallerEnv { col: &'c [Region], env: EnvId },
+    /// A caller-table type (in `types`, e.g. an anonymous `async { .. }` block's `Future::Output`)
+    /// whose `len` slots are fresh existential origins bound at `Param(start..start + len)` in `env`.
+    CallerFresh { env: EnvId, start: u32, len: SlotCount },
 }
 
 impl<'c> Slots<'c> {
@@ -170,6 +173,7 @@ impl<'c> Slots<'c> {
         match self {
             Slots::Caller(r) => Some(r.count()),
             Slots::Sig { col, .. } | Slots::CallerEnv { col, .. } => SlotCount::of_len(col.len()),
+            Slots::CallerFresh { len, .. } => Some(len),
         }
     }
 
@@ -190,6 +194,14 @@ impl<'c> Slots<'c> {
                 }
                 let (a, b) = col.split_at(n.len());
                 Some((Slots::CallerEnv { col: a, env }, Slots::CallerEnv { col: b, env }))
+            }
+            Slots::CallerFresh { env, start, len } => {
+                if n.get() > len.get() {
+                    return None;
+                }
+                let mid = start.checked_add(n.get())?;
+                let rem = SlotCount::new(len.get() - n.get());
+                Some((Slots::CallerFresh { env, start, len: n }, Slots::CallerFresh { env, start: mid, len: rem }))
             }
         }
     }
@@ -754,6 +766,16 @@ pub trait Selected {
     }
     /// Whether `trait_` is one of the `Fn` / `FnMut` / `FnOnce` language traits.
     fn is_fn_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
+    /// Whether `trait_` is `core::future::Future`.
+    fn is_future_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
+    /// Whether `trait_` is `core::future::IntoFuture`.
+    fn is_into_future_trait(&self, trait_: ItemKey) -> bool {
         let _ = trait_;
         false
     }
