@@ -252,6 +252,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                             PClause::Const { .. } => return Err(Why::Unsupported("a trait alias with `where const` in a trait object", pr)),
                             PClause::TypeOutlives { .. } => return Err(Why::Unsupported("a trait alias with a type outlives bound (`T: 'a`) in a trait object", pr)),
                             PClause::RegionOutlives { .. } => return Err(Why::Unsupported("a trait alias with a lifetime outlives bound (`'a: 'b`) in a trait object", pr)),
+                            PClause::ForFields { .. } => return Err(Why::Unsupported("a trait alias with `for<F in fields(..)>` in a trait object", pr)),
                         };
                         let first = tys.view().list(args).map_err(|_| Why::Program("a list outside the table".into(), pr))?.first().copied();
                         if first != Some(erased) {

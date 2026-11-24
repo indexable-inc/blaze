@@ -485,6 +485,9 @@ fn heads_dump<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>) 
                 PClause::Const { cond, args } => format!("Const {cond:?}:{}", terms(t, &t.list(*args).map(|s| s.to_vec()).unwrap_or_default())),
                 PClause::TypeOutlives { ty, region } => format!("TypeOutlives {region:?}:{}", terms(t, &[*ty])),
                 PClause::RegionOutlives { long, short } => format!("RegionOutlives {long:?}: {short:?}"),
+                PClause::ForFields { container, trait_, args } => {
+                    format!("ForFields {trait_:?} {}:{}", terms(t, &[*container]), terms(t, t.list(*args).unwrap_or(&[])))
+                }
             })
             .collect();
         out.insert(format!("Predicates {k:?}"), format!("conds {}\n  {}\n  {}", p.conds.len(), clauses.join("\n  "), text(*k)));

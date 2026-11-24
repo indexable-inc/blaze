@@ -825,6 +825,11 @@ impl<'a> FactCache<'a> {
                     }
                     Pred::ConstHolds { cond: SDef(cond.0), args: self.list(c, args)? }
                 }
+                PClause::ForFields { container, trait_, args } => Pred::ForFields {
+                    container: self.ty(c, container)?,
+                    trait_: SDef(trait_.0),
+                    args_after_self: self.list(c, args)?,
+                },
                 // Outlives clauses are the borrow checker's (D148); the checker takes them as true.
                 PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => continue,
             };

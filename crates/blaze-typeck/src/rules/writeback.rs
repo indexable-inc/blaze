@@ -164,6 +164,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             let (args, extra) = match g {
                 crate::ty::Goal::Trait { args, .. } | crate::ty::Goal::ConstHolds { args, .. } => (Some(args), None),
                 crate::ty::Goal::Projection { args, term, .. } => (Some(args), Some(term)),
+                crate::ty::Goal::ForFields { container, args, .. } => (Some(args), Some(container)),
                 crate::ty::Goal::WellFormed(t) => (None, Some(t)),
             };
             if let Some(l) = args {
@@ -178,7 +179,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             let kept = match g {
                 crate::ty::Goal::Trait { trait_, args } => Some(PendingGoal::Trait { trait_, args }),
                 crate::ty::Goal::Projection { trait_, args, name, term } => Some(PendingGoal::Projection { trait_, args, name, term }),
-                crate::ty::Goal::WellFormed(_) | crate::ty::Goal::ConstHolds { .. } => None,
+                crate::ty::Goal::WellFormed(_) | crate::ty::Goal::ConstHolds { .. } | crate::ty::Goal::ForFields { .. } => None,
             };
             if let (Some(k), Some(slot)) = (kept, pending.iter_mut().find(|s| s.is_none())) {
                 *slot = Some(k);

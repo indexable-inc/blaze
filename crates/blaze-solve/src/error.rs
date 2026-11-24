@@ -95,6 +95,7 @@ pub enum PredKind {
     Coerce,
     DynCompatible,
     ConstHolds,
+    ForFields,
     ConstArgHasType,
     Other,
 }

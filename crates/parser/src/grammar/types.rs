@@ -387,7 +387,28 @@ pub(super) fn for_binder<S: Sink>(p: &mut Parser<'_, S>) {
     let m = p.start();
     p.bump(T![for]);
     if p.at(T![<]) {
-        generic_params::generic_param_list(p);
+        if p.nth_at(1, IDENT) && p.nth_at(2, T![in]) {
+            p.bump(T![<]);
+            name(p);
+            p.bump(T![in]);
+            if p.eat(IDENT) {
+                if p.eat(T!['(']) {
+                    type_(p);
+                    if !p.eat(T![')']) {
+                        p.error("expected `)`");
+                    }
+                } else {
+                    p.error("expected `(`");
+                }
+            } else {
+                p.error("expected `fields`");
+            }
+            if !p.eat(T![>]) {
+                p.error("expected `>`");
+            }
+        } else {
+            generic_params::generic_param_list(p);
+        }
     } else {
         p.error("expected `<`");
     }

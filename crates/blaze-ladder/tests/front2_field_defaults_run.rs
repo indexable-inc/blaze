@@ -2153,7 +2153,7 @@ pub extern \"C\" fn main() -> i32 {
             use blaze_code::record::{Space, Target};
             use blaze_launch_rt::sys::{Code, page};
 
-            let mut members = Vec::new();
+            let mut members = blaze_own::Vec::new_in(alloc);
             for row in 0..walk.len() {
                 assert_eq!(walk.kind(row), RowKind::Instance);
                 let bytes = store.get(walk.key(row).expect("record key")).expect("store get").expect("record");
@@ -2175,7 +2175,7 @@ pub extern \"C\" fn main() -> i32 {
                 memory.write((write.at - base) as usize, &write.value.to_le_bytes()).expect("write reloc");
             }
             let addr = image.home(Target { space: Space::Func, symbol: walk.symbol(0) }).expect("main");
-            let main_fn: extern "C-unwind" fn() -> i32 = unsafe { std::mem::transmute(addr as usize) };
+            let main_fn: extern "C-unwind" fn() -> i32 = unsafe { core::mem::transmute(addr as usize) };
             assert_eq!(main_fn(), 42, "{label}: native execution returned wrong value");
         }
         #[cfg(not(target_arch = "aarch64"))]
@@ -2237,4 +2237,603 @@ pub extern \"C\" fn main() -> i32 {
         !verdict.diagnostics.is_empty(),
         "expected type error inside concrete inline for body, got clean verdict"
     );
+}
+
+/// First-class `where for<F in fields(T)> F: Trait` bounds on generic `inline for` functions
+/// (structs, structural records with spread, tuples, generic-to-generic forwarding, `zip_fields`)
+/// AND recursive blanket impls (`impl<T> FieldCodec for T where for<F in fields(T)> F: FieldCodec`)
+/// alongside primitive impls on nested structs, compiled and executed natively via both
+/// `Front2Program` and `LazyProgram`.
+#[test]
+fn for_fields_bounded_generic_inline_for_and_recursive_blanket_impl() {
+    use blaze_build::{OverflowChecks, Panic, UbChecks};
+    use blaze_emit::{Isa, Os};
+    use blaze_ids::Hasher;
+    use blaze_ids::producer::{CodeBuilder, Producers};
+    use blaze_ladder::body_ids::{BodyId, BodyIds, Fixture, Make, Read, RowKind};
+    use blaze_ladder::code_records::{Builder, CodeStore, EntryView, MemoryStore, Settings, TierName};
+    use blaze_ladder::crates::{Inputs, Toolchain};
+    use blaze_ladder::front2::keys::{checker_of, member_key_of};
+    use blaze_ladder::front2::program::Front2Program;
+    use blaze_ladder::front2::program::lazy::LazyProgram;
+    use blaze_ladder::front2::program::lazy::typed::{TypedGap, TypedRecords};
+    use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
+    use blaze_ladder::program_texts::ProgramTexts;
+    use blaze_ladder::run::RunError;
+    use blaze_ladder::run::make_one::{CheckCount, FromRecord, MakerState, SecondCheck, Typing, make_instance, walk_records};
+    use blaze_ladder::seam::FrontEnd;
+    use blaze_mem::Frame;
+    use blaze_own::{AString, AVec};
+    use blaze_toolchain::ToolchainId;
+    use blaze_typeck::ItemKey;
+
+    let body = "
+impl Copy for usize {}
+impl Copy for i32 {}
+impl Copy for bool {}
+
+#[lang = \"drop\"]
+trait Drop {
+    fn drop(&mut self);
+}
+
+#[repr(C)]
+struct Words {
+    data: usize,
+    len: usize,
+}
+impl Copy for Words {}
+
+union Wide {
+    s: &'static str,
+    bytes: &'static [u8],
+    words: Words,
+}
+
+fn str_len(s: &'static str) -> i32 {
+    unsafe { Wide { s }.words.len as i32 }
+}
+
+fn str_eq(a: &'static str, b: &'static str) -> bool {
+    let na = unsafe { Wide { s: a }.words.len };
+    let nb = unsafe { Wide { s: b }.words.len };
+    if na != nb {
+        return false;
+    }
+    let ab = unsafe { Wide { s: a }.bytes };
+    let bb = unsafe { Wide { s: b }.bytes };
+    let mut i: usize = 0;
+    while i < na {
+        if ab[i] != bb[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+trait FieldCodec {
+    fn json_len(&self) -> i32;
+    fn patch_i32_self(&mut self, val: i32) -> bool;
+}
+
+impl FieldCodec for i32 {
+    fn json_len(&self) -> i32 { *self }
+    fn patch_i32_self(&mut self, val: i32) -> bool {
+        *self = val;
+        true
+    }
+}
+
+impl FieldCodec for bool {
+    fn json_len(&self) -> i32 {
+        if *self { 4 } else { 5 }
+    }
+    fn patch_i32_self(&mut self, _val: i32) -> bool { false }
+}
+
+impl<T> FieldCodec for T
+where
+    for<F in fields(T)> F: FieldCodec,
+{
+    fn json_len(&self) -> i32 {
+        let mut total: i32 = 0;
+        inline for (_name, field) in self {
+            total = total + field.json_len();
+        }
+        total
+    }
+    fn patch_i32_self(&mut self, val: i32) -> bool {
+        let mut changed = false;
+        inline for (_name, field) in self {
+            if field.patch_i32_self(val) {
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+struct Pos { pub x: i32, pub y: i32 }
+struct Health { pub hp: i32, pub max_hp: i32 }
+struct Ship { pub pos: Pos, pub hp: Health, pub active: bool }
+type Base = { a: i32, b: i32 };
+type Extended = { ..Base, flag: bool };
+
+fn to_json_len<T>(v: &T) -> i32
+where
+    for<F in fields(T)> F: FieldCodec,
+{
+    let mut total: i32 = 0;
+    inline for (name, field) in v {
+        total = total + str_len(name) + field.json_len();
+    }
+    total
+}
+
+fn outer<U>(u: &U) -> i32
+where
+    for<F in fields(U)> F: FieldCodec,
+{
+    to_json_len(u)
+}
+
+fn patch_i32<T>(dst: &mut T, key: &'static str, val: i32) -> bool
+where
+    for<F in fields(T)> F: FieldCodec,
+{
+    inline for (name, field) in dst {
+        if str_eq(name, key) {
+            return field.patch_i32_self(val);
+        }
+    }
+    false
+}
+
+fn sum_pair_json<T>(a: &T, b: &T) -> i32
+where
+    for<F in fields(T)> F: FieldCodec,
+{
+    let mut total: i32 = 0;
+    inline for (fa, fb) in zip_fields(a, b) {
+        total = total + fa.json_len() + fb.json_len();
+    }
+    total
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut p = Pos { x: 10, y: 20 };
+    if to_json_len(&p) != 32 { return 1; }
+    if outer(&p) != 32 { return 2; }
+    if !patch_i32(&mut p, \"x\", 15) { return 3; }
+    if p.x != 15 || p.y != 20 { return 4; }
+    if patch_i32(&mut p, \"missing\", 99) { return 5; }
+
+    let mut h = Health { hp: 3, max_hp: 7 };
+    if to_json_len(&h) != 18 { return 6; }
+    if !patch_i32(&mut h, \"hp\", 5) { return 7; }
+
+    let rec: Extended = { a: 2, b: 4, flag: true };
+    if to_json_len(&rec) != 16 { return 8; }
+    if rec.json_len() != 10 { return 9; }
+
+    let tup = (6i32, false);
+    if to_json_len(&tup) != 13 { return 10; }
+    if tup.json_len() != 11 { return 11; }
+
+    let n: i32 = 7;
+    let b: bool = false;
+    if n.json_len() != 7 || b.json_len() != 5 { return 12; }
+
+    let mut ship = Ship { pos: p, hp: h, active: true };
+    if ship.json_len() != 51 { return 13; }
+    if to_json_len(&ship) != 62 { return 14; }
+
+    let other = Pos { x: 1, y: 2 };
+    if sum_pair_json(&ship.pos, &other) != 38 { return 15; }
+
+    if !ship.patch_i32_self(10) { return 16; }
+    ship.json_len()
+}
+";
+    // 1. Whole-program `Front2Program` baseline.
+    assert_eq!(run_head(RECORDS_HEAD, body), Ok(44));
+
+    // 2. Build `Names` once for `ProjectWorld` and `LazyProgram`.
+    let heap = blaze_own::testing::heap();
+    let alloc = heap.alloc();
+    let mut text = AString::with_capacity_in(RECORDS_HEAD.len() + body.len(), alloc);
+    text.push_str(RECORDS_HEAD);
+    text.push_str(body);
+    let files = [SourceFile { path: "src/main.rs", text: text.as_str() }];
+    let Ok(frame) = Frame::new(blaze_mem::tag::Tag::Infer) else {
+        assert!(false, "frame");
+        return;
+    };
+    let tc = Toolchain::none(alloc);
+    let Ok(texts) = ProgramTexts::new(&files, "src/main.rs", NEW, &tc, Panic::Abort) else {
+        assert!(false, "program texts");
+        return;
+    };
+    let user = texts.user();
+    let Ok(inputs) = Inputs::new(&user, &tc) else {
+        assert!(false, "inputs");
+        return;
+    };
+    let crates = inputs.crates();
+    let Ok(names) = inputs.resolve(&crates, blaze_own::testing::bump()) else {
+        assert!(false, "names");
+        return;
+    };
+
+    // Pre-check every body (both free fns and impl methods) with `ProjectWorld::check_borrows`.
+    let mut encoded_records: AVec<'static, (ItemKey, AVec<'static, u8>)> = AVec::new_in(alloc);
+    {
+        let Ok(check_frame) = Frame::new(blaze_mem::tag::Tag::Infer) else {
+            assert!(false, "check frame");
+            return;
+        };
+        let Ok(mut world) = ProjectWorld::new(&names, &check_frame, &files, alloc) else {
+            assert!(false, "project world");
+            return;
+        };
+        let bodies = world.bodies(alloc);
+        for &(body_ref, _) in bodies.iter() {
+            let key = match body_ref {
+                BodyRef::Free(item) => checker_of(item),
+                BodyRef::Member { container, kind, name, .. } => member_key_of(checker_of(container), kind, name),
+            };
+            let (verdict, _) = world.check_borrows(body_ref, alloc);
+            assert!(verdict.diagnostics.is_empty(), "{body_ref:?}: check diagnostics: {:?}", verdict.diagnostics);
+            assert!(verdict.gaps.is_empty(), "{body_ref:?}: check gaps: {:?}", verdict.gaps);
+            assert!(verdict.refused.is_none(), "{body_ref:?}: check refused: {:?}", verdict.refused);
+            let Some(Ok(bytes)) = verdict.typed else {
+                assert!(false, "{body_ref:?}: missing clean typed record");
+                return;
+            };
+            let mut copy = AVec::with_capacity_in(bytes.len(), alloc);
+            copy.extend_from_slice(bytes.as_slice());
+            encoded_records.push((key, copy));
+        }
+    }
+
+    struct EveryItem;
+    static READS: [Read; 1] = [Read { fact: [5; 32], digest: [6; 32] }];
+    impl BodyIds for EveryItem {
+        fn body_check(&self, item: ItemKey) -> Option<BodyId<'_>> {
+            Some(BodyId { key: Hasher::new("for-fields lazy test").part(&item.0.to_le_bytes()).finish(), reads: &READS })
+        }
+        fn today(&self, fact: &[u8; 32]) -> Option<[u8; 32]> {
+            (*fact == READS[0].fact).then_some(READS[0].digest)
+        }
+        fn crate_fact(&self, _: ItemKey) -> Option<Read> {
+            Some(Read { fact: [10; 32], digest: [11; 32] })
+        }
+    }
+
+    struct RefTyped<'r> {
+        records: &'r [(ItemKey, AVec<'static, u8>)],
+        alloc: blaze_own::Alloc<'static>,
+    }
+    impl TypedRecords for RefTyped<'_> {
+        fn typed(&mut self, key: ItemKey) -> Result<blaze_typeck::Checked<'static>, TypedGap> {
+            let Some((_, bytes)) = self.records.iter().find(|(k, _)| *k == key) else {
+                return Err(TypedGap::NoRecord { key });
+            };
+            blaze_typeck::checked_record::decode(bytes.as_slice(), self.alloc).map_err(|why| TypedGap::Record { key, why })
+        }
+    }
+
+    struct LazyWalkMaker<'p, P, T> {
+        program: &'p mut P,
+        typing: T,
+        state: Option<MakerState>,
+        checks: CheckCount,
+        isa: Isa,
+        overflow: OverflowChecks,
+        ub: UbChecks,
+        panic: Panic,
+        alloc: blaze_own::Alloc<'static>,
+    }
+    impl<P: FrontEnd, T: Typing<P>> Make for LazyWalkMaker<'_, P, T> {
+        type Error = RunError;
+        type Grant = Fixture;
+        fn make(&mut self, _grant: &Fixture, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+            if self.state.is_none() {
+                self.state = Some(MakerState::new(self.program, tabled, self.isa, self.overflow, self.ub, self.panic, self.alloc)?);
+            }
+            let Some(state) = self.state.as_mut() else {
+                return Err(RunError::OneBody { key: tabled, why: "maker state missing" });
+            };
+            make_instance(self.program, &mut self.typing, state, &mut self.checks, tabled, name, entry)
+        }
+        fn make_static(&mut self, _grant: &Fixture, item: ItemKey, _: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+            Err(RunError::OneBody { key: item, why: "unexpected static" })
+        }
+        fn make_thread_local(&mut self, _grant: &Fixture, item: ItemKey, _: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+            Err(RunError::OneBody { key: item, why: "unexpected tls" })
+        }
+    }
+
+    let Ok(whole) = Front2Program::new(&names, &frame, &files, alloc) else {
+        assert!(false, "whole program");
+        return;
+    };
+    let Some(entry_row) = whole.entry() else {
+        assert!(false, "entry");
+        return;
+    };
+    let entry = whole.function(entry_row).key;
+    let producer = Producers::for_tests(b"for-fields lazy").get::<CodeBuilder>();
+    let isa = Isa { lse: true, os: if cfg!(target_os = "macos") { Os::MacOs } else { Os::Linux } };
+    let Ok(pkg_ed) = edition::PackageEdition::of_manifest("blaze-2026.11") else {
+        assert!(false, "blaze edition");
+        return;
+    };
+    let builder = Builder {
+        isa,
+        tier: TierName::Reference,
+        settings: Settings::baseline(OverflowChecks::Off, Panic::Abort),
+        toolchain: ToolchainId([8; 32]),
+        producer,
+        edition: pkg_ed,
+    };
+
+    let run_lazy_mode = |label: &str, use_records: bool| {
+        let Ok(mut lazy) = LazyProgram::new(&names, &frame, &files, Some(entry), alloc) else {
+            assert!(false, "{label}: lazy program");
+            return;
+        };
+        if let Err(e) = lazy.decide_start(blaze_ladder::run::special::MakerStart::ByRule) {
+            assert!(false, "{label}: decide_start: {e:?}");
+            return;
+        }
+        let mut store = MemoryStore::new_in(alloc);
+        let walked = if use_records {
+            let mut maker = LazyWalkMaker {
+                program: &mut lazy,
+                typing: FromRecord(RefTyped { records: encoded_records.as_slice(), alloc }),
+                state: None,
+                checks: CheckCount::default(),
+                isa,
+                overflow: OverflowChecks::Off,
+                ub: UbChecks::Off,
+                panic: Panic::Abort,
+                alloc,
+            };
+            walk_records(entry, &EveryItem, &mut store, &builder, &producer, &mut maker, alloc)
+        } else {
+            let mut maker = LazyWalkMaker {
+                program: &mut lazy,
+                typing: SecondCheck,
+                state: None,
+                checks: CheckCount::default(),
+                isa,
+                overflow: OverflowChecks::Off,
+                ub: UbChecks::Off,
+                panic: Panic::Abort,
+                alloc,
+            };
+            walk_records(entry, &EveryItem, &mut store, &builder, &producer, &mut maker, alloc)
+        };
+        let Ok((walk, _)) = walked else {
+            assert!(false, "{label}: walk_records failed: {:?}", walked.err());
+            return;
+        };
+        #[cfg(target_arch = "aarch64")]
+        {
+            use blaze_code::image::{Image, Kind, Member, lay_out_positions};
+            use blaze_code::record::{Space, Target};
+            use blaze_launch_rt::sys::{Code, page};
+
+            let mut members = AVec::new_in(alloc);
+            for row in 0..walk.len() {
+                assert_eq!(walk.kind(row), RowKind::Instance);
+                let Some(rk) = walk.key(row) else {
+                    assert!(false, "{label}: missing record key");
+                    return;
+                };
+                let Ok(Some(bytes)) = store.get(rk) else {
+                    assert!(false, "{label}: missing record");
+                    return;
+                };
+                let Ok(view) = EntryView::read(bytes) else {
+                    assert!(false, "{label}: bad entry");
+                    return;
+                };
+                members.push(Member { symbol: walk.symbol(row), record: view.record });
+            }
+            let Ok(pg) = page() else {
+                assert!(false, "{label}: page size");
+                return;
+            };
+            let Ok(pg64) = u64::try_from(pg) else {
+                assert!(false, "{label}: page size u64");
+                return;
+            };
+            let Ok(segment) = lay_out_positions(members.as_slice(), Kind::Bundle, pg64, alloc, |_, row| {
+                lazy.source_position(ItemKey(row.item), row.site)
+                    .map_err(|_| blaze_code::image::ImageError::Base { base: 0 })
+            }) else {
+                assert!(false, "{label}: lay out");
+                return;
+            };
+            let Ok(seg_size) = usize::try_from(segment.size) else {
+                assert!(false, "{label}: segment size");
+                return;
+            };
+            let Ok(mut memory) = Code::map(seg_size) else {
+                assert!(false, "{label}: map");
+                return;
+            };
+            let Ok(base) = u64::try_from(memory.base()) else {
+                assert!(false, "{label}: base");
+                return;
+            };
+            let Ok(mut image) = Image::new(base, pg64, alloc) else {
+                assert!(false, "{label}: image");
+                return;
+            };
+            let Ok(placed) = image.append(&segment) else {
+                assert!(false, "{label}: append");
+                return;
+            };
+            assert!(placed.outside.is_empty(), "{label}: unexpected native import");
+            assert!(memory.write(0, &segment.code).is_ok());
+            if let Ok(relro_at) = usize::try_from(segment.relro_at) {
+                assert!(memory.write(relro_at, &segment.relro).is_ok());
+            }
+            for write in placed.writes.iter() {
+                if let Ok(off) = usize::try_from(write.at.saturating_sub(base)) {
+                    assert!(memory.write(off, &write.value.to_le_bytes()).is_ok());
+                }
+            }
+            let Some(addr) = image.home(Target { space: Space::Func, symbol: walk.symbol(0) }) else {
+                assert!(false, "{label}: main symbol");
+                return;
+            };
+            let Ok(addr_usize) = usize::try_from(addr) else {
+                assert!(false, "{label}: addr usize");
+                return;
+            };
+            let main_fn: extern "C-unwind" fn() -> i32 = unsafe { core::mem::transmute(addr_usize) };
+            assert_eq!(main_fn(), 44, "{label}: native execution returned wrong value");
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = walk;
+    };
+
+    run_lazy_mode("LazyProgram + SecondCheck (for_fields)", false);
+    run_lazy_mode("LazyProgram + FromRecord (for_fields)", true);
+}
+
+/// Proves that `where for<F in fields(T)> F: Trait` rejects:
+/// 1. Bad call sites passing a struct with a field that does not implement `FieldCodec`.
+/// 2. Broken generic `inline for` bodies calling a method not in `FieldCodec` AT DEFINITION TIME
+///    even with zero callers anywhere in the crate (both single `inline for` and `zip_fields`).
+#[test]
+fn for_fields_rejects_bad_call_site_and_unbounded_body_at_definition_time() {
+    use blaze_build::Panic;
+    use blaze_ladder::crates::{Inputs, Toolchain};
+    use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
+    use blaze_ladder::front2::source::NamesSource as _;
+    use blaze_ladder::program_texts::ProgramTexts;
+    use blaze_mem::Frame;
+    use blaze_own::AString;
+
+    let check_fn_fails = |label: &str, body_src: &str, target_fn: &str| {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let mut src = AString::with_capacity_in(RECORDS_HEAD.len() + body_src.len(), alloc);
+        src.push_str(RECORDS_HEAD);
+        src.push_str(body_src);
+        let files = [SourceFile { path: "src/main.rs", text: src.as_str() }];
+        let Ok(frame) = Frame::new(blaze_mem::tag::Tag::Infer) else {
+            assert!(false, "{label}: frame");
+            return;
+        };
+        let tc = Toolchain::none(alloc);
+        let Ok(texts) = ProgramTexts::new(&files, "src/main.rs", NEW, &tc, Panic::Abort) else {
+            assert!(false, "{label}: program texts");
+            return;
+        };
+        let user = texts.user();
+        let Ok(inputs) = Inputs::new(&user, &tc) else {
+            assert!(false, "{label}: inputs");
+            return;
+        };
+        let crates = inputs.crates();
+        let Ok(names) = inputs.resolve(&crates, blaze_own::testing::bump()) else {
+            assert!(false, "{label}: names");
+            return;
+        };
+        let Ok(mut world) = ProjectWorld::new(&names, &frame, &files, alloc) else {
+            assert!(false, "{label}: project world");
+            return;
+        };
+        let mut target_item = None;
+        (&names).each_item(0, &mut |it, _| {
+            if (&names).name_of(it) == Some(target_fn) {
+                target_item = Some(it);
+            }
+        });
+        let Some(target_item) = target_item else {
+            assert!(false, "{label}: missing target fn `{target_fn}`");
+            return;
+        };
+        let (verdict, _) = world.check_borrows(BodyRef::Free(target_item), alloc);
+        assert!(
+            !verdict.diagnostics.is_empty(),
+            "{label}: expected diagnostics for `{target_fn}`, got clean verdict (refused: {:?})",
+            verdict.refused
+        );
+    };
+
+    // 1. Call-site rejection: `Opaque` does not implement `FieldCodec`.
+    let bad_call = "
+trait FieldCodec {
+    fn json_len(&self) -> i32;
+}
+impl FieldCodec for i32 {
+    fn json_len(&self) -> i32 { *self }
+}
+struct Opaque(i32);
+struct Bad { pub x: i32, pub h: Opaque }
+
+fn to_json_len<T>(v: &T) -> i32
+where
+    for<F in fields(T)> F: FieldCodec,
+{
+    let mut total: i32 = 0;
+    inline for (_name, f) in v {
+        total = total + f.json_len();
+    }
+    total
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let b = Bad { x: 1, h: Opaque(7) };
+    to_json_len(&b)
+}
+";
+    check_fn_fails("bad call site", bad_call, "main");
+    assert!(run_head(RECORDS_HEAD, bad_call).is_err(), "expected bad call site to fail compilation");
+
+    // 2. Definition-time rejection with ZERO callers: calling `f.does_not_exist()` inside a
+    //    `ForFields`-bounded generic `inline for` body must fail `check_borrows` immediately.
+    let bad_body = "
+trait FieldCodec {
+    fn json_len(&self) -> i32;
+}
+impl FieldCodec for i32 {
+    fn json_len(&self) -> i32 { *self }
+}
+
+fn broken<T>(v: &T)
+where
+    for<F in fields(T)> F: FieldCodec,
+{
+    inline for (_, f) in v {
+        f.does_not_exist();
+    }
+}
+
+fn broken_zip<T>(a: &T, b: &T)
+where
+    for<F in fields(T)> F: FieldCodec,
+{
+    inline for (fa, fb) in zip_fields(a, b) {
+        fa.does_not_exist(fb);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    0
+}
+";
+    check_fn_fails("broken single inline for (zero callers)", bad_body, "broken");
+    check_fn_fails("broken zip_fields inline for (zero callers)", bad_body, "broken_zip");
 }

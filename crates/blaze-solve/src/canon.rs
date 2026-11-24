@@ -81,6 +81,8 @@ const P_CAHT: u32 = 76;
 const P_EQ: u32 = 77;
 /// `Pred::ConstHolds`: laid out as `P_TRAIT` (the list, the def, a flag word of 0).
 const P_HOLDS: u32 = 78;
+/// `Pred::ForFields`: container term, `args_after_self` list, header, then the trait def.
+const P_FOR_FIELDS: u32 = 79;
 
 fn header(tag: u32, arity: u32) -> u32 {
     tag | (arity << 8)
@@ -263,6 +265,12 @@ impl<'a> Canon<'a> {
                 out.push(header(P_HOLDS, 1));
                 push_def(out, cond);
                 out.push(0);
+            }
+            Pred::ForFields { container, trait_, args_after_self } => {
+                self.term(tys, out, container)?;
+                self.list(tys, out, args_after_self)?;
+                out.push(header(P_FOR_FIELDS, 2));
+                push_def(out, trait_);
             }
             Pred::Projection { alias, term } => two(self, out, alias, term, P_PROJ)?,
             Pred::NormalizesTo { alias, term } => two(self, out, alias, term, P_NORM)?,
@@ -761,6 +769,17 @@ impl<'a> Decode<'a> {
                 }
                 *i += 4;
                 Pred::DynCompatible(read_def(w, at + 1))
+            }
+            P_FOR_FIELDS => {
+                if at + 5 > w.len() {
+                    return Err(bad);
+                }
+                let trait_ = read_def(w, at + 1);
+                *i += 4;
+                self.pop_kids(1, at)?;
+                let container = self.kids[0];
+                let args_after_self = self.lists.pop().ok_or(bad)?;
+                Pred::ForFields { container, trait_, args_after_self }
             }
             _ => return Err(bad),
         })

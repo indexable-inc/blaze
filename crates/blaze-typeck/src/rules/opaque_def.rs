@@ -197,6 +197,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     Goal::Projection { trait_, args, name, term }
                 }
                 PClause::Const { cond, args } => Goal::ConstHolds { cond, args: self.lower_list_for(preds.types, args, cause)? },
+                PClause::ForFields { container, trait_, args } => Goal::ForFields {
+                    container: self.lower(preds.types, container, Lower::Body, cause)?,
+                    trait_,
+                    args: self.lower_list_for(preds.types, args, cause)?,
+                },
                 // Outlives clauses are the borrow checker's (D148); the checker takes them as true.
                 PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => continue,
             };

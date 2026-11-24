@@ -150,6 +150,8 @@ pub enum Goal {
     WellFormed(Ty),
     /// The `where const` condition `cond` holds at `args` (`PClause::Const`).
     ConstHolds { cond: ItemKey, args: TyList },
+    /// `for<F in fields(container)> F: trait_<args...>` (`PClause::ForFields`; `args` = args after `Self`).
+    ForFields { container: Ty, trait_: ItemKey, args: TyList },
 }
 
 /// Where an obligation came from, for its error.

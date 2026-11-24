@@ -401,6 +401,11 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
                 Pred::HostEffect { trait_, args: self.map_list(args, &mut f)?, constness }
             }
             Pred::ConstHolds { cond, args } => Pred::ConstHolds { cond, args: self.map_list(args, &mut f)? },
+            Pred::ForFields { container, trait_, args_after_self } => Pred::ForFields {
+                container: f(self, container)?,
+                trait_,
+                args_after_self: self.map_list(args_after_self, &mut f)?,
+            },
             Pred::Projection { alias, term } => Pred::Projection { alias: f(self, alias)?, term: f(self, term)? },
             Pred::NormalizesTo { alias, term } => Pred::NormalizesTo { alias: f(self, alias)?, term: f(self, term)? },
             Pred::TypeOutlives { ty, region } => Pred::TypeOutlives { ty: f(self, ty)?, region: f(self, region)? },
@@ -483,6 +488,11 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
             Pred::ConstHolds { cond, args: a } => {
                 Pred::ConstHolds { cond, args: fold::import_list_at(self.tys, self.scratch, p, a, inst, at)? }
             }
+            Pred::ForFields { container, trait_, args_after_self } => Pred::ForFields {
+                container: fold::import_at(self.tys, self.scratch, p, container, inst, at)?,
+                trait_,
+                args_after_self: fold::import_list_at(self.tys, self.scratch, p, args_after_self, inst, at)?,
+            },
             Pred::WellFormed(t) => Pred::WellFormed(fold::import_at(self.tys, self.scratch, p, t, inst, at)?),
             Pred::ConstEvaluatable(t) => {
                 Pred::ConstEvaluatable(fold::import_at(self.tys, self.scratch, p, t, inst, at)?)

@@ -82,15 +82,16 @@ fn known(r: Range) -> Option<Range> {
 /// self type first), then a projection's term; `None` when it mentions none, or past
 /// [`MAX_SEARCH_NODES`].
 fn subject(clause: PClause, types: PTys<'_>, alloc: Alloc<'_>) -> Result<Option<u32>, CheckError> {
-    let (list, term) = match clause {
-        PClause::Trait { args, .. } | PClause::Const { args, .. } => (args, None),
-        PClause::Projection { args, term, .. } => (args, Some(term)),
-        PClause::TypeOutlives { ty, .. } => (List::EMPTY, Some(ty)),
-        PClause::RegionOutlives { .. } => (List::EMPTY, None),
+    let (first, list, last) = match clause {
+        PClause::Trait { args, .. } | PClause::Const { args, .. } => (None, args, None),
+        PClause::Projection { args, term, .. } => (None, args, Some(term)),
+        PClause::ForFields { container, args, .. } => (Some(container), args, None),
+        PClause::TypeOutlives { ty, .. } => (None, List::EMPTY, Some(ty)),
+        PClause::RegionOutlives { .. } => (None, List::EMPTY, None),
     };
     let mut stack: Vec<PTy, Alloc<'_>> = Vec::new_in(alloc);
     let mut budget = MAX_SEARCH_NODES;
-    for &top in types.list(list)?.iter().chain(term.as_ref()) {
+    for &top in first.iter().chain(types.list(list)?.iter()).chain(last.iter()) {
         stack.clear();
         stack.push(top);
         while let Some(t) = stack.pop() {

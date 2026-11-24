@@ -262,6 +262,7 @@ fn twin(store: &Store<'_>, view: PTys<'_>, fk: ItemKey, o: ItemKey, args: List) 
             PClause::Trait { trait_, args } => PClause::Trait { trait_, args: swap_list(args)? },
             PClause::Projection { trait_, args, name, term } => PClause::Projection { trait_, args: swap_list(args)?, name, term: swap(term)? },
             PClause::Const { cond, args } => PClause::Const { cond, args: swap_list(args)? },
+            PClause::ForFields { container, trait_, args } => PClause::ForFields { container: swap(container)?, trait_, args: swap_list(args)? },
             PClause::TypeOutlives { ty, region } => PClause::TypeOutlives { ty: swap(ty)?, region },
             c @ PClause::RegionOutlives { .. } => c,
         });

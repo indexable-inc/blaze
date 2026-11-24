@@ -596,6 +596,9 @@ pub enum WherePred {
     /// condition, an anonymous constant of type `bool` over the item's generics (its range
     /// covers the `const` block); the item applies only where it evaluates to `true`.
     Const { cond: ConstIdx },
+    /// `where for<F in fields(T)> F: Bound`: field-quantified bound asserting `bounds` on
+    /// `subject` for every field type `param` of `container`.
+    ForFields { param: NameIdx, container: TypeId, subject: TypeId, bounds: List },
 }
 
 impl WherePred {
@@ -607,6 +610,9 @@ impl WherePred {
             }
             WherePred::Lifetime { name, bounds } => Node { a: name.0, d: bounds.start, e: bounds.len, ..n.with(1) },
             WherePred::Const { cond } => Node { a: cond.0, ..n.with(2) },
+            WherePred::ForFields { param, container, subject, bounds } => {
+                Node { a: param.0, b: container.0, c: subject.0, d: bounds.start, e: bounds.len, ..n.with(3) }
+            }
         }
     }
 
@@ -618,6 +624,12 @@ impl WherePred {
             0 => WherePred::Type { binder: list(n.a, n.b), ty: TypeId(n.c), bounds: list(n.d, n.e) },
             1 => WherePred::Lifetime { name: NameIdx(n.a), bounds: list(n.d, n.e) },
             2 => WherePred::Const { cond: ConstIdx(n.a) },
+            3 => WherePred::ForFields {
+                param: NameIdx(n.a),
+                container: TypeId(n.b),
+                subject: TypeId(n.c),
+                bounds: list(n.d, n.e),
+            },
             _ => return Err(bad("where predicates", n.tag)),
         })
     }

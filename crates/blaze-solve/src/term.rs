@@ -599,6 +599,10 @@ pub enum Pred {
     /// argument is ground (`Facts::const_holds`); ambiguous while one is an inference variable;
     /// never decided over a generic parameter; never proves two impls disjoint (coherence).
     ConstHolds { cond: Def, args: List },
+    /// `for<F in fields(container)> F: trait_<args_after_self...>`: every field type `F` of the
+    /// product type `container` (struct ADT, structural record, or tuple) implements
+    /// `trait_<args_after_self...>`, or the bound is assumed in the param env.
+    ForFields { container: Ty, trait_: Def, args_after_self: List },
     /// The const `ct` has type `ty`.
     ConstArgHasType { ct: Ty, ty: Ty },
     /// Internal to a probe: unify `a` and `b` now (never canonicalized, never a query).

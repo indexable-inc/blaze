@@ -766,6 +766,57 @@ fn a_where_const_condition_is_a_predicate() {
     assert!(dump_of(&l).contains("(const-pred const { false })"), "{}", dump_of(&l));
 }
 
+/// `where for<F in fields(T)> F: FieldCodec + Copy` lowers to `WherePred::ForFields` with exact
+/// `param`, `container`, `subject`, and `bounds`.
+#[test]
+fn a_where_for_fields_predicate_lowers_with_container_subject_and_bounds() {
+    let text = "fn to_json<T>(v: &T, out: &mut Buf) where for<F in fields(T)> F: FieldCodec + Copy {}";
+    let l = signature(text);
+    let v = l.view();
+    assert!(v.diags().next().is_none(), "unexpected diagnostics: {}", dump_of(&l));
+    let rows = v.rows(v.list(crate::columns::head::WHERE)).expect("where rows");
+    assert_eq!(rows.len(), 1, "{}", dump_of(&l));
+    let Ok(WherePred::ForFields { param, container, subject, bounds }) = WherePred::decode(rows[0]) else {
+        panic!("{}", dump_of(&l))
+    };
+    assert_eq!(v.text_at(v.name_range(param).expect("param range")).expect("param text"), "F");
+    assert_eq!(v.text_at(v.type_range(container).expect("container range")).expect("container text"), "T");
+    assert_eq!(v.text_at(v.type_range(subject).expect("subject range")).expect("subject text"), "F");
+    let bound_rows = v.rows(bounds).expect("bound rows");
+    assert_eq!(bound_rows.len(), 2, "{}", dump_of(&l));
+    let Ok(Bound::Trait { ty: b0, .. }) = Bound::decode(bound_rows[0]) else { panic!("{}", dump_of(&l)) };
+    let Ok(Bound::Trait { ty: b1, .. }) = Bound::decode(bound_rows[1]) else { panic!("{}", dump_of(&l)) };
+    assert_eq!(v.text_at(v.type_range(b0).expect("b0 range")).expect("b0 text"), "FieldCodec");
+    assert_eq!(v.text_at(v.type_range(b1).expect("b1 range")).expect("b1 text"), "Copy");
+    assert!(dump_of(&l).contains("(for-fields-pred F"), "{}", dump_of(&l));
+
+    // Also works on impl with generic trait args & compound container types,
+    // and body lowering skips the where clause cleanly.
+    let impl_l = signature("impl<T> FieldCodec for T where for<F in fields(Foo<T>)> F: FieldCodec<Buf> + Copy {}");
+    let iv = impl_l.view();
+    assert!(iv.diags().next().is_none(), "{}", dump_of(&impl_l));
+    let irows = iv.rows(iv.list(crate::columns::head::WHERE)).expect("impl where rows");
+    assert_eq!(irows.len(), 1);
+    let Ok(WherePred::ForFields { param, container, subject, bounds }) = WherePred::decode(irows[0]) else {
+        panic!("{}", dump_of(&impl_l))
+    };
+    assert_eq!(iv.text_at(iv.name_range(param).expect("param")).expect("text"), "F");
+    assert_eq!(iv.text_at(iv.type_range(container).expect("container")).expect("text"), "Foo<T>");
+    assert_eq!(iv.text_at(iv.type_range(subject).expect("subject")).expect("text"), "F");
+    assert_eq!(iv.rows(bounds).expect("bounds").len(), 2);
+
+    let body_l = body("fn to_json<T>(v: &T) -> u32 where for<F in fields(T)> F: FieldCodec + Copy { 42 }");
+    assert!(body_l.view().diags().next().is_none(), "{}", dump_of(&body_l));
+
+    // Unknown binder keyword (not `fields`) records a syntax diagnostic instead of `ForFields`.
+    let bad_l = signature("fn f<T>() where for<F in other(T)> F: Copy {}");
+    let bv = bad_l.view();
+    assert!(bv.diags().next().is_some(), "expected diagnostic for `other(T)`: {}", dump_of(&bad_l));
+    for &row in bv.rows(bv.list(crate::columns::head::WHERE)).expect("bad where rows") {
+        assert!(!matches!(WherePred::decode(row), Ok(WherePred::ForFields { .. })), "{}", dump_of(&bad_l));
+    }
+}
+
 /// A format spec's trait and the arguments its width and precision name.
 #[test]
 fn format_specs_name_their_trait_and_counts() {

@@ -338,6 +338,9 @@ pub enum PClause {
     /// `'long: 'short` (`'a: 'b`, `where 'a: 'static`; D148): true for the type checker, as
     /// [`PClause::TypeOutlives`] is.
     RegionOutlives { long: Region, short: Region },
+    /// `where for<F in fields(container)> F: trait_<args...>`: every field type `F` of
+    /// `container` implements `trait_` with `args` (the trait's arguments after `Self`).
+    ForFields { container: PTy, trait_: ItemKey, args: List },
 }
 
 /// The value of a `where const` condition at ground arguments: blaze-solve's answer type,
@@ -1171,6 +1174,10 @@ fn clauses_shape(cs: &[PClause], h: &mut StableHasher) {
             // and a lifetime-only edit must not move what type checks read (D148).
             PClause::TypeOutlives { .. } => h.tag(3),
             PClause::RegionOutlives { .. } => h.tag(4),
+            PClause::ForFields { trait_, .. } => {
+                h.tag(5);
+                h.u128(trait_.0);
+            }
         }
     }
 }
@@ -1182,6 +1189,10 @@ fn clause_roots(cs: &[PClause], roots: &mut Vec<Root, Alloc<'_>>) {
             PClause::Projection { args, term, .. } => {
                 roots.push(Root::List(args));
                 roots.push(Root::Ty(term));
+            }
+            PClause::ForFields { container, args, .. } => {
+                roots.push(Root::Ty(container));
+                roots.push(Root::List(args));
             }
             PClause::TypeOutlives { ty, .. } => roots.push(Root::Ty(ty)),
             PClause::RegionOutlives { .. } => {}
@@ -2080,6 +2091,13 @@ impl ContentHash for PClause {
                 h.u32(ty.0);
             }
             PClause::RegionOutlives { long: _, short: _ } => h.tag(4),
+            PClause::ForFields { container, trait_, args } => {
+                h.tag(5);
+                h.u32(container.0);
+                h.u128(trait_.0);
+                h.u32(args.start);
+                h.u32(args.len);
+            }
         }
     }
 }

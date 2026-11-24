@@ -1152,6 +1152,11 @@ impl<'a> InferCtx<'a> {
             }
             Goal::WellFormed(t) => Pred::WellFormed(STy(self.bty(t).node().bits())),
             Goal::ConstHolds { cond, args } => Pred::ConstHolds { cond: SDef(cond.0), args: self.slist(args) },
+            Goal::ForFields { container, trait_, args } => Pred::ForFields {
+                container: STy(self.bty(container).node().bits()),
+                trait_: SDef(trait_.0),
+                args_after_self: self.slist(args),
+            },
         }
     }
 

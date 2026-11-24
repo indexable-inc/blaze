@@ -137,6 +137,7 @@ pub(super) fn member_where(v: &View<'_>, name: &str) -> Result<AssocWhere, Why> 
             }
             lf::WherePred::Lifetime { name, bounds } => (Outlived::Lifetime(Name(v.name(name)?)), bounds),
             lf::WherePred::Const { .. } => return Err(Why::Unsupported("a `where const` condition on an associated type", at)),
+            lf::WherePred::ForFields { .. } => return Err(Why::Unsupported("a `for<F in fields(..)>` bound on an associated type", at)),
         };
         for &b in v.rows(bounds)? {
             match lf::Bound::decode(b)? {

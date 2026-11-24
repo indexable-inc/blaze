@@ -566,6 +566,11 @@ fn assume_where_clauses<W: World>(cx: &mut InferCtx<'_>, reads: &mut Reads<'_, '
                 term: import(cx, &mut NoClosures, preds.types, term, &[], 0)?,
             },
             PClause::Const { cond, args } => Goal::ConstHolds { cond, args: import_list(cx, &mut NoClosures, preds.types, args, &[], 0)? },
+            PClause::ForFields { container, trait_, args } => Goal::ForFields {
+                container: import(cx, &mut NoClosures, preds.types, container, &[], 0)?,
+                trait_,
+                args: import_list(cx, &mut NoClosures, preds.types, args, &[], 0)?,
+            },
             // Outlives clauses are the borrow checker's (D148); the checker takes them as true.
             PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => continue,
         };

@@ -882,6 +882,12 @@ fn row(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, r: RowIdx) -> fmt::R
                 Ok(r) => node(p, work, "const-pred", &[W::Src(r)]),
                 Err(b) => node(p, work, "const-pred", &[W::Bad(b)]),
             },
+            Ok(WherePred::ForFields { param, container, subject, bounds }) => node(
+                p,
+                work,
+                "for-fields-pred",
+                &[W::Name(param), W::Ty(container), W::Ty(subject), W::Rows(bounds)],
+            ),
             Err(b) => p.atom_fmt(format_args!("<bad {}>", b.column)),
         },
         ROW_ATTR => match p.v.attr(n) {
