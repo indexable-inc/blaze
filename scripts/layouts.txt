@@ -84,6 +84,8 @@ crates/blaze-drive/src/answers.rs	PAGE_MAGIC	none
 crates/blaze-drive/src/answers.rs	ROOT_MAGIC	none
 crates/blaze-drive/src/lib.rs	FORMATS	none
 crates/blaze-drive/src/record.rs	MAGIC	none
+crates/blaze-emit/src/sota/bolt.rs	BPG2_MAGIC	none
+crates/blaze-emit/src/sota/bolt.rs	BPG2_VERSION	none
 crates/blaze-engine/src/pages.rs	FILE_SHARD_MAGIC	none
 crates/blaze-engine/src/pages.rs	PAGE_MAGIC	none
 crates/blaze-engine/src/pages.rs	PLACES_MAGIC	none
@@ -155,6 +157,8 @@ crates/blaze-lir/src/lib.rs	VERSION	none
 crates/blaze-lir/src/persist.rs	SCHEMA	none
 crates/blaze-lir/src/pgo.rs	PGO_MAGIC	none
 crates/blaze-lir/src/pgo.rs	PGO_VERSION	none
+crates/blaze-lir/src/simplify/mach_egraph.rs	CACHE_MAGIC	none
+crates/blaze-lir/src/simplify/mach_egraph.rs	CACHE_VERSION	none
 crates/blaze-lower/src/form.rs	ROW_FORMAT	none
 crates/blaze-macro-run/src/call.rs	FORMAT	none
 crates/blaze-manifest/src/metadata.rs	VERSION	not persisted: cargo metadata's output, not blaze's

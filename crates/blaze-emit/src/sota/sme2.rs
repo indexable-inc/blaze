@@ -1221,7 +1221,8 @@ mod tests {
             return;
         }
 
-        let code = emit_sme2_gemm_f32(blaze_own::testing::heap().alloc());
+        let alloc = blaze_own::testing::heap().alloc();
+        let code = emit_sme2_gemm_f32(alloc);
         let exec = blaze_inproc::exec::Executable::new(&code, 0)
             .expect("W^X executable mapping for SME2 f32 kernel must succeed");
         type GemmF32Fn = extern "C" fn(*mut f32, *const f32, *const f32, i64, i64, i64, i64);
@@ -1241,19 +1242,23 @@ mod tests {
         ];
 
         for &(m, n, k) in shapes {
-            let a: std::vec::Vec<f32> = (0..m * k)
-                .map(|idx| (((idx.wrapping_mul(37).wrapping_add(11)) % 97) as f32 - 48.0) * 0.03125)
-                .collect();
-            let b: std::vec::Vec<f32> = (0..k * n)
-                .map(|idx| (((idx.wrapping_mul(53).wrapping_add(7)) % 89) as f32 - 44.0) * 0.03125)
-                .collect();
+            let mut a: AVec<'static, f32> = Vec::with_capacity_in(m * k, alloc);
+            for idx in 0..m * k {
+                a.push((((idx.wrapping_mul(37).wrapping_add(11)) % 97) as f32 - 48.0) * 0.03125);
+            }
+            let mut b: AVec<'static, f32> = Vec::with_capacity_in(k * n, alloc);
+            for idx in 0..k * n {
+                b.push((((idx.wrapping_mul(53).wrapping_add(7)) % 89) as f32 - 44.0) * 0.03125);
+            }
 
             for &accum in &[false, true] {
-                let init_c: std::vec::Vec<f32> = (0..m * n)
-                    .map(|idx| (((idx.wrapping_mul(19).wrapping_add(3)) % 61) as f32 - 30.0) * 0.125)
-                    .collect();
-                let mut got = init_c.clone();
-                let mut expected = init_c;
+                let mut got: AVec<'static, f32> = Vec::with_capacity_in(m * n, alloc);
+                let mut expected: AVec<'static, f32> = Vec::with_capacity_in(m * n, alloc);
+                for idx in 0..m * n {
+                    let v = (((idx.wrapping_mul(19).wrapping_add(3)) % 61) as f32 - 30.0) * 0.125;
+                    got.push(v);
+                    expected.push(v);
+                }
 
                 let flags = if accum { SME2_GEMM_FLAG_ACCUM } else { 0 };
                 kernel(
@@ -1291,7 +1296,8 @@ mod tests {
             return;
         }
 
-        let code = emit_sme2_gemm_f64(blaze_own::testing::heap().alloc());
+        let alloc = blaze_own::testing::heap().alloc();
+        let code = emit_sme2_gemm_f64(alloc);
         let exec = blaze_inproc::exec::Executable::new(&code, 0)
             .expect("W^X executable mapping for SME2 f64 kernel must succeed");
         type GemmF64Fn = extern "C" fn(*mut f64, *const f64, *const f64, i64, i64, i64, i64);
@@ -1311,19 +1317,23 @@ mod tests {
         ];
 
         for &(m, n, k) in shapes {
-            let a: std::vec::Vec<f64> = (0..m * k)
-                .map(|idx| (((idx.wrapping_mul(37).wrapping_add(11)) % 97) as f64 - 48.0) * 0.03125)
-                .collect();
-            let b: std::vec::Vec<f64> = (0..k * n)
-                .map(|idx| (((idx.wrapping_mul(53).wrapping_add(7)) % 89) as f64 - 44.0) * 0.03125)
-                .collect();
+            let mut a: AVec<'static, f64> = Vec::with_capacity_in(m * k, alloc);
+            for idx in 0..m * k {
+                a.push((((idx.wrapping_mul(37).wrapping_add(11)) % 97) as f64 - 48.0) * 0.03125);
+            }
+            let mut b: AVec<'static, f64> = Vec::with_capacity_in(k * n, alloc);
+            for idx in 0..k * n {
+                b.push((((idx.wrapping_mul(53).wrapping_add(7)) % 89) as f64 - 44.0) * 0.03125);
+            }
 
             for &accum in &[false, true] {
-                let init_c: std::vec::Vec<f64> = (0..m * n)
-                    .map(|idx| (((idx.wrapping_mul(19).wrapping_add(3)) % 61) as f64 - 30.0) * 0.125)
-                    .collect();
-                let mut got = init_c.clone();
-                let mut expected = init_c;
+                let mut got: AVec<'static, f64> = Vec::with_capacity_in(m * n, alloc);
+                let mut expected: AVec<'static, f64> = Vec::with_capacity_in(m * n, alloc);
+                for idx in 0..m * n {
+                    let v = (((idx.wrapping_mul(19).wrapping_add(3)) % 61) as f64 - 30.0) * 0.125;
+                    got.push(v);
+                    expected.push(v);
+                }
 
                 let flags = if accum { SME2_GEMM_FLAG_ACCUM } else { 0 };
                 kernel(
