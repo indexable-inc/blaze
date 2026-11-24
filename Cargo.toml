@@ -493,6 +493,8 @@ blaze-json = { path = "crates/blaze-json" }
 blaze-semver = { path = "crates/blaze-semver" }
 blaze-tab = { path = "crates/blaze-tab" } # Blaze's LLM-first tabular data format inspired by NUON (sparse schemas, lossless Value).
 blaze-toml = { path = "crates/blaze-toml" }
+blaze-ui = { path = "crates/blaze-ui" } # Pure no_std, zero-unsafe, sans-IO relational ECS UI library + Rust->WGSL/MSL WebGPU renderer.
+blaze-ui-wasm = { path = "crates/blaze-ui-wasm" } # Zero-import no_std wasm32 C-ABI cdylib over blaze-ui + generated WebGPU shaders.
 blaze-v2-proof = { path = "crates/blaze-v2-proof" }
 # WASI preview 1 for wasm guests at both pointer widths.
 blaze-wasi = { path = "crates/blaze-wasi" }

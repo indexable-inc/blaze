@@ -2331,6 +2331,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-ui"
+version = "0.0.0"
+dependencies = [
+ "blaze-ecs",
+ "blaze-int",
+ "blaze-own",
+ "gpu",
+]
+
+[[package]]
+name = "blaze-ui-wasm"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-ui",
+]
+
+[[package]]
 name = "blaze-unicode"
 version = "0.0.0"
 dependencies = [
