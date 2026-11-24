@@ -355,7 +355,6 @@ fn gc_sweeps_native_work_caches_and_superseded_toolchain_packs_preserving_active
     let fs = io.need_fs().expect("fs");
     let clock = io.need_clock().expect("clock");
     let home = Home::of(&cx, &fs, Some("/h")).expect("home");
-    let now_ns = clock.wall().as_ns();
     let put = |rel: &str, bytes: &[u8]| {
         home.dir().publish(&cx, &Path::new(rel).expect("path"), Content::bytes(bytes), Durable::No).expect("publish");
     };
@@ -408,16 +407,17 @@ fn gc_sweeps_native_work_caches_and_superseded_toolchain_packs_preserving_active
     put(bstd::mem::format_in!(cx.frame(), "v2/toolchain/{}", stale_hex.as_str()).as_str(), &[0x22u8; 48]);
     put("v2/toolchain/clang/bin/clang", b"elf");
 
+    let after_puts_ns = clock.wall().as_ns();
     let probe = FixedPids(&[1001]);
 
-    // 1. At now_ns: only dead jobserver entry (2002) is swept; fresh work/caches/packs stay.
-    let immediate = sweep_aux_with(&cx, home.dir(), now_ns, &probe, false, AuxSweepPlant::None);
+    // 1. At after_puts_ns: only dead jobserver entry (2002) is swept; fresh work/caches/packs stay.
+    let immediate = sweep_aux_with(&cx, home.dir(), after_puts_ns, &probe, false, AuxSweepPlant::None);
     assert_eq!(immediate.files, 1, "only dead jobserver FIFO 2002 swept immediately");
     assert!(home.dir().stat(&cx, &Path::new("v2/native-work/build-script/jobs/1001").expect("p")).expect("s").is_some());
     assert!(home.dir().stat(&cx, &Path::new("v2/native-work/build-script/jobs/2002").expect("p")).expect("s").is_none());
 
     // 2. Past 7d (AUX_EXPIRY_NS) but before 30d: native-work out dir swept, 30d caches/packs kept.
-    let after_7d = now_ns.saturating_add(AUX_EXPIRY_NS);
+    let after_7d = after_puts_ns.saturating_add(AUX_EXPIRY_NS).saturating_add(1_000_000_000);
     let week = sweep_aux_with(&cx, home.dir(), after_7d, &probe, false, AuxSweepPlant::None);
     assert_eq!(week.files, 1, "expired native-work out/oldkey/libfoo.a swept at 7d");
     assert!(home.dir().stat(&cx, &Path::new("v2/native-work/build-script/out/oldkey").expect("p")).expect("s").is_none());
@@ -427,7 +427,7 @@ fn gc_sweeps_native_work_caches_and_superseded_toolchain_packs_preserving_active
 
     // 3. Past 30d (CACHE_EXPIRY_NS): all 6 cache dirs + superseded pack swept; bootstrap modules,
     //    live job FIFO, active manifest, active pack, and clang/ ALL preserved.
-    let after_30d = now_ns.saturating_add(CACHE_EXPIRY_NS);
+    let after_30d = after_puts_ns.saturating_add(CACHE_EXPIRY_NS).saturating_add(1_000_000_000);
     let month = sweep_aux_with(&cx, home.dir(), after_30d, &probe, false, AuxSweepPlant::None);
     assert_eq!(month.files, 6, "6 expired cache files swept at 30d");
     let tc_swept = sweep_toolchain_packs(&cx, home.dir(), pinned, after_30d, false, AuxSweepPlant::None);
