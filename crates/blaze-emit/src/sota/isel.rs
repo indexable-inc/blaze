@@ -1954,13 +1954,20 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                                 | Op::Smax
                                 | Op::Call
                                 | Op::CallIndirect
+                                | Op::Invoke
+                                | Op::InvokeIndirect
                                 | Op::Udiv
                                 | Op::Sdiv
                                 | Op::Urem
                                 | Op::Srem
                                 | Op::Memcpy
+                                | Op::Memmove
                                 | Op::Memset
+                                | Op::Memcmp
+                                | Op::Frem
+                                | Op::TlsAddr
                                 | Op::AtomicRmw
+                                | Op::Cmpxchg
                                 | Op::Br
                                 | Op::Switch
                         ) {
@@ -2103,13 +2110,20 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                                 | Op::Smax
                                 | Op::Call
                                 | Op::CallIndirect
+                                | Op::Invoke
+                                | Op::InvokeIndirect
                                 | Op::Udiv
                                 | Op::Sdiv
                                 | Op::Urem
                                 | Op::Srem
                                 | Op::Memcpy
+                                | Op::Memmove
                                 | Op::Memset
+                                | Op::Memcmp
+                                | Op::Frem
+                                | Op::TlsAddr
                                 | Op::AtomicRmw
+                                | Op::Cmpxchg
                                 | Op::Br
                                 | Op::Switch
                         ) {
@@ -4185,7 +4199,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                 inst += 1;
                 continue;
             }
-            if ty == Ty::I128 && !matches!(op, Op::Call | Op::CallIndirect) {
+            if ty == Ty::I128 && !matches!(op, Op::Call | Op::CallIndirect | Op::Invoke | Op::InvokeIndirect) {
                 let load_half = |words: &mut Vec<u32, Alloc<'a>>, v: u32, hi: bool, scratch: Reg| -> Reg {
                     match at_loc(&reg_alloc.loc_of, to_idx(v)) {
                         AllocLoc::GprPair(lo, h) => u32::from(if hi { h } else { lo }),
@@ -6716,7 +6730,22 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                                             let is_cs = (19..=28).contains(&qr);
                                             let clobbered = ((prev + 1)..inst).any(|mid| {
                                                 let mop = view.op(mid);
-                                                (!is_cs && matches!(mop, Op::Call | Op::CallIndirect))
+                                                (!is_cs
+                                                    && matches!(
+                                                        mop,
+                                                        Op::Call
+                                                            | Op::CallIndirect
+                                                            | Op::Memcpy
+                                                            | Op::Memmove
+                                                            | Op::Memset
+                                                            | Op::Memcmp
+                                                            | Op::Frem
+                                                            | Op::TlsAddr
+                                                            | Op::Udiv
+                                                            | Op::Sdiv
+                                                            | Op::Urem
+                                                            | Op::Srem
+                                                    ))
                                                     || matches!(
                                                         at_loc(&reg_alloc.loc_of, mid),
                                                         AllocLoc::Gpr(r) if r == qr
