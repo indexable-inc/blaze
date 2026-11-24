@@ -71,8 +71,10 @@ fn run<'o>(mode: CallScratch, text: &str, out: Alloc<'o>) -> Ran<'o> {
     let erased = Erased::new(&home);
     let bump = erased.bump();
     let g = bump.alloc();
-    let scratch = Frame::new(Tag::Expand).unwrap_or_else(|e| panic!("the call scratch: {e:?}"));
-    let metered = Metered::new(&home, scratch, mode);
+    let (scratch, solve_scratch) = Frame::new(Tag::Expand)
+        .and_then(|s| Ok((s, Frame::new(Tag::Nameres)?)))
+        .unwrap_or_else(|e| panic!("the scratch frames: {e:?}"));
+    let metered = Metered::new(&home, scratch, solve_scratch, mode);
     let crates = [CrateInput {
         name: "fixture",
         key: CrateItemKey(ContentId::of("blaze-cli metered call scratch test crate", b"fixture")),

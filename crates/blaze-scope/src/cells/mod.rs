@@ -805,6 +805,10 @@ pub(crate) struct Cells<'a, N> {
     frags: AVec<'a, Frag<'a, N>>,
     /// Reusable traversal stack for [`Cells::textual`], avoiding per-call bump allocations.
     textual_stack: AVec<'a, (FragId, usize)>,
+    /// Reusable working buffers for `globs_value`, `quiet_point`, `fixpoint`, `stall_with_calls`
+    /// and `weak_guess` so repeated quiet points and glob evaluations do not leak bump memory
+    /// (rule 11).
+    scratch: SolverScratch<'a, N>,
     cell_queue: ABTreeSet<'a, CellId>,
     item_queue: ABTreeSet<'a, ItemId>,
     /// Calls resolved and not expanded yet.
@@ -941,9 +945,209 @@ enum GuessStep {
     Item(Option<Outcome>),
 }
 
+/// Sparse-touched dense table keyed by `u32` (`CellId` / `ItemId`): O(1) array lookup,
+/// O(|inserted|) `clear()`, and zero bump growth after warmup across thousands of small sinks.
+struct DenseMap<'a, V: Copy> {
+    slots: AVec<'a, Option<V>>,
+    touched: AVec<'a, u32>,
+}
+
+impl<'a, V: Copy> DenseMap<'a, V> {
+    fn new_in(alloc: Alloc<'a>) -> Self {
+        DenseMap {
+            slots: AVec::new_in(alloc),
+            touched: AVec::new_in(alloc),
+        }
+    }
+
+    #[inline]
+    fn get(&self, key: &u32) -> Option<&V> {
+        let i = usize::try_from(*key).ok()?;
+        self.slots.get(i).and_then(Option::as_ref)
+    }
+
+    #[inline]
+    fn contains_key(&self, key: &u32) -> bool {
+        usize::try_from(*key).ok().and_then(|i| self.slots.get(i)).is_some_and(Option::is_some)
+    }
+
+    #[inline]
+    fn insert(&mut self, key: u32, value: V) -> Option<V> {
+        let Ok(i) = usize::try_from(key) else { return None };
+        if i >= self.slots.len() {
+            self.slots.resize(i + 1, None);
+        }
+        let slot = self.slots.get_mut(i)?;
+        let prev = slot.replace(value);
+        if prev.is_none() {
+            self.touched.push(key);
+        }
+        prev
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.touched.is_empty()
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        for &key in self.touched.iter() {
+            if let Ok(i) = usize::try_from(key)
+                && let Some(slot) = self.slots.get_mut(i)
+            {
+                *slot = None;
+            }
+        }
+        self.touched.clear();
+    }
+}
+
 struct Guess<'a> {
-    cells: ABTreeMap<'a, CellId, Option<Value>>,
-    items: ABTreeMap<'a, ItemId, Option<Outcome>>,
+    cells: DenseMap<'a, Option<Value>>,
+    items: DenseMap<'a, Option<Outcome>>,
+}
+
+impl<'a> Guess<'a> {
+    fn new_in(alloc: Alloc<'a>) -> Guess<'a> {
+        Guess {
+            cells: DenseMap::new_in(alloc),
+            items: DenseMap::new_in(alloc),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.cells.clear();
+        self.items.clear();
+    }
+}
+
+/// Reusable Tarjan SCC scratch buffers (cleared per `quiet_point`, zero bump growth after warmup).
+struct TarjanScratch<'a> {
+    index: AVec<'a, u32>,
+    low: AVec<'a, u32>,
+    on_stack: AVec<'a, bool>,
+    comp: AVec<'a, u32>,
+    stack: AVec<'a, u32>,
+    calls: AVec<'a, (u32, u32)>,
+}
+
+impl<'a> TarjanScratch<'a> {
+    fn new_in(alloc: Alloc<'a>) -> TarjanScratch<'a> {
+        TarjanScratch {
+            index: AVec::new_in(alloc),
+            low: AVec::new_in(alloc),
+            on_stack: AVec::new_in(alloc),
+            comp: AVec::new_in(alloc),
+            stack: AVec::new_in(alloc),
+            calls: AVec::new_in(alloc),
+        }
+    }
+}
+
+/// Reusable scratch buffers for [`Cells::quiet_point`], replacing per-call bump allocations and
+/// the O(sinks * nodes) sink scan with a single O(nodes) CSR bucket pass.
+struct QuietScratch<'a> {
+    nodes: AVec<'a, Node>,
+    dense: AVec<'a, u32>,
+    hub_of: AVec<'a, u32>,
+    hub_rows: AVec<'a, u32>,
+    hub_off: AVec<'a, u32>,
+    off: AVec<'a, u32>,
+    to: AVec<'a, u32>,
+    buf: AVec<'a, Node>,
+    srcs: AVec<'a, ModId>,
+    tarjan: TarjanScratch<'a>,
+    sink: AVec<'a, bool>,
+    has_item: AVec<'a, bool>,
+    sink_counts: AVec<'a, u32>,
+    sink_off: AVec<'a, u32>,
+    sink_cursor: AVec<'a, u32>,
+    sink_members: AVec<'a, Node>,
+}
+
+impl<'a> QuietScratch<'a> {
+    fn new_in(alloc: Alloc<'a>) -> QuietScratch<'a> {
+        QuietScratch {
+            nodes: AVec::new_in(alloc),
+            dense: AVec::new_in(alloc),
+            hub_of: AVec::new_in(alloc),
+            hub_rows: AVec::new_in(alloc),
+            hub_off: AVec::new_in(alloc),
+            off: AVec::new_in(alloc),
+            to: AVec::new_in(alloc),
+            buf: AVec::new_in(alloc),
+            srcs: AVec::new_in(alloc),
+            tarjan: TarjanScratch::new_in(alloc),
+            sink: AVec::new_in(alloc),
+            has_item: AVec::new_in(alloc),
+            sink_counts: AVec::new_in(alloc),
+            sink_off: AVec::new_in(alloc),
+            sink_cursor: AVec::new_in(alloc),
+            sink_members: AVec::new_in(alloc),
+        }
+    }
+}
+
+/// Reusable scratch buffers for [`Cells::stall_with_calls`].
+struct StallScratch<'a, N> {
+    calls: Guess<'a>,
+    picked: AVec<'a, (ItemId, Outcome)>,
+    kept: AVec<'a, (ItemId, Taken<N>)>,
+    spared: AVec<'a, ItemId>,
+    blocking: AVec<'a, ItemId>,
+}
+
+impl<'a, N> StallScratch<'a, N> {
+    fn new_in(alloc: Alloc<'a>) -> StallScratch<'a, N> {
+        StallScratch {
+            calls: Guess::new_in(alloc),
+            picked: AVec::new_in(alloc),
+            kept: AVec::new_in(alloc),
+            spared: AVec::new_in(alloc),
+            blocking: AVec::new_in(alloc),
+        }
+    }
+}
+
+/// Reusable scratch buffers for [`Cells::weak_guess`].
+struct WeakScratch<'a> {
+    view: Guess<'a>,
+    todo: AVec<'a, CellId>,
+    srcs: AVec<'a, ModId>,
+    members: AVec<'a, CellId>,
+}
+
+impl<'a> WeakScratch<'a> {
+    fn new_in(alloc: Alloc<'a>) -> WeakScratch<'a> {
+        WeakScratch {
+            view: Guess::new_in(alloc),
+            todo: AVec::new_in(alloc),
+            srcs: AVec::new_in(alloc),
+            members: AVec::new_in(alloc),
+        }
+    }
+}
+
+/// Reusable per-solver scratch buffers kept across evaluations and quiet points.
+struct SolverScratch<'a, N> {
+    edges: AVec<'a, (ModId, Visibility)>,
+    quiet: QuietScratch<'a>,
+    fixpoint: Guess<'a>,
+    stall: StallScratch<'a, N>,
+    weak: WeakScratch<'a>,
+}
+
+impl<'a, N> SolverScratch<'a, N> {
+    fn new_in(alloc: Alloc<'a>) -> SolverScratch<'a, N> {
+        SolverScratch {
+            edges: AVec::new_in(alloc),
+            quiet: QuietScratch::new_in(alloc),
+            fixpoint: Guess::new_in(alloc),
+            stall: StallScratch::new_in(alloc),
+            weak: WeakScratch::new_in(alloc),
+        }
+    }
 }
 
 impl<'a, N: crate::Name> Cells<'a, N> {
@@ -1060,6 +1264,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             items: AVec::new_in(alloc),
             frags: AVec::new_in(alloc),
             textual_stack: AVec::new_in(alloc),
+            scratch: SolverScratch::new_in(alloc),
             cell_queue: ABTreeSet::new_in(alloc),
             item_queue: ABTreeSet::new_in(alloc),
             expand_queue: ABTreeSet::new_in(alloc),
@@ -2248,7 +2453,25 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 }
                 // The glob edges by use index: the resolved ones, and under a guess the group's
                 // pending globs as guessed (one at the bottom brings nothing yet).
-                let mut edges: AVec<'a, (ModId, Visibility)> = AVec::new_in(self.alloc);
+                let mut edges = core::mem::replace(&mut self.scratch.edges, AVec::new_in(self.alloc));
+                edges.clear();
+                let res = self.globs_value_with(c, m, ns, name, guess, skip, &mut edges);
+                self.scratch.edges = edges;
+                res
+            }
+        }
+    }
+
+    fn globs_value_with(
+        &mut self,
+        _c: CellId,
+        m: ModId,
+        ns: Namespace,
+        name: N,
+        guess: Option<&Guess<'a>>,
+        skip: Skip,
+        edges: &mut AVec<'a, (ModId, Visibility)>,
+    ) -> Step<Value> {
                 {
                     let module = &self.modules[m as usize];
                     let (mut r, mut p) = (module.edges.iter().peekable(), module.glob_items.iter().peekable());
@@ -2351,8 +2574,6 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     }
                 }
                 Step::Done(acc.unwrap_or(if outside { Value::Outside } else { Value::NotFound }))
-            }
-        }
     }
 
     /// A cell's value: decided, or a member's guess (the bottom is not found); `None` while it is
@@ -2852,60 +3073,68 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// A pending named import of `name` in `m` or in a module those globs reach holds the view
     /// (`Step::Wait`): it may bind the name, and nothing is taken before it is decided.
     fn weak_view(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId) -> Step<(Value, From)> {
-        match self.weak_guess(m, ns, name, me) {
-            Step::Done(view) => self.own_view(m, ns, name, me, Skip::Weak, Some(&view)),
+        let mut w = core::mem::replace(&mut self.scratch.weak, WeakScratch::new_in(self.alloc));
+        let res = match self.weak_guess_into(m, ns, name, me, &mut w) {
+            Step::Done(()) => self.own_view(m, ns, name, me, Skip::Weak, Some(&w.view)),
             Step::Wait(n) => Step::Wait(n),
-        }
+        };
+        self.scratch.weak = w;
+        res
     }
 
     /// What `m`'s globs bring of `name` in `ns` now, by the weak view's rule.
     fn weak_globs(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId) -> Step<Value> {
-        match self.weak_guess(m, ns, name, me) {
-            Step::Done(view) => {
+        let mut w = core::mem::replace(&mut self.scratch.weak, WeakScratch::new_in(self.alloc));
+        let res = match self.weak_guess_into(m, ns, name, me, &mut w) {
+            Step::Done(()) => {
                 let g = self.cell(m, ns, name, Layer::Globs);
-                self.cell_value(g, Some(&view), Skip::Weak)
+                self.cell_value(g, Some(&w.view), Skip::Weak)
             }
             Step::Wait(n) => Step::Wait(n),
-        }
+        };
+        self.scratch.weak = w;
+        res
     }
 
     /// The weak view's cells: every undecided cell of `name` in `ns` that `m`'s `Globs` cell
-    /// reaches through resolved glob imports, each with its value at their least fixed point.
-    fn weak_guess(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId) -> Step<Guess<'a>> {
-        let alloc = self.alloc;
-        let mut view = Guess { cells: ABTreeMap::new_in(alloc), items: ABTreeMap::new_in(alloc) };
-        let mut todo: AVec<'a, CellId> = AVec::new_in(alloc);
-        todo.push(self.cell(m, ns, name, Layer::Globs));
-        let mut srcs: AVec<'a, ModId> = AVec::new_in(alloc);
-        while let Some(c) = todo.pop() {
-            if self.cells[c as usize].value.is_some() || view.cells.insert(c, None).is_some() {
+    /// reaches through resolved glob imports, each with its value at their least fixed point,
+    /// computed inside the reusable scratch `w`.
+    fn weak_guess_into(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId, w: &mut WeakScratch<'a>) -> Step<()> {
+        w.view.clear();
+        w.todo.clear();
+        w.srcs.clear();
+        w.members.clear();
+        w.todo.push(self.cell(m, ns, name, Layer::Globs));
+        while let Some(c) = w.todo.pop() {
+            if self.cells[c as usize].value.is_some() || w.view.cells.insert(c, None).is_some() {
                 continue;
             }
+            w.members.push(c);
             let Cell { module, layer, .. } = self.cells[c as usize];
             match layer {
-                Layer::Full => todo.push(self.cell(module, ns, name, Layer::Globs)),
+                Layer::Full => w.todo.push(self.cell(module, ns, name, Layer::Globs)),
                 Layer::Globs => {
-                    srcs.clear();
-                    srcs.extend(self.modules[module as usize].edges.values().map(|x| x.0));
-                    for &src in srcs.iter() {
-                        todo.push(self.cell(src, ns, name, Layer::Full));
+                    w.srcs.clear();
+                    w.srcs.extend(self.modules[module as usize].edges.values().map(|x| x.0));
+                    for &src in w.srcs.iter() {
+                        w.todo.push(self.cell(src, ns, name, Layer::Full));
                     }
                 }
             }
         }
+        // Sorted by CellId for deterministic iteration order identical to ABTreeMap::keys().
+        w.members.sort_unstable();
         // Each value only rises (as in `fixpoint`), so the rounds are bounded.
-        let mut members: AVec<'a, CellId> = AVec::new_in(alloc);
-        members.extend(view.cells.keys().copied());
-        let bound = 4 * members.len() + 4;
+        let bound = 4 * w.members.len() + 4;
         let mut rounds = 0;
         loop {
             let mut changed = false;
-            for &c in members.iter() {
-                let v = match self.cell_value(c, Some(&view), Skip::Weak) {
+            for &c in w.members.iter() {
+                let v = match self.cell_value(c, Some(&w.view), Skip::Weak) {
                     Step::Done(v) => Some(v).filter(|v| *v != Value::NotFound),
                     Step::Wait(on) => return Step::Wait(on),
                 };
-                if view.cells.insert(c, v) != Some(v) {
+                if w.view.cells.insert(c, v) != Some(v) {
                     changed = true;
                 }
             }
@@ -2914,11 +3143,11 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             }
             rounds += 1;
             if rounds > bound {
-                self.weak_error = Some(CellError::NoFixpoint { module: self.modules[m as usize].key, cells: members.len() });
+                self.weak_error = Some(CellError::NoFixpoint { module: self.modules[m as usize].key, cells: w.members.len() });
                 return Step::Wait(Node::Item(me));
             }
         }
-        Step::Done(view)
+        Step::Done(())
     }
 
     /// The first call of `m` not grown yet that may still write (not `me`, not one of a group
@@ -4089,36 +4318,43 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// Condenses the undecided nodes; decides the sinks of cells alone (glob cycles), else
     /// fails the items of the sinks (stalls). `false` when nothing is undecided.
     fn quiet_point(&mut self) -> Result<bool, CellError> {
+        let mut q = core::mem::replace(&mut self.scratch.quiet, QuietScratch::new_in(self.alloc));
+        let res = self.run_quiet_point(&mut q);
+        self.scratch.quiet = q;
+        res
+    }
+
+    fn run_quiet_point(&mut self, q: &mut QuietScratch<'a>) -> Result<bool, CellError> {
         let alloc = self.alloc;
-        let mut nodes: AVec<'a, Node> = AVec::new_in(alloc);
+        q.nodes.clear();
         for c in 0..self.cells.len() as CellId {
             if self.cells[c as usize].value.is_none() {
-                nodes.push(Node::Cell(c));
+                q.nodes.push(Node::Cell(c));
             }
         }
         for i in 0..self.items.len() as ItemId {
             if self.items[i as usize].outcome.is_none() && !self.items[i as usize].deep {
-                nodes.push(Node::Item(i));
+                q.nodes.push(Node::Item(i));
             }
         }
-        if nodes.is_empty() {
+        if q.nodes.is_empty() {
             return Ok(false);
         }
         self.stats.quiet_points += 1;
-        self.stats.quiet_nodes += nodes.len() as u64;
+        self.stats.quiet_nodes += q.nodes.len() as u64;
         // Each undecided node's index, dense by node (cells, then items): one load per edge,
         // where the ordered map it replaces was a tree walk (core: 324k nodes over 331 quiet
         // points).
         let cells_len = self.cells.len();
-        let mut dense: AVec<'a, u32> = AVec::new_in(alloc);
-        dense.resize(cells_len + self.items.len(), u32::MAX);
-        for (k, &n) in nodes.iter().enumerate() {
+        q.dense.clear();
+        q.dense.resize(cells_len + self.items.len(), u32::MAX);
+        for (k, &n) in q.nodes.iter().enumerate() {
             match n {
-                Node::Cell(c) => dense[c as usize] = k as u32,
-                Node::Item(i) => dense[cells_len + i as usize] = k as u32,
+                Node::Cell(c) => q.dense[c as usize] = k as u32,
+                Node::Item(i) => q.dense[cells_len + i as usize] = k as u32,
             }
         }
-        let index_of = |n: &Node| -> Option<u32> {
+        let index_of = |dense: &[u32], n: &Node| -> Option<u32> {
             let at = match *n {
                 Node::Cell(c) => c as usize,
                 Node::Item(i) => cells_len + i as usize,
@@ -4132,94 +4368,94 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         // no such call gets no edge in (it would be a node with nothing to wait on).
         const NO_HUB: u32 = u32::MAX;
         const EMPTY_HUB: u32 = u32::MAX - 1;
-        let real = nodes.len();
-        let mut hub_of: AVec<'a, u32> = AVec::new_in(alloc);
-        hub_of.resize(self.modules.len(), NO_HUB);
-        let mut hub_rows: AVec<'a, u32> = AVec::new_in(alloc);
-        let mut hub_off: AVec<'a, u32> = AVec::new_in(alloc);
-        hub_off.push(0);
-        let mut off: AVec<'a, u32> = AVec::new_in(alloc);
-        let mut to: AVec<'a, u32> = AVec::new_in(alloc);
-        off.push(0);
-        let mut buf: AVec<'a, Node> = AVec::new_in(alloc);
-        let mut srcs: AVec<'a, ModId> = AVec::new_in(alloc);
+        let real = q.nodes.len();
+        q.hub_of.clear();
+        q.hub_of.resize(self.modules.len(), NO_HUB);
+        q.hub_rows.clear();
+        q.hub_off.clear();
+        q.hub_off.push(0);
+        q.off.clear();
+        q.to.clear();
+        q.off.push(0);
+        q.buf.clear();
+        q.srcs.clear();
         let mut growth = None;
         // The fixed points' outside edges, in node order like `nodes`: one ordered walk.
         let extra = core::mem::replace(&mut self.extra, ABTreeSet::new_in(alloc));
         let mut more = extra.iter().peekable();
         for k in 0..real {
-            let n = nodes[k];
-            self.inputs(n, &mut buf, &mut srcs, &mut growth);
+            let n = q.nodes[k];
+            self.inputs(n, &mut q.buf, &mut q.srcs, &mut growth);
             while let Some(&&(from, x)) = more.peek() {
                 if from > n {
                     break;
                 }
                 if from == n {
-                    buf.push(x);
+                    q.buf.push(x);
                 }
                 more.next();
             }
-            for x in buf.iter() {
-                if let Some(j) = index_of(x) {
-                    to.push(j);
+            for x in q.buf.iter() {
+                if let Some(j) = index_of(&q.dense, x) {
+                    q.to.push(j);
                 }
             }
             if let Some(m) = growth {
-                if hub_of[m as usize] == NO_HUB {
-                    let start = hub_rows.len();
+                if q.hub_of[m as usize] == NO_HUB {
+                    let start = q.hub_rows.len();
                     for &j in self.modules[m as usize].calls.iter() {
                         if !self.items[j as usize].grown
-                            && let Some(x) = index_of(&Node::Item(j))
+                            && let Some(x) = index_of(&q.dense, &Node::Item(j))
                         {
-                            hub_rows.push(x);
+                            q.hub_rows.push(x);
                         }
                     }
-                    if hub_rows.len() == start {
-                        hub_of[m as usize] = EMPTY_HUB;
+                    if q.hub_rows.len() == start {
+                        q.hub_of[m as usize] = EMPTY_HUB;
                     } else {
-                        hub_of[m as usize] = (real + hub_off.len() - 1) as u32;
-                        hub_off.push(hub_rows.len() as u32);
+                        q.hub_of[m as usize] = (real + q.hub_off.len() - 1) as u32;
+                        q.hub_off.push(q.hub_rows.len() as u32);
                     }
                 }
-                if hub_of[m as usize] != EMPTY_HUB {
-                    to.push(hub_of[m as usize]);
+                if q.hub_of[m as usize] != EMPTY_HUB {
+                    q.to.push(q.hub_of[m as usize]);
                 }
             }
-            off.push(to.len() as u32);
+            q.off.push(q.to.len() as u32);
         }
         drop(more);
         self.extra = extra;
-        for h in 0..hub_off.len() - 1 {
-            to.extend_from_slice(&hub_rows[hub_off[h] as usize..hub_off[h + 1] as usize]);
-            off.push(to.len() as u32);
+        for h in 0..q.hub_off.len() - 1 {
+            q.to.extend_from_slice(&q.hub_rows[q.hub_off[h] as usize..q.hub_off[h + 1] as usize]);
+            q.off.push(q.to.len() as u32);
         }
         // Reading the inputs made a cell no evaluation had made yet: it is tried first, and the
         // graph is drawn again with it (a cell is made once, so this ends).
         if !self.cell_queue.is_empty() {
             return Ok(true);
         }
-        let comp = tarjan(&off, &to, alloc);
-        let count = comp.iter().copied().max().map_or(0, |c| c as usize + 1);
-        let mut sink: AVec<'a, bool> = AVec::new_in(alloc);
-        sink.resize(count, true);
-        for k in 0..off.len() - 1 {
-            for &j in to[off[k] as usize..off[k + 1] as usize].iter() {
+        let count = tarjan_into(&q.off, &q.to, &mut q.tarjan);
+        let comp = &q.tarjan.comp;
+        q.sink.clear();
+        q.sink.resize(count, true);
+        for k in 0..q.off.len() - 1 {
+            for &j in q.to[q.off[k] as usize..q.off[k + 1] as usize].iter() {
                 if comp[k] != comp[j as usize] {
-                    sink[comp[k] as usize] = false;
+                    q.sink[comp[k] as usize] = false;
                 }
             }
         }
-        let mut has_item: AVec<'a, bool> = AVec::new_in(alloc);
-        has_item.resize(count, false);
-        for (k, n) in nodes.iter().enumerate() {
+        q.has_item.clear();
+        q.has_item.resize(count, false);
+        for (k, n) in q.nodes.iter().enumerate() {
             if let Node::Item(_) = n {
-                has_item[comp[k] as usize] = true;
+                q.has_item[comp[k] as usize] = true;
             }
         }
-        if self.plant == CellPlant::StallFailsAll && (0..count).any(|s| sink[s] && has_item[s]) {
+        if self.plant == CellPlant::StallFailsAll && (0..count).any(|s| q.sink[s] && q.has_item[s]) {
             // The planted R5 bug: a stall fails every undecided item.
             self.stats.stalls += 1;
-            for n in nodes.iter() {
+            for n in q.nodes.iter() {
                 if let Node::Item(i) = *n {
                     self.stats.stalled_items += 1;
                     self.settle(i, Outcome::Failed(Unresolved::NotFound));
@@ -4227,23 +4463,56 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             }
             return Ok(true);
         }
+        // Group sink members in O(N) into a flat CSR slice, preserving exact component order
+        // `0..count` and exact member order `k = 0..real` (eliminates O(sinks * nodes) scan).
+        q.sink_counts.clear();
+        q.sink_counts.resize(count, 0);
+        for &c_id in comp.iter().take(real) {
+            if let Ok(s) = usize::try_from(c_id)
+                && q.sink.get(s).copied().unwrap_or(false)
+                && let Some(cnt) = q.sink_counts.get_mut(s)
+            {
+                *cnt += 1;
+            }
+        }
+        q.sink_off.clear();
+        q.sink_off.reserve(count + 1);
+        q.sink_cursor.clear();
+        q.sink_cursor.reserve(count);
+        let mut total = 0u32;
+        q.sink_off.push(0);
+        for &cnt in q.sink_counts.iter() {
+            q.sink_cursor.push(total);
+            total += cnt;
+            q.sink_off.push(total);
+        }
+        q.sink_members.clear();
+        q.sink_members.resize(usize::try_from(total).unwrap_or(0), Node::Cell(0));
+        for (&node, &c_id) in q.nodes.iter().take(real).zip(comp.iter()) {
+            if let Ok(s) = usize::try_from(c_id)
+                && q.sink.get(s).copied().unwrap_or(false)
+                && let Some(cursor) = q.sink_cursor.get_mut(s)
+                && let Ok(at) = usize::try_from(*cursor)
+                && let Some(slot) = q.sink_members.get_mut(at)
+            {
+                *slot = node;
+                *cursor += 1;
+            }
+        }
         // Every sink waits on itself alone: nothing outside it can change it any more, so it is
         // decided as its least fixed point (R3); a member that reaches nothing from outside the
         // group is not found (R5, the stall rule). Sinks share no edge, so their order is moot.
-        for s in 0..count {
-            if !sink[s] {
+        for (&is_sink, span) in q.sink.iter().zip(q.sink_off.windows(2)) {
+            if !is_sink {
                 continue;
             }
-            let mut members: AVec<'a, Node> = AVec::new_in(alloc);
-            for (k, &n) in nodes.iter().enumerate() {
-                if comp[k] as usize == s {
-                    members.push(n);
-                }
-            }
-            if members.is_empty() {
+            let (Ok(start), Ok(end)) = (usize::try_from(span[0]), usize::try_from(span[1])) else { continue };
+            if start == end {
                 continue;
             }
-            self.fixpoint(&members)?;
+            if let Some(members) = q.sink_members.get(start..end) {
+                self.fixpoint(members)?;
+            }
         }
         Ok(true)
     }
@@ -4265,7 +4534,14 @@ impl<'a, N: crate::Name> Cells<'a, N> {
 
     /// Decides a sink of cells together as the least fixed point of their candidates (R3).
     fn fixpoint(&mut self, members: &[Node]) -> Result<(), CellError> {
-        let mut guess = Guess { cells: ABTreeMap::new_in(self.alloc), items: ABTreeMap::new_in(self.alloc) };
+        let mut guess = core::mem::replace(&mut self.scratch.fixpoint, Guess::new_in(self.alloc));
+        let res = self.fixpoint_with(members, &mut guess);
+        self.scratch.fixpoint = guess;
+        res
+    }
+
+    fn fixpoint_with(&mut self, members: &[Node], guess: &mut Guess<'a>) -> Result<(), CellError> {
+        guess.clear();
         for &n in members {
             match n {
                 Node::Cell(c) => {
@@ -4283,7 +4559,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         loop {
             let mut changed = false;
             for &n in members {
-                let step = self.member_step(n, &guess);
+                let step = self.member_step(n, guess);
                 let on = match step {
                     Step::Wait(on) => on,
                     Step::Done(GuessStep::Cell(v)) => {
@@ -4330,7 +4606,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 return Err(CellError::NoFixpoint { module, cells: members.len() });
             }
         }
-        self.conclude(members, &guess)
+        self.conclude(members, guess)
     }
 
     /// A group at its least fixed point `guess` is decided: a stall with calls, or every member
@@ -4442,28 +4718,35 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// round: the earlier call fails first), every import takes its guess,
     /// and the cells are decided only when no call was spared (a spared call may still write).
     fn stall_with_calls(&mut self, members: &[Node], guess: &Guess<'a>) -> Result<(), CellError> {
+        let mut s = core::mem::replace(&mut self.scratch.stall, StallScratch::new_in(self.alloc));
+        let res = self.stall_with_calls_in(members, guess, &mut s);
+        self.scratch.stall = s;
+        res
+    }
+
+    fn stall_with_calls_in(&mut self, members: &[Node], guess: &Guess<'a>, s: &mut StallScratch<'a, N>) -> Result<(), CellError> {
         let alloc = self.alloc;
         // Calls are never decided from a guess: R5 fails them (the reference's sinks), and one
         // resolving under the guess would expand before an earlier call failed.
-        let mut picked: AVec<'a, (ItemId, Outcome)> = AVec::new_in(alloc);
+        s.picked.clear();
         // The group's calls, adding nothing: what a stalled call is asked under.
-        let mut calls = Guess { cells: ABTreeMap::new_in(alloc), items: ABTreeMap::new_in(alloc) };
+        s.calls.clear();
         for &n in members {
             if let Node::Item(i) = n
                 && self.items[i as usize].call.is_some()
             {
-                calls.items.insert(i, None);
+                s.calls.items.insert(i, None);
             }
         }
         // What the picked calls took: kept with them (`taken` is one call's at a time).
-        let mut kept: AVec<'a, (ItemId, Taken<N>)> = AVec::new_in(alloc);
+        s.kept.clear();
         let queued = self.cell_queue.len();
         for &n in members {
             let Node::Item(i) = n else { continue };
             if self.items[i as usize].call.is_none() {
                 // An import: R5 as in `fixpoint`, its guess when the guess resolves it.
                 if let Some(&Some(o @ (Outcome::Named(_) | Outcome::Glob(_) | Outcome::Outside))) = guess.items.get(&i) {
-                    picked.push((i, o));
+                    s.picked.push((i, o));
                 }
                 continue;
             }
@@ -4472,10 +4755,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             // `#[derive(Clone)]` in a module whose globs wait on its own derives takes the
             // standard prelude's; `cfg_select!` there is unknown, never failed), and nothing
             // else is guessed: every later segment is read from a decided cell.
-            if let Step::Done(o @ (Outcome::Called(_) | Outcome::Inert | Outcome::Outside)) = self.stalled_call(i, &calls) {
-                picked.push((i, o));
+            if let Step::Done(o @ (Outcome::Called(_) | Outcome::Inert | Outcome::Outside)) = self.stalled_call(i, &s.calls) {
+                s.picked.push((i, o));
                 for k in 0..self.taken.len() {
-                    kept.push((i, self.taken[k]));
+                    s.kept.push((i, self.taken[k]));
                 }
             }
         }
@@ -4483,16 +4766,16 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         if let Some(e) = self.weak_error.take() {
             return Err(e);
         }
-        if !picked.is_empty() {
+        if !s.picked.is_empty() {
             self.stats.stalls += 1;
-            for &(i, t) in kept.iter() {
+            for &(i, t) in s.kept.iter() {
                 match t {
                     Taken::Watch(m, ns, name, def, kind) => self.watches.entry((m, ns, name)).or_insert_with(|| AVec::new_in(alloc)).push((i, def, kind)),
                     Taken::Globs(g, def, globbed) => self.speculated.push((i, g, def, globbed)),
                     Taken::Error(e) => self.r6_error(i, e),
                 }
             }
-            for &(i, o) in picked.iter() {
+            for &(i, o) in s.picked.iter() {
                 self.settle(i, o);
             }
             return Ok(());
@@ -4502,8 +4785,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             // first, and the group is asked again (a cell is made once, so this ends).
             return Ok(());
         }
-        let mut spared: AVec<'a, ItemId> = AVec::new_in(alloc);
-        let mut blocking: AVec<'a, ItemId> = AVec::new_in(alloc);
+        s.spared.clear();
+        s.blocking.clear();
         if self.plant != CellPlant::StallSparesNone {
             for &n in members {
                 let Node::Item(i) = n else { continue };
@@ -4515,30 +4798,30 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 if let Step::Wait(w) = self.textual(at.frag, at.pos, name, Some(at.shape), None)
                     && members.contains(&w)
                 {
-                    spared.push(i);
+                    s.spared.push(i);
                     if let Node::Item(j) = w {
-                        blocking.push(j);
+                        s.blocking.push(j);
                     }
                 }
             }
         }
         // R5 (2026-11-16): a round that spares a call fails only the calls the spared calls'
         // textual reads wait on; every other member is tried again with the facts.
-        if !spared.is_empty() {
-            blocking.retain(|j| !spared.contains(j));
-            blocking.sort_unstable();
-            blocking.dedup();
-            if !blocking.is_empty() {
+        if !s.spared.is_empty() {
+            s.blocking.retain(|j| !s.spared.contains(j));
+            s.blocking.sort_unstable();
+            s.blocking.dedup();
+            if !s.blocking.is_empty() {
                 self.stats.stalls += 1;
-                self.stats.spared += spared.len() as u64;
-                for &j in blocking.iter() {
+                self.stats.spared += s.spared.len() as u64;
+                for &j in s.blocking.iter() {
                     self.stats.stalled_items += 1;
                     self.settle(j, Outcome::Failed(Unresolved::NotFound));
                 }
                 return Ok(());
             }
         }
-        let failing = members.iter().filter(|n| matches!(n, Node::Item(i) if !spared.contains(i))).count();
+        let failing = members.iter().filter(|n| matches!(n, Node::Item(i) if !s.spared.contains(i))).count();
         if failing == 0 {
             let module = match members[0] {
                 Node::Cell(c) => self.modules[self.cells[c as usize].module as usize].key,
@@ -4547,8 +4830,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             return Err(CellError::AllSpared { module });
         }
         self.stats.stalls += 1;
-        self.stats.spared += spared.len() as u64;
-        if spared.is_empty() {
+        self.stats.spared += s.spared.len() as u64;
+        if s.spared.is_empty() {
             for &n in members {
                 if let Node::Cell(c) = n {
                     let v = guess.cells.get(&c).copied().flatten().unwrap_or(Value::NotFound);
@@ -4558,7 +4841,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         for &n in members {
             let Node::Item(i) = n else { continue };
-            if spared.contains(&i) {
+            if s.spared.contains(&i) {
                 continue;
             }
             let o = if self.items[i as usize].call.is_some() {
@@ -4575,60 +4858,60 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     }
 }
 
-/// Strongly connected components of `adj`, iteratively (Tarjan): each node's component number.
-fn tarjan<'a>(off: &[u32], to: &[u32], alloc: Alloc<'a>) -> AVec<'a, u32> {
+/// Strongly connected components of `adj`, iteratively (Tarjan) into reusable scratch `t`:
+/// writes each node's component number into `t.comp` and returns the number of components.
+fn tarjan_into(off: &[u32], to: &[u32], t: &mut TarjanScratch<'_>) -> usize {
     const NONE: u32 = u32::MAX;
     let n = off.len() - 1;
     let row = |v: usize| &to[off[v] as usize..off[v + 1] as usize];
-    let mut index: AVec<'a, u32> = AVec::new_in(alloc);
-    index.resize(n, NONE);
-    let mut low: AVec<'a, u32> = AVec::new_in(alloc);
-    low.resize(n, 0);
-    let mut on_stack: AVec<'a, bool> = AVec::new_in(alloc);
-    on_stack.resize(n, false);
-    let mut comp: AVec<'a, u32> = AVec::new_in(alloc);
-    comp.resize(n, NONE);
-    let mut stack: AVec<'a, u32> = AVec::new_in(alloc);
-    // (node, next edge to look at)
-    let mut calls: AVec<'a, (u32, u32)> = AVec::new_in(alloc);
+    t.index.clear();
+    t.index.resize(n, NONE);
+    t.low.clear();
+    t.low.resize(n, 0);
+    t.on_stack.clear();
+    t.on_stack.resize(n, false);
+    t.comp.clear();
+    t.comp.resize(n, NONE);
+    t.stack.clear();
+    t.calls.clear();
     let (mut next, mut comps) = (0u32, 0u32);
     for start in 0..n as u32 {
-        if index[start as usize] != NONE {
+        if t.index[start as usize] != NONE {
             continue;
         }
-        calls.push((start, 0));
-        index[start as usize] = next;
-        low[start as usize] = next;
+        t.calls.push((start, 0));
+        t.index[start as usize] = next;
+        t.low[start as usize] = next;
         next += 1;
-        stack.push(start);
-        on_stack[start as usize] = true;
-        while let Some(&(v, e)) = calls.last() {
+        t.stack.push(start);
+        t.on_stack[start as usize] = true;
+        while let Some(&(v, e)) = t.calls.last() {
             let vi = v as usize;
             if (e as usize) < row(vi).len() {
-                let last = calls.len() - 1;
-                calls[last].1 += 1;
+                let last = t.calls.len() - 1;
+                t.calls[last].1 += 1;
                 let w = row(vi)[e as usize];
                 let wi = w as usize;
-                if index[wi] == NONE {
-                    index[wi] = next;
-                    low[wi] = next;
+                if t.index[wi] == NONE {
+                    t.index[wi] = next;
+                    t.low[wi] = next;
                     next += 1;
-                    stack.push(w);
-                    on_stack[wi] = true;
-                    calls.push((w, 0));
-                } else if on_stack[wi] {
-                    low[vi] = low[vi].min(index[wi]);
+                    t.stack.push(w);
+                    t.on_stack[wi] = true;
+                    t.calls.push((w, 0));
+                } else if t.on_stack[wi] {
+                    t.low[vi] = t.low[vi].min(t.index[wi]);
                 }
                 continue;
             }
-            calls.pop();
-            if let Some(&(p, _)) = calls.last() {
-                low[p as usize] = low[p as usize].min(low[vi]);
+            t.calls.pop();
+            if let Some(&(p, _)) = t.calls.last() {
+                t.low[p as usize] = t.low[p as usize].min(t.low[vi]);
             }
-            if low[vi] == index[vi] {
-                while let Some(w) = stack.pop() {
-                    on_stack[w as usize] = false;
-                    comp[w as usize] = comps;
+            if t.low[vi] == t.index[vi] {
+                while let Some(w) = t.stack.pop() {
+                    t.on_stack[w as usize] = false;
+                    t.comp[w as usize] = comps;
                     if w == v {
                         break;
                     }
@@ -4637,5 +4920,5 @@ fn tarjan<'a>(off: &[u32], to: &[u32], alloc: Alloc<'a>) -> AVec<'a, u32> {
             }
         }
     }
-    comp
+    comps as usize
 }

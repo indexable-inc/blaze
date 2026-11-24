@@ -435,7 +435,7 @@ impl<'c, 'a, 's, N: crate::Name> Decider<'c, 'a, 's, N> {
     /// The guess node `p` is evaluated under: the open nodes it read, at the bottom.
     fn guess_of(&self, p: usize) -> Guess<'a> {
         let alloc = self.core.alloc;
-        let mut g = Guess { cells: ABTreeMap::new_in(alloc), items: ABTreeMap::new_in(alloc) };
+        let mut g = Guess::new_in(alloc);
         let mut k = self.open[p].reads;
         while k != NONE {
             let (r, next) = self.reads[k as usize];
@@ -543,7 +543,7 @@ impl<'c, 'a, 's, N: crate::Name> Decider<'c, 'a, 's, N> {
         let mut members: AVec<'s, Node> = AVec::with_capacity_in(self.open.len() - p, self.scratch);
         members.extend(self.open[p..].iter().map(|o| o.node));
         let alloc = self.core.alloc;
-        let mut guess = Guess { cells: ABTreeMap::new_in(alloc), items: ABTreeMap::new_in(alloc) };
+        let mut guess = Guess::new_in(alloc);
         for &n in members.iter() {
             match n {
                 Node::Cell(c) => {
@@ -854,7 +854,7 @@ pub(crate) fn check<'a, 'o, N: crate::Name>(core: &mut Cells<'a, N>, now: &dyn F
         freeze(d.core);
         let start = now();
         for &(c, _) in text.iter() {
-            let g = Guess { cells: ABTreeMap::new_in(alloc), items: ABTreeMap::new_in(alloc) };
+            let g = Guess::new_in(alloc);
             if let Step::Done(GuessStep::Cell(v)) = d.core.member_step(Node::Cell(c), &g) {
                 d.core.decide(c, v.unwrap_or(Value::NotFound));
             }

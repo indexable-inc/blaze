@@ -23,7 +23,7 @@ pub(super) fn index_key(at: ItemIndex) -> ItemKey {
 /// The facts of one file `text` as the only text of crate `t`, on macOS.
 fn links_of<'a>(text: &'a str, bump: Bump<'a>) -> Result<CrateLinks<'a>, LinksError<'a>> {
     let outline = blaze_file_items::outline(text, Edition::E2021, bump.alloc());
-    let mut gather = Gather::new("t", Edition::E2021, MAC, &[], bump);
+    let mut gather = Gather::new("t", Edition::E2021, MAC, &[], bump)?;
     gather.text(TextOf::File("src/lib.rs"), text, &outline, &|at| Entry::Keyed(index_key(at)))?;
     gather.finish()
 }
@@ -76,7 +76,7 @@ fn two_exporters_of_one_name_refused() {
 
     // An exported entry the names source gives no key is refused by name, never passed over.
     let outline = blaze_file_items::outline(one, Edition::E2021, bump.alloc());
-    let mut gather = Gather::new("t", Edition::E2021, MAC, &[], bump);
+    let mut gather = Gather::new("t", Edition::E2021, MAC, &[], bump).unwrap_or_else(|e| panic!("gather: {e:?}"));
     assert_eq!(
         gather.text(TextOf::File("src/lib.rs"), one, &outline, &|_| Entry::Unkeyed).err(),
         Some(LinksError::Unkeyed { krate: "t", text: TextOf::File("src/lib.rs"), at: ItemIndex(0), line: 1, item: "S", needs: KeyFor::Export })

@@ -56,7 +56,7 @@ use blaze_unit_graph::Implicit;
 use crate::graph::{CrateGraph, CrateId, ExternGone, GraphCrate, GraphDep, GraphError, RootAttrs, Sysroot};
 use crate::names::{PathError, Unheld, VariantHit, Why, World, Written, variant_in};
 use crate::task::{
-    CallSrc, Cfg, Fill, FillEnv, FillReport, Files, First, Fragment, Held, ImplSrc,
+    CallSrc, Cfg, Fill, FillEnv, FillReport, Files, First, Fragment, FragmentTokens, Held, ImplSrc,
     ItemText, LangSrc, Loc, LowerCx, LowerNote, Lowered, MacroBody, MacroSrc, Member, ModMade, Par,
     PreludeImport, RootInput, RootNote, RootPlan, TaskError, Tree, Variant, Where,
     crate_root, crate_tools, file_attrs, lower, walk,
@@ -404,20 +404,61 @@ impl<'a> Tables<'a> {
     }
 
     fn merge(&mut self, other: Tables<'a>) {
-        let Tables { macros, calls, enums, impls, langs, use_locs, texts, by_place, members, ctors, values } = other;
-        self.by_place.extend(by_place);
-        self.values.extend(values);
-        for (owner, list) in members {
-            self.join_members(owner, list);
+        // Merge the smaller HashMap into the larger one (preserving `other`-wins semantics on any
+        // key collision) so merging large expansion tables into small file tables avoids repeated
+        // bump-abandoned rehashes during Stage::Publish (~60-70 MB saved on `core`).
+        fn merge_map<'a, K: Eq + core::hash::Hash, V>(
+            dst: &mut HashMap<K, V, Alloc<'a>>,
+            mut src: HashMap<K, V, Alloc<'a>>,
+        ) {
+            if src.len() > dst.len() {
+                let prev = core::mem::replace(dst, src);
+                dst.reserve(prev.len());
+                for (k, v) in prev {
+                    dst.entry(k).or_insert(v);
+                }
+            } else {
+                dst.reserve(src.len());
+                for (k, v) in src.drain() {
+                    dst.insert(k, v);
+                }
+            }
         }
-        self.ctors.extend(ctors);
-        self.macros.extend(macros);
-        self.calls.extend(calls);
-        self.enums.extend(enums);
+        let Tables { macros, calls, enums, impls, langs, use_locs, texts, by_place, members, ctors, values } = other;
+        merge_map(&mut self.by_place, by_place);
+        self.values.reserve(values.len());
+        self.values.extend(values);
+        if members.len() > self.members.len() {
+            let prev = core::mem::replace(&mut self.members, members);
+            self.members.reserve(prev.len());
+            for (owner, mut list) in prev {
+                match self.members.get_mut(&owner) {
+                    Some(existing) => {
+                        list.reserve(existing.len());
+                        list.extend(existing.iter().copied());
+                        *existing = list;
+                    }
+                    None => {
+                        self.members.insert(owner, list);
+                    }
+                }
+            }
+        } else {
+            self.members.reserve(members.len());
+            for (owner, list) in members {
+                self.join_members(owner, list);
+            }
+        }
+        merge_map(&mut self.ctors, ctors);
+        merge_map(&mut self.macros, macros);
+        merge_map(&mut self.calls, calls);
+        merge_map(&mut self.enums, enums);
+        self.impls.reserve(impls.len());
         self.impls.extend(impls);
+        self.langs.reserve(langs.len());
         self.langs.extend(langs);
-        self.use_locs.extend(use_locs);
-        self.texts.extend(texts);
+        merge_map(&mut self.use_locs, use_locs);
+        merge_map(&mut self.texts, texts);
     }
 }
 
@@ -1560,7 +1601,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         // modules before it starts: it is told of them as of any made module.
         par.stage(crate::task::Stage::Solve);
         par.names_part(crate::task::NamesPart::Blocks);
-        blocks_of(&base, &run, &low.bodies, None);
+        blocks_of(&base, &run, &low.bodies, None, alloc, None);
         let places = |m: ItemKey| held(run.block_places.lock(), "block places").get(&m).copied();
         let expand = |call: ItemKey, def: Def| {
             let _ = crate::task::Expand::expand(&cx, ExpandRequest { call, def });
@@ -1574,7 +1615,8 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
             out.extend(low.tables.values.iter().map(|v| v.place));
             out.extend(held(run.tables.read(), "tables").values.iter().map(|v| v.place));
         };
-        let solved = crate::cells::solve_and_write(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &expand, &made, &held_places, par.decide_check(), par.decide_plant(), par.names_groups(), par.names_members(), &names_part, bump)
+        let solve_scratch = |work: &mut dyn FnMut(Alloc<'_>)| par.solve_scratch(work);
+        let solved = crate::cells::solve_and_write(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &expand, &made, &held_places, par.decide_check(), par.decide_plant(), par.names_groups(), par.names_members(), &names_part, &solve_scratch, bump)
             .map_err(|error| NamesError::Cells { krate: input.name, error })?;
         if let Some(check) = &solved.decide {
             par.decided(input.name, check);
@@ -1627,6 +1669,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     let mut tables_all = low.tables;
     tables_all.merge(held(tables.into_inner(), "tables"));
     let made = held(made.into_inner(), "made modules");
+    chains.reserve(made.len());
     for (&m, module) in made.iter() {
         chains.insert(m, module.chain.clone_in(alloc));
     }
@@ -1922,7 +1965,7 @@ pub fn solve_held_body_scratch<'a, S: SourceTexts<'a>>(
         let seen = |_: ItemKey, _: &str| {};
         let scratch = |_: &mut dyn FnMut(Alloc<'_>)| crate::task::Scratch::Kept;
         let cx = FillCx { base: &base, run: &run, facts: Facts { base: &base, run: &run }, mark: &mark, part: &part, seen: &seen, scratch: &scratch };
-        make_blocks(&base, &run, core::slice::from_ref(&body.src), body.writer);
+        make_blocks(&base, &run, core::slice::from_ref(&body.src), body.writer, alloc, None);
         let mut outermost: AVec<'a, ItemKey> = AVec::new_in(alloc);
         outermost.extend(held(run.block_places.lock(), "block places").iter().filter(|&(_, &p)| p == body.src.place).map(|(&k, _)| k));
         outermost.sort_unstable();
@@ -2433,7 +2476,7 @@ fn lower_modules<'a, P: Par>(
             let fragment = Fragment {
                 // A file: no expansion wrote it.
                 marks: None,
-                tokens: None,
+                tokens: FragmentTokens::None,
                 module: m.key,
                 owner: m.key,
                 text: file.text,
@@ -2626,16 +2669,31 @@ enum BlocksAt {
 /// item ([`blaze_file_items::nested::Nested::writes`], the scan [`make_blocks`] reads first):
 /// any other body's blocks declare nothing a name or an impl table reads, and its own lowering
 /// answers its block-local names.
-fn blocks_of<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bodies: &[crate::task::BodySrc<'a>], writer: Option<&'a ExpansionText<'a>>) {
+fn blocks_of<'a, S: SourceTexts<'a>>(
+    base: &Base<'_, 'a, S>,
+    run: &Run<'a>,
+    bodies: &[crate::task::BodySrc<'a>],
+    writer: Option<&'a ExpansionText<'a>>,
+    scratch: Alloc<'_>,
+    deferred_tokens: Option<&dyn Fn() -> crate::nested_input::ExpansionTokens<'a>>,
+) {
     match base.blocks {
-        BlocksAt::Crate | BlocksAt::Body => make_blocks(base, run, bodies, writer),
+        BlocksAt::Crate | BlocksAt::Body => make_blocks(base, run, bodies, writer, scratch, deferred_tokens),
         BlocksAt::Held => {
             let writes = |b: &crate::task::BodySrc<'a>| {
-                let nested = blaze_file_items::nested::scan(b.text, base.alloc);
+                let nested = blaze_file_items::nested::scan(b.text, scratch);
                 nested.end == blaze_file_items::nested::NestedEnd::Whole && nested.writes()
             };
             let mut held_bodies = held(run.held.lock(), "held bodies");
-            held_bodies.extend(bodies.iter().filter(|b| writes(b)).map(|&b| (b, writer)));
+            for &b in bodies.iter() {
+                if writes(&b) {
+                    let mut b = b;
+                    if b.tokens.is_none() {
+                        b.tokens = deferred_tokens.map(|f| f());
+                    }
+                    held_bodies.push((b, writer));
+                }
+            }
         }
     }
 }
@@ -3775,16 +3833,14 @@ fn expand_call<'a, S: SourceTexts<'a>>(
         }
     };
     part(ExpandPart::Render, mac.name, expansion.tokens.len());
-    // Each placed piece as the nested input keeps it, `(start, end, token)`, made once at its
-    // final size (at most one a token), and the `crate` written for another crate's `$crate`
-    // beside it, sparse, by its place's index: no wide row per token is held or grown (the
-    // frame's largest stretch in tempo's core, `scope frame by stretch`).
-    // `placed` and `words` are kept (the nested input reads them), sized once in `home`; the
-    // rendering, `roots` and the column grow in the call's work.
-    let mut placed: BVec<'a, (u32, u32, u32)> = BVec::with_capacity_in(expansion.tokens.len(), home_bump);
+    // `placed`, `words`, `roots` and the rendered string live in the call's resettable scratch
+    // (`alloc`). Only if lowering actually encounters a nested macro call, an attribute-value
+    // call, an inline module, or a body that may write a block module are `sealed`, `placed` and
+    // `words` materialized into `home_bump` via `FragmentTokens::Lazy` (rule 11).
+    let mut placed: AVec<'_, (u32, u32, u32)> = AVec::with_capacity_in(expansion.tokens.len(), alloc);
     let mut roots: AVec<'_, (u32, CrateItemKey)> = AVec::new_in(alloc);
     let mut too_large = false;
-    let mut words: BVec<'a, Option<u32>> = BVec::with_capacity_in(expansion.tokens.len(), home_bump);
+    let mut words: AVec<'_, Option<u32>> = AVec::with_capacity_in(expansion.tokens.len(), alloc);
     let rendered = render_with(
         &expansion.tokens,
         Some(here),
@@ -3817,7 +3873,7 @@ fn expand_call<'a, S: SourceTexts<'a>>(
     // with its marks (crate::crate_roots).
     let roots_written = roots.iter().filter(|(_, k)| *k != here).count();
     // Rendered in the call's work (the text grows as it is written), kept at its exact size.
-    let text: &'a str = keep(rendered.as_str(), home_bump);
+    let rendered_text: &'a str = keep(rendered.as_str(), home_bump);
     let input_index = match written_input.as_deref() {
         Some(map) => blaze_expand::origin_column::InputIndex::Aligned(map),
         None => blaze_expand::origin_column::InputIndex::AsWritten,
@@ -3832,21 +3888,9 @@ fn expand_call<'a, S: SourceTexts<'a>>(
     let origins: Result<&'a [u8], crate::expansion_origins::OriginsError> = origin_column
         .and_then(|column| crate::expansion_origins::write_bytes(call, src.place, shape, src.name, src.implicit, &column, alloc))
         .map(|bytes| &*home_bump.alloc_slice_copy(&bytes));
-    // What a call written in this text takes its input from (crate::nested_input): the
-    // expansion's tokens sealed with its key, each placed piece's bytes, each token's word. The
-    // stream was made in the call's work: it is kept as one exact copy in `home` (each table
-    // sized once, `TokenStream::clone_in`), sealed there.
-    let expansion_tokens = {
-        let mut sealed = expansion.tokens.clone_in(home);
-        sealed.seal(own_key.0);
-        let sealed: &'a TokenStream<'a> = home_bump.alloc_val(sealed);
-        let placed: &'a [(u32, u32, u32)] = placed.into_bump_slice();
-        let words: &'a [Option<u32>] = words.into_bump_slice();
-        crate::nested_input::ExpansionTokens { stream: sealed, text, places: placed, words }
-    };
-    part(ExpandPart::Outline, mac.name, text.len());
-    let made: &'a ExpansionText<'a> = home_bump.alloc_val(ExpansionText::new(text, outline(text, edition, home), origins));
-    part(ExpandPart::Lower, mac.name, text.len());
+    part(ExpandPart::Outline, mac.name, rendered_text.len());
+    let made: &'a ExpansionText<'a> = home_bump.alloc_val(ExpansionText::new(rendered_text, outline(rendered_text, edition, home), origins));
+    part(ExpandPart::Lower, mac.name, rendered_text.len());
     // The marks a lowered path's first segment resolves by (token-mark-2): the text's column,
     // opened once in `ExpansionText::new`.
     let column = match made.column {
@@ -3864,8 +3908,8 @@ fn expand_call<'a, S: SourceTexts<'a>>(
     // ([`crate::nested_input::ExpansionTokens::moved`]), so a call there takes its input as the
     // expansion's tokens, never as its text lexed again.
     #[allow(clippy::type_complexity)]
-    let (text, made, column, fragment_tokens): (&'a str, &'a ExpansionText<'a>, Option<blaze_expand::origin_column::OriginsRef<'a>>, crate::nested_input::ExpansionTokens<'a>) = match made.outline.errors().first() {
-        None => (text, made, column, expansion_tokens),
+    let (text, made, column, moved_copies): (&'a str, &'a ExpansionText<'a>, Option<blaze_expand::origin_column::OriginsRef<'a>>, Option<AVec<'_, crate::crate_roots::Copied>>) = match made.outline.errors().first() {
+        None => (rendered_text, made, column, None),
         Some(error) => {
             // A call a block's module holds ([`crate::blocks`]) stands in STATEMENT position:
             // the Reference, "Macro invocation", "Statements": its expansion is statements of
@@ -3883,9 +3927,9 @@ fn expand_call<'a, S: SourceTexts<'a>>(
                 .is_some_and(|m| m.info.name.is_some_and(crate::blocks::is_block_module));
             if !in_block {
                 note(ExpandNote::NotItems { macro_name: mac.name, message: made.outline.message(error) });
-                (text, made, column, expansion_tokens)
+                (rendered_text, made, column, None)
             } else {
-                match crate::expanded_blocks::statements_as_items(text, call, alloc) {
+                match crate::expanded_blocks::statements_as_items(rendered_text, call, alloc) {
                     Ok(None) => return Some((DeclsBuilder::new_in(home), None)),
                     Ok(Some((items, copies))) => {
                         let items: &'a str = keep(items.as_str(), home_bump);
@@ -3923,7 +3967,7 @@ fn expand_call<'a, S: SourceTexts<'a>>(
                             note(ExpandNote::NotItems { macro_name: mac.name, message: again.outline.message(error) });
                             return Some((DeclsBuilder::new_in(home), None));
                         }
-                        (items, again, column, expansion_tokens.moved(items, &copies, home_bump))
+                        (items, again, column, Some(copies))
                     }
                     Err(refused) => {
                         note(ExpandNote::NotItems { macro_name: mac.name, message: refused.message() });
@@ -3944,9 +3988,24 @@ fn expand_call<'a, S: SourceTexts<'a>>(
         _ => None,
     };
     let written = included.unwrap_or(calling);
-    let fragment_tokens = Some(fragment_tokens);
+    // Materialize `ExpansionTokens` into `home_bump` AT MOST ONCE, ONLY when a consumer needs it.
+    let cached_tokens: core::cell::OnceCell<crate::nested_input::ExpansionTokens<'a>> = core::cell::OnceCell::new();
+    let get_tokens = || -> crate::nested_input::ExpansionTokens<'a> {
+        *cached_tokens.get_or_init(|| {
+            let mut sealed = expansion.tokens.clone_in(home);
+            sealed.seal(own_key.0);
+            let sealed: &'a TokenStream<'a> = home_bump.alloc_val(sealed);
+            let placed_home: &'a [(u32, u32, u32)] = home_bump.alloc_slice_copy(&placed);
+            let words_home: &'a [Option<u32>] = home_bump.alloc_slice_copy(&words);
+            let base = crate::nested_input::ExpansionTokens { stream: sealed, text: rendered_text, places: placed_home, words: words_home };
+            match moved_copies.as_deref() {
+                Some(copies) => base.moved(text, copies, home_bump),
+                None => base,
+            }
+        })
+    };
     let fragment = Fragment {
-        tokens: fragment_tokens,
+        tokens: FragmentTokens::LazyDeferBody(&get_tokens),
         module: src.module,
         owner: call,
         text,
@@ -3965,34 +4024,34 @@ fn expand_call<'a, S: SourceTexts<'a>>(
     // Entered only by a call that makes modules: one that makes none stays in `Lower` for the
     // few moves below (what the part costs is what `make_modules` does: a module's file read,
     // outlined and lowered).
-    if !out.mods_made.is_empty() {
-        part(ExpandPart::Modules, mac.name, out.mods_made.len());
-    }
     let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(home));
-    // An `include!`'s file is the current file of what it writes ([`crate::included`]): a
-    // `mod x;` in it is found from the INCLUDED file's folder, not the calling module's.
-    let included_dir: Option<&'a str> = included.filter(|_| !mods.is_empty()).map(|path| {
-        let mut dir = AString::from_str_in(path, alloc);
-        pop_dir(&mut dir);
-        keep(&dir, home_bump)
-    });
-    let place = Made {
-        text,
-        outline: &made.outline,
-        at: Where::Expansion(src.loc),
-        place: At::Expansion(call),
-        dir: included_dir,
-        written,
-        marks: column.map(|column| crate::crate_roots::TextMarks { text, column }),
-        tokens: fragment_tokens,
-    };
     let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(home));
-    make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies);
+    if !mods.is_empty() {
+        part(ExpandPart::Modules, mac.name, mods.len());
+        // An `include!`'s file is the current file of what it writes ([`crate::included`]): a
+        // `mod x;` in it is found from the INCLUDED file's folder, not the calling module's.
+        let included_dir: Option<&'a str> = included.map(|path| {
+            let mut dir = AString::from_str_in(path, alloc);
+            pop_dir(&mut dir);
+            keep(&dir, home_bump)
+        });
+        let place = Made {
+            text,
+            outline: &made.outline,
+            at: Where::Expansion(src.loc),
+            place: At::Expansion(call),
+            dir: included_dir,
+            written,
+            marks: column.map(|column| crate::crate_roots::TextMarks { text, column }),
+            tokens: Some(get_tokens()),
+        };
+        make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies);
+    }
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(home));
     part(ExpandPart::Tables, mac.name, 0);
     add_lowered(run, call, At::Expansion(call), out);
     part(ExpandPart::Blocks, mac.name, bodies.len());
-    blocks_of(base, run, &bodies, Some(made));
+    blocks_of(base, run, &bodies, Some(made), alloc, Some(&get_tokens));
     Some((decls, Some(made)))
 }
 
@@ -4089,7 +4148,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
         marks: None,
         // A slice of the calling text: written in an expansion, its calls take their inputs
         // from that expansion's tokens, placed in the same text.
-        tokens: kept_tokens,
+        tokens: FragmentTokens::from_option(kept_tokens),
     };
     let mut out = lower(
         LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() },
@@ -4113,7 +4172,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
     part(ExpandPart::Tables, name, 0);
     add_lowered(run, call, At::Expansion(call), out);
     part(ExpandPart::Blocks, name, bodies.len());
-    blocks_of(base, run, &bodies, Some(made));
+    blocks_of(base, run, &bodies, Some(made), alloc, None);
     Some((decls, Some(made)))
 }
 
@@ -4144,14 +4203,16 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
     run: &Run<'a>,
     bodies: &[crate::task::BodySrc<'a>],
     writer: Option<&ExpansionText<'a>>,
+    scratch: Alloc<'_>,
+    deferred_tokens: Option<&dyn Fn() -> crate::nested_input::ExpansionTokens<'a>>,
 ) {
     use crate::expansion_origins::OriginsError;
 
     let alloc = base.alloc;
     let bump = base.bump;
-    let mut work: AVec<'a, crate::task::BodySrc<'a>> = AVec::from_slice_in(bodies, alloc);
+    let mut work: AVec<'_, crate::task::BodySrc<'a>> = AVec::from_slice_in(bodies, scratch);
     while let Some(body) = work.pop() {
-        let nested = blaze_file_items::nested::scan(body.text, alloc);
+        let nested = blaze_file_items::nested::scan(body.text, scratch);
         // An unbalanced body is the parser's error to report; nothing is read from it.
         // A block is a module when it holds an item that makes one (its head is made in the
         // block's module by the ordinary code; front2's `Locals::keep` derives the same module
@@ -4166,8 +4227,8 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
             run.note(NamesNote::Made { name: crate::blocks::BLOCK_MODULE, at: body.loc, note: MadeNote::TooMany });
             continue;
         }
-        let mut copies: AVec<'a, crate::crate_roots::Copied> = AVec::new_in(alloc);
-        let rendered = crate::blocks::module_text(body.text, &nested, &mut |c| copies.push(c), alloc);
+        let mut copies: AVec<'_, crate::crate_roots::Copied> = AVec::new_in(scratch);
+        let rendered = crate::blocks::module_text(body.text, &nested, &mut |c| copies.push(c), scratch);
         let text: &'a str = bump.alloc_str(&rendered);
         let call = crate::task::key_of(base.key, body.key, "blocks", "", 0);
         // Copied tokens keep their indexes in the writing call's input, even when this
@@ -4177,10 +4238,10 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
             let writer = writer.ok_or(OriginsError::Unplaced { call })?;
             let (call_part, _) = crate::expansion_origins::split(writer.origins?)?;
             let at = crate::expansion_origins::offset_in(of.text, body.text).ok_or(OriginsError::InputNotInText { call })?;
-            let shifted = AVec::from_iter_in(copies.iter().map(|c| crate::crate_roots::Copied { from: at + c.from, ..*c }), alloc);
+            let shifted = AVec::from_iter_in(copies.iter().map(|c| crate::crate_roots::Copied { from: at + c.from, ..*c }), scratch);
             let column_error = |error| OriginsError::Column { call: Some(call), error };
-            let column = crate::crate_roots::remap(of.column, &shifted, alloc).map_err(column_error)?;
-            let mut bytes = AVec::from_slice_in(call_part, alloc);
+            let column = crate::crate_roots::remap(of.column, &shifted, scratch).map_err(column_error)?;
+            let mut bytes = AVec::from_slice_in(call_part, scratch);
             column.write(&mut bytes).map_err(column_error)?;
             Ok(&*bump.alloc_slice_copy(&bytes))
         })();
@@ -4202,9 +4263,9 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
         // `fn all() { .. $crate::__bitflags_expr_safe_attrs!(..) .. }`, written through
         // `__impl_bitflags!`'s argument). A body outside the text they place is no
         // expansion's: none.
-        let tokens = body.tokens.and_then(|of| {
+        let tokens = body.tokens.or_else(|| deferred_tokens.map(|f| f())).and_then(|of| {
             let at = crate::expansion_origins::offset_in(of.text, body.text)?;
-            let mut shifted: AVec<'a, crate::crate_roots::Copied> = AVec::with_capacity_in(copies.len(), alloc);
+            let mut shifted: AVec<'_, crate::crate_roots::Copied> = AVec::with_capacity_in(copies.len(), scratch);
             shifted.extend(copies.iter().map(|c| crate::crate_roots::Copied { from: c.from + at, ..*c }));
             Some(of.moved(text, &shifted, bump))
         });
@@ -4221,7 +4282,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
             written: body.written,
             kept: None,
             marks,
-            tokens,
+            tokens: FragmentTokens::from_option(tokens),
         };
         let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, bump);
         let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
@@ -4538,7 +4599,7 @@ fn make_modules<'a, S: SourceTexts<'a>>(
     made: Made<'a>,
     depth: u16,
     // The bodies lowered in the made modules that may write an impl in a block, added.
-    bodies: &mut AVec<'a, crate::task::BodySrc<'a>>,
+    bodies: &mut AVec<'_, crate::task::BodySrc<'a>>,
 ) {
     let alloc = base.alloc;
     let bump = base.bump;
@@ -4621,7 +4682,7 @@ fn make_modules<'a, S: SourceTexts<'a>>(
             written: fragment_of.written,
             kept: None,
             marks: fragment_of.marks,
-            tokens: fragment_of.tokens,
+            tokens: FragmentTokens::from_option(fragment_of.tokens),
         };
         let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, bump);
         bodies.extend(out.bodies.iter().copied());

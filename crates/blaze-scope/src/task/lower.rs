@@ -1872,7 +1872,7 @@ impl<'t> BodySrc<'t> {
         depth: u16,
         place: (ItemKey, u32),
         marks: Option<crate::crate_roots::TextMarks<'t>>,
-        tokens: Option<crate::nested_input::ExpansionTokens<'t>>,
+        tokens: FragmentTokens<'_, 't>,
     ) -> Option<BodySrc<'t>> {
         let holds = matches!(
             detail,
@@ -1886,7 +1886,17 @@ impl<'t> BodySrc<'t> {
         // A `!` too: a statement call may declare items (crate::expanded_blocks); the scan
         // decides whether one is in statement position. The one test, shared with the names
         // digest (`blaze_file_items::nested::may_write_block`, lane CX19).
-        (holds && blaze_file_items::nested::may_write_block(text)).then_some(BodySrc { key, module, text, loc, written, depth, place, marks, tokens })
+        (holds && blaze_file_items::nested::may_write_block(text)).then(|| BodySrc {
+            key,
+            module,
+            text,
+            loc,
+            written,
+            depth,
+            place,
+            marks,
+            tokens: tokens.get_for_body(),
+        })
     }
 }
 
@@ -2089,6 +2099,47 @@ impl<W: ?Sized> Clone for LowerCx<'_, '_, W> {
 
 impl<W: ?Sized> Copy for LowerCx<'_, '_, W> {}
 
+/// How a [`Fragment`] supplies the rendered tokens of a macro expansion to lowering: absent for a
+/// source file, already materialized, or lazily cloned into the crate frame on first consumer
+/// (nested call, attribute value call, or body that may write a block module) so expansions with
+/// none keep zero token/place/word tables in the crate frame (rule 11).
+#[derive(Clone, Copy)]
+pub enum FragmentTokens<'c, 't> {
+    None,
+    Ready(crate::nested_input::ExpansionTokens<'t>),
+    Lazy(&'c dyn Fn() -> crate::nested_input::ExpansionTokens<'t>),
+    /// Like [`FragmentTokens::Lazy`], but leaves [`BodySrc::tokens`] as `None` because the caller
+    /// (`resolve.rs::blocks_of`) runs `nested::scan` immediately and materializes tokens ONLY if
+    /// `nested.writes()` is true, avoiding cloning `TokenStream` for bodies that merely contain
+    /// `assert!()` / `panic!()` (rule 11).
+    LazyDeferBody(&'c dyn Fn() -> crate::nested_input::ExpansionTokens<'t>),
+}
+
+impl<'t> FragmentTokens<'_, 't> {
+    pub fn from_option(tokens: Option<crate::nested_input::ExpansionTokens<'t>>) -> Self {
+        match tokens {
+            Some(tokens) => FragmentTokens::Ready(tokens),
+            None => FragmentTokens::None,
+        }
+    }
+
+    pub fn get(self) -> Option<crate::nested_input::ExpansionTokens<'t>> {
+        match self {
+            FragmentTokens::None => None,
+            FragmentTokens::Ready(tokens) => Some(tokens),
+            FragmentTokens::Lazy(make) | FragmentTokens::LazyDeferBody(make) => Some(make()),
+        }
+    }
+
+    pub fn get_for_body(self) -> Option<crate::nested_input::ExpansionTokens<'t>> {
+        match self {
+            FragmentTokens::None | FragmentTokens::LazyDeferBody(_) => None,
+            FragmentTokens::Ready(tokens) => Some(tokens),
+            FragmentTokens::Lazy(make) => Some(make()),
+        }
+    }
+}
+
 /// One fragment's text and place.
 #[derive(Clone, Copy)]
 pub struct Fragment<'c, 't> {
@@ -2123,8 +2174,8 @@ pub struct Fragment<'c, 't> {
     /// segment's mark resolves its root. `None`: a file, or a text no column carries.
     pub marks: Option<crate::crate_roots::TextMarks<'t>>,
     /// The tokens `text` was rendered from (an expansion's; crate::nested_input): a call in it
-    /// takes its input as a range of them. `None`: a file, or a text rewritten after rendering.
-    pub tokens: Option<crate::nested_input::ExpansionTokens<'t>>,
+    /// takes its input as a range of them.
+    pub tokens: FragmentTokens<'c, 't>,
 }
 
 /// Lowers `fragment`'s items under `cx`.
@@ -2266,7 +2317,7 @@ struct Lower<'c, 't, 'a, W: ?Sized> {
     /// [`Fragment::marks`].
     marks: Option<crate::crate_roots::TextMarks<'t>>,
     /// [`Fragment::tokens`].
-    tokens: Option<crate::nested_input::ExpansionTokens<'t>>,
+    tokens: FragmentTokens<'c, 't>,
     pos: u32,
     procs: ProcDecls<'t>,
     alloc: Alloc<'a>,
@@ -2845,7 +2896,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
     /// found is kept as the refusal it is, for the expansion to report (rule 3).
     fn call_tokens(&self, input: &'t str, cut: crate::nested_input::InputCut) -> crate::nested_input::CallTokens<'t> {
         use crate::nested_input::CallTokens;
-        match self.tokens {
+        match self.tokens.get() {
             None => CallTokens::Text,
             Some(tokens) => match tokens.input(input, cut) {
                 Ok(input) => CallTokens::Expansion(input),

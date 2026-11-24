@@ -51,7 +51,10 @@ pub fn table_digest(table: &[u8]) -> ContentId {
 
 /// The table of the crate `c` resolved by its `CrateScope` job, as bytes appended to `out`. A
 /// refused table is written as its refusal's words (state 1), never as an empty table.
-pub fn scope_table<'a>(c: &CrateNames<'a>, out: &mut AVec<'_, u8>, bump: Bump<'a>) -> Result<(), TableError> {
+pub fn scope_table<'n, 'b>(c: &CrateNames<'n>, out: &mut AVec<'_, u8>, bump: Bump<'b>) -> Result<(), TableError>
+where
+    'n: 'b,
+{
     match scope_links(c, bump) {
         Ok(links) => write_table(&links, out),
         Err(refused) => {

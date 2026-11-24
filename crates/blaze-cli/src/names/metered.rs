@@ -71,14 +71,18 @@ pub(crate) struct Metered<'f> {
     /// The call scratch, its caller's (made fallibly beside the crate's frame: scope.rs
     /// `resolve`): borrowed for one call at a time.
     scratch: RefCell<Frame>,
+    /// The cell core's scratch frame (`Par::solve_scratch`), trimmed back to 0 bytes as soon as
+    /// `solve_and_write` finishes so solver state never overlaps Publish/Write/scope_record.
+    solve_scratch: RefCell<Frame>,
     mode: CallScratch,
     /// How many calls ran in the scratch.
     scratch_calls: Cell<u64>,
 }
 
 impl<'f> Metered<'f> {
-    /// Charging starts now, to [`Outside::Before`]; each macro call's work runs in `scratch`.
-    pub(crate) fn new(frame: &'f Frame, scratch: Frame, mode: CallScratch) -> Metered<'f> {
+    /// Charging starts now, to [`Outside::Before`]; each macro call's work runs in `scratch`
+    /// and the cell solver's working graph runs in `solve_scratch`.
+    pub(crate) fn new(frame: &'f Frame, scratch: Frame, solve_scratch: Frame, mode: CallScratch) -> Metered<'f> {
         let metered = Metered {
             frame,
             at: Cell::new(STAGES + PARTS),
@@ -86,6 +90,7 @@ impl<'f> Metered<'f> {
             gone: Cell::new(frame.abandoned().bytes),
             slots: [const { Cell::new(Slot { grown: 0, abandoned: 0, entries: 0 }) }; SLOTS],
             scratch: RefCell::new(scratch),
+            solve_scratch: RefCell::new(solve_scratch),
             mode,
             scratch_calls: Cell::new(0),
         };
@@ -119,6 +124,21 @@ impl<'f> Metered<'f> {
     /// [`super::resolve`]'s own stretch `outside` starts now.
     pub(crate) fn outside(&self, outside: Outside) {
         self.enter(STAGES + PARTS + outside as usize);
+    }
+
+    /// Runs `work` in a rolled-back scope of the resolve's scratch frame (idle once the solve
+    /// finishes), reclaiming every temporary byte before the next encoder runs (rule 11).
+    pub(crate) fn with_scratch<R>(&self, work: impl FnOnce(blaze_own::Bump<'_>) -> R) -> R {
+        let mut scratch = self.scratch.borrow_mut();
+        scratch.scope(|frame| {
+            let erased = Erased::new(frame);
+            work(erased.bump())
+        })
+    }
+
+    /// Returns any committed scratch pages past 0 back to the kernel once record encoding ends.
+    pub(crate) fn trim_scratch(&self) {
+        self.scratch.borrow_mut().trim(0);
     }
 
     /// The breakdown, the last stretch charged; `of` names the crate.
@@ -169,6 +189,21 @@ impl Par for Metered<'_> {
         self.scratch_calls.set(self.scratch_calls.get() + 1);
         Scratch::Reset
     }
+
+    fn solve_scratch(&self, work: &mut dyn FnMut(Alloc<'_>)) -> Scratch {
+        match self.mode {
+            CallScratch::Reset => {}
+            #[cfg(test)]
+            CallScratch::Kept => return Scratch::Kept,
+        }
+        let mut solve = self.solve_scratch.borrow_mut();
+        solve.scope(|frame| {
+            let erased = Erased::new(frame);
+            work(erased.handle());
+        });
+        solve.trim(0);
+        Scratch::Reset
+    }
 }
 
 /// One crate scope frame's bytes by stretch ([`Metered`]), its peak and its crate.
@@ -181,6 +216,12 @@ pub(crate) struct ScopeBytes {
     scratch_peak: u64,
     scratch_calls: u64,
     of: Label,
+}
+
+impl ScopeBytes {
+    pub(crate) fn peak(&self) -> u64 {
+        self.peak
+    }
 }
 
 impl Default for ScopeBytes {
@@ -276,7 +317,12 @@ mod tests {
     #[test]
     fn each_stretch_is_charged_its_own_growth() {
         let frame = Frame::with_reserve(1 << 20, Tag::Other).expect("a test frame");
-        let metered = Metered::new(&frame, Frame::with_reserve(1 << 20, Tag::Expand).expect("a test scratch"), CallScratch::Reset);
+        let metered = Metered::new(
+            &frame,
+            Frame::with_reserve(1 << 20, Tag::Expand).expect("a test scratch"),
+            Frame::with_reserve(1 << 20, Tag::Nameres).expect("a test solve scratch"),
+            CallScratch::Reset,
+        );
         metered.stage(Stage::Solve);
         let _solve = frame.alloc_slice_copy(&[0u8; 4096]);
         metered.stage(Stage::Expand);

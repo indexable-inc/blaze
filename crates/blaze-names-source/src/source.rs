@@ -280,7 +280,7 @@ impl<'w, T: Texts> CrateSource<'w, T> {
             written: text_path(w, m.file),
             kept: None,
             marks: None,
-            tokens: None,
+            tokens: blaze_scope::task::FragmentTokens::None,
         };
         let entry = self.crates[index].implicit.entry && m.parent.is_none();
         let low = lower(lower_cx(w, &self.crates[index], entry), fragment, bump);
@@ -341,7 +341,7 @@ impl<'w, T: Texts> CrateSource<'w, T> {
             written: info.src.written,
             kept: None,
             marks: None,
-            tokens: None,
+            tokens: blaze_scope::task::FragmentTokens::None,
         };
         let low = lower(lower_cx(w, &facts, false), fragment, bump);
         if !low.mods_made.is_empty() {

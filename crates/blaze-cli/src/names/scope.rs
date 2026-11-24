@@ -125,7 +125,11 @@ pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame:
         Ok(scratch) => scratch,
         Err(error) => return (failed_with(std::format!("crate `{}`: its macro calls' scratch frame ({CALL_SCRATCH} bytes) could not be reserved: {error:?}", job.input.name)), super::metered::ScopeBytes::default()),
     };
-    let metered = super::metered::Metered::new(frame, scratch, super::metered::CallScratch::Reset);
+    let solve_scratch = match Frame::with_reserve(SCOPE_FRAME, Tag::Nameres) {
+        Ok(solve_scratch) => solve_scratch,
+        Err(error) => return (failed_with(std::format!("crate `{}`: its cell solver's scratch frame ({SCOPE_FRAME} bytes) could not be reserved: {error:?}", job.input.name)), super::metered::ScopeBytes::default()),
+    };
+    let metered = super::metered::Metered::new(frame, scratch, solve_scratch, super::metered::CallScratch::Reset);
     let resolution = resolve_metered(cx, root, job, frame, &metered);
     let of = crate::phases::byte_rows::Label::of(format_args!("{}", job.input.name));
     (resolution, metered.finish(of))
@@ -209,6 +213,10 @@ impl Par for FilePar<'_> {
 
     fn call_scratch(&self, work: &mut dyn FnMut(blaze_own::Alloc<'_>)) -> blaze_scope::task::Scratch {
         self.meter.call_scratch(work)
+    }
+
+    fn solve_scratch(&self, work: &mut dyn FnMut(blaze_own::Alloc<'_>)) -> blaze_scope::task::Scratch {
+        self.meter.solve_scratch(work)
     }
 
     fn outline_files<'a>(
@@ -503,7 +511,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         Some(blaze_scope::waits_on::FailedDep { called: Some(*called), name, key })
     }));
     let (out, payload, findings, failed, ok, unresolved, test_marks, expansions) = match done {
-        Ok(done) => match scope_record(&done, crate_name, job.member, &blaze_scope::waits_on::WaitsOn::of(done.names, &failed_deps, alloc), bump, job.kept) {
+        Ok(done) => match scope_record(&done, crate_name, job.member, &blaze_scope::waits_on::WaitsOn::of(done.names, &failed_deps, alloc), metered, job.kept) {
             Ok(record) => {
                 // Both records (rule 21): a dependent reads the exports, but the crate's own
                 // bodies read its inner names (front_load.rs), so an out over the exports alone

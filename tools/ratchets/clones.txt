@@ -72,7 +72,7 @@ blaze-rel	7
 blaze-remote	51
 blaze-report	1
 blaze-resolve	68
-blaze-scope	75
+blaze-scope	74
 blaze-screen	8
 blaze-script	50
 blaze-semver	12

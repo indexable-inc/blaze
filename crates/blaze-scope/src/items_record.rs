@@ -1992,7 +1992,10 @@ impl<'a> ItemsRecord<'a> {
     }
 
     /// Reuse the solve's surface and file ranges when building cells from its records.
-    pub(super) fn use_solved_texts(&mut self, names: &CrateNames<'a>, bump: Bump<'a>) {
+    pub(super) fn use_solved_texts<'n>(&mut self, names: &CrateNames<'n>, bump: Bump<'a>)
+    where
+        'n: 'a,
+    {
         let checked = |saw, found, text| if saw == found { Seen::Fresh(text) } else { Seen::Stale(found) };
         let files = &names.files[..names.files.len().min(self.files())];
         let mut texts: AVec<'_, &[u8]> = AVec::with_capacity_in(files.len(), self.alloc);

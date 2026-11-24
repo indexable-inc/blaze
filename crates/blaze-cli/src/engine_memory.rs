@@ -136,11 +136,33 @@ pub(crate) struct NamesMemory {
     pub(crate) at_once: (u64, u32, u16),
     /// The largest tasks by scratch committed, the largest first (ties by name; rule 25).
     pub(crate) largest: [Option<(u64, Name)>; LARGEST],
+    /// The two largest crates' per-stretch scope frame breakdowns (`names::metered::ScopeBytes`).
+    pub(crate) largest_scope: [crate::names::metered::ScopeBytes; 2],
 }
 
 impl NamesMemory {
     pub(crate) fn new() -> NamesMemory {
-        NamesMemory { waves: 0, tasks: 0, scratch: 0, wave_frame: (0, 0), at_once: (0, 0, 0), largest: [None; LARGEST] }
+        NamesMemory {
+            waves: 0,
+            tasks: 0,
+            scratch: 0,
+            wave_frame: (0, 0),
+            at_once: (0, 0, 0),
+            largest: [None; LARGEST],
+            largest_scope: [crate::names::metered::ScopeBytes::default(); 2],
+        }
+    }
+
+    pub(crate) fn scope_bytes(&mut self, bytes: crate::names::metered::ScopeBytes) {
+        if bytes.peak() == 0 {
+            return;
+        }
+        if bytes.peak() > self.largest_scope[0].peak() {
+            self.largest_scope[1] = self.largest_scope[0];
+            self.largest_scope[0] = bytes;
+        } else if bytes.peak() > self.largest_scope[1].peak() {
+            self.largest_scope[1] = bytes;
+        }
     }
 
     /// One names phase ended: its wave, what its frame committed, each resolved task's scratch
@@ -305,6 +327,11 @@ pub(crate) fn profile(ledger: &Ledger, names: Option<&NamesStage<'_>>, into: &mu
                 let _ = write!(into, " {bytes}");
             }
             let _ = writeln!(into);
+            for sb in &stage.memory.largest_scope {
+                if sb.peak() > 0 {
+                    let _ = write!(into, "{sb}");
+                }
+            }
             if let Some(world) = world {
                 let (crates, lists, payloads) = world.held();
                 let (used, committed) = world.frame_held();
