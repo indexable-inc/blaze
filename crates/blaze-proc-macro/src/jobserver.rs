@@ -99,6 +99,8 @@ struct State {
 /// The command's jobserver ([`JobserverOpts`]).
 pub struct Jobserver {
     fifo: std::string::String,
+    id: u32,
+    run_seq: core::sync::atomic::AtomicU64,
     workers: NonZeroU32,
     /// `workers - 1`: what the fifo holds at rest.
     tokens: u32,
@@ -172,7 +174,21 @@ impl Jobserver {
         }
         let tokens = opts.workers.get() - 1;
         fill(&file, tokens, &fifo)?;
-        Ok(Jobserver { fifo, workers: opts.workers, tokens, state: Lock::new("scripts.jobserver", State { file: Some(file), running: 0, restored: 0, broken: None }) })
+        Ok(Jobserver {
+            fifo,
+            id: opts.id,
+            run_seq: core::sync::atomic::AtomicU64::new(0),
+            workers: opts.workers,
+            tokens,
+            state: Lock::new("scripts.jobserver", State { file: Some(file), running: 0, restored: 0, broken: None }),
+        })
+    }
+
+    /// Returns a `(command_id, sequence)` pair unique across threads of this command and across
+    /// concurrent commands sharing one home, so each native build-script invocation gets private
+    /// work folders (`pkg/`, `out/`, `facts/`, `deps/`) with zero ambient `process::id()` calls.
+    pub fn next_run_id(&self) -> (u32, u64) {
+        (self.id, self.run_seq.fetch_add(1, core::sync::atomic::Ordering::Relaxed))
     }
 
     /// The fifo's path (granted read and write to each native run).

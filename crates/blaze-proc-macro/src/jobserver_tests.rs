@@ -115,3 +115,91 @@ fn jobserver_replaces_a_stale_fifo_and_one_worker_lends_nothing() {
     drop(first);
     _ = std::fs::remove_dir_all(&work);
 }
+
+/// Overlapping native build-script runs of the same `key_hex` (either two threads of one command
+/// or two concurrent commands sharing `<home>/.blaze/v2/native-work/blaze`) get disjoint `(id, seq)`
+/// work directories from [`Jobserver::next_run_id`], so neither run's `fresh_folder` deletes files
+/// out from under the other's `OutDir::list_output` (`FilesError { op: ListOutput, code: 2 }`),
+/// and `RunWorkGuard` removes all private directories and lock files on drop.
+#[test]
+fn overlapping_runs_of_same_key_use_disjoint_work_dirs_and_clean_up() {
+    use bstd::{fs::Durable, mem::TASK_FRAME, procs::hermetic::RootFiles as _};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let work_dir = work("run-isolation");
+    let cmd_a = Jobserver::new(JobserverOpts { work: &work_dir, workers: NonZeroU32::new(2).expect("2"), id: 101 }).expect("cmd_a");
+    let cmd_b = Jobserver::new(JobserverOpts { work: &work_dir, workers: NonZeroU32::new(2).expect("2"), id: 202 }).expect("cmd_b");
+
+    let (io, root) = crate::record::native_world(work_dir.as_ref()).expect("native world");
+    let cx = io.cx(core::time::Duration::from_secs(60), TASK_FRAME).expect("cx");
+    let shim_rel = bstd::path::Path::new("fake-shim").expect("shim path");
+    let sf = root.create(&cx, &shim_rel).expect("create fake shim");
+    sf.write_at(&cx, 0, b"#!/bin/sh\nexit 0\n", Durable::No).expect("write shim");
+    sf.close(&cx, Durable::No).expect("close shim");
+    let shim_path = blaze_own::format_in!(alloc, "{work_dir}/fake-shim");
+    let placed = crate::native_facts::place_shim(&work_dir, shim_path.as_str()).expect("place shim");
+
+    let same_key = "1f7948020d269c853f239f31e1e4e69149b7929842b80f36f305779778cd3eff";
+    let (a0, a1, b0) = (cmd_a.next_run_id(), cmd_a.next_run_id(), cmd_b.next_run_id());
+    assert_eq!(a0, (101, 0));
+    assert_eq!(a1, (101, 1));
+    assert_eq!(b0, (202, 0));
+
+    let rk_a0 = blaze_own::format_in!(alloc, "{same_key}-{}-{}", a0.0, a0.1);
+    let rk_a1 = blaze_own::format_in!(alloc, "{same_key}-{}-{}", a1.0, a1.1);
+    let rk_b0 = blaze_own::format_in!(alloc, "{same_key}-{}-{}", b0.0, b0.1);
+
+    let out_a0_rel = blaze_own::format_in!(alloc, "out/{}", rk_a0.as_str());
+    let out_a1_rel = blaze_own::format_in!(alloc, "out/{}", rk_a1.as_str());
+    let out_b0_rel = blaze_own::format_in!(alloc, "out/{}", rk_b0.as_str());
+    let lock_a0_rel = blaze_own::format_in!(alloc, "facts/{}.lock", rk_a0.as_str());
+    {
+        let mut guard_a0 = crate::native_unit::RunWorkGuard::new(&work_dir, alloc);
+        let out_a0 = crate::native_unit::fresh_folder(&work_dir, out_a0_rel.as_str(), &[], "tikv-jemalloc-sys", alloc).expect("out a0");
+        guard_a0.push_dir(blaze_own::AString::from_str_in(out_a0_rel.as_str(), alloc));
+        let _facts_a0 = crate::native_facts::prepare(&placed, &work_dir, rk_a0.as_str(), None, alloc).expect("facts a0");
+        guard_a0.push_dir(blaze_own::format_in!(alloc, "facts/{}", rk_a0.as_str()));
+        guard_a0.push_file(blaze_own::AString::from_str_in(lock_a0_rel.as_str(), alloc));
+
+        // Write a nested file in run a0, then start overlapping runs a1 and b0 for the SAME key_hex.
+        let nested_rel = blaze_own::format_in!(alloc, "{}/build/lib/libjemalloc.a", out_a0_rel.as_str());
+        let nf = root.create(&cx, &bstd::path::Path::new(nested_rel.as_str()).expect("nested")).expect("create a0 output");
+        nf.write_at(&cx, 0, b"archive-a0", Durable::No).expect("write a0");
+        nf.close(&cx, Durable::No).expect("close a0");
+
+        let mut guard_a1 = crate::native_unit::RunWorkGuard::new(&work_dir, alloc);
+        let _out_a1 = crate::native_unit::fresh_folder(&work_dir, out_a1_rel.as_str(), &[], "tikv-jemalloc-sys", alloc).expect("out a1");
+        guard_a1.push_dir(blaze_own::AString::from_str_in(out_a1_rel.as_str(), alloc));
+        let _facts_a1 = crate::native_facts::prepare(&placed, &work_dir, rk_a1.as_str(), None, alloc).expect("facts a1");
+        guard_a1.push_dir(blaze_own::format_in!(alloc, "facts/{}", rk_a1.as_str()));
+        guard_a1.push_file(blaze_own::format_in!(alloc, "facts/{}.lock", rk_a1.as_str()));
+
+        let mut guard_b0 = crate::native_unit::RunWorkGuard::new(&work_dir, alloc);
+        let _out_b0 = crate::native_unit::fresh_folder(&work_dir, out_b0_rel.as_str(), &[], "tikv-jemalloc-sys", alloc).expect("out b0");
+        guard_b0.push_dir(blaze_own::AString::from_str_in(out_b0_rel.as_str(), alloc));
+        let _facts_b0 = crate::native_facts::prepare(&placed, &work_dir, rk_b0.as_str(), None, alloc).expect("facts b0");
+        guard_b0.push_dir(blaze_own::format_in!(alloc, "facts/{}", rk_b0.as_str()));
+        guard_b0.push_file(blaze_own::format_in!(alloc, "facts/{}.lock", rk_b0.as_str()));
+
+        // Run a0's `list_output` must still see its file cleanly (never ENOENT from a1/b0).
+        let out = crate::native_script::OutDir { root: blaze_roots::RootId(7), folder: &out_a0, package_root: None };
+        let mut count = 0usize;
+        out.list_output(&mut |_path, _digest, len| {
+            assert_eq!(len, 10);
+            count += 1;
+            Ok(())
+        })
+        .expect("list_output succeeds despite overlapping runs of the same key");
+        assert_eq!(count, 1);
+    }
+
+    // All private directories and lock files were cleaned up on drop.
+    assert!(root.stat(&cx, &bstd::path::Path::new(out_a0_rel.as_str()).expect("p")).expect("stat").is_none());
+    assert!(root.stat(&cx, &bstd::path::Path::new(out_a1_rel.as_str()).expect("p")).expect("stat").is_none());
+    assert!(root.stat(&cx, &bstd::path::Path::new(out_b0_rel.as_str()).expect("p")).expect("stat").is_none());
+    assert!(root.stat(&cx, &bstd::path::Path::new(lock_a0_rel.as_str()).expect("p")).expect("stat").is_none());
+
+    cmd_a.end().expect("end cmd_a");
+    cmd_b.end().expect("end cmd_b");
+    let _ = crate::native_script::remove(&work_dir, "fake-shim");
+}

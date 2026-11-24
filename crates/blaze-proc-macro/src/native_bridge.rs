@@ -661,10 +661,29 @@ fn decode_flat_tree_json_with_origins<'a>(
         Close(Delim, u32),
     }
 
-    // Walk iteratively starting from root subtree 0 (its Invisible delimiters are implicit).
+    // Walk iteratively starting from root subtree 0. When a proc macro returns a single
+    // delimited group (e.g. `paste::paste! {{ ... }}` returning a block expression `{ ... }`),
+    // `rust-analyzer-proc-macro-srv` collapses that group into root subtree 0 with a non-zero
+    // delimiter (`1` Paren, `2` Brace, `3` Bracket); only `0` (Invisible) is implicit.
+    let stream_err = |what: &'static str, e: blaze_expand::StreamError| {
+        NativeBridgeError::Failed(format!("token stream {what}: {e:?}"))
+    };
     let mut stack: Vec<Step> = Vec::new();
+    let root_open_span = subtrees[0];
+    let root_close_span = subtrees[1];
+    let root_delim = match subtrees[2] {
+        1 => Some(Delim::Paren),
+        2 => Some(Delim::Brace),
+        3 => Some(Delim::Bracket),
+        _ => None,
+    };
     let root_start = subtrees[3] as usize;
     let root_end = subtrees[4] as usize;
+    if let Some(delim) = root_delim {
+        stream.open(delim, ctx).map_err(|e| stream_err("open", e))?;
+        origins.push(origin_of_span(root_open_span, input_len, attr_len));
+        stack.push(Step::Close(delim, root_close_span));
+    }
     for idx in (root_start..root_end.min(token_tree.len())).rev() {
         stack.push(Step::Tree(idx));
     }
@@ -672,9 +691,7 @@ fn decode_flat_tree_json_with_origins<'a>(
     while let Some(step) = stack.pop() {
         match step {
             Step::Close(delim, close_span) => {
-                stream
-                    .close(delim, ctx)
-                    .map_err(|e| NativeBridgeError::Failed(format!("token stream close: {e:?}")))?;
+                stream.close(delim, ctx).map_err(|e| stream_err("close", e))?;
                 origins.push(origin_of_span(close_span, input_len, attr_len));
             }
             Step::Tree(tt_pos) => {
@@ -697,9 +714,7 @@ fn decode_flat_tree_json_with_origins<'a>(
                         };
                         let start = subtrees[base + 3] as usize;
                         let end = subtrees[base + 4] as usize;
-                        stream
-                            .open(delim, ctx)
-                            .map_err(|e| NativeBridgeError::Failed(format!("token stream open: {e:?}")))?;
+                        stream.open(delim, ctx).map_err(|e| stream_err("open", e))?;
                         origins.push(origin_of_span(open_span, input_len, attr_len));
                         stack.push(Step::Close(delim, close_span));
                         for c in (start..end.min(token_tree.len())).rev() {
@@ -1424,6 +1439,47 @@ fn main() {
                 "expected sol! macro in {:?}",
                 exports
             );
+        }
+    }
+
+    #[test]
+    fn decode_flat_tree_preserves_non_invisible_root_delimiters() {
+        let alloc = blaze_own::testing::heap().alloc();
+        // `rust-analyzer-proc-macro-srv` encodes a single top-level `{ ... }`, `(...)`, or `[...]`
+        // (such as `paste::paste! {{ let x = 1; x }}` returning a block expression) in root subtree 0's
+        // delimiter slot (`subtrees[2] != 0`). Verify all four root delimiter kinds and span origins.
+        for (delim_code, expected) in [
+            (0u32, None),
+            (1u32, Some(Delim::Paren)),
+            (2u32, Some(Delim::Brace)),
+            (3u32, Some(Delim::Bracket)),
+        ] {
+            // Single ident `"x"` inside root subtree 0 with open_span=3 (Input(0)), close_span=4 (Input(1)).
+            let json = blaze_own::format_in!(
+                alloc,
+                r#"{{"subtree":[3,4,{delim_code},0,1],"literal":[],"punct":[],"ident":[0,0,0],"token_tree":[3],"text":["x"]}}"#
+            );
+            let (stream, origins) =
+                decode_flat_tree_json_with_origins(json.as_str(), Edition::E2024, 2, 0, None, alloc)
+                    .expect("decode root subtree");
+            assert_eq!(stream.len(), origins.len(), "delim_code={delim_code}");
+            match expected {
+                None => {
+                    assert_eq!(stream.len(), 1);
+                    assert!(matches!(stream.tokens()[0].kind, TokenKind::Ident { .. }));
+                    assert_eq!(stream.text_at(0), "x");
+                    assert_eq!(origins[0], TokenOrigin::Made(Transparency::Transparent));
+                }
+                Some(delim) => {
+                    assert_eq!(stream.len(), 3, "expected Open, Ident, Close for {delim:?}");
+                    assert_eq!(stream.tokens()[0].kind, TokenKind::Open(delim));
+                    assert_eq!(stream.text_at(1), "x");
+                    assert_eq!(stream.tokens()[2].kind, TokenKind::Close(delim));
+                    assert_eq!(origins[0], TokenOrigin::Input(0));
+                    assert_eq!(origins[1], TokenOrigin::Made(Transparency::Transparent));
+                    assert_eq!(origins[2], TokenOrigin::Input(1));
+                }
+            }
         }
     }
 }
