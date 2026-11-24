@@ -711,9 +711,12 @@ impl MakerState {
 
 /// Reification records a selected fn item. Closure coercion records `call_once` at the
 /// closure type, whose body belongs to the item that contains the closure expression.
-pub(super) fn static_fn_tabled<P: FrontEnd>(program: &P, instance: Instance, ground: blaze_typeck::PTys<'_>) -> ItemKey {
-    if let Some(target) = blaze_build::vtable_shim_of(instance, ground) {
-        return static_fn_tabled(program, target, ground);
+pub(super) fn static_fn_tabled<P: FrontEnd>(program: &P, mut instance: Instance, ground: blaze_typeck::PTys<'_>) -> ItemKey {
+    for _ in 0..8 {
+        let Some(target) = blaze_build::vtable_shim_of(instance, ground) else {
+            break;
+        };
+        instance = target;
     }
     if let Some(target) = blaze_build::reify_shim_of(instance, ground) {
         return target.item;

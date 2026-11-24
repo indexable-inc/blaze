@@ -334,33 +334,102 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         ty: PTy,
         norm_depth: u32,
     ) -> Result<PTy, CheckError> {
-        if norm_depth >= 8 {
-            return Ok(ty);
+        struct NormFrame<'a> {
+            orig: PTy,
+            node: PNode,
+            kids: Vec<PTy, Alloc<'a>>,
+            next: usize,
+            changed: bool,
+            norm_depth: u32,
         }
         let alloc = self.alloc;
-        let node = ex.out.view().node(ty)?;
-        let mut kids: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
-        ex.out.view().children_of(node, &mut kids)?;
-        let mut changed = false;
-        for kid in kids.iter_mut() {
-            let n = self.normalize_portable(ex, rows, inert, seen, out, nest, e, depth, *kid, norm_depth + 1)?;
-            if self.reads.stopped() {
-                return Ok(ty);
+        let mut stack: Vec<NormFrame<'a>, Alloc<'a>> = Vec::new_in(alloc);
+        let mut cur_ty = ty;
+        let mut cur_depth = norm_depth;
+        loop {
+            // Descend into `cur_ty` at `cur_depth`.
+            let mut res = if cur_depth >= 8 {
+                cur_ty
+            } else {
+                let node = ex.out.view().node(cur_ty)?;
+                let mut kids: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+                ex.out.view().children_of(node, &mut kids)?;
+                if let Some(&first_kid) = kids.first() {
+                    let next_depth = cur_depth + 1;
+                    stack.push(NormFrame { orig: cur_ty, node, kids, next: 0, changed: false, norm_depth: cur_depth });
+                    cur_ty = first_kid;
+                    cur_depth = next_depth;
+                    continue;
+                }
+                if let Some(sub) = self.normalize_portable_alias(ex, rows, inert, seen, out, nest, e, depth, cur_ty)? {
+                    cur_ty = sub;
+                    cur_depth += 1;
+                    continue;
+                }
+                if self.reads.stopped() {
+                    return Ok(cur_ty);
+                }
+                cur_ty
+            };
+
+            // Ascend with `res` until either a sibling needs descending, an alias expands, or
+            // the stack empties.
+            let mut descend: Option<(PTy, u32)> = None;
+            while let Some(mut frame) = stack.pop() {
+                if let Some(slot) = frame.kids.get_mut(frame.next)
+                    && *slot != res
+                {
+                    *slot = res;
+                    frame.changed = true;
+                }
+                frame.next += 1;
+                if let Some(&next_kid) = frame.kids.get(frame.next) {
+                    let next_depth = frame.norm_depth + 1;
+                    stack.push(frame);
+                    descend = Some((next_kid, next_depth));
+                    break;
+                }
+                let rebuilt = if frame.changed { rebuild_in(&mut ex.out, frame.node, &frame.kids)? } else { frame.orig };
+                if let Some(sub) = self.normalize_portable_alias(ex, rows, inert, seen, out, nest, e, depth, rebuilt)? {
+                    descend = Some((sub, frame.norm_depth + 1));
+                    break;
+                }
+                if self.reads.stopped() {
+                    return Ok(rebuilt);
+                }
+                res = rebuilt;
             }
-            if n != *kid {
-                *kid = n;
-                changed = true;
+            if let Some((next_ty, next_depth)) = descend {
+                cur_ty = next_ty;
+                cur_depth = next_depth;
+            } else {
+                return Ok(res);
             }
         }
-        let cur = if changed { rebuild_in(&mut ex.out, node, &kids)? } else { ty };
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn normalize_portable_alias(
+        &mut self,
+        ex: &mut Export<'a>,
+        rows: &mut Rows<'_, 'a>,
+        inert: Inert,
+        seen: &mut HashMap<(ExprId, ItemKey, Option<Name>, List), (), Alloc<'a>>,
+        out: &mut Vec<Projected, Alloc<'a>>,
+        nest: &mut Vec<(usize, u32), Alloc<'a>>,
+        e: ExprId,
+        depth: u32,
+        cur: PTy,
+    ) -> Result<Option<PTy>, CheckError> {
+        let alloc = self.alloc;
         let PNode::Alias { trait_: at, name: an, args: al } = ex.out.view().node(cur)? else {
-            return Ok(cur);
+            return Ok(None);
         };
         let mut aps: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
         aps.extend_from_slice(ex.out.view().list(al)?);
         let selected = self.select_row(ex, rows, inert, &aps, (at, al, Some(an)), e)?;
         if self.reads.stopped() {
-            return Ok(cur);
+            return Ok(None);
         }
         if seen.insert((e, at, Some(an), al), ()).is_none() {
             if out.len() >= MOST_PROJECTED {
@@ -372,25 +441,28 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         }
         let Selected::Impl { imp, args: imp_args } = selected else {
-            return Ok(cur);
+            return Ok(None);
         };
         let hdr = match self.reads.impl_header(imp) {
             Ok(h) => h,
-            Err(Stop::Need(_)) if self.reads.stopped() => return Ok(cur),
+            Err(Stop::Need(_)) if self.reads.stopped() => return Ok(None),
             Err(Stop::Need(_)) => None,
             Err(Stop::Error(err)) => return Err(err),
         };
-        let Some(h) = hdr else { return Ok(cur) };
+        let Some(h) = hdr else { return Ok(None) };
         let Some(&(_, val_ty)) = h.assoc_types.iter().find(|&&(n, _)| n == an) else {
-            return Ok(cur);
+            return Ok(None);
         };
         let mut ia: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
         ia.extend_from_slice(ex.out.view().list(imp_args)?);
-        if !params_in_bounds(h.types, &[val_ty], ia.len() as u32, alloc)? {
-            return Ok(cur);
+        let Ok(ia_len) = u32::try_from(ia.len()) else {
+            return Ok(None);
+        };
+        if !params_in_bounds(h.types, &[val_ty], ia_len, alloc)? {
+            return Ok(None);
         }
         let sub = subst_into(h.types, val_ty, &ia, &mut ex.out, alloc)?;
-        self.normalize_portable(ex, rows, inert, seen, out, nest, e, depth, sub, norm_depth + 1)
+        Ok(Some(sub))
     }
 
     /// How the row `key` (`(trait, [Self, trait args..], name)`, its arguments `ps` in

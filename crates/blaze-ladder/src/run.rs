@@ -562,15 +562,23 @@ fn closure_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, gr
 /// method (its shim, fn_shim.rs; a pointer's at `caller`). One answer for a call's callee and
 /// for a vtable's method word (census g091226: 467 words "NoImpl at a closure" while calls
 /// found the closure's body).
-fn language_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, ground: &PortableTys<'_>, caller: usize) -> Option<usize> {
-    if let Some(target) = blaze_build::vtable_shim_of(called, ground.view()) {
-        return language_owner(program, adts, target, ground, caller).or_else(|| program.fn_index(target.item));
+fn language_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, mut called: Instance, ground: &PortableTys<'_>, caller: usize) -> Option<usize> {
+    let mut shims: [Option<ItemKey>; 8] = [None; 8];
+    let mut n = 0usize;
+    for slot in &mut shims {
+        let Some(target) = blaze_build::vtable_shim_of(called, ground.view()) else {
+            break;
+        };
+        *slot = Some(target.item);
+        n += 1;
+        called = target;
     }
     crate::front2::coroutines::owner_of(program, adts, called, ground)
         .or_else(|| closure_owner(program, adts, called, ground))
         .or_else(|| crate::fn_shim::fn_shim_owner(program, adts, called, ground, caller))
         .or_else(|| blaze_build::reify_shim_of(called, ground.view()).and_then(|t| program.fn_index(t.item)))
         .or_else(|| crate::clone_shim::language_from(program, called, ground).and_then(|f| program.fn_index(f.from)))
+        .or_else(|| shims.iter().take(n).rev().flatten().find_map(|&item| program.fn_index(item)))
 }
 
 /// What a by-value `self` `VTableShim` build needs from its tabled row (one home for `run.rs`

@@ -1322,7 +1322,7 @@ pub struct ContainerRegions {
     pub trait_regions: Option<Vec<Region, Alloc<'static>>>,
     /// Non-higher-ranked trait bounds on the container's own type parameters (`Param(p): Trait<..>`),
     /// extracted from the container's filed clause columns (numbered in `Param(0..count)`).
-    pub param_bounds: Vec<ContainerParamBound, Alloc<'static>>,
+    pub param_bounds: blaze_own::Vec<ContainerParamBound, Alloc<'static>>,
 }
 
 /// Extract non-higher-ranked trait bounds on bare type parameters (`PNode::Param(p)`) from a
@@ -1331,8 +1331,8 @@ fn extract_container_param_bounds<A: core::alloc::Allocator>(
     tys: tc::PTys<'_>,
     clauses: &[tc::region_facts::ClauseRegions<A>],
     alloc: Alloc<'static>,
-) -> Vec<ContainerParamBound, Alloc<'static>> {
-    let mut out = Vec::new_in(alloc);
+) -> blaze_own::Vec<ContainerParamBound, Alloc<'static>> {
+    let mut out = blaze_own::Vec::new_in(alloc);
     for c in clauses {
         if c.binders != 0 {
             continue;
@@ -1341,7 +1341,7 @@ fn extract_container_param_bounds<A: core::alloc::Allocator>(
         let Ok(list) = tys.list(args) else { continue };
         let Some(&first) = list.first() else { continue };
         let Ok(PNode::Param(param)) = tys.node(first) else { continue };
-        let mut regions = Vec::with_capacity_in(c.col.as_slice().len(), alloc);
+        let mut regions = blaze_own::Vec::with_capacity_in(c.col.as_slice().len(), alloc);
         regions.extend_from_slice(c.col.as_slice());
         out.push(ContainerParamBound { param, trait_, regions });
     }
@@ -1353,8 +1353,8 @@ impl ContainerRegions {
     pub fn of_header(v: &View<'_>, self_regions: Option<Vec<Region, Alloc<'static>>>, alloc: Alloc<'static>) -> Result<ContainerRegions, Why> {
         let mut names = Vec::new_in(alloc);
         lifetime_names(v, &mut names)?;
-        let count = names.len() as u32;
-        Ok(ContainerRegions { names, count, self_regions, self_binders: 0, trait_regions: None, param_bounds: Vec::new_in(alloc) })
+        let count = u32::try_from(names.len()).unwrap_or(u32::MAX);
+        Ok(ContainerRegions { names, count, self_regions, self_binders: 0, trait_regions: None, param_bounds: blaze_own::Vec::new_in(alloc) })
     }
 
     /// What a member walk in `env` is given ([`SelfGiven`]): in an impl's member, `Self`'s
@@ -3452,7 +3452,7 @@ impl<'n> Store<'n> {
         owned.extend_from_slice(names);
         let container = match impl_ {
             // A trait's group is its declared lifetimes (`ContainerRegions::of_header`).
-            None => Some(ContainerRegions { names: owned, count: declared, self_regions: None, self_binders: 0, trait_regions: None, param_bounds: Vec::new_in(alloc) }),
+            None => Some(ContainerRegions { names: owned, count: declared, self_regions: None, self_binders: 0, trait_regions: None, param_bounds: blaze_own::Vec::new_in(alloc) }),
             // An impl's whose regions were refused has none (its members' are refused by name).
             Some((None, _)) => None,
             Some((Some(r), self_ty)) => {

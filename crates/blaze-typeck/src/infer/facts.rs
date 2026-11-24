@@ -54,11 +54,16 @@ struct Span {
 
 impl Span {
     fn of<T>(v: &[T], start: usize) -> Span {
-        Span { start: start as u32, len: (v.len() - start) as u32 }
+        Span {
+            start: u32::try_from(start).unwrap_or(u32::MAX),
+            len: u32::try_from(v.len().saturating_sub(start)).unwrap_or(u32::MAX),
+        }
     }
 
     fn get<T>(self, v: &[T]) -> &[T] {
-        &v[self.start as usize..(self.start + self.len) as usize]
+        let start = usize::try_from(self.start).unwrap_or(usize::MAX);
+        let end = usize::try_from(self.start.saturating_add(self.len)).unwrap_or(usize::MAX);
+        v.get(start..end).unwrap_or(&[])
     }
 }
 

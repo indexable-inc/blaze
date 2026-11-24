@@ -228,7 +228,11 @@ fn diagnostic_text<'a>(d: &blaze_expand::Diagnostic, notes: &[u8], alloc: Alloc<
     };
     let mut out = AString::new_in(alloc);
     // The expander writes its notes as whole `str`s; a range off them is named as such.
-    match notes.get(t.at as usize..(t.at as usize).saturating_add(t.len as usize)).map(core::str::from_utf8) {
+    let slice = usize::try_from(t.at)
+        .ok()
+        .zip(usize::try_from(t.len).ok())
+        .and_then(|(at, len)| notes.get(at..at.saturating_add(len)));
+    match slice.map(core::str::from_utf8) {
         Some(Ok(text)) => out.push_str(text),
         _ => out.push_str("(a range off the expansion's notes)"),
     }
