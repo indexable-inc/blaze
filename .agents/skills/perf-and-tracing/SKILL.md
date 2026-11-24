@@ -71,3 +71,24 @@ interp_search_by_prefix}` on hot paths so one code path scales from Macs to 128-
 See [docs/v2/plan/design/auto-perf.md](../../../docs/v2/plan/design/auto-perf.md).
 
 <!-- End of the generated rules. Hand-written notes follow. -->
+
+## Hot-leaf SOTA checklist (hit >100% of C on attempt #1)
+
+Before writing or optimizing any hot kernel (codecs, parsers, hashers, scanners, schedulers):
+
+1. **Compute the hardware floor first** (`within-ten-percent-of-the-floor`, rule 67): state target
+   cycles/byte or `ns/op/core` and verify identical units against the reference (e.g. `zstd -b` /
+   `lz4 -b` report decimal `MB/s` = `1e6` bytes/s, not binary `MiB/s`).
+2. **Use `blaze-own` / `bstd` primitives from the start**: put zero-bounds-check cursors, bit
+   readers/writers, wildcopies (`u128` 16B/32B with `#[cold] #[inline(never)]` fallback so the
+   compiler never merges fast paths into `bl _memcpy`), and raw-pointer scanners in `crates/blaze-own/`
+   with `// SAFETY:` invariants while keeping `crates/blaze-std/` zero-`unsafe`.
+3. **Disassembly gate on build #1**: inspect the release disassembly (`otool -tV` on macOS) of the
+   hot leaf function immediately and eliminate any:
+   - out-of-line `bl _memcpy` / `bl Vec::try_push` calls inside the inner loop,
+   - loop-invariant pointer/limit stack spills (`ldr ..., [sp, #...]`),
+   - redundant slice bounds checks inside `while pos <= len.saturating_sub(K)`.
+4. **Profile before tuning**: run `sample` (or `blaze` profile parquet) to confirm the true
+   top-of-stack bottleneck before changing algorithms, and benchmark back-to-back with the C
+   reference in the same host load window.
+

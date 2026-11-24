@@ -417,6 +417,23 @@ impl<'a, A: Allocator> ByteCursor<'a, A> {
         {
             return false;
         }
+        if (lit_len | match_len) <= 16 && offset >= 16 {
+            // SAFETY:
+            // - `lit_pos + 32 <= literals.len()` and `len + 32 < self.cap`, so 16B literal
+            //   wildcopy stays strictly in bounds and non-overlapping.
+            // - `16 <= offset <= after_lit` and `next_out + 48 <= self.cap`, so 16B match
+            //   wildcopy reads initialized history non-overlapping with `dst` and writes in bounds.
+            unsafe {
+                let ls = literals.as_ptr().add(lit_pos);
+                let ld = self.base.add(len);
+                ptr::write_unaligned(ld.cast::<u128>(), ptr::read_unaligned(ls.cast::<u128>()));
+                let ms = self.base.add(after_lit - offset);
+                let md = self.base.add(after_lit);
+                ptr::write_unaligned(md.cast::<u128>(), ptr::read_unaligned(ms.cast::<u128>()));
+            }
+            self.len = next_out;
+            return true;
+        }
         if offset < 16 {
             if offset < 8 || match_len > 16 {
                 return false;

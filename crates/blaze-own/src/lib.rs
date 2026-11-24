@@ -120,6 +120,7 @@ pub mod fixed;
 pub mod found;
 pub mod heap4;
 pub mod lists;
+pub mod lz77;
 pub mod make;
 pub mod packed;
 pub mod paths;
@@ -163,6 +164,9 @@ pub use arc::Arc;
 pub use boxed::{Box, CallOnce};
 pub use btree::{BTreeMap, BTreeSet};
 pub use byte_cursor::{ByteCursor, RevBitCursor, SeqOp, SliceWriter, common_prefix_len};
+pub use lz77::{
+    LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, lz77_scan_default, lz77_scan_fast,
+};
 pub use cow::{Cow, ToOwnedIn};
 pub use deque::VecDeque;
 pub use error::AllocFailure;

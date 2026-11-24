@@ -1,5 +1,5 @@
 //! RFC 8878 Zstandard frame, block, literals, and sequence decoder powered by zero-pre-zeroing
-//! [`blaze_own::ByteCursor`], pre-resolved [`SeqDecTable`], and `HUF_4X2` Huffman decoding.
+//! [`blaze_own::ByteCursor`], flat pre-resolved [`SeqTables`], and `HUF_4X2` Huffman decoding.
 
 use core::alloc::Allocator;
 
@@ -9,7 +9,7 @@ use crate::digest::xxh64;
 use crate::zstd::fse::{
     FseDecTable, LL_DEFAULT_LOG, LL_DEFAULT_NORM, LL_MAX_CODE, LL_MAX_LOG, ML_DEFAULT_LOG,
     ML_DEFAULT_NORM, ML_MAX_CODE, ML_MAX_LOG, OF_DEFAULT_LOG, OF_DEFAULT_NORM, OF_MAX_CODE,
-    OF_MAX_LOG, SeqDecTable, SeqKind,
+    OF_MAX_LOG, SEQ_ML_OFFSET, SEQ_OF_OFFSET, SeqKind, SeqTables,
 };
 use crate::zstd::huffman::HuffTable;
 use crate::zstd::{
@@ -195,24 +195,6 @@ pub(crate) fn peek_frame_content_size(input: &[u8]) -> Result<Option<u64>, ZstdE
     Err(ZstdError::TooManyFrames { limit: ZstdLimits::USUAL.most_frames })
 }
 
-/// Contiguous container of the three pre-resolved sequence FSE tables so `decode_exec_leaf`
-/// indexes all three tables from a single base pointer register (freeing 2 GPRs).
-struct SeqTables {
-    ll: SeqDecTable,
-    of: SeqDecTable,
-    ml: SeqDecTable,
-}
-
-impl SeqTables {
-    const fn new() -> Self {
-        Self {
-            ll: SeqDecTable::new_empty(),
-            of: SeqDecTable::new_empty(),
-            ml: SeqDecTable::new_empty(),
-        }
-    }
-}
-
 struct FrameState {
     huff: HuffTable,
     scratch_fse: FseDecTable,
@@ -232,7 +214,7 @@ impl FrameState {
         Self {
             huff: HuffTable::new_empty(),
             scratch_fse: FseDecTable::new_empty(),
-            seqs: SeqTables::new(),
+            seqs: SeqTables::new_empty(),
             has_huff: false,
             has_ll: false,
             has_of: false,
@@ -552,7 +534,7 @@ fn load_seq_table(
     cur: &mut Cursor<'_>,
     mode: u8,
     scratch: &mut FseDecTable,
-    table: &mut SeqDecTable,
+    tables: &mut SeqTables,
     kind: SeqKind,
     has_table: &mut bool,
     is_predef: &mut bool,
@@ -565,7 +547,7 @@ fn load_seq_table(
         0 => {
             if !*is_predef {
                 scratch.build_from_norm(default_norm, default_log)?;
-                table.compile_from(scratch, kind)?;
+                tables.compile_from(scratch, kind)?;
                 *is_predef = true;
             }
             *has_table = true;
@@ -577,7 +559,7 @@ fn load_seq_table(
                 return Err(ZstdError::CorruptFse);
             }
             scratch.set_rle(sym);
-            table.compile_from(scratch, kind)?;
+            tables.compile_from(scratch, kind)?;
             *is_predef = false;
             *has_table = true;
             Ok(())
@@ -585,7 +567,7 @@ fn load_seq_table(
         2 => {
             let used = scratch.decode_header_and_build(cur.rest(), max_sym, max_log)?;
             cur.skip(used).map_err(|_| ZstdError::CorruptFse)?;
-            table.compile_from(scratch, kind)?;
+            tables.compile_from(scratch, kind)?;
             *is_predef = false;
             *has_table = true;
             Ok(())
@@ -685,6 +667,13 @@ fn extract_top(win: u64, n: u32) -> u32 {
     u32::from_le_bytes([b0, b1, b2, b3])
 }
 
+#[inline(always)]
+fn extract_top_usize(win: u64, n: u32) -> usize {
+    // Directly produces `usize` for FSE state deltas (`n <= 9`), avoiding 32->64 zero-extend moves.
+    let v = (win >> 1).wrapping_shr(!n);
+    usize::try_from(v).unwrap_or(0)
+}
+
 struct FusedState<'a> {
     br: RevBitCursor<'a>,
     ll_state: usize,
@@ -704,19 +693,16 @@ enum LeafStop {
     BadOffset { offset: usize, available: usize },
 }
 
-/// Zero-call fused sequence decoder + 128-bit NEON wildcopy executor.
+/// Zero-call, zero-spill fused sequence decoder + 128-bit NEON wildcopy executor.
 ///
-/// Contains ZERO function calls (`bl`) so LLVM keeps all ~23 hot registers (FSE tables, states,
-/// bitstream cursor, repeat offsets, literal pointer, and output `ByteCursor`) live in AArch64's
-/// 29 GPRs with zero stack spills, while letting Apple Silicon's out-of-order engine overlap
-/// sequence `i`'s NEON wildcopies with sequence `i + 1`'s FSE table loads and bit shifts.
-///
-/// Whenever a rare sequence (`lit_len > 32`, `offset < 16`, final 32B literal slack, or a
-/// `> 56`-bit sequence) occurs, the leaf returns `LeafStop::Pending` / `LeafStop::Wide` so the
-/// outer driver executes that single sequence and immediately re-enters the leaf loop.
+/// - Indexes all three pre-resolved FSE tables (`LL`, `OF`, `ML`) from ONE base pointer register
+///   via the flat 2048-entry `SeqTables` array.
+/// - Specializes `FULL_WINDOW` (`frame_start == 0 && block_out_limit <= win_usize`, true for all
+///   frames fitting within their window), eliminating `frame_start`, `win_usize`, and `umin`.
+/// - Counts `rem` down to zero so `last_idx` needs no register, keeping hot pointers in GPRs.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn decode_exec_leaf<const SINGLE_RELOAD: bool, A: Allocator>(
+fn decode_exec_leaf<const SINGLE_RELOAD: bool, const FULL_WINDOW: bool, A: Allocator>(
     tables: &SeqTables,
     literals: &[u8],
     writer: &mut ByteCursor<'_, A>,
@@ -732,51 +718,46 @@ fn decode_exec_leaf<const SINGLE_RELOAD: bool, A: Allocator>(
     let mut ml_state = st.ml_state;
     let [mut r0, mut r1, mut r2] = st.rep;
     let mut lit_pos = st.lit_pos;
-    let mut seq_idx = st.seq_idx;
-    let lit_total = literals.len();
-    let lit_safe_end = lit_total.saturating_sub(32);
+    let mut rem = last_idx.saturating_sub(st.seq_idx);
+    let lit_safe_end = literals.len().saturating_sub(32);
     let out_safe_limit = block_out_limit.min(writer.cap().saturating_sub(48));
     let min_avail: usize = if SINGLE_RELOAD { 8 } else { 16 };
     let mut stop = LeafStop::Done;
 
-    while seq_idx < last_idx && br.avail_bytes() >= min_avail {
-        let (ll_base, ll_eb, ll_nb, ll_bl) = tables.ll.entry_fast(ll_state).unpack();
-        let (of_base, of_eb, of_nb, of_bl) = tables.of.entry_fast(of_state).unpack();
-        let (ml_base, ml_eb, ml_nb, ml_bl) = tables.ml.entry_fast(ml_state).unpack();
+    while rem > 0 && br.avail_bytes() >= min_avail {
+        let e_ll = tables.entry_flat(ll_state);
+        let e_of = tables.entry_flat(of_state);
+        let e_ml = tables.entry_flat(ml_state);
 
         if !br.reload_if_slack8() {
             break;
         }
-        let extras_bits = of_eb + ml_eb + ll_eb;
-        let total = extras_bits + ll_nb + ml_nb + of_nb;
+        let (of_base, of_eb, of_nb, of_bl) = e_of.unpack();
+        let (ml_base, ml_eb, ml_nb, ml_bl) = e_ml.unpack();
+        let (ll_base, ll_eb, ll_nb, ll_bl) = e_ll.unpack();
+
+        // Balanced parallel bit-offset tree: `o_ll_nb` and `o_ml_nb` resolve together in 2 cycles.
+        let o_ll_eb = of_eb + ml_eb;
+        let ll_both = ll_eb + ll_nb;
+        let o_ll_nb = o_ll_eb + ll_eb;
+        let o_ml_nb = o_ll_eb + ll_both;
+        let o_of_nb = o_ml_nb + ml_nb;
+        let total = o_of_nb + of_nb;
         if !SINGLE_RELOAD && total > 56 {
             stop = LeafStop::Wide;
             break;
         }
 
-        let mut we = br.bits_window();
-        let mut ws = we.wrapping_shl(extras_bits);
+        let we = br.bits_window();
         br.advance_fast(total);
 
-        let ll_add = usize::try_from(extract_top(ws, ll_nb)).unwrap_or(0);
-        ws = ws.wrapping_shl(ll_nb);
-        let ml_add = usize::try_from(extract_top(ws, ml_nb)).unwrap_or(0);
-        ws = ws.wrapping_shl(ml_nb);
-        let of_add = usize::try_from(extract_top(ws, of_nb)).unwrap_or(0);
+        ll_state = ll_bl + extract_top_usize(we.wrapping_shl(o_ll_nb), ll_nb);
+        ml_state = ml_bl + extract_top_usize(we.wrapping_shl(o_ml_nb), ml_nb);
+        of_state = of_bl + extract_top_usize(we.wrapping_shl(o_of_nb), of_nb);
 
-        let of_extra = extract_top(we, of_eb);
-        we = we.wrapping_shl(of_eb);
-        let ml_extra = extract_top(we, ml_eb);
-        we = we.wrapping_shl(ml_eb);
-        let ll_extra = extract_top(we, ll_eb);
-
-        ll_state = ll_bl + ll_add;
-        ml_state = ml_bl + ml_add;
-        of_state = of_bl + of_add;
-
-        let offset_value = of_base.wrapping_add(of_extra);
-        let match_len_u32 = ml_base.wrapping_add(ml_extra);
-        let lit_len_u32 = ll_base.wrapping_add(ll_extra);
+        let offset_value = of_base.wrapping_add(extract_top(we, of_eb));
+        let match_len_u32 = ml_base.wrapping_add(extract_top(we.wrapping_shl(of_eb), ml_eb));
+        let lit_len_u32 = ll_base.wrapping_add(extract_top(we.wrapping_shl(o_ll_eb), ll_eb));
 
         // Branchless 2-level `csel` tree in 32-bit registers for repeat offsets.
         let rep_code = offset_value.wrapping_sub(1) + u32::from(lit_len_u32 == 0);
@@ -797,14 +778,17 @@ fn decode_exec_leaf<const SINGLE_RELOAD: bool, A: Allocator>(
         let lit_end = lit_pos + lit_len;
         let after_lit = writer.len() + lit_len;
         let next_out = after_lit + match_len;
-        let available = after_lit - frame_start;
-        let max_off = available.min(win_usize);
+        let max_off = if FULL_WINDOW {
+            after_lit
+        } else {
+            (after_lit - frame_start).min(win_usize)
+        };
         if lit_pos > lit_safe_end
             || lit_len > 32
             || next_out > out_safe_limit
             || off_usize.wrapping_sub(1) >= max_off
         {
-            if lit_end > lit_total {
+            if lit_end > literals.len() {
                 stop = LeafStop::LitOverflow;
                 break;
             }
@@ -813,6 +797,7 @@ fn decode_exec_leaf<const SINGLE_RELOAD: bool, A: Allocator>(
                 break;
             }
             if off_usize.wrapping_sub(1) >= max_off {
+                let available = if FULL_WINDOW { after_lit } else { after_lit - frame_start };
                 stop = LeafStop::BadOffset { offset: off_usize, available };
                 break;
             }
@@ -833,7 +818,7 @@ fn decode_exec_leaf<const SINGLE_RELOAD: bool, A: Allocator>(
             break;
         }
         lit_pos = lit_end;
-        seq_idx += 1;
+        rem -= 1;
     }
 
     st.br = br;
@@ -842,7 +827,7 @@ fn decode_exec_leaf<const SINGLE_RELOAD: bool, A: Allocator>(
     st.ml_state = ml_state;
     st.rep = [r0, r1, r2];
     st.lit_pos = lit_pos;
-    st.seq_idx = seq_idx;
+    st.seq_idx = last_idx.saturating_sub(rem);
     stop
 }
 
@@ -860,9 +845,9 @@ fn decode_one_wide_seq<A: Allocator>(
     block_out_limit: usize,
     limit: usize,
 ) -> Result<(), ZstdError> {
-    let (ll_base, ll_eb, ll_nb, ll_bl) = tables.ll.entry_fast(st.ll_state).unpack();
-    let (of_base, of_eb, of_nb, of_bl) = tables.of.entry_fast(st.of_state).unpack();
-    let (ml_base, ml_eb, ml_nb, ml_bl) = tables.ml.entry_fast(st.ml_state).unpack();
+    let (ll_base, ll_eb, ll_nb, ll_bl) = tables.entry_flat(st.ll_state).unpack();
+    let (of_base, of_eb, of_nb, of_bl) = tables.entry_flat(st.of_state).unpack();
+    let (ml_base, ml_eb, ml_nb, ml_bl) = tables.entry_flat(st.ml_state).unpack();
 
     let of_extra = st.br.read_bits_branchless(of_eb);
     let ml_extra = st.br.read_bits_branchless(ml_eb);
@@ -954,17 +939,32 @@ fn decode_sequences_fast<'a, A: Allocator>(
         lit_pos: 0,
         seq_idx: 0,
     };
-    let max_seq_bits = u32::from(tables.ll.max_extra_bits())
-        + u32::from(tables.of.max_extra_bits())
-        + u32::from(tables.ml.max_extra_bits())
-        + u32::from(tables.ll.accuracy_log())
-        + u32::from(tables.of.accuracy_log())
-        + u32::from(tables.ml.accuracy_log());
-    let single_reload = max_seq_bits <= 56;
+    let single_reload = tables.max_seq_bits() <= 56;
+    let full_window = frame_start == 0 && block_out_limit <= win_usize;
 
     loop {
-        let stop = if single_reload {
-            decode_exec_leaf::<true, A>(
+        let stop = match (single_reload, full_window) {
+            (true, true) => decode_exec_leaf::<true, true, A>(
+                tables,
+                literals,
+                writer,
+                &mut st,
+                last_idx,
+                0,
+                win_usize,
+                block_out_limit,
+            ),
+            (false, true) => decode_exec_leaf::<false, true, A>(
+                tables,
+                literals,
+                writer,
+                &mut st,
+                last_idx,
+                0,
+                win_usize,
+                block_out_limit,
+            ),
+            (true, false) => decode_exec_leaf::<true, false, A>(
                 tables,
                 literals,
                 writer,
@@ -973,9 +973,8 @@ fn decode_sequences_fast<'a, A: Allocator>(
                 frame_start,
                 win_usize,
                 block_out_limit,
-            )
-        } else {
-            decode_exec_leaf::<false, A>(
+            ),
+            (false, false) => decode_exec_leaf::<false, false, A>(
                 tables,
                 literals,
                 writer,
@@ -984,7 +983,7 @@ fn decode_sequences_fast<'a, A: Allocator>(
                 frame_start,
                 win_usize,
                 block_out_limit,
-            )
+            ),
         };
         match stop {
             LeafStop::Done => break,
@@ -1098,7 +1097,7 @@ fn decode_compressed_block<A: Allocator>(
         &mut cur,
         ll_mode,
         &mut state.scratch_fse,
-        &mut state.seqs.ll,
+        &mut state.seqs,
         SeqKind::Ll,
         &mut state.has_ll,
         &mut state.ll_predef,
@@ -1111,7 +1110,7 @@ fn decode_compressed_block<A: Allocator>(
         &mut cur,
         of_mode,
         &mut state.scratch_fse,
-        &mut state.seqs.of,
+        &mut state.seqs,
         SeqKind::Of,
         &mut state.has_of,
         &mut state.of_predef,
@@ -1124,7 +1123,7 @@ fn decode_compressed_block<A: Allocator>(
         &mut cur,
         ml_mode,
         &mut state.scratch_fse,
-        &mut state.seqs.ml,
+        &mut state.seqs,
         SeqKind::Ml,
         &mut state.has_ml,
         &mut state.ml_predef,
@@ -1135,23 +1134,26 @@ fn decode_compressed_block<A: Allocator>(
     )?;
 
     let mut br = RevBitCursor::new(cur.rest()).ok_or(ZstdError::CorruptSequences)?;
-    let ll_log = u32::from(state.seqs.ll.accuracy_log());
-    let of_log = u32::from(state.seqs.of.accuracy_log());
-    let ml_log = u32::from(state.seqs.ml.accuracy_log());
+    let ll_log = u32::from(state.seqs.ll_log());
+    let of_log = u32::from(state.seqs.of_log());
+    let ml_log = u32::from(state.seqs.ml_log());
 
-    let ll_state = usize::try_from(br.read_bits(ll_log).ok_or(ZstdError::CorruptSequences)?)
+    let ll_raw = usize::try_from(br.read_bits(ll_log).ok_or(ZstdError::CorruptSequences)?)
         .map_err(|_| ZstdError::CorruptSequences)?;
-    let of_state = usize::try_from(br.read_bits(of_log).ok_or(ZstdError::CorruptSequences)?)
+    let of_raw = usize::try_from(br.read_bits(of_log).ok_or(ZstdError::CorruptSequences)?)
         .map_err(|_| ZstdError::CorruptSequences)?;
-    let ml_state = usize::try_from(br.read_bits(ml_log).ok_or(ZstdError::CorruptSequences)?)
+    let ml_raw = usize::try_from(br.read_bits(ml_log).ok_or(ZstdError::CorruptSequences)?)
         .map_err(|_| ZstdError::CorruptSequences)?;
 
-    if ll_state >= (1usize << ll_log)
-        || of_state >= (1usize << of_log)
-        || ml_state >= (1usize << ml_log)
+    if ll_raw >= (1usize << ll_log)
+        || of_raw >= (1usize << of_log)
+        || ml_raw >= (1usize << ml_log)
     {
         return Err(ZstdError::CorruptSequences);
     }
+    let ll_state = ll_raw;
+    let of_state = SEQ_OF_OFFSET + of_raw;
+    let ml_state = SEQ_ML_OFFSET + ml_raw;
 
     // Reserve room for up to one full block (+ 64B wildcopy slack) once, with ZERO zeroing.
     let block_start_out = writer.len();
@@ -1192,9 +1194,9 @@ fn decode_compressed_block<A: Allocator>(
     let mut block_regen = writer.len().saturating_sub(block_start_out);
     state.rep = rep;
     while seq_idx < num_seq {
-        let (ll_base, ll_eb, ll_nb, ll_bl) = state.seqs.ll.entry_fast(ll_state).unpack();
-        let (of_base, of_eb, of_nb, of_bl) = state.seqs.of.entry_fast(of_state).unpack();
-        let (ml_base, ml_eb, ml_nb, ml_bl) = state.seqs.ml.entry_fast(ml_state).unpack();
+        let (ll_base, ll_eb, ll_nb, ll_bl) = state.seqs.entry_flat(ll_state).unpack();
+        let (of_base, of_eb, of_nb, of_bl) = state.seqs.entry_flat(of_state).unpack();
+        let (ml_base, ml_eb, ml_nb, ml_bl) = state.seqs.entry_flat(ml_state).unpack();
 
         let of_extra = br.read_bits(of_eb).ok_or(ZstdError::CorruptSequences)?;
         let ml_extra = br.read_bits(ml_eb).ok_or(ZstdError::CorruptSequences)?;
