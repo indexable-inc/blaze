@@ -465,53 +465,56 @@ pub(crate) fn write_records<'a, 'b>(names: &CrateNames<'a>, built: &Built<'_, 'a
     def_site.sort_unstable();
     def_site.dedup();
     let outside = Outside { def_site };
-    // Each module's scope split: what `outside` keeps, and the rest.
-    let mut split: HashMap<ItemKey, (ScopeBuilder<'b, &str>, ScopeBuilder<'_, &str>), Alloc<'b>> = HashMap::new_in(alloc);
-    for (m, done) in names.done.iter() {
-        let mut inner = done.scope.clone();
-        if leak_private {
-            for e in inner.bindings.iter_mut() {
-                e.binding.vis = Visibility::Public;
-            }
-        }
-        let mut exports = ScopeBuilder::new_in(*m, alloc);
-        let mut keep = AVec::with_capacity_in(inner.bindings.len(), alloc);
-        for e in inner.bindings.iter() {
-            keep.push(outside.sees(e.binding.vis) || may_shadow(names, built, &inner.globs, &outside, e.ns, e.name));
-        }
-        let mut at = 0;
-        inner.bindings.retain(|e| {
-            at += 1;
-            if keep[at - 1] {
-                exports.bindings.push(*e);
-            }
-            !keep[at - 1]
-        });
-        inner.globs.retain(|g| {
-            if outside.sees(g.vis) {
-                exports.globs.push(*g);
-            }
-            !outside.sees(g.vis)
-        });
-        inner.traits.retain(|t| {
-            if outside.sees(t.vis) {
-                exports.traits.push(*t);
-            }
-            !outside.sees(t.vis)
-        });
-        exports.macro_exports.extend(inner.macro_exports.drain(..));
-        split.insert(*m, (exports, inner));
-    }
-    // The modules a dependent can walk into, and every item key their kept names name.
-    let mut walked: HashMap<ItemKey, (), Alloc<'b>> = HashMap::new_in(alloc);
+    // Split ONLY the modules a dependent can actually walk into (BFS from `names.root` and
+    // `outside.def_site`), allocating both halves in `alloc` (the scratch frame) instead of
+    // cloning every module's `ScopeBuilder` into the crate frame. Unwalked modules (e.g.
+    // ~11,000 block modules in `core`) go whole to `inner` without ever being cloned or split.
+    let mut split: HashMap<ItemKey, (ScopeBuilder<'b, &'a str>, ScopeBuilder<'b, &'a str>), Alloc<'b>> = HashMap::new_in(alloc);
     let mut named: HashMap<ItemKey, (), Alloc<'b>> = HashMap::new_in(alloc);
     let mut work = AVec::new_in(alloc);
     work.push(names.root);
     work.extend_from_slice(&outside.def_site);
     while let Some(m) = work.pop() {
-        let Some((exports, _)) = split.get(&m) else { continue };
-        if walked.insert(m, ()).is_some() {
+        if split.contains_key(&m) {
             continue;
+        }
+        let Some(done) = names.done.get(&m) else { continue };
+        let src = &done.scope;
+        let mut exports = ScopeBuilder::new_in(m, alloc);
+        let mut inner = ScopeBuilder::new_in(m, alloc);
+        for &entry in src.bindings.iter() {
+            let mut entry = entry;
+            if leak_private {
+                entry.binding.vis = Visibility::Public;
+            }
+            let keep = outside.sees(entry.binding.vis)
+                || may_shadow(names, built, &src.globs, &outside, entry.ns, entry.name);
+            if keep {
+                exports.bindings.push(entry);
+            } else {
+                inner.bindings.push(entry);
+            }
+        }
+        for &g in src.globs.iter() {
+            if outside.sees(g.vis) {
+                exports.globs.push(g);
+            } else {
+                inner.globs.push(g);
+            }
+        }
+        for &t in src.traits.iter() {
+            if outside.sees(t.vis) {
+                exports.traits.push(t);
+            } else {
+                inner.traits.push(t);
+            }
+        }
+        exports.macro_exports.extend_from_slice(&src.macro_exports);
+        inner.textual.extend_from_slice(&src.textual);
+        inner.marks.extend_from_slice(&src.marks);
+        inner.errors.reserve(src.errors.len());
+        for err in src.errors.iter() {
+            inner.errors.push(clone_scope_error_in(err, alloc));
         }
         let keys = exports
             .bindings
@@ -522,10 +525,11 @@ pub(crate) fn write_records<'a, 'b>(names: &CrateNames<'a>, built: &Built<'_, 'a
             .chain(exports.macro_exports.iter().map(|t| t.def));
         for key in keys {
             named.insert(key, ());
-            if key.0.0[..8] == own && split.contains_key(&key) && !walked.contains_key(&key) {
+            if key.0.0[..8] == own && names.done.contains_key(&key) && !split.contains_key(&key) {
                 work.push(key);
             }
         }
+        split.insert(m, (exports, inner));
     }
     // A `#[macro_export]` macro is a binding of the root for other crates (its own crate does
     // not see it by path), and a dependent reads its definition by key.
@@ -547,30 +551,35 @@ pub(crate) fn write_records<'a, 'b>(names: &CrateNames<'a>, built: &Built<'_, 'a
             reach[part as usize].extend(dep.reaches().iter());
         }
     };
-    let mut exports_scopes = AVec::new_in(alloc);
-    let mut inner_scopes = AVec::new_in(alloc);
+    let mut exports_scopes = AVec::with_capacity_in(modules.len(), alloc);
+    let mut inner_scopes = AVec::with_capacity_in(modules.len(), alloc);
     for m in modules.iter() {
-        let (exports, inner) = &split[m];
-        // An unwalked module's whole scope is the crate's own.
-        let to = if walked.contains_key(m) { Part::Exports } else { Part::Inner };
-        for e in exports.bindings.iter() {
-            add(to, e.binding.def.key, &mut reach);
-        }
-        for g in exports.globs.iter() {
-            add(to, g.source.key, &mut reach);
-        }
-        for e in inner.bindings.iter() {
-            add(Part::Inner, e.binding.def.key, &mut reach);
-        }
-        for g in inner.globs.iter() {
-            add(Part::Inner, g.source.key, &mut reach);
-        }
-        if to == Part::Exports {
+        if let Some((exports, inner)) = split.get(m) {
+            for e in exports.bindings.iter() {
+                add(Part::Exports, e.binding.def.key, &mut reach);
+            }
+            for g in exports.globs.iter() {
+                add(Part::Exports, g.source.key, &mut reach);
+            }
+            for e in inner.bindings.iter() {
+                add(Part::Inner, e.binding.def.key, &mut reach);
+            }
+            for g in inner.globs.iter() {
+                add(Part::Inner, g.source.key, &mut reach);
+            }
             exports_scopes.push(Some(exports.write(alloc)?));
             inner_scopes.push(Some(inner.write(alloc)?));
         } else {
+            // An unwalked module's whole scope is the crate's own.
+            let scope = &names.done[m].scope;
+            for e in scope.bindings.iter() {
+                add(Part::Inner, e.binding.def.key, &mut reach);
+            }
+            for g in scope.globs.iter() {
+                add(Part::Inner, g.source.key, &mut reach);
+            }
             exports_scopes.push(None);
-            inner_scopes.push(Some(names.done[m].scope.write(alloc)?));
+            inner_scopes.push(Some(scope.write(alloc)?));
         }
     }
     let [exports_reach, inner_reach] = reach;
@@ -584,6 +593,29 @@ pub(crate) fn write_records<'a, 'b>(names: &CrateNames<'a>, built: &Built<'_, 'a
 enum Part {
     Exports = 0,
     Inner = 1,
+}
+
+fn clone_path_in<'b, N: Copy>(p: &blaze_surface::Path<'_, N>, alloc: Alloc<'b>) -> blaze_surface::Path<'b, N> {
+    blaze_surface::Path { kind: p.kind, segments: AVec::from_slice_in(&p.segments, alloc) }
+}
+
+fn clone_scope_error_in<'b, N: Copy>(
+    err: &blaze_surface::ScopeError<N, blaze_surface::Path<'_, N>>,
+    alloc: Alloc<'b>,
+) -> blaze_surface::ScopeError<N, blaze_surface::Path<'b, N>> {
+    use blaze_surface::ScopeError;
+    match *err {
+        ScopeError::Import { site, ref path, segment, why } => ScopeError::Import { site, path: clone_path_in(path, alloc), segment, why },
+        ScopeError::Macro { call, ref path, segment, why } => ScopeError::Macro { call, path: clone_path_in(path, alloc), segment, why },
+        ScopeError::ExternCrate { name } => ScopeError::ExternCrate { name },
+        ScopeError::RestrictedNotAncestor { ref path } => ScopeError::RestrictedNotAncestor { path: clone_path_in(path, alloc) },
+        ScopeError::Duplicate { ns, name, first, second } => ScopeError::Duplicate { ns, name, first, second },
+        ScopeError::WiderReexport { site, ns, name, def } => ScopeError::WiderReexport { site, ns, name, def },
+        ScopeError::Ambiguous { site, ns, name, kind, first, second } => ScopeError::Ambiguous { site, ns, name, kind, first, second },
+        ScopeError::Inconsistent { site, ns, name, early, last } => ScopeError::Inconsistent { site, ns, name, early, last },
+        ScopeError::RecursionLimit { call } => ScopeError::RecursionLimit { call },
+        ScopeError::Refused { call, name, why } => ScopeError::Refused { call, name, why },
+    }
 }
 
 /// One record: each of `modules` that has a scope's bytes in `scopes`, the crates it `reaches`,
@@ -1224,7 +1256,24 @@ fn resolve_crate_decoded<'a, S: SourceTexts<'a>, P: Par>(
     let alloc = bump.alloc();
     let write = |names: CrateNames<'a>, built: &Built<'_, 'a>| -> Result<_, CrateScopeError<'a>> {
         par.stage(crate::task::Stage::Write);
-        let Records { exports, inner } = write_records(&names, built, leak_private, alloc).map_err(|error| CrateScopeError::Write { krate: input.name, error })?;
+        // Run `write_records`'s ScopeBuilder clones and per-module scratch inside the idle
+        // `call_scratch` frame, copying ONLY the final `exports` and `inner` record bytes into
+        // the crate frame (~110 MB saved on `core`, rule 11).
+        let mut written = None;
+        let mode = par.call_scratch(&mut |scratch_alloc| {
+            written = Some(write_records(&names, built, leak_private, scratch_alloc).map(|Records { exports, inner }| {
+                let mut out_exports = RecordBytes::with_capacity_in(exports.len(), alloc);
+                out_exports.extend_from_slice(&exports);
+                let mut out_inner = RecordBytes::with_capacity_in(inner.len(), alloc);
+                out_inner.extend_from_slice(&inner);
+                Records { exports: out_exports, inner: out_inner }
+            }));
+        });
+        let Records { exports, inner } = match (mode, written) {
+            (crate::task::Scratch::Reset, Some(res)) => res,
+            _ => write_records(&names, built, leak_private, alloc),
+        }
+        .map_err(|error| CrateScopeError::Write { krate: input.name, error })?;
         Ok((names, exports, inner))
     };
     let ((names, record, inner), asked) = with_names(input, deps, sysroot, sources, source, par, prepares, kept, bump, write)?;
@@ -1292,6 +1341,10 @@ impl<P: Par> Par for OfMembers<'_, P> {
         self.par.call_scratch(work)
     }
 
+    fn solve_scratch(&self, work: &mut dyn FnMut(blaze_own::Alloc<'_>)) -> crate::task::Scratch {
+        self.par.solve_scratch(work)
+    }
+
     fn expand_part(&self, part: crate::task::ExpandPart, macro_name: &str, size: usize) {
         self.par.expand_part(part, macro_name, size);
     }
@@ -1339,6 +1392,10 @@ impl<P: Par> Par for Strategy<'_, P> {
 
     fn call_scratch(&self, work: &mut dyn FnMut(blaze_own::Alloc<'_>)) -> crate::task::Scratch {
         self.par.call_scratch(work)
+    }
+
+    fn solve_scratch(&self, work: &mut dyn FnMut(blaze_own::Alloc<'_>)) -> crate::task::Scratch {
+        self.par.solve_scratch(work)
     }
 
     fn expand_part(&self, part: crate::task::ExpandPart, macro_name: &str, size: usize) {

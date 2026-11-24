@@ -98,140 +98,151 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
     groups: bool,
     only: Option<Members<'_>>,
     part: &dyn Fn(NamesPart),
+    solve_scratch: &dyn Fn(&mut dyn FnMut(Alloc<'_>)) -> crate::task::Scratch,
     bump: Bump<'a>,
 ) -> Result<Solved<'a>, Unwritten> {
-    let alloc = bump.alloc();
-    let deps = BuiltDeps { built, alloc, asks: true, through: core::cell::Cell::new(None) };
-    // A one-group solve reads its members' texts alone (edit.rs).
-    let read = |k: ItemKey| only.is_none_or(|o| o.holds(k));
-    // Every other module of the crate from its group's record when a member first reads it,
-    // its scope kept to be written as it was.
-    let records = only.map(|o| OutsideRecords { o, alloc: bump, recorded: core::cell::RefCell::new(AVec::new_in(alloc)) });
-    part(NamesPart::Load);
-    let mut c = Cells::load_reading(facts, root, Some(&deps), super::CellPlant::None, &read, alloc).map_err(Unwritten::Load)?;
-    // A driver's control of its oracle (task/fill.rs `Par::decide_plant`): the plant is read by
-    // the on-demand walk alone (decide.rs), so the whole solve below is unchanged by it.
-    if check.is_some() && plant == crate::task::DecidePlant::CachesOpenCycle {
-        c.plant = super::CellPlant::DecideCachesOpenCycle;
-    }
-    c.enums = Some(enums);
-    // The root's scope gathers every module's expanded `#[macro_export]`s (task/exports.rs
-    // `publish_expanded_exports` reads every scope): a group holding the root reads every
-    // module's record, the rest only those its members read.
-    let every = only.is_some_and(|o| o.holds(root));
-    if let (Some(r), Some(_)) = (&records, only) {
-        if check.is_some() {
-            return Err(Unwritten::Member(MemberRefusal::DecideCheck));
-        }
-        c.outside = Some(r);
-        part(NamesPart::Outside);
-        c.pend(0..c.modules.len() as super::ModId);
-        c.fill_macro_use_children();
-        if every {
-            for m in 0..c.modules.len() as super::ModId {
-                c.fill_pending(m);
-            }
-        }
-    }
-    part(NamesPart::Run);
-    c.run(facts, expand, &[]).map_err(Unwritten::Run)?;
-    // The modules no `mod` line names (a block's module) and those made after the walk: solved
-    // after the rest, round by round, until a run makes none.
-    let mut rounds = 0u32;
-    loop {
-        let mut extra: AVec<'a, ItemKey> = AVec::new_in(alloc);
-        made(&mut extra);
-        extra.retain(|k| !c.by_key.contains_key(k));
-        if extra.is_empty() {
-            break;
-        }
-        rounds += 1;
-        if rounds > MOST_ROUNDS {
-            return Err(Unwritten::Rounds);
-        }
-        extra.sort_unstable();
-        extra.dedup();
-        // A made module outside the members (a block of a body outside, a module an expansion
-        // outside wrote) is answered from its group's record, as a walked one is.
+    let out_alloc = bump.alloc();
+    let solve_in = |solver_alloc: Alloc<'_>| -> Result<Solved<'a>, Unwritten> {
+        let deps = BuiltDeps { built, alloc: out_alloc, asks: true, through: core::cell::Cell::new(None) };
+        // A one-group solve reads its members' texts alone (edit.rs).
+        let read = |k: ItemKey| only.is_none_or(|o| o.holds(k));
+        // Every other module of the crate from its group's record when a member first reads it,
+        // its scope kept to be written as it was.
+        let records = only.map(|o| OutsideRecords { o, alloc: bump, recorded: core::cell::RefCell::new(AVec::new_in(out_alloc)) });
         part(NamesPart::Load);
-        let (_, outside) = c.load_more_reading(facts, &extra, places, &read).map_err(Unwritten::Load)?;
-        if only.is_some() {
+        let mut c = Cells::load_reading(facts, root, Some(&deps), super::CellPlant::None, &read, solver_alloc).map_err(Unwritten::Load)?;
+        // A driver's control of its oracle (task/fill.rs `Par::decide_plant`): the plant is read by
+        // the on-demand walk alone (decide.rs), so the whole solve below is unchanged by it.
+        if check.is_some() && plant == crate::task::DecidePlant::CachesOpenCycle {
+            c.plant = super::CellPlant::DecideCachesOpenCycle;
+        }
+        c.enums = Some(enums);
+        // The root's scope gathers every module's expanded `#[macro_export]`s (task/exports.rs
+        // `publish_expanded_exports` reads every scope): a group holding the root reads every
+        // module's record, the rest only those its members read.
+        let every = only.is_some_and(|o| o.holds(root));
+        if let (Some(r), Some(_)) = (&records, only) {
+            if check.is_some() {
+                return Err(Unwritten::Member(MemberRefusal::DecideCheck));
+            }
+            c.outside = Some(r);
             part(NamesPart::Outside);
-            c.pend(outside.iter().copied());
+            c.pend(0..c.modules.len() as super::ModId);
             c.fill_macro_use_children();
             if every {
-                for &m in outside.iter() {
+                for m in 0..c.modules.len() as super::ModId {
                     c.fill_pending(m);
                 }
             }
         }
         part(NamesPart::Run);
         c.run(facts, expand, &[]).map_err(Unwritten::Run)?;
-    }
-    // Each held body's cut of its module's textual sequence, over the final fragments.
-    let mut at: AVec<'a, (ItemKey, u32)> = AVec::new_in(alloc);
-    held(&mut at);
-    at.sort_unstable();
-    at.dedup();
-    let mut cuts: AVec<'a, ((ItemKey, u32), u32)> = AVec::with_capacity_in(at.len(), alloc);
-    cuts.extend(at.iter().filter_map(|&(owner, pos)| c.textual_len_at(owner, pos).map(|len| ((owner, pos), len))));
-    part(NamesPart::Scopes);
-    // A member that read a module the solve holds neither the text nor a record of saw it as
-    // unknown: the refusal names the cause, before any scope's unknowns (E13's on-demand
-    // driver, cells/lazy.rs, solves that module first and asks again).
-    if let Some(r) = c.member_refusal {
-        return Err(Unwritten::Member(r));
-    }
-    let ix = c.write_index(alloc);
-    let mut keys: AVec<'a, ItemKey> = AVec::with_capacity_in(c.modules.len(), alloc);
-    keys.extend(c.modules.iter().filter(|m| !m.foreign && !m.unread && m.text != FragId::MAX).map(|m| m.key));
-    keys.sort_unstable();
-    let mut done: HashMap<ItemKey, Resolved<'a, &'a str>, Alloc<'a>> = HashMap::new_in(alloc);
-    for &k in keys.iter() {
-        let Some((scope, unknown)) = c.scope(&ix, k, alloc) else { continue };
-        if unknown > 0 {
-            return Err(Unwritten::Unknown { module: k, count: unknown, why: c.first_unknown(&ix, k) });
+        // The modules no `mod` line names (a block's module) and those made after the walk: solved
+        // after the rest, round by round, until a run makes none.
+        let mut rounds = 0u32;
+        loop {
+            let mut extra: AVec<'a, ItemKey> = AVec::new_in(out_alloc);
+            made(&mut extra);
+            extra.retain(|k| !c.by_key.contains_key(k));
+            if extra.is_empty() {
+                break;
+            }
+            rounds += 1;
+            if rounds > MOST_ROUNDS {
+                return Err(Unwritten::Rounds);
+            }
+            extra.sort_unstable();
+            extra.dedup();
+            // A made module outside the members (a block of a body outside, a module an expansion
+            // outside wrote) is answered from its group's record, as a walked one is.
+            part(NamesPart::Load);
+            let (_, outside) = c.load_more_reading(facts, &extra, places, &read).map_err(Unwritten::Load)?;
+            if only.is_some() {
+                part(NamesPart::Outside);
+                c.pend(outside.iter().copied());
+                c.fill_macro_use_children();
+                if every {
+                    for &m in outside.iter() {
+                        c.fill_pending(m);
+                    }
+                }
+            }
+            part(NamesPart::Run);
+            c.run(facts, expand, &[]).map_err(Unwritten::Run)?;
         }
-        done.insert(k, Resolved { scope, reads: ReadList { entries: AVec::new_in(alloc) } });
-    }
-    // The modules outside the group a member read: their scopes as their records hold them.
-    if let Some(r) = &records {
-        for (k, view) in r.recorded.borrow().iter() {
-            done.insert(*k, Resolved { scope: ScopeBuilder::from(view, alloc), reads: ReadList { entries: AVec::new_in(alloc) } });
+        // Each held body's cut of its module's textual sequence, over the final fragments.
+        let mut at: AVec<'a, (ItemKey, u32)> = AVec::new_in(out_alloc);
+        held(&mut at);
+        at.sort_unstable();
+        at.dedup();
+        let mut cuts: AVec<'a, ((ItemKey, u32), u32)> = AVec::with_capacity_in(at.len(), out_alloc);
+        cuts.extend(at.iter().filter_map(|&(owner, pos)| c.textual_len_at(owner, pos).map(|len| ((owner, pos), len))));
+        part(NamesPart::Scopes);
+        // A member that read a module the solve holds neither the text nor a record of saw it as
+        // unknown: the refusal names the cause, before any scope's unknowns (E13's on-demand
+        // driver, cells/lazy.rs, solves that module first and asks again).
+        if let Some(r) = c.member_refusal {
+            return Err(Unwritten::Member(r));
         }
-    }
-    let mut added_externs: AVec<'a, (&'a str, ItemKey)> = AVec::with_capacity_in(c.outer.added.len(), alloc);
-    added_externs.extend(c.outer.added.iter().map(|(&name, &root)| (name, root)));
-    // D116: every cell decided again on demand over the frozen tables, after the scopes are
-    // written (it leaves `c` re-decided; nothing reads `c` after it).
-    // D116 point 7: the records at module grain against the written scopes, before `decide`
-    // re-decides `c`.
-    let links = check.map(|_| c.links_agree(alloc, alloc));
-    let decide = match check {
-        Some(now) => {
-            let mut d = super::decide::check(&mut c, now, alloc).map_err(Unwritten::Decide)?;
-            d.links = links;
-            Some(d)
+        let ix = c.write_index(solver_alloc);
+        let mut keys: AVec<'_, ItemKey> = AVec::with_capacity_in(c.modules.len(), solver_alloc);
+        keys.extend(c.modules.iter().filter(|m| !m.foreign && !m.unread && m.text != FragId::MAX).map(|m| m.key));
+        keys.sort_unstable();
+        let mut done: HashMap<ItemKey, Resolved<'a, &'a str>, Alloc<'a>> = HashMap::new_in(out_alloc);
+        for &k in keys.iter() {
+            let Some((scope, unknown)) = c.scope(&ix, k, out_alloc) else { continue };
+            if unknown > 0 {
+                return Err(Unwritten::Unknown { module: k, count: unknown, why: c.first_unknown(&ix, k) });
+            }
+            done.insert(k, Resolved { scope, reads: ReadList { entries: AVec::new_in(out_alloc) } });
         }
-        None => None,
+        // The modules outside the group a member read: their scopes as their records hold them.
+        if let Some(r) = &records {
+            for (k, view) in r.recorded.borrow().iter() {
+                done.insert(*k, Resolved { scope: ScopeBuilder::from(view, out_alloc), reads: ReadList { entries: AVec::new_in(out_alloc) } });
+            }
+        }
+        let mut added_externs: AVec<'a, (&'a str, ItemKey)> = AVec::with_capacity_in(c.outer.added.len(), out_alloc);
+        added_externs.extend(c.outer.added.iter().map(|(&name, &root)| (name, root)));
+        // D116: every cell decided again on demand over the frozen tables, after the scopes are
+        // written (it leaves `c` re-decided; nothing reads `c` after it).
+        // D116 point 7: the records at module grain against the written scopes, before `decide`
+        // re-decides `c`.
+        let links = check.map(|_| c.links_agree(solver_alloc, out_alloc));
+        let decide = match check {
+            Some(now) => {
+                let mut d = super::decide::check(&mut c, now, out_alloc).map_err(Unwritten::Decide)?;
+                d.links = links;
+                Some(d)
+            }
+            None => None,
+        };
+        // E4: the groups, over the decided values (after D116's check, which re-decides `c`;
+        // `groups` leaves every value as it found it), when the caller asked.
+        // A member's own text: its own fragment's `ModuleDecls` record, as the facts hold it.
+        let own = |k: ItemKey| -> Result<blaze_id::ContentId, super::GroupsError> {
+            let fail = |error| super::GroupsError::Own { module: k, error };
+            let info = facts.module(k).map_err(|e| fail(super::OwnError::Facts(e)))?;
+            let decls = facts.decls(k).map_err(|e| fail(super::OwnError::Facts(e)))?;
+            let bytes = decls.write(k, &info, solver_alloc).map_err(|e| fail(super::OwnError::Write(e)))?;
+            Ok(super::groups::own_digest(&bytes))
+        };
+        // A one-group solve writes its members' groups alone.
+        part(NamesPart::Groups);
+        let groups = if groups { c.groups(&|k| read(k) && done.contains_key(&k), &own, out_alloc).map_err(Unwritten::Groups)? } else { AVec::new_in(out_alloc) };
+        if let Some(r) = c.member_refusal {
+            return Err(Unwritten::Member(r));
+        }
+        Ok(Solved { done, added_externs, decide, groups, cuts })
     };
-    // E4: the groups, over the decided values (after D116's check, which re-decides `c`;
-    // `groups` leaves every value as it found it), when the caller asked.
-    // A member's own text: its own fragment's `ModuleDecls` record, as the facts hold it.
-    let own = |k: ItemKey| -> Result<blaze_id::ContentId, super::GroupsError> {
-        let fail = |error| super::GroupsError::Own { module: k, error };
-        let info = facts.module(k).map_err(|e| fail(super::OwnError::Facts(e)))?;
-        let decls = facts.decls(k).map_err(|e| fail(super::OwnError::Facts(e)))?;
-        let bytes = decls.write(k, &info, alloc).map_err(|e| fail(super::OwnError::Write(e)))?;
-        Ok(super::groups::own_digest(&bytes))
-    };
-    // A one-group solve writes its members' groups alone.
-    part(NamesPart::Groups);
-    let groups =if groups { c.groups(&|k| read(k) && done.contains_key(&k), &own, alloc).map_err(Unwritten::Groups)? } else { AVec::new_in(alloc) };
-    if let Some(r) = c.member_refusal {
-        return Err(Unwritten::Member(r));
+    let mut result = None;
+    let mode = solve_scratch(&mut |solver_alloc| {
+        result = Some(solve_in(solver_alloc));
+    });
+    match (mode, result) {
+        (crate::task::Scratch::Reset, Some(res)) => res,
+        _ => solve_in(out_alloc),
     }
-    Ok(Solved { done, added_externs, decide, groups, cuts })
 }
 
 /// `bytes` copied into `alloc` at a 16-byte boundary (a record is read in place, aligned).

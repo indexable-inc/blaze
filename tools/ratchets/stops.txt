@@ -30,7 +30,7 @@ blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1375
+blaze-cli	1370
 blaze-code	94
 blaze-columns	193
 blaze-comptime	68
@@ -115,7 +115,7 @@ blaze-rng	3
 blaze-roots	24
 blaze-run	273
 blaze-rungs	2
-blaze-scope	1693
+blaze-scope	1688
 blaze-screen	30
 blaze-script	91
 blaze-semver	9

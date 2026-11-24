@@ -560,7 +560,7 @@ impl<'f> NamesStage<'f> {
                     let name = task.planned.name;
                     self.admissions.admit(name)?;
                     let Some(at) = names.crate_at(name.subject) else {
-                        answered.push((i, Completion { done: crate::engine_tasks::failed(task, alloc), result: Err(refusal(name, "a `CrateScope` task of a crate the world does not hold")) }));
+                        answered.push((i, Completion { done: crate::engine_tasks::failed(task, alloc), result: Err(refusal(name, "a `CrateScope` task of a crate the world does not hold")), scope_bytes: crate::names::metered::ScopeBytes::default() }));
                         continue;
                     };
                     #[cfg(test)]
@@ -631,6 +631,7 @@ impl<'f> NamesStage<'f> {
                             let fail = |why, words| WorkerAnswer {
                                 done: crate::engine_tasks::failed_with(task, failure_reads(&deps, script, alloc), alloc),
                                 result: Err((TaskFailure { name, why }, words)),
+                                scope_bytes: crate::names::metered::ScopeBytes::default(),
                             };
                             let procs = match gate {
                                 Err(Blocked::Runner(message)) => {
@@ -655,7 +656,7 @@ impl<'f> NamesStage<'f> {
                                     Mapped::Unreadable(why) => {
                                         let words = blaze_own::format_in!(alloc, "crate `{}`: the record of its dependency `{}`: {why}", crates[at].input.name, crates[g].input.name);
                                         let failed = TaskFailure { name, why: Why::Refused { what: "a dependency's record", rule: crate::names::RULE } };
-                                        return Ok(WorkerAnswer { done: crate::engine_tasks::failed_with(task, failure_reads(&deps, script, alloc), alloc), result: Err((failed, Some(words))) });
+                                        return Ok(WorkerAnswer { done: crate::engine_tasks::failed_with(task, failure_reads(&deps, script, alloc), alloc), result: Err((failed, Some(words))), scope_bytes: crate::names::metered::ScopeBytes::default() });
                                     }
                                 }
                             }
@@ -693,7 +694,10 @@ impl<'f> NamesStage<'f> {
                         scratch.push((committed, name));
                         match result {
                             Ok(Ok(result)) => match result.into_completion(frame) {
-                                Ok(answer) => answered.push((i, answer)),
+                                Ok(answer) => {
+                                    self.memory.scope_bytes(answer.scope_bytes);
+                                    answered.push((i, answer));
+                                }
                                 Err(why) => { error.get_or_insert(why); }
                             },
                             Ok(Err(why)) => { error.get_or_insert(why.into()); }
@@ -706,6 +710,7 @@ impl<'f> NamesStage<'f> {
                                 answered.push((i, Completion {
                                     done: crate::engine_tasks::failed_with(task, reads, alloc),
                                     result: Err(Failure { failure: TaskFailure { name, why: Why::Panicked { used: committed, limit: crate::names::SCOPE_FRAME as u64 } }, words: None }),
+                                    scope_bytes: crate::names::metered::ScopeBytes::default(),
                                 }));
                             }
                         }
@@ -1220,6 +1225,7 @@ impl<'j, 'a: 'j> WaitingName<'j, 'a> {
             let failure = |why, words| WorkerAnswer {
                 done: crate::engine_tasks::failed_with(&task, failure_reads(job.deps, script, alloc), alloc),
                 result: Err((TaskFailure { name, why }, words)),
+                scope_bytes: crate::names::metered::ScopeBytes::default(),
             };
             let answer = match work::unwinding(|| match blocked {
                 None => job.run(cx, root, &task, outlined, alloc),
@@ -1610,6 +1616,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         self.edges.clear();
         times.names_width(u32::try_from(self.width).unwrap_or(u32::MAX));
         let answer = timed.answer?.into_completion(frame)?;
+        stage.memory.scope_bytes(answer.scope_bytes);
         stage.file(&task, answer, buffer)?;
         self.scratch.entry(task.planned.phase.wave).or_insert_with(|| Vec::new_in(self.frame)).push((timed.scratch, name));
         if self.order.is_empty() {
@@ -1707,6 +1714,7 @@ struct Job<'j> {
 struct WorkerAnswer<'a> {
     done: Done<'a>,
     result: Result<Finished<work::Record<SharedAlloc<'static>>>, (TaskFailure, Option<blaze_own::String<SharedAlloc<'a>>>)>,
+    scope_bytes: crate::names::metered::ScopeBytes,
 }
 
 struct Finished<R> {
@@ -1725,6 +1733,7 @@ struct Finished<R> {
 struct Completion<'a, 'f> {
     done: Done<'a>,
     result: Result<Finished<work::Made<'f>>, Failure<'f>>,
+    scope_bytes: crate::names::metered::ScopeBytes,
 }
 
 impl<'a> WorkerAnswer<'a> {
@@ -1739,7 +1748,7 @@ impl<'a> WorkerAnswer<'a> {
             }
             Err((failure, words)) => Err(Failure { failure, words: words.map(|s| work::held_str(s.as_str(), frame)) }),
         };
-        Ok(Completion { done: self.done, result })
+        Ok(Completion { done: self.done, result, scope_bytes: self.scope_bytes })
     }
 }
 
@@ -1776,6 +1785,7 @@ impl Job<'_> {
         let refuse = |what, words| WorkerAnswer {
             done: crate::engine_tasks::failed_with(task, failure_reads(self.deps, script_input.map(|s| (s, false)), alloc), alloc),
             result: Err((TaskFailure { name, why: Why::Refused { what, rule: crate::names::RULE } }, Some(words))),
+            scope_bytes: crate::names::metered::ScopeBytes::default(),
         };
         let area;
         let outputs = if let Some((script, bytes)) = self.script {
@@ -1880,7 +1890,8 @@ impl Job<'_> {
             (env, _) => env,
         };
         let job = ScopeJob { workers: self.workers, kept: self.kept, at: self.at, member: krate.member, input: CrateInput { deps: &own_deps, ..input }, deps: &exports, sysroot, packs: self.packs.into(), corrected: self.corrected, env, procs: self.procs, oracle: self.oracle, clock: self.clock, board: Some(self.board) };
-        let (resolved, ok, unresolved, oracle) = match crate::names::resolve(cx, root, &job, cx.frame()).0 {
+        let (resolution, scope_bytes) = crate::names::resolve(cx, root, &job, cx.frame());
+        let (resolved, ok, unresolved, oracle) = match resolution {
             Resolution::Made { resolved, ok, unresolved, oracle } => (resolved, ok, unresolved, oracle),
             Resolution::Need(keys) => return need(&keys),
         };
@@ -1944,7 +1955,9 @@ impl Job<'_> {
         found.outlined.sort_unstable_by_key(|one| one.name);
         found.probes.sort_unstable_by_key(|(slot, ..)| Name::file(slot));
         let implicit_entry_root = input.implicit.entry.then(|| input.root.strip_prefix("/0/")).flatten();
-        finish(task, input.name, implicit_entry_root, resolved, ok, unresolved, oracle, &order, script_input, outlined, found, alloc, local, self.kept)
+        let mut answer = finish(task, input.name, implicit_entry_root, resolved, ok, unresolved, oracle, &order, script_input, outlined, found, alloc, local, self.kept)?;
+        answer.scope_bytes = scope_bytes;
+        Ok(answer)
     }
 }
 
@@ -2113,7 +2126,7 @@ fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>,
     let done = Done { name, key: task.key, out: record.out, defines, reads, findings: u32::try_from(record.findings.len()).unwrap_or(u32::MAX), failed: false };
     let header = blaze_drive::record::write_plain_head(name, task.planned.source, record.out, &record.reads, payload.len(), scratch);
     let head = SVec::from_slice_in(&header, heap);
-    Ok(WorkerAnswer { done, result: Ok(Finished { record, resolved, ok, unresolved, key, head, oracle, found }) })
+    Ok(WorkerAnswer { done, result: Ok(Finished { record, resolved, ok, unresolved, key, head, oracle, found }), scope_bytes: crate::names::metered::ScopeBytes::default() })
 }
 
 /// Results may arrive in any order. The engine's task index orders every observable merge.

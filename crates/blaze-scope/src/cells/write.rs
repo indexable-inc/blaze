@@ -180,7 +180,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         out.globs = w.globs;
         let mut unknown = w.unknown;
         // The non-glob bindings met so far in tree order: a second target is `Duplicate`.
-        let mut seen: ABTreeMap<'o, (Namespace, N), Def> = ABTreeMap::new_in(alloc);
+        let mut seen: ABTreeMap<'_, (Namespace, N), Def> = ABTreeMap::new_in(self.alloc);
         let mut bind = |ns: Namespace, name: N, def: Def, errors: &mut AVec<'o, ScopeError<N, Path<'o, N>>>| {
             let first = *seen.entry((ns, name)).or_insert(def);
             if first != def {
@@ -199,9 +199,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         self.vis_errors(m, &ix.call, alloc, &mut out.errors);
         // The walk: (fragment, next slot, next import, the module's own fragment or a
         // `#[macro_use]` child's carried out). Slots and imports merge by text position.
-        let mut stack: AVec<'o, (FragId, usize, usize, bool)> = AVec::new_in(alloc);
+        let mut stack: AVec<'_, (FragId, usize, usize, bool)> = AVec::new_in(self.alloc);
         // The fragment each `macro_exports` entry was written in (the plant's order only).
-        let mut export_frags: AVec<'o, FragId> = AVec::new_in(alloc);
+        let mut export_frags: AVec<'_, FragId> = AVec::new_in(self.alloc);
         let text = self.modules[m as usize].text;
         stack.push((text, 0, 0, true));
         for &(ns, name, def) in ix.explicit[text as usize].iter() {

@@ -874,12 +874,15 @@ pub const MAX_ROWS: usize = 1 << 24;
 /// The cell table of a crate just solved, from the two records written of it: what the crate's
 /// `CrateScope` record files beside them (blaze-cli names.rs). Item texts are read from the
 /// solve's own files and expansions; each of `wholes` is a [`NameCell::Whole`].
-pub fn crate_table<'a>(names: &CrateNames<'a>, names_record: &[u8], items_record: &[u8], wholes: &[(Section, &[u8])], bump: Bump<'a>) -> Result<AVec<'a, u8>, CellsError> {
+pub fn crate_table<'n, 'b>(names: &CrateNames<'n>, names_record: &[u8], items_record: &[u8], wholes: &[(Section, &[u8])], bump: Bump<'b>) -> Result<AVec<'b, u8>, CellsError>
+where
+    'n: 'b,
+{
     let alloc = bump.alloc();
     let record = NamesRecord::open(Verified::check(aligned(names_record, bump)).map_err(CellsError::Names)?);
     let mut items = ItemsRecord::open(aligned(items_record, bump), alloc).map_err(CellsError::Items)?;
     items.use_solved_texts(names, bump);
-    let read = |of: TextOf<'_>| -> Option<&'a str> {
+    let read = |of: TextOf<'_>| -> Option<&'b str> {
         match of {
             TextOf::File { index, .. } => names.files.get(index as usize).map(|file| file.text),
             TextOf::Expansion { call } => names.expansions.get(&call).and_then(|expansion| expansion.made).map(|made| made.text),
@@ -893,10 +896,15 @@ pub fn crate_table<'a>(names: &CrateNames<'a>, names_record: &[u8], items_record
 /// every owner's members, every expansion); each of `wholes` is a [`NameCell::Whole`] over
 /// those bytes.
 pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, ReadText<'_, 'a>)>, wholes: &[(Section, &[u8])], alloc: Alloc<'b>) -> Result<AVec<'b, u8>, CellsError> {
-    let mut rows: AVec<'b, ([u8; 16], ContentId)> = AVec::new_in(alloc);
+    let est = wholes.len()
+        + record.modules().len() * 4
+        + record.enums().len()
+        + 1
+        + items.map_or(0, |(it, _)| it.items() * 3 + it.modules() * 2 + it.expansions() + it.owned_members() + it.variant_rows());
+    let mut rows: AVec<'b, ([u8; 16], [u8; 16])> = AVec::with_capacity_in(est, alloc);
     let krate = record.key().prefix();
     for (section, bytes) in wholes {
-        rows.push((NameCell::Whole { krate, section: *section }.key(), whole_digest(*section, bytes)));
+        rows.push((NameCell::Whole { krate, section: *section }.key(), cell_digest(whole_digest(*section, bytes))));
     }
     if let Some((items, read)) = items {
         let mut keys: AVec<'_, ItemKey> = AVec::with_capacity_in(items.items() + items.modules(), alloc);
@@ -904,7 +912,7 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
             if let Some(row) = items.item_at(i).map_err(CellsError::Items)? {
                 keys.push(row.key);
                 if let Some(digest) = members_digest(items, row.key, read).map_err(CellsError::Items)? {
-                    rows.push((NameCell::Members { owner: row.key }.key(), digest));
+                    rows.push((NameCell::Members { owner: row.key }.key(), cell_digest(digest)));
                 }
             }
         }
@@ -917,14 +925,14 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
         keys.dedup();
         for key in keys.iter() {
             if let Some(digest) = item_digest(items, *key, read).map_err(CellsError::Items)? {
-                rows.push((NameCell::Item { key: *key }.key(), digest));
+                rows.push((NameCell::Item { key: *key }.key(), cell_digest(digest)));
             }
         }
         let directory = directory_of(wholes)?;
         for i in 0..items.expansions() {
             if let Some(row) = items.expansion_at(i) {
                 if let Some(digest) = expansion_digest(items, directory.as_ref(), row.call)? {
-                    rows.push((NameCell::Expansion { call: row.call }.key(), digest));
+                    rows.push((NameCell::Expansion { call: row.call }.key(), cell_digest(digest)));
                 }
             }
         }
@@ -938,7 +946,7 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
             }
             last = Some(member);
             if let Some(digest) = member_of_digest(items, member).map_err(CellsError::Items)? {
-                rows.push((NameCell::MemberOf { member }.key(), digest));
+                rows.push((NameCell::MemberOf { member }.key(), cell_digest(digest)));
             }
         }
         // One `VariantOf` a variant key, over its run of the (sorted) variant table.
@@ -947,7 +955,7 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
             let Some((variant, ..)) = items.variant_at(i).map_err(CellsError::Items)? else { break };
             let (run, n) = variant_rows_of(items, variant).map_err(CellsError::Items)?;
             if let Some(digest) = variant_of_digest(&run[..n]) {
-                rows.push((NameCell::VariantOf { variant }.key(), digest));
+                rows.push((NameCell::VariantOf { variant }.key(), cell_digest(digest)));
             }
             // Past the whole run (a refused key may have more than the two rows read).
             i += 1;
@@ -967,52 +975,52 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
         firsts.dedup();
         for first in firsts.iter() {
             if let Some(digest) = beginning_digest(*first, [&lists[0][..], &lists[1][..], &lists[2][..]]) {
-                rows.push((NameCell::Beginning { first: *first }.key(), digest));
+                rows.push((NameCell::Beginning { first: *first }.key(), cell_digest(digest)));
             }
         }
         if let Some(digest) = lang_digest(items).map_err(CellsError::Items)? {
-            rows.push((NameCell::Lang { krate }.key(), digest));
+            rows.push((NameCell::Lang { krate }.key(), cell_digest(digest)));
         }
         if let Some(digest) = incoherent_digest(items) {
-            rows.push((NameCell::Incoherent { krate }.key(), digest));
+            rows.push((NameCell::Incoherent { krate }.key(), cell_digest(digest)));
         }
         if let Some(digest) = internal_symbols_digest(items, read).map_err(CellsError::Items)? {
-            rows.push((NameCell::InternalSymbols { krate }.key(), digest));
+            rows.push((NameCell::InternalSymbols { krate }.key(), cell_digest(digest)));
         }
-        rows.push((NameCell::Links { krate }.key(), links_digest(record, items).map_err(CellsError::Items)?));
+        rows.push((NameCell::Links { krate }.key(), cell_digest(links_digest(record, items).map_err(CellsError::Items)?)));
         if let Some(digest) = impl_rows_digest(items).map_err(CellsError::Items)? {
-            rows.push((NameCell::ImplRows { krate }.key(), digest));
+            rows.push((NameCell::ImplRows { krate }.key(), cell_digest(digest)));
         }
         if let Some(digest) = files_digest(items).map_err(CellsError::Items)? {
-            rows.push((NameCell::Files { krate }.key(), digest));
+            rows.push((NameCell::Files { krate }.key(), cell_digest(digest)));
         }
         if let Some(digest) = extensions_digest(items, read).map_err(CellsError::Items)? {
-            rows.push((NameCell::Extensions { krate }.key(), digest));
+            rows.push((NameCell::Extensions { krate }.key(), cell_digest(digest)));
         }
         if let Some(digest) = cfg_atoms_digest(items).map_err(CellsError::Items)? {
-            rows.push((NameCell::CfgAtoms { krate }.key(), digest));
+            rows.push((NameCell::CfgAtoms { krate }.key(), cell_digest(digest)));
         }
     }
     for module in record.modules() {
         if let Some(digest) = module_digest(record, module) {
-            rows.push((NameCell::Module { module }.key(), digest));
+            rows.push((NameCell::Module { module }.key(), cell_digest(digest)));
         }
         if let Some(digest) = textual_cell_digest(record, module) {
-            rows.push((NameCell::Textual { module }.key(), digest));
+            rows.push((NameCell::Textual { module }.key(), cell_digest(digest)));
         }
         if let Some(view) = record.scope(module) {
             for entry in view.bindings() {
                 let cell = NameCell::Binding { module, name: cell_key(entry.ns, entry.name) };
-                rows.push((cell.key(), binding_digest(entry.binding)));
+                rows.push((cell.key(), cell_digest(binding_digest(entry.binding))));
             }
         }
     }
     for owner in record.enums() {
         if let Some(digest) = variants_digest(record, owner) {
-            rows.push((NameCell::Variants { owner }.key(), digest));
+            rows.push((NameCell::Variants { owner }.key(), cell_digest(digest)));
         }
     }
-    rows.push((NameCell::Root { krate: record.key().prefix() }.key(), root_digest(record)));
+    rows.push((NameCell::Root { krate: record.key().prefix() }.key(), cell_digest(root_digest(record))));
     if rows.len() > MAX_ROWS {
         return Err(CellsError::TooManyRows { rows: rows.len() });
     }
@@ -1023,7 +1031,7 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
             return Err(CellsError::TwoUnderOneKey { key: *key });
         }
         bytes.extend_from_slice(key);
-        bytes.extend_from_slice(&cell_digest(*digest));
+        bytes.extend_from_slice(digest);
     }
     Ok(bytes)
 }
