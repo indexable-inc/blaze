@@ -469,8 +469,9 @@ fn compare_binding(provider: &'static str, plant: bool) {
         if plant {
             assert_ne!(w, l, "the comparison must catch the other module's definition");
             let syms = NameCell::InternalSymbols { krate: crates[1].key.prefix() };
-            let orig_names = blaze_scope::names_record::encode(names.krate(1), a).expect("original provider names");
-            let orig_items = items_record::encode_with(names.krate(1), &names, a).expect("original provider items");
+            let bump = blaze_own::testing::bump();
+            let orig_names = blaze_scope::resolve::aligned(&blaze_scope::names_record::encode(names.krate(1), a).expect("original provider names"), bump);
+            let orig_items = blaze_scope::resolve::aligned(&items_record::encode_with(names.krate(1), &names, a).expect("original provider items"), bump);
             let digest_of = |n_bytes: &[u8], i_bytes: &[u8], text: &'static str| {
                 let record = blaze_scope::names_record::NamesRecord::open(blaze_scope::names_record::Verified::check(n_bytes).expect("names record"));
                 let items_rec = blaze_scope::items_record::ItemsRecord::open_with_files(i_bytes, blaze_own::testing::heap().alloc(), move |index, _, _, edition| {

@@ -285,13 +285,56 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
     modules.sort_unstable();
     modules.dedup();
 
-    let mut rows = RecordBytes::new_in(alloc);
+    // Deduplicate and prefix/suffix-share module ancestor chains deterministically: longest
+    // chains first, tie-broken by module key. Every emitted chain registers all its prefixes
+    // and suffixes, so parent/ancestor modules slice straight into a descendant's chain with
+    // zero copy and zero format change (rule 25, rule 51).
+    let mut chain_order: AVec<'b, (usize, ItemKey)> = AVec::with_capacity_in(modules.len(), alloc);
+    for (idx, m) in modules.iter().enumerate() {
+        if names.chains.contains_key(m) {
+            chain_order.push((idx, *m));
+        }
+    }
+    chain_order.sort_unstable_by(|a, b| {
+        let la = names.chains.get(&a.1).map_or(0, |c| c.len());
+        let lb = names.chains.get(&b.1).map_or(0, |c| c.len());
+        lb.cmp(&la).then_with(|| a.1.cmp(&b.1))
+    });
     let mut chains = RecordBytes::new_in(alloc);
-    let mut blob = RecordBytes::new_in(alloc);
     let mut chain_keys = 0usize;
+    let mut chain_places: HashMap<&[ItemKey], u32, Alloc<'b>> = HashMap::new_in(alloc);
+    let mut module_chain_at: AVec<'b, u32> = AVec::new_in(alloc);
+    module_chain_at.resize(modules.len(), NONE);
+    for &(idx, m) in chain_order.iter() {
+        let Some(chain) = names.chains.get(&m) else { continue };
+        let slice = chain.as_slice();
+        let at = if let Some(&existing) = chain_places.get(slice) {
+            existing
+        } else {
+            let start = u32_of(chain_keys, "names chains")?;
+            for k in slice.iter() {
+                chains.extend_from_slice(&k.0.0);
+            }
+            for len in 1..=slice.len() {
+                chain_places.entry(&slice[..len]).or_insert(start);
+            }
+            for off in 1..slice.len() {
+                let sub_start = u32_of(chain_keys + off, "names chains")?;
+                chain_places.entry(&slice[off..]).or_insert(sub_start);
+            }
+            chain_keys += slice.len();
+            start
+        };
+        if let Some(slot) = module_chain_at.get_mut(idx) {
+            *slot = at;
+        }
+    }
+
+    let mut rows = RecordBytes::new_in(alloc);
+    let mut blob = RecordBytes::new_in(alloc);
     #[cfg(test)]
     let mut planted_once = false;
-    for m in modules.iter() {
+    for (idx, m) in modules.iter().enumerate() {
         rows.extend_from_slice(&m.0.0);
         match names.done.get(m) {
             Some(done) => {
@@ -315,13 +358,10 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
         }
         match names.chains.get(m) {
             Some(chain) => {
-                rows.extend_from_slice(&u32_of(chain_keys, "names chains")?.to_le_bytes());
+                let first = module_chain_at.get(idx).copied().unwrap_or(NONE);
+                rows.extend_from_slice(&first.to_le_bytes());
                 let len = u16::try_from(chain.len()).map_err(|_| NamesRecordError::TooBig { what: "a module chain" })?;
                 rows.extend_from_slice(&len.to_le_bytes());
-                for k in chain.iter() {
-                    chains.extend_from_slice(&k.0.0);
-                }
-                chain_keys += chain.len();
             }
             None => {
                 rows.extend_from_slice(&NONE.to_le_bytes());

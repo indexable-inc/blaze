@@ -616,3 +616,17 @@ unsafe impl<T> Gen<[T; 2]> for m::Other<T> {}
         assert!(row.flags.contains(ImplFlags::UNSAFE) == header.starts_with("unsafe"), "`{header}`: unsafe");
     }
 }
+
+#[test]
+fn previous_items_version_13_is_rejected() {
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
+    let n = solve_one("#![no_core]\npub struct S;\n", None);
+    let mut bytes = encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")).to_vec();
+    bytes[4..8].copy_from_slice(&13u32.to_le_bytes());
+    let aligned_bytes = aligned(&bytes, bump);
+    assert!(
+        matches!(ItemsRecord::open(aligned_bytes, g), Err(ItemsRecordError::NotThisRecord)),
+        "version-13 items record must be rejected as NotThisRecord"
+    );
+}

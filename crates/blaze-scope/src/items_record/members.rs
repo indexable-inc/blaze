@@ -10,8 +10,7 @@ use blaze_id::ItemKey;
 use blaze_surface::{ItemIndex, ItemKind};
 
 use super::{
-    BODY_HOLDS_ITEMS, CTOR_OR_WRITTEN_BY, ItemsRecord, ItemsRecordError, MemberRow, NAMED, T_MEMBERS, T_OWNERS, TextSpan, key_at, le16,
-    le32,
+    BODY_HOLDS_ITEMS, CTOR_OR_WRITTEN_BY, ItemsRecord, ItemsRecordError, MemberRow, NAMED, T_MEMBERS, T_OWNERS, TextSpan, le32,
 };
 use crate::resolve::At;
 
@@ -62,25 +61,28 @@ impl<'a> ItemsRecord<'a> {
 
     /// Member row `k` of the members table, below its count.
     fn member_row(&self, k: usize) -> Result<MemberRow<'a>, ItemsRecordError> {
-        let b: &'a [u8] = self.bytes;
-        let m = self.row(T_MEMBERS, k);
-        let flags = b[m + 55];
-        let outline = ItemIndex(le32(b, m + 44));
-        let at = self.at_of(le32(b, m + 32))?;
-        let text = self.item_span(at, outline, le32(b, m + 36), le32(b, m + 40))?;
+        let cols = self.member_cols;
+        let meta = cols.meta.get(k);
+        let name_len = u32::try_from(meta & 0xffff).unwrap_or(0);
+        let kind_byte = u8::try_from((meta >> 16) & 0xff).unwrap_or(0);
+        let flags = u8::try_from((meta >> 24) & 0xff).unwrap_or(0);
+        let lifetimes = u16::try_from((meta >> 32) & 0xffff).unwrap_or(0);
+        let outline = ItemIndex(cols.outline.get_u32(k));
+        let at = self.at_of(cols.code.get_u32(k))?;
+        let text = self.item_span(at, outline, cols.start.get_u32(k), cols.len.get_u32(k))?;
         let written_by = match text {
             Some(TextSpan { at: At::Expansion(call), .. }) if flags & CTOR_OR_WRITTEN_BY != 0 => Some(call),
             _ => None,
         };
         Ok(MemberRow {
-            key: key_at(b, m),
-            name: if flags & NAMED != 0 { Some(self.str_at("a member's name", le32(b, m + 48), u32::from(le16(b, m + 52)))?) } else { None },
+            key: self.member_key(k),
+            name: if flags & NAMED != 0 { Some(self.str_at("a member's name", cols.name_at.get_u32(k), name_len)?) } else { None },
             outline,
-            kind: ItemKind::from_byte(b[m + 54]).ok_or(ItemsRecordError::Byte { what: "a member's kind", byte: b[m + 54] })?,
+            kind: ItemKind::from_byte(kind_byte).ok_or(ItemsRecordError::Byte { what: "a member's kind", byte: kind_byte })?,
             body_holds_items: flags & BODY_HOLDS_ITEMS != 0,
             text,
             written_by,
-            lifetimes: super::lifetimes_of(le16(b, m + 56)),
+            lifetimes: super::lifetimes_of(lifetimes),
         })
     }
 }

@@ -16,19 +16,47 @@
 //! kept as two rows and [`ItemsRecord::variant_home`] refuses it by name, never answers one.
 
 use blaze_hash::HashMap;
-use blaze_id::ItemKey;
+use blaze_id::{ContentId, ItemKey};
 use blaze_own::{AVec, Alloc};
 use blaze_surface::RecordBytes;
 
-use super::{ItemsRecord, ItemsRecordError, key_at, le32, pad, put32, u32_of};
+use super::cols::{OptId, OptInt, VariantCol, VariantColsBuf, encode_opt_id, encode_opt_u64, patch_dir, read_dir};
+use super::{ItemsRecord, ItemsRecordError, key_at, pad, put32, u32_of};
 use crate::task::Variant;
 
 /// The header field holding how many rows the section has.
 pub(crate) const F_VARIANTS_COUNT: usize = 29;
 /// The header field holding the section's offset.
 pub(crate) const F_VARIANTS_AT: usize = 30;
-/// A row: variant key 32, enum key 32, index u32, 4 zero bytes.
-pub(crate) const VARIANT_ROW: usize = 72;
+
+/// Columnar variant table opened once in [`ItemsRecord::open`]: sorted 32-byte variant keys for
+/// direct binary search, deduplicated enum keys (`IdView`), and bit-packed declaration indices.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct VariantsCols<'a> {
+    count: usize,
+    keys: &'a [u8],
+    enum_keys: OptId<'a>,
+    indices: OptInt<'a>,
+}
+
+impl<'a> VariantsCols<'a> {
+    pub(super) const fn empty() -> Self {
+        VariantsCols { count: 0, keys: &[], enum_keys: OptId::empty(), indices: OptInt::empty(0) }
+    }
+
+    pub(super) fn open(bytes: &'a [u8], base: usize, count: usize) -> Result<Self, ItemsRecordError> {
+        if count == 0 {
+            return Ok(Self::empty());
+        }
+        let Some(keys_bytes) = count.checked_mul(32) else {
+            return Err(ItemsRecordError::Short { what: "the variant table", at: base });
+        };
+        let (keys, [enum_b, idx_b]) = read_dir::<2>(bytes, base, keys_bytes, "the variant table")?;
+        let enum_keys = OptId::open(enum_b, count, "the variant table's enum keys", base)?;
+        let indices = OptInt::open(idx_b, count, 0, "the variant table's indices", base)?;
+        Ok(VariantsCols { count, keys, enum_keys, indices })
+    }
+}
 
 /// Appends the section for `enums` (each enum's variants in declaration order; the map's order
 /// is not read: the rows are sorted here) to `out`, a record whose header is written, and sets
@@ -44,11 +72,19 @@ pub(super) fn append<'a>(out: &mut RecordBytes<'_>, enums: &HashMap<ItemKey, AVe
     pad(out);
     let at = u32_of(out.len(), "the variant table")?;
     let count = u32_of(rows.len(), "the variant table's rows")?;
-    for (variant, owner, index) in rows.iter() {
-        out.extend_from_slice(&variant.0.0);
-        out.extend_from_slice(&owner.0.0);
-        put32(out, *index);
+    if !rows.is_empty() {
+        let dir_at = out.len();
         put32(out, 0);
+        put32(out, 0);
+        let mut buf = VariantColsBuf::with_capacity_in(rows.len(), alloc);
+        for (variant, owner, index) in rows.iter() {
+            out.extend_from_slice(&variant.0.0);
+            buf.push(VariantCol { owner: owner.0.0, index: u64::from(*index) });
+        }
+        let mut scratch = AVec::new_in(alloc);
+        let enum_len = encode_opt_id(buf.owners(), "the variant table's enum keys", alloc, &mut scratch, out)?;
+        let idx_len = encode_opt_u64(buf.indices(), 0, "the variant table's indices", alloc, &mut scratch, out)?;
+        patch_dir(out, dir_at, [enum_len, idx_len]);
     }
     let field = 8 + 4 * F_VARIANTS_COUNT;
     out[field..field + 4].copy_from_slice(&count.to_le_bytes());
@@ -58,54 +94,49 @@ pub(super) fn append<'a>(out: &mut RecordBytes<'_>, enums: &HashMap<ItemKey, AVe
 }
 
 impl<'a> ItemsRecord<'a> {
-    /// The section's offset and row count, checked to lie in the record.
-    fn variant_table(&self) -> Result<(usize, usize), ItemsRecordError> {
-        let (base, count) = (self.field(F_VARIANTS_AT) as usize, self.field(F_VARIANTS_COUNT) as usize);
-        if count.checked_mul(VARIANT_ROW).and_then(|len| base.checked_add(len)).is_none_or(|end| end > self.bytes.len()) {
-            return Err(ItemsRecordError::Short { what: "the variant table", at: base });
-        }
-        Ok((base, count))
-    }
-
     /// How many rows the variant table has: one per variant of the crate's enums.
     pub fn variant_rows(&self) -> usize {
-        self.field(F_VARIANTS_COUNT) as usize
+        self.variants.count
     }
 
     /// Row `i` of the variant table (sorted by variant key): the variant, its enum, its index.
     pub fn variant_at(&self, i: usize) -> Result<Option<(ItemKey, ItemKey, u32)>, ItemsRecordError> {
-        let (base, count) = self.variant_table()?;
-        if i >= count {
+        if i >= self.variants.count {
             return Ok(None);
         }
-        let r = base + i * VARIANT_ROW;
-        Ok(Some((key_at(self.bytes, r), key_at(self.bytes, r + 32), le32(self.bytes, r + 64))))
+        let variant = key_at(self.variants.keys, i * 32);
+        let owner = ItemKey(ContentId(*self.variants.enum_keys.get(i)));
+        let index = self.variants.indices.get_u32(i);
+        Ok(Some((variant, owner, index)))
     }
 
     /// The enum `variant` is a variant of, and its index in the enum's declaration order: one
     /// binary search of the section (no item row, no variant list, no text is read).
     /// `Ok(None)`: no variant of the crate has that key.
     pub fn variant_home(&self, variant: ItemKey) -> Result<Option<(ItemKey, u32)>, ItemsRecordError> {
-        let (base, count) = self.variant_table()?;
+        let count = self.variants.count;
+        let keys = self.variants.keys;
         // The first row whose key is not below `variant`.
         let (mut lo, mut hi) = (0usize, count);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let r = base + mid * VARIANT_ROW;
-            if self.bytes[r..r + 32] < variant.0.0[..] {
+            let r = mid * 32;
+            if keys[r..r + 32] < variant.0.0[..] {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        let r = base + lo * VARIANT_ROW;
-        if lo >= count || self.bytes[r..r + 32] != variant.0.0[..] {
+        let r = lo * 32;
+        if lo >= count || keys[r..r + 32] != variant.0.0[..] {
             return Ok(None);
         }
         // The rows are sorted: a second enum holding the key is the next row.
-        if lo + 1 < count && self.bytes[r + VARIANT_ROW..r + VARIANT_ROW + 32] == variant.0.0[..] {
+        if lo + 1 < count && keys[r + 32..r + 64] == variant.0.0[..] {
             return Err(ItemsRecordError::Short { what: "a variant's enum (two rows of the variant table hold the key)", at: lo });
         }
-        Ok(Some((key_at(self.bytes, r + 32), le32(self.bytes, r + 64))))
+        let owner = ItemKey(ContentId(*self.variants.enum_keys.get(lo)));
+        let index = self.variants.indices.get_u32(lo);
+        Ok(Some((owner, index)))
     }
 }

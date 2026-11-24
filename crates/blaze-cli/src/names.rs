@@ -75,8 +75,8 @@ pub(crate) mod sections;
 // moves this source domain alone (every key moves; the name a reader reads by stays). Bump it
 // there only when what a name stands for changes. Source 18: D104 implicit `fn main` reads on
 // blaze-edition binary roots (engine_names.rs `finish`, rule 21) and expansion record keys in
-// `OUT_DOMAIN` 3.
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 18";
+// `OUT_DOMAIN` 3. Source 19: `CrateScope` form 7 (32-byte `NameCell` rows + columnar `ItemsRecord` v14).
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 19";
 /// The out: the names record, the crate's expansion record keys (`EXPANSIONS_OUT_DOMAIN`), AND
 /// the checkout files the crate holds ([`crate_out`]). "1" was the names record alone, but a
 /// body's check reads its crate's items record to find which crate owns its file (body_types.rs
