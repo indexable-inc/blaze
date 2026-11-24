@@ -247,7 +247,7 @@ impl BodyBuf {
             expr_editions: &[],
             pat_editions: &[],
             record_expr_schemas: &[],
-            closure_static_params: &[],
+            closure_param_regions: &[],
         }
     }
 }

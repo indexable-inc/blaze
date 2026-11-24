@@ -427,9 +427,46 @@ pub struct BodyView<'b> {
     /// Canonical lexicographically-sorted [`crate::ids::RecordSchema`] for each anonymous
     /// `Expr::Record` literal, ascending by [`ExprId`].
     pub record_expr_schemas: &'b [(ExprId, crate::ids::RecordSchema)],
-    /// Closure parameter annotations whose outer reference explicitly writes `'static`
-    /// (`|lock: &'static str|`): `(closure_expr, param_index)`, ascending.
-    pub closure_static_params: &'b [(ExprId, u32)],
+    /// Explicit written non-elided lifetimes in closure parameter type annotations
+    /// (`|lock: &'static str|`, `|t: Typed<'c>|`, `|buf: &mut Vec<(A, B), Alloc<'a>>|`), sorted
+    /// ascending by `(closure, param, path, own)`.
+    pub closure_param_regions: &'b [ClosureParamRegion],
+}
+
+/// What kind of explicit non-elided lifetime a closure parameter type wrote at a region slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WrittenRegion {
+    /// Explicitly `'static`.
+    Static,
+    /// An explicitly named lifetime from the enclosing item (not `'static`, not `'_`).
+    Named,
+}
+
+/// One explicit non-elided lifetime written in a closure parameter type annotation, located by
+/// structural child-index path from the parameter's root type (4 bits per step, depth in low 4
+/// bits) and the node's own lifetime index (`0` for `&`, `0..n` for an ADT's lifetime args).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ClosureParamRegion {
+    pub closure: ExprId,
+    pub param: u32,
+    pub path: u64,
+    pub own: u32,
+    pub kind: WrittenRegion,
+}
+
+impl ClosureParamRegion {
+    /// The root structural path (depth 0).
+    pub const ROOT: u64 = 0;
+
+    /// Appends child index `child` (0..16) to structural path `path` (depth 0..15).
+    pub fn push_step(path: u64, child: u32) -> Option<u64> {
+        let depth = path & 0xf;
+        if depth >= 15 || child >= 16 {
+            return None;
+        }
+        let shift = 4 + (depth << 2);
+        Some(((path & !0xf) | (u64::from(child) << shift)) | (depth + 1))
+    }
 }
 
 /// The edition at `id` in the runs `runs` (rows `(first, edition)`, ascending), `body`
@@ -451,6 +488,16 @@ fn slice<'b, T>(column: &'static str, all: &'b [T], l: List) -> Result<&'b [T], 
 }
 
 impl<'b> BodyView<'b> {
+    /// The written non-elided lifetime at `(closure, param, path, own)`, if any.
+    pub fn closure_param_region(&self, closure: ExprId, param: u32, path: u64, own: u32) -> Option<WrittenRegion> {
+        let key = (closure.0, param, path, own);
+        let at = self
+            .closure_param_regions
+            .binary_search_by_key(&key, |r| (r.closure.0, r.param, r.path, r.own))
+            .ok()?;
+        self.closure_param_regions.get(at).map(|r| r.kind)
+    }
+
     pub(crate) fn expr(&self, e: ExprId) -> Result<Expr, CheckError> {
         self.exprs.get(e.ix()).copied().ok_or(CheckError::Malformed(Malformed::Expr(e)))
     }

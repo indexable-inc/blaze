@@ -311,6 +311,33 @@ env T: ?Sized
 struct PtWrap<X: ?Sized>(u8, X)
 goal <PtWrap<T> as Pointee>::Metadata == ?0 => yes ?0 = rigid <T as Pointee>::Metadata
 
+# A struct whose tail is a rigid associated type with a `Sized` item bound (e.g.
+# `blaze-mem/src/revision.rs`: `trait Built { type Value; }` and `struct Placed<B: Built>(u64, B::Value)`)
+# has metadata `()`; control: an `?Sized` item bound stays rigid.
+case metadata_rigid_alias_sized_item_bound_unit = normalizes_to.rs::consider_builtin_pointee_candidate
+params B
+trait BuiltSized { type Value: Sized; }
+env B: BuiltSized
+struct PlacedSized<X: BuiltSized>(u64, <X as BuiltSized>::Value)
+goal <PlacedSized<B> as Pointee>::Metadata == () => yes
+
+case metadata_rigid_alias_unsized_item_bound_rigid = normalizes_to.rs::consider_builtin_pointee_candidate
+params B
+trait BuiltUnsized { type Value: ?Sized; }
+env B: BuiltUnsized
+struct PlacedUnsized<X: BuiltUnsized>(u64, <X as BuiltUnsized>::Value)
+goal <PlacedUnsized<B> as Pointee>::Metadata == () => no
+goal <PlacedUnsized<B> as Pointee>::Metadata == ?0 => yes ?0 = rigid <rigid <B as BuiltUnsized>::Value as Pointee>::Metadata
+
+case try_as_dyn_compatible_yes = trait_goals.rs::consider_builtin_try_as_dyn
+goal dyn Debug: TryAsDynCompatible => yes
+
+case try_as_dyn_compatible_no_assoc_bound = trait_goals.rs::consider_builtin_try_as_dyn
+goal dyn Iterator<Item = u8>: TryAsDynCompatible => no
+
+case try_as_dyn_compatible_no_concrete = trait_goals.rs::consider_builtin_try_as_dyn
+goal u32: TryAsDynCompatible => no
+
 case discriminant_kind_yes =trait_goals.rs::consider_builtin_discriminant_kind_candidate
 goal Option<u8>: DiscriminantKind => yes
 

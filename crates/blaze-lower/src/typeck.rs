@@ -414,9 +414,9 @@ pub struct TypeckBody<'a> {
     /// Canonical lexicographically-sorted [`tc::RecordSchema`] for each anonymous `Expr::Record`,
     /// ascending by [`ExprId`].
     pub record_expr_schemas: AVec<'a, (ExprId, tc::RecordSchema)>,
-    /// Closure parameter annotations whose outer reference explicitly writes `'static`
-    /// (`|lock: &'static str|`): `(closure_expr, param_index)`, ascending.
-    pub closure_static_params: AVec<'a, (ExprId, u32)>,
+    /// Explicit written non-elided lifetimes in closure parameter type annotations
+    /// (`|lock: &'static str|`, `|t: Typed<'c>|`), sorted ascending by `(closure, param, slot)`.
+    pub closure_param_regions: AVec<'a, tc::ClosureParamRegion>,
     /// Unexpanded `inline for pat in iter { body }` sites lowered in this body (ascending by
     /// [`ExprId`]); `front2` uses each site's checked `iter` type to unroll the body before
     /// final checking and codegen.
@@ -485,7 +485,7 @@ impl<'a> TypeckBody<'a> {
             expr_editions: &self.expr_editions,
             pat_editions: &self.pat_editions,
             record_expr_schemas: &self.record_expr_schemas,
-            closure_static_params: &self.closure_static_params,
+            closure_param_regions: &self.closure_param_regions,
         }
     }
 }
@@ -771,6 +771,153 @@ impl Conv<'_, '_, '_, '_, '_> {
 
     fn opt_ty(&mut self, t: Option<TypeId>) -> Result<Option<PTy>, Refused> {
         t.map(|t| self.ty(t)).transpose()
+    }
+
+    /// Walks a closure parameter's written type `root` by structural child-index path, recording
+    /// every explicitly written non-elided lifetime (`'static` or a named enclosing lifetime,
+    /// never `'_` or an omitted lifetime). Keying by structural `(path, own)` avoids depending on
+    /// sibling types' lifetime slot counts (e.g. `&mut Vec<(X64Loc, X64Loc), Alloc<'a>>`).
+    fn record_closure_param_regions(&mut self, closure: ExprId, param: u32, root: TypeId) -> Result<(), Refused> {
+        let mut stack: [(TypeId, u64); 64] = [(TypeId(0), 0); 64];
+        let mut sp = 1usize;
+        if let Some(slot) = stack.get_mut(0) {
+            *slot = (root, tc::ClosureParamRegion::ROOT);
+        }
+        let mut steps = 0u32;
+        while let Some(top) = sp.checked_sub(1) {
+            sp = top;
+            steps += 1;
+            if steps > 64 {
+                break;
+            }
+            let Some(&(tid, path)) = stack.get(top) else { break };
+            match self.v.ty(tid)? {
+                TypeRef::Ref { lifetime, inner, .. } => {
+                    if let Some(nm) = lifetime {
+                        let text = self.v.name_text(nm)?;
+                        let kind = if text == "'static" {
+                            Some(tc::WrittenRegion::Static)
+                        } else if text != "'_" {
+                            Some(tc::WrittenRegion::Named)
+                        } else {
+                            None
+                        };
+                        if let Some(kind) = kind {
+                            self.out.closure_param_regions.push(tc::ClosureParamRegion {
+                                closure,
+                                param,
+                                path,
+                                own: 0,
+                                kind,
+                            });
+                        }
+                    }
+                    if let Some(next) = tc::ClosureParamRegion::push_step(path, 0)
+                        && let Some(slot) = stack.get_mut(sp)
+                    {
+                        *slot = (inner, next);
+                        sp += 1;
+                    }
+                }
+                TypeRef::Ptr { inner, .. }
+                | TypeRef::Array { elem: inner, .. }
+                | TypeRef::Slice(inner)
+                | TypeRef::Pat { base: inner, .. } => {
+                    if let Some(next) = tc::ClosureParamRegion::push_step(path, 0)
+                        && let Some(slot) = stack.get_mut(sp)
+                    {
+                        *slot = (inner, next);
+                        sp += 1;
+                    }
+                }
+                TypeRef::Tuple(elems) => {
+                    let ids = self.v.ids(elems)?;
+                    for (ci, &id) in ids.iter().enumerate().rev() {
+                        if let Ok(ci_u32) = u32::try_from(ci)
+                            && let Some(next) = tc::ClosureParamRegion::push_step(path, ci_u32)
+                            && let Some(slot) = stack.get_mut(sp)
+                        {
+                            *slot = (TypeId(id), next);
+                            sp += 1;
+                        }
+                    }
+                }
+                TypeRef::Path(path_idx) => {
+                    let p = self.v.path(path_idx)?;
+                    let segs = self.v.segments(p)?;
+                    let Some((&last, earlier)) = segs.split_last() else { continue };
+                    let mut earlier_has_args = false;
+                    for &n in earlier {
+                        let es = Segment::decode(n)?;
+                        if es.kind == SegKind::Anchor || es.has_args || es.parenthesized {
+                            earlier_has_args = true;
+                            break;
+                        }
+                    }
+                    if earlier_has_args {
+                        continue;
+                    }
+                    let s = Segment::decode(last)?;
+                    if s.kind == SegKind::SelfTy || s.kind == SegKind::Anchor || s.parenthesized || s.return_notation || !s.has_args {
+                        continue;
+                    }
+                    let rows = self.v.rows(s.args)?;
+                    let mut lt_idx = 0u32;
+                    let mut arg_idx = 0u32;
+                    let mut ty_args: [(TypeId, u32); 16] = [(TypeId(0), 0); 16];
+                    let mut ty_len = 0usize;
+                    for &row in rows {
+                        match GenericArg::decode(row)? {
+                            GenericArg::Lifetime(nm) => {
+                                let text = self.v.name_text(nm)?;
+                                let kind = if text == "'static" {
+                                    Some(tc::WrittenRegion::Static)
+                                } else if text != "'_" {
+                                    Some(tc::WrittenRegion::Named)
+                                } else {
+                                    None
+                                };
+                                if let Some(kind) = kind {
+                                    self.out.closure_param_regions.push(tc::ClosureParamRegion {
+                                        closure,
+                                        param,
+                                        path,
+                                        own: lt_idx,
+                                        kind,
+                                    });
+                                }
+                                lt_idx += 1;
+                            }
+                            GenericArg::Type(t) => {
+                                if let Some(slot) = ty_args.get_mut(ty_len) {
+                                    *slot = (t, arg_idx);
+                                    ty_len += 1;
+                                }
+                                arg_idx += 1;
+                            }
+                            GenericArg::Const(_) => {
+                                arg_idx += 1;
+                            }
+                            GenericArg::AssocType { .. }
+                            | GenericArg::AssocConst { .. }
+                            | GenericArg::AssocBound { .. } => {}
+                        }
+                    }
+                    if let Some(slice) = ty_args.get(..ty_len) {
+                        for &(t, ci) in slice.iter().rev() {
+                            if let Some(next) = tc::ClosureParamRegion::push_step(path, ci)
+                                && let Some(slot) = stack.get_mut(sp)
+                            {
+                                *slot = (t, next);
+                                sp += 1;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Each of call arguments `args` that is an integer literal, or a `-` whose operand is one
@@ -1276,11 +1423,8 @@ impl Conv<'_, '_, '_, '_, '_> {
                 for (pi, &n) in self.v.rows(c.params)?.iter().enumerate() {
                     let p = Param::decode(n)?;
                     let Some(pat) = p.pat else { return self.refuse("a closure parameter with no pattern", r) };
-                    if let Some(tid) = p.ty
-                        && let TypeRef::Ref { lifetime: Some(nm), .. } = self.v.ty(tid)?
-                        && self.v.name_text(nm)? == "'static"
-                    {
-                        self.out.closure_static_params.push((e, pi as u32));
+                    if let Some(tid) = p.ty {
+                        self.record_closure_param_regions(e, len(pi), tid)?;
                     }
                     let ty = self.opt_ty(p.ty)?;
                     self.out.pat_lists.push(pat);
@@ -1512,7 +1656,7 @@ pub fn to_typeck<'a>(
         super_lets: crate::super_let::super_lets(view, alloc),
         const_gaps: Vec::new_in(alloc),
         record_expr_schemas: Vec::new_in(alloc),
-        closure_static_params: Vec::new_in(alloc),
+        closure_param_regions: Vec::new_in(alloc),
         inline_fors: Vec::new_in(alloc),
     };
     let mut slice_rest: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(view.pats.len(), alloc);
@@ -1581,6 +1725,7 @@ pub fn to_typeck<'a>(
     // The same for the legacy arguments' terms (`BodyView::legacy_arg`); one argument is
     // one call's, so no id repeats.
     c.out.legacy_args.sort_unstable_by_key(|&(x, _)| x);
+    c.out.closure_param_regions.sort_unstable();
     for i in 0..view.pats.len() {
         let id = PatId(len(i));
         let ed = view.mark_of_pat(id)?.map_or(body_edition, |m| edition(m.edition));

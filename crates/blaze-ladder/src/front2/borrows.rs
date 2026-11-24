@@ -298,6 +298,7 @@ impl core::fmt::Display for BorrowRefused {
                     Some(External::Static) => "'static",
                     Some(External::OwnerParam(_)) => "owner param",
                     Some(External::Param(_)) => "type param",
+                    Some(External::DynPlaceholder(_)) => "dyn placeholder",
                     None => "hidden",
                 };
                 write!(f, "[{} -> {}] ", endpoint(*from), endpoint(*into))?;

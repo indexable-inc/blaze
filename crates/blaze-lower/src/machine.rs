@@ -576,7 +576,7 @@ impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
     /// names a substring of a string token and inherits the hygiene of that literal.
     fn hygiene_at(&self, byte: u32) -> u64 {
         if (byte as usize) < self.text.len() {
-            return 0;
+            return self.mark_at(byte).map_or(0, blaze_expand::origin_column::TextMark::local_hygiene);
         }
         let i = self.words.partition_point(|w| w.text.end <= byte);
         self.words.get(i).filter(|w| w.text.start <= byte).map_or(0, |w| w.hygiene)

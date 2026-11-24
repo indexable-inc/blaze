@@ -528,6 +528,32 @@ fn push_alias_bounds<T: Tys, F: Facts>(
     Err(Stop::Error(SolveError::Limit(Limit::Walk)))
 }
 
+/// Whether rigid alias `t` (`AliasKind::Projection | AliasKind::Opaque`) directly declares
+/// positive trait `trait_` among its own item bounds (e.g. `trait Built { type Value<'a>: Sized; }`
+/// proves `<B as Built>::Value<'a>: Sized` for `<Placed<B> as Pointee>::Metadata == ()`).
+pub(crate) fn alias_has_item_bound_trait<T: Tys, F: Facts>(
+    cx: &mut Cx<'_, '_, T, F>,
+    t: Ty,
+    k: AliasKind,
+    d: Def,
+    largs: List,
+    wanted_trait: Def,
+) -> Result<bool, Stop> {
+    let n = bound_count(cx, k, d)?;
+    for i in 0..n {
+        let (p, portable) = bound_pred(cx, k, d, i)?;
+        let Pred::Trait { trait_, polarity: Polarity::Positive, .. } = p else { continue };
+        if trait_ != wanted_trait {
+            continue;
+        }
+        let p = cx.import_alias_bound(d, i, portable, p, largs)?;
+        if pred_self(cx, p).is_some_and(|s| same_alias(cx, s, t)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The alias bounds of a trait goal whose self type `g.self_ty` is a rigid alias
 /// (assembly/mod.rs `assemble_alias_bound_candidates`).
 pub fn assemble_alias_bounds<T: Tys, F: Facts>(

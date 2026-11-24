@@ -35,8 +35,20 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     /// Coerces `a` to `b`, recording the adjustments on `e`. `false`: they do not coerce, and
     /// nothing was bound.
     pub(crate) fn coerce(&mut self, e: Option<ExprId>, a: Ty, b: Ty, two_phase: bool) -> Result<bool, Stop> {
-        let a = self.ty.shallow_resolve(a);
-        let b = self.ty.shallow_resolve(b);
+        let mut a = self.ty.shallow_resolve(a);
+        let mut b = self.ty.shallow_resolve(b);
+        if matches!(self.view(a), TyView::Alias { .. })
+            || (matches!(self.view(a), TyView::Infer(_))
+                && matches!(
+                    self.view(b),
+                    TyView::Ref(..) | TyView::Ptr(..) | TyView::FnPtr(..) | TyView::Union(..) | TyView::Record(..) | TyView::Adt(..)
+                ))
+        {
+            a = self.try_structurally_resolve(a)?;
+        }
+        if matches!(self.view(b), TyView::Alias { .. }) {
+            b = self.try_structurally_resolve(b)?;
+        }
         if self.is_err(a) || self.is_err(b) {
             self.unify(a, b)?;
             return Ok(true);

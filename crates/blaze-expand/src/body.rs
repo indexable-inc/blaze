@@ -82,6 +82,9 @@ pub fn parser_words<'a>(stream: &TokenStream<'_>, alloc: Alloc<'a>) -> ParserWor
     ParserWords { words, word_at }
 }
 
+/// Hash domain shared by [`local_hygiene`] and [`crate::TextMark::local_hygiene`].
+pub(crate) const LOCAL_HYGIENE_DOMAIN: &str = "blaze v2 local hygiene 1";
+
 /// The local hygiene of a token of `ctx` in `stream` (see the module's doc): 0 when no
 /// semi-opaque or opaque mark is on it; `this` names the stream's own expansion's marks.
 pub fn local_hygiene(stream: &TokenStream<'_>, mut ctx: Ctx, this: ContentId) -> u64 {
@@ -92,7 +95,7 @@ pub fn local_hygiene(stream: &TokenStream<'_>, mut ctx: Ctx, this: ContentId) ->
                 MarkOf::This => this,
                 MarkOf::Outer(key) => key,
             };
-            let h = hasher.get_or_insert_with(|| Hasher::new("blaze v2 local hygiene 1"));
+            let h = hasher.get_or_insert_with(|| Hasher::new(LOCAL_HYGIENE_DOMAIN));
             h.id(&key);
             h.part(&[u8::from(node.mark.transparency == Transparency::Opaque)]);
         }

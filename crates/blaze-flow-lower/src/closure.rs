@@ -123,6 +123,8 @@ pub enum External {
     OwnerParam(u32),
     /// A type parameter outlives placeholder `ρ_P` of the enclosing fn (`param_origs`).
     Param(u32),
+    /// The `ordinal`-th canonical higher-ranked `dyn for<..>` placeholder (`dyn_bound_placeholders`).
+    DynPlaceholder(u32),
 }
 
 /// What one position of a closure's signature (its inputs' positions, then its output's, as
@@ -157,6 +159,8 @@ pub enum Need {
     OwnerParam(u32),
     /// Type parameter outlives placeholder `ρ_P` of the enclosing fn ([`External::Param`]).
     Param(u32),
+    /// Canonical higher-ranked `dyn for<..>` placeholder `ordinal` ([`External::DynPlaceholder`]).
+    DynPlaceholder(u32),
 }
 
 impl Need {
@@ -192,6 +196,7 @@ pub fn requirement(externals: &[(blaze_flow::Origin, External)], from: blaze_flo
         Some(External::SigOwner(k)) => Some(Need::Sig(k)),
         Some(External::OwnerParam(i)) => Some(Need::OwnerParam(i)),
         Some(External::Param(u)) => Some(Need::Param(u)),
+        Some(External::DynPlaceholder(ord)) => Some(Need::DynPlaceholder(ord)),
         Some(External::Env | External::Sig | External::Late) | None => None,
     };
     Some(Requirement { from: end(from)?, into: end(into)? })
@@ -219,7 +224,9 @@ pub fn escapes_closure<A: Allocator>(
     alloc: A,
 ) -> bool {
     let end = |o: Origin| externals.iter().find(|(x, _)| *x == o).map(|&(_, w)| w);
-    let owner_names = |w: Option<External>| matches!(w, Some(External::Capture(_) | External::SigOwner(_) | External::Static | External::OwnerParam(_) | External::Param(_)));
+    let owner_names = |w: Option<External>| {
+        matches!(w, Some(External::Capture(_) | External::SigOwner(_) | External::Static | External::OwnerParam(_) | External::Param(_) | External::DynPlaceholder(_)))
+    };
     if end(from) != Some(External::Late) || !owner_names(end(into)) {
         return false;
     }
@@ -320,6 +327,11 @@ pub(crate) fn lower_closure_with<A: Allocator + Copy, F: Facts, R: crate::one_ca
     }
     for p in l.param_origs.iter() {
         externals.push((p.origin, External::Param(p.param)));
+    }
+    for (idx, &o) in l.dyn_bound_placeholders.iter().enumerate() {
+        if let Ok(ord) = u32::try_from(idx) {
+            externals.push((o, External::DynPlaceholder(ord)));
+        }
     }
     let stats = l.stats;
     let b = core::mem::replace(&mut l.b, crate::builder::Builder::new(crate::FlowBuilder::new_in(1, 0, alloc)));
@@ -686,23 +698,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     _ => None,
                 });
                 for (pi, &t) in inputs.iter().enumerate() {
-                    let pn = self.npos(t, e)?;
-                    let is_static_outer = ce.is_some_and(|ce| self.body.closure_static_params.binary_search(&(ce, to_u32(pi))).is_ok());
                     let param_written = written_tys.and_then(|l| l.get(pi)).is_some_and(Option::is_some);
-                    for pos in 0..pn {
-                        if pos == 0 && is_static_outer {
-                            out.push(SigSlot::Static);
-                        } else if from == SigFrom::Inferred && !param_written {
-                            // Unannotated inferred closure parameters are NOT higher-ranked in
-                            // Rust: their lifetimes are existential regions of the closure value
-                            // in the enclosing body (so `let pipe = |fd, what| DeadlineFd::new(fd, what)`
-                            // infers `what: &'static str` cleanly while `|x: &T|` stays higher-ranked).
-                            out.push(SigSlot::Owner(owner));
-                            owner += 1;
-                        } else {
-                            out.push(SigSlot::Late(None));
-                        }
-                    }
+                    self.lay_written_param(ce, to_u32(pi), t, param_written, from, &mut owner, out, e)?;
                 }
             }
         }
@@ -718,6 +715,90 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 for _ in 0..nout {
                     out.push(SigSlot::Owner(owner));
                     owner += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Lays `SigSlot`s for one closure parameter `root` when no expecting clause supplies its
+    /// signature regions, walking `root` in exact `npos` pre-order while tracking the structural
+    /// child-index path to look up explicitly written `'static` and named enclosing lifetimes in
+    /// `BodyView::closure_param_regions`.
+    #[expect(clippy::too_many_arguments, reason = "closure id, param index, type, written flag, source, owner counter, output, and expr")]
+    fn lay_written_param(
+        &self,
+        ce: Option<ExprId>,
+        param: u32,
+        root: PTy,
+        param_written: bool,
+        from: SigFrom,
+        owner: &mut u32,
+        out: &mut Vec<SigSlot, A>,
+        e: ExprId,
+    ) -> Result<(), Refusal> {
+        let inferred_unannotated = from == SigFrom::Inferred && !param_written;
+        let push_default = |n: u32, owner: &mut u32, out: &mut Vec<SigSlot, A>| {
+            for _ in 0..n {
+                if inferred_unannotated {
+                    out.push(SigSlot::Owner(*owner));
+                    *owner += 1;
+                } else {
+                    out.push(SigSlot::Late(None));
+                }
+            }
+        };
+        let push_written = |path: u64, own: u32, owner: &mut u32, out: &mut Vec<SigSlot, A>| {
+            let written = ce.and_then(|c| self.body.closure_param_region(c, param, path, own));
+            match written {
+                Some(blaze_typeck::WrittenRegion::Static) => out.push(SigSlot::Static),
+                Some(blaze_typeck::WrittenRegion::Named) => {
+                    out.push(SigSlot::Owner(*owner));
+                    *owner += 1;
+                }
+                None if inferred_unannotated => {
+                    out.push(SigSlot::Owner(*owner));
+                    *owner += 1;
+                }
+                None => out.push(SigSlot::Late(None)),
+            }
+        };
+        let mut stack: Vec<(PTy, Option<u64>), A> = Vec::new_in(self.alloc);
+        stack.push((root, Some(blaze_typeck::ClosureParamRegion::ROOT)));
+        let mut steps = 0u32;
+        while let Some((t, path)) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            let Some(p) = path else {
+                push_default(self.npos(t, e)?, owner, out);
+                continue;
+            };
+            match self.node(t, e)? {
+                PNode::Ref(_, inner) => {
+                    push_written(p, 0, owner, out);
+                    stack.push((inner, blaze_typeck::ClosureParamRegion::push_step(p, 0)));
+                }
+                PNode::Ptr(_, inner) | PNode::Slice(inner) | PNode::Array(inner, _) | PNode::Pat(inner, _) => {
+                    stack.push((inner, blaze_typeck::ClosureParamRegion::push_step(p, 0)));
+                }
+                PNode::Tuple(l) => {
+                    for (ci, &child) in self.list(l, e)?.iter().enumerate().rev() {
+                        stack.push((child, blaze_typeck::ClosureParamRegion::push_step(p, to_u32(ci))));
+                    }
+                }
+                PNode::Adt(k, l) => {
+                    let nl = self.adt_facts(k, e)?.lifetimes;
+                    for lt in 0..nl {
+                        push_written(p, lt, owner, out);
+                    }
+                    for (ci, &child) in self.list(l, e)?.iter().enumerate().rev() {
+                        stack.push((child, blaze_typeck::ClosureParamRegion::push_step(p, to_u32(ci))));
+                    }
+                }
+                _ => {
+                    push_default(self.npos(t, e)?, owner, out);
                 }
             }
         }

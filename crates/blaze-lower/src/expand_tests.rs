@@ -1550,3 +1550,33 @@ fn nested_unbraced_call_in_macro_stmts_stays_in_statement_position() {
         l.view().diags
     );
 }
+
+/// An item-level `macro_rules!` expansion (like `blaze-sys`'s `cold!`): a call-site parameter
+/// `name: i32` (unmarked) MUST NOT shadow a def-site call `name(1)` (marked `SemiOpaque`),
+/// while an unmarked reference to `name` still resolves to the parameter and a marked `let x`
+/// still resolves to marked `x`.
+#[test]
+fn item_macro_call_site_param_does_not_shadow_def_site_call() {
+    let text = "fn confstr(name: i32) { let found = name(1); call(found, name); }";
+    let call_name_at = u32::try_from(text.find("name(1)").expect("def-site call")).expect("short");
+    let let_found_at = u32::try_from(text.find("found =").expect("def-site let")).expect("short");
+    let use_found_at = u32::try_from(text.find("found, ").expect("def-site use")).expect("short");
+    let call_at = u32::try_from(text.find("call(").expect("def-site fn")).expect("short");
+    let mut marked = vec![call_name_at, let_found_at, use_found_at, call_at];
+    marked.sort_unstable();
+    let l = expanding_marked(&[], text, &marked);
+    let (whys, dump) = outcome(&l);
+    assert!(whys.is_empty(), "{whys:?}\n{dump}");
+    // Def-site `name(1)` stays a module path, NOT local `name: i32`.
+    assert!(dump.contains("(call (path name)"), "def-site `name(1)` must stay a path:\n{dump}");
+    // Both `found` (def-site) and `name` in `call(found, name)` (call-site) resolve as locals.
+    let v = l.view();
+    let local_names: StdVec<&str> = locals(&v)
+        .into_iter()
+        .map(|p| {
+            let crate::Pat::Bind { name, .. } = v.pat(p).expect("bind") else { panic!("expected bind") };
+            v.name_text(name).expect("name")
+        })
+        .collect();
+    assert_eq!(local_names, vec!["found", "name"], "expected `found` then `name` locals:\n{dump}");
+}

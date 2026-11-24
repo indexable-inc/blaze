@@ -1196,6 +1196,6 @@ pub(crate) fn empty_view(owner: ItemKey, types: PTys<'_>) -> BodyView<'_> {
         expr_editions: &[],
         pat_editions: &[],
         record_expr_schemas: &[],
-        closure_static_params: &[],
+        closure_param_regions: &[],
     }
 }

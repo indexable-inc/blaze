@@ -453,12 +453,44 @@ pub fn assemble<T: Tys, F: Facts>(
                 }
             }
             Some(Lang::From) => assemble_from(cx, g, self_ty, out)?,
+            Some(Lang::TryAsDyn) => assemble_try_as_dyn(cx, g, self_ty, out)?,
             _ => {}
         }
     }
     if def.lang == Some(Lang::Unsize) {
         assemble_unsize(cx, g, self_ty, out)?;
     }
+    Ok(())
+}
+
+/// `TryAsDynCompatible<'a>` (`#[lang = "try_as_dyn"]`, library/core/src/any.rs):
+/// automatically implemented for every `dyn Trait + 'a` without associated type bounds whose
+/// principal trait is dyn-compatible.
+fn assemble_try_as_dyn<T: Tys, F: Facts>(
+    cx: &mut Cx<'_, '_, T, F>,
+    g: TraitGoal,
+    self_ty: Ty,
+    out: &mut Vec<Cand, Alloc<'_>>,
+) -> Result<(), Stop> {
+    if g.polarity != Polarity::Positive {
+        return Ok(());
+    }
+    let TyKind::Dynamic(preds, _) = cx.kind(self_ty) else {
+        return Ok(());
+    };
+    for i in 0..preds.len {
+        let p = cx.arg(preds, i);
+        match cx.kind(p) {
+            TyKind::ExProj { .. } => return Ok(()),
+            TyKind::ExTrait(d, _) => {
+                if !dyn_compatible(cx, d)? {
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+    }
+    out.push(certain(Certainty::Yes));
     Ok(())
 }
 
@@ -1203,10 +1235,15 @@ pub(crate) fn metadata_ty<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_ty: 
             TyKind::Alias(Rigid::No, ..) => return Ok(Metadata::Normalize(t)),
             TyKind::Param(_) | TyKind::Placeholder(..) | TyKind::Alias(..) => {
                 let sized = require_lang(cx, Lang::Sized)?;
-                let known = cx.env.iter().any(|c| match c.pred {
+                let mut known = cx.env.iter().any(|c| match c.pred {
                     Pred::Trait { trait_, args, polarity: Polarity::Positive } => trait_ == sized && args.len > 0 && cx.arg(args, 0) == t,
                     _ => false,
                 });
+                if !known
+                    && let TyKind::Alias(_, k @ (AliasKind::Projection | AliasKind::Opaque), d, largs) = cx.kind(t)
+                {
+                    known = crate::alias::alias_has_item_bound_trait(cx, t, k, d, largs, sized)?;
+                }
                 if !known {
                     return Ok(Metadata::Rigid(t));
                 }
