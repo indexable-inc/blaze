@@ -204,5 +204,5 @@ pub(super) fn select_made<'n, S: NamesSource<'n>>(
             }
         }
     }
-    Err(ConstFail::Check { item: constant, error: super::check::rounds_fail(r, constant, "selecting a trait's constant", made, Vec::new_in(Global)) })
+    Err(ConstFail::Check { item: constant, error: super::check::rounds_fail(r, constant, "selecting a trait's constant", made, MOST_ROUNDS, Vec::new_in(Global)) })
 }

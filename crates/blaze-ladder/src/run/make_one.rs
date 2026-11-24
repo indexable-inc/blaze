@@ -932,16 +932,29 @@ fn make_instance_timed<P: FrontEnd, T: Typing<P>>(
                 }
                 return Err(e);
             }
-            // A layout met a type alias's `impl Trait` whose defining fn is not checked yet
-            // (coroutines.rs `opaque_hidden`): that fn is checked, as a lay's owner is
-            // (`Step::Check`), and the instance made again; bounded by the same count, and an
-            // owner asked before is the refusal itself (its check made no row).
+            // A layout met an `impl Trait` whose defining fn (a TAIT's `#[define_opaque]` fn, a
+            // trait fn's RPITIT declaration, or its selected impl fn) is not tabled/checked yet
+            // (coroutines.rs `opaque_hidden` / `opaque_at_impl`): check it (or table its head row
+            // when it is a required trait fn with no body), as a lay's owner is (`Step::Check`),
+            // and build the instance again; bounded by the same count, and an owner asked before
+            // is the refusal itself (its check made no row).
             Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { owner, .. }, .. })
-                if owners < MOST_HELD_COROUTINES && state.asked.binary_search_by_key(&owner, |r| r.0).is_err() =>
+                if owners < MOST_HELD_COROUTINES
+                    && match state.asked.binary_search_by_key(&owner, |r| r.0) {
+                        Err(_) => true,
+                        Ok(slot) => state.asked.get(slot).is_some_and(|e| e.1.is_none()) && program.fn_index(owner).is_none(),
+                    } =>
             {
                 owners += 1;
                 if state.ensure(program, typing, owner, checks)?.is_none() {
-                    return Err(unchecked_owner(&*program, build_i, owner));
+                    let Some(row) = program.head_row(owner)? else {
+                        return Err(unchecked_owner(&*program, build_i, owner));
+                    };
+                    if let Ok(slot) = state.asked.binary_search_by_key(&owner, |r| r.0)
+                        && let Some(entry) = state.asked.get_mut(slot)
+                    {
+                        entry.1 = Some(row);
+                    }
                 }
                 continue;
             }
@@ -1355,10 +1368,22 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
         let args = state.work.ground.view().list(list).map_err(|_| refused(&*program, CodeRecordError::Reads(ReadsError::Question)))?;
         state.work.needs.push(need, args).map_err(|error| RunError::Build { function: program.function(i).named(), error, range: None })?;
     }
-    // An opaque type's hidden type is its defining fn's check's (coroutines.rs `opaque_hidden`).
+    // An opaque type's hidden type is its defining fn's check's (coroutines.rs `opaque_hidden`);
+    // a required trait fn's RPITIT has no body and needs only its signature row (`head_row`).
     for &owner in owners.iter() {
-        if state.ensure(program, typing, owner, checks).is_err() {
-            return Ok(Verdict::Stale { kind: ReadKind::OpaqueHidden, item: owner });
+        match state.ensure(program, typing, owner, checks) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                let Ok(Some(row)) = program.head_row(owner) else {
+                    return Ok(Verdict::Stale { kind: ReadKind::OpaqueHidden, item: owner });
+                };
+                if let Ok(slot) = state.asked.binary_search_by_key(&owner, |r| r.0)
+                    && let Some(entry) = state.asked.get_mut(slot)
+                {
+                    entry.1 = Some(row);
+                }
+            }
+            Err(_) => return Ok(Verdict::Stale { kind: ReadKind::OpaqueHidden, item: owner }),
         }
     }
     // The constants the rows read, pulled as a make pulls them (`pull_constants`).

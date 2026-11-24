@@ -1875,6 +1875,62 @@ pub(super) fn fn_ptr_abi(written: &str, r: Range) -> Result<tc::Abi, Why> {
 /// (super::const_open::local_const). `None`: not a body's type, not one name, no path in the
 /// type to place it, or no item of the body takes the name: the caller reads the length as
 /// before (at the module). A body item of the name that is no constant is refused by name.
+/// The block scope enclosing written type `t` in `v`: first any path written inside `t`
+/// (its own `scope`, exact for `[u8; SIZE]`), then the innermost `Expr::Block` whose range
+/// covers `t` (needed when `t` contains no path, such as `*const [_; SIZE]` in `bytes`'s
+/// `buf_try_get_impl!` macro), falling back to the call site's enclosing block when `t`
+/// lives in a macro expansion with no block of its own.
+fn type_scope(v: &View<'_>, t: lf::TypeId) -> Result<Option<lf::ScopeId>, Why> {
+    let at = v.type_range(t)?;
+    for (p, _) in (0u32..).zip(v.paths) {
+        let p = PathIdx(p);
+        if at.cover(v.path_range(p)?) != Some(at) {
+            continue;
+        }
+        if let Some(s) = v.path(p)?.scope {
+            return Ok(Some(s));
+        }
+    }
+    let mut best: Option<(u32, lf::ScopeId)> = None;
+    for (e, _) in (0u32..).zip(v.exprs) {
+        let eid = blaze_typeck::ExprId(e);
+        if let lf::Expr::Block { scope, .. } = v.expr(eid)? {
+            let br = v.expr_range(eid)?;
+            if br.cover(at) == Some(br) {
+                let len = br.len();
+                if best.is_none_or(|(b, _)| len < b) {
+                    best = Some((len, scope));
+                }
+            }
+        }
+    }
+    if let Some((_, scope)) = best {
+        return Ok(Some(scope));
+    }
+    if at.in_expansion() {
+        let site = v.site(at)?;
+        for (e, _) in (0u32..).zip(v.exprs) {
+            let eid = blaze_typeck::ExprId(e);
+            if let lf::Expr::Block { scope, .. } = v.expr(eid)? {
+                let br = v.expr_range(eid)?;
+                if let Some(ir) = v.item_relative(br)
+                    && ir.start <= site.start
+                    && site.end <= ir.end
+                {
+                    let len = ir.end.saturating_sub(ir.start);
+                    if best.is_none_or(|(b, _)| len < b) {
+                        best = Some((len, scope));
+                    }
+                }
+            }
+        }
+        if let Some((_, scope)) = best {
+            return Ok(Some(scope));
+        }
+    }
+    Ok(None)
+}
+
 fn body_const_len<H: Heads + ?Sized>(heads: &H, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, text: &str, r: Range) -> Result<Option<u128>, Why> {
     let Some(body) = env.body else { return Ok(None) };
     let mut name = text.trim();
@@ -1885,19 +1941,7 @@ fn body_const_len<H: Heads + ?Sized>(heads: &H, env: &Env<'_>, v: &View<'_>, t: 
     if !ident {
         return Ok(None);
     }
-    let at = v.type_range(t)?;
-    let mut scope = None;
-    for p in 0..v.paths.len() {
-        let p = PathIdx(p as u32);
-        if at.cover(v.path_range(p)?) != Some(at) {
-            continue;
-        }
-        if let Some(s) = v.path(p)?.scope {
-            scope = Some(s);
-            break;
-        }
-    }
-    let Some(scope) = scope else { return Ok(None) };
+    let Some(scope) = type_scope(v, t)? else { return Ok(None) };
     let Some(row) = body.locals.find(body.owner, Some(scope.0), name, super::locals::LocalNs::Value) else { return Ok(None) };
     match row.kind {
         super::locals::LocalKind::Const => match heads.const_bits(row.key) {

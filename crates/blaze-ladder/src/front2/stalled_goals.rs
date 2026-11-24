@@ -463,7 +463,7 @@ pub fn decide_stalled_goals<'n, 'a, S: NamesSource<'n>>(
     }
     let mut questions = Vec::new_in(Global);
     questions.extend(last);
-    Decision::Refused(Refused::Check(super::check::rounds_fail(r, owner, "deciding the stalled goals of an async body", made, questions)))
+    Decision::Refused(Refused::Check(super::check::rounds_fail(r, owner, "deciding the stalled goals of an async body", made, MOST_ROUNDS, questions)))
 }
 
 impl AsyncInteriors<'_> {

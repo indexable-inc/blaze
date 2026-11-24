@@ -42,7 +42,7 @@ use super::seeds::{Freezing, HeadSeed};
 use super::task::{BodyFrame, BodyReads, record_body_met};
 use super::view::{Tables, TablesOpts};
 use crate::front2::asks::{AsksMet, AsksPlant};
-use crate::front2::check::MOST_ROUNDS;
+use crate::front2::check::{MOST_PROGRESS_ROUNDS, MOST_ROUNDS};
 use crate::front2::heads::{NeedsMet, Want};
 use crate::front2::source::NamesSource;
 
@@ -195,12 +195,12 @@ fn assert_agree(old: &Run, new: &Run) {
     );
 }
 
-/// The restart path stopped at its round cap: types not clean, every round the cap allows
-/// entered, each but the last ending in a need.
+/// The restart path stopped at its progress round cap: types not clean, every round the cap
+/// allows entered, each but the last ending in a need.
 fn assert_at_cap(old: &Run) {
-    assert!(!old.types_clean(), "CONTROL: the restart path checked the chain clean under a cap of {MOST_ROUNDS} rounds:\n{}", old.diagnosis());
-    assert!(old.rounds >= u64::from(MOST_ROUNDS), "CONTROL: the restart path stopped before its cap of {MOST_ROUNDS}:\n{}", old.diagnosis());
-    assert!(old.again >= u64::from(MOST_ROUNDS) - 1, "CONTROL: too few rounds ended in a need:\n{}", old.diagnosis());
+    assert!(!old.types_clean(), "CONTROL: the restart path checked the chain clean under a cap of {MOST_PROGRESS_ROUNDS} rounds:\n{}", old.diagnosis());
+    assert!(old.rounds >= u64::from(MOST_PROGRESS_ROUNDS), "CONTROL: the restart path stopped before its cap of {MOST_PROGRESS_ROUNDS}:\n{}", old.diagnosis());
+    assert!(old.again >= u64::from(MOST_PROGRESS_ROUNDS) - 1, "CONTROL: too few rounds ended in a need:\n{}", old.diagnosis());
 }
 
 #[test]
@@ -231,12 +231,30 @@ fn a_chain_of_a_hundred_needs_is_one_entry_and_alike_where_the_restart_path_fini
 
 #[test]
 fn a_chain_of_three_hundred_needs_is_one_entry_where_the_restart_path_stops_at_its_cap() {
+    // 300 links (602 restart rounds, past `MOST_ROUNDS` = 256): monotonic forward progress
+    // now lets the restart path check clean and agree with the one ask, while one ask still
+    // enters once.
     let world = chain(300);
     let new = run(world, 300, Side::Once);
     assert_entered_once(&new);
-    // CONTROL (rule 23): the restart path on the same body meets a link a round or more and
-    // stops at the cap, tempo's `tempo_main_with` in miniature.
     let old = run(world, 300, Side::Restart);
-    assert_at_cap(&old);
-    std::println!("chain of 300: one ask {} entry, {} needs served; restart stopped after {} rounds", new.rounds, served(&new.body), old.rounds);
+    assert!(old.rounds > u64::from(MOST_ROUNDS), "CONTROL: expected > {MOST_ROUNDS} restart rounds on 300 links:\n{}", old.diagnosis());
+    assert_agree(&old, &new);
+    // Past `MOST_PROGRESS_ROUNDS` (2048): the restart path stops at its progress cap while
+    // the one ask still enters once.
+    let big_links = (MOST_PROGRESS_ROUNDS as usize) / 2 + 20;
+    let big = chain(big_links);
+    let big_new = run(big, big_links, Side::Once);
+    assert_entered_once(&big_new);
+    let big_old = run(big, big_links, Side::Restart);
+    assert_at_cap(&big_old);
+    std::println!(
+        "chain of 300: one ask {} entry ({} served), restart {} rounds; chain of {big_links}: one ask {} entry ({} served), restart stopped after {} rounds",
+        new.rounds,
+        served(&new.body),
+        old.rounds,
+        big_new.rounds,
+        served(&big_new.body),
+        big_old.rounds,
+    );
 }

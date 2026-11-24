@@ -289,9 +289,17 @@ fn defined_hidden<P: FrontEnd>(
         return Err(BuildError::OpaqueOwnerUnchecked { opaque, owner });
     };
     let function = program.function(i);
-    let (Some(_), Some(done)) = (function.body, checked.get(i).and_then(Option::as_ref)) else {
+    let Some(done) = checked.get(i).and_then(Option::as_ref) else {
+        // A lazy program may have tabled a head-only row for `owner` (via `callee_row` or
+        // `head_row`) before its body was checked: ask the driver to check `owner` and retry.
+        if function.body.is_none() {
+            return Err(BuildError::OpaqueOwnerUnchecked { opaque, owner });
+        }
         return Err(refused("an `impl Trait` type whose defining fn has no checked body"));
     };
+    if function.body.is_none() {
+        return Err(refused("an `impl Trait` type whose defining fn has no checked body"));
+    }
     let Some(&(_, hidden)) = done.hidden.iter().find(|h| h.0 == opaque) else {
         return Err(refused("an `impl Trait` type its defining body gave no hidden type (a body that never returns)"));
     };
@@ -324,8 +332,14 @@ fn opaque_at_impl<P: FrontEnd>(
     scratch: Alloc<'_>,
 ) -> Result<PTy, BuildError> {
     let refused = |what| BuildError::UnsupportedSig { what };
-    let (Some(t), Some(j)) = (program.fn_index(owner), program.fn_index(callee)) else {
-        return Err(refused("a trait fn's `impl Trait` type whose trait fn or selected impl fn is not in the program"));
+    // In lazy mode, neither the trait fn (`owner`) nor the selected impl fn (`callee`) may have
+    // a row in the program yet when the caller builds an expression of the RPITIT type. Ask the
+    // driver to ensure each missing fn by name and retry, matching `defined_hidden`.
+    let Some(t) = program.fn_index(owner) else {
+        return Err(BuildError::OpaqueOwnerUnchecked { opaque, owner });
+    };
+    let Some(j) = program.fn_index(callee) else {
+        return Err(BuildError::OpaqueOwnerUnchecked { opaque, owner: callee });
     };
     // The impl fn's own opaque is revealed from its record: one not checked yet is asked by
     // name, to be checked and the build asked again (never read as the trait's default).

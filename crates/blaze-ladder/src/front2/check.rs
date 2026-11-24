@@ -31,9 +31,16 @@ use blaze_lower::scoped::Prepares;
 use super::world_items::{BodyWorld, Fill, Gap};
 pub use super::body_reads::{check_body_asked, check_body_filed};
 
-/// The most checks of one body: each round makes at least one record, so past this the
-/// fills do not converge.
+/// The base round cap for loops and for a body check that stops discovering new holes.
 pub const MOST_ROUNDS: u32 = 256;
+
+/// The upper round cap for a body check while it keeps discovering new holes (e.g., large
+/// async test bodies whose transitive demand chains legitimately exceed `MOST_ROUNDS`).
+pub const MOST_PROGRESS_ROUNDS: u32 = 2048;
+
+/// Once a body check passes `MOST_ROUNDS`, stop if this many consecutive rounds discover no
+/// new distinct holes so a stuck fill loop cannot burn to `MOST_PROGRESS_ROUNDS`.
+const MOST_STALLED_ROUNDS: u32 = 64;
 
 /// Where a body is written: what its paths are resolved against.
 pub struct BodyScope<'s> {
@@ -81,12 +88,13 @@ pub enum CheckFail {
     /// `filed`, one per diagnostic: where it is filed (front2 expansion_origin.rs): in expanded
     /// text, at the user's tokens or at the call; elsewhere [`Filed::Own`](super::expansion_origin::Filed::Own).
     Diags { owner: ItemKey, diags: Vec<(tc::DiagCode, tc::Range, Box<str>), Global>, filed: Vec<super::expansion_origin::Filed, Global> },
-    /// Still `Need` after [`MOST_ROUNDS`]. `last`: the last round's HOLES (the questions it had
-    /// no answer to, never every question it asked: rt-loop a1750's `tempo_main_with` printed
-    /// 4,200 asked questions and no hole). `shown`: what stopped, by path (rule 19), made by
-    /// [`rounds_fail`]: the loop, the records it made, the holes left and the first of them
-    /// with its item's path.
-    Rounds { owner: ItemKey, last: Vec<Question, Global>, shown: Box<str, Global> },
+    /// Still `Need` after `rounds` rounds (bounded by [`MOST_ROUNDS`] when stalled, or
+    /// [`MOST_PROGRESS_ROUNDS`] while discovering new holes). `last`: the last round's HOLES (the
+    /// questions it had no answer to, never every question it asked: rt-loop a1750's
+    /// `tempo_main_with` printed 4,200 asked questions and no hole). `shown`: what stopped, by
+    /// path (rule 19), made by [`rounds_fail`]: the loop, the records it made, the holes left and
+    /// the first of them with its item's path.
+    Rounds { owner: ItemKey, rounds: u32, last: Vec<Question, Global>, shown: Box<str, Global> },
     /// The constant `key` an array length in a head names has no value: the evaluator's
     /// refusal, or [`ConstFail::Nested`] for one met while another constant is evaluated.
     /// `shown` is what `key` names ([`key_shown`]: rule 19), beside the key tools grep.
@@ -131,12 +139,12 @@ impl core::fmt::Display for CheckFail {
                 }
                 Ok(())
             }
-            CheckFail::Rounds { last, shown, .. } => {
+            CheckFail::Rounds { rounds, last, shown, .. } => {
                 let need = last.first().map_or("a record", |question| match question.record_kind() {
                     tc::RecordKind::Body => "the checked body record of a dependency item",
                     tc::RecordKind::Item => "an item record",
                 });
-                write!(f, "checking the body in its source file: still needs {need} after {MOST_ROUNDS} rounds: {shown}")
+                write!(f, "checking the body in its source file: still needs {need} after {rounds} rounds: {shown}")
             }
             CheckFail::ReadsDiffer { owner, diff } => write!(f, "checking {owner:?} again read other answers than its first check: two read-list digests under one body (rule 21): {diff}"),
             CheckFail::Resolve { owner, item, error, args } => write!(f, "in {owner:?}, the call of {item:?} at [{args}]: {error}"),
@@ -324,7 +332,10 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     // same test, read once; the store's seeds and asks do not change during a check.
     let stops_at_holes = r.store.stops_at_holes();
     let mut holes = RoundHoles::new();
-    for round in 0..MOST_ROUNDS {
+    let mut stalled_rounds = 0u32;
+    let mut rounds_run = 0u32;
+    for round in 0..MOST_PROGRESS_ROUNDS {
+        rounds_run = round + 1;
         r.store.hidden.set_leaking(&leaks);
         // Facts made on the spot this round (world_items.rs `BodyWorld::store_want`; under the
         // one ask, what it made: `Store::imports`).
@@ -361,6 +372,7 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
                     r.store.traced = cx.take_trace();
                 }
                 handle_check_error(r, body, owner, error, &mut leaks, asked.as_deref_mut(), alloc)?;
+                stalled_rounds = 0;
                 continue;
             }
         };
@@ -429,7 +441,12 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             }
             Outcome::Need(needs) => needs,
         };
-        holes.round(round, &needs.missing);
+        let new_holes = holes.round(round, &needs.missing);
+        if new_holes > 0 {
+            stalled_rounds = 0;
+        } else {
+            stalled_rounds += 1;
+        }
         if let Some(cost) = meter {
             cost.again(&needs, &r.store.gate.borrow());
         }
@@ -449,6 +466,7 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             return Err(CheckFail::Gap { owner, gaps: all_gaps });
         }
         if fills.is_empty() && r.store.imports() != imported_at {
+            stalled_rounds = 0;
             hints = needs;
             continue;
         }
@@ -505,8 +523,11 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             }
         }
         hints = needs;
+        if rounds_run >= MOST_ROUNDS && stalled_rounds >= MOST_STALLED_ROUNDS {
+            break;
+        }
     }
-    Err(rounds_exhausted(r, owner, made, &hints, &holes))
+    Err(rounds_exhausted(r, owner, made, rounds_run, &hints, &holes))
 }
 
 #[cold]
@@ -526,12 +547,13 @@ fn rounds_exhausted<'n, S: NamesSource<'n>>(
     r: &Records<'_, 'n, S>,
     owner: ItemKey,
     made: u64,
+    rounds: u32,
     hints: &Needs<'static>,
     holes: &RoundHoles,
 ) -> CheckFail {
     let mut last = Vec::new_in(Global);
     last.extend_from_slice(&hints.missing);
-    let mut fail = rounds_fail(r, owner, "the body's check", made, last);
+    let mut fail = rounds_fail(r, owner, "the body's check", made, rounds, last);
     if let CheckFail::Rounds { last, shown, .. } = &mut fail {
         *shown = format!("{shown}; {}", holes.said(last)).into_boxed_str();
     }
@@ -620,7 +642,7 @@ impl RoundHoles {
         RoundHoles { per_round: Vec::new_in(Global), seen: Vec::new_in(Global) }
     }
 
-    fn round(&mut self, round: u32, missing: &[Question]) {
+    fn round(&mut self, round: u32, missing: &[Question]) -> u32 {
         let mut new = 0u32;
         for &q in missing {
             if let Err(at) = self.seen.binary_search_by(|(s, _)| s.cmp(&q)) {
@@ -629,6 +651,7 @@ impl RoundHoles {
             }
         }
         self.per_round.push((missing.len() as u32, new));
+        new
     }
 
     /// `holes per round (new): r0 12 (12), .. ; N distinct over R rounds, the last new one in
@@ -670,10 +693,10 @@ impl RoundHoles {
 /// kind and its item's path ([`key_shown`]). Few records over many rounds is a chain of needs
 /// each found only once the one before it is made (a round per link); many is a body that
 /// needs many records.
-pub(crate) fn rounds_fail<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, what: &str, made: u64, last: Vec<Question, Global>) -> CheckFail {
+pub(crate) fn rounds_fail<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, what: &str, made: u64, rounds: u32, last: Vec<Question, Global>) -> CheckFail {
     use core::fmt::Write as _;
     let mut shown = String::new();
-    let _ = write!(shown, "{what} of {} made {made} records over {MOST_ROUNDS} rounds, and its last round met {} holes", key_shown(r, owner), last.len());
+    let _ = write!(shown, "{what} of {} made {made} records over {rounds} rounds, and its last round met {} holes", key_shown(r, owner), last.len());
     for (i, q) in last.iter().take(MOST_HOLES_SHOWN).enumerate() {
         let sep = if i == 0 { ": " } else { "; " };
         let text = format!("{q:?}");
@@ -686,7 +709,7 @@ pub(crate) fn rounds_fail<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner:
     if last.len() > MOST_HOLES_SHOWN {
         let _ = write!(shown, "; and {} more", last.len() - MOST_HOLES_SHOWN);
     }
-    CheckFail::Rounds { owner, last, shown: shown.into_boxed_str() }
+    CheckFail::Rounds { owner, rounds, last, shown: shown.into_boxed_str() }
 }
 
 /// The most holes a [`CheckFail::Rounds`] names.
@@ -1817,7 +1840,7 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
     }
     let mut last = Vec::new_in(Global);
     last.extend(hole);
-    Err(rounds_fail(r, owner, &format!("instance resolution of the call of {}", key_shown(r, item)), made, last))
+    Err(rounds_fail(r, owner, &format!("instance resolution of the call of {}", key_shown(r, item)), made, MOST_ROUNDS, last))
 }
 
 /// Resolves a trait method `item` at concrete ground `args` (interned in `r.store.tys`) to its
@@ -1963,7 +1986,7 @@ pub fn reach_capture_copy<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, sc
         if !done {
             let mut last = Vec::new_in(Global);
             last.extend(hole);
-            return Err(rounds_fail(r, owner, "whether a closure's capture is `Copy`", made, last));
+            return Err(rounds_fail(r, owner, "whether a closure's capture is `Copy`", made, MOST_ROUNDS, last));
         }
     }
     Ok(())
@@ -2045,6 +2068,7 @@ pub(super) enum MakeFail {
     Tables(TablesReadError),
     Question(ImplQuestionError),
     Const(LibKey, ConstFail),
+    Hidden(super::opaque_auto::HiddenFail),
 }
 
 impl From<AdmitError> for MakeFail {
@@ -2064,6 +2088,7 @@ impl MakeFail {
             MakeFail::Tables(error) => CheckFail::Tables { owner, error },
             MakeFail::Question(error) => CheckFail::ImplQuestion { owner, error },
             MakeFail::Const(key, error) => CheckFail::Const { owner, key, shown: lib_shown(r, key), error: Box::new_in(error, Global) },
+            MakeFail::Hidden(error) => super::opaque_auto::gap(owner, error),
         }
     }
 }
@@ -2277,6 +2302,7 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
         }
         Fill::InferredOutput(_) => Ok(()),
         Fill::ConstHolds(cond, digest) => eval_where_const(r, cond, digest),
+        Fill::DefineOpaque(opaque) => super::opaque_auto::define_for_reveal(r, opaque).map_err(MakeFail::Hidden),
     }
 }
 
@@ -2630,4 +2656,40 @@ fn refused_derive_words(row: &blaze_scope::names_record::FailedRow<'_>) -> Box<s
         row.path, row.file, row.why
     )
     .into_boxed_str()
+}
+
+#[cfg(test)]
+mod round_cap_tests {
+    use super::{MOST_PROGRESS_ROUNDS, MOST_ROUNDS, MOST_STALLED_ROUNDS, RoundHoles};
+    use blaze_typeck::{ItemKey, Question};
+
+    #[test]
+    fn round_holes_distinguishes_progress_from_stalled_loops() {
+        let mut progressing = RoundHoles::new();
+        let mut stalled_rounds = 0u32;
+        for r in 0..500u32 {
+            let new = progressing.round(r, &[Question::FnSig(ItemKey(u128::from(r) + 1))]);
+            assert_eq!(new, 1, "each new hole in round {r} counts as forward progress");
+            stalled_rounds = 0;
+        }
+        assert_eq!(stalled_rounds, 0);
+        assert!(500 > MOST_ROUNDS && 500 < MOST_PROGRESS_ROUNDS);
+
+        let mut stuck = RoundHoles::new();
+        let mut stuck_rounds = 0u32;
+        let mut stopped_at = None;
+        for r in 0..MOST_PROGRESS_ROUNDS {
+            let new = stuck.round(r, &[Question::FnSig(ItemKey(42))]);
+            if new > 0 {
+                stuck_rounds = 0;
+            } else {
+                stuck_rounds += 1;
+            }
+            if r + 1 >= MOST_ROUNDS && stuck_rounds >= MOST_STALLED_ROUNDS {
+                stopped_at = Some(r + 1);
+                break;
+            }
+        }
+        assert_eq!(stopped_at, Some(MOST_ROUNDS), "a stuck loop stops right at MOST_ROUNDS");
+    }
 }
