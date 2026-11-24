@@ -52,7 +52,7 @@ pub mod vectorize;
 pub use amac::{AmacOpts, AmacOutput, AmacStats, interleave_amac_loops};
 pub use bce::{BceOutput, BceStats, eliminate_redundant_checks};
 pub use bce_hoist::{BceHoistOpts, BceHoistOutput, BceHoistStats, hoist_loop_bounds_checks};
-pub use coldsplit::{ColdSplitOutput, ColdSplitStats, partition_cold_blocks};
+pub use coldsplit::{ColdSplitOutput, ColdSplitStats, RpoOrderOutput, partition_cold_blocks, reorder_blocks_rpo};
 pub use coro_opt::{
     CoroFramePlan, CoroFrameSlot, CoroFrameStats, CoroFuseOutput, CoroFuseStats, fuse_nested_coroutines,
     pack_coroutine_frame_colored,

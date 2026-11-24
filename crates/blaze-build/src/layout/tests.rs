@@ -1041,3 +1041,47 @@ fn record_and_union_layouts() {
         assert_eq!(permits(check, ty, &mut ls, &mut cx).unwrap(), want, "{check:?} of union type {}", ty.0);
     }
 }
+
+/// Regression test for structural `Unsize` prefix-offset preservation (`core::array::iter::PolymorphicIter`):
+/// a generic struct whose last field may be unsized (`struct S<T: ?Sized> { alive: (u64, u64), data: T }`)
+/// must keep its tail field last even when instantiated with a higher-alignment sized type (such as
+/// `[u128; 2]`, align 16) so `&S<[u128; 2]>` and `&S<[u128]>` place `alive` at the exact same offset.
+#[test]
+fn unsizable_generic_tail_preserves_prefix_offsets_when_instantiated_with_high_align_sized_type() {
+    let mut w = World::default();
+    let mut g = G::new();
+    let h = blaze_own::testing::heap();
+    let mut ls = Layouts::new_in(h.alloc());
+
+    // `struct Poly<DATA: ?Sized> { start: u64, end: u64, data: DATA }`
+    let poly = w.strukt(1, &[F::Leaf(U64), F::Leaf(U64), F::P(0)], ReprAttrs::RUST);
+    // Nested wrapper: `struct Outer<T: ?Sized> { tag: u8, inner: Poly<T> }`
+    let outer = w.strukt(1, &[F::Leaf(U8), F::AdtP(poly, 0)], ReprAttrs::RUST);
+
+    let u128_ty = g.n(PNode::Uint(UintTy::U128));
+    let usize_ty = g.n(PNode::Uint(UintTy::Usize));
+    let two = g.n(PNode::ConstValue { ty: usize_ty, bits: 2 });
+    let arr_u128 = g.n(PNode::Array(u128_ty, two));
+    let slice_u128 = g.n(PNode::Slice(u128_ty));
+
+    let poly_sized_ty = g.adt(poly, &[arr_u128]);
+    let poly_unsized_ty = g.adt(poly, &[slice_u128]);
+    let poly_sized = lay(&w, &mut g, &mut ls, poly_sized_ty).unwrap();
+    let poly_unsized = lay(&w, &mut g, &mut ls, poly_unsized_ty).unwrap();
+
+    assert_eq!(ls.field_offset(poly_sized, 0), Some(0), "start stays at 0 in sized Poly<[u128; 2]>");
+    assert_eq!(ls.field_offset(poly_sized, 1), Some(8), "end stays at 8 in sized Poly<[u128; 2]>");
+    assert_eq!(ls.field_offset(poly_sized, 2), Some(16), "data stays last at 16 in sized Poly<[u128; 2]>");
+    assert_eq!(ls.field_offset(poly_sized, 0), ls.field_offset(poly_unsized, 0));
+    assert_eq!(ls.field_offset(poly_sized, 1), ls.field_offset(poly_unsized, 1));
+    assert_eq!(ls.field_offset(poly_sized, 2), ls.field_offset(poly_unsized, 2));
+
+    let outer_sized_ty = g.adt(outer, &[arr_u128]);
+    let outer_unsized_ty = g.adt(outer, &[slice_u128]);
+    let outer_sized = lay(&w, &mut g, &mut ls, outer_sized_ty).unwrap();
+    let outer_unsized = lay(&w, &mut g, &mut ls, outer_unsized_ty).unwrap();
+    assert_eq!(ls.field_offset(outer_sized, 0), Some(0), "tag stays at 0 in sized Outer<[u128; 2]>");
+    assert_eq!(ls.field_offset(outer_sized, 1), Some(16), "inner stays last at 16 in sized Outer<[u128; 2]>");
+    assert_eq!(ls.field_offset(outer_sized, 0), ls.field_offset(outer_unsized, 0));
+    assert_eq!(ls.field_offset(outer_sized, 1), ls.field_offset(outer_unsized, 1));
+}

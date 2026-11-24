@@ -42,6 +42,15 @@ pub struct ColdSplitOutput<A: Allocator> {
     pub stats: ColdSplitStats,
 }
 
+/// Output of [`reorder_blocks_rpo`] when the input CFG was not already dominator-ordered.
+#[derive(Debug)]
+pub struct RpoOrderOutput<A: Allocator> {
+    pub func: Func<A>,
+    /// Maps each instruction index in `func` back to its original instruction index in the input
+    /// view (useful for remapping per-callsite tables such as IPRA `call_clobbers`).
+    pub old_inst_of_new: Vec<usize, A>,
+}
+
 #[inline]
 fn to_idx(v: u32) -> usize {
     usize::try_from(v).unwrap_or(usize::MAX)
@@ -358,21 +367,28 @@ pub fn partition_cold_blocks<A: Allocator + Copy>(
 
     // Step 3: Build partitioned layout order: all hot blocks in original relative order
     // (entry block `0` always first), followed by all cold blocks in original relative order.
+    // If that order is not dominator-respecting (every reachable non-entry block must have at
+    // least one reachable predecessor placed strictly earlier), fall back to hot-first DFS RPO
+    // so downstream linear-interval register allocation and back-edge analyses remain sound.
     let mut order: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
-    let mut out_is_cold: Vec<bool, A> = Vec::with_capacity_in(blocks, alloc);
     for b in 0..blocks {
         if !at(&cold, b, false) {
             order.push(b);
-            out_is_cold.push(false);
         }
     }
     let mut cold_count = 0u32;
     for b in 0..blocks {
         if at(&cold, b, false) {
             order.push(b);
-            out_is_cold.push(true);
             cold_count += 1;
         }
+    }
+    if !is_order_dominator_valid(blocks, &succs, &order, alloc) {
+        order = compute_hot_first_rpo(blocks, &succs, &cold, alloc);
+    }
+    let mut out_is_cold: Vec<bool, A> = Vec::with_capacity_in(blocks, alloc);
+    for &old_b in order.iter() {
+        out_is_cold.push(at(&cold, old_b, false));
     }
 
     let mut new_block = filled(blocks, NONE, &alloc);
@@ -444,6 +460,209 @@ pub fn partition_cold_blocks<A: Allocator + Copy>(
     }
     verify(func.view()).map_err(SimplifyError::Verify)?;
     Ok(ColdSplitOutput { func, is_cold: out_is_cold, stats })
+}
+
+/// Checks whether `order` (a permutation of `0..blocks` with `order[0] == 0`) is dominator-ordered:
+/// every reachable block `b != 0` has at least one reachable predecessor placed strictly earlier
+/// in `order`, and every reachable block precedes any unreachable block.
+///
+/// Proof: if `u` strictly dominates reachable `v` with `pos[v] < pos[u]`, let `w` be the block
+/// strictly dominated by `u` with minimum `pos[w]`; its reachable predecessor `p` with
+/// `pos[p] < pos[w]` must also be dominated by `u` (and `p != u` since `pos[p] < pos[w] < pos[u]`),
+/// contradicting minimality of `w`.
+fn is_order_dominator_valid<A: Allocator + Copy>(
+    blocks: usize,
+    succs: &[Vec<u32, A>],
+    order: &[usize],
+    alloc: A,
+) -> bool {
+    if blocks <= 1 {
+        return true;
+    }
+    if order.first().copied() != Some(0) || order.len() != blocks {
+        return false;
+    }
+    let mut pos = filled(blocks, NONE, &alloc);
+    for (p, &b) in order.iter().enumerate() {
+        set_at(&mut pos, b, u32_of(p));
+    }
+    // Mark blocks reachable from entry block `0` via iterative DFS.
+    let mut reachable = filled(blocks, false, &alloc);
+    let mut stack: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
+    set_at(&mut reachable, 0, true);
+    stack.push(0);
+    while let Some(b) = stack.pop() {
+        if let Some(sb) = succs.get(b) {
+            for &s in sb.iter() {
+                let si = to_idx(s);
+                if !at(&reachable, si, true) {
+                    set_at(&mut reachable, si, true);
+                    stack.push(si);
+                }
+            }
+        }
+    }
+    let mut has_earlier_pred = filled(blocks, false, &alloc);
+    set_at(&mut has_earlier_pred, 0, true);
+    for b in 0..blocks {
+        if !at(&reachable, b, false) {
+            continue;
+        }
+        let pb = at(&pos, b, NONE);
+        if let Some(sb) = succs.get(b) {
+            for &s in sb.iter() {
+                let si = to_idx(s);
+                if pb < at(&pos, si, 0) {
+                    set_at(&mut has_earlier_pred, si, true);
+                }
+            }
+        }
+    }
+    for b in 1..blocks {
+        if at(&reachable, b, false) && !at(&has_earlier_pred, b, false) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Computes a deterministic, iterative hot-first Reverse Post-Order (RPO) over `0..blocks`.
+///
+/// Cold successors are explored first in post-order so they land last in RPO while strictly
+/// preserving dominator-before-dominated ordering for all reachable blocks (and any unreachable
+/// components appended at the tail).
+fn compute_hot_first_rpo<A: Allocator + Copy>(
+    blocks: usize,
+    succs: &[Vec<u32, A>],
+    is_cold: &[bool],
+    alloc: A,
+) -> Vec<usize, A> {
+    let mut visited = filled(blocks, false, &alloc);
+    let mut post: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
+    let mut stack: Vec<(usize, bool), A> = Vec::with_capacity_in(blocks, alloc);
+    let mut rpo: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
+
+    for root in 0..blocks {
+        if at(&visited, root, true) {
+            continue;
+        }
+        post.clear();
+        set_at(&mut visited, root, true);
+        stack.push((root, false));
+        while let Some((b, done)) = stack.pop() {
+            if done {
+                post.push(b);
+                continue;
+            }
+            stack.push((b, true));
+            if let Some(sb) = succs.get(b) {
+                // LIFO stack: items pushed earlier are popped later, finish later in post-order,
+                // and therefore appear EARLIER in RPO. Push hot successors first (in edge order),
+                // then cold successors (in edge order) so cold blocks finish first and sink last.
+                for &s in sb.iter() {
+                    let si = to_idx(s);
+                    if !at(is_cold, si, false) && !at(&visited, si, true) {
+                        set_at(&mut visited, si, true);
+                        stack.push((si, false));
+                    }
+                }
+                for &s in sb.iter() {
+                    let si = to_idx(s);
+                    if at(is_cold, si, false) && !at(&visited, si, true) {
+                        set_at(&mut visited, si, true);
+                        stack.push((si, false));
+                    }
+                }
+            }
+        }
+        for &b in post.iter().rev() {
+            rpo.push(b);
+        }
+    }
+    rpo
+}
+
+/// Ensures basic blocks are in dominator-respecting order (`def_block <= use_block` for every
+/// reachable block and `target <= src` for every natural loop back-edge).
+///
+/// Fast-paths to `Ok(None)` in O(V+E) with zero function copying when `view` is already
+/// dominator-ordered; otherwise rewrites `view` into deterministic hot-first DFS RPO.
+pub fn reorder_blocks_rpo<A: Allocator + Copy>(
+    view: View<'_>,
+    alloc: A,
+) -> Result<Option<RpoOrderOutput<A>>, SimplifyError> {
+    let blocks = view.blocks();
+    let len = view.len();
+    if blocks <= 1 {
+        return Ok(None);
+    }
+
+    let mut succs: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(blocks, alloc);
+    let mut is_cold = filled(blocks, false, &alloc);
+    let mut identity: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
+    for b in 0..blocks {
+        succs.push(Vec::new_in(alloc));
+        identity.push(b);
+        let blk = Block(u32_of(b));
+        if b > 0 && view.block_kind(blk) != BlockKind::Normal {
+            set_at(&mut is_cold, b, true);
+        }
+    }
+    for b in 0..blocks {
+        let term = view.terminator(Block(u32_of(b)));
+        each(&view, term, |item| {
+            if let Item::Edge(edge) = item
+                && let Some(sb) = succs.get_mut(b)
+                && sb.scan_for(&edge.block).is_none()
+            {
+                sb.push(edge.block);
+            }
+        });
+    }
+
+    if is_order_dominator_valid(blocks, &succs, &identity, alloc) {
+        return Ok(None);
+    }
+
+    let order = compute_hot_first_rpo(blocks, &succs, &is_cold, alloc);
+    let mut new_block = filled(blocks, NONE, &alloc);
+    let mut new_inst = filled(len, NONE, &alloc);
+    let mut old_inst_of_new: Vec<usize, A> = Vec::with_capacity_in(len, alloc);
+    let mut next_inst = 0u32;
+    for (new_b, &old_b) in order.iter().enumerate() {
+        set_at(&mut new_block, old_b, u32_of(new_b));
+        for inst in view.block(Block(u32_of(old_b))) {
+            set_at(&mut new_inst, inst, next_inst);
+            old_inst_of_new.push(inst);
+            next_inst += 1;
+        }
+    }
+
+    let mut func = view.to_func_in(alloc);
+    func.ops.clear();
+    func.flags.clear();
+    func.tys.clear();
+    func.data.clear();
+    func.extra.clear();
+    func.attrs.clear();
+    func.locs.clear();
+    func.block_starts.clear();
+    func.block_kinds.clear();
+
+    for &old_b in order.iter() {
+        func.block_starts.push(u32_of(func.ops.len()));
+        let old_blk = Block(u32_of(old_b));
+        func.block_kinds.push(block_kind_byte(view.block_kind(old_blk)));
+        for inst in view.block(old_blk) {
+            copy_remapped(&view, inst, &new_inst, &new_block, &mut func)?;
+        }
+    }
+
+    if u32::try_from(func.ops.len()).is_err() || u32::try_from(func.extra.len()).is_err() {
+        return Err(SimplifyError::Refused { inst: 0, what: "an output past LIR's columns" });
+    }
+    verify(func.view()).map_err(SimplifyError::Verify)?;
+    Ok(Some(RpoOrderOutput { func, old_inst_of_new }))
 }
 
 #[cfg(test)]
@@ -677,5 +896,67 @@ mod tests {
         let part_t = eval::run_in(split.func.view(), &[Val::Int(1), Val::Int(1)], 10_000, TestHeap).unwrap();
         assert_eq!(orig_t, part_t);
         assert!(matches!(part_t, Outcome::Trapped(Trap::Code(7))));
+    }
+
+    #[test]
+    fn reorder_blocks_rpo_canonicalizes_inverted_loop_and_fast_paths_valid_cfg() {
+        // Non-RPO CFG produced when jump-threading folds a loop entry directly into the body:
+        //   block0 -> block2(0)
+        //   block1 (latch, BEFORE header!): cmp(v7 < 4) ? block2(v7) : block4
+        //   block2 (header, AFTER latch!):  param v5; uadd_overflow(v5, 1) -> v7; br ovf ? block3 : block1
+        //   block3: trap 1
+        //   block4: ret v5
+        let src = "\
+func ptr64 sig s0 attrs [] features \"\"
+type t0 = {i64, i1}
+sig s0 = c () -> (i64)
+block0 normal:
+  v0 = iconst i64 0
+  v1 = iconst i64 4
+  v2 = iconst i64 1
+  jump block2(v0)
+block1 normal:
+  v4 = icmp i1 ult, v8, v1
+  br v4, block2(v8), block4()
+block2 normal:
+  v6 = param i64
+  v7 = uadd_overflow t0 v6, v2
+  v8 = project i64 v7, 0
+  v9 = project i1 v7, 1
+  br v9, block3(), block1()
+block3 normal:
+  trap 1
+block4 normal:
+  return (v6)
+";
+        let func = crate::parse::parse(src).expect("parses non-RPO LIR");
+        verify(func.view()).expect("valid SSA CFG despite non-RPO block order");
+        assert!(matches!(
+            eval::run_in(func.view(), &[], 10_000, TestHeap).unwrap(),
+            Outcome::Returned(ref v) if v.as_slice() == [Val::Int(3)]
+        ));
+
+        let reordered = reorder_blocks_rpo(func.view(), TestHeap)
+            .expect("reorder succeeds")
+            .expect("non-RPO CFG must be reordered");
+        assert!(matches!(
+            eval::run_in(reordered.func.view(), &[], 10_000, TestHeap).unwrap(),
+            Outcome::Returned(ref v) if v.as_slice() == [Val::Int(3)]
+        ));
+        // Once canonicalized into RPO, a second call fast-paths to `Ok(None)`.
+        assert!(
+            reorder_blocks_rpo(reordered.func.view(), TestHeap).unwrap().is_none(),
+            "already dominator-ordered CFG must fast-path to Ok(None)"
+        );
+        // Also verify `partition_cold_blocks` on the non-RPO input produces dominator-ordered output.
+        let split = partition_cold_blocks(func.view(), |_| false, TestHeap).unwrap();
+        assert!(
+            reorder_blocks_rpo(split.func.view(), TestHeap).unwrap().is_none(),
+            "partition_cold_blocks must preserve dominator-first block order"
+        );
+        assert!(matches!(
+            eval::run_in(split.func.view(), &[], 10_000, TestHeap).unwrap(),
+            Outcome::Returned(ref v) if v.as_slice() == [Val::Int(3)]
+        ));
     }
 }

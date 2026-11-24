@@ -823,6 +823,10 @@ pub(crate) fn emit_sota_x64<'a>(
     let has_avx512 = features & blaze_tier::Machine::AVX512 != 0;
     check_x64_subset(&view, has_fma, has_avx2, has_avx512)?;
 
+    // Canonicalize into dominator-respecting RPO order before linear-interval register allocation.
+    let rpo_owned = blaze_lir::coldsplit::reorder_blocks_rpo(view, alloc).ok().flatten();
+    let view = rpo_owned.as_ref().map_or(view, |r| r.func.view());
+
     let len = view.len();
     let uses_sdot_ymm = has_avx2
         && (0..len).any(|i| {
