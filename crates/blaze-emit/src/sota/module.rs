@@ -23,16 +23,24 @@ use blaze_code::record::Symbol;
 use blaze_lir::{
     Op, Verified, View,
     body::{Bodies, BodyId, DatumId, Target},
-    func::{Func, RefId, RefKind},
+    func::{FnAttrs, Func, RefId, RefKind},
     inline::{InlinePolicy, SiteWeights},
     lto::{ModuleBody, OptimizedBody, lto_optimize_module, tarjan_sccs},
     superopt::SuperoptOpts,
     verify,
 };
 use blaze_own::{Alloc, Vec};
-use blaze_tier::{Arch, CallClobbers, Emitted, Machine, Named, Names, Outside, RoutinePlaces, Tier, TierError, TierName};
+use blaze_tier::{
+    Arch, CallClobbers, Emitted, Machine, Named, Names, Outside, RegSet, RoutinePlaces, Tier,
+    TierError, TierName,
+};
 
-use super::{CallMode, Sota, isel, optimize_sota_midend};
+use super::{
+    CallMode, Sota,
+    abi::{AbiFnInput, ZeroAbiOpts, ZeroAbiStats, plan_module_abi},
+    bolt::{BoltCallEdge, BoltFn, BoltLayoutStats, BoltOpts, PlacedFn, pack_module_pages},
+    isel, optimize_sota_midend,
+};
 
 /// One input function in a whole-program / crate SOTA compilation batch.
 #[derive(Clone, Copy)]
@@ -112,6 +120,9 @@ pub struct SotaModuleOut<'a> {
     pub scc_count: usize,
     pub total_inlined_bodies: usize,
     pub ipra_calls_narrowed: usize,
+    pub abi_stats: ZeroAbiStats,
+    pub bolt_layout: BoltLayoutStats,
+    pub page_order: Vec<PlacedFn, Alloc<'a>>,
 }
 
 /// [`Bodies`] view over the original input slice of [`ModuleFn`], resolving `RefKind::Func`
@@ -485,11 +496,165 @@ pub fn compile_module_a64<'a, 'f, F: Tier>(
         })?;
         functions.push(compiled_fn);
     }
+
+    // 5. Whole-module Zero-ABI planning (internal fast ABI, cold `preserve_all`, global SCC
+    //    pointer pinning, and caller-pressure register-avoidance ordering from post-inline LIR
+    //    and bottom-up IPRA `clobbers`).
+    let mut in_degree: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(n, alloc);
+    let mut address_taken: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(n, alloc);
+    for _ in 0..n {
+        in_degree.push(0);
+        address_taken.push(false);
+    }
+    let mut callees_per_fn: Vec<Vec<usize, Alloc<'a>>, Alloc<'a>> = Vec::with_capacity_in(n, alloc);
+    for caller in 0..n {
+        let start = adj_offsets.get(caller).copied().and_then(|v| usize::try_from(v).ok()).unwrap_or(0);
+        let end = adj_offsets.get(caller + 1).copied().and_then(|v| usize::try_from(v).ok()).unwrap_or(start);
+        let mut row: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(end.saturating_sub(start), alloc);
+        for &callee_u32 in adj.get(start..end).unwrap_or(&[]) {
+            if let Ok(cidx) = usize::try_from(callee_u32)
+                && cidx < n
+            {
+                row.push(cidx);
+                if let Some(deg) = in_degree.get_mut(cidx) {
+                    *deg += 1;
+                }
+            }
+        }
+        callees_per_fn.push(row);
+    }
+    for (idx, opt_func) in opt_funcs.iter().enumerate() {
+        let names = ImportedNames {
+            body_idx: idx,
+            fns,
+            lto_bodies: &lto.bodies,
+            by_sym: &input_bodies.by_sym,
+        };
+        let view = opt_func.view();
+        for inst in 0..view.len() {
+            if view.op(inst) == Op::FuncAddr
+                && let Some(&ref_word) = view.data.get(inst)
+                && let Some(r) = view.refs.get(RefId(ref_word).index())
+                && RefKind::from_word(r.kind) == Some(RefKind::Func)
+                && let Some(Named::Symbol(sym)) = names.name(Outside::Func(r.place))
+                && let Some(target_idx) = input_bodies.find_idx(sym.0)
+                && let Some(slot) = address_taken.get_mut(target_idx)
+            {
+                *slot = true;
+            }
+        }
+        for reloc in view.data_relocs {
+            if let Some(r) = view.refs.get(RefId(reloc.target).index())
+                && RefKind::from_word(r.kind) == Some(RefKind::Func)
+                && let Some(Named::Symbol(sym)) = names.name(Outside::Func(r.place))
+                && let Some(target_idx) = input_bodies.find_idx(sym.0)
+                && let Some(slot) = address_taken.get_mut(target_idx)
+            {
+                *slot = true;
+            }
+        }
+    }
+    const EMPTY_CALLEES: &[usize] = &[];
+    let mut abi_inputs: Vec<AbiFnInput<'_>, Alloc<'a>> = Vec::with_capacity_in(n, alloc);
+    for idx in 0..n {
+        let Some(opt_func) = opt_funcs.get(idx) else {
+            break;
+        };
+        let view = opt_func.view();
+        let is_exported = in_degree.get(idx).copied().unwrap_or(0) == 0;
+        let is_addr_taken = address_taken.get(idx).copied().unwrap_or(false);
+        let is_cold = (view.head.attrs & FnAttrs::COLD) != 0;
+        let direct_callees = callees_per_fn.get(idx).map_or(EMPTY_CALLEES, Vec::as_slice);
+        let clob = known_clobbers.get(idx).and_then(|c| *c).unwrap_or(CallClobbers::C_ABI_ARM64);
+        let caller_live_pressure_gprs = RegSet(clob.clobbered.0 & 0x0000_0000_ffff_ffff);
+        let caller_live_pressure_fps = RegSet(clob.clobbered.0 & 0xffff_ffff_0000_0000);
+        abi_inputs.push(AbiFnInput {
+            view,
+            is_exported,
+            address_taken: is_addr_taken,
+            is_cold,
+            direct_callees,
+            caller_live_pressure_gprs,
+            caller_live_pressure_fps,
+        });
+    }
+    let abi_plan = plan_module_abi(&abi_inputs, ZeroAbiOpts::arm64_export(), alloc);
+    let abi_stats = abi_plan.stats;
+
+    // 6. 16 KB Apple Silicon BOLT page-exact layout & hot/cold section packing over the compiled
+    //    module's code sizes and post-inline weighted call graph.
+    let mut fn_weights: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(n, alloc);
+    for _ in 0..n {
+        fn_weights.push(1);
+    }
+    let mut bolt_edges: Vec<BoltCallEdge, Alloc<'a>> = Vec::with_capacity_in(adj.len(), alloc);
+    for (idx, opt_func) in opt_funcs.iter().enumerate() {
+        let Some(caller_fn) = fns.get(idx) else {
+            break;
+        };
+        let caller_id = BodyId(caller_fn.symbol.0);
+        let names = ImportedNames {
+            body_idx: idx,
+            fns,
+            lto_bodies: &lto.bodies,
+            by_sym: &input_bodies.by_sym,
+        };
+        let view = opt_func.view();
+        let caller_u32 = u32::try_from(idx).unwrap_or(u32::MAX);
+        for inst in 0..view.len() {
+            if let Some(callee_idx) = direct_callee_idx(view, inst, &names, &input_bodies)
+                && let Ok(callee_u32) = u32::try_from(callee_idx)
+            {
+                let site_u32 = u32::try_from(inst).unwrap_or(u32::MAX);
+                let w = weights.weight(caller_id, site_u32).max(1);
+                bolt_edges.push(BoltCallEdge {
+                    caller_idx: caller_u32,
+                    callee_idx: callee_u32,
+                    call_weight: w,
+                });
+                if let Some(cw) = fn_weights.get_mut(idx) {
+                    *cw = cw.saturating_add(w);
+                }
+                if let Some(tw) = fn_weights.get_mut(callee_idx) {
+                    *tw = tw.saturating_add(w);
+                }
+            }
+        }
+    }
+    let mut bolt_fns: Vec<BoltFn, Alloc<'a>> = Vec::with_capacity_in(n, alloc);
+    for (idx, compiled_fn) in functions.iter().enumerate() {
+        let is_cold = opt_funcs
+            .get(idx)
+            .is_some_and(|f| (f.view().head.attrs & FnAttrs::COLD) != 0);
+        let body_weight = if is_cold {
+            0
+        } else {
+            fn_weights.get(idx).copied().unwrap_or(1).max(1)
+        };
+        let id = u32::try_from(idx).unwrap_or(u32::MAX);
+        let code_bytes = u32::try_from(compiled_fn.emitted.code.len()).unwrap_or(u32::MAX);
+        bolt_fns.push(BoltFn {
+            id,
+            code_bytes,
+            body_weight,
+            is_cold,
+        });
+    }
+    let layout_plan = pack_module_pages(&bolt_fns, &bolt_edges, BoltOpts::apple_silicon(), alloc);
+    let bolt_layout = layout_plan.stats;
+    let mut page_order: Vec<PlacedFn, Alloc<'a>> =
+        Vec::with_capacity_in(layout_plan.hot_order.len() + layout_plan.cold_order.len(), alloc);
+    page_order.extend_from_slice(&layout_plan.hot_order);
+    page_order.extend_from_slice(&layout_plan.cold_order);
+
     Ok(SotaModuleOut {
         functions,
         scc_count: lto.scc_count,
         total_inlined_bodies: lto.total_inlined_bodies,
         ipra_calls_narrowed,
+        abi_stats,
+        bolt_layout,
+        page_order,
     })
 }
 
@@ -818,6 +983,144 @@ mod tests {
         assert!(
             !decode_words(&caller_out.emitted.code).any(|w| (w & 0x3b80_03e0) == 0x3900_03e0),
             "IPRA caller must emit zero stack spill loads/stores (`ldr`/`str [sp, #imm]`)"
+        );
+    }
+
+    #[test]
+    fn compile_module_a64_populates_zero_abi_and_bolt_16kb_layout() {
+        let alloc = test_alloc();
+        let sym_entry = Symbol::of_name("sota_mod_test::bolt_entry");
+        let sym_fast = Symbol::of_name("sota_mod_test::bolt_internal_fast");
+        let sym_cold = Symbol::of_name("sota_mod_test::bolt_cold_sink");
+
+        // 1. Internal non-inlined fast helper: fn(x: i64, y: i64) -> i64 { x * y + y }
+        let mut bf = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let fast_sig = bf.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        bf.set_signature(fast_sig);
+        bf.set_attrs(FnAttrs::default().with_inline(Inline::Never));
+        let f_entry = bf.create_block(BlockKind::Normal);
+        bf.begin(f_entry);
+        let fx = bf.param(Ty::I64);
+        let fy = bf.param(Ty::I64);
+        let fprod = bf.binary(Op::Mul, Flags::NONE, fx, fy);
+        let fres = bf.binary(Op::Add, Flags::NONE, fprod, fy);
+        bf.ret(&[fres]);
+        let func_fast = bf.finish_checked().expect("fast helper LIR builds");
+
+        // 2. Internal #[cold] #[inline(never)] sink: fn(x: i64) -> i64 { x ^ 42 }
+        let mut bcold = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let cold_sig = bcold.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        bcold.set_signature(cold_sig);
+        bcold.set_attrs(FnAttrs(FnAttrs::COLD).with_inline(Inline::Never));
+        let c_entry = bcold.create_block(BlockKind::Normal);
+        bcold.begin(c_entry);
+        let cx = bcold.param(Ty::I64);
+        let c42 = bcold.iconst(Ty::I64, 42);
+        let cres = bcold.binary(Op::Xor, Flags::NONE, cx, c42);
+        bcold.ret(&[cres]);
+        let func_cold = bcold.finish_checked().expect("cold sink LIR builds");
+
+        // 3. Exported entry dispatching to `fast` on hot path and `cold` on `a == 0`.
+        let mut be = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let entry_sig = be.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        let call_fast_sig = be.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        let call_cold_sig = be.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        be.set_signature(entry_sig);
+        let fast_ref = be.reference(RefKind::Func, 0);
+        let cold_ref = be.reference(RefKind::Func, 1);
+        let e_entry = be.create_block(BlockKind::Normal);
+        let e_cold = be.create_block(BlockKind::Cold);
+        let e_hot = be.create_block(BlockKind::Normal);
+
+        be.begin(e_entry);
+        let ea = be.param(Ty::I64);
+        let eb = be.param(Ty::I64);
+        let zero = be.iconst(Ty::I64, 0);
+        let is_zero = be.icmp(IntCond::Eq, ea, zero);
+        be.br(Flags::NONE, is_zero, (e_cold, &[]), (e_hot, &[]));
+
+        be.begin(e_cold);
+        let cold_r = be.call(Flags::NONE, cold_ref, call_cold_sig, &[eb]);
+        be.ret(&[cold_r]);
+
+        be.begin(e_hot);
+        let hot_r = be.call(Flags::NONE, fast_ref, call_fast_sig, &[ea, eb]);
+        be.ret(&[hot_r]);
+        let func_entry = be.finish_checked().expect("entry LIR builds");
+
+        let no_names = TableNames(&[]);
+        let entry_names = TableNames(&[(0, sym_fast), (1, sym_cold)]);
+        let fns = [
+            ModuleFn {
+                symbol: sym_entry,
+                func: verify(func_entry.view()).expect("entry verifies"),
+                names: &entry_names,
+            },
+            ModuleFn {
+                symbol: sym_fast,
+                func: verify(func_fast.view()).expect("fast helper verifies"),
+                names: &no_names,
+            },
+            ModuleFn {
+                symbol: sym_cold,
+                func: verify(func_cold.view()).expect("cold sink verifies"),
+                names: &no_names,
+            },
+        ];
+
+        let opts = SotaModuleOpts::for_export(MAC_ARM64);
+        let out = compile_module_a64(&fns, &NoWeights, opts, Option::<&crate::Reference>::None, alloc)
+            .expect("module compilation with Zero-ABI + BOLT succeeds");
+
+        assert_eq!(out.functions.len(), 3);
+        assert!(
+            out.abi_stats.internal_fast_fns > 0,
+            "expected internal non-exported helper to upgrade to InternalFast, got {:?}",
+            out.abi_stats
+        );
+        assert!(
+            out.abi_stats.cold_preserve_all_fns > 0,
+            "expected internal #[cold] sink to upgrade to ColdPreserveAll, got {:?}",
+            out.abi_stats
+        );
+        assert!(
+            out.bolt_layout.hot_pages >= 1,
+            "expected at least 1 hot 16 KB page, got {:?}",
+            out.bolt_layout
+        );
+        assert!(
+            out.bolt_layout.cold_pages >= 1,
+            "expected cold sink packed onto a dedicated 16 KB .text.cold page, got {:?}",
+            out.bolt_layout
+        );
+        assert_eq!(
+            out.page_order.len(),
+            out.functions.len(),
+            "page_order must place every compiled module function"
+        );
+        let cold_placed = out
+            .page_order
+            .iter()
+            .find(|p| p.fn_idx == 2)
+            .expect("cold sink present in page_order");
+        assert!(
+            cold_placed.page_index >= out.bolt_layout.hot_pages,
+            "cold sink must reside strictly after hot pages"
         );
     }
 }

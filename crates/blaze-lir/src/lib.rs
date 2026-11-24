@@ -98,8 +98,9 @@ pub use op::{End, Field, Info, Layout, Op, Operands, Res};
 pub use parse::{ParseError, parse};
 pub use print::print;
 pub use simplify::{
-    amac, bce, coldsplit, coro_opt, devirt, egraph, escape, gemm, ifconv, loopnest, mach_egraph, memopt, modulo_sched,
-    prefetch, rvsdg, sched, semproof, simd_idioms, slp, soa, speculate, superopt, taildup, unroll, unswitch, vectorize,
+    amac, bce, bce_hoist, coldsplit, coro_opt, devirt, egraph, escape, gemm, ifconv, loopnest, mach_egraph, memopt,
+    modulo_sched, prefetch, rvsdg, sched, semproof, simd_idioms, slp, soa, speculate, superopt, taildup, unroll,
+    unswitch, vectorize,
 };
 #[cfg(any(test, feature = "eval"))]
 pub use simplify::validate;

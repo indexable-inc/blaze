@@ -1079,10 +1079,114 @@ pub(crate) fn pshufb_xmm<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg, idx: XRe
 }
 
 /// AVX2 `vpshufb dst, tbl, idx` (16B/32B non-destructive vectorized LUT: `VEX.{128,256}.66.0F38.W0 00 /r`).
-#[allow(dead_code)]
 pub(crate) fn avx2_vpshufb<A: Allocator>(buf: &mut Vec<u8, A>, l256: bool, dst: XReg, tbl: XReg, idx: XReg) {
     emit_vex3(buf, false, dst, 0, idx, 2, tbl, l256, 1);
     buf.extend_from_slice(&[0x00, modrm(3, dst, idx)]);
+}
+
+/// `prefetcht0 [base + disp]` (`[REX] 0F 18 /1`): L1 temporal cache prefetch.
+pub(crate) fn prefetcht0<A: Allocator>(buf: &mut Vec<u8, A>, base: XReg, disp: i32) {
+    emit_rex(buf, false, 0, 0, base);
+    buf.extend_from_slice(&[0x0f, 0x18]);
+    emit_mem_base_disp(buf, 1, base, disp);
+}
+
+/// AVX2 `vpshufb xmm_dst, xmm_src, xmm_mask` (`VEX.128.66.0F38.WIG 00 /r`): 16-byte parallel LUT.
+pub(crate) fn vpshufb_xmm<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg, src: XReg, mask: XReg) {
+    avx2_vpshufb(buf, false, dst, src, mask);
+}
+
+/// AVX2 `vpshufb ymm_dst, ymm_src, ymm_mask` (`VEX.256.66.0F38.WIG 00 /r`): 32-byte parallel LUT.
+#[allow(dead_code)]
+pub(crate) fn vpshufb_ymm<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg, src: XReg, mask: XReg) {
+    avx2_vpshufb(buf, true, dst, src, mask);
+}
+
+/// FMA3 `vfmadd231ps xmm_dst, xmm_src1, xmm_src2` (`VEX.128.66.0F38.W0 B8 /r`).
+pub(crate) fn vfmadd231ps_xmm<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg, src1: XReg, src2: XReg) {
+    fma3_vfmadd231_w(buf, false, false, true, dst, src1, src2);
+}
+
+/// FMA3 `vfmadd231pd xmm_dst, xmm_src1, xmm_src2` (`VEX.128.66.0F38.W1 B8 /r`).
+pub(crate) fn vfmadd231pd_xmm<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg, src1: XReg, src2: XReg) {
+    fma3_vfmadd231_w(buf, false, true, true, dst, src1, src2);
+}
+
+/// FMA3 `vfmadd231ps ymm_dst, ymm_src1, ymm_src2` (`VEX.256.66.0F38.W0 B8 /r`).
+pub(crate) fn vfmadd231ps_ymm<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg, src1: XReg, src2: XReg) {
+    fma3_vfmadd231_w(buf, true, false, true, dst, src1, src2);
+}
+
+/// FMA3 `vfmadd231pd ymm_dst, ymm_src1, ymm_src2` (`VEX.256.66.0F38.W1 B8 /r`).
+pub(crate) fn vfmadd231pd_ymm<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg, src1: XReg, src2: XReg) {
+    fma3_vfmadd231_w(buf, true, true, true, dst, src1, src2);
+}
+
+/// AVX2 `vpminsd dst, src1, src2` (`VEX.{128,256}.66.0F38.WIG 39 /r`).
+pub(crate) fn vpminsd<A: Allocator>(buf: &mut Vec<u8, A>, l256: bool, dst: XReg, src1: XReg, src2: XReg) {
+    avx_vec_int_0f38(buf, l256, 0x39, dst, src1, src2);
+}
+
+/// AVX2 `vpmaxsd dst, src1, src2` (`VEX.{128,256}.66.0F38.WIG 3D /r`).
+pub(crate) fn vpmaxsd<A: Allocator>(buf: &mut Vec<u8, A>, l256: bool, dst: XReg, src1: XReg, src2: XReg) {
+    avx_vec_int_0f38(buf, l256, 0x3d, dst, src1, src2);
+}
+
+/// AVX2 `vpminud dst, src1, src2` (`VEX.{128,256}.66.0F38.WIG 3B /r`).
+pub(crate) fn vpminud<A: Allocator>(buf: &mut Vec<u8, A>, l256: bool, dst: XReg, src1: XReg, src2: XReg) {
+    avx_vec_int_0f38(buf, l256, 0x3b, dst, src1, src2);
+}
+
+/// AVX2 `vpmaxud dst, src1, src2` (`VEX.{128,256}.66.0F38.WIG 3F /r`).
+pub(crate) fn vpmaxud<A: Allocator>(buf: &mut Vec<u8, A>, l256: bool, dst: XReg, src1: XReg, src2: XReg) {
+    avx_vec_int_0f38(buf, l256, 0x3f, dst, src1, src2);
+}
+
+/// AVX2 `vpmaddubsw xmm_dst, xmm_src1_u8, xmm_src2_i8` (`VEX.128.66.0F38.WIG 04 /r`).
+#[allow(dead_code)]
+pub(crate) fn vpmaddubsw_xmm<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg, src1: XReg, src2: XReg) {
+    avx_vec_int_0f38(buf, false, 0x04, dst, src1, src2);
+}
+
+/// AVX2 `vpmaddwd xmm_dst, xmm_src1, xmm_src2` (`VEX.128.66.0F.WIG F5 /r`).
+#[allow(dead_code)]
+pub(crate) fn vpmaddwd_xmm<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg, src1: XReg, src2: XReg) {
+    avx_vec_int_bin_w(buf, false, 0xf5, dst, src1, src2);
+}
+
+/// AVX2 `vpmaddwd ymm_dst, ymm_src1, ymm_src2` (`VEX.256.66.0F.WIG F5 /r`).
+pub(crate) fn vpmaddwd_ymm<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg, src1: XReg, src2: XReg) {
+    avx_vec_int_bin_w(buf, true, 0xf5, dst, src1, src2);
+}
+
+/// AVX2 `vpsignb xmm_dst, xmm_src1, xmm_src2` (`VEX.128.66.0F38.WIG 08 /r`).
+#[allow(dead_code)]
+pub(crate) fn vpsignb_xmm<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg, src1: XReg, src2: XReg) {
+    avx_vec_int_0f38(buf, false, 0x08, dst, src1, src2);
+}
+
+/// AVX2 `vpabsb xmm_dst, xmm_src` (`VEX.128.66.0F38.WIG 1C /r`).
+#[allow(dead_code)]
+pub(crate) fn vpabsb_xmm<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg, src: XReg) {
+    emit_vex3(buf, false, dst, 0, src, 2, 0, false, 1);
+    buf.extend_from_slice(&[0x1c, modrm(3, dst, src)]);
+}
+
+/// AVX2 `vpmovsxbw ymm_dst, xmm_src` (`VEX.256.66.0F38.WIG 20 /r`): sign-extends 16x `i8` -> 16x `i16`.
+pub(crate) fn vpmovsxbw_ymm<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg, src: XReg) {
+    emit_vex3(buf, false, dst, 0, src, 2, 0, true, 1);
+    buf.extend_from_slice(&[0x20, modrm(3, dst, src)]);
+}
+
+/// AVX2 `vpmovzxbw ymm_dst, xmm_src` (`VEX.256.66.0F38.WIG 30 /r`): zero-extends 16x `u8` -> 16x `i16`.
+pub(crate) fn vpmovzxbw_ymm<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg, src: XReg) {
+    emit_vex3(buf, false, dst, 0, src, 2, 0, true, 1);
+    buf.extend_from_slice(&[0x30, modrm(3, dst, src)]);
+}
+
+/// AVX2 `vphaddd xmm_dst, xmm_src1, xmm_src2` (`VEX.128.66.0F38.WIG 02 /r`): horizontal `i32` pair sum.
+pub(crate) fn vphaddd_xmm<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg, src1: XReg, src2: XReg) {
+    avx_vec_int_0f38(buf, false, 0x02, dst, src1, src2);
 }
 
 /// Emits a 4-byte EVEX prefix for 512-bit AVX-512 (`zmm0..zmm15`, `L'L = 10` = 512-bit, `opmask = 0`).
@@ -1168,4 +1272,160 @@ pub(crate) fn avx512_int_bin<A: Allocator>(
 pub(crate) fn avx512_vextracti64x4<A: Allocator>(buf: &mut Vec<u8, A>, dst_ymm: XReg, src_zmm: XReg, imm8: u8) {
     emit_evex512(buf, true, src_zmm, 0, dst_ymm, 3, 0, 1);
     buf.extend_from_slice(&[0x3b, modrm(3, src_zmm, dst_ymm), imm8]);
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_own::{Alloc, Vec};
+
+    use super::{
+        R8, RAX, RBP, RDI, RSP, prefetcht0, vfmadd231pd_xmm, vfmadd231pd_ymm, vfmadd231ps_xmm, vfmadd231ps_ymm,
+        vpabsb_xmm, vphaddd_xmm, vpmaddubsw_xmm, vpmaddwd_xmm, vpmaddwd_ymm, vpmaxsd, vpmaxud, vpminsd, vpminud,
+        vpmovsxbw_ymm, vpmovzxbw_ymm, vpshufb_xmm, vpshufb_ymm, vpsignb_xmm,
+    };
+
+    fn test_alloc() -> Alloc<'static> {
+        blaze_own::testing::heap().alloc()
+    }
+
+    #[test]
+    fn encodes_prefetcht0_addressing_modes() {
+        let alloc = test_alloc();
+        let mut buf: Vec<u8, Alloc<'static>> = Vec::new_in(alloc);
+
+        prefetcht0(&mut buf, RDI, 0);
+        assert_eq!(buf.as_slice(), &[0x0f, 0x18, 0x0f]);
+
+        buf.clear();
+        prefetcht0(&mut buf, RDI, 64);
+        assert_eq!(buf.as_slice(), &[0x0f, 0x18, 0x4f, 0x40]);
+
+        buf.clear();
+        prefetcht0(&mut buf, R8, 0);
+        assert_eq!(buf.as_slice(), &[0x41, 0x0f, 0x18, 0x08]);
+
+        buf.clear();
+        prefetcht0(&mut buf, RSP, 0);
+        assert_eq!(buf.as_slice(), &[0x0f, 0x18, 0x0c, 0x24]);
+
+        buf.clear();
+        prefetcht0(&mut buf, RBP, 0);
+        assert_eq!(buf.as_slice(), &[0x0f, 0x18, 0x4d, 0x00]);
+
+        buf.clear();
+        prefetcht0(&mut buf, RAX, 0x1234);
+        assert_eq!(buf.as_slice(), &[0x0f, 0x18, 0x88, 0x34, 0x12, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn encodes_vpshufb_xmm_and_ymm() {
+        let alloc = test_alloc();
+        let mut buf: Vec<u8, Alloc<'static>> = Vec::new_in(alloc);
+
+        vpshufb_xmm(&mut buf, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x71, 0x00, 0xc2]);
+
+        buf.clear();
+        vpshufb_ymm(&mut buf, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x75, 0x00, 0xc2]);
+
+        buf.clear();
+        vpshufb_xmm(&mut buf, 8, 9, 10);
+        assert_eq!(buf.as_slice(), &[0xc4, 0x42, 0x31, 0x00, 0xc2]);
+    }
+
+    #[test]
+    fn encodes_fma3_vfmadd231_128_and_256() {
+        let alloc = test_alloc();
+        let mut buf: Vec<u8, Alloc<'static>> = Vec::new_in(alloc);
+
+        vfmadd231ps_xmm(&mut buf, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x71, 0xb8, 0xc2]);
+
+        buf.clear();
+        vfmadd231pd_xmm(&mut buf, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0xf1, 0xb8, 0xc2]);
+
+        buf.clear();
+        vfmadd231ps_ymm(&mut buf, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x75, 0xb8, 0xc2]);
+
+        buf.clear();
+        vfmadd231pd_ymm(&mut buf, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0xf5, 0xb8, 0xc2]);
+
+        buf.clear();
+        vfmadd231pd_ymm(&mut buf, 11, 8, 9);
+        assert_eq!(buf.as_slice(), &[0xc4, 0x42, 0xbd, 0xb8, 0xd9]);
+    }
+
+    #[test]
+    fn encodes_vpmin_vpmax_i32_and_u32_128_and_256() {
+        let alloc = test_alloc();
+        let mut buf: Vec<u8, Alloc<'static>> = Vec::new_in(alloc);
+
+        vpminsd(&mut buf, false, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x71, 0x39, 0xc2]);
+        buf.clear();
+        vpminsd(&mut buf, true, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x75, 0x39, 0xc2]);
+
+        buf.clear();
+        vpmaxsd(&mut buf, false, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x71, 0x3d, 0xc2]);
+        buf.clear();
+        vpmaxsd(&mut buf, true, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x75, 0x3d, 0xc2]);
+
+        buf.clear();
+        vpminud(&mut buf, false, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x71, 0x3b, 0xc2]);
+        buf.clear();
+        vpminud(&mut buf, true, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x75, 0x3b, 0xc2]);
+
+        buf.clear();
+        vpmaxud(&mut buf, false, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x71, 0x3f, 0xc2]);
+        buf.clear();
+        vpmaxud(&mut buf, true, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x75, 0x3f, 0xc2]);
+    }
+
+    #[test]
+    fn encodes_dotprod_helpers() {
+        let alloc = test_alloc();
+        let mut buf: Vec<u8, Alloc<'static>> = Vec::new_in(alloc);
+
+        vpmaddubsw_xmm(&mut buf, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x71, 0x04, 0xc2]);
+
+        buf.clear();
+        vpmaddwd_xmm(&mut buf, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe1, 0x71, 0xf5, 0xc2]);
+
+        buf.clear();
+        vpmaddwd_ymm(&mut buf, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe1, 0x75, 0xf5, 0xc2]);
+
+        buf.clear();
+        vpsignb_xmm(&mut buf, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x71, 0x08, 0xc2]);
+
+        buf.clear();
+        vpabsb_xmm(&mut buf, 0, 1);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x79, 0x1c, 0xc1]);
+
+        buf.clear();
+        vpmovsxbw_ymm(&mut buf, 0, 1);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x7d, 0x20, 0xc1]);
+
+        buf.clear();
+        vpmovzxbw_ymm(&mut buf, 0, 1);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x7d, 0x30, 0xc1]);
+
+        buf.clear();
+        vphaddd_xmm(&mut buf, 0, 1, 2);
+        assert_eq!(buf.as_slice(), &[0xc4, 0xe2, 0x71, 0x02, 0xc2]);
+    }
 }

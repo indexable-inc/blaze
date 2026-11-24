@@ -16,6 +16,7 @@ use crate::{BuildError, VerifyError};
 
 pub mod amac;
 pub mod bce;
+pub mod bce_hoist;
 pub mod coldsplit;
 pub mod coro_opt;
 mod dce;
@@ -49,6 +50,7 @@ pub mod vectorize;
 
 pub use amac::{AmacOpts, AmacOutput, AmacStats, interleave_amac_loops};
 pub use bce::{BceOutput, BceStats, eliminate_redundant_checks};
+pub use bce_hoist::{BceHoistOpts, BceHoistOutput, BceHoistStats, hoist_loop_bounds_checks};
 pub use coldsplit::{ColdSplitOutput, ColdSplitStats, partition_cold_blocks};
 pub use coro_opt::{
     CoroFramePlan, CoroFrameSlot, CoroFrameStats, CoroFuseOutput, CoroFuseStats, fuse_nested_coroutines,

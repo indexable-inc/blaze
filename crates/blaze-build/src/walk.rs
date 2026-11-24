@@ -7,7 +7,7 @@ use core::alloc::Allocator;
 use std::alloc::Global;
 
 use blaze_lir::builder::{MemAttrs, Param, Variadic};
-use blaze_lir::func::{BlockKind, Conv, Ext, RefId, RefKind, SlotId, SlotKind};
+use blaze_lir::func::{BlockKind, Conv, Ext, ParamFactsRec, RefId, RefKind, SlotId, SlotKind};
 use blaze_lir::{Block, Builder, Flags, Full, IntCond, Op, Ty, Value};
 use blaze_code::record::{SUBJECT_SHOWN, Subject, TrapKind, TrapSource};
 use blaze_own::Alloc;
@@ -3034,6 +3034,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         };
         let mut reprs = Vec::with_capacity_in(sig.inputs.len(), self.alloc);
         let mut passes = Vec::with_capacity_in(sig.inputs.len(), self.alloc);
+        let mut ptr_facts: blaze_own::Vec<u8, A> = blaze_own::Vec::with_capacity_in(sig.inputs.len(), self.alloc);
         // "rust-call": the last parameter, a tuple, arrives as its fields (lib.rs `Abi`).
         let mut spread = Vec::new_in(self.alloc);
         for (i, &t) in sig.inputs.iter().enumerate() {
@@ -3044,9 +3045,11 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 spread = self.rust_call_fields(repr)?;
                 for &(_, frepr) in spread.iter() {
                     passes.push(self.rust_pass(frepr)?);
+                    ptr_facts.push(0);
                 }
             } else {
                 passes.push(self.pass(g, repr, abi, Some(owner))?);
+                ptr_facts.push(ptr_facts_for_rust_ty(self.ground.view(), g));
             }
         }
         // An `async fn` returns its coroutine, whatever its signature writes (coroutine.rs).
@@ -3061,8 +3064,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let tracked = kind == Kind::Body && self.own_tracked()?;
         if tracked {
             passes.push(track_caller::PASS);
+            ptr_facts.push(0);
         }
-        let (params, rets) = self.sig_of(&passes, self.ret_pass);
+        let (params, rets) = self.sig_of_with_ptr_facts(&passes, &ptr_facts, self.ret_pass);
         let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
         self.b.set_signature(own);
         self.mark_nounwind(owner, abi, kind == Kind::Body)?;
@@ -3351,6 +3355,18 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// pointer, C's `sret`), then each input's registers.
     fn sig_of(&self, inputs: &[Pass], ret: Pass) -> (Vec<Param, A>, Vec<Param, A>) {
         crate::abi::sig_of_in(inputs, ret, self.alloc)
+    }
+
+    /// The lowered signature of passes `inputs` and `ret` with per-input pointer facts
+    /// `ptr_facts`: a result pointer first (Rust's plain pointer, C's `sret`), then each input's
+    /// registers.
+    fn sig_of_with_ptr_facts(
+        &self,
+        inputs: &[Pass],
+        ptr_facts: &[u8],
+        ret: Pass,
+    ) -> (blaze_own::Vec<Param, A>, blaze_own::Vec<Param, A>) {
+        crate::abi::sig_of_with_ptr_facts_in(inputs, ptr_facts, ret, self.alloc)
     }
 
     /// The `size` (1 to 8) bytes at `at`, `start` bytes into a value aligned to `align`, as a
@@ -6890,5 +6906,50 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             self.work.push(Task::Eval(g));
         }
         Ok(())
+    }
+}
+
+/// Whether `node` is a primitive type with no interior mutability (`Freeze`, zero `UnsafeCell`).
+fn is_plain_freeze_prim(node: PNode) -> bool {
+    matches!(
+        node,
+        PNode::Bool
+            | PNode::Char
+            | PNode::Int(_)
+            | PNode::Uint(_)
+            | PNode::Float(_)
+            | PNode::Ptr(..)
+            | PNode::FnPtr(..)
+    )
+}
+
+/// [`ParamFactsRec`] bitmask implied by Rust's reference aliasing and non-null rules for a
+/// parameter of ground type `ty` (attached to the parameter's `Ty::PTR` register when lowering the
+/// function's own LIR signature).
+fn ptr_facts_for_rust_ty(ground: PTys<'_>, ty: PTy) -> u8 {
+    let Ok(node) = ground.node(ty) else {
+        return 0;
+    };
+    match node {
+        // Every `&mut T` / `&mut [T]` / `&mut dyn Trait` is unique and non-null, even if `T`
+        // contains `UnsafeCell`.
+        PNode::Ref(Mutbl::Mut, _) => ParamFactsRec::NOALIAS | ParamFactsRec::NONNULL,
+        // Every `&T` / `&[T]` / `&str` / `&dyn Trait` is non-null; when the pointee is a plain
+        // primitive, `str`, or slice/array of plain primitives (no `UnsafeCell`), it is also
+        // `noalias readonly` (matching `rustc_codegen_llvm`).
+        PNode::Ref(Mutbl::Not, inner) => {
+            let freeze_readonly = match ground.node(inner) {
+                Ok(PNode::Str) => true,
+                Ok(PNode::Slice(elem) | PNode::Array(elem, _)) => ground.node(elem).is_ok_and(is_plain_freeze_prim),
+                Ok(other) => is_plain_freeze_prim(other),
+                Err(_) => false,
+            };
+            if freeze_readonly {
+                ParamFactsRec::NOALIAS | ParamFactsRec::NONNULL | ParamFactsRec::READONLY
+            } else {
+                ParamFactsRec::NONNULL
+            }
+        }
+        _ => 0,
     }
 }

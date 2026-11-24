@@ -20,7 +20,7 @@ use crate::Allocator;
 use blaze_code::record::{OWN_RELRO, Space, Symbol, Target};
 use blaze_lir::{
     AtomicRmw, Block, Flags, FloatCond, IntCond, Op, Ordering, Ty, View,
-    func::{Conv, ParamKind, RefId, RefKind, SigId},
+    func::{Conv, IntrinsicId, ParamKind, RefId, RefKind, SigId},
 };
 use blaze_own::{Alloc, Vec};
 use blaze_tier::{Emitted, Named, Names, Outside, Reloc, RelocKind, TierError, TierName};
@@ -472,11 +472,12 @@ fn check_x64_subset(view: &View<'_>, has_fma: bool, has_avx2: bool, has_avx512: 
                 | Op::ReduceFadd
                 | Op::Call
                 | Op::CallIndirect
+                | Op::TargetIntrinsic
         );
         if !ok {
             return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: op.name() });
         }
-        if matches!(op, Op::Fma | Op::Fmuladd) && !has_fma {
+        if op == Op::Fma && !has_fma {
             return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "x86-64 FMA requires Machine::FMA" });
         }
         if mask_ty.is_some() {
@@ -506,17 +507,56 @@ fn check_x64_subset(view: &View<'_>, has_fma: bool, has_avx2: bool, has_avx512: 
                     Op::Param | Op::Load | Op::Splat | Op::Uninit | Op::Freeze => true,
                     Op::Add | Op::Sub | Op::And | Op::Or | Op::Xor => !vfp,
                     Op::Mul => !vfp && (vsize == 1 || (has_avx2 && vsize == 2)), // pmullw / vpmulld
+                    Op::Smin | Op::Smax | Op::Umin | Op::Umax => !vfp && has_avx2 && vsize <= 2,
                     Op::Fadd | Op::Fsub | Op::Fmul => vfp,
-                    Op::Fma | Op::Fmuladd => vfp && has_fma,
+                    Op::Fma => vfp && has_fma,
+                    Op::Fmuladd => vfp,
                     Op::Select => {
                         let at = to_idx(at_u32(view.data, inst));
                         is_vec_mask_ty(ty_at(view.tys, to_idx(at_u32(view.extra, at)))).is_some()
+                    }
+                    Op::TargetIntrinsic if vw == VecW::W128 && has_avx2 => {
+                        let at = to_idx(at_u32(view.data, inst));
+                        let name = view.intrinsic_name(IntrinsicId(at_u32(view.extra, at)));
+                        let argc = to_idx(at_u32(view.extra, at + 1));
+                        (name == b"blaze.neon.tbl16" && argc == 2 && !vfp && vsize == 0)
+                            || ((name == b"blaze.neon.sdot" || name == b"blaze.neon.udot")
+                                && argc == 3
+                                && !vfp
+                                && vsize == 2)
                     }
                     _ => false,
                 }
             };
             if !vok {
                 return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unsupported x86-64 vector op" });
+            }
+        }
+        if op == Op::TargetIntrinsic {
+            let at = to_idx(at_u32(view.data, inst));
+            let name = view.intrinsic_name(IntrinsicId(at_u32(view.extra, at)));
+            let argc = to_idx(at_u32(view.extra, at + 1));
+            let tok = if name == b"blaze.prefetch.r1" && argc == 1 && ty == Ty::NONE {
+                let arg_ty = ty_at(view.tys, to_idx(at_u32(view.extra, at + 2)));
+                is_supported_x64_scalar(arg_ty) && is_fp_ty(arg_ty).is_none() && arg_ty != Ty::NONE
+            } else if has_avx2 && name == b"blaze.neon.tbl16" && argc == 2 {
+                is_vec128_ty(ty) == Some((0, false))
+                    && is_vec128_ty(ty_at(view.tys, to_idx(at_u32(view.extra, at + 2)))) == Some((0, false))
+                    && is_vec128_ty(ty_at(view.tys, to_idx(at_u32(view.extra, at + 3)))) == Some((0, false))
+            } else if has_avx2 && (name == b"blaze.neon.sdot" || name == b"blaze.neon.udot") && argc == 3 {
+                is_vec128_ty(ty) == Some((2, false))
+                    && is_vec128_ty(ty_at(view.tys, to_idx(at_u32(view.extra, at + 2)))) == Some((2, false))
+                    && is_vec128_ty(ty_at(view.tys, to_idx(at_u32(view.extra, at + 3)))) == Some((0, false))
+                    && is_vec128_ty(ty_at(view.tys, to_idx(at_u32(view.extra, at + 4)))) == Some((0, false))
+            } else {
+                false
+            };
+            if !tok {
+                return Err(TierError::Refused {
+                    tier: TIER,
+                    inst: Some(u32_of(inst)),
+                    what: "unsupported x86-64 target_intrinsic",
+                });
             }
         }
         if matches!(op, Op::ReduceAdd | Op::ReduceAnd | Op::ReduceOr | Op::ReduceXor | Op::ReduceUmax | Op::ReduceFadd) {
@@ -754,8 +794,18 @@ pub(crate) fn emit_sota_x64<'a>(
     check_x64_subset(&view, has_fma, has_avx2, has_avx512)?;
 
     let len = view.len();
+    let uses_sdot_ymm = has_avx2
+        && (0..len).any(|i| {
+            if view.op(i) != Op::TargetIntrinsic {
+                return false;
+            }
+            let at = to_idx(at_u32(view.data, i));
+            let name = view.intrinsic_name(IntrinsicId(at_u32(view.extra, at)));
+            name == b"blaze.neon.sdot" || name == b"blaze.neon.udot"
+        });
     let has_ymm = (has_avx2 && (0..len).any(|i| is_vec256_ty(ty_at(view.tys, i)).is_some()))
-        || (has_avx512 && (0..len).any(|i| is_vec512_ty(ty_at(view.tys, i)).is_some()));
+        || (has_avx512 && (0..len).any(|i| is_vec512_ty(ty_at(view.tys, i)).is_some()))
+        || uses_sdot_ymm;
     let blocks = view.blocks();
     let tail_calls = detect_tail_calls(&view, call_mode == CallMode::DirectBl, crate::Os::Linux, alloc);
     let block_order = compute_block_order(&view, alloc);
@@ -1704,6 +1754,7 @@ pub(crate) fn emit_sota_x64<'a>(
                     op,
                     Op::Call
                         | Op::CallIndirect
+                        | Op::TargetIntrinsic
                         | Op::Load
                         | Op::Store
                         | Op::AtomicLoad
@@ -2016,6 +2067,34 @@ pub(crate) fn emit_sota_x64<'a>(
                         }
                         store_vec_spill(&mut code, vd, sp);
                     }
+                    Op::Smin | Op::Smax | Op::Umin | Op::Umax => {
+                        let at = to_idx(at_u32(view.data, inst));
+                        let (vd, sp) = dst_vec(inst)?;
+                        let va = load_vec(&mut code, at_u32(view.extra, at), XMM14)?;
+                        let vb = load_vec(&mut code, at_u32(view.extra, at + 1), XMM15)?;
+                        match (op, vsize) {
+                            (Op::Smin, 2) => x64::vpminsd(&mut code, l256, vd, va, vb),
+                            (Op::Smax, 2) => x64::vpmaxsd(&mut code, l256, vd, va, vb),
+                            (Op::Umin, 2) => x64::vpminud(&mut code, l256, vd, va, vb),
+                            (Op::Umax, 2) => x64::vpmaxud(&mut code, l256, vd, va, vb),
+                            (Op::Smin, 0) => x64::avx_vec_int_0f38(&mut code, l256, 0x38, vd, va, vb),
+                            (Op::Smax, 0) => x64::avx_vec_int_0f38(&mut code, l256, 0x3c, vd, va, vb),
+                            (Op::Umin, 0) => x64::avx_vec_int_bin_w(&mut code, l256, 0xda, vd, va, vb),
+                            (Op::Umax, 0) => x64::avx_vec_int_bin_w(&mut code, l256, 0xde, vd, va, vb),
+                            (Op::Smin, 1) => x64::avx_vec_int_bin_w(&mut code, l256, 0xea, vd, va, vb),
+                            (Op::Smax, 1) => x64::avx_vec_int_bin_w(&mut code, l256, 0xee, vd, va, vb),
+                            (Op::Umin, 1) => x64::avx_vec_int_0f38(&mut code, l256, 0x3a, vd, va, vb),
+                            (Op::Umax, 1) => x64::avx_vec_int_0f38(&mut code, l256, 0x3e, vd, va, vb),
+                            _ => {
+                                return Err(TierError::Refused {
+                                    tier: TIER,
+                                    inst: Some(u32_of(inst)),
+                                    what: "unsupported x86-64 vector min/max width",
+                                });
+                            }
+                        }
+                        store_vec_spill(&mut code, vd, sp);
+                    }
                     Op::Select => {
                         let at = to_idx(at_u32(view.data, inst));
                         let (cv, tv, fv) = (at_u32(view.extra, at), at_u32(view.extra, at + 1), at_u32(view.extra, at + 2));
@@ -2068,13 +2147,21 @@ pub(crate) fn emit_sota_x64<'a>(
                         let (vd, sp) = dst_vec(inst)?;
                         let double = vsize == 3;
                         let fma_ops = match (op, at_fusion(&fusion, inst)) {
-                            (Op::Fma | Op::Fmuladd, _) => {
+                            (Op::Fma | Op::Fmuladd, _) if has_fma => {
                                 Some((at_u32(view.extra, at), at_u32(view.extra, at + 1), at_u32(view.extra, at + 2)))
                             }
                             (Op::Fadd, X64Fusion::Fma { a, b, acc }) => Some((a, b, acc)),
                             _ => None,
                         };
                         if let Some((a_v, b_v, c_v)) = fma_ops {
+                            let emit_vfmadd231 = |buf: &mut Vec<u8, Alloc<'a>>, dst: XReg, s1: XReg, s2: XReg| {
+                                match (l256, double) {
+                                    (false, false) => x64::vfmadd231ps_xmm(buf, dst, s1, s2),
+                                    (false, true) => x64::vfmadd231pd_xmm(buf, dst, s1, s2),
+                                    (true, false) => x64::vfmadd231ps_ymm(buf, dst, s1, s2),
+                                    (true, true) => x64::vfmadd231pd_ymm(buf, dst, s1, s2),
+                                }
+                            };
                             let loc_a = at_loc(&loc_of, to_idx(a_v));
                             let loc_b = at_loc(&loc_of, to_idx(b_v));
                             let loc_c = at_loc(&loc_of, to_idx(c_v));
@@ -2100,7 +2187,7 @@ pub(crate) fn emit_sota_x64<'a>(
                                     }
                                 };
                                 if vd == vc {
-                                    x64::fma3_vfmadd231_w(&mut code, l256, double, true, vd, va, vb);
+                                    emit_vfmadd231(&mut code, vd, va, vb);
                                 } else if vd == va {
                                     x64::fma3_vfmadd213_w(&mut code, l256, double, true, vd, vb, vc);
                                 } else if vd == vb {
@@ -2111,7 +2198,26 @@ pub(crate) fn emit_sota_x64<'a>(
                                     } else {
                                         x64::movdqa_rr(&mut code, vd, vc);
                                     }
-                                    x64::fma3_vfmadd231_w(&mut code, l256, double, true, vd, va, vb);
+                                    emit_vfmadd231(&mut code, vd, va, vb);
+                                }
+                            }
+                        } else if op == Op::Fmuladd {
+                            let va = load_vec(&mut code, at_u32(view.extra, at), XMM14)?;
+                            let vb = load_vec(&mut code, at_u32(view.extra, at + 1), XMM15)?;
+                            let c_v = at_u32(view.extra, at + 2);
+                            if has_avx2 {
+                                x64::avx_vec_fp_bin_w(&mut code, l256, double, 0x59, XMM14, va, vb);
+                                let vc = load_vec(&mut code, c_v, XMM15)?;
+                                x64::avx_vec_fp_bin_w(&mut code, l256, double, 0x58, vd, XMM14, vc);
+                            } else {
+                                if va != XMM14 {
+                                    x64::movdqa_rr(&mut code, XMM14, va);
+                                }
+                                x64::vec_fp_bin(&mut code, double, 0x59, XMM14, vb);
+                                let vc = load_vec(&mut code, c_v, XMM15)?;
+                                x64::vec_fp_bin(&mut code, double, 0x58, XMM14, vc);
+                                if vd != XMM14 {
+                                    x64::movdqa_rr(&mut code, vd, XMM14);
                                 }
                             }
                         } else {
@@ -2141,6 +2247,58 @@ pub(crate) fn emit_sota_x64<'a>(
                                 }
                                 x64::vec_fp_bin(&mut code, double, opc, vd, vb);
                             }
+                        }
+                        store_vec_spill(&mut code, vd, sp);
+                    }
+                    Op::TargetIntrinsic => {
+                        let at = to_idx(at_u32(view.data, inst));
+                        let name = view.intrinsic_name(IntrinsicId(at_u32(view.extra, at)));
+                        let (vd, sp) = dst_vec(inst)?;
+                        if name == b"blaze.neon.tbl16" {
+                            let tbl_v = at_u32(view.extra, at + 2);
+                            let idx_v = at_u32(view.extra, at + 3);
+                            // NEON `tbl16` zeroes any lane with `idx >= 16`; x86 `vpshufb` zeroes when bit 7 is set
+                            // (`idx >= 128`) and masks low 4 bits otherwise. Saturating-adding `0x70` (`112`) maps:
+                            // - `0..=15`    -> `0x70..=0x7f` (bit 7 = 0, low nibble unchanged -> `tbl[idx]`)
+                            // - `16..=127`  -> `0x80..=0xef` (bit 7 = 1 -> `0`)
+                            // - `128..=255` -> `0xf0..=0xff` (bit 7 = 1 -> `0`)
+                            x64::mov_imm64(&mut code, R10, 0x70);
+                            x64::mov_gpr_to_xmm(&mut code, false, XMM15, R10);
+                            x64::avx2_vpbroadcast(&mut code, false, 0, XMM15, XMM15);
+                            let vi = load_vec(&mut code, idx_v, XMM14)?;
+                            x64::avx_vec_int_bin_w(&mut code, false, 0xdc, XMM15, vi, XMM15); // vpaddusb
+                            let vt = load_vec(&mut code, tbl_v, XMM14)?;
+                            x64::vpshufb_xmm(&mut code, vd, vt, XMM15);
+                        } else if name == b"blaze.neon.sdot" || name == b"blaze.neon.udot" {
+                            let acc_v = at_u32(view.extra, at + 2);
+                            let a_v = at_u32(view.extra, at + 3);
+                            let b_v = at_u32(view.extra, at + 4);
+                            let signed = name == b"blaze.neon.sdot";
+                            let va = load_vec(&mut code, a_v, XMM14)?;
+                            if signed {
+                                x64::vpmovsxbw_ymm(&mut code, XMM14, va);
+                            } else {
+                                x64::vpmovzxbw_ymm(&mut code, XMM14, va);
+                            }
+                            let vb = load_vec(&mut code, b_v, XMM15)?;
+                            if signed {
+                                x64::vpmovsxbw_ymm(&mut code, XMM15, vb);
+                            } else {
+                                x64::vpmovzxbw_ymm(&mut code, XMM15, vb);
+                            }
+                            // Exact 16-bit -> 32-bit pairwise multiply-add (ZERO 16-bit saturation overflow even
+                            // for `(-128)*(-128)` in `sdot` or `255*255` in `udot`!), then horizontal pairwise add.
+                            x64::vpmaddwd_ymm(&mut code, XMM14, XMM14, XMM15);
+                            x64::avx2_vextracti128(&mut code, XMM15, XMM14, 1);
+                            x64::vphaddd_xmm(&mut code, XMM14, XMM14, XMM15);
+                            let vc = load_vec(&mut code, acc_v, XMM15)?;
+                            x64::avx_vec_int_bin_w(&mut code, false, 0xfe, vd, vc, XMM14); // vpaddd
+                        } else {
+                            return Err(TierError::Refused {
+                                tier: TIER,
+                                inst: Some(u32_of(inst)),
+                                what: "unsupported x86-64 vector target_intrinsic",
+                            });
                         }
                         store_vec_spill(&mut code, vd, sp);
                     }
@@ -3320,7 +3478,7 @@ pub(crate) fn emit_sota_x64<'a>(
                     let (vd, sp) = dst_xmm(inst)?;
                     let at = to_idx(at_u32(view.data, inst));
                     let fma_ops = match (op, at_fusion(&fusion, inst)) {
-                        (Op::Fma | Op::Fmuladd, _) => {
+                        (Op::Fma | Op::Fmuladd, _) if has_fma => {
                             Some((at_u32(view.extra, at), at_u32(view.extra, at + 1), at_u32(view.extra, at + 2)))
                         }
                         (Op::Fadd, X64Fusion::Fma { a, b, acc }) => Some((a, b, acc)),
@@ -3357,6 +3515,18 @@ pub(crate) fn emit_sota_x64<'a>(
                                 x64::movfp_rr(&mut code, double, vd, vc);
                                 x64::fma3_vfmadd231(&mut code, double, false, vd, va, vb);
                             }
+                        }
+                    } else if op == Op::Fmuladd {
+                        let va = load_xmm(&mut code, at_u32(view.extra, at), double, XMM14)?;
+                        let vb = load_xmm(&mut code, at_u32(view.extra, at + 1), double, XMM15)?;
+                        if va != XMM14 {
+                            x64::movfp_rr(&mut code, double, XMM14, va);
+                        }
+                        x64::fp_bin(&mut code, double, 0x59, XMM14, vb);
+                        let vc = load_xmm(&mut code, at_u32(view.extra, at + 2), double, XMM15)?;
+                        x64::fp_bin(&mut code, double, 0x58, XMM14, vc);
+                        if vd != XMM14 {
+                            x64::movfp_rr(&mut code, double, vd, XMM14);
                         }
                     } else {
                         let va = load_xmm(&mut code, at_u32(view.extra, at), double, XMM14)?;
@@ -3631,6 +3801,21 @@ pub(crate) fn emit_sota_x64<'a>(
                     emit_epilogue(&mut code);
                     x64::ret(&mut code);
                 }
+                Op::TargetIntrinsic => {
+                    let at = to_idx(at_u32(view.data, inst));
+                    let name = view.intrinsic_name(IntrinsicId(at_u32(view.extra, at)));
+                    if name == b"blaze.prefetch.r1" {
+                        let ptr_v = at_u32(view.extra, at + 2);
+                        let rptr = load_gpr(&mut code, ptr_v, R10)?;
+                        x64::prefetcht0(&mut code, rptr, 0);
+                    } else {
+                        return Err(TierError::Refused {
+                            tier: TIER,
+                            inst: Some(u32_of(inst)),
+                            what: "unsupported x86-64 target_intrinsic",
+                        });
+                    }
+                }
                 Op::Trap | Op::Unreachable => x64::ud2(&mut code),
                 _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: op.name() }),
             }
@@ -3646,4 +3831,287 @@ pub(crate) fn emit_sota_x64<'a>(
 
     out.code = code;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_lir::{
+        Flags, Op, Scalar, Ty,
+        builder::{Builder, Full, MemAttrs, Param, Variadic},
+        func::{BlockKind, Conv},
+    };
+    use blaze_own::Alloc;
+    use blaze_tier::{Machine, Named, Names, Outside, RoutinePlaces};
+
+    use super::{CallMode, emit_sota_x64};
+
+    struct NoNames;
+
+    impl Names for NoNames {
+        fn name(&self, _of: Outside) -> Option<Named<'_>> {
+            None
+        }
+
+        fn routines(&self) -> RoutinePlaces {
+            RoutinePlaces::NONE
+        }
+    }
+
+    fn test_alloc() -> Alloc<'static> {
+        blaze_own::testing::heap().alloc()
+    }
+
+    fn has_vex3(code: &[u8], map: u8, w: bool, l256: bool, opc: u8) -> bool {
+        code.windows(5).any(|win| {
+            win[0] == 0xc4
+                && (win[1] & 0x1f) == map
+                && ((win[2] >> 7) != 0) == w
+                && (((win[2] >> 2) & 1) != 0) == l256
+                && win[3] == opc
+        })
+    }
+
+    #[test]
+    fn emits_fma3_for_vector_fma_and_mul_add_for_fmuladd_without_fma() {
+        let alloc = test_alloc();
+        for (elem, lanes, double, l256) in [
+            (Scalar::F32, 4u32, false, false),
+            (Scalar::F64, 2, true, false),
+            (Scalar::F32, 8, false, true),
+            (Scalar::F64, 4, true, true),
+        ] {
+            let vty = Ty::vector(elem, lanes).expect("valid vector fp type");
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let pa = b.param(Ty::PTR);
+            let pb = b.param(Ty::PTR);
+            let pc = b.param(Ty::PTR);
+            let pout = b.param(Ty::PTR);
+            let a = b.load(vty, Flags::NONE, pa, 0, MemAttrs::aligned(4));
+            let bv = b.load(vty, Flags::NONE, pb, 0, MemAttrs::aligned(4));
+            let c = b.load(vty, Flags::NONE, pc, 0, MemAttrs::aligned(4));
+            let res = b.ternary(Op::Fma, Flags::NONE, a, bv, c);
+            b.store(Flags::NONE, res, pout, 0, MemAttrs::aligned(4));
+            b.ret(&[]);
+            let func = b.finish_checked().expect("vector Fma LIR builds");
+
+            let emitted = emit_sota_x64(
+                func.view(),
+                &NoNames,
+                CallMode::DirectBl,
+                Machine::AVX2 | Machine::FMA,
+                alloc,
+            )
+            .expect("x86-64 FMA3 emits");
+            assert!(
+                has_vex3(&emitted.code, 2, double, l256, 0xb8),
+                "expected VEX 0F38 0xB8 (vfmadd231) for elem={elem:?} lanes={lanes}, got {:02x?}",
+                emitted.code.as_slice()
+            );
+
+            // Strict `Op::Fma` without `Machine::FMA` must refuse (single-rounding semantics).
+            assert!(
+                emit_sota_x64(func.view(), &NoNames, CallMode::DirectBl, Machine::AVX2, alloc).is_err(),
+                "Op::Fma without Machine::FMA must be refused"
+            );
+        }
+
+        // `Op::Fmuladd` without `Machine::FMA` lowers to `vmulps` (0x59) + `vaddps` (0x58).
+        let v4f32 = Ty::vector(Scalar::F32, 4).expect("v4f32");
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+            &[],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let pa = b.param(Ty::PTR);
+        let pb = b.param(Ty::PTR);
+        let pc = b.param(Ty::PTR);
+        let pout = b.param(Ty::PTR);
+        let a = b.load(v4f32, Flags::NONE, pa, 0, MemAttrs::aligned(4));
+        let bv = b.load(v4f32, Flags::NONE, pb, 0, MemAttrs::aligned(4));
+        let c = b.load(v4f32, Flags::NONE, pc, 0, MemAttrs::aligned(4));
+        let res = b.ternary(Op::Fmuladd, Flags::NONE, a, bv, c);
+        b.store(Flags::NONE, res, pout, 0, MemAttrs::aligned(4));
+        b.ret(&[]);
+        let func = b.finish_checked().expect("vector Fmuladd LIR builds");
+
+        let emitted = emit_sota_x64(func.view(), &NoNames, CallMode::DirectBl, Machine::AVX2, alloc)
+            .expect("Op::Fmuladd without Machine::FMA lowers to vmulps + vaddps");
+        assert!(has_vex3(&emitted.code, 1, false, false, 0x59), "expected vmulps");
+        assert!(has_vex3(&emitted.code, 1, false, false, 0x58), "expected vaddps");
+        assert!(!has_vex3(&emitted.code, 2, false, false, 0xb8), "must not emit FMA3 without Machine::FMA");
+    }
+
+    #[test]
+    fn emits_vpmin_and_vpmax_for_i32_vectors_128_and_256() {
+        let alloc = test_alloc();
+        for (lanes, l256) in [(4u32, false), (8, true)] {
+            let vty = Ty::vector(Scalar::I32, lanes).expect("vNi32");
+            for (op, expected_opc) in [
+                (Op::Smin, 0x39u8),
+                (Op::Smax, 0x3d),
+                (Op::Umin, 0x3b),
+                (Op::Umax, 0x3f),
+            ] {
+                let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+                let sig = b.sig(
+                    Conv::C,
+                    Variadic::No,
+                    &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                    &[],
+                );
+                b.set_signature(sig);
+                let entry = b.create_block(BlockKind::Normal);
+                b.begin(entry);
+                let pa = b.param(Ty::PTR);
+                let pb = b.param(Ty::PTR);
+                let pout = b.param(Ty::PTR);
+                let a = b.load(vty, Flags::NONE, pa, 0, MemAttrs::aligned(4));
+                let bv = b.load(vty, Flags::NONE, pb, 0, MemAttrs::aligned(4));
+                let r = b.binary(op, Flags::NONE, a, bv);
+                b.store(Flags::NONE, r, pout, 0, MemAttrs::aligned(4));
+                b.ret(&[]);
+                let func = b.finish_checked().expect("vector min/max LIR builds");
+
+                let emitted = emit_sota_x64(func.view(), &NoNames, CallMode::DirectBl, Machine::AVX2, alloc)
+                    .expect("vector min/max emits");
+                assert!(
+                    has_vex3(&emitted.code, 2, false, l256, expected_opc),
+                    "expected 0F38 {expected_opc:#04x} for {op:?} lanes={lanes}, got {:02x?}",
+                    emitted.code.as_slice()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn emits_prefetcht0_for_blaze_prefetch_r1() {
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let p = b.param(Ty::PTR);
+        let pf_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
+        let pf_id = b.intrinsic("blaze.prefetch.r1", pf_sig);
+        b.target_intrinsic(pf_id, &[p]);
+        b.ret(&[]);
+        let func = b.finish_checked().expect("prefetch LIR builds");
+
+        let emitted = emit_sota_x64(func.view(), &NoNames, CallMode::DirectBl, 0, alloc)
+            .expect("blaze.prefetch.r1 emits on baseline x86-64");
+        assert!(
+            emitted.code.windows(2).any(|w| w == [0x0f, 0x18]),
+            "expected PREFETCHT0 (0F 18), got {:02x?}",
+            emitted.code.as_slice()
+        );
+        assert_eq!(emitted.code.as_slice(), &[0x0f, 0x18, 0x0f, 0xc3]);
+    }
+
+    #[test]
+    fn emits_vpshufb_for_blaze_neon_tbl16() {
+        let alloc = test_alloc();
+        let v16i8 = Ty::vector(Scalar::I8, 16).expect("v16i8");
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+            &[],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let ptbl = b.param(Ty::PTR);
+        let pidx = b.param(Ty::PTR);
+        let pout = b.param(Ty::PTR);
+        let tbl = b.load(v16i8, Flags::NONE, ptbl, 0, MemAttrs::aligned(4));
+        let idx = b.load(v16i8, Flags::NONE, pidx, 0, MemAttrs::aligned(4));
+        let tbl_sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(v16i8), Param::of(v16i8)],
+            &[Param::of(v16i8)],
+        );
+        let tbl_id = b.intrinsic("blaze.neon.tbl16", tbl_sig);
+        let res = b.target_intrinsic(tbl_id, &[tbl, idx]);
+        b.store(Flags::NONE, res, pout, 0, MemAttrs::aligned(4));
+        b.ret(&[]);
+        let func = b.finish_checked().expect("tbl16 LIR builds");
+
+        let emitted = emit_sota_x64(func.view(), &NoNames, CallMode::DirectBl, Machine::AVX2, alloc)
+            .expect("blaze.neon.tbl16 emits with AVX2");
+        assert!(
+            has_vex3(&emitted.code, 1, false, false, 0xdc),
+            "expected vpaddusb index clamp for NEON tbl16 parity"
+        );
+        assert!(
+            has_vex3(&emitted.code, 2, false, false, 0x00),
+            "expected vpshufb (0F38 00), got {:02x?}",
+            emitted.code.as_slice()
+        );
+    }
+
+    #[test]
+    fn emits_exact_widening_dotprod_for_blaze_neon_sdot_and_udot() {
+        let alloc = test_alloc();
+        let v16i8 = Ty::vector(Scalar::I8, 16).expect("v16i8");
+        let v4i32 = Ty::vector(Scalar::I32, 4).expect("v4i32");
+        for (name, ext_opc) in [("blaze.neon.sdot", 0x20u8), ("blaze.neon.udot", 0x30u8)] {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let pacc = b.param(Ty::PTR);
+            let pa = b.param(Ty::PTR);
+            let pb = b.param(Ty::PTR);
+            let pout = b.param(Ty::PTR);
+            let acc = b.load(v4i32, Flags::NONE, pacc, 0, MemAttrs::aligned(4));
+            let a = b.load(v16i8, Flags::NONE, pa, 0, MemAttrs::aligned(4));
+            let bv = b.load(v16i8, Flags::NONE, pb, 0, MemAttrs::aligned(4));
+            let dot_sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(v4i32), Param::of(v16i8), Param::of(v16i8)],
+                &[Param::of(v4i32)],
+            );
+            let dot_id = b.intrinsic(name, dot_sig);
+            let res = b.target_intrinsic(dot_id, &[acc, a, bv]);
+            b.store(Flags::NONE, res, pout, 0, MemAttrs::aligned(4));
+            b.ret(&[]);
+            let func = b.finish_checked().expect("sdot/udot LIR builds");
+
+            let emitted = emit_sota_x64(func.view(), &NoNames, CallMode::DirectBl, Machine::AVX2, alloc)
+                .expect("blaze.neon.sdot/udot emits with AVX2");
+            assert!(has_vex3(&emitted.code, 2, false, true, ext_opc), "expected vpmov[sz]xbw ymm for {name}");
+            assert!(has_vex3(&emitted.code, 1, false, true, 0xf5), "expected vpmaddwd ymm for {name}");
+            assert!(has_vex3(&emitted.code, 3, false, true, 0x39), "expected vextracti128 for {name}");
+            assert!(has_vex3(&emitted.code, 2, false, false, 0x02), "expected vphaddd for {name}");
+            assert!(has_vex3(&emitted.code, 1, false, false, 0xfe), "expected vpaddd for {name}");
+            assert!(
+                emitted.code.windows(3).any(|w| w == [0xc5, 0xf8, 0x77]),
+                "expected vzeroupper in epilogue for {name}"
+            );
+        }
+    }
 }

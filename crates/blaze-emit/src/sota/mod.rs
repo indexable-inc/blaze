@@ -45,6 +45,7 @@ use blaze_lir::{
     Op, Verified,
     amac::{AmacOpts, interleave_amac_loops},
     bce::eliminate_redundant_checks,
+    bce_hoist::{BceHoistOpts, hoist_loop_bounds_checks},
     coldsplit::partition_cold_blocks,
     egraph::{RegBudget, sota_optimize_fixpoint},
     gemm::{GemmOpts, optimize_gemm_loops},
@@ -200,8 +201,25 @@ fn run_sota_loop_and_late_passes<'a>(
         Arch::X86_64 => blaze_lir::superopt::AArch64MicroArch::X86_64Zen5,
     };
 
-    // Stage 1b-0: Triple-nested GEMM recognition (Auto-SME2 FMOPA / 4x16 NEON register blocking)
-    // runs BEFORE `unswitch_loops` so inner `0 < n` unswitching guards don't split the 3D nest.
+    // Stage 1b-0: Dominating BCE + Safe-Rust Loop-Versioning Bounds-Check Hoisting + Triple-Nested
+    // GEMM recognition (Auto-SME2 FMOPA / 4x16 NEON register blocking) run BEFORE `unswitch_loops`
+    // so safe Rust slice loops hoist their panic checks and expose clean 1D/3D fast-path loops!
+    let bce0_out = eliminate_redundant_checks(input, alloc).ok();
+    let post_bce0 = match &bce0_out {
+        Some(o) => o.func.view(),
+        None => input,
+    };
+    let hoist_out = if auto_vectorize {
+        hoist_loop_bounds_checks(post_bce0, BceHoistOpts::default_sota(), alloc)
+            .ok()
+            .filter(|o| o.stats.checks_hoisted > 0)
+    } else {
+        None
+    };
+    let post_hoist = match &hoist_out {
+        Some(o) => o.func.view(),
+        None => post_bce0,
+    };
     let mut did_gemm = false;
     let gemm_func = if auto_vectorize && machine.arch == Arch::Arm64 {
         let gemm_opts = if (machine.features & Machine::SME2) != 0 {
@@ -209,7 +227,7 @@ fn run_sota_loop_and_late_passes<'a>(
         } else {
             GemmOpts::neon()
         };
-        optimize_gemm_loops(input, gemm_opts, alloc)
+        optimize_gemm_loops(post_hoist, gemm_opts, alloc)
             .ok()
             .filter(|o| o.stats.sme2_lowered > 0 || o.stats.neon_blocked > 0)
             .map(|o| {
@@ -221,7 +239,7 @@ fn run_sota_loop_and_late_passes<'a>(
     };
     let post_gemm_in = match &gemm_func {
         Some(f) => f.view(),
-        None => input,
+        None => post_hoist,
     };
 
     // Stage 1b: Dominating Bounds-Check Elimination + Loop Unswitching + If-Conversion.
@@ -447,7 +465,7 @@ fn run_sota_loop_and_late_passes<'a>(
     };
 
     // Stage 1e: Joint Apple-M5 Machine-Op E-Graph + Bounded Multi-Round Superoptimization.
-    let mach_func = if superopt.is_some() && machine.arch == Arch::Arm64 {
+    let mach_func = if machine.arch == Arch::Arm64 {
         let mut mopts = MachEGraphOpts::apple_m5();
         mopts.enable_synth = false; // Fast deterministic saturation in hot path; synth available via explicit cache.
         optimize_mach_egraph(post_td, mopts, None, alloc)
@@ -605,14 +623,15 @@ fn emitted_to_code_record<'a>(
     rec.positions = emitted.position_slots;
 
     for source in traps {
-        let row = emitted.traps.iter().find(|t| t.site == Some((0, source.ordinal)))?;
-        rec.traps.push(TrapRow {
-            at: row.at,
-            kind: source.kind,
-            site: source.site,
-            held: row.held,
-            subject: source.subject,
-        });
+        for row in emitted.traps.iter().filter(|t| t.site == Some((0, source.ordinal))) {
+            rec.traps.push(TrapRow {
+                at: row.at,
+                kind: source.kind,
+                site: source.site,
+                held: row.held,
+                subject: source.subject,
+            });
+        }
     }
 
     let mut target_remap: blaze_own::Vec<u32, Alloc<'a>> =
@@ -686,22 +705,30 @@ fn emitted_to_code_record<'a>(
     Some((rec, insts))
 }
 
-/// Default AArch64 optimizing record emitter for `blaze-ladder` (`blaze run` / `blaze test`):
-/// runs SROA + fixed-point Aegraph/Reassociation/Strength-Reduction/LICM/DCE, emits native fused
-/// AArch64 `Sota` code directly whenever the function fits `Sota`'s subset, and delegates exotic
-/// ops (already SOTA-optimized!) cleanly to `emit_record_sourced`.
-pub fn emit_sota_record_measured<'a>(
+/// Explicit-`Machine` AArch64 optimizing record emitter for `blaze run`, `blaze test`, and
+/// `blaze export`: runs SROA + fixed-point Aegraph/Reassociation/Strength-Reduction/LICM/DCE +
+/// full SOTA loop, vectorization, GEMM, Apple-M5 machine-op e-graph, and superoptimization
+/// passes, emits native fused AArch64 `Sota` code directly whenever the function fits `Sota`'s
+/// subset (preserving 0..=N surviving/cloned trap rows via [`emitted_to_code_record`]), and
+/// delegates exotic ops cleanly to `emit_record_sourced`.
+///
+/// Callers targeting Apple M4/M5 can pass explicit hardware feature flags
+/// (`Machine::LSE | Machine::DOTPROD | Machine::CSSC | Machine::SME | Machine::SME2`)
+/// deterministically.
+pub fn emit_sota_record_for_machine<'a>(
     func: Verified<'_>,
     names: &dyn Names,
     routines: &RoutinePlaces,
-    isa: Isa,
+    machine: Machine,
     traps: &[TrapSource],
     alloc: Alloc<'a>,
 ) -> Result<(CodeRecord<'a>, u32, Called), RecordEmitError> {
-    let orig_unreach = if traps.is_empty() {
-        0
-    } else {
-        func.view().ops.iter().filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable)).count()
+    let isa = Isa {
+        lse: (machine.features & Machine::LSE) != 0,
+        os: match machine.os {
+            blaze_tier::Os::MacOs => crate::Os::MacOs,
+            blaze_tier::Os::Linux => crate::Os::Linux,
+        },
     };
 
     let sroa_func = scalar_replace(func.view(), alloc).ok();
@@ -710,50 +737,63 @@ pub fn emit_sota_record_measured<'a>(
         None => func.view(),
     };
     let sota_opt = sota_optimize_fixpoint(mid_in, RegBudget::AARCH64, 3, |_| 1, alloc).ok();
-    let chosen_opt = sota_opt.as_ref().and_then(|res| {
-        let v = verify(res.func.view()).ok()?;
-        if !traps.is_empty() {
-            let after_unreach = v.view().ops.iter().filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable)).count();
-            if after_unreach != orig_unreach {
-                return None;
-            }
-        }
-        Some(v)
-    });
+    let chosen_opt = sota_opt.as_ref().and_then(|res| verify(res.func.view()).ok());
 
     if let Some(opt_v) = chosen_opt {
+        let late_func = run_sota_loop_and_late_passes(
+            opt_v.view(),
+            machine,
+            RegBudget::AARCH64,
+            true,
+            Some(SuperoptOpts::apple_silicon()),
+            alloc,
+        );
+        let full_v = match verify(late_func.view()) {
+            Ok(v) => v,
+            Err(_) => opt_v,
+        };
+        let is_macos = machine.os == blaze_tier::Os::MacOs;
+        if let Ok(emitted) =
+            isel::emit_sota_a64(full_v.view(), names, CallMode::GotSlot, machine.features, is_macos, alloc)
         {
-            // Only enable LSE when advertised by `isa`; never assume CSSC (not present on M1/M2/M3).
-            let features = if isa.lse { Machine::LSE } else { 0 };
-            let os = match isa.os {
-                crate::Os::MacOs => blaze_tier::Os::MacOs,
-                crate::Os::Linux => blaze_tier::Os::Linux,
-            };
-            let machine = Machine { arch: Arch::Arm64, os, features };
-            let late_func = run_sota_loop_and_late_passes(
-                opt_v.view(),
-                machine,
-                RegBudget::AARCH64,
-                true,
-                None,
-                alloc,
-            );
-            let final_v = late_func.view();
-
-            let traps_ok = traps.is_empty()
-                || final_v.ops.iter().filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable)).count() == orig_unreach;
-            let emit_v = if traps_ok { final_v } else { opt_v.view() };
-            if let Ok(full_v) = verify(emit_v) {
-                let is_macos = isa.os == crate::Os::MacOs;
-                if let Ok(emitted) = isel::emit_sota_a64(full_v.view(), names, CallMode::GotSlot, features, is_macos, alloc) {
-                    if let Some((rec, insts)) = emitted_to_code_record(emitted, traps, alloc) {
-                        return Ok((rec, insts, Called::NONE));
-                    }
-                }
+            if let Some((rec, insts)) = emitted_to_code_record(emitted, traps, alloc) {
+                return Ok((rec, insts, Called::NONE));
             }
         }
-        return emit_record_sourced(opt_v, names, routines, isa, BULK_INLINE_MOST, traps, alloc);
+        // `emit_record_sourced` indexes `form.unreachables` by `TrapSource::ordinal`; if `opt_v`
+        // changed the `Op::Unreachable` count while traps are present, delegate `func` so ordinals
+        // stay intact on the baseline path.
+        let fallback_v = if traps.is_empty()
+            || opt_v.view().ops.iter().filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable)).count()
+                == func.view().ops.iter().filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable)).count()
+        {
+            opt_v
+        } else {
+            func
+        };
+        return emit_record_sourced(fallback_v, names, routines, isa, BULK_INLINE_MOST, traps, alloc);
     }
 
     emit_record_sourced(func, names, routines, isa, BULK_INLINE_MOST, traps, alloc)
+}
+
+/// Default AArch64 optimizing record emitter for `blaze-ladder` (`blaze run` / `blaze test`):
+/// derives the target [`Machine`] from `isa` (enabling `Machine::LSE` when advertised and
+/// `Machine::DOTPROD` on Apple Silicon macOS) and delegates to [`emit_sota_record_for_machine`].
+pub fn emit_sota_record_measured<'a>(
+    func: Verified<'_>,
+    names: &dyn Names,
+    routines: &RoutinePlaces,
+    isa: Isa,
+    traps: &[TrapSource],
+    alloc: Alloc<'a>,
+) -> Result<(CodeRecord<'a>, u32, Called), RecordEmitError> {
+    let features = (if isa.lse { Machine::LSE } else { 0 })
+        | (if isa.os == crate::Os::MacOs { Machine::DOTPROD } else { 0 });
+    let os = match isa.os {
+        crate::Os::MacOs => blaze_tier::Os::MacOs,
+        crate::Os::Linux => blaze_tier::Os::Linux,
+    };
+    let machine = Machine { arch: Arch::Arm64, os, features };
+    emit_sota_record_for_machine(func, names, routines, machine, traps, alloc)
 }
