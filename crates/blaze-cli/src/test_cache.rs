@@ -21,6 +21,7 @@ use blaze_cas::Key as CasKey;
 use blaze_cas::plain::{Lent, LentError, Namespace};
 use blaze_code::record::{CodeView, Space, Symbol as CodeSymbol};
 use blaze_core::Driver;
+use blaze_hash::{BuildKeyHasher, FixedState, Map, MapOpts, Set};
 use blaze_ids::{ContentId, Hasher};
 use blaze_keyed::kind::{Kind as _, TestIndex, TestPostings, TestRun};
 use blaze_ladder::body_ids::instance_key;
@@ -45,6 +46,8 @@ use crate::test_run::{Answers, RunError};
 const SUITE_ID_DOMAIN: &str = "blaze test suite identity 1";
 const SUITE_PTR_DOMAIN: &str = "blaze test suite pointer 1";
 const SUITE_STATE_DOMAIN: &str = "blaze test suite state 1";
+const VERIFIED_PTR_DOMAIN: &str = "blaze test verified pointer 1";
+const VERIFIED_STATE_DOMAIN: &str = "blaze test verified state 1";
 const HEAD_KEY_DOMAIN: &str = "blaze test head record 1";
 const POSTINGS_KEY_DOMAIN: &str = "blaze test postings record 1";
 const RESULT_SLOT_DOMAIN: &str = "blaze test result slot 1";
@@ -53,6 +56,10 @@ const ADDRESS_DOMAIN: &str = "blaze test address of traced run 1";
 
 const STATE_MAGIC: [u8; 4] = *b"BZTS";
 const STATE_VERSION: u32 = 1;
+const VERIFIED_MAGIC: [u8; 4] = *b"BZTV";
+const VERIFIED_VERSION: u32 = 1;
+/// Cap on verified `(instance_key, content_key)` pairs persisted per suite under today's certificate.
+const MOST_VERIFIED_PERSISTED: usize = 65_536;
 
 /// Typed store error from persisting incremental test cache records (rule 19).
 #[derive(Debug)]
@@ -138,6 +145,10 @@ fn hash_builder(h: &mut Hasher, builder: &Builder) {
 
 fn suite_ptr_key(suite: ContentId) -> CasKey {
     CasKey(ContentId::of(SUITE_PTR_DOMAIN, &suite.0))
+}
+
+fn verified_ptr_key(suite: ContentId) -> CasKey {
+    CasKey(ContentId::of(VERIFIED_PTR_DOMAIN, &suite.0))
 }
 
 fn result_slot_key(address: Address, slot: Slot) -> CasKey {
@@ -477,11 +488,19 @@ struct SuiteSlot<'a, 'm> {
     id: ContentId,
     head_bytes: Option<&'m [u8]>,
     postings_bytes: Option<&'m [u8]>,
+    /// Existing pinned keys loaded for this suite (ptr, state, head, postings, results) so a
+    /// verified-only commit preserves them under `test.<id>`.
+    loaded_root_keys: AVec<'a, CasKey>,
     fns: AVec<'a, FnEntry<'a>>,
+    fn_index: Map<[u8; 32], usize, BuildKeyHasher, Alloc<'a>>,
     result_keys: AVec<'a, CasKey>,
     new_head: Option<(CasKey, AVec<'a, u8>)>,
     new_postings: Option<CasKey>,
     dirty: bool,
+    /// Existing persisted `(verified_ptr, verified_state)` keys if already in CAS for today's certificate.
+    loaded_verified_keys: Option<(CasKey, CasKey)>,
+    /// Newly verified `(instance_key, content_key)` pairs to persist under today's certificate.
+    verified_to_save: Option<(crate::start_list::Certificate, AVec<'a, ([u8; 32], [u8; 32])>)>,
 }
 
 /// CAS-backed incremental cache for all suites in one `blaze test` invocation.
@@ -515,11 +534,15 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
                 id: sid,
                 head_bytes: None,
                 postings_bytes: None,
+                loaded_root_keys: Vec::new_in(alloc),
                 fns: Vec::new_in(alloc),
+                fn_index: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None }),
                 result_keys: Vec::new_in(alloc),
                 new_head: None,
                 new_postings: None,
                 dirty: false,
+                loaded_verified_keys: None,
+                verified_to_save: None,
             };
             let mut head = Head::EMPTY;
             let mut postings = Postings::EMPTY;
@@ -530,6 +553,11 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
             {
                 slot.head_bytes = Some(loaded.head_bytes);
                 slot.postings_bytes = Some(loaded.postings_bytes);
+                slot.loaded_root_keys.push(loaded.ptr_key);
+                slot.loaded_root_keys.push(loaded.state_key);
+                slot.loaded_root_keys.push(loaded.head_key);
+                slot.loaded_root_keys.push(loaded.postings_key);
+                slot.loaded_root_keys.extend_from_slice(loaded.result_keys.as_slice());
                 slot.result_keys = loaded.result_keys;
                 for mut f in loaded.fns {
                     let now = instance_key(
@@ -546,6 +574,8 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
                     if now != Some(f.old_key) {
                         moved.push(Ask::Fn(f.symbol));
                     }
+                    let at = slot.fns.len();
+                    slot.fn_index.insert(f.symbol.0, at);
                     slot.fns.push(f);
                 }
                 head = opened_head;
@@ -580,33 +610,76 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
         suite
     }
 
+    /// Loads previously verified `(instance_key, content_key)` pairs for `suite` if and only if
+    /// they were recorded under today's exact `certificate` (the unforgeable `Standing::root`).
+    /// Returns how many pairs were loaded.
+    pub(crate) fn load_verified(
+        &mut self,
+        suite: SuiteId,
+        certificate: &crate::start_list::Certificate,
+        into: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    ) -> usize {
+        let Ok(idx) = usize::try_from(suite.0) else { return 0 };
+        let Some(slot) = self.suites.get_mut(idx) else { return 0 };
+        let ptr_key = verified_ptr_key(slot.id);
+        let Ok(Some(state_key)) = self.lent.pointed(TestIndex::TAG, &ptr_key) else { return 0 };
+        let Ok(Some(lend)) = self.lent.get(&state_key) else { return 0 };
+        if lend.tag != TestIndex::TAG {
+            return 0;
+        }
+        let Some(loaded) = decode_verified(lend.bytes, certificate, into) else { return 0 };
+        slot.loaded_verified_keys = Some((ptr_key, state_key));
+        loaded
+    }
+
+    /// Schedules the full set of verified `(instance_key, content_key)` pairs for `suite` to be
+    /// persisted under today's `certificate` on [`Self::commit`].
+    pub(crate) fn record_verified(
+        &mut self,
+        suite: SuiteId,
+        certificate: crate::start_list::Certificate,
+        pairs: impl Iterator<Item = ([u8; 32], [u8; 32])>,
+    ) {
+        let Ok(idx) = usize::try_from(suite.0) else { return };
+        let Some(slot) = self.suites.get_mut(idx) else { return };
+        let mut list = Vec::new_in(self.alloc);
+        for pair in pairs {
+            if list.len() >= MOST_VERIFIED_PERSISTED {
+                break;
+            }
+            list.push(pair);
+        }
+        if !list.is_empty() {
+            slot.verified_to_save = Some((certificate, list));
+        }
+    }
+
     /// Records the walked function metadata observed during a test run so [`Answers::answer`] and
     /// [`Self::commit`] know every entered function's identity and `instance_name`.
     pub(crate) fn record_entered(&mut self, suite: SuiteId, entered: &[EnteredFn<'a>]) {
         let Ok(idx) = usize::try_from(suite.0) else { return };
         let Some(slot) = self.suites.get_mut(idx) else { return };
         for e in entered {
-            match slot.fns.binary_search_by_key(&e.symbol, |row| row.symbol) {
-                Ok(at) => {
-                    if let Some(entry) = slot.fns.get_mut(at) {
-                        entry.now_key = Some(e.code_key);
-                        entry.old_key = e.code_key;
-                        entry.tabled = e.tabled;
-                        entry.name.clear();
-                        entry.name.extend_from_slice(e.name.as_slice());
-                    }
+            if let Some(&at) = slot.fn_index.get(&e.symbol.0) {
+                if let Some(entry) = slot.fns.get_mut(at) {
+                    entry.now_key = Some(e.code_key);
+                    entry.old_key = e.code_key;
+                    entry.tabled = e.tabled;
+                    entry.name.clear();
+                    entry.name.extend_from_slice(e.name.as_slice());
                 }
-                Err(at) => {
-                    let mut name = Vec::with_capacity_in(e.name.len(), self.alloc);
-                    name.extend_from_slice(e.name.as_slice());
-                    slot.fns.insert_shift(at, FnEntry {
-                        symbol: e.symbol,
-                        old_key: e.code_key,
-                        now_key: Some(e.code_key),
-                        tabled: e.tabled,
-                        name,
-                    });
-                }
+            } else {
+                let mut name = Vec::with_capacity_in(e.name.len(), self.alloc);
+                name.extend_from_slice(e.name.as_slice());
+                let at = slot.fns.len();
+                slot.fn_index.insert(e.symbol.0, at);
+                slot.fns.push(FnEntry {
+                    symbol: e.symbol,
+                    old_key: e.code_key,
+                    now_key: Some(e.code_key),
+                    tabled: e.tabled,
+                    name,
+                });
             }
         }
     }
@@ -623,7 +696,7 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
         for ask in head.asks(row) {
             match ask {
                 Ask::Fn(name) => {
-                    let Ok(at) = slot.fns.binary_search_by_key(&name, |f| f.symbol) else {
+                    let Some(&at) = slot.fn_index.get(&name.0) else {
                         return Ok(false);
                     };
                     let Some(now) = slot.fns.get(at).and_then(|f| f.now_key) else {
@@ -648,11 +721,39 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
         }
     }
 
-    /// Commits every dirty suite's `SuiteState`, pointer, and root into `Lent` (flushed to disk
-    /// by the command's single post-answer commit).
+    /// Commits every dirty suite's `SuiteState`, verified-entry cache, pointer, and root into
+    /// `Lent` (flushed to disk by the command's single post-answer commit).
     pub(crate) fn commit(mut self) -> Result<(), DriveError> {
+        let store_err = |e: LentError| DriveError::CacheStore { what: "writing test suite cache", why: CacheError::Store(e) };
+        let root_err = |e: RootError| DriveError::CacheStore { what: "pinning test suite root", why: CacheError::Root(e) };
         for slot in self.suites.iter_mut() {
+            let mut verified_keys = slot.loaded_verified_keys;
+            let mut verified_changed = false;
+            if let Some((cert, mut pairs)) = slot.verified_to_save.take()
+                && !pairs.is_empty()
+            {
+                pairs.sort_unstable();
+                pairs.dedup();
+                let mut vbytes: AVec<'_, u8> = Vec::new_in(self.alloc);
+                encode_verified(&cert, pairs.as_slice(), &mut vbytes);
+                let vstate_key = CasKey(ContentId::of(VERIFIED_STATE_DOMAIN, vbytes.as_slice()));
+                let vptr_key = verified_ptr_key(slot.id);
+                self.lent.put(&vstate_key, Namespace::LOCAL, TestIndex::TAG, vbytes.as_slice()).map_err(store_err)?;
+                self.lent.point(TestIndex::TAG, &vptr_key, &vstate_key).map_err(store_err)?;
+                verified_keys = Some((vptr_key, vstate_key));
+                verified_changed = true;
+            }
+
             if !slot.dirty {
+                if verified_changed
+                    && let Some((vptr_key, vstate_key)) = verified_keys
+                {
+                    let mut pinned: AVec<'_, CasKey> = Vec::with_capacity_in(slot.loaded_root_keys.len() + 2, self.alloc);
+                    pinned.extend_from_slice(slot.loaded_root_keys.as_slice());
+                    pinned.push(vptr_key);
+                    pinned.push(vstate_key);
+                    roots::keep_test_suite(self.lent, &slot.id, pinned.as_slice()).map_err(root_err)?;
+                }
                 continue;
             }
             let (head_key, head_bytes_slice): (CasKey, &[u8]) = match &slot.new_head {
@@ -681,21 +782,19 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
             live_results.sort_unstable();
             live_results.dedup();
 
-            // Encode SuiteState deterministically.
+            // Encode SuiteState deterministically (sorted by `symbol`, rule 25).
             let mut state_bytes: AVec<'_, u8> = Vec::new_in(self.alloc);
             state_bytes.extend_from_slice(&STATE_MAGIC);
             state_bytes.extend_from_slice(&STATE_VERSION.to_le_bytes());
             state_bytes.extend_from_slice(&head_key.0.0);
             state_bytes.extend_from_slice(&postings_key.0.0);
-            let kept_fns: AVec<'_, usize> = {
-                let mut v = Vec::new_in(self.alloc);
-                for (i, f) in slot.fns.iter().enumerate() {
-                    if live_fns.binary_search(&f.symbol).is_ok() && f.now_key.is_some() {
-                        v.push(i);
-                    }
+            let mut kept_fns: AVec<'_, usize> = Vec::new_in(self.alloc);
+            for (i, f) in slot.fns.iter().enumerate() {
+                if live_fns.binary_search(&f.symbol).is_ok() && f.now_key.is_some() {
+                    kept_fns.push(i);
                 }
-                v
-            };
+            }
+            kept_fns.sort_unstable_by_key(|&i| slot.fns.get(i).map(|f| f.symbol));
             let fn_count = u32::try_from(kept_fns.len()).unwrap_or(u32::MAX);
             let res_count = u32::try_from(live_results.len()).unwrap_or(u32::MAX);
             state_bytes.extend_from_slice(&fn_count.to_le_bytes());
@@ -716,17 +815,19 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
 
             let state_key = CasKey(ContentId::of(SUITE_STATE_DOMAIN, state_bytes.as_slice()));
             let ptr_key = suite_ptr_key(slot.id);
-            let store_err = |e: LentError| DriveError::CacheStore { what: "writing test suite cache", why: CacheError::Store(e) };
-            let root_err = |e: RootError| DriveError::CacheStore { what: "pinning test suite root", why: CacheError::Root(e) };
             self.lent.put(&state_key, Namespace::LOCAL, TestIndex::TAG, state_bytes.as_slice()).map_err(store_err)?;
             self.lent.point(TestIndex::TAG, &ptr_key, &state_key).map_err(store_err)?;
 
-            let mut pinned: AVec<'_, CasKey> = Vec::with_capacity_in(4 + live_results.len(), self.alloc);
+            let mut pinned: AVec<'_, CasKey> = Vec::with_capacity_in(6 + live_results.len(), self.alloc);
             pinned.push(ptr_key);
             pinned.push(state_key);
             pinned.push(head_key);
             pinned.push(postings_key);
             pinned.extend_from_slice(live_results.as_slice());
+            if let Some((vptr_key, vstate_key)) = verified_keys {
+                pinned.push(vptr_key);
+                pinned.push(vstate_key);
+            }
             roots::keep_test_suite(self.lent, &slot.id, pinned.as_slice()).map_err(root_err)?;
         }
         Ok(())
@@ -748,7 +849,7 @@ impl<D: Driver> Answers for TestCache<'_, '_, D> {
         };
         let mut pairs: AVec<'_, (FnName, [u8; 32])> = Vec::with_capacity_in(entered.len(), self.alloc);
         for &name in entered {
-            if let Ok(at) = slot.fns.binary_search_by_key(&name, |f| f.symbol)
+            if let Some(&at) = slot.fn_index.get(&name.0)
                 && let Some(key) = slot.fns.get(at).and_then(|f| f.now_key)
             {
                 pairs.push((name, key));
@@ -818,10 +919,65 @@ impl<D: Driver> Filed for TestCache<'_, '_, D> {
 }
 
 struct LoadedState<'a, 'm> {
+    ptr_key: CasKey,
+    state_key: CasKey,
+    head_key: CasKey,
+    postings_key: CasKey,
     head_bytes: &'m [u8],
     postings_bytes: &'m [u8],
     fns: AVec<'a, FnEntry<'a>>,
     result_keys: AVec<'a, CasKey>,
+}
+
+fn encode_verified(
+    certificate: &crate::start_list::Certificate,
+    pairs: &[([u8; 32], [u8; 32])],
+    out: &mut AVec<'_, u8>,
+) {
+    let count = pairs.len().min(MOST_VERIFIED_PERSISTED);
+    out.reserve(4 + 4 + 32 + 4 + count * 64);
+    out.extend_from_slice(&VERIFIED_MAGIC);
+    out.extend_from_slice(&VERIFIED_VERSION.to_le_bytes());
+    out.extend_from_slice(certificate.bytes());
+    out.extend_from_slice(&u32::try_from(count).unwrap_or(u32::MAX).to_le_bytes());
+    for &(key, under) in pairs.iter().take(count) {
+        out.extend_from_slice(&key);
+        out.extend_from_slice(&under);
+    }
+}
+
+fn decode_verified(
+    bytes: &[u8],
+    certificate: &crate::start_list::Certificate,
+    into: &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+) -> Option<usize> {
+    let header_len = 4 + 4 + 32 + 4;
+    if bytes.len() < header_len || bytes.get(0..4) != Some(&VERIFIED_MAGIC) {
+        return None;
+    }
+    let version = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
+    if version != VERIFIED_VERSION {
+        return None;
+    }
+    if bytes.get(8..40) != Some(certificate.bytes().as_slice()) {
+        return None;
+    }
+    let count = usize::try_from(u32::from_le_bytes(bytes.get(40..44)?.try_into().ok()?)).ok()?;
+    let payload = count.checked_mul(64)?;
+    if bytes.len().checked_sub(header_len)? != payload {
+        return None;
+    }
+    let mut at = header_len;
+    let mut loaded = 0usize;
+    for _ in 0..count {
+        let key: [u8; 32] = bytes.get(at..at + 32)?.try_into().ok()?;
+        let under: [u8; 32] = bytes.get(at + 32..at + 64)?.try_into().ok()?;
+        at += 64;
+        if into.insert((key, under)) {
+            loaded += 1;
+        }
+    }
+    Some(loaded)
 }
 
 fn load_suite_state<'a, 'm, D: Driver>(lent: &'m Lent<D, StoreAlloc>, suite: ContentId, alloc: Alloc<'a>) -> Option<LoadedState<'a, 'm>> {
@@ -895,7 +1051,7 @@ fn load_suite_state<'a, 'm, D: Driver>(lent: &'m Lent<D, StoreAlloc>, suite: Con
     if postings_lend.tag != TestPostings::TAG {
         return None;
     }
-    Some(LoadedState { head_bytes: head_lend.bytes, postings_bytes: postings_lend.bytes, fns, result_keys })
+    Some(LoadedState { ptr_key, state_key, head_key, postings_key, head_bytes: head_lend.bytes, postings_bytes: postings_lend.bytes, fns, result_keys })
 }
 
 #[cfg(test)]
@@ -958,5 +1114,25 @@ mod tests {
             // `svc #0x80` -> Foreign
             assert_eq!(check_record_purity(&build_record(&0xD400_1001u32.to_le_bytes(), None)), Err(NotKept::Foreign));
         }
+    }
+
+    #[test]
+    fn verified_cache_round_trips_under_matching_certificate_and_rejects_stale_certificate() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let today = crate::start_list::Certificate::for_tests([0xaa; 32]);
+        let moved = crate::start_list::Certificate::for_tests([0xbb; 32]);
+        let pairs = [([1u8; 32], [2u8; 32]), ([3u8; 32], [4u8; 32])];
+        let mut bytes = Vec::new_in(alloc);
+        encode_verified(&today, &pairs, &mut bytes);
+
+        let mut loaded = Set::new(blaze_hash::SetOpts { hasher: FixedState, alloc, capacity: None });
+        assert_eq!(decode_verified(bytes.as_slice(), &today, &mut loaded), Some(2));
+        assert!(loaded.contains(&([1u8; 32], [2u8; 32])));
+        assert!(loaded.contains(&([3u8; 32], [4u8; 32])));
+
+        // Planted control: a changed workspace certificate must reject all cached verdicts.
+        let mut stale = Set::new(blaze_hash::SetOpts { hasher: FixedState, alloc, capacity: None });
+        assert_eq!(decode_verified(bytes.as_slice(), &moved, &mut stale), None);
+        assert!(stale.is_empty());
     }
 }

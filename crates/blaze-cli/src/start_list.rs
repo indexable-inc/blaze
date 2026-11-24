@@ -245,7 +245,7 @@ impl Certificate {
     }
 
     /// Its bytes, as the list's head holds them.
-    fn bytes(&self) -> &[u8; 32] {
+    pub(crate) fn bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }

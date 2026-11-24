@@ -883,6 +883,10 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         if let Some(kind) = self.statics.kind(item) {
             Ok(kind)
         } else {
+            // Locate the static first so body-local statics (e.g. `static X: OnceLock<..>`
+            // inside a cached function whose enclosing body was not lowered in this run) are
+            // registered in `self.front.keys` before `one_static` evaluates them.
+            self.locate(item)?;
             let made = {
                 let mut r = self.records(true);
                 crate::front2::statics::one_static(&mut r, item)

@@ -568,6 +568,99 @@ impl core::error::Error for RunModeError {}
 /// No slot: the value an empty row of a slot map holds.
 const NONE: u32 = u32::MAX;
 
+/// Append-only open-addressed O(1) map keyed by 32-byte BLAKE3 hashes (`Symbol` / `RecordId`).
+/// Keys are cryptographic digests so the first 8 bytes are already uniformly distributed.
+pub(super) struct HashIndexMap<'a, V> {
+    entries: AVec<'a, ([u8; 32], V)>,
+    /// Power-of-two table; 0 = empty, else `entry_index + 1`. Load factor <= 0.5.
+    slots: AVec<'a, u32>,
+    alloc: Alloc<'a>,
+}
+
+impl<'a, V> HashIndexMap<'a, V> {
+    pub(super) fn new_in(alloc: Alloc<'a>) -> Self {
+        Self { entries: Vec::new_in(alloc), slots: Vec::new_in(alloc), alloc }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn slot_of(key: &[u8; 32], mask: usize) -> usize {
+        let head = u64::from_le_bytes([key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]]);
+        let mask_u64 = u64::try_from(mask).unwrap_or(u64::MAX);
+        usize::try_from(head & mask_u64).unwrap_or(0)
+    }
+
+    fn find(&self, key: &[u8; 32]) -> Result<usize, usize> {
+        let mask = self.slots.len().saturating_sub(1);
+        let mut at = Self::slot_of(key, mask);
+        loop {
+            match self.slots.get(at).copied() {
+                None | Some(0) => return Err(at),
+                Some(n) => {
+                    let idx = usize::try_from(n - 1).unwrap_or(usize::MAX);
+                    if self.entries.get(idx).is_some_and(|entry| entry.0 == *key) {
+                        return Ok(idx);
+                    }
+                    at = (at + 1) & mask;
+                }
+            }
+        }
+    }
+
+    fn grow(&mut self) {
+        let len = (self.slots.len() * 2).max(16);
+        let mut slots: AVec<'a, u32> = Vec::with_capacity_in(len, self.alloc);
+        slots.resize(len, 0);
+        self.slots = slots;
+        for idx in 0..self.entries.len() {
+            let Some(key) = self.entries.get(idx).map(|entry| entry.0) else {
+                continue;
+            };
+            if let Err(at) = self.find(&key)
+                && let Some(slot) = self.slots.get_mut(at)
+            {
+                *slot = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+            }
+        }
+    }
+
+    pub(super) fn contains_key(&self, key: &[u8; 32]) -> bool {
+        !self.slots.is_empty() && self.find(key).is_ok()
+    }
+
+    pub(super) fn get(&self, key: &[u8; 32]) -> Option<&V> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let idx = self.find(key).ok()?;
+        self.entries.get(idx).map(|entry| &entry.1)
+    }
+
+    /// Inserts `(key, value)` if absent. Returns `true` if inserted, `false` if already present.
+    pub(super) fn insert(&mut self, key: [u8; 32], value: V) -> bool {
+        if (self.entries.len() + 1) * 2 > self.slots.len() {
+            self.grow();
+        }
+        match self.find(&key) {
+            Ok(_) => false,
+            Err(at) => {
+                let idx = self.entries.len();
+                self.entries.push((key, value));
+                if let Some(slot) = self.slots.get_mut(at) {
+                    *slot = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+                }
+                true
+            }
+        }
+    }
+}
+
 /// The run's slots: the first-call machine, each local slot's symbol, and the parent's numbers.
 struct Numbering<'a> {
     first: FirstCall<'a>,
@@ -577,12 +670,12 @@ struct Numbering<'a> {
     to_wire: AVec<'a, u32>,
     /// By the parent's slot: the local slot, or [`NONE`].
     to_local: AVec<'a, u32>,
-    /// Every symbol the parent declared, sorted, with its local slot: how a C name the program
-    /// defines (its symbol `Symbol::of_name`, run_mode/bind.rs) is found without numbering it.
-    declared: AVec<'a, (CodeSymbol, SlotId)>,
-    /// Every C name symbol the run's strategy bound, sorted: a later declaration or static of
+    /// Every symbol the parent declared, with its local slot: how a C name the program
+    /// defines (its symbol `Symbol::of_name`, run_mode/bind.rs) is found in O(1) without numbering it.
+    declared: HashIndexMap<'a, SlotId>,
+    /// Every C name symbol the run's strategy bound: a later declaration or static of
     /// one is [`RunModeError::DefinedAfterBound`], so no name has two answers in one run.
-    bound_outside: AVec<'a, CodeSymbol>,
+    bound_outside: HashIndexMap<'a, ()>,
     alloc: Alloc<'a>,
 }
 
@@ -606,7 +699,7 @@ impl<'a> Numbering<'a> {
 
     /// The local slot of `symbol` when the parent declared it; `None` numbers nothing.
     fn declared(&self, symbol: CodeSymbol) -> Option<SlotId> {
-        self.declared.binary_search_by_key(&symbol, |&(it, _)| it).ok().map(|at| self.declared[at].1)
+        self.declared.get(&symbol.0).copied()
     }
 
     fn wire(&self, slot: SlotId) -> Option<Slot> {
@@ -650,8 +743,8 @@ pub struct RunMode<'a> {
     /// The program's native library: waiting for the parent's `Native`, declared, or loaded
     /// (run_mode/native.rs).
     native: native::NativeState<'a>,
-    /// Every static placed or being placed, sorted by symbol: its word's number and its address.
-    statics: AVec<'a, (CodeSymbol, StaticAt)>,
+    /// Every static placed or being placed, indexed by symbol: its word's number and its address.
+    statics: HashIndexMap<'a, StaticAt>,
     /// The statics the parent told and [`Act::Statics`] has not placed yet, in its order.
     told: AVec<'a, (CodeSymbol, RecordId)>,
     /// The run's thread-local descriptor and indexes (run_mode/thread_locals.rs).
@@ -681,8 +774,8 @@ impl<'a> RunMode<'a> {
                 symbols: Vec::new_in(alloc),
                 to_wire: Vec::new_in(alloc),
                 to_local: Vec::new_in(alloc),
-                declared: Vec::new_in(alloc),
-                bound_outside: Vec::new_in(alloc),
+                declared: HashIndexMap::new_in(alloc),
+                bound_outside: HashIndexMap::new_in(alloc),
                 alloc,
             },
             inbox: Vec::new_in(alloc),
@@ -696,7 +789,7 @@ impl<'a> RunMode<'a> {
             stopped: false,
             personality: None,
             native: native::NativeState::Waiting,
-            statics: Vec::new_in(alloc),
+            statics: HashIndexMap::new_in(alloc),
             told: Vec::new_in(alloc),
             thread_locals: thread_locals::ThreadLocals::new(),
             received: received::Received::new(alloc),
@@ -806,10 +899,10 @@ impl<'a> RunMode<'a> {
             Down::Data { data } => {
                 for told in data.iter() {
                     let symbol = CodeSymbol(told.symbol.0);
-                    if self.slots.bound_outside.binary_search(&symbol).is_ok() {
+                    if self.slots.bound_outside.contains_key(&symbol.0) {
                         return Err(RunModeError::DefinedAfterBound { symbol });
                     }
-                    let placed = self.statics.binary_search_by_key(&symbol, |&(it, _)| it).is_ok();
+                    let placed = self.statics.contains_key(&symbol.0);
                     if placed || self.told.iter().any(|&(it, _)| it == symbol) {
                         return Err(RunModeError::StaticTwice { symbol: told.symbol });
                     }
@@ -933,15 +1026,13 @@ impl<'a> RunMode<'a> {
         match (had_local, had_wire) {
             (NONE, NONE) => {
                 let symbol = CodeSymbol(symbol.0);
-                if self.slots.bound_outside.binary_search(&symbol).is_ok() {
+                if self.slots.bound_outside.contains_key(&symbol.0) {
                     return Err(RunModeError::DefinedAfterBound { symbol });
                 }
                 self.slots.to_local[at] = local.0;
                 self.slots.to_wire[local.index()] = wire.0;
                 // Not found: `to_wire` was NONE, so this symbol was never declared before.
-                if let Err(pos) = self.slots.declared.binary_search_by_key(&symbol, |&(it, _)| it) {
-                    self.slots.declared.insert_shift(pos, (symbol, local));
-                }
+                self.slots.declared.insert(symbol.0, local);
             }
             (l, w) if l == local.0 && w == wire.0 => {}
             _ => return Err(RunModeError::Redeclared { slot: wire, symbol }),
@@ -1046,9 +1137,8 @@ impl<'a> RunMode<'a> {
                 DatumPlace::Writable | DatumPlace::Zeroed { .. } => (memory.reserve_data(len, align)?, Room::Data),
             };
             let row = StaticAt { index, at, len: view.len(), align: view.align() };
-            match self.statics.binary_search_by_key(&symbol, |&(it, _)| it) {
-                Ok(_) => return Err(RunModeError::StaticTwice { symbol: WireSymbol(symbol.0) }),
-                Err(pos) => self.statics.insert_shift(pos, (symbol, row)),
+            if !self.statics.insert(symbol.0, row) {
+                return Err(RunModeError::StaticTwice { symbol: WireSymbol(symbol.0) });
             }
             metas.push((symbol, record, row, room));
         }
@@ -1214,8 +1304,8 @@ impl<'a> RunMode<'a> {
 /// whole in `refused` (the trait's error type is the image's); the caller returns it.
 struct Binder<'s, 'a, M: Memory> {
     slots: &'s mut Numbering<'a>,
-    /// The statics placed (or given their room in this batch), sorted by symbol.
-    statics: &'s [(CodeSymbol, StaticAt)],
+    /// The statics placed (or given their room in this batch), indexed by symbol.
+    statics: &'s HashIndexMap<'a, StaticAt>,
     /// The run's thread-local indexes: a load of a thread-local's index numbers it.
     thread_locals: &'s mut thread_locals::ThreadLocals<'a>,
     memory: &'s mut M,
@@ -1269,16 +1359,14 @@ impl<M: Memory> Binder<'_, '_, M> {
         if let Some(slot) = self.slots.declared(symbol) {
             return Ok(Bound::Slot(slot));
         }
-        if let Ok(at) = self.statics.binary_search_by_key(&symbol, |&(it, _)| it) {
-            return Ok(Bound::Static(self.statics[at].1));
+        if let Some(&at) = self.statics.get(&symbol.0) {
+            return Ok(Bound::Static(at));
         }
         let Some(name) = self.names.name(symbol) else {
             return Err(RunModeError::Outside { record: self.record, symbol, name: CName::NONE, why: "the record keeps no name for it" });
         };
         let bound = self.memory.outside(self.record, symbol, name)?;
-        if let Err(at) = self.slots.bound_outside.binary_search(&symbol) {
-            self.slots.bound_outside.insert_shift(at, symbol);
-        }
+        self.slots.bound_outside.insert(symbol.0, ());
         Ok(Bound::Outside(bound))
     }
 
@@ -1308,9 +1396,9 @@ impl<M: Memory> Binder<'_, '_, M> {
 
     /// Static `symbol`, which the parent sent before the record naming it.
     fn static_at(&self, symbol: CodeSymbol) -> Result<StaticAt, RunModeError> {
-        match self.statics.binary_search_by_key(&symbol, |&(it, _)| it) {
-            Ok(at) => Ok(self.statics[at].1),
-            Err(_) => Err(RunModeError::StaticNotTold { record: self.record, symbol }),
+        match self.statics.get(&symbol.0) {
+            Some(&at) => Ok(at),
+            None => Err(RunModeError::StaticNotTold { record: self.record, symbol }),
         }
     }
 

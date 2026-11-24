@@ -93,6 +93,9 @@ use crate::store::CommandLent;
 use crate::test_loop::{CannotRun, Effect, Event, LoopConfig, LoopError, Status, SuiteId, TestLoop};
 use crate::test_run::{Answers, ChildEnd, Heard, Host as TestHost, RunError, Runner, Start, Zygotes};
 
+#[path = "test_suite_cache.rs"]
+mod suite_cache;
+
 /// The system's launcher of `sandbox_init` (blaze-proc-macro native_sandbox.rs uses the same):
 /// it applies the profile, then executes the launcher in its place, so the launcher's process is
 /// the test's and its end is the test's end.
@@ -359,12 +362,16 @@ impl fmt::Display for InstanceRefusal {
 /// wire error, or an invariant of the parent stops the command; a names-record read that did
 /// not answer while one instance was made (`LazyRefusal::RecordsVoid`) is that test's. Keep the walk alive until the instance and item-relative site have been named.
 fn test_parent_error<F: Front, D: run_parent::Folder>(lazy: &mut Lazy<'_, '_, F, D>, cause: ParentError) -> OneError {
+    test_parent_error_places(lazy, cause)
+}
+
+fn test_parent_error_places(places: &mut impl crate::run_fault::Places, cause: ParentError) -> OneError {
     let Some((symbol, location)) = instance_site(&cause) else { return OneError::Parent(cause) };
-    let site = location.map(|(item, byte)| match lazy.site_of(item, byte) {
+    let site = location.map(|(item, byte)| match places.site(item, byte) {
         Some(shown) => InstanceSite::Source(shown),
         None => InstanceSite::Item { item, byte },
     });
-    OneError::CannotBuild(InstanceRefusal { instance: lazy.name_of(symbol), symbol, site, cause: RefusalCause::Build(cause) })
+    OneError::CannotBuild(InstanceRefusal { instance: places.named(symbol), symbol, site, cause: RefusalCause::Build(cause) })
 }
 
 /// The test whose instance could not be made, and where (its tabled fn and [`refused_byte`]),
@@ -835,6 +842,9 @@ pub(crate) struct Signals {
     /// after its process started: passed in by [`OneEach`] before each poll so `run_captured`
     /// extends its own `until` deadline by the same amount the runner credits.
     stalled: Cell<u64>,
+    /// Set by any child turn that observed socket/pipe I/O, started a child, or handled a reply,
+    /// so [`OneEach::wait`] immediately does another non-blocking sweep instead of sleeping.
+    progress: Cell<bool>,
 }
 
 /// What one child's run was doing on the command thread. Every child is served by that one
@@ -1133,10 +1143,15 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
             let before_sweep = (self.now)();
             let left = Duration::from_nanos(until.0.saturating_sub(before_sweep.0));
             self.signals.wait.set(interval.min(left));
+            self.signals.progress.set(false);
             self.sweep(&mut context)?;
             swept = true;
             crossed_until = before_sweep < until && (self.now)() >= until;
-            interval = DRAIN_EVERY;
+            interval = if self.signals.progress.get() {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(1).min(DRAIN_EVERY)
+            };
         }
         // If `until` was crossed mid-sweep, give every remaining child one non-blocking poll so
         // earlier-indexed children can report ready exits, enforce their own timeout, or refresh
@@ -2366,6 +2381,9 @@ pub(crate) struct Launched<'c, 'h, 'a> {
     pub entered_sink: &'c RefCell<AVec<'a, (SuiteId, crate::test_cache::EnteredFn<'a>)>>,
     /// Allocator matching `entered_sink`'s lifetime.
     pub cache_alloc: Alloc<'a>,
+    /// Suite-wide shared walk, maker, verified set, and publication cache (borrowed strictly
+    /// within synchronous calls, never across `.await`, rule 27).
+    pub suite_cache: &'c RefCell<suite_cache::SuiteCache<'h>>,
 }
 
 /// The test profile with the one grant a native image needs: `dlopen` maps `<store>/<64 hex>`
@@ -2548,6 +2566,9 @@ impl<'c> Launched<'c, '_, '_> {
     }
 
     async fn run_captured(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals, stderr: &mut StderrCapture<'_>, frame: &Frame) -> Result<RunOutcome, OneError> {
+        if self.codes.is_none() {
+            return self.run_captured_cached(row, budget, output, signals, stderr, frame).await;
+        }
         let cx = self.cx;
         let test = key_of(&self.tests, row)?;
         // The test's own frame: everything of its run, dropped with it.
@@ -2598,8 +2619,7 @@ impl<'c> Launched<'c, '_, '_> {
             vars.push(("BLAZE_LAUNCH_NATIVE", send.hex));
         }
         // 4. The profile (blaze-run child.rs, the one test profile), the launcher under it.
-        let profile = blaze_run::child::seatbelt(temp.as_str(), None, alloc).map_err(|why| OneError::Profile { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) })?;
-        let profile = with_native(profile, self.store, self.native)?;
+        let profile = seatbelt_profile(temp.as_str(), self.store, self.native, frame, alloc)?;
         let mut args = Vec::with_capacity_in(self.args.len() + 3, frame);
         args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
         args.extend_from_slice(self.args);
@@ -2720,11 +2740,16 @@ impl<'c> Launched<'c, '_, '_> {
                 RelayAct::Nothing => {}
             }
             let bound = until.min(relay.bound());
-            drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)?;
+            if drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)? {
+                signals.progress.set(true);
+            }
             if open && !reply.is_empty() {
                 let by = Deadline::after(run.now(), WRITE_BOUND).min(bound);
                 match run.send(&reply, by) {
-                    Ok(()) => published = calls.len(),
+                    Ok(()) => {
+                        published = calls.len();
+                        signals.progress.set(true);
+                    }
                     Err(ProcError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => open = false,
                     Err(error) => return Err(child_error(error)),
                 }
@@ -2738,9 +2763,13 @@ impl<'c> Launched<'c, '_, '_> {
                     Some(inbox.len())
                 } else {
                     match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, poll) {
-                        Ok(Message::Whole { len }) => Some(len),
+                        Ok(Message::Whole { len }) => {
+                            signals.progress.set(true);
+                            Some(len)
+                        }
                         Ok(Message::Closed) => {
                             open = false;
+                            signals.progress.set(true);
                             None
                         }
                         Err(error @ ProcError { fault: RunFault::Channel(ChannelError::Torn { .. }), .. }) => {
@@ -2758,7 +2787,8 @@ impl<'c> Launched<'c, '_, '_> {
                         let serving = run.now();
                         let before = lazy.tally();
                         let mut resolver = TestResolve { parent: &mut lazy, requested: None };
-                        let taken = match needs.serve(&mut resolver, &inbox[..len], &mut reply) {
+                        let frame_bytes = inbox.get(..len).unwrap_or(inbox.as_slice());
+                    let taken = match needs.serve(&mut resolver, frame_bytes, &mut reply) {
                             Ok(taken) => taken,
                             Err(cause) => {
                                 signals.add_host_nanos(run.now().saturating_sub(serving));
@@ -2855,6 +2885,15 @@ impl<'c> Launched<'c, '_, '_> {
                         let left = inbox.len() - taken;
                         inbox.copy_within(taken.., 0);
                         inbox.truncate(left);
+                        if open && !reply.is_empty() {
+                            let by = Deadline::after(run.now(), WRITE_BOUND).min(bound);
+                            match run.send(&reply, by) {
+                                Ok(()) => published = calls.len(),
+                                Err(ProcError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => open = false,
+                                Err(error) => return Err(child_error(error)),
+                            }
+                            reply.clear();
+                        }
                         continue;
                 }
             }
@@ -2870,123 +2909,33 @@ impl<'c> Launched<'c, '_, '_> {
             let drain_until = Deadline::after(over_ref.now(), DRAIN_AFTER);
             while pipes.iter().any(Option::is_some) && !drain_until.passed(over_ref.now()) {
                 let poll = Deadline::after(over_ref.now(), signals.wait.replace(Duration::ZERO)).min(drain_until);
-                drain_pipes(cx, &mut pipes, output, stderr, poll)?;
+                let _ = drain_pipes(cx, &mut pipes, output, stderr, poll)?;
                 if pipes.iter().any(Option::is_some) {
                     next_turn().await;
                 }
             }
         } else {
-            drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)?;
+            let _ = drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)?;
         }
         if let How::Signal { number } = ended {
-            let path = self.tests.row(row as usize).map_err(OneError::Record)?.ok_or(OneError::NoRow { row })?.path;
-            let err = self.err;
-            let diagnostic = OneError::Diagnostic;
-            err.line(cx, format_args!("---- {}/{}/{path} signal {number}: stderr ({} bytes) ----", self.package, self.target, stderr.bytes)).map_err(diagnostic)?;
-            let mut first = [0u8; 4000];
-            let wanted = stderr.bytes.min(first.len() as u64) as usize;
-            let held = wanted.min(stderr.prefix.len());
-            first[..held].copy_from_slice(&stderr.prefix[..held]);
-            if held < wanted {
-                // The spill starts immediately after the in-memory prefix, even when
-                // the first pipe read was too large to keep any prefix.
-                let file = stderr.dir.open_read(cx, &stderr.path).map_err(OneError::Capture)?;
-                let mut read = held;
-                while read < wanted {
-                    let n = file.read_into(&mut first[read..wanted], (read - held) as u64).wait(cx).map_err(OneError::Capture)?;
-                    if n == 0 {
-                        return Err(OneError::ShortCapture { read: read as u64, written: stderr.bytes });
-                    }
-                    read += n;
-                }
-            }
-            let mut line = [0u8; 101];
-            let mut width = 0;
-            for &byte in &first[..wanted] {
-                let escaped = core::ascii::escape_default(byte);
-                if width + escaped.len() > 100 {
-                    line[width] = b'\n';
-                    err.write_all(cx, &line[..=width]).map_err(diagnostic)?;
-                    width = 0;
-                }
-                for ascii in escaped {
-                    line[width] = ascii;
-                    width += 1;
-                }
-            }
-            if width != 0 {
-                line[width] = b'\n';
-                err.write_all(cx, &line[..=width]).map_err(diagnostic)?;
-            }
-            err.line(cx, "---- end escaped stderr ----").map_err(diagnostic)?;
-            if pipes[1].is_some() {
-                err.line(cx, "\nstderr was still open at the post-exit drain deadline").map_err(diagnostic)?;
-            }
-            err.line(cx, format_args!("\nfirst calls: {}; parent serving requests: {service_time:?}; {}", calls.len(), lazy.tally())).map_err(diagnostic)?;
-            match calls[..published].last() {
-                Some(call) => err.line(cx, format_args!("last published: {}", InstanceName(&lazy.name_of(call.symbol.0), call.symbol.0))),
-                None => err.line(cx, "last published: none"),
-            }.map_err(diagnostic)?;
-            for call in &calls[published..] {
-                err.line(cx, format_args!("pending need: {}", InstanceName(&lazy.name_of(call.symbol.0), call.symbol.0))).map_err(diagnostic)?;
-            }
-            // A last request or fault may have reached fd 3 between the final poll and
-            // waitpid. Read already-queued messages without building anything for a dead child.
-            let mut fault = needs.fault();
-            let mut queued = false;
-            let wire_error = |why| OneError::Parent(ParentError::Wire(why));
-            if let Some(over) = over.as_mut() {
-                let read_until = Deadline::after(over.now(), DRAIN_AFTER);
-                while torn.is_none() && !read_until.passed(over.now()) {
-                    match over.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, Deadline::PASSED) {
-                        Ok(Message::Whole { len }) => {
-                            let (_, up) = blaze_launch::wire::run::Up::decode(&inbox[4..len]).map_err(wire_error)?;
-                            match up {
-                                blaze_launch::wire::run::Up::Need { need, .. } => {
-                                    queued = true;
-                                    err.line(cx, format_args!("pending need (received after exit): {need:?}")).map_err(diagnostic)?;
-                                }
-                                blaze_launch::wire::run::Up::Fault { fault: last } => {
-                                    if fault.is_none() {
-                                        fault = Some(last);
-                                    }
-                                }
-                            }
-                            let left = inbox.len() - len;
-                            inbox.copy_within(len.., 0);
-                            inbox.truncate(left);
-                        }
-                        Ok(Message::Closed | Message::Deadline) => break,
-                        Err(error @ ProcError { fault: RunFault::Channel(ChannelError::Torn { .. }), .. }) => torn = Some(error),
-                        Err(error) => return Err(child_error(error)),
-                    }
-                }
-            }
-            if !queued && calls.len() == published && inbox.is_empty() {
-                err.line(cx, "pending need: none").map_err(diagnostic)?;
-            }
-            if let Some(error) = torn {
-                err.line(cx, format_args!("incomplete first-call channel message: {error}")).map_err(diagnostic)?;
-            } else if !inbox.is_empty() {
-                err.line(cx, format_args!("unprocessed first-call channel bytes at exit: {}", inbox.len())).map_err(diagnostic)?;
-            }
-            err.line(cx, "refusal stub: no refused first call observed by the parent").map_err(diagnostic)?;
-            if let Some(fault) = fault {
-                let mut bytes = bstd::mem::Bytes::new_in(frame, "the code record a test struck in");
-                let record = match fault.at {
-                    Some(spot) if spot.placed == blaze_launch::wire::fault::Placed::Code => Some(lazy.read_record(&spot.record, &mut bytes).map(|()| bytes.as_slice())),
-                    _ => None,
-                };
-                err.line(cx, format_args!("{}", crate::run_fault::report(fault, &mut lazy, record))).map_err(diagnostic)?;
-            } else {
-                err.line(cx, format_args!("the launcher sent no fault location for signal {number}")).map_err(diagnostic)?;
-            }
-            for call in &calls[..published] {
-                err.line(cx, format_args!("published: {} in {:?} (records made {}, found {}, unkeyed {})",
-                    InstanceName(&lazy.name_of(call.symbol.0), call.symbol.0), call.elapsed, call.made, call.found, call.unkeyed)).map_err(diagnostic)?;
-            }
-            err.line(cx, "---- end signal report ----").map_err(diagnostic)?;
-            err.flush(cx).map_err(diagnostic)?;
+            let tally = lazy.tally();
+            self.write_signal_report(
+                row,
+                number,
+                stderr,
+                pipes[1].is_some(),
+                service_time,
+                tally,
+                calls.as_slice(),
+                published,
+                &needs,
+                &mut over,
+                &mut inbox,
+                torn,
+                frame,
+                &mut lazy,
+                |lazy, rec, bytes| lazy.read_record(rec, bytes),
+            )?;
         } else if let Some(error) = torn {
             return Err(child_error(error));
         }
@@ -3007,6 +2956,522 @@ impl<'c> Launched<'c, '_, '_> {
         }
         Ok(RunOutcome { how: ended, keep, entered })
     }
+
+    /// Suite-cached serial execution path: shares one `Walk`, one `TestMaker`, one verified-entry
+    /// cache, and pre-resolved publications across all tests of the suite, with batch
+    /// pre-publishing for impure tests and heavy pure tests.
+    async fn run_captured_cached(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals, stderr: &mut StderrCapture<'_>, frame: &Frame) -> Result<RunOutcome, OneError> {
+        use suite_cache::{ChildAnswer, ChildResolver, ChildSent};
+
+        let cx = self.cx;
+        let test = key_of(&self.tests, row)?;
+        let erased = blaze_own::Erased::new(frame);
+        let alloc = erased.handle();
+        // 1. Per-test temporary folder.
+        let name = bstd::mem::format_in!(frame, "{row}");
+        let named = Path::new(name.as_str()).map_err(OneError::Path)?;
+        self.temps.make_dir(cx, &named, Durable::No).map_err(OneError::Temp)?;
+        let temp = bstd::mem::format_in!(frame, "{}/{row}", self.temp);
+        // 2. Per-test roots rooted into the suite's single shared walk.
+        let exports = self.native.map_or(&[][..], |send| send.items);
+        signals.begin(Doing::Roots);
+        let roots = entry_roots(self.tests.harnessed(), self.names, test, exports, self.builder, self.tables, alloc)
+            .map_err(|why| OneError::Parent(ParentError::Roots(why)))?;
+        let head = roots.head();
+        let test_entry = {
+            let mut sc = self.suite_cache.borrow_mut();
+            match sc.root_test(&roots) {
+                Ok(entry_sym) => entry_sym,
+                Err(cause) => return Err(test_parent_error_places(&mut *sc, cause)),
+            }
+        };
+        let mut codes = HomeCodeStore::new(self.lent);
+        let mut needs = Needs::new(alloc);
+        let mut child_sent = ChildSent::new(alloc);
+        let mut ahead = run_parent::wire_out(alloc);
+        let mut tally = run_parent::Tally::default();
+        if let Some(send) = self.native {
+            if let Err(cause) = needs.tell_native(send.library, send.words, &mut ahead) {
+                return Err(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause));
+            }
+        }
+        if let Err(cause) = needs.name_personality(head.personality, &mut ahead) {
+            return Err(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause));
+        }
+        let mut keep: Result<(), NotKept> = if !self.tests.harnessed() {
+            Err(NotKept::Untraced)
+        } else if self.native.is_some() {
+            Err(NotKept::Foreign)
+        } else {
+            Ok(())
+        };
+        let mut entered_fns: AVec<'_, crate::test_cache::EnteredFn<'_>> = Vec::new_in(self.cache_alloc);
+        // If this test is already impure at launch (native C image or custom harness), batch
+        // pre-publish the suite's warm functions into `ahead` before spawning.
+        if keep.is_err() {
+            let prep = self.suite_cache.borrow().prepublish_warm(
+                test_entry,
+                head,
+                false,
+                &mut child_sent,
+                &mut needs,
+                &mut ahead,
+                &mut entered_fns,
+                self.cache_alloc,
+                &mut tally,
+                alloc,
+            );
+            if let Err(cause) = prep {
+                return Err(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause));
+            }
+        }
+        let line = head.line;
+        let entry = bstd::mem::format_in!(frame, "{line}");
+        // 3. Environment.
+        let mut vars: Vec<(&str, &str), &Frame> = Vec::with_capacity_in(self.env.len() + self.place.vars.len() + 8, frame);
+        vars.push(("TMPDIR", temp.as_str()));
+        vars.extend_from_slice(self.place.vars);
+        let package = self.place.vars;
+        let command = self.env.iter().copied().filter(|(name, _)| *name != "TMPDIR" && package.binary_search_by(|(set, _)| set.cmp(name)).is_err());
+        run_parent::launch_env(command, self.store, entry.as_str(), None, &mut vars);
+        if let Some(send) = self.native {
+            vars.push(("BLAZE_LAUNCH_NATIVE", send.hex));
+        }
+        // 4. Seatbelt profile + spawn.
+        let profile = seatbelt_profile(temp.as_str(), self.store, self.native, frame, alloc)?;
+        let mut args = Vec::with_capacity_in(self.args.len() + 3, frame);
+        args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
+        args.extend_from_slice(self.args);
+        let spec = RunSpec { program: SANDBOX_EXEC, arg0: None, args: args.as_slice(), env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
+        signals.begin(Doing::Starting);
+        let Started { child: mut run, pipes: given } = self.spawner.start_served(cx, &spec).map_err(OneError::Start)?;
+        let started_at = run.now();
+        signals.started.set(true);
+        signals.progress.set(true);
+        let allowance = Duration::from_nanos(budget.0);
+        let stdout = given.stdout.ok_or(OneError::MissingPipe { stream: "stdout" })?;
+        let stderr_pipe = given.stderr.ok_or(OneError::MissingPipe { stream: "stderr" })?;
+        let mut pipes = [Some(stdout), Some(stderr_pipe)];
+        let mut relay = Relay::new(GRACE);
+        let mut inbox = run_parent::wire_out(alloc);
+        let mut reply = ahead;
+        let mut open = true;
+        let mut calls = Vec::new_in(alloc);
+        let mut published = 0;
+        let mut service_time = Duration::ZERO;
+        let mut torn = None;
+        let child_error = |error| OneError::Loop(RunLoopError::Child(error));
+        let (ended, mut over) = loop {
+            next_turn().await;
+            let _span = cx.span("blaze test: service one child's pipes, requests and deadline");
+            signals.begin(Doing::Relaying);
+            let now = run.now();
+            let host_stalled = Duration::from_nanos(signals.stalled.get());
+            let until = Deadline::after(started_at, allowance.saturating_add(host_stalled));
+            if until.passed(now) {
+                match stop_child(run).map_err(child_error)? {
+                    Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
+                    Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
+                    Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
+                }
+            }
+            match relay.turn(now, signals.terminate(now)?) {
+                RelayAct::Forward => {
+                    if let Err(error) = run.terminate() {
+                        if is_macos_group_eperm(&error, RunStep::Terminate) {
+                            match run.wait(Deadline::PASSED).map_err(child_error)? {
+                                Waited::Ended(reaped) => break (child_outcome(reaped.exit), Some(reaped.left)),
+                                Waited::Running(_) => return Err(child_error(error)),
+                            }
+                        }
+                        return Err(child_error(error));
+                    }
+                }
+                RelayAct::Kill => {
+                    match stop_child(run).map_err(child_error)? {
+                        Stopped::Exited { exit, left } | Stopped::Killed { exit, left } => break (child_outcome(exit), Some(left)),
+                        Stopped::ZombieRace => break (How::Signal { number: 9 }, None),
+                    }
+                }
+                RelayAct::Nothing => {}
+            }
+            let bound = until.min(relay.bound());
+            if drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)? {
+                signals.progress.set(true);
+            }
+            if open && !reply.is_empty() {
+                let by = Deadline::after(run.now(), WRITE_BOUND).min(bound);
+                match run.send(&reply, by) {
+                    Ok(()) => {
+                        published = calls.len();
+                        signals.progress.set(true);
+                    }
+                    Err(ProcError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => open = false,
+                    Err(error) => return Err(child_error(error)),
+                }
+                reply.clear();
+            }
+            let poll = Deadline::after(run.now(), signals.wait.replace(Duration::ZERO)).min(bound);
+            if open {
+                let got = match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, poll) {
+                    Ok(Message::Whole { len }) => {
+                        signals.progress.set(true);
+                        Some(len)
+                    }
+                    Ok(Message::Closed) => {
+                        open = false;
+                        signals.progress.set(true);
+                        None
+                    }
+                    Err(error @ ProcError { fault: RunFault::Channel(ChannelError::Torn { .. }), .. }) => {
+                        torn = Some(error);
+                        open = false;
+                        None
+                    }
+                    Ok(Message::Deadline) => None,
+                    Err(error) => return Err(child_error(error)),
+                };
+                if let Some(len) = got {
+                    self.watch.see(blaze_screen::Step::Waits);
+                    signals.begin(Doing::Serving);
+                    let serving = run.now();
+                    let was_keep_ok = keep.is_ok();
+                    let mut resolver = ChildResolver::new(
+                        self.suite_cache,
+                        &mut child_sent,
+                        &roots,
+                        test_entry,
+                        self.ids,
+                        &mut codes,
+                        cx,
+                        self.watch,
+                        &mut tally,
+                        &mut keep,
+                        &mut entered_fns,
+                        self.cache_alloc,
+                        alloc,
+                    );
+                    let frame_bytes = inbox.get(..len).unwrap_or(inbox.as_slice());
+                    let taken = match needs.serve(&mut resolver, frame_bytes, &mut reply) {
+                        Ok(taken) => taken,
+                        Err(cause) => {
+                            signals.add_host_nanos(run.now().saturating_sub(serving));
+                            stop_child(run).map_err(child_error)?;
+                            return Err(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause));
+                        }
+                    };
+                    let requested = resolver.requested.take();
+                    drop(resolver);
+                    match requested {
+                        Some(ChildAnswer::Unresolved(Symbol(symbol))) => {
+                            signals.add_host_nanos(run.now().saturating_sub(serving));
+                            stop_child(run).map_err(child_error)?;
+                            let instance = self.suite_cache.borrow().name_of(symbol);
+                            return Err(OneError::CannotBuild(InstanceRefusal {
+                                instance, symbol, site: None, cause: RefusalCause::Unresolved,
+                            }));
+                        }
+                        Some(ChildAnswer::Ready { symbol, counts, .. }) => {
+                            // Batch pre-publish:
+                            // (a) When a test becomes impure (or warm_order grew by >= 256 while impure),
+                            //     push all remaining warm suite functions in one batch.
+                            // (b) When a pure test makes >= 128 calls, push pure keyed toolchain functions
+                            //     once so heavy pure tests avoid stdlib IPC storms without breaking TestCache.
+                            let warm_len = self.suite_cache.borrow().warm_len();
+                            if keep.is_err()
+                                && child_sent.warm_cursor < warm_len
+                                && (was_keep_ok || warm_len.saturating_sub(child_sent.warm_cursor) >= 256)
+                            {
+                                if let Err(cause) = self.suite_cache.borrow().prepublish_warm(
+                                    test_entry,
+                                    head,
+                                    false,
+                                    &mut child_sent,
+                                    &mut needs,
+                                    &mut reply,
+                                    &mut entered_fns,
+                                    self.cache_alloc,
+                                    &mut tally,
+                                    alloc,
+                                ) {
+                                    signals.add_host_nanos(run.now().saturating_sub(serving));
+                                    stop_child(run).map_err(child_error)?;
+                                    return Err(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause));
+                                }
+                            } else if keep.is_ok() && !child_sent.pure_toolchain_flushed && calls.len() >= 128 && warm_len > 0 {
+                                if let Err(cause) = self.suite_cache.borrow().prepublish_warm(
+                                    test_entry,
+                                    head,
+                                    true,
+                                    &mut child_sent,
+                                    &mut needs,
+                                    &mut reply,
+                                    &mut entered_fns,
+                                    self.cache_alloc,
+                                    &mut tally,
+                                    alloc,
+                                ) {
+                                    signals.add_host_nanos(run.now().saturating_sub(serving));
+                                    stop_child(run).map_err(child_error)?;
+                                    return Err(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause));
+                                }
+                            }
+                            let elapsed = run.now().saturating_sub(serving);
+                            service_time += elapsed;
+                            signals.add_host_nanos(elapsed);
+                            calls.push(FirstCall {
+                                symbol, elapsed, made: counts.made, found: counts.found, unkeyed: counts.unkeyed,
+                            });
+                        }
+                        None => {
+                            let elapsed = run.now().saturating_sub(serving);
+                            service_time += elapsed;
+                            signals.add_host_nanos(elapsed);
+                        }
+                    }
+                    self.watch.see(blaze_screen::Step::Answers);
+                    let left = inbox.len() - taken;
+                    inbox.copy_within(taken.., 0);
+                    inbox.truncate(left);
+                    // Send immediately on the same turn so the child resumes without waiting an extra sweep.
+                    if open && !reply.is_empty() {
+                        let sending = run.now();
+                        let by = Deadline::after(sending, WRITE_BOUND).min(bound);
+                        match run.send(&reply, by) {
+                            Ok(()) => published = calls.len(),
+                            Err(ProcError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => open = false,
+                            Err(error) => return Err(child_error(error)),
+                        }
+                        let sent_elapsed = run.now().saturating_sub(sending);
+                        if sent_elapsed >= DRAIN_EVERY {
+                            signals.add_host_nanos(sent_elapsed);
+                        }
+                        reply.clear();
+                    }
+                    continue;
+                }
+            }
+            let look = if open { Deadline::PASSED } else { poll };
+            run = match run.wait(look).map_err(child_error)? {
+                Waited::Ended(reaped) => break (child_outcome(reaped.exit), Some(reaped.left)),
+                Waited::Running(running) => running,
+            };
+        };
+        if let Some(over_ref) = over.as_ref() {
+            let drain_until = Deadline::after(over_ref.now(), DRAIN_AFTER);
+            while pipes.iter().any(Option::is_some) && !drain_until.passed(over_ref.now()) {
+                let poll = Deadline::after(over_ref.now(), signals.wait.replace(Duration::ZERO)).min(drain_until);
+                let _ = drain_pipes(cx, &mut pipes, output, stderr, poll)?;
+                if pipes.iter().any(Option::is_some) {
+                    next_turn().await;
+                }
+            }
+        } else {
+            let _ = drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)?;
+        }
+        if let How::Signal { number } = ended {
+            let mut sc = self.suite_cache.borrow_mut();
+            self.write_signal_report(
+                row,
+                number,
+                stderr,
+                pipes[1].is_some(),
+                service_time,
+                tally,
+                calls.as_slice(),
+                published,
+                &needs,
+                &mut over,
+                &mut inbox,
+                torn,
+                frame,
+                &mut *sc,
+                |sc, rec, bytes| sc.read_record(rec, bytes),
+            )?;
+        } else if let Some(error) = torn {
+            return Err(child_error(error));
+        }
+        if entered_fns.is_empty() && keep.is_ok() {
+            keep = Err(NotKept::Untraced);
+        }
+        entered_fns.sort_unstable_by_key(|e| e.symbol);
+        entered_fns.dedup_by_key(|e| e.symbol);
+        let mut entered = Vec::with_capacity_in(entered_fns.len(), self.tables);
+        for e in entered_fns.iter() {
+            entered.push(e.symbol);
+        }
+        if !entered_fns.is_empty() {
+            let mut sink = self.entered_sink.borrow_mut();
+            for e in entered_fns {
+                sink.push((self.suite, e));
+            }
+        }
+        Ok(RunOutcome { how: ended, keep, entered })
+    }
+
+    /// Formats one signaled test child's diagnostic report (shared by `run_captured` and
+    /// `run_captured_cached`).
+    #[expect(clippy::too_many_arguments, reason = "formats one child's signal diagnostic from the run's captured state")]
+    fn write_signal_report<P, R>(
+        &self,
+        row: u32,
+        number: i32,
+        stderr: &StderrCapture<'_>,
+        stderr_open: bool,
+        service_time: Duration,
+        tally: run_parent::Tally,
+        calls: &[FirstCall],
+        published: usize,
+        needs: &Needs<'_>,
+        over: &mut Option<bstd::procs::ServedEnd>,
+        inbox: &mut run_parent::WireOut<Alloc<'_>>,
+        mut torn: Option<ProcError>,
+        frame: &Frame,
+        places: &mut P,
+        mut read_record: R,
+    ) -> Result<(), OneError>
+    where
+        P: crate::run_fault::Places,
+        R: FnMut(&mut P, &blaze_launch::wire::RecordId, &mut bstd::mem::Bytes<'_>) -> Result<(), ParentError>,
+    {
+        let cx = self.cx;
+        let row_idx = usize::try_from(row).unwrap_or(usize::MAX);
+        let path = self.tests.row(row_idx).map_err(OneError::Record)?.ok_or(OneError::NoRow { row })?.path;
+        let err = self.err;
+        let diagnostic = OneError::Diagnostic;
+        let child_error = |error| OneError::Loop(RunLoopError::Child(error));
+        err.line(cx, format_args!("---- {}/{}/{path} signal {number}: stderr ({} bytes) ----", self.package, self.target, stderr.bytes)).map_err(diagnostic)?;
+        let mut first = [0u8; 4000];
+        let cap = u64::try_from(first.len()).unwrap_or(u64::MAX);
+        let wanted = usize::try_from(stderr.bytes.min(cap)).unwrap_or(first.len());
+        let held = wanted.min(stderr.prefix.len());
+        if let (Some(dst), Some(src)) = (first.get_mut(..held), stderr.prefix.get(..held)) {
+            dst.copy_from_slice(src);
+        }
+        if held < wanted {
+            let file = stderr.dir.open_read(cx, &stderr.path).map_err(OneError::Capture)?;
+            let mut read = held;
+            while read < wanted {
+                let Some(slice) = first.get_mut(read..wanted) else { break };
+                let off = u64::try_from(read - held).unwrap_or(u64::MAX);
+                let n = file.read_into(slice, off).wait(cx).map_err(OneError::Capture)?;
+                if n == 0 {
+                    return Err(OneError::ShortCapture { read: u64::try_from(read).unwrap_or(u64::MAX), written: stderr.bytes });
+                }
+                read += n;
+            }
+        }
+        let mut line = [0u8; 101];
+        let mut width = 0;
+        for &byte in first.iter().take(wanted) {
+            let escaped = core::ascii::escape_default(byte);
+            if width + escaped.len() > 100 {
+                if let Some(slot) = line.get_mut(width) {
+                    *slot = b'\n';
+                }
+                if let Some(chunk) = line.get(..=width) {
+                    err.write_all(cx, chunk).map_err(diagnostic)?;
+                }
+                width = 0;
+            }
+            for ascii in escaped {
+                if let Some(slot) = line.get_mut(width) {
+                    *slot = ascii;
+                    width += 1;
+                }
+            }
+        }
+        if width != 0 {
+            if let Some(slot) = line.get_mut(width) {
+                *slot = b'\n';
+            }
+            if let Some(chunk) = line.get(..=width) {
+                err.write_all(cx, chunk).map_err(diagnostic)?;
+            }
+        }
+        err.line(cx, "---- end escaped stderr ----").map_err(diagnostic)?;
+        if stderr_open {
+            err.line(cx, "\nstderr was still open at the post-exit drain deadline").map_err(diagnostic)?;
+        }
+        err.line(cx, format_args!("\nfirst calls: {}; parent serving requests: {service_time:?}; {tally}", calls.len())).map_err(diagnostic)?;
+        let pub_slice = calls.get(..published).unwrap_or(calls);
+        let pend_slice = calls.get(published..).unwrap_or(&[]);
+        match pub_slice.last() {
+            Some(call) => err.line(cx, format_args!("last published: {}", InstanceName(&places.named(call.symbol.0), call.symbol.0))),
+            None => err.line(cx, "last published: none"),
+        }.map_err(diagnostic)?;
+        for call in pend_slice {
+            err.line(cx, format_args!("pending need: {}", InstanceName(&places.named(call.symbol.0), call.symbol.0))).map_err(diagnostic)?;
+        }
+        let mut fault = needs.fault();
+        let mut queued = false;
+        let wire_error = |why| OneError::Parent(ParentError::Wire(why));
+        if let Some(over) = over.as_mut() {
+            let read_until = Deadline::after(over.now(), DRAIN_AFTER);
+            while torn.is_none() && !read_until.passed(over.now()) {
+                match over.recv_message(inbox, blaze_launch::wire::LONGEST_FRAME, Deadline::PASSED) {
+                    Ok(Message::Whole { len }) => {
+                        let body = inbox.get(4..len).unwrap_or(&[]);
+                        let (_, up) = blaze_launch::wire::run::Up::decode(body).map_err(wire_error)?;
+                        match up {
+                            blaze_launch::wire::run::Up::Need { need, .. } => {
+                                queued = true;
+                                err.line(cx, format_args!("pending need (received after exit): {need:?}")).map_err(diagnostic)?;
+                            }
+                            blaze_launch::wire::run::Up::Fault { fault: last } => {
+                                if fault.is_none() {
+                                    fault = Some(last);
+                                }
+                            }
+                        }
+                        let left = inbox.len() - len;
+                        inbox.copy_within(len.., 0);
+                        inbox.truncate(left);
+                    }
+                    Ok(Message::Closed | Message::Deadline) => break,
+                    Err(error @ ProcError { fault: RunFault::Channel(ChannelError::Torn { .. }), .. }) => torn = Some(error),
+                    Err(error) => return Err(child_error(error)),
+                }
+            }
+        }
+        if !queued && calls.len() == published && inbox.is_empty() {
+            err.line(cx, "pending need: none").map_err(diagnostic)?;
+        }
+        if let Some(error) = torn {
+            err.line(cx, format_args!("incomplete first-call channel message: {error}")).map_err(diagnostic)?;
+        } else if !inbox.is_empty() {
+            err.line(cx, format_args!("unprocessed first-call channel bytes at exit: {}", inbox.len())).map_err(diagnostic)?;
+        }
+        err.line(cx, "refusal stub: no refused first call observed by the parent").map_err(diagnostic)?;
+        if let Some(fault) = fault {
+            let mut bytes = bstd::mem::Bytes::new_in(frame, "the code record a test struck in");
+            let record = match fault.at {
+                Some(spot) if spot.placed == blaze_launch::wire::fault::Placed::Code => Some(read_record(places, &spot.record, &mut bytes).map(|()| bytes.as_slice())),
+                _ => None,
+            };
+            err.line(cx, format_args!("{}", crate::run_fault::report(fault, places, record))).map_err(diagnostic)?;
+        } else {
+            err.line(cx, format_args!("the launcher sent no fault location for signal {number}")).map_err(diagnostic)?;
+        }
+        for call in pub_slice {
+            err.line(cx, format_args!("published: {} in {:?} (records made {}, found {}, unkeyed {})",
+                InstanceName(&places.named(call.symbol.0), call.symbol.0), call.elapsed, call.made, call.found, call.unkeyed)).map_err(diagnostic)?;
+        }
+        err.line(cx, "---- end signal report ----").map_err(diagnostic)?;
+        err.flush(cx).map_err(diagnostic)?;
+        Ok(())
+    }
+}
+
+fn seatbelt_profile<'a>(
+    temp: &str,
+    store: &str,
+    native: Option<crate::engine_native::NativeSend<'_>>,
+    frame: &Frame,
+    alloc: Alloc<'a>,
+) -> Result<AString<'a>, OneError> {
+    let profile = blaze_run::child::seatbelt(temp, None, alloc).map_err(|why| OneError::Profile { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) })?;
+    with_native(profile, store, native)
 }
 
 fn child_outcome(exit: Exit) -> How {
@@ -3018,25 +3483,31 @@ fn child_outcome(exit: Exit) -> How {
 }
 
 /// At most a pipeful from each stream per turn, so a writer that never stops cannot starve
-/// another child's first-call channel or deadline.
-fn drain_pipes(cx: &Cx, pipes: &mut [Option<OutPipe>; 2], output: &mut Output<'_>, stderr: &mut StderrCapture<'_>, by: Deadline) -> Result<(), OneError> {
+/// another child's first-call channel or deadline. Returns `true` if any pipe produced bytes
+/// or closed on this call.
+fn drain_pipes(cx: &Cx, pipes: &mut [Option<OutPipe>; 2], output: &mut Output<'_>, stderr: &mut StderrCapture<'_>, by: Deadline) -> Result<bool, OneError> {
     let mut chunk = [0u8; 16 * 1024];
+    let mut active = false;
     for (stream, slot) in pipes.iter_mut().enumerate() {
         for _ in 0..4 {
             let Some(pipe) = slot.as_ref() else { break };
             match pipe.read(&mut chunk, by).map_err(OneError::Pipe)? {
                 Piped::Bytes(n) => {
+                    active = true;
                     output.push(&chunk[..n]);
                     if stream == 1 {
                         stderr.push(cx, &chunk[..n])?;
                     }
                 }
-                Piped::Closed => *slot = None,
+                Piped::Closed => {
+                    active = true;
+                    *slot = None;
+                }
                 Piped::Deadline => break,
             }
         }
     }
-    Ok(())
+    Ok(active)
 }
 
 /// The front of one test's run: the command's names records and body ids (made once for the
@@ -3332,7 +3803,7 @@ pub(crate) fn run_suites<'h>(
     rng: &mut bstd::rng::Rng,
     out: &bstd::out::Out,
     err: &bstd::out::Out,
-    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, config: LoopConfig<'_>,
+    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'_>,
     args: &[&str], lent: &CommandLent, root: &Dir<ReadWrite>, procs: crate::job_texts::Procs<'_>, heap: &'static blaze_own::Heap, watch: &dyn Watch, frame: &Frame,
 ) -> Result<Status, DriveError> {
     let tables = heap.alloc();
@@ -3340,8 +3811,8 @@ pub(crate) fn run_suites<'h>(
     // every maker, the serial turns' and each code worker's (rule 16: a large or slow make's line).
     let make_watch = crate::run_parent::command_make_watch();
     match CODES {
-        Codes::Serial => run_selected(cx, fs, env, host, clock, out, err, suites, ids, config, args, lent, tables, watch, make_watch, frame, None),
-        Codes::Pooled => pooled(cx, clock, rng, suites, root, procs, heap, make_watch, |relay| run_selected(cx, fs, env, host, clock, out, err, suites, ids, config, args, lent, tables, watch, make_watch, frame, Some(relay))),
+        Codes::Serial => run_selected(cx, fs, env, host, clock, out, err, suites, ids, certificate, config, args, lent, tables, watch, make_watch, frame, None),
+        Codes::Pooled => pooled(cx, clock, rng, suites, root, procs, heap, make_watch, |relay| run_selected(cx, fs, env, host, clock, out, err, suites, ids, certificate, config, args, lent, tables, watch, make_watch, frame, Some(relay))),
     }
 }
 
@@ -3424,7 +3895,7 @@ fn run_selected<'h>(
     clock: &bstd::clock::Clock,
     out: &bstd::out::Out,
     err: &bstd::out::Out,
-    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, config: LoopConfig<'_>,
+    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'_>,
     args: &[&str], lent: &CommandLent, tables: Alloc<'static>, watch: &dyn Watch, make_watch: blaze_ladder::run::make_one::MakeWatch<'static>, frame: &Frame,
     relay: Option<&CodeRelay<'_>>,
 ) -> Result<Status, DriveError> {
@@ -3505,13 +3976,20 @@ fn run_selected<'h>(
                 .map_err(|error| LoopError::Postings { suite: SuiteId(u32::MAX), error })?
         }
     };
+    let mut suite_caches = Vec::with_capacity_in(suites.len(), alloc);
+    for (index, suite) in suites.iter().enumerate() {
+        let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
+        let mut sc = suite_cache::SuiteCache::new(suite.names, suite.builder, tables, make_watch);
+        let _ = cache.load_verified(suite_id, &certificate, sc.verified_mut());
+        suite_caches.push(RefCell::new(sc));
+    }
     let mut launches = Vec::with_capacity_in(suites.len(), alloc);
     let mut checks = Vec::with_capacity_in(suites.len(), alloc);
     let mut locations = Vec::new_in(alloc);
     let mut owners = Vec::new_in(alloc);
     let mut rows = Vec::new_in(alloc);
     let mut filtered = 0u32;
-    for (index, suite) in suites.iter().enumerate() {
+    for (index, (suite, suite_cache)) in suites.iter().zip(suite_caches.iter()).enumerate() {
         let unit = suite.unit;
         let tests = unit.tests;
         let (dir, temp) = &dirs[index];
@@ -3528,6 +4006,7 @@ fn run_selected<'h>(
             child_base,
             entered_sink: &entered_sink,
             cache_alloc: alloc,
+            suite_cache,
         });
         child_base += tests.len();
         checks.push(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, image: suite.native.map(|native| native.map_or(&[][..], |send| send.items)), said: String::new_in(alloc) });
@@ -3609,6 +4088,13 @@ fn run_selected<'h>(
         )).map_err(|_| DriveError::Print)?;
     }
     let status = status?;
+    for (index, sc) in suite_caches.iter().enumerate() {
+        let sc = sc.borrow();
+        if sc.verified_dirty() {
+            let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
+            cache.record_verified(suite_id, certificate, sc.verified_pairs());
+        }
+    }
     cache.commit()?;
     Ok(status)
 }

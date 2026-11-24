@@ -118,17 +118,16 @@ impl RunMode<'_> {
         let index = u32::try_from(self.statics.len()).ok().filter(|&n| n < MOST_STATICS).ok_or(RunModeError::StaticsFull)?;
         let len = DESC_BYTES + CAP as usize * ROW_BYTES;
         let at = memory.reserve(len, 16)?;
-        let pos = match self.statics.binary_search_by_key(&symbol, |&(it, _)| it) {
-            Ok(_) => return Err(RunModeError::StaticTwice { symbol: WireSymbol(symbol.0) }),
-            Err(pos) => pos,
-        };
+        if self.statics.contains_key(&symbol.0) {
+            return Err(RunModeError::StaticTwice { symbol: WireSymbol(symbol.0) });
+        }
         // The header alone: the rows are written as indexes are given (zero until then, as the
         // reservation is).
         let header = descriptor(key.key, key.root, 0, CAP, at + DESC_BYTES as u64);
         // In the code area: the program only reads the descriptor; its rows are written by the
         // control thread through the write view ([`super::Memory::write`]).
         memory.publish_static(index, at, &header, super::Room::Code)?;
-        self.statics.insert_shift(pos, (symbol, StaticAt { index, at, len: DESC_BYTES as u64, align: 16 }));
+        self.statics.insert(symbol.0, StaticAt { index, at, len: u64::try_from(DESC_BYTES).unwrap_or(0), align: 16 });
         self.thread_locals = ThreadLocals::Made(Made { at, vars: Vec::new_in(self.alloc) });
         Ok(())
     }

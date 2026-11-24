@@ -437,6 +437,12 @@ pub trait Make {
         let _ = (tabled, name, entry);
         Ok(None)
     }
+    /// Keyed verification hook receiving `(key, under)` (instance key and content key of the
+    /// stored entry) so a suite-level or certificate-checked verifier can memoize `Verdict::Holds`
+    /// within a single checked snapshot without re-evaluating read lists. Defaults to [`Make::verify`].
+    fn verify_keyed(&mut self, _key: CodeKey, _under: CodeKey, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<Verdict>, Self::Error> {
+        self.verify(tabled, name, entry)
+    }
 }
 
 /// A proof a make takes ([`Make::Grant`]). It is held, not read: the make path's signature is
@@ -1286,7 +1292,7 @@ impl<'a> Walk<'a> {
             let rows = form.reads(bytes).map_err(|why| WalkError::Entry { tabled, found: true, why })?;
             let holds = match rows {
                 0 => true,
-                rows => match verify.verify(tabled, name.as_slice(), bytes).map_err(|why| WalkError::Verify { tabled, why })? {
+                rows => match verify.verify_keyed(key, under, tabled, name.as_slice(), bytes).map_err(|why| WalkError::Verify { tabled, why })? {
                     None => return Err(WalkError::Unverified { tabled, rows }),
                     Some(Verdict::Holds) => {
                         self.verified += 1;
