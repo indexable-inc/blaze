@@ -279,6 +279,169 @@ pub(crate) fn compute_block_order<'a>(view: &View<'_>, alloc: Alloc<'a>) -> Vec<
         }
     }
 
+    // 2b. Zero-duplication latch-before-header fall-through placement (bounded to `blocks <= 2048`
+    //     to keep mega-functions strictly O(B) per PR #2400):
+    //     When a tiny call-free single-predecessor back-edge latch `l` (`Jump(h)`, `h < l`,
+    //     `h != 0`) is entered only from a conditional `Br` inside the loop, placing `l`
+    //     immediately before `h` eliminates the unconditional `b h` on EVERY loop iteration
+    //     with ZERO code duplication and ZERO branch-predictor splitting, while letting the
+    //     loop-exit branch fall straight through into the post-loop block!
+    if blocks <= 2048 {
+    let mut pred_count: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    let mut only_pred: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    let mut has_latch_before: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    for _ in 0..blocks {
+        pred_count.push(0);
+        only_pred.push(usize::MAX);
+        has_latch_before.push(false);
+    }
+    let record_pred = |pred_count: &mut Vec<u32, Alloc<'a>>,
+                       only_pred: &mut Vec<usize, Alloc<'a>>,
+                       from: usize,
+                       to: usize| {
+        if let Some(cnt) = pred_count.get_mut(to) {
+            *cnt = cnt.saturating_add(1);
+            if *cnt == 1 {
+                if let Some(op) = only_pred.get_mut(to) {
+                    *op = from;
+                }
+            }
+        }
+    };
+    for b in 0..blocks {
+        let term = view.terminator(Block(u32_of(b)));
+        match view.op(term) {
+            Op::Jump => {
+                if let Some(&at_raw) = view.data.get(term) {
+                    if let Some(&t_raw) = view.extra.get(idx(at_raw)) {
+                        record_pred(&mut pred_count, &mut only_pred, b, idx(t_raw));
+                    }
+                }
+            }
+            Op::Br => {
+                if let Some(&at_raw) = view.data.get(term) {
+                    let at = idx(at_raw);
+                    if let (Some(&t_raw), Some(&t_argc_raw)) =
+                        (view.extra.get(at + 1), view.extra.get(at + 2))
+                    {
+                        let t = idx(t_raw);
+                        let t_argc = idx(t_argc_raw);
+                        record_pred(&mut pred_count, &mut only_pred, b, t);
+                        if let Some(&e_raw) = view.extra.get(at + 3 + t_argc) {
+                            record_pred(&mut pred_count, &mut only_pred, b, idx(e_raw));
+                        }
+                    }
+                }
+            }
+            Op::Invoke | Op::InvokeIndirect => {
+                if let Some(&at_raw) = view.data.get(term) {
+                    let at = idx(at_raw);
+                    if let Some(&norm_raw) = view.extra.get(at + 2) {
+                        record_pred(&mut pred_count, &mut only_pred, b, idx(norm_raw));
+                    }
+                    if let Some(&unw_raw) = view.extra.get(at + 3) {
+                        record_pred(&mut pred_count, &mut only_pred, b, idx(unw_raw));
+                    }
+                }
+            }
+            Op::Switch | Op::AsmBr => {
+                // Conservative: mark every block as multi-pred so switch/asmbr targets are never moved.
+                for cnt in pred_count.iter_mut() {
+                    *cnt = cnt.saturating_add(2);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for l in 1..blocks {
+        if is_cold.get(l).copied().unwrap_or(true) {
+            continue;
+        }
+        if pred_count.get(l).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let p = only_pred.get(l).copied().unwrap_or(usize::MAX);
+        if p >= blocks || p == l {
+            continue;
+        }
+        let p_term = view.terminator(Block(u32_of(p)));
+        if view.op(p_term) != Op::Br {
+            continue;
+        }
+        // Extract `p`'s OTHER branch target so we only hoist `l` before `h` when `p`'s other arm
+        // lies forward of `p` (avoiding breaking `p -> l` fallthrough into a `cbz; b` pair on
+        // multi-exit loops like hash probing).
+        let Some(&p_at_raw) = view.data.get(p_term) else { continue };
+        let p_at = idx(p_at_raw);
+        let (Some(&pt_raw), Some(&pt_argc_raw)) = (view.extra.get(p_at + 1), view.extra.get(p_at + 2)) else {
+            continue;
+        };
+        let pt = idx(pt_raw);
+        let Some(&pe_raw) = view.extra.get(p_at + 3 + idx(pt_argc_raw)) else { continue };
+        let pe = idx(pe_raw);
+        let other_arm = if pt == l { pe } else if pe == l { pt } else { continue };
+        let l_range = view.block(Block(u32_of(l)));
+        if l_range.len() > 8 {
+            continue;
+        }
+        let l_term = view.terminator(Block(u32_of(l)));
+        if view.op(l_term) != Op::Jump {
+            continue;
+        }
+        let mut l_has_call = false;
+        for inst in l_range {
+            if matches!(
+                view.op(inst),
+                Op::Call | Op::CallIndirect | Op::Invoke | Op::InvokeIndirect
+            ) {
+                l_has_call = true;
+                break;
+            }
+        }
+        if l_has_call {
+            continue;
+        }
+        let Some(&at_raw) = view.data.get(l_term) else { continue };
+        let Some(&h_raw) = view.extra.get(idx(at_raw)) else { continue };
+        let h = idx(h_raw);
+        if h == 0 || h >= l || is_cold.get(h).copied().unwrap_or(true) {
+            continue;
+        }
+        if has_latch_before.get(h).copied().unwrap_or(true) {
+            continue;
+        }
+        // Only hoist `l` immediately before `h` when `p`'s other arm lies after `p` in `order`
+        // (so `p` does not regress from fallthrough into a back-to-back `cbz; b` branch pair).
+        let mut pos_h = None;
+        let mut pos_l = None;
+        let mut pos_p = None;
+        let mut pos_other = None;
+        for (pos, &blk) in order.iter().enumerate() {
+            if blk == h {
+                pos_h = Some(pos);
+            } else if blk == l {
+                pos_l = Some(pos);
+            }
+            if blk == p {
+                pos_p = Some(pos);
+            }
+            if blk == other_arm {
+                pos_other = Some(pos);
+            }
+        }
+        if let (Some(ph), Some(pl), Some(pp), Some(po)) = (pos_h, pos_l, pos_p, pos_other) {
+            if ph > 0 && ph < pl && po > pp {
+                let moved = order.remove_shift(pl);
+                order.insert(ph, moved);
+                if let Some(slot) = has_latch_before.get_mut(h) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+    }
+
     // 3. Append all cold/trap/unreachable blocks at the tail in deterministic order.
     for (b, &is_p) in placed.iter().enumerate() {
         if !is_p {
