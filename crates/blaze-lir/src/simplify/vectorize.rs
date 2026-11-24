@@ -469,10 +469,32 @@ fn is_stride_aligned_end(view: &View<'_>, iv_init: u32, bound: u32, elem_shift: 
     }
 }
 
+/// When `bound` is `PtrAdd[INBOUNDS](iv_init, byte_off)` with an `I64` offset, returns `Some(byte_off)`.
+/// Because `INBOUNDS` guarantees both `iv_init` and `bound` lie within the same allocation (no
+/// address wraparound), `iv_init < bound` implies `byte_off == addr(bound) - addr(iv_init)` with
+/// zero `Op::PtrAddr` needed.
+fn inbounds_ptr_byte_offset(view: &View<'_>, iv_init: u32, bound: u32) -> Option<u32> {
+    let bi = to_idx(bound);
+    if view.op(bi) != Op::PtrAdd || !Flags(at(view.flags, bi)).contains(Flags::INBOUNDS) {
+        return None;
+    }
+    let pos = to_idx(at(view.data, bi));
+    if at(view.extra, pos) != iv_init {
+        return None;
+    }
+    let off = at(view.extra, pos + 1);
+    if Ty(at(view.tys, to_idx(off))) == Ty::I64 {
+        Some(off)
+    } else {
+        None
+    }
+}
+
 /// Matches a conditional-count reduction update on `acc` (`p_inst`) of type `acc_ty` (`I8..I64`)
 /// over integer elements of type `elem_ty` (`elem_ty.bits <= acc_ty.bits`):
 /// - `acc + Select(cond, 1, 0)` or `acc + Select(cond, 0, 1)`
 /// - `acc + Zext(cond)` or `acc + Zext(Select(cond, 1, 0))`
+/// - `acc - Sext(cond)` or `acc - Select(cond, -1, 0)` / `acc - Select(cond, 0, -1)`
 /// - `Select(cond, acc + 1, acc)` or `Select(cond, acc, acc + 1)`
 /// Returns `(effective_cond, cmp_a, cmp_b, optional_extra_acc_use_inst)`.
 fn match_count_cond_update(
@@ -502,8 +524,8 @@ fn match_count_cond_update(
         if at(inst_block, cur) != body_block {
             return None;
         }
-        // Strip up to 2 `Op::Zext` wrappers (e.g. `Zext(i1 -> i64)` or `Zext(Select(i1, 1i32, 0i32) -> i64)`).
-        for _ in 0..2 {
+        // Strip up to 3 `Op::Zext` wrappers (e.g. `Zext(i1 -> i8 -> i32 -> i64)` or `Zext(Select(i1, 1, 0) -> i64)`).
+        for _ in 0..3 {
             if at(inst_block, cur) == body_block && view.op(cur) == Op::Zext {
                 let src = at(view.data, cur);
                 let src_i = to_idx(src);
@@ -547,14 +569,36 @@ fn match_count_cond_update(
             return None;
         }
         let ri = to_idx(r);
-        if at(inst_block, ri) != body_block || view.op(ri) != Op::Sext {
+        if at(inst_block, ri) != body_block {
             return None;
         }
-        let src = at(view.data, ri);
-        if Ty(at(view.tys, to_idx(src))) != Ty::I1 {
+        if view.op(ri) == Op::Sext {
+            let src = at(view.data, ri);
+            if Ty(at(view.tys, to_idx(src))) != Ty::I1 {
+                return None;
+            }
+            (src, false, None)
+        } else if view.op(ri) == Op::Select {
+            let acc_bits = Ty(at(view.tys, bi)).bits(64);
+            let all_ones = if acc_bits >= 64 { u64::MAX } else { (1u64 << acc_bits) - 1 };
+            let sel_at = to_idx(at(view.data, ri));
+            let (cv, tv, fv) = (
+                at(view.extra, sel_at),
+                at(view.extra, sel_at + 1),
+                at(view.extra, sel_at + 2),
+            );
+            let tc = const_u64(view, to_idx(tv));
+            let fc = const_u64(view, to_idx(fv));
+            if tc == Some(all_ones) && fc == Some(0) {
+                (cv, false, None)
+            } else if tc == Some(0) && fc == Some(all_ones) {
+                (cv, true, None)
+            } else {
+                return None;
+            }
+        } else {
             return None;
         }
-        (src, false, None)
     } else if bop == Op::Select {
         let sat = to_idx(at(view.data, bi));
         let (cv, tv, fv) = (
@@ -942,7 +986,15 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
                 if inst != to_idx(cv)
                     && !matches!(
                         view.op(inst),
-                        Op::Icmp | Op::PtrAddr | Op::Not | Op::Xor | Op::Zext | Op::Trunc | Op::Iconst | Op::IconstWide
+                        Op::Icmp
+                            | Op::PtrAddr
+                            | Op::Not
+                            | Op::Xor
+                            | Op::Zext
+                            | Op::Trunc
+                            | Op::Select
+                            | Op::Iconst
+                            | Op::IconstWide
                     )
                 {
                     header_simple = false;
@@ -998,8 +1050,13 @@ fn find_vectorizable_loop<A: Allocator + Copy>(
         for blk in [header, body_block] {
             for inst in view.block(Block(blk)) {
                 if at(&used_outside, inst) {
-                    // Only header params used directly in exit (Shape 1) are allowed if they're IV or reductions.
-                    if !(blk == header && inst >= h_params.start && inst < h_params.end) {
+                    // Only `HeaderBody` header params may be used directly in exit (`vec_reduce`
+                    // always routes through `orig_header_new`, preserving dominance).
+                    if !(matches!(shape, LoopShape::HeaderBody { .. })
+                        && blk == header
+                        && inst >= h_params.start
+                        && inst < h_params.end)
+                    {
                         has_illegal_escape = true;
                     }
                 }
@@ -2054,14 +2111,22 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                     }
                 }
                 IvKind::Pointer => {
-                    let p_addr = push_inst(&mut func, Op::PtrAddr, Flags::NONE, Ty::I64, iv_init_new, 0);
-                    let end_addr = if Ty(at(view.tys, to_idx(plan.bound))) == Ty::PTR {
-                        push_inst(&mut func, Op::PtrAddr, Flags::NONE, Ty::I64, bound_new, 0)
-                    } else {
-                        bound_new
-                    };
-                    let has_rem = push_icmp(&mut func, IntCond::Ult, p_addr, end_addr);
-                    let byte_rem = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, end_addr, p_addr);
+                    let (has_rem, byte_rem) =
+                        if let Some(byte_off) = inbounds_ptr_byte_offset(&view, plan.iv_init, plan.bound) {
+                            let off_new = at(&val_map, to_idx(byte_off));
+                            let hr = push_icmp(&mut func, IntCond::Ult, iv_init_new, bound_new);
+                            (hr, off_new)
+                        } else {
+                            let p_addr = push_inst(&mut func, Op::PtrAddr, Flags::NONE, Ty::I64, iv_init_new, 0);
+                            let end_addr = if Ty(at(view.tys, to_idx(plan.bound))) == Ty::PTR {
+                                push_inst(&mut func, Op::PtrAddr, Flags::NONE, Ty::I64, bound_new, 0)
+                            } else {
+                                bound_new
+                            };
+                            let hr = push_icmp(&mut func, IntCond::Ult, p_addr, end_addr);
+                            let br = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, end_addr, p_addr);
+                            (hr, br)
+                        };
                     let k_sbytes = push_iconst(&mut func, Ty::I64, step_bytes);
                     let enough = push_icmp(&mut func, IntCond::Uge, byte_rem, k_sbytes);
                     let mut g = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, has_rem, enough);
@@ -2342,12 +2407,13 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
             }
 
             let n_iv_params = if use_ptr_iv { streams.len() } else { 1 };
-            let (loop_p0_end, chunk_acc_params) = if needs_chunk {
+            let (loop_p0_end, chunk_acc_params, chunk_rem_after) = if needs_chunk {
                 let mut chunk_init_args: Vec<u32, A> =
-                    Vec::with_capacity_in(streams.len() + plan.reductions.len(), alloc);
+                    Vec::with_capacity_in(streams.len() + 1 + plan.reductions.len(), alloc);
                 for s in &streams {
                     chunk_init_args.push(s.init_ptr);
                 }
+                chunk_init_args.push(vec_bytes_total);
                 for red in &plan.reductions {
                     chunk_init_args.push(at(&val_map, to_idx(red.init_val)));
                 }
@@ -2360,17 +2426,16 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                 for _ in 0..streams.len() {
                     chunk_ptrs.push(push_inst(&mut func, Op::Param, Flags::NONE, Ty::PTR, 0, 0));
                 }
+                let chunk_rem_bytes = push_inst(&mut func, Op::Param, Flags::NONE, Ty::I64, 0, 0);
                 let mut chunk_accs: Vec<u32, A> = Vec::with_capacity_in(plan.reductions.len(), alloc);
                 for red in &plan.reductions {
                     chunk_accs.push(push_inst(&mut func, Op::Param, Flags::NONE, red.acc_ty, 0, 0));
                 }
                 let cur_p0 = at(&chunk_ptrs, 0);
-                let cur_addr = push_inst(&mut func, Op::PtrAddr, Flags::NONE, Ty::I64, cur_p0, 0);
-                let end_addr = push_inst(&mut func, Op::PtrAddr, Flags::NONE, Ty::I64, p0_end, 0);
-                let rem_c = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, end_addr, cur_addr);
                 let k_cbytes = push_iconst(&mut func, Ty::I64, chunk_elems << plan.elem_shift);
-                let step_c = push_bin(&mut func, Op::Umin, Flags::NONE, Ty::I64, rem_c, k_cbytes);
+                let step_c = push_bin(&mut func, Op::Umin, Flags::NONE, Ty::I64, chunk_rem_bytes, k_cbytes);
                 let c_end = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, cur_p0, step_c);
+                let rem_after = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, chunk_rem_bytes, step_c);
 
                 let mut vloop_args: Vec<u32, A> =
                     Vec::with_capacity_in(streams.len() + plan.reductions.len() * unroll, alloc);
@@ -2383,7 +2448,7 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                     }
                 }
                 push_jump(&mut func, vec_loop_blk, &vloop_args);
-                (c_end, chunk_accs)
+                (c_end, chunk_accs, rem_after)
             } else {
                 let mut vec_init_args: Vec<u32, A> =
                     Vec::with_capacity_in(n_iv_params + plan.reductions.len() * unroll, alloc);
@@ -2400,7 +2465,7 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
                     }
                 }
                 push_jump(&mut func, vec_loop_blk, &vec_init_args);
-                (p0_end, Vec::new_in(alloc))
+                (p0_end, Vec::new_in(alloc), NONE)
             };
 
             // --- Emit `vec_loop` block (4x = 64B/iter or 2x = 32B/iter 128-bit SIMD!) ---
@@ -2692,12 +2757,14 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
             };
 
             if needs_chunk {
-                let more_chunks = push_icmp(&mut func, IntCond::Ult, at(&done_ptr_params, 0), p0_end);
+                let k_z64 = push_iconst(&mut func, Ty::I64, 0);
+                let more_chunks = push_icmp(&mut func, IntCond::Ne, chunk_rem_after, k_z64);
                 let mut chunk_back_args: Vec<u32, A> =
-                    Vec::with_capacity_in(streams.len() + plan.reductions.len(), alloc);
+                    Vec::with_capacity_in(streams.len() + 1 + plan.reductions.len(), alloc);
                 for &dp in &done_ptr_params {
                     chunk_back_args.push(dp);
                 }
+                chunk_back_args.push(chunk_rem_after);
                 for &rs in &red_scalar_vals {
                     chunk_back_args.push(rs);
                 }
@@ -4911,5 +4978,437 @@ mod tests {
             gv.block(Block(1)).filter(|&k| gv.op(k) == Op::And).count() >= 3,
             "arbitrary pointer-IV end must include `(byte_rem & (elem_bytes - 1)) == 0` alignment guard"
         );
+    }
+
+    struct NoRoutines;
+
+    impl crate::legalize::QuadRoutines for NoRoutines {
+        fn routine(&self, _: crate::legalize::SoftFloat) -> Option<crate::func::RefId> {
+            None
+        }
+    }
+
+    #[test]
+    fn slice_iter_sum_u64_both_param_orders_eval_bit_exact_and_zero_ptr_addr() {
+        use blaze_own::Alloc;
+        use crate::{
+            eval::{self, Outcome, Val},
+            func::SlotKind,
+            legalize::legalize,
+            ty::Scalar,
+        };
+
+        let v2i64 = Ty::vector(Scalar::I64, 2).unwrap();
+        let mut data = [0u64; 36];
+        for (k, slot) in data.iter_mut().enumerate() {
+            let kk = k as u64;
+            *slot = kk
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .wrapping_add(0xbf58_476d_1ce4_e5b9);
+        }
+
+        for &(acc_first, use_mul) in &[(false, false), (true, false), (true, true)] {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, blaze_own::testing::heap().alloc());
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let slot = b.slot(36 * 8, 4, SlotKind::Temp);
+            let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let len = b.param(Ty::I64);
+            let base = b.slot_addr(slot);
+            for (k, &val) in data.iter().enumerate() {
+                let c = b.iconst(Ty::I64, u128::from(val));
+                b.store(Flags::NONE, c, base, (k * 8) as i32, MemAttrs::aligned(3));
+            }
+            let bytes = if use_mul {
+                let k8 = b.iconst(Ty::I64, 8);
+                b.binary(Op::Mul, Flags::NONE, len, k8)
+            } else {
+                let k3 = b.iconst(Ty::I64, 3);
+                b.binary(Op::Shl, Flags::NONE, len, k3)
+            };
+            let end = b.ptr_add(Flags::INBOUNDS, base, bytes);
+            let z64 = b.iconst(Ty::I64, 0);
+            let eight = b.iconst(Ty::I64, 8);
+            if acc_first {
+                b.jump((hdr, &[z64, base]));
+            } else {
+                b.jump((hdr, &[base, z64]));
+            }
+
+            b.begin(hdr);
+            let (p, acc) = if acc_first {
+                let a = b.param(Ty::I64);
+                let ptr = b.param(Ty::PTR);
+                (ptr, a)
+            } else {
+                let ptr = b.param(Ty::PTR);
+                let a = b.param(Ty::I64);
+                (ptr, a)
+            };
+            let cond = b.icmp(IntCond::Ne, p, end);
+            b.br(Flags::NONE, cond, (body, &[]), (exit, &[acc]));
+
+            b.begin(body);
+            let p_next = b.ptr_add(Flags::INBOUNDS, p, eight);
+            let x = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+            let acc_next = b.binary(Op::Add, Flags::NONE, acc, x);
+            if acc_first {
+                b.jump((hdr, &[acc_next, p_next]));
+            } else {
+                b.jump((hdr, &[p_next, acc_next]));
+            }
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+            let func = b.finish_checked().unwrap();
+
+            let out = auto_vectorize_loops(func.view(), blaze_own::testing::heap().alloc()).unwrap();
+            verify(out.func.view()).unwrap();
+            assert_eq!(out.stats.loops_vectorized, 1);
+            let v = out.func.view();
+            assert_eq!(
+                (0..v.len()).filter(|&k| v.op(k) == Op::PtrAddr).count(),
+                0,
+                "inbounds slice::Iter sum_u64 should emit zero Op::PtrAddr"
+            );
+            assert_eq!(
+                (0..v.len()).filter(|&k| v.op(k) == Op::Load && Ty(v.tys[k]) == v2i64).count(),
+                4,
+                "expected 4x-unrolled <2 x i64> loads"
+            );
+            assert!(
+                (0..v.len()).filter(|&k| v.op(k) == Op::Add && Ty(v.tys[k]) == v2i64).count() >= 4,
+                "expected >= 4 <2 x i64> Op::Add instructions"
+            );
+            assert!((0..v.len()).any(|k| v.op(k) == Op::ReduceAdd && Ty(v.tys[k]) == Ty::I64));
+
+            let mut legalized = out.func;
+            legalize(&mut legalized, &NoRoutines, blaze_own::testing::heap().alloc()).unwrap();
+            verify(legalized.view()).unwrap();
+
+            for &n in &[0usize, 1, 7, 8, 15, 16, 33] {
+                let expected: u64 = data[..n].iter().fold(0u64, |s, &x| s.wrapping_add(x));
+                let args = [Val::Int(n as u128)];
+                let Outcome::Returned(orig) =
+                    eval::run_in(func.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("orig sum_u64 eval failed at n={n}");
+                };
+                let Outcome::Returned(got) =
+                    eval::run_in(legalized.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("vec sum_u64 eval failed at n={n}");
+                };
+                assert_eq!(orig.as_slice(), &[Val::Int(u128::from(expected))]);
+                assert_eq!(
+                    got.as_slice(),
+                    orig.as_slice(),
+                    "sum_u64 mismatch at n={n} (acc_first={acc_first}, use_mul={use_mul})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slice_iter_count_lt_u32_variants_eval_bit_exact_and_zero_ptr_addr() {
+        use blaze_own::Alloc;
+        use crate::{
+            eval::{self, Outcome, Val},
+            func::SlotKind,
+            legalize::legalize,
+            ty::Scalar,
+        };
+
+        #[derive(Clone, Copy)]
+        enum CountForm {
+            AddSelect10,
+            AddSelect01,
+            AddZext,
+            SubSext,
+            SubSelectNeg1,
+            AddSelectI32Acc,
+        }
+
+        let v4i32 = Ty::vector(Scalar::I32, 4).unwrap();
+        let mut data = [0u32; 40];
+        for (k, slot) in data.iter_mut().enumerate() {
+            *slot = match k {
+                0 => 0,
+                1 => u32::MAX,
+                2 => 50,
+                3 => 49,
+                _ => ((k as u32).wrapping_mul(37).wrapping_add(13)) % 100,
+            };
+        }
+
+        for form in [
+            CountForm::AddSelect10,
+            CountForm::AddSelect01,
+            CountForm::AddZext,
+            CountForm::SubSext,
+            CountForm::SubSelectNeg1,
+            CountForm::AddSelectI32Acc,
+        ] {
+            let acc_ty = match form {
+                CountForm::AddSelectI32Acc => Ty::I32,
+                _ => Ty::I64,
+            };
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, blaze_own::testing::heap().alloc());
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I32)],
+                &[Param::of(acc_ty)],
+            );
+            b.set_signature(sig);
+            let slot = b.slot(40 * 4, 4, SlotKind::Temp);
+            let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let len = b.param(Ty::I64);
+            let thresh = b.param(Ty::I32);
+            let base = b.slot_addr(slot);
+            for (k, &val) in data.iter().enumerate() {
+                let c = b.iconst(Ty::I32, u128::from(val));
+                b.store(Flags::NONE, c, base, (k * 4) as i32, MemAttrs::aligned(2));
+            }
+            let k2 = b.iconst(Ty::I64, 2);
+            let bytes = b.binary(Op::Shl, Flags::NONE, len, k2);
+            let end = b.ptr_add(Flags::INBOUNDS, base, bytes);
+            let zero_acc = b.iconst(acc_ty, 0);
+            let one_acc = b.iconst(acc_ty, 1);
+            let neg1_acc = b.iconst(acc_ty, u128::from(u64::MAX));
+            let four = b.iconst(Ty::I64, 4);
+            b.jump((hdr, &[base, zero_acc]));
+
+            b.begin(hdr);
+            let p = b.param(Ty::PTR);
+            let acc = b.param(acc_ty);
+            let keep = b.icmp(IntCond::Ne, p, end);
+            b.br(Flags::NONE, keep, (body, &[]), (exit, &[acc]));
+
+            b.begin(body);
+            let p_next = b.ptr_add(Flags::INBOUNDS, p, four);
+            let val = b.load(Ty::I32, Flags::NONE, p, 0, MemAttrs::aligned(2));
+            let acc_next = match form {
+                CountForm::AddSelect10 | CountForm::AddSelectI32Acc => {
+                    let cmp = b.icmp(IntCond::Ult, val, thresh);
+                    let inc = b.select(Flags::NONE, cmp, one_acc, zero_acc);
+                    b.binary(Op::Add, Flags::NONE, acc, inc)
+                }
+                CountForm::AddSelect01 => {
+                    let cmp = b.icmp(IntCond::Uge, val, thresh);
+                    let inc = b.select(Flags::NONE, cmp, zero_acc, one_acc);
+                    b.binary(Op::Add, Flags::NONE, acc, inc)
+                }
+                CountForm::AddZext => {
+                    let cmp = b.icmp(IntCond::Ult, val, thresh);
+                    let inc = b.convert(Op::Zext, Flags::NONE, acc_ty, cmp);
+                    b.binary(Op::Add, Flags::NONE, acc, inc)
+                }
+                CountForm::SubSext => {
+                    let cmp = b.icmp(IntCond::Ult, val, thresh);
+                    let m = b.convert(Op::Sext, Flags::NONE, acc_ty, cmp);
+                    b.binary(Op::Sub, Flags::NONE, acc, m)
+                }
+                CountForm::SubSelectNeg1 => {
+                    let cmp = b.icmp(IntCond::Ult, val, thresh);
+                    let m = b.select(Flags::NONE, cmp, neg1_acc, zero_acc);
+                    b.binary(Op::Sub, Flags::NONE, acc, m)
+                }
+            };
+            b.jump((hdr, &[p_next, acc_next]));
+
+            b.begin(exit);
+            let res = b.param(acc_ty);
+            b.ret(&[res]);
+            let func = b.finish_checked().unwrap();
+
+            let out = auto_vectorize_loops(func.view(), blaze_own::testing::heap().alloc()).unwrap();
+            verify(out.func.view()).unwrap();
+            assert_eq!(out.stats.loops_vectorized, 1);
+            let v = out.func.view();
+            assert_eq!(
+                (0..v.len()).filter(|&k| v.op(k) == Op::PtrAddr).count(),
+                0,
+                "inbounds slice::Iter count_lt_u32 should emit zero Op::PtrAddr"
+            );
+            assert_eq!(
+                (0..v.len()).filter(|&k| v.op(k) == Op::Load && Ty(v.tys[k]) == v4i32).count(),
+                4,
+                "expected 4x-unrolled <4 x i32> loads"
+            );
+            assert_eq!(
+                (0..v.len()).filter(|&k| v.op(k) == Op::Sub && Ty(v.tys[k]) == v4i32).count(),
+                4,
+                "expected 4x-unrolled <4 x i32> mask-subtract accumulators"
+            );
+
+            let mut legalized = out.func;
+            legalize(&mut legalized, &NoRoutines, blaze_own::testing::heap().alloc()).unwrap();
+            verify(legalized.view()).unwrap();
+
+            let thresh_val = 50u32;
+            for &n in &[0usize, 1, 7, 16, 35] {
+                let expected = data[..n].iter().filter(|&&x| x < thresh_val).count() as u64;
+                let args = [Val::Int(n as u128), Val::Int(u128::from(thresh_val))];
+                let Outcome::Returned(orig) =
+                    eval::run_in(func.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("orig count_lt_u32 eval failed at n={n}");
+                };
+                let Outcome::Returned(got) =
+                    eval::run_in(legalized.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("vec count_lt_u32 eval failed at n={n}");
+                };
+                assert_eq!(orig.as_slice(), &[Val::Int(u128::from(expected))]);
+                assert_eq!(got.as_slice(), orig.as_slice(), "count_lt_u32 mismatch at n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn strict_ieee_dot_f32_preserves_bit_exact_rounding_order() {
+        use blaze_own::Alloc;
+        use crate::{
+            eval::{self, Outcome, Val},
+            func::SlotKind,
+        };
+
+        // Non-exact and cancellation-sensitive IEEE 754 floats:
+        // `(1e20 + 1e-20) + (-1e20) == 0.0` in strict left-to-right order,
+        // whereas reassociated `(1e20 + -1e20) + 1e-20 == 1e-20`.
+        let xs: [f32; 20] = [
+            -0.0,
+            1.0 / 3.0,
+            1e20,
+            1e-20,
+            -1e20,
+            0.1,
+            7.0 / 11.0,
+            -1.0 / 3.0,
+            1e20,
+            1e-20,
+            -1e20,
+            -0.0,
+            3.0 / 7.0,
+            1e-20,
+            1e20,
+            -1e20,
+            0.2,
+            1.0 / 9.0,
+            -1e-20,
+            1.0 / 13.0,
+        ];
+        let ys: [f32; 20] = [
+            1.0,
+            1.0 / 7.0,
+            1.0,
+            1.0,
+            1.0,
+            0.2,
+            -0.3,
+            2.0 / 5.0,
+            1.0,
+            1.0,
+            1.0,
+            -1.0,
+            0.7,
+            1.0,
+            1.0,
+            1.0,
+            -0.1,
+            3.0 / 11.0,
+            1.0,
+            -0.25,
+        ];
+
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, blaze_own::testing::heap().alloc());
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::F32)],
+            &[Param::of(Ty::F32)],
+        );
+        b.set_signature(sig);
+        let slot_a = b.slot(20 * 4, 4, SlotKind::Temp);
+        let slot_b = b.slot(20 * 4, 4, SlotKind::Temp);
+        let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let n = b.param(Ty::I64);
+        let init = b.param(Ty::F32);
+        let pa = b.slot_addr(slot_a);
+        let pb = b.slot_addr(slot_b);
+        for k in 0..20usize {
+            let ca = b.fconst(Ty::F32, u128::from(xs[k].to_bits()));
+            let cb = b.fconst(Ty::F32, u128::from(ys[k].to_bits()));
+            b.store(Flags::NONE, ca, pa, (k * 4) as i32, MemAttrs::aligned(2));
+            b.store(Flags::NONE, cb, pb, (k * 4) as i32, MemAttrs::aligned(2));
+        }
+        let zero = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        let two = b.iconst(Ty::I64, 2);
+        b.jump((hdr, &[zero, init]));
+
+        b.begin(hdr);
+        let i = b.param(Ty::I64);
+        let acc = b.param(Ty::F32);
+        let keep = b.icmp(IntCond::Ult, i, n);
+        b.br(Flags::NONE, keep, (body, &[]), (exit, &[acc]));
+
+        b.begin(body);
+        let off = b.binary(Op::Shl, Flags::NONE, i, two);
+        let p1 = b.ptr_add(Flags::NONE, pa, off);
+        let p2 = b.ptr_add(Flags::NONE, pb, off);
+        let va = b.load(Ty::F32, Flags::NONE, p1, 0, MemAttrs::aligned(2));
+        let vb = b.load(Ty::F32, Flags::NONE, p2, 0, MemAttrs::aligned(2));
+        let prod = b.binary(Op::Fmul, Flags::NONE, va, vb);
+        let acc_next = b.binary(Op::Fadd, Flags::NONE, acc, prod);
+        let i_next = b.binary(Op::Add, Flags::NONE, i, one);
+        b.jump((hdr, &[i_next, acc_next]));
+
+        b.begin(exit);
+        let res = b.param(Ty::F32);
+        b.ret(&[res]);
+        let func = b.finish_checked().unwrap();
+
+        let out = auto_vectorize_loops(func.view(), blaze_own::testing::heap().alloc()).unwrap();
+        verify(out.func.view()).unwrap();
+        assert_eq!(
+            out.stats.loops_vectorized, 0,
+            "strict IEEE 754 dot_f32 without REASSOC must not be reassociated into ReduceFadd"
+        );
+
+        for &init_f in &[0.0_f32, -0.0_f32] {
+            for &len in &[0usize, 1, 2, 3, 4, 7, 8, 15, 16, 20] {
+                let mut expected = init_f;
+                for k in 0..len {
+                    expected += xs[k] * ys[k];
+                }
+                let args = [Val::Int(len as u128), Val::Int(u128::from(init_f.to_bits()))];
+                let Outcome::Returned(orig) =
+                    eval::run_in(func.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("orig strict dot_f32 eval failed at len={len}");
+                };
+                let Outcome::Returned(got) =
+                    eval::run_in(out.func.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                else {
+                    panic!("post-vectorize strict dot_f32 eval failed at len={len}");
+                };
+                assert_eq!(orig.as_slice(), &[Val::Int(u128::from(expected.to_bits()))]);
+                assert_eq!(
+                    got.as_slice(),
+                    orig.as_slice(),
+                    "strict IEEE dot_f32 bit-exact mismatch at len={len}, init_bits={:#x}",
+                    init_f.to_bits()
+                );
+            }
+        }
     }
 }

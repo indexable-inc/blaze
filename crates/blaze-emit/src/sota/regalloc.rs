@@ -1017,8 +1017,8 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
 
     // 1. Compute live intervals `[def, last_use]`, call sites, and loop-weighted spill priorities.
     for b in 0..blocks {
-        let depth = block_depth.get(b).copied().unwrap_or(0).min(4);
-        let b_weight = 1u32 << (depth * 3); // 1x outer, 8x depth-1 loop, 64x depth-2 loop, ...
+        let depth = block_depth.get(b).copied().unwrap_or(0).min(5);
+        let b_weight = 1u32 << (depth * 4); // 1x outer, 16x depth-1, 256x depth-2, 4096x depth-3, ...
         let range = view.block(Block(u32_of(b)));
         for inst in range {
             if let Some(slot) = inst_block.get_mut(inst) {
@@ -1403,7 +1403,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
         prog_order.push(Candidate { inst, end, weight, is_remat });
     }
 
-    let run_coloring = |order: &[Candidate]| -> Result<(Vec<AllocLoc, A>, [bool; 32], [bool; 32], u32, u32), RegAllocError> {
+    let run_coloring = |order: &[Candidate]| -> Result<(Vec<AllocLoc, A>, [bool; 32], [bool; 32], u32, u32, u64), RegAllocError> {
         let mut loc_try: Vec<AllocLoc, A> = Vec::with_capacity_in(len, alloc);
         for _ in 0..len {
             loc_try.push(AllocLoc::None);
@@ -1427,6 +1427,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
         let mut used_callee_fp = [false; 32];
         let mut num_spill_slots = 0u32;
         let mut remat_count = 0u32;
+        let mut spill_cost = 0u64;
 
         let mut alloc_spill_n = |slots: usize, start: usize, end: usize| -> Result<u32, RegAllocError> {
             let slots_u32 = u32_of(slots);
@@ -1536,41 +1537,61 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                     if let Some(slot) = loc_try.get_mut(inst) {
                         *slot = AllocLoc::GprPairSpill(s0, s1);
                     }
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(8));
                 }
             } else if is_vec128_ty(ty).is_some() || is_vec_mask_ty(ty).is_some() {
-                let vec_safe = |r: Reg| -> bool { !crosses_call || !crossed_clobbers.clobbers_fp(reg_u8(r)) };
-                let try_vec = |h: u8| -> Option<Reg> {
-                    if h != NO_REG
-                        && CALLER_SAVED_FP.contains(&u32::from(h))
-                        && vec_safe(u32::from(h))
-                        && fp_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
-                    {
-                        Some(u32::from(h))
+                // Under AAPCS64, callees preserve only the low 64 bits (`d8..d15`) of `v8..v15`.
+                // For any 128-bit vector whose live interval does NOT cross a call (`!crosses_call`),
+                // `v8..v15` are 100% legal full 128-bit NEON registers once `used_callee_fp[r]` is
+                // recorded (emitting `stp/ldp d8..d15`), expanding the pool from 21 -> 29 registers!
+                let vec_safe = |r: Reg| -> bool {
+                    if (8..=15).contains(&r) {
+                        !crosses_call
                     } else {
-                        None
+                        !crosses_call || !crossed_clobbers.clobbers_fp(reg_u8(r))
                     }
+                };
+                let try_vec = |h: u8| -> Option<Reg> {
+                    if h != NO_REG {
+                        let r = u32::from(h);
+                        if (CALLER_SAVED_FP.contains(&r) || CALLEE_SAVED_FP.contains(&r))
+                            && vec_safe(r)
+                            && fp_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                        {
+                            return Some(r);
+                        }
+                    }
+                    None
                 };
                 let chosen = try_vec(primary_hint)
                     .or_else(|| try_vec(secondary_hint))
                     .or_else(|| {
                         let (avoid0, avoid1) = vec_fma_avoid_regs(view, skip_alloc, &loc_try, inst);
                         if avoid0 != NO_REG || avoid1 != NO_REG {
-                            caller_fp_order.iter().copied().find(|&r| {
-                                let ru = reg_u8(r);
-                                ru != avoid0
-                                    && ru != avoid1
-                                    && vec_safe(r)
-                                    && fp_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
-                            })
+                            caller_fp_order
+                                .iter()
+                                .copied()
+                                .chain(CALLEE_SAVED_FP.iter().copied())
+                                .find(|&r| {
+                                    let ru = reg_u8(r);
+                                    ru != avoid0
+                                        && ru != avoid1
+                                        && vec_safe(r)
+                                        && fp_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                                })
                         } else {
                             None
                         }
                     })
                     .or_else(|| {
-                        caller_fp_order.iter().copied().find(|&r| {
-                            vec_safe(r)
-                                && fp_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
-                        })
+                        caller_fp_order
+                            .iter()
+                            .copied()
+                            .chain(CALLEE_SAVED_FP.iter().copied())
+                            .find(|&r| {
+                                vec_safe(r)
+                                    && fp_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                            })
                     });
                 if let Some(reg) = chosen {
                     if let Some(slot) = loc_try.get_mut(inst) {
@@ -1579,11 +1600,17 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                     if let Some(b) = fp_busy.get_mut(idx(reg)) {
                         b.push((inst, end, cur_rbw));
                     }
+                    if (8..=15).contains(&reg) {
+                        if let Some(u) = used_callee_fp.get_mut(idx(reg)) {
+                            *u = true;
+                        }
+                    }
                 } else {
                     let slot = alloc_spill_n(2, inst, end)?;
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::VecSpill(slot);
                     }
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(8));
                 }
             } else if is_fp_ty(ty).is_some() {
                 let try_fp = |h: u8| -> Option<Reg> {
@@ -1625,8 +1652,33 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::FpSpill(slot);
                     }
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(4));
                 }
             } else {
+                let pair_trunc_hint = if view.op(inst) == Op::Trunc {
+                    view.data.get(inst).map(|&raw| idx(raw)).and_then(|si| {
+                        if view.tys.get(si).copied().map(Ty) != Some(Ty::I128) {
+                            return None;
+                        }
+                        if !skip_alloc.get(si).copied().unwrap_or(false) {
+                            match loc_try.get(si).copied() {
+                                Some(AllocLoc::GprPair(lo, _)) => Some(lo),
+                                _ => None,
+                            }
+                        } else if matches!(view.op(si), Op::Lshr | Op::Ashr) {
+                            let x = view.data.get(si).and_then(|&d| view.extra.get(idx(d))).copied()?;
+                            match loc_try.get(idx(x)).copied() {
+                                Some(AllocLoc::GprPair(_, hi)) => Some(hi),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+                .unwrap_or(NO_REG);
                 let try_gpr = |h: u8| -> Option<Reg> {
                     if h != NO_REG
                         && gpr_safe(u32::from(h))
@@ -1639,6 +1691,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                 };
                 let chosen = try_gpr(primary_hint)
                     .or_else(|| try_gpr(secondary_hint))
+                    .or_else(|| try_gpr(pair_trunc_hint))
                     .or_else(|| {
                         caller_gpr_order
                             .iter()
@@ -1666,24 +1719,28 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                         *slot = AllocLoc::RematConst(cval);
                     }
                     remat_count += 1;
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
                 } else {
                     let slot = alloc_spill_n(1, inst, end)?;
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::GprSpill(slot);
                     }
+                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(4));
                 }
             }
         }
-        Ok((loc_try, used_callee_gpr, used_callee_fp, num_spill_slots, remat_count))
+        Ok((loc_try, used_callee_gpr, used_callee_fp, num_spill_slots, remat_count, spill_cost))
     };
 
     // Phase 1: exact chordal-SSA program-order coloring (provably minimal register count!).
-    let (mut final_loc, mut used_callee_gpr, mut used_callee_fp, mut num_spill_slots, mut remat_count) =
+    let (mut final_loc, mut used_callee_gpr, mut used_callee_fp, mut num_spill_slots, mut remat_count, spill_cost) =
         run_coloring(&prog_order)?;
 
-    // Phase 2: if register pressure overflowed (spills > 0), run loop-weighted Greedy Priority
-    // Coloring so hot inner loops NEVER spill while cold outer values/constants yield & rematerialize!
-    if num_spill_slots > 0 {
+    // Phase 2: if register pressure overflowed (spills > 0 or remat > 0), run loop-weighted
+    // Greedy Priority Coloring so hot inner loops NEVER spill while cold outer values/constants
+    // yield & rematerialize! Compare by loop-weighted `spill_cost` (never raw unweighted slot
+    // count) so spilling outer depth-0/1 values ALWAYS beats spilling even one inner-loop value.
+    if num_spill_slots > 0 || remat_count > 0 {
         let mut greedy_order: Vec<Candidate, A> = Vec::with_capacity_in(prog_order.len(), alloc);
         for &c in &prog_order {
             greedy_order.push(c);
@@ -1694,8 +1751,8 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                 .then_with(|| a.is_remat.cmp(&b.is_remat))
                 .then_with(|| a.inst.cmp(&b.inst))
         });
-        if let Ok((g_loc, g_cgpr, g_cfp, g_spills, g_remat)) = run_coloring(&greedy_order) {
-            if g_spills <= num_spill_slots {
+        if let Ok((g_loc, g_cgpr, g_cfp, g_spills, g_remat, g_cost)) = run_coloring(&greedy_order) {
+            if g_cost < spill_cost || (g_cost == spill_cost && g_spills <= num_spill_slots) {
                 final_loc = g_loc;
                 used_callee_gpr = g_cgpr;
                 used_callee_fp = g_cfp;
@@ -1743,8 +1800,10 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                     clob = clob.with(TierReg(hi));
                 }
             }
-            AllocLoc::Fp(r) | AllocLoc::Vec(r) if !(8..=15).contains(&r) => {
-                clob = clob.with(TierReg(32 + r));
+            AllocLoc::Fp(r) | AllocLoc::Vec(r) => {
+                if !(8..=15).contains(&r) {
+                    clob = clob.with(TierReg(32 + r));
+                }
                 clob = clob.with(TierReg(32 + 29)).with(TierReg(32 + 30)).with(TierReg(32 + 31));
             }
             _ => {}
@@ -2062,5 +2121,260 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn matmul_4x16_neon_zero_vec_spills_and_zero_inner_ptr_spills() {
+        let alloc = test_alloc();
+        let v4f32 = Ty::vector(Scalar::F32, 4).expect("v4f32");
+        const OFFSETS: [i32; 4] = [0, 16, 32, 48];
+
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                Param::of(Ty::PTR), // a_base
+                Param::of(Ty::PTR), // b_base
+                Param::of(Ty::PTR), // c_base
+                Param::of(Ty::I64), // m
+                Param::of(Ty::I64), // n
+                Param::of(Ty::I64), // k_len
+                Param::of(Ty::I64), // a_stride
+                Param::of(Ty::I64), // b_stride
+            ],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+
+        let entry = b.create_block(BlockKind::Normal);
+        let i_loop = b.create_block(BlockKind::Normal);
+        let j_loop = b.create_block(BlockKind::Normal);
+        let k_loop = b.create_block(BlockKind::Normal);
+        let j_tail = b.create_block(BlockKind::Normal);
+        let i_tail = b.create_block(BlockKind::Normal);
+        let exit = b.create_block(BlockKind::Normal);
+
+        // Depth 0: 8 params + 14 cold outer GPRs live across the entire 3-deep loop nest
+        // (total GPR pressure > 26 so spilling MUST occur on cold outer values, never inner ptrs!).
+        b.begin(entry);
+        let a_base = b.param(Ty::PTR);
+        let b_base = b.param(Ty::PTR);
+        let c_base = b.param(Ty::PTR);
+        let m = b.param(Ty::I64);
+        let n = b.param(Ty::I64);
+        let k_len = b.param(Ty::I64);
+        let a_stride = b.param(Ty::I64);
+        let b_stride = b.param(Ty::I64);
+
+        let mut outer_vals = Vec::with_capacity_in(14, alloc);
+        for idx_k in 0..14u64 {
+            let ck = b.iconst(Ty::I64, u128::from(idx_k * 7 + 3));
+            let base_v = match idx_k % 5 {
+                0 => m,
+                1 => n,
+                2 => k_len,
+                3 => a_stride,
+                _ => b_stride,
+            };
+            let v = b.binary(Op::Add, Flags::NONE, base_v, ck);
+            outer_vals.push(v);
+        }
+        let z64 = b.iconst(Ty::I64, 0);
+        b.jump((i_loop, &[z64]));
+
+        // Depth 1 (`i` loop): 4 row pointers into A and 4 row pointers into C live across `j`/`k`.
+        b.begin(i_loop);
+        let i_iv = b.param(Ty::I64);
+        let row_off = b.binary(Op::Mul, Flags::NONE, i_iv, a_stride);
+        let mut a_rows = Vec::with_capacity_in(4, alloc);
+        let mut c_rows = Vec::with_capacity_in(4, alloc);
+        let mut cur_a = b.ptr_add(Flags::NONE, a_base, row_off);
+        let mut cur_c = b.ptr_add(Flags::NONE, c_base, row_off);
+        for r in 0..4usize {
+            if r > 0 {
+                cur_a = b.ptr_add(Flags::NONE, cur_a, a_stride);
+                cur_c = b.ptr_add(Flags::NONE, cur_c, b_stride);
+            }
+            a_rows.push(cur_a);
+            c_rows.push(cur_c);
+        }
+        let z64_j = b.iconst(Ty::I64, 0);
+        b.jump((j_loop, &[z64_j]));
+
+        // Depth 2 (`j` loop): load 16 `v4f32` accumulators and enter depth-3 `k` loop.
+        b.begin(j_loop);
+        let j_iv = b.param(Ty::I64);
+        let c_two = b.iconst(Ty::I64, 2);
+        let j_bytes = b.binary(Op::Shl, Flags::NONE, j_iv, c_two);
+        let b_j = b.ptr_add(Flags::NONE, b_base, j_bytes);
+        let mut c_j_ptrs = Vec::with_capacity_in(4, alloc);
+        let mut init_c = Vec::with_capacity_in(16, alloc);
+        for r in 0..4usize {
+            let cj = b.ptr_add(Flags::NONE, c_rows[r], j_bytes);
+            c_j_ptrs.push(cj);
+            for col in 0..4usize {
+                init_c.push(b.load(v4f32, Flags::NONE, cj, OFFSETS[col], MemAttrs::aligned(4)));
+            }
+        }
+        let z64_k = b.iconst(Ty::I64, 0);
+        let mut k_entry_args = Vec::with_capacity_in(22, alloc);
+        k_entry_args.push(z64_k);
+        for r in 0..4usize {
+            k_entry_args.push(a_rows[r]);
+        }
+        k_entry_args.push(b_j);
+        for &cv in &init_c {
+            k_entry_args.push(cv);
+        }
+        b.jump((k_loop, &k_entry_args));
+
+        // Depth 3 (`k` loop): 5 running pointers (`pa0..pa3, pb`), 16 `v4f32` accumulators,
+        // 4 `v4f32` B loads, scalar `f32` loads + `dup.4s` + strict-IEEE `fmul.4s` + `fadd.4s`.
+        b.begin(k_loop);
+        let k_iv = b.param(Ty::I64);
+        let mut pa = Vec::with_capacity_in(4, alloc);
+        for _ in 0..4usize {
+            pa.push(b.param(Ty::PTR));
+        }
+        let pb = b.param(Ty::PTR);
+        let mut acc = Vec::with_capacity_in(16, alloc);
+        for _ in 0..16usize {
+            acc.push(b.param(v4f32));
+        }
+
+        let mut b_vecs = Vec::with_capacity_in(4, alloc);
+        for col in 0..4usize {
+            b_vecs.push(b.load(v4f32, Flags::NONE, pb, OFFSETS[col], MemAttrs::aligned(4)));
+        }
+        let mut next_acc = Vec::with_capacity_in(16, alloc);
+        for r in 0..4usize {
+            let a_sc = b.load(Ty::F32, Flags::NONE, pa[r], 0, MemAttrs::aligned(4));
+            let va = b.convert(Op::Splat, Flags::NONE, v4f32, a_sc);
+            for col in 0..4usize {
+                let prod = b.binary(Op::Fmul, Flags::NONE, va, b_vecs[col]);
+                let sum = b.binary(Op::Fadd, Flags::NONE, acc[r * 4 + col], prod);
+                next_acc.push(sum);
+            }
+        }
+        let c4_ptr = b.iconst(Ty::I64, 4);
+        let mut pa_next = Vec::with_capacity_in(4, alloc);
+        for r in 0..4usize {
+            pa_next.push(b.ptr_add(Flags::NONE, pa[r], c4_ptr));
+        }
+        let pb_next = b.ptr_add(Flags::NONE, pb, b_stride);
+        let c1_k = b.iconst(Ty::I64, 1);
+        let k_next = b.binary(Op::Add, Flags::NONE, k_iv, c1_k);
+        let cond_k = b.icmp(IntCond::Ult, k_next, k_len);
+        let mut k_back_args = Vec::with_capacity_in(22, alloc);
+        k_back_args.push(k_next);
+        for &p in &pa_next {
+            k_back_args.push(p);
+        }
+        k_back_args.push(pb_next);
+        for &cv in &next_acc {
+            k_back_args.push(cv);
+        }
+        b.br(Flags::NONE, cond_k, (k_loop, &k_back_args), (j_tail, &next_acc));
+
+        // Depth 2 tail: store 16 `v4f32` accumulators and advance `j`.
+        b.begin(j_tail);
+        let mut out_c = Vec::with_capacity_in(16, alloc);
+        for _ in 0..16usize {
+            out_c.push(b.param(v4f32));
+        }
+        for r in 0..4usize {
+            for col in 0..4usize {
+                b.store(Flags::NONE, out_c[r * 4 + col], c_j_ptrs[r], OFFSETS[col], MemAttrs::aligned(4));
+            }
+        }
+        let c16_j = b.iconst(Ty::I64, 16);
+        let j_next = b.binary(Op::Add, Flags::NONE, j_iv, c16_j);
+        let cond_j = b.icmp(IntCond::Ult, j_next, n);
+        b.br(Flags::NONE, cond_j, (j_loop, &[j_next]), (i_tail, &[]));
+
+        // Depth 1 tail: advance `i`.
+        b.begin(i_tail);
+        let c4_i = b.iconst(Ty::I64, 4);
+        let i_next = b.binary(Op::Add, Flags::NONE, i_iv, c4_i);
+        let cond_i = b.icmp(IntCond::Ult, i_next, m);
+        b.br(Flags::NONE, cond_i, (i_loop, &[i_next]), (exit, &[]));
+
+        // Depth 0 exit: consume all 14 outer values so they stay live across the entire loop nest.
+        b.begin(exit);
+        let mut ret_v = outer_vals[0];
+        for &ov in &outer_vals[1..] {
+            ret_v = b.binary(Op::Xor, Flags::NONE, ret_v, ov);
+        }
+        b.ret(&[ret_v]);
+
+        let func = b.finish_checked().expect("4x16 NEON GEMM LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+
+        let ra = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+            .expect("regalloc succeeds for 4x16 NEON GEMM");
+
+        // 1. ZERO VecSpill across the entire function, using callee-saved v8..v15 (`d_pairs != 0`).
+        let vec_spills = ra
+            .loc_of
+            .iter()
+            .filter(|loc| matches!(loc, AllocLoc::VecSpill(_)))
+            .count();
+        assert_eq!(
+            vec_spills, 0,
+            "4x16 NEON GEMM must have ZERO VecSpill (29 allocatable NEON regs via v8..v15)"
+        );
+        assert_ne!(
+            ra.d_pairs, 0,
+            "4x16 NEON GEMM must allocate callee-saved v8..v15 and mark d_pairs"
+        );
+
+        // 2. GPR pressure exceeded 26, so cold outer values spilled — NEVER the 5 depth-3 pointers!
+        assert!(
+            ra.num_spill_slots > 0,
+            "test must exercise GPR pressure > 26 so Phase 2 loop-weighted spilling is verified"
+        );
+        let inner_ptrs = [
+            ("pa0", pa[0], pa_next[0]),
+            ("pa1", pa[1], pa_next[1]),
+            ("pa2", pa[2], pa_next[2]),
+            ("pa3", pa[3], pa_next[3]),
+            ("pb", pb, pb_next),
+        ];
+        for (name, p_cur, p_nxt) in inner_ptrs {
+            assert!(
+                matches!(ra.loc_of[p_cur.index()], AllocLoc::Gpr(_)),
+                "depth-3 inner pointer {name} must stay in a physical GPR, got {:?}",
+                ra.loc_of[p_cur.index()]
+            );
+            assert!(
+                matches!(ra.loc_of[p_nxt.index()], AllocLoc::Gpr(_)),
+                "depth-3 inner pointer {name}_next must stay in a physical GPR, got {:?}",
+                ra.loc_of[p_nxt.index()]
+            );
+        }
+
+        // 3. Full AArch64 emission succeeds with `d_pairs != 0` in the unwind frame.
+        let emitted = super::super::isel::emit_sota_a64(
+            view,
+            &NoNames,
+            super::super::CallMode::DirectBl,
+            Machine::LSE,
+            true,
+            alloc,
+        )
+        .expect("emit_sota_a64 succeeds for 4x16 NEON GEMM");
+        assert_ne!(
+            emitted.unwind_frame.expect("4x16 GEMM has frame").d_pairs,
+            0,
+            "emitted unwind frame must record saved d_pairs for v8..v15"
+        );
     }
 }

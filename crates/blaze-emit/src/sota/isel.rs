@@ -277,6 +277,10 @@ enum Fusion {
     /// Widening `I128` multiply whose single-use `Zext(<=64 -> I128)` operand(s) read directly from
     /// their scalar source GPRs with zero `mov hi, xzr` and zero `madd`.
     I128WideMul { lhs_src: Option<u32>, rhs_src: Option<u32> },
+    /// `Trunc(Mul(lhs, rhs): I128 -> <=64)` when the `I128` multiply is single-use: computes only
+    /// the low 64-bit `mul` directly into the scalar destination with zero `umulh`, zero `madd`,
+    /// zero `GprPair`, and zero `mov`.
+    I128LoMul { lhs: u32, rhs: u32, lhs_src: Option<u32>, rhs_src: Option<u32> },
     /// `Trunc(Lshr/Ashr(x: I128, 64) -> <=64)` reading `x`'s upper 64-bit register directly with zero shift.
     I128HiTrunc { src: u32, shift_imm: u32 },
 }
@@ -3510,6 +3514,27 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         set_at(&mut fusion, inst, Fusion::I128HiTrunc { src: x, shift_imm: bv });
                         set_at(&mut skip_emit, si, true);
                     }
+                } else if bits <= 64
+                    && ty_at(view.tys, si) == Ty::I128
+                    && at_u32(&use_count, si) == 1
+                    && at_u32(&inst_block, si) == b
+                    && view.op(si) == Op::Mul
+                    && !at_bool(&skip_emit, si)
+                {
+                    let mat = to_idx(at_u32(view.data, si));
+                    let lhs = at_u32(view.extra, mat);
+                    let rhs = at_u32(view.extra, mat + 1);
+                    match at_fusion(&fusion, si) {
+                        Fusion::None => {
+                            set_at(&mut fusion, inst, Fusion::I128LoMul { lhs, rhs, lhs_src: None, rhs_src: None });
+                            set_at(&mut skip_emit, si, true);
+                        }
+                        Fusion::I128WideMul { lhs_src, rhs_src } => {
+                            set_at(&mut fusion, inst, Fusion::I128LoMul { lhs, rhs, lhs_src, rhs_src });
+                            set_at(&mut skip_emit, si, true);
+                        }
+                        _ => {}
+                    }
                 }
             }
             _ => {}
@@ -3828,7 +3853,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             | Fusion::TstBr { imm_nrs: None, .. }
             | Fusion::BlazeResultCallBr
             | Fusion::VecUadalp { .. }
-            | Fusion::I128WideMul { .. } => {}
+            | Fusion::I128WideMul { .. }
+            | Fusion::I128LoMul { .. } => {}
             Fusion::None => match op {
                 Op::Add => {
                     let at = to_idx(at_u32(view.data, inst));
@@ -9605,37 +9631,81 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 }
                 Op::Trunc => {
                     let (rd, sp) = dst_gpr(inst);
-                    let src = if let Fusion::I128HiTrunc { src: x, .. } = at_fusion(&fusion, inst) {
-                        match at_loc(&reg_alloc.loc_of, to_idx(x)) {
-                            AllocLoc::GprPair(_, hi) => u32::from(hi),
-                            AllocLoc::GprPairSpill(_, s1) => {
-                                emit_ld_spill_gpr(&mut words, X16, spill_base, s1);
-                                X16
-                            }
-                            _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected i128 hi trunc src loc" }),
-                        }
-                    } else {
-                        let src_v = at_u32(view.data, inst);
-                        if ty_at(view.tys, to_idx(src_v)) == Ty::I128 {
-                            match at_loc(&reg_alloc.loc_of, to_idx(src_v)) {
+                    if let Fusion::I128LoMul { lhs, rhs, lhs_src, rhs_src } = at_fusion(&fusion, inst) {
+                        let a0 = match lhs_src {
+                            Some(src) => load_gpr(&mut words, src, X16),
+                            None => match at_loc(&reg_alloc.loc_of, to_idx(lhs)) {
                                 AllocLoc::GprPair(lo, _) => u32::from(lo),
                                 AllocLoc::GprPairSpill(s0, _) => {
                                     emit_ld_spill_gpr(&mut words, X16, spill_base, s0);
                                     X16
                                 }
-                                _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected i128 trunc src loc" }),
+                                _ => {
+                                    return Err(TierError::Refused {
+                                        tier: TIER,
+                                        inst: Some(u32_of(inst)),
+                                        what: "unexpected i128 lo mul lhs loc",
+                                    });
+                                }
+                            },
+                        };
+                        let b0 = match rhs_src {
+                            Some(src) => load_gpr(&mut words, src, X17),
+                            None => match at_loc(&reg_alloc.loc_of, to_idx(rhs)) {
+                                AllocLoc::GprPair(lo, _) => u32::from(lo),
+                                AllocLoc::GprPairSpill(s0, _) => {
+                                    emit_ld_spill_gpr(&mut words, X17, spill_base, s0);
+                                    X17
+                                }
+                                _ => {
+                                    return Err(TierError::Refused {
+                                        tier: TIER,
+                                        inst: Some(u32_of(inst)),
+                                        what: "unexpected i128 lo mul rhs loc",
+                                    });
+                                }
+                            },
+                        };
+                        words.push(enc::mul(rd, a0, b0));
+                        if bits < 64 {
+                            words.push(enc::zext(rd, rd, bits));
+                        }
+                        if let Some(s) = sp {
+                            emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                        }
+                    } else {
+                        let src = if let Fusion::I128HiTrunc { src: x, .. } = at_fusion(&fusion, inst) {
+                            match at_loc(&reg_alloc.loc_of, to_idx(x)) {
+                                AllocLoc::GprPair(_, hi) => u32::from(hi),
+                                AllocLoc::GprPairSpill(_, s1) => {
+                                    emit_ld_spill_gpr(&mut words, X16, spill_base, s1);
+                                    X16
+                                }
+                                _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected i128 hi trunc src loc" }),
                             }
                         } else {
-                            load_gpr(&mut words, src_v, X16)
+                            let src_v = at_u32(view.data, inst);
+                            if ty_at(view.tys, to_idx(src_v)) == Ty::I128 {
+                                match at_loc(&reg_alloc.loc_of, to_idx(src_v)) {
+                                    AllocLoc::GprPair(lo, _) => u32::from(lo),
+                                    AllocLoc::GprPairSpill(s0, _) => {
+                                        emit_ld_spill_gpr(&mut words, X16, spill_base, s0);
+                                        X16
+                                    }
+                                    _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected i128 trunc src loc" }),
+                                }
+                            } else {
+                                load_gpr(&mut words, src_v, X16)
+                            }
+                        };
+                        if bits < 64 {
+                            words.push(enc::zext(rd, src, bits));
+                        } else if rd != src {
+                            words.push(enc::mov(rd, src));
                         }
-                    };
-                    if bits < 64 {
-                        words.push(enc::zext(rd, src, bits));
-                    } else if rd != src {
-                        words.push(enc::mov(rd, src));
-                    }
-                    if let Some(s) = sp {
-                        emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                        if let Some(s) = sp {
+                            emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                        }
                     }
                 }
                 Op::Call | Op::CallIndirect | Op::Invoke | Op::InvokeIndirect => {
@@ -11360,6 +11430,135 @@ mod tests {
             f(x.as_ptr(), y.as_mut_ptr(), 32, a);
             for k in 0..32 {
                 assert_eq!(y[k].to_bits(), want[k].to_bits(), "saxpy lane {k} mismatch");
+            }
+        }
+    }
+
+    #[test]
+    fn wyhash_post_egraph_single_umulh_and_zero_madd() {
+        let alloc = test_alloc();
+
+        // 1. Exact post-egraph `wyhash` inner-loop LIR where `((prod >> 64) as u64)` was folded
+        //    to `Op::Umulhi(a, b)` and scheduled before `prod = Mul(Zext(a), Zext(b))` whose only
+        //    remaining user is `lo = Trunc(prod -> i64)`.
+        //    Must fuse `lo` into `Fusion::I128LoMul` -> EXACTLY 1 `umulh`, 1 `mul`, 0 `madd`!
+        let wyhash_umulhi_first = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let hi = b.binary(Op::Umulhi, Flags::NONE, a, bv);
+            let za = b.convert(Op::Zext, Flags::NONE, Ty::I128, a);
+            let zb = b.convert(Op::Zext, Flags::NONE, Ty::I128, bv);
+            let prod = b.binary(Op::Mul, Flags::NONE, za, zb);
+            let lo = b.convert(Op::Trunc, Flags::NONE, Ty::I64, prod);
+            let mixed = b.binary(Op::Xor, Flags::NONE, lo, hi);
+            b.ret(&[mixed]);
+            let func = b.finish_checked().expect("post-egraph wyhash LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("post-egraph wyhash emits")
+        };
+        let w1 = decode_words(&wyhash_umulhi_first.code, alloc);
+        assert_eq!(w1.iter().filter(|&&w| is_umulh(w)).count(), 1, "expected EXACTLY 1 umulh");
+        assert_eq!(w1.iter().filter(|&&w| is_mul_x(w)).count(), 1, "expected EXACTLY 1 mul");
+        assert_eq!(w1.iter().filter(|&&w| is_madd_x(w)).count(), 0, "expected ZERO madd");
+
+        // 2. General `Trunc(Mul(a: i128, b: i128) -> i64)` (non-zext i128 inputs):
+        //    Only low 64 bits are needed -> 0 `umulh`, 1 `mul`, 0 `madd`!
+        let lo_mul_i128 = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I128), Param::of(Ty::I128)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I128);
+            let bv = b.param(Ty::I128);
+            let prod = b.binary(Op::Mul, Flags::NONE, a, bv);
+            let lo = b.convert(Op::Trunc, Flags::NONE, Ty::I64, prod);
+            b.ret(&[lo]);
+            let func = b.finish_checked().expect("i128 lo-mul LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("i128 lo-mul emits")
+        };
+        let w2 = decode_words(&lo_mul_i128.code, alloc);
+        assert_eq!(w2.iter().filter(|&&w| is_umulh(w)).count(), 0, "lo-only i128 mul must emit 0 umulh");
+        assert_eq!(w2.iter().filter(|&&w| is_mul_x(w)).count(), 1, "lo-only i128 mul must emit 1 mul");
+        assert_eq!(w2.iter().filter(|&&w| is_madd_x(w)).count(), 0, "lo-only i128 mul must emit 0 madd");
+
+        // 3. Narrow truncation `Trunc(Mul(Zext(a), Zext(b)) -> i32)` -> 0 `umulh`, 1 `mul`, 0 `madd`.
+        let lo_mul_i32 = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I32)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let za = b.convert(Op::Zext, Flags::NONE, Ty::I128, a);
+            let zb = b.convert(Op::Zext, Flags::NONE, Ty::I128, bv);
+            let prod = b.binary(Op::Mul, Flags::NONE, za, zb);
+            let lo32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, prod);
+            b.ret(&[lo32]);
+            let func = b.finish_checked().expect("i128 lo-mul i32 LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("i128 lo-mul i32 emits")
+        };
+        let w3 = decode_words(&lo_mul_i32.code, alloc);
+        assert_eq!(w3.iter().filter(|&&w| is_umulh(w)).count(), 0);
+        assert_eq!(w3.iter().filter(|&&w| is_mul_x(w)).count(), 1);
+        assert_eq!(w3.iter().filter(|&&w| is_madd_x(w)).count(), 0);
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex_wy = exec_leaf(wyhash_umulhi_first);
+            let f_wy: extern "C" fn(u64, u64) -> u64 = unsafe { ex_wy.as_fn() };
+            let ex_lo = exec_leaf(lo_mul_i128);
+            let f_lo: extern "C" fn(u128, u128) -> u64 = unsafe { ex_lo.as_fn() };
+            let ex_lo32 = exec_leaf(lo_mul_i32);
+            let f_lo32: extern "C" fn(u64, u64) -> u32 = unsafe { ex_lo32.as_fn() };
+
+            let cases: &[(u64, u64)] = &[
+                (0, 0),
+                (1, 0),
+                (1, 1),
+                (u64::MAX, u64::MAX),
+                (0xa076_1d64_78bd_642f, 0xe703_7ed1_a0b4_28db),
+                (0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210),
+            ];
+            for &(a, bv) in cases {
+                let p = u128::from(a).wrapping_mul(u128::from(bv));
+                let want_wy = (p as u64) ^ ((p >> 64) as u64);
+                assert_eq!(f_wy(a, bv), want_wy, "post-egraph wyhash({a:#x}, {bv:#x}) mismatch");
+                let a128 = (u128::from(a.rotate_left(17)) << 64) | u128::from(a);
+                let b128 = (u128::from(bv.rotate_right(13)) << 64) | u128::from(bv);
+                assert_eq!(
+                    f_lo(a128, b128),
+                    a128.wrapping_mul(b128) as u64,
+                    "i128 lo-mul mismatch"
+                );
+                assert_eq!(
+                    f_lo32(a, bv),
+                    p as u32,
+                    "i128 lo-mul i32 mismatch"
+                );
             }
         }
     }
