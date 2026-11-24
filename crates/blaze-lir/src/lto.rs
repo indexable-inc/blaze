@@ -232,11 +232,16 @@ impl<A: Allocator> Bodies for ModuleBodies<'_, A> {
     }
 }
 
-/// Runs `scalar_replace -> propagate -> dead` on `view` in `alloc`.
+/// Runs `scalar_replace -> propagate -> dead -> coalesce_cfg` on `view` in `alloc`.
+///
+/// Coalescing single-predecessor `Jump` chains after inlining restores 2-block
+/// `HeaderBody` loop shapes so downstream loop passes (vectorization, unrolling,
+/// LICM) see the inlined loop body as a single block.
 fn simplify_body<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
     let sroa = scalar_replace(view, alloc)?;
     let prop = propagate(sroa.view(), alloc)?;
-    dead(prop.view(), alloc)
+    let dce = dead(prop.view(), alloc)?;
+    crate::simplify::coalesce_cfg(dce.view(), alloc)
 }
 
 fn from_inline(error: InlineError) -> SimplifyError {

@@ -175,45 +175,27 @@ impl<F: Tier> Sota<F> {
     }
 }
 
-/// Canonical SOTA mid-end optimization stack shared by single-function `Sota::emit`,
-/// `emit_sota_record_measured`, and whole-program `compile_module_a64`.
-pub(crate) fn optimize_sota_midend<'a>(
+/// Shared Stage 1b–1g loop, vectorization, dispatch tail-duplication, superoptimization,
+/// scheduling, and hot/cold partitioning stack used by both [`optimize_sota_midend`] and
+/// [`emit_sota_record_measured`].
+fn run_sota_loop_and_late_passes<'a>(
     input: blaze_lir::View<'_>,
     machine: Machine,
-    max_rounds: u32,
+    reg_budget: RegBudget,
     auto_vectorize: bool,
     superopt: Option<SuperoptOpts>,
     alloc: Alloc<'a>,
-) -> Result<blaze_lir::Func<Alloc<'a>>, TierError> {
-    let (reg_budget, default_super_arch) = match machine.arch {
-        Arch::Arm64 => (RegBudget::AARCH64, blaze_lir::superopt::AArch64MicroArch::AppleSilicon),
-        Arch::X86_64 => (
-            RegBudget { hardware_fma: (machine.features & Machine::FMA) != 0, ..RegBudget::X86_64 },
-            blaze_lir::superopt::AArch64MicroArch::X86_64Zen5,
-        ),
+) -> blaze_lir::Func<Alloc<'a>> {
+    let default_super_arch = match machine.arch {
+        Arch::Arm64 => blaze_lir::superopt::AArch64MicroArch::AppleSilicon,
+        Arch::X86_64 => blaze_lir::superopt::AArch64MicroArch::X86_64Zen5,
     };
-
-    // Stage 0: Scalar Replacement of Aggregates (SROA) promotes non-escaping local stack slots
-    // straight into SSA registers before Aegraph + LICM + Strength Reduction.
-    let sroa_func = scalar_replace(input, alloc).ok();
-    let mid_in = match &sroa_func {
-        Some(f) => f.view(),
-        None => input,
-    };
-
-    // Stage 1: Fixed-point Aegraph + Reassociation + Strength Reduction + LICM + DCE.
-    let optimized = sota_optimize_fixpoint(mid_in, reg_budget, max_rounds, |_| 1, alloc)
-        .map_err(|_| TierError::Refused {
-            tier: TierName::Sota,
-            inst: None,
-            what: "SOTA mid-end optimization refused function",
-        })?;
 
     // Stage 1b: Dominating Bounds-Check Elimination + Loop Unswitching + If-Conversion.
-    let bce_out = eliminate_redundant_checks(optimized.func.view(), alloc).ok();
+    let bce_out = eliminate_redundant_checks(input, alloc).ok();
     let post_bce = match &bce_out {
         Some(o) => o.func.view(),
-        None => optimized.func.view(),
+        None => input,
     };
     let unsw_out = unswitch_loops(post_bce, 2, alloc).ok();
     let post_unsw = match &unsw_out {
@@ -267,7 +249,8 @@ pub(crate) fn optimize_sota_midend<'a>(
     };
 
     // Stage 1d: 4x-unrolled SIMD Loop Auto-Vectorization, SIMD `memchr`, SLP, IV-div NEON,
-    // 4x Scalar Multi-Accumulator Unrolling, and Loop Rotation.
+    // 4x Scalar Multi-Accumulator Unrolling, and Loop Rotation (turns `HeaderBody` loops like
+    // `wyhash_mix`, if-converted `bsearch`, and scalar epilogues into `SingleBlock` do-while loops).
     let vec_bytes = if machine.arch == Arch::X86_64 && (machine.features & Machine::AVX512 != 0) {
         64
     } else if machine.arch == Arch::X86_64 && (machine.features & Machine::AVX2 != 0) {
@@ -287,6 +270,12 @@ pub(crate) fn optimize_sota_midend<'a>(
                     loop_cur = Some(o.func);
                 }
                 _ => break,
+            }
+        }
+        if did_vectorize {
+            let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
+            if let Ok(o) = sota_optimize_fixpoint(v, reg_budget, 2, |_| 1, alloc) {
+                loop_cur = Some(o.func);
             }
         }
         for _ in 0..8 {
@@ -340,18 +329,21 @@ pub(crate) fn optimize_sota_midend<'a>(
     }
     let post_loop = loop_cur.as_ref().map_or(post_nest, |f| f.view());
 
-    // Stage 1d-ii: Interpreter / State-Machine `Switch` Tail Duplication.
+    // Stage 1d-ii: Interpreter / State-Machine `Switch` Tail Duplication (both 1-block direct and
+    // 2-block bounded `dispatch -> decode(Switch)` loops).
     let taildup_func = if auto_vectorize {
         tail_duplicate_dispatch(post_loop, alloc).ok().filter(|o| o.stats.arms_duplicated > 0).map(|o| o.func)
     } else {
         None
     };
+    let did_taildup = taildup_func.is_some();
     let post_td = match &taildup_func {
         Some(f) => f.view(),
         None => post_loop,
     };
 
-    // Stage 1e: Bounded multi-round e-graph superoptimization.
+    // Stage 1e: Bounded multi-round e-graph superoptimization (local arithmetic rewrites only;
+    // preserves vectorization and tail-duplicated CFG structure).
     let super_func = if let Some(mut sopts) = superopt {
         if machine.arch == Arch::X86_64 {
             sopts.microarch = default_super_arch;
@@ -365,8 +357,10 @@ pub(crate) fn optimize_sota_midend<'a>(
         None => post_td,
     };
 
-    // Stage 1f: Intra-block critical-path latency-aware DAG list scheduler.
-    let sched_func = if !did_vectorize && !did_unroll {
+    // Stage 1f: Intra-block critical-path latency-aware DAG list scheduler (skipped after
+    // vectorization, unrolling, or dispatch tail-duplication so contiguous `ldp`/`stp` pairing and
+    // per-arm `CmpBr`/coalescing order stay intact).
+    let sched_func = if !did_vectorize && !did_unroll && !did_taildup {
         schedule_dag(post_super, alloc).ok().filter(|o| o.stats.insts_reordered > 0).map(|o| o.func)
     } else {
         None
@@ -380,9 +374,50 @@ pub(crate) fn optimize_sota_midend<'a>(
     if let Ok(o) = partition_cold_blocks(post_sched, |_| false, alloc)
         && o.stats.blocks_sunk > 0
     {
-        return Ok(o.func);
+        return o.func;
     }
-    Ok(post_sched.to_func_in(alloc))
+    post_sched.to_func_in(alloc)
+}
+
+/// Canonical SOTA mid-end optimization stack shared by single-function `Sota::emit`,
+/// `emit_sota_record_measured`, and whole-program `compile_module_a64`.
+pub(crate) fn optimize_sota_midend<'a>(
+    input: blaze_lir::View<'_>,
+    machine: Machine,
+    max_rounds: u32,
+    auto_vectorize: bool,
+    superopt: Option<SuperoptOpts>,
+    alloc: Alloc<'a>,
+) -> Result<blaze_lir::Func<Alloc<'a>>, TierError> {
+    let reg_budget = match machine.arch {
+        Arch::Arm64 => RegBudget::AARCH64,
+        Arch::X86_64 => RegBudget { hardware_fma: (machine.features & Machine::FMA) != 0, ..RegBudget::X86_64 },
+    };
+
+    // Stage 0: Scalar Replacement of Aggregates (SROA) promotes non-escaping local stack slots
+    // straight into SSA registers before Aegraph + LICM + Strength Reduction.
+    let sroa_func = scalar_replace(input, alloc).ok();
+    let mid_in = match &sroa_func {
+        Some(f) => f.view(),
+        None => input,
+    };
+
+    // Stage 1: Fixed-point Aegraph + Reassociation + Strength Reduction + LICM + DCE.
+    let optimized = sota_optimize_fixpoint(mid_in, reg_budget, max_rounds, |_| 1, alloc)
+        .map_err(|_| TierError::Refused {
+            tier: TierName::Sota,
+            inst: None,
+            what: "SOTA mid-end optimization refused function",
+        })?;
+
+    Ok(run_sota_loop_and_late_passes(
+        optimized.func.view(),
+        machine,
+        reg_budget,
+        auto_vectorize,
+        superopt,
+        alloc,
+    ))
 }
 
 impl<F: Tier> Tier for Sota<F> {
@@ -572,111 +607,27 @@ pub fn emit_sota_record_measured<'a>(
 
     if let Some(opt_v) = chosen_opt {
         {
-            // Run the full SOTA loop & straight-line optimization stack for direct native AArch64 `Sota`
-            // emission (`BCE -> Unswitch -> IfConv -> MemOpt -> 4x NEON / memchr / iv-div NEON / SLP / 4x Unroll / Rotate -> TailDup -> Sched`).
-            let bce_out = eliminate_redundant_checks(opt_v.view(), alloc).ok();
-            let post_bce = bce_out.as_ref().map_or(opt_v.view(), |o| o.func.view());
-            let unsw_out = unswitch_loops(post_bce, 2, alloc).ok();
-            let post_unsw = unsw_out.as_ref().map_or(post_bce, |o| o.func.view());
-            let ifc_out = if_convert(post_unsw, 8, alloc).ok();
-            let post_ifc = ifc_out.as_ref().map_or(post_unsw, |o| o.func.view());
-            let clean_func = if bce_out.as_ref().is_some_and(|o| o.stats.checks_eliminated > 0)
-                || unsw_out.as_ref().is_some_and(|o| o.stats.loops_unswitched > 0)
-                || ifc_out.as_ref().is_some_and(|o| o.stats.branches_converted > 0)
-            {
-                sota_optimize_fixpoint(post_ifc, RegBudget::AARCH64, 2, |_| 1, alloc).ok().map(|o| o.func)
-            } else {
-                None
+            // Only enable LSE when advertised by `isa`; never assume CSSC (not present on M1/M2/M3).
+            let features = if isa.lse { Machine::LSE } else { 0 };
+            let os = match isa.os {
+                crate::Os::MacOs => blaze_tier::Os::MacOs,
+                crate::Os::Linux => blaze_tier::Os::Linux,
             };
-            let post_clean = clean_func.as_ref().map_or(post_ifc, |f| f.view());
-            let mem_func = optimize_memory(post_clean, alloc).ok().map(|o| o.func);
-            let post_mem = mem_func.as_ref().map_or(post_clean, |f| f.view());
-            let fuse_f = fuse_adjacent_loops(post_mem, alloc).ok().filter(|o| o.stats.loops_fused > 0).map(|o| o.func);
-            let post_fuse = fuse_f.as_ref().map_or(post_mem, |f| f.view());
-            let inter_f = interchange_and_tile_loops(post_fuse, 0, alloc)
-                .ok()
-                .filter(|o| o.stats.loops_interchanged > 0)
-                .map(|o| o.func);
-            let post_nest = inter_f.as_ref().map_or(post_fuse, |f| f.view());
-            let mut loop_cur: Option<blaze_lir::Func<Alloc<'a>>> = None;
-            let mut did_vec = false;
-            let mut did_unroll = false;
-            for _ in 0..8 {
-                let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
-                match auto_vectorize_loops_with_width(v, 16, alloc) {
-                    Ok(o) if o.stats.loops_vectorized > 0 => {
-                        did_vec = true;
-                        loop_cur = Some(o.func);
-                    }
-                    _ => break,
-                }
-            }
-            for _ in 0..8 {
-                let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
-                match vectorize_memchr_loops(v, alloc) {
-                    Ok(o) if o.stats.loops_vectorized > 0 => {
-                        loop_cur = Some(o.func);
-                    }
-                    _ => break,
-                }
-            }
-            {
-                let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
-                if let Ok(o) = slp_vectorize(v, alloc)
-                    && o.stats.trees_vectorized > 0
-                {
-                    loop_cur = Some(o.func);
-                }
-            }
-            for _ in 0..8 {
-                let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
-                match vectorize_iv_div_loops(v, alloc) {
-                    Ok(o) if o.stats.loops_vectorized > 0 => {
-                        did_vec = true;
-                        loop_cur = Some(o.func);
-                    }
-                    _ => break,
-                }
-            }
-            for _ in 0..8 {
-                let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
-                match unroll_scalar_loops(v, alloc) {
-                    Ok(o) if o.stats.loops_unrolled > 0 => {
-                        did_unroll = true;
-                        loop_cur = Some(o.func);
-                    }
-                    _ => break,
-                }
-            }
-            for _ in 0..8 {
-                let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
-                match rotate_loops(v, alloc) {
-                    Ok(o) if o.stats.loops_rotated > 0 => {
-                        loop_cur = Some(o.func);
-                    }
-                    _ => break,
-                }
-            }
-            let post_loop = loop_cur.as_ref().map_or(post_nest, |f| f.view());
-            let td_f = tail_duplicate_dispatch(post_loop, alloc).ok().filter(|o| o.stats.arms_duplicated > 0).map(|o| o.func);
-            let post_td = td_f.as_ref().map_or(post_loop, |f| f.view());
-            let sched_f = if !did_vec && !did_unroll {
-                schedule_dag(post_td, alloc).ok().filter(|o| o.stats.insts_reordered > 0).map(|o| o.func)
-            } else {
-                None
-            };
-            let post_sched = sched_f.as_ref().map_or(post_td, |f| f.view());
-            let cold_f = partition_cold_blocks(post_sched, |_| false, alloc)
-                .ok()
-                .filter(|o| o.stats.blocks_sunk > 0)
-                .map(|o| o.func);
-            let final_v = cold_f.as_ref().map_or(post_sched, |f| f.view());
+            let machine = Machine { arch: Arch::Arm64, os, features };
+            let late_func = run_sota_loop_and_late_passes(
+                opt_v.view(),
+                machine,
+                RegBudget::AARCH64,
+                true,
+                None,
+                alloc,
+            );
+            let final_v = late_func.view();
 
             let traps_ok = traps.is_empty()
                 || final_v.ops.iter().filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable)).count() == orig_unreach;
             let emit_v = if traps_ok { final_v } else { opt_v.view() };
             if let Ok(full_v) = verify(emit_v) {
-                let features = if isa.lse { Machine::LSE } else { 0 };
                 let is_macos = isa.os == crate::Os::MacOs;
                 if let Ok(emitted) = isel::emit_sota_a64(full_v.view(), names, CallMode::GotSlot, features, is_macos, alloc) {
                     if let Some((rec, insts)) = emitted_to_code_record(emitted, traps, alloc) {

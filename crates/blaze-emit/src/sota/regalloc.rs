@@ -468,6 +468,340 @@ pub(crate) fn for_each_edge(view: &View<'_>, inst: usize, mut f: impl FnMut(u32,
     }
 }
 
+/// Register bank classification for coalescing compatibility:
+/// `0` = none / 2-word GPR pair, `1` = 128-bit SIMD vector/mask, `2` = scalar FP, `3` = scalar GPR.
+#[inline]
+fn reg_bank(view: &View<'_>, ty: Ty) -> u8 {
+    if ty == Ty::NONE || is_gpr_pair_ty(view, ty) {
+        0
+    } else if is_vec128_ty(ty).is_some() || is_vec_mask_ty(ty).is_some() {
+        1
+    } else if is_fp_ty(ty).is_some() {
+        2
+    } else {
+        3
+    }
+}
+
+/// True iff `inst` reads all of its inputs before writing its destination register,
+/// allowing safe zero-copy coalescing with a dying operand whose `last_use == inst`
+/// (e.g. `fmla v16.4s, v20.4s, v21.4s`, `add.2d v16, v16, v21`, or `add x9, x9, #1`).
+fn is_rbw(view: &View<'_>, inst: usize) -> bool {
+    let op = view.op(inst);
+    let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
+    if is_gpr_pair_ty(view, ty) {
+        return false;
+    }
+    if op == Op::Icmp {
+        let is_i128_cmp = view
+            .data
+            .get(inst)
+            .and_then(|&d| view.extra.get(idx(d) + 1))
+            .and_then(|&lhs| view.tys.get(idx(lhs)))
+            .copied()
+            .map(Ty)
+            == Some(Ty::I128);
+        if is_i128_cmp {
+            return false;
+        }
+    }
+    matches!(
+        op,
+        Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Umulhi
+            | Op::Smulhi
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Not
+            | Op::Shl
+            | Op::Lshr
+            | Op::Ashr
+            | Op::Rotl
+            | Op::Rotr
+            | Op::Umin
+            | Op::Umax
+            | Op::Smin
+            | Op::Smax
+            | Op::UaddSat
+            | Op::UsubSat
+            | Op::SaddSat
+            | Op::SsubSat
+            | Op::Clz
+            | Op::Ctz
+            | Op::Popcnt
+            | Op::Bswap
+            | Op::Bitrev
+            | Op::Fadd
+            | Op::Fsub
+            | Op::Fmul
+            | Op::Fdiv
+            | Op::Fma
+            | Op::Fmuladd
+            | Op::Fneg
+            | Op::Fabs
+            | Op::Sqrt
+            | Op::Nearest
+            | Op::Ceil
+            | Op::Floor
+            | Op::Ftrunc
+            | Op::Fround
+            | Op::Fminimum
+            | Op::Fmaximum
+            | Op::FminNum
+            | Op::FmaxNum
+            | Op::Fpext
+            | Op::Fptrunc
+            | Op::SitoFp
+            | Op::UitoFp
+            | Op::FptoSi
+            | Op::FptoUi
+            | Op::Bitcast
+            | Op::Freeze
+            | Op::Load
+            | Op::PtrAdd
+            | Op::Zext
+            | Op::Sext
+            | Op::Trunc
+            | Op::Icmp
+            | Op::Fcmp
+            | Op::Select
+            | Op::Splat
+            | Op::Shuffle
+            | Op::Insert
+            | Op::Extract
+    )
+}
+
+/// Returns the preferred same-bank operand `src < inst` that `inst` should coalesce into:
+/// - Destructive 2-address NEON accumulators (`Fma`/`Fmuladd` operand `c`, `Fadd`/`Fsub` fused with
+///   `Fmul`, `Add`/`Sub` fused with `Mul` or `VecUadalp`, reduction/IV chains)
+/// - In-place lane insertion (`Insert` base vector)
+/// - Same-bank zero-copy `Bitcast` / `Freeze`
+/// - Dying operand of 128-bit vector `Select` (`bsl`/`bit`/`bif` in 1 instruction)
+fn preferred_inplace_operand(
+    view: &View<'_>,
+    skip_alloc: &[bool],
+    last_use: &[usize],
+    inst: usize,
+) -> Option<usize> {
+    let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
+    let bank = reg_bank(view, ty);
+    if bank == 0 {
+        return None;
+    }
+    let valid_src = |v: u32| -> Option<usize> {
+        let vi = idx(v);
+        if vi >= inst || skip_alloc.get(vi).copied().unwrap_or(false) {
+            return None;
+        }
+        let sty = view.tys.get(vi).copied().map_or(Ty::NONE, Ty);
+        if reg_bank(view, sty) == bank { Some(vi) } else { None }
+    };
+    let op_of = |i: usize| -> Option<Op> { (i < inst).then(|| view.op(i)) };
+    match view.op(inst) {
+        Op::Fma | Op::Fmuladd => {
+            let at = idx(*view.data.get(inst)?);
+            valid_src(*view.extra.get(at + 2)?)
+        }
+        Op::Fadd => {
+            let at = idx(*view.data.get(inst)?);
+            let a = *view.extra.get(at)?;
+            let b = *view.extra.get(at + 1)?;
+            let (ai, bi) = (idx(a), idx(b));
+            let (oa, ob) = (op_of(ai), op_of(bi));
+            if oa == Some(Op::Fmul) && ob != Some(Op::Fmul) {
+                valid_src(b)
+            } else if ob == Some(Op::Fmul) && oa != Some(Op::Fmul) {
+                valid_src(a)
+            } else if oa == Some(Op::Param) && ob != Some(Op::Param) {
+                valid_src(a)
+            } else if ob == Some(Op::Param) && oa != Some(Op::Param) {
+                valid_src(b)
+            } else if matches!(oa, Some(Op::Fadd | Op::Fma | Op::Fmuladd))
+                && !matches!(ob, Some(Op::Fadd | Op::Fma | Op::Fmuladd))
+            {
+                valid_src(a)
+            } else if matches!(ob, Some(Op::Fadd | Op::Fma | Op::Fmuladd))
+                && !matches!(oa, Some(Op::Fadd | Op::Fma | Op::Fmuladd))
+            {
+                valid_src(b)
+            } else {
+                None
+            }
+        }
+        Op::Fsub => {
+            let at = idx(*view.data.get(inst)?);
+            let a = *view.extra.get(at)?;
+            let b = *view.extra.get(at + 1)?;
+            if op_of(idx(b)) == Some(Op::Fmul) && op_of(idx(a)) != Some(Op::Fmul) {
+                valid_src(a)
+            } else {
+                None
+            }
+        }
+        Op::Add => {
+            let at = idx(*view.data.get(inst)?);
+            let a = *view.extra.get(at)?;
+            let b = *view.extra.get(at + 1)?;
+            let (ai, bi) = (idx(a), idx(b));
+            let (oa, ob) = (op_of(ai), op_of(bi));
+            // Fused `VecUadalp`: `add(add(acc, and(...)), lshr(...))` where the inner `add` is skipped.
+            if skip_alloc.get(ai).copied().unwrap_or(false) && oa == Some(Op::Add) {
+                if let Some(&iat_raw) = view.data.get(ai) {
+                    let iat = idx(iat_raw);
+                    if let (Some(&ia), Some(&ib)) = (view.extra.get(iat), view.extra.get(iat + 1)) {
+                        if op_of(idx(ib)) == Some(Op::And) {
+                            if let Some(acc) = valid_src(ia) {
+                                return Some(acc);
+                            }
+                        } else if op_of(idx(ia)) == Some(Op::And) {
+                            if let Some(acc) = valid_src(ib) {
+                                return Some(acc);
+                            }
+                        }
+                    }
+                }
+            }
+            if oa == Some(Op::Mul) && ob != Some(Op::Mul) {
+                valid_src(b)
+            } else if ob == Some(Op::Mul) && oa != Some(Op::Mul) {
+                valid_src(a)
+            } else if oa == Some(Op::Param) && ob != Some(Op::Param) {
+                valid_src(a)
+            } else if ob == Some(Op::Param) && oa != Some(Op::Param) {
+                valid_src(b)
+            } else if oa == Some(Op::Add) && ob != Some(Op::Add) {
+                valid_src(a)
+            } else if ob == Some(Op::Add) && oa != Some(Op::Add) {
+                valid_src(b)
+            } else {
+                None
+            }
+        }
+        Op::Sub => {
+            let at = idx(*view.data.get(inst)?);
+            let a = *view.extra.get(at)?;
+            let b = *view.extra.get(at + 1)?;
+            if op_of(idx(b)) == Some(Op::Mul) && op_of(idx(a)) != Some(Op::Mul) {
+                valid_src(a)
+            } else {
+                None
+            }
+        }
+        Op::Insert => {
+            let at = idx(*view.data.get(inst)?);
+            valid_src(*view.extra.get(at)?)
+        }
+        Op::Bitcast | Op::Freeze => valid_src(*view.data.get(inst)?),
+        Op::Select if bank == 1 => {
+            let at = idx(*view.data.get(inst)?);
+            let cv = *view.extra.get(at)?;
+            let tv = *view.extra.get(at + 1)?;
+            let fv = *view.extra.get(at + 2)?;
+            for cand in [cv, fv, tv] {
+                if let Some(ci) = valid_src(cand) {
+                    if last_use.get(ci).copied() == Some(inst) {
+                        return Some(ci);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// For a 128-bit vector destructive 2-address accumulate op (`Fma`/`Fmuladd`, `Fadd`/`Fsub` fused
+/// with `Fmul`, or `Add`/`Sub` fused with `Mul`), returns the physical registers of the two
+/// non-accumulator operands `(a, b)` so the allocator avoids clobbering them (which would trigger
+/// a 3-instruction `V31` bounce in `isel.rs`) whenever the accumulator itself cannot be reused.
+fn vec_fma_avoid_regs(
+    view: &View<'_>,
+    skip_alloc: &[bool],
+    loc_try: &[AllocLoc],
+    inst: usize,
+) -> (u8, u8) {
+    let vec_reg_of = |v: u32| -> u8 {
+        match loc_try.get(idx(v)).copied() {
+            Some(AllocLoc::Vec(r)) => r,
+            _ => NO_REG,
+        }
+    };
+    let mul_operands = |m: usize| -> (u8, u8) {
+        let Some(&mat_raw) = view.data.get(m) else {
+            return (NO_REG, NO_REG);
+        };
+        let mat = idx(mat_raw);
+        let ra = view.extra.get(mat).copied().map_or(NO_REG, vec_reg_of);
+        let rb = view.extra.get(mat + 1).copied().map_or(NO_REG, vec_reg_of);
+        (ra, rb)
+    };
+    let Some(&at_raw) = view.data.get(inst) else {
+        return (NO_REG, NO_REG);
+    };
+    let at = idx(at_raw);
+    match view.op(inst) {
+        Op::Fma | Op::Fmuladd => {
+            let ra = view.extra.get(at).copied().map_or(NO_REG, vec_reg_of);
+            let rb = view.extra.get(at + 1).copied().map_or(NO_REG, vec_reg_of);
+            (ra, rb)
+        }
+        Op::Fadd => {
+            let (Some(&a), Some(&b)) = (view.extra.get(at), view.extra.get(at + 1)) else {
+                return (NO_REG, NO_REG);
+            };
+            let (ai, bi) = (idx(a), idx(b));
+            if ai < inst && skip_alloc.get(ai).copied().unwrap_or(false) && view.op(ai) == Op::Fmul {
+                mul_operands(ai)
+            } else if bi < inst && skip_alloc.get(bi).copied().unwrap_or(false) && view.op(bi) == Op::Fmul {
+                mul_operands(bi)
+            } else {
+                (NO_REG, NO_REG)
+            }
+        }
+        Op::Fsub => {
+            let Some(&b) = view.extra.get(at + 1) else {
+                return (NO_REG, NO_REG);
+            };
+            let bi = idx(b);
+            if bi < inst && skip_alloc.get(bi).copied().unwrap_or(false) && view.op(bi) == Op::Fmul {
+                mul_operands(bi)
+            } else {
+                (NO_REG, NO_REG)
+            }
+        }
+        Op::Add => {
+            let (Some(&a), Some(&b)) = (view.extra.get(at), view.extra.get(at + 1)) else {
+                return (NO_REG, NO_REG);
+            };
+            let (ai, bi) = (idx(a), idx(b));
+            if ai < inst && skip_alloc.get(ai).copied().unwrap_or(false) && view.op(ai) == Op::Mul {
+                mul_operands(ai)
+            } else if bi < inst && skip_alloc.get(bi).copied().unwrap_or(false) && view.op(bi) == Op::Mul {
+                mul_operands(bi)
+            } else {
+                (NO_REG, NO_REG)
+            }
+        }
+        Op::Sub => {
+            let Some(&b) = view.extra.get(at + 1) else {
+                return (NO_REG, NO_REG);
+            };
+            let bi = idx(b);
+            if bi < inst && skip_alloc.get(bi).copied().unwrap_or(false) && view.op(bi) == Op::Mul {
+                mul_operands(bi)
+            } else {
+                (NO_REG, NO_REG)
+            }
+        }
+        _ => (NO_REG, NO_REG),
+    }
+}
+
 /// Active register-allocated interval entry for loop-weighted eviction.
 /// Allocates physical AArch64 GPRs, 2-word GPR pairs, scalar FP/NEON registers, rematerialized
 /// constants (`AllocLoc::RematConst`), and (only on true pressure overflow) reusable 8-byte stack
@@ -657,16 +991,16 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
         }
     }
 
-    // 2. Coalescing hints: entry params (incl. `sret` in X8), return value (`X0`/`V0`), and
-    //    block-param (`phi`) partner links (so loop step defs coalesce directly into header params!).
-    let mut loc_of: Vec<AllocLoc, A> = Vec::with_capacity_in(len, alloc);
+    // 2. Coalescing hints: entry params (incl. `sret` in X8), return value (`X0`/`V0`),
+    //    block-param (`phi`) back-edges, and in-place 2-address accumulators (`fmla`/`mla`/`ins`).
     let mut hint: Vec<u8, A> = Vec::with_capacity_in(len, alloc);
-    // `phi_partner[arg]` = header block-param index `p` that `arg` feeds on a loop back-edge.
+    // `phi_partner[arg]` = partner index `p < arg` whose physical register `arg` should inherit.
     let mut phi_partner: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
+    let mut phi_prio: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     for _ in 0..len {
-        loc_of.push(AllocLoc::None);
         hint.push(NO_REG);
         phi_partner.push(u32::MAX);
+        phi_prio.push(0);
     }
 
     let func_sig = view.sig(SigId(view.head.sig));
@@ -734,12 +1068,11 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
                                 let rv0 = idx(rv0_raw);
                                 if let Some(slot) = hint.get_mut(rv0) {
                                     if *slot == NO_REG {
-                                        let is_fp = view
-                                            .tys
-                                            .get(rv0)
-                                            .copied()
-                                            .is_some_and(|t| is_fp_ty(Ty(t)).is_some());
-                                        *slot = if is_fp { 0 } else { reg_u8(X0) };
+                                        let is_fp_or_vec = view.tys.get(rv0).copied().is_some_and(|t| {
+                                            let ty = Ty(t);
+                                            is_fp_ty(ty).is_some() || is_vec128_ty(ty).is_some()
+                                        });
+                                        *slot = if is_fp_or_vec { 0 } else { reg_u8(X0) };
                                     }
                                 }
                             }
@@ -749,12 +1082,11 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
                                 let rv1 = idx(rv1_raw);
                                 if let Some(slot) = hint.get_mut(rv1) {
                                     if *slot == NO_REG {
-                                        let is_fp = view
-                                            .tys
-                                            .get(rv1)
-                                            .copied()
-                                            .is_some_and(|t| is_fp_ty(Ty(t)).is_some());
-                                        *slot = if is_fp { 1 } else { reg_u8(X1) };
+                                        let is_fp_or_vec = view.tys.get(rv1).copied().is_some_and(|t| {
+                                            let ty = Ty(t);
+                                            is_fp_ty(ty).is_some() || is_vec128_ty(ty).is_some()
+                                        });
+                                        *slot = if is_fp_or_vec { 1 } else { reg_u8(X1) };
                                     }
                                 }
                             }
@@ -763,23 +1095,78 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
                 }
             }
             _ => {
+                let b_depth = block_depth.get(b).copied().unwrap_or(0);
                 for_each_edge(view, term, |target_block, args_start, args_len| {
                     let target_params = view.params(Block(target_block));
                     let n = args_len.min(target_params.len());
+                    let is_back = idx(target_block) <= b;
+                    let edge_prio = if is_back { b_depth.saturating_add(1) } else { 0 };
                     if let Some(args) = view.extra.get(args_start..args_start + n) {
                         for (k, &arg_raw) in args.iter().enumerate() {
                             let p = target_params.start + k;
                             let arg = idx(arg_raw);
                             if arg < len && arg > p {
-                                if let Some(slot) = phi_partner.get_mut(arg) {
-                                    if *slot == u32::MAX {
-                                        *slot = u32_of(p);
+                                let p_ty = view.tys.get(p).copied().map_or(Ty::NONE, Ty);
+                                let arg_ty = view.tys.get(arg).copied().map_or(Ty::NONE, Ty);
+                                let bank = reg_bank(view, arg_ty);
+                                if bank != 0 && bank == reg_bank(view, p_ty) {
+                                    let cur = phi_partner.get(arg).copied().unwrap_or(u32::MAX);
+                                    let cur_prio = phi_prio.get(arg).copied().unwrap_or(0);
+                                    if cur == u32::MAX || edge_prio > cur_prio {
+                                        if let Some(slot) = phi_partner.get_mut(arg) {
+                                            *slot = u32_of(p);
+                                        }
+                                        if let Some(pslot) = phi_prio.get_mut(arg) {
+                                            *pslot = edge_prio;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 });
+            }
+        }
+    }
+
+    // Propagate loop back-edge `phi_partner` backward through in-place accumulator chains
+    // (e.g. `p -> fma_0 -> fma_1 -> back_edge(p)` so every step stays in `p`'s register).
+    for inst in (0..len).rev() {
+        if skip_alloc.get(inst).copied().unwrap_or(false) {
+            continue;
+        }
+        let partner = phi_partner.get(inst).copied().unwrap_or(u32::MAX);
+        if partner == u32::MAX {
+            continue;
+        }
+        let pi = idx(partner);
+        if let Some(acc) = preferred_inplace_operand(view, skip_alloc, &last_use, inst) {
+            if acc > pi
+                && last_use.get(acc).copied() == Some(inst)
+                && phi_partner.get(acc).copied() == Some(u32::MAX)
+            {
+                if let Some(slot) = phi_partner.get_mut(acc) {
+                    *slot = partner;
+                }
+            }
+        }
+    }
+
+    // Coalesce destructive 2-address accumulators & zero-copy ops (`Fma`/`Fmuladd`, `Fadd`+`Fmul`,
+    // `Add`+`Mul`/`VecUadalp`, `Insert`, same-bank `Bitcast`/`Freeze`, dying vector `Select`)
+    // directly into their dying source operand (eliminating `mov` in `saxpy`/`matmul`/`dot`!).
+    for inst in 0..len {
+        if skip_alloc.get(inst).copied().unwrap_or(false) {
+            continue;
+        }
+        if phi_partner.get(inst).copied() != Some(u32::MAX) || !is_rbw(view, inst) {
+            continue;
+        }
+        if let Some(src) = preferred_inplace_operand(view, skip_alloc, &last_use, inst) {
+            if last_use.get(src).copied() == Some(inst) {
+                if let Some(slot) = phi_partner.get_mut(inst) {
+                    *slot = u32_of(src);
+                }
             }
         }
     }
@@ -820,13 +1207,24 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
         remat_val.push(cv);
     }
 
-    for (arg, &p) in phi_partner.iter().enumerate() {
+    // Propagate priority weights and return-value hints backward along `phi_partner` chains so
+    // chain heads color first in Phase 2 greedy order and avoid unnecessary return copies.
+    for arg in (0..len).rev() {
+        let p = phi_partner.get(arg).copied().unwrap_or(u32::MAX);
         if p != u32::MAX {
             let pi = idx(p);
             let aw = use_weight.get(arg).copied().unwrap_or(0).saturating_add(1);
             if let Some(pw) = use_weight.get_mut(pi) {
                 if aw > *pw {
                     *pw = aw;
+                }
+            }
+            let ah = hint.get(arg).copied().unwrap_or(NO_REG);
+            if ah != NO_REG {
+                if let Some(ph) = hint.get_mut(pi) {
+                    if *ph == NO_REG {
+                        *ph = ah;
+                    }
                 }
             }
         }
@@ -856,67 +1254,10 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
         prog_order.push(Candidate { inst, end, weight, is_remat });
     }
 
-    // True iff `inst` reads all of its inputs before writing its destination register,
-    // allowing safe zero-copy coalescing with a dying operand whose `last_use == inst`
-    // (e.g. `add.2d v16, v16, v21` or `add x9, x9, #1` on loop back-edges!).
-    let is_rbw = |inst: usize| -> bool {
-        let op = view.op(inst);
-        let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
-        if is_gpr_pair_ty(view, ty) {
-            return false;
-        }
-        if op == Op::Icmp {
-            let is_i128_cmp = view
-                .data
-                .get(inst)
-                .and_then(|&d| view.extra.get(idx(d) + 1))
-                .and_then(|&lhs| view.tys.get(idx(lhs)))
-                .copied()
-                .map(Ty)
-                == Some(Ty::I128);
-            if is_i128_cmp {
-                return false;
-            }
-        }
-        matches!(
-            op,
-            Op::Add
-                | Op::Sub
-                | Op::Mul
-                | Op::Umulhi
-                | Op::Smulhi
-                | Op::Neg
-                | Op::And
-                | Op::Or
-                | Op::Xor
-                | Op::Not
-                | Op::Shl
-                | Op::Lshr
-                | Op::Ashr
-                | Op::Fadd
-                | Op::Fsub
-                | Op::Fmul
-                | Op::Fdiv
-                | Op::Fneg
-                | Op::Fabs
-                | Op::Load
-                | Op::PtrAdd
-                | Op::Zext
-                | Op::Sext
-                | Op::Trunc
-                | Op::Icmp
-                | Op::Fcmp
-                | Op::Select
-                | Op::Splat
-        )
-    };
-
     let run_coloring = |order: &[Candidate]| -> Result<(Vec<AllocLoc, A>, [bool; 32], [bool; 32], u32, u32), RegAllocError> {
         let mut loc_try: Vec<AllocLoc, A> = Vec::with_capacity_in(len, alloc);
-        let mut hint_try: Vec<u8, A> = Vec::with_capacity_in(len, alloc);
-        for &h in &hint {
+        for _ in 0..len {
             loc_try.push(AllocLoc::None);
-            hint_try.push(h);
         }
         let mut gpr_busy: Vec<Vec<(usize, usize, bool), A>, A> = Vec::with_capacity_in(32, alloc);
         let mut fp_busy: Vec<Vec<(usize, usize, bool), A>, A> = Vec::with_capacity_in(32, alloc);
@@ -969,21 +1310,20 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
             let inst = cand.inst;
             let end = cand.end;
             let ty = view.tys.get(inst).copied().map_or(Ty::NONE, Ty);
+            let bank = reg_bank(view, ty);
 
-            let cur_hint = hint_try.get(inst).copied().unwrap_or(NO_REG);
             let partner = phi_partner.get(inst).copied().unwrap_or(u32::MAX);
-            if cur_hint == NO_REG && partner != u32::MAX {
-                if let Some(&ploc) = loc_try.get(idx(partner)) {
-                    match ploc {
-                        AllocLoc::Gpr(r) | AllocLoc::Fp(r) | AllocLoc::Vec(r) => {
-                            if let Some(hslot) = hint_try.get_mut(inst) {
-                                *hslot = r;
-                            }
-                        }
-                        _ => {}
-                    }
+            let primary_hint = if partner != u32::MAX {
+                match (bank, loc_try.get(idx(partner)).copied()) {
+                    (1, Some(AllocLoc::Vec(r)))
+                    | (2, Some(AllocLoc::Fp(r)))
+                    | (3, Some(AllocLoc::Gpr(r))) => r,
+                    _ => NO_REG,
                 }
-            }
+            } else {
+                NO_REG
+            };
+            let secondary_hint = hint.get(inst).copied().unwrap_or(NO_REG);
 
             let mut crossed_clobbers = CallClobbers::EMPTY;
             let mut crosses_call = false;
@@ -1006,7 +1346,7 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
                 !crosses_call || (8..=15).contains(&r) || !crossed_clobbers.clobbers_fp(reg_u8(r))
             };
 
-            let cur_rbw = is_rbw(inst);
+            let cur_rbw = is_rbw(view, inst);
             if is_gpr_pair_ty(view, ty) {
                 let pool_pick = |busy: &[Vec<(usize, usize, bool), A>], skip: Option<Reg>| -> Option<Reg> {
                     CALLER_SAVED_GPR
@@ -1050,22 +1390,39 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
                 }
             } else if is_vec128_ty(ty).is_some() || is_vec_mask_ty(ty).is_some() {
                 let vec_safe = |r: Reg| -> bool { !crosses_call || !crossed_clobbers.clobbers_fp(reg_u8(r)) };
-                let h = hint_try.get(inst).copied().unwrap_or(NO_REG);
-                let chosen = if h != NO_REG
-                    && CALLER_SAVED_FP.contains(&u32::from(h))
-                    && vec_safe(u32::from(h))
-                    && fp_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
-                {
-                    Some(u32::from(h))
-                } else {
-                    CALLER_SAVED_FP
-                        .iter()
-                        .copied()
-                        .find(|&r| {
+                let try_vec = |h: u8| -> Option<Reg> {
+                    if h != NO_REG
+                        && CALLER_SAVED_FP.contains(&u32::from(h))
+                        && vec_safe(u32::from(h))
+                        && fp_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                    {
+                        Some(u32::from(h))
+                    } else {
+                        None
+                    }
+                };
+                let chosen = try_vec(primary_hint)
+                    .or_else(|| try_vec(secondary_hint))
+                    .or_else(|| {
+                        let (avoid0, avoid1) = vec_fma_avoid_regs(view, skip_alloc, &loc_try, inst);
+                        if avoid0 != NO_REG || avoid1 != NO_REG {
+                            CALLER_SAVED_FP.iter().copied().find(|&r| {
+                                let ru = reg_u8(r);
+                                ru != avoid0
+                                    && ru != avoid1
+                                    && vec_safe(r)
+                                    && fp_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        CALLER_SAVED_FP.iter().copied().find(|&r| {
                             vec_safe(r)
                                 && fp_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
                         })
-                };
+                    });
                 if let Some(reg) = chosen {
                     if let Some(slot) = loc_try.get_mut(inst) {
                         *slot = AllocLoc::Vec(reg_u8(reg));
@@ -1080,22 +1437,28 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
                     }
                 }
             } else if is_fp_ty(ty).is_some() {
-                let h = hint_try.get(inst).copied().unwrap_or(NO_REG);
-                let chosen = if h != NO_REG
-                    && fp_safe(u32::from(h))
-                    && fp_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
-                {
-                    Some(u32::from(h))
-                } else {
-                    CALLER_SAVED_FP
-                        .iter()
-                        .copied()
-                        .chain(CALLEE_SAVED_FP.iter().copied())
-                        .find(|&r| {
-                            fp_safe(r)
-                                && fp_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
-                        })
+                let try_fp = |h: u8| -> Option<Reg> {
+                    if h != NO_REG
+                        && fp_safe(u32::from(h))
+                        && fp_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                    {
+                        Some(u32::from(h))
+                    } else {
+                        None
+                    }
                 };
+                let chosen = try_fp(primary_hint)
+                    .or_else(|| try_fp(secondary_hint))
+                    .or_else(|| {
+                        CALLER_SAVED_FP
+                            .iter()
+                            .copied()
+                            .chain(CALLEE_SAVED_FP.iter().copied())
+                            .find(|&r| {
+                                fp_safe(r)
+                                    && fp_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                            })
+                    });
                 if let Some(reg) = chosen {
                     if let Some(slot) = loc_try.get_mut(inst) {
                         *slot = AllocLoc::Fp(reg_u8(reg));
@@ -1115,22 +1478,28 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
                     }
                 }
             } else {
-                let h = hint_try.get(inst).copied().unwrap_or(NO_REG);
-                let chosen = if h != NO_REG
-                    && gpr_safe(u32::from(h))
-                    && gpr_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
-                {
-                    Some(u32::from(h))
-                } else {
-                    CALLER_SAVED_GPR
-                        .iter()
-                        .copied()
-                        .chain(CALLEE_SAVED_GPR.iter().copied())
-                        .find(|&r| {
-                            gpr_safe(r)
-                                && gpr_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
-                        })
+                let try_gpr = |h: u8| -> Option<Reg> {
+                    if h != NO_REG
+                        && gpr_safe(u32::from(h))
+                        && gpr_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                    {
+                        Some(u32::from(h))
+                    } else {
+                        None
+                    }
                 };
+                let chosen = try_gpr(primary_hint)
+                    .or_else(|| try_gpr(secondary_hint))
+                    .or_else(|| {
+                        CALLER_SAVED_GPR
+                            .iter()
+                            .copied()
+                            .chain(CALLEE_SAVED_GPR.iter().copied())
+                            .find(|&r| {
+                                gpr_safe(r)
+                                    && gpr_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
+                            })
+                    });
                 if let Some(reg) = chosen {
                     if let Some(slot) = loc_try.get_mut(inst) {
                         *slot = AllocLoc::Gpr(reg_u8(reg));
@@ -1186,7 +1555,7 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
             }
         }
     }
-    loc_of = final_loc;
+    let loc_of = final_loc;
 
     // Build exact ARM64 unwind pair masks (`blaze_code::unwind::Frame`).
     let mut x_pairs = 0u8;

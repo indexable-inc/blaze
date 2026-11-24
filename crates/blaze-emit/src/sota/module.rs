@@ -22,7 +22,7 @@
 use blaze_code::record::Symbol;
 use blaze_lir::{
     Op, Verified, View,
-    body::{Bodies, BodyId},
+    body::{Bodies, BodyId, DatumId, Target},
     func::{Func, RefId, RefKind},
     inline::{InlinePolicy, SiteWeights},
     lto::{ModuleBody, OptimizedBody, lto_optimize_module, tarjan_sccs},
@@ -54,18 +54,18 @@ pub struct SotaModuleOpts {
 }
 
 impl SotaModuleOpts {
-    /// Release AOT export defaults (`DirectBl`, full cross-function inlining, superopt, NEON).
+    /// Release AOT export defaults (`DirectBl`, aggressive cross-function inlining, superopt, NEON).
     pub const fn for_export(machine: Machine) -> Self {
         Self {
             machine,
             call_mode: CallMode::DirectBl,
             policy: InlinePolicy {
-                cost_threshold: 45,
-                max_callee_insts: 128,
+                cost_threshold: 75,
+                max_callee_insts: 192,
                 hot_multiplier: 4,
                 hot_weight_threshold: 10,
-                max_depth: 6,
-                max_growth: 512,
+                max_depth: 8,
+                max_growth: 1024,
                 allow_external_refs: true,
                 allow_loops: true,
             },
@@ -152,6 +152,28 @@ impl Bodies for InputBodies<'_, '_, '_> {
         let callee_idx = self.find_idx(callee_sym.0)?;
         Some((BodyId(callee_sym.0), self.fns.get(callee_idx)?.func.view()))
     }
+
+    fn target(&self, from: BodyId, reference: RefId) -> Option<Target> {
+        let caller_idx = self.find_idx(from.0)?;
+        let caller = self.fns.get(caller_idx)?;
+        let row = caller.func.view().refs.get(reference.index())?;
+        let kind = RefKind::from_word(row.kind)?;
+        let outside = match kind {
+            RefKind::Func => Outside::Func(row.place),
+            RefKind::Static => Outside::Static(row.place),
+            RefKind::Vtable => Outside::Vtable(row.place),
+            RefKind::Tls => Outside::Tls(row.place),
+            RefKind::Data => return None,
+        };
+        let Named::Symbol(sym) = caller.names.name(outside)? else {
+            return None;
+        };
+        match kind {
+            RefKind::Func => Some(Target::Func(BodyId(sym.0))),
+            RefKind::Static | RefKind::Vtable | RefKind::Tls => Some(Target::Datum(DatumId(sym.0))),
+            RefKind::Data => None,
+        }
+    }
 }
 
 /// [`Names`] adapter that transparently resolves both original `Outside` references on body
@@ -213,6 +235,28 @@ impl Names for ImportedNames<'_, '_, '_> {
     fn routines(&self) -> RoutinePlaces {
         self.fns.get(self.body_idx).map_or(RoutinePlaces::NONE, |f| f.names.routines())
     }
+}
+
+/// Resolves a direct `Op::Call` or `Op::Invoke` instruction to its intra-module callee index.
+fn direct_callee_idx(
+    view: View<'_>,
+    inst: usize,
+    names: &ImportedNames<'_, '_, '_>,
+    input_bodies: &InputBodies<'_, '_, '_>,
+) -> Option<usize> {
+    if !matches!(view.op(inst), Op::Call | Op::Invoke) {
+        return None;
+    }
+    let &data_at = view.data.get(inst)?;
+    let &ref_word = usize::try_from(data_at).ok().and_then(|at| view.extra.get(at))?;
+    let r = view.refs.get(RefId(ref_word).index())?;
+    if RefKind::from_word(r.kind) != Some(RefKind::Func) {
+        return None;
+    }
+    let Named::Symbol(sym) = names.name(Outside::Func(r.place))? else {
+        return None;
+    };
+    input_bodies.find_idx(sym.0)
 }
 
 /// Compiles a whole module of verified LIR functions through `ThinLTO` cross-function inlining,
@@ -282,19 +326,7 @@ pub fn compile_module_a64<'a, 'f, F: Tier>(
         let view = opt_func.view();
         let edge_start = adj.len();
         for inst in 0..view.len() {
-            if !matches!(view.op(inst), Op::Call | Op::Invoke) {
-                continue;
-            }
-            let Some(&data_at) = view.data.get(inst) else {
-                continue;
-            };
-            let Some(&ref_word) = usize::try_from(data_at).ok().and_then(|at| view.extra.get(at)) else {
-                continue;
-            };
-            let r = view.reference(RefId(ref_word));
-            if RefKind::from_word(r.kind) == Some(RefKind::Func)
-                && let Some(Named::Symbol(sym)) = names.name(Outside::Func(r.place))
-                && let Some(callee_idx) = input_bodies.find_idx(sym.0)
+            if let Some(callee_idx) = direct_callee_idx(view, inst, &names, &input_bodies)
                 && let Ok(callee_u32) = u32::try_from(callee_idx)
             {
                 adj.push(callee_u32);
@@ -362,22 +394,19 @@ pub fn compile_module_a64<'a, 'f, F: Tier>(
                 what: "post-LTO optimized LIR failed verify",
             })?;
 
-            // Count & feed IPRA call-clobber masks for direct calls to already-compiled callees.
+            // Count & feed IPRA call-clobber masks for direct `Op::Call` / `Op::Invoke` sites
+            // targeting already-compiled callees with strictly narrower clobber sets than C ABI.
             let view = verified.view();
+            let lookup_clobbers = |inst: usize| -> Option<CallClobbers> {
+                let cidx = direct_callee_idx(view, inst, &names, &input_bodies)?;
+                known_clobbers.get(cidx).and_then(|c| *c)
+            };
             let mut narrowed_here = 0usize;
             for inst in 0..view.len() {
-                if view.op(inst) == Op::Call
-                    && let Some(&data_at) = view.data.get(inst)
-                    && let Some(&ref_word) = usize::try_from(data_at).ok().and_then(|at| view.extra.get(at))
+                if let Some(clob) = lookup_clobbers(inst)
+                    && (CallClobbers::C_ABI_ARM64.clobbered.0 & !clob.clobbered.0) != 0
                 {
-                    let r = view.reference(RefId(ref_word));
-                    if RefKind::from_word(r.kind) == Some(RefKind::Func)
-                        && let Some(Named::Symbol(sym)) = names.name(Outside::Func(r.place))
-                        && let Some(cidx) = input_bodies.find_idx(sym.0)
-                        && known_clobbers.get(cidx).and_then(|c| *c).is_some()
-                    {
-                        narrowed_here += 1;
-                    }
+                    narrowed_here += 1;
                 }
             }
 
@@ -387,26 +416,11 @@ pub fn compile_module_a64<'a, 'f, F: Tier>(
                 opts.call_mode,
                 opts.machine.features,
                 is_macos,
-                |inst| {
-                    if view.op(inst) == Op::Call
-                        && let Some(&data_at) = view.data.get(inst)
-                        && let Some(&ref_word) = usize::try_from(data_at).ok().and_then(|at| view.extra.get(at))
-                    {
-                        let r = view.reference(RefId(ref_word));
-                        if RefKind::from_word(r.kind) == Some(RefKind::Func)
-                            && let Some(Named::Symbol(sym)) = names.name(Outside::Func(r.place))
-                            && let Some(cidx) = input_bodies.find_idx(sym.0)
-                            && let Some(clob) = known_clobbers.get(cidx).and_then(|c| *c)
-                        {
-                            return clob;
-                        }
-                    }
-                    CallClobbers::C_ABI_ARM64
-                },
+                |inst| lookup_clobbers(inst).unwrap_or(CallClobbers::C_ABI_ARM64),
                 alloc,
             );
 
-            let (emitted, clobbers, used_fallback) = match emit_res {
+            let (emitted, mut clobbers, used_fallback) = match emit_res {
                 Ok((em, clob)) => {
                     ipra_calls_narrowed += narrowed_here;
                     (em, clob, false)
@@ -420,6 +434,23 @@ pub fn compile_module_a64<'a, 'f, F: Tier>(
                     }
                 }
             };
+
+            // Soundly union callee clobbers for tail-called `Op::Call`/`Op::CallIndirect` sites
+            // (which `regalloc` excludes from `call_positions` since they do not clobber locals).
+            if !used_fallback {
+                for inst in 0..view.len() {
+                    match view.op(inst) {
+                        Op::Call | Op::Invoke => {
+                            let callee_clob = lookup_clobbers(inst).unwrap_or(CallClobbers::C_ABI_ARM64);
+                            clobbers.clobbered = clobbers.clobbered.union(callee_clob.clobbered);
+                        }
+                        Op::CallIndirect | Op::InvokeIndirect => {
+                            clobbers.clobbered = clobbers.clobbered.union(CallClobbers::C_ABI_ARM64.clobbered);
+                        }
+                        _ => {}
+                    }
+                }
+            }
 
             if let Some(slot) = known_clobbers.get_mut(idx) {
                 *slot = Some(clobbers);
@@ -482,5 +513,311 @@ impl<F: Tier> Sota<F> {
             max_rounds: self.max_rounds,
         };
         compile_module_a64(fns, weights, opts, self.fallback.as_ref(), alloc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_code::record::Symbol;
+    use blaze_lir::{
+        Flags, IntCond, Op, Ty,
+        builder::{Builder, Full, MemAttrs, Param, Variadic},
+        func::{BlockKind, Conv, FnAttrs, Inline, RefKind},
+        inline::NoWeights,
+        verify,
+    };
+    use blaze_own::Alloc;
+    use blaze_tier::{Arch, CallClobbers, Machine, Named, Names, Os, Outside, RelocKind, RoutinePlaces};
+
+    use super::{ModuleFn, SotaModuleOpts, compile_module_a64};
+
+    const MAC_ARM64: Machine = Machine { arch: Arch::Arm64, os: Os::MacOs, features: Machine::LSE };
+
+    fn test_alloc() -> Alloc<'static> {
+        blaze_own::testing::heap().alloc()
+    }
+
+    struct TableNames<'a>(&'a [(u32, Symbol)]);
+
+    impl Names for TableNames<'_> {
+        fn name(&self, of: Outside) -> Option<Named<'_>> {
+            let Outside::Func(place) = of else {
+                return None;
+            };
+            self.0.iter().find(|&&(p, _)| p == place).map(|&(_, sym)| Named::Symbol(sym))
+        }
+
+        fn routines(&self) -> RoutinePlaces {
+            RoutinePlaces::NONE
+        }
+    }
+
+    fn decode_words(code: &[u8]) -> impl Iterator<Item = u32> + '_ {
+        code.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    }
+
+    #[test]
+    fn for_export_inlines_three_layer_pipeline_and_vectorizes_loop() {
+        let alloc = test_alloc();
+        let opts = SotaModuleOpts::for_export(MAC_ARM64);
+        assert_eq!(opts.policy.cost_threshold, 75);
+        assert_eq!(opts.policy.max_callee_insts, 192);
+        assert_eq!(opts.policy.hot_multiplier, 4);
+        assert_eq!(opts.policy.max_depth, 8);
+        assert_eq!(opts.policy.max_growth, 1024);
+
+        let sym_transform = Symbol::of_name("sota_mod_test::helper_transform");
+        let sym_combine = Symbol::of_name("sota_mod_test::helper_combine");
+        let sym_main = Symbol::of_name("sota_mod_test::main_loop");
+
+        // 1. helper_transform(x: i32) -> i32 { (x * 5) ^ 7 }
+        let mut bt = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let tx_sig = bt.sig(Conv::C, Variadic::No, &[Param::of(Ty::I32)], &[Param::of(Ty::I32)]);
+        bt.set_signature(tx_sig);
+        let t_entry = bt.create_block(BlockKind::Normal);
+        bt.begin(t_entry);
+        let tx_x = bt.param(Ty::I32);
+        let five = bt.iconst(Ty::I32, 5);
+        let prod = bt.binary(Op::Mul, Flags::NONE, tx_x, five);
+        let seven = bt.iconst(Ty::I32, 7);
+        let tx_res = bt.binary(Op::Xor, Flags::NONE, prod, seven);
+        bt.ret(&[tx_res]);
+        let func_transform = bt.finish_checked().expect("helper_transform LIR builds");
+
+        // 2. helper_combine(acc: i32, x: i32) -> i32 { acc + helper_transform(x) }
+        let mut bc = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let comb_sig = bc.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I32), Param::of(Ty::I32)],
+            &[Param::of(Ty::I32)],
+        );
+        let comb_tx_sig = bc.sig(Conv::C, Variadic::No, &[Param::of(Ty::I32)], &[Param::of(Ty::I32)]);
+        bc.set_signature(comb_sig);
+        let tx_ref = bc.reference(RefKind::Func, 0);
+        let c_entry = bc.create_block(BlockKind::Normal);
+        bc.begin(c_entry);
+        let c_acc = bc.param(Ty::I32);
+        let c_x = bc.param(Ty::I32);
+        let c_t = bc.call(Flags::NONE, tx_ref, comb_tx_sig, &[c_x]);
+        let c_sum = bc.binary(Op::Add, Flags::NONE, c_acc, c_t);
+        bc.ret(&[c_sum]);
+        let func_combine = bc.finish_checked().expect("helper_combine LIR builds");
+
+        // 3. main_loop(ptr: *const i32, n: i64) -> i32 { sum helper_combine(acc, ptr[i]) }
+        let mut bm = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let main_sig = bm.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64)],
+            &[Param::of(Ty::I32)],
+        );
+        let main_comb_sig = bm.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I32), Param::of(Ty::I32)],
+            &[Param::of(Ty::I32)],
+        );
+        bm.set_signature(main_sig);
+        let comb_ref = bm.reference(RefKind::Func, 0);
+        let m_entry = bm.create_block(BlockKind::Normal);
+        let m_header = bm.create_block(BlockKind::Normal);
+        let m_body = bm.create_block(BlockKind::Normal);
+        let m_exit = bm.create_block(BlockKind::Normal);
+
+        bm.begin(m_entry);
+        let ptr = bm.param(Ty::PTR);
+        let n = bm.param(Ty::I64);
+        let zero64 = bm.iconst(Ty::I64, 0);
+        let zero32 = bm.iconst(Ty::I32, 0);
+        bm.jump((m_header, &[zero64, zero32]));
+
+        bm.begin(m_header);
+        let i = bm.param(Ty::I64);
+        let acc = bm.param(Ty::I32);
+        let cond = bm.icmp(IntCond::Ult, i, n);
+        bm.br(Flags::NONE, cond, (m_body, &[]), (m_exit, &[acc]));
+
+        bm.begin(m_body);
+        let shift2 = bm.iconst(Ty::I64, 2);
+        let byte_off = bm.binary(Op::Shl, Flags::NONE, i, shift2);
+        let addr = bm.ptr_add(Flags::NONE, ptr, byte_off);
+        let elem = bm.load(Ty::I32, Flags::NONE, addr, 0, MemAttrs::aligned(2));
+        let next_acc = bm.call(Flags::NONE, comb_ref, main_comb_sig, &[acc, elem]);
+        let one = bm.iconst(Ty::I64, 1);
+        let next_i = bm.binary(Op::Add, Flags::NONE, i, one);
+        bm.jump((m_header, &[next_i, next_acc]));
+
+        bm.begin(m_exit);
+        let exit_acc = bm.param(Ty::I32);
+        bm.ret(&[exit_acc]);
+        let func_main = bm.finish_checked().expect("main_loop LIR builds");
+
+        let no_names = TableNames(&[]);
+        let combine_names = TableNames(&[(0, sym_transform)]);
+        let main_names = TableNames(&[(0, sym_combine)]);
+
+        // Supply functions in top-down order to verify bottom-up SCC ordering too.
+        let fns = [
+            ModuleFn {
+                symbol: sym_main,
+                func: verify(func_main.view()).expect("main_loop verifies"),
+                names: &main_names,
+            },
+            ModuleFn {
+                symbol: sym_combine,
+                func: verify(func_combine.view()).expect("helper_combine verifies"),
+                names: &combine_names,
+            },
+            ModuleFn {
+                symbol: sym_transform,
+                func: verify(func_transform.view()).expect("helper_transform verifies"),
+                names: &no_names,
+            },
+        ];
+
+        let out = compile_module_a64(&fns, &NoWeights, opts, Option::<&crate::Reference>::None, alloc)
+            .expect("whole-module SOTA export compilation succeeds");
+        assert_eq!(out.functions.len(), 3);
+        assert!(out.total_inlined_bodies >= 2, "expected both helper layers to inline");
+
+        let main_out = &out.functions[0];
+        assert!(!main_out.used_fallback);
+        assert!(main_out.inlined_bodies >= 1, "main_loop should inline helper_combine");
+        assert!(
+            main_out.emitted.relocs.is_empty(),
+            "3-function pipeline should inline away all calls, left {:?}",
+            main_out.emitted.relocs.len()
+        );
+        assert!(
+            !decode_words(&main_out.emitted.code).any(|w| (w & 0xfc00_0000) == 0x9400_0000),
+            "inlined main_loop must contain zero direct `bl` calls"
+        );
+        // Post-inlining SOTA mid-end must auto-vectorize the `i32` reduction into NEON `<4 x i32>`.
+        let has_neon_4s = decode_words(&main_out.emitted.code).any(|w| {
+            let masked = w & 0xffe0_fc00;
+            masked == 0x4ea0_8400 || masked == 0x4ea0_9c00 || masked == 0x4ea0_9400
+        });
+        assert!(has_neon_4s, "expected post-inline main_loop to vectorize into NEON `.4s` instructions");
+    }
+
+    #[test]
+    fn ipra_noinline_leaf_in_loop_avoids_spills_and_callee_saves() {
+        let alloc = test_alloc();
+        let sym_leaf = Symbol::of_name("sota_mod_test::noinline_leaf");
+        let sym_caller = Symbol::of_name("sota_mod_test::ipra_caller_loop");
+
+        // 1. #[inline(never)] fn noinline_leaf(x: i64) -> i64 { (x ^ 0x5555) * 3 + 1 }
+        let mut bl = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let leaf_sig = bl.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        bl.set_signature(leaf_sig);
+        bl.set_attrs(FnAttrs::default().with_inline(Inline::Never));
+        let l_entry = bl.create_block(BlockKind::Normal);
+        bl.begin(l_entry);
+        let lx = bl.param(Ty::I64);
+        let mask = bl.iconst(Ty::I64, 0x5555);
+        let xored = bl.binary(Op::Xor, Flags::NONE, lx, mask);
+        let three = bl.iconst(Ty::I64, 3);
+        let prod = bl.binary(Op::Mul, Flags::NONE, xored, three);
+        let one = bl.iconst(Ty::I64, 1);
+        let l_res = bl.binary(Op::Add, Flags::NONE, prod, one);
+        bl.ret(&[l_res]);
+        let func_leaf = bl.finish_checked().expect("noinline_leaf LIR builds");
+
+        // 2. Caller loop keeping 4 live loop values (`i`, `n`, `step`, `salt`) across `bl noinline_leaf`.
+        let mut bc = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let caller_sig = bc.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+            ],
+            &[Param::of(Ty::I64)],
+        );
+        let call_leaf_sig = bc.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        bc.set_signature(caller_sig);
+        let leaf_ref = bc.reference(RefKind::Func, 0);
+        let c_entry = bc.create_block(BlockKind::Normal);
+        let c_header = bc.create_block(BlockKind::Normal);
+        let c_body = bc.create_block(BlockKind::Normal);
+        let c_exit = bc.create_block(BlockKind::Normal);
+
+        bc.begin(c_entry);
+        let n = bc.param(Ty::I64);
+        let seed = bc.param(Ty::I64);
+        let step = bc.param(Ty::I64);
+        let salt = bc.param(Ty::I64);
+        let zero = bc.iconst(Ty::I64, 0);
+        bc.jump((c_header, &[zero, seed]));
+
+        bc.begin(c_header);
+        let i = bc.param(Ty::I64);
+        let acc = bc.param(Ty::I64);
+        let cond = bc.icmp(IntCond::Ult, i, n);
+        bc.br(Flags::NONE, cond, (c_body, &[]), (c_exit, &[]));
+
+        bc.begin(c_body);
+        let mixed = bc.call(Flags::NONE, leaf_ref, call_leaf_sig, &[acc]);
+        let added = bc.binary(Op::Add, Flags::NONE, mixed, step);
+        let next_acc = bc.binary(Op::Xor, Flags::NONE, added, salt);
+        let step_one = bc.iconst(Ty::I64, 1);
+        let next_i = bc.binary(Op::Add, Flags::NONE, i, step_one);
+        bc.jump((c_header, &[next_i, next_acc]));
+
+        bc.begin(c_exit);
+        bc.ret(&[acc]);
+        let func_caller = bc.finish_checked().expect("ipra_caller_loop LIR builds");
+
+        let no_names = TableNames(&[]);
+        let caller_names = TableNames(&[(0, sym_leaf)]);
+
+        // Supply caller before leaf to verify reverse-topological IPRA emission order.
+        let fns = [
+            ModuleFn {
+                symbol: sym_caller,
+                func: verify(func_caller.view()).expect("ipra_caller_loop verifies"),
+                names: &caller_names,
+            },
+            ModuleFn {
+                symbol: sym_leaf,
+                func: verify(func_leaf.view()).expect("noinline_leaf verifies"),
+                names: &no_names,
+            },
+        ];
+
+        let opts = SotaModuleOpts::for_export(MAC_ARM64);
+        let out = compile_module_a64(&fns, &NoWeights, opts, Option::<&crate::Reference>::None, alloc)
+            .expect("whole-module IPRA compilation succeeds");
+        assert_eq!(out.functions.len(), 2);
+        assert!(out.ipra_calls_narrowed >= 1, "expected IPRA to narrow direct call to noinline_leaf");
+
+        let caller_out = &out.functions[0];
+        let leaf_out = &out.functions[1];
+        assert!(!caller_out.used_fallback && !leaf_out.used_fallback);
+        assert_eq!(caller_out.inlined_bodies, 0, "Inline::Never callee must not be inlined");
+        assert!(leaf_out.emitted.unwind_frame.is_none(), "noinline_leaf should be frameless");
+        assert!(
+            (CallClobbers::C_ABI_ARM64.clobbered.0 & !leaf_out.clobbers.clobbered.0) != 0,
+            "noinline_leaf must expose a narrowed IPRA clobber mask"
+        );
+        assert!(
+            caller_out.emitted.relocs.iter().any(|r| r.kind == RelocKind::Branch26),
+            "DirectBl mode must emit a direct `bl` (`RelocKind::Branch26`) relocation"
+        );
+
+        let frame = caller_out.emitted.unwind_frame.expect("caller with `bl` saves fp/lr");
+        assert_eq!(frame.x_pairs, 0, "IPRA caller must save zero callee-saved GPR pairs");
+        assert_eq!(frame.d_pairs, 0, "IPRA caller must save zero callee-saved FP pairs");
+        assert!(
+            !decode_words(&caller_out.emitted.code).any(|w| (w & 0xff80_03ff) == 0xd100_03ff),
+            "IPRA caller must allocate zero stack spill frame (`sub sp, sp, #imm`)"
+        );
+        assert!(
+            !decode_words(&caller_out.emitted.code).any(|w| (w & 0x3b80_03e0) == 0x3900_03e0),
+            "IPRA caller must emit zero stack spill loads/stores (`ldr`/`str [sp, #imm]`)"
+        );
     }
 }
