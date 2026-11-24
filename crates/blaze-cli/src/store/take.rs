@@ -52,6 +52,7 @@ use blaze_remote::PublicKey;
 use blaze_remote::published::set::{SetCheck, SetName, SetNameError};
 use blaze_remote::read::form::{HEAD_DOMAIN, HEAD_LEN, HEAD_SIGNED, PREFIX_MOST, decode_prefix};
 use blaze_remote::read::{Head, HeadCheck, Namespace, Object, Origin, Refused, SignatureWhy, Unfetched};
+use blaze_remote::wire_segment::{WireSegmentError, decode_wire_segment};
 use blaze_toolchain::ToolchainId;
 use bstd::clock::Clock;
 use bstd::cx::Cx;
@@ -166,6 +167,8 @@ impl TakePlant {
 /// Why a segment was refused.
 #[derive(Debug)]
 pub enum SegmentWhy {
+    /// `BZS1` wire decoding refused it before segment verification.
+    Wire(WireSegmentError),
     /// blaze-cas's check of a whole segment refused it (its digest, its form).
     Check(StoreError),
     /// A segment, but not the one its row names (another digest, count, index or namespace).
@@ -208,6 +211,7 @@ impl fmt::Display for TakeError {
             TakeError::Set(error) => write!(f, "this blaze's set name: {error}")?,
             TakeError::Read(why) => write!(f, "{why}")?,
             TakeError::Moved => f.write_str("prefix: its head is not the head read a moment before: the set was published again during the take")?,
+            TakeError::Segment { object, why: SegmentWhy::Wire(error) } => write!(f, "{object}: {error}")?,
             TakeError::Segment { object, why: SegmentWhy::Check(error) } => write!(f, "{object}: {error}")?,
             TakeError::Segment { object, why: SegmentWhy::NotItsRow } => write!(f, "{object}: a segment, but not the one the manifest's row names (its digest, count, index or namespace)")?,
             TakeError::Segment { object, why: SegmentWhy::Entry { what, at } } => write!(f, "{object}: the index entry at byte {at}: {what}")?,
@@ -342,16 +346,23 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
         return Err(TakeError::TooLarge { what: "the set's segments' bytes", len: bytes_named, most: BYTES_TAKEN_MOST });
     }
     drop(bytes);
-    // 3. Each segment whole, checked once, its records put; committed segment by segment.
+    // 3. Each segment whole in one GET (`segz-<digest>`, BZS1 wire encoding), decoded back to
+    //    BLPS, checked ONCE against the row's digest, its records put; committed segment by segment.
     let mut kept: std::vec::Vec<CasKey, StoreAlloc> = std::vec::Vec::with_capacity_in(records_named as usize, alloc);
-    let mut segment: std::vec::Vec<u8, StoreAlloc> = std::vec::Vec::new_in(alloc);
+    let mut wire: blaze_own::Vec<u8, StoreAlloc> = blaze_own::Vec::new_in(alloc);
+    let mut segment: blaze_own::Vec<u8, StoreAlloc> = blaze_own::Vec::new_in(alloc);
     for row in prefixed.rows.iter() {
-        let object = Object::Segment(row.segment);
+        let object = Object::SegmentWire(row.segment);
         if row.len > SEGMENT_TAKEN_MOST {
             return Err(TakeError::TooLarge { what: "a segment's length", len: row.len, most: SEGMENT_TAKEN_MOST });
         }
-        let len = row.len as usize;
-        read_exact(origin, object, len, &mut segment, clock)?;
+        if row.wire_len > SEGMENT_TAKEN_MOST {
+            return Err(TakeError::TooLarge { what: "a wire segment's length", len: row.wire_len, most: SEGMENT_TAKEN_MOST });
+        }
+        let wire_len = usize::try_from(row.wire_len).map_err(|_| TakeError::TooLarge { what: "a wire segment's length", len: row.wire_len, most: SEGMENT_TAKEN_MOST })?;
+        read_exact(origin, object, wire_len, &mut wire, clock)?;
+        decode_wire_segment(wire.as_slice(), row.len, &mut segment, alloc).map_err(|why| TakeError::Segment { object, why: SegmentWhy::Wire(why) })?;
+        let len = segment.len();
         let verifying = now_ns(clock);
         #[cfg(test)]
         let unverified = plant.unverified;
@@ -363,7 +374,7 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
                 .flatten()
                 .ok_or(TakeError::Segment { object, why: SegmentWhy::NotItsRow })?
         } else {
-            check_segment(&segment).map_err(|why| TakeError::Segment { object, why: SegmentWhy::Check(why) })?
+            check_segment(segment.as_slice()).map_err(|why| TakeError::Segment { object, why: SegmentWhy::Check(why) })?
         };
         taken.verify_ns += now_ns(clock).saturating_sub(verifying);
         if described.digest != row.segment || described.count != row.count || described.index_at != row.index_at || described.namespace != Namespace::PUBLIC {
@@ -476,15 +487,15 @@ fn read_to_end<O: Origin + ?Sized>(origin: &mut O, object: Object, most: u64, in
     }
 }
 
-/// `len` bytes of `object` from its start into `into`, in reads of at most [`READ_CHUNK`]; fewer
-/// is refused short.
-fn read_exact<O: Origin + ?Sized>(origin: &mut O, object: Object, len: usize, into: &mut std::vec::Vec<u8, StoreAlloc>, clock: &Clock) -> Result<(), TakeError> {
+/// `len` bytes of `object` from its start into `into`, asking the whole remaining range in one
+/// read (bounded by [`SEGMENT_TAKEN_MOST`], which matches `ORIGIN_WIRE.body_most`); loops only
+/// if the origin returns a short read, and refuses EOF before `len`.
+fn read_exact<O: Origin + ?Sized>(origin: &mut O, object: Object, len: usize, into: &mut blaze_own::Vec<u8, StoreAlloc>, clock: &Clock) -> Result<(), TakeError> {
     into.clear();
     into.resize(len, 0);
     let mut at = 0;
     while at < len {
-        let end = (at + READ_CHUNK).min(len);
-        let n = read_at(origin, object, at as u64, &mut into[at..end], clock)?;
+        let n = read_at(origin, object, at as u64, &mut into[at..len], clock)?;
         if n == 0 {
             return Err(TakeError::Read(Unfetched::Short { object, got: at as u64, wanted: len as u64 }));
         }

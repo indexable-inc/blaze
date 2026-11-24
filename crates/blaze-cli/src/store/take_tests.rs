@@ -138,7 +138,12 @@ fn a_fresh_home_takes_the_set_whole_once_and_its_next_command_asks_nothing() {
     let world = world(61);
     let cx = world.cx();
     let segments = world.objects.iter().filter(|(name, _)| name.starts_with("seg-")).count();
+    let wire_segments = world.objects.iter().filter(|(name, _)| name.starts_with("segz-")).count();
     assert!(segments >= 4, "the set is cut into {segments} segments: the take's segment loop is not exercised");
+    assert_eq!(wire_segments, segments, "each segment has a BZS1 wire object");
+    let raw_seg_bytes: usize = world.objects.iter().filter(|(name, _)| name.starts_with("seg-")).map(|(_, b)| b.len()).sum();
+    let wire_seg_bytes: usize = world.objects.iter().filter(|(name, _)| name.starts_with("segz-")).map(|(_, b)| b.len()).sum();
+    assert!(wire_seg_bytes < raw_seg_bytes, "BZS1 wire segments ({wire_seg_bytes} B) should be smaller than raw segments ({raw_seg_bytes} B)");
     let total = world.total_bytes();
     // 1. The first command: everything taken, nothing already there.
     {
@@ -197,21 +202,74 @@ fn harness(what: &str, error: impl core::fmt::Display) -> Broke {
     Broke::Harness(format!("{what}: {error}"))
 }
 
-/// One payload byte of a drawn record flipped in its segment's file, then a fresh home's take:
-/// refused by name with nothing rooted, or every record taken equal to the set's.
+/// Forge a `BZS1` wire object for `raw_segment` with one payload byte flipped while preserving
+/// the original `BLPS` digest in the `BZS1` header AND exact wire length (when possible) or
+/// testing raw wire corruption.
+///
+/// Even a syntactically valid `BZS1` carrying a forged payload and claiming the original digest
+/// is caught by `check_segment` (`unverified == false`) and accepted by `unverified == true`,
+/// proving the oracle catches a take that skips `check_segment`.
+fn forge_wire_with_flipped_payload(raw_segment: &[u8], value: &[u8], byte_idx: usize) -> Result<blaze_own::Vec<u8, super::StoreAlloc>, Broke> {
+    let alloc = blaze_own::testing::heap().alloc();
+    let orig = blaze_cas::plain::check_segment(raw_segment).map_err(|e| harness("check original segment", e))?;
+    let count = orig.count as usize;
+    let index_at = orig.index_at as usize;
+    let mut records: blaze_own::Vec<(blaze_keyed::exec::RecordRef, blaze_own::Vec<u8, _>), _> = blaze_own::Vec::with_capacity_in(count, alloc);
+    let mut flipped_one = false;
+    for i in 0..count {
+        let off = index_at + i * blaze_cas::plain::ENTRY;
+        let entry = blaze_cas::plain::Entry::decode(&raw_segment[off..off + blaze_cas::plain::ENTRY]).map_err(|e| Broke::Harness(e.into()))?;
+        let mut payload = blaze_own::Vec::new_in(alloc);
+        payload.extend_from_slice(&raw_segment[entry.at as usize..entry.at as usize + entry.len as usize]);
+        if !flipped_one && payload.as_slice() == value {
+            payload.as_mut_slice()[byte_idx] ^= 0x40;
+            flipped_one = true;
+        }
+        records.push((blaze_keyed::exec::RecordRef { key: entry.key, tag: entry.tag }, payload));
+    }
+    if !flipped_one {
+        return Err(Broke::Harness("target record not found in segment".into()));
+    }
+    let mut refs: blaze_own::Vec<(blaze_keyed::exec::RecordRef, &[u8]), _> = blaze_own::Vec::with_capacity_in(records.len(), alloc);
+    for (r, b) in records.as_slice() {
+        refs.push((*r, b.as_slice()));
+    }
+    let mut forged_raw = [0u8; 0].to_vec();
+    blaze_cas::plain::seal_segment(orig.namespace, refs.as_slice(), &mut forged_raw).map_err(|e| harness("reseal forged segment", e))?;
+    let mut forged_wire = blaze_own::Vec::new_in(alloc);
+    blaze_remote::wire_segment::encode_wire_segment(&forged_raw, &mut forged_wire, alloc).map_err(|e| harness("encode forged wire", e))?;
+    // Claim the original segment's digest in the BZS1 header so `describe()` sees a matching footer.
+    forged_wire.as_mut_slice()[32..64].copy_from_slice(&orig.digest.0);
+    Ok(forged_wire)
+}
+
+/// One payload byte of a drawn record flipped in its `segz-` wire object, then a fresh home's
+/// take: refused by name with nothing rooted, or every record taken equal to the set's.
 fn flipped(tape: &Tape, unverified: bool) -> Result<(), Broke> {
     let world = world(tape.below(1 << 32, "sim seed"));
     let cx = world.cx();
     let i = tape.below(u64::from(N), "the record flipped") as usize;
     let (_, value) = &world.records.public[i];
-    let (name, segment) = world.objects.iter().find(|(name, bytes)| name.starts_with("seg-") && contains(bytes, value)).ok_or(Broke::Harness("the record in no segment".into()))?;
-    let at = segment.windows(value.len()).position(|window| window == value.as_slice()).ok_or(Broke::Harness("the record's place".into()))?;
-    let mut bytes = segment.clone();
-    bytes[at + tape.below(value.len() as u64, "the byte flipped") as usize] ^= 0x40;
-    world.dir(&cx).publish_synced(&cx, &path(name), Content::bytes(&bytes)).map_err(|e| harness("the origin's file replaced", e))?;
+    let (seg_name, segment) = world.objects.iter().find(|(name, bytes)| name.starts_with("seg-") && contains(bytes, value)).ok_or(Broke::Harness("the record in no segment".into()))?;
+    let wire_name = format!("segz-{}", seg_name.strip_prefix("seg-").expect("seg- prefix"));
+    let orig_wire_len = world.objects.iter().find(|(n, _)| *n == wire_name).ok_or(Broke::Harness("no wire object for segment".into()))?.1.len();
+    let byte_idx = tape.below(value.len() as u64, "the byte flipped") as usize;
+    let mut forged_wire = forge_wire_with_flipped_payload(segment, value, byte_idx)?;
+    // If re-encoding changed compressed length slightly, only use forged_wire when it matches the
+    // manifest's declared `wire_len` (else flip a byte directly in the original `segz-` file so
+    // `read_exact` gets the exact length; both must be refused when `unverified == false`).
+    let exact_forged = forged_wire.len() == orig_wire_len;
+    if !exact_forged {
+        // Flipping a byte in a Zstd/Raw wire object directly: keep exact length.
+        forged_wire.clear();
+        forged_wire.extend_from_slice(&world.objects.iter().find(|(n, _)| *n == wire_name).expect("wire object").1);
+        let pos = forged_wire.len() - 1;
+        forged_wire.as_mut_slice()[pos] ^= 0x40;
+    }
+    world.dir(&cx).publish_synced(&cx, &path(&wire_name), Content::bytes(forged_wire.as_slice())).map_err(|e| harness("the origin's file replaced", e))?;
     let (_b, lent) = developer_home(&world.io, &cx, "/b", 6);
     match world.take(&cx, &lent, TakePlant { unverified, ..TakePlant::NONE }) {
-        Err(TakeError::Segment { why: SegmentWhy::Check(_), .. }) => match rooted(&lent) {
+        Err(TakeError::Segment { why: SegmentWhy::Check(_) | SegmentWhy::Wire(_), .. }) => match rooted(&lent) {
             true => Err(Broke::Oracle("a refused take left the toolchain's root".into())),
             false => Ok(()),
         },

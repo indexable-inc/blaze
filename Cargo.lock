@@ -1848,6 +1848,7 @@ dependencies = [
  "blaze-own",
  "blaze-sha256",
  "blaze-sim",
+ "blaze-zstd",
  "ring",
 ]
 
