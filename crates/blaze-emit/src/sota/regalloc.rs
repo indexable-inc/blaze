@@ -84,6 +84,100 @@ const CALLER_SAVED_FP: &[Reg] = &[
 /// Callee-saved allocatable FP registers (low 64 bits `d8..d15`, saved/restored in canonical pairs `d8:d9..d14:d15`).
 const CALLEE_SAVED_FP: &[Reg] = &[8, 9, 10, 11, 12, 13, 14, 15];
 
+/// Preferred caller-saved scratch allocation order for interprocedural register-avoidance coloring
+/// (from `sota::abi::CustomCallPlan::{scratch_gpr_order, scratch_fp_order}`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ScratchOrder {
+    pub gpr: [u8; 16],
+    pub fp: [u8; 24],
+}
+
+impl ScratchOrder {
+    /// Default caller-saved allocation order matching [`CALLER_SAVED_GPR`] and [`CALLER_SAVED_FP`]
+    /// (with permanently reserved FP scratch `V29..=V31` trailing and filtered out during coloring).
+    pub const DEFAULT: Self = Self {
+        gpr: [9, 10, 11, 12, 13, 14, 15, 8, 0, 1, 2, 3, 4, 5, 6, 7],
+        fp: [
+            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+            0, 1, 2, 3, 4, 5, 6, 7,
+            29, 30, 31,
+        ],
+    };
+}
+
+/// Builds a sanitized, duplicate-free caller-saved GPR preference order containing every register
+/// in [`CALLER_SAVED_GPR`] exactly once, honoring `scratch_order.gpr` first.
+fn build_caller_gpr_order(scratch_order: Option<&ScratchOrder>) -> [Reg; 16] {
+    let ord = scratch_order.unwrap_or(&ScratchOrder::DEFAULT);
+    let mut out = [0u32; 16];
+    let mut seen = [false; 32];
+    let mut len = 0usize;
+    for &r in &ord.gpr {
+        let reg = u32::from(r);
+        let ri = usize::from(r);
+        if CALLER_SAVED_GPR.contains(&reg)
+            && !seen.get(ri).copied().unwrap_or(true)
+            && let Some(slot) = out.get_mut(len)
+        {
+            *slot = reg;
+            if let Some(s) = seen.get_mut(ri) {
+                *s = true;
+            }
+            len += 1;
+        }
+    }
+    for &reg in CALLER_SAVED_GPR {
+        let ri = idx(reg);
+        if !seen.get(ri).copied().unwrap_or(true)
+            && let Some(slot) = out.get_mut(len)
+        {
+            *slot = reg;
+            if let Some(s) = seen.get_mut(ri) {
+                *s = true;
+            }
+            len += 1;
+        }
+    }
+    out
+}
+
+/// Builds a sanitized, duplicate-free caller-saved FP/NEON preference order containing every
+/// allocatable register in [`CALLER_SAVED_FP`] exactly once (excluding reserved `V29..=V31`),
+/// honoring `scratch_order.fp` first.
+fn build_caller_fp_order(scratch_order: Option<&ScratchOrder>) -> [Reg; 21] {
+    let ord = scratch_order.unwrap_or(&ScratchOrder::DEFAULT);
+    let mut out = [0u32; 21];
+    let mut seen = [false; 32];
+    let mut len = 0usize;
+    for &r in &ord.fp {
+        let reg = u32::from(r);
+        let ri = usize::from(r);
+        if CALLER_SAVED_FP.contains(&reg)
+            && !seen.get(ri).copied().unwrap_or(true)
+            && let Some(slot) = out.get_mut(len)
+        {
+            *slot = reg;
+            if let Some(s) = seen.get_mut(ri) {
+                *s = true;
+            }
+            len += 1;
+        }
+    }
+    for &reg in CALLER_SAVED_FP {
+        let ri = idx(reg);
+        if !seen.get(ri).copied().unwrap_or(true)
+            && let Some(slot) = out.get_mut(len)
+        {
+            *slot = reg;
+            if let Some(s) = seen.get_mut(ri) {
+                *s = true;
+            }
+            len += 1;
+        }
+    }
+    out
+}
+
 /// Physical location assigned to a single LIR SSA value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum AllocLoc {
@@ -839,6 +933,32 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
     call_clobbers: impl Fn(usize) -> CallClobbers,
     alloc: A,
 ) -> Result<Allocation<A>, RegAllocError> {
+    allocate_with_ipra_and_order(
+        view,
+        skip_alloc,
+        tail_calls,
+        max_spill_slots,
+        os,
+        call_clobbers,
+        None,
+        alloc,
+    )
+}
+
+/// IPRA-aware register allocation with optional interprocedural register-avoidance scratch order
+/// (`scratch_order`): callees allocate caller-untouched GPR/FP registers before caller-hot ones.
+pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
+    view: &View<'_>,
+    skip_alloc: &[bool],
+    tail_calls: &[bool],
+    max_spill_slots: u32,
+    os: crate::Os,
+    call_clobbers: impl Fn(usize) -> CallClobbers,
+    scratch_order: Option<&ScratchOrder>,
+    alloc: A,
+) -> Result<Allocation<A>, RegAllocError> {
+    let caller_gpr_order = build_caller_gpr_order(scratch_order);
+    let caller_fp_order = build_caller_fp_order(scratch_order);
     let len = view.len();
     let blocks = view.blocks();
     let mut last_use: Vec<usize, A> = Vec::with_capacity_in(len, alloc);
@@ -1352,7 +1472,7 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
             let cur_rbw = is_rbw(view, inst);
             if is_gpr_pair_ty(view, ty) {
                 let pool_pick = |busy: &[Vec<(usize, usize, bool), A>], skip: Option<Reg>| -> Option<Reg> {
-                    CALLER_SAVED_GPR
+                    caller_gpr_order
                         .iter()
                         .copied()
                         .chain(CALLEE_SAVED_GPR.iter().copied())
@@ -1409,7 +1529,7 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
                     .or_else(|| {
                         let (avoid0, avoid1) = vec_fma_avoid_regs(view, skip_alloc, &loc_try, inst);
                         if avoid0 != NO_REG || avoid1 != NO_REG {
-                            CALLER_SAVED_FP.iter().copied().find(|&r| {
+                            caller_fp_order.iter().copied().find(|&r| {
                                 let ru = reg_u8(r);
                                 ru != avoid0
                                     && ru != avoid1
@@ -1421,7 +1541,7 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
                         }
                     })
                     .or_else(|| {
-                        CALLER_SAVED_FP.iter().copied().find(|&r| {
+                        caller_fp_order.iter().copied().find(|&r| {
                             vec_safe(r)
                                 && fp_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, inst, end, cur_rbw))
                         })
@@ -1453,7 +1573,7 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
                 let chosen = try_fp(primary_hint)
                     .or_else(|| try_fp(secondary_hint))
                     .or_else(|| {
-                        CALLER_SAVED_FP
+                        caller_fp_order
                             .iter()
                             .copied()
                             .chain(CALLEE_SAVED_FP.iter().copied())
@@ -1494,7 +1614,7 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
                 let chosen = try_gpr(primary_hint)
                     .or_else(|| try_gpr(secondary_hint))
                     .or_else(|| {
-                        CALLER_SAVED_GPR
+                        caller_gpr_order
                             .iter()
                             .copied()
                             .chain(CALLEE_SAVED_GPR.iter().copied())
@@ -1629,4 +1749,106 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
         clobbers: CallClobbers { clobbered: clob },
         remat_count,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_lir::{
+        Flags, Op, Ty,
+        builder::{Builder, Full, Param, Variadic},
+        func::{BlockKind, Conv},
+    };
+    use blaze_own::Alloc;
+    use blaze_tier::CallClobbers;
+
+    use super::{
+        AllocLoc, CALLER_SAVED_FP, CALLER_SAVED_GPR, ScratchOrder, allocate_with_ipra_and_order,
+        build_caller_fp_order, build_caller_gpr_order,
+    };
+
+    fn test_alloc() -> Alloc<'static> {
+        blaze_own::testing::heap().alloc()
+    }
+
+    #[test]
+    fn scratch_order_filters_reserved_regs_and_reorders_allocation() {
+        let alloc = test_alloc();
+
+        // Default order matches CALLER_SAVED_GPR / CALLER_SAVED_FP verbatim.
+        assert_eq!(build_caller_gpr_order(None).as_slice(), CALLER_SAVED_GPR);
+        assert_eq!(build_caller_fp_order(None).as_slice(), CALLER_SAVED_FP);
+
+        // Reserved regs (x16, x17, x18, x19, v29, v30, v31) are filtered out even if listed first.
+        let dirty = ScratchOrder {
+            gpr: [16, 17, 18, 19, 13, 14, 15, 12, 11, 10, 9, 8, 0, 1, 2, 3],
+            fp: [
+                29, 30, 31, 8, 22, 23, 24, 25, 26, 27, 28, 16, 17, 18, 19, 20, 21, 0, 1, 2, 3, 4,
+                5, 6,
+            ],
+        };
+        let sanitized_gpr = build_caller_gpr_order(Some(&dirty));
+        let sanitized_fp = build_caller_fp_order(Some(&dirty));
+        assert_eq!(sanitized_gpr[0], 13);
+        assert!(sanitized_gpr.iter().all(|r| CALLER_SAVED_GPR.contains(r)));
+        assert_eq!(sanitized_fp[0], 22);
+        assert!(sanitized_fp.iter().all(|r| CALLER_SAVED_FP.contains(r)));
+
+        // Leaf fn(x, y) -> ((x * y) + x) ^ y: `t1 = x * y` has both `x` and `y` live past it,
+        // so `t1` picks the first caller-saved scratch GPR from `ScratchOrder`.
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(32, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let x = b.param(Ty::I64);
+        let y = b.param(Ty::I64);
+        let t1 = b.binary(Op::Mul, Flags::NONE, x, y);
+        let t2 = b.binary(Op::Add, Flags::NONE, t1, x);
+        let t3 = b.binary(Op::Xor, Flags::NONE, t2, y);
+        b.ret(&[t3]);
+        let func = b.finish_checked().expect("leaf LIR builds");
+        let view = func.view();
+        let skip = [false; 16];
+        let tail = [false; 16];
+        let n = view.len();
+
+        let default_alloc = allocate_with_ipra_and_order(
+            &view,
+            &skip[..n],
+            &tail[..n],
+            32,
+            crate::Os::MacOs,
+            |_| CallClobbers::C_ABI_ARM64,
+            None,
+            alloc,
+        )
+        .expect("default regalloc succeeds");
+        assert_eq!(default_alloc.loc_of[t1.index()], AllocLoc::Gpr(9));
+
+        let avoid_x9 = ScratchOrder {
+            gpr: [13, 14, 15, 12, 11, 10, 9, 8, 0, 1, 2, 3, 4, 5, 6, 7],
+            fp: ScratchOrder::DEFAULT.fp,
+        };
+        let avoided_alloc = allocate_with_ipra_and_order(
+            &view,
+            &skip[..n],
+            &tail[..n],
+            32,
+            crate::Os::MacOs,
+            |_| CallClobbers::C_ABI_ARM64,
+            Some(&avoid_x9),
+            alloc,
+        )
+        .expect("register-avoidance regalloc succeeds");
+        assert_eq!(avoided_alloc.loc_of[t1.index()], AllocLoc::Gpr(13));
+        assert!(
+            !avoided_alloc.clobbers.clobbers_gpr(9),
+            "callee must avoid clobbering caller-hot X9 when demoted in ScratchOrder"
+        );
+    }
 }
