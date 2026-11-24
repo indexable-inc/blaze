@@ -678,7 +678,7 @@ fn command(
         Some("export") => engine_export::command(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
         Some("explain") => explain(cx, args.get(2), out),
         // The checkout's state, and with `--store` the home's store, removed (clean.rs).
-        Some("clean") => clean::run(cx, fs, env, args, out),
+        Some("clean") => clean::run(cx, fs, env, args, host, rng, out, heap),
         // Bounded store compaction, root-LRU budget eviction, and stale old-format cleanup (gc.rs).
         Some("gc") => gc::run(cx, args, fs, env, host, &clock, rng, out, err, heap),
         // Hidden: the checkout's journal helper, run by hand until a command starts one

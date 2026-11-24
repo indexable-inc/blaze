@@ -109,10 +109,18 @@ pub(crate) fn root_name<'f>(checkout: &str, frame: &'f Frame) -> blaze_own::Stri
     root_name_with("engine.", checkout.as_bytes(), frame)
 }
 
+/// Whether `name` is the checkout's own root (`checkout_root`) or one of its auxiliary / scoped
+/// roots (`<checkout_root>.*`), so `blaze clean` can discard this checkout's cached answers
+/// without touching any other checkout or shared store data.
+pub(crate) fn is_checkout_root(name: &str, checkout_root: &str) -> bool {
+    name == checkout_root
+        || (name.starts_with(checkout_root) && name.as_bytes().get(checkout_root.len()) == Some(&b'.'))
+}
+
 /// The root a check of `scope` hangs from: equal to [`root_name`] for whole-workspace checks, and
-/// a disjoint `"engine.s.<hex>"` root for scoped `blaze test` / `blaze run` / `blaze export`
+/// a disjoint `"<root_name>.s.<hex>"` root for scoped `blaze test` / `blaze run` / `blaze export`
 /// requests so scoped checks never overwrite the whole-workspace answer while still supporting
-/// certificate hits and incremental edits for repeated scoped runs.
+/// certificate hits, incremental edits, and per-checkout cleanup (`blaze clean`).
 pub(crate) fn scoped_root_name<'f>(checkout: &str, scope: crate::engine_check::CheckScope<'_>, frame: &'f Frame) -> blaze_own::String<&'f Frame> {
     match scope {
         crate::engine_check::CheckScope::Whole => root_name(checkout, frame),
@@ -142,7 +150,8 @@ pub(crate) fn scoped_root_name<'f>(checkout: &str, scope: crate::engine_check::C
             for root in bin_roots {
                 push_part(&mut key, root.as_bytes());
             }
-            root_name_with("engine.s.", key.as_slice(), frame)
+            let prefix = bstd::mem::format_in!(frame, "{}.s.", root_name(checkout, frame).as_str());
+            root_name_with(prefix.as_str(), key.as_slice(), frame)
         }
         crate::engine_check::CheckScope::Bin { package, root } => {
             let mut key = blaze_own::Vec::new_in(frame);
@@ -155,9 +164,77 @@ pub(crate) fn scoped_root_name<'f>(checkout: &str, scope: crate::engine_check::C
             push_part(&mut key, b"bin");
             push_part(&mut key, package.as_bytes());
             push_part(&mut key, root.as_bytes());
-            root_name_with("engine.s.", key.as_slice(), frame)
+            let prefix = bstd::mem::format_in!(frame, "{}.s.", root_name(checkout, frame).as_str());
+            root_name_with(prefix.as_str(), key.as_slice(), frame)
         }
     }
+}
+
+/// Unroots every stored answer root (whole-workspace, scoped, reach, journal, grains, members,
+/// scripts, view) belonging to `checkout` from `lent`, and removes any pointer owned by this
+/// checkout from [`BASES_ROOT`] / [`BASES_KEPT_ROOT`] so a subsequent check does not immediately
+/// reload the just-discarded answer as a workspace base. Returns the number of roots unrooted.
+pub(crate) fn unroot_checkout<D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    checkout: &str,
+    frame: &Frame,
+) -> Result<u32, CliError> {
+    let prefix = root_name(checkout, frame);
+    let mut removed_pointers: blaze_own::Vec<Key, &Frame> = blaze_own::Vec::new_in(frame);
+    if let Some(root_rec_key) = lent.root_named(prefix.as_str())
+        && let Some(held) = lent.get(&root_rec_key).map_err(crate::store::PlaceError::from)?
+        && held.bytes.len() == 32
+    {
+        removed_pointers.push(key_at(held.bytes, 0));
+    }
+    let roots = lent.roots();
+    let mut unrooted = 0u32;
+    for (name, _) in roots.iter() {
+        if is_checkout_root(name.as_str(), prefix.as_str()) {
+            lent.unroot(name.as_str());
+            unrooted = unrooted.saturating_add(1);
+        }
+    }
+    if unrooted == 0 {
+        return Ok(0);
+    }
+    if !removed_pointers.is_empty()
+        && let Some(bases_rec_key) = lent.root_named(BASES_ROOT)
+        && let Some(held_keys) = lent.get(&bases_rec_key).map_err(crate::store::PlaceError::from)?
+        && held_keys.bytes.len() == 32
+        && let Some(held_bases) = lent.get(&cas_key_at(held_keys.bytes, 0)).map_err(crate::store::PlaceError::from)?
+        && let Some(bases) = decode_bases(held_bases.bytes, frame)
+    {
+        let mut kept: blaze_own::Vec<Base, &Frame> = blaze_own::Vec::with_capacity_in(bases.len(), frame);
+        for base in bases.iter() {
+            if removed_pointers.scan_for(&base.pointer).is_none() {
+                kept.push(*base);
+            }
+        }
+        if kept.len() != bases.len() {
+            if kept.is_empty() {
+                lent.unroot(BASES_ROOT);
+                if lent.has_root(BASES_KEPT_ROOT) {
+                    lent.unroot(BASES_KEPT_ROOT);
+                }
+            } else {
+                let bytes = encode_bases(&kept, frame);
+                let record = blaze_cas::Key(ContentId::of(BASES_DOMAIN, &bytes));
+                lent.put_parts(
+                    &record,
+                    blaze_cas::plain::Namespace::LOCAL,
+                    blaze_keyed::kind::ReservedTag::Drive.tag(),
+                    &[bytes.as_slice()],
+                ).map_err(crate::store::PlaceError::from)?;
+                lent.root_for(BASES_ROOT, &[record], blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+                let mut pointers: blaze_own::Vec<blaze_cas::Key, &Frame> = blaze_own::Vec::with_capacity_in(kept.len(), frame);
+                pointers.extend(kept.iter().map(|it| blaze_cas::Key(it.pointer.0)));
+                lent.root_for(BASES_KEPT_ROOT, &pointers, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+            }
+        }
+    }
+    lent.commit().map_err(crate::store::PlaceError::from)?;
+    Ok(unrooted)
 }
 
 /// Whether a saved answer should update the home's shared workspace bases (`BASES_ROOT`): whole-

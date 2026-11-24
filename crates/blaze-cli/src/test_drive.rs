@@ -68,7 +68,7 @@ use bstd::fs::{Dir, Durable, FsError, FsKind, ReadWrite};
 use bstd::io::Missing;
 use bstd::mem::Frame;
 use bstd::path::{Path, PathError};
-use bstd::procs::{ChannelError, Exit, GRACE, Held, Message, OutPipe, ParentDeath, ParentSignals, Read as Piped, Relay, RelayAct, RunChild, RunError as ProcError, RunFault, RunSpec, SignalError, Spawner, Started, Streams, Waited};
+use bstd::procs::{ChannelError, Exit, GRACE, Held, Message, OutPipe, ParentDeath, ParentSignals, Read as Piped, Relay, RelayAct, RunChild, RunError as ProcError, RunFault, RunSpec, RunStep, SignalError, Spawner, Started, Streams, Waited};
 
 use crate::code_store::HomeCodeStore;
 use crate::run_names::{Found, TestRows, TestUnit};
@@ -538,6 +538,105 @@ pub(crate) mod refusal_tests {
         let capped = Front2Refusal::Capped { entry: "lib::main".into(), queued: 9, cap: 8, items: 9, forced: false, report: "".into() };
         assert_eq!(instance_site(&make(RunError::Front2(capped))), None, "control: the program's queue cap stops the suite");
         assert_eq!(instance_site(&make(RunError::TooManyInstances)), None, "control: the run's instance bound stops the suite");
+    }
+
+    #[test]
+    fn stop_child_reaps_already_exited_and_handles_macos_zombie_killpg_eperm() {
+        use bstd::procs::{Act, ProcId, Reaped, SimChild};
+
+        // 1. Already exited: reaped directly without calling kill() (which would fail with EPERM on macOS).
+        let acts_exited = [Act::Exit { after: Duration::ZERO, status: 0 }];
+        let mut exited = SimChild::new(&acts_exited, 1, ProcId(2650));
+        assert!(matches!(stop_child(&mut exited), Ok(Stopped::Exited { exit: Exit::Exited(0), .. })));
+        assert!(!exited.killed(), "already-exited child must be reaped without calling kill()");
+
+        // 2. Running and kill() succeeds.
+        let acts_running = [Act::Hang];
+        let mut running = SimChild::new(&acts_running, 2, ProcId(2651));
+        assert!(matches!(stop_child(&mut running), Ok(Stopped::Killed { exit: Exit::Signaled(9), .. })));
+        assert!(running.killed(), "still-running child must be killed");
+
+        // 3. Narrow TOCTOU race: wait saw Running, then child exited to zombie before kill(-pgid, SIGKILL) -> EPERM.
+        let eperm = ProcError {
+            proc: Some(ProcId(2650)),
+            step: RunStep::Kill,
+            fault: RunFault::Host { what: "killing its process group", os: 1 },
+        };
+        let race: Result<Reaped<()>, ProcError> = Err(eperm);
+        if cfg!(target_os = "macos") {
+            assert!(matches!(classify_kill(race), Ok(Stopped::ZombieRace)), "macOS zombie killpg EPERM race must not abort suite");
+        } else {
+            assert!(classify_kill(race).is_err(), "non-macOS EPERM must remain an error");
+        }
+
+        // 4. Control: non-EPERM host errors are never swallowed on any OS.
+        let einval = ProcError {
+            proc: Some(ProcId(2650)),
+            step: RunStep::Kill,
+            fault: RunFault::Host { what: "killing its process group", os: 22 },
+        };
+        let bad: Result<Reaped<()>, ProcError> = Err(einval);
+        assert!(classify_kill(bad).is_err(), "control: non-EPERM kill error must propagate");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stop_child_reaps_real_macos_zombie_own_group_without_eperm() {
+        use bstd::io::Io;
+        use bstd::mem::TASK_FRAME;
+        use bstd::test::BUDGET;
+
+        let io: Io = bstd::test::native("/tmp".as_ref()).expect("native world over /tmp");
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let spawner = io.need_host().expect("host").spawner().expect("spawner");
+
+        // 1. Spawn a real own-group child that exits immediately (becomes a zombie).
+        //    Raw `kill()` on this child returns EPERM on macOS XNU; `stop_child()` must reap cleanly.
+        let args_exit = ["-c", "exit 0"];
+        let spec_exit = RunSpec {
+            program: "/bin/sh",
+            arg0: None,
+            args: &args_exit,
+            env: &[],
+            dir: "/",
+            streams: Streams::PIPED,
+            own_group: true,
+            parent_death: ParentDeath::STRONGEST,
+        };
+        let Started { child, pipes } = spawner.start_served(&cx, &spec_exit).expect("start exiting child");
+        // Wait for the child's stdout pipe to close (EOF) so the child has definitely exited to a zombie.
+        let stdout = pipes.stdout.expect("stdout pipe");
+        let mut scratch = [0u8; 16];
+        let eof_deadline = Deadline::after(child.now(), Duration::from_secs(5));
+        loop {
+            match stdout.read(&mut scratch, eof_deadline).expect("read stdout") {
+                Piped::Closed => break,
+                Piped::Bytes(_) => {}
+                Piped::Deadline => panic!("exiting child did not close stdout within 5s"),
+            }
+        }
+        match stop_child(child) {
+            Ok(Stopped::Exited { exit: Exit::Exited(0), .. } | Stopped::ZombieRace | Stopped::Killed { .. }) => {}
+            other => panic!("expected zombie own-group child to reap cleanly without EPERM, got {:?}", other.map(|_| ())),
+        }
+
+        // 2. Control: a real live own-group child is killed cleanly with SIGKILL.
+        let args_sleep = ["30"];
+        let spec_sleep = RunSpec {
+            program: "/bin/sleep",
+            arg0: None,
+            args: &args_sleep,
+            env: &[],
+            dir: "/",
+            streams: Streams::PIPED,
+            own_group: true,
+            parent_death: ParentDeath::STRONGEST,
+        };
+        let Started { child, .. } = spawner.start_served(&cx, &spec_sleep).expect("start sleeping child");
+        match stop_child(child) {
+            Ok(Stopped::Killed { exit: Exit::Signaled(9), .. }) => {}
+            other => panic!("expected live own-group child to be killed with SIGKILL, got {:?}", other.map(|_| ())),
+        }
     }
 }
 
@@ -2393,6 +2492,49 @@ struct FirstCall {
     unkeyed: usize,
 }
 
+/// On macOS (XNU `killpg1`), signalling a process group (`kill(-pgid, sig)`) returns `EPERM`
+/// (`os error 1`) instead of `ESRCH` when the group's sole remaining member is an unreaped zombie
+/// leader (zero live processes remain in the group).
+fn is_macos_group_eperm(error: &ProcError, step: RunStep) -> bool {
+    cfg!(target_os = "macos")
+        && error.step == step
+        && matches!(error.fault, RunFault::Host { os: 1, .. })
+}
+
+/// Result of stopping a test child whose own process group may already have exited.
+enum Stopped<L> {
+    /// Already exited before `kill()` was needed (reaped with its actual exit status).
+    Exited { exit: Exit, left: L },
+    /// Killed by `SIGKILL` (its whole process group) and reaped.
+    Killed { exit: Exit, left: L },
+    /// Narrow macOS TOCTOU race: the child exited to a zombie (zero live group members) between
+    /// `wait(Deadline::PASSED)` and `kill(-pgid, SIGKILL)`, causing XNU to return `EPERM`;
+    /// `LinkedChild::drop` already reaped the zombie.
+    ZombieRace,
+}
+
+/// Classifies the outcome of `RunChild::kill()`, treating the narrow macOS zombie-pgrp `EPERM`
+/// race as [`Stopped::ZombieRace`] while propagating every other host error.
+fn classify_kill<L>(result: Result<bstd::procs::Reaped<L>, ProcError>) -> Result<Stopped<L>, ProcError> {
+    match result {
+        Ok(killed) => Ok(Stopped::Killed { exit: killed.exit, left: killed.left }),
+        Err(error) if is_macos_group_eperm(&error, RunStep::Kill) => Ok(Stopped::ZombieRace),
+        Err(error) => Err(error),
+    }
+}
+
+/// Stops and reaps a test child without tripping over macOS XNU's `kill(-pgid, SIGKILL) -> EPERM`
+/// on an already-exited zombie process-group leader. Reaps an already-exited child directly via
+/// `wait(Deadline::PASSED)`, kills its process group if still running, and treats the narrow
+/// macOS zombie TOCTOU `EPERM` as already reaped while still propagating every other host error.
+fn stop_child<C: RunChild>(run: C) -> Result<Stopped<C::Left>, ProcError> {
+    let running = match run.wait(Deadline::PASSED)? {
+        Waited::Ended(reaped) => return Ok(Stopped::Exited { exit: reaped.exit, left: reaped.left }),
+        Waited::Running(running) => running,
+    };
+    classify_kill(running.kill())
+}
+
 impl<'c> Launched<'c, '_, '_> {
     /// The make `lazy`'s waiting row asked for, handed to the relay as child `child`'s ask: its
     /// order, name and proof, and the maker its roots make ([`TestFront::maker`]).
@@ -2543,22 +2685,37 @@ impl<'c> Launched<'c, '_, '_> {
                     };
                     if let Some(error) = stop {
                         // Its process waits for code it will never receive.
-                        run.kill().map_err(child_error)?;
+                        stop_child(run).map_err(child_error)?;
                         return Err(error);
                     }
                     again = true;
                 }
             }
             if until.passed(now) {
-                let killed = run.kill().map_err(child_error)?;
-                break (How::TimedOut { after: budget }, killed.left);
+                match stop_child(run).map_err(child_error)? {
+                    Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
+                    Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
+                    Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
+                }
             }
             match relay.turn(now, signals.terminate(now)?) {
-                RelayAct::Forward => run.terminate().map_err(child_error)?,
+                RelayAct::Forward => {
+                    if let Err(error) = run.terminate() {
+                        if is_macos_group_eperm(&error, RunStep::Terminate) {
+                            match run.wait(Deadline::PASSED).map_err(child_error)? {
+                                Waited::Ended(reaped) => break (child_outcome(reaped.exit), Some(reaped.left)),
+                                Waited::Running(_) => return Err(child_error(error)),
+                            }
+                        }
+                        return Err(child_error(error));
+                    }
+                }
                 RelayAct::Kill => {
                     // A kill reaps: its end is always known.
-                    let killed = run.kill().map_err(child_error)?;
-                    break (child_outcome(killed.exit), killed.left);
+                    match stop_child(run).map_err(child_error)? {
+                        Stopped::Exited { exit, left } | Stopped::Killed { exit, left } => break (child_outcome(exit), Some(left)),
+                        Stopped::ZombieRace => break (How::Signal { number: 9 }, None),
+                    }
                 }
                 RelayAct::Nothing => {}
             }
@@ -2607,7 +2764,7 @@ impl<'c> Launched<'c, '_, '_> {
                                 signals.add_host_nanos(run.now().saturating_sub(serving));
                                 // This group is waiting for code it will never receive.
                                 // Kill and reap before returning its typed outcome to the plan.
-                                run.kill().map_err(child_error)?;
+                                stop_child(run).map_err(child_error)?;
                                 return Err(test_parent_error(&mut lazy, cause));
                             }
                         };
@@ -2617,7 +2774,7 @@ impl<'c> Launched<'c, '_, '_> {
                         match resolver.requested {
                             Some(TestAnswer::Unresolved(Symbol(symbol))) => {
                                 // Sending Failed would turn the unavailable instance into a launcher exit.
-                                run.kill().map_err(child_error)?;
+                                stop_child(run).map_err(child_error)?;
                                 return Err(OneError::CannotBuild(InstanceRefusal {
                                     instance: lazy.name_of(symbol), symbol, site: None, cause: RefusalCause::Unresolved,
                                 }));
@@ -2683,7 +2840,7 @@ impl<'c> Launched<'c, '_, '_> {
                                     None => Err(OneError::Parent(ParentError::NotReady { symbol })),
                                 };
                                 if let Err(error) = asked {
-                                    run.kill().map_err(child_error)?;
+                                    stop_child(run).map_err(child_error)?;
                                     return Err(error);
                                 }
                                 parked = Some(Parked { since: run.now(), symbol });
@@ -2704,18 +2861,22 @@ impl<'c> Launched<'c, '_, '_> {
             // Parked, the turn's wait is the sweep's interval (as a read's would be).
             let look = if open && parked.is_none() { Deadline::PASSED } else { poll };
             run = match run.wait(look).map_err(child_error)? {
-                Waited::Ended(reaped) => break (child_outcome(reaped.exit), reaped.left),
+                Waited::Ended(reaped) => break (child_outcome(reaped.exit), Some(reaped.left)),
                 Waited::Running(running) => running,
             };
         };
         // The reaped child's remaining output belongs to its own capture.
-        let drain_until = Deadline::after(over.now(), DRAIN_AFTER);
-        while pipes.iter().any(Option::is_some) && !drain_until.passed(over.now()) {
-            let poll = Deadline::after(over.now(), signals.wait.replace(Duration::ZERO)).min(drain_until);
-            drain_pipes(cx, &mut pipes, output, stderr, poll)?;
-            if pipes.iter().any(Option::is_some) {
-                next_turn().await;
+        if let Some(over_ref) = over.as_ref() {
+            let drain_until = Deadline::after(over_ref.now(), DRAIN_AFTER);
+            while pipes.iter().any(Option::is_some) && !drain_until.passed(over_ref.now()) {
+                let poll = Deadline::after(over_ref.now(), signals.wait.replace(Duration::ZERO)).min(drain_until);
+                drain_pipes(cx, &mut pipes, output, stderr, poll)?;
+                if pipes.iter().any(Option::is_some) {
+                    next_turn().await;
+                }
             }
+        } else {
+            drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)?;
         }
         if let How::Signal { number } = ended {
             let path = self.tests.row(row as usize).map_err(OneError::Record)?.ok_or(OneError::NoRow { row })?.path;
@@ -2774,29 +2935,31 @@ impl<'c> Launched<'c, '_, '_> {
             let mut fault = needs.fault();
             let mut queued = false;
             let wire_error = |why| OneError::Parent(ParentError::Wire(why));
-            let read_until = Deadline::after(over.now(), DRAIN_AFTER);
-            while torn.is_none() && !read_until.passed(over.now()) {
-                match over.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, Deadline::PASSED) {
-                    Ok(Message::Whole { len }) => {
-                        let (_, up) = blaze_launch::wire::run::Up::decode(&inbox[4..len]).map_err(wire_error)?;
-                        match up {
-                            blaze_launch::wire::run::Up::Need { need, .. } => {
-                                queued = true;
-                                err.line(cx, format_args!("pending need (received after exit): {need:?}")).map_err(diagnostic)?;
-                            }
-                            blaze_launch::wire::run::Up::Fault { fault: last } => {
-                                if fault.is_none() {
-                                    fault = Some(last);
+            if let Some(over) = over.as_mut() {
+                let read_until = Deadline::after(over.now(), DRAIN_AFTER);
+                while torn.is_none() && !read_until.passed(over.now()) {
+                    match over.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, Deadline::PASSED) {
+                        Ok(Message::Whole { len }) => {
+                            let (_, up) = blaze_launch::wire::run::Up::decode(&inbox[4..len]).map_err(wire_error)?;
+                            match up {
+                                blaze_launch::wire::run::Up::Need { need, .. } => {
+                                    queued = true;
+                                    err.line(cx, format_args!("pending need (received after exit): {need:?}")).map_err(diagnostic)?;
+                                }
+                                blaze_launch::wire::run::Up::Fault { fault: last } => {
+                                    if fault.is_none() {
+                                        fault = Some(last);
+                                    }
                                 }
                             }
+                            let left = inbox.len() - len;
+                            inbox.copy_within(len.., 0);
+                            inbox.truncate(left);
                         }
-                        let left = inbox.len() - len;
-                        inbox.copy_within(len.., 0);
-                        inbox.truncate(left);
+                        Ok(Message::Closed | Message::Deadline) => break,
+                        Err(error @ ProcError { fault: RunFault::Channel(ChannelError::Torn { .. }), .. }) => torn = Some(error),
+                        Err(error) => return Err(child_error(error)),
                     }
-                    Ok(Message::Closed | Message::Deadline) => break,
-                    Err(error @ ProcError { fault: RunFault::Channel(ChannelError::Torn { .. }), .. }) => torn = Some(error),
-                    Err(error) => return Err(child_error(error)),
                 }
             }
             if !queued && calls.len() == published && inbox.is_empty() {

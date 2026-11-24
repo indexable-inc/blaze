@@ -416,3 +416,134 @@ fn clean_all_refuses_a_linked_folder_and_removes_nothing() {
         assert!(there(&io, kept), "{kept} was removed although the clean was refused");
     }
 }
+
+/// `blaze clean <dir>` (without `--store`) unroots every cached answer root belonging to that
+/// checkout (whole-workspace, auxiliary `.answer`/`.reach`/`.journal`, and scoped `.s.*` roots)
+/// and prunes its pointer from `BASES_ROOT`, while leaving other checkouts' roots and the shared
+/// store intact. A second `blaze clean <dir>` reports `nothing to remove`.
+#[test]
+fn clean_unroots_checkouts_cached_answers_and_keeps_other_checkouts() {
+    use blaze_cas::plain::{Namespace, ROOT_LIFE_NS, Settings};
+    use blaze_drive::Key;
+    use blaze_ids::ContentId;
+    use blaze_keyed::kind::ReservedTag;
+
+    let io = world(&[
+        ("ws/Cargo.toml", "[package]\nname = \"ws\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        ("ws/src/lib.rs", "pub fn f() -> u8 { 1 }\n"),
+        ("other/Cargo.toml", "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        ("other/src/lib.rs", "pub fn g() -> u8 { 2 }\n"),
+        ("h/.blaze/v2/store/CACHEDIR.TAG", TAG),
+    ]);
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+    let fs = io.need_fs().expect("fs");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let heap = blaze_own::testing::heap();
+    let frame = cx.frame();
+
+    let ws_root = crate::engine_answer::root_name("ws", frame);
+    let ws_scoped = crate::engine_answer::scoped_root_name(
+        "ws",
+        crate::engine_check::CheckScope::Test { packages: &["ws"], bin: None, bin_roots: &[] },
+        frame,
+    );
+    let other_root = crate::engine_answer::root_name("other", frame);
+    assert!(crate::engine_answer::is_checkout_root(ws_scoped.as_str(), ws_root.as_str()), "scoped root shares checkout prefix");
+    assert!(!crate::engine_answer::is_checkout_root(other_root.as_str(), ws_root.as_str()), "other checkout has distinct prefix");
+
+    let ws_ptr = Key(ContentId::of("clean test ws ptr", b"ws"));
+    let other_ptr = Key(ContentId::of("clean test other ptr", b"other"));
+    let store_home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+    {
+        let facts = crate::store::Facts { boot: Some(1), nonce: 11 };
+        let lent = store_home.open_store(&Settings::default(), facts, heap.alloc()).expect("open store");
+        let put = |k: Key, bytes: &[u8]| {
+            lent.put_parts(&blaze_cas::Key(k.0), Namespace::LOCAL, ReservedTag::Drive.tag(), &[bytes]).expect("put");
+        };
+        put(ws_ptr, b"ws-pointer-payload");
+        put(other_ptr, b"other-pointer-payload");
+        let ws_cas = blaze_cas::Key(ws_ptr.0);
+        let other_cas = blaze_cas::Key(other_ptr.0);
+        lent.root_for(ws_root.as_str(), &[ws_cas], ROOT_LIFE_NS).expect("pin ws root");
+        let ws_answer = bstd::mem::format_in!(frame, "{}.answer", ws_root.as_str());
+        lent.root_for(ws_answer.as_str(), &[ws_cas], ROOT_LIFE_NS).expect("pin ws answer");
+        lent.root_for(ws_scoped.as_str(), &[ws_cas], ROOT_LIFE_NS).expect("pin ws scoped");
+        lent.root_for(other_root.as_str(), &[other_cas], ROOT_LIFE_NS).expect("pin other root");
+
+        let bases = [
+            crate::engine_answer::Base {
+                workspace: ContentId::of("clean test ws", b"ws"),
+                lock: ContentId([0; 32]),
+                layout: ContentId::of("clean test layout", b"ws"),
+                root: ContentId([0; 32]),
+                pointer: ws_ptr,
+                seq: 2,
+            },
+            crate::engine_answer::Base {
+                workspace: ContentId::of("clean test ws", b"other"),
+                lock: ContentId([0; 32]),
+                layout: ContentId::of("clean test layout", b"other"),
+                root: ContentId([0; 32]),
+                pointer: other_ptr,
+                seq: 1,
+            },
+        ];
+        let bases_bytes = crate::engine_answer::encode_bases(&bases, frame);
+        let bases_key = Key(ContentId::of("blaze-cli engine-check bases 2", bases_bytes.as_slice()));
+        put(bases_key, bases_bytes.as_slice());
+        lent.root_for(crate::engine_answer::BASES_ROOT, &[blaze_cas::Key(bases_key.0)], ROOT_LIFE_NS).expect("pin bases");
+        lent.root_for(crate::engine_answer::BASES_KEPT_ROOT, &[ws_cas, other_cas], ROOT_LIFE_NS).expect("pin bases kept");
+        lent.commit().expect("commit");
+    }
+
+    let before = io.script(|h| h.out.len()).expect("sim");
+    let out = io.need_out().expect("out");
+    let result = super::run_with_store(
+        &cx,
+        &fs,
+        ["ws"].into_iter(),
+        Some("/h"),
+        &out,
+        Some(super::StoreClean { host: &host, rng: &mut rng, heap }),
+    );
+    let said = io
+        .script(|h| blaze_own::String::from_str_in(core::str::from_utf8(&h.out[before..]).expect("utf8"), frame))
+        .expect("sim");
+    assert!(result.is_ok(), "clean failed: {result:?}");
+    assert!(said.as_str().contains("cleared 3 cached answer roots for this checkout"), "unexpected output:\n{said}");
+
+    // Verify ws roots are gone, other checkout's root survives, and BASES_ROOT pruned ws_ptr only.
+    {
+        let facts = crate::store::Facts { boot: Some(1), nonce: 12 };
+        let lent = store_home.open_store(&Settings::default(), facts, heap.alloc()).expect("reopen store");
+        assert!(!lent.has_root(ws_root.as_str()), "ws whole root must be unrooted");
+        let ws_answer = bstd::mem::format_in!(frame, "{}.answer", ws_root.as_str());
+        assert!(!lent.has_root(ws_answer.as_str()), "ws answer root must be unrooted");
+        assert!(!lent.has_root(ws_scoped.as_str()), "ws scoped root must be unrooted");
+        assert!(lent.has_root(other_root.as_str()), "other checkout's root must stay intact");
+        let bases_rec = lent.root_named(crate::engine_answer::BASES_ROOT).expect("BASES_ROOT kept for other checkout");
+        let bases_key_bytes = lent.get(&bases_rec).expect("get").expect("present").bytes;
+        let bases_key = blaze_cas::Key(ContentId(bases_key_bytes.try_into().expect("32 bytes")));
+        let bases_payload = lent.get(&bases_key).expect("get").expect("present").bytes;
+        let decoded = crate::engine_answer::decode_bases(bases_payload, frame).expect("valid bases");
+        assert_eq!(decoded.len(), 1, "only other checkout's base should remain");
+        assert_eq!(decoded[0].pointer, other_ptr, "ws pointer pruned from BASES_ROOT");
+    }
+
+    // Second clean has nothing left to remove.
+    let before2 = io.script(|h| h.out.len()).expect("sim");
+    let again = super::run_with_store(
+        &cx,
+        &fs,
+        ["ws"].into_iter(),
+        Some("/h"),
+        &out,
+        Some(super::StoreClean { host: &host, rng: &mut rng, heap }),
+    );
+    let said2 = io
+        .script(|h| blaze_own::String::from_str_in(core::str::from_utf8(&h.out[before2..]).expect("utf8"), frame))
+        .expect("sim");
+    assert!(again.is_ok(), "second clean failed: {again:?}");
+    assert_eq!(said2.as_str(), bstd::mem::format_in!(frame, "{NOTHING}\n").as_str());
+}

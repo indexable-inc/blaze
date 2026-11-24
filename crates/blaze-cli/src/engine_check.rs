@@ -234,6 +234,9 @@ impl EngineCheckError {
 impl fmt::Display for EngineCheckError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            EngineCheckError::Engine(error @ EngineError::Last { error: blaze_engine::last::LastError::Pages(blaze_engine::pages::PagesError::Missing { .. }) }) => {
+                write!(f, "the engine: {error} (run `blaze clean` to discard this checkout's cached answer)")
+            }
             EngineCheckError::Engine(error) => write!(f, "the engine: {error}"),
             EngineCheckError::MissingIndexedRow { name } => write!(f, "stored answer directory names missing row {name:?}"),
             EngineCheckError::MissingRecord { name } => write!(f, "stored answer row {name:?} has no producer record"),
@@ -259,7 +262,7 @@ impl fmt::Display for EngineCheckError {
             EngineCheckError::Grow { what, had } => write!(f, "{what}: the list could not grow past {had} entries: its allocator refused (engine_*.rs)"),
             EngineCheckError::CellTable { task, what } => write!(f, "{task:?}: its record's cell table {what} (engine_names.rs `cells_of`)"),
             EngineCheckError::OutlineBack(crate::engine_store::OutlineBack::Missing { name, key }) => {
-                write!(f, "{name:?}: its row stands, and the store holds no outline at {key:?}, the key the stored answer names (engine_check.rs `plan`; run `blaze check` with the answer cleared)")
+                write!(f, "{name:?}: its row stands, and the store holds no outline at {key:?}, the key the stored answer names (engine_check.rs `plan`; run `blaze clean` to discard this checkout's cached answer)")
             }
             EngineCheckError::OutlineBack(crate::engine_store::OutlineBack::Unreadable { name, key, why }) => {
                 write!(f, "{name:?}: the outline at {key:?} is no whole drive record of it ({why:?}) (engine_store.rs `outline_from`)")
@@ -1600,6 +1603,24 @@ fn check_live<'f>(
     check_live_with_daemon(cx, fs, host, rng, args, net, root, opts, shown, phases, out, err, live, None)
 }
 
+/// Extracts an [`crate::engine_answer::Unreadable`] reason when reading a lazy page or standing
+/// outline record of a prior stored answer fails because that record is no longer in the store
+/// (e.g. a shared workspace base whose writer moved on and compacted old pages, or an interrupted
+/// older run). Matches the stated contract in `engine_answer.rs` (`Unreadable::Pages` /
+/// `Unreadable::Missing`): report the unreadable prior answer visibly and answer in full once,
+/// overwriting the checkout's stored answer with a complete one.
+fn missing_stored_record(error: &CliError) -> Option<crate::engine_answer::Unreadable> {
+    match error {
+        CliError::EngineCheck(EngineCheckError::Engine(EngineError::Last {
+            error: blaze_engine::last::LastError::Pages(missing @ blaze_engine::pages::PagesError::Missing { .. }),
+        })) => Some(crate::engine_answer::Unreadable::Pages(*missing)),
+        CliError::EngineCheck(EngineCheckError::OutlineBack(crate::engine_store::OutlineBack::Missing { key, .. })) => {
+            Some(crate::engine_answer::Unreadable::Missing { key: *key })
+        }
+        _ => None,
+    }
+}
+
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
 fn check_live_with_daemon<'f, 'd>(
     cx: &'f Cx,
@@ -1615,26 +1636,81 @@ fn check_live_with_daemon<'f, 'd>(
     out: &Out,
     err: &Out,
     live: Option<&(dyn blaze_screen::Watch + Sync)>,
-    daemon: Option<&mut DaemonCheckCtx<'d>>,
+    mut daemon: Option<&mut DaemonCheckCtx<'d>>,
 ) -> Result<Checked, CliError> {
     #[cfg(test)]
     stack_probe::at("check");
     // Where the check stands, said when asked or stopped (engine_status.rs), the watcher
     // beside it when anything can ask.
     let asking = opts.status;
-    // Boxed, made in its own call ([`board_in`]): by value its task slots sat twice in this
-    // frame (~79 KiB, bt4 2026-11-20) under every stage's (rule 54).
-    let board = board_in(opts.heap, &asking, phases.now().since_start());
-    let board: &crate::engine_status::Board<'_> = &board;
     let clock = phases.clock().clone();
     let heap = opts.heap;
-    let mut active = None;
     let stop_host = daemon.is_none().then_some(host);
-    let result = work::unwinding(|| {
-        crate::engine_status::watched(cx, stop_host, root, err, &clock, board, asking.every, live, || {
-            checking(cx, fs, host, rng, args, net, root, opts, shown, phases, out, err, board, &mut active, live, daemon)
-        }).map_err(EngineCheckError::Watcher)?
+    // Preserve the daemon watcher's crash cursor in case a lazy missing stored-answer page forces
+    // a single full rebuild after `daemon.watch` is consumed on the incremental attempt.
+    let daemon_crash_cursor = daemon.as_ref().and_then(|ctx| ctx.watch.as_ref()).map(|watch| match watch {
+        crate::daemon_watch::PollOutcome::Clean { crash_cursor }
+        | crate::daemon_watch::PollOutcome::Dirty { crash_cursor, .. }
+        | crate::daemon_watch::PollOutcome::FullRescan { crash_cursor, .. } => *crash_cursor,
+        crate::daemon_watch::PollOutcome::FsEvents { cursor, .. } => Some(*cursor),
     });
+    // Boxed, made in its own call ([`board_in`]): by value its task slots sat twice in this
+    // frame (~79 KiB, bt4 2026-11-20) under every stage's (rule 54).
+    let mut board = board_in(heap, &asking, phases.now().since_start());
+    let mut active = None;
+    let mut printed = false;
+    let first = {
+        let board_ref: &crate::engine_status::Board<'_> = &board;
+        work::unwinding(|| {
+            crate::engine_status::watched(cx, stop_host, root, err, &clock, board_ref, asking.every, live, || {
+                checking(cx, fs, host, rng, args, net, root, &opts, false, None, &mut printed, shown, phases, out, err, board_ref, &mut active, live, daemon.as_deref_mut())
+            }).map_err(EngineCheckError::Watcher)?
+        })
+    };
+    let result = match first {
+        Ok(Err(error))
+            if !printed
+                && !opts.fresh
+                && opts.driver != crate::engine_ready_edit::Driver::Ready
+                && let Some(unreadable) = missing_stored_record(&error) =>
+        {
+            if let Some(ctx) = daemon.as_deref_mut()
+                && let Some(crash_cursor) = daemon_crash_cursor
+            {
+                ctx.watch = Some(crate::daemon_watch::PollOutcome::FullRescan { crash_cursor, needs_refresh: true });
+            }
+            board = board_in(heap, &asking, phases.now().since_start());
+            active = None;
+            let board_ref: &crate::engine_status::Board<'_> = &board;
+            work::unwinding(|| {
+                crate::engine_status::watched(cx, stop_host, root, err, &clock, board_ref, asking.every, live, || {
+                    checking(
+                        cx,
+                        fs,
+                        host,
+                        rng,
+                        args,
+                        net,
+                        root,
+                        &opts,
+                        true,
+                        Some(unreadable),
+                        &mut printed,
+                        shown,
+                        phases,
+                        out,
+                        err,
+                        board_ref,
+                        &mut active,
+                        live,
+                        daemon,
+                    )
+                }).map_err(EngineCheckError::Watcher)?
+            })
+        }
+        other => other,
+    };
+    let board: &crate::engine_status::Board<'_> = &board;
     let error = match result {
         // Unboxed once, here ([`BoxedChecked`]): the caller's return slot is the one copy.
         Ok(Ok(checked)) => return Ok(blaze_own::Box::into_inner(checked)),
@@ -1700,7 +1776,10 @@ fn checking<'f, 'd>(
     args: Option<&bstd::args::Args>,
     net: Option<&bstd::net::Net>,
     root: &Dir<ReadWrite>,
-    opts: Opts<'f>,
+    opts: &Opts<'f>,
+    fresh_override: bool,
+    prior_unreadable: Option<crate::engine_answer::Unreadable>,
+    printed_out: &mut bool,
     shown: &mut print::Shown<'f>,
     phases: &mut Phases,
     out: &Out,
@@ -1712,9 +1791,9 @@ fn checking<'f, 'd>(
 ) -> Result<BoxedChecked, CliError> {
     #[cfg(test)]
     stack_probe::at("checking");
-    let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, origin, names_oracle, driver, ready_plant, scope: check_scope } = opts;
+    let &Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, origin, names_oracle, driver, ready_plant, scope: check_scope } = opts;
     // The oracle compares every crate's names, so every crate is entered: no stored answer read.
-    let fresh = fresh || names_oracle.on();
+    let fresh = fresh || fresh_override || names_oracle.on();
     let began = phases.now();
     let erased = blaze_own::Erased::new(frame);
     // The request's arena (engine_phase_mem.rs): what this call keeps to its end and no record
@@ -1750,7 +1829,7 @@ fn checking<'f, 'd>(
     let view_slot = crate::engine_lines::ViewSlot::load(&opened.lent, answer_root.as_str(), fresh, shown, &tools, frame)?;
     // The pointer and the last request's lines, in a frame of their own ([`own_frame`]).
     let (mut unreadable, pointer, last_lines, other_checkout) = own_frame(|| -> Result<_, CliError> {
-        let mut unreadable: Option<crate::engine_answer::Unreadable> = None;
+        let mut unreadable: Option<crate::engine_answer::Unreadable> = prior_unreadable;
         let mut other_checkout = false;
         let stored = match fresh {
             true => None,
@@ -1924,6 +2003,7 @@ fn checking<'f, 'd>(
                 live.see(blaze_screen::Step::Says);
             }
             let certified_key = (pointer.key, pointer.lines, pointer.facts);
+            *printed_out = true;
             let stood = certified(cx, root, &view_slot, pointer, lines, answer_root.as_str(), journal, &mut store, (&tools, toolchain), shown, phases, began, request, frame, out)?;
             drop(store);
             let cleanup = match owned_opened {
@@ -2700,6 +2780,7 @@ fn checking<'f, 'd>(
         if let Some(live) = live {
             live.see(blaze_screen::Step::Says);
         }
+        *printed_out = true;
         let printed = print_answer(cx, root, &view_slot, &mut store, &made, rows, (names.as_ref(), &*bodies), &finished, (outlined, files_checked), unreadable.as_ref(), names_oracle, (&*phases, began), shown, frame, out)?;
         let AnswerPrinted { tally, lines_key, lines_bytes, status, oracle, bodies_whole } = printed;
         let unprinted = made.unprinted;
