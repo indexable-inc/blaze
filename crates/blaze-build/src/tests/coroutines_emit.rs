@@ -62,15 +62,21 @@ struct World {
     /// The enum `Poll` (`Ready` 0, `Pending` 1) and the struct `Pin`.
     poll: ItemKey,
     pin: ItemKey,
-    /// `struct D { x: u64 }`, its host `Drop` fn, `fn mk_d() -> D` and `drop_in_place`.
+    /// `struct D { x: u64 }`, its host `Drop` fn, `fn mk_d() -> D`, `fn consume_d(d: D)` and
+    /// `drop_in_place`.
     d: ItemKey,
     drop_d: ItemKey,
     mk_d: ItemKey,
+    consume_d: ItemKey,
     dip: ItemKey,
     /// `struct Twice`, `fn twice() -> Twice` and the host's `<Twice as Future>::poll`.
     twice_adt: ItemKey,
     twice: ItemKey,
     twice_poll: ItemKey,
+    /// `struct ZstFut {}`, `fn zst_fut() -> ZstFut` and the host's `<ZstFut as Future>::poll`.
+    zst_fut_adt: ItemKey,
+    zst_fut: ItemKey,
+    zst_fut_poll: ItemKey,
     /// Names with no body of their own: `main`, the host's executor, and the item a
     /// coroutine's resume fn is named by (`AsyncItems::resume`).
     main: ItemKey,
@@ -110,6 +116,8 @@ thread_local! {
     static MADE: Cell<u32> = const { Cell::new(0) };
     /// How many polls the executor made.
     static POLLS: Cell<u32> = const { Cell::new(0) };
+    /// Remaining pending polls for the zero-sized future `ZstFut`.
+    static ZST_LEFT: Cell<u32> = const { Cell::new(0) };
     static SCRIPT: Cell<Script> = const { Cell::new(Script::Complete) };
     static POLL: Cell<PollLayout> = const { Cell::new(PollLayout { tag_at: 0, tag_bytes: 0, ready: 0, pending: 0, payload_at: 0 }) };
     /// The driven state's tag: its offset and its width in bytes.
@@ -128,6 +136,39 @@ extern "C" fn host_drop_d(p: *const u64) {
 extern "C" fn host_mk_d(out: *mut u64) {
     // SAFETY: `out` is the caller's result slot of one D.
     unsafe { out.write(5) };
+}
+
+/// `consume_d(d: D)`: consumes a `D` (passed by address, as a `Drop` aggregate) and drops it on
+/// the host.
+extern "C" fn host_consume_d(p: *const u64) {
+    host_drop_d(p);
+}
+
+/// `zst_fut()`: zero-sized `ZstFut`; sets `ZST_LEFT = 1` so the first poll is `Pending` and the
+/// second is `Ready(77)`.
+extern "C" fn host_zst_fut() {
+    MADE.with(|m| m.set(m.get() + 1));
+    ZST_LEFT.with(|l| l.set(1));
+}
+
+/// `<ZstFut as Future>::poll(self: Pin<&mut ZstFut>, cx) -> Poll<u64>`: verifies the dangling
+/// pointer is non-null, returns `Pending` once, then `Ready(77)`.
+extern "C" fn host_poll_zst_fut(out: *mut u8, pin: *const *mut u8, _cx: *mut u8) {
+    let l = POLL.with(Cell::get);
+    // SAFETY: `pin` is the caller's `Pin<&mut ZstFut>`, holding a non-null dangling pointer;
+    // `out` is its result slot of one `Poll<u64>`.
+    unsafe {
+        let this = pin.read();
+        assert!(!this.is_null(), "Pin<&mut ZstFut> must carry a non-null aligned dangling pointer");
+        let left = ZST_LEFT.with(Cell::get);
+        if left == 0 {
+            out.add(l.payload_at).cast::<u64>().write_unaligned(77);
+            write_tag(out, l, l.ready);
+        } else {
+            ZST_LEFT.with(|c| c.set(left - 1));
+            write_tag(out, l, l.pending);
+        }
+    }
 }
 
 /// `twice()`: a `Twice` whose two words are both 2 (so no field order matters here: the
@@ -261,6 +302,7 @@ fn open_world() -> World {
     let md = fx.r(Mutbl::Mut, dt);
     let drop_d = fx.func("drop_d", 0, &[md], unit, StdVec::new());
     let mk_d = fx.func("mk_d", 0, &[], dt, StdVec::new());
+    let consume_d = fx.func("consume_d", 0, &[dt], unit, StdVec::new());
     let raw = fx.ty(PNode::Ptr(Mutbl::Mut, p0));
     let dip = fx.func("drop_in_place", 1, &[raw], unit, StdVec::new());
     fx.unsized_fn_param(dip, 0);
@@ -270,6 +312,12 @@ fn open_world() -> World {
     fx.imp("impl Future for Twice", 0, twice_t, Some((future, &[])), &[("Output", u64_)], StdVec::new());
     let twice = fx.func("twice", 0, &[], twice_t, StdVec::new());
     let twice_poll = fx.func("twice_poll", 0, &[], unit, StdVec::new());
+
+    let zst_fut_adt = fx.strukt("ZstFut", 0, &[]);
+    let zst_fut_t = fx.adt(zst_fut_adt, &[]);
+    fx.imp("impl Future for ZstFut", 0, zst_fut_t, Some((future, &[])), &[("Output", u64_)], StdVec::new());
+    let zst_fut = fx.func("zst_fut", 0, &[], zst_fut_t, StdVec::new());
+    let zst_fut_poll = fx.func("zst_fut_poll", 0, &[], unit, StdVec::new());
 
     let main = fx.func("main", 0, &[], u64_, StdVec::new());
     let drive = fx.func("drive", 0, &[], u64_, StdVec::new());
@@ -286,10 +334,14 @@ fn open_world() -> World {
         d,
         drop_d,
         mk_d,
+        consume_d,
         dip,
         twice_adt,
         twice,
         twice_poll,
+        zst_fut_adt,
+        zst_fut,
+        zst_fut_poll,
         main,
         drive,
         resume,
@@ -645,6 +697,9 @@ fn run_laid(w: &World, progs: &[Prog<'_>], script: Script, laid: Option<&state_n
     let twice_t = ground.intern(PNode::Adt(w.twice_adt, none)).expect("`Twice`");
     let twice_at = ground.intern_list(&[twice_t]).expect("a list");
     bodies.push((w.poll_fn, twice_at, forward3(w.twice_poll)));
+    let zst_t = ground.intern(PNode::Adt(w.zst_fut_adt, none)).expect("`ZstFut`");
+    let zst_at = ground.intern_list(&[zst_t]).expect("a list");
+    bodies.push((w.poll_fn, zst_at, forward3(w.zst_fut_poll)));
     for (_, _, built) in bodies.iter() {
         super::emits(built, &[]);
     }
@@ -708,11 +763,14 @@ fn run_laid(w: &World, progs: &[Prog<'_>], script: Script, laid: Option<&state_n
     assert!(placed.iter().all(|&p| p), "a cycle among the built bodies");
     fns.push((w.main, None, &main));
     let host = [
-        (w.drop_d, host_drop_d as usize as u64),
-        (w.mk_d, host_mk_d as usize as u64),
-        (w.twice, host_twice as usize as u64),
-        (w.twice_poll, host_poll_twice as usize as u64),
-        (w.drive, host_drive as usize as u64),
+        (w.drop_d, host_drop_d as *const () as usize as u64),
+        (w.mk_d, host_mk_d as *const () as usize as u64),
+        (w.consume_d, host_consume_d as *const () as usize as u64),
+        (w.twice, host_twice as *const () as usize as u64),
+        (w.twice_poll, host_poll_twice as *const () as usize as u64),
+        (w.zst_fut, host_zst_fut as *const () as usize as u64),
+        (w.zst_fut_poll, host_poll_zst_fut as *const () as usize as u64),
+        (w.drive, host_drive as *const () as usize as u64),
     ];
     DROPS.with(|d| d.set(0));
     MADE.with(|m| m.set(0));
@@ -1060,6 +1118,27 @@ fn a_nested_async_block_reads_its_reordered_environment_by_declaration_index() {
     let ran = run(&w, &[Prog { item: wide, b: &b, root, lits: &lits }], Script::Complete);
     assert_eq!(ran, Ran { value: 70402, polls: 1, drops: 0, made: 0 });
     println!("coroutine emit 7: a nested block over (u8, u64, u8): ready({}) at poll {}", ran.value, ran.polls);
+}
+
+/// `async fn zst() -> u64 { zst_fut().await }`: awaiting a zero-sized `Future` (`Repr::None`)
+/// passes a non-null aligned dangling pointer to `Future::poll` without allocating a state slot.
+#[test]
+fn await_of_zero_sized_future_completes_without_state_slot() {
+    let mut w = open_world();
+    let zst = async_fn(&mut w, "zst", "zst_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let lits = StdVec::new();
+    let awaited = call_await(&mut b, "zst_fut");
+    let body = b.block(&[], Some(awaited));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item: zst, b: &b, root, lits: &lits }];
+    let ran = run(&w, &progs, Script::Complete);
+    assert_eq!(ran, Ran { value: 77, polls: 2, drops: 0, made: 1 });
+    // Laid state with ZERO saved locals: the zero-sized future occupies no state bytes.
+    let laid = state_names::Laid::new((0, 0), &[], 1, crate::coroutine_state::StatePlant::None);
+    let ran_laid = run_laid(&w, &progs, Script::Complete, Some(&laid)).unwrap_or_else(|e| panic!("laid ZST await failed: {e}"));
+    assert_eq!(ran_laid, ran);
 }
 
 mod async_unwind;

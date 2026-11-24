@@ -171,7 +171,7 @@ pub(super) struct Co {
     /// passes its own).
     cx: Value,
     /// The number the next `.await`'s `suspend` takes: points count up in emit order.
-    points: u32,
+    pub(super) points: u32,
     /// `Poll<Output>`'s walk row and its layout in `ls`.
     poll_row: u32,
     poll_id: LayoutId,
@@ -728,20 +728,32 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             self.b.slot_dead(slot);
         }
 
-        // Step 2: `tmp`.
-        let at = match (hv, hrepr) {
-            (_, Repr::None) => return Err(unsupported(e, "`.await` of a zero-sized future")),
-            (V::Place(p, off), Repr::Agg(_)) => (p, off),
+        // Step 2: `tmp`. A zero-sized future whose type needs no drop (`Repr::None`) holds no
+        // bytes and needs no state slot: `Pin<&mut Held>` is handed the dangling aligned non-null
+        // address (`1 << align_of::<Held>()`, as `NonNull::dangling`), which is identical on every
+        // poll and remade across suspensions.
+        let (at, fut_slot, zst_align) = match (hv, hrepr) {
+            (_, Repr::None) => {
+                let id = self.ls_of(held).map_err(err)?;
+                let align = self.ls.get(id).align;
+                (None, None, align)
+            }
+            (V::Place(p, off), Repr::Agg(_)) => {
+                let at = (p, off);
+                // `tmp`'s storage ends on the Ready edge (ASYNC.md D-A6), so the state's bytes
+                // for it are free for what a later await keeps.
+                let fut_slot = self.await_slot(e, at, "`.await` of a future not in a slot of its own: its storage cannot end on the Ready edge")?;
+                self.name_slot(fut_slot, Identity::Temp(e, Role::Awaitee));
+                (Some(at), Some(fut_slot), 0)
+            }
             (hv, hrepr) => {
                 let at = self.temp(hrepr);
                 self.store(hv, hrepr, at)?;
-                at
+                let fut_slot = self.await_slot(e, at, "`.await` of a future not in a slot of its own: its storage cannot end on the Ready edge")?;
+                self.name_slot(fut_slot, Identity::Temp(e, Role::Awaitee));
+                (Some(at), Some(fut_slot), 0)
             }
         };
-        // `tmp`'s storage ends on the Ready edge (ASYNC.md D-A6), so the state's bytes for it
-        // are free for what a later await keeps.
-        let fut_slot = self.await_slot(e, at, "`.await` of a future not in a slot of its own: its storage cannot end on the Ready edge")?;
-        self.name_slot(fut_slot, Identity::Temp(e, Role::Awaitee));
 
         // Step 3's type: `Pin<&mut Held>`; the loop's result type: `Poll<Output>`.
         let fut_ref = self.ground.intern(PNode::Ref(Mutbl::Mut, held)).map_err(full)?;
@@ -774,13 +786,20 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         // written into the slot of the flow local it is, before the loop, and read back on the
         // Ready edge: the walk invents no slot across a suspend (walk/await_spill.rs).
         let spilled = self.spill_waiting(e)?;
+        self.end_moved_locals_before_await();
         let planted = self.plant_before();
 
         // Steps 3 and 4, the loop's head: where a poll after a suspend goes on.
         let head = self.create();
         self.jump(head, &[]);
         self.begin(head);
-        let fut = self.address(at);
+        let fut = match at {
+            Some(at) => self.address(at),
+            None => {
+                let addr = self.b.iconst(Ty::I64, 1u128 << zst_align);
+                self.b.convert(Op::FromExposed, Flags::NONE, Ty::PTR, addr)
+            }
+        };
         let pa = self.b.slot_addr(pin_slot);
         self.store(V::Scalar(fut), Repr::Ptr, (pa, pin_off as i32))?;
         self.push_val(V::Place(pa, 0), None);
@@ -815,7 +834,14 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         // temporary, so it goes first; then every open scope, as a `return`'s exit.
         self.begin(cancel);
         if held_drops {
-            self.drop_at(held, at)?;
+            let drop_at = match at {
+                Some(at) => at,
+                None => {
+                    let addr = self.b.iconst(Ty::I64, 1u128 << zst_align);
+                    (self.b.convert(Op::FromExposed, Flags::NONE, Ty::PTR, addr), 0)
+                }
+            };
+            self.drop_at(held, drop_at)?;
         }
         self.drop_from(0)?;
         self.b.cancelled();
@@ -850,9 +876,18 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         };
         self.b.slot_dead(poll_slot);
         if held_drops {
-            self.drop_at(held, at)?;
+            let drop_at = match at {
+                Some(at) => at,
+                None => {
+                    let addr = self.b.iconst(Ty::I64, 1u128 << zst_align);
+                    (self.b.convert(Op::FromExposed, Flags::NONE, Ty::PTR, addr), 0)
+                }
+            };
+            self.drop_at(held, drop_at)?;
         }
-        self.b.slot_dead(fut_slot);
+        if let Some(fut_slot) = fut_slot {
+            self.b.slot_dead(fut_slot);
+        }
         self.push_val(value, None);
         Ok(())
     }

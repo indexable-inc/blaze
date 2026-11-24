@@ -111,30 +111,107 @@ fn check(dir: &Path, home: &Path) -> String {
     std::fs::read_to_string(&said).unwrap_or_else(|error| panic!("reading {}: {error}", said.display()))
 }
 
-#[test]
-fn every_written_body_is_checked_by_the_command() {
-    let base = fresh_home("check_written_bodies", true);
-    let dir = base.join("written-bodies");
+fn check_package(tag: &str, pkg: &str, manifest: &str, lock: &str, src_rel: &str, src: &str, check_said: impl FnOnce(&str)) {
+    let base = fresh_home(tag, true);
+    let dir = base.join(pkg);
     std::fs::create_dir_all(dir.join("src")).expect("the package's folders");
-    std::fs::write(dir.join("Cargo.toml"), MANIFEST).expect("the manifest");
+    std::fs::write(dir.join("Cargo.toml"), manifest).expect("the manifest");
     // A lock to match, so the command has a unit graph and checks types (body_types.rs `NO_GRAPH`).
-    std::fs::write(dir.join("Cargo.lock"), "version = 4\n\n[[package]]\nname = \"written-bodies\"\nversion = \"0.1.0\"\n").expect("the lock");
-    std::fs::write(dir.join("src/main.rs"), MAIN).expect("src/main.rs");
+    std::fs::write(dir.join("Cargo.lock"), lock).expect("the lock");
+    std::fs::write(dir.join(src_rel), src).expect(src_rel);
     let said = check(&dir, &base.join("home"));
     let _ = std::fs::remove_dir_all(&base);
+    check_said(&said);
+}
 
-    let printed = said.matches(E0308).count();
-    assert_eq!(printed, 2, "2 planted E0308, {printed} printed:\n{said}");
-    // Each finding says which body it is in (covered.rs `Shown`): the body the user wrote, the
-    // local `main` of the launcher `main!` wrote in its place (D104), and `deep` two blocks
-    // down. The launcher is a body a macro wrote at the entry (covered.rs `written_by`), named
-    // by its macro, so its local is `<the launcher>::main`; the entry's REPLACED_MAIN name
-    // (engine_bodies.rs) stands only where no written body is found at the entry. Once, under
-    // one name (rule 77: the block's module of the launcher lists it no second time,
-    // covered.rs `in_blocks`).
-    assert!(said.contains("in `{the expansion of `std::main!`}::main::main`"), "the written main's E0308 names its body:\n{said}");
-    assert!(said.contains("in `outer::mid::deep`"), "deep's E0308 names its body:\n{said}");
-    // Never a pass for a body that was not checked: no "lists no body" note for `main`.
-    assert!(!said.contains("front2 lists no body at this item"), "an entry left unchecked:\n{said}");
-    println!("WRITTEN BODIES CLI: {printed} E0308 printed (the written main, outer::mid::deep)");
+#[test]
+fn every_written_body_is_checked_by_the_command() {
+    check_package(
+        "check_written_bodies",
+        "written-bodies",
+        MANIFEST,
+        "version = 4\n\n[[package]]\nname = \"written-bodies\"\nversion = \"0.1.0\"\n",
+        "src/main.rs",
+        MAIN,
+        |said| {
+            let printed = said.matches(E0308).count();
+            assert_eq!(printed, 2, "2 planted E0308, {printed} printed:\n{said}");
+            // Each finding says which body it is in (covered.rs `Shown`): the body the user wrote, the
+            // local `main` of the launcher `main!` wrote in its place (D104), and `deep` two blocks
+            // down. The launcher is a body a macro wrote at the entry (covered.rs `written_by`), named
+            // by its macro, so its local is `<the launcher>::main`; the entry's REPLACED_MAIN name
+            // (engine_bodies.rs) stands only where no written body is found at the entry. Once, under
+            // one name (rule 77: the block's module of the launcher lists it no second time,
+            // covered.rs `in_blocks`).
+            assert!(said.contains("in `{the expansion of `std::main!`}::main::main`"), "the written main's E0308 names its body:\n{said}");
+            assert!(said.contains("in `outer::mid::deep`"), "deep's E0308 names its body:\n{said}");
+            // Never a pass for a body that was not checked: no "lists no body" note for `main`.
+            assert!(!said.contains("front2 lists no body at this item"), "an entry left unchecked:\n{said}");
+            println!("WRITTEN BODIES CLI: {printed} E0308 printed (the written main, outer::mid::deep)");
+        },
+    );
+}
+
+/// Macro-written bodies inside a function block — `const _: () = { impl ... }` (as fn-local
+/// `#[derive(Serialize)]` / `#[derive(RlpDecodable)]` expand) and macro-written `const` items
+/// (as `thread_local!` expands) — must be assigned to the enclosing fn's check task and checked
+/// cleanly, while a statement-block macro holding `{ static __CALLSITE = concat!(file!(), ..); }`
+/// (as `tracing::debug!` expands into `__blaze_block_x...`) must NOT be double-checked through
+/// the synthetic block module with a `HostError` / `Place` note.
+#[test]
+fn fn_local_macro_written_bodies_are_checked_and_stmt_block_skipped() {
+    const LOCAL_MANIFEST: &str = "[package]\nname = \"local-macro-bodies\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    const LOCAL_LIB: &str = r#"macro_rules! derive_like {
+    ($t:ident) => {
+        const _: () = {
+            impl LocalTrait for $t {
+                fn bad(&self) {
+                    let x: u8 = "derive_boom";
+                    let _ = x;
+                }
+            }
+        };
+    };
+}
+
+macro_rules! const_like {
+    () => {
+        const LOCAL_KEY: u8 = "const_boom";
+    };
+}
+
+macro_rules! stmt_block_like {
+    () => {{
+        static __CALLSITE: &'static str = concat!(file!(), ":", line!());
+        let _ = __CALLSITE;
+    }};
+}
+
+trait LocalTrait {
+    fn bad(&self);
+}
+
+pub fn host() {
+    struct LocalStruct;
+    derive_like!(LocalStruct);
+    const_like!();
+    stmt_block_like!();
+    LocalStruct.bad();
+    let _ = LOCAL_KEY;
+}
+"#;
+    check_package(
+        "check_local_macro_bodies",
+        "local-macro-bodies",
+        LOCAL_MANIFEST,
+        "version = 4\n\n[[package]]\nname = \"local-macro-bodies\"\nversion = \"0.1.0\"\n",
+        "src/lib.rs",
+        LOCAL_LIB,
+        |said| {
+            let printed = said.matches(E0308).count();
+            assert_eq!(printed, 2, "expected 2 E0308 (fn-local derive-like impl + const-like item), got {printed}:\n{said}");
+            assert!(!said.contains("checked by no task"), "macro-written fn-local body was checked by no task:\n{said}");
+            assert!(!said.contains("HostError"), "stmt-block macro triggered HostError:\n{said}");
+        },
+    );
 }

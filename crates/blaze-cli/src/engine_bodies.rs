@@ -4905,21 +4905,48 @@ impl<'f> BodiesStage<'f> {
                 // `Checker::holds`): what tells an entry a `cfg` left out from one the records
                 // lost ([`absent_entry`]).
                 let cfg = NamesSource::cfg_atoms(records, 0).map(|atoms| blaze_scope::task::Cfg::from_atoms(atoms, g));
-                // Free fn/const/static items in block modules (e.g. `bstd_hosted_start` inside
-                // `bstd::main!`'s launcher `main`): `covered::in_blocks` skips them so each body
-                // is checked once via `each_from`, while `program.rs` calls exported block items
-                // by their block-module library key. Pre-index `(expansion_key, item_key)` once
-                // per member so each body adds its library-key aliases to `covers` in O(log N).
+                // Free fn/const/static items in block modules (direct block locals like
+                // `bstd_hosted_start` inside `bstd::main!`'s launcher `main`, AND macro-written
+                // block locals like `::std::thread_local!` inside a derive's `const _: () = { .. }`
+                // or a fn body): `covered::in_blocks` skips them so each body is checked once via
+                // `each_from`, while `program.rs` calls exported/macro-written block items by
+                // their block-module library key. Pre-index `(block_key, item_key)` once per
+                // member so each body adds its library-key aliases to `covers` in O(log N).
                 let mut block_locals: Vec<(ItemKey, ItemKey), blaze_own::Alloc<'static>> = Vec::new_in(g);
+                let mut stop_blocks: Vec<ItemKey, blaze_own::Alloc<'static>> = Vec::new_in(g);
+                if expansions.is_some() {
+                    let krate = items.key();
+                    for idx in 0..items.items() {
+                        if let Ok(Some(id)) = items.identity_at(idx) {
+                            stop_blocks.push(crate::body_types::covered::block_key(krate, id.key));
+                            if matches!(id.kind, blaze_surface::ItemKind::Impl | blaze_surface::ItemKind::Trait) {
+                                NamesSource::each_member(records, id.key, &mut |m| {
+                                    stop_blocks.push(crate::body_types::covered::block_key(krate, m.key));
+                                });
+                            }
+                        }
+                    }
+                    stop_blocks.sort_unstable();
+                    stop_blocks.dedup();
+                }
+                let stop = |at: ItemKey| stop_blocks.binary_search(&at).is_ok();
                 for idx in 0..items.items() {
                     if let Ok(Some(id)) = items.identity_at(idx)
                         && matches!(id.kind, blaze_surface::ItemKind::Function | blaze_surface::ItemKind::Const | blaze_surface::ItemKind::Static)
                         && let Some(blaze_scope::resolve::At::Expansion(exp)) = id.at
                     {
                         block_locals.push((exp, id.key));
+                        if let Some(texts) = expansions.as_ref()
+                            && !stop(exp)
+                            && let Ok(crate::body_types::covered::Up::Stopped(block)) =
+                                crate::body_types::covered::walk_up(texts, exp, &mut |_, _| {}, &stop)
+                        {
+                            block_locals.push((block, id.key));
+                        }
                     }
                 }
                 block_locals.sort_unstable();
+                block_locals.dedup();
                 (records, mine, row, cfg, block_locals)
             });
             tally.parts.listing_list_ns = tally.parts.listing_list_ns.saturating_add(lap(handles.clock, &mut list_mark));
@@ -6685,7 +6712,29 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                                 written
                             };
                             match found_of(line, written, item_text, sc) {
-                                Ok(Some(one_found)) => found.push(one_found),
+                                Ok(Some(one_found)) => {
+                                    // A macro-written free item in a block (e.g. `const` from a
+                                    // macro inside a fn body) is checked both via `each_from`
+                                    // (`host::ITEM`) and via `in_blocks` (`{a block of host}::ITEM`
+                                    // so its block-module library key and nested statics enter
+                                    // `covers`). Report each finding once (rule 77).
+                                    let dup_block = written.is_some_and(|u| {
+                                        u.words == crate::body_types::covered::BLOCK_UNPLACED
+                                            && u.label.rsplit("::").next().is_some_and(|name| {
+                                                let tag = bstd::mem::format_in!(sc, "::{name}`, ");
+                                                found.iter().any(|prev| {
+                                                    prev.rule == one_found.rule
+                                                        && prev.at == one_found.at
+                                                        && core::str::from_utf8(prev.message).is_ok_and(|msg| {
+                                                            msg.ends_with(line.words.as_str()) && msg.contains(tag.as_str())
+                                                        })
+                                                })
+                                            })
+                                    });
+                                    if !dup_block {
+                                        found.push(one_found);
+                                    }
+                                }
                                 Ok(None) => {}
                                 // Never quietly dropped (rule 3): the body is then not checked whole.
                                 Err(cause) => {

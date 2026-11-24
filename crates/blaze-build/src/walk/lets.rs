@@ -68,8 +68,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         // The condition's region (lets/scope.rs): its bindings and, in edition 2024, its
         // scrutinee temporaries; dropped after the consequent (the region's `ScopeEnd`, then
         // the temporary scope's end), or by each failed link before the `else` block.
+        let repr = self.expr_repr(e)?;
+        let res = self.join_slot(repr);
         let temps = self.if_let_open(e, cond, links.len())?;
-        self.work.push(Task::IfThen { expr: e, else_, else_block, join });
+        self.work.push(Task::IfThen { expr: e, else_, else_block, join, res });
         if temps {
             self.work.push(Task::TempScopeEnd(cond));
         }
@@ -172,8 +174,16 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         // `scan_flags` gave them, walk/moves.rs `scan_local_scrutinee`), as a `match` arm does.
         let m = self.matches.len() as u32;
         let at = self.owned_place(m, init, init, s, srepr)?;
+        // A non-dropping temporary slot made for the scrutinee (not held in `scope_pats` and not
+        // a local): must end on the miss path and (unless `pat` borrows from it via `ref`) after
+        // bindings on the match path so it cannot falsely stay live across a later `.await`.
+        let scrut_slot = self.whole_slot(at.at).filter(|&slot| self.is_temp_slot(slot) && !self.slot_held(slot) && !self.slot_is_local(slot));
         // A failed test drops what the region holds at this link, then goes to the `else`.
-        let (to, undo) = self.link_fail(fail)?;
+        let (to, undo) = match self.link_fail(fail)? {
+            (to, true) => (to, true),
+            (_, false) if scrut_slot.is_some() => (self.create(), true),
+            (to, false) => (to, false),
+        };
         let pass = self.create();
         // Set before the tests: an or-alternative binds (and moves) on its own pass.
         self.move_arm(m, pat, false);
@@ -183,13 +193,21 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
         self.move_arm_end();
         if undo {
-            self.link_fail_end(to, fail)?;
+            self.link_fail_end(to, fail, scrut_slot)?;
         }
         self.begin(pass);
         self.move_arm(m, pat, false);
         let bound = self.bind_tested(pat, at);
         self.move_arm_end();
-        bound
+        bound?;
+        if let Some(slot) = scrut_slot {
+            if self.pat_has_ref(pat)? {
+                self.hold_copy_temp(init, at.at)?;
+            } else {
+                self.end_temp_slot(slot);
+            }
+        }
+        Ok(())
     }
 
     /// `Task::CondLink`: a `bool` link's value on top; false to `fail`, through a block that
@@ -201,7 +219,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let (to, undo) = self.link_fail(fail)?;
         self.br(c, (next, &[]), (to, &[]));
         if undo {
-            self.link_fail_end(to, fail)?;
+            self.link_fail_end(to, fail, None)?;
         }
         self.begin(next);
         Ok(())
@@ -233,6 +251,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         // part out by the local's field flags (walk/moves.rs `scan_local_scrutinee`).
         let m = self.matches.len() as u32;
         let at = self.owned_place(m, init, init, v, srepr)?;
+        let scrut_slot = self.whole_slot(at.at).filter(|&slot| self.is_temp_slot(slot) && !self.slot_held(slot) && !self.slot_is_local(slot));
         let pass = self.create();
         let fail = self.create();
         // Set before the tests: an or-alternative binds (and moves) on its own pass.
@@ -247,6 +266,13 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let bound = self.bind_tested(pat, at);
         self.move_arm_end();
         bound?;
+        if let Some(slot) = scrut_slot {
+            if self.pat_has_ref(pat)? {
+                self.hold_copy_temp(init, at.at)?;
+            } else {
+                self.end_temp_slot(slot);
+            }
+        }
         let cont = self.create();
         self.jump(cont, &[]);
         // The pattern failed: the statement's temporaries (the initializer's borrowed ones and
@@ -274,6 +300,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     return Err(unsupported(init, "an extended temporary in a `let`-`else` initializer"));
                 }
             }
+        }
+        self.end_scope_slots_peek(mark, usize::MAX);
+        if let Some(slot) = scrut_slot {
+            self.end_temp_slot(slot);
         }
         let from = self.let_else_held.len() as u32;
         self.let_else_held.extend_from_slice(&self.scope_pats[mark..]);

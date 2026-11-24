@@ -330,6 +330,8 @@ struct Target {
     header: Option<Block>,
     exit: Block,
     repr: Repr,
+    /// Shared result slot for an aggregate exit (instead of a pointer block param).
+    res: Option<SlotId>,
     /// The drop scopes open outside it: leaving it drops every scope from this depth on.
     depth: u32,
 }
@@ -347,6 +349,8 @@ struct MatchState {
     of_enum: Option<((Value, i32), u32, LayoutId)>,
     join: Block,
     repr: Repr,
+    /// Shared result slot for an aggregate join (instead of a pointer block param).
+    res: Option<SlotId>,
     first: u32,
     arms: u32,
     /// Some arm has a guard: the arms are tested in turn rather than by one `switch`.
@@ -404,8 +408,8 @@ enum Task {
     Let(PatId, Option<ExprId>),
     BlockExit(ExprId),
     If { expr: ExprId, then: ExprId, else_: Option<ExprId> },
-    IfThen { expr: ExprId, else_: Option<ExprId>, else_block: Block, join: Block },
-    IfElse { expr: ExprId, join: Block },
+    IfThen { expr: ExprId, else_: Option<ExprId>, else_block: Block, join: Block, res: Option<SlotId> },
+    IfElse { expr: ExprId, join: Block, res: Option<SlotId> },
     /// A `let` link of an `if` condition (walk/lets.rs): `let` expression `expr`, its
     /// scrutinee on top; a failed test to `fail`.
     LetLink { expr: ExprId, fail: Block },
@@ -449,6 +453,10 @@ enum Task {
     /// Every part of the aggregate literal on top (laid out as row `l`) is stored: it is one
     /// value from now on, owned whole (walk/val_stack.rs `literal_built`).
     LitBuilt { l: u32 },
+    /// Builds an aggregate ctor call / struct / tuple / array after all its operands have been
+    /// evaluated onto the value stack (in coroutine bodies, so the aggregate's own slot is never
+    /// allocated before an operand's `.await`).
+    BuildAgg { expr: ExprId, l: u32, variant: u32 },
     /// Base-less struct expression `e` (`S { a: 1, .. }`, RFC 3681), its place on top, every
     /// written field stored: each unwritten field stored from its default's value.
     InitDefaults(ExprId),
@@ -562,6 +570,9 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     /// Per expression: its parent (`NO_EXPR` for none) and whether the edge to it is
     /// conditional, from `scan_flags` (walk/temps.rs finds a temporary's scope by it).
     expr_parent: Vec<(u32, bool), A>,
+    /// Per pattern: the expression that declares it (`NO_EXPR` for parameters / outer captures),
+    /// from `scan_flags`.
+    pat_decl: blaze_own::Vec<u32, A>,
     /// Per statement being built: where its temporaries start in `scope_pats`.
     temp_marks: Vec<u32, A>,
     /// A `let`-`else` statement's own entries of `scope_pats` (its temporaries, its bindings),
@@ -590,6 +601,10 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     owned: Vec<LocalOwn, A>,
     /// Per pattern: whether a binding without a flag is initialized here.
     init: Vec<bool, A>,
+    /// Per pattern: whether a flagged binding has been unconditionally moved out in its
+    /// declaring expression (and not re-initialized since), so subsequent drops and `.await`s
+    /// know it is definitely uninitialized without reading its drop flag.
+    definitely_uninit: blaze_own::Vec<bool, A>,
     /// What needs drop, in declaration order, of every open drop scope.
     scope_pats: Vec<Held, A>,
     /// Per open drop scope (a fn's parameters first, then each block): where its bindings
@@ -901,6 +916,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         needs_flag,
         partial,
         expr_parent: Vec::new_in(alloc),
+        pat_decl: blaze_own::Vec::new_in(alloc),
         temp_marks: Vec::new_in(alloc),
         let_else_held: Vec::new_in(alloc),
         temp_here: {
@@ -915,6 +931,11 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         super_temps: Vec::new_in(alloc),
         owned,
         init,
+        definitely_uninit: {
+            let mut du = blaze_own::Vec::with_capacity_in(body.pats.len(), alloc);
+            du.resize(body.pats.len(), false);
+            du
+        },
         scope_pats: Vec::new_in(alloc),
         scope_marks: Vec::new_in(alloc),
         moves: moves::Moves::new_in(alloc),
@@ -1794,6 +1815,50 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
     }
 
+    /// Allocates a shared temporary slot for an aggregate join (`match`, `if`, labeled block,
+    /// `loop`), so each branch copies into it and ends its own temporary slot, and the join
+    /// produces a real `SlotAddr` instead of hiding the slot behind a block parameter.
+    fn join_slot(&mut self, repr: Repr) -> Option<SlotId> {
+        let Repr::Agg(_) = repr else { return None };
+        let (size, align) = self.size_align(repr);
+        Some(self.b.slot(size, align, SlotKind::Temp))
+    }
+
+    /// Jumps to join block `join` with branch value `v` (of `repr`), copying into shared slot
+    /// `res` and ending `v`'s temporary slot for aggregate joins. In unreachable code
+    /// (`!self.live`), emits `unreachable` instead of allocating a dummy slot or adding a dead
+    /// edge to `join`.
+    fn join_jump(&mut self, v: V, repr: Repr, res: Option<SlotId>, join: Block) -> Result<(), BuildError> {
+        if !self.live {
+            self.b.unreachable();
+            return Ok(());
+        }
+        match res {
+            Some(slot) => {
+                let to = (self.b.slot_addr(slot), 0);
+                self.store(v, repr, to)?;
+                self.end_temp_val(v);
+                self.jump(join, &[]);
+            }
+            None => {
+                let arg = self.arg(v, repr)?;
+                self.jump(join, arg.as_slice());
+            }
+        }
+        Ok(())
+    }
+
+    /// The value at a join block after `self.begin(join)`.
+    fn join_value(&mut self, repr: Repr, res: Option<SlotId>) -> V {
+        if !self.live {
+            return V::None;
+        }
+        match res {
+            Some(slot) => V::Place(self.b.slot_addr(slot), 0),
+            None => self.join_param(repr),
+        }
+    }
+
     fn mem(&self, repr: Repr) -> MemAttrs {
         MemAttrs::aligned(self.size_align(repr).1)
     }
@@ -2068,7 +2133,13 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             return Err(malformed("a binding bound twice"));
         }
         let repr = self.local_repr(p)?;
-        self.slots[p.ix()] = Some((Home::At(at.0, at.1), repr));
+        let home = match self.whole_slot(at) {
+            Some(slot) => Home::Slot(slot),
+            None => Home::At(at.0, at.1),
+        };
+        if let Some(entry) = self.slots.get_mut(p.ix()) {
+            *entry = Some((home, repr));
+        }
         self.name_at(at, blaze_flow_lower::identity::Identity::Binding(p));
         Ok(())
     }
@@ -2353,13 +2424,39 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         self.owned[p.ix()] = LocalOwn::Drop(Owned { ty: g, flag, rest });
         self.hold_all(p);
         self.init[p.ix()] = init;
+        if let Some(du) = self.definitely_uninit.get_mut(p.ix()) {
+            *du = !init;
+        }
         self.scope_pats.push(Held::Pat(p));
         Ok(())
+    }
+
+    /// Registers a non-dropping local binding `p`'s slot (if any) in `scope_slots` at the
+    /// current drop scope depth so coroutine lowering ends its storage when the scope closes.
+    pub(in crate::walk) fn track_local_slot(&mut self, p: PatId) {
+        if self.co.is_none() || self.captured_whole(p) {
+            return;
+        }
+        let depth = self.scope_marks.len();
+        if depth == 0 {
+            return;
+        }
+        let Some((home, _)) = self.slots.get(p.ix()).copied().flatten() else { return };
+        let slot = match home {
+            Home::Slot(s) => Some(s),
+            Home::At(v, off) => self.whole_slot((v, off)),
+        };
+        if let Some(s) = slot
+            && self.scope_slots.scan_for(&(depth, s)).is_none()
+        {
+            self.scope_slots.push((depth, s));
+        }
     }
 
     /// Marks binding `p` whose type needs no drop (e.g. `ManuallyDrop<T>`) as owned by this body,
     /// allocating its field-flags word when a dropping part moves out of it (`partial`).
     fn own_kept(&mut self, p: PatId, init: bool) {
+        self.track_local_slot(p);
         let Some(entry) = self.owned.get_mut(p.ix()) else { return };
         if !self.partial.get(p.ix()).copied().unwrap_or(false) {
             *entry = LocalOwn::Kept;
@@ -2373,6 +2470,12 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 slot
             }
         };
+        if self.co.is_some() {
+            let depth = self.scope_marks.len();
+            if depth > 0 && self.scope_slots.scan_for(&(depth, slot)).is_none() {
+                self.scope_slots.push((depth, slot));
+            }
+        }
         let at = self.b.slot_addr(slot);
         let bits = self.b.iconst(Ty::I64, if init { u128::from(u64::MAX) } else { 0 });
         self.b.store(Flags::NONE, bits, at, 0, MemAttrs::aligned(3));
@@ -2542,6 +2645,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
 
     /// Stores `on` into binding `p`'s flag, if it has one.
     fn set_flag(&mut self, p: PatId, on: bool) {
+        if on && let Some(du) = self.definitely_uninit.get_mut(p.ix()) {
+            *du = false;
+        }
         if let Some(Owned { flag: Some(slot), .. }) = self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop) {
             let at = self.b.slot_addr(slot);
             let v = self.b.iconst(Ty::I8, u128::from(on));
@@ -2566,6 +2672,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 }
             }
             Some(slot) => {
+                if self.definitely_uninit.get(p.ix()).copied().unwrap_or(false) {
+                    return Ok(());
+                }
                 let fa = self.b.slot_addr(slot);
                 let f = self.b.load(Ty::I8, Flags::NONE, fa, 0, MemAttrs::aligned(0));
                 let zero = self.b.iconst(Ty::I8, 0);
@@ -2603,6 +2712,43 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
 
     /// A value about to outlive the drops of the bindings from `start` on: an aggregate place is
     /// copied out first, as it may be one of theirs (a field of a binding the drop changes).
+    /// Settles `v` (of `repr`) leaving drop scope `(mark, depth)`: copies an aggregate place into
+    /// a fresh temporary slot when the scope has pending drops (`pending_from(mark)`) or, in a
+    /// coroutine body, when `v` is backed by a slot owned by this closing scope, so the scope's
+    /// local slot can end (`slot_dead`) and the outgoing value lives in a `SlotKind::Temp`.
+    fn settle_scope(&mut self, v: V, repr: Repr, mark: usize, depth: usize) -> Result<V, BuildError> {
+        let in_closing_scope = self.live
+            && self.co.is_some()
+            && matches!(repr, Repr::Agg(_))
+            && match v {
+                V::Place(p, _) => self.value_slot(p).is_some_and(|s| {
+                    self.scope_slots.iter().any(|&(d, x)| d >= depth && x == s)
+                        || self.scope_pats.get(mark..).is_some_and(|held| {
+                            held.iter().any(|&h| match h {
+                                Held::Pat(pat) => match self.slots.get(pat.ix()).copied().flatten() {
+                                    Some((Home::Slot(x), _)) => x == s,
+                                    Some((Home::At(val, off), _)) => self.whole_slot((val, off)) == Some(s),
+                                    None => false,
+                                },
+                                _ => false,
+                            })
+                        })
+                }),
+                _ => false,
+            };
+        if !in_closing_scope && !self.pending_from(mark) {
+            return Ok(v);
+        }
+        match (v, repr) {
+            (V::Place(..), Repr::Agg(_)) => {
+                let at = self.temp(repr);
+                self.store(v, repr, at)?;
+                Ok(V::Place(at.0, at.1))
+            }
+            _ => Ok(v),
+        }
+    }
+
     fn settle(&mut self, v: V, repr: Repr, start: usize) -> Result<V, BuildError> {
         if !self.pending_from(start) {
             return Ok(v);
@@ -2617,11 +2763,40 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
     }
 
+    /// Whether `e` executes unconditionally inside binding `p`'s declaring expression (no
+    /// branch or loop edge between `e` and `self.pat_decl[p]`).
+    fn unconditional_in_decl(&self, p: PatId, e: ExprId) -> bool {
+        let Some(&home) = self.pat_decl.get(p.ix()) else { return false };
+        let mut c = e.0;
+        let limit = self.expr_parent.len();
+        for _ in 0..=limit {
+            if c == home {
+                return true;
+            }
+            let Some(&(up, cond)) = usize::try_from(c).ok().and_then(|ix| self.expr_parent.get(ix)) else {
+                return false;
+            };
+            if cond {
+                return false;
+            }
+            if up == NO_EXPR {
+                return home == NO_EXPR;
+            }
+            c = up;
+        }
+        false
+    }
+
     /// Binding `p` is used by value: a move, when its type needs drop.
     fn moved(&mut self, e: ExprId, p: PatId) -> Result<(), BuildError> {
         let Some(o) = self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop) else { return Ok(()) };
         if o.flag.is_some() {
             self.set_flag(p, false);
+            if self.live && o.rest.is_none() && self.unconditional_in_decl(p, e)
+                && let Some(du) = self.definitely_uninit.get_mut(p.ix())
+            {
+                *du = true;
+            }
             return Ok(());
         }
         if !self.init[p.ix()] && self.live {
@@ -2676,7 +2851,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         // Per expression: its parent and whether the edge to it is conditional.
         let mut parent: Vec<(u32, bool), A> = Vec::with_capacity_in(n, self.alloc);
         parent.resize(n, (NO_EXPR, false));
-        let mut decl: Vec<u32, A> = Vec::with_capacity_in(body.pats.len(), self.alloc);
+        let mut decl: blaze_own::Vec<u32, A> = blaze_own::Vec::with_capacity_in(body.pats.len(), self.alloc);
         decl.resize(body.pats.len(), NO_EXPR);
         let mut kids: Vec<(ExprId, bool), A> = Vec::new_in(self.alloc);
         let mut pats: Vec<PatId, A> = Vec::new_in(self.alloc);
@@ -2860,6 +3035,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         // A field taken out of a struct update's base likewise (walk/moves/struct_update.rs).
         self.scan_update_moves()?;
         self.expr_parent = parent;
+        self.pat_decl = decl;
         self.scan_temp_scopes()
     }
 
@@ -2899,8 +3075,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     }
 
     /// Every binding of pattern `p` is declared by expression `by`.
-    fn mark_decl(&self, p: PatId, by: u32, decl: &mut Vec<u32, A>) -> Result<(), BuildError> {
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
+    fn mark_decl(&self, p: PatId, by: u32, decl: &mut [u32]) -> Result<(), BuildError> {
+        let mut todo: blaze_own::Vec<PatId, A> = blaze_own::Vec::new_in(self.alloc);
         todo.push(p);
         while let Some(p) = todo.pop() {
             *decl.get_mut(p.ix()).ok_or(malformed("a pattern past `pats`"))? = by;
@@ -3645,7 +3821,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let depth = self.scope_marks.len();
                 let mark = self.scope_marks.pop().ok_or(malformed("a block's drop scope out of order"))? as usize;
                 let repr = self.expr_repr(e)?;
-                let v = self.settle(v, repr, mark)?;
+                let v = self.settle_scope(v, repr, mark, depth)?;
                 // Last declared first, each with its unwind ladder (walk/unwind_ladder.rs); each
                 // binding's own drop reads only its own `owned`, so they are cleared after.
                 self.drop_scope(mark, true)?;
@@ -3709,32 +3885,32 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Task::BlockExit(e) => {
                 let v = self.pop()?;
                 let t = self.targets.pop().filter(|t| t.expr == e).ok_or(malformed("a block's break target out of order"))?;
-                let arg = self.arg(v, t.repr)?;
-                self.jump(t.exit, arg.as_slice());
+                self.join_jump(v, t.repr, t.res, t.exit)?;
                 self.begin(t.exit);
-                let v = self.join_param(t.repr);
+                let v = self.join_value(t.repr, t.res);
                 self.push_val(v, None);
             }
             Task::If { expr, then, else_ } => {
                 let c = self.pop()?;
                 let c = self.cond(c)?;
+                let repr = self.expr_repr(expr)?;
+                let res = self.join_slot(repr);
                 let then_block = self.create();
                 let else_block = self.create();
                 let join = self.create();
                 self.br(c, (then_block, &[]), (else_block, &[]));
                 self.begin(then_block);
-                self.work.push(Task::IfThen { expr, else_, else_block, join });
+                self.work.push(Task::IfThen { expr, else_, else_block, join, res });
                 self.work.push(Task::Eval(then));
             }
-            Task::IfThen { expr, else_, else_block, join } => {
+            Task::IfThen { expr, else_, else_block, join, res } => {
                 let v = self.pop()?;
                 let repr = self.expr_repr(expr)?;
-                let arg = self.arg(v, repr)?;
-                self.jump(join, arg.as_slice());
+                self.join_jump(v, repr, res, join)?;
                 self.begin(else_block);
                 match else_ {
                     Some(x) => {
-                        self.work.push(Task::IfElse { expr, join });
+                        self.work.push(Task::IfElse { expr, join, res });
                         self.work.push(Task::Eval(x));
                     }
                     None => {
@@ -3747,13 +3923,12 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     }
                 }
             }
-            Task::IfElse { expr, join } => {
+            Task::IfElse { expr, join, res } => {
                 let v = self.pop()?;
                 let repr = self.expr_repr(expr)?;
-                let arg = self.arg(v, repr)?;
-                self.jump(join, arg.as_slice());
+                self.join_jump(v, repr, res, join)?;
                 self.begin(join);
-                let v = self.join_param(repr);
+                let v = self.join_value(repr, res);
                 self.push_val(v, None);
             }
             Task::LetLink { expr, fail } => self.let_link(expr, fail)?,
@@ -3763,9 +3938,13 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Task::LoopEnd(e) => {
                 let t = self.targets.pop().filter(|t| t.expr == e).ok_or(malformed("a loop's target out of order"))?;
                 let header = t.header.ok_or(malformed("a loop without its head"))?;
-                self.jump(header, &[]);
+                if self.live {
+                    self.jump(header, &[]);
+                } else {
+                    self.b.unreachable();
+                }
                 self.begin(t.exit);
-                let v = self.join_param(t.repr);
+                let v = self.join_value(t.repr, t.res);
                 self.push_val(v, None);
             }
             Task::Break(target, has_value) => {
@@ -3776,11 +3955,28 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     .rev()
                     .find(|t| t.expr == target)
                     .ok_or(malformed("a `break` whose target is not around it"))?;
+                if !self.live {
+                    self.b.unreachable();
+                    self.dead_block();
+                    self.push_val(V::None, None);
+                    return Ok(());
+                }
                 let start = self.scope_start(t.depth);
-                let v = self.settle(v, t.repr, start)?;
-                let arg = self.arg(v, t.repr)?;
-                self.drop_from(start)?;
-                self.jump(t.exit, arg.as_slice());
+                match t.res {
+                    Some(slot) => {
+                        let to = (self.b.slot_addr(slot), 0);
+                        self.store(v, t.repr, to)?;
+                        self.end_temp_val(v);
+                        self.drop_from(start)?;
+                        self.jump(t.exit, &[]);
+                    }
+                    None => {
+                        let v = self.settle(v, t.repr, start)?;
+                        let arg = self.arg(v, t.repr)?;
+                        self.drop_from(start)?;
+                        self.jump(t.exit, arg.as_slice());
+                    }
+                }
                 self.dead_block();
                 self.push_val(V::None, None);
             }
@@ -3806,8 +4002,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Task::ArmEnd { m } => {
                 let v = self.pop()?;
                 let st = self.matches[m as usize];
-                let arg = self.arg(v, st.repr)?;
-                self.jump(st.join, arg.as_slice());
+                self.join_jump(v, st.repr, st.res, st.join)?;
             }
             Task::MatchEnd => {
                 let st = self.matches.pop().ok_or(malformed("a match's state out of order"))?;
@@ -3816,7 +4011,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.unreachable_of(TrapKind::MatchNoArm, Some(st.expr));
                 self.arm_blocks.truncate(st.first as usize);
                 self.begin(st.join);
-                let v = self.join_param(st.repr);
+                let v = self.join_value(st.repr, st.res);
                 self.push_val(v, None);
             }
             Task::Call(e) => self.call(e)?,
@@ -4015,6 +4210,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.stored_part(off, repr)?;
             }
             Task::LitBuilt { l } => self.literal_built(l)?,
+            Task::BuildAgg { expr, l, variant } => self.build_agg(expr, l, variant)?,
             Task::StructBase(e) => self.struct_update_base(e)?,
             Task::InitDefaults(e) => self.init_defaults(e)?,
             // A field of an unsized place: of a struct ending in a slice or `str`, reached
@@ -4834,6 +5030,16 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 if args.len() != len as usize {
                     return Err(malformed("a ctor call whose arguments are not its variant's fields"));
                 }
+                if self.co.is_some() {
+                    self.work.push(Task::BuildAgg { expr: e, l, variant });
+                    for &a in args.iter().rev() {
+                        if let Repr::Agg(_) = self.adjusted_repr(a)? {
+                            self.work.push(Task::ArgCopy(a));
+                        }
+                        self.work.push(Task::Eval(a));
+                    }
+                    return Ok(());
+                }
                 let at = self.temp(repr);
                 self.write_tag(tag, variant, at);
                 // Partly built while its arguments run, owned part by part (walk/val_stack.rs).
@@ -4846,6 +5052,106 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 }
             }
             _ => return Err(malformed("a ctor call of a type held as a scalar")),
+        }
+        Ok(())
+    }
+
+    /// `Task::BuildAgg`: constructs an aggregate ctor call, struct/record literal, tuple, or
+    /// array from its already-evaluated operands on top of `self.vals`.
+    fn build_agg(&mut self, e: ExprId, l: u32, variant: u32) -> Result<(), BuildError> {
+        let repr = Repr::Agg(l);
+        match self.expr(e)? {
+            Expr::Call { args, .. } => {
+                let list = self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?;
+                let n = list.len();
+                let base = self.vals.len().checked_sub(n).ok_or(malformed("a ctor call's arguments missing from the value stack"))?;
+                let slice = self.vals.get(base..).ok_or(malformed("a ctor call's arguments past `vals`"))?;
+                let mut vs = blaze_own::Vec::with_capacity_in(n, self.alloc);
+                vs.extend_from_slice(slice);
+                self.truncate_vals(base);
+                if !self.live {
+                    self.push_val(V::None, None);
+                    return Ok(());
+                }
+                let (first, _, tag) = self.variant_rows(l, variant)?;
+                let first_ix = usize::try_from(first).map_err(|_| malformed("a variant's field index past `usize`"))?;
+                let at = self.temp(repr);
+                self.write_tag(tag, variant, at);
+                for (i, &v) in vs.iter().enumerate() {
+                    let row_ix = first_ix.checked_add(i).ok_or(malformed("a ctor field index overflow"))?;
+                    let &(_, off, frepr) = self.layout_fields.get(row_ix).ok_or(malformed("a ctor field past `layout_fields`"))?;
+                    let off_i32 = i32::try_from(off).map_err(|_| malformed("a field offset past `i32`"))?;
+                    self.store(v, frepr, (at.0, at.1 + off_i32))?;
+                    self.end_temp_val(v);
+                }
+                let owned = self.owned_arg(repr);
+                self.push_val(V::Place(at.0, at.1), owned);
+            }
+            Expr::Struct { fields, .. } | Expr::Record { fields, .. } => {
+                let inits = self.body.field_inits.get(fields.range()).ok_or(malformed("a struct literal's fields past `field_inits`"))?;
+                let n = inits.len();
+                let base = self.vals.len().checked_sub(n).ok_or(malformed("a struct literal's fields missing from the value stack"))?;
+                let slice = self.vals.get(base..).ok_or(malformed("a struct literal's fields past `vals`"))?;
+                let mut vs = blaze_own::Vec::with_capacity_in(n, self.alloc);
+                vs.extend_from_slice(slice);
+                self.truncate_vals(base);
+                if !self.live {
+                    self.push_val(V::None, None);
+                    return Ok(());
+                }
+                let (first, len, tag) = self.variant_rows(l, variant)?;
+                let at = self.temp(repr);
+                self.write_tag(tag, variant, at);
+                for (init, &v) in inits.iter().zip(vs.iter()) {
+                    let row = (first..first.saturating_add(len))
+                        .find(|&i| usize::try_from(i).ok().and_then(|ix| self.layout_fields.get(ix)).is_some_and(|f| f.0 == init.name))
+                        .ok_or(malformed("a struct literal naming a field its struct lacks"))?;
+                    let row_ix = usize::try_from(row).map_err(|_| malformed("a field row past `usize`"))?;
+                    let &(_, off, frepr) = self.layout_fields.get(row_ix).ok_or(malformed("a struct field past `layout_fields`"))?;
+                    let off_i32 = i32::try_from(off).map_err(|_| malformed("a field offset past `i32`"))?;
+                    self.store(v, frepr, (at.0, at.1 + off_i32))?;
+                    self.end_temp_val(v);
+                }
+                let owned = self.owned_arg(repr);
+                self.push_val(V::Place(at.0, at.1), owned);
+            }
+            Expr::Tuple { elems } | Expr::Array { elems } => {
+                let list = self.body.expr_lists.get(elems.range()).ok_or(malformed("a literal's elements past `expr_lists`"))?;
+                let n = list.len();
+                let base = self.vals.len().checked_sub(n).ok_or(malformed("a literal's elements missing from the value stack"))?;
+                let slice = self.vals.get(base..).ok_or(malformed("a literal's elements past `vals`"))?;
+                let mut vs = blaze_own::Vec::with_capacity_in(n, self.alloc);
+                vs.extend_from_slice(slice);
+                self.truncate_vals(base);
+                if !self.live {
+                    self.push_val(V::None, None);
+                    return Ok(());
+                }
+                let l_ix = usize::try_from(l).map_err(|_| malformed("a layout index past `usize`"))?;
+                let shape = self.layouts.get(l_ix).ok_or(malformed("a layout past `layouts`"))?.shape;
+                let at = self.temp(repr);
+                for (i, &v) in vs.iter().enumerate() {
+                    let i_u32 = u32::try_from(i).map_err(|_| malformed("a literal element index past `u32`"))?;
+                    let (off, frepr) = match shape {
+                        Shape::Fields { first, len } if i_u32 < len => {
+                            let row_ix = usize::try_from(first.saturating_add(i_u32)).map_err(|_| malformed("a tuple field index past `usize`"))?;
+                            let &(_, off, frepr) = self.layout_fields.get(row_ix).ok_or(malformed("a tuple field past `layout_fields`"))?;
+                            (off, frepr)
+                        }
+                        Shape::Array { elem, len, stride } if i_u32 < len => {
+                            let off = i_u32.checked_mul(stride).ok_or(malformed("an array element offset overflow"))?;
+                            (off, elem)
+                        }
+                        _ => return Err(malformed("a literal with more elements than its type")),
+                    };
+                    let off_i32 = i32::try_from(off).map_err(|_| malformed("a field offset past `i32`"))?;
+                    self.store(v, frepr, (at.0, at.1 + off_i32))?;
+                    self.end_temp_val(v);
+                }
+                let owned = self.owned_arg(repr);
+                self.push_val(V::Place(at.0, at.1), owned);
+            }
+            _ => return Err(malformed("`BuildAgg` on another expression")),
         }
         Ok(())
     }
@@ -5545,8 +5851,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let depth = self.scope_marks.len() as u32;
                 if self.break_target[e.ix()] {
                     let repr = self.expr_repr(e)?;
+                    let res = self.join_slot(repr);
                     let exit = self.create();
-                    self.targets.push(Target { expr: e, header: None, exit, repr, depth });
+                    self.targets.push(Target { expr: e, header: None, exit, repr, res, depth });
                     self.work.push(Task::BlockExit(e));
                 }
                 // The block's drop scope: its bindings are dropped after its value is made.
@@ -5633,12 +5940,13 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             }
             Expr::Loop { body } => {
                 let repr = self.expr_repr(e)?;
+                let res = self.join_slot(repr);
                 let header = self.create();
                 let exit = self.create();
                 self.jump(header, &[]);
                 self.begin(header);
                 let depth = self.scope_marks.len() as u32;
-                self.targets.push(Target { expr: e, header: Some(header), exit, repr, depth });
+                self.targets.push(Target { expr: e, header: Some(header), exit, repr, res, depth });
                 self.work.push(Task::LoopEnd(e));
                 self.work.push(Task::Discard);
                 self.work.push(Task::Eval(body));
@@ -5894,6 +6202,19 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         if inits.len() + taken != named {
                             return Err(malformed("a struct literal that does not name every field, or a union literal not one"));
                         }
+                        if self.co.is_some() {
+                            if defaults {
+                                self.work.push(Task::InitDefaults(e));
+                            }
+                            self.work.push(Task::BuildAgg { expr: e, l, variant });
+                            for init in inits.iter().rev() {
+                                if let Repr::Agg(_) = self.adjusted_repr(init.expr)? {
+                                    self.work.push(Task::ArgCopy(init.expr));
+                                }
+                                self.work.push(Task::Eval(init.expr));
+                            }
+                            return Ok(());
+                        }
                         let at = self.temp(repr);
                         self.write_tag(tag, variant, at);
                         // Partly built while its fields run, owned part by part
@@ -5930,6 +6251,16 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         }
                     }
                     Repr::Agg(l) => {
+                        if self.co.is_some() {
+                            self.work.push(Task::BuildAgg { expr: e, l, variant: 0 });
+                            for &x in list.iter().rev() {
+                                if let Repr::Agg(_) = self.adjusted_repr(x)? {
+                                    self.work.push(Task::ArgCopy(x));
+                                }
+                                self.work.push(Task::Eval(x));
+                            }
+                            return Ok(());
+                        }
                         let shape = self.layouts[l as usize].shape;
                         let at = self.temp(repr);
                         // Partly built while its elements run, owned element by element
@@ -6828,7 +7159,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             }
             self.switch(x, default, &cases);
         }
-        self.matches.push(MatchState { expr: e, scrutinee: x, width, of_enum, join, repr, first, arms: n, guarded, by_ref, owner, tested: None });
+        let res = self.join_slot(repr);
+        self.matches.push(MatchState { expr: e, scrutinee: x, width, of_enum, join, repr, res, first, arms: n, guarded, by_ref, owner, tested: None });
         let m = (self.matches.len() - 1) as u32;
         self.work.push(Task::MatchEnd);
         for i in (0..n).rev() {

@@ -59,7 +59,7 @@ enum ResidualTest {
 #[derive(Clone, Copy)]
 pub(super) struct At {
     /// The place; of an unsized type (`[T]`, `str`), the memory of the wide pointer to it.
-    at: (Value, i32),
+    pub(super) at: (Value, i32),
     /// Its ground type.
     g: PTy,
     /// The default binding mode is `ref`: a reference was followed by a non-reference pattern.
@@ -264,6 +264,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let to = self.arm_blocks[first as usize];
         self.jump(to, &[]);
         let tested = Some(At { at, g, by_ref: false, copy });
+        let res = self.join_slot(repr);
         self.matches.push(MatchState {
             expr: e,
             scrutinee: at.0,
@@ -271,6 +272,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             of_enum: None,
             join,
             repr,
+            res,
             first,
             arms: n,
             guarded: true,
@@ -692,6 +694,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                         self.arm_effect(super::moves::Pending::Own(target), hold)?;
                     } else if !by_ref {
                         self.own_kept(target, true);
+                    } else {
+                        self.track_local_slot(target);
                     }
                     if let Some(s) = sub {
                         todo.push((s, at));

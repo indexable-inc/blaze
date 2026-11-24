@@ -39,7 +39,7 @@ pub(super) struct Laid {
 
 impl Laid {
     /// `saved` laid after an upvars' tuple of `env`, with `points` suspensions.
-    fn new(env: (u64, u8), saved: &[(Identity, (u64, u8), bool)], points: u32, plant: StatePlant) -> Laid {
+    pub(super) fn new(env: (u64, u8), saved: &[(Identity, (u64, u8), bool)], points: u32, plant: StatePlant) -> Laid {
         let sizes: StdVec<(u64, u8)> = saved.iter().map(|s| s.1).collect();
         let flags: StdVec<bool> = saved.iter().map(|s| s.2).collect();
         let l = lay_state(env, &sizes, &flags, points, Alloc::global(), Global).unwrap_or_else(|e| panic!("lay_state: {e}"));
@@ -147,4 +147,136 @@ fn lay_state_with_upvar_flags_places_flags_inside_region() {
     assert_eq!(names.get(Identity::Binding(PatId(0))).and_then(|r| r.flag), Some(laid.upvar_flag[0]));
     assert_eq!(names.get(Identity::Binding(PatId(1))).and_then(|r| r.flag), Some(laid.upvar_flag[1]));
     assert_ne!(laid.upvar_flag[0], laid.upvar_flag[1]);
+}
+
+/// A `bool` literal expression (`Expr::Lit(Lit::Bool(v))`).
+fn bool_lit(b: &mut blaze_typeck::fixture::Bb, v: bool) -> ExprId {
+    let e = b.bool();
+    b.exprs[e.ix()] = blaze_typeck::Expr::Lit(blaze_typeck::Lit::Bool(v));
+    e
+}
+
+/// `if cond { then } else { else_ }`.
+fn if_expr(b: &mut blaze_typeck::fixture::Bb, cond: ExprId, then: ExprId, else_: Option<ExprId>) -> ExprId {
+    let e = b.int(None);
+    b.exprs[e.ix()] = blaze_typeck::Expr::If { cond, then, else_ };
+    e
+}
+
+/// `lhs = rhs`.
+fn assign_expr(b: &mut blaze_typeck::fixture::Bb, lhs: ExprId, rhs: ExprId) -> ExprId {
+    let e = b.int(None);
+    b.exprs[e.ix()] = blaze_typeck::Expr::Assign { lhs, rhs };
+    e
+}
+
+/// `base.<index>` (tuple field).
+fn tuple_field(b: &mut blaze_typeck::fixture::Bb, base: ExprId, index: u32) -> ExprId {
+    let e = b.int(None);
+    b.exprs[e.ix()] = blaze_typeck::Expr::TupleField { base, index };
+    e
+}
+
+/// A `Drop` local conditionally reassigned (giving it a dynamic drop flag) and then
+/// unconditionally moved out before `.await` must end its slot before suspension so a laid state
+/// that saves only the `.await`'s future builds cleanly and drops the local once.
+#[test]
+fn moved_flagged_local_before_await_ends_its_slot() {
+    let mut w = open_world();
+    let item = async_fn(&mut w, "moved_before_await", "moved_before_await_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let lits = StdVec::new();
+    // let mut d = mk_d();
+    let d = b.bind("d");
+    let mk0 = b.path(&["mk_d"]);
+    let call_mk0 = b.call(mk0, &[]);
+    let s0 = b.let_(d, None, call_mk0);
+    // if false { d = mk_d(); }
+    let cond = bool_lit(&mut b, false);
+    let dl0 = b.local(d);
+    let mk1 = b.path(&["mk_d"]);
+    let call_mk1 = b.call(mk1, &[]);
+    let assign = assign_expr(&mut b, dl0, call_mk1);
+    let s_assign = b.semi(assign);
+    let then_blk = b.block(&[s_assign], None);
+    let if_e = if_expr(&mut b, cond, then_blk, None);
+    let s1 = b.semi(if_e);
+    // consume_d(d);
+    let consume = b.path(&["consume_d"]);
+    let dl1 = b.local(d);
+    let call_consume = b.call(consume, &[dl1]);
+    let s2 = b.semi(call_consume);
+    // twice().await
+    let awaited = call_await(&mut b, "twice");
+    let body = b.block(&[s0, s1, s2], Some(awaited));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item, b: &b, root, lits: &lits }];
+    // Only the `.await`'s future is saved across the suspension; neither `d` nor its drop flag is saved.
+    let saved = [(Identity::Temp(awaited, Role::Awaitee), (16, 3), false)];
+    let laid = Laid::new((0, 0), &saved, 1, StatePlant::None);
+    let ran = run_laid(&w, &progs, Script::Complete, Some(&laid))
+        .unwrap_or_else(|e| panic!("moved flagged local before await failed in laid state: {e}"));
+    assert_eq!(ran, Ran { value: 2, polls: 3, drops: 1, made: 1 });
+}
+
+/// An `if` returning a `Copy` aggregate before `.await` (whose join uses a shared slot and whose
+/// inner local settles out) plus a tuple literal wrapping `.await` `(twice().await, 37)` must not
+/// require unnamed slots across the suspension in a laid state.
+#[test]
+fn aggregate_literal_around_await_and_if_join_before_await() {
+    let mut w = open_world();
+    let item = async_fn(&mut w, "agg_and_join", "agg_and_join_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let mut lits = StdVec::new();
+    // let pre: (u64, u64) = if true { let inner = (1, 2); inner } else { (3, 4) };
+    let cond = bool_lit(&mut b, true);
+    let one = lit(&mut b, &mut lits, 1);
+    let two_v = lit(&mut b, &mut lits, 2);
+    let t_in = b.tuple(&[one, two_v]);
+    let inner = b.bind("inner");
+    let s_inner = b.let_(inner, None, t_in);
+    let inner_l = b.local(inner);
+    let then_blk = b.block(&[s_inner], Some(inner_l));
+    let three = lit(&mut b, &mut lits, 3);
+    let four = lit(&mut b, &mut lits, 4);
+    let t_else = b.tuple(&[three, four]);
+    let else_blk = b.block(&[], Some(t_else));
+    let if_agg = if_expr(&mut b, cond, then_blk, Some(else_blk));
+    let pre = b.bind("pre");
+    let s0 = b.let_(pre, None, if_agg);
+    // let base: u64 = pre.0 + pre.1;  (pre is dead before `.await`; only `base` crosses)
+    let p0 = b.local(pre);
+    let f0 = tuple_field(&mut b, p0, 0);
+    let p1 = b.local(pre);
+    let f1 = tuple_field(&mut b, p1, 1);
+    let sum0 = bin(&mut b, BinOp::Add, f0, f1);
+    let (s1, base) = let_u64(&mut b, "base", sum0);
+    // let pair = (twice().await, 37);
+    let awaited = call_await(&mut b, "twice");
+    let k37 = lit(&mut b, &mut lits, 37);
+    let pair_e = b.tuple(&[awaited, k37]);
+    let pair = b.bind("pair");
+    let s2 = b.let_(pair, None, pair_e);
+    // base + pair.0 + pair.1 == 3 + 2 + 37 == 42
+    let bl = b.local(base);
+    let pl0 = b.local(pair);
+    let pf0 = tuple_field(&mut b, pl0, 0);
+    let pl1 = b.local(pair);
+    let pf1 = tuple_field(&mut b, pl1, 1);
+    let s_ab = bin(&mut b, BinOp::Add, bl, pf0);
+    let total = bin(&mut b, BinOp::Add, s_ab, pf1);
+    let body = b.block(&[s0, s1, s2], Some(total));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item, b: &b, root, lits: &lits }];
+    // Only `base` and `awaited` cross the suspension — neither `pre`, `inner`, `if_agg`, nor `pair_e`!
+    let saved = [
+        (Identity::Binding(base), (8, 3), false),
+        (Identity::Temp(awaited, Role::Awaitee), (16, 3), false),
+    ];
+    let laid = Laid::new((0, 0), &saved, 1, StatePlant::None);
+    let ran = run_laid(&w, &progs, Script::Complete, Some(&laid))
+        .unwrap_or_else(|e| panic!("agg literal / if join around await failed in laid state: {e}"));
+    assert_eq!(ran, Ran { value: 42, polls: 3, drops: 0, made: 1 });
 }
