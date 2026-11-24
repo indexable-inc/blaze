@@ -475,19 +475,19 @@ pub fn lz77_scan_default<A: Allocator>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Vec;
-    use std::alloc::Global;
+    use crate::{Inline, Vec};
 
     #[test]
     fn fast_and_default_find_expected_matches() {
-        let mut data = Vec::new_in(Global);
+        let heap: Inline<16384> = Inline::new();
+        let mut data = Vec::new_in(&heap);
         for _ in 0..8 {
             data.try_extend_from_slice(b"fn blaze_fast_lz77_test_pattern(x: u64) -> u64 { x + 1 }\n")
                 .unwrap();
         }
         let mut ht_fast = [0u32; LZ77_FAST_HASH_SIZE];
-        let mut lits = Vec::new_in(Global);
-        let mut seqs = Vec::new_in(Global);
+        let mut lits = Vec::new_in(&heap);
+        let mut seqs = Vec::new_in(&heap);
         let mut rep = [1usize, 4, 8];
         lz77_scan_fast(
             data.as_slice(),

@@ -1,5 +1,6 @@
 use std::alloc::Global;
-use std::vec::Vec;
+
+use blaze_own::Inline;
 
 use crate::flow::{BorrowKind, Bound, Flow, FlowBuilder, Loan, Operand, Place, Point, Span, Stmt};
 use crate::record::Plant;
@@ -58,15 +59,19 @@ fn generated_logging_bodies_stay_within_quadratic_steps() {
         let mut meter = Meter::new(bound.min(LIMIT));
         let found = solve(BODY, &flow, &facts, Plant::None, Global, &mut meter)
             .expect("short consecutive loans fit the quadratic work bound");
-        let expected: Vec<_> = (0..n)
-            .map(|i| BorrowFinding::Invalidated {
-                at: Point::start(Stmt(3 * i + 1)),
-                loan: Loan(i),
-                span: SPAN,
-                returned: false,
-            })
-            .collect();
-        assert_eq!(found.as_slice(), expected.as_slice());
+        assert_eq!(found.len(), usize::try_from(n).expect("u32 fits in usize"));
+        for (i, item) in found.iter().enumerate() {
+            let i = u32::try_from(i).expect("index fits in u32");
+            assert_eq!(
+                *item,
+                BorrowFinding::Invalidated {
+                    at: Point::start(Stmt(3 * i + 1)),
+                    loan: Loan(i),
+                    span: SPAN,
+                    returned: false,
+                }
+            );
+        }
         assert!(meter.used() > 0 && meter.used() <= bound);
         std::println!(
             "N={n} steps={} old_cells={} bound={bound} findings={n}",
@@ -177,17 +182,25 @@ fn later_return_marks_invalidated_loans_on_both_sides_of_word_boundary() {
         .expect("all loans reach the return origin");
     let oracle = tier_two_oracle(&flow, &facts, Plant::None, Global).expect("65 loans reach the return origin");
     assert_eq!(found.as_slice(), oracle.as_slice());
-    let expected: Vec<_> = (0..65)
-        .map(|l| BorrowFinding::Invalidated {
-            at: Point::start(Stmt(65)), loan: Loan(l), span: SPAN, returned: true,
-        })
-        .collect();
-    assert_eq!(found.as_slice(), expected.as_slice());
+    assert_eq!(found.len(), 65);
+    for (l, item) in found.iter().enumerate() {
+        let l = u32::try_from(l).expect("index fits in u32");
+        assert_eq!(
+            *item,
+            BorrowFinding::Invalidated {
+                at: Point::start(Stmt(65)),
+                loan: Loan(l),
+                span: SPAN,
+                returned: true,
+            }
+        );
+    }
 }
 
 #[test]
 fn candidates_keep_an_unloaned_placeholder_bridge_and_drop_an_unobservable_loan() {
-    let mut b = FlowBuilder::new_in(4, 1, Global);
+    let heap: Inline<65536> = Inline::new();
+    let mut b = FlowBuilder::new_in(4, 1, &heap);
     let held = b.origin(false);
     let unused = b.origin(false);
     let a = b.origin(true);
@@ -207,11 +220,11 @@ fn candidates_keep_an_unloaned_placeholder_bridge_and_drop_an_unobservable_loan(
     b.subset(bridge, z);
     b.subset(a, leaf);
     let flow = b.finish().expect("terminated block");
-    let facts = facts(&flow, Global).unwrap();
-    let keep = super::filter::candidates(&flow, &facts, Plant::None, &mut Meter::new(LIMIT), Global).unwrap();
+    let facts = facts(&flow, &heap).unwrap();
+    let keep = super::filter::candidates(&flow, &facts, Plant::None, &mut Meter::new(LIMIT), &heap).unwrap();
     assert_eq!(keep.loans.as_slice(), &[true, false]);
     assert_eq!(keep.origins.as_slice(), &[true, false, true, true, true, false]);
-    let found = super::tier_two(&flow, &facts, Plant::None, Global).unwrap();
+    let found = super::tier_two(&flow, &facts, Plant::None, &heap).unwrap();
     assert_eq!(found.as_slice(), &[
         BorrowFinding::Invalidated { at: Point::start(write), loan: Loan(0), span: SPAN, returned: false },
         BorrowFinding::UnprovenOutlives { at: Point::mid(end), from: a, into: z, span: SPAN },

@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-318 invariants, 44 refinements, 12 reference models.
-By level: 259 tested, 87 simulated, 1 model-checked, 15 proved.
+318 invariants, 43 refinements, 12 reference models.
+By level: 258 tested, 87 simulated, 1 model-checked, 15 proved.
 
 ## Invariants
 
@@ -161,6 +161,11 @@ By level: 259 tested, 87 simulated, 1 model-checked, 15 proved.
   Controls: `a_file_that_lost_what_was_not_synced`, `a_file_that_lost_what_was_synced`, `a_later_append_kept_without_what_was_ordered`.
 - **`no_unpark_is_lost_on_any_schedule`** *tested* (`crates/blaze-core/src/world/threads.rs`): on every schedule of a park and an unpark of one word, no unpark is lost: where the unparker returned the parker is not asleep with no wake coming; where both returned, the park took the token and the word is `EMPTY`, or it timed out without one and the token waits in the word; and a park with no time limit returns only with a token. The statement of `no_unpark_is_lost` (Tests/ThreadsPark.lean), run on drawn schedules. Its control is `the_oracle_catches_a_lost_wakeup_in_a_drawn_schedule`.
   Controls: `a_lost_wakeup_in_a_drawn_schedule`.
+
+### blaze-ecs
+
+- **`property_world_matches_reference_model_and_bijection`** *tested* (`crates/blaze-ecs/src/tests.rs`): any sequence of spawns, despawns, component sets/removals, exclusive `ChildOf` reparenting, and `IsA` inheritance links preserves exact entity liveness, direct and inherited component values, `ChildOf` exclusivity, and table-row bijection against the reference model.
+  Controls: `stale_entity_row_update`.
 
 ### blaze-emit
 
@@ -481,8 +486,6 @@ By level: 259 tested, 87 simulated, 1 model-checked, 15 proved.
   Controls: `pointer_loop_miss`.
 - **`property_dotenv_round_trip`** *tested* (`crates/blaze-std/src/dotenv.rs`): dotenv formatting and parsing round-trip arbitrary keys and escaped values without loss.
   Controls: `skipped_escapes`.
-- **`property_world_matches_reference_model_and_bijection`** *tested* (`crates/blaze-std/src/ecs/tests.rs`): any sequence of spawns, despawns, component sets/removals, exclusive `ChildOf` reparenting, and `IsA` inheritance links preserves exact entity liveness, direct and inherited component values, `ChildOf` exclusivity, and table-row bijection against the reference model.
-  Controls: `stale_entity_row_update`.
 - **`property_hex_round_trip`** *tested* (`crates/blaze-std/src/hex.rs`): hex encoding and decoding round-trip arbitrary byte slices exactly.
   Controls: `swapped_nibbles`.
 - **`property_escape_round_trip_and_sanitizer_never_leaks_xss`** *tested* (`crates/blaze-std/src/html.rs`): HTML entity escaping round-trips arbitrary UTF-8 and `sanitize_html_in` never emits `<script`, `onerror=`, or `javascript:`.
@@ -796,11 +799,6 @@ By level: 259 tested, 87 simulated, 1 model-checked, 15 proved.
   Controls: `double_ownership`, `publication_in_completion_order`, `a_speculative_entry`, `a_lost_refused_waiter`, `uncancelled_speculation`.
 - **`the_header_index_answers_as_the_pages_across_both_writers`** *simulated* (`crates/blaze-engine/src/headers_sim.rs`): across both phase and ready commits and crashes, the producer header index answers identically to reading the pages directly and never serves stale shards. Expected: "test headers_sim::the_header_index_answers_as_the_pages_across_both_writers ... ok".
   Controls: `a_ready_commit_that_keeps_the_shards`.
-
-### blaze-flow-lower
-
-- **`the_oracle_sees_a_closure_bodys_calls`** *tested* (`crates/blaze-flow-lower/src/oracle.rs`): lowering under the one-rule call lowering agrees call-site by call-site (including inside closure bodies) with the reference lowering, catching any dropped constraint. A CLOSURE'S BODY IS COMPARED: the planted control (one subset dropped per call) is caught at the call inside the closure under (b); the real one rule there has no finding.
-  Controls: `a_dropped_constraint`.
 
 ### blaze-format-core
 

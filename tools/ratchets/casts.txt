@@ -19,7 +19,7 @@ blaze-body-drops	16
 blaze-body-eval	57
 blaze-body-flow	24
 blaze-body-lower	24
-blaze-borrow	25
+blaze-borrow	21
 blaze-bstd-convert	9
 blaze-build	754
 blaze-build-script	109
@@ -55,8 +55,8 @@ blaze-export	425
 blaze-facts	12
 blaze-fetch	213
 blaze-file-items	94
-blaze-flow	144
-blaze-flow-lower	453
+blaze-flow	142
+blaze-flow-lower	443
 blaze-fmt	62
 blaze-format	44
 blaze-format-core	95
@@ -74,14 +74,14 @@ blaze-inproc	70
 blaze-int	7
 blaze-keyed	677
 blaze-kit	2
-blaze-ladder	1220
+blaze-ladder	1219
 blaze-launch	174
 blaze-launch-rt	458
 blaze-launcher	6
 blaze-lint	187
 blaze-lint-defs	21
 blaze-lir	1444
-blaze-lower	306
+blaze-lower	304
 blaze-malloc	48
 blaze-manifest	6
 blaze-math	15
@@ -127,7 +127,7 @@ blaze-tier	109
 blaze-toolchain	24
 blaze-trace	53
 blaze-ty	2
-blaze-typeck	497
+blaze-typeck	495
 blaze-unit-graph	65
 blaze-units	2
 blaze-url	3

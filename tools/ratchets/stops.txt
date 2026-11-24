@@ -15,7 +15,7 @@ blaze-base64	24
 blaze-bench	7
 blaze-blake3	413
 blaze-bstd-convert	109
-blaze-build	536
+blaze-build	534
 blaze-build-script	246
 blaze-bytes	3
 blaze-c	325
@@ -51,8 +51,8 @@ blaze-expand	469
 blaze-export	239
 blaze-fetch	175
 blaze-file-items	277
-blaze-flow	284
-blaze-flow-lower	286
+blaze-flow	282
+blaze-flow-lower	270
 blaze-fmt	352
 blaze-format	24
 blaze-format-core	103
@@ -73,7 +73,7 @@ blaze-int	41
 blaze-json	32
 blaze-keyed	588
 blaze-kit	167
-blaze-ladder	1159
+blaze-ladder	1142
 blaze-launch	83
 blaze-launch-rt	219
 blaze-launcher	2
@@ -143,7 +143,7 @@ blaze-toml	122
 blaze-toolchain	104
 blaze-trace	56
 blaze-ty	239
-blaze-typeck	507
+blaze-typeck	505
 blaze-unicode	7
 blaze-unit-graph	77
 blaze-units	7

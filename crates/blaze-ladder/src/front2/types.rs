@@ -2585,7 +2585,7 @@ impl<'c> Captures<'c> {
 pub struct ContainerParamBound {
     pub param: u32,
     pub trait_: ItemKey,
-    pub regions: Vec<Region, Alloc<'static>>,
+    pub regions: blaze_own::Vec<Region, Alloc<'static>>,
 }
 
 /// What a container's member's region walk is given for `Self` and for bounds on the container's
@@ -2623,7 +2623,7 @@ pub struct RegionSink<'s> {
     slots: Vec<Slot, Alloc<'s>>,
     frags: Vec<Frag, Alloc<'s>>,
     /// Each elided lifetime's site, by its id.
-    elided: Vec<Range, Alloc<'s>>,
+    elided: blaze_own::Vec<Range, Alloc<'s>>,
     /// `Self`'s regions where `Self` is a type (an impl's self type, numbered as its members'
     /// container group); `None` where they are not known.
     self_slots: Option<Vec<Region, Alloc<'s>>>,
@@ -2633,13 +2633,13 @@ pub struct RegionSink<'s> {
     impl_trait: Option<Vec<Region, Alloc<'s>>>,
     /// The container's non-higher-ranked trait bounds on its type parameters: `(param, trait_,
     /// start, len)` indexing `param_bound_regions`.
-    param_bounds: Vec<(u32, ItemKey, u32, u32), Alloc<'s>>,
-    param_bound_regions: Vec<Region, Alloc<'s>>,
+    param_bounds: blaze_own::Vec<(u32, ItemKey, u32, u32), Alloc<'s>>,
+    param_bound_regions: blaze_own::Vec<Region, Alloc<'s>>,
     /// The captured lifetime count of each opaque type of the item being made.
-    opaques: Vec<(ItemKey, u32), Alloc<'s>>,
+    opaques: blaze_own::Vec<(ItemKey, u32), Alloc<'s>>,
     /// The regions each of `opaques` captures, one run per opaque ([`Captures`]).
-    captured: Vec<Region, Alloc<'s>>,
-    scratch: Vec<Slot, Alloc<'s>>,
+    captured: blaze_own::Vec<Region, Alloc<'s>>,
+    scratch: blaze_own::Vec<Slot, Alloc<'s>>,
     refused: Option<RegionRefusal>,
     /// The part of the signature being laid ([`RegionSink::set_part`]).
     part: SigPart,
@@ -2653,14 +2653,14 @@ impl<'s> RegionSink<'s> {
             alloc,
             slots: Vec::new_in(alloc),
             frags: Vec::new_in(alloc),
-            elided: Vec::new_in(alloc),
+            elided: blaze_own::Vec::new_in(alloc),
             self_slots: None,
             impl_trait: None,
-            param_bounds: Vec::new_in(alloc),
-            param_bound_regions: Vec::new_in(alloc),
-            opaques: Vec::new_in(alloc),
-            captured: Vec::new_in(alloc),
-            scratch: Vec::new_in(alloc),
+            param_bounds: blaze_own::Vec::new_in(alloc),
+            param_bound_regions: blaze_own::Vec::new_in(alloc),
+            opaques: blaze_own::Vec::new_in(alloc),
+            captured: blaze_own::Vec::new_in(alloc),
+            scratch: blaze_own::Vec::new_in(alloc),
             refused: None,
             part: SigPart::Whole,
             refused_part: SigPart::Whole,
@@ -2699,9 +2699,10 @@ impl<'s> RegionSink<'s> {
         self.param_bounds.clear();
         self.param_bound_regions.clear();
         for b in bounds {
-            let start = self.param_bound_regions.len() as u32;
+            let start = u32::try_from(self.param_bound_regions.len()).unwrap_or(u32::MAX);
             self.param_bound_regions.extend_from_slice(&b.regions);
-            self.param_bounds.push((b.param, b.trait_, start, b.regions.len() as u32));
+            let len = u32::try_from(b.regions.len()).unwrap_or(u32::MAX);
+            self.param_bounds.push((b.param, b.trait_, start, len));
         }
     }
 
@@ -2770,12 +2771,12 @@ impl<'s> RegionSink<'s> {
 
     /// The site of the elided lifetime `id`.
     pub fn elided_at(&self, id: u32) -> Option<Range> {
-        self.elided.get(id as usize).copied()
+        usize::try_from(id).ok().and_then(|i| self.elided.get(i).copied())
     }
 
     /// A new elided lifetime at `at`.
     pub fn new_elided(&mut self, at: Range) -> SlotKind {
-        let id = self.elided.len() as u32;
+        let id = u32::try_from(self.elided.len()).unwrap_or(u32::MAX);
         self.elided.push(at);
         SlotKind::Elided(id)
     }
@@ -3921,7 +3922,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 let Some((p, _)) = super::dyn_ty::dyn_bound(v, lf::Bound::decode(b)?, r)? else { continue };
                 let (abs, texts, _, pr) = path_texts_of(v, p, true)?;
                 if let Ok(Bounded::Trait(key)) = self.bound_target(env, v, p, abs, &texts, pr) {
-                    let mut work: Vec<LibKey, Alloc<'_>> = Vec::new_in(alloc);
+                    let mut work: blaze_own::Vec<LibKey, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
                     work.push(key);
                     let mut next = 0usize;
                     while next < work.len() && work.len() < 64 {
@@ -3933,7 +3934,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                         }
                         if let Some(supers) = self.heads.trait_supers(k) {
                             for &(sk, _) in supers {
-                                if !work.contains(&sk) {
+                                if work.scan_for(&sk).is_none() {
                                     work.push(sk);
                                 }
                             }
