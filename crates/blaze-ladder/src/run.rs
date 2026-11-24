@@ -2397,7 +2397,8 @@ fn build_from<P: FrontEnd>(
         } else {
             blaze_build::closure_method_key_args(instance, ground, alloc).map_err(fail)?
         };
-        blaze_build::instance_key_normalized(code, args, from, ground, facts, alloc).map_err(fail)
+        let own = program.function(c).body.map(|(b, _)| b.view(program.body_types(c)));
+        blaze_build::instance_key_normalized_own(code, args, from, own.as_ref(), ground, facts, alloc).map_err(fail)
     };
     let key_of = |program: &P, c: usize, instance: Instance, ground: &mut PortableTys<'_>, facts: &dyn LayoutFacts| key_with(program, program.code_of(c), c, instance, ground, facts);
     // Slot `n` is the `n`th instance reached; `keys[n]` its key, by which instances are told apart.
@@ -2895,6 +2896,69 @@ fn build_from<P: FrontEnd>(
         args.extend_from_slice(ground.view().list(owner_args).map_err(malformed)?);
         // A coroutine's function: its instance is built once for all three (here, when no
         // body asked for its state before), and this slot takes its own.
+        let mut pull_coro_constants = |program_mut: &mut P,
+                                       checked_bodies: &mut Bodies<'_>,
+                                       ground: &mut PortableTys<'_>,
+                                       layouts: &mut Layouts<Alloc<'static>>,
+                                       missing: &[(ItemKey, List)],
+                                       const_needs: &mut crate::front2::const_at::Needs<_>|
+         -> Result<Option<ItemKey>, RunError> {
+            let mut owner_args_buf: blaze_own::AVec<'_, PTy> = blaze_own::AVec::new_in(alloc);
+            for &(owner, owner_args_list) in missing {
+                let Some(ci) = program_mut.fn_index(owner) else {
+                    return Ok(Some(owner));
+                };
+                let (Some((obody, _)), Some(odone)) = (program_mut.function(ci).body, checked_bodies.checked.get(ci).and_then(Option::as_ref)) else {
+                    continue;
+                };
+                owner_args_buf.clear();
+                owner_args_buf.extend_from_slice(
+                    ground
+                        .view()
+                        .list(owner_args_list)
+                        .map_err(|_| RunError::Build { function: program_mut.function(ci).named(), error: BuildError::Malformed { what: "a coroutine owner's arguments past the ground table" }, range: None })?,
+                );
+                let oview = obody.view(program_mut.body_types(ci));
+                let ofacts = FrontAdts(&*program_mut, ci, &consts, &langs, checked_bodies);
+                crate::front2::const_at::needs_of(&oview, odone, &owner_args_buf, ground, &ofacts, alloc, const_needs)
+                    .map_err(|error| RunError::Build { function: program_mut.function(ci).named(), error, range: None })?;
+                if const_needs.is_empty() {
+                    continue;
+                }
+                let mut need_tys: blaze_own::AVec<'_, PTy> = blaze_own::AVec::new_in(alloc);
+                for (_, a) in const_needs.iter() {
+                    need_tys.extend_from_slice(a);
+                }
+                need_tys.sort_unstable();
+                need_tys.dedup();
+                let mut laid_for_const: blaze_own::AVec<'static, blaze_build::CoroutineOf> = blaze_own::AVec::new_in(alloc);
+                if !need_tys.is_empty() {
+                    let ofacts = FrontAdts(&*program_mut, ci, &consts, &langs, checked_bodies);
+                    let coro_roots = crate::front2::coroutine_needs::held_coroutines(ground, &need_tys, &ofacts, alloc)
+                        .map_err(|error| RunError::Build { function: program_mut.function(ci).named(), error, range: None })?;
+                    if !coro_roots.is_empty() {
+                        match lay_states::lay_only(&*program_mut, &consts, &langs, checked_bodies, ground, layouts, ci, &coro_roots, alloc)? {
+                            lay_states::LaidOnly::Done(recorded) => laid_for_const = recorded,
+                            lay_states::LaidOnly::Unchecked(u) => return Ok(Some(u)),
+                        }
+                    }
+                }
+                let pull_res = crate::front2::const_at::pull(
+                    &mut *program_mut,
+                    const_needs,
+                    ground.view(),
+                    &mut checked_bodies.const_at,
+                    crate::front2::const_at::BuildFacts::new(&checked_bodies.closures, &checked_bodies.coroutines),
+                );
+                lay_states::forget_laid_in(&checked_bodies.coroutines, &laid_for_const, ground.view());
+                if let Err(refusal) = pull_res {
+                    let item = refusal.need.item();
+                    let path = program_mut.item_named(item);
+                    return Err(RunError::ConstAt { function: program_mut.function(ci).named(), refusal, path });
+                }
+            }
+            Ok(None)
+        };
         let from_coroutine = match coroutine {
             None => None,
             Some((of, part)) => {
@@ -2902,11 +2966,31 @@ fn build_from<P: FrontEnd>(
                 if find(&coroutine_stash).is_none() {
                     // Its state laid out from types, with every state it holds, and each built
                     // into its state (run/lay_states.rs).
-                    let laid = lay_states::lay_and_build(&*program, &consts, &langs, &checked_bodies, &mut ground, &mut layouts, &mut coroutine_stash, i, &[of], alloc);
-                    match laid {
-                        Ok(lay_states::Lay::Done) => {}
-                        Ok(lay_states::Lay::Unchecked(owner)) => {
-                            filed(&mut survey, lay_states::unchecked_owner(&*program, i, owner))?;
+                    let mut rounds = 0usize;
+                    let laid_res: Result<Option<ItemKey>, RunError> = loop {
+                        let laid = lay_states::lay_and_build(&*program_mut, &consts, &langs, &checked_bodies, &mut ground, &mut layouts, &mut coroutine_stash, i, &[of], false, alloc);
+                        match laid {
+                            Ok(lay_states::Lay::Done) => break Ok(None),
+                            Ok(lay_states::Lay::Unchecked(owner)) => break Ok(Some(owner)),
+                            Ok(lay_states::Lay::PullConstants(missing)) => {
+                                rounds += 1;
+                                if rounds > crate::front2::coroutine_needs::MOST_HELD {
+                                    let error = BuildError::UnsupportedSig { what: "an instance whose coroutine states needed more than 4096 constant pull rounds" };
+                                    break Err(RunError::Build { function: program_mut.function(i).named(), error, range: None });
+                                }
+                                match pull_coro_constants(program_mut, &mut checked_bodies, &mut ground, &mut layouts, &missing, &mut const_needs) {
+                                    Ok(None) => {}
+                                    Ok(Some(owner)) => break Ok(Some(owner)),
+                                    Err(e) => break Err(e),
+                                }
+                            }
+                            Err(e) => break Err(e),
+                        }
+                    };
+                    match laid_res {
+                        Ok(None) => {}
+                        Ok(Some(owner)) => {
+                            filed(&mut survey, lay_states::unchecked_owner(&*program_mut, i, owner))?;
                             continue;
                         }
                         Err(e) => step_refused!(e),
@@ -2918,7 +3002,7 @@ fn build_from<P: FrontEnd>(
                 };
                 let Some(taken) = taken else {
                     let error = BuildError::Malformed { what: "a coroutine's function its instance's build did not leave (asked for twice, or never made)" };
-                    filed(&mut survey, RunError::Build { function: name(), error, range: None })?;
+                    filed(&mut survey, RunError::Build { function: program_mut.function(i).named(), error, range: None })?;
                     continue;
                 };
                 Some(taken)
@@ -2929,21 +3013,49 @@ fn build_from<P: FrontEnd>(
         // state not laid. A coroutine's own function was built with its coroutine; a shim has
         // no body of its own.
         if from_coroutine.is_none() && shim.is_none() && vtable_shim.is_none() && test_report.is_none() && clone_row.is_none() && from_row.is_none() {
-            let adts = FrontAdts(&*program, i, &consts, &langs, &checked_bodies);
-            let laid = match lay_states::roots_of_instance(&*program, &checked_bodies, &adts, i, &args, &mut ground, alloc) {
-                Ok(roots) if roots.is_empty() => Ok(lay_states::Lay::Done),
-                Ok(roots) => lay_states::lay_and_build(&*program, &consts, &langs, &checked_bodies, &mut ground, &mut layouts, &mut coroutine_stash, i, &roots, alloc),
-                Err(e) => Err(e),
-            };
-            match laid {
-                Ok(lay_states::Lay::Done) => {}
-                Ok(lay_states::Lay::Unchecked(owner)) => {
-                    filed(&mut survey, lay_states::unchecked_owner(&*program, i, owner))?;
-                    continue;
+            let roots = {
+                let adts = FrontAdts(&*program_mut, i, &consts, &langs, &checked_bodies);
+                match lay_states::roots_of_instance(&*program_mut, &checked_bodies, &adts, i, &args, &mut ground, alloc) {
+                    Ok(roots) => roots,
+                    Err(e) => step_refused!(e),
                 }
-                Err(e) => step_refused!(e),
+            };
+            if !roots.is_empty() {
+                let mut rounds = 0usize;
+                let laid_res: Result<Option<ItemKey>, RunError> = loop {
+                    let laid = lay_states::lay_and_build(&*program_mut, &consts, &langs, &checked_bodies, &mut ground, &mut layouts, &mut coroutine_stash, i, &roots, false, alloc);
+                    match laid {
+                        Ok(lay_states::Lay::Done) => break Ok(None),
+                        Ok(lay_states::Lay::Unchecked(owner)) => break Ok(Some(owner)),
+                        Ok(lay_states::Lay::PullConstants(missing)) => {
+                            rounds += 1;
+                            if rounds > crate::front2::coroutine_needs::MOST_HELD {
+                                let error = BuildError::UnsupportedSig { what: "an instance whose coroutine states needed more than 4096 constant pull rounds" };
+                                break Err(RunError::Build { function: program_mut.function(i).named(), error, range: None });
+                            }
+                            match pull_coro_constants(program_mut, &mut checked_bodies, &mut ground, &mut layouts, &missing, &mut const_needs) {
+                                Ok(None) => {}
+                                Ok(Some(owner)) => break Ok(Some(owner)),
+                                Err(e) => break Err(e),
+                            }
+                        }
+                        Err(e) => break Err(e),
+                    }
+                };
+                match laid_res {
+                    Ok(None) => {}
+                    Ok(Some(owner)) => {
+                        filed(&mut survey, lay_states::unchecked_owner(&*program_mut, i, owner))?;
+                        continue;
+                    }
+                    Err(e) => step_refused!(e),
+                }
             }
         }
+        let program = &*program_mut;
+        let function = program.function(i);
+        let name = || function.named();
+        let body = function.body.map(|(body, _)| body);
         let view = body.map(|body| body.view(program.body_types(i)));
         let adts = FrontAdts(program, i, &consts, &langs, &checked_bodies);
         // The record walk hands the builder its world recorded: what the build reads beyond the

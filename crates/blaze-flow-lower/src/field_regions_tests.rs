@@ -328,3 +328,85 @@ fn a_struct_literal_relates_each_field_to_its_own_positions() {
         "the control is refused by the coarse relation's name: {control:?}"
     );
 }
+
+/// Region-erased witness lowering (`lower_async_witness`, `Erased` / `Positions` grain) must not
+/// run `field_slot` against `RegionSlots`-laid `field_regions` rows: under `Positions`, an
+/// associated-type field (`Role::FinalResult` in `tokio_tungstenite::handshake::handshake`) counts
+/// 1 position while `RegionSlots` lays `[FieldRegion::Arg(0)]` (0 positions for `Param(0)`), which
+/// previously refused with `FieldRegionsUnaligned` and prevented building the coroutine state recipe.
+#[test]
+fn witness_lowering_skips_region_slot_field_alignment() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, vec![], &[]);
+    fx.lang(blaze_typeck::LangItem::Sized, sized);
+    let future = fx.tr("Future", 1, vec![], &["Output"]);
+    fx.lang(blaze_typeck::LangItem::Future, future);
+    let role_tr = fx.tr("Role", 1, vec![], &["Out"]);
+    let p0 = fx.param(0);
+    let role_out = fx.alias(role_tr, "Out", &[p0]);
+    let holder = fx.strukt("Holder", 1, &[("out", role_out)]);
+    let holder_p0 = fx.adt(holder, &[p0]);
+    let role_bound = fx.bound(role_tr, &[p0]);
+    let unit = fx.unit();
+    let f = fx.func("handshake", 1, &[holder_p0], unit, vec![role_bound]);
+    fx.finish();
+
+    let mut b = Bb::new();
+    let x = b.param("x");
+    let lx = b.local(x);
+    let read = field(&mut b, x, lx, "out");
+    let inner = b.block(&[], Some(read));
+    let ab = b.async_block(inner, blaze_typeck::Capture::Move);
+    let s = b.semi(ab);
+    let root = b.block(&[s], None);
+    let view = b.view(f, root);
+    let mut cx = blaze_typeck::InferCtx::new_in(region_fixture::alloc());
+    let needs = blaze_typeck::Needs::new_in(region_fixture::alloc());
+    let blaze_typeck::Outcome::Done(ck) = blaze_typeck::check(&view, &fx, &mut cx, &needs, region_fixture::alloc()).expect("check") else {
+        panic!("expected Done");
+    };
+    assert!(ck.diags.is_empty(), "diags: {:?}", ck.diags);
+
+    const HOLDER_OUT: [FieldRegion; 1] = [FieldRegion::Arg(0)];
+    struct WitnessWorld {
+        holder: ItemKey,
+    }
+    impl Facts for WitnessWorld {
+        fn regions(&self) -> &dyn crate::RegionFacts { &crate::NoRegions }
+        fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> { None }
+        fn adt_variances(&self, _: ItemKey) -> Option<&[crate::Variance]> { Some(&[]) }
+        fn implied_bounds(&self) -> Option<(&[(u32, Region)], &[(Region, Region)])> { None }
+        fn constant_initializer(&self) -> bool { false }
+        fn fn_binders(&self) -> bool { true }
+        fn closure_bodies_checked(&self) -> bool { false }
+        fn closure_requirements(&self, _: ExprId) -> &[crate::Requirement] { &[] }
+        fn async_bodies_checked(&self) -> bool { false }
+        fn is_future(&self, _: PTy) -> Option<bool> { None }
+        fn shape(&self, _: ItemKey) -> Option<crate::Shape<'_>> { None }
+        fn object_trait_lifetimes(&self, _: ItemKey) -> Option<bool> { None }
+        fn call_bounds(&self, _: ItemKey) -> Option<crate::CallBounds<'_>> { None }
+        fn trait_lifetimes(&self, _: ItemKey) -> Option<u32> { Some(0) }
+        fn alias_lifetimes(&self, _: ItemKey, _: Name) -> Option<u32> { Some(0) }
+        fn ties(&self, _: ItemKey) -> Option<crate::Ties<'_>> { None }
+        fn field_param(&self, _: ItemKey, _: u32, _: u32) -> Option<u32> { None }
+        fn field_lead(&self, _: ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> { None }
+        fn copy_args(&self, _: ItemKey) -> Option<&[bool]> { None }
+        fn adt(&self, _: ItemKey) -> Option<AdtFacts> {
+            Some(AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false })
+        }
+        fn callee(&self, _: ItemKey) -> Option<CalleeFacts> { None }
+        fn field(&self, adt: ItemKey, variant: u32, name: Name) -> Option<u32> {
+            (adt == self.holder && variant == 0 && name == Name::of("out")).then_some(0)
+        }
+        fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32> {
+            (adt == self.holder && variant == 0).then_some(1)
+        }
+        fn field_regions(&self, adt: ItemKey, variant: u32, field: u32) -> Option<&[FieldRegion]> {
+            (adt == self.holder && variant == 0 && field == 0).then_some(&HOLDER_OUT[..])
+        }
+        fn param_copy(&self, _: u32) -> bool { false }
+    }
+
+    let witness = crate::lower_async_witness(&view, &ck, ab, &WitnessWorld { holder }, region_fixture::alloc());
+    assert!(witness.is_ok(), "witness lowering must not refuse RegionSlots field_regions with FieldRegionsUnaligned: {:?}", witness.err());
+}

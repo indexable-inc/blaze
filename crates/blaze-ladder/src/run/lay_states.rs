@@ -31,7 +31,7 @@ use core::cell::Cell;
 
 use blaze_build::coroutine_state::{LaidState, StateName, StateNames, StatePlan, StatePlant, lay_state_with_flags, may_partial_move_bindings};
 use blaze_build::layout::{LayoutCx, Layouts};
-use blaze_build::{CoroutineOf, coroutine_identity, coroutines_in};
+use blaze_build::{CoroutineOf, coroutines_in};
 use blaze_own::AVec;
 use blaze_typeck::BodyView;
 
@@ -45,6 +45,10 @@ pub(super) enum Lay {
     Done,
     /// The walk met a coroutine whose owner fn is not checked yet: check it, lay again.
     Unchecked(ItemKey),
+    /// One or more coroutines to build need their owner's constants pulled at `owner_args`
+    /// (`const_at::needs_of`, plus `plain_needs_of` when `pull_plain`) before `build_laid`
+    /// walks their bodies. States laid in this pass have already been forgotten.
+    PullConstants(AVec<'static, (ItemKey, List)>),
 }
 
 /// A coroutine the front end gave no upvars' facts or no state recipe for.
@@ -91,23 +95,10 @@ fn ground_saved(
     scratch: Alloc<'_>,
 ) -> Result<PTy, BuildError> {
     let full = |_| BuildError::Malformed { what: "the ground table is full" };
-    // In its own body's record a block is named by its expression (`PNode::Future`); its
-    // identity is `PNode::Coroutine` (blaze-build coroutine.rs), its output a fact of that.
-    let own = match record.node(ty) {
-        Ok(PNode::Future(e, ..)) => Some(e),
-        _ => None,
-    };
-    let g = match own {
-        Some(e) => {
-            let ordinal = coroutines_in(view)
-                .find(|c| c.1 == e)
-                .map(|c| c.0)
-                .ok_or(BuildError::Malformed { what: "a saved local's future that is not an async block of its body" })?;
-            let list = ground.intern_list(args).map_err(full)?;
-            coroutine_identity(ground, view.owner, ordinal, list)?
-        }
-        None => blaze_build::ground(record, ty, args, ground, scratch, facts)?,
-    };
+    // In its own body's record a block (at top level OR nested inside an ADT/combinator/tuple)
+    // is named by its expression (`PNode::Future`); `ground_own` maps every one to its identity
+    // (`PNode::Coroutine`, blaze-build coroutine.rs).
+    let g = blaze_build::ground_own(record, ty, args, view, ground, scratch, facts)?;
     match wrap {
         None => Ok(g),
         Some(m) => ground.intern(PNode::Ref(m, g)).map_err(full),
@@ -180,6 +171,7 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     stash: &mut Vec<BuiltParts, Global>,
     asking: usize,
     roots: &[CoroutineOf],
+    pull_plain: bool,
     alloc: Alloc<'static>,
 ) -> Result<Lay, RunError> {
     let (all, laid_all) = match order_and_lay(program, consts, langs, bodies, ground, layouts, asking, roots, alloc)? {
@@ -195,6 +187,64 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
         }
         Some(ci)
     };
+    // Ensure every coroutine owner's constants (promoted borrows, const blocks, generic consts,
+    // and plain constants when `pull_plain`) are in `bodies.const_at` before `build_laid` walks
+    // its body: a callee coroutine laid and built ahead of its own owner fn has not been pulled
+    // by the caller's own `pull_constants`.
+    if program.evaluates_at_args() {
+        let mut seen: AVec<'_, (ItemKey, List)> = AVec::new_in(alloc);
+        let mut missing: AVec<'static, (ItemKey, List)> = AVec::new_in(alloc);
+        let mut needs = crate::front2::const_at::Needs::new_in(alloc);
+        for &c in all.iter() {
+            let key = (c.owner, c.owner_args);
+            if seen.iter().any(|&x| x == key) {
+                continue;
+            }
+            seen.push(key);
+            let Some(ci) = owner_of(c) else {
+                forget_laid(bodies, &all, ground.view());
+                return Ok(Lay::Unchecked(unchecked.get().unwrap_or(c.owner)));
+            };
+            let function = program.function(ci);
+            let (Some((body, _)), Some(done)) = (function.body, bodies.checked.get(ci).and_then(Option::as_ref)) else {
+                continue;
+            };
+            let has_plain = pull_plain
+                && (done.expr_defs.column::<1>().iter().any(|d| matches!(d, blaze_typeck::Def::Const(_)))
+                    || done.pat_defs.column::<1>().iter().any(|d| matches!(d, blaze_typeck::Def::Const(_))));
+            let has_any = !done.const_args.is_empty()
+                || !done.pat_const_args.is_empty()
+                || !done.default_fields.is_empty()
+                || !done.promoted.is_empty()
+                || body.exprs.iter().any(|x| matches!(x, blaze_typeck::Expr::ConstBlock { .. }))
+                || has_plain;
+            if !has_any {
+                continue;
+            }
+            let view = body.view(program.body_types(ci));
+            let adts = FrontAdts(program, ci, consts, langs, bodies);
+            let args = match args_of(ground, c, alloc) {
+                Ok(a) => a,
+                Err(error) => {
+                    forget_laid(bodies, &all, ground.view());
+                    return Err(build_error(program, function.named(), error, None));
+                }
+            };
+            let res = crate::front2::const_at::needs_of(&view, done, &args, ground, adts.facts(), alloc, &mut needs)
+                .and_then(|()| if pull_plain { crate::front2::const_at::plain_needs_of(done, &mut needs) } else { Ok(()) });
+            if let Err(error) = res {
+                forget_laid(bodies, &all, ground.view());
+                return Err(build_error(program, function.named(), error, None));
+            }
+            if needs.iter().any(|(need, a)| bodies.const_at.get(need, a).is_none()) {
+                missing.push(key);
+            }
+        }
+        if !missing.is_empty() {
+            forget_laid(bodies, &all, ground.view());
+            return Ok(Lay::PullConstants(missing));
+        }
+    }
     // 3. BUILD. A build that stops (a refusal, or a `Missing` the run makes and steps again)
     // forgets every state recorded above and not built into `stash`: one left recorded would be
     // skipped as made by the next lay, its functions never built.

@@ -21,7 +21,7 @@ blaze-body-flow	24
 blaze-body-lower	24
 blaze-borrow	21
 blaze-bstd-convert	9
-blaze-build	739
+blaze-build	738
 blaze-build-script	109
 blaze-c	4
 blaze-cad	101
@@ -127,7 +127,7 @@ blaze-tier	109
 blaze-toolchain	24
 blaze-trace	53
 blaze-ty	2
-blaze-typeck	495
+blaze-typeck	494
 blaze-unit-graph	63
 blaze-units	2
 blaze-url	3

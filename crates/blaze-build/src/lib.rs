@@ -237,7 +237,8 @@ use blaze_lir::VerifyError;
 use blaze_typeck::{Adt, BodyView, Checked, Expr, ExprId, FmtTrait, FnSig, ItemKey, LangItem, List, Mutbl, PTy, PTys, PatId, PortableTys};
 
 pub use instance::{
-    Instance, InstanceKey, REIFY_SHIM_ITEM, TEST_REPORT_SHIM_ITEM, VTABLE_SHIM_ITEM, closure_method_key_args, copy_written, ground, instance_key, instance_key_normalized, reify_shim_instance,
+    Instance, InstanceKey, REIFY_SHIM_ITEM, TEST_REPORT_SHIM_ITEM, VTABLE_SHIM_ITEM, closure_method_key_args, copy_written, ground, ground_own, instance_key, instance_key_normalized,
+    instance_key_normalized_own, reify_shim_instance,
     reify_shim_key_args, reify_shim_of, test_report_shim_instance, test_report_shim_key_args, test_report_shim_of, vtable_shim_instance, vtable_shim_key_args, vtable_shim_of,
 };
 pub use walk::arith_checks::PanicConst;

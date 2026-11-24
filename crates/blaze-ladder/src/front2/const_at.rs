@@ -207,7 +207,7 @@ pub fn needs_of<A: Allocator + Copy>(
         };
         grounded.clear();
         for &t in types.list(list).map_err(|_| malformed("a constant path's arguments past the record's types"))? {
-            grounded.push(blaze_build::ground(types, t, args, ground, scratch, facts)?);
+            grounded.push(blaze_build::ground_own(types, t, args, view, ground, scratch, facts)?);
         }
         out.push(ConstNeed::Item(item), &grounded)?;
     }
@@ -223,7 +223,7 @@ pub fn needs_of<A: Allocator + Copy>(
         };
         grounded.clear();
         for &t in types.list(list).map_err(|_| malformed("a constant pattern's arguments past the record's types"))? {
-            grounded.push(blaze_build::ground(types, t, args, ground, scratch, facts)?);
+            grounded.push(blaze_build::ground_own(types, t, args, view, ground, scratch, facts)?);
         }
         out.push(ConstNeed::Item(item), &grounded)?;
     }
@@ -235,7 +235,7 @@ pub fn needs_of<A: Allocator + Copy>(
     for (&e, &key) in done.default_fields.column::<0>().iter().zip(done.default_fields.column::<2>().iter()) {
         if last != Some(e) {
             let t = *done.expr_ty.get(e.0 as usize).ok_or(malformed("a struct expression with defaults past the record's types"))?;
-            let g = blaze_build::ground(types, t, args, ground, scratch, facts)?;
+            let g = blaze_build::ground_own(types, t, args, view, ground, scratch, facts)?;
             match ground.view().node(g).map_err(|_| malformed("a grounded type past the ground table"))? {
                 PNode::Adt(_, list) => {
                     grounded.clear();

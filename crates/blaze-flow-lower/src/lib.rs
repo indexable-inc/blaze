@@ -3060,7 +3060,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// is its declared type at the value's arguments), so a loan into one reaches exactly the
     /// value's positions that type names, and a write of the field relates into them.
     fn field_slot(&mut self, of: PInfo, adt_ty: PTy, variant: u32, field: u32, field_ty: TyD, e: ExprId) -> Result<Option<(u32, u32)>, Refusal> {
-        if !of.exact {
+        // Region-erased witness lowering (`Erased`: `!R::RELATES`, `Positions` grain) never relates
+        // origins and counts in `Positions`, whereas `field_regions` is laid in `RegionSlots`.
+        if !R::RELATES || !<R::Grain as grain::Grain>::SLOTS || !of.exact {
             return Ok(None);
         }
         let PNode::Adt(k, l) = self.node(adt_ty, e)? else { return Ok(None) };

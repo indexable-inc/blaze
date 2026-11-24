@@ -581,6 +581,9 @@ enum Phase1<A: core::alloc::Allocator> {
     /// The lay of a coroutine state met owner fn `.0` not checked yet (lay_states.rs
     /// `Lay::Unchecked`): check it, then build again.
     Check(ItemKey),
+    /// One or more coroutines laid for this build need their owner's constants pulled
+    /// (lay_states.rs `Lay::PullConstants`): pull them, then build again.
+    PullConstants(AVec<'static, (ItemKey, List)>),
 }
 
 /// Missing facts collected in a single Phase 2 sweep across all `built.refs` and `built.vtables`.
@@ -1128,6 +1131,60 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
                 }
                 if state.ensure(program, typing, owner, checks)?.is_none() {
                     return Err(unchecked_owner(&*program, build_i, owner));
+                }
+            }
+            Ok(Phase1::PullConstants(missing)) => {
+                owners += 1;
+                if owners > MOST_HELD_COROUTINES {
+                    let error = BuildError::UnsupportedSig { what: "an instance whose coroutine states needed more than 4096 constant pull rounds" };
+                    return Err(RunError::Build { function: program.function(build_i).named(), error, range: None });
+                }
+                for &(owner, owner_args) in missing.iter() {
+                    let Some(owner_i) = state.ensure(program, typing, owner, checks)? else {
+                        return Err(unchecked_owner(&*program, build_i, owner));
+                    };
+                    let owner_inst = Instance { item: owner, args: owner_args };
+                    let mut owner_pulled = AskProgress::new_in(alloc);
+                    loop {
+                        match pull_constants(program, state, owner_i, owner_inst) {
+                            Ok(PullStep::Done) => break,
+                            Ok(PullStep::Check(co_owner)) => {
+                                pull_owners += 1;
+                                if pull_owners > MOST_HELD_COROUTINES {
+                                    let error = BuildError::UnsupportedSig { what: "an instance whose constant evaluation needed more than 4096 coroutine owner fns checked" };
+                                    return Err(RunError::Build { function: program.function(build_i).named(), error, range: None });
+                                }
+                                if state.ensure(program, typing, co_owner, checks)?.is_none() {
+                                    return Err(unchecked_owner(&*program, build_i, co_owner));
+                                }
+                            }
+                            Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { owner: op_owner, .. }, .. })
+                                if pull_owners < MOST_HELD_COROUTINES
+                                    && match state.asked.binary_search_by_key(&op_owner, |r| r.0) {
+                                        Err(_) => true,
+                                        Ok(slot) => state.asked.get(slot).is_some_and(|e| e.1.is_none()) && program.fn_index(op_owner).is_none(),
+                                    } =>
+                            {
+                                pull_owners += 1;
+                                if state.ensure(program, typing, op_owner, checks)?.is_none() {
+                                    let Some(row) = program.head_row(op_owner)? else {
+                                        return Err(unchecked_owner(&*program, build_i, op_owner));
+                                    };
+                                    if let Ok(slot) = state.asked.binary_search_by_key(&op_owner, |r| r.0)
+                                        && let Some(entry) = state.asked.get_mut(slot)
+                                    {
+                                        entry.1 = Some(row);
+                                    }
+                                }
+                            }
+                            Err(e) if asks_again(&e) && owner_pulled.allow(&e) => {
+                                if !program.make_asked(owner_i)? {
+                                    return Err(e);
+                                }
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
                 }
             }
             Err(e) if asks_again(&e) && asked.allow(&e) => {
@@ -2140,8 +2197,10 @@ fn build_lir_phase<P: FrontEnd>(
                 work.stash.swap_remove(at);
             }
             if find(&work.stash[..]).is_none() {
-                if let Lay::Unchecked(owner) = lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &[of], work.alloc)? {
-                    return Ok(Phase1::Check(owner));
+                match lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &[of], true, work.alloc)? {
+                    Lay::Done => {}
+                    Lay::Unchecked(owner) => return Ok(Phase1::Check(owner)),
+                    Lay::PullConstants(missing) => return Ok(Phase1::PullConstants(missing)),
                 }
             }
             let Some(at) = find(&work.stash[..]) else {
@@ -2158,10 +2217,12 @@ fn build_lir_phase<P: FrontEnd>(
     };
     if from_coroutine.is_none() && shim.is_none() && vtable_shim.is_none() && test_report.is_none() {
         let roots = roots_of_instance(program, bodies, &adts, i, &args, &mut work.ground, work.alloc)?;
-        if !roots.is_empty()
-            && let Lay::Unchecked(owner) = lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &roots, work.alloc)?
-        {
-            return Ok(Phase1::Check(owner));
+        if !roots.is_empty() {
+            match lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &roots, true, work.alloc)? {
+                Lay::Done => {}
+                Lay::Unchecked(owner) => return Ok(Phase1::Check(owner)),
+                Lay::PullConstants(missing) => return Ok(Phase1::PullConstants(missing)),
+            }
         }
     }
     let view = checked.map(|(body, done)| (body.view(program.body_types(i)), done));

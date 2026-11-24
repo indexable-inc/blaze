@@ -397,6 +397,189 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok(before.iter().filter(|x| matches!(x, crate::body::Expr::Closure { .. })).count() as u32)
     }
 
+    /// Rewrites every `PNode::Future` reachable from `root` (at top level or nested inside an
+    /// ADT, tuple, reference, combinator, etc.) to its cross-body identity `PNode::Coroutine`
+    /// (`coroutine_id::coroutine_ordinal` at the owner's generic parameters). Types that cross a
+    /// body boundary (`Checked::hidden`, `Checked::inferred_output`) must never carry a
+    /// body-local expression id.
+    fn canonicalize_futures(&self, out: &mut PortableTys<'a>, root: PTy) -> Result<PTy, CheckError> {
+        let to_idx = |id: u32| -> Result<usize, CheckError> {
+            usize::try_from(id).map_err(|_| CheckError::Malformed(Malformed::TypeOrder { node: id, child: id }))
+        };
+        let to_u32 = |at: usize| -> Result<u32, CheckError> {
+            u32::try_from(at).map_err(|_| CheckError::Malformed(Malformed::TypeOrder { node: u32::MAX, child: u32::MAX }))
+        };
+        let top = to_idx(root.0)?;
+        let len = top.checked_add(1).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }))?;
+        let mut reached: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, self.alloc);
+        reached.resize(len, false);
+        if let Some(slot) = reached.get_mut(top) {
+            *slot = true;
+        }
+        let mut children: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut has_future = false;
+        {
+            let view = out.view();
+            for at in (0..=top).rev() {
+                if !reached.get(at).copied().unwrap_or(false) {
+                    continue;
+                }
+                let at_u32 = to_u32(at)?;
+                let node = view.node(PTy(at_u32))?;
+                if matches!(node, PNode::Future(..)) {
+                    has_future = true;
+                    continue;
+                }
+                children.clear();
+                view.children_of(node, &mut children)?;
+                for &child in children.iter() {
+                    let child_idx = to_idx(child.0)?;
+                    let Some(slot) = reached.get_mut(child_idx) else {
+                        return Err(CheckError::Malformed(Malformed::TypeOrder { node: at_u32, child: child.0 }));
+                    };
+                    *slot = true;
+                }
+            }
+        }
+        if !has_future {
+            return Ok(root);
+        }
+        let mut ps: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(to_idx(self.own_params)?, self.alloc);
+        for i in 0..self.own_params {
+            let is_const = self.own_consts.binary_search_by_key(&i, |&(index, _)| index).is_ok();
+            ps.push(out.intern(if is_const { PNode::ConstParam(i) } else { PNode::Param(i) })?);
+        }
+        let owner_args = out.intern_list(&ps)?;
+        let mut mapped: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(len, self.alloc);
+        mapped.resize(len, PTy(u32::MAX));
+        let mut kids: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+        let lookup = |mapped: &[PTy], at_u32: u32, c: PTy| -> Result<PTy, CheckError> {
+            let idx = to_idx(c.0)?;
+            mapped.get(idx).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: at_u32, child: c.0 }))
+        };
+        for at in 0..=top {
+            if !reached.get(at).copied().unwrap_or(false) {
+                continue;
+            }
+            let at_u32 = to_u32(at)?;
+            let cur = PTy(at_u32);
+            let raw = out.view().node(cur)?;
+            let map_list = |out: &mut PortableTys<'a>, l: List, mapped: &[PTy], kids: &mut Vec<PTy, Alloc<'a>>| -> Result<(List, bool), CheckError> {
+                kids.clear();
+                let mut changed = false;
+                for &c in out.view().list(l)? {
+                    let m = lookup(mapped, at_u32, c)?;
+                    changed |= m != c;
+                    kids.push(m);
+                }
+                if changed { Ok((out.intern_list(kids)?, true)) } else { Ok((l, false)) }
+            };
+            let next = match raw {
+                PNode::Future(e, ..) => {
+                    let Some(ordinal) = crate::coroutine_id::coroutine_ordinal(&self.body, e) else {
+                        return Err(CheckError::Malformed(crate::error::Malformed::Unreached(e)));
+                    };
+                    out.intern(PNode::Coroutine { owner: self.body.owner, ordinal, args: owner_args })?
+                }
+                PNode::Bool
+                | PNode::Char
+                | PNode::Int(_)
+                | PNode::Uint(_)
+                | PNode::Float(_)
+                | PNode::Str
+                | PNode::Never
+                | PNode::Param(_)
+                | PNode::ConstParam(_)
+                | PNode::Infer
+                | PNode::Error
+                | PNode::ExAuto(_)
+                | PNode::Foreign(_) => cur,
+                PNode::Ref(m, c) => {
+                    let mc = lookup(&mapped, at_u32, c)?;
+                    if mc == c { cur } else { out.intern(PNode::Ref(m, mc))? }
+                }
+                PNode::Ptr(m, c) => {
+                    let mc = lookup(&mapped, at_u32, c)?;
+                    if mc == c { cur } else { out.intern(PNode::Ptr(m, mc))? }
+                }
+                PNode::Slice(c) => {
+                    let mc = lookup(&mapped, at_u32, c)?;
+                    if mc == c { cur } else { out.intern(PNode::Slice(mc))? }
+                }
+                PNode::ConstValue { ty: c, bits } => {
+                    let mc = lookup(&mapped, at_u32, c)?;
+                    if mc == c { cur } else { out.intern(PNode::ConstValue { ty: mc, bits })? }
+                }
+                PNode::Array(a, b) => {
+                    let (ma, mb) = (lookup(&mapped, at_u32, a)?, lookup(&mapped, at_u32, b)?);
+                    if ma == a && mb == b { cur } else { out.intern(PNode::Array(ma, mb))? }
+                }
+                PNode::Pat(c, l) => {
+                    let mc = lookup(&mapped, at_u32, c)?;
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if mc == c && !ch { cur } else { out.intern(PNode::Pat(mc, ml))? }
+                }
+                PNode::ExProj { trait_, name, args, term } => {
+                    let mt = lookup(&mapped, at_u32, term)?;
+                    let (ml, ch) = map_list(out, args, &mapped, &mut kids)?;
+                    if mt == term && !ch { cur } else { out.intern(PNode::ExProj { trait_, name, args: ml, term: mt })? }
+                }
+                PNode::Tuple(l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Tuple(ml))? }
+                }
+                PNode::Record(s, l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Record(s, ml))? }
+                }
+                PNode::Union(l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Union(ml))? }
+                }
+                PNode::Adt(k, l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Adt(k, ml))? }
+                }
+                PNode::FnDef(k, l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::FnDef(k, ml))? }
+                }
+                PNode::FnPtr(l, h) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::FnPtr(ml, h))? }
+                }
+                PNode::Closure { owner, ordinal, args } => {
+                    let (ml, ch) = map_list(out, args, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Closure { owner, ordinal, args: ml })? }
+                }
+                PNode::Coroutine { owner, ordinal, args } => {
+                    let (ml, ch) = map_list(out, args, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Coroutine { owner, ordinal, args: ml })? }
+                }
+                PNode::Alias { trait_, name, args } => {
+                    let (ml, ch) = map_list(out, args, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Alias { trait_, name, args: ml })? }
+                }
+                PNode::Opaque(k, l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Opaque(k, ml))? }
+                }
+                PNode::Dynamic(l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::Dynamic(ml))? }
+                }
+                PNode::ExTrait(k, l) => {
+                    let (ml, ch) = map_list(out, l, &mapped, &mut kids)?;
+                    if !ch { cur } else { out.intern(PNode::ExTrait(k, ml))? }
+                }
+            };
+            if let Some(slot) = mapped.get_mut(at) {
+                *slot = next;
+            }
+        }
+        mapped.get(top).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }))
+    }
+
     /// `resolve_type_vars_in_body`: the record, or the needs when writeback's own reads met a
     /// hole (a run past a hole makes no record: world.rs `Hole`).
     pub(crate) fn writeback(mut self) -> Result<crate::Outcome<'a>, CheckError> {
@@ -714,21 +897,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         for &(k, t) in defined.iter() {
             let n = self.diags.len();
             let p = self.export(&mut ex, t, At::Body)?;
-            let p = match ex.out.view().node(p)? {
-                PNode::Future(e, ..) => {
-                    let Some(ordinal) = crate::coroutine_id::coroutine_ordinal(&self.body, e) else {
-                        return Err(CheckError::Malformed(crate::error::Malformed::Unreached(e)));
-                    };
-                    let mut ps: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(self.own_params as usize, self.alloc);
-                    for i in 0..self.own_params {
-                        let is_const = self.own_consts.binary_search_by_key(&i, |&(index, _)| index).is_ok();
-                        ps.push(ex.out.intern(if is_const { PNode::ConstParam(i) } else { PNode::Param(i) })?);
-                    }
-                    let args = ex.out.intern_list(&ps)?;
-                    ex.out.intern(PNode::Coroutine { owner: self.body.owner, ordinal, args })?
-                }
-                _ => p,
-            };
+            let p = self.canonicalize_futures(&mut ex.out, p)?;
             if self.diags.len() == n {
                 hidden.push((k, p));
             } else {
@@ -776,7 +945,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         coroutine_witnesses.extend(self.futures.iter().map(|f| (f.expr, f.witness)));
         coroutine_witnesses.sort_unstable_by_key(|r| r.0);
         let inferred_output = match self.inferred_output_ty {
-            Some(t) => Some(self.export(&mut ex, t, At::Expr(self.body.root))?),
+            Some(t) => {
+                let p = self.export(&mut ex, t, At::Expr(self.body.root))?;
+                Some(self.canonicalize_futures(&mut ex.out, p)?)
+            }
             None => None,
         };
         let (reads, needs) = self.reads.finish(alloc);
