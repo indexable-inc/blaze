@@ -6,15 +6,16 @@
 use core::alloc::Allocator;
 
 use blaze_own::{
-    LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, SeqOp, Vec, lz77_scan_default, lz77_scan_fast,
+    LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, SeqOp, Vec, fse_pack_sequences_fast, lz77_scan_default,
+    lz77_scan_fast,
 };
 
 use crate::digest::xxh64;
 use crate::zstd::fse::{
-    FseDecTable, FseEncTable, LL_DEFAULT_LOG, LL_DEFAULT_NORM, LL_MAX_CODE, ML_DEFAULT_LOG,
-    ML_DEFAULT_NORM, ML_MAX_CODE, OF_DEFAULT_LOG, OF_DEFAULT_NORM, OF_MAX_CODE, encode_ll_fast,
-    encode_ll_raw, encode_ml_fast, encode_ml_raw, encode_of_fast, encode_of_raw,
-    normalize_fse_counts, write_fse_header,
+    FseDecTable, FseEncTable, LL_DEFAULT_LOG, LL_DEFAULT_NORM, LL_ENC_PACKED, LL_MAX_CODE,
+    ML_DEFAULT_LOG, ML_DEFAULT_NORM, ML_ENC_PACKED, ML_MAX_CODE, OF_DEFAULT_LOG, OF_DEFAULT_NORM,
+    OF_MAX_CODE, encode_ll_fast, encode_ll_raw, encode_ml_fast, encode_ml_raw, encode_of_fast,
+    encode_of_raw, normalize_fse_counts, write_fse_header,
 };
 use crate::zstd::huffman::{HuffEncCache, encode_huffman_literals_into};
 use crate::zstd::{CompressOpts, Level, MAX_BLOCK_SIZE, ZSTD_MAGIC, ZstdError};
@@ -172,9 +173,9 @@ impl PredefinedEncTables {
     }
 }
 
-/// Single-pass reverse FSE sequence packer directly from `SeqOp` (zero intermediate `EncodedSeq`
-/// buffer — used by both `Level::Fast` and `Level::Default`).
-#[inline(never)]
+/// Single-pass reverse FSE sequence packer directly from `SeqOp` via `blaze_own`'s zero-bounds-check
+/// kernel (used by both `Level::Fast` and `Level::Default`).
+#[inline]
 fn pack_raw_sequences_fse<A: Allocator>(
     raw_seqs: &[SeqOp],
     ll_tbl: &FseEncTable,
@@ -190,67 +191,28 @@ fn pack_raw_sequences_fse<A: Allocator>(
     let (l_of_c, l_of_e, l_of_b) =
         encode_of_fast(last.offset).ok_or(ZstdError::CorruptSequences)?;
 
-    let mut ll_state = ll_tbl.init_state(l_ll_c).ok_or(ZstdError::CorruptFse)?;
-    let mut of_state = of_tbl.init_state(l_of_c).ok_or(ZstdError::CorruptFse)?;
-    let mut ml_state = ml_tbl.init_state(l_ml_c).ok_or(ZstdError::CorruptFse)?;
+    let init_ll = ll_tbl.init_state(l_ll_c).ok_or(ZstdError::CorruptFse)?;
+    let init_of = of_tbl.init_state(l_of_c).ok_or(ZstdError::CorruptFse)?;
+    let init_ml = ml_tbl.init_state(l_ml_c).ok_or(ZstdError::CorruptFse)?;
 
-    let mut cur = comp_buf.byte_cursor();
-    cur.try_reserve(raw_seqs.len().saturating_mul(11).saturating_add(48))?;
-    let mut buf: u64 = 0;
-    let mut bits: u32 = 0;
-
-    buf |= u64::from(l_ll_e) << bits;
-    bits += l_ll_b;
-    buf |= u64::from(l_ml_e) << bits;
-    bits += l_ml_b;
-    flush_bits_u64_cur(&mut buf, &mut bits, &mut cur);
-    buf |= u64::from(l_of_e) << bits;
-    bits += l_of_b;
-    flush_bits_u64_cur(&mut buf, &mut bits, &mut cur);
-
-    let head_seqs = raw_seqs.get(..raw_seqs.len().saturating_sub(1)).unwrap_or(&[]);
-    for raw in head_seqs.iter().rev() {
-        let (ll_code, ll_extra, ll_bits) = encode_ll_raw(raw.lit_len);
-        let (ml_code, ml_extra, ml_bits) = encode_ml_raw(raw.match_len);
-        let (of_code, of_extra, of_bits) = encode_of_raw(raw.offset);
-
-        let (next_of, of_st_bits, of_st_nb) = of_tbl.encode_step_fast(of_code, of_state);
-        let (next_ml, ml_st_bits, ml_st_nb) = ml_tbl.encode_step_fast(ml_code, ml_state);
-        let (next_ll, ll_st_bits, ll_st_nb) = ll_tbl.encode_step_fast(ll_code, ll_state);
-        of_state = next_of;
-        ml_state = next_ml;
-        ll_state = next_ll;
-
-        buf |= u64::from(of_st_bits) << bits;
-        bits += of_st_nb;
-        buf |= u64::from(ml_st_bits) << bits;
-        bits += ml_st_nb;
-        buf |= u64::from(ll_st_bits) << bits;
-        bits += ll_st_nb;
-        buf |= u64::from(ll_extra) << bits;
-        bits += ll_bits;
-        if bits + ml_bits + of_bits > 63 {
-            flush_bits_u64_cur(&mut buf, &mut bits, &mut cur);
-        }
-        buf |= u64::from(ml_extra) << bits;
-        bits += ml_bits;
-        buf |= u64::from(of_extra) << bits;
-        bits += of_bits;
-        flush_bits_u64_cur(&mut buf, &mut bits, &mut cur);
-    }
-
-    buf |= u64::from(ml_state) << bits;
-    bits += u32::from(ml_tbl.accuracy_log());
-    buf |= u64::from(of_state) << bits;
-    bits += u32::from(of_tbl.accuracy_log());
-    buf |= u64::from(ll_state) << bits;
-    bits += u32::from(ll_tbl.accuracy_log());
-    flush_bits_u64_cur(&mut buf, &mut bits, &mut cur);
-
-    buf |= 1u64 << bits;
-    let [b0, ..] = buf.to_le_bytes();
-    let _ = cur.push_within_cap(b0);
-    cur.finish();
+    fse_pack_sequences_fast(
+        raw_seqs,
+        &LL_ENC_PACKED,
+        &ML_ENC_PACKED,
+        ll_tbl.pack_view(),
+        of_tbl.pack_view(),
+        ml_tbl.pack_view(),
+        init_ll,
+        init_of,
+        init_ml,
+        l_ll_e,
+        l_ll_b,
+        l_ml_e,
+        l_ml_b,
+        l_of_e,
+        l_of_b,
+        comp_buf,
+    )?;
     Ok(())
 }
 
@@ -292,19 +254,6 @@ fn plan_seq_table(
         return SeqTableChoice::Custom { norm, max_sym, log: target_log };
     }
     SeqTableChoice::Predefined
-}
-
-#[inline(always)]
-fn flush_bits_u64_cur<A: Allocator>(
-    buf: &mut u64,
-    bits: &mut u32,
-    cur: &mut blaze_own::ByteCursor<'_, A>,
-) {
-    let [lo, ..] = bits.to_le_bytes();
-    let adv = usize::from(lo >> 3);
-    let _ = cur.write_u64_le_adv(*buf, adv);
-    *buf >>= u32::from(lo & !7u8);
-    *bits &= 7;
 }
 
 /// Reusable RFC 8878 Zstandard compressor context.

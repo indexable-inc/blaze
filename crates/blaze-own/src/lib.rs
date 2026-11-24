@@ -165,7 +165,8 @@ pub use boxed::{Box, CallOnce};
 pub use btree::{BTreeMap, BTreeSet};
 pub use byte_cursor::{ByteCursor, RevBitCursor, SeqOp, SliceWriter, common_prefix_len};
 pub use lz77::{
-    LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, lz77_scan_default, lz77_scan_fast,
+    FsePackTable, LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, fse_pack_sequences_fast,
+    huff_encode_stream_raw, lz77_scan_default, lz77_scan_fast,
 };
 pub use cow::{Cow, ToOwnedIn};
 pub use deque::VecDeque;
