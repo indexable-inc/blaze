@@ -198,9 +198,10 @@
 //! place ([`Adts::caller_site`]), a call from a tracked fn forwards what it was given (the
 //! Reference, "The `track_caller` attribute", [attributes.codegen.track_caller]). A `Fn*` shim
 //! of a tracked fn item passes a row of the `Fn*` method's definition site ([`Adts::def_site`],
-//! as rustc's call shim does). A tracked fn taken as a fn pointer is refused by name
-//! ([`BuildError::TrackCaller`]: its shim, which passes the fn's own definition site, is not
-//! built).
+//! as rustc's call shim does). A tracked fn taken as a fn pointer points to its `ReifyShim`
+//! ([`build_reify_shim`], named by [`REIFY_SHIM_ITEM`]), which has the plain fn-pointer ABI,
+//! materializes a `Location` row for the fn's own definition site ([`Adts::def_site`]), and calls
+//! the tracked fn with that location passed last.
 
 #![feature(allocator_api)]
 
@@ -234,7 +235,9 @@ use std::alloc::Global;
 use blaze_lir::VerifyError;
 use blaze_typeck::{Adt, BodyView, Checked, Expr, ExprId, FmtTrait, FnSig, ItemKey, LangItem, List, Mutbl, PTy, PTys, PatId, PortableTys};
 
-pub use instance::{Instance, InstanceKey, closure_method_key_args, copy_written, ground, instance_key, instance_key_normalized};
+pub use instance::{
+    Instance, InstanceKey, REIFY_SHIM_ITEM, closure_method_key_args, copy_written, ground, instance_key, instance_key_normalized, reify_shim_instance, reify_shim_key_args, reify_shim_of,
+};
 pub use walk::arith_checks::PanicConst;
 pub use walk::coroutine::{CoroutineFacts, CoroutineOf, StateShape, coroutine_facts, coroutine_of, coroutines_in, identity as coroutine_identity};
 pub use coroutine_niche::{NicheRefused, StateNiche, niche_of, row_niche};
@@ -1300,6 +1303,21 @@ pub fn build_fn_shim<A: Allocator + Copy>(
     alloc: A,
 ) -> Result<Built<A>, BuildError> {
     walk::build_fn_shim(callee, tuple, which, sig, subst, adts, alloc)
+}
+
+/// Builds the `ReifyShim` of `#[track_caller]` fn `callee` (whose signature is `sig`, at the
+/// instance `subst` names): the plain fn-pointer entry point (with no hidden `&Location`
+/// parameter) that materializes a `Location` row for `callee`'s own definition site
+/// ([`Adts::def_site`]) and calls `callee` directly with that location passed last
+/// (walk/track_caller.rs).
+pub fn build_reify_shim<A: Allocator + Copy>(
+    callee: ItemKey,
+    sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    walk::build_reify_shim(callee, sig, subst, adts, alloc)
 }
 
 /// Builds the CTOR FN `ctor` of variant `variant` (a struct's is 0) of a tuple struct or tuple

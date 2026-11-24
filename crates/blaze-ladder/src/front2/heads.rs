@@ -33,7 +33,7 @@ use super::keys::{KeyClash, Keys, MemberKind, checker_of};
 use super::preds::Preds;
 use super::source::NamesSource;
 use super::type_miss::{HeadMiss, MissOf, TypeMiss};
-use super::types::{AliasGap, AliasRegions, AliasSlot, Bounds, Builder, Captures, Env, Heads, HeadsArity, NotLaidWhy, ParamBound, RegionRefusal, RegionSink, SelfGiven, SigPart, SelfTy, Slot, SlotKind, TraitAliasHead, Used, Why, intern, intern_list, used_lifetimes};
+use super::types::{AliasGap, AliasRegions, AliasSlot, Bounds, Builder, Captures, ContainerParamBound, Env, Heads, HeadsArity, NotLaidWhy, ParamBound, RegionRefusal, RegionSink, SelfGiven, SigPart, SelfTy, Slot, SlotKind, TraitAliasHead, Used, Why, intern, intern_list, used_lifetimes};
 use blaze_typeck::region_facts::HeadRegions;
 use blaze_typeck::regions::{LifetimeParams, Numbering, Region, RegionCol};
 
@@ -470,6 +470,9 @@ impl Heads for Maps {
     }
     fn trait_auto(&self, trait_: LibKey) -> Option<bool> {
         self.traits.get(&trait_).map(|t| t.flags.has(tc::TraitFlags::AUTO))
+    }
+    fn trait_self_static(&self, trait_: LibKey) -> Option<bool> {
+        self.traits.get(&trait_).map(|t| t.flags.has(tc::TraitFlags::SELF_STATIC))
     }
     fn checker(&self, key: LibKey) -> ItemKey {
         checker_of(key)
@@ -1317,6 +1320,32 @@ pub struct ContainerRegions {
     /// `projection_slots`); `None` for a trait, an inherent impl, or before the header's
     /// regions are laid.
     pub trait_regions: Option<Vec<Region, Alloc<'static>>>,
+    /// Non-higher-ranked trait bounds on the container's own type parameters (`Param(p): Trait<..>`),
+    /// extracted from the container's filed clause columns (numbered in `Param(0..count)`).
+    pub param_bounds: Vec<ContainerParamBound, Alloc<'static>>,
+}
+
+/// Extract non-higher-ranked trait bounds on bare type parameters (`PNode::Param(p)`) from a
+/// container's laid clause columns (`HeadRegions::clauses`).
+fn extract_container_param_bounds<A: core::alloc::Allocator>(
+    tys: tc::PTys<'_>,
+    clauses: &[tc::region_facts::ClauseRegions<A>],
+    alloc: Alloc<'static>,
+) -> Vec<ContainerParamBound, Alloc<'static>> {
+    let mut out = Vec::new_in(alloc);
+    for c in clauses {
+        if c.binders != 0 {
+            continue;
+        }
+        let Ok(PNode::ExTrait(trait_, args)) = tys.node(c.col.ty()) else { continue };
+        let Ok(list) = tys.list(args) else { continue };
+        let Some(&first) = list.first() else { continue };
+        let Ok(PNode::Param(param)) = tys.node(first) else { continue };
+        let mut regions = Vec::with_capacity_in(c.col.as_slice().len(), alloc);
+        regions.extend_from_slice(c.col.as_slice());
+        out.push(ContainerParamBound { param, trait_, regions });
+    }
+    out
 }
 
 impl ContainerRegions {
@@ -1325,14 +1354,20 @@ impl ContainerRegions {
         let mut names = Vec::new_in(alloc);
         lifetime_names(v, &mut names)?;
         let count = names.len() as u32;
-        Ok(ContainerRegions { names, count, self_regions, self_binders: 0, trait_regions: None })
+        Ok(ContainerRegions { names, count, self_regions, self_binders: 0, trait_regions: None, param_bounds: Vec::new_in(alloc) })
     }
 
-    /// What a member walk in `env` is given for `Self` ([`SelfGiven`]): in an impl's member,
-    /// `Self`'s regions and the trait column; elsewhere nothing.
+    /// What a member walk in `env` is given ([`SelfGiven`]): in an impl's member, `Self`'s
+    /// regions, the trait column, and the container's parameter bounds; in a trait's member,
+    /// the container's parameter bounds; elsewhere nothing.
     pub fn given<'c>(this: Option<&'c ContainerRegions>, env: &Env<'_>) -> SelfGiven<'c> {
         match (env.self_, this) {
-            (SelfTy::Ty(..), Some(c)) => SelfGiven { self_: c.self_regions.as_deref(), impl_trait: c.trait_regions.as_deref() },
+            (SelfTy::Ty(..), Some(c)) => SelfGiven {
+                self_: c.self_regions.as_deref(),
+                impl_trait: c.trait_regions.as_deref(),
+                param_bounds: &c.param_bounds,
+            },
+            (_, Some(c)) => SelfGiven { self_: None, impl_trait: None, param_bounds: &c.param_bounds },
             _ => SelfGiven::NONE,
         }
     }
@@ -1458,11 +1493,12 @@ fn alias_slots<'n, H: Heads, S: NamesSource<'n>>(b: &Builder<'_, H, S>, tys: &mu
         slots.push(match s.kind {
             SlotKind::Static => AliasSlot::Static,
             SlotKind::Late { binder, var } => AliasSlot::Late { binder, var },
+            SlotKind::ObjectDefault(_) => AliasSlot::ObjectDefault,
             SlotKind::Named(n, _) => match names.iter().position(|&m| m == n).map(u32::try_from) {
                 Some(Ok(i)) => AliasSlot::Lifetime(i),
                 _ => return Ok(None),
             },
-            SlotKind::Elided(_) | SlotKind::Bound(_) | SlotKind::Given(_) | SlotKind::ObjectDefault(_) => return Ok(None),
+            SlotKind::Elided(_) | SlotKind::Bound(_) | SlotKind::Given(_) => return Ok(None),
         });
     }
     Ok(Some(AliasRegions { lifetimes, slots }))
@@ -2035,6 +2071,23 @@ pub struct ConstWait {
     pub need: LibKey,
 }
 
+/// A trait impl whose header (`generics`, `self_ty`, `trait_`, `trait_args`, `preds`, `fns`,
+/// `consts`, `polarity`) has been lowered while one or more of its associated types
+/// (`type Name = ..;`) is waiting on a constant (`Why::NeedConst`).
+///
+/// Kept apart from [`Store::impls`] (never frozen or encoded as a head record) and visible
+/// only while constant evaluation is running (`Maps::evaluating > 0`), so evaluating the
+/// constant can prove `T: Trait` (e.g. `itoa`'s `Integer: private::Sealed` where `impl Sealed
+/// for i128` writes `type Buffer = [MaybeUninit<u8>; Self::MAX_STR_LEN]`, or a same-trait
+/// `impl Tr for T` with `type Buf = [u8; Self::N]`) without re-entering the pending
+/// associated type. Removed as soon as `Store::impl_` finishes or fails the impl, or when the
+/// waited-on constant finishes.
+pub struct ProvisionalImpl {
+    pub head: ImplHead,
+    pub pending_assoc: blaze_own::Vec<Name, Alloc<'static>>,
+    pub waiting_const: LibKey,
+}
+
 pub struct Store<'n> {
     pub tys: PortableTys<'static>,
     pub maps: Maps,
@@ -2051,6 +2104,12 @@ pub struct Store<'n> {
     /// without its entry is the world's gap `field_defaults`, never "no defaults".
     pub field_defaults: Rows<ItemKey, Vec<Option<ItemKey>, Global>>,
     pub impls: Rows<ItemKey, ImplHead>,
+    /// Trait impls whose header is lowered while one of their associated types waits on a
+    /// constant ([`ProvisionalImpl`]). Visible only while `maps.evaluating > 0`.
+    pub provisional_impls: Rows<ItemKey, ProvisionalImpl>,
+    /// Provisional impl keys read during the current body check or projection normalization
+    /// (`BodyWorld::impl_header_once`, `BodyWorld::assoc_item_once`).
+    pub(super) provisional_used: core::cell::RefCell<blaze_own::Vec<ItemKey, Alloc<'static>>>,
     pub fns: Rows<ItemKey, FnHead<'n>>,
     /// Each head's regions (D148), by [`super::head_record::regions_key`]: a fn's made by
     /// [`Store::fn_head`] in the walk that makes its types, or filed from its record.
@@ -2529,6 +2588,8 @@ impl<'n> Store<'n> {
             adt_declarations: Rows::new_in(alloc),
             field_defaults: Rows::new_in(alloc),
             impls: Rows::new_in(alloc),
+            provisional_impls: Rows::new_in(alloc),
+            provisional_used: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)),
             fns: Rows::new_in(alloc),
             regions: super::head_record::RegionTable::new_in(alloc),
             region_gaps: Rows::new_in(alloc),
@@ -3173,6 +3234,23 @@ impl<'n> Store<'n> {
                         // A trait has no regions side here: its record's lifetime names that do
                         // not line up are the record's own error.
                         self.restore_container(ck, l, None).map_err(|what| HeadError::Filed { want, at, what })?;
+                        if let Some(r) = regions.as_ref() {
+                            let param_bounds = extract_container_param_bounds(self.tys.view(), &r.regions().clauses, self.tys.alloc());
+                            if !param_bounds.is_empty()
+                                && let Some(prev) = self.container_regions.get(&ck)
+                            {
+                                let mut names = Vec::with_capacity_in(prev.names.len(), self.tys.alloc());
+                                names.extend_from_slice(&prev.names);
+                                self.container_regions.insert(ck, ContainerRegions {
+                                    names,
+                                    count: prev.count,
+                                    self_regions: None,
+                                    self_binders: 0,
+                                    trait_regions: None,
+                                    param_bounds,
+                                });
+                            }
+                        }
                     }
                     if let Some(l) = life {
                         self.file_container_life(ck, l);
@@ -3369,7 +3447,7 @@ impl<'n> Store<'n> {
         owned.extend_from_slice(names);
         let container = match impl_ {
             // A trait's group is its declared lifetimes (`ContainerRegions::of_header`).
-            None => Some(ContainerRegions { names: owned, count: declared, self_regions: None, self_binders: 0, trait_regions: None }),
+            None => Some(ContainerRegions { names: owned, count: declared, self_regions: None, self_binders: 0, trait_regions: None, param_bounds: Vec::new_in(alloc) }),
             // An impl's whose regions were refused has none (its members' are refused by name).
             Some((None, _)) => None,
             Some((Some(r), self_ty)) => {
@@ -3400,7 +3478,8 @@ impl<'n> Store<'n> {
                     v.extend_from_slice(t.as_slice());
                     v
                 });
-                Some(ContainerRegions { names: owned, count, self_regions: Some(self_regions), self_binders: binders, trait_regions })
+                let param_bounds = extract_container_param_bounds(self.tys.view(), &h.clauses, alloc);
+                Some(ContainerRegions { names: owned, count, self_regions: Some(self_regions), self_binders: binders, trait_regions, param_bounds })
             }
         };
         // The members' scope: declared names, then the whole group (as `impl_` files it).
@@ -3608,6 +3687,30 @@ impl<'n> Store<'n> {
         if written & sig::UNSAFE != 0 {
             flags |= tc::TraitFlags::UNSAFE;
         }
+        // The Reference, "Default trait object lifetimes": a trait with a `Self: 'static` bound
+        // (such as `core::any::Any`) gives `dyn Trait` a `'static` default even behind `&`.
+        for &b in v.rows(v.list(head::BOUNDS))? {
+            if let lf::Bound::Lifetime(nm) = lf::Bound::decode(b)?
+                && v.name_text(nm)? == "'static"
+            {
+                flags |= tc::TraitFlags::SELF_STATIC;
+            }
+        }
+        for &w in v.rows(v.list(head::WHERE))? {
+            let lf::WherePred::Type { ty, bounds, .. } = lf::WherePred::decode(w)? else { continue };
+            let lf::TypeRef::Path(p) = v.ty(ty)? else { continue };
+            let (abs, texts, _, _) = super::types::path_texts(v, p)?;
+            if abs || texts.as_slice() != ["Self"] {
+                continue;
+            }
+            for &b in v.rows(bounds)? {
+                if let lf::Bound::Lifetime(nm) = lf::Bound::decode(b)?
+                    && v.name_text(nm)? == "'static"
+                {
+                    flags |= tc::TraitFlags::SELF_STATIC;
+                }
+            }
+        }
         // `#[rustc_coinductive]` (core's `Sized`, `MetaSized`, `PointeeSized`): a cycle through
         // the trait's own steps holds (library/core/src/marker.rs: "`Sized` being coinductive,
         // despite having supertraits, is okay as there are no user-written impls").
@@ -3772,6 +3875,23 @@ impl<'n> Store<'n> {
                 Err(why) => Err(RegionGap::Clauses(*why)),
             };
             let view = self.tys.view();
+            if let Ok(h) = &own {
+                let param_bounds = extract_container_param_bounds(view, &h.clauses, alloc);
+                if !param_bounds.is_empty()
+                    && let Some(prev) = self.container_regions.get(&ck)
+                {
+                    let mut names = Vec::with_capacity_in(prev.names.len(), alloc);
+                    names.extend_from_slice(&prev.names);
+                    self.container_regions.insert(ck, ContainerRegions {
+                        names,
+                        count: prev.count,
+                        self_regions: None,
+                        self_binders: 0,
+                        trait_regions: None,
+                        param_bounds,
+                    });
+                }
+            }
             let own = own.map_err(RegionGap::Clauses).and_then(|h| super::head_record::FiledRegions::new(h, &arity, view, alloc).map_err(RegionGap::Record));
             (own, members)
         };
@@ -4069,18 +4189,77 @@ impl<'n> Store<'n> {
         let mut preds = Preds::new_in(scope.clone_in(alloc));
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
         // D148: the ADT's regions (its own lifetimes, its clauses' columns, its fields'), filed
-        // under its checker key ([`super::head_record::regions_key`]).
+        // under its checker key ([`super::head_record::regions_key`]), plus a `HeadRegions::sig`
+        // for each tuple struct / tuple variant constructor (`CtorSig`) so `FnDef` values like
+        // `Ok`, `ControlFlow::Break`, `Asked::Run`, `OneOf` prove builtin `Fn*` bounds.
+        let mut ctor_filed: blaze_own::Vec<(ItemKey, Result<super::head_record::FiledRegions, RegionGap>), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         let filed = {
             let mut written: blaze_own::Vec<lf::TypeId, Alloc<'static>> = blaze_own::Vec::with_capacity_in(field_at.len(), alloc);
             written.extend(field_at.iter().map(|f| f.written));
             let laid = lay_listed(&b, &mut self.tys, &env, v, (&preds, &written), SelfGiven::NONE, Captures::NONE, alloc)?;
             let arity = HeadsArity { heads: &self.maps, opaques: &[], names };
             let cx = hreg::Cx { v, facts: &arity, written: &laid, scope: &scope, made: &[], alloc };
-            let head = hreg::adt_regions(&cx, &mut self.tys, &preds, &field_at).map_err(RegionGap::Clauses);
+            let mut head = hreg::adt_regions(&cx, &mut self.tys, &preds, &field_at).map_err(RegionGap::Clauses);
+            if let Ok(ref mut h) = head {
+                for (vi, var) in variants.iter().enumerate() {
+                    if var.ctor != tc::CtorKind::Tuple {
+                        continue;
+                    }
+                    let fslice = fields.get(var.fields.range()).unwrap_or(&[]);
+                    let mut io: blaze_own::Vec<PTy, Alloc<'static>> = blaze_own::Vec::with_capacity_in(fslice.len() + 1, alloc);
+                    let mut sig_slots: blaze_own::Vec<Region, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+                    let mut ok = true;
+                    for (fi, f) in fslice.iter().enumerate() {
+                        io.push(f.ty);
+                        if let Some((_, _, col)) = h.fields.iter().find(|&&(v_i, f_i, _)| v_i == vi as u32 && f_i == fi as u32) {
+                            sig_slots.extend_from_slice(col.as_slice());
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    io.push(self_ty);
+                    for li in 0..h.params.count() {
+                        sig_slots.push(Region::Param(li));
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    if let Ok(io_list) = self.tys.intern_list(&io)
+                        && let Ok(sig_ty) = self.tys.intern(PNode::FnPtr(io_list, tc::FnPtrHeader::RUST))
+                    {
+                        let arity2 = HeadsArity { heads: &self.maps, opaques: &[], names };
+                        let view2 = self.tys.view();
+                        if let Ok(sig_col) = RegionCol::lay(view2, sig_ty, &arity2, &sig_slots, alloc) {
+                            if var.key == ck {
+                                h.sig = Some(sig_col);
+                            } else {
+                                let mut cparams = tc::regions::LifetimeParams::new_in(h.params.count(), alloc);
+                                for &(l, s) in h.params.outlives() {
+                                    let _ = cparams.add_outlives(l, s);
+                                }
+                                let mut chr = HeadRegions::new_in(cparams, alloc);
+                                chr.sig = Some(sig_col);
+                                for c in h.clauses.iter() {
+                                    if let Ok(ccol) = RegionCol::lay(view2, c.col.ty(), &arity2, c.col.as_slice(), alloc) {
+                                        chr.clauses.push(tc::region_facts::ClauseRegions { nth: c.nth, binders: c.binders, col: ccol });
+                                    }
+                                }
+                                chr.outlives.extend_from_slice(&h.outlives);
+                                let cf = super::head_record::FiledRegions::new(chr, &arity2, view2, alloc).map_err(RegionGap::Record);
+                                ctor_filed.push((var.key, cf));
+                            }
+                        }
+                    }
+                }
+            }
             let view = self.tys.view();
             head.and_then(|h| super::head_record::FiledRegions::new(h, &arity, view, alloc).map_err(RegionGap::Record))
         };
         file_regions(self, ck, filed);
+        for (vk, cf) in ctor_filed {
+            file_regions(self, vk, cf);
+        }
         // Each field default (RFC 3681): an anonymous constant of the field's type in a const
         // context, generic over the ADT's parameters with its clauses (it may name `N` or
         // `T`), evaluated at each use's ground arguments (the struct expression's type's).
@@ -4157,6 +4336,63 @@ impl<'n> Store<'n> {
         Ok(())
     }
 
+    /// The impl head of `ck` if complete, or its provisional header while constant evaluation
+    /// is running (`maps.evaluating > 0`) and one of its associated types is waiting on a
+    /// constant. Returns `(head, is_provisional)`.
+    pub(super) fn impl_or_provisional(&self, ck: ItemKey) -> Option<(&ImplHead, bool)> {
+        if let Some(h) = self.impls.get(&ck) {
+            return Some((h, false));
+        }
+        if self.maps.evaluating.get() > 0 {
+            if let Some(p) = self.provisional_impls.get(&ck) {
+                return Some((&p.head, true));
+            }
+        }
+        None
+    }
+
+    /// Records that the current check or projection read the provisional impl `ck`.
+    pub(super) fn note_provisional_read(&self, ck: ItemKey) {
+        let mut used = self.provisional_used.borrow_mut();
+        if !used.iter().any(|&k| k == ck) {
+            used.push(ck);
+        }
+    }
+
+    /// Removes any provisional impl waiting on constant `need` now that `need` has been
+    /// answered (or refused). Returns whether any entry was removed.
+    pub(super) fn clear_provisional_for(&self, need: LibKey) -> bool {
+        if self.provisional_impls.is_empty() {
+            return false;
+        }
+        let mut drop_keys: blaze_own::Vec<ItemKey, Alloc<'static>> = blaze_own::Vec::new_in(self.tys.alloc());
+        for (&ck, p) in self.provisional_impls.iter() {
+            if p.waiting_const == need {
+                drop_keys.push(ck);
+            }
+        }
+        for &ck in drop_keys.iter() {
+            self.provisional_impls.remove(&ck);
+        }
+        !drop_keys.is_empty()
+    }
+
+    /// Removes every provisional impl entry (called when constant evaluation returns to
+    /// depth 0 so no provisional state can outlive an evaluation).
+    pub(super) fn clear_all_provisional(&self) -> bool {
+        if self.provisional_impls.is_empty() {
+            return false;
+        }
+        let mut drop_keys: blaze_own::Vec<ItemKey, Alloc<'static>> = blaze_own::Vec::new_in(self.tys.alloc());
+        for (&ck, _) in self.provisional_impls.iter() {
+            drop_keys.push(ck);
+        }
+        for &ck in drop_keys.iter() {
+            self.provisional_impls.remove(&ck);
+        }
+        !drop_keys.is_empty()
+    }
+
     fn impl_<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let mut polarity = if v.head[head::FLAGS] & sig::NEGATIVE != 0 { tc::ImplPolarity::Negative } else { tc::ImplPolarity::Positive };
@@ -4166,6 +4402,7 @@ impl<'n> Store<'n> {
             }
         }
         let ck = checker_of(key);
+        self.provisional_impls.remove(&ck);
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
         let marks = self.marks(names, key, v.item())?;
@@ -4260,7 +4497,7 @@ impl<'n> Store<'n> {
             },
             Err(_) => None,
         };
-        let given = SelfGiven { self_: self_given, impl_trait: impl_trait.as_deref() };
+        let given = SelfGiven { self_: self_given, impl_trait: impl_trait.as_deref(), param_bounds: &[] };
         let ms = members(names, key).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
         let mut assoc = Vec::new_in(Global);
         let mut fns = Vec::new_in(Global);
@@ -4279,6 +4516,13 @@ impl<'n> Store<'n> {
         // Each `type X = U;` value's column (D148, `HeadRegions::impl_assoc`), or why not: filed
         // with the impl's regions below, a refusal refusing them.
         let mut assoc_cols: blaze_own::Vec<Result<(Name, RegionCol<Alloc<'static>>), RegionsRefusal>, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        // For a trait impl, `Self::X` in where-clauses and members lowers to `<SelfTy as Trait>::X`
+        // (types.rs `self_assoc_path`), never reading `env.self_assoc`. When an associated type's
+        // value needs a constant (`Why::NeedConst`), we still lower the impl's header, where-clauses
+        // and associated constants into `provisional_impls` before returning `NeedConst` so that
+        // evaluating the constant can prove `T: Trait` without re-entering the pending associated type.
+        let mut first_assoc_const: Option<(LibKey, Why)> = None;
+        let mut pending_assoc: blaze_own::Vec<Name, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         for m in &ms {
             let low = lower(names, key, m.text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
             let mv = low.view();
@@ -4322,24 +4566,42 @@ impl<'n> Store<'n> {
                     for &row in mv.rows(mv.list(head::GENERICS))? {
                         own_lifetimes |= matches!(lf::GenericParam::decode(row)?, lf::GenericParam::Lifetime { .. });
                     }
-                    let (value, laid) = if mv.rows(mv.list(head::GENERICS))?.is_empty() {
-                        let value = mb.ty(&mut self.tys, &env, &mv, written_t)?;
-                        (value, lay_written(&mb, &mut self.tys, &env, &mv, &[written_t], given, Captures::NONE, alloc)?)
+                    let lowered_assoc = if mv.rows(mv.list(head::GENERICS))?.is_empty() {
+                        mb.ty(&mut self.tys, &env, &mv, written_t).and_then(|value| {
+                            lay_written(&mb, &mut self.tys, &env, &mv, &[written_t], given, Captures::NONE, alloc).map(|laid| (value, laid))
+                        })
                     } else {
                         let mut own_ps = Vec::new_in(Global);
                         own_ps.extend_from_slice(&ps);
                         let mut own_cs = Vec::new_in(Global);
                         own_cs.extend_from_slice(&cs);
-                        own_generics(&mb, &mut self.tys, module, &mv, generics, &mut own_ps, &mut own_cs)?;
-                        let own_env = Env { params: &own_ps, consts: &own_cs, ..env };
-                        let value = mb.ty(&mut self.tys, &own_env, &mv, written_t)?;
-                        (value, lay_written(&mb, &mut self.tys, &own_env, &mv, &[written_t], given, Captures::NONE, alloc)?)
+                        own_generics(&mb, &mut self.tys, module, &mv, generics, &mut own_ps, &mut own_cs).and_then(|_| {
+                            let own_env = Env { params: &own_ps, consts: &own_cs, ..env };
+                            let value = mb.ty(&mut self.tys, &own_env, &mv, written_t)?;
+                            lay_written(&mb, &mut self.tys, &own_env, &mv, &[written_t], given, Captures::NONE, alloc).map(|laid| (value, laid))
+                        })
+                    };
+                    let (value, laid) = match lowered_assoc {
+                        Ok(pair) => pair,
+                        Err(why @ Why::NeedConst(need, _)) if trait_.is_some() => {
+                            if first_assoc_const.is_none() {
+                                first_assoc_const = Some((need, why));
+                            }
+                            pending_assoc.push(Name::of(m.name));
+                            continue;
+                        }
+                        Err(why) => return Err(why),
                     };
                     super::gat::member_where(&mv, m.name)?;
+                    let arity = HeadsArity { heads: &self.maps, opaques: &[], names };
                     if !own_lifetimes {
-                        let arity = HeadsArity { heads: &self.maps, opaques: &[], names };
                         let cx = hreg::Cx { v: &mv, facts: &arity, written: &laid, scope: &scope, made: &[], alloc };
                         assoc_cols.push(hreg::impl_assoc(&cx, self.tys.view(), hreg::AssocAt { name: Name::of(m.name), written: written_t, ty: value }));
+                    } else if let Ok(gat_scope) = scope.with_gat_lifetimes(&mv, alloc) {
+                        let cx = hreg::Cx { v: &mv, facts: &arity, written: &laid, scope: &gat_scope, made: &[], alloc };
+                        if let Ok(col) = hreg::impl_assoc(&cx, self.tys.view(), hreg::AssocAt { name: Name::of(m.name), written: written_t, ty: value }) {
+                            assoc_cols.push(Ok(col));
+                        }
                     }
                     assoc.push((Name::of(m.name), value));
                 }
@@ -4353,6 +4615,28 @@ impl<'n> Store<'n> {
         let env = Env { self_assoc: &assoc, ..env };
         let mut preds = Preds::new_in(scope.clone_in(alloc));
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
+        let mut consts = Vec::with_capacity_in(const_texts.len(), Global);
+        let mut life_names = Vec::new_in(alloc);
+        lifetime_names(v, &mut life_names)?;
+        if let Some((waiting_const, need_const)) = first_assoc_const {
+            self.container_scopes.insert(ck, Scope::container(&life_names, scope.params(), alloc).map_err(Why::Regions)?);
+            for &(name, mk, text, written_by) in &const_texts {
+                if self.impl_const(names, key, ck, mk, text, written_by, &env, (&preds.scope, preds.clauses.as_slice()), &bounds, generics).is_ok() {
+                    self.fn_gaps.remove(&mk);
+                    consts.push((name, mk));
+                }
+            }
+            self.preds.insert(ck, preds);
+            self.provisional_impls.insert(
+                ck,
+                ProvisionalImpl {
+                    head: ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, fn_vis, unstable, consts, polarity },
+                    pending_assoc,
+                    waiting_const,
+                },
+            );
+            return Err(need_const);
+        }
         // D148: the impl's regions (its header's columns, laid above; its clauses'; its values'),
         // filed under its key, and its members' container group. L1a's group
         // (`impl_container`, from the self type's walk) and the header's (heads_regions.rs
@@ -4386,6 +4670,7 @@ impl<'n> Store<'n> {
                         // The self columns agree here, so it is the one the values and clauses
                         // were given (`impl_trait` above).
                         c.trait_regions = impl_trait;
+                        c.param_bounds = extract_container_param_bounds(self.tys.view(), &h.clauses, alloc);
                         self.container_regions.insert(ck, c);
                         let view = self.tys.view();
                         super::head_record::FiledRegions::new(h, &arity, view, alloc).map_err(RegionGap::Record)
@@ -4404,11 +4689,8 @@ impl<'n> Store<'n> {
         // The members' clauses name the impl's declared lifetimes; their own come after every
         // lifetime of the impl's group (its elided ones too), when that group is known.
         let group = self.container_regions.get(&ck).map_or(scope.params(), |c| c.count);
-        let mut life_names = Vec::new_in(alloc);
-        lifetime_names(v, &mut life_names)?;
         self.container_scopes.insert(ck, Scope::container(&life_names, group, alloc).map_err(Why::Regions)?);
         file_regions(self, ck, filed);
-        let mut consts = Vec::with_capacity_in(const_texts.len(), Global);
         // Every constant's name and key, for the waits below (`ConstWait`).
         let mut declared_consts = Vec::with_capacity_in(const_texts.len(), Global);
         declared_consts.extend(const_texts.iter().map(|&(name, mk, ..)| (name, mk)));
@@ -4921,6 +5203,7 @@ impl<'n> Store<'n> {
             SelfTy::Ty(..) => sink.set_impl_trait(container_regions.and_then(|c| c.trait_regions.as_deref())),
             _ => sink.set_impl_trait(None),
         }
+        sink.set_param_bounds(container_regions.map_or(&[], |c| c.param_bounds.as_slice()));
         let list = v.list(head::PARAMS);
         for (k, &n) in v.rows(list)?.iter().enumerate() {
             let prm = lf::Param::decode(n)?;
@@ -5096,6 +5379,7 @@ impl<'n> Store<'n> {
                 SelfTy::Ty(..) => container_regions.and_then(|c| c.trait_regions.as_deref()),
                 _ => None,
             },
+            param_bounds: container_regions.map_or(&[], |c| c.param_bounds.as_slice()),
         };
         for (j, &(t, me)) in opaques.iter().enumerate() {
             let k = super::keys::opaque_key(key, first + j as u32);

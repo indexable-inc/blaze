@@ -328,8 +328,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 }
                 return self.arm_effect(Pending::Moved { expr: cx.root.expr, x }, cx.guarded);
             }
-            (Owner::Local(x), None) => self.owned[x.ix()]
-                .and_then(|o| o.rest)
+            (Owner::Local(x), None) => self
+                .field_mask(x)
                 .ok_or(malformed("a match by tests moving out of a local without field flags (`scan_flags`)"))?,
             (Owner::Temp, None) => cx.root.mask.ok_or(malformed("a temporary scrutinee without its word"))?,
             (Owner::None, None) => return Err(malformed("a part moved out of a scrutinee no one owns")),
@@ -719,8 +719,12 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             .rposition(|h| matches!(*h, Held::Rest { at: a, variant: None, .. } | Held::Moved { at: a, .. } if a == held_at));
         let Some(i) = found else {
             self.moves.steps.truncate(start as usize);
-            if !self.live {
-                // Unreachable code: nothing runs, nothing is held (`Task::Spill` held nothing).
+            let t = self.expr_ty(base)?;
+            let g = self.ground_ty(t).map_err(|error| Self::ty_err(base, error))?;
+            if !self.live || !self.needs_drop(g).map_err(|error| Self::ty_err(base, error))? {
+                // Unreachable code, or a temporary whose own type needs no drop (e.g.
+                // `ManuallyDrop::new(x).value`): `Task::Spill` held nothing because nothing in
+                // the temporary drops at statement end.
                 let tmp = self.temp(repr);
                 self.store(V::Place(at.0, at.1), repr, tmp)?;
                 return Ok(V::Place(tmp.0, tmp.1));
@@ -885,10 +889,40 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// it holds by `drop_owned` and sets every bit by `hold_all`): kept so a part moved later
     /// in the same loop is refused (`part_bit`), as this drop, walked first, does not test it.
     pub(super) fn note_whole_assign(&mut self, e: ExprId, p: PatId) {
-        if let Some(mask) = self.owned[p.ix()].and_then(|o| o.rest) {
+        if let Some(mask) = self.field_mask(p) {
             // The empty path: every part is under it.
             self.moves.assigned.push(Assigned { mask, start: 0, len: 0, by: e });
         }
+    }
+
+    /// `lhs = v` over a placed field whose own type needs no drop (e.g. `w.m = ManuallyDrop::new(x)`),
+    /// after the store: sets every bit moved under `lhs` back to held, and records the assignment
+    /// for `part_bit`'s loop check.
+    pub(super) fn reinit_field_bits(&mut self, lhs: ExprId) -> Result<(), BuildError> {
+        let path = self.field_path(lhs)?;
+        let Some((_, mask, start, len, false)) = path else {
+            if let Some((.., start, _, true)) = path
+                && let Ok(n) = usize::try_from(start)
+            {
+                self.moves.steps.truncate(n);
+            }
+            return Ok(());
+        };
+        let mut bits = 0u64;
+        for q in self.moves.parts.iter() {
+            if q.mask == mask && self.part_under(*q, start, len) {
+                bits |= 1u64 << q.bit;
+            }
+        }
+        if bits != 0 {
+            let fa = self.b.slot_addr(mask);
+            let word = self.b.load(Ty::I64, Flags::NONE, fa, 0, MemAttrs::aligned(3));
+            let set = self.b.iconst(Ty::I64, u128::from(bits));
+            let held = self.b.binary(Op::Or, Flags::NONE, word, set);
+            self.b.store(Flags::NONE, held, fa, 0, MemAttrs::aligned(3));
+        }
+        self.moves.assigned.push(Assigned { mask, start, len, by: lhs });
+        Ok(())
     }
 
     /// Whether part `q`'s path is at least `depth + 1` long and starts with part `rep`'s first

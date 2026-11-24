@@ -152,6 +152,9 @@ impl<A: Allocator + Copy> Builder<A> {
     pub(crate) fn mentions(&mut self, local: u32, origin: Origin) {
         self.inner.mentions(local, origin)
     }
+    pub(crate) fn mentions_no_drop(&mut self, local: u32, origin: Origin) {
+        self.inner.mentions_no_drop(local, origin)
+    }
     pub(crate) fn known(&mut self, from: Origin, into: Origin) {
         self.inner.known(from, into)
     }

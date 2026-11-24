@@ -32,10 +32,22 @@ fn match_on(b: &mut BodyBuf, scrutinee: ExprId, list: &[(PatId, ExprId)]) -> Exp
     b.e(Expr::Match { scrutinee, arms })
 }
 
-/// Builds `main` (checked against `w`), runs it natively with `G`'s glue, and returns what was
-/// dropped, in order (empty off aarch64, where nothing runs).
-fn drops_of(w: &TestWorld, b: &BodyBuf, root: ExprId, g: PNode) -> Result<Vec<i32, Global>, String> {
+/// Builds `main` (checked against `w`), plus an optional generic helper instantiated at `[g]`,
+/// runs it natively with `G`'s glue, and returns what was dropped, in order (empty off aarch64,
+/// where nothing runs).
+fn drops_of(
+    w: &TestWorld,
+    b: &BodyBuf,
+    root: ExprId,
+    g: PNode,
+    extra: Option<(ItemKey, &BodyBuf, ExprId)>,
+) -> Result<Vec<i32, Global>, String> {
     let mut ground = PortableTys::new_in(Alloc::global());
+    let g_ty = ground.intern(g).expect("intern");
+    let extra_built = match extra {
+        Some((item, eb, eroot)) => Some((item, build_instance(w, eb, item, eroot, &[g_ty], &mut ground)?)),
+        None => None,
+    };
     let main = build_instance(w, b, MAIN, root, &[], &mut ground)?;
     #[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
     let mut seen: Vec<i32, Global> = Vec::new_in(Global);
@@ -52,28 +64,38 @@ fn drops_of(w: &TestWorld, b: &BodyBuf, root: ExprId, g: PNode) -> Result<Vec<i3
             other => panic!("the check did not finish: {:?}", other.err()),
         };
         let sig = w.sig(DROP_IN_PLACE).expect("a signature");
-        let ty = ground.intern(g).expect("intern");
-        let args = ground.intern_list(&[ty]).expect("intern");
+        let args = ground.intern_list(&[g_ty]).expect("intern");
         // A local dropped whole (no field flags: `t` below, only borrowed) drops by
         // `drop_in_place::<(i32, G, G)>`, whose glue calls `G`'s: placed after it.
         let i32_ty = ground.intern(I32).expect("intern");
-        let elems = ground.intern_list(&[i32_ty, ty, ty]).expect("intern");
+        let elems = ground.intern_list(&[i32_ty, g_ty, g_ty]).expect("intern");
         let tuple_ty = ground.intern(PNode::Tuple(elems)).expect("intern");
         let tuple_args = ground.intern_list(&[tuple_ty]).expect("intern");
-        let mut subst = Subst { args: &[ty], ground: &mut ground, scratch: Alloc::global() };
+        let mut subst = Subst { args: &[g_ty], ground: &mut ground, scratch: Alloc::global() };
         let glue = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: w, body: &gb }, Global)
             .unwrap_or_else(|e| panic!("{e}"));
         let mut subst = Subst { args: &[tuple_ty], ground: &mut ground, scratch: Alloc::global() };
         let tuple_glue = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: w, body: &gb }, Global)
             .unwrap_or_else(|e| panic!("{e}"));
         DROPPED.with(|d| d.borrow_mut().clear());
-        run_native_with(
-            &[(G_DROP, host_g_drop as usize as u64)],
-            &[(DROP_IN_PLACE, Some(args), &glue), (DROP_IN_PLACE, Some(tuple_args), &tuple_glue), (MAIN, None, &main)],
-        );
+        match &extra_built {
+            Some((item, built)) => run_native_with(
+                &[(G_DROP, host_g_drop as usize as u64)],
+                &[
+                    (DROP_IN_PLACE, Some(args), &glue),
+                    (DROP_IN_PLACE, Some(tuple_args), &tuple_glue),
+                    (*item, Some(args), built),
+                    (MAIN, None, &main),
+                ],
+            ),
+            None => run_native_with(
+                &[(G_DROP, host_g_drop as usize as u64)],
+                &[(DROP_IN_PLACE, Some(args), &glue), (DROP_IN_PLACE, Some(tuple_args), &tuple_glue), (MAIN, None, &main)],
+            ),
+        };
         seen = DROPPED.with(|d| d.borrow().clone());
     }
-    let _ = (&main, g);
+    let _ = (&main, &extra_built, g);
     Ok(seen)
 }
 
@@ -124,7 +146,7 @@ fn a_field_moved_out_of_a_temporary_drops_the_rest_at_the_statement_end() {
         let g9 = g_lit(&mut b, 9);
         stmts.push(Stmt::Let { pat: k, ty: None, init: Some(g9), else_: None });
         let root = b.block(&stmts, None);
-        let seen = drops_of(&w, &b, root, g).unwrap_or_else(|e| panic!("nested={nested}: {e}"));
+        let seen = drops_of(&w, &b, root, g, None).unwrap_or_else(|e| panic!("nested={nested}: {e}"));
         #[cfg(target_arch = "aarch64")]
         assert_eq!(seen.as_slice(), &[1, 3, 9, 2], "nested={nested}");
         let _ = seen;
@@ -226,7 +248,7 @@ fn place_scrutinees_through_a_reference_move_nothing() {
         let k = b.bind("k");
         stmts.push(Stmt::Let { pat: k, ty: None, init: Some(k_init), else_: None });
         let root = b.block(&stmts, None);
-        let seen = drops_of(&w, &b, root, g).unwrap_or_else(|e| panic!("sel={sel}: {e}"));
+        let seen = drops_of(&w, &b, root, g, None).unwrap_or_else(|e| panic!("sel={sel}: {e}"));
         #[cfg(target_arch = "aarch64")]
         assert_eq!(seen.as_slice(), want, "sel={sel}");
         let _ = (seen, want);
@@ -272,8 +294,290 @@ fn a_move_out_of_a_place_behind_a_reference_is_refused_by_name() {
     let x = b.bind("x");
     stmts.push(Stmt::Let { pat: x, ty: None, init: Some(m), else_: None });
     let root = b.block(&stmts, None);
-    let Err(error) = drops_of(&w, &b, root, g) else { panic!("a move out of `*r` must be refused") };
+    let Err(error) = drops_of(&w, &b, root, g, None) else { panic!("a move out of `*r` must be refused") };
     // The checker may refuse it first (a diagnostic); the builder's refusal names the move.
+    assert!(error.contains("a move out") || error.starts_with("diagnostics"), "{error}");
+}
+
+/// `ManuallyDrop { value }` literal expression.
+fn md_lit(b: &mut BodyBuf, value: ExprId) -> ExprId {
+    let path = b.path("ManuallyDrop");
+    let start = b.field_inits.len() as u32;
+    b.field_inits.push(FieldInit { name: Name::of("value"), expr: value });
+    b.e(Expr::Struct { path, fields: List { start, len: 1 }, base: blaze_typeck::StructBase::None })
+}
+
+/// Moving out of a `ManuallyDrop<T>` field — the exact shape of `core::mem::ManuallyDrop::into_inner`
+/// (`fn into_inner<T>(slot: ManuallyDrop<T>) -> T { slot.value }`), plus a local, a nested field
+/// (`slot.value.0`), and a temporary (`ManuallyDrop { value: G { x: 1 } }.value`).
+///
+/// `ManuallyDrop<T>` does not need drop (`!needs_drop`), so `slot` is never dropped at scope end,
+/// while its field `value: T` DOES need drop. Moving `slot.value` out hands ownership to the
+/// destination (dropped once) without double-dropping or leaking, and any sibling left inside
+/// `ManuallyDrop` (`slot.value.1`) stays undropped.
+/// ```text
+/// fn into_inner<T>(slot: ManuallyDrop<T>) -> T { slot.value }
+/// fn main() {
+///     let a = into_inner(ManuallyDrop { value: G { x: 1 } }); // a drops 1 at end
+///     let m = ManuallyDrop { value: G { x: 2 } };
+///     let b = m.value;                                         // b drops 2
+///     let c = ManuallyDrop { value: G { x: 3 } }.value;        // c drops 3
+///     let p = ManuallyDrop { value: (G { x: 4 }, G { x: 5 }) };
+///     let d = p.value.0;                                       // d drops 4; 5 stays in ManuallyDrop
+///     let k = G { x: 9 };                                      // k drops 9
+/// }   // reverse order of declaration: 9, 4, 3, 2, 1 (no 5, no double-drop)
+/// ```
+/// Before `KeptOwned`, `into_inner` failed to build with "a move out of a field of other than a
+/// temporary or a local with field flags" and the temporary case failed with "a move out of a
+/// field of a temporary not held to its statement's end".
+#[test]
+fn manually_drop_into_inner_and_field_moves_drop_once() {
+    const MD: ItemKey = ItemKey(70);
+    const INTO_INNER: ItemKey = ItemKey(72);
+
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], UNIT);
+    let g = g_world(&mut w);
+    w.generic_strukt(MD.0, "ManuallyDrop", 1, &[("value", PNode::Param(0))]);
+    w.manually_drop = Some(MD);
+    let p0 = w.ty(PNode::Param(0));
+    let md_t_args = w.types.intern_list(&[p0]).expect("intern");
+    let md_t = PNode::Adt(MD, md_t_args);
+    w.generic_func(INTO_INNER.0, "into_inner", 1, &[md_t], PNode::Param(0));
+
+    // fn into_inner<T>(slot: ManuallyDrop<T>) -> T { slot.value }
+    let mut ib = BodyBuf::new();
+    let slot = ib.bind("slot");
+    ib.params.push(slot);
+    let slot_e = ib.local(slot);
+    let iroot = ib.field(slot_e, "value");
+
+    // main
+    let mut b = BodyBuf::new();
+    // let a = into_inner(ManuallyDrop { value: G { x: 1 } });
+    let g1 = g_lit(&mut b, 1);
+    let m1 = md_lit(&mut b, g1);
+    let call_a = b.call("into_inner", &[m1]);
+    let a = b.bind("a");
+    // let m = ManuallyDrop { value: G { x: 2 } }; let b = m.value;
+    let g2 = g_lit(&mut b, 2);
+    let m2 = md_lit(&mut b, g2);
+    let m = b.bind("m");
+    let m_e = b.local(m);
+    let m_val = b.field(m_e, "value");
+    let bb = b.bind("b");
+    // let c = ManuallyDrop { value: G { x: 3 } }.value;
+    let g3 = g_lit(&mut b, 3);
+    let m3 = md_lit(&mut b, g3);
+    let m3_val = b.field(m3, "value");
+    let c = b.bind("c");
+    // let p = ManuallyDrop { value: (G { x: 4 }, G { x: 5 }) }; let d = p.value.0;
+    let (g4, g5) = (g_lit(&mut b, 4), g_lit(&mut b, 5));
+    let pair = b.tuple(&[g4, g5]);
+    let mp = md_lit(&mut b, pair);
+    let p = b.bind("p");
+    let p_e = b.local(p);
+    let p_val = b.field(p_e, "value");
+    let p_val_0 = b.tfield(p_val, 0);
+    let d = b.bind("d");
+    // let k = G { x: 9 };
+    let g9 = g_lit(&mut b, 9);
+    let k = b.bind("k");
+    let root = b.block(
+        &[
+            Stmt::Let { pat: a, ty: None, init: Some(call_a), else_: None },
+            Stmt::Let { pat: m, ty: None, init: Some(m2), else_: None },
+            Stmt::Let { pat: bb, ty: None, init: Some(m_val), else_: None },
+            Stmt::Let { pat: c, ty: None, init: Some(m3_val), else_: None },
+            Stmt::Let { pat: p, ty: None, init: Some(mp), else_: None },
+            Stmt::Let { pat: d, ty: None, init: Some(p_val_0), else_: None },
+            Stmt::Let { pat: k, ty: None, init: Some(g9), else_: None },
+        ],
+        None,
+    );
+
+    let seen = drops_of(&w, &b, root, g, Some((INTO_INNER, &ib, iroot))).unwrap_or_else(|e| panic!("{e}"));
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(seen.as_slice(), &[9, 4, 3, 2, 1]);
+    let _ = seen;
+}
+
+/// Moving a field out of a `ManuallyDrop` local and then reassigning it (and whole-reassigning
+/// the `ManuallyDrop` local) tracks field flags so `assign_over` drops only when initialized and
+/// never double-drops a moved-out field, while leaving the final value undropped at scope end.
+/// ```text
+/// fn main() {                                // take = 1          take = 0
+///     let mut m = ManuallyDrop { value: G { x: 1 } };
+///     if take != 0 {
+///         let a = m.value;                   // drops 1           (not moved)
+///     }
+///     { let mid = G { x: 5 }; }              // drops 5           drops 5
+///     m.value = G { x: 2 };                  // no drop (moved)   drops 1
+///     m.value = G { x: 3 };                  // drops 2           drops 2
+///     let b = m.value;                       // moves 3 out (dropped at scope end)
+///     m = ManuallyDrop { value: G { x: 4 } };// resets field flags (3 not dropped here)
+///     m.value = G { x: 6 };                  // drops 4           drops 4
+/// }                                          // drops b (3); 6 stays in ManuallyDrop
+/// ```
+/// take = 1: `[1, 5, 2, 4, 3]`; take = 0: `[5, 1, 2, 4, 3]`.
+#[test]
+fn manually_drop_field_move_then_reassign_tracks_field_flags() {
+    const MD: ItemKey = ItemKey(70);
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], UNIT);
+    let g = g_world(&mut w);
+    w.generic_strukt(MD.0, "ManuallyDrop", 1, &[("value", PNode::Param(0))]);
+    w.manually_drop = Some(MD);
+
+    let cases: [(u128, &[i32]); 2] = [(1, &[1, 5, 2, 4, 3]), (0, &[5, 1, 2, 4, 3])];
+    for (take, want) in cases {
+        let mut b = BodyBuf::new();
+        let g1 = g_lit(&mut b, 1);
+        let m_init = md_lit(&mut b, g1);
+        let m = b.bind("m");
+        // if take != 0 { let a = m.value; }
+        let t_lit = b.int(take, None);
+        let z_lit = b.int(0, None);
+        let cond = b.bin(BinOp::Ne, t_lit, z_lit);
+        let m_e = b.local(m);
+        let m_val = b.field(m_e, "value");
+        let a = b.bind("a");
+        let then = b.block(&[Stmt::Let { pat: a, ty: None, init: Some(m_val), else_: None }], None);
+        let iff = b.e(Expr::If { cond, then, else_: None });
+        // { let mid = G { x: 5 }; }
+        let g5 = g_lit(&mut b, 5);
+        let mid = b.bind("mid");
+        let mid_blk = b.block(&[Stmt::Let { pat: mid, ty: None, init: Some(g5), else_: None }], None);
+        // m.value = G { x: 2 };
+        let m_e2 = b.local(m);
+        let lhs2 = b.field(m_e2, "value");
+        let g2 = g_lit(&mut b, 2);
+        let asg2 = b.e(Expr::Assign { lhs: lhs2, rhs: g2 });
+        // m.value = G { x: 3 };
+        let m_e3 = b.local(m);
+        let lhs3 = b.field(m_e3, "value");
+        let g3 = g_lit(&mut b, 3);
+        let asg3 = b.e(Expr::Assign { lhs: lhs3, rhs: g3 });
+        // let b = m.value;
+        let m_e4 = b.local(m);
+        let m_val4 = b.field(m_e4, "value");
+        let bb = b.bind("b");
+        // m = ManuallyDrop { value: G { x: 4 } };
+        let m_e5 = b.local(m);
+        let g4 = g_lit(&mut b, 4);
+        let m4 = md_lit(&mut b, g4);
+        let asg_whole = b.e(Expr::Assign { lhs: m_e5, rhs: m4 });
+        // m.value = G { x: 6 };
+        let m_e6 = b.local(m);
+        let lhs6 = b.field(m_e6, "value");
+        let g6 = g_lit(&mut b, 6);
+        let asg6 = b.e(Expr::Assign { lhs: lhs6, rhs: g6 });
+        let root = b.block(
+            &[
+                Stmt::Let { pat: m, ty: None, init: Some(m_init), else_: None },
+                Stmt::Expr { expr: iff, semi: true },
+                Stmt::Expr { expr: mid_blk, semi: true },
+                Stmt::Expr { expr: asg2, semi: true },
+                Stmt::Expr { expr: asg3, semi: true },
+                Stmt::Let { pat: bb, ty: None, init: Some(m_val4), else_: None },
+                Stmt::Expr { expr: asg_whole, semi: true },
+                Stmt::Expr { expr: asg6, semi: true },
+            ],
+            None,
+        );
+        let seen = drops_of(&w, &b, root, g, None).unwrap_or_else(|e| panic!("take={take}: {e}"));
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(seen.as_slice(), want, "take={take}");
+        let _ = (seen, want);
+    }
+}
+
+/// Matching on a field of a `ManuallyDrop` local keeps it in place (`ref` and `_` drop nothing,
+/// while a by-value binding moves it out and drops it once); moving out of a `ManuallyDrop`
+/// behind a reference (`(&m).value`) is still refused (E0507).
+#[test]
+fn manually_drop_field_scrutinee_and_ref_move_control() {
+    const MD: ItemKey = ItemKey(70);
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], UNIT);
+    let g = g_world(&mut w);
+    w.generic_strukt(MD.0, "ManuallyDrop", 1, &[("value", PNode::Param(0))]);
+    w.manually_drop = Some(MD);
+
+    // match m.value { ref r => r.x } and match m.value { _ => 0 } drop nothing;
+    // match m.value { v => v.x } drops G { x: 1 } once at arm end.
+    let mut b = BodyBuf::new();
+    let g1 = g_lit(&mut b, 1);
+    let m_init = md_lit(&mut b, g1);
+    let m = b.bind("m");
+    // let x = match m.value { ref r => r.x };
+    let m1 = b.local(m);
+    let m1_val = b.field(m1, "value");
+    let rp = ref_bind(&mut b, "r");
+    let r_e = b.local(rp);
+    let r_x = b.field(r_e, "x");
+    let match1 = match_on(&mut b, m1_val, &[(rp, r_x)]);
+    let x = b.bind("x");
+    // let _y = match m.value { _ => 0 };
+    let m2 = b.local(m);
+    let m2_val = b.field(m2, "value");
+    let wild = b.pat(Pat::Wild);
+    let zero = b.int(0, None);
+    let match2 = match_on(&mut b, m2_val, &[(wild, zero)]);
+    let y = b.bind("y");
+    // let z = match m.value { v => v.x };
+    let m3 = b.local(m);
+    let m3_val = b.field(m3, "value");
+    let vp = plain_bind(&mut b, "v");
+    let v_e = b.local(vp);
+    let v_x = b.field(v_e, "x");
+    let match3 = match_on(&mut b, m3_val, &[(vp, v_x)]);
+    let z = b.bind("z");
+    // let k = G { x: x * 10 + z }; -> 11
+    let (xe, ze) = (b.local(x), b.local(z));
+    let ten = b.int(10, None);
+    let x10 = b.bin(BinOp::Mul, xe, ten);
+    let sum = b.bin(BinOp::Add, x10, ze);
+    let g_path = b.path("G");
+    let start = b.field_inits.len() as u32;
+    b.field_inits.push(FieldInit { name: Name::of("x"), expr: sum });
+    let k_init = b.e(Expr::Struct { path: g_path, fields: List { start, len: 1 }, base: blaze_typeck::StructBase::None });
+    let k = b.bind("k");
+    let root = b.block(
+        &[
+            Stmt::Let { pat: m, ty: None, init: Some(m_init), else_: None },
+            Stmt::Let { pat: x, ty: None, init: Some(match1), else_: None },
+            Stmt::Let { pat: y, ty: None, init: Some(match2), else_: None },
+            Stmt::Let { pat: z, ty: None, init: Some(match3), else_: None },
+            Stmt::Let { pat: k, ty: None, init: Some(k_init), else_: None },
+        ],
+        None,
+    );
+    let seen = drops_of(&w, &b, root, g, None).unwrap_or_else(|e| panic!("{e}"));
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(seen.as_slice(), &[1, 11]);
+    let _ = seen;
+
+    // Control: moving out of `r.value` where `r: &ManuallyDrop<G>` is refused (E0507).
+    let mut b = BodyBuf::new();
+    let g1 = g_lit(&mut b, 1);
+    let m_init = md_lit(&mut b, g1);
+    let m = b.bind("m");
+    let m_e = b.local(m);
+    let r_init = b.e(Expr::Ref { mutbl: Mutbl::Not, operand: m_e });
+    let r = b.bind("r");
+    let r_e = b.local(r);
+    let r_val = b.field(r_e, "value");
+    let bad = b.bind("bad");
+    let root = b.block(
+        &[
+            Stmt::Let { pat: m, ty: None, init: Some(m_init), else_: None },
+            Stmt::Let { pat: r, ty: None, init: Some(r_init), else_: None },
+            Stmt::Let { pat: bad, ty: None, init: Some(r_val), else_: None },
+        ],
+        None,
+    );
+    let Err(error) = drops_of(&w, &b, root, g, None) else { panic!("a move out of `(&m).value` must be refused") };
     assert!(error.contains("a move out") || error.starts_with("diagnostics"), "{error}");
 }
 

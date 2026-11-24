@@ -80,7 +80,7 @@ fn a_match_on_an_owned_locals_field_moves_by_its_field_flags() {
         let k = b.bind("k");
         stmts.push(Stmt::Let { pat: k, ty: None, init: Some(k_init), else_: None });
         let root = b.block(&stmts, None);
-        let seen = drops_of(&w, &b, root, g).unwrap_or_else(|e| panic!("sel={sel}: {e}"));
+        let seen = drops_of(&w, &b, root, g, None).unwrap_or_else(|e| panic!("sel={sel}: {e}"));
         #[cfg(target_arch = "aarch64")]
         assert_eq!(seen.as_slice(), want, "sel={sel}");
         let _ = (seen, want);

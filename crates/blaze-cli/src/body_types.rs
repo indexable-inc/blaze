@@ -50,13 +50,12 @@ pub const BORROWS: u16 = 19;
 /// "NOT checked".
 pub const BORROWS_NOT_CHECKED: u16 = 20;
 /// THE FLIP: whether a borrow finding ([`BORROWS`]) is an error of the program, and the
-/// borrows stage is counted as run when no body filed [`BORROWS_NOT_CHECKED`]. FALSE until the
-/// flow census on blaze's own standard layer (crates/blaze-ladder/tests/flow_census.rs, its head
-/// line's "findings N") reads 0 false findings: census 3 (docs/v2/plan/design/flow.md, 2026-11-16
-/// 12:44, tree 11d224a93a) read "findings 536 (in 206 bodies)", every one false. Change it only
-/// with that census's head line quoted from a run on the commit that flips it. Nothing else
-/// changes at the flip: every body's borrow verdict is already in its record.
-pub const BORROWS_ARE_ERRORS: bool = false;
+/// borrows stage is counted as run when no body filed [`BORROWS_NOT_CHECKED`].
+/// Flipped to `true` under `OneRule` (`blaze-borrow` + `RegionSlots`) after both flow censuses
+/// read 0 refused and 0 false findings:
+/// - `bstd` (`flow_census`): `clean bodies 4305; borrow-checked whole 4305; refused 0; accepted 4305; findings 0 (in 0 bodies)`
+/// - `core` (`flow_census_core`): `clean bodies 2922; borrow-checked whole 2922; refused 0; accepted 2922; findings 0 (in 0 bodies)`
+pub const BORROWS_ARE_ERRORS: bool = true;
 
 /// The domain of a body part's source ([`body_source`]). 6: a body stopped by a failed head now
 /// places that head's cell to its owning `Signature` task before recording `Done::reads`

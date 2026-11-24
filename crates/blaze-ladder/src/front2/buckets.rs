@@ -1270,6 +1270,10 @@ pub struct Buckets {
     /// question's gap. Only a question that HAS such a candidate is a gap of the body asking it,
     /// so a body's outcome never depends on which other bodies or rounds lowered what first.
     answer_failed: Rows<(ItemKey, Shape, Seen), LibKey>,
+    /// Trait questions whose answer read a provisional impl header during constant evaluation
+    /// (`Store::provisional_impls`): cleared once the waited-on constant finishes so the final
+    /// `ImplHead` is lowered and cached.
+    provisional_answers: OnceCell<RefCell<blaze_own::Vec<(ItemKey, Shape, Seen), blaze_own::Alloc<'static>>>>,
     /// Each crate's sight ([`SightRow`]), made once at its first checked body's first trait
     /// question ([`Buckets::sight`]) in the store's allocator, which that question names.
     sights: OnceCell<Rows<usize, SightRow, blaze_own::Alloc<'static>>>,
@@ -1379,6 +1383,7 @@ impl Buckets {
         Buckets {
             answers: Rows::new_in(Global),
             answer_failed: Rows::new_in(Global),
+            provisional_answers: OnceCell::new(),
             sights: OnceCell::new(),
             whole_program_sight: false,
             inherent: Rows::new_in(Global),
@@ -2012,6 +2017,7 @@ impl Buckets {
         let mut got = Vec::new_in(Global);
         // Candidates come sorted, so the first failed one is the least key.
         let mut first_failed = None;
+        let mut used_provisional = false;
         {
             // The index borrowed once (`Buckets::index_mut`): inside, only the index's own
             // methods and reads of `store`'s rows.
@@ -2022,7 +2028,10 @@ impl Buckets {
                     first_failed = first_failed.or(Some(k));
                     continue;
                 }
-                let h = store.impls.get(&checker_of(k)).ok_or(Unfilled::Impl(k))?;
+                let (h, provisional) = store.impl_or_provisional(checker_of(k)).ok_or(Unfilled::Impl(k))?;
+                if provisional {
+                    used_provisional = true;
+                }
                 // A header built WITHOUT the trait its text names answers nothing: it is the
                 // question's gap, never an impl left out of the answer unseen.
                 if h.trait_.is_none() && ix.by_text.contains(&k) {
@@ -2041,7 +2050,26 @@ impl Buckets {
             self.answer_failed.insert(asked, k);
         }
         self.answers.insert(asked, got);
+        if used_provisional {
+            let list = self.provisional_answers.get_or_init(|| RefCell::new(blaze_own::Vec::new_in(store.tys.alloc())));
+            let mut list = list.borrow_mut();
+            if !list.iter().any(|&a| a == asked) {
+                list.push(asked);
+            }
+        }
         Ok(())
+    }
+
+    /// Removes trait question answers that depended on provisional impl headers so subsequent
+    /// checks lower and cache the complete `ImplHead`.
+    pub(super) fn clear_provisional(&self) {
+        let Some(list) = self.provisional_answers.get() else { return };
+        let mut list = list.borrow_mut();
+        for &asked in list.iter() {
+            self.answers.remove(&asked);
+            self.answer_failed.remove(&asked);
+        }
+        list.clear();
     }
 
     /// A test's removed cause (rule 23): every trait question, a checked body's too, takes the

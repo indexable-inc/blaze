@@ -1268,3 +1268,88 @@ fn large_flow_stress_and_equivalence() {
         flow.origins,
     );
 }
+
+/// Dropping a non-`Drop` wrapper (`Slot<&'a T>`) does NOT conflict with a live borrow behind
+/// `Proj::Deref` (`&*slot.0`) when no intervening ancestor implements `Drop`.
+/// NEGATIVE CONTROL (rule 23): when the wrapper implements `Drop` (`of_drop_type = true` on
+/// `slot.0`), dropping `slot` DOES conflict with the live borrow behind `Deref` (`Invalidated`).
+#[test]
+fn a_drop_of_a_non_drop_wrapper_does_not_conflict_behind_deref() {
+    let build = |of_drop_type: bool| {
+        // _0 return, _1 wrapper `slot`, _2 borrowed ref `r`
+        let mut b = FlowBuilder::new_in(3, 1, Global);
+        let bb0 = b.block();
+        b.start(bb0);
+        let slot = Place(1);
+        let r = Place(2);
+        let o_ref = b.origin(false);
+        b.mentions(2, o_ref);
+        let field0 = b.project_marked(slot, Proj::Field(0), of_drop_type);
+        let deref0 = b.project(field0, Proj::Deref);
+        // r = &(*slot.0)
+        let _loan = b.borrow(r, BorrowKind::Shared, deref0, o_ref, S);
+        // Drop(slot) while `r` is still live (used below)
+        b.stmt(StmtKind::Drop(slot), S);
+        // Use `r` so `o_ref` is live across `Drop(slot)`
+        b.assign(Place(0), Operand::Copy(r), S);
+        b.ret(S);
+        finish(b)
+    };
+
+    let ok_flow = build(false);
+    assert_eq!(tiers(&ok_flow), (TierOne::Accepted, Vec::new()), "non-Drop wrapper drop behind Deref must not conflict");
+
+    let bad_flow = build(true);
+    let (tier1, findings) = tiers(&bad_flow);
+    assert_eq!(tier1, TierOne::Refused, "CONTROL: Drop wrapper must conflict with live borrow behind Deref");
+    assert!(
+        findings.iter().any(|f| matches!(*f, BorrowFinding::Invalidated { .. })),
+        "CONTROL: expected Invalidated when wrapper implements Drop, got {findings:?}"
+    );
+}
+
+/// Borrowing behind `Proj::Deref` of a shared reference (`&T`, `PlaceMark::SharedDeref`, e.g.
+/// `let rest = &*(*self).src;` where `self.src: &'a str`) does NOT lock `*self`, so activating
+/// `&mut *self` while `rest` is live is accepted.
+/// NEGATIVE CONTROL (rule 23): when `self.src` is `&mut T` (`PlaceMark::None`), activating
+/// `&mut *self` while `rest` is live STILL conflicts (`Invalidated`).
+#[test]
+fn a_borrow_behind_shared_ref_deref_does_not_conflict_with_prefix_mut_borrow() {
+    let build = |shared_ref: bool| {
+        // _0 return, _1 self: &mut S, _2 rest: &str, _3 m: &mut S
+        let mut b = FlowBuilder::new_in(4, 1, Global);
+        let bb0 = b.block();
+        b.start(bb0);
+        let me = Place(1);
+        let rest = Place(2);
+        let m = Place(3);
+        let o_rest = b.origin(false);
+        let o_mut = b.origin(false);
+        b.mentions(2, o_rest);
+        b.mentions(3, o_mut);
+        let star_self = b.project(me, Proj::Deref);
+        let src = b.project(star_self, Proj::Field(0));
+        let mark = if shared_ref { crate::PlaceMark::SharedDeref } else { crate::PlaceMark::None };
+        let deref_src = b.project_in(src, Proj::Deref, mark);
+        // rest = &*(*self).src
+        let _l_rest = b.borrow(rest, BorrowKind::Shared, deref_src, o_rest, S);
+        // m = &two_phase mut *self; Activate(m)
+        let l_mut = b.borrow(m, BorrowKind::TwoPhase, star_self, o_mut, S);
+        b.stmt(StmtKind::Activate(l_mut), S);
+        // Use both `m` and `rest` after activation
+        b.assign(Place(0), Operand::Copy(rest), S);
+        b.ret(S);
+        finish(b)
+    };
+
+    let ok_flow = build(true);
+    assert_eq!(tiers(&ok_flow), (TierOne::Accepted, Vec::new()), "shared-ref deref borrow must not lock prefix");
+
+    let bad_flow = build(false);
+    let (tier1, findings) = tiers(&bad_flow);
+    assert_eq!(tier1, TierOne::Refused, "CONTROL: &mut-ref deref borrow MUST lock prefix");
+    assert!(
+        findings.iter().any(|f| matches!(*f, BorrowFinding::Invalidated { .. })),
+        "CONTROL: expected Invalidated for &mut-ref deref, got {findings:?}"
+    );
+}

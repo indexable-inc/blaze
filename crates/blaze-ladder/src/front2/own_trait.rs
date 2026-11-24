@@ -46,8 +46,8 @@ pub fn of_member(store: &Store<'_>, container: Option<ItemKey>) -> Result<Option
     if store.trait_defs.contains_key(&c) {
         return Ok(Some(c));
     }
-    match store.impls.get(&c) {
-        Some(head) => Ok(head.trait_),
+    match store.impl_or_provisional(c) {
+        Some((head, _)) => Ok(head.trait_),
         None => Err(NoContainer(c)),
     }
 }

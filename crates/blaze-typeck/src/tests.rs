@@ -105,6 +105,7 @@ impl BodyBuf {
             expr_editions: &[],
             pat_editions: &[],
             record_expr_schemas: &[],
+            closure_static_params: &[],
         }
     }
 }
@@ -904,6 +905,7 @@ fn empty_body<'b>(owner: ItemKey, types: PTys<'b>, root: ExprId) -> BodyView<'b>
         expr_editions: &[],
         pat_editions: &[],
         record_expr_schemas: &[],
+        closure_static_params: &[],
     }
 }
 

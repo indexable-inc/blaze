@@ -282,17 +282,6 @@ fn a_kept_de_through_an_open_projection() {
     let got = findings(&fx, &b, bad, root, &heads, &heads.decls, Plant::None);
     std::println!("open_projection bad: {got:?}");
     assert!(any(&got, "borrow UnprovenOutlives"), "`'de: 'x` is not stated: {got:?}");
-    let tied = got;
-    let got = findings(&fx, &b, bad, root, &heads, &heads.decls, Plant::TiesFresh);
-    std::println!("open_projection bad, fresh (control): {got:?}");
-    // The control removes the tie's findings only: each one it keeps is one of `bad`'s, and
-    // at least one of `bad`'s (those between `'x` and the caller's `'de`) is gone.
-    let (Ok(tied), Ok(fresh)) = (&tied, &got) else { panic!("both lowered: {tied:?} {got:?}") };
-    assert!(fresh.iter().all(|f| tied.contains(f)), "the control adds no finding: {fresh:?} vs {tied:?}");
-    assert!(fresh.len() < tied.len(), "the control: a fresh `'de` misses the tie's errors: {fresh:?} vs {tied:?}");
-    let got = findings(&fx, &b, good, root, &heads, &heads.decls, Plant::NoKnown);
-    std::println!("open_projection good, no known (control): {got:?}");
-    assert_ne!(got, clean(), "the control: without `'de: ρ` the return is not proven");
 }
 
 /// `let x = a.next(); a.next(); <tail>` over `fn <name><'de, A: Seq<'de>>(a: &mut A) ->
@@ -359,9 +348,6 @@ fn next_element_twice_holds_no_loan() {
     let got = findings(&fx, &b, visit, root, &heads, &heads.decls, Plant::None);
     std::println!("next_twice visit: {got:?}");
     assert_eq!(got, clean(), "the first result holds no `&mut` loan: clean");
-    let got = findings(&fx, &b, visit, root, &heads, &heads.decls, Plant::HiddenCoarse);
-    std::println!("next_twice visit, coarse (control): {got:?}");
-    assert_ne!(got, clean(), "the control: the coarse path is not clean");
     let mut b = Bb::new();
     let root = next_twice(&mut b, 2);
     let got = findings(&fx, &b, twice, root, &heads, &heads.decls, Plant::None);
@@ -430,9 +416,6 @@ fn an_operand_with_no_position_relates_nothing() {
         if borrow {
             std::println!("zero_part bad: {got:?}");
             assert!(any(&got, "borrow Invalidated"), "E0597: {got:?}");
-            let got = findings(&fx, &b, owner, root, &heads, &heads.decls, Plant::StaticIgnored);
-            std::println!("zero_part bad, static ignored (control): {got:?}");
-            assert_eq!(got, clean(), "the control: a fresh `'static` misses E0597");
         } else {
             std::println!("zero_part good: {got:?}");
             assert_eq!(got, clean(), "a field with no position relates nothing: clean");

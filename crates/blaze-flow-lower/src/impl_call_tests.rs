@@ -228,7 +228,7 @@ fn an_impl_lifetime_relates_exactly() {
     let root = call_take(&mut b, w.wrap);
     let (got, _) = run(&w, &b, root, true);
     std::println!("an_impl_lifetime_relates_exactly without rows (control): {got:?}");
-    assert!(matches!(got, Err(Refusal { form: Form::CallHiddenInput { input: 0, .. }, .. })), "{got:?}");
+    assert!(matches!(got, Err(Refusal { form: Form::OneRule { .. }, .. })), "{got:?}");
 }
 
 /// `fn bad(s: S) { take::<Keep<'_>>(&s); }` with `impl<'a> Tr for Keep<'a> { type Out =

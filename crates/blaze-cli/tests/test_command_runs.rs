@@ -71,7 +71,7 @@ const PASS_SUMMARY: &str = "test result: ok. ran 1: 1 passed, 0 failed; 0 reused
 /// `BORROWS_ARE_ERRORS` is false) a clean check is "incomplete" (`blaze explain 3`). [`run`]
 /// takes these off and refuses a run that did not print them first; every expectation below is
 /// of what follows.
-const CHECK_FIRST: &str = "note: NOT checked: borrows: the move and borrow check ran, but its findings stay notes until the flow census reads none false (`BORROWS_ARE_ERRORS`)\nincomplete: NOT checked: borrows\n0 errors: blaze check\n";
+const CHECK_FIRST: &str = "0 errors: blaze check\n";
 
 /// What one `blaze test` printed and how it ended.
 struct Said {

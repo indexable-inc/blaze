@@ -471,9 +471,12 @@ impl MakerState {
         let alloc = self.work.alloc;
         let ground = &mut self.work.ground;
         let fn_target = |key| {
-            let Some(instance) = program.const_fn_instance(key, ground, alloc) else {
+            let Some(mut instance) = program.const_fn_instance(key, ground, alloc) else {
                 return Ok(None);
             };
+            if program.track_caller(instance.item) == Some(true) {
+                instance = blaze_build::reify_shim_instance(instance, ground).map_err(|_| crate::symbols::SymbolError::TableFull)?;
+            }
             let view = ground.view();
             let tabled = static_fn_tabled(program, instance, view);
             let mut name = blaze_own::Vec::new_in(alloc);
@@ -709,6 +712,9 @@ impl MakerState {
 /// Reification records a selected fn item. Closure coercion records `call_once` at the
 /// closure type, whose body belongs to the item that contains the closure expression.
 pub(super) fn static_fn_tabled<P: FrontEnd>(program: &P, instance: Instance, ground: blaze_typeck::PTys<'_>) -> ItemKey {
+    if let Some(target) = blaze_build::reify_shim_of(instance, ground) {
+        return target.item;
+    }
     if let Ok([first, _]) = ground.list(instance.args)
         && let Some(closure) = blaze_build::closure_of(ground, *first)
     {
@@ -1044,7 +1050,9 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
         Some(instance.args)
     } else if let Some((of, _)) = crate::front2::coroutines::part_of(&facts, instance, &work.ground) {
         Some(of.owner_args)
-    } else if crate::fn_shim::fn_shim_of(&facts, instance, &work.ground).is_some() {
+    } else if crate::fn_shim::fn_shim_of(&facts, instance, &work.ground).is_some()
+        || blaze_build::reify_shim_of(instance, work.ground.view()).is_some()
+    {
         None
     } else {
         let first = work.ground.view().list(instance.args).ok().and_then(|a| a.first().copied());
@@ -1444,9 +1452,10 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     work.reads.clear();
     let asking = Asking::new(program, i, &work.langs, bodies, &work.reads);
     let adts = asking.world();
-    let coroutine = if instance.item == function.key { None } else { crate::front2::coroutines::part_of(&adts, instance, &work.ground) };
-    let shim = if instance.item == function.key || coroutine.is_some() { None } else { crate::fn_shim::fn_shim_of(&adts, instance, &work.ground) };
-    let closure = if instance.item == function.key || shim.is_some() || coroutine.is_some() {
+    let reify = if instance.item == function.key { None } else { blaze_build::reify_shim_of(instance, work.ground.view()) };
+    let coroutine = if instance.item == function.key || reify.is_some() { None } else { crate::front2::coroutines::part_of(&adts, instance, &work.ground) };
+    let shim = if instance.item == function.key || reify.is_some() || coroutine.is_some() { None } else { crate::fn_shim::fn_shim_of(&adts, instance, &work.ground) };
+    let closure = if instance.item == function.key || reify.is_some() || shim.is_some() || coroutine.is_some() {
         None
     } else {
         let first = work.ground.view().list(instance.args).map_err(malformed)?.first().copied();
@@ -1459,12 +1468,16 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
             _ => return Err(callee_refusal(program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NotOwnInstance, work.ground.view())),
         }
     };
-    let owner_args = match shim {
-        Some(s) => s.item.map_or(List::EMPTY, |(_, fn_args)| fn_args),
-        None => match coroutine {
-            Some((of, _)) => of.owner_args,
-            None => closure.map_or(instance.args, |(of, _)| of.owner_args),
-        },
+    let owner_args = if let Some(target) = reify {
+        target.args
+    } else {
+        match shim {
+            Some(s) => s.item.map_or(List::EMPTY, |(_, fn_args)| fn_args),
+            None => match coroutine {
+                Some((of, _)) => of.owner_args,
+                None => closure.map_or(instance.args, |(of, _)| of.owner_args),
+            },
+        }
     };
     let mut args: AVec<'_, PTy> = blaze_own::Vec::new_in(work.alloc);
     args.extend_from_slice(work.ground.view().list(owner_args).map_err(malformed)?);
@@ -1524,9 +1537,11 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, &adts, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, &adts, Global),
             }
-        } else if builtin_clone.is_some() || builtin_from.is_some() {
+        } else if reify.is_some() || builtin_clone.is_some() || builtin_from.is_some() {
             let g = Global;
-            if let Some(made) = builtin_clone {
+            if let Some(target) = reify {
+                blaze_build::build_reify_shim(target.item, &program.sig(i), &mut subst, &adts, g)
+            } else if let Some(made) = builtin_clone {
                 // A fn item's and a fn pointer's clone is a copy of its bytes (`Copy` by the
                 // language, no solver asked); a tuple's or a closure's clones each field by its own
                 // `clone` (clone_shim.rs `language_clone`: what it does is a function of the type).

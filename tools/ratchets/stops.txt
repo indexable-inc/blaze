@@ -15,7 +15,7 @@ blaze-base64	24
 blaze-bench	7
 blaze-blake3	413
 blaze-bstd-convert	109
-blaze-build	549
+blaze-build	536
 blaze-build-script	246
 blaze-bytes	3
 blaze-c	325

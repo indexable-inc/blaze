@@ -566,9 +566,6 @@ pub(crate) struct RunOut<'a> {
     untyped_clean: u32,
     /// The run's stretches' setup ([`StretchSetup`]).
     setup: StretchSetup,
-    /// The call census's totals over the run's stretches (feature `call-census`; [`Census`]:
-    /// nothing without).
-    census: Census,
     /// Each checkout file a body of the run read as data through its `Given` cell ([`data_read`],
     /// `DataCell::Followed`), its path and the answer the body saw: the leaf rows the request
     /// saves so the sweep follows them ([`BodiesStage::data_files`]).
@@ -577,57 +574,11 @@ pub(crate) struct RunOut<'a> {
 
 impl<'a> RunOut<'a> {
     fn new(alloc: SharedAlloc<'a>) -> RunOut<'a> {
-        RunOut { found: SVec::new_in(alloc), messages: SVec::new_in(alloc), notes: SVec::new_in(alloc), locals: SVec::new_in(alloc), clean: 0, items: 0, item_tasks: 0, outs: SVec::new_in(alloc), scratch_most: 0, frames: FramesHeld::default(), typed: SVec::new_in(alloc), untyped_clean: 0, setup: StretchSetup::default(), census: Census::NONE, data_files: SVec::new_in(alloc) }
+        RunOut { found: SVec::new_in(alloc), messages: SVec::new_in(alloc), notes: SVec::new_in(alloc), locals: SVec::new_in(alloc), clean: 0, items: 0, item_tasks: 0, outs: SVec::new_in(alloc), scratch_most: 0, frames: FramesHeld::default(), typed: SVec::new_in(alloc), untyped_clean: 0, setup: StretchSetup::default(), data_files: SVec::new_in(alloc) }
     }
 }
 
-/// The call census's totals (feature `call-census`) behind a handle on the request's heap: a
-/// pointer in [`RunOut`] and [`BodiesStage`], never the 62 KiB `CallCensusTotals` (its fixed
-/// `fewer` table) by value. By value it made each of `RunOut`, `BodyRun` and `BodiesStage` 62 KiB
-/// and every `Result`/`Option` of them on the stretch path as large (`-Zprint-type-sizes`, wave-1119
-/// t59): `bodies_phase` began 400 KiB above `run_bodies` (t59's stack marks; piece C, rule 54).
-/// Without the feature nothing is allocated: no stretch makes a census cell.
-// The box is in the process heap's SHARED allocator: `RunOut` crosses to a worker (`Scope::
-// may_overlap` needs `Send`), and `Alloc` is not `Send` while `SharedAlloc` is.
-pub(crate) struct Census(Option<blaze_own::Box<blaze_ladder::front2::call_census::CallCensusTotals, blaze_own::SharedAlloc<'static>>>);
-
-impl Census {
-    pub(crate) const NONE: Census = Census(None);
-
-    /// `other`'s totals added into these, `other` left empty: the first moves its box, no copy.
-    fn absorb(&mut self, other: &mut Census) {
-        let Some(more) = other.0.take() else { return };
-        match self.0.as_mut() {
-            Some(totals) => totals.add(&more),
-            None => self.0 = Some(more),
-        }
-    }
-
-    /// A stretch's cell's totals added, boxed in `g` at the first. In a call of its own: the
-    /// totals' copy (`CensusCell::totals` returns them by value) sits in this frame alone, and
-    /// only under the feature.
-    #[inline(never)]
-    fn add_cell(&mut self, cell: &blaze_ladder::front2::call_census::CensusCell, g: blaze_own::SharedAlloc<'static>) {
-        let totals = cell.totals();
-        match self.0.as_mut() {
-            Some(into) => into.add(&totals),
-            None => self.0 = Some(blaze_own::Box::new_in(totals, g)),
-        }
-    }
-
-    /// The census's report, when any body was asked about.
-    fn write(&self, into: &mut dyn core::fmt::Write) {
-        if let Some(totals) = self.0.as_deref().filter(|totals| totals.bodies > 0) {
-            let _ = totals.write(into);
-        }
-    }
-}
-
-// The stretch path's types, bounded where they are declared (rule 76): each was 62 KiB with the
-// census by value (wave-1119 t59 `-Zprint-type-sizes`); a regression fails the build here, at
-// its cause, and the error names the true size.
-// Two words: the box's pointer and its allocator's handle.
-const _: () = assert!(core::mem::size_of::<Census>() <= 16);
+// The stretch path's types, bounded where they are declared (rule 76).
 const _: () = assert!(core::mem::size_of::<RunOut<'static>>() <= 4 << 10);
 
 /// A body's scratch frame, reset when the body ends (rule 11): reserved once a run, nothing
@@ -2176,9 +2127,6 @@ pub(crate) struct BodiesStage<'f> {
     untyped_clean: u32,
     /// Every stretch's setup before its first body ([`StretchSetup`]), summed over the phases.
     setup: StretchSetup,
-    /// The call census's totals summed over the phases (feature `call-census`; [`Census`]:
-    /// nothing without).
-    census: Census,
     /// Each slice's task as the profile names it ([`Part`], [`BodiesStage::task_label`]): its
     /// time's name (its first body's), its entry's label, and its bodies' place in the entry.
     /// `None`: no entry was sliced.
@@ -3177,7 +3125,6 @@ impl<'f> BodiesStage<'f> {
             typed_bytes: 0,
             untyped_clean: 0,
             setup: StretchSetup::default(),
-            census: Census::NONE,
             slices: None,
             cost_fit: CostFit::default(),
             grains_last: None,
@@ -4116,7 +4063,6 @@ impl<'f> BodiesStage<'f> {
             // `blaze run` builds from it.
             self.untyped_clean = self.untyped_clean.saturating_add(run_out.untyped_clean);
             self.setup.add(run_out.setup);
-            self.census.absorb(&mut run_out.census);
             typed_keys.clear();
             for one in run_out.typed.iter() {
                 let key = crate::engine_body_record::typed_key(&one.bytes);
@@ -5699,8 +5645,6 @@ impl<'f> BodiesStage<'f> {
         if let Some(line) = self.grains_line {
             let _ = writeln!(into, "{line}");
         }
-        // The call census (feature `call-census`): its whole report and the summary block.
-        self.census.write(into);
         let s = self.setup;
         let [first, second, third] = s.largest();
         let _ = writeln!(
@@ -6114,7 +6058,6 @@ fn join_slices<'a, 'f>(
         joined.typed.append(&mut run_out.typed);
         joined.untyped_clean = joined.untyped_clean.saturating_add(run_out.untyped_clean);
         joined.setup.add(run_out.setup);
-        joined.census.absorb(&mut run_out.census);
         // Its data files followed as its reads are joined: each slice's up to a stopped one.
         joined.data_files.append(&mut run_out.data_files);
         buffer.made.append(&mut out.made);
@@ -6131,7 +6074,6 @@ fn join_slices<'a, 'f>(
             joined.typed.append(&mut run_out.typed);
             joined.untyped_clean = joined.untyped_clean.saturating_add(run_out.untyped_clean);
             joined.setup.add(run_out.setup);
-            joined.census.absorb(&mut run_out.census);
         }
     }
     reads.sort_unstable_by_key(|read| read.0);
@@ -6447,15 +6389,11 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
     // Each body's rounds (front2 tables/cost.rs `Spent::rounds`): one when its heads are all
     // seeded (runtime.md point 3).
     let cost: &Cost<'_> = frame.alloc(Cost::new(&NO_GAUGE));
-    // The call census (D190 step 2), one cell per stretch, filled by each body on this worker:
-    // only in a build with the feature.
-    let census: Option<&blaze_ladder::front2::call_census::CensusCell> =
-        cfg!(feature = "call-census").then(|| &*frame.alloc(blaze_ladder::front2::call_census::CensusCell::new(shared.heap.shared())));
     // One stretch-scoped macro preparation table shared across every body in the stretch so
     // `ProjectWorld::over_prepared` allocates 0 bytes in `frame` per body and macros are prepared
     // once per stretch rather than leaked per body.
     let prepared: &blaze_scope::prepares::Prepares<'_> = blaze_scope::prepares::Prepares::new_in(fb);
-    let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed.map(|s| s as &dyn HeadSeed<'_>), sources: Some(opened.sources), goals: None, census, prepared: Some(prepared) };
+    let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed.map(|s| s as &dyn HeadSeed<'_>), sources: Some(opened.sources), goals: None, prepared: Some(prepared) };
     // Each crate's listing from the request's table (engine_heads.rs `Listings`): made once a
     // request, not once a stretch that places a read in it.
     let set_lang = clock.now();
@@ -7196,9 +7134,6 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
     // The stretch's records opened each expansion's origin column once (front2 source.rs
     // `Records::text_marks`): how many, for the stage's line.
     tally.origins_opened = tally.origins_opened.saturating_add(opened.records.opened().origins);
-    if let Some(census) = census {
-        run_out.census.add_cell(census, shared.heap.shared());
-    }
     taken
 }
 

@@ -138,7 +138,8 @@ pub(crate) fn lower_async_with<A: Allocator + Copy, F: Facts, R: crate::one_call
     };
     // Only expressions evaluated by this block contribute suspension points. Evaluating a
     // closure or nested async block constructs its captures; its body has a flow of its own.
-    let mut l: Lower<'_, '_, F, A, R> = Lower::new(body, ck, facts, alloc)?;
+    let mut l: blaze_own::Box<Lower<'_, '_, F, A, R>, A> = Lower::new(body, ck, facts, alloc);
+    l.in_nested = true;
     if logged {
         l.b.start_log(alloc);
         l.per_call = true;
@@ -153,7 +154,8 @@ pub(crate) fn lower_async_with<A: Allocator + Copy, F: Facts, R: crate::one_call
     if let Some(&(_, st)) = l.uni.iter().find(|(r, _)| *r == Region::Static) {
         externals.push((st, External::Static));
     }
-    let flow = l.b.finish().map_err(|_| Refusal { form: Form::Builder, range })?;
+    let b = core::mem::replace(&mut l.b, crate::builder::Builder::new(crate::FlowBuilder::new_in(1, 0, alloc)));
+    let flow = b.finish().map_err(|_| Refusal { form: Form::Builder, range })?;
     if l.local_ty.len() != flow.locals as usize {
         return Err(Refusal { form: Form::Malformed, range });
     }
@@ -170,7 +172,9 @@ pub(crate) fn lower_async_with<A: Allocator + Copy, F: Facts, R: crate::one_call
     if l.identity.len() != flow.locals as usize {
         return Err(Refusal { form: Form::Malformed, range });
     }
-    Ok(LoweredAsync { flow, local_ty, point_of: l.points, local_wrap, identity: l.identity, range, externals, coarse: l.coarse.get() })
+    let point_of = core::mem::replace(&mut l.points, Vec::new_in(alloc));
+    let identity = core::mem::replace(&mut l.identity, Vec::new_in(alloc));
+    Ok(LoweredAsync { flow, local_ty, point_of, local_wrap, identity, range, externals, coarse: l.coarse.get() })
 }
 
 /// An async block's WITNESS (typeck.md "Witness records", W1): what its state stores, region-

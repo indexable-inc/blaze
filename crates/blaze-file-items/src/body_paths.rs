@@ -191,7 +191,7 @@ fn path_at<'t>(t: &[Tok<'t>], mut at: usize) -> Option<(WrittenPath<'t>, usize)>
 /// an attribute macro on a statement call is not). `None` for a path not read here (a `$m`, a
 /// path longer than [`MAX_SEGMENTS`], a `Self::m`).
 pub fn call_path<'t>(text: &'t str, call: &NestedCall, alloc: Alloc<'_>) -> Option<(WrittenPath<'t>, bool)> {
-    let own = text.get(call.path.start as usize..call.path.end as usize)?;
+    let own = text.get(call.range.start as usize..call.path.end as usize)?;
     let t = tokens(own, alloc);
     let (at, inert) = skip_attrs(&t, 0)?;
     let (path, end) = path_at(&t, at)?;

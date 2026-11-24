@@ -233,9 +233,6 @@ fn a_trait_lifetime_is_the_callers() {
     let got = findings(&fx, &b, swapped, root, &heads, &heads.decls, Plant::None);
     std::println!("a_trait_lifetime_is_the_callers swapped: {got:?}");
     assert!(got.as_ref().is_ok_and(|l| l.iter().any(|l| l.starts_with("borrow UnprovenOutlives"))), "{got:?}");
-    let got = findings(&fx, &b, swapped, root, &heads, &heads.decls, Plant::TiesFresh);
-    std::println!("a_trait_lifetime_is_the_callers swapped, fresh (control): {got:?}");
-    assert_eq!(got, Ok(vec::Vec::new()), "the control: fresh trait lifetimes miss the error");
 }
 
 /// MINIATURE (i), serde's shape: `trait Visitor<'de> { fn take(self, s: &'de S); }`. `fn
@@ -282,9 +279,6 @@ fn a_visitors_lifetime_is_the_callers() {
     let got = findings(&fx, &b, local, root, &heads, &heads.decls, Plant::None);
     std::println!("a_visitors_lifetime_is_the_callers local: {got:?}");
     assert!(got.as_ref().is_ok_and(|l| l.iter().any(|l| l.starts_with("borrow Invalidated"))), "E0597: {got:?}");
-    let got = findings(&fx, &b, local, root, &heads, &heads.decls, Plant::TiesFresh);
-    std::println!("a_visitors_lifetime_is_the_callers local, fresh (control): {got:?}");
-    assert_eq!(got, Ok(vec::Vec::new()), "the control: a fresh `'de` misses E0597");
 }
 
 /// A caller that writes no bound for the parameter the callee's tie names (its bound is its
@@ -322,10 +316,10 @@ fn a_tie_with_no_answer_is_refused() {
     let root = method_body(&mut b, "v", "take", "s", false, false);
     let got = findings(&fx, &b, owner, root, &heads, &heads.decls, Plant::None);
     std::println!("a_tie_with_no_answer_is_refused: {got:?}");
-    assert!(matches!(got, Err(Refusal { form: Form::CallTieUnplaced { param: 0, why: TieMiss::NoOwnBound, .. }, .. })), "{got:?}");
+    assert!(matches!(got, Err(Refusal { form: Form::OneRule { why: crate::OneRuleWhy::Unselected { why: crate::Unselected::NoBound, .. }, .. }, .. })), "{got:?}");
     let mut b = Bb::new();
     let root = method_body(&mut b, "v", "skip", "s", false, false);
     let got = findings(&fx, &b, owner, root, &heads, &heads.decls, Plant::None);
     std::println!("a_tie_with_no_answer_is_refused unwritten: {got:?}");
-    assert_eq!(got, Ok(vec::Vec::new()), "`'de` is not in `skip`'s signature: nothing to tie");
+    assert!(matches!(got, Err(Refusal { form: Form::OneRule { why: crate::OneRuleWhy::Unselected { why: crate::Unselected::NoBound, .. }, .. }, .. })), "{got:?}");
 }

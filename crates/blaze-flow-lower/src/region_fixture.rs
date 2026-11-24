@@ -564,6 +564,15 @@ impl<F: Facts> Facts for WithRegions<'_, F> {
     fn call_bounds(&self, item: ItemKey) -> Option<CallBounds<'_>> {
         self.base.call_bounds(item)
     }
+    fn is_fn_trait(&self, trait_: ItemKey) -> bool {
+        self.base.is_fn_trait(trait_)
+    }
+    fn deref_impl(&self, adt: ItemKey) -> Option<ItemKey> {
+        self.base.deref_impl(adt)
+    }
+    fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
+        self.base.is_zero_slot_builtin_assoc(trait_, name)
+    }
     fn ties(&self, item: ItemKey) -> Option<Ties<'_>> {
         self.base.ties(item)
     }

@@ -1386,7 +1386,7 @@ mod tests {
         assert!(out[seen..].contains("lib.rs:4:12: error[unresolved]: no `nope` in `crate`"), "{}", &out[seen..]);
         write(&io, "src/lib.rs", "pub fn f() -> u8 {\n    1\n}\nmod nope { pub struct Thing; }\nuse crate::nope::Thing;\n");
         let fixed = check(&io);
-        assert_eq!((fixed.errors, fixed.status), (0, Some(3)), "{}", &stdout(&io)[seen..]);
+        assert_eq!((fixed.errors, fixed.status), (0, Some(0)), "{}", &stdout(&io)[seen..]);
     }
 
     /// One task per body, keyed by its item's text: an edit inside one body checks that body
@@ -1397,10 +1397,10 @@ mod tests {
         write(&io, "Cargo.toml", MANIFEST);
         write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\npub fn g() -> u8 { 2 }\n");
         let first = check(&io);
-        assert!(first.status == Some(3) && first.entered(blaze_engine::Stage::Bodies) >= 2, "{}", first.profile);
+        assert!(first.status == Some(0) && first.entered(blaze_engine::Stage::Bodies) >= 2, "{}", first.profile);
         write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\npub fn g() -> u8 { 3 }\n");
         let edited = check(&io);
-        assert_eq!((edited.status, edited.entered(blaze_engine::Stage::Bodies)), (Some(3), 2), "one body, in its 2 units' rows (D191: \"every holder checks\": the library's and its test build's)\n{}", edited.profile);
+        assert_eq!((edited.status, edited.entered(blaze_engine::Stage::Bodies)), (Some(0), 2), "one body, in its 2 units' rows (D191: \"every holder checks\": the library's and its test build's)\n{}", edited.profile);
     }
 
     /// A body's types are checked in its own task over the crates' records. `fn f() -> u32 {
@@ -1534,18 +1534,10 @@ mod tests {
         write(&io, "Cargo.toml", MANIFEST);
         write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\n");
         let clean = check(&io);
-        assert_eq!(clean.status, Some(3), "{}", clean.profile);
+        assert_eq!(clean.status, Some(0), "{}", clean.profile);
         let out = stdout(&io);
-        let last = out.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("");
-        assert!(last.contains("incomplete"), "{out}");
-        // A narrow line keeps what was NOT checked and drops the rest (blaze-report `closing`).
-        // Its bodies' types are checked over records (piece 7): only borrows are left out.
-        assert!(last.contains("NOT checked: borrows") && !last.contains("types") && !last.contains(" ok"), "{last}");
-        // A "NOT checked" never stands without its reason: no body was refused here, so the
-        // stage's own (work.rs `CHECK_STAGES`) is a note before the closing line. Control: it
-        // names the flag that keeps the stage off, so it goes when the flag flips.
-        let reason = out.lines().find(|line| line.contains("NOT checked: borrows:")).unwrap_or_else(|| panic!("no note says why borrows were not checked:\n{out}"));
-        assert!(reason.contains("BORROWS_ARE_ERRORS"), "{reason}");
+        assert!(!out.contains("NOT checked: borrows"), "{out}");
+        assert!(!out.contains("incomplete"), "{out}");
         let io = Io::simulated(SimWorld::new(6, Limits::USUAL));
         write(&io, "Cargo.toml", MANIFEST);
         write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\nfn fn\n");
@@ -1683,7 +1675,8 @@ mod tests {
         // The body's record of the first run said "no unit graph" and read the root's units:
         // the manifest edit moves them, so the body is checked again, not left standing with
         // the old note (rule 21; the read in body_types.rs `TypesJob::units`).
-        assert!(out[seen..].contains("NOT checked: borrows") && !out[seen..].contains("NOT checked: names") && !out[seen..].contains("types"), "{}\n{}", &out[seen..], whole.profile);
+        assert_eq!(whole.status, Some(0), "{}\n{}", &out[seen..], whole.profile);
+        assert!(!out[seen..].contains("NOT checked:"), "{}\n{}", &out[seen..], whole.profile);
     }
 
     /// A module whose items come from `include!("file")` (blaze-diff's `mod rules_gen {

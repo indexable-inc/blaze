@@ -20,12 +20,16 @@ use blaze_surface::{Namespace, PathKind};
 
 const EDITION: &str = "blaze-2026.11";
 
+fn open_toolchain() -> Toolchain {
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"))
+}
+
 /// Each fn of `fns` in the crate `text`, lowered and checked in order over one store: its
 /// name and its outcome ("clean", the diagnostics, or the failure as printed).
 fn check_fns(text: &str, fns: &[&str]) -> Vec<(String, String)> {
-    let home = std::env::var("HOME").expect("HOME is set");
-    let shelf = format!("{home}/.blaze/v2/toolchain");
-    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let tc = open_toolchain();
     let files = [("/hello-world/src/main.rs".to_string(), text.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
@@ -66,11 +70,10 @@ fn check_fns(text: &str, fns: &[&str]) -> Vec<(String, String)> {
 }
 
 fn all_clean(what: &str, got: &[(String, String)]) {
-    let lines: Vec<String> = got.iter().map(|(n, o)| format!("{what}: {n}: {o}")).collect();
-    for l in &lines {
-        println!("{l}");
+    for (n, o) in got {
+        println!("{what}: {n}: {o}");
     }
-    assert!(got.iter().all(|(_, o)| o == "clean"), "{}", lines.join("\n"));
+    assert!(got.iter().all(|(_, o)| o == "clean"), "{what}: {got:?}");
 }
 
 /// Const generics in every head (the Reference, "Generic parameters", "Const generics"): a
@@ -771,9 +774,7 @@ fn adt_rows(text: &str, adts: &[&str]) -> Vec<(String, String)> {
     use blaze_ladder::front2::keys::checker_of;
     use blaze_ladder::front2::types::Why;
     use blaze_typeck::PNode;
-    let home = std::env::var("HOME").expect("HOME is set");
-    let shelf = format!("{home}/.blaze/v2/toolchain");
-    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let tc = open_toolchain();
     let files = [("/hello-world/src/main.rs".to_string(), text.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
@@ -1122,4 +1123,123 @@ fn main() {}
 ";
     let got = check_fns(TEXT, &["lo", "half"]);
     all_clean("inherent by name", &got);
+}
+
+/// A trait impl whose associated type's array length evaluates a constant that proves the
+/// impl's own trait (either as a supertrait, like `itoa`'s `trait Integer: private::Sealed`
+/// where `impl private::Sealed for i128` defines `type Buffer = [MaybeUninit<u8>;
+/// Self::MAX_STR_LEN]`, or on the same trait, like `impl ArrayLen for u32 { const N: usize =
+/// 4; type Buf = [u8; Self::N]; }`). Proving `T: Trait` needs only the impl's header and
+/// where-clauses, never its associated type values, so `Store::impl_` publishes a provisional
+/// trait-impl header while the associated type's constant evaluates, then completes and
+/// replaces it with the final `ImplHead`.
+///
+/// Also tests: exact evaluated lengths (`40` for `i128`, `20` for `u64`, `4` for `ArrayLen`),
+/// a named constant shared between an impl's associated type and a body (no `ReadsDiffer`),
+/// missing supertrait (`Bad::MAX_STR_LEN` still reports E0277), and a real self-referential
+/// associated type cycle (`type A = [u8; size_of::<<u8 as Cyc>::A>()]`, still refused).
+#[test]
+fn trait_const_array_len_with_supertrait_assoc_array() {
+    const TEXT: &str = "use core::mem::{MaybeUninit, size_of};
+pub struct Buffer {
+    bytes: [MaybeUninit<u8>; i128::MAX_STR_LEN],
+}
+impl Buffer {
+    pub fn new() -> Buffer {
+        let bytes = [MaybeUninit::<u8>::uninit(); i128::MAX_STR_LEN];
+        Buffer { bytes }
+    }
+    pub fn format<I: Integer>(&mut self, i: I) -> usize {
+        let buf_ptr = self.bytes.as_mut_ptr().cast::<I::Buffer>();
+        i.write(unsafe { &mut *buf_ptr })
+    }
+}
+pub trait Integer: private::Sealed {
+    const MAX_STR_LEN: usize;
+}
+mod private {
+    pub trait Sealed: Copy {
+        type Buffer: 'static;
+        fn write(self, buf: &mut Self::Buffer) -> usize;
+    }
+}
+impl Integer for i128 {
+    const MAX_STR_LEN: usize = i128::MAX.ilog10() as usize + 2;
+}
+impl private::Sealed for i128 {
+    type Buffer = [MaybeUninit<u8>; Self::MAX_STR_LEN];
+    fn write(self, buf: &mut Self::Buffer) -> usize { buf.len() }
+}
+impl Integer for u64 {
+    const MAX_STR_LEN: usize = u64::MAX.ilog10() as usize + 1;
+}
+impl private::Sealed for u64 {
+    type Buffer = [MaybeUninit<u8>; Self::MAX_STR_LEN];
+    fn write(self, buf: &mut Self::Buffer) -> usize { buf.len() }
+}
+trait ArrayLen {
+    const N: usize;
+    type Buf;
+}
+impl ArrayLen for u32 {
+    const N: usize = 4;
+    type Buf = [u8; Self::N];
+}
+const SHARED_LEN: usize = i128::MAX_STR_LEN;
+trait SharedTrait {
+    type Arr;
+}
+impl SharedTrait for i128 {
+    type Arr = [u8; SHARED_LEN];
+}
+#[derive(Copy, Clone)]
+struct MissingSuper;
+impl Integer for MissingSuper {
+    const MAX_STR_LEN: usize = 4;
+}
+trait Cyc {
+    type A;
+}
+impl Cyc for u8 {
+    type A = [u8; size_of::<<u8 as Cyc>::A>()];
+}
+fn use_buf() -> usize {
+    let mut b = Buffer::new();
+    b.format(42u64)
+}
+fn i128_ok(x: <i128 as private::Sealed>::Buffer) -> [MaybeUninit<u8>; 40] { x }
+fn i128_bad(x: <i128 as private::Sealed>::Buffer) -> [MaybeUninit<u8>; 41] { x }
+fn u64_ok(x: <u64 as private::Sealed>::Buffer) -> [MaybeUninit<u8>; 20] { x }
+fn u64_bad(x: <u64 as private::Sealed>::Buffer) -> [MaybeUninit<u8>; 21] { x }
+fn same_trait_ok(x: <u32 as ArrayLen>::Buf) -> [u8; 4] { x }
+fn same_trait_bad(x: <u32 as ArrayLen>::Buf) -> [u8; 5] { x }
+fn named_const_ok(x: <i128 as SharedTrait>::Arr) -> ([u8; 40], usize) { (x, SHARED_LEN) }
+fn missing_supertrait_bad() -> usize { MissingSuper::MAX_STR_LEN }
+fn real_cycle_bad(x: <u8 as Cyc>::A) -> <u8 as Cyc>::A { x }
+fn main() {}
+";
+    let got = check_fns(
+        TEXT,
+        &[
+            "use_buf",
+            "i128_ok",
+            "i128_bad",
+            "u64_ok",
+            "u64_bad",
+            "same_trait_ok",
+            "same_trait_bad",
+            "named_const_ok",
+            "missing_supertrait_bad",
+            "real_cycle_bad",
+        ],
+    );
+    let outcome = |n: &str| got.iter().find(|(m, _)| m == n).map(|(_, o)| o.as_str()).unwrap_or("");
+    for ok in ["use_buf", "i128_ok", "u64_ok", "same_trait_ok", "named_const_ok"] {
+        assert_eq!(outcome(ok), "clean", "{ok}: {got:?}");
+    }
+    for mismatch in ["i128_bad", "u64_bad", "same_trait_bad"] {
+        assert!(outcome(mismatch).contains("E0308"), "{mismatch}: {got:?}");
+    }
+    assert!(outcome("missing_supertrait_bad").contains("E0277"), "missing_supertrait_bad: {got:?}");
+    assert_ne!(outcome("real_cycle_bad"), "clean", "real_cycle_bad: {got:?}");
 }

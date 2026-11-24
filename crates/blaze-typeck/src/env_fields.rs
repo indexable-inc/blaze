@@ -423,9 +423,13 @@ pub fn cover(ck: &Checked<'_>, fields: &[EnvField], path: &UsePath) -> Cover {
             // `path` is above field `j`'s place: its value is the field's when the field is a
             // shared reference to `*path`.
             if n == steps.len() + 1
-                && f.how == CaptureKind::ByRef
+                && matches!(f.how, CaptureKind::ByRef | CaptureKind::ByMutRef)
                 && f.proj(ck, n as u32 - 1).is_some_and(|(p, _)| p == CaptureProj::Deref)
-                && f.ty_before(ck, n as u32 - 1).and_then(|t| ck.types.view().node(t).ok()).is_some_and(|t| matches!(t, PNode::Ref(Mutbl::Not, _)))
+                && f.ty_before(ck, n as u32 - 1).and_then(|t| ck.types.view().node(t).ok()).is_some_and(|t| match (t, f.how) {
+                    (PNode::Ref(Mutbl::Not, _), CaptureKind::ByRef)
+                    | (PNode::Ref(Mutbl::Mut, _), CaptureKind::ByMutRef | CaptureKind::ByRef) => true,
+                    _ => false,
+                })
             {
                 return Cover::RefOf(j);
             }
