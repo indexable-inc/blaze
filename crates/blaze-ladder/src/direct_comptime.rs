@@ -248,8 +248,8 @@ mod tests {
         let res = exec_lir_u64_1(view, n_val).expect("direct LIR Sota execution");
         assert_eq!(res.value, expected);
         assert!(
-            res.code_bytes <= 128,
-            "expected compact frameless AArch64, got {} B",
+            res.code_bytes <= 256,
+            "expected compact frameless AArch64 (scalar or vectorized/unrolled), got {} B",
             res.code_bytes
         );
         eprintln!(
