@@ -54,14 +54,16 @@ impl<A: Allocator> Pass<'_, '_, A> {
 
     /// `lo, hi = ` value's two words.
     pub(super) fn ld2(&mut self, lo: Reg, hi: Reg, value: Value) {
-        self.ld_sp(lo, value.0 * 16);
-        self.ld_sp(hi, value.0 * 16 + 8);
+        let off = self.cell_of(value.index());
+        self.ld_sp(lo, off);
+        self.ld_sp(hi, off + 8);
     }
 
     /// Stores `lo, hi` to `inst`'s cell.
     pub(super) fn st2(&mut self, lo: Reg, hi: Reg, inst: usize) {
-        self.st_sp(lo, inst as u32 * 16);
-        self.st_sp(hi, inst as u32 * 16 + 8);
+        let off = self.cell_of(inst);
+        self.st_sp(lo, off);
+        self.st_sp(hi, off + 8);
     }
 
     pub(super) fn wide(&mut self, inst: usize, op: Op) -> Result<(), EmitError> {
@@ -136,7 +138,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 self.ld2(X0, X1, a);
                 // The amount's low 7 bits (an amount of 128 or more is the walk's to check).
                 if Self::is_wide(view.ty(b)) {
-                    self.ld_sp(X2, b.0 * 16);
+                    self.ld_sp(X2, self.cell_of(b.index()));
                 } else {
                     self.ld(X2, b);
                 }
@@ -233,7 +235,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
             Op::Trunc => {
                 let a = o.value();
                 let width = self.result_width(inst, op)?;
-                self.ld_sp(X9, a.0 * 16);
+                self.ld_sp(X9, self.cell_of(a.index()));
                 self.narrow(X9, width);
                 self.st(X9, inst);
             }

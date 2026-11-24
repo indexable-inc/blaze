@@ -26,7 +26,7 @@ blaze-cunit	0	0	9	0
 blaze-dbsp	12	0	12	4
 blaze-deflate	0	0	0	1
 blaze-drive	0	0	0	1
-blaze-emit	0	0	29	0
+blaze-emit	0	0	25	0
 blaze-engine	0	0	0	2
 blaze-expand	0	0	0	9
 blaze-fetch	17	0	2	11

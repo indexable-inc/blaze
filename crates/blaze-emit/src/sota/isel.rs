@@ -2068,6 +2068,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         detect_tail_calls(&view, call_mode == CallMode::DirectBl, os, alloc)
     };
     let block_order = compute_block_order(&view, alloc);
+    let sole_switch_default = crate::pass::frame::sole_switch_defaults(view, alloc);
+    // Functions past 64K LIR instructions can exceed ARM64's ±1 MiB `Imm19`/`adr` reach; emit
+    // 2-instruction inverted conditional branches (`b.<!cond> +8; b target`, ±128 MiB reach) and
+    // avoid `adr` jump tables so gigantic functions stay natively on SOTA with zero fallback.
+    let far_branches = len >= 65_536;
 
     // 0. Compute outgoing stacked-arg area (`[sp, #0..out_area]`), outgoing `byval` scratch area
     //    (`[sp, #byval_base..byval_end]`), and local LIR stack slots (`[sp, #byval_end..spill_base]`)
@@ -2112,29 +2117,35 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         }
     }
 
-    let mut most_align: u64 = 16;
-    let mut slot_cursor: u64 = byval_base + byval_size;
-    let mut slot_at: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(view.slots.len(), alloc);
-    for slot in view.slots {
-        let align = 1u64 << slot.align;
-        most_align = most_align.max(align);
-        slot_cursor = slot_cursor.next_multiple_of(align);
-        if slot_cursor >= FRAME_LIMIT {
+    let byval_end = byval_base + byval_size;
+    // Pack LIR stack slots by lifetime (`SlotLive`/`SlotDead`/provenance) using the shared frame
+    // packer (`pass/frame.rs`). When the packed slots fit comfortably under half the 32 KiB
+    // scaled-immediate window, place slots first (so Pattern A folds `load`/`store` directly into
+    // `[sp, #imm]`); otherwise place spill slots first so large-frame functions still get up to
+    // 4095 single-instruction spill slots instead of falling back with `max_spill_slots = 0`!
+    let packed_zero = crate::pass::frame::pack_slots(view, 0, alloc)
+        .map_err(|_| TierError::Refused { tier: TIER, inst: None, what: "stack frame >= 16 MiB" })?;
+    let most_align = packed_zero.most_align;
+    let slots_after_spills = byval_end.saturating_add(packed_zero.end) >= 16384;
+    let (mut slot_at, slots_end_rel, spill_base, max_spill_slots) = if !slots_after_spills {
+        let packed = crate::pass::frame::pack_slots(view, byval_end, alloc)
+            .map_err(|_| TierError::Refused { tier: TIER, inst: None, what: "stack frame >= 16 MiB" })?;
+        let spill_base_u64 = packed.end.next_multiple_of(8);
+        if spill_base_u64 >= FRAME_LIMIT {
             return Err(TierError::Refused { tier: TIER, inst: None, what: "stack frame >= 16 MiB" });
         }
-        slot_at.push(u32_of(slot_cursor));
-        slot_cursor += u64::from(slot.size);
-        if slot_cursor >= FRAME_LIMIT {
+        let sb = u32_of(spill_base_u64);
+        let max_spills = if sb < 32760 { (32760 - sb) / 8 } else { 0 };
+        (packed.slot_at, 0u64, sb, max_spills)
+    } else {
+        let spill_base_u64 = byval_end.next_multiple_of(8);
+        if spill_base_u64 >= FRAME_LIMIT {
             return Err(TierError::Refused { tier: TIER, inst: None, what: "stack frame >= 16 MiB" });
         }
-    }
-    let spill_base_u64 = slot_cursor.next_multiple_of(8);
-    if spill_base_u64 >= FRAME_LIMIT {
-        return Err(TierError::Refused { tier: TIER, inst: None, what: "stack frame >= 16 MiB" });
-    }
-    let spill_base = u32_of(spill_base_u64);
-    // All spill slots use single-instruction `[sp, #imm12*8]` accesses (< 32 KiB).
-    let max_spill_slots = if spill_base < 32760 { (32760 - spill_base) / 8 } else { 0 };
+        let sb = u32_of(spill_base_u64);
+        let max_spills = if sb < 32760 { (32760 - sb) / 8 } else { 0 };
+        (packed_zero.slot_at, packed_zero.end, sb, max_spills)
+    };
 
     // 1. Precompute block ownership, use counts, and inline integer constants.
     let mut inst_block: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
@@ -3064,7 +3075,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 let pi = to_idx(ptr);
                 let pop = view.op(pi);
                 // Pattern A: `load`/`store` on `slot_addr(slot)` -> `[sp, #(slot_at[slot] + off)]`!
-                if pop == Op::SlotAddr {
+                if !slots_after_spills && pop == Op::SlotAddr {
                     let s_off = i64::from(at_u32(&slot_at, to_idx(at_u32(view.data, pi))));
                     let total = s_off + off;
                     if fits_off(total) {
@@ -4238,7 +4249,21 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         what: "spill slots exceeded Sota fast frame budget",
     })?;
 
-    let used_bytes = u64::from(spill_base) + u64::from(reg_alloc.num_spill_slots) * 8;
+    let spills_end = u64::from(spill_base) + u64::from(reg_alloc.num_spill_slots) * 8;
+    let used_bytes = if slots_after_spills {
+        let slots_base = spills_end.next_multiple_of(most_align);
+        let total = slots_base.saturating_add(slots_end_rel);
+        if total >= FRAME_LIMIT {
+            return Err(TierError::Refused { tier: TIER, inst: None, what: "stack frame >= 16 MiB" });
+        }
+        let delta = u32_of(slots_base);
+        for off in slot_at.iter_mut() {
+            *off = off.wrapping_add(delta);
+        }
+        total
+    } else {
+        spills_end
+    };
     let frame_size_u64 = used_bytes.next_multiple_of(16);
     if frame_size_u64 + (most_align - 16) >= FRAME_LIMIT {
         return Err(TierError::Refused { tier: TIER, inst: None, what: "stack frame >= 16 MiB" });
@@ -10556,7 +10581,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                     words.push(enc::ands(ZR, ra, rb));
                                 }
                                 let cond = if nonzero_is_then { Cond::Ne } else { Cond::Eq };
-                                emit_cond_branch_pair(&mut words, &mut patches, cond, then_block, else_block, next_block);
+                                emit_cond_branch_pair(&mut words, &mut patches, cond, then_block, else_block, next_block, far_branches);
                             }
                             Fusion::CmpBr { cond, a, b: bv, op_ty } => {
                                 let is_zero_cmp = at_opt(&const_u64, to_idx(bv)) == Some(0)
@@ -10565,58 +10590,42 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                     let ra = load_gpr(&mut words, a, X16);
                                     if next_block == Some(to_idx(else_block)) {
                                         let kind = if cond == IntCond::Eq { PatchKind::Cbz(ra) } else { PatchKind::Cbnz(ra) };
-                                        let widx = words.len();
-                                        words.push(enc::cbz(ra, 0));
-                                        patches.push(BranchPatch { word_idx: widx, kind, target_block: then_block });
+                                        emit_branch_patch(&mut words, &mut patches, kind, then_block, far_branches);
                                     } else if next_block == Some(to_idx(then_block)) {
                                         let kind = if cond == IntCond::Eq { PatchKind::Cbnz(ra) } else { PatchKind::Cbz(ra) };
-                                        let widx = words.len();
-                                        words.push(enc::cbnz(ra, 0));
-                                        patches.push(BranchPatch { word_idx: widx, kind, target_block: else_block });
+                                        emit_branch_patch(&mut words, &mut patches, kind, else_block, far_branches);
                                     } else {
                                         let kind = if cond == IntCond::Eq { PatchKind::Cbz(ra) } else { PatchKind::Cbnz(ra) };
-                                        let w1 = words.len();
-                                        words.push(enc::cbz(ra, 0));
-                                        patches.push(BranchPatch { word_idx: w1, kind, target_block: then_block });
-                                        let w2 = words.len();
-                                        words.push(enc::b(0));
-                                        patches.push(BranchPatch { word_idx: w2, kind: PatchKind::B, target_block: else_block });
+                                        emit_branch_patch(&mut words, &mut patches, kind, then_block, far_branches);
+                                        emit_branch_patch(&mut words, &mut patches, PatchKind::B, else_block, false);
                                     }
                                 } else {
                                     emit_cmp(&mut words, cond, a, bv, op_ty);
-                                    emit_cond_branch_pair(&mut words, &mut patches, cond_of(cond), then_block, else_block, next_block);
+                                    emit_cond_branch_pair(&mut words, &mut patches, cond_of(cond), then_block, else_block, next_block, far_branches);
                                 }
                             }
                             Fusion::FcmpBr { cond, a, b: bv, double } => {
                                 let va = load_fp(&mut words, a, V30);
                                 let vb = load_fp(&mut words, bv, V31);
                                 words.push(enc::fcmp(double, va, vb));
-                                emit_cond_branch_pair(&mut words, &mut patches, cond, then_block, else_block, next_block);
+                                emit_cond_branch_pair(&mut words, &mut patches, cond, then_block, else_block, next_block, far_branches);
                             }
                             Fusion::BlazeResultCallBr => {
                                 // Single-instruction `b.cs err_blk` directly on the callee's Carry flag (`C=1` = Err)!
-                                emit_cond_branch_pair(&mut words, &mut patches, Cond::Hs, then_block, else_block, next_block);
+                                emit_cond_branch_pair(&mut words, &mut patches, Cond::Hs, then_block, else_block, next_block, far_branches);
                             }
                             Fusion::ReuseFlagsBr { cond, .. } => {
-                                emit_cond_branch_pair(&mut words, &mut patches, cond, then_block, else_block, next_block);
+                                emit_cond_branch_pair(&mut words, &mut patches, cond, then_block, else_block, next_block, far_branches);
                             }
                             _ => {
                                 let rc = load_gpr(&mut words, cond_v, X16);
                                 if next_block == Some(to_idx(else_block)) {
-                                    let widx = words.len();
-                                    words.push(enc::cbnz(rc, 0));
-                                    patches.push(BranchPatch { word_idx: widx, kind: PatchKind::Cbnz(rc), target_block: then_block });
+                                    emit_branch_patch(&mut words, &mut patches, PatchKind::Cbnz(rc), then_block, far_branches);
                                 } else if next_block == Some(to_idx(then_block)) {
-                                    let widx = words.len();
-                                    words.push(enc::cbz(rc, 0));
-                                    patches.push(BranchPatch { word_idx: widx, kind: PatchKind::Cbz(rc), target_block: else_block });
+                                    emit_branch_patch(&mut words, &mut patches, PatchKind::Cbz(rc), else_block, far_branches);
                                 } else {
-                                    let w1 = words.len();
-                                    words.push(enc::cbnz(rc, 0));
-                                    patches.push(BranchPatch { word_idx: w1, kind: PatchKind::Cbnz(rc), target_block: then_block });
-                                    let w2 = words.len();
-                                    words.push(enc::b(0));
-                                    patches.push(BranchPatch { word_idx: w2, kind: PatchKind::B, target_block: else_block });
+                                    emit_branch_patch(&mut words, &mut patches, PatchKind::Cbnz(rc), then_block, far_branches);
+                                    emit_branch_patch(&mut words, &mut patches, PatchKind::B, else_block, false);
                                 }
                             }
                         }
@@ -10695,7 +10704,12 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 // Zero-move `then` arm (e.g. rotated-loop back-edge): branch DIRECTLY to
                                 // `then_block` with ZERO trampoline, falling through into cold `else` moves!
                                 let (widx, kind) = emit_br_cond(&mut words, true);
-                                patches.push(BranchPatch { word_idx: widx, kind, target_block: then_block });
+                                if far_branches {
+                                    words.pop();
+                                    emit_branch_patch(&mut words, &mut patches, kind, then_block, true);
+                                } else {
+                                    patches.push(BranchPatch { word_idx: widx, kind, target_block: then_block });
+                                }
                                 emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, else_block, else_at + 2, else_argc);
                                 if next_block != Some(to_idx(else_block)) {
                                     let w_else = words.len();
@@ -10720,7 +10734,12 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 // branch DIRECTLY to `else_block` with ZERO trampoline, falling through into
                                 // cold `then` moves (and falling straight into `then_block` when next)!
                                 let (widx, kind) = emit_br_cond(&mut words, false);
-                                patches.push(BranchPatch { word_idx: widx, kind, target_block: else_block });
+                                if far_branches {
+                                    words.pop();
+                                    emit_branch_patch(&mut words, &mut patches, kind, else_block, true);
+                                } else {
+                                    patches.push(BranchPatch { word_idx: widx, kind, target_block: else_block });
+                                }
                                 emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, then_block, at + 3, then_argc);
                                 if next_block != Some(to_idx(then_block)) {
                                     let w_then = words.len();
@@ -10816,9 +10835,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 words.push(enc::cmp(sr_hi, X17));
                             }
                             if case_argc == 0 {
-                                let widx = words.len();
-                                words.push(enc::b_cond(Cond::Eq, 0));
-                                patches.push(BranchPatch { word_idx: widx, kind: PatchKind::BCond(Cond::Eq), target_block: case_block });
+                                emit_branch_patch(&mut words, &mut patches, PatchKind::BCond(Cond::Eq), case_block, far_branches);
                                 let after = words.len();
                                 set_at(&mut words, skip_lo, enc::b_cond(Cond::Ne, i32_of(after - skip_lo)));
                             } else {
@@ -10838,7 +10855,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         if default_argc == 0
                             && !def_range.is_empty()
                             && view.op(def_range.start) == Op::Unreachable
-                            && blaze_lir::verify::sole_switch_default(&view, Block(default_block)).is_some()
+                            && sole_switch_default.get(to_idx(default_block)).copied().unwrap_or(blaze_lir::func::NONE) != blaze_lir::func::NONE
                         {
                             let sr_lo = load_h(&mut words, false);
                             if sr_lo != X9 {
@@ -10858,7 +10875,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
 
                     // Dense O(1) PC-relative jump table (`adr` + `ldrsw [tab, idx, lsl #2]` + `add` + `br`),
                     // sharing out-of-line tables across zero-move `taildup` dispatch sites for peak I-cache/L1D density!
-                    if let Some((min_v, span)) = dense_switch_plan(&view, inst) {
+                    if !far_branches
+                        && let Some((min_v, span)) = dense_switch_plan(&view, inst)
+                    {
                         // `(target_block, args_start, argc)` per dense table entry; default fills holes.
                         let mut entries: Vec<(u32, usize, usize), Alloc<'a>> = Vec::with_capacity_in(span, alloc);
                         for _ in 0..span {
@@ -11028,9 +11047,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             words.push(enc::cmp(sr, X17));
                         }
                         if case_argc == 0 {
-                            let widx = words.len();
-                            words.push(enc::b_cond(Cond::Eq, 0));
-                            patches.push(BranchPatch { word_idx: widx, kind: PatchKind::BCond(Cond::Eq), target_block: case_block });
+                            emit_branch_patch(&mut words, &mut patches, PatchKind::BCond(Cond::Eq), case_block, far_branches);
                         } else {
                             let skip_idx = words.len();
                             words.push(enc::b_cond(Cond::Ne, 0));
@@ -11047,7 +11064,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     if default_argc == 0
                         && !def_range.is_empty()
                         && view.op(def_range.start) == Op::Unreachable
-                        && blaze_lir::verify::sole_switch_default(&view, Block(default_block)).is_some()
+                        && sole_switch_default.get(to_idx(default_block)).copied().unwrap_or(blaze_lir::func::NONE) != blaze_lir::func::NONE
                         && sr != X9
                     {
                         words.push(enc::mov(X9, sr));
@@ -11214,17 +11231,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     let ord = at_u32(&unreach_ord, inst);
                     if ord != u32::MAX {
                         let blk = Block(u32_of(b));
+                        let switch_term = sole_switch_default.get(b).copied().unwrap_or(blaze_lir::func::NONE);
                         let held = if view.block(blk).start == inst
-                            && blaze_lir::verify::sole_switch_default(&view, blk).is_some()
-                            && (0..view.blocks()).any(|pb| {
-                                let term = view.terminator(Block(u32_of(pb)));
-                                if view.op(term) != Op::Switch {
-                                    return false;
-                                }
-                                let mut ops = view.operands(term);
-                                let _ = ops.value();
-                                ops.target().block == blk && dense_switch_plan(&view, term).is_none()
-                            }) {
+                            && switch_term != blaze_lir::func::NONE
+                            && (far_branches || dense_switch_plan(&view, to_idx(switch_term)).is_none())
+                        {
                             Held::Reg(9)
                         } else {
                             Held::Unknown
@@ -11246,21 +11257,62 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             inst += 1;
         }
     }
+    let encode_branch_patch = |kind: PatchKind, delta: i32| -> Result<u32, TierError> {
+        let fits_signed = |val: i32, bits: u32| -> bool {
+            let min = -(1i64 << (bits - 1));
+            let max = (1i64 << (bits - 1)) - 1;
+            let v = i64::from(val);
+            v >= min && v <= max
+        };
+        let too_far = || TierError::TooLarge { tier: TIER, what: "branch target out of reach" };
+        match kind {
+            PatchKind::B => {
+                if !fits_signed(delta, 26) {
+                    return Err(too_far());
+                }
+                Ok(enc::b(delta))
+            }
+            PatchKind::BCond(c) => {
+                if !fits_signed(delta, 19) {
+                    return Err(too_far());
+                }
+                Ok(enc::b_cond(c, delta))
+            }
+            PatchKind::Cbz(r) => {
+                if !fits_signed(delta, 19) {
+                    return Err(too_far());
+                }
+                Ok(enc::cbz(r, delta))
+            }
+            PatchKind::Cbnz(r) => {
+                if !fits_signed(delta, 19) {
+                    return Err(too_far());
+                }
+                Ok(enc::cbnz(r, delta))
+            }
+            PatchKind::Tbz(r, bit) => {
+                if !fits_signed(delta, 14) {
+                    return Err(too_far());
+                }
+                Ok(enc::tbz(r, bit, delta))
+            }
+            PatchKind::Tbnz(r, bit) => {
+                if !fits_signed(delta, 14) {
+                    return Err(too_far());
+                }
+                Ok(enc::tbnz(r, bit, delta))
+            }
+            PatchKind::JumpTableEntry { .. } => {
+                Err(TierError::Refused { tier: TIER, inst: None, what: "unexpected jump table patch kind" })
+            }
+        }
+    };
+
     // 4b. Emit deferred cold edge-move stubs at the tail of the function (out of hot I-cache lines).
     for stub in &cold_stubs {
         let stub_w = words.len();
         let delta = word_delta(stub_w, stub.branch_word_idx);
-        set_at(&mut words, stub.branch_word_idx, match stub.branch_kind {
-            PatchKind::B => enc::b(delta),
-            PatchKind::BCond(c) => enc::b_cond(c, delta),
-            PatchKind::Cbz(r) => enc::cbz(r, delta),
-            PatchKind::Cbnz(r) => enc::cbnz(r, delta),
-            PatchKind::Tbz(r, bit) => enc::tbz(r, bit, delta),
-            PatchKind::Tbnz(r, bit) => enc::tbnz(r, bit, delta),
-            PatchKind::JumpTableEntry { .. } => {
-                return Err(TierError::Refused { tier: TIER, inst: None, what: "unexpected cold stub patch kind" });
-            }
-        });
+        set_at(&mut words, stub.branch_word_idx, encode_branch_patch(stub.branch_kind, delta)?);
         emit_edge_moves(
             &mut words,
             &mut gpr_moves,
@@ -11283,6 +11335,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         let table_start_word = words.len();
         for &adr_w in &tab.adr_sites {
             let byte_delta = word_delta(table_start_word, adr_w).wrapping_mul(4);
+            let bd = i64::from(byte_delta);
+            if !(-(1i64 << 20)..(1i64 << 20)).contains(&bd) {
+                return Err(TierError::TooLarge { tier: TIER, what: "jump-table adr target out of reach" });
+            }
             set_at(&mut words, adr_w, enc::adr(X17, byte_delta));
         }
         for &tb in &tab.targets {
@@ -11345,17 +11401,13 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     for p in &patches {
         let target_w = at_usize(&block_word_off, to_idx(p.target_block));
         let delta = word_delta(target_w, p.word_idx);
-        set_at(&mut words, p.word_idx, match p.kind {
-            PatchKind::B => enc::b(delta),
-            PatchKind::BCond(c) => enc::b_cond(c, delta),
-            PatchKind::Cbz(r) => enc::cbz(r, delta),
-            PatchKind::Cbnz(r) => enc::cbnz(r, delta),
-            PatchKind::Tbz(r, bit) => enc::tbz(r, bit, delta),
-            PatchKind::Tbnz(r, bit) => enc::tbnz(r, bit, delta),
+        let word = match p.kind {
             PatchKind::JumpTableEntry { table_start_word } => {
                 word_delta(target_w, table_start_word).wrapping_mul(4).cast_unsigned()
             }
-        });
+            other => encode_branch_patch(other, delta)?,
+        };
+        set_at(&mut words, p.word_idx, word);
     }
 
     // 5b. Finalize unwind rows now that every landing block's exact byte offset is known.
@@ -11401,6 +11453,53 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
 }
 
 #[inline]
+fn emit_branch_patch<'a>(
+    words: &mut Vec<u32, Alloc<'a>>,
+    patches: &mut Vec<BranchPatch, Alloc<'a>>,
+    kind: PatchKind,
+    target_block: u32,
+    far_branches: bool,
+) {
+    if far_branches {
+        match kind {
+            PatchKind::BCond(c) => {
+                words.push(enc::b_cond(invert_cond(c), 2));
+                let wb = words.len();
+                words.push(enc::b(0));
+                patches.push(BranchPatch { word_idx: wb, kind: PatchKind::B, target_block });
+                return;
+            }
+            PatchKind::Cbz(r) => {
+                words.push(enc::cbnz(r, 2));
+                let wb = words.len();
+                words.push(enc::b(0));
+                patches.push(BranchPatch { word_idx: wb, kind: PatchKind::B, target_block });
+                return;
+            }
+            PatchKind::Cbnz(r) => {
+                words.push(enc::cbz(r, 2));
+                let wb = words.len();
+                words.push(enc::b(0));
+                patches.push(BranchPatch { word_idx: wb, kind: PatchKind::B, target_block });
+                return;
+            }
+            _ => {}
+        }
+    }
+    let widx = words.len();
+    words.push(match kind {
+        PatchKind::B => enc::b(0),
+        PatchKind::BCond(c) => enc::b_cond(c, 0),
+        PatchKind::Cbz(r) => enc::cbz(r, 0),
+        PatchKind::Cbnz(r) => enc::cbnz(r, 0),
+        PatchKind::Tbz(r, bit) => enc::tbz(r, bit, 0),
+        PatchKind::Tbnz(r, bit) => enc::tbnz(r, bit, 0),
+        PatchKind::JumpTableEntry { .. } => 0,
+    });
+    patches.push(BranchPatch { word_idx: widx, kind, target_block });
+}
+
+#[inline]
 fn emit_cond_branch_pair<'a>(
     words: &mut Vec<u32, Alloc<'a>>,
     patches: &mut Vec<BranchPatch, Alloc<'a>>,
@@ -11408,23 +11507,15 @@ fn emit_cond_branch_pair<'a>(
     then_block: u32,
     else_block: u32,
     next_block: Option<usize>,
+    far_branches: bool,
 ) {
     if next_block == Some(to_idx(else_block)) {
-        let widx = words.len();
-        words.push(enc::b_cond(cond, 0));
-        patches.push(BranchPatch { word_idx: widx, kind: PatchKind::BCond(cond), target_block: then_block });
+        emit_branch_patch(words, patches, PatchKind::BCond(cond), then_block, far_branches);
     } else if next_block == Some(to_idx(then_block)) {
-        let inv = invert_cond(cond);
-        let widx = words.len();
-        words.push(enc::b_cond(inv, 0));
-        patches.push(BranchPatch { word_idx: widx, kind: PatchKind::BCond(inv), target_block: else_block });
+        emit_branch_patch(words, patches, PatchKind::BCond(invert_cond(cond)), else_block, far_branches);
     } else {
-        let w1 = words.len();
-        words.push(enc::b_cond(cond, 0));
-        patches.push(BranchPatch { word_idx: w1, kind: PatchKind::BCond(cond), target_block: then_block });
-        let w2 = words.len();
-        words.push(enc::b(0));
-        patches.push(BranchPatch { word_idx: w2, kind: PatchKind::B, target_block: else_block });
+        emit_branch_patch(words, patches, PatchKind::BCond(cond), then_block, far_branches);
+        emit_branch_patch(words, patches, PatchKind::B, else_block, false);
     }
 }
 

@@ -1005,23 +1005,31 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
         inst_block.push(0);
     }
 
-    // 0. Compute per-block loop nesting depth from backward CFG edges (`target <= b`).
-    let mut block_depth: Vec<u32, A> = Vec::with_capacity_in(blocks, alloc);
-    for _ in 0..blocks {
-        block_depth.push(0);
+    // 0. Compute per-block loop nesting depth from backward CFG edges (`target <= b`) in O(B) via
+    //    a difference array.
+    let mut depth_diff: Vec<i32, A> = Vec::with_capacity_in(blocks + 1, alloc);
+    for _ in 0..=blocks {
+        depth_diff.push(0);
     }
     for b in 0..blocks {
         let term = view.terminator(Block(u32_of(b)));
         for_each_edge(view, term, |target_block, _, _| {
             let tb = idx(target_block);
             if tb <= b {
-                if let Some(slice) = block_depth.get_mut(tb..=b) {
-                    for d in slice {
-                        *d = d.saturating_add(1);
-                    }
+                if let Some(s) = depth_diff.get_mut(tb) {
+                    *s = s.saturating_add(1);
+                }
+                if let Some(e) = depth_diff.get_mut(b + 1) {
+                    *e = e.saturating_sub(1);
                 }
             }
         });
+    }
+    let mut block_depth: Vec<u32, A> = Vec::with_capacity_in(blocks, alloc);
+    let mut cur_depth: i32 = 0;
+    for b in 0..blocks {
+        cur_depth = cur_depth.saturating_add(depth_diff.get(b).copied().unwrap_or(0));
+        block_depth.push(u32::try_from(cur_depth.max(0)).unwrap_or(u32::MAX));
     }
 
     // 1. Compute live intervals `[def, last_use]`, call sites, and loop-weighted spill priorities.
@@ -1129,33 +1137,62 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
     }
 
     // Extend live intervals across backward CFG edges (loops and backward unwind edges) to a fixed point.
-    loop {
-        let mut changed = false;
-        for b in 0..blocks {
-            let term = view.terminator(Block(u32_of(b)));
-            let term_is_invoke = matches!(view.op(term), Op::Invoke | Op::InvokeIndirect);
-            for_each_edge(view, term, |target_block, _, _| {
-                let target_start = view.block(Block(target_block)).start;
-                if target_start <= term {
-                    let ext_end = if term_is_invoke { term.saturating_add(1) } else { term };
-                    if let (Some(used_slice), Some(lu_slice)) =
-                        (has_any_use.get(..target_start), last_use.get_mut(..target_start))
-                    {
-                        for (&used, lu) in used_slice.iter().zip(lu_slice.iter_mut()) {
-                            if used && *lu >= target_start && *lu < ext_end {
+    // Deduplicate back-edges by `target_start` (keeping max `ext_end`), and only scan values whose
+    // live interval crosses a block boundary (block-local values can never span a block start).
+    let mut back_edges: Vec<(usize, usize), A> = Vec::new_in(alloc);
+    for b in 0..blocks {
+        let term = view.terminator(Block(u32_of(b)));
+        let term_is_invoke = matches!(view.op(term), Op::Invoke | Op::InvokeIndirect);
+        for_each_edge(view, term, |target_block, _, _| {
+            let target_start = view.block(Block(target_block)).start;
+            if target_start <= term {
+                let ext_end = if term_is_invoke { term.saturating_add(1) } else { term };
+                back_edges.push((target_start, ext_end));
+            }
+        });
+    }
+    if !back_edges.is_empty() {
+        back_edges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+        let mut unique_edges: Vec<(usize, usize), A> = Vec::with_capacity_in(back_edges.len(), alloc);
+        for &(ts, ee) in &back_edges {
+            if unique_edges.last().is_none_or(|&(prev_ts, _)| prev_ts != ts) {
+                unique_edges.push((ts, ee));
+            }
+        }
+        let mut cross_vals: Vec<usize, A> = Vec::new_in(alloc);
+        let mut skip_list: Vec<usize, A> = Vec::new_in(alloc);
+        for inst in 0..len {
+            if skip_alloc.get(inst).copied().unwrap_or(false) {
+                skip_list.push(inst);
+            }
+            if has_any_use.get(inst).copied().unwrap_or(false) {
+                let b = inst_block.get(inst).copied().unwrap_or(0);
+                let b_end = view.block(Block(b)).end;
+                let lu = last_use.get(inst).copied().unwrap_or(0);
+                if lu >= b_end {
+                    cross_vals.push(inst);
+                }
+            }
+        }
+        loop {
+            let mut changed = false;
+            for &(target_start, ext_end) in &unique_edges {
+                let hi_idx = cross_vals.partition_point(|&v| v < target_start);
+                if let Some(slice) = cross_vals.get(..hi_idx) {
+                    for &v in slice {
+                        if let Some(lu) = last_use.get_mut(v) {
+                            if *lu >= target_start && *lu < ext_end {
                                 *lu = ext_end;
                                 changed = true;
                             }
                         }
                     }
                 }
-            });
-        }
-        if !changed {
-            break;
-        }
-        for inst in (0..len).rev() {
-            if skip_alloc.get(inst).copied().unwrap_or(false) {
+            }
+            if !changed {
+                break;
+            }
+            for &inst in skip_list.iter().rev() {
                 let consumer_end = last_use.get(inst).copied().unwrap_or(0);
                 for_each_use(view, inst, |v| {
                     let vi = idx(v);
@@ -1444,26 +1481,96 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
         prog_order.push(Candidate { inst, end, weight, is_remat });
     }
 
-    let run_coloring = |order: &[Candidate]| -> Result<(Vec<AllocLoc, A>, [bool; 32], [bool; 32], u32, u32, u64), RegAllocError> {
+    const BUSY_BUCKET_SHIFT: u32 = 10;
+    const BUSY_BUCKET_SPAN: usize = 1 << BUSY_BUCKET_SHIFT;
+    let num_buckets = (len >> BUSY_BUCKET_SHIFT) + 1;
+
+    #[inline]
+    fn intervals_conflict(s: usize, e: usize, s_rbw: bool, start: usize, end: usize, cur_rbw: bool) -> bool {
+        (start < e && s < end)
+            || start == s
+            || (start == e && !cur_rbw)
+            || (end == s && !s_rbw)
+    }
+
+    enum BusySet<A: Allocator> {
+        /// Monotonic ascending `start` order (Phase 1): only the latest interval can overlap.
+        Monotonic(Option<(usize, usize, bool)>),
+        /// Arbitrary insertion order (Phase 2): O(1) amortized bucketed intervals.
+        Bucketed {
+            long: Vec<(usize, usize, bool), A>,
+            buckets: Vec<Vec<(usize, usize, bool), A>, A>,
+        },
+    }
+
+    impl<A: Allocator + Copy> BusySet<A> {
+        fn new(monotonic: bool, num_buckets: usize, alloc: A) -> Self {
+            if monotonic {
+                Self::Monotonic(None)
+            } else {
+                let mut buckets = Vec::with_capacity_in(num_buckets, alloc);
+                for _ in 0..num_buckets {
+                    buckets.push(Vec::new_in(alloc));
+                }
+                Self::Bucketed { long: Vec::new_in(alloc), buckets }
+            }
+        }
+
+        #[inline]
+        fn is_free(&self, start: usize, end: usize, cur_rbw: bool) -> bool {
+            match self {
+                Self::Monotonic(None) => true,
+                Self::Monotonic(Some((s, e, s_rbw))) => !intervals_conflict(*s, *e, *s_rbw, start, end, cur_rbw),
+                Self::Bucketed { long, buckets } => {
+                    if long.iter().any(|&(s, e, s_rbw)| intervals_conflict(s, e, s_rbw, start, end, cur_rbw)) {
+                        return false;
+                    }
+                    let lo_b = (start >> BUSY_BUCKET_SHIFT).saturating_sub(1);
+                    let hi_b = (end >> BUSY_BUCKET_SHIFT).min(buckets.len().saturating_sub(1));
+                    if let Some(slice) = buckets.get(lo_b..=hi_b) {
+                        for b in slice {
+                            if b.iter().any(|&(s, e, s_rbw)| intervals_conflict(s, e, s_rbw, start, end, cur_rbw)) {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                }
+            }
+        }
+
+        #[inline]
+        fn insert(&mut self, start: usize, end: usize, rbw: bool) {
+            match self {
+                Self::Monotonic(last) => *last = Some((start, end, rbw)),
+                Self::Bucketed { long, buckets } => {
+                    if end.saturating_sub(start) > BUSY_BUCKET_SPAN {
+                        long.push((start, end, rbw));
+                    } else if let Some(b) = buckets.get_mut(start >> BUSY_BUCKET_SHIFT) {
+                        b.push((start, end, rbw));
+                    } else {
+                        long.push((start, end, rbw));
+                    }
+                }
+            }
+        }
+    }
+
+    let run_coloring = |order: &[Candidate], monotonic: bool| -> Result<(Vec<AllocLoc, A>, [bool; 32], [bool; 32], u32, u32, u64), RegAllocError> {
         let mut loc_try: Vec<AllocLoc, A> = Vec::with_capacity_in(len, alloc);
         for _ in 0..len {
             loc_try.push(AllocLoc::None);
         }
-        let mut gpr_busy: Vec<Vec<(usize, usize, bool), A>, A> = Vec::with_capacity_in(32, alloc);
-        let mut fp_busy: Vec<Vec<(usize, usize, bool), A>, A> = Vec::with_capacity_in(32, alloc);
+        let mut gpr_busy: Vec<BusySet<A>, A> = Vec::with_capacity_in(32, alloc);
+        let mut fp_busy: Vec<BusySet<A>, A> = Vec::with_capacity_in(32, alloc);
         for _ in 0..32 {
-            gpr_busy.push(Vec::new_in(alloc));
-            fp_busy.push(Vec::new_in(alloc));
+            gpr_busy.push(BusySet::new(monotonic, num_buckets, alloc));
+            fp_busy.push(BusySet::new(monotonic, num_buckets, alloc));
         }
-        let is_reg_free = |busy: &[(usize, usize, bool)], start: usize, end: usize, cur_rbw: bool| -> bool {
-            !busy.iter().any(|&(s, e, s_rbw)| {
-                (start < e && s < end)
-                    || start == s
-                    || (start == e && !cur_rbw)
-                    || (end == s && !s_rbw)
-            })
+        let is_reg_free = |busy: &BusySet<A>, start: usize, end: usize, cur_rbw: bool| -> bool {
+            busy.is_free(start, end, cur_rbw)
         };
-        let mut spill_busy: Vec<Vec<(usize, usize), A>, A> = Vec::new_in(alloc);
+        let mut spill_busy: Vec<BusySet<A>, A> = Vec::new_in(alloc);
         let mut used_callee_gpr = [false; 32];
         let mut used_callee_fp = [false; 32];
         let mut num_spill_slots = 0u32;
@@ -1475,9 +1582,9 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
             if spill_busy.len() >= slots {
                 for slot_idx in 0..=(spill_busy.len() - slots) {
                     if let Some(window) = spill_busy.get_mut(slot_idx..slot_idx + slots) {
-                        if window.iter().all(|s_iv| !s_iv.iter().any(|&(s, e)| start <= e && s <= end)) {
+                        if window.iter().all(|s_iv| s_iv.is_free(start, end, false)) {
                             for s_iv in window {
-                                s_iv.push((start, end));
+                                s_iv.insert(start, end, false);
                             }
                             return Ok(u32_of(slot_idx));
                         }
@@ -1490,8 +1597,8 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
             let slot = num_spill_slots;
             num_spill_slots += slots_u32;
             for _ in 0..slots {
-                let mut iv = Vec::new_in(alloc);
-                iv.push((start, end));
+                let mut iv = BusySet::new(monotonic, num_buckets, alloc);
+                iv.insert(start, end, false);
                 spill_busy.push(iv);
             }
             Ok(slot)
@@ -1518,8 +1625,12 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
 
             let mut crossed_clobbers = CallClobbers::EMPTY;
             let mut crosses_call = false;
-            for &c in &call_positions {
-                if c > inst && c < end {
+            let first_call = call_positions.partition_point(|&c| c <= inst);
+            if let Some(calls) = call_positions.get(first_call..) {
+                for &c in calls {
+                    if c >= end {
+                        break;
+                    }
                     crosses_call = true;
                     // Unwinding out of an `Invoke` clobbers all caller-saved regs regardless of IPRA.
                     let clob = if matches!(view.op(c), Op::Invoke | Op::InvokeIndirect) {
@@ -1528,6 +1639,11 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                         call_clobbers(c)
                     };
                     crossed_clobbers.clobbered = crossed_clobbers.clobbered.union(clob.clobbered);
+                    if crossed_clobbers.clobbered.union(CallClobbers::C_ABI_ARM64.clobbered)
+                        == crossed_clobbers.clobbered
+                    {
+                        break;
+                    }
                 }
             }
             let gpr_safe = |r: Reg| -> bool {
@@ -1539,7 +1655,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
 
             let cur_rbw = is_rbw(view, inst);
             if is_gpr_pair_ty(view, ty) {
-                let pool_pick = |busy: &[Vec<(usize, usize, bool), A>], skip: Option<Reg>| -> Option<Reg> {
+                let pool_pick = |busy: &[BusySet<A>], skip: Option<Reg>| -> Option<Reg> {
                     caller_gpr_order
                         .iter()
                         .copied()
@@ -1557,10 +1673,10 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                         *slot = AllocLoc::GprPair(reg_u8(lo), reg_u8(hi));
                     }
                     if let Some(b) = gpr_busy.get_mut(idx(lo)) {
-                        b.push((inst, end, cur_rbw));
+                        b.insert(inst, end, cur_rbw);
                     }
                     if let Some(b) = gpr_busy.get_mut(idx(hi)) {
-                        b.push((inst, end, cur_rbw));
+                        b.insert(inst, end, cur_rbw);
                     }
                     if (X19..=X28).contains(&lo) {
                         if let Some(u) = used_callee_gpr.get_mut(idx(lo)) {
@@ -1639,7 +1755,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                         *slot = AllocLoc::Vec(reg_u8(reg));
                     }
                     if let Some(b) = fp_busy.get_mut(idx(reg)) {
-                        b.push((inst, end, cur_rbw));
+                        b.insert(inst, end, cur_rbw);
                     }
                     if (8..=15).contains(&reg) {
                         if let Some(u) = used_callee_fp.get_mut(idx(reg)) {
@@ -1700,7 +1816,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                         *slot = AllocLoc::Fp(reg_u8(reg));
                     }
                     if let Some(b) = fp_busy.get_mut(idx(reg)) {
-                        b.push((inst, end, cur_rbw));
+                        b.insert(inst, end, cur_rbw);
                     }
                     if (8..=15).contains(&reg) {
                         if let Some(u) = used_callee_fp.get_mut(idx(reg)) {
@@ -1767,7 +1883,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                         *slot = AllocLoc::Gpr(reg_u8(reg));
                     }
                     if let Some(b) = gpr_busy.get_mut(idx(reg)) {
-                        b.push((inst, end, cur_rbw));
+                        b.insert(inst, end, cur_rbw);
                     }
                     if (X19..=X28).contains(&reg) {
                         if let Some(u) = used_callee_gpr.get_mut(idx(reg)) {
@@ -1794,7 +1910,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
 
     // Phase 1: exact chordal-SSA program-order coloring (provably minimal register count!).
     let (mut final_loc, mut used_callee_gpr, mut used_callee_fp, mut num_spill_slots, mut remat_count, spill_cost) =
-        run_coloring(&prog_order)?;
+        run_coloring(&prog_order, true)?;
 
     // Phase 2: if register pressure overflowed (spills > 0 or remat > 0), run loop-weighted
     // Greedy Priority Coloring so hot inner loops NEVER spill while cold outer values/constants
@@ -1811,7 +1927,7 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
                 .then_with(|| a.is_remat.cmp(&b.is_remat))
                 .then_with(|| a.inst.cmp(&b.inst))
         });
-        if let Ok((g_loc, g_cgpr, g_cfp, g_spills, g_remat, g_cost)) = run_coloring(&greedy_order) {
+        if let Ok((g_loc, g_cgpr, g_cfp, g_spills, g_remat, g_cost)) = run_coloring(&greedy_order, false) {
             if g_cost < spill_cost || (g_cost == spill_cost && g_spills <= num_spill_slots) {
                 final_loc = g_loc;
                 used_callee_gpr = g_cgpr;

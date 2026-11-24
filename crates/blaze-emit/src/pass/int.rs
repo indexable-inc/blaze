@@ -207,7 +207,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
         }
         self.narrow(X11, width);
         self.st(X11, inst);
-        self.st_sp(X12, inst as u32 * 16 + 8);
+        self.st_sp(X12, self.cell_of(inst) + 8);
         Ok(())
     }
 

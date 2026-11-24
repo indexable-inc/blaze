@@ -37,7 +37,7 @@ blaze-data	3	0	4	0
 blaze-dbsp	14	1	0	36
 blaze-deflate	11	0	1	6
 blaze-ed25519	3	0	0	1
-blaze-emit	0	0	23	50
+blaze-emit	0	0	23	46
 blaze-engine	0	0	0	14
 blaze-expand	32	0	0	38
 blaze-export	12	0	0	0

@@ -172,7 +172,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
         }
         let base = named_end.next_multiple_of(8);
         let area = (base + area_of(slots)).next_multiple_of(16);
-        if area >= super::stack::MOST_AREA || view.len() as u64 * 16 + u64::from(area) >= super::FRAME_LIMIT {
+        if area >= super::stack::MOST_AREA || self.cells_end + u64::from(area) >= super::FRAME_LIMIT {
             return Err(EmitError::TooLarge { what: "a call's stacked arguments (1 MiB, and every cell below 16 MiB while they are open)" });
         }
         // The registers, while every cell is still at its own offset.
@@ -201,7 +201,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 // zero-extended to 64 bits (lib.rs, "Values"); the callee's `va_arg` of an `int`
                 // reads the slot's low 4 bytes (little-endian), of a `long`, a pointer or a
                 // `double` all 8.
-                self.ld_sp(X9, value.0 * 16 + area);
+                self.ld_sp(X9, self.cell_of(value.index()) + area);
                 self.st_sp_sized(Size::X, X9, base + offset);
             }
         }

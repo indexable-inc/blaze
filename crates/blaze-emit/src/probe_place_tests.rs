@@ -55,7 +55,7 @@ impl Names for Nameless {
 }
 
 /// `f() = ret`, with one stack slot of `slot` bytes aligned to `1 << align` and nothing else:
-/// its frame is one 16-byte cell (the `ret`), the slot at its alignment, rounded to 16, plus
+/// its frame is the slot at its alignment (`ret` takes 0 cell bytes), rounded to 16, plus
 /// `(1 << align) - 16` for the rounding of `sp` (pass.rs, `run`; pass/probe.rs, `frame_bytes`).
 fn framed(slot: u32, align: u8) -> Func<Global> {
     let mut b = Builder::<Global, Full>::new_in(64, Global);
@@ -179,20 +179,20 @@ fn the_probe_tail_is_inside_the_record_instructions() {
 }
 
 /// A slot aligned past 16 bytes: the prologue rounds `sp` down after the frame's `sub`s, which
-/// drops it by up to `align - 16` more. A 2048-byte slot at 1 KiB: frame `3072 + 1008 = 4080`
+/// drops it by up to `align - 16` more. A 3072-byte slot at 1 KiB: frame `3072 + 1008 = 4080`
 /// (`16 + 4080` is at the bound, so a count of the frame alone pays nothing), drop up to
 /// `4080 + 1008`: past a page, so it is probed and the tail touches the frame's bottom before the
-/// rounding. A 16-byte slot at 1 KiB: frame `1040 + 1008 = 2048`, drop at most 3056: no probe,
+/// rounding. A 1040-byte slot at 1 KiB: frame `1040 + 1008 = 2048`, drop at most 3056: no probe,
 /// the two `sub`s. The first version counted the frame alone and fails the first case. Prints
 /// "an over-aligned frame counts its rounding".
 #[test]
 fn an_over_aligned_frame_counts_its_rounding() {
-    let small = emitted(framed(16, 10).view(), &[]).expect("emits");
+    let small = emitted(framed(1040, 10).view(), &[]).expect("emits");
     assert_eq!(word(&small.bytes, FRAME_AT), enc::sub_imm(SP, SP, 0, true), "a 2048-byte frame keeps its first `sub`");
     assert_eq!(word(&small.bytes, FRAME_AT + 4), enc::sub_imm(SP, SP, 2048, false), "a 2048-byte frame keeps its second `sub`");
 
     let entry: u64 = 1 << 40;
-    let code = emitted(framed(2048, 10).view(), &[]).expect("emits");
+    let code = emitted(framed(3072, 10).view(), &[]).expect("emits");
     let bytes = &code.bytes;
     let first = word(bytes, FRAME_AT);
     assert_eq!(first & 0xfc00_0000, 0x1400_0000, "a 4080-byte frame aligned to 1 KiB is probed: {first:#010x}");

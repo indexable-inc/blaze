@@ -267,7 +267,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
             let Some(v) = p.input else { continue };
             let ty = view.ty(v);
             let bits = bits_of(self.width(ty), ty).map_err(|why| unsupported(inst, op, why))?;
-            let off = v.0 * 16;
+            let off = self.cell_of(v.index());
             match (p.bank, bits) {
                 (Bank::X, Some(_)) => self.asm_word(true, p.reg, off, far),
                 (Bank::X, None) => return Err(unsupported(inst, op, "an `i128` or `f128` `asm!` operand in a general register")),
@@ -305,7 +305,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
         for p in placed.iter().flatten() {
             let Some(member) = p.member else { continue };
             let (ty, off) = match pair {
-                None => (result, inst as u32 * 16),
+                None => (result, self.cell_of(inst)),
                 Some(tys) => (tys[member as usize], self.value_word_at(inst, member)),
             };
             let bits = bits_of(self.width(ty), ty).map_err(|why| unsupported(inst, op, why))?;
