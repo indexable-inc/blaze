@@ -4303,3 +4303,158 @@ fn daemon_head_generation_on_disk_catches_external_commits() {
     drop(lent);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Bounded-window streamed commit DST (rule 43): commits records spanning `Plain::put`, external
+/// `Batch`es, and `LentRecord`s (including an oversized 10 KiB single record under a 2 KiB piece
+/// cap) through `Driven::commit_records` with shuffled completions in `Sim`, asserting:
+/// 1. Peak in-flight payload `WriteAt` bytes never exceeds `COMMIT_PIECES_IN_FLIGHT * piece_bytes`.
+/// 2. Every committed record reads back equal and the on-disk segment bytes match `seal_segment`
+///    byte-for-byte.
+/// 3. A planted unbounded commit (`Plant::CommitWholeWindow`) is caught by the commit meter.
+fn run_commit_meter_case(seed: u64, plant: Plant) -> Result<(), &'static str> {
+    use super::core::{COMMIT_PIECES_IN_FLIGHT, LentRecord};
+    use super::driven::Driven;
+    use super::format::{record_crc, seal_segment};
+    use crate::plain::Batch;
+    use blaze_keyed::exec::RecordRef;
+
+    let piece_bytes = 2048usize;
+    let window_cap = u64::from(COMMIT_PIECES_IN_FLIGHT) * (piece_bytes as u64);
+    let root = test_root();
+    let base = (seed as u32) * 100;
+
+    let mut expected: blaze_own::Vec<(Key, blaze_own::Vec<u8, &blaze_mem::Frame>), &blaze_mem::Frame> = blaze_own::Vec::new_in(&root);
+    // 1. Store's own puts (small records)
+    for i in 0..12u32 {
+        let k = key(1000 + base + i);
+        let mut v: blaze_own::Vec<u8, &blaze_mem::Frame> = blaze_own::Vec::from_elem_in(((i * 31 + seed as u32) & 0xff) as u8, 700 + (i as usize) * 53, &root);
+        v[0] = (i & 0xff) as u8;
+        expected.push((k, v));
+    }
+    // 2. External worker batch (including an oversized 10 KiB single record > piece_bytes)
+    let mut batch = Batch::new(Namespace::LOCAL);
+    let big_k = key(2000 + base);
+    let big_v: blaze_own::Vec<u8, &blaze_mem::Frame> = blaze_own::Vec::from_iter_in((0..10_333usize).map(|j| ((j * 17 + seed as usize) & 0xff) as u8), &root);
+    batch.put(big_k, TAG, &big_v).map_err(|_| "batch put")?;
+    expected.push((big_k, big_v));
+    for i in 1..6u32 {
+        let k = key(2000 + base + i);
+        let v: blaze_own::Vec<u8, &blaze_mem::Frame> = blaze_own::Vec::from_iter_in((0..(1_300 + (i as usize) * 211)).map(|j| ((j * 13 + i as usize) & 0xff) as u8), &root);
+        batch.put(k, TAG, &v).map_err(|_| "batch put")?;
+        expected.push((k, v));
+    }
+    // 3. Lent records (simulating shared arena records)
+    let mut lent_bufs: blaze_own::Vec<(Key, blaze_own::Vec<u8, &blaze_mem::Frame>), &blaze_mem::Frame> = blaze_own::Vec::new_in(&root);
+    for i in 0..8u32 {
+        let k = key(3000 + base + i);
+        let v: blaze_own::Vec<u8, &blaze_mem::Frame> = blaze_own::Vec::from_iter_in((0..(1_900 + (i as usize) * 173)).map(|j| ((j * 7 + seed as usize) & 0xff) as u8), &root);
+        lent_bufs.push((k, v));
+    }
+    let lent_recs: blaze_own::Vec<LentRecord<'_>, &blaze_mem::Frame> = blaze_own::Vec::from_iter_in(
+        lent_bufs.iter().map(|(k, v)| LentRecord { key: *k, namespace: Namespace::LOCAL, tag: TAG, bytes: v.as_slice(), crc: record_crc(&k.0, TAG, v) }),
+        &root,
+    );
+    for (k, v) in &lent_bufs {
+        let mut copy = blaze_own::Vec::with_capacity_in(v.len(), &root);
+        copy.extend_from_slice(v);
+        expected.push((*k, copy));
+    }
+
+    // Meter every seg-* WriteAt during streamed commit via `Sim` + `Meter`.
+    let mut sim = Sim::new(seed.wrapping_add(17), Faults::default());
+    let mut actors = [Actor::new(cfg(1, 2, true, &root), &root, plant)];
+    settle(&mut sim, &mut actors);
+    actors[0].store.set_stream_commits(true);
+    actors[0].store.set_commit_piece_bytes(piece_bytes);
+    actors[0].store.map_all(sim.wall_ns(), &mut actors[0].effects).map_err(|_| "map_all")?;
+    settle(&mut sim, &mut actors);
+    let mut meter = Meter::default();
+    let mut done = Default::default();
+    for (k, v) in expected.iter().take(12) {
+        actors[0].store.put(*k, Namespace::LOCAL, TAG, v).map_err(|_| "plain put")?;
+    }
+    meter.on = true;
+    actors[0]
+        .store
+        .commit_records(&[&batch], &lent_recs, sim.wall_ns(), &mut actors[0].effects)
+        .map_err(|_| "commit_records")?;
+    loop {
+        for e in &actors[0].effects {
+            meter.asked(e);
+        }
+        sim.submit(&mut actors[0].effects);
+        if sim.in_flight() == 0 {
+            break;
+        }
+        sim.poll(&mut done, Deadline::after(sim.now(), Duration::from_secs(60)));
+        let wall = sim.wall_ns();
+        for c in done.drain(..) {
+            meter.done(c.tag.0);
+            actors[0].store.complete_with(c, wall, &[&batch], &lent_recs, &mut actors[0].effects);
+        }
+    }
+    meter.on = false;
+    if actors[0].store.broken().is_some() {
+        return Err("plain broken");
+    }
+    let committed = actors[0].store.take_committed().ok_or("commit did not settle")?.map_err(|_| "commit err")?;
+    if meter.total <= window_cap {
+        return Err("fixture too small");
+    }
+    if meter.alive_most > window_cap {
+        return Err("the commit meter: peak in-flight payload bytes exceeded cap");
+    }
+    if meter.write_most > piece_bytes as u64 {
+        return Err("the commit meter: single WriteAt exceeded piece_bytes");
+    }
+    // Verify byte-for-byte equality with `seal_segment`!
+    let refs: blaze_own::Vec<(RecordRef, &[u8]), &blaze_mem::Frame> = blaze_own::Vec::from_iter_in(
+        expected.iter().map(|(k, v)| (RecordRef { key: k.0, tag: TAG }, v.as_slice())),
+        &root,
+    );
+    let mut sealed_bytes = Default::default();
+    let _described = seal_segment(Namespace::LOCAL, &refs, &mut sealed_bytes).map_err(|_| "seal_segment")?;
+    let seg_id = committed.segments.first().copied().ok_or("no segment committed")?;
+    let seg_path = format!("plain/seg-{seg_id:016x}");
+    let disk = sim.contents(&FileName::new(&seg_path).expect("seg path"));
+    if disk.as_slice() != sealed_bytes.as_slice() {
+        return Err("segment bytes mismatch vs seal_segment");
+    }
+
+    // Also run `Driven::commit_records` end-to-end and verify every record reads back equal!
+    let mut driven = Driven::with(Sim::new(seed, Faults::default()), Path::new("/sim"), cfg(1, 1, true, &root), &root).map_err(|_| "driven open")?;
+    driven.core_mut().set_commit_piece_bytes(piece_bytes);
+    for (k, v) in expected.iter().take(12) {
+        driven.put(*k, Namespace::LOCAL, TAG, v).map_err(|_| "driven put")?;
+    }
+    let _ = driven.commit_records(&[&batch], &lent_recs).map_err(|_| "driven commit")?;
+    for (k, v) in &expected {
+        let got = driven.get(k).map_err(|_| "get")?.ok_or("missing key")?;
+        if driven.got(got).bytes != v.as_slice() {
+            return Err("record payload mismatch");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn streamed_commit_stays_within_window_and_matches_seal_segment() {
+    for seed in 0..8 {
+        if let Err(why) = run_commit_meter_case(seed, Plant::None) {
+            panic!("seed {seed}: {why}");
+        }
+    }
+}
+
+#[test]
+fn the_commit_meter_catches_an_unbounded_window() {
+    let mut caught = None;
+    for seed in 0..8 {
+        if let Err(why) = run_commit_meter_case(seed, Plant::CommitWholeWindow) {
+            assert!(why.contains("the commit meter"), "seed {seed}: planted unbounded commit failed another check first: {why}");
+            caught = Some(why);
+            break;
+        }
+    }
+    assert!(caught.is_some(), "no seed of 8 caught an unbounded commit window");
+}

@@ -37,7 +37,7 @@ blaze-cad-field	1	0	0	0	0	0	6	0	3	0	0	4	0	0	7	0	0	0
 blaze-cad-mesh	1	0	0	0	0	0	2	0	2	0	0	3	0	0	5	0	0	0
 blaze-cad-out	1	0	0	0	0	0	1	0	1	0	0	3	0	0	4	0	0	0
 blaze-cad-picture	1	0	0	0	0	0	0	0	1	0	0	4	0	0	5	0	0	0
-blaze-cas	94	4	58	56	0	0	63	0	1	2	0	32	1	1	0	1	5	5
+blaze-cas	92	4	56	56	0	0	63	0	1	2	0	32	1	1	0	1	5	5
 blaze-cast	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
 blaze-cbor	0	1	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-cc	0	5	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
