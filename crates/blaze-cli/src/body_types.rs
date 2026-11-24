@@ -57,11 +57,13 @@ pub const BORROWS_NOT_CHECKED: u16 = 20;
 /// - `core` (`flow_census_core`): `clean bodies 2922; borrow-checked whole 2922; refused 0; accepted 2922; findings 0 (in 0 bodies)`
 pub const BORROWS_ARE_ERRORS: bool = true;
 
-/// The domain of a body part's source ([`body_source`]). 5: the source is the item's text alone,
-/// the file around the bodies gone (D114): a "4" record read no head and could stand after a
-/// sibling's signature moved, so none is found again. (4: a body reads its file's `Owners` and
-/// only the crates its owners' checks open, no longer every member.)
-const SOURCE_DOMAIN: &str = "blaze-cli body check source 5";
+/// The domain of a body part's source ([`body_source`]). 6: a body stopped by a failed head now
+/// places that head's cell to its owning `Signature` task before recording `Done::reads`
+/// (engine_bodies.rs, rule 21); a "5" record could keep an unplaced phantom cell and stay stuck
+/// on a stale head failure after the head was repaired. (5: the source is the item's text alone,
+/// the file around the bodies gone (D114); 4: a body reads its file's `Owners` and only the
+/// crates its owners' checks open, no longer every member.)
+const SOURCE_DOMAIN: &str = "blaze-cli body check source 6";
 
 /// The body checker's identity is not typed in here (decision D105): it is the table's
 /// `Row::BodyChecker` (blaze_ids::producer), and it moves with the checker's code, never by hand.

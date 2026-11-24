@@ -1721,7 +1721,8 @@ impl Job<'_> {
         // in what it answers).
         found.outlined.sort_unstable_by_key(|one| one.name);
         found.probes.sort_unstable_by_key(|(slot, ..)| Name::file(slot));
-        finish(task, input.name, resolved, ok, unresolved, oracle, &order, script_input, outlined, found, alloc, local, self.kept)
+        let implicit_entry_root = input.implicit.entry.then(|| input.root.strip_prefix("/0/")).flatten();
+        finish(task, input.name, implicit_entry_root, resolved, ok, unresolved, oracle, &order, script_input, outlined, found, alloc, local, self.kept)
     }
 }
 
@@ -1791,7 +1792,7 @@ fn unseen_file(task: Name, read: Name, krate: &str, path: &str, heap: SharedAllo
 }
 
 #[expect(clippy::too_many_arguments, reason = "one resolved crate and the inputs it was handed")]
-fn finish<'a>(task: &EngineTask, krate: &str, resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate>, deps: &[Dependency<'_>], script: Option<Input>, outlined: &[Outlined<'_>], found: FoundBy, alloc: SharedAlloc<'a>, scratch: blaze_own::Alloc<'_>, heap: SharedAlloc<'static>) -> Result<WorkerAnswer<'a>, WorkerError> {
+fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>, resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate>, deps: &[Dependency<'_>], script: Option<Input>, outlined: &[Outlined<'_>], found: FoundBy, alloc: SharedAlloc<'a>, scratch: blaze_own::Alloc<'_>, heap: SharedAlloc<'static>) -> Result<WorkerAnswer<'a>, WorkerError> {
     let name = task.planned.name;
     // A file this crate found and its worker outlined (which may upgrade a walk `DATA_FILE` to a
     // Rust outline), else one the request's outlines hold.
@@ -1814,6 +1815,32 @@ fn finish<'a>(task: &EngineTask, krate: &str, resolved: Resolved, ok: bool, unre
         let digest = crate::engine_tasks::surface_of(record_of).ok_or_else(|| unseen(surface, path))?;
         record.reads.push((surface, digest));
         reads.push((CellId { of: record_of.name, cell: crate::engine_tasks::SURFACE }, digest));
+    }
+    // D104 (rule 21): a blaze-edition binary's root top-level `fn main` is the whole-item input
+    // of the implicit `#[::std::main]` call (`blaze-scope` task/lower.rs), whose expansion is
+    // stored in this `CrateScope` record. `Outline::surface()` omits plain fn bodies because
+    // `blaze-file-items` does not know `Implicit::entry`, so record `definition_cell` for every
+    // top-level `fn main` in the crate root file.
+    if let Some(root_path) = implicit_entry_root {
+        let root_file = Name::file(root_path.as_bytes());
+        if let Some((root_outlined, root_record)) =
+            surface_outlined(&found.outlined, root_file, root_path).or_else(|| surface_outlined(outlined, root_file, root_path))
+            && let Ok(payload) = root_record.payload_bytes()
+            && let Ok(view) = blaze_surface::FileItemsView::read(payload)
+        {
+            let sig_file = crate::signature::SignatureFile::new(&root_outlined.path);
+            for (index, entry) in view.items().enumerate() {
+                if entry.item.parent.is_none()
+                    && entry.item.kind() == blaze_surface::ItemKind::Function
+                    && blaze_scope::task::unraw(entry.name) == "main"
+                    && let Ok(index) = u32::try_from(index)
+                {
+                    let entry_name = sig_file.entry_from_chain(crate::signature::stored_chain(view, blaze_surface::ItemIndex(index)));
+                    record.reads.push((entry_name, entry.item.hash));
+                    reads.push((CellId { of: root_outlined.name, cell: crate::engine_tasks::definition_cell(entry_name) }, entry.item.hash));
+                }
+            }
+        }
     }
     for path in absent {
         let file = Name::file(path.as_bytes());
@@ -1954,24 +1981,29 @@ fn outline_of<'o, 'h>(outlined: &'o [Outlined<'h>], name: Name, path: &str) -> O
     one.made.as_ref().ok()
 }
 
-/// The Rust (surface-bearing) outline of the checkout file at `path`: by its name if that record
-/// holds a `Surface`, else by its physical path (e.g. a `mod.rs` whose `Name::file` was also
-/// listed as a `DATA_FILE` beside the `mod x;` slot outline).
-fn surface_outline_of<'o, 'h>(outlined: &'o [Outlined<'h>], name: Name, path: &str) -> Option<&'o work::Record<SharedAlloc<'h>>> {
+/// The Rust (surface-bearing) outline entry and record of the checkout file at `path`: by its
+/// name if that record holds a `Surface`, else by its physical path (e.g. a `mod.rs` whose
+/// `Name::file` was also listed as a `DATA_FILE` beside the `mod x;` slot outline).
+fn surface_outlined<'o, 'h>(outlined: &'o [Outlined<'h>], name: Name, path: &str) -> Option<(&'o Outlined<'h>, &'o work::Record<SharedAlloc<'h>>)> {
     if let Ok(at) = outlined.binary_search_by(|one| one.name.cmp(&name))
         && let Some(one) = outlined.get(at)
         && let Ok(record) = &one.made
         && crate::engine_tasks::surface_of(record).is_some()
     {
-        return Some(record);
+        return Some((one, record));
     }
     outlined.iter().find_map(|one| {
         if one.path.as_slice() != path.as_bytes() {
             return None;
         }
         let record = one.made.as_ref().ok()?;
-        crate::engine_tasks::surface_of(record).map(|_| record)
+        crate::engine_tasks::surface_of(record).map(|_| (one, record))
     })
+}
+
+/// The Rust (surface-bearing) outline of the checkout file at `path`.
+fn surface_outline_of<'o, 'h>(outlined: &'o [Outlined<'h>], name: Name, path: &str) -> Option<&'o work::Record<SharedAlloc<'h>>> {
+    surface_outlined(outlined, name, path).map(|(_, record)| record)
 }
 
 /// The crates the crate at `at` reads directly: its dependencies and, for a program crate, the

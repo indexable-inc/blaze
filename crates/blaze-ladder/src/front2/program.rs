@@ -251,6 +251,8 @@ struct Tabled<'n> {
     /// Whether the fn's own signature says `#[track_caller]` ([`FrontEnd::track_caller`] adds
     /// what a trait impl's method inherits from the trait's declaration).
     track_caller: bool,
+    /// Function code-generation attributes (`#[inline]`, `#[inline(always)]`, `#[inline(never)]`, `#[cold]`).
+    fn_attrs: blaze_lir::func::FnAttrs,
     symbol: Box<str>,
     export: Option<Box<str>>,
     lits: Literals,
@@ -1292,7 +1294,7 @@ impl<'n> Front2Program<'n> {
             by_key.insert(key, fns.len());
             let at = head_abi::placed_ctor(names, front.keys.library_in(names, key));
             let none = Box::<str>::from("");
-            fns.push(Tabled { key, body: None, checked: None, kind: FnKind::Ctor, path: path.into_text(), at, abi: Abi::Rust, nounwind: false, track_caller: false, symbol: none, export: None, lits: Literals::default(), intrinsic: None });
+            fns.push(Tabled { key, body: None, checked: None, kind: FnKind::Ctor, path: path.into_text(), at, abi: Abi::Rust, nounwind: false, track_caller: false, fn_attrs: blaze_lir::func::FnAttrs::default(), symbol: none, export: None, lits: Literals::default(), intrinsic: None });
         }
         let mut langs = [(LangItem::Drop, None); SEAM_LANGS.len()];
         for (slot, item) in langs.iter_mut().zip(SEAM_LANGS) {
@@ -1475,6 +1477,8 @@ struct Symbols {
     /// `#[track_caller]`: the fn takes its caller's `Location` as a hidden last parameter
     /// (the Reference, "The `track_caller` attribute").
     track_caller: bool,
+    /// `#[inline]`, `#[inline(always)]`, `#[inline(never)]`, `#[cold]`.
+    fn_attrs: blaze_lir::func::FnAttrs,
 }
 
 /// The identifier a signature's lowering declares, `r#` dropped: the symbol `#[no_mangle]`
@@ -1501,7 +1505,7 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, valu
     // `sig::HAS_BODY`), as the frozen fn head's qualifiers read by const_fn_fact.rs.
     let has_body = v.head[head::FLAGS] & blaze_lower::machine::sig::HAS_BODY != 0;
     let intrinsic_declared = super::intrinsic_rule::Declared { has_body, must_be_overridden: false };
-    let mut out = Symbols { export: None, link_name: None, intrinsic: false, intrinsic_declared, nounwind: false, track_caller: false };
+    let mut out = Symbols { export: None, link_name: None, intrinsic: false, intrinsic_declared, nounwind: false, track_caller: false, fn_attrs: blaze_lir::func::FnAttrs::default() };
     for &n in v.rows(v.list(head::ATTRS)).map_err(|e| refuse(format!("{e:?}")))? {
         let a = v.attr(n).map_err(|e| refuse(format!("{e:?}")))?;
         // The cooked string, as the native image reads it (links.rs `symbol_of`): escapes
@@ -1528,6 +1532,17 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, valu
             super::intrinsic_rule::MUST_BE_OVERRIDDEN => out.intrinsic_declared.must_be_overridden = true,
             "rustc_nounwind" => out.nounwind = true,
             "track_caller" => out.track_caller = true,
+            "cold" => out.fn_attrs.0 |= blaze_lir::func::FnAttrs::COLD,
+            "inline" => {
+                let args = v.text_at(a.args).map_or("", str::trim);
+                let inner = args.strip_prefix('(').and_then(|s| s.strip_suffix(')')).unwrap_or(args).trim();
+                let mode = match inner {
+                    "always" => blaze_lir::func::Inline::Always,
+                    "never" => blaze_lir::func::Inline::Never,
+                    _ => blaze_lir::func::Inline::Hint,
+                };
+                out.fn_attrs = out.fn_attrs.with_inline(mode);
+            }
             _ => {}
         }
     }
@@ -1873,6 +1888,13 @@ impl FrontEnd for Front2Program<'_> {
         None
     }
 
+    fn specialize_inline_for(&mut self, i: usize, args: &[PTy], ground: PTys<'_>) -> Result<Option<(usize, Option<Checked<'static>>)>, crate::run::RunError> {
+        let Some(row) = self.specialized_row(i, args, ground) else {
+            return Ok(None);
+        };
+        Ok(Some((row, self.fns.get_mut(row).and_then(|f| f.checked.take()))))
+    }
+
     /// The digest filed in the store when fn `i`'s body was checked: its `Checked` holds no
     /// list (front2 body_reads.rs).
     fn body_reads(&self, i: usize, _checked: &Checked<'static>) -> Option<super::body_reads::ReadsDigest> {
@@ -2144,6 +2166,10 @@ impl FrontEnd for Front2Program<'_> {
         Some(self.fns.get(*self.by_key.get(&key)?)?.nounwind)
     }
 
+    fn fn_attrs(&self, key: ItemKey) -> blaze_lir::func::FnAttrs {
+        self.by_key.get(&key).and_then(|&i| self.fns.get(i)).map_or_else(blaze_lir::func::FnAttrs::default, |r| r.fn_attrs)
+    }
+
     /// From the fn's row; a trait impl's method that does not say it itself answers with the
     /// row of its trait's declaration of the method of its name (`None` when that row is not
     /// tabled: never guessed `false`).
@@ -2156,12 +2182,19 @@ impl FrontEnd for Front2Program<'_> {
     fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
         let not_live = blaze_build::SiteGap::NotLive { owner };
         let row = self.by_key.get(&owner).and_then(|&i| self.fns.get(i)).ok_or(not_live)?;
-        lazy::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, owner, row.body.as_ref().ok_or(not_live)?, expr)
+        let body = row.body.as_ref().ok_or(not_live)?;
+        let anchor_owner = body.param_subst.as_ref().map_or(owner, |(orig, _)| *orig);
+        lazy::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, anchor_owner, body, expr)
     }
 
     /// By seam_rules.rs `def_site`, from the item's head and the names source.
     fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
-        lazy::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, item)
+        let anchor = self
+            .inline_for_specs
+            .iter()
+            .find(|s| self.fns.get(s.row).is_some_and(|r| r.key == item))
+            .map_or(item, |s| s.orig);
+        lazy::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, anchor)
     }
 
     fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {

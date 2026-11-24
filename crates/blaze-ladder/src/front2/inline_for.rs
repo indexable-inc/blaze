@@ -1183,8 +1183,8 @@ fn synth_spec_key(orig: ItemKey, args: &[PTy], tys: PTys<'_>, alloc: Alloc<'_>) 
 }
 
 /// Inserts a monomorphized `FnHead` + empty `Preds` into `r.store` under `spec_key`.
-fn install_spec_head<'n>(
-    r: &mut Records<'_, 'n>,
+fn install_spec_head<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
     orig_key: ItemKey,
     spec_key: ItemKey,
     concrete_args: &[PTy],
@@ -1308,6 +1308,85 @@ fn install_spec_head<'n>(
     r.store.fns.insert(spec_key, head);
     r.store.preds.insert(spec_key, Preds::new_in(RegionScope::new_in(alloc)));
     Ok(lib)
+}
+
+/// Specializes a single generic `inline for` function `orig_key` at already-imported
+/// `args_copy` (interned in `r.store.tys`), unrolling and checking its monomorphized body.
+fn specialize_one_imported<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    prepared: &Prepares<'n>,
+    orig_key: ItemKey,
+    args_copy: OwnVec<PTy, Alloc<'static>>,
+) -> Result<SpecializedBody<'n>, CheckFail> {
+    let alloc = r.store.tys.alloc();
+    let spec_key = synth_spec_key(orig_key, &args_copy, r.store.tys.view(), alloc);
+    let lib = install_spec_head(r, orig_key, spec_key, &args_copy, None)?;
+    let orig_text = r
+        .store
+        .fns
+        .get(&orig_key)
+        .map(|h| h.text)
+        .ok_or(CheckFail::InlineFor {
+            owner: orig_key,
+            at: tc::Range { start: 0, end: 0 },
+            why: "generic inline for function has no source text",
+        })?;
+    let mut spec_body = lower_body_with_text(
+        r.names,
+        prepared,
+        r.keys,
+        r.store,
+        lib,
+        spec_key,
+        orig_text,
+        Some((orig_key, &args_copy)),
+        None,
+    )
+    .map_err(|_| CheckFail::InlineFor {
+        owner: orig_key,
+        at: tc::Range { start: 0, end: 0 },
+        why: "lowering specialized generic inline for body failed",
+    })?;
+    let spec_checked = unroll_concrete_body(r, prepared, &mut spec_body)?;
+    // Update `spec_head.text` so `FnFacts::text` and `symbols_of` see the expanded text.
+    if let Some(exp) = spec_body.expanded_text {
+        let _ = install_spec_head(r, orig_key, spec_key, &args_copy, Some(exp));
+    }
+    Ok(SpecializedBody {
+        orig: orig_key,
+        args: args_copy,
+        spec_key,
+        body: spec_body,
+        checked: spec_checked,
+    })
+}
+
+/// Specializes a single generic `inline for` function `orig_key` on demand at concrete
+/// `ground_args` (interned in `ground_tys`), unrolling all now-concrete `inline for` loops
+/// and checking the resulting monomorphic body. Returns `Ok(None)` if `ground_args` is empty
+/// or contains a non-ground type.
+pub fn specialize_one_generic_inline_for<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    prepared: &Prepares<'n>,
+    orig_key: ItemKey,
+    ground_tys: PTys<'_>,
+    ground_args: &[PTy],
+) -> Result<Option<SpecializedBody<'n>>, CheckFail> {
+    if ground_args.is_empty() {
+        return Ok(None);
+    }
+    let alloc = r.store.tys.alloc();
+    let mut args_copy: OwnVec<PTy, Alloc<'static>> = OwnVec::with_capacity_in(ground_args.len(), alloc);
+    for &raw in ground_args {
+        let Some(copied) = copy_ty_into(ground_tys, raw, &mut r.store.tys, None, alloc) else {
+            return Ok(None);
+        };
+        if !is_ground_ty(r.store.tys.view(), copied, alloc) {
+            return Ok(None);
+        }
+        args_copy.push(copied);
+    }
+    specialize_one_imported(r, prepared, orig_key, args_copy).map(Some)
 }
 
 /// Discovers every concrete call `(callee, concrete_args)` targeting any reached generic
@@ -1440,39 +1519,8 @@ pub fn specialize_generic_inline_fors<'n>(
                 if already {
                     continue;
                 }
-                let spec_key = synth_spec_key(callee, &args_copy, r.store.tys.view(), alloc);
-                let lib = install_spec_head(r, callee, spec_key, &args_copy, None)?;
-                let orig_text = r
-                    .store
-                    .fns
-                    .get(&callee)
-                    .map(|h| h.text)
-                    .ok_or(CheckFail::InlineFor {
-                        owner: callee,
-                        at: tc::Range { start: 0, end: 0 },
-                        why: "generic inline for function has no source text",
-                    })?;
-                let mut spec_body = lower_body_with_text(
-                    r.names,
-                    prepared,
-                    r.keys,
-                    r.store,
-                    lib,
-                    spec_key,
-                    orig_text,
-                    Some((callee, &args_copy)),
-                    None,
-                )
-                .map_err(|_| CheckFail::InlineFor {
-                    owner: callee,
-                    at: tc::Range { start: 0, end: 0 },
-                    why: "lowering specialized generic inline for body failed",
-                })?;
-                let mut spec_checked = unroll_concrete_body(r, prepared, &mut spec_body)?;
-                // Update `spec_head.text` so `FnFacts::text` and `symbols_of` see the expanded text.
-                if let Some(exp) = spec_body.expanded_text {
-                    let _ = install_spec_head(r, callee, spec_key, &args_copy, Some(exp));
-                }
+                let SpecializedBody { orig: _, args: args_copy, spec_key, body: spec_body, checked: mut spec_checked } =
+                    specialize_one_imported(r, prepared, callee, args_copy)?;
                 // Reach every newly discovered callee from the specialized unrolled body.
                 let sub_census = {
                     let view = spec_body.lowered.view();

@@ -623,42 +623,86 @@ impl MakerState {
         let at = match got {
             None => None,
             Some((i, done)) => {
-                checks.check_one += 1;
-                while self.checked.len() < program.fn_count().max(i + 1) {
-                    self.checked.push(None);
-                }
-                let mut refresh = !done.closures.is_empty();
-                if !refresh && let Some((body, _)) = program.function(i).body {
-                    let view = body.view(program.body_types(i));
-                    refresh = blaze_build::coroutines_in(&view).into_iter().next().is_some();
-                }
-                self.checked[i] = Some(done);
-                if refresh {
-                    let tables = self.tables.as_mut().ok_or_else(|| tables_gone(key))?;
-                    // This body's closures, one row each ([`ClosureTable::add`]): the table is
-                    // never re-made over the bodies checked before.
-                    if let (Some((body, _)), Some(done)) = (program.function(i).body, self.checked[i].as_ref()) {
-                        let sig = program.sig(i);
-                        tables.closures.add(&body.view(program.body_types(i)), done, sig.parent_count + sig.own_count, self.work.alloc);
-                    }
-                    // This body's async blocks, one row each (front2/coroutines.rs
-                    // `CoroutineTable::add`): the table is never re-made over the bodies checked
-                    // before, so each checked body is walked once (counted).
-                    if let Some(done) = self.checked[i].as_ref() {
-                        checks.coroutine_walks += 1;
-                        tables.coroutines.table.add(&*program, i, done, self.work.alloc);
-                    }
-                    // The library's async items, read again with the rows made so far: before the
-                    // first check a lazy front end has no `Poll` row yet, so `MakerState::new`'s
-                    // reading is `None` (front2/coroutines.rs `async_items`).
-                    tables.coroutines.items = crate::front2::coroutines::async_items(&*program);
-                    tables.coroutines.poll = crate::front2::coroutines::future_poll(&*program);
-                }
+                self.register_checked_row(&*program, key, i, done, checks)?;
                 Some(i)
             }
         };
         self.asked.insert_shift(slot, (key, at));
         Ok(at)
+    }
+
+    /// Stores `done` at row `i` and refreshes the closure and coroutine tables if the body
+    /// declares any closures or async blocks. Shared by `ensure_one` and on-demand generic
+    /// `inline for` specialization (`register_specialized`).
+    fn register_checked_row<P: FrontEnd>(&mut self, program: &P, key: ItemKey, i: usize, done: Checked<'static>, checks: &mut CheckCount) -> Result<(), RunError> {
+        checks.check_one += 1;
+        while self.checked.len() < program.fn_count().max(i + 1) {
+            self.checked.push(None);
+        }
+        let mut refresh = !done.closures.is_empty();
+        if !refresh && let Some((body, _)) = program.function(i).body {
+            let view = body.view(program.body_types(i));
+            refresh = blaze_build::coroutines_in(&view).into_iter().next().is_some();
+        }
+        if let Some(slot) = self.checked.get_mut(i) {
+            *slot = Some(done);
+        }
+        if refresh {
+            let tables = self.tables.as_mut().ok_or_else(|| tables_gone(key))?;
+            // This body's closures, one row each ([`ClosureTable::add`]): the table is
+            // never re-made over the bodies checked before.
+            if let (Some((body, _)), Some(done)) = (program.function(i).body, self.checked.get(i).and_then(|d| d.as_ref())) {
+                let sig = program.sig(i);
+                tables.closures.add(&body.view(program.body_types(i)), done, sig.parent_count + sig.own_count, self.work.alloc);
+            }
+            // This body's async blocks, one row each (front2/coroutines.rs
+            // `CoroutineTable::add`): the table is never re-made over the bodies checked
+            // before, so each checked body is walked once (counted).
+            if let Some(done) = self.checked.get(i).and_then(|d| d.as_ref()) {
+                checks.coroutine_walks += 1;
+                tables.coroutines.table.add(program, i, done, self.work.alloc);
+            }
+            // The library's async items, read again with the rows made so far: before the
+            // first check a lazy front end has no `Poll` row yet, so `MakerState::new`'s
+            // reading is `None` (front2/coroutines.rs `async_items`).
+            tables.coroutines.items = crate::front2::coroutines::async_items(program);
+            tables.coroutines.poll = crate::front2::coroutines::future_poll(program);
+        }
+        Ok(())
+    }
+
+    /// Registers a newly created generic `inline for` specialization row `spec_i` (synthetic
+    /// key `spec_key`) and ensures any external closure or opaque owners its checked types name.
+    fn register_specialized<P: FrontEnd, T: Typing<P>>(
+        &mut self,
+        program: &mut P,
+        typing: &mut T,
+        spec_key: ItemKey,
+        spec_i: usize,
+        done: Checked<'static>,
+        checks: &mut CheckCount,
+    ) -> Result<(), RunError> {
+        /// The most closure owners one ensure follows (rule 18).
+        const MOST_OWNERS: usize = 4096;
+        if let Err(slot) = self.asked.binary_search_by_key(&spec_key, |r| r.0) {
+            self.asked.insert_shift(slot, (spec_key, Some(spec_i)));
+        }
+        self.register_checked_row(&*program, spec_key, spec_i, done, checks)?;
+        let mut todo: AVec<'_, ItemKey> = blaze_own::Vec::new_in(self.work.alloc);
+        self.owners_named(&*program, spec_key, &mut todo);
+        let mut steps = 0;
+        while let Some(owner) = todo.pop() {
+            if self.asked.binary_search_by_key(&owner, |r| r.0).is_ok() {
+                continue;
+            }
+            steps += 1;
+            if steps > MOST_OWNERS {
+                return Err(RunError::OneBody { key: spec_key, why: "more closure owners named than the most one ensure follows" });
+            }
+            self.ensure_one(program, typing, owner, checks)?;
+            self.owners_named(&*program, owner, &mut todo);
+        }
+        Ok(())
     }
 }
 
@@ -765,6 +809,26 @@ fn make_instance_timed<P: FrontEnd, T: Typing<P>>(
     for &item in items.iter() {
         program.head_row(item)?;
     }
+    // Generic `inline for` functions specialize on demand at concrete ground arguments into a
+    // monomorphic unrolled row with 0 generic args of its own (matching `run.rs:2321-2327`).
+    let (build_i, build_instance) = if instance.args.len > 0 && instance.item == tabled {
+        let mut ground_args: AVec<'_, PTy> = blaze_own::Vec::new_in(alloc);
+        if let Ok(list) = state.work.ground.view().list(instance.args) {
+            ground_args.extend_from_slice(list);
+        }
+        match program.specialize_inline_for(i, &ground_args, state.work.ground.view())? {
+            Some((spec_i, spec_checked)) => {
+                let spec_key = program.function(spec_i).key;
+                if let Some(done) = spec_checked {
+                    state.register_specialized(program, typing, spec_key, spec_i, done, checks)?;
+                }
+                (spec_i, Instance { item: spec_key, args: List::EMPTY })
+            }
+            None => (i, instance),
+        }
+    } else {
+        (i, instance)
+    };
     // The constants this instance reads at its ground arguments, pulled before the build
     // (front2/const_at.rs): a plain instance's own body only, as in build_from. Grounding a
     // constant path's arguments normalizes them, and that asks the world as the build does:
@@ -777,11 +841,11 @@ fn make_instance_timed<P: FrontEnd, T: Typing<P>>(
     // same count (rule 18), and nothing made is the `Missing` itself.
     let mut pulled = 0u32;
     loop {
-        match pull_constants(program, state, i, instance) {
+        match pull_constants(program, state, build_i, build_instance) {
             Ok(()) => break,
             Err(e) if asks_again(&e) && pulled < crate::front2::check::MOST_ROUNDS => {
                 pulled += 1;
-                if !program.make_asked(i)? {
+                if !program.make_asked(build_i)? {
                     return Err(e);
                 }
             }
@@ -800,12 +864,12 @@ fn make_instance_timed<P: FrontEnd, T: Typing<P>>(
         let MakerState { checked, tables, work, .. } = &mut *state;
         let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
         let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
-let step = build_one(&*program, &bodies, work, i, instance, entry);
+        let step = build_one(&*program, &bodies, work, build_i, build_instance, entry);
         *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
         let step = match step {
             Err(e) if asks_again(&e) && asked < crate::front2::check::MOST_ROUNDS => {
                 asked += 1;
-                if program.make_asked(i)? {
+                if program.make_asked(build_i)? {
                     continue;
                 }
                 return Err(e);
@@ -819,7 +883,7 @@ let step = build_one(&*program, &bodies, work, i, instance, entry);
             {
                 owners += 1;
                 if state.ensure(program, typing, owner, checks)?.is_none() {
-                    return Err(unchecked_owner(&*program, i, owner));
+                    return Err(unchecked_owner(&*program, build_i, owner));
                 }
                 continue;
             }
@@ -847,10 +911,10 @@ let step = build_one(&*program, &bodies, work, i, instance, entry);
                 owners += 1;
                 if owners > MOST_HELD_COROUTINES {
                     let error = BuildError::UnsupportedSig { what: "an instance whose coroutine states needed more than 4096 owner fns checked" };
-                    return Err(RunError::Build { function: program.function(i).named(), error, range: None });
+                    return Err(RunError::Build { function: program.function(build_i).named(), error, range: None });
                 }
                 if state.ensure(program, typing, owner, checks)?.is_none() {
-                    return Err(unchecked_owner(&*program, i, owner));
+                    return Err(unchecked_owner(&*program, build_i, owner));
                 }
             }
             Step::Table(keys) => {

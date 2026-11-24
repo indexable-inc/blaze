@@ -1807,3 +1807,434 @@ pub extern \"C\" fn main() -> i32 {
 ");
     assert_eq!(got, Ok(42));
 }
+
+/// Regression test for generic + concrete `inline for` under `LazyProgram` / `make_one.rs`
+/// (`blaze run`) with BOTH `SecondCheck` AND `FromRecord` (pre-checked typed records produced
+/// by `ProjectWorld::check_borrows`, mirroring `blaze check` -> `blaze run`).
+#[test]
+fn lazy_program_generic_inline_for_second_check_and_from_record_run() {
+    use blaze_build::{OverflowChecks, Panic, UbChecks};
+    use blaze_emit::{Isa, Os};
+    use blaze_ids::Hasher;
+    use blaze_ids::producer::{CodeBuilder, Producers};
+    use blaze_ladder::body_ids::{BodyId, BodyIds, Fixture, Make, Read, RowKind, Walk};
+    use blaze_ladder::code_records::{Builder, CodeStore, EntryView, MemoryStore, Settings, TierName};
+    use blaze_ladder::crates::{Inputs, Toolchain};
+    use blaze_ladder::front2::keys::checker_of;
+    use blaze_ladder::front2::program::Front2Program;
+    use blaze_ladder::front2::program::lazy::LazyProgram;
+    use blaze_ladder::front2::program::lazy::typed::{TypedGap, TypedRecords};
+    use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
+    use blaze_ladder::front2::source::NamesSource as _;
+    use blaze_ladder::program_texts::ProgramTexts;
+    use blaze_ladder::run::RunError;
+    use blaze_ladder::run::make_one::{CheckCount, FromRecord, MakerState, SecondCheck, Typing, make_instance, walk_records};
+    use blaze_ladder::seam::FrontEnd;
+    use blaze_mem::Frame;
+    use blaze_own::AVec;
+    use blaze_toolchain::ToolchainId;
+    use blaze_typeck::ItemKey;
+
+    let body = "
+impl Copy for usize {}
+impl Copy for i32 {}
+impl Copy for bool {}
+
+#[lang = \"drop\"]
+trait Drop {
+    fn drop(&mut self);
+}
+
+#[lang = \"fn_once\"]
+trait FnOnce<Args> {
+    #[lang = \"fn_once_output\"]
+    type Output;
+    extern \"rust-call\" fn call_once(self, args: Args) -> Self::Output;
+}
+
+#[lang = \"fn_mut\"]
+trait FnMut<Args>: FnOnce<Args> {
+    extern \"rust-call\" fn call_mut(&mut self, args: Args) -> Self::Output;
+}
+
+#[lang = \"fn\"]
+trait Fn<Args>: FnMut<Args> {
+    extern \"rust-call\" fn call(&self, args: Args) -> Self::Output;
+}
+
+#[repr(C)]
+struct Words {
+    data: usize,
+    len: usize,
+}
+impl Copy for Words {}
+
+union Wide {
+    s: &'static str,
+    bytes: &'static [u8],
+    words: Words,
+}
+
+fn str_eq(a: &'static str, b: &'static str) -> bool {
+    let na = unsafe { Wide { s: a }.words.len };
+    let nb = unsafe { Wide { s: b }.words.len };
+    if na != nb {
+        return false;
+    }
+    let ab = unsafe { Wide { s: a }.bytes };
+    let bb = unsafe { Wide { s: b }.bytes };
+    let mut i: usize = 0;
+    while i < na {
+        if ab[i] != bb[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+struct Pos { pub x: i32, pub y: i32 }
+struct Health { pub hp: i32, pub max_hp: i32 }
+struct Pair { pub a: Pos, pub b: Health }
+
+fn sum_fields<T>(v: &T) -> i32 {
+    let mut total = 0;
+    inline for (_name, field) in v {
+        total = total + *field;
+    }
+    total
+}
+
+fn patch_field<T>(dst: &mut T, target: &'static str, value: i32) -> bool {
+    inline for (name, field) in dst {
+        if str_eq(name, target) {
+            *field = value;
+            return true;
+        }
+    }
+    false
+}
+
+fn sum_via_closure<T>(v: &T) -> i32 {
+    let mut total = 0;
+    inline for (_name, field) in v {
+        let read = || *field;
+        total = total + read();
+    }
+    total
+}
+
+fn nested_sum<T>(v: &T) -> i32 {
+    let mut total = 0;
+    inline for (_name, inner) in v {
+        total = total + sum_fields(inner);
+    }
+    total
+}
+
+fn zip_delta<T>(a: &T, b: &T) -> i32 {
+    let mut total = 0;
+    inline for (_name, x, y) in zip_fields(a, b) {
+        total = total + (*y - *x);
+    }
+    total
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut p = Pos { x: 10, y: 20 };
+    // Generic sum_fields(&Pos): 30
+    if sum_fields(&p) != 30 {
+        return 1;
+    }
+    // Generic patch_field(&mut Pos): x -> 42, returns true
+    if !patch_field(&mut p, \"x\", 42) {
+        return 2;
+    }
+    if p.x != 42 || p.y != 20 {
+        return 3;
+    }
+    if patch_field(&mut p, \"missing\", 99) {
+        return 4;
+    }
+    // Same generic fn instantiated at a second struct type `Health`
+    let mut h = Health { hp: 5, max_hp: 15 };
+    if sum_fields(&h) != 20 {
+        return 5;
+    }
+    if !patch_field(&mut h, \"max_hp\", 25) {
+        return 6;
+    }
+    // Generic inline for with closure inside unrolled body: 42 + 20 = 62
+    if sum_via_closure(&p) != 62 {
+        return 7;
+    }
+    // Nested generic inline for calling another generic inline for: (42+20) + (5+25) = 92
+    let pair = Pair { a: p, b: h };
+    if nested_sum(&pair) != 92 {
+        return 8;
+    }
+    // Generic zip_fields: (42-10) + (20-20) = 32
+    let before = Pos { x: 10, y: 20 };
+    if zip_delta(&before, &p) != 32 {
+        return 9;
+    }
+    // Concrete inline for inside main() (also tests Typer::Record expansion)
+    let mut concrete = 0;
+    inline for (_name, f) in &p {
+        concrete = concrete + *f;
+    }
+    if concrete != 62 {
+        return 10;
+    }
+    // Generic inline for on structural record: 3 + 7 = 10
+    let rec = { alpha: 3i32, beta: 7i32 };
+    if sum_fields(&rec) != 10 {
+        return 11;
+    }
+    // 32 + 10 = 42
+    zip_delta(&before, &p) + sum_fields(&rec)
+}
+";
+    // 1. Whole-program `Front2Program` baseline.
+    assert_eq!(run_head(RECORDS_HEAD, body), Ok(42));
+
+    // 2. Build `Names` once for `ProjectWorld` (`blaze check`) and `LazyProgram` (`blaze run`).
+    let text = [RECORDS_HEAD, body].concat();
+    let files = [SourceFile { path: "src/main.rs", text: &text }];
+    let heap = blaze_own::testing::heap();
+    let alloc = heap.alloc();
+    let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    let tc = Toolchain::none(alloc);
+    let texts = ProgramTexts::new(&files, "src/main.rs", NEW, &tc, Panic::Abort).expect("program texts");
+    let user = texts.user();
+    let inputs = Inputs::new(&user, &tc).expect("inputs");
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("names");
+
+    // Pre-check every free fn with `ProjectWorld::check_borrows` (the exact path `blaze check`
+    // uses to write typed records for `blaze run`).
+    let mut encoded_records: blaze_own::Vec<(ItemKey, blaze_own::Vec<u8, blaze_own::Alloc<'static>>), blaze_own::Alloc<'static>> =
+        blaze_own::Vec::new_in(alloc);
+    {
+        let check_frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("check frame");
+        let mut world = ProjectWorld::new(&names, &check_frame, &files, alloc).expect("project world");
+        let mut fn_items = blaze_own::Vec::new_in(alloc);
+        (&names).each_item(0, &mut |item, _| {
+            if (&names).kind_of_item(item) == Some(blaze_surface::ItemKind::Function) {
+                fn_items.push(item);
+            }
+        });
+        for item in fn_items {
+            let fn_name = (&names).name_of(item).unwrap_or("");
+            let (verdict, borrows) = world.check_borrows(BodyRef::Free(item), alloc);
+            assert!(verdict.diagnostics.is_empty(), "{fn_name}: check diagnostics: {:?}", verdict.diagnostics);
+            assert!(verdict.gaps.is_empty(), "{fn_name}: check gaps: {:?}", verdict.gaps);
+            assert!(verdict.refused.is_none(), "{fn_name}: check refused: {:?}", verdict.refused);
+            if fn_name != "str_eq" {
+                assert!(borrows.refused.is_none(), "{fn_name}: borrow refused: {:?}", borrows.refused);
+            }
+            let bytes = verdict.typed.expect("typed record encoded").expect("clean typed record");
+            let mut copy = blaze_own::Vec::with_capacity_in(bytes.len(), alloc);
+            copy.extend_from_slice(bytes.as_slice());
+            encoded_records.push((checker_of(item), copy));
+        }
+    }
+
+    struct EveryItem;
+    static READS: [Read; 1] = [Read { fact: [3; 32], digest: [4; 32] }];
+    impl BodyIds for EveryItem {
+        fn body_check(&self, item: ItemKey) -> Option<BodyId<'_>> {
+            Some(BodyId { key: Hasher::new("inline-for lazy test").part(&item.0.to_le_bytes()[..]).finish(), reads: &READS })
+        }
+        fn today(&self, fact: &[u8; 32]) -> Option<[u8; 32]> {
+            (*fact == READS[0].fact).then_some(READS[0].digest)
+        }
+        fn crate_fact(&self, _: ItemKey) -> Option<Read> {
+            Some(Read { fact: [8; 32], digest: [9; 32] })
+        }
+    }
+
+    struct MapTyped {
+        records: blaze_own::Vec<(ItemKey, blaze_own::Vec<u8, blaze_own::Alloc<'static>>), blaze_own::Alloc<'static>>,
+        alloc: blaze_own::Alloc<'static>,
+    }
+    impl TypedRecords for MapTyped {
+        fn typed(&mut self, key: ItemKey) -> Result<blaze_typeck::Checked<'static>, TypedGap> {
+            let Some((_, bytes)) = self.records.iter().find(|(k, _)| *k == key) else {
+                return Err(TypedGap::NoRecord { key });
+            };
+            blaze_typeck::checked_record::decode(bytes.as_slice(), self.alloc).map_err(|why| TypedGap::Record { key, why })
+        }
+    }
+
+    struct LazyWalkMaker<'p, P, T> {
+        program: &'p mut P,
+        typing: T,
+        state: Option<MakerState>,
+        checks: CheckCount,
+        isa: Isa,
+        overflow: OverflowChecks,
+        ub: UbChecks,
+        panic: Panic,
+        alloc: blaze_own::Alloc<'static>,
+    }
+    impl<P: FrontEnd, T: Typing<P>> Make for LazyWalkMaker<'_, P, T> {
+        type Error = RunError;
+        type Grant = Fixture;
+        fn make(&mut self, _grant: &Fixture, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+            if self.state.is_none() {
+                self.state = Some(MakerState::new(self.program, tabled, self.isa, self.overflow, self.ub, self.panic, self.alloc)?);
+            }
+            let Some(state) = self.state.as_mut() else {
+                return Err(RunError::OneBody { key: tabled, why: "maker state missing" });
+            };
+            make_instance(self.program, &mut self.typing, state, &mut self.checks, tabled, name, entry)
+        }
+        fn make_static(&mut self, _grant: &Fixture, item: ItemKey, _: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+            Err(RunError::OneBody { key: item, why: "unexpected static" })
+        }
+        fn make_thread_local(&mut self, _grant: &Fixture, item: ItemKey, _: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+            Err(RunError::OneBody { key: item, why: "unexpected tls" })
+        }
+    }
+
+    let whole = Front2Program::new(&names, &frame, &files, alloc).expect("whole program");
+    let entry = whole.function(whole.entry().expect("entry")).key;
+    let producer = Producers::for_tests(b"inline-for lazy").get::<CodeBuilder>();
+    let isa = Isa { lse: true, os: if cfg!(target_os = "macos") { Os::MacOs } else { Os::Linux } };
+    let builder = Builder {
+        isa,
+        tier: TierName::Reference,
+        settings: Settings::baseline(OverflowChecks::Off, Panic::Abort),
+        toolchain: ToolchainId([7; 32]),
+        producer,
+        edition: edition::PackageEdition::of_manifest("blaze-2026.11").expect("blaze edition"),
+    };
+
+    let run_lazy_mode = |label: &str, use_records: bool| {
+        let mut lazy = LazyProgram::new(&names, &frame, &files, Some(entry), alloc).expect("lazy program");
+        lazy.decide_start(blaze_ladder::run::special::MakerStart::ByRule).expect("decide_start");
+        let mut store = MemoryStore::new_in(alloc);
+        let walk: Walk<'_> = if use_records {
+            let mut maker = LazyWalkMaker {
+                program: &mut lazy,
+                typing: FromRecord(MapTyped { records: encoded_records.clone(), alloc }),
+                state: None,
+                checks: CheckCount::default(),
+                isa,
+                overflow: OverflowChecks::Off,
+                ub: UbChecks::Off,
+                panic: Panic::Abort,
+                alloc,
+            };
+            walk_records(entry, &EveryItem, &mut store, &builder, &producer, &mut maker, alloc)
+                .unwrap_or_else(|e| panic!("{label}: walk_records failed: {e}"))
+                .0
+        } else {
+            let mut maker = LazyWalkMaker {
+                program: &mut lazy,
+                typing: SecondCheck,
+                state: None,
+                checks: CheckCount::default(),
+                isa,
+                overflow: OverflowChecks::Off,
+                ub: UbChecks::Off,
+                panic: Panic::Abort,
+                alloc,
+            };
+            walk_records(entry, &EveryItem, &mut store, &builder, &producer, &mut maker, alloc)
+                .unwrap_or_else(|e| panic!("{label}: walk_records failed: {e}"))
+                .0
+        };
+        #[cfg(target_arch = "aarch64")]
+        {
+            use blaze_code::image::{Image, Kind, Member, lay_out_positions};
+            use blaze_code::record::{Space, Target};
+            use blaze_launch_rt::sys::{Code, page};
+
+            let mut members = blaze_own::Vec::new_in(alloc);
+            for row in 0..walk.len() {
+                assert_eq!(walk.kind(row), RowKind::Instance);
+                let bytes = store.get(walk.key(row).expect("record key")).expect("store get").expect("record");
+                members.push(Member { symbol: walk.symbol(row), record: EntryView::read(bytes).expect("entry").record });
+            }
+            let pg = page().expect("page size");
+            let segment = lay_out_positions(&members, Kind::Bundle, pg as u64, alloc, |_, row| {
+                Ok(lazy.source_position(ItemKey(row.item), row.site).expect("source position"))
+            })
+            .expect("lay out");
+            let mut memory = Code::map(segment.size as usize).expect("map");
+            let base = memory.base() as u64;
+            let mut image = Image::new(base, pg as u64, alloc).expect("image");
+            let placed = image.append(&segment).expect("append");
+            assert!(placed.outside.is_empty(), "{label}: unexpected native import");
+            memory.write(0, &segment.code).expect("write code");
+            memory.write(segment.relro_at as usize, &segment.relro).expect("write relro");
+            for write in placed.writes.iter() {
+                memory.write((write.at - base) as usize, &write.value.to_le_bytes()).expect("write reloc");
+            }
+            let addr = image.home(Target { space: Space::Func, symbol: walk.symbol(0) }).expect("main");
+            let main_fn: extern "C-unwind" fn() -> i32 = unsafe { core::mem::transmute(addr as usize) };
+            assert_eq!(main_fn(), 42, "{label}: native execution returned wrong value");
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = walk;
+    };
+
+    run_lazy_mode("LazyProgram + SecondCheck", false);
+    run_lazy_mode("LazyProgram + FromRecord (blaze check -> blaze run)", true);
+}
+
+/// `ProjectWorld::check_borrows` (`blaze check`) expands concrete `inline for` loops and catches
+/// type errors inside the unrolled loop body rather than silently checking only the probe block.
+#[test]
+fn project_world_checks_concrete_inline_for_diagnostics() {
+    use blaze_build::Panic;
+    use blaze_ladder::crates::{Inputs, Toolchain};
+    use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
+    use blaze_ladder::front2::source::NamesSource as _;
+    use blaze_ladder::program_texts::ProgramTexts;
+    use blaze_mem::Frame;
+
+    let bad = [
+        RECORDS_HEAD,
+        "
+struct Pos { pub x: i32, pub y: i32 }
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let p = Pos { x: 1, y: 2 };
+    let mut bad_acc: bool = false;
+    inline for (_name, field) in &p {
+        bad_acc = *field;
+    }
+    0
+}
+",
+    ]
+    .concat();
+    let files = [SourceFile { path: "src/main.rs", text: &bad }];
+    let heap = blaze_own::testing::heap();
+    let alloc = heap.alloc();
+    let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    let tc = Toolchain::none(alloc);
+    let texts = ProgramTexts::new(&files, "src/main.rs", NEW, &tc, Panic::Abort).expect("program texts");
+    let user = texts.user();
+    let inputs = Inputs::new(&user, &tc).expect("inputs");
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("names");
+    let mut world = ProjectWorld::new(&names, &frame, &files, alloc).expect("project world");
+    let mut main_item = None;
+    (&names).each_item(0, &mut |it, _| {
+        if (&names).name_of(it) == Some("main") {
+            main_item = Some(it);
+        }
+    });
+    let main_item = main_item.expect("main item");
+    let (verdict, _) = world.check_borrows(BodyRef::Free(main_item), alloc);
+    assert!(
+        !verdict.diagnostics.is_empty(),
+        "expected type error inside concrete inline for body, got clean verdict"
+    );
+}

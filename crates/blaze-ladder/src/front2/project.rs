@@ -465,7 +465,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         let lowering = Cost::enter(cost, Part::Lower);
         // Boxed, lowered in a frame of its own: this frame stays on the stack under the whole
         // check (blaze-int notes t29 overflow-bt4.txt: 27,728 bytes).
-        let lowered = match lower_boxed(&mut r, prepared, body, alloc) {
+        let mut lowered = match lower_boxed(&mut r, prepared, body, alloc) {
             Ok(b) => b,
             // A required anonymous body's check can stop on a world gap. That is an
             // unanswered input to this body, not a refusal of the constant itself. Keep the
@@ -509,6 +509,28 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
             }
         };
         drop(lowering);
+        if !lowered.typeck.inline_fors.is_empty() {
+            if let Err(err) = super::inline_for::expand_concrete_body(&mut r, prepared, &mut lowered) {
+                match err {
+                    CheckFail::Diags { diags, .. } => {
+                        for (code, at, about) in diags.iter() {
+                            verdict.diagnostics.push(BodyDiagnostic { code: code.code(), text: AString::from_str_in(about, alloc), start: at.start, end: at.end, notes: AVec::new_in(alloc) });
+                        }
+                    }
+                    CheckFail::Gap { gaps, .. } => {
+                        for g in gaps {
+                            verdict.gaps.push(g);
+                        }
+                    }
+                    CheckFail::InlineFor { at, why, .. } => {
+                        verdict.diagnostics.push(BodyDiagnostic { code: "E0277", text: AString::from_str_in(why, alloc), start: at.start, end: at.end, notes: AVec::new_in(alloc) });
+                    }
+                    other => verdict.refused = Some(Refused::Check(other)),
+                }
+                verdict.diagnostics.sort_by_key(|d| (d.start, d.end, d.code));
+                return verdict;
+            }
+        }
         let view = lowered.lowered.view();
         let spell = match Spelling::of(&view) {
             Ok(s) => s,

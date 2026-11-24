@@ -6873,10 +6873,26 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                     }
                     other => other,
                 };
-                if let Some(want) = head {
-                    // Keep the failed head's own cell.  Widening a failed head to its record
-                    // would make an unrelated edit in the same file re-enter this body.
-                    data_reads.push(head_cell_id(want));
+                match head {
+                    Some(want) => {
+                        // Place the failed head's cell to its owning `Signature` task (same rule
+                        // as `widen`, rule 21): `head_cell_id(want)` is unplaced (keyed by item,
+                        // not task name), and `data_reads` bypasses `widen_as`, so leaving it
+                        // unplaced recorded a phantom cell that was forever `ABSENT` and never
+                        // woke the body when the head was repaired. Widening a placed member head
+                        // to its file would wake unrelated edits; keep its exact head cell.
+                        let raw = head_cell_id(want);
+                        match owners.place(opened.records, &raw, g) {
+                            Some(crate::engine_heads::HeadAt::Cell { cell, .. }) => data_reads.push(cell),
+                            Some(
+                                crate::engine_heads::HeadAt::Dependency(of)
+                                | crate::engine_heads::HeadAt::OfTheBody(of)
+                                | crate::engine_heads::HeadAt::Unlisted { scope: of, .. },
+                            ) => data_reads.push(CellId { of, cell: WHOLE }),
+                            None => scope_required = true,
+                        }
+                    }
+                    None => scope_required = true,
                 }
             }
             if let Err(words) = placed {

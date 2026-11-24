@@ -51,12 +51,12 @@ enum Kind {
 const fn kind(op: Op) -> Option<Kind> {
     Some(match op {
         Op::Add | Op::Sub | Op::Mul | Op::And | Op::Or | Op::Xor | Op::Shl | Op::Lshr | Op::Ashr
-        | Op::Rotl | Op::Rotr | Op::Umin | Op::Umax | Op::Smin | Op::Smax | Op::UaddSat
-        | Op::SaddSat | Op::UsubSat | Op::SsubSat => Kind::LaneInt,
+        | Op::Rotl | Op::Rotr | Op::Umulhi | Op::Smulhi | Op::Umin | Op::Umax | Op::Smin | Op::Smax
+        | Op::UaddSat | Op::SaddSat | Op::UsubSat | Op::SsubSat => Kind::LaneInt,
         Op::Udiv | Op::Sdiv | Op::Urem | Op::Srem => Kind::LaneDivision,
         Op::Fadd | Op::Fsub | Op::Fmul | Op::Fdiv | Op::Frem | Op::FminNum | Op::FmaxNum
         | Op::Fminimum | Op::Fmaximum | Op::Fcopysign => Kind::LaneFloat,
-        Op::Splat | Op::Insert | Op::Shuffle | Op::Swizzle => Kind::Whole,
+        Op::Splat | Op::Insert | Op::Shuffle | Op::Swizzle | Op::Bitcast => Kind::Whole,
         Op::Extract | Op::ReduceAdd | Op::ReduceMul | Op::ReduceAnd | Op::ReduceOr | Op::ReduceXor
         | Op::ReduceUmin | Op::ReduceUmax | Op::ReduceSmin | Op::ReduceSmax | Op::ReduceFadd
         | Op::ReduceFmul | Op::ReduceFmin | Op::ReduceFmax | Op::Bitmask => Kind::ToScalar,
@@ -125,7 +125,7 @@ impl<A: Allocator + Clone> Run<'_, A> {
         let Some(kind) = kind(op) else { return Ok(None) };
         let ty = self.view.ty(Value(inst as u32));
         let ptr_bits = self.view.head.ptr_bits;
-        if matches!(kind, Kind::LaneInt | Kind::LaneFloat | Kind::LaneDivision) && !ty.is_vector() {
+        if (matches!(kind, Kind::LaneInt | Kind::LaneFloat | Kind::LaneDivision) || op == Op::Bitcast) && !ty.is_vector() {
             return Ok(None);
         }
         let refuse = |what| EvalError::Unsupported { inst, op, what };
@@ -193,6 +193,10 @@ impl<A: Allocator + Clone> Run<'_, A> {
                             out = with_lane(out, i, w, x);
                         }
                         out
+                    }
+                    Op::Bitcast => {
+                        let (v, _) = self.vec(inst, op, o.value())?;
+                        v
                     }
                     _ => return Err(refuse("this vector operation")),
                 }

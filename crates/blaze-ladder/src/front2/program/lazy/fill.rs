@@ -100,12 +100,28 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                     Ok(checked) => checked,
                     Err(gap) => return Err(LazyRefusal::Typed { function, gap }),
                 };
+                if !made.typeck.inline_fors.is_empty() {
+                    let expanded = {
+                        let mut r = self.records(true);
+                        crate::front2::inline_for::expand_concrete_body(&mut r, prepared, &mut made)
+                    };
+                    expanded.map_err(|error| self.check_refusal(&function, error))?;
+                }
                 self.file_read_check(key, want, &made, &checked, &function)?;
                 checked
             }
         };
         let i = self.row(key, false)?;
         self.rows.checked[i] = true;
+        self.table_body_facts(i, key, made, &checked, &function)?;
+        Ok(Some((i, checked)))
+    }
+
+    /// Tables everything the build of row `i`'s checked body asks the `&self` seam getters
+    /// (ADTs, callees, async/fmt items, constants, statics, trait objects, coroutine recipes,
+    /// and the live body itself). Shared between `check_one_key_by` and on-demand generic
+    /// `inline for` specialization (`specialize_inline_for_row`).
+    fn table_body_facts(&mut self, i: usize, fmt_owner: ItemKey, made: Body<'n>, checked: &Checked<'static>, function: &str) -> Result<(), LazyRefusal> {
         // THE ONE RULE for what a body's columns name (both arms): every item they name is
         // filed and its head made HERE, from the columns, never left to the check's side
         // effects. A check files what it asks as it goes (an impl's head files its members,
@@ -114,7 +130,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         // rung": `main`'s callee, a member of an impl no other body here had asked, had no row
         // path). Over a checked body each step finds its item already filed and does nothing.
         // The ADT heads first: a callee that is a ctor is filed by its ADT's head.
-        self.adt_rows(&checked)?;
+        self.adt_rows(checked)?;
         // Each fn the body names as a value: filed (lazy/locate.rs), so `bind_internal` and
         // the walk's `check_one` of it read a key the map knows.
         for &def in checked.expr_defs.column::<1>() {
@@ -129,21 +145,89 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             self.callee_row(callee)?;
         }
         self.async_rows(&made)?;
-        self.fmt_rows(&made, key, &function)?;
+        self.fmt_rows(&made, fmt_owner, function)?;
         // Again after the callees' and async items' heads: their types name ADTs too (the
         // rounds over the store's table pick them up; nothing missing is nothing made).
-        self.adt_rows(&checked)?;
-        self.body_consts(&checked)?;
-        self.body_statics(&checked, &function)?;
-        self.body_objects(&checked, &function)?;
+        self.adt_rows(checked)?;
+        self.body_consts(checked)?;
+        self.body_statics(checked, function)?;
+        self.body_objects(checked, function)?;
         // Its async blocks' state recipes (coroutine_recipes.rs, as `Front2Program::make_from`
         // makes them), AFTER its callees' heads are in the store: the lowering relates a call
         // through its callee's signature (an `async fn` called with an `.await`, its future's
         // lifetimes), and with no head there the call is refused `ElisionAmbiguous`. A body
         // with no async block asks nothing.
-        self.body_recipes(&made, &checked, &function)?;
-        self.keep_body(i, made, &function)?;
-        Ok(Some((i, checked)))
+        self.body_recipes(&made, checked, function)?;
+        self.keep_body(i, made, function)?;
+        Ok(())
+    }
+
+    /// On-demand specialization of a generic `inline for` function at row `orig_i` for concrete
+    /// ground `args` (in `ground`): unrolls and checks the monomorphized body, tables all its
+    /// dependencies and head facts into a new row, caches it in `self.inline_for_specs`, and
+    /// hands over `(spec_row, orig_key, checked)`. Returns `Ok(None)` if row `orig_i` has no
+    /// unexpanded generic `inline for` loops or `args` cannot be specialized.
+    pub(super) fn specialize_inline_for_row(
+        &mut self,
+        orig_i: usize,
+        args: &[PTy],
+        ground: PTys<'_>,
+    ) -> Result<Option<(usize, ItemKey, Checked<'static>)>, LazyRefusal> {
+        if args.is_empty() {
+            return Ok(None);
+        }
+        let has_inline_for = self.live_of(orig_i).is_some_and(|l| !l.made.typeck.inline_fors.is_empty());
+        if !has_inline_for {
+            return Ok(None);
+        }
+        let Some(&orig_key) = self.rows.key.get(orig_i) else {
+            return Ok(None);
+        };
+        let function = self.shown(orig_key).into_boxed_str();
+        let prepared = self.prepared;
+        let specialized = {
+            let mut r = self.records(true);
+            crate::front2::inline_for::specialize_one_generic_inline_for(&mut r, prepared, orig_key, ground, args)
+        };
+        let Some(spec) = specialized.map_err(|error| self.check_refusal(&function, error))? else {
+            return Ok(None);
+        };
+        let spec_i = self.push_specialized_row(orig_i, spec.spec_key, &function)?;
+        if let Some(flag) = self.rows.checked.get_mut(spec_i) {
+            *flag = true;
+        }
+        self.counts.checked += 1;
+        self.table_body_facts(spec_i, orig_key, spec.body, &spec.checked, &function)?;
+        self.inline_for_specs.push(crate::front2::inline_for::SpecRow { orig: orig_key, args: spec.args, row: spec_i });
+        Ok(Some((spec_i, orig_key, spec.checked)))
+    }
+
+    fn push_specialized_row(&mut self, orig_i: usize, spec_key: ItemKey, function: &str) -> Result<usize, LazyRefusal> {
+        let i = self.rows.len();
+        let idx = u32::try_from(i).map_err(|_| LazyRefusal::Table { function: function.into() })?;
+        let missing = || LazyRefusal::Table { function: function.into() };
+        let abi = *self.rows.abi.get(orig_i).ok_or_else(missing)?;
+        let nounwind = *self.rows.nounwind.get(orig_i).ok_or_else(missing)?;
+        let track_caller = *self.rows.track_caller.get(orig_i).ok_or_else(missing)?;
+        let at = *self.rows.at.get(orig_i).ok_or_else(missing)?;
+        let path = *self.rows.path.get(orig_i).ok_or_else(missing)?;
+        let symbol = *self.rows.symbol.get(orig_i).ok_or_else(missing)?;
+        let intrinsic = *self.rows.intrinsic.get(orig_i).ok_or_else(missing)?;
+        self.rows.key.push(spec_key);
+        self.rows.kind.push(FnKind::Free);
+        self.rows.abi.push(abi);
+        self.rows.nounwind.push(nounwind);
+        self.rows.track_caller.push(track_caller);
+        self.rows.at.push(at);
+        self.rows.path.push(path);
+        self.rows.symbol.push(symbol);
+        self.rows.export.push(None);
+        self.rows.intrinsic.push(intrinsic);
+        self.rows.live.push(None);
+        self.rows.checked.push(false);
+        self.rows.by_key.insert(spec_key, idx);
+        self.counts.rows += 1;
+        Ok(i)
     }
 
     /// Decides where the process starts, once, by THE start rule (program.rs `start_of`, as
@@ -341,7 +425,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             // A ctor is a safe Rust fn (head_abi.rs `head_abi`, the one home): unwinding, never
             // nounwind, never tracked.
             let ctor = head_abi(self.front.names, &self.store, key, || Box::from(path.as_str())).map_err(&refuse)?;
-            return Ok(self.push(key, FnKind::Ctor, ctor, false, at, &path, "", None, None));
+            return Ok(self.push(key, FnKind::Ctor, ctor, false, blaze_lir::func::FnAttrs::default(), at, &path, "", None, None));
         }
         if !self.store.fns.contains_key(&key) {
             let (_, want) = self.target_of(key)?;
@@ -357,7 +441,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let local = |why: crate::front2::panic_entry::Refused| Front2Refusal::Attrs { function: Box::from(path.as_str()), why: why.form().into() };
         let foreign = foreign.or_else(|| crate::front2::panic_entry::local_abi(&self.store, key));
         if let Some(llvm) = seam_rules::llvm_row(foreign, symbols.link_name.as_deref(), &path).map_err(&refuse)? {
-            return Ok(self.push(key, llvm.kind, llvm.build, llvm.track_caller, at, &path, llvm.symbol, symbols.export.as_deref(), Some(llvm.intrinsic)));
+            return Ok(self.push(key, llvm.kind, llvm.build, llvm.track_caller, symbols.fn_attrs, at, &path, llvm.symbol, symbols.export.as_deref(), Some(llvm.intrinsic)));
         }
         let declared_name = crate::front2::panic_entry::local_name(&self.store, key).map_err(local).map_err(&refuse)?;
         let alloc = self.store.tys.alloc();
@@ -417,11 +501,11 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let own = head_abi(self.front.names, &self.store, key, || Box::from(path.as_str())).map_err(&refuse)?;
         // `#[rustc_nounwind]` makes any fn nounwind (core/src/panicking.rs:88-92), as tabled.rs.
         let build = BuildAbi { abi: own.abi, nounwind: own.nounwind || symbols.nounwind };
-        Ok(self.push(key, kind, build, symbols.track_caller, at, &path, symbol, symbols.export.as_deref(), intrinsic))
+        Ok(self.push(key, kind, build, symbols.track_caller, symbols.fn_attrs, at, &path, symbol, symbols.export.as_deref(), intrinsic))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn push(&mut self, key: ItemKey, kind: FnKind, build: BuildAbi, track_caller: bool, at: At, path: &str, symbol: &str, export: Option<&str>, intrinsic: Option<Intrinsic>) -> usize {
+    fn push(&mut self, key: ItemKey, kind: FnKind, build: BuildAbi, track_caller: bool, fn_attrs: blaze_lir::func::FnAttrs, at: At, path: &str, symbol: &str, export: Option<&str>, intrinsic: Option<Intrinsic>) -> usize {
         let i = self.rows.len();
         let path = self.rows.put(path);
         let symbol = self.rows.put(symbol);
@@ -431,6 +515,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         self.rows.abi.push(build.abi);
         self.rows.nounwind.push(build.nounwind);
         self.rows.track_caller.push(track_caller);
+        self.rows.fn_attrs.push(fn_attrs);
         self.rows.at.push(at);
         self.rows.path.push(path);
         self.rows.symbol.push(symbol);

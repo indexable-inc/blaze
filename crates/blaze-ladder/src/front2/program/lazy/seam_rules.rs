@@ -305,6 +305,9 @@ fn past_outer_attributes(text: &str, from: u32, edition: blaze_surface::Edition,
 /// needs no shown path, so a toolchain crate's body (core's `AlignmentEnum` copy) keeps its
 /// trap's site; the report places it by the item. `None`: the expression has no range.
 pub(in crate::front2::program) fn expr_offset(body: &Body<'_>, expr: ExprId) -> Option<u32> {
+    if body.expanded_text.is_some() {
+        return Some(0);
+    }
     let view = body.lowered.view();
     Some(view.site(view.expr_range(expr).ok()?).ok()?.start)
 }
