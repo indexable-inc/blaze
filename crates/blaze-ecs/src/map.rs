@@ -38,13 +38,18 @@ impl<K, V, A: Allocator + Copy> FlatMap<K, V, A> {
 
     /// Mutably look up a value by borrowed key `Q` in O(log N) time.
     #[inline]
-    #[cfg(test)]
     pub(crate) fn get_mut<Q: Ord + ?Sized>(&mut self, key: &Q) -> Option<&mut V>
     where
         K: Borrow<Q>,
     {
         let idx = self.entries.as_slice().binary_search_by(|(k, _)| k.borrow().cmp(key)).ok()?;
         self.entries.get_mut(idx).map(|(_, v)| v)
+    }
+
+    /// Mutable slice over stored `(K, V)` pairs in sorted key order.
+    #[inline]
+    pub(crate) fn entries_mut(&mut self) -> &mut [(K, V)] {
+        self.entries.as_mut_slice()
     }
 
     /// Insert or replace `(key, value)` maintaining strict key order.
@@ -133,5 +138,21 @@ impl<K, A: Allocator + Copy> FlatSet<K, A> {
                 Ok(true)
             }
         }
+    }
+
+    /// Remove `key` if present, returning `true` when removed.
+    pub(crate) fn remove<Q: Ord + ?Sized>(&mut self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+    {
+        let Ok(idx) = self.entries.as_slice().binary_search_by(|k| k.borrow().cmp(key)) else {
+            return false;
+        };
+        if let Some(tail) = self.entries.as_mut_slice().get_mut(idx..) {
+            if !tail.is_empty() {
+                tail.rotate_left(1);
+            }
+        }
+        self.entries.pop().is_some()
     }
 }

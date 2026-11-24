@@ -21,7 +21,7 @@ use core::ptr::{self, NonNull};
 
 use blaze_own::{Box as OwnBox, String as OwnString};
 use blaze_ui::{
-    ClipRectGpu, GlyphInst, InputEvent, Key, RectInst, WorkbenchApp, emit_ui_glyph_wgsl,
+    ClipRectGpu, GlyphInst, GpuPatch, InputEvent, Key, RectInst, WorkbenchApp, emit_ui_glyph_wgsl,
     emit_ui_sdf_wgsl,
 };
 
@@ -525,6 +525,78 @@ pub unsafe extern "C" fn ui_cursor_ptr(h: *const Handle) -> *const u8 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ui_cursor_len(h: *const Handle) -> usize {
     if h.is_null() { 0 } else { unsafe { (*h).app.ui.cursor().css_name().len() } }
+}
+
+/// Returns `1` if the host should upload full GPU buffers this frame, `0` for incremental patches.
+///
+/// # Safety
+/// `h` from `ui_new`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ui_is_full_upload(h: *const Handle) -> u32 {
+    if h.is_null() { 1 } else if unsafe { (*h).app.ui.draw.full_upload } { 1 } else { 0 }
+}
+
+/// Pointer to base-layer `GpuPatch` array for `rects` (`8B` stride: `[start, count]`).
+///
+/// # Safety
+/// `h` from `ui_new`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ui_rect_patches_ptr(h: *const Handle) -> *const GpuPatch {
+    if h.is_null() { ptr::null() } else { unsafe { (*h).app.ui.draw.rect_patches.as_ptr() } }
+}
+
+/// Number of base-layer rect patches.
+///
+/// # Safety
+/// `h` from `ui_new`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ui_rect_patches_len(h: *const Handle) -> usize {
+    if h.is_null() { 0 } else { unsafe { (*h).app.ui.draw.rect_patches.len() } }
+}
+
+/// Pointer to base-layer `GpuPatch` array for `glyphs` (`8B` stride).
+///
+/// # Safety
+/// `h` from `ui_new`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ui_glyph_patches_ptr(h: *const Handle) -> *const GpuPatch {
+    if h.is_null() { ptr::null() } else { unsafe { (*h).app.ui.draw.glyph_patches.as_ptr() } }
+}
+
+/// Number of base-layer glyph patches.
+///
+/// # Safety
+/// `h` from `ui_new`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ui_glyph_patches_len(h: *const Handle) -> usize {
+    if h.is_null() { 0 } else { unsafe { (*h).app.ui.draw.glyph_patches.len() } }
+}
+
+/// Number of layout nodes visited in the last frame (`0` on paint-only / idle frames).
+///
+/// # Safety
+/// `h` from `ui_new`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ui_last_layout_nodes(h: *const Handle) -> u32 {
+    if h.is_null() { 0 } else { unsafe { (*h).app.ui.last_stats.layout_nodes_visited } }
+}
+
+/// Number of paint nodes extracted/patched in the last frame.
+///
+/// # Safety
+/// `h` from `ui_new`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ui_last_paint_nodes(h: *const Handle) -> u32 {
+    if h.is_null() { 0 } else { unsafe { (*h).app.ui.last_stats.paint_nodes_visited } }
+}
+
+/// GPU bytes patched in the last frame.
+///
+/// # Safety
+/// `h` from `ui_new`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ui_last_patched_bytes(h: *const Handle) -> u32 {
+    if h.is_null() { 0 } else { unsafe { (*h).app.ui.last_stats.gpu_bytes_patched } }
 }
 
 #[cfg(test)]

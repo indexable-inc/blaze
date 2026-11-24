@@ -87,6 +87,15 @@ pub trait AnyColumn<A: Allocator + Copy> {
     /// Downcast handle for exclusive typed slice access.
     fn as_any_mut(&mut self) -> &mut dyn Any;
 
+    /// Last world tick at which `row` was written or added (`0` if unrecorded).
+    fn changed_tick(&self, row: usize) -> u64;
+
+    /// Highest `changed_tick` across all rows in this column (enables $O(1)$ table skip).
+    fn max_tick(&self) -> u64;
+
+    /// Stamp `row` with `tick` and advance the column's `max_tick`.
+    fn set_changed_tick(&mut self, row: usize, tick: u64);
+
     /// Remove and drop the value at `row` using O(1) swap-remove.
     fn swap_remove_drop(&mut self, table: TableId, row: usize) -> Result<(), EcsError>;
 
@@ -147,6 +156,8 @@ pub trait AnyColumn<A: Allocator + Copy> {
 /// Concrete contiguous SoA column for component type `T`.
 pub struct TypedColumn<T: 'static, A: Allocator + Copy> {
     data: OwnVec<T, A>,
+    changed_ticks: OwnVec<u64, A>,
+    max_tick: u64,
     duplicator: Option<fn(&T) -> T>,
     reflect: Option<ReflectVtable<T, A>>,
 }
@@ -155,7 +166,13 @@ impl<T: 'static, A: Allocator + Copy> TypedColumn<T, A> {
     /// Create an empty column in `alloc` with an optional value duplicator for prefab instantiation.
     #[inline]
     pub fn new_in(alloc: A, duplicator: Option<fn(&T) -> T>) -> Self {
-        Self { data: OwnVec::new_in(alloc), duplicator, reflect: None }
+        Self {
+            data: OwnVec::new_in(alloc),
+            changed_ticks: OwnVec::new_in(alloc),
+            max_tick: 0,
+            duplicator,
+            reflect: None,
+        }
     }
 
     /// Create an empty column in `alloc` with optional duplicator and reflection vtable.
@@ -165,7 +182,13 @@ impl<T: 'static, A: Allocator + Copy> TypedColumn<T, A> {
         duplicator: Option<fn(&T) -> T>,
         reflect: Option<ReflectVtable<T, A>>,
     ) -> Self {
-        Self { data: OwnVec::new_in(alloc), duplicator, reflect }
+        Self {
+            data: OwnVec::new_in(alloc),
+            changed_ticks: OwnVec::new_in(alloc),
+            max_tick: 0,
+            duplicator,
+            reflect,
+        }
     }
 
     /// Enable value duplication for a `Copy` component column (used when upgrading a lazily
@@ -190,10 +213,24 @@ impl<T: 'static, A: Allocator + Copy> TypedColumn<T, A> {
         self.reflect = Some(reflect_vtable::<T, A>());
     }
 
-    /// Push a new value onto the back of the column.
+    /// Push a new value onto the back of the column with `changed_tick = 0`.
     #[inline]
     pub fn push(&mut self, value: T) -> Result<(), EcsError> {
-        self.data.try_push(value).map_err(|refused| EcsError::Alloc(refused.why))
+        self.push_tick(value, 0)
+    }
+
+    /// Push a new value onto the back of the column stamped with `tick`.
+    #[inline]
+    pub fn push_tick(&mut self, value: T, tick: u64) -> Result<(), EcsError> {
+        self.changed_ticks.try_push(tick).map_err(|refused| EcsError::Alloc(refused.why))?;
+        if let Err(refused) = self.data.try_push(value) {
+            let _ = self.changed_ticks.pop();
+            return Err(EcsError::Alloc(refused.why));
+        }
+        if tick > self.max_tick {
+            self.max_tick = tick;
+        }
+        Ok(())
     }
 
     /// Replace an existing value at `row`.
@@ -203,6 +240,39 @@ impl<T: 'static, A: Allocator + Copy> TypedColumn<T, A> {
         let slot = self.data.get_mut(row).ok_or(EcsError::RowOutOfBounds { table, row, len })?;
         *slot = value;
         Ok(())
+    }
+
+    /// Replace an existing value at `row` and stamp its change `tick`.
+    #[inline]
+    pub fn set_tick(
+        &mut self,
+        table: TableId,
+        row: usize,
+        value: T,
+        tick: u64,
+    ) -> Result<(), EcsError> {
+        let len = self.data.len();
+        let slot = self.data.get_mut(row).ok_or(EcsError::RowOutOfBounds { table, row, len })?;
+        *slot = value;
+        if let Some(t) = self.changed_ticks.get_mut(row) {
+            *t = tick;
+        }
+        if tick > self.max_tick {
+            self.max_tick = tick;
+        }
+        Ok(())
+    }
+
+    /// Per-row change tick slice (1:1 aligned with [`Self::as_slice`]).
+    #[inline]
+    pub fn changed_ticks(&self) -> &[u64] {
+        self.changed_ticks.as_slice()
+    }
+
+    /// Highest change tick stored in this column (`0` if untouched).
+    #[inline]
+    pub fn max_tick_val(&self) -> u64 {
+        self.max_tick
     }
 
     /// Shared reference to the value at `row`.
@@ -229,13 +299,24 @@ impl<T: 'static, A: Allocator + Copy> TypedColumn<T, A> {
         self.data.as_mut_slice()
     }
 
-    /// Remove and return the value at `row` using O(1) swap-remove.
-    pub fn swap_remove(&mut self, table: TableId, row: usize) -> Result<T, EcsError> {
+    /// Remove and return `(value, changed_tick)` at `row` using O(1) swap-remove.
+    pub fn swap_remove_with_tick(&mut self, table: TableId, row: usize) -> Result<(T, u64), EcsError> {
         let len = self.data.len();
         if row >= len {
             return Err(EcsError::RowOutOfBounds { table, row, len });
         }
-        Ok(self.data.remove_swap(row))
+        let val = self.data.remove_swap(row);
+        let tick = if row < self.changed_ticks.len() {
+            self.changed_ticks.remove_swap(row)
+        } else {
+            0
+        };
+        Ok((val, tick))
+    }
+
+    /// Remove and return the value at `row` using O(1) swap-remove.
+    pub fn swap_remove(&mut self, table: TableId, row: usize) -> Result<T, EcsError> {
+        self.swap_remove_with_tick(table, row).map(|(v, _)| v)
     }
 }
 
@@ -260,6 +341,26 @@ impl<T: 'static, A: Allocator + Copy + 'static> AnyColumn<A> for TypedColumn<T, 
         self
     }
 
+    #[inline]
+    fn changed_tick(&self, row: usize) -> u64 {
+        self.changed_ticks.get(row).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    fn max_tick(&self) -> u64 {
+        self.max_tick
+    }
+
+    #[inline]
+    fn set_changed_tick(&mut self, row: usize, tick: u64) {
+        if let Some(slot) = self.changed_ticks.get_mut(row) {
+            *slot = tick;
+        }
+        if tick > self.max_tick {
+            self.max_tick = tick;
+        }
+    }
+
     fn swap_remove_drop(&mut self, table: TableId, row: usize) -> Result<(), EcsError> {
         let _ = self.swap_remove(table, row)?;
         Ok(())
@@ -276,8 +377,8 @@ impl<T: 'static, A: Allocator + Copy + 'static> AnyColumn<A> for TypedColumn<T, 
             .as_any_mut()
             .downcast_mut::<TypedColumn<T, A>>()
             .ok_or(EcsError::ComponentTypeMismatch { component: cid })?;
-        let value = self.swap_remove(table, row)?;
-        dst_typed.push(value)
+        let (value, tick) = self.swap_remove_with_tick(table, row)?;
+        dst_typed.push_tick(value, tick)
     }
 
     fn copy_row_to(
@@ -292,11 +393,12 @@ impl<T: 'static, A: Allocator + Copy + 'static> AnyColumn<A> for TypedColumn<T, 
         };
         let len = self.data.len();
         let src_val = self.data.get(row).ok_or(EcsError::RowOutOfBounds { table, row, len })?;
+        let tick = self.changed_tick(row);
         let dst_typed = dst
             .as_any_mut()
             .downcast_mut::<TypedColumn<T, A>>()
             .ok_or(EcsError::ComponentTypeMismatch { component: cid })?;
-        dst_typed.push(dup(src_val))?;
+        dst_typed.push_tick(dup(src_val), tick)?;
         Ok(true)
     }
 

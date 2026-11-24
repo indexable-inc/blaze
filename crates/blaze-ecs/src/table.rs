@@ -459,30 +459,67 @@ impl<A: Allocator + Copy + 'static> Table<A> {
         typed.get_mut(row).ok_or(EcsError::RowOutOfBounds { table: tid, row, len })
     }
 
-    /// Overwrite an existing component value at `row` in-place.
-    pub(crate) fn set_row<T: 'static>(
+    /// Overwrite an existing component value at `row` in-place and stamp `tick`.
+    pub(crate) fn set_row_tick<T: 'static>(
         &mut self,
         cid: ComponentId,
         row: usize,
         value: T,
+        tick: u64,
     ) -> Result<(), EcsError> {
         let tid = self.id;
         let idx = self.column_index(cid).ok_or(EcsError::MissingComponent(cid))?;
         let entry = self.columns.get_mut(idx).ok_or(EcsError::MissingComponent(cid))?;
         let typed = downcast_typed_mut::<T, A>(entry.col.as_mut(), cid)?;
-        typed.set(tid, row, value)
+        typed.set_tick(tid, row, value, tick)
     }
 
-    /// Push a new value into component column `cid`.
-    pub(crate) fn push_component<T: 'static>(
+    /// Push a new value into component column `cid` stamped with `tick`.
+    pub(crate) fn push_component_tick<T: 'static>(
         &mut self,
         cid: ComponentId,
         value: T,
+        tick: u64,
     ) -> Result<(), EcsError> {
         let idx = self.column_index(cid).ok_or(EcsError::MissingComponent(cid))?;
         let entry = self.columns.get_mut(idx).ok_or(EcsError::MissingComponent(cid))?;
         let typed = downcast_typed_mut::<T, A>(entry.col.as_mut(), cid)?;
-        typed.push(value)
+        typed.push_tick(value, tick)
+    }
+
+    /// Highest change tick stored in component column `cid` (`0` if absent or untouched).
+    #[inline]
+    pub fn column_max_tick(&self, cid: ComponentId) -> u64 {
+        let Some(idx) = self.column_index(cid) else { return 0 };
+        self.columns.get(idx).map_or(0, |e| e.col.max_tick())
+    }
+
+    /// Change tick of `(cid, row)` (`0` if absent or untouched).
+    #[inline]
+    pub fn row_changed_tick(&self, cid: ComponentId, row: usize) -> u64 {
+        let Some(idx) = self.column_index(cid) else { return 0 };
+        self.columns.get(idx).map_or(0, |e| e.col.changed_tick(row))
+    }
+
+    /// Stamp `(cid, row)` with `tick`.
+    #[inline]
+    pub(crate) fn mark_row_changed(&mut self, cid: ComponentId, row: usize, tick: u64) {
+        if let Some(idx) = self.column_index(cid) {
+            if let Some(entry) = self.columns.get_mut(idx) {
+                entry.col.set_changed_tick(row, tick);
+            }
+        }
+    }
+
+    /// Contiguous read-only slice and aligned `changed_ticks` slice for component `cid`.
+    pub fn column_with_ticks<T: 'static>(
+        &self,
+        cid: ComponentId,
+    ) -> Result<(&[T], &[u64]), EcsError> {
+        let idx = self.column_index(cid).ok_or(EcsError::MissingComponent(cid))?;
+        let entry = self.columns.get(idx).ok_or(EcsError::MissingComponent(cid))?;
+        let typed = downcast_typed::<T, A>(entry.col.as_ref(), cid)?;
+        Ok((typed.as_slice(), typed.changed_ticks()))
     }
 
     /// Reflect the component value at `(cid, row)` into a [`Value`], returning `Ok(None)` if opaque.

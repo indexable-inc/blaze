@@ -171,9 +171,9 @@ impl Id {
 /// Deterministic built-in Flecs 4.2 relation and trait entities created on `World::new_in`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Builtins {
-    /// Exclusive parent-child hierarchy relation (with `Exclusive` and `OnDeleteCascade`).
+    /// Exclusive parent-child hierarchy relation (with `Exclusive`, `Traversable`, `Acyclic`, `OnDeleteCascade`).
     pub child_of: Entity,
-    /// Prefab inheritance relation (`(IsA, prefab)`).
+    /// Prefab inheritance relation (`(IsA, prefab)` with `Traversable`, `Acyclic`).
     pub is_a: Entity,
     /// Tag marking an entity as a prefab (excluded from default queries).
     pub prefab: Entity,
@@ -187,6 +187,14 @@ pub struct Builtins {
     pub symmetric: Entity,
     /// Relation trait: despawning `target` cascades despawn to all entities with `(rel, target)`.
     pub on_delete_cascade: Entity,
+    /// Flecs 4.2 storage trait: store tag or relation pairs sparsely without moving archetypes.
+    pub dont_fragment: Entity,
+    /// Flecs 4.2 hierarchy trait: preserve explicit/creation child order on a parent entity.
+    pub ordered_children: Entity,
+    /// Flecs 4.2 relation trait: allows hierarchical up/down traversal (implies `Acyclic`).
+    pub traversable: Entity,
+    /// Flecs 4.2 relation trait: rejects cycles on `add_pair`.
+    pub acyclic: Entity,
 }
 
 impl Builtins {
@@ -195,10 +203,15 @@ impl Builtins {
         "ChildOf",
         "IsA",
         "Prefab",
+        "Wildcard",
         "Exclusive",
         "Symmetric",
         "Transitive",
         "OnDeleteCascade",
+        "DontFragment",
+        "OrderedChildren",
+        "Traversable",
+        "Acyclic",
     ];
 
     /// Whether `name` matches one of the built-in ECS entities.

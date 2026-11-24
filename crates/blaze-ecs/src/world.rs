@@ -50,6 +50,16 @@ pub struct World<A: Allocator + Copy + 'static> {
     tables: OwnVec<Table<A>, A>,
     table_by_archetype: FlatMap<ArchetypeKey<A>, TableId, A>,
     observers: OwnVec<Observer<A>, A>,
+    /// Monotonic world change tick (`1`-based) for $O(\Delta)$ `Changed<T>` tracking.
+    tick: u64,
+    /// Maintained $O(1)$ reverse index for `(ChildOf, parent)` in deterministic insertion order.
+    children_index: FlatMap<Entity, OwnVec<Entity, A>, A>,
+    /// Maintained $O(1)$ reverse index for `(IsA, prefab)` dependents.
+    isa_dependents: FlatMap<Entity, OwnVec<Entity, A>, A>,
+    /// Flecs 4.2 `DontFragment` sparse tag storage (`tag_entity -> set of entities`, zero table moves!).
+    sparse_tags: FlatMap<Entity, FlatSet<Entity, A>, A>,
+    /// Flecs 4.2 `DontFragment` sparse pair storage (`(entity, rel) -> targets`, zero table moves!).
+    sparse_pairs: FlatMap<(Entity, Entity), OwnVec<Entity, A>, A>,
     live_count: usize,
     #[cfg(test)]
     plant_skip_swap_row_update: bool,
@@ -77,6 +87,10 @@ impl<A: Allocator + Copy + 'static> World<A> {
             transitive: Entity::NULL,
             symmetric: Entity::NULL,
             on_delete_cascade: Entity::NULL,
+            dont_fragment: Entity::NULL,
+            ordered_children: Entity::NULL,
+            traversable: Entity::NULL,
+            acyclic: Entity::NULL,
         };
 
         let mut world = Self {
@@ -93,6 +107,11 @@ impl<A: Allocator + Copy + 'static> World<A> {
             tables,
             table_by_archetype,
             observers: OwnVec::new_in(alloc),
+            tick: 1,
+            children_index: FlatMap::new_in(alloc),
+            isa_dependents: FlatMap::new_in(alloc),
+            sparse_tags: FlatMap::new_in(alloc),
+            sparse_pairs: FlatMap::new_in(alloc),
             live_count: 0,
             #[cfg(test)]
             plant_skip_swap_row_update: false,
@@ -106,6 +125,10 @@ impl<A: Allocator + Copy + 'static> World<A> {
         let transitive = world.spawn_named("Transitive")?;
         let symmetric = world.spawn_named("Symmetric")?;
         let on_delete_cascade = world.spawn_named("OnDeleteCascade")?;
+        let dont_fragment = world.spawn_named("DontFragment")?;
+        let ordered_children = world.spawn_named("OrderedChildren")?;
+        let traversable = world.spawn_named("Traversable")?;
+        let acyclic = world.spawn_named("Acyclic")?;
 
         world.builtins = Builtins {
             child_of,
@@ -116,11 +139,19 @@ impl<A: Allocator + Copy + 'static> World<A> {
             transitive,
             symmetric,
             on_delete_cascade,
+            dont_fragment,
+            ordered_children,
+            traversable,
+            acyclic,
         };
 
-        // `ChildOf` is exclusive and cascades deletion to children, matching Flecs 4.2.
+        // `ChildOf` is exclusive, traversable, acyclic, and cascades deletion (Flecs 4.2).
         world.add_tag(child_of, exclusive)?;
         world.add_tag(child_of, on_delete_cascade)?;
+        world.add_tag(child_of, traversable)?;
+        world.add_tag(child_of, acyclic)?;
+        world.add_tag(is_a, traversable)?;
+        world.add_tag(is_a, acyclic)?;
 
         Ok(world)
     }
@@ -192,10 +223,47 @@ impl<A: Allocator + Copy + 'static> World<A> {
         self.builtins.on_delete_cascade
     }
 
+    /// Built-in Flecs 4.2 `DontFragment` sparse storage trait tag.
+    #[inline]
+    pub fn dont_fragment(&self) -> Entity {
+        self.builtins.dont_fragment
+    }
+
+    /// Built-in Flecs 4.2 `OrderedChildren` hierarchy trait tag.
+    #[inline]
+    pub fn ordered_children(&self) -> Entity {
+        self.builtins.ordered_children
+    }
+
+    /// Built-in Flecs 4.2 `Traversable` relation trait tag.
+    #[inline]
+    pub fn traversable(&self) -> Entity {
+        self.builtins.traversable
+    }
+
+    /// Built-in Flecs 4.2 `Acyclic` relation trait tag.
+    #[inline]
+    pub fn acyclic(&self) -> Entity {
+        self.builtins.acyclic
+    }
+
     /// Number of currently alive entities (including built-in entities).
     #[inline]
     pub fn live_count(&self) -> usize {
         self.live_count
+    }
+
+    /// Current monotonic world change tick (`1`-based).
+    #[inline]
+    pub fn tick(&self) -> u64 {
+        self.tick
+    }
+
+    /// Advance the world change tick by `1` and return the new tick.
+    #[inline]
+    pub fn advance_tick(&mut self) -> u64 {
+        self.tick = self.tick.saturating_add(1);
+        self.tick
     }
 
     /// Number of registered component types.
@@ -805,6 +873,7 @@ impl<A: Allocator + Copy + 'static> World<A> {
             slot.table_id = dst_tid;
             slot.row = dst_row;
         }
+        self.index_pair_added(inst, self.builtins.is_a, prefab)?;
 
         // 5. Fire observers for `(IsA, prefab)` and all copied components.
         self.emit_event(EventKind::OnAdd, inst, is_a_pair)?;
@@ -900,7 +969,36 @@ impl<A: Allocator + Copy + 'static> World<A> {
                 }
             }
             for &id in removed_ids.as_slice() {
+                if let Id::Pair(rel, target) = id {
+                    self.index_pair_removed(dead, rel, target);
+                }
                 self.emit_event(EventKind::OnRemove, dead, id)?;
+            }
+            let _ = self.children_index.remove(&dead);
+            let _ = self.isa_dependents.remove(&dead);
+            // Clean Flecs 4.2 `DontFragment` sparse tags & pairs referencing `dead`.
+            let _ = self.sparse_tags.remove(&dead);
+            for (_, set) in self.sparse_tags.entries_mut() {
+                let _ = set.remove(&dead);
+            }
+            let mut dead_keys = OwnVec::new_in(self.alloc);
+            for ((holder, rel), targets) in self.sparse_pairs.entries_mut() {
+                let (h, r) = (*holder, *rel);
+                if h == dead || r == dead {
+                    dead_keys.try_push((h, r)).map_err(|err| EcsError::Alloc(err.why))?;
+                } else {
+                    let mut i = 0usize;
+                    while i < targets.len() {
+                        if targets.get(i).copied() == Some(dead) {
+                            let _ = targets.remove_swap(i);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            for &k in dead_keys.as_slice() {
+                let _ = self.sparse_pairs.remove(&k);
             }
 
             let moved = {
@@ -989,6 +1087,43 @@ impl<A: Allocator + Copy + 'static> World<A> {
         self.set_by_id(entity, cid, value)
     }
 
+    /// Set component `T` on `entity` **only if absent or `new != old`**.
+    ///
+    /// Returns `Ok(false)` in $O(1)$ with zero tick bump, zero observer dispatch, and zero
+    /// downstream dirty propagation when `entity` already holds an equal value.
+    pub fn set_if_changed<T: PartialEq + 'static>(
+        &mut self,
+        entity: Entity,
+        value: T,
+    ) -> Result<bool, EcsError> {
+        let _ = self.live_slot(entity)?;
+        if let Some(existing) = self.get::<T>(entity)? {
+            if *existing == value {
+                return Ok(false);
+            }
+        }
+        let cid = self.component::<T>()?;
+        self.set_by_id(entity, cid, value)?;
+        Ok(true)
+    }
+
+    /// Set `Copy` component `T` on `entity` **only if absent or `new != old`**.
+    pub fn set_copy_if_changed<T: Copy + PartialEq + 'static>(
+        &mut self,
+        entity: Entity,
+        value: T,
+    ) -> Result<bool, EcsError> {
+        let _ = self.live_slot(entity)?;
+        if let Some(existing) = self.get::<T>(entity)? {
+            if *existing == value {
+                return Ok(false);
+            }
+        }
+        let cid = self.component_copy::<T>()?;
+        self.set_by_id(entity, cid, value)?;
+        Ok(true)
+    }
+
     /// Set (insert or overwrite) component `T` on `entity` using its pre-fetched [`ComponentId`].
     pub fn set_by_id<T: 'static>(
         &mut self,
@@ -1001,17 +1136,18 @@ impl<A: Allocator + Copy + 'static> World<A> {
         if meta.type_id != TypeId::of::<T>() {
             return Err(EcsError::ComponentTypeMismatch { component: cid });
         }
+        let tick = self.tick;
         let id = Id::Component(cid);
         let already_has = self.table(src_tid)?.has_id(id);
         if already_has {
-            self.table_mut(src_tid)?.set_row(cid, src_row, value)?;
+            self.table_mut(src_tid)?.set_row_tick(cid, src_row, value, tick)?;
             self.emit_event(EventKind::OnSet, entity, id)?;
             return Ok(());
         }
 
         let dst_tid = self.get_or_create_add_edge(src_tid, id)?;
         let (dst_row, moved_in_src) = self.move_entity_tables(src_tid, src_row, dst_tid)?;
-        self.table_mut(dst_tid)?.push_component(cid, value)?;
+        self.table_mut(dst_tid)?.push_component_tick(cid, value, tick)?;
 
         if let Some(slot) = self.slots.get_mut(u32_to_usize(entity.slot())) {
             slot.table_id = dst_tid;
@@ -1023,6 +1159,52 @@ impl<A: Allocator + Copy + 'static> World<A> {
 
         self.emit_event(EventKind::OnAdd, entity, id)?;
         self.emit_event(EventKind::OnSet, entity, id)?;
+        Ok(())
+    }
+
+    /// Return `true` if component `T` on `entity` was added or mutated after `since_tick`.
+    pub fn changed_since<T: 'static>(
+        &self,
+        entity: Entity,
+        since_tick: u64,
+    ) -> Result<bool, EcsError> {
+        let (tid, row) = self.entity_table(entity)?;
+        let Some(cid) = self.component_id::<T>() else {
+            return Ok(false);
+        };
+        let table = self.table(tid)?;
+        Ok(table.row_changed_tick(cid, row) > since_tick)
+    }
+
+    /// Visit every live entity whose component `T` changed after `since_tick`.
+    ///
+    /// Untouched archetype tables are skipped in $O(1)$ via `column_max_tick <= since_tick`.
+    pub fn each_changed<T: 'static>(
+        &self,
+        since_tick: u64,
+        mut f: impl FnMut(Entity, &T),
+    ) -> Result<(), EcsError> {
+        let Some(cid) = self.component_id::<T>() else {
+            return Ok(());
+        };
+        let id = Id::Component(cid);
+        let prefab_tag = Id::Tag(self.builtins.prefab);
+        for table in self.tables.as_slice() {
+            if table.is_empty()
+                || table.has_id(prefab_tag)
+                || !table.has_id(id)
+                || table.column_max_tick(cid) <= since_tick
+            {
+                continue;
+            }
+            let entities = table.entities();
+            let (vals, ticks) = table.column_with_ticks::<T>(cid)?;
+            for (idx, (&ent, val)) in entities.iter().zip(vals.iter()).enumerate() {
+                if ticks.get(idx).copied().unwrap_or(0) > since_tick {
+                    f(ent, val);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1039,16 +1221,18 @@ impl<A: Allocator + Copy + 'static> World<A> {
         Ok(Some(table.get_row::<T>(cid, row)?))
     }
 
-    /// Mutably borrow component `T` directly from `entity`.
+    /// Mutably borrow component `T` directly from `entity` and stamp its change tick.
     pub fn get_mut<T: 'static>(&mut self, entity: Entity) -> Result<Option<&mut T>, EcsError> {
         let (tid, row) = self.entity_table(entity)?;
         let Some(cid) = self.component_id::<T>() else {
             return Ok(None);
         };
+        let tick = self.tick;
         let table = self.table_mut(tid)?;
         if !table.has_id(Id::Component(cid)) {
             return Ok(None);
         }
+        table.mark_row_changed(cid, row, tick);
         Ok(Some(table.get_row_mut::<T>(cid, row)?))
     }
 
@@ -1121,11 +1305,31 @@ impl<A: Allocator + Copy + 'static> World<A> {
     // -------------------------------------------------------------------------
 
     /// Attach zero-sized tag `tag` to `entity`.
+    ///
+    /// If `tag` carries the Flecs 4.2 `DontFragment` trait, attaches sparsely in $O(1)$ without
+    /// moving `entity` between archetype tables!
     pub fn add_tag(&mut self, entity: Entity, tag: Entity) -> Result<(), EcsError> {
         let _ = self.live_slot(entity)?;
         let _ = self.live_slot(tag)?;
         if tag == self.builtins.wildcard {
             return Err(EcsError::InvalidWildcardUse);
+        }
+        if tag != self.builtins.dont_fragment
+            && self.entity_has_tag_raw(tag, self.builtins.dont_fragment)
+        {
+            let inserted = match self.sparse_tags.get_mut(&tag) {
+                Some(set) => set.insert(entity)?,
+                None => {
+                    let mut set = FlatSet::new_in(self.alloc);
+                    let ok = set.insert(entity)?;
+                    let _ = self.sparse_tags.insert(tag, set)?;
+                    ok
+                }
+            };
+            if inserted {
+                self.emit_event(EventKind::OnAdd, entity, Id::Tag(tag))?;
+            }
+            return Ok(());
         }
         let _ = self.add_id_no_data(entity, Id::Tag(tag))?;
         Ok(())
@@ -1134,29 +1338,50 @@ impl<A: Allocator + Copy + 'static> World<A> {
     /// Remove tag `tag` from `entity`.
     pub fn remove_tag(&mut self, entity: Entity, tag: Entity) -> Result<bool, EcsError> {
         let _ = self.live_slot(entity)?;
+        if tag != self.builtins.dont_fragment
+            && self.entity_has_tag_raw(tag, self.builtins.dont_fragment)
+        {
+            let removed = self.sparse_tags.get_mut(&tag).is_some_and(|set| set.remove(&entity));
+            if removed {
+                self.emit_event(EventKind::OnRemove, entity, Id::Tag(tag))?;
+            }
+            return Ok(removed);
+        }
         self.remove_id_internal(entity, Id::Tag(tag))
     }
 
-    /// Return whether `entity` has `tag`.
+    /// Return whether `entity` has `tag` (checks both archetype tables and `DontFragment` sparse storage).
     pub fn has_tag(&self, entity: Entity, tag: Entity) -> Result<bool, EcsError> {
         let (tid, _) = self.entity_table(entity)?;
-        Ok(self.table(tid)?.has_id(Id::Tag(tag)))
+        if self.table(tid)?.has_id(Id::Tag(tag)) {
+            return Ok(true);
+        }
+        Ok(self.sparse_tags.get(&tag).is_some_and(|set| set.contains(&entity)))
     }
 
     #[inline]
     fn entity_has_tag_raw(&self, entity: Entity, tag: Entity) -> bool {
-        self.live_slot(entity)
+        if tag == Entity::NULL {
+            return false;
+        }
+        if self
+            .live_slot(entity)
             .ok()
             .and_then(|slot| self.table(slot.table_id).ok())
             .is_some_and(|tbl| tbl.has_id(Id::Tag(tag)))
+        {
+            return true;
+        }
+        self.sparse_tags.get(&tag).is_some_and(|set| set.contains(&entity))
     }
 
     /// Attach pair `(rel, target)` to `entity`.
     ///
     /// Enforces:
-    /// - Hierarchy/inheritance cycle rejection for `ChildOf` and `IsA`.
+    /// - Hierarchy/inheritance cycle rejection for `ChildOf`, `IsA`, `Acyclic`, and `Traversable`.
     /// - `Exclusive` relation replacement (removes any previous `(rel, old_target)`).
     /// - `Symmetric` relation mirroring (also attaches `(rel, entity)` on `target`).
+    /// - Flecs 4.2 `DontFragment` sparse storage (zero archetype table migration!).
     pub fn add_pair(
         &mut self,
         entity: Entity,
@@ -1170,15 +1395,47 @@ impl<A: Allocator + Copy + 'static> World<A> {
             return Err(EcsError::InvalidWildcardUse);
         }
 
-        // Cycle rejection for `ChildOf` and `IsA` (iterative BFS).
-        if rel == self.builtins.child_of || rel == self.builtins.is_a {
-            if entity == target || self.can_reach_via_relation(target, rel, entity)? {
-                return Err(EcsError::HierarchyCycle { entity, relation: rel, target });
+        // Cycle rejection for `ChildOf`, `IsA`, `Acyclic`, and `Traversable` (iterative BFS).
+        let is_acyclic = rel == self.builtins.child_of
+            || rel == self.builtins.is_a
+            || self.entity_has_tag_raw(rel, self.builtins.acyclic)
+            || self.entity_has_tag_raw(rel, self.builtins.traversable);
+        if is_acyclic && (entity == target || self.can_reach_via_relation(target, rel, entity)?) {
+            return Err(EcsError::HierarchyCycle { entity, relation: rel, target });
+        }
+
+        let is_exclusive = self.entity_has_tag_raw(rel, self.builtins.exclusive);
+        let is_symmetric = self.entity_has_tag_raw(rel, self.builtins.symmetric);
+        let is_sparse = self.entity_has_tag_raw(rel, self.builtins.dont_fragment);
+
+        if is_sparse {
+            let mut replaced: OwnVec<Entity, A> = OwnVec::new_in(self.alloc);
+            if is_exclusive {
+                if let Some(cur) = self.sparse_pairs.get(&(entity, rel)) {
+                    if cur.as_slice() == [target] {
+                        return Ok(());
+                    }
+                    for &old_t in cur.as_slice() {
+                        replaced.try_push(old_t).map_err(|r| EcsError::Alloc(r.why))?;
+                    }
+                }
+                for &old_t in replaced.as_slice() {
+                    let _ = self.remove_pair(entity, rel, old_t)?;
+                }
             }
+            if self.insert_sparse_pair(entity, rel, target)? {
+                self.index_pair_added(entity, rel, target)?;
+                self.emit_event(EventKind::OnAdd, entity, Id::Pair(rel, target))?;
+            }
+            if is_symmetric && entity != target && self.insert_sparse_pair(target, rel, entity)? {
+                self.index_pair_added(target, rel, entity)?;
+                self.emit_event(EventKind::OnAdd, target, Id::Pair(rel, entity))?;
+            }
+            return Ok(());
         }
 
         // Exclusive relation handling: replace existing target if different.
-        if self.entity_has_tag_raw(rel, self.builtins.exclusive) {
+        if is_exclusive {
             let mut old_targets = OwnVec::new_in(self.alloc);
             let (tid, _) = self.entity_table(entity)?;
             let table = self.table(tid)?;
@@ -1200,11 +1457,44 @@ impl<A: Allocator + Copy + 'static> World<A> {
         let _ = self.add_id_no_data(entity, Id::Pair(rel, target))?;
 
         // Symmetric relation mirroring (non-recursive).
-        if self.entity_has_tag_raw(rel, self.builtins.symmetric) && entity != target {
+        if is_symmetric && entity != target {
             let _ = self.add_id_no_data(target, Id::Pair(rel, entity))?;
         }
 
         Ok(())
+    }
+
+    fn insert_sparse_pair(
+        &mut self,
+        entity: Entity,
+        rel: Entity,
+        target: Entity,
+    ) -> Result<bool, EcsError> {
+        match self.sparse_pairs.get_mut(&(entity, rel)) {
+            Some(list) => {
+                if list.iter().any(|&t| t == target) {
+                    return Ok(false);
+                }
+                list.try_push(target).map_err(|r| EcsError::Alloc(r.why))?;
+                Ok(true)
+            }
+            None => {
+                let mut list = OwnVec::new_in(self.alloc);
+                list.try_push(target).map_err(|r| EcsError::Alloc(r.why))?;
+                let _ = self.sparse_pairs.insert((entity, rel), list)?;
+                Ok(true)
+            }
+        }
+    }
+
+    fn remove_sparse_pair(&mut self, entity: Entity, rel: Entity, target: Entity) -> bool {
+        if let Some(list) = self.sparse_pairs.get_mut(&(entity, rel)) {
+            if let Some(pos) = list.iter().position(|&t| t == target) {
+                let _ = list.remove_swap(pos);
+                return true;
+            }
+        }
+        false
     }
 
     /// Remove pair `(rel, target)` from `entity` (and mirrors removal for `Symmetric` relations).
@@ -1215,6 +1505,22 @@ impl<A: Allocator + Copy + 'static> World<A> {
         target: Entity,
     ) -> Result<bool, EcsError> {
         let _ = self.live_slot(entity)?;
+        if self.entity_has_tag_raw(rel, self.builtins.dont_fragment) {
+            let removed = self.remove_sparse_pair(entity, rel, target);
+            if removed {
+                self.index_pair_removed(entity, rel, target);
+                self.emit_event(EventKind::OnRemove, entity, Id::Pair(rel, target))?;
+            }
+            if self.entity_has_tag_raw(rel, self.builtins.symmetric)
+                && entity != target
+                && self.is_alive(target)
+                && self.remove_sparse_pair(target, rel, entity)
+            {
+                self.index_pair_removed(target, rel, entity);
+                self.emit_event(EventKind::OnRemove, target, Id::Pair(rel, entity))?;
+            }
+            return Ok(removed);
+        }
         let removed = self.remove_id_internal(entity, Id::Pair(rel, target))?;
         if self.entity_has_tag_raw(rel, self.builtins.symmetric)
             && entity != target
@@ -1233,7 +1539,13 @@ impl<A: Allocator + Copy + 'static> World<A> {
         target: Entity,
     ) -> Result<bool, EcsError> {
         let (tid, _) = self.entity_table(entity)?;
-        Ok(self.table(tid)?.has_id(Id::Pair(rel, target)))
+        if self.table(tid)?.has_id(Id::Pair(rel, target)) {
+            return Ok(true);
+        }
+        Ok(self
+            .sparse_pairs
+            .get(&(entity, rel))
+            .is_some_and(|list| list.iter().any(|&t| t == target)))
     }
 
     /// Check whether `(entity, rel, target)` holds directly or transitively (when `rel` carries
@@ -1293,6 +1605,17 @@ impl<A: Allocator + Copy + 'static> World<A> {
                     }
                 }
             }
+            if let Some(sparse) = self.sparse_pairs.get(&(cur, rel)) {
+                for &next in sparse.as_slice() {
+                    if next == goal {
+                        return Ok(true);
+                    }
+                    if !visited.contains(&next) {
+                        let _ = visited.insert(next)?;
+                        queue.try_push(next).map_err(|r| EcsError::Alloc(r.why))?;
+                    }
+                }
+            }
         }
         Ok(false)
     }
@@ -1306,6 +1629,72 @@ impl<A: Allocator + Copy + 'static> World<A> {
             if let Id::Pair(r, t) = id {
                 if r == rel {
                     out.try_push(t).map_err(|r| EcsError::Alloc(r.why))?;
+                }
+            }
+        }
+        if let Some(sparse) = self.sparse_pairs.get(&(entity, rel)) {
+            for &t in sparse.as_slice() {
+                if !out.iter().any(|&x| x == t) {
+                    out.try_push(t).map_err(|r| EcsError::Alloc(r.why))?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Flecs 4.2 `OrderedChildren`: explicitly set the deterministic order of `parent`'s children.
+    pub fn set_child_order(&mut self, parent: Entity, ordered: &[Entity]) -> Result<(), EcsError> {
+        let _ = self.live_slot(parent)?;
+        self.add_tag(parent, self.builtins.ordered_children)?;
+        let mut next = OwnVec::try_with_capacity_in(ordered.len(), self.alloc)?;
+        for &ch in ordered {
+            if self.is_alive(ch) && self.parent_of(ch)? == Some(parent) && !next.iter().any(|&x| x == ch) {
+                next.try_push(ch).map_err(|r| EcsError::Alloc(r.why))?;
+            }
+        }
+        // Append any existing children not listed in `ordered` so none are dropped.
+        if let Some(existing) = self.children_index.get(&parent) {
+            for &ch in existing.as_slice() {
+                if !next.iter().any(|&x| x == ch) {
+                    next.try_push(ch).map_err(|r| EcsError::Alloc(r.why))?;
+                }
+            }
+        }
+        let _ = self.children_index.insert(parent, next)?;
+        Ok(())
+    }
+
+    /// Mark typed tag `T` with Flecs 4.2 `DontFragment` (sparse storage — zero archetype moves!).
+    pub fn mark_tag_dont_fragment<T: 'static>(&mut self) -> Result<Entity, EcsError> {
+        let tag = self.tag_entity::<T>()?;
+        self.add_tag(tag, self.builtins.dont_fragment)?;
+        Ok(tag)
+    }
+
+    /// Iteratively walk upwards along any `Traversable` relation `R` starting from `entity`.
+    pub fn traverse_up<R: Relation>(&mut self, entity: Entity) -> Result<OwnVec<Entity, A>, EcsError> {
+        let _ = self.live_slot(entity)?;
+        let rel = self.relation_entity::<R>()?;
+        let step_cap = self.slots.len().saturating_add(1);
+        let mut out = OwnVec::new_in(self.alloc);
+        let mut visited: FlatSet<Entity, A> = FlatSet::new_in(self.alloc);
+        let mut queue = OwnVec::new_in(self.alloc);
+        let _ = visited.insert(entity)?;
+        queue.try_push(entity).map_err(|r| EcsError::Alloc(r.why))?;
+        let mut head = 0usize;
+        let mut steps = 0usize;
+        while let Some(&cur) = queue.get(head) {
+            head += 1;
+            steps += 1;
+            if steps > step_cap {
+                return Err(EcsError::TraversalBoundExceeded { limit: step_cap });
+            }
+            let targets = self.targets_of(cur, rel)?;
+            for &t in targets.as_slice() {
+                if !visited.contains(&t) {
+                    let _ = visited.insert(t)?;
+                    out.try_push(t).map_err(|r| EcsError::Alloc(r.why))?;
+                    queue.try_push(t).map_err(|r| EcsError::Alloc(r.why))?;
                 }
             }
         }
@@ -1326,17 +1715,25 @@ impl<A: Allocator + Copy + 'static> World<A> {
         Ok(None)
     }
 
-    /// Return all live entities with `(ChildOf, parent)` in deterministic order.
+    /// Zero-allocation $O(1)$ slice of all live entities with `(ChildOf, parent)` in insertion order.
+    #[inline]
+    pub fn children_slice(&self, parent: Entity) -> &[Entity] {
+        self.children_index.get(&parent).map_or(&[], OwnVec::as_slice)
+    }
+
+    /// Zero-allocation $O(1)$ slice of all live entities inheriting `(IsA, prefab)`.
+    #[inline]
+    pub fn isa_dependents_slice(&self, prefab: Entity) -> &[Entity] {
+        self.isa_dependents.get(&prefab).map_or(&[], OwnVec::as_slice)
+    }
+
+    /// Return all live entities with `(ChildOf, parent)` in deterministic sorted order.
     pub fn children_of(&self, parent: Entity) -> Result<OwnVec<Entity, A>, EcsError> {
         let _ = self.live_slot(parent)?;
-        let pair = Id::Pair(self.builtins.child_of, parent);
-        let mut out = OwnVec::new_in(self.alloc);
-        for table in self.tables.as_slice() {
-            if table.has_id(pair) {
-                for &child in table.entities() {
-                    out.try_push(child).map_err(|r| EcsError::Alloc(r.why))?;
-                }
-            }
+        let slice = self.children_slice(parent);
+        let mut out = OwnVec::try_with_capacity_in(slice.len(), self.alloc)?;
+        for &child in slice {
+            out.try_push(child).map_err(|r| EcsError::Alloc(r.why))?;
         }
         out.as_mut_slice().sort_unstable();
         Ok(out)
@@ -1375,11 +1772,11 @@ impl<A: Allocator + Copy + 'static> World<A> {
 
     /// Check whether `entity` carries typed marker tag `T`.
     pub fn has_tag_typed<T: 'static>(&self, entity: Entity) -> Result<bool, EcsError> {
-        let (tid, _) = self.entity_table(entity)?;
+        let _ = self.live_slot(entity)?;
         let Some(tag) = self.tag_entity_id::<T>() else {
             return Ok(false);
         };
-        Ok(self.table(tid)?.has_id(Id::Tag(tag)))
+        self.has_tag(entity, tag)
     }
 
     /// Remove typed marker tag `T` from `entity`.
@@ -1432,6 +1829,15 @@ impl<A: Allocator + Copy + 'static> World<A> {
         }
         if R::ON_DELETE_CASCADE {
             self.add_tag(rel, self.builtins.on_delete_cascade)?;
+        }
+        if R::DONT_FRAGMENT {
+            self.add_tag(rel, self.builtins.dont_fragment)?;
+        }
+        if R::TRAVERSABLE {
+            self.add_tag(rel, self.builtins.traversable)?;
+            self.add_tag(rel, self.builtins.acyclic)?;
+        } else if R::ACYCLIC {
+            self.add_tag(rel, self.builtins.acyclic)?;
         }
         let _ = self.relation_by_type.insert(tid, rel)?;
         Ok(rel)
@@ -1894,6 +2300,55 @@ impl<A: Allocator + Copy + 'static> World<A> {
     // Internal Table Graph Transitions
     // -------------------------------------------------------------------------
 
+    fn index_pair_added(&mut self, entity: Entity, rel: Entity, target: Entity) -> Result<(), EcsError> {
+        if rel == self.builtins.child_of {
+            let list = match self.children_index.get_mut(&target) {
+                Some(v) => v,
+                None => {
+                    let _ = self.children_index.insert(target, OwnVec::new_in(self.alloc))?;
+                    match self.children_index.get_mut(&target) {
+                        Some(v) => v,
+                        None => return Ok(()),
+                    }
+                }
+            };
+            if !list.iter().any(|&e| e == entity) {
+                list.try_push(entity).map_err(|r| EcsError::Alloc(r.why))?;
+            }
+        } else if rel == self.builtins.is_a {
+            let list = match self.isa_dependents.get_mut(&target) {
+                Some(v) => v,
+                None => {
+                    let _ = self.isa_dependents.insert(target, OwnVec::new_in(self.alloc))?;
+                    match self.isa_dependents.get_mut(&target) {
+                        Some(v) => v,
+                        None => return Ok(()),
+                    }
+                }
+            };
+            if !list.iter().any(|&e| e == entity) {
+                list.try_push(entity).map_err(|r| EcsError::Alloc(r.why))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn index_pair_removed(&mut self, entity: Entity, rel: Entity, target: Entity) {
+        if rel == self.builtins.child_of {
+            if let Some(list) = self.children_index.get_mut(&target) {
+                if let Some(pos) = list.iter().position(|&e| e == entity) {
+                    let _ = list.remove_shift(pos);
+                }
+            }
+        } else if rel == self.builtins.is_a {
+            if let Some(list) = self.isa_dependents.get_mut(&target) {
+                if let Some(pos) = list.iter().position(|&e| e == entity) {
+                    let _ = list.remove_swap(pos);
+                }
+            }
+        }
+    }
+
     fn add_id_no_data(&mut self, entity: Entity, id: Id) -> Result<bool, EcsError> {
         let (src_tid, src_row) = self.entity_table(entity)?;
         if self.table(src_tid)?.has_id(id) {
@@ -1907,6 +2362,9 @@ impl<A: Allocator + Copy + 'static> World<A> {
         }
         if let Some(moved) = moved_in_src {
             self.update_moved_row(moved, src_row);
+        }
+        if let Id::Pair(rel, target) = id {
+            self.index_pair_added(entity, rel, target)?;
         }
         self.emit_event(EventKind::OnAdd, entity, id)?;
         Ok(true)
@@ -1925,6 +2383,9 @@ impl<A: Allocator + Copy + 'static> World<A> {
         }
         if let Some(moved) = moved_in_src {
             self.update_moved_row(moved, src_row);
+        }
+        if let Id::Pair(rel, target) = id {
+            self.index_pair_removed(entity, rel, target);
         }
         self.emit_event(EventKind::OnRemove, entity, id)?;
         Ok(true)

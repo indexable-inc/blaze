@@ -86,7 +86,7 @@ pub enum UiEvent {
     CanvasWheel { entity: Entity, local_x: f32, local_y: f32, dy: f32, ctrl_or_meta: bool },
 }
 
-/// Persistent pointer, capture, focus, and event queue state.
+/// Persistent pointer, capture, focus, dirty-entity hints, and event queue state.
 pub struct InputState<A: Allocator + Copy> {
     pub pointer_x: f32,
     pub pointer_y: f32,
@@ -95,6 +95,10 @@ pub struct InputState<A: Allocator + Copy> {
     pub focused: Option<Entity>,
     pub cursor: CursorHint,
     pub events: OwnVec<UiEvent, A>,
+    /// Entities whose visual state (`Hovered`/`Active`/`Focused`/toggle/slider/text) changed.
+    pub dirty_paint: OwnVec<Entity, A>,
+    /// Set when dock chrome, splitter ratios, or scroll offsets require layout/full redraw.
+    pub dirty_layout: bool,
     tab_drag_origin: Option<(Entity, Entity, f32, f32)>,
 }
 
@@ -108,7 +112,15 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
             focused: None,
             cursor: CursorHint::Default,
             events: OwnVec::new_in(alloc),
+            dirty_paint: OwnVec::new_in(alloc),
+            dirty_layout: false,
             tab_drag_origin: None,
+        }
+    }
+
+    fn mark_paint(&mut self, entity: Entity) {
+        if !self.dirty_paint.iter().any(|&e| e == entity) {
+            let _ = self.dirty_paint.try_push(entity);
         }
     }
 
@@ -130,6 +142,7 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
                 // 1. Active dock splitter drag
                 if dock.dragging_splitter.is_some() {
                     if dock.drag_splitter(world, x, y)? {
+                        self.dirty_layout = true;
                         self.events.try_push(UiEvent::DockChanged).map_err(|r| UiError::Alloc(r.why))?;
                     }
                     return Ok(());
@@ -141,6 +154,7 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
                     drag.pointer_y = y;
                     drag.target = dock.compute_drop_target(x, y);
                     dock.dragging_tab = Some(drag);
+                    self.dirty_layout = true;
                     self.cursor = CursorHint::Grabbing;
                     return Ok(());
                 }
@@ -157,6 +171,7 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
                             target,
                         });
                         self.tab_drag_origin = None;
+                        self.dirty_layout = true;
                         self.cursor = CursorHint::Grabbing;
                         return Ok(());
                     }
@@ -176,6 +191,7 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
                 // 4. Dock splitter hover cursor
                 if let Some(sp) = dock.hit_splitter(x, y) {
                     self.set_hovered(world, None)?;
+                    self.dirty_layout = true;
                     self.cursor = match sp.dir {
                         SplitDir::Horizontal => CursorHint::ColResize,
                         SplitDir::Vertical => CursorHint::RowResize,
@@ -186,6 +202,7 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
                 // 5. Dock header tab hover
                 if hit_dock_tab(world, dock, x, y)?.is_some() {
                     self.set_hovered(world, None)?;
+                    self.dirty_layout = true;
                     self.cursor = CursorHint::Pointer;
                     return Ok(());
                 }
@@ -218,6 +235,7 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
 
                 // 2. Check dock header tabs & expand button
                 if let Some(hit_tab) = hit_dock_tab(world, dock, x, y)? {
+                    self.dirty_layout = true;
                     match hit_tab {
                         DockHeaderHit::Tab { leaf, tab, idx, pane_id } => {
                             dock.select_tab(world, leaf, idx)?;
@@ -274,12 +292,14 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
                 }
 
                 if dock.dragging_splitter.take().is_some() {
+                    self.dirty_layout = true;
                     self.cursor = CursorHint::Default;
                     return Ok(());
                 }
 
                 self.tab_drag_origin = None;
                 if let Some(drag) = dock.dragging_tab.take() {
+                    self.dirty_layout = true;
                     if let Some((target_leaf, zone, _)) = drag.target {
                         if dock.drop_tab(world, drag.tab, drag.source_leaf, target_leaf, zone)? {
                             self.events.try_push(UiEvent::DockChanged).map_err(|r| UiError::Alloc(r.why))?;
@@ -345,9 +365,14 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
                         if let Some(cr) = world.get::<ComputedRect>(ent)?.copied() {
                             let max_y = (scroll.content_h - cr.content_rect.h).max(0.0);
                             let max_x = (scroll.content_w - cr.content_rect.w).max(0.0);
-                            scroll.y = (scroll.y + dy).clamp(0.0, max_y);
-                            scroll.x = (scroll.x + dx).clamp(0.0, max_x);
-                            world.set_copy(ent, scroll)?;
+                            let ny = (scroll.y + dy).clamp(0.0, max_y);
+                            let nx = (scroll.x + dx).clamp(0.0, max_x);
+                            if (ny - scroll.y).abs() > 0.01 || (nx - scroll.x).abs() > 0.01 {
+                                scroll.y = ny;
+                                scroll.x = nx;
+                                world.set_copy(ent, scroll)?;
+                                self.dirty_layout = true;
+                            }
                             return Ok(());
                         }
                     }
@@ -387,6 +412,7 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
                                     }
                                 }
                                 if changed {
+                                    self.mark_paint(f);
                                     let action = world.get::<ActionTag>(f)?.map_or(0, |a| a.0);
                                     self.events
                                         .try_push(UiEvent::TextChanged { entity: f, action })
@@ -432,6 +458,7 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
                 st.cursor = st.text.len();
             }
         }
+        self.mark_paint(entity);
         let action = world.get::<ActionTag>(entity)?.map_or(0, |a| a.0);
         self.events
             .try_push(UiEvent::TextChanged { entity, action })
@@ -445,6 +472,7 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
         if kind == WidgetKind::Toggle {
             let next = !world.get::<ToggleState>(entity)?.map_or(false, |t| t.checked);
             world.set_copy(entity, ToggleState { checked: next })?;
+            self.mark_paint(entity);
             self.events
                 .try_push(UiEvent::ToggleChanged { entity, action, checked: next })
                 .map_err(|r| UiError::Alloc(r.why))?;
@@ -474,6 +502,7 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
         let t = ((pointer_x - track_x0) / track_w).clamp(0.0, 1.0);
         if slider.set_normalized(t) {
             world.set_copy(entity, slider)?;
+            self.mark_paint(entity);
             let action = world.get::<ActionTag>(entity)?.map_or(0, |a| a.0);
             self.events
                 .try_push(UiEvent::SliderChanged { entity, action, value: slider.value })
@@ -489,11 +518,13 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
         if let Some(prev) = self.hovered {
             if world.is_alive(prev) {
                 let _ = world.remove_tag_typed::<Hovered>(prev)?;
+                self.mark_paint(prev);
             }
         }
         if let Some(n) = next {
             if world.is_alive(n) {
                 world.add_tag_typed::<Hovered>(n)?;
+                self.mark_paint(n);
             }
         }
         self.hovered = next;
@@ -507,11 +538,13 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
         if let Some(prev) = self.active {
             if world.is_alive(prev) {
                 let _ = world.remove_tag_typed::<Active>(prev)?;
+                self.mark_paint(prev);
             }
         }
         if let Some(n) = next {
             if world.is_alive(n) {
                 world.add_tag_typed::<Active>(n)?;
+                self.mark_paint(n);
             }
         }
         self.active = next;
@@ -525,11 +558,13 @@ impl<A: Allocator + Copy + 'static> InputState<A> {
         if let Some(prev) = self.focused {
             if world.is_alive(prev) {
                 let _ = world.remove_tag_typed::<Focused>(prev)?;
+                self.mark_paint(prev);
             }
         }
         if let Some(n) = next {
             if world.is_alive(n) {
                 world.add_tag_typed::<Focused>(n)?;
+                self.mark_paint(n);
             }
         }
         self.focused = next;

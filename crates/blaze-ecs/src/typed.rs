@@ -73,22 +73,33 @@ pub trait Relation: 'static {
     const TRANSITIVE: bool = false;
     /// Despawning `target` cascades despawn to all entities holding `(R, target)`.
     const ON_DELETE_CASCADE: bool = false;
+    /// Flecs 4.2: store pairs sparsely without fragmenting archetype tables.
+    const DONT_FRAGMENT: bool = false;
+    /// Flecs 4.2: marks this relation valid for `traverse_up` queries (implies `ACYCLIC`).
+    const TRAVERSABLE: bool = false;
+    /// Flecs 4.2: rejects hierarchy cycles on `relate`.
+    const ACYCLIC: bool = false;
 }
 
 /// Built-in typed marker for the Flecs `ChildOf` hierarchy relation (`Exclusive` +
-/// `OnDeleteCascade`). Maps directly to `world.child_of()`.
+/// `Traversable` + `Acyclic` + `OnDeleteCascade`). Maps directly to `world.child_of()`.
 pub struct ChildOf;
 
 impl Relation for ChildOf {
     const EXCLUSIVE: bool = true;
     const ON_DELETE_CASCADE: bool = true;
+    const TRAVERSABLE: bool = true;
+    const ACYCLIC: bool = true;
 }
 
-/// Built-in typed marker for the Flecs `IsA` prefab inheritance relation. Maps directly to
-/// `world.is_a()`.
+/// Built-in typed marker for the Flecs `IsA` prefab inheritance relation (`Traversable` +
+/// `Acyclic`). Maps directly to `world.is_a()`.
 pub struct IsA;
 
-impl Relation for IsA {}
+impl Relation for IsA {
+    const TRAVERSABLE: bool = true;
+    const ACYCLIC: bool = true;
+}
 
 // -----------------------------------------------------------------------------
 // Typed Component Bundles (0..=8 tuples, no allocator generic on trait)

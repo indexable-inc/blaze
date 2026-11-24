@@ -22,22 +22,25 @@ use crate::types::Rect;
 // Typed ECS Relations
 // =============================================================================
 
-/// Links a dock tab / pane entity to its owning `DockLeaf` container.
+/// Links a dock tab / pane entity to its owning `DockLeaf` container (Flecs 4.2 `DontFragment`).
 pub struct DockedIn;
 impl Relation for DockedIn {
     const EXCLUSIVE: bool = true;
+    const DONT_FRAGMENT: bool = true;
 }
 
-/// Links a floating tooltip overlay entity to the widget entity it describes.
+/// Links a floating tooltip overlay entity to the widget entity it describes (`DontFragment`).
 pub struct TooltipFor;
 impl Relation for TooltipFor {
     const EXCLUSIVE: bool = true;
+    const DONT_FRAGMENT: bool = true;
 }
 
-/// Links an inspector entity to the entity it currently inspects (supports UI self-inspection!).
+/// Links an inspector entity to the entity it currently inspects (`DontFragment` — zero table move!).
 pub struct Inspects;
 impl Relation for Inspects {
     const EXCLUSIVE: bool = true;
+    const DONT_FRAGMENT: bool = true;
 }
 
 // =============================================================================
@@ -134,6 +137,32 @@ pub struct ComputedRect {
     pub layer: u8,
     /// Monotonic paint sequence written during layout for reverse hit-testing.
     pub paint_order: u32,
+}
+
+/// Retained per-entity GPU instance buffer range enabling $O(\Delta)$ in-place WebGPU patching.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuSlot {
+    pub epoch: u64,
+    pub layer: u8,
+    pub rect_start: u32,
+    pub rect_len: u32,
+    pub rect_cap: u32,
+    pub glyph_start: u32,
+    pub glyph_len: u32,
+    pub glyph_cap: u32,
+}
+
+/// Per-frame incremental execution telemetry proving true $O(\Delta)$ scaling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameStats {
+    pub full_layout: bool,
+    pub full_extract: bool,
+    pub layout_nodes_visited: u32,
+    pub paint_nodes_visited: u32,
+    pub rect_patches: u32,
+    pub glyph_patches: u32,
+    pub gpu_bytes_patched: u32,
+    pub reactive_evals: u32,
 }
 
 /// Scroll offset and measured content extent for scrollable containers.
@@ -268,6 +297,7 @@ pub fn register_ui_schema<A: Allocator + Copy + 'static>(
     let _ = world.register_copy::<ChildOrder>()?;
     let _ = world.register_copy::<WidgetKind>()?;
     let _ = world.register_copy::<ComputedRect>()?;
+    let _ = world.register_copy::<GpuSlot>()?;
     let _ = world.register_copy::<ScrollOffset>()?;
     let _ = world.register_copy::<ActionTag>()?;
     let _ = world.register_copy::<BadgeTone>()?;
@@ -284,12 +314,13 @@ pub fn register_ui_schema<A: Allocator + Copy + 'static>(
     let _ = world.relation_entity::<TooltipFor>()?;
     let _ = world.relation_entity::<Inspects>()?;
 
-    let _ = world.tag_entity::<Hovered>()?;
-    let _ = world.tag_entity::<Active>()?;
-    let _ = world.tag_entity::<Focused>()?;
-    let _ = world.tag_entity::<Selected>()?;
-    let _ = world.tag_entity::<Disabled>()?;
-    let _ = world.tag_entity::<Hidden>()?;
+    // Flecs 4.2 `DontFragment`: transient UI state tags NEVER trigger archetype table migrations!
+    let _ = world.mark_tag_dont_fragment::<Hovered>()?;
+    let _ = world.mark_tag_dont_fragment::<Active>()?;
+    let _ = world.mark_tag_dont_fragment::<Focused>()?;
+    let _ = world.mark_tag_dont_fragment::<Selected>()?;
+    let _ = world.mark_tag_dont_fragment::<Disabled>()?;
+    let _ = world.mark_tag_dont_fragment::<Hidden>()?;
     let _ = world.tag_entity::<Interactive>()?;
     let _ = world.tag_entity::<Focusable>()?;
     Ok(())

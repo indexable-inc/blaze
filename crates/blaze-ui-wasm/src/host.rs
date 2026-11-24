@@ -203,7 +203,9 @@ async function boot() {
     if (canvas.width !== pxW || canvas.height !== pxH) { canvas.width = pxW; canvas.height = pxH; }
     const time = (now - t0) * 0.001;
 
+    const tRender0 = performance.now();
     w.ui_render_frame(h, cssW, cssH, dpr, time);
+    const renderMs = performance.now() - tRender0;
 
     const cc = Math.min(w.ui_clips_len(h), MAX_CLIPS);
     const rc = Math.min(w.ui_rects_len(h), MAX_RECTS - 512);
@@ -212,28 +214,59 @@ async function boot() {
     const ovGc = Math.min(w.ui_ov_glyphs_len(h), MAX_GLYPHS - gc);
 
     vpData[0] = cssW; vpData[1] = cssH; vpData[2] = dpr; vpData[3] = time;
-    device.queue.writeBuffer(vpBuf, 0, vpData);
-    if (cc > 0) device.queue.writeBuffer(clipBuf, 0, new Uint8Array(w.memory.buffer, w.ui_clips_ptr(h), cc * CLIP_STRIDE));
-    if (rc > 0) device.queue.writeBuffer(rectBuf, 0, new Uint8Array(w.memory.buffer, w.ui_rects_ptr(h), rc * RECT_STRIDE));
-    if (ovRc > 0) device.queue.writeBuffer(rectBuf, rc * RECT_STRIDE, new Uint8Array(w.memory.buffer, w.ui_ov_rects_ptr(h), ovRc * RECT_STRIDE));
-    if (gc > 0) device.queue.writeBuffer(glyphBuf, 0, new Uint8Array(w.memory.buffer, w.ui_glyphs_ptr(h), gc * GLYPH_STRIDE));
-    if (ovGc > 0) device.queue.writeBuffer(glyphBuf, gc * GLYPH_STRIDE, new Uint8Array(w.memory.buffer, w.ui_ov_glyphs_ptr(h), ovGc * GLYPH_STRIDE));
+    const isFull = w.ui_is_full_upload(h) !== 0;
+    const rpCount = w.ui_rect_patches_len(h);
+    const gpCount = w.ui_glyph_patches_len(h);
+    const needsDraw = isFull || rpCount > 0 || gpCount > 0 || window.__BLAZE_STATS__.frames < 2;
 
-    const enc = device.createCommandEncoder();
-    const pass = enc.beginRenderPass({
-      colorAttachments: [{
-        view: gpuCtx.getCurrentTexture().createView(),
-        clearValue: { r: 0.063, g: 0.063, b: 0.067, a: 1.0 },
-        loadOp: 'clear',
-        storeOp: 'store',
-      }],
-    });
-    if (rc > 0) { pass.setPipeline(sdfPipe); pass.setBindGroup(0, sdfBG); pass.draw(6, rc, 0, 0); }
-    if (gc > 0) { pass.setPipeline(glyphPipe); pass.setBindGroup(0, glyphBG); pass.draw(6, gc, 0, 0); }
-    if (ovRc > 0) { pass.setPipeline(sdfPipe); pass.setBindGroup(0, sdfBG); pass.draw(6, ovRc, 0, rc); }
-    if (ovGc > 0) { pass.setPipeline(glyphPipe); pass.setBindGroup(0, glyphBG); pass.draw(6, ovGc, 0, gc); }
-    pass.end();
-    device.queue.submit([enc.finish()]);
+    if (isFull) {
+      device.queue.writeBuffer(vpBuf, 0, vpData);
+      if (cc > 0) device.queue.writeBuffer(clipBuf, 0, new Uint8Array(w.memory.buffer, w.ui_clips_ptr(h), cc * CLIP_STRIDE));
+      if (rc > 0) device.queue.writeBuffer(rectBuf, 0, new Uint8Array(w.memory.buffer, w.ui_rects_ptr(h), rc * RECT_STRIDE));
+      if (ovRc > 0) device.queue.writeBuffer(rectBuf, rc * RECT_STRIDE, new Uint8Array(w.memory.buffer, w.ui_ov_rects_ptr(h), ovRc * RECT_STRIDE));
+      if (gc > 0) device.queue.writeBuffer(glyphBuf, 0, new Uint8Array(w.memory.buffer, w.ui_glyphs_ptr(h), gc * GLYPH_STRIDE));
+      if (ovGc > 0) device.queue.writeBuffer(glyphBuf, gc * GLYPH_STRIDE, new Uint8Array(w.memory.buffer, w.ui_ov_glyphs_ptr(h), ovGc * GLYPH_STRIDE));
+    } else if (rpCount > 0 || gpCount > 0) {
+      // O(Δ) partial WebGPU buffer patching: upload ONLY the dirty entity slab slices!
+      const rBase = w.ui_rects_ptr(h);
+      if (rpCount > 0) {
+        const patches = new Uint32Array(w.memory.buffer, w.ui_rect_patches_ptr(h), rpCount * 2);
+        for (let i = 0; i < rpCount; i++) {
+          const start = patches[i * 2], count = patches[i * 2 + 1];
+          if (start + count <= rc) {
+            device.queue.writeBuffer(rectBuf, start * RECT_STRIDE, new Uint8Array(w.memory.buffer, rBase + start * RECT_STRIDE, count * RECT_STRIDE));
+          }
+        }
+      }
+      const gBase = w.ui_glyphs_ptr(h);
+      if (gpCount > 0) {
+        const patches = new Uint32Array(w.memory.buffer, w.ui_glyph_patches_ptr(h), gpCount * 2);
+        for (let i = 0; i < gpCount; i++) {
+          const start = patches[i * 2], count = patches[i * 2 + 1];
+          if (start + count <= gc) {
+            device.queue.writeBuffer(glyphBuf, start * GLYPH_STRIDE, new Uint8Array(w.memory.buffer, gBase + start * GLYPH_STRIDE, count * GLYPH_STRIDE));
+          }
+        }
+      }
+    }
+
+    if (needsDraw) {
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{
+          view: gpuCtx.getCurrentTexture().createView(),
+          clearValue: { r: 0.063, g: 0.063, b: 0.067, a: 1.0 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      if (rc > 0) { pass.setPipeline(sdfPipe); pass.setBindGroup(0, sdfBG); pass.draw(6, rc, 0, 0); }
+      if (gc > 0) { pass.setPipeline(glyphPipe); pass.setBindGroup(0, glyphBG); pass.draw(6, gc, 0, 0); }
+      if (ovRc > 0) { pass.setPipeline(sdfPipe); pass.setBindGroup(0, sdfBG); pass.draw(6, ovRc, 0, rc); }
+      if (ovGc > 0) { pass.setPipeline(glyphPipe); pass.setBindGroup(0, glyphBG); pass.draw(6, ovGc, 0, gc); }
+      pass.end();
+      device.queue.submit([enc.finish()]);
+    }
 
     const cur = readUtf8(w, w.ui_cursor_ptr(h), w.ui_cursor_len(h));
     if (canvas.style.cursor !== cur) canvas.style.cursor = cur;
@@ -242,6 +275,13 @@ async function boot() {
     window.__BLAZE_STATS__.clips = cc;
     window.__BLAZE_STATS__.rects = rc + ovRc;
     window.__BLAZE_STATS__.glyphs = gc + ovGc;
+    window.__BLAZE_STATS__.lastLayout = w.ui_last_layout_nodes(h);
+    window.__BLAZE_STATS__.lastPaint = w.ui_last_paint_nodes(h);
+    window.__BLAZE_STATS__.lastPatchedBytes = w.ui_last_patched_bytes(h);
+    window.__BLAZE_STATS__.lastRenderMs = renderMs;
+    if (isFull) window.__BLAZE_STATS__.fullFrames = (window.__BLAZE_STATS__.fullFrames || 0) + 1;
+    else if (rpCount > 0 || gpCount > 0) window.__BLAZE_STATS__.partialFrames = (window.__BLAZE_STATS__.partialFrames || 0) + 1;
+    else window.__BLAZE_STATS__.idleFrames = (window.__BLAZE_STATS__.idleFrames || 0) + 1;
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
