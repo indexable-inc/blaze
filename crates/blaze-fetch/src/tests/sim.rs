@@ -795,9 +795,9 @@ fn a_record_opens_finds_and_refuses_a_flipped_byte() {
         let krate = draw_crate(tape, 0, &unpack);
         let Some(record) = &krate.truth else { return Ok(()) };
         let view = PackView::open(record).map_err(|e| Broke::Oracle(format!("{e:?}")))?;
-        for file in view.files() {
-            if view.find(file.path) != Some(file) {
-                return Err(Broke::Oracle(format!("{} not found by its path", file.path)));
+        for entry in view.entries() {
+            if view.find_entry(entry.path) != Some(entry) {
+                return Err(Broke::Oracle(format!("{} not found by its path", entry.path)));
             }
         }
         if view.source() != &krate.sha256 {
@@ -806,8 +806,10 @@ fn a_record_opens_finds_and_refuses_a_flipped_byte() {
         // The reader by the lock's id: these sources open, any other id's are refused.
         let id = crate::SourceId::Crate { name: &krate.name, version: &krate.version, sha256: krate.sha256 };
         let by_id = PackView::open_source(&id, record).map_err(|e| Broke::Oracle(format!("{e:?}")))?;
-        for file in by_id.files() {
-            if file.blake3 != crate::Blake3::of(file.bytes) {
+        let alloc = blaze_own::testing::heap().alloc();
+        for at in 0..by_id.len() {
+            let file = by_id.read_at(at, alloc).map_err(|e| Broke::Oracle(format!("{e:?}")))?;
+            if file.blake3 != crate::Blake3::of(file.bytes.as_slice()) {
                 return Err(Broke::Oracle(format!("{}: the row's BLAKE3 is not its bytes'", file.path)));
             }
         }

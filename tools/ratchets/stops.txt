@@ -49,7 +49,7 @@ blaze-emit	443
 blaze-engine	259
 blaze-expand	469
 blaze-export	239
-blaze-fetch	175
+blaze-fetch	170
 blaze-file-items	277
 blaze-flow	282
 blaze-flow-lower	269

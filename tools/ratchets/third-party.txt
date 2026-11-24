@@ -160,6 +160,7 @@ blaze-wasi	1	0	124
 blaze-watch	0	0	1
 blaze-world	0	0	228
 blaze-world-api	0	0	8
+blaze-zstd	0	0	1
 edit-applier	0	0	37
 intern	0	0	8
 ix-prof	9	0	110

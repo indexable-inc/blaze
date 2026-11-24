@@ -968,6 +968,7 @@ dependencies = [
  "blaze-tar",
  "blaze-text",
  "blaze-unicode",
+ "blaze-zstd",
 ]
 
 [[package]]

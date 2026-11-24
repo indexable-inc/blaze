@@ -391,7 +391,13 @@ fn main() {
                         }
                         LockSource::Path | LockSource::Registry { .. } => None,
                     };
-                    (mem_tree(view.files().map(|f| (f.path, f.bytes)), dir.as_str(), git), ScriptRoot::package())
+                    let mut decoded = blaze_own::Vec::with_capacity_in(view.len(), alloc);
+                    for e in view.entries() {
+                        if let Ok(b) = e.read_in(alloc) {
+                            decoded.push((e.path, b));
+                        }
+                    }
+                    (mem_tree(decoded.iter().map(|(p, b)| (*p, b.as_slice())), dir.as_str(), git), ScriptRoot::package())
                 }
             })
             .clone();

@@ -53,7 +53,7 @@ pub use crate::{
     digest::{Algo, Blake3, Digest, DigestRefused, Hashed, Hashing},
     drive::{FetchIo, Reserved, Woke},
     fetch::{Effect, Failed, Limits, Machine, Method, NetFailure, Outcome, Reply, StoreFailure, Why},
-    pack::{File, Mode, PackRefused, PackView},
+    pack::{Codec, File, FileBytes, FileEntry, Mode, PackRefused, PackView},
     plan::{Plan, PlanRefused, Skip, SourceId, Unit},
     unpack::UnpackError,
 };

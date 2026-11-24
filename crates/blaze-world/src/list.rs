@@ -668,7 +668,7 @@ fn world_inner<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     refused.sort_unstable_by_key(|r| r.krate);
     let role = |i: Option<usize>| i.map(|i| CrateId(i as u32));
     let sysroot = Sysroot { core: role(toolchain.core()), alloc: role(toolchain.alloc()), std: role(toolchain.std()), bstd: role(toolchain.bstd()) };
-    Ok(World { crates, texts: Texts { checkout, packs, origins, corrected, envs }, sysroot, toolchain_crates: t, crate_of_unit, corrections: used, refused })
+    Ok(World { crates, texts: Texts { checkout, packs, origins, corrected, envs, bump }, sysroot, toolchain_crates: t, crate_of_unit, corrections: used, refused })
 }
 
 /// Lightweight world for build-script execution: holds only the toolchain crates (target and
@@ -833,7 +833,7 @@ pub fn script_world<'w, B: AsRef<[u8]>>(
     let sysroot = Sysroot { core: role(toolchain.core()), alloc: role(toolchain.alloc()), std: role(toolchain.std()), bstd: role(toolchain.bstd()) };
     let world = World {
         crates,
-        texts: Texts { checkout, packs, origins, corrected: AVec::new_in(alloc), envs },
+        texts: Texts { checkout, packs, origins, corrected: AVec::new_in(alloc), envs, bump },
         sysroot,
         toolchain_crates: t,
         crate_of_unit: AVec::new_in(alloc),

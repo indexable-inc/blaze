@@ -83,12 +83,6 @@ pub trait Tree {
     fn file(&self, path: &str) -> Option<&[u8]>;
 }
 
-impl Tree for PackView<'_> {
-    fn file(&self, path: &str) -> Option<&[u8]> {
-        self.find(path).map(|f| f.bytes)
-    }
-}
-
 /// Whether a checkout path package is a workspace member or an external path package (from
 /// `[patch.*]` or a path dependency outside `workspace.members`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -349,6 +343,8 @@ pub struct Texts<'w> {
     /// Each crate's environment, by crate index ([`SourceTexts::crate_env`]): what its `env!`
     /// reads, `CARGO_MANIFEST_DIR` the root it sees (D96).
     envs: AVec<'w, CrateEnv<'w>>,
+    /// World arena for decompressing compressed `BLZFPK04` pack files on read.
+    bump: Bump<'w>,
 }
 
 impl<'w> Texts<'w> {
@@ -380,7 +376,7 @@ impl<'w> SourceTexts<'w> for Texts<'w> {
         }
         let bytes = match tree {
             0 => self.checkout.file(inner)?,
-            n => self.packs.get(n - 1)?.find(inner)?.bytes,
+            n => self.packs.get(n - 1)?.read_slice(inner, self.bump).ok()??,
         };
         core::str::from_utf8(bytes).ok()
     }
@@ -510,7 +506,7 @@ fn correct_pack<'w>(
         path
     };
     let files = row
-        .correct_crate(&unit.version, |file| view.find(&path_of(file)).map(|f| f.bytes), blaze_lex::Cpu::BASELINE, alloc)
+        .correct_crate(&unit.version, |file| view.read_slice(&path_of(file), bump).ok().flatten(), blaze_lex::Cpu::BASELINE, alloc)
         .map_err(|why| {
             let mut words = AString::new_in(alloc);
             let _ = fmt::write(&mut Words(&mut words), format_args!("{why}"));

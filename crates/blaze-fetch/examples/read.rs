@@ -137,11 +137,12 @@ fn main() {
     let mut manifest_bytes = 0u64;
     let mut touched = 0u64;
     for view in views.iter() {
-        for file in view.files() {
-            if file.path == "Cargo.toml" || file.path.ends_with("/Cargo.toml") {
+        for entry in view.entries() {
+            if entry.path == "Cargo.toml" || entry.path.ends_with("/Cargo.toml") {
+                let bytes = entry.read_in(alloc).unwrap_or_else(|e| fail(&shown(&e)));
                 manifests += 1;
-                manifest_bytes += file.bytes.len() as u64;
-                touched = touched.wrapping_add(file.bytes.iter().map(|b| u64::from(*b)).sum::<u64>());
+                manifest_bytes += bytes.len() as u64;
+                touched = touched.wrapping_add(bytes.iter().map(|b| u64::from(*b)).sum::<u64>());
             }
         }
     }
@@ -184,9 +185,10 @@ fn main() {
         let opened = started.elapsed();
         let mut sum = 0u64;
         let mut bytes = 0u64;
-        for file in view.files() {
-            bytes += file.bytes.len() as u64;
-            sum = sum.wrapping_add(file.bytes.iter().map(|b| u64::from(*b)).sum::<u64>());
+        for entry in view.entries() {
+            let file_bytes = entry.read_in(alloc).unwrap_or_else(|e| fail(&shown(&e)));
+            bytes += file_bytes.len() as u64;
+            sum = sum.wrapping_add(file_bytes.iter().map(|b| u64::from(*b)).sum::<u64>());
         }
         let all = started.elapsed();
         println!(

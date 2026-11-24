@@ -93,6 +93,7 @@ impl<'f, P: Packages<'static>> Packages<'f> for Placing<'_, '_, P> {
 pub(crate) fn shown(
     place: Place<'static>,
     checkout: &str,
+    alloc: blaze_own::SharedAlloc<'static>,
 ) -> Result<blaze_proc_macro::sandbox::Files, blaze_expand::seen::MemberDirError<'static>> {
     use blaze_world::procs::files::{PackageAt, sandbox_files};
     match place {
@@ -108,7 +109,7 @@ pub(crate) fn shown(
             let folder = if dir.is_empty() { base.to_path_buf() } else { base.join(dir) };
             Ok(blaze_proc_macro::sandbox::Files::Folder(folder))
         }
-        Place::Pack { view, dir } => Ok(sandbox_files(PackageAt::Pack { view, dir })),
+        Place::Pack { view, dir } => Ok(sandbox_files(PackageAt::Pack { view, dir, alloc })),
     }
 }
 
@@ -199,8 +200,8 @@ mod tests {
         assert!(matches!(placed.of(LockId(0)), Some(Place::Checkout { dir: "app" })), "the member's place was not kept");
         assert!(placed.of(LockId(2)).is_none(), "a package the world never placed has a place");
         let Some(Place::Pack { view, dir }) = placed.of(LockId(1)) else { panic!("the fetched package's place was not kept") };
-        let Files::Listed(files) = sandbox_files(PackageAt::Pack { view, dir }) else { panic!("a fetched package is not served from its record") };
-        let shown: std::vec::Vec<(&str, &[u8])> = files.iter().map(|(path, bytes)| (path.as_str(), *bytes)).collect();
+        let Files::Listed(files) = sandbox_files(PackageAt::Pack { view, dir, alloc: blaze_own::testing::heap().shared() }) else { panic!("a fetched package is not served from its record") };
+        let shown: std::vec::Vec<(&str, &[u8])> = files.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice())).collect();
         assert_eq!(shown, [("Cargo.toml", MANIFEST.as_bytes()), ("abi/Token.json", ABI.as_bytes()), ("src/lib.rs", LIB.as_bytes())], "the macro is shown its own package's files");
         // The control: the old rule had no package for this crate (tree 1, the first fetched
         // package's tree), so its calls were refused before the macro ran.
@@ -223,16 +224,17 @@ mod tests {
     fn a_member_s_macro_sees_its_workspace_mount() {
         use std::string::ToString;
 
-        let member = super::shown(Place::Checkout { dir: "crates/app" }, "/ws").expect("a plain member dir");
+        let alloc = blaze_own::testing::heap().shared();
+        let member = super::shown(Place::Checkout { dir: "crates/app" }, "/ws", alloc).expect("a plain member dir");
         let seen = member.seen();
         assert_eq!(seen.mount(), "/workspace", "a member is mounted at the workspace's mount");
         assert_eq!(seen.folder(), "crates/app", "the member's folder in the mount");
         assert_eq!(seen.to_string(), "/workspace/crates/app", "CARGO_MANIFEST_DIR is the mounted folder");
         let Files::Member { workspace, .. } = &member else { panic!("a member is not served as its workspace: {member:?}") };
         assert_eq!(workspace.as_path(), std::path::Path::new("/ws"), "the workspace served is the checkout");
-        let root = super::shown(Place::Checkout { dir: "" }, "/ws").expect("the root package");
+        let root = super::shown(Place::Checkout { dir: "" }, "/ws", alloc).expect("the root package");
         assert_eq!(root.seen().to_string(), "/workspace", "the root package is the workspace's folder");
-        assert!(super::shown(Place::Checkout { dir: "../out" }, "/ws").is_err(), "a dir above the workspace was mounted");
+        assert!(super::shown(Place::Checkout { dir: "../out" }, "/ws", alloc).is_err(), "a dir above the workspace was mounted");
         // The control: the old arm.
         let old = sandbox_files(PackageAt::Disk(std::path::Path::new("/ws/crates/app")));
         assert_ne!(old.seen().to_string(), seen.to_string(), "the planted old arm mounted the member where D96 does");
@@ -259,7 +261,7 @@ mod tests {
         use blaze_proc_macro::sandbox::{Package, Sandbox};
         use blaze_wasi::{Filetype, ROOT_FD, System};
 
-        let files = super::shown(Place::Checkout { dir: "src" }, "").expect("a plain member dir");
+        let files = super::shown(Place::Checkout { dir: "src" }, "", blaze_own::testing::heap().shared()).expect("a plain member dir");
         let package = Package::new(files, PackageEnv::default()).unwrap_or_else(|e| panic!("{e}"));
         let mut sandbox = Sandbox::new(Arc::new(package));
         let cwd = sandbox.package().cwd();
@@ -271,7 +273,7 @@ mod tests {
         let Err(stop) = above else { panic!("a path above the workspace was answered") };
         assert!(stop.0.contains("named /workspace/../x, outside /workspace"), "{}", stop.0);
         // A fetched package's macro: its record at `/package`, nothing above it.
-        let fetched: Arc<[(std::string::String, &'static [u8])]> = Arc::from(std::vec![(std::string::String::from("Cargo.toml"), &b"[package]"[..])]);
+        let fetched = Arc::from([(std::string::String::from("Cargo.toml"), blaze_proc_macro::sandbox::ListedBytes::Static(&b"[package]"[..]))]);
         let dependency = Package::new(Files::Listed(fetched), PackageEnv::default()).unwrap_or_else(|e| panic!("{e}"));
         let mut dep = Sandbox::new(Arc::new(dependency));
         assert!(matches!(dep.path_stat(ROOT_FD, b"/package/Cargo.toml", true), Ok(Ok(_))));

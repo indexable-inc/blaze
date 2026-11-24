@@ -781,33 +781,39 @@ fn git_origin(args: &Args, wanted: &Wanted, source: &str, alloc: blaze_own::Allo
         .map_err(|why| Failure::Manifest { path: record.clone(), why: format!("the record of commit {commit}: {}", blaze_text::Shown(&why)) })?;
     let root = args.work.join("git").join(commit);
     let mut found: Option<String> = None;
-    for file in view.files() {
-        let out = root.join(file.path);
-        if !out.exists() {
-            write(&out, file.bytes)?;
+    for entry in view.entries() {
+        let out = root.join(entry.path);
+        let is_manifest = entry.path == "Cargo.toml" || entry.path.ends_with("/Cargo.toml");
+        if out.exists() && !is_manifest {
+            continue;
         }
-        let is_manifest = file.path == "Cargo.toml" || file.path.ends_with("/Cargo.toml");
+        let bytes = entry
+            .read_in(alloc)
+            .map_err(|why| Failure::Manifest { path: record.clone(), why: format!("the record of commit {commit}: {}: {}", entry.path, blaze_text::Shown(&why)) })?;
+        if !out.exists() {
+            write(&out, bytes.as_slice())?;
+        }
         if !is_manifest {
             continue;
         }
         // Every manifest of the commit is a candidate, as cargo walks a git source; its name is
         // read as TOML (a comment may open it). One that is no TOML is no package, as cargo
         // skips a malformed package there; it is named, not passed over in silence.
-        let name = match std::str::from_utf8(file.bytes) {
+        let name = match std::str::from_utf8(bytes.as_slice()) {
             Ok(text) => match manifest_package_name(text, alloc) {
                 Ok(name) => name,
                 Err(why) => {
-                    println!("{SCRIPT}: {} {}: commit {commit}: {} is no TOML ({}), so no package", wanted.name, wanted.version, file.path, why.display(text));
+                    println!("{SCRIPT}: {} {}: commit {commit}: {} is no TOML ({}), so no package", wanted.name, wanted.version, entry.path, why.display(text));
                     None
                 }
             },
             Err(_) => {
-                println!("{SCRIPT}: {} {}: commit {commit}: {} is not UTF-8, so no package", wanted.name, wanted.version, file.path);
+                println!("{SCRIPT}: {} {}: commit {commit}: {} is not UTF-8, so no package", wanted.name, wanted.version, entry.path);
                 None
             }
         };
         if name.as_deref() == Some(wanted.name.as_str()) {
-            let folder = file.path.strip_suffix("Cargo.toml").unwrap_or("").trim_end_matches('/');
+            let folder = entry.path.strip_suffix("Cargo.toml").unwrap_or("").trim_end_matches('/');
             // The shortest such folder: a package copied into a test fixture deeper down is not it.
             if found.as_ref().is_none_or(|held| folder.len() < held.len()) {
                 found = Some(folder.to_owned());

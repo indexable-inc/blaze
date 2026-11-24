@@ -41,7 +41,7 @@ crates/blaze-emit	0	crates/blaze-blake3,crates/blaze-code,crates/blaze-lir,crate
 crates/blaze-engine	0	crates/blaze-answer,crates/blaze-drive,crates/blaze-hash,crates/blaze-id,crates/blaze-own
 crates/blaze-expand	0	crates/blaze-format,crates/blaze-id,crates/blaze-ids,crates/blaze-mem,crates/blaze-own,crates/blaze-surface,crates/blaze-tokens,crates/parser,crates/rustc_lexer
 crates/blaze-export	0	crates/blaze-code,crates/blaze-ids,crates/blaze-native,crates/blaze-own,crates/blaze-sha256,crates/blaze-tier
-crates/blaze-fetch	0	crates/blaze-data,crates/blaze-deflate,crates/blaze-ed25519,crates/blaze-format,crates/blaze-git-fetch,crates/blaze-ids,crates/blaze-json,crates/blaze-lex,crates/blaze-manifest,crates/blaze-own,crates/blaze-semver,crates/blaze-sha256,crates/blaze-tar,crates/blaze-text,crates/blaze-unicode
+crates/blaze-fetch	0	crates/blaze-data,crates/blaze-deflate,crates/blaze-ed25519,crates/blaze-format,crates/blaze-git-fetch,crates/blaze-ids,crates/blaze-json,crates/blaze-lex,crates/blaze-manifest,crates/blaze-own,crates/blaze-semver,crates/blaze-sha256,crates/blaze-tar,crates/blaze-text,crates/blaze-unicode,crates/blaze-zstd
 crates/blaze-file-items	0	crates/blaze-blake3,crates/blaze-hash,crates/blaze-ids,crates/blaze-lex,crates/blaze-mem,crates/blaze-memchr,crates/blaze-own,crates/blaze-surface,crates/blaze-tokens,crates/parser
 crates/blaze-flow	0	crates/blaze-own
 crates/blaze-flow-lower	0	crates/blaze-borrow,crates/blaze-flow,crates/blaze-own,crates/blaze-typeck
