@@ -275,6 +275,16 @@ impl<A: Allocator + Copy + 'static> BlazeSite<A> {
         self.reactive.get(self.sig_dark).copied().unwrap_or(true)
     }
 
+    /// Project the live `blaze_ecs::World` scene graph into semantic HTML (fallback when WebGPU
+    /// is unavailable or `?renderer=html`). Returns the number of projected ECS entities.
+    pub fn project_html(&self, out: &mut OwnString<A>) -> Result<u32, SiteError> {
+        let Some(handles) = &self.handles else {
+            out.clear();
+            return Ok(0);
+        };
+        crate::html::project_ecs_html(&self.world, handles, &self.model, self.is_dark(), out, self.alloc)
+    }
+
     pub fn theme(&self) -> SiteTheme {
         if self.is_dark() { SiteTheme::dark() } else { SiteTheme::light() }
     }

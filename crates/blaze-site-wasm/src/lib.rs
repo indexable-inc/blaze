@@ -201,6 +201,8 @@ pub struct SiteHandle {
     scratch: OwnVec<u8, WasmAlloc>,
     copy_buf: OwnString<WasmAlloc>,
     nav_buf: OwnString<WasmAlloc>,
+    html_buf: OwnString<WasmAlloc>,
+    projected_entities: u32,
 }
 
 fn with_handle<'a>(h: *mut SiteHandle) -> Option<&'a mut SiteHandle> {
@@ -229,6 +231,8 @@ pub extern "C" fn site_create() -> *mut SiteHandle {
             scratch: OwnVec::new_in(alloc),
             copy_buf: OwnString::new_in(alloc),
             nav_buf: OwnString::new_in(alloc),
+            html_buf: OwnString::new_in(alloc),
+            projected_entities: 0,
         },
         alloc,
     ) else {
@@ -564,6 +568,35 @@ pub extern "C" fn site_nav_ptr(h: *mut SiteHandle) -> *const u8 {
     }
 }
 
+/// Project the live `blaze_ecs::World` scene graph into semantic HTML for non-WebGPU fallback.
+#[unsafe(no_mangle)]
+pub extern "C" fn site_project_html_len(h: *mut SiteHandle) -> usize {
+    let Some(st) = with_handle(h) else { return 0 };
+    match st.site.project_html(&mut st.html_buf) {
+        Ok(n) => {
+            st.projected_entities = n;
+            st.html_buf.len()
+        }
+        Err(_) => {
+            st.projected_entities = 0;
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn site_project_html_ptr(h: *mut SiteHandle) -> *const u8 {
+    match with_handle(h) {
+        Some(st) => st.html_buf.as_ptr(),
+        None => ptr::null(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn site_projected_entities(h: *mut SiteHandle) -> u32 {
+    with_handle(h).map_or(0, |st| st.projected_entities)
+}
+
 #[cfg(test)]
 mod tests {
     use super::host::SITE_HTML;
@@ -580,5 +613,6 @@ mod tests {
         assert!(SITE_HTML.contains("slug_site_fs"));
         assert!(!SITE_HTML.contains("ctrlHeld"));
         assert!(SITE_HTML.contains("e.ctrlKey && !e.metaKey"));
+        assert!(SITE_HTML.contains("site_project_html_len"));
     }
 }

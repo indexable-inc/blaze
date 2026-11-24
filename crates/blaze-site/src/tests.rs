@@ -101,11 +101,23 @@ fn parses_page_model_and_mounts_ecs_with_dont_fragment_tags() {
     assert_eq!(handles.link_entities.len(), 2);
     assert_eq!(handles.part_entities.len(), 2);
 
-    // Toggling Flecs 4.2 `DontFragment` tag `SiteHovered` MUST cause zero archetype table migrations!
+    // Toggling Flecs 4.2 `DontFragment` tag `SiteHovered` MUST cause zero archetype table migrations,
+    // and `blaze_ecs::ecs_query!` filters both `(ChildOf, root)` and `DontFragment` `tag(SiteHovered)`!
     let tables_before = site.world.table_count();
+    let root = handles.root;
     let e0 = handles.link_entities.first().copied().expect("link 0");
     site.world.add_tag_typed::<SiteHovered>(e0).expect("add hover");
     assert!(site.world.has_tag_typed::<SiteHovered>(e0).expect("has hover"));
+
+    let mut hovered_links = 0usize;
+    blaze_ecs::ecs_query!(&mut site.world, entity, &crate::SiteNodeKind, (blaze_ecs::ChildOf, root), tag(SiteHovered) => |ent, kind| {
+        assert_eq!(ent, e0);
+        assert_eq!(*kind, crate::SiteNodeKind::Link(0));
+        hovered_links += 1;
+    })
+    .expect("ecs_query hovered");
+    assert_eq!(hovered_links, 1);
+
     let _ = site.world.remove_tag_typed::<SiteHovered>(e0).expect("remove hover");
     assert!(!site.world.has_tag_typed::<SiteHovered>(e0).expect("no hover"));
     assert_eq!(site.world.table_count(), tables_before);
@@ -198,4 +210,159 @@ fn layout_find_matches_and_cursor_anchored_pinch_zoom_work() {
     )
     .expect("narrow layout");
     assert!(narrow_layout.height > 100.0);
+}
+
+#[test]
+fn projects_live_ecs_world_into_semantic_html_for_non_webgpu_browsers() {
+    let a = alloc();
+    let mut site = BlazeSite::new_in(a).expect("site");
+    site.load_page_json(SAMPLE_PAGE_JSON).expect("load");
+    let mut html = OwnString::new_in(a);
+    let count = site.project_html(&mut html).expect("project_html");
+    assert!(count >= 8);
+
+    let s = html.as_str();
+    assert!(s.contains("data-ecs-kind=\"page-root\""));
+    assert!(s.contains("data-ecs-kind=\"block:bar\""));
+    assert!(s.contains("data-ecs-kind=\"block:title\""));
+    assert!(s.contains("data-ecs-kind=\"block:command\""));
+    assert!(s.contains("data-ecs-kind=\"block:list\""));
+    assert!(s.contains("data-ecs-kind=\"list-item\""));
+    assert!(s.contains("data-ecs-kind=\"copy-button\""));
+    assert!(s.contains("data-copy=\"curl -fsSL https://blazelang.dev/install.sh | sh\""));
+    assert!(s.contains("data-tip=\"part:1\""));
+    assert!(s.contains("<template data-tip-key=\"ref:ReadOnly\">"));
+    assert!(s.contains("ReadOnly"));
+    assert!(s.contains("<ul class=\"sub-list\">"));
+}
+
+#[test]
+fn flecs_style_ecs_query_macro_supports_fetches_filters_relations_dont_fragment_and_cascade() {
+    use blaze_ecs::{ChildOf, Entity, Relation, World, ecs_query};
+    use blaze_own::Vec as OwnVec;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Pos {
+        x: i32,
+        y: i32,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Vel {
+        dx: i32,
+        dy: i32,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Depth(u32);
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Frozen;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Active;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct HoveredSparse;
+    struct Likes;
+    impl Relation for Likes {}
+
+    let a = alloc();
+    let mut w = World::new_in(a).expect("world");
+    w.mark_tag_dont_fragment::<HoveredSparse>().expect("df");
+
+    let hero = w.spawn().expect("hero");
+    let enemy = w.spawn().expect("enemy");
+    let root = w.spawn().expect("root");
+    let child = w.spawn().expect("child");
+    let grandchild = w.spawn().expect("grandchild");
+    let frozen = w.spawn().expect("frozen");
+    let prefab = w.spawn().expect("prefab");
+
+    // Hierarchy: root (depth 0) -> child (depth 1) -> grandchild (depth 2)
+    w.set_copy(root, Pos { x: 10, y: 0 }).expect("p");
+    w.set_copy(root, Vel { dx: 1, dy: 0 }).expect("v");
+    w.set_copy(root, Depth(0)).expect("d");
+    w.add_tag_typed::<Active>(root).expect("t");
+
+    w.set_copy(child, Pos { x: 20, y: 0 }).expect("p");
+    w.set_copy(child, Vel { dx: 2, dy: 0 }).expect("v");
+    w.set_copy(child, Depth(1)).expect("d");
+    w.add_tag_typed::<Active>(child).expect("t");
+    w.relate::<ChildOf>(child, root).expect("r");
+    w.relate::<Likes>(child, hero).expect("likes");
+    w.add_tag_typed::<HoveredSparse>(child).expect("df hover");
+
+    w.set_copy(grandchild, Pos { x: 30, y: 0 }).expect("p");
+    w.set_copy(grandchild, Vel { dx: 3, dy: 0 }).expect("v");
+    w.set_copy(grandchild, Depth(2)).expect("d");
+    w.add_tag_typed::<Active>(grandchild).expect("t");
+    w.relate::<ChildOf>(grandchild, child).expect("r");
+    w.relate::<Likes>(grandchild, enemy).expect("likes enemy");
+
+    w.set_copy(frozen, Pos { x: 100, y: 0 }).expect("p");
+    w.set_copy(frozen, Vel { dx: 50, dy: 0 }).expect("v");
+    w.add_tag_typed::<Active>(frozen).expect("t");
+    w.add_tag_typed::<Frozen>(frozen).expect("frozen");
+
+    w.set_copy(prefab, Pos { x: 999, y: 0 }).expect("p");
+    w.set_copy(prefab, Vel { dx: 1, dy: 0 }).expect("v");
+    w.add_tag(prefab, w.prefab()).expect("prefab");
+
+    // 1. Inline Flecs `each` query with `&mut`, `&`, `!Frozen`, `tag(Active)` (excludes prefab & frozen)
+    ecs_query!(&mut w, &mut Pos, &Vel, !Frozen, tag(Active) => |p, v| {
+        p.x += v.dx;
+    })
+    .expect("inline each");
+    assert_eq!(w.get::<Pos>(root).unwrap().unwrap().x, 11);
+    assert_eq!(w.get::<Pos>(child).unwrap().unwrap().x, 22);
+    assert_eq!(w.get::<Pos>(grandchild).unwrap().unwrap().x, 33);
+    assert_eq!(w.get::<Pos>(frozen).unwrap().unwrap().x, 100);
+    assert_eq!(w.get::<Pos>(prefab).unwrap().unwrap().x, 999);
+
+    // 2. Flecs `cascade(ChildOf)` visits strictly parent-before-child (`0 -> 1 -> 2`)!
+    let mut visited_depths: OwnVec<u32, _> = OwnVec::new_in(a);
+    ecs_query!(&mut w, &Depth, cascade(ChildOf) => |d| {
+        let _ = visited_depths.try_push(d.0);
+    })
+    .expect("cascade");
+    assert_eq!(visited_depths.as_slice(), &[0, 1, 2]);
+
+    // 3. Flecs 4.2 `DontFragment` sparse tag filtering (`tag(HoveredSparse)` & `!tag(HoveredSparse)`)!
+    let mut hovered_ents: OwnVec<Entity, _> = OwnVec::new_in(a);
+    ecs_query!(&mut w, entity, &Pos, tag(HoveredSparse) => |ent, _p| {
+        let _ = hovered_ents.try_push(ent);
+    })
+    .expect("sparse tag query");
+    assert_eq!(hovered_ents.as_slice(), &[child]);
+
+    let not_hovered = ecs_query!(&mut w, &Pos, tag(Active), !Frozen, !tag(HoveredSparse))
+        .expect("not hovered")
+        .count()
+        .expect("count");
+    assert_eq!(not_hovered, 2); // root and grandchild
+
+    // 4. Exact & wildcard relation pairs: `(Likes, *)`, `!(Likes, enemy)`, `(ChildOf, root)`!
+    let likes_any = ecs_query!(&mut w, &Pos, (Likes, *)).expect("q").count().expect("c");
+    assert_eq!(likes_any, 2);
+    let likes_not_enemy = ecs_query!(&mut w, &Pos, (Likes, *), !(Likes, enemy))
+        .expect("q")
+        .count()
+        .expect("c");
+    assert_eq!(likes_not_enemy, 1);
+
+    // 5. SoA `chunk` mode & `prefabs` inclusion + `.build_cached()`
+    let mut chunk_sum = 0i32;
+    ecs_query!(&mut w, chunk, &Pos, (ChildOf, root) => |ps| {
+        for p in ps {
+            chunk_sum += p.x;
+        }
+    })
+    .expect("chunk");
+    assert_eq!(chunk_sum, 22);
+
+    let with_prefabs = ecs_query!(&mut w, &Pos, prefabs).expect("prefabs").count().expect("c");
+    assert_eq!(with_prefabs, 5);
+
+    let mut cached = ecs_query!(&mut w, &Pos, &Vel, !Frozen)
+        .expect("build")
+        .build_cached()
+        .expect("cached");
+    let matched_tables = w.query_tables(&mut cached).expect("sync");
+    assert!(!matched_tables.is_empty());
 }

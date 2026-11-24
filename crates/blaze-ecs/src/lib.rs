@@ -42,6 +42,8 @@ pub(crate) mod map;
 pub mod observer;
 pub mod pipeline;
 pub mod query;
+#[macro_use]
+pub mod query_macro;
 pub mod reactive;
 pub mod reflect;
 pub mod table;

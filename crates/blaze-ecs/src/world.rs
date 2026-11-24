@@ -18,7 +18,7 @@ use super::fetch::{QueryFetch, TypedQuery};
 use super::id::{Builtins, ComponentId, Entity, Id, TableId, u32_to_usize, usize_to_u32};
 use super::map::{FlatMap, FlatSet};
 use super::observer::{DEFAULT_OBSERVER_CAP, Event, EventKind, Observer, ObserverCallback, ObserverId};
-use super::query::{CachedQuery, QuerySpec};
+use super::query::{CachedQuery, QuerySpec, QueryTerm};
 use super::reflect::{ReflectComponent, ReflectError};
 use super::table::{ArchetypeKey, Table, move_row_between_tables};
 use super::typed::{
@@ -2032,28 +2032,103 @@ impl<A: Allocator + Copy + 'static> World<A> {
     }
 
     /// Iterate all entities matching both `Q` and additional filter specification `extra`.
+    fn is_dont_fragment_tag(&self, tag: Entity) -> bool {
+        self.has_tag(tag, self.builtins.dont_fragment).unwrap_or(false)
+    }
+
+    fn spec_has_sparse_tag_terms(&self, spec: &QuerySpec<A>) -> bool {
+        for &term in spec.terms() {
+            match term {
+                QueryTerm::With(Id::Tag(t)) | QueryTerm::Without(Id::Tag(t)) => {
+                    if self.is_dont_fragment_tag(t) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn table_matches_non_sparse(&self, table: &Table<A>, spec: &QuerySpec<A>) -> bool {
+        if !spec.includes_prefabs() && table.has_id(Id::Tag(self.builtins.prefab)) {
+            return false;
+        }
+        let wildcard = self.builtins.wildcard;
+        for &term in spec.terms() {
+            match term {
+                QueryTerm::With(Id::Tag(t)) if self.is_dont_fragment_tag(t) => {}
+                QueryTerm::Without(Id::Tag(t)) if self.is_dont_fragment_tag(t) => {}
+                QueryTerm::With(pattern) => {
+                    if !table.matches_id_pattern(pattern, wildcard) {
+                        return false;
+                    }
+                }
+                QueryTerm::Without(pattern) => {
+                    if table.matches_id_pattern(pattern, wildcard) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn entity_matches_sparse_tags(&self, entity: Entity, spec: &QuerySpec<A>) -> bool {
+        for &term in spec.terms() {
+            match term {
+                QueryTerm::With(Id::Tag(t)) if self.is_dont_fragment_tag(t) => {
+                    let has = self.sparse_tags.get(&t).is_some_and(|s| s.contains(&entity));
+                    if !has {
+                        return false;
+                    }
+                }
+                QueryTerm::Without(Id::Tag(t)) if self.is_dont_fragment_tag(t) => {
+                    let has = self.sparse_tags.get(&t).is_some_and(|s| s.contains(&entity));
+                    if has {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    fn cascade_table_order(
+        &self,
+        ids: &[ComponentId],
+        extra: &QuerySpec<A>,
+        rel: Entity,
+    ) -> Result<OwnVec<usize, A>, EcsError> {
+        let mut keyed: OwnVec<(usize, usize), A> = OwnVec::new_in(self.alloc);
+        for (ti, table) in self.tables.as_slice().iter().enumerate() {
+            if table.is_empty() || !table_has_all_components(table, ids) {
+                continue;
+            }
+            if !self.table_matches_non_sparse(table, extra) {
+                continue;
+            }
+            let depth = match table.entities().first() {
+                Some(&rep) => self.hierarchy_depth(rep, rel)?,
+                None => 0,
+            };
+            keyed.try_push((depth, ti)).map_err(|r| EcsError::Alloc(r.why))?;
+        }
+        keyed.as_mut_slice().sort_unstable();
+        let mut out = OwnVec::try_with_capacity_in(keyed.len(), self.alloc)?;
+        for &(_, ti) in keyed.as_slice() {
+            out.try_push(ti).map_err(|r| EcsError::Alloc(r.why))?;
+        }
+        Ok(out)
+    }
+
     pub fn each_filtered<Q: QueryFetch>(
         &mut self,
         extra: &QuerySpec<A>,
         mut f: impl for<'a> FnMut(Q::Item<'a>),
     ) -> Result<(), EcsError> {
-        Q::check_conflicts(self)?;
-        let Some(fetch_ids) = Q::lookup_ids(self) else {
-            return Ok(());
-        };
-        let ids = fetch_ids.as_slice();
-        let prefab_tag = self.builtins.prefab;
-        let wildcard = self.builtins.wildcard;
-        for table in self.tables.as_mut_slice() {
-            if table.is_empty() || !table_has_all_components(table, ids) {
-                continue;
-            }
-            if !extra.matches_table(table, prefab_tag, wildcard) {
-                continue;
-            }
-            Q::for_each_in_table(table, ids, &mut f)?;
-        }
-        Ok(())
+        self.each_with_entity_filtered::<Q>(extra, |_, item| f(item))
     }
 
     /// Iterate contiguous SoA chunks for all non-empty tables matching both `Q` and `extra`.
@@ -2067,6 +2142,15 @@ impl<A: Allocator + Copy + 'static> World<A> {
             return Ok(());
         };
         let ids = fetch_ids.as_slice();
+        if let Some(rel) = extra.cascade_relation() {
+            let order = self.cascade_table_order(ids, extra, rel)?;
+            for &ti in order.as_slice() {
+                if let Some(table) = self.tables.get_mut(ti) {
+                    Q::for_each_chunk_in_table(table, ids, &mut f)?;
+                }
+            }
+            return Ok(());
+        }
         let prefab_tag = self.builtins.prefab;
         let wildcard = self.builtins.wildcard;
         for table in self.tables.as_mut_slice() {
@@ -2081,7 +2165,8 @@ impl<A: Allocator + Copy + 'static> World<A> {
         Ok(())
     }
 
-    /// Iterate `(Entity, Q::Item<'_>)` for all entities matching both `Q` and `extra`.
+    /// Iterate `(Entity, Q::Item<'_>)` for all entities matching both `Q` and `extra`
+    /// (supports Flecs 4.2 `DontFragment` sparse tags and `cascade(Rel)` topological ordering).
     pub fn each_with_entity_filtered<Q: QueryFetch>(
         &mut self,
         extra: &QuerySpec<A>,
@@ -2092,38 +2177,120 @@ impl<A: Allocator + Copy + 'static> World<A> {
             return Ok(());
         };
         let ids = fetch_ids.as_slice();
-        let prefab_tag = self.builtins.prefab;
-        let wildcard = self.builtins.wildcard;
-        for table in self.tables.as_mut_slice() {
-            if table.is_empty() || !table_has_all_components(table, ids) {
+        let has_sparse = self.spec_has_sparse_tag_terms(extra);
+
+        if let Some(rel) = extra.cascade_relation() {
+            let order = self.cascade_table_order(ids, extra, rel)?;
+            if !has_sparse {
+                for &ti in order.as_slice() {
+                    if let Some(table) = self.tables.get_mut(ti) {
+                        Q::for_each_with_entity_in_table(table, ids, &mut f)?;
+                    }
+                }
+                return Ok(());
+            }
+            // Collect allowed entities per table before mutably borrowing the table.
+            let mut keep: OwnVec<bool, A> = OwnVec::new_in(self.alloc);
+            for &ti in order.as_slice() {
+                keep.clear();
+                if let Some(table) = self.tables.get(ti) {
+                    for &ent in table.entities() {
+                        let ok = self.entity_matches_sparse_tags(ent, extra);
+                        keep.try_push(ok).map_err(|r| EcsError::Alloc(r.why))?;
+                    }
+                }
+                if let Some(table) = self.tables.get_mut(ti) {
+                    let mut row = 0usize;
+                    Q::for_each_with_entity_in_table(table, ids, &mut |ent, item| {
+                        let pass = keep.get(row).copied().unwrap_or(false);
+                        row += 1;
+                        if pass {
+                            f(ent, item);
+                        }
+                    })?;
+                }
+            }
+            return Ok(());
+        }
+
+        if !has_sparse {
+            let prefab_tag = self.builtins.prefab;
+            let wildcard = self.builtins.wildcard;
+            for table in self.tables.as_mut_slice() {
+                if table.is_empty() || !table_has_all_components(table, ids) {
+                    continue;
+                }
+                if !extra.matches_table(table, prefab_tag, wildcard) {
+                    continue;
+                }
+                Q::for_each_with_entity_in_table(table, ids, &mut f)?;
+            }
+            return Ok(());
+        }
+
+        let mut keep: OwnVec<bool, A> = OwnVec::new_in(self.alloc);
+        let n_tables = self.tables.len();
+        for ti in 0..n_tables {
+            let matched = match self.tables.get(ti) {
+                Some(t) => !t.is_empty() && table_has_all_components(t, ids) && self.table_matches_non_sparse(t, extra),
+                None => false,
+            };
+            if !matched {
                 continue;
             }
-            if !extra.matches_table(table, prefab_tag, wildcard) {
+            keep.clear();
+            let mut any_keep = false;
+            if let Some(table) = self.tables.get(ti) {
+                for &ent in table.entities() {
+                    let ok = self.entity_matches_sparse_tags(ent, extra);
+                    if ok {
+                        any_keep = true;
+                    }
+                    keep.try_push(ok).map_err(|r| EcsError::Alloc(r.why))?;
+                }
+            }
+            if !any_keep {
                 continue;
             }
-            Q::for_each_with_entity_in_table(table, ids, &mut f)?;
+            if let Some(table) = self.tables.get_mut(ti) {
+                let mut row = 0usize;
+                Q::for_each_with_entity_in_table(table, ids, &mut |ent, item| {
+                    let pass = keep.get(row).copied().unwrap_or(false);
+                    row += 1;
+                    if pass {
+                        f(ent, item);
+                    }
+                })?;
+            }
         }
         Ok(())
     }
 
-    /// Count all entities matching both `Q` and `extra`.
+    /// Count all entities matching both `Q` and `extra` (supports `DontFragment` sparse tags).
     pub fn count_filtered<Q: QueryFetch>(&self, extra: &QuerySpec<A>) -> Result<usize, EcsError> {
         Q::check_conflicts(self)?;
         let Some(fetch_ids) = Q::lookup_ids(self) else {
             return Ok(0);
         };
         let ids = fetch_ids.as_slice();
-        let prefab_tag = self.builtins.prefab;
-        let wildcard = self.builtins.wildcard;
+        let has_sparse = self.spec_has_sparse_tag_terms(extra);
         let mut total = 0usize;
         for table in self.tables.as_slice() {
             if table.is_empty() || !table_has_all_components(table, ids) {
                 continue;
             }
-            if !extra.matches_table(table, prefab_tag, wildcard) {
+            if !self.table_matches_non_sparse(table, extra) {
                 continue;
             }
-            total = total.saturating_add(table.len());
+            if !has_sparse {
+                total = total.saturating_add(table.len());
+            } else {
+                for &ent in table.entities() {
+                    if self.entity_matches_sparse_tags(ent, extra) {
+                        total = total.saturating_add(1);
+                    }
+                }
+            }
         }
         Ok(total)
     }
