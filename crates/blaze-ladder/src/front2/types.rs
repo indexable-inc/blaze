@@ -3378,7 +3378,49 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                         None => {
                             let sub = soft!(subtree(tys.view(), a, &arity, alloc));
                             if sub.slots != 0 {
-                                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DefaultArg, r)));
+                                let raw_default = self.heads.adt_generics(found.key).and_then(|(_, ds)| ds.get(i).copied().flatten());
+                                let Some(raw_default) = raw_default else {
+                                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DefaultArg, r)));
+                                };
+                                let mut visits: blaze_own::Vec<(PTy, PNode, u32), Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+                                soft!(each_slot_node(tys.view(), raw_default, &arity, alloc, &mut |t, node, own| {
+                                    visits.push((t, node, own));
+                                    Ok(())
+                                }));
+                                let Ok(cap) = usize::try_from(sub.slots) else {
+                                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DefaultArg, r)));
+                                };
+                                let mut added: blaze_own::Vec<Slot, Alloc<'_>> = blaze_own::Vec::with_capacity_in(cap, alloc);
+                                let mut db = 0u32;
+                                for &(_, node, own) in &visits {
+                                    if let PNode::Param(p) = node
+                                        && let Ok(pi) = usize::try_from(p)
+                                        && let Some(&(start, len, b)) = index.get(pi)
+                                        && let (Ok(st), Ok(ln)) = (usize::try_from(start), usize::try_from(len))
+                                        && let Some(slice) = st.checked_add(ln).and_then(|end| pool.get(st..end))
+                                    {
+                                        for &slot in slice {
+                                            let slot = match slot.kind {
+                                                SlotKind::ObjectDefault(_) if want == 0 => Slot::quiet(SlotKind::Static),
+                                                SlotKind::ObjectDefault(oat) => return Ok(Err(RegionRefusal::ObjectDefault { at: oat })),
+                                                _ => Slot::quiet(slot.shifted(binders + db).kind),
+                                            };
+                                            added.push(slot);
+                                        }
+                                        db += b;
+                                        continue;
+                                    }
+                                    if own != 0 {
+                                        return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DefaultArg, r)));
+                                    }
+                                    if is_binder(node) {
+                                        db += 1;
+                                    }
+                                }
+                                if u32::try_from(added.len()).ok() != Some(sub.slots) || db != sub.binders {
+                                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DefaultArg, r)));
+                                }
+                                s.scratch.extend_from_slice(&added);
                             }
                             binders += sub.binders;
                         }
@@ -3592,11 +3634,10 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                         }
                         (matched, conflict)
                     });
-                if trait_count == 0 {
-                    if let Some((Some(m), false)) = container_match {
-                        param_bound_col = Some(m);
-                    }
-                } else {
+                if let Some((Some(m), false)) = container_match {
+                    param_bound_col = Some(m);
+                }
+                if trait_count != 0 {
                     let mut found = 0u32;
                     for &n in v.rows(v.list(blaze_lower::head::GENERICS))? {
                         if let lf::GenericParam::Type { name: pn, bounds, .. } = lf::GenericParam::decode(n)?
@@ -3635,7 +3676,6 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                 }
                                 slots.extend(lead.iter().map(|&g| Slot::quiet(SlotKind::Given(g))));
                                 param_bound_col = Some((bs, be));
-                                found = 1;
                             }
                             _ => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionBoundElsewhere, r))),
                         }

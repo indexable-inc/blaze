@@ -232,6 +232,19 @@ pub struct OwnerTraitImpl {
     pub self_shape: SelfShape,
 }
 
+/// Metadata for a trait fn's RPITIT opaque (`-> impl Trait` or `async fn` in a trait, RFC 3425):
+/// maps the opaque back to its trait, synthetic associated type name, trait fn, method name,
+/// trait generic count (including `Self`), and optional default `Twin` opaque key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RpititOpaque {
+    pub trait_: ItemKey,
+    pub name: Name,
+    pub trait_fn: ItemKey,
+    pub fn_name: Name,
+    pub trait_types: u32,
+    pub default_twin: Option<ItemKey>,
+}
+
 /// What the lowering needs to know about a callee's signature (flow.md section 7, heads).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CalleeFacts {
@@ -403,6 +416,17 @@ pub trait Facts {
     fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
         let _ = (trait_, name);
         false
+    }
+    /// If `opaque` is an RPITIT opaque of a trait fn, returns its [`RpititOpaque`] metadata so
+    /// `blaze-borrow` can normalize concrete RPITIT calls through the selected impl's method.
+    fn rpitit_opaque(&self, opaque: ItemKey) -> Option<RpititOpaque> {
+        let _ = opaque;
+        None
+    }
+    /// The impl method key overriding `fn_name` in trait impl `imp`, if overridden.
+    fn impl_fn(&self, imp: ItemKey, fn_name: Name) -> Option<ItemKey> {
+        let _ = (imp, fn_name);
+        None
     }
     /// The trait bounds with lifetime arguments of fn `item` ([`Ties`]): a callee's tie its
     /// trait lifetimes to what the call's arguments answer them with, the body's own say what
