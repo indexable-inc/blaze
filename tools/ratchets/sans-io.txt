@@ -172,6 +172,8 @@ blaze-v2-proof	12	0	0	0	0	0	27	3	0	1	0	6	1	1	0	0	0	0
 blaze-wasi	0	3	5	0	0	0	12	0	0	0	0	0	0	1	0	0	0	0
 blaze-watch	0	0	0	38	0	0	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-world	106	0	3	0	3	0	139	22	12	3	0	116	0	1	0	1	1	1
+# blaze-zstd is 0 in every sans-IO column (`#![no_std]`, `#![deny(unsafe_code)]`, `#![blaze::sans_io]`, 0 third-party deps); `bare = 1` is inherited transitively from `blaze-own` once reached via `blaze-std`.
+blaze-zstd	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 const-ast	0	5	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
 edition	0	3	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 gpu	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0

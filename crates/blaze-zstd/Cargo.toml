@@ -1,0 +1,24 @@
+[package]
+name = "blaze-zstd"
+description = "Pure `#![no_std]`, zero-unsafe RFC 8878 Zstandard (`zstd`) compressor and decompressor with raw-content dictionary support, caller-supplied safety limits, and XXH64 content checksums"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-own.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["testing"] }
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

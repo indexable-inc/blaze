@@ -3,21 +3,33 @@
 //! - Full RFC 8878 decoder: concatenated frames, skippable frames (`0x184D2A50..=0x184D2A5F`),
 //!   Raw/RLE/Compressed blocks, Raw/RLE/1-stream and 4-stream Huffman Compressed & Treeless
 //!   literals (direct 4-bit and FSE-compressed Huffman weights), Predefined/RLE/FSE/Repeat
-//!   sequence tables, repeat-offset history (`[1, 4, 8]`), `Frame_Content_Size`, and 32-bit
-//!   `XXH64` content checksum verification via [`crate::digest::xxh64`].
+//!   sequence tables, repeat-offset history (`[1, 4, 8]`), `Frame_Content_Size`, raw-content
+//!   dictionaries (`decompress_with_dict_in`), and 32-bit `XXH64` content checksum verification
+//!   via [`xxh64::xxh64`].
 //! - Valid RFC 8878 compressor: single-segment or windowed frames, RLE blocks for constant runs,
-//!   SWAR LZ77 match finding with repeat-offset preference, 1-stream and 4-stream Huffman literals
-//!   (direct 4-bit and FSE-compressed weights), O(1) Predefined/Repeat-mode FSE sequence encoding,
-//!   Raw fallback per block when incompressible, and optional `XXH64` content checksum.
+//!   SWAR/Double-Fast LZ77 match finding with repeat-offset preference and pre-hashed raw-content
+//!   dictionaries ([`ZstdDict`]), 1-stream and 4-stream Huffman literals, custom/RLE/Predefined/
+//!   Repeat FSE sequence encoding, Raw fallback per block when incompressible, and optional
+//!   `XXH64` content checksum.
 //! - Caller-supplied [`ZstdLimits`] bound output size, window size, and frame count against
 //!   decompression bombs.
 //! - Zero `unsafe`, zero integer `as` casts, zero `.clone()`, zero panicking slice indexes, and
 //!   zero recursion.
 
+#![no_std]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(unsafe_code)]
+
 mod decode;
+mod dict;
 mod encode;
 mod fse;
 mod huffman;
+pub mod xxh64;
 
 #[cfg(test)]
 mod tests;
@@ -28,6 +40,7 @@ use core::fmt;
 use blaze_own::{AllocFailure, Vec};
 
 pub use decode::ZstdDecoder;
+pub use dict::{MAX_DICT_BYTES, ZstdDict};
 pub use encode::ZstdEncoder;
 
 pub(crate) const ZSTD_MAGIC: u32 = 0xFD2F_B528;
@@ -186,6 +199,18 @@ pub fn decompress_in<A: Allocator + Copy>(
     decode::decompress_in_inner(input, limits, alloc, false)
 }
 
+/// Decompress an RFC 8878 Zstandard frame compressed with raw-content dictionary `dict` into
+/// `alloc`, enforcing `limits`.
+pub fn decompress_with_dict_in<A: Allocator + Copy>(
+    input: &[u8],
+    dict: &[u8],
+    limits: ZstdLimits,
+    alloc: A,
+) -> Result<Vec<u8, A>, ZstdError> {
+    let mut dec = ZstdDecoder::new_in(alloc);
+    dec.decompress_with_dict(input, dict, limits)
+}
+
 /// Compress `input` into a valid RFC 8878 Zstandard frame in `alloc`.
 pub fn compress_in<A: Allocator + Copy>(
     input: &[u8],
@@ -193,6 +218,17 @@ pub fn compress_in<A: Allocator + Copy>(
     alloc: A,
 ) -> Result<Vec<u8, A>, ZstdError> {
     encode::compress_in_inner(input, opts, alloc)
+}
+
+/// Compress `input` using a pre-hashed raw-content dictionary `dict` into `alloc`.
+pub fn compress_with_dict_in<A: Allocator + Copy, D: Allocator + Copy>(
+    input: &[u8],
+    dict: &ZstdDict<D>,
+    opts: CompressOpts,
+    alloc: A,
+) -> Result<Vec<u8, A>, ZstdError> {
+    let mut enc = ZstdEncoder::try_new_in(alloc)?;
+    enc.compress_with_dict(input, dict, opts)
 }
 
 /// Inspect the first Zstandard frame header in `input` and return its declared

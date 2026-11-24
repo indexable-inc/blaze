@@ -3,12 +3,35 @@ use core::alloc::Allocator;
 use blaze_own::{Vec as OwnVec, format_in, testing::heap};
 use blaze_sim::{Broke, Config, Tape, check, control};
 
-use crate::hex::decode_in as hex_decode_in;
-use crate::zstd::decode::decompress_in_inner;
-use crate::zstd::{
-    CompressOpts, Level, ZstdDecoder, ZstdEncoder, ZstdError, ZstdLimits, compress_in,
-    decompress_in, frame_content_size,
+use crate::decode::decompress_in_inner;
+use crate::{
+    CompressOpts, Level, ZstdDecoder, ZstdDict, ZstdEncoder, ZstdError, ZstdLimits, compress_in,
+    compress_with_dict_in, decompress_in, decompress_with_dict_in, frame_content_size,
 };
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_decode_in<A: Allocator>(hex: &[u8], alloc: A) -> Result<OwnVec<u8, A>, &'static str> {
+    if !hex.len().is_multiple_of(2) {
+        return Err("odd hex length");
+    }
+    let mut out = OwnVec::with_capacity_in(hex.len() / 2, alloc);
+    let mut i = 0usize;
+    while i < hex.len() {
+        let hi = hex_nibble(*hex.get(i).ok_or("hex")?).ok_or("bad hex")?;
+        let lo = hex_nibble(*hex.get(i + 1).ok_or("hex")?).ok_or("bad hex")?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
 
 const EMPTY_L3_CHECK_HEX: &[u8] = b"28b52ffd240001000099e9d851";
 const SHORT_L3_CHECK_HEX: &[u8] =
@@ -394,4 +417,76 @@ fn the_oracle_catches_skipped_checksum() {
             )),
         }
     });
+}
+
+#[test]
+fn raw_content_dictionary_round_trips_and_improves_small_rust_files() {
+    let h = heap();
+    let alloc = h.alloc();
+    let dict_bytes = concat!(
+        "//! Standard library module.\n#![no_std]\nuse core::fmt;\nuse core::mem;\n",
+        "use core::ptr;\nuse core::slice;\nuse core::marker::PhantomData;\n",
+        "#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]\n",
+        "#[inline]\n#[must_use]\npub const fn new() -> Self { Self }\n",
+        "impl<T> Default for Option<T> { fn default() -> Self { None } }\n",
+        "pub fn from_raw_parts<'a, T>(data: *const T, len: usize) -> &'a [T]\n",
+        "Result<Self, Error>\nOk(Self)\nErr(Error)\n",
+    )
+    .as_bytes();
+    let sample = concat!(
+        "//! Standard library module.\n#![no_std]\nuse core::fmt;\nuse core::ptr;\n",
+        "#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]\n",
+        "pub struct Foo<T>(core::marker::PhantomData<T>);\n",
+        "impl<T> Foo<T> { #[inline] #[must_use] pub const fn new() -> Self { Self(core::marker::PhantomData) } }\n",
+    )
+    .as_bytes();
+
+    let dict = ZstdDict::try_new_in(dict_bytes, alloc).expect("dict builds");
+    let mut enc = ZstdEncoder::try_new_in(alloc).expect("encoder builds");
+    let mut dec = ZstdDecoder::new_in(alloc);
+
+    for level in [Level::Fast, Level::Default] {
+        let opts = CompressOpts { level, checksum: true };
+        let plain = enc.compress(sample, opts).expect("plain compress");
+        let with_dict = enc.compress_with_dict(sample, &dict, opts).expect("dict compress");
+        assert!(
+            with_dict.len() < plain.len(),
+            "{level:?}: dict compressed {} bytes should beat plain {} bytes",
+            with_dict.len(),
+            plain.len()
+        );
+        let decoded = dec
+            .decompress_with_dict(with_dict.as_slice(), dict.bytes(), ZstdLimits::SHIPPED)
+            .expect("dict decompress");
+        assert_eq!(decoded.as_slice(), sample, "{level:?}: round-trip mismatch");
+
+        // Reusing the same decoder across multiple frames with the same dict must stay exact.
+        let sample2 = b"use core::slice;\n#[inline]\n#[must_use]\npub fn len(s: &[u8]) -> usize { s.len() }\n";
+        let with_dict2 = compress_with_dict_in(sample2, &dict, opts, alloc).expect("dict compress 2");
+        let mut out2 = OwnVec::new_in(alloc);
+        dec.decompress_with_dict_into(with_dict2.as_slice(), dict.bytes(), ZstdLimits::SHIPPED, &mut out2)
+            .expect("dict decompress 2");
+        assert_eq!(out2.as_slice(), sample2, "{level:?}: second frame round-trip mismatch");
+
+        // Wrong dictionary must fail checksum (or offset) verification!
+        let wrong_dict = b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+        let bad = decompress_with_dict_in(with_dict.as_slice(), wrong_dict, ZstdLimits::SHIPPED, alloc);
+        assert!(bad.is_err(), "{level:?}: wrong dictionary must not match checksum");
+    }
+
+    // Empty input and multi-block (> 128 KiB) input with dictionary.
+    let empty_c = enc.compress_with_dict(b"", &dict, CompressOpts::DEFAULT).expect("empty");
+    assert_eq!(
+        dec.decompress_with_dict(empty_c.as_slice(), dict.bytes(), ZstdLimits::SHIPPED)
+            .expect("empty dec")
+            .as_slice(),
+        b""
+    );
+    let big = repeat_bytes(sample, b"\n", 600, alloc);
+    assert!(big.len() > 150_000);
+    let big_c = enc.compress_with_dict(big.as_slice(), &dict, CompressOpts::DEFAULT).expect("big");
+    let big_d = dec
+        .decompress_with_dict(big_c.as_slice(), dict.bytes(), ZstdLimits::SHIPPED)
+        .expect("big dec");
+    assert_eq!(big_d.as_slice(), big.as_slice());
 }

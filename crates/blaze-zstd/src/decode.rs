@@ -5,14 +5,15 @@ use core::alloc::Allocator;
 
 use blaze_own::{ByteCursor, RevBitCursor, SeqOp, Vec};
 
-use crate::digest::xxh64;
-use crate::zstd::fse::{
+use crate::dict::MAX_DICT_BYTES;
+use crate::fse::{
     FseDecTable, LL_DEFAULT_LOG, LL_DEFAULT_NORM, LL_MAX_CODE, LL_MAX_LOG, ML_DEFAULT_LOG,
     ML_DEFAULT_NORM, ML_MAX_CODE, ML_MAX_LOG, OF_DEFAULT_LOG, OF_DEFAULT_NORM, OF_MAX_CODE,
     OF_MAX_LOG, SEQ_ML_OFFSET, SEQ_OF_OFFSET, SeqKind, SeqTables,
 };
-use crate::zstd::huffman::HuffTable;
-use crate::zstd::{
+use crate::huffman::HuffTable;
+use crate::xxh64::xxh64;
+use crate::{
     MAX_BLOCK_SIZE, SKIPPABLE_MAGIC_MAX, SKIPPABLE_MAGIC_MIN, ZSTD_MAGIC, ZstdError, ZstdLimits,
 };
 
@@ -88,22 +89,28 @@ impl<'a> Cursor<'a> {
     #[inline]
     fn read_u16_le(&mut self) -> Result<u16, ZstdError> {
         let bytes = self.read_slice(2)?;
-        let &arr = bytes.first_chunk::<2>().ok_or(ZstdError::Truncated)?;
-        Ok(u16::from_le_bytes(arr))
+        let [b0, b1] = *bytes else {
+            return Err(ZstdError::Truncated);
+        };
+        Ok(u16::from_le_bytes([b0, b1]))
     }
 
     #[inline]
     fn read_u32_le(&mut self) -> Result<u32, ZstdError> {
         let bytes = self.read_slice(4)?;
-        let &arr = bytes.first_chunk::<4>().ok_or(ZstdError::Truncated)?;
-        Ok(u32::from_le_bytes(arr))
+        let [b0, b1, b2, b3] = *bytes else {
+            return Err(ZstdError::Truncated);
+        };
+        Ok(u32::from_le_bytes([b0, b1, b2, b3]))
     }
 
     #[inline]
     fn read_u64_le(&mut self) -> Result<u64, ZstdError> {
         let bytes = self.read_slice(8)?;
-        let &arr = bytes.first_chunk::<8>().ok_or(ZstdError::Truncated)?;
-        Ok(u64::from_le_bytes(arr))
+        let [b0, b1, b2, b3, b4, b5, b6, b7] = *bytes else {
+            return Err(ZstdError::Truncated);
+        };
+        Ok(u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]))
     }
 }
 
@@ -236,6 +243,7 @@ impl FrameState {
 pub struct ZstdDecoder<A: Allocator + Copy> {
     state: FrameState,
     lit_buf: Vec<u8, A>,
+    dict_work: Vec<u8, A>,
     alloc: A,
 }
 
@@ -243,13 +251,30 @@ impl<A: Allocator + Copy> ZstdDecoder<A> {
     /// Create a new reusable Zstandard decoder backed by `alloc`.
     #[inline]
     pub fn new_in(alloc: A) -> Self {
-        Self { state: FrameState::new(), lit_buf: Vec::new_in(alloc), alloc }
+        Self {
+            state: FrameState::new(),
+            lit_buf: Vec::new_in(alloc),
+            dict_work: Vec::new_in(alloc),
+            alloc,
+        }
     }
 
     /// Decompress `input` into a freshly allocated `Vec<u8, A>` in this decoder's allocator.
     pub fn decompress(&mut self, input: &[u8], limits: ZstdLimits) -> Result<Vec<u8, A>, ZstdError> {
         let mut out = Vec::new_in(self.alloc);
         self.decompress_into_inner(input, limits, &mut out, false)?;
+        Ok(out)
+    }
+
+    /// Decompress `input` using raw-content dictionary `dict` into a freshly allocated `Vec<u8, A>`.
+    pub fn decompress_with_dict(
+        &mut self,
+        input: &[u8],
+        dict: &[u8],
+        limits: ZstdLimits,
+    ) -> Result<Vec<u8, A>, ZstdError> {
+        let mut out = Vec::new_in(self.alloc);
+        self.decompress_with_dict_into(input, dict, limits, &mut out)?;
         Ok(out)
     }
 
@@ -264,153 +289,207 @@ impl<A: Allocator + Copy> ZstdDecoder<A> {
         self.decompress_into_inner(input, limits, out, false)
     }
 
-    pub(crate) fn decompress_into_inner(
+    /// Decompress `input` compressed with raw-content dictionary `dict`, appending decoded bytes
+    /// into `out` (never copying `dict` into `out`). Reuses `dict_work` across frames with the
+    /// same dictionary without re-copying `dict`.
+    pub fn decompress_with_dict_into<O: Allocator>(
+        &mut self,
+        input: &[u8],
+        dict: &[u8],
+        limits: ZstdLimits,
+        out: &mut Vec<u8, O>,
+    ) -> Result<(), ZstdError> {
+        if dict.is_empty() {
+            return decompress_into_core(&mut self.state, &mut self.lit_buf, input, limits, out, false, false);
+        }
+        let dict_slice = if dict.len() > MAX_DICT_BYTES {
+            dict.get(dict.len() - MAX_DICT_BYTES..).unwrap_or(&[])
+        } else {
+            dict
+        };
+        let dict_len = dict_slice.len();
+        if self.dict_work.as_slice().get(..dict_len) != Some(dict_slice) {
+            self.dict_work.clear();
+            self.dict_work.try_extend_from_slice(dict_slice)?;
+        } else {
+            self.dict_work.truncate(dict_len);
+        }
+        decompress_into_core(
+            &mut self.state,
+            &mut self.lit_buf,
+            input,
+            limits,
+            &mut self.dict_work,
+            false,
+            true,
+        )?;
+        let decoded = self.dict_work.as_slice().get(dict_len..).ok_or(ZstdError::CorruptSequences)?;
+        out.try_extend_from_slice(decoded)?;
+        Ok(())
+    }
+
+    pub(crate) fn decompress_into_inner<O: Allocator>(
         &mut self,
         input: &[u8],
         limits: ZstdLimits,
-        out: &mut Vec<u8, A>,
+        out: &mut Vec<u8, O>,
         skip_checksum: bool,
     ) -> Result<(), ZstdError> {
-        if input.is_empty() {
-            return Err(ZstdError::Truncated);
-        }
-
-        let start_out_len = out.len();
-        let mut cur = Cursor::new(input);
-        let mut frames: usize = 0;
-
-        while !cur.is_empty() {
-            frames = frames
-                .checked_add(1)
-                .ok_or(ZstdError::TooManyFrames { limit: limits.most_frames })?;
-            if frames > limits.most_frames {
-                return Err(ZstdError::TooManyFrames { limit: limits.most_frames });
-            }
-
-            let magic = cur.read_u32_le()?;
-            if (SKIPPABLE_MAGIC_MIN..=SKIPPABLE_MAGIC_MAX).contains(&magic) {
-                let skip_u32 = cur.read_u32_le()?;
-                let skip_len = usize::try_from(skip_u32).map_err(|_| ZstdError::Truncated)?;
-                cur.skip(skip_len)?;
-                continue;
-            }
-            if magic != ZSTD_MAGIC {
-                return Err(ZstdError::BadMagic);
-            }
-
-            let hdr = parse_frame_header(&mut cur)?;
-            let produced_so_far = out.len().saturating_sub(start_out_len);
-            if let Some(cs) = hdr.content_size {
-                let rem_cap = limits.most_output_bytes.saturating_sub(produced_so_far);
-                let rem_cap_u64 = u64::try_from(rem_cap).unwrap_or(u64::MAX);
-                if cs > rem_cap_u64 {
-                    return Err(ZstdError::OutputTooLarge { limit: limits.most_output_bytes });
-                }
-            }
-            let win_limit_u64 = u64::try_from(limits.most_window_bytes).unwrap_or(u64::MAX);
-            if hdr.window_bytes > win_limit_u64 {
-                return Err(ZstdError::WindowTooLarge {
-                    window_bytes: hdr.window_bytes,
-                    limit: limits.most_window_bytes,
-                });
-            }
-
-            let frame_start = out.len();
-            let total_output_cap = start_out_len.saturating_add(limits.most_output_bytes);
-            self.state.reset_frame();
-
-            {
-                let mut writer = out.byte_cursor();
-                // Reserve the entire frame once without zeroing (plus 64B slack for NEON wildcopy).
-                if let Some(cs) = hdr.content_size {
-                    let safe_cap = input.len().saturating_mul(16).max(65_536).min(MAX_PREALLOC_HINT);
-                    let hint = usize::try_from(cs).unwrap_or(safe_cap).min(safe_cap);
-                    writer.try_reserve(hint.saturating_add(64))?;
-                }
-
-                loop {
-                    let bh = cur.read_slice(3)?;
-                    let &[b0, b1, b2] = bh.first_chunk::<3>().ok_or(ZstdError::Truncated)?;
-                    let hdr_u32 = u32::from_le_bytes([b0, b1, b2, 0]);
-                    let last_block = (hdr_u32 & 1) != 0;
-                    let block_type = (hdr_u32 >> 1) & 0x03;
-                    let block_size =
-                        usize::try_from(hdr_u32 >> 3).map_err(|_| ZstdError::Truncated)?;
-
-                    match block_type {
-                        0 => {
-                            if block_size > MAX_BLOCK_SIZE {
-                                return Err(ZstdError::BlockTooLarge { size: block_size });
-                            }
-                            check_output_budget(
-                                writer.len(),
-                                block_size,
-                                total_output_cap,
-                                limits.most_output_bytes,
-                            )?;
-                            let raw = cur.read_slice(block_size)?;
-                            writer.try_write_slice(raw)?;
-                        }
-                        1 => {
-                            if block_size > MAX_BLOCK_SIZE {
-                                return Err(ZstdError::BlockTooLarge { size: block_size });
-                            }
-                            check_output_budget(
-                                writer.len(),
-                                block_size,
-                                total_output_cap,
-                                limits.most_output_bytes,
-                            )?;
-                            let val = cur.read_u8()?;
-                            writer.try_fill_bytes(val, block_size)?;
-                        }
-                        2 => {
-                            if block_size > MAX_BLOCK_SIZE {
-                                return Err(ZstdError::BlockTooLarge { size: block_size });
-                            }
-                            let block_bytes = cur.read_slice(block_size)?;
-                            decode_compressed_block(
-                                block_bytes,
-                                &mut self.state,
-                                &mut self.lit_buf,
-                                &mut writer,
-                                frame_start,
-                                hdr.window_bytes,
-                                total_output_cap,
-                                limits.most_output_bytes,
-                            )?;
-                        }
-                        _ => return Err(ZstdError::BadBlockType),
-                    }
-
-                    if last_block {
-                        break;
-                    }
-                }
-                writer.finish();
-            }
-
-            if hdr.checksum_flag {
-                let expected = cur.read_u32_le()?;
-                let frame_slice = out.get(frame_start..).ok_or(ZstdError::CorruptSequences)?;
-                let hash = xxh64(frame_slice, 0);
-                let [c0, c1, c2, c3, ..] = hash.to_le_bytes();
-                let actual = u32::from_le_bytes([c0, c1, c2, c3]);
-                if !skip_checksum && actual != expected {
-                    return Err(ZstdError::ChecksumMismatch { expected, actual });
-                }
-            }
-
-            if let Some(expected) = hdr.content_size {
-                let actual = out.len().saturating_sub(frame_start);
-                if u64::try_from(actual).ok() != Some(expected) {
-                    return Err(ZstdError::ContentSizeMismatch { expected, actual });
-                }
-            }
-        }
-
-        Ok(())
+        decompress_into_core(&mut self.state, &mut self.lit_buf, input, limits, out, skip_checksum, false)
     }
+}
+
+fn decompress_into_core<A: Allocator, O: Allocator>(
+    state: &mut FrameState,
+    lit_buf: &mut Vec<u8, A>,
+    input: &[u8],
+    limits: ZstdLimits,
+    out: &mut Vec<u8, O>,
+    skip_checksum: bool,
+    has_dict_prefix: bool,
+) -> Result<(), ZstdError> {
+    if input.is_empty() {
+        return Err(ZstdError::Truncated);
+    }
+
+    let start_out_len = out.len();
+    let mut cur = Cursor::new(input);
+    let mut frames: usize = 0;
+
+    while !cur.is_empty() {
+        frames = frames
+            .checked_add(1)
+            .ok_or(ZstdError::TooManyFrames { limit: limits.most_frames })?;
+        if frames > limits.most_frames {
+            return Err(ZstdError::TooManyFrames { limit: limits.most_frames });
+        }
+
+        let magic = cur.read_u32_le()?;
+        if (SKIPPABLE_MAGIC_MIN..=SKIPPABLE_MAGIC_MAX).contains(&magic) {
+            let skip_u32 = cur.read_u32_le()?;
+            let skip_len = usize::try_from(skip_u32).map_err(|_| ZstdError::Truncated)?;
+            cur.skip(skip_len)?;
+            continue;
+        }
+        if magic != ZSTD_MAGIC {
+            return Err(ZstdError::BadMagic);
+        }
+
+        let hdr = parse_frame_header(&mut cur)?;
+        let produced_so_far = out.len().saturating_sub(start_out_len);
+        if let Some(cs) = hdr.content_size {
+            let rem_cap = limits.most_output_bytes.saturating_sub(produced_so_far);
+            let rem_cap_u64 = u64::try_from(rem_cap).unwrap_or(u64::MAX);
+            if cs > rem_cap_u64 {
+                return Err(ZstdError::OutputTooLarge { limit: limits.most_output_bytes });
+            }
+        }
+        let win_limit_u64 = u64::try_from(limits.most_window_bytes).unwrap_or(u64::MAX);
+        if hdr.window_bytes > win_limit_u64 {
+            return Err(ZstdError::WindowTooLarge {
+                window_bytes: hdr.window_bytes,
+                limit: limits.most_window_bytes,
+            });
+        }
+
+        let frame_start = out.len();
+        let history_start = if has_dict_prefix && frames == 1 { 0 } else { frame_start };
+        let total_output_cap = start_out_len.saturating_add(limits.most_output_bytes);
+        state.reset_frame();
+
+        {
+            let mut writer = out.byte_cursor();
+            // Reserve the entire frame once without zeroing (plus 64B slack for NEON wildcopy).
+            if let Some(cs) = hdr.content_size {
+                let safe_cap = input.len().saturating_mul(16).max(65_536).min(MAX_PREALLOC_HINT);
+                let hint = usize::try_from(cs).unwrap_or(safe_cap).min(safe_cap);
+                writer.try_reserve(hint.saturating_add(64))?;
+            }
+
+            loop {
+                let bh = cur.read_slice(3)?;
+                let [b0, b1, b2] = *bh else {
+                    return Err(ZstdError::Truncated);
+                };
+                let hdr_u32 = u32::from_le_bytes([b0, b1, b2, 0]);
+                let last_block = (hdr_u32 & 1) != 0;
+                let block_type = (hdr_u32 >> 1) & 0x03;
+                let block_size =
+                    usize::try_from(hdr_u32 >> 3).map_err(|_| ZstdError::Truncated)?;
+
+                match block_type {
+                    0 => {
+                        if block_size > MAX_BLOCK_SIZE {
+                            return Err(ZstdError::BlockTooLarge { size: block_size });
+                        }
+                        check_output_budget(
+                            writer.len(),
+                            block_size,
+                            total_output_cap,
+                            limits.most_output_bytes,
+                        )?;
+                        let raw = cur.read_slice(block_size)?;
+                        writer.try_write_slice(raw)?;
+                    }
+                    1 => {
+                        if block_size > MAX_BLOCK_SIZE {
+                            return Err(ZstdError::BlockTooLarge { size: block_size });
+                        }
+                        check_output_budget(
+                            writer.len(),
+                            block_size,
+                            total_output_cap,
+                            limits.most_output_bytes,
+                        )?;
+                        let val = cur.read_u8()?;
+                        writer.try_fill_bytes(val, block_size)?;
+                    }
+                    2 => {
+                        if block_size > MAX_BLOCK_SIZE {
+                            return Err(ZstdError::BlockTooLarge { size: block_size });
+                        }
+                        let block_bytes = cur.read_slice(block_size)?;
+                        decode_compressed_block(
+                            block_bytes,
+                            state,
+                            lit_buf,
+                            &mut writer,
+                            history_start,
+                            hdr.window_bytes,
+                            total_output_cap,
+                            limits.most_output_bytes,
+                        )?;
+                    }
+                    _ => return Err(ZstdError::BadBlockType),
+                }
+
+                if last_block {
+                    break;
+                }
+            }
+            writer.finish();
+        }
+
+        if hdr.checksum_flag {
+            let expected = cur.read_u32_le()?;
+            let frame_slice = out.get(frame_start..).ok_or(ZstdError::CorruptSequences)?;
+            let hash = xxh64(frame_slice, 0);
+            let [c0, c1, c2, c3, ..] = hash.to_le_bytes();
+            let actual = u32::from_le_bytes([c0, c1, c2, c3]);
+            if !skip_checksum && actual != expected {
+                return Err(ZstdError::ChecksumMismatch { expected, actual });
+            }
+        }
+
+        if let Some(expected) = hdr.content_size {
+            let actual = out.len().saturating_sub(frame_start);
+            if u64::try_from(actual).ok() != Some(expected) {
+                return Err(ZstdError::ContentSizeMismatch { expected, actual });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 enum LiteralsRef<'a> {
@@ -1036,11 +1115,11 @@ fn decode_sequences_fast<'a, A: Allocator>(
 }
 
 #[inline(never)]
-fn decode_compressed_block<A: Allocator>(
+fn decode_compressed_block<A: Allocator, O: Allocator>(
     block_bytes: &[u8],
     state: &mut FrameState,
     lit_buf: &mut Vec<u8, A>,
-    writer: &mut ByteCursor<'_, A>,
+    writer: &mut ByteCursor<'_, O>,
     frame_start: usize,
     window_bytes: u64,
     total_output_cap: usize,
