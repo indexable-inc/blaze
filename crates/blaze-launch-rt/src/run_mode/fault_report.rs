@@ -116,8 +116,41 @@ pub const REGION_NAMES: [&str; 8] = [
     "the hot region, in no placed record",
 ];
 
-/// The rows' mapping (`MOST_ROWS` rows, mapped once by [`install`], never unmapped).
+/// The rows' mapping (`MOST_ROWS` rows followed by one [`Scratch`] in the same `mmap`, mapped
+/// once by [`install`], never unmapped).
 static ROWS: AtomicPtr<Row> = AtomicPtr::new(ptr::null_mut());
+/// Off-stack scratch for the crash signal handler, placed at [`SCRATCH_OFFSET`] inside the
+/// [`ROWS`] mapping and serialized by [`CHANNEL_HELD`]. Keeps the 4 KiB frame buffer and the
+/// ~1.5 KiB `Up::Fault` off the alternate signal stack (Linux AArch64's `SIGSTKSZ` is 16 KiB).
+struct Scratch {
+    room: blaze_own::Inline<FRAME_ROOM>,
+    up: Up,
+}
+
+const SCRATCH_OFFSET: usize = (MOST_ROWS * core::mem::size_of::<Row>()).next_multiple_of(core::mem::align_of::<Scratch>());
+const TABLE_BYTES: usize = SCRATCH_OFFSET + core::mem::size_of::<Scratch>();
+
+/// Typed failure of [`tell_parent_in_scratch`], keeping the handler async-signal-safe.
+#[derive(Clone, Copy, Debug)]
+enum TellError {
+    NoRoom,
+    FrameTooLong,
+    RoomOverflow,
+    WriteStalled,
+    WriteRefused,
+}
+
+impl TellError {
+    fn reason(self) -> &'static str {
+        match self {
+            TellError::NoRoom => "no room in the handler's scratch",
+            TellError::FrameTooLong => "the fault's frame is longer than a frame carries",
+            TellError::RoomOverflow => "the fault's frame outgrew its room in the handler's scratch",
+            TellError::WriteStalled => "the socket took no more bytes in 64 tries",
+            TellError::WriteRefused => "the socket refused the frame",
+        }
+    }
+}
 /// Rows published: each row below it is written whole and never written again.
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Placements not kept because the table was full.
@@ -130,26 +163,51 @@ const SIGNALS: [c_int; 4] = [os::SIGSEGV, os::SIGBUS, os::SIGILL, os::SIGTRAP];
 static PREVIOUS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 static PREVIOUS_FLAGS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 
-/// Maps the table, keeps `regions`, and installs the report on [`SIGNALS`], each chained to
-/// the action that was there.
+/// Initializes one off-stack [`Scratch`] in place at `ptr` (caller guarantees `ptr` points to
+/// properly aligned, writable, unaliased memory of at least `size_of::<Scratch>()` bytes).
+unsafe fn init_scratch(ptr: *mut Scratch) {
+    // SAFETY: caller guarantees `ptr` points to writable, aligned memory for `Scratch`.
+    unsafe { ptr::addr_of_mut!((*ptr).room).write(blaze_own::Inline::new()) };
+    // SAFETY: as above.
+    unsafe {
+        ptr::addr_of_mut!((*ptr).up).write(Up::Fault {
+            fault: Fault {
+                signal: Signal::Trap,
+                pc: None,
+                at: None,
+                code: None,
+                regs: None,
+                address: 0,
+                touched: None,
+                write: None,
+                callers: None,
+            },
+        });
+    }
+}
+
+/// Maps the table (and its trailing off-stack [`Scratch`]), keeps `regions`, and installs the
+/// report on [`SIGNALS`], each chained to the action that was there.
 ///
 /// # Safety
 ///
 /// Called once, by the control thread, before any program code runs (so no program action is
 /// replaced and no fault can come while `PREVIOUS` is written).
 pub unsafe fn install(regions: Regions) -> Result<(), RunModeError> {
-    let bytes = MOST_ROWS * core::mem::size_of::<Row>();
     // SAFETY: an anonymous private mapping; the kernel picks the address. Its pages are made
     // as rows are written, so the cap costs address space, not memory.
     let rows = unsafe {
-        io::mmap(None, bytes, io::Prot::READ | io::Prot::WRITE, io::MapFlags::PRIVATE | io::MapFlags::ANONYMOUS, None, 0)
+        io::mmap(None, TABLE_BYTES, io::Prot::READ | io::Prot::WRITE, io::MapFlags::PRIVATE | io::MapFlags::ANONYMOUS, None, 0)
     }.map_err(|error| RunModeError::Sys(crate::sys::SysError {
-        call: "mmap (the run's placement table for crash reports)", errno: i32::from(error.raw()), at: 0, len: bytes,
+        call: "mmap (the run's placement table for crash reports)", errno: i32::from(error.raw()), at: 0, len: TABLE_BYTES,
     }))?;
+    // SAFETY: `TABLE_BYTES >= SCRATCH_OFFSET + size_of::<Scratch>()` and `SCRATCH_OFFSET` is
+    // aligned to `align_of::<Scratch>()`; `rows` is newly mapped and unaliased.
+    unsafe { init_scratch(rows.as_ptr().add(SCRATCH_OFFSET).cast::<Scratch>()) };
     for (i, edge) in regions.edges.iter().enumerate() {
         EDGES[i].store(*edge, Ordering::Relaxed);
     }
-    // Release: a handler that acquires the table's pointer sees the edges.
+    // Release: a handler that acquires the table's pointer sees the edges and initialized scratch.
     ROWS.store(rows.as_ptr().cast(), Ordering::Release);
     for (i, &sig) in SIGNALS.iter().enumerate() {
         let before = os::get_action(sig).map_err(|error| RunModeError::Sys(crate::sys::SysError {
@@ -189,7 +247,9 @@ pub fn note(row: Row) {
     COUNT.store(n + 1, Ordering::Release);
 }
 
-/// The handler (the module's doc).
+/// The handler (the module's doc). Kept lean so its stack frame stays tiny on Linux AArch64's
+/// 16 KiB `SIGSTKSZ` alternate signal stack: the 4 KiB frame buffer and `Fault` live in
+/// [`SCRATCH`], and the stderr fallback is `#[inline(never)]`.
 extern "C" fn on_signal(sig: c_int, info: *mut SignalInfo, ctx: *mut c_void) {
     // SAFETY: the kernel hands an SA_SIGINFO handler a live `siginfo_t` and `ucontext_t`.
     let (address, (pc, write)) = unsafe { ((*info).si_addr() as u64, regs(ctx)) };
@@ -203,34 +263,32 @@ extern "C" fn on_signal(sig: c_int, info: *mut SignalInfo, ctx: *mut c_void) {
         // loaded Acquire above) and are never written again; the mapping is never unmapped.
         false => unsafe { core::slice::from_raw_parts(rows, count) },
     };
-    let mut edges = [0u64; REGION_NAMES.len() + 1];
-    for (i, edge) in EDGES.iter().enumerate() {
-        edges[i] = edge.load(Ordering::Relaxed);
-    }
     let struck = Struck { sig, pc, address, write };
     // ONE report (rule 30): the parent's, which names paths and reasons (blaze-cli
     // run_fault.rs). The child's own line is written only when the parent could not be told:
     // a signal the frame does not carry, no socket, or a failed write (then with why).
-    let told = match fault_of(struck, placed) {
-        Some(mut fault) => {
-            fault.regs = state;
-            fault.code = code_around(struck, placed);
-            fault.callers = state.and_then(|regs| callers_of(&regs, placed));
-            tell_parent(&fault)
-        }
-        None => Err("a signal the parent's report does not carry"),
-    };
-    if let Err(why) = told {
-        let mut line = Line::new();
-        report(&mut line, struck, placed, &Regions { edges }, DROPPED.load(Ordering::Relaxed));
-        let _ = io::write(Fd::STDERR, &line.bytes[..line.at]);
-        let mut said = Line::new();
-        said.put(b"blaze run: (the parent was not told where: ");
-        said.put(why.as_bytes());
-        said.put(b")\n");
-        let _ = io::write(Fd::STDERR, &said.bytes[..said.at]);
+    if let Err(why) = tell_parent_struck(struck, state, placed) {
+        write_fallback(struck, placed, why);
     }
     hand_on(sig, info.cast(), ctx);
+}
+
+/// Fallback stderr report when the parent could not be told. Marked `#[inline(never)]` so
+/// `Line` (648 bytes) never sits in `on_signal`'s hot stack frame on a 16 KiB signal stack.
+#[inline(never)]
+fn write_fallback(struck: Struck, placed: &[Row], why: &'static str) {
+    let mut edges = [0u64; REGION_NAMES.len() + 1];
+    for (i, edge) in EDGES.iter().enumerate() {
+        edges[i] = edge.load(Ordering::Relaxed);
+    }
+    let mut line = Line::new();
+    report(&mut line, struck, placed, &Regions { edges }, DROPPED.load(Ordering::Relaxed));
+    let _ = io::write(Fd::STDERR, &line.bytes[..line.at]);
+    line.at = 0;
+    line.put(b"blaze run: (the parent was not told where: ");
+    line.put(why.as_bytes());
+    line.put(b")\n");
+    let _ = io::write(Fd::STDERR, &line.bytes[..line.at]);
 }
 
 /// The parent's socket, once [`channel`] named it (-1 before: no frame is sent).
@@ -282,16 +340,20 @@ fn take_channel() -> bool {
     false
 }
 
+fn signal_of(sig: c_int) -> Option<Signal> {
+    match sig {
+        os::SIGSEGV => Some(Signal::Segv),
+        os::SIGBUS => Some(Signal::Bus),
+        os::SIGILL => Some(Signal::Ill),
+        os::SIGTRAP => Some(Signal::Trap),
+        _ => None,
+    }
+}
+
 /// Where the program struck, as the parent is told it: `None` for a signal this handler does
 /// not report. Pure, so it is tested without a signal.
 pub fn fault_of(struck: Struck, rows: &[Row]) -> Option<Fault> {
-    let signal = match struck.sig {
-        os::SIGSEGV => Signal::Segv,
-        os::SIGBUS => Signal::Bus,
-        os::SIGILL => Signal::Ill,
-        os::SIGTRAP => Signal::Trap,
-        _ => return None,
-    };
+    let signal = signal_of(struck.sig)?;
     // The registers and the code bytes are read from the delivery by the handler (`on_signal`):
     // this is pure, and the rows a test gives place nothing at their addresses.
     Some(Fault {
@@ -303,7 +365,7 @@ pub fn fault_of(struck: Struck, rows: &[Row]) -> Option<Fault> {
         address: struck.address,
         touched: spot(struck.address, rows),
         write: struck.write,
-        // Walked by the handler from the delivery's registers (`on_signal`, `callers_of`).
+        // Walked by the handler from the delivery's registers (`on_signal`, `fill_callers_into`).
         callers: None,
     })
 }
@@ -367,12 +429,23 @@ pub fn callers_from(walked: (u8, [u64; MOST_CALLERS], WalkEnd), rows: &[Row]) ->
     callers
 }
 
-/// The interrupted thread's callers, from its `fp` (x29) and `sp` (`None` off AArch64).
-fn callers_of(regs: &Regs, rows: &[Row]) -> Option<Callers> {
-    let Regs::Arm64(a) = regs else { return None };
+/// Walks the interrupted thread's callers from its `fp` (x29) and `sp` into `out` (`None` off
+/// AArch64). Marked `#[inline(never)]` so its stack frame does not overlap with `fault_frame`.
+#[inline(never)]
+fn fill_callers_into(out: &mut Option<Callers>, regs: &Regs, rows: &[Row]) {
+    let Regs::Arm64(a) = regs else {
+        *out = None;
+        return;
+    };
     let bounds = stack_bounds(a.sp);
-    let walked = walk_frames(a.x[29], bounds, &mut |at| read_stack_word(at));
-    Some(callers_from(walked, rows))
+    let (len, ret, end) = walk_frames(a.x[29], bounds, &mut |at| read_stack_word(at));
+    let dst = out.get_or_insert(Callers { len: 0, ret: [0; MOST_CALLERS], at: [None; NAMED_CALLERS], end: WalkEnd::Top });
+    dst.len = len;
+    dst.ret = ret;
+    dst.end = end;
+    for (i, slot) in dst.at.iter_mut().enumerate() {
+        *slot = if i < usize::from(len) { ret.get(i).copied().and_then(|r| return_spot(r, rows)) } else { None };
+    }
 }
 
 /// The faulting thread's stack, `lo..hi`: from its `sp` at the fault up to the stack's top, as
@@ -527,36 +600,81 @@ pub fn fault_frame<A: core::alloc::Allocator>(fault: &Fault, out: &mut std::vec:
     Up::Fault { fault: *fault }.encode(0, out).map_err(|_| "the fault's frame is longer than a frame carries")?;
     match out.len() <= FRAME_ROOM {
         true => Ok(()),
-        false => Err("the fault's frame outgrew its room on the handler's stack"),
+        false => Err("the fault's frame outgrew its room in the handler's scratch"),
     }
 }
 
-/// Writes `fault`'s frame on the parent's socket, async-signal-safely: encoded on this stack,
-/// written whole under [`CHANNEL_HELD`], each wait bounded. `Err` says why it was not.
-fn tell_parent(fault: &Fault) -> Result<(), &'static str> {
+/// Writes the fault frame for `struck` on the parent's socket, async-signal-safely: encoded in
+/// the off-stack [`Scratch`] inside [`ROWS`] under [`CHANNEL_HELD`], each wait bounded. `Err`
+/// says why it was not.
+#[inline(never)]
+fn tell_parent_struck(struck: Struck, state: Option<Regs>, placed: &[Row]) -> Result<(), &'static str> {
+    let Some(signal) = signal_of(struck.sig) else {
+        return Err("a signal the parent's report does not carry");
+    };
     let fd = CHANNEL.load(Ordering::Acquire);
     if fd < 0 {
         return Err("no socket named");
     }
-    let fd = Fd::new(fd);
-    let room = blaze_own::Inline::<FRAME_ROOM>::new();
-    let mut frame: std::vec::Vec<u8, &blaze_own::Inline<FRAME_ROOM>> = match std::vec::Vec::try_with_capacity_in(FRAME_ROOM, &room) {
-        Ok(frame) => frame,
-        Err(_) => return Err("no room on the handler's stack"),
-    };
-    fault_frame(fault, &mut frame)?;
+    let rows = ROWS.load(Ordering::Acquire);
+    if rows.is_null() {
+        return Err("no off-stack scratch mapped");
+    }
     if !take_channel() {
         return Err("the socket stayed held past 2 s");
     }
+    // SAFETY: `rows` points to `TABLE_BYTES` mapped and initialized by `install` (never
+    // unmapped), `SCRATCH_OFFSET` is aligned for `Scratch`, and `CHANNEL_HELD` (acquired by
+    // `take_channel` above) serializes exclusive access until released below.
+    let scratch = unsafe { &mut *rows.cast::<u8>().add(SCRATCH_OFFSET).cast::<Scratch>() };
+    let wrote = tell_parent_in_scratch(Fd::new(fd), scratch, signal, struck, state, placed).map_err(TellError::reason);
+    CHANNEL_HELD.store(false, Ordering::Release);
+    wrote
+}
+
+/// Fills `scratch.up` in place, encodes it into `scratch.room` (off the signal stack, without
+/// copying `Fault` by value onto the stack), and writes the whole frame to `fd`.
+#[inline(never)]
+fn tell_parent_in_scratch(
+    fd: Fd,
+    scratch: &mut Scratch,
+    signal: Signal,
+    struck: Struck,
+    state: Option<Regs>,
+    placed: &[Row],
+) -> Result<(), TellError> {
+    if let Up::Fault { fault } = &mut scratch.up {
+        fault.signal = signal;
+        fault.pc = struck.pc;
+        fault.at = struck.pc.and_then(|pc| spot(pc, placed));
+        fault.code = code_around(struck, placed);
+        fault.regs = state;
+        fault.address = struck.address;
+        fault.touched = spot(struck.address, placed);
+        fault.write = struck.write;
+        fault.callers = None;
+        if let Some(ref regs) = fault.regs {
+            fill_callers_into(&mut fault.callers, regs, placed);
+        }
+    }
+    scratch.room.reset();
+    let mut frame: std::vec::Vec<u8, &blaze_own::Inline<FRAME_ROOM>> = match std::vec::Vec::try_with_capacity_in(FRAME_ROOM, &scratch.room) {
+        Ok(frame) => frame,
+        Err(_) => return Err(TellError::NoRoom),
+    };
+    scratch.up.encode(0, &mut frame).map_err(|_| TellError::FrameTooLong)?;
+    if frame.len() > FRAME_ROOM {
+        return Err(TellError::RoomOverflow);
+    }
     let mut bytes: &[u8] = &frame;
     let mut tries = 0u32;
-    let wrote = loop {
+    loop {
         if bytes.is_empty() {
-            break Ok(());
+            return Ok(());
         }
         tries += 1;
         if tries > 64 {
-            break Err("the socket took no more bytes in 64 tries");
+            return Err(TellError::WriteStalled);
         }
         match io::write(fd, bytes) {
             Ok(n) if n > 0 => bytes = &bytes[n..],
@@ -565,11 +683,9 @@ fn tell_parent(fault: &Fault) -> Result<(), &'static str> {
                 let _ = io::poll(&mut poll, Some(Timespec { sec: 0, nsec: 100_000_000 }));
             }
             Err(Errno::Intr) => continue,
-            _ => break Err("the socket refused the frame"),
+            _ => return Err(TellError::WriteRefused),
         }
-    };
-    CHANNEL_HELD.store(false, Ordering::Release);
-    wrote
+    }
 }
 
 /// Hands the signal to the action before ours, or puts the default back: a fault then repeats
@@ -815,5 +931,137 @@ mod tests {
         let outside = said(os::SIGILL, None, BASE + 0x9000, Some(false), &[]);
         assert!(outside.contains("SIGILL: pc unknown; it read 0x7000009000, which is outside the run's reservation"), "{outside}");
         std::println!("{}", line.trim_end());
+    }
+
+    /// Runs the crash handler's `tell_parent_in_scratch` path on a real kernel-delivered
+    /// `SA_ONSTACK` signal frame (`SIGUSR1`), measures the high-water stack usage across a
+    /// `0xA5`-poisoned alternate stack, and decodes the `Up::Fault` frame from the parent end
+    /// of a real Unix `socketpair`. Linux AArch64's `std` gives threads a 16 KiB `SIGSTKSZ`
+    /// alternate stack; keeping `FRAME_ROOM` and `Fault` in `Scratch` keeps total signal-stack
+    /// usage well below 16 KiB.
+    #[test]
+    fn tell_parent_fits_a_16kib_signal_stack() {
+        use blaze_launch::wire::split;
+        use blaze_sys::posix::net::{AF_UNIX, SOCK_STREAM, socketpair};
+        use blaze_sys::posix::thread::{pthread_kill, pthread_self};
+
+        static TEST_FD: AtomicI32 = AtomicI32::new(-1);
+        static TEST_SCRATCH: AtomicPtr<Scratch> = AtomicPtr::new(ptr::null_mut());
+        static TEST_OK: AtomicBool = AtomicBool::new(false);
+
+        extern "C" fn on_usr1(_sig: c_int, info: *mut SignalInfo, ctx: *mut c_void) {
+            // SAFETY: the kernel hands an SA_SIGINFO handler a live `siginfo_t` and `ucontext_t`.
+            let (address, (pc, write)) = unsafe { ((*info).si_addr() as u64, regs(ctx)) };
+            // SAFETY: the same live `ucontext_t`.
+            let state = unsafe { thread_state(ctx) };
+            let fd = TEST_FD.load(Ordering::Acquire);
+            let scratch = TEST_SCRATCH.load(Ordering::Acquire);
+            if fd >= 0 && !scratch.is_null() {
+                let struck = Struck { sig: os::SIGTRAP, pc, address, write };
+                // SAFETY: `scratch` is uniquely owned by this test until the handler returns.
+                let res = tell_parent_in_scratch(Fd::new(fd), unsafe { &mut *scratch }, Signal::Trap, struck, state, &[]);
+                TEST_OK.store(res.is_ok(), Ordering::Release);
+            }
+        }
+
+        let pair = socketpair(AF_UNIX, SOCK_STREAM, 0);
+        assert!(pair.is_ok(), "socketpair failed: {pair:?}");
+        let Ok([parent_fd, child_fd]) = pair else { return };
+
+        let scratch_bytes = core::mem::size_of::<Scratch>();
+        // SAFETY: fresh private anonymous mapping for the test's off-stack scratch.
+        let mapped_scratch = unsafe {
+            io::mmap(None, scratch_bytes, io::Prot::READ | io::Prot::WRITE, io::MapFlags::PRIVATE | io::MapFlags::ANONYMOUS, None, 0)
+        };
+        assert!(mapped_scratch.is_ok(), "mmap scratch failed: {mapped_scratch:?}");
+        let Ok(scratch_raw) = mapped_scratch else { return };
+        let scratch = scratch_raw.as_ptr().cast::<Scratch>();
+        // SAFETY: `scratch` points to `scratch_bytes` newly mapped writable bytes.
+        unsafe { init_scratch(scratch) };
+
+        let alt_size = os::SIGSTKSZ;
+        // SAFETY: fresh private anonymous mapping for the test's alternate signal stack.
+        let mapped_alt = unsafe {
+            io::mmap(None, alt_size, io::Prot::READ | io::Prot::WRITE, io::MapFlags::PRIVATE | io::MapFlags::ANONYMOUS, None, 0)
+        };
+        assert!(mapped_alt.is_ok(), "mmap altstack failed: {mapped_alt:?}");
+        let Ok(alt_raw) = mapped_alt else { return };
+        // SAFETY: `alt_raw` maps `alt_size` writable bytes.
+        unsafe { ptr::write_bytes(alt_raw.as_ptr(), 0xA5, alt_size) };
+
+        let prev_stack_res = os::alt_stack();
+        assert!(prev_stack_res.is_ok(), "alt_stack failed: {prev_stack_res:?}");
+        let Ok(prev_stack) = prev_stack_res else { return };
+
+        let prev_action_res = os::get_action(os::SIGUSR1);
+        assert!(prev_action_res.is_ok(), "get_action(SIGUSR1) failed: {prev_action_res:?}");
+        let Ok(prev_action) = prev_action_res else { return };
+
+        let mut new_stack = os::stack_t::DISABLED;
+        new_stack.ss_sp = alt_raw.as_ptr().cast::<c_void>();
+        new_stack.ss_size = alt_size;
+        new_stack.ss_flags = 0;
+        // SAFETY: `alt_raw` is mapped read+write for `alt_size` bytes and stays mapped until restored.
+        let set_stack_ok = unsafe { os::set_alt_stack(&new_stack) }.is_ok();
+        assert!(set_stack_ok, "set_alt_stack failed");
+
+        TEST_OK.store(false, Ordering::Release);
+        TEST_FD.store(child_fd.raw(), Ordering::Release);
+        TEST_SCRATCH.store(scratch, Ordering::Release);
+
+        let mut act = os::sigaction::DEFAULT;
+        act.sa_sigaction = on_usr1 as extern "C" fn(c_int, *mut SignalInfo, *mut c_void) as sighandler_t;
+        act.sa_flags = os::SA_SIGINFO | os::SA_ONSTACK;
+        // SAFETY: `on_usr1` is async-signal-safe and a function of this binary.
+        let set_act_ok = unsafe { os::set_action(os::SIGUSR1, &act) }.is_ok();
+        assert!(set_act_ok, "set_action(SIGUSR1) failed");
+
+        // SAFETY: `pthread_self()` is this live thread and `SIGUSR1` is handled above.
+        let kill_rc = unsafe { pthread_kill(pthread_self(), os::SIGUSR1) };
+        assert_eq!(kill_rc, 0, "pthread_kill(SIGUSR1) failed");
+
+        // SAFETY: restoring the thread's prior signal action and alternate stack.
+        let _ = unsafe { os::set_action(os::SIGUSR1, &prev_action) };
+        // SAFETY: restoring the thread's prior alternate stack before unmapping `alt_raw`.
+        let _ = unsafe { os::set_alt_stack(&prev_stack) };
+        TEST_FD.store(-1, Ordering::Release);
+        TEST_SCRATCH.store(ptr::null_mut(), Ordering::Release);
+
+        assert!(TEST_OK.load(Ordering::Acquire), "tell_parent_in_scratch failed inside SIGUSR1 handler");
+
+        // Measure high-water usage of the alternate signal stack (stack grows downward).
+        // SAFETY: `alt_raw` maps `alt_size` readable bytes and is no longer the active altstack.
+        let stack_bytes = unsafe { core::slice::from_raw_parts(alt_raw.as_ptr(), alt_size) };
+        let lowest_touched = stack_bytes.iter().position(|&b| b != 0xA5).unwrap_or(alt_size);
+        let used = alt_size - lowest_touched;
+        assert!(used > 0, "signal handler did not execute on the alternate stack");
+        assert!(used < 14 * 1024, "signal handler used {used} bytes of altstack (must fit in Linux AArch64's 16 KiB SIGSTKSZ)");
+
+        // Read and decode the wire frame from the parent end of the socket pair.
+        let mut buf = [0u8; FRAME_ROOM];
+        let read_res = io::read(parent_fd, &mut buf);
+        assert!(read_res.is_ok(), "read from parent socket failed: {read_res:?}");
+        let Ok(n) = read_res else { return };
+        assert!(n > 0, "parent socket received 0 bytes");
+        let split_res = split(&buf[..n]);
+        assert!(matches!(split_res, Ok(Some(_))), "received bytes did not form a complete frame: {split_res:?}");
+        let Ok(Some((item, took))) = split_res else { return };
+        assert_eq!(took, n);
+        let decoded = Up::decode(item);
+        assert!(
+            matches!(decoded, Ok((0, Up::Fault { fault })) if fault.signal == Signal::Trap),
+            "unexpected decoded frame: {decoded:?}"
+        );
+
+        // SAFETY: both descriptors are owned by this test and no longer referenced.
+        let _ = io::close(unsafe { io::OwnedFd::from_raw(parent_fd.raw()) });
+        // SAFETY: as above.
+        let _ = io::close(unsafe { io::OwnedFd::from_raw(child_fd.raw()) });
+        // SAFETY: `alt_raw` is no longer installed as an altstack.
+        let _ = unsafe { io::munmap(alt_raw, alt_size) };
+        if let Some(nn) = core::ptr::NonNull::new(scratch.cast::<u8>()) {
+            // SAFETY: `scratch` is no longer referenced.
+            let _ = unsafe { io::munmap(nn, core::mem::size_of::<Scratch>()) };
+        }
     }
 }

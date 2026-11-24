@@ -304,7 +304,7 @@ impl Up {
     /// Writes the message as one frame onto the end of `out`. A message too long for a frame
     /// leaves `out` as it was.
     pub fn encode<A: Allocator>(&self, id: u64, out: &mut Vec<u8, A>) -> Result<(), WireError> {
-        run_frame(id, out, |to| match *self {
+        run_frame(id, out, |to| match self {
             Up::Need { need, thread } => {
                 variant(to, "Need", 2);
                 to.text("need");
@@ -312,7 +312,7 @@ impl Up {
                 to.text("thread");
                 to.uint(thread.0);
             }
-            Up::Fault { fault } => super::fault::write(to, &fault),
+            Up::Fault { fault } => super::fault::write(to, fault),
         })
     }
 

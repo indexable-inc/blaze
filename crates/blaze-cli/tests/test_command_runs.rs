@@ -443,11 +443,9 @@ fn only_dependent_test_refused(stdout: &str, code: Option<i32>) -> bool {
 #[test]
 #[cfg(target_os = "macos")]
 fn refused_first_call_does_not_hide_the_next_test() {
-    // A ref binding extends the value temporary's lifetime (Reference, "Temporary lifetime
-    // extension"). The builder supports the place initializer only (walk/matches/ref_bind.rs)
-    // and refuses this valid value initializer in walk.rs plain_binding. Keep it in the
-    // *callee* so the launcher first enters a successfully built test.
-    let lib = "fn refused_callee() { let ref _word = 7u8; }\n\
+    // A `let` binding with an `@` subpattern is refused in walk.rs `plain_binding` with
+    // `REFUSED`. Keep it in the *callee* so the launcher first enters a successfully built test.
+    let lib = "fn refused_callee() { let _word @ _ = 7u8; }\n\
                #[test] fn a_needs_callee() { refused_callee(); }\n\
                #[test] fn b_returns() {}\n";
     let said = fixture("test_command_refused_call", &[("Cargo.toml", MANIFEST), ("src/lib.rs", lib)], |dir, home| {

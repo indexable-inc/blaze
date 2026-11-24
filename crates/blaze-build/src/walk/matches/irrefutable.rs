@@ -267,7 +267,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// or-pattern, a variant of an enum with another inhabited variant or a path to a constant
     /// (`only_variant`), a slice pattern over a slice `[T]` (its length untested). The same
     /// refusals `bind_pattern_at` makes on its way.
-    fn refuse_refutable(&mut self, root: PatId) -> Result<(), BuildError> {
+    pub(super) fn refuse_refutable(&mut self, root: PatId) -> Result<(), BuildError> {
         let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(root);
         while let Some(p) = todo.pop() {
@@ -471,7 +471,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// local's field flags), `stmt` (`init` pushed as a scrutinee) and `Task::Let` (bound by
     /// `bind_let_owned`): all three answers are the same.
     pub(in crate::walk) fn let_owns_parts(&mut self, pat: PatId, init: ExprId) -> Result<bool, BuildError> {
-        if matches!(self.pat(pat)?, Pat::Bind { .. } | Pat::Wild) || self.let_borrows_place(pat, init)? {
+        if matches!(self.pat(pat)?, Pat::Bind { .. } | Pat::Wild) || self.pat_has_ref_bind(pat)? {
             return Ok(false);
         }
         // An initializer that needs no drop (a reference the pattern peels: the check records
