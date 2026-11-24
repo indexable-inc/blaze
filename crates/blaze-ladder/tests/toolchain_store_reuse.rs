@@ -60,7 +60,7 @@ fn the_second_program_reads_the_toolchain_from_the_test_store() {
 
     let some = Paths { names: second.records }.path(second.root, false, &["Option", "Some"], Ns::Value);
     assert!(some.is_ok(), "`Option::Some` from the program's root over the store's records: {some:?}");
-    assert!(std::ptr::eq(second.front.frame, second.frame), "front2 holds the frame it was given");
+    assert!(core::ptr::eq(second.front.frame, second.frame), "front2 holds the frame it was given");
 
     println!(
         "toolchain store: first {:?} in {first_ms} ms, second {:?} in {second_ms} ms, {} crates, at {}",

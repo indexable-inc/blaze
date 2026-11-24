@@ -23,7 +23,7 @@
 //! Needs the installed toolchain under `$HOME/.blaze/v2/toolchain`.
 
 use core::cell::RefCell;
-use std::fmt::Write as _;
+use core::fmt::Write as _;
 
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_mem::{Frame, Tag};

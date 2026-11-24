@@ -174,8 +174,8 @@ fn copy_loop(n: u64) -> Func<Global> {
 #[ignore = "a measurement, printed"]
 fn inline_or_call() {
     const COUNT: u64 = 10_000_000;
-    let src = vec![0x5au8; 256];
-    let mut dst = vec![0u8; 256];
+    let src = [0x5au8; 256];
+    let mut dst = [0u8; 256];
     println!("bytes  inline_ns_per_copy  call_ns_per_copy");
     for n in (8..=256).step_by(8) {
         let func = copy_loop(n);

@@ -56,15 +56,15 @@ const MOST_SECONDS: u64 = 3600;
 const TAIL: usize = 12;
 
 /// The steps of the `scripts` job that run outside the list, each with why it cannot be a row.
-const CI_ONLY_STEPS: [(&str, &str); 1] = [(
-    "ix.dev/explore reads a new profile schema",
-    "compares blaze-profile's schema version with main's head, fetched from origin: a run by hand has no main of the run to compare with",
-)];
+const CI_ONLY_STEPS: [(&str, &str); 0] = [];
 
 /// The scripts another job of the workflow calls, each with why it is not a row.
-const CI_ONLY_SCRIPTS: [(&str, &str); 2] = [
-    ("gate_changes", "the `changes` job: which tier of the workflow runs, from GitHub's comparison of the event's commits (needs GH_TOKEN)"),
+const CI_ONLY_SCRIPTS: [(&str, &str); 5] = [
     ("gate", "the runner itself, called by the `scripts` job's one gate step"),
+    ("lean_gate", "the `lean` job: builds Lean packages and verifies `#print axioms`"),
+    ("toolchain_cut", "the `cargo` job: cuts the pinned toolchain shelf before running workspace tests"),
+    ("ci_test", "the `cargo` job: runs workspace tests in parallel with bounded timeouts"),
+    ("sys_imports", "the `cargo` job: checks blaze-sys object imports across targets"),
 ];
 
 /// Why the list, the justfile or the workflow is refused (rule 19: each names the file and line).
@@ -439,16 +439,16 @@ fn selftest() {
     expect(matches!(check_justfile(&cargo), Err(GateError::Justfile { what: "runs cargo", .. })), "cargo beside the gate is refused");
     expect(check_justfile("scripts:\n    echo\n") == Err(GateError::NoLint), "no lint recipe is refused");
     expect(matches!(check_justfile("lint:\n    echo\n"), Err(GateError::Justfile { what: "does not run the gate exactly once", .. })), "a lint recipe with no gate is refused");
-    // The workflow: the job's one gate step, a uses step, a named CI-only step; each other refused.
-    let flow = "jobs:\n  changes:\n    steps:\n      - run: '\"$BLAZE_SCRIPTS/gate_changes\" x'\n  scripts:\n    name: s\n    steps:\n      - uses: actions/checkout@v7\n      # the gate\n      - name: the gate\n        env:\n          BASE: x\n        run: |\n          \"$BLAZE_SCRIPTS/gate\" \"{\\\"command\\\": \\\"run\\\"}\"\n      - name: ix.dev/explore reads a new profile schema\n        run: |\n          git fetch -q origin main\n  # the next job\n  lean:\n    steps:\n      - run: lake build\n";
-    expect(check_workflow(flow).is_ok(), "the gate step, a uses step and a CI-only step hold; another job's own commands are not read");
+    // The workflow: the job's one gate step and uses steps; any extra command is refused.
+    let flow = "jobs:\n  scripts:\n    name: s\n    steps:\n      - uses: actions/checkout@v7\n      # the gate\n      - name: the gate\n        env:\n          BASE: x\n        run: |\n          \"$BLAZE_SCRIPTS/gate\" \"{\\\"command\\\": \\\"run\\\"}\"\n  # the next job\n  lean:\n    steps:\n      - run: '\"$BLAZE_SCRIPTS/lean_gate\" x'\n";
+    expect(check_workflow(flow).is_ok(), "the gate step and uses steps hold; another job's named CI-only script holds");
     let python = flow.replace("      - uses: actions/checkout@v7\n", "      - uses: actions/checkout@v7\n      - run: uv run --frozen ruff check\n");
-    expect(matches!(check_workflow(&python), Err(GateError::Step { line: 9, what: "runs Python", .. })), "a Python step beside the gate is refused by its line");
+    expect(matches!(check_workflow(&python), Err(GateError::Step { line: 6, what: "runs Python", .. })), "a Python step beside the gate is refused by its line");
     let inline = flow.replace("      - uses: actions/checkout@v7\n", "      - uses: actions/checkout@v7\n      - run: '\"$BLAZE_SCRIPTS/rustcsites\"'\n");
     expect(matches!(check_workflow(&inline), Err(GateError::Step { what: "calls a script", .. })), "an inline script step is refused");
-    let elsewhere = flow.replace("lake build", "\"$BLAZE_SCRIPTS/docs\" check");
-    expect(matches!(check_workflow(&elsewhere), Err(GateError::Script { line: 21, .. })), "a script another job calls is refused unless named");
-    let twice = flow.replace("      - name: ix.dev", "      - run: '\"$BLAZE_SCRIPTS/gate\" \"{\\\"command\\\": \\\"run\\\"}\"'\n      - name: ix.dev");
+    let elsewhere = flow.replace("lean_gate", "docs");
+    expect(matches!(check_workflow(&elsewhere), Err(GateError::Script { line: 15, .. })), "a script another job calls is refused unless named");
+    let twice = flow.replace("  # the next job", "      - run: '\"$BLAZE_SCRIPTS/gate\" \"{\\\"command\\\": \\\"run\\\"}\"'\n  # the next job");
     expect(check_workflow(&twice) == Err(GateError::GateSteps { count: 2 }), "two gate steps are refused");
     expect(check_workflow("jobs:\n  lean:\n") == Err(GateError::NoJob), "no scripts job is refused");
     println!("{SCRIPT} selftest: ok");

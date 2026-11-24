@@ -313,6 +313,8 @@ crates/blaze-tokens/src/form.rs	TOKENS_SCHEMA	none
 crates/blaze-toolchain/src/record.rs	MAGIC	none
 crates/blaze-ty/src/portable.rs	MAGIC	none
 crates/blaze-typeck/src/checked_record.rs	CHECKED_RECORD_MAGIC	test previous_magic_bzchkd06_is_rejected
+crates/blaze-ui/src/slug.rs	BZG1_MAGIC	not persisted: static site font outline table built by gen/glyphtable.ts
+crates/blaze-ui/src/slug.rs	BZG1_VERSION	not persisted: static site font outline table built by gen/glyphtable.ts
 crates/blaze-unicode/src/lib.rs	UNICODE_VERSION	none
 crates/blaze-unicode/src/tables.rs	UNICODE_VERSION	none
 crates/blaze-unit-graph/src/record.rs	MAGIC	none

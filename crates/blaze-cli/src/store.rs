@@ -666,12 +666,29 @@ pub fn old_home<D: Driver>(cx: &Cx, home: &Home, root: &Dir<ReadWrite>, checkout
     }
     if !items.is_empty() {
         let noun = if items.len() == 1 { "folder" } else { "folders" };
-        let headline = std::format!("{} old store {noun} unused by this blaze", items.len());
+        struct StackBuf {
+            buf: [u8; 96],
+            len: usize,
+        }
+        impl core::fmt::Write for StackBuf {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let take = bytes.len().min(self.buf.len().saturating_sub(self.len));
+                if let (Some(dst), Some(src)) = (self.buf.get_mut(self.len..self.len + take), bytes.get(..take)) {
+                    dst.copy_from_slice(src);
+                    self.len += take;
+                }
+                Ok(())
+            }
+        }
+        let mut sb = StackBuf { buf: [0u8; 96], len: 0 };
+        let _ = core::fmt::write(&mut sb, format_args!("{} old store {noun} unused by this blaze", items.len()));
+        let headline = core::str::from_utf8(sb.buf.get(..sb.len).unwrap_or(&[])).unwrap_or("");
         let rows: std::vec::Vec<(&str, &str), Global> = items.iter().map(|p| (p.as_str(), "unused")).collect();
         let rendered = blaze_report::ui::Theme::PLAIN.notice_group(
             "note",
             blaze_report::palette::Token::Warning,
-            &headline,
+            headline,
             &rows,
             Some("delete when no older blaze needs them; records are rebuilt in the active store"),
         );

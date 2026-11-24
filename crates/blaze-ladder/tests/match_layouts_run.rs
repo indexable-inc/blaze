@@ -53,7 +53,7 @@
 //! stand-in), copied: a test file is its own crate.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
+use core::fmt::Write as _;
 
 use blaze_emit::{Isa, Os};
 use blaze_id::{CrateItemKey, ItemKey as LibKey};

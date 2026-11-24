@@ -30,7 +30,7 @@ macro_rules! ecs_scene {
     ($world:expr, { $($body:tt)* }) => {
         '__blaze_ecs_scene: {
             let __w = $world;
-            $crate::ecs_scene!(@stmts __w, '__blaze_ecs_scene, None, $($body)*);
+            $crate::scene_macro::ecs_scene!(@stmts __w, '__blaze_ecs_scene, None, $($body)*);
             ::core::result::Result::<(), $crate::EcsError>::Ok(())
         }
     };
@@ -47,7 +47,7 @@ macro_rules! ecs_scene {
         if let ::core::result::Result::Err(__e) = $w.set_singleton::<$comp>($val) {
             break $lbl ::core::result::Result::Err(__e);
         }
-        $crate::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
     };
 
     // -------------------------------------------------------------------------
@@ -63,9 +63,9 @@ macro_rules! ecs_scene {
         if let ::core::result::Result::Err(__err) = $w.add_tag($name, __pf_tag) {
             break $lbl ::core::result::Result::Err(__err);
         }
-        $crate::ecs_scene!(@attach_parent $w, $lbl, $parent, $name);
-        $crate::ecs_scene!(@body $w, $lbl, $name, $($inner)*);
-        $crate::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@attach_parent $w, $lbl, $parent, $name);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $name, $($inner)*);
+        $crate::scene_macro::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
     };
 
     // -------------------------------------------------------------------------
@@ -85,9 +85,9 @@ macro_rules! ecs_scene {
         if let ::core::result::Result::Err(__err) = $w.add_pair($name, __isa, $base) {
             break $lbl ::core::result::Result::Err(__err);
         }
-        $crate::ecs_scene!(@attach_parent $w, $lbl, $parent, $name);
-        $crate::ecs_scene!(@body $w, $lbl, $name, $($inner)*);
-        $crate::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@attach_parent $w, $lbl, $parent, $name);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $name, $($inner)*);
+        $crate::scene_macro::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
     };
 
     // -------------------------------------------------------------------------
@@ -101,9 +101,9 @@ macro_rules! ecs_scene {
         if let ::core::result::Result::Err(__err) = $w.set_name($var, ::core::stringify!($name)) {
             break $lbl ::core::result::Result::Err(__err);
         }
-        $crate::ecs_scene!(@attach_parent $w, $lbl, $parent, $var);
-        $crate::ecs_scene!(@body $w, $lbl, $var, $($inner)*);
-        $crate::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@attach_parent $w, $lbl, $parent, $var);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $var, $($inner)*);
+        $crate::scene_macro::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
     };
 
     // -------------------------------------------------------------------------
@@ -114,9 +114,9 @@ macro_rules! ecs_scene {
             ::core::result::Result::Ok(__e) => __e,
             ::core::result::Result::Err(__err) => break $lbl ::core::result::Result::Err(__err),
         };
-        $crate::ecs_scene!(@attach_parent $w, $lbl, $parent, $var);
-        $crate::ecs_scene!(@body $w, $lbl, $var, $($inner)*);
-        $crate::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@attach_parent $w, $lbl, $parent, $var);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $var, $($inner)*);
+        $crate::scene_macro::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
     };
 
     // -------------------------------------------------------------------------
@@ -131,9 +131,9 @@ macro_rules! ecs_scene {
         if let ::core::result::Result::Err(__err) = $w.set_name($name, ::core::stringify!($name)) {
             break $lbl ::core::result::Result::Err(__err);
         }
-        $crate::ecs_scene!(@attach_parent $w, $lbl, $parent, $name);
-        $crate::ecs_scene!(@body $w, $lbl, $name, $($inner)*);
-        $crate::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@attach_parent $w, $lbl, $parent, $name);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $name, $($inner)*);
+        $crate::scene_macro::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
     };
 
     // -------------------------------------------------------------------------
@@ -145,14 +145,14 @@ macro_rules! ecs_scene {
             ::core::result::Result::Ok(__e) => __e,
             ::core::result::Result::Err(__err) => break $lbl ::core::result::Result::Err(__err),
         };
-        $crate::ecs_scene!(@attach_parent $w, $lbl, $parent, $name);
-        $crate::ecs_scene!(@body $w, $lbl, $name, $($inner)*);
-        $crate::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@attach_parent $w, $lbl, $parent, $name);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $name, $($inner)*);
+        $crate::scene_macro::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
     };
 
     // Optional semicolon between declarations
     (@stmts $w:ident, $lbl:lifetime, $parent:tt, ; $($rest:tt)*) => {
-        $crate::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@stmts $w, $lbl, $parent, $($rest)*);
     };
 
     // -------------------------------------------------------------------------
@@ -180,7 +180,7 @@ macro_rules! ecs_scene {
         if let ::core::result::Result::Err(__err) = $w.add_tag_typed::<$tag>($ent) {
             break $lbl ::core::result::Result::Err(__err);
         }
-        $crate::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
     };
 
     // Typed relation pair: `(Rel, target);`
@@ -188,7 +188,7 @@ macro_rules! ecs_scene {
         if let ::core::result::Result::Err(__err) = $w.relate::<$rel>($ent, $tgt) {
             break $lbl ::core::result::Result::Err(__err);
         }
-        $crate::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
     };
 
     // Copyable component (propagates through `IsA` / `instantiate`): `copy Comp = expr;`
@@ -196,7 +196,7 @@ macro_rules! ecs_scene {
         if let ::core::result::Result::Err(__err) = $w.set_copy::<$comp>($ent, $val) {
             break $lbl ::core::result::Result::Err(__err);
         }
-        $crate::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
     };
 
     // Owned or general component: `Comp = expr;`
@@ -204,13 +204,13 @@ macro_rules! ecs_scene {
         if let ::core::result::Result::Err(__err) = $w.set::<$comp>($ent, $val) {
             break $lbl ::core::result::Result::Err(__err);
         }
-        $crate::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
     };
 
     // Nested child declarations inside entity body (`prefab`, `let`, `Child : Pf`, `Child { ... }`)
     (@body $w:ident, $lbl:lifetime, $ent:ident, prefab $name:ident { $($inner:tt)* } $($rest:tt)*) => {
-        $crate::ecs_scene!(@stmts $w, $lbl, ($ent), prefab $name { $($inner)* });
-        $crate::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@stmts $w, $lbl, ($ent), prefab $name { $($inner)* });
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
     };
     (@body $w:ident, $lbl:lifetime, $ent:ident, let $var:ident = $name:ident : $pf:ident { $($inner:tt)* } $($rest:tt)*) => {
         let $var: $crate::Entity = match $w.instantiate($pf) {
@@ -220,18 +220,18 @@ macro_rules! ecs_scene {
         if let ::core::result::Result::Err(__err) = $w.set_name($var, ::core::stringify!($name)) {
             break $lbl ::core::result::Result::Err(__err);
         }
-        $crate::ecs_scene!(@attach_parent $w, $lbl, ($ent), $var);
-        $crate::ecs_scene!(@body $w, $lbl, $var, $($inner)*);
-        $crate::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@attach_parent $w, $lbl, ($ent), $var);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $var, $($inner)*);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
     };
     (@body $w:ident, $lbl:lifetime, $ent:ident, let $var:ident = $name:ident { $($inner:tt)* } $($rest:tt)*) => {
         let $var: $crate::Entity = match $w.spawn_named(::core::stringify!($name)) {
             ::core::result::Result::Ok(__e) => __e,
             ::core::result::Result::Err(__err) => break $lbl ::core::result::Result::Err(__err),
         };
-        $crate::ecs_scene!(@attach_parent $w, $lbl, ($ent), $var);
-        $crate::ecs_scene!(@body $w, $lbl, $var, $($inner)*);
-        $crate::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@attach_parent $w, $lbl, ($ent), $var);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $var, $($inner)*);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
     };
     (@body $w:ident, $lbl:lifetime, $ent:ident, $name:ident : $pf:ident { $($inner:tt)* } $($rest:tt)*) => {
         #[allow(non_snake_case, unused_variables)]
@@ -242,9 +242,9 @@ macro_rules! ecs_scene {
         if let ::core::result::Result::Err(__err) = $w.set_name($name, ::core::stringify!($name)) {
             break $lbl ::core::result::Result::Err(__err);
         }
-        $crate::ecs_scene!(@attach_parent $w, $lbl, ($ent), $name);
-        $crate::ecs_scene!(@body $w, $lbl, $name, $($inner)*);
-        $crate::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@attach_parent $w, $lbl, ($ent), $name);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $name, $($inner)*);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
     };
     (@body $w:ident, $lbl:lifetime, $ent:ident, $name:ident { $($inner:tt)* } $($rest:tt)*) => {
         #[allow(non_snake_case, unused_variables)]
@@ -252,11 +252,13 @@ macro_rules! ecs_scene {
             ::core::result::Result::Ok(__e) => __e,
             ::core::result::Result::Err(__err) => break $lbl ::core::result::Result::Err(__err),
         };
-        $crate::ecs_scene!(@attach_parent $w, $lbl, ($ent), $name);
-        $crate::ecs_scene!(@body $w, $lbl, $name, $($inner)*);
-        $crate::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@attach_parent $w, $lbl, ($ent), $name);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $name, $($inner)*);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
     };
     (@body $w:ident, $lbl:lifetime, $ent:ident, ; $($rest:tt)*) => {
-        $crate::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
+        $crate::scene_macro::ecs_scene!(@body $w, $lbl, $ent, $($rest)*);
     };
 }
+
+pub use ecs_scene;

@@ -21,7 +21,7 @@ use blaze_lir::{
     builder::{DataPosition, DataReloc, MemAttrs, Param, Variadic},
     func::{Conv, DataId, RefKind},
 };
-use blaze_own::{Alloc, Vec};
+use blaze_own::{AVec, Alloc};
 
 use crate::{
     BULK_INLINE_MOST, EmitError, Isa, Named, Names, Outside, RecordEmitError,
@@ -83,8 +83,8 @@ fn sealed_of(func: View<'_>, names: &dyn Names, isa: Isa) -> Result<(Sealed<'sta
     Ok((sealed, insts))
 }
 
-fn encode(sealed: &Sealed<'static>) -> Vec<u8, Alloc<'static>> {
-    let mut out = Vec::new_in(Alloc::global());
+fn encode(sealed: &Sealed<'static>) -> AVec<'static, u8> {
+    let mut out = AVec::new_in(blaze_own::testing::heap().alloc());
     sealed.encode(&mut out);
     out
 }
@@ -260,8 +260,10 @@ fn moving_the_untracked_caller_preserves_the_record() {
         }
     }
     let placed = |source: &str| {
-        let mut code = vec![0; view.code().len()];
-        let mut relro = vec![0; view.relro().len()];
+        let mut code = AVec::new_in(blaze_own::testing::heap().alloc());
+        code.resize(view.code().len(), 0);
+        let mut relro = AVec::new_in(blaze_own::testing::heap().alloc());
+        relro.resize(view.relro().len(), 0);
         let at = At { code: 0x1000, relro: 0x2000 };
         place_positions(&view, Symbol::of_name("caller"), at, &mut Tracked, &mut code, &mut relro, |_, row| {
             assert_eq!(row.item, ITEM);

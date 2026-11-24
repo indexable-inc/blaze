@@ -15,7 +15,7 @@ use blaze_lir::{
     func::{BlockKind, Conv, RefKind, SlotKind},
     verify,
 };
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AVec, Alloc};
 use blaze_tier::{
     ARM64, Arch, Emitted, Machine, Names, Os, Outside, RoutinePlaces, Table, Tier, TierName, optimizing_tier,
     record::{encode, place, read, seal},
@@ -65,7 +65,7 @@ fn test_alloc() -> Alloc<'static> {
 /// Places an `Emitted` record into executable memory on this Apple Silicon host.
 fn load_exec(emitted: Emitted<'static>) -> (Executable, usize) {
     let sealed = seal(emitted).expect("emitted record must seal cleanly");
-    let mut bytes: AVec<'static, u8> = Vec::new_in(test_alloc());
+    let mut bytes: AVec<'static, u8> = AVec::new_in(test_alloc());
     encode(&sealed, &mut bytes);
     let view = read(&bytes).expect("encoded record must read back");
     let code_bytes = view.code().len();
@@ -563,7 +563,7 @@ fn sota_high_register_pressure_spilling_over_30_live_values_matches_evaluator_on
     let x = b.param(Ty::I64);
     let y = b.param(Ty::I64);
 
-    let mut live = std::vec::Vec::with_capacity(32);
+    let mut live = AVec::with_capacity_in(32, test_alloc());
     for k in 0..32u64 {
         let c1 = b.iconst(Ty::I64, (k * 7 + 3).into());
         let c2 = b.iconst(Ty::I64, (k * 13 + 5).into());
@@ -625,7 +625,7 @@ fn sota_high_register_pressure_spilling_over_30_live_values_matches_evaluator_on
     let n = b2.param(Ty::I64);
     let seed = b2.param(Ty::I64);
     let zero = b2.iconst(Ty::I64, 0);
-    let mut init_args = std::vec::Vec::with_capacity(31);
+    let mut init_args = AVec::with_capacity_in(31, test_alloc());
     init_args.push(zero);
     for k in 0..30u64 {
         let ck = b2.iconst(Ty::I64, (k + 1).into());
@@ -635,7 +635,7 @@ fn sota_high_register_pressure_spilling_over_30_live_values_matches_evaluator_on
 
     b2.begin(header);
     let iter = b2.param(Ty::I64);
-    let mut ring = std::vec::Vec::with_capacity(30);
+    let mut ring = AVec::with_capacity_in(30, test_alloc());
     for _ in 0..30 {
         ring.push(b2.param(Ty::I64));
     }
@@ -647,7 +647,7 @@ fn sota_high_register_pressure_spilling_over_30_live_values_matches_evaluator_on
     let next_iter = b2.binary(Op::Add, Flags::NONE, iter, one);
     // Rotate all 30 values cyclically (guaranteed spill-to-spill cycle!) while mixing `ring[0] + ring[29]`.
     let mixed = b2.binary(Op::Add, Flags::NONE, ring[0], ring[29]);
-    let mut next_args = std::vec::Vec::with_capacity(31);
+    let mut next_args = AVec::with_capacity_in(31, test_alloc());
     next_args.push(next_iter);
     for k in 1..30 {
         next_args.push(ring[k]);
@@ -945,7 +945,7 @@ fn sota_data_addr_func_addr_call_indirect_and_code_record_seal_on_hardware() {
     let has_call = code_rec.sites.iter().any(|s| s.kind == blaze_code::record::SiteKind::Call);
     assert!(has_load && has_relro && has_call, "expected Load, Relro, and Call sites in CodeRecord");
     let sealed_rec = code_rec.seal().expect("Sota CodeRecord must seal without error");
-    let mut rec_bytes: AVec<'static, u8> = Vec::new_in(Alloc::global());
+    let mut rec_bytes: AVec<'static, u8> = AVec::new_in(test_alloc());
     sealed_rec.encode(&mut rec_bytes);
     let rec_view = blaze_code::record::CodeView::read(&rec_bytes).expect("encoded CodeRecord must read back");
     blaze_code::unwind::read(rec_view).expect("Sota CodeRecord unwind info must validate cleanly");
@@ -1007,7 +1007,7 @@ fn sota_data_addr_func_addr_call_indirect_and_code_record_seal_on_hardware() {
     }
     let emitted_c = Sota::standalone().emit(v, &ExtCNames, MAC_ARM64, Alloc::global()).unwrap();
     let sealed_c = seal(emitted_c).expect("emitted bzcode08 record must seal cleanly");
-    let mut bytes_c: AVec<'static, u8> = Vec::new_in(Alloc::global());
+    let mut bytes_c: AVec<'static, u8> = AVec::new_in(test_alloc());
     encode(&sealed_c, &mut bytes_c);
     let view_c = read(&bytes_c).expect("encoded bzcode08 must read back");
     let mut done_c: Result<(), PlaceError> = Ok(());
@@ -1143,7 +1143,7 @@ mod std_readiness_tests {
         }
         blaze_tier::record::declare(&mut emitted, &BoundDeclares).expect("declare");
         let sealed = seal(emitted).expect("seal");
-        let mut bytes: AVec<'static, u8> = Vec::new_in(test_alloc());
+        let mut bytes: AVec<'static, u8> = AVec::new_in(test_alloc());
         encode(&sealed, &mut bytes);
         let view = read(&bytes).expect("read");
         let code_bytes = view.code().len();
@@ -1256,7 +1256,7 @@ mod std_readiness_tests {
         byval_param.kind = ParamKind::Byval;
         byval_param.facts = Facts { size: 48, align: 3, ..Facts::default() };
 
-        let mut callee_params: AVec<'static, Param> = Vec::new_in(alloc);
+        let mut callee_params: AVec<'static, Param> = AVec::new_in(alloc);
         for _ in 0..10 {
             callee_params.push(Param::of(Ty::I64));
         }
@@ -1271,12 +1271,12 @@ mod std_readiness_tests {
             b.set_signature(sig);
             let e = b.create_block(BlockKind::Normal);
             b.begin(e);
-            let mut gprs = Vec::new_in(alloc);
+            let mut gprs = AVec::new_in(alloc);
             for _ in 0..10 {
                 gprs.push(b.param(Ty::I64));
             }
             let bv_ptr = b.param(Ty::PTR);
-            let mut fps = Vec::new_in(alloc);
+            let mut fps = AVec::new_in(alloc);
             for _ in 0..10 {
                 fps.push(b.param(Ty::F64));
             }
@@ -1327,7 +1327,7 @@ mod std_readiness_tests {
             let e = b.create_block(BlockKind::Normal);
             b.begin(e);
             let src_struct = b.param(Ty::PTR);
-            let mut args = Vec::new_in(alloc);
+            let mut args = AVec::new_in(alloc);
             for k in 1u64..=10 {
                 args.push(b.iconst(Ty::I64, u128::from(k * 10)));
             }
@@ -1435,7 +1435,7 @@ mod std_readiness_tests {
         assert_eq!(rec.positions[0].field, PositionField::Line);
         assert_eq!(rec.positions[0].site, 42);
         let sealed = rec.seal().expect("Sota CodeRecord with words+positions+TLS must seal cleanly");
-        let mut enc_bytes: AVec<'static, u8> = Vec::new_in(alloc);
+        let mut enc_bytes: AVec<'static, u8> = AVec::new_in(alloc);
         sealed.encode(&mut enc_bytes);
         let view = CodeView::read(&enc_bytes).expect("encoded CodeRecord must read back");
         assert_eq!(view.words(), 1);
@@ -1495,7 +1495,7 @@ mod std_readiness_tests {
         )
         .expect("Sota must emit Invoke/Resume/Cleanup cleanly");
         let sealed = rec.seal().expect("Sota unwind CodeRecord must seal cleanly");
-        let mut bytes: AVec<'static, u8> = Vec::new_in(alloc);
+        let mut bytes: AVec<'static, u8> = AVec::new_in(alloc);
         sealed.encode(&mut bytes);
         let view = CodeView::read(&bytes).expect("read back");
         assert_eq!(view.name(Symbol::of_name("_Unwind_Resume")), Some("_Unwind_Resume"));
@@ -1634,7 +1634,7 @@ mod std_readiness_tests {
             b.set_signature(sig);
             let e = b.create_block(BlockKind::Normal);
             b.begin(e);
-            let mut gprs = Vec::new_in(alloc);
+            let mut gprs = AVec::new_in(alloc);
             for _ in 0..7 {
                 gprs.push(b.param(Ty::I64));
             }
@@ -1740,7 +1740,7 @@ mod std_readiness_tests {
         let em_unscaled = Sota::standalone()
             .emit(verify(unscaled_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
             .expect("Sota emits unscaled MemUxtwIdx load");
-        let mut words_unscaled = blaze_own::Vec::new_in(alloc);
+        let mut words_unscaled = blaze_own::AVec::new_in(alloc);
         for c in em_unscaled.code.as_slice().chunks_exact(4) {
             words_unscaled.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
         }
@@ -1784,7 +1784,7 @@ mod std_readiness_tests {
         let em_scaled = Sota::standalone()
             .emit(verify(scaled_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
             .expect("Sota emits scaled MemUxtwIdx load");
-        let mut words_scaled = blaze_own::Vec::new_in(alloc);
+        let mut words_scaled = blaze_own::AVec::new_in(alloc);
         for c in em_scaled.code.as_slice().chunks_exact(4) {
             words_scaled.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
         }
@@ -1806,7 +1806,7 @@ mod std_readiness_tests {
     fn sota_ubfx_and_loop_align() {
         let alloc = blaze_own::testing::heap().alloc();
         let decode_words = |bytes: &[u8]| -> AVec<'static, u32> {
-            let mut out = Vec::with_capacity_in(bytes.len() / 4, alloc);
+            let mut out = AVec::with_capacity_in(bytes.len() / 4, alloc);
             for c in bytes.chunks_exact(4) {
                 out.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
             }
