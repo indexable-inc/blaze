@@ -70,7 +70,7 @@ blaze-launcher	60	1	0	13
 blaze-lex	14	0	0	16
 blaze-lint	17	0	0	31
 blaze-lint-defs	0	0	3	16
-blaze-lir	0	0	31	135
+blaze-lir	0	0	31	134
 blaze-lower	17	0	0	15
 blaze-malloc	4	0	3	20
 blaze-manifest	151	1	0	775

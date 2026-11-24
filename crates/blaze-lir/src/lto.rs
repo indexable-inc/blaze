@@ -196,24 +196,49 @@ pub fn tarjan_sccs<A: Allocator + Copy>(
 }
 
 /// Internal `Bodies` overlay that serves the module's latest optimized `Func`s for intra-module
-/// callees while forwarding external bodies, targets, data, and source positions to `external`.
+/// callees while transitively resolving `ImportedRef`s added in earlier SCC passes and forwarding
+/// external bodies, targets, data, and source positions to `external`.
 struct ModuleBodies<'a, A: Allocator> {
     bodies: &'a [ModuleBody<A>],
+    imports: &'a [Vec<ImportedRef, A>],
     id_to_index: &'a Map<BodyId, usize, FixedState, A>,
     external: &'a dyn Bodies,
 }
 
+impl<A: Allocator> ModuleBodies<'_, A> {
+    fn resolve_origin(&self, mut from: BodyId, mut reference: RefId) -> (BodyId, RefId) {
+        for _ in 0..32 {
+            let Some(&idx) = self.id_to_index.get(&from) else {
+                break;
+            };
+            let Some(body_imports) = self.imports.get(idx) else {
+                break;
+            };
+            let Some(imp) = body_imports.iter().find(|r| r.caller_ref == reference) else {
+                break;
+            };
+            from = imp.source_body;
+            reference = imp.source_ref;
+        }
+        (from, reference)
+    }
+}
+
 impl<A: Allocator> Bodies for ModuleBodies<'_, A> {
     fn callee(&self, from: BodyId, reference: RefId) -> Option<(BodyId, View<'_>)> {
-        let (callee_id, ext_view) = self.external.callee(from, reference)?;
-        if let Some(&idx) = self.id_to_index.get(&callee_id) {
-            return Some((callee_id, self.bodies[idx].func.view()));
+        let (orig_from, orig_ref) = self.resolve_origin(from, reference);
+        let (callee_id, ext_view) = self.external.callee(orig_from, orig_ref)?;
+        if let Some(&idx) = self.id_to_index.get(&callee_id)
+            && let Some(mb) = self.bodies.get(idx)
+        {
+            return Some((callee_id, mb.func.view()));
         }
         Some((callee_id, ext_view))
     }
 
     fn target(&self, from: BodyId, reference: RefId) -> Option<Target> {
-        self.external.target(from, reference)
+        let (orig_from, orig_ref) = self.resolve_origin(from, reference);
+        self.external.target(orig_from, orig_ref)
     }
 
     fn datum(&self, id: DatumId) -> Option<Datum<'_>> {
@@ -350,7 +375,12 @@ pub fn lto_optimize_module<A: Allocator + Copy>(
             let idx = node as usize;
             let body_id = module[idx].id;
             let inlined = {
-                let overlay = ModuleBodies { bodies: &module, id_to_index: &id_to_index, external };
+                let overlay = ModuleBodies {
+                    bodies: &module,
+                    imports: &imports,
+                    id_to_index: &id_to_index,
+                    external,
+                };
                 inline_guided_with_cache(
                     module[idx].func.view(),
                     body_id,
