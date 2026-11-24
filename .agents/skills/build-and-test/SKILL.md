@@ -9,20 +9,21 @@ description: "How blaze is built, checked, tested and measured, and how a lane r
 
 ## blaze-builds-blaze (rule 2)
 
-Compile and run every Blaze app, demo, example, proof, and Blaze-edition (`edition =
-"blaze-2026.11"`) program with `blaze` (`blaze run`, `blaze check`, `blaze test`, `blaze export`),
-NEVER with `rustc` or `cargo run --example`. Never write Rust-side bridge macros (e.g.
-`reflect_struct!`) or manual `#[derive]` workarounds just so a Blaze demo compiles under `rustc`:
-dogfood `blaze` itself using Blaze's real language features (auto-`Copy` all-`pub` structs, `inline
-for` comptime reflection, structural records/unions), and when `blaze` hits a bug or missing piece,
-fix it in `blaze` immediately (`build-the-missing-piece`). Interim scope of `cargo` (by the owner's
-decision of 2026-11-11): `cargo` with the pinned nightly (`pins/toolchain`) is used ONLY as the
-dev-loop builder for blaze's own compiler crates (`cargo +nightly-<date> check -p blaze-engine`,
-`cargo +nightly-<date> build --release -p blaze-cli --bin blaze`). Even there: blaze must keep
-building blaze (a self-build runs daily and before a release, stage 2 equal to stage 3); every claim
+Use `blaze` (`blaze check`, `blaze test crates/<crate>`, `blaze run`, `blaze export`) for every
+Blaze app, demo, example, proof, Blaze-edition (`edition = "blaze-2026.11"`) program, AND inner-loop
+edits/tests on blaze's own crates — never cold `cargo`/`rustc` builds! Never write Rust-side bridge
+macros (e.g. `reflect_struct!`) or manual `#[derive]` workarounds just so a Blaze demo compiles
+under `rustc`: dogfood `blaze` itself using Blaze's real language features (auto-`Copy` all-`pub`
+structs, `inline for` comptime reflection, structural records/unions), and when `blaze` hits a bug
+or missing piece on its own crates or on a demo, fix it in `blaze` immediately
+(`build-the-missing-piece`). Interim scope of `cargo` (only for `gate` scripts or a crate `blaze`
+cannot yet self-test/self-host): NEVER cold-build into an empty `CARGO_TARGET_DIR=/tmp/...`
+(recompiling 300+ crates wastes 15–20 min per lane); instead either share the warm `target/` behind
+the build lock or instant-clone it on APFS (`cp -cR <warm-target> <lane-target>`, `<1 s`, 0 extra
+disk, deleted on merge) with `CARGO_BUILD_JOBS=4` so incremental rebuilds stay seconds. Scope `blaze
+test` by crate directory (`blaze test crates/<crate> -- <filter>`), never `-p <pkg>`. Every claim
 about what blaze compiles or runs is measured with a release `blaze`, never with `cargo` standing in
-for it; and any failure of blaze on blaze or on a dogfooded program is ranked work, never bypassed
-by falling back to `rustc`. Never sccache.
+for it. Never sccache.
 
 See [docs/contributing.md](../../../docs/contributing.md).
 
