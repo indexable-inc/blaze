@@ -1376,3 +1376,97 @@ fn struct_update_bases() {
     std::println!("struct_update_bases: temporary {temporary:?}, copy {copy:?}, written {written:?}, taken {taken:?}");
     assert!(taken.as_ref().is_ok_and(|g| g.iter().any(|l| l.contains("UseOfMoved"))), "{taken:?}");
 }
+
+/// Compound assignment evaluates its RHS before its LHS (`starts[b + 1] += starts[b]` in
+/// `blaze-lir/src/coroutine.rs:622`): settling `rhs` ends the shared borrow from `Index` before
+/// `IndexMut` borrows the container mutably.
+#[test]
+fn assign_op_evaluates_rhs_before_lhs_on_index_mut() {
+    use blaze_typeck::{BinOp, Expr, LangItem};
+    let mut fx = Fx::new();
+    let idx_tr = fx.tr("Index", 2, vec![], &["Output"]);
+    let idx_mut_tr = fx.tr("IndexMut", 2, vec![], &[]);
+    let add_assign_tr = fx.tr("AddAssign", 2, vec![], &[]);
+    fx.lang(LangItem::Index, idx_tr);
+    fx.lang(LangItem::IndexMut, idx_mut_tr);
+    fx.lang(LangItem::AddAssign, add_assign_tr);
+    let u32_ = fx.u32();
+    let usize_ = fx.usize();
+    let unit = fx.unit();
+    let vec_def = fx.strukt("VecU32", 0, &[]);
+    let vec_u32 = fx.adt(vec_def, &[]);
+    fx.imp("impl Index<usize> for VecU32", 0, vec_u32, Some((idx_tr, &[usize_])), &[("Output", u32_)], vec![]);
+    fx.imp("impl IndexMut<usize> for VecU32", 0, vec_u32, Some((idx_mut_tr, &[usize_])), &[], vec![]);
+    fx.imp("impl AddAssign<u32> for u32", 0, u32_, Some((add_assign_tr, &[u32_])), &[], vec![]);
+    let f = fx.func("f", 0, &[vec_u32, usize_, usize_], unit, vec![]);
+    fx.finish();
+
+    let mut b = Bb::new();
+    let v = b.param("v");
+    let i = b.param("i");
+    let j = b.param("j");
+    let v1 = b.local(v);
+    let i1 = b.local(i);
+    let lhs = b.bool();
+    b.exprs[lhs.ix()] = Expr::Index { base: v1, index: i1 };
+    let v2 = b.local(v);
+    let j1 = b.local(j);
+    let rhs = b.bool();
+    b.exprs[rhs.ix()] = Expr::Index { base: v2, index: j1 };
+    let op = b.bool();
+    b.exprs[op.ix()] = Expr::AssignOp { op: BinOp::Add, lhs, rhs };
+    let st = b.semi(op);
+    let root = b.block(&[st], None);
+    let got = findings_with(&fx, &b, f, root, &Plain, Plant::None);
+    assert!(got.as_ref().is_ok_and(|g| g.is_empty()), "v[i] += v[j] must have no borrow conflict: {got:?}");
+}
+
+/// Shared indexing of a `Freeze` constant array (`&INFO[self as usize]` in
+/// `blaze-lir/src/op.rs:183`) borrows `'static` storage rather than a stack temporary;
+/// negative control: indexing a local array still fails when returned as `&'static`.
+#[test]
+fn shared_index_of_immutable_static_returns_static() {
+    use blaze_typeck::{Expr, PNode};
+    let mut fx = Fx::new();
+    let u32_ = fx.u32();
+    let usize_ = fx.usize();
+    let four = fx.ty(PNode::ConstValue { ty: usize_, bits: 4 });
+    let arr = fx.ty(PNode::Array(u32_, four));
+    let r_u32 = fx.r(Mutbl::Not, u32_);
+    fx.konst("INFO", arr);
+    let good = fx.func("good", 0, &[usize_], r_u32, vec![]);
+    let bad = fx.func("bad", 0, &[arr, usize_], r_u32, vec![]);
+    fx.finish();
+
+    let mut sigs = Sigs::new();
+    sigs.add(good, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[usize_], output: r_u32, slots: &[Region::Static] });
+    sigs.add(bad, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[arr, usize_], output: r_u32, slots: &[Region::Static] });
+
+    // Positive: `fn good(i: usize) -> &'static u32 { &INFO[i] }`
+    let mut bg = Bb::new();
+    let gi = bg.param("i");
+    let info = bg.path(&["INFO"]);
+    let lgi = bg.local(gi);
+    let idx = bg.bool();
+    bg.exprs[idx.ix()] = Expr::Index { base: info, index: lgi };
+    let r = bg.borrow(Mutbl::Not, idx);
+    let root_g = bg.block(&[], Some(r));
+    let got_g = findings_laid(&fx, &bg, good, root_g, &sigs, Plant::None);
+    assert!(got_g.as_ref().is_ok_and(|g| g.is_empty()), "&INFO[i] must return &'static cleanly: {got_g:?}");
+
+    // Negative control: `fn bad(a: [u32; 4], i: usize) -> &'static u32 { &a[i] }`
+    let mut bb = Bb::new();
+    let ba = bb.param("a");
+    let bi = bb.param("i");
+    let lba = bb.local(ba);
+    let lbi = bb.local(bi);
+    let idx_b = bb.bool();
+    bb.exprs[idx_b.ix()] = Expr::Index { base: lba, index: lbi };
+    let rb = bb.borrow(Mutbl::Not, idx_b);
+    let root_b = bb.block(&[], Some(rb));
+    let got_b = findings_laid(&fx, &bb, bad, root_b, &sigs, Plant::None);
+    assert!(
+        got_b.as_ref().is_ok_and(|g| !g.is_empty()),
+        "CONTROL: &local_arr[i] must NOT return &'static: {got_b:?}",
+    );
+}

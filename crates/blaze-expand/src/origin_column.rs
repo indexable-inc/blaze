@@ -64,39 +64,44 @@ impl TextMark {
     }
 
     /// The stream mark a token of a text keeps when the text is lexed again
-    /// ([`crate::tokens::lex_marked`]): this mark's site and edition, of an earlier expansion
-    /// ([`crate::MarkOf::Outer`], never `This`: a call's input holds no mark of the call's own,
-    /// `ExpandError::Unsealed`), named by a key hashed from the mark's bytes (the column does
-    /// not keep which expansion wrote the token), and TRANSPARENT.
+    /// ([`crate::tokens::lex_marked`]): this mark's site, transparency and edition, of an earlier
+    /// expansion ([`crate::MarkOf::Outer`], never `This`: a call's input holds no mark of the
+    /// call's own, `ExpandError::Unsealed`), named by a key hashed from the mark's bytes.
     ///
-    /// Why transparent: a word keeps through the round trip the syntax context the text's own
-    /// lowering gives it. That lowering keys a local or a label of the item's text by its name
-    /// alone (blaze-lower machine.rs `hygiene_at` is 0 for every word of the item's text), so a
-    /// binder the expansion wrote there (`let mut config = ..;`, proptest's `proptest!`) and its
-    /// use inside an inner call's input (`$crate::proptest_helper!(.. config ..)`) must have equal
-    /// [`crate::local_hygiene`]: 0, which only a transparent mark gives (the Reference, "Macros
-    /// By Example", "Hygiene": locals resolve at the definition site's context, and both tokens
-    /// are of one expansion). A semi-opaque mark here made the use a different local and every
-    /// such body E0425 (tempo a1630: 590 errors in `proptest!`, `hardfork!`, `paste!`,
-    /// `bitflags!` bodies). What the mark still gives is all a non-opaque mark ever gave a path:
-    /// `$crate` (its site's crate, blaze-scope crate_roots.rs), the edition, and a path read at
-    /// the call. A token the INNER macro writes gets that call's own mark over it, so the inner
-    /// macro's locals stay hidden from the outer's tokens.
-    ///
-    /// GAP (named): an opaque (`macro`) mark is made transparent too, so a path of an item text a
-    /// `macro` wrote, handed through an inner call's input, is read at the call and not at the
-    /// `macro`'s module (as before marks were kept on inputs). Keeping it needs the item text's
-    /// own locals keyed by their marks (`hygiene_at` from the mark column), which is the end
-    /// state of item-text hygiene: one rule for both sides.
+    /// Keeping `self.transparency` pairs with [`Self::local_hygiene`] in `blaze-lower`
+    /// (`Machine::hygiene_at`): both the item's own tokens and any token re-lexed into an inner
+    /// macro call compute the exact same [`crate::local_hygiene`], so an item-level macro's own
+    /// bindings match across inner calls (`proptest!`) while call-site parameters stay
+    /// hygienically separate from def-site template identifiers (`cold!` in `blaze-sys`).
     pub fn as_outer_mark(self) -> crate::tokens::Mark {
         let mut hasher = blaze_ids::Hasher::new("blaze v2 text mark expansion 1");
         hasher.part(&self.to_bytes());
         crate::tokens::Mark {
             of: crate::tokens::MarkOf::Outer(hasher.finish()),
-            transparency: crate::Transparency::Transparent,
+            transparency: self.transparency,
             edition: self.edition,
             site: self.site,
         }
+    }
+
+    /// The local hygiene of a word carrying this mark in an item's own text, matching
+    /// [`crate::local_hygiene`] for a single `CtxNode` of [`Self::as_outer_mark`]: 0 when
+    /// transparent, otherwise the same non-zero hash.
+    pub fn local_hygiene(self) -> u64 {
+        if self.transparency == Transparency::Transparent {
+            return 0;
+        }
+        let mark = self.as_outer_mark();
+        let crate::tokens::MarkOf::Outer(key) = mark.of else {
+            return 0;
+        };
+        let mut h = blaze_ids::Hasher::new(crate::body::LOCAL_HYGIENE_DOMAIN);
+        h.id(&key);
+        h.part(&[u8::from(mark.transparency == Transparency::Opaque)]);
+        let id = h.finish();
+        let mut first = [0u8; 8];
+        first.copy_from_slice(&id.0[..8]);
+        u64::from_le_bytes(first) | 1
     }
 
     /// The mark's [`MARK`] bytes, little-endian: the crate key (32), the module flag u32 (0 none,

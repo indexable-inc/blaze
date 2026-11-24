@@ -91,8 +91,8 @@ pub use rules::unsafety::Undecided;
 pub use stalled::{Stalled, StalledDecision, StalledError, check_deferring, decide_stalled, decide_stalled_listed};
 pub use asks::{Ask, AskLog, Clock, Order, QUESTION_KINDS, R_THRESHOLD, Restarts, Solve, Tally, entries_histogram, question_kind, restarts};
 pub use body::{
-    Anchor, Arm, BinOp, BindAnn, BodyPath, BodyView, Capture, CoroutineKind, Expr, FieldInit, FieldPat, FmtTrait, FmtUse,
-    IntSuffix, Lit, Pat, Segment, Stmt, StructBase, UnOp,
+    Anchor, Arm, BinOp, BindAnn, BodyPath, BodyView, Capture, ClosureParamRegion, CoroutineKind, Expr, FieldInit, FieldPat,
+    FmtTrait, FmtUse, IntSuffix, Lit, Pat, Segment, Stmt, StructBase, UnOp, WrittenRegion,
 };
 pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, CapturePlaceRows, CaptureProjs, Captures, Checked, Closures, ConstArgs, DefaultFields, ExprDefs, Fields, FruFields, PatConstArgs, PatDefs, UnionPat, UnionPats};
 pub use columns::CoroutineWitness;

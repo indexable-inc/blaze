@@ -96,3 +96,48 @@ fn the_other_order_leaves_the_variable_to_the_argument_and_fails() {
 fn a_source_that_does_not_coerce_to_the_fixed_target_is_e0308() {
     assert_eq!(codes(2, "need", false), std::vec![DiagCode::Mismatch]);
 }
+
+/// Coercing an unnormalized projection (`<Vec<&&str> as Index<usize>>::Output`, which normalizes
+/// to `&&str`) to `&str` structurally normalizes the alias first so deref coercion runs
+/// (`blaze-build/src/tests/nounwind.rs:109`: `words(calls[0])`). Negative control: when the
+/// projection normalizes to `&u8`, coercing to `&str` still fails.
+#[test]
+fn deref_coercion_normalizes_source_alias_before_borrow_coercion() {
+    let mut fx = Fx::new();
+    let idx_tr = fx.tr("Index", 2, Default::default(), &["Output"]);
+    fx.lang(crate::ids::LangItem::Index, idx_tr);
+    let str_ = fx.ty(PNode::Str);
+    let r_str = fx.r(Mutbl::Not, str_);
+    let rr_str = fx.r(Mutbl::Not, r_str);
+    let u8_ = fx.u8();
+    let r_u8 = fx.r(Mutbl::Not, u8_);
+    let usize_ = fx.usize();
+    let unit = fx.unit();
+    let holder_ok = fx.strukt("HolderOk", 0, &[]);
+    let holder_ok_ty = fx.adt(holder_ok, &[]);
+    let holder_bad = fx.strukt("HolderBad", 0, &[]);
+    let holder_bad_ty = fx.adt(holder_bad, &[]);
+    fx.imp("impl Index<usize> for HolderOk", 0, holder_ok_ty, Some((idx_tr, &[usize_])), &[("Output", rr_str)], Default::default());
+    fx.imp("impl Index<usize> for HolderBad", 0, holder_bad_ty, Some((idx_tr, &[usize_])), &[("Output", r_u8)], Default::default());
+    fx.func("words", 0, &[r_str], unit, Default::default());
+    let f_ok = fx.func("f_ok", 0, &[holder_ok_ty, usize_], unit, Default::default());
+    let f_bad = fx.func("f_bad", 0, &[holder_bad_ty, usize_], unit, Default::default());
+    fx.finish();
+
+    let run = |owner: ItemKey| -> usize {
+        let mut b = Bb::new();
+        let h = b.param("h");
+        let i = b.param("i");
+        let words = b.path(&["words"]);
+        let lh = b.local(h);
+        let li = b.local(i);
+        let indexed = b.e(crate::body::Expr::Index { base: lh, index: li });
+        let call = b.call(words, &[indexed]);
+        let root = b.block(&[], Some(call));
+        let checked = check_body(&fx, &b, owner, root, Plant::None, InferPlant::None);
+        checked.diags.len()
+    };
+
+    assert_eq!(run(f_ok), 0, "HolderOk[i] (&&str) coerces to &str");
+    assert!(run(f_bad) > 0, "CONTROL: HolderBad[i] (&u8) must not coerce to &str");
+}

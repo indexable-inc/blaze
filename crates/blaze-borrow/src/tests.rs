@@ -1688,3 +1688,157 @@ fn dynamic_in_binder_skolemizes_rigidly_against_caller() {
     assert!(reach(&rec, 3).contains(&ph) && reach(&rec, ph).contains(&3), "slot 3 must equate with placeholder {ph}: {:?}", rec.subsets);
     assert!(rejects(&rec, &[], &[3, ph]), "CONTROL: a caller universal at slot 3 cannot equal rigid placeholder {ph}");
 }
+
+/// RFC 1214 implied alias outlives from `Owner::sig` (`blaze_own::vec::Index::index` shape):
+/// `fn index<'a, T, I: SliceIndex<[T]>>(&'a self, index: I) -> &'a I::Output` calling
+/// `<[T] as Index<I>>::index(&'call [T], index) -> &'call I::Output`.
+/// - With `Owner::sig` carrying `&'a I::Output`, `I::Output: 'call` is proved via `'a: 'call`
+///   without constraining `Param(1)` (`I`) at all.
+/// - Negative control (rule 23): without `Owner::sig`, `I::Output: 'call` falls back to
+///   demanding `Param(1): 'call` (`ρ_I: 'call`).
+#[test]
+fn implied_alias_outlives_from_owner_signature() {
+    const F_INDEX: ItemKey = ItemKey(0x0211);
+    const T_INDEX: ItemKey = ItemKey(0x0311);
+    const T_SLICE_INDEX: ItemKey = ItemKey(0x0312);
+    const OUTPUT: Name = Name::of("Output");
+
+    let mut t = Tys::new();
+    let p0 = t.param(0); // T
+    let p1 = t.param(1); // I
+    let slice_t = t.n(PNode::Slice(p0));
+    let r_slice = t.r(slice_t);
+    let idx_out = t.alias(T_INDEX, OUTPUT, &[p0, p1]);
+    let slice_idx_out = t.alias(T_SLICE_INDEX, OUTPUT, &[p1, slice_t]);
+    let r_idx_out = t.r(idx_out);
+    let r_slice_idx_out = t.r(slice_idx_out);
+    let sig_list = t.list(&[r_slice, p1, r_slice_idx_out]);
+    let fn_sig_ty = t.n(PNode::FnPtr(sig_list, FnPtrHeader::RUST));
+
+    // Impl `<[T] as Index<I>>::Output = <I as SliceIndex<[T]>>::Output`
+    let header = t.extrait(T_INDEX, &[slice_t, p1]);
+    let sel = Sel {
+        rows: SVec::from([(
+            T_INDEX,
+            Some(OUTPUT),
+            Selection::Impl {
+                head: ImplHead { imp: IMP, lifetimes: 0, types: 2, trait_ref: ty(header, NONE) },
+                value: Some(ImplValue { value: ty(slice_idx_out, NONE), gat_lifetimes: 0 }),
+            },
+        )]),
+    };
+
+    // Callee: `fn index<'0, Self, Idx>(&'0 self, i: Idx) -> &'0 <Self as Index<Idx>>::Output`
+    // `'0` is late-bound (Param(0) marked late).
+    let p = params(1, &[0]);
+    let inputs = [ty(t.r(p0), P0), ty(p1, NONE)];
+    let sig = Sig { item: F_INDEX, params: ParamsView::of(&p), inputs: &inputs, output: ty(r_idx_out, P0), clauses: &[] };
+    let facts = Facts::default()
+        .trait_(T_INDEX, 0)
+        .alias(T_INDEX, OUTPUT, 0)
+        .trait_(T_SLICE_INDEX, 0)
+        .alias(T_SLICE_INDEX, OUTPUT, 0);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+    let types = [arg(slice_t, 0, 0), arg(p1, 0, 0)];
+    let generics = GenericArgs { lifetimes: SlotRange::EMPTY, types: &types };
+    // Caller slots: 0 is `&'a [T]` (owner universal `Origin(10)`), 1 is destination `&'a I::Output`.
+    let args = [arg(r_slice, 0, 1), arg(p1, 0, 0)];
+    let dest = arg(r_slice_idx_out, 1, 1);
+
+    struct WithSig<'s> {
+        sig: Option<Typed<'s>>,
+    }
+    impl Owner for WithSig<'_> {
+        fn item(&self) -> ItemKey { OWNER }
+        fn universal(&self, r: Region) -> Option<Origin> {
+            (r == Region::Param(0)).then_some(Origin(10))
+        }
+        fn param(&self, p: u32) -> Option<Origin> { Some(Origin(20 + p)) }
+        fn bound(&self, _: u32, _: ItemKey) -> Option<Typed<'_>> { None }
+        fn sig(&self) -> Option<Typed<'_>> { self.sig }
+        fn body_params(&self, _: PTy) -> Option<&[u32]> { None }
+    }
+
+    const SIG_COL: &[Region] = &[Region::Param(0), Region::Param(0)];
+    let with_sig = WithSig { sig: Some(ty(fn_sig_ty, SIG_COL)) };
+    let (res, rec) = run(&cols, &sel, &with_sig, 2, Callee::Fn(sig), generics, &args, dest);
+    assert_eq!(res, Ok(()), "with implied Owner::sig bound: {res:?}");
+    assert!(
+        !rec.subsets.iter().any(|&(a, _)| a == 21),
+        "I (Origin(21)) must NOT be constrained when Owner::sig implies `&'a I::Output`: {:?}",
+        rec.subsets,
+    );
+    assert!(
+        rec.subsets.iter().any(|&(a, _)| a == 10),
+        "implied `'a` (Origin(10)) must constrain the call's lifetime: {:?}",
+        rec.subsets,
+    );
+
+    // Negative control: without Owner::sig, `I` (Origin(21)) IS constrained.
+    let without_sig = WithSig { sig: None };
+    let (res, rec) = run(&cols, &sel, &without_sig, 2, Callee::Fn(sig), generics, &args, dest);
+    assert_eq!(res, Ok(()));
+    assert!(
+        rec.subsets.iter().any(|&(a, _)| a == 21),
+        "CONTROL: without Owner::sig, `I` (Origin(21)) must be constrained: {:?}",
+        rec.subsets,
+    );
+}
+
+/// `BinderCtx::Dynamic(Co)` Skolemization (`blaze_sim::check::replace_hook` shape):
+/// passing `&dyn Tr<'?1>` to `fn f<'r>(x: &'r (dyn for<'a> Tr<'a> + 'r))` Skolemizes the
+/// supertype's higher-ranked `dyn` binder via `Constraints::dyn_placeholder(ordinal)` rather than
+/// an unmapped anonymous placeholder, so closures capturing `Box<dyn for<'a> Fn(&'a T)>` map the
+/// constraint to `External::DynPlaceholder(ordinal)` while still rejecting caller universals.
+#[test]
+fn dynamic_co_binder_skolemizes_via_canonical_dyn_placeholder() {
+    let mut t = Tys::new();
+    let ex = t.extrait(T_TR, &[]);
+    let preds = t.list(&[ex]);
+    let dyn_ty = t.n(PNode::Dynamic(preds));
+    let ref_dyn = t.n(PNode::Ref(Mutbl::Not, dyn_ty));
+    let unit = t.unit();
+    let facts = Facts::default().trait_(T_TR, 1);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    const COL: &[Region] = &[Region::Param(0), Region::Param(0), Region::Late { binder: 1, var: 0 }];
+    let p = params(1, &[]);
+    let inputs = [ty(ref_dyn, COL)];
+    let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &inputs, output: ty(unit, NONE), clauses: &[] };
+    let generics = GenericArgs { lifetimes: range(0, 1), types: &[] };
+
+    struct RecDyn {
+        rec: Rec,
+        dyn_ph: SVec<Origin>,
+    }
+    impl Constraints for RecDyn {
+        fn subset(&mut self, a: Origin, b: Origin) { self.rec.subset(a, b); }
+        fn outlives_static(&mut self, a: Origin) { self.rec.outlives_static(a); }
+        fn fresh(&mut self, kind: Kind) -> Origin { self.rec.fresh(kind) }
+        fn dyn_placeholder(&mut self, ordinal: u32) -> Origin {
+            let idx = ordinal as usize;
+            while self.dyn_ph.len() <= idx {
+                let o = self.rec.fresh(Kind::Placeholder);
+                self.dyn_ph.push(o);
+            }
+            self.dyn_ph[idx]
+        }
+    }
+
+    let origins: SVec<Origin> = (0..4).map(Origin).collect();
+    let mut out = RecDyn {
+        rec: Rec { next: 100, subsets: SVec::new(), statics: SVec::new(), placeholders: SVec::new() },
+        dyn_ph: SVec::new(),
+    };
+    let sel = Sel::default();
+    let own = Own::default();
+    let res = {
+        let mut cx = Cx { types: &cols, sig_types: &cols, selected: &sel, owner: &own, origins: &origins, out: &mut out };
+        call(&mut cx, Callee::Fn(sig), generics, &[arg(ref_dyn, 1, 3)], arg(unit, 4, 0), alloc())
+    };
+    assert_eq!(res, Ok(()), "shared `&dyn for<'a> Tr<'a>` lowers cleanly: {res:?}");
+    assert_eq!(out.dyn_ph.len(), 1, "Dynamic(Co) must invoke dyn_placeholder(0)");
+    let ph = out.dyn_ph[0].0;
+    assert!(reach(&out.rec, 3).contains(&ph) && reach(&out.rec, ph).contains(&3), "slot 3 must equate with dyn_placeholder(0) ({ph}): {:?}", out.rec.subsets);
+    assert!(rejects(&out.rec, &[], &[3, ph]), "CONTROL: a caller universal at slot 3 cannot equal rigid dyn_placeholder {ph}");
+}

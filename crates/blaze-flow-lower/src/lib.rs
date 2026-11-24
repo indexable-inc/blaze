@@ -2548,8 +2548,25 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             Need::Sig(k) if ci.exact && caps + k < ci.len => Ok(self.origs[(ci.start + caps + k) as usize]),
             Need::OwnerParam(i) => Ok(self.universal(Region::Param(i))),
             Need::Param(u) => Ok(self.param_origin(u)),
+            Need::DynPlaceholder(ord) => Ok(self.dyn_placeholder_origin(ord)),
             Need::Capture(_) | Need::Sig(_) => self.refuse(Form::Malformed, e),
         }
+    }
+
+    fn dyn_placeholder_origin(&mut self, ordinal: u32) -> Origin {
+        let Ok(idx) = usize::try_from(ordinal) else { return self.b.origin(true) };
+        if let Some(&o) = self.dyn_bound_placeholders.get(idx) {
+            return o;
+        }
+        let st = self.universal(Region::Static);
+        let mut last = st;
+        while self.dyn_bound_placeholders.len() <= idx {
+            let o = self.b.origin(true);
+            self.b.known(st, o);
+            self.dyn_bound_placeholders.push(o);
+            last = o;
+        }
+        last
     }
 
     fn npos_d(&self, t: TyD, e: ExprId) -> Result<u32, Refusal> {
@@ -3734,20 +3751,41 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         for i in 0..=nparams {
             let is_out = i == nparams;
-            let (l, t) = if is_out {
-                (Local(0), TyD::of(self.adjusted_ty(root)?))
-            } else {
-                let p = self.body.params[i as usize];
-                match self.ck.pat_ty.get(p.ix()) {
-                    Some(&t) => (Local(1 + i), TyD::of(t)),
-                    None => return self.refuse_pat(Form::Malformed, p),
-                }
-            };
             let Some(regions) = (if is_out { sig.output() } else { sig.input(i) }) else {
                 let site = SigSite::NoChild { input: (!is_out).then_some(i) };
                 return self.refuse(Form::SigPositionsUnaligned { positions: nparams as usize, regions: sig.inputs() as usize, site }, root);
             };
             let declared = self.sig_declared(sig, i, root)?;
+            let (l, t) = if is_out {
+                (Local(0), TyD::of(self.adjusted_ty(root)?))
+            } else {
+                let p = match usize::try_from(i).ok().and_then(|idx| self.body.params.get(idx)) {
+                    Some(&p) => p,
+                    None => return self.refuse(Form::Malformed, root),
+                };
+                let pat_ty = match self.ck.pat_ty.get(p.ix()) {
+                    Some(&t) => t,
+                    None => return self.refuse_pat(Form::Malformed, p),
+                };
+                // A parameter pattern that peels a reference via default binding modes
+                // (`fn f([a, b]: &[T; 2])`, `fn f((a, b): &(A, B))`): `pat_ty` holds the
+                // type AFTER peeling `&`/`&mut`, whereas the signature's declared input
+                // carries the outer reference. Restore that outer `&`/`&mut` via `TyD::wrap`
+                // so signature regions align and `bind_pattern` peels it properly.
+                let peels = matches!(
+                    self.body.pats.get(p.ix()),
+                    Some(Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. })
+                );
+                let ty = if peels
+                    && let PNode::Ref(dm, _) = self.head_node(declared, root)?
+                    && !matches!(self.node(pat_ty, root)?, PNode::Ref(..))
+                {
+                    TyD { wrap: Some(dm), ty: pat_ty }
+                } else {
+                    TyD::of(pat_ty)
+                };
+                (Local(1 + i), ty)
+            };
             let async_body = is_out && sig.body() != BodyOut::Output;
             if async_body {
                 self.async_body = true;
@@ -3782,8 +3820,23 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 if t.wrap.is_some() {
                     return self.refuse(unaligned(SigSite::Wrapped { input }), root);
                 }
-            } else if t.wrap.is_some() {
-                return self.refuse(unaligned(SigSite::Wrapped { input }), root);
+            } else if let Some(wm) = t.wrap {
+                let PNode::Ref(dm, inner_declared) = self.head_node(declared, root)? else {
+                    return self.refuse(unaligned(SigSite::Wrapped { input }), root);
+                };
+                if dm != wm {
+                    return self.refuse(unaligned(SigSite::Wrapped { input }), root);
+                }
+                let Some((&first_r, rest_r)) = regions.split_first() else {
+                    return self.refuse(unaligned(SigSite::Unlaid { input }), root);
+                };
+                if !self.lay_over_rpit(inner_declared, t.ty, rest_r, &mut laid, None, root)? {
+                    return self.refuse(unaligned(SigSite::Unlaid { input }), root);
+                }
+                laid.insert(0, Some(first_r));
+                if u32::try_from(laid.len()) != Ok(n) {
+                    return self.refuse(unaligned(SigSite::Count { input }), root);
+                }
             } else if !self.lay_over_rpit(declared, t.ty, regions, &mut laid, is_out.then_some(&mut rpit_laid), root)? {
                 return self.refuse(unaligned(SigSite::Unlaid { input }), root);
             } else if laid.len() != n as usize {
@@ -4995,8 +5048,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 Ok(())
             }
             Task::AssignOpDone(e) => {
-                let rhs = self.pop(e)?;
                 let lhs = self.pop(e)?;
+                let rhs = self.pop(e)?;
                 let lp = self.as_place(lhs, e)?;
                 let r = self.operand(rhs, e)?;
                 self.b.aggregate(lp, &[Operand::Copy(lp), r], self.span(e));
@@ -5424,9 +5477,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 }
             }
             Expr::AssignOp { lhs, rhs, .. } => {
+                // The Reference, "Compound assignment expressions": "the right-hand operand is
+                // evaluated first, then the left-hand operand". Settle `rhs` before evaluating
+                // `lhs` so `starts[b + 1] += starts[b]` ends the shared borrow of `starts` before
+                // `IndexMut` borrows `starts` mutably.
                 self.tasks.push(Task::AssignOpDone(e));
-                self.tasks.push(Task::Eval(rhs, false));
                 self.tasks.push(Task::Eval(lhs, true));
+                self.tasks.push(Task::Settle(rhs));
+                self.tasks.push(Task::Eval(rhs, false));
             }
             // The Reference, "Constant promotion": a borrow the checker promoted
             // (`Checked::promoted`) is of a `'static` slot: no loan of the body's, and the
@@ -6496,7 +6554,15 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let idx = self.pop(e)?;
         let base = self.pop(e)?;
         let ty = TyD::of(self.expr_ty(e)?);
-        let bp = self.as_place(base, e)?;
+        let static_base = if !m && matches!(base.at, At::Const)
+            && let Expr::Index { base: be, .. } = self.expr(e)?
+        {
+            self.is_immutable_static(be)?
+                || matches!(self.expr(be)?, Expr::Array { elems } if elems.len == 0)
+                || self.const_init_freeze_no_drop(base.ty, e)?
+        } else {
+            false
+        };
         let builtin = base.ty.wrap.is_none() && matches!(self.node(base.ty.ty, e)?, PNode::Array(..) | PNode::Slice(_));
         if builtin {
             if let At::Place(ip) = idx.at {
@@ -6505,6 +6571,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 let tp = self.place_of(t);
                 self.b.assign(tp, Operand::Copy(ip), self.span(e));
             }
+            // Indexing an immutable `static` (e.g. `&INFO[self as usize]`) or a promotable
+            // `Freeze` constant array borrows `'static` storage directly rather than a stack
+            // temporary that would die with the fn.
+            if static_base {
+                self.vals.push(Val { at: At::Const, ty });
+                return Ok(());
+            }
+            let bp = self.as_place(base, e)?;
             let p = self.project(bp, base.ty, Proj::Index, ty, false, e)?;
             self.push_place(p, ty);
             return Ok(());
@@ -6512,14 +6586,21 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         // `Index::index(&base, i)` / `IndexMut::index_mut(&mut base, i)`, then `*` of the result,
         // whose lifetime is the receiver's (elision, `&self`). `ET[..]` of an extending borrow's
         // operand: the base temporary it borrows lives as the result does (`mark_extended`).
-        if let Expr::Index { base: be, .. } = self.expr(e)? {
-            self.extend_root(bp, be)?;
-        }
         let mutbl = if m { Mutbl::Mut } else { Mutbl::Not };
         let bt = self.temp(TyD { wrap: Some(mutbl), ty: base.ty.ty }, e)?;
         self.name_local(bt, Identity::Temp(e, Role::Borrow));
-        let kind = if m { BorrowKind::Mut } else { BorrowKind::Shared };
-        self.borrow(bp, base.ty, kind, bt, e)?;
+        if static_base {
+            // Shared indexing of an immutable `static` or promotable constant (e.g. `&[][..]`)
+            // borrows `'static` storage directly, as `deref_done` does for `Deref::deref(&S)`.
+            self.b.assign(self.place_of(bt), Operand::Const, self.span(e));
+        } else {
+            let bp = self.as_place(base, e)?;
+            if let Expr::Index { base: be, .. } = self.expr(e)? {
+                self.extend_root(bp, be)?;
+            }
+            let kind = if m { BorrowKind::Mut } else { BorrowKind::Shared };
+            self.borrow(bp, base.ty, kind, bt, e)?;
+        }
         let iop = self.operand(idx, e)?;
         let rt = self.temp(TyD { wrap: Some(mutbl), ty: ty.ty }, e)?;
         self.name_local(rt, Identity::Temp(e, Role::Result));

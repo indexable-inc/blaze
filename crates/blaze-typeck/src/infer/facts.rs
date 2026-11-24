@@ -398,12 +398,13 @@ pub fn lang_item(l: Lang) -> LangItem {
         Lang::From => LangItem::From,
         Lang::Enum => LangItem::Enum,
         Lang::UnitEnum => LangItem::UnitEnum,
+        Lang::TryAsDyn => LangItem::TryAsDyn,
     }
 }
 
 /// The solver's lang item of typeck's, for the ones the solver knows.
 fn solver_lang(l: LangItem) -> Option<Lang> {
-    const ALL: [Lang; 38] = [
+    const ALL: [Lang; 39] = [
         Lang::Sized,
         Lang::MetaSized,
         Lang::PointeeSized,
@@ -442,6 +443,7 @@ fn solver_lang(l: LangItem) -> Option<Lang> {
         Lang::From,
         Lang::Enum,
         Lang::UnitEnum,
+        Lang::TryAsDyn,
     ];
     ALL.into_iter().find(|&s| lang_item(s) == l)
 }
@@ -956,10 +958,15 @@ impl<'a> FactCache<'a> {
             crate::dyn_compat::Verdict::Gap { .. } => flags |= STraitFlags::DYN_UNDECIDED,
             crate::dyn_compat::Verdict::Not { .. } => {}
         }
+        let lang = match t.lang.and_then(solver_lang) {
+            Some(l) => Some(l),
+            None if reads.lang_item(LangItem::TryAsDyn)? == Some(k) => Some(Lang::TryAsDyn),
+            None => None,
+        };
         let row = TraitRow {
             flags: STraitFlags(flags),
             generics: t.generics,
-            lang: t.lang.and_then(solver_lang),
+            lang,
             supers,
             assoc,
             item_bounds,

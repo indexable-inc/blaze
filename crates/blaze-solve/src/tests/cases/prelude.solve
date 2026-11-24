@@ -23,6 +23,7 @@ extern lang(phantom_data) struct PhantomData<T>
 extern lang(owned_box) fundamental struct Box<T>(T)
 extern lang(manually_drop) struct ManuallyDrop<T>(T)
 extern lang(dyn_metadata) struct DynMetadata<T>
+extern lang(try_as_dyn) trait TryAsDynCompatible
 
 extern trait Iterator { type Item; }
 extern trait IntoIterator { type Item; type IntoIter: Iterator<Item = <Self as IntoIterator>::Item>; }

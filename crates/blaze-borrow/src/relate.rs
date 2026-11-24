@@ -100,6 +100,12 @@ pub trait Owner {
     fn clauses(&self) -> &[blaze_typeck::region_facts::ClauseView<'_>] {
         &[]
     }
+    /// The caller's own signature column (`FnPtr([inputs.., output])`), in the caller's
+    /// numbering (`owner_env`), for RFC 1214 implied outlives bounds (`&'a T::Assoc` in the
+    /// signature implies `T::Assoc: 'a`).
+    fn sig(&self) -> Option<Typed<'_>> {
+        None
+    }
     /// Signature of closure `ordinal` of this body (`owner == self.item()`), when known.
     fn closure_sig(&self, ordinal: u32) -> Option<ClosureSig<'_>> {
         let _ = ordinal;
@@ -476,8 +482,9 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             let key = BoundAt { env: ea, binder, var };
             let o = match self.binder_v {
                 BinderCtx::FnPtr(Variance::Co) | BinderCtx::Dynamic(Variance::Co) | BinderCtx::Clause => self.hr_origin(node, key, Kind::Existential)?,
-                BinderCtx::FnPtr(Variance::Contra) | BinderCtx::Dynamic(Variance::Contra) => self.hr_origin(node, key, Kind::Placeholder)?,
-                BinderCtx::Dynamic(Variance::In) if eb.is_none() => self.hr_dyn_origin(node, key)?,
+                BinderCtx::FnPtr(Variance::Contra) => self.hr_origin(node, key, Kind::Placeholder)?,
+                BinderCtx::Dynamic(Variance::Contra | Variance::In) if eb.is_none() => self.hr_dyn_origin(node, key)?,
+                BinderCtx::Dynamic(Variance::Contra) => self.hr_origin(node, key, Kind::Placeholder)?,
                 BinderCtx::None | BinderCtx::FnPtr(Variance::In) | BinderCtx::Dynamic(Variance::In) => {
                     return Err(Refused::HigherRanked { item: self.item, node, binder });
                 }
@@ -487,9 +494,10 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         if let Reg::Bound { binder, var } = b {
             let key = BoundAt { env: eb, binder, var };
             let o = match self.binder_v {
-                BinderCtx::FnPtr(Variance::Co) | BinderCtx::Dynamic(Variance::Co) | BinderCtx::Clause => self.hr_origin(node, key, Kind::Placeholder)?,
+                BinderCtx::FnPtr(Variance::Co) | BinderCtx::Clause => self.hr_origin(node, key, Kind::Placeholder)?,
+                BinderCtx::Dynamic(Variance::Co | Variance::In) if ea.is_none() => self.hr_dyn_origin(node, key)?,
+                BinderCtx::Dynamic(Variance::Co) => self.hr_origin(node, key, Kind::Placeholder)?,
                 BinderCtx::FnPtr(Variance::Contra) | BinderCtx::Dynamic(Variance::Contra) => self.hr_origin(node, key, Kind::Existential)?,
-                BinderCtx::Dynamic(Variance::In) if ea.is_none() => self.hr_dyn_origin(node, key)?,
                 BinderCtx::None | BinderCtx::FnPtr(Variance::In) | BinderCtx::Dynamic(Variance::In) => {
                     return Err(Refused::HigherRanked { item: self.item, node, binder });
                 }
@@ -1223,6 +1231,126 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     }
 
     /// Every component of `s` outlives `region`.
+    fn alias_side_eq(&self, a: Side<'c>, b: Side<'c>) -> bool {
+        let Some(n) = a.slots.len() else { return false };
+        b.slots.len() == Some(n)
+            && self.erased_sides(a, b)
+            && (0..n.get()).all(|k| {
+                matches!(
+                    (self.slot(a, k), self.slot(b, k)),
+                    (Ok(RegAt::Known(ra)), Ok(RegAt::Known(rb))) if ra == rb
+                )
+            })
+    }
+
+    /// Whether `cur` (an unselected alias) is already assumed to outlive some region `rhs_reg`
+    /// in the caller — either from an explicit `where <Alias>: 'rhs` clause (`owner.clauses()`)
+    /// or from an RFC 1214 implied bound (`&'rhs <Alias>` in `owner.sig()`) — that can prove
+    /// `cur: region`. When satisfied, emits `rhs_reg: region` and returns `Ok(true)`.
+    fn alias_assumed_outlives(&mut self, cur: Side<'c>, region: Reg) -> Result<bool, Refused> {
+        let owner: &'c dyn Owner = self.owner;
+        let clauses = owner.clauses();
+        let sig = owner.sig();
+        if clauses.is_empty() && sig.is_none() {
+            return Ok(false);
+        }
+        let Some(oenv) = self.envs.owner_env() else { return Ok(false) };
+        let mut unique_rhs: Option<Option<Reg>> = None;
+        let record_rhs = |unique: &mut Option<Option<Reg>>, r: Reg| match *unique {
+            None => *unique = Some(Some(r)),
+            Some(Some(prev)) if prev == r => {}
+            _ => *unique = Some(None),
+        };
+        for cv in clauses {
+            let Some(rhs) = cv.outlives else { continue };
+            if cv.binders != 0 {
+                continue;
+            }
+            let rhs_reg = if rhs == Region::Static { Reg::Static } else { Reg::Owner(rhs) };
+            let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: oenv } };
+            if !self.alias_side_eq(c, cur) {
+                continue;
+            }
+            if rhs_reg == Reg::Static || rhs_reg == region {
+                self.outlives(cur.ty, rhs_reg, region)?;
+                return Ok(true);
+            }
+            record_rhs(&mut unique_rhs, rhs_reg);
+        }
+        if let Some(sig) = sig {
+            // Walk the caller's signature (`FnPtr([inputs.., output])`) to collect RFC 1214
+            // implied bounds `&'rhs T` -> `T: 'rhs` where `T` contains an unselected alias.
+            let mut stack: [Option<(Side<'c>, Option<Reg>)>; 64] = [None; 64];
+            let mut sp = 1usize;
+            if let Some(slot) = stack.get_mut(0) {
+                *slot = Some((Side { ty: sig.ty, slots: Slots::Sig { col: sig.col, env: oenv } }, None));
+            }
+            let mut steps = 0u32;
+            while let Some(top_idx) = sp.checked_sub(1) {
+                sp = top_idx;
+                steps += 1;
+                if steps > 256 {
+                    break;
+                }
+                let Some((s, under)) = stack.get(top_idx).copied().flatten() else { continue };
+                let Ok(n) = self.node(s) else { continue };
+                if matches!(n, PNode::Alias { .. }) {
+                    if let Some(rhs_reg) = under
+                        && self.alias_side_eq(s, cur)
+                    {
+                        if rhs_reg == Reg::Static || rhs_reg == region {
+                            self.outlives(cur.ty, rhs_reg, region)?;
+                            return Ok(true);
+                        }
+                        record_rhs(&mut unique_rhs, rhs_reg);
+                    }
+                    continue;
+                }
+                let descend = matches!(
+                    n,
+                    PNode::FnPtr(..)
+                        | PNode::Ref(..)
+                        | PNode::Ptr(..)
+                        | PNode::Slice(_)
+                        | PNode::Array(..)
+                        | PNode::Pat(..)
+                        | PNode::Tuple(_)
+                        | PNode::Record(..)
+                        | PNode::Union(_)
+                        | PNode::Adt(..)
+                );
+                if !descend || self.fits(s).is_err() {
+                    continue;
+                }
+                let next_under = if matches!(n, PNode::Ref(..)) {
+                    match self.slot(s, 0) {
+                        Ok(RegAt::Known(r @ (Reg::Static | Reg::Owner(_)))) => Some(r),
+                        _ => None,
+                    }
+                } else {
+                    under
+                };
+                let (Ok(own), Ok(kids)) = (self.own(s), self.kids_of(s)) else { continue };
+                let Some((_, mut rest)) = s.slots.split(own) else { continue };
+                for k in 0..kids.len() {
+                    let Ok((child, rem)) = self.kid(s, &kids, rest, k) else { break };
+                    rest = rem;
+                    if let Some(slot) = stack.get_mut(sp) {
+                        *slot = Some((child, next_under));
+                        sp += 1;
+                    }
+                }
+            }
+        }
+        if matches!(region, Reg::Origin(_) | Reg::Slot(_))
+            && let Some(Some(rhs_reg)) = unique_rhs
+        {
+            self.outlives(cur.ty, rhs_reg, region)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn components(&mut self, s: Side<'c>, region: Reg, depth: u32) -> Result<(), Refused> {
         let base_sp = self.comp_sp;
         let res = self.components_loop(s, region, depth, base_sp);
@@ -1257,44 +1385,13 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                                 continue;
                             }
                             Selection::Not(_) => {
-                                // Caller's own `where <Alias>: 'rhs` clause (e.g. `forward_output`:
-                                // `fn f<F: Future>(f: F) where F::Output: 'static { output_only(f); }`):
-                                // if the caller already assumes `cur: 'rhs` and `'rhs` satisfies
-                                // `region`, no further outlives requirement on `cur`'s arguments is needed.
-                                let owner: &'c dyn Owner = self.owner;
-                                let clauses = owner.clauses();
-                                if !clauses.is_empty()
-                                    && let Some(oenv) = self.envs.owner_env()
-                                {
-                                    let mut satisfied = false;
-                                    for cv in clauses {
-                                        let Some(rhs) = cv.outlives else { continue };
-                                        if cv.binders != 0 {
-                                            continue;
-                                        }
-                                        let rhs_reg = if rhs == Region::Static { Reg::Static } else { Reg::Owner(rhs) };
-                                        if rhs_reg != Reg::Static && rhs_reg != region {
-                                            continue;
-                                        }
-                                        let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: oenv } };
-                                        if let Some(n) = c.slots.len()
-                                            && cur.slots.len() == Some(n)
-                                            && self.erased_sides(c, cur)
-                                            && (0..n.get()).all(|k| {
-                                                matches!(
-                                                    (self.slot(c, k), self.slot(cur, k)),
-                                                    (Ok(RegAt::Known(a)), Ok(RegAt::Known(b))) if a == b
-                                                )
-                                            })
-                                        {
-                                            self.outlives(cur.ty, rhs_reg, region)?;
-                                            satisfied = true;
-                                            break;
-                                        }
-                                    }
-                                    if satisfied {
-                                        continue;
-                                    }
+                                // Caller's own `where <Alias>: 'rhs` clause or RFC 1214 implied
+                                // bound (`&'rhs <Alias>` in the caller's signature): if the
+                                // caller already assumes `cur: 'rhs` and `'rhs` can prove
+                                // `region`, no further outlives requirement on `cur`'s arguments
+                                // is needed.
+                                if self.alias_assumed_outlives(cur, region)? {
+                                    continue;
                                 }
                                 // Builtin `<async { .. } as Future>::Output`: when the future's
                                 // output type carries zero lifetime slots (e.g. `()` or a bare

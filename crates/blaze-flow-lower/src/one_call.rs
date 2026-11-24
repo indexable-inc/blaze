@@ -710,6 +710,7 @@ struct CallOwner<'s> {
     uni: &'s [(Region, Origin)],
     params: &'s [ParamOrigin],
     bounds: &'s [ClauseView<'s>],
+    sig: Option<Typed<'s>>,
     heads: &'s dyn RegionTypes,
     bodies: BodyParams<'s>,
     closures: ClosureSigs<'s>,
@@ -733,6 +734,9 @@ impl Owner for CallOwner<'_> {
     }
     fn clauses(&self) -> &[ClauseView<'_>] {
         self.bounds
+    }
+    fn sig(&self) -> Option<Typed<'_>> {
+        self.sig
     }
     fn closure_sig(&self, ordinal: u32) -> Option<blaze_borrow::ClosureSig<'_>> {
         self.closures.of(ordinal)
@@ -1160,6 +1164,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 uni: &self.uni,
                 params: &self.param_origs,
                 bounds,
+                sig: (!self.in_nested).then(|| {
+                    let c = own.regions().col;
+                    Typed { ty: c.ty(), col: c.as_slice() }
+                }),
                 heads: &heads,
                 bodies: BodyParams { rows: &body_rows, held: &held },
                 closures: ClosureSigs { rows: &closure_rows, regs: &closure_regs },
@@ -1294,6 +1302,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             uni: &self.uni,
             params: &self.param_origs,
             bounds,
+            sig: (!self.in_nested).then(|| {
+                let c = own.regions().col;
+                Typed { ty: c.ty(), col: c.as_slice() }
+            }),
             heads: &heads,
             bodies: BodyParams { rows: &body_rows, held: &held },
             closures: ClosureSigs { rows: &[], regs: &[] },

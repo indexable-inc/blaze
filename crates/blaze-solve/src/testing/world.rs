@@ -76,6 +76,7 @@ fn lang_of(name: &str) -> Option<Lang> {
         "call_ref_future" => Lang::CallRefFuture,
         "blaze_enum" => Lang::Enum,
         "blaze_unit_enum" => Lang::UnitEnum,
+        "try_as_dyn" => Lang::TryAsDyn,
         _ => return None,
     })
 }
