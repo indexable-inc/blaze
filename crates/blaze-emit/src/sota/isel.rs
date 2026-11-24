@@ -1324,6 +1324,17 @@ fn check_subset(view: &View<'_>, has_lse: bool, os: crate::Os) -> Result<(), Tie
                     let at = to_idx(at_u32(view.data, inst));
                     is_vec_mask_ty(ty_at(view.tys, to_idx(at_u32(view.extra, at)))).is_some()
                 }
+                Op::TargetIntrinsic => {
+                    let at = to_idx(at_u32(view.data, inst));
+                    let name = view.intrinsic_name(IntrinsicId(at_u32(view.extra, at)));
+                    let argc = to_idx(at_u32(view.extra, at + 1));
+                    (name == b"blaze.neon.tbl16" && argc == 2 && !vfp && vsize == 0)
+                        || (name == b"blaze.neon.tbl64" && argc == 5 && !vfp && vsize == 0)
+                        || ((name == b"blaze.neon.sdot" || name == b"blaze.neon.udot")
+                            && argc == 3
+                            && !vfp
+                            && vsize == 2)
+                }
                 _ => false,
             };
             if !vec_ok {
@@ -1493,7 +1504,15 @@ fn check_subset(view: &View<'_>, has_lse: bool, os: crate::Os) -> Result<(), Tie
                 let at = to_idx(at_u32(view.data, inst));
                 let name = view.intrinsic_name(IntrinsicId(at_u32(view.extra, at)));
                 let argc = to_idx(at_u32(view.extra, at + 1));
-                let ok = name == b"blaze.prefetch.r1" && argc == 1 && ty == Ty::NONE;
+                let ok = (name == b"blaze.prefetch.r1" && argc == 1 && ty == Ty::NONE)
+                    || ((name == b"blaze.sme2.gemm_f32" || name == b"blaze.sme2.gemm_f64")
+                        && argc == 7
+                        && ty == Ty::NONE)
+                    || (name == b"blaze.neon.tbl16" && argc == 2 && is_vec128_ty(ty).is_some())
+                    || (name == b"blaze.neon.tbl64" && argc == 5 && is_vec128_ty(ty).is_some())
+                    || ((name == b"blaze.neon.sdot" || name == b"blaze.neon.udot")
+                        && argc == 3
+                        && is_vec128_ty(ty).is_some());
                 if !ok {
                     return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unsupported target_intrinsic" });
                 }
@@ -4354,6 +4373,8 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
 
     let mut cold_stubs: Vec<ColdEdgeStub, Alloc<'a>> = Vec::new_in(alloc);
     let mut shared_jump_tables: Vec<SharedJumpTable<'a>, Alloc<'a>> = Vec::new_in(alloc);
+    let mut sme2_f32_bl_sites: Vec<usize, Alloc<'a>> = Vec::new_in(alloc);
+    let mut sme2_f64_bl_sites: Vec<usize, Alloc<'a>> = Vec::new_in(alloc);
     let mut post_pairs: Vec<PostIndexPlan, Alloc<'a>> = Vec::with_capacity_in(8, alloc);
     let mut ptr_accesses: Vec<(usize, bool, PostAccessKind, i64), Alloc<'a>> = Vec::with_capacity_in(16, alloc);
     let mut skip_p_nexts: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(8, alloc);
@@ -5753,6 +5774,84 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             words.push(enc::sub(X17, ZR, X17)); // ror(x, -k) == rol(x, k)
                             words.push(enc::rorv(X16, X16, X17));
                             words.push(enc::ins_d_gpr(vd, lane, X16));
+                        }
+                        if let Some(s) = sp {
+                            emit_st_spill_vec(&mut words, vd, spill_base, s);
+                        }
+                    }
+                    Op::TargetIntrinsic => {
+                        let at = to_idx(at_u32(view.data, inst));
+                        let name = view.intrinsic_name(IntrinsicId(at_u32(view.extra, at)));
+                        let (vd, sp) = dst_vec(inst);
+                        if name == b"blaze.neon.tbl16" {
+                            let vt = load_vec(&mut words, at_u32(view.extra, at + 2), V29);
+                            let vi = load_vec(&mut words, at_u32(view.extra, at + 3), V30);
+                            words.push(super::sme2::tbl1_16b(vd, vt, vi));
+                        } else if name == b"blaze.neon.tbl64" {
+                            let v0 = at_u32(view.extra, at + 2);
+                            let v1 = at_u32(view.extra, at + 3);
+                            let v2 = at_u32(view.extra, at + 4);
+                            let v3 = at_u32(view.extra, at + 5);
+                            let vi_val = at_u32(view.extra, at + 6);
+                            let consec = match (
+                                at_loc(&reg_alloc.loc_of, to_idx(v0)),
+                                at_loc(&reg_alloc.loc_of, to_idx(v1)),
+                                at_loc(&reg_alloc.loc_of, to_idx(v2)),
+                                at_loc(&reg_alloc.loc_of, to_idx(v3)),
+                            ) {
+                                (AllocLoc::Fp(r0), AllocLoc::Fp(r1), AllocLoc::Fp(r2), AllocLoc::Fp(r3))
+                                    if ((r0 + 1) & 31) == r1 && ((r0 + 2) & 31) == r2 && ((r0 + 3) & 31) == r3 =>
+                                {
+                                    Some(u32::from(r0))
+                                }
+                                _ => None,
+                            };
+                            if let Some(base_r) = consec {
+                                let vi = load_vec(&mut words, vi_val, V31);
+                                words.push(super::sme2::tbl4_16b(vd, base_r, vi));
+                            } else {
+                                // Stackless 2x `tbl2_16b` split using reserved scratch `V29, V30, V31`:
+                                // indices 0..31 lookup in `{t0,t1}`, indices 32..63 shifted by -32 lookup in `{t2,t3}`.
+                                let vi = load_vec(&mut words, vi_val, V31);
+                                let ri_safe = if vi == vd {
+                                    words.push(enc::orr_v(V31, vi, vi));
+                                    V31
+                                } else {
+                                    vi
+                                };
+                                let rt0 = load_vec(&mut words, v0, V29);
+                                if rt0 != V29 {
+                                    words.push(enc::orr_v(V29, rt0, rt0));
+                                }
+                                let rt1 = load_vec(&mut words, v1, V30);
+                                if rt1 != V30 {
+                                    words.push(enc::orr_v(V30, rt1, rt1));
+                                }
+                                words.push(super::sme2::tbl2_16b(vd, V29, ri_safe));
+                                // `movi V29.16b, #32` (0x4f01_e400 | V29) -> `sub V31.16b, ri_safe, V29`
+                                words.push(0x4f01_e400 | V29);
+                                words.push(enc::sub_v(0, V31, ri_safe, V29));
+                                let rt2 = load_vec(&mut words, v2, V29);
+                                if rt2 != V29 {
+                                    words.push(enc::orr_v(V29, rt2, rt2));
+                                }
+                                let rt3 = load_vec(&mut words, v3, V30);
+                                if rt3 != V30 {
+                                    words.push(enc::orr_v(V30, rt3, rt3));
+                                }
+                                words.push(super::sme2::tbl2_16b(V31, V29, V31));
+                                words.push(enc::orr_v(vd, vd, V31));
+                            }
+                        } else if name == b"blaze.neon.sdot" {
+                            let vc = load_vec(&mut words, at_u32(view.extra, at + 2), V31);
+                            let va = load_vec(&mut words, at_u32(view.extra, at + 3), V29);
+                            let vb = load_vec(&mut words, at_u32(view.extra, at + 4), V30);
+                            emit_vec_acc3(&mut words, vd, va, vb, vc, super::sme2::sdot_4s);
+                        } else if name == b"blaze.neon.udot" {
+                            let vc = load_vec(&mut words, at_u32(view.extra, at + 2), V31);
+                            let va = load_vec(&mut words, at_u32(view.extra, at + 3), V29);
+                            let vb = load_vec(&mut words, at_u32(view.extra, at + 4), V30);
+                            emit_vec_acc3(&mut words, vd, va, vb, vc, super::sme2::udot_4s);
                         }
                         if let Some(s) = sp {
                             emit_st_spill_vec(&mut words, vd, spill_base, s);
@@ -7251,6 +7350,37 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                         let ptr_v = at_u32(view.extra, at + 2);
                         let rptr = load_gpr(&mut words, ptr_v, X16);
                         words.push(enc::prfm_pldl1keep(rptr, 0));
+                    } else if name == b"blaze.sme2.gemm_f32" || name == b"blaze.sme2.gemm_f64" {
+                        gpr_moves.clear();
+                        const_edge_writes.clear();
+                        for k in 0..7usize {
+                            let arg_v = at_u32(view.extra, at + 2 + k);
+                            let dst = GprCopyLoc::Reg(u32_of(k));
+                            match at_loc(&reg_alloc.loc_of, to_idx(arg_v)) {
+                                AllocLoc::Gpr(r) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(r)))),
+                                AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
+                                AllocLoc::RematConst(imm) => {
+                                    const_edge_writes.push((dst, imm));
+                                }
+                                _ => {
+                                    let r = load_gpr(&mut words, arg_v, X16);
+                                    gpr_moves.push((dst, GprCopyLoc::Reg(r)));
+                                }
+                            }
+                        }
+                        emit_parallel_gpr_moves(&mut words, &mut gpr_moves, spill_base)?;
+                        for &(dst, imm) in &const_edge_writes {
+                            if let GprCopyLoc::Reg(r) = dst {
+                                emit_const_u64(&mut words, r, imm);
+                            }
+                        }
+                        let bl_w = words.len();
+                        words.push(enc::bl(0));
+                        if name == b"blaze.sme2.gemm_f32" {
+                            sme2_f32_bl_sites.push(bl_w);
+                        } else {
+                            sme2_f64_bl_sites.push(bl_w);
+                        }
                     }
                 }
                 Op::AtomicLoad => {
@@ -10292,6 +10422,29 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                 kind: PatchKind::JumpTableEntry { table_start_word },
                 target_block: tb,
             });
+        }
+    }
+    // 4d. Emit local PC-relative SME2 `FMOPA` micro-kernel stubs once per function when invoked.
+    if !sme2_f32_bl_sites.is_empty() {
+        while words.len() % 4 != 0 {
+            words.push(enc::nop());
+        }
+        let stub_w = words.len();
+        let stub_words = super::sme2::emit_sme2_gemm_f32_words(alloc);
+        words.extend_from_slice(&stub_words);
+        for &bl_w in &sme2_f32_bl_sites {
+            set_at(&mut words, bl_w, enc::bl(word_delta(stub_w, bl_w)));
+        }
+    }
+    if !sme2_f64_bl_sites.is_empty() {
+        while words.len() % 4 != 0 {
+            words.push(enc::nop());
+        }
+        let stub_w = words.len();
+        let stub_words = super::sme2::emit_sme2_gemm_f64_words(alloc);
+        words.extend_from_slice(&stub_words);
+        for &bl_w in &sme2_f64_bl_sites {
+            set_at(&mut words, bl_w, enc::bl(word_delta(stub_w, bl_w)));
         }
     }
 
