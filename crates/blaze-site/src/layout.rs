@@ -1504,6 +1504,10 @@ pub fn word_range<A: Allocator + Copy>(layout: &PageLayout<A>, idx: usize) -> Ch
     let blk = ci.block;
     let mut from = i;
     while from > 0 {
+        let Some(cur) = chars.get(from) else { break };
+        if cur.before.is_some() {
+            break;
+        }
         let Some(prev) = chars.get(from - 1) else { break };
         if prev.block == blk && is_word(prev.ch) == kind {
             from -= 1;
@@ -1514,6 +1518,9 @@ pub fn word_range<A: Allocator + Copy>(layout: &PageLayout<A>, idx: usize) -> Ch
     let mut to = i + 1;
     while to < chars.len() {
         let Some(next) = chars.get(to) else { break };
+        if next.before.is_some() {
+            break;
+        }
         if next.block == blk && is_word(next.ch) == kind {
             to += 1;
         } else {

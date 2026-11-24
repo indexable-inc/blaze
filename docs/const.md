@@ -82,14 +82,14 @@ is refused.
 - `const-fn-pointers`: calling a `fn` pointer in const. The nightly refuses it ("function
   pointer calls are not allowed in constant functions"), and so does v2's const checker.
 
-A third is planned as a crate feature rather than a manifest name, since it adds syntax and
-`core` items to the crate that opts in: `#![feature(blaze_comptime)]`, generic code over a
-type's fields and variants. `for const f in core::reflect::fields_of::<T>() { .. value.[f] .. }`
-unrolls once per field at monomorphization, with a body type-checked once against bounds that
-quantify over the fields (`where for<F: Field<T>> F::Type: Hash`), so a type with a non-`Hash`
-field is refused at the call, naming the field. `core::reflect::fn_info(f).code_id` gives a
-function's code identity. rustc refuses `#![feature(blaze_comptime)]` (unknown feature), and v2
-has none of it yet. Design: [docs/v2/plan/design/comptime.md](v2/plan/design/comptime.md).
+Compile-time reflection in the blaze edition uses `inline for` over a struct, tuple, or
+anonymous record's fields (`inline for (name, field) in &value { .. }` and lockstep
+`inline for (a, b) in zip_fields(lhs, rhs) { .. }`), unrolling once per field at
+monomorphization with zero `IntoIterator` desugaring. Generic functions and recursive blanket
+impls quantify over every field with `where for<F in fields(T)> F: Trait`, so a type with a
+field lacking the bound is refused structurally at the call site. Implemented in `blaze-lower`,
+`blaze-solve`, `blaze-typeck`, and `blaze-ladder` (`tests/front2_field_defaults_run.rs`).
+Background design: [docs/v2/plan/design/comptime.md](v2/plan/design/comptime.md).
 
 ## Bit-packed structs (`#[blaze::bits]`)
 

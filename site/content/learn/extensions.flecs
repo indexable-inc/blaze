@@ -1,7 +1,6 @@
-// Lesson: blaze's attribute extensions, all behind `#![register_tool(blaze)]`: linear types (`#[blaze::linear]`,
-// checked on MIR by crates/hir-ty-linear; docs/v2/plan/design/linear.md), effects (`#[blaze::may(..)]`,
-// crates/blaze-lints/src/blaze/may.rs; effects.md; ledger E11) and purity (`#[blaze::pure]`, crates/hir-ty/src/facts.rs).
-// Designs are `status: plan`; say so.
+// Lesson: blaze's language extensions: linear types (`#[blaze::linear]`), effects (`#[blaze::may(..)]`),
+// purity (`#[blaze::pure]` / `#![blaze::sans_io]`), error unions (`A | B` and `Result<T, _>`),
+// anonymous records with defaults, and explicit `become` tail calls.
 site {
   learn {
     extensions : Page {
@@ -46,7 +45,25 @@ site {
       }
 
       Step pure("Pure functions") {
-        P pure("`#[blaze::pure]`: reads the world only through its arguments. Checked through every call, so its result can be reused.")
+        P pure("`#[blaze::pure]` and `#![blaze::sans_io]`: reads the world only through its arguments. Checked through every call, so results can be reused and replayed deterministically.")
+      }
+
+      Step unions("Error unions and records") {
+        Code union_ex(lang: "rust", text: `fn load(mode: u32) -> Result<u32, _> \{
+            let raw = read(mode)?;   // ErrA
+            parse(raw)               // ErrB -> inferred ErrA | ErrB
+        }
+
+        fn sum(r: \{ a: u32, b: u32 = 32 }) -> u32 \{ r.a + r.b }`)
+        P unions_p("`ErrA | ErrB` is an order-free union type that widens automatically across `?`, and `Result<T, _>` infers the exact error set. Anonymous records carry type-level defaults and width subtyping.")
+      }
+
+      Step tail("Explicit tail calls") {
+        Code become_ex(lang: "rust", text: `fn step(state: State, n: u32) -> u32 \{
+            if n == 0 \{ return state.done(); }
+            become step(state.next(), n - 1)
+        }`)
+        P become_p("`become` guarantees a constant-stack tail call, compiled directly in blaze's backend.")
       }
 
       Step status("Where it stands") {
