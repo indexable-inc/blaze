@@ -35,7 +35,7 @@ use crate::{
     Block, BlockKind, Flags, Func, IntCond, Op, Scalar, Ty, Value, View,
     arith::{iconst_value, wide_value},
     builder::{Builder, Full, Param, Sink, Variadic},
-    func::{Conv, Ext, IntrinsicId, IntrinsicRec, ParamKind, ParamRec, SigRec},
+    func::{Conv, Ext, IntrinsicId, IntrinsicRec, ParamFactsRec, ParamKind, ParamRec, SigId, SigRec},
     op::{Field, Layout},
     verify,
 };
@@ -751,6 +751,69 @@ fn dominates(idom: &[u32], a: u32, mut b: u32) -> bool {
 fn is_ready_invariant(inst_block: &[u32], idom: &[u32], val: u32, target_blk: u32) -> bool {
     let def_blk = at(inst_block, to_idx(val));
     def_blk <= target_blk && dominates(idom, def_blk, target_blk)
+}
+
+/// Strips up to 8 nested `Op::PtrAdd` / `Op::Freeze` operations to recover a pointer's root object.
+fn ptr_root(view: &View<'_>, mut ptr: u32) -> u32 {
+    for _ in 0..8 {
+        let pi = to_idx(ptr);
+        match view.op(pi) {
+            Op::PtrAdd => ptr = at(view.extra, to_idx(at(view.data, pi))),
+            Op::Freeze => ptr = at(view.data, pi),
+            _ => break,
+        }
+    }
+    ptr
+}
+
+/// True iff pointer roots `a` and `b` are provably non-aliasing:
+/// - distinct local stack slots (`Op::SlotAddr`),
+/// - a local stack slot (`Op::SlotAddr`) and an entry-block parameter (`Op::Param`) or static/const
+///   data (`Op::DataAddr`),
+/// - distinct entry-block parameters where at least one carries `ParamFactsRec::NOALIAS`, or
+/// - an entry-block parameter carrying `ParamFactsRec::NOALIAS` and a static/const `Op::DataAddr`.
+fn provably_noalias_bases(view: &View<'_>, a: u32, b: u32) -> bool {
+    let ra = ptr_root(view, a);
+    let rb = ptr_root(view, b);
+    if ra == rb {
+        return false;
+    }
+    let ai = to_idx(ra);
+    let bi = to_idx(rb);
+    let a_slot = view.op(ai) == Op::SlotAddr;
+    let b_slot = view.op(bi) == Op::SlotAddr;
+    if a_slot && b_slot {
+        return at(view.data, ai) != at(view.data, bi);
+    }
+    let a_data = view.op(ai) == Op::DataAddr;
+    let b_data = view.op(bi) == Op::DataAddr;
+    let entry_params = view.params(Block(0));
+    let a_param = view.op(ai) == Op::Param && ai >= entry_params.start && ai < entry_params.end;
+    let b_param = view.op(bi) == Op::Param && bi >= entry_params.start && bi < entry_params.end;
+    if (a_slot && (b_param || b_data)) || (b_slot && (a_param || a_data)) {
+        return true;
+    }
+    if a_param || b_param {
+        let sig = view.sig(SigId(view.head.sig));
+        let has_noalias = |p_idx: usize| -> bool {
+            sig.params
+                .get(p_idx)
+                .and_then(|p| view.facts(p))
+                .is_some_and(|f| (f.bits & ParamFactsRec::NOALIAS) != 0)
+        };
+        if a_param && b_param {
+            let pa = ai - entry_params.start;
+            let pb = bi - entry_params.start;
+            return has_noalias(pa) || has_noalias(pb);
+        }
+        if a_param && b_data {
+            return has_noalias(ai - entry_params.start);
+        }
+        if b_param && a_data {
+            return has_noalias(bi - entry_params.start);
+        }
+    }
+    false
 }
 
 // ============================================================================
@@ -1753,30 +1816,40 @@ fn apply_lut_plan<A: Allocator + Copy>(
                 let db = at(&val_map, to_idx(dst_base));
                 let db_adj = emit_offset_base(&mut func, db, dst_off);
 
-                // Runtime alias guard 1: `dst` vs `src` (in-place exact equality is safe, else disjoint).
-                let dst_start = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, db_adj, iv_init);
-                let src_start = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, src_base_adj, iv_init);
-                let dst_addr = push_unary(&mut func, Op::PtrAddr, Ty::I64, dst_start);
-                let src_addr = push_unary(&mut func, Op::PtrAddr, Ty::I64, src_start);
-                let d_ds = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, dst_addr, src_addr);
-                let d_sd = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, src_addr, dst_addr);
-                let k0 = push_iconst(&mut func, Ty::I64, 0);
-                let same_ptr = push_icmp(&mut func, IntCond::Eq, Ty::I1, d_ds, k0);
-                let min_dist = push_bin(&mut func, Op::Umin, Flags::NONE, Ty::I64, d_ds, d_sd);
-                let disj_src = push_icmp(&mut func, IntCond::Uge, Ty::I1, min_dist, rem);
-                let ok_src = push_bin(&mut func, Op::Or, Flags::NONE, Ty::I1, same_ptr, disj_src);
+                let skip_src_guard = (dst_base == plan.src_base && dst_off == plan.src_off)
+                    || provably_noalias_bases(view, dst_base, plan.src_base);
+                let skip_lut_guard = provably_noalias_bases(view, dst_base, plan.lut_base);
 
-                // Runtime alias guard 2: `dst[iv_init..bound]` must not overlap `lut[0..table_bytes]`.
-                let lut_addr = push_unary(&mut func, Op::PtrAddr, Ty::I64, lut_base_adj);
-                let d_dl = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, dst_addr, lut_addr);
-                let d_ld = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, lut_addr, dst_addr);
-                let k_tbl_bytes = push_iconst(&mut func, Ty::I64, plan.mode.table_bytes());
-                let dst_after_lut = push_icmp(&mut func, IntCond::Uge, Ty::I1, d_dl, k_tbl_bytes);
-                let lut_after_dst = push_icmp(&mut func, IntCond::Uge, Ty::I1, d_ld, rem);
-                let ok_lut = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, dst_after_lut, lut_after_dst);
+                if !skip_src_guard || !skip_lut_guard {
+                    let dst_start = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, db_adj, iv_init);
+                    let dst_addr = push_unary(&mut func, Op::PtrAddr, Ty::I64, dst_start);
 
-                let ok_alias = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, ok_src, ok_lut);
-                go_vec = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, go_vec, ok_alias);
+                    if !skip_src_guard {
+                        // Runtime alias guard 1: `dst` vs `src` (in-place exact equality is safe, else disjoint).
+                        let src_start = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, src_base_adj, iv_init);
+                        let src_addr = push_unary(&mut func, Op::PtrAddr, Ty::I64, src_start);
+                        let d_ds = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, dst_addr, src_addr);
+                        let d_sd = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, src_addr, dst_addr);
+                        let k0 = push_iconst(&mut func, Ty::I64, 0);
+                        let same_ptr = push_icmp(&mut func, IntCond::Eq, Ty::I1, d_ds, k0);
+                        let min_dist = push_bin(&mut func, Op::Umin, Flags::NONE, Ty::I64, d_ds, d_sd);
+                        let disj_src = push_icmp(&mut func, IntCond::Uge, Ty::I1, min_dist, rem);
+                        let ok_src = push_bin(&mut func, Op::Or, Flags::NONE, Ty::I1, same_ptr, disj_src);
+                        go_vec = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, go_vec, ok_src);
+                    }
+
+                    if !skip_lut_guard {
+                        // Runtime alias guard 2: `dst[iv_init..bound]` must not overlap `lut[0..table_bytes]`.
+                        let lut_addr = push_unary(&mut func, Op::PtrAddr, Ty::I64, lut_base_adj);
+                        let d_dl = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, dst_addr, lut_addr);
+                        let d_ld = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, lut_addr, dst_addr);
+                        let k_tbl_bytes = push_iconst(&mut func, Ty::I64, plan.mode.table_bytes());
+                        let dst_after_lut = push_icmp(&mut func, IntCond::Uge, Ty::I1, d_dl, k_tbl_bytes);
+                        let lut_after_dst = push_icmp(&mut func, IntCond::Uge, Ty::I1, d_ld, rem);
+                        let ok_lut = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, dst_after_lut, lut_after_dst);
+                        go_vec = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, go_vec, ok_lut);
+                    }
+                }
                 db_adj
             }
             LutSink::ReduceAdd | LutSink::ReduceXor => NONE,
@@ -1893,10 +1966,17 @@ fn apply_lut_plan<A: Allocator + Copy>(
             NONE
         };
 
-        let mut next_vaccs = [NONE; 4];
+        // 1. Emit all 4 contiguous 16B loads first so backend pairs (0, 16) and (32, 48) into 2x `ldp q, q`.
+        let mut raw_vecs = [NONE; 4];
         for u in 0..4usize {
             let byte_off = i32::try_from(u * 16).unwrap_or(0);
-            let raw = push_load(&mut func, v16i8, psrc, byte_off, 0);
+            set_at(&mut raw_vecs, u, push_load(&mut func, v16i8, psrc, byte_off, 0));
+        }
+
+        // 2. Emit all 4 index masks/shifts back-to-back across 4 independent vector registers.
+        let mut idx_vecs = [NONE; 4];
+        for u in 0..4usize {
+            let raw = at(&raw_vecs, u);
             let idx_v = match plan.mode {
                 LutIndexMode::Mask16 | LutIndexMode::Mask64 => {
                     push_bin(&mut func, Op::And, Flags::NONE, v16i8, raw, vidx_imm)
@@ -1905,12 +1985,26 @@ fn apply_lut_plan<A: Allocator + Copy>(
                     push_bin(&mut func, Op::Lshr, Flags::NONE, v16i8, raw, vidx_imm)
                 }
             };
+            set_at(&mut idx_vecs, u, idx_v);
+        }
+
+        // 3. Emit all 4 NEON `tbl` lookups back-to-back for 4-wide NEON execution.
+        let mut out_vecs = [NONE; 4];
+        for u in 0..4usize {
+            let idx_v = at(&idx_vecs, u);
             let out_v = if plan.mode.is_64() {
                 push_target_intrinsic(&mut func, tbl_id, v16i8, &[t0, t1, t2, t3, idx_v])
             } else {
                 push_target_intrinsic(&mut func, tbl_id, v16i8, &[t0, idx_v])
             };
+            set_at(&mut out_vecs, u, out_v);
+        }
 
+        // 4. Emit all 4 contiguous 16B stores (pairing into 2x `stp q, q`) or 4 reduction updates.
+        let mut next_vaccs = [NONE; 4];
+        for u in 0..4usize {
+            let byte_off = i32::try_from(u * 16).unwrap_or(0);
+            let out_v = at(&out_vecs, u);
             match plan.sink {
                 LutSink::Store { .. } => {
                     push_store(&mut func, out_v, pdst, byte_off, 0);
@@ -3231,7 +3325,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        builder::MemAttrs,
+        builder::{Facts, MemAttrs},
         eval::{self, Outcome, Val},
     };
 
@@ -3762,5 +3856,149 @@ mod tests {
         assert_eq!(out.stats.dotprod_loops, 1);
         assert_eq!(count_intrinsic_calls(&out.func.view(), NEON_SDOT_INTRINSIC), 4);
         assert!((0..out.func.view().len()).any(|k| out.func.view().op(k) == Op::ReduceAdd));
+    }
+
+    #[test]
+    fn lut16_and_lut64_group_loads_masks_tbls_stores_for_ldp_stp_and_ilp() {
+        for &(mask, intr_name) in &[(15u128, NEON_TBL16_INTRINSIC), (63u128, NEON_TBL64_INTRINSIC)] {
+            let func = build_byte_lut_map_loop(mask);
+            let out = lower_simd_idioms(func.view(), SimdIdiomOpts::apple_silicon(), TestHeap).unwrap();
+            let v = out.func.view();
+            verify(v).unwrap();
+            assert_eq!(out.stats.tbl_loops, 1);
+            assert_eq!(count_intrinsic_calls(&v, intr_name), 4);
+
+            // Locate the `vloop` block containing all 4 `tbl` intrinsics and verify exact grouped order:
+            // 4 contiguous `<16 x i8>` loads (offsets 0, 16, 32, 48 on same `psrc`),
+            // 4 contiguous `<16 x i8>` `And` masks,
+            // 4 contiguous `TargetIntrinsic` `tbl` calls,
+            // 4 contiguous `<16 x i8>` stores (offsets 0, 16, 32, 48 on same `pdst`).
+            let v16i8 = Ty::vector(Scalar::I8, 16).unwrap();
+            let vloop_blk = (0..v.blocks())
+                .find(|&b| {
+                    v.block(Block(b as u32))
+                        .filter(|&i| v.op(i) == Op::TargetIntrinsic)
+                        .count()
+                        == 4
+                })
+                .expect("expected 4x-unrolled vloop block");
+            let range = v.block(Block(vloop_blk as u32));
+            let first_load = range
+                .clone()
+                .find(|&i| v.op(i) == Op::Load && Ty(v.tys[i]) == v16i8)
+                .expect("expected vector load in vloop");
+
+            let load_base = v.extra[v.data[first_load] as usize];
+            for u in 0..4usize {
+                let li = first_load + u;
+                assert_eq!(v.op(li), Op::Load, "lane {u} must be grouped load (mask={mask})");
+                assert_eq!(Ty(v.tys[li]), v16i8);
+                let lat = v.data[li] as usize;
+                assert_eq!(v.extra[lat], load_base, "all 4 loads must share psrc for ldp pairing");
+                assert_eq!(v.extra[lat + 1] as i32, (u * 16) as i32);
+            }
+            for u in 0..4usize {
+                let mi = first_load + 4 + u;
+                assert_eq!(v.op(mi), Op::And, "lane {u} must be grouped index mask (mask={mask})");
+                assert_eq!(Ty(v.tys[mi]), v16i8);
+            }
+            for u in 0..4usize {
+                let ti = first_load + 8 + u;
+                assert_eq!(v.op(ti), Op::TargetIntrinsic, "lane {u} must be grouped tbl (mask={mask})");
+                assert_eq!(Ty(v.tys[ti]), v16i8);
+            }
+            let first_store = first_load + 12;
+            let store_base = v.extra[v.data[first_store] as usize + 1];
+            for u in 0..4usize {
+                let si = first_store + u;
+                assert_eq!(v.op(si), Op::Store, "lane {u} must be grouped store (mask={mask})");
+                let sat = v.data[si] as usize;
+                assert_eq!(v.extra[sat + 1], store_base, "all 4 stores must share pdst for stp pairing");
+                assert_eq!(v.extra[sat + 2] as i32, (u * 16) as i32);
+            }
+        }
+    }
+
+    #[test]
+    fn lut16_elides_runtime_alias_guard_when_out_is_noalias() {
+        let build = |out_noalias: bool| -> Func<TestHeap> {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let mut p_dst = Param::of(Ty::PTR);
+            if out_noalias {
+                p_dst.facts = Facts { bits: ParamFactsRec::NOALIAS, ..Facts::default() };
+            }
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[p_dst, Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[],
+            );
+            b.set_signature(sig);
+            let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let lut = b.param(Ty::PTR);
+            let n = b.param(Ty::I64);
+            let z = b.iconst(Ty::I64, 0);
+            b.jump((hdr, &[z]));
+
+            b.begin(hdr);
+            let i = b.param(Ty::I64);
+            let keep = b.icmp(IntCond::Ult, i, n);
+            b.br(Flags::NONE, keep, (body, &[]), (exit, &[]));
+
+            b.begin(body);
+            let psrc = b.ptr_add(Flags::NONE, src, i);
+            let byte = b.load(Ty::I8, Flags::NONE, psrc, 0, MemAttrs::default());
+            let k15 = b.iconst(Ty::I8, 15);
+            let masked = b.binary(Op::And, Flags::NONE, byte, k15);
+            let idx64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, masked);
+            let plut = b.ptr_add(Flags::NONE, lut, idx64);
+            let out_b = b.load(Ty::I8, Flags::NONE, plut, 0, MemAttrs::default());
+            let pdst = b.ptr_add(Flags::NONE, dst, i);
+            b.store(Flags::NONE, out_b, pdst, 0, MemAttrs::default());
+            let one = b.iconst(Ty::I64, 1);
+            let i_next = b.binary(Op::Add, Flags::NONE, i, one);
+            b.jump((hdr, &[i_next]));
+
+            b.begin(exit);
+            b.ret(&[]);
+            b.finish_checked().unwrap()
+        };
+
+        // With `NOALIAS` on `out`: runtime alias guards (`PtrAddr`/`Umin`) are completely elided!
+        let f_noalias = build(true);
+        let out_noalias =
+            lower_simd_idioms(f_noalias.view(), SimdIdiomOpts::apple_silicon(), TestHeap).unwrap();
+        let v_noalias = out_noalias.func.view();
+        verify(v_noalias).unwrap();
+        assert_eq!(out_noalias.stats.tbl_loops, 1);
+        assert_eq!(count_intrinsic_calls(&v_noalias, NEON_TBL16_INTRINSIC), 4);
+        assert_eq!(
+            v_noalias.block(Block(0)).filter(|&i| v_noalias.op(i) == Op::PtrAddr).count(),
+            0,
+            "NOALIAS `out` must skip runtime pointer overlap checks"
+        );
+        assert_eq!(
+            v_noalias.block(Block(0)).filter(|&i| v_noalias.op(i) == Op::Umin).count(),
+            0,
+            "NOALIAS `out` must skip runtime Umin overlap distance check"
+        );
+
+        // Control: without `NOALIAS`, the runtime overlap guard MUST still be emitted!
+        let f_aliased = build(false);
+        let out_aliased =
+            lower_simd_idioms(f_aliased.view(), SimdIdiomOpts::apple_silicon(), TestHeap).unwrap();
+        let v_aliased = out_aliased.func.view();
+        verify(v_aliased).unwrap();
+        assert!(
+            v_aliased.block(Block(0)).filter(|&i| v_aliased.op(i) == Op::PtrAddr).count() >= 3,
+            "aliased raw pointer `out` must retain runtime overlap checks"
+        );
+        assert_eq!(
+            v_aliased.block(Block(0)).filter(|&i| v_aliased.op(i) == Op::Umin).count(),
+            1
+        );
     }
 }

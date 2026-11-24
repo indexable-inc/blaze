@@ -85,12 +85,11 @@ const HEADERS_CURRENT: u8 = 0;
 const HEADERS_ABSENT: u8 = 1;
 const POINTER_DOMAIN: &str = "blaze-cli engine-check pointer";
 
-/// The root the checkout's stored answer hangs from, whichever tools wrote it (the module's doc,
-/// "THE TOOLS"; a machine's path is hashed here alone: a root is local, never shared).
-pub(crate) fn root_name<'f>(checkout: &str, frame: &'f Frame) -> blaze_own::String<&'f Frame> {
-    let id = ContentId::of("blaze-cli engine-check root 2", checkout.as_bytes());
+/// Formats an answer root name from `prefix` and `input` under the checkout root domain.
+fn root_name_with<'f>(prefix: &str, input: &[u8], frame: &'f Frame) -> blaze_own::String<&'f Frame> {
+    let id = ContentId::of("blaze-cli engine-check root 2", input);
     let mut name = blaze_own::String::new_in(frame);
-    name.push_str("engine.");
+    name.push_str(prefix);
     // A home made before the root stopped hashing the tools holds its answers under names no
     // request asks for again: dead roots, whose records the store's cleanup takes when their
     // pins expire, `ROOT_LIFE_NS` after their last renewal (store/plain_place.rs `pin`).
@@ -102,6 +101,72 @@ pub(crate) fn root_name<'f>(checkout: &str, frame: &'f Frame) -> blaze_own::Stri
         let _ = write!(name, "{byte:02x}");
     }
     name
+}
+
+/// The root the checkout's stored answer hangs from, whichever tools wrote it (the module's doc,
+/// "THE TOOLS"; a machine's path is hashed here alone: a root is local, never shared).
+pub(crate) fn root_name<'f>(checkout: &str, frame: &'f Frame) -> blaze_own::String<&'f Frame> {
+    root_name_with("engine.", checkout.as_bytes(), frame)
+}
+
+/// The root a check of `scope` hangs from: equal to [`root_name`] for whole-workspace checks, and
+/// a disjoint `"engine.s.<hex>"` root for scoped `blaze test` / `blaze run` / `blaze export`
+/// requests so scoped checks never overwrite the whole-workspace answer while still supporting
+/// certificate hits and incremental edits for repeated scoped runs.
+pub(crate) fn scoped_root_name<'f>(checkout: &str, scope: crate::engine_check::CheckScope<'_>, frame: &'f Frame) -> blaze_own::String<&'f Frame> {
+    match scope {
+        crate::engine_check::CheckScope::Whole => root_name(checkout, frame),
+        crate::engine_check::CheckScope::Test { packages, bin, bin_roots } => {
+            let mut key = blaze_own::Vec::new_in(frame);
+            let push_part = |buf: &mut blaze_own::Vec<u8, &'f Frame>, bytes: &[u8]| {
+                let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                buf.extend_from_slice(&len.to_le_bytes());
+                buf.extend_from_slice(bytes);
+            };
+            push_part(&mut key, checkout.as_bytes());
+            push_part(&mut key, b"test");
+            let pkg_count = u64::try_from(packages.len()).unwrap_or(u64::MAX);
+            key.extend_from_slice(&pkg_count.to_le_bytes());
+            for package in packages {
+                push_part(&mut key, package.as_bytes());
+            }
+            match bin {
+                Some(name) => {
+                    key.push(1);
+                    push_part(&mut key, name.as_bytes());
+                }
+                None => key.push(0),
+            }
+            let root_count = u64::try_from(bin_roots.len()).unwrap_or(u64::MAX);
+            key.extend_from_slice(&root_count.to_le_bytes());
+            for root in bin_roots {
+                push_part(&mut key, root.as_bytes());
+            }
+            root_name_with("engine.s.", key.as_slice(), frame)
+        }
+        crate::engine_check::CheckScope::Bin { package, root } => {
+            let mut key = blaze_own::Vec::new_in(frame);
+            let push_part = |buf: &mut blaze_own::Vec<u8, &'f Frame>, bytes: &[u8]| {
+                let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                buf.extend_from_slice(&len.to_le_bytes());
+                buf.extend_from_slice(bytes);
+            };
+            push_part(&mut key, checkout.as_bytes());
+            push_part(&mut key, b"bin");
+            push_part(&mut key, package.as_bytes());
+            push_part(&mut key, root.as_bytes());
+            root_name_with("engine.s.", key.as_slice(), frame)
+        }
+    }
+}
+
+/// Whether a saved answer should update the home's shared workspace bases (`BASES_ROOT`): whole-
+/// workspace checks keep their base; scoped checks skip it so a partial answer never replaces a
+/// workspace base.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SaveBase {
+    Keep,
+    Skip,
 }
 
 /// The control of main.rs tests `a_moved_body_checker_enters_its_bodies_alone` (rule 23):
@@ -1296,8 +1361,9 @@ pub(crate) fn save_edit<'m, D: Driver, S: Sharing>(
     frame: &Frame,
     row_keys: &[Key],
     (last_root, workers): (Option<Key>, core::num::NonZeroU32),
+    save_base: SaveBase,
 ) -> Result<Saved, CliError> {
-    save(cx, store, lent, name, toolchain, tools, kept, printed, lines, last, Writer::Phases, rows, journal, alloc, frame, row_keys, (last_root, Rekey::Changed), workers)
+    save(cx, store, lent, name, toolchain, tools, kept, printed, lines, last, Writer::Phases, rows, journal, alloc, frame, row_keys, (last_root, Rekey::Changed), workers, save_base)
 }
 
 /// [`save_edit`] keying every page into the reach root: the page edit test's planted control.
@@ -1320,7 +1386,7 @@ pub(crate) fn save_edit_rekeying_all<'m, D: Driver, S: Sharing>(
     frame: &Frame,
     last_root: Option<Key>,
 ) -> Result<Saved, CliError> {
-    save(cx, store, lent, name, toolchain, tools, kept, printed, lines, last, Writer::Phases, rows, journal, alloc, frame, &[], (last_root, Rekey::All), core::num::NonZeroU32::MIN)
+    save(cx, store, lent, name, toolchain, tools, kept, printed, lines, last, Writer::Phases, rows, journal, alloc, frame, &[], (last_root, Rekey::All), core::num::NonZeroU32::MIN, SaveBase::Keep)
 }
 
 /// The `Ready` driver's commit of an edit (D187, engine_ready_check.rs): `kept`'s changed rows
@@ -1346,8 +1412,9 @@ pub(crate) fn save_changes<'m, D: Driver, S: Sharing>(
     frame: &Frame,
     row_keys: &[Key],
     (last_root, workers): (Option<Key>, core::num::NonZeroU32),
+    save_base: SaveBase,
 ) -> Result<Saved, CliError> {
-    save(cx, store, lent, name, toolchain, tools, kept, printed, lines, Some(last), Writer::Ready, rows, journal, alloc, frame, row_keys, (last_root, Rekey::Changed), workers)
+    save(cx, store, lent, name, toolchain, tools, kept, printed, lines, Some(last), Writer::Ready, rows, journal, alloc, frame, row_keys, (last_root, Rekey::Changed), workers, save_base)
 }
 
 const SAVE_TASK_FRAME: usize = 64 << 10;
@@ -1373,6 +1440,7 @@ fn save<'m, D: Driver, S: Sharing>(
     row_keys: &[Key],
     (last_root, rekey): (Option<Key>, Rekey),
     workers: core::num::NonZeroU32,
+    save_base: SaveBase,
 ) -> Result<Saved, CliError> {
     let encoded = match last {
         Some(stored) => {
@@ -1639,7 +1707,12 @@ fn save<'m, D: Driver, S: Sharing>(
     // so subsequent runs do not probe older segments for a stale checkpoint of an earlier answer.
     store.pin(crate::journal_checkpoint::name(name, frame).as_str(), &[key])?;
     // This answer as its workspace's newest base: a checkout of it with none of its own starts
-    // from it ([`BASES_ROOT`]). The control keeps the one home-wide pointer instead.
+    // from it ([`BASES_ROOT`]). Scoped checks skip this so a partial answer never replaces a
+    // workspace base. The control keeps the one home-wide pointer instead.
+    if save_base == SaveBase::Skip {
+        saved.base = BaseKept::NotAsked;
+        return Ok(saved);
+    }
     #[cfg(test)]
     if base_plant() == BasePlant::OnePointer {
         store.pin(LATEST_ROOT, &[key])?;

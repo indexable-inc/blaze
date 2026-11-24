@@ -182,22 +182,86 @@ impl RegionTypes for BodyTypes<'_> {
     }
 }
 
-/// One column [`Lower::lay_slots`] reads: the signature's own, or an impl's value laid through.
-/// A region of the column being laid, as the body's slot reads it: the signature's own as
-/// written (`binds` `None`); an impl value's through its lifetimes' bindings (`Param(i)` is
-/// `binds[i]`, `'static` kept, anything else a placeholder).
-fn bound_region(binds: Option<&[Option<Region>]>, r: Region) -> Option<Region> {
-    let Some(binds) = binds else { return Some(r) };
-    match r {
-        Region::Param(i) => binds.get(i as usize).copied().flatten(),
-        Region::Static => Some(Region::Static),
-        Region::Late { .. } => None,
+/// Lifetime and type parameter bindings for laying an impl's associated type value (`through_impl`).
+/// `regs[..gat_base]` holds the impl's own `Param(i)` bindings; `regs[gat_base..]` holds the GAT's
+/// own lifetime arguments (`Region::Late { binder: u32::MAX, var }`). `tys[p]` maps impl type
+/// parameter `Param(p)` to `(declared_ty_in_heads, start, len)` slicing `ty_slots`.
+struct ImplBinds<A: Allocator> {
+    regs: Vec<Option<Region>, A>,
+    gat_base: usize,
+    tys: Vec<Option<(PTy, usize, usize)>, A>,
+    ty_slots: Vec<Option<Region>, A>,
+}
+
+impl<A: Allocator> ImplBinds<A> {
+    fn region(&self, r: Region) -> Option<Region> {
+        match r {
+            Region::Param(i) => {
+                let idx = usize::try_from(i).ok()?;
+                self.regs.get(..self.gat_base).and_then(|p| p.get(idx)).copied().flatten()
+            }
+            Region::Static => Some(Region::Static),
+            Region::Late { binder: u32::MAX, var } => {
+                let idx = usize::try_from(var).ok()?;
+                self.regs.get(self.gat_base..).and_then(|g| g.get(idx)).copied().flatten()
+            }
+            Region::Late { .. } => None,
+        }
+    }
+
+    fn ty_param(&self, p: u32) -> Option<(PTy, &[Option<Region>])> {
+        let idx = usize::try_from(p).ok()?;
+        let &(ty, start, len) = self.tys.get(idx)?.as_ref()?;
+        let end = start.checked_add(len)?;
+        Some((ty, self.ty_slots.get(start..end)?))
     }
 }
 
+/// Slot backing for a `lay_slots` frame: either raw `Region`s from a signature / impl column
+/// (mapped through `frame.binds`), or pre-mapped `Option<Region>`s from a substituted type param.
+enum FrameSlots<'s, A: Allocator> {
+    Borrowed(&'s [Region]),
+    Owned(Vec<Option<Region>, A>),
+}
+
+impl<A: Allocator> FrameSlots<'_, A> {
+    fn len(&self) -> usize {
+        match self {
+            FrameSlots::Borrowed(s) => s.len(),
+            FrameSlots::Owned(v) => v.len(),
+        }
+    }
+
+    fn push_mapped(&self, at: usize, count: usize, binds: Option<&ImplBinds<A>>, out: &mut Vec<Option<Region>, A>) -> bool {
+        let Some(end) = at.checked_add(count) else { return false };
+        match self {
+            FrameSlots::Borrowed(s) => {
+                let Some(slice) = s.get(at..end) else { return false };
+                for &r in slice {
+                    out.push(match binds {
+                        Some(b) => b.region(r),
+                        None => Some(r),
+                    });
+                }
+                true
+            }
+            FrameSlots::Owned(v) => {
+                let Some(slice) = v.get(at..end) else { return false };
+                for &r in slice {
+                    out.push(r);
+                }
+                true
+            }
+        }
+    }
+}
+
+/// Maximum nesting depth of impl associated-type projections unfolded inside `lay_slots`.
+const MAX_IMPL_PROJ_DEPTH: usize = 8;
+
 /// What a declared projection laid through its selected impl gives (`Lower::through_impl`):
-/// the impl's value, its column, and its lifetimes' bindings.
-type ThroughImpl<'b, A> = Option<(PTy, &'b [Region], Vec<Option<Region>, A>)>;
+/// the impl's value, its column, and its lifetime + type bindings.
+type ThroughImpl<'b, A> = Option<(PTy, &'b [Region], ImplBinds<A>)>;
 
 impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> {
     /// The region slots of `t` (the module doc), bounded.
@@ -365,9 +429,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         let body = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &table);
 
         struct Frame<'s, Al: Allocator> {
-            slots: &'s [Region],
+            slots: FrameSlots<'s, Al>,
             at: usize,
-            binds: Option<Vec<Option<Region>, Al>>,
+            binds: Option<ImplBinds<Al>>,
             stack: Vec<(PTy, PTy), Al>,
             steps: u32,
             /// `Some((trait_, body_ty, before))` for an impl value laid through a projection.
@@ -377,7 +441,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         let mut root_stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
         root_stack.push((declared, body_t));
         let mut frames: Vec<Frame<'_, A>, A> = Vec::new_in(self.alloc);
-        frames.push(Frame { slots, at: 0, binds: None, stack: root_stack, steps: 0, impl_ctx: None });
+        frames.push(Frame { slots: FrameSlots::Borrowed(slots), at: 0, binds: None, stack: root_stack, steps: 0, impl_ctx: None });
 
         'frames: while let Some(mut frame) = frames.pop() {
             let mut aligned = true;
@@ -391,6 +455,30 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 if matches!(dn, PNode::ConstValue { .. } | PNode::ConstParam(_)) && matches!(bn, PNode::ConstValue { .. } | PNode::ConstParam(_)) {
                     continue;
                 }
+                // Inside an impl's associated type value, substitute a bound impl type parameter
+                // (`Param(p)`) with its argument type and pre-mapped slots (e.g. `type Output = T`
+                // or `impl<T0, T1> SolType for (T0, T1)`).
+                if let PNode::Param(p) = dn
+                    && let Some(ref binds) = frame.binds
+                    && let Some((sub_ty, sub_slots)) = binds.ty_param(p)
+                {
+                    if frames.len() < MAX_IMPL_PROJ_DEPTH {
+                        let mut owned: Vec<Option<Region>, A> = Vec::with_capacity_in(sub_slots.len(), self.alloc);
+                        owned.extend_from_slice(sub_slots);
+                        let mut child_stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
+                        child_stack.push((sub_ty, b));
+                        frames.push(frame);
+                        frames.push(Frame {
+                            slots: FrameSlots::Owned(owned),
+                            at: 0,
+                            binds: None,
+                            stack: child_stack,
+                            steps: 0,
+                            impl_ctx: None,
+                        });
+                        continue 'frames;
+                    }
+                }
                 if blaze_borrow::head_eq(dn, bn) {
                     let (Ok(own), Ok(dk), Ok(bo), Ok(bk)) = (heads.own(d), heads.kids(d), body.own(b), body.kids(b)) else {
                         aligned = false;
@@ -400,14 +488,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                         aligned = false;
                         break;
                     }
-                    let Some(mine) = frame.slots.get(frame.at..frame.at + own.len()) else {
+                    if !frame.slots.push_mapped(frame.at, own.len(), frame.binds.as_ref(), out) {
                         aligned = false;
                         break;
-                    };
-                    frame.at += own.len();
-                    for &r in mine {
-                        out.push(bound_region(frame.binds.as_deref(), r));
                     }
+                    frame.at += own.len();
                     for k in (0..dk.len()).rev() {
                         let (Some(x), Some(y)) = (dk.get(k), bk.get(k)) else { return self.refuse(Form::Malformed, e) };
                         frame.stack.push((x, y));
@@ -419,23 +504,24 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                     aligned = false;
                     break;
                 };
-                let Some(mine) = frame.slots.get(frame.at..frame.at + dc.len()) else {
+                let mut mine_mapped: Vec<Option<Region>, A> = Vec::with_capacity_in(dc.len(), self.alloc);
+                if !frame.slots.push_mapped(frame.at, dc.len(), frame.binds.as_ref(), &mut mine_mapped) {
                     aligned = false;
                     break;
-                };
+                }
                 frame.at += dc.len();
                 match dn {
-                    PNode::Alias { trait_, .. } if frame.binds.is_some() => {
+                    PNode::Alias { trait_, .. } if frames.len() >= MAX_IMPL_PROJ_DEPTH => {
                         self.coarse_step(Form::ProjectionUnbound { trait_, why: ProjectionUnbound::InsideImplValue }, e);
                     }
                     PNode::Alias { trait_, name, .. } => {
-                        if let Some((vty, vslots, bound)) = self.through_impl(&heads, trait_, name, d, mine, e)? {
+                        if let Some((vty, vslots, bound)) = self.through_impl(&heads, trait_, name, d, &mine_mapped, frame.binds.as_ref(), frames.len(), e)? {
                             let before = out.len();
                             let mut child_stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
                             child_stack.push((vty, b));
                             frames.push(frame);
                             frames.push(Frame {
-                                slots: vslots,
+                                slots: FrameSlots::Borrowed(vslots),
                                 at: 0,
                                 binds: Some(bound),
                                 stack: child_stack,
@@ -452,8 +538,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                         };
                         if let Some(rp) = rpit.as_deref_mut() {
                             let Ok(cap_start) = u32::try_from(rp.caps.len()) else { return self.refuse(Form::Bound, e) };
-                            for &r in mine {
-                                if let Some(rr) = bound_region(frame.binds.as_deref(), r) {
+                            for &r in mine_mapped.iter() {
+                                if let Some(rr) = r {
                                     rp.caps.push(rr);
                                 }
                             }
@@ -511,60 +597,334 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         Ok(false)
     }
 
-    /// The declared projection `d` (`<S as trait_>::name`, `mine` its slots in the signature's
-    /// column) laid through the impl the type checker selected for the body's own signature
-    /// ([`Lower::lay_slots`]): the impl's value and column, and its lifetimes bound from the
-    /// alias's self type slots against the impl header's self type column (the Reference,
-    /// "Generic implementations": an impl's lifetime appears in its self type or trait
-    /// reference; one only in the trait's stays unbound, a placeholder). `None`: placeholders,
-    /// noted as stricter where the projection is not `Selected::Generic` (each step its
-    /// [`ProjectionUnbound`], as `lay_through_impl` names them).
+    /// The declared projection `d` (`<S as trait_>::name`, `mine` its already-mapped slots in the
+    /// body signature's numbering) laid through the impl the type checker selected for the body's
+    /// own signature ([`Lower::lay_slots`]): binds the impl's lifetimes from both the trait
+    /// reference's own lifetime arguments (`trait_col.own()`) and the header's `Self` and trait
+    /// type arguments (structurally, also binding impl type parameters `Param(p)`), and binds a
+    /// GAT's own lifetimes (`mine[tl..own]`) for `Region::Late { binder: u32::MAX, var }`.
     ///
     /// Read list (rule 21): the impl's head record, as `lay_through_impl`'s (blaze-ladder
     /// borrows.rs files a head read for every impl a `selected` row names).
-    fn through_impl(&self, heads: &Columns<'_>, trait_: ItemKey, name: Name, d: PTy, mine: &[Region], e: ExprId) -> Result<ThroughImpl<'b, A>, Refusal> {
+    #[expect(clippy::too_many_arguments, reason = "projection head, slots, outer bindings, depth, and site")]
+    fn through_impl(
+        &self,
+        heads: &Columns<'_>,
+        trait_: ItemKey,
+        name: Name,
+        d: PTy,
+        mine: &[Option<Region>],
+        outer: Option<&ImplBinds<A>>,
+        depth: usize,
+        e: ExprId,
+    ) -> Result<ThroughImpl<'b, A>, Refusal> {
         let note = |why: ProjectionUnbound| -> Result<ThroughImpl<'b, A>, Refusal> {
             self.coarse_step(Form::ProjectionUnbound { trait_, why }, e);
             Ok(None)
         };
-        let imp = match self.sig_impl(trait_, name) {
+        let Ok(Kids::List(raw_args)) = heads.kids(d) else { return note(ProjectionUnbound::SelfTypeUnread) };
+        let Ok(own) = heads.own(d) else { return note(ProjectionUnbound::GatLifetimes) };
+        let own_len = own.len();
+        let Some(after_own) = mine.get(own_len..) else { return note(ProjectionUnbound::GatLifetimes) };
+        // Resolve each argument of `d` through `outer`'s type bindings (and if an argument is
+        // itself a concrete outer projection like `Self::Parameters<'a>`, normalize it one step
+        // so both `sig_impl` disambiguation and impl-header matching see its normalized head).
+        let mut arg_tys: Vec<PTy, A> = Vec::with_capacity_in(raw_args.len(), self.alloc);
+        let mut arg_spans: Vec<(usize, usize), A> = Vec::with_capacity_in(raw_args.len(), self.alloc);
+        let mut arg_slots: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
+        let mut cursor = 0usize;
+        for &raw_arg in raw_args {
+            let Ok(raw_n) = heads.count(raw_arg) else { return note(ProjectionUnbound::SelfTypeUnread) };
+            let Some(end) = cursor.checked_add(raw_n.len()) else { return note(ProjectionUnbound::SelfTypeUnread) };
+            let Some(raw_slice) = after_own.get(cursor..end) else { return note(ProjectionUnbound::SelfTypeUnread) };
+            cursor = end;
+            let (mut cur_ty, mut cur_start, mut cur_len) = match heads.node(raw_arg) {
+                Ok(PNode::Param(p)) => match outer.and_then(|o| o.ty_param(p)) {
+                    Some((sub_ty, sub_sl)) => {
+                        let s = arg_slots.len();
+                        arg_slots.extend_from_slice(sub_sl);
+                        (sub_ty, s, sub_sl.len())
+                    }
+                    None => {
+                        let s = arg_slots.len();
+                        arg_slots.extend_from_slice(raw_slice);
+                        (raw_arg, s, raw_slice.len())
+                    }
+                },
+                _ => {
+                    let s = arg_slots.len();
+                    arg_slots.extend_from_slice(raw_slice);
+                    (raw_arg, s, raw_slice.len())
+                }
+            };
+            // Normalize an outer `Alias` argument (e.g. `<Call as SolCall>::Parameters<'a>` ->
+            // `(sol_data::Address, ...)`) so selecting the outer trait sees the concrete tuple.
+            let mut norm_steps = 0usize;
+            while depth + norm_steps + 1 < MAX_IMPL_PROJ_DEPTH
+                && let Ok(PNode::Alias { trait_: at, name: an, .. }) = heads.node(cur_ty)
+            {
+                let Some(slice) = arg_slots.get(cur_start..cur_start + cur_len) else { break };
+                let mut tmp: Vec<Option<Region>, A> = Vec::with_capacity_in(slice.len(), self.alloc);
+                tmp.extend_from_slice(slice);
+                match self.through_impl_quiet(heads, at, an, cur_ty, &tmp, None, depth + norm_steps + 1, e)? {
+                    Some((nty, nslots, nbinds)) => {
+                        let s = arg_slots.len();
+                        for &r in nslots {
+                            arg_slots.push(nbinds.region(r));
+                        }
+                        cur_ty = nty;
+                        cur_start = s;
+                        cur_len = nslots.len();
+                        norm_steps += 1;
+                    }
+                    None => break,
+                }
+            }
+            arg_tys.push(cur_ty);
+            arg_spans.push((cur_start, cur_len));
+        }
+
+        let imp = match self.sig_impl(heads, trait_, name, Some(&arg_tys)) {
             Ok(Some(imp)) => imp,
             Ok(None) => return Ok(None),
             Err(why) => return note(why),
         };
         let facts: &'b F = self.facts;
         let regions = facts.regions();
-        let Ok((self_col, _)) = regions.impl_header(imp) else { return note(ProjectionUnbound::ImplHeaderUnread) };
+        let Ok((self_col, trait_col)) = regions.impl_header(imp) else { return note(ProjectionUnbound::ImplHeaderUnread) };
         let Ok(value) = regions.impl_assoc(imp, name) else { return note(ProjectionUnbound::ImplAssocUnread) };
         let Ok(params) = regions.lifetime_params(imp) else { return note(ProjectionUnbound::ImplParamsUnread) };
-        match heads.own(d) {
-            Ok(own) if own.get() == 0 => {}
-            _ => return note(ProjectionUnbound::GatLifetimes),
+        let trait_own: &[Region] = match trait_col {
+            Some(tc) => tc.own(),
+            None if own_len == 0 => &[],
+            None => return note(ProjectionUnbound::GatLifetimes),
+        };
+        let tl = trait_own.len();
+        if own_len < tl {
+            return note(ProjectionUnbound::GatLifetimes);
         }
-        let Ok(Kids::List(args)) = heads.kids(d) else { return note(ProjectionUnbound::SelfTypeUnread) };
-        let Some(&self_ty) = args.first() else { return note(ProjectionUnbound::SelfTypeUnread) };
-        let Ok(self_n) = heads.count(self_ty) else { return note(ProjectionUnbound::SelfTypeUnread) };
-        let differ = ProjectionUnbound::SelfSlotsDiffer { imp: self_col.as_slice().len() as u32, declared: self_n.get() };
-        let Some(decl_self) = mine.get(..self_n.len()) else { return note(differ) };
-        if self_col.as_slice().len() != decl_self.len() {
-            return note(differ);
-        }
-        let mut bind: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
-        bind.resize(params.count() as usize, None);
-        for (&ir, &dr) in self_col.as_slice().iter().zip(decl_self.iter()) {
-            match ir {
-                Region::Param(i) => {
-                    let Some(slot) = bind.get_mut(i as usize) else { return note(ProjectionUnbound::SelfRegionUnnumbered) };
-                    match *slot {
-                        Some(x) if x != dr => return note(ProjectionUnbound::BoundTwice),
-                        _ => *slot = Some(dr),
-                    }
+        let gat_n = own_len - tl;
+        let Some(decl_trait_lts) = mine.get(..tl) else { return note(ProjectionUnbound::GatLifetimes) };
+        let Some(decl_gat_lts) = mine.get(tl..own_len) else { return note(ProjectionUnbound::GatLifetimes) };
+        let Ok(gat_base) = usize::try_from(params.count()) else { return note(ProjectionUnbound::SelfRegionUnnumbered) };
+        let mut regs: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
+        regs.resize(gat_base + gat_n, None);
+        // Bind trait lifetime arguments (`trait_col.own()` against `mine[0..tl]`).
+        {
+            let Some(param_regs) = regs.get_mut(..gat_base) else { return note(ProjectionUnbound::SelfRegionUnnumbered) };
+            for (&ir, &dr_opt) in trait_own.iter().zip(decl_trait_lts.iter()) {
+                if let Err(why) = bind_one_region(param_regs, ir, dr_opt) {
+                    return note(why);
                 }
-                // `impl Tr for Wrap<'static>`: the selection itself shows the region `'static`.
-                Region::Static => {}
-                Region::Late { .. } => return note(ProjectionUnbound::SelfRegionUnnumbered),
             }
         }
-        Ok(Some((value.ty(), value.as_slice(), bind)))
+        // Populate GAT lifetime arguments (`mine[tl..own]`).
+        for (j, &dr_opt) in decl_gat_lts.iter().enumerate() {
+            if let Some(slot) = regs.get_mut(gat_base + j) {
+                *slot = dr_opt;
+            }
+        }
+        let mut ty_binds: Vec<Option<(PTy, usize, usize)>, A> = Vec::new_in(self.alloc);
+        let mut ty_slots: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
+        // Bind `Self` (`self_col` against `arg_tys[0]`), structurally so generic impls like
+        // `impl<T0, T1> SolType for (T0, T1)` bind both lifetimes and type parameters `T0, T1`.
+        let Some(&self_ty) = arg_tys.first() else { return note(ProjectionUnbound::SelfTypeUnread) };
+        let Some(&(s_start, s_len)) = arg_spans.first() else { return note(ProjectionUnbound::SelfTypeUnread) };
+        let Some(decl_self) = arg_slots.get(s_start..s_start + s_len) else { return note(ProjectionUnbound::SelfTypeUnread) };
+        {
+            let Some(param_regs) = regs.get_mut(..gat_base) else { return note(ProjectionUnbound::SelfRegionUnnumbered) };
+            if let Err(why) = self.bind_header_ty(heads, self_col.ty(), self_col.as_slice(), self_ty, decl_self, param_regs, &mut ty_binds, &mut ty_slots, e)? {
+                return note(why);
+            }
+            // Also bind any trait type arguments (`trait_col.child(k)` against `arg_tys[k]` for `k >= 1`)
+            // so impl lifetimes or type params appearing in trait arguments are bound too.
+            if let Some(tc) = trait_col
+                && let Ok(Kids::List(hkids)) = heads.kids(tc.ty())
+            {
+                for k in 1..arg_tys.len().min(hkids.len()) {
+                    let Some(&h_arg) = hkids.get(k) else { break };
+                    let Ok(k32) = u32::try_from(k) else { break };
+                    let Some(h_slots) = tc.child(k32) else { break };
+                    let Some(&a_ty) = arg_tys.get(k) else { break };
+                    let Some(&(a_start, a_len)) = arg_spans.get(k) else { break };
+                    let Some(a_slots) = arg_slots.get(a_start..a_start + a_len) else { break };
+                    if let Err(why) = self.bind_header_ty(heads, h_arg, h_slots, a_ty, a_slots, param_regs, &mut ty_binds, &mut ty_slots, e)? {
+                        return note(why);
+                    }
+                }
+            }
+        }
+        Ok(Some((value.ty(), value.as_slice(), ImplBinds { regs, gat_base, tys: ty_binds, ty_slots })))
+    }
+
+    /// Quiet variant of [`Lower::through_impl`] used for speculative normalization of an alias's
+    /// argument (never records a coarse step on failure).
+    #[expect(clippy::too_many_arguments, reason = "same shape as through_impl")]
+    fn through_impl_quiet(
+        &self,
+        heads: &Columns<'_>,
+        trait_: ItemKey,
+        name: Name,
+        d: PTy,
+        mine: &[Option<Region>],
+        outer: Option<&ImplBinds<A>>,
+        depth: usize,
+        e: ExprId,
+    ) -> Result<ThroughImpl<'b, A>, Refusal> {
+        let Ok(Kids::List(raw_args)) = heads.kids(d) else { return Ok(None) };
+        let Ok(own) = heads.own(d) else { return Ok(None) };
+        let own_len = own.len();
+        let Some(after_own) = mine.get(own_len..) else { return Ok(None) };
+        let Ok(Some(imp)) = self.sig_impl(heads, trait_, name, Some(raw_args)) else { return Ok(None) };
+        let regions = self.facts.regions();
+        let Ok((self_col, trait_col)) = regions.impl_header(imp) else { return Ok(None) };
+        let Ok(value) = regions.impl_assoc(imp, name) else { return Ok(None) };
+        let Ok(params) = regions.lifetime_params(imp) else { return Ok(None) };
+        let trait_own: &[Region] = match trait_col {
+            Some(tc) => tc.own(),
+            None if own_len == 0 => &[],
+            None => return Ok(None),
+        };
+        let tl = trait_own.len();
+        if own_len < tl {
+            return Ok(None);
+        }
+        let gat_n = own_len - tl;
+        let Some(decl_trait_lts) = mine.get(..tl) else { return Ok(None) };
+        let Some(decl_gat_lts) = mine.get(tl..own_len) else { return Ok(None) };
+        let Ok(gat_base) = usize::try_from(params.count()) else { return Ok(None) };
+        let mut regs: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
+        regs.resize(gat_base + gat_n, None);
+        {
+            let Some(param_regs) = regs.get_mut(..gat_base) else { return Ok(None) };
+            for (&ir, &dr_opt) in trait_own.iter().zip(decl_trait_lts.iter()) {
+                if bind_one_region(param_regs, ir, dr_opt).is_err() {
+                    return Ok(None);
+                }
+            }
+        }
+        for (j, &dr_opt) in decl_gat_lts.iter().enumerate() {
+            if let Some(slot) = regs.get_mut(gat_base + j) {
+                *slot = dr_opt;
+            }
+        }
+        let Some(&self_ty) = raw_args.first() else { return Ok(None) };
+        let Ok(self_n) = heads.count(self_ty) else { return Ok(None) };
+        let Some(decl_self) = after_own.get(..self_n.len()) else { return Ok(None) };
+        let mut ty_binds: Vec<Option<(PTy, usize, usize)>, A> = Vec::new_in(self.alloc);
+        let mut ty_slots: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
+        let _ = (outer, depth);
+        let Some(param_regs) = regs.get_mut(..gat_base) else { return Ok(None) };
+        if self.bind_header_ty(heads, self_col.ty(), self_col.as_slice(), self_ty, decl_self, param_regs, &mut ty_binds, &mut ty_slots, e)?.is_err() {
+            return Ok(None);
+        }
+        Ok(Some((value.ty(), value.as_slice(), ImplBinds { regs, gat_base, tys: ty_binds, ty_slots })))
+    }
+
+    /// Structurally match an impl header type (`h_ty`, `h_slots`) against a concrete declared
+    /// projection argument (`a_ty`, `a_slots`), binding impl lifetime parameters into `reg_binds`
+    /// and impl type parameters into `ty_binds` / `ty_slots`.
+    #[expect(clippy::too_many_arguments, reason = "structural header-vs-argument binder")]
+    fn bind_header_ty(
+        &self,
+        heads: &Columns<'_>,
+        h_ty: PTy,
+        h_slots: &[Region],
+        a_ty: PTy,
+        a_slots: &[Option<Region>],
+        reg_binds: &mut [Option<Region>],
+        ty_binds: &mut Vec<Option<(PTy, usize, usize)>, A>,
+        ty_slots: &mut Vec<Option<Region>, A>,
+        e: ExprId,
+    ) -> Result<Result<(), ProjectionUnbound>, Refusal> {
+        let differ = || {
+            let imp = u32::try_from(h_slots.len()).unwrap_or(u32::MAX);
+            let declared = u32::try_from(a_slots.len()).unwrap_or(u32::MAX);
+            ProjectionUnbound::SelfSlotsDiffer { imp, declared }
+        };
+        let mut stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
+        stack.push((h_ty, a_ty));
+        let mut hat = 0usize;
+        let mut aat = 0usize;
+        let mut steps = 0u32;
+        while let Some((ht, at)) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            let (hn, an) = (self.head_node(ht, e)?, self.head_node(at, e)?);
+            if matches!(hn, PNode::ConstValue { .. } | PNode::ConstParam(_)) && matches!(an, PNode::ConstValue { .. } | PNode::ConstParam(_)) {
+                continue;
+            }
+            if let PNode::Param(p) = hn {
+                let Ok(ac) = heads.count(at) else { return Ok(Err(ProjectionUnbound::SelfTypeUnread)) };
+                let Some(aend) = aat.checked_add(ac.len()) else { return Ok(Err(differ())) };
+                let Some(aslice) = a_slots.get(aat..aend) else { return Ok(Err(differ())) };
+                aat = aend;
+                let Ok(idx) = usize::try_from(p) else { return Ok(Err(differ())) };
+                if idx >= ty_binds.len() {
+                    if idx >= 64 {
+                        return Ok(Err(differ()));
+                    }
+                    ty_binds.resize(idx + 1, None);
+                }
+                if let Some(slot) = ty_binds.get_mut(idx)
+                    && slot.is_none()
+                {
+                    let start = ty_slots.len();
+                    ty_slots.extend_from_slice(aslice);
+                    *slot = Some((at, start, aslice.len()));
+                }
+                continue;
+            }
+            if !blaze_borrow::head_eq(hn, an) {
+                return Ok(Err(differ()));
+            }
+            let (Ok(ho), Ok(hk), Ok(ao), Ok(ak)) = (heads.own(ht), heads.kids(ht), heads.own(at), heads.kids(at)) else {
+                return Ok(Err(ProjectionUnbound::SelfTypeUnread));
+            };
+            if ho != ao || hk.len() != ak.len() {
+                return Ok(Err(differ()));
+            }
+            let Some(hend) = hat.checked_add(ho.len()) else { return Ok(Err(differ())) };
+            let Some(aend) = aat.checked_add(ao.len()) else { return Ok(Err(differ())) };
+            let (Some(hslice), Some(aslice)) = (h_slots.get(hat..hend), a_slots.get(aat..aend)) else {
+                return Ok(Err(differ()));
+            };
+            hat = hend;
+            aat = aend;
+            for (&ir, &dr_opt) in hslice.iter().zip(aslice.iter()) {
+                if let Err(why) = bind_one_region(reg_binds, ir, dr_opt) {
+                    return Ok(Err(why));
+                }
+            }
+            for k in (0..hk.len()).rev() {
+                let (Some(hc), Some(ac)) = (hk.get(k), ak.get(k)) else { return self.refuse(Form::Malformed, e) };
+                stack.push((hc, ac));
+            }
+        }
+        if hat != h_slots.len() || aat != a_slots.len() {
+            return Ok(Err(differ()));
+        }
+        Ok(Ok(()))
+    }
+}
+
+fn bind_one_region(reg_binds: &mut [Option<Region>], ir: Region, dr_opt: Option<Region>) -> Result<(), ProjectionUnbound> {
+    match ir {
+        Region::Param(i) => {
+            let Ok(idx) = usize::try_from(i) else { return Err(ProjectionUnbound::SelfRegionUnnumbered) };
+            let Some(slot) = reg_binds.get_mut(idx) else { return Err(ProjectionUnbound::SelfRegionUnnumbered) };
+            if let Some(dr) = dr_opt {
+                match *slot {
+                    Some(x) if x != dr => return Err(ProjectionUnbound::BoundTwice),
+                    _ => *slot = Some(dr),
+                }
+            }
+            Ok(())
+        }
+        // `impl Tr for Wrap<'static>`: the selection itself shows the region `'static`.
+        Region::Static => Ok(()),
+        Region::Late { .. } => Err(ProjectionUnbound::SelfRegionUnnumbered),
     }
 }

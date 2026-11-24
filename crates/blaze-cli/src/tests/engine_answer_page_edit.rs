@@ -80,7 +80,7 @@ fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
         names.sort_unstable();
     }
     let saved = save_edit(&cx, &mut store, &lent, "answer", toolchain, &tools, &cold, Printed::default(), (lines.0, &lines.1),
-        None, &leaves, &journal, alloc, frame, &[], (None, core::num::NonZeroU32::MIN)).expect("save all rows");
+        None, &leaves, &journal, alloc, frame, &[], (None, core::num::NonZeroU32::MIN), crate::engine_answer::SaveBase::Keep).expect("save all rows");
     assert_eq!(saved.rekeyed.whole, Some(WhyWhole::NoLast), "a first commit keys every page");
     assert!(saved.new_pages > 1, "the answer spans multiple pages");
     lent.commit().expect("commit original answer");
@@ -117,7 +117,7 @@ fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
     payloads.insert(plan.name, after);
     let changed = Kept::after(BTreeMap::new_in(alloc), finished.answer, &finished.causes, payloads);
     let saved = save_edit(&cx, &mut store, &lent, "answer", toolchain, &tools, &changed, Printed::default(), (lines.0, &lines.1),
-        Some(&stored), &leaves, &journal, alloc, frame, &[], (Some(pointer.root), core::num::NonZeroU32::MIN)).expect("publish edit");
+        Some(&stored), &leaves, &journal, alloc, frame, &[], (Some(pointer.root), core::num::NonZeroU32::MIN), crate::engine_answer::SaveBase::Keep).expect("publish edit");
     assert_eq!(stored.pages_read(), 2, "planning, merging and publication read the file plan and the changed row");
     assert!((1..=2).contains(&saved.new_pages), "only the edited row and file plan can require a new page");
     lent.commit().expect("commit edited answer");

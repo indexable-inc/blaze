@@ -1084,45 +1084,145 @@ struct CountedLoop<A: Allocator> {
     block_count: usize,
 }
 
+/// Unwraps up to 6 layers of boolean wrappers (`Op::Freeze`, `Op::Not`, `Op::Xor(_, 1)`,
+/// `Op::Trunc(Op::Zext(i1))`, or `Op::Icmp(Eq|Ne, i1|Zext(i1), 0|1)`) around an `i1` condition.
+fn unwrap_bool_cond(view: &View<'_>, mut cond_val: u32) -> (u32, bool) {
+    let mut flipped = false;
+    for _ in 0..6 {
+        let ci = to_idx(cond_val);
+        if ci >= view.len() {
+            break;
+        }
+        match view.op(ci) {
+            Op::Freeze => {
+                cond_val = at(view.data, ci);
+            }
+            Op::Not => {
+                cond_val = at(view.data, ci);
+                flipped = !flipped;
+            }
+            Op::Trunc => {
+                let src = at(view.data, ci);
+                let si = to_idx(src);
+                if si < view.len() && view.op(si) == Op::Zext {
+                    let inner = at(view.data, si);
+                    if Ty(at(view.tys, to_idx(inner))) == Ty::I1 {
+                        cond_val = inner;
+                        continue;
+                    }
+                }
+                break;
+            }
+            Op::Xor => {
+                let pos = to_idx(at(view.data, ci));
+                let (l, r) = (at(view.extra, pos), at(view.extra, pos + 1));
+                if const_u64(view, to_idx(r)) == Some(1) {
+                    cond_val = l;
+                    flipped = !flipped;
+                } else if const_u64(view, to_idx(l)) == Some(1) {
+                    cond_val = r;
+                    flipped = !flipped;
+                } else {
+                    break;
+                }
+            }
+            Op::Icmp => {
+                let cat = to_idx(at(view.data, ci));
+                let Some(ic) = IntCond::from_word(at(view.extra, cat)) else {
+                    break;
+                };
+                if ic != IntCond::Eq && ic != IntCond::Ne {
+                    break;
+                }
+                let (lhs, rhs) = (at(view.extra, cat + 1), at(view.extra, cat + 2));
+                let (val, c) = if let Some(k) = const_u64(view, to_idx(rhs)).filter(|&k| k <= 1) {
+                    (lhs, k)
+                } else if let Some(k) = const_u64(view, to_idx(lhs)).filter(|&k| k <= 1) {
+                    (rhs, k)
+                } else {
+                    break;
+                };
+                let vi = to_idx(val);
+                let inner_i1 = if Ty(at(view.tys, vi)) == Ty::I1 {
+                    val
+                } else if view.op(vi) == Op::Zext {
+                    let src = at(view.data, vi);
+                    if Ty(at(view.tys, to_idx(src))) == Ty::I1 {
+                        src
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                };
+                let is_inverted = (c == 0 && ic == IntCond::Eq) || (c == 1 && ic == IntCond::Ne);
+                cond_val = inner_i1;
+                if is_inverted {
+                    flipped = !flipped;
+                }
+            }
+            _ => break,
+        }
+    }
+    (cond_val, flipped)
+}
+
 #[inline]
 fn is_step_one(view: &View<'_>, inst: u32, iv: u32) -> bool {
     let i = to_idx(inst);
-    if view.op(i) != Op::Add {
-        return false;
-    }
-    let pos = to_idx(at(view.data, i));
-    let (a, b) = (at(view.extra, pos), at(view.extra, pos + 1));
+    let (a, b) = match view.op(i) {
+        Op::Add => {
+            let pos = to_idx(at(view.data, i));
+            (at(view.extra, pos), at(view.extra, pos + 1))
+        }
+        Op::Project => {
+            let pos = to_idx(at(view.data, i));
+            let pair = at(view.extra, pos);
+            let field = at(view.extra, pos + 1);
+            let pi = to_idx(pair);
+            if field == 0 && pi < view.len() && view.op(pi) == Op::UaddOverflow {
+                let apos = to_idx(at(view.data, pi));
+                (at(view.extra, apos), at(view.extra, apos + 1))
+            } else {
+                return false;
+            }
+        }
+        _ => return false,
+    };
     (a == iv && const_u64(view, to_idx(b)) == Some(1))
         || (b == iv && const_u64(view, to_idx(a)) == Some(1))
 }
 
 /// Parses a branch `cond` testing `iv < bound` (true -> `stay_blk`, false -> `exit_blk`) or its
-/// swapped/inverted equivalents. Returns `(bound, is_signed)`.
+/// swapped/inverted equivalents (including `iv != bound` / `!(iv == bound)` for `0..bound`).
+/// Returns `(bound, is_signed)`.
 fn parse_lt_cond(view: &View<'_>, cond_val: u32, iv_val: u32, stay_is_then: bool) -> Option<(u32, bool)> {
-    let ci = to_idx(cond_val);
+    let (inner_cond, flipped) = unwrap_bool_cond(view, cond_val);
+    let stay = stay_is_then ^ flipped;
+    let ci = to_idx(inner_cond);
     if view.op(ci) != Op::Icmp {
         return None;
     }
     let cat = to_idx(at(view.data, ci));
     let cond = IntCond::from_word(at(view.extra, cat))?;
     let (lhs, rhs) = (at(view.extra, cat + 1), at(view.extra, cat + 2));
-    if stay_is_then {
-        if lhs == iv_val && cond == IntCond::Ult {
+    if stay {
+        if lhs == iv_val && matches!(cond, IntCond::Ult | IntCond::Ne) {
             Some((rhs, false))
         } else if lhs == iv_val && cond == IntCond::Slt {
             Some((rhs, true))
-        } else if rhs == iv_val && cond == IntCond::Ugt {
+        } else if rhs == iv_val && matches!(cond, IntCond::Ugt | IntCond::Ne) {
             Some((lhs, false))
         } else if rhs == iv_val && cond == IntCond::Sgt {
             Some((lhs, true))
         } else {
             None
         }
-    } else if lhs == iv_val && cond == IntCond::Uge {
+    } else if lhs == iv_val && matches!(cond, IntCond::Uge | IntCond::Eq) {
         Some((rhs, false))
     } else if lhs == iv_val && cond == IntCond::Sge {
         Some((rhs, true))
-    } else if rhs == iv_val && cond == IntCond::Ule {
+    } else if rhs == iv_val && matches!(cond, IntCond::Ule | IntCond::Eq) {
         Some((lhs, false))
     } else if rhs == iv_val && cond == IntCond::Sle {
         Some((lhs, true))
@@ -1139,7 +1239,9 @@ fn preheader_guards_positive(
     is_signed: bool,
     enter_is_then: bool,
 ) -> bool {
-    let ci = to_idx(cond_val);
+    let (inner_cond, flipped) = unwrap_bool_cond(view, cond_val);
+    let enter = enter_is_then ^ flipped;
+    let ci = to_idx(inner_cond);
     if view.op(ci) != Op::Icmp {
         return false;
     }
@@ -1153,7 +1255,7 @@ fn preheader_guards_positive(
     let lhs_bound = same_val_or_const(view, lhs, bound);
     let rhs_bound = same_val_or_const(view, rhs, bound);
 
-    if enter_is_then {
+    if enter {
         if is_signed {
             (lhs_zero && rhs_bound && cond == IntCond::Slt)
                 || (lhs_bound && rhs_zero && cond == IntCond::Sgt)
@@ -1212,6 +1314,47 @@ fn read_jump<A: Allocator + Copy>(view: &View<'_>, term: usize, alloc: A) -> Opt
         args.push(at(view.extra, pos + 2 + k));
     }
     Some((target, args))
+}
+
+/// Reads the back-edge argument list of a pre-tested loop from `latch` to `header`: either
+/// `Op::Jump(header, args)` or an `Op::Br` arm targeting `header` whose OTHER arm stays inside
+/// `in_loop` (e.g. an inner loop header exiting directly back to an outer loop header after
+/// `Range::next` + `thread_jumps` collapses empty latch blocks).
+fn read_pretested_back_edge_to_header<A: Allocator + Copy>(
+    view: &View<'_>,
+    latch: u32,
+    header: u32,
+    expected_argc: usize,
+    in_loop: &[bool],
+    alloc: A,
+) -> Option<Vec<u32, A>> {
+    if latch == header {
+        return None;
+    }
+    let term = view.terminator(Block(latch));
+    if let Some((tgt, args)) = read_jump(view, term, alloc) {
+        if tgt == header && args.len() == expected_argc {
+            return Some(args);
+        }
+        return None;
+    }
+    if let Some(br) = read_br(view, term, alloc) {
+        if br.t_blk == header
+            && br.e_blk != header
+            && at(in_loop, to_idx(br.e_blk))
+            && br.t_args.len() == expected_argc
+        {
+            return Some(br.t_args);
+        }
+        if br.e_blk == header
+            && br.t_blk != header
+            && at(in_loop, to_idx(br.t_blk))
+            && br.e_args.len() == expected_argc
+        {
+            return Some(br.e_args);
+        }
+    }
+    None
 }
 
 /// Discovers all single-latch, single-preheader counted natural loops `[0, bound)` (step `+1`)
@@ -1302,13 +1445,13 @@ fn discover_counted_loops<A: Allocator + Copy>(
             continue;
         };
 
-        // Determine loop shape: `HeaderBody` (`latch` ends in `Jump(header)`) or `Rotated` (`latch` ends in `Br`).
+        // Determine loop shape: `HeaderBody` (`latch` jumps to `header` or is a collapsed inner
+        // `Br` whose other arm stays inside `in_loop`) or `Rotated` (`latch` ends in an exit `Br`).
         let latch_term = view.terminator(Block(latch));
-        if let Some((back_tgt, back_args)) = read_jump(view, latch_term, alloc) {
+        if let Some(back_args) =
+            read_pretested_back_edge_to_header(view, latch, header, h_params.len(), &in_loop, alloc)
+        {
             // Pre-tested loop (`HeaderBody` / multi-block with header test).
-            if back_tgt != header || back_args.len() != h_params.len() || latch == header {
-                continue;
-            }
             let h_term = view.terminator(Block(header));
             let Some(h_br) = read_br(view, h_term, alloc) else {
                 continue;
@@ -1316,14 +1459,8 @@ fn discover_counted_loops<A: Allocator + Copy>(
             let t_in = at(&in_loop, to_idx(h_br.t_blk));
             let e_in = at(&in_loop, to_idx(h_br.e_blk));
             let (stay_is_then, body_entry, exit, exit_args) = if t_in && !e_in {
-                if !h_br.t_args.is_empty() {
-                    continue;
-                }
                 (true, h_br.t_blk, h_br.e_blk, h_br.e_args)
             } else if e_in && !t_in {
-                if !h_br.e_args.is_empty() {
-                    continue;
-                }
                 (false, h_br.e_blk, h_br.t_blk, h_br.t_args)
             } else {
                 continue;
@@ -2159,6 +2296,7 @@ struct GemmKernel<A: Allocator> {
     ldc: DimVal,
     is_accumulate_into_c: bool,
     fma_flags: Flags,
+    use_fused_fma: bool,
     outer_preheader: u32,
     outer_header: u32,
     outer_exit: u32,
@@ -2297,7 +2435,7 @@ fn verify_nest_cfg<A: Allocator + Copy>(
         if l2.block_count != 1 || l2.header != l2.latch {
             return false;
         }
-    } else if l2.block_count != 2 || l2.body_entry != l2.latch {
+    } else if l2.block_count != 2 || l2.body_entry != l2.latch || !view.params(Block(l2.body_entry)).is_empty() {
         return false;
     }
     if let Some(lz) = l_zero {
@@ -2305,7 +2443,10 @@ fn verify_nest_cfg<A: Allocator + Copy>(
             if lz.block_count != 1 || lz.header != lz.latch {
                 return false;
             }
-        } else if lz.block_count != 2 || lz.body_entry != lz.latch {
+        } else if lz.block_count != 2
+            || lz.body_entry != lz.latch
+            || !view.params(Block(lz.body_entry)).is_empty()
+        {
             return false;
         }
     }
@@ -2386,10 +2527,12 @@ fn verify_nest_cfg<A: Allocator + Copy>(
     true
 }
 
-/// Extracts `(mul_lhs, mul_rhs, acc_in, fma_flags)` from a multiply-accumulate instruction
-/// supporting `Op::Fma`, `Op::Fmuladd`, `Op::Fadd[REASSOC|CONTRACT](Op::Fmul(a, b), acc)`, and
-/// `Op::Add(Op::Mul(a, b), acc)` (for `Ty::I32`).
-fn match_mac(view: &View<'_>, mac: u32, elem_ty: Ty) -> Option<(u32, u32, u32, Flags)> {
+/// Extracts `(mul_lhs, mul_rhs, acc_in, fma_flags, use_fused_fma)` from a multiply-accumulate
+/// instruction supporting `Op::Fma`, `Op::Fmuladd`, `Op::Fadd(Op::Fmul(a, b), acc)` (with
+/// `use_fused_fma = fl.contains(REASSOC | CONTRACT)` so strict IEEE 754 `fmul + fadd` stays
+/// bit-exact via separate `Fmul` + `Fadd` in 4x16 NEON and never contracts via SME2 `FMOPA`),
+/// and `Op::Add(Op::Mul(a, b), acc)` (for `Ty::I32`).
+fn match_mac(view: &View<'_>, mac: u32, elem_ty: Ty) -> Option<(u32, u32, u32, Flags, bool)> {
     let mi = to_idx(mac);
     if Ty(at(view.tys, mi)) != elem_ty {
         return None;
@@ -2400,20 +2543,21 @@ fn match_mac(view: &View<'_>, mac: u32, elem_ty: Ty) -> Option<(u32, u32, u32, F
         if matches!(op, Op::Fma | Op::Fmuladd) {
             let pos = to_idx(at(view.data, mi));
             let (a, b, c) = (at(view.extra, pos), at(view.extra, pos + 1), at(view.extra, pos + 2));
-            return Some((a, b, c, fl));
+            return Some((a, b, c, fl, true));
         }
-        if op == Op::Fadd && (fl.contains(Flags::REASSOC) || fl.contains(Flags::CONTRACT)) {
+        if op == Op::Fadd {
+            let fused = fl.contains(Flags::REASSOC) || fl.contains(Flags::CONTRACT);
             let pos = to_idx(at(view.data, mi));
             let (x, y) = (at(view.extra, pos), at(view.extra, pos + 1));
             let xi = to_idx(x);
             let yi = to_idx(y);
             if view.op(xi) == Op::Fmul {
                 let mp = to_idx(at(view.data, xi));
-                return Some((at(view.extra, mp), at(view.extra, mp + 1), y, fl));
+                return Some((at(view.extra, mp), at(view.extra, mp + 1), y, fl, fused));
             }
             if view.op(yi) == Op::Fmul {
                 let mp = to_idx(at(view.data, yi));
-                return Some((at(view.extra, mp), at(view.extra, mp + 1), x, fl));
+                return Some((at(view.extra, mp), at(view.extra, mp + 1), x, fl, fused));
             }
         }
         None
@@ -2424,11 +2568,11 @@ fn match_mac(view: &View<'_>, mac: u32, elem_ty: Ty) -> Option<(u32, u32, u32, F
         let yi = to_idx(y);
         if view.op(xi) == Op::Mul {
             let mp = to_idx(at(view.data, xi));
-            return Some((at(view.extra, mp), at(view.extra, mp + 1), y, Flags::NONE));
+            return Some((at(view.extra, mp), at(view.extra, mp + 1), y, Flags::NONE, true));
         }
         if view.op(yi) == Op::Mul {
             let mp = to_idx(at(view.data, yi));
-            return Some((at(view.extra, mp), at(view.extra, mp + 1), x, Flags::NONE));
+            return Some((at(view.extra, mp), at(view.extra, mp + 1), x, Flags::NONE, true));
         }
         None
     } else {
@@ -2725,81 +2869,82 @@ fn detect_gemm_nest<A: Allocator + Copy>(
 
     // Match the MAC pattern: either Case A (`store_c` inside `L2`, RMW `C += A*B`), or Case B
     // (`store_c` inside `L1 \ L2` after `L2`, register-accumulated dot-product in `L2`).
-    let (lhs_val, rhs_val, mut is_accumulate_into_c, load_c_opt, fma_flags) = if at(&l2.in_loop, to_idx(store_blk)) {
-        // Case A: RMW inside L2 (`i-k-j` or unhoisted `i-j-k`).
-        let (a_v, b_v, acc_in, fl) = match_mac(view, store_val, acc_ty)?;
-        if view.op(to_idx(acc_in)) != Op::Load {
-            return None;
-        }
-        (a_v, b_v, true, Some(acc_in), fl)
-    } else if at(&l1.in_loop, to_idx(store_blk)) && cfg.dominates(l2.exit, store_blk) {
-        // Case B: Register-accumulated dot product in `L2`, stored to `C` in `L1` after `L2`.
-        let l2_params = view.params(Block(l2.header));
-        let exit_params = view.params(Block(l2.exit));
-        let sv_i = to_idx(store_val);
+    let (lhs_val, rhs_val, mut is_accumulate_into_c, load_c_opt, fma_flags, use_fused_fma) =
+        if at(&l2.in_loop, to_idx(store_blk)) {
+            // Case A: RMW inside L2 (`i-k-j` or unhoisted `i-j-k`).
+            let (a_v, b_v, acc_in, fl, fused) = match_mac(view, store_val, acc_ty)?;
+            if view.op(to_idx(acc_in)) != Op::Load {
+                return None;
+            }
+            (a_v, b_v, true, Some(acc_in), fl, fused)
+        } else if at(&l1.in_loop, to_idx(store_blk)) && cfg.dominates(l2.exit, store_blk) {
+            // Case B: Register-accumulated dot product in `L2`, stored to `C` in `L1` after `L2`.
+            let l2_params = view.params(Block(l2.header));
+            let exit_params = view.params(Block(l2.exit));
+            let sv_i = to_idx(store_val);
 
-        // Identify the `L2.header` accumulator param position `acc_pos`.
-        let (acc_pos, skip_init_opt) = if sv_i >= exit_params.start && sv_i < exit_params.end {
-            let epos = sv_i - exit_params.start;
-            let ex_v = at(&l2.exit_args, epos);
-            let skip_v = if l2.is_rotated && !l2.skip_args.is_empty() {
-                Some(at(&l2.skip_args, epos))
+            // Identify the `L2.header` accumulator param position `acc_pos`.
+            let (acc_pos, skip_init_opt) = if sv_i >= exit_params.start && sv_i < exit_params.end {
+                let epos = sv_i - exit_params.start;
+                let ex_v = at(&l2.exit_args, epos);
+                let skip_v = if l2.is_rotated && !l2.skip_args.is_empty() {
+                    Some(at(&l2.skip_args, epos))
+                } else {
+                    None
+                };
+                let mut found_pos = None;
+                for p in 0..l2_params.len() {
+                    if p == l2.iv_pos {
+                        continue;
+                    }
+                    let p_inst = to_u32(l2_params.start + p);
+                    let back_v = at(&l2.back_args, p);
+                    if (!l2.is_rotated && ex_v == p_inst) || (l2.is_rotated && ex_v == back_v) {
+                        found_pos = Some(p);
+                        break;
+                    }
+                }
+                (found_pos?, skip_v)
             } else {
-                None
+                let mut found_pos = None;
+                for p in 0..l2_params.len() {
+                    if p == l2.iv_pos {
+                        continue;
+                    }
+                    let p_inst = to_u32(l2_params.start + p);
+                    let back_v = at(&l2.back_args, p);
+                    if (!l2.is_rotated && store_val == p_inst) || (l2.is_rotated && store_val == back_v) {
+                        found_pos = Some(p);
+                        break;
+                    }
+                }
+                (found_pos?, None)
             };
-            let mut found_pos = None;
-            for p in 0..l2_params.len() {
-                if p == l2.iv_pos {
-                    continue;
-                }
-                let p_inst = to_u32(l2_params.start + p);
-                let back_v = at(&l2.back_args, p);
-                if (!l2.is_rotated && ex_v == p_inst) || (l2.is_rotated && ex_v == back_v) {
-                    found_pos = Some(p);
-                    break;
-                }
-            }
-            (found_pos?, skip_v)
-        } else {
-            let mut found_pos = None;
-            for p in 0..l2_params.len() {
-                if p == l2.iv_pos {
-                    continue;
-                }
-                let p_inst = to_u32(l2_params.start + p);
-                let back_v = at(&l2.back_args, p);
-                if (!l2.is_rotated && store_val == p_inst) || (l2.is_rotated && store_val == back_v) {
-                    found_pos = Some(p);
-                    break;
-                }
-            }
-            (found_pos?, None)
-        };
 
-        let acc_param = to_u32(l2_params.start + acc_pos);
-        let acc_init = at(&l2.pre_args, acc_pos);
-        if let Some(sk) = skip_init_opt
-            && !same_val_or_const(view, sk, acc_init)
-            && !(is_zero_elem_const(view, to_idx(sk), acc_ty)
-                && is_zero_elem_const(view, to_idx(acc_init), acc_ty))
-        {
-            return None;
-        }
-        let acc_back = at(&l2.back_args, acc_pos);
-        let (a_v, b_v, acc_in, fl) = match_mac(view, acc_back, acc_ty)?;
-        if acc_in != acc_param {
-            return None;
-        }
-        if is_zero_elem_const(view, to_idx(acc_init), acc_ty) {
-            (a_v, b_v, false, None, fl)
-        } else if view.op(to_idx(acc_init)) == Op::Load {
-            (a_v, b_v, true, Some(acc_init), fl)
+            let acc_param = to_u32(l2_params.start + acc_pos);
+            let acc_init = at(&l2.pre_args, acc_pos);
+            if let Some(sk) = skip_init_opt
+                && !same_val_or_const(view, sk, acc_init)
+                && !(is_zero_elem_const(view, to_idx(sk), acc_ty)
+                    && is_zero_elem_const(view, to_idx(acc_init), acc_ty))
+            {
+                return None;
+            }
+            let acc_back = at(&l2.back_args, acc_pos);
+            let (a_v, b_v, acc_in, fl, fused) = match_mac(view, acc_back, acc_ty)?;
+            if acc_in != acc_param {
+                return None;
+            }
+            if is_zero_elem_const(view, to_idx(acc_init), acc_ty) {
+                (a_v, b_v, false, None, fl, fused)
+            } else if view.op(to_idx(acc_init)) == Op::Load {
+                (a_v, b_v, true, Some(acc_init), fl, fused)
+            } else {
+                return None;
+            }
         } else {
             return None;
-        }
-    } else {
-        return None;
-    };
+        };
 
     // Resolve the two input matrix loads (uniform `f32`/`f64`/`i32` or widening `Sext`/`Zext` from `i8`).
     let (elem, lhs_load, rhs_load) =
@@ -2948,6 +3093,7 @@ fn detect_gemm_nest<A: Allocator + Copy>(
         ldc,
         is_accumulate_into_c,
         fma_flags,
+        use_fused_fma,
         outer_preheader: l0.preheader,
         outer_header: l0.header,
         outer_exit: l0.exit,
@@ -3014,17 +3160,24 @@ fn emit_ptr_with_const_off<A: Allocator>(func: &mut Func<A>, base_remapped: u32,
     }
 }
 
-/// Emits one scalar or vector multiply-accumulate `a * b + acc`.
+/// Emits one scalar or vector multiply-accumulate `a * b + acc`, preserving strict IEEE 754
+/// separate `Fmul` + `Fadd` rounding when `use_fused_fma` is false.
 fn emit_mac<A: Allocator>(
     func: &mut Func<A>,
     ty: Ty,
     fma_flags: Flags,
+    use_fused_fma: bool,
     a: u32,
     b: u32,
     acc: u32,
 ) -> u32 {
     if ty.is_float() {
-        push_tern(func, Op::Fma, fma_flags, ty, a, b, acc)
+        if use_fused_fma {
+            push_tern(func, Op::Fma, fma_flags, ty, a, b, acc)
+        } else {
+            let prod = push_bin(func, Op::Fmul, fma_flags, ty, a, b);
+            push_bin(func, Op::Fadd, fma_flags, ty, acc, prod)
+        }
     } else {
         let prod = push_bin(func, Op::Mul, Flags::NONE, ty, a, b);
         push_bin(func, Op::Add, Flags::NONE, ty, acc, prod)
@@ -3421,7 +3574,7 @@ fn emit_gemm_lowered<A: Allocator + Copy>(
             for (u, &bu) in b_vecs.iter().enumerate() {
                 let slot = r * 4 + u;
                 let prev = at(&c_acc, slot);
-                let updated = emit_mac(func, vec_ty, kernel.fma_flags, va_r, bu, prev);
+                let updated = emit_mac(func, vec_ty, kernel.fma_flags, kernel.use_fused_fma, va_r, bu, prev);
                 set_at(&mut c_next, slot, updated);
             }
         }
@@ -3516,13 +3669,13 @@ fn emit_gemm_lowered<A: Allocator + Copy>(
 
         let tb_v = push_load(func, elem_ty, t_pb, 0);
         let ta0_v = push_load(func, elem_ty, t_pa0, 0);
-        let t_s0_n = emit_mac(func, elem_ty, kernel.fma_flags, ta0_v, tb_v, t_s0);
+        let t_s0_n = emit_mac(func, elem_ty, kernel.fma_flags, kernel.use_fused_fma, ta0_v, tb_v, t_s0);
         let ta1_v = push_load(func, elem_ty, t_pa1, 0);
-        let t_s1_n = emit_mac(func, elem_ty, kernel.fma_flags, ta1_v, tb_v, t_s1);
+        let t_s1_n = emit_mac(func, elem_ty, kernel.fma_flags, kernel.use_fused_fma, ta1_v, tb_v, t_s1);
         let ta2_v = push_load(func, elem_ty, t_pa2, 0);
-        let t_s2_n = emit_mac(func, elem_ty, kernel.fma_flags, ta2_v, tb_v, t_s2);
+        let t_s2_n = emit_mac(func, elem_ty, kernel.fma_flags, kernel.use_fused_fma, ta2_v, tb_v, t_s2);
         let ta3_v = push_load(func, elem_ty, t_pa3, 0);
-        let t_s3_n = emit_mac(func, elem_ty, kernel.fma_flags, ta3_v, tb_v, t_s3);
+        let t_s3_n = emit_mac(func, elem_ty, kernel.fma_flags, kernel.use_fused_fma, ta3_v, tb_v, t_s3);
 
         let t_pa0_n = push_bin(func, Op::PtrAdd, Flags::NONE, Ty::PTR, t_pa0, k_elem_bytes);
         let t_pa1_n = push_bin(func, Op::PtrAdd, Flags::NONE, Ty::PTR, t_pa1, k_elem_bytes);
@@ -3621,7 +3774,7 @@ fn emit_gemm_lowered<A: Allocator + Copy>(
         let r_s = push_param(func, elem_ty);
         let ra_v = push_load(func, elem_ty, r_pa, 0);
         let rb_v = push_load(func, elem_ty, r_pb, 0);
-        let r_s_n = emit_mac(func, elem_ty, kernel.fma_flags, ra_v, rb_v, r_s);
+        let r_s_n = emit_mac(func, elem_ty, kernel.fma_flags, kernel.use_fused_fma, ra_v, rb_v, r_s);
         let r_pa_n = push_bin(func, Op::PtrAdd, Flags::NONE, Ty::PTR, r_pa, k_elem_bytes);
         let r_pb_n = push_bin(func, Op::PtrAdd, Flags::NONE, Ty::PTR, r_pb, ldb_bytes);
         let keep_rk = push_icmp(func, IntCond::Ult, r_pa_n, pa_ir_end);
@@ -3750,7 +3903,9 @@ pub fn optimize_gemm_loops<A: Allocator + Copy>(
         let compact_strides = k.lda.matches_bound(&view, k.k_dim)
             && k.ldb.matches_bound(&view, k.n_dim)
             && k.ldc.matches_bound(&view, k.n_dim);
-        let emit_sme2 = opts.enable_sme2 && k.elem.sme2_intrinsic().is_some() && compact_strides;
+        let sme2_rounding_ok = !k.elem.acc_ty().is_float() || k.use_fused_fma;
+        let emit_sme2 =
+            opts.enable_sme2 && k.elem.sme2_intrinsic().is_some() && compact_strides && sme2_rounding_ok;
         let emit_neon = opts.enable_neon_4x16 && k.elem.supports_neon_4x16();
         if !emit_sme2 && !emit_neon {
             plans.push(LowerPlan {
@@ -4265,11 +4420,17 @@ mod tests {
 
     #[test]
     fn non_gemm_strict_ieee_and_noalias_behavior() {
-        // 1. Strict IEEE `fmul + fadd` WITHOUT `Flags::REASSOC`/`CONTRACT` must NOT be altered.
+        // 1. Strict IEEE `fmul + fadd` WITHOUT `Flags::REASSOC`/`CONTRACT` must NEVER contract into
+        //    SME2 `FMOPA` or `Op::Fma`, but lowers to bit-exact 4x16 NEON using separate `Fmul`+`Fadd`.
         let strict_fn = build_ikj_gemm(Ty::F32, false, Flags::NONE, false);
         let strict_out = optimize_gemm_loops(strict_fn.view(), GemmOpts::sme2(), TestHeap).unwrap();
         verify(strict_out.func.view()).unwrap();
-        assert_eq!(strict_out.stats.gemms_detected, 0);
+        assert_eq!(strict_out.stats.gemms_detected, 1);
+        assert_eq!(strict_out.stats.sme2_lowered, 0);
+        assert_eq!(strict_out.stats.neon_blocked, 1);
+        let sv = strict_out.func.view();
+        assert_eq!((0..sv.len()).filter(|&i| matches!(sv.op(i), Op::Fma | Op::Fmuladd)).count(), 0);
+        assert!(find_intrinsic_call(sv, SME2_GEMM_F32_INTRINSIC).is_none());
 
         // 2. `C` with `ParamFactsRec::NOALIAS` skips runtime `Op::Umin` alias checks.
         let noalias_fn = build_ikj_gemm(Ty::F32, true, Flags::NONE, true);
@@ -4871,5 +5032,138 @@ mod tests {
         let bad_out = optimize_gemm_loops(bad_order.view(), GemmOpts::sme2(), TestHeap).unwrap();
         verify(bad_out.func.view()).unwrap();
         assert_eq!(bad_out.stats.gemms_detected, 0);
+    }
+
+    #[test]
+    fn collapsed_br_latches_sibling_zero_init_lowers_to_sme2_and_strict_neon() {
+        // Exact CFG shape emitted after `Range::next` + `sroa` + `thread_jumps`:
+        // - `i_hdr` -> `z_hdr(0)` directly (non-empty `h_br.t_args`),
+        // - `z_hdr` exits directly to `k_hdr(0)`,
+        // - `k_hdr` exits directly back to `i_hdr(i+1)` (`l0.latch == k_hdr` with `Op::Br`!),
+        // - `j_hdr` exits directly back to `k_hdr(k+1)` (`l1.latch == j_hdr` with `Op::Br`!).
+        let build_collapsed = |mode: u8| -> Func<TestHeap> {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[],
+            );
+            b.set_signature(sig);
+            let [entry, i_hdr, z_hdr, z_body, k_hdr, k_body, j_hdr, j_body, exit] =
+                [(); 9].map(|_| b.create_block(BlockKind::Normal));
+            let is_i8 = mode == 0;
+            let use_fma = mode == 2;
+            let acc_ty = if is_i8 { Ty::I32 } else { Ty::F32 };
+
+            b.begin(entry);
+            let pc = b.param(Ty::PTR);
+            let pa = b.param(Ty::PTR);
+            let pb = b.param(Ty::PTR);
+            let n = b.param(Ty::I64);
+            let zero = b.iconst(Ty::I64, 0);
+            let one = b.iconst(Ty::I64, 1);
+            let two = b.iconst(Ty::I64, 2);
+            let zero_elem = if is_i8 { b.iconst(Ty::I32, 0) } else { b.fconst(Ty::F32, 0) };
+            b.jump((i_hdr, &[zero]));
+
+            b.begin(i_hdr);
+            let i = b.param(Ty::I64);
+            let i_n = b.binary(Op::Mul, Flags::NONE, i, n);
+            let i_next = b.binary(Op::Add, Flags::NONE, i, one);
+            let keep_i = b.icmp(IntCond::Ult, i, n);
+            b.br(Flags::NONE, keep_i, (z_hdr, &[zero]), (exit, &[]));
+
+            b.begin(z_hdr);
+            let jz = b.param(Ty::I64);
+            let keep_jz = b.icmp(IntCond::Ult, jz, n);
+            b.br(Flags::NONE, keep_jz, (z_body, &[]), (k_hdr, &[zero]));
+
+            b.begin(z_body);
+            let z_idx = b.binary(Op::Add, Flags::NONE, i_n, jz);
+            let z_off = b.binary(Op::Shl, Flags::NONE, z_idx, two);
+            let z_ptr = b.ptr_add(Flags::NONE, pc, z_off);
+            b.store(Flags::NONE, zero_elem, z_ptr, 0, MemAttrs::aligned(2));
+            let jz2 = b.binary(Op::Add, Flags::NONE, jz, one);
+            b.jump((z_hdr, &[jz2]));
+
+            b.begin(k_hdr);
+            let k = b.param(Ty::I64);
+            let k_next = b.binary(Op::Add, Flags::NONE, k, one);
+            let keep_k = b.icmp(IntCond::Ult, k, n);
+            b.br(Flags::NONE, keep_k, (k_body, &[]), (i_hdr, &[i_next]));
+
+            b.begin(k_body);
+            let a_idx = b.binary(Op::Add, Flags::NONE, i_n, k);
+            let a_val = if is_i8 {
+                let a_ptr = b.ptr_add(Flags::NONE, pa, a_idx);
+                let a_raw = b.load(Ty::I8, Flags::NONE, a_ptr, 0, MemAttrs::aligned(0));
+                b.convert(Op::Sext, Flags::NONE, Ty::I32, a_raw)
+            } else {
+                let a_off = b.binary(Op::Shl, Flags::NONE, a_idx, two);
+                let a_ptr = b.ptr_add(Flags::NONE, pa, a_off);
+                b.load(Ty::F32, Flags::NONE, a_ptr, 0, MemAttrs::aligned(2))
+            };
+            let k_n = b.binary(Op::Mul, Flags::NONE, k, n);
+            b.jump((j_hdr, &[zero]));
+
+            b.begin(j_hdr);
+            let j = b.param(Ty::I64);
+            let keep_j = b.icmp(IntCond::Ult, j, n);
+            b.br(Flags::NONE, keep_j, (j_body, &[]), (k_hdr, &[k_next]));
+
+            b.begin(j_body);
+            let b_idx = b.binary(Op::Add, Flags::NONE, k_n, j);
+            let b_val = if is_i8 {
+                let b_ptr = b.ptr_add(Flags::NONE, pb, b_idx);
+                let b_raw = b.load(Ty::I8, Flags::NONE, b_ptr, 0, MemAttrs::aligned(0));
+                b.convert(Op::Sext, Flags::NONE, Ty::I32, b_raw)
+            } else {
+                let b_off = b.binary(Op::Shl, Flags::NONE, b_idx, two);
+                let b_ptr = b.ptr_add(Flags::NONE, pb, b_off);
+                b.load(Ty::F32, Flags::NONE, b_ptr, 0, MemAttrs::aligned(2))
+            };
+            let c_idx = b.binary(Op::Add, Flags::NONE, i_n, j);
+            let c_off = b.binary(Op::Shl, Flags::NONE, c_idx, two);
+            let c_ptr = b.ptr_add(Flags::NONE, pc, c_off);
+            let c_val = b.load(acc_ty, Flags::NONE, c_ptr, 0, MemAttrs::aligned(2));
+            let c_new = if is_i8 {
+                let prod = b.binary(Op::Mul, Flags::NONE, a_val, b_val);
+                b.binary(Op::Add, Flags::NONE, c_val, prod)
+            } else if use_fma {
+                b.ternary(Op::Fma, Flags::NONE, a_val, b_val, c_val)
+            } else {
+                let prod = b.binary(Op::Fmul, Flags::NONE, a_val, b_val);
+                b.binary(Op::Fadd, Flags::NONE, c_val, prod)
+            };
+            b.store(Flags::NONE, c_new, c_ptr, 0, MemAttrs::aligned(2));
+            let j2 = b.binary(Op::Add, Flags::NONE, j, one);
+            b.jump((j_hdr, &[j2]));
+
+            b.begin(exit);
+            b.ret(&[]);
+            b.finish_checked().unwrap()
+        };
+
+        // 1. i8 -> i32 lowers directly to SME2 SMOPA overwrite (`flags = 0`).
+        let i8_out = optimize_gemm_loops(build_collapsed(0).view(), GemmOpts::sme2(), TestHeap).unwrap();
+        verify(i8_out.func.view()).unwrap();
+        assert_eq!(i8_out.stats.sme2_lowered, 1);
+        let i8_args = find_intrinsic_call(i8_out.func.view(), SME2_GEMM_I8_I32_INTRINSIC).unwrap();
+        assert_eq!(const_u64(&i8_out.func.view(), i8_args[6] as usize), Some(0));
+
+        // 2. Strict IEEE f32 (`+= a * b`) lowers to 4x16 NEON without FMA contraction or SME2.
+        let strict_out = optimize_gemm_loops(build_collapsed(1).view(), GemmOpts::sme2(), TestHeap).unwrap();
+        verify(strict_out.func.view()).unwrap();
+        assert_eq!(strict_out.stats.sme2_lowered, 0);
+        assert_eq!(strict_out.stats.neon_blocked, 1);
+        assert!(find_intrinsic_call(strict_out.func.view(), SME2_GEMM_F32_INTRINSIC).is_none());
+
+        // 3. FMA f32 (`mul_add`) lowers directly to SME2 FMOPA overwrite (`flags = 0`).
+        let fma_out = optimize_gemm_loops(build_collapsed(2).view(), GemmOpts::sme2(), TestHeap).unwrap();
+        verify(fma_out.func.view()).unwrap();
+        assert_eq!(fma_out.stats.sme2_lowered, 1);
+        let fma_args = find_intrinsic_call(fma_out.func.view(), SME2_GEMM_F32_INTRINSIC).unwrap();
+        assert_eq!(const_u64(&fma_out.func.view(), fma_args[6] as usize), Some(0));
     }
 }

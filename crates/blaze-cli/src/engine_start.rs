@@ -242,16 +242,27 @@ pub(crate) fn command(
     let view = flags.view.unwrap_or(blaze_report::frame::plain::View::Person);
     let line = crate::run_line::LineOpts::from_env(env, err, flags.color, screen_cmd, view, flags.status_every.is_some());
     let line = crate::run_line::LineOpts { live: line.live && matches!(command, Command::Run | Command::Test), ..line };
+    let start_scope = match command {
+        Command::Run => crate::engine_check::StartScope::Bin(launch.select),
+        Command::Test => crate::engine_check::StartScope::Test(launch.select),
+        Command::Check => return Err(CliError::Usage("`check` is engine_check.rs's; engine_start.rs starts `run` and `test`")),
+    };
     let lined = crate::run_line::watched(cx, err, clock, line, |watch, bg| {
         watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
         let bg_live = if line.live { Some(bg) } else { None };
-        check_for_start(cx, Some(args), fs, env, net, host, rng, words, err, phases, heap, &flags, command == Command::Run, bg_live, |standing, phases, rng| {
+        check_for_start(cx, Some(args), fs, env, net, host, rng, words, err, phases, heap, &flags, command == Command::Run, start_scope, bg_live, |standing, phases, rng| {
             let (root, frame) = (standing.checkout, standing.frame);
             // The member's folder the command was given selects when no `-p` does (R3).
             let select = run_package::Select { member: standing.member, ..launch.select };
             let started = match command {
-                Command::Run => run_package::pick(cx, root, select, frame).and_then(|picked| run_program(cx, standing, &picked, &launch, phases, watch)),
-                Command::Test => run_package::test_packages(cx, root, select, frame).and_then(|packages| run_tests(cx, standing, &packages, select.bin, &launch, clock, rng, phases, watch)),
+                Command::Run => match standing.picked {
+                    Some(picked) => run_program(cx, standing, &picked, &launch, phases, watch),
+                    None => run_package::pick(cx, root, select, frame).and_then(|picked| run_program(cx, standing, &picked, &launch, phases, watch)),
+                },
+                Command::Test => match standing.test_packages {
+                    Some(packages) => run_tests(cx, standing, packages, select.bin, &launch, clock, rng, phases, watch),
+                    None => run_package::test_packages(cx, root, select, frame).and_then(|packages| run_tests(cx, standing, &packages, select.bin, &launch, clock, rng, phases, watch)),
+                },
                 Command::Check => Err(CliError::Usage("`check` is engine_check.rs's; engine_start.rs starts `run` and `test`")),
             };
             write_start_profile(cx, root, phases, frame)?;
@@ -280,10 +291,13 @@ pub(crate) fn body_ids<'a, 'r: 'a, 'm: 'a>(
     if let Some(ids) = RunIds::from_record(cx, &mut *standing.store, cert, toolchain, &tools, bump).map_err(refused)? {
         return reading(ids);
     }
-    // Each member unit's root and view: the walk asks each unit's row of a body at its view (D191).
-    let units = crate::run_ids::unit_roots(list, alloc).map_err(refused)?;
+    // Each active member unit's root and view: the walk asks each unit's row of a body at its view (D191).
+    let scoped = crate::engine_check::ScopedUnits::of(standing.scope, list, standing.heap.alloc());
+    let units = crate::run_ids::unit_roots_scoped(list, scoped.as_ref(), alloc).map_err(refused)?;
+    let walk_from = if scoped.is_some() { crate::run_ids::WalkFrom::UnitRoots } else { crate::run_ids::WalkFrom::Workspace };
     let mut answer = standing.answer();
-    let walk = crate::run_ids::workspace_of(cx, &mut answer, tools[Kind::BodyCheck.index()], &units, None, alloc).map_err(refused)?;
+    let body_tool = blaze_engine::Tools(tools).of(blaze_drive::Name { kind: Kind::BodyCheck, subject: blaze_ids::ContentId([0; 32]) });
+    let walk = crate::run_ids::workspace_of_scoped(cx, &mut answer, body_tool, &units, walk_from, None, alloc).map_err(refused)?;
     let ids = RunIds::new(cx, toolchain, list, &tools, &walk.bodies, &walk.edges, &mut answer, None, most, bump).map_err(refused)?;
     drop(answer);
     ids.put(cx, &mut *standing.store, cert, &tools, alloc).map_err(refused)?;

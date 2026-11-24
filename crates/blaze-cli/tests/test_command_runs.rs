@@ -121,17 +121,18 @@ fn fixture<T>(name: &str, files: &[(&str, &str)], check: impl FnOnce(&Path, &Pat
     result
 }
 
-fn run(dir: &Path, home: &Path, args: &[&str]) -> Said {
+fn run_cmd(dir: &Path, home: &Path, subcommand: &str, args: &[&str]) -> Said {
     // A full pipe must never stall the compiler while the fixture waits for it to exit.
     let stdout = home.join("test.stdout");
     let stderr = home.join("test.stderr");
     let mut child = Command::new(env!("CARGO_BIN_EXE_blaze"))
-        .arg("test")
+        .arg(subcommand)
         .args(args)
         .current_dir(dir)
         .env("PWD", dir)
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))
+        .env("BLAZE_NO_DAEMON", "1")
         .stdin(Stdio::null())
         .stdout(std::fs::File::create(&stdout).expect("capture blaze's standard output"))
         .stderr(std::fs::File::create(&stderr).expect("capture blaze's standard error"))
@@ -143,23 +144,27 @@ fn run(dir: &Path, home: &Path, args: &[&str]) -> Said {
             break status;
         }
         if started.elapsed() > DEADLINE {
-            child.kill().expect("stop the timed-out test command");
+            child.kill().expect("stop the timed-out command");
             let killed = Instant::now();
-            while child.try_wait().expect("reap the killed test command").is_none() {
+            while child.try_wait().expect("reap the killed command").is_none() {
                 assert!(killed.elapsed() < Duration::from_secs(10), "reaping blaze in {}", dir.display());
                 pause_poll();
             }
-            panic!("`blaze test` past {DEADLINE:?} in {}: the command hung (rule 18)", dir.display());
+            panic!("`blaze {subcommand}` past {DEADLINE:?} in {}: the command hung (rule 18)", dir.display());
         }
         pause_poll();
     };
-    let said = Said {
+    Said {
         stdout: std::fs::read_to_string(stdout).expect("read blaze's standard output"),
         // Lossy on purpose: a test child's raw standard error is quoted in it, and a child that
         // writes bytes that are not UTF-8 is evidence to show, not a reason to hide the rest.
         stderr: String::from_utf8_lossy(&std::fs::read(stderr).expect("read blaze's standard error")).into_owned(),
         code: status.code(),
-    };
+    }
+}
+
+fn run(dir: &Path, home: &Path, args: &[&str]) -> Said {
+    let said = run_cmd(dir, home, "test", args);
     // The check's lines first (D147, D151), then the tests' alone.
     let Some(tests) = said.stdout.strip_prefix(CHECK_FIRST) else {
         panic!("{}", evidence(&format!("the check's own lines first, exactly:\n{CHECK_FIRST}"), &said));
@@ -710,5 +715,67 @@ fn exit_code_42() -> ExitCode {
         let expect_warm = "test result: ok. ran 0: 0 passed, 0 failed; 4 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 2 filtered out; 0 flaky\n";
         assert_eq!(warm.code, Some(0), "{}", evidence("warm passing termination tests reused", &warm));
         assert_eq!(warm.stdout, expect_warm, "{}", evidence(expect_warm, &warm));
+    });
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn scoped_test_checks_only_selected_member_and_its_deps() {
+    let files: &[(&str, &str)] = &[
+        ("Cargo.toml", "[workspace]\nmembers = [\"dep\", \"a\", \"b\"]\nresolver = \"2\"\n"),
+        ("dep/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        (
+            "dep/src/lib.rs",
+            "#[cfg(test)]\nmod tests;\n\npub fn answer() -> u32 {\n    42\n}\n\n#[cfg(test)]\n#[test]\nfn dep_inline_test() {\n    assert_eq!(answer(), 42);\n}\n",
+        ),
+        ("dep/src/tests.rs", "#[test]\nfn dep_submod_test() {\n    assert_eq!(super::answer(), 42);\n}\n"),
+        (
+            "a/Cargo.toml",
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        ),
+        ("a/src/lib.rs", "#[test]\nfn a_uses_dep() {\n    assert_eq!(dep::answer(), 42);\n}\n"),
+        ("b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        ("b/src/lib.rs", "pub fn broken() -> u8 {\n    \"not a number\"\n}\n\n#[test]\nfn b_test() {}\n"),
+    ];
+    fixture("test_command_scoped_member", files, |dir, home| {
+        // 1. Member directory: `blaze test a` checks only `a` + `dep` (never broken sibling `b`),
+        //    has 0 errors (even though `dep` has both an inline `#[cfg(test)]` fn and a
+        //    `#[cfg(test)] mod tests;` file), and runs and passes `a`'s test.
+        let by_dir = run(dir, home, &["a", "--", "--deadline", "20s"]);
+        let expect_cold = "test result: ok. ran 1: 1 passed, 0 failed; 0 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky\n";
+        assert_eq!(by_dir.code, Some(0), "{}", evidence("blaze test a passes without checking b", &by_dir));
+        assert_eq!(by_dir.stdout, expect_cold, "{}", evidence(expect_cold, &by_dir));
+        assert!(!by_dir.stderr.contains("b/src/lib.rs"), "{}", evidence("b must not be checked by `blaze test a`", &by_dir));
+
+        // 2. `-p a` selects the same package scope: hits the scoped check certificate and reuses
+        //    `a`'s kept test result without checking `b`.
+        let by_pkg = run(dir, home, &["-p", "a", "--", "--deadline", "20s"]);
+        let expect_warm = "test result: ok. ran 0: 0 passed, 0 failed; 1 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky\n";
+        assert_eq!(by_pkg.code, Some(0), "{}", evidence("blaze test -p a passes without checking b", &by_pkg));
+        assert_eq!(by_pkg.stdout, expect_warm, "{}", evidence(expect_warm, &by_pkg));
+        assert!(!by_pkg.stderr.contains("b/src/lib.rs"), "{}", evidence("b must not be checked by `blaze test -p a`", &by_pkg));
+
+        // 3. Soundness control: whole-workspace `blaze check` was NOT poisoned by the scoped runs
+        //    and still reports `b`'s type error.
+        let whole_check = run_cmd(dir, home, "check", &[]);
+        assert_ne!(whole_check.code, Some(0), "{}", evidence("whole-workspace `blaze check` must report b's error", &whole_check));
+        assert!(
+            whole_check.stdout.contains("b/src/lib.rs") || whole_check.stderr.contains("b/src/lib.rs"),
+            "{}",
+            evidence("whole-workspace `blaze check` mentions b/src/lib.rs", &whole_check),
+        );
+
+        // 4. Whole-workspace `blaze test` (no member / no -p) also still checks `b` and reports its error.
+        let whole_test = run_cmd(dir, home, "test", &["--", "--list"]);
+        assert!(
+            whole_test.stdout.contains("b/src/lib.rs") || whole_test.stderr.contains("b/src/lib.rs"),
+            "{}",
+            evidence("whole-workspace `blaze test` still checks b/src/lib.rs", &whole_test),
+        );
+
+        // 5. Re-running `blaze test a` after whole-workspace `blaze check` still stays clean.
+        let after_whole = run(dir, home, &["a", "--", "--deadline", "20s"]);
+        assert_eq!(after_whole.code, Some(0), "{}", evidence("blaze test a stays clean after whole check", &after_whole));
+        assert_eq!(after_whole.stdout, expect_warm, "{}", evidence(expect_warm, &after_whole));
     });
 }
