@@ -316,16 +316,30 @@ impl<A: Allocator + Copy> ConstTable<A> {
     }
 }
 
+/// Build-side facts for laying out closure and coroutine types met during constant evaluation
+/// (`Box::new` at a closure or async block reads `<T as SizedTypeProperties>::LAYOUT`).
+#[derive(Clone, Copy)]
+pub struct BuildFacts<'a> {
+    pub closures: &'a crate::run::ClosureTable,
+    pub(crate) coroutines: Option<&'a super::coroutines::Coroutines>,
+}
+
+impl<'a> BuildFacts<'a> {
+    pub(crate) fn new(closures: &'a crate::run::ClosureTable, coroutines: &'a super::coroutines::Coroutines) -> BuildFacts<'a> {
+        BuildFacts { closures, coroutines: Some(coroutines) }
+    }
+}
+
 /// Asks the front end for each of `needs` (arguments of `from`, the build's ground table) not
 /// in `table` yet, and files each answer. The first need refused is the instance's refusal.
-/// `closures`: the build's closure facts, which a closure type among the arguments is laid
-/// out from ([`FrontEnd::const_at`]).
-pub fn pull<P: FrontEnd, A: Allocator + Copy>(program: &mut P, needs: &Needs<A>, from: PTys<'_>, table: &mut ConstTable<A>, closures: &crate::run::ClosureTable) -> Result<(), ConstAtRefusal> {
+/// `facts`: the build's closure and coroutine facts, which closure or coroutine types among the
+/// arguments are laid out from ([`FrontEnd::const_at`]).
+pub fn pull<P: FrontEnd, A: Allocator + Copy>(program: &mut P, needs: &Needs<A>, from: PTys<'_>, table: &mut ConstTable<A>, facts: BuildFacts<'_>) -> Result<(), ConstAtRefusal> {
     for (need, args) in needs.iter() {
         if table.get(need, args).is_some() {
             continue;
         }
-        let record = program.const_at(need, from, args, closures).map_err(|why| ConstAtRefusal { need, why })?;
+        let record = program.const_at(need, from, args, facts).map_err(|why| ConstAtRefusal { need, why })?;
         table.insert(need, args, record);
     }
     Ok(())

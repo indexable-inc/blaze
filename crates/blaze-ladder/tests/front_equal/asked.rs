@@ -403,12 +403,12 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         r
     }
 
-    fn const_at(&mut self, need: ConstNeed, from: PTys<'_>, args: &[PTy], closures: &ClosureTable) -> Result<SeamData, ConstAtWhy> {
+    fn const_at(&mut self, need: ConstNeed, from: PTys<'_>, args: &[PTy], build: blaze_ladder::front2::const_at::BuildFacts<'_>) -> Result<SeamData, ConstAtWhy> {
         let mut q = self.text();
         write!(q, "const_at {need:?} <").expect(WRITES);
         shown::types(&mut q, from, args).expect(WRITES);
         q.push_str(">");
-        let r = self.inner.const_at(need, from, args, closures);
+        let r = self.inner.const_at(need, from, args, build);
         let mut o = self.text();
         match &r {
             Ok(d) => shown::data(&mut o, d),

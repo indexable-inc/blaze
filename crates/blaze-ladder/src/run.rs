@@ -2704,13 +2704,51 @@ fn build_from<P: FrontEnd>(
             }
         }
         let named = function.named();
-        if !const_needs.is_empty()
-            && let Err(refusal) = crate::front2::const_at::pull(&mut *program_mut, &const_needs, ground.view(), &mut checked_bodies.const_at, &checked_bodies.closures)
-        {
-            let item = refusal.need.item();
-            let path = program_mut.item_named(item);
-            filed(&mut survey, RunError::ConstAt { function: named, refusal, path })?;
-            continue;
+        if !const_needs.is_empty() {
+            let mut need_tys: blaze_own::AVec<'_, PTy> = blaze_own::AVec::new_in(alloc);
+            for (_, a) in const_needs.iter() {
+                need_tys.extend_from_slice(a);
+            }
+            need_tys.sort_unstable();
+            need_tys.dedup();
+            let mut laid_for_const: blaze_own::AVec<'static, blaze_build::CoroutineOf> = blaze_own::AVec::new_in(alloc);
+            if !need_tys.is_empty() {
+                let facts = FrontAdts(&*program_mut, i, &consts, &langs, &checked_bodies);
+                let coro_roots = match crate::front2::coroutine_needs::held_coroutines(&mut ground, &need_tys, &facts, alloc) {
+                    Ok(roots) => roots,
+                    Err(error) => {
+                        filed(&mut survey, RunError::Build { function: named, error, range: None })?;
+                        continue;
+                    }
+                };
+                if !coro_roots.is_empty() {
+                    match lay_states::lay_only(&*program_mut, &consts, &langs, &checked_bodies, &mut ground, &mut layouts, i, &coro_roots, alloc) {
+                        Ok(lay_states::LaidOnly::Done(recorded)) => laid_for_const = recorded,
+                        Ok(lay_states::LaidOnly::Unchecked(owner)) => {
+                            filed(&mut survey, lay_states::unchecked_owner(&*program_mut, i, owner))?;
+                            continue;
+                        }
+                        Err(e) => {
+                            filed(&mut survey, e)?;
+                            continue;
+                        }
+                    }
+                }
+            }
+            let pull_res = crate::front2::const_at::pull(
+                &mut *program_mut,
+                &const_needs,
+                ground.view(),
+                &mut checked_bodies.const_at,
+                crate::front2::const_at::BuildFacts::new(&checked_bodies.closures, &checked_bodies.coroutines),
+            );
+            lay_states::forget_laid_in(&checked_bodies.coroutines, &laid_for_const, ground.view());
+            if let Err(refusal) = pull_res {
+                let item = refusal.need.item();
+                let path = program_mut.item_named(item);
+                filed(&mut survey, RunError::ConstAt { function: named, refusal, path })?;
+                continue;
+            }
         }
         // The step's borrows again, after the pull.
         let program = &*program_mut;

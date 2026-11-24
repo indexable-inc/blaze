@@ -1863,6 +1863,46 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         if let Some(norm) = self.try_normalize_non_impl(proj, last, subject, trait_, name)? {
             return self.walk(norm, term, Variance::In, 1);
         }
+        // Reflexive projection equality (`<T as Tr<A..>>::N == <T as Tr<A..>>::N`, e.g.
+        // `P: WriterIn<Buffer = B>` instantiated with `B = P::Buffer`): relate own lifetime slots
+        // and `[Self, A..]` invariantly, just as `walk_loop`'s `same_alias` does.
+        if let Resolved::Side(term_res) = self.resolve(term)?
+            && let PNode::Alias { trait_: t2, name: n2, .. } = self.node(term_res)?
+            && t2 == trait_
+            && n2 == name
+            && self.fits(term_res).is_ok()
+        {
+            let t_own = self.own(term_res)?;
+            let tkids = self.kids_of(term_res)?;
+            if t_own == own && tkids.len() == last {
+                let mut same_args = true;
+                for k in 0..last {
+                    let p_arg = if k == 0 { Some(subject) } else { self.erased_kid(proj, k) };
+                    let t_arg = self.erased_kid(term_res, k);
+                    if !matches!((p_arg, t_arg), (Some(pa), Some(ta)) if self.erased_sides(pa, ta)) {
+                        same_args = false;
+                        break;
+                    }
+                }
+                if same_args {
+                    for k in 0..own.get() {
+                        let (x, y) = (self.slot(proj, k)?, self.slot(term_res, k)?);
+                        self.pair(proj.ty, x, y, Variance::In, Self::env_of(proj), Self::env_of(term_res))?;
+                    }
+                    let (_, mut prest) = proj.slots.split(own).ok_or(self.malformed(proj.ty, Bad::StepBound))?;
+                    let (_, mut trest) = term_res.slots.split(t_own).ok_or(self.malformed(term_res.ty, Bad::StepBound))?;
+                    for k in 0..last {
+                        let (p_kid, pr) = self.kid(proj, &kids, prest, k)?;
+                        let (t_kid, tr) = self.kid(term_res, &tkids, trest, k)?;
+                        prest = pr;
+                        trest = tr;
+                        let p_side = if k == 0 { subject } else { p_kid };
+                        self.walk(p_side, t_kid, Variance::In, 1)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
         let selected: &'c dyn Selected = self.selected;
         let key = Keyer { walk: &*self, at: AskAt::SubjectKids { subject, of: proj, len: last }, budget: Cell::new(MOST_WALK_STEPS) };
         let (head, value) = match selected.select_keyed(Ask { trait_, name: Some(name), written: proj.ty }, &key) {

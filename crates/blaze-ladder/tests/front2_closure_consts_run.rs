@@ -200,3 +200,79 @@ pub extern \"C\" fn main() -> i32 {
     // rustc says E0435): the fn is refused before any build.
     assert!(matches!(&got, Err(e) if e.contains("cannot find value `x`")), "a const block may not use the fn's parameter (E0435), got {got:?}");
 }
+
+/// `Box::new(async move { .. })`'s shape: a trait's default associated constant reading
+/// `size_of::<Self>()` and `align_of::<Self>()` (core's `SizedTypeProperties::LAYOUT`) at
+/// coroutine types (an `async move` block with upvars + saved locals across `.await`, a generic
+/// `async fn` at two instantiations, and a struct wrapping a coroutine), plus a `const { .. }`
+/// block reading `size_of::<T>()`. Each compile-time size must agree with the runtime layout.
+#[test]
+fn a_constant_at_a_coroutine_type_runs() {
+    let got = run("
+use future::*;
+
+struct YieldOnce(bool);
+impl Future for YieldOnce {
+    type Output = u64;
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<u64> {
+        if self.pointer.0 {
+            Poll::Ready(1)
+        } else {
+            self.pointer.0 = true;
+            Poll::Pending
+        }
+    }
+}
+
+trait Props: Sized {
+    const SIZE: usize = size_of::<Self>();
+    const ALIGN: usize = align_of::<Self>();
+}
+
+impl<T> Props for T {}
+
+fn props_match<T>(_x: &T) -> usize {
+    let c_sz = <T as Props>::SIZE;
+    let c_al = <T as Props>::ALIGN;
+    let b_sz = const { size_of::<T>() };
+    let r_sz = size_of::<T>();
+    let r_al = align_of::<T>();
+    if c_sz == r_sz && b_sz == r_sz && c_al == r_al && c_sz > 0 { 1 } else { 0 }
+}
+
+async fn generic_fut<T: Copy>(v: T) -> T {
+    let saved = v;
+    let _ = YieldOnce(false).await;
+    saved
+}
+
+struct Wrap<F>(F, u8);
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let captured = 42u64;
+    let mut f1 = async move {
+        let local = captured + 1;
+        let y = YieldOnce(false).await;
+        local + y
+    };
+    let f2 = generic_fut(7u32);
+    let f3 = generic_fut([1u64; 4]);
+    let f4 = Wrap(async move { captured }, 3u8);
+    let ok = props_match(&f1) + props_match(&f2) + props_match(&f3) + props_match(&f4);
+    let mut w = 0u32;
+    let mut cx = Context { wakes: &mut w };
+    let first = match Future::poll(Pin { pointer: &mut f1 }, &mut cx) {
+        Poll::Pending => 1,
+        Poll::Ready(_) => 0,
+    };
+    let second = match Future::poll(Pin { pointer: &mut f1 }, &mut cx) {
+        Poll::Ready(v) => v as usize,
+        Poll::Pending => 0,
+    };
+    (first * 100 + ok * 10 + second) as i32
+}
+");
+    println!("CONST AT A COROUTINE: {got:?}");
+    assert_eq!(got, Ok(184));
+}

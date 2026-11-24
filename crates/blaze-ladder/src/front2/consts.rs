@@ -419,8 +419,26 @@ struct ConstsWorld<'w, 'n, S> {
     /// arguments, `<{closure} as SizedTypeProperties>::SIZE` under `Box::new`), which
     /// [`LayoutFacts::closure`] answers from.
     closures: Closures<'w>,
+    /// The build's coroutine facts and laid states (when evaluated at an instance's arguments:
+    /// `<{coroutine} as SizedTypeProperties>::LAYOUT` under `Box::new` / `Box::pin`), paired
+    /// with the build's ground table their laid states' arguments live in.
+    coroutines: Option<BuildCoroutines<'w>>,
     /// Each crate's `#[define_opaque(..)]` definers, for [`LayoutFacts::opaque_hidden`].
     definers: &'w super::tait::Definers<'static>,
+}
+
+/// Build-side coroutine facts and laid states paired with the build's ground table.
+#[derive(Clone, Copy)]
+struct BuildCoroutines<'w> {
+    coroutines: &'w super::coroutines::Coroutines,
+    ground: tc::PTys<'w>,
+}
+
+/// Build-side closure and coroutine tables passed into constant evaluation at ground arguments.
+#[derive(Clone, Copy)]
+struct EvalBuild<'w> {
+    closures: &'w crate::run::ClosureTable,
+    coroutines: Option<BuildCoroutines<'w>>,
 }
 
 /// Where [`ConstsWorld`]'s closure facts come from: the evaluator's own checked bodies and the
@@ -531,6 +549,18 @@ impl<'n, S: NamesSource<'n>> LayoutFacts for ConstsWorld<'_, 'n, S> {
     /// checked. `None`: no such body was checked, and the layout refuses naming the closure.
     fn closure(&self, owner: ItemKey, ordinal: u32) -> Option<blaze_build::layout::ClosureFacts<'_>> {
         self.closures.get(owner, ordinal)
+    }
+
+    /// From the build's coroutine table: an async block among the instance's ground arguments
+    /// (`Box::new(async move { .. })` reading `<{coroutine} as SizedTypeProperties>::LAYOUT`).
+    fn coroutine(&self, owner: ItemKey, ordinal: u32) -> Option<blaze_build::CoroutineFacts<'_>> {
+        self.coroutines.and_then(|c| c.coroutines.table.get(owner, ordinal))
+    }
+
+    /// From the build's laid coroutine states (`run/lay_states.rs`), matched structurally across
+    /// the evaluator's ground table and the build's (`coroutines::pty_eq_across`).
+    fn coroutine_state(&self, owner: ItemKey, ordinal: u32, args: &[tc::PTy], ground: tc::PTys<'_>) -> Result<Option<blaze_build::StateShape>, LayoutMissing> {
+        Ok(self.coroutines.and_then(|c| c.coroutines.state_across(owner, ordinal, args, ground, c.ground)))
     }
 
     /// The hidden type of `opaque` at ground `args` (coroutines.rs `opaque_hidden`'s rule for
@@ -776,8 +806,9 @@ impl<'n> Consts<'n> {
     /// `build` is the build's table of its checked fn bodies' closures: a closure type among
     /// `args` is laid out from its owner's facts there.
     #[allow(clippy::too_many_arguments)]
-    pub fn value_with_args<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, from: tc::PTys<'_>, args: &[tc::PTy], build: Option<&crate::run::ClosureTable>, scratch: Alloc<'_>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
+    pub fn value_with_args<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, from: tc::PTys<'_>, args: &[tc::PTy], build: Option<super::const_at::BuildFacts<'_>>, scratch: Alloc<'_>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
         let list = self.args_in_unit(item, from, args, r.store.tys.alloc(), scratch)?;
+        let build = build.map(|b| EvalBuild { closures: b.closures, coroutines: b.coroutines.map(|coroutines| BuildCoroutines { coroutines, ground: from }) });
         self.value_at(r, prepared, item, Root::Args(list), build)
     }
 
@@ -788,7 +819,7 @@ impl<'n> Consts<'n> {
     /// ([`ConstBody::root`]); then evaluated as any constant. `build` as
     /// [`Consts::value_with_args`] takes it.
     #[allow(clippy::too_many_arguments)]
-    pub fn body_value<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, owner: ItemKey, root: BodyRoot, key: ItemKey, from: tc::PTys<'_>, args: &[tc::PTy], build: Option<&crate::run::ClosureTable>, scratch: Alloc<'_>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
+    pub fn body_value<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, owner: ItemKey, root: BodyRoot, key: ItemKey, from: tc::PTys<'_>, args: &[tc::PTy], build: Option<super::const_at::BuildFacts<'_>>, scratch: Alloc<'_>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
         // The owner's body is checked inside `value_at` (`Root::Body`), never before it: a head
         // that check makes may name a constant, and only inside the count (`Maps::evaluating`)
         // is that a need the work list evaluates first. Checked outside it, a caller whose
@@ -797,6 +828,7 @@ impl<'n> Consts<'n> {
         // and every later check of a body using that head refused (tempo t2115d: RawVec's
         // `new_in`, a head's `1 << 0`).
         let list = self.args_in_unit(key, from, args, r.store.tys.alloc(), scratch)?;
+        let build = build.map(|b| EvalBuild { closures: b.closures, coroutines: b.coroutines.map(|coroutines| BuildCoroutines { coroutines, ground: from }) });
         self.value_at(r, prepared, key, Root::Body { owner, at: root, args: list }, build)
     }
 
@@ -879,7 +911,7 @@ impl<'n> Consts<'n> {
     /// [`Consts::value`] (`self_ty` is `None`: `item` at no arguments), or
     /// [`Consts::trait_const_value`] (`item` is a trait's constant, selected for `self_ty`).
     /// `build`: the build's closure facts, when an instance asked (const_at.rs).
-    fn value_at<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, root: Root, build: Option<&crate::run::ClosureTable>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
+    fn value_at<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, root: Root, build: Option<EvalBuild<'_>>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
         // Counted in and out (`Maps::evaluating`): a head that needs a constant while this
         // runs finds the evaluator BUSY (`ConstFail::Nested`, which the work list below
         // reads), where a caller with no evaluator at all has the head refused by name
@@ -913,7 +945,7 @@ impl<'n> Consts<'n> {
     }
 
     /// [`Consts::value_at`]'s work: the root's evaluation, with every constant it needs first.
-    fn value_listed<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, root: Root, build: Option<&crate::run::ClosureTable>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
+    fn value_listed<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, root: Root, build: Option<EvalBuild<'_>>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
         // A work list of the constants to evaluate FIRST, innermost last: a head made while a
         // body of the evaluation was checked names one (front2/const_open.rs `needed_first`:
         // `[u8; size_of::<Self>()]` on a method of `u8`, met when `u8::MAX` is checked). The
@@ -1018,7 +1050,7 @@ impl<'n> Consts<'n> {
 
     /// One evaluation of [`Consts::value_at`]'s root: the key of its record (kept in
     /// `self.records`), or the refusal.
-    fn value_key<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, root: Root, build: Option<&crate::run::ClosureTable>) -> Result<RecordKey, ConstFail> {
+    fn value_key<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, root: Root, build: Option<EvalBuild<'_>>) -> Result<RecordKey, ConstFail> {
         let alloc = r.store.tys.alloc();
         // A body's constant: its owner's body checked for this evaluator once, under the
         // constant's key, before the evaluator's table is taken (a failure that names a
@@ -1086,7 +1118,20 @@ impl<'n> Consts<'n> {
             }
             let capture = r.store.maps.capture_const(alloc);
             let definers = self.definers.get_or_insert_with(|| super::tait::Definers::new_in(alloc));
-            let world = ConstsWorld { names: r.names, keys: r.keys, index: r.index, store: r.store, bodies: &self.bodies, records: &self.records, selected: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()), alloc, closures: Closures { own: self.closures.as_ref(), build }, definers };
+            let world = ConstsWorld {
+                names: r.names,
+                keys: r.keys,
+                index: r.index,
+                store: r.store,
+                bodies: &self.bodies,
+                records: &self.records,
+                selected: core::cell::Cell::new(None),
+                project: super::const_project::ProjectAsk::new(r.buckets.as_ref()),
+                alloc,
+                closures: Closures { own: self.closures.as_ref(), build: build.map(|b| b.closures) },
+                coroutines: build.and_then(|b| b.coroutines),
+                definers,
+            };
             let answer = value_of(&world, &mut layout, &mut codes, n.item, n.args, &mut ground, Limits::DEFAULT, alloc);
             let selected = world.selected.take();
             // A call refused by its callee's kind: the refusal carries what `fn_kind` said

@@ -255,11 +255,47 @@ pub(super) fn relay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     Ok(Relaid::Done { recorded, laid })
 }
 
+/// How a types-only lay ended ([`lay_only`]: for constant evaluation before the build).
+pub(super) enum LaidOnly {
+    /// Every state laid and recorded in `bodies.coroutines.states`; the caller must forget these
+    /// states with [`forget_laid_in`] once constant evaluation finishes so the subsequent build
+    /// still lays and builds their functions into `stash`.
+    Done(AVec<'static, CoroutineOf>),
+    /// The walk met a coroutine whose owner fn is not checked yet: check it, lay again.
+    Unchecked(ItemKey),
+}
+
+/// Phases 1 (ORDER) and 2 (LAY) without Phase 3 (BUILD): lays out the coroutine states needed by
+/// constant evaluation (`const_at::pull`: `<{coroutine} as SizedTypeProperties>::LAYOUT` under
+/// `Box::new` / `Box::pin`) using the exact same `order_and_lay` / `lay_one` as the build.
+#[expect(clippy::too_many_arguments, reason = "the lay's tables, borrowed apart")]
+pub(super) fn lay_only<P: FrontEnd, L: core::alloc::Allocator + Clone>(
+    program: &P,
+    consts: &[(ItemKey, DataRecord<Global>)],
+    langs: &BackLangs,
+    bodies: &Bodies<'_>,
+    ground: &mut PortableTys<'_>,
+    layouts: &mut Layouts<L>,
+    asking: usize,
+    roots: &[CoroutineOf],
+    alloc: Alloc<'static>,
+) -> Result<LaidOnly, RunError> {
+    match order_and_lay(program, consts, langs, bodies, ground, layouts, asking, roots, alloc)? {
+        Ordered::Laid { all, .. } => Ok(LaidOnly::Done(all)),
+        Ordered::Unchecked(owner) => Ok(LaidOnly::Unchecked(owner)),
+    }
+}
+
 /// Forgets the states of `laid` (`States::forget`): recorded by a lay that built none of them.
 pub(super) fn forget_laid(bodies: &Bodies<'_>, laid: &[CoroutineOf], ground: PTys<'_>) {
+    forget_laid_in(&bodies.coroutines, laid, ground);
+}
+
+/// Like [`forget_laid`], taking `&Coroutines` directly.
+pub(super) fn forget_laid_in(coroutines: &crate::front2::coroutines::Coroutines, laid: &[CoroutineOf], ground: PTys<'_>) {
     for &c in laid {
         if let Ok(args) = ground.list(c.owner_args) {
-            bodies.coroutines.states.forget(c.owner, c.ordinal, args);
+            coroutines.states.forget(c.owner, c.ordinal, args);
         }
     }
 }
@@ -290,7 +326,10 @@ fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     let unchecked: Cell<Option<ItemKey>> = Cell::new(None);
     // The owner's index and checked body of coroutine `c`, or `None` (and `unchecked` set).
     let owner_of = |c: CoroutineOf| -> Option<usize> {
-        let ci = program.fn_index(c.owner)?;
+        let Some(ci) = program.fn_index(c.owner) else {
+            unchecked.set(Some(c.owner));
+            return None;
+        };
         if bodies.checked.get(ci).and_then(Option::as_ref).is_none() {
             unchecked.set(Some(c.owner));
             return None;

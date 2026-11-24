@@ -36,7 +36,7 @@ use core::cell::RefCell;
 use blaze_build::layout::{LayoutFacts, Missing};
 use blaze_build::{Adts, AsyncItems, BuildError, CoroutineFacts, CoroutineOf, Instance, StateShape};
 use blaze_own::{Alloc, Vec};
-use blaze_typeck::{Checked, ItemKey, LangItem, List, Name, PNode, PTy, PortableTys};
+use blaze_typeck::{Checked, ItemKey, LangItem, List, Name, PNode, PTy, PTys, PortableTys};
 
 use crate::front::FnLang;
 use crate::seam::FrontEnd;
@@ -113,6 +113,153 @@ impl StatesInner {
             .find(|m| m.0 == owner && m.1 == ordinal && self.args.get(m.2 as usize..(m.2 + m.3) as usize) == Some(args))
             .map(|m| m.4)
     }
+
+    fn find_across(&self, owner: ItemKey, ordinal: u32, args: &[PTy], arg_tys: PTys<'_>, own_tys: PTys<'_>) -> Option<StateShape> {
+        self.made
+            .iter()
+            .find(|m| {
+                m.0 == owner
+                    && m.1 == ordinal
+                    && usize::try_from(m.2)
+                        .ok()
+                        .zip(usize::try_from(m.2.saturating_add(m.3)).ok())
+                        .and_then(|(s, e)| self.args.get(s..e))
+                        .is_some_and(|stored| {
+                            stored.len() == args.len() && args.iter().zip(stored.iter()).all(|(&a, &b)| pty_eq_across(arg_tys, a, own_tys, b))
+                        })
+            })
+            .map(|m| m.4)
+    }
+}
+
+/// Structural equality of two portable types residing in different `PTys` tables (bounded,
+/// zero-allocation, used when matching constant-evaluation types against the build's ground table).
+pub(crate) fn pty_eq_across(ta: PTys<'_>, a: PTy, tb: PTys<'_>, b: PTy) -> bool {
+    let mut stack = [(PTy(0), PTy(0)); 256];
+    let mut sp = 1usize;
+    stack[0] = (a, b);
+    let mut steps = 0u32;
+    while sp > 0 {
+        steps += 1;
+        if steps > 4096 {
+            return false;
+        }
+        sp -= 1;
+        let Some(&(x, y)) = stack.get(sp) else { return false };
+        let (Ok(nx), Ok(ny)) = (ta.node(x), tb.node(y)) else { return false };
+        let push_pair = |stack: &mut [(PTy, PTy); 256], sp: &mut usize, px: PTy, py: PTy| -> bool {
+            let Some(slot) = stack.get_mut(*sp) else { return false };
+            *slot = (px, py);
+            *sp += 1;
+            true
+        };
+        let push_lists = |stack: &mut [(PTy, PTy); 256], sp: &mut usize, lx: List, ly: List| -> bool {
+            let (Ok(sx), Ok(sy)) = (ta.list(lx), tb.list(ly)) else { return false };
+            if sx.len() != sy.len() {
+                return false;
+            }
+            for (&ex, &ey) in sx.iter().zip(sy.iter()) {
+                if !push_pair(stack, sp, ex, ey) {
+                    return false;
+                }
+            }
+            true
+        };
+        match (nx, ny) {
+            (PNode::Bool, PNode::Bool)
+            | (PNode::Char, PNode::Char)
+            | (PNode::Str, PNode::Str)
+            | (PNode::Never, PNode::Never)
+            | (PNode::Infer, PNode::Infer)
+            | (PNode::Error, PNode::Error) => {}
+            (PNode::Int(i), PNode::Int(j)) if i == j => {}
+            (PNode::Uint(i), PNode::Uint(j)) if i == j => {}
+            (PNode::Float(i), PNode::Float(j)) if i == j => {}
+            (PNode::Param(i), PNode::Param(j)) if i == j => {}
+            (PNode::ConstParam(i), PNode::ConstParam(j)) if i == j => {}
+            (PNode::ExAuto(kx), PNode::ExAuto(ky)) | (PNode::Foreign(kx), PNode::Foreign(ky)) if kx == ky => {}
+            (PNode::ConstValue { ty: tx, bits: vx }, PNode::ConstValue { ty: ty, bits: vy }) if vx == vy => {
+                if !push_pair(&mut stack, &mut sp, tx, ty) {
+                    return false;
+                }
+            }
+            (PNode::Ref(mx, ix), PNode::Ref(my, iy)) | (PNode::Ptr(mx, ix), PNode::Ptr(my, iy)) if mx == my => {
+                if !push_pair(&mut stack, &mut sp, ix, iy) {
+                    return false;
+                }
+            }
+            (PNode::Slice(ix), PNode::Slice(iy)) => {
+                if !push_pair(&mut stack, &mut sp, ix, iy) {
+                    return false;
+                }
+            }
+            (PNode::Array(ix, lx), PNode::Array(iy, ly)) => {
+                if !push_pair(&mut stack, &mut sp, ix, iy) || !push_pair(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (PNode::Pat(bx, rx), PNode::Pat(by, ry)) => {
+                if !push_pair(&mut stack, &mut sp, bx, by) || !push_lists(&mut stack, &mut sp, rx, ry) {
+                    return false;
+                }
+            }
+            (PNode::Tuple(lx), PNode::Tuple(ly))
+            | (PNode::Union(lx), PNode::Union(ly))
+            | (PNode::Dynamic(lx), PNode::Dynamic(ly)) => {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (PNode::Record(sx, lx), PNode::Record(sy, ly)) if sx == sy => {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (PNode::Adt(kx, lx), PNode::Adt(ky, ly))
+            | (PNode::Opaque(kx, lx), PNode::Opaque(ky, ly))
+            | (PNode::FnDef(kx, lx), PNode::FnDef(ky, ly))
+            | (PNode::ExTrait(kx, lx), PNode::ExTrait(ky, ly))
+                if kx == ky =>
+            {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (PNode::FnPtr(lx, sx), PNode::FnPtr(ly, sy)) if sx == sy => {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (PNode::Closure { owner: ox, ordinal: rx, args: lx }, PNode::Closure { owner: oy, ordinal: ry, args: ly })
+            | (PNode::Coroutine { owner: ox, ordinal: rx, args: lx }, PNode::Coroutine { owner: oy, ordinal: ry, args: ly })
+                if ox == oy && rx == ry =>
+            {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (PNode::Future(ex, ox, ix), PNode::Future(ey, oy, iy)) if ex == ey => {
+                if !push_pair(&mut stack, &mut sp, ox, oy) || !push_pair(&mut stack, &mut sp, ix, iy) {
+                    return false;
+                }
+            }
+            (PNode::Alias { trait_: tx, name: nx, args: lx }, PNode::Alias { trait_: ty, name: ny, args: ly }) if tx == ty && nx == ny => {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (
+                PNode::ExProj { trait_: tx, name: nx, args: lx, term: mx },
+                PNode::ExProj { trait_: ty, name: ny, args: ly, term: my },
+            ) if tx == ty && nx == ny => {
+                if !push_pair(&mut stack, &mut sp, mx, my) || !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// The states of the coroutine instances built so far ([`LayoutFacts::coroutine_state`]).
@@ -133,6 +280,13 @@ impl States {
     /// refuses by name (never a second build).
     pub(crate) fn get(&self, owner: ItemKey, ordinal: u32, args: &[PTy]) -> Result<StateShape, Missing> {
         self.inner.borrow().find(owner, ordinal, args).ok_or(Missing { item: owner })
+    }
+
+    /// The state of `owner`'s block `ordinal` at `args` (types of `arg_tys`), matched structurally
+    /// against the states recorded over `own_tys` (the build's ground table). Used when constant
+    /// evaluation lays out a coroutine in its own ground table (`front2/consts.rs`).
+    pub(crate) fn find_across(&self, owner: ItemKey, ordinal: u32, args: &[PTy], arg_tys: PTys<'_>, own_tys: PTys<'_>) -> Option<StateShape> {
+        self.inner.borrow().find_across(owner, ordinal, args, arg_tys, own_tys)
     }
 
     /// Whether the state of that instance is made.
@@ -164,7 +318,7 @@ impl States {
 
 /// What one build holds of the program's coroutines: the facts, the states made so far, and
 /// the library's items, each looked up once.
-pub(crate) struct Coroutines {
+pub struct Coroutines {
     pub(crate) table: CoroutineTable,
     pub(crate) states: States,
     pub(crate) items: Option<AsyncItems>,
@@ -183,6 +337,16 @@ impl Coroutines {
             return Ok(None);
         }
         self.states.get(owner, ordinal, args).map(Some)
+    }
+
+    /// Like [`Self::state`], matching `args` in `arg_tys` structurally against the states recorded
+    /// over `own_tys` (the build's ground table). Returns `None` when the block or its laid state
+    /// is absent.
+    pub(crate) fn state_across(&self, owner: ItemKey, ordinal: u32, args: &[PTy], arg_tys: PTys<'_>, own_tys: PTys<'_>) -> Option<StateShape> {
+        if !self.table.has(owner, ordinal) {
+            return None;
+        }
+        self.states.find_across(owner, ordinal, args, arg_tys, own_tys)
     }
 }
 

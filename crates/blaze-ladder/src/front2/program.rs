@@ -2198,7 +2198,7 @@ impl FrontEnd for Front2Program<'_> {
     /// a const block or a promoted borrow of a body (`Consts::body_value`, under its key over
     /// the owner's text: `ConstNeed::in_body`). The evaluator checks any body and makes any
     /// impl row the value needs.
-    fn const_at(&mut self, need: super::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy], closures: &crate::run::ClosureTable) -> Result<DataRecord<Global>, super::const_at::ConstAtWhy> {
+    fn const_at(&mut self, need: super::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy], build: super::const_at::BuildFacts<'_>) -> Result<DataRecord<Global>, super::const_at::ConstAtWhy> {
         let alloc = self.store.tys.alloc();
         let mut records = Records {
             names: self.front.names,
@@ -2212,14 +2212,14 @@ impl FrontEnd for Front2Program<'_> {
             consts: None,
         };
         let made = match need {
-            super::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, self.prepared, item, from, args, Some(closures), alloc),
+            super::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, self.prepared, item, from, args, Some(build), alloc),
             super::const_at::ConstNeed::Block { .. } | super::const_at::ConstNeed::Promoted { .. } => {
                 let owner = need.item();
                 let in_body = records.store.fns.get(&owner).and_then(|h| need.in_body(h.text));
                 let Some((owner, root, key)) = in_body else {
                     return Err(super::const_at::ConstAtWhy::Eval(super::consts::ConstFail::Body { item: owner, error: super::body::BodyError::NoHead(owner) }));
                 };
-                self.consts.body_value(&mut records, self.prepared, owner, root, key, from, args, Some(closures), alloc)
+                self.consts.body_value(&mut records, self.prepared, owner, root, key, from, args, Some(build), alloc)
             }
         };
         made.map(super::const_at::data_record).map_err(super::const_at::ConstAtWhy::Eval)

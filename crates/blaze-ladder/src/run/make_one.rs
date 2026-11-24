@@ -54,7 +54,7 @@ use crate::code_records::{Builder, Callee, CodeRecordError, CodeStore, Declared,
 use crate::front2::const_at::{ConstNeed, ConstTable, Needs};
 use crate::front2::coroutines::Coroutines;
 use crate::front2::program::lazy::LazyRefusal;
-use super::lay_states::{Lay, lay_and_build, roots_of_instance, unchecked_owner};
+use super::lay_states::{LaidOnly, Lay, forget_laid_in, lay_and_build, lay_only, roots_of_instance, unchecked_owner};
 use crate::symbols::{decode_instance, encode_instance, fn_symbol_of_name, vtable_symbol};
 
 /// Whole-program demand-driven cross-function LIR inlining and LTO for `blaze export`.
@@ -988,9 +988,39 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
     // worlds asked (`FrontEnd::make_asked`) and the constants are pulled again; bounded by the
     // same count (rule 18), and nothing made is the `Missing` itself.
     let mut pulled = AskProgress::new_in(alloc);
+    let mut pull_owners = 0usize;
     loop {
         match pull_constants(program, state, build_i, build_instance) {
-            Ok(()) => break,
+            Ok(PullStep::Done) => break,
+            Ok(PullStep::Check(owner)) => {
+                pull_owners += 1;
+                if pull_owners > MOST_HELD_COROUTINES {
+                    let error = BuildError::UnsupportedSig { what: "an instance whose constant evaluation needed more than 4096 coroutine owner fns checked" };
+                    return Err(RunError::Build { function: program.function(build_i).named(), error, range: None });
+                }
+                if state.ensure(program, typing, owner, checks)?.is_none() {
+                    return Err(unchecked_owner(&*program, build_i, owner));
+                }
+            }
+            Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { owner, .. }, .. })
+                if pull_owners < MOST_HELD_COROUTINES
+                    && match state.asked.binary_search_by_key(&owner, |r| r.0) {
+                        Err(_) => true,
+                        Ok(slot) => state.asked.get(slot).is_some_and(|e| e.1.is_none()) && program.fn_index(owner).is_none(),
+                    } =>
+            {
+                pull_owners += 1;
+                if state.ensure(program, typing, owner, checks)?.is_none() {
+                    let Some(row) = program.head_row(owner)? else {
+                        return Err(unchecked_owner(&*program, build_i, owner));
+                    };
+                    if let Ok(slot) = state.asked.binary_search_by_key(&owner, |r| r.0)
+                        && let Some(entry) = state.asked.get_mut(slot)
+                    {
+                        entry.1 = Some(row);
+                    }
+                }
+            }
             Err(e) if asks_again(&e) && pulled.allow(&e) => {
                 if !program.make_asked(build_i)? {
                     return Err(e);
@@ -1228,12 +1258,19 @@ struct Held<'a> {
     objects: AVec<'a, ItemKey>,
 }
 
+/// Result of [`pull_constants`]: either every constant need was pulled, or a coroutine held by
+/// one of the constant needs' arguments requires its owner fn to be checked first.
+enum PullStep {
+    Done,
+    Check(ItemKey),
+}
+
 /// The per-item constant pull of build_from's step (`const_at::needs_of`, `const_at::pull`),
 /// and every constant the body reads at no arguments (`const_at::plain_needs_of`): the walk's
 /// builds and its verifier read every constant from the one pulled table (rule 30). A
 /// closure's and a coroutine's function read their owner's body at the owner's arguments, as
 /// `build_one` builds them, so they pull the owner's needs there.
-fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize, instance: Instance) -> Result<(), RunError> {
+fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize, instance: Instance) -> Result<PullStep, RunError> {
     let MakerState { checked, tables, work, .. } = &mut *state;
     work.needs.clear();
     let function = program.function(i);
@@ -1245,7 +1282,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
                 || crate::clone_shim::language_clone(&*program, instance, &work.ground).is_some()
                 || crate::clone_shim::language_from(&*program, instance, &work.ground).is_some()))
     {
-        return Ok(());
+        return Ok(PullStep::Done);
     }
     let (Some((body, _)), Some(done)) = (function.body, checked.get(i).and_then(Option::as_ref)) else {
         return Err(callee_refusal(&*program, function.named(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, work.ground.view()));
@@ -1284,19 +1321,68 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
             Err(e) => Err(malformed(e)),
         },
     };
+    // Any coroutine held by value in a constant need's arguments (e.g. `Box::new(async move { .. })`
+    // reading `<{coroutine} as SizedTypeProperties>::LAYOUT`): lay out its state from types first
+    // (`lay_only`) so constant evaluation observes the exact same `StateShape` as the build.
+    let mut laid_for_const: AVec<'static, blaze_build::CoroutineOf> = blaze_own::Vec::new_in(work.alloc);
+    let mut unchecked_coro = None;
+    let lay_result = if found.is_ok() && !work.needs.is_empty() {
+        let mut need_tys: AVec<'_, PTy> = blaze_own::Vec::new_in(work.alloc);
+        for (_, a) in work.needs.iter() {
+            need_tys.extend_from_slice(a);
+        }
+        need_tys.sort_unstable();
+        need_tys.dedup();
+        if need_tys.is_empty() {
+            Ok(())
+        } else {
+            match crate::front2::coroutine_needs::held_coroutines(&mut work.ground, &need_tys, &facts, work.alloc) {
+                Ok(coro_roots) if coro_roots.is_empty() => Ok(()),
+                Ok(coro_roots) => match lay_only(&*program, &[], &work.langs, &bodies, &mut work.ground, &mut work.layouts, i, &coro_roots, work.alloc) {
+                    Ok(LaidOnly::Done(recorded)) => {
+                        laid_for_const = recorded;
+                        Ok(())
+                    }
+                    Ok(LaidOnly::Unchecked(owner)) => {
+                        unchecked_coro = Some(owner);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                },
+                Err(error) => Err(RunError::Build { function: function.named(), error, range: None }),
+            }
+        }
+    } else {
+        Ok(())
+    };
     *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
     found?;
+    lay_result?;
+    if let Some(owner) = unchecked_coro {
+        return Ok(PullStep::Check(owner));
+    }
     if work.needs.is_empty() {
-        return Ok(());
+        return Ok(PullStep::Done);
     }
     let named = function.named();
     let table = tables.as_mut().ok_or_else(|| tables_gone(instance.item))?;
-    if let Err(refusal) = crate::front2::const_at::pull(&mut *program, &work.needs, work.ground.view(), &mut table.const_at, &table.closures) {
+    let pull_res = crate::front2::const_at::pull(
+        &mut *program,
+        &work.needs,
+        work.ground.view(),
+        &mut table.const_at,
+        crate::front2::const_at::BuildFacts::new(&table.closures, &table.coroutines),
+    );
+    // Forget states laid solely for constant evaluation so `build_one`'s `lay_and_build` still
+    // builds their functions into `stash` (states already laid & built earlier were not in
+    // `laid_for_const` and remain recorded).
+    forget_laid_in(&table.coroutines, &laid_for_const, work.ground.view());
+    if let Err(refusal) = pull_res {
         let item = refusal.need.item();
         let path = program.item_named(item);
         return Err(RunError::ConstAt { function: named, refusal, path });
     }
-    Ok(())
+    Ok(PullStep::Done)
 }
 
 /// The one interface a build asks the world through (F20; rule 30: the recorder of
@@ -1532,28 +1618,55 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
             Err(_) => return Ok(Verdict::Stale { kind: ReadKind::OpaqueHidden, item: owner }),
         }
     }
-    // The constants the rows read, pulled as a make pulls them (`pull_constants`).
-    let mut pulled = 0u32;
-    while !state.work.needs.is_empty() {
-        let table = state.tables.as_mut().ok_or_else(|| tables_gone(tabled))?;
-        let Err(refusal) = crate::front2::const_at::pull(&mut *program, &state.work.needs, state.work.ground.view(), &mut table.const_at, &table.closures) else { break };
-        if pulled < crate::front2::check::MOST_ROUNDS && matches!(program.make_asked(i), Ok(true)) {
-            pulled += 1;
-            continue;
+    // Also include any coroutine held by value in the constant needs' arguments (e.g.
+    // `Box::new(async move { .. })` verifying `<{coroutine} as SizedTypeProperties>::LAYOUT`),
+    // laid BEFORE `const_at::pull` below so constant evaluation sees their laid `StateShape`s.
+    if !state.work.needs.is_empty() {
+        let mut need_tys: AVec<'_, PTy> = blaze_own::Vec::new_in(alloc);
+        for (_, a) in state.work.needs.iter() {
+            need_tys.extend_from_slice(a);
         }
-        let kind = match refusal.need {
-            ConstNeed::Item(_) => ReadKind::Const,
-            ConstNeed::Block { .. } => ReadKind::ConstBlock,
-            ConstNeed::Promoted { .. } => ReadKind::Promoted,
-        };
-        return Ok(Verdict::Stale { kind, item: refusal.need.item() });
+        need_tys.sort_unstable();
+        need_tys.dedup();
+        let mut rounds = 0u32;
+        while !need_tys.is_empty() {
+            let found = {
+                let MakerState { checked, tables, work, .. } = &mut *state;
+                let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
+                let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
+                let facts = FrontAdts(&*program, i, &[], &work.langs, &bodies);
+                let found = crate::front2::coroutine_needs::held_coroutines(&mut work.ground, &need_tys, &facts, work.alloc);
+                *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
+                found
+            };
+            match found {
+                Ok(extra) => {
+                    for c in extra {
+                        if roots.scan_for(&c).is_none() {
+                            roots.push(c);
+                        }
+                    }
+                    break;
+                }
+                Err(BuildError::OpaqueOwnerUnchecked { owner, .. }) if rounds < crate::front2::check::MOST_ROUNDS => {
+                    rounds += 1;
+                    if state.ensure(program, typing, owner, checks).is_err() {
+                        return Ok(Verdict::Stale { kind: ReadKind::Const, item: tabled });
+                    }
+                }
+                Err(_) if rounds < crate::front2::check::MOST_ROUNDS && matches!(program.make_asked(i), Ok(true)) => {
+                    rounds += 1;
+                }
+                Err(_) => return Ok(Verdict::Stale { kind: ReadKind::Const, item: tabled }),
+            }
+        }
     }
-    // The coroutine states the rows read, laid again as the build's lay laid them
-    // (lay_states.rs `relay`: the same order, the same `lay_one`), so a `CoroutineState` or
-    // `CoroutineNiche` row is asked of the same facts and a `Laid` row compared with the same
-    // digest: a row moves only when its answer does. An owner not checked is checked and an
-    // ADT head a lay met unmade is made, then the lay again (bounded, rule 18); a lay that
-    // cannot be made today leaves the entry stale, and the make that follows refuses by name.
+    // The coroutine states the rows (and constant needs) read, laid again as the build's lay laid
+    // them (lay_states.rs `relay`: the same order, the same `lay_one`), so a `CoroutineState` or
+    // `CoroutineNiche` row or constant evaluation is asked of the same facts and a `Laid` row
+    // compared with the same digest: a row moves only when its answer does. An owner not checked
+    // is checked and an ADT head a lay met unmade is made, then the lay again (bounded, rule 18);
+    // a lay that cannot be made today leaves the entry stale, and the make that follows refuses by name.
     let mut relaid: AVec<'_, (blaze_build::CoroutineOf, ContentId)> = blaze_own::Vec::new_in(alloc);
     let mut recorded: AVec<'_, blaze_build::CoroutineOf> = blaze_own::Vec::new_in(alloc);
     let mut lays = 0usize;
@@ -1586,15 +1699,41 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
             }
         }
     }
-    let verdict = verify_rows(program, state, i, tabled, &view, &relaid);
+    // The constants the rows read, pulled as a make pulls them (`pull_constants`), with the
+    // relaid coroutine states visible to constant evaluation.
+    let mut pulled = 0u32;
+    let mut pull_stale = None;
+    while !state.work.needs.is_empty() {
+        let table = state.tables.as_mut().ok_or_else(|| tables_gone(tabled))?;
+        let Err(refusal) = crate::front2::const_at::pull(
+            &mut *program,
+            &state.work.needs,
+            state.work.ground.view(),
+            &mut table.const_at,
+            crate::front2::const_at::BuildFacts::new(&table.closures, &table.coroutines),
+        ) else {
+            break;
+        };
+        if pulled < crate::front2::check::MOST_ROUNDS && matches!(program.make_asked(i), Ok(true)) {
+            pulled += 1;
+            continue;
+        }
+        let kind = match refusal.need {
+            ConstNeed::Item(_) => ReadKind::Const,
+            ConstNeed::Block { .. } => ReadKind::ConstBlock,
+            ConstNeed::Promoted { .. } => ReadKind::Promoted,
+        };
+        pull_stale = Some(Verdict::Stale { kind, item: refusal.need.item() });
+        break;
+    }
+    let verdict = match pull_stale {
+        Some(stale) => Ok(stale),
+        None => verify_rows(program, state, i, tabled, &view, &relaid),
+    };
     // The states laid again above were built into nothing: forgotten, so a make that follows
     // lays and builds them (lay_states.rs `forget_laid`).
     if let Some(t) = state.tables.as_ref() {
-        for c in recorded.iter() {
-            if let Ok(args) = state.work.ground.view().list(c.owner_args) {
-                t.coroutines.states.forget(c.owner, c.ordinal, args);
-            }
-        }
+        forget_laid_in(&t.coroutines, &recorded, state.work.ground.view());
     }
     verdict
 }

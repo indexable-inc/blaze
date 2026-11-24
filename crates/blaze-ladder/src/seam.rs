@@ -413,11 +413,11 @@ pub trait FrontEnd {
     /// build's instance loop pulls each need of an instance before it walks it
     /// (front2/const_at.rs). The front end may check a body or make an impl row it has not
     /// made yet. The default evaluates none: each need is refused by name. Asked only of a
-    /// front end whose [`FrontEnd::evaluates_at_args`] is true. `closures` is the build's
-    /// table of its checked fn bodies' closures: a closure type among `args` (`Box::new` at a
-    /// closure reads `<{closure} as SizedTypeProperties>::LAYOUT`) is laid out from it.
-    fn const_at(&mut self, need: crate::front2::const_at::ConstNeed, from: blaze_typeck::PTys<'_>, args: &[blaze_typeck::PTy], closures: &crate::run::ClosureTable) -> Result<blaze_build::data::DataRecord<Global>, crate::front2::const_at::ConstAtWhy> {
-        let _ = (need, from, args, closures);
+    /// front end whose [`FrontEnd::evaluates_at_args`] is true. `build` carries the build's
+    /// closure and coroutine tables: closure or coroutine types among `args` (`Box::new` at a
+    /// closure or async block reads `<T as SizedTypeProperties>::LAYOUT`) are laid out from it.
+    fn const_at(&mut self, need: crate::front2::const_at::ConstNeed, from: blaze_typeck::PTys<'_>, args: &[blaze_typeck::PTy], build: crate::front2::const_at::BuildFacts<'_>) -> Result<blaze_build::data::DataRecord<Global>, crate::front2::const_at::ConstAtWhy> {
+        let _ = (need, from, args, build);
         Err(crate::front2::const_at::ConstAtWhy::NoEvaluator)
     }
     /// The fn instance that key `key` names in a constant's record this front end evaluated
