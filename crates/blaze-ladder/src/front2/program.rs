@@ -1920,10 +1920,10 @@ impl FrontEnd for Front2Program<'_> {
         self.front.index.fn_lang(l).map(checker_of)
     }
 
-    /// The `drop` lang trait and its `drop` fn (filed once the trait's head was made).
+    /// The `drop` lang trait and its `drop` fn (from its filed head or the library's member row).
     fn drop_trait(&self) -> Option<(ItemKey, Option<ItemKey>)> {
         let tr = self.made_lang(LangItem::Drop)?;
-        Some((tr, self.front.keys.filed_member(tr, MemberKind::Fn, "drop")))
+        Some((tr, self.lang_trait_fn(LangItem::Drop, "drop")))
     }
 
     /// The library item for `item`, by the one home the checker's world asks too

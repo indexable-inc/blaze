@@ -2887,3 +2887,93 @@ fn an_opaque_at_a_projected_argument_is_named_and_verified_over_names_records() 
     assert_eq!(status, 5, "the run's status is the last item");
     println!("d106 for_each over names records: first {first}; again {again}; run status {status}");
 }
+
+/// An `async fn` holding ADTs whose `Drop` impl buckets were not made during body check:
+/// - `Tag`, a `Copy` ADT whose `Drop` bucket `gather_facts` skipped ("YES to `Copy` is NO to
+///   `Drop` without asking"),
+/// - `Outer`, holding a nested ADT `Inner` not directly named in the async body,
+/// - generic `T` instantiated at `HiddenTag`, whose concrete ADT is unknown until instantiation.
+/// When `lay_one` asks `drop_facts::needs_drop` for each saved local, `adt_drop_impl` notes the
+/// unmade `Drop` impl bucket and returns `ResolveError::Missing`, which must pass through to
+/// `asks_again` so `make_asked` fills it and the lay retries.
+const ASYNC_SAVED_DROP: &str = "
+struct Tag {
+    n: u32,
+}
+
+impl Clone for Tag {
+    fn clone(&self) -> Tag { *self }
+}
+impl Copy for Tag {}
+
+struct Inner {
+    n: u32,
+}
+
+impl Clone for Inner {
+    fn clone(&self) -> Inner { *self }
+}
+impl Copy for Inner {}
+
+struct Outer {
+    inner: Inner,
+}
+
+impl Clone for Outer {
+    fn clone(&self) -> Outer { *self }
+}
+impl Copy for Outer {}
+
+struct HiddenTag {
+    n: u32,
+}
+
+impl Clone for HiddenTag {
+    fn clone(&self) -> HiddenTag { *self }
+}
+impl Copy for HiddenTag {}
+
+fn read_hidden(h: HiddenTag) -> u32 {
+    h.n
+}
+
+async fn with_saved_copy(tag: Tag) -> u32 {
+    let saved = tag;
+    let v = Twice { left: 1, value: 20 }.await;
+    v + saved.n
+}
+
+async fn with_saved_nested(outer: Outer) -> u32 {
+    let saved = outer;
+    let v = Twice { left: 1, value: 20 }.await;
+    v + saved.inner.n
+}
+
+async fn with_saved_generic<T>(x: T, read: fn(T) -> u32) -> u32 {
+    let saved = x;
+    let v = Twice { left: 1, value: 20 }.await;
+    v + read(saved)
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut polls = 0u32;
+    let mut wakes = 0u32;
+    let a = block_on(with_saved_copy(Tag { n: 22 }), &mut polls, &mut wakes);
+    let b = block_on(with_saved_nested(Outer { inner: Inner { n: 22 } }), &mut polls, &mut wakes);
+    let c = block_on(with_saved_generic(HiddenTag { n: 22 }, read_hidden), &mut polls, &mut wakes);
+    if a == 42 && b == 42 && c == 42 { 42 } else { 1 }
+}
+";
+
+/// A coroutine whose saved local is an ADT with an unmade `Drop` impl bucket (a `Copy` ADT whose
+/// `Drop` bucket `gather_facts` skipped, a nested field ADT, or a generic parameter instantiated
+/// at an ADT) asks `make_asked` and retries instead of failing with "whether a saved local of a
+/// coroutine state needs drop was not answered" (tempo-alloy `selected_key_validates_its_pending_authorization`).
+///
+/// Prints: `d106 async saved drop over names records: first <counts>; again <counts>`
+#[test]
+fn a_coroutine_saved_local_needs_drop_fills_unmade_drop_impls() {
+    let (first, again) = walk_async(ASYNC_SAVED_DROP, &["with_saved_copy", "with_saved_nested", "with_saved_generic"]);
+    println!("d106 async saved drop over names records: first {first}; again {again}");
+}
