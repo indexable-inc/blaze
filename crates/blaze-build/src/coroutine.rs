@@ -233,25 +233,6 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         Ok(CoParts { of, env, output })
     }
 
-    /// `Walk::copy`'s step for walk row `l` when it is a coroutine's: the state's bytes moved
-    /// whole, `true`; `false` for every other row. A state's row has one field, its upvars,
-    /// but what the pass keeps past them and the tag are the state too. Only a state not
-    /// polled yet is ever moved (after its first poll it is pinned: the Reference, "Await
-    /// expressions", step 3), so the bytes hold no pointer into themselves.
-    pub(super) fn copy_state(&mut self, l: u32, from: (Value, i32), to: (Value, i32)) -> bool {
-        let row = &self.layouts[l as usize];
-        let (ty, size, align) = (row.ty, row.size, row.align);
-        if coroutine_of(self.ground.view(), ty).is_none() {
-            return false;
-        }
-        let (src, dst) = (self.address(from), self.address(to));
-        let len = self.b.iconst(Ty::I64, u128::from(size));
-        let mut attrs = MemAttrs::aligned(align);
-        attrs.src_align = align;
-        self.b.bulk(Op::Memcpy, Flags::NONE, dst, src, len, attrs);
-        true
-    }
-
     /// The library items `.await` and a coroutine's entries need, asked at `expr`.
     fn async_items(&self, expr: Option<ExprId>) -> Result<crate::AsyncItems, BuildError> {
         self.adts.async_items().ok_or(BuildError::NoLangFn { expr, name: "the `Poll`, `Pin` and `IntoFuture` items (`Adts::async_items`)" })
