@@ -280,6 +280,7 @@ pub(crate) fn compute_block_order<'a>(view: &View<'_>, alloc: Alloc<'a>) -> Vec<
 pub(crate) fn detect_tail_calls<'a>(
     view: &View<'_>,
     allow_direct_tco: bool,
+    os: crate::Os,
     alloc: Alloc<'a>,
 ) -> Vec<bool, Alloc<'a>> {
     let len = view.len();
@@ -297,22 +298,12 @@ pub(crate) fn detect_tail_calls<'a>(
         return is_tail;
     }
     let has_stacked = |sig: blaze_lir::func::Sig<'_>| -> bool {
-        let mut gpr = 0usize;
-        let mut fp = 0usize;
+        let mut regs = crate::pass::Regs::new(os);
         for p in sig.params {
             if ParamKind::from_byte(p.kind) == Some(ParamKind::Sret) {
                 continue;
             }
-            let ty = Ty(p.ty);
-            if ty == Ty::F32 || ty == Ty::F64 {
-                fp += 1;
-            } else if ty == Ty::I128 {
-                gpr = (gpr + 1) & !1;
-                gpr += 2;
-            } else {
-                gpr += 1;
-            }
-            if gpr > 8 || fp > 8 {
+            if regs.next(Ty(p.ty)).is_none() {
                 return true;
             }
         }

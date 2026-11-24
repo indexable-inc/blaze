@@ -369,3 +369,55 @@ pub extern \"C\" fn main() -> i32 {
     println!("CLOSURE OF A CLOSURE: {got:?}");
     assert_eq!(got, Ok(29));
 }
+
+/// Shape of `sha2::Sha512VarCore::finalize_variable_core` calling
+/// `block_buffer::BlockBuffer::len128_padding_be(&mut self, data_len: u128, compress: impl FnMut(&[u8; 16]))`:
+/// with overflow checks enabled, the caller's checked `u128` arithmetic falls back to `Reference`
+/// while `len128_padding_be` compiles on `Sota`. On macOS arm64, `data_len: u128` sits in `x1:x2`
+/// and `compress` in `x3`; before unifying `Sota` onto `crate::pass::Regs`, `Sota` aligned `u128`
+/// to `x2:x3` and read garbage from `x4` as `compress` (SIGSEGV).
+/// Result: state starts at 7, adds `pos` (3) + low byte of `bit_len` (`8 * (3 + 128 * 2) = 2072`,
+/// `2072 & 0xff = 24`) + high word check (0) = `7 + 3 + 24 = 34`.
+#[test]
+fn method_taking_mut_self_u128_and_closure_runs_across_tiers() {
+    let got = run("
+struct Buf {
+    data: [u8; 16],
+    pos: u8,
+}
+
+impl Buf {
+    fn len128_padding_be<F: FnMut(&[u8; 16])>(&mut self, data_len: u128, mut compress: F) {
+        self.data[0] = self.pos;
+        self.data[1] = (data_len & 0xff) as u8;
+        self.data[2] = ((data_len >> 64) & 0xff) as u8;
+        compress(&self.data);
+    }
+}
+
+struct Core {
+    state: u64,
+    block_len: u128,
+}
+
+impl Core {
+    fn finalize(&mut self, buf: &mut Buf) {
+        let bs = 128u128;
+        let bit_len = 8u128 * (buf.pos as u128 + bs * self.block_len);
+        buf.len128_padding_be(bit_len, |b| {
+            self.state = self.state + b[0] as u64 + b[1] as u64 + b[2] as u64;
+        });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut buf = Buf { data: [0u8; 16], pos: 3 };
+    let mut core = Core { state: 7, block_len: 2 };
+    core.finalize(&mut buf);
+    core.state as i32
+}
+");
+    println!("U128+CLOSURE CROSS-TIER: {got:?}");
+    assert_eq!(got, Ok(34));
+}
