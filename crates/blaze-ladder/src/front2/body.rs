@@ -1174,7 +1174,7 @@ pub(crate) fn lower_body_with_text<'n, S: NamesSource<'n>>(
         self_assoc: head.self_assoc.to_vec_in(alloc),
     };
     let subst_slice = param_subst.map(|(_, args)| args);
-    let mut body = lower_at(names, prepared, keys, store, site, into, subst_slice)?;
+    let mut body = lower_at(names, prepared, keys, store, site, into, subst_slice, parser::Extensions::RECORDS)?;
     body.expanded_text = Some(text);
     if let Some((orig, args)) = param_subst {
         let store_alloc = store.tys.alloc();
@@ -1221,7 +1221,7 @@ fn lower_fn_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys
         self_: head.self_,
         self_assoc: head.self_assoc.to_vec_in(alloc),
     };
-    lower_at(names, prepared, keys, store, site, into, None)
+    lower_at(names, prepared, keys, store, site, into, None, parser::Extensions::NONE)
 }
 
 /// Lowers and converts the body of the member fn `key` of a trait or an impl, in the env its
@@ -1292,7 +1292,7 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
         self_assoc: head.self_assoc.to_vec_in(alloc),
     };
     let container = head.container;
-    let mut body = lower_at(names, prepared, keys, store, site, into, None)?;
+    let mut body = lower_at(names, prepared, keys, store, site, into, None, parser::Extensions::NONE)?;
     // The body's own trait is in scope in it, imported or not (own_trait.rs: `impl
     // core::hash::Hash for X { .. self.field.hash(state) .. }`); `traits` stays sorted.
     if let Some(own) = super::own_trait::of_member(store, container).map_err(|e| BodyError::NoHead(e.0))? {
@@ -1418,7 +1418,8 @@ fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, ite
     None
 }
 
-fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, site: Site<'n>, mut into: Option<&mut PortableTys<'static>>, param_subst: Option<&[PTy]>) -> Result<Body<'n>, BodyError> {
+#[expect(clippy::too_many_arguments, reason = "internal body lowering entry point")]
+fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, site: Site<'n>, mut into: Option<&mut PortableTys<'static>>, param_subst: Option<&[PTy]>, extra_extensions: parser::Extensions) -> Result<Body<'n>, BodyError> {
     let Site { item, owner, krate, module, text, marks, params, consts, bounds, self_, self_assoc } = site;
     // The body's local items keep these marks for their own heads and bodies (locals.rs
     // `LocalHead::marks`).
@@ -1455,7 +1456,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let body_sources = store.sources;
     let mut expand = ByName::with_names(&scoped, host, alloc);
     let mut values = ModuleValues { names, module, store: &mut *store, keys: &mut *keys, failed: None, krate, item, owner, text, blocks: None };
-    let extensions = names.blaze_extensions(krate);
+    let extensions = names.blaze_extensions(krate).with(extra_extensions);
     let lowered = match marks {
         Some(marks) => blaze_lower::lower_body_expanding_marked_with_extensions(marks, edition, extensions, &mut CrateCfg(atoms), &mut values, &mut expand, alloc),
         None => blaze_lower::lower_body_expanding_with_extensions(text, edition, extensions, &mut CrateCfg(atoms), &mut values, &mut expand, alloc),

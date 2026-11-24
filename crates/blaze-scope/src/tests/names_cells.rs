@@ -138,10 +138,10 @@ impl Side {
 
 /// The keys of the rows two tables do not share: a cell added, gone or holding another digest.
 fn moved(before: &[u8], after: &[u8]) -> Vec<[u8; 16]> {
-    let rows = |t: &[u8]| -> Vec<([u8; 16], [u8; 32])> {
-        t.chunks(48)
+    let rows = |t: &[u8]| -> Vec<([u8; 16], [u8; 16])> {
+        t.chunks_exact(crate::names_cells::TABLE_ROW)
             .map(|r| {
-                let (mut k, mut d) = ([0; 16], [0; 32]);
+                let (mut k, mut d) = ([0; 16], [0; 16]);
                 k.copy_from_slice(&r[..16]);
                 d.copy_from_slice(&r[16..]);
                 (k, d)

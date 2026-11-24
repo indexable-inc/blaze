@@ -658,6 +658,40 @@ pub fn written_types(v: &View<'_>, preds: &Preds, out: &mut Vec<lf::TypeId, Mem>
     Ok(())
 }
 
+/// Written types of non-higher-ranked `Param(p): Trait<...>` clauses of `preds`, collected for
+/// pre-laying local parameter bounds before laying the item's other types (e.g. `M::Visitor`
+/// under `where M: MakeOutput<Writer<'writer>, Out>`).
+pub fn param_bound_types(v: &View<'_>, tys: PTys<'_>, preds: &Preds, out: &mut Vec<lf::TypeId, Mem>) -> Result<(), RegionsRefusal> {
+    let add = |t: lf::TypeId, out: &mut Vec<lf::TypeId, Mem>| {
+        if out.scan_for(&t).is_none() {
+            out.push(t);
+        }
+    };
+    for (&c, &src) in preds.clauses.iter().zip(preds.sources.iter()) {
+        let PClause::Trait { args, .. } = c else { continue };
+        let Src::Trait { on, bound, binders } = src else { continue };
+        if binders != Binders::NONE {
+            continue;
+        }
+        let Ok(list) = tys.list(args) else { continue };
+        if !list.first().is_some_and(|&f| matches!(tys.node(f), Ok(PNode::Param(_)))) {
+            continue;
+        }
+        if let On::Written(t) = on {
+            add(t, out);
+        }
+        let seg = last_segment(v, bound)?;
+        if seg.has_args || seg.parenthesized {
+            for &n in read(v.rows(seg.args), "a bound's arguments")? {
+                if let lf::GenericArg::Type(t) = read(lf::GenericArg::decode(n), "a generic argument")? {
+                    add(t, out);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The written types of an impl header that [`impl_header_regions`] reads: the self type, then the
 /// trait reference's type arguments.
 pub fn header_types(v: &View<'_>, self_written: lf::TypeId, trait_path: Option<lf::TypeId>, out: &mut Vec<lf::TypeId, Mem>) -> Result<(), RegionsRefusal> {
@@ -1103,6 +1137,32 @@ pub fn fill_clauses(cx: &Cx<'_, '_>, tys: &mut PortableTys<'_>, preds: &Preds, c
         parts.push(part);
     }
     Ok(())
+}
+
+/// Pre-lays non-higher-ranked `Param(p): Trait<...>` clauses from `preds` into `out`. Any clause
+/// whose bound type itself cannot yet be laid (e.g. chained projections) is skipped here and
+/// handled by the full [`fill_clauses`] pass.
+pub fn param_bound_clauses(cx: &Cx<'_, '_>, tys: &mut PortableTys<'_>, preds: &Preds, out: &mut Vec<ClauseRegions<Mem>, Mem>) {
+    if preds.sources.len() != preds.clauses.len() || preds.regions_gap.is_some() {
+        return;
+    }
+    for (i, (&c, &src)) in preds.clauses.iter().zip(preds.sources.iter()).enumerate() {
+        let PClause::Trait { trait_, args } = c else { continue };
+        let Src::Trait { on, bound, binders } = src else { continue };
+        if binders != Binders::NONE {
+            continue;
+        }
+        let Ok(list) = tys.view().list(args) else { continue };
+        if !list.first().is_some_and(|&f| matches!(tys.view().node(f), Ok(PNode::Param(_)))) {
+            continue;
+        }
+        let Ok(nth) = index(i) else { continue };
+        if let Ok((col, p)) = trait_clause(cx, tys, nth, trait_, args, on, bound, binders, &[])
+            && p.binder.vars == 0
+        {
+            out.push(ClauseRegions { nth, binders: 0, col });
+        }
+    }
 }
 
 /// A head with only clauses (a trait's, an associated type's or const's, a type alias's): `count`

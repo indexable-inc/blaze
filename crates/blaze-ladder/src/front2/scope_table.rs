@@ -176,7 +176,7 @@ pub(super) fn direct_name_in<'a, 'n, S: super::source::NamesSource<'n>>(
     blocks: BlockNames<'_, '_>,
 ) -> Result<Option<super::glob_uses::UseAt<'a>>, super::locals::LocalGap> {
     use super::glob_uses::{Start, UseAt};
-    let place = body.scopes.get(scope as usize).expect("the enclosing body's recorded ScopeId indexes its scope table");
+    let Some(place) = body.scopes.get(scope as usize) else { return Ok(None) };
     let Some(module) = place.own() else { return Ok(None) };
     let ns = match ns {
         crate::resolve::Ns::Type => blaze_surface::Namespace::Types,

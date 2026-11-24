@@ -1711,4 +1711,97 @@ mod std_readiness_tests {
             "Linux AAPCS64 (even pair x2:x3, ptr in x4) and macOS (unaligned pair x1:x2, ptr in x3) must emit distinct register placements"
         );
     }
+
+    #[test]
+    fn sota_mem_uxtw_idx_folding() {
+        let alloc = Alloc::global();
+
+        // 1. Unscaled `ptr_add(base, zext(u32 -> u64, idx))` -> `ldr xt, [xn, wm, uxtw]`.
+        let unscaled_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I32)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let base = b.param(Ty::PTR);
+            let idx32 = b.param(Ty::I32);
+            let idx64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, idx32);
+            let p = b.ptr_add(Flags::NONE, base, idx64);
+            let v = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(0));
+            b.ret(&[v]);
+            b.finish_checked().unwrap()
+        };
+        let em_unscaled = Sota::standalone()
+            .emit(verify(unscaled_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits unscaled MemUxtwIdx load");
+        let words_unscaled: std::vec::Vec<u32> = em_unscaled
+            .code
+            .as_slice()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert!(
+            words_unscaled.iter().any(|&w| (w & 0x3fe0_fc00) == 0x3860_4800),
+            "expected folded `ldr [rn, wm, uxtw]` instruction, got: {words_unscaled:#x?}"
+        );
+        let (ex_unscaled, _k1) = load_exec_with_syms(em_unscaled, &[]);
+        // Pass a `u64` with dirty upper 32 bits in x1 to prove `UXTW` ignores bits 63..32.
+        let f_unscaled: extern "C" fn(*const u8, u64) -> u64 = unsafe { ex_unscaled.as_fn() };
+        let mut buf = [0u8; 32];
+        buf[5..13].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(
+            f_unscaled(buf.as_ptr(), 0xDEAD_BEEF_0000_0005u64),
+            0x1122_3344_5566_7788u64,
+            "unscaled UXTW load must zero-extend low 32 bits of index"
+        );
+
+        // 2. Scaled `ptr_add(base, shl(zext(u32 -> u64, idx), 2))` -> `ldr wt, [xn, wm, uxtw #2]`.
+        let scaled_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I32)],
+                &[Param::of(Ty::I32)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let base = b.param(Ty::PTR);
+            let idx32 = b.param(Ty::I32);
+            let idx64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, idx32);
+            let c2 = b.iconst(Ty::I64, 2);
+            let byte_off = b.binary(Op::Shl, Flags::NONE, idx64, c2);
+            let p = b.ptr_add(Flags::NONE, base, byte_off);
+            let v = b.load(Ty::I32, Flags::NONE, p, 0, MemAttrs::aligned(2));
+            b.ret(&[v]);
+            b.finish_checked().unwrap()
+        };
+        let em_scaled = Sota::standalone()
+            .emit(verify(scaled_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits scaled MemUxtwIdx load");
+        let words_scaled: std::vec::Vec<u32> = em_scaled
+            .code
+            .as_slice()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert!(
+            words_scaled.iter().any(|&w| (w & 0x3fe0_fc00) == 0x3860_5800),
+            "expected folded `ldr wt, [rn, wm, uxtw #2]` instruction, got: {words_scaled:#x?}"
+        );
+        let (ex_scaled, _k2) = load_exec_with_syms(em_scaled, &[]);
+        let f_scaled: extern "C" fn(*const u32, u64) -> u32 = unsafe { ex_scaled.as_fn() };
+        let table = [10u32, 20, 30, 40, 0xCAFE_BABE, 60, 70, 80];
+        assert_eq!(
+            f_scaled(table.as_ptr(), 0xFFFF_0000_0000_0004u64),
+            0xCAFE_BABE,
+            "scaled UXTW #2 load must zero-extend low 32 bits and scale by 4"
+        );
+    }
 }
