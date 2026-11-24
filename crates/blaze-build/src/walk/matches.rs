@@ -613,6 +613,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                         // in a guarded arm, once its guard passed (walk/moves.rs `Pending`).
                         let hold = self.holding_moves();
                         self.arm_effect(super::moves::Pending::Own(target), hold)?;
+                    } else if !by_ref {
+                        self.own_kept(target, true);
                     }
                     if let Some(s) = sub {
                         todo.push((s, at));

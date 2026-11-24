@@ -148,7 +148,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let Some(i) = self.super_temps.iter().position(|q| q.0 == p.0) else { return Ok(false) };
         self.super_temps.remove(i);
         self.drop_held(h, true)?;
-        self.owned[p.ix()] = None;
+        self.owned[p.ix()] = super::LocalOwn::None;
         Ok(true)
     }
 }
