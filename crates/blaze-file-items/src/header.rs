@@ -286,6 +286,101 @@ pub fn declared_lifetimes(text: &str, edition: Edition) -> Result<u16, GenericsE
     }
 }
 
+/// Bitmask of an `impl` item's type/const generic parameter indices (`0..64`, lifetimes omitted,
+/// matching `impl_header`'s `params` / `PNode::Param(p)` numbering) marked `#[may_dangle]`
+/// (RFC 1327, e.g. `unsafe impl<#[may_dangle] T: ?Sized, A: Allocator> Drop for Arc<T, A>` ->
+/// bit 0 set). One pass over the tokens, nothing kept (rule 11).
+pub fn impl_may_dangle_params(text: &str, edition: Edition) -> Result<u64, GenericsError> {
+    #[derive(Clone, Copy)]
+    enum At {
+        Seek { depth: usize },
+        Open,
+        In,
+    }
+    let lexed = parser::LexedStr::new(parser_edition(edition), text);
+    if lexed.errors().next().is_some() {
+        return Err(GenericsError::Lex);
+    }
+    let mut state = At::Seek { depth: 0 };
+    let mut params = Params::new();
+    let mut mask = 0u64;
+    let mut param_idx = 0u32;
+    let mut has_may_dangle = false;
+    let mut prev: Option<(SyntaxKind, usize)> = None;
+    let mut offset = 0;
+    for i in 0..lexed.len() {
+        let (start, kind) = (offset, lexed.kind(i));
+        offset += lexed.text_len(i);
+        if kind.is_trivia() {
+            continue;
+        }
+        let arrow = kind == R_ANGLE && prev == Some((MINUS, start));
+        prev = Some((kind, offset));
+        let opens = matches!(kind, L_ANGLE | L_PAREN | L_BRACK | L_CURLY);
+        let closes = !arrow && matches!(kind, R_ANGLE | R_PAREN | R_BRACK | R_CURLY);
+        let word = text.get(start..offset).unwrap_or("");
+        state = match state {
+            At::Seek { depth } => {
+                if depth == 0 && kind == IMPL_KW {
+                    At::Open
+                } else if opens {
+                    At::Seek { depth: depth + 1 }
+                } else if closes {
+                    At::Seek { depth: depth.checked_sub(1).ok_or(GenericsError::Unclosed)? }
+                } else {
+                    At::Seek { depth }
+                }
+            }
+            At::Open => {
+                if kind == L_ANGLE {
+                    At::In
+                } else {
+                    return Ok(0);
+                }
+            }
+            At::In => {
+                if params.attr && params.depth == 1 && kind == IDENT && word == "may_dangle" {
+                    has_may_dangle = true;
+                }
+                let s = if arrow {
+                    Step::Arrow
+                } else if opens {
+                    Step::Open
+                } else if closes {
+                    Step::Close
+                } else {
+                    Step::Other
+                };
+                match params.next(kind, s) {
+                    ParamTok::End => return Ok(mask),
+                    ParamTok::Start => {
+                        match kind {
+                            IDENT => {
+                                if has_may_dangle && param_idx < 64 {
+                                    mask |= 1u64 << param_idx;
+                                }
+                                param_idx = param_idx.saturating_add(1);
+                            }
+                            CONST_KW => {
+                                param_idx = param_idx.saturating_add(1);
+                            }
+                            _ => {}
+                        }
+                        has_may_dangle = false;
+                        At::In
+                    }
+                    ParamTok::Inside => At::In,
+                }
+            }
+        };
+    }
+    match state {
+        At::Seek { .. } => Err(GenericsError::NoKeyword),
+        At::Open => Ok(0),
+        At::In => Err(GenericsError::Unclosed),
+    }
+}
+
 enum Step {
     Open,
     Close,
