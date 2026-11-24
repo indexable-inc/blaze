@@ -36,14 +36,18 @@ fn block(params: &[Ty], ret: Ty, template: &[AsmPiece<'_>], operands: &[AsmOpera
 }
 
 /// `func` emitted and placed, called on each of `cases`' arguments.
-fn calls(func: &Func<Global>, cases: &[[u64; 4]]) -> Vec<u64> {
+fn calls(func: &Func<Global>, cases: &[[u64; 4]]) -> blaze_own::AVec<'static, u64> {
     calls_view(func.view(), cases)
 }
 
-fn calls_view(func: blaze_lir::View<'_>, cases: &[[u64; 4]]) -> Vec<u64> {
+fn calls_view(func: blaze_lir::View<'_>, cases: &[[u64; 4]]) -> blaze_own::AVec<'static, u64> {
     let code = emitted_for(func, &[], ISA).unwrap_or_else(|e| panic!("the block emits: {e}"));
     let exec = run::place(&code, |fixup| panic!("no literal word: {fixup:?}"));
-    cases.iter().map(|&args| run::call(&exec, args)).collect()
+    let mut out = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+    for &args in cases {
+        out.push(run::call(&exec, args));
+    }
+    out
 }
 
 #[test]
