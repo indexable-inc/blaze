@@ -289,6 +289,11 @@ fn a_pass_and_a_failure() {
     let original = std::str::from_utf8(original).unwrap_or_else(|_| panic!("{}", report("the assertion was not text")));
     assert!(original.lines().any(|line| line.contains("panicked at ") && line.ends_with("src/lib.rs:6:5:"))
         && original.contains("assertion `left == right` failed"), "{}", report("fd 2 is missing the assertion"));
+    assert!(
+        !original.contains("Rust cannot catch foreign exceptions"),
+        "{}",
+        report("a guest test panic unwound into host catch_unwind and aborted as a foreign exception")
+    );
     assert!(parent.lines().any(|line| line.starts_with("last published: ") && line != "last published: none")
         && parent.lines().any(|line| line == "pending need: none")
         && parent.lines().any(|line| line == "refusal stub: no refused first call observed by the parent"),

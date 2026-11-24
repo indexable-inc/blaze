@@ -42,7 +42,11 @@
     all(target_os = "macos", target_arch = "aarch64"),
     all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
 ))]
-#![feature(allocator_api)]
+#![feature(allocator_api, core_intrinsics)]
+#![expect(
+    internal_features,
+    reason = "`core::intrinsics::catch_unwind` stops an uncaught guest exception at `run_mode::call_entry` without invoking host `panic_unwind::__rust_panic_cleanup`"
+)]
 // The launcher's own root word on Linux (run_mode/thread_locals.rs `ROOT`).
 #![cfg_attr(target_os = "linux", feature(thread_local))]
 // `#![blaze::trust]` below names blaze's tool; inert under rustc.

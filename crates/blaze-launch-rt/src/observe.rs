@@ -707,8 +707,13 @@ extern "C" fn span_leave(current_sp: usize) -> usize {
             span.real_lr as usize
         }
         // Should never happen: `span_exit` is only installed when `span_enter` pushed.
-        _ => std::process::abort(),
+        _ => abort_process(),
     }
+}
+
+/// Ends this launcher process with `SIGABRT` from one shared site.
+pub(crate) fn abort_process() -> ! {
+    std::process::abort()
 }
 
 /// Restores every `[fp + 8] == span_exit` saved return address on the current thread's AArch64
@@ -807,7 +812,7 @@ pub unsafe extern "C" fn unwind_raise_exception(exception: *mut core::ffi::c_voi
     #[cfg(not(target_os = "macos"))]
     let raw = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"_Unwind_RaiseException".as_ptr()) };
     if raw.is_null() {
-        std::process::abort();
+        abort_process();
     }
     // SAFETY: `raw` is the system's `_Unwind_RaiseException`.
     let real: unsafe extern "C" fn(*mut core::ffi::c_void) -> core::ffi::c_int =
