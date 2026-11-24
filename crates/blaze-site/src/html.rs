@@ -514,9 +514,13 @@ fn emit_single_word<A: Allocator + Copy>(w: &Word<A>, out: &mut OwnString<A>) ->
             _ if img.is_mask() => "ico ico-mask",
             _ => "ico",
         };
-        out.try_push_str("<span class=\"")?;
-        out.try_push_str(cls)?;
-        out.try_push_str("\" aria-hidden=\"true\">")?;
+        let h_em = (w.rise + w.drop).max(0.85);
+        let va_em = -w.drop;
+        let _ = write!(
+            out,
+            "<span class=\"{}\" style=\"height:{:.3}em;vertical-align:{:.3}em\" aria-hidden=\"true\">",
+            cls, h_em, va_em
+        );
         out.try_push_str(img.svg_source())?;
         out.try_push_str("</span>")?;
         return Ok(());
