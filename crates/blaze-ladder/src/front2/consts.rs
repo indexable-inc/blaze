@@ -815,9 +815,19 @@ impl<'n> Consts<'n> {
         // Counted in and out (`Maps::evaluating`): a head that needs a constant while this
         // runs finds the evaluator BUSY (`ConstFail::Nested`, which the work list below
         // reads), where a caller with no evaluator at all has the head refused by name
-        // (check.rs `make`).
+        // (check.rs `make`). Track the exact `NeedConst` key on `Store::active_consts` so
+        // provisional impls are visible ONLY while the constant they wait on is active.
+        let active_before = r.store.active_consts_len();
+        let root_need = r.keys.library_in(r.names, item).or_else(|| {
+            matches!(r.keys.origin(item), Some(super::keys::Origin::Member { kind: super::keys::MemberKind::Anon, .. }))
+                .then(|| super::anon::need_key(item))
+        });
+        if let Some(need) = root_need {
+            r.store.push_active_const(need);
+        }
         r.store.maps.evaluating.set(r.store.maps.evaluating.get().saturating_add(1));
         let out = self.value_listed(r, prepared, item, root, build);
+        r.store.truncate_active_consts(active_before);
         let left = r.store.maps.evaluating.get().saturating_sub(1);
         r.store.maps.evaluating.set(left);
         if left == 0 {
@@ -825,6 +835,11 @@ impl<'n> Consts<'n> {
             if let Some(b) = r.buckets.as_ref() {
                 b.clear_provisional();
             }
+        } else if let Some(need) = root_need
+            && r.store.clear_provisional_for(need)
+            && let Some(b) = r.buckets.as_ref()
+        {
+            b.clear_provisional();
         }
         out
     }
@@ -837,25 +852,28 @@ impl<'n> Consts<'n> {
         // failed evaluation is dropped whole, the constant evaluated and filed
         // ([`Consts::first`]), and the failed one evaluated again: never a nested evaluation.
         // One already on the list needs itself: the refusal it failed with is returned.
+        let active_before = r.store.active_consts_len();
         let mut firsts: Vec<LibKey, Global> = Vec::new_in(Global);
         let mut rounds = 0u32;
-        let key = loop {
+        let result = loop {
             let step = match firsts.last().copied() {
                 None => self.value_key(r, prepared, item, root, build).map(Some),
                 Some(c) => self.first(r, prepared, c).map(|()| None),
             };
             match step {
-                Ok(Some(key)) => break key,
+                Ok(Some(key)) => break Ok(key),
                 Ok(None) => {
-                    if let Some(done_c) = firsts.pop()
-                        && r.store.clear_provisional_for(done_c)
-                        && let Some(b) = r.buckets.as_ref()
-                    {
-                        b.clear_provisional();
+                    if let Some(done_c) = firsts.pop() {
+                        r.store.pop_active_const(done_c);
+                        if r.store.clear_provisional_for(done_c)
+                            && let Some(b) = r.buckets.as_ref()
+                        {
+                            b.clear_provisional();
+                        }
                     }
                 }
                 Err(e) => {
-                    let Some(c) = super::const_open::needed_first(&e) else { return Err(e) };
+                    let Some(c) = super::const_open::needed_first(&e) else { break Err(e) };
                     // Any constant `check::eval_len` evaluates by its checker key (an item's,
                     // an impl's or trait's member's, an anonymous one's) is filed here the
                     // same way; a qualified leaf's need key is not: it is answered by
@@ -866,13 +884,23 @@ impl<'n> Consts<'n> {
                         || (firsts.is_empty() && super::keys::checker_of(c) == item)
                         || !fileable
                     {
-                        return Err(e);
+                        break Err(e);
                     }
                     rounds += 1;
                     firsts.push(c);
+                    r.store.push_active_const(c);
                 }
             }
         };
+        r.store.truncate_active_consts(active_before);
+        let mut cleared = false;
+        while let Some(c) = firsts.pop() {
+            cleared |= r.store.clear_provisional_for(c);
+        }
+        if cleared && let Some(b) = r.buckets.as_ref() {
+            b.clear_provisional();
+        }
+        let key = result?;
         self.records.iter().find(|x| x.record.key == key).map(|x| &x.record).ok_or(ConstFail::MissingRecord { item, key })
     }
 

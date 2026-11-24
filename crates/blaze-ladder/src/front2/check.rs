@@ -2154,7 +2154,13 @@ fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
     // constant item's head first; `c` may be one's need key, whose checker key is that head's.
     let filed = super::anon::file_asked(&mut *r.store, &mut *r.keys).map_err(|e| ConstFail::Eval(format!("constant {:?}: {e}", checker_of(c)).into_boxed_str()));
     let (value, asked) = match filed {
-        Ok(asked) => (consts.value(r, prepared, checker_of(c)).map(int_of), asked),
+        Ok(asked) => {
+            let active_before = r.store.active_consts_len();
+            r.store.push_active_const(c);
+            let got = consts.value(r, prepared, checker_of(c)).map(int_of);
+            r.store.truncate_active_consts(active_before);
+            (got, asked)
+        }
         Err(e) => (Err(e), Vec::new_in(Global)),
     };
     // The other anonymous constants asked with it (an enum's other discriminants) are
@@ -2171,7 +2177,11 @@ fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
         if o == c || r.store.maps.const_bits.contains_key(&o) || r.store.maps.anon_failed.contains_key(&o) {
             continue;
         }
-        match consts.value(r, prepared, checker_of(o)).map(int_of) {
+        let active_before = r.store.active_consts_len();
+        r.store.push_active_const(o);
+        let got = consts.value(r, prepared, checker_of(o)).map(int_of);
+        r.store.truncate_active_consts(active_before);
+        match got {
             Ok(Some(bits)) => more.push((o, bits)),
             Ok(None) => failed.push((o, Box::from("its value is not an integer of at most 16 bytes"))),
             Err(e) => failed.push((o, format!("{e}").into_boxed_str())),
@@ -2527,7 +2537,7 @@ fn lower_heads<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H
     while let Some(&k) = if order == BuildOrder::Reversed { iter.next_back() } else { iter.next() } {
         let ck = checker_of(k);
         if heads.store().impls.contains_key(&ck)
-            || (heads.store().maps.evaluating.get() > 0 && heads.store().provisional_impls.contains_key(&ck))
+            || heads.store().is_provisional_active(ck)
             || b.has_failed(k)
         {
             continue;
