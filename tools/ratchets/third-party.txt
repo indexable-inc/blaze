@@ -54,6 +54,8 @@ blaze-data	0	0	1
 blaze-dbsp	0	0	8
 blaze-deflate	0	1	1
 blaze-drive	0	0	86
+blaze-ecs	0	0	1
+blaze-ecs-wasm	0	0	1
 blaze-ed25519	0	1	1
 blaze-emit	0	0	8
 blaze-engine	0	0	86

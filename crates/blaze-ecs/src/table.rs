@@ -10,7 +10,7 @@ use core::cmp::Ordering;
 
 use blaze_own::{Box as OwnBox, Vec as OwnVec};
 
-use crate::data::Value;
+use blaze_data::Value;
 
 use super::column::{
     AnyColumn, ComponentMeta, downcast_slice, downcast_slice_mut, downcast_typed,

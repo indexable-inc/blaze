@@ -71,6 +71,7 @@ blaze-base64.workspace = true
 blaze-bitflags.workspace = true
 blaze-columns.workspace = true
 blaze-deflate.workspace = true
+blaze-ecs.workspace = true
 blaze-ed25519.workspace = true
 blaze-glob = { workspace = true, default-features = false }
 blaze-h2.workspace = true

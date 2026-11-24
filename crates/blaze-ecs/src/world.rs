@@ -7,7 +7,7 @@ use core::fmt::Write as _;
 
 use blaze_own::{AllocFailure, String as OwnString, Vec as OwnVec};
 
-use crate::data::{Int, Map, Value};
+use blaze_data::{Int, Map, Value};
 
 use super::column::{
     AnyColumn, ComponentMeta, downcast_typed_mut, enable_copy_any, enable_reflect_any,

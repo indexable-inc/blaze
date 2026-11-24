@@ -8,7 +8,7 @@ use core::any::{Any, TypeId};
 
 use blaze_own::{AllocFailure, Box as OwnBox, String as OwnString, Vec as OwnVec};
 
-use crate::data::Value;
+use blaze_data::Value;
 
 use super::error::EcsError;
 use super::id::{ComponentId, TableId};
