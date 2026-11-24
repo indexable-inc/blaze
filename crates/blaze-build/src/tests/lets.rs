@@ -193,3 +193,98 @@ fn let_chains_while_let_and_let_else_take_the_right_branch() {
     assert_eq!(run_native(&[(MAIN, &built)]) as u32, 340_760_448);
     let _ = built;
 }
+
+/// `if let` and `let`-`else` with a dereferenced slice scrutinee (`*s` where `s: &[u32]`): the
+/// scrutinee is an unsized place (`V::Unsized`), never loaded by value.
+/// ```text
+/// fn main() -> u32 {
+///     let arr2 = [3u32, 4u32];
+///     let s2: &[u32] = &arr2;
+///     let hit = if let [a, b] = *s2 { a * 10 + b } else { 1 };   // 34
+///     let arr3 = [1u32, 2u32, 3u32];
+///     let s3: &[u32] = &arr3;
+///     let miss = if let [a, b] = *s3 { a } else { 7 };           // 7
+///     let [p, q] = *s2 else { return 0 };                        // 3, 4
+///     hit * 1000 + miss * 100 + p * 10 + q
+/// }
+/// ```
+#[test]
+fn if_let_and_let_else_destructure_a_dereferenced_slice() {
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], U32);
+    let mut b = BodyBuf::new();
+    let u32_ty = b.types.intern(U32).expect("u32 interns");
+    let slice_u32 = b.types.intern(PNode::Slice(u32_ty)).expect("[u32] interns");
+    let ref_slice = b.types.intern(PNode::Ref(Mutbl::Not, slice_u32)).expect("&[u32] interns");
+
+    // let arr2 = [3u32, 4u32]; let s2: &[u32] = &arr2;
+    let arr2 = b.bind("arr2");
+    let (v3, v4) = (b.int(3, Some(IntSuffix::Uint(UintTy::U32))), b.int(4, Some(IntSuffix::Uint(UintTy::U32))));
+    let arr2_init = b.array(&[v3, v4]);
+    let st0 = Stmt::Let { pat: arr2, ty: None, init: Some(arr2_init), else_: None };
+    let s2 = b.bind("s2");
+    let arr2_e = b.local(arr2);
+    let s2_init = b.e(Expr::Ref { mutbl: Mutbl::Not, operand: arr2_e });
+    let st1 = Stmt::Let { pat: s2, ty: Some(ref_slice), init: Some(s2_init), else_: None };
+
+    // let hit = if let [a, b] = *s2 { a * 10 + b } else { 1 };
+    let (pa, pb) = (plain(&mut b, "a"), plain(&mut b, "b"));
+    let ab_pats = b.pats_list(&[pa, pb]);
+    let ab_slice = b.pat(Pat::Slice { elems: ab_pats, rest: None });
+    let s2_e = b.local(s2);
+    let deref_s2 = b.e(Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: s2_e });
+    let cond_hit = b.e(Expr::Let { pat: ab_slice, init: deref_s2 });
+    let (ae, be, k10, k1) = (b.local(pa), b.local(pb), b.int(10, None), b.int(1, None));
+    let a10 = b.bin(BinOp::Mul, ae, k10);
+    let then_hit = b.bin(BinOp::Add, a10, be);
+    let if_hit = if_else(&mut b, cond_hit, then_hit, k1);
+    let hit = b.bind("hit");
+    let st2 = Stmt::Let { pat: hit, ty: Some(u32_ty), init: Some(if_hit), else_: None };
+
+    // let arr3 = [1u32, 2u32, 3u32]; let s3: &[u32] = &arr3;
+    let arr3 = b.bind("arr3");
+    let elems3 = [1, 2, 3].map(|n| b.int(n, Some(IntSuffix::Uint(UintTy::U32))));
+    let arr3_init = b.array(&elems3);
+    let st3 = Stmt::Let { pat: arr3, ty: None, init: Some(arr3_init), else_: None };
+    let s3 = b.bind("s3");
+    let arr3_e = b.local(arr3);
+    let s3_init = b.e(Expr::Ref { mutbl: Mutbl::Not, operand: arr3_e });
+    let st4 = Stmt::Let { pat: s3, ty: Some(ref_slice), init: Some(s3_init), else_: None };
+
+    // let miss = if let [a2, b2] = *s3 { a2 } else { 7 };
+    let (pa2, pb2) = (plain(&mut b, "a2"), plain(&mut b, "b2"));
+    let ab2_pats = b.pats_list(&[pa2, pb2]);
+    let ab2_slice = b.pat(Pat::Slice { elems: ab2_pats, rest: None });
+    let s3_e = b.local(s3);
+    let deref_s3 = b.e(Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: s3_e });
+    let cond_miss = b.e(Expr::Let { pat: ab2_slice, init: deref_s3 });
+    let (a2e, k7) = (b.local(pa2), b.int(7, None));
+    let if_miss = if_else(&mut b, cond_miss, a2e, k7);
+    let miss = b.bind("miss");
+    let st5 = Stmt::Let { pat: miss, ty: Some(u32_ty), init: Some(if_miss), else_: None };
+
+    // let [p, q] = *s2 else { return 0 };
+    let (pp, pq) = (plain(&mut b, "p"), plain(&mut b, "q"));
+    let pq_pats = b.pats_list(&[pp, pq]);
+    let pq_slice = b.pat(Pat::Slice { elems: pq_pats, rest: None });
+    let s2_e2 = b.local(s2);
+    let deref_s2_2 = b.e(Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: s2_e2 });
+    let k0 = b.int(0, None);
+    let ret0 = b.e(Expr::Return { value: Some(k0) });
+    let else_blk = b.block(&[], Some(ret0));
+    let st6 = Stmt::Let { pat: pq_slice, ty: None, init: Some(deref_s2_2), else_: Some(else_blk) };
+
+    // hit * 1000 + miss * 100 + p * 10 + q
+    let mut total = b.int(0, None);
+    for (local, weight) in [(hit, 1000), (miss, 100), (pp, 10), (pq, 1)] {
+        let le = b.local(local);
+        let kw = b.int(weight, None);
+        let term = b.bin(BinOp::Mul, le, kw);
+        total = b.bin(BinOp::Add, total, term);
+    }
+    let root = b.block(&[st0, st1, st2, st3, st4, st5, st6], Some(total));
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(run_native(&[(MAIN, &built)]) as u32, 34_734);
+    let _ = built;
+}

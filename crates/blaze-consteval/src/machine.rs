@@ -14,7 +14,7 @@ use blaze_build::vtable::{VtableKey, VtableRef, vtable_key};
 use blaze_build::{InstanceKey, instance_key};
 use blaze_ids::ContentId;
 use blaze_own::{Alloc, Vec};
-use blaze_typeck::{BinOp, FloatTy, IntTy, ItemKey, List, Mutbl, PNode, PTy, PTys, PortableTys, UnOp};
+use blaze_typeck::{AdtKind, BinOp, FloatTy, IntTy, ItemKey, List, Mutbl, Name, PNode, PTy, PTys, PortableTys, UnOp};
 
 pub use code::Codes;
 use code::{Code, CodeTable, EnumFacts, Meta, Num, Op, Reg, TyInfo, Valid};
@@ -580,6 +580,14 @@ enum Flow {
 
 const _: () = assert!(core::mem::size_of::<Flow>() <= 8);
 
+/// What a `TypeId` produced during this constant evaluation identifies, for `#[rustc_comptime]`
+/// reflection intrinsics (`core::mem::type_info`).
+#[derive(Clone, Copy, Debug)]
+enum TypeIdTarget {
+    Ty(PTy),
+    Field { base: PTy, variant: u32, field: u32 },
+}
+
 /// The machine's working vectors, kept in [`Codes`] between evaluations of its unit and
 /// borrowed in place (`&mut Work`): each evaluation empties them and keeps their room, so
 /// after the first few nothing grows and nothing moves by value.
@@ -597,6 +605,8 @@ pub(crate) struct Work<K: Allocator + Copy> {
     strs: Vec<(u64, AllocId), K>,
     /// Cached `type_name::<T>()` allocations by ground `PTy`: `(ty, alloc, len)`.
     type_names: Vec<(PTy, AllocId, u64), K>,
+    /// Map of 128-bit `TypeId` values produced in this evaluation back to their ground type or field.
+    type_ids: Vec<(u128, TypeIdTarget), K>,
     reads: Vec<ContentId, K>,
     entered: Vec<u32, K>,
 }
@@ -615,6 +625,7 @@ impl<K: Allocator + Copy> Work<K> {
             vtables: Vec::new_in(alloc),
             strs: Vec::new_in(alloc.clone()),
             type_names: Vec::new_in(alloc.clone()),
+            type_ids: Vec::new_in(alloc),
             reads: Vec::new_in(alloc.clone()),
             entered: Vec::new_in(alloc),
         }
@@ -632,6 +643,7 @@ impl<K: Allocator + Copy> Work<K> {
         self.vtables.clear();
         self.strs.clear();
         self.type_names.clear();
+        self.type_ids.clear();
         self.reads.clear();
         self.entered.clear();
     }
@@ -2209,16 +2221,179 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
             // `data` words, little-endian, so `TypeId::as_u128` reads them back whole.
             Intrinsic::TypeId => {
                 let t = t0.ok_or(malformed("`type_id` with no type"))?;
-                let bits = blaze_build::instance::type_id_hash(t, self.ground.view(), self.alloc)
-                    .map_err(|_| unsupported("`type_id` of a type that is not ground (an alias, parameter or inference variable left)"))?;
-                let info = self.tyinfo(rt)?;
-                if info.repr != Repr::Mem(16) {
-                    return Err(malformed("a `type_id` result that is not `TypeId`'s 16 bytes"));
+                let bits = self.record_type_id(t)?;
+                self.write_type_id(bits, rt)
+            }
+            Intrinsic::TypeIdTypeOf => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_type_of` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                self.build_type_info(ty, rt)
+            }
+            Intrinsic::TypeIdVariants => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_variants` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                let n: usize = match self.node(ty)? {
+                    PNode::Adt(k, _) => {
+                        let adt = self
+                            .world
+                            .adt(k)
+                            .ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: k }))?;
+                        match adt.kind {
+                            AdtKind::Enum => adt.variants.len(),
+                            AdtKind::Struct | AdtKind::Union => 1,
+                        }
+                    }
+                    PNode::Tuple(_) | PNode::Record(..) => 1,
+                    _ => 0,
+                };
+                s(u128::try_from(n).unwrap_or(0))
+            }
+            Intrinsic::TypeIdFields => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_fields` arguments"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                let v_ix = usize::try_from(int(1)?).map_err(|_| malformed("`type_id_fields` variant index overflow"))?;
+                let n: u32 = match self.node(ty)? {
+                    PNode::Adt(k, _) => {
+                        let adt = self
+                            .world
+                            .adt(k)
+                            .ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: k }))?;
+                        let v = adt.variants.get(v_ix).ok_or(Stop::Refused(Refusal::OutOfBounds {
+                            offset: u64::try_from(v_ix).unwrap_or(u64::MAX),
+                            size: 1,
+                            len: u64::try_from(adt.variants.len()).unwrap_or(u64::MAX),
+                        }))?;
+                        v.fields.len
+                    }
+                    PNode::Tuple(l) | PNode::Record(_, l) => {
+                        if v_ix != 0 {
+                            return Err(Stop::Refused(Refusal::OutOfBounds { offset: u64::try_from(v_ix).unwrap_or(u64::MAX), size: 1, len: 1 }));
+                        }
+                        l.len
+                    }
+                    _ => {
+                        if v_ix != 0 {
+                            return Err(Stop::Refused(Refusal::OutOfBounds { offset: u64::try_from(v_ix).unwrap_or(u64::MAX), size: 1, len: 1 }));
+                        }
+                        0
+                    }
+                };
+                s(u128::from(n))
+            }
+            Intrinsic::TypeIdFieldRepresentingType => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_field_representing_type` arguments"))?.0)?;
+                let base = self.lookup_type_id_ty(tid)?;
+                let variant = u32::try_from(int(1)?).map_err(|_| malformed("`type_id_field_representing_type` variant overflow"))?;
+                let field = u32::try_from(int(2)?).map_err(|_| malformed("`type_id_field_representing_type` field overflow"))?;
+                let field_count = match self.node(base)? {
+                    PNode::Adt(k, _) => {
+                        let adt = self
+                            .world
+                            .adt(k)
+                            .ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: k }))?;
+                        let v_ix = usize::try_from(variant).map_err(|_| malformed("variant index"))?;
+                        let v = adt.variants.get(v_ix).ok_or(Stop::Refused(Refusal::OutOfBounds {
+                            offset: u64::from(variant),
+                            size: 1,
+                            len: u64::try_from(adt.variants.len()).unwrap_or(u64::MAX),
+                        }))?;
+                        v.fields.len
+                    }
+                    PNode::Tuple(l) | PNode::Record(_, l) => {
+                        if variant != 0 {
+                            return Err(Stop::Refused(Refusal::OutOfBounds { offset: u64::from(variant), size: 1, len: 1 }));
+                        }
+                        l.len
+                    }
+                    _ => return Err(Stop::Refused(Refusal::OutOfBounds { offset: u64::from(field), size: 1, len: 0 })),
+                };
+                if field >= field_count {
+                    return Err(Stop::Refused(Refusal::OutOfBounds {
+                        offset: u64::from(field),
+                        size: 1,
+                        len: u64::from(field_count),
+                    }));
                 }
-                let p = self.temp_i(info)?;
-                self.work.mem.write(p, 8, Scalar::Int(bits & u128::from(u64::MAX)))?;
-                self.work.mem.write(p.at(8), 8, Scalar::Int(bits >> 64))?;
-                Ok(Val::Mem(p))
+                let frt_bits = frt_hash(tid, variant, field);
+                if !self.work.type_ids.iter().any(|&(k, _)| k == frt_bits) {
+                    self.work.type_ids.push((frt_bits, TypeIdTarget::Field { base, variant, field }));
+                }
+                self.write_type_id(frt_bits, rt)
+            }
+            Intrinsic::FieldRepresentingTypeActualTypeId => {
+                let frt = self.read_type_id(vals.first().ok_or(malformed("`field_representing_type_actual_type_id` argument"))?.0)?;
+                let (base, variant, field) = self.lookup_type_id_field(frt)?;
+                let ft = self.field_ty(base, variant, field)?;
+                let bits = self.record_type_id(ft)?;
+                self.write_type_id(bits, rt)
+            }
+            Intrinsic::FieldRepresentingTypeOffset => {
+                let frt = self.read_type_id(vals.first().ok_or(malformed("`field_representing_type_offset` argument"))?.0)?;
+                let (base, variant, field) = self.lookup_type_id_field(frt)?;
+                let off = self.field_offset(base, variant, field)?;
+                s(u128::from(off))
+            }
+            Intrinsic::TypeIdIsSigned => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_is_signed` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                s(u128::from(matches!(self.node(ty)?, PNode::Int(_))))
+            }
+            Intrinsic::TypeIdArrayLen => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_array_len` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                let len = match self.node(ty)? {
+                    PNode::Array(_, n) => u128::from(self.len(n)?),
+                    _ => 0,
+                };
+                s(len)
+            }
+            Intrinsic::TypeIdElementTy => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_element_ty` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                let elem = match self.node(ty)? {
+                    PNode::Array(elem, _) | PNode::Slice(elem) => Some(elem),
+                    _ => None,
+                };
+                self.build_option_type_id(rt, elem)
+            }
+            Intrinsic::TypeIdSizeOf => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_size_of` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                if layout::is_unsized(self.world, self.ground, ty, self.alloc)? {
+                    self.build_option_val(rt, None)
+                } else {
+                    let (sz, _) = self.size_align(ty)?;
+                    self.build_option_val(rt, Some(Val::Int(sz)))
+                }
+            }
+            Intrinsic::TypeIdPointsTo => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_points_to` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                let pointee = match self.node(ty)? {
+                    PNode::Ref(_, p) | PNode::Ptr(_, p) => Some(p),
+                    _ => None,
+                };
+                self.build_option_type_id(rt, pointee)
+            }
+            Intrinsic::TypeIdPointsMutably => {
+                let tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_points_mutably` argument"))?.0)?;
+                let ty = self.lookup_type_id_ty(tid)?;
+                s(u128::from(matches!(self.node(ty)?, PNode::Ref(Mutbl::Mut, _) | PNode::Ptr(Mutbl::Mut, _))))
+            }
+            Intrinsic::AssertInhabited | Intrinsic::AssertZeroValid | Intrinsic::AssertMemUninitializedValid => {
+                let t = t0.ok_or(malformed("validity assertion type argument"))?;
+                let check = blaze_build::intrinsics::validity::Check::of(i).ok_or(malformed("validity assertion"))?;
+                let ok = self.permits(check, t)?;
+                if !ok {
+                    let (pre, post) = check.message();
+                    let mut text = Vec::with_capacity_in(pre.len() + post.len(), self.alloc);
+                    text.extend_from_slice(pre.as_bytes());
+                    text.extend_from_slice(post.as_bytes());
+                    let mut parts = Vec::with_capacity_in(1, self.alloc);
+                    parts.push(PanicPart::Str(text));
+                    return Err(Stop::Refused(Refusal::Panic { parts }));
+                }
+                Ok(Val::Zst)
             }
             // blaze's `blaze_int_cast::<S, D>(x)` (library/core/src/intrinsics/mod.rs): "`x as D`
             // between two integer types of any width ... it truncates to `D`'s width, or extends
@@ -2345,9 +2520,203 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 }
                 self.load_i(pl, info)
             }
+            Intrinsic::WriteBytes => {
+                let t = t0.ok_or(malformed("`write_bytes` with no type"))?;
+                let (dst, _) = *vals.first().ok_or(malformed("`write_bytes` arguments"))?;
+                let byte = u8::try_from(int(1)? & 0xff).unwrap_or(0);
+                let count = u64::try_from(int(2)?).map_err(|_| malformed("`write_bytes` count past 64 bits"))?;
+                let (size, align_log2) = self.size_align(t)?;
+                let total = size.checked_mul(count).ok_or(Stop::Refused(Refusal::OutOfBounds {
+                    offset: u64::MAX,
+                    size,
+                    len: 0,
+                }))?;
+                let pl = self.deref(dst)?;
+                if total == 0 {
+                    if pl.alloc == NO_ALLOC {
+                        let align = 1u64 << align_log2;
+                        if pl.offset == 0 || !pl.offset.is_multiple_of(align) {
+                            return Err(Stop::Refused(Refusal::IntAsPointer));
+                        }
+                    }
+                    return Ok(Val::Zst);
+                }
+                let p = pl.ptr()?;
+                self.ensure_loaded(p.alloc)?;
+                self.work.mem.memset(p, total, byte)?;
+                Ok(Val::Zst)
+            }
             // A row of the table the evaluator does not compute: refused by its name.
             other => Err(unsupported(other.entry().name)),
         }
+    }
+
+    fn record_type_id(&mut self, t: PTy) -> R<'a, u128> {
+        let bits = blaze_build::instance::type_id_hash(t, self.ground.view(), self.alloc)
+            .map_err(|_| unsupported("`type_id` of a type that is not ground (an alias, parameter or inference variable left)"))?;
+        if !self.work.type_ids.iter().any(|&(k, _)| k == bits) {
+            self.work.type_ids.push((bits, TypeIdTarget::Ty(t)));
+        }
+        Ok(bits)
+    }
+
+    fn write_type_id(&mut self, bits: u128, rt: PTy) -> R<'a, Val> {
+        let info = self.tyinfo(rt)?;
+        if info.repr != Repr::Mem(16) {
+            return Err(malformed("a `type_id` result that is not `TypeId`'s 16 bytes"));
+        }
+        let p = self.temp_i(info)?;
+        self.work.mem.write(p, 8, Scalar::Int(bits & u128::from(u64::MAX)))?;
+        self.work.mem.write(p.at(8), 8, Scalar::Int(bits >> 64))?;
+        Ok(Val::Mem(p))
+    }
+
+    fn read_type_id(&mut self, v: Val) -> R<'a, u128> {
+        let Val::Mem(p) = v else {
+            return Err(malformed("a `TypeId` argument that is not 16 bytes in memory"));
+        };
+        self.ensure_loaded(p.alloc)?;
+        let bytes = self.work.mem.read_bytes(p, 16)?;
+        let arr: [u8; 16] = bytes.try_into().map_err(|_| malformed("a `TypeId` not 16 bytes"))?;
+        Ok(u128::from_le_bytes(arr))
+    }
+
+    fn lookup_type_id_ty(&self, bits: u128) -> R<'a, PTy> {
+        match self.work.type_ids.iter().find(|&&(k, _)| k == bits).map(|&(_, v)| v) {
+            Some(TypeIdTarget::Ty(ty)) => Ok(ty),
+            Some(TypeIdTarget::Field { .. }) => Err(malformed("expected a type's `TypeId`, found a `FieldRepresentingType`")),
+            None => Err(unsupported("a `TypeId` whose type was not produced in this constant evaluation")),
+        }
+    }
+
+    fn lookup_type_id_field(&self, bits: u128) -> R<'a, (PTy, u32, u32)> {
+        match self.work.type_ids.iter().find(|&&(k, _)| k == bits).map(|&(_, v)| v) {
+            Some(TypeIdTarget::Field { base, variant, field }) => Ok((base, variant, field)),
+            Some(TypeIdTarget::Ty(_)) => Err(malformed("expected a `FieldRepresentingType` `TypeId`, found a type")),
+            None => Err(unsupported("a `FieldRepresentingType` `TypeId` not produced in this constant evaluation")),
+        }
+    }
+
+    fn option_variants(&self, rt: PTy) -> R<'a, (u32, u32)> {
+        let PNode::Adt(opt_key, _) = self.node(rt)? else {
+            return Err(malformed("an `Option` reflection result that is not an ADT"));
+        };
+        let adt = self
+            .world
+            .adt(opt_key)
+            .ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: opt_key }))?;
+        let none_v = adt
+            .variants
+            .iter()
+            .position(|v| v.name == Name::of("None"))
+            .or_else(|| adt.variants.iter().position(|v| v.fields.len == 0))
+            .ok_or(malformed("`Option` without a `None` variant"))?;
+        let some_v = adt
+            .variants
+            .iter()
+            .position(|v| v.name == Name::of("Some"))
+            .or_else(|| adt.variants.iter().position(|v| v.fields.len == 1))
+            .ok_or(malformed("`Option` without a `Some` variant"))?;
+        let none_v = u32::try_from(none_v).map_err(|_| malformed("variant index overflow"))?;
+        let some_v = u32::try_from(some_v).map_err(|_| malformed("variant index overflow"))?;
+        Ok((none_v, some_v))
+    }
+
+    fn build_option_val(&mut self, rt: PTy, payload: Option<Val>) -> R<'a, Val> {
+        let (none_v, some_v) = self.option_variants(rt)?;
+        let v_idx = if payload.is_some() { some_v } else { none_v };
+        let info = self.tyinfo(rt)?;
+        let p = self.temp_i(info)?;
+        if let Some(val) = payload {
+            let ft = self.field_ty(rt, some_v, 0)?;
+            let off = self.field_offset(rt, some_v, 0)?;
+            self.store(Place::of(p.at(off)), ft, val)?;
+        }
+        let tag = {
+            let (mut cx, l) = self.cx();
+            l.tag_write(rt, v_idx, &mut cx)?
+        };
+        if let Some(w) = tag {
+            self.work.mem.write(p.at(w.offset), w.size, Scalar::Int(w.value))?;
+        }
+        self.load_i(Place::of(p), info)
+    }
+
+    fn build_option_type_id(&mut self, rt: PTy, inner: Option<PTy>) -> R<'a, Val> {
+        let payload = match inner {
+            Some(t) => {
+                let (_, some_v) = self.option_variants(rt)?;
+                let ft = self.field_ty(rt, some_v, 0)?;
+                let bits = self.record_type_id(t)?;
+                Some(self.write_type_id(bits, ft)?)
+            }
+            None => None,
+        };
+        self.build_option_val(rt, payload)
+    }
+
+    fn build_type_info(&mut self, ty: PTy, rt: PTy) -> R<'a, Val> {
+        let want = match self.node(ty)? {
+            PNode::Tuple(_) => Name::of("Tuple"),
+            PNode::Array(..) => Name::of("Array"),
+            PNode::Slice(_) => Name::of("Slice"),
+            PNode::Dynamic(_) => Name::of("DynTrait"),
+            PNode::Adt(k, _) => {
+                let adt = self
+                    .world
+                    .adt(k)
+                    .ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: k }))?;
+                match adt.kind {
+                    AdtKind::Struct => Name::of("Struct"),
+                    AdtKind::Enum => Name::of("Enum"),
+                    AdtKind::Union => Name::of("Union"),
+                }
+            }
+            PNode::Bool => Name::of("Bool"),
+            PNode::Char => Name::of("Char"),
+            PNode::Int(_) | PNode::Uint(_) => Name::of("Int"),
+            PNode::Float(_) => Name::of("Float"),
+            PNode::Str => Name::of("Str"),
+            PNode::Ref(..) => Name::of("Reference"),
+            PNode::Ptr(..) => Name::of("Pointer"),
+            PNode::FnPtr(..) => Name::of("FnPtr"),
+            _ => Name::of("Other"),
+        };
+        let kind_ty = self.field_ty(rt, 0, 0)?;
+        let kind_off = self.field_offset(rt, 0, 0)?;
+        let PNode::Adt(kind_key, _) = self.node(kind_ty)? else {
+            return Err(malformed("`Type::kind` is not an ADT"));
+        };
+        let kind_adt = self
+            .world
+            .adt(kind_key)
+            .ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: kind_key }))?;
+        let v_idx = kind_adt
+            .variants
+            .iter()
+            .position(|v| v.name == want)
+            .ok_or(malformed("`TypeKind` lacks the expected variant"))?;
+        let v_idx = u32::try_from(v_idx).map_err(|_| malformed("`TypeKind` variant overflow"))?;
+        let rt_info = self.tyinfo(rt)?;
+        let p = self.temp_i(rt_info)?;
+        let kp = p.at(kind_off);
+        if want == Name::of("DynTrait") {
+            let dyn_ty = self.field_ty(kind_ty, v_idx, 0)?;
+            let dyn_off = self.field_offset(kind_ty, v_idx, 0)?;
+            let slice_ty = self.field_ty(dyn_ty, 0, 0)?;
+            let slice_off = self.field_offset(dyn_ty, 0, 0)?;
+            let empty_id = self.work.mem.allocate(0, 3, false, Origin::Data)?;
+            let empty = Val::pair(Scalar::Ptr(Pointer { alloc: empty_id, offset: 0 }), Scalar::Int(0));
+            self.store(Place::of(kp.at(dyn_off + slice_off)), slice_ty, empty)?;
+        }
+        let tag = {
+            let (mut cx, l) = self.cx();
+            l.tag_write(kind_ty, v_idx, &mut cx)?
+        };
+        if let Some(w) = tag {
+            self.work.mem.write(kp.at(w.offset), w.size, Scalar::Int(w.value))?;
+        }
+        self.load_i(Place::of(p), rt_info)
     }
 
     fn build_tuple(&mut self, t: PTy, parts: &[(Val, PTy)]) -> R<'a, Val> {
@@ -2613,6 +2982,11 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
         let (mut cx, l) = self.cx();
         Ok(l.interior_mut(t, &mut cx)?)
     }
+
+    fn permits(&mut self, check: blaze_build::intrinsics::validity::Check, t: PTy) -> R<'a, bool> {
+        let (mut cx, l) = self.cx();
+        Ok(l.permits(check, t, &mut cx)?)
+    }
 }
 
 /// How the evaluated value is held: a static's record is the static's memory (its
@@ -2662,6 +3036,24 @@ pub(crate) fn value_of_planted<'a, W: ConstWorld, L: Layout, A: Allocator + Copy
         Err(Stop::Need(n)) => Ok(Answer::Need(n)),
         Err(Stop::Refused(refusal)) => Err(ConstError { constant: item, at, refusal }),
     }
+}
+
+/// Deterministic 128-bit identifier for a `FieldRepresentingType` `(base_type_id, variant, field)`
+/// during constant evaluation (`type_id_field_representing_type`).
+fn frt_hash(base: u128, variant: u32, field: u32) -> u128 {
+    let mix = |mut z: u64| -> u64 {
+        z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    let [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15] = base.to_le_bytes();
+    let lo_in = u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
+    let hi_in = u64::from_le_bytes([b8, b9, b10, b11, b12, b13, b14, b15]);
+    let vf = (u64::from(variant) << 32) | u64::from(field);
+    let lo = mix(lo_in ^ vf ^ 0x6672_745f_6c6f_3031);
+    let hi = mix(hi_in ^ lo ^ vf.rotate_left(17) ^ 0x6672_745f_6869_3032);
+    u128::from(lo) | (u128::from(hi) << 64)
 }
 
 /// `eval_discriminant` with a planted bug.

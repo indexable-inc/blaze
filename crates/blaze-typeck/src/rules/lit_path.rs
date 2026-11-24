@@ -370,60 +370,68 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
             },
             Def::Adt(k) => {
-                let Some(adt) = self.reads.adt(k)? else {
-                    self.diag(DiagCode::UnresolvedPath, at, About::path(last_name));
-                    return Ok(self.common.err);
-                };
                 // `Self::X` in an impl: `Self` is the impl's self type at the impl's own
                 // arguments (rules/self_path.rs `impl_self_adt_args`), so `Self::HIGH` in
                 // `impl<const SLOTS: usize> Ctrl<SLOTS>` leaves no variable; a written name
                 // (`Ctrl::HIGH`) takes fresh arguments, inferred or E0282.
+                // When the path has no explicit args on `X` and the body is in an impl, take
+                // the impl's `Self` type directly without reading `adt(k)` (which lowers field
+                // types and would cycle when a struct's field type names `Self::LEN` whose own
+                // body reads `Self::BITS`, e.g. `regalloc2::PRegSet`).
                 let by_self = consumed == 1 && segs[0].name == SELF_NAME;
-                let args = if by_self {
-                    if segs[0].has_args {
-                        // The Reference, "Paths", "`Self`": "The Self path cannot include
-                        // generic arguments (as in Self::<i32>)." rustc's E0109, for which the
-                        // checker has no code: refused by name.
-                        return Err(CheckError::Unported("generic arguments on `Self` in a value path (E0109)").into());
-                    }
-                    if adt.generics == 0 {
-                        // An ADT with no generic parameters has one argument list, the empty
-                        // one, so `Self` needs nothing from an impl: the body may be in none.
-                        // front2's anonymous constant `[u8; Self::BYTES]` of an `impl L` (anon.rs
-                        // `Ask::of_self`, filed with `Self` = `L` and no container) is checked
-                        // as `const _: usize = Self::BYTES;` and has no assoc parent.
-                        self.common.empty
-                    } else {
-                        match self.impl_self_adt_args(at, cause, k)? {
-                            Some(args) => args,
-                            None => return Ok(self.common.err),
-                        }
-                    }
-                } else {
-                    self.explicit_args(at, Some(segs[consumed - 1]), k, 0, adt.generics)?
-                };
-                // `Self::A`, `Alias::A`: a variant of the enum the prefix names, in an
-                // expression or a pattern, before any associated item of that name (rustc's
-                // `associated_path_to_ty` checks the variants first; its deny-by-default lint
-                // `ambiguous_associated_items` refuses a variant and an associated item of one
-                // name through `Self` or an alias, so either order types such a program alike).
-                // Without arguments on its segment the variant is found by
-                // [`Self::assoc_value`], as through any type-relative path.
                 let seg = segs[consumed];
-                if adt.kind == crate::world::AdtKind::Enum && seg.has_args {
-                    if let Some((i, v)) = adt.variants.iter().enumerate().find(|(_, v)| v.name == seg.name) {
-                        let (vkey, ctor) = (v.key, v.ctor);
-                        let def = Def::Ctor { adt: k, variant: i as u32, kind: ctor };
-                        // `E::A::<T>`: the arguments on the variant's segment.
-                        let args = self.explicit_args(at, Some(seg), k, 0, adt.generics)?;
-                        let t = self.ctor_ty(at, k, Some(vkey), ctor, args, Some(seg.name))?;
-                        if !self.is_err(t) {
-                            self.defs.push((at, def));
-                        }
-                        return Ok(t);
-                    }
+                if by_self && segs[0].has_args {
+                    // The Reference, "Paths", "`Self`": "The Self path cannot include
+                    // generic arguments (as in Self::<i32>)." rustc's E0109, for which the
+                    // checker has no code: refused by name.
+                    return Err(CheckError::Unported("generic arguments on `Self` in a value path (E0109)").into());
                 }
-                self.mk(TyView::Adt(k, args))?
+                if by_self && !seg.has_args && let Some(t) = self.impl_self_ty(cause)? {
+                    t
+                } else {
+                    let Some(adt) = self.reads.adt(k)? else {
+                        self.diag(DiagCode::UnresolvedPath, at, About::path(last_name));
+                        return Ok(self.common.err);
+                    };
+                    let args = if by_self {
+                        if adt.generics == 0 {
+                            // An ADT with no generic parameters has one argument list, the empty
+                            // one, so `Self` needs nothing from an impl: the body may be in none.
+                            // front2's anonymous constant `[u8; Self::BYTES]` of an `impl L` (anon.rs
+                            // `Ask::of_self`, filed with `Self` = `L` and no container) is checked
+                            // as `const _: usize = Self::BYTES;` and has no assoc parent.
+                            self.common.empty
+                        } else {
+                            match self.impl_self_adt_args(at, cause, k)? {
+                                Some(args) => args,
+                                None => return Ok(self.common.err),
+                            }
+                        }
+                    } else {
+                        self.explicit_args(at, Some(segs[consumed - 1]), k, 0, adt.generics)?
+                    };
+                    // `Self::A`, `Alias::A`: a variant of the enum the prefix names, in an
+                    // expression or a pattern, before any associated item of that name (rustc's
+                    // `associated_path_to_ty` checks the variants first; its deny-by-default lint
+                    // `ambiguous_associated_items` refuses a variant and an associated item of one
+                    // name through `Self` or an alias, so either order types such a program alike).
+                    // Without arguments on its segment the variant is found by
+                    // [`Self::assoc_value`], as through any type-relative path.
+                    if adt.kind == crate::world::AdtKind::Enum && seg.has_args {
+                        if let Some((i, v)) = adt.variants.iter().enumerate().find(|(_, v)| v.name == seg.name) {
+                            let (vkey, ctor) = (v.key, v.ctor);
+                            let def = Def::Ctor { adt: k, variant: i as u32, kind: ctor };
+                            // `E::A::<T>`: the arguments on the variant's segment.
+                            let args = self.explicit_args(at, Some(seg), k, 0, adt.generics)?;
+                            let t = self.ctor_ty(at, k, Some(vkey), ctor, args, Some(seg.name))?;
+                            if !self.is_err(t) {
+                                self.defs.push((at, def));
+                            }
+                            return Ok(t);
+                        }
+                    }
+                    self.mk(TyView::Adt(k, args))?
+                }
             }
             // `A::new()`, `A::Variant` through `type A<..> = X;` (rules/alias_path.rs): `X` at
             // the alias's segment's arguments, then a variant of the enum it is, then an
@@ -805,9 +813,6 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// (rustc's deny-by-default `ambiguous_associated_items` refuses such a program anyway).
     fn assoc_value(&mut self, at: At, cause: Cause, self_ty: Ty, seg: Segment, scope: ScopeId) -> Result<Ty, Stop> {
         let self_ty = self.try_structurally_resolve(self_ty)?;
-        if let Some(t) = self.type_relative_variant(at, self_ty, seg)? {
-            return Ok(t);
-        }
         // A type parameter has no inherent items (the Reference, "Implementations", "Inherent
         // implementations": the implementing type is a nominal type), so the world is not asked:
         // its answer for "any type" would list every inherent impl whose self type it could
@@ -816,6 +821,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         // rustc's `pick_core` for a path too (probe.rs, `Mode::Path` takes the same `pick`): an
         // inherent item unstable under a feature this crate does not turn on is left out first,
         // and taken only when neither an inherent item nor a trait's is picked without it.
+        // Checked before `type_relative_variant` so an inherent constant (e.g. `Self::BITS` inside
+        // `PRegSet::LEN` while `struct PRegSet { bits: [Bits; Self::LEN] }` is being lowered)
+        // resolves without forcing the ADT's fields (`ambiguous_associated_items` forbids a
+        // variant and an inherent item of the same name).
         // turso's `DynVec::try_with_capacity_in(n, alloc)` (`DynVec<T> = Vec<T>`): std's
         // `#[unstable(feature = "allocator_ext", implied_by = "allocator_api")]` inherent fn is
         // left out, and the in-scope `TursoVecInExt::try_with_capacity_in` is the pick.
@@ -823,6 +832,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         if let Some(shape) = nominal
             && let Some(t) = self.inherent_value(at, cause, self_ty, seg, shape, true, &mut left_out)?
         {
+            return Ok(t);
+        }
+        if let Some(t) = self.type_relative_variant(at, self_ty, seg)? {
             return Ok(t);
         }
         // Trait candidates, in two tiers: the traits of a parameter's bounds come before the

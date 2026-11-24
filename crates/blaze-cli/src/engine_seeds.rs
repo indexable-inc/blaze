@@ -860,6 +860,10 @@ impl<'p> RequestTable<'p> {
             Ok(Stored::Whole(view)) => view.payload,
             Ok(Stored::Shape(_)) | Err(_) => return MemberRead::Bad("a head task's record does not read as a whole record (engine_seeds.rs `RequestTable::read_member`)"),
         };
+        if payload.is_empty() {
+            // A head task whose file was held by no member unit (`no_units_out`): 0 runs, 0 cells.
+            return MemberRead::Lacked(Lack::NoCell);
+        }
         let base = payload.as_ptr() as usize - bytes.as_ptr() as usize;
         match run_of(payload, id.cell) {
             Ok(Some((from, len))) => match FrozenHead::read(&payload[from..from + len]) {

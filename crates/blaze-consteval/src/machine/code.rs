@@ -2438,17 +2438,35 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 cc.rs.push(r);
             }
             Expr::Unary { operand, .. } => {
-                cc.tasks.push(C::Unary(e));
+                if rows(typed.callees.0, e).next().is_some() {
+                    cc.tasks.push(C::Call(e));
+                } else {
+                    cc.tasks.push(C::Unary(e));
+                }
                 cc.tasks.push(C::Eval(operand, Mode::Value));
             }
             Expr::Binary { op: BinOp::And | BinOp::Or, lhs, .. } => {
                 cc.tasks.push(C::Logic(e));
                 cc.tasks.push(C::Eval(lhs, Mode::Value));
             }
-            Expr::Binary { lhs, rhs, .. } => {
-                cc.tasks.push(C::Binary(e));
-                cc.tasks.push(C::Eval(rhs, Mode::Value));
-                cc.tasks.push(C::Eval(lhs, Mode::Value));
+            Expr::Binary { op, lhs, rhs } => {
+                if rows(typed.callees.0, e).next().is_some() {
+                    cc.tasks.push(C::Call(e));
+                    if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+                        // [expr.cmp.place]: comparison operators implicitly borrow both operands.
+                        cc.tasks.push(C::Ref(e));
+                        cc.tasks.push(C::Eval(rhs, Mode::Place));
+                        cc.tasks.push(C::Ref(e));
+                        cc.tasks.push(C::Eval(lhs, Mode::Place));
+                    } else {
+                        cc.tasks.push(C::Eval(rhs, Mode::Value));
+                        cc.tasks.push(C::Eval(lhs, Mode::Value));
+                    }
+                } else {
+                    cc.tasks.push(C::Binary(e));
+                    cc.tasks.push(C::Eval(rhs, Mode::Value));
+                    cc.tasks.push(C::Eval(lhs, Mode::Value));
+                }
             }
             Expr::Assign { lhs, rhs } => {
                 // The right operand first, then the place (the Reference, "Assignment expressions").
@@ -2459,12 +2477,20 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 cc.tasks.push(C::Eval(rhs, Mode::Value));
             }
             Expr::AssignOp { lhs, rhs, .. } => {
-                // Both primitive: the modifying operand first (the Reference, "Compound assignment").
-                cc.tasks.push(C::AssignOp(e));
-                if self.reg_local(cc, lhs).is_none() {
+                if rows(typed.callees.0, e).next().is_some() {
+                    // [expr.compound-assign.trait]: `a += b` is `AddAssign::add_assign(&mut a, b)`.
+                    cc.tasks.push(C::Call(e));
+                    cc.tasks.push(C::Eval(rhs, Mode::Value));
+                    cc.tasks.push(C::Ref(e));
                     cc.tasks.push(C::Eval(lhs, Mode::Place));
+                } else {
+                    // Both primitive: the modifying operand first (the Reference, "Compound assignment").
+                    cc.tasks.push(C::AssignOp(e));
+                    if self.reg_local(cc, lhs).is_none() {
+                        cc.tasks.push(C::Eval(lhs, Mode::Place));
+                    }
+                    cc.tasks.push(C::Eval(rhs, Mode::Value));
                 }
-                cc.tasks.push(C::Eval(rhs, Mode::Value));
             }
             Expr::Ref { operand, .. } => {
                 cc.tasks.push(C::Ref(e));
@@ -2769,21 +2795,59 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
     fn call_c<A: Allocator + Clone>(&mut self, cc: &mut Cc<'w, '_>, code: &mut Code<A>, e: ExprId) -> R<'a, ()> {
         let typed = cc.typed;
         let body = typed.body;
-        let (arg_exprs, receiver) = match self.expr_c(cc, e)? {
-            Expr::Call { args, .. } => (args, None),
-            Expr::MethodCall { receiver, args, .. } => (args, Some(receiver)),
-            _ => return Err(malformed("a call task")),
-        };
         let mut exprs: Vec<ExprId, Alloc<'a>> = Vec::new_in(self.alloc);
-        exprs.extend(receiver);
-        exprs.extend_from_slice(body.expr_lists.get(arg_exprs.range()).ok_or(malformed("a list past `expr_lists`"))?);
-        let at = cc.rs.len().checked_sub(exprs.len()).ok_or(malformed("the value stack ran out"))?;
         let mut vals: Vec<(Reg, PTy), Alloc<'a>> = Vec::new_in(self.alloc);
-        for (k, &x) in exprs.iter().enumerate() {
-            let t = self.final_ty_c(cc, x)?;
-            vals.push((cc.rs[at + k], t));
+        match self.expr_c(cc, e)? {
+            Expr::Call { args, .. } => {
+                exprs.extend_from_slice(body.expr_lists.get(args.range()).ok_or(malformed("a list past `expr_lists`"))?);
+                let at = cc.rs.len().checked_sub(exprs.len()).ok_or(malformed("the value stack ran out"))?;
+                for (k, &x) in exprs.iter().enumerate() {
+                    let r = *cc.rs.get(at + k).ok_or(malformed("the value stack ran out"))?;
+                    vals.push((r, self.final_ty_c(cc, x)?));
+                }
+                cc.rs.truncate(at);
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                exprs.push(receiver);
+                exprs.extend_from_slice(body.expr_lists.get(args.range()).ok_or(malformed("a list past `expr_lists`"))?);
+                let at = cc.rs.len().checked_sub(exprs.len()).ok_or(malformed("the value stack ran out"))?;
+                for (k, &x) in exprs.iter().enumerate() {
+                    let r = *cc.rs.get(at + k).ok_or(malformed("the value stack ran out"))?;
+                    vals.push((r, self.final_ty_c(cc, x)?));
+                }
+                cc.rs.truncate(at);
+            }
+            Expr::Unary { operand, .. } => {
+                exprs.push(operand);
+                let r = cc.rs.pop().ok_or(malformed("the value stack ran out"))?;
+                vals.push((r, self.final_ty_c(cc, operand)?));
+            }
+            Expr::Binary { op, lhs, rhs } => {
+                exprs.push(lhs);
+                exprs.push(rhs);
+                let rr = cc.rs.pop().ok_or(malformed("the value stack ran out"))?;
+                let lr = cc.rs.pop().ok_or(malformed("the value stack ran out"))?;
+                let (mut lt, mut rt) = (self.final_ty_c(cc, lhs)?, self.final_ty_c(cc, rhs)?);
+                if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+                    lt = self.ground.intern(PNode::Ref(Mutbl::Not, lt)).map_err(|_| malformed("the ground table is full"))?;
+                    rt = self.ground.intern(PNode::Ref(Mutbl::Not, rt)).map_err(|_| malformed("the ground table is full"))?;
+                }
+                vals.push((lr, lt));
+                vals.push((rr, rt));
+            }
+            Expr::AssignOp { lhs, rhs, .. } => {
+                exprs.push(lhs);
+                exprs.push(rhs);
+                let rr = cc.rs.pop().ok_or(malformed("the value stack ran out"))?;
+                let lr = cc.rs.pop().ok_or(malformed("the value stack ran out"))?;
+                let lt = self.final_ty_c(cc, lhs)?;
+                let lt = self.ground.intern(PNode::Ref(Mutbl::Mut, lt)).map_err(|_| malformed("the ground table is full"))?;
+                let rt = self.final_ty_c(cc, rhs)?;
+                vals.push((lr, lt));
+                vals.push((rr, rt));
+            }
+            _ => return Err(malformed("a call task")),
         }
-        cc.rs.truncate(at);
         let row = rows(typed.callees.0, e).next();
         let (item, args) = match row {
             Some(i) => {
@@ -3330,6 +3394,8 @@ fn shape<'a>(task: C, typed: &Typed<'_>) -> R<'a, (u32, bool)> {
         C::Call(e) => match expr(e)? {
             Expr::Call { args, .. } => (args.len, true),
             Expr::MethodCall { args, .. } => (args.len + 1, true),
+            Expr::Unary { .. } => (1, true),
+            Expr::Binary { .. } | Expr::AssignOp { .. } => (2, true),
             _ => (0, true),
         },
         // The place is on the stack unless the left side is a register local; the compile of

@@ -55,6 +55,9 @@ pub trait Layout {
     /// Whether `ty` is not `Freeze`: an `UnsafeCell` held by value somewhere in it
     /// (blaze-build's `Layouts::interior_mut`).
     fn interior_mut(&mut self, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<bool, Stop>;
+    /// Whether `ty` passes a validity assertion (`assert_inhabited`, `assert_zero_valid`,
+    /// `assert_mem_uninitialized_valid`), answered by blaze-build's exact check.
+    fn permits(&mut self, check: blaze_build::intrinsics::validity::Check, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<bool, Stop>;
 }
 
 fn stop(e: &blaze_build::layout::LayoutError) -> Stop {
@@ -109,6 +112,10 @@ impl<A: Allocator + Clone> Layout for Layouts<A> {
 
     fn interior_mut(&mut self, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<bool, Stop> {
         Layouts::interior_mut(self, ty, cx).map_err(|e| stop(&e))
+    }
+
+    fn permits(&mut self, check: blaze_build::intrinsics::validity::Check, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<bool, Stop> {
+        blaze_build::intrinsics::validity::permits(check, ty, self, cx).map_err(|e| stop(&e))
     }
 
     fn tag(&mut self, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<Tag, Stop> {

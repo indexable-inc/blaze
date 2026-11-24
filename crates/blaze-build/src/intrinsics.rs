@@ -151,6 +151,30 @@ pub enum Which {
     /// block): the 128 bits of [`crate::instance::type_id_hash`], laid out as `TypeId`'s two
     /// `data` words; the constant evaluator and the builder both make it from that function.
     TypeId,
+    /// `type_id_type_of(id)` (`#[rustc_comptime]`): `core::mem::type_info::Type` for `id`.
+    TypeIdTypeOf,
+    /// `type_id_variants(id)` (`#[rustc_comptime]`): variant count (enum's, or 1 for struct/union/tuple).
+    TypeIdVariants,
+    /// `type_id_fields(id, variant)` (`#[rustc_comptime]`): field count of `variant`.
+    TypeIdFields,
+    /// `type_id_field_representing_type(id, variant, field)` (`#[rustc_comptime]`): `FieldId`'s `TypeId`.
+    TypeIdFieldRepresentingType,
+    /// `field_representing_type_actual_type_id(frt)` (`#[rustc_comptime]`): `TypeId` of a field's type.
+    FieldRepresentingTypeActualTypeId,
+    /// `field_representing_type_offset(frt)` (`#[rustc_comptime]`): byte offset of a field.
+    FieldRepresentingTypeOffset,
+    /// `type_id_is_signed(id)` (`#[rustc_comptime]`): whether `id` is a signed integer.
+    TypeIdIsSigned,
+    /// `type_id_array_len(id)` (`#[rustc_comptime]`): array length, or 0 for non-arrays.
+    TypeIdArrayLen,
+    /// `type_id_element_ty(id)` (`#[rustc_comptime]`): `Option<TypeId>` of array/slice element.
+    TypeIdElementTy,
+    /// `type_id_size_of(id)` (`#[rustc_comptime]`): `Option<usize>` byte size (`None` if unsized).
+    TypeIdSizeOf,
+    /// `type_id_points_to(id)` (`#[rustc_comptime]`): `Option<TypeId>` pointee of ref/raw ptr.
+    TypeIdPointsTo,
+    /// `type_id_points_mutably(id)` (`#[rustc_comptime]`): whether ref/raw ptr is mutable.
+    TypeIdPointsMutably,
     /// `float_to_int_unchecked::<F, I>(value)`: `fptosi`/`fptoui` by `I`'s signedness.
     FloatToIntUnchecked,
     /// core's `ub_checks()`: `true` in a constant (blaze-consteval machine.rs `intrinsic`); at
@@ -268,6 +292,8 @@ pub const TABLE: &[Entry] = &[
     e("cttz_nonzero", Which::CttzNonzero, "Like `cttz`, but extra-unsafe as it returns `undef` when given an `x` with value `0`.", "`ctz nonzero`, to `u32`"),
     e("discriminant_value", Which::DiscriminantValue, "Returns the value of the discriminant for the variant in 'v'; if `T` has no discriminant, returns `0`.", "the tag loaded and decoded by the layout's encoding, mapped to the discriminant"),
     e("exact_div", Which::ExactDiv, "Performs an exact division, resulting in undefined behavior where `x % y != 0` or `y == 0` or `x == T::MIN && y == -1`", "`sdiv`/`udiv exact`"),
+    e("field_representing_type_actual_type_id", Which::FieldRepresentingTypeActualTypeId, "Gets the `TypeId` of the actual field type represented by a `FieldRepresentingType`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns the field's `TypeId`"),
+    e("field_representing_type_offset", Which::FieldRepresentingTypeOffset, "Gets the byte offset of the field represented by a `FieldRepresentingType`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns the layout field offset"),
     e("float_to_int_unchecked", Which::FloatToIntUnchecked, "Converts with LLVM’s fptoui/fptosi, which may return undef for values out of range (<https://github.com/rust-lang/rust/issues/10184>). Stabilized as [`f32::to_int_unchecked`] and [`f64::to_int_unchecked`]: the value must not be `NaN` or infinite, and must be representable in the return type once truncated, else the behavior is undefined.", "`fptosi`/`fptoui` by the integer's signedness (saturating: a defined value where Rust's is undefined)"),
     e("forget", Which::Forget, "Moves a value out of scope without running drop glue.", "nothing"),
     e("likely", Which::Likely, "Hints to the compiler that branch condition is likely to be true. Returns the value passed to it.", "its argument"),
@@ -294,6 +320,16 @@ pub const TABLE: &[Entry] = &[
     e("transmute", Which::Transmute, "Reinterprets the bits of a value of one type as another type.", "the bits kept (`expose`/`from_exposed`/`bitcast` between scalar kinds); an aggregate through memory"),
     e("transmute_unchecked", Which::TransmuteUnchecked, "Like [`transmute`], but even less checked at compile-time: rather than giving an error for `size_of::<Src>() != size_of::<Dst>()`, it's **Undefined Behavior** at runtime.", "as `transmute`; sizes must still agree here"),
     e("type_id", Which::TypeId, "Gets an identifier which is globally unique to the specified type. This function will return the same value for a type regardless of whichever crate it is invoked in.", "the 128 bits of `instance::type_id_hash` (the type's ground tree, lifetimes erased) as `TypeId`'s two words, little-endian; blaze-consteval makes the same bytes from the same function"),
+    e("type_id_array_len", Which::TypeIdArrayLen, "Gets the length of the array represented by this `TypeId`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns the array length or 0"),
+    e("type_id_element_ty", Which::TypeIdElementTy, "Gets the element `TypeId` of an array or slice represented by this `TypeId`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns `Option<TypeId>`"),
+    e("type_id_field_representing_type", Which::TypeIdFieldRepresentingType, "Gets the `FieldRepresentingType` `TypeId` for a variant and field index.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval records and returns the field's `TypeId`"),
+    e("type_id_fields", Which::TypeIdFields, "Gets the number of fields at the given `variant_index` represented by this `TypeId`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns the variant's field count"),
+    e("type_id_is_signed", Which::TypeIdIsSigned, "Returns whether the type represented by this `TypeId` is a signed integer.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns `bool`"),
+    e("type_id_points_mutably", Which::TypeIdPointsMutably, "Returns whether the pointer or reference represented by this `TypeId` is mutable.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns `bool`"),
+    e("type_id_points_to", Which::TypeIdPointsTo, "Returns the pointee `TypeId` of a pointer or reference represented by this `TypeId`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns `Option<TypeId>`"),
+    e("type_id_size_of", Which::TypeIdSizeOf, "Returns the byte size of the type represented by this `TypeId`, or `None` if unsized.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns `Option<usize>`"),
+    e("type_id_type_of", Which::TypeIdTypeOf, "Computes the compile-time `core::mem::type_info::Type` of a concrete `TypeId`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval constructs `Type`"),
+    e("type_id_variants", Which::TypeIdVariants, "Gets the number of variants of the type represented by this `TypeId`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns the variant count"),
     e("type_name", Which::TypeName, "Gets a static string slice containing the name of a type.", "nothing at run time (\"can only be called at compile-time\"): blaze-consteval evaluates it to the text of type_name.rs"),
     e("ub_checks", Which::UbChecks, "Returns whether we should perform some UB-checking at runtime.", "the building profile's `debug-assertions`, a constant; `true` in a constant"),
     e("unaligned_volatile_load", Which::UnalignedVolatileLoad, "Performs a volatile load from the `src` pointer The pointer is not required to be aligned.", "`load volatile`, alignment 1"),
@@ -1038,6 +1074,20 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
         // core/src/intrinsics/mod.rs: "this can only be called at compile-time as backends do
         // not have an implementation for it"; core's `type_name` wraps it in a `const` block.
         W::TypeName => return Err(s.shape("`type_name` reached the intrinsic builder: it is evaluated in its `const` block (blaze-consteval)")),
+        W::TypeIdTypeOf
+        | W::TypeIdVariants
+        | W::TypeIdFields
+        | W::TypeIdFieldRepresentingType
+        | W::FieldRepresentingTypeActualTypeId
+        | W::FieldRepresentingTypeOffset
+        | W::TypeIdIsSigned
+        | W::TypeIdArrayLen
+        | W::TypeIdElementTy
+        | W::TypeIdSizeOf
+        | W::TypeIdPointsTo
+        | W::TypeIdPointsMutably => {
+            return Err(s.shape("a `#[rustc_comptime]` reflection intrinsic reached the intrinsic builder: it is evaluated at compile time (blaze-consteval)"));
+        }
         // core reaches it in `TypeId::of`'s `const` block (blaze-consteval); a run-time call is
         // built from the same function, so it is the same 16 bytes.
         W::TypeId => {

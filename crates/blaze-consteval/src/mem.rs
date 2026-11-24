@@ -483,6 +483,27 @@ impl<A: Allocator + Clone> Memory<A> {
         Ok(())
     }
 
+    /// Fills `size` bytes at `p` with `byte`, marking them initialized and clearing relocations
+    /// in the range (`intrinsics::write_bytes`).
+    pub fn memset(&mut self, p: Pointer, size: u64, byte: u8) -> Result<(), Refusal<'static>> {
+        if size == 0 {
+            return Ok(());
+        }
+        let start = self.writable(p, size)?;
+        let end = p.offset + size;
+        let alloc_ix = usize::try_from(p.alloc.0).map_err(|_| Refusal::Malformed { what: "allocation index" })?;
+        let r = self.relocs.get_mut(alloc_ix).ok_or(Refusal::Malformed { what: "allocation index" })?;
+        if !r.is_empty() {
+            remove_relocs_in(r, p.offset, end);
+        }
+        let lo = usize::try_from(start + p.offset).map_err(|_| Refusal::Malformed { what: "heap range" })?;
+        let hi = usize::try_from(start + end).map_err(|_| Refusal::Malformed { what: "heap range" })?;
+        let dst = self.heap.get_mut(lo..hi).ok_or(Refusal::Malformed { what: "heap range" })?;
+        dst.fill(byte);
+        self.set_init(start + p.offset, start + end, true);
+        Ok(())
+    }
+
     /// Copies `size` bytes from `src` to `dst`, with which were written and the pointers in them.
     pub fn copy(&mut self, src: Pointer, dst: Pointer, size: u64) -> Result<(), Refusal<'static>> {
         if size == 0 {

@@ -219,3 +219,38 @@ fn let_takes_a_variant_whose_other_variants_are_uninhabited() {
     let refused = build(&w, &b, root).err().unwrap_or_default();
     assert!(refused.contains("a variant pattern of an enum of more than one variant"), "the refutable `let` was not refused: {refused:?}");
 }
+
+/// Irrefutable or-pattern in a `let` (`let (Y(x) | Z(x)) = e;`), as in `blaze-typeck`
+/// `push_goal_finding`: built via `test_pat` + `TrapKind::MatchNoArm` + `bind_tested`.
+#[test]
+fn let_binds_an_irrefutable_or_pattern() {
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], U32);
+    w.enum_(230, &[("Y", CtorKind::Tuple, &[("0", U32)]), ("Z", CtorKind::Tuple, &[("0", U32)])]);
+
+    let make = |ctor: &str, n: u32| -> u64 {
+        let mut b = BodyBuf::new();
+        let init_n = u32_lit(&mut b, u128::from(n));
+        let init = b.call(ctor, &[init_n]);
+        let local = plain(&mut b, "e");
+        let s0 = let_stmt(local, init);
+        let x1 = plain(&mut b, "x");
+        let x2 = plain(&mut b, "x");
+        let py = b.path("Y");
+        let pz = b.path("Z");
+        let ly = b.pats_list(&[x1]);
+        let lz = b.pats_list(&[x2]);
+        let alt1 = b.pat(Pat::TupleStruct { path: py, elems: ly, rest: None });
+        let alt2 = b.pat(Pat::TupleStruct { path: pz, elems: lz, rest: None });
+        let alts = b.pats_list(&[alt1, alt2]);
+        let or_pat = b.pat(Pat::Or { alts });
+        let use_e = b.local(local);
+        let s1 = let_stmt(or_pat, use_e);
+        let use_x = b.local(x1);
+        let root = b.block(&[s0, s1], Some(use_x));
+        let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+        run_native(&[(MAIN, &built)])
+    };
+    assert_eq!(make("Y", 41), 41);
+    assert_eq!(make("Z", 99), 99);
+}

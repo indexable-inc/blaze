@@ -194,7 +194,9 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// `Parts::WithRegions`, left out of the erased digest.
 /// 38: a fn's text slot starts with a mode byte (`0` external whole text, `1` external signature
 /// prefix, `2` inline synthetic text for synthesized fn heads such as RFC 3681 field defaults).
-pub const VERSION: u32 = 38;
+/// 39: `MemberFrame` carries `is_const` (`const impl` / `const trait` propagates `CONST` to member
+/// fns) and `#[rustc_comptime]` sets `FnQualifiers::CONST`.
+pub const VERSION: u32 = 39;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -1481,6 +1483,7 @@ fn encode_into_scratch<'b>(
             o.opt(frame, |o, f| {
                 o.lib(f.module);
                 o.u32(f.generics);
+                o.flag(f.is_const);
                 o.scope(&f.params, &f.consts, &f.bounds, f.self_)
             })?;
             o.container_life(life, slot)?;
@@ -3588,8 +3591,9 @@ impl<'r> In<'r, '_, '_> {
         let frame = self.opt("an impl's members' frame", |r| {
             let module = r.lib("a frame's module")?;
             let generics = r.u32("a frame's generics")?;
+            let is_const = r.flag("a frame's const")?;
             let (params, consts, bounds, self_) = r.scope()?;
-            Ok(MemberFrame { module, generics, params, consts, bounds, self_ })
+            Ok(MemberFrame { module, generics, is_const, params, consts, bounds, self_ })
         })?;
         let head = ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, fn_vis, unstable, consts, polarity };
         if head.fn_self.len() != head.fns.len() {
