@@ -1811,10 +1811,21 @@ fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>,
     for path in files {
         let file = Name::file(path.as_bytes());
         let surface = Name::new(Kind::Surface, file.subject);
-        let record_of = surface_outline_of(file, path).ok_or_else(|| unseen(surface, path))?;
-        let digest = crate::engine_tasks::surface_of(record_of).ok_or_else(|| unseen(surface, path))?;
-        record.reads.push((surface, digest));
-        reads.push((CellId { of: record_of.name, cell: crate::engine_tasks::SURFACE }, digest));
+        if let Some(record_of) = surface_outline_of(file, path)
+            && let Some(digest) = crate::engine_tasks::surface_of(record_of)
+        {
+            record.reads.push((surface, digest));
+            reads.push((CellId { of: record_of.name, cell: crate::engine_tasks::SURFACE }, digest));
+        } else if let Some(record_of) = outline_of(file, path)
+            && record_of.out == crate::work::failed_out()
+        {
+            // A failed outline (e.g. non-UTF-8 `FILE_NOT_TEXT`) defines `WHOLE = failed_out()`
+            // and no `SURFACE` cell; bind to `WHOLE` so fixing the file wakes this crate.
+            record.reads.push((file, record_of.out));
+            reads.push((CellId { of: record_of.name, cell: WHOLE }, record_of.out));
+        } else {
+            return Err(unseen(surface, path).into());
+        }
     }
     // D104 (rule 21): a blaze-edition binary's root top-level `fn main` is the whole-item input
     // of the implicit `#[::std::main]` call (`blaze-scope` task/lower.rs), whose expansion is

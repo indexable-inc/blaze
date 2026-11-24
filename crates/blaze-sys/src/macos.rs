@@ -168,6 +168,7 @@ pub(crate) mod ffi {
         pub(crate) fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
         pub(crate) fn renameatx_np(from_dir: c_int, from: *const c_char, to_dir: c_int, to: *const c_char, flags: c_uint) -> c_int;
         pub(crate) fn openat(dir: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
+        pub(crate) fn ioctl(fd: c_int, request: core::ffi::c_ulong, ...) -> c_int;
         pub(crate) fn mach_absolute_time() -> u64;
         pub(crate) fn mach_continuous_time() -> u64;
         pub(crate) fn getentropy(into: *mut c_void, len: usize) -> c_int;
@@ -500,7 +501,7 @@ pub fn window_size(fd: crate::Fd) -> Result<crate::WindowSize, crate::Errno> {
     let mut size = crate::types::Winsize::default();
     // SAFETY: TIOCGWINSZ writes one `struct winsize` into the one given; `ioctl` passes the
     // pointer on (its request is not `IOC_VOID`).
-    let said = unsafe { cold::ioctl(fd.raw(), TIOCGWINSZ, &raw mut size) };
+    let said = unsafe { ffi::ioctl(fd.raw(), TIOCGWINSZ, &raw mut size) };
     if said != 0 {
         // SAFETY: `__error` returns the calling thread's `errno`, valid while it runs.
         let code = unsafe { *ffi::__error() };

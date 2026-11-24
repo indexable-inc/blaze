@@ -25,7 +25,7 @@ use blaze_own::{Alloc, Vec};
 use blaze_tier::{CallClobbers, Emitted, Named, Names, Outside, Reloc, RelocKind, TierError, TierName};
 
 use super::CallMode;
-use super::regalloc::{self, ARG_REGS, AllocLoc, FP_ARG_REGS, is_fp_ty, is_gpr_pair_ty, is_vec128_ty, is_vec_mask_ty};
+use super::regalloc::{self, AllocLoc, is_fp_ty, is_gpr_pair_ty, is_vec128_ty, is_vec_mask_ty};
 use super::release_opts::{
     MagicUdiv64, compute_block_order, compute_magic_udiv64, dense_switch_plan, detect_tail_calls,
 };
@@ -34,7 +34,7 @@ use crate::enc::{
 };
 use crate::{enc_probe, enc_tls};
 use crate::pass::{
-    BRK_DIV_OVERFLOW, BRK_DIV_ZERO, BRK_UNREACHABLE,
+    BRK_DIV_OVERFLOW, BRK_DIV_ZERO, BRK_UNREACHABLE, Loc, Regs,
     probe::PROBE_STEP,
     stack::{MOST_AREA, Nsaa, Stacked},
     tls_index::{DESC_ROOT_WORDS, TABLE_LEN_WORDS, TABLE_SLOTS},
@@ -749,38 +749,22 @@ enum ParamPlace {
     Stack(Stacked),
 }
 
-/// Computes the exact register or stacked placement for parameter `p`, updating `(gpr_n, fp_n, nsaa)`.
+/// Computes the exact register or stacked placement for parameter `p`, updating `(regs, nsaa)`
+/// via the canonical AArch64 ABI register walk (`crate::pass::Regs`, matching `Reference`).
 fn place_param(
     p: &blaze_lir::func::ParamRec,
-    gpr_n: &mut usize,
-    fp_n: &mut usize,
+    regs: &mut Regs,
     nsaa: &mut Nsaa,
 ) -> Option<ParamPlace> {
     if ParamKind::from_byte(p.kind) == Some(ParamKind::Sret) {
         return Some(ParamPlace::Sret);
     }
     let ty = Ty(p.ty);
-    if is_fp_ty(ty).is_some() {
-        if let Some(&r) = FP_ARG_REGS.get(*fp_n) {
-            *fp_n += 1;
-            Some(ParamPlace::Fp(r))
-        } else {
-            nsaa.place(ty).map(ParamPlace::Stack)
-        }
-    } else if ty == Ty::I128 {
-        let aligned = (*gpr_n + 1) & !1;
-        if let (Some(&lo), Some(&hi)) = (ARG_REGS.get(aligned), ARG_REGS.get(aligned + 1)) {
-            *gpr_n = aligned + 2;
-            Some(ParamPlace::GprPair(lo, hi))
-        } else {
-            *gpr_n = ARG_REGS.len(); // AAPCS64 C.11
-            nsaa.place(Ty::I128).map(ParamPlace::Stack)
-        }
-    } else if let Some(&r) = ARG_REGS.get(*gpr_n) {
-        *gpr_n += 1;
-        Some(ParamPlace::Gpr(r))
-    } else {
-        nsaa.place(ty).map(ParamPlace::Stack)
+    match regs.next(ty) {
+        Some(Loc::V(r, _)) => Some(ParamPlace::Fp(r)),
+        Some(Loc::Pair(lo)) => Some(ParamPlace::GprPair(lo, lo + 1)),
+        Some(Loc::X(r)) => Some(ParamPlace::Gpr(r)),
+        None => nsaa.place(ty).map(ParamPlace::Stack),
     }
 }
 
@@ -810,8 +794,7 @@ fn check_sota_sig(view: &View<'_>, sig_id: SigId, inst: Option<u32>, os: crate::
     if conv == Some(Conv::BlazeResult) && sig.rets.len() != 2 {
         return Err(TierError::Refused { tier: TIER, inst, what: "blaze_result requires 2 return values (val, is_err)" });
     }
-    let mut gpr_n = 0usize;
-    let mut fp_n = 0usize;
+    let mut regs = Regs::new(os);
     let mut nsaa = Nsaa::new(os);
     let mut has_sret = false;
     for p in sig.params {
@@ -840,7 +823,7 @@ fn check_sota_sig(view: &View<'_>, sig_id: SigId, inst: Option<u32>, os: crate::
         if ty != Ty::I128 && (!is_supported_scalar(ty) || ty == Ty::NONE) {
             return Err(TierError::Refused { tier: TIER, inst, what: "unsupported parameter type" });
         }
-        if place_param(p, &mut gpr_n, &mut fp_n, &mut nsaa).is_none() {
+        if place_param(p, &mut regs, &mut nsaa).is_none() {
             return Err(TierError::Refused { tier: TIER, inst, what: "unplaceable stacked parameter" });
         }
     }
@@ -1691,7 +1674,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
 
     let len = view.len();
     let blocks = view.blocks();
-    let tail_calls = detect_tail_calls(&view, call_mode == CallMode::DirectBl, alloc);
+    let tail_calls = detect_tail_calls(&view, call_mode == CallMode::DirectBl, os, alloc);
     let block_order = compute_block_order(&view, alloc);
 
     // 0. Compute outgoing stacked-arg area (`[sp, #0..out_area]`), outgoing `byval` scratch area
@@ -1704,8 +1687,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
         if matches!(op, Op::Call | Op::CallIndirect | Op::Invoke | Op::InvokeIndirect) {
             let at = to_idx(at_u32(view.data, i));
             let sig = view.sig(SigId(at_u32(view.extra, at + 1)));
-            let mut gpr_n = 0usize;
-            let mut fp_n = 0usize;
+            let mut regs = Regs::new(os);
             let mut nsaa = Nsaa::new(os);
             let mut byval_cur = 0u64;
             for p in sig.params {
@@ -1717,7 +1699,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                     byval_cur = byval_cur.next_multiple_of(align);
                     byval_cur += u64::from(facts.size);
                 }
-                let _ = place_param(p, &mut gpr_n, &mut fp_n, &mut nsaa);
+                let _ = place_param(p, &mut regs, &mut nsaa);
             }
             max_out_area = max_out_area.max(u64::from(nsaa.end()));
             max_byval_bytes = max_byval_bytes.max(byval_cur);
@@ -1729,11 +1711,10 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
 
     let mut has_stacked_in = false;
     {
-        let mut gpr_n = 0usize;
-        let mut fp_n = 0usize;
+        let mut regs = Regs::new(os);
         let mut nsaa = Nsaa::new(os);
         for p in view.sig(SigId(view.head.sig)).params {
-            if matches!(place_param(p, &mut gpr_n, &mut fp_n, &mut nsaa), Some(ParamPlace::Stack(_))) {
+            if matches!(place_param(p, &mut regs, &mut nsaa), Some(ParamPlace::Stack(_))) {
                 has_stacked_in = true;
             }
         }
@@ -1954,13 +1935,20 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                                 | Op::Smax
                                 | Op::Call
                                 | Op::CallIndirect
+                                | Op::Invoke
+                                | Op::InvokeIndirect
                                 | Op::Udiv
                                 | Op::Sdiv
                                 | Op::Urem
                                 | Op::Srem
                                 | Op::Memcpy
+                                | Op::Memmove
                                 | Op::Memset
+                                | Op::Memcmp
+                                | Op::Frem
+                                | Op::TlsAddr
                                 | Op::AtomicRmw
+                                | Op::Cmpxchg
                                 | Op::Br
                                 | Op::Switch
                         ) {
@@ -2103,13 +2091,20 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                                 | Op::Smax
                                 | Op::Call
                                 | Op::CallIndirect
+                                | Op::Invoke
+                                | Op::InvokeIndirect
                                 | Op::Udiv
                                 | Op::Sdiv
                                 | Op::Urem
                                 | Op::Srem
                                 | Op::Memcpy
+                                | Op::Memmove
                                 | Op::Memset
+                                | Op::Memcmp
+                                | Op::Frem
+                                | Op::TlsAddr
                                 | Op::AtomicRmw
+                                | Op::Cmpxchg
                                 | Op::Br
                                 | Op::Switch
                         ) {
@@ -2886,6 +2881,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
         &skip_emit,
         &tail_calls,
         max_spill_slots,
+        os,
         call_clobbers,
         alloc,
     )
@@ -3135,12 +3131,11 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
     gpr_moves.clear();
     fp_moves.clear();
     let mut stacked_in: Vec<(usize, Ty, Stacked), Alloc<'a>> = Vec::new_in(alloc);
-    let mut gpr_arg_idx = 0usize;
-    let mut fp_arg_idx = 0usize;
+    let mut entry_regs = Regs::new(os);
     let mut entry_nsaa = Nsaa::new(os);
     for (p, param) in entry_params.clone().zip(func_sig.params.iter().copied()) {
         let ty = ty_at(view.tys, p);
-        let Some(placed) = place_param(&param, &mut gpr_arg_idx, &mut fp_arg_idx, &mut entry_nsaa) else {
+        let Some(placed) = place_param(&param, &mut entry_regs, &mut entry_nsaa) else {
             return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(p)), what: "unplaceable entry param" });
         };
         match placed {
@@ -4185,7 +4180,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                 inst += 1;
                 continue;
             }
-            if ty == Ty::I128 && !matches!(op, Op::Call | Op::CallIndirect) {
+            if ty == Ty::I128 && !matches!(op, Op::Call | Op::CallIndirect | Op::Invoke | Op::InvokeIndirect) {
                 let load_half = |words: &mut Vec<u32, Alloc<'a>>, v: u32, hi: bool, scratch: Reg| -> Reg {
                     match at_loc(&reg_alloc.loc_of, to_idx(v)) {
                         AllocLoc::GprPair(lo, h) => u32::from(if hi { h } else { lo }),
@@ -6716,7 +6711,22 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                                             let is_cs = (19..=28).contains(&qr);
                                             let clobbered = ((prev + 1)..inst).any(|mid| {
                                                 let mop = view.op(mid);
-                                                (!is_cs && matches!(mop, Op::Call | Op::CallIndirect))
+                                                (!is_cs
+                                                    && matches!(
+                                                        mop,
+                                                        Op::Call
+                                                            | Op::CallIndirect
+                                                            | Op::Memcpy
+                                                            | Op::Memmove
+                                                            | Op::Memset
+                                                            | Op::Memcmp
+                                                            | Op::Frem
+                                                            | Op::TlsAddr
+                                                            | Op::Udiv
+                                                            | Op::Sdiv
+                                                            | Op::Urem
+                                                            | Op::Srem
+                                                    ))
                                                     || matches!(
                                                         at_loc(&reg_alloc.loc_of, mid),
                                                         AllocLoc::Gpr(r) if r == qr
@@ -7472,8 +7482,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected indirect callee loc" }),
                         }
                     }
-                    let mut gpr_k = 0usize;
-                    let mut fp_k = 0usize;
+                    let mut call_regs = Regs::new(os);
                     let mut call_nsaa = Nsaa::new(os);
                     let mut sext_args: [(Reg, u32); 8] = [(0, 0); 8];
                     let mut sext_n = 0usize;
@@ -7487,7 +7496,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                         } else {
                             None
                         };
-                        let placed = place_param(&param, &mut gpr_k, &mut fp_k, &mut call_nsaa).ok_or(TierError::Refused {
+                        let placed = place_param(&param, &mut call_regs, &mut call_nsaa).ok_or(TierError::Refused {
                             tier: TIER,
                             inst: Some(u32_of(inst)),
                             what: "unplaceable call arg",

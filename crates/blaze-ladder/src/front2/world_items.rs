@@ -774,13 +774,16 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// `#[allow_internal_unstable(..)]` at the call (rustc's `span.allows_unstable`) and a
     /// module's own `#[unstable]` over an unmarked impl.
     fn member_unstable_once(&self, container: ItemKey, name: Name) -> Fetch<bool> {
-        let Some(i) = self.store.impls.get(&container) else {
+        let Some((i, provisional)) = self.store.impl_or_provisional(container) else {
             return match self.detail(container) {
                 Some(ItemDetail::Impl) => self.want(container),
                 // No inherent impl: the question was asked of no member, nothing marks it.
                 _ => Ok(false),
             };
         };
+        if provisional {
+            self.store.note_provisional_read(container);
+        }
         let Some((_, u)) = i.unstable.iter().find(|(n, _)| *n == name) else { return Ok(false) };
         let gap = |why: &'static str| self.gap(Gap::MemberStability { impl_: container, name, why });
         let home = self.keys.library_in(self.names, container).and_then(|k| self.names.crate_of(k));
@@ -806,13 +809,16 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     }
 
     fn member_visible_once(&self, container: ItemKey, name: Name) -> Fetch<bool> {
-        let Some(i) = self.store.impls.get(&container) else {
+        let Some((i, provisional)) = self.store.impl_or_provisional(container) else {
             return match self.detail(container) {
                 Some(ItemDetail::Impl) => self.want(container),
                 // No inherent impl: the question was asked of no member, nothing hides it.
                 _ => Ok(true),
             };
         };
+        if provisional {
+            self.store.note_provisional_read(container);
+        }
         let Some(at) = i.fns.iter().position(|(n, _)| *n == name) else { return Ok(true) };
         let Some(&vis) = i.fn_vis.get(at) else {
             return self.gap(Gap::MemberVisibility { impl_: container, name, why: "its impl's head holds no visibility for it" });
@@ -1041,7 +1047,11 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
                             }
                         }
                         Some(ItemDetail::Impl) => {
-                            let Some(i) = self.store.impls.get(&checker_of(owner)) else { return self.store_want(Want::Impl(owner)) };
+                            let ck = checker_of(owner);
+                            let Some((i, provisional)) = self.store.impl_or_provisional(ck) else { return self.store_want(Want::Impl(owner)) };
+                            if provisional {
+                                self.store.note_provisional_read(ck);
+                            }
                             match i.fns.iter().find(|(n, _)| *n == name) {
                                 Some(&(_, f)) => Ok(Some(Def::Fn(f))),
                                 None => self.gap(Gap::Lang(item, "the impl holds no fn of its `#[lang]` name")),

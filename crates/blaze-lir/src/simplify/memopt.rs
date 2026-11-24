@@ -52,8 +52,10 @@ struct MemLoc {
     off: i64,
     /// Access byte width (`1, 2, 4, 8, 16`).
     size: i64,
-    /// If `base` is an `Op::SlotAddr`, its slot index (`u32::MAX` otherwise).
+    /// Local stack slot index this pointer derives from (`u32::MAX` if not derived from a slot).
     slot: u32,
+    /// `true` when `off` is exact relative to `SlotAddr(slot)` (false if derived via dynamic `PtrAdd`).
+    off_known: bool,
 }
 
 #[inline]
@@ -120,14 +122,14 @@ fn access_bytes(ty: Ty, ptr_bits: u32) -> Option<i64> {
         Some(i64::from(ty.elem().bits(ptr_bits) * ty.lanes() / 8))
     } else if ty.is_scalar() {
         let b = ty.bits(ptr_bits);
-        if matches!(b, 8 | 16 | 32 | 64) { Some(i64::from(b / 8)) } else { None }
+        if matches!(b, 8 | 16 | 32 | 64 | 128) { Some(i64::from(b / 8)) } else { None }
     } else {
         None
     }
 }
 
 /// Decomposes `(ptr, extra_off, access_ty)` through up to 8 `Op::PtrAdd(_, const)` hops.
-fn decompose_loc(view: &View<'_>, mut ptr: u32, mut off: i64, ty: Ty) -> Option<MemLoc> {
+fn decompose_loc(view: &View<'_>, slot_of: &[u32], mut ptr: u32, mut off: i64, ty: Ty) -> Option<MemLoc> {
     let size = access_bytes(ty, view.head.ptr_bits)?;
     for _ in 0..8 {
         let pi = to_idx(ptr);
@@ -146,17 +148,21 @@ fn decompose_loc(view: &View<'_>, mut ptr: u32, mut off: i64, ty: Ty) -> Option<
         break;
     }
     let pi = to_idx(ptr);
-    let slot = if view.op(pi) == Op::SlotAddr {
-        at_u32(view.data, pi)
+    let (slot, off_known) = if view.op(pi) == Op::SlotAddr {
+        (at_u32(view.data, pi), true)
     } else {
-        u32::MAX
+        let derived = at_u32(slot_of, pi);
+        if derived != u32::MAX { (derived, false) } else { (u32::MAX, true) }
     };
-    Some(MemLoc { base: ptr, off, size, slot })
+    Some(MemLoc { base: ptr, off, size, slot, off_known })
 }
 
 /// Computes which local stack slots never have their address escape (only used as direct pointer
-/// operand of `Load`/`Store`/`PtrAdd` chains).
-fn compute_non_escaping_slots<A: Allocator + Copy>(view: &View<'_>, alloc: &A) -> Vec<bool, A> {
+/// operand of `Load`/`Store`/`PtrAdd` chains), returning `(non_escaping, slot_of)`.
+fn compute_non_escaping_slots<A: Allocator + Copy>(
+    view: &View<'_>,
+    alloc: &A,
+) -> (Vec<bool, A>, Vec<u32, A>) {
     let nslots = view.slots.len();
     let mut non_escaping = filled(nslots, true, alloc);
     let len = view.len();
@@ -202,7 +208,7 @@ fn compute_non_escaping_slots<A: Allocator + Copy>(view: &View<'_>, alloc: &A) -
             }
         }
     }
-    non_escaping
+    (non_escaping, slot_of)
 }
 
 /// Returns `true` if `a` and `b` are provably disjoint (`NoAlias`).
@@ -217,7 +223,7 @@ fn no_alias(a: MemLoc, b: MemLoc, non_escaping: &[bool]) -> bool {
     if b.slot != u32::MAX && at_bool(non_escaping, to_idx(b.slot)) && a.slot != b.slot {
         return true;
     }
-    if a.base == b.base || (a.slot != u32::MAX && a.slot == b.slot) {
+    if a.base == b.base || (a.slot != u32::MAX && a.slot == b.slot && a.off_known && b.off_known) {
         let a_end = a.off.saturating_add(a.size);
         let b_end = b.off.saturating_add(b.size);
         return a_end <= b.off || b_end <= a.off;
@@ -252,7 +258,7 @@ fn hoist_invariant_loads<A: Allocator + Copy>(
         return Ok((view.to_func_in(alloc), 0));
     }
 
-    let non_escaping = compute_non_escaping_slots(&view, &alloc);
+    let (non_escaping, slot_of) = compute_non_escaping_slots(&view, &alloc);
     let mut inst_block = filled(len, 0u32, &alloc);
     let mut preds: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(blocks, alloc);
     for _ in 0..blocks {
@@ -349,36 +355,57 @@ fn hoist_invariant_loads<A: Allocator + Copy>(
 
         // Collect all memory clobbers inside the loop body.
         let mut has_opaque_clobber = false;
+        let mut has_unknown_store = false;
         let mut store_locs: Vec<MemLoc, A> = Vec::new_in(alloc);
         for &bb in &body {
             for inst in view.block(Block(bb)) {
                 let op = view.op(inst);
                 match op {
                     Op::Store => {
-                        let at = to_idx(at_u32(view.data, inst));
-                        let val_ty = Ty(at_u16(view.tys, to_idx(at_u32(view.extra, at))));
-                        let ptr = at_u32(view.extra, at + 1);
-                        let off = i64::from(at_u32(view.extra, at + 2).cast_signed());
-                        if let Some(loc) = decompose_loc(&view, ptr, off, val_ty) {
-                            store_locs.push(loc);
+                        if Flags(at_u8(view.flags, inst)).contains(Flags::VOLATILE) {
+                            has_unknown_store = true;
                         } else {
-                            has_opaque_clobber = true;
+                            let at = to_idx(at_u32(view.data, inst));
+                            let val_ty = Ty(at_u16(view.tys, to_idx(at_u32(view.extra, at))));
+                            let ptr = at_u32(view.extra, at + 1);
+                            let off = i64::from(at_u32(view.extra, at + 2).cast_signed());
+                            if let Some(loc) = decompose_loc(&view, &slot_of, ptr, off, val_ty) {
+                                store_locs.push(loc);
+                            } else {
+                                has_unknown_store = true;
+                            }
                         }
+                    }
+                    Op::MaskedStore | Op::Scatter | Op::SlotDead => {
+                        has_unknown_store = true;
                     }
                     Op::Call
                     | Op::CallIndirect
+                    | Op::Invoke
+                    | Op::InvokeIndirect
+                    | Op::TailCall
+                    | Op::TailCallIndirect
                     | Op::Memcpy
                     | Op::Memmove
                     | Op::Memset
                     | Op::AtomicStore
                     | Op::AtomicRmw
                     | Op::Cmpxchg
-                    | Op::Fence => {
+                    | Op::Fence
+                    | Op::Asm
+                    | Op::AsmBr
+                    | Op::TargetIntrinsic => {
                         has_opaque_clobber = true;
                     }
                     _ => {}
                 }
             }
+        }
+        if has_unknown_store {
+            for &bb in &body {
+                set_at(&mut in_loop, to_idx(bb), false);
+            }
+            continue;
         }
 
         // Hoist non-volatile invariant loads that are guaranteed dereferenceable (in `header` or from a `SlotAddr`).
@@ -399,15 +426,15 @@ fn hoist_invariant_loads<A: Allocator + Copy>(
                 if at_bool(&in_loop, to_idx(ptr_b)) || ptr_b > preheader {
                     continue;
                 }
-                let Some(loc) = decompose_loc(&view, ptr, off, Ty(at_u16(view.tys, inst))) else {
+                let Some(loc) = decompose_loc(&view, &slot_of, ptr, off, Ty(at_u16(view.tys, inst))) else {
                     continue;
                 };
                 // Crash safety: only hoist if in `header` (always runs on entry) OR local `SlotAddr` (always valid memory)!
-                let guaranteed_deref = bb == header || loc.slot != u32::MAX;
+                let guaranteed_deref = bb == header || (loc.slot != u32::MAX && loc.off_known);
                 if !guaranteed_deref {
                     continue;
                 }
-                // Check clobbers: opaque calls/fences only spare non-escaping local slots!
+                // Check clobbers: opaque calls/invokes/fences only spare non-escaping local slots!
                 if has_opaque_clobber && !(loc.slot != u32::MAX && at_bool(&non_escaping, to_idx(loc.slot))) {
                     continue;
                 }
@@ -477,7 +504,7 @@ fn eliminate_dead_stores<A: Allocator + Copy>(
 ) -> Result<(Func<A>, u32), SimplifyError> {
     let blocks = view.blocks();
     let len = view.len();
-    let non_escaping = compute_non_escaping_slots(&view, &alloc);
+    let (non_escaping, slot_of) = compute_non_escaping_slots(&view, &alloc);
     let mut kill = filled(len, false, &alloc);
     let mut killed = 0u32;
 
@@ -494,19 +521,19 @@ fn eliminate_dead_stores<A: Allocator + Copy>(
                     let ptr = at_u32(view.extra, at + 1);
                     let off = i64::from(at_u32(view.extra, at + 2).cast_signed());
                     let volatile = Flags(at_u8(view.flags, inst)).contains(Flags::VOLATILE);
-                    if let Some(loc) = decompose_loc(&view, ptr, off, val_ty) {
-                        if !volatile
-                            && killed_locs
-                                .iter()
-                                .any(|&k| k.base == loc.base && k.off == loc.off && k.size == loc.size)
-                        {
+                    if volatile {
+                        killed_locs.clear();
+                    } else if let Some(loc) = decompose_loc(&view, &slot_of, ptr, off, val_ty) {
+                        if killed_locs.iter().any(|&k| {
+                            k.off == loc.off
+                                && k.size == loc.size
+                                && (k.base == loc.base
+                                    || (k.slot != u32::MAX && k.slot == loc.slot && k.off_known && loc.off_known))
+                        }) {
                             set_at(&mut kill, inst, true);
                             killed += 1;
-                        } else {
-                            // Remove any previously recorded store that might alias differently, then record this one.
-                            if killed_locs.len() < 16 {
-                                killed_locs.push(loc);
-                            }
+                        } else if killed_locs.len() < 16 {
+                            killed_locs.push(loc);
                         }
                     } else {
                         killed_locs.clear();
@@ -516,7 +543,7 @@ fn eliminate_dead_stores<A: Allocator + Copy>(
                     let at = to_idx(at_u32(view.data, inst));
                     let ptr = at_u32(view.extra, at);
                     let off = i64::from(at_u32(view.extra, at + 1).cast_signed());
-                    if let Some(loc) = decompose_loc(&view, ptr, off, Ty(at_u16(view.tys, inst))) {
+                    if let Some(loc) = decompose_loc(&view, &slot_of, ptr, off, Ty(at_u16(view.tys, inst))) {
                         let mut i = 0;
                         while i < killed_locs.len() {
                             if let Some(&k) = killed_locs.get(i) {
@@ -531,8 +558,15 @@ fn eliminate_dead_stores<A: Allocator + Copy>(
                         killed_locs.clear();
                     }
                 }
+                Op::MaskedLoad | Op::Gather | Op::MaskedStore | Op::Scatter | Op::SlotDead => {
+                    killed_locs.clear();
+                }
                 Op::Call
                 | Op::CallIndirect
+                | Op::Invoke
+                | Op::InvokeIndirect
+                | Op::TailCall
+                | Op::TailCallIndirect
                 | Op::Memcpy
                 | Op::Memmove
                 | Op::Memset
@@ -541,8 +575,15 @@ fn eliminate_dead_stores<A: Allocator + Copy>(
                 | Op::AtomicStore
                 | Op::AtomicRmw
                 | Op::Cmpxchg
-                | Op::Fence => {
-                    // Only non-escaping local stack slots survive calls/fences.
+                | Op::Fence
+                | Op::Asm
+                | Op::AsmBr
+                | Op::TargetIntrinsic
+                | Op::Resume
+                | Op::Trap
+                | Op::Unreachable
+                | Op::Cancelled => {
+                    // Only non-escaping local stack slots survive calls/invokes/fences.
                     let mut i = 0;
                     while i < killed_locs.len() {
                         if let Some(&k) = killed_locs.get(i) {
@@ -766,5 +807,99 @@ mod tests {
 
         let out = optimize_memory(func.view(), TestHeap).unwrap();
         assert_eq!(out.stats.dead_stores_eliminated, 1, "overwritten store across non-aliasing ext load must be eliminated");
+    }
+
+    #[test]
+    fn memory_licm_does_not_hoist_sret_slot_load_past_invoke() {
+        // Exact `Iterator::fold` pattern: `SlotAddr` in entry, loop invokes `next(sret = slot)`
+        // and then loads the discriminant from `slot`. `Op::Invoke` clobbers escaping `slot`, so
+        // the load MUST NOT hoist above the loop!
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[Param::of(Ty::I64)]);
+        b.set_signature(sig);
+        let callee_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+        let callee = b.reference(crate::func::RefKind::Func, 1);
+        let [entry, header, after_call, exit, lpad] = [
+            b.create_block(BlockKind::Normal),
+            b.create_block(BlockKind::Normal),
+            b.create_block(BlockKind::Normal),
+            b.create_block(BlockKind::Normal),
+            b.create_block(BlockKind::Cleanup),
+        ];
+
+        b.begin(entry);
+        let iter_ptr = b.param(Ty::PTR);
+        let ret_slot = b.slot(48, 3, SlotKind::Named);
+        let ret_ptr = b.slot_addr(ret_slot);
+        let zero = b.iconst(Ty::I64, 0);
+        b.jump((header, &[zero]));
+
+        b.begin(header);
+        let acc = b.param(Ty::I64);
+        b.invoke(Flags::NONE, callee, callee_sig, &[iter_ptr, ret_ptr], after_call, lpad);
+
+        b.begin(after_call);
+        let disc = b.load(Ty::I8, Flags::NONE, ret_ptr, 0, MemAttrs::aligned(1));
+        let zero_i8 = b.iconst(Ty::I8, 0);
+        let is_some = b.icmp(crate::IntCond::Ne, disc, zero_i8);
+        let payload = b.load(Ty::I64, Flags::NONE, ret_ptr, 8, MemAttrs::aligned(8));
+        let acc2 = b.binary(Op::Add, Flags::NONE, acc, payload);
+        b.br(Flags::NONE, is_some, (header, &[acc2]), (exit, &[acc]));
+
+        b.begin(exit);
+        let out_val = b.param(Ty::I64);
+        b.ret(&[out_val]);
+
+        b.begin(lpad);
+        let exc = b.param(Ty::PTR);
+        b.resume(exc);
+
+        let func = b.finish_checked().unwrap();
+        let out = optimize_memory(func.view(), TestHeap).unwrap();
+        assert_eq!(
+            out.stats.loads_hoisted, 0,
+            "sret slot load after Op::Invoke inside loop must NEVER hoist into preheader"
+        );
+    }
+
+    #[test]
+    fn memory_licm_does_not_hoist_slot_load_past_dynamic_ptradd_store() {
+        // Non-escaping local slot read at `[s + 0]` and written via `PtrAdd(s, i)` in loop:
+        // dynamic index MAY alias offset 0, so the load must NOT hoist!
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        b.set_signature(sig);
+        let [entry, header, exit] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let n = b.param(Ty::I64);
+        let s = b.slot(64, 3, SlotKind::Named);
+        let sp = b.slot_addr(s);
+        let zero = b.iconst(Ty::I64, 0);
+        b.store(Flags::NONE, zero, sp, 0, MemAttrs::aligned(8));
+        b.jump((header, &[zero, zero]));
+
+        b.begin(header);
+        let i = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let cur = b.load(Ty::I64, Flags::NONE, sp, 0, MemAttrs::aligned(8));
+        let acc2 = b.binary(Op::Add, Flags::NONE, acc, cur);
+        let elem_ptr = b.ptr_add(Flags::NONE, sp, i);
+        b.store(Flags::NONE, acc2, elem_ptr, 0, MemAttrs::aligned(1));
+        let one = b.iconst(Ty::I64, 1);
+        let i2 = b.binary(Op::Add, Flags::NONE, i, one);
+        let keep = b.icmp(crate::IntCond::Ult, i2, n);
+        b.br(Flags::NONE, keep, (header, &[i2, acc2]), (exit, &[acc2]));
+
+        b.begin(exit);
+        let res = b.param(Ty::I64);
+        b.ret(&[res]);
+
+        let func = b.finish_checked().unwrap();
+        let out = optimize_memory(func.view(), TestHeap).unwrap();
+        assert_eq!(
+            out.stats.loads_hoisted, 0,
+            "load from [slot+0] must NOT hoist across dynamic PtrAdd(slot, i) store"
+        );
     }
 }

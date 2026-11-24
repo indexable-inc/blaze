@@ -269,7 +269,7 @@ impl ReadAnswer {
     }
 
     /// What a read of a place answered `place` records.
-    pub(crate) fn of_place(place: Place<'_>) -> ReadAnswer {
+    pub fn of_place(place: Place<'_>) -> ReadAnswer {
         match place {
             Place::Number(value) => ReadAnswer::Number(value),
             Place::Text(value) => ReadAnswer::Digest(ContentId::of("blaze v2 expand place 1", value.as_bytes())),

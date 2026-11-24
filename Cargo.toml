@@ -143,12 +143,36 @@ blaze-body.opt-level = 2
 blaze-body-lower.opt-level = 2
 blaze-flow.opt-level = 2
 blaze-flow-lower.opt-level = 2
+blaze-borrow.opt-level = 2
 blaze-consteval.opt-level = 2
 blaze-build.opt-level = 2
 blaze-lir.opt-level = 2
 blaze-emit.opt-level = 2
 blaze-ed25519.opt-level = 2
 blaze-deflate.opt-level = 2
+# Generic front-end and engine crates (`blaze-ladder` monomorphizes `blaze-typeck`/`blaze-solve`/
+# `blaze-flow-lower`/`blaze-build`; `blaze-cli` monomorphizes `blaze-scope::resolve_crate_verified`
+# over `JobTexts`/`FilePar`): without opt-level = 2 here, those generic instantiations compile at
+# opt-level = 0, causing 40s+ `crate scope` tasks, 120s-600s front2 tests, and 20 KiB/frame stack
+# overflows on Linux ARM64 debug runs.
+blaze-ladder.opt-level = 2
+blaze-cli.opt-level = 2
+blaze-tokens.opt-level = 2
+blaze-memchr.opt-level = 2
+blaze-format.opt-level = 2
+blaze-mem.opt-level = 2
+blaze-std.opt-level = 2
+blaze-world.opt-level = 2
+blaze-fetch.opt-level = 2
+blaze-cas.opt-level = 2
+blaze-engine.opt-level = 2
+blaze-drive.opt-level = 2
+blaze-code.opt-level = 2
+blaze-export.opt-level = 2
+blaze-native.opt-level = 2
+blaze-manifest.opt-level = 2
+blaze-unit-graph.opt-level = 2
+blaze-build-script.opt-level = 2
 
 [profile.release]
 # Set this to 1 or 2 to get more useful backtraces in debugger.

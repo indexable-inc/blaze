@@ -6,9 +6,11 @@
 //! be told does the handler write its own line to standard error naming the signal, the pc and
 //! the faulting address, each as WHAT IS PLACED THERE:
 //!
-//!     blaze run: the program was killed by SIGBUS: pc 0x7002aa78c0 is +0x40 in the code of
-//!     function 3f2a.. (record 9c01..); it wrote 0x7002aa6410, which is +0x0 in the read-only
-//!     datum of static 51d0.. (record 77ab..)
+//! ```text
+//! blaze run: the program was killed by SIGBUS: pc 0x7002aa78c0 is +0x40 in the code of
+//! function 3f2a.. (record 9c01..); it wrote 0x7002aa6410, which is +0x0 in the read-only
+//! datum of static 51d0.. (record 77ab..)
+//! ```
 //!
 //! (one line). The table it reads is the run's placements, appended by the control thread (the
 //! one writer of code and words) as each record's code and relro and each static's datum is

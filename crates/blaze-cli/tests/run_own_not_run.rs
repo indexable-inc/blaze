@@ -103,11 +103,16 @@ fn run_own_not_run_a_blocked_records_folder_exits_125() {
     let said = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(NOT_RUN), "status {:?}; standard error:\n{said}", output.status.code());
     assert!(
-        // The run parent's own words (run_parent.rs `ParentError`: the records folder refused
-        // as it is opened, or the first record's write under it, by where bstd `Fs::home`
-        // finds the file in the way).
-        said.lines().any(|line| line.starts_with("error: ") && line.contains("`blaze run` did not start or serve the program (run.md piece 6, D124)")),
-        "an `error: ` line says the run parent did not start the program:\n{said}"
+        // Either the run parent's own words (run_parent.rs `ParentError`: no native image handed
+        // before launch) or the native image handoff's (`engine_native.rs` `NativeError::Send`:
+        // on Linux where `std` links non-libc shared libraries, `send_of` opens the blocked
+        // records folder first). Both exit 125 and name the records folder refusal.
+        said.lines().any(|line| {
+            line.starts_with("error: ")
+                && (line.contains("`blaze run` did not start or serve the program (run.md piece 6, D124)")
+                    || line.contains("the records folder:"))
+        }),
+        "an `error: ` line says the run parent or native image handoff failed on the blocked records folder:\n{said}"
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "", "standard output is the program's alone, and nothing ran");
 }

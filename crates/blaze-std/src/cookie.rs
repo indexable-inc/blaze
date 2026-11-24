@@ -1100,7 +1100,7 @@ mod tests {
                 .map_err(|e| Broke::Oracle(format_in!(alloc, "parse failed: {e}").as_str().into()))?;
             if decoded != original {
                 return Err(Broke::Oracle(
-                    format_in!(alloc, "round-trip mismatch for `{}`", encoded.as_str())
+                    format_in!(alloc, "round-trip mismatch for '{}'", encoded.as_str())
                         .as_str()
                         .into(),
                 ));

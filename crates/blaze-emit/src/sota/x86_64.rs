@@ -757,7 +757,7 @@ pub(crate) fn emit_sota_x64<'a>(
     let has_ymm = (has_avx2 && (0..len).any(|i| is_vec256_ty(ty_at(view.tys, i)).is_some()))
         || (has_avx512 && (0..len).any(|i| is_vec512_ty(ty_at(view.tys, i)).is_some()));
     let blocks = view.blocks();
-    let tail_calls = detect_tail_calls(&view, call_mode == CallMode::DirectBl, alloc);
+    let tail_calls = detect_tail_calls(&view, call_mode == CallMode::DirectBl, crate::Os::Linux, alloc);
     let block_order = compute_block_order(&view, alloc);
 
     // 0. Layout local stack slots at `[rsp + 0..spill_base]`.
