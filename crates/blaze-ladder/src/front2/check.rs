@@ -2071,6 +2071,11 @@ impl MakeFail {
 /// The most constants one fill may need evaluated before it is made (rule 18).
 const MOST_CONSTS: u32 = 64;
 
+/// Builds a [`CheckFail::Const`] carrying [`ConstFail::Nested`] for `key` on `owner`.
+pub(super) fn const_nested_fail<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, key: LibKey) -> CheckFail {
+    MakeFail::Const(key, ConstFail::Nested { item: checker_of(key), shown: lib_shown(r, key) }).at(r, owner)
+}
+
 /// [`make`] for front2/const_qpath.rs (the trait's members and the impl candidates a
 /// qualified constant leaf is selected from): the fill's refusal as the check's, naming
 /// `owner`.
@@ -2520,7 +2525,11 @@ fn lower_heads<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H
     let mut refused = None;
     let mut iter = candidates.iter();
     while let Some(&k) = if order == BuildOrder::Reversed { iter.next_back() } else { iter.next() } {
-        if heads.store().impls.contains_key(&checker_of(k)) || b.has_failed(k) {
+        let ck = checker_of(k);
+        if heads.store().impls.contains_key(&ck)
+            || (heads.store().maps.evaluating.get() > 0 && heads.store().provisional_impls.contains_key(&ck))
+            || b.has_failed(k)
+        {
             continue;
         }
         // A refused derive's gap (D193 point 5: buckets.rs `file_rows`): a candidate whose

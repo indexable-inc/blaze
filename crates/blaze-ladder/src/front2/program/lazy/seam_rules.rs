@@ -224,9 +224,9 @@ pub(in crate::front2::program) fn caller_site<'n, S: PositionSource<'n>>(names: 
     let point = body_anchor(names, keys, store, owner, offset)?;
     let (krate, file, first) = point.anchor.placement(names, store.tys.alloc()).map_err(|gap| SiteGap::Placement { item: owner, gap })?;
     let clash = |_| SiteGap::KeyClash { item: owner };
-    let (item, offset) = match (first, point.local) {
-        (Start::Invocation(_) | Start::MemberInvocation(..), _) => (keys.item(point.anchor.lib()).map_err(clash)?, 0),
-        (_, Some((live, relative))) => {
+    let (item, offset) = match (first.is_invocation(), point.local) {
+        (true, _) => (keys.item(point.anchor.lib()).map_err(clash)?, 0),
+        (false, Some((live, relative))) => {
             let declaration = point.offset.checked_sub(relative).ok_or(SiteGap::BeforeDeclaration { item: owner, offset: point.offset, first: relative })?;
             // The site counts from the declaration's first token (local_position.rs
             // `first_token`: past a doc comment), as `source_position` and the cold reading
@@ -235,7 +235,7 @@ pub(in crate::front2::program) fn caller_site<'n, S: PositionSource<'n>>(names: 
             let local = keys.file_source_local(source, live).map_err(|_| SiteGap::LocalKey { item: owner, declaration })?;
             (local, point.offset.checked_sub(first).ok_or(SiteGap::BeforeDeclaration { item: owner, offset: point.offset, first })?)
         }
-        (_, None) => (keys.item(point.anchor.lib()).map_err(clash)?, point.offset),
+        (false, None) => (keys.item(point.anchor.lib()).map_err(clash)?, point.offset),
     };
     let file = names.file_shown(krate, file).ok_or(SiteGap::NoShownFile { item: owner, krate, file })?;
     Ok(blaze_build::CallerSite { file, item, offset })
@@ -255,7 +255,7 @@ pub(in crate::front2::program) fn def_site<'n, S: PositionSource<'n>>(names: S, 
     let (krate, file, first) = point.anchor.placement(names, store.tys.alloc()).map_err(|gap| SiteGap::Placement { item, gap })?;
     let file = names.file_shown(krate, file).ok_or(SiteGap::NoShownFile { item, krate, file })?;
     let clash = |_| SiteGap::KeyClash { item };
-    if let Start::Invocation(_) | Start::MemberInvocation(..) = first {
+    if first.is_invocation() {
         return Ok(blaze_build::CallerSite { file, item: keys.item(point.anchor.lib()).map_err(clash)?, offset: 0 });
     }
     let text = point.anchor.text(names).ok_or(SiteGap::NoText { item })?;
@@ -349,23 +349,34 @@ impl<'n> Anchor<'n> {
         /// an attribute or derive call's expansion at. rustc_const_eval
         /// `location_triple_for_span`: "`span.ctxt().outer_expn().expansion_cause()`", the
         /// outermost expansion's `call_site`, and its `lo()`; rustc_expand `Invocation::span`:
-        /// an attribute macro's call site is `attr.span` (the whole attribute, from its `#`), a
-        /// derive's is `path.span` (its path in the `derive(..)` list). `origin.entry` is the
-        /// calling item's whole outline entry, doc comments and outer attributes first: the
-        /// attribute or the path is found among them by its tokens against the macro's path as
-        /// written (`CallView::macro_name`: `::` kept, spaces skipped). A function-like call's
-        /// site is its `span` (`InvocationKind::Bang`: the call from its path, the attributes
-        /// and doc comments on the call not in it): the first token after them. An implicit
-        /// attribute's, which no text writes (D104), is the entry's start. An attribute or
-        /// derive not found: refused (`NoItem`), never the entry's start in its place (rule 3).
-        fn invoked_at(origin: &crate::front2::expansion_origin::CallOrigin<'_>, alloc: Alloc<'_>) -> Result<u32, PositionGap> {
+        /// a direct outer attribute macro's call site is `attr.span` (the whole attribute, from
+        /// its `#`), an attribute macro unwrapped from a `#[cfg_attr(pred, ..)]` starts at that
+        /// inner attribute's first token (as rustc's `cfg_attr` expansion spans the emitted
+        /// attribute), and a derive's is `path.span` (its path in the `derive(..)` list).
+        /// `origin.entry` is the calling item's whole outline entry, doc comments and outer
+        /// attributes first: active `cfg_attr` predicates are evaluated against the crate's cfg
+        /// (blaze-scope `Cfg::eval`) and each attribute or derive path is matched by its tokens
+        /// against `target.0` (`CallView::macro_name`: `::` kept, spaces skipped). A
+        /// function-like call's site is its `span` (`InvocationKind::Bang`: the call from its
+        /// path, the attributes and doc comments on the call not in it): the first token after
+        /// them. An implicit attribute's, which no text writes (D104), is the entry's start. An
+        /// attribute or derive not found: refused (`NoItem`), never the entry's start in its
+        /// place (rule 3).
+        fn invoked_at<'n, S: PositionSource<'n>>(
+            names: S,
+            krate: usize,
+            origin: &crate::front2::expansion_origin::CallOrigin<'_>,
+            target: (&str, blaze_expand::origin_column::InputShape, bool),
+            alloc: Alloc<'_>,
+        ) -> Result<u32, PositionGap> {
             use blaze_expand::origin_column::{InputShape, input_places};
             use blaze_expand::{Delim, TokenKind};
+            let (macro_name, shape, implicit) = target;
             let (start, end) = origin.entry;
-            if origin.view.implicit {
+            if implicit {
                 return Ok(start);
             }
-            let fn_like = origin.view.shape == InputShape::Inside;
+            let fn_like = shape == InputShape::Inside;
             let entry = origin.text.get(start as usize..end as usize).ok_or(PositionGap::PastText)?;
             let tokens = blaze_expand::lex(entry, origin.edition, alloc).map_err(|_| PositionGap::NoItem)?;
             let places = input_places(entry, InputShape::Whole, origin.edition, alloc).map_err(|_| PositionGap::NoItem)?;
@@ -375,11 +386,12 @@ impl<'n> Anchor<'n> {
             }
             let kind = |i: usize| list.get(i).map(|t| t.kind);
             let punct = |i: usize, c: char| matches!(kind(i), Some(TokenKind::Punct { char, .. }) if char == c);
-            // The token after the path written from token `i`, when that path is the macro's.
-            let path_end = |i: usize| -> Option<usize> {
-                let mut rest = origin.view.macro_name;
+            // The token after the path written from token `i` (within `limit`), when that path
+            // is the macro's.
+            let path_end = |i: usize, limit: usize| -> Option<usize> {
+                let mut rest = macro_name;
                 let mut j = i;
-                loop {
+                while j < limit {
                     let word = match kind(j) {
                         Some(TokenKind::Ident { .. }) => tokens.text_at(j),
                         Some(TokenKind::Punct { char: ':', .. }) => ":",
@@ -390,10 +402,42 @@ impl<'n> Anchor<'n> {
                 }
                 (j > i && rest.trim_start().is_empty()).then_some(j)
             };
+            // The token after any Rust path starting at `i` (within `limit`), for reading
+            // built-in wrapper attributes (`cfg_attr`, `derive`, `derive_const`, `unsafe`).
+            let any_path_end = |i: usize, limit: usize| -> Option<usize> {
+                let mut j = i;
+                while j < limit {
+                    match kind(j) {
+                        Some(TokenKind::Ident { .. }) | Some(TokenKind::Punct { char: ':', .. }) => j += 1,
+                        _ => break,
+                    }
+                }
+                (j > i).then_some(j)
+            };
+            let span_text = |lo: usize, hi: usize| -> Option<&str> {
+                let a = usize::try_from(places.get(lo)?.0).ok()?;
+                let b = usize::try_from(places.get(hi)?.1).ok()?;
+                entry.get(a..b)
+            };
             let first_byte = |i: usize| -> Result<u32, PositionGap> {
                 let at = places.get(i).ok_or(PositionGap::NoItem)?.0;
                 start.checked_add(at).ok_or(PositionGap::PastText)
             };
+            let mut cfg: Option<blaze_scope::task::Cfg<'n, '_>> = None;
+            let mut eval_cfg = |pred: &str| -> Result<bool, PositionGap> {
+                let cfg = match &cfg {
+                    Some(cfg) => cfg,
+                    None => {
+                        let atoms = names.cfg_atoms(krate).ok_or(PositionGap::NoFile)?;
+                        cfg.insert(blaze_scope::task::Cfg::from_atoms(atoms, alloc))
+                    }
+                };
+                Ok(cfg.eval(pred) == Some(true))
+            };
+            // Iterative meta-item stack: `(meta_start, meta_end, direct_hash)`.
+            // `Some(hash)` for a top-level `#[meta]` (rustc starts at `#`); `None` for an inner
+            // meta unwrapped from `cfg_attr(..)` (rustc starts at the meta item's first token).
+            let mut metas: AVec<'_, (usize, usize, Option<usize>)> = AVec::new_in(alloc);
             let mut at = 0usize;
             while punct(at, '#') && matches!(kind(at + 1), Some(TokenKind::Open(Delim::Bracket))) {
                 let close = tokens.close_of(at + 1).ok_or(PositionGap::NoItem)?;
@@ -401,41 +445,88 @@ impl<'n> Anchor<'n> {
                     at = close + 1;
                     continue;
                 }
-                // `#[path]`, `#[path(..)]` or `#[path = ..]`: the attribute macro's own call.
-                if let Some(after) = path_end(at + 2)
-                    && (after == close || punct(after, '=') || matches!(kind(after), Some(TokenKind::Open(_))))
-                {
-                    return first_byte(at);
-                }
-                // A path of a `derive(..)` list anywhere in the attribute: a `cfg_attr` keeps
-                // its tokens where they are written.
-                let mut j = at + 2;
-                while j < close {
-                    let derive = matches!(kind(j), Some(TokenKind::Ident { .. }))
-                        && matches!(tokens.text_at(j), "derive" | "derive_const")
-                        && matches!(kind(j + 1), Some(TokenKind::Open(Delim::Paren)));
-                    if !derive {
-                        j += 1;
+                metas.clear();
+                metas.push((at + 2, close, Some(at)));
+                while let Some((m_start, m_end, direct_hash)) = metas.pop() {
+                    if m_start >= m_end {
                         continue;
                     }
-                    let group = tokens.close_of(j + 1).ok_or(PositionGap::NoItem)?;
-                    let mut k = j + 2;
-                    while k < group {
-                        if let Some(after) = path_end(k)
-                            && (after == group || punct(after, ','))
-                        {
-                            return first_byte(k);
-                        }
-                        // The list's next path: past this one's `,`, a group skipped whole.
-                        while k < group && !punct(k, ',') {
-                            k = match kind(k) {
-                                Some(TokenKind::Open(_)) => tokens.close_of(k).ok_or(PositionGap::NoItem)? + 1,
-                                _ => k + 1,
-                            };
-                        }
-                        k += 1;
+                    // `#[path]`, `#[path(..)]` or `#[path = ..]` (direct or inside `cfg_attr`):
+                    // the attribute macro's own call.
+                    if let Some(after) = path_end(m_start, m_end)
+                        && (after == m_end || punct(after, '=') || matches!(kind(after), Some(TokenKind::Open(_))))
+                    {
+                        return first_byte(direct_hash.unwrap_or(m_start));
                     }
-                    j = group + 1;
+                    let Some(p_end) = any_path_end(m_start, m_end) else { continue };
+                    if !matches!(kind(p_end), Some(TokenKind::Open(Delim::Paren))) {
+                        continue;
+                    }
+                    let group = tokens.close_of(p_end).ok_or(PositionGap::NoItem)?;
+                    if group >= m_end {
+                        continue;
+                    }
+                    let Some(path_str) = span_text(m_start, p_end - 1) else { continue };
+                    match blaze_scope::task::prelude_attr(path_str) {
+                        "derive" | "derive_const" => {
+                            let mut k = p_end + 1;
+                            while k < group {
+                                if let Some(after) = path_end(k, group)
+                                    && (after == group || punct(after, ','))
+                                {
+                                    return first_byte(k);
+                                }
+                                // The list's next path: past this one's `,`, a group skipped whole.
+                                while k < group && !punct(k, ',') {
+                                    k = match kind(k) {
+                                        Some(TokenKind::Open(_)) => tokens.close_of(k).ok_or(PositionGap::NoItem)? + 1,
+                                        _ => k + 1,
+                                    };
+                                }
+                                k += 1;
+                            }
+                        }
+                        "cfg_attr" => {
+                            let pred_start = p_end + 1;
+                            let mut k = pred_start;
+                            while k < group && !punct(k, ',') {
+                                k = match kind(k) {
+                                    Some(TokenKind::Open(_)) => tokens.close_of(k).ok_or(PositionGap::NoItem)? + 1,
+                                    _ => k + 1,
+                                };
+                            }
+                            if k >= group || k == pred_start {
+                                continue;
+                            }
+                            let pred_text = span_text(pred_start, k - 1).ok_or(PositionGap::PastText)?;
+                            if !eval_cfg(pred_text)? {
+                                continue;
+                            }
+                            // Push each inner meta item in reverse so they are visited in written order.
+                            let stack_base = metas.len();
+                            let mut item_start = k + 1;
+                            while item_start < group {
+                                let mut item_end = item_start;
+                                while item_end < group && !punct(item_end, ',') {
+                                    item_end = match kind(item_end) {
+                                        Some(TokenKind::Open(_)) => tokens.close_of(item_end).ok_or(PositionGap::NoItem)? + 1,
+                                        _ => item_end + 1,
+                                    };
+                                }
+                                if item_end > item_start {
+                                    metas.push((item_start, item_end, None));
+                                }
+                                item_start = item_end + 1;
+                            }
+                            if let Some(tail) = metas.get_mut(stack_base..) {
+                                tail.reverse();
+                            }
+                        }
+                        "unsafe" => {
+                            metas.push((p_end + 1, group, direct_hash));
+                        }
+                        _ => {}
+                    }
                 }
                 at = close + 1;
             }
@@ -484,7 +575,7 @@ impl<'n> Anchor<'n> {
                         let first = start.byte(names, krate, text, alloc)?;
                         return Ok((krate, file, Start::Invocation(first.checked_add(at).ok_or(PositionGap::PastText)?)));
                     }
-                    return Ok((krate, file, if expanded { start.invocation() } else { start }));
+                    return Ok((krate, file, if expanded { start.invocation(anchor.lib()) } else { start }));
                 }
                 TextAt::Expansion(call) => call,
             };
@@ -501,19 +592,51 @@ impl<'n> Anchor<'n> {
             } else {
                 let mut call = call;
                 let mut in_body = None;
+                // A keep call (`resolve.rs keep_item`, `macro_name == "derive"`) stages a
+                // derived item verbatim across helper-attribute checks and is not itself a
+                // macro invocation: carry the inner call's `(macro_name, shape, implicit)`
+                // across any chain of keep calls so `invoked_at` locates the real derive or
+                // attribute macro, not `"derive"`.
+                let mut carried: Option<(&'n str, blaze_expand::origin_column::InputShape, bool, &'n str)> = None;
                 for _ in 0..crate::front2::expansion_origin::MOST_LEVELS {
                     let origin = names.call_origin(krate, call).map_err(|_| PositionGap::NoFile)?;
+                    let is_keep = !origin.view.implicit
+                        && origin.view.shape == blaze_expand::origin_column::InputShape::Whole
+                        && origin.view.macro_name == "derive"
+                        && carried.is_some_and(|(_, _, _, inner_text)| {
+                            let entry = usize::try_from(origin.entry.0)
+                                .ok()
+                                .zip(usize::try_from(origin.entry.1).ok())
+                                .and_then(|(a, b)| origin.text.get(a..b));
+                            entry == Some(inner_text)
+                        });
+                    let target = match (is_keep, carried) {
+                        (true, Some((macro_name, shape, implicit, _))) => (macro_name, shape, implicit),
+                        _ => (origin.view.macro_name, origin.view.shape, origin.view.implicit),
+                    };
                     match origin.view.text {
-                        TextAt::File(file) => return Ok((krate, file, Start::Invocation(invoked_at(&origin, alloc)?))),
+                        TextAt::File(file) => {
+                            return Ok((krate, file, Start::Invocation(invoked_at(names, krate, &origin, target, alloc)?)));
+                        }
                         // A call written in a block of a body is in the module text of the
                         // body's blocks, which no call wrote (it has no origins): its site is
                         // placed in the body's own text, and the body is placed as any item.
-                        TextAt::Expansion(parent) => match local_position::block_call_site(names, krate, parent, origin.text, || invoked_at(&origin, alloc), alloc)? {
+                        TextAt::Expansion(parent) => match local_position::block_call_site(
+                            names,
+                            krate,
+                            parent,
+                            origin.text,
+                            || invoked_at(names, krate, &origin, target, alloc),
+                            alloc,
+                        )? {
                             Some(site) => {
                                 in_body = Some(site);
                                 break;
                             }
-                            None => call = parent,
+                            None => {
+                                carried = Some((target.0, target.1, target.2, origin.text));
+                                call = parent;
+                            }
                         },
                     }
                 }
@@ -555,13 +678,20 @@ enum Start<'n> {
     Copied(u32, &'n str),
     Entry(blaze_surface::ItemIndex, &'n str),
     Invocation(u32),
+    CallItem(u32, LibKey),
+    CopiedCall(u32, &'n str),
     MemberInvocation(blaze_surface::ItemIndex, &'n str),
 }
 
 impl<'n> Start<'n> {
-    fn invocation(self) -> Self {
+    fn is_invocation(self) -> bool {
+        matches!(self, Self::Invocation(_) | Self::CallItem(..) | Self::CopiedCall(..) | Self::MemberInvocation(..))
+    }
+
+    fn invocation(self, lib: LibKey) -> Self {
         match self {
-            Self::Byte(at) | Self::Copied(at, _) => Self::Invocation(at),
+            Self::Byte(at) => Self::CallItem(at, lib),
+            Self::Copied(at, body) => Self::CopiedCall(at, body),
             Self::Entry(i, text) => Self::MemberInvocation(i, text),
             other => other,
         }
@@ -744,18 +874,40 @@ impl<'n> Start<'n> {
     fn byte<S: NamesSource<'n>>(self, names: S, krate: usize, text: &str, alloc: Alloc<'_>) -> Result<u32, PositionGap> {
         match self {
             Start::Byte(at) | Start::Copied(at, _) | Start::Invocation(at) => Ok(at),
+            Start::CallItem(at, lib) => {
+                let item = names.text_of(lib).ok_or(PositionGap::NoItem)?.text;
+                let edition = names.edition_of(krate).ok_or(PositionGap::NoFile)?;
+                let past = past_outer_attributes(item, 0, edition, alloc).ok_or(PositionGap::NoItem)?;
+                at.checked_add(past).ok_or(PositionGap::PastText)
+            }
+            Start::CopiedCall(at, body) => {
+                let edition = names.edition_of(krate).ok_or(PositionGap::NoFile)?;
+                let past = past_outer_attributes(body, 0, edition, alloc).ok_or(PositionGap::NoItem)?;
+                at.checked_add(past).ok_or(PositionGap::PastText)
+            }
             Start::Entry(index, part) | Start::MemberInvocation(index, part) => {
                 // The member row already has today's outline index. A loader may hand
                 // back independent buffers for the file and the member's text.
-                if let Some(at) = blaze_scope::expansion_origins::offset_in(text, part) {
-                    return Ok(at);
+                let start = if let Some(at) = blaze_scope::expansion_origins::offset_in(text, part) {
+                    at
+                } else {
+                    let outline = blaze_file_items::outline(text, names.edition_of(krate).ok_or(PositionGap::NoFile)?, alloc);
+                    let ix = usize::try_from(index.0).map_err(|_| PositionGap::NoItem)?;
+                    let range = outline.items().get(ix).ok_or(PositionGap::NoItem)?.range;
+                    let lo = usize::try_from(range.start).map_err(|_| PositionGap::NoItem)?;
+                    let hi = usize::try_from(range.end).map_err(|_| PositionGap::NoItem)?;
+                    if text.get(lo..hi) != Some(part) {
+                        return Err(PositionGap::NoItem);
+                    }
+                    range.start
+                };
+                if matches!(self, Start::MemberInvocation(..)) {
+                    let edition = names.edition_of(krate).ok_or(PositionGap::NoFile)?;
+                    let past = past_outer_attributes(part, 0, edition, alloc).ok_or(PositionGap::NoItem)?;
+                    start.checked_add(past).ok_or(PositionGap::PastText)
+                } else {
+                    Ok(start)
                 }
-                let outline = blaze_file_items::outline(text, names.edition_of(krate).ok_or(PositionGap::NoFile)?, alloc);
-                let range = outline.items().get(index.0 as usize).ok_or(PositionGap::NoItem)?.range;
-                if text.get(range.start as usize..range.end as usize) != Some(part) {
-                    return Err(PositionGap::NoItem);
-                }
-                Ok(range.start)
             }
         }
     }
@@ -775,7 +927,7 @@ pub fn body_place<'n, S: PositionSource<'n>>(names: S, lib: LibKey, alloc: Alloc
     let (krate, file, start) = Anchor::from_lib(names, lib).ok_or(PositionGap::NoItem)?.placement(names, alloc)?;
     let text = names.file_text(krate, file).ok_or(PositionGap::NoFile)?;
     let at = start.byte(names, krate, text, alloc)?;
-    Ok((krate, text, at, matches!(start, Start::Invocation(_) | Start::MemberInvocation(..))))
+    Ok((krate, text, at, start.is_invocation()))
 }
 
 fn position_in_file<'n, S: PositionSource<'n>>(names: S, anchor: Anchor<'n>, site: u32, alloc: Alloc<'_>) -> Result<(u32, u32), PositionGap> {
@@ -784,10 +936,7 @@ fn position_in_file<'n, S: PositionSource<'n>>(names: S, anchor: Anchor<'n>, sit
 
 fn position_at<'n, S: NamesSource<'n>>(names: S, (krate, i, start): (usize, u32, Start<'n>), site: u32, alloc: Alloc<'_>) -> Result<(u32, u32), PositionGap> {
     let text = names.file_text(krate, i).ok_or(PositionGap::NoFile)?;
-    let site = match start {
-        Start::Invocation(_) | Start::MemberInvocation(..) => 0,
-        _ => site,
-    };
+    let site = if start.is_invocation() { 0 } else { site };
     line_and_column(text, start.byte(names, krate, text, alloc)?, site)
 }
 

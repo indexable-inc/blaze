@@ -49,6 +49,15 @@ pub(crate) fn shim_self_resolved_by<'g>(
     ground: &mut PortableTys<'g>,
     resolve: impl FnOnce(blaze_typeck::ItemKey, blaze_typeck::List, &mut PortableTys<'g>) -> Result<(blaze_typeck::ItemKey, blaze_typeck::List), ResolveError>,
 ) -> Result<Instance, ResolveError> {
+    if let Some(target) = blaze_build::reify_shim_of(called, ground.view()) {
+        let (runs, runs_args) = resolve(target.item, target.args, ground)?;
+        if runs == target.item && runs_args == target.args {
+            return Ok(called);
+        }
+        let callee = ground.intern(PNode::FnDef(runs, runs_args)).map_err(ResolveError::Check)?;
+        let list = ground.intern_list(&[callee]).map_err(ResolveError::Check)?;
+        return Ok(Instance { item: blaze_build::REIFY_SHIM_ITEM, args: list });
+    }
     let Some(shim) = crate::fn_shim::fn_shim_of(adts, called, ground) else { return Ok(called) };
     let Some((item, args)) = shim.item else { return Ok(called) };
     let (runs, runs_args) = resolve(item, args, ground)?;

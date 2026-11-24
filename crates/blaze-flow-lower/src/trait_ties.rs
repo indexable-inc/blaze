@@ -267,7 +267,23 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 _ => return self.refuse(miss(TieMiss::ImplAnswers), e),
             }
         }
-        let Some(imp) = found else { return self.refuse(miss(TieMiss::ImplAnswers), e) };
+        let Some(imp) = found else {
+            // An unnormalized projection (`P::Searcher<'a>`) bounded by its associated type
+            // declaration (`type Searcher<'a>: Searcher<'a>`) has no user impl in `call_selections`,
+            // and its single position IS its lifetime argument.
+            if matches!(self.node(a, e)?, PNode::Alias { .. })
+                && theirs.len() == 1
+                && !matches!(theirs[0], Region::Late { .. })
+                && self.npos(a, e)? == 1
+            {
+                let pos = TieEnd::Arg { param: t.param, k: 0 };
+                let cal = TieEnd::Callee(theirs[0]);
+                out.rel.push((pos, cal));
+                out.rel.push((cal, pos));
+                return Ok(());
+            }
+            return self.refuse(miss(TieMiss::ImplAnswers), e);
+        };
         let facts: &'b F = self.facts;
         let regions: &'b dyn RegionFacts = facts.regions();
         let unread = |_: blaze_typeck::region_facts::RegionsUnread| miss(TieMiss::ImplUnread);

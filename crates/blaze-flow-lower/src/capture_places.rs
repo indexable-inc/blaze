@@ -96,13 +96,13 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
                 None => self.refuse(Form::Malformed, e),
             },
             Cover::Under { .. } => Ok(false),
-            // The field is `&*r` by shared reference: `r`'s value is the field's pointer, the
-            // argument local itself (`&T` as the lowering lays a reference, `wrap`).
+            // The field is `&*r` or `&mut *r`: `r`'s value is the field's pointer, the
+            // argument local itself (`&T` / `&mut T` as the lowering lays a reference, `wrap`).
             Cover::RefOf(j) => match self.field_places.get(j).copied().flatten() {
-                Some((_, ty, Some(Mutbl::Not))) => {
+                Some((_, ty, Some(m))) => {
                     let l = Local(1 + j as u32);
                     let at = self.place_of(l);
-                    self.push_place(at, TyD { wrap: Some(Mutbl::Not), ty: ty.ty });
+                    self.push_place(at, TyD { wrap: Some(m), ty: ty.ty });
                     Ok(true)
                 }
                 _ => self.refuse(Form::CapturePlace, e),
@@ -121,12 +121,44 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
     /// variant or a union, an index (the analysis truncates at one; a row with one is
     /// malformed).
     pub(crate) fn capture_source(&mut self, f: EnvField, e: ExprId) -> Result<(Place, TyD), Refusal> {
-        if self.env_now.iter().any(|g| g.base == f.base && !g.is_whole()) {
-            return self.refuse(Form::CapturePlace, e);
-        }
         let ck = self.ck;
-        let (mut at, mut ty) = self.binding_place(f.base, e)?;
-        for i in 0..f.len {
+        let (mut at, mut ty, start_i) = if self.env_now.iter().any(|g| g.base == f.base && !g.is_whole()) {
+            // Inside an outer closure that holds projected fields of `f.base`: find the
+            // enclosing projected field (prefix of `f`) or a `RefOf` field (`&*f`), and
+            // project any remaining steps from it.
+            let mut found = None;
+            for (j, g) in self.env_now.iter().enumerate() {
+                if g.base != f.base || g.is_whole() {
+                    continue;
+                }
+                let n = g.len as usize;
+                let m = f.len as usize;
+                let common = (0..n.min(m)).take_while(|&i| g.proj(ck, i as u32).map(|(p, _)| p) == f.proj(ck, i as u32).map(|(p, _)| p)).count();
+                if common == n {
+                    if let Some((place, pty, _)) = self.field_places.get(j).copied().flatten() {
+                        found = Some((place, pty, g.len));
+                        break;
+                    }
+                } else if common == m
+                    && n == m + 1
+                    && matches!(g.how, CaptureKind::ByRef | CaptureKind::ByMutRef)
+                    && g.proj(ck, m as u32).is_some_and(|(p, _)| p == CaptureProj::Deref)
+                    && let Some((_, pty, Some(mutbl))) = self.field_places.get(j).copied().flatten()
+                {
+                    let l = Local(1 + j as u32);
+                    found = Some((self.place_of(l), TyD { wrap: Some(mutbl), ty: pty.ty }, f.len));
+                    break;
+                }
+            }
+            match found {
+                Some(x) => x,
+                None => return self.refuse(Form::CapturePlace, e),
+            }
+        } else {
+            let (p, t) = self.binding_place(f.base, e)?;
+            (p, t, 0)
+        };
+        for i in start_i..f.len {
             let Some((proj, after)) = f.proj(ck, i) else { return self.refuse(Form::Malformed, e) };
             let child = TyD::of(after);
             at = match proj {

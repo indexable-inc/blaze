@@ -60,6 +60,28 @@ pub(crate) enum Cond {
 }
 
 impl Cond {
+    /// The 4-bit condition code encoding.
+    const fn bits(self) -> u32 {
+        match self {
+            Cond::Eq => 0,
+            Cond::Ne => 1,
+            Cond::Hs => 2,
+            Cond::Lo => 3,
+            Cond::Mi => 4,
+            Cond::Pl => 5,
+            Cond::Vs => 6,
+            Cond::Vc => 7,
+            Cond::Hi => 8,
+            Cond::Ls => 9,
+            Cond::Ge => 10,
+            Cond::Lt => 11,
+            Cond::Gt => 12,
+            Cond::Le => 13,
+            Cond::Al => 14,
+            Cond::Nv => 15,
+        }
+    }
+
     /// The opposite condition: the low bit flipped.
     pub(crate) const fn invert(self) -> u32 {
         self as u32 ^ 1
@@ -74,6 +96,21 @@ pub(crate) enum Size {
     H = 1,
     W = 2,
     X = 3,
+}
+
+impl Size {
+    const fn bits(self) -> u32 {
+        match self {
+            Size::B => 0,
+            Size::H => 1,
+            Size::W => 2,
+            Size::X => 3,
+        }
+    }
+}
+
+const fn bit(flag: bool) -> u32 {
+    if flag { 1 } else { 0 }
 }
 
 // Moves of immediates (C6.2.226, 224, 225).
@@ -144,6 +181,131 @@ pub(crate) const fn orr(rd: Reg, rn: Reg, rm: Reg) -> u32 {
 
 pub(crate) const fn eor(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0xca00_0000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `eor xd, xn, xm, lsl #shift` (`shift` in `0..=63`).
+pub(crate) const fn eor_lsl(rd: Reg, rn: Reg, rm: Reg, shift: u32) -> u32 {
+    0xca00_0000 | (rm << 16) | ((shift & 63) << 10) | (rn << 5) | rd
+}
+
+/// `eor xd, xn, xm, lsr #shift` (`shift` in `0..=63`).
+pub(crate) const fn eor_lsr(rd: Reg, rn: Reg, rm: Reg, shift: u32) -> u32 {
+    0xca40_0000 | (rm << 16) | ((shift & 63) << 10) | (rn << 5) | rd
+}
+
+/// `bic xd, xn, xm`: `xn & !xm` (C6.2.32).
+pub(crate) const fn bic(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x8a20_0000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `orn xd, xn, xm`: `xn | !xm` (C6.2.244).
+pub(crate) const fn orn(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0xaa20_0000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `eon xd, xn, xm`: `xn ^ !xm` (C6.2.101).
+pub(crate) const fn eon(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0xca20_0000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `and xd, xn, #imm` of [`logical_imm`]'s `N:immr:imms` (`nrs`).
+pub(crate) const fn and_imm_nrs(rd: Reg, rn: Reg, nrs: u32) -> u32 {
+    0x9200_0000 | (nrs << 10) | (rn << 5) | rd
+}
+
+/// `orr xd, xn, #imm` of [`logical_imm`]'s `N:immr:imms` (`nrs`).
+pub(crate) const fn orr_imm_nrs(rd: Reg, rn: Reg, nrs: u32) -> u32 {
+    0xb200_0000 | (nrs << 10) | (rn << 5) | rd
+}
+
+/// `eor xd, xn, #imm` of [`logical_imm`]'s `N:immr:imms` (`nrs`).
+pub(crate) const fn eor_imm_nrs(rd: Reg, rn: Reg, nrs: u32) -> u32 {
+    0xd200_0000 | (nrs << 10) | (rn << 5) | rd
+}
+
+/// `extr xd, xn, xm, #lsb` (C6.2.106; `extr xd, xn, xn, #k` is 1-inst `ror #k`).
+pub(crate) const fn extr(rd: Reg, rn: Reg, rm: Reg, lsb: u32) -> u32 {
+    0x93c0_0000 | (rm << 16) | ((lsb & 63) << 10) | (rn << 5) | rd
+}
+
+/// `extr wd, wn, wm, #lsb` (32-bit extract / rotate-right immediate).
+pub(crate) const fn extr_w(rd: Reg, rn: Reg, rm: Reg, lsb: u32) -> u32 {
+    0x1380_0000 | (rm << 16) | ((lsb & 31) << 10) | (rn << 5) | rd
+}
+
+/// `ubfm wd, wn, #immr, #imms` (32-bit bitfield unsigned move; `N=0`).
+pub(crate) const fn ubfm_w(rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
+    0x5300_0000 | ((immr & 31) << 16) | ((imms & 31) << 10) | (rn << 5) | rd
+}
+
+/// `sbfm wd, wn, #immr, #imms` (32-bit bitfield signed move; `N=0`).
+pub(crate) const fn sbfm_w(rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
+    0x1300_0000 | ((immr & 31) << 16) | ((imms & 31) << 10) | (rn << 5) | rd
+}
+
+/// `lsl wd, wn, #shift` (`shift` in 1..=31).
+pub(crate) const fn lsl_imm_w(rd: Reg, rn: Reg, shift: u32) -> u32 {
+    ubfm_w(rd, rn, 32 - shift, 31 - shift)
+}
+
+/// `lsr wd, wn, #shift` (`shift` in 0..=31).
+pub(crate) const fn lsr_imm_w(rd: Reg, rn: Reg, shift: u32) -> u32 {
+    ubfm_w(rd, rn, shift, 31)
+}
+
+/// `asr wd, wn, #shift` (`shift` in 0..=31).
+pub(crate) const fn asr_imm_w(rd: Reg, rn: Reg, shift: u32) -> u32 {
+    sbfm_w(rd, rn, shift, 31)
+}
+
+/// `csinc xd, xn, xm, cond`: `if cond { xn } else { xm + 1 }` (C6.2.72).
+pub(crate) const fn csinc(rd: Reg, rn: Reg, rm: Reg, cond: Cond) -> u32 {
+    0x9a80_0400 | (rm << 16) | (cond.bits() << 12) | (rn << 5) | rd
+}
+
+/// `csinv xd, xn, xm, cond`: `if cond { xn } else { !xm }` (C6.2.73).
+pub(crate) const fn csinv(rd: Reg, rn: Reg, rm: Reg, cond: Cond) -> u32 {
+    0xda80_0000 | (rm << 16) | (cond.bits() << 12) | (rn << 5) | rd
+}
+
+/// `csneg xd, xn, xm, cond`: `if cond { xn } else { -xm }` (C6.2.74).
+pub(crate) const fn csneg(rd: Reg, rn: Reg, rm: Reg, cond: Cond) -> u32 {
+    0xda80_0400 | (rm << 16) | (cond.bits() << 12) | (rn << 5) | rd
+}
+
+/// `stp xt, xt2, [rn, #off]` (signed offset, no writeback), `off` a multiple of 8 in -512..=504.
+pub(crate) const fn stp_off(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
+    0xa900_0000 | (((off / 8).cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+}
+
+/// `ldp xt, xt2, [rn, #off]` (signed offset, no writeback), `off` a multiple of 8 in -512..=504.
+pub(crate) const fn ldp_off(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
+    0xa940_0000 | (((off / 8).cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+}
+
+/// `ldr{b,h,,} rt, [rn, rm, lsl #size]` (scaled register-index load).
+pub(crate) const fn ldr_reg_scaled(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3860_7800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
+}
+
+/// `str{b,h,,} rt, [rn, rm, lsl #size]` (scaled register-index store).
+pub(crate) const fn str_reg_scaled(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3820_7800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
+}
+
+/// `ldrsw xt, [xn, xm, lsl #2]` (signed 32-bit scaled load for dense PC-relative jump tables).
+pub(crate) const fn ldrsw_reg_scaled(rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0xb8a0_7800 | (rm << 16) | (rn << 5) | rt
+}
+
+/// `umull xd, wn, wm`: unsigned 32x32->64 widening multiply (C6.2.404).
+pub(crate) const fn umull(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x9ba0_7c00 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `smull xd, wn, wm`: signed 32x32->64 widening multiply (C6.2.307).
+pub(crate) const fn smull(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x9b20_7c00 | (rm << 16) | (rn << 5) | rd
 }
 
 /// `orn xd, xzr, xm`.
@@ -370,6 +532,11 @@ pub(crate) const fn adrp(rd: Reg, pages: i32) -> u32 {
 
 // Branches (C6.2.26, 25, 66, 65, 37, 35, 290, 49).
 
+/// `bl <pc + 4 * words>` (C6.2.34: direct PC-relative call within ±128 MiB).
+pub(crate) const fn bl(words: i32) -> u32 {
+    0x9400_0000 | (words.cast_unsigned() & 0x3ff_ffff)
+}
+
 /// `b <pc + 4 * words>`.
 pub(crate) const fn b(words: i32) -> u32 {
     0x1400_0000 | ((words as u32) & 0x3ff_ffff)
@@ -390,12 +557,21 @@ pub(crate) const fn cbnz(rt: Reg, words: i32) -> u32 {
     0xb500_0000 | (((words as u32) & 0x7_ffff) << 5) | rt
 }
 
+/// `tbz xt, #bit, <pc + 4 * words>` (C6.2.398).
+pub(crate) const fn tbz(rt: Reg, bit: u32, words: i32) -> u32 {
+    test_branch(false, rt, bit) | ((words.cast_unsigned() & 0x3fff) << 5)
+}
+
+/// `tbnz xt, #bit, <pc + 4 * words>` (C6.2.397).
+pub(crate) const fn tbnz(rt: Reg, bit: u32, words: i32) -> u32 {
+    test_branch(true, rt, bit) | ((words.cast_unsigned() & 0x3fff) << 5)
+}
+
 /// Test bit and branch: b5 011011 op b40 imm14 Rt. The displacement starts at zero.
 pub(crate) const fn test_branch(nonzero: bool, rt: Reg, bit: u32) -> u32 {
     0x3600_0000 | ((bit >> 5) << 31) | ((nonzero as u32) << 24) | ((bit & 31) << 19) | rt
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "a form pinned by the encoding tests, which the pass does not use yet"))]
 pub(crate) const fn br(rn: Reg) -> u32 {
     0xd61f_0000 | (rn << 5)
 }
@@ -1036,4 +1212,355 @@ pub(crate) fn logical_imm(value: u64, size: u32) -> Option<u64> {
         return None;
     }
     Some((n << 12) | (immr << 6) | imms)
+}
+
+// -----------------------------------------------------------------------------
+// 128-bit NEON SIMD encoders for `TierName::Sota` auto-vectorization (C7.2)
+// -----------------------------------------------------------------------------
+
+/// `ldur qt, [rn, #imm9]` (C7.2 LDUR SIMD&FP, 128-bit unscaled signed 9-bit byte offset).
+pub(crate) const fn ldur_q(rt: Reg, rn: Reg, imm9: i32) -> u32 {
+    0x3cc0_0000 | ((imm9.cast_unsigned() & 0x1ff) << 12) | (rn << 5) | rt
+}
+
+/// `stur qt, [rn, #imm9]` (C7.2 STUR SIMD&FP, 128-bit unscaled signed 9-bit byte offset).
+pub(crate) const fn stur_q(rt: Reg, rn: Reg, imm9: i32) -> u32 {
+    0x3c80_0000 | ((imm9.cast_unsigned() & 0x1ff) << 12) | (rn << 5) | rt
+}
+
+/// `ldr qt, [rn, rm, lsl #(4 if scaled else 0)]` (C7.2 LDR register, SIMD&FP 128-bit).
+pub(crate) const fn ldr_q_reg(rt: Reg, rn: Reg, rm: Reg, scaled: bool) -> u32 {
+    0x3ce0_6800 | (rm << 16) | (bit(scaled) << 12) | (rn << 5) | rt
+}
+
+/// `str qt, [rn, rm, lsl #(4 if scaled else 0)]` (C7.2 STR register, SIMD&FP 128-bit).
+pub(crate) const fn str_q_reg(rt: Reg, rn: Reg, rm: Reg, scaled: bool) -> u32 {
+    0x3ca0_6800 | (rm << 16) | (bit(scaled) << 12) | (rn << 5) | rt
+}
+
+/// `ldp qt1, qt2, [rn, #imm7 * 16]` (C7.2 LDP SIMD&FP, 128-bit pair = 32 bytes in one op).
+pub(crate) const fn ldp_q_off(rt1: Reg, rt2: Reg, rn: Reg, imm7: i32) -> u32 {
+    0xad40_0000 | ((imm7.cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt1
+}
+
+/// `stp qt1, qt2, [rn, #imm7 * 16]` (C7.2 STP SIMD&FP, 128-bit pair = 32 bytes in one op).
+pub(crate) const fn stp_q_off(rt1: Reg, rt2: Reg, rn: Reg, imm7: i32) -> u32 {
+    0xad00_0000 | ((imm7.cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt1
+}
+
+/// `orr vd.16b, vn.16b, vm.16b` (`mov vd.16b, vn.16b` when `vn == vm`).
+pub(crate) const fn orr_v(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4ea0_1c00 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `eor vd.16b, vn.16b, vm.16b`.
+pub(crate) const fn eor_v(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x6e20_1c00 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `movi vd.2d, #0`: 0-cycle zero idiom on Apple Silicon & Neoverse.
+pub(crate) const fn movi_zero_v(rd: Reg) -> u32 {
+    0x6f00_e400 | rd
+}
+
+/// `dup vd.T, rn` (C7.2 DUP general, 128-bit `Q=1`): `size = 0:16B, 1:8H, 2:4S, 3:2D`.
+pub(crate) const fn dup_gen_v(size: u32, rd: Reg, rn: Reg) -> u32 {
+    0x4e00_0c00 | ((1u32 << size) << 16) | (rn << 5) | rd
+}
+
+/// `dup vd.T, vn.Ts[0]` (C7.2 DUP element lane 0, 128-bit `Q=1`): `size = 2:4S, 3:2D`.
+pub(crate) const fn dup_elem0_v(size: u32, rd: Reg, rn: Reg) -> u32 {
+    0x4e00_0400 | ((1u32 << size) << 16) | (rn << 5) | rd
+}
+
+/// `add vd.T, vn.T, vm.T` (`Q=1`, `size = 0:16B, 1:8H, 2:4S, 3:2D`).
+pub(crate) const fn add_v(size: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4e20_8400 | (size << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `sub vd.T, vn.T, vm.T` (`Q=1`, `size = 0:16B, 1:8H, 2:4S, 3:2D`).
+pub(crate) const fn sub_v(size: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x6e20_8400 | (size << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `mul vd.T, vn.T, vm.T` (`Q=1`, `size = 0:16B, 1:8H, 2:4S`).
+pub(crate) const fn mul_v(size: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4e20_9c00 | (size << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `mla vd.T, vn.T, vm.T` (`vd += vn * vm`, `Q=1`, `size = 0:16B, 1:8H, 2:4S`).
+pub(crate) const fn mla_v(size: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4e20_9400 | (size << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `smin`/`smax`/`umin`/`umax` (`Q=1`, `size = 0:16B, 1:8H, 2:4S`).
+pub(crate) const fn minmax_v(unsigned: bool, is_min: bool, size: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    let base = 0x4e20_6400 | (bit(unsigned) << 29) | (bit(is_min) << 11);
+    base | (size << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `fadd vd.T, vn.T, vm.T` (`Q=1`, `double ? 2D : 4S`).
+pub(crate) const fn fadd_v(double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4e20_d400 | (bit(double) << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `fsub vd.T, vn.T, vm.T` (`Q=1`, `double ? 2D : 4S`).
+pub(crate) const fn fsub_v(double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4ea0_d400 | (bit(double) << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `fmul vd.T, vn.T, vm.T` (`Q=1`, `double ? 2D : 4S`).
+pub(crate) const fn fmul_v(double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x6e20_dc00 | (bit(double) << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `fmla vd.T, vn.T, vm.T` (`vd += vn * vm`, `Q=1`, `double ? 2D : 4S`).
+pub(crate) const fn fmla_v(double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4e20_cc00 | (bit(double) << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `addv d/s/h/b, vn.T` (`Q=1`, `size = 0:16B, 1:8H, 2:4S`).
+pub(crate) const fn addv_v(size: u32, rd: Reg, rn: Reg) -> u32 {
+    0x4e31_b800 | (size << 22) | (rn << 5) | rd
+}
+
+/// `addp dd, vn.2d` (C7.2 ADDP scalar: sums both 64-bit lanes of `vn` into `dd`).
+pub(crate) const fn addp_d(rd: Reg, rn: Reg) -> u32 {
+    0x5ef1_b800 | (rn << 5) | rd
+}
+
+/// `faddp sd/dd, vn.2s/2d` (C7.2 FADDP scalar pairwise FP sum).
+pub(crate) const fn faddp_scalar(double: bool, rd: Reg, rn: Reg) -> u32 {
+    0x7e30_d800 | (bit(double) << 22) | (rn << 5) | rd
+}
+
+/// `faddp vd.4s, vn.4s, vm.4s` (C7.2 FADDP vector pairwise FP sum).
+pub(crate) const fn faddp_v(double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x6e20_d400 | (bit(double) << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `umov wd/xd, vn.Ts[idx]` (C7.2 UMOV): `size = 0:B, 1:H, 2:S, 3:D`.
+pub(crate) const fn umov_lane(size: u32, idx: u32, rd: Reg, rn: Reg) -> u32 {
+    let q = bit(size == 3);
+    let imm5 = (idx << (size + 1)) | (1u32 << size);
+    0x0e00_3c00 | (q << 30) | (imm5 << 16) | (rn << 5) | rd
+}
+
+/// `ext vd.16b, vn.16b, vm.16b, #imm4` (C7.2 EXT byte extract/shift).
+pub(crate) const fn ext_v(rd: Reg, rn: Reg, rm: Reg, imm4: u32) -> u32 {
+    0x6e00_0000 | (rm << 16) | ((imm4 & 0xf) << 11) | (rn << 5) | rd
+}
+
+// -----------------------------------------------------------------------------
+// ARMv8.9/v9.4 CSSC (Common Short Sequence Compression) hardware intrinsics
+// -----------------------------------------------------------------------------
+
+/// `smax`/`umax`/`smin`/`umin xd, xn, xm` (CSSC 1-instruction scalar integer min/max).
+pub(crate) const fn cssc_minmax(unsigned: bool, is_min: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    let opc = (bit(is_min) << 1) | bit(unsigned);
+    0x9ac0_6000 | (rm << 16) | (opc << 10) | (rn << 5) | rd
+}
+
+/// `cnt xd, xn` (CSSC 1-instruction scalar integer popcount without NEON domain crossing).
+pub(crate) const fn cssc_cnt(rd: Reg, rn: Reg) -> u32 {
+    0xdac0_1c00 | (rn << 5) | rd
+}
+
+/// `abs xd, xn` (CSSC 1-instruction scalar integer absolute value).
+pub(crate) const fn cssc_abs(rd: Reg, rn: Reg) -> u32 {
+    0xdac0_2000 | (rn << 5) | rd
+}
+
+// -----------------------------------------------------------------------------
+// AArch64 NEON 128-bit Vector Comparisons & Bitwise Select (Masked SIMD)
+// -----------------------------------------------------------------------------
+
+/// `cmgt`/`cmhi vd.T, vn.T, vm.T` (`Q=1`, `unsigned ? cmhi : cmgt`, `size = 0..=3`).
+pub(crate) const fn cmgt_v(unsigned: bool, size: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4e20_3400 | (bit(unsigned) << 29) | (size << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `cmge`/`cmhs vd.T, vn.T, vm.T` (`Q=1`, `unsigned ? cmhs : cmge`, `size = 0..=3`).
+pub(crate) const fn cmge_v(unsigned: bool, size: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4e20_3c00 | (bit(unsigned) << 29) | (size << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `mvn vd.16b, vn.16b` (`Q=1`, bitwise NOT of 128-bit mask).
+pub(crate) const fn not_v(rd: Reg, rn: Reg) -> u32 {
+    0x6e20_5800 | (rn << 5) | rd
+}
+
+/// `bsl vd.16b, vn.16b, vm.16b` (`Q=1`: `vd = (vd & vn) | (~vd & vm)`).
+pub(crate) const fn bsl_v(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x6e60_1c00 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `bit vd.16b, vn.16b, vm.16b` (`Q=1`: `vd = (vm & vn) | (~vm & vd)`).
+pub(crate) const fn bit_v(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x6ea0_1c00 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `bif vd.16b, vn.16b, vm.16b` (`Q=1`: `vd = (~vm & vn) | (vm & vd)`).
+pub(crate) const fn bif_v(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x6ee0_1c00 | (rm << 16) | (rn << 5) | rd
+}
+
+// -----------------------------------------------------------------------------
+// ARMv8.2-SHA3 (`eor3`, `xar`) & ARMv8.0-CRC32 hardware intrinsics
+// -----------------------------------------------------------------------------
+
+/// `eor3 vd.16b, vn.16b, vm.16b, va.16b` (3-way 128-bit XOR in 1 instruction — Keccak/SHA3!).
+pub(crate) const fn eor3_v(rd: Reg, rn: Reg, rm: Reg, ra: Reg) -> u32 {
+    0xce00_0000 | (rm << 16) | (ra << 10) | (rn << 5) | rd
+}
+
+/// `xar vd.2d, vn.2d, vm.2d, #imm6` (128-bit XOR + 64-bit lane rotate-right in 1 instruction!).
+#[allow(dead_code)]
+pub(crate) const fn xar_v(rd: Reg, rn: Reg, rm: Reg, imm6: u32) -> u32 {
+    0xce80_0000 | (rm << 16) | ((imm6 & 0x3f) << 10) | (rn << 5) | rd
+}
+
+/// `bcax vd.16b, vn.16b, vm.16b, va.16b` (ARMv8.2-SHA3: `vd = vn ^ (vm & ~va)` — Keccak Chi step in 1 op!).
+pub(crate) const fn bcax_v(rd: Reg, rn: Reg, rm: Reg, ra: Reg) -> u32 {
+    0xce20_0000 | (rm << 16) | (ra << 10) | (rn << 5) | rd
+}
+
+/// `rax1 vd.2d, vn.2d, vm.2d` (ARMv8.2-SHA3: `vd = vn ^ ROL64(vm, 1)` — Keccak Theta step in 1 op!).
+pub(crate) const fn rax1_v(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0xce60_8c00 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `tbl vd.16b, {vn.16b}, vm.16b` (NEON 16-byte single-table vectorized LUT lookup in 1 op!).
+pub(crate) const fn tbl1_v(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4e00_0000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `ins vd.d[lane], xn` (insert 64-bit GPR into 64-bit lane 0 or 1 of a 128-bit NEON vector).
+pub(crate) const fn ins_d_gpr(rd: Reg, lane: u32, rn: Reg) -> u32 {
+    0x4e08_1c00 | ((lane & 1) << 20) | (rn << 5) | rd
+}
+
+// -----------------------------------------------------------------------------
+// ARMv8.2-DotProd (`sdot`/`udot`), ARMv8.6-I8MM (`smmla`/`ummla`), AES & SHA2
+// -----------------------------------------------------------------------------
+
+/// `sdot`/`udot vd.4s, vn.16b, vm.16b` (4x 4-lane int8 dot product accumulate into 4x i32!).
+#[allow(dead_code)]
+pub(crate) const fn dotprod_v(unsigned: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4e80_9400 | (bit(unsigned) << 29) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `smmla`/`ummla vd.4s, vn.16b, vm.16b` (ARMv8.6-I8MM 2x8 * 8x2 int8 matrix multiply-accumulate!).
+#[allow(dead_code)]
+pub(crate) const fn mmla_v(unsigned: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4e80_a400 | (bit(unsigned) << 29) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `aese vd.16b, vn.16b` (ARMv8-AES single-round encryption + AddRoundKey/SubBytes/ShiftRows).
+#[allow(dead_code)]
+pub(crate) const fn aese_v(rd: Reg, rn: Reg) -> u32 {
+    0x4e28_4800 | (rn << 5) | rd
+}
+
+/// `aesmc vd.16b, vn.16b` (ARMv8-AES MixColumns).
+#[allow(dead_code)]
+pub(crate) const fn aesmc_v(rd: Reg, rn: Reg) -> u32 {
+    0x4e28_6800 | (rn << 5) | rd
+}
+
+/// `sha256h qd, qn, vm.4s` (ARMv8-SHA2 hash update part 1).
+#[allow(dead_code)]
+pub(crate) const fn sha256h_v(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x5e00_4000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `sha256su0 vd.4s, vn.4s` (ARMv8-SHA2 schedule update 0).
+#[allow(dead_code)]
+pub(crate) const fn sha256su0_v(rd: Reg, rn: Reg) -> u32 {
+    0x5e28_2800 | (rn << 5) | rd
+}
+
+/// `prfm pldl1keep, [rn, #(imm12 * 8)]` (C6.2.253: hardware L1 read prefetch hint, non-faulting).
+pub(crate) const fn prfm_pldl1keep(rn: Reg, imm12: u32) -> u32 {
+    0xf980_0000 | ((imm12 & 0xfff) << 10) | (rn << 5)
+}
+
+/// `uminv bd, vn.16b` (C7.2.369: unsigned horizontal minimum across 16 bytes -> `0` iff any lane is `0`).
+pub(crate) const fn uminv_b(rd: Reg, rn: Reg) -> u32 {
+    0x6e31_a800 | (rn << 5) | rd
+}
+
+/// `smaxv`/`umaxv`/`sminv`/`uminv b/h/s, vn.16b/8h/4s` (C7.2 AdvSIMD across-lanes min/max; `size = 0..=2`).
+pub(crate) const fn minmaxv_v(unsigned: bool, is_min: bool, size: u32, rd: Reg, rn: Reg) -> u32 {
+    0x4e30_a800 | (bit(unsigned) << 29) | (size << 22) | (bit(is_min) << 16) | (rn << 5) | rd
+}
+
+/// `sqadd`/`uqadd`/`sqsub`/`uqsub vd.T, vn.T, vm.T` (C7.2 AdvSIMD saturating add/sub; `Q=1`, `size = 0..=3`).
+pub(crate) const fn sat_addsub_v(unsigned: bool, is_sub: bool, size: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    let base = if is_sub { 0x4e20_2c00 } else { 0x4e20_0c00 };
+    base | (bit(unsigned) << 29) | (size << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `ldp dt1, dt2, [rn, #off]` (`off` in `-512..=504`, 8-byte aligned).
+pub(crate) const fn ldp_d_off(rt1: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
+    let imm7 = (off >> 3).cast_unsigned() & 0x7f;
+    0x6d40_0000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1
+}
+
+/// `stp dt1, dt2, [rn, #off]` (`off` in `-512..=504`, 8-byte aligned).
+pub(crate) const fn stp_d_off(rt1: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
+    let imm7 = (off >> 3).cast_unsigned() & 0x7f;
+    0x6d00_0000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1
+}
+
+/// `xtn vd.2s, vn.2d` (C7.2.383: extract low 32 bits of each 64-bit lane into `vd.2s`).
+pub(crate) const fn xtn_2s(rd: Reg, rn: Reg) -> u32 {
+    0x0ea1_2800 | (rn << 5) | rd
+}
+
+/// `umull vd.2d, vn.2s, vm.2s` (C7.2.374: unsigned 32x32->64 widening vector multiply, low 2 lanes).
+pub(crate) const fn umull_2d(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x2ea0_c000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `umull2 vd.2d, vn.4s, vm.4s` (C7.2.374: unsigned 32x32->64 widening vector multiply, high 2 lanes).
+pub(crate) const fn umull2_2d(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x6ea0_c000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `uzp2 vd.4s, vn.4s, vm.4s` (C7.2.380: unzip odd 32-bit lanes = upper 32 bits of 4 64-bit products).
+pub(crate) const fn uzp2_4s(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4e80_5800 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `uadalp vd.2d, vn.4s` (C7.2.357: unsigned zero-extending pairwise add-accumulate `<4 x u32>` into `<2 x u64>`).
+pub(crate) const fn uadalp_2d(rd: Reg, rn: Reg) -> u32 {
+    0x6ea0_6800 | (rn << 5) | rd
+}
+
+/// `ushr vd.4s, vn.4s, #shift` (`shift` in `1..=32`, C7.2.376).
+pub(crate) const fn ushr_4s_imm(rd: Reg, rn: Reg, shift: u32) -> u32 {
+    let imm = (64u32.saturating_sub(shift)) & 0x3f;
+    0x6f00_0400 | (imm << 16) | (rn << 5) | rd
+}
+
+/// `shl vd.4s, vn.4s, #shift` (`shift` in `0..=31`, C7.2.266).
+pub(crate) const fn shl_4s_imm(rd: Reg, rn: Reg, shift: u32) -> u32 {
+    0x4f20_5400 | ((shift & 31) << 16) | (rn << 5) | rd
+}
+
+/// `ins vd.s[lane], wn` (`lane` in `0..=3`, C7.2.172).
+pub(crate) const fn ins_s_gpr(rd: Reg, lane: u32, rn: Reg) -> u32 {
+    0x4e04_1c00 | ((lane & 3) << 19) | (rn << 5) | rd
+}
+
+/// `ushr vd.2d, vn.2d, #shift` (`shift` in `1..=64`, C7.2.376).
+pub(crate) const fn ushr_2d_imm(rd: Reg, rn: Reg, shift: u32) -> u32 {
+    let imm = (128u32.saturating_sub(shift)) & 0x7f;
+    0x6f00_0400 | (imm << 16) | (rn << 5) | rd
+}
+
+/// `shl vd.2d, vn.2d, #shift` (`shift` in `0..=63`, C7.2.266).
+pub(crate) const fn shl_2d_imm(rd: Reg, rn: Reg, shift: u32) -> u32 {
+    0x4f40_5400 | ((shift & 63) << 16) | (rn << 5) | rd
 }

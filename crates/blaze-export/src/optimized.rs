@@ -332,20 +332,186 @@ fn in_poll(r: &RecordView<'_>, at: u32) -> bool {
     lo > 0 && at < r.poll(lo - 1).at + 8
 }
 
-/// The placement order: profile first, then a depth-first walk from the entry, then the rest by
-/// symbol. A work list, no recursion.
-fn order<'a>(members: &[Member02<'_>], by_symbol: &[u32], entry: usize, profile: Option<Profile<'_>>, alloc: Alloc<'a>) -> AVec<'a, u32> {
+/// Maximum byte size of a single PGO hot call-chain cluster (bounded to one 4 KiB..16 KiB iTLB page).
+const MAX_HFSORT_CLUSTER_BYTES: usize = 16384;
+
+/// The placement order: when a profile is supplied, hot functions are placed first using HFSort /
+/// C3 call-graph clustering (merging hot callees into their hottest caller's page-sized cluster
+/// weighted by callsite multiplicity, then sorting clusters by execution density `score / bytes`
+/// so the hottest working set packs into the fewest possible iTLB/L1i pages); then a depth-first
+/// walk from the entry, then the rest by symbol. Deterministic, no recursion.
+fn order<'a>(
+    members: &[Member02<'_>],
+    by_symbol: &[u32],
+    entry: usize,
+    profile: Option<Profile<'_>>,
+    page: u64,
+    alloc: Alloc<'a>,
+) -> AVec<'a, u32> {
     let n = members.len();
     let mut placed: AVec<'_, bool> = Vec::from_elem_in(false, n, alloc);
     let mut walked: AVec<'_, bool> = Vec::from_elem_in(false, n, alloc);
     let mut order: AVec<'a, u32> = Vec::with_capacity_in(n, alloc);
     let hot = profile.map_or(&[][..], |p| p.hot);
-    for &symbol in hot {
-        if let Some(i) = find_member(members, by_symbol, symbol)
-            && !placed[i]
-        {
-            placed[i] = true;
-            order.push(i as u32);
+    if !hot.is_empty() {
+        let cluster_cap = usize::try_from(page).unwrap_or(MAX_HFSORT_CLUSTER_BYTES).clamp(4096, MAX_HFSORT_CLUSTER_BYTES);
+        let mut hot_rank: AVec<'_, u32> = Vec::from_elem_in(u32::MAX, n, alloc);
+        let mut hot_nodes: AVec<'_, usize> = Vec::with_capacity_in(hot.len(), alloc);
+        for (rank, &symbol) in hot.iter().enumerate() {
+            if let Some(i) = find_member(members, by_symbol, symbol)
+                && hot_rank.get(i).copied() == Some(u32::MAX)
+            {
+                if let Some(slot) = hot_rank.get_mut(i) {
+                    *slot = u32::try_from(rank).unwrap_or(u32::MAX);
+                }
+                hot_nodes.push(i);
+            }
+        }
+        let h_len = hot_nodes.len();
+        // Build weighted call-graph clusters (HFSort / C3):
+        // Each hot function starts in its own cluster; in order of decreasing hotness, merge
+        // each hot callee into its hottest caller's cluster when combined bytes fit in one iTLB page,
+        // or follow outgoing hottest direct call edges when caller-side merging is already satisfied.
+        let mut cluster_of: AVec<'_, usize> = Vec::from_elem_in(usize::MAX, n, alloc);
+        let mut clusters: AVec<'_, AVec<'a, u32>> = Vec::with_capacity_in(h_len, alloc);
+        let mut cluster_bytes: AVec<'_, usize> = Vec::with_capacity_in(h_len, alloc);
+        let mut cluster_score: AVec<'_, u64> = Vec::with_capacity_in(h_len, alloc);
+        for (ci, &node) in hot_nodes.iter().enumerate() {
+            if let Some(slot) = cluster_of.get_mut(node) {
+                *slot = ci;
+            }
+            let mut c: AVec<'a, u32> = Vec::with_capacity_in(4, alloc);
+            c.push(u32::try_from(node).unwrap_or(u32::MAX));
+            clusters.push(c);
+            let node_bytes = members.get(node).map_or(16, |m| m.record.code().len().max(16));
+            cluster_bytes.push(node_bytes);
+            // Higher rank weight for hotter functions (`h_len - rank`, quadratic decay for top hot tier).
+            let w = u64::try_from(h_len.saturating_sub(ci)).unwrap_or(u64::MAX);
+            cluster_score.push(w.saturating_mul(w));
+        }
+
+        // Compute best direct caller for each hot node (weighted by caller hotness * callsite count).
+        let mut best_caller: AVec<'_, (u64, usize)> = Vec::from_elem_in((0, usize::MAX), n, alloc);
+        for (ci, &caller) in hot_nodes.iter().enumerate() {
+            let caller_w = u64::try_from(h_len.saturating_sub(ci)).unwrap_or(u64::MAX);
+            let Some(caller_member) = members.get(caller) else {
+                continue;
+            };
+            let r = caller_member.record;
+            // Count direct calls to each hot callee in `caller`.
+            let mut seen_callees: AVec<'_, (usize, u64)> = Vec::new_in(alloc);
+            for k in 0..r.relocs() {
+                let reloc = r.reloc(k);
+                if reloc.in_relro || in_poll(&r, reloc.at) {
+                    continue;
+                }
+                if let Some(t) = named(&r, reloc.target)
+                    && t.space == Space::Func
+                    && let Some(j) = find_member(members, by_symbol, t.symbol)
+                    && j != caller
+                    && hot_rank.get(j).copied().is_some_and(|rk| rk != u32::MAX)
+                {
+                    if let Some(slot) = seen_callees.iter_mut().find(|(id, _)| *id == j) {
+                        slot.1 = slot.1.saturating_add(1);
+                    } else {
+                        seen_callees.push((j, 1));
+                    }
+                }
+            }
+            for &(callee, mult) in &seen_callees {
+                let edge_w = caller_w.saturating_mul(mult);
+                if let Some(slot) = best_caller.get_mut(callee) {
+                    let (cur_w, cur_c) = *slot;
+                    if edge_w > cur_w || (edge_w == cur_w && caller < cur_c) {
+                        *slot = (edge_w, caller);
+                    }
+                }
+            }
+        }
+
+        // Merge each hot function into its hottest caller's cluster when combined bytes fit in `cluster_cap`.
+        for &callee in &hot_nodes {
+            let Some(&(_, caller)) = best_caller.get(callee) else {
+                continue;
+            };
+            if caller == usize::MAX {
+                continue;
+            }
+            let (Some(&c_dst), Some(&c_src)) = (cluster_of.get(caller), cluster_of.get(callee)) else {
+                continue;
+            };
+            if c_dst == c_src || clusters.get(c_src).is_none_or(|c| c.is_empty()) {
+                continue;
+            }
+            let dst_b = cluster_bytes.get(c_dst).copied().unwrap_or(0);
+            let src_b = cluster_bytes.get(c_src).copied().unwrap_or(0);
+            if dst_b.saturating_add(src_b) > cluster_cap {
+                continue;
+            }
+            // Move all nodes of `c_src` to the end of `c_dst`.
+            let src_len = clusters.get(c_src).map_or(0, |c| c.len());
+            for k in 0..src_len {
+                let Some(node) = clusters.get(c_src).and_then(|c| c.get(k).copied()) else {
+                    break;
+                };
+                if let Ok(ni) = usize::try_from(node)
+                    && let Some(slot) = cluster_of.get_mut(ni)
+                {
+                    *slot = c_dst;
+                }
+                if let Some(dst_c) = clusters.get_mut(c_dst) {
+                    dst_c.push(node);
+                }
+            }
+            if let Some(src_c) = clusters.get_mut(c_src) {
+                src_c.clear();
+            }
+            let src_s = cluster_score.get(c_src).copied().unwrap_or(0);
+            if let Some(slot) = cluster_bytes.get_mut(c_dst) {
+                *slot = dst_b.saturating_add(src_b);
+            }
+            if let Some(slot) = cluster_score.get_mut(c_dst) {
+                *slot = slot.saturating_add(src_s);
+            }
+            if let Some(slot) = cluster_bytes.get_mut(c_src) {
+                *slot = 0;
+            }
+            if let Some(slot) = cluster_score.get_mut(c_src) {
+                *slot = 0;
+            }
+        }
+
+        // Sort non-empty clusters by execution density (`cluster_score / cluster_bytes`, exact cross-mul,
+        // tie-broken by earliest hot rank for 100% determinism).
+        let mut live_clusters: AVec<'_, usize> = Vec::with_capacity_in(h_len, alloc);
+        for (ci, c) in clusters.iter().enumerate() {
+            if !c.is_empty() {
+                live_clusters.push(ci);
+            }
+        }
+        live_clusters.sort_unstable_by(|&a, &b| {
+            let sa = cluster_score.get(a).copied().unwrap_or(0);
+            let sb = cluster_score.get(b).copied().unwrap_or(0);
+            let ba = u64::try_from(cluster_bytes.get(a).copied().unwrap_or(1).max(1)).unwrap_or(u64::MAX);
+            let bb = u64::try_from(cluster_bytes.get(b).copied().unwrap_or(1).max(1)).unwrap_or(u64::MAX);
+            let lhs = u128::from(sb) * u128::from(ba);
+            let rhs = u128::from(sa) * u128::from(bb);
+            lhs.cmp(&rhs).then_with(|| a.cmp(&b))
+        });
+
+        for ci in live_clusters {
+            let Some(c) = clusters.get(ci) else {
+                continue;
+            };
+            for &node in c {
+                if let Ok(ni) = usize::try_from(node)
+                    && let Some(slot) = placed.get_mut(ni)
+                    && !*slot
+                {
+                    *slot = true;
+                    order.push(node);
+                }
+            }
         }
     }
     let mut stack: AVec<'_, u32> = Vec::new_in(alloc);
@@ -466,7 +632,7 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
     let Some(entry_member) = find_member(members, &by_symbol, entry) else {
         return Err(ExportError::NoEntry { symbol: entry });
     };
-    let order = order(members, &by_symbol, entry_member, profile, alloc);
+    let order = order(members, &by_symbol, entry_member, profile, page, alloc);
 
     // Folding: each position's representative is the first position with an equal record.
     let mut digests: AVec<'_, ([u8; 32], u32)> = Vec::with_capacity_in(n, alloc);

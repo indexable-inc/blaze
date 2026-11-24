@@ -281,6 +281,22 @@ impl Scope {
         Ok(s)
     }
 
+    /// This scope extended with a GAT's own lifetime parameters of `v` (its GENERICS), each
+    /// mapped to `Region::Late { binder: u32::MAX, var: j }` so `impl_assoc` can lay GAT values
+    /// without altering the impl's own `Param` count.
+    pub fn with_gat_lifetimes(&self, v: &View<'_>, alloc: Mem) -> Result<Scope, RegionsRefusal> {
+        let mut s = self.clone_in(alloc);
+        let mut gat = 0u32;
+        for &n in read(v.rows(v.list(head::GENERICS)), "a GAT's generics")? {
+            if let lf::GenericParam::Lifetime { name, .. } = read(lf::GenericParam::decode(n), "a GAT generic parameter")? {
+                let h = read(v.name(name), "a GAT lifetime's name")?;
+                s.names.push((h, Region::Late { binder: u32::MAX, var: gat }));
+                gat = gat.checked_add(1).ok_or(RegionError::LifetimePast { index: u32::MAX, count: u32::MAX })?;
+            }
+        }
+        Ok(s)
+    }
+
     /// A container's scope from its filed group (heads.rs `ContainerRegions`): `names[i]` (a
     /// declared lifetime's hash, declaration order) is `Param(i)`, and `params` counts its
     /// declared and its header's elided lifetimes. More names than `params` is the producer's

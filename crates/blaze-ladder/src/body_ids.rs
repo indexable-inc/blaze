@@ -229,7 +229,10 @@ pub fn each_item(name: &[u8], mut each: impl FnMut(ItemKey)) -> Result<(), NameE
         let bytes = name.get(at..at + 4).ok_or(NameError::Truncated { at })?;
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     };
-    each(key_at(0)?);
+    let head = key_at(0)?;
+    if head != blaze_build::REIFY_SHIM_ITEM {
+        each(head);
+    }
     // The item's key (16) and the count of arguments (4); at no argument, nothing more.
     let args = u32_at(16)? as usize;
     let mut at = 20;

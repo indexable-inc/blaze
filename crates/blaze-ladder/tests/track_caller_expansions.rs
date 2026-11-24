@@ -295,6 +295,125 @@ fn a_derive_written_by_a_macro_is_placed_at_the_outermost_call() {
         "wrap!();", "/// A doc comment", "/// A doc comment")
 }
 
+/// tempo-primitives' `ConfigurableAccountConfigTests::malformed_rlp_header_check` shape: an
+/// attribute macro invoked inside `#[cfg_attr(..)]` (after a `#[derive(..)]`) that generates
+/// a module containing a fn calling a `#[track_caller]` fn. Before the fix, `invoked_at` only
+/// searched top-level `#[attr]` and `derive(..)` lists, refusing `#[cfg_attr(.., attr(..))]`
+/// with `PositionGap::NoItem`. rustc places the `Location` at the inner attribute's path.
+#[test]
+fn an_attribute_macro_in_cfg_attr_generating_a_module_is_placed_at_the_attr_path() {
+    check_expansion_site_calling(
+        "macro_rules! add_tests { attr($($a:tt)*) ($(#[$m:meta])* struct $name:ident;) => {\n\
+             struct $name;\n\
+             mod tests { pub fn sample() -> u8 { super::tracked(11) } }\n\
+         }; }\n\
+         /// A doc comment above the struct.\n\
+         #[derive(Other)]\n\
+         #[cfg_attr(all(), add_tests(rlp))]\n\
+         struct S;",
+        "tests::sample()", "add_tests(rlp))]", "/// A doc comment", "/// A doc comment")
+}
+
+/// Multi-item and nested `#[cfg_attr(..)]`, with an inactive `#[cfg_attr(any(), ..)]` above
+/// it: `invoked_at` evaluates each `cfg_attr` predicate against the crate's cfg and places
+/// the site at the active inner attribute's path, skipping the inactive branch.
+#[test]
+fn a_nested_cfg_attr_attribute_macro_skips_inactive_branches() {
+    check_expansion_site_calling(
+        "mod codecs {\n\
+             macro_rules! add_tests { attr($($a:tt)*) ($(#[$m:meta])* struct $name:ident;) => {\n\
+                 struct $name;\n\
+                 pub mod tests { pub fn sample() -> u8 { super::tracked(12) } }\n\
+             }; }\n\
+             pub(crate) use add_tests;\n\
+         }\n\
+         /// A doc comment above the struct.\n\
+         #[cfg_attr(any(), codecs::add_tests(inactive))]\n\
+         #[cfg_attr(all(), allow(unused), cfg_attr(all(), codecs::add_tests(active)))]\n\
+         struct S;",
+        "tests::sample()", "codecs::add_tests(active)))]", "/// A doc comment", "/// A doc comment")
+}
+
+/// A function-like macro generating `mod m { pub fn sample() { tracked(..); } }`, with a doc
+/// comment above the call: placed at the macro call's path, past the doc comment.
+#[test]
+fn a_macro_generated_module_fn_is_placed_at_the_call_past_doc_comments() {
+    check_expansion_site_calling(
+        "macro_rules! make_mod { () => { mod m { pub fn sample() -> u8 { super::tracked(13) } } }; }\n\
+         /// A doc comment above the call.\n\
+         make_mod!();",
+        "m::sample()", "make_mod!();", "/// A doc comment", "/// A doc comment")
+}
+
+/// Nested macro-in-macro generating `mod m { inner!(); }` -> `fn sample()`: placed at the
+/// outermost call's path, past doc comments and outer attributes.
+#[test]
+fn a_nested_macro_generated_module_fn_is_placed_at_the_outermost_call() {
+    check_expansion_site_calling(
+        "macro_rules! inner { () => { pub fn sample() -> u8 { super::tracked(14) } }; }\n\
+         macro_rules! outer { () => { mod m { inner!(); } }; }\n\
+         /// A doc comment above the outer call.\n\
+         #[allow(unused)]\n\
+         outer!();",
+        "m::sample()", "outer!();", "/// A doc comment", "/// A doc comment")
+}
+
+/// tempo-primitives' `Call` / `KeyAuthorization` / `TempoHeader` shape: a derive with an inert
+/// helper attribute precedes a later derive and a `#[cfg_attr(.., attr(..))]`, so `blaze-scope`
+/// stages the item through a `Keep` call (`macro_name == "derive"`). `Anchor::placement` must
+/// look through the transparent keep pass to the real attribute/derive call instead of matching
+/// `"derive"` (which either pointed at an earlier `#[derive]` or failed with `NoItem` when the
+/// first derive was itself inside `#[cfg_attr(..)]`).
+#[test]
+fn a_cfg_attr_attribute_after_a_derive_and_helper_skips_the_keep_stage() {
+    const TEXT: &str = concat!(
+        "#![feature(no_core, lang_items, rustc_attrs, decl_macro, macro_attr, macro_derive)]\n",
+        "#![no_core]\n#![no_main]\n#![allow(internal_features)]\n",
+        "#[lang = \"sized\"] trait Sized {}\n#[lang = \"copy\"] trait Copy {}\nimpl Copy for u8 {}\n",
+        "#[rustc_builtin_macro(Copy, attributes(helper))]\npub macro Copy($item:item) {}\n",
+        "#[track_caller] const fn tracked(_: u8) -> u8 { 7 }\n",
+        "macro_rules! Other { derive() ($($t:tt)*) => {}; }\n",
+        "macro_rules! add_tests { attr($($a:tt)*) ($(#[$m:meta])* struct $name:ident;) => { struct $name; mod tests { pub fn sample() -> u8 { super::tracked(15) } } }; }\n",
+        "/// A doc comment above the struct.\n",
+        "#[cfg_attr(all(), derive(Copy))]\n#[helper]\n#[cfg_attr(all(), derive(Other))]\n#[cfg_attr(all(), add_tests(rlp))]\nstruct S;\n",
+        "#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 { tests::sample() as i32 }\n",
+    );
+    const MOVED: &str = concat!(
+        "#![feature(no_core, lang_items, rustc_attrs, decl_macro, macro_attr, macro_derive)]\n",
+        "#![no_core]\n#![no_main]\n#![allow(internal_features)]\n",
+        "#[lang = \"sized\"] trait Sized {}\n#[lang = \"copy\"] trait Copy {}\nimpl Copy for u8 {}\n",
+        "#[rustc_builtin_macro(Copy, attributes(helper))]\npub macro Copy($item:item) {}\n",
+        "#[track_caller] const fn tracked(_: u8) -> u8 { 7 }\n",
+        "macro_rules! Other { derive() ($($t:tt)*) => {}; }\n",
+        "macro_rules! add_tests { attr($($a:tt)*) ($(#[$m:meta])* struct $name:ident;) => { struct $name; mod tests { pub fn sample() -> u8 { super::tracked(15) } } }; }\n",
+        "\n\n\n/// A doc comment above the struct.\n",
+        "#[cfg_attr(all(), derive(Copy))]\n#[helper]\n#[cfg_attr(all(), derive(Other))]\n#[cfg_attr(all(), add_tests(rlp))]\nstruct S;\n",
+        "#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 { tests::sample() as i32 }\n",
+    );
+    let expected = line_col(TEXT, "add_tests(rlp))]");
+    let first_derive = line_col(TEXT, "derive(Copy))]");
+    let (moved_line, moved_col) = line_col(MOVED, "add_tests(rlp))]");
+    with_programs(TEXT, move |names, whole, lazy| {
+        let key = (0..whole.fn_count())
+            .map(|i| whole.function(i))
+            .find(|f| f.body.is_some() && f.path.rsplit("::").next() == Some("sample"))
+            .expect("`sample`")
+            .key;
+        lazy.check_one(key).expect("check `sample`").expect("`sample` has a body");
+        for (label, front) in [("whole", whole as &dyn FrontEnd), ("records", &*lazy)] {
+            let row = front.function(front.fn_index(key).expect("owner row"));
+            let (i, _) = row.body.expect("live caller").0.exprs.iter().enumerate()
+                .find(|(_, e)| matches!(e, Expr::Call { .. })).expect("the call of `tracked`");
+            let site = front.caller_site(row.key, ExprId(i as u32))
+                .unwrap_or_else(|gap| panic!("{label}: `sample` through keep stage has no site: {gap}"));
+            let pos = front.source_position(site.item, site.offset);
+            assert_eq!(pos, Ok(expected), "{label}: placed at `add_tests(rlp)`");
+            assert_ne!(pos, Ok(first_derive), "{label}: not placed at the earlier derive");
+            assert_eq!(cold_position(names, MOVED, site.item, site.offset), Ok((moved_line, moved_col)), "{label}: cold site after edit");
+        }
+    });
+}
+
 // ---- a call written in a block of a body (tempo t1855d, 2026-11-21: 50 NOT RUN) ----
 //
 // Before: a call written in a body's block is in the names library's module text of that
@@ -505,4 +624,80 @@ fn a_derived_fns_location_is_the_derive_paths_line_and_column() {
     assert_eq!(u32::from(run_status("S::line()")), line, "the derive path's line");
     assert_eq!(u32::from(run_status("S::col()")), col, "the derive path's column");
     println!("TRACK CALLER EXPANSIONS: derive path at {line}:{col}");
+}
+
+/// Runtime `Location::caller()` check for:
+/// 1. an attribute macro inside `#[cfg_attr(..)]` generating a module with a fn calling a
+///    `#[track_caller]` fn (`ConfigurableAccountConfigTests` shape), and
+/// 2. a nested macro-in-macro generating a module + fn calling a `#[track_caller]` fn.
+#[test]
+fn a_cfg_attr_and_nested_macro_module_location_points_to_the_call_site() {
+    let head = "#![feature(no_core, lang_items, intrinsics, rustc_attrs, macro_attr, macro_derive)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+#[lang = \"sized\"] trait Sized {}
+#[lang = \"copy\"] trait Copy {}
+impl Copy for u32 {}
+
+#[lang = \"panic_location\"]
+struct Location<'a> { file: &'a str, line: u32, col: u32 }
+
+#[rustc_intrinsic]
+const fn caller_location() -> &'static Location<'static>;
+
+#[track_caller]
+fn here() -> &'static Location<'static> { caller_location() }
+
+macro_rules! Other { derive() ($($t:tt)*) => {}; }
+
+macro_rules! add_tests {
+    attr($($a:tt)*) ($(#[$m:meta])* struct $name:ident;) => {
+        struct $name;
+        mod attr_tests {
+            pub fn line() -> u32 { super::here().line }
+            pub fn col() -> u32 { super::here().col }
+        }
+    };
+}
+
+macro_rules! inner_mod_fn {
+    () => {
+        pub fn line() -> u32 { super::here().line }
+        pub fn col() -> u32 { super::here().col }
+    };
+}
+
+macro_rules! outer_mod {
+    () => {
+        mod nested_tests {
+            inner_mod_fn!();
+        }
+    };
+}
+
+/// Doc comment above cfg_attr struct.
+#[derive(Other)]
+#[cfg_attr(all(),   add_tests(rlp))]
+struct T;
+
+/// Doc comment above nested macro.
+    outer_mod!();
+";
+    let run = |expr: &str| -> u32 {
+        let text = format!("{head}\n#[unsafe(no_mangle)]\npub extern \"C\" fn main() -> i32 {{ {expr} as i32 }}\n");
+        let files = [SourceFile { path: ROOT, text: &text }];
+        u32::from(
+            run_with(&files, ROOT, None, FrontChoice::New(NEW), blaze_own::testing::heap().shared())
+                .unwrap_or_else(|e| panic!("TRACK CALLER EXPANSIONS ({expr}): refused: {e}")),
+        )
+    };
+    let (attr_line, attr_col) = line_col(head, "add_tests(rlp))]");
+    assert_eq!(run("attr_tests::line()"), attr_line, "cfg_attr attribute macro line");
+    assert_eq!(run("attr_tests::col()"), attr_col, "cfg_attr attribute macro col");
+    let (nested_line, nested_col) = line_col(head, "outer_mod!();");
+    assert_eq!(run("nested_tests::line()"), nested_line, "nested macro module line");
+    assert_eq!(run("nested_tests::col()"), nested_col, "nested macro module col");
+    println!("TRACK CALLER EXPANSIONS: cfg_attr at {attr_line}:{attr_col}, nested macro at {nested_line}:{nested_col}");
 }

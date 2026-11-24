@@ -14,8 +14,7 @@ use blaze_typeck::fixture::{Bb, Fx};
 use blaze_typeck::{ExprId, ItemKey, Name, PTy};
 
 use crate::callee_value_tests::{no_clauses, world_with};
-use crate::one_call::OneRule;
-use crate::oracle::{Finding, against};
+use crate::oracle::lower_checked;
 use crate::region_fixture::{self, Decls, FnHead, WithRegions};
 use crate::{AdtFacts, CalleeFacts, Facts, Lowered, Refusal, Region, Variance};
 
@@ -41,20 +40,14 @@ fn lines(lowered: Result<Lowered<blaze_own::Alloc<'static>>, Refusal>) -> Lines 
     Ok(out)
 }
 
-/// `root`, the body of `owner`, lowered under the old paths and under the one rule over
-/// `decls`' heads: `(old, one)` findings; the oracle's call findings printed, and none of the
-/// failing kinds ((a), (b)) allowed.
-fn both<F: Facts>(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, facts: &F, decls: &Decls) -> (Lines, Lines) {
+/// `root`, the body of `owner`, lowered under production (`OneRule` + `RegionSlots`) over
+/// `decls`' heads.
+fn one_rule<F: Facts>(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, facts: &F, decls: &Decls) -> Lines {
     let view = b.view(owner, root);
     let mut c = region_fixture::checked(fx, &view);
     let regions = decls.lay(fx.t.view(), &mut c.types);
     let with = WithRegions { base: facts, regions: &regions };
-    let (old, one, findings) = against::<_, _, OneRule>(&view, &c, &with, region_fixture::alloc());
-    for f in findings.iter() {
-        std::println!("oracle: {f:?}");
-        assert!(!matches!(f, Finding::OneAcceptsOldRefused { .. } | Finding::Fewer { .. }), "a failing oracle finding: {f:?}");
-    }
-    (lines(old), lines(one))
+    lines(lower_checked(&view, &c, &with, crate::Plant::None, region_fixture::alloc()))
 }
 
 fn found(got: &Lines) -> bool {
@@ -159,7 +152,7 @@ const B: Region = Region::Param(1);
 
 /// `fn f<'a, 'b: 'a>(x: Box<&'x S>) -> Box<&'y S> { x }`, with `'x`, `'y` the column `input`,
 /// `output`, under the one rule's grain, the box known as the box or not.
-fn boxed(input: Region, output: Region, known: bool) -> (Lines, Lines) {
+fn boxed(input: Region, output: Region, known: bool) -> Lines {
     let mut owner: Option<(ItemKey, ItemKey, PTy)> = None;
     let w = world_with(|fx, _st, rs, _unit| {
         let p0 = fx.param(0);
@@ -175,7 +168,7 @@ fn boxed(input: Region, output: Region, known: bool) -> (Lines, Lines) {
     let px = b.param("x");
     let lx = b.local(px);
     let root = b.block(&[], Some(lx));
-    both(&w.fx, &b, f, root, &Boxed { boxed: bx, known }, &decls)
+    one_rule(&w.fx, &b, f, root, &Boxed { boxed: bx, known }, &decls)
 }
 
 /// The Reference, "Subtyping and Variance": `Box<T>` is covariant in `T`. Under the slot grain
@@ -183,17 +176,17 @@ fn boxed(input: Region, output: Region, known: bool) -> (Lines, Lines) {
 /// NEGATIVE TWIN: `Box<&'a S>` to `Box<&'b S>` is "lifetime may not live long enough": found.
 /// CONTROL (rule 23): the same ADT not known as the box has no variance row, so its slot is
 /// related invariantly (a coarse `VarianceUnknown` note, the stricter answer): the positive
-/// is no longer clean. Prints each `(old, one)`.
+/// is no longer clean.
 #[test]
 fn a_box_is_covariant_under_the_slot_grain() {
-    let (old, one) = boxed(B, A, true);
-    std::println!("Box<&'b S> -> Box<&'a S>: old {old:?} one {one:?}");
+    let one = boxed(B, A, true);
+    std::println!("Box<&'b S> -> Box<&'a S>: {one:?}");
     assert!(clean(&one), "covariant: {one:?}");
-    let (old, one) = boxed(A, B, true);
-    std::println!("TWIN Box<&'a S> -> Box<&'b S>: old {old:?} one {one:?}");
+    let one = boxed(A, B, true);
+    std::println!("TWIN Box<&'a S> -> Box<&'b S>: {one:?}");
     assert!(found(&one), "TWIN: the reverse needs 'a: 'b: {one:?}");
-    let (old, one) = boxed(B, A, false);
-    std::println!("CONTROL, not known as the box: old {old:?} one {one:?}");
+    let one = boxed(B, A, false);
+    std::println!("CONTROL, not known as the box: {one:?}");
     assert!(!clean(&one), "CONTROL: unknown variance relates both ways: {one:?}");
 }
 
@@ -242,8 +235,8 @@ fn a_closure_result_holds_its_capture_by_the_signature() {
         lane.wide.add(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[w.st], output: w.unit, slots: &[] });
         lane.closure = Some(cl);
         lane.reqs = reqs;
-        let (old, one) = both(&w.fx, &b, f, root, &lane, lane.decls());
-        std::println!("late {late}, requirements {}: old {old:?} one {one:?}", reqs.len());
+        let one = one_rule(&w.fx, &b, f, root, &lane, lane.decls());
+        std::println!("late {late}, requirements {}: {one:?}", reqs.len());
         one
     };
     let early = run(false, &REQ);
@@ -293,8 +286,8 @@ fn the_capture_count_walk_is_bounded() {
         let root = b.block(&stmts, None);
         let mut lane = Lane::of(&w);
         lane.wide.add(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[w.st], output: w.unit, slots: &[] });
-        let (old, one) = both(&w.fx, &b, f, root, &lane, lane.decls());
-        std::println!("{closures} closures, nested {nested}: old {old:?} one {one:?}");
+        let one = one_rule(&w.fx, &b, f, root, &lane, lane.decls());
+        std::println!("{closures} closures, nested {nested}: {one:?}");
         one
     };
     let at_bound = run(MOST_BODY_NEST, true);

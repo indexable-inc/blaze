@@ -11,10 +11,9 @@
 //! `Drop`, which declare lifetimes, each callee's signature and its lifetime part) are gathered
 //! here, ONE home: [`gather_facts`], which the census (tests/flow_census.rs) calls too.
 //!
-//! The verdict is TRUSTED NOWHERE YET: on bstd, census 3 (flow.md) found 536 findings in 206
-//! of 1,756 lowered bodies, all false. The command files each finding as a NOTE and keeps
-//! saying "NOT checked: borrows" until that census reads 0 false findings (blaze-cli
-//! body_types.rs `BORROWS_ARE_ERRORS`).
+//! Borrow checking runs under `OneRule` (`blaze-borrow` + `RegionSlots`) and its findings are
+//! errors (`blaze-cli body_types.rs` `BORROWS_ARE_ERRORS = true`); any body whose borrows cannot
+//! be lowered whole files a refusal (`BORROWS_NOT_CHECKED`) so `check` reports it honestly.
 
 use blaze_flow::loans::{Access, conflicts, for_each_access};
 use blaze_flow::{BorrowFinding, BorrowKind, Flow, Loan, MoveFindingKind, MoveOut, Point, StmtKind, Value};
@@ -26,7 +25,7 @@ use blaze_typeck as tc;
 use core::alloc::Allocator;
 
 use super::body::Body;
-use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, copy_supertrait_read, file_borrow_reads, head_read, impl_read};
+use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, clauses_read, copy_supertrait_read, file_borrow_reads, head_read, impl_read};
 use super::check::{Records, answer_impls, eval_len};
 use super::reads::Read;
 use super::borrows_nested::{FlowOf, NestedFacts, Requirements, closure_flow_of, flow_of, nested_inner_first, nested_range, next_nested};
@@ -297,6 +296,8 @@ impl core::fmt::Display for BorrowRefused {
                     Some(External::Env) => "External::Env",
                     Some(External::Capture(_)) => "capture",
                     Some(External::Static) => "'static",
+                    Some(External::OwnerParam(_)) => "owner param",
+                    Some(External::Param(_)) => "type param",
                     None => "hidden",
                 };
                 write!(f, "[{} -> {}] ", endpoint(*from), endpoint(*into))?;
@@ -440,17 +441,25 @@ pub struct BorrowLangs {
     /// (`Copy: Clone`), read by [`Facts::copy_args`]'s provider (borrow_fields.rs).
     pub clone: Option<tc::ItemKey>,
     /// The traits whose every proof relates no region ([`Facts::trait_relates_nothing`]):
-    /// `Sized`, `MetaSized`, `PointeeSized` and `Destruct`. Each is `#[rustc_deny_explicit_impl]`
-    /// in core (library/core/src/marker.rs: no impl can be written), and its builtin rule reads
-    /// no region: sizedness ignores lifetimes, and `Destruct` "non-const bounds will always
-    /// hold for every type" (its doc there). A `[const] Destruct` in a const context asks a
-    /// const `Drop`, whose impl must be as generic as its type (E0366): no region either.
+    /// `Sized`, `MetaSized`, `PointeeSized`, `Destruct`, `DiscriminantKind`, and `Pointee`.
+    /// Each is `#[rustc_deny_explicit_impl]` in core (no impl can be written), and its builtin
+    /// rule reads no region.
     pub relates_nothing: [Option<tc::ItemKey>; 4],
+    /// The callable traits (`Fn`, `FnMut`, `FnOnce`), for [`Facts::is_fn_trait`].
+    pub fn_traits: [Option<tc::ItemKey>; 3],
+    /// `Deref`: for [`Facts::deref_impl`].
+    pub deref: Option<tc::ItemKey>,
+    /// Compiler-builtin traits whose associated types always have zero lifetimes:
+    /// `DiscriminantKind::Discriminant` and `Pointee::Metadata`.
+    pub discriminant_kind: Option<tc::ItemKey>,
+    pub pointee: Option<tc::ItemKey>,
 }
 
 impl BorrowLangs {
     pub fn of(index: &Index<'_>) -> BorrowLangs {
         let lang = |n: &str| index.lang(n).map(checker_of);
+        let discriminant_kind = lang("discriminant_kind");
+        let pointee = lang("pointee_trait");
         BorrowLangs {
             copy: lang("copy"),
             drop: lang("drop"),
@@ -459,6 +468,10 @@ impl BorrowLangs {
             phantom_data: lang("phantom_data"),
             clone: lang("clone"),
             relates_nothing: [lang("sized"), lang("meta_sized"), lang("pointee_sized"), lang("destruct")],
+            fn_traits: [lang("fn"), lang("fn_mut"), lang("fn_once")],
+            deref: lang("deref"),
+            discriminant_kind,
+            pointee,
         }
     }
 }
@@ -555,6 +568,15 @@ pub struct BorrowFacts<'a> {
     /// [`BorrowLangs::relates_nothing`], copied by the gather: the core lang items, read from
     /// the toolchain's library (its key covers them).
     relates_nothing: [Option<tc::ItemKey>; 4],
+    fn_traits: [Option<tc::ItemKey>; 3],
+    discriminant_kind: Option<tc::ItemKey>,
+    pointee: Option<tc::ItemKey>,
+    /// Unique `Deref` impl per ADT, sorted by ADT key (`Facts::deref_impl`).
+    deref_impls: AVec<'a, (u128, tc::ItemKey)>,
+    /// `(trait_key, assoc_name, assoc_item)` sorted by `(trait_key, assoc_name)` (`Facts::assoc_item`).
+    assoc_items: AVec<'a, (u128, tc::Name, tc::ItemKey)>,
+    /// Enclosing trait impl of `owner`, if `owner` is a method of `impl<..> Trait for SelfTy`.
+    owner_trait_impl: Option<blaze_flow_lower::OwnerTraitImpl>,
 }
 
 /// The facts the lowering asks: a body's gathered [`BorrowFacts`] with the head records' region
@@ -623,6 +645,12 @@ impl<'a> BorrowFacts<'a> {
             implied_state: None,
             constant_initializer: false,
             relates_nothing: [None; 4],
+            fn_traits: [None; 3],
+            discriminant_kind: None,
+            pointee: None,
+            deref_impls: AVec::new_in(alloc),
+            assoc_items: AVec::new_in(alloc),
+            owner_trait_impl: None,
         }
     }
 
@@ -752,6 +780,26 @@ impl Facts for ReadBy<'_, '_> {
     }
     fn trait_relates_nothing(&self, trait_: tc::ItemKey) -> bool {
         self.facts.relates_nothing.contains(&Some(trait_))
+            || Some(trait_) == self.facts.discriminant_kind
+            || Some(trait_) == self.facts.pointee
+    }
+    fn is_fn_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.fn_traits.contains(&Some(trait_))
+    }
+    fn assoc_item(&self, trait_: tc::ItemKey, name: tc::Name) -> Option<tc::ItemKey> {
+        let at = self.facts.assoc_items.binary_search_by_key(&(trait_.0, name), |&(k, n, _)| (k, n)).ok()?;
+        Some(self.facts.assoc_items[at].2)
+    }
+    fn owner_trait_impl(&self) -> Option<blaze_flow_lower::OwnerTraitImpl> {
+        self.facts.owner_trait_impl
+    }
+    fn deref_impl(&self, adt: tc::ItemKey) -> Option<tc::ItemKey> {
+        let at = self.facts.deref_impls.binary_search_by_key(&adt.0, |&(k, _)| k).ok()?;
+        Some(self.facts.deref_impls[at].1)
+    }
+    fn is_zero_slot_builtin_assoc(&self, trait_: tc::ItemKey, name: tc::Name) -> bool {
+        (Some(trait_) == self.facts.discriminant_kind && name == tc::Name::of("Discriminant"))
+            || (Some(trait_) == self.facts.pointee && name == tc::Name::of("Metadata"))
     }
     fn adt_variances(&self, adt: tc::ItemKey) -> Option<&[blaze_flow_lower::Variance]> {
         let at = self.facts.variance_at.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
@@ -1237,14 +1285,8 @@ pub enum FactsPlant {
     /// `Facts::alias_lifetimes` answer nothing): the one call rule refuses each call whose
     /// contract holds an alias or a trait reference by `Count`, and each selected impl read
     /// for an associated value by `HeadUnread`, as before the counts reached the flows
-    /// (borrows_nested.rs `NestedFacts`). Only the census asks with it (the old paths read
-    /// neither count).
+    /// (borrows_nested.rs `NestedFacts`).
     NoTraitCounts,
-    /// NOT a fact: every fact gathered as `None` does, and the census runs its one-rule side
-    /// without the closure-argument tie (blaze-flow-lower `CensusRule::OneUntied`, one_call.rs
-    /// `tie_closure_args`), so `x.map(|s| s.as_str())` is (b) again and its twin returned as
-    /// `'static` is accepted. Only the census asks with it (front2 call_census.rs `census_of`).
-    ClosureArgsUntied,
 }
 
 /// [`gather_facts`] with one provider turned off ([`FactsPlant`]).
@@ -1260,16 +1302,26 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     let mut g = BorrowFacts::new_in(alloc);
     g.fn_binders = plant != FactsPlant::FnBindersFree;
     g.relates_nothing = langs.relates_nothing;
-    // A `const` or `static` item's body is a constant initializer: its extending borrows'
-    // temporaries live for `'static` (the Reference, "Temporary lifetime extension").
-    g.constant_initializer = r.keys.library_in(r.names, owner).is_some_and(|lib| {
-        matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Const { .. } | blaze_surface::ItemDetail::Static { .. }))
-    });
-    // The owner's `T: Copy` clauses (own and inherited), including transitive supertraits
-    // (`T: Tr` where `trait Tr: Copy`, e.g. `Planted<P>: Copy`, `ArbitraryInt: Copy`): a value
-    // of such a parameter is copied, never moved (the Reference, "Copy types"). Each inspected
-    // trait's direct `Self` supertraits are filed as a `BorrowHead` read row (rule 21).
-    if let Some(copy) = langs.copy {
+    g.fn_traits = langs.fn_traits;
+    g.discriminant_kind = langs.discriminant_kind;
+    g.pointee = langs.pointee;
+    // A `const` or `static` item's body (module-level, local in a fn/macro, associated, or
+    // anonymous) is a constant initializer: its extending borrows' temporaries live for `'static`
+    // (the Reference, "Temporary lifetime extension").
+    g.constant_initializer = matches!(
+        super::by_origin::kind_of_key(r.names, &*r.keys, owner),
+        Ok(
+            super::by_origin::KeyKind::Item(super::by_origin::ItemKind::Const(_) | super::by_origin::ItemKind::Static(_))
+                | super::by_origin::KeyKind::MemberConst { .. }
+                | super::by_origin::KeyKind::Anon { .. }
+        )
+    );
+    // The owner's `T: Copy` and transitive supertrait `T: 'static` clauses (own and inherited),
+    // including transitive supertraits (`T: Tr` where `trait Tr: Copy` or `trait Tr: 'static`,
+    // e.g. `Planted<P>: Copy`, `Relation: 'static`, `Prefab: 'static`). Each inspected trait's
+    // direct `Self` supertraits and `Self: 'static` flag are filed as a `BorrowHead` read row (rule 21).
+    let mut param_static: AVec<'a, u32> = AVec::new_in(alloc);
+    {
         let mut param_traits: AVec<'a, (u32, tc::ItemKey)> = AVec::new_in(alloc);
         if let Some(p) = r.store.preds.get(&owner) {
             let tys = r.store.tys.view();
@@ -1279,7 +1331,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                     && let Some(&first) = list.first()
                     && let Ok(tc::PNode::Param(i)) = tys.node(first)
                 {
-                    if trait_ == copy {
+                    if Some(trait_) == langs.copy {
                         g.param_copy.push(i);
                     } else {
                         param_traits.push((i, trait_));
@@ -1293,17 +1345,21 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let mut direct: AVec<'a, u128> = AVec::new_in(alloc);
             let mut recorded: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
             for &(param, start_trait) in param_traits.iter() {
-                if g.param_copy.scan_for(&param).is_some() {
+                let mut found_copy = g.param_copy.scan_for(&param).is_some();
+                let mut found_static = param_static.scan_for(&param).is_some();
+                if found_copy && found_static {
                     continue;
                 }
                 visited.clear();
                 stack.clear();
                 stack.push(start_trait);
-                let mut found_copy = false;
                 while let Some(t) = stack.pop() {
-                    if t == copy {
+                    if Some(t) == langs.copy {
                         found_copy = true;
-                        break;
+                        if found_static {
+                            break;
+                        }
+                        continue;
                     }
                     if visited.scan_for(&t).is_some() || visited.len() >= 64 {
                         continue;
@@ -1315,22 +1371,35 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                         ensure_one(r, Want::Members(lib));
                     }
                     direct.clear();
+                    let mut self_static = false;
                     if let Some(def) = r.store.trait_defs.get(&t) {
                         let tys = r.store.tys.view();
                         for sc in def.supertraits.iter() {
-                            if let tc::PClause::Trait { trait_: sup, args } = *sc
-                                && let Ok(list) = tys.list(args)
-                                && let Some(&first) = list.first()
-                                && matches!(tys.node(first), Ok(tc::PNode::Param(0)))
-                            {
-                                direct.push(sup.0);
+                            match *sc {
+                                tc::PClause::Trait { trait_: sup, args }
+                                    if tys.list(args).ok().and_then(|l| l.first().copied()).is_some_and(|first| matches!(tys.node(first), Ok(tc::PNode::Param(0)))) =>
+                                {
+                                    direct.push(sup.0);
+                                }
+                                tc::PClause::TypeOutlives { ty, region: tc::regions::Region::Static }
+                                    if matches!(tys.node(ty), Ok(tc::PNode::Param(0))) =>
+                                {
+                                    self_static = true;
+                                }
+                                _ => {}
                             }
                         }
                         direct.sort_unstable();
                         direct.dedup();
                         if recorded.scan_for(&t).is_none() {
                             recorded.push(t);
-                            g.reads.push(copy_supertrait_read(t.0, Some(&direct)));
+                            g.reads.push(copy_supertrait_read(t.0, Some((&direct, self_static))));
+                        }
+                        if self_static {
+                            found_static = true;
+                        }
+                        if found_copy && found_static {
+                            break;
                         }
                         for &sup in direct.iter() {
                             stack.push(tc::ItemKey(sup));
@@ -1343,15 +1412,267 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 if found_copy {
                     g.param_copy.push(param);
                 }
+                if found_static {
+                    param_static.push(param);
+                }
             }
         }
         g.param_copy.sort_unstable();
         g.param_copy.dedup();
+        param_static.sort_unstable();
+        param_static.dedup();
+    }
+    // Ensure callees, FnDef value items, selected impls, and supertrait heads BEFORE collecting
+    // ADTs so every ADT named inside a signature, selected impl header/assoc value, or supertrait
+    // clause gets its `AdtFacts` and variances (preventing `Count/Contract/AdtLifetimes`).
+    let mut items: AVec<'a, u128> = AVec::new_in(alloc);
+    for k in c.callees.column::<1>().iter() {
+        items.push(k.0);
+    }
+    let mut opaques: AVec<'a, u128> = AVec::new_in(alloc);
+    let mut traits: AVec<'a, u128> = AVec::new_in(alloc);
+    for n in c.types.view().nodes() {
+        match n {
+            tc::PNode::FnDef(k, _) => items.push(k.0),
+            tc::PNode::Opaque(k, _) => opaques.push(k.0),
+            tc::PNode::ExTrait(k, _) | tc::PNode::ExProj { trait_: k, .. } | tc::PNode::Alias { trait_: k, .. } => traits.push(k.0),
+            _ => {}
+        }
+    }
+    items.push(owner.0);
+    items.sort_unstable();
+    items.dedup();
+    opaques.sort_unstable();
+    opaques.dedup();
+    for &k in items.iter() {
+        let key = tc::ItemKey(k);
+        if !r.store.fns.contains_key(&key) && !r.store.ctors.contains_key(&key) {
+            match r.keys.origin(key).cloned() {
+                Some(Origin::Item(lib)) => {
+                    match r.names.detail_of(lib) {
+                        Some(blaze_surface::ItemDetail::Variant { .. }) => {
+                            if let Some((parent, _)) = r.names.variant_of(lib) {
+                                ensure_one(r, Want::Adt(parent));
+                            }
+                        }
+                        Some(blaze_surface::ItemDetail::Struct | blaze_surface::ItemDetail::Enum | blaze_surface::ItemDetail::Union) => {
+                            ensure_one(r, Want::Adt(lib));
+                        }
+                        _ => {
+                            ensure_one(r, Want::Fn(lib));
+                        }
+                    }
+                }
+                Some(Origin::Member { container, kind, .. }) => {
+                    if let Some(lib) = r.keys.library_in(r.names, container) {
+                        match r.names.detail_of(lib) {
+                            Some(blaze_surface::ItemDetail::Impl) => {
+                                container_head(r, lib, false);
+                            }
+                            Some(blaze_surface::ItemDetail::Trait) => {
+                                container_head(r, lib, true);
+                            }
+                            Some(blaze_surface::ItemDetail::Struct | blaze_surface::ItemDetail::Enum | blaze_surface::ItemDetail::Union)
+                                if kind == super::keys::MemberKind::Ctor =>
+                            {
+                                ensure_one(r, Want::Adt(lib));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(w) = member_fn_want(r.names, &*r.keys, key) {
+                        ensure_one(r, w);
+                    }
+                }
+                None => {}
+            }
+        }
+        if let Some(f) = r.store.fns.get(&key) {
+            let tys = r.store.tys.view();
+            let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(tys.node(t), Ok(tc::PNode::Ref(..))));
+            let callee = CalleeFacts { writes_lifetimes: f.qualifiers.writes_lifetimes(), self_ref };
+            g.callees.push((k, callee));
+        } else if r.store.ctors.contains_key(&key) {
+            g.callees.push((k, CalleeFacts { writes_lifetimes: true, self_ref: false }));
+        } else {
+            g.reads.push(head_read(k, HeadAnswer::NotMade));
+        }
+    }
+    let mut selected: AVec<'a, (u128, Option<tc::Name>)> = AVec::new_in(alloc);
+    if let Some(Origin::Member { container, .. }) = r.keys.origin(owner).cloned()
+        && let Some(ih) = r.store.impls.get(&container)
+        && let Some(tr) = ih.trait_
+    {
+        let tys = r.store.tys.view();
+        let self_shape = match tys.node(ih.self_ty) {
+            Ok(tc::PNode::Adt(k, _)) => Some(blaze_flow_lower::SelfShape::Adt(k)),
+            Ok(tc::PNode::Ref(m, _)) => Some(blaze_flow_lower::SelfShape::Ref(m)),
+            Ok(tc::PNode::Tuple(l)) => tys.list(l).ok().and_then(|ks| u32::try_from(ks.len()).ok()).map(blaze_flow_lower::SelfShape::Tuple),
+            _ => None,
+        };
+        if let Some(self_shape) = self_shape {
+            g.owner_trait_impl = Some(blaze_flow_lower::OwnerTraitImpl { imp: container, trait_: tr, generics: ih.generics, self_shape });
+            traits.push(tr.0);
+            selected.push((container.0, None));
+        }
+    }
+    for p in c.selected.iter() {
+        traits.push(p.trait_.0);
+        if let tc::Selected::Impl { imp, .. } = p.selected {
+            selected.push((imp.0, p.name));
+        }
+    }
+    if let Some(p) = r.store.preds.get(&owner) {
+        for cl in p.clauses.iter() {
+            if let tc::PClause::Trait { trait_, .. } | tc::PClause::Projection { trait_, .. } = *cl {
+                traits.push(trait_.0);
+            }
+        }
+    }
+    selected.sort_unstable_by_key(|&(k, n)| (k, n.is_some(), n.map_or(0, |n| n.0)));
+    selected.dedup();
+    let mut last_impl = None;
+    for &(k, _) in selected.iter() {
+        if last_impl == Some(k) {
+            continue;
+        }
+        last_impl = Some(k);
+        if let Some(lib) = r.keys.library_in(r.names, tc::ItemKey(k))
+            && matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Impl))
+        {
+            container_head(r, lib, false);
+        }
+    }
+    // Ensure trait heads transitively through supertraits so `regions.clauses(trait_)` is loaded
+    // for supertrait elaboration in `blaze-borrow`.
+    {
+        let mut ti = 0usize;
+        traits.sort_unstable();
+        traits.dedup();
+        while ti < traits.len() && traits.len() < 256 {
+            let tk = tc::ItemKey(traits[ti]);
+            ti += 1;
+            if let Some(lib) = r.keys.library_in(r.names, tk)
+                && matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Trait))
+            {
+                container_head(r, lib, true);
+            }
+            if let Some(def) = r.store.trait_defs.get(&tk) {
+                for sc in def.supertraits.iter() {
+                    if let tc::PClause::Trait { trait_: sup, .. } | tc::PClause::Projection { trait_: sup, .. } = *sc
+                        && traits.scan_for(&sup.0).is_none()
+                    {
+                        traits.push(sup.0);
+                    }
+                }
+                for a in def.assoc.iter() {
+                    g.assoc_items.push((tk.0, a.name, a.item));
+                    if let Some(ap) = r.store.preds.get(&a.item) {
+                        for ac in ap.clauses.iter() {
+                            if let tc::PClause::Trait { trait_: sup, .. } | tc::PClause::Projection { trait_: sup, .. } = *ac
+                                && traits.scan_for(&sup.0).is_none()
+                            {
+                                traits.push(sup.0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        traits.sort_unstable();
+        traits.dedup();
+        g.assoc_items.sort_unstable_by_key(|&(k, n, _)| (k, n));
+        g.assoc_items.dedup_by_key(|&mut (k, n, _)| (k, n));
     }
     let mut adts: AVec<'a, u128> = AVec::new_in(alloc);
     for n in c.types.view().nodes() {
         if let tc::PNode::Adt(k, _) = n {
             adts.push(k.0);
+        }
+    }
+    // Also collect every ADT mentioned in selected impl headers/assoc values/where-clauses,
+    // callee signatures/clauses, opaque clauses, and trait supertrait clauses.
+    {
+        let reader = r.store.regions.reader(alloc);
+        let tys = r.store.tys.view();
+        let mut walk_ty = |root: tc::PTy| {
+            let mut st: AVec<'a, tc::PTy> = AVec::new_in(alloc);
+            st.push(root);
+            let mut steps = 0u32;
+            while let Some(t) = st.pop() {
+                steps += 1;
+                if steps > 4096 {
+                    break;
+                }
+                let Ok(node) = tys.node(t) else { continue };
+                if let tc::PNode::Adt(a, _) = node {
+                    adts.push(a.0);
+                }
+                if let Ok((list, last)) = super::adt_variance::children(tys, t, node) {
+                    st.extend_from_slice(list);
+                    if let Some(c) = last {
+                        st.push(c);
+                    }
+                }
+            }
+        };
+        for &(k, name) in selected.iter() {
+            let ik = tc::ItemKey(k);
+            if let Ok((self_col, trait_col)) = reader.impl_header(ik) {
+                walk_ty(self_col.ty());
+                if let Some(tc) = trait_col {
+                    walk_ty(tc.ty());
+                }
+            }
+            if let Some(n) = name
+                && let Ok(v) = reader.impl_assoc(ik, n)
+            {
+                walk_ty(v.ty());
+            }
+            if let Some(ih) = r.store.impls.get(&ik) {
+                for &(an, _) in ih.assoc.iter() {
+                    if let Ok(v) = reader.impl_assoc(ik, an) {
+                        walk_ty(v.ty());
+                    }
+                }
+            }
+            if let Ok(cls) = reader.clauses(ik) {
+                for cv in cls {
+                    walk_ty(cv.col.ty());
+                }
+            }
+        }
+        for &k in items.iter() {
+            let ik = tc::ItemKey(k);
+            if let Ok(sig) = reader.sig(ik) {
+                walk_ty(sig.col.ty());
+            }
+            if let Ok(cls) = reader.clauses(ik) {
+                for cv in cls {
+                    walk_ty(cv.col.ty());
+                }
+            }
+        }
+        for &k in opaques.iter() {
+            if let Ok(cls) = reader.clauses(tc::ItemKey(k)) {
+                for cv in cls {
+                    walk_ty(cv.col.ty());
+                }
+            }
+        }
+        for &k in traits.iter() {
+            if let Ok(cls) = reader.clauses(tc::ItemKey(k)) {
+                for cv in cls {
+                    walk_ty(cv.col.ty());
+                }
+            }
+        }
+        for &(_, _, a_item) in g.assoc_items.iter() {
+            if let Ok(cls) = reader.clauses(a_item) {
+                for cv in cls {
+                    walk_ty(cv.col.ty());
+                }
+            }
         }
     }
     adts.sort_unstable();
@@ -1489,10 +1810,24 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             g.variance_at.push((k, lo, hi));
         }
         let copy_taken = copy.unwrap_or(false);
-        let (needs_drop, drop_need) = fields::drop_facts_of(r, langs, key, drop_impl, &mut g.drop_need, &mut g.reads, alloc);
+        let adt_uncond_copy = copy_need.is_some_and(|(start, len)| {
+            let s = start as usize;
+            let e = s.saturating_add(len as usize);
+            g.copy_need.get(s..e).is_some_and(|need| need.iter().all(|&b| !b))
+        });
+        let (needs_drop, drop_need) = fields::drop_facts_of(r, langs, key, drop_impl, adt_uncond_copy, &mut g.drop_need, &mut g.reads, alloc);
         if let Some((start, len)) = drop_need {
             g.drop_args.push((k, start, len));
         }
+        let deref_impl = if let Some(deref_tr) = langs.deref
+            && let Some(impls) = answer_impls(r, deref_tr, tc::Shape::Adt(key))
+            && let &[imp] = &impls[..]
+        {
+            g.deref_impls.push((k, imp));
+            Some(imp.0)
+        } else {
+            None
+        };
         let facts = AdtFacts {
             copy: copy_taken,
             drop_impl: drop_impl.unwrap_or(false),
@@ -1544,6 +1879,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 region_list: &regions.list,
                 copy_args,
                 drop_args,
+                deref_impl,
                 variances,
             },
         );
@@ -1552,81 +1888,25 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             g.field_regions.insert(key, RegionFields { first_variant: variants_from, variant_count, first_field: fields_from, regions });
         }
     }
-    let mut items: AVec<'a, u128> = AVec::new_in(alloc);
-    for k in c.callees.column::<1>().iter() {
-        items.push(k.0);
+    let target_name = tc::Name::of("Target");
+    let prev_selected_len = selected.len();
+    for &(_, imp) in g.deref_impls.iter() {
+        selected.push((imp.0, Some(target_name)));
     }
-    items.push(owner.0);
-    items.sort_unstable();
-    items.dedup();
-    for &k in items.iter() {
-        // A callee's head is made when something asks: ask, so its regions are filed and not
-        // taken as unknown (a call of unknown signature is related coarsely, and cannot say
-        // that the callee demands `'static`). A member is made with its impl or its trait.
-        let key = tc::ItemKey(k);
-        if !r.store.fns.contains_key(&key) {
-            match r.keys.origin(key).cloned() {
-                Some(Origin::Item(lib)) => {
-                    ensure_one(r, Want::Fn(lib));
-                }
-                Some(Origin::Member { container, .. }) => {
-                    // The container asked by what it is, never tried as one kind and then the
-                    // other: a struct's ctor (made with the struct's head) and an anonymous
-                    // constant (a member of its module) have no container head to make, and a
-                    // refused ask of one is a seed error that refuses a seeded body (lane FM).
-                    if let Some(lib) = r.keys.library_in(r.names, container) {
-                        match r.names.detail_of(lib) {
-                            Some(blaze_surface::ItemDetail::Impl) => {
-                                container_head(r, lib, false);
-                            }
-                            Some(blaze_surface::ItemDetail::Trait) => {
-                                container_head(r, lib, true);
-                            }
-                            _ => {}
-                        }
-                    }
-                    // An impl's fn's signature is its own want (heads.rs `Want::MemberFn`).
-                    if let Some(w) = member_fn_want(r.names, &*r.keys, key) {
-                        ensure_one(r, w);
-                    }
-                }
-                None => {}
+    if selected.len() != prev_selected_len {
+        selected.sort_unstable_by_key(|&(k, n)| (k, n.is_some(), n.map_or(0, |n| n.0)));
+        selected.dedup();
+        let mut last_impl = None;
+        for &(k, _) in selected.iter() {
+            if last_impl == Some(k) {
+                continue;
             }
-        }
-        let Some(f) = r.store.fns.get(&key) else {
-            g.reads.push(head_read(k, HeadAnswer::NotMade));
-            continue;
-        };
-        let tys = r.store.tys.view();
-        let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(tys.node(t), Ok(tc::PNode::Ref(..))));
-        let callee = CalleeFacts { writes_lifetimes: f.qualifiers.writes_lifetimes(), self_ref };
-        g.callees.push((k, callee));
-    }
-    // Each impl a projection of the body selected (`c.selected`: a call's `T::Out` at the
-    // impl's `type Out`, blaze-flow-lower impl_call.rs), with the associated types read of it:
-    // its head made now (as a callee's above), so its regions are filed and its row below
-    // says them, not `NoHead`.
-    // Every impl the body's record selected: for a projection (`Some(name)`: the associated
-    // type is read) and for a trait bound (`None`: its header and where-clauses are related at
-    // the call, blaze-borrow relate.rs `impl_where`), so its head is made and its row filed.
-    let mut selected: AVec<'a, (u128, Option<tc::Name>)> = AVec::new_in(alloc);
-    for p in c.selected.iter() {
-        if let tc::Selected::Impl { imp, .. } = p.selected {
-            selected.push((imp.0, p.name));
-        }
-    }
-    selected.sort_unstable_by_key(|&(k, n)| (k, n.is_some(), n.map_or(0, |n| n.0)));
-    selected.dedup();
-    let mut last_impl = None;
-    for &(k, _) in selected.iter() {
-        if last_impl == Some(k) {
-            continue;
-        }
-        last_impl = Some(k);
-        if let Some(lib) = r.keys.library_in(r.names, tc::ItemKey(k))
-            && matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Impl))
-        {
-            container_head(r, lib, false);
+            last_impl = Some(k);
+            if let Some(lib) = r.keys.library_in(r.names, tc::ItemKey(k))
+                && matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Impl))
+            {
+                container_head(r, lib, false);
+            }
         }
     }
     // From here the records are only read. Each head's regions (D148) are its head record's,
@@ -1635,7 +1915,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     // refused, an old form) is named by the lowering at the call that needs them
     // (`Form::RegionsUnread`), never related under a guess.
     {
-        let regions = r.store.regions.reader(r.store.tys.alloc());
+        let regions = r.store.regions.reader(alloc);
         // Each head's row (rule 21): its callee facts and its signature column as read, or
         // why it was not, so a lifetime-only edit of a callee's signature moves the body's
         // read list (the regions digest moves with it: head_record.rs `regions_digest`).
@@ -1657,7 +1937,24 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 }
                 i += 1;
             }
+            if let Some(ih) = r.store.impls.get(&tc::ItemKey(imp)) {
+                for &(an, _) in ih.assoc.iter() {
+                    if names.scan_for(&an).is_none() {
+                        names.push(an);
+                    }
+                }
+                names.sort_unstable_by_key(|n| n.0);
+            }
             g.reads.push(impl_read(imp, &names, &regions));
+        }
+        for &k in traits.iter() {
+            g.reads.push(clauses_read(k, &regions));
+        }
+        for &k in opaques.iter() {
+            g.reads.push(clauses_read(k, &regions));
+        }
+        for &(_, _, a_item) in g.assoc_items.iter() {
+            g.reads.push(clauses_read(a_item.0, &regions));
         }
         // The generic shape of each head whose signature regions are filed: where its type
         // parameters stand among its positions (blaze-flow-lower generic_call.rs), counted by
@@ -1693,7 +1990,8 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let key = tc::ItemKey(k);
             let head = r.store.fns.get(&key);
             let clauses = r.store.preds.get(&key).map(|p| &p.clauses[..]);
-            g.calls.gather(k, head, clauses, r.store.tys.view(), &regions, future, alloc);
+            let extra_static: &[u32] = if k == owner.0 { &param_static } else { &[] };
+            g.calls.gather(k, head, clauses, r.store.tys.view(), &regions, future, extra_static, alloc);
             g.ties.gather(k, head, clauses, r.store.tys.view(), &regions);
         }
         // Each trait object's principal: whether it declares a lifetime decides how an unsized
@@ -1805,7 +2103,7 @@ fn adt_variances_in(table: &super::adt_facts::AdtFactsTable<'_>, key: u128, list
 fn owner_implied_input<'n, 'a, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: tc::ItemKey, alloc: Alloc<'a>) -> super::adt_facts::ImpliedInput<'a> {
     let mut input = super::adt_facts::ImpliedInput::new_in(alloc);
     let arity = super::types::HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names };
-    let reader = r.store.regions.reader(r.store.tys.alloc());
+    let reader = r.store.regions.reader(alloc);
     let tys = r.store.tys.view();
     match reader.sig(owner) {
         Ok(sig) => input.piece(owner.0, tys, &arity, sig.col.ty(), sig.col.as_slice()),
@@ -1924,7 +2222,7 @@ fn adt_facts_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, roots: &
     }
     // Each laid with its fields' columns, as the head record filed them.
     let arity = super::types::HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names };
-    let reader = r.store.regions.reader(r.store.tys.alloc());
+    let reader = r.store.regions.reader(alloc);
     let tys = r.store.tys.view();
     let mut input = AdtFactsInput::new_in(alloc);
     for &(k, unmade) in seen.iter() {
@@ -2109,7 +2407,7 @@ pub(super) fn witness_and_decide<'n, 'a, S: NamesSource<'n>>(
         reads.extend_from_slice(facts.reads());
         reads.extend_from_slice(facts.calls.reads());
         reads.extend_from_slice(facts.ties.reads());
-        let reader = r.store.regions.reader(r.store.tys.alloc());
+        let reader = r.store.regions.reader(alloc);
         let lowering = facts.read_by(&reader, r.store.tys.view());
         if let Ok(tys) = body.tys.view(&r.store.tys) {
             let view = body.typeck.view(tys);
@@ -2143,7 +2441,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
     // Every fn's signature regions are its head record's, read in place (D148): the lowering's
     // facts are the gathered ones with the head records' reader. The control
     // (`FactsPlant::NoAliases`) gives none: every call carrying a lifetime is then refused.
-    let reader = r.store.regions.reader(r.store.tys.alloc());
+    let reader = r.store.regions.reader(alloc);
     let regions: &dyn RegionFacts = if plant == FactsPlant::NoAliases { &NoRegions } else { &reader };
     let lowering = facts.read_by(regions, r.store.tys.view());
     if let Some(out) = show.as_deref_mut() {

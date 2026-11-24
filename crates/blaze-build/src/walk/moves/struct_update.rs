@@ -190,6 +190,12 @@ impl<'x, A: Allocator + Copy> Walk<'x, '_, '_, A> {
                 // Unreachable code: nothing runs, nothing is held (`Task::Spill` held nothing).
                 return Ok(());
             }
+            let t = self.adjusted_ty(base)?;
+            let g = self.ground_ty(t).map_err(|error| Self::ty_err(base, error))?;
+            if !self.needs_drop(g).map_err(|error| Self::ty_err(base, error))? {
+                // A temporary whose own type needs no drop (e.g. `ManuallyDrop<T>`) was never held.
+                return Ok(());
+            }
             return Err(unsupported(e, "a struct update moving a field out of a temporary base not held to its statement's end (an extended temporary)"));
         };
         let mask = match self.scope_pats[i] {

@@ -212,7 +212,10 @@ mod scratch_tests;
 mod sota;
 pub mod table_gen;
 mod tier;
-pub use sota::{Sota, emit_sota_record_measured};
+pub use sota::{
+    CallMode, CompiledModuleFn, ModuleFn, Sota, SotaModuleOpts, SotaModuleOut, compile_module_a64,
+    emit_sota_record_measured,
+};
 pub use tier::Reference;
 pub use asm::AsmToken;
 

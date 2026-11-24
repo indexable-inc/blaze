@@ -77,7 +77,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// (a copy moves nothing, and its build does not change).
     pub(in crate::walk) fn owned_field_scrutinee(&mut self, scrutinee: ExprId) -> Result<Option<PatId>, BuildError> {
         let Some(x) = self.field_chain_local(scrutinee)? else { return Ok(None) };
-        if self.owned.get(x.ix()).copied().flatten().is_none() {
+        if !self.local_is_owned(x) {
             return Ok(None);
         }
         let t = self.adjusted_ty(scrutinee)?;

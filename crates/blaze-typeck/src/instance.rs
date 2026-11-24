@@ -914,9 +914,51 @@ pub(crate) fn select_owning<W: World>(
     args: &[PTy],
     ground: &mut PortableTys<'_>,
 ) -> Result<Option<(ItemKey, List)>, ResolveError> {
-    let Some(h) = holding_owning(cx, reads, own, trait_, args, ground)? else { return Ok(None) };
+    let Some(h) = holding_owning(cx, reads, own, trait_, args, ground, false)? else { return Ok(None) };
     let (imp, impl_args) = (h.impls[h.chosen], h.args[h.chosen]);
     match export_list(&mut cx.exporter(), impl_args, ground, 0)? {
+        Some(l) => Ok(Some((imp, l))),
+        None => Err(ResolveError::NotGround { item: imp }),
+    }
+}
+
+/// [`select_owning`] preserving the caller's own type and const parameters (`Keep::Owner`):
+/// for projections whose self type is a concrete constructor carrying the body's parameters
+/// (e.g. `<Windows<'a, T> as Iterator>::Item`), assuming `owner`'s where-clauses.
+pub(crate) fn select_owning_owner<W: World>(
+    cx: &mut InferCtx<'_>,
+    reads: &mut Reads<'_, '_, W>,
+    owner: ItemKey,
+    own: Option<OwnClosures<'_>>,
+    trait_: ItemKey,
+    args: &[PTy],
+    ground: &mut PortableTys<'_>,
+) -> Result<Option<(ItemKey, List)>, ResolveError> {
+    if let Ok(preds) = reads.predicates(owner) {
+        for clause in preds.clauses {
+            let goal = match *clause {
+                PClause::Trait { trait_, args } => Goal::Trait {
+                    trait_,
+                    args: import_list(cx, &mut NoClosures, preds.types, args, &[], 0)?,
+                },
+                PClause::Projection { trait_, args, name, term } => Goal::Projection {
+                    trait_,
+                    args: import_list(cx, &mut NoClosures, preds.types, args, &[], 0)?,
+                    name,
+                    term: import(cx, &mut NoClosures, preds.types, term, &[], 0)?,
+                },
+                PClause::Const { cond, args } => Goal::ConstHolds {
+                    cond,
+                    args: import_list(cx, &mut NoClosures, preds.types, args, &[], 0)?,
+                },
+                PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => continue,
+            };
+            cx.assume(goal)?;
+        }
+    }
+    let Some(h) = holding_owning(cx, reads, own, trait_, args, ground, true)? else { return Ok(None) };
+    let (imp, impl_args) = (h.impls[h.chosen], h.args[h.chosen]);
+    match export_list_as(&mut cx.exporter(), impl_args, ground, Keep::Owner, 0)? {
         Some(l) => Ok(Some((imp, l))),
         None => Err(ResolveError::NotGround { item: imp }),
     }
@@ -933,7 +975,8 @@ struct Holding<'x> {
     chosen: usize,
 }
 
-/// [`Holding`] at the ground `args` (self first, in `ground`); `None` when no impl holds.
+/// [`Holding`] at `args` (self first, in `ground`); `None` when no impl holds. When
+/// `allow_param` is true, a `TyView::Param` self type searches blanket impls (`Shape::Param`).
 fn holding_owning<'x, W: World>(
     cx: &mut InferCtx<'x>,
     reads: &mut Reads<'_, '_, W>,
@@ -941,6 +984,7 @@ fn holding_owning<'x, W: World>(
     trait_: ItemKey,
     args: &[PTy],
     ground: &mut PortableTys<'_>,
+    allow_param: bool,
 ) -> Result<Option<Holding<'x>>, ResolveError> {
     if args.is_empty() {
         return Err(ResolveError::NotGround { item: trait_ });
@@ -954,15 +998,26 @@ fn holding_owning<'x, W: World>(
     }
     let goal_args = cx.mk_list(&tys)?;
     let self_ty = cx.list_get(goal_args, 0);
-    let Some(shape) = shape_of(cx.view(self_ty), cx) else { return Err(ResolveError::NotGround { item: trait_ }) };
+    let shape = match shape_of(cx.view(self_ty), cx) {
+        Some(s) => Some(s),
+        None if allow_param
+            && matches!(cx.view(self_ty), TyView::Param(_) | TyView::Opaque(..) | TyView::Alias { .. } | TyView::Dynamic(_)) =>
+        {
+            None
+        }
+        None => return Err(ResolveError::NotGround { item: trait_ }),
+    };
     // Every holding impl, in selection order, with its arguments in `cx` (walk AJ P9: the
     // pinned alloc's `min_specialization` pairs, `impl<T: Display + ?Sized> ToString for T`
     // beside `impl ToString for str`, both hold at `str`).
     let mut holding: Vec<ItemKey, Alloc<'_>> = Vec::new_in(cx.alloc());
     let mut holding_args: Vec<crate::ty::TyList, Alloc<'_>> = Vec::new_in(cx.alloc());
-    let buckets = [shape, Shape::Param];
+    let buckets: &[Shape] = match shape {
+        Some(s) => &[s, Shape::Param],
+        None => &[Shape::Param],
+    };
     let mut seen: Vec<ItemKey, Alloc<'_>> = Vec::new_in(cx.alloc());
-    for b in buckets {
+    for &b in buckets {
         for &imp in reads.impls_of(trait_, b)? {
             if seen.contains(&imp) {
                 continue;
@@ -1097,7 +1152,7 @@ fn resolve_in<W: World>(
         return Err(ResolveError::NotGround { item });
     }
     let mut cx = InferCtx::post_analysis_in(alloc);
-    let Some(h) = holding_owning(&mut cx, reads, None, trait_, &all[..n], ground)? else {
+    let Some(h) = holding_owning(&mut cx, reads, None, trait_, &all[..n], ground, false)? else {
         return Err(ResolveError::NoImpl { trait_, item });
     };
     // The item's definition: the selected impl's, else the nearest specialization ancestor's

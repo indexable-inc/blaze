@@ -97,7 +97,12 @@ pub use func::{Block, BlockKind, Func, Head, Value, View};
 pub use op::{End, Field, Info, Layout, Op, Operands, Res};
 pub use parse::{ParseError, parse};
 pub use print::print;
-pub use simplify::egraph;
+pub use simplify::{
+    bce, coldsplit, coro_opt, devirt, egraph, escape, ifconv, loopnest, memopt, prefetch, rvsdg, sched, semproof, slp,
+    soa, speculate, superopt, taildup, unroll, unswitch, vectorize,
+};
+#[cfg(any(test, feature = "eval"))]
+pub use simplify::validate;
 pub use ty::{Scalar, Ty};
 pub use verify::{Verified, VerifiedFunc, VerifyError, verify};
 

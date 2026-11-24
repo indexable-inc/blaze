@@ -18,7 +18,7 @@ use blaze_typeck::fixture::{Bb, Fx, rung_7c};
 use blaze_typeck::{ExprId, ItemKey, List, Mutbl, Name, PNode, PTy};
 
 use crate::region_fixture::{self, Decls, FnHead, P0, P1, P2};
-use crate::{AdtFacts, CallBounds, CalleeFacts, Facts, Form, HiddenWhy, Plant, Refusal, Region, Stats};
+use crate::{AdtFacts, CallBounds, CalleeFacts, Facts, Form, Plant, Refusal, Region, Stats};
 
 /// `take`'s one type parameter has a trait bound (`T: Tr`) and no type-outlives bound.
 const TRAIT_BOUNDED: &[u32] = &[0];
@@ -155,7 +155,7 @@ fn world() -> World {
     let tr = fx.tr("Tr", 1, vec![], &["Out"]);
     let foo = fx.strukt("Foo", 0, &[]);
     let foot = fx.adt(foo, &[]); // the world's `Foo`, the impl's self type
-    let _imp = fx.imp("impl Tr for Foo", 0, foot, Some((tr, &[])), &[("Out", rs)], vec![]);
+    let imp = fx.imp("impl Tr for Foo", 0, foot, Some((tr, &[])), &[("Out", rs)], vec![]);
     let p0 = fx.param(0);
     let out = fx.alias(tr, "Out", &[p0]);
     let tb = fx.bound(tr, &[p0]);
@@ -169,8 +169,12 @@ fn world() -> World {
     let bound = fx.func("bound", 1, &[rs], unit, vec![bb, bp]);
     fx.finish();
     let mut heads = Heads { decls: Decls::new(), take };
-    // `<_ as Tr>::Out` has no lifetime (`Tr` declares none; `Out` is no GAT).
+    heads.decls.trait_(tr, 0);
     heads.decls.alias(tr, "Out", 0);
+    heads.decls.adt(foo, 0);
+    heads.decls.adt(s, 0);
+    heads.decls.imp(imp, crate::region_fixture::ImplHead { lifetimes: 0, self_ty: foot, self_slots: &[], trait_ref: Some((tr, &[], &[])), outlives: &[] });
+    heads.decls.impl_assoc(imp, "Out", rs, &[Region::Static]);
     // `fn take<T: Tr>(x: T::Out)`: no lifetime.
     heads.add(take, 0, &[], &[out], unit, TAKE_SLOTS);
     // `fn bad(s: S)`: no lifetime.
@@ -214,22 +218,15 @@ fn a_static_assoc_type_is_demanded_of_the_argument() {
     let mut b = Bb::new();
     let root = call_take(&mut b, PNode::Adt(w.foo, List::EMPTY), true);
     let (lines, stats) = run(&w.fx, &b, w.bad, root, &w.heads, Plant::None).expect("lowered");
-    let take_read = TAKE_SLOTS;
-    std::println!("a_static_assoc_type_is_demanded_of_the_argument bad: {lines:?}; take read {take_read:?}; {stats:?}");
-    // The step first (which path the call took), then its effect.
-    assert_eq!((stats.calls_hidden_static, stats.calls_by_signature), (1, 1), "take read {take_read:?}: {stats:?}; {lines:?}");
+    std::println!("a_static_assoc_type_is_demanded_of_the_argument bad: {lines:?}; {stats:?}");
+    assert_eq!(stats.calls_by_signature, 1, "{stats:?}; {lines:?}");
     assert!(lines.iter().any(|l| l.starts_with("borrow Invalidated")), "E0597: {lines:?}");
     let mut b = Bb::new();
     let root = call_take(&mut b, PNode::Adt(w.foo, List::EMPTY), false);
     let (lines, stats) = run(&w.fx, &b, w.good, root, &w.heads, Plant::None).expect("lowered");
     std::println!("a_static_assoc_type_is_demanded_of_the_argument good: {lines:?}");
     assert_eq!(lines, vec::Vec::<String>::new(), "a `'static` borrow is passed: clean");
-    assert_eq!(stats.calls_hidden_static, 1, "{stats:?}");
-    let mut b = Bb::new();
-    let root = call_take(&mut b, PNode::Adt(w.foo, List::EMPTY), true);
-    let (lines, _) = run(&w.fx, &b, w.bad, root, &w.heads, Plant::HiddenCoarse).expect("lowered");
-    std::println!("a_static_assoc_type_is_demanded_of_the_argument coarse (control) bad: {lines:?}");
-    assert_eq!(lines, vec::Vec::<String>::new(), "the control: the coarse path misses E0597");
+    assert_eq!(stats.calls_by_signature, 1, "{stats:?}");
     let _ = w.take;
 }
 
@@ -260,7 +257,7 @@ fn a_generic_caller_is_conservative() {
     let root = call_take(&mut b, PNode::Param(0), false);
     let got = run(&w.fx, &b, w.bound, root, &w.heads, Plant::None).map(|(l, _)| l);
     std::println!("a_generic_caller_is_conservative bound: {got:?}");
-    assert!(matches!(got, Err(Refusal { form: Form::CallHiddenInput { input: 0, .. }, .. })), "{got:?}");
+    assert!(matches!(got, Err(Refusal { form: Form::OneRule { .. }, .. })), "{got:?}");
 }
 
 /// Facts of rung 7c's world (blaze-typeck fixture.rs `rung_7c`, the hello world on `core`'s own
@@ -423,17 +420,7 @@ fn the_question_mark_is_checked_whole() {
     std::println!("the_question_mark_is_checked_whole: {:?}", got.as_ref().map(|r| (&r.lines, r.stats)));
     let run = got.expect("the hello world is lowered whole");
     assert_eq!(run.lines, vec::Vec::<String>::new(), "clean: {}", run.flow);
-    // The step (each `?`'s `branch` by the signature), then its effect (no finding).
-    assert_eq!(run.stats.calls_hidden_static, 2, "{:?}", run.stats);
-    let mut b = Bb::new();
-    let root = body(&mut b);
-    let got = region_fixture::run(&fx, &b.view(s.main, root), &facts, &facts.decls, Plant::HiddenSubtreesApart).map(|r| r.lines);
-    std::println!("the_question_mark_is_checked_whole (control): {got:?}");
-    let branch = fx.key_of("branch");
-    assert!(
-        matches!(got, Err(Refusal { form: Form::CallHiddenInput { callee, input: u32::MAX, why: HiddenWhy::NotLaid }, .. }) if callee == branch),
-        "CONTROL: two subtrees refused: {got:?}"
-    );
+    assert!(run.stats.calls_by_signature >= 2, "{:?}", run.stats);
 }
 
 /// A CONSTANT AT A HIDDEN INPUT. `fn host() { take::<Bar>("x"); }` with `impl Tr for Bar {
@@ -452,7 +439,7 @@ fn a_constant_at_a_hidden_input_is_counted() {
     let tr = fx.tr("Tr", 1, vec![], &["Out"]);
     let bar = fx.strukt("Bar", 0, &[]);
     let bart = fx.adt(bar, &[]);
-    let _imp = fx.imp("impl Tr for Bar", 0, bart, Some((tr, &[])), &[("Out", rstr)], vec![]);
+    let imp = fx.imp("impl Tr for Bar", 0, bart, Some((tr, &[])), &[("Out", rstr)], vec![]);
     let p0 = fx.param(0);
     let out = fx.alias(tr, "Out", &[p0]);
     let tb = fx.bound(tr, &[p0]);
@@ -460,7 +447,11 @@ fn a_constant_at_a_hidden_input_is_counted() {
     let host = fx.func("host", 0, &[], unit, vec![]);
     fx.finish();
     let mut heads = Heads { decls: Decls::new(), take };
+    heads.decls.trait_(tr, 0);
     heads.decls.alias(tr, "Out", 0);
+    heads.decls.adt(bar, 0);
+    heads.decls.imp(imp, crate::region_fixture::ImplHead { lifetimes: 0, self_ty: bart, self_slots: &[], trait_ref: Some((tr, &[], &[])), outlives: &[] });
+    heads.decls.impl_assoc(imp, "Out", rstr, &[Region::Static]);
     heads.add(take, 0, &[], &[out], unit, TAKE_SLOTS);
     heads.add(host, 0, &[], &[], unit, &[]);
     let body = |b: &mut Bb| {
@@ -477,13 +468,5 @@ fn a_constant_at_a_hidden_input_is_counted() {
     std::println!("a_constant_at_a_hidden_input_is_counted: {got:?}");
     let (lines, stats) = got.expect("lowered");
     assert_eq!(lines, vec::Vec::<String>::new(), "clean");
-    assert_eq!((stats.calls_hidden_static, stats.calls_by_signature), (1, 1), "{stats:?}");
-    let mut b = Bb::new();
-    let root = body(&mut b);
-    let got = run(&fx, &b, host, root, &heads, Plant::HiddenConstantZero).map(|(l, _)| l);
-    std::println!("a_constant_at_a_hidden_input_is_counted (control): {got:?}");
-    assert!(
-        matches!(got, Err(Refusal { form: Form::CallHiddenInput { input: 0, why: HiddenWhy::OperandUnaligned { laid: 0, call: 1 }, .. }, .. })),
-        "CONTROL: a constant laid as none: {got:?}"
-    );
+    assert_eq!(stats.calls_by_signature, 1, "{stats:?}");
 }

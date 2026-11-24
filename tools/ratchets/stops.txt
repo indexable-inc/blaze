@@ -15,7 +15,7 @@ blaze-base64	24
 blaze-bench	7
 blaze-blake3	413
 blaze-bstd-convert	109
-blaze-build	549
+blaze-build	536
 blaze-build-script	246
 blaze-bytes	3
 blaze-c	325
@@ -45,10 +45,10 @@ blaze-dbsp	55
 blaze-deflate	228
 blaze-drive	157
 blaze-ed25519	58
-blaze-emit	1000
+blaze-emit	443
 blaze-engine	259
 blaze-expand	469
-blaze-export	241
+blaze-export	239
 blaze-fetch	175
 blaze-file-items	277
 blaze-flow	284
@@ -80,7 +80,7 @@ blaze-launcher	2
 blaze-lex	63
 blaze-lint	270
 blaze-lint-defs	109
-blaze-lir	1553
+blaze-lir	1542
 blaze-lower	320
 blaze-macro-run	4
 blaze-malloc	65

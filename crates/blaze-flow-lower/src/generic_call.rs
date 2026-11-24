@@ -594,7 +594,286 @@ pub fn read_shape<A: Allocator + Copy>(
 }
 
 
+/// One mapped position of an impl's associated type (`type Assoc = U;`) relative to the impl's
+/// `Self` type's positions (`SelfPos(k)` or `Static`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ImplAssocSlot {
+    SelfPos(u32),
+    Static,
+}
+
 impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
+    fn mentions_unknown(&self, args: &[PTy], e: ExprId) -> Result<bool, Refusal> {
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
+        stack.extend_from_slice(args);
+        let mut steps = 0u32;
+        while let Some(t) = stack.pop() {
+            steps += 1;
+            if steps > crate::MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            match self.node(t, e)? {
+                PNode::Ref(_, i) | PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) | PNode::Adt(_, l) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_)
+                | PNode::Str | PNode::Never | PNode::ConstParam(_) | PNode::ConstValue { .. } => {}
+                _ => return Ok(true),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Maps each position of `<Self as Trait>::assoc_name` to an exact position of `self_arg_ty`
+    /// (or `'static`) by reading `imp`'s filed `impl_header` and `impl_assoc` columns.
+    /// Returns `Ok(None)` when either column is unread or cannot be aligned position-for-position.
+    pub(crate) fn map_impl_assoc_slots(
+        &self,
+        imp: ItemKey,
+        assoc_name: blaze_typeck::Name,
+        self_arg_ty: PTy,
+        self_pos_count: u32,
+        expected_out: u32,
+        e: ExprId,
+    ) -> Result<Option<Vec<ImplAssocSlot, A>>, Refusal> {
+        let facts: &'b F = self.facts;
+        let regions = facts.regions();
+        let Ok((self_col, _)) = regions.impl_header(imp) else {
+            return Ok(None);
+        };
+        let Ok(assoc_col) = regions.impl_assoc(imp, assoc_name) else {
+            return Ok(None);
+        };
+        let arity = crate::one_call::FactsArity { facts };
+        let heads = blaze_borrow::Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
+        // Step 1: align `self_col.ty()` (in `heads`) with `self_arg_ty` (in `self.tys`) to bind
+        // each impl type param `Param(ip)` to `(pos_start, pos_len)` and each impl lifetime param
+        // `Region::Param(ir)` to `pos_idx` in `0..self_pos_count`.
+        let mut param_span: Vec<(u32, u32, u32), A> = Vec::new_in(self.alloc);
+        let mut reg_pos: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
+        let mut work: Vec<(PTy, &[Region], PTy, u32), A> = Vec::new_in(self.alloc);
+        work.push((self_col.ty(), self_col.as_slice(), self_arg_ty, 0));
+        let mut steps = 0u32;
+        while let Some((decl, dslots, act, pos_off)) = work.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return Ok(None);
+            }
+            let Ok(dnode) = blaze_borrow::RegionTypes::node(&heads, decl) else {
+                return Ok(None);
+            };
+            match (dnode, self.node(act, e)?) {
+                (PNode::Param(ip), _) => {
+                    let len = self.npos(act, e)?;
+                    if let Some(&(_, ps, pl)) = param_span.iter().find(|&&(q, _, _)| q == ip) {
+                        if ps != pos_off || pl != len {
+                            return Ok(None);
+                        }
+                    } else {
+                        param_span.push((ip, pos_off, len));
+                    }
+                }
+                (PNode::Ref(_, di), PNode::Ref(_, ai)) => {
+                    let Some(&r0) = dslots.first() else { return Ok(None) };
+                    if let Region::Param(ir) = r0
+                        && !reg_pos.iter().any(|&(q, _)| q == ir)
+                    {
+                        reg_pos.push((ir, pos_off));
+                    }
+                    work.push((di, &dslots[1..], ai, pos_off + 1));
+                }
+                (PNode::Ptr(_, di), PNode::Ptr(_, ai))
+                | (PNode::Slice(di), PNode::Slice(ai))
+                | (PNode::Array(di, _), PNode::Array(ai, _))
+                | (PNode::Pat(di, _), PNode::Pat(ai, _)) => {
+                    work.push((di, dslots, ai, pos_off));
+                }
+                (PNode::Tuple(_), PNode::Tuple(al)) => {
+                    let Ok(dkids) = blaze_borrow::RegionTypes::kids(&heads, decl) else { return Ok(None) };
+                    let alist = self.list(al, e)?;
+                    if dkids.len() as usize != alist.len() {
+                        return Ok(None);
+                    }
+                    let mut doff = 0usize;
+                    let mut poff = pos_off;
+                    for (i, &ak) in alist.iter().enumerate() {
+                        let Some(dk) = dkids.get(i as u32) else { return Ok(None) };
+                        let Ok(dc) = blaze_borrow::RegionTypes::count(&heads, dk) else { return Ok(None) };
+                        let dn = dc.get() as usize;
+                        let Some(ds) = dslots.get(doff..doff + dn) else { return Ok(None) };
+                        doff += dn;
+                        let pn = self.npos(ak, e)?;
+                        work.push((dk, ds, ak, poff));
+                        poff += pn;
+                    }
+                    if doff != dslots.len() {
+                        return Ok(None);
+                    }
+                }
+                (PNode::Adt(dk, _), PNode::Adt(ak, al)) if dk == ak => {
+                    let lts = self.adt_facts(ak, e)?.lifetimes as usize;
+                    if dslots.len() < lts {
+                        return Ok(None);
+                    }
+                    for (i, &r) in dslots[..lts].iter().enumerate() {
+                        if let Region::Param(ir) = r
+                            && !reg_pos.iter().any(|&(q, _)| q == ir)
+                        {
+                            reg_pos.push((ir, pos_off + i as u32));
+                        }
+                    }
+                    let Ok(dkids) = blaze_borrow::RegionTypes::kids(&heads, decl) else { return Ok(None) };
+                    let alist = self.list(al, e)?;
+                    if dkids.len() as usize != alist.len() {
+                        return Ok(None);
+                    }
+                    let mut doff = lts;
+                    let mut poff = pos_off + lts as u32;
+                    for (i, &ak_ty) in alist.iter().enumerate() {
+                        let Some(dk_ty) = dkids.get(i as u32) else { return Ok(None) };
+                        let Ok(dc) = blaze_borrow::RegionTypes::count(&heads, dk_ty) else { return Ok(None) };
+                        let dn = dc.get() as usize;
+                        let Some(ds) = dslots.get(doff..doff + dn) else { return Ok(None) };
+                        doff += dn;
+                        let pn = self.npos(ak_ty, e)?;
+                        work.push((dk_ty, ds, ak_ty, poff));
+                        poff += pn;
+                    }
+                    if doff != dslots.len() {
+                        return Ok(None);
+                    }
+                }
+                (PNode::Bool, PNode::Bool)
+                | (PNode::Char, PNode::Char)
+                | (PNode::Int(_), PNode::Int(_))
+                | (PNode::Uint(_), PNode::Uint(_))
+                | (PNode::Float(_), PNode::Float(_))
+                | (PNode::Str, PNode::Str)
+                | (PNode::Never, PNode::Never)
+                | (PNode::ConstValue { .. } | PNode::ConstParam(_), _) => {}
+                _ => return Ok(None),
+            }
+        }
+        // Step 2: walk `assoc_col.ty()` in pre-order to map each output position.
+        enum OutStep<'r> {
+            Ty(PTy, &'r [Region]),
+            Slot(ImplAssocSlot),
+        }
+        let mut out: Vec<ImplAssocSlot, A> = Vec::with_capacity_in(expected_out as usize, self.alloc);
+        let mut ostack: Vec<OutStep<'_>, A> = Vec::new_in(self.alloc);
+        ostack.push(OutStep::Ty(assoc_col.ty(), assoc_col.as_slice()));
+        let mut osteps = 0u32;
+        while let Some(step) = ostack.pop() {
+            osteps += 1;
+            if osteps > MOST_POSITIONS || out.len() as u32 > expected_out {
+                return Ok(None);
+            }
+            let (decl, dslots) = match step {
+                OutStep::Slot(s) => {
+                    out.push(s);
+                    continue;
+                }
+                OutStep::Ty(d, ds) => (d, ds),
+            };
+            let Ok(dnode) = blaze_borrow::RegionTypes::node(&heads, decl) else {
+                return Ok(None);
+            };
+            let map_reg = |r: Region| -> Option<ImplAssocSlot> {
+                match r {
+                    Region::Static => Some(ImplAssocSlot::Static),
+                    Region::Param(ir) => reg_pos.iter().find(|&&(q, _)| q == ir).map(|&(_, pos)| ImplAssocSlot::SelfPos(pos)),
+                    Region::Late { .. } => None,
+                }
+            };
+            match dnode {
+                PNode::Param(ip) => {
+                    let Some(&(_, start, len)) = param_span.iter().find(|&&(q, _, _)| q == ip) else {
+                        return Ok(None);
+                    };
+                    if start + len > self_pos_count {
+                        return Ok(None);
+                    }
+                    for j in 0..len {
+                        out.push(ImplAssocSlot::SelfPos(start + j));
+                    }
+                }
+                PNode::Ref(_, di) => {
+                    let Some(&r0) = dslots.first() else { return Ok(None) };
+                    let Some(s0) = map_reg(r0) else { return Ok(None) };
+                    ostack.push(OutStep::Ty(di, &dslots[1..]));
+                    ostack.push(OutStep::Slot(s0));
+                }
+                PNode::Ptr(_, di) | PNode::Slice(di) | PNode::Array(di, _) | PNode::Pat(di, _) => {
+                    ostack.push(OutStep::Ty(di, dslots));
+                }
+                PNode::Tuple(_) => {
+                    let Ok(dkids) = blaze_borrow::RegionTypes::kids(&heads, decl) else { return Ok(None) };
+                    let mut spans: Vec<(PTy, usize, usize), A> = Vec::new_in(self.alloc);
+                    let mut off = 0usize;
+                    for i in 0..dkids.len() {
+                        let Some(dk) = dkids.get(i) else { return Ok(None) };
+                        let Ok(dc) = blaze_borrow::RegionTypes::count(&heads, dk) else { return Ok(None) };
+                        let dn = dc.get() as usize;
+                        if off + dn > dslots.len() {
+                            return Ok(None);
+                        }
+                        spans.push((dk, off, off + dn));
+                        off += dn;
+                    }
+                    if off != dslots.len() {
+                        return Ok(None);
+                    }
+                    for &(dk, lo, hi) in spans.iter().rev() {
+                        ostack.push(OutStep::Ty(dk, &dslots[lo..hi]));
+                    }
+                }
+                PNode::Adt(dk, _) => {
+                    let Some(af) = facts.adt(dk) else { return Ok(None) };
+                    let lts = af.lifetimes as usize;
+                    if dslots.len() < lts {
+                        return Ok(None);
+                    }
+                    let Ok(dkids) = blaze_borrow::RegionTypes::kids(&heads, decl) else { return Ok(None) };
+                    let mut spans: Vec<(PTy, usize, usize), A> = Vec::new_in(self.alloc);
+                    let mut off = lts;
+                    for i in 0..dkids.len() {
+                        let Some(dk_ty) = dkids.get(i) else { return Ok(None) };
+                        let Ok(dc) = blaze_borrow::RegionTypes::count(&heads, dk_ty) else { return Ok(None) };
+                        let dn = dc.get() as usize;
+                        if off + dn > dslots.len() {
+                            return Ok(None);
+                        }
+                        spans.push((dk_ty, off, off + dn));
+                        off += dn;
+                    }
+                    if off != dslots.len() {
+                        return Ok(None);
+                    }
+                    for &(dk_ty, lo, hi) in spans.iter().rev() {
+                        ostack.push(OutStep::Ty(dk_ty, &dslots[lo..hi]));
+                    }
+                    for &r in dslots[..lts].iter().rev() {
+                        let Some(sr) = map_reg(r) else { return Ok(None) };
+                        ostack.push(OutStep::Slot(sr));
+                    }
+                }
+                PNode::Bool
+                | PNode::Char
+                | PNode::Int(_)
+                | PNode::Uint(_)
+                | PNode::Float(_)
+                | PNode::Str
+                | PNode::Never
+                | PNode::ConstValue { .. }
+                | PNode::ConstParam(_) => {}
+                _ => return Ok(None),
+            }
+        }
+        if out.len() as u32 != expected_out {
+            return Ok(None);
+        }
+        Ok(Some(out))
+    }
+
     /// Notes why this call was not lined up ([`Misfit`]) and relates nothing (`Ok(false)`).
     fn misfit(&mut self, why: Misfit) -> Result<bool, Refusal> {
         self.misfit = why;
@@ -624,8 +903,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
     /// pushing to `out` per projection, in order, its subtree's position count, whether it is
     /// still a projection there, and the opaque type it is there (`PNode::Opaque`'s key, else
     /// `None`). `false`: the destination does not have those nodes.
-    #[expect(clippy::type_complexity, reason = "one row per projection: count, still one, opaque")]
-    fn proj_counts(&self, skel: &[Skel], dest_ty: TyD, out: &mut Vec<(u32, bool, Option<ItemKey>), A>, e: ExprId) -> Result<bool, Refusal> {
+    #[expect(clippy::type_complexity, reason = "one row per projection: count, still one, nested alias/opaque, opaque")]
+    fn proj_counts(&self, skel: &[Skel], dest_ty: TyD, out: &mut Vec<(u32, bool, bool, Option<ItemKey>), A>, e: ExprId) -> Result<bool, Refusal> {
         out.clear();
         if dest_ty.wrap.is_some() {
             return Ok(false);
@@ -669,12 +948,36 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         PNode::Opaque(k, _) => Some(k),
                         _ => None,
                     };
-                    out.push((self.npos(t, e)?, matches!(node, PNode::Alias { .. } | PNode::Opaque(..)), opaque));
+                    let is_direct = matches!(node, PNode::Alias { .. } | PNode::Opaque(..));
+                    let nested_proj = !is_direct && self.contains_proj_or_opaque(t, e)?;
+                    out.push((self.npos(t, e)?, is_direct, nested_proj, opaque));
                 }
                 _ => return Ok(false),
             }
         }
         Ok(stack.is_empty())
+    }
+
+    /// Whether `root` contains any `PNode::Alias` or `PNode::Opaque` anywhere inside it.
+    fn contains_proj_or_opaque(&self, root: PTy, e: ExprId) -> Result<bool, Refusal> {
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
+        stack.push(root);
+        let mut steps = 0u32;
+        while let Some(t) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            match self.node(t, e)? {
+                PNode::Alias { .. } | PNode::Opaque(..) => return Ok(true),
+                PNode::Ref(_, i) | PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) | PNode::FnPtr(l, _) | PNode::Adt(_, l) => {
+                    stack.extend_from_slice(self.list(l, e)?);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
     }
 
     /// The body's own signature's projections over its own type parameters (each one position,
@@ -919,7 +1222,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         // The projections, opaque types and trait objects the parts hold, in the marks' order
         // (`Slot::Joined`); the output's projections' and opaque types' destination counts
         // (`proj_counts`), taken in order (`pk`).
-        let mut counts: Vec<(u32, bool, Option<ItemKey>), A> = Vec::new_in(self.alloc);
+        let mut counts: Vec<(u32, bool, bool, Option<ItemKey>), A> = Vec::new_in(self.alloc);
         let mut projs: Vec<Proj, A> = Vec::new_in(self.alloc);
         let mut pk = 0usize;
         // The type check's selections at this call (`Checked::selected_at`) are one per
@@ -1017,7 +1320,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             continue;
                         }
                         // The destination's positions where it stands, in the marks' order.
-                        let Some(&(n, alias, there)) = counts.get(pk) else { return self.misfit(Misfit::Skeleton { part }) };
+                        let Some(&(n, alias, nested_proj, there)) = counts.get(pk) else { return self.misfit(Misfit::Skeleton { part }) };
                         pk += 1;
                         // What the opaque value keeps live (rust-lang/rust#116733, lib.rs
                         // `opaque_live`). Its `+ 'r` region is in its own fn's numbering, so it
@@ -1040,22 +1343,45 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         if n == 0 {
                             continue;
                         }
+                        // Exact mapping via the selected impl's `impl_header` + `impl_assoc`
+                        // (`Try::branch` on `Option`/`Result`, `IntoIterator::into_iter` on
+                        // `&mut [T]`, etc.): avoids `JoinedSuperset` equating unrelated lifetimes.
+                        if !alias
+                            && opaque.is_none()
+                            && let &[self_p] = ps
+                            && let Some(&self_ty) = args.get(self_p as usize)
+                            && let rows = self.ck.selected_at(e)
+                            && let Some(row) = rows.get(this)
+                            && let Some(assoc_name) = row.name
+                            && let blaze_typeck::Selected::Impl { imp, .. } = row.selected
+                            && self.list(row.args, e)?.first() == Some(&self_ty)
+                            && let Some(mapped) = self.map_impl_assoc_slots(imp, assoc_name, self_ty, arg_at[self_p as usize].1, n, e)?
+                        {
+                            for slot in mapped {
+                                match slot {
+                                    ImplAssocSlot::SelfPos(k) => seq.push(Slot::Arg(self_p, k)),
+                                    ImplAssocSlot::Static => seq.push(Slot::Sig(Region::Static)),
+                                }
+                            }
+                            continue;
+                        }
                         for &p in ps {
                             let Some(&t) = args.get(p as usize) else {
                                 return self.refuse(Form::CalleeParamPastArgs { callee, param: p, args: arg_at.len() as u32 }, e);
                             };
                             // An argument whose lifetimes are not all positions (a trait
-                            // object's `Item = &'a u8`, a closure's captures): not taken. A
-                            // type parameter of the body is taken only where the projection
-                            // is still one (by its placeholder); a normalized type holding it
-                            // has positions no input names. For an opaque return type
-                            // (`opaque.is_some()`), an argument opaque's captured lifetimes
-                            // ARE its positions (`outlives_components(..., true)`).
+                            // object's `Item = &'a u8`, an alias): not taken. Opaques and
+                            // closures of this body carry their lifetimes in their positions
+                            // (`captures: true`). When the projection normalized to a concrete
+                            // type holding no nested alias/opaque (`!alias && !nested_proj`),
+                            // Rust parametricity + E0207 guarantee no lifetime position of the
+                            // normalized type comes from inside a caller's bare type parameter
+                            // `Param(u)` (`held`).
                             held.clear();
-                            if self.outlives_components(t, e, &mut held, opaque.is_some())? {
+                            if self.outlives_components(t, e, &mut held, true)? {
                                 return self.misfit(Misfit::ProjectionLoose { part, held: false });
                             }
-                            if !alias && !held.is_empty() {
+                            if !alias && nested_proj && !held.is_empty() {
                                 return self.misfit(Misfit::ProjectionLoose { part, held: true });
                             }
                         }
@@ -1195,7 +1521,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         if pj.alias {
                             held.clear();
                             if let Some(&arg) = args.get(usize::try_from(p).unwrap_or(usize::MAX)) {
-                                self.outlives_components(arg, e, &mut held, pj.opaque)?;
+                                self.outlives_components(arg, e, &mut held, true)?;
                             }
                             for h in 0..held.len() {
                                 let u = self.param_origin(held[h]);

@@ -275,6 +275,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             Some(r) => self.owner_sig_count(r, e)?,
             None => 0,
         };
+        if row.is_some() {
+            for f in ck.env_fields_by::<blaze_typeck::Places>(expr) {
+                let Some(t) = f.place_ty(ck) else {
+                    return self.refuse(Form::Malformed, e);
+                };
+                let m = self.region_slots_in(t, path, e)?;
+                n = match n.checked_add(u32::from(f.how != CaptureKind::ByValue)).and_then(|n| n.checked_add(m)) {
+                    Some(n) if n <= MOST_POSITIONS => n,
+                    _ => return self.refuse(Form::Bound, e),
+                };
+            }
+            return Ok(n);
+        }
         for &row in self.captures_of(expr) {
             let i = row as usize;
             let (Some(&pat), Some(&kind)) = (ck.captures.column::<1>().get(i), ck.captures.column::<2>().get(i)) else {

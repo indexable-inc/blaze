@@ -134,3 +134,166 @@ pub extern \"C\" fn main() -> i32 {
     println!("ASSIGN TO AN OWNED BINDING: {got:?}");
     assert_eq!(got, Ok(27), "one drop at the assignment, one at the scope's end");
 }
+
+/// Regression for the tempo `AA2dPool::descendant_txs` SIGSEGV: a non-`move` closure reading
+/// `id.seq` through a borrowed parameter `id: &'b TxId` and returned from the function. Under
+/// RFC 2229 (`BuildEnv = Places`), the closure captures `*id` (`&'b TxId`), NOT `&id` (a
+/// pointer to the parameter's dead stack slot in `make_matcher`). After `clobber_stack`
+/// overwrites the old stack frame, invoking the closure compares the live `[u8; 20]` arrays
+/// without dereferencing garbage.
+#[test]
+fn returned_closure_capturing_through_shared_ref_does_not_dangle() {
+    let got = run("
+struct Seq {
+    addr: [u8; 20],
+    key: u64,
+}
+
+impl Seq {
+    fn same(&self, other: &Seq) -> bool {
+        let mut i = 0usize;
+        while i < 20 {
+            if self.addr[i] != other.addr[i] {
+                return false;
+            }
+            i = i + 1;
+        }
+        self.key == other.key
+    }
+}
+
+struct TxId {
+    seq: Seq,
+    nonce: u64,
+}
+
+#[inline(never)]
+fn make_matcher<'a>(id: &'a TxId) -> impl Fn(&TxId) -> bool + 'a {
+    |other: &TxId| id.seq.same(&other.seq)
+}
+
+#[inline(never)]
+fn clobber_stack(seed: u64) -> u64 {
+    let mut buf = [seed; 64];
+    let mut i = 0usize;
+    let mut acc = 0u64;
+    while i < 64 {
+        buf[i] = seed ^ (i as u64);
+        acc = acc ^ buf[i];
+        i = i + 1;
+    }
+    acc
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let a = TxId { seq: Seq { addr: [7u8; 20], key: 42 }, nonce: 1 };
+    let b = TxId { seq: Seq { addr: [7u8; 20], key: 42 }, nonce: 2 };
+    let c = TxId { seq: Seq { addr: [9u8; 20], key: 42 }, nonce: 3 };
+    let pred = make_matcher(&a);
+    let _ = clobber_stack(0xdead_beef_cafe_babeu64);
+    let m1 = if pred(&b) { 10 } else { 0 };
+    let m2 = if pred(&c) { 1 } else { 0 };
+    m1 + m2
+}
+");
+    println!("RETURNED CLOSURE THROUGH SHARED REF: {got:?}");
+    assert_eq!(got, Ok(10), "captured `*id` survives return and stack clobber");
+}
+
+/// Companion: a returned non-`move` closure reading through a WIDE shared reference (`&'a [u8]`)
+/// and a closure capturing the unsized tail field of a DST struct (`core::array::iter::PolymorphicIter::next`).
+#[test]
+fn closure_capturing_through_wide_ref_and_dst_tail_runs() {
+    let got = run("
+struct Dst<T: PointeeSized> {
+    head: u8,
+    tail: T,
+}
+
+#[inline(never)]
+fn make_reader<'a>(s: &'a [u8]) -> impl Fn(usize) -> u8 + 'a {
+    |i: usize| s[i]
+}
+
+#[inline(never)]
+fn clobber_stack(seed: u64) -> u64 {
+    let mut buf = [seed; 64];
+    let mut i = 0usize;
+    let mut acc = 0u64;
+    while i < 64 {
+        buf[i] = seed ^ (i as u64);
+        acc = acc ^ buf[i];
+        i = i + 1;
+    }
+    acc
+}
+
+fn read_dst_tail(d: &mut Dst<[u8]>) -> u8 {
+    let f = |i: usize| d.tail[i];
+    f(1) + f(2)
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let data = [3u8, 10u8, 20u8];
+    let reader = make_reader(&data);
+    let _ = clobber_stack(0xdead_beef_cafe_babeu64);
+    let a = reader(0);
+    let mut dst = Dst { head: 1, tail: [5u8, 11u8, 22u8] };
+    let b = read_dst_tail(&mut dst);
+    (a + b) as i32
+}
+");
+    println!("WIDE REF AND DST TAIL CAPTURE: {got:?}");
+    assert_eq!(got, Ok(36), "3 + (11 + 22) = 36");
+}
+
+/// Companion: a returned non-`move` `FnMut` closure calling a `&mut self` method through a
+/// borrowed `&'a mut Counter` parameter (auto-deref + reborrow in `push_deref_chain` ->
+/// `PlaceDerefs` -> `env_use`).
+#[test]
+fn returned_closure_calling_method_through_mut_ref_does_not_dangle() {
+    let got = run("
+struct Counter {
+    n: u8,
+}
+
+impl Counter {
+    fn bump(&mut self, delta: u8) -> u8 {
+        self.n = self.n + delta;
+        self.n
+    }
+}
+
+#[inline(never)]
+fn make_bumper<'a>(c: &'a mut Counter) -> impl FnMut(u8) -> u8 + 'a {
+    |d: u8| c.bump(d)
+}
+
+#[inline(never)]
+fn clobber_stack(seed: u64) -> u64 {
+    let mut buf = [seed; 64];
+    let mut i = 0usize;
+    let mut acc = 0u64;
+    while i < 64 {
+        buf[i] = seed ^ (i as u64);
+        acc = acc ^ buf[i];
+        i = i + 1;
+    }
+    acc
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut c = Counter { n: 5 };
+    let mut f = make_bumper(&mut c);
+    let _ = clobber_stack(0xdead_beef_cafe_babeu64);
+    let a = f(3);
+    let b = f(4);
+    (a + b) as i32
+}
+");
+    println!("RETURNED CLOSURE THROUGH MUT REF METHOD: {got:?}");
+    assert_eq!(got, Ok(20), "8 + 12 = 20");
+}

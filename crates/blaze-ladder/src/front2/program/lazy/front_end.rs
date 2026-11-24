@@ -320,6 +320,14 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
         super::seam_rules::nounwind_from(tabled, self.front.names, &self.front.keys, &self.store, key)
     }
 
+    fn fn_attrs(&self, key: ItemKey) -> blaze_lir::func::FnAttrs {
+        self.rows
+            .by_key
+            .get(&key)
+            .and_then(|&i| usize::try_from(i).ok().and_then(|idx| self.rows.fn_attrs.get(idx).copied()))
+            .unwrap_or_default()
+    }
+
     /// A row's ABI, else the head's (program/seam_rules.rs `fn_abi`, `Front2Program`'s rule): a
     /// callee the build resolved to before its own `check_one` made its row still has its
     /// signature's ABI.

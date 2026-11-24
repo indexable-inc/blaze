@@ -164,7 +164,23 @@ impl<'w> ProjectAsk<'w> {
             // every opaque reached is its hidden type.
             reveal: super::opaque_auto::Reveal::All,
         };
+        let used_before = store.provisional_used.borrow().len();
         let out = tc::normalize_projection(&world, trait_, name, args, ground, alloc);
+        let pending_hit = {
+            let mut used = store.provisional_used.borrow_mut();
+            let hit = used.get(used_before..).is_some_and(|slice| {
+                slice.iter().any(|&ck| {
+                    store.provisional_impls.get(&ck).is_some_and(|p| {
+                        p.head.trait_ == Some(trait_) && p.pending_assoc.iter().any(|&n| n == name)
+                    })
+                })
+            });
+            used.truncate(used_before);
+            hit
+        };
+        if pending_hit {
+            return refuse(ProjectionWhy::Solver(None));
+        }
         let fills = world.fills.into_inner();
         let gaps = world.gaps.into_inner();
         // Taken only when the world noted nothing to make or answer AND the answer is ground: while

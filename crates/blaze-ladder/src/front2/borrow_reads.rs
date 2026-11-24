@@ -38,7 +38,8 @@ use super::reads::{Fact, FactKind, Read, ReadsError};
 /// v6 (D148, piece L6): the fields' regions are the head record's field columns; no written
 /// type is read, so the asked ADT counts and path answers are no longer in the row.
 /// v7: structural `needs_drop` and `drop_args` (borrow_fields.rs `drop_facts_of`).
-const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v7";
+/// v8: `field_row` lays `PNode::Alias` fields (`CharSliceSearcher`, `CharArrayRefSearcher`).
+const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v8";
 /// The domain of a [`FactKind::BorrowHead`] answer.
 /// v2 (piece RB8): a head's verdict now also reads its trait bounds' lifetime arguments
 /// (borrows_ties.rs), so a list filed under v1 never answers for one checked since.
@@ -77,6 +78,8 @@ pub enum AdtAnswer<'f> {
         copy_args: Option<&'f [bool]>,
         /// Which arguments its drop glue drops (`None`: not read; borrow_fields.rs `drop_facts_of`).
         drop_args: Option<&'f [bool]>,
+        /// The ADT's unique `Deref` impl (`Facts::deref_impl`), when any.
+        deref_impl: Option<u128>,
         /// Its lifetime parameters' variances, in head order (`None`: not read; borrows.rs
         /// `adt_variances_of`).
         variances: Option<&'f [Variance]>,
@@ -156,7 +159,7 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
     let mut h = StableHasher::new(ADT_DOMAIN);
     match answer {
         AdtAnswer::NotMade => h.tag(0),
-        AdtAnswer::Made { copy, drop_impl, facts, variant_lens, fields, field_params, field_leads, field_regions, region_list, copy_args, drop_args, variances } => {
+        AdtAnswer::Made { copy, drop_impl, facts, variant_lens, fields, field_params, field_leads, field_regions, region_list, copy_args, drop_args, deref_impl, variances } => {
             h.tag(1);
             option_bool(&mut h, copy);
             option_bool(&mut h, drop_impl);
@@ -234,6 +237,13 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
                     for &n in need {
                         flag(&mut h, n);
                     }
+                }
+            }
+            match deref_impl {
+                None => h.tag(0),
+                Some(imp) => {
+                    h.tag(1);
+                    h.u128(imp);
                 }
             }
             match variances {
@@ -383,22 +393,24 @@ pub fn impl_read(imp: u128, names: &[tc::Name], regions: &dyn blaze_flow_lower::
     Read { fact: Fact { kind: FactKind::BorrowHead, key: imp, detail: IMPL_DETAIL }, answer: Some(h.finish()) }
 }
 
-/// The `detail` of a trait's `Self` supertraits read for transitive `Copy` bounds (borrows.rs).
+/// The `detail` of a trait's `Self` supertraits read for transitive `Copy` and `'static` bounds (borrows.rs).
 pub const COPY_SUPERTRAIT_DETAIL: u64 = 9;
-const COPY_SUPERTRAIT_DOMAIN: &str = "blaze-ladder front2 borrow copy supertrait v1";
+const COPY_SUPERTRAIT_DOMAIN: &str = "blaze-ladder front2 borrow copy supertrait v2";
 
 /// The `detail` of a nested ADT's drop summary read (borrow_fields.rs `drop_facts_of`).
 pub const DROP_ADT_DETAIL: u64 = 10;
 const DROP_ADT_DOMAIN: &str = "blaze-ladder front2 borrow drop adt v1";
 
-/// The row of what the borrow check took about trait `trait_key`'s direct `Self` supertraits.
-/// `supers` is `None` when the trait head was not made, else the sorted direct supertrait keys.
-pub fn copy_supertrait_read(trait_key: u128, supers: Option<&[u128]>) -> Read {
+/// The row of what the borrow check took about trait `trait_key`'s direct `Self` supertraits
+/// (and whether it directly declares `Self: 'static`).
+/// `supers` is `None` when the trait head was not made, else `(sorted direct supertrait keys, self_static)`.
+pub fn copy_supertrait_read(trait_key: u128, supers: Option<(&[u128], bool)>) -> Read {
     let mut h = StableHasher::new(COPY_SUPERTRAIT_DOMAIN);
     match supers {
         None => h.tag(0),
-        Some(list) => {
+        Some((list, self_static)) => {
             h.tag(1);
+            h.tag(u8::from(self_static));
             h.u32(u32::try_from(list.len()).unwrap_or(u32::MAX));
             for &sup in list {
                 h.u128(sup);
@@ -409,17 +421,69 @@ pub fn copy_supertrait_read(trait_key: u128, supers: Option<&[u128]>) -> Read {
 }
 
 /// The row of what the structural `needs_drop` walk took about ADT `adt`: whether it was made,
-/// its kind, whether it is `ManuallyDrop`/`PhantomData`, its `Drop` impl answer, its generic
-/// count, and the structural digest of its fields' types (`fields_digest`).
-pub fn drop_adt_read(adt: u128, made: bool, union: bool, inert: bool, drop_impl: Option<bool>, generics: u32, fields_digest: u64) -> Read {
+/// its kind, whether it is `ManuallyDrop`/`PhantomData`, whether it is unconditionally `Copy`,
+/// its `Drop` impl answer, its generic count, and the structural digest of its fields' types
+/// (`fields_digest`).
+#[expect(clippy::too_many_arguments, reason = "each structural drop input hashed into the read answer")]
+pub fn drop_adt_read(
+    adt: u128,
+    made: bool,
+    union: bool,
+    inert: bool,
+    uncond_copy: bool,
+    drop_impl: Option<bool>,
+    generics: u32,
+    fields_digest: u64,
+) -> Read {
     let mut h = StableHasher::new(DROP_ADT_DOMAIN);
     flag(&mut h, made);
     flag(&mut h, union);
     flag(&mut h, inert);
+    flag(&mut h, uncond_copy);
     option_bool(&mut h, drop_impl);
     h.u32(generics);
     h.u64(fields_digest);
     Read { fact: Fact { kind: FactKind::BorrowAdt, key: adt, detail: DROP_ADT_DETAIL }, answer: Some(h.finish()) }
+}
+
+/// The detail of a [`FactKind::BorrowHead`] row holding a trait's or opaque's region clauses
+/// (supertrait elaboration and `impl Trait` bounds in `blaze-borrow`).
+pub const CLAUSES_DETAIL: u64 = 11;
+const CLAUSES_DOMAIN: &str = "blaze-ladder front2 borrow clauses v1";
+
+/// The row of what the borrow check read of item `item`'s region clauses and lifetime count.
+pub fn clauses_read(item: u128, regions: &dyn blaze_flow_lower::RegionFacts) -> Read {
+    let mut h = StableHasher::new(CLAUSES_DOMAIN);
+    let key = tc::ItemKey(item);
+    match regions.lifetime_params(key) {
+        Ok(p) => {
+            h.tag(1);
+            h.u32(p.count());
+        }
+        Err(u) => {
+            h.tag(0);
+            unread(&mut h, u.why);
+        }
+    }
+    match regions.clauses(key) {
+        Ok(cls) => {
+            h.tag(1);
+            h.u32(u32::try_from(cls.len()).unwrap_or(u32::MAX));
+            for cv in cls {
+                h.u32(cv.nth);
+                h.u32(cv.binders);
+                h.u32(u32::try_from(cv.col.as_slice().len()).unwrap_or(u32::MAX));
+                for &r in cv.col.as_slice() {
+                    region(&mut h, r);
+                }
+            }
+        }
+        Err(u) => {
+            h.tag(0);
+            unread(&mut h, u.why);
+        }
+    }
+    Read { fact: Fact { kind: FactKind::BorrowHead, key: item, detail: CLAUSES_DETAIL }, answer: Some(h.finish()) }
 }
 
 /// Files the borrow check's `rows` into the body's read list in `verdict` (sorted by fact, one

@@ -32,6 +32,7 @@ struct Row<'n> {
     abi: Abi,
     nounwind: bool,
     track_caller: bool,
+    fn_attrs: blaze_lir::func::FnAttrs,
     symbol: Box<str>,
     export: Option<Box<str>>,
     lits: Literals,
@@ -59,6 +60,7 @@ pub(super) fn table_one<'n>(
             abi: r.abi,
             nounwind: r.nounwind,
             track_caller: r.track_caller,
+            fn_attrs: r.fn_attrs,
             symbol: r.symbol,
             export: r.export,
             lits: r.lits,
@@ -99,6 +101,7 @@ fn row<'n>(
             abi: llvm.build.abi,
             nounwind: llvm.build.nounwind,
             track_caller: llvm.track_caller,
+            fn_attrs: symbols.fn_attrs,
             symbol: llvm.symbol.into(),
             export: symbols.export,
             lits: Literals::default(),
@@ -166,7 +169,7 @@ fn row<'n>(
     };
     // `#[rustc_nounwind]` makes any fn nounwind (core/src/panicking.rs:88-92).
     let nounwind = own.nounwind || symbols.nounwind;
-    Ok(Row { body, checked, kind, at, abi: own.abi, nounwind, track_caller: symbols.track_caller, symbol, export: symbols.export, lits, intrinsic })
+    Ok(Row { body, checked, kind, at, abi: own.abi, nounwind, track_caller: symbols.track_caller, fn_attrs: symbols.fn_attrs, symbol, export: symbols.export, lits, intrinsic })
 }
 
 /// The cause a survey files a left-out fn under: the refusal without the fn's own name or

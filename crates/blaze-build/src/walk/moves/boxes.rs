@@ -227,7 +227,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     pub(in crate::walk) fn place_path(&mut self, e: ExprId, derefs: u32) -> Result<Option<(PatId, blaze_lir::func::SlotId, u32, u32, bool)>, BuildError> {
         let start = self.moves.steps.len() as u32;
         let Some((x, drops)) = self.path_steps(e, derefs)? else { return Ok(None) };
-        let Some(mask) = self.owned.get(x.ix()).copied().flatten().and_then(|o| o.rest) else {
+        let Some(mask) = self.field_mask(x) else {
             self.moves.steps.truncate(start as usize);
             return Ok(None);
         };

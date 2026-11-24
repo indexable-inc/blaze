@@ -185,7 +185,8 @@ fn world(static_row: bool, captures: u32) -> World {
     let rs = fx.r(Mutbl::Not, st);
     let unit = fx.unit();
     let p0 = fx.param(0);
-    let g = fx.func("g", 1, &[p0], unit, vec![PClause::TypeOutlives { ty: p0, region: Region::Static }]);
+    let g_clauses = if static_row { vec![PClause::TypeOutlives { ty: p0, region: Region::Static }] } else { vec![] };
+    let g = fx.func("g", 1, &[p0], unit, g_clauses);
     let o = fx.opaque_key("h::{opaque#0}");
     fx.set_opaque_bounds(o, vec![]);
     let ot = fx.ty(PNode::Opaque(o, List::EMPTY));
@@ -200,11 +201,12 @@ fn world(static_row: bool, captures: u32) -> World {
     decls.opaque(o, captures);
     let mut heads = Heads { decls, shapes: vec::Vec::new(), bounds: vec::Vec::new() };
     heads.add(&fx, &arity, g, 0, &[p0], unit, &[]);
-    // `T: 'static` is `g`'s clause 0 (`Outlives::Type { clause: 0, .. }`), read as
-    // blaze-ladder front2/call_generics.rs reads it.
-    heads.decls.type_outlives(g, 0, Region::Static);
-    if static_row && let Some((_, b)) = heads.bounds.iter_mut().find(|(k, _)| *k == g) {
-        b.push((OutlivesType::Param(0), Region::Static));
+    if static_row {
+        heads.decls.clause(g, 0, 0, p0, &[]);
+        heads.decls.type_outlives(g, 0, Region::Static);
+        if let Some((_, b)) = heads.bounds.iter_mut().find(|(k, _)| *k == g) {
+            b.push((OutlivesType::Param(0), Region::Static));
+        }
     }
     let h_slots: &[Region] = if captures == 1 { &[Region::Param(0), Region::Param(0)] } else { &[Region::Param(0)] };
     heads.add(&fx, &arity, h, 1, &[rs], ot, h_slots);

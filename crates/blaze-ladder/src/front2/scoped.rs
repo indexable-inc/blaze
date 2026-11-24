@@ -402,22 +402,23 @@ mod tests {
     fn a_call_an_expansion_wrote_in_its_own_block_reads_that_block() {
         let item = "fn f(x: bool) { check!(x); }";
         let expansion = "if x { extern crate dep as __d ; let _m = __d :: unit ! ( ) ; } __d :: unit ! ( ) ;";
-        let mut text = std::string::String::from(item);
-        text.push_str(expansion);
         let alloc = blaze_own::testing::heap().alloc();
+        let mut text = blaze_own::AString::new_in(alloc);
+        text.push_str(item);
+        text.push_str(expansion);
         let krate = CrateItemKey(key(b"app"));
         let body = ItemKey(key(b"body"));
         let blocks = body_blocks(krate, body, item, alloc).unwrap_or_else(|| panic!("the item scans whole"));
         let written = nth(item, "check!(x)", 0);
         let calls = [written];
-        let expansions = blaze_lower::Expansions { text: &text, item_len: u32::try_from(item.len()).unwrap_or(u32::MAX), starts: &[0], calls: &calls };
+        let expansions = blaze_lower::Expansions { text: text.as_str(), item_len: u32::try_from(item.len()).unwrap_or(u32::MAX), starts: &[0], calls: &calls };
         // The keys as the names library makes them: the fn's block, its statement call, the
         // call's `if` block (the expansion's first written block).
         let fn_block = blocks.hand_module(written).unwrap_or_else(|| panic!("the fn's block is written: it holds a statement call"));
         let call = key_of(krate, fn_block, "MacroCall", "", 0);
         let want = expansion_block(krate, call, 0);
-        let inside = nth(&text, "__d :: unit ! ( )", 0);
-        let after = nth(&text, "__d :: unit ! ( )", 1);
+        let inside = nth(text.as_str(), "__d :: unit ! ( )", 0);
+        let after = nth(text.as_str(), "__d :: unit ! ( )", 1);
         assert_eq!(blocks.expansion_module(expansions, inside), Ok(Some(want)), "the path in the `if` block reads that block's module");
         assert_eq!(blocks.expansion_module(expansions, after), Ok(None), "the twin: the path after the block is in no block the expansion wrote");
         assert_ne!(Some(want), blocks.hand_module(written), "the control: the written call's block is another module");
@@ -468,5 +469,37 @@ mod tests {
         let calls = [nth(item, "check!(x)", 0)];
         let expansions = blaze_lower::Expansions { text: &text, item_len: u32::try_from(item.len()).unwrap_or(u32::MAX), starts: &[0], calls: &calls };
         assert_eq!(blocks.expansion_module(expansions, nth(&text, "__d :: unit ! ( )", 0)), Err(UNFILED_BLOCK));
+    }
+
+    /// `cfg_if!` (nybbles 0.4.8 `Nibbles::as_array`) expands through an attributed statement call
+    /// `#[cfg(all(..))] $crate :: cfg_if ! { @ __temp_group .. }` whose `MACRO_CALL` range in
+    /// body lowering starts at `$crate`, after the attribute, and whose expansion writes a
+    /// `const { assert!(..); }` block. Both an attributed hand-written call and an attributed
+    /// call inside an expansion must resolve to their filed block module, never `UNFILED_BLOCK`.
+    #[test]
+    fn an_attributed_statement_call_resolves_its_expansion_block() {
+        let item = "fn as_array() { #[cfg(all())] outer!(); }";
+        let first = "# [ cfg ( all ( ) ) ] $crate :: inner ! { }";
+        let second = "const { assert ! ( true ) ; }";
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut text = blaze_own::AString::new_in(alloc);
+        text.push_str(item);
+        text.push_str(first);
+        text.push_str(second);
+        let krate = CrateItemKey(key(b"app"));
+        let body = ItemKey(key(b"body"));
+        let blocks = body_blocks(krate, body, item, alloc).unwrap_or_else(|| panic!("the item scans whole"));
+        // Body lowering places `MACRO_CALL` at the path (`outer!()`, `$crate :: inner ! { }`),
+        // after any leading `#[cfg(..)]` attribute on the enclosing `MACRO_EXPR`.
+        let written = nth(item, "outer!()", 0);
+        let inner_call = nth(text.as_str(), "$crate :: inner ! { }", 0);
+        let calls = [written, inner_call];
+        let starts = [0, u32::try_from(first.len()).unwrap_or(u32::MAX)];
+        let expansions = blaze_lower::Expansions { text: text.as_str(), item_len: u32::try_from(item.len()).unwrap_or(u32::MAX), starts: &starts, calls: &calls };
+        let fn_block = blocks.hand_module(written).unwrap_or_else(|| panic!("the fn's block is written"));
+        let outer = key_of(krate, fn_block, "MacroCall", "", 0);
+        let inner = key_of(krate, outer, "MacroCall", "", 0);
+        let want = expansion_block(krate, inner, 0);
+        assert_eq!(blocks.expansion_module(expansions, nth(text.as_str(), "assert ! ( true )", 0)), Ok(Some(want)));
     }
 }

@@ -28,7 +28,7 @@ use blaze_lower::{View, form as lf, head};
 use blaze_own::{AVec, Alloc};
 use blaze_typeck as tc;
 use blaze_typeck::region_facts::RegionFacts;
-use blaze_typeck::regions::{Arity, Region, RegionError, Unknown, region_arity, slots};
+use blaze_typeck::regions::{Arity, Region, RegionError, Unknown, region_arity};
 
 use crate::front2::borrow_reads::drop_adt_read;
 use crate::front2::check::{Records, answer_impls};
@@ -200,13 +200,6 @@ fn field_row<'a, F: Arity + ?Sized>(tys: tc::PTys<'_>, root: tc::PTy, arity: &F,
     stack.push(root);
     let (mut taken, mut steps) = (0usize, 0u32);
     let table = |e| Unlaid::Count(RegionError::Table(e));
-    // The slots of `l`'s types, stepped over.
-    let skip = |l: tc::List, taken: &mut usize| -> Result<(), Unlaid> {
-        for &c in tys.list(l).map_err(table)? {
-            *taken = taken.checked_add(slots(tys, c, arity, alloc).map_err(Unlaid::Count)? as usize).ok_or(Unlaid::Unnamed)?;
-        }
-        Ok(())
-    };
     while let Some(t) = stack.pop() {
         steps += 1;
         if steps > MOST_NODES {
@@ -216,16 +209,12 @@ fn field_row<'a, F: Arity + ?Sized>(tys: tc::PTys<'_>, root: tc::PTy, arity: &F,
         // Nodes whose positions no `FieldRegion` names, before the counter is asked of them.
         if matches!(
             node,
-            tc::PNode::Alias { .. }
-                | tc::PNode::Opaque(..)
+            tc::PNode::Opaque(..)
                 | tc::PNode::Closure { .. }
                 | tc::PNode::Future(..)
                 | tc::PNode::Coroutine { .. }
                 | tc::PNode::Infer
                 | tc::PNode::Error
-                | tc::PNode::ExTrait(..)
-                | tc::PNode::ExProj { .. }
-                | tc::PNode::ExAuto(_)
         ) {
             return Err(Unlaid::Unnamed);
         }
@@ -234,14 +223,26 @@ fn field_row<'a, F: Arity + ?Sized>(tys: tc::PTys<'_>, root: tc::PTy, arity: &F,
         }
         match node {
             tc::PNode::Ref(_, inner) | tc::PNode::Ptr(_, inner) | tc::PNode::Slice(inner) | tc::PNode::Pat(inner, _) | tc::PNode::Array(inner, _) => stack.push(inner),
-            // A fn pointer's positions are its inputs' then its output's (lane B15), as a tuple's.
-            tc::PNode::Tuple(l) | tc::PNode::Record(_, l) | tc::PNode::Union(l) | tc::PNode::FnPtr(l, _) | tc::PNode::Adt(_, l) => {
+            // Pre-order child walk matching `RegionCol` / `RegionSlots` (`blaze_borrow::Columns`).
+            tc::PNode::Tuple(l)
+            | tc::PNode::Record(_, l)
+            | tc::PNode::Union(l)
+            | tc::PNode::FnPtr(l, _)
+            | tc::PNode::Adt(_, l)
+            | tc::PNode::Alias { args: l, .. }
+            | tc::PNode::Dynamic(l)
+            | tc::PNode::FnDef(_, l)
+            | tc::PNode::ExTrait(_, l) => {
                 for &a in tys.list(l).map_err(table)?.iter().rev() {
                     stack.push(a);
                 }
             }
-            // `dyn Tr<..> + 'a`: its one position is its own slot, taken above.
-            tc::PNode::Dynamic(l) | tc::PNode::FnDef(_, l) => skip(l, &mut taken)?,
+            tc::PNode::ExProj { args, term, .. } => {
+                stack.push(term);
+                for &a in tys.list(args).map_err(table)?.iter().rev() {
+                    stack.push(a);
+                }
+            }
             tc::PNode::Param(p) => out.push(FieldRegion::Arg(p)),
             tc::PNode::Bool
             | tc::PNode::Char
@@ -252,16 +253,13 @@ fn field_row<'a, F: Arity + ?Sized>(tys: tc::PTys<'_>, root: tc::PTy, arity: &F,
             | tc::PNode::Never
             | tc::PNode::ConstValue { .. }
             | tc::PNode::ConstParam(_)
-            | tc::PNode::Alias { .. }
+            | tc::PNode::ExAuto(_)
             | tc::PNode::Opaque(..)
             | tc::PNode::Closure { .. }
             | tc::PNode::Future(..)
             | tc::PNode::Coroutine { .. }
             | tc::PNode::Infer
             | tc::PNode::Error
-            | tc::PNode::ExTrait(..)
-            | tc::PNode::ExProj { .. }
-            | tc::PNode::ExAuto(_)
             // An extern type has no generics, so no region position.
             | tc::PNode::Foreign(_) => {}
         }
@@ -345,6 +343,31 @@ fn read_copy_impl<'a>(store: &Store<'_>, langs: super::BorrowLangs, adt: tc::Ite
     let sized = sized.or_else(|| store.sized.map(checker_of));
     let adt_preds = store.preds.get(&adt)?;
     for c in store.preds.get(&imp)?.clauses.iter() {
+        if let tc::PClause::TypeOutlives { ty, region } = *c {
+            // A `T: 'r` clause already required by the ADT's own predicates (e.g.
+            // `struct ReflectVtable<T: 'static, A>` with `impl<T: 'static, A> Copy`) is
+            // implied by well-formedness of any value of the ADT.
+            let implied = tys
+                .node(ty)
+                .ok()
+                .and_then(|n| match n {
+                    tc::PNode::Param(p) => param_of.iter().position(|&q| q == Some(p)),
+                    _ => None,
+                })
+                .is_some_and(|j| {
+                    adt_preds.clauses.iter().any(|ac| {
+                        matches!(
+                            *ac,
+                            tc::PClause::TypeOutlives { ty: aty, region: ar }
+                                if ar == region && matches!(tys.node(aty), Ok(tc::PNode::Param(q)) if q as usize == j)
+                        )
+                    })
+                });
+            if implied {
+                continue;
+            }
+            return None;
+        }
         let tc::PClause::Trait { trait_, args: cargs } = *c else { return None };
         // `PointeeSized` and `Destruct` hold for every type and ask nothing of the arguments.
         if Some(trait_) == pointee_sized || Some(trait_) == destruct {
@@ -520,6 +543,25 @@ fn mapped_pty_eq(
 const MOST_DROP_ADTS: usize = 256;
 const MOST_DROP_NODES: u32 = 4096;
 
+/// Whether `adt` implements `Copy` unconditionally (for every well-formed instantiation, so
+/// `Copy` implies no `Drop` impl and no dropping fields, rustc E0184/E0204).
+fn is_uncond_copy<'n, 'a, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    langs: super::BorrowLangs,
+    adt: tc::ItemKey,
+    copy_answered: Option<bool>,
+    scratch: &mut AVec<'a, bool>,
+    alloc: Alloc<'a>,
+) -> bool {
+    scratch.clear();
+    let Some((start, len)) = copy_args_of(r, langs, adt, copy_answered, scratch, alloc) else {
+        return false;
+    };
+    let s = start as usize;
+    let e = s.saturating_add(len as usize);
+    scratch.get(s..e).is_some_and(|need| need.iter().all(|&b| !b))
+}
+
 /// Structural drop summary for `adt`: `(needs_drop_unconditionally, drop_args_span)`.
 /// Computes a bounded fixed point over ADTs reachable from `adt`'s fields in dropping positions
 /// and files a `BorrowAdt` (`DROP_ADT_DETAIL`) read row for each nested ADT inspected (rule 21).
@@ -529,12 +571,13 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
     langs: super::BorrowLangs,
     adt: tc::ItemKey,
     adt_drop_impl: Option<bool>,
+    adt_uncond_copy: bool,
     need: &mut AVec<'a, bool>,
     reads: &mut AVec<'a, Read>,
     alloc: Alloc<'a>,
 ) -> (bool, Option<(u32, u32)>) {
     let is_inert = |k: tc::ItemKey| langs.manually_drop == Some(k) || langs.phantom_data == Some(k);
-    if is_inert(adt) {
+    if is_inert(adt) || adt_uncond_copy {
         let generics = BodyHeadFacts::new(&*r.store, r.names).adt(adt).map_or(0, |row| row.generics);
         return push_drop_mask(generics, 0, need);
     }
@@ -567,6 +610,7 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
     let mut field_tys: AVec<'a, tc::PTy> = AVec::new_in(alloc);
     let mut field_spans: AVec<'a, (usize, usize)> = AVec::new_in(alloc);
     let mut ty_stack: AVec<'a, tc::PTy> = AVec::new_in(alloc);
+    let mut copy_scratch: AVec<'a, bool> = AVec::new_in(alloc);
 
     while let Some(key) = nodes.get(cursor).map(|n| n.key) {
         let is_root = cursor == 0;
@@ -576,9 +620,17 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
                 super::ensure_one(r, Want::Adt(lib));
             }
         }
+        let uncond_copy = if is_root {
+            adt_uncond_copy
+        } else if inert {
+            false
+        } else {
+            let copy_impl = super::has_impl(r, langs.copy, key).ok();
+            is_uncond_copy(r, langs, key, copy_impl, &mut copy_scratch, alloc)
+        };
         let drop_impl = if is_root {
             adt_drop_impl
-        } else if inert {
+        } else if inert || uncond_copy {
             Some(false)
         } else {
             super::has_impl(r, langs.drop, key).ok()
@@ -602,10 +654,10 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
         let fields_end = field_tys.len();
         field_spans.push((fields_start, fields_end));
         if !is_root {
-            reads.push(drop_adt_read(key.0, made, union, inert, drop_impl, generics, fhash.finish()));
+            reads.push(drop_adt_read(key.0, made, union, inert, uncond_copy, drop_impl, generics, fhash.finish()));
         }
 
-        let fixed = if inert {
+        let fixed = if inert || uncond_copy {
             Some((false, 0))
         } else if !made || generics > 64 || drop_impl != Some(false) {
             Some((true, 0))

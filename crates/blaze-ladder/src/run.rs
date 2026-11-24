@@ -566,6 +566,7 @@ fn language_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, g
     crate::front2::coroutines::owner_of(program, adts, called, ground)
         .or_else(|| closure_owner(program, adts, called, ground))
         .or_else(|| crate::fn_shim::fn_shim_owner(program, adts, called, ground, caller))
+        .or_else(|| blaze_build::reify_shim_of(called, ground.view()).and_then(|t| program.fn_index(t.item)))
         .or_else(|| crate::clone_shim::language_from(program, called, ground).and_then(|f| program.fn_index(f.from)))
 }
 
@@ -1103,6 +1104,10 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     /// [items.fn.extern.unwind.behavior]).
     fn nounwind(&self, owner: ItemKey) -> Option<bool> {
         self.0.nounwind(owner)
+    }
+
+    fn fn_attrs(&self, owner: ItemKey) -> blaze_lir::func::FnAttrs {
+        self.0.fn_attrs(owner)
     }
 
     /// The front end resolves the function's own or inherited caller-tracking attribute.
@@ -2181,6 +2186,8 @@ fn build_from<P: FrontEnd>(
             clones.key_args(shim, ground).map_err(fail)?
         } else if instance.item == program.function(c).key {
             instance.args
+        } else if let Some(target) = blaze_build::reify_shim_of(instance, ground.view()) {
+            blaze_build::reify_shim_key_args(target, ground, alloc).map_err(fail)?
         } else if crate::front2::coroutines::self_is_coroutine(instance, ground) {
             // One of a coroutine's three functions, tabled as its owner (front2/coroutines.rs).
             crate::front2::coroutines::key_args(instance, ground, alloc).map_err(fail)?
@@ -2274,7 +2281,11 @@ fn build_from<P: FrontEnd>(
                     } else {
                         static_instances.get(&key).copied()
                     };
-                    let Some(instance) = target else { continue };
+                    let Some(mut instance) = target else { continue };
+                    if program.track_caller(instance.item) == Some(true) {
+                        instance = blaze_build::reify_shim_instance(instance, &mut ground)
+                            .map_err(|error| RunError::Build { function: program.function(entry.unwrap_or(0)).named(), error, range: None })?;
+                    }
                     let tabled = make_one::static_fn_tabled(program, instance, ground.view());
                     let Some(c) = program.fn_index(tabled) else { continue };
                     let facts = FrontAdts(program, c, &consts, &langs, &checked_bodies);
@@ -2505,17 +2516,22 @@ fn build_from<P: FrontEnd>(
         // One of a coroutine's three functions (`Future::poll`, the resume fn, `drop_in_place`,
         // each at `[coroutine]`; tabled as the block's owner): taken from the one build of that
         // coroutine instance (front2/coroutines.rs, `build_coroutines`).
-        let coroutine = if is_own_instance {
+        let reify = if is_own_instance {
+            None
+        } else {
+            blaze_build::reify_shim_of(instance, ground.view())
+        };
+        let coroutine = if is_own_instance || reify.is_some() {
             None
         } else {
             crate::front2::coroutines::part_of(&FrontAdts(program, i, &consts, &langs, &checked_bodies), instance, &ground)
         };
-        let shim = if is_own_instance || coroutine.is_some() {
+        let shim = if is_own_instance || reify.is_some() || coroutine.is_some() {
             None
         } else {
             crate::fn_shim::fn_shim_of(&FrontAdts(program, i, &consts, &langs, &checked_bodies), instance, &ground)
         };
-        let closure = if is_own_instance || shim.is_some() || coroutine.is_some() {
+        let closure = if is_own_instance || reify.is_some() || shim.is_some() || coroutine.is_some() {
             None
         } else {
             let first = ground.view().list(instance.args).map_err(malformed)?.first().copied();
@@ -2530,6 +2546,8 @@ fn build_from<P: FrontEnd>(
         };
         let owner_args = if spec_i.is_some() {
             List::EMPTY
+        } else if let Some(target) = reify {
+            target.args
         } else {
             match shim {
                 Some(s) => s.item.map_or(List::EMPTY, |(_, fn_args)| fn_args),
@@ -2612,9 +2630,11 @@ fn build_from<P: FrontEnd>(
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, world, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, world, Global),
             }
-        } else if clone_row.is_some() || from_row.is_some() {
+        } else if reify.is_some() || clone_row.is_some() || from_row.is_some() {
             let g = Global;
-            if let Some((s, copy)) = clone_row {
+            if let Some(target) = reify {
+                blaze_build::build_reify_shim(target.item, &program.sig(i), &mut subst, world, g)
+            } else if let Some((s, copy)) = clone_row {
                 // A builtin clone: its bytes when `Self: Copy`, else each field's own `clone`.
                 match copy {
                     Some(copy) => blaze_build::build_builtin_clone(s.clone, copy, &mut subst, world, g),
