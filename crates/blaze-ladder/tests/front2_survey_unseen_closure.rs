@@ -260,6 +260,53 @@ pub extern \"C\" fn main() -> i32 {
 }
 ";
 
+/// Models `cookie_factory::sequence::Tuple::serialize` with `Self` a tuple of closures where an
+/// element is an imported closure carrying an opaque in its owner arguments (`wrap(make(5))` inside
+/// `seq((make(2), wrap(make(5))))`). Resolving `Seq::serialize` unifies the tuple impl's parameter
+/// with the imported closure; `Relate::Lazy` generalizes the inner opaque, `select_all` normalizes
+/// it to `make`'s closure, and `adopt` must recognize the rebuilt closure from `rows.foreign`. 7.
+const TUPLE_OF_CLOSURES_OVER_OPAQUE: &str = "
+trait SerializeFn<W>: Fn(W) -> W {}
+
+impl<W, F: Fn(W) -> W> SerializeFn<W> for F {}
+
+trait Seq<W> {
+    fn serialize(&self, w: W) -> W;
+}
+
+impl<W: Copy, A: SerializeFn<W>, B: SerializeFn<W>> Seq<W> for (A, B) {
+    fn serialize(&self, w: W) -> W {
+        let a = (self.0)(w);
+        (self.1)(a)
+    }
+}
+
+fn make(n: u32) -> impl SerializeFn<u32> {
+    move |w: u32| match n {
+        0 => w,
+        _ => n,
+    }
+}
+
+fn wrap<G: SerializeFn<u32>>(g: G) -> impl SerializeFn<u32> {
+    move |w: u32| g(w)
+}
+
+fn seq<W: Copy, L: Seq<W>>(l: L) -> impl SerializeFn<W> {
+    move |w: W| l.serialize(w)
+}
+
+fn run_ser<W, F: SerializeFn<W>>(f: F, w: W) -> W {
+    f(w)
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let s = seq((make(2), wrap(make(7))));
+    run_ser(s, 0) as i32
+}
+";
+
 /// Surveys `HEAD` + `tail` on the census's path: the refused rows, and `(built, tried)`.
 fn survey(tail: &str) -> (Vec<String>, usize, usize) {
     let text = [HEAD, tail].concat();
@@ -346,4 +393,15 @@ fn an_array_in_a_selected_impls_arguments_exports_its_length() {
     let got = run(ARRAY_IN_IMPL_ARGS);
     println!("ARRAY IN IMPL ARGS: {got:?}");
     assert_eq!(got, Ok(4));
+}
+
+/// Prints `SURVEY: n of n instances (0 refused: )` and `TUPLE OF CLOSURES OVER OPAQUE: Ok(7)`.
+#[test]
+fn tuple_impl_of_closures_over_opaque_resolves_and_runs() {
+    let (rows, built, tried) = survey(TUPLE_OF_CLOSURES_OVER_OPAQUE);
+    assert!(rows.is_empty(), "every instance builds: {rows:?}");
+    assert!(tried > 0 && built == tried, "{built} of {tried}");
+    let got = run(TUPLE_OF_CLOSURES_OVER_OPAQUE);
+    println!("TUPLE OF CLOSURES OVER OPAQUE: {got:?}");
+    assert_eq!(got, Ok(7));
 }
