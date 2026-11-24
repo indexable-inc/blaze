@@ -139,6 +139,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     _ => return Ok(false),
                 },
                 Expr::Tuple { elems } | Expr::Array { elems } => work.extend_from_slice(self.body.expr_list(elems)?),
+                Expr::Repeat { elem, .. } => work.push(elem),
                 Expr::Struct { fields, base: crate::body::StructBase::None, .. } => {
                     for f in self.body.field_init_list(fields)? {
                         work.push(f.expr);

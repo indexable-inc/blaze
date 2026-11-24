@@ -767,6 +767,7 @@ fn proj_clause_of<'v>(heads: &dyn RegionTypes, views: &'v [ClauseView<'v>], p: u
 struct Sink<'s, A: Allocator + Copy> {
     b: &'s mut Builder<A>,
     static_: Origin,
+    dyn_ph: &'s mut Vec<Origin, A>,
     /// The planted control: drop the next subset.
     drop_next: bool,
 }
@@ -789,6 +790,20 @@ impl<A: Allocator + Copy> Constraints for Sink<'_, A> {
             self.b.known(self.static_, o);
         }
         o
+    }
+    fn dyn_placeholder(&mut self, ordinal: u32) -> Origin {
+        let Ok(idx) = usize::try_from(ordinal) else { return self.fresh(Kind::Placeholder) };
+        if let Some(&o) = self.dyn_ph.get(idx) {
+            return o;
+        }
+        let mut last = self.static_;
+        while self.dyn_ph.len() <= idx {
+            let o = self.b.origin(true);
+            self.b.known(self.static_, o);
+            self.dyn_ph.push(o);
+            last = o;
+        }
+        last
     }
 }
 
@@ -1146,7 +1161,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 bodies: BodyParams { rows: &body_rows, held: &held },
                 closures: ClosureSigs { rows: &closure_rows, regs: &closure_regs },
             };
-            let mut sink = Sink { b: &mut self.b, static_, drop_next: drop_first };
+            let mut sink = Sink { b: &mut self.b, static_, dyn_ph: &mut self.dyn_bound_placeholders, drop_next: drop_first };
             let mut cx = Cx { types: &caller, sig_types: &heads, selected: &sel, owner: &who, origins: &col, out: &mut sink };
             blaze_borrow::call(&mut cx, Callee::Fn(sig), GenericArgs { lifetimes, types: &types }, &args, dest, self.alloc)
         };
@@ -1280,7 +1295,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             bodies: BodyParams { rows: &body_rows, held: &held },
             closures: ClosureSigs { rows: &[], regs: &[] },
         };
-        let mut sink = Sink { b: &mut self.b, static_, drop_next: false };
+        let mut sink = Sink { b: &mut self.b, static_, dyn_ph: &mut self.dyn_bound_placeholders, drop_next: false };
         let mut cx = Cx { types: &caller, sig_types: &heads, selected: &sel, owner: &who, origins: &col, out: &mut sink };
         let generics = GenericArgs { lifetimes, types: &[] };
         let res = if out_match.is_some() {
@@ -1533,10 +1548,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 return self.refuse(Form::Bound, e);
             }
             if let Some(expr) = self.body_expr(t, e)? {
-                for &row in self.captures_of(expr) {
-                    let i = row as usize;
-                    let Some(&pat) = ck.captures.column::<1>().get(i) else { return self.refuse(Form::Malformed, e) };
-                    let Some(&c) = ck.local_ty.get(pat.ix()) else { return self.refuse(Form::Malformed, e) };
+                for f in ck.env_fields_by::<blaze_typeck::Places>(expr) {
+                    let Some(c) = f.place_ty(ck) else { return self.refuse(Form::Malformed, e) };
                     stack.push(c);
                 }
                 continue;

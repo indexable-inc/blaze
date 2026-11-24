@@ -485,10 +485,22 @@ pub trait Facts {
     fn drop_strict(&self, _adt: ItemKey) -> Option<&[bool]> {
         None
     }
+    /// For each declared lifetime parameter `0..lifetimes` of `adt`, whether dropping `adt` may
+    /// observe that lifetime (via a `Drop` impl, a dropping field whose drop observes it, a
+    /// strict `Drop` arg, or a trait object/opaque/alias in a dropping field). `None`:
+    /// conservative (`true` whenever `drop_impl || needs_drop`).
+    fn drop_lifetimes(&self, _adt: ItemKey) -> Option<&[bool]> {
+        None
+    }
     /// The number of fields of `variant`.
     fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32>;
     /// Whether the body's generic parameter `index` is bounded by `Copy`.
     fn param_copy(&self, index: u32) -> bool;
+    /// Whether a projection `PNode::Alias` in this body is bounded by `Copy` (via its
+    /// associated type item's bounds or the body owner's `where` clauses).
+    fn alias_copy(&self, _alias: PTy) -> bool {
+        false
+    }
 }
 
 /// Which check of a signature's laying refused it ([`Form::SigPositionsUnaligned`]). `input`:
@@ -1513,6 +1525,7 @@ pub fn pty_is_copy<'a, 'c, F: Facts, A: Allocator + Copy, E>(
         | PNode::Ref(Mutbl::Not, _) => Some(true),
         PNode::Ref(Mutbl::Mut, _) => Some(false),
         PNode::Param(i) => Some(walk.facts.param_copy(i)),
+        PNode::Alias { .. } => Some(walk.facts.alias_copy(root)),
         PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) if l.len == 0 => Some(true),
         PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
         PNode::Closure { owner, .. } => match walk.closures {
@@ -1596,6 +1609,11 @@ pub fn pty_is_copy<'a, 'c, F: Facts, A: Allocator + Copy, E>(
             }
             PNode::Param(i) => {
                 if !walk.facts.param_copy(i) {
+                    return set_false();
+                }
+            }
+            PNode::Alias { .. } => {
+                if !walk.facts.alias_copy(t) {
                     return set_false();
                 }
             }
@@ -1924,10 +1942,14 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule = one_
     async_root: Option<ExprId>,
     /// True when lowering a nested closure or async block body (not a top-level fn/async fn).
     in_nested: bool,
-    /// For a non-async RPIT fn (`-> impl Trait`), the placeholder representing the opaque's
-    /// captured lifetimes (`future_region(regions)`). Every concrete return position gets a
-    /// distinct existential constrained one-way into `rpit_out` at each return.
-    rpit_out: Option<Origin>,
+    /// For RPIT / RPITIT outputs (`-> impl Trait` or nested `-> Result<impl Trait, E>`):
+    /// each `(return_slot_index, future_region_placeholder)` pair. Every concrete return position
+    /// inside an RPIT opaque gets a distinct existential constrained one-way into its opaque's
+    /// captured-lifetimes placeholder at each return.
+    rpit_outs: Vec<(u32, Origin), A>,
+    /// Canonical rigid placeholders for `dyn for<..>` binder ordinals in invariant position
+    /// (`Sink::dyn_placeholder`), shared across calls in this body.
+    dyn_bound_placeholders: Vec<Origin, A>,
     /// True when the outer body is an `async fn` whose return place `Local(0)` holds the single
     /// opaque future region (`future_region`), so the root async block's capture origins flow one
     /// way into it without equating independent captures (`relate`).
@@ -2054,7 +2076,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             nargs: n,
             async_root: None,
             in_nested: false,
-            rpit_out: None,
+            rpit_outs: Vec::new_in(alloc),
+            dyn_bound_placeholders: Vec::new_in(alloc),
             async_body: false,
             upvar_places: Vec::new_in(alloc),
             env_now: Vec::new_in(alloc),
@@ -2350,13 +2373,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 // reference, then the captured type's own.
                 PNode::Future(fe, _, _) => {
                     let ck: &'c Checked<'c> = self.ck;
-                    for &row in self.captures_of(fe) {
-                        let i = row as usize;
-                        if ck.captures.column::<2>()[i] != blaze_typeck::CaptureKind::ByValue {
+                    for f in ck.env_fields_by::<blaze_typeck::Places>(fe) {
+                        if f.how != blaze_typeck::CaptureKind::ByValue {
                             n += 1;
                         }
-                        match ck.local_ty.get(ck.captures.column::<1>()[i].ix()) {
-                            Some(&t) => stack.push(t),
+                        match f.place_ty(ck) {
+                            Some(t) => stack.push(t),
                             None => return self.refuse(Form::Malformed, e),
                         }
                     }
@@ -2417,7 +2439,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         // start in the closure's, how many, and its type.
         let mut rel: Vec<(Place, u32, u32, TyD), A> = Vec::new_in(self.alloc);
         let mut at = ci.start;
-        if matches!(self.expr(e)?, Expr::Closure { .. }) {
+        if matches!(self.expr(e)?, Expr::Closure { .. } | Expr::AsyncBlock { .. }) {
             let mut fields: Vec<blaze_typeck::EnvField, A> = Vec::new_in(self.alloc);
             for f in ck.env_fields_by::<blaze_typeck::Places>(e) {
                 fields.push(f);
@@ -2721,8 +2743,15 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                             };
                             todo.push(Step::Ty(x, if is_strict { DropMode::Strict } else { DropMode::Glue }));
                         }
-                        for _ in 0..af.lifetimes {
-                            todo.push(Step::Pos(OriginLive::Full));
+                        let drop_lts = self.facts.drop_lifetimes(k);
+                        for j in (0..af.lifetimes).rev() {
+                            let live_lt = match drop_lts {
+                                Some(d) if usize::try_from(af.lifetimes) == Ok(d.len()) => {
+                                    usize::try_from(j).ok().and_then(|ix| d.get(ix).copied()).unwrap_or(true)
+                                }
+                                _ => true,
+                            };
+                            todo.push(Step::Pos(if live_lt { OriginLive::Full } else { OriginLive::NoDrop }));
                         }
                     } else {
                         let drop_args = self.facts.drop_args(k);
@@ -3734,6 +3763,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             let future = async_body || rpit_future;
             let input = (!is_out).then_some(i);
             let unaligned = |site| Form::SigPositionsUnaligned { positions: n as usize, regions: regions.len(), site };
+            let mut rpit_laid = grain::RpitLaid::new_in(self.alloc);
             if future {
                 if !matches!(self.head_node(declared, root)?, PNode::Opaque(..)) {
                     return self.refuse(unaligned(SigSite::FutureNotOpaque), root);
@@ -3744,14 +3774,24 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 }
             } else if t.wrap.is_some() {
                 return self.refuse(unaligned(SigSite::Wrapped { input }), root);
-            } else if !self.lay_over(declared, t.ty, regions, &mut laid, root)? {
+            } else if !self.lay_over_rpit(declared, t.ty, regions, &mut laid, is_out.then_some(&mut rpit_laid), root)? {
                 return self.refuse(unaligned(SigSite::Unlaid { input }), root);
             } else if laid.len() != n as usize {
                 return self.refuse(unaligned(SigSite::Count { input }), root);
             }
             let start = self.origs.len() as u32;
             if rpit_opaque {
-                self.rpit_out = Some(self.future_region(regions));
+                let out_o = self.future_region(regions);
+                for k in 0..n {
+                    self.rpit_outs.push((k, out_o));
+                }
+            }
+            let mut rpit_group_origins: Vec<Origin, A> = Vec::new_in(self.alloc);
+            for &(cap_start, cap_len) in rpit_laid.groups.iter() {
+                let lo = usize::try_from(cap_start).unwrap_or(usize::MAX);
+                let hi = lo.saturating_add(usize::try_from(cap_len).unwrap_or(0));
+                let caps = rpit_laid.caps.get(lo..hi).unwrap_or(&[]);
+                rpit_group_origins.push(self.future_region(caps));
             }
             let mut live_mask: Vec<OriginLive, A> = Vec::new_in(self.alloc);
             if n > 0 && !async_body {
@@ -3765,7 +3805,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     // never one shared placeholder (that would relate independent captures or
                     // conflict with invariant positions like `&'static` in a closure). For
                     // `rpit_opaque`, each return constrains every position one-way into
-                    // `self.rpit_out` (`future_region(regions)`).
+                    // `self.rpit_outs` (`future_region(regions)`).
+                    self.b.origin(false)
+                } else if let Ok(k32) = u32::try_from(k)
+                    && let Some(&(_, gid)) = rpit_laid.slots.iter().find(|&&(slot, _)| slot == k32)
+                    && let Some(&out_o) = usize::try_from(gid).ok().and_then(|gi| rpit_group_origins.get(gi))
+                {
+                    self.rpit_outs.push((k32, out_o));
                     self.b.origin(false)
                 } else {
                     match laid.get(k) {
@@ -4036,7 +4082,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// In the rule's grain (grain.rs `Grain::lay`): this walk under the positions; under the
     /// slot grain grain.rs `lay_slots`, the same rule over every slot.
     fn lay_over(&self, declared: PTy, body_t: PTy, slots: &[Region], out: &mut Vec<Option<Region>, A>, e: ExprId) -> Result<bool, Refusal> {
-        <R::Grain as grain::Grain>::lay(self, declared, body_t, slots, out, e)
+        <R::Grain as grain::Grain>::lay(self, declared, body_t, slots, out, None, e)
+    }
+
+    fn lay_over_rpit(
+        &self,
+        declared: PTy,
+        body_t: PTy,
+        slots: &[Region],
+        out: &mut Vec<Option<Region>, A>,
+        rpit: Option<&mut grain::RpitLaid<A>>,
+        e: ExprId,
+    ) -> Result<bool, Refusal> {
+        <R::Grain as grain::Grain>::lay(self, declared, body_t, slots, out, rpit, e)
     }
 
     /// [`Lower::lay_over`]; `through_impls` false inside an impl's value (its projections are
@@ -4767,10 +4825,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     self.closure_sig_kept(v.ty.ty, e)?;
                 }
                 self.assign_val(rp, rt, v, e)?;
-                if let Some(out_o) = self.rpit_out {
+                if !self.rpit_outs.is_empty() {
                     let ri = self.info(rp);
-                    for k in ri.start..ri.start + ri.len {
-                        self.b.subset(self.origs[k as usize], out_o);
+                    for &(slot, out_o) in self.rpit_outs.iter() {
+                        if let Some(idx) = ri.start.checked_add(slot).and_then(|v| usize::try_from(v).ok())
+                            && let Some(&orig) = self.origs.get(idx)
+                        {
+                            self.b.subset(orig, out_o);
+                        }
                     }
                 }
                 self.exit_drops(0, 0, e)?;
@@ -4790,10 +4852,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     self.closure_sig_kept(v.ty.ty, e)?;
                 }
                 self.assign_val(rp, rt, v, e)?;
-                if let Some(out_o) = self.rpit_out {
+                if !self.rpit_outs.is_empty() {
                     let ri = self.info(rp);
-                    for k in ri.start..ri.start + ri.len {
-                        self.b.subset(self.origs[k as usize], out_o);
+                    for &(slot, out_o) in self.rpit_outs.iter() {
+                        if let Some(idx) = ri.start.checked_add(slot).and_then(|v| usize::try_from(v).ok())
+                            && let Some(&orig) = self.origs.get(idx)
+                        {
+                            self.b.subset(orig, out_o);
+                        }
                     }
                 }
                 self.exit_drops(0, 0, e)?;

@@ -25,7 +25,7 @@ use blaze_typeck as tc;
 use core::alloc::Allocator;
 
 use super::body::Body;
-use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, clauses_read, copy_supertrait_read, file_borrow_reads, head_read, impl_read};
+use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, assoc_copy_read, clauses_read, copy_supertrait_read, file_borrow_reads, head_read, impl_read};
 use super::check::{Records, answer_impls, eval_len};
 use super::reads::Read;
 use super::borrows_nested::{FlowOf, NestedFacts, Requirements, closure_flow_of, flow_of, nested_inner_first, nested_range, next_nested};
@@ -503,9 +503,16 @@ pub struct BorrowFacts<'a> {
     /// key: where its arguments' strict flags are in `drop_strict_need` (`Facts::drop_strict`).
     drop_strict: AVec<'a, (u128, u32, u32)>,
     drop_strict_need: AVec<'a, bool>,
+    /// Per ADT whose per-lifetime drop-liveness summary was read, sorted by checker key: where
+    /// its lifetime flags are in `drop_lt_need` (`Facts::drop_lifetimes`).
+    drop_lifetimes: AVec<'a, (u128, u32, u32)>,
+    drop_lt_need: AVec<'a, bool>,
     /// The body owner's type parameters bounded by `Copy` in its clauses (own and inherited:
     /// `Preds::clauses`), sorted, each once (`Facts::param_copy`).
     param_copy: AVec<'a, u32>,
+    /// `PNode::Alias` types in this body bounded by `Copy` (via their associated type's own
+    /// trait bounds or the body owner's `where` clauses), sorted by `PTy::0` (`Facts::alias_copy`).
+    alias_copy: AVec<'a, u32>,
     /// Per callee with a made head, sorted. Its signature regions are NOT here: the lowering
     /// reads them from the head records ([`BorrowFacts::read_by`], D148), each in place.
     callees: AVec<'a, (u128, CalleeFacts)>,
@@ -634,7 +641,10 @@ impl<'a> BorrowFacts<'a> {
             drop_need: AVec::new_in(alloc),
             drop_strict: AVec::new_in(alloc),
             drop_strict_need: AVec::new_in(alloc),
+            drop_lifetimes: AVec::new_in(alloc),
+            drop_lt_need: AVec::new_in(alloc),
             param_copy: AVec::new_in(alloc),
+            alias_copy: AVec::new_in(alloc),
             callees: AVec::new_in(alloc),
             calls: super::call_generics::CallBoundsTable::new_in(alloc),
             ties: ties::TiesTable::new_in(alloc),
@@ -778,8 +788,18 @@ impl Facts for ReadBy<'_, '_> {
         let end = start.checked_add(usize::try_from(len).ok()?)?;
         self.facts.drop_strict_need.get(start..end)
     }
+    fn drop_lifetimes(&self, adt: tc::ItemKey) -> Option<&[bool]> {
+        let at = self.facts.drop_lifetimes.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
+        let &(_, start, len) = self.facts.drop_lifetimes.get(at)?;
+        let start = usize::try_from(start).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        self.facts.drop_lt_need.get(start..end)
+    }
     fn param_copy(&self, index: u32) -> bool {
         self.facts.param_copy.binary_search(&index).is_ok()
+    }
+    fn alias_copy(&self, alias: tc::PTy) -> bool {
+        self.facts.alias_copy.binary_search(&alias.0).is_ok()
     }
     fn shape(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::Shape<'_>> {
         let at = self.facts.shapes.binary_search_by_key(&item.0, |(k, _)| *k).ok()?;
@@ -866,6 +886,102 @@ impl Facts for ReadBy<'_, '_> {
 /// reference to a type parameter or to a type with no reference at its head, a type with no
 /// reference at its head, or not read (a projection, an opaque type or a trait object, which may
 /// stand for a reference; two references deep).
+/// Structural equality of two erased `PTy`s residing in different `PTys` tables (bounded,
+/// zero-allocation, used to match owner `where` clauses against body `PNode::Alias` types).
+fn pty_eq_across(ta: tc::PTys<'_>, a: tc::PTy, tb: tc::PTys<'_>, b: tc::PTy) -> bool {
+    let mut stack = [(tc::PTy(0), tc::PTy(0)); 64];
+    let mut sp = 1usize;
+    stack[0] = (a, b);
+    let mut steps = 0u32;
+    while sp > 0 {
+        steps += 1;
+        if steps > 256 {
+            return false;
+        }
+        sp -= 1;
+        let Some(&(x, y)) = stack.get(sp) else { return false };
+        let (Ok(nx), Ok(ny)) = (ta.node(x), tb.node(y)) else { return false };
+        let push_pair = |stack: &mut [(tc::PTy, tc::PTy); 64], sp: &mut usize, px: tc::PTy, py: tc::PTy| -> bool {
+            let Some(slot) = stack.get_mut(*sp) else { return false };
+            *slot = (px, py);
+            *sp += 1;
+            true
+        };
+        let push_lists = |stack: &mut [(tc::PTy, tc::PTy); 64], sp: &mut usize, lx: tc::List, ly: tc::List| -> bool {
+            let (Ok(sx), Ok(sy)) = (ta.list(lx), tb.list(ly)) else { return false };
+            if sx.len() != sy.len() {
+                return false;
+            }
+            for (&ex, &ey) in sx.iter().zip(sy.iter()) {
+                if !push_pair(stack, sp, ex, ey) {
+                    return false;
+                }
+            }
+            true
+        };
+        match (nx, ny) {
+            (tc::PNode::Bool, tc::PNode::Bool)
+            | (tc::PNode::Char, tc::PNode::Char)
+            | (tc::PNode::Str, tc::PNode::Str)
+            | (tc::PNode::Never, tc::PNode::Never) => {}
+            (tc::PNode::Int(i), tc::PNode::Int(j)) if i == j => {}
+            (tc::PNode::Uint(i), tc::PNode::Uint(j)) if i == j => {}
+            (tc::PNode::Float(i), tc::PNode::Float(j)) if i == j => {}
+            (tc::PNode::Param(i), tc::PNode::Param(j)) if i == j => {}
+            (tc::PNode::ConstParam(i), tc::PNode::ConstParam(j)) if i == j => {}
+            (tc::PNode::ConstValue { ty: tx, bits: vx }, tc::PNode::ConstValue { ty: ty, bits: vy }) if vx == vy => {
+                if !push_pair(&mut stack, &mut sp, tx, ty) {
+                    return false;
+                }
+            }
+            (tc::PNode::Ref(mx, ix), tc::PNode::Ref(my, iy)) | (tc::PNode::Ptr(mx, ix), tc::PNode::Ptr(my, iy)) if mx == my => {
+                if !push_pair(&mut stack, &mut sp, ix, iy) {
+                    return false;
+                }
+            }
+            (tc::PNode::Slice(ix), tc::PNode::Slice(iy)) => {
+                if !push_pair(&mut stack, &mut sp, ix, iy) {
+                    return false;
+                }
+            }
+            (tc::PNode::Array(ix, lx), tc::PNode::Array(iy, ly)) if lx == ly => {
+                if !push_pair(&mut stack, &mut sp, ix, iy) {
+                    return false;
+                }
+            }
+            (tc::PNode::Tuple(lx), tc::PNode::Tuple(ly))
+            | (tc::PNode::Union(lx), tc::PNode::Union(ly))
+            | (tc::PNode::Dynamic(lx), tc::PNode::Dynamic(ly)) => {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (tc::PNode::Adt(kx, lx), tc::PNode::Adt(ky, ly))
+            | (tc::PNode::Opaque(kx, lx), tc::PNode::Opaque(ky, ly))
+            | (tc::PNode::FnDef(kx, lx), tc::PNode::FnDef(ky, ly))
+            | (tc::PNode::ExTrait(kx, lx), tc::PNode::ExTrait(ky, ly))
+                if kx == ky =>
+            {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (tc::PNode::FnPtr(lx, sx), tc::PNode::FnPtr(ly, sy)) if sx == sy => {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (tc::PNode::Alias { trait_: tx, name: nx, args: lx }, tc::PNode::Alias { trait_: ty, name: ny, args: ly }) if tx == ty && nx == ny => {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn field_lead(tys: tc::PTys<'_>, t: tc::PTy) -> FieldLead {
     let plain = |n: tc::PNode| {
         matches!(
@@ -1630,6 +1746,134 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         g.assoc_items.sort_unstable_by_key(|&(k, n, _)| (k, n));
         g.assoc_items.dedup_by_key(|&mut (k, n, _)| (k, n));
     }
+    // Check which `PNode::Alias` types in this body are bounded by `Copy` (either via their
+    // associated type item's own trait bounds `type At<'a>: Copy` / supertrait of `Copy`, or
+    // via the body owner's `where` clauses `M::At<'_>: Copy`).
+    if let Some(copy_tr) = langs.copy {
+        let mut visited: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+        let mut stack: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+        let mut direct: AVec<'a, u128> = AVec::new_in(alloc);
+        let mut recorded: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+        let mut assoc_copy_cache: AVec<'a, (u128, bool)> = AVec::new_in(alloc);
+        let mut reaches_copy = |r: &mut Records<'_, 'n, S>, start: tc::ItemKey, reads: &mut AVec<'a, Read>| -> bool {
+            visited.clear();
+            stack.clear();
+            stack.push(start);
+            while let Some(t) = stack.pop() {
+                if t == copy_tr {
+                    return true;
+                }
+                if visited.scan_for(&t).is_some() || visited.len() >= 64 {
+                    continue;
+                }
+                visited.push(t);
+                if !r.store.trait_defs.contains_key(&t)
+                    && let Some(lib) = r.keys.library_in(r.names, t)
+                {
+                    ensure_one(r, Want::Members(lib));
+                }
+                direct.clear();
+                let mut self_static = false;
+                if let Some(def) = r.store.trait_defs.get(&t) {
+                    let tys = r.store.tys.view();
+                    for sc in def.supertraits.iter() {
+                        match *sc {
+                            tc::PClause::Trait { trait_: sup, args }
+                                if tys.list(args).ok().and_then(|l| l.first().copied()).is_some_and(|first| matches!(tys.node(first), Ok(tc::PNode::Param(0)))) =>
+                            {
+                                direct.push(sup.0);
+                            }
+                            tc::PClause::TypeOutlives { ty, region: tc::regions::Region::Static }
+                                if matches!(tys.node(ty), Ok(tc::PNode::Param(0))) =>
+                            {
+                                self_static = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    direct.sort_unstable();
+                    direct.dedup();
+                    if recorded.scan_for(&t).is_none() {
+                        recorded.push(t);
+                        reads.push(copy_supertrait_read(t.0, Some((&direct, self_static))));
+                    }
+                    for &sup in direct.iter() {
+                        stack.push(tc::ItemKey(sup));
+                    }
+                } else if recorded.scan_for(&t).is_none() {
+                    recorded.push(t);
+                    reads.push(copy_supertrait_read(t.0, None));
+                }
+            }
+            false
+        };
+        let body_tys = c.types.view();
+        for (idx, n) in body_tys.nodes().enumerate() {
+            let tc::PNode::Alias { trait_, name, .. } = *n else { continue };
+            let mut is_copy = false;
+            if let Ok(pos) = g.assoc_items.binary_search_by_key(&(trait_.0, name), |&(k, nm, _)| (k, nm))
+                && let Some(&(_, _, a_item)) = g.assoc_items.get(pos)
+            {
+                if let Some(&(_, cached)) = assoc_copy_cache.iter().find(|&&(k, _)| k == a_item.0) {
+                    is_copy = cached;
+                } else {
+                    let mut sups: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+                    if let Some(ap) = r.store.preds.get(&a_item) {
+                        let stys = r.store.tys.view();
+                        for ac in ap.clauses.iter() {
+                            if let tc::PClause::Trait { trait_: sup, args } = *ac
+                                && let Ok(list) = stys.list(args)
+                                && let Some(&first) = list.first()
+                                && let Ok(tc::PNode::Alias { trait_: at, name: an, .. }) = stys.node(first)
+                                && at == trait_
+                                && an == name
+                            {
+                                sups.push(sup);
+                            }
+                        }
+                    }
+                    let mut found = false;
+                    for &sup in sups.iter() {
+                        if reaches_copy(r, sup, &mut g.reads) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    assoc_copy_cache.push((a_item.0, found));
+                    g.reads.push(assoc_copy_read(a_item.0, found));
+                    is_copy = found;
+                }
+            }
+            if !is_copy
+                && let Ok(pty_id) = u32::try_from(idx)
+            {
+                let mut owner_sups: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+                if let Some(op) = r.store.preds.get(&owner) {
+                    let stys = r.store.tys.view();
+                    for oc in op.clauses.iter() {
+                        if let tc::PClause::Trait { trait_: sup, args } = *oc
+                            && let Ok(list) = stys.list(args)
+                            && let Some(&first) = list.first()
+                            && pty_eq_across(stys, first, body_tys, tc::PTy(pty_id))
+                        {
+                            owner_sups.push(sup);
+                        }
+                    }
+                }
+                for &sup in owner_sups.iter() {
+                    if reaches_copy(r, sup, &mut g.reads) {
+                        is_copy = true;
+                        break;
+                    }
+                }
+            }
+            if is_copy && let Ok(pty_id) = u32::try_from(idx) {
+                g.alias_copy.push(pty_id);
+            }
+        }
+        g.alias_copy.sort_unstable();
+        g.alias_copy.dedup();
+    }
     // Gather RPITIT synthetic metadata (`rpitit_opaques`, overriding `impl_fns`, and `Twin`
     // default opaque regions) before ADT/read collection so every overriding impl fn and Twin
     // opaque participates in ADT variance/outlives, read tracking (Rule 21), and signature facts.
@@ -1983,17 +2227,22 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             adt_uncond_copy,
             &mut g.drop_need,
             &mut g.drop_strict_need,
+            &mut g.drop_lt_need,
             &mut g.reads,
             alloc,
         );
         let needs_drop = drop_summary.needs_drop;
         let drop_need = drop_summary.drop_args;
         let drop_strict_span = drop_summary.drop_strict;
+        let drop_lt_span = drop_summary.drop_lifetimes;
         if let Some((start, len)) = drop_need {
             g.drop_args.push((k, start, len));
         }
         if let Some((start, len)) = drop_strict_span {
             g.drop_strict.push((k, start, len));
+        }
+        if let Some((start, len)) = drop_lt_span {
+            g.drop_lifetimes.push((k, start, len));
         }
         let deref_impl = if let Some(deref_tr) = langs.deref
             && let Some(impls) = answer_impls(r, deref_tr, tc::Shape::Adt(key))
@@ -2034,6 +2283,11 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let e = s.checked_add(usize::try_from(len).ok()?)?;
             g.drop_strict_need.get(s..e)
         });
+        let drop_lifetimes = drop_lt_span.and_then(|(start, len)| {
+            let s = usize::try_from(start).ok()?;
+            let e = s.checked_add(usize::try_from(len).ok()?)?;
+            g.drop_lt_need.get(s..e)
+        });
         let variances = variances.and_then(|(lo, hi)| {
             let s = usize::try_from(lo).ok()?;
             let e = usize::try_from(hi).ok()?;
@@ -2061,6 +2315,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 copy_args,
                 drop_args,
                 drop_strict,
+                drop_lifetimes,
                 deref_impl,
                 variances,
             },

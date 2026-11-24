@@ -299,11 +299,15 @@ pub(crate) struct CapturePlaces<'a> {
     chain: Vec<ExprId, Alloc<'a>>,
     pat_stack: Vec<(PatId, PlaceRef, u32), Alloc<'a>>,
     arena: Vec<Proj, Alloc<'a>>,
-    uses: Vec<(PlaceRef, PlaceMode), Alloc<'a>>,
+    /// The scrutinee expression currently being matched by [`Machine::walk_pat`], if any.
+    pat_ctx: Option<ExprId>,
+    uses: Vec<(PlaceRef, PlaceMode, Option<ExprId>), Alloc<'a>>,
     /// The owner's places a pattern is matched against or a struct update takes fields of.
     scrutinees: Vec<PlaceRef, Alloc<'a>>,
     /// The owner's places a pattern binding moves out (not a plain `let x = place;`).
     pat_moves: Vec<PlaceRef, Alloc<'a>>,
+    /// The owner's places a pattern binding borrows by `ref`/`ref mut` (could escape the match).
+    pat_ref_borrows: Vec<PlaceRef, Alloc<'a>>,
     caps: Vec<Cap, Alloc<'a>>,
     roots: Vec<PatId, Alloc<'a>>,
     /// Every widening of the body's owners, in the order made: owner, binding, why.
@@ -479,9 +483,11 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             chain: Vec::new_in(alloc),
             pat_stack: Vec::new_in(alloc),
             arena: Vec::new_in(alloc),
+            pat_ctx: None,
             uses: Vec::new_in(alloc),
             scrutinees: Vec::new_in(alloc),
             pat_moves: Vec::new_in(alloc),
+            pat_ref_borrows: Vec::new_in(alloc),
             caps: Vec::new_in(alloc),
             roots: Vec::new_in(alloc),
             widened: Vec::new_in(alloc),
@@ -592,9 +598,11 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         let is_move = self.captures_by_move(owner)?;
         let suspends = self.mark_owner_bound(cp, owner)?;
         cp.arena.clear();
+        cp.pat_ctx = None;
         cp.uses.clear();
         cp.scrutinees.clear();
         cp.pat_moves.clear();
+        cp.pat_ref_borrows.clear();
         cp.caps.clear();
         cp.roots.clear();
         cp.tasks.clear();
@@ -720,7 +728,10 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 Task::Pat { pat, init, guard, plain_let } => {
                     if let Some(place) = self.cat(cp, init, true)? {
                         cp.scrutinees.push(place);
-                        self.walk_pat(cp, pat, place, guard, plain_let)?;
+                        cp.pat_ctx = Some(init);
+                        let res = self.walk_pat(cp, pat, place, guard, plain_let);
+                        cp.pat_ctx = None;
+                        res?;
                     }
                 }
                 Task::Fru { expr, base } => self.fru(cp, expr, base)?,
@@ -1102,7 +1113,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         let t = cp.place_ty(place);
         match self.copy_of(cp, t)? {
             Copyness::Copy => self.borrow(cp, place, PlaceMode::ImmBorrow),
-            Copyness::NotCopy => cp.uses.push((place, PlaceMode::ByValue)),
+            Copyness::NotCopy => cp.uses.push((place, PlaceMode::ByValue, cp.pat_ctx)),
             Copyness::Undecided => return Err(gap(at, CaptureGapKind::CopyUndecided)),
         }
         Ok(())
@@ -1118,7 +1129,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 break;
             }
         }
-        cp.uses.push((place, mode));
+        cp.uses.push((place, mode, cp.pat_ctx));
     }
 
     /// Whether `t` is `Copy`: decided once per type. No `Copy` lang item: nothing is (as
@@ -1257,7 +1268,10 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                         },
                     };
                     match by_ref {
-                        Some(m) => self.borrow(cp, place, PlaceMode::of(m)),
+                        Some(m) => {
+                            cp.pat_ref_borrows.push(place);
+                            self.borrow(cp, place, PlaceMode::of(m));
+                        }
                         None => {
                             let before = cp.uses.len();
                             self.consume_or_copy(cp, Some(place), At::Pat(p))?;
@@ -1428,7 +1442,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     fn settle_uses(&mut self, cp: &mut CapturePlaces<'a>, is_move: bool) -> Result<ClosureKind, Halt> {
         let mut kind = ClosureKind::Fn;
         for u in 0..cp.uses.len() {
-            let (mut place, mut mode) = cp.uses[u];
+            let (mut place, mut mode, _) = cp.uses[u];
             // `restrict_repr_packed_field_ref_capture`, which rustc applies in `borrow` and
             // `fake_read` before anything else (a `Copy` read is a borrow too): a reference into
             // a `repr(packed)` struct may be unaligned, so a BORROW of a field (any alignment)
@@ -1608,11 +1622,36 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             }
         }
         if cap.mode == PlaceMode::ByValue {
-            if cp.uses.iter().any(|&(u, m)| m == PlaceMode::ByValue && cp.relation(cap.place, u) == Some(Ordering::Less)) {
-                return Ok(Some(CaptureWiden::MoveBelow));
+            // If every use of `cap.place` in this owner comes from one pattern match/let whose
+            // scrutinee is `cap.place` itself with no `ref`/`ref mut` bindings that could escape,
+            // `blaze-build` lowers that scrutinee by moving `cap.place` once into `Owner::Temp`
+            // (`Task::Eval` -> `env_moved`), so no widening to the whole binding is needed.
+            let mut single_init: Option<ExprId> = None;
+            let mut only_one_move_match = true;
+            for &(u, _, ctx) in cp.uses.iter() {
+                if cp.relation(cap.place, u).is_none() {
+                    continue;
+                }
+                match (ctx, single_init) {
+                    (Some(init), None) => single_init = Some(init),
+                    (Some(init), Some(prev)) if init == prev => {}
+                    _ => {
+                        only_one_move_match = false;
+                        break;
+                    }
+                }
             }
-            if cp.pat_moves.iter().any(|&m| matches!(cp.relation(cap.place, m), Some(Ordering::Less | Ordering::Equal))) {
-                return Ok(Some(CaptureWiden::PatternMove));
+            let single_move_match = only_one_move_match
+                && single_init.is_some()
+                && cp.scrutinees.iter().all(|&s| cp.relation(cap.place, s).is_none_or(|o| o == Ordering::Equal))
+                && cp.pat_ref_borrows.iter().all(|&r| cp.relation(cap.place, r).is_none());
+            if !single_move_match {
+                if cp.uses.iter().any(|&(u, m, _)| m == PlaceMode::ByValue && cp.relation(cap.place, u) == Some(Ordering::Less)) {
+                    return Ok(Some(CaptureWiden::MoveBelow));
+                }
+                if cp.pat_moves.iter().any(|&m| matches!(cp.relation(cap.place, m), Some(Ordering::Less | Ordering::Equal))) {
+                    return Ok(Some(CaptureWiden::PatternMove));
+                }
             }
         }
         for &s in cp.scrutinees.iter() {
