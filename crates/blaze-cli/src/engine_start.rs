@@ -272,6 +272,55 @@ pub(crate) fn command(
     lined.map_err(CliError::RunLine)?
 }
 
+/// Domain for folding a non-whole `CheckScope` into the `RunIds` table's certificate so two
+/// scoped starts reusing the same whole-workspace stored answer root never collide on one table.
+const SCOPED_IDS_CERT_DOMAIN: &str = "blaze-cli run ids scoped cert 1";
+
+/// The certificate key for `RunIds` of `standing`: equal to `Key(root)` for whole-workspace runs,
+/// and folded with `scope` for scoped runs so each scope owns a disjoint `RunIds` record.
+fn body_ids_cert(root: ContentId, scope: crate::engine_check::CheckScope<'_>) -> Key {
+    let put_len = |h: &mut blaze_ids::Hasher, n: usize| {
+        h.update(&u64::try_from(n).unwrap_or(u64::MAX).to_le_bytes());
+    };
+    match scope {
+        crate::engine_check::CheckScope::Whole => Key(root),
+        crate::engine_check::CheckScope::Bin { package, root: bin_root } => {
+            let mut h = blaze_ids::Hasher::new(SCOPED_IDS_CERT_DOMAIN);
+            h.id(&root).update(&[1]);
+            put_len(&mut h, package.len());
+            h.update(package.as_bytes());
+            put_len(&mut h, bin_root.len());
+            h.update(bin_root.as_bytes());
+            Key(h.finish())
+        }
+        crate::engine_check::CheckScope::Test { packages, bin, bin_roots } => {
+            let mut h = blaze_ids::Hasher::new(SCOPED_IDS_CERT_DOMAIN);
+            h.id(&root).update(&[2]);
+            put_len(&mut h, packages.len());
+            for package in packages {
+                put_len(&mut h, package.len());
+                h.update(package.as_bytes());
+            }
+            match bin {
+                Some(name) => {
+                    h.update(&[1]);
+                    put_len(&mut h, name.len());
+                    h.update(name.as_bytes());
+                }
+                None => {
+                    h.update(&[0]);
+                }
+            }
+            put_len(&mut h, bin_roots.len());
+            for bin_root in bin_roots {
+                put_len(&mut h, bin_root.len());
+                h.update(bin_root.as_bytes());
+            }
+            Key(h.finish())
+        }
+    }
+}
+
 /// The body ids of the answer at its root (run_ids.rs): one get when a start under this root
 /// wrote them, else walked over E2's answer from the workspace's bodies and written at the root.
 /// Either way they read each workspace body's reads BY NEED from the stored rows in place
@@ -283,7 +332,7 @@ pub(crate) fn body_ids<'a, 'r: 'a, 'm: 'a>(
     let alloc = bump.alloc();
     let frame = standing.frame;
     let refused = |error: RunIdsError<'_>| CliError::Start(StartError::BodyIds { shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) });
-    let cert = Key(standing.root);
+    let cert = body_ids_cert(standing.root, standing.scope);
     let (toolchain, tools): (_, [Tool; KINDS]) = (standing.toolchain, standing.tools);
     let most = crate::run_ids::Most::USUAL;
     let from = crate::run_ids::ReadsFrom::new(standing.rows(), asked, most);
@@ -298,7 +347,7 @@ pub(crate) fn body_ids<'a, 'r: 'a, 'm: 'a>(
     let mut answer = standing.answer();
     let body_tool = blaze_engine::Tools(tools).of(blaze_drive::Name { kind: Kind::BodyCheck, subject: blaze_ids::ContentId([0; 32]) });
     let walk = crate::run_ids::workspace_of_scoped(cx, &mut answer, body_tool, &units, walk_from, None, alloc).map_err(refused)?;
-    let ids = RunIds::new(cx, toolchain, list, &tools, &walk.bodies, &walk.edges, &mut answer, None, most, bump).map_err(refused)?;
+    let ids = RunIds::new_scoped(cx, toolchain, list, scoped.as_ref(), &tools, &walk.bodies, &walk.edges, &mut answer, None, most, bump).map_err(refused)?;
     drop(answer);
     ids.put(cx, &mut *standing.store, cert, &tools, alloc).map_err(refused)?;
     reading(ids)
@@ -370,7 +419,7 @@ pub(crate) fn run_program(
     let mut made = Some(ids);
     // The start list (start_list.rs): under the answer's root, named by the program; its
     // tables are the root's body ids and the program's image, so both stay rooted beside it.
-    let cert = Key(standing.root);
+    let cert = body_ids_cert(standing.root, standing.scope);
     let shape = ContentId::of(RUN_SHAPE, picked.root.as_bytes());
     let today = crate::start_list::Today {
         certificate: crate::start_list::Certificate::of_answer(&standing),
@@ -619,5 +668,20 @@ mod tests {
         assert_eq!(errors.runs(body), Err(crate::run_ids::NotRunnable::Checked(errors)), "a body with an error is not run, its verdict said");
         assert!(matches!(class_of(core::iter::empty::<u16>()), Class::Clean), "control: a body with no finding is Clean");
         assert!(Checked::Clean.runs(body).is_ok(), "control: a clean body runs");
+    }
+
+    #[test]
+    fn scoped_body_ids_certs_are_disjoint_from_whole_and_each_other() {
+        let root = blaze_ids::ContentId([9; 32]);
+        let whole = super::body_ids_cert(root, crate::engine_check::CheckScope::Whole);
+        assert_eq!(whole, blaze_drive::Key(root), "whole-workspace cert is unchanged");
+        let a = super::body_ids_cert(root, crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] });
+        let b = super::body_ids_cert(root, crate::engine_check::CheckScope::Test { packages: &["b"], bin: None, bin_roots: &[] });
+        let bin = super::body_ids_cert(root, crate::engine_check::CheckScope::Bin { package: "a", root: "crates/a/src/main.rs" });
+        assert_ne!(a, whole);
+        assert_ne!(b, whole);
+        assert_ne!(a, b);
+        assert_ne!(bin, whole);
+        assert_ne!(bin, a);
     }
 }

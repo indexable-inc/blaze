@@ -1067,6 +1067,13 @@ impl ScopedUnits {
     pub(crate) fn allows(&self, at: usize) -> bool {
         self.allowed.get(at).copied().unwrap_or(false)
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_allowed(allowed: &[bool], alloc: blaze_own::Alloc<'static>) -> ScopedUnits {
+        let mut vec = blaze_own::Vec::with_capacity_in(allowed.len(), alloc);
+        vec.extend_from_slice(allowed);
+        ScopedUnits { allowed: vec }
+    }
 }
 
 /// How [`check_and_open`] configures the check and standing answer for its caller.
