@@ -46,7 +46,8 @@ use super::Global;
 /// The payload's first bytes.
 pub(crate) const MAGIC: [u8; 4] = *b"BZCS";
 /// This form's number. Bump it, and names.rs's domains, at any change of the layout.
-pub(crate) const FORM: u32 = 6;
+/// 7: 32-byte `cells` rows (16-byte key + 16-byte digest prefix) and columnar `ItemsRecord` v14.
+pub(crate) const FORM: u32 = 7;
 /// How many sections a payload of this form holds.
 pub(crate) const SECTIONS: usize = 8;
 /// Where the eight (place, length) pairs start.

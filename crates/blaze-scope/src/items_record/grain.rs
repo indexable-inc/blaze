@@ -72,9 +72,8 @@ impl<'a> ItemsRecord<'a> {
         let Some(r) = i.checked_mul(GRAIN_ROW).and_then(|o| base.checked_add(o)).filter(|r| r.checked_add(GRAIN_ROW).is_some_and(|end| end <= self.bytes.len())) else {
             return Err(short);
         };
-        let row = self.row(T_ITEMS, i);
-        let body = match self.at_of(le32(self.bytes, row + 36))? {
-            Some(At::File(file)) => self.file_entry(file, blaze_surface::ItemIndex(le32(self.bytes, row + 48)))?.1.hash,
+        let body = match self.at_of(self.item_code(i))? {
+            Some(At::File(file)) => self.file_entry(file, self.item_outline(i))?.1.hash,
             Some(At::Expansion(_)) => {
                 let offset = le32(self.bytes, r + 32) as usize;
                 let hashes = self.counts[T_ITEMS].checked_mul(GRAIN_ROW).and_then(|n| base.checked_add(n)).ok_or(short)?;
@@ -82,7 +81,7 @@ impl<'a> ItemsRecord<'a> {
                     .ok_or(ItemsRecordError::Short { what: "an expansion item hash", at: offset })?;
                 id_at(self.bytes, pos)
             }
-            None => return Err(ItemsRecordError::NoPlace { key: super::key_at(self.bytes, row) }),
+            None => return Err(ItemsRecordError::NoPlace { key: self.item_key(i) }),
         };
         Ok(ItemPieces { chain: id_at(self.bytes, r), body })
     }

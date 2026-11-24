@@ -47,8 +47,10 @@ queue, an owner for one holder); a shared map is `papaya::HashMap`; a single-own
 `blaze_hash::{HashMap<K, V, A>, HashSet<K, A>}` (foldhash with a fixed seed, its allocator named as
 `bump-allocate` says: a frame's for a task, `Global` with a reason otherwise), with
 `blaze_hash::KeyHasher` for keys that are already content hashes and `blaze_hash::Blake3Hasher` for
-persisted content IDs; results of parallel items come back from `blaze_graph::par` in order, never
-pushed into a `Mutex<Vec>`; a queue is `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is
+persisted content IDs; parallel same-length columns (struct-of-arrays) are `blaze_own::soa!`
+(`Soa<C, A>`: one allocation, one `len`, one `capacity`, typed column slices), never parallel
+`Vec`/`AVec`s; results of parallel items come back from `blaze_graph::par` in order, never pushed
+into a `Mutex<Vec>`; a queue is `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is
 `crossbeam-channel`; a counter or flag is an atomic. How a thread or fiber waits is
 `deadline-waits`. `BTreeMap` only where iteration order is part of the output.
 

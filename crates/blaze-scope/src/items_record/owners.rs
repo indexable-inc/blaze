@@ -20,7 +20,7 @@
 use blaze_id::ItemKey;
 use blaze_surface::RecordBytes;
 
-use super::{ItemsRecord, ItemsRecordError, LoadItems, RecordItems, T_MEMBERS, T_OWNERS, key_at, le16, le32, pad, put32, u32_of};
+use super::{ItemsRecord, ItemsRecordError, LoadItems, RecordItems, T_MEMBERS, T_OWNERS, key_at, le32, pad, put32, u32_of};
 
 /// The header field holding how many rows the section has.
 pub(crate) const F_OWNED_COUNT: usize = 35;
@@ -100,13 +100,12 @@ impl<'a> ItemsRecord<'a> {
         if owner >= self.counts[T_OWNERS] || row >= self.counts[T_MEMBERS] {
             return Err(ItemsRecordError::Short { what: "a member owner's rows", at: last });
         }
-        let m = self.row(T_MEMBERS, row);
-        if key_at(self.bytes, m) != member {
+        if self.member_key(row) != member {
             // The row the section names is another member's: the section and the member
             // table disagree (a writer's bug, never answered as an owner).
             return Err(ItemsRecordError::Short { what: "a member owner's member row (it holds another key)", at: last });
         }
-        let name = self.str_at("a member's name", le32(self.bytes, m + 48), u32::from(le16(self.bytes, m + 52)))?;
+        let name = self.member_name(row)?;
         Ok(Some((key_at(self.bytes, self.row(T_OWNERS, owner)), name)))
     }
 }

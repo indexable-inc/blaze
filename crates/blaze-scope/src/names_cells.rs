@@ -62,14 +62,36 @@ use crate::resolve::{CrateNames, aligned};
 /// and old reads miss.
 pub const KEY_DOMAIN: &str = "blaze v2 crate names cell key 1";
 /// The domain of a cell's digest. "1": a `Module` cell that held the module's textual macros
-/// and marks, now the `Textual` cell's.
-pub const DIGEST_DOMAIN: &str = "blaze v2 crate names cell digest 3";
+/// and marks, now the `Textual` cell's. "4": 128-bit cell digests in `TABLE_ROW` (32 B rows).
+pub const DIGEST_DOMAIN: &str = "blaze v2 crate names cell digest 4";
 
 static KEYS: Domain = Domain::new(KEY_DOMAIN);
 static DIGESTS: Domain = Domain::new(DIGEST_DOMAIN);
 
-/// One row of a cell table: the cell's key, then its digest.
-pub const TABLE_ROW: usize = 16 + 32;
+/// One row of a cell table: the cell's 16-byte key, then its 16-byte BLAKE3 digest prefix.
+pub const TABLE_ROW: usize = 16 + 16;
+
+/// Truncates a cell's 256-bit BLAKE3 digest to the 128-bit digest stored in a cell table row.
+#[inline]
+pub fn cell_digest(id: ContentId) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&id.0[..16]);
+    out
+}
+
+/// Widens a 128-bit cell-table digest back into the canonical 32-byte [`ContentId`] form
+/// (`[digest[0..16], 0..0]`) that [`seen_in`], [`seen_by_record`], and the engine compare.
+#[inline]
+pub fn expand_digest(digest: [u8; 16]) -> ContentId {
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(&digest);
+    ContentId(out)
+}
+
+#[inline]
+fn norm_digest(id: ContentId) -> ContentId {
+    expand_digest(cell_digest(id))
+}
 
 /// One cell of a crate's names: see the module doc.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -662,7 +684,7 @@ pub fn beginning_digest(first: [u8; 16], lists: [&[ItemKey]; 3]) -> Option<Conte
             h.id(&key.0);
         }
     }
-    any.then(|| h.finish())
+    any.then(|| norm_digest(h.finish()))
 }
 
 /// The keys of the crate's item rows, module rows and variant rows, each in the record's order,
@@ -694,7 +716,7 @@ fn beginning_lists<'b>(items: &ItemsRecord<'_>, alloc: Alloc<'b>) -> Result<[AVe
 
 /// What `Whole(section)` holds: the digest of the section's bytes as the record holds them.
 pub fn whole_digest(section: Section, bytes: &[u8]) -> ContentId {
-    Hasher::of(&DIGESTS).update(&[8, section as u8]).part(bytes).finish()
+    norm_digest(Hasher::of(&DIGESTS).update(&[8, section as u8]).part(bytes).finish())
 }
 
 fn binding_digest(binding: Binding) -> ContentId {
@@ -1001,7 +1023,7 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
             return Err(CellsError::TwoUnderOneKey { key: *key });
         }
         bytes.extend_from_slice(key);
-        bytes.extend_from_slice(&digest.0);
+        bytes.extend_from_slice(&cell_digest(*digest));
     }
     Ok(bytes)
 }
@@ -1019,9 +1041,9 @@ pub fn seen_in(table: &[u8], key: [u8; 16]) -> Result<Option<ContentId>, CellsEr
             core::cmp::Ordering::Less => lo = mid + 1,
             core::cmp::Ordering::Greater => hi = mid,
             core::cmp::Ordering::Equal => {
-                let mut digest = [0; 32];
+                let mut digest = [0; 16];
                 digest.copy_from_slice(&row[16..]);
-                return Ok(Some(ContentId(digest)));
+                return Ok(Some(expand_digest(digest)));
             }
         }
     }
@@ -1235,7 +1257,7 @@ impl<'l, N: Name, W: World<N>> World<N> for Logged<'l, W> {
 pub fn seen_by_record<'a>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, ReadText<'_, 'a>)>, wholes: &[(Section, &[u8])], cell: NameCell) -> Result<Option<ContentId>, CellsError> {
     let items_of = || items.map(|(items, _)| items).ok_or(CellsError::NoItemsRecord);
     let read_of = || items.map(|(_, read)| read).ok_or(CellsError::NoItemsRecord);
-    Ok(match cell {
+    let out = match cell {
         NameCell::Binding { module, name } => {
             let Some(view) = record.scope(module) else { return Ok(None) };
             let view: ScopeView<'_> = view;
@@ -1278,7 +1300,8 @@ pub fn seen_by_record<'a>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<
         NameCell::Extensions { .. } => None,
         NameCell::CfgAtoms { krate } if krate == record.key().prefix() => cfg_atoms_digest(items_of()?).map_err(CellsError::Items)?,
         NameCell::CfgAtoms { .. } => None,
-    })
+    };
+    Ok(out.map(norm_digest))
 }
 
 /// `Beginning(first)` read from the record by three binary searches, nothing allocated: the

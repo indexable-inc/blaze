@@ -136,6 +136,9 @@ fn a_crate_scope_record_files_its_names_and_items() {
     let mut older = payload.clone();
     older[4] = 1;
     assert!(matches!(sections(&older), Err(SectionsError::Form { form: 1, .. })), "another form's number is refused");
+    let mut prev = payload.clone();
+    prev[4] = 6;
+    assert!(matches!(sections(&prev), Err(SectionsError::Form { form: 6, .. })), "previous form 6 is refused");
 }
 
 /// The tests record filed as the fifth section of a TEST unit's `CrateScope` payload (test.md,

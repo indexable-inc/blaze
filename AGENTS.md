@@ -90,7 +90,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 
 ### Runtime code (skill `runtime-code`)
 - **3. no-fallback**: No fallback, no retry, nothing quietly ignored: stop with an error naming what and where.
-- **12. standard-structures**: One per need: named `blaze_core::lock` locks, papaya and blaze_hash maps, crossbeam, atomics.
+- **12. standard-structures**: One per need: blaze_core::lock, papaya/blaze_hash maps, blaze_own::soa!, crossbeam, atomics.
 - **14. sans-io-cores**: All logic is a sans-IO state machine (`#![blaze::sans_io]`) under thin drivers; convert what is not.
 - **15. every-wait-says-what**: Every blocking wait opens a span naming what it waits for.
 - **18. bounded-progress**: Every wait has a deadline, a retry a count, a table a cap, memory a frame; a hang is a bug.

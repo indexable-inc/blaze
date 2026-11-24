@@ -92,7 +92,7 @@ crates/blaze-resolve	3	crates/blaze-core,crates/blaze-hash,crates/blaze-ids,crat
 crates/blaze-rng	0	-
 crates/blaze-roots	0	crates/blaze-blake3,crates/blaze-own
 crates/blaze-run	0	crates/blaze-blake3,crates/blaze-format,crates/blaze-hash,crates/blaze-own,crates/blaze-sim
-crates/blaze-scope	0	crates/blaze-build-script,crates/blaze-expand,crates/blaze-file-items,crates/blaze-format,crates/blaze-hash,crates/blaze-id,crates/blaze-ids,crates/blaze-manifest,crates/blaze-memchr,crates/blaze-own,crates/blaze-surface,crates/blaze-toolchain,crates/blaze-unit-graph,crates/edition
+crates/blaze-scope	0	crates/blaze-build-script,crates/blaze-columns,crates/blaze-expand,crates/blaze-file-items,crates/blaze-format,crates/blaze-hash,crates/blaze-id,crates/blaze-ids,crates/blaze-manifest,crates/blaze-memchr,crates/blaze-own,crates/blaze-surface,crates/blaze-toolchain,crates/blaze-unit-graph,crates/edition
 crates/blaze-screen	1	crates/blaze-protocol,crates/blaze-report,crates/blaze-unicode
 crates/blaze-semver	0	crates/blaze-data,crates/blaze-own
 crates/blaze-sha256	0	-
