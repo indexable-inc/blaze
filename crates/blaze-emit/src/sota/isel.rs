@@ -283,6 +283,12 @@ enum Fusion {
     I128LoMul { lhs: u32, rhs: u32, lhs_src: Option<u32>, rhs_src: Option<u32> },
     /// `Trunc(Lshr/Ashr(x: I128, 64) -> <=64)` reading `x`'s upper 64-bit register directly with zero shift.
     I128HiTrunc { src: u32, shift_imm: u32 },
+    /// `fmul(vec, splat(scalar))` -> 1-instruction NEON by-element `fmul.4s/2d vd, vn, vm.s/d[0]`!
+    VecFmulElem { vec: u32, scalar: u32 },
+    /// `fma(vec, splat(scalar), acc)` or `fadd(acc, fmul(vec, splat(scalar)))` -> `fmla.4s/2d vd, vn, vm.s/d[0]`!
+    VecFmaddElem { vec: u32, scalar: u32, acc: u32 },
+    /// `fsub(acc, fmul(vec, splat(scalar)))` -> `fmls.4s/2d vd, vn, vm.s/d[0]`!
+    VecFmsubElem { vec: u32, scalar: u32, acc: u32 },
 }
 
 /// Branch patch site resolved once every block's word offset is known.
@@ -414,6 +420,7 @@ fn op_preserves_nzcv(op: Op, ty: Ty, fus: Fusion) -> bool {
             | Op::Bitcast
             | Op::Project
             | Op::Splat
+            | Op::Extract
             | Op::Insert
             | Op::Shuffle
             | Op::Fpext
@@ -847,6 +854,57 @@ fn emit_st_spill_vec(words: &mut Vec<u32, Alloc<'_>>, vs: Reg, spill_base: u32, 
     emit_mem_q(words, false, vs, SP, off);
 }
 
+/// `cnt vd.16b, vn.16b` (C7.2.47 CNT, Q=1): per-byte population count across 16 bytes.
+#[inline]
+const fn cnt_16b(rd: Reg, rn: Reg) -> u32 {
+    0x4e20_5800 | (rn << 5) | rd
+}
+
+/// `shl vd.8h, vn.8h, #k` (C7.2.262 SHL immediate, Q=1, `1 <= k <= 15`).
+#[inline]
+const fn shl_8h_imm(rd: Reg, rn: Reg, k: u32) -> u32 {
+    0x4f00_5400 | ((16 + (k & 0xf)) << 16) | (rn << 5) | rd
+}
+
+/// `ushr vd.8h, vn.8h, #k` (C7.2.382 USHR immediate, Q=1, `1 <= k <= 15`).
+#[inline]
+const fn ushr_8h_imm(rd: Reg, rn: Reg, k: u32) -> u32 {
+    0x6f00_0400 | ((32 - (k & 0xf)) << 16) | (rn << 5) | rd
+}
+
+/// `uaddlp vd.<Ta>, vn.<Tb>` (C7.2.358 UADDLP, Q=1): unsigned pairwise add-long
+/// (`size = 0`: `8h, 16b`; `size = 1`: `4s, 8h`; `size = 2`: `2d, 4s`).
+#[inline]
+const fn uaddlp_v(size: u32, rd: Reg, rn: Reg) -> u32 {
+    0x6e20_2800 | (size << 22) | (rn << 5) | rd
+}
+
+/// `dup sd/dd, vn.s[lane]/vn.d[lane]` (C7.2.40 DUP element, scalar): `size = 2:S, 3:D`.
+#[inline]
+const fn dup_scalar_elem(size: u32, lane: u32, rd: Reg, rn: Reg) -> u32 {
+    let imm5 = (lane << (size + 1)) | (1u32 << size);
+    0x5e00_0400 | ((imm5 & 0x1f) << 16) | (rn << 5) | rd
+}
+
+/// `fmul vd.4s, vn.4s, vm.s[0]` / `fmul vd.2d, vn.2d, vm.d[0]` (C7.2.126 FMUL by element, Q=1, lane 0).
+/// For `S` and `D` elements, `M:Rm` is a full 5-bit register index (`V0..V31`).
+#[inline]
+const fn fmul_elem0_v(double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    (if double { 0x4fc0_9000 } else { 0x4f80_9000 }) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `fmla vd.4s, vn.4s, vm.s[0]` / `fmla vd.2d, vn.2d, vm.d[0]` (C7.2.104 FMLA by element, Q=1, lane 0).
+#[inline]
+const fn fmla_elem0_v(double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    (if double { 0x4fc0_1000 } else { 0x4f80_1000 }) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `fmls vd.4s, vn.4s, vm.s[0]` / `fmls vd.2d, vn.2d, vm.d[0]` (C7.2.110 FMLS by element, Q=1, lane 0).
+#[inline]
+const fn fmls_elem0_v(double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    (if double { 0x4fc0_5000 } else { 0x4f80_5000 }) | (rm << 16) | (rn << 5) | rd
+}
+
 /// Emits a destructive 3-operand 128-bit NEON multiply-accumulate/sub (`vd = vc ± va * vb`),
 /// assuming `va` was loaded with scratch `V29`, `vb` with `V30`, and `vc` with `V31`.
 #[inline]
@@ -1252,6 +1310,7 @@ fn check_subset(view: &View<'_>, has_lse: bool, os: crate::Os) -> Result<(), Tie
                 | Op::Trap
                 | Op::Unreachable
                 | Op::Splat
+                | Op::Extract
                 | Op::Insert
                 | Op::Shuffle
                 | Op::ReduceAdd
@@ -1295,6 +1354,7 @@ fn check_subset(view: &View<'_>, has_lse: bool, os: crate::Os) -> Result<(), Tie
                 | Op::Or
                 | Op::Xor
                 | Op::Not
+                | Op::Popcnt
                 | Op::UaddSat
                 | Op::UsubSat
                 | Op::SaddSat
@@ -1330,10 +1390,16 @@ fn check_subset(view: &View<'_>, has_lse: bool, os: crate::Os) -> Result<(), Tie
                 }
                 Op::Umulhi if !vfp && vsize == 2 => true,
                 Op::Bitcast => is_vec128_ty(ty_at(view.tys, to_idx(at_u32(view.data, inst)))).is_some(),
-                Op::Shl | Op::Lshr if !vfp && (vsize == 2 || vsize == 3) => {
+                Op::Shl | Op::Lshr if !vfp && (vsize == 1 || vsize == 2 || vsize == 3) => {
                     let at = to_idx(at_u32(view.data, inst));
                     let rhs = to_idx(at_u32(view.extra, at + 1));
-                    let max_sh = if vsize == 2 { 32 } else { 64 };
+                    let max_sh = if vsize == 1 {
+                        16
+                    } else if vsize == 2 {
+                        32
+                    } else {
+                        64
+                    };
                     view.op(rhs) == Op::Splat
                         && extract_const_u64(view, to_idx(at_u32(view.data, rhs))).is_some_and(|k| k < max_sh)
                 }
@@ -1372,6 +1438,18 @@ fn check_subset(view: &View<'_>, has_lse: bool, os: crate::Os) -> Result<(), Tie
             };
             if !vec_ok {
                 return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unsupported 128-bit NEON vector op" });
+            }
+        }
+        if op == Op::Extract {
+            let at = to_idx(at_u32(view.data, inst));
+            let vec_v = to_idx(at_u32(view.extra, at));
+            let lane = at_u32(view.extra, at + 1);
+            let Some((vsize, _)) = is_vec128_ty(ty_at(view.tys, vec_v)) else {
+                return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "non-128-bit vector extract" });
+            };
+            let max_lane = 16u32 >> vsize;
+            if lane >= max_lane {
+                return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "vector extract lane out of range" });
             }
         }
         if matches!(
@@ -3734,6 +3812,154 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         }
     }
 
+    // 2a-iii. Multi-use FP `Op::Splat` -> by-element NEON `fmul`/`fmla`/`fmls` fusion:
+    // Eliminates all `dup.4s`/`dup.2d` instructions in `matmul_f32`/`matmul_f64`/`saxpy` whenever
+    // every surviving use of an FP vector `Op::Splat(scalar)` is a multiplicand of `Fmul`/`Fma`/
+    // `Fmuladd`/`Fmadd`/`Fmsub`.
+    let has_fp_splat = (0..len).any(|i| {
+        !at_bool(&skip_emit, i)
+            && view.op(i) == Op::Splat
+            && at_u32(&use_count, i) > 0
+            && is_vec128_ty(ty_at(view.tys, i)).is_some_and(|(_, vfp)| vfp)
+    });
+    if has_fp_splat {
+        let mut splat_fusable_uses: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+        let mut splat_disqualified: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+        let mut splat_fused: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+        for _ in 0..len {
+            splat_fusable_uses.push(0);
+            splat_disqualified.push(false);
+            splat_fused.push(false);
+        }
+        let is_fp_splat_cand = |v: u32, skip_ref: &[bool]| -> bool {
+            let vi = to_idx(v);
+            vi < len
+                && !at_bool(skip_ref, vi)
+                && view.op(vi) == Op::Splat
+                && at_u32(&use_count, vi) > 0
+                && is_vec128_ty(ty_at(view.tys, vi)).is_some_and(|(_, vfp)| vfp)
+        };
+        for u in 0..len {
+            if at_bool(&skip_emit, u) {
+                continue;
+            }
+            if !is_vec128_ty(ty_at(view.tys, u)).is_some_and(|(_, vfp)| vfp) {
+                continue;
+            }
+            let uop = view.op(u);
+            let ufus = at_fusion(&fusion, u);
+            let operands = match (uop, ufus) {
+                (Op::Fmul, Fusion::None) => {
+                    let uat = to_idx(at_u32(view.data, u));
+                    Some((at_u32(view.extra, uat), at_u32(view.extra, uat + 1), None))
+                }
+                (Op::Fma | Op::Fmuladd, Fusion::None) => {
+                    let uat = to_idx(at_u32(view.data, u));
+                    Some((at_u32(view.extra, uat), at_u32(view.extra, uat + 1), Some(at_u32(view.extra, uat + 2))))
+                }
+                (Op::Fadd, Fusion::Fmadd { a, b, acc }) | (Op::Fsub, Fusion::Fmsub { a, b, acc }) => {
+                    Some((a, b, Some(acc)))
+                }
+                _ => None,
+            };
+            if let Some((ma, mb, acc_opt)) = operands {
+                if let Some(acc) = acc_opt {
+                    if is_fp_splat_cand(acc, &skip_emit) {
+                        set_at(&mut splat_disqualified, to_idx(acc), true);
+                    }
+                }
+                let a_cand = is_fp_splat_cand(ma, &skip_emit);
+                let b_cand = is_fp_splat_cand(mb, &skip_emit);
+                if ma == mb {
+                    if a_cand {
+                        set_at(&mut splat_disqualified, to_idx(ma), true);
+                    }
+                } else if a_cand && b_cand {
+                    set_at(&mut splat_disqualified, to_idx(ma), true);
+                    inc_u32(&mut splat_fusable_uses, to_idx(mb));
+                } else if a_cand {
+                    inc_u32(&mut splat_fusable_uses, to_idx(ma));
+                } else if b_cand {
+                    inc_u32(&mut splat_fusable_uses, to_idx(mb));
+                }
+            }
+        }
+        let mut any_fused = false;
+        for i in 0..len {
+            if is_fp_splat_cand(u32_of(i), &skip_emit)
+                && !at_bool(&splat_disqualified, i)
+                && at_u32(&splat_fusable_uses, i) == at_u32(&use_count, i)
+            {
+                set_at(&mut splat_fused, i, true);
+                any_fused = true;
+            }
+        }
+        if any_fused {
+            for i in 0..len {
+                if at_bool(&splat_fused, i) {
+                    set_at(&mut skip_emit, i, true);
+                }
+            }
+            for u in 0..len {
+                if at_bool(&skip_emit, u) {
+                    continue;
+                }
+                if !is_vec128_ty(ty_at(view.tys, u)).is_some_and(|(_, vfp)| vfp) {
+                    continue;
+                }
+                let uop = view.op(u);
+                let ufus = at_fusion(&fusion, u);
+                match (uop, ufus) {
+                    (Op::Fmul, Fusion::None) => {
+                        let uat = to_idx(at_u32(view.data, u));
+                        let (ma, mb) = (at_u32(view.extra, uat), at_u32(view.extra, uat + 1));
+                        if at_bool(&splat_fused, to_idx(mb)) {
+                            let scalar = at_u32(view.data, to_idx(mb));
+                            set_at(&mut fusion, u, Fusion::VecFmulElem { vec: ma, scalar });
+                        } else if at_bool(&splat_fused, to_idx(ma)) {
+                            let scalar = at_u32(view.data, to_idx(ma));
+                            set_at(&mut fusion, u, Fusion::VecFmulElem { vec: mb, scalar });
+                        }
+                    }
+                    (Op::Fma | Op::Fmuladd, Fusion::None) => {
+                        let uat = to_idx(at_u32(view.data, u));
+                        let (ma, mb, acc) = (
+                            at_u32(view.extra, uat),
+                            at_u32(view.extra, uat + 1),
+                            at_u32(view.extra, uat + 2),
+                        );
+                        if at_bool(&splat_fused, to_idx(mb)) {
+                            let scalar = at_u32(view.data, to_idx(mb));
+                            set_at(&mut fusion, u, Fusion::VecFmaddElem { vec: ma, scalar, acc });
+                        } else if at_bool(&splat_fused, to_idx(ma)) {
+                            let scalar = at_u32(view.data, to_idx(ma));
+                            set_at(&mut fusion, u, Fusion::VecFmaddElem { vec: mb, scalar, acc });
+                        }
+                    }
+                    (Op::Fadd, Fusion::Fmadd { a: ma, b: mb, acc }) => {
+                        if at_bool(&splat_fused, to_idx(mb)) {
+                            let scalar = at_u32(view.data, to_idx(mb));
+                            set_at(&mut fusion, u, Fusion::VecFmaddElem { vec: ma, scalar, acc });
+                        } else if at_bool(&splat_fused, to_idx(ma)) {
+                            let scalar = at_u32(view.data, to_idx(ma));
+                            set_at(&mut fusion, u, Fusion::VecFmaddElem { vec: mb, scalar, acc });
+                        }
+                    }
+                    (Op::Fsub, Fusion::Fmsub { a: ma, b: mb, acc }) => {
+                        if at_bool(&splat_fused, to_idx(mb)) {
+                            let scalar = at_u32(view.data, to_idx(mb));
+                            set_at(&mut fusion, u, Fusion::VecFmsubElem { vec: ma, scalar, acc });
+                        } else if at_bool(&splat_fused, to_idx(ma)) {
+                            let scalar = at_u32(view.data, to_idx(ma));
+                            set_at(&mut fusion, u, Fusion::VecFmsubElem { vec: mb, scalar, acc });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     // Any `slot_addr` whose EVERY use folded into `[sp, #off]` needs ZERO register & ZERO emission!
     for inst in 0..len {
         if view.op(inst) == Op::SlotAddr && at_u32(&use_count, inst) > 0 && at_u32(&slot_addr_folded_uses, inst) == at_u32(&use_count, inst) {
@@ -3853,6 +4079,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             | Fusion::TstBr { imm_nrs: None, .. }
             | Fusion::BlazeResultCallBr
             | Fusion::VecUadalp { .. }
+            | Fusion::VecFmulElem { .. }
+            | Fusion::VecFmaddElem { .. }
+            | Fusion::VecFmsubElem { .. }
             | Fusion::I128WideMul { .. }
             | Fusion::I128LoMul { .. } => {}
             Fusion::None => match op {
@@ -5747,6 +5976,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             if vd != vs {
                                 words.push(enc::orr_v(vd, vs, vs));
                             }
+                        } else if vsize == 1 {
+                            words.push(if op == Op::Shl { shl_8h_imm(vd, vs, k) } else { ushr_8h_imm(vd, vs, k) });
                         } else if vsize == 2 {
                             words.push(if op == Op::Shl { enc::shl_4s_imm(vd, vs, k) } else { enc::ushr_4s_imm(vd, vs, k) });
                         } else if op == Op::Shl {
@@ -5908,11 +6139,18 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         let (vd, sp) = dst_vec(inst);
                         let double = vsize == 3;
                         if matches!(op, Op::Fma | Op::Fmuladd) {
-                            let at = to_idx(at_u32(view.data, inst));
-                            let va = load_vec(&mut words, at_u32(view.extra, at), V29);
-                            let vb = load_vec(&mut words, at_u32(view.extra, at + 1), V30);
-                            let vc = load_vec(&mut words, at_u32(view.extra, at + 2), V31);
-                            emit_vec_acc3(&mut words, vd, va, vb, vc, |d, n, m| enc::fmla_v(double, d, n, m));
+                            if let Fusion::VecFmaddElem { vec, scalar, acc } = at_fusion(&fusion, inst) {
+                                let vv = load_vec(&mut words, vec, V29);
+                                let vs = load_fp(&mut words, scalar, V30);
+                                let vc = load_vec(&mut words, acc, V31);
+                                emit_vec_acc3(&mut words, vd, vv, vs, vc, |d, n, m| fmla_elem0_v(double, d, n, m));
+                            } else {
+                                let at = to_idx(at_u32(view.data, inst));
+                                let va = load_vec(&mut words, at_u32(view.extra, at), V29);
+                                let vb = load_vec(&mut words, at_u32(view.extra, at + 1), V30);
+                                let vc = load_vec(&mut words, at_u32(view.extra, at + 2), V31);
+                                emit_vec_acc3(&mut words, vd, va, vb, vc, |d, n, m| enc::fmla_v(double, d, n, m));
+                            }
                             if let Some(s) = sp {
                                 emit_st_spill_vec(&mut words, vd, spill_base, s);
                             }
@@ -5920,24 +6158,64 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             continue;
                         }
                         if op == Op::Fadd {
-                            if let Fusion::Fmadd { a, b: mb, acc } = at_fusion(&fusion, inst) {
-                                let va = load_vec(&mut words, a, V29);
-                                let vb = load_vec(&mut words, mb, V30);
-                                let vc = load_vec(&mut words, acc, V31);
-                                emit_vec_acc3(&mut words, vd, va, vb, vc, |d, n, m| enc::fmla_v(double, d, n, m));
-                                if let Some(s) = sp {
-                                    emit_st_spill_vec(&mut words, vd, spill_base, s);
+                            match at_fusion(&fusion, inst) {
+                                Fusion::VecFmaddElem { vec, scalar, acc } => {
+                                    let vv = load_vec(&mut words, vec, V29);
+                                    let vs = load_fp(&mut words, scalar, V30);
+                                    let vc = load_vec(&mut words, acc, V31);
+                                    emit_vec_acc3(&mut words, vd, vv, vs, vc, |d, n, m| fmla_elem0_v(double, d, n, m));
+                                    if let Some(s) = sp {
+                                        emit_st_spill_vec(&mut words, vd, spill_base, s);
+                                    }
+                                    inst += 1;
+                                    continue;
                                 }
-                                inst += 1;
-                                continue;
+                                Fusion::Fmadd { a, b: mb, acc } => {
+                                    let va = load_vec(&mut words, a, V29);
+                                    let vb = load_vec(&mut words, mb, V30);
+                                    let vc = load_vec(&mut words, acc, V31);
+                                    emit_vec_acc3(&mut words, vd, va, vb, vc, |d, n, m| enc::fmla_v(double, d, n, m));
+                                    if let Some(s) = sp {
+                                        emit_st_spill_vec(&mut words, vd, spill_base, s);
+                                    }
+                                    inst += 1;
+                                    continue;
+                                }
+                                _ => {}
                             }
                         }
                         if op == Op::Fsub {
-                            if let Fusion::Fmsub { a, b: mb, acc } = at_fusion(&fusion, inst) {
-                                let va = load_vec(&mut words, a, V29);
-                                let vb = load_vec(&mut words, mb, V30);
-                                let vc = load_vec(&mut words, acc, V31);
-                                emit_vec_acc3(&mut words, vd, va, vb, vc, |d, n, m| enc::fmls_v(double, d, n, m));
+                            match at_fusion(&fusion, inst) {
+                                Fusion::VecFmsubElem { vec, scalar, acc } => {
+                                    let vv = load_vec(&mut words, vec, V29);
+                                    let vs = load_fp(&mut words, scalar, V30);
+                                    let vc = load_vec(&mut words, acc, V31);
+                                    emit_vec_acc3(&mut words, vd, vv, vs, vc, |d, n, m| fmls_elem0_v(double, d, n, m));
+                                    if let Some(s) = sp {
+                                        emit_st_spill_vec(&mut words, vd, spill_base, s);
+                                    }
+                                    inst += 1;
+                                    continue;
+                                }
+                                Fusion::Fmsub { a, b: mb, acc } => {
+                                    let va = load_vec(&mut words, a, V29);
+                                    let vb = load_vec(&mut words, mb, V30);
+                                    let vc = load_vec(&mut words, acc, V31);
+                                    emit_vec_acc3(&mut words, vd, va, vb, vc, |d, n, m| enc::fmls_v(double, d, n, m));
+                                    if let Some(s) = sp {
+                                        emit_st_spill_vec(&mut words, vd, spill_base, s);
+                                    }
+                                    inst += 1;
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if op == Op::Fmul {
+                            if let Fusion::VecFmulElem { vec, scalar } = at_fusion(&fusion, inst) {
+                                let vv = load_vec(&mut words, vec, V30);
+                                let vs = load_fp(&mut words, scalar, V31);
+                                words.push(fmul_elem0_v(double, vd, vv, vs));
                                 if let Some(s) = sp {
                                     emit_st_spill_vec(&mut words, vd, spill_base, s);
                                 }
@@ -6008,6 +6286,23 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         let (vd, sp) = dst_vec(inst);
                         let vs = load_vec(&mut words, at_u32(view.data, inst), V30);
                         words.push(enc::not_v(vd, vs));
+                        if let Some(s) = sp {
+                            emit_st_spill_vec(&mut words, vd, spill_base, s);
+                        }
+                    }
+                    Op::Popcnt => {
+                        let (vd, sp) = dst_vec(inst);
+                        let vs = load_vec(&mut words, at_u32(view.data, inst), V30);
+                        words.push(cnt_16b(vd, vs));
+                        if vsize >= 1 {
+                            words.push(uaddlp_v(0, vd, vd));
+                        }
+                        if vsize >= 2 {
+                            words.push(uaddlp_v(1, vd, vd));
+                        }
+                        if vsize >= 3 {
+                            words.push(uaddlp_v(2, vd, vd));
+                        }
                         if let Some(s) = sp {
                             emit_st_spill_vec(&mut words, vd, spill_base, s);
                         }
@@ -6867,6 +7162,40 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         }
                         _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unsupported vector reduce op" }),
                     }
+                    if let Some(s) = sp {
+                        emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                    }
+                }
+                inst += 1;
+                continue;
+            }
+            if op == Op::Extract {
+                let at = to_idx(at_u32(view.data, inst));
+                let vec_v = at_u32(view.extra, at);
+                let lane = at_u32(view.extra, at + 1);
+                let (vsize, vfp) = is_vec128_ty(ty_at(view.tys, to_idx(vec_v))).ok_or(TierError::Refused {
+                    tier: TIER,
+                    inst: Some(u32_of(inst)),
+                    what: "non-vec128 extract",
+                })?;
+                if vfp {
+                    let double = vsize == 3;
+                    let (vd, sp) = dst_fp(inst);
+                    let vs = load_vec(&mut words, vec_v, V30);
+                    if lane == 0 {
+                        if vd != vs {
+                            words.push(enc::fmov_reg(double, vd, vs));
+                        }
+                    } else {
+                        words.push(dup_scalar_elem(vsize, lane, vd, vs));
+                    }
+                    if let Some(s) = sp {
+                        emit_st_spill_fp(&mut words, vd, spill_base, s);
+                    }
+                } else {
+                    let (rd, sp) = dst_gpr(inst);
+                    let vs = load_vec(&mut words, vec_v, V30);
+                    words.push(enc::umov_lane(vsize, lane, rd, vs));
                     if let Some(s) = sp {
                         emit_st_spill_gpr(&mut words, rd, spill_base, s);
                     }
@@ -10187,174 +10516,117 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 }
                             }
                         }
-                    } else if then_nop && !else_nop && next_block == Some(to_idx(then_block)) && len < 32_768 {
-                        // Hot `then` falls straight through into `next_block` with ZERO moves;
-                        // sink cold `else` edge moves to a deferred stub at the end of the function!
-                        let (widx, kind) = match at_fusion(&fusion, inst) {
-                            Fusion::CmpBr { cond, a, b: bv, op_ty } => {
-                                if at_opt(&const_u64, to_idx(bv)) == Some(0) && matches!(cond, IntCond::Eq | IntCond::Ne) {
-                                    let ra = load_gpr(&mut words, a, X16);
-                                    let w = words.len();
-                                    let k = if cond == IntCond::Eq {
-                                        words.push(enc::cbnz(ra, 0));
-                                        PatchKind::Cbnz(ra)
+                    } else {
+                        let emit_br_cond = |words: &mut Vec<u32, Alloc<'a>>, branch_if_true: bool| -> (usize, PatchKind) {
+                            match at_fusion(&fusion, inst) {
+                                Fusion::CmpBr { cond, a, b: bv, op_ty } => {
+                                    if at_opt(&const_u64, to_idx(bv)) == Some(0) && matches!(cond, IntCond::Eq | IntCond::Ne) {
+                                        let ra = load_gpr(words, a, X16);
+                                        let w = words.len();
+                                        let jump_on_zero = (cond == IntCond::Eq) == branch_if_true;
+                                        let k = if jump_on_zero {
+                                            words.push(enc::cbz(ra, 0));
+                                            PatchKind::Cbz(ra)
+                                        } else {
+                                            words.push(enc::cbnz(ra, 0));
+                                            PatchKind::Cbnz(ra)
+                                        };
+                                        (w, k)
                                     } else {
-                                        words.push(enc::cbz(ra, 0));
-                                        PatchKind::Cbz(ra)
-                                    };
-                                    (w, k)
-                                } else {
-                                    emit_cmp(&mut words, cond, a, bv, op_ty);
-                                    let inv = invert_cond(cond_of(cond));
-                                    let w = words.len();
-                                    words.push(enc::b_cond(inv, 0));
-                                    (w, PatchKind::BCond(inv))
+                                        emit_cmp(words, cond, a, bv, op_ty);
+                                        let c = if branch_if_true { cond_of(cond) } else { invert_cond(cond_of(cond)) };
+                                        let w = words.len();
+                                        words.push(enc::b_cond(c, 0));
+                                        (w, PatchKind::BCond(c))
+                                    }
                                 }
-                            }
-                            Fusion::FcmpBr { cond, a, b: bv, double } => {
-                                let va = load_fp(&mut words, a, V30);
-                                let vb = load_fp(&mut words, bv, V31);
-                                words.push(enc::fcmp(double, va, vb));
-                                let inv = invert_cond(cond);
-                                let w = words.len();
-                                words.push(enc::b_cond(inv, 0));
-                                (w, PatchKind::BCond(inv))
-                            }
-                            Fusion::BlazeResultCallBr => {
-                                let w = words.len();
-                                words.push(enc::b_cond(Cond::Lo, 0));
-                                (w, PatchKind::BCond(Cond::Lo))
-                            }
-                            Fusion::ReuseFlagsBr { cond, .. } => {
-                                let inv = invert_cond(cond);
-                                let w = words.len();
-                                words.push(enc::b_cond(inv, 0));
-                                (w, PatchKind::BCond(inv))
-                            }
-                            _ => {
-                                let rc = load_gpr(&mut words, cond_v, X16);
-                                let w = words.len();
-                                words.push(enc::cbz(rc, 0));
-                                (w, PatchKind::Cbz(rc))
-                            }
-                        };
-                        cold_stubs.push(ColdEdgeStub {
-                            branch_word_idx: widx,
-                            branch_kind: kind,
-                            target_block: else_block,
-                            args_start: else_at + 2,
-                            args_len: else_argc,
-                        });
-                    } else if !then_nop && else_nop && next_block == Some(to_idx(else_block)) && len < 32_768 {
-                        // Hot `else` falls straight through into `next_block` with ZERO moves;
-                        // sink cold `then` edge moves to a deferred stub at the end of the function!
-                        let (widx, kind) = match at_fusion(&fusion, inst) {
-                            Fusion::CmpBr { cond, a, b: bv, op_ty } => {
-                                if at_opt(&const_u64, to_idx(bv)) == Some(0) && matches!(cond, IntCond::Eq | IntCond::Ne) {
-                                    let ra = load_gpr(&mut words, a, X16);
-                                    let w = words.len();
-                                    let k = if cond == IntCond::Eq {
-                                        words.push(enc::cbz(ra, 0));
-                                        PatchKind::Cbz(ra)
-                                    } else {
-                                        words.push(enc::cbnz(ra, 0));
-                                        PatchKind::Cbnz(ra)
-                                    };
-                                    (w, k)
-                                } else {
-                                    emit_cmp(&mut words, cond, a, bv, op_ty);
-                                    let c = cond_of(cond);
+                                Fusion::FcmpBr { cond, a, b: bv, double } => {
+                                    let va = load_fp(words, a, V30);
+                                    let vb = load_fp(words, bv, V31);
+                                    words.push(enc::fcmp(double, va, vb));
+                                    let c = if branch_if_true { cond } else { invert_cond(cond) };
                                     let w = words.len();
                                     words.push(enc::b_cond(c, 0));
                                     (w, PatchKind::BCond(c))
                                 }
-                            }
-                            Fusion::FcmpBr { cond, a, b: bv, double } => {
-                                let va = load_fp(&mut words, a, V30);
-                                let vb = load_fp(&mut words, bv, V31);
-                                words.push(enc::fcmp(double, va, vb));
-                                let w = words.len();
-                                words.push(enc::b_cond(cond, 0));
-                                (w, PatchKind::BCond(cond))
-                            }
-                            Fusion::BlazeResultCallBr => {
-                                let w = words.len();
-                                words.push(enc::b_cond(Cond::Hs, 0));
-                                (w, PatchKind::BCond(Cond::Hs))
-                            }
-                            Fusion::ReuseFlagsBr { cond, .. } => {
-                                let w = words.len();
-                                words.push(enc::b_cond(cond, 0));
-                                (w, PatchKind::BCond(cond))
-                            }
-                            _ => {
-                                let rc = load_gpr(&mut words, cond_v, X16);
-                                let w = words.len();
-                                words.push(enc::cbnz(rc, 0));
-                                (w, PatchKind::Cbnz(rc))
-                            }
-                        };
-                        cold_stubs.push(ColdEdgeStub {
-                            branch_word_idx: widx,
-                            branch_kind: kind,
-                            target_block: then_block,
-                            args_start: at + 3,
-                            args_len: then_argc,
-                        });
-                    } else {
-                        let skip_then = match at_fusion(&fusion, inst) {
-                            Fusion::CmpBr { cond, a, b: bv, op_ty } => {
-                                emit_cmp(&mut words, cond, a, bv, op_ty);
-                                let inv = invert_cond(cond_of(cond));
-                                let idx = words.len();
-                                words.push(enc::b_cond(inv, 0));
-                                (idx, PatchKind::BCond(inv))
-                            }
-                            Fusion::FcmpBr { cond, a, b: bv, double } => {
-                                let va = load_fp(&mut words, a, V30);
-                                let vb = load_fp(&mut words, bv, V31);
-                                words.push(enc::fcmp(double, va, vb));
-                                let inv = invert_cond(cond);
-                                let idx = words.len();
-                                words.push(enc::b_cond(inv, 0));
-                                (idx, PatchKind::BCond(inv))
-                            }
-                            Fusion::BlazeResultCallBr => {
-                                // Skip `then` (Err) edge moves when Carry Clear (`Ok`, `Cond::Lo` = `b.cc`)!
-                                let inv = Cond::Lo;
-                                let idx = words.len();
-                                words.push(enc::b_cond(inv, 0));
-                                (idx, PatchKind::BCond(inv))
-                            }
-                            Fusion::ReuseFlagsBr { cond, .. } => {
-                                let inv = invert_cond(cond);
-                                let idx = words.len();
-                                words.push(enc::b_cond(inv, 0));
-                                (idx, PatchKind::BCond(inv))
-                            }
-                            _ => {
-                                let rc = load_gpr(&mut words, cond_v, X16);
-                                let idx = words.len();
-                                words.push(enc::cbz(rc, 0));
-                                (idx, PatchKind::Cbz(rc))
+                                Fusion::BlazeResultCallBr => {
+                                    let c = if branch_if_true { Cond::Hs } else { Cond::Lo };
+                                    let w = words.len();
+                                    words.push(enc::b_cond(c, 0));
+                                    (w, PatchKind::BCond(c))
+                                }
+                                Fusion::ReuseFlagsBr { cond, .. } => {
+                                    let c = if branch_if_true { cond } else { invert_cond(cond) };
+                                    let w = words.len();
+                                    words.push(enc::b_cond(c, 0));
+                                    (w, PatchKind::BCond(c))
+                                }
+                                _ => {
+                                    let rc = load_gpr(words, cond_v, X16);
+                                    let w = words.len();
+                                    let k = if branch_if_true {
+                                        words.push(enc::cbnz(rc, 0));
+                                        PatchKind::Cbnz(rc)
+                                    } else {
+                                        words.push(enc::cbz(rc, 0));
+                                        PatchKind::Cbz(rc)
+                                    };
+                                    (w, k)
+                                }
                             }
                         };
-                        let after_skip = words.len();
-                        emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, then_block, at + 3, then_argc);
-                        if words.len() == after_skip {
-                            // Zero `then`-edge moves after register coalescing: replace `b.!cond skip; b then`
-                            // with a single direct conditional branch `b.cond then` falling straight into `else`!
-                            let direct_kind = match skip_then.1 {
-                                PatchKind::BCond(inv) => PatchKind::BCond(invert_cond(inv)),
-                                PatchKind::Cbz(rc) => PatchKind::Cbnz(rc),
-                                _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected skip_then patch kind" }),
-                            };
-                            patches.push(BranchPatch {
-                                word_idx: skip_then.0,
-                                kind: direct_kind,
-                                target_block: then_block,
-                            });
+                        if then_nop && !else_nop {
+                            if next_block == Some(to_idx(then_block)) && len < 32_768 {
+                                // Hot `then` falls straight through into `next_block` with ZERO moves;
+                                // sink cold `else` edge moves to a deferred stub at the end of the function!
+                                let (widx, kind) = emit_br_cond(&mut words, false);
+                                cold_stubs.push(ColdEdgeStub {
+                                    branch_word_idx: widx,
+                                    branch_kind: kind,
+                                    target_block: else_block,
+                                    args_start: else_at + 2,
+                                    args_len: else_argc,
+                                });
+                            } else {
+                                // Zero-move `then` arm (e.g. rotated-loop back-edge): branch DIRECTLY to
+                                // `then_block` with ZERO trampoline, falling through into cold `else` moves!
+                                let (widx, kind) = emit_br_cond(&mut words, true);
+                                patches.push(BranchPatch { word_idx: widx, kind, target_block: then_block });
+                                emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, else_block, else_at + 2, else_argc);
+                                if next_block != Some(to_idx(else_block)) {
+                                    let w_else = words.len();
+                                    words.push(enc::b(0));
+                                    patches.push(BranchPatch { word_idx: w_else, kind: PatchKind::B, target_block: else_block });
+                                }
+                            }
+                        } else if !then_nop && else_nop {
+                            if next_block == Some(to_idx(else_block)) && len < 32_768 {
+                                // Hot `else` falls straight through into `next_block` with ZERO moves;
+                                // sink cold `then` edge moves to a deferred stub at the end of the function!
+                                let (widx, kind) = emit_br_cond(&mut words, true);
+                                cold_stubs.push(ColdEdgeStub {
+                                    branch_word_idx: widx,
+                                    branch_kind: kind,
+                                    target_block: then_block,
+                                    args_start: at + 3,
+                                    args_len: then_argc,
+                                });
+                            } else {
+                                // Zero-move `else` arm (e.g. inverted rotated-loop back-edge `wyhash_stream`):
+                                // branch DIRECTLY to `else_block` with ZERO trampoline, falling through into
+                                // cold `then` moves (and falling straight into `then_block` when next)!
+                                let (widx, kind) = emit_br_cond(&mut words, false);
+                                patches.push(BranchPatch { word_idx: widx, kind, target_block: else_block });
+                                emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, then_block, at + 3, then_argc);
+                                if next_block != Some(to_idx(then_block)) {
+                                    let w_then = words.len();
+                                    words.push(enc::b(0));
+                                    patches.push(BranchPatch { word_idx: w_then, kind: PatchKind::B, target_block: then_block });
+                                }
+                            }
                         } else {
+                            let skip_then = emit_br_cond(&mut words, false);
+                            emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, then_block, at + 3, then_argc);
                             let w_then = words.len();
                             words.push(enc::b(0));
                             patches.push(BranchPatch { word_idx: w_then, kind: PatchKind::B, target_block: then_block });
@@ -10364,15 +10636,16 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             let skip_word = match skip_then.1 {
                                 PatchKind::BCond(inv) => enc::b_cond(inv, delta),
                                 PatchKind::Cbz(rc) => enc::cbz(rc, delta),
+                                PatchKind::Cbnz(rc) => enc::cbnz(rc, delta),
                                 _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected skip_then patch kind" }),
                             };
                             set_at(&mut words, skip_then.0, skip_word);
-                        }
-                        emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, else_block, else_at + 2, else_argc);
-                        if next_block != Some(to_idx(else_block)) {
-                            let w_else = words.len();
-                            words.push(enc::b(0));
-                            patches.push(BranchPatch { word_idx: w_else, kind: PatchKind::B, target_block: else_block });
+                            emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, else_block, else_at + 2, else_argc);
+                            if next_block != Some(to_idx(else_block)) {
+                                let w_else = words.len();
+                                words.push(enc::b(0));
+                                patches.push(BranchPatch { word_idx: w_else, kind: PatchKind::B, target_block: else_block });
+                            }
                         }
                     }
                 }
@@ -11559,6 +11832,446 @@ mod tests {
                     p as u32,
                     "i128 lo-mul i32 mismatch"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn vec_popcnt_neon_all_widths_and_hardware_exec() {
+        let alloc = test_alloc();
+        let build_popcnt = |elem: Scalar, lanes: u32| -> Emitted<'static> {
+            let vty = Ty::vector(elem, lanes).expect("valid 128-bit vector type");
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let inp = b.param(Ty::PTR);
+            let outp = b.param(Ty::PTR);
+            let v = b.load(vty, Flags::NONE, inp, 0, MemAttrs::aligned(1));
+            let pc = b.unary(Op::Popcnt, Flags::NONE, v);
+            b.store(Flags::NONE, pc, outp, 0, MemAttrs::aligned(1));
+            b.ret(&[]);
+            let func = b.finish_checked().expect("vec popcnt LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("vec popcnt emits")
+        };
+
+        let is_cnt_16b = |w: u32| (w & 0xffff_fc00) == 0x4e20_5800;
+        let is_uaddlp_8h = |w: u32| (w & 0xffff_fc00) == 0x6e20_2800;
+        let is_uaddlp_4s = |w: u32| (w & 0xffff_fc00) == 0x6e60_2800;
+        let is_uaddlp_2d = |w: u32| (w & 0xffff_fc00) == 0x6ea0_2800;
+
+        let e8 = build_popcnt(Scalar::I8, 16);
+        let w8 = decode_words(&e8.code, alloc);
+        assert_eq!(w8.iter().filter(|&&w| is_cnt_16b(w)).count(), 1, "v16i8 must emit 1 cnt.16b");
+        assert_eq!(w8.iter().filter(|&&w| is_uaddlp_8h(w) || is_uaddlp_4s(w) || is_uaddlp_2d(w)).count(), 0);
+
+        let e16 = build_popcnt(Scalar::I16, 8);
+        let w16 = decode_words(&e16.code, alloc);
+        assert_eq!(w16.iter().filter(|&&w| is_cnt_16b(w)).count(), 1, "v8i16 must emit 1 cnt.16b");
+        assert_eq!(w16.iter().filter(|&&w| is_uaddlp_8h(w)).count(), 1, "v8i16 must emit 1 uaddlp.8h");
+        assert_eq!(w16.iter().filter(|&&w| is_uaddlp_4s(w) || is_uaddlp_2d(w)).count(), 0);
+
+        let e32 = build_popcnt(Scalar::I32, 4);
+        let w32 = decode_words(&e32.code, alloc);
+        assert_eq!(w32.iter().filter(|&&w| is_cnt_16b(w)).count(), 1, "v4i32 must emit 1 cnt.16b");
+        assert_eq!(w32.iter().filter(|&&w| is_uaddlp_8h(w)).count(), 1, "v4i32 must emit 1 uaddlp.8h");
+        assert_eq!(w32.iter().filter(|&&w| is_uaddlp_4s(w)).count(), 1, "v4i32 must emit 1 uaddlp.4s");
+        assert_eq!(w32.iter().filter(|&&w| is_uaddlp_2d(w)).count(), 0);
+
+        let e64 = build_popcnt(Scalar::I64, 2);
+        let w64 = decode_words(&e64.code, alloc);
+        assert_eq!(w64.iter().filter(|&&w| is_cnt_16b(w)).count(), 1, "v2i64 must emit 1 cnt.16b");
+        assert_eq!(w64.iter().filter(|&&w| is_uaddlp_8h(w)).count(), 1, "v2i64 must emit 1 uaddlp.8h");
+        assert_eq!(w64.iter().filter(|&&w| is_uaddlp_4s(w)).count(), 1, "v2i64 must emit 1 uaddlp.4s");
+        assert_eq!(w64.iter().filter(|&&w| is_uaddlp_2d(w)).count(), 1, "v2i64 must emit 1 uaddlp.2d");
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex8 = exec_leaf(e8);
+            let f8: extern "C" fn(*const u8, *mut u8) = unsafe { ex8.as_fn() };
+            let in8: [u8; 16] = [0x00, 0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff, 0x55, 0xaa, 0x81, 0x42, 0x24, 0x18, 0x99];
+            let mut out8 = [0u8; 16];
+            f8(in8.as_ptr(), out8.as_mut_ptr());
+            for k in 0..16 {
+                assert_eq!(out8[k], in8[k].count_ones() as u8, "v16i8 popcnt lane {k}");
+            }
+
+            let ex16 = exec_leaf(e16);
+            let f16: extern "C" fn(*const u16, *mut u16) = unsafe { ex16.as_fn() };
+            let in16: [u16; 8] = [0x0000, 0x0001, 0x8001, 0x5555, 0xaaaa, 0x0fff, 0xfffe, 0xffff];
+            let mut out16 = [0u16; 8];
+            f16(in16.as_ptr(), out16.as_mut_ptr());
+            for k in 0..8 {
+                assert_eq!(out16[k], in16[k].count_ones() as u16, "v8i16 popcnt lane {k}");
+            }
+
+            let ex32 = exec_leaf(e32);
+            let f32_fn: extern "C" fn(*const u32, *mut u32) = unsafe { ex32.as_fn() };
+            let in32: [u32; 4] = [0x0000_0000, 0xdead_beef, 0x5555_aaaa, 0xffff_ffff];
+            let mut out32 = [0u32; 4];
+            f32_fn(in32.as_ptr(), out32.as_mut_ptr());
+            for k in 0..4 {
+                assert_eq!(out32[k], in32[k].count_ones(), "v4i32 popcnt lane {k}");
+            }
+
+            let ex64 = exec_leaf(e64);
+            let f64_fn: extern "C" fn(*const u64, *mut u64) = unsafe { ex64.as_fn() };
+            let in64: [u64; 2] = [0x0123_4567_89ab_cdef, u64::MAX];
+            let mut out64 = [0u64; 2];
+            f64_fn(in64.as_ptr(), out64.as_mut_ptr());
+            for k in 0..2 {
+                assert_eq!(out64[k], u64::from(in64[k].count_ones()), "v2i64 popcnt lane {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn vec_extract_neon_fp_and_int_all_lanes_hardware_exec() {
+        let alloc = test_alloc();
+        let build_extract = |elem: Scalar, lanes: u32, lane: u32| -> Emitted<'static> {
+            let vty = Ty::vector(elem, lanes).expect("valid 128-bit vector type");
+            let sty = vty.lane();
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[Param::of(sty)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let p = b.param(Ty::PTR);
+            let v = b.load(vty, Flags::NONE, p, 0, MemAttrs::aligned(1));
+            let ex = b.extract(v, lane);
+            b.ret(&[ex]);
+            let func = b.finish_checked().expect("vec extract LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("vec extract emits")
+        };
+
+        let is_dup_scalar = |w: u32| (w & 0xffe0_fc00) == 0x5e00_0400;
+        let is_fmov_reg = |w: u32| (w & 0xffbf_fc00) == 0x1e20_4000;
+        let is_umov = |w: u32| (w & 0xbfe0_fc00) == 0x0e00_3c00;
+
+        // 1. `<4 x f32>` across all 4 lanes.
+        let f32_vals: [f32; 4] = [1.25, -3.5, 42.75, f32::from_bits(0x3f80_0001)];
+        for lane in 0..4u32 {
+            let emitted = build_extract(Scalar::F32, 4, lane);
+            let words = decode_words(&emitted.code, alloc);
+            if lane == 0 {
+                assert_eq!(words.iter().filter(|&&w| is_fmov_reg(w) || is_dup_scalar(w)).count(), 0, "f32 lane 0 extract must coalesce to 0 instructions");
+            } else {
+                assert_eq!(words.iter().filter(|&&w| is_dup_scalar(w)).count(), 1, "f32 lane {lane} extract must emit 1 scalar dup");
+            }
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let ex = exec_leaf(emitted);
+                let f: extern "C" fn(*const f32) -> f32 = unsafe { ex.as_fn() };
+                assert_eq!(f(f32_vals.as_ptr()).to_bits(), f32_vals[lane as usize].to_bits(), "v4f32 extract lane {lane}");
+            }
+        }
+
+        // 2. `<2 x f64>` across both lanes.
+        let f64_vals: [f64; 2] = [core::f64::consts::PI, -12345.6789];
+        for lane in 0..2u32 {
+            let emitted = build_extract(Scalar::F64, 2, lane);
+            let words = decode_words(&emitted.code, alloc);
+            if lane == 0 {
+                assert_eq!(words.iter().filter(|&&w| is_fmov_reg(w) || is_dup_scalar(w)).count(), 0, "f64 lane 0 extract must coalesce to 0 instructions");
+            } else {
+                assert_eq!(words.iter().filter(|&&w| is_dup_scalar(w)).count(), 1, "f64 lane {lane} extract must emit 1 scalar dup");
+            }
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let ex = exec_leaf(emitted);
+                let f: extern "C" fn(*const f64) -> f64 = unsafe { ex.as_fn() };
+                assert_eq!(f(f64_vals.as_ptr()).to_bits(), f64_vals[lane as usize].to_bits(), "v2f64 extract lane {lane}");
+            }
+        }
+
+        // 3. `<4 x i32>` across all 4 lanes.
+        let i32_vals: [u32; 4] = [0x1122_3344, 0x5566_7788, 0x99aa_bbcc, 0xddee_ff00];
+        for lane in 0..4u32 {
+            let emitted = build_extract(Scalar::I32, 4, lane);
+            let words = decode_words(&emitted.code, alloc);
+            assert_eq!(words.iter().filter(|&&w| is_umov(w)).count(), 1, "v4i32 extract lane {lane} must emit 1 umov");
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let ex = exec_leaf(emitted);
+                let f: extern "C" fn(*const u32) -> u32 = unsafe { ex.as_fn() };
+                assert_eq!(f(i32_vals.as_ptr()), i32_vals[lane as usize], "v4i32 extract lane {lane}");
+            }
+        }
+
+        // 4. `<2 x i64>` across both lanes.
+        let i64_vals: [u64; 2] = [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
+        for lane in 0..2u32 {
+            let emitted = build_extract(Scalar::I64, 2, lane);
+            let words = decode_words(&emitted.code, alloc);
+            assert_eq!(words.iter().filter(|&&w| is_umov(w)).count(), 1, "v2i64 extract lane {lane} must emit 1 umov");
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let ex = exec_leaf(emitted);
+                let f: extern "C" fn(*const u64) -> u64 = unsafe { ex.as_fn() };
+                assert_eq!(f(i64_vals.as_ptr()), i64_vals[lane as usize], "v2i64 extract lane {lane}");
+            }
+        }
+
+        // 5. `<16 x i8>` across all 16 lanes.
+        let i8_vals: [u8; 16] = [10, 21, 32, 43, 54, 65, 76, 87, 98, 109, 120, 131, 142, 153, 164, 255];
+        for lane in 0..16u32 {
+            let emitted = build_extract(Scalar::I8, 16, lane);
+            let words = decode_words(&emitted.code, alloc);
+            assert_eq!(words.iter().filter(|&&w| is_umov(w)).count(), 1, "v16i8 extract lane {lane} must emit 1 umov");
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let ex = exec_leaf(emitted);
+                let f: extern "C" fn(*const u8) -> u8 = unsafe { ex.as_fn() };
+                assert_eq!(f(i8_vals.as_ptr()), i8_vals[lane as usize], "v16i8 extract lane {lane}");
+            }
+        }
+    }
+
+    #[test]
+    fn vec_fmul_by_element_fuses_splat_zero_dup_hardware_exec() {
+        let alloc = test_alloc();
+        let v4f32 = Ty::vector(Scalar::F32, 4).expect("v4f32");
+        let v2f64 = Ty::vector(Scalar::F64, 2).expect("v2f64");
+
+        let is_dup_elem_v = |w: u32| (w & 0xffe0_fc00) == 0x4e00_0400;
+        let is_fmul_4s_elem0 = |w: u32| (w & 0xffe0_fc00) == 0x4f80_9000;
+        let is_fmul_2d_elem0 = |w: u32| (w & 0xffe0_fc00) == 0x4fc0_9000;
+        let is_fmla_4s_elem0 = |w: u32| (w & 0xffe0_fc00) == 0x4f80_1000;
+
+        // 1. Exact `matmul_f32` strict-IEEE micro-kernel shape:
+        //    `a_sc = load f32; va = splat(a_sc); for col in 0..4: c[col] += va * b[col]`.
+        let matmul_emitted = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let pa = b.param(Ty::PTR);
+            let pb = b.param(Ty::PTR);
+            let pc = b.param(Ty::PTR);
+            let a_sc = b.load(Ty::F32, Flags::NONE, pa, 0, MemAttrs::aligned(4));
+            let va = b.convert(Op::Splat, Flags::NONE, v4f32, a_sc);
+            for col in 0..4i32 {
+                let off = col * 16;
+                let bv = b.load(v4f32, Flags::NONE, pb, off, MemAttrs::aligned(4));
+                let cv = b.load(v4f32, Flags::NONE, pc, off, MemAttrs::aligned(4));
+                let prod = b.binary(Op::Fmul, Flags::NONE, va, bv);
+                let sum = b.binary(Op::Fadd, Flags::NONE, cv, prod);
+                b.store(Flags::NONE, sum, pc, off, MemAttrs::aligned(4));
+            }
+            b.ret(&[]);
+            let func = b.finish_checked().expect("matmul 1x16 LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("matmul 1x16 emits")
+        };
+        let mw = decode_words(&matmul_emitted.code, alloc);
+        assert_eq!(mw.iter().filter(|&&w| is_dup_elem_v(w)).count(), 0, "matmul_f32 must emit ZERO dup.4s");
+        assert_eq!(mw.iter().filter(|&&w| is_fmul_4s_elem0(w)).count(), 4, "matmul_f32 must emit 4 by-element fmul.4s");
+
+        // 2. Entry scalar param in `v0` (`rm < 16`) with `<4 x f32>` FMA + `<2 x f64>` Fmul.
+        let param_f32_emitted = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::F32), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a_sc = b.param(Ty::F32);
+            let px = b.param(Ty::PTR);
+            let py = b.param(Ty::PTR);
+            let va = b.convert(Op::Splat, Flags::NONE, v4f32, a_sc);
+            let vx = b.load(v4f32, Flags::NONE, px, 0, MemAttrs::aligned(4));
+            let vy = b.load(v4f32, Flags::NONE, py, 0, MemAttrs::aligned(4));
+            let res = b.ternary(Op::Fma, Flags::NONE, vx, va, vy);
+            b.store(Flags::NONE, res, py, 0, MemAttrs::aligned(4));
+            b.ret(&[]);
+            let func = b.finish_checked().expect("param fma elem LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("param fma elem emits")
+        };
+        let pw = decode_words(&param_f32_emitted.code, alloc);
+        assert_eq!(pw.iter().filter(|&&w| is_dup_elem_v(w)).count(), 0, "fma by-element must emit ZERO dup.4s");
+        assert_eq!(pw.iter().filter(|&&w| is_fmla_4s_elem0(w)).count(), 1, "expected 1 by-element fmla.4s");
+
+        let f64_emitted = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::F64), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a_sc = b.param(Ty::F64);
+            let px = b.param(Ty::PTR);
+            let pout = b.param(Ty::PTR);
+            let va = b.convert(Op::Splat, Flags::NONE, v2f64, a_sc);
+            let vx = b.load(v2f64, Flags::NONE, px, 0, MemAttrs::aligned(8));
+            let prod = b.binary(Op::Fmul, Flags::NONE, va, vx);
+            b.store(Flags::NONE, prod, pout, 0, MemAttrs::aligned(8));
+            b.ret(&[]);
+            let func = b.finish_checked().expect("v2f64 fmul elem LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("v2f64 fmul elem emits")
+        };
+        let dw = decode_words(&f64_emitted.code, alloc);
+        assert_eq!(dw.iter().filter(|&&w| is_dup_elem_v(w)).count(), 0, "v2f64 fmul by-element must emit ZERO dup.2d");
+        assert_eq!(dw.iter().filter(|&&w| is_fmul_2d_elem0(w)).count(), 1, "expected 1 by-element fmul.2d");
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex_mm = exec_leaf(matmul_emitted);
+            let f_mm: extern "C" fn(*const f32, *const f32, *mut f32) = unsafe { ex_mm.as_fn() };
+            let a_val = 2.75f32;
+            let b_arr: [f32; 16] = core::array::from_fn(|k| (k as f32) * 0.5 - 3.0);
+            let mut c_arr: [f32; 16] = core::array::from_fn(|k| (k as f32) * 1.25 + 0.5);
+            let want_c: [f32; 16] = core::array::from_fn(|k| c_arr[k] + a_val * b_arr[k]);
+            f_mm(&a_val, b_arr.as_ptr(), c_arr.as_mut_ptr());
+            for k in 0..16 {
+                assert_eq!(c_arr[k].to_bits(), want_c[k].to_bits(), "matmul by-element lane {k}");
+            }
+
+            let ex_fma = exec_leaf(param_f32_emitted);
+            let f_fma: extern "C" fn(f32, *const f32, *mut f32) = unsafe { ex_fma.as_fn() };
+            let x4 = [1.5f32, -2.25, 3.75, 0.125];
+            let mut y4 = [0.5f32, 1.0, -4.0, 2.5];
+            let want_y4: [f32; 4] = core::array::from_fn(|k| x4[k].mul_add(-1.75f32, y4[k]));
+            f_fma(-1.75f32, x4.as_ptr(), y4.as_mut_ptr());
+            for k in 0..4 {
+                assert_eq!(y4[k].to_bits(), want_y4[k].to_bits(), "fmla by-element lane {k}");
+            }
+
+            let ex_f64 = exec_leaf(f64_emitted);
+            let f_f64: extern "C" fn(f64, *const f64, *mut f64) = unsafe { ex_f64.as_fn() };
+            let x2 = [3.5f64, -7.25];
+            let mut out2 = [0.0f64; 2];
+            f_f64(2.5f64, x2.as_ptr(), out2.as_mut_ptr());
+            assert_eq!(out2[0].to_bits(), (2.5f64 * x2[0]).to_bits());
+            assert_eq!(out2[1].to_bits(), (2.5f64 * x2[1]).to_bits());
+        }
+    }
+
+    #[test]
+    fn rotated_loop_inverted_backedge_zero_trampoline_hardware_exec() {
+        let alloc = test_alloc();
+
+        // Build exact `wyhash_stream`-shaped rotated loop with 0 back-edge moves and 1 exit-edge move:
+        // - `inverted == true`: `br(i_next == n, (exit, &[acc_next]), (loop_hdr, &[i_next, acc_next]))`
+        //   (`!then_nop && else_nop`, hot back-edge is the `else` arm!)
+        // - `inverted == false`: `br(i_next != n, (loop_hdr, &[i_next, acc_next]), (exit, &[acc_next]))`
+        //   (`then_nop && !else_nop`, hot back-edge is the `then` arm!)
+        let build_loop = |inverted: bool| -> Emitted<'static> {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let loop_hdr = b.create_block(BlockKind::Normal);
+            let exit = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let ptr = b.param(Ty::PTR);
+            let n = b.param(Ty::I64);
+            let seed = b.param(Ty::I64);
+            let zero = b.iconst(Ty::I64, 0);
+            let is_empty = b.icmp(IntCond::Eq, n, zero);
+            b.br(Flags::NONE, is_empty, (exit, &[seed]), (loop_hdr, &[zero, seed]));
+
+            b.begin(loop_hdr);
+            let i = b.param(Ty::I64);
+            let acc = b.param(Ty::I64);
+            let c3 = b.iconst(Ty::I64, 3);
+            let off = b.binary(Op::Shl, Flags::NONE, i, c3);
+            let elem_ptr = b.ptr_add(Flags::NONE, ptr, off);
+            let val = b.load(Ty::I64, Flags::NONE, elem_ptr, 0, MemAttrs::aligned(8));
+            let sum = b.binary(Op::Add, Flags::NONE, acc, val);
+            let acc_next = b.binary(Op::Xor, Flags::NONE, sum, i);
+            let c1 = b.iconst(Ty::I64, 1);
+            let i_next = b.binary(Op::Add, Flags::NONE, i, c1);
+            if inverted {
+                let done = b.icmp(IntCond::Eq, i_next, n);
+                b.br(Flags::NONE, done, (exit, &[acc_next]), (loop_hdr, &[i_next, acc_next]));
+            } else {
+                let cont = b.icmp(IntCond::Ne, i_next, n);
+                b.br(Flags::NONE, cont, (loop_hdr, &[i_next, acc_next]), (exit, &[acc_next]));
+            }
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+
+            let func = b.finish_checked().expect("rotated loop LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("rotated loop emits")
+        };
+
+        for inverted in [true, false] {
+            let emitted = build_loop(inverted);
+            let words = decode_words(&emitted.code, alloc);
+
+            let mut back_branch = None;
+            for (idx, &w) in words.iter().enumerate() {
+                if (w & 0xff00_0010) == 0x5400_0000 {
+                    let imm19 = ((w >> 5) & 0x7_ffff) as i32;
+                    let disp = (imm19 << 13) >> 13;
+                    if disp < 0 {
+                        let target = (idx as isize + disp as isize) as usize;
+                        back_branch = Some((idx, target));
+                    }
+                }
+            }
+            let (b_idx, loop_start) =
+                back_branch.expect("expected direct backward b.cond back-edge to loop header");
+            assert_ne!(
+                words[loop_start] & 0xfc00_0000,
+                0x1400_0000,
+                "inverted={inverted}: back-edge b.cond must NOT target an unconditional `b` trampoline"
+            );
+            let uncond_b_in_loop = words[loop_start..=b_idx]
+                .iter()
+                .filter(|&&w| (w & 0xfc00_0000) == 0x1400_0000)
+                .count();
+            assert_eq!(
+                uncond_b_in_loop, 0,
+                "inverted={inverted}: hot loop body must contain ZERO unconditional `b` trampolines"
+            );
+
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let ex = exec_leaf(emitted);
+                let f: extern "C" fn(*const u64, u64, u64) -> u64 = unsafe { ex.as_fn() };
+                let data: [u64; 16] = core::array::from_fn(|k| (k as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(17));
+                for len in [0usize, 1, 2, 7, 16] {
+                    let seed = 0x1234_5678_9abc_def0u64;
+                    let mut want = seed;
+                    for k in 0..len {
+                        want = want.wrapping_add(data[k]) ^ (k as u64);
+                    }
+                    assert_eq!(f(data.as_ptr(), len as u64, seed), want, "inverted={inverted} len={len}");
+                }
             }
         }
     }
