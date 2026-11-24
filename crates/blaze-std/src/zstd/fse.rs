@@ -850,19 +850,20 @@ impl FseDecTable {
 }
 
 // ---------------------------------------------------------------------------
-// O(1) FSE Encoding Table (exact inverse of any FseDecTable with log <= 6)
+// O(1) FSE Encoding Table (exact inverse of any FseDecTable with log <= 8)
 // ---------------------------------------------------------------------------
 
-const MAX_ENC_TABLE_SIZE: usize = 1 << 6;
+const MAX_ENC_LOG: u8 = 8;
+const MAX_ENC_TABLE_SIZE: usize = 1 << MAX_ENC_LOG;
 
 #[derive(Clone, Copy)]
 struct FseSymMeta {
     /// Start index of this symbol's states in `state_table`.
-    offset: u8,
+    offset: u16,
     /// Number of states assigned to this symbol (`0` if unused).
-    count: u8,
+    count: u16,
     /// `target < split` uses `max_nb - 1` bits; `target >= split` uses `max_nb` bits.
-    split: u8,
+    split: u16,
     max_nb: u8,
 }
 
@@ -879,7 +880,7 @@ pub(crate) fn normalize_fse_counts(
     accuracy_log: u8,
     norm: &mut [i16],
 ) -> Option<usize> {
-    if total == 0 || accuracy_log > 6 || counts.len() > norm.len() {
+    if total == 0 || accuracy_log > MAX_ENC_LOG || counts.len() > norm.len() {
         return None;
     }
     norm.fill(0);
@@ -1010,11 +1011,11 @@ impl FseEncTable {
 
     pub(crate) fn rebuild_from_dec(&mut self, dec: &FseDecTable) -> Result<(), ZstdError> {
         let log = dec.accuracy_log();
-        if log > 6 {
+        if log > MAX_ENC_LOG {
             return Err(ZstdError::CorruptFse);
         }
         let table_size = 1usize << u32::from(log);
-        let mut counts = [0u8; MAX_FSE_SYMBOLS];
+        let mut counts = [0u16; MAX_FSE_SYMBOLS];
         for state in 0..table_size {
             let entry = dec.entry(state).ok_or(ZstdError::CorruptFse)?;
             let c = counts.get_mut(usize::from(entry.symbol)).ok_or(ZstdError::CorruptFse)?;
@@ -1039,15 +1040,15 @@ impl FseEncTable {
             };
             let slot = self.meta.get_mut(sym).ok_or(ZstdError::CorruptFse)?;
             *slot = FseSymMeta {
-                offset: u8::try_from(cursor).map_err(|_| ZstdError::CorruptFse)?,
+                offset: u16::try_from(cursor).map_err(|_| ZstdError::CorruptFse)?,
                 count,
-                split: u8::try_from(split_u32).map_err(|_| ZstdError::CorruptFse)?,
+                split: u16::try_from(split_u32).map_err(|_| ZstdError::CorruptFse)?,
                 max_nb: u8::try_from(max_nb).map_err(|_| ZstdError::CorruptFse)?,
             };
             cursor += usize::from(count);
         }
 
-        let mut write_pos = [0u8; MAX_FSE_SYMBOLS];
+        let mut write_pos = [0u16; MAX_FSE_SYMBOLS];
         for sym in 0..MAX_FSE_SYMBOLS {
             let dst = write_pos.get_mut(sym).ok_or(ZstdError::CorruptFse)?;
             let m = *self.meta.get(sym).ok_or(ZstdError::CorruptFse)?;
@@ -1088,7 +1089,7 @@ impl FseEncTable {
             .get(usize::from(sym) & (MAX_FSE_SYMBOLS - 1))
             .copied()
             .unwrap_or(FseSymMeta::ZERO);
-        let nb = u32::from(m.max_nb).wrapping_sub(u32::from(target_state < m.split));
+        let nb = u32::from(m.max_nb).wrapping_sub(u32::from(u16::from(target_state) < m.split));
         let target = u32::from(target_state);
         let bits = target & ((1u32 << nb) - 1);
         let u = (target + u32::from(self.table_size)) >> nb;
@@ -1108,7 +1109,7 @@ impl FseEncTable {
         if m.count == 0 {
             return None;
         }
-        let nb = if target_state < m.split {
+        let nb = if u16::from(target_state) < m.split {
             u32::from(m.max_nb - 1)
         } else {
             u32::from(m.max_nb)
