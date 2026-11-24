@@ -1411,7 +1411,7 @@ mod tests {
         builder::{Builder, Facts, Full, MemAttrs, Param, Variadic},
         func::{BlockKind, Conv, Ext, FnAttrs, Func, ParamKind, RefKind},
     };
-    use blaze_own::Alloc;
+    use blaze_own::{Alloc, Vec};
     use blaze_tier::{CallClobbers, Reg, RegSet};
 
     use super::{
@@ -1424,19 +1424,26 @@ mod tests {
     }
 
     fn build_i64_fn(n_params: usize, n_rets: usize, attrs: FnAttrs) -> Func<Alloc<'static>> {
-        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, test_alloc());
-        let params: std::vec::Vec<Param> = (0..n_params).map(|_| Param::of(Ty::I64)).collect();
-        let rets: std::vec::Vec<Param> = (0..n_rets).map(|_| Param::of(Ty::I64)).collect();
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let mut params = Vec::with_capacity_in(n_params, alloc);
+        for _ in 0..n_params {
+            params.push(Param::of(Ty::I64));
+        }
+        let mut rets = Vec::with_capacity_in(n_rets, alloc);
+        for _ in 0..n_rets {
+            rets.push(Param::of(Ty::I64));
+        }
         let sig = b.sig(Conv::C, Variadic::No, &params, &rets);
         b.set_signature(sig);
         b.set_attrs(attrs);
         let entry = b.create_block(BlockKind::Normal);
         b.begin(entry);
-        let mut vals = std::vec::Vec::with_capacity(n_params);
+        let mut vals = Vec::with_capacity_in(n_params, alloc);
         for _ in 0..n_params {
             vals.push(b.param(Ty::I64));
         }
-        let mut ret_vals = std::vec::Vec::with_capacity(n_rets);
+        let mut ret_vals = Vec::with_capacity_in(n_rets, alloc);
         for i in 0..n_rets {
             if let Some(&v) = vals.get(i) {
                 ret_vals.push(v);

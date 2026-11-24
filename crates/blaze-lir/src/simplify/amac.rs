@@ -3222,15 +3222,15 @@ mod tests {
     /// Generates a sorted `i64` table of length `n` (with duplicates & gaps) and `q_max` queries
     /// hitting `< table[0]`, exact matches, duplicate runs, between-element misses, and `> table[n-1]`
     /// (which specifically drives `lo == hi == n` to stress out-of-bounds load safety!).
-    fn make_table_and_queries(n: usize, q_max: usize) -> (alloc::vec::Vec<u64>, alloc::vec::Vec<u64>) {
-        let mut table = alloc::vec::Vec::with_capacity(n);
+    fn make_table_and_queries(n: usize, q_max: usize) -> (Vec<u64, TestHeap>, Vec<u64, TestHeap>) {
+        let mut table = Vec::with_capacity_in(n, TestHeap);
         for i in 0..n {
             // Intentional duplicate runs (e.g., i=3,4) and gaps.
             let v = ((i as u64) - ((i as u64) % 3 == 2) as u64) * 10 + 10;
             table.push(v);
         }
         let max_v = table.last().copied().unwrap_or(0);
-        let mut queries = alloc::vec::Vec::with_capacity(q_max);
+        let mut queries = Vec::with_capacity_in(q_max, TestHeap);
         for q in 0..q_max {
             let key = match q % 7 {
                 0 => 0,                         // strictly < table[0]
