@@ -1622,3 +1622,279 @@ fn main() {
         }
     }
 }
+
+mod box_dyn_supertrait_dispatch {
+    use blaze_ladder::refusal::SourceFile;
+    use blaze_ladder::run::{FrontChoice, NewFront, run_with};
+
+    const NEW_NO_CORE: NewFront<'static> = NewFront {
+        package: "box_dyn_supertrait",
+        edition: "2024",
+        shelf: None,
+        overflow: blaze_build::OverflowChecks::Off,
+    };
+
+    const REPRO_PROGRAM: &str = "
+#![no_std]
+#![no_core]
+
+#[lang = \"pointee_sized\"]
+trait PointeeSized {}
+
+#[lang = \"meta_sized\"]
+trait MetaSized: PointeeSized {}
+
+#[lang = \"sized\"]
+trait Sized: MetaSized {}
+
+#[lang = \"legacy_receiver\"]
+trait LegacyReceiver: PointeeSized {}
+
+impl<T: PointeeSized> LegacyReceiver for &T {}
+impl<T: PointeeSized> LegacyReceiver for &mut T {}
+impl<T: PointeeSized> LegacyReceiver for MyBox<T> {}
+
+#[lang = \"copy\"]
+trait Copy {}
+impl Copy for bool {}
+impl Copy for u8 {}
+impl Copy for u32 {}
+impl Copy for u64 {}
+impl Copy for i32 {}
+impl Copy for usize {}
+impl<T: PointeeSized> Copy for &T {}
+impl<T: PointeeSized> Copy for *const T {}
+impl<T: PointeeSized> Copy for *mut T {}
+
+#[lang = \"drop\"]
+trait Drop {
+    fn drop(&mut self);
+}
+
+#[lang = \"drop_in_place\"]
+unsafe fn drop_in_place<T: PointeeSized>(_to_drop: *mut T) {}
+
+#[lang = \"panic_cannot_unwind\"]
+fn panic_cannot_unwind() -> ! {
+    loop {}
+}
+
+#[lang = \"deref\"]
+trait Deref {
+    type Target: PointeeSized;
+    fn deref(&self) -> &Self::Target;
+}
+
+#[lang = \"deref_mut\"]
+trait DerefMut: Deref {
+    fn deref_mut(&mut self) -> &mut Self::Target;
+}
+
+#[lang = \"unsize\"]
+trait Unsize<T: PointeeSized>: PointeeSized {}
+
+#[lang = \"coerce_unsized\"]
+trait CoerceUnsized<T: PointeeSized> {}
+
+impl<'a, 'b: 'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a U> for &'b T {}
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a mut U> for &'a mut T {}
+impl<T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<MyBox<U>> for MyBox<T> {}
+
+#[lang = \"dispatch_from_dyn\"]
+trait DispatchFromDyn<T> {}
+
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<&'a U> for &'a T {}
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<&'a mut U> for &'a mut T {}
+impl<T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<MyBox<U>> for MyBox<T> {}
+
+#[rustc_intrinsic]
+const fn size_of<T>() -> usize;
+
+#[rustc_intrinsic]
+unsafe fn write_via_move<T>(dst: *mut T, value: T);
+
+#[rustc_intrinsic]
+const fn forget<T>(_: T);
+
+static mut ARENA: [u64; 256] = [0; 256];
+static mut NEXT_SLOT: usize = 0;
+
+#[lang = \"send\"]
+unsafe auto trait Send {}
+
+#[lang = \"sync\"]
+unsafe auto trait Sync {}
+
+#[lang = \"owned_box\"]
+struct MyBox<T: PointeeSized>(*mut T);
+
+impl<T> MyBox<T> {
+    fn new(v: T) -> MyBox<T> {
+        let sz = size_of::<T>();
+        if sz == 0 {
+            forget(v);
+            let ptr = 8usize as *mut T;
+            return MyBox(ptr);
+        }
+        unsafe {
+            let words = (sz + 7) >> 3;
+            let base = &raw mut ARENA as usize;
+            let slot = (base + NEXT_SLOT * 8) as *mut T;
+            NEXT_SLOT = NEXT_SLOT + words;
+            write_via_move(slot, v);
+            MyBox(slot)
+        }
+    }
+}
+
+impl<T: PointeeSized> Deref for MyBox<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &**self
+    }
+}
+
+impl<T: PointeeSized> DerefMut for MyBox<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut **self
+    }
+}
+
+impl<T: PointeeSized> Drop for MyBox<T> {
+    fn drop(&mut self) {}
+}
+
+enum MyPoll<T> {
+    Ready(T),
+    Pending,
+}
+
+enum MyResult<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+struct BigError {
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+}
+
+trait Service<Request> {
+    type Response;
+    type Error;
+    fn poll_ready(&mut self, cx: &mut u32) -> MyPoll<MyResult<(), Self::Error>>;
+    fn call(&mut self, req: Request) -> Self::Response;
+}
+
+impl<S: Service<Request> + MetaSized, Request> Service<Request> for MyBox<S> {
+    type Response = S::Response;
+    type Error = S::Error;
+    fn poll_ready(&mut self, cx: &mut u32) -> MyPoll<MyResult<(), Self::Error>> {
+        (**self).poll_ready(cx)
+    }
+    fn call(&mut self, req: Request) -> Self::Response {
+        (**self).call(req)
+    }
+}
+
+trait Transport: Service<u32, Response = u64, Error = BigError> + Send + Sync + 'static {
+    fn boxed(self) -> BoxTransport where Self: Sized {
+        BoxTransport { inner: MyBox::new(self) }
+    }
+}
+
+impl<T: Service<u32, Response = u64, Error = BigError> + Send + Sync + 'static> Transport for T {}
+
+trait AnyLike {
+    fn tag(&self) -> u32;
+}
+
+impl<T: 'static> AnyLike for T {
+    fn tag(&self) -> u32 { 99 }
+}
+
+trait CloneTransport: Transport + AnyLike {
+    fn clone_box(&self) -> MyBox<dyn CloneTransport + Send + Sync>;
+}
+
+struct MockTransport {
+    state: u32,
+}
+
+impl Service<u32> for MockTransport {
+    type Response = u64;
+    type Error = BigError;
+    fn poll_ready(&mut self, cx: &mut u32) -> MyPoll<MyResult<(), BigError>> {
+        self.state = self.state + *cx;
+        MyPoll::Ready(MyResult::Ok(()))
+    }
+    fn call(&mut self, req: u32) -> u64 {
+        (self.state as u64) * 100 + (req as u64)
+    }
+}
+
+impl CloneTransport for MockTransport {
+    fn clone_box(&self) -> MyBox<dyn CloneTransport + Send + Sync> {
+        MyBox::new(MockTransport { state: self.state })
+    }
+}
+
+struct BoxTransport {
+    inner: MyBox<dyn CloneTransport>,
+}
+
+impl BoxTransport {
+    fn clone_self(&self) -> Self {
+        Self { inner: self.inner.clone_box() }
+    }
+}
+
+impl Service<u32> for BoxTransport {
+    type Response = u64;
+    type Error = BigError;
+    fn poll_ready(&mut self, cx: &mut u32) -> MyPoll<MyResult<(), BigError>> {
+        self.inner.poll_ready(cx)
+    }
+    fn call(&mut self, req: u32) -> u64 {
+        self.inner.call(req)
+    }
+}
+
+#[no_mangle]
+pub extern \"C\" fn main() -> i32 {
+    let mut bt = BoxTransport { inner: MyBox::new(MockTransport { state: 10 }) };
+    let mut cx = 5u32;
+    match bt.poll_ready(&mut cx) {
+        MyPoll::Ready(MyResult::Ok(())) => {}
+        _ => return 1,
+    }
+    let r2 = bt.call(7);
+    if r2 != 1507 {
+        return 2;
+    }
+    let mut bt2 = bt.clone_self();
+    match bt2.poll_ready(&mut cx) {
+        MyPoll::Ready(MyResult::Ok(())) => {}
+        _ => return 3,
+    }
+    let r3 = bt2.call(8);
+    if r3 != 2008 {
+        return 4;
+    }
+    0
+}
+";
+
+    #[test]
+    fn box_dyn_supertrait_service_dispatch() {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let files = [SourceFile { path: "src/main.rs", text: REPRO_PROGRAM }];
+            let status = run_with(&files, "src/main.rs", None, FrontChoice::New(NEW_NO_CORE), blaze_own::testing::heap().shared())
+                .unwrap_or_else(|e| panic!("box_dyn_supertrait run refused: {e}"));
+            assert_eq!(status, 0, "box_dyn_supertrait failed with status {status}");
+        }
+    }
+}
