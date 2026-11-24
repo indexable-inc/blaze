@@ -1842,3 +1842,39 @@ fn dynamic_co_binder_skolemizes_via_canonical_dyn_placeholder() {
     assert!(reach(&out.rec, 3).contains(&ph) && reach(&out.rec, ph).contains(&3), "slot 3 must equate with dyn_placeholder(0) ({ph}): {:?}", out.rec.subsets);
     assert!(rejects(&out.rec, &[], &[3, ph]), "CONTROL: a caller universal at slot 3 cannot equal rigid dyn_placeholder {ph}");
 }
+
+/// Reflexive projection equality (`blaze_format_core::Writer::new` -> `Writer::with_buffer` shape):
+/// `fn callee<'a, P: Tr<'a, Out = B>, B>()` called with `B = <P as Tr<'b>>::Out` (no impl
+/// selected: `P` is a caller type parameter) satisfies `<P as Tr<'a>>::Out == <P as Tr<'b>>::Out`
+/// reflexively, equating `'a` and `'b` invariantly (`(0, 1)` and `(1, 0)`).
+/// CONTROL: instantiating `B = <P as Tr<'b>>::Err` (a different associated type) is still
+/// refused (`Unselected`), never falsely equated.
+#[test]
+fn reflexive_projection_equality_relates_invariantly() {
+    let mut t = Tys::new();
+    let unit = t.unit();
+    let p0 = t.param(0);
+    let p1 = t.param(1);
+    let proj_clause = t.exproj(T_TR, OUTPUT, &[p0], p1);
+    let alias_out = t.alias(T_TR, OUTPUT, &[p0]);
+    let alias_err = t.alias(T_TR, ERR, &[p0]);
+    let facts = Facts::default().trait_(T_TR, 1).alias(T_TR, OUTPUT, 1).alias(T_TR, ERR, 1);
+    let cols = Columns::new(t.t.view(), &facts, &facts);
+
+    let p = params(1, &[]);
+    let clauses = [ClauseIn::ProjOf { proj: ty(proj_clause, P0) }];
+    let sig = Sig { item: F, params: ParamsView::of(&p), inputs: &[], output: ty(unit, NONE), clauses: &clauses };
+
+    let types = [arg(p0, 0, 0), arg(alias_out, 1, 1)];
+    let generics = GenericArgs { lifetimes: range(0, 1), types: &types };
+    let (res, rec) = run(&cols, &Sel::default(), &Own::default(), 2, Callee::Fn(sig), generics, &[], arg(unit, 2, 0));
+    assert_eq!(res, Ok(()), "reflexive `<P as Tr<'a>>::Out == <P as Tr<'b>>::Out` must succeed: {res:?}");
+    assert_eq!(set(&rec), pairs(&[(0, 1), (1, 0)]), "reflexive projection must equate `'a` and `'b` invariantly");
+    assert!(rejects(&rec, &[1], &[0]), "local `'b` cannot satisfy universal `'a`");
+    assert!(rejects(&rec, &[0], &[1]), "local `'a` cannot satisfy universal `'b`");
+
+    let mismatch_types = [arg(p0, 0, 0), arg(alias_err, 1, 1)];
+    let mismatch_gen = GenericArgs { lifetimes: range(0, 1), types: &mismatch_types };
+    let (res, _) = run(&cols, &Sel::default(), &Own::default(), 2, Callee::Fn(sig), mismatch_gen, &[], arg(unit, 2, 0));
+    assert!(matches!(res, Err(Refused::Unselected { .. })), "CONTROL: distinct associated types must not equate reflexively: {res:?}");
+}

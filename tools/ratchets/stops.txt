@@ -143,7 +143,7 @@ blaze-toml	122
 blaze-toolchain	104
 blaze-trace	56
 blaze-ty	239
-blaze-typeck	505
+blaze-typeck	503
 blaze-unicode	7
 blaze-unit-graph	77
 blaze-units	7

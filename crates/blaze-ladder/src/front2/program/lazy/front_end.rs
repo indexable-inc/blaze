@@ -714,7 +714,7 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
 
     /// As `Front2Program::const_at`: the evaluator the program keeps checks any body and makes
     /// any impl row the value needs.
-    fn const_at(&mut self, need: crate::front2::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy], closures: &crate::run::ClosureTable) -> Result<DataRecord<Global>, crate::front2::const_at::ConstAtWhy> {
+    fn const_at(&mut self, need: crate::front2::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy], build: crate::front2::const_at::BuildFacts<'_>) -> Result<DataRecord<Global>, crate::front2::const_at::ConstAtWhy> {
         let prepared = self.prepared;
         let alloc = self.store.tys.alloc();
         let mut records = Records {
@@ -727,14 +727,14 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
             consts: None,
         };
         let made = match need {
-            crate::front2::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, prepared, item, from, args, Some(closures), alloc),
+            crate::front2::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, prepared, item, from, args, Some(build), alloc),
             crate::front2::const_at::ConstNeed::Block { .. } | crate::front2::const_at::ConstNeed::Promoted { .. } => {
                 let owner = need.item();
                 let in_body = records.store.fns.get(&owner).and_then(|h| need.in_body(h.text));
                 let Some((owner, root, key)) = in_body else {
                     return Err(crate::front2::const_at::ConstAtWhy::Eval(crate::front2::consts::ConstFail::Body { item: owner, error: BodyError::NoHead(owner) }));
                 };
-                self.consts.body_value(&mut records, prepared, owner, root, key, from, args, Some(closures), alloc)
+                self.consts.body_value(&mut records, prepared, owner, root, key, from, args, Some(build), alloc)
             }
         };
         made.map(crate::front2::const_at::data_record).map_err(crate::front2::const_at::ConstAtWhy::Eval)

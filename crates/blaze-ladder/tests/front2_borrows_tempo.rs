@@ -1161,6 +1161,203 @@ fn control_assoc_subtrait_dangling<T: Outer>(o: &T) -> &'static u8 {
     let local = 11u8;
     o.item().help(&local)
 }
+
+// Class M: GenericSelf(Param) — `for value in iter` where `iter: I::IntoIter` (`deque::extend`, `csr::group_into`)
+fn extend_into_iter<T, I: IntoIterator<Item = T>>(iter: I, out: &mut Vec<T>) {
+    let iter = iter.into_iter();
+    for value in iter {
+        out.push(value);
+    }
+}
+fn extend_into_iter_ref<'a, T: Copy + 'a, I: IntoIterator<Item = &'a T>>(iter: I, out: &mut Vec<T>) {
+    let iter = iter.into_iter();
+    for &value in iter {
+        out.push(value);
+    }
+}
+fn control_extend_into_iter_dangling<'a, I: IntoIterator<Item = &'a u8>>(iter: I) -> &'static u8 {
+    let iter = iter.into_iter();
+    for x in iter {
+        return x;
+    }
+    &0
+}
+
+// Class N: GenericSelf(Other) — `TempoTxEnvelope` ground where-clauses on concrete types
+struct SignedTx<T>(T);
+impl<T: PartialEq> PartialEq for SignedTx<T> {
+    fn eq(&self, other: &Self) -> bool { self.0 == other.0 }
+}
+#[derive(PartialEq)]
+struct LegacyTx(u64);
+enum EnvTx { Legacy(SignedTx<LegacyTx>) }
+impl PartialEq for EnvTx
+where
+    SignedTx<LegacyTx>: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Legacy(a), Self::Legacy(b)) => a.eq(b),
+        }
+    }
+}
+trait Enc2718 {
+    fn enc_len(&self) -> usize;
+    fn enc(&self, out: &mut Vec<u8>);
+    fn net_len(&self) -> usize { self.enc_len() + 1 }
+}
+impl<T> Enc2718 for SignedTx<T> {
+    fn enc_len(&self) -> usize { 1 }
+    fn enc(&self, out: &mut Vec<u8>) { out.push(1); }
+}
+impl Enc2718 for EnvTx
+where
+    SignedTx<LegacyTx>: Enc2718,
+{
+    fn enc_len(&self) -> usize { match self { Self::Legacy(tx) => tx.enc_len() } }
+    fn enc(&self, out: &mut Vec<u8>) { match self { Self::Legacy(tx) => tx.enc(out) } }
+}
+trait MyEnc {
+    fn length(&self) -> usize;
+}
+impl MyEnc for EnvTx
+where
+    SignedTx<LegacyTx>: Enc2718,
+{
+    fn length(&self) -> usize {
+        <Self as Enc2718>::net_len(self)
+    }
+}
+trait MyDec: Sized {
+    fn decode_from<'a>(buf: &mut &'a [u8]) -> Result<Self, ()>;
+}
+impl<T> MyDec for SignedTx<T> where T: Default {
+    fn decode_from<'a>(_buf: &mut &'a [u8]) -> Result<Self, ()> { Ok(SignedTx(T::default())) }
+}
+impl Default for LegacyTx { fn default() -> Self { LegacyTx(0) } }
+impl MyDec for EnvTx
+where
+    SignedTx<LegacyTx>: MyDec,
+{
+    fn decode_from<'a>(buf: &mut &'a [u8]) -> Result<Self, ()> {
+        Ok(Self::Legacy(SignedTx::<LegacyTx>::decode_from(buf)?))
+    }
+}
+
+// Class O: GenericSelf(Other) — `blaze-format-core::Slice` derive on struct with associated type field + PhantomData<fn() -> T>
+trait MyOffset: Copy + Eq + core::fmt::Debug {
+    type Len: Copy + Eq + core::fmt::Debug;
+}
+impl MyOffset for i32 { type Len = u32; }
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct MySlice<T, O: MyOffset = i32> {
+    offset: O,
+    len: O::Len,
+    of: core::marker::PhantomData<fn() -> T>,
+}
+
+// Class P: GenericSelf(Other) — `TempoTxEnvelope` serde/arbitrary higher-ranked ground where-clauses
+trait MyDe<'de>: Sized {
+    fn de(src: &'de [u8]) -> Result<Self, ()>;
+}
+trait MyDeOwned: for<'de> MyDe<'de> {}
+impl<T: for<'de> MyDe<'de>> MyDeOwned for T {}
+impl<'de, T: MyDe<'de>> MyDe<'de> for SignedTx<T> {
+    fn de(src: &'de [u8]) -> Result<Self, ()> { Ok(SignedTx(T::de(src)?)) }
+}
+impl<'de> MyDe<'de> for LegacyTx {
+    fn de(_src: &'de [u8]) -> Result<Self, ()> { Ok(LegacyTx(0)) }
+}
+fn de_via_bound<'de, V: MyDe<'de>>(src: &'de [u8]) -> Result<V, ()> {
+    V::de(src)
+}
+impl<'de> MyDe<'de> for u32 {
+    fn de(_src: &'de [u8]) -> Result<Self, ()> { Ok(0) }
+}
+impl<'de> MyDe<'de> for EnvTx
+where
+    SignedTx<LegacyTx>: MyDeOwned,
+{
+    fn de(src: &'de [u8]) -> Result<Self, ()> {
+        let _ = de_via_bound::<u32>(src)?;
+        Ok(Self::Legacy(de_via_bound::<SignedTx<LegacyTx>>(src)?))
+    }
+}
+trait MyArb<'a>: Sized {
+    fn arb(u: &'a [u8]) -> Result<Self, ()>;
+}
+impl<'a, T: MyArb<'a>> MyArb<'a> for SignedTx<T> {
+    fn arb(u: &'a [u8]) -> Result<Self, ()> { Ok(SignedTx(T::arb(u)?)) }
+}
+impl<'a> MyArb<'a> for LegacyTx {
+    fn arb(_u: &'a [u8]) -> Result<Self, ()> { Ok(LegacyTx(0)) }
+}
+fn arb_via_bound<'a, V: MyArb<'a>>(u: &'a [u8]) -> Result<V, ()> {
+    V::arb(u)
+}
+impl<'a> MyArb<'a> for EnvTx
+where
+    SignedTx<LegacyTx>: for<'b> MyArb<'b>,
+{
+    fn arb(u: &'a [u8]) -> Result<Self, ()> {
+        Ok(Self::Legacy(arb_via_bound::<SignedTx<LegacyTx>>(u)?))
+    }
+}
+// Negative soundness control for Class P: a ground supertrait clause on an unrelated type MUST
+// NOT shadow an impl that enforces `'static` on a different concrete type.
+trait NeedStaticDe<'de>: Sized {}
+impl NeedStaticDe<'static> for u16 {}
+fn require_static_de<'de, T: NeedStaticDe<'de>>(_: &'de u8, _: T) {}
+trait StaticDeSub: for<'de> NeedStaticDe<'de> {}
+struct OtherDe;
+impl<'de> NeedStaticDe<'de> for OtherDe {}
+impl StaticDeSub for OtherDe {}
+fn control_ground_supertrait_other_type_dangling()
+where
+    OtherDe: StaticDeSub,
+{
+    let local = 7u8;
+    require_static_de(&local, 0u16);
+}
+
+// Class Q: Reflexive projection equality `P: WriterIn<Buffer = B>` instantiated at `B = P::Buffer`
+// (`blaze-format-core::Writer::new` calling `Writer::with_buffer`)
+trait MyWriterIn: Sized {
+    type Buffer: MyWriteBuf<In = Self>;
+    fn make_buf(self) -> Self::Buffer;
+}
+trait MyWriteBuf: Sized {
+    type In: MyWriterIn<Buffer = Self>;
+}
+struct MyWriter<P: MyWriterIn> {
+    buf: P::Buffer,
+}
+impl<P: MyWriterIn> MyWriter<P> {
+    fn new_writer(p: P) -> MyWriter<P> {
+        MyWriter::with_buf(p.make_buf())
+    }
+    fn with_buf<B>(buf: B) -> MyWriter<P>
+    where
+        B: MyWriteBuf<In = P>,
+        P: MyWriterIn<Buffer = B>,
+    {
+        MyWriter { buf }
+    }
+}
+// Negative control for reflexive projection equality: mismatched trait lifetime `'a` vs `'static`
+trait LtProj<'a> {
+    type Out;
+    fn make(&self, x: &'a u8) -> Self::Out;
+}
+fn need_static_proj<P, B>(_: B)
+where
+    P: LtProj<'static, Out = B>,
+{}
+fn control_reflexive_proj_lifetime_mismatch<'a, P: LtProj<'a>>(p: &P, x: &'a u8) {
+    let local = 1u8;
+    let _ = x;
+    need_static_proj::<P, _>(p.make(&local));
+}
 "#;
     let heap = blaze_own::testing::heap();
     let tc = open_toolchain();

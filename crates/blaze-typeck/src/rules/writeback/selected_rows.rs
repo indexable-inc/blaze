@@ -603,8 +603,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         } else {
             // A where-clause of the caller may be the candidate that applies (`CallEnv`).
             let env = rows.env.all
-                || rows.env.traits.contains(&trait_)
-                || (rows.env.exact.contains(&trait_) && self.ground_clause_may_equal(ex.out.view(), sel_ps, trait_)?);
+                || rows.env.traits.scan_for(&trait_).is_some()
+                || (rows.env.exact.scan_for(&trait_).is_some() && self.ground_clause_may_equal(ex.out.view(), sel_ps, trait_, inert)?);
             // Part of the body's own check, recorded for its borrow check: analysis.
             let mut cx = InferCtx::analysis_in(alloc);
             match crate::instance::select_owning(&mut cx, &mut self.reads, Some(rows.own), trait_, sel_ps, &mut ex.out) {
@@ -701,16 +701,28 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 env.exact.push(trait_);
             }
         }
-        // The supertraits of every parameter-free clause's trait, each answerable at any row.
-        let mut work: Vec<ItemKey, Alloc<'a>> = Vec::new_in(alloc);
-        work.extend_from_slice(&env.traits);
-        work.extend(env.exact.iter().copied().filter(|t| !env.traits.contains(t)));
+        // Supertraits of parameter-free clauses:
+        // - From an alias-bearing clause (`env.traits`), or any non-`Self` supertrait predicate
+        //   (`Self::Assoc: St`), the supertrait goes into `env.traits` (may match any ground row).
+        // - From a plain ground clause (`env.exact`, e.g. `Signed<TxLegacy>: DeserializeOwned`)
+        //   through a `Self: Super` chain (`DeserializeOwned: for<'de> Deserialize<'de>`), the
+        //   supertrait stays in `env.exact` so `ground_clause_may_equal` matches it ONLY against
+        //   rows whose `Self` may equal `Signed<TxLegacy>` (never shadowing `u32: Deserialize` or
+        //   `Value: Deserialize`).
+        let mut work: Vec<(ItemKey, bool), Alloc<'a>> = Vec::new_in(alloc);
+        for &t in env.traits.iter() {
+            work.push((t, false));
+        }
+        for &t in env.exact.iter() {
+            if env.traits.scan_for(&t).is_none() {
+                work.push((t, true));
+            }
+        }
         let mut next = 0usize;
-        while next < work.len() {
-            if work.len() > MOST_ENV_TRAITS {
+        while let Some(&(t, exact_self)) = work.get(next) {
+            if work.len() > MOST_ENV_TRAITS * 2 {
                 return Err(CheckError::Limit(Limit::Solver));
             }
-            let t = work[next];
             next += 1;
             let def = match self.reads.trait_def(t) {
                 Ok(Some(def)) => def,
@@ -722,53 +734,117 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Err(Stop::Error(err)) => return Err(err),
             };
             for s in def.supertraits {
-                let (PClause::Trait { trait_: st, .. } | PClause::Projection { trait_: st, .. }) = *s else { continue };
+                let (PClause::Trait { trait_: st, args: sargs } | PClause::Projection { trait_: st, args: sargs, .. }) = *s else { continue };
                 if inert.has(st) {
                     continue;
                 }
-                if !env.traits.contains(&st) {
+                let self_is_param0 = def
+                    .types
+                    .list(sargs)
+                    .ok()
+                    .and_then(|l| l.first())
+                    .and_then(|&a| def.types.node(a).ok())
+                    .is_some_and(|n| matches!(n, PNode::Param(0)));
+                let st_exact = exact_self && self_is_param0;
+                if st_exact {
+                    if env.traits.scan_for(&st).is_none() && env.exact.scan_for(&st).is_none() {
+                        env.exact.push(st);
+                    }
+                } else if env.traits.scan_for(&st).is_none() {
                     env.traits.push(st);
                 }
-                if !work.contains(&st) {
-                    work.push(st);
+                if work.scan_for(&(st, st_exact)).is_none() {
+                    work.push((st, st_exact));
                 }
             }
         }
         Ok(env)
     }
 
-    /// Whether a ground clause of the caller of `trait_` ([`CallEnv::exact`]) may equal the
-    /// ground row `ps` (types of `tys`) up to regions, so may be the candidate rustc prefers.
+    /// Whether a ground clause of the caller of `trait_` (or a subtrait whose `Self`-supertrait
+    /// chain reaches `trait_`, [`CallEnv::exact`]) may equal the ground row `ps` (types of `tys`)
+    /// up to regions, so may be the candidate rustc prefers.
     /// The caller's predicates were read by `call_env`; one not answered now may answer
     /// (never a wait at writeback).
-    fn ground_clause_may_equal(&mut self, tys: PTys<'_>, ps: &[PTy], trait_: ItemKey) -> Result<bool, CheckError> {
+    fn ground_clause_may_equal(&mut self, tys: PTys<'_>, ps: &[PTy], trait_: ItemKey, inert: Inert) -> Result<bool, CheckError> {
         let alloc = self.alloc;
         let own = match self.reads.predicates(self.body.owner) {
             Ok(own) => own,
             Err(Stop::Need(_)) => return Ok(true),
             Err(Stop::Error(err)) => return Err(err),
         };
+        let Some(&ps0) = ps.first() else { return Ok(true) };
         for c in own.clauses {
             let (t, args) = match *c {
                 PClause::Trait { trait_, args } | PClause::Projection { trait_, args, .. } => (trait_, args),
                 _ => continue,
             };
-            if t != trait_ || names_param(own.types, args, alloc)? || holds_alias(own.types, args, alloc)? {
+            if names_param(own.types, args, alloc)? || holds_alias(own.types, args, alloc)? {
                 continue;
             }
             let l = own.types.list(args)?;
-            if l.len() != ps.len() {
-                continue;
-            }
-            let mut equal = true;
-            for (&a, &b) in l.iter().zip(ps) {
-                if !may_equal(own.types, a, tys, b, alloc)? {
-                    equal = false;
-                    break;
+            if t == trait_ {
+                if l.len() != ps.len() {
+                    continue;
                 }
-            }
-            if equal {
+                let mut equal = true;
+                for (&a, &b) in l.iter().zip(ps) {
+                    if !may_equal(own.types, a, tys, b, alloc)? {
+                        equal = false;
+                        break;
+                    }
+                }
+                if equal {
+                    return Ok(true);
+                }
+            } else if let Some(&a0) = l.first()
+                && may_equal(own.types, a0, tys, ps0, alloc)?
+                && self.trait_has_self_super(t, trait_, inert)?
+            {
                 return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `target` is reachable from `start` via `Self: Super` (`Param(0)`) supertrait edges.
+    fn trait_has_self_super(&mut self, start: ItemKey, target: ItemKey, inert: Inert) -> Result<bool, CheckError> {
+        let alloc = self.alloc;
+        let mut work: Vec<ItemKey, Alloc<'a>> = Vec::new_in(alloc);
+        work.push(start);
+        let mut next = 0usize;
+        while let Some(&t) = work.get(next) {
+            if work.len() > MOST_ENV_TRAITS {
+                return Err(CheckError::Limit(Limit::Solver));
+            }
+            next += 1;
+            let def = match self.reads.trait_def(t) {
+                Ok(Some(def)) => def,
+                Ok(None) => continue,
+                Err(Stop::Need(_)) => return Ok(true),
+                Err(Stop::Error(err)) => return Err(err),
+            };
+            for s in def.supertraits {
+                let (PClause::Trait { trait_: st, args: sargs } | PClause::Projection { trait_: st, args: sargs, .. }) = *s else { continue };
+                if inert.has(st) {
+                    continue;
+                }
+                let self_is_param0 = def
+                    .types
+                    .list(sargs)
+                    .ok()
+                    .and_then(|l| l.first())
+                    .and_then(|&a| def.types.node(a).ok())
+                    .is_some_and(|n| matches!(n, PNode::Param(0)));
+                if !self_is_param0 {
+                    continue;
+                }
+                if st == target {
+                    return Ok(true);
+                }
+                if work.scan_for(&st).is_none() {
+                    work.push(st);
+                }
             }
         }
         Ok(false)
@@ -786,6 +862,15 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         let Some(&ps0) = ps.first() else { return Ok(true) };
         let ps0_node = tys.node(ps0)?;
+        // Whether `own.clauses` carries any projection equality `<.. as at>::an = term` (which
+        // could normalize a rigid alias to another type in this body's param-env).
+        let has_proj_eq = |at: ItemKey, an: Name| -> bool {
+            own.clauses.iter().any(|cl| matches!(*cl, PClause::Projection { trait_: pt, name: pn, .. } if pt == at && pn == an))
+        };
+        let ps0_is_concrete = !matches!(
+            ps0_node,
+            PNode::Param(_) | PNode::ConstParam(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Dynamic(_) | PNode::Infer | PNode::Error
+        );
         for c in own.clauses {
             let (ct, args) = match *c {
                 PClause::Trait { trait_: ct, args } | PClause::Projection { trait_: ct, args, .. } => (ct, args),
@@ -803,13 +888,22 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             let a0_node = own.types.node(a0)?;
             let self_matches = match (a0_node, ps0_node) {
                 (PNode::Param(q), PNode::Param(p)) => q == p,
-                (PNode::Param(_), PNode::Alias { .. } | PNode::Opaque(..) | PNode::Infer | PNode::Error) => true,
+                (PNode::Param(_), PNode::Alias { trait_: at, name: an, args: p_args }) => {
+                    // A clause `P: Tr` cannot match a rigid alias `<Q as Foo>::Assoc` (e.g.
+                    // `I: IntoIterator` vs `I::IntoIter: IntoIterator` in `for x in iter.into_iter()`)
+                    // unless a projection equality in `own.clauses` can equate that alias.
+                    let rigid_param = tys.list(p_args).ok().and_then(|al| al.first()).and_then(|&s| tys.node(s).ok()).is_some_and(|n| matches!(n, PNode::Param(_)));
+                    !rigid_param || has_proj_eq(at, an)
+                }
+                (PNode::Param(_), PNode::Opaque(..) | PNode::Infer | PNode::Error) => true,
                 (PNode::Param(_), _) => false,
-                (PNode::Alias { args: a_args, .. }, PNode::Adt(..)) => {
-                    // A rigid alias `<P as Tr>::Assoc` on a type parameter cannot shadow a
-                    // nominal ADT's own impl (e.g. `P::Searcher<'a>: Clone` vs `MatchIndicesInternal<'a, P>: Clone`).
+                (PNode::Alias { trait_: at, name: an, args: a_args }, _) if ps0_is_concrete => {
+                    // A rigid alias `<P as Tr>::Assoc` on a type parameter cannot shadow a concrete
+                    // type constructor's impl (e.g. `O::Len: PartialEq` vs `&O: PartialEq` or
+                    // `P::Searcher<'a>: Clone` vs `MatchIndicesInternal<'a, P>: Clone`) unless a
+                    // projection equality in `own.clauses` can equate that alias.
                     let rigid_param = own.types.list(a_args).ok().and_then(|al| al.first()).and_then(|&s| own.types.node(s).ok()).is_some_and(|n| matches!(n, PNode::Param(_)));
-                    !rigid_param
+                    !rigid_param || has_proj_eq(at, an)
                 }
                 (PNode::Alias { .. } | PNode::Opaque(..) | PNode::Infer | PNode::Error, _) => true,
                 _ => may_equal(own.types, a0, tys, ps0, alloc)?,
@@ -841,11 +935,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut work: Vec<ItemKey, Alloc<'a>> = Vec::new_in(alloc);
         work.push(start);
         let mut next = 0usize;
-        while next < work.len() {
+        while let Some(&t) = work.get(next) {
             if work.len() > MOST_ENV_TRAITS {
                 return Err(CheckError::Limit(Limit::Solver));
             }
-            let t = work[next];
             next += 1;
             let def = match self.reads.trait_def(t) {
                 Ok(Some(def)) => def,
