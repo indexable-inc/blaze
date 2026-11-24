@@ -2148,6 +2148,921 @@ fn provably_noalias_bases(view: &View<'_>, mut a: u32, mut b: u32) -> bool {
     false
 }
 
+struct PrefixScanPlan<A: Allocator> {
+    preheader: u32,
+    pre_term: PreTerm,
+    shape: LoopShape,
+    iv_kind: IvKind,
+    iv_pos: usize,
+    acc_pos: usize,
+    iv_init: u32,
+    acc_init: u32,
+    bound: u32,
+    elem_ty: Ty,
+    elem_shift: u32,
+    base: u32,
+    row_idx_off: Option<u32>,
+    const_off: i32,
+    load_mem_attr: u32,
+    store_mem_attr: u32,
+    inclusive: bool,
+    acc_update_inst: u32,
+    pre_args: Vec<u32, A>,
+    single_exit_args: Vec<u32, A>,
+}
+
+/// Matches a clean in-place wrapping-add prefix-scan loop (`I64` or `I32`, inclusive or
+/// exclusive, `IvKind::Pointer` or `IvKind::Counted`, `HeaderBody` or `SingleBlock`,
+/// `PreTerm::Jump` or `PreTerm::Br`) eligible for 8-way decoupled parallel prefix-scan
+/// transformation (`1` loop-carried `add` per 8 elements).
+fn find_prefix_scan_loop<A: Allocator + Copy>(
+    view: &View<'_>,
+    alloc: A,
+) -> Option<PrefixScanPlan<A>> {
+    if view.head.ptr_bits != 64 {
+        return None;
+    }
+    let blocks = view.blocks();
+    let len = view.len();
+    if blocks < 2 {
+        return None;
+    }
+
+    let mut inst_block = filled(len, 0u32, &alloc);
+    let mut preds: Vec<Vec<u32, A>, A> = Vec::with_capacity_in(blocks, alloc);
+    for _ in 0..blocks {
+        preds.push(Vec::new_in(alloc));
+    }
+    for b in 0..blocks {
+        let b_u32 = to_u32(b);
+        for inst in view.block(Block(b_u32)) {
+            set_at(&mut inst_block, inst, b_u32);
+        }
+        let term = view.terminator(Block(b_u32));
+        each(view, term, |item| {
+            if let Item::Edge(edge) = item {
+                let tb = to_idx(edge.block);
+                if let Some(p) = preds.get_mut(tb)
+                    && p.scan_for(&b_u32).is_none()
+                {
+                    p.push(b_u32);
+                }
+            }
+        });
+    }
+
+    for h in 1..blocks {
+        let header = to_u32(h);
+        if view.block_kind(Block(header)) != BlockKind::Normal {
+            continue;
+        }
+        let (p0, p1) = match preds.get(h).map(Vec::as_slice) {
+            Some(&[p0, p1]) => (p0, p1),
+            _ => continue,
+        };
+        let (preheader, latch) = if p0 < header && p1 >= header {
+            (p0, p1)
+        } else if p1 < header && p0 >= header {
+            (p1, p0)
+        } else {
+            continue;
+        };
+        let h_params = view.params(Block(header));
+        if h_params.len() != 2 {
+            continue;
+        }
+        let pre_term = view.terminator(Block(preheader));
+        let (pre_term_kind, pre_args_start) = match view.op(pre_term) {
+            Op::Jump => {
+                let pre_at = to_idx(at(view.data, pre_term));
+                if at(view.extra, pre_at) != header || to_idx(at(view.extra, pre_at + 1)) != 2 {
+                    continue;
+                }
+                (PreTerm::Jump, pre_at + 2)
+            }
+            Op::Br => {
+                let pre_at = to_idx(at(view.data, pre_term));
+                let pre_cv = at(view.extra, pre_at);
+                let t_blk = at(view.extra, pre_at + 1);
+                let t_argc = to_idx(at(view.extra, pre_at + 2));
+                let e_at = pre_at + 3 + t_argc;
+                let e_blk = at(view.extra, e_at);
+                let e_argc = to_idx(at(view.extra, e_at + 1));
+                if t_blk == header && e_blk != header && e_blk != preheader && t_argc == 2 {
+                    (
+                        PreTerm::Br {
+                            cond: pre_cv,
+                            header_is_then: true,
+                            other_blk: e_blk,
+                            other_args_start: e_at + 2,
+                            other_argc: e_argc,
+                        },
+                        pre_at + 3,
+                    )
+                } else if e_blk == header && t_blk != header && t_blk != preheader && e_argc == 2 {
+                    (
+                        PreTerm::Br {
+                            cond: pre_cv,
+                            header_is_then: false,
+                            other_blk: t_blk,
+                            other_args_start: pre_at + 3,
+                            other_argc: t_argc,
+                        },
+                        e_at + 2,
+                    )
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        let mut pre_args: Vec<u32, A> = Vec::with_capacity_in(2, alloc);
+        pre_args.push(at(view.extra, pre_args_start));
+        pre_args.push(at(view.extra, pre_args_start + 1));
+
+        let (shape, body_block, back_args_start, cond_val, stay_is_then, single_exit_args) = if latch == header {
+            let h_term = view.terminator(Block(header));
+            if view.op(h_term) != Op::Br {
+                continue;
+            }
+            let idx = to_idx(at(view.data, h_term));
+            let cv = at(view.extra, idx);
+            let t_blk = at(view.extra, idx + 1);
+            let t_argc = to_idx(at(view.extra, idx + 2));
+            let e_at = idx + 3 + t_argc;
+            let e_blk = at(view.extra, e_at);
+            let e_argc = to_idx(at(view.extra, e_at + 1));
+            if t_blk == header && e_blk != header && t_argc == 2 {
+                let mut ex_args = Vec::with_capacity_in(e_argc, alloc);
+                for k in 0..e_argc {
+                    ex_args.push(at(view.extra, e_at + 2 + k));
+                }
+                (LoopShape::SingleBlock { header, exit: e_blk }, header, idx + 3, cv, true, ex_args)
+            } else if e_blk == header && t_blk != header && e_argc == 2 {
+                let mut ex_args = Vec::with_capacity_in(t_argc, alloc);
+                for k in 0..t_argc {
+                    ex_args.push(at(view.extra, idx + 3 + k));
+                }
+                (LoopShape::SingleBlock { header, exit: t_blk }, header, e_at + 2, cv, false, ex_args)
+            } else {
+                continue;
+            }
+        } else {
+            if preds.get(to_idx(latch)).map(Vec::as_slice) != Some(&[header]) {
+                continue;
+            }
+            if !view.params(Block(latch)).is_empty() {
+                continue;
+            }
+            let h_term = view.terminator(Block(header));
+            let b_term = view.terminator(Block(latch));
+            if view.op(h_term) != Op::Br || view.op(b_term) != Op::Jump {
+                continue;
+            }
+            let hat = to_idx(at(view.data, h_term));
+            let cv = at(view.extra, hat);
+            let t_blk = at(view.extra, hat + 1);
+            let t_argc = to_idx(at(view.extra, hat + 2));
+            let e_at = hat + 3 + t_argc;
+            let e_blk = at(view.extra, e_at);
+            let e_argc = to_idx(at(view.extra, e_at + 1));
+            let bat = to_idx(at(view.data, b_term));
+            let (exit_blk, stay_then) = if t_blk == latch && t_argc == 0 && e_blk != header && e_blk != latch {
+                (e_blk, true)
+            } else if e_blk == latch && e_argc == 0 && t_blk != header && t_blk != latch {
+                (t_blk, false)
+            } else {
+                continue;
+            };
+            if at(view.extra, bat) != header || to_idx(at(view.extra, bat + 1)) != 2 {
+                continue;
+            }
+            let h_range = view.block(Block(header));
+            let mut header_simple = true;
+            for inst in h_params.end..(h_range.end - 1) {
+                if inst != to_idx(cv)
+                    && !matches!(
+                        view.op(inst),
+                        Op::Icmp
+                            | Op::PtrAddr
+                            | Op::Not
+                            | Op::Xor
+                            | Op::Zext
+                            | Op::Trunc
+                            | Op::Select
+                            | Op::Iconst
+                            | Op::IconstWide
+                    )
+                {
+                    header_simple = false;
+                    break;
+                }
+            }
+            if !header_simple {
+                continue;
+            }
+            (
+                LoopShape::HeaderBody { header, body: latch, exit: exit_blk },
+                latch,
+                bat + 2,
+                cv,
+                stay_then,
+                Vec::new_in(alloc),
+            )
+        };
+
+        let is_loop_blk = |b: u32| b == header || b == body_block;
+        let is_not_inv_blk = |b: u32| is_loop_blk(b) || b > preheader;
+
+        if !pre_args.iter().all(|&a| !is_not_inv_blk(at(&inst_block, to_idx(a)))) {
+            continue;
+        }
+        if let PreTerm::Br { cond, other_args_start, other_argc, .. } = pre_term_kind {
+            if is_not_inv_blk(at(&inst_block, to_idx(cond)))
+                || (0..other_argc)
+                    .any(|k| is_not_inv_blk(at(&inst_block, to_idx(at(view.extra, other_args_start + k)))))
+            {
+                continue;
+            }
+        }
+
+        // Verify no loop instruction escapes outside except `HeaderBody` header params.
+        let mut used_outside = filled(len, false, &alloc);
+        for b in 0..blocks {
+            let b_u32 = to_u32(b);
+            if is_loop_blk(b_u32) {
+                continue;
+            }
+            for inst in view.block(Block(b_u32)) {
+                each(view, inst, |item| {
+                    if let Item::Value(v) = item {
+                        set_at(&mut used_outside, to_idx(v), true);
+                    }
+                });
+            }
+        }
+        let mut has_illegal_escape = false;
+        for blk in [header, body_block] {
+            for inst in view.block(Block(blk)) {
+                if at(&used_outside, inst)
+                    && !(matches!(shape, LoopShape::HeaderBody { .. })
+                        && blk == header
+                        && inst >= h_params.start
+                        && inst < h_params.end)
+                {
+                    has_illegal_escape = true;
+                }
+            }
+        }
+        if has_illegal_escape {
+            continue;
+        }
+
+        // Body must contain exactly 1 non-volatile `Load`, 1 non-volatile `Store` (in order
+        // `load < store`), and only pure non-trapping integer/pointer/compare/const ops.
+        let body_range = view.block(Block(body_block));
+        let body_start = if body_block == header { h_params.end } else { body_range.start };
+        let body_end = body_range.end - 1;
+        let mut load_inst_opt: Option<u32> = None;
+        let mut store_inst_opt: Option<u32> = None;
+        let mut bad_body = false;
+        for inst in body_start..body_end {
+            let op = view.op(inst);
+            let flags = Flags(at(view.flags, inst));
+            match op {
+                Op::Load => {
+                    let lt = Ty(at(view.tys, inst));
+                    if flags.contains(Flags::VOLATILE)
+                        || load_inst_opt.is_some()
+                        || !matches!(lt, Ty::I64 | Ty::I32)
+                    {
+                        bad_body = true;
+                        break;
+                    }
+                    load_inst_opt = Some(to_u32(inst));
+                }
+                Op::Store => {
+                    if flags.contains(Flags::VOLATILE) || store_inst_opt.is_some() {
+                        bad_body = true;
+                        break;
+                    }
+                    store_inst_opt = Some(to_u32(inst));
+                }
+                Op::Add
+                | Op::PtrAdd
+                | Op::PtrAddr
+                | Op::Shl
+                | Op::Mul
+                | Op::Zext
+                | Op::Trunc
+                | Op::Icmp
+                | Op::Not
+                | Op::Xor
+                | Op::Select
+                | Op::Iconst
+                | Op::IconstWide => {}
+                _ => {
+                    bad_body = true;
+                    break;
+                }
+            }
+        }
+        let (Some(load_inst), Some(store_inst)) = (load_inst_opt, store_inst_opt) else {
+            continue;
+        };
+        if bad_body || load_inst >= store_inst {
+            continue;
+        }
+        let elem_ty = Ty(at(view.tys, to_idx(load_inst)));
+        let elem_shift = if elem_ty == Ty::I32 { 2u32 } else { 3u32 };
+        let elem_bytes = 1u64 << elem_shift;
+        let st_idx = to_idx(at(view.data, to_idx(store_inst)));
+        let store_val = at(view.extra, st_idx);
+        let store_ptr = at(view.extra, st_idx + 1);
+        let store_off = at(view.extra, st_idx + 2).cast_signed();
+        if Ty(at(view.tys, to_idx(store_val))) != elem_ty {
+            continue;
+        }
+
+        // Parse loop exit condition and identify the primary IV (`Counted` or `Pointer`).
+        let (inner_cond, cond_flipped) = unwrap_bool_cond(view, cond_val);
+        let stay_on_cmp = stay_is_then ^ cond_flipped;
+        let ci = to_idx(inner_cond);
+        if view.op(ci) != Op::Icmp {
+            continue;
+        }
+        let cat = to_idx(at(view.data, ci));
+        let Some(exit_ic) = IntCond::from_word(at(view.extra, cat)) else {
+            continue;
+        };
+        let raw_lhs = at(view.extra, cat + 1);
+        let raw_rhs = at(view.extra, cat + 2);
+
+        let mut found_iv: Option<(usize, u32, u32, IvKind)> = None;
+        for pos in 0..2 {
+            let p_idx = h_params.start + pos;
+            let p_inst = to_u32(p_idx);
+            let back_v = at(view.extra, back_args_start + pos);
+            let back_i = to_idx(back_v);
+            let p_ty = Ty(at(view.tys, p_idx));
+            let cmp_target = match shape {
+                LoopShape::HeaderBody { .. } => p_inst,
+                LoopShape::SingleBlock { .. } => back_v,
+            };
+
+            if p_ty == Ty::I64 || p_ty == Ty::I32 {
+                if view.op(back_i) != Op::Add {
+                    continue;
+                }
+                let aat = to_idx(at(view.data, back_i));
+                let (al, ar) = (at(view.extra, aat), at(view.extra, aat + 1));
+                let is_step1 = (al == p_inst && const_u64(view, to_idx(ar)) == Some(1))
+                    || (ar == p_inst && const_u64(view, to_idx(al)) == Some(1));
+                if !is_step1 {
+                    continue;
+                }
+                let start_is_zero = const_u64(view, to_idx(at(&pre_args, pos))) == Some(0);
+                let bound_opt = if stay_on_cmp {
+                    if raw_lhs == cmp_target && (exit_ic == IntCond::Ult || (start_is_zero && exit_ic == IntCond::Ne)) {
+                        Some(raw_rhs)
+                    } else if raw_rhs == cmp_target
+                        && (exit_ic == IntCond::Ugt || (start_is_zero && exit_ic == IntCond::Ne))
+                    {
+                        Some(raw_lhs)
+                    } else {
+                        None
+                    }
+                } else if raw_lhs == cmp_target
+                    && (exit_ic == IntCond::Uge || (start_is_zero && exit_ic == IntCond::Eq))
+                {
+                    Some(raw_rhs)
+                } else if raw_rhs == cmp_target
+                    && (exit_ic == IntCond::Ule || (start_is_zero && exit_ic == IntCond::Eq))
+                {
+                    Some(raw_lhs)
+                } else {
+                    None
+                };
+                if let Some(bnd) = bound_opt
+                    && !is_not_inv_blk(at(&inst_block, to_idx(bnd)))
+                    && Ty(at(view.tys, to_idx(bnd))) == p_ty
+                {
+                    found_iv = Some((pos, p_inst, bnd, IvKind::Counted { iv_ty: p_ty }));
+                    break;
+                }
+            } else if p_ty == Ty::PTR {
+                if !is_ptr_step(view, back_v, p_inst, elem_bytes) {
+                    continue;
+                }
+                let lhs_is_addr = view.op(to_idx(raw_lhs)) == Op::PtrAddr;
+                let rhs_is_addr = view.op(to_idx(raw_rhs)) == Op::PtrAddr;
+                let u_lhs = unwrap_ptr_addr(view, raw_lhs);
+                let u_rhs = unwrap_ptr_addr(view, raw_rhs);
+                let end_opt = if stay_on_cmp {
+                    if u_lhs == cmp_target && matches!(exit_ic, IntCond::Ult | IntCond::Ne) {
+                        Some((u_rhs, lhs_is_addr))
+                    } else if u_rhs == cmp_target && matches!(exit_ic, IntCond::Ugt | IntCond::Ne) {
+                        Some((u_lhs, rhs_is_addr))
+                    } else {
+                        None
+                    }
+                } else if u_lhs == cmp_target && matches!(exit_ic, IntCond::Uge | IntCond::Eq) {
+                    Some((u_rhs, lhs_is_addr))
+                } else if u_rhs == cmp_target && matches!(exit_ic, IntCond::Ule | IntCond::Eq) {
+                    Some((u_lhs, rhs_is_addr))
+                } else {
+                    None
+                };
+                if let Some((end_val, cmp_was_addr)) = end_opt
+                    && !is_not_inv_blk(at(&inst_block, to_idx(end_val)))
+                    && (Ty(at(view.tys, to_idx(end_val))) == Ty::PTR
+                        || (cmp_was_addr && Ty(at(view.tys, to_idx(end_val))) == Ty::I64))
+                {
+                    found_iv = Some((pos, p_inst, end_val, IvKind::Pointer));
+                    break;
+                }
+            }
+        }
+        let Some((iv_pos, iv_inst, bound, iv_kind)) = found_iv else {
+            continue;
+        };
+        let iv_init = at(&pre_args, iv_pos);
+        let acc_pos = 1 - iv_pos;
+        let acc_param_idx = h_params.start + acc_pos;
+        let acc_param = to_u32(acc_param_idx);
+        if Ty(at(view.tys, acc_param_idx)) != elem_ty {
+            continue;
+        }
+        let acc_init = at(&pre_args, acc_pos);
+        let acc_update = at(view.extra, back_args_start + acc_pos);
+        let acc_upd_i = to_idx(acc_update);
+        if at(&inst_block, acc_upd_i) != body_block
+            || view.op(acc_upd_i) != Op::Add
+            || Flags(at(view.flags, acc_upd_i)) != Flags::NONE
+            || Ty(at(view.tys, acc_upd_i)) != elem_ty
+        {
+            continue;
+        }
+        let aat = to_idx(at(view.data, acc_upd_i));
+        let (al, ar) = (at(view.extra, aat), at(view.extra, aat + 1));
+        if !((al == acc_param && ar == load_inst) || (al == load_inst && ar == acc_param)) {
+            continue;
+        }
+        let inclusive = if store_val == acc_update {
+            true
+        } else if store_val == acc_param {
+            false
+        } else {
+            continue;
+        };
+
+        // Verify strict use discipline for `load_inst`, `acc_param`, and `acc_update`.
+        let store_i = to_idx(store_inst);
+        let mut bad_uses = false;
+        if matches!(shape, LoopShape::HeaderBody { .. }) {
+            let h_range = view.block(Block(header));
+            for inst in h_params.end..(h_range.end - 1) {
+                each(view, inst, |item| {
+                    if let Item::Value(v) = item
+                        && (v == acc_param || v == load_inst || v == acc_update)
+                    {
+                        bad_uses = true;
+                    }
+                });
+            }
+        }
+        for inst in body_start..=body_end {
+            each(view, inst, |item| {
+                if let Item::Value(v) = item {
+                    if v == load_inst && inst != acc_upd_i {
+                        bad_uses = true;
+                    }
+                    if v == acc_param && inst != acc_upd_i && !(!inclusive && inst == store_i) {
+                        bad_uses = true;
+                    }
+                    if v == acc_update && inst != body_end && !(inclusive && inst == store_i) {
+                        bad_uses = true;
+                    }
+                }
+            });
+        }
+        if bad_uses {
+            continue;
+        }
+
+        if matches!(shape, LoopShape::SingleBlock { .. }) {
+            let mut exit_ok = true;
+            for &ea in &single_exit_args {
+                let eb = at(&inst_block, to_idx(ea));
+                if is_loop_blk(eb) {
+                    if ea != acc_update {
+                        exit_ok = false;
+                        break;
+                    }
+                } else if eb > preheader {
+                    exit_ok = false;
+                    break;
+                }
+            }
+            if !exit_ok {
+                continue;
+            }
+        }
+
+        // Verify `Load` and `Store` address the exact same unit-stride location.
+        let ld_idx = to_idx(at(view.data, to_idx(load_inst)));
+        let load_ptr = at(view.extra, ld_idx);
+        let load_off = at(view.extra, ld_idx + 1).cast_signed();
+        let (ld_addr, st_addr) = match iv_kind {
+            IvKind::Counted { .. } => (
+                match_unit_stride_addr(view, load_ptr, load_off, iv_inst, elem_shift, is_not_inv_blk, &inst_block),
+                match_unit_stride_addr(view, store_ptr, store_off, iv_inst, elem_shift, is_not_inv_blk, &inst_block),
+            ),
+            IvKind::Pointer => (
+                match_ptr_iv_addr(view, load_ptr, load_off, iv_inst, iv_init, &[]),
+                match_ptr_iv_addr(view, store_ptr, store_off, iv_inst, iv_init, &[]),
+            ),
+        };
+        let (Some((ld_base, ld_const_off, ld_row_off)), Some((st_base, st_const_off, st_row_off))) =
+            (ld_addr, st_addr)
+        else {
+            continue;
+        };
+        if ld_base != st_base || ld_const_off != st_const_off || ld_row_off != st_row_off {
+            continue;
+        }
+        let Ok(max_delta) = i32::try_from(7 * elem_bytes) else {
+            continue;
+        };
+        if ld_const_off.checked_add(max_delta).is_none() {
+            continue;
+        }
+
+        return Some(PrefixScanPlan {
+            preheader,
+            pre_term: pre_term_kind,
+            shape,
+            iv_kind,
+            iv_pos,
+            acc_pos,
+            iv_init,
+            acc_init,
+            bound,
+            elem_ty,
+            elem_shift,
+            base: ld_base,
+            row_idx_off: ld_row_off,
+            const_off: ld_const_off,
+            load_mem_attr: at(view.attrs, to_idx(load_inst)),
+            store_mem_attr: at(view.attrs, store_i),
+            inclusive,
+            acc_update_inst: acc_update,
+            pre_args,
+            single_exit_args,
+        });
+    }
+
+    None
+}
+
+/// Emits an 8-way decoupled parallel prefix-scan fast loop ahead of the untouched scalar
+/// remainder loop: a 3-level local prefix tree (`p01..p07`) executes completely independently
+/// of `acc`, reducing the loop-carried dependency chain to 1 single `add` per 8 elements
+/// (`acc_next = acc + p07`).
+fn emit_prefix_scan_loop<A: Allocator + Copy>(
+    view: &View<'_>,
+    plan: PrefixScanPlan<A>,
+    alloc: A,
+) -> Result<VectorizeOutput<A>, SimplifyError> {
+    const SCAN_K: u64 = 8;
+    let blocks = view.blocks();
+    let len = view.len();
+    let elem_bytes = 1u64 << plan.elem_shift;
+    let chunk_bytes = SCAN_K * elem_bytes;
+    let elem_bytes_i32 = i32::try_from(elem_bytes).unwrap_or(8);
+    let iv_starts_zero = match plan.iv_kind {
+        IvKind::Counted { .. } => const_u64(view, to_idx(plan.iv_init)) == Some(0),
+        IvKind::Pointer => true,
+    };
+
+    let insert_at = to_idx(plan.preheader) + 1;
+    let has_guard_blk = matches!(plan.pre_term, PreTerm::Br { .. });
+    let is_single = matches!(plan.shape, LoopShape::SingleBlock { .. });
+    let guard_extra: usize = if has_guard_blk { 1 } else { 0 };
+    let tail_extra: usize = if is_single { 1 } else { 0 };
+    let extra_blocks = guard_extra + 2 + tail_extra;
+
+    let scan_guard_blk = if has_guard_blk { to_u32(insert_at) } else { NONE };
+    let scan_pre_blk = to_u32(insert_at + guard_extra);
+    let scan_loop_blk = to_u32(insert_at + guard_extra + 1);
+    let scan_tail_blk = if is_single { to_u32(insert_at + guard_extra + 2) } else { NONE };
+
+    let mut blk_map: Vec<u32, A> = Vec::with_capacity_in(blocks, alloc);
+    for b in 0..blocks {
+        blk_map.push(if b < insert_at { to_u32(b) } else { to_u32(b + extra_blocks) });
+    }
+    let orig_header_new = match plan.shape {
+        LoopShape::HeaderBody { header, .. } | LoopShape::SingleBlock { header, .. } => {
+            at(&blk_map, to_idx(header))
+        }
+    };
+    let orig_exit_new = match plan.shape {
+        LoopShape::HeaderBody { exit, .. } | LoopShape::SingleBlock { exit, .. } => {
+            at(&blk_map, to_idx(exit))
+        }
+    };
+
+    let mut func = view.to_func_in(alloc);
+    func.ops.clear();
+    func.flags.clear();
+    func.tys.clear();
+    func.data.clear();
+    func.extra.clear();
+    func.attrs.clear();
+    func.locs.clear();
+    func.block_starts.clear();
+    func.block_kinds.clear();
+
+    let mut val_map = filled(len, NONE, &alloc);
+
+    for b in 0..blocks {
+        let b_u32 = to_u32(b);
+        func.block_starts.push(to_u32(func.ops.len()));
+        func.block_kinds.push(at(view.block_kinds, b));
+        let range = view.block(Block(b_u32));
+        let term = range.end - 1;
+
+        if b_u32 == plan.preheader {
+            for inst in range.start..term {
+                let mapped = copy_inst_remapped_blocks(view, inst, &val_map, &blk_map, &mut func);
+                set_at(&mut val_map, inst, mapped);
+            }
+            if let PreTerm::Br {
+                cond,
+                header_is_then,
+                other_blk,
+                other_args_start,
+                other_argc,
+            } = plan.pre_term
+            {
+                let cond_new = at(&val_map, to_idx(cond));
+                let other_blk_new = at(&blk_map, to_idx(other_blk));
+                let mut other_args_new: Vec<u32, A> = Vec::with_capacity_in(other_argc, alloc);
+                for k in 0..other_argc {
+                    other_args_new.push(at(&val_map, to_idx(at(view.extra, other_args_start + k))));
+                }
+                if header_is_then {
+                    push_br(&mut func, cond_new, scan_guard_blk, &[], other_blk_new, &other_args_new);
+                } else {
+                    push_br(&mut func, cond_new, other_blk_new, &other_args_new, scan_guard_blk, &[]);
+                }
+                // --- Emit `scan_guard` trampoline block ---
+                func.block_starts.push(to_u32(func.ops.len()));
+                func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+            }
+
+            let iv_init_new = at(&val_map, to_idx(plan.iv_init));
+            let acc_init_new = at(&val_map, to_idx(plan.acc_init));
+            let bound_new = at(&val_map, to_idx(plan.bound));
+            let (rem_val, go_scan) = match plan.iv_kind {
+                IvKind::Counted { iv_ty } => {
+                    let k_step = push_iconst(&mut func, iv_ty, SCAN_K);
+                    if iv_starts_zero {
+                        let enough = push_icmp(&mut func, IntCond::Uge, bound_new, k_step);
+                        (bound_new, enough)
+                    } else {
+                        let has_rem = push_icmp(&mut func, IntCond::Ult, iv_init_new, bound_new);
+                        let rem = push_bin(&mut func, Op::Sub, Flags::NONE, iv_ty, bound_new, iv_init_new);
+                        let enough = push_icmp(&mut func, IntCond::Uge, rem, k_step);
+                        let g = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, has_rem, enough);
+                        (rem, g)
+                    }
+                }
+                IvKind::Pointer => {
+                    let (has_rem, byte_rem) =
+                        if let Some(byte_off) = inbounds_ptr_byte_offset(view, plan.iv_init, plan.bound)
+                            && at(&val_map, to_idx(byte_off)) != NONE
+                        {
+                            let off_new = at(&val_map, to_idx(byte_off));
+                            let hr = push_icmp(&mut func, IntCond::Ult, iv_init_new, bound_new);
+                            (hr, off_new)
+                        } else {
+                            let p_addr = push_inst(&mut func, Op::PtrAddr, Flags::NONE, Ty::I64, iv_init_new, 0);
+                            let end_addr = if Ty(at(view.tys, to_idx(plan.bound))) == Ty::PTR {
+                                push_inst(&mut func, Op::PtrAddr, Flags::NONE, Ty::I64, bound_new, 0)
+                            } else {
+                                bound_new
+                            };
+                            let hr = push_icmp(&mut func, IntCond::Ult, p_addr, end_addr);
+                            let br = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, end_addr, p_addr);
+                            (hr, br)
+                        };
+                    let k_cbytes = push_iconst(&mut func, Ty::I64, chunk_bytes);
+                    let enough = push_icmp(&mut func, IntCond::Uge, byte_rem, k_cbytes);
+                    let mut g = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, has_rem, enough);
+                    if !is_stride_aligned_end(view, plan.iv_init, plan.bound, plan.elem_shift) {
+                        let k_emask = push_iconst(&mut func, Ty::I64, elem_bytes - 1);
+                        let rem_misalign = push_bin(&mut func, Op::And, Flags::NONE, Ty::I64, byte_rem, k_emask);
+                        let k_z64 = push_iconst(&mut func, Ty::I64, 0);
+                        let aligned = push_icmp(&mut func, IntCond::Eq, rem_misalign, k_z64);
+                        g = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, g, aligned);
+                    }
+                    (byte_rem, g)
+                }
+            };
+
+            let mut fallback_args = [0u32; 2];
+            set_at(&mut fallback_args, 0, at(&val_map, to_idx(at(&plan.pre_args, 0))));
+            set_at(&mut fallback_args, 1, at(&val_map, to_idx(at(&plan.pre_args, 1))));
+            push_br(&mut func, go_scan, scan_pre_blk, &[], orig_header_new, &fallback_args);
+
+            // --- Emit `scan_pre` block ---
+            func.block_starts.push(to_u32(func.ops.len()));
+            func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+            let (init_ptr, scan_end, tail_iv_val) = match plan.iv_kind {
+                IvKind::Pointer => {
+                    let k_bmask = push_iconst(&mut func, Ty::I64, !(chunk_bytes - 1));
+                    let scan_bytes = push_bin(&mut func, Op::And, Flags::NONE, Ty::I64, rem_val, k_bmask);
+                    let s_end = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, iv_init_new, scan_bytes);
+                    (iv_init_new, s_end, s_end)
+                }
+                IvKind::Counted { iv_ty } => {
+                    let k_mask = push_iconst(&mut func, iv_ty, !(SCAN_K - 1));
+                    let vec_count = push_bin(&mut func, Op::And, Flags::NONE, iv_ty, rem_val, k_mask);
+                    let vec_end_i = if iv_starts_zero {
+                        vec_count
+                    } else {
+                        push_bin(&mut func, Op::Add, Flags::NONE, iv_ty, iv_init_new, vec_count)
+                    };
+                    let base_new = at(&val_map, to_idx(plan.base));
+                    let eff_base = if let Some(row_off) = plan.row_idx_off {
+                        let row_v = at(&val_map, to_idx(row_off));
+                        let ks = push_iconst(&mut func, Ty::I64, u64::from(plan.elem_shift));
+                        let row_bytes = push_bin(&mut func, Op::Shl, Flags::NONE, Ty::I64, row_v, ks);
+                        push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, base_new, row_bytes)
+                    } else {
+                        base_new
+                    };
+                    let start_ptr = if iv_starts_zero {
+                        eff_base
+                    } else {
+                        let iv0_64 = if iv_ty == Ty::I32 {
+                            push_inst(&mut func, Op::Zext, Flags::NONE, Ty::I64, iv_init_new, 0)
+                        } else {
+                            iv_init_new
+                        };
+                        let ks = push_iconst(&mut func, Ty::I64, u64::from(plan.elem_shift));
+                        let iv0_bytes = push_bin(&mut func, Op::Shl, Flags::NONE, Ty::I64, iv0_64, ks);
+                        push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, eff_base, iv0_bytes)
+                    };
+                    let vc64 = if iv_ty == Ty::I32 {
+                        push_inst(&mut func, Op::Zext, Flags::NONE, Ty::I64, vec_count, 0)
+                    } else {
+                        vec_count
+                    };
+                    let ks = push_iconst(&mut func, Ty::I64, u64::from(plan.elem_shift));
+                    let scan_bytes = push_bin(&mut func, Op::Shl, Flags::NONE, Ty::I64, vc64, ks);
+                    let s_end = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, start_ptr, scan_bytes);
+                    (start_ptr, s_end, vec_end_i)
+                }
+            };
+            push_jump(&mut func, scan_loop_blk, &[init_ptr, acc_init_new]);
+
+            // --- Emit `scan_loop` block (8-way decoupled parallel prefix scan, <= 11 live GPRs) ---
+            func.block_starts.push(to_u32(func.ops.len()));
+            func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+            let p_param = push_inst(&mut func, Op::Param, Flags::NONE, Ty::PTR, 0, 0);
+            let acc_param = push_inst(&mut func, Op::Param, Flags::NONE, plan.elem_ty, 0, 0);
+
+            let emit_load_at = |func: &mut Func<A>, k: i32| -> u32 {
+                let idx = to_u32(func.extra.len());
+                func.extra.push(p_param);
+                func.extra.push(plan.const_off.wrapping_add(k.wrapping_mul(elem_bytes_i32)).cast_unsigned());
+                push_inst(func, Op::Load, Flags::NONE, plan.elem_ty, idx, plan.load_mem_attr)
+            };
+            let emit_store_at = |func: &mut Func<A>, k: i32, val: u32| {
+                let idx = to_u32(func.extra.len());
+                func.extra.push(val);
+                func.extra.push(p_param);
+                func.extra.push(plan.const_off.wrapping_add(k.wrapping_mul(elem_bytes_i32)).cast_unsigned());
+                push_inst(func, Op::Store, Flags::NONE, Ty::NONE, idx, plan.store_mem_attr);
+            };
+
+            // 3-level local prefix tree (100% independent of `acc`, scheduled in two halves to
+            // cap peak live registers at 11 GPRs while keeping adjacent load/store pairs for ldp/stp).
+            let x0 = emit_load_at(&mut func, 0);
+            let x1 = emit_load_at(&mut func, 1);
+            let x2 = emit_load_at(&mut func, 2);
+            let x3 = emit_load_at(&mut func, 3);
+            let p01 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, x0, x1);
+            let p23 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, x2, x3);
+            let p02 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, p01, x2);
+            let p03 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, p01, p23);
+
+            let x4 = emit_load_at(&mut func, 4);
+            let x5 = emit_load_at(&mut func, 5);
+            let x6 = emit_load_at(&mut func, 6);
+            let x7 = emit_load_at(&mut func, 7);
+            let p45 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, x4, x5);
+            let p67 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, x6, x7);
+            let p46 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, p45, x6);
+            let p47 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, p45, p67);
+            let p04 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, p03, x4);
+            let p05 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, p03, p45);
+            let p06 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, p03, p46);
+            let p07 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, p03, p47);
+
+            // Single loop-carried `add` per 8 elements (0.125 cycles/elem critical path).
+            let acc_next = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, acc_param, p07);
+            if plan.inclusive {
+                let y0 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, acc_param, x0);
+                let y1 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, acc_param, p01);
+                emit_store_at(&mut func, 0, y0);
+                emit_store_at(&mut func, 1, y1);
+                let y2 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, acc_param, p02);
+                let y3 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, acc_param, p03);
+                emit_store_at(&mut func, 2, y2);
+                emit_store_at(&mut func, 3, y3);
+                let y4 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, acc_param, p04);
+                let y5 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, acc_param, p05);
+                emit_store_at(&mut func, 4, y4);
+                emit_store_at(&mut func, 5, y5);
+                let y6 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, acc_param, p06);
+                emit_store_at(&mut func, 6, y6);
+                emit_store_at(&mut func, 7, acc_next);
+            } else {
+                let y1 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, acc_param, x0);
+                emit_store_at(&mut func, 0, acc_param);
+                emit_store_at(&mut func, 1, y1);
+                let y2 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, acc_param, p01);
+                let y3 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, acc_param, p02);
+                emit_store_at(&mut func, 2, y2);
+                emit_store_at(&mut func, 3, y3);
+                let y4 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, acc_param, p03);
+                let y5 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, acc_param, p04);
+                emit_store_at(&mut func, 4, y4);
+                emit_store_at(&mut func, 5, y5);
+                let y6 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, acc_param, p05);
+                let y7 = push_bin(&mut func, Op::Add, Flags::NONE, plan.elem_ty, acc_param, p06);
+                emit_store_at(&mut func, 6, y6);
+                emit_store_at(&mut func, 7, y7);
+            }
+
+            let k_chunk = push_iconst(&mut func, Ty::I64, chunk_bytes);
+            let p_next = push_bin(&mut func, Op::PtrAdd, Flags::NONE, Ty::PTR, p_param, k_chunk);
+            let keep_scan = push_icmp(&mut func, IntCond::Ult, p_next, scan_end);
+
+            match plan.shape {
+                LoopShape::HeaderBody { .. } => {
+                    let mut tail_args = [0u32; 2];
+                    set_at(&mut tail_args, plan.iv_pos, tail_iv_val);
+                    set_at(&mut tail_args, plan.acc_pos, acc_next);
+                    push_br(&mut func, keep_scan, scan_loop_blk, &[p_next, acc_next], orig_header_new, &tail_args);
+                }
+                LoopShape::SingleBlock { .. } => {
+                    push_br(&mut func, keep_scan, scan_loop_blk, &[p_next, acc_next], scan_tail_blk, &[acc_next]);
+                    // --- Emit `scan_tail` block for `SingleBlock` do-while remainder ---
+                    func.block_starts.push(to_u32(func.ops.len()));
+                    func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+                    let acc_final = push_inst(&mut func, Op::Param, Flags::NONE, plan.elem_ty, 0, 0);
+                    let has_tail = if matches!(plan.iv_kind, IvKind::Pointer)
+                        && Ty(at(view.tys, to_idx(plan.bound))) != Ty::PTR
+                    {
+                        let tail_addr = push_inst(&mut func, Op::PtrAddr, Flags::NONE, Ty::I64, tail_iv_val, 0);
+                        push_icmp(&mut func, IntCond::Ult, tail_addr, bound_new)
+                    } else {
+                        push_icmp(&mut func, IntCond::Ult, tail_iv_val, bound_new)
+                    };
+                    let mut tail_args = [0u32; 2];
+                    set_at(&mut tail_args, plan.iv_pos, tail_iv_val);
+                    set_at(&mut tail_args, plan.acc_pos, acc_final);
+                    let mut direct_exit_args: Vec<u32, A> =
+                        Vec::with_capacity_in(plan.single_exit_args.len(), alloc);
+                    for &ea in &plan.single_exit_args {
+                        if ea == plan.acc_update_inst {
+                            direct_exit_args.push(acc_final);
+                        } else {
+                            direct_exit_args.push(at(&val_map, to_idx(ea)));
+                        }
+                    }
+                    push_br(&mut func, has_tail, orig_header_new, &tail_args, orig_exit_new, &direct_exit_args);
+                }
+            }
+        } else {
+            for inst in range {
+                let mapped = copy_inst_remapped_blocks(view, inst, &val_map, &blk_map, &mut func);
+                set_at(&mut val_map, inst, mapped);
+            }
+        }
+    }
+
+    verify(func.view()).map_err(SimplifyError::Verify)?;
+    Ok(VectorizeOutput {
+        func,
+        stats: VectorizeStats { loops_vectorized: 1 },
+    })
+}
+
 /// Automatically vectorizes eligible countable unit-stride scalar loops into 4x-unrolled (or
 /// 2x-unrolled for larger bodies) 128-bit SIMD loops (`64` or `32 bytes / iteration`) with
 /// independent accumulators and an exact scalar tail.
@@ -2166,6 +3081,9 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
     alloc: A,
 ) -> Result<VectorizeOutput<A>, SimplifyError> {
     let Some(plan) = find_vectorizable_loop(&view, vec_bytes, alloc) else {
+        if let Some(scan_plan) = find_prefix_scan_loop(&view, alloc) {
+            return emit_prefix_scan_loop(&view, scan_plan, alloc);
+        }
         return Ok(VectorizeOutput {
             func: view.to_func_in(alloc),
             stats: VectorizeStats::default(),
@@ -6613,5 +7531,314 @@ mod tests {
                 assert_eq!(got.as_slice(), orig.as_slice(), "strict f64 bit-exact mismatch at n={n}");
             }
         }
+    }
+
+    #[test]
+    fn vectorize_prefix_scan_u64_pointer_iter_mut() {
+        use blaze_own::Alloc;
+        use crate::{
+            eval::{self, Outcome, Val},
+            func::SlotKind,
+        };
+
+        const MAX_N: usize = 64;
+        const INIT_ACC: u64 = 0xffff_ffff_ffff_fff0;
+        let edge_vals: [u64; 8] = [
+            u64::MAX,
+            u64::MAX - 1,
+            0,
+            1,
+            0x8000_0000_0000_0000,
+            0x7fff_ffff_ffff_ffff,
+            0xdead_beef_cafe_babe,
+            0x0123_4567_89ab_cdef,
+        ];
+        let mut xs = [0u64; MAX_N];
+        for k in 0..MAX_N {
+            xs[k] = edge_vals[k % edge_vals.len()].wrapping_add((k as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        }
+
+        for rotated in [false, true] {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, blaze_own::testing::heap().alloc());
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let slot = b.slot((MAX_N * 8) as u32, 3, SlotKind::Temp);
+
+            let entry = b.create_block(BlockKind::Normal);
+            let hdr = b.create_block(BlockKind::Normal);
+            let body = if rotated { hdr } else { b.create_block(BlockKind::Normal) };
+            let exit = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let len = b.param(Ty::I64);
+            let check_idx = b.param(Ty::I64);
+            let pa = b.slot_addr(slot);
+            for (k, &val) in xs.iter().enumerate() {
+                let cv = b.iconst(Ty::I64, u128::from(val));
+                b.store(Flags::NONE, cv, pa, (k * 8) as i32, MemAttrs::aligned(3));
+            }
+            let three = b.iconst(Ty::I64, 3);
+            let eight = b.iconst(Ty::I64, 8);
+            let init_acc = b.iconst(Ty::I64, u128::from(INIT_ACC));
+            let bytes = b.binary(Op::Shl, Flags::NONE, len, three);
+            let end_p = b.ptr_add(Flags::INBOUNDS, pa, bytes);
+            if rotated {
+                let non_empty = b.icmp(IntCond::Ne, pa, end_p);
+                b.br(Flags::NONE, non_empty, (hdr, &[pa, init_acc]), (exit, &[init_acc]));
+
+                b.begin(hdr);
+                let p = b.param(Ty::PTR);
+                let acc = b.param(Ty::I64);
+                let p_next = b.ptr_add(Flags::INBOUNDS, p, eight);
+                let x = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+                let acc_next = b.binary(Op::Add, Flags::NONE, acc, x);
+                b.store(Flags::NONE, acc_next, p, 0, MemAttrs::aligned(3));
+                let keep = b.icmp(IntCond::Ne, p_next, end_p);
+                b.br(Flags::NONE, keep, (hdr, &[p_next, acc_next]), (exit, &[acc_next]));
+            } else {
+                b.jump((hdr, &[pa, init_acc]));
+
+                b.begin(hdr);
+                let p = b.param(Ty::PTR);
+                let acc = b.param(Ty::I64);
+                let keep = b.icmp(IntCond::Ne, p, end_p);
+                b.br(Flags::NONE, keep, (body, &[]), (exit, &[acc]));
+
+                b.begin(body);
+                let p_next = b.ptr_add(Flags::INBOUNDS, p, eight);
+                let x = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+                let acc_next = b.binary(Op::Add, Flags::NONE, acc, x);
+                b.store(Flags::NONE, acc_next, p, 0, MemAttrs::aligned(3));
+                b.jump((hdr, &[p_next, acc_next]));
+            }
+
+            b.begin(exit);
+            let final_acc = b.param(Ty::I64);
+            let check_off = b.binary(Op::Shl, Flags::NONE, check_idx, three);
+            let check_ptr = b.ptr_add(Flags::NONE, pa, check_off);
+            let elem_out = b.load(Ty::I64, Flags::NONE, check_ptr, 0, MemAttrs::aligned(3));
+            b.ret(&[final_acc, elem_out]);
+            let func = b.finish_checked().unwrap();
+
+            let out = auto_vectorize_loops(func.view(), blaze_own::testing::heap().alloc()).unwrap();
+            assert_eq!(out.stats.loops_vectorized, 1, "rotated={rotated}");
+            verify(out.func.view()).unwrap();
+
+            // Must not re-vectorize on a second pass.
+            let second = auto_vectorize_loops(out.func.view(), blaze_own::testing::heap().alloc()).unwrap();
+            assert_eq!(second.stats.loops_vectorized, 0, "rotated={rotated} re-vectorized");
+
+            // Check that `scan_loop` has 8 loads and 8 stores of `Ty::I64`.
+            let v = out.func.view();
+            let scan_loop_blk = if rotated { Block(3) } else { Block(2) };
+            let loop_loads = v
+                .block(scan_loop_blk)
+                .filter(|&k| v.op(k) == Op::Load && Ty(v.tys[k]) == Ty::I64)
+                .count();
+            let loop_stores = v.block(scan_loop_blk).filter(|&k| v.op(k) == Op::Store).count();
+            assert_eq!(loop_loads, 8, "expected 8 scalar I64 loads in 8-way scan_loop");
+            assert_eq!(loop_stores, 8, "expected 8 scalar I64 stores in 8-way scan_loop");
+
+            for &n in &[0usize, 1, 2, 7, 8, 9, 15, 16, 17, 33, 64] {
+                let mut expected_arr = xs;
+                let mut expected_acc = INIT_ACC;
+                for k in 0..n {
+                    expected_acc = expected_acc.wrapping_add(expected_arr[k]);
+                    expected_arr[k] = expected_acc;
+                }
+                let check_end = if n < MAX_N { n + 1 } else { MAX_N };
+                for check_i in 0..check_end {
+                    let args = [Val::Int(n as u128), Val::Int(check_i as u128)];
+                    let Outcome::Returned(orig) =
+                        eval::run_in(func.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                    else {
+                        panic!("orig eval failed at rotated={rotated} n={n} idx={check_i}");
+                    };
+                    let Outcome::Returned(got) =
+                        eval::run_in(out.func.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                    else {
+                        panic!("scan eval failed at rotated={rotated} n={n} idx={check_i}");
+                    };
+                    let want = [Val::Int(u128::from(expected_acc)), Val::Int(u128::from(expected_arr[check_i]))];
+                    assert_eq!(orig.as_slice(), &want);
+                    assert_eq!(
+                        got.as_slice(),
+                        orig.as_slice(),
+                        "u64 prefix scan mismatch at rotated={rotated} n={n} idx={check_i}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vectorize_prefix_scan_i32_counted_inclusive_and_exclusive() {
+        use blaze_own::Alloc;
+        use crate::{
+            eval::{self, Outcome, Val},
+            func::SlotKind,
+        };
+
+        const MAX_N: usize = 25;
+        const INIT_ACC: u32 = 0xffff_fff5;
+        let edge_vals: [u32; 6] = [u32::MAX, 0x8000_0000, 0x7fff_ffff, 0, 1, 0x1234_5678];
+        let mut xs = [0u32; MAX_N];
+        for k in 0..MAX_N {
+            xs[k] = edge_vals[k % edge_vals.len()].wrapping_add((k as u32).wrapping_mul(0x9e37_79b9));
+        }
+
+        for inclusive in [true, false] {
+            for use_mul in [false, true] {
+                let mut b = Builder::<Alloc<'static>, Full>::new_in(64, blaze_own::testing::heap().alloc());
+                let sig = b.sig(
+                    Conv::C,
+                    Variadic::No,
+                    &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                    &[Param::of(Ty::I32), Param::of(Ty::I32)],
+                );
+                b.set_signature(sig);
+                let slot = b.slot((MAX_N * 4) as u32, 2, SlotKind::Temp);
+                let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+                b.begin(entry);
+                let len = b.param(Ty::I64);
+                let check_idx = b.param(Ty::I64);
+                let pa = b.slot_addr(slot);
+                for (k, &val) in xs.iter().enumerate() {
+                    let cv = b.iconst(Ty::I32, u128::from(val));
+                    b.store(Flags::NONE, cv, pa, (k * 4) as i32, MemAttrs::aligned(2));
+                }
+                let zero_i = b.iconst(Ty::I64, 0);
+                let one_i = b.iconst(Ty::I64, 1);
+                let two_i = b.iconst(Ty::I64, 2);
+                let four_i = b.iconst(Ty::I64, 4);
+                let init_acc = b.iconst(Ty::I32, u128::from(INIT_ACC));
+                b.jump((hdr, &[zero_i, init_acc]));
+
+                b.begin(hdr);
+                let i = b.param(Ty::I64);
+                let acc = b.param(Ty::I32);
+                let keep = b.icmp(IntCond::Ult, i, len);
+                b.br(Flags::NONE, keep, (body, &[]), (exit, &[acc]));
+
+                b.begin(body);
+                let off = if use_mul {
+                    b.binary(Op::Mul, Flags::NONE, i, four_i)
+                } else {
+                    b.binary(Op::Shl, Flags::NONE, i, two_i)
+                };
+                let ptr = b.ptr_add(Flags::NONE, pa, off);
+                let x = b.load(Ty::I32, Flags::NONE, ptr, 0, MemAttrs::aligned(2));
+                let acc_next = b.binary(Op::Add, Flags::NONE, x, acc);
+                let to_store = if inclusive { acc_next } else { acc };
+                b.store(Flags::NONE, to_store, ptr, 0, MemAttrs::aligned(2));
+                let i_next = b.binary(Op::Add, Flags::NONE, i, one_i);
+                b.jump((hdr, &[i_next, acc_next]));
+
+                b.begin(exit);
+                let final_acc = b.param(Ty::I32);
+                let check_off = b.binary(Op::Shl, Flags::NONE, check_idx, two_i);
+                let check_ptr = b.ptr_add(Flags::NONE, pa, check_off);
+                let elem_out = b.load(Ty::I32, Flags::NONE, check_ptr, 0, MemAttrs::aligned(2));
+                b.ret(&[final_acc, elem_out]);
+                let func = b.finish_checked().unwrap();
+
+                let out = auto_vectorize_loops(func.view(), blaze_own::testing::heap().alloc()).unwrap();
+                assert_eq!(out.stats.loops_vectorized, 1, "inclusive={inclusive} use_mul={use_mul}");
+                verify(out.func.view()).unwrap();
+
+                let second = auto_vectorize_loops(out.func.view(), blaze_own::testing::heap().alloc()).unwrap();
+                assert_eq!(second.stats.loops_vectorized, 0);
+
+                for &n in &[0usize, 1, 7, 8, 9, 25] {
+                    let mut expected_arr = xs;
+                    let mut expected_acc = INIT_ACC;
+                    for k in 0..n {
+                        let x = expected_arr[k];
+                        let next = expected_acc.wrapping_add(x);
+                        expected_arr[k] = if inclusive { next } else { expected_acc };
+                        expected_acc = next;
+                    }
+                    let check_end = if n < MAX_N { n + 1 } else { MAX_N };
+                    for check_i in 0..check_end {
+                        let args = [Val::Int(n as u128), Val::Int(check_i as u128)];
+                        let Outcome::Returned(orig) =
+                            eval::run_in(func.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                        else {
+                            panic!("orig i32 eval failed");
+                        };
+                        let Outcome::Returned(got) =
+                            eval::run_in(out.func.view(), &args, 200_000, blaze_own::testing::heap().alloc()).unwrap()
+                        else {
+                            panic!("scan i32 eval failed");
+                        };
+                        let want = [Val::Int(u128::from(expected_acc)), Val::Int(u128::from(expected_arr[check_i]))];
+                        assert_eq!(orig.as_slice(), &want);
+                        assert_eq!(
+                            got.as_slice(),
+                            orig.as_slice(),
+                            "i32 prefix scan mismatch at inclusive={inclusive} use_mul={use_mul} n={n} idx={check_i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vectorize_prefix_scan_does_not_match_mismatched_base() {
+        use blaze_own::Alloc;
+
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, blaze_own::testing::heap().alloc());
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let src = b.param(Ty::PTR);
+        let dst = b.param(Ty::PTR);
+        let n = b.param(Ty::I64);
+        let zero = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        let three = b.iconst(Ty::I64, 3);
+        b.jump((hdr, &[zero, zero]));
+
+        b.begin(hdr);
+        let i = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let keep = b.icmp(IntCond::Ult, i, n);
+        b.br(Flags::NONE, keep, (body, &[]), (exit, &[acc]));
+
+        b.begin(body);
+        let off = b.binary(Op::Shl, Flags::NONE, i, three);
+        let sp = b.ptr_add(Flags::NONE, src, off);
+        let dp = b.ptr_add(Flags::NONE, dst, off);
+        let x = b.load(Ty::I64, Flags::NONE, sp, 0, MemAttrs::aligned(3));
+        let acc_next = b.binary(Op::Add, Flags::NONE, acc, x);
+        b.store(Flags::NONE, acc_next, dp, 0, MemAttrs::aligned(3));
+        let i_next = b.binary(Op::Add, Flags::NONE, i, one);
+        b.jump((hdr, &[i_next, acc_next]));
+
+        b.begin(exit);
+        let res = b.param(Ty::I64);
+        b.ret(&[res]);
+        let func = b.finish_checked().unwrap();
+
+        let out = auto_vectorize_loops(func.view(), blaze_own::testing::heap().alloc()).unwrap();
+        verify(out.func.view()).unwrap();
+        assert_eq!(
+            out.stats.loops_vectorized, 0,
+            "mismatched load/store base pointers must not be transformed into an unguarded prefix scan"
+        );
     }
 }

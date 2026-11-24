@@ -35,7 +35,7 @@ pub struct UnswitchOutput<A: Allocator> {
 }
 
 /// Maximum total instructions inside a loop eligible for cloning during unswitching.
-const MAX_UNSWITCH_INSTS: usize = 96;
+const MAX_UNSWITCH_INSTS: usize = 128;
 
 #[inline]
 fn to_idx(v: u32) -> usize {
@@ -145,17 +145,36 @@ enum UnswitchKind<A: Allocator> {
     },
 }
 
+#[inline]
+fn br_arm_target(view: &View<'_>, br_inst: usize, take_then: bool) -> (u32, usize, usize) {
+    let idx = to_idx(at(view.data, br_inst));
+    let t_blk = at(view.extra, idx + 1);
+    let t_argc = to_idx(at(view.extra, idx + 2));
+    let e_at = idx + 3 + t_argc;
+    let e_blk = at(view.extra, e_at);
+    let e_argc = to_idx(at(view.extra, e_at + 1));
+    if take_then { (t_blk, idx + 3, t_argc) } else { (e_blk, e_at + 2, e_argc) }
+}
+
 struct UnswitchPlan<A: Allocator> {
     preheader: u32,
     header: u32,
     /// Blocks belonging to the natural loop (sorted ascending, `loop_blocks[0] == header`).
     loop_blocks: Vec<u32, A>,
+    /// Blocks emitted in the `L_true` copy (in emission order).
+    l_true_blocks: Vec<u32, A>,
+    /// Blocks emitted in the `L_false` copy (in emission order).
+    l_false_blocks: Vec<u32, A>,
+    /// Outside blocks (`!in_loop`) reachable from `L_true` (empty when per-copy pruning is unused).
+    reach_out_true: Vec<bool, A>,
+    /// Outside blocks (`!in_loop`) reachable from `L_false` (empty when per-copy pruning is unused).
+    reach_out_false: Vec<bool, A>,
     kind: UnswitchKind<A>,
     /// Block index defining each instruction in `view`.
     inst_block: Vec<u32, A>,
-    /// Unique external exit block (if any) that receives direct def-uses from `loop_blocks`.
+    /// Unique external exit block (if any) that receives direct def-uses from both copies.
     direct_exit: Option<u32>,
-    /// Values defined in `loop_blocks` that are directly used outside `loop_blocks` (promoted to exit params).
+    /// Values defined in `loop_blocks` promoted to `direct_exit` block params.
     escaped_vals: Vec<u32, A>,
 }
 
@@ -510,6 +529,412 @@ fn find_inner_loop_guard_candidate<A: Allocator + Copy>(
     None
 }
 
+struct InvariantBrAnalysis<A: Allocator> {
+    l_true_blocks: Vec<u32, A>,
+    l_false_blocks: Vec<u32, A>,
+    reach_out_true: Vec<bool, A>,
+    reach_out_false: Vec<bool, A>,
+    direct_exit: Option<u32>,
+    escaped_vals: Vec<u32, A>,
+}
+
+/// Forward BFS from `header` staying inside `in_loop`, folding `br_blk`'s terminator to
+/// `take_then` (`true` -> `then`, `false` -> `else`). Returns `(copy_blocks_sorted, in_copy, exit_from_copy)`.
+fn collect_copy_reach<A: Allocator + Copy>(
+    view: &View<'_>,
+    header: u32,
+    in_loop: &[bool],
+    br_blk: u32,
+    br_inst: usize,
+    take_then: bool,
+    alloc: A,
+) -> (Vec<u32, A>, Vec<bool, A>, Vec<bool, A>) {
+    let blocks = view.blocks();
+    let mut in_copy = filled(blocks, false, &alloc);
+    let mut exit_from_copy = filled(blocks, false, &alloc);
+    let mut copy_blocks: Vec<u32, A> = Vec::new_in(alloc);
+    let mut work: Vec<u32, A> = Vec::new_in(alloc);
+    let (folded_target, _, _) = br_arm_target(view, br_inst, take_then);
+
+    set_at(&mut in_copy, to_idx(header), true);
+    copy_blocks.push(header);
+    work.push(header);
+
+    while let Some(u) = work.pop() {
+        if u == br_blk {
+            let ti = to_idx(folded_target);
+            if at(in_loop, ti) {
+                if !at(&in_copy, ti) {
+                    set_at(&mut in_copy, ti, true);
+                    copy_blocks.push(folded_target);
+                    work.push(folded_target);
+                }
+            } else {
+                set_at(&mut exit_from_copy, ti, true);
+            }
+        } else {
+            let term = view.terminator(Block(u));
+            each(view, term, |item| {
+                if let Item::Edge(edge) = item {
+                    let ti = to_idx(edge.block);
+                    if at(in_loop, ti) {
+                        if !at(&in_copy, ti) {
+                            set_at(&mut in_copy, ti, true);
+                            copy_blocks.push(edge.block);
+                            work.push(edge.block);
+                        }
+                    } else {
+                        set_at(&mut exit_from_copy, ti, true);
+                    }
+                }
+            });
+        }
+    }
+    copy_blocks.sort_unstable();
+    (copy_blocks, in_copy, exit_from_copy)
+}
+
+/// Forward BFS over outside blocks (`!in_loop`) starting from every block in `seeds`.
+fn collect_outside_reach<A: Allocator + Copy>(
+    view: &View<'_>,
+    in_loop: &[bool],
+    seeds: &[bool],
+    alloc: A,
+) -> Vec<bool, A> {
+    let blocks = view.blocks();
+    let mut reach = filled(blocks, false, &alloc);
+    let mut work: Vec<u32, A> = Vec::new_in(alloc);
+    for b in 0..blocks {
+        if at(seeds, b) && !at(in_loop, b) {
+            set_at(&mut reach, b, true);
+            work.push(to_u32(b));
+        }
+    }
+    while let Some(u) = work.pop() {
+        let term = view.terminator(Block(u));
+        each(view, term, |item| {
+            if let Item::Edge(edge) = item {
+                let ti = to_idx(edge.block);
+                if !at(in_loop, ti) && !at(&reach, ti) {
+                    set_at(&mut reach, ti, true);
+                    work.push(edge.block);
+                }
+            }
+        });
+    }
+    reach
+}
+
+/// Verify every operand used inside `copy_blocks` is already emitted in def-before-use order
+/// when `copy_blocks` is emitted in ascending order after `0..=preheader`.
+fn check_copy_defs(
+    view: &View<'_>,
+    preheader: u32,
+    in_loop: &[bool],
+    inst_block: &[u32],
+    copy_blocks: &[u32],
+    in_copy: &[bool],
+    br_inst: usize,
+    take_then: bool,
+) -> bool {
+    let (_, br_args_start, br_argc) = br_arm_target(view, br_inst, take_then);
+    for &lb in copy_blocks {
+        for inst in view.block(Block(lb)) {
+            let mut ok = true;
+            if inst == br_inst {
+                for k in 0..br_argc {
+                    let v = at(view.extra, br_args_start + k);
+                    let vi = to_idx(v);
+                    let vb = at(inst_block, vi);
+                    let vb_idx = to_idx(vb);
+                    if at(in_loop, vb_idx) {
+                        if !at(in_copy, vb_idx) || vb > lb || (vb == lb && vi >= inst) {
+                            ok = false;
+                            break;
+                        }
+                    } else if vb > preheader {
+                        ok = false;
+                        break;
+                    }
+                }
+            } else {
+                for_each_use(view, inst, |v| {
+                    let vi = to_idx(v);
+                    let vb = at(inst_block, vi);
+                    let vb_idx = to_idx(vb);
+                    if at(in_loop, vb_idx) {
+                        if !at(in_copy, vb_idx) || vb > lb || (vb == lb && vi >= inst) {
+                            ok = false;
+                        }
+                    } else if vb > preheader {
+                        ok = false;
+                    }
+                });
+            }
+            if !ok {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Verify every edge from `copy_blocks` to `shared_exit` sees all `shared_escaped_vals`
+/// already emitted in `copy_blocks` before that edge's terminator.
+fn check_exit_edges_have_escaped_defs(
+    view: &View<'_>,
+    inst_block: &[u32],
+    copy_blocks: &[u32],
+    in_copy: &[bool],
+    br_blk: u32,
+    br_inst: usize,
+    take_then: bool,
+    shared_exit: u32,
+    shared_escaped_vals: &[u32],
+) -> bool {
+    let (folded_target, _, _) = br_arm_target(view, br_inst, take_then);
+    for &lb in copy_blocks {
+        let term = view.terminator(Block(lb));
+        let jumps_to_exit = if lb == br_blk {
+            folded_target == shared_exit
+        } else {
+            let mut hit = false;
+            each(view, term, |item| {
+                if let Item::Edge(edge) = item
+                    && edge.block == shared_exit
+                {
+                    hit = true;
+                }
+            });
+            hit
+        };
+        if jumps_to_exit {
+            for &ev in shared_escaped_vals {
+                let evi = to_idx(ev);
+                let evb = at(inst_block, evi);
+                let evb_idx = to_idx(evb);
+                if !at(in_copy, evb_idx) || evb > lb || (evb == lb && evi >= term) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Per-copy reachability pruning and multi-exit escape analysis for an `InvariantBr` candidate.
+fn analyze_invariant_br<A: Allocator + Copy>(
+    view: &View<'_>,
+    preheader: u32,
+    header: u32,
+    in_loop: &[bool],
+    exit_blocks: &[u32],
+    inst_block: &[u32],
+    preds: &[Vec<u32, A>],
+    br_blk: u32,
+    br_inst: usize,
+    alloc: A,
+) -> Option<InvariantBrAnalysis<A>> {
+    let blocks = view.blocks();
+    let (l_true_blocks, in_l_true, exit_from_true) =
+        collect_copy_reach(view, header, in_loop, br_blk, br_inst, true, alloc);
+    let (l_false_blocks, in_l_false, exit_from_false) =
+        collect_copy_reach(view, header, in_loop, br_blk, br_inst, false, alloc);
+
+    // Require `br_blk` itself to be reachable from `header` in both copies.
+    if !at(&in_l_true, to_idx(br_blk)) || !at(&in_l_false, to_idx(br_blk)) {
+        return None;
+    }
+
+    // Cloning an `Invoke`/`InvokeIndirect`/`AsmBr` into BOTH copies when its normal/fallthrough
+    // target lies outside `in_loop` would violate LIR's single-predecessor rule on that target.
+    for &lb in &l_true_blocks {
+        if !at(&in_l_false, to_idx(lb)) {
+            continue;
+        }
+        let term = view.terminator(Block(lb));
+        if matches!(view.op(term), Op::Invoke | Op::InvokeIndirect | Op::AsmBr) {
+            let mut bad_edge = false;
+            each(view, term, |item| {
+                if let Item::Edge(edge) = item
+                    && !at(in_loop, to_idx(edge.block))
+                    && !view.block_kind(Block(edge.block)).is_landing()
+                {
+                    bad_edge = true;
+                }
+            });
+            if bad_edge {
+                return None;
+            }
+        }
+    }
+
+    if !check_copy_defs(view, preheader, in_loop, inst_block, &l_true_blocks, &in_l_true, br_inst, true)
+        || !check_copy_defs(view, preheader, in_loop, inst_block, &l_false_blocks, &in_l_false, br_inst, false)
+    {
+        return None;
+    }
+
+    let reach_out_true = collect_outside_reach(view, in_loop, &exit_from_true, alloc);
+    let reach_out_false = collect_outside_reach(view, in_loop, &exit_from_false, alloc);
+
+    let mut shared_escaped_vals: Vec<u32, A> = Vec::new_in(alloc);
+    let mut shared_user_blocks: Vec<u32, A> = Vec::new_in(alloc);
+    let mut uses_ok = true;
+
+    for b in 0..blocks {
+        if at(in_loop, b) {
+            continue;
+        }
+        let b_u32 = to_u32(b);
+        let r_true = at(&reach_out_true, b);
+        let r_false = at(&reach_out_false, b);
+        for inst in view.block(Block(b_u32)) {
+            for_each_use(view, inst, |v| {
+                let vi = to_idx(v);
+                let vb = at(inst_block, vi);
+                let vb_idx = to_idx(vb);
+                if at(in_loop, vb_idx) {
+                    if b_u32 <= preheader {
+                        uses_ok = false;
+                        return;
+                    }
+                    if r_true && !r_false {
+                        if !at(&in_l_true, vb_idx) {
+                            uses_ok = false;
+                        }
+                    } else if r_false && !r_true {
+                        if !at(&in_l_false, vb_idx) {
+                            uses_ok = false;
+                        }
+                    } else if r_true && r_false {
+                        if !at(&in_l_true, vb_idx) || !at(&in_l_false, vb_idx) {
+                            uses_ok = false;
+                            return;
+                        }
+                        if shared_escaped_vals.scan_for(&v).is_none() {
+                            shared_escaped_vals.push(v);
+                        }
+                        if shared_user_blocks.scan_for(&b_u32).is_none() {
+                            shared_user_blocks.push(b_u32);
+                        }
+                    } else {
+                        // Dead outside block using a loop-defined value: reject so `verify()` never sees `NONE`.
+                        uses_ok = false;
+                    }
+                } else if vb > b_u32 || (vb == b_u32 && vi >= inst) {
+                    uses_ok = false;
+                }
+            });
+            if !uses_ok {
+                break;
+            }
+        }
+        if !uses_ok {
+            break;
+        }
+    }
+    if !uses_ok {
+        return None;
+    }
+
+    let direct_exit = if shared_escaped_vals.is_empty() {
+        None
+    } else {
+        let mut shared_exit = NONE;
+        let mut shared_exit_count = 0u32;
+        for &ex in exit_blocks {
+            let ex_idx = to_idx(ex);
+            if at(&exit_from_true, ex_idx) && at(&exit_from_false, ex_idx) {
+                shared_exit = ex;
+                shared_exit_count += 1;
+            }
+        }
+        if shared_exit_count != 1
+            || shared_exit == NONE
+            || shared_exit <= preheader
+            || view.block_kind(Block(shared_exit)).is_landing()
+        {
+            return None;
+        }
+        let ps = preds.get(to_idx(shared_exit)).map(Vec::as_slice).unwrap_or(&[]);
+        if ps.is_empty() {
+            return None;
+        }
+        for &p in ps {
+            if !at(in_loop, to_idx(p)) {
+                return None;
+            }
+            let p_term = view.terminator(Block(p));
+            let mut edge_ok = true;
+            each(view, p_term, |item| {
+                if let Item::Edge(edge) = item
+                    && edge.block == shared_exit
+                    && edge.args.is_none()
+                {
+                    edge_ok = false;
+                }
+            });
+            if !edge_ok {
+                return None;
+            }
+        }
+        for &u in &shared_user_blocks {
+            if u < shared_exit {
+                return None;
+            }
+        }
+        if !check_exit_edges_have_escaped_defs(
+            view,
+            inst_block,
+            &l_true_blocks,
+            &in_l_true,
+            br_blk,
+            br_inst,
+            true,
+            shared_exit,
+            &shared_escaped_vals,
+        ) || !check_exit_edges_have_escaped_defs(
+            view,
+            inst_block,
+            &l_false_blocks,
+            &in_l_false,
+            br_blk,
+            br_inst,
+            false,
+            shared_exit,
+            &shared_escaped_vals,
+        ) {
+            return None;
+        }
+
+        // Prove `shared_exit` dominates every `shared_user_blocks` entry: BFS from
+        // `exit_blocks \ {shared_exit}` over `!in_loop` must not reach any shared user block.
+        let mut other_seeds = filled(blocks, false, &alloc);
+        for &other_ex in exit_blocks {
+            if other_ex != shared_exit {
+                set_at(&mut other_seeds, to_idx(other_ex), true);
+            }
+        }
+        let reach_other = collect_outside_reach(view, in_loop, &other_seeds, alloc);
+        for &u in &shared_user_blocks {
+            if at(&reach_other, to_idx(u)) {
+                return None;
+            }
+        }
+        Some(shared_exit)
+    };
+
+    Some(InvariantBrAnalysis {
+        l_true_blocks,
+        l_false_blocks,
+        reach_out_true,
+        reach_out_false,
+        direct_exit,
+        escaped_vals: shared_escaped_vals,
+    })
+}
+
 fn find_unswitch_candidate<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Option<UnswitchPlan<A>> {
     let blocks = view.blocks();
     let len = view.len();
@@ -615,7 +1040,7 @@ fn find_unswitch_candidate<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Op
             continue;
         }
 
-        // Check if any loop-defined value is directly used outside the loop (without an exit param).
+        // Collect all external exit targets of edges leaving `loop_blocks`.
         let mut exit_blocks: Vec<u32, A> = Vec::new_in(alloc);
         for &bb in &loop_blocks {
             let term = view.terminator(Block(bb));
@@ -629,32 +1054,102 @@ fn find_unswitch_candidate<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Op
             });
         }
 
+        // 1. Scan for an internal `Op::Br` whose condition is defined outside the loop (`<= preheader`),
+        //    or is a pure, flag-free `Op::Icmp`/`Op::Fcmp` inside the loop with invariant operands.
+        //    Uses per-copy reachability pruning so multi-exit loops (e.g. bounds-check traps) qualify!
+        for &bb in &loop_blocks {
+            let term = view.terminator(Block(bb));
+            if view.op(term) != Op::Br {
+                continue;
+            }
+            let idx = to_idx(at(view.data, term));
+            let cv = at(view.extra, idx);
+            let cvi = to_idx(cv);
+            let cb = at(&inst_block, cvi);
+            let candidate = if !at(&in_loop, to_idx(cb)) && cb <= preheader {
+                Some((cv, None))
+            } else if matches!(view.op(cvi), Op::Icmp | Op::Fcmp) && at(view.flags, cvi) == 0 {
+                let cat = to_idx(at(view.data, cvi));
+                let lhs = at(view.extra, cat + 1);
+                let rhs = at(view.extra, cat + 2);
+                if is_outer_invariant(view, lhs, &in_loop, &inst_block, preheader)
+                    && is_outer_invariant(view, rhs, &in_loop, &inst_block, preheader)
+                {
+                    Some((cv, Some(cvi)))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let Some((inv_cond, hoist_cmp)) = candidate else {
+                continue;
+            };
+            if let Some(analysis) = analyze_invariant_br(
+                view,
+                preheader,
+                header,
+                &in_loop,
+                &exit_blocks,
+                &inst_block,
+                &preds,
+                bb,
+                term,
+                alloc,
+            ) {
+                for &lb in &loop_blocks {
+                    set_at(&mut in_loop, to_idx(lb), false);
+                }
+                return Some(UnswitchPlan {
+                    preheader,
+                    header,
+                    loop_blocks,
+                    l_true_blocks: analysis.l_true_blocks,
+                    l_false_blocks: analysis.l_false_blocks,
+                    reach_out_true: analysis.reach_out_true,
+                    reach_out_false: analysis.reach_out_false,
+                    kind: UnswitchKind::InvariantBr { inv_cond, br_inst: term, hoist_cmp },
+                    inst_block,
+                    direct_exit: analysis.direct_exit,
+                    escaped_vals: analysis.escaped_vals,
+                });
+            }
+        }
+
+        // 2. Otherwise check the single-exit escape invariant and look for a nested inner loop
+        //    whose first-iteration header guard `cond(init_args)` is outer-loop-invariant.
         let mut escaped_vals: Vec<u32, A> = Vec::new_in(alloc);
+        let mut escaped_user_blocks: Vec<u32, A> = Vec::new_in(alloc);
         for b in 0..blocks {
             if at(&in_loop, b) {
                 continue;
             }
-            for inst in view.block(Block(to_u32(b))) {
+            let b_u32 = to_u32(b);
+            for inst in view.block(Block(b_u32)) {
                 for_each_use(view, inst, |v| {
-                    if at(&in_loop, to_idx(at(&inst_block, to_idx(v))))
-                        && escaped_vals.scan_for(&v).is_none()
-                    {
-                        escaped_vals.push(v);
+                    if at(&in_loop, to_idx(at(&inst_block, to_idx(v)))) {
+                        if escaped_vals.scan_for(&v).is_none() {
+                            escaped_vals.push(v);
+                        }
+                        if escaped_user_blocks.scan_for(&b_u32).is_none() {
+                            escaped_user_blocks.push(b_u32);
+                        }
                     }
                 });
             }
         }
 
-        // If values escape directly without exit block params, we can promote them cleanly iff
-        // there is a single exit block whose ONLY predecessors are inside the loop!
         let direct_exit = if escaped_vals.is_empty() {
             None
         } else if exit_blocks.len() == 1
             && let Some(&ex) = exit_blocks.first()
         {
-            let all_preds_in_loop = preds
-                .get(to_idx(ex))
-                .is_some_and(|ps| ps.iter().all(|&p| at(&in_loop, to_idx(p))));
+            let ps = preds.get(to_idx(ex)).map(Vec::as_slice).unwrap_or(&[]);
+            let all_preds_in_loop = !ps.is_empty()
+                && ex > preheader
+                && !view.block_kind(Block(ex)).is_landing()
+                && ps.iter().all(|&p| at(&in_loop, to_idx(p)))
+                && escaped_user_blocks.iter().all(|&u| u >= ex);
             if all_preds_in_loop {
                 Some(ex)
             } else {
@@ -670,64 +1165,53 @@ fn find_unswitch_candidate<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Op
             continue;
         };
 
-        // 1. Look for an internal `Op::Br` whose condition is defined outside the loop (`<= preheader`),
-        //    or is a pure, flag-free `Op::Icmp`/`Op::Fcmp` inside the loop with invariant operands.
-        let mut found_kind: Option<UnswitchKind<A>> = None;
-        for &bb in &loop_blocks {
-            let term = view.terminator(Block(bb));
-            if view.op(term) == Op::Br {
-                let idx = to_idx(at(view.data, term));
-                let cv = at(view.extra, idx);
-                let cvi = to_idx(cv);
-                let cb = at(&inst_block, cvi);
-                if !at(&in_loop, to_idx(cb)) && cb <= preheader {
-                    found_kind = Some(UnswitchKind::InvariantBr {
-                        inv_cond: cv,
-                        br_inst: term,
-                        hoist_cmp: None,
-                    });
-                    break;
-                }
-                if matches!(view.op(cvi), Op::Icmp | Op::Fcmp) && at(view.flags, cvi) == 0 {
-                    let cat = to_idx(at(view.data, cvi));
-                    let lhs = at(view.extra, cat + 1);
-                    let rhs = at(view.extra, cat + 2);
-                    if is_outer_invariant(view, lhs, &in_loop, &inst_block, preheader)
-                        && is_outer_invariant(view, rhs, &in_loop, &inst_block, preheader)
-                    {
-                        found_kind = Some(UnswitchKind::InvariantBr {
-                            inv_cond: cv,
-                            br_inst: term,
-                            hoist_cmp: Some(cvi),
-                        });
-                        break;
-                    }
-                }
-            }
-        }
-
-        // 2. Otherwise look for a nested inner loop whose first-iteration header guard
-        //    `cond(init_args)` is outer-loop-invariant (e.g. `0 < n` in `bsearch_batch`).
-        if found_kind.is_none() {
-            found_kind = find_inner_loop_guard_candidate(
-                view,
-                preheader,
-                header,
-                &loop_blocks,
-                &in_loop,
-                &inst_block,
-                &preds,
-                &escaped_vals,
-                alloc,
-            );
-        }
-
-        let Some(kind) = found_kind else {
+        let Some(kind) = find_inner_loop_guard_candidate(
+            view,
+            preheader,
+            header,
+            &loop_blocks,
+            &in_loop,
+            &inst_block,
+            &preds,
+            &escaped_vals,
+            alloc,
+        ) else {
             for &bb in &loop_blocks {
                 set_at(&mut in_loop, to_idx(bb), false);
             }
             continue;
         };
+
+        let mut l_true_blocks: Vec<u32, A> = Vec::with_capacity_in(loop_blocks.len(), alloc);
+        let mut l_false_blocks: Vec<u32, A> = Vec::with_capacity_in(loop_blocks.len(), alloc);
+        if let UnswitchKind::InnerLoopGuard { inner_header, inner_body, ref inner_blocks, .. } = kind {
+            let mut in_inner = filled(blocks, false, &alloc);
+            for &ib in inner_blocks {
+                set_at(&mut in_inner, to_idx(ib), true);
+            }
+            for &lb in &loop_blocks {
+                if lb < inner_header && !at(&in_inner, to_idx(lb)) {
+                    l_true_blocks.push(lb);
+                }
+            }
+            l_true_blocks.push(inner_body);
+            for &ib in inner_blocks {
+                if ib != inner_header && ib != inner_body {
+                    l_true_blocks.push(ib);
+                }
+            }
+            l_true_blocks.push(inner_header);
+            for &lb in &loop_blocks {
+                if lb > inner_header && !at(&in_inner, to_idx(lb)) {
+                    l_true_blocks.push(lb);
+                }
+            }
+            for &lb in &loop_blocks {
+                if !at(&in_inner, to_idx(lb)) {
+                    l_false_blocks.push(lb);
+                }
+            }
+        }
 
         for &bb in &loop_blocks {
             set_at(&mut in_loop, to_idx(bb), false);
@@ -736,6 +1220,10 @@ fn find_unswitch_candidate<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> Op
             preheader,
             header,
             loop_blocks,
+            l_true_blocks,
+            l_false_blocks,
+            reach_out_true: Vec::new_in(alloc),
+            reach_out_false: Vec::new_in(alloc),
             kind,
             inst_block,
             direct_exit,
@@ -1019,49 +1507,6 @@ pub fn unswitch_loops<A: Allocator + Copy>(
             set_at(&mut in_loop, to_idx(bb), true);
         }
 
-        // Compute ordered block lists for `L_true` and `L_false`.
-        // For `InnerLoopGuard`, `L_true` rotates `inner_body` immediately after `< inner_header`
-        // (and places `inner_header` at the bottom of `inner_blocks` as the latch check), while
-        // `L_false` omits `inner_blocks` completely.
-        let mut l_true_blocks: Vec<u32, A> = Vec::with_capacity_in(plan.loop_blocks.len(), alloc);
-        let mut l_false_blocks: Vec<u32, A> = Vec::with_capacity_in(plan.loop_blocks.len(), alloc);
-        match &plan.kind {
-            UnswitchKind::InvariantBr { .. } => {
-                for &lb in &plan.loop_blocks {
-                    l_true_blocks.push(lb);
-                    l_false_blocks.push(lb);
-                }
-            }
-            UnswitchKind::InnerLoopGuard { inner_header, inner_body, inner_blocks, .. } => {
-                let mut in_inner = filled(blocks, false, &alloc);
-                for &ib in inner_blocks {
-                    set_at(&mut in_inner, to_idx(ib), true);
-                }
-                for &lb in &plan.loop_blocks {
-                    if lb < *inner_header && !at(&in_inner, to_idx(lb)) {
-                        l_true_blocks.push(lb);
-                    }
-                }
-                l_true_blocks.push(*inner_body);
-                for &ib in inner_blocks {
-                    if ib != *inner_header && ib != *inner_body {
-                        l_true_blocks.push(ib);
-                    }
-                }
-                l_true_blocks.push(*inner_header);
-                for &lb in &plan.loop_blocks {
-                    if lb > *inner_header && !at(&in_inner, to_idx(lb)) {
-                        l_true_blocks.push(lb);
-                    }
-                }
-                for &lb in &plan.loop_blocks {
-                    if !at(&in_inner, to_idx(lb)) {
-                        l_false_blocks.push(lb);
-                    }
-                }
-            }
-        }
-
         // New block layout:
         //   0..=preheader -> unchanged
         //   L_true blocks (immediately after preheader -> hot fast loop!)
@@ -1079,11 +1524,11 @@ pub fn unswitch_loops<A: Allocator + Copy>(
             set_at(&mut blk_map_false, b, next_blk);
             next_blk += 1;
         }
-        for &lb in &l_true_blocks {
+        for &lb in &plan.l_true_blocks {
             set_at(&mut blk_map_true, to_idx(lb), next_blk);
             next_blk += 1;
         }
-        for &lb in &l_false_blocks {
+        for &lb in &plan.l_false_blocks {
             set_at(&mut blk_map_false, to_idx(lb), next_blk);
             next_blk += 1;
         }
@@ -1269,7 +1714,7 @@ pub fn unswitch_loops<A: Allocator + Copy>(
         // 2. Emit `L_true` clone.
         match &plan.kind {
             UnswitchKind::InvariantBr { br_inst, .. } => {
-                for &lb in &l_true_blocks {
+                for &lb in &plan.l_true_blocks {
                     func.block_starts.push(to_u32(func.ops.len()));
                     func.block_kinds.push(at(v.block_kinds, to_idx(lb)));
                     let range = v.block(Block(lb));
@@ -1312,7 +1757,7 @@ pub fn unswitch_loops<A: Allocator + Copy>(
                 ..
             } => {
                 let ih_params = v.params(Block(*inner_header));
-                for &lb in &l_true_blocks {
+                for &lb in &plan.l_true_blocks {
                     func.block_starts.push(to_u32(func.ops.len()));
                     func.block_kinds.push(at(v.block_kinds, to_idx(lb)));
                     let range = v.block(Block(lb));
@@ -1431,7 +1876,7 @@ pub fn unswitch_loops<A: Allocator + Copy>(
         // 3. Emit `L_false` clone.
         match &plan.kind {
             UnswitchKind::InvariantBr { br_inst, .. } => {
-                for &lb in &l_false_blocks {
+                for &lb in &plan.l_false_blocks {
                     func.block_starts.push(to_u32(func.ops.len()));
                     func.block_kinds.push(at(v.block_kinds, to_idx(lb)));
                     let range = v.block(Block(lb));
@@ -1471,7 +1916,7 @@ pub fn unswitch_loops<A: Allocator + Copy>(
                 ..
             } => {
                 let ih_params = v.params(Block(*inner_header));
-                for &lb in &l_false_blocks {
+                for &lb in &plan.l_false_blocks {
                     func.block_starts.push(to_u32(func.ops.len()));
                     func.block_kinds.push(at(v.block_kinds, to_idx(lb)));
                     let range = v.block(Block(lb));
@@ -1525,7 +1970,9 @@ pub fn unswitch_loops<A: Allocator + Copy>(
             }
         }
 
-        // 4. Emit remaining non-loop blocks after `preheader` (inserting promoted params on `direct_exit`!).
+        // 4. Emit remaining non-loop blocks after `preheader` (inserting promoted params on `direct_exit`
+        //    and binding true-only/false-only exit regions directly to their dominating copy's values!).
+        let mut val_map_tmp: Vec<u32, A> = Vec::new_in(alloc);
         for b in (preheader_idx + 1)..blocks {
             if at(&in_loop, b) {
                 continue;
@@ -1551,9 +1998,35 @@ pub fn unswitch_loops<A: Allocator + Copy>(
                     set_at(&mut val_map_out, to_idx(ev), p_idx);
                 }
             }
-            for inst in params.end..range.end {
-                let nv = emit_remapped(&v, inst, &val_map_out, &blk_map_outside, None, &[], &mut func);
-                set_at(&mut val_map_out, inst, nv);
+            let true_only = at(&plan.reach_out_true, b) && !at(&plan.reach_out_false, b);
+            let false_only = at(&plan.reach_out_false, b) && !at(&plan.reach_out_true, b);
+            if true_only || false_only {
+                if val_map_tmp.len() != len {
+                    val_map_tmp = filled(len, NONE, &alloc);
+                }
+                for (dst, &src) in val_map_tmp.iter_mut().zip(val_map_out.iter()) {
+                    *dst = src;
+                }
+                let (copy_blocks, copy_vals) = if true_only {
+                    (plan.l_true_blocks.as_slice(), val_map_true.as_slice())
+                } else {
+                    (plan.l_false_blocks.as_slice(), val_map_false.as_slice())
+                };
+                for &lb in copy_blocks {
+                    for li in v.block(Block(lb)) {
+                        set_at(&mut val_map_tmp, li, at(copy_vals, li));
+                    }
+                }
+                for inst in params.end..range.end {
+                    let nv = emit_remapped(&v, inst, &val_map_tmp, &blk_map_outside, None, &[], &mut func);
+                    set_at(&mut val_map_out, inst, nv);
+                    set_at(&mut val_map_tmp, inst, nv);
+                }
+            } else {
+                for inst in params.end..range.end {
+                    let nv = emit_remapped(&v, inst, &val_map_out, &blk_map_outside, None, &[], &mut func);
+                    set_at(&mut val_map_out, inst, nv);
+                }
             }
         }
 
@@ -1878,6 +2351,289 @@ mod tests {
                     panic!("unsw eval failed");
                 };
                 assert_eq!(orig, unsw, "loop-local icmp unswitch mismatch for n={nv}, m={mv}");
+            }
+        }
+    }
+
+    #[test]
+    fn unswitch_hoists_invariant_guard_from_multi_exit_nested_probe_loop() {
+        // Exact `hash_probe_batch` CFG: multi-exit outer+inner probe loop where
+        // - `ret_blk` is shared (reads escaped `sum` directly, no edge arg),
+        // - `panic_keys` is false-only (reads escaped `slot` directly, then traps),
+        // - `panic_vals` is true-only (reads escaped `slot` directly, then traps).
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+
+        let keys_slot = b.slot(16 * 8, 3, SlotKind::Temp);
+        let vals_slot = b.slot(16 * 8, 3, SlotKind::Temp);
+        let queries_slot = b.slot(8 * 8, 3, SlotKind::Temp);
+        let err_slot = b.slot(8, 3, SlotKind::Temp);
+
+        let [
+            entry,
+            outer_hdr,
+            probe_init,
+            inner_hdr,
+            probe,
+            hit_check,
+            hit_add,
+            miss_check,
+            miss_step,
+            ret_blk,
+            panic_keys,
+            panic_vals,
+        ] = [(); 12].map(|_| b.create_block(BlockKind::Normal));
+
+        const HASH_C: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut table_keys = [0u64; 16];
+        let mut table_vals = [0u64; 16];
+        let base_k = 101u64;
+        let base_bucket = (base_k.wrapping_mul(HASH_C) >> 44) & 15;
+        let mut colliding_k = 0u64;
+        for cand in 200..2000u64 {
+            if ((cand.wrapping_mul(HASH_C) >> 44) & 15) == base_bucket {
+                colliding_k = cand;
+                break;
+            }
+        }
+        assert_ne!(colliding_k, 0, "must find a colliding key for 16 buckets");
+        let seed_keys = [base_k, colliding_k, 303, 404, 505, 606];
+        for (idx, &k) in seed_keys.iter().enumerate() {
+            let mut s = (k.wrapping_mul(HASH_C) >> 44) & 15;
+            while table_keys[s as usize] != 0 {
+                s = (s + 1) & 15;
+            }
+            table_keys[s as usize] = k;
+            table_vals[s as usize] = (idx as u64 + 1) * 111 + 7;
+        }
+        let queries = [base_k, colliding_k, 999_999, 303, 888_888, 505, 777_777, 606];
+
+        b.begin(entry);
+        let keys_len = b.param(Ty::I64);
+        let vals_len = b.param(Ty::I64);
+        let queries_len = b.param(Ty::I64);
+        let keys_ptr = b.slot_addr(keys_slot);
+        let vals_ptr = b.slot_addr(vals_slot);
+        let queries_ptr = b.slot_addr(queries_slot);
+        let err_ptr = b.slot_addr(err_slot);
+        for (idx, (&tk, &tv)) in table_keys.iter().zip(table_vals.iter()).enumerate() {
+            let kv = b.iconst(Ty::I64, u128::from(tk));
+            let vv = b.iconst(Ty::I64, u128::from(tv));
+            let off = (idx * 8) as i32;
+            b.store(Flags::NONE, kv, keys_ptr, off, MemAttrs::aligned(3));
+            b.store(Flags::NONE, vv, vals_ptr, off, MemAttrs::aligned(3));
+        }
+        for (idx, &qv) in queries.iter().enumerate() {
+            let q_inst = b.iconst(Ty::I64, u128::from(qv));
+            b.store(Flags::NONE, q_inst, queries_ptr, (idx * 8) as i32, MemAttrs::aligned(3));
+        }
+        let zero = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        let three = b.iconst(Ty::I64, 3);
+        let eight = b.iconst(Ty::I64, 8);
+        let shift44 = b.iconst(Ty::I64, 44);
+        let hash_c = b.iconst(Ty::I64, u128::from(HASH_C));
+        let q_bytes = b.binary(Op::Shl, Flags::NONE, queries_len, three);
+        let end = b.ptr_add(Flags::NONE, queries_ptr, q_bytes);
+        let mask = b.binary(Op::Sub, Flags::NONE, keys_len, one);
+        b.jump((outer_hdr, &[queries_ptr, zero]));
+
+        b.begin(outer_hdr);
+        let ptr = b.param(Ty::PTR);
+        let sum = b.param(Ty::I64);
+        let done = b.icmp(IntCond::Eq, ptr, end);
+        b.br(Flags::NONE, done, (ret_blk, &[]), (probe_init, &[]));
+
+        b.begin(probe_init);
+        let q = b.load(Ty::I64, Flags::NONE, ptr, 0, MemAttrs::aligned(3));
+        let h1 = b.binary(Op::Mul, Flags::NONE, q, hash_c);
+        let h2 = b.binary(Op::Lshr, Flags::NONE, h1, shift44);
+        let slot0 = b.binary(Op::And, Flags::NONE, h2, mask);
+        b.jump((inner_hdr, &[slot0]));
+
+        b.begin(inner_hdr);
+        let slot = b.param(Ty::I64);
+        let has_keys = b.icmp(IntCond::Ne, keys_len, zero);
+        b.br(Flags::NONE, has_keys, (probe, &[]), (panic_keys, &[]));
+
+        b.begin(probe);
+        let k_off = b.binary(Op::Shl, Flags::NONE, slot, three);
+        let kp = b.ptr_add(Flags::NONE, keys_ptr, k_off);
+        let k = b.load(Ty::I64, Flags::NONE, kp, 0, MemAttrs::aligned(3));
+        let is_hit = b.icmp(IntCond::Eq, k, q);
+        b.br(Flags::NONE, is_hit, (hit_check, &[]), (miss_check, &[]));
+
+        b.begin(hit_check);
+        let in_vals = b.icmp(IntCond::Ult, slot, vals_len);
+        b.br(Flags::NONE, in_vals, (hit_add, &[]), (panic_vals, &[]));
+
+        b.begin(hit_add);
+        let v_off = b.binary(Op::Shl, Flags::NONE, slot, three);
+        let vp = b.ptr_add(Flags::NONE, vals_ptr, v_off);
+        let val = b.load(Ty::I64, Flags::NONE, vp, 0, MemAttrs::aligned(3));
+        let sum2 = b.binary(Op::Add, Flags::NONE, sum, val);
+        let ptr2 = b.ptr_add(Flags::NONE, ptr, eight);
+        b.jump((outer_hdr, &[ptr2, sum2]));
+
+        b.begin(miss_check);
+        let is_empty = b.icmp(IntCond::Eq, k, zero);
+        let ptr_miss = b.ptr_add(Flags::NONE, ptr, eight);
+        b.br(Flags::NONE, is_empty, (outer_hdr, &[ptr_miss, sum]), (miss_step, &[]));
+
+        b.begin(miss_step);
+        let slot_inc = b.binary(Op::Add, Flags::NONE, slot, one);
+        let slot2 = b.binary(Op::And, Flags::NONE, slot_inc, mask);
+        b.jump((inner_hdr, &[slot2]));
+
+        b.begin(ret_blk);
+        b.ret(&[sum]);
+
+        b.begin(panic_keys);
+        b.store(Flags::NONE, slot, err_ptr, 0, MemAttrs::aligned(3));
+        b.trap(1);
+
+        b.begin(panic_vals);
+        b.store(Flags::NONE, slot, err_ptr, 0, MemAttrs::aligned(3));
+        b.trap(2);
+
+        let func = b.finish_checked().unwrap();
+
+        let out = unswitch_loops(func.view(), 2, alloc).unwrap();
+        assert!(out.stats.loops_unswitched >= 1, "expected multi-exit probe loop to unswitch");
+        assert!(verify(out.func.view()).is_ok());
+
+        // Entry now branches on hoisted `Ne(keys_len, 0)` and NO `keys_len` comparison remains
+        // anywhere inside the unswitched fast loop!
+        let ov = out.func.view();
+        assert_eq!(ov.op(ov.terminator(Block(0))), Op::Br);
+        for blk in 1..ov.blocks() {
+            for inst in ov.block(Block(to_u32(blk))) {
+                if ov.op(inst) == Op::Icmp {
+                    let cat = to_idx(at(ov.data, inst));
+                    let lhs = at(ov.extra, cat + 1);
+                    let rhs = at(ov.extra, cat + 2);
+                    assert!(
+                        lhs != 0 && rhs != 0,
+                        "keys_len guard must not remain inside unswitched loop (block {blk}, inst {inst})"
+                    );
+                }
+            }
+        }
+
+        // 1. `keys_len == 0, queries_len == 0` -> returns `0` (must NOT trap!).
+        {
+            let args = [Val::Int(0), Val::Int(0), Val::Int(0)];
+            let orig = eval::run_in(func.view(), &args, 50_000, alloc).unwrap();
+            let unsw = eval::run_in(ov, &args, 50_000, alloc).unwrap();
+            assert_eq!(orig, unsw);
+            assert!(matches!(unsw, Outcome::Returned(ref vals) if vals.as_slice() == [Val::Int(0)]));
+        }
+
+        // 2. `keys_len == 0, queries_len == 2` -> traps identically to original!
+        {
+            let args = [Val::Int(0), Val::Int(0), Val::Int(2)];
+            let orig = eval::run_in(func.view(), &args, 50_000, alloc).unwrap();
+            let unsw = eval::run_in(ov, &args, 50_000, alloc).unwrap();
+            assert!(matches!(orig, Outcome::Trapped(_)));
+            assert_eq!(orig, unsw);
+        }
+
+        // 3. `keys_len == 16, vals_len == 16`, mix of hits, misses, and linear-probe collisions -> identical `sum`!
+        {
+            let args = [Val::Int(16), Val::Int(16), Val::Int(8)];
+            let orig = eval::run_in(func.view(), &args, 50_000, alloc).unwrap();
+            let unsw = eval::run_in(ov, &args, 50_000, alloc).unwrap();
+            assert!(matches!(orig, Outcome::Returned(_)));
+            assert_eq!(orig, unsw);
+        }
+
+        // 4. `keys_len == 16, vals_len == 0, queries_len == 8` -> traps via true-only `panic_vals` identically!
+        {
+            let args = [Val::Int(16), Val::Int(0), Val::Int(8)];
+            let orig = eval::run_in(func.view(), &args, 50_000, alloc).unwrap();
+            let unsw = eval::run_in(ov, &args, 50_000, alloc).unwrap();
+            assert!(matches!(orig, Outcome::Trapped(_)));
+            assert_eq!(orig, unsw);
+        }
+    }
+
+    #[test]
+    fn unswitch_rejects_shared_escape_with_two_shared_exits() {
+        // Soundness negative test: `acc` (defined in `header`) escapes directly without exit params
+        // to TWO distinct shared exits (`exit_a` and `exit_b`), both reachable from `L_true` and `L_false`.
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I1), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let [entry, header, body, fast, slow, check_limit, latch, exit_a, exit_b] =
+            [(); 9].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let n = b.param(Ty::I64);
+        let mode = b.param(Ty::I1);
+        let limit = b.param(Ty::I64);
+        let zero = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        let three = b.iconst(Ty::I64, 3);
+        let five = b.iconst(Ty::I64, 5);
+        b.jump((header, &[zero, zero]));
+
+        b.begin(header);
+        let i = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let done = b.icmp(IntCond::Uge, i, n);
+        b.br(Flags::NONE, done, (exit_a, &[]), (body, &[]));
+
+        b.begin(body);
+        b.br(Flags::NONE, mode, (fast, &[]), (slow, &[]));
+
+        b.begin(fast);
+        let acc_f = b.binary(Op::Add, Flags::NONE, acc, three);
+        b.jump((check_limit, &[acc_f]));
+
+        b.begin(slow);
+        let acc_s = b.binary(Op::Add, Flags::NONE, acc, five);
+        b.jump((check_limit, &[acc_s]));
+
+        b.begin(check_limit);
+        let acc2 = b.param(Ty::I64);
+        let over = b.icmp(IntCond::Uge, acc2, limit);
+        b.br(Flags::NONE, over, (exit_b, &[]), (latch, &[]));
+
+        b.begin(latch);
+        let i2 = b.binary(Op::Add, Flags::NONE, i, one);
+        b.jump((header, &[i2, acc2]));
+
+        b.begin(exit_a);
+        b.ret(&[acc]);
+
+        b.begin(exit_b);
+        b.ret(&[acc]);
+
+        let func = b.finish_checked().unwrap();
+
+        let out = unswitch_loops(func.view(), 2, alloc).unwrap();
+        assert_eq!(out.stats.loops_unswitched, 0, "must reject loop with shared value escaping via two shared exits");
+        assert!(verify(out.func.view()).is_ok());
+
+        for &m in &[0u128, 1u128] {
+            for &lim in &[7u128, 100u128] {
+                let args = [Val::Int(5), Val::Int(m), Val::Int(lim)];
+                let orig = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+                let unsw = eval::run_in(out.func.view(), &args, 10_000, alloc).unwrap();
+                assert_eq!(orig, unsw);
             }
         }
     }
