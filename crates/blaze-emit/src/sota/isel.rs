@@ -201,6 +201,18 @@ enum Fusion {
     EorRor { a: u32, b: u32, shift: u32, imm_inst: u32 },
     /// `or`/`xor(shl(x, k), lshr(x, bits - k))` -> single `extr rd, x, x, #(bits - k)`.
     RorImm { x: u32, ror_amt: u32, imm1: u32, imm2: u32 },
+    /// `and(lshr(src, lsb), (1 << width) - 1)` -> single `ubfx rd, src, #lsb, #width`.
+    Ubfx { src: u32, lsb: u32, width: u32, shift_imm: u32, mask_imm: u32 },
+    /// `or(and(dst, !((1 << width) - 1)), and(src [>> lsb], (1 << width) - 1))` -> `bfxil rd, src, #lsb, #width`.
+    Bfxil {
+        dst: u32,
+        src: u32,
+        lsb: u32,
+        width: u32,
+        dst_mask_imm: u32,
+        src_mask_imm: u32,
+        shift_imm: u32,
+    },
     /// `br(icmp(cond, a, b), then, else)` -> fused `cmp`/`cbz` + `b.cond`.
     CmpBr { cond: IntCond, a: u32, b: u32, op_ty: Ty },
     /// `br(fcmp(cond, a, b), then, else)` -> fused `fcmp` + `b.cond`.
@@ -2610,6 +2622,119 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                     set_at(&mut skip_emit, to_idx(lhs), true);
                     continue;
                 }
+                if op == Op::And {
+                    // Fuse `and(lshr(x, lsb), (1 << width) - 1)` -> 1-instruction `ubfx rd, x, #lsb, #width`!
+                    let try_ubfx = |sh_cand: u32, mask_cand: u32| -> Option<(usize, Fusion)> {
+                        let mask_v = at_opt(&const_u64, to_idx(mask_cand))?;
+                        let width = is_low_bitmask(mask_v)?;
+                        let si = to_idx(sh_cand);
+                        if at_u32(&use_count, si) != 1
+                            || at_u32(&inst_block, si) != b
+                            || view.op(si) != Op::Lshr
+                            || at_bool(&skip_emit, si)
+                            || at_fusion(&fusion, si) != Fusion::None
+                        {
+                            return None;
+                        }
+                        let sat = to_idx(at_u32(view.data, si));
+                        let src = at_u32(view.extra, sat);
+                        let shift_imm = at_u32(view.extra, sat + 1);
+                        let lsb_u64 = at_opt(&const_u64, to_idx(shift_imm))?;
+                        if lsb_u64 >= u64::from(bits) {
+                            return None;
+                        }
+                        let lsb = trunc_u32(lsb_u64);
+                        if width >= 1 && lsb + width <= bits {
+                            Some((
+                                si,
+                                Fusion::Ubfx {
+                                    src,
+                                    lsb,
+                                    width,
+                                    shift_imm,
+                                    mask_imm: mask_cand,
+                                },
+                            ))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((si, fus)) = try_ubfx(lhs, rhs).or_else(|| try_ubfx(rhs, lhs)) {
+                        set_at(&mut fusion, inst, fus);
+                        set_at(&mut skip_emit, si, true);
+                        continue;
+                    }
+                }
+                if op == Op::Or {
+                    // Fuse `or(and(dst, !mask), and(src [>> lsb], mask))` where `mask == (1 << w) - 1`
+                    // -> `bfxil rd, src, #lsb, #w`!
+                    let li = to_idx(lhs);
+                    let ri = to_idx(rhs);
+                    if at_u32(&use_count, li) == 1
+                        && at_u32(&use_count, ri) == 1
+                        && at_u32(&inst_block, li) == b
+                        && at_u32(&inst_block, ri) == b
+                        && !at_bool(&skip_emit, li)
+                        && !at_bool(&skip_emit, ri)
+                        && view.op(li) == Op::And
+                        && view.op(ri) == Op::And
+                    {
+                        let type_mask = if bits == 64 { u64::MAX } else { 0xffff_ffffu64 };
+                        let try_bfxil = |dst_and: usize, src_and: usize| -> Option<Fusion> {
+                            if at_fusion(&fusion, dst_and) != Fusion::None {
+                                return None;
+                            }
+                            let (src, lsb, width, src_mask_imm, shift_imm) = match at_fusion(&fusion, src_and) {
+                                Fusion::Ubfx { src, lsb, width, shift_imm, mask_imm } => {
+                                    (src, lsb, width, mask_imm, shift_imm)
+                                }
+                                Fusion::None => {
+                                    let sat = to_idx(at_u32(view.data, src_and));
+                                    let sa = at_u32(view.extra, sat);
+                                    let sb = at_u32(view.extra, sat + 1);
+                                    if let Some(w) = at_opt(&const_u64, to_idx(sb)).and_then(is_low_bitmask) {
+                                        (sa, 0, w, sb, u32::MAX)
+                                    } else if let Some(w) = at_opt(&const_u64, to_idx(sa)).and_then(is_low_bitmask) {
+                                        (sb, 0, w, sa, u32::MAX)
+                                    } else {
+                                        return None;
+                                    }
+                                }
+                                _ => return None,
+                            };
+                            if width == 0 || width >= bits || lsb + width > bits {
+                                return None;
+                            }
+                            let low_mask = (1u64 << width) - 1;
+                            let want_dst_mask = (!low_mask) & type_mask;
+                            let dat = to_idx(at_u32(view.data, dst_and));
+                            let da = at_u32(view.extra, dat);
+                            let db = at_u32(view.extra, dat + 1);
+                            let (dst, dst_mask_imm) = if at_opt(&const_u64, to_idx(db)) == Some(want_dst_mask) {
+                                (da, db)
+                            } else if at_opt(&const_u64, to_idx(da)) == Some(want_dst_mask) {
+                                (db, da)
+                            } else {
+                                return None;
+                            };
+                            Some(Fusion::Bfxil {
+                                dst,
+                                src,
+                                lsb,
+                                width,
+                                dst_mask_imm,
+                                src_mask_imm,
+                                shift_imm,
+                            })
+                        };
+                        if let Some(fus) = try_bfxil(li, ri).or_else(|| try_bfxil(ri, li)) {
+                            set_at(&mut fusion, inst, fus);
+                            set_at(&mut skip_emit, li, true);
+                            set_at(&mut skip_emit, ri, true);
+                            continue;
+                        }
+                    }
+                }
                 if matches!(op, Op::Or | Op::Xor) {
                     // Fuse open-coded rotate `(x << k) | (x >> (bits - k))` -> 1-instruction `extr`/`extr_w`!
                     let li = to_idx(lhs);
@@ -3470,6 +3595,17 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
             Fusion::RorImm { imm1, imm2, .. } => {
                 inc_u32(&mut imm_uses, to_idx(imm1));
                 inc_u32(&mut imm_uses, to_idx(imm2));
+            }
+            Fusion::Ubfx { shift_imm, mask_imm, .. } => {
+                inc_u32(&mut imm_uses, to_idx(shift_imm));
+                inc_u32(&mut imm_uses, to_idx(mask_imm));
+            }
+            Fusion::Bfxil { dst_mask_imm, src_mask_imm, shift_imm, .. } => {
+                inc_u32(&mut imm_uses, to_idx(dst_mask_imm));
+                inc_u32(&mut imm_uses, to_idx(src_mask_imm));
+                if shift_imm != u32::MAX {
+                    inc_u32(&mut imm_uses, to_idx(shift_imm));
+                }
             }
             Fusion::MemScaledIdx { shift_imm, .. } => {
                 inc_u32(&mut imm_uses, to_idx(shift_imm));
@@ -7589,36 +7725,43 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                 Op::And => {
                     let (rd, sp) = dst_gpr(inst);
                     let w32 = bits == 32;
-                    if let Fusion::Bic { a, b: nb } = at_fusion(&fusion, inst) {
-                        let ra = load_gpr(&mut words, a, X16);
-                        let rb = load_gpr(&mut words, nb, X17);
-                        words.push(enc::sf(!w32, enc::bic(rd, ra, rb)));
-                    } else {
-                        let at = to_idx(at_u32(view.data, inst));
-                        let lhs = at_u32(view.extra, at);
-                        let rhs = at_u32(view.extra, at + 1);
-                        if let Some(nrs) = (bits == 64 || w32)
-                            .then(|| at_opt(&const_u64, to_idx(rhs)).and_then(|v| enc::logical_imm(v, bits)))
-                            .flatten()
-                        {
-                            let rl = load_gpr(&mut words, lhs, X16);
-                            words.push(enc::sf(!w32, enc::and_imm_nrs(rd, rl, u32_of(nrs))));
-                        } else if let Some(nrs) = (bits == 64 || w32)
-                            .then(|| at_opt(&const_u64, to_idx(lhs)).and_then(|v| enc::logical_imm(v, bits)))
-                            .flatten()
-                        {
-                            let rr = load_gpr(&mut words, rhs, X16);
-                            words.push(enc::sf(!w32, enc::and_imm_nrs(rd, rr, u32_of(nrs))));
-                        } else if let Some(k) = at_opt(&const_u64, to_idx(rhs)).and_then(is_low_bitmask) {
-                            let rl = load_gpr(&mut words, lhs, X16);
-                            words.push(enc::ubfm(rd, rl, 0, k - 1));
-                        } else if let Some(k) = at_opt(&const_u64, to_idx(lhs)).and_then(is_low_bitmask) {
-                            let rr = load_gpr(&mut words, rhs, X16);
-                            words.push(enc::ubfm(rd, rr, 0, k - 1));
-                        } else {
-                            let rl = load_gpr(&mut words, lhs, X16);
-                            let rr = load_gpr(&mut words, rhs, X17);
-                            words.push(enc::sf(!w32, enc::and(rd, rl, rr)));
+                    match at_fusion(&fusion, inst) {
+                        Fusion::Bic { a, b: nb } => {
+                            let ra = load_gpr(&mut words, a, X16);
+                            let rb = load_gpr(&mut words, nb, X17);
+                            words.push(enc::sf(!w32, enc::bic(rd, ra, rb)));
+                        }
+                        Fusion::Ubfx { src, lsb, width, .. } => {
+                            let rs = load_gpr(&mut words, src, X16);
+                            words.push(enc::ubfx(!w32, rd, rs, lsb, width));
+                        }
+                        _ => {
+                            let at = to_idx(at_u32(view.data, inst));
+                            let lhs = at_u32(view.extra, at);
+                            let rhs = at_u32(view.extra, at + 1);
+                            if let Some(nrs) = (bits == 64 || w32)
+                                .then(|| at_opt(&const_u64, to_idx(rhs)).and_then(|v| enc::logical_imm(v, bits)))
+                                .flatten()
+                            {
+                                let rl = load_gpr(&mut words, lhs, X16);
+                                words.push(enc::sf(!w32, enc::and_imm_nrs(rd, rl, u32_of(nrs))));
+                            } else if let Some(nrs) = (bits == 64 || w32)
+                                .then(|| at_opt(&const_u64, to_idx(lhs)).and_then(|v| enc::logical_imm(v, bits)))
+                                .flatten()
+                            {
+                                let rr = load_gpr(&mut words, rhs, X16);
+                                words.push(enc::sf(!w32, enc::and_imm_nrs(rd, rr, u32_of(nrs))));
+                            } else if let Some(k) = at_opt(&const_u64, to_idx(rhs)).and_then(is_low_bitmask) {
+                                let rl = load_gpr(&mut words, lhs, X16);
+                                words.push(enc::ubfm(rd, rl, 0, k - 1));
+                            } else if let Some(k) = at_opt(&const_u64, to_idx(lhs)).and_then(is_low_bitmask) {
+                                let rr = load_gpr(&mut words, rhs, X16);
+                                words.push(enc::ubfm(rd, rr, 0, k - 1));
+                            } else {
+                                let rl = load_gpr(&mut words, lhs, X16);
+                                let rr = load_gpr(&mut words, rhs, X17);
+                                words.push(enc::sf(!w32, enc::and(rd, rl, rr)));
+                            }
                         }
                     }
                     if let Some(s) = sp {
@@ -7641,6 +7784,22 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             } else {
                                 enc::extr(rd, rx, rx, ror_amt)
                             });
+                        }
+                        Fusion::Bfxil { dst, src, lsb, width, .. } => {
+                            let rdst = load_gpr(&mut words, dst, X16);
+                            let rsrc = load_gpr(&mut words, src, X17);
+                            if rd == rsrc && rd != rdst {
+                                if rsrc != X17 {
+                                    words.push(enc::mov(X17, rsrc));
+                                }
+                                words.push(enc::mov(rd, rdst));
+                                words.push(enc::bfxil(!w32, rd, X17, lsb, width));
+                            } else {
+                                if rd != rdst {
+                                    words.push(enc::mov(rd, rdst));
+                                }
+                                words.push(enc::bfxil(!w32, rd, rsrc, lsb, width));
+                            }
                         }
                         _ => {
                             let at = to_idx(at_u32(view.data, inst));

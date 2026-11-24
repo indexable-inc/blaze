@@ -417,6 +417,34 @@ pub(crate) const fn ubfm(rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
     0xd340_0000 | (immr << 16) | (imms << 10) | (rn << 5) | rd
 }
 
+/// `ubfx xd/wd, xn/wn, #lsb, #width` (C6.2.417: alias of `ubfm` with `immr = lsb`, `imms = lsb + width - 1`).
+pub(crate) const fn ubfx(is64: bool, rd: Reg, rn: Reg, lsb: u32, width: u32) -> u32 {
+    if is64 {
+        ubfm(rd, rn, lsb & 63, (lsb + width - 1) & 63)
+    } else {
+        ubfm_w(rd, rn, lsb & 31, (lsb + width - 1) & 31)
+    }
+}
+
+/// `bfm xd, xn, #immr, #imms` (C6.2.30: 64-bit bitfield move; `N=1`).
+pub(crate) const fn bfm(rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
+    0xb340_0000 | ((immr & 63) << 16) | ((imms & 63) << 10) | (rn << 5) | rd
+}
+
+/// `bfm wd, wn, #immr, #imms` (C6.2.30: 32-bit bitfield move; `N=0`).
+pub(crate) const fn bfm_w(rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
+    0x3300_0000 | ((immr & 31) << 16) | ((imms & 31) << 10) | (rn << 5) | rd
+}
+
+/// `bfxil xd/wd, xn/wn, #lsb, #width` (C6.2.31: alias of `bfm` with `immr = lsb`, `imms = lsb + width - 1`).
+pub(crate) const fn bfxil(is64: bool, rd: Reg, rn: Reg, lsb: u32, width: u32) -> u32 {
+    if is64 {
+        bfm(rd, rn, lsb & 63, (lsb + width - 1) & 63)
+    } else {
+        bfm_w(rd, rn, lsb & 31, (lsb + width - 1) & 31)
+    }
+}
+
 /// `sbfx xd, xn, #0, #bits`: the low `bits` (1..=63) sign-extended; `sxtb`/`sxth`/`sxtw` at
 /// 8, 16 and 32.
 pub(crate) const fn sext(rd: Reg, rn: Reg, bits: u32) -> u32 {

@@ -1804,4 +1804,170 @@ mod std_readiness_tests {
             "scaled UXTW #2 load must zero-extend low 32 bits and scale by 4"
         );
     }
+
+    #[test]
+    fn sota_ubfx_and_loop_align() {
+        let alloc = Alloc::global();
+
+        // 1. `UBFX` fusion: `(x >> 10) & 0x3FF` -> single `ubfx xd, xn, #10, #10` (`0xd34a_4c00`).
+        let ubfx_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let c10 = b.iconst(Ty::I64, 10);
+            let shifted = b.binary(Op::Lshr, Flags::NONE, x, c10);
+            let mask = b.iconst(Ty::I64, 0x3FF);
+            let extracted = b.binary(Op::And, Flags::NONE, shifted, mask);
+            b.ret(&[extracted]);
+            b.finish_checked().unwrap()
+        };
+        let em_ubfx = Sota::standalone()
+            .emit(verify(ubfx_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits UBFX fused bitfield extract");
+        let words_ubfx: std::vec::Vec<u32> = em_ubfx
+            .code
+            .as_slice()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        // `ubfx xd, xn, #10, #10` = `ubfm xd, xn, #10, #19` = `0xd340_0000 | (10 << 16) | (19 << 10) = 0xd34a_4c00`.
+        assert!(
+            words_ubfx.iter().any(|&w| (w & 0xffff_fc00) == 0xd34a_4c00),
+            "expected fused `ubfx xd, xn, #10, #10` instruction, got: {words_ubfx:#x?}"
+        );
+        let (ex_ubfx, _k1) = load_exec_with_syms(em_ubfx, &[]);
+        let f_ubfx: extern "C" fn(u64) -> u64 = unsafe { ex_ubfx.as_fn() };
+        for &x in &[0u64, u64::MAX, 0xDEAD_BEEF_CAFE_BABE, 0x3FFu64 << 10, 1u64 << 9, 1u64 << 20] {
+            assert_eq!(f_ubfx(x), (x >> 10) & 0x3FF, "ubfx mismatch for x={x:#x}");
+        }
+
+        // 2. `BFXIL` fusion: `(dst & !0xFF) | (src & 0xFF)` -> `bfxil xd, xn, #0, #8` (`0xb340_1c00`).
+        let bfxil_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::I64);
+            let src = b.param(Ty::I64);
+            let hi_mask = b.iconst(Ty::I64, (!0xFFu64) as u128);
+            let lo_mask = b.iconst(Ty::I64, 0xFF);
+            let dst_hi = b.binary(Op::And, Flags::NONE, dst, hi_mask);
+            let src_lo = b.binary(Op::And, Flags::NONE, src, lo_mask);
+            let inserted = b.binary(Op::Or, Flags::NONE, dst_hi, src_lo);
+            b.ret(&[inserted]);
+            b.finish_checked().unwrap()
+        };
+        let em_bfxil = Sota::standalone()
+            .emit(verify(bfxil_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits BFXIL fused bitfield insert");
+        let words_bfxil: std::vec::Vec<u32> = em_bfxil
+            .code
+            .as_slice()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        // `bfxil xd, xn, #0, #8` = `bfm xd, xn, #0, #7` = `0xb340_0000 | (0 << 16) | (7 << 10) = 0xb340_1c00`.
+        assert!(
+            words_bfxil.iter().any(|&w| (w & 0xffff_fc00) == 0xb340_1c00),
+            "expected fused `bfxil xd, xn, #0, #8` instruction, got: {words_bfxil:#x?}"
+        );
+        let (ex_bfxil, _k2) = load_exec_with_syms(em_bfxil, &[]);
+        let f_bfxil: extern "C" fn(u64, u64) -> u64 = unsafe { ex_bfxil.as_fn() };
+        for &(d, s) in &[
+            (0u64, u64::MAX),
+            (u64::MAX, 0u64),
+            (0xDEAD_BEEF_CAFE_BABEu64, 0x1234_5678_9ABC_DEF0u64),
+        ] {
+            assert_eq!(f_bfxil(d, s), (d & !0xFF) | (s & 0xFF), "bfxil mismatch for ({d:#x}, {s:#x})");
+        }
+
+        // 3. Simple loop with 16-byte loop-header alignment: executes cleanly & backward branches land on 16B boundary.
+        let loop_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, header, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let n = b.param(Ty::I64);
+            let zero = b.iconst(Ty::I64, 0);
+            let seed = b.iconst(Ty::I64, 0x1234);
+            b.jump((header, &[zero, seed]));
+
+            b.begin(header);
+            let i = b.param(Ty::I64);
+            let acc = b.param(Ty::I64);
+            let cont = b.icmp(IntCond::Ult, i, n);
+            b.br(Flags::NONE, cont, (body, &[]), (exit, &[]));
+
+            b.begin(body);
+            let c3 = b.iconst(Ty::I64, 3);
+            let c1 = b.iconst(Ty::I64, 1);
+            let p = b.binary(Op::Mul, Flags::NONE, acc, c3);
+            let s = b.binary(Op::Add, Flags::NONE, p, i);
+            let r = b.binary(Op::Lshr, Flags::NONE, acc, c1);
+            let next_acc = b.binary(Op::Xor, Flags::NONE, s, r);
+            let next_i = b.binary(Op::Add, Flags::NONE, i, c1);
+            b.jump((header, &[next_i, next_acc]));
+
+            b.begin(exit);
+            b.ret(&[acc]);
+            b.finish_checked().unwrap()
+        };
+        let em_loop = Sota::standalone()
+            .emit(verify(loop_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits aligned loop");
+        let words_loop: std::vec::Vec<u32> = em_loop
+            .code
+            .as_slice()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut saw_back_branch = false;
+        for (idx, &w) in words_loop.iter().enumerate() {
+            let delta = if (w & 0xfc00_0000) == 0x1400_0000 {
+                // `b <imm26>`
+                Some(((w & 0x03ff_ffff) as i32) << 6 >> 6)
+            } else if (w & 0xff00_0010) == 0x5400_0000 || (w & 0x7e00_0000) == 0x3400_0000 {
+                // `b.cond <imm19>` or `cbz`/`cbnz <imm19>`
+                Some((((w >> 5) & 0x7_ffff) as i32) << 13 >> 13)
+            } else {
+                None
+            };
+            if let Some(d) = delta {
+                if d < 0 {
+                    let target_w = (idx as isize + d as isize) as usize;
+                    if words_loop[target_w] == 0xd65f_03c0 {
+                        // Skip tail jump to shared `ret` epilogue (not a loop header).
+                        continue;
+                    }
+                    assert_eq!(
+                        target_w % 4,
+                        0,
+                        "loop-header target word {target_w} (from branch at {idx}) must be 16-byte aligned: {words_loop:#x?}"
+                    );
+                    saw_back_branch = true;
+                }
+            }
+        }
+        assert!(saw_back_branch, "expected at least one backward loop branch in {words_loop:#x?}");
+        let (ex_loop, _k3) = load_exec_with_syms(em_loop, &[]);
+        let f_loop: extern "C" fn(u64) -> u64 = unsafe { ex_loop.as_fn() };
+        for &n in &[0u64, 1, 5, 32, 200] {
+            let mut want = 0x1234u64;
+            for i in 0..n {
+                want = want.wrapping_mul(3).wrapping_add(i) ^ (want >> 1);
+            }
+            assert_eq!(f_loop(n), want, "aligned loop mismatch for n={n}");
+        }
+    }
 }
