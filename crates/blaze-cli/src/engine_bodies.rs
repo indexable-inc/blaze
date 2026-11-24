@@ -2025,6 +2025,9 @@ pub(crate) struct Handles<'h, 'e, 'n, 'o> {
     /// The `BodyCheck` kind's tool (engine_store.rs `tools`): in each member listing row's key
     /// (engine_member_rows.rs `row_key`), as it is in every body task's.
     pub(crate) tool: blaze_drive::Tool,
+    /// When the check is scoped to a subset of workspace units (`blaze test <member>` / `blaze run`
+    /// / `blaze export`), the transitive closure of active crate indices in the `CrateList`.
+    pub(crate) scoped: Option<&'h crate::engine_check::ScopedUnits>,
 }
 
 /// Why the Bodies stage checks no body this command, and the cells that stop is a function of
@@ -3205,6 +3208,7 @@ impl<'f> BodiesStage<'f> {
         store: &mut dyn crate::store::Store<'r>,
         graph: Option<Input>,
         list: Option<&blaze_world::crate_list::CrateList<'_>>,
+        scoped: Option<&crate::engine_check::ScopedUnits>,
         outlined: &[Outlined<'_>],
         // Every member unit's found files (engine_body_plan.rs `FoundEdge`): its walk's beside
         // its root, and the setup's walk of it (`groups`).
@@ -3216,7 +3220,7 @@ impl<'f> BodiesStage<'f> {
         self.reach = None;
         let Some(list) = list else { return Ok(None) };
         let reach = match from {
-            ReachFrom::Walk => Reach::walk(list, outlined, found, g).map_err(EngineCheckError::Unoutlined)?,
+            ReachFrom::Walk => Reach::walk(list, scoped, outlined, found, g).map_err(EngineCheckError::Unoutlined)?,
             ReachFrom::MembersRecord => {
                 let refused = |unit: Option<Name>| EngineCheckError::ReadyRefused(ReadyRefused::Members { unit });
                 let Some(graph) = graph else { return Err(refused(None).into()) };
@@ -3228,7 +3232,7 @@ impl<'f> BodiesStage<'f> {
                     Some(Ok(view)) if view.header.graph_out == graph.out => view,
                     _ => return Err(refused(None).into()),
                 };
-                Reach::of_members(list, &view, found, g).map_err(|unknown| refused(Some(unknown.unit)))?
+                Reach::of_members(list, scoped, &view, found, g).map_err(|unknown| refused(Some(unknown.unit)))?
             }
         };
         self.reach = Some(reach);
@@ -3285,6 +3289,7 @@ impl<'f> BodiesStage<'f> {
         store: &mut dyn crate::store::Store<'r>,
         graph: blaze_drive::Input,
         names: NamesInputs<'_, '_>,
+        scoped: Option<&crate::engine_check::ScopedUnits>,
         tool: blaze_drive::Tool,
         moved: &[Name],
         frame: &'f Frame,
@@ -3309,7 +3314,7 @@ impl<'f> BodiesStage<'f> {
         // file text actually asked during checking (`StoreLoad::file_items`, e.g. a `const` body)
         // is outlined on demand from disk (`CurrentFile::from_text`), so standing transitive
         // dependency outlines are never eagerly read back from the store.
-        for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at)) {
+        for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at) && scoped.is_none_or(|s| s.allows(*at))) {
             let own_name = blaze_drive::key::crate_scope_name(&list.key(member));
             let unit = crate::engine_body_plan::Unit { name: own_name, prefix: list.key(member).prefix(), test: is_test(own_name) };
             let place = u32::try_from(member).unwrap_or(u32::MAX);
@@ -4307,7 +4312,7 @@ impl<'f> BodiesStage<'f> {
         // each unit whose row is entered, and by no other. A visit then adds the member's claims
         // alone: its entry, row, head subjects and uncovered bodies are the record's, taken
         // already (`again`: its unit, made at its first turn).
-        let mut first_turn = (0..CrateGraph::len(&list)).filter(|at| list.member(*at));
+        let mut first_turn = (0..CrateGraph::len(&list)).filter(|at| list.member(*at) && handles.scoped.is_none_or(|s| s.allows(*at)));
         // The entered tasks' names, sorted: the only finds a decision reads (piece B, the
         // listing's walk by need). Each is a body's row at one unit: a unit's find of a body is
         // asked when the body's name AT THAT UNIT'S VIEW is entered (below, `own_view`).

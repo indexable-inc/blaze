@@ -654,15 +654,26 @@ pub(crate) fn pick<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'_>, frame
     })
 }
 
-/// The packages `blaze test` runs the tests of, by name, sorted, each once (run_names.rs
-/// `tests_of` selects the unit graph's units by them). Every `-p` given, else the member the
-/// command was given ([`Select::member`]), else the root's `default-members`, else the root's
-/// package of a real workspace and every member of a virtual one. With `--bin <name>`, the
-/// selected packages that have that binary, at least one.
-pub(crate) fn test_packages<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'_>, frame: &'f Frame) -> Result<Vec<&'f str, &'f Frame>, CliError> {
+/// What `blaze test` selected in the workspace: the sorted, deduplicated package names, any
+/// `--bin <name>` crate roots (checkout-relative, sorted, deduplicated), and how many members the
+/// workspace has in total (so a selection of every member with no `--bin` runs the whole-workspace
+/// check while a strict subset or `--bin` scopes the check to its transitive unit closure).
+pub(crate) struct TestSelection<'f> {
+    pub(crate) packages: Vec<&'f str, &'f Frame>,
+    pub(crate) bin_roots: Vec<&'f str, &'f Frame>,
+    pub(crate) total_members: usize,
+}
+
+/// The packages `blaze test` runs the tests of, with their optional `--bin` crate roots and the
+/// workspace's total member count. Every `-p` given, else the member the command was given
+/// ([`Select::member`]), else the root's `default-members`, else the root's package of a real
+/// workspace and every member of a virtual one. With `--bin <name>`, the selected packages that
+/// have that binary, at least one.
+pub(crate) fn test_selection<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'_>, frame: &'f Frame) -> Result<TestSelection<'f>, CliError> {
     let cx = cx.span("blaze test: selected packages");
     with_layout(&cx, root, "", frame, |units, root_text| {
         let members = units.members.as_slice();
+        let total_members = members.len();
         let mut selected = Vec::new_in(frame);
         if !select.test_packages.is_empty() {
             for package in select.test_packages {
@@ -676,6 +687,7 @@ pub(crate) fn test_packages<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'
                 None => selected.extend(members),
             }
         }
+        let mut bin_roots = Vec::new_in(frame);
         if let Some(asked) = select.bin {
             let has_bin = |member: &&Member<'_>| member.bins.iter().any(|bin| bin.name.as_str() == asked);
             if !selected.iter().any(has_bin) {
@@ -684,6 +696,15 @@ pub(crate) fn test_packages<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'
                 return Err(CliError::RunPackage(PickError::TestBin { asked: owned(asked), bins }));
             }
             selected.retain(has_bin);
+            for member in selected.iter() {
+                for bin in member.bins.iter() {
+                    if bin.name.as_str() == asked {
+                        bin_roots.push(kept(bin.root.as_str(), frame)?);
+                    }
+                }
+            }
+            bin_roots.sort_unstable();
+            bin_roots.dedup();
         }
         selected.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
         selected.dedup_by(|a, b| core::ptr::eq(*a, *b));
@@ -691,8 +712,14 @@ pub(crate) fn test_packages<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'
         for member in selected {
             names.push(kept(member.name.as_str(), frame)?);
         }
-        Ok(names)
+        Ok(TestSelection { packages: names, bin_roots, total_members })
     })
+}
+
+/// The packages `blaze test` runs the tests of, by name, sorted, each once (run_names.rs
+/// `tests_of` selects the unit graph's units by them).
+pub(crate) fn test_packages<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'_>, frame: &'f Frame) -> Result<Vec<&'f str, &'f Frame>, CliError> {
+    Ok(test_selection(cx, root, select, frame)?.packages)
 }
 
 fn kept<'f>(text: &str, frame: &'f Frame) -> Result<&'f str, CliError> {
