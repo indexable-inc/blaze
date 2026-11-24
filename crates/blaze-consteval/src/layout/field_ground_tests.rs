@@ -28,3 +28,18 @@ fn a_field_with_no_ground_form_is_named() {
     std::eprintln!("{shown}");
     assert_eq!(shown, "constant 0x9: field 1 (name 0x1) of ADT 0x1000 has no ground form: the projection `<_ as 0x77>::0x5` is not normalized");
 }
+
+#[test]
+fn an_unchecked_opaque_defining_body_is_pending_missing() {
+    let e = LayoutError {
+        ty: PTy(3),
+        why: L::FieldGround {
+            adt: ItemKey(0x1000),
+            field: 0,
+            name: Name(1),
+            error: BuildError::OpaqueOwnerUnchecked { opaque: ItemKey(0x2000), owner: ItemKey(0x3000) },
+        },
+    };
+    let Stop::Refused(refusal) = stop(&e) else { panic!("expected pending Missing refusal") };
+    assert_eq!(refusal, Refusal::Missing { what: "opaque defining body", item: ItemKey(0x3000) });
+}

@@ -326,7 +326,7 @@ fn a_tree_opens_at_the_first_read_of_a_text_from_it() {
     let lazy = LazyTrees::new(&opener, 3, &seen, &frame);
     let packs: Packs<'_> = Packs::from(&lazy);
     assert_eq!(seen.opened(), (0, 3), "a tree was opened before any read");
-    let text = packs.tree(&cx, &frame, 1).and_then(|view| view.find("src/lib.rs")).map(|file| file.bytes);
+    let text = packs.tree(&cx, &frame, 1).and_then(|view| view.read_slice("src/lib.rs", &frame).ok().flatten());
     assert_eq!(text, Some(&b"pub fn tree_1() {}\n"[..]), "tree 1's text");
     assert_eq!(seen.opened(), (1, 3), "one read of tree 1 opened other trees");
     assert!(packs.tree(&cx, &frame, 1).is_some() && packs.tree(&cx, &frame, 0).is_none(), "tree 1 again, and tree 0 is the checkout");
@@ -340,7 +340,7 @@ fn a_tree_opens_at_the_first_read_of_a_text_from_it() {
     // CONTROL: the opened slice, every tree before any read, serves the same text.
     let views = [pack(1), pack(2)];
     let open: Packs<'_> = Packs::from(&views[..]);
-    assert_eq!(open.tree(&cx, &frame, 1).and_then(|view| view.find("src/lib.rs")).map(|file| file.bytes), text, "the two schedules serve other texts");
+    assert_eq!(open.tree(&cx, &frame, 1).and_then(|view| view.read_slice("src/lib.rs", &frame).ok().flatten()), text, "the two schedules serve other texts");
 }
 
 #[test]

@@ -441,8 +441,9 @@ pub(super) fn method_dispatch(
 const MOST_OBJECT_TRAITS: usize = 1024;
 
 /// The constants one ADT head may name before its row is given up on (reach.rs's
-/// `MOST_LENS`): a pattern type's ends, an array length.
-const MOST_ADT_LENS: u32 = 64;
+/// `MOST_LENS`): a pattern type's ends, an array length, or explicit enum discriminants
+/// (e.g. `nix::errno::consts::Errno` has >100 `= libc::E*` variants).
+const MOST_ADT_LENS: u32 = 1024;
 
 /// Every static `bodies` name, evaluated once ([`super::statics::static_values`]); one
 /// refused is named: in a survey filed in `left_out` and left out (each reader's build then
@@ -963,13 +964,23 @@ impl<'n> Front2Program<'n> {
         // fn is a root of the walk, so it is tabled and in the test's reach.
         let mut shapes: Vec<Result<EntryShape, TestEntryRefusal>, Global> = Vec::new_in(Global);
         let mut also: Vec<ItemKey, Global> = Vec::new_in(Global);
+        let mut termination_report_fn: Option<ItemKey> = None;
         if tests {
+            let mut has_report = false;
             for (m, &lib) in mains.iter().zip(roots.iter()) {
                 let shape = super::test_entry::entry_shape(&mut records, lib, m.owner);
                 if let Ok(EntryShape::Report { report, .. }) = shape {
                     also.push(report);
+                    has_report = true;
                 }
                 shapes.push(shape);
+            }
+            if has_report
+                && let Some(term_lib) = records.index.lang(super::test_entry::TERMINATION_LANG)
+                && records.store.ensure(names, &mut records.keys, super::heads::Want::Members(term_lib)).is_ok()
+                && let Ok(term_key) = records.keys.item(term_lib)
+            {
+                termination_report_fn = records.keys.filed_member(term_key, MemberKind::Fn, "report");
             }
             also.sort_unstable();
             also.dedup();
@@ -1082,6 +1093,13 @@ impl<'n> Front2Program<'n> {
                     declared.push((item, super::row_path::row_path_of(&records, item)));
                 }
             }
+        }
+        // If any test of a suite is entered through the report shim, table `Termination::report`
+        // as a declared trait fn so whole-program builds can read its signature and ABI.
+        if let Some(report_fn) = termination_report_fn
+            && met.insert(report_fn, ()).is_none()
+        {
+            declared.push((report_fn, super::row_path::row_path_of(&records, report_fn)));
         }
         // Every ADT a type of the program names has its row before the build: the back half
         // lays out each type it meets (an impl's signature's `ControlFlow<..>` too, which no
@@ -1930,6 +1948,14 @@ impl FrontEnd for Front2Program<'_> {
         Ok(out)
     }
 
+    fn restore_checked(&mut self, checked: &mut [Option<Checked<'static>>]) {
+        for (f, c) in self.fns.iter_mut().zip(checked.iter_mut()) {
+            if f.checked.is_none() {
+                f.checked = c.take();
+            }
+        }
+    }
+
     /// D106: fn `key`'s body, checked in `new` (the whole reach, today), handed over once: the
     /// record walk's maker asks each key once a run. A stage: the lazy program (piece Y) checks
     /// only this body here, and this table goes when it is tested equal.
@@ -2010,6 +2036,17 @@ impl FrontEnd for Front2Program<'_> {
         let mut declared = false;
         super::source::NamesSource::each_member(names, lib, &mut |m| declared |= m.kind == blaze_surface::ItemKind::Function && m.name == Some(name));
         declared.then(|| super::keys::member_key_of(tr, MemberKind::Fn, name))
+    }
+
+    fn termination_report(&self) -> Option<ItemKey> {
+        let lib = self.front.index.lang(super::test_entry::TERMINATION_LANG)?;
+        let tr = checker_of(lib);
+        if let Some(filed) = self.front.keys.filed_member(tr, MemberKind::Fn, "report") {
+            return Some(filed);
+        }
+        let mut declared = false;
+        super::source::NamesSource::each_member(self.front.names, lib, &mut |m| declared |= m.kind == blaze_surface::ItemKind::Function && m.name == Some("report"));
+        declared.then(|| super::keys::member_key_of(tr, MemberKind::Fn, "report"))
     }
 
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {

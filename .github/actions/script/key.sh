@@ -28,7 +28,7 @@ set -euo pipefail
 sha() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
 die() { echo "::error::$*" >&2; echo "key.sh: $*" >&2; exit 1; }
 
-for need in .github/blaze-version pins/toolchain Cargo.toml Cargo.lock .cargo/config.toml scripts/Cargo.toml crates/blaze-script/Cargo.toml; do
+for need in .github/blaze-version .github/blaze-cli-version pins/toolchain Cargo.toml Cargo.lock .cargo/config.toml scripts/Cargo.toml crates/blaze-script/Cargo.toml; do
   [ -f "$need" ] || die "no $need in $(pwd -P): run from the checkout's top, with this file checked out"
 done
 export LC_ALL=C
@@ -84,6 +84,7 @@ manifest=$(awk -v direct=" $direct " '
 
 digest=$({
   printf 'blaze-version %s\n' "$(cat .github/blaze-version)"
+  printf 'blaze-cli-version %s\n' "$(cat .github/blaze-cli-version)"
   printf 'toolchain %s\n' "$(cat pins/toolchain)"
   printf 'host %s %s\n' "$(uname -s)" "$(uname -m)"
   printf 'checkout %s\n' "$(pwd -P)"
@@ -94,4 +95,4 @@ digest=$({
   printf '%s\n' "$closure" "$manifest"
   cat .cargo/config.toml
 } | sha | cut -d' ' -f1)
-echo "scripts-$(uname -s)-$(uname -m)-$(cat .github/blaze-version)-$digest"
+echo "scripts-$(uname -s)-$(uname -m)-$(cat .github/blaze-cli-version)-$digest"

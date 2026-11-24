@@ -259,7 +259,7 @@ fn git_package<'a>(c: &mut Commit<'a>, view: &PackView<'_>, name: &str, version:
     if !c.root_tried {
         c.root_tried = true;
         // The root may hold no manifest, or one that is no workspace: then only the scan finds.
-        if view.find("Cargo.toml").is_some() {
+        if view.find_entry("Cargo.toml").is_some() {
             c.layouts.push(lay_out(view, "", name, version, alloc)?);
             if let Some(package) = found(&c.layouts) {
                 return Ok(package);
@@ -267,7 +267,7 @@ fn git_package<'a>(c: &mut Commit<'a>, view: &PackView<'_>, name: &str, version:
         }
     }
     if c.scan.is_none() {
-        c.scan = Some(scan(view, name, alloc)?);
+        c.scan = Some(scan(view, name, version, alloc)?);
     }
     let mut dir: Option<&str> = None;
     for (n, d) in c.scan.iter().flat_map(|s| s.iter()) {
@@ -299,17 +299,21 @@ fn member_version<'m>(m: &'m blaze_manifest::layout::Member<'_>) -> &'m str {
 /// Every `(package.name, directory)` of a commit's record, sorted. A manifest that does not
 /// parse names no package here (cargo skips a nested manifest it cannot read the same way); a
 /// package that lives only in one is then [`SourceError::NoManifest`], never guessed.
-fn scan<'a>(view: &PackView<'_>, package: &str, alloc: Alloc<'a>) -> Result<AVec<'a, (Text<'a>, Text<'a>)>, SourceError<'a>> {
+fn scan<'a>(view: &PackView<'_>, package: &str, version: &Text<'a>, alloc: Alloc<'a>) -> Result<AVec<'a, (Text<'a>, Text<'a>)>, SourceError<'a>> {
     let mut out = Vec::new_in(alloc);
-    for file in view.files() {
-        let dir = match file.path {
+    for entry in view.entries() {
+        let dir = match entry.path {
             "Cargo.toml" => "",
             path => match path.strip_suffix("/Cargo.toml") {
                 Some(dir) => dir,
                 None => continue,
             },
         };
-        let text = core::str::from_utf8(file.bytes).map_err(|_| SourceError::NotUtf8 { package: own(package, alloc), path: own(file.path, alloc) })?;
+        let bytes = entry
+            .read_in(alloc)
+            .map_err(|why| SourceError::Refused { package: own(package, alloc), version: own(version.as_str(), alloc), why })?;
+        let text = core::str::from_utf8(bytes.as_slice())
+            .map_err(|_| SourceError::NotUtf8 { package: own(package, alloc), path: own(entry.path, alloc) })?;
         let Ok(doc) = blaze_toml::Document::parse_in(text, blaze_toml::Limits::CARGO, alloc) else { continue };
         let Some(name) = doc.root().get("package").and_then(|p| p.get("name")).and_then(|n| n.as_str()) else { continue };
         out.push((own(name, alloc), own(dir, alloc)));
@@ -330,8 +334,14 @@ fn lay_out<'a>(view: &PackView<'_>, start: &str, package: &str, version: &Text<'
         for need in needs.iter() {
             match need {
                 Need::Manifest(path) => {
-                    let text = match view.find(path) {
-                        Some(file) => Some(core::str::from_utf8(file.bytes).map_err(|_| SourceError::NotUtf8 { package: own(package, alloc), path: path.clone() })?),
+                    let loaded = view
+                        .read(path, alloc)
+                        .map_err(|why| SourceError::Refused { package: own(package, alloc), version: own(version.as_str(), alloc), why })?;
+                    let text = match loaded.as_ref() {
+                        Some(file) => Some(
+                            core::str::from_utf8(file.bytes.as_slice())
+                                .map_err(|_| SourceError::NotUtf8 { package: own(package, alloc), path: path.clone() })?,
+                        ),
                         None => None,
                     };
                     reader.manifest(path, text).map_err(refused)?;
@@ -359,14 +369,14 @@ fn listing<'v, 'a>(view: &PackView<'v>, dir: &str, alloc: Alloc<'a>) -> Option<A
     let (mut lo, mut hi) = (0usize, view.len());
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        match view.file(mid).path < prefix.as_str() {
+        match view.entry(mid).path < prefix.as_str() {
             true => lo = mid + 1,
             false => hi = mid,
         }
     }
     let mut entries: AVec<'a, Entry<'v>> = Vec::new_in(alloc);
     for at in lo..view.len() {
-        let path = view.file(at).path;
+        let path = view.entry(at).path;
         let Some(rest) = path.strip_prefix(prefix.as_str()) else { break };
         let (name, is_dir) = match rest.find('/') {
             Some(cut) => (&rest[..cut], true),

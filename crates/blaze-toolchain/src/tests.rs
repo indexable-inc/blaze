@@ -147,8 +147,8 @@ fn a_shelf_opens_what_it_holds_and_names_what_it_lacks() {
     let core = view.with_role(Role::Core).expect("core");
     let pack = shelf::open_pack(&mut shelf, id, &core).expect("core's pack");
     let files = PackView::open_verified(&pack).expect("a pack");
-    let root = files.find("core/src/lib.rs").expect("core's root");
-    assert_eq!(root.bytes, b"pub mod result;");
+    let root = files.read("core/src/lib.rs", blaze_own::testing::heap().alloc()).expect("read").expect("core's root");
+    assert_eq!(root.bytes.as_slice(), b"pub mod result;");
 
     // Absent: names the toolchain, the crate, the digest and the folder.
     let bstd = view.with_role(Role::Bstd).expect("bstd");

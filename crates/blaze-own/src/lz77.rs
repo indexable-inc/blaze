@@ -129,6 +129,56 @@ unsafe fn copy_lits_wild_ptr(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
+/// Pre-populates `hash_table` from a raw-content dictionary prefix (`dict`) so subsequent
+/// [`lz77_scan_fast`] calls over `[dict | input]` (starting at `block_start = dict.len()`)
+/// match into `dict` without re-hashing the dictionary per frame.
+pub fn lz77_preload_fast(dict: &[u8], hash_table: &mut [u32; LZ77_FAST_HASH_SIZE]) {
+    hash_table.fill(0);
+    let Some(limit) = dict.len().checked_sub(8) else {
+        return;
+    };
+    let base = dict.as_ptr();
+    let ht = hash_table.as_mut_ptr();
+    // SAFETY: `pos <= dict.len() - 8` gives 8 readable bytes at `base.add(pos)`;
+    // `h < LZ77_FAST_HASH_SIZE` by `hash7_tagged`'s top-`LZ77_FAST_HASH_LOG` shift.
+    unsafe {
+        let mut pos = 0usize;
+        while pos <= limit {
+            let v = read_u64_unaligned(base.add(pos));
+            let (h, e) = hash7_tagged(v, pos, LZ77_FAST_HASH_LOG);
+            *ht.add(h) = e;
+            pos += 1;
+        }
+    }
+}
+
+/// Pre-populates `buckets` (`ht_short` 2-way `hash4` + `ht_long` `hash7`) from a raw-content
+/// dictionary prefix (`dict`) so subsequent [`lz77_scan_default`] calls over `[dict | input]`
+/// match into `dict` without re-hashing the dictionary per frame.
+pub fn lz77_preload_default(dict: &[u8], buckets: &mut [u64; LZ77_DEF_BUCKETS]) {
+    buckets.fill(0);
+    let Some(limit) = dict.len().checked_sub(8) else {
+        return;
+    };
+    let base = dict.as_ptr();
+    let ht_short = buckets.as_mut_ptr();
+    // SAFETY: `LZ77_DEF_BUCKETS == DFAST_SHORT_U64S + DFAST_LONG_U64S`, `u64` align >= `u32`,
+    // `pos <= dict.len() - 8` gives 8 readable bytes, and `hl`/`bs` are bounded by table logs.
+    unsafe {
+        let ht_long = ht_short.add(DFAST_SHORT_U64S).cast::<u32>();
+        let mut pos = 0usize;
+        while pos <= limit {
+            let v = read_u64_unaligned(base.add(pos));
+            let (hl, el) = hash7_tagged(v, pos, DFAST_LONG_LOG);
+            let (bs, es) = hash4_tagged(v, pos, DFAST_SHORT_LOG);
+            *ht_long.add(hl) = el;
+            let ps = *ht_short.add(bs);
+            *ht_short.add(bs) = (ps << 32) | u64::from(es);
+            pos += 1;
+        }
+    }
+}
+
 /// Fast 2-position pipelined 10-bit-tagged 7-byte-hash LZ77 block scanner (128 KiB L1D hash
 /// table, 512 KiB window, repeat-offset `rep[0]`/`rep[1]` chain harvesting, backward match
 /// extension, zero inner-loop bounds checks).

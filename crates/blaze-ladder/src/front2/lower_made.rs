@@ -37,7 +37,7 @@ use super::types::Why;
 
 /// The most heads and constants one body's lowering may have made before it is refused
 /// ([`BodyError::Made`]): the drivers' former `MOST_LENS` bound, now over both kinds of need.
-pub const MOST_MADE: u32 = 64;
+pub const MOST_MADE: u32 = 1024;
 
 /// Which body to lower: a free fn (or a free constant's or static's initializer) by its
 /// library key, or a member fn of a trait or an impl by its checker key.

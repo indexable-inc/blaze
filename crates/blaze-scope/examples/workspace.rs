@@ -247,6 +247,7 @@ enum Place {
 /// Each crate's path prefix (its `shown_from`) and where its files are.
 struct Texts {
     places: Vec<(String, Place)>,
+    alloc: Alloc<'static>,
 }
 
 impl<'a> SourceTexts<'a> for Texts {
@@ -256,8 +257,14 @@ impl<'a> SourceTexts<'a> for Texts {
         match place {
             Place::Disk(dir) => std::fs::read_to_string(dir.join(rest)).ok().map(leak_str),
             Place::Pack(view, dir) => {
-                let file = view.find(&format!("{dir}{rest}"))?;
-                core::str::from_utf8(file.bytes).ok()
+                let mut full = blaze_own::String::with_capacity_in(dir.len() + rest.len(), self.alloc);
+                full.push_str(dir);
+                full.push_str(rest);
+                let file = view.read(full.as_str(), self.alloc).ok()??;
+                match file.bytes {
+                    blaze_fetch::FileBytes::Borrowed(b) => core::str::from_utf8(b).ok(),
+                    blaze_fetch::FileBytes::Owned(v) => core::str::from_utf8(v.leak_static()).ok(),
+                }
             }
         }
     }
@@ -396,7 +403,7 @@ fn main() -> ExitCode {
         };
         places.push((c.shown_from.as_str().to_string(), place));
     }
-    let texts = Texts { places };
+    let texts = Texts { places, alloc };
     // A refused crate (a member proc macro the shelf has no wasm32-wasip1 side for) is not
     // resolved with no dependencies: the run stops, naming it (rule 3).
     let inputs = match crates.checked_inputs() {

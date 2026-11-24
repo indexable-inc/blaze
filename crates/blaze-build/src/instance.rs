@@ -426,6 +426,43 @@ pub fn vtable_shim_key_args(target: Instance, ground: &mut PortableTys<'_>, scra
     ground.intern_list(&all).map_err(full)
 }
 
+/// Synthetic item key naming the test report shim of a `#[test]` fn returning a `T: Termination`
+/// other than `()` (docs/v2/plan/design/test.md, piece 8):
+/// `Instance { item: TEST_REPORT_SHIM_ITEM, args: [PNode::FnDef(test, List::EMPTY)] }`.
+///
+/// The shim has C `main`'s signature `extern "C" fn(argc: i32, argv: *const *const c_char) -> i32`,
+/// ignores its arguments, calls `test()`, passes the returned value to
+/// `<R as Termination>::report`, and returns the resulting `ExitCode` byte zero-extended to `i32`.
+pub const TEST_REPORT_SHIM_ITEM: ItemKey = ItemKey(u128::from_be_bytes(*b"blaze-build trs1"));
+
+/// The test report shim instance wrapping monomorphic test fn `test`:
+/// `Instance { item: TEST_REPORT_SHIM_ITEM, args: [PNode::FnDef(test, List::EMPTY)] }`.
+pub fn test_report_shim_instance(test: ItemKey, ground: &mut PortableTys<'_>) -> Result<Instance, BuildError> {
+    let full = |_| BuildError::Malformed { what: "the ground table is full" };
+    let fn_ty = ground.intern(PNode::FnDef(test, List::EMPTY)).map_err(full)?;
+    let args = ground.intern_list(&[fn_ty]).map_err(full)?;
+    Ok(Instance { item: TEST_REPORT_SHIM_ITEM, args })
+}
+
+/// If `instance` is a test report shim (`item == TEST_REPORT_SHIM_ITEM`,
+/// `args == [FnDef(test, [])]`), returns the underlying test fn `ItemKey`.
+pub fn test_report_shim_of(instance: Instance, ground: PTys<'_>) -> Option<ItemKey> {
+    if instance.item != TEST_REPORT_SHIM_ITEM {
+        return None;
+    }
+    let &[fn_ty] = ground.list(instance.args).ok()? else { return None };
+    let PNode::FnDef(item, args) = ground.node(fn_ty).ok()? else { return None };
+    (args.len == 0).then_some(item)
+}
+
+/// The list a test report shim for `test` is keyed by over `test`'s code identity:
+/// `[FnDef(TEST_REPORT_SHIM_ITEM, [])]`. Distinct from `test`'s own empty argument list.
+pub fn test_report_shim_key_args(ground: &mut PortableTys<'_>) -> Result<List, BuildError> {
+    let full = |_| BuildError::Malformed { what: "the ground table is full" };
+    let marker = ground.intern(PNode::FnDef(TEST_REPORT_SHIM_ITEM, List::EMPTY)).map_err(full)?;
+    ground.intern_list(&[marker]).map_err(full)
+}
+
 /// The one function every type lowered at an instance passes through (signatures, locals,
 /// fields, casts, a callee's signature): `ty` of table `from`, in `ground` with `Param(i)`
 /// replaced by `args[i]` (`args` are types of `ground`), every projection then normalized by

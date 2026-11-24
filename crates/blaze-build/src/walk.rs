@@ -26,7 +26,7 @@ use crate::{Abi, Adts, BuildError, Built, Instance, Intrinsic, Subst, ground};
 
 #[path = "closure.rs"]
 mod closure;
-pub(crate) use closure::{build_builtin_clone, build_builtin_from, build_ctor_fn, build_fn_shim, build_reify_shim, build_vtable_shim, closures_in};
+pub(crate) use closure::{build_builtin_clone, build_builtin_from, build_ctor_fn, build_fn_shim, build_reify_shim, build_test_report_shim, build_vtable_shim, closures_in};
 #[cfg(test)]
 pub(crate) use closure::{empty_record as empty_record_for_tests, empty_view as empty_view_for_tests};
 #[path = "coroutine.rs"]
@@ -352,9 +352,11 @@ struct MatchState {
     /// Some arm has a guard: the arms are tested in turn rather than by one `switch`.
     guarded: bool,
     /// The scrutinee was a reference the arms' patterns matched through (the reference's
-    /// "Binding modes": the default binding mode becomes `ref`): each binding takes its
-    /// part's address, nothing is moved or dropped.
-    by_ref: bool,
+    /// "Binding modes": the default binding mode becomes `ref`): `Some(raw)` holds the
+    /// original un-dereferenced reference scalar (so a top-level catch-all `other => ..` arm
+    /// binds that reference directly, while variant arms bind fields by address without moving
+    /// or dropping).
+    by_ref: Option<Value>,
     /// By value on an enum that needs drop: who holds what the arms do not move.
     owner: Owner,
     /// A match by tests (walk/matches.rs): the scrutinee's place each arm tests and binds from.
@@ -6659,7 +6661,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
         // A reference to an enum, matched by variant patterns: the default binding mode (the
         // reference, "Binding modes"): the references are followed to the enum's place.
-        let mut by_ref = false;
+        let mut by_ref: Option<Value> = None;
         // The enum's ground type when the references were followed to it.
         let mut pointee: Option<PTy> = None;
         let mut owner = Owner::None;
@@ -6688,13 +6690,14 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 _ => false,
             } && self.is_agg(g).map_err(|error| Self::ty_err(scrutinee, error))?;
             if variant_pats && depth > 0 && is_enum {
-                let mut p = self.scalar(s, Ty::PTR)?;
+                let raw = self.scalar(s, Ty::PTR)?;
+                let mut p = raw;
                 for _ in 1..depth {
                     p = self.b.load(Ty::PTR, Flags::NONE, p, 0, MemAttrs::aligned(3));
                 }
                 srepr = self.repr(g).map_err(|error| Self::ty_err(scrutinee, error))?;
                 s = V::Place(p, 0);
-                by_ref = true;
+                by_ref = Some(raw);
                 pointee = Some(g);
             }
         }
@@ -6731,7 +6734,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 // By value, what no arm moves is dropped at the scrutinee's end: a local's
                 // field flags, or a temporary's rest per arm (codegen.md, "A `match` by value
                 // on an enum that needs drop"); through a reference nothing moves.
-                if self.layouts[l as usize].needs_drop && !by_ref {
+                if self.layouts[l as usize].needs_drop && by_ref.is_none() {
                     owner = match self.local_of(scrutinee)? {
                         // As `Expr::Match` evaluated it: in place.
                         Some(p) if self.local_drops(p) && self.adjust_rows(scrutinee).is_empty() => Owner::Local(p),
@@ -6839,15 +6842,22 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         match (self.pat(arm.pat)?, st.of_enum) {
             (Pat::Bind { .. }, None) => self.bind_value(arm.pat, V::Scalar(st.scrutinee))?,
             (Pat::Bind { .. }, Some((at, _, _))) => {
-                self.bind_value(arm.pat, V::Place(at.0, at.1))?;
+                // Top-level identifier bindings do not peel references (Reference, "Binding
+                // modes"): in a match on `&E` / `&mut E` / `&&E`, `existing => ..` binds the
+                // original reference scalar, not the dereferenced enum place.
+                let bound = match st.by_ref {
+                    Some(ptr) => V::Scalar(ptr),
+                    None => V::Place(at.0, at.1),
+                };
+                self.bind_value(arm.pat, bound)?;
                 if st.owner != Owner::None {
                     self.arm_effect(moves::Pending::OwnPat(arm.pat), hold)?;
                     whole = true;
                 }
             }
             (Pat::TupleStruct { .. } | Pat::Struct { .. }, Some((at, l, _))) => {
-                moved = self.bind_variant(arm.pat, at, l, st.by_ref, !hold)?;
-                if hold && !st.by_ref {
+                moved = self.bind_variant(arm.pat, at, l, st.by_ref.is_some(), !hold)?;
+                if hold && st.by_ref.is_none() {
                     self.arm_effect(moves::Pending::OwnPat(arm.pat), true)?;
                 }
                 if moved != 0 {

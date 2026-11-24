@@ -369,8 +369,11 @@ pub(super) fn from_store<'a>(
         let requested = if decided { requests.features[package.at].as_ref() } else { None };
         let manifest = match requested {
             Some(requested) => {
-                let file = view.find("Cargo.toml").ok_or_else(|| refused(&record, "the crate's record holds no Cargo.toml".to_owned()))?;
-                let text = std::str::from_utf8(file.bytes).map_err(|error| refused(&record, format!("its Cargo.toml is not UTF-8: {error}")))?;
+                let file = view
+                    .read("Cargo.toml", std::alloc::Global)
+                    .map_err(|why| refused(&record, format!("{}", Shown(&why))))?
+                    .ok_or_else(|| refused(&record, "the crate's record holds no Cargo.toml".to_owned()))?;
+                let text = std::str::from_utf8(file.bytes.as_slice()).map_err(|error| refused(&record, format!("its Cargo.toml is not UTF-8: {error}")))?;
                 let path = Path::new(&format!("{}-{}", package.name, package.version)).join("Cargo.toml");
                 member_dependencies::rewritten_manifest(text, &path, requested.as_slice(), alloc)?
             }
@@ -573,8 +576,11 @@ fn manifest_in_record(store: &Path, unit: &Unit<'_, '_>) -> Result<Option<String
     };
     let refuse = |why: String| Failure::Manifest { path: record.clone(), why };
     let view = PackView::open_source(&unit.source(), &bytes).map_err(|why| refuse(format!("{}", Shown(&why))))?;
-    let file = view.find("Cargo.toml").ok_or_else(|| refuse("the crate's record holds no Cargo.toml".to_owned()))?;
-    let text = std::str::from_utf8(file.bytes).map_err(|error| refuse(format!("its Cargo.toml is not UTF-8: {error}")))?;
+    let file = view
+        .read("Cargo.toml", std::alloc::Global)
+        .map_err(|why| refuse(format!("{}", Shown(&why))))?
+        .ok_or_else(|| refuse("the crate's record holds no Cargo.toml".to_owned()))?;
+    let text = std::str::from_utf8(file.bytes.as_slice()).map_err(|error| refuse(format!("its Cargo.toml is not UTF-8: {error}")))?;
     Ok(Some(text.to_owned()))
 }
 
@@ -589,13 +595,22 @@ fn write_package(dir: &Path, view: &PackView<'_>, manifest: Option<&str>, checks
         Err(error) => return Err(Failure::Io { path: dir.to_owned(), error }),
     }
     let mut files = String::new();
-    for file in view.files() {
-        let path: PathBuf = dir.join(file.path);
-        let bytes = match manifest {
-            Some(manifest) if file.path == "Cargo.toml" => manifest.as_bytes(),
-            _ => file.bytes,
+    for entry in view.entries() {
+        let path: PathBuf = dir.join(entry.path);
+        let decoded = if manifest.is_some() && entry.path == "Cargo.toml" {
+            None
+        } else {
+            Some(entry.read_in(std::alloc::Global).map_err(|why| Failure::Manifest {
+                path: record.to_owned(),
+                why: format!("{}: {}", entry.path, Shown(&why)),
+            })?)
         };
-        match file.mode {
+        let bytes = match (manifest, decoded.as_ref()) {
+            (Some(manifest), None) => manifest.as_bytes(),
+            (_, Some(decoded)) => decoded.as_slice(),
+            _ => unreachable!(),
+        };
+        match entry.mode {
             Mode::File => write(&path, bytes)?,
             Mode::Exec => {
                 use std::os::unix::fs::PermissionsExt as _;
@@ -605,14 +620,14 @@ fn write_package(dir: &Path, view: &PackView<'_>, manifest: Option<&str>, checks
             Mode::Link => {
                 return Err(Failure::Manifest {
                     path: record.to_owned(),
-                    why: format!("{} is a link: a crate's link is not vendored yet (cargo's directory source checks files)", file.path),
+                    why: format!("{} is a link: a crate's link is not vendored yet (cargo's directory source checks files)", entry.path),
                 });
             }
         }
         if !files.is_empty() {
             files.push(',');
         }
-        let quoted = serde_json::to_string(file.path).map_err(|error| Failure::Manifest { path: record.to_owned(), why: error.to_string() })?;
+        let quoted = serde_json::to_string(entry.path).map_err(|error| Failure::Manifest { path: record.to_owned(), why: error.to_string() })?;
         files.push_str(&format!("{quoted}:\"{}\"", sha256(bytes)));
     }
     write(&dir.join(".cargo-checksum.json"), format!("{{\"files\":{{{files}}},\"package\":\"{checksum}\"}}"))

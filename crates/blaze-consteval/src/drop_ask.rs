@@ -51,6 +51,7 @@ pub(crate) fn needs_drop<W: ConstWorld>(world: &W, ty: PTy, ground: &mut Portabl
 fn refusal(e: NeedsDropError<Ask>) -> Refusal<'static> {
     let build = |e: BuildError, what: &'static str| match e {
         BuildError::Projection { trait_, name } => Refusal::Projection { trait_, name },
+        BuildError::OpaqueOwnerUnchecked { owner, .. } => Refusal::Missing { what: "opaque defining body", item: owner },
         _ => Refusal::NeedsDrop { what },
     };
     match e {

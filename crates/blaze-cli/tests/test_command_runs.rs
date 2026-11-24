@@ -653,3 +653,64 @@ fn impure_test_is_not_kept_and_reruns() {
         check("second impure run reruns instead of reusing", &second);
     });
 }
+
+#[test]
+#[cfg(target_os = "macos")]
+fn termination_returning_tests_pass_fail_and_cache() {
+    let source = r#"
+use std::process::ExitCode;
+
+fn answer() -> u32 {
+    42
+}
+
+#[test]
+fn plain_unit() {
+    assert_eq!(answer(), 42);
+}
+
+#[test]
+fn result_str_ok() -> Result<(), &'static str> {
+    if answer() == 42 { Ok(()) } else { Err("wrong") }
+}
+
+#[test]
+fn result_string_ok() -> Result<(), String> {
+    if answer() == 42 { Ok(()) } else { Err(String::from("wrong")) }
+}
+
+#[test]
+fn result_string_err() -> Result<(), String> {
+    Err(String::from("termination boom"))
+}
+
+#[test]
+fn exit_code_ok() -> ExitCode {
+    ExitCode::SUCCESS
+}
+
+#[test]
+fn exit_code_42() -> ExitCode {
+    ExitCode::from(42)
+}
+"#;
+    fixture("test_command_termination_shim", &[("Cargo.toml", MANIFEST), ("src/lib.rs", source)], |dir, home| {
+        // 1. Cold run: 4 pass (plain_unit, result_str_ok, result_string_ok, exit_code_ok),
+        //    2 fail cleanly (result_string_err with code 1 + "termination boom", exit_code_42 with code 42),
+        //    ZERO `NOT RUN`!
+        let cold = run(dir, home, &["--", "--deadline", "20s"]);
+        assert_eq!(cold.code, Some(1), "{}", evidence("failing termination tests fail the suite", &cold));
+        assert!(!cold.stdout.contains("NOT RUN"), "{}", evidence("no NOT RUN for Termination tests", &cold));
+        assert!(cold.stdout.contains("FAILED result_string_err"), "{}", evidence("result_string_err failed", &cold));
+        assert!(cold.stdout.contains("termination boom"), "{}", evidence("Error message from Result::report printed", &cold));
+        assert!(cold.stdout.contains("FAILED exit_code_42") && cold.stdout.contains("code 42"), "{}", evidence("exit_code_42 failed with code 42", &cold));
+        let expect_summary = "test result: FAILED. ran 6: 4 passed, 2 failed; 0 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky";
+        assert_eq!(cold.stdout.lines().last(), Some(expect_summary), "{}", evidence(expect_summary, &cold));
+
+        // 2. Warm rerun of only the 4 passing tests: all 4 reused from kept results (`ran 0`, `4 reused`).
+        let warm = run(dir, home, &["--", "--skip", "err", "--skip", "42", "--deadline", "20s"]);
+        let expect_warm = "test result: ok. ran 0: 0 passed, 0 failed; 4 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 2 filtered out; 0 flaky\n";
+        assert_eq!(warm.code, Some(0), "{}", evidence("warm passing termination tests reused", &warm));
+        assert_eq!(warm.stdout, expect_warm, "{}", evidence(expect_warm, &warm));
+    });
+}

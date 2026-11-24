@@ -42,7 +42,7 @@ impl<'t> Library<'t> {
     pub fn inputs_for(&self, user: &'t UserCrate<'t>) -> Inputs<'t> {
         let of = self.inputs;
         Inputs {
-            texts: Texts { user: user.files, packs: Shared::Borrowed(&of.texts.packs) },
+            texts: Texts { user: user.files, packs: Shared::Borrowed(&of.texts.packs), arena: of.texts.arena },
             features: Shared::Borrowed(&of.features),
             cfgs: Shared::Borrowed(&of.cfgs),
             deps: Shared::Borrowed(&of.deps),

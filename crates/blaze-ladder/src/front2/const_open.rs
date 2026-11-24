@@ -63,8 +63,9 @@ use super::source::NamesSource;
 use super::types::{Env, Heads, SelfTy, Why};
 
 /// The most constants one evaluation may have evaluated FIRST (`Consts::value_at`'s work
-/// list: each is a constant a head named while a body of the evaluation was checked).
-pub(super) const MOST_FIRSTS: u32 = 64;
+/// list: each is a constant a head named while a body of the evaluation was checked, e.g.
+/// explicit enum discriminants such as `nix::errno::consts::Errno`).
+pub(super) const MOST_FIRSTS: u32 = 1024;
 
 /// The constant that must have a value before the evaluation that failed with `e` can go on:
 /// a head made while one of its bodies was checked names it (`[u8; size_of::<Self>()]` on a

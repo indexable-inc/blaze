@@ -66,11 +66,17 @@ fn stop(e: &blaze_build::layout::LayoutError) -> Stop {
         L::Recursive => Refusal::Malformed { what: "a type that holds itself by value" },
         L::TooLarge => Refusal::Unsupported { what: "a type larger than `isize::MAX` bytes" },
         L::NoAdt(item) => Refusal::Missing { what: "ADT definition", item },
-        L::Ground(ref error) => match projection_of(error) {
-            Some((trait_, name)) => Refusal::Projection { trait_, name },
-            None => Refusal::Unsupported { what: "a field type with no ground form" },
+        L::Ground(ref error) => match *error {
+            blaze_build::BuildError::OpaqueOwnerUnchecked { owner, .. } => Refusal::Missing { what: "opaque defining body", item: owner },
+            _ => match projection_of(error) {
+                Some((trait_, name)) => Refusal::Projection { trait_, name },
+                None => Refusal::Unsupported { what: "a field type with no ground form" },
+            },
         },
-        L::FieldGround { adt, field, name, ref error } => Refusal::FieldGround { adt, field, name, projection: projection_of(error) },
+        L::FieldGround { adt, field, name, ref error } => match *error {
+            blaze_build::BuildError::OpaqueOwnerUnchecked { owner, .. } => Refusal::Missing { what: "opaque defining body", item: owner },
+            _ => Refusal::FieldGround { adt, field, name, projection: projection_of(error) },
+        },
         L::NoSize(item) => Refusal::NoSize { item },
     })
 }
@@ -232,8 +238,10 @@ pub(crate) fn field_ty(key: ItemKey, adt: &Adt<'_>, field: u32, args: List, grou
     let f = adt.fields.get(field as usize).ok_or(Refusal::Malformed { what: "a field past its ADT" })?;
     let mut a: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
     a.extend_from_slice(ground.view().list(args).map_err(|_| bad())?);
-    blaze_build::ground(adt.types, f.ty, &a, ground, scratch, facts)
-        .map_err(|e| Refusal::FieldGround { adt: key, field, name: f.name, projection: projection_of(&e) })
+    blaze_build::ground(adt.types, f.ty, &a, ground, scratch, facts).map_err(|e| match e {
+        blaze_build::BuildError::OpaqueOwnerUnchecked { owner, .. } => Refusal::Missing { what: "opaque defining body", item: owner },
+        _ => Refusal::FieldGround { adt: key, field, name: f.name, projection: projection_of(&e) },
+    })
 }
 
 #[cfg(test)]

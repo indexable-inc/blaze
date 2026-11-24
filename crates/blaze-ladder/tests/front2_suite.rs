@@ -167,18 +167,18 @@ fn show(suite: &Suite<'_, '_, '_>) -> Vec<Shown> {
 }
 
 /// The suite of `text`'s test unit, made in `f`'s hands.
-fn with_suite<R>(tc: &Toolchain, text: &str, f: impl FnOnce(&Names<'_>, &Suite<'_, '_, '_>) -> R) -> R {
+fn with_suite<R>(tc: &Toolchain, text: &str, f: impl FnOnce(&Names<'_>, &mut Suite<'_, '_, '_>) -> R) -> R {
     with_unit(tc, text, true, |names, _cfg, sources| {
         let g = Alloc::global();
         let bytes = encode(names.krate(0), g).unwrap_or_else(|e| panic!("the tests record: {e}")).bytes;
         let record = TestsRecord::open(aligned(&bytes, blaze_own::testing::bump())).unwrap_or_else(|e| panic!("the tests record does not open: {e}"));
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
         let mut left: Vec<(Box<str>, blaze_ladder::front2::program::LeftOut)> = Vec::new();
-        let suite = Front2Program::suite(names, &frame, sources, &record, Some(&mut left), g).unwrap_or_else(|e| panic!("the suite: {e}"));
+        let mut suite = Front2Program::suite(names, &frame, sources, &record, Some(&mut left), g).unwrap_or_else(|e| panic!("the suite: {e}"));
         for (what, why) in &left {
             println!("SUITE left out {what}: {why}");
         }
-        f(names, &suite)
+        f(names, &mut suite)
     })
 }
 
@@ -435,4 +435,78 @@ fn reach_digest_moves_only_for_the_test_that_reaches_the_edit() {
     }
     println!("REACH edit bump: {}", shown.join(", "));
     assert_eq!(shown, ["tests::adds same", "tests::ignored moved", "tests::panics same"]);
+}
+
+/// PART D (piece 8, report shim execution). Builds and runs `SuiteEntry::Report` and
+/// `SuiteEntry::Direct` rows through `blaze_ladder::run::build_suite_entry` + `ran_built`:
+/// - `-> Result<(), String>` `Ok(())` returns exit code 0 (pass), `Err(...)` returns 1 (fail);
+/// - `-> Result<(), &'static str>` `Ok(())` returns 0, `Err(...)` returns 1;
+/// - `-> std::process::ExitCode` `SUCCESS` returns 0, `ExitCode::from(42)` returns 42;
+/// - `-> ()` direct entry still returns 0.
+#[test]
+fn report_shim_runs_termination_tests_in_suite() {
+    const SUITE_LIB: &str = "\
+#[cfg(test)]
+mod tests {
+    use std::process::ExitCode;
+
+    #[test]
+    fn unit_ok() {
+        let x = 2 + 2;
+        assert_eq!(x, 4);
+    }
+
+    #[test]
+    fn result_string_ok() -> Result<(), String> {
+        Ok(())
+    }
+
+    #[test]
+    fn result_string_err() -> Result<(), String> {
+        Err(String::from(\"boom\"))
+    }
+
+    #[test]
+    fn result_str_ok() -> Result<(), &'static str> {
+        Ok(())
+    }
+
+    #[test]
+    fn result_str_err() -> Result<(), &'static str> {
+        Err(\"bad\")
+    }
+
+    #[test]
+    fn exit_code_ok() -> ExitCode {
+        ExitCode::SUCCESS
+    }
+
+    #[test]
+    fn exit_code_42() -> ExitCode {
+        ExitCode::from(42)
+    }
+}
+";
+    let tc = toolchain();
+    with_suite(&tc, SUITE_LIB, |_names, suite| {
+        let alloc = blaze_own::testing::heap().shared();
+        let cases = [
+            ("tests::unit_ok", 0u8),
+            ("tests::result_string_ok", 0u8),
+            ("tests::result_string_err", 1u8),
+            ("tests::result_str_ok", 0u8),
+            ("tests::result_str_err", 1u8),
+            ("tests::exit_code_ok", 0u8),
+            ("tests::exit_code_42", 42u8),
+        ];
+        for (path, want_status) in cases {
+            let row = suite.row_of(path).unwrap_or_else(|| panic!("row `{path}` missing"));
+            let entry = suite.rows[row].entry.clone().unwrap_or_else(|e| panic!("entry `{path}` refused: {e:?}"));
+            let built = blaze_ladder::run::build_suite_entry(&mut suite.program, entry, blaze_ladder::run::OverflowChecks::On, alloc.into())
+                .unwrap_or_else(|e| panic!("build_suite_entry `{path}` failed: {e}"));
+            let ran = blaze_ladder::run::ran_built(built, None, alloc)
+                .unwrap_or_else(|e| panic!("ran_built `{path}` failed: {e}"));
+            assert_eq!(ran.status, want_status, "test `{path}` returned wrong status");
+        }
+    });
 }

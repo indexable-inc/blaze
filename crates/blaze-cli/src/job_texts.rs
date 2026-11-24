@@ -312,7 +312,7 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
             return Some(text);
         }
         if tree != 0 {
-            return core::str::from_utf8(self.packs.tree(self.cx, self.frame, tree)?.find(inner)?.bytes).ok();
+            return self.packs.tree(self.cx, self.frame, tree)?.read_str_slice(inner, self.frame).ok()?;
         }
         if let Some((_, text)) = self.read.borrow().iter().find(|(p, _)| *p == inner) {
             return *text;
@@ -370,7 +370,7 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         let (tree, inner) = rest.split_once('/')?;
         let tree: usize = tree.parse().ok()?;
         if tree != 0 {
-            return Some(self.packs.tree(self.cx, self.frame, tree)?.find(inner)?.bytes);
+            return self.packs.tree(self.cx, self.frame, tree)?.read_slice(inner, self.frame).ok()?;
         }
         let bytes = self.checkout_bytes(inner);
         let from = from.strip_prefix("/0/").unwrap_or(from);

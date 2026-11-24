@@ -5,8 +5,8 @@ use core::alloc::Allocator;
 
 use blaze_own::{RevBitCursor, SliceWriter, Vec};
 
-use crate::zstd::ZstdError;
-use crate::zstd::fse::{
+use crate::ZstdError;
+use crate::fse::{
     BitWriter, FseDecTable, FseEncTable, normalize_fse_counts, write_fse_header,
 };
 

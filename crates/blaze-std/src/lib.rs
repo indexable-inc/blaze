@@ -399,7 +399,7 @@ pub mod yaml;
 /// Bounded, traversal-safe Store/Deflate ZIP archive reader and writer over [`compress`] and [`digest::Crc32`].
 pub mod zip;
 /// Pure `#![no_std]` RFC 8878 Zstandard compression and decompression (`XXH64` checksums).
-pub mod zstd;
+pub use blaze_zstd as zstd;
 /// A worker's state as a value the pool owns, in typed columns (D171): `Workers`, `Slot<T>`,
 /// `cx.on_worker`.
 #[expect(

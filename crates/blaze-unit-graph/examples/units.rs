@@ -330,7 +330,7 @@ fn main() {
             "" => "Cargo.toml".to_owned(),
             dir => format!("{dir}/Cargo.toml"),
         };
-        assert!(view.find(&manifest).is_some(), "{}: no `{manifest}` in its record", lock.package(*id).name);
+        assert!(view.find_entry(&manifest).is_some(), "{}: no `{manifest}` in its record", lock.package(*id).name);
         located += 1;
     }
     println!("files         {located} store packages located, each directory's Cargo.toml present ({:.1} ms)", t_files.elapsed().as_secs_f64() * 1e3);

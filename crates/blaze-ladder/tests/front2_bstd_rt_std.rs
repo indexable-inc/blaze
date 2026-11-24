@@ -205,7 +205,8 @@ fn the_shelfs_crates_read_with_every_module_file() {
         let root = if krate.dir.is_empty() || row.root.starts_with(krate.dir) { row.root.to_string() } else { format!("{}/{}", krate.dir, row.root) };
         let mut cfg = target_cfg.clone();
         cfg.extend(row.features().map(|f| ("feature", Some(f))));
-        let file = |p: &str| pack.find(p).and_then(|f| std::str::from_utf8(f.bytes).ok());
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Other).expect("decode frame");
+        let file = |p: &str| pack.read_str_slice(p, &frame).ok().flatten();
         match blaze_toolchain::implied::crate_facts(&root, file, &cfg, blaze_own::Alloc::global()) {
             Ok(facts) => {
                 read += 1;

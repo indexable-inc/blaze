@@ -2069,7 +2069,9 @@ impl MakeFail {
 }
 
 /// The most constants one fill may need evaluated before it is made (rule 18).
-const MOST_CONSTS: u32 = 64;
+/// Constants evaluated for one head fill before giving up (array lengths, pattern bounds, or
+/// explicit enum discriminants such as `nix::errno::consts::Errno`).
+const MOST_CONSTS: u32 = 1024;
 
 /// Builds a [`CheckFail::Const`] carrying [`ConstFail::Nested`] for `key` on `owner`.
 pub(super) fn const_nested_fail<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, key: LibKey) -> CheckFail {

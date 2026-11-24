@@ -41,7 +41,7 @@ pub mod every_body;
 
 /// How many constants an array length in one body's heads may name before the body is
 /// refused ([`Refused::Lengths`]): reach.rs's and the census's `MOST_LENS`.
-pub(super) const MOST_LENS: u32 = 64;
+pub(super) const MOST_LENS: u32 = 1024;
 
 /// One body of the program's own crate: a free fn, `const` or `static` (its initializer), or a
 /// fn or `const` member of an impl or a trait (`kind`: [`MemberKind::Fn`] or

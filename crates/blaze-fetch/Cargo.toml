@@ -32,6 +32,8 @@ blaze-unicode.workspace = true
 # gzip and tar: a `.crate`, inflated and read under the limits given, every path checked.
 blaze-deflate.workspace = true
 blaze-tar.workspace = true
+# RFC 8878 Zstandard + raw-content dictionary: per-file payload compression in `BLZFPK04` packs.
+blaze-zstd.workspace = true
 # A git commit: protocol v2's request and answer, the pack read and its tree walked.
 blaze-git-fetch.workspace = true
 # Source corrections (`correct`, D58): the table read strictly, crate versions matched, files

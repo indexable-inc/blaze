@@ -458,9 +458,9 @@ impl<'t> Holds<'t> {
     }
 }
 
-fn atom<'t>(name: &'t str, value: Option<&str>, cfg: Cfg<'_>, line: u32) -> Holds<'t> {
+fn atom<'t>(name: &'t str, value: Option<&str>, cfg: Cfg<'_>, text: &str, at: usize) -> Holds<'t> {
     if name == "debug_assertions" {
-        return Holds::Unknown(ImpliedRefused::ProfileAtom { name, line });
+        return Holds::Unknown(ImpliedRefused::ProfileAtom { name, line: line_of(text, at) });
     }
     Holds::of(cfg.iter().any(|(n, v)| *n == name && *v == value))
 }
@@ -485,9 +485,10 @@ fn holds<'t>(lx: &mut Lexer<'t>, cfg: Cfg<'_>) -> Result<Holds<'t>, ImpliedRefus
     let mut stack = [(Combine::All, Holds::No, 0u32); MAX_DEPTH];
     let mut depth = 0usize;
     loop {
-        let line = lx.line(lx.at);
-        let Some((tok, at)) = lx.next()? else { return Err(ImpliedRefused::Predicate { why: "a cfg predicate cut short", line }) };
-        let line = lx.line(at);
+        let before = lx.at;
+        let Some((tok, at)) = lx.next()? else {
+            return Err(ImpliedRefused::Predicate { why: "a cfg predicate cut short", line: lx.line(before) });
+        };
         let value = match tok {
             Tok::Ident(name) => {
                 let save = lx.at;
@@ -504,10 +505,10 @@ fn holds<'t>(lx: &mut Lexer<'t>, cfg: Cfg<'_>) -> Result<Holds<'t>, ImpliedRefus
                             }
                         };
                         if !matches!(name, "all" | "any" | "not") {
-                            Holds::Unknown(ImpliedRefused::UnknownPredicate { name, line })
+                            Holds::Unknown(ImpliedRefused::UnknownPredicate { name, line: lx.line(at) })
                         } else {
                             if depth == MAX_DEPTH {
-                                return Err(ImpliedRefused::TooDeep { line });
+                                return Err(ImpliedRefused::TooDeep { line: lx.line(at) });
                             }
                             stack[depth] = (kind, Holds::of(kind == Combine::All), 0);
                             depth += 1;
@@ -515,12 +516,12 @@ fn holds<'t>(lx: &mut Lexer<'t>, cfg: Cfg<'_>) -> Result<Holds<'t>, ImpliedRefus
                         }
                     }
                     Some((Tok::Punct(b'='), _)) => match lx.next()? {
-                        Some((Tok::Str(value), _)) => atom(name, Some(value), cfg, line),
-                        _ => return Err(ImpliedRefused::ValueForm { line }),
+                        Some((Tok::Str(value), _)) => atom(name, Some(value), cfg, lx.text, at),
+                        _ => return Err(ImpliedRefused::ValueForm { line: lx.line(at) }),
                     },
                     _ => {
                         lx.at = save;
-                        atom(name, None, cfg, line)
+                        atom(name, None, cfg, lx.text, at)
                     }
                 }
             }
@@ -529,11 +530,11 @@ fn holds<'t>(lx: &mut Lexer<'t>, cfg: Cfg<'_>) -> Result<Holds<'t>, ImpliedRefus
                 depth -= 1;
                 let (kind, acc, n) = stack[depth];
                 if kind == Combine::Not && n != 1 {
-                    return Err(ImpliedRefused::Predicate { why: "`not(..)` of other than one predicate", line });
+                    return Err(ImpliedRefused::Predicate { why: "`not(..)` of other than one predicate", line: lx.line(at) });
                 }
                 acc
             }
-            _ => return Err(ImpliedRefused::Predicate { why: "a token no cfg predicate holds", line }),
+            _ => return Err(ImpliedRefused::Predicate { why: "a token no cfg predicate holds", line: lx.line(at) }),
         };
         if depth == 0 {
             return Ok(value);
@@ -572,12 +573,12 @@ fn cfg_attr_parts<'t>(lx: &mut Lexer<'t>, out: &mut Ranges) -> Result<usize, Imp
             None => return Err(ImpliedRefused::Unclosed { what: "`cfg_attr`", line: lx.line(pred) }),
             Some((Tok::Open(_), _)) => depth += 1,
             Some((Tok::Close(_), at)) if depth == 0 => {
-                out.push((start, at), lx.line(at))?;
+                out.push((start, at), lx.text, at)?;
                 return Ok(pred);
             }
             Some((Tok::Close(_), _)) => depth -= 1,
             Some((Tok::Punct(b','), at)) if depth == 0 => {
-                out.push((start, at), lx.line(at))?;
+                out.push((start, at), lx.text, at)?;
                 start = lx.at;
             }
             Some(_) => {}
@@ -596,9 +597,9 @@ impl Ranges {
         Ranges { items: [(0, 0); MAX_DEPTH], len: 0 }
     }
 
-    fn push<'t>(&mut self, range: (usize, usize), line: u32) -> Result<(), ImpliedRefused<'t>> {
+    fn push<'t>(&mut self, range: (usize, usize), text: &str, at: usize) -> Result<(), ImpliedRefused<'t>> {
         if self.len == MAX_DEPTH {
-            return Err(ImpliedRefused::TooDeep { line });
+            return Err(ImpliedRefused::TooDeep { line: line_of(text, at) });
         }
         self.items[self.len] = range;
         self.len += 1;
@@ -634,7 +635,7 @@ fn expand<'t>(
     mut each: impl FnMut(&'t str, Lexer<'t>) -> Result<(), ImpliedRefused<'t>>,
 ) -> Result<(), ImpliedRefused<'t>> {
     let mut work = Ranges::new();
-    work.push(range, line_of(text, range.0))?;
+    work.push(range, text, range.0)?;
     while let Some(range) = work.pop() {
         let Some((word, mut lx)) = word_of(text, range)? else { continue };
         if word != "cfg_attr" {
@@ -656,7 +657,7 @@ fn expand<'t>(
         let mut p = Lexer { text, at: pred, end: range.1 };
         if predicate(&mut p, cfg)? {
             for part in &parts.items[..parts.len] {
-                work.push(*part, line_of(text, part.0))?;
+                work.push(*part, text, part.0)?;
             }
         }
     }
@@ -823,16 +824,16 @@ fn scan_file<'t, 'a>(
                 let range = lx.group(open)?;
                 let (mut holds, mut path) = (Holds::Yes, None);
                 expand(text, range, cfg, |w| matches!(w, "cfg" | "path"), |word, mut rest| {
-                    let line = rest.line(rest.at);
+                    let at_rest = rest.at;
                     if word == "path" {
                         match (rest.next()?, rest.next()?) {
                             (Some((Tok::Punct(b'='), _)), Some((Tok::Str(p), _))) => path = Some(p),
-                            _ => return Err(ImpliedRefused::ModulePath { line }),
+                            _ => return Err(ImpliedRefused::ModulePath { line: rest.line(at_rest) }),
                         }
                         return Ok(());
                     }
                     let Some((Tok::Open(b'('), _)) = rest.next()? else {
-                        return Err(ImpliedRefused::Predicate { why: "a `cfg` with no predicate", line });
+                        return Err(ImpliedRefused::Predicate { why: "a `cfg` with no predicate", line: rest.line(at_rest) });
                     };
                     holds = holds.and(self::holds(&mut rest, cfg)?);
                     Ok(())

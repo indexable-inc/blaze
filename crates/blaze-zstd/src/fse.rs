@@ -4,7 +4,7 @@ use core::alloc::Allocator;
 
 use blaze_own::{AllocFailure, Vec};
 
-use crate::zstd::ZstdError;
+use crate::ZstdError;
 
 pub(crate) const MAX_FSE_LOG: u8 = 9;
 pub(crate) const MAX_FSE_TABLE_SIZE: usize = 1 << MAX_FSE_LOG;

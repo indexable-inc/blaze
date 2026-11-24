@@ -308,3 +308,73 @@ fn a_reify_shim_passes_its_fns_own_definition_site() {
     assert!(has_own_sig(gview, &[Ty::PTR, Ty::PTR], &[]), "sret + agg arg, no location: {gtext}");
     assert!(has_direct_call_sig(gview, &[Ty::PTR, Ty::PTR, Ty::PTR], &[]), "generic agg reify shim calls callee with (sret, arg, loc): {gtext}");
 }
+
+/// `build_test_report_shim` (test.md, piece 8) builds an `extern "C" fn(i32, ptr) -> i32` shim
+/// that calls a monomorphic `#[test]` fn, forwards its returned value (scalar, pair, or sret
+/// aggregate) to `<R as Termination>::report`, and returns the resulting 1-byte `ExitCode`
+/// zero-extended to `i32`; diverging (`-> !`) tests emit `AfterDivergingCall` unreachable.
+#[test]
+fn test_report_shim_builds_for_exit_code_sret_and_never() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut w = TestWorld::new();
+    // 1-byte `ExitCode(u8)` struct matching `std::process::ExitCode`.
+    w.strukt(30, "ExitCode", &[("code", PNode::Uint(UintTy::U8))]);
+    let exit_code = PNode::Adt(ItemKey(30), List::EMPTY);
+    // 24-byte aggregate (sret on AArch64), matching `Result<(), String>`.
+    w.strukt(31, "BigResult", &[
+        ("a", PNode::Uint(UintTy::U64)),
+        ("b", PNode::Uint(UintTy::U64)),
+        ("c", PNode::Uint(UintTy::U64)),
+    ]);
+    let big_result = PNode::Adt(ItemKey(31), List::EMPTY);
+    // `trait Termination { fn report(self) -> ExitCode; }`
+    let report_item = ItemKey(40);
+    w.generic_func(40, "report", 1, &[PNode::Param(0)], exit_code);
+    // Test returning `ExitCode` (1-byte scalar agg)
+    let test_exit = ItemKey(41);
+    w.generic_func(41, "test_exit", 0, &[], exit_code);
+    // Test returning `BigResult` (24-byte sret agg)
+    let test_big = ItemKey(42);
+    w.generic_func(42, "test_big", 0, &[], big_result);
+    // Diverging test returning `!`
+    let test_never = ItemKey(43);
+    w.generic_func(43, "test_never", 0, &[], PNode::Never);
+
+    let body = BodyBuf::new();
+    let report_sig = w.sig(report_item).expect("report sig");
+
+    // 1. 1-byte `ExitCode` return.
+    let mut ground = PortableTys::new_in(alloc);
+    let exit_sig = w.sig(test_exit).expect("test_exit sig");
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: alloc };
+    let built_exit = crate::build_test_report_shim(test_exit, &exit_sig, report_item, &report_sig, &mut subst, &TestAdts { world: &w, body: &body }, alloc)
+        .unwrap_or_else(|e| panic!("test_exit report shim failed: {e}"));
+    blaze_lir::verify(built_exit.func.view()).expect("test_exit report shim verifies");
+    let exit_text = blaze_lir::print(built_exit.func.view());
+    assert!(has_own_sig(built_exit.func.view(), &[Ty::I32, Ty::PTR], &[Ty::I32]), "c-main sig: {exit_text}");
+    assert_eq!(built_exit.refs.len(), 2, "calls test and Termination::report: {exit_text}");
+    assert_eq!(built_exit.refs[0], Instance { item: test_exit, args: List::EMPTY });
+    assert_eq!(built_exit.refs[1].item, report_item);
+
+    // 2. 24-byte sret aggregate return.
+    let mut ground = PortableTys::new_in(alloc);
+    let big_sig = w.sig(test_big).expect("test_big sig");
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: alloc };
+    let built_big = crate::build_test_report_shim(test_big, &big_sig, report_item, &report_sig, &mut subst, &TestAdts { world: &w, body: &body }, alloc)
+        .unwrap_or_else(|e| panic!("test_big report shim failed: {e}"));
+    blaze_lir::verify(built_big.func.view()).expect("test_big report shim verifies");
+    let big_text = blaze_lir::print(built_big.func.view());
+    assert!(has_own_sig(built_big.func.view(), &[Ty::I32, Ty::PTR], &[Ty::I32]), "c-main sig: {big_text}");
+    assert_eq!(built_big.refs.len(), 2, "calls test_big and Termination::report: {big_text}");
+    assert_eq!(built_big.refs[0], Instance { item: test_big, args: List::EMPTY });
+    assert_eq!(built_big.refs[1].item, report_item);
+
+    // 3. Diverging `-> !` return does not call `Termination::report` (unreachable after test call).
+    let mut ground = PortableTys::new_in(alloc);
+    let never_sig = w.sig(test_never).expect("test_never sig");
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: alloc };
+    let built_never = crate::build_test_report_shim(test_never, &never_sig, report_item, &report_sig, &mut subst, &TestAdts { world: &w, body: &body }, alloc)
+        .unwrap_or_else(|e| panic!("test_never report shim failed: {e}"));
+    blaze_lir::verify(built_never.func.view()).expect("test_never report shim verifies");
+    assert_eq!(built_never.refs.as_slice(), &[Instance { item: test_never, args: List::EMPTY }]);
+}

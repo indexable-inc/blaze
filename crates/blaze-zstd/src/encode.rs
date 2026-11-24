@@ -10,15 +10,16 @@ use blaze_own::{
     lz77_scan_fast,
 };
 
-use crate::digest::xxh64;
-use crate::zstd::fse::{
+use crate::dict::ZstdDict;
+use crate::fse::{
     FseDecTable, FseEncTable, LL_DEFAULT_LOG, LL_DEFAULT_NORM, LL_ENC_PACKED, LL_MAX_CODE,
     ML_DEFAULT_LOG, ML_DEFAULT_NORM, ML_ENC_PACKED, ML_MAX_CODE, OF_DEFAULT_LOG, OF_DEFAULT_NORM,
     OF_MAX_CODE, encode_ll_fast, encode_ll_raw, encode_ml_fast, encode_ml_raw, encode_of_fast,
     encode_of_raw, normalize_fse_counts, write_fse_header,
 };
-use crate::zstd::huffman::{HuffEncCache, encode_huffman_literals_into};
-use crate::zstd::{CompressOpts, Level, MAX_BLOCK_SIZE, ZSTD_MAGIC, ZstdError};
+use crate::huffman::{HuffEncCache, encode_huffman_literals_into};
+use crate::xxh64::xxh64;
+use crate::{CompressOpts, Level, MAX_BLOCK_SIZE, ZSTD_MAGIC, ZstdError};
 
 /// 4 MiB sliding window for multi-block frames (well within `ZstdLimits::USUAL` = 8 MiB).
 const MAX_WINDOW: usize = 1 << 22;
@@ -265,6 +266,8 @@ pub struct ZstdEncoder<A: Allocator + Copy> {
     custom_ml: FseEncTable,
     hash_table: Vec<u32, A>,
     hash_table_2way: Vec<u64, A>,
+    dict_work: Vec<u8, A>,
+    dict_tag: (usize, usize, u64),
     literals_buf: Vec<u8, A>,
     raw_seqs: Vec<SeqOp, A>,
     comp_buf: Vec<u8, A>,
@@ -284,6 +287,8 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
             custom_ml: FseEncTable::new_empty(),
             hash_table: Vec::new_in(alloc),
             hash_table_2way: Vec::new_in(alloc),
+            dict_work: Vec::new_in(alloc),
+            dict_tag: (0, 0, 0),
             literals_buf: Vec::new_in(alloc),
             raw_seqs: Vec::new_in(alloc),
             comp_buf: Vec::new_in(alloc),
@@ -302,6 +307,20 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
         Ok(out)
     }
 
+    /// Compress `input` with pre-hashed raw-content dictionary `dict` into a freshly allocated
+    /// RFC 8878 Zstandard frame in this encoder's allocator.
+    pub fn compress_with_dict<D: Allocator + Copy>(
+        &mut self,
+        input: &[u8],
+        dict: &ZstdDict<D>,
+        opts: CompressOpts,
+    ) -> Result<Vec<u8, A>, ZstdError> {
+        let init_cap = (input.len() / 2).max(256).min(input.len().saturating_add(64));
+        let mut out = Vec::try_with_capacity_in(init_cap, self.alloc)?;
+        self.compress_with_dict_into(input, dict, opts, &mut out)?;
+        Ok(out)
+    }
+
     /// Compress `input`, appending a complete RFC 8878 Zstandard frame into `out`.
     pub fn compress_into(
         &mut self,
@@ -309,12 +328,43 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
         opts: CompressOpts,
         out: &mut Vec<u8, A>,
     ) -> Result<(), ZstdError> {
+        self.compress_inner(input, None, opts, out)
+    }
+
+    /// Compress `input` using pre-hashed raw-content dictionary `dict`, appending a complete
+    /// RFC 8878 Zstandard frame into `out`.
+    pub fn compress_with_dict_into<D: Allocator + Copy>(
+        &mut self,
+        input: &[u8],
+        dict: &ZstdDict<D>,
+        opts: CompressOpts,
+        out: &mut Vec<u8, A>,
+    ) -> Result<(), ZstdError> {
+        if dict.bytes().is_empty() {
+            return self.compress_inner(input, None, opts, out);
+        }
+        self.compress_inner(
+            input,
+            Some((dict.bytes(), dict.fast_table(), dict.default_table(), dict.hash())),
+            opts,
+            out,
+        )
+    }
+
+    fn compress_inner(
+        &mut self,
+        input: &[u8],
+        dict: Option<(&[u8], &[u32], &[u64], u64)>,
+        opts: CompressOpts,
+        out: &mut Vec<u8, A>,
+    ) -> Result<(), ZstdError> {
         // 1. Frame magic
         out.try_extend_from_slice(&ZSTD_MAGIC.to_le_bytes())?;
 
         // 2. Frame header descriptor + optional Window_Descriptor + Frame_Content_Size
+        let has_dict = dict.is_some();
         let len_u64 = u64::try_from(input.len()).map_err(|_| ZstdError::CorruptSequences)?;
-        let single_segment = input.len() <= MAX_BLOCK_SIZE;
+        let single_segment = !has_dict && input.len() <= MAX_BLOCK_SIZE;
         let fcs_flag: u8 = if single_segment && len_u64 <= 255 {
             0
         } else if (256..=65_791).contains(&len_u64) {
@@ -361,67 +411,103 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
             write_block_header(out, true, 0, 0)?;
         } else {
             let fast_mode = matches!(opts.level, Level::Fast);
-            if fast_mode {
-                ensure_zero_hash(&mut self.hash_table, LZ77_FAST_HASH_SIZE)?;
+            let dict_len = if let Some((db, ft, dt, dh)) = dict {
+                let tag = (db.as_ptr().addr(), db.len(), dh);
+                if self.dict_tag != tag || self.dict_work.len() < db.len() {
+                    self.dict_work.clear();
+                    self.dict_work.try_reserve(db.len().saturating_add(input.len()))?;
+                    self.dict_work.try_extend_from_slice(db)?;
+                    self.dict_tag = tag;
+                } else {
+                    self.dict_work.truncate(db.len());
+                    self.dict_work.try_reserve(input.len())?;
+                }
+                self.dict_work.try_extend_from_slice(input)?;
+                if fast_mode {
+                    if self.hash_table.len() != LZ77_FAST_HASH_SIZE {
+                        self.hash_table.clear();
+                        self.hash_table.try_extend_from_slice(ft)?;
+                    } else {
+                        self.hash_table.as_mut_slice().copy_from_slice(ft);
+                    }
+                } else if self.hash_table_2way.len() != LZ77_DEF_BUCKETS {
+                    self.hash_table_2way.clear();
+                    self.hash_table_2way.try_extend_from_slice(dt)?;
+                } else {
+                    self.hash_table_2way.as_mut_slice().copy_from_slice(dt);
+                }
+                db.len()
             } else {
-                ensure_zero_u64(&mut self.hash_table_2way, LZ77_DEF_BUCKETS)?;
-            }
+                if fast_mode {
+                    ensure_zero_hash(&mut self.hash_table, LZ77_FAST_HASH_SIZE)?;
+                } else {
+                    ensure_zero_u64(&mut self.hash_table_2way, LZ77_DEF_BUCKETS)?;
+                }
+                0
+            };
             self.huff_cache.reset();
 
             let mut rep = [1usize, 4usize, 8usize];
             let mut emitted_predef_fse = false;
             let mut has_fast_custom_fse = false;
-            let mut block_start: usize = 0;
+            let scan_end = dict_len.saturating_add(input.len());
+            let mut block_start: usize = dict_len;
 
-            while block_start < input.len() {
-                let block_end = block_start.saturating_add(MAX_BLOCK_SIZE).min(input.len());
-                let last_block = block_end == input.len();
-                let block = input.get(block_start..block_end).ok_or(ZstdError::CorruptLiterals)?;
+            while block_start < scan_end {
+                let block_end = block_start.saturating_add(MAX_BLOCK_SIZE).min(scan_end);
+                let last_block = block_end == scan_end;
+                let block_len = block_end.saturating_sub(block_start);
+                let input_block = input
+                    .get(block_start.saturating_sub(dict_len)..block_end.saturating_sub(dict_len))
+                    .ok_or(ZstdError::CorruptLiterals)?;
 
-                if block.len() >= 4
-                    && let Some(byte) = is_all_same(block)
+                if input_block.len() >= 4
+                    && let Some(byte) = is_all_same(input_block)
                 {
-                    write_block_header(out, last_block, 1, block.len())?;
+                    write_block_header(out, last_block, 1, block_len)?;
                     out.try_push(byte).map_err(|r| r.why)?;
                     block_start = block_end;
                     continue;
                 }
 
                 let mut trial_rep = rep;
-                if fast_mode {
-                    let table_arr: &mut [u32; LZ77_FAST_HASH_SIZE] = self
-                        .hash_table
-                        .as_mut_slice()
-                        .get_mut(..LZ77_FAST_HASH_SIZE)
-                        .and_then(|s| s.try_into().ok())
-                        .ok_or(ZstdError::CorruptSequences)?;
-                    lz77_scan_fast(
-                        input,
-                        block_start,
-                        block_end,
-                        MAX_WINDOW,
-                        table_arr,
-                        &mut trial_rep,
-                        &mut self.literals_buf,
-                        &mut self.raw_seqs,
-                    )?;
-                } else {
-                    let table_arr: &mut [u64; LZ77_DEF_BUCKETS] = self
-                        .hash_table_2way
-                        .as_mut_slice()
-                        .get_mut(..LZ77_DEF_BUCKETS)
-                        .and_then(|s| s.try_into().ok())
-                        .ok_or(ZstdError::CorruptSequences)?;
-                    lz77_scan_default(
-                        input,
-                        block_start,
-                        block_end,
-                        MAX_WINDOW,
-                        table_arr,
-                        &mut trial_rep,
-                        &mut self.literals_buf,
-                        &mut self.raw_seqs,
-                    )?;
+                {
+                    let scan_input: &[u8] = if dict_len > 0 { self.dict_work.as_slice() } else { input };
+                    if fast_mode {
+                        let table_arr: &mut [u32; LZ77_FAST_HASH_SIZE] = self
+                            .hash_table
+                            .as_mut_slice()
+                            .get_mut(..LZ77_FAST_HASH_SIZE)
+                            .and_then(|s| s.try_into().ok())
+                            .ok_or(ZstdError::CorruptSequences)?;
+                        lz77_scan_fast(
+                            scan_input,
+                            block_start,
+                            block_end,
+                            MAX_WINDOW,
+                            table_arr,
+                            &mut trial_rep,
+                            &mut self.literals_buf,
+                            &mut self.raw_seqs,
+                        )?;
+                    } else {
+                        let table_arr: &mut [u64; LZ77_DEF_BUCKETS] = self
+                            .hash_table_2way
+                            .as_mut_slice()
+                            .get_mut(..LZ77_DEF_BUCKETS)
+                            .and_then(|s| s.try_into().ok())
+                            .ok_or(ZstdError::CorruptSequences)?;
+                        lz77_scan_default(
+                            scan_input,
+                            block_start,
+                            block_end,
+                            MAX_WINDOW,
+                            table_arr,
+                            &mut trial_rep,
+                            &mut self.literals_buf,
+                            &mut self.raw_seqs,
+                        )?;
+                    }
                 }
 
                 if !self.raw_seqs.is_empty() {
@@ -432,7 +518,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
                         emitted_predef_fse && !use_custom_fse,
                         has_fast_custom_fse,
                     )?;
-                    if self.comp_buf.len() < block.len() {
+                    if self.comp_buf.len() < block_len {
                         write_block_header(out, last_block, 2, self.comp_buf.len())?;
                         out.try_extend_from_slice(self.comp_buf.as_slice())?;
                         rep = trial_rep;
@@ -449,8 +535,8 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
                     self.huff_cache.discard();
                 }
 
-                write_block_header(out, last_block, 0, block.len())?;
-                out.try_extend_from_slice(block)?;
+                write_block_header(out, last_block, 0, input_block.len())?;
+                out.try_extend_from_slice(input_block)?;
                 block_start = block_end;
             }
         }

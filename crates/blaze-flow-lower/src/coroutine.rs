@@ -425,19 +425,14 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
     /// and the output's placeholder stands for in the block's maker ([`LoweredAsync::externals`]).
     fn run_async(&mut self, block: ExprId, inner: ExprId, externals: &mut Vec<(blaze_flow::Origin, External), A>) -> Result<(), Refusal> {
         let ck = self.ck;
-        // The block's captures, in row order: argument `1 + k` is row `k`.
-        let mut rows: Vec<(PatId, CaptureKind), A> = Vec::new_in(self.alloc);
-        {
-            let firsts = ck.captures.column::<0>();
-            let pats = ck.captures.column::<1>();
-            let kinds = ck.captures.column::<2>();
-            for i in 0..firsts.len() {
-                if firsts[i] == block {
-                    rows.push((pats[i], kinds[i]));
-                }
-            }
+        // The block's captures, in environment-field order: argument `1 + k` is field `k`.
+        self.env_now.clear();
+        self.field_places.clear();
+        for f in ck.env_fields_by::<blaze_typeck::Places>(block) {
+            self.env_now.push(f);
         }
-        let nu = rows.len() as u32;
+        let mut rows: Vec<(PatId, CaptureKind), A> = Vec::new_in(self.alloc);
+        let Ok(nu) = u32::try_from(self.env_now.len()) else { return self.refuse(Form::Bound, block) };
         self.b.replace(blaze_flow::FlowBuilder::new_in(1 + nu, nu, self.alloc));
         self.nargs = nu;
         let entry = self.b.block();
@@ -446,36 +441,49 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         self.scope_marks.push(0);
         self.scope_temps.push((self.temps.len() as u32, self.temp_marks.len() as u32));
         // The next position of the future value (`External::Capture`): a capture by reference
-        // is its reference then its variable's type's positions, one by value its type's, the
-        // order `Lower::npos` of `PNode::Future` counts and `closure_value` lays them in. An
+        // is its reference then its captured place's type's positions, one by value its type's,
+        // the order `Lower::npos` of `PNode::Future` counts and `closure_value` lays them in. An
         // async block is polled through `Pin<&mut Self>` and owns its captures, so no capture
         // is reached through a per-call environment reference (closure.rs `External::Env`).
         let mut value_at = 0u32;
-        for k in 0..rows.len() {
-            let (p, kind) = rows[k];
-            let t = match ck.local_ty.get(p.ix()) {
-                Some(&t) => t,
-                None => return self.refuse_pat(Form::Malformed, p),
-            };
+        for k in 0..self.env_now.len() {
+            let f = self.env_now[k];
+            let kind = f.how;
             let l = Local(1 + k as u32);
             let first = self.origs.len() as u32;
-            match kind {
-                CaptureKind::ByValue => {
-                    self.new_local_with(TyD::of(t), true, Some(l), block)?;
-                    if let Some(slot) = self.pat_local.get_mut(p.ix()) {
-                        *slot = l.0;
-                    } else {
-                        return self.refuse_pat(Form::Malformed, p);
+            if f.is_whole() {
+                let p = f.base;
+                rows.push((p, kind));
+                let t = match ck.local_ty.get(p.ix()) {
+                    Some(&t) => t,
+                    None => return self.refuse_pat(Form::Malformed, p),
+                };
+                match kind {
+                    CaptureKind::ByValue => {
+                        self.new_local_with(TyD::of(t), true, Some(l), block)?;
+                        if let Some(slot) = self.pat_local.get_mut(p.ix()) {
+                            *slot = l.0;
+                        } else {
+                            return self.refuse_pat(Form::Malformed, p);
+                        }
+                    }
+                    CaptureKind::ByRef | CaptureKind::ByMutRef => {
+                        let m = if kind == CaptureKind::ByRef { Mutbl::Not } else { Mutbl::Mut };
+                        let rt = TyD { wrap: Some(m), ty: t };
+                        self.new_local_with(rt, true, Some(l), block)?;
+                        let at = self.place_of(l);
+                        let place = self.project(at, rt, Proj::Deref, TyD::of(t), false, block)?;
+                        self.upvar_places.push((p, place, TyD::of(t)));
                     }
                 }
-                CaptureKind::ByRef | CaptureKind::ByMutRef => {
-                    let m = if kind == CaptureKind::ByRef { Mutbl::Not } else { Mutbl::Mut };
-                    let rt = TyD { wrap: Some(m), ty: t };
-                    self.new_local_with(rt, true, Some(l), block)?;
-                    let at = self.place_of(l);
-                    let place = self.project(at, rt, Proj::Deref, TyD::of(t), false, block)?;
-                    self.upvar_places.push((p, place, TyD::of(t)));
-                }
+            } else {
+                let through = match kind {
+                    CaptureKind::ByValue => None,
+                    CaptureKind::ByRef => Some(Mutbl::Not),
+                    CaptureKind::ByMutRef => Some(Mutbl::Mut),
+                };
+                let Ok(k32) = u32::try_from(k) else { return self.refuse(Form::Bound, block) };
+                self.place_upvar(block, k32, f, through)?;
             }
             let made = self.origs.len() as u32;
             for o in first..made {
