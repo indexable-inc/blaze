@@ -145,6 +145,7 @@ pub mod texts;
 pub mod thin_arc;
 pub mod thin_vec;
 pub mod vec;
+mod xxhash;
 
 // A test-only switch that plants a known bug, for the oracles' controls (rule 53).
 #[cfg(test)]
@@ -169,7 +170,7 @@ pub use byte_cursor::{
     ByteCursor, RevBitCursor, SeqExecCtx, SeqLeafResult, SeqOp, SliceWriter, common_prefix_len,
 };
 pub use lz77::{
-    FsePackTable, LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, fse_pack_sequences_fast,
+    FseSeqEncTables, LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, fse_pack_sequences_fast,
     huff_encode_stream_checked_raw, huff_encode_stream_raw, lz77_preload_default,
     lz77_preload_fast, lz77_scan_default, lz77_scan_fast,
 };
@@ -190,6 +191,7 @@ pub use text::{FromUtf8Error, String};
 pub use thin_arc::{ThinArc, ThinArcSlice, ThinStr};
 pub use thin_vec::ThinVec;
 pub use vec::{CollectIn, Refused, Vec};
+pub use xxhash::{xxhash64_slice, xxhash64_stripes};
 
 #[cfg(test)]
 mod tests;

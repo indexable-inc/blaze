@@ -47,6 +47,7 @@ const X25: Reg = 25;
 const X26: Reg = 26;
 const X27: Reg = 27;
 const X28: Reg = 28;
+const X30: Reg = 30;
 
 /// Unassigned hint sentinel.
 pub(crate) const NO_REG: u8 = u8::MAX;
@@ -85,6 +86,11 @@ const CALLER_SAVED_GPR: &[Reg] = &[X9, X10, X11, X12, X13, X14, X15, X8, X0, X1,
 
 /// Callee-saved allocatable GPRs (saved/restored in canonical ARM64 unwind pairs `x19:x20..x27:x28`).
 const CALLEE_SAVED_GPR: &[Reg] = &[X19, X20, X21, X22, X23, X24, X25, X26, X27, X28];
+
+/// Callee-saved allocatable GPRs for provably zero-call leaf functions: appends `X30` (`LR`) at
+/// the very end of the pool so it is used only once all 26 other GPRs are busy (`stp/ldp x29, x30`
+/// saves and restores `X30`).
+const CALLEE_SAVED_GPR_WITH_LR: &[Reg] = &[X19, X20, X21, X22, X23, X24, X25, X26, X27, X28, X30];
 
 /// Caller-saved allocatable FP registers (`V29`/`V30`/`V31` stay permanently free as FP scratch/reload/cycle-breakers).
 const CALLER_SAVED_FP: &[Reg] = &[
@@ -376,6 +382,9 @@ pub(crate) struct Allocation<A: Allocator> {
     pub(crate) num_spill_slots: u32,
     /// `true` iff the function contains any non-tail call (requiring `FP`/`LR` frame record).
     pub(crate) has_calls: bool,
+    /// `true` iff `X30` (`LR`) was allocated as a GPR in a zero-call leaf function (requiring
+    /// `stp/ldp x29, x30` frame record so `LR` is saved on entry and restored before `ret`/`b`).
+    pub(crate) uses_lr: bool,
     /// Exact IPRA physical register clobber summary for callers of this function.
     pub(crate) clobbers: CallClobbers,
     /// Number of constants rematerialized instead of spilled to the stack.
@@ -851,6 +860,21 @@ fn preferred_inplace_operand(
             }
             None
         }
+        Op::Xor | Op::Or | Op::And | Op::Mul if bank == 3 => {
+            let at = idx(*view.data.get(inst)?);
+            let a = *view.extra.get(at)?;
+            let b = *view.extra.get(at + 1)?;
+            if let Some(ai) = valid_src(a).filter(|&i| is_dying(i)) {
+                Some(ai)
+            } else {
+                valid_src(b).filter(|&i| is_dying(i))
+            }
+        }
+        Op::Shl | Op::Lshr | Op::Ashr | Op::Rotl | Op::Rotr if bank == 3 => {
+            let at = idx(*view.data.get(inst)?);
+            let a = *view.extra.get(at)?;
+            valid_src(a).filter(|&i| is_dying(i))
+        }
         _ => None,
     }
 }
@@ -1122,17 +1146,7 @@ fn is_clobbering_call_inst(view: &View<'_>, tail_calls: &[bool], inst: usize) ->
             .get(inst)
             .and_then(|&d| view.extra.get(idx(d) + 2))
             .map(|&v| idx(v))
-            .is_some_and(|len_v| match view.op(len_v) {
-                Op::Iconst => view.data.get(len_v).is_some_and(|&w| sext32_u64(w) <= 256),
-                Op::IconstWide => view.data.get(len_v).is_some_and(|&d| {
-                    let at = idx(d);
-                    match (view.extra.get(at), view.extra.get(at + 1)) {
-                        (Some(&lo), Some(&hi)) => (u64::from(lo) | (u64::from(hi) << 32)) <= 256,
-                        _ => false,
-                    }
-                }),
-                _ => false,
-            });
+            .is_some_and(|len_v| extract_remat_const(view, len_v).is_some_and(|n| n <= 256));
         !const_ok
     };
     let is_i128_div = view.tys.get(inst).copied().map(Ty) == Some(Ty::I128)
@@ -1219,23 +1233,153 @@ fn const_mat_cost(v: u64) -> u32 {
 
 /// Computes `(priority_weight, cheap_remat)` for register-allocation ordering and eviction cost.
 ///
-/// Weights are in uniform instruction-cost units (`4 * uw` for a scalar stack spill, `2 * uw`
-/// for `adrp + add/ldr` global remat, and `const_mat_cost(v) * uw` for integer constants, with
-/// `5 * uw` for 4-inst 64-bit constants used inside loops so hot hash primes keep physical GPRs
-/// rather than rematerializing `movz + 3*movk` on every loop iteration).
+/// Weights are in uniform instruction-cost units (`8 * uw` for a non-constant scalar stack spill,
+/// `2 * uw` for `adrp + add/ldr` global remat). For integer constants:
+/// - `1`-inst constants (`0..=65535`, bitmask imms): `1 * net_uw.max(1)`, `cheap_remat = true` so
+///   cheap immediates always sort behind non-remat scalars and never steal GPRs under pressure.
+/// - `2`-inst constants inside loops: `6 * net_uw`, `cheap_remat = false`.
+/// - `3`-inst and `4`-inst constants inside loops (e.g. 64-bit hash primes like
+///   `0x9e3779b185ebca87`): `4 * mat_cost * uw` (`12 * uw` for 3-inst, `16 * uw` for 4-inst, using
+///   full `uw` rather than `uw - def_w` so loop-local 4-inst constants never collapse to weight `1`
+///   and rematerialize `movz + 3*movk` at every use), `cheap_remat = false`.
+/// - Outside loops (`!in_loop`) or when `net_uw == 0` for `mat_cost <= 2`: `mat_cost * net_uw`
+///   (min `1`), `cheap_remat = true`.
 #[inline]
-fn candidate_priority(op: Op, remat_const: Option<u64>, uw: u32, in_loop: bool) -> (u32, bool) {
+fn candidate_priority(
+    op: Op,
+    remat_const: Option<u64>,
+    uw: u32,
+    def_w: u32,
+    in_loop: bool,
+) -> (u64, bool) {
     if let Some(cval) = remat_const {
         let mat_cost = const_mat_cost(cval);
-        let scale = if mat_cost >= 4 && in_loop { 5 } else { mat_cost };
-        let weight = uw.saturating_mul(scale).max(1);
-        let cheap_remat = mat_cost <= 2 || !in_loop;
-        (weight, cheap_remat)
+        if in_loop && mat_cost >= 3 {
+            let scale = u64::from(mat_cost).saturating_mul(4);
+            return (u64::from(uw).saturating_mul(scale).max(1), false);
+        }
+        let net_uw = u64::from(uw.saturating_sub(def_w));
+        if net_uw == 0 {
+            return (1, true);
+        }
+        let (scale, cheap_remat) = if !in_loop || mat_cost <= 1 {
+            (u64::from(mat_cost), true)
+        } else {
+            (6u64, false)
+        };
+        (net_uw.saturating_mul(scale).max(1), cheap_remat)
     } else if matches!(op, Op::DataAddr | Op::FuncAddr) {
-        (uw.saturating_mul(2).max(1), true)
+        (u64::from(uw).saturating_mul(2).max(1), true)
     } else {
-        (uw.saturating_mul(4), false)
+        (u64::from(uw).saturating_mul(8), false)
     }
+}
+
+/// Computes iterative-DFS Reverse Post-Order (`rpo_blocks`, `rpo_idx`) and deduplicated per-block
+/// loop nesting depth (`block_depth`) in O(B + E) time with zero recursion.
+///
+/// Back-edges are identified in RPO coordinate space (`rpo_idx[target] <= rpo_idx[src]`) so
+/// out-of-order CFG layouts never lose loop depth or synthesize false loops from forward jumps.
+/// Multiple back-edges targeting the same loop header (e.g. `continue` paths) are merged to the
+/// farthest latch rank so one loop contributes depth `+1` rather than `+k`.
+fn compute_rpo_and_loop_depth<A: Allocator + Copy>(
+    view: &View<'_>,
+    alloc: A,
+) -> (Vec<usize, A>, Vec<usize, A>, Vec<u32, A>) {
+    let blocks = view.blocks();
+    let mut dfs_state: Vec<u8, A> = Vec::with_capacity_in(blocks, alloc);
+    for _ in 0..blocks {
+        dfs_state.push(0);
+    }
+    let mut rpo_blocks: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
+    let mut dfs_stack: Vec<usize, A> = Vec::with_capacity_in(blocks.min(1024), alloc);
+    if blocks > 0 {
+        dfs_stack.push(0);
+        while let Some(b) = dfs_stack.pop() {
+            let st = dfs_state.get(b).copied().unwrap_or(2);
+            if st == 0 {
+                if let Some(s) = dfs_state.get_mut(b) {
+                    *s = 1;
+                }
+                dfs_stack.push(b);
+                let term = view.terminator(Block(u32_of(b)));
+                for_each_edge(view, term, |target_block, _, _| {
+                    let t = idx(target_block);
+                    if dfs_state.get(t).copied() == Some(0) {
+                        dfs_stack.push(t);
+                    }
+                });
+            } else if st == 1 {
+                if let Some(s) = dfs_state.get_mut(b) {
+                    *s = 2;
+                }
+                rpo_blocks.push(b);
+            }
+        }
+        rpo_blocks.reverse();
+        for b in 0..blocks {
+            if dfs_state.get(b).copied() == Some(0) {
+                rpo_blocks.push(b);
+            }
+        }
+    }
+
+    let mut rpo_idx: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
+    for _ in 0..blocks {
+        rpo_idx.push(0);
+    }
+    for (rank, &b) in rpo_blocks.iter().enumerate() {
+        if let Some(slot) = rpo_idx.get_mut(b) {
+            *slot = rank;
+        }
+    }
+
+    let mut max_latch_rank: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
+    for _ in 0..blocks {
+        max_latch_rank.push(usize::MAX);
+    }
+    for (rank, &b) in rpo_blocks.iter().enumerate() {
+        let term = view.terminator(Block(u32_of(b)));
+        for_each_edge(view, term, |target_block, _, _| {
+            let tr = rpo_idx.get(idx(target_block)).copied().unwrap_or(blocks);
+            if tr <= rank {
+                if let Some(slot) = max_latch_rank.get_mut(tr) {
+                    if *slot == usize::MAX || rank > *slot {
+                        *slot = rank;
+                    }
+                }
+            }
+        });
+    }
+
+    let mut depth_diff: Vec<i32, A> = Vec::with_capacity_in(blocks + 1, alloc);
+    for _ in 0..=blocks {
+        depth_diff.push(0);
+    }
+    for (tr, &latch) in max_latch_rank.iter().enumerate() {
+        if latch != usize::MAX {
+            if let Some(s) = depth_diff.get_mut(tr) {
+                *s = s.saturating_add(1);
+            }
+            if let Some(e) = depth_diff.get_mut(latch + 1) {
+                *e = e.saturating_sub(1);
+            }
+        }
+    }
+
+    let mut block_depth: Vec<u32, A> = Vec::with_capacity_in(blocks, alloc);
+    for _ in 0..blocks {
+        block_depth.push(0);
+    }
+    let mut cur_depth: i32 = 0;
+    for (rank, &b) in rpo_blocks.iter().enumerate() {
+        cur_depth = cur_depth.saturating_add(depth_diff.get(rank).copied().unwrap_or(0));
+        if let Some(slot) = block_depth.get_mut(b) {
+            *slot = u32::try_from(cur_depth.max(0)).unwrap_or(u32::MAX);
+        }
+    }
+
+    (rpo_blocks, rpo_idx, block_depth)
 }
 
 /// Seeds ABI register hints for entry parameters (including `sret` in `X8`), landing-pad
@@ -1422,6 +1566,7 @@ fn finalize_allocation<A: Allocator>(
         d_pairs,
         num_spill_slots,
         has_calls: !call_positions.is_empty(),
+        uses_lr: used_callee_gpr.get(idx(X30)).copied().unwrap_or(false),
         clobbers: CallClobbers { clobbered: clob },
         remat_count,
     }
@@ -1583,6 +1728,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
     let blocks = view.blocks();
     let mut has_any_use: Vec<bool, A> = Vec::with_capacity_in(len, alloc);
     let mut use_weight: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
+    let mut def_weight: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     let mut max_use_depth: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     let mut has_hot_use: Vec<bool, A> = Vec::with_capacity_in(len, alloc);
     let mut is_clobbering_call: Vec<bool, A> = Vec::with_capacity_in(len, alloc);
@@ -1591,40 +1737,21 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
     for i in 0..len {
         has_any_use.push(false);
         use_weight.push(0);
+        def_weight.push(0);
         max_use_depth.push(0);
         has_hot_use.push(false);
         is_clobbering_call.push(false);
         remat_val.push(extract_remat_const(view, i));
     }
 
-    // 0. Compute per-block loop nesting depth in O(B) via a difference array and identify cold
+    // 0. Compute RPO-ordered, header-deduplicated loop nesting depth in O(B + E) and identify cold
     //    dead-end blocks (blocks that can never reach `Op::Return` and are not in a loop,
     //    e.g. panic/bounds-check/trap/unwind blocks).
-    let mut depth_diff: Vec<i32, A> = Vec::with_capacity_in(blocks + 1, alloc);
+    let (_rpo_blocks, rpo_idx, block_depth) = compute_rpo_and_loop_depth(view, alloc);
     let mut can_return: Vec<bool, A> = Vec::with_capacity_in(blocks, alloc);
-    for _ in 0..=blocks {
-        depth_diff.push(0);
-    }
     for b in 0..blocks {
         let term = view.terminator(Block(u32_of(b)));
         can_return.push(matches!(view.op(term), Op::Return | Op::TailCall | Op::TailCallIndirect));
-        for_each_edge(view, term, |target_block, _, _| {
-            let tb = idx(target_block);
-            if tb <= b {
-                if let Some(s) = depth_diff.get_mut(tb) {
-                    *s = s.saturating_add(1);
-                }
-                if let Some(e) = depth_diff.get_mut(b + 1) {
-                    *e = e.saturating_sub(1);
-                }
-            }
-        });
-    }
-    let mut block_depth: Vec<u32, A> = Vec::with_capacity_in(blocks, alloc);
-    let mut cur_depth: i32 = 0;
-    for b in 0..blocks {
-        cur_depth = cur_depth.saturating_add(depth_diff.get(b).copied().unwrap_or(0));
-        block_depth.push(u32::try_from(cur_depth.max(0)).unwrap_or(u32::MAX));
     }
     loop {
         let mut changed = false;
@@ -1662,8 +1789,8 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
     let mut work: Vec<(usize, u32), A> = Vec::with_capacity_in(16, alloc);
     for b in 0..blocks {
         let raw_depth = block_depth.get(b).copied().unwrap_or(0);
-        let depth = raw_depth.min(5);
-        let b_weight = 1u32 << (depth * 4); // 1x outer, 16x depth-1, 256x depth-2, 4096x depth-3, ...
+        let depth = raw_depth.min(3);
+        let b_weight = 1u32 << depth.saturating_mul(7); // 1x outer, 128x depth-1, 16384x depth-2, 2097152x depth-3+
         let b_is_cold = is_cold_block.get(b).copied().unwrap_or(false);
         let range = view.block(Block(u32_of(b)));
         for inst in range {
@@ -1677,16 +1804,19 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                     *slot = true;
                 }
             }
-            // Value defined inside a hot loop carries that loop's weight.
-            if let Some(w) = use_weight.get_mut(inst) {
-                *w = w.saturating_add(b_weight);
+            // Record defining block weight; non-constants pay a store on spill at def, while
+            // constants are weighted by net rematerialized use savings (`use_weight - def_weight`).
+            if let Some(dw) = def_weight.get_mut(inst) {
+                *dw = b_weight;
+            }
+            if remat_val.get(inst).copied().flatten().is_none() {
+                if let Some(w) = use_weight.get_mut(inst) {
+                    *w = w.saturating_add(b_weight);
+                }
             }
             for_each_expanded_use(view, skip_alloc, inst, &mut work, |user, vi| {
                 if let Some(u) = has_any_use.get_mut(vi) {
                     *u = true;
-                }
-                if let Some(w) = use_weight.get_mut(vi) {
-                    *w = w.saturating_add(b_weight);
                 }
                 let imm_folded = remat_val
                     .get(vi)
@@ -1694,6 +1824,9 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                     .flatten()
                     .is_some_and(|cval| is_folded_imm_use(view, user, vi, cval));
                 if !imm_folded {
+                    if let Some(w) = use_weight.get_mut(vi) {
+                        *w = w.saturating_add(b_weight);
+                    }
                     if let Some(md) = max_use_depth.get_mut(vi) {
                         if raw_depth > *md {
                             *md = raw_depth;
@@ -2020,10 +2153,16 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
     let mut hint: Vec<u8, A> = Vec::with_capacity_in(len, alloc);
     let mut phi_partner: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     let mut phi_prio: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
+    let mut is_back_phi_arg: Vec<bool, A> = Vec::with_capacity_in(len, alloc);
+    let mut back_partner_of: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
+    let mut back_partner_prio: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     for _ in 0..len {
         hint.push(NO_REG);
         phi_partner.push(u32::MAX);
         phi_prio.push(0);
+        is_back_phi_arg.push(false);
+        back_partner_of.push(u32::MAX);
+        back_partner_prio.push(0);
     }
 
     seed_abi_and_return_hints(view, os, &mut hint);
@@ -2034,10 +2173,11 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
             continue;
         }
         let b_depth = block_depth.get(b).copied().unwrap_or(0);
+        let b_rpo = rpo_idx.get(b).copied().unwrap_or(0);
         for_each_edge(view, term, |target_block, args_start, args_len| {
             let target_params = view.params(Block(target_block));
             let n = args_len.min(target_params.len());
-            let is_back = idx(target_block) <= b;
+            let is_back = rpo_idx.get(idx(target_block)).copied().unwrap_or(blocks) <= b_rpo;
             let edge_prio = if is_back { b_depth.saturating_add(2) } else { 1 };
             if let Some(args) = view.extra.get(args_start..args_start + n) {
                 for (k, &arg_raw) in args.iter().enumerate() {
@@ -2069,6 +2209,25 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                             }
                             if let Some(pslot) = phi_prio.get_mut(arg) {
                                 *pslot = edge_prio;
+                            }
+                            if is_back
+                                && !skip_alloc.get(arg).copied().unwrap_or(false)
+                                && remat_val.get(arg).copied().flatten().is_none()
+                                && !matches!(view.op(arg), Op::DataAddr | Op::FuncAddr)
+                            {
+                                if let Some(bslot) = is_back_phi_arg.get_mut(arg) {
+                                    *bslot = true;
+                                }
+                                let cur_bp = back_partner_of.get(p).copied().unwrap_or(u32::MAX);
+                                let cur_bp_prio = back_partner_prio.get(p).copied().unwrap_or(0);
+                                if cur_bp == u32::MAX || edge_prio > cur_bp_prio {
+                                    if let Some(bpslot) = back_partner_of.get_mut(p) {
+                                        *bpslot = u32_of(arg);
+                                    }
+                                    if let Some(bppslot) = back_partner_prio.get_mut(p) {
+                                        *bppslot = edge_prio;
+                                    }
+                                }
                             }
                         }
                     } else if remat_val.get(arg).copied().flatten().is_none()
@@ -2132,6 +2291,8 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
             preferred_inplace_operand(view, skip_alloc, |vi| vi < inst, |ci| !vals_interfere(inst, ci), inst)
         {
             if pre_remat.get(src).copied().unwrap_or(AllocLoc::None) == AllocLoc::None
+                && remat_val.get(src).copied().flatten().is_none()
+                && !matches!(view.op(src), Op::DataAddr | Op::FuncAddr)
                 && !vals_interfere(inst, src)
             {
                 if let Some(slot) = phi_partner.get_mut(inst) {
@@ -2143,15 +2304,29 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
 
     propagate_extract_lane0_hints(view, &mut hint, (0..len).rev());
 
+    // Boost loop back-edge phi arguments by +1 before backward `phi_partner` propagation so
+    // Phase 2 colors `loop_param` -> `back_phi_arg` (claiming `loop_param`'s reg) -> same-depth temp.
+    for (arg, &is_back_arg) in is_back_phi_arg.iter().enumerate() {
+        if is_back_arg {
+            if let Some(w) = use_weight.get_mut(arg) {
+                *w = w.saturating_add(1);
+            }
+        }
+    }
+
     // Propagate priority weights and return-value hints backward along `phi_partner` chains.
     for arg in (0..len).rev() {
         let p = phi_partner.get(arg).copied().unwrap_or(u32::MAX);
         if p != u32::MAX {
             let pi = idx(p);
-            let aw = use_weight.get(arg).copied().unwrap_or(0).saturating_add(1);
-            if let Some(pw) = use_weight.get_mut(pi) {
-                if aw > *pw {
-                    *pw = aw;
+            if remat_val.get(pi).copied().flatten().is_none()
+                && !matches!(view.op(pi), Op::DataAddr | Op::FuncAddr)
+            {
+                let aw = use_weight.get(arg).copied().unwrap_or(0).saturating_add(1);
+                if let Some(pw) = use_weight.get_mut(pi) {
+                    if aw > *pw {
+                        *pw = aw;
+                    }
                 }
             }
             let ah = hint.get(arg).copied().unwrap_or(NO_REG);
@@ -2169,7 +2344,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
     struct Candidate {
         inst: usize,
         vid: usize,
-        weight: u32,
+        weight: u64,
         is_remat: bool,
     }
     let mut prog_order: Vec<Candidate, A> = Vec::with_capacity_in(len, alloc);
@@ -2185,10 +2360,14 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
         }
         let cval = remat_val.get(inst).copied().flatten();
         let uw = use_weight.get(inst).copied().unwrap_or(0);
+        let dw = def_weight.get(inst).copied().unwrap_or(0);
         let in_loop = max_use_depth.get(inst).copied().unwrap_or(0) > 0;
-        let (weight, is_remat) = candidate_priority(view.op(inst), cval, uw, in_loop);
+        let (weight, is_remat) = candidate_priority(view.op(inst), cval, uw, dw, in_loop);
         prog_order.push(Candidate { inst, vid: idx(vid_raw), weight, is_remat });
     }
+
+    let allow_lr = call_positions.is_empty();
+    let callee_gpr_pool = if allow_lr { CALLEE_SAVED_GPR_WITH_LR } else { CALLEE_SAVED_GPR };
 
     let run_coloring = |order: &[Candidate]| -> Result<(Vec<AllocLoc, A>, [bool; 32], [bool; 32], u32, u32, u64), RegAllocError> {
         let mut loc_try: Vec<AllocLoc, A> = Vec::with_capacity_in(len, alloc);
@@ -2298,7 +2477,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                     caller_gpr_order
                         .iter()
                         .copied()
-                        .chain(CALLEE_SAVED_GPR.iter().copied())
+                        .chain(callee_gpr_pool.iter().copied())
                         .find(|&r| Some(r) != skip && gpr_safe(r) && is_reg_free(busy, idx(r), vid))
                 };
                 let r0 = pool_pick(&gpr_busy, None);
@@ -2309,12 +2488,12 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                     }
                     mark_reg_busy(&mut gpr_busy, idx(lo), vid);
                     mark_reg_busy(&mut gpr_busy, idx(hi), vid);
-                    if (X19..=X28).contains(&lo) {
+                    if (X19..=X28).contains(&lo) || lo == X30 {
                         if let Some(u) = used_callee_gpr.get_mut(idx(lo)) {
                             *u = true;
                         }
                     }
-                    if (X19..=X28).contains(&hi) {
+                    if (X19..=X28).contains(&hi) || hi == X30 {
                         if let Some(u) = used_callee_gpr.get_mut(idx(hi)) {
                             *u = true;
                         }
@@ -2325,7 +2504,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                     if let Some(slot) = loc_try.get_mut(inst) {
                         *slot = AllocLoc::GprPairSpill(s0, s1);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(2));
+                    spill_cost = spill_cost.saturating_add(cand.weight.saturating_mul(2));
                 }
             } else if is_vec128_ty(ty).is_some() || is_vec_mask_ty(ty).is_some() {
                 let vec_safe = |r: Reg| -> bool {
@@ -2389,7 +2568,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::VecSpill(slot);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(2));
+                    spill_cost = spill_cost.saturating_add(cand.weight.saturating_mul(2));
                 }
             } else if is_fp_ty(ty).is_some() {
                 let extract_lane0_hint = if view.op(inst) == Op::Extract {
@@ -2442,7 +2621,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::FpSpill(slot);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
+                    spill_cost = spill_cost.saturating_add(cand.weight);
                 }
             } else {
                 let pair_trunc_hint = if view.op(inst) == Op::Trunc {
@@ -2469,21 +2648,70 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                     None
                 }
                 .unwrap_or(NO_REG);
+                let bp_raw = back_partner_of.get(inst).copied().unwrap_or(u32::MAX);
+                let bp_info = if bp_raw != u32::MAX {
+                    let bpi = idx(bp_raw);
+                    let bp_uncolored = loc_try.get(bpi).copied().unwrap_or(AllocLoc::None) == AllocLoc::None;
+                    let bp_vid_raw = val_id.get(bpi).copied().unwrap_or(NO_VAL);
+                    if bp_uncolored && bp_vid_raw != NO_VAL {
+                        let bp_crosses = val_crosses_call.get(bpi).copied().unwrap_or(false);
+                        let bp_clobbers = val_crossed_clobbers
+                            .get(bpi)
+                            .copied()
+                            .unwrap_or(CallClobbers::EMPTY);
+                        Some((idx(bp_vid_raw), bp_crosses, bp_clobbers))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let try_gpr = |h: u8| -> Option<Reg> {
-                    if h != NO_REG && gpr_safe(u32::from(h)) && is_reg_free(&gpr_busy, usize::from(h), vid) {
+                    if h != NO_REG
+                        && (u32::from(h) != X30 || allow_lr)
+                        && gpr_safe(u32::from(h))
+                        && is_reg_free(&gpr_busy, usize::from(h), vid)
+                    {
                         Some(u32::from(h))
                     } else {
                         None
                     }
                 };
-                let chosen = try_gpr(primary_hint)
+                let joint_chosen = if let Some((bp_vid, bp_crosses, bp_clobbers)) = bp_info {
+                    let bp_safe = |r: Reg| -> bool {
+                        !bp_crosses || (X19..=X28).contains(&r) || !bp_clobbers.clobbers_gpr(reg_u8(r))
+                    };
+                    let try_gpr_joint = |h: u8| -> Option<Reg> {
+                        let r = try_gpr(h)?;
+                        (bp_safe(r) && is_reg_free(&gpr_busy, idx(r), bp_vid)).then_some(r)
+                    };
+                    try_gpr_joint(primary_hint)
+                        .or_else(|| try_gpr_joint(secondary_hint))
+                        .or_else(|| try_gpr_joint(pair_trunc_hint))
+                        .or_else(|| {
+                            caller_gpr_order
+                                .iter()
+                                .copied()
+                                .chain(callee_gpr_pool.iter().copied())
+                                .find(|&r| {
+                                    gpr_safe(r)
+                                        && bp_safe(r)
+                                        && is_reg_free(&gpr_busy, idx(r), vid)
+                                        && is_reg_free(&gpr_busy, idx(r), bp_vid)
+                                })
+                        })
+                } else {
+                    None
+                };
+                let chosen = joint_chosen
+                    .or_else(|| try_gpr(primary_hint))
                     .or_else(|| try_gpr(secondary_hint))
                     .or_else(|| try_gpr(pair_trunc_hint))
                     .or_else(|| {
                         caller_gpr_order
                             .iter()
                             .copied()
-                            .chain(CALLEE_SAVED_GPR.iter().copied())
+                            .chain(callee_gpr_pool.iter().copied())
                             .find(|&r| gpr_safe(r) && is_reg_free(&gpr_busy, idx(r), vid))
                     });
                 if let Some(reg) = chosen {
@@ -2491,7 +2719,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                         *slot = AllocLoc::Gpr(reg_u8(reg));
                     }
                     mark_reg_busy(&mut gpr_busy, idx(reg), vid);
-                    if (X19..=X28).contains(&reg) {
+                    if (X19..=X28).contains(&reg) || reg == X30 {
                         if let Some(u) = used_callee_gpr.get_mut(idx(reg)) {
                             *u = true;
                         }
@@ -2501,19 +2729,19 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
                         *slot = AllocLoc::RematConst(cval);
                     }
                     remat_count += 1;
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
+                    spill_cost = spill_cost.saturating_add(cand.weight);
                 } else if matches!(view.op(inst), Op::DataAddr | Op::FuncAddr) {
                     if let Some(slot) = loc_try.get_mut(inst) {
                         *slot = AllocLoc::RematGlobal(u32_of(inst));
                     }
                     remat_count += 1;
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
+                    spill_cost = spill_cost.saturating_add(cand.weight);
                 } else {
                     let slot = alloc_spill_n(1, vid)?;
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::GprSpill(slot);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
+                    spill_cost = spill_cost.saturating_add(cand.weight);
                 }
             }
         }
@@ -2533,9 +2761,9 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
             greedy_order.push(c);
         }
         greedy_order.sort_unstable_by(|a, b| {
-            b.weight
-                .cmp(&a.weight)
-                .then_with(|| a.is_remat.cmp(&b.is_remat))
+            a.is_remat
+                .cmp(&b.is_remat)
+                .then_with(|| b.weight.cmp(&a.weight))
                 .then_with(|| a.inst.cmp(&b.inst))
         });
         if let Ok((g_loc, g_cgpr, g_cfp, g_spills, g_remat, g_cost)) = run_coloring(&greedy_order) {
@@ -2583,49 +2811,13 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
     let len = view.len();
     let blocks = view.blocks();
 
-    // 0a. Compute iterative-DFS Reverse Post-Order (RPO) over blocks in O(B + E).
-    let mut dfs_state: Vec<u8, A> = Vec::with_capacity_in(blocks, alloc);
-    for _ in 0..blocks {
-        dfs_state.push(0);
-    }
-    let mut rpo_blocks: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
-    let mut dfs_stack: Vec<usize, A> = Vec::with_capacity_in(blocks.min(1024), alloc);
-    if blocks > 0 {
-        dfs_stack.push(0);
-        while let Some(b) = dfs_stack.pop() {
-            let st = dfs_state.get(b).copied().unwrap_or(2);
-            if st == 0 {
-                if let Some(s) = dfs_state.get_mut(b) {
-                    *s = 1;
-                }
-                dfs_stack.push(b);
-                let term = view.terminator(Block(u32_of(b)));
-                for_each_edge(view, term, |target_block, _, _| {
-                    let t = idx(target_block);
-                    if dfs_state.get(t).copied() == Some(0) {
-                        dfs_stack.push(t);
-                    }
-                });
-            } else if st == 1 {
-                if let Some(s) = dfs_state.get_mut(b) {
-                    *s = 2;
-                }
-                rpo_blocks.push(b);
-            }
-        }
-        rpo_blocks.reverse();
-        for b in 0..blocks {
-            if dfs_state.get(b).copied() == Some(0) {
-                rpo_blocks.push(b);
-            }
-        }
-    }
+    // 0a. Compute iterative-DFS Reverse Post-Order (RPO) and deduplicated per-block loop depth
+    //     in O(B + E) time with zero recursion.
+    let (rpo_blocks, rpo_idx, block_depth) = compute_rpo_and_loop_depth(view, alloc);
 
-    let mut rpo_idx: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
     let mut rpo_block_start: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
     let mut rpo_block_end: Vec<usize, A> = Vec::with_capacity_in(blocks, alloc);
     for _ in 0..blocks {
-        rpo_idx.push(0);
         rpo_block_start.push(0);
         rpo_block_end.push(0);
     }
@@ -2636,10 +2828,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
         rpo_pos.push(0);
         inst_block.push(0);
     }
-    for (rank, &b) in rpo_blocks.iter().enumerate() {
-        if let Some(slot) = rpo_idx.get_mut(b) {
-            *slot = rank;
-        }
+    for &b in &rpo_blocks {
         let b_start = rpo_to_inst.len();
         let range = view.block(Block(u32_of(b)));
         for inst in range {
@@ -2661,43 +2850,12 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
         }
     }
 
-    // 0b. Compute per-block loop nesting depth from backward RPO edges (`target_rank <= rank`)
-    //     in O(B) via a difference array.
-    let mut depth_diff: Vec<i32, A> = Vec::with_capacity_in(blocks + 1, alloc);
-    for _ in 0..=blocks {
-        depth_diff.push(0);
-    }
-    for (rank, &b) in rpo_blocks.iter().enumerate() {
-        let term = view.terminator(Block(u32_of(b)));
-        for_each_edge(view, term, |target_block, _, _| {
-            let tr = rpo_idx.get(idx(target_block)).copied().unwrap_or(blocks);
-            if tr <= rank {
-                if let Some(s) = depth_diff.get_mut(tr) {
-                    *s = s.saturating_add(1);
-                }
-                if let Some(e) = depth_diff.get_mut(rank + 1) {
-                    *e = e.saturating_sub(1);
-                }
-            }
-        });
-    }
-    let mut block_depth: Vec<u32, A> = Vec::with_capacity_in(blocks, alloc);
-    for _ in 0..blocks {
-        block_depth.push(0);
-    }
-    let mut cur_depth: i32 = 0;
-    for (rank, &b) in rpo_blocks.iter().enumerate() {
-        cur_depth = cur_depth.saturating_add(depth_diff.get(rank).copied().unwrap_or(0));
-        if let Some(slot) = block_depth.get_mut(b) {
-            *slot = u32::try_from(cur_depth.max(0)).unwrap_or(u32::MAX);
-        }
-    }
-
     // 1. Compute RPO live intervals `[rpo_pos[def], last_use_pos[def]]`, sorted RPO call sites,
     //    and loop-weighted spill priorities.
     let mut last_use_pos: Vec<usize, A> = Vec::with_capacity_in(len, alloc);
     let mut has_any_use: Vec<bool, A> = Vec::with_capacity_in(len, alloc);
     let mut use_weight: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
+    let mut def_weight: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     let mut max_use_depth: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     let mut remat_val: Vec<Option<u64>, A> = Vec::with_capacity_in(len, alloc);
     let mut call_rpo_positions: Vec<(usize, usize), A> = Vec::new_in(alloc);
@@ -2706,14 +2864,15 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
         last_use_pos.push(rpo_pos.get(i).copied().unwrap_or(0));
         has_any_use.push(false);
         use_weight.push(0);
+        def_weight.push(0);
         max_use_depth.push(0);
         remat_val.push(extract_remat_const(view, i));
     }
 
     for &b in &rpo_blocks {
         let raw_depth = block_depth.get(b).copied().unwrap_or(0);
-        let depth = raw_depth.min(5);
-        let b_weight = 1u32 << (depth * 4);
+        let depth = raw_depth.min(3);
+        let b_weight = 1u32 << depth.saturating_mul(7); // 1x outer, 128x depth-1, 16384x depth-2, 2097152x depth-3+
         let range = view.block(Block(u32_of(b)));
         for inst in range {
             let inst_pos = rpo_pos.get(inst).copied().unwrap_or(0);
@@ -2723,8 +2882,13 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                 call_rpo_positions.push((inst_pos, inst));
                 call_positions.push(inst);
             }
-            if let Some(w) = use_weight.get_mut(inst) {
-                *w = w.saturating_add(b_weight);
+            if let Some(dw) = def_weight.get_mut(inst) {
+                *dw = b_weight;
+            }
+            if remat_val.get(inst).copied().flatten().is_none() {
+                if let Some(w) = use_weight.get_mut(inst) {
+                    *w = w.saturating_add(b_weight);
+                }
             }
             for_each_use(view, inst, |v| {
                 let vi = idx(v);
@@ -2732,12 +2896,19 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                     if let Some(u) = has_any_use.get_mut(vi) {
                         *u = true;
                     }
-                    if let Some(w) = use_weight.get_mut(vi) {
-                        *w = w.saturating_add(b_weight);
-                    }
-                    if let Some(md) = max_use_depth.get_mut(vi) {
-                        if raw_depth > *md {
-                            *md = raw_depth;
+                    let imm_folded = remat_val
+                        .get(vi)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|cval| is_folded_imm_use(view, inst, vi, cval));
+                    if !imm_folded {
+                        if let Some(w) = use_weight.get_mut(vi) {
+                            *w = w.saturating_add(b_weight);
+                        }
+                        if let Some(md) = max_use_depth.get_mut(vi) {
+                            if raw_depth > *md {
+                                *md = raw_depth;
+                            }
                         }
                     }
                     if let Some(lu) = last_use_pos.get_mut(vi) {
@@ -2763,14 +2934,21 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                         *lu = consumer_end;
                     }
                 }
-                if let Some(w) = use_weight.get_mut(vi) {
-                    if consumer_w > *w {
-                        *w = consumer_w;
+                let imm_folded = remat_val
+                    .get(vi)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|cval| is_folded_imm_use(view, inst, vi, cval));
+                if !imm_folded {
+                    if let Some(w) = use_weight.get_mut(vi) {
+                        if consumer_w > *w {
+                            *w = consumer_w;
+                        }
                     }
-                }
-                if let Some(md) = max_use_depth.get_mut(vi) {
-                    if consumer_d > *md {
-                        *md = consumer_d;
+                    if let Some(md) = max_use_depth.get_mut(vi) {
+                        if consumer_d > *md {
+                            *md = consumer_d;
+                        }
                     }
                 }
             });
@@ -2853,13 +3031,27 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
     let mut hint: Vec<u8, A> = Vec::with_capacity_in(len, alloc);
     let mut phi_partner: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     let mut phi_prio: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
+    let mut is_back_phi_arg: Vec<bool, A> = Vec::with_capacity_in(len, alloc);
+    let mut back_partner_of: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
+    let mut back_partner_prio: Vec<u32, A> = Vec::with_capacity_in(len, alloc);
     for _ in 0..len {
         hint.push(NO_REG);
         phi_partner.push(u32::MAX);
         phi_prio.push(0);
+        is_back_phi_arg.push(false);
+        back_partner_of.push(u32::MAX);
+        back_partner_prio.push(0);
     }
 
     seed_abi_and_return_hints(view, os, &mut hint);
+
+    #[inline]
+    fn intervals_conflict(s: usize, e: usize, s_rbw: bool, start: usize, end: usize, cur_rbw: bool) -> bool {
+        (start < e && s < end)
+            || start == s
+            || (start == e && !cur_rbw)
+            || (end == s && !s_rbw)
+    }
 
     for (rank, &b) in rpo_blocks.iter().enumerate() {
         let term = view.terminator(Block(u32_of(b)));
@@ -2892,6 +3084,38 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                                 }
                                 if let Some(pslot) = phi_prio.get_mut(arg) {
                                     *pslot = edge_prio;
+                                }
+                                if is_back
+                                    && !skip_alloc.get(arg).copied().unwrap_or(false)
+                                    && remat_val.get(arg).copied().flatten().is_none()
+                                    && !matches!(view.op(arg), Op::DataAddr | Op::FuncAddr)
+                                {
+                                    if let Some(bslot) = is_back_phi_arg.get_mut(arg) {
+                                        *bslot = true;
+                                    }
+                                    let p_start = rpo_pos.get(p).copied().unwrap_or(0);
+                                    let p_end = last_use_pos.get(p).copied().unwrap_or(p_start).max(p_start);
+                                    let arg_start = rpo_pos.get(arg).copied().unwrap_or(0);
+                                    let arg_end = last_use_pos.get(arg).copied().unwrap_or(arg_start).max(arg_start);
+                                    if !intervals_conflict(
+                                        p_start,
+                                        p_end,
+                                        is_rbw(view, p),
+                                        arg_start,
+                                        arg_end,
+                                        is_rbw(view, arg),
+                                    ) {
+                                        let cur_bp = back_partner_of.get(p).copied().unwrap_or(u32::MAX);
+                                        let cur_bp_prio = back_partner_prio.get(p).copied().unwrap_or(0);
+                                        if cur_bp == u32::MAX || edge_prio > cur_bp_prio {
+                                            if let Some(bpslot) = back_partner_of.get_mut(p) {
+                                                *bpslot = u32_of(arg);
+                                            }
+                                            if let Some(bppslot) = back_partner_prio.get_mut(p) {
+                                                *bppslot = edge_prio;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2947,7 +3171,10 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
             |ci| last_use_pos.get(ci).copied() == Some(inst_pos),
             inst,
         ) {
-            if last_use_pos.get(src).copied() == Some(inst_pos) {
+            if last_use_pos.get(src).copied() == Some(inst_pos)
+                && remat_val.get(src).copied().flatten().is_none()
+                && !matches!(view.op(src), Op::DataAddr | Op::FuncAddr)
+            {
                 if let Some(slot) = phi_partner.get_mut(inst) {
                     *slot = u32_of(src);
                 }
@@ -2957,15 +3184,29 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
 
     propagate_extract_lane0_hints(view, &mut hint, rpo_to_inst.iter().copied().rev());
 
+    // Boost loop back-edge phi arguments by +1 before backward `phi_partner` propagation so
+    // Phase 2 colors `loop_param` -> `back_phi_arg` (claiming `loop_param`'s reg) -> same-depth temp.
+    for (arg, &is_back_arg) in is_back_phi_arg.iter().enumerate() {
+        if is_back_arg {
+            if let Some(w) = use_weight.get_mut(arg) {
+                *w = w.saturating_add(1);
+            }
+        }
+    }
+
     // Propagate priority weights and return-value hints backward along `phi_partner` chains (reverse RPO).
     for &arg in rpo_to_inst.iter().rev() {
         let p = phi_partner.get(arg).copied().unwrap_or(u32::MAX);
         if p != u32::MAX {
             let pi = idx(p);
-            let aw = use_weight.get(arg).copied().unwrap_or(0).saturating_add(1);
-            if let Some(pw) = use_weight.get_mut(pi) {
-                if aw > *pw {
-                    *pw = aw;
+            if remat_val.get(pi).copied().flatten().is_none()
+                && !matches!(view.op(pi), Op::DataAddr | Op::FuncAddr)
+            {
+                let aw = use_weight.get(arg).copied().unwrap_or(0).saturating_add(1);
+                if let Some(pw) = use_weight.get_mut(pi) {
+                    if aw > *pw {
+                        *pw = aw;
+                    }
                 }
             }
             let ah = hint.get(arg).copied().unwrap_or(NO_REG);
@@ -2985,7 +3226,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
         inst: usize,
         start: usize,
         end: usize,
-        weight: u32,
+        weight: u64,
         is_remat: bool,
     }
     let mut prog_order: Vec<Candidate, A> = Vec::with_capacity_in(len, alloc);
@@ -2999,8 +3240,9 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
         }
         let cval = remat_val.get(inst).copied().flatten();
         let uw = use_weight.get(inst).copied().unwrap_or(0);
+        let dw = def_weight.get(inst).copied().unwrap_or(0);
         let in_loop = max_use_depth.get(inst).copied().unwrap_or(0) > 0;
-        let (weight, is_remat) = candidate_priority(view.op(inst), cval, uw, in_loop);
+        let (weight, is_remat) = candidate_priority(view.op(inst), cval, uw, dw, in_loop);
         let end = last_use_pos.get(inst).copied().unwrap_or(pos).max(pos);
         prog_order.push(Candidate { inst, start: pos, end, weight, is_remat });
     }
@@ -3008,14 +3250,6 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
     const BUSY_BUCKET_SHIFT: u32 = 10;
     const BUSY_BUCKET_SPAN: usize = 1 << BUSY_BUCKET_SHIFT;
     let num_buckets = (len >> BUSY_BUCKET_SHIFT) + 1;
-
-    #[inline]
-    fn intervals_conflict(s: usize, e: usize, s_rbw: bool, start: usize, end: usize, cur_rbw: bool) -> bool {
-        (start < e && s < end)
-            || start == s
-            || (start == e && !cur_rbw)
-            || (end == s && !s_rbw)
-    }
 
     enum BusySet<A: Allocator> {
         /// Monotonic ascending `start` order (Phase 1): only the latest interval can overlap.
@@ -3079,6 +3313,9 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
             }
         }
     }
+
+    let allow_lr = call_positions.is_empty();
+    let callee_gpr_pool = if allow_lr { CALLEE_SAVED_GPR_WITH_LR } else { CALLEE_SAVED_GPR };
 
     let run_coloring = |order: &[Candidate], monotonic: bool| -> Result<(Vec<AllocLoc, A>, [bool; 32], [bool; 32], u32, u32, u64), RegAllocError> {
         let mut loc_try: Vec<AllocLoc, A> = Vec::with_capacity_in(len, alloc);
@@ -3148,29 +3385,33 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
             };
             let secondary_hint = hint.get(inst).copied().unwrap_or(NO_REG);
 
-            let mut crossed_clobbers = CallClobbers::EMPTY;
-            let mut crosses_call = false;
-            let first_call = call_rpo_positions.partition_point(|&(c_pos, _)| c_pos <= start);
-            if let Some(calls) = call_rpo_positions.get(first_call..) {
-                for &(c_pos, c_inst) in calls {
-                    if c_pos >= end {
-                        break;
-                    }
-                    crosses_call = true;
-                    // Unwinding out of an `Invoke` clobbers all caller-saved regs regardless of IPRA.
-                    let clob = if matches!(view.op(c_inst), Op::Invoke | Op::InvokeIndirect) {
-                        CallClobbers::C_ABI_ARM64
-                    } else {
-                        call_clobbers(c_inst)
-                    };
-                    crossed_clobbers.clobbered = crossed_clobbers.clobbered.union(clob.clobbered);
-                    if crossed_clobbers.clobbered.union(CallClobbers::C_ABI_ARM64.clobbered)
-                        == crossed_clobbers.clobbered
-                    {
-                        break;
+            let call_clobbers_for = |s_pos: usize, e_pos: usize| -> (bool, CallClobbers) {
+                let mut clobbers = CallClobbers::EMPTY;
+                let mut crosses = false;
+                let first_call = call_rpo_positions.partition_point(|&(c_pos, _)| c_pos <= s_pos);
+                if let Some(calls) = call_rpo_positions.get(first_call..) {
+                    for &(c_pos, c_inst) in calls {
+                        if c_pos >= e_pos {
+                            break;
+                        }
+                        crosses = true;
+                        // Unwinding out of an `Invoke` clobbers all caller-saved regs regardless of IPRA.
+                        let clob = if matches!(view.op(c_inst), Op::Invoke | Op::InvokeIndirect) {
+                            CallClobbers::C_ABI_ARM64
+                        } else {
+                            call_clobbers(c_inst)
+                        };
+                        clobbers.clobbered = clobbers.clobbered.union(clob.clobbered);
+                        if clobbers.clobbered.union(CallClobbers::C_ABI_ARM64.clobbered)
+                            == clobbers.clobbered
+                        {
+                            break;
+                        }
                     }
                 }
-            }
+                (crosses, clobbers)
+            };
+            let (crosses_call, crossed_clobbers) = call_clobbers_for(start, end);
             let gpr_safe = |r: Reg| -> bool {
                 !crosses_call || (X19..=X28).contains(&r) || !crossed_clobbers.clobbers_gpr(reg_u8(r))
             };
@@ -3184,7 +3425,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                     caller_gpr_order
                         .iter()
                         .copied()
-                        .chain(CALLEE_SAVED_GPR.iter().copied())
+                        .chain(callee_gpr_pool.iter().copied())
                         .find(|&r| {
                             Some(r) != skip
                                 && gpr_safe(r)
@@ -3203,12 +3444,12 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                     if let Some(b) = gpr_busy.get_mut(idx(hi)) {
                         b.insert(start, end, cur_rbw);
                     }
-                    if (X19..=X28).contains(&lo) {
+                    if (X19..=X28).contains(&lo) || lo == X30 {
                         if let Some(u) = used_callee_gpr.get_mut(idx(lo)) {
                             *u = true;
                         }
                     }
-                    if (X19..=X28).contains(&hi) {
+                    if (X19..=X28).contains(&hi) || hi == X30 {
                         if let Some(u) = used_callee_gpr.get_mut(idx(hi)) {
                             *u = true;
                         }
@@ -3219,7 +3460,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                     if let Some(slot) = loc_try.get_mut(inst) {
                         *slot = AllocLoc::GprPairSpill(s0, s1);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(2));
+                    spill_cost = spill_cost.saturating_add(cand.weight.saturating_mul(2));
                 }
             } else if is_vec128_ty(ty).is_some() || is_vec_mask_ty(ty).is_some() {
                 // Under AAPCS64, callees preserve only the low 64 bits (`d8..d15`) of `v8..v15`.
@@ -3292,7 +3533,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::VecSpill(slot);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight).saturating_mul(2));
+                    spill_cost = spill_cost.saturating_add(cand.weight.saturating_mul(2));
                 }
             } else if is_fp_ty(ty).is_some() {
                 let extract_lane0_hint = if view.op(inst) == Op::Extract {
@@ -3353,7 +3594,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::FpSpill(slot);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
+                    spill_cost = spill_cost.saturating_add(cand.weight);
                 }
             } else {
                 let pair_trunc_hint = if view.op(inst) == Op::Trunc {
@@ -3380,8 +3621,28 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                     None
                 }
                 .unwrap_or(NO_REG);
+                let bp_raw = back_partner_of.get(inst).copied().unwrap_or(u32::MAX);
+                let bp_info = if bp_raw != u32::MAX {
+                    let bpi = idx(bp_raw);
+                    let bp_uncolored = loc_try.get(bpi).copied().unwrap_or(AllocLoc::None) == AllocLoc::None;
+                    if bp_uncolored
+                        && !skip_alloc.get(bpi).copied().unwrap_or(false)
+                        && has_any_use.get(bpi).copied().unwrap_or(false)
+                    {
+                        let bp_start = rpo_pos.get(bpi).copied().unwrap_or(0);
+                        let bp_end = last_use_pos.get(bpi).copied().unwrap_or(bp_start).max(bp_start);
+                        let bp_rbw = is_rbw(view, bpi);
+                        let (bp_crosses, bp_clobbers) = call_clobbers_for(bp_start, bp_end);
+                        Some((bp_start, bp_end, bp_rbw, bp_crosses, bp_clobbers))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let try_gpr = |h: u8| -> Option<Reg> {
                     if h != NO_REG
+                        && (u32::from(h) != X30 || allow_lr)
                         && gpr_safe(u32::from(h))
                         && gpr_busy.get(usize::from(h)).is_some_and(|b| is_reg_free(b, start, end, cur_rbw))
                     {
@@ -3390,14 +3651,48 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                         None
                     }
                 };
-                let chosen = try_gpr(primary_hint)
+                let joint_chosen = if let Some((bp_start, bp_end, bp_rbw, bp_crosses, bp_clobbers)) = bp_info {
+                    let bp_safe = |r: Reg| -> bool {
+                        !bp_crosses || (X19..=X28).contains(&r) || !bp_clobbers.clobbers_gpr(reg_u8(r))
+                    };
+                    let bp_free = |r: Reg| -> bool {
+                        bp_safe(r)
+                            && gpr_busy
+                                .get(idx(r))
+                                .is_some_and(|b| is_reg_free(b, bp_start, bp_end, bp_rbw))
+                    };
+                    let try_gpr_joint = |h: u8| -> Option<Reg> {
+                        let r = try_gpr(h)?;
+                        bp_free(r).then_some(r)
+                    };
+                    try_gpr_joint(primary_hint)
+                        .or_else(|| try_gpr_joint(secondary_hint))
+                        .or_else(|| try_gpr_joint(pair_trunc_hint))
+                        .or_else(|| {
+                            caller_gpr_order
+                                .iter()
+                                .copied()
+                                .chain(callee_gpr_pool.iter().copied())
+                                .find(|&r| {
+                                    gpr_safe(r)
+                                        && gpr_busy
+                                            .get(idx(r))
+                                            .is_some_and(|b| is_reg_free(b, start, end, cur_rbw))
+                                        && bp_free(r)
+                                })
+                        })
+                } else {
+                    None
+                };
+                let chosen = joint_chosen
+                    .or_else(|| try_gpr(primary_hint))
                     .or_else(|| try_gpr(secondary_hint))
                     .or_else(|| try_gpr(pair_trunc_hint))
                     .or_else(|| {
                         caller_gpr_order
                             .iter()
                             .copied()
-                            .chain(CALLEE_SAVED_GPR.iter().copied())
+                            .chain(callee_gpr_pool.iter().copied())
                             .find(|&r| {
                                 gpr_safe(r)
                                     && gpr_busy.get(idx(r)).is_some_and(|b| is_reg_free(b, start, end, cur_rbw))
@@ -3410,7 +3705,7 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                     if let Some(b) = gpr_busy.get_mut(idx(reg)) {
                         b.insert(start, end, cur_rbw);
                     }
-                    if (X19..=X28).contains(&reg) {
+                    if (X19..=X28).contains(&reg) || reg == X30 {
                         if let Some(u) = used_callee_gpr.get_mut(idx(reg)) {
                             *u = true;
                         }
@@ -3420,19 +3715,19 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
                         *slot = AllocLoc::RematConst(cval);
                     }
                     remat_count += 1;
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
+                    spill_cost = spill_cost.saturating_add(cand.weight);
                 } else if matches!(view.op(inst), Op::DataAddr | Op::FuncAddr) {
                     if let Some(slot) = loc_try.get_mut(inst) {
                         *slot = AllocLoc::RematGlobal(u32_of(inst));
                     }
                     remat_count += 1;
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
+                    spill_cost = spill_cost.saturating_add(cand.weight);
                 } else {
                     let slot = alloc_spill_n(1, start, end)?;
                     if let Some(loc_slot) = loc_try.get_mut(inst) {
                         *loc_slot = AllocLoc::GprSpill(slot);
                     }
-                    spill_cost = spill_cost.saturating_add(u64::from(cand.weight));
+                    spill_cost = spill_cost.saturating_add(cand.weight);
                 }
             }
         }
@@ -3452,9 +3747,9 @@ fn allocate_linear_scan_rpo<A: Allocator + Copy>(
             greedy_order.push(c);
         }
         greedy_order.sort_unstable_by(|a, b| {
-            b.weight
-                .cmp(&a.weight)
-                .then_with(|| a.is_remat.cmp(&b.is_remat))
+            a.is_remat
+                .cmp(&b.is_remat)
+                .then_with(|| b.weight.cmp(&a.weight))
                 .then_with(|| a.start.cmp(&b.start))
         });
         if let Ok((g_loc, g_cgpr, g_cfp, g_spills, g_remat, g_cost)) = run_coloring(&greedy_order, false) {
@@ -4562,6 +4857,919 @@ mod tests {
                 matches!(ra.loc_of[prime4.index()], AllocLoc::Gpr(_)),
                 "{label}: 4-inst HASH4_PRIME inside hot loop must stay in a GPR, got {:?}",
                 ra.loc_of[prime4.index()]
+            );
+        }
+    }
+
+    #[test]
+    fn skipped_i128_load_keeps_src_addr_live_to_store_in_both_allocators() {
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(32, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR)],
+            &[Param::of(Ty::PTR)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let dst = b.param(Ty::PTR);
+        let src = b.param(Ty::PTR);
+        let loaded = b.load(Ty::I128, Flags::NONE, src, 0, MemAttrs::aligned(0));
+        let c16 = b.iconst(Ty::I64, 16);
+        let src_next = b.ptr_add(Flags::NONE, src, c16);
+        b.store(Flags::NONE, loaded, dst, 0, MemAttrs::aligned(0));
+        b.ret(&[src_next]);
+        let func = b.finish_checked().expect("fused i128 regalloc LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+        skip[loaded.index()] = true;
+
+        let ra_exact = allocate(&view, &skip, &tail, 32, crate::Os::MacOs, alloc)
+            .expect("exact-CFG regalloc succeeds for skipped i128 load");
+        let gpr_ord = build_caller_gpr_order(None);
+        let fp_ord = build_caller_fp_order(None);
+        let ra_rpo = allocate_linear_scan_rpo(
+            &view,
+            &skip,
+            &tail,
+            32,
+            crate::Os::MacOs,
+            |_| CallClobbers::C_ABI_ARM64,
+            &gpr_ord,
+            &fp_ord,
+            alloc,
+        )
+        .expect("RPO linear-scan regalloc succeeds for skipped i128 load");
+
+        for (label, ra) in [("exact_cfg", &ra_exact), ("linear_scan_rpo", &ra_rpo)] {
+            assert_eq!(
+                ra.loc_of[loaded.index()],
+                AllocLoc::None,
+                "{label}: skipped I128 load must allocate ZERO GPR pair"
+            );
+            assert!(
+                matches!(ra.loc_of[src.index()], AllocLoc::Gpr(_)),
+                "{label}: src ptr must stay allocated in a GPR, got {:?}",
+                ra.loc_of[src.index()]
+            );
+            assert!(
+                matches!(ra.loc_of[src_next.index()], AllocLoc::Gpr(_)),
+                "{label}: src_next ptr must be allocated in a GPR, got {:?}",
+                ra.loc_of[src_next.index()]
+            );
+            assert_ne!(
+                ra.loc_of[src.index()],
+                ra.loc_of[src_next.index()],
+                "{label}: src must stay live until Store so src_next cannot clobber it"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_4inst_hash_prime_keeps_callee_saved_gpr_across_cold_call() {
+        const HASH8_PRIME: u64 = 0x9e37_79b1_85eb_ca87;
+        const CHEAP_MASK: u64 = 0x3fff;
+
+        // Verify `candidate_priority` scales non-constant scalars to `8 * uw`, keeps 3-4 inst loop
+        // constants at `4 * mat_cost * uw` (even when loop-local `uw == def_w`), and marks 1-inst
+        // constants `cheap_remat = true` with weight `net_uw.max(1)`.
+        let (p4_w, p4_cheap) =
+            super::candidate_priority(Op::IconstWide, Some(HASH8_PRIME), 32, 1, true);
+        let (p3_w, p3_cheap) = super::candidate_priority(
+            Op::IconstWide,
+            Some(0x0000_1234_5678_9abc),
+            32,
+            1,
+            true,
+        );
+        let (p1_w, p1_cheap) =
+            super::candidate_priority(Op::Iconst, Some(CHEAP_MASK), 32, 1, true);
+        let (s3_w, s3_cheap) = super::candidate_priority(Op::Add, None, 49, 1, true);
+        let (s2_w, s2_cheap) = super::candidate_priority(Op::Add, None, 33, 1, true);
+        let (same_depth_p4_w, same_depth_p4_cheap) =
+            super::candidate_priority(Op::IconstWide, Some(HASH8_PRIME), 16, 16, true);
+        let (same_depth_p1_w, same_depth_p1_cheap) =
+            super::candidate_priority(Op::Iconst, Some(CHEAP_MASK), 16, 16, true);
+        assert!(
+            !p4_cheap
+                && !p3_cheap
+                && p1_cheap
+                && !s3_cheap
+                && !s2_cheap
+                && !same_depth_p4_cheap
+                && same_depth_p1_cheap
+        );
+        assert_eq!(p4_w, 32 * 16);
+        assert_eq!(p3_w, 32 * 12);
+        assert_eq!(p1_w, 31);
+        assert_eq!(s3_w, 49 * 8);
+        assert_eq!(same_depth_p4_w, 16 * 16);
+        assert_eq!(same_depth_p1_w, 1);
+        assert!(
+            p4_w > s3_w,
+            "2 loop uses of 4-inst prime ({p4_w}) must outrank 3-use scalar ({s3_w})"
+        );
+        assert!(
+            p3_w > s2_w,
+            "2 loop uses of 3-inst const ({p3_w}) must outrank 2-use scalar ({s2_w})"
+        );
+
+        // Build a loop using `HASH8_PRIME` twice per iteration alongside a call in a cold block
+        // and >10 call-crossing values competing for the 10 callee-saved GPRs (`x19..=x28`),
+        // including 8 hot 3-use call-crossing scalars (which previously beat `scale = 5`) and
+        // 4 cold post-loop scalars.
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[
+                Param::of(Ty::PTR),
+                Param::of(Ty::PTR),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+            ],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let callee_sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        let callee_ref = b.reference(RefKind::Func, 0);
+
+        let entry = b.create_block(BlockKind::Normal);
+        let loop_hdr = b.create_block(BlockKind::Normal);
+        let cold_call = b.create_block(BlockKind::Normal);
+        let loop_latch = b.create_block(BlockKind::Normal);
+        let exit = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let ptr0 = b.param(Ty::PTR);
+        let ptr1 = b.param(Ty::PTR);
+        let n = b.param(Ty::I64);
+        let seed = b.param(Ty::I64);
+        let z0 = b.iconst(Ty::I64, 0);
+        let c1 = b.iconst(Ty::I64, 1);
+        let mut cold_vals = Vec::with_capacity_in(4, alloc);
+        let mut cur = seed;
+        for _ in 0..4usize {
+            cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+            cold_vals.push(cur);
+        }
+        let mut hot_mix = Vec::with_capacity_in(8, alloc);
+        for _ in 0..8usize {
+            cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+            hot_mix.push(cur);
+        }
+        // Defined after 12 other call-crossing values so Phase 1 program-order coloring fills
+        // all 10 callee-saved GPRs before reaching `prime`, exercising Phase 2 priority recovery.
+        let prime = b.iconst(Ty::I64, u128::from(HASH8_PRIME));
+        let cheap_mask = b.iconst(Ty::I64, u128::from(CHEAP_MASK));
+        b.jump((loop_hdr, &[z0, seed]));
+
+        b.begin(loop_hdr);
+        let iv = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let p0 = b.ptr_add(Flags::NONE, ptr0, iv);
+        let p1 = b.ptr_add(Flags::NONE, ptr1, iv);
+        let v0 = b.load(Ty::I64, Flags::NONE, p0, 0, MemAttrs::aligned(8));
+        let v1 = b.load(Ty::I64, Flags::NONE, p1, 0, MemAttrs::aligned(8));
+        let h0 = b.binary(Op::Mul, Flags::NONE, v0, prime);
+        let h1 = b.binary(Op::Mul, Flags::NONE, v1, prime);
+        let mixed = b.binary(Op::Xor, Flags::NONE, h0, h1);
+        let mut acc1 = b.binary(Op::Add, Flags::NONE, acc, mixed);
+        acc1 = b.binary(Op::Xor, Flags::NONE, acc1, cheap_mask);
+        for &hm in &hot_mix {
+            acc1 = b.binary(Op::Add, Flags::NONE, acc1, hm);
+            acc1 = b.binary(Op::Xor, Flags::NONE, acc1, hm);
+            acc1 = b.binary(Op::Sub, Flags::NONE, acc1, hm);
+        }
+        let is_cold = b.icmp(IntCond::Eq, mixed, z0);
+        b.br(Flags::NONE, is_cold, (cold_call, &[]), (loop_latch, &[acc1]));
+
+        b.begin(cold_call);
+        let call_res = b.call(Flags::NONE, callee_ref, callee_sig, &[acc1]);
+        let acc_cold = b.binary(Op::Add, Flags::NONE, acc1, call_res);
+        b.jump((loop_latch, &[acc_cold]));
+
+        b.begin(loop_latch);
+        let acc_merged = b.param(Ty::I64);
+        let iv_next = b.binary(Op::Add, Flags::NONE, iv, c1);
+        let keep_going = b.icmp(IntCond::Ult, iv_next, n);
+        b.br(
+            Flags::NONE,
+            keep_going,
+            (loop_hdr, &[iv_next, acc_merged]),
+            (exit, &[acc_merged]),
+        );
+
+        b.begin(exit);
+        let mut out = b.param(Ty::I64);
+        for &cv in &cold_vals {
+            out = b.binary(Op::Xor, Flags::NONE, out, cv);
+        }
+        b.ret(&[out]);
+
+        let func = b.finish_checked().expect("cold-call hash prime loop LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+
+        let ra_exact = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+            .expect("exact-CFG regalloc succeeds for cold-call hash prime loop");
+        let gpr_ord = build_caller_gpr_order(None);
+        let fp_ord = build_caller_fp_order(None);
+        let ra_rpo = allocate_linear_scan_rpo(
+            &view,
+            &skip,
+            &tail,
+            64,
+            crate::Os::MacOs,
+            |_| CallClobbers::C_ABI_ARM64,
+            &gpr_ord,
+            &fp_ord,
+            alloc,
+        )
+        .expect("RPO linear-scan regalloc succeeds for cold-call hash prime loop");
+
+        for (label, ra) in [("exact_cfg", &ra_exact), ("linear_scan_rpo", &ra_rpo)] {
+            assert!(
+                ra.num_spill_slots > 0,
+                "{label}: test must overflow the 10 callee-saved GPRs and spill lower-weight values"
+            );
+            assert_ne!(ra.x_pairs, 0, "{label}: must save callee-saved GPR pairs");
+            match ra.loc_of[prime.index()] {
+                AllocLoc::Gpr(r) => {
+                    assert!(
+                        (19..=28).contains(&r),
+                        "{label}: call-crossing 4-inst HASH8_PRIME must stay in callee-saved x19..=x28, got x{r}"
+                    );
+                }
+                other => panic!(
+                    "{label}: 4-inst HASH8_PRIME used twice per loop iteration must stay in a physical GPR, got {other:?}"
+                ),
+            }
+            assert_eq!(
+                ra.loc_of[cheap_mask.index()],
+                AllocLoc::RematConst(CHEAP_MASK),
+                "{label}: 1-inst constant 0x3fff should stay cheap to rematerialize under pressure"
+            );
+        }
+    }
+
+    #[test]
+    fn cheap_1inst_const_never_steals_gpr_from_loop_scalar() {
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let loop_hdr = b.create_block(BlockKind::Normal);
+        let exit = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let x = b.param(Ty::I64);
+        let n = b.param(Ty::I64);
+        // Define 1-inst constant `#0x10` FIRST so Phase 1 program-order coloring tries to give it
+        // a GPR before the 24 loop-invariant scalars, forcing Phase 2 to evict `#0x10` instead.
+        let c16 = b.iconst(Ty::I64, 0x10);
+        let c1 = b.iconst(Ty::I64, 1);
+        let mut loop_scalars = Vec::with_capacity_in(24, alloc);
+        let mut cur = x;
+        for _ in 0..24usize {
+            cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+            loop_scalars.push(cur);
+        }
+        let z0 = b.iconst(Ty::I64, 0);
+        b.jump((loop_hdr, &[z0, cur]));
+
+        b.begin(loop_hdr);
+        let iv = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let mut tmp = acc;
+        for &sv in &loop_scalars {
+            tmp = b.binary(Op::Xor, Flags::NONE, tmp, sv);
+        }
+        // Two non-imm-folded uses of `#0x10` inside the loop (Mul & Xor).
+        tmp = b.binary(Op::Mul, Flags::NONE, tmp, c16);
+        tmp = b.binary(Op::Xor, Flags::NONE, tmp, c16);
+        let iv_next = b.binary(Op::Add, Flags::NONE, iv, c1);
+        let cond = b.icmp(IntCond::Ult, iv_next, n);
+        b.br(Flags::NONE, cond, (loop_hdr, &[iv_next, tmp]), (exit, &[tmp]));
+
+        b.begin(exit);
+        let out = b.param(Ty::I64);
+        b.ret(&[out]);
+
+        let func = b.finish_checked().expect("loop scalar vs #0x10 LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+        // Fold `c1` (add_imm) and `cond` (CmpBr) just like `isel.rs` so peak non-remat GPR
+        // pressure inside `loop_hdr` is exactly 27 (`n`, `iv`, `acc`, and 24 `loop_scalars`).
+        skip[c1.index()] = true;
+        skip[cond.index()] = true;
+
+        let ra_exact = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+            .expect("exact-CFG regalloc succeeds");
+        let gpr_ord = build_caller_gpr_order(None);
+        let fp_ord = build_caller_fp_order(None);
+        let ra_rpo = allocate_linear_scan_rpo(
+            &view,
+            &skip,
+            &tail,
+            64,
+            crate::Os::MacOs,
+            |_| CallClobbers::C_ABI_ARM64,
+            &gpr_ord,
+            &fp_ord,
+            alloc,
+        )
+        .expect("RPO linear-scan regalloc succeeds");
+
+        for (label, ra) in [("exact_cfg", &ra_exact), ("linear_scan_rpo", &ra_rpo)] {
+            assert_eq!(
+                ra.loc_of[c16.index()],
+                AllocLoc::RematConst(16),
+                "{label}: 1-inst constant #0x10 must yield RematConst(16), got {:?}",
+                ra.loc_of[c16.index()]
+            );
+            assert_eq!(
+                ra.num_spill_slots, 0,
+                "{label}: all 27 loop scalars must stay in physical GPRs with zero spills"
+            );
+            for (k, &sv) in loop_scalars.iter().enumerate() {
+                assert!(
+                    matches!(ra.loc_of[sv.index()], AllocLoc::Gpr(_)),
+                    "{label}: loop scalar[{k}] must stay in a GPR, got {:?}",
+                    ra.loc_of[sv.index()]
+                );
+            }
+            assert!(
+                matches!(ra.loc_of[n.index()], AllocLoc::Gpr(_))
+                    && matches!(ra.loc_of[iv.index()], AllocLoc::Gpr(_))
+                    && matches!(ra.loc_of[acc.index()], AllocLoc::Gpr(_)),
+                "{label}: loop control/accumulator scalars must stay in GPRs"
+            );
+        }
+    }
+
+    #[test]
+    fn leaf_function_can_allocate_lr_when_pressure_exceeds_26() {
+        let alloc = test_alloc();
+        let gpr_ord = build_caller_gpr_order(None);
+        let fp_ord = build_caller_fp_order(None);
+
+        let uses_x30 = |loc_of: &[AllocLoc]| {
+            loc_of.iter().any(|&loc| {
+                matches!(
+                    loc,
+                    AllocLoc::Gpr(30) | AllocLoc::GprPair(30, _) | AllocLoc::GprPair(_, 30)
+                )
+            })
+        };
+
+        // 1. Zero-call leaf function with 27 simultaneously live GPRs allocates X30 with 0 spills!
+        {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let c1 = b.iconst(Ty::I64, 1);
+            let mut live = Vec::with_capacity_in(26, alloc);
+            let mut cur = x;
+            for _ in 0..26usize {
+                cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+                live.push(cur);
+            }
+            let mut acc = b.binary(Op::Xor, Flags::NONE, x, live[0]);
+            for &v in &live[1..] {
+                acc = b.binary(Op::Xor, Flags::NONE, acc, v);
+            }
+            b.ret(&[acc]);
+
+            let func = b.finish_checked().expect("27-GPR leaf LIR builds");
+            let view = func.view();
+            let n_inst = view.len();
+            let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            for _ in 0..n_inst {
+                skip.push(false);
+                tail.push(false);
+            }
+            skip[c1.index()] = true;
+
+            let ra_exact = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+                .expect("exact-CFG leaf regalloc succeeds");
+            let ra_rpo = allocate_linear_scan_rpo(
+                &view,
+                &skip,
+                &tail,
+                64,
+                crate::Os::MacOs,
+                |_| CallClobbers::C_ABI_ARM64,
+                &gpr_ord,
+                &fp_ord,
+                alloc,
+            )
+            .expect("RPO linear-scan leaf regalloc succeeds");
+
+            for (label, ra) in [("exact_cfg", &ra_exact), ("linear_scan_rpo", &ra_rpo)] {
+                assert_eq!(ra.num_spill_slots, 0, "{label}: 27 live GPRs in leaf must have 0 spills");
+                assert!(!ra.has_calls, "{label}: leaf function must have has_calls == false");
+                assert!(ra.uses_lr, "{label}: 27 live GPRs in leaf must set uses_lr = true");
+                assert!(uses_x30(&ra.loc_of), "{label}: expected one value allocated to Gpr(30)");
+                assert_eq!(ra.x_pairs, 0x1f, "{label}: X30 must only be used after all 5 x19..x28 pairs");
+            }
+        }
+
+        // 2. Function with an `Op::Call` MUST NEVER allocate X30!
+        {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let callee_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            let callee_ref = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let c1 = b.iconst(Ty::I64, 1);
+            let mut live = Vec::with_capacity_in(26, alloc);
+            let mut cur = x;
+            for _ in 0..26usize {
+                cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+                live.push(cur);
+            }
+            let call_res = b.call(Flags::NONE, callee_ref, callee_sig, &[x]);
+            let mut acc = b.binary(Op::Xor, Flags::NONE, call_res, x);
+            for &v in &live {
+                acc = b.binary(Op::Xor, Flags::NONE, acc, v);
+            }
+            b.ret(&[acc]);
+
+            let func = b.finish_checked().expect("27-GPR call LIR builds");
+            let view = func.view();
+            let n_inst = view.len();
+            let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            for _ in 0..n_inst {
+                skip.push(false);
+                tail.push(false);
+            }
+            skip[c1.index()] = true;
+
+            let ra_exact = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+                .expect("exact-CFG call regalloc succeeds");
+            let ra_rpo = allocate_linear_scan_rpo(
+                &view,
+                &skip,
+                &tail,
+                64,
+                crate::Os::MacOs,
+                |_| CallClobbers::C_ABI_ARM64,
+                &gpr_ord,
+                &fp_ord,
+                alloc,
+            )
+            .expect("RPO linear-scan call regalloc succeeds");
+
+            for (label, ra) in [("exact_cfg", &ra_exact), ("linear_scan_rpo", &ra_rpo)] {
+                assert!(ra.has_calls, "{label}: call function must report has_calls = true");
+                assert!(!ra.uses_lr, "{label}: function with Op::Call must never set uses_lr");
+                assert!(!uses_x30(&ra.loc_of), "{label}: function with Op::Call must never allocate X30");
+            }
+        }
+
+        // 3. Function with dynamic-length `Op::Memcpy` (`bl memcpy`) MUST NEVER allocate X30!
+        {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[
+                    Param::of(Ty::I64),
+                    Param::of(Ty::PTR),
+                    Param::of(Ty::PTR),
+                    Param::of(Ty::I64),
+                ],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let dyn_len = b.param(Ty::I64);
+            let c1 = b.iconst(Ty::I64, 1);
+            let mut live = Vec::with_capacity_in(26, alloc);
+            let mut cur = x;
+            for _ in 0..26usize {
+                cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+                live.push(cur);
+            }
+            b.bulk(Op::Memcpy, Flags::NONE, dst, src, dyn_len, MemAttrs::aligned(1));
+            let mut acc = b.binary(Op::Xor, Flags::NONE, x, live[0]);
+            for &v in &live[1..] {
+                acc = b.binary(Op::Xor, Flags::NONE, acc, v);
+            }
+            b.ret(&[acc]);
+
+            let func = b.finish_checked().expect("27-GPR memcpy LIR builds");
+            let view = func.view();
+            let n_inst = view.len();
+            let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            for _ in 0..n_inst {
+                skip.push(false);
+                tail.push(false);
+            }
+            skip[c1.index()] = true;
+
+            let ra_exact = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+                .expect("exact-CFG memcpy regalloc succeeds");
+            let ra_rpo = allocate_linear_scan_rpo(
+                &view,
+                &skip,
+                &tail,
+                64,
+                crate::Os::MacOs,
+                |_| CallClobbers::C_ABI_ARM64,
+                &gpr_ord,
+                &fp_ord,
+                alloc,
+            )
+            .expect("RPO linear-scan memcpy regalloc succeeds");
+
+            for (label, ra) in [("exact_cfg", &ra_exact), ("linear_scan_rpo", &ra_rpo)] {
+                assert!(ra.has_calls, "{label}: dynamic Op::Memcpy must report has_calls = true");
+                assert!(!ra.uses_lr, "{label}: function with dynamic Op::Memcpy must never set uses_lr");
+                assert!(
+                    !uses_x30(&ra.loc_of),
+                    "{label}: function with dynamic Op::Memcpy must never allocate X30"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn depth1_loop_invariant_beats_40_depth0_uses_of_epilogue_ptr() {
+        let alloc = test_alloc();
+        let gpr_ord = build_caller_gpr_order(None);
+        let fp_ord = build_caller_fp_order(None);
+
+        // 1. Depth-1 loop invariant with 1 loop use (weight 128 + 1 = 129) must stay in a GPR
+        //    even when 3 cold depth-0 epilogue pointers each have 40 depth-0 uses (weight 41)
+        //    under >27 live GPR pressure (previously evicted under 16x depth weighting!).
+        {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[
+                    Param::of(Ty::PTR),
+                    Param::of(Ty::PTR),
+                    Param::of(Ty::PTR),
+                    Param::of(Ty::I64),
+                    Param::of(Ty::I64),
+                ],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let loop_hdr = b.create_block(BlockKind::Normal);
+            let exit = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let ep0 = b.param(Ty::PTR);
+            let ep1 = b.param(Ty::PTR);
+            let ep2 = b.param(Ty::PTR);
+            let x = b.param(Ty::I64);
+            let n = b.param(Ty::I64);
+            let c1 = b.iconst(Ty::I64, 1);
+            let c0 = b.iconst(Ty::I64, 0);
+            let lit_limit = b.binary(Op::Add, Flags::NONE, x, n);
+            let mut invs = Vec::with_capacity_in(21, alloc);
+            let mut cur = x;
+            for _ in 0..21usize {
+                cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+                invs.push(cur);
+            }
+            b.jump((loop_hdr, &[c0, x]));
+
+            b.begin(loop_hdr);
+            let iv = b.param(Ty::I64);
+            let acc = b.param(Ty::I64);
+            // `lit_limit` has a SINGLE use at depth 1; each `inv` has 2 uses at depth 1.
+            let mut h = b.binary(Op::Xor, Flags::NONE, acc, lit_limit);
+            for &inv in &invs {
+                let t = b.binary(Op::Add, Flags::NONE, h, inv);
+                h = b.binary(Op::Xor, Flags::NONE, t, inv);
+            }
+            let iv_next = b.binary(Op::Add, Flags::NONE, iv, c1);
+            let cond = b.icmp(IntCond::Ult, iv_next, n);
+            b.br(Flags::NONE, cond, (loop_hdr, &[iv_next, h]), (exit, &[h]));
+
+            b.begin(exit);
+            let out = b.param(Ty::I64);
+            for k in 0..40usize {
+                let off = i32::try_from(k * 8).unwrap_or(0);
+                b.store(Flags::NONE, out, ep0, off, MemAttrs::aligned(8));
+                b.store(Flags::NONE, out, ep1, off, MemAttrs::aligned(8));
+                b.store(Flags::NONE, out, ep2, off, MemAttrs::aligned(8));
+            }
+            b.ret(&[out]);
+
+            let func = b.finish_checked().expect("depth1 vs 40-use epilogue ptr LIR builds");
+            let view = func.view();
+            let n_inst = view.len();
+            let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            for _ in 0..n_inst {
+                skip.push(false);
+                tail.push(false);
+            }
+            skip[c1.index()] = true;
+
+            let ra_exact = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+                .expect("exact-CFG regalloc succeeds");
+            let ra_rpo = allocate_linear_scan_rpo(
+                &view,
+                &skip,
+                &tail,
+                64,
+                crate::Os::MacOs,
+                |_| CallClobbers::C_ABI_ARM64,
+                &gpr_ord,
+                &fp_ord,
+                alloc,
+            )
+            .expect("RPO linear-scan regalloc succeeds");
+
+            for (label, ra) in [("exact_cfg", &ra_exact), ("linear_scan_rpo", &ra_rpo)] {
+                assert!(
+                    ra.num_spill_slots >= 2,
+                    "{label}: must overflow 27 leaf GPRs and spill cold depth-0 epilogue pointers"
+                );
+                assert!(
+                    matches!(ra.loc_of[lit_limit.index()], AllocLoc::Gpr(_)),
+                    "{label}: single-use depth-1 loop invariant `lit_limit` must stay in a GPR, got {:?}",
+                    ra.loc_of[lit_limit.index()]
+                );
+                assert!(
+                    matches!(ra.loc_of[n.index()], AllocLoc::Gpr(_)),
+                    "{label}: single-use depth-1 loop invariant `n` must stay in a GPR, got {:?}",
+                    ra.loc_of[n.index()]
+                );
+                for (i, &inv) in invs.iter().enumerate() {
+                    assert!(
+                        matches!(ra.loc_of[inv.index()], AllocLoc::Gpr(_)),
+                        "{label}: depth-1 invariant inv[{i}] must stay in a GPR, got {:?}",
+                        ra.loc_of[inv.index()]
+                    );
+                }
+                let ep_spills = [ep0, ep1, ep2]
+                    .iter()
+                    .filter(|&&ep| matches!(ra.loc_of[ep.index()], AllocLoc::GprSpill(_)))
+                    .count();
+                assert!(
+                    ep_spills >= 2,
+                    "{label}: expected cold 40-use depth-0 epilogue pointers to spill before depth-1 invariants, ep_spills={ep_spills}"
+                );
+            }
+        }
+
+        // 2. Back-edge phi argument coalesces with its loop header `Param` over a same-depth
+        //    single-use temporary that appears earlier in program order (Phase 2 greedy coloring).
+        {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let loop_hdr = b.create_block(BlockKind::Normal);
+            let exit = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let tbl_ptr = b.param(Ty::PTR);
+            let a0 = b.param(Ty::I64);
+            let n = b.param(Ty::I64);
+            let c1 = b.iconst(Ty::I64, 1);
+            let c7 = b.iconst(Ty::I64, 7);
+            let c0 = b.iconst(Ty::I64, 0);
+            let mut cold = Vec::with_capacity_in(25, alloc);
+            let mut cur = a0;
+            for _ in 0..25usize {
+                cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+                cold.push(cur);
+            }
+            b.jump((loop_hdr, &[a0, c0]));
+
+            b.begin(loop_hdr);
+            let p0 = b.param(Ty::I64);
+            let iv = b.param(Ty::I64);
+            let u0 = b.binary(Op::Add, Flags::NONE, p0, n);
+            let tmp = b.binary(Op::Add, Flags::NONE, u0, c7);
+            let p0_next = b.load(Ty::I64, Flags::NONE, tbl_ptr, 0, MemAttrs::aligned(8));
+            let iv_next = b.binary(Op::Add, Flags::NONE, iv, tmp);
+            let cond = b.icmp(IntCond::Ult, iv_next, n);
+            b.br(Flags::NONE, cond, (loop_hdr, &[p0_next, iv_next]), (exit, &[iv_next]));
+
+            b.begin(exit);
+            let mut out = b.param(Ty::I64);
+            out = b.binary(Op::Xor, Flags::NONE, out, a0);
+            for &cv in &cold {
+                out = b.binary(Op::Xor, Flags::NONE, out, cv);
+            }
+            b.ret(&[out]);
+
+            let func = b.finish_checked().expect("back-edge phi coalescing LIR builds");
+            let view = func.view();
+            let n_inst = view.len();
+            let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+            for _ in 0..n_inst {
+                skip.push(false);
+                tail.push(false);
+            }
+            skip[c1.index()] = true;
+            skip[c7.index()] = true;
+
+            let ra_exact = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+                .expect("exact-CFG back-edge phi regalloc succeeds");
+            let ra_rpo = allocate_linear_scan_rpo(
+                &view,
+                &skip,
+                &tail,
+                64,
+                crate::Os::MacOs,
+                |_| CallClobbers::C_ABI_ARM64,
+                &gpr_ord,
+                &fp_ord,
+                alloc,
+            )
+            .expect("RPO linear-scan back-edge phi regalloc succeeds");
+
+            for (label, ra) in [("exact_cfg", &ra_exact), ("linear_scan_rpo", &ra_rpo)] {
+                assert!(
+                    ra.num_spill_slots > 0,
+                    "{label}: must trigger Phase 2 greedy coloring via cold depth-0 pressure"
+                );
+                assert!(
+                    matches!(ra.loc_of[p0.index()], AllocLoc::Gpr(_)),
+                    "{label}: loop header param `p0` must stay in a GPR, got {:?}",
+                    ra.loc_of[p0.index()]
+                );
+                assert_eq!(
+                    ra.loc_of[p0_next.index()],
+                    ra.loc_of[p0.index()],
+                    "{label}: back-edge phi arg `p0_next` must coalesce with loop param `p0` instead of losing to same-depth temp `tmp` (tmp={:?})",
+                    ra.loc_of[tmp.index()]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn loop_param_skips_reg_busy_for_backedge_arg() {
+        let alloc = test_alloc();
+        let gpr_ord = build_caller_gpr_order(None);
+        let fp_ord = build_caller_fp_order(None);
+
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let loop_hdr = b.create_block(BlockKind::Normal);
+        let exit = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let tbl_ptr = b.param(Ty::PTR);
+        let a0 = b.param(Ty::I64);
+        let n = b.param(Ty::I64);
+        let c1 = b.iconst(Ty::I64, 1);
+        let c0 = b.iconst(Ty::I64, 0);
+        // 25 cold depth-0 values live into `exit` so Phase 1 overflows and Phase 2 greedy coloring runs.
+        let mut cold = Vec::with_capacity_in(25, alloc);
+        let mut cur = a0;
+        for _ in 0..25usize {
+            cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+            cold.push(cur);
+        }
+        b.jump((loop_hdr, &[a0, c0]));
+
+        b.begin(loop_hdr);
+        let p = b.param(Ty::I64);
+        let iv = b.param(Ty::I64);
+        // Top of loop: `p` is read once and dies before `hot_tmp` is defined.
+        let u0 = b.binary(Op::Add, Flags::NONE, p, iv);
+        // Bottom of loop: `hot_tmp` does not interfere with `p`, has 5 depth-1 uses (colored
+        // BEFORE `p` in Phase 2, taking `X9`), and stays live across `p_next` (interfering with `p_next`).
+        let hot_tmp = b.binary(Op::Xor, Flags::NONE, u0, n);
+        let p_next = b.load(Ty::I64, Flags::NONE, tbl_ptr, 0, MemAttrs::aligned(8));
+        let h1 = b.binary(Op::Add, Flags::NONE, hot_tmp, hot_tmp);
+        let h2 = b.binary(Op::Xor, Flags::NONE, h1, hot_tmp);
+        let h3 = b.binary(Op::Add, Flags::NONE, h2, hot_tmp);
+        let h4 = b.binary(Op::Xor, Flags::NONE, h3, hot_tmp);
+        let iv_next = b.binary(Op::Add, Flags::NONE, iv, h4);
+        let cond = b.icmp(IntCond::Ult, iv_next, n);
+        b.br(Flags::NONE, cond, (loop_hdr, &[p_next, iv_next]), (exit, &[iv_next]));
+
+        b.begin(exit);
+        let mut out = b.param(Ty::I64);
+        out = b.binary(Op::Xor, Flags::NONE, out, a0);
+        for &cv in &cold {
+            out = b.binary(Op::Xor, Flags::NONE, out, cv);
+        }
+        b.ret(&[out]);
+
+        let func = b.finish_checked().expect("joint loop-param co-coloring LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+        skip[c1.index()] = true;
+
+        let ra_exact = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+            .expect("exact-CFG joint loop-param regalloc succeeds");
+        let ra_rpo = allocate_linear_scan_rpo(
+            &view,
+            &skip,
+            &tail,
+            64,
+            crate::Os::MacOs,
+            |_| CallClobbers::C_ABI_ARM64,
+            &gpr_ord,
+            &fp_ord,
+            alloc,
+        )
+        .expect("RPO linear-scan joint loop-param regalloc succeeds");
+
+        for (label, ra) in [("exact_cfg", &ra_exact), ("linear_scan_rpo", &ra_rpo)] {
+            assert!(
+                ra.num_spill_slots > 0,
+                "{label}: must trigger Phase 2 greedy coloring via cold depth-0 pressure"
+            );
+            assert_eq!(
+                ra.loc_of[hot_tmp.index()],
+                AllocLoc::Gpr(9),
+                "{label}: highest-weight bottom-of-loop `hot_tmp` must claim X9"
+            );
+            assert_ne!(
+                ra.loc_of[p.index()],
+                AllocLoc::Gpr(9),
+                "{label}: loop header `p` must skip X9 because X9 interferes with back-edge `p_next`"
+            );
+            assert!(
+                matches!(ra.loc_of[p.index()], AllocLoc::Gpr(_)),
+                "{label}: loop header `p` must stay in a GPR, got {:?}",
+                ra.loc_of[p.index()]
+            );
+            assert_eq!(
+                ra.loc_of[p.index()],
+                ra.loc_of[p_next.index()],
+                "{label}: loop header `p` and back-edge `p_next` must share one GPR (0 back-edge mov)"
             );
         }
     }

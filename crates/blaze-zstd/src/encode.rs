@@ -1,13 +1,13 @@
 //! RFC 8878 Zstandard frame and block compressor: reusable [`ZstdEncoder`] context,
-//! 5-byte SWAR / 2-way associative LZ77 with 1 MiB window, Treeless-reusing 4-stream Huffman
-//! literals, custom per-block & RLE FSE sequence tables, and zero-pre-zeroing [`ByteCursor`]
-//! bit-packing.
+//! 1-way 10-bit-tagged `hash7` Fast (64 KiB table, 512 KiB window) and Double-Fast `hash8` +
+//! `hash4` (512 KiB tables, 2 MiB window) LZ77 scanners, Treeless-reusing 4-stream Huffman
+//! literals, custom/seeded/RLE FSE sequence tables, and zero-bounds-check reverse FSE bit-packing.
 
 use core::alloc::Allocator;
 
 use blaze_own::{
-    Int, LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, Pow2Array, SeqOp, Vec, fse_pack_sequences_fast,
-    lz77_scan_default, lz77_scan_fast,
+    FseSeqEncTables, Int, LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, Pow2Array, SeqOp, Vec,
+    fse_pack_sequences_fast, lz77_scan_default, lz77_scan_fast,
 };
 
 use crate::dict::ZstdDict;
@@ -21,10 +21,14 @@ use crate::huffman::{HuffEncCache, encode_huffman_literals_into};
 use crate::xxh64::xxh64;
 use crate::{CompressOpts, Level, MAX_BLOCK_SIZE, ZSTD_MAGIC, ZstdError};
 
-/// 4 MiB sliding window for multi-block frames (well within `ZstdLimits::USUAL` = 8 MiB).
-const MAX_WINDOW: usize = 1 << 22;
-/// Window_Descriptor for exact 4 MiB window: exponent = 12, mantissa = 0 (`1 << (10 + 12)`).
-const WINDOW_DESC_4M: u8 = 12u8 << 3;
+/// 512 KiB sliding window for `Level::Fast` (matches C `zstd -1`, `wlog = 19`).
+const MAX_WINDOW_FAST: usize = 1 << 19;
+/// Window_Descriptor for exact 512 KiB window: exponent = 9, mantissa = 0 (`1 << (10 + 9)`).
+const WINDOW_DESC_512K: u8 = 9u8 << 3;
+/// 2 MiB sliding window for `Level::Default` (matches C `zstd -3`, `wlog = 21`).
+const MAX_WINDOW_DEFAULT: usize = 1 << 21;
+/// Window_Descriptor for exact 2 MiB window: exponent = 11, mantissa = 0 (`1 << (10 + 11)`).
+const WINDOW_DESC_2M: u8 = 11u8 << 3;
 
 #[inline]
 fn ensure_zeroed<T: Copy, A: Allocator>(
@@ -130,6 +134,7 @@ struct PredefinedEncTables {
     ll: FseEncTable,
     of: FseEncTable,
     ml: FseEncTable,
+    packed: FseSeqEncTables,
 }
 
 impl PredefinedEncTables {
@@ -144,7 +149,12 @@ impl PredefinedEncTables {
         dec.build_from_norm(&ML_DEFAULT_NORM, ML_DEFAULT_LOG)?;
         let ml = FseEncTable::build_from_dec(&dec)?;
 
-        Ok(Self { ll, of, ml })
+        let mut packed = FseSeqEncTables::new_zeroed();
+        ll.write_ll_into(&mut packed);
+        of.write_of_into(&mut packed);
+        ml.write_ml_into(&mut packed);
+
+        Ok(Self { ll, of, ml, packed })
     }
 }
 
@@ -156,6 +166,7 @@ fn pack_raw_sequences_fse<A: Allocator>(
     ll_tbl: &FseEncTable,
     of_tbl: &FseEncTable,
     ml_tbl: &FseEncTable,
+    packed: &FseSeqEncTables,
     comp_buf: &mut Vec<u8, A>,
 ) -> Result<(), ZstdError> {
     let last = raw_seqs.last().ok_or(ZstdError::CorruptSequences)?;
@@ -166,17 +177,15 @@ fn pack_raw_sequences_fse<A: Allocator>(
     let (l_of_c, l_of_e, l_of_b) =
         encode_of_fast(last.offset).ok_or(ZstdError::CorruptSequences)?;
 
-    let init_ll = ll_tbl.init_state(l_ll_c).ok_or(ZstdError::CorruptFse)?;
-    let init_of = of_tbl.init_state(l_of_c).ok_or(ZstdError::CorruptFse)?;
-    let init_ml = ml_tbl.init_state(l_ml_c).ok_or(ZstdError::CorruptFse)?;
+    let init_ll = ll_tbl.init_state_biased(l_ll_c).ok_or(ZstdError::CorruptFse)?;
+    let init_of = of_tbl.init_state_biased(l_of_c).ok_or(ZstdError::CorruptFse)?;
+    let init_ml = ml_tbl.init_state_biased(l_ml_c).ok_or(ZstdError::CorruptFse)?;
 
     fse_pack_sequences_fast(
         raw_seqs,
         &LL_ENC_PACKED,
         &ML_ENC_PACKED,
-        ll_tbl.pack_view(),
-        of_tbl.pack_view(),
-        ml_tbl.pack_view(),
+        packed,
         init_ll,
         init_of,
         init_ml,
@@ -250,20 +259,17 @@ fn plan_seq_table(
     SeqTableChoice::Predefined
 }
 
-/// Reusable RFC 8878 Zstandard compressor context.
-///
-/// Reuses prebuilt FSE tables, LZ77 hash table, Huffman table cache (for `Treeless_Literals_Block`),
-/// and block scratch buffers across calls with zero per-call workspace allocation.
-pub struct ZstdEncoder<A: Allocator + Copy> {
+/// Per-block entropy and scratch state split out of [`ZstdEncoder`] so the LZ77 hash-table array
+/// borrow can be validated once per frame before the block loop without conflicting with
+/// [`BlockEncState::encode_compressed_block`].
+struct BlockEncState<A: Allocator + Copy> {
     predef: PredefinedEncTables,
     scratch_dec: FseDecTable,
     custom_ll: FseEncTable,
     custom_of: FseEncTable,
     custom_ml: FseEncTable,
-    hash_table: Vec<u32, A>,
-    hash_table_2way: Vec<u64, A>,
-    dict_work: Vec<u8, A>,
-    dict_tag: (usize, usize, u64),
+    packed_custom: FseSeqEncTables,
+    packed_active: FseSeqEncTables,
     literals_buf: Vec<u8, A>,
     raw_seqs: Vec<SeqOp, A>,
     comp_buf: Vec<u8, A>,
@@ -272,25 +278,46 @@ pub struct ZstdEncoder<A: Allocator + Copy> {
     alloc: A,
 }
 
+enum ActiveTable<'a> {
+    Fast(&'a mut [u32; LZ77_FAST_HASH_SIZE]),
+    Default(&'a mut [u64; LZ77_DEF_BUCKETS]),
+}
+
+/// Reusable RFC 8878 Zstandard compressor context.
+///
+/// Reuses prebuilt FSE tables, LZ77 hash table, Huffman table cache (for `Treeless_Literals_Block`),
+/// and block scratch buffers across calls with zero per-call workspace allocation.
+pub struct ZstdEncoder<A: Allocator + Copy> {
+    block: BlockEncState<A>,
+    hash_table: Vec<u32, A>,
+    hash_table_dfast: Vec<u64, A>,
+    dict_work: Vec<u8, A>,
+    dict_tag: (usize, usize, u64),
+}
+
 impl<A: Allocator + Copy> ZstdEncoder<A> {
     /// Create a reusable Zstandard compressor context backed by `alloc`.
     pub fn try_new_in(alloc: A) -> Result<Self, ZstdError> {
         Ok(Self {
-            predef: PredefinedEncTables::build()?,
-            scratch_dec: FseDecTable::new_empty(),
-            custom_ll: FseEncTable::new_empty(),
-            custom_of: FseEncTable::new_empty(),
-            custom_ml: FseEncTable::new_empty(),
+            block: BlockEncState {
+                predef: PredefinedEncTables::build()?,
+                scratch_dec: FseDecTable::new_empty(),
+                custom_ll: FseEncTable::new_empty(),
+                custom_of: FseEncTable::new_empty(),
+                custom_ml: FseEncTable::new_empty(),
+                packed_custom: FseSeqEncTables::new_zeroed(),
+                packed_active: FseSeqEncTables::new_zeroed(),
+                literals_buf: Vec::new_in(alloc),
+                raw_seqs: Vec::new_in(alloc),
+                comp_buf: Vec::new_in(alloc),
+                huff_payload: Vec::new_in(alloc),
+                huff_cache: HuffEncCache::new(),
+                alloc,
+            },
             hash_table: Vec::new_in(alloc),
-            hash_table_2way: Vec::new_in(alloc),
+            hash_table_dfast: Vec::new_in(alloc),
             dict_work: Vec::new_in(alloc),
             dict_tag: (0, 0, 0),
-            literals_buf: Vec::new_in(alloc),
-            raw_seqs: Vec::new_in(alloc),
-            comp_buf: Vec::new_in(alloc),
-            huff_payload: Vec::new_in(alloc),
-            huff_cache: HuffEncCache::new(),
-            alloc,
         })
     }
 
@@ -298,7 +325,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
     /// allocator.
     pub fn compress(&mut self, input: &[u8], opts: CompressOpts) -> Result<Vec<u8, A>, ZstdError> {
         let init_cap = (input.len() / 2).max(256).min(input.len().saturating_add(64));
-        let mut out = Vec::try_with_capacity_in(init_cap, self.alloc)?;
+        let mut out = Vec::try_with_capacity_in(init_cap, self.block.alloc)?;
         self.compress_into(input, opts, &mut out)?;
         Ok(out)
     }
@@ -312,7 +339,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
         opts: CompressOpts,
     ) -> Result<Vec<u8, A>, ZstdError> {
         let init_cap = (input.len() / 2).max(256).min(input.len().saturating_add(64));
-        let mut out = Vec::try_with_capacity_in(init_cap, self.alloc)?;
+        let mut out = Vec::try_with_capacity_in(init_cap, self.block.alloc)?;
         self.compress_with_dict_into(input, dict, opts, &mut out)?;
         Ok(out)
     }
@@ -358,6 +385,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
         out.try_extend_from_slice(&ZSTD_MAGIC.to_le_bytes())?;
 
         // 2. Frame header descriptor + optional Window_Descriptor + Frame_Content_Size
+        let fast_mode = matches!(opts.level, Level::Fast);
         let has_dict = dict.is_some();
         let len_u64 = input.len().widen_to::<u64>();
         let single_segment = !has_dict && input.len() <= MAX_BLOCK_SIZE;
@@ -381,7 +409,8 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
         out.try_push(fhd).map_err(|r| r.why)?;
 
         if !single_segment {
-            out.try_push(WINDOW_DESC_4M).map_err(|r| r.why)?;
+            let window_desc = if fast_mode { WINDOW_DESC_512K } else { WINDOW_DESC_2M };
+            out.try_push(window_desc).map_err(|r| r.why)?;
         }
 
         match fcs_flag {
@@ -403,7 +432,6 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
         if input.is_empty() {
             write_block_header(out, true, 0, 0)?;
         } else {
-            let fast_mode = matches!(opts.level, Level::Fast);
             let dict_len = if let Some((db, ft, dt, dh)) = dict {
                 let tag = (db.as_ptr().addr(), db.len(), dh);
                 if self.dict_tag != tag || self.dict_work.len() < db.len() {
@@ -423,22 +451,43 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
                     } else {
                         self.hash_table.as_mut_slice().copy_from_slice(ft);
                     }
-                } else if self.hash_table_2way.len() != LZ77_DEF_BUCKETS {
-                    self.hash_table_2way.clear();
-                    self.hash_table_2way.try_extend_from_slice(dt)?;
+                } else if self.hash_table_dfast.len() != LZ77_DEF_BUCKETS {
+                    self.hash_table_dfast.clear();
+                    self.hash_table_dfast.try_extend_from_slice(dt)?;
                 } else {
-                    self.hash_table_2way.as_mut_slice().copy_from_slice(dt);
+                    self.hash_table_dfast.as_mut_slice().copy_from_slice(dt);
                 }
                 db.len()
             } else {
                 if fast_mode {
                     ensure_zeroed(&mut self.hash_table, LZ77_FAST_HASH_SIZE, 0u32)?;
                 } else {
-                    ensure_zeroed(&mut self.hash_table_2way, LZ77_DEF_BUCKETS, 0u64)?;
+                    ensure_zeroed(&mut self.hash_table_dfast, LZ77_DEF_BUCKETS, 0u64)?;
                 }
                 0
             };
-            self.huff_cache.reset();
+            self.block.huff_cache.reset();
+
+            // Hoist the frame scan slice and fixed-length hash-table array borrow once per frame
+            // so the per-block loop pays zero slice/array `Option`/`Result` checks.
+            let scan_input: &[u8] = if dict_len > 0 { self.dict_work.as_slice() } else { input };
+            let mut active_table = if fast_mode {
+                let table_arr: &mut [u32; LZ77_FAST_HASH_SIZE] = self
+                    .hash_table
+                    .as_mut_slice()
+                    .get_mut(..LZ77_FAST_HASH_SIZE)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or(ZstdError::CorruptSequences)?;
+                ActiveTable::Fast(table_arr)
+            } else {
+                let table_arr: &mut [u64; LZ77_DEF_BUCKETS] = self
+                    .hash_table_dfast
+                    .as_mut_slice()
+                    .get_mut(..LZ77_DEF_BUCKETS)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or(ZstdError::CorruptSequences)?;
+                ActiveTable::Default(table_arr)
+            };
 
             let mut rep = [1usize, 4usize, 8usize];
             let mut emitted_predef_fse = false;
@@ -464,58 +513,46 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
                 }
 
                 let mut trial_rep = rep;
-                {
-                    let scan_input: &[u8] = if dict_len > 0 { self.dict_work.as_slice() } else { input };
-                    if fast_mode {
-                        let table_arr: &mut [u32; LZ77_FAST_HASH_SIZE] = self
-                            .hash_table
-                            .as_mut_slice()
-                            .get_mut(..LZ77_FAST_HASH_SIZE)
-                            .and_then(|s| s.try_into().ok())
-                            .ok_or(ZstdError::CorruptSequences)?;
+                match &mut active_table {
+                    ActiveTable::Fast(table_arr) => {
                         lz77_scan_fast(
                             scan_input,
                             block_start,
                             block_end,
-                            MAX_WINDOW,
-                            table_arr,
+                            MAX_WINDOW_FAST,
+                            *table_arr,
                             &mut trial_rep,
-                            &mut self.literals_buf,
-                            &mut self.raw_seqs,
+                            &mut self.block.literals_buf,
+                            &mut self.block.raw_seqs,
                         )?;
-                    } else {
-                        let table_arr: &mut [u64; LZ77_DEF_BUCKETS] = self
-                            .hash_table_2way
-                            .as_mut_slice()
-                            .get_mut(..LZ77_DEF_BUCKETS)
-                            .and_then(|s| s.try_into().ok())
-                            .ok_or(ZstdError::CorruptSequences)?;
+                    }
+                    ActiveTable::Default(table_arr) => {
                         lz77_scan_default(
                             scan_input,
                             block_start,
                             block_end,
-                            MAX_WINDOW,
-                            table_arr,
+                            MAX_WINDOW_DEFAULT,
+                            *table_arr,
                             &mut trial_rep,
-                            &mut self.literals_buf,
-                            &mut self.raw_seqs,
+                            &mut self.block.literals_buf,
+                            &mut self.block.raw_seqs,
                         )?;
                     }
                 }
 
-                if !self.raw_seqs.is_empty() {
-                    let use_custom_fse = !fast_mode && self.raw_seqs.len() >= 128;
-                    let built_fast_custom = self.encode_compressed_block(
+                if !self.block.raw_seqs.is_empty() {
+                    let use_custom_fse = !fast_mode && self.block.raw_seqs.len() >= 128;
+                    let built_fast_custom = self.block.encode_compressed_block(
                         fast_mode,
                         use_custom_fse,
                         emitted_predef_fse && !use_custom_fse,
                         has_fast_custom_fse,
                     )?;
-                    if self.comp_buf.len() < block_len {
-                        write_block_header(out, last_block, 2, self.comp_buf.len())?;
-                        out.try_extend_from_slice(self.comp_buf.as_slice())?;
+                    if self.block.comp_buf.len() < block_len {
+                        write_block_header(out, last_block, 2, self.block.comp_buf.len())?;
+                        out.try_extend_from_slice(self.block.comp_buf.as_slice())?;
                         rep = trial_rep;
-                        self.huff_cache.commit();
+                        self.block.huff_cache.commit();
                         if built_fast_custom {
                             has_fast_custom_fse = true;
                             emitted_predef_fse = false;
@@ -525,7 +562,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
                         block_start = block_end;
                         continue;
                     }
-                    self.huff_cache.discard();
+                    self.block.huff_cache.discard();
                 }
 
                 write_block_header(out, last_block, 0, input_block.len())?;
@@ -542,7 +579,9 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
 
         Ok(())
     }
+}
 
+impl<A: Allocator + Copy> BlockEncState<A> {
     fn encode_compressed_block(
         &mut self,
         fast_mode: bool,
@@ -573,6 +612,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
                     &self.custom_ll,
                     &self.custom_of,
                     &self.custom_ml,
+                    &self.packed_custom,
                     &mut self.comp_buf,
                 )?;
                 return Ok(false);
@@ -585,6 +625,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
                     &self.custom_ll,
                     &self.custom_of,
                     &self.custom_ml,
+                    &self.packed_custom,
                     &mut self.comp_buf,
                 )?;
                 return Ok(true);
@@ -596,6 +637,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
                 &self.predef.ll,
                 &self.predef.of,
                 &self.predef.ml,
+                &self.predef.packed,
                 &mut self.comp_buf,
             )?;
             return Ok(false);
@@ -610,6 +652,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
                 &self.predef.ll,
                 &self.predef.of,
                 &self.predef.ml,
+                &self.predef.packed,
                 &mut self.comp_buf,
             )?;
             return Ok(false);
@@ -623,7 +666,12 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
 
         write_num_sequences(&mut self.comp_buf, raw_seqs.len())?;
 
-        let (ll_tbl, of_tbl, ml_tbl): (&FseEncTable, &FseEncTable, &FseEncTable) = {
+        let (ll_tbl, of_tbl, ml_tbl, packed): (
+            &FseEncTable,
+            &FseEncTable,
+            &FseEncTable,
+            &FseSeqEncTables,
+        ) = {
             let total = u32::try_from(raw_seqs.len()).map_err(|_| ZstdError::CorruptSequences)?;
 
             let (ll_log, of_log, ml_log) =
@@ -697,10 +745,18 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
                 SeqTableChoice::Predefined => &self.predef.ml,
                 SeqTableChoice::Rle(_) | SeqTableChoice::Custom { .. } => &self.custom_ml,
             };
-            (ll_t, of_t, ml_t)
+            let packed_ref: &FseSeqEncTables = if mode_byte == 0 {
+                &self.predef.packed
+            } else {
+                ll_t.write_ll_into(&mut self.packed_active);
+                of_t.write_of_into(&mut self.packed_active);
+                ml_t.write_ml_into(&mut self.packed_active);
+                &self.packed_active
+            };
+            (ll_t, of_t, ml_t, packed_ref)
         };
 
-        pack_raw_sequences_fse(raw_seqs, ll_tbl, of_tbl, ml_tbl, &mut self.comp_buf)?;
+        pack_raw_sequences_fse(raw_seqs, ll_tbl, of_tbl, ml_tbl, packed, &mut self.comp_buf)?;
         Ok(false)
     }
 
@@ -757,10 +813,13 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
 
         self.scratch_dec.build_from_norm(ll_slice, ll_log)?;
         self.custom_ll.rebuild_from_dec(&self.scratch_dec)?;
+        self.custom_ll.write_ll_into(&mut self.packed_custom);
         self.scratch_dec.build_from_norm(of_slice, of_log)?;
         self.custom_of.rebuild_from_dec(&self.scratch_dec)?;
+        self.custom_of.write_of_into(&mut self.packed_custom);
         self.scratch_dec.build_from_norm(ml_slice, ml_log)?;
         self.custom_ml.rebuild_from_dec(&self.scratch_dec)?;
+        self.custom_ml.write_ml_into(&mut self.packed_custom);
 
         // Mode byte: LL=FSE(2), OF=FSE(2), ML=FSE(2) -> (2<<6)|(2<<4)|(2<<2) = 0xA8.
         self.comp_buf.try_push(0xA8).map_err(|r| r.why)?;

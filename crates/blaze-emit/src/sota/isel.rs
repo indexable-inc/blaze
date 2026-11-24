@@ -187,6 +187,28 @@ enum LogShift {
     Asr,
 }
 
+/// Folded 128-bit memory addressing mode for fused `I128` load+store NEON copies (`ldr q30; str q30`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CopyAddr {
+    /// `[ptr, #off]` (direct pointer operand + LIR offset).
+    Direct { ptr: u32, off: i32 },
+    /// `[sp, #off]` (folded `Op::SlotAddr`).
+    SpOff { off: i32 },
+    /// `[base, #off]` (folded `PtrAdd`/`Add` with constant offset).
+    BaseOff { base: u32, off: i32, imm_inst: u32 },
+    /// `[base, idx, lsl #4]` (folded `PtrAdd(base, Shl(idx, 4))` with offset 0).
+    ScaledIdx { base: u32, idx: u32, shift_imm: u32 },
+    /// `[base, idx]` (folded `PtrAdd`/`Add(base, idx)` with offset 0).
+    RegIdx { base: u32, idx: u32 },
+}
+
+/// Base register for a paired 32-byte NEON `ldp/stp q29, q30` copy (`Fusion::I128CopyPair`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PairBase {
+    Sp,
+    Reg(u32),
+}
+
 /// Fused instruction selection pattern chosen for an instruction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Fusion {
@@ -203,8 +225,11 @@ enum Fusion {
     AddLsl { a: u32, b: u32, shift: u32, imm_inst: u32 },
     /// `add(a, lshr(b, k))` -> `add rd, a, b, lsr #k`.
     AddLsr { a: u32, b: u32, shift: u32, imm_inst: u32 },
-    /// `sub(a, shl(b, k))` -> `sub rd, a, b, lsl #k`.
+    /// `sub(a, shl(b, k))` / `add(a, neg(shl(b, k)))` / `ptr_add(a, neg(shl(b, k)))` -> `sub rd, a, b, lsl #k`.
     SubLsl { a: u32, b: u32, shift: u32, imm_inst: u32 },
+    /// `sub(a, lshr(b, k))` / `add(a, neg(lshr(b, k)))` / `ptr_add(a, neg(lshr(b, k)))` -> `sub rd, a, b, lsr #k`,
+    /// and with `shift == 0` (`imm_inst == u32::MAX`): `ptr_add(a, neg(b))` / `add(a, neg(b))` -> `sub rd, a, b`.
+    SubLsr { a: u32, b: u32, shift: u32, imm_inst: u32 },
     /// `and`/`or`/`xor(a, shl/lshr/ashr(b, k))` -> single `and`/`orr`/`eor rd, a, b, {lsl,lsr,asr} #k`.
     LogicalShifted { a: u32, b: u32, kind: LogShift, shift: u32, imm_inst: u32 },
     /// `xor(a, rotl/rotr(b, k))` -> `eor rd, a, b, ror #shift`.
@@ -297,6 +322,19 @@ enum Fusion {
     VecFmaddElem { vec: u32, scalar: u32, acc: u32 },
     /// `fsub(acc, fmul(vec, splat(scalar)))` -> `fmls.4s/2d vd, vn, vm.s/d[0]`!
     VecFmsubElem { vec: u32, scalar: u32, acc: u32 },
+    /// Single-use same-block `Load(I128)` -> `Store(I128)` fused into 128-bit NEON
+    /// `ldr q30, [src]; str q30, [dst]` (zero GPR pair pressure, half the uops, overlap-safe).
+    I128Copy { src: CopyAddr, dst: CopyAddr },
+    /// Paired 32-byte `Load(I128)` + `Load(I128)` -> `Store(I128)` + `Store(I128)` (both loads
+    /// preceding both stores) fused into 2-instruction `ldp q29, q30, [src, #src_off]; stp q29, q30, [dst, #dst_off]`.
+    I128CopyPair {
+        src_base: PairBase,
+        src_off: i32,
+        dst_base: PairBase,
+        dst_off: i32,
+        swap: bool,
+        imm_insts: [u32; 4],
+    },
 }
 
 /// Branch patch site resolved once every block's word offset is known.
@@ -304,8 +342,8 @@ enum Fusion {
 enum PatchKind {
     B,
     BCond(Cond),
-    Cbz(Reg),
-    Cbnz(Reg),
+    Cbz { reg: Reg, wide: bool },
+    Cbnz { reg: Reg, wide: bool },
     Tbz(Reg, u32),
     Tbnz(Reg, u32),
     /// 32-bit signed byte offset entry inside an inline PC-relative jump table (`table_start_word`).
@@ -480,6 +518,215 @@ fn op_preserves_nzcv(op: Op, ty: Ty, fus: Fusion) -> bool {
         && !matches!(fus, Fusion::AdcsChain { .. } | Fusion::SubsFlags))
 }
 
+/// True iff `op` is a pure, non-trapping, non-memory, non-synchronizing register/ALU operation
+/// across which a non-volatile `Load(I128)` may safely be sunk into its sole same-block `Store(I128)`.
+#[inline]
+fn op_is_pure_no_trap(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Param
+            | Op::Iconst
+            | Op::IconstWide
+            | Op::Fconst
+            | Op::FconstWide
+            | Op::Null
+            | Op::Uninit
+            | Op::Freeze
+            | Op::Assume
+            | Op::SlotAddr
+            | Op::DataAddr
+            | Op::FuncAddr
+            | Op::PtrAdd
+            | Op::PtrAddr
+            | Op::Expose
+            | Op::FromExposed
+            | Op::PtrWithAddr
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Not
+            | Op::Shl
+            | Op::Lshr
+            | Op::Ashr
+            | Op::Rotl
+            | Op::Rotr
+            | Op::Umulhi
+            | Op::Smulhi
+            | Op::Umin
+            | Op::Umax
+            | Op::Smin
+            | Op::Smax
+            | Op::UaddSat
+            | Op::UsubSat
+            | Op::SaddSat
+            | Op::SsubSat
+            | Op::UaddOverflow
+            | Op::SaddOverflow
+            | Op::UsubOverflow
+            | Op::SsubOverflow
+            | Op::UmulOverflow
+            | Op::SmulOverflow
+            | Op::Clz
+            | Op::Ctz
+            | Op::Popcnt
+            | Op::Bswap
+            | Op::Bitrev
+            | Op::Icmp
+            | Op::Fcmp
+            | Op::Select
+            | Op::Zext
+            | Op::Sext
+            | Op::Trunc
+            | Op::Bitcast
+            | Op::Project
+            | Op::Fpext
+            | Op::Fptrunc
+            | Op::SitoFp
+            | Op::UitoFp
+            | Op::FptoSi
+            | Op::FptoUi
+            | Op::Fadd
+            | Op::Fsub
+            | Op::Fmul
+            | Op::Fdiv
+            | Op::Fneg
+            | Op::Fabs
+            | Op::Sqrt
+            | Op::Floor
+            | Op::Ceil
+            | Op::Ftrunc
+            | Op::Nearest
+            | Op::Fround
+            | Op::Fma
+            | Op::Fmuladd
+            | Op::FminNum
+            | Op::FmaxNum
+            | Op::Fminimum
+            | Op::Fmaximum
+            | Op::Splat
+            | Op::Extract
+            | Op::Insert
+            | Op::Shuffle
+            | Op::ReduceAdd
+            | Op::ReduceAnd
+            | Op::ReduceOr
+            | Op::ReduceXor
+            | Op::ReduceUmin
+            | Op::ReduceUmax
+            | Op::ReduceSmin
+            | Op::ReduceSmax
+            | Op::ReduceFadd
+    )
+}
+
+/// True iff `k` does not write memory, trap, synchronize, or perform volatile I/O,
+/// so a non-volatile `Load(I128)` may safely sink past it into its sole same-block `Store(I128)`.
+#[inline]
+fn inst_is_no_mem_write(view: &View<'_>, k: usize) -> bool {
+    let op = view.op(k);
+    op_is_pure_no_trap(op)
+        || (op == Op::Load && !Flags(at_u8(view.flags, k)).contains(Flags::VOLATILE))
+}
+
+/// True iff byte offset `off` fits ARM64 `ldp/stp q` signed 7-bit scaled-by-16 immediate (`-1024..=1008`).
+#[inline]
+fn fits_q_pair_off(off: i32) -> bool {
+    off % 16 == 0 && (-1024..=1008).contains(&off)
+}
+
+/// Extracts `(base, offset, folded_imm_inst)` for a `CopyAddr` eligible for `ldp/stp q` pairing.
+#[inline]
+fn copy_addr_pair_base(addr: CopyAddr) -> Option<(PairBase, i32, u32)> {
+    match addr {
+        CopyAddr::Direct { ptr, off } => Some((PairBase::Reg(ptr), off, u32::MAX)),
+        CopyAddr::BaseOff { base, off, imm_inst } => Some((PairBase::Reg(base), off, imm_inst)),
+        CopyAddr::SpOff { off } => Some((PairBase::Sp, off, u32::MAX)),
+        CopyAddr::ScaledIdx { .. } | CopyAddr::RegIdx { .. } => None,
+    }
+}
+
+/// Single-step non-recursive constant offset peeling (`PtrAdd(base, c)` or 64-bit `Add(base, c)`).
+#[inline]
+fn peel_ptr_const(view: &View<'_>, const_u64: &[Option<u64>], ptr: u32) -> Option<(u32, i64)> {
+    let pi = to_idx(ptr);
+    match view.op(pi) {
+        Op::PtrAdd => {
+            let pat = to_idx(at_u32(view.data, pi));
+            let base = at_u32(view.extra, pat);
+            let by = at_u32(view.extra, pat + 1);
+            let cv = at_opt(const_u64, to_idx(by))?;
+            let by_bits = ty_at(view.tys, to_idx(by)).bits(64);
+            Some((base, sign_extend_u64(cv, by_bits)))
+        }
+        Op::Add if ty_at(view.tys, pi).bits(64) == 64 => {
+            let pat = to_idx(at_u32(view.data, pi));
+            let lhs = at_u32(view.extra, pat);
+            let rhs = at_u32(view.extra, pat + 1);
+            if lhs == rhs {
+                return None;
+            }
+            if let Some(cv) = at_opt(const_u64, to_idx(rhs)) {
+                Some((lhs, cv.cast_signed()))
+            } else if let Some(cv) = at_opt(const_u64, to_idx(lhs)) {
+                Some((rhs, cv.cast_signed()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Matches two 128-bit copy addresses `addr0` (first copy) and `addr1` (second copy) as adjacent
+/// 16-byte slots using `addr1`'s base register (guaranteed live at the second store).
+/// Returns `(base, low_off, reversed, imm0, imm1)` where `reversed == false` means `addr0` is at
+/// `low_off` and `addr1` at `low_off + 16`, and `reversed == true` means `addr1` is at `low_off`.
+fn match_pair_addr(
+    view: &View<'_>,
+    const_u64: &[Option<u64>],
+    addr0: CopyAddr,
+    addr1: CopyAddr,
+) -> Option<(PairBase, i32, bool, u32, u32)> {
+    let (base0, off0, imm0) = copy_addr_pair_base(addr0)?;
+    let (base1, off1, imm1) = copy_addr_pair_base(addr1)?;
+    let diff: i64 = if base0 == base1 {
+        i64::from(off1) - i64::from(off0)
+    } else if let (PairBase::Reg(p0), PairBase::Reg(p1)) = (base0, base1) {
+        if let Some((b_inner, delta)) = peel_ptr_const(view, const_u64, p1)
+            && b_inner == p0
+        {
+            delta.checked_add(i64::from(off1))?.checked_sub(i64::from(off0))?
+        } else if let Some((b_inner, delta)) = peel_ptr_const(view, const_u64, p0)
+            && b_inner == p1
+        {
+            i64::from(off1).checked_sub(delta.checked_add(i64::from(off0))?)?
+        } else if let (Some((b0, d0)), Some((b1, d1))) = (
+            peel_ptr_const(view, const_u64, p0),
+            peel_ptr_const(view, const_u64, p1),
+        ) && b0 == b1
+        {
+            d1.checked_add(i64::from(off1))?
+                .checked_sub(d0.checked_add(i64::from(off0))?)?
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+    if diff == 16 {
+        let low_off = off1.checked_sub(16)?;
+        fits_q_pair_off(low_off).then_some((base1, low_off, false, imm0, imm1))
+    } else if diff == -16 {
+        fits_q_pair_off(off1).then_some((base1, off1, true, imm0, imm1))
+    } else {
+        None
+    }
+}
+
 /// Source or destination location for a parallel move (register, 8-byte spill slot, or 16-byte SIMD spill),
 /// tagged by register bank (`FP = false` for GPR, `FP = true` for FP/SIMD).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -602,6 +849,121 @@ fn i128_hi_is_zero(view: &View<'_>, v: u32) -> bool {
             let at = to_idx(at_u32(view.data, vi));
             at_u32(view.extra, at + 2) == 0 && at_u32(view.extra, at + 3) == 0
         }
+        _ => false,
+    }
+}
+
+/// Non-recursive leaf check: true iff `v`'s 64-bit GPR is guaranteed to have all bits at
+/// positions `>= target_bits` equal to `0` (`1 <= target_bits < 64`).
+///
+/// Only trusts defining operations whose emitted AArch64 instructions unconditionally clear
+/// bits `target_bits..64`; never trusts bare `Op::Param`, unbounded arithmetic, or `Op::Ashr`.
+#[inline]
+fn leaf_fits_unsigned_bits(view: &View<'_>, const_u64: &[Option<u64>], v: u32, target_bits: u32) -> bool {
+    let vi = to_idx(v);
+    if vi >= view.len() {
+        return false;
+    }
+    let src_ty = ty_at(view.tys, vi);
+    if !(src_ty.is_scalar() && src_ty.is_int()) {
+        return false;
+    }
+    let src_bits = src_ty.bits(64);
+    if src_bits == 0 || src_bits > 64 {
+        return false;
+    }
+    match view.op(vi) {
+        Op::Iconst | Op::IconstWide => at_opt(const_u64, vi).is_some_and(|c| (c >> target_bits) == 0),
+        Op::And => {
+            let at = to_idx(at_u32(view.data, vi));
+            let lhs = at_u32(view.extra, at);
+            let rhs = at_u32(view.extra, at + 1);
+            at_opt(const_u64, to_idx(lhs)).is_some_and(|c| (c >> target_bits) == 0)
+                || at_opt(const_u64, to_idx(rhs)).is_some_and(|c| (c >> target_bits) == 0)
+        }
+        Op::Lshr => {
+            if !src_bits.is_power_of_two() || src_bits < 2 {
+                return false;
+            }
+            let at = to_idx(at_u32(view.data, vi));
+            let rhs = at_u32(view.extra, at + 1);
+            at_opt(const_u64, to_idx(rhs)).is_some_and(|k| {
+                let sh = trunc_u32(k & u64::from(src_bits - 1));
+                src_bits - sh <= target_bits
+            })
+        }
+        Op::Clz | Op::Ctz | Op::Popcnt => target_bits >= 7,
+        Op::Zext => {
+            let from_ty = ty_at(view.tys, to_idx(at_u32(view.data, vi)));
+            from_ty.is_scalar() && from_ty.is_int() && {
+                let from_bits = from_ty.bits(64);
+                from_bits > 0 && from_bits <= target_bits
+            }
+        }
+        Op::Trunc | Op::Load | Op::Umax => src_bits <= target_bits,
+        Op::Umin => {
+            if src_bits <= target_bits {
+                return true;
+            }
+            let at = to_idx(at_u32(view.data, vi));
+            let lhs = at_u32(view.extra, at);
+            let rhs = at_u32(view.extra, at + 1);
+            at_opt(const_u64, to_idx(lhs)).is_some_and(|c| (c >> target_bits) == 0)
+                || at_opt(const_u64, to_idx(rhs)).is_some_and(|c| (c >> target_bits) == 0)
+        }
+        Op::Icmp | Op::Fcmp => true,
+        _ => false,
+    }
+}
+
+/// True iff the 64-bit GPR holding `v` is mathematically guaranteed to have all bits at
+/// positions `>= target_bits` equal to `0` (non-recursive, O(1) bounded inspection).
+#[inline]
+fn value_fits_unsigned_bits(view: &View<'_>, const_u64: &[Option<u64>], v: u32, target_bits: u32) -> bool {
+    if target_bits == 0 {
+        return false;
+    }
+    if target_bits >= 64 {
+        return true;
+    }
+    if leaf_fits_unsigned_bits(view, const_u64, v, target_bits) {
+        return true;
+    }
+    let vi = to_idx(v);
+    if vi >= view.len() {
+        return false;
+    }
+    let src_ty = ty_at(view.tys, vi);
+    if !(src_ty.is_scalar() && src_ty.is_int()) {
+        return false;
+    }
+    let src_bits = src_ty.bits(64);
+    if src_bits == 0 || src_bits > 64 {
+        return false;
+    }
+    match view.op(vi) {
+        Op::And | Op::Umin => {
+            let at = to_idx(at_u32(view.data, vi));
+            let lhs = at_u32(view.extra, at);
+            let rhs = at_u32(view.extra, at + 1);
+            leaf_fits_unsigned_bits(view, const_u64, lhs, target_bits)
+                || leaf_fits_unsigned_bits(view, const_u64, rhs, target_bits)
+        }
+        Op::Umax | Op::Or | Op::Xor => {
+            let at = to_idx(at_u32(view.data, vi));
+            let lhs = at_u32(view.extra, at);
+            let rhs = at_u32(view.extra, at + 1);
+            leaf_fits_unsigned_bits(view, const_u64, lhs, target_bits)
+                && leaf_fits_unsigned_bits(view, const_u64, rhs, target_bits)
+        }
+        Op::Select => {
+            let at = to_idx(at_u32(view.data, vi));
+            let t = at_u32(view.extra, at + 1);
+            let f = at_u32(view.extra, at + 2);
+            leaf_fits_unsigned_bits(view, const_u64, t, target_bits)
+                && leaf_fits_unsigned_bits(view, const_u64, f, target_bits)
+        }
+        Op::Freeze => leaf_fits_unsigned_bits(view, const_u64, at_u32(view.data, vi), target_bits),
         _ => false,
     }
 }
@@ -950,6 +1312,12 @@ const fn fmla_elem0_v(double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
 #[inline]
 const fn fmls_elem0_v(double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
     (if double { 0x4fc0_5000 } else { 0x4f80_5000 }) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `sub xd, xn, xm, lsr #shift` (C6.2.350 SUB shifted register, `sf = 1`, `shift = 01`, `shift` in `0..=63`).
+#[inline]
+const fn sub_lsr(rd: Reg, rn: Reg, rm: Reg, shift: u32) -> u32 {
+    0xcb40_0000 | (rm << 16) | ((shift & 63) << 10) | (rn << 5) | rd
 }
 
 /// `and`/`orr`/`eor rd, rn, rm, {lsl,lsr,asr} #shift` (C6.2.15/246/104, `N = 0`):
@@ -2486,6 +2854,75 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     set_at(&mut skip_emit, to_idx(lhs), true);
                     continue;
                 }
+                // Pattern 2b: `add(a, neg(lshr/shl(b, k)))` (commutative) -> `sub rd, a, b, lsr/lsl #k`.
+                let try_neg_shift = |neg_v: u32, other: u32| -> Option<(Op, u32, u32, u32, u32, usize, usize)> {
+                    let ni = to_idx(neg_v);
+                    if at_u32(&use_count, ni) != 1
+                        || at_u32(&inst_block, ni) != b
+                        || view.op(ni) != Op::Neg
+                        || at_bool(&skip_emit, ni)
+                        || at_fusion(&fusion, ni) != Fusion::None
+                    {
+                        return None;
+                    }
+                    let sh_v = at_u32(view.data, ni);
+                    let si = to_idx(sh_v);
+                    let sop = view.op(si);
+                    if at_u32(&use_count, si) == 1
+                        && at_u32(&inst_block, si) == b
+                        && matches!(sop, Op::Shl | Op::Lshr)
+                        && !at_bool(&skip_emit, si)
+                        && at_fusion(&fusion, si) == Fusion::None
+                    {
+                        let sat = to_idx(at_u32(view.data, si));
+                        let sb = at_u32(view.extra, sat);
+                        let sk = at_u32(view.extra, sat + 1);
+                        if let Some(k) = at_opt(&const_u64, to_idx(sk)) {
+                            return Some((sop, other, sb, trunc_u32(k & 63), sk, ni, si));
+                        }
+                    }
+                    None
+                };
+                if let Some((sop, a, sb, shift, sk, ni, si)) =
+                    try_neg_shift(rhs, lhs).or_else(|| try_neg_shift(lhs, rhs))
+                {
+                    set_at(
+                        &mut fusion,
+                        inst,
+                        if sop == Op::Shl {
+                            Fusion::SubLsl { a, b: sb, shift, imm_inst: sk }
+                        } else {
+                            Fusion::SubLsr { a, b: sb, shift, imm_inst: sk }
+                        },
+                    );
+                    set_at(&mut skip_emit, ni, true);
+                    set_at(&mut skip_emit, si, true);
+                    continue;
+                }
+                // Pattern 2c: `add(a, neg(x))` (commutative) -> single `sub rd, a, x`.
+                let try_neg = |neg_v: u32, other: u32| -> Option<(u32, u32, usize)> {
+                    let ni = to_idx(neg_v);
+                    if neg_v == other
+                        || at_u32(&use_count, ni) != 1
+                        || at_u32(&inst_block, ni) != b
+                        || view.op(ni) != Op::Neg
+                        || at_bool(&skip_emit, ni)
+                        || at_fusion(&fusion, ni) != Fusion::None
+                    {
+                        return None;
+                    }
+                    let x = at_u32(view.data, ni);
+                    if ty_at(view.tys, to_idx(x)) == ty {
+                        Some((other, x, ni))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((a, x, ni)) = try_neg(rhs, lhs).or_else(|| try_neg(lhs, rhs)) {
+                    set_at(&mut fusion, inst, Fusion::SubLsr { a, b: x, shift: 0, imm_inst: u32::MAX });
+                    set_at(&mut skip_emit, ni, true);
+                    continue;
+                }
                 // Pattern 3: `U128`/`U256` hardware carry-chain final limb:
                 // `add(add(a, b), zext(carry))` where `carry` comes directly from an earlier
                 // `uadd_overflow` (or `AdcsOverflowChain`) in the same block with no intervening flag clobber!
@@ -2762,6 +3199,35 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     continue;
                 }
             }
+            Op::Add if bits == 32 => {
+                // Fuse 32-bit `add(a, neg(x))` (commutative) -> single `sub wd, wa, wx`.
+                let at = to_idx(at_u32(view.data, inst));
+                let lhs = at_u32(view.extra, at);
+                let rhs = at_u32(view.extra, at + 1);
+                let try_neg = |neg_v: u32, other: u32| -> Option<(u32, u32, usize)> {
+                    let ni = to_idx(neg_v);
+                    if neg_v == other
+                        || at_u32(&use_count, ni) != 1
+                        || at_u32(&inst_block, ni) != b
+                        || view.op(ni) != Op::Neg
+                        || at_bool(&skip_emit, ni)
+                        || at_fusion(&fusion, ni) != Fusion::None
+                    {
+                        return None;
+                    }
+                    let x = at_u32(view.data, ni);
+                    if ty_at(view.tys, to_idx(x)) == ty {
+                        Some((other, x, ni))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((a, x, ni)) = try_neg(rhs, lhs).or_else(|| try_neg(lhs, rhs)) {
+                    set_at(&mut fusion, inst, Fusion::SubLsr { a, b: x, shift: 0, imm_inst: u32::MAX });
+                    set_at(&mut skip_emit, ni, true);
+                    continue;
+                }
+            }
             Op::Add if is_vec128_ty(ty) == Some((3, false)) => {
                 // Fuse `add(add(acc, and(bitcast(e: <4 x i32>), splat(0xffff_ffff))), lshr(bitcast(e), splat(32)))`
                 // -> single-instruction `uadalp.2d vacc, ve.4s`!
@@ -2881,14 +3347,100 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     set_at(&mut skip_emit, ri, true);
                     continue;
                 }
-                if at_u32(&use_count, ri) == 1 && at_u32(&inst_block, ri) == b && view.op(ri) == Op::Shl && !at_bool(&skip_emit, ri) {
+                if at_u32(&use_count, ri) == 1
+                    && at_u32(&inst_block, ri) == b
+                    && matches!(view.op(ri), Op::Shl | Op::Lshr)
+                    && !at_bool(&skip_emit, ri)
+                    && at_fusion(&fusion, ri) == Fusion::None
+                {
+                    let sop = view.op(ri);
                     let sat = to_idx(at_u32(view.data, ri));
                     let sb = at_u32(view.extra, sat);
                     let sk = at_u32(view.extra, sat + 1);
                     if let Some(k) = at_opt(&const_u64, to_idx(sk)) {
-                        set_at(&mut fusion, inst, Fusion::SubLsl { a: lhs, b: sb, shift: trunc_u32(k & 63), imm_inst: sk });
+                        let shift = trunc_u32(k & 63);
+                        set_at(
+                            &mut fusion,
+                            inst,
+                            if sop == Op::Shl {
+                                Fusion::SubLsl { a: lhs, b: sb, shift, imm_inst: sk }
+                            } else {
+                                Fusion::SubLsr { a: lhs, b: sb, shift, imm_inst: sk }
+                            },
+                        );
                         set_at(&mut skip_emit, ri, true);
                         continue;
+                    }
+                }
+            }
+            Op::PtrAdd => {
+                let at = to_idx(at_u32(view.data, inst));
+                let ptr = at_u32(view.extra, at);
+                let by = at_u32(view.extra, at + 1);
+                if ty_at(view.tys, to_idx(by)).bits(64) == 64 {
+                    let bi = to_idx(by);
+                    if at_u32(&use_count, bi) == 1
+                        && at_u32(&inst_block, bi) == b
+                        && !at_bool(&skip_emit, bi)
+                        && at_fusion(&fusion, bi) == Fusion::None
+                    {
+                        let bop = view.op(bi);
+                        if bop == Op::Neg {
+                            // `ptr_add(ptr, neg(lshr/shl(b, k)))` (Rust `ptr.sub(x >> k)`) -> `sub rd, ptr, b, lsr/lsl #k`.
+                            let sh_v = at_u32(view.data, bi);
+                            let si = to_idx(sh_v);
+                            let sop = view.op(si);
+                            if at_u32(&use_count, si) == 1
+                                && at_u32(&inst_block, si) == b
+                                && matches!(sop, Op::Shl | Op::Lshr)
+                                && !at_bool(&skip_emit, si)
+                                && at_fusion(&fusion, si) == Fusion::None
+                            {
+                                let sat = to_idx(at_u32(view.data, si));
+                                let sb = at_u32(view.extra, sat);
+                                let sk = at_u32(view.extra, sat + 1);
+                                if let Some(k) = at_opt(&const_u64, to_idx(sk)) {
+                                    let shift = trunc_u32(k & 63);
+                                    set_at(
+                                        &mut fusion,
+                                        inst,
+                                        if sop == Op::Shl {
+                                            Fusion::SubLsl { a: ptr, b: sb, shift, imm_inst: sk }
+                                        } else {
+                                            Fusion::SubLsr { a: ptr, b: sb, shift, imm_inst: sk }
+                                        },
+                                    );
+                                    set_at(&mut skip_emit, bi, true);
+                                    set_at(&mut skip_emit, si, true);
+                                    continue;
+                                }
+                            }
+                            // `ptr_add(ptr, neg(x))` (Rust `ptr.sub(x)`) -> single `sub xd, xptr, xx`.
+                            let neg_ty = ty_at(view.tys, si);
+                            if neg_ty.is_ptr() || (neg_ty.is_scalar() && neg_ty.is_int() && neg_ty.bits(64) == 64) {
+                                set_at(
+                                    &mut fusion,
+                                    inst,
+                                    Fusion::SubLsr { a: ptr, b: sh_v, shift: 0, imm_inst: u32::MAX },
+                                );
+                                set_at(&mut skip_emit, bi, true);
+                                continue;
+                            }
+                        } else if bop == Op::Lshr {
+                            // `ptr_add(ptr, lshr(b, k))` (Rust `ptr.add(x >> k)`) -> `add rd, ptr, b, lsr #k`.
+                            let sat = to_idx(at_u32(view.data, bi));
+                            let sb = at_u32(view.extra, sat);
+                            let sk = at_u32(view.extra, sat + 1);
+                            if let Some(k) = at_opt(&const_u64, to_idx(sk)) {
+                                set_at(
+                                    &mut fusion,
+                                    inst,
+                                    Fusion::AddLsr { a: ptr, b: sb, shift: trunc_u32(k & 63), imm_inst: sk },
+                                );
+                                set_at(&mut skip_emit, bi, true);
+                                continue;
+                            }
+                        }
                     }
                 }
             }
@@ -3230,6 +3782,223 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     (at_u32(view.extra, at + 1), i64::from(at_u32(view.extra, at + 2).cast_signed()), ty_at(view.tys, to_idx(val)), val)
                 };
                 if access_ty == Ty::I128 {
+                    if op == Op::Store && !Flags(at_u8(view.flags, inst)).contains(Flags::VOLATILE) {
+                        let li = to_idx(store_val);
+                        if li < inst
+                            && view.op(li) == Op::Load
+                            && ty_at(view.tys, li) == Ty::I128
+                            && !Flags(at_u8(view.flags, li)).contains(Flags::VOLATILE)
+                            && at_u32(&use_count, li) == 1
+                            && at_u32(&inst_block, li) == b
+                            && !at_bool(&skip_emit, li)
+                            && at_fusion(&fusion, li) == Fusion::None
+                        {
+                            let mut non_read_count = 0u32;
+                            let mut only_non_read = 0usize;
+                            for k in (li + 1)..inst {
+                                if !inst_is_no_mem_write(&view, k) {
+                                    non_read_count += 1;
+                                    only_non_read = k;
+                                    if non_read_count > 1 {
+                                        break;
+                                    }
+                                }
+                            }
+                            if non_read_count <= 1 {
+                                let lat = to_idx(at_u32(view.data, li));
+                                let src_ptr = at_u32(view.extra, lat);
+                                let src_off = at_u32(view.extra, lat + 1).cast_signed();
+                                let dst_ptr = ptr;
+                                let dst_off = at_u32(view.extra, at + 2).cast_signed();
+                                let fits_q_off = |o: i64| -> bool {
+                                    (o >= 0 && o % 16 == 0 && o / 16 < 4096) || (-256..=255).contains(&o)
+                                };
+                                let plan_q_addr = |aptr: u32, aoff: i32| -> (CopyAddr, Option<usize>, Option<usize>, Option<usize>) {
+                                    let off64 = i64::from(aoff);
+                                    let pi = to_idx(aptr);
+                                    let pop = view.op(pi);
+                                    if !slots_after_spills && pop == Op::SlotAddr {
+                                        let s_off = i64::from(at_u32(&slot_at, to_idx(at_u32(view.data, pi))));
+                                        if let Some(total) = s_off.checked_add(off64)
+                                            && fits_q_off(total)
+                                        {
+                                            return (CopyAddr::SpOff { off: i32_of(total) }, None, None, Some(pi));
+                                        }
+                                    }
+                                    if at_u32(&use_count, pi) == 1
+                                        && at_u32(&inst_block, pi) == b
+                                        && !at_bool(&skip_emit, pi)
+                                    {
+                                        if pop == Op::PtrAdd && at_fusion(&fusion, pi) == Fusion::None {
+                                            let pat = to_idx(at_u32(view.data, pi));
+                                            let base = at_u32(view.extra, pat);
+                                            let by = at_u32(view.extra, pat + 1);
+                                            if let Some(cv) = at_opt(&const_u64, to_idx(by)) {
+                                                let by_bits = ty_at(view.tys, to_idx(by)).bits(64);
+                                                let delta = sign_extend_u64(cv, by_bits);
+                                                if let Some(total) = delta.checked_add(off64)
+                                                    && fits_q_off(total)
+                                                {
+                                                    return (
+                                                        CopyAddr::BaseOff {
+                                                            base,
+                                                            off: i32_of(total),
+                                                            imm_inst: by,
+                                                        },
+                                                        Some(pi),
+                                                        None,
+                                                        None,
+                                                    );
+                                                }
+                                            } else if aoff == 0 && ty_at(view.tys, to_idx(by)).bits(64) == 64 {
+                                                let bi = to_idx(by);
+                                                if at_u32(&use_count, bi) == 1
+                                                    && at_u32(&inst_block, bi) == b
+                                                    && view.op(bi) == Op::Shl
+                                                    && !at_bool(&skip_emit, bi)
+                                                    && at_fusion(&fusion, bi) == Fusion::None
+                                                {
+                                                    let sat = to_idx(at_u32(view.data, bi));
+                                                    let idx_v = at_u32(view.extra, sat);
+                                                    let sh_v = at_u32(view.extra, sat + 1);
+                                                    if at_opt(&const_u64, to_idx(sh_v)) == Some(4) {
+                                                        return (
+                                                            CopyAddr::ScaledIdx {
+                                                                base,
+                                                                idx: idx_v,
+                                                                shift_imm: sh_v,
+                                                            },
+                                                            Some(pi),
+                                                            Some(bi),
+                                                            None,
+                                                        );
+                                                    }
+                                                }
+                                                return (CopyAddr::RegIdx { base, idx: by }, Some(pi), None, None);
+                                            }
+                                        } else if pop == Op::Add && ty_at(view.tys, pi).bits(64) == 64 {
+                                            if let Fusion::AddLsl { a: base, b: idx, shift: 4, imm_inst } =
+                                                at_fusion(&fusion, pi)
+                                            {
+                                                if aoff == 0 {
+                                                    return (
+                                                        CopyAddr::ScaledIdx {
+                                                            base,
+                                                            idx,
+                                                            shift_imm: imm_inst,
+                                                        },
+                                                        Some(pi),
+                                                        None,
+                                                        None,
+                                                    );
+                                                }
+                                            } else if at_fusion(&fusion, pi) == Fusion::None {
+                                                let pat = to_idx(at_u32(view.data, pi));
+                                                let a_lhs = at_u32(view.extra, pat);
+                                                let a_rhs = at_u32(view.extra, pat + 1);
+                                                let cand = if a_lhs != a_rhs {
+                                                    if let Some(cv) = at_opt(&const_u64, to_idx(a_rhs)) {
+                                                        Some((a_lhs, a_rhs, cv.cast_signed()))
+                                                    } else if let Some(cv) = at_opt(&const_u64, to_idx(a_lhs)) {
+                                                        Some((a_rhs, a_lhs, cv.cast_signed()))
+                                                    } else {
+                                                        None
+                                                    }
+                                                } else {
+                                                    None
+                                                };
+                                                if let Some((base, by, delta)) = cand {
+                                                    if let Some(total) = delta.checked_add(off64)
+                                                        && fits_q_off(total)
+                                                    {
+                                                        return (
+                                                            CopyAddr::BaseOff {
+                                                                base,
+                                                                off: i32_of(total),
+                                                                imm_inst: by,
+                                                            },
+                                                            Some(pi),
+                                                            None,
+                                                            None,
+                                                        );
+                                                    }
+                                                } else if aoff == 0 {
+                                                    return (
+                                                        CopyAddr::RegIdx { base: a_lhs, idx: a_rhs },
+                                                        Some(pi),
+                                                        None,
+                                                        None,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    (CopyAddr::Direct { ptr: aptr, off: aoff }, None, None, None)
+                                };
+                                let commit_q_addr = |plan: (CopyAddr, Option<usize>, Option<usize>, Option<usize>),
+                                                     skip_emit: &mut [bool],
+                                                     slot_addr_folded_uses: &mut [u32]|
+                                 -> CopyAddr {
+                                    if let Some(pi) = plan.1 {
+                                        set_at(skip_emit, pi, true);
+                                    }
+                                    if let Some(bi) = plan.2 {
+                                        set_at(skip_emit, bi, true);
+                                    }
+                                    if let Some(spi) = plan.3 {
+                                        inc_u32(slot_addr_folded_uses, spi);
+                                    }
+                                    plan.0
+                                };
+                                if non_read_count == 0 {
+                                    let src_plan = plan_q_addr(src_ptr, src_off);
+                                    let dst_plan = plan_q_addr(dst_ptr, dst_off);
+                                    let src = commit_q_addr(src_plan, &mut skip_emit, &mut slot_addr_folded_uses);
+                                    let dst = commit_q_addr(dst_plan, &mut skip_emit, &mut slot_addr_folded_uses);
+                                    set_at(&mut fusion, inst, Fusion::I128Copy { src, dst });
+                                    set_at(&mut skip_emit, li, true);
+                                } else {
+                                    // `only_non_read` is the sole memory-writing instruction in `(li + 1)..inst`:
+                                    // when it is a preceding `Fusion::I128Copy` with only pure no-trap ops after it,
+                                    // BOTH loads precede BOTH stores, so `ldp q29, q30; stp q29, q30` is 100% sound
+                                    // under arbitrary pointer aliasing!
+                                    let s0 = only_non_read;
+                                    if !at_bool(&skip_emit, s0)
+                                        && let Fusion::I128Copy { src: src0, dst: dst0 } = at_fusion(&fusion, s0)
+                                        && ((s0 + 1)..inst).all(|k| op_is_pure_no_trap(view.op(k)))
+                                    {
+                                        let src1_plan = plan_q_addr(src_ptr, src_off);
+                                        let dst1_plan = plan_q_addr(dst_ptr, dst_off);
+                                        if let (
+                                            Some((src_base, src_off_p, src_rev, s_imm0, s_imm1)),
+                                            Some((dst_base, dst_off_p, dst_rev, d_imm0, d_imm1)),
+                                        ) = (
+                                            match_pair_addr(&view, &const_u64, src0, src1_plan.0),
+                                            match_pair_addr(&view, &const_u64, dst0, dst1_plan.0),
+                                        ) {
+                                            let _ = commit_q_addr(src1_plan, &mut skip_emit, &mut slot_addr_folded_uses);
+                                            let _ = commit_q_addr(dst1_plan, &mut skip_emit, &mut slot_addr_folded_uses);
+                                            set_at(&mut fusion, s0, Fusion::None);
+                                            set_at(&mut skip_emit, s0, true);
+                                            set_at(&mut skip_emit, li, true);
+                                            set_at(
+                                                &mut fusion,
+                                                inst,
+                                                Fusion::I128CopyPair {
+                                                    src_base,
+                                                    src_off: src_off_p,
+                                                    dst_base,
+                                                    dst_off: dst_off_p,
+                                                    swap: src_rev != dst_rev,
+                                                    imm_insts: [s_imm0, s_imm1, d_imm0, d_imm1],
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
                 let is_vec128 = is_vec128_ty(access_ty).is_some();
@@ -3385,7 +4154,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     && at_u32(&ptr_off_foldable_uses, pi) == pi_uses
                     && at_fusion(&fusion, pi) == Fusion::None;
                 if (pi_uses == 1 && pi_same_blk && !at_bool(&skip_emit, pi)) || pi_all_fold_off {
-                    if pop == Op::PtrAdd {
+                    if pop == Op::PtrAdd && at_fusion(&fusion, pi) == Fusion::None {
                         let pat = to_idx(at_u32(view.data, pi));
                         let base = at_u32(view.extra, pat);
                         let by = at_u32(view.extra, pat + 1);
@@ -4305,6 +5074,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             | Fusion::EorRor { imm_inst, .. } => {
                 inc_u32(&mut imm_uses, to_idx(imm_inst));
             }
+            Fusion::SubLsr { imm_inst, .. } => {
+                if imm_inst != u32::MAX {
+                    inc_u32(&mut imm_uses, to_idx(imm_inst));
+                }
+            }
             Fusion::MemBaseOff { imm_inst, .. } => {
                 if imm_inst != u32::MAX {
                     inc_u32(&mut imm_uses, to_idx(imm_inst));
@@ -4376,6 +5150,26 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             }
             Fusion::I128HiTrunc { shift_imm, .. } => {
                 inc_u32(&mut imm_uses, to_idx(shift_imm));
+            }
+            Fusion::I128Copy { src, dst } => {
+                for addr in [src, dst] {
+                    match addr {
+                        CopyAddr::BaseOff { imm_inst, .. } if imm_inst != u32::MAX => {
+                            inc_u32(&mut imm_uses, to_idx(imm_inst));
+                        }
+                        CopyAddr::ScaledIdx { shift_imm, .. } if shift_imm != u32::MAX => {
+                            inc_u32(&mut imm_uses, to_idx(shift_imm));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Fusion::I128CopyPair { imm_insts, .. } => {
+                for imm_inst in imm_insts {
+                    if imm_inst != u32::MAX {
+                        inc_u32(&mut imm_uses, to_idx(imm_inst));
+                    }
+                }
             }
             Fusion::Madd { .. }
             | Fusion::Msub { .. }
@@ -4514,6 +5308,303 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             || (ty_at(view.tys, inst) == Ty::I128 && matches!(view.op(inst), Op::Iconst | Op::IconstWide));
         if is_foldable_const && at_u32(&use_count, inst) > 0 && at_u32(&imm_uses, inst) == at_u32(&use_count, inst) {
             set_at(&mut skip_emit, inst, true);
+        }
+    }
+
+    // 2c. Consumer-driven `Trunc(I64 -> I32)` upper-32 cleanliness analysis (O(N)):
+    //     `val_needs_clean_upper32[v]` stays `false` iff EVERY surviving emitted instruction and
+    //     fusion reading `v` is proven to use strictly 32-bit `w`-register / `uxtw` / `str w`
+    //     AArch64 forms that hardware-ignore bits `63..32` (and zero bits `63..32` of any GPR
+    //     result). Any other op, non-32-bit fusion, block edge arg, call/return, `Zext`/`Sext`/
+    //     `Trunc`/`Select`/`Freeze`/`Bitcast`/`Popcnt`/`Udiv`/`Sdiv`/`Urem`/`Srem`/`Switch`
+    //     conservatively marks `v` as `true`.
+    let mut val_needs_clean_upper32: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+    for _ in 0..len {
+        val_needs_clean_upper32.push(false);
+    }
+    let mark_upper32 = |needs: &mut [bool], v: u32| {
+        set_at(needs, to_idx(v), true);
+    };
+    let mark_all_uses = |needs: &mut [bool], inst: usize| {
+        regalloc::for_each_use(&view, inst, |v| {
+            set_at(needs, to_idx(v), true);
+        });
+    };
+    let mark_br_edge_args = |needs: &mut [bool], inst: usize| {
+        regalloc::for_each_edge(&view, inst, |_target, args_start, args_len| {
+            for k in 0..args_len {
+                set_at(needs, to_idx(at_u32(view.extra, args_start + k)), true);
+            }
+        });
+    };
+    for inst in 0..len {
+        if at_bool(&skip_emit, inst) {
+            continue;
+        }
+        let op = view.op(inst);
+        let ty = ty_at(view.tys, inst);
+        let is_i32 = ty == Ty::I32;
+        match at_fusion(&fusion, inst) {
+            Fusion::None => match op {
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::And
+                | Op::Or
+                | Op::Xor
+                | Op::Neg
+                | Op::Not
+                | Op::Shl
+                | Op::Lshr
+                | Op::Ashr
+                | Op::Rotl
+                | Op::Rotr
+                | Op::Clz
+                | Op::Ctz
+                | Op::Bswap
+                | Op::Bitrev
+                | Op::Umin
+                | Op::Umax
+                | Op::Smin
+                | Op::Smax
+                    if is_i32 => {}
+                Op::Icmp if is_vec_mask_ty(ty).is_none() => {
+                    let at = to_idx(at_u32(view.data, inst));
+                    let a = at_u32(view.extra, at + 1);
+                    let bv = at_u32(view.extra, at + 2);
+                    if ty_at(view.tys, to_idx(a)) != Ty::I32 {
+                        mark_upper32(&mut val_needs_clean_upper32, a);
+                        mark_upper32(&mut val_needs_clean_upper32, bv);
+                    }
+                }
+                Op::Store => {
+                    let at = to_idx(at_u32(view.data, inst));
+                    let val = at_u32(view.extra, at);
+                    let ptr = at_u32(view.extra, at + 1);
+                    mark_upper32(&mut val_needs_clean_upper32, ptr);
+                    if ty_at(view.tys, to_idx(val)) != Ty::I32 {
+                        mark_upper32(&mut val_needs_clean_upper32, val);
+                    }
+                }
+                _ => mark_all_uses(&mut val_needs_clean_upper32, inst),
+            },
+            Fusion::Bic { a, b }
+            | Fusion::Orn { a, b }
+            | Fusion::Eon { a, b }
+            | Fusion::EorRor { a, b, .. }
+            | Fusion::LogicalShifted { a, b, .. } => {
+                if !is_i32 {
+                    mark_upper32(&mut val_needs_clean_upper32, a);
+                    mark_upper32(&mut val_needs_clean_upper32, b);
+                }
+            }
+            Fusion::Ubfx { src, .. } => {
+                if !is_i32 {
+                    mark_upper32(&mut val_needs_clean_upper32, src);
+                }
+            }
+            Fusion::Bfxil { dst, src, .. } => {
+                if !is_i32 {
+                    mark_upper32(&mut val_needs_clean_upper32, dst);
+                    mark_upper32(&mut val_needs_clean_upper32, src);
+                }
+            }
+            Fusion::RorImm { x, .. } => {
+                if !is_i32 {
+                    mark_upper32(&mut val_needs_clean_upper32, x);
+                }
+            }
+            Fusion::SubsFlags => {
+                if !is_i32 {
+                    mark_all_uses(&mut val_needs_clean_upper32, inst);
+                }
+            }
+            Fusion::CmpBr { a, b, op_ty, .. } => {
+                if op_ty != Ty::I32 {
+                    mark_upper32(&mut val_needs_clean_upper32, a);
+                    mark_upper32(&mut val_needs_clean_upper32, b);
+                }
+                mark_br_edge_args(&mut val_needs_clean_upper32, inst);
+            }
+            Fusion::FcmpBr { a, b, .. } => {
+                mark_upper32(&mut val_needs_clean_upper32, a);
+                mark_upper32(&mut val_needs_clean_upper32, b);
+                mark_br_edge_args(&mut val_needs_clean_upper32, inst);
+            }
+            Fusion::TbzBr { val, .. } => {
+                mark_upper32(&mut val_needs_clean_upper32, val);
+                mark_br_edge_args(&mut val_needs_clean_upper32, inst);
+            }
+            Fusion::TstBr { a, rhs, .. } => {
+                mark_upper32(&mut val_needs_clean_upper32, a);
+                mark_upper32(&mut val_needs_clean_upper32, rhs);
+                mark_br_edge_args(&mut val_needs_clean_upper32, inst);
+            }
+            Fusion::ReuseFlagsBr { .. } | Fusion::BlazeResultCallBr => {
+                mark_br_edge_args(&mut val_needs_clean_upper32, inst);
+            }
+            Fusion::CmpSelect { a, b, op_ty, .. } => {
+                if op_ty != Ty::I32 {
+                    mark_upper32(&mut val_needs_clean_upper32, a);
+                    mark_upper32(&mut val_needs_clean_upper32, b);
+                }
+                let at = to_idx(at_u32(view.data, inst));
+                mark_upper32(&mut val_needs_clean_upper32, at_u32(view.extra, at + 1));
+                mark_upper32(&mut val_needs_clean_upper32, at_u32(view.extra, at + 2));
+            }
+            Fusion::CsnegSelect { a, b, op_ty, x, .. } | Fusion::CsinvSelect { a, b, op_ty, x, .. } => {
+                if op_ty != Ty::I32 {
+                    mark_upper32(&mut val_needs_clean_upper32, a);
+                    mark_upper32(&mut val_needs_clean_upper32, b);
+                }
+                mark_upper32(&mut val_needs_clean_upper32, x);
+            }
+            Fusion::CsincSelect { a, b, op_ty, rn, rm, .. } => {
+                if op_ty != Ty::I32 {
+                    mark_upper32(&mut val_needs_clean_upper32, a);
+                    mark_upper32(&mut val_needs_clean_upper32, b);
+                }
+                mark_upper32(&mut val_needs_clean_upper32, rn);
+                mark_upper32(&mut val_needs_clean_upper32, rm);
+            }
+            Fusion::FcmpSelect { a, b, .. } => {
+                mark_upper32(&mut val_needs_clean_upper32, a);
+                mark_upper32(&mut val_needs_clean_upper32, b);
+                let at = to_idx(at_u32(view.data, inst));
+                mark_upper32(&mut val_needs_clean_upper32, at_u32(view.extra, at + 1));
+                mark_upper32(&mut val_needs_clean_upper32, at_u32(view.extra, at + 2));
+            }
+            Fusion::ReuseFlagsSelect { .. } => {
+                let at = to_idx(at_u32(view.data, inst));
+                mark_upper32(&mut val_needs_clean_upper32, at_u32(view.extra, at + 1));
+                mark_upper32(&mut val_needs_clean_upper32, at_u32(view.extra, at + 2));
+            }
+            Fusion::ReuseFlagsCsinc { rn, rm, .. } => {
+                mark_upper32(&mut val_needs_clean_upper32, rn);
+                mark_upper32(&mut val_needs_clean_upper32, rm);
+            }
+            Fusion::MemSpOff { .. } => {
+                if op == Op::Store {
+                    let val = at_u32(view.extra, to_idx(at_u32(view.data, inst)));
+                    if ty_at(view.tys, to_idx(val)) != Ty::I32 {
+                        mark_upper32(&mut val_needs_clean_upper32, val);
+                    }
+                }
+            }
+            Fusion::MemBaseOff { base, .. } => {
+                mark_upper32(&mut val_needs_clean_upper32, base);
+                if op == Op::Store {
+                    let val = at_u32(view.extra, to_idx(at_u32(view.data, inst)));
+                    if ty_at(view.tys, to_idx(val)) != Ty::I32 {
+                        mark_upper32(&mut val_needs_clean_upper32, val);
+                    }
+                }
+            }
+            Fusion::MemScaledIdx { base, idx, .. } | Fusion::MemRegIdx { base, idx } => {
+                mark_upper32(&mut val_needs_clean_upper32, base);
+                mark_upper32(&mut val_needs_clean_upper32, idx);
+                if op == Op::Store {
+                    let val = at_u32(view.extra, to_idx(at_u32(view.data, inst)));
+                    if ty_at(view.tys, to_idx(val)) != Ty::I32 {
+                        mark_upper32(&mut val_needs_clean_upper32, val);
+                    }
+                }
+            }
+            Fusion::MemUxtwIdx { base, .. } => {
+                mark_upper32(&mut val_needs_clean_upper32, base);
+                if op == Op::Store {
+                    let val = at_u32(view.extra, to_idx(at_u32(view.data, inst)));
+                    if ty_at(view.tys, to_idx(val)) != Ty::I32 {
+                        mark_upper32(&mut val_needs_clean_upper32, val);
+                    }
+                }
+            }
+            Fusion::Madd { a, b, acc }
+            | Fusion::Msub { a, b, acc }
+            | Fusion::Fmadd { a, b, acc }
+            | Fusion::Fmsub { a, b, acc } => {
+                mark_upper32(&mut val_needs_clean_upper32, a);
+                mark_upper32(&mut val_needs_clean_upper32, b);
+                mark_upper32(&mut val_needs_clean_upper32, acc);
+            }
+            Fusion::AddLsl { a, b, .. }
+            | Fusion::AddLsr { a, b, .. }
+            | Fusion::SubLsl { a, b, .. }
+            | Fusion::AdcsChain { a, b, .. }
+            | Fusion::AdcsOverflowChain { a, b, .. } => {
+                mark_upper32(&mut val_needs_clean_upper32, a);
+                mark_upper32(&mut val_needs_clean_upper32, b);
+            }
+            Fusion::SubLsr { a, b, .. } => {
+                if !is_i32 {
+                    mark_upper32(&mut val_needs_clean_upper32, a);
+                    mark_upper32(&mut val_needs_clean_upper32, b);
+                }
+            }
+            Fusion::Eor3 { a, b, c } | Fusion::Bcax { a, b, c } => {
+                mark_upper32(&mut val_needs_clean_upper32, a);
+                mark_upper32(&mut val_needs_clean_upper32, b);
+                mark_upper32(&mut val_needs_clean_upper32, c);
+            }
+            Fusion::Rax1 { a, b } => {
+                mark_upper32(&mut val_needs_clean_upper32, a);
+                mark_upper32(&mut val_needs_clean_upper32, b);
+            }
+            Fusion::VecUadalp { acc, src_4s } => {
+                mark_upper32(&mut val_needs_clean_upper32, acc);
+                mark_upper32(&mut val_needs_clean_upper32, src_4s);
+            }
+            Fusion::I128WideMul { lhs_src, rhs_src } => {
+                mark_all_uses(&mut val_needs_clean_upper32, inst);
+                if let Some(s) = lhs_src {
+                    mark_upper32(&mut val_needs_clean_upper32, s);
+                }
+                if let Some(s) = rhs_src {
+                    mark_upper32(&mut val_needs_clean_upper32, s);
+                }
+            }
+            Fusion::I128LoMul { lhs, rhs, lhs_src, rhs_src } => {
+                mark_upper32(&mut val_needs_clean_upper32, lhs);
+                mark_upper32(&mut val_needs_clean_upper32, rhs);
+                if let Some(s) = lhs_src {
+                    mark_upper32(&mut val_needs_clean_upper32, s);
+                }
+                if let Some(s) = rhs_src {
+                    mark_upper32(&mut val_needs_clean_upper32, s);
+                }
+            }
+            Fusion::I128HiTrunc { src, .. } => {
+                mark_upper32(&mut val_needs_clean_upper32, src);
+            }
+            Fusion::VecFmulElem { vec, scalar } => {
+                mark_upper32(&mut val_needs_clean_upper32, vec);
+                mark_upper32(&mut val_needs_clean_upper32, scalar);
+            }
+            Fusion::VecFmaddElem { vec, scalar, acc } | Fusion::VecFmsubElem { vec, scalar, acc } => {
+                mark_upper32(&mut val_needs_clean_upper32, vec);
+                mark_upper32(&mut val_needs_clean_upper32, scalar);
+                mark_upper32(&mut val_needs_clean_upper32, acc);
+            }
+            Fusion::I128Copy { src, dst } => {
+                for addr in [src, dst] {
+                    match addr {
+                        CopyAddr::Direct { ptr, .. } => mark_upper32(&mut val_needs_clean_upper32, ptr),
+                        CopyAddr::SpOff { .. } => {}
+                        CopyAddr::BaseOff { base, .. } => mark_upper32(&mut val_needs_clean_upper32, base),
+                        CopyAddr::ScaledIdx { base, idx, .. } | CopyAddr::RegIdx { base, idx } => {
+                            mark_upper32(&mut val_needs_clean_upper32, base);
+                            mark_upper32(&mut val_needs_clean_upper32, idx);
+                        }
+                    }
+                }
+            }
+            Fusion::I128CopyPair { src_base, dst_base, .. } => {
+                for base in [src_base, dst_base] {
+                    if let PairBase::Reg(ptr) = base {
+                        mark_upper32(&mut val_needs_clean_upper32, ptr);
+                    }
+                }
+            }
         }
     }
 
@@ -4843,11 +5934,19 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         let name = view.intrinsic_name(IntrinsicId(at_u32(view.extra, at)));
         name == b"blaze.sme2.gemm_i8_i32" || name == b"blaze.sme2.gemm_u8_u32"
     });
-    let raw_clobbers = if has_sme2_int_call {
+    let has_i128_copy = fusion.iter().any(|f| matches!(f, Fusion::I128Copy { .. }));
+    let has_i128_copy_pair = fusion.iter().any(|f| matches!(f, Fusion::I128CopyPair { .. }));
+    let mut raw_clobbers = if has_sme2_int_call {
         reg_alloc.clobbers.clobbered.union(CallClobbers::C_ABI_ARM64.clobbered)
     } else {
         reg_alloc.clobbers.clobbered
     };
+    if has_i128_copy || has_i128_copy_pair {
+        raw_clobbers = raw_clobbers.with(TierReg(32 + 30));
+    }
+    if has_i128_copy_pair {
+        raw_clobbers = raw_clobbers.with(TierReg(32 + 29));
+    }
     let mut out_clobbers = CallClobbers { clobbered: raw_clobbers };
     let mut cold_gpr_pairs: Vec<(Reg, Reg), Alloc<'a>> = Vec::new_in(alloc);
     let mut cold_fp_pairs: Vec<(Reg, Reg), Alloc<'a>> = Vec::new_in(alloc);
@@ -4928,6 +6027,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     let cold_fp_bytes = u32_of(cold_fp_pairs.len()) * 32;
     let total_saved_bytes = cs_bytes + cold_gpr_bytes + cold_fp_bytes;
     let needs_frame = reg_alloc.has_calls
+        || reg_alloc.uses_lr
         || has_sme2_int_call
         || x_pairs != 0
         || d_pairs != 0
@@ -6920,6 +8020,60 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 continue;
             }
             if op == Op::Store && ty_at(view.tys, to_idx(at_u32(view.extra, to_idx(at_u32(view.data, inst))))) == Ty::I128 {
+                if let Fusion::I128CopyPair { src_base, src_off, dst_base, dst_off, swap, .. } =
+                    at_fusion(&fusion, inst)
+                {
+                    let rsrc = match src_base {
+                        PairBase::Sp => SP,
+                        PairBase::Reg(ptr) => load_gpr(&mut words, ptr, X16),
+                    };
+                    words.push(enc::ldp_q_off(V29, V30, rsrc, src_off / 16));
+                    let rdst = match dst_base {
+                        PairBase::Sp => SP,
+                        PairBase::Reg(ptr) => load_gpr(&mut words, ptr, X16),
+                    };
+                    let (rt1, rt2) = if swap { (V30, V29) } else { (V29, V30) };
+                    words.push(enc::stp_q_off(rt1, rt2, rdst, dst_off / 16));
+                    inst += 1;
+                    continue;
+                }
+                if let Fusion::I128Copy { src, dst } = at_fusion(&fusion, inst) {
+                    for (is_load, addr) in [(true, src), (false, dst)] {
+                        match addr {
+                            CopyAddr::Direct { ptr, off } => {
+                                let rb = load_gpr(&mut words, ptr, X16);
+                                emit_mem_q(&mut words, is_load, V30, rb, i64::from(off));
+                            }
+                            CopyAddr::SpOff { off } => {
+                                emit_mem_q(&mut words, is_load, V30, SP, i64::from(off));
+                            }
+                            CopyAddr::BaseOff { base, off, .. } => {
+                                let rb = load_gpr(&mut words, base, X16);
+                                emit_mem_q(&mut words, is_load, V30, rb, i64::from(off));
+                            }
+                            CopyAddr::ScaledIdx { base, idx, .. } => {
+                                let rb = load_gpr(&mut words, base, X16);
+                                let ri = load_gpr(&mut words, idx, X17);
+                                words.push(if is_load {
+                                    enc::ldr_q_reg(V30, rb, ri, true)
+                                } else {
+                                    enc::str_q_reg(V30, rb, ri, true)
+                                });
+                            }
+                            CopyAddr::RegIdx { base, idx } => {
+                                let rb = load_gpr(&mut words, base, X16);
+                                let ri = load_gpr(&mut words, idx, X17);
+                                words.push(if is_load {
+                                    enc::ldr_q_reg(V30, rb, ri, false)
+                                } else {
+                                    enc::str_q_reg(V30, rb, ri, false)
+                                });
+                            }
+                        }
+                    }
+                    inst += 1;
+                    continue;
+                }
                 let at = to_idx(at_u32(view.data, inst));
                 let val_v = at_u32(view.extra, at);
                 let ptr_v = at_u32(view.extra, at + 1);
@@ -7764,30 +8918,53 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     }
                 }
                 Op::PtrAdd => {
-                    let at = to_idx(at_u32(view.data, inst));
-                    let ptr = at_u32(view.extra, at);
-                    let by = at_u32(view.extra, at + 1);
                     let (rd, sp) = dst_gpr(inst);
-                    let rptr = load_gpr(&mut words, ptr, X16);
-                    if let Some(cv) = at_opt(&const_u64, to_idx(by)) {
-                        let by_bits = ty_at(view.tys, to_idx(by)).bits(64);
-                        let delta = sign_extend_u64(cv, by_bits);
-                        if (0..=4095).contains(&delta) {
-                            words.push(enc::add_imm(rd, rptr, u32_of(delta), false));
-                        } else if (-4095..0).contains(&delta) {
-                            words.push(enc::sub_imm(rd, rptr, u32_of(-delta), false));
-                        } else {
-                            emit_const_u64(&mut words, X17, delta.cast_unsigned());
-                            words.push(enc::add(rd, rptr, X17));
+                    match at_fusion(&fusion, inst) {
+                        Fusion::AddLsr { a, b: sb, shift, .. } => {
+                            let ra = load_gpr(&mut words, a, X16);
+                            let rb = load_gpr(&mut words, sb, X17);
+                            words.push(enc::add_lsr(rd, ra, rb, shift));
                         }
-                    } else {
-                        let by_bits = ty_at(view.tys, to_idx(by)).bits(64);
-                        let rby = load_gpr(&mut words, by, X17);
-                        if by_bits < 64 {
-                            words.push(enc::sext(X17, rby, by_bits));
-                            words.push(enc::add(rd, rptr, X17));
-                        } else {
-                            words.push(enc::add(rd, rptr, rby));
+                        Fusion::SubLsl { a, b: sb, shift, .. } => {
+                            let ra = load_gpr(&mut words, a, X16);
+                            let rb = load_gpr(&mut words, sb, X17);
+                            words.push(enc::sub_lsl(rd, ra, rb, shift));
+                        }
+                        Fusion::SubLsr { a, b: sb, shift, .. } => {
+                            let ra = load_gpr(&mut words, a, X16);
+                            let rb = load_gpr(&mut words, sb, X17);
+                            words.push(if shift == 0 {
+                                enc::sub(rd, ra, rb)
+                            } else {
+                                sub_lsr(rd, ra, rb, shift)
+                            });
+                        }
+                        _ => {
+                            let at = to_idx(at_u32(view.data, inst));
+                            let ptr = at_u32(view.extra, at);
+                            let by = at_u32(view.extra, at + 1);
+                            let rptr = load_gpr(&mut words, ptr, X16);
+                            if let Some(cv) = at_opt(&const_u64, to_idx(by)) {
+                                let by_bits = ty_at(view.tys, to_idx(by)).bits(64);
+                                let delta = sign_extend_u64(cv, by_bits);
+                                if (0..=4095).contains(&delta) {
+                                    words.push(enc::add_imm(rd, rptr, u32_of(delta), false));
+                                } else if (-4095..0).contains(&delta) {
+                                    words.push(enc::sub_imm(rd, rptr, u32_of(-delta), false));
+                                } else {
+                                    emit_const_u64(&mut words, X17, delta.cast_unsigned());
+                                    words.push(enc::add(rd, rptr, X17));
+                                }
+                            } else {
+                                let by_bits = ty_at(view.tys, to_idx(by)).bits(64);
+                                let rby = load_gpr(&mut words, by, X17);
+                                if by_bits < 64 {
+                                    words.push(enc::sext(X17, rby, by_bits));
+                                    words.push(enc::add(rd, rptr, X17));
+                                } else {
+                                    words.push(enc::add(rd, rptr, rby));
+                                }
+                            }
                         }
                     }
                     if let Some(s) = sp {
@@ -8943,6 +10120,20 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             let rb = load_gpr(&mut words, sb, X17);
                             words.push(enc::add_lsr(rd, ra, rb, shift));
                         }
+                        Fusion::SubLsl { a, b: sb, shift, .. } => {
+                            let ra = load_gpr(&mut words, a, X16);
+                            let rb = load_gpr(&mut words, sb, X17);
+                            words.push(enc::sub_lsl(rd, ra, rb, shift));
+                        }
+                        Fusion::SubLsr { a, b: sb, shift, .. } => {
+                            let ra = load_gpr(&mut words, a, X16);
+                            let rb = load_gpr(&mut words, sb, X17);
+                            words.push(if shift == 0 {
+                                enc::sf(bits != 32, enc::sub(rd, ra, rb))
+                            } else {
+                                sub_lsr(rd, ra, rb, shift)
+                            });
+                        }
                         Fusion::AdcsChain { a, b: mb, .. } => {
                             // `U128`/`U256` hardware carry-chain final limb: 1-instruction `adcs rd, ra, rb`!
                             let ra = load_gpr(&mut words, a, X16);
@@ -9010,6 +10201,15 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             let ra = load_gpr(&mut words, a, X16);
                             let rb = load_gpr(&mut words, sb, X17);
                             words.push(enc::sub_lsl(rd, ra, rb, shift));
+                        }
+                        Fusion::SubLsr { a, b: sb, shift, .. } => {
+                            let ra = load_gpr(&mut words, a, X16);
+                            let rb = load_gpr(&mut words, sb, X17);
+                            words.push(if shift == 0 {
+                                enc::sub(rd, ra, rb)
+                            } else {
+                                sub_lsr(rd, ra, rb, shift)
+                            });
                         }
                         Fusion::SubsFlags => {
                             let at = to_idx(at_u32(view.data, inst));
@@ -9461,7 +10661,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     let mut rl = load_gpr(&mut words, at_u32(view.extra, at), X16);
                     let mut rr = load_gpr(&mut words, at_u32(view.extra, at + 1), X17);
                     let signed = matches!(op, Op::Smin | Op::Smax);
-                    if signed && bits < 64 {
+                    let w32 = bits == 32;
+                    if signed && !w32 && bits < 64 {
                         words.push(enc::sext(X16, rl, bits));
                         words.push(enc::sext(X17, rr, bits));
                         rl = X16;
@@ -9469,7 +10670,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     }
                     if has_cssc {
                         let is_min = matches!(op, Op::Umin | Op::Smin);
-                        words.push(enc::cssc_minmax(!signed, is_min, rd, rl, rr));
+                        words.push(enc::sf(!w32, enc::cssc_minmax(!signed, is_min, rd, rl, rr)));
                     } else {
                         let cond = match op {
                             Op::Umin => Cond::Lo,
@@ -9477,10 +10678,12 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             Op::Smin => Cond::Lt,
                             _ => Cond::Gt,
                         };
-                        words.push(enc::cmp(rl, rr));
-                        words.push(enc::csel(rd, rl, rr, cond));
+                        words.push(enc::sf(!w32, enc::cmp(rl, rr)));
+                        words.push(enc::sf(!w32, enc::csel(rd, rl, rr, cond)));
                     }
-                    emit_narrow(&mut words, rd, bits);
+                    if signed && !w32 {
+                        emit_narrow(&mut words, rd, bits);
+                    }
                     if let Some(s) = sp {
                         emit_st_spill_gpr(&mut words, rd, spill_base, s);
                     }
@@ -10591,7 +11794,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                     words.push(enc::mov(rd, src));
                                 }
                             }
-                        } else if bits == 64 {
+                        } else if bits == 64
+                            || value_fits_unsigned_bits(&view, &const_u64, src_v, bits)
+                            || (bits == 32 && !at_bool(&val_needs_clean_upper32, inst))
+                        {
                             emit_gpr_copy(&mut words, inst, src_v);
                         } else {
                             let src = load_gpr(&mut words, src_v, X16);
@@ -11038,15 +12244,28 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 let is_zero_cmp = at_opt(&const_u64, to_idx(bv)) == Some(0)
                                     && matches!(cond, IntCond::Eq | IntCond::Ne);
                                 if is_zero_cmp {
+                                    let wide = op_ty.bits(64) != 32;
                                     let ra = load_gpr(&mut words, a, X16);
                                     if next_block == Some(to_idx(else_block)) {
-                                        let kind = if cond == IntCond::Eq { PatchKind::Cbz(ra) } else { PatchKind::Cbnz(ra) };
+                                        let kind = if cond == IntCond::Eq {
+                                            PatchKind::Cbz { reg: ra, wide }
+                                        } else {
+                                            PatchKind::Cbnz { reg: ra, wide }
+                                        };
                                         emit_branch_patch(&mut words, &mut patches, kind, then_block, far_branches);
                                     } else if next_block == Some(to_idx(then_block)) {
-                                        let kind = if cond == IntCond::Eq { PatchKind::Cbnz(ra) } else { PatchKind::Cbz(ra) };
+                                        let kind = if cond == IntCond::Eq {
+                                            PatchKind::Cbnz { reg: ra, wide }
+                                        } else {
+                                            PatchKind::Cbz { reg: ra, wide }
+                                        };
                                         emit_branch_patch(&mut words, &mut patches, kind, else_block, far_branches);
                                     } else {
-                                        let kind = if cond == IntCond::Eq { PatchKind::Cbz(ra) } else { PatchKind::Cbnz(ra) };
+                                        let kind = if cond == IntCond::Eq {
+                                            PatchKind::Cbz { reg: ra, wide }
+                                        } else {
+                                            PatchKind::Cbnz { reg: ra, wide }
+                                        };
                                         emit_branch_patch(&mut words, &mut patches, kind, then_block, far_branches);
                                         emit_branch_patch(&mut words, &mut patches, PatchKind::B, else_block, false);
                                     }
@@ -11071,11 +12290,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             _ => {
                                 let rc = load_gpr(&mut words, cond_v, X16);
                                 if next_block == Some(to_idx(else_block)) {
-                                    emit_branch_patch(&mut words, &mut patches, PatchKind::Cbnz(rc), then_block, far_branches);
+                                    emit_branch_patch(&mut words, &mut patches, PatchKind::Cbnz { reg: rc, wide: true }, then_block, far_branches);
                                 } else if next_block == Some(to_idx(then_block)) {
-                                    emit_branch_patch(&mut words, &mut patches, PatchKind::Cbz(rc), else_block, far_branches);
+                                    emit_branch_patch(&mut words, &mut patches, PatchKind::Cbz { reg: rc, wide: true }, else_block, far_branches);
                                 } else {
-                                    emit_branch_patch(&mut words, &mut patches, PatchKind::Cbnz(rc), then_block, far_branches);
+                                    emit_branch_patch(&mut words, &mut patches, PatchKind::Cbnz { reg: rc, wide: true }, then_block, far_branches);
                                     emit_branch_patch(&mut words, &mut patches, PatchKind::B, else_block, false);
                                 }
                             }
@@ -11085,15 +12304,16 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             match at_fusion(&fusion, inst) {
                                 Fusion::CmpBr { cond, a, b: bv, op_ty } => {
                                     if at_opt(&const_u64, to_idx(bv)) == Some(0) && matches!(cond, IntCond::Eq | IntCond::Ne) {
+                                        let wide = op_ty.bits(64) != 32;
                                         let ra = load_gpr(words, a, X16);
                                         let w = words.len();
                                         let jump_on_zero = (cond == IntCond::Eq) == branch_if_true;
                                         let k = if jump_on_zero {
-                                            words.push(enc::cbz(ra, 0));
-                                            PatchKind::Cbz(ra)
+                                            words.push(enc::sf(wide, enc::cbz(ra, 0)));
+                                            PatchKind::Cbz { reg: ra, wide }
                                         } else {
-                                            words.push(enc::cbnz(ra, 0));
-                                            PatchKind::Cbnz(ra)
+                                            words.push(enc::sf(wide, enc::cbnz(ra, 0)));
+                                            PatchKind::Cbnz { reg: ra, wide }
                                         };
                                         (w, k)
                                     } else {
@@ -11130,10 +12350,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                     let w = words.len();
                                     let k = if branch_if_true {
                                         words.push(enc::cbnz(rc, 0));
-                                        PatchKind::Cbnz(rc)
+                                        PatchKind::Cbnz { reg: rc, wide: true }
                                     } else {
                                         words.push(enc::cbz(rc, 0));
-                                        PatchKind::Cbz(rc)
+                                        PatchKind::Cbz { reg: rc, wide: true }
                                     };
                                     (w, k)
                                 }
@@ -11209,8 +12429,8 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             let delta = i32_of(else_start - skip_then.0);
                             let skip_word = match skip_then.1 {
                                 PatchKind::BCond(inv) => enc::b_cond(inv, delta),
-                                PatchKind::Cbz(rc) => enc::cbz(rc, delta),
-                                PatchKind::Cbnz(rc) => enc::cbnz(rc, delta),
+                                PatchKind::Cbz { reg: rc, wide } => enc::sf(wide, enc::cbz(rc, delta)),
+                                PatchKind::Cbnz { reg: rc, wide } => enc::sf(wide, enc::cbnz(rc, delta)),
                                 _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected skip_then patch kind" }),
                             };
                             set_at(&mut words, skip_then.0, skip_word);
@@ -11732,17 +12952,17 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 }
                 Ok(enc::b_cond(c, delta))
             }
-            PatchKind::Cbz(r) => {
+            PatchKind::Cbz { reg: r, wide } => {
                 if !fits_signed(delta, 19) {
                     return Err(too_far());
                 }
-                Ok(enc::cbz(r, delta))
+                Ok(enc::sf(wide, enc::cbz(r, delta)))
             }
-            PatchKind::Cbnz(r) => {
+            PatchKind::Cbnz { reg: r, wide } => {
                 if !fits_signed(delta, 19) {
                     return Err(too_far());
                 }
-                Ok(enc::cbnz(r, delta))
+                Ok(enc::sf(wide, enc::cbnz(r, delta)))
             }
             PatchKind::Tbz(r, bit) => {
                 if !fits_signed(delta, 14) {
@@ -11926,15 +13146,15 @@ fn emit_branch_patch<'a>(
                 patches.push(BranchPatch { word_idx: wb, kind: PatchKind::B, target_block });
                 return;
             }
-            PatchKind::Cbz(r) => {
-                words.push(enc::cbnz(r, 2));
+            PatchKind::Cbz { reg: r, wide } => {
+                words.push(enc::sf(wide, enc::cbnz(r, 2)));
                 let wb = words.len();
                 words.push(enc::b(0));
                 patches.push(BranchPatch { word_idx: wb, kind: PatchKind::B, target_block });
                 return;
             }
-            PatchKind::Cbnz(r) => {
-                words.push(enc::cbz(r, 2));
+            PatchKind::Cbnz { reg: r, wide } => {
+                words.push(enc::sf(wide, enc::cbz(r, 2)));
                 let wb = words.len();
                 words.push(enc::b(0));
                 patches.push(BranchPatch { word_idx: wb, kind: PatchKind::B, target_block });
@@ -11947,8 +13167,8 @@ fn emit_branch_patch<'a>(
     words.push(match kind {
         PatchKind::B => enc::b(0),
         PatchKind::BCond(c) => enc::b_cond(c, 0),
-        PatchKind::Cbz(r) => enc::cbz(r, 0),
-        PatchKind::Cbnz(r) => enc::cbnz(r, 0),
+        PatchKind::Cbz { reg: r, wide } => enc::sf(wide, enc::cbz(r, 0)),
+        PatchKind::Cbnz { reg: r, wide } => enc::sf(wide, enc::cbnz(r, 0)),
         PatchKind::Tbz(r, bit) => enc::tbz(r, bit, 0),
         PatchKind::Tbnz(r, bit) => enc::tbnz(r, bit, 0),
         PatchKind::JumpTableEntry { .. } => 0,
@@ -13672,6 +14892,1382 @@ mod tests {
             }
             want = want.wrapping_add(1);
             assert_eq!(f(x_in, y_in), want, "high-pressure spill-copy runtime result mismatch");
+        }
+    }
+
+    #[test]
+    fn fused_i128_copy_emits_neon_q_load_store() {
+        let alloc = test_alloc();
+
+        let is_ldr_q30 = |w: u32| (w & 0xffc0_001f) == crate::enc::ldr_q(super::V30, 0, 0);
+        let is_str_q30 = |w: u32| (w & 0xffc0_001f) == crate::enc::str_q(super::V30, 0, 0);
+        let is_gpr_mem64 = |w: u32| {
+            (w & 0xffc0_0000) == 0xf940_0000
+                || (w & 0xffc0_0000) == 0xf900_0000
+                || (w & 0xffe0_0c00) == 0xf840_0000
+                || (w & 0xffe0_0c00) == 0xf800_0000
+        };
+
+        // 1. `Load(I128) -> PtrAdd(dst, 16) -> Store(I128)`:
+        //    fuses into `ldr q30, [x_src]; str q30, [x_dst, #16]` with ZERO GPR pair load/store
+        //    and ZERO standalone `add` for `PtrAdd(dst, 16)`!
+        let copy_folded_ptr_add = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let v = b.load(Ty::I128, Flags::NONE, src, 0, MemAttrs::aligned(0));
+            let c16 = b.iconst(Ty::I64, 16);
+            let dst_off = b.ptr_add(Flags::NONE, dst, c16);
+            b.store(Flags::NONE, v, dst_off, 0, MemAttrs::aligned(0));
+            b.ret(&[]);
+            let func = b.finish_checked().expect("fused i128 copy LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("fused i128 copy emits")
+        };
+        let w1 = decode_words(&copy_folded_ptr_add.code, alloc);
+        assert_eq!(w1.iter().filter(|&&w| is_ldr_q30(w)).count(), 1, "expected 1 ldr q30, got {w1:#x?}");
+        assert_eq!(w1.iter().filter(|&&w| is_str_q30(w)).count(), 1, "expected 1 str q30, got {w1:#x?}");
+        assert!(
+            w1.iter().any(|&w| (w & 0xffff_fc1f) == crate::enc::str_q(super::V30, 0, 1)),
+            "expected folded `str q30, [x_dst, #16]`, got {w1:#x?}"
+        );
+        assert_eq!(
+            w1.iter().filter(|&&w| is_gpr_mem64(w)).count(),
+            0,
+            "fused i128 copy must emit ZERO 64-bit GPR ldr/str pair copies, got {w1:#x?}"
+        );
+        assert!(
+            w1.scan_for(&0xa9bf_7bfd).is_none(),
+            "fused i128 copy must remain a frameless leaf"
+        );
+
+        // 2. Intervening live `PtrAdd(src, 16)` returned to caller: `src` MUST remain live until
+        //    `Store(I128)` so `ldr q30, [src]` reads the original address, NOT `src + 16`!
+        let copy_live_src_advance = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[Param::of(Ty::PTR)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let v = b.load(Ty::I128, Flags::NONE, src, 0, MemAttrs::aligned(0));
+            let c16 = b.iconst(Ty::I64, 16);
+            let src_next = b.ptr_add(Flags::NONE, src, c16);
+            b.store(Flags::NONE, v, dst, 0, MemAttrs::aligned(0));
+            b.ret(&[src_next]);
+            let func = b.finish_checked().expect("live-src-advance i128 copy LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("live-src-advance i128 copy emits")
+        };
+        let w2 = decode_words(&copy_live_src_advance.code, alloc);
+        assert_eq!(w2.iter().filter(|&&w| is_ldr_q30(w)).count(), 1, "expected 1 ldr q30, got {w2:#x?}");
+        assert_eq!(w2.iter().filter(|&&w| is_str_q30(w)).count(), 1, "expected 1 str q30, got {w2:#x?}");
+        assert_eq!(
+            w2.iter().filter(|&&w| is_gpr_mem64(w)).count(),
+            0,
+            "live-src-advance fused i128 copy must emit ZERO 64-bit GPR ldr/str copies, got {w2:#x?}"
+        );
+
+        // 3. Aliasing negative control: intervening `Op::Store` between `Load(I128)` and `Store(I128)`
+        //    MUST prevent fusion so the load observes memory BEFORE the intervening write!
+        let aliasing_blocked = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I8)],
+                &[],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let clobber = b.param(Ty::PTR);
+            let byte = b.param(Ty::I8);
+            let v = b.load(Ty::I128, Flags::NONE, src, 0, MemAttrs::aligned(0));
+            b.store(Flags::NONE, byte, clobber, 0, MemAttrs::aligned(0));
+            b.store(Flags::NONE, v, dst, 0, MemAttrs::aligned(0));
+            b.ret(&[]);
+            let func = b.finish_checked().expect("aliasing i128 LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("aliasing i128 emits")
+        };
+        let w3 = decode_words(&aliasing_blocked.code, alloc);
+        assert_eq!(w3.iter().filter(|&&w| is_ldr_q30(w)).count(), 0, "intervening store must block ldr q30 fusion");
+        assert_eq!(w3.iter().filter(|&&w| is_str_q30(w)).count(), 0, "intervening store must block str q30 fusion");
+
+        // 4. Volatile negative control: volatile `Load(I128)` MUST NOT fuse.
+        let volatile_blocked = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let v = b.load(Ty::I128, Flags::VOLATILE, src, 0, MemAttrs::aligned(0));
+            b.store(Flags::NONE, v, dst, 0, MemAttrs::aligned(0));
+            b.ret(&[]);
+            let func = b.finish_checked().expect("volatile i128 LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("volatile i128 emits")
+        };
+        let w4 = decode_words(&volatile_blocked.code, alloc);
+        assert_eq!(w4.iter().filter(|&&w| is_ldr_q30(w)).count(), 0, "volatile load must block ldr q30 fusion");
+        assert_eq!(w4.iter().filter(|&&w| is_str_q30(w)).count(), 0, "volatile load must block str q30 fusion");
+
+        // 5. High-pressure spilled `src`/`dst` pointers still fuse to `ldr q30` + `str q30` cleanly!
+        let spilled_ptrs_copy = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let seed = b.param(Ty::I64);
+            let c1 = b.iconst(Ty::I64, 1);
+            let mut live_vals = Vec::with_capacity_in(28, alloc);
+            let mut cur = seed;
+            for _ in 0..28usize {
+                cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+                live_vals.push(cur);
+            }
+            let v = b.load(Ty::I128, Flags::NONE, src, 0, MemAttrs::aligned(0));
+            let c16 = b.iconst(Ty::I64, 16);
+            let dst_off = b.ptr_add(Flags::NONE, dst, c16);
+            b.store(Flags::NONE, v, dst_off, 0, MemAttrs::aligned(0));
+            let mut acc = seed;
+            for &lv in &live_vals {
+                acc = b.binary(Op::Xor, Flags::NONE, acc, lv);
+            }
+            b.ret(&[acc]);
+            let func = b.finish_checked().expect("spilled-ptrs i128 copy LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("spilled-ptrs i128 copy emits")
+        };
+        let w5 = decode_words(&spilled_ptrs_copy.code, alloc);
+        assert_eq!(w5.iter().filter(|&&w| is_ldr_q30(w)).count(), 1, "spilled-ptrs copy must emit 1 ldr q30");
+        assert_eq!(w5.iter().filter(|&&w| is_str_q30(w)).count(), 1, "spilled-ptrs copy must emit 1 str q30");
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex1 = exec_leaf(copy_folded_ptr_add);
+            let f1: extern "C" fn(*mut u8, *const u8) = unsafe { ex1.as_fn() };
+            let ex2 = exec_leaf(copy_live_src_advance);
+            let f2: extern "C" fn(*mut u8, *const u8) -> *const u8 = unsafe { ex2.as_fn() };
+            let ex3 = exec_leaf(aliasing_blocked);
+            let f3: extern "C" fn(*mut u8, *const u8, *mut u8, u8) = unsafe { ex3.as_fn() };
+            let ex5 = exec_leaf(spilled_ptrs_copy);
+            let f5: extern "C" fn(*mut u8, *const u8, u64) -> u64 = unsafe { ex5.as_fn() };
+
+            let init: [u8; 128] = core::array::from_fn(|i| u8::try_from((i.wrapping_mul(41).wrapping_add(7)) & 0xff).unwrap_or(0));
+
+            // Test disjoint, aligned, unaligned (offsets 1, 3, 7, 15), identical, forward-overlap, and backward-overlap!
+            for src_off in [32usize, 33, 35, 39, 47] {
+                for delta in [-15isize, -8, -3, -1, 0, 1, 3, 7, 8, 15, 24, 37] {
+                    let eff_dst = usize::try_from(isize::try_from(src_off).unwrap_or(0) + delta).unwrap_or(0);
+                    // f1 writes to `dst + 16`, so pass `eff_dst - 16`.
+                    let mut got1 = init;
+                    let mut want = init;
+                    want.copy_within(src_off..(src_off + 16), eff_dst);
+                    let base1 = got1.as_mut_ptr();
+                    unsafe {
+                        f1(base1.add(eff_dst - 16), base1.add(src_off));
+                    }
+                    assert_eq!(got1, want, "f1 mismatch for src_off={src_off}, delta={delta}");
+
+                    // f2 writes directly to `eff_dst` and returns `src + 16`.
+                    let mut got2 = init;
+                    let base2 = got2.as_mut_ptr();
+                    let ret_ptr = unsafe { f2(base2.add(eff_dst), base2.add(src_off)) };
+                    assert_eq!(got2, want, "f2 mismatch for src_off={src_off}, delta={delta}");
+                    assert_eq!(
+                        ret_ptr,
+                        unsafe { base2.add(src_off + 16) },
+                        "f2 must return src + 16 without clobbering src before ldr q30"
+                    );
+                }
+            }
+
+            // Aliasing negative control: clobbering `src[0]` between Load and Store MUST NOT affect copied bytes!
+            let mut got3 = init;
+            let base3 = got3.as_mut_ptr();
+            unsafe {
+                f3(base3.add(64), base3.add(33), base3.add(33), 0xaa);
+            }
+            assert_eq!(got3[33], 0xaa);
+            assert_eq!(&got3[64..80], &init[33..49], "aliasing store between load and store must preserve original loaded bytes");
+
+            // Spilled pointers copy execution check!
+            let mut got5 = init;
+            let mut want5 = init;
+            want5.copy_within(35..51, 71);
+            let seed = 0x1122_3344_5566_7788u64;
+            let mut want_acc = seed;
+            let mut c = seed;
+            for _ in 0..28usize {
+                c = c.wrapping_add(1);
+                want_acc ^= c;
+            }
+            let base5 = got5.as_mut_ptr();
+            let got_acc = unsafe { f5(base5.add(71 - 16), base5.add(35), seed) };
+            assert_eq!(got_acc, want_acc);
+            assert_eq!(got5, want5, "spilled-ptrs fused i128 copy mismatch");
+        }
+    }
+
+    #[test]
+    fn fused_i128_copy_pair_emits_ldp_stp_q29_q30() {
+        let alloc = test_alloc();
+
+        let is_ldp_q29_q30 = |w: u32| (w & 0xffc0_7c1f) == crate::enc::ldp_q_off(super::V29, super::V30, 0, 0);
+        let is_stp_q29_q30 = |w: u32| (w & 0xffc0_7c1f) == crate::enc::stp_q_off(super::V29, super::V30, 0, 0);
+        let is_ldr_q30 = |w: u32| (w & 0xffc0_001f) == crate::enc::ldr_q(super::V30, 0, 0);
+        let is_str_q30 = |w: u32| (w & 0xffc0_001f) == crate::enc::str_q(super::V30, 0, 0);
+        let is_gpr_mem64 = |w: u32| {
+            (w & 0xffc0_0000) == 0xf940_0000
+                || (w & 0xffc0_0000) == 0xf900_0000
+                || (w & 0xffe0_0c00) == 0xf840_0000
+                || (w & 0xffe0_0c00) == 0xf800_0000
+        };
+
+        // 1. Direct-offset 32B copy (`a = load(s, 0); b = load(s, 16); store(d, 0, a); store(d, 16, b)`):
+        //    fuses into 2-instruction `ldp q29, q30, [x_s, #0]; stp q29, q30, [x_d, #0]` with ZERO scalar ldr/str!
+        let copy32_direct = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let a = b.load(Ty::I128, Flags::NONE, src, 0, MemAttrs::aligned(0));
+            let b_val = b.load(Ty::I128, Flags::NONE, src, 16, MemAttrs::aligned(0));
+            b.store(Flags::NONE, a, dst, 0, MemAttrs::aligned(0));
+            b.store(Flags::NONE, b_val, dst, 16, MemAttrs::aligned(0));
+            b.ret(&[]);
+            let func = b.finish_checked().expect("direct 32B i128 pair LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("direct 32B i128 pair emits")
+        };
+        let w1 = decode_words(&copy32_direct.code, alloc);
+        assert_eq!(w1.iter().filter(|&&w| is_ldp_q29_q30(w)).count(), 1, "expected 1 ldp q29, q30, got {w1:#x?}");
+        assert_eq!(w1.iter().filter(|&&w| is_stp_q29_q30(w)).count(), 1, "expected 1 stp q29, q30, got {w1:#x?}");
+        assert_eq!(w1.iter().filter(|&&w| is_gpr_mem64(w)).count(), 0, "32B pair copy must emit 0 scalar ldr/str x, got {w1:#x?}");
+        assert_eq!(w1.iter().filter(|&&w| is_ldr_q30(w) || is_str_q30(w)).count(), 0, "32B pair copy must not emit scalar ldr/str q30, got {w1:#x?}");
+
+        // 2. PtrAdd-offset 32B copy (`PtrAdd(src, 16)` + `PtrAdd(dst, 16)`):
+        //    fuses into `ldp q29, q30; stp q29, q30` and skips both `PtrAdd`s and the constant 16!
+        let copy32_ptr_add = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let c16 = b.iconst(Ty::I64, 16);
+            let a = b.load(Ty::I128, Flags::NONE, src, 0, MemAttrs::aligned(0));
+            let s16 = b.ptr_add(Flags::NONE, src, c16);
+            let b_val = b.load(Ty::I128, Flags::NONE, s16, 0, MemAttrs::aligned(0));
+            b.store(Flags::NONE, a, dst, 0, MemAttrs::aligned(0));
+            let d16 = b.ptr_add(Flags::NONE, dst, c16);
+            b.store(Flags::NONE, b_val, d16, 0, MemAttrs::aligned(0));
+            b.ret(&[]);
+            let func = b.finish_checked().expect("ptr_add 32B i128 pair LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("ptr_add 32B i128 pair emits")
+        };
+        let w2 = decode_words(&copy32_ptr_add.code, alloc);
+        assert_eq!(w2.iter().filter(|&&w| is_ldp_q29_q30(w)).count(), 1, "expected 1 ldp q29, q30, got {w2:#x?}");
+        assert_eq!(w2.iter().filter(|&&w| is_stp_q29_q30(w)).count(), 1, "expected 1 stp q29, q30, got {w2:#x?}");
+        assert_eq!(w2.iter().filter(|&&w| is_gpr_mem64(w)).count(), 0, "ptr_add 32B pair copy must emit 0 scalar ldr/str x, got {w2:#x?}");
+        assert_eq!(w2.len(), 3, "expected exactly 3 instructions (ldp, stp, ret), got {w2:#x?}");
+
+        // 3. Separate-load non-pair copy across an intervening unrelated `Op::Load` still fuses to `ldr q30; str q30`.
+        let copy16_across_load = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let other = b.param(Ty::PTR);
+            let a = b.load(Ty::I128, Flags::NONE, src, 0, MemAttrs::aligned(0));
+            let extra = b.load(Ty::I64, Flags::NONE, other, 0, MemAttrs::aligned(8));
+            b.store(Flags::NONE, a, dst, 0, MemAttrs::aligned(0));
+            b.ret(&[extra]);
+            let func = b.finish_checked().expect("across-load i128 copy LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("across-load i128 copy emits")
+        };
+        let w3 = decode_words(&copy16_across_load.code, alloc);
+        assert_eq!(w3.iter().filter(|&&w| is_ldr_q30(w)).count(), 1, "expected 1 ldr q30 across load, got {w3:#x?}");
+        assert_eq!(w3.iter().filter(|&&w| is_str_q30(w)).count(), 1, "expected 1 str q30 across load, got {w3:#x?}");
+
+        // 4. Sequential alias-sensitive negative control (`load0, store0, load1, store1`):
+        //    MUST NOT reorder `load1` before `store0` into `ldp q29, q30; stp q29, q30`!
+        let sequential_16x2 = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let a = b.load(Ty::I128, Flags::NONE, src, 0, MemAttrs::aligned(0));
+            b.store(Flags::NONE, a, dst, 0, MemAttrs::aligned(0));
+            let b_val = b.load(Ty::I128, Flags::NONE, src, 16, MemAttrs::aligned(0));
+            b.store(Flags::NONE, b_val, dst, 16, MemAttrs::aligned(0));
+            b.ret(&[]);
+            let func = b.finish_checked().expect("sequential 16x2 i128 copy LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("sequential 16x2 i128 copy emits")
+        };
+        let w4 = decode_words(&sequential_16x2.code, alloc);
+        assert_eq!(w4.iter().filter(|&&w| is_ldp_q29_q30(w)).count(), 0, "load0,store0,load1,store1 must NOT emit ldp q29, q30");
+        assert_eq!(w4.iter().filter(|&&w| is_stp_q29_q30(w)).count(), 0, "load0,store0,load1,store1 must NOT emit stp q29, q30");
+        assert_eq!(w4.iter().filter(|&&w| is_ldr_q30(w)).count(), 2, "sequential 16x2 should emit 2 ldr q30, got {w4:#x?}");
+        assert_eq!(w4.iter().filter(|&&w| is_str_q30(w)).count(), 2, "sequential 16x2 should emit 2 str q30, got {w4:#x?}");
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex1 = exec_leaf(copy32_direct);
+            let f1: extern "C" fn(*mut u8, *const u8) = unsafe { ex1.as_fn() };
+            let ex2 = exec_leaf(copy32_ptr_add);
+            let f2: extern "C" fn(*mut u8, *const u8) = unsafe { ex2.as_fn() };
+            let ex4 = exec_leaf(sequential_16x2);
+            let f4: extern "C" fn(*mut u8, *const u8) = unsafe { ex4.as_fn() };
+
+            let init: [u8; 128] = core::array::from_fn(|i| {
+                u8::try_from((i.wrapping_mul(53).wrapping_add(11)) & 0xff).unwrap_or(0)
+            });
+
+            // Hardware verification across disjoint, unaligned, backward-overlap, and forward-overlap (incl. d = s + 8)!
+            for src_off in [32usize, 33, 39] {
+                for delta in [-24isize, -16, -8, -1, 0, 1, 8, 16, 24, 32] {
+                    let dst_off = usize::try_from(isize::try_from(src_off).unwrap_or(0) + delta).unwrap_or(0);
+                    let mut want = init;
+                    want.copy_within(src_off..(src_off + 32), dst_off);
+
+                    let mut got1 = init;
+                    let p1 = got1.as_mut_ptr();
+                    unsafe { f1(p1.add(dst_off), p1.add(src_off)); }
+                    assert_eq!(got1, want, "copy32_direct mismatch for src_off={src_off}, delta={delta}");
+
+                    let mut got2 = init;
+                    let p2 = got2.as_mut_ptr();
+                    unsafe { f2(p2.add(dst_off), p2.add(src_off)); }
+                    assert_eq!(got2, want, "copy32_ptr_add mismatch for src_off={src_off}, delta={delta}");
+                }
+            }
+
+            // Sequential negative control: for d = s + 8, the second 16B load MUST observe the bytes written by the first 16B store!
+            let mut got4 = init;
+            let mut want4 = init;
+            want4.copy_within(32..48, 40);
+            want4.copy_within(48..64, 56);
+            let p4 = got4.as_mut_ptr();
+            unsafe { f4(p4.add(40), p4.add(32)); }
+            assert_eq!(got4, want4, "sequential 16x2 copy with d = s + 8 must preserve sequential aliasing semantics");
+        }
+    }
+
+    #[test]
+    fn trunc_i64_to_i32_elides_ubfx_after_and_mask_and_clz_and_lshr32() {
+        let alloc = test_alloc();
+        // `ubfm xd, xn, #0, #(bits-1)` = `ubfx xd, xn, #0, #bits` (`1 <= bits <= 63`).
+        let is_zext_ubfx = |w: u32| {
+            (w & 0xffc0_0000) == 0xd340_0000 && ((w >> 16) & 0x3f) == 0 && ((w >> 10) & 0x3f) < 63
+        };
+        // `ubfx xd, xn, #32, #16` (`ubfm` with `immr = 32`, `imms = 47`).
+        let is_ubfx_32_16 = |w: u32| (w & 0xffff_fc00) == 0xd360_bc00;
+        // 32-bit CSSC `umax wd, wn, wm` (`sf = 0`, `opc = 1`).
+        let is_umax_w = |w: u32| (w & 0xffe0_fc00) == 0x1ac0_6400;
+
+        let build_unary_case = |make: fn(&mut Builder<Alloc<'static>, Full>, blaze_lir::Value) -> blaze_lir::Value| {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let t32 = make(&mut b, x);
+            let out64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, t32);
+            b.ret(&[out64]);
+            let func = b.finish_checked().expect("trunc elision LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("trunc elision emits")
+        };
+
+        let and_mask = build_unary_case(|b, x| {
+            let m = b.iconst(Ty::I64, 0x3fffff);
+            let masked = b.binary(Op::And, Flags::NONE, x, m);
+            b.convert(Op::Trunc, Flags::NONE, Ty::I32, masked)
+        });
+        let clz = build_unary_case(|b, x| {
+            let c = b.unary(Op::Clz, Flags::NONE, x);
+            b.convert(Op::Trunc, Flags::NONE, Ty::I32, c)
+        });
+        let ctz = build_unary_case(|b, x| {
+            let c = b.unary(Op::Ctz, Flags::NONE, x);
+            b.convert(Op::Trunc, Flags::NONE, Ty::I32, c)
+        });
+        let popcnt = build_unary_case(|b, x| {
+            let c = b.unary(Op::Popcnt, Flags::NONE, x);
+            b.convert(Op::Trunc, Flags::NONE, Ty::I32, c)
+        });
+        let lshr32 = build_unary_case(|b, x| {
+            let k = b.iconst(Ty::I64, 32);
+            let sh = b.binary(Op::Lshr, Flags::NONE, x, k);
+            b.convert(Op::Trunc, Flags::NONE, Ty::I32, sh)
+        });
+        let ubfx_32_16 = build_unary_case(|b, x| {
+            let k = b.iconst(Ty::I64, 32);
+            let sh = b.binary(Op::Lshr, Flags::NONE, x, k);
+            let m = b.iconst(Ty::I64, 0xffff);
+            let extracted = b.binary(Op::And, Flags::NONE, sh, m);
+            b.convert(Op::Trunc, Flags::NONE, Ty::I32, extracted)
+        });
+
+        let build_umax_i32 = |feats: u64| {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let m = b.iconst(Ty::I64, 0x3fffff);
+            let ax = b.binary(Op::And, Flags::NONE, x, m);
+            let ay = b.binary(Op::And, Flags::NONE, y, m);
+            let a32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, ax);
+            let b32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, ay);
+            let u32_max = b.binary(Op::Umax, Flags::NONE, a32, b32);
+            let out64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, u32_max);
+            b.ret(&[out64]);
+            let func = b.finish_checked().expect("umax i32 LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, feats, true, alloc)
+                .expect("umax i32 emits")
+        };
+        let umax_i32_lse = build_umax_i32(Machine::LSE);
+        let umax_i32_cssc = build_umax_i32(Machine::LSE | Machine::CSSC);
+
+        let umax_zext_i64 = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let m = b.iconst(Ty::I64, 0x3fffff);
+            let ax = b.binary(Op::And, Flags::NONE, x, m);
+            let ay = b.binary(Op::And, Flags::NONE, y, m);
+            let a32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, ax);
+            let b32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, ay);
+            let za = b.convert(Op::Zext, Flags::NONE, Ty::I64, a32);
+            let zb = b.convert(Op::Zext, Flags::NONE, Ty::I64, b32);
+            let u64_max = b.binary(Op::Umax, Flags::NONE, za, zb);
+            let t32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, u64_max);
+            let out64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, t32);
+            b.ret(&[out64]);
+            let func = b.finish_checked().expect("umax zext i64 LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("umax zext i64 emits")
+        };
+
+        for (label, code) in [
+            ("and 0x3fffff -> trunc i32", &and_mask.code),
+            ("clz i64 -> trunc i32", &clz.code),
+            ("ctz i64 -> trunc i32", &ctz.code),
+            ("popcnt i64 -> trunc i32", &popcnt.code),
+            ("lshr 32 -> trunc i32", &lshr32.code),
+            ("ubfx #32,#16 -> trunc i32", &ubfx_32_16.code),
+            ("umax i32 (LSE)", &umax_i32_lse.code),
+            ("umax i32 (CSSC)", &umax_i32_cssc.code),
+            ("umax(zext i32, zext i32) -> trunc i32", &umax_zext_i64.code),
+        ] {
+            let words = decode_words(code, alloc);
+            assert_eq!(
+                words.iter().filter(|&&w| is_zext_ubfx(w)).count(),
+                0,
+                "{label}: must emit ZERO redundant ubfx #0,#k instructions, words={words:#x?}"
+            );
+        }
+
+        let ubfx_words = decode_words(&ubfx_32_16.code, alloc);
+        assert_eq!(
+            ubfx_words.iter().filter(|&&w| is_ubfx_32_16(w)).count(),
+            1,
+            "expected fused ubfx #32, #16, words={ubfx_words:#x?}"
+        );
+        let cssc_words = decode_words(&umax_i32_cssc.code, alloc);
+        assert_eq!(
+            cssc_words.iter().filter(|&&w| is_umax_w(w)).count(),
+            1,
+            "expected 32-bit CSSC umax wd, wn, wm, words={cssc_words:#x?}"
+        );
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex_and = exec_leaf(and_mask);
+            let f_and: extern "C" fn(u64) -> u64 = unsafe { ex_and.as_fn() };
+            let ex_clz = exec_leaf(clz);
+            let f_clz: extern "C" fn(u64) -> u64 = unsafe { ex_clz.as_fn() };
+            let ex_ctz = exec_leaf(ctz);
+            let f_ctz: extern "C" fn(u64) -> u64 = unsafe { ex_ctz.as_fn() };
+            let ex_pop = exec_leaf(popcnt);
+            let f_pop: extern "C" fn(u64) -> u64 = unsafe { ex_pop.as_fn() };
+            let ex_lsr = exec_leaf(lshr32);
+            let f_lsr: extern "C" fn(u64) -> u64 = unsafe { ex_lsr.as_fn() };
+            let ex_ext = exec_leaf(ubfx_32_16);
+            let f_ext: extern "C" fn(u64) -> u64 = unsafe { ex_ext.as_fn() };
+            let ex_umax32 = exec_leaf(umax_i32_lse);
+            let f_umax32: extern "C" fn(u64, u64) -> u64 = unsafe { ex_umax32.as_fn() };
+            let ex_umax64 = exec_leaf(umax_zext_i64);
+            let f_umax64: extern "C" fn(u64, u64) -> u64 = unsafe { ex_umax64.as_fn() };
+
+            for x in [0u64, 1, 0x3fffff, 0xdead_beef_cafe_babe, 0x8000_0000_ffff_ffff, u64::MAX] {
+                assert_eq!(f_and(x), x & 0x3fffff);
+                assert_eq!(f_clz(x), u64::from(x.leading_zeros()));
+                assert_eq!(f_ctz(x), u64::from(x.trailing_zeros()));
+                assert_eq!(f_pop(x), u64::from(x.count_ones()));
+                assert_eq!(f_lsr(x), x >> 32);
+                assert_eq!(f_ext(x), (x >> 32) & 0xffff);
+                let y = x.rotate_left(17) ^ 0x1234_5678_9abc_def0;
+                let want_max = (x & 0x3fffff).max(y & 0x3fffff);
+                assert_eq!(f_umax32(x, y), want_max);
+                assert_eq!(f_umax64(x, y), want_max);
+            }
+        }
+    }
+
+    #[test]
+    fn trunc_i64_to_i32_preserves_ubfx_after_unbounded_add_or_param() {
+        let alloc = test_alloc();
+        // `ubfx xd, xn, #0, #32` (`ubfm` with `immr = 0`, `imms = 31`).
+        let is_ubfx_32 = |w: u32| (w & 0xffff_fc00) == 0xd340_7c00;
+
+        let build_trunc32 = |make: fn(&mut Builder<Alloc<'static>, Full>, blaze_lir::Value, blaze_lir::Value) -> blaze_lir::Value| {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let v = make(&mut b, x, y);
+            let t32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, v);
+            let out64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, t32);
+            b.ret(&[out64]);
+            let func = b.finish_checked().expect("trunc soundness LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("trunc soundness emits")
+        };
+
+        let raw_param = build_trunc32(|_b, x, _y| x);
+        let unbounded_add = build_trunc32(|b, x, y| b.binary(Op::Add, Flags::NONE, x, y));
+        let lshr31 = build_trunc32(|b, x, _y| {
+            let k = b.iconst(Ty::I64, 31);
+            b.binary(Op::Lshr, Flags::NONE, x, k)
+        });
+        let lshr64 = build_trunc32(|b, x, _y| {
+            let k = b.iconst(Ty::I64, 64);
+            b.binary(Op::Lshr, Flags::NONE, x, k)
+        });
+        let ashr32 = build_trunc32(|b, x, _y| {
+            let k = b.iconst(Ty::I64, 32);
+            b.binary(Op::Ashr, Flags::NONE, x, k)
+        });
+
+        for (label, code) in [
+            ("raw i64 param -> trunc i32", &raw_param.code),
+            ("add(a, b) -> trunc i32", &unbounded_add.code),
+            ("lshr(x, 31) -> trunc i32", &lshr31.code),
+            ("lshr(x, 64) -> trunc i32", &lshr64.code),
+            ("ashr(x, 32) -> trunc i32", &ashr32.code),
+        ] {
+            let words = decode_words(code, alloc);
+            assert_eq!(
+                words.iter().filter(|&&w| is_ubfx_32(w)).count(),
+                1,
+                "{label}: must preserve ubfx #0,#32 for soundness, words={words:#x?}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex_param = exec_leaf(raw_param);
+            let f_param: extern "C" fn(u64, u64) -> u64 = unsafe { ex_param.as_fn() };
+            let ex_add = exec_leaf(unbounded_add);
+            let f_add: extern "C" fn(u64, u64) -> u64 = unsafe { ex_add.as_fn() };
+            let ex_lsr31 = exec_leaf(lshr31);
+            let f_lsr31: extern "C" fn(u64, u64) -> u64 = unsafe { ex_lsr31.as_fn() };
+            let ex_lsr64 = exec_leaf(lshr64);
+            let f_lsr64: extern "C" fn(u64, u64) -> u64 = unsafe { ex_lsr64.as_fn() };
+            let ex_asr32 = exec_leaf(ashr32);
+            let f_asr32: extern "C" fn(u64, u64) -> u64 = unsafe { ex_asr32.as_fn() };
+
+            let x = 0xffff_ffff_1234_5678u64;
+            let y = 0x8000_0000_dead_beefu64;
+            assert_eq!(f_param(x, y), x & 0xffff_ffff);
+            assert_eq!(f_add(x, y), x.wrapping_add(y) & 0xffff_ffff);
+            assert_eq!(f_lsr31(x, y), (x >> 31) & 0xffff_ffff);
+            assert_eq!(f_lsr64(x, y), x & 0xffff_ffff);
+            assert_eq!(f_asr32(x, y), (x.cast_signed() >> 32).cast_unsigned() & 0xffff_ffff);
+        }
+    }
+
+    #[test]
+    fn trunc_i64_to_i8_preserves_ubfx_after_u32_mask() {
+        let alloc = test_alloc();
+        let is_zext_ubfx = |w: u32| {
+            (w & 0xffc0_0000) == 0xd340_0000 && ((w >> 16) & 0x3f) == 0 && ((w >> 10) & 0x3f) < 63
+        };
+        // `ubfx xd, xn, #0, #8` (`ubfm` with `immr = 0`, `imms = 7`).
+        let is_ubfx_8 = |w: u32| (w & 0xffff_fc00) == 0xd340_1c00;
+
+        let build_masked_trunc8 = |mask: u64| {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let m = b.iconst(Ty::I64, u128::from(mask));
+            let masked = b.binary(Op::And, Flags::NONE, x, m);
+            let t8 = b.convert(Op::Trunc, Flags::NONE, Ty::I8, masked);
+            let out64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, t8);
+            b.ret(&[out64]);
+            let func = b.finish_checked().expect("trunc i8 LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("trunc i8 emits")
+        };
+
+        let wider_mask = build_masked_trunc8(0x3fffff);
+        let exact_mask = build_masked_trunc8(0xff);
+
+        let w_wider = decode_words(&wider_mask.code, alloc);
+        assert_eq!(
+            w_wider.iter().filter(|&&w| is_ubfx_8(w)).count(),
+            1,
+            "and 0x3fffff -> trunc i8 must preserve ubfx #0,#8, words={w_wider:#x?}"
+        );
+
+        let w_exact = decode_words(&exact_mask.code, alloc);
+        assert_eq!(
+            w_exact.iter().filter(|&&w| is_zext_ubfx(w)).count(),
+            0,
+            "and 0xff -> trunc i8 must elide redundant ubfx #0,#8, words={w_exact:#x?}"
+        );
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex_wider = exec_leaf(wider_mask);
+            let f_wider: extern "C" fn(u64) -> u64 = unsafe { ex_wider.as_fn() };
+            let ex_exact = exec_leaf(exact_mask);
+            let f_exact: extern "C" fn(u64) -> u64 = unsafe { ex_exact.as_fn() };
+            for x in [0u64, 0xab, 0x3f_ffab, 0xdead_beef_cafe_12ab, u64::MAX] {
+                assert_eq!(f_wider(x), x & 0xff);
+                assert_eq!(f_exact(x), x & 0xff);
+            }
+        }
+    }
+
+    #[test]
+    fn trunc_i64_to_i32_elides_ubfx_when_only_used_by_i32_add_and_icmp() {
+        let alloc = test_alloc();
+        // `ubfx xd, xn, #0, #32` (`ubfm` with `immr = 0`, `imms = 31`).
+        let is_ubfx_32 = |w: u32| (w & 0xffff_fc00) == 0xd340_7c00;
+
+        let emitted = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let t32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, x);
+            let y32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, y);
+            let c7 = b.iconst(Ty::I32, 7);
+            let sum32 = b.binary(Op::Add, Flags::NONE, t32, c7);
+            let lt = b.icmp(IntCond::Ult, t32, y32);
+            let sum64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, sum32);
+            let lt64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, lt);
+            let sh = b.iconst(Ty::I64, 32);
+            let hi = b.binary(Op::Shl, Flags::NONE, lt64, sh);
+            let out64 = b.binary(Op::Or, Flags::NONE, sum64, hi);
+            b.ret(&[out64]);
+            let func = b.finish_checked().expect("consumer-driven trunc elision LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("consumer-driven trunc elision emits")
+        };
+
+        let words = decode_words(&emitted.code, alloc);
+        assert_eq!(
+            words.iter().filter(|&&w| is_ubfx_32(w)).count(),
+            0,
+            "trunc(i64->i32) used only by i32 add/icmp must emit ZERO ubfx #0,#32, words={words:#x?}"
+        );
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex = exec_leaf(emitted);
+            let f: extern "C" fn(u64, u64) -> u64 = unsafe { ex.as_fn() };
+            assert_eq!(f(0xDEAD_BEEF_0000_0005, 0x0000_0000_0000_000A), (1u64 << 32) | 12);
+            assert_eq!(f(0xDEAD_BEEF_FFFF_FFFE, 0xCAFE_BABE_0000_0005), 5);
+            assert_eq!(f(0x1234_5678_0000_0005, 0x0000_0000_0000_0005), 12);
+            assert_eq!(f(0xFFFF_FFFF_0000_0000, 0x0000_0000_0000_0001), (1u64 << 32) | 7);
+        }
+    }
+
+    #[test]
+    fn trunc_i64_to_i32_preserves_ubfx_when_used_by_zext_or_ret_or_block_param() {
+        let alloc = test_alloc();
+        // `ubfx xd, xn, #0, #32` (`ubfm` with `immr = 0`, `imms = 31`).
+        let is_ubfx_32 = |w: u32| (w & 0xffff_fc00) == 0xd340_7c00;
+
+        let zext_emitted = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let t32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, x);
+            let out64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, t32);
+            b.ret(&[out64]);
+            let func = b.finish_checked().expect("trunc->zext LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("trunc->zext emits")
+        };
+
+        let select_emitted = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let flag = b.param(Ty::I64);
+            let t32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, x);
+            let zero64 = b.iconst(Ty::I64, 0);
+            let c9 = b.iconst(Ty::I32, 9);
+            let cond = b.icmp(IntCond::Ne, flag, zero64);
+            let sel32 = b.select(Flags::NONE, cond, t32, c9);
+            let out64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, sel32);
+            b.ret(&[out64]);
+            let func = b.finish_checked().expect("trunc->select LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("trunc->select emits")
+        };
+
+        let block_param_emitted = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let join = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let flag = b.param(Ty::I64);
+            let t32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, x);
+            let zero64 = b.iconst(Ty::I64, 0);
+            let c9 = b.iconst(Ty::I32, 9);
+            let cond = b.icmp(IntCond::Ne, flag, zero64);
+            b.br(Flags::NONE, cond, (join, &[t32]), (join, &[c9]));
+            b.begin(join);
+            let p32 = b.param(Ty::I32);
+            let out64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, p32);
+            b.ret(&[out64]);
+            let func = b.finish_checked().expect("trunc->block_param LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("trunc->block_param emits")
+        };
+
+        let ret_i32_emitted = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I32)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let t32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, x);
+            b.ret(&[t32]);
+            let func = b.finish_checked().expect("trunc->ret i32 LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("trunc->ret i32 emits")
+        };
+
+        for (label, code) in [
+            ("trunc -> zext", &zext_emitted.code),
+            ("trunc -> select", &select_emitted.code),
+            ("trunc -> block param", &block_param_emitted.code),
+            ("trunc -> ret i32", &ret_i32_emitted.code),
+        ] {
+            let words = decode_words(code, alloc);
+            assert_eq!(
+                words.iter().filter(|&&w| is_ubfx_32(w)).count(),
+                1,
+                "{label}: must preserve ubfx #0,#32 so dirty upper 32 bits never leak, words={words:#x?}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex_zext = exec_leaf(zext_emitted);
+            let f_zext: extern "C" fn(u64) -> u64 = unsafe { ex_zext.as_fn() };
+            let ex_sel = exec_leaf(select_emitted);
+            let f_sel: extern "C" fn(u64, u64) -> u64 = unsafe { ex_sel.as_fn() };
+            let ex_bp = exec_leaf(block_param_emitted);
+            let f_bp: extern "C" fn(u64, u64) -> u64 = unsafe { ex_bp.as_fn() };
+            let ex_ret = exec_leaf(ret_i32_emitted);
+            let f_ret: extern "C" fn(u64) -> u64 = unsafe { ex_ret.as_fn() };
+
+            let dirty = 0xDEAD_BEEF_0000_0005u64;
+            assert_eq!(f_zext(dirty), 5);
+            assert_eq!(f_sel(dirty, 1), 5);
+            assert_eq!(f_sel(dirty, 0), 9);
+            assert_eq!(f_bp(dirty, 1), 5);
+            assert_eq!(f_bp(dirty, 0), 9);
+            assert_eq!(f_ret(dirty), 5);
+        }
+    }
+
+    #[test]
+    fn trunc_i64_to_i32_cbz_with_dirty_upper32_is_sound() {
+        let alloc = test_alloc();
+        // `ubfx xd, xn, #0, #32` (`ubfm` with `immr = 0`, `imms = 31`).
+        let is_ubfx_32 = |w: u32| (w & 0xffff_fc00) == 0xd340_7c00;
+        // 32-bit `cbz`/`cbnz wt, label` (`sf = 0`, bits 30..25 = `011010`).
+        let is_cbz_or_cbnz_w = |w: u32| (w & 0xfe00_0000) == 0x3400_0000;
+        // 64-bit `cbz`/`cbnz xt, label` (`sf = 1`, bits 30..25 = `011010`).
+        let is_cbz_or_cbnz_x = |w: u32| (w & 0xfe00_0000) == 0xb400_0000;
+
+        let direct_br = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let zero_blk = b.create_block(BlockKind::Normal);
+            let nz_blk = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let t32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, x);
+            let zero32 = b.iconst(Ty::I32, 0);
+            let is_z = b.icmp(IntCond::Eq, t32, zero32);
+            b.br(Flags::NONE, is_z, (zero_blk, &[]), (nz_blk, &[]));
+            b.begin(zero_blk);
+            let c111 = b.iconst(Ty::I64, 111);
+            b.ret(&[c111]);
+            b.begin(nz_blk);
+            let c222 = b.iconst(Ty::I64, 222);
+            b.ret(&[c222]);
+            let func = b.finish_checked().expect("trunc->cbz direct LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("trunc->cbz direct emits")
+        };
+
+        let edge_move_br = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let join = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let t32 = b.convert(Op::Trunc, Flags::NONE, Ty::I32, x);
+            let zero32 = b.iconst(Ty::I32, 0);
+            let is_z = b.icmp(IntCond::Eq, t32, zero32);
+            let c111 = b.iconst(Ty::I64, 111);
+            let c222 = b.iconst(Ty::I64, 222);
+            b.br(Flags::NONE, is_z, (join, &[c111]), (join, &[c222]));
+            b.begin(join);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+            let func = b.finish_checked().expect("trunc->cbz edge-move LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("trunc->cbz edge-move emits")
+        };
+
+        for (label, code) in [
+            ("direct cbz/cbnz", &direct_br.code),
+            ("edge-move cbz/cbnz", &edge_move_br.code),
+        ] {
+            let words = decode_words(code, alloc);
+            assert_eq!(
+                words.iter().filter(|&&w| is_ubfx_32(w)).count(),
+                0,
+                "{label}: trunc(i64->i32) -> cbz w must elide ubfx #0,#32, words={words:#x?}"
+            );
+            assert_eq!(
+                words.iter().filter(|&&w| is_cbz_or_cbnz_w(w)).count(),
+                1,
+                "{label}: expected 32-bit cbz/cbnz w for i32 zero-compare, words={words:#x?}"
+            );
+            assert_eq!(
+                words.iter().filter(|&&w| is_cbz_or_cbnz_x(w)).count(),
+                0,
+                "{label}: must NOT emit 64-bit cbz/cbnz x on i32 value, words={words:#x?}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex_direct = exec_leaf(direct_br);
+            let f_direct: extern "C" fn(u64) -> u64 = unsafe { ex_direct.as_fn() };
+            let ex_edge = exec_leaf(edge_move_br);
+            let f_edge: extern "C" fn(u64) -> u64 = unsafe { ex_edge.as_fn() };
+
+            for f in [f_direct, f_edge] {
+                assert_eq!(f(0xDEAD_BEEF_0000_0000), 111);
+                assert_eq!(f(0xFFFF_FFFF_0000_0000), 111);
+                assert_eq!(f(0x0000_0000_0000_0000), 111);
+                assert_eq!(f(0xDEAD_BEEF_0000_0001), 222);
+                assert_eq!(f(0x0000_0000_8000_0000), 222);
+            }
+        }
+    }
+
+    #[test]
+    fn sub_and_add_neg_lshr_fuse_to_shifted_sub() {
+        let alloc = test_alloc();
+        // `sub xd, xn, xm, lsr #3` (`sf = 1, op = 1, S = 0, shift = 01 (lsr), imm6 = 3`).
+        let is_sub_lsr3 = |w: u32| (w & 0xffe0_fc00) == 0xcb40_0c00;
+        // Separate 64-bit `lsr xd, xn, #imm` (`ubfm` with `imms = 63`).
+        let is_lsr64_imm = |w: u32| (w & 0xffc0_fc00) == 0xd340_fc00;
+        // Separate 64-bit `neg xd, xm` (`sub xd, xzr, xm`, `rn = 31`, `shift = 0`).
+        let is_neg64 = |w: u32| (w & 0xffe0_ffe0) == 0xcb00_03e0;
+
+        // 1. `Sub(a, Lshr(b, 3))` -> single `sub xd, xa, xb, lsr #3`.
+        let sub_lshr = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let c3 = b.iconst(Ty::I64, 3);
+            let sh = b.binary(Op::Lshr, Flags::NONE, bv, c3);
+            let res = b.binary(Op::Sub, Flags::NONE, a, sh);
+            b.ret(&[res]);
+            let func = b.finish_checked().expect("sub(a, lshr(b, 3)) LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("sub(a, lshr(b, 3)) emits")
+        };
+
+        // 2. `Add(a, Neg(Lshr(b, 3)))` -> single `sub xd, xa, xb, lsr #3`.
+        let add_neg_lshr = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let c3 = b.iconst(Ty::I64, 3);
+            let sh = b.binary(Op::Lshr, Flags::NONE, bv, c3);
+            let neg_sh = b.unary(Op::Neg, Flags::NONE, sh);
+            let res = b.binary(Op::Add, Flags::NONE, a, neg_sh);
+            b.ret(&[res]);
+            let func = b.finish_checked().expect("add(a, neg(lshr(b, 3))) LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("add(a, neg(lshr(b, 3))) emits")
+        };
+
+        // 3. `PtrAdd(ptr, Neg(Lshr(b, 3)))` (Rust `ptr.sub(bits_consumed >> 3)`) -> single `sub xd, xptr, xb, lsr #3`.
+        let ptr_sub_lshr = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[Param::of(Ty::PTR)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let p = b.param(Ty::PTR);
+            let bv = b.param(Ty::I64);
+            let c3 = b.iconst(Ty::I64, 3);
+            let sh = b.binary(Op::Lshr, Flags::NONE, bv, c3);
+            let neg_sh = b.unary(Op::Neg, Flags::NONE, sh);
+            let res = b.ptr_add(Flags::NONE, p, neg_sh);
+            b.ret(&[res]);
+            let func = b.finish_checked().expect("ptr_add(p, neg(lshr(b, 3))) LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("ptr_add(p, neg(lshr(b, 3))) emits")
+        };
+
+        for (label, code) in [
+            ("Sub(a, Lshr(b, 3))", &sub_lshr.code),
+            ("Add(a, Neg(Lshr(b, 3)))", &add_neg_lshr.code),
+            ("PtrAdd(p, Neg(Lshr(b, 3)))", &ptr_sub_lshr.code),
+        ] {
+            let words = decode_words(code, alloc);
+            assert_eq!(
+                words.iter().filter(|&&w| is_sub_lsr3(w)).count(),
+                1,
+                "{label}: expected single `sub xd, xa, xb, lsr #3`, words={words:#x?}"
+            );
+            assert_eq!(
+                words.iter().filter(|&&w| is_lsr64_imm(w)).count(),
+                0,
+                "{label}: must elide standalone `lsr`, words={words:#x?}"
+            );
+            assert_eq!(
+                words.iter().filter(|&&w| is_neg64(w)).count(),
+                0,
+                "{label}: must elide standalone `neg`, words={words:#x?}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex_sub = exec_leaf(sub_lshr);
+            let f_sub: extern "C" fn(u64, u64) -> u64 = unsafe { ex_sub.as_fn() };
+            let ex_add = exec_leaf(add_neg_lshr);
+            let f_add: extern "C" fn(u64, u64) -> u64 = unsafe { ex_add.as_fn() };
+            let ex_ptr = exec_leaf(ptr_sub_lshr);
+            let f_ptr: extern "C" fn(u64, u64) -> u64 = unsafe { ex_ptr.as_fn() };
+
+            for &(a, bv) in &[
+                (1000u64, 0u64),
+                (1000, 7),
+                (1000, 8),
+                (1000, 63),
+                (1000, 64),
+                (0x1_0000_0000, 0xdead_beef_cafe_babe),
+                (0, u64::MAX),
+                (u64::MAX, 56),
+            ] {
+                let want = a.wrapping_sub(bv >> 3);
+                assert_eq!(f_sub(a, bv), want, "Sub(a, Lshr(b, 3)) failed for ({a:#x}, {bv:#x})");
+                assert_eq!(f_add(a, bv), want, "Add(a, Neg(Lshr(b, 3))) failed for ({a:#x}, {bv:#x})");
+                assert_eq!(f_ptr(a, bv), want, "PtrAdd(p, Neg(Lshr(b, 3))) failed for ({a:#x}, {bv:#x})");
+            }
+        }
+    }
+
+    #[test]
+    fn leaf_lr_allocation_round_trips_hardware_exec_leaf() {
+        use crate::enc::{self, FP, LR, SP};
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let x = b.param(Ty::I64);
+        let c1 = b.iconst(Ty::I64, 1);
+        let mut live = Vec::with_capacity_in(26, alloc);
+        let mut cur = x;
+        for _ in 0..26usize {
+            cur = b.binary(Op::Add, Flags::NONE, cur, c1);
+            live.push(cur);
+        }
+        let mut acc = b.binary(Op::Xor, Flags::NONE, x, live[0]);
+        for &v in &live[1..] {
+            acc = b.binary(Op::Xor, Flags::NONE, acc, v);
+        }
+        b.ret(&[acc]);
+
+        let func = b.finish_checked().expect("27-GPR leaf LIR builds");
+        let emitted = emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+            .expect("27-GPR leaf emits");
+        let words = decode_words(&emitted.code, alloc);
+
+        assert_eq!(
+            emitted.unwind_frame,
+            Some(blaze_code::unwind::Frame { x_pairs: 0x1f, d_pairs: 0 }),
+            "27-GPR leaf must save x19..=x28 (x_pairs = 0x1f) alongside FP/LR frame"
+        );
+        assert!(
+            words.contains(&enc::stp_pre(FP, LR, SP, -16)),
+            "27-GPR leaf allocating X30 must save FP/LR in prologue, words={words:#x?}"
+        );
+        assert!(
+            words.contains(&enc::ldp_post(FP, LR, SP, 16)),
+            "27-GPR leaf allocating X30 must restore FP/LR in epilogue, words={words:#x?}"
+        );
+        assert_eq!(words.last().copied(), Some(enc::ret()));
+
+        // Verify X30 is actually written by an `add x30, xn, #1` (`0x9100_0400 | (rn<<5) | 30`)
+        // and zero stack spill loads/stores (`ldr/str xt, [sp, #imm]`) were emitted.
+        let writes_x30_add = words
+            .iter()
+            .any(|&w| (w & 0xffc0_001f) == 0x9100_001e);
+        assert!(
+            writes_x30_add,
+            "expected 27-GPR leaf to allocate and write X30 in body, words={words:#x?}"
+        );
+        let spill_mem_ops = words
+            .iter()
+            .filter(|&&w| (w & 0xffc0_03e0) == 0xf940_03e0 || (w & 0xffc0_03e0) == 0xf900_03e0)
+            .count();
+        assert_eq!(
+            spill_mem_ops, 0,
+            "27-GPR leaf must have ZERO stack spill ldr/str when X30 is allocatable, words={words:#x?}"
+        );
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex = exec_leaf(emitted);
+            let f: extern "C" fn(u64) -> u64 = unsafe { ex.as_fn() };
+            for &x_in in &[0u64, 1, 42, 0x1234_5678_9abc_def0, u64::MAX - 5] {
+                let mut want = 0u64;
+                for k in 0..=26u64 {
+                    want ^= x_in.wrapping_add(k);
+                }
+                assert_eq!(f(x_in), want, "27-GPR X30 leaf returned wrong value for {x_in:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn ptr_add_neg_fuses_to_single_sub_and_runs() {
+        let alloc = test_alloc();
+        // 64-bit `sub xd, xn, xm` (`rn != xzr`), `neg xd, xm` (`rn == xzr`), and `add xd, xn, xm`.
+        let is_sub64 = |w: u32| (w & 0xffe0_fc00) == 0xcb00_0000 && ((w >> 5) & 31) != 31;
+        let is_neg64 = |w: u32| (w & 0xffe0_ffe0) == 0xcb00_03e0;
+        let is_add64 = |w: u32| (w & 0xffe0_fc00) == 0x8b00_0000;
+        // 32-bit `sub wd, wn, wm` (`rn != wzr`), `neg wd, wm` (`rn == wzr`), and `add wd, wn, wm`.
+        let is_sub32 = |w: u32| (w & 0xffe0_fc00) == 0x4b00_0000 && ((w >> 5) & 31) != 31;
+        let is_neg32 = |w: u32| (w & 0xffe0_ffe0) == 0x4b00_03e0;
+        let is_add32 = |w: u32| (w & 0xffe0_fc00) == 0x0b00_0000;
+
+        // 1. `PtrAdd(p, Neg(x))` (Rust `dst_ptr.sub(offset)`) -> single `sub xd, xp, xx`.
+        let ptr_sub = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[Param::of(Ty::PTR)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let p = b.param(Ty::PTR);
+            let x = b.param(Ty::I64);
+            let neg_x = b.unary(Op::Neg, Flags::NONE, x);
+            let res = b.ptr_add(Flags::NONE, p, neg_x);
+            b.ret(&[res]);
+            let func = b.finish_checked().expect("ptr_add(p, neg(x)) LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("ptr_add(p, neg(x)) emits")
+        };
+
+        // 2. `Add(a, Neg(x))` (64-bit) -> single `sub xd, xa, xx`.
+        let add64_neg = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let x = b.param(Ty::I64);
+            let neg_x = b.unary(Op::Neg, Flags::NONE, x);
+            let res = b.binary(Op::Add, Flags::NONE, a, neg_x);
+            b.ret(&[res]);
+            let func = b.finish_checked().expect("add64(a, neg(x)) LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("add64(a, neg(x)) emits")
+        };
+
+        // 3. `Add(Neg(x), a)` (32-bit, commutative) -> single `sub wd, wa, wx`.
+        let add32_neg = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I32), Param::of(Ty::I32)],
+                &[Param::of(Ty::I32)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I32);
+            let x = b.param(Ty::I32);
+            let neg_x = b.unary(Op::Neg, Flags::NONE, x);
+            let res = b.binary(Op::Add, Flags::NONE, neg_x, a);
+            b.ret(&[res]);
+            let func = b.finish_checked().expect("add32(neg(x), a) LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("add32(neg(x), a) emits")
+        };
+
+        for (label, code) in [
+            ("PtrAdd(p, Neg(x))", &ptr_sub.code),
+            ("Add64(a, Neg(x))", &add64_neg.code),
+        ] {
+            let words = decode_words(code, alloc);
+            assert_eq!(
+                words.iter().filter(|&&w| is_sub64(w)).count(),
+                1,
+                "{label}: expected single `sub xd, xa, xx`, words={words:#x?}"
+            );
+            assert_eq!(
+                words.iter().filter(|&&w| is_neg64(w)).count(),
+                0,
+                "{label}: must elide standalone `neg`, words={words:#x?}"
+            );
+            assert_eq!(
+                words.iter().filter(|&&w| is_add64(w)).count(),
+                0,
+                "{label}: must elide standalone `add`, words={words:#x?}"
+            );
+        }
+
+        {
+            let words = decode_words(&add32_neg.code, alloc);
+            assert_eq!(
+                words.iter().filter(|&&w| is_sub32(w)).count(),
+                1,
+                "Add32(Neg(x), a): expected single `sub wd, wa, wx`, words={words:#x?}"
+            );
+            assert_eq!(
+                words.iter().filter(|&&w| is_neg32(w)).count(),
+                0,
+                "Add32(Neg(x), a): must elide standalone 32-bit `neg`, words={words:#x?}"
+            );
+            assert_eq!(
+                words.iter().filter(|&&w| is_add32(w)).count(),
+                0,
+                "Add32(Neg(x), a): must elide standalone 32-bit `add`, words={words:#x?}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex_ptr = exec_leaf(ptr_sub);
+            let f_ptr: extern "C" fn(u64, u64) -> u64 = unsafe { ex_ptr.as_fn() };
+            let ex_add64 = exec_leaf(add64_neg);
+            let f_add64: extern "C" fn(u64, u64) -> u64 = unsafe { ex_add64.as_fn() };
+            let ex_add32 = exec_leaf(add32_neg);
+            let f_add32: extern "C" fn(u32, u32) -> u32 = unsafe { ex_add32.as_fn() };
+
+            for &(p, x) in &[
+                (1000u64, 0u64),
+                (1000, 1),
+                (1000, 1000),
+                (0x1_0000_0000, 0x1234_5678),
+                (0, 1),
+                (0x8000_0000_0000_0000, 0x8000_0000_0000_0000),
+                (42, i64::MIN.cast_unsigned()),
+                (u64::MAX, u64::MAX),
+            ] {
+                let want = p.wrapping_sub(x);
+                assert_eq!(f_ptr(p, x), want, "PtrAdd(p, Neg(x)) failed for ({p:#x}, {x:#x})");
+                assert_eq!(f_add64(p, x), want, "Add64(a, Neg(x)) failed for ({p:#x}, {x:#x})");
+            }
+
+            for &(a, x) in &[
+                (0u32, 0u32),
+                (100, 37),
+                (0, 1),
+                (0x8000_0000, 0x8000_0000),
+                (u32::MAX, 0x1234_5678),
+            ] {
+                let want = a.wrapping_sub(x);
+                assert_eq!(f_add32(a, x), want, "Add32(Neg(x), a) failed for ({a:#x}, {x:#x})");
+            }
         }
     }
 }

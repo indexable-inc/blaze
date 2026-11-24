@@ -2,21 +2,23 @@
 //! `lz77_scan_default`), Huffman literal encoders, and reverse FSE sequence packers backing
 //! `bstd::zstd`.
 //!
-//! - `lz77_scan_fast`: 64 KiB L1D-resident 10-bit-tagged 7-byte prime hash table
-//!   (`LZ77_FAST_HASH_LOG = 14`), 2-position pipelined miss loop with stride `1 + ((pos - anchor) >> 6).min(7)`,
-//!   backward match extension, and `rep[0]`/`rep[1]` chain harvesting.
-//! - `lz77_scan_default`: hybrid Double-Fast (`128K` 10-bit-tagged `hash7` long table + `16K`
-//!   2-way SWAR `hash4` short table), 2-position pipelined miss loop with `kSearchStrength = 7`
-//!   acceleration, `pos + 1` lazy override when `ml < 36`, and `rep[0]`/`rep[1]` chain harvesting.
+//! - `lz77_scan_fast`: 64 KiB 10-bit-tagged 7-byte prime hash table (`LZ77_FAST_HASH_LOG = 14`,
+//!   half of L1D), 2-position pipelined miss loop with unclamped `step_acc >> 6` recurrence,
+//!   backward match extension, and `rep[0]`/`rep[1]` chain harvesting in a zero-call leaf kernel.
+//! - `lz77_scan_default`: 1-way 10-bit-tagged Double-Fast (`64K` `hash8` long table = 256 KiB +
+//!   `64K` `hash5` short table = 256 KiB, 2 MiB window), sequential 2-position unrolled miss loop
+//!   with `step_acc >> 6`, short `ht_long` (`m_ml < 12`) + `ht_short` `pos + 1` lazy upgrade,
+//!   backward match extension, in-match table inserts (`ht_short` at `match_start + 1`, both tables
+//!   at `match_start + 2` and `pos - 2`), and zero-literal `rep[1]` + 1-literal `rep[0]` chain
+//!   harvesting in a zero-call leaf kernel.
 
 use core::alloc::Allocator;
 use core::ptr;
 
 use crate::{AllocFailure, Int, SeqOp, Vec};
 
-const HASH4_PRIME: u64 = 2_654_435_761;
-const HASH7_PRIME: u64 = 58_295_818_150_454_627;
-const MASK_4BYTES: u64 = 0x0000_0000_FFFF_FFFF;
+/// C `zstd` `prime8bytes` / `xxHash64` `PRIME64_1` (`0x9E37_79B1_85EB_CA87`).
+const HASH8_PRIME: u64 = 11_400_714_785_074_694_791;
 const MASK_5BYTES: u64 = 0x0000_00FF_FFFF_FFFF;
 const MASK_7BYTES: u64 = 0x00FF_FFFF_FFFF_FFFF;
 
@@ -27,22 +29,21 @@ const WIN_MASK_U32: u32 = (1u32 << WIN_BITS) - 1;
 /// Top 10 bits store a non-zero fingerprint tag (bit 22 = `1`, bits 23..32 = 9 hash bits).
 const TAG_MASK: u32 = !WIN_MASK_U32;
 const TAG_NONZERO: u32 = 1u32 << WIN_BITS;
-const TAG_PAIR_MASK: u64 = 0xFFC0_0000_FFC0_0000;
 
-/// Hash table size for [`lz77_scan_fast`]: 16,384 `u32` entries = 64 KiB (fits in half of L1D).
+/// Hash table size for [`lz77_scan_fast`]: 16,384 `u32` entries = 64 KiB (half of L1D).
 pub const LZ77_FAST_HASH_LOG: u32 = 14;
 /// Number of `u32` entries in [`lz77_scan_fast`]'s hash table.
 pub const LZ77_FAST_HASH_SIZE: usize = 1 << LZ77_FAST_HASH_LOG;
 
-/// Double-Fast short table (`hash4`, 2-way `u64` buckets): 16,384 buckets = 128 KiB (L1D).
-const DFAST_SHORT_LOG: u32 = 14;
-const DFAST_SHORT_U64S: usize = 1 << DFAST_SHORT_LOG;
-/// Double-Fast long table (`hash7`, 1-way `u32` entries): 131,072 entries = 512 KiB (L2).
-const DFAST_LONG_LOG: u32 = 17;
-const DFAST_LONG_U64S: usize = (1 << DFAST_LONG_LOG) / 2;
+/// Double-Fast long table (`hash8`, 1-way `u32` entries): 65,536 entries = 256 KiB.
+const DFAST_LONG_LOG: u32 = 16;
+const DFAST_LONG_U32S: usize = 1 << DFAST_LONG_LOG;
+/// Double-Fast short table (`hash5`, 1-way `u32` entries): 32,768 entries = 128 KiB (L1D-resident).
+const DFAST_SHORT_LOG: u32 = 15;
 
-/// Number of `u64` words backing [`lz77_scan_default`]'s hybrid Double-Fast tables.
-pub const LZ77_DEF_BUCKETS: usize = DFAST_SHORT_U64S + DFAST_LONG_U64S;
+/// Number of `u64` words backing [`lz77_scan_default`]'s Double-Fast tables (512 KiB buffer:
+/// 256 KiB `ht_long` + 256 KiB `ht_short`).
+pub const LZ77_DEF_BUCKETS: usize = 65_536;
 
 #[inline(always)]
 unsafe fn read_u32_unaligned(p: *const u8) -> u32 {
@@ -56,24 +57,45 @@ unsafe fn read_u64_unaligned(p: *const u8) -> u64 {
     unsafe { ptr::read_unaligned(p.cast::<u64>()) }.to_le()
 }
 
-/// Single-multiply 4-byte hash returning `(table_index, tagged_entry)`.
 #[inline(always)]
-fn hash4_tagged(v: u64, pos: usize, hash_log: u32) -> (usize, u32) {
-    let prod = (v & MASK_4BYTES).wrapping_mul(HASH4_PRIME.wrapping_mul(0x9E37_79B1));
+fn pos_low_nz(pos: usize) -> u32 {
+    (pos & MAX_WIN_MASK).truncate_to::<u32>() | TAG_NONZERO
+}
+
+/// Single-multiply 5-byte hash returning `(table_index, tagged_entry)`.
+///
+/// Masks to the low 40 bits (`MASK_5BYTES`, a 1-cycle AArch64 logical immediate) and multiplies
+/// by `HASH8_PRIME` so all 5 input bytes avalanche into both the 16-bit bucket index (`48..64`)
+/// and the disjoint 9-bit tag (`39..48`), while sharing the single 64-bit multiplier register
+/// with [`hash8_tagged`].
+#[inline(always)]
+fn hash5_tagged(v: u64, low_nz: u32, hash_log: u32) -> (usize, u32) {
+    let prod = (v & MASK_5BYTES).wrapping_mul(HASH8_PRIME);
     let idx = (prod >> (64u32 - hash_log)).truncate_to::<usize>();
-    let tag = ((prod >> 10).truncate_to::<u32>() & TAG_MASK) | TAG_NONZERO;
-    let low = (pos & MAX_WIN_MASK).truncate_to::<u32>();
-    (idx, tag | low)
+    let tag = (prod >> 39).truncate_to::<u32>() << 23;
+    (idx, low_nz | tag)
 }
 
 /// Single-multiply 7-byte hash returning `(table_index, tagged_entry)`.
+///
+/// Masks to the low 56 bits (`MASK_7BYTES`, a 1-cycle AArch64 logical immediate) and multiplies
+/// by `HASH8_PRIME` so all 7 input bytes avalanche into both the 14-bit bucket index (`50..64`)
+/// and the disjoint 9-bit tag (`39..48`).
 #[inline(always)]
 fn hash7_tagged(v: u64, pos: usize, hash_log: u32) -> (usize, u32) {
-    let prod = (v & MASK_7BYTES).wrapping_mul(HASH7_PRIME);
+    let prod = (v & MASK_7BYTES).wrapping_mul(HASH8_PRIME);
     let idx = (prod >> (64u32 - hash_log)).truncate_to::<usize>();
-    let tag = ((prod >> 10).truncate_to::<u32>() & TAG_MASK) | TAG_NONZERO;
-    let low = (pos & MAX_WIN_MASK).truncate_to::<u32>();
-    (idx, tag | low)
+    let tag = (prod >> 39).truncate_to::<u32>() << 23;
+    (idx, pos_low_nz(pos) | tag)
+}
+
+/// Single-multiply 8-byte hash returning `(table_index, tagged_entry)` (zero masking needed).
+#[inline(always)]
+fn hash8_tagged(v: u64, low_nz: u32, hash_log: u32) -> (usize, u32) {
+    let prod = v.wrapping_mul(HASH8_PRIME);
+    let idx = (prod >> (64u32 - hash_log)).truncate_to::<usize>();
+    let tag = (prod >> 39).truncate_to::<u32>() << 23;
+    (idx, low_nz | tag)
 }
 
 #[inline(always)]
@@ -109,20 +131,31 @@ unsafe fn match_len_ptr(mut a: *const u8, mut b: *const u8, b_end: *const u8) ->
     }
 }
 
+/// Zero-call 16/32-byte wildcopy helper for LZ77 literal runs inside leaf scanner kernels.
+///
+/// Emits a single 16-byte unaligned load/store for the common `len <= 16` case and loops 32 bytes
+/// per iteration as a pair of 16-byte unaligned `u128` loads/stores when `len > 16`, fusing into
+/// AArch64 `ldp q, q; stp q, q` while keeping `store_size (16) != stride (32)` so LLVM's
+/// `LoopIdiomRecognize` never lowers the loop to `bl memcpy` and preserves full leaf-function
+/// register allocation.
 #[inline(always)]
-unsafe fn copy_lits_wild_ptr(src: *const u8, dst: *mut u8, len: usize) {
-    // SAFETY: Caller guarantees `src..src + max(len, 16)` is readable and
-    // `dst..dst + len + 32` is writable spare capacity non-overlapping with `src`.
+unsafe fn copy_literals_wild16(src: *const u8, dst: *mut u8, len: usize) {
+    // SAFETY: Caller guarantees `src..src + len + 31` (and at least `src..src + 16`) is readable
+    // and `dst..dst + len + 31` (and at least `dst..dst + 16`) is writable spare capacity
+    // non-overlapping with `src`. When `len > 16`, every loop iteration has `off <= len - 1`, so
+    // the paired 16B accesses at `off` and `off + 16` reach at most `off + 32 <= len + 31`.
     unsafe {
         ptr::write_unaligned(dst.cast::<u128>(), ptr::read_unaligned(src.cast::<u128>()));
         if len > 16 {
             let mut off = 16usize;
             while off < len {
-                ptr::write_unaligned(
-                    dst.add(off).cast::<u128>(),
-                    ptr::read_unaligned(src.add(off).cast::<u128>()),
-                );
-                off += 16;
+                let s = src.add(off);
+                let d = dst.add(off);
+                let v0 = ptr::read_unaligned(s.cast::<u128>());
+                let v1 = ptr::read_unaligned(s.add(16).cast::<u128>());
+                ptr::write_unaligned(d.cast::<u128>(), v0);
+                ptr::write_unaligned(d.add(16).cast::<u128>(), v1);
+                off += 32;
             }
         }
     }
@@ -151,94 +184,90 @@ pub fn lz77_preload_fast(dict: &[u8], hash_table: &mut [u32; LZ77_FAST_HASH_SIZE
     }
 }
 
-/// Pre-populates `buckets` (`ht_short` 2-way `hash4` + `ht_long` `hash7`) from a raw-content
-/// dictionary prefix (`dict`) so subsequent [`lz77_scan_default`] calls over `[dict | input]`
-/// match into `dict` without re-hashing the dictionary per frame.
+/// Pre-populates `buckets` (`ht_long` 1-way `hash8` + `ht_short` 1-way `hash5`) from a
+/// raw-content dictionary prefix (`dict`) so subsequent [`lz77_scan_default`] calls over
+/// `[dict | input]` match into `dict` without re-hashing the dictionary per frame.
 pub fn lz77_preload_default(dict: &[u8], buckets: &mut [u64; LZ77_DEF_BUCKETS]) {
     buckets.fill(0);
     let Some(limit) = dict.len().checked_sub(8) else {
         return;
     };
     let base = dict.as_ptr();
-    let ht_short = buckets.as_mut_ptr();
-    // SAFETY: `LZ77_DEF_BUCKETS == DFAST_SHORT_U64S + DFAST_LONG_U64S`, `u64` align >= `u32`,
-    // `pos <= dict.len() - 8` gives 8 readable bytes, and `hl`/`bs` are bounded by table logs.
+    let ht_long = buckets.as_mut_ptr().cast::<u32>();
+    // SAFETY: `buckets` has `LZ77_DEF_BUCKETS = 65_536` `u64`s = `131_072` `u32`s with
+    // `u64` align >= `u32`; `ht_long` uses `65_536` `u32`s (`DFAST_LONG_LOG = 16`) and
+    // `ht_short` uses `65_536` `u32`s (`DFAST_SHORT_LOG = 16`), totaling
+    // `131_072 == LZ77_DEF_BUCKETS * 2` `u32`s. `pos <= dict.len() - 8` gives 8 readable bytes,
+    // and `hl`/`hs` are bounded by their respective table logs.
     unsafe {
-        let ht_long = ht_short.add(DFAST_SHORT_U64S).cast::<u32>();
+        let ht_short = ht_long.add(DFAST_LONG_U32S);
         let mut pos = 0usize;
         while pos <= limit {
             let v = read_u64_unaligned(base.add(pos));
-            let (hl, el) = hash7_tagged(v, pos, DFAST_LONG_LOG);
-            let (bs, es) = hash4_tagged(v, pos, DFAST_SHORT_LOG);
+            let low_nz = pos_low_nz(pos);
+            let (hl, el) = hash8_tagged(v, low_nz, DFAST_LONG_LOG);
+            let (hs, es) = hash5_tagged(v, low_nz, DFAST_SHORT_LOG);
             *ht_long.add(hl) = el;
-            let ps = *ht_short.add(bs);
-            *ht_short.add(bs) = (ps << 32) | u64::from(es);
+            *ht_short.add(hs) = es;
             pos += 1;
         }
     }
 }
 
-/// Fast 10-bit-tagged 7-byte-hash LZ77 block scanner (64 KiB L1D hash table, 512 KiB window,
-/// 2-position pipelined miss loop with stride `1 + ((pos - anchor) >> 6).min(7)`, backward match
-/// extension, `rep[0]`/`rep[1]` chain harvesting, zero inner-loop bounds checks).
+/// Zero-call leaf kernel for [`lz77_scan_fast`].
+///
+/// Keeping allocation (`try_reserve`) and trailing `copy_nonoverlapping` outside this function
+/// lets LLVM allocate all loop-carried state across caller-saved + callee-saved AArch64 GPRs
+/// without spilling across `bl memcpy`.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-pub fn lz77_scan_fast<A: Allocator>(
-    input: &[u8],
-    block_start: usize,
-    block_end: usize,
-    max_window: usize,
-    hash_table: &mut [u32; LZ77_FAST_HASH_SIZE],
+unsafe fn lz77_scan_fast_leaf(
+    base: *const u8,
+    start: usize,
+    end: usize,
+    win: usize,
+    ht: *mut u32,
     rep: &mut [usize; 3],
-    literals_out: &mut Vec<u8, A>,
-    seqs_out: &mut Vec<SeqOp, A>,
-) -> Result<(), AllocFailure> {
-    literals_out.clear();
-    seqs_out.clear();
-
-    let end = block_end.min(input.len());
-    let start = block_start.min(end);
-    let block_len = end - start;
-    if block_len == 0 {
-        return Ok(());
-    }
-
-    literals_out.try_reserve(block_len.saturating_add(32))?;
-    seqs_out.try_reserve(block_len / 3 + 32)?;
-
-    let base = input.as_ptr();
-    let ht = hash_table.as_mut_ptr();
-    let mut lit_dst = literals_out.as_mut_ptr();
-    let mut seq_dst = seqs_out.as_mut_ptr();
-
+    lit_start: *mut u8,
+    seq_start: *mut SeqOp,
+) -> (usize, usize, usize) {
+    let mut lit_dst = lit_start;
+    let mut seq_dst = seq_start;
     let mut pos = start.max(1);
     let mut lit_anchor = start;
-    let match_limit = end.saturating_sub(32);
-    let win = max_window.min(1 << 19).max(1);
+    let mut step_acc: usize = 1 << 6;
+    let match_limit = end.saturating_sub(33);
     let [mut r0, mut r1, mut r2] = *rep;
 
     // SAFETY:
-    // - Loop runs only while `1 <= pos <= match_limit = end - 32` (never when `end < 33`).
-    // - `step = 1 + ((pos - lit_anchor) >> 6).min(7)` satisfies `1 <= step <= 8`, so
-    //   `pos1 = pos + step <= end - 24`, giving >= 24 readable bytes at `pos` and `pos1`
-    //   (sufficient for 8-byte unaligned loads, `match_len_ptr` from `+ 8`, and 16-byte
-    //   wildcopy slack from `lit_anchor <= hit_pos <= end - 24`).
+    // - Caller guarantees `base..base + end` is readable (`start <= end <= isize::MAX`),
+    //   `ht` points to `LZ77_FAST_HASH_SIZE` `u32`s, `lit_start` has `(end - start) + 48`
+    //   writable bytes non-overlapping with `base`, and `seq_start` has `(end - start) / 3 + 32`
+    //   writable `SeqOp` slots.
+    // - Loop runs only while `1 <= pos < pos1 = pos + (step_acc >> 6) <= match_limit = end - 33`
+    //   (never when `end < 35`), giving >= 33 readable bytes at both `pos` and `pos1`
+    //   (sufficient for 8-byte unaligned loads, `match_len_ptr` from `+ 8`, and paired 32-byte
+    //   wildcopy slack `lit_anchor + lit_len + 31 = hit_pos + 31 <= end - 2 < end`).
+    // - `step_acc` starts at `64`, resets to `64` on match emit, and grows by <= 2 per >= 2
+    //   bytes advanced, so `step_acc <= 64 + end` and `pos + (step_acc >> 6)` cannot overflow.
     // - `hash7_tagged` indices are top `LZ77_FAST_HASH_LOG` bits, so `h0, h1 < LZ77_FAST_HASH_SIZE`.
     // - For validated candidates, `1 <= off <= hit_pos` and `off <= win`, so
-    //   `0 <= prev_pos < hit_pos <= end - 24` also has >= 24 readable bytes.
-    // - In the repeat harvester, `rp <= match_limit = end - 32` and `1 <= r <= rp`, keeping
+    //   `0 <= prev_pos < hit_pos <= end - 33` also has >= 33 readable bytes.
+    // - In the repeat harvester, `rp <= match_limit = end - 33` and `1 <= r <= rp`, keeping
     //   all reads strictly within `base..base + end`.
-    // - `lit_dst` writes at most `block_len` committed bytes (+ <= 16B wildcopy slack) within
-    //   `literals_out`'s reserved `block_len + 32` capacity.
-    // - Every emitted sequence consumes `match_len >= 4` input bytes, so at most `block_len / 4`
-    //   `SeqOp`s are written within `seqs_out`'s reserved `block_len / 3 + 32` capacity.
+    // - `lit_dst` writes at most `end - start` committed bytes (+ <= 31B paired wildcopy slack)
+    //   within `lit_start`'s `(end - start) + 48` reserved bytes.
+    // - Every emitted sequence consumes `match_len >= 4` input bytes, so at most `(end - start) / 4`
+    //   `SeqOp`s are written within `seq_start`'s `(end - start) / 3 + 32` reserved slots.
     unsafe {
         let b_end = base.add(end);
-        'scan: while pos <= match_limit {
-            let (mut hit_pos, cur8, prev_entry, next_miss_pos) = loop {
-                let step = 1usize + ((pos - lit_anchor) >> 6).min(7);
-                let pos1 = pos + step;
-
+        'scan: loop {
+            let mut step = step_acc >> 6;
+            let mut pos1 = pos + step;
+            if pos1 > match_limit {
+                break;
+            }
+            let (mut hit_pos, cur8, prev_entry, next_miss_pos, next_step_acc) = loop {
                 let c0 = read_u64_unaligned(base.add(pos));
                 let c1 = read_u64_unaligned(base.add(pos1));
                 let (h0, e0) = hash7_tagged(c0, pos, LZ77_FAST_HASH_LOG);
@@ -249,14 +278,17 @@ pub fn lz77_scan_fast<A: Allocator>(
 
                 *ht.add(h0) = e0;
                 if tag_matches(p0, e0) {
-                    break (pos, c0, p0, pos1);
+                    break (pos, c0, p0, pos1, step_acc + 1);
                 }
                 *ht.add(h1) = e1;
                 if tag_matches(p1, e1) {
-                    break (pos1, c1, p1, pos1 + step);
+                    break (pos1, c1, p1, pos1 + step, step_acc + 2);
                 }
                 pos = pos1 + step;
-                if pos > match_limit {
+                step_acc += 2;
+                step = step_acc >> 6;
+                pos1 = pos + step;
+                if pos1 > match_limit {
                     break 'scan;
                 }
             };
@@ -264,12 +296,14 @@ pub fn lz77_scan_fast<A: Allocator>(
             let off = offset_from_entry(hit_pos, prev_entry);
             if off == 0 || off > hit_pos || off > win {
                 pos = next_miss_pos;
+                step_acc = next_step_acc;
                 continue;
             }
             let mut prev_pos = hit_pos - off;
             let diff = cur8 ^ read_u64_unaligned(base.add(prev_pos));
             if diff.truncate_to::<u32>() != 0 {
                 pos = next_miss_pos;
+                step_acc = next_step_acc;
                 continue;
             }
 
@@ -279,7 +313,13 @@ pub fn lz77_scan_fast<A: Allocator>(
                 8 + match_len_ptr(base.add(prev_pos + 8), base.add(hit_pos + 8), b_end)
             };
 
-            while hit_pos > lit_anchor
+            // Preserve `lit_len >= 1` on `rep[0]` matches so `ov = 1` stays valid (RFC 8878 §3.1.1.5).
+            let back_floor = if off == r0 && hit_pos > lit_anchor {
+                lit_anchor + 1
+            } else {
+                lit_anchor
+            };
+            while hit_pos > back_floor
                 && prev_pos > 0
                 && *base.add(hit_pos - 1) == *base.add(prev_pos - 1)
             {
@@ -289,16 +329,41 @@ pub fn lz77_scan_fast<A: Allocator>(
             }
 
             let lit_len = hit_pos - lit_anchor;
-            let ov = if lit_len > 0 && off == r0 {
+            let ov = if lit_len > 0 {
+                if off == r0 {
+                    1u32
+                } else if off == r1 {
+                    let t = r0;
+                    r0 = r1;
+                    r1 = t;
+                    2u32
+                } else if off == r2 {
+                    let t = r2;
+                    r2 = r1;
+                    r1 = r0;
+                    r0 = t;
+                    3u32
+                } else {
+                    r2 = r1;
+                    r1 = r0;
+                    r0 = off;
+                    off.truncate_to::<u32>().wrapping_add(3)
+                }
+            } else if off == r1 {
+                let t = r0;
+                r0 = r1;
+                r1 = t;
                 1u32
-            } else if lit_len > 0 && off == r1 {
-                core::mem::swap(&mut r0, &mut r1);
-                2u32
-            } else if lit_len > 0 && off == r2 {
+            } else if off == r2 {
                 let t = r2;
                 r2 = r1;
                 r1 = r0;
                 r0 = t;
+                2u32
+            } else if r0 > 1 && off == r0 - 1 {
+                r2 = r1;
+                r1 = r0;
+                r0 = off;
                 3u32
             } else {
                 r2 = r1;
@@ -307,7 +372,7 @@ pub fn lz77_scan_fast<A: Allocator>(
                 off.truncate_to::<u32>().wrapping_add(3)
             };
 
-            copy_lits_wild_ptr(base.add(lit_anchor), lit_dst, lit_len);
+            copy_literals_wild16(base.add(lit_anchor), lit_dst, lit_len);
             lit_dst = lit_dst.add(lit_len);
             ptr::write(
                 seq_dst,
@@ -321,6 +386,7 @@ pub fn lz77_scan_fast<A: Allocator>(
 
             pos = hit_pos + ml;
             lit_anchor = pos;
+            step_acc = 1 << 6;
 
             if pos <= match_limit && pos >= 2 {
                 let tail8 = read_u64_unaligned(base.add(pos - 2));
@@ -355,7 +421,9 @@ pub fn lz77_scan_fast<A: Allocator>(
                     let d1 = read_u64_unaligned(base.add(rprev1))
                         ^ read_u64_unaligned(base.add(rp1));
                     if d1.truncate_to::<u32>() == 0 {
-                        core::mem::swap(&mut r0, &mut r1);
+                        let t = r0;
+                        r0 = r1;
+                        r1 = t;
                         rp = rp1;
                         rprev = rprev1;
                         rdiff = d1;
@@ -400,76 +468,597 @@ pub fn lz77_scan_fast<A: Allocator>(
             }
         }
 
-        let tail_len = end - lit_anchor;
-        if tail_len > 0 {
-            ptr::copy_nonoverlapping(base.add(lit_anchor), lit_dst, tail_len);
-            lit_dst = lit_dst.add(tail_len);
-        }
+        *rep = [r0, r1, r2];
+        (
+            lit_dst.offset_from_unsigned(lit_start),
+            seq_dst.offset_from_unsigned(seq_start),
+            lit_anchor,
+        )
+    }
+}
 
-        let new_lit_len = lit_dst.offset_from_unsigned(literals_out.as_mut_ptr());
-        literals_out.set_len(new_lit_len);
-        let new_seq_len = seq_dst.offset_from_unsigned(seqs_out.as_mut_ptr());
-        seqs_out.set_len(new_seq_len);
+/// Fast 10-bit-tagged 7-byte-hash LZ77 block scanner (64 KiB hash table, 512 KiB window,
+/// 2-position pipelined miss loop with unclamped `step_acc >> 6` recurrence, backward match
+/// extension, `rep[0]`/`rep[1]` chain harvesting, zero inner-loop bounds checks).
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn lz77_scan_fast<A: Allocator>(
+    input: &[u8],
+    block_start: usize,
+    block_end: usize,
+    max_window: usize,
+    hash_table: &mut [u32; LZ77_FAST_HASH_SIZE],
+    rep: &mut [usize; 3],
+    literals_out: &mut Vec<u8, A>,
+    seqs_out: &mut Vec<SeqOp, A>,
+) -> Result<(), AllocFailure> {
+    literals_out.clear();
+    seqs_out.clear();
+
+    let end = block_end.min(input.len());
+    let start = block_start.min(end);
+    let block_len = end - start;
+    if block_len == 0 {
+        return Ok(());
     }
 
-    *rep = [r0, r1, r2];
+    literals_out.try_reserve(block_len.saturating_add(48))?;
+    seqs_out.try_reserve(block_len / 3 + 32)?;
+
+    let base = input.as_ptr();
+    let ht = hash_table.as_mut_ptr();
+    let lit_start = literals_out.as_mut_ptr();
+    let seq_start = seqs_out.as_mut_ptr();
+    let win = max_window.min(1 << 19).max(1);
+
+    // SAFETY:
+    // - `start <= end <= input.len()`, so `base..base + end` is readable.
+    // - `ht` points to `LZ77_FAST_HASH_SIZE` mutable `u32`s.
+    // - `literals_out` and `seqs_out` were cleared and reserved for `block_len + 48` bytes and
+    //   `block_len / 3 + 32` `SeqOp`s, disjoint from `input`.
+    // - The leaf returns `lit_written <= lit_anchor - start <= block_len` and
+    //   `seq_written <= block_len / 4`, so `lit_written + (end - lit_anchor) <= block_len`
+    //   fits in `literals_out` and `seq_written` fits in `seqs_out`.
+    unsafe {
+        let (lit_written, seq_written, lit_anchor) =
+            lz77_scan_fast_leaf(base, start, end, win, ht, rep, lit_start, seq_start);
+
+        let tail_len = end - lit_anchor;
+        if tail_len > 0 {
+            ptr::copy_nonoverlapping(base.add(lit_anchor), lit_start.add(lit_written), tail_len);
+        }
+
+        literals_out.set_len(lit_written + tail_len);
+        seqs_out.set_len(seq_written);
+    }
+
     Ok(())
+}
+
+#[inline(always)]
+unsafe fn insert_dfast_short(base: *const u8, ht_short: *mut u32, pos: usize) {
+    // SAFETY: Caller guarantees `pos + 8 <= input.len()` and `ht_short` has
+    // `1 << DFAST_SHORT_LOG` entries.
+    unsafe {
+        let v = read_u64_unaligned(base.add(pos));
+        let (hs, es) = hash5_tagged(v, pos_low_nz(pos), DFAST_SHORT_LOG);
+        *ht_short.add(hs) = es;
+    }
 }
 
 #[inline(always)]
 unsafe fn insert_dfast_both(
     base: *const u8,
-    ht_short: *mut u64,
     ht_long: *mut u32,
+    ht_short: *mut u32,
     pos: usize,
 ) {
-    // SAFETY: Caller guarantees `pos + 8 <= input.len()`, `ht_short` has `DFAST_SHORT_U64S`
-    // entries, and `ht_long` has `1 << DFAST_LONG_LOG` entries.
+    // SAFETY: Caller guarantees `pos + 8 <= input.len()`, `ht_long` has `1 << DFAST_LONG_LOG`
+    // entries, and `ht_short` has `1 << DFAST_SHORT_LOG` entries.
     unsafe {
         let v = read_u64_unaligned(base.add(pos));
-        let (hl, el) = hash7_tagged(v, pos, DFAST_LONG_LOG);
-        let (bs, es) = hash4_tagged(v, pos, DFAST_SHORT_LOG);
+        let low_nz = pos_low_nz(pos);
+        let (hl, el) = hash8_tagged(v, low_nz, DFAST_LONG_LOG);
+        let (hs, es) = hash5_tagged(v, low_nz, DFAST_SHORT_LOG);
         *ht_long.add(hl) = el;
-        let pair = *ht_short.add(bs);
-        *ht_short.add(bs) = (pair << 32) | u64::from(es);
+        *ht_short.add(hs) = es;
     }
 }
 
-/// Validate one tagged Double-Fast match candidate `entry` at `hit_pos`, returning
-/// `(prev_pos, offset, diff)` on a valid >=4-byte (or >=5-byte when far) match, or `(0, 0, 0)`
-/// on miss (`offset == 0` unambiguously signals miss because valid offsets are `>= 1`).
-#[inline(always)]
-unsafe fn probe_match_cand(
+/// Zero-call leaf kernel for [`lz77_scan_default`].
+///
+/// Keeping allocation (`try_reserve`) and trailing `copy_nonoverlapping` outside this function
+/// lets LLVM allocate all loop-carried state across caller-saved + callee-saved AArch64 GPRs
+/// without spilling across `bl memcpy`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn lz77_scan_default_leaf(
     base: *const u8,
-    hit_pos: usize,
-    cur8: u64,
-    entry: u32,
+    start: usize,
+    end: usize,
     win: usize,
-    require_5_if_far: bool,
-) -> (usize, usize, u64) {
-    let off = offset_from_entry(hit_pos, entry);
-    if off == 0 || off > hit_pos || off > win {
-        return (0, 0, 0);
+    ht_long: *mut u32,
+    rep: &mut [usize; 3],
+    lit_start: *mut u8,
+    seq_start: *mut SeqOp,
+) -> (usize, usize, usize) {
+    let mut lit_dst = lit_start;
+    let mut seq_dst = seq_start;
+    let mut pos = start.max(1);
+    let mut lit_anchor = start;
+    let mut step_acc: usize = 1 << 6;
+    let match_limit = end.saturating_sub(33);
+    let [mut r0, mut r1, mut r2] = *rep;
+
+    // SAFETY:
+    // - Caller guarantees `base..base + end` is readable (`start <= end <= isize::MAX`),
+    //   `ht_long` points to `DFAST_LONG_U32S + (1 << DFAST_SHORT_LOG) = 131_072` `u32`s,
+    //   `lit_start` has `(end - start) + 48` writable bytes non-overlapping with `base`, and
+    //   `seq_start` has `(end - start) / 3 + 32` writable `SeqOp` slots.
+    // - Loop runs only while `1 <= pos < pos1 = pos + (step_acc >> 6) <= match_limit = end - 33`
+    //   (never when `end < 35`), giving >= 33 readable bytes at both `pos` and `pos1` (and thus
+    //   at `hit_pos`), and >= 32 readable bytes at lazy/rep `p1 = hit_pos + 1 <= end - 32`
+    //   (sufficient for 8-byte unaligned loads, `match_len_ptr` from `+ 8`, and paired 32-byte
+    //   wildcopy slack `lit_anchor + lit_len + 31 = m_pos + 31 <= end - 1 < end`).
+    // - `step_acc` starts at `64`, resets to `64` on match emit, and grows by <= 3 per >= 2
+    //   bytes advanced while `step_acc < 128` (at most 22 iterations, reaching <= 130) and
+    //   thereafter `step = step_acc >> 6 >= 2` so `step_acc` grows by <= 3 per >= 4 bytes (or 1
+    //   per >= 2 bytes on false positives). Hence `step_acc <= 130 + end`, `step <= 2 + (end >> 6)`,
+    //   and `pos + step` / `pos1 + step` stay `< 2 * end <= usize::MAX` (since `end <= isize::MAX`).
+    // - `hash8_tagged`/`hash5_tagged` indices are top `DFAST_LONG_LOG`/`DFAST_SHORT_LOG` bits,
+    //   so `hl0, hl1, hl < 1 << DFAST_LONG_LOG` and `hs0, hs1, hs < 1 << DFAST_SHORT_LOG`.
+    // - Whenever `rep[0]` is checked at `p1 = hit_pos + 1`, `1 <= r0 <= win && r0 <= p1`, so
+    //   `0 <= p1 - r0 <= hit_pos <= end - 33` has >= 33 readable bytes.
+    // - For validated candidates, `1 <= off <= hit_pos` (or `<= p1`) and `off <= win`, so
+    //   `0 <= prev < hit_pos <= end - 33` (or `0 <= prev1 < p1 <= end - 32`) also has >= 32
+    //   readable bytes.
+    // - Every `insert_dfast_*` call checks its target position `<= match_limit = end - 33`,
+    //   giving >= 33 readable bytes for `read_u64_unaligned`.
+    // - In the repeat harvester, `rp <= match_limit = end - 33` and `1 <= r <= rp`, keeping
+    //   all reads strictly within `base..base + end`.
+    // - `lit_dst` writes at most `end - start` committed bytes (+ <= 31B paired wildcopy slack)
+    //   within `lit_start`'s `(end - start) + 48` reserved bytes; `seq_dst` matches
+    //   `lz77_scan_fast_leaf`.
+    unsafe {
+        let ht_short = ht_long.add(DFAST_LONG_U32S);
+        let b_end = base.add(end);
+        'scan: loop {
+            let mut pos1 = pos + (step_acc >> 6);
+            if pos1 > match_limit {
+                break;
+            }
+            let (is_long, hit_pos, cur8, entry) = loop {
+                // Position 0: keep only 6 temporaries live so all loop state stays in GPRs
+                // with zero stack spills.
+                let cur8_0 = read_u64_unaligned(base.add(pos));
+                let low_nz0 = pos_low_nz(pos);
+                let (hl0, el0) = hash8_tagged(cur8_0, low_nz0, DFAST_LONG_LOG);
+                let (hs0, es0) = hash5_tagged(cur8_0, low_nz0, DFAST_SHORT_LOG);
+                let pl0 = *ht_long.add(hl0);
+                let ps0 = *ht_short.add(hs0);
+                *ht_long.add(hl0) = el0;
+                *ht_short.add(hs0) = es0;
+                if tag_matches(pl0, el0) {
+                    break (true, pos, cur8_0, pl0);
+                }
+                if tag_matches(ps0, es0) {
+                    break (false, pos, cur8_0, ps0);
+                }
+
+                // Position 1: all p0 temporaries are dead; the OOO core speculates past p0's
+                // rare-hit checks and overlaps p1's table loads with p0's automatically.
+                let cur8_1 = read_u64_unaligned(base.add(pos1));
+                let low_nz1 = pos_low_nz(pos1);
+                let (hl1, el1) = hash8_tagged(cur8_1, low_nz1, DFAST_LONG_LOG);
+                let (hs1, es1) = hash5_tagged(cur8_1, low_nz1, DFAST_SHORT_LOG);
+                let pl1 = *ht_long.add(hl1);
+                let ps1 = *ht_short.add(hs1);
+                *ht_long.add(hl1) = el1;
+                *ht_short.add(hs1) = es1;
+                if tag_matches(pl1, el1) {
+                    break (true, pos1, cur8_1, pl1);
+                }
+                if tag_matches(ps1, es1) {
+                    break (false, pos1, cur8_1, ps1);
+                }
+
+                pos = pos1 + (step_acc >> 6);
+                step_acc += 3;
+                pos1 = pos + (step_acc >> 6);
+                if pos1 > match_limit {
+                    break 'scan;
+                }
+            };
+
+            let mut m_pos = hit_pos;
+            let mut m_prev = 0usize;
+            let mut m_off = 0usize;
+            let mut m_ml = 0usize;
+
+            if is_long {
+                // 1. Long (`hash8`) hit at `hit_pos`: verify first.
+                let off = offset_from_entry(hit_pos, entry);
+                if off != 0 && off <= hit_pos && off <= win {
+                    let prev = hit_pos - off;
+                    let diff = cur8 ^ read_u64_unaligned(base.add(prev));
+                    if diff.truncate_to::<u32>() == 0 {
+                        m_prev = prev;
+                        m_off = off;
+                        m_ml = if diff != 0 {
+                            (diff.trailing_zeros() >> 3).widen_to::<usize>()
+                        } else {
+                            8 + match_len_ptr(base.add(prev + 8), base.add(hit_pos + 8), b_end)
+                        };
+                    }
+                }
+                if m_off == 0 {
+                    // Rare (~0.2%) 9-bit tag collision: advance without carrying `ps`/`es`.
+                    pos = hit_pos + (step_acc >> 6);
+                    step_acc += 1;
+                    continue 'scan;
+                }
+                // Short `ht_long` hit (`m_ml < 12`): probe `ht_long` at `hit_pos + 1` to catch
+                // longer matches starting 1 byte later, and check `rep[0]` only when `m_ml <= 9`
+                // so long matches skip a wasted random cache load.
+                if m_ml < 12 {
+                    let p1 = hit_pos + 1;
+                    let next8 = read_u64_unaligned(base.add(p1));
+                    let (hl1, el1) = hash8_tagged(next8, pos_low_nz(p1), DFAST_LONG_LOG);
+                    let pl1 = *ht_long.add(hl1);
+                    *ht_long.add(hl1) = el1;
+                    if tag_matches(pl1, el1) {
+                        let off1 = offset_from_entry(p1, pl1);
+                        if off1 != 0 && off1 <= p1 && off1 <= win {
+                            let prev1 = p1 - off1;
+                            let diff1 = next8 ^ read_u64_unaligned(base.add(prev1));
+                            if diff1.truncate_to::<u32>() == 0 {
+                                let ml1 = if diff1 != 0 {
+                                    (diff1.trailing_zeros() >> 3).widen_to::<usize>()
+                                } else {
+                                    8 + match_len_ptr(
+                                        base.add(prev1 + 8),
+                                        base.add(p1 + 8),
+                                        b_end,
+                                    )
+                                };
+                                if ml1 > m_ml + 1 || (ml1 > m_ml && off1 < (m_off >> 3)) {
+                                    m_pos = p1;
+                                    m_prev = prev1;
+                                    m_off = off1;
+                                    m_ml = ml1;
+                                }
+                            }
+                        }
+                    }
+                    if m_ml <= 9
+                        && r0 != 0
+                        && r0 <= win
+                        && r0 <= p1
+                        && (m_off != r0 || m_pos == lit_anchor)
+                        && read_u32_unaligned(base.add(p1 - r0)) == next8.truncate_to::<u32>()
+                    {
+                        let rprev = p1 - r0;
+                        let rdiff = next8 ^ read_u64_unaligned(base.add(rprev));
+                        let rml = if rdiff != 0 {
+                            (rdiff.trailing_zeros() >> 3).widen_to::<usize>()
+                        } else {
+                            8 + match_len_ptr(base.add(rprev + 8), base.add(p1 + 8), b_end)
+                        };
+                        if rml + 1 >= m_ml {
+                            m_pos = p1;
+                            m_prev = rprev;
+                            m_off = r0;
+                            m_ml = rml;
+                        }
+                    }
+                }
+            } else {
+                // 2. Short (`hash5`, minMatch = 5) hit + single `hit_pos + 1` lazy upgrade
+                //    (`ht_long` when `m_ml < 48`, `rep[0]` when `m_ml <= 7`, and `ht_short` when
+                //    `m_ml == 5`).
+                let off = offset_from_entry(hit_pos, entry);
+                if off != 0 && off <= hit_pos && off <= win {
+                    let prev = hit_pos - off;
+                    let diff = cur8 ^ read_u64_unaligned(base.add(prev));
+                    if (diff & MASK_5BYTES) == 0 {
+                        m_prev = prev;
+                        m_off = off;
+                        m_ml = if diff != 0 {
+                            (diff.trailing_zeros() >> 3).widen_to::<usize>()
+                        } else {
+                            8 + match_len_ptr(base.add(prev + 8), base.add(hit_pos + 8), b_end)
+                        };
+                    }
+                }
+                if m_off == 0 {
+                    // False-positive or <5-byte collision: check `rep[0]` at `hit_pos + 1`
+                    // before advancing as a miss.
+                    let p1 = hit_pos + 1;
+                    if r0 != 0
+                        && r0 <= win
+                        && r0 <= p1
+                        && read_u32_unaligned(base.add(p1 - r0))
+                            == (cur8 >> 8).truncate_to::<u32>()
+                    {
+                        let rprev = p1 - r0;
+                        let rdiff =
+                            read_u64_unaligned(base.add(p1)) ^ read_u64_unaligned(base.add(rprev));
+                        m_pos = p1;
+                        m_prev = rprev;
+                        m_off = r0;
+                        m_ml = if rdiff != 0 {
+                            (rdiff.trailing_zeros() >> 3).widen_to::<usize>()
+                        } else {
+                            8 + match_len_ptr(base.add(rprev + 8), base.add(p1 + 8), b_end)
+                        };
+                    } else {
+                        pos = hit_pos + (step_acc >> 6);
+                        step_acc += 1;
+                        continue 'scan;
+                    }
+                } else if m_ml < 48 {
+                    let p1 = hit_pos + 1;
+                    let next8 = read_u64_unaligned(base.add(p1));
+                    let (hl1, el1) = hash8_tagged(next8, pos_low_nz(p1), DFAST_LONG_LOG);
+                    let pl1 = *ht_long.add(hl1);
+                    *ht_long.add(hl1) = el1;
+
+                    let mut upgraded = false;
+                    if tag_matches(pl1, el1) {
+                        let off1 = offset_from_entry(p1, pl1);
+                        if off1 != 0 && off1 <= p1 && off1 <= win {
+                            let prev1 = p1 - off1;
+                            let diff1 = next8 ^ read_u64_unaligned(base.add(prev1));
+                            if diff1.truncate_to::<u32>() == 0 {
+                                let ml1 = if diff1 != 0 {
+                                    (diff1.trailing_zeros() >> 3).widen_to::<usize>()
+                                } else {
+                                    8 + match_len_ptr(
+                                        base.add(prev1 + 8),
+                                        base.add(p1 + 8),
+                                        b_end,
+                                    )
+                                };
+                                if ml1 > m_ml + 1 || (ml1 > m_ml && off1 < (m_off >> 3)) {
+                                    m_pos = p1;
+                                    m_prev = prev1;
+                                    m_off = off1;
+                                    m_ml = ml1;
+                                    upgraded = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if !upgraded
+                        && m_ml <= 7
+                        && r0 != 0
+                        && r0 <= win
+                        && r0 <= p1
+                        && m_off != r0
+                        && m_off != r1
+                        && m_off != r2
+                        && read_u32_unaligned(base.add(p1 - r0)) == next8.truncate_to::<u32>()
+                    {
+                        let rprev = p1 - r0;
+                        let rdiff = next8 ^ read_u64_unaligned(base.add(rprev));
+                        let rml = if rdiff != 0 {
+                            (rdiff.trailing_zeros() >> 3).widen_to::<usize>()
+                        } else {
+                            8 + match_len_ptr(base.add(rprev + 8), base.add(p1 + 8), b_end)
+                        };
+                        if rml + 1 >= m_ml {
+                            m_pos = p1;
+                            m_prev = rprev;
+                            m_off = r0;
+                            m_ml = rml;
+                            upgraded = true;
+                        }
+                    }
+
+                    if !upgraded && m_ml == 5 {
+                        let (hs1, es1) = hash5_tagged(next8, pos_low_nz(p1), DFAST_SHORT_LOG);
+                        let ps1 = *ht_short.add(hs1);
+                        *ht_short.add(hs1) = es1;
+                        if tag_matches(ps1, es1) {
+                            let off1 = offset_from_entry(p1, ps1);
+                            if off1 != 0 && off1 <= p1 && off1 <= win {
+                                let prev1 = p1 - off1;
+                                let diff1 = next8 ^ read_u64_unaligned(base.add(prev1));
+                                if (diff1 & MASK_5BYTES) == 0 {
+                                    let ml1 = if diff1 != 0 {
+                                        (diff1.trailing_zeros() >> 3).widen_to::<usize>()
+                                    } else {
+                                        8 + match_len_ptr(
+                                            base.add(prev1 + 8),
+                                            base.add(p1 + 8),
+                                            b_end,
+                                        )
+                                    };
+                                    if ml1 >= m_ml + 2 || (ml1 > m_ml && off1 < (m_off >> 3)) {
+                                        m_pos = p1;
+                                        m_prev = prev1;
+                                        m_off = off1;
+                                        m_ml = ml1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Preserve `lit_len >= 1` on `rep[0]` matches so `ov = 1` stays valid (RFC 8878 §3.1.1.5).
+            let back_floor = if m_off == r0 && m_pos > lit_anchor {
+                lit_anchor + 1
+            } else {
+                lit_anchor
+            };
+            while m_pos > back_floor
+                && m_prev > 0
+                && *base.add(m_pos - 1) == *base.add(m_prev - 1)
+            {
+                m_pos -= 1;
+                m_prev -= 1;
+                m_ml += 1;
+            }
+
+            let lit_len = m_pos - lit_anchor;
+            let ov = if lit_len > 0 {
+                if m_off == r0 {
+                    1u32
+                } else if m_off == r1 {
+                    let t = r0;
+                    r0 = r1;
+                    r1 = t;
+                    2u32
+                } else if m_off == r2 {
+                    let t = r2;
+                    r2 = r1;
+                    r1 = r0;
+                    r0 = t;
+                    3u32
+                } else {
+                    r2 = r1;
+                    r1 = r0;
+                    r0 = m_off;
+                    m_off.truncate_to::<u32>().wrapping_add(3)
+                }
+            } else if m_off == r1 {
+                let t = r0;
+                r0 = r1;
+                r1 = t;
+                1u32
+            } else if m_off == r2 {
+                let t = r2;
+                r2 = r1;
+                r1 = r0;
+                r0 = t;
+                2u32
+            } else if r0 > 1 && m_off == r0 - 1 {
+                r2 = r1;
+                r1 = r0;
+                r0 = m_off;
+                3u32
+            } else {
+                r2 = r1;
+                r1 = r0;
+                r0 = m_off;
+                m_off.truncate_to::<u32>().wrapping_add(3)
+            };
+
+            copy_literals_wild16(base.add(lit_anchor), lit_dst, lit_len);
+            lit_dst = lit_dst.add(lit_len);
+            ptr::write(
+                seq_dst,
+                SeqOp {
+                    lit_len: lit_len.truncate_to::<u32>(),
+                    match_len: m_ml.truncate_to::<u32>(),
+                    offset: ov,
+                },
+            );
+            seq_dst = seq_dst.add(1);
+
+            let match_start = m_pos;
+            pos = m_pos + m_ml;
+            lit_anchor = pos;
+            step_acc = 1 << 6;
+
+            // Populate tables inside the match (`ht_short` at `match_start + 1`, plus both
+            // tables at `match_start + 2` and `pos - 2`, matching C `zstd_double_fast`).
+            if match_start + 1 <= match_limit {
+                insert_dfast_short(base, ht_short, match_start + 1);
+            }
+            if m_ml >= 5 && match_start + 2 <= match_limit {
+                insert_dfast_both(base, ht_long, ht_short, match_start + 2);
+            }
+            if pos <= match_limit && pos >= 2 {
+                insert_dfast_both(base, ht_long, ht_short, pos - 2);
+            }
+
+            // Harvest zero-literal `rep[1]` ping-pong (at `pos`) and 1-literal `rep[0]` chains
+            // (at `pos + 1`).
+            loop {
+                let mut rp = 0usize;
+                let mut rprev = 0usize;
+                let mut rdiff = 0u64;
+                let mut r_lits = 0usize;
+                let mut r_ov = 0u32;
+
+                if pos <= match_limit && r1 != 0 && r1 <= pos && r1 <= win {
+                    let rprev0 = pos - r1;
+                    let d0 =
+                        read_u64_unaligned(base.add(rprev0)) ^ read_u64_unaligned(base.add(pos));
+                    if d0.truncate_to::<u32>() == 0 {
+                        let t = r0;
+                        r0 = r1;
+                        r1 = t;
+                        rp = pos;
+                        rprev = rprev0;
+                        rdiff = d0;
+                        r_lits = 0;
+                        r_ov = 1;
+                    }
+                }
+                if r_ov == 0 && pos + 1 <= match_limit && r0 != 0 && r0 <= pos + 1 && r0 <= win {
+                    let rp1 = pos + 1;
+                    let rprev1 = rp1 - r0;
+                    let d1 =
+                        read_u64_unaligned(base.add(rprev1)) ^ read_u64_unaligned(base.add(rp1));
+                    if d1.truncate_to::<u32>() == 0 {
+                        rp = rp1;
+                        rprev = rprev1;
+                        rdiff = d1;
+                        r_lits = 1;
+                        r_ov = 1;
+                    }
+                }
+                if r_ov == 0 {
+                    break;
+                }
+
+                let rml = if rdiff != 0 {
+                    (rdiff.trailing_zeros() >> 3).widen_to::<usize>()
+                } else {
+                    8 + match_len_ptr(base.add(rprev + 8), base.add(rp + 8), b_end)
+                };
+                if r_lits == 1 {
+                    *lit_dst = *base.add(pos);
+                    lit_dst = lit_dst.add(1);
+                }
+                ptr::write(
+                    seq_dst,
+                    SeqOp {
+                        lit_len: r_lits.truncate_to::<u32>(),
+                        match_len: rml.truncate_to::<u32>(),
+                        offset: r_ov,
+                    },
+                );
+                seq_dst = seq_dst.add(1);
+                pos = rp + rml;
+                lit_anchor = pos;
+                if pos <= match_limit && pos >= 2 {
+                    insert_dfast_both(base, ht_long, ht_short, pos - 2);
+                }
+            }
+        }
+
+        *rep = [r0, r1, r2];
+        (
+            lit_dst.offset_from_unsigned(lit_start),
+            seq_dst.offset_from_unsigned(seq_start),
+            lit_anchor,
+        )
     }
-    let prev_u = hit_pos - off;
-    // SAFETY: Caller guarantees `hit_pos + 8 <= input.len()` and `1 <= off <= hit_pos`,
-    // so `prev_u < hit_pos` also has >= 8 readable bytes.
-    let diff = cur8 ^ unsafe { read_u64_unaligned(base.add(prev_u)) };
-    let smask = if require_5_if_far && off >= 65_536 {
-        MASK_5BYTES
-    } else {
-        MASK_4BYTES
-    };
-    if (diff & smask) != 0 {
-        return (0, 0, 0);
-    }
-    (prev_u, off, diff)
 }
 
-/// Default hybrid 10-bit-tagged Double-Fast (`128K` `hash7` long table + `16K` 2-way SWAR `hash4`
-/// short table) LZ77 block scanner: 2-position pipelined miss loop with `kSearchStrength = 7`
-/// acceleration, long-match priority, `pos + 1` lazy override when `ml < 36`, repeat-offset chain
-/// harvesting, backward extension, zero inner-loop bounds checks.
+/// Default 1-way 10-bit-tagged Double-Fast (`64K` `hash8` long table = 256 KiB + `64K`
+/// `hash5` short table = 256 KiB, 2 MiB window) LZ77 block scanner: sequential 2-position
+/// unrolled miss loop with `step_acc >> 6`, short `ht_long` (`m_ml < 12`, `rep[0]` when
+/// `m_ml <= 9`) + `ht_short` `hit_pos + 1` lazy check (`ht_long` when `m_ml < 48`, `rep[0]`
+/// when `m_ml <= 7`, `ht_short` when `m_ml == 5`), backward extension, in-match table inserts
+/// (`ht_short` at `match_start + 1`, both tables at `match_start + 2` and `pos - 2`),
+/// zero-literal `rep[1]` + 1-literal `rep[0]` chain harvesting, zero inner-loop bounds checks.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 pub fn lz77_scan_default<A: Allocator>(
@@ -492,323 +1081,38 @@ pub fn lz77_scan_default<A: Allocator>(
         return Ok(());
     }
 
-    literals_out.try_reserve(block_len.saturating_add(32))?;
+    literals_out.try_reserve(block_len.saturating_add(48))?;
     seqs_out.try_reserve(block_len / 3 + 32)?;
 
     let base = input.as_ptr();
-    let ht_short = hash_table.as_mut_ptr();
-    // SAFETY: `LZ77_DEF_BUCKETS == DFAST_SHORT_U64S + DFAST_LONG_U64S`, `u64` align >= `u32`.
-    let ht_long = unsafe { ht_short.add(DFAST_SHORT_U64S).cast::<u32>() };
-
-    let mut lit_dst = literals_out.as_mut_ptr();
-    let mut seq_dst = seqs_out.as_mut_ptr();
-
-    let mut pos = start.max(1);
-    let mut lit_anchor = start;
-    let match_limit = end.saturating_sub(32);
+    let ht_long = hash_table.as_mut_ptr().cast::<u32>();
+    let lit_start = literals_out.as_mut_ptr();
+    let seq_start = seqs_out.as_mut_ptr();
     let win = max_window.min(1 << 21).max(1); // 2 MiB window (matches C zstd `-3`).
-    let [mut r0, mut r1, mut r2] = *rep;
 
     // SAFETY:
-    // - Loop runs only while `1 <= pos <= match_limit = end - 32` (never when `end < 33`).
-    // - `step = 1 + ((pos - lit_anchor) >> 7).min(5)` satisfies `1 <= step <= 6`, so
-    //   `pos1 = pos + step <= end - 26` and lazy `p1 = m_pos + 1 <= end - 25`, giving >= 25
-    //   readable bytes (sufficient for 8-byte loads, `match_len_ptr` from `+ 8`, and 16-byte
-    //   wildcopy slack from `lit_anchor <= m_pos <= end - 25`).
-    // - `hash7_tagged`/`hash4_tagged` indices are bounded by `DFAST_LONG_LOG`/`DFAST_SHORT_LOG`.
-    // - Output buffer capacities match `lz77_scan_fast`.
+    // - `start <= end <= input.len()`, so `base..base + end` is readable.
+    // - `hash_table` has `LZ77_DEF_BUCKETS = 65_536` `u64`s = `131_072` `u32`s with `u64`
+    //   align >= `u32`; `ht_long` covers `DFAST_LONG_U32S = 65_536` `u32`s and `ht_short`
+    //   covers `1 << DFAST_SHORT_LOG = 65_536` `u32`s (`131_072 == LZ77_DEF_BUCKETS * 2`).
+    // - `literals_out` and `seqs_out` were cleared and reserved for `block_len + 48` bytes and
+    //   `block_len / 3 + 32` `SeqOp`s, disjoint from `input`.
+    // - The leaf returns `lit_written <= lit_anchor - start <= block_len` and
+    //   `seq_written <= block_len / 4`, so `lit_written + (end - lit_anchor) <= block_len`
+    //   fits in `literals_out` and `seq_written` fits in `seqs_out`.
     unsafe {
-        let b_end = base.add(end);
-        'scan: while pos <= match_limit {
-            // 2-position pipelined probe of `ht_long` (`hash7`) + 2-way `ht_short` (`hash4`):
-            // overlaps L2 + L1D table loads across `pos` and `pos1` on misses.
-            let (hit_pos, cur8, pl, el, pair_s, x_short, next_miss_pos) = loop {
-                let step = 1usize + ((pos - lit_anchor) >> 7).min(5);
-                let pos1 = pos + step;
-
-                let c0 = read_u64_unaligned(base.add(pos));
-                let c1 = read_u64_unaligned(base.add(pos1));
-                let (hl0, el0) = hash7_tagged(c0, pos, DFAST_LONG_LOG);
-                let (bs0, es0) = hash4_tagged(c0, pos, DFAST_SHORT_LOG);
-                let (hl1, el1) = hash7_tagged(c1, pos1, DFAST_LONG_LOG);
-                let (bs1, es1) = hash4_tagged(c1, pos1, DFAST_SHORT_LOG);
-
-                let pl0 = *ht_long.add(hl0);
-                let ps0 = *ht_short.add(bs0);
-                let pl1 = *ht_long.add(hl1);
-                let ps1 = *ht_short.add(bs1);
-
-                let es0_u64 = u64::from(es0);
-                *ht_long.add(hl0) = el0;
-                *ht_short.add(bs0) = (ps0 << 32) | es0_u64;
-
-                let tp0 = (es0_u64 << 32) | es0_u64;
-                let x0 = (ps0 ^ tp0) & TAG_PAIR_MASK;
-                if tag_matches(pl0, el0)
-                    | (x0.truncate_to::<u32>() == 0)
-                    | ((x0 >> 32) == 0)
-                {
-                    break (pos, c0, pl0, el0, ps0, x0, pos1);
-                }
-
-                let es1_u64 = u64::from(es1);
-                *ht_long.add(hl1) = el1;
-                *ht_short.add(bs1) = (ps1 << 32) | es1_u64;
-
-                let after2 = pos1 + step;
-                let tp1 = (es1_u64 << 32) | es1_u64;
-                let x1 = (ps1 ^ tp1) & TAG_PAIR_MASK;
-                if tag_matches(pl1, el1)
-                    | (x1.truncate_to::<u32>() == 0)
-                    | ((x1 >> 32) == 0)
-                {
-                    break (pos1, c1, pl1, el1, ps1, x1, after2);
-                }
-
-                pos = after2;
-                if pos > match_limit {
-                    break 'scan;
-                }
-            };
-
-            let mut m_prev = 0usize;
-            let mut m_off = 0usize;
-            let mut m_diff = 0u64;
-
-            if tag_matches(pl, el) {
-                (m_prev, m_off, m_diff) =
-                    probe_match_cand(base, hit_pos, cur8, pl, win, false);
-            }
-            if m_off == 0 && x_short.truncate_to::<u32>() == 0 {
-                (m_prev, m_off, m_diff) = probe_match_cand(
-                    base,
-                    hit_pos,
-                    cur8,
-                    pair_s.truncate_to::<u32>(),
-                    win,
-                    true,
-                );
-            }
-            if m_off == 0 && (x_short >> 32) == 0 {
-                (m_prev, m_off, m_diff) = probe_match_cand(
-                    base,
-                    hit_pos,
-                    cur8,
-                    (pair_s >> 32).truncate_to::<u32>(),
-                    win,
-                    true,
-                );
-            }
-
-            if m_off == 0 {
-                pos = next_miss_pos;
-                continue;
-            }
-
-            let mut m_pos = hit_pos;
-            let mut m_ml = if m_diff != 0 {
-                (m_diff.trailing_zeros() >> 3).widen_to::<usize>()
-            } else {
-                8 + match_len_ptr(base.add(m_prev + 8), base.add(hit_pos + 8), b_end)
-            };
-
-            // Double-Fast `m_pos + 1` lazy override: check `ht_long` when `m_ml < 36`,
-            // and `ht_short` (2-way tagged) when `m_ml < 12` to beat C zstd `-3` ratio.
-            if m_ml < 36 {
-                let p1 = m_pos + 1;
-                let next8 = read_u64_unaligned(base.add(p1));
-                let (hl1, el1) = hash7_tagged(next8, p1, DFAST_LONG_LOG);
-                let pl1 = *ht_long.add(hl1);
-                *ht_long.add(hl1) = el1;
-
-                let mut l_prev = 0usize;
-                let mut l_off = 0usize;
-                let mut l_diff = 0u64;
-                let mut l_need_plus = 0usize;
-
-                if tag_matches(pl1, el1) {
-                    (l_prev, l_off, l_diff) =
-                        probe_match_cand(base, p1, next8, pl1, win, false);
-                }
-                if l_off == 0 && m_ml < 12 {
-                    let (bs1, es1) = hash4_tagged(next8, p1, DFAST_SHORT_LOG);
-                    let ps1 = *ht_short.add(bs1);
-                    let es1_u64 = u64::from(es1);
-                    *ht_short.add(bs1) = (ps1 << 32) | es1_u64;
-                    let tp1 = (es1_u64 << 32) | es1_u64;
-                    let x1 = (ps1 ^ tp1) & TAG_PAIR_MASK;
-                    if x1.truncate_to::<u32>() == 0 {
-                        (l_prev, l_off, l_diff) = probe_match_cand(
-                            base,
-                            p1,
-                            next8,
-                            ps1.truncate_to::<u32>(),
-                            win,
-                            true,
-                        );
-                    }
-                    if l_off == 0 && (x1 >> 32) == 0 {
-                        (l_prev, l_off, l_diff) = probe_match_cand(
-                            base,
-                            p1,
-                            next8,
-                            (ps1 >> 32).truncate_to::<u32>(),
-                            win,
-                            true,
-                        );
-                    }
-                    l_need_plus = 1;
-                }
-                if l_off != 0 {
-                    let ml1 = if l_diff != 0 {
-                        (l_diff.trailing_zeros() >> 3).widen_to::<usize>()
-                    } else {
-                        8 + match_len_ptr(base.add(l_prev + 8), base.add(p1 + 8), b_end)
-                    };
-                    if ml1 > m_ml + l_need_plus {
-                        m_pos = p1;
-                        m_prev = l_prev;
-                        m_off = l_off;
-                        m_ml = ml1;
-                    }
-                }
-            }
-
-            pos = m_pos;
-            let mut prev_u = m_prev;
-            while pos > lit_anchor
-                && prev_u > 0
-                && *base.add(pos - 1) == *base.add(prev_u - 1)
-            {
-                pos -= 1;
-                prev_u -= 1;
-                m_ml += 1;
-            }
-
-            let lit_len = pos - lit_anchor;
-            let ov = if lit_len > 0 && m_off == r0 {
-                1u32
-            } else if lit_len > 0 && m_off == r1 {
-                core::mem::swap(&mut r0, &mut r1);
-                2u32
-            } else if lit_len > 0 && m_off == r2 {
-                let t = r2;
-                r2 = r1;
-                r1 = r0;
-                r0 = t;
-                3u32
-            } else {
-                r2 = r1;
-                r1 = r0;
-                r0 = m_off;
-                m_off.truncate_to::<u32>().wrapping_add(3)
-            };
-
-            copy_lits_wild_ptr(base.add(lit_anchor), lit_dst, lit_len);
-            lit_dst = lit_dst.add(lit_len);
-            ptr::write(
-                seq_dst,
-                SeqOp {
-                    lit_len: lit_len.truncate_to::<u32>(),
-                    match_len: m_ml.truncate_to::<u32>(),
-                    offset: ov,
-                },
-            );
-            seq_dst = seq_dst.add(1);
-
-            let match_start = m_pos;
-            pos += m_ml;
-            lit_anchor = pos;
-            if match_start + 2 < pos && match_start + 2 <= match_limit {
-                insert_dfast_both(base, ht_short, ht_long, match_start + 2);
-            }
-            if pos <= match_limit && pos >= 2 {
-                insert_dfast_both(base, ht_short, ht_long, pos - 2);
-            }
-
-            // Harvest `rep[0]` (at `pos + 1`) and `rep[1]` (at `pos + 2`) chains.
-            loop {
-                let mut rp = 0usize;
-                let mut rprev = 0usize;
-                let mut rdiff = 0u64;
-                let mut r_lits = 0usize;
-                let mut r_ov = 0u32;
-
-                if pos + 1 <= match_limit && r0 != 0 && r0 <= pos + 1 && r0 <= win {
-                    let rp0 = pos + 1;
-                    let rprev0 = rp0 - r0;
-                    let d0 = read_u64_unaligned(base.add(rprev0))
-                        ^ read_u64_unaligned(base.add(rp0));
-                    if d0.truncate_to::<u32>() == 0 {
-                        rp = rp0;
-                        rprev = rprev0;
-                        rdiff = d0;
-                        r_lits = 1;
-                        r_ov = 1;
-                    }
-                }
-                if r_lits == 0 && pos + 2 <= match_limit && r1 != 0 && r1 <= pos + 2 && r1 <= win {
-                    let rp1 = pos + 2;
-                    let rprev1 = rp1 - r1;
-                    let d1 = read_u64_unaligned(base.add(rprev1))
-                        ^ read_u64_unaligned(base.add(rp1));
-                    if d1.truncate_to::<u32>() == 0 {
-                        core::mem::swap(&mut r0, &mut r1);
-                        rp = rp1;
-                        rprev = rprev1;
-                        rdiff = d1;
-                        r_lits = 2;
-                        r_ov = 2;
-                    }
-                }
-                if r_lits == 0 {
-                    break;
-                }
-
-                let rml = if rdiff != 0 {
-                    (rdiff.trailing_zeros() >> 3).widen_to::<usize>()
-                } else {
-                    8 + match_len_ptr(base.add(rprev + 8), base.add(rp + 8), b_end)
-                };
-                if r_lits == 1 {
-                    *lit_dst = *base.add(pos);
-                } else {
-                    ptr::write_unaligned(
-                        lit_dst.cast::<u16>(),
-                        ptr::read_unaligned(base.add(pos).cast::<u16>()),
-                    );
-                }
-                lit_dst = lit_dst.add(r_lits);
-                ptr::write(
-                    seq_dst,
-                    SeqOp {
-                        lit_len: r_lits.truncate_to::<u32>(),
-                        match_len: rml.truncate_to::<u32>(),
-                        offset: r_ov,
-                    },
-                );
-                seq_dst = seq_dst.add(1);
-                pos = rp + rml;
-                lit_anchor = pos;
-                if pos <= match_limit && pos >= 2 {
-                    insert_dfast_both(base, ht_short, ht_long, pos - 2);
-                }
-            }
-        }
+        let (lit_written, seq_written, lit_anchor) =
+            lz77_scan_default_leaf(base, start, end, win, ht_long, rep, lit_start, seq_start);
 
         let tail_len = end - lit_anchor;
         if tail_len > 0 {
-            ptr::copy_nonoverlapping(base.add(lit_anchor), lit_dst, tail_len);
-            lit_dst = lit_dst.add(tail_len);
+            ptr::copy_nonoverlapping(base.add(lit_anchor), lit_start.add(lit_written), tail_len);
         }
 
-        let new_lit_len = lit_dst.offset_from_unsigned(literals_out.as_mut_ptr());
-        literals_out.set_len(new_lit_len);
-        let new_seq_len = seq_dst.offset_from_unsigned(seqs_out.as_mut_ptr());
-        seqs_out.set_len(new_seq_len);
+        literals_out.set_len(lit_written + tail_len);
+        seqs_out.set_len(seq_written);
     }
 
-    *rep = [r0, r1, r2];
     Ok(())
 }
 
@@ -988,43 +1292,66 @@ pub fn huff_encode_stream_checked_raw<A: Allocator>(
     Ok(true)
 }
 
-/// Packed FSE encoder table view for [`fse_pack_sequences_fast`].
+/// Single-base-pointer packed FSE sequence encoder tables for [`fse_pack_sequences_fast`].
 ///
-/// Each `meta[sym]` packs `offset | (count << 16) | (split << 32) | (max_nb << 48)` as `u64`.
-#[derive(Clone, Copy)]
-pub struct FsePackTable<'a> {
-    pub state_table: &'a [u8; 256],
-    pub meta: &'a [u64; 64],
-    pub table_size: u16,
-    pub accuracy_log: u8,
+/// Consolidating all three `sym_tt` (`delta_nb_bits | (delta_find_state << 32)`) and
+/// `+table_size`-biased `state_table` arrays into one 3 KiB struct frees 5 GPRs inside the
+/// reverse sequence packing loop so zero table pointers spill on AArch64.
+#[repr(C)]
+pub struct FseSeqEncTables {
+    pub ll_tt: [u64; 64],
+    pub of_tt: [u64; 64],
+    pub ml_tt: [u64; 64],
+    pub ll_st: [u16; 256],
+    pub of_st: [u16; 256],
+    pub ml_st: [u16; 256],
+    pub ll_table_size: u16,
+    pub of_table_size: u16,
+    pub ml_table_size: u16,
+    pub ll_log: u8,
+    pub of_log: u8,
+    pub ml_log: u8,
+}
+
+impl FseSeqEncTables {
+    #[inline(always)]
+    #[must_use]
+    pub const fn new_zeroed() -> Self {
+        Self {
+            ll_tt: [0u64; 64],
+            of_tt: [0u64; 64],
+            ml_tt: [0u64; 64],
+            ll_st: [0u16; 256],
+            of_st: [0u16; 256],
+            ml_st: [0u16; 256],
+            ll_table_size: 0,
+            of_table_size: 0,
+            ml_table_size: 0,
+            ll_log: 0,
+            of_log: 0,
+            ml_log: 0,
+        }
+    }
 }
 
 #[inline(always)]
 unsafe fn fse_step_raw(
-    meta: *const u64,
-    state_table: *const u8,
-    table_size: u32,
+    sym_tt: *const u64,
+    state_table: *const u16,
     sym: u8,
-    target_state: u8,
-) -> (u8, u32, u32) {
-    // SAFETY: Caller guarantees `meta` points to 64 `u64`s and `state_table` points to 256 `u8`s;
+    state: u32,
+) -> (u32, u32, u32) {
+    // SAFETY: Caller guarantees `sym_tt` points to 64 `u64`s and `state_table` points to 256 `u16`s;
     // `sym & 63 < 64` and `idx & 255 < 256`.
     unsafe {
-        let m = *meta.add(usize::from(sym) & 63);
-        let offset = (m & 0xFFFF).truncate_to::<usize>();
-        let count = ((m >> 16) & 0xFFFF).truncate_to::<usize>();
-        let split = ((m >> 32) & 0xFFFF).truncate_to::<u32>();
-        let max_nb = ((m >> 48) & 0xFF).truncate_to::<u32>();
-        let target = u32::from(target_state);
-        let nb = max_nb.wrapping_sub(u32::from(target < split));
-        let bits = target & ((1u32 << nb) - 1);
-        let u = (target + table_size) >> nb;
-        let idx = offset
-            .wrapping_add(u.widen_to::<usize>())
-            .wrapping_sub(count)
-            & 255;
-        let prev = *state_table.add(idx);
-        (prev, bits, nb)
+        let packed = *sym_tt.add(usize::from(sym) & 63);
+        let delta_nb_bits = packed.truncate_to::<u32>();
+        let delta_find_state = (packed >> 32).truncate_to::<u32>();
+        let nb = state.wrapping_add(delta_nb_bits) >> 16;
+        let bits = state & ((1u32 << nb).wrapping_sub(1));
+        let idx = (state >> nb).wrapping_add(delta_find_state) & 255;
+        let next = u32::from(*state_table.add(idx.widen_to::<usize>()));
+        (next, bits, nb)
     }
 }
 
@@ -1060,12 +1387,10 @@ pub fn fse_pack_sequences_fast<A: Allocator>(
     raw_seqs: &[SeqOp],
     ll_lut: &[u32; 64],
     ml_lut: &[u32; 128],
-    ll_tbl: FsePackTable<'_>,
-    of_tbl: FsePackTable<'_>,
-    ml_tbl: FsePackTable<'_>,
-    init_ll: u8,
-    init_of: u8,
-    init_ml: u8,
+    tables: &FseSeqEncTables,
+    init_ll: u32,
+    init_of: u32,
+    init_ml: u32,
     last_ll_extra: u32,
     last_ll_bits: u32,
     last_ml_extra: u32,
@@ -1085,16 +1410,7 @@ pub fn fse_pack_sequences_fast<A: Allocator>(
     let ll_lut_ptr = ll_lut.as_ptr();
     let ml_lut_ptr = ml_lut.as_ptr();
     let seq_ptr = raw_seqs.as_ptr();
-
-    let ll_meta = ll_tbl.meta.as_ptr();
-    let ll_st = ll_tbl.state_table.as_ptr();
-    let ll_ts = u32::from(ll_tbl.table_size);
-    let of_meta = of_tbl.meta.as_ptr();
-    let of_st = of_tbl.state_table.as_ptr();
-    let of_ts = u32::from(of_tbl.table_size);
-    let ml_meta = ml_tbl.meta.as_ptr();
-    let ml_st = ml_tbl.state_table.as_ptr();
-    let ml_ts = u32::from(ml_tbl.table_size);
+    let t: *const FseSeqEncTables = tables;
 
     let mut ll_state = init_ll;
     let mut of_state = init_of;
@@ -1106,7 +1422,8 @@ pub fn fse_pack_sequences_fast<A: Allocator>(
     // SAFETY:
     // - `comp_buf` has `n * 11 + 48` reserved bytes (each sequence emits <= 11 bytes + 8B wild write).
     // - `seq_ptr` is walked backwards over `0..n - 1`.
-    // - `ll_meta`/`of_meta`/`ml_meta` point to `[u64; 64]` and `ll_st`/`of_st`/`ml_st` to `[u8; 256]`.
+    // - `t` points to `tables: &FseSeqEncTables`, valid and immutable for the entire call; each
+    //   `*_tt` has 64 `u64`s and each `*_st` has 256 `u16`s.
     unsafe {
         let mut out_ptr = comp_buf.as_mut_ptr().add(start_len);
 
@@ -1130,19 +1447,22 @@ pub fn fse_pack_sequences_fast<A: Allocator>(
         let mut i = n - 1;
         while i > 0 {
             i -= 1;
-            let raw = *seq_ptr.add(i);
-            let (ll_code, ll_extra, ll_b) = encode_ll_lut_raw(raw.lit_len, ll_lut_ptr);
-            let (ml_code, ml_extra, ml_b) = encode_ml_lut_raw(raw.match_len, ml_lut_ptr);
-            let of_b = 31u32 - raw.offset.max(1).leading_zeros();
+            let sp = seq_ptr.add(i);
+            let ll_len = (*sp).lit_len;
+            let ml_len = (*sp).match_len;
+            let off = (*sp).offset;
+            let (ll_code, ll_extra, ll_b) = encode_ll_lut_raw(ll_len, ll_lut_ptr);
+            let (ml_code, ml_extra, ml_b) = encode_ml_lut_raw(ml_len, ml_lut_ptr);
+            let of_b = 31u32 - off.max(1).leading_zeros();
             let of_code = of_b.truncate_to::<u8>();
-            let of_extra = raw.offset - (1u32 << of_b);
+            let of_extra = off.wrapping_sub(1u32 << of_b);
 
             let (next_of, of_st_bits, of_st_nb) =
-                fse_step_raw(of_meta, of_st, of_ts, of_code, of_state);
+                fse_step_raw((*t).of_tt.as_ptr(), (*t).of_st.as_ptr(), of_code, of_state);
             let (next_ml, ml_st_bits, ml_st_nb) =
-                fse_step_raw(ml_meta, ml_st, ml_ts, ml_code, ml_state);
+                fse_step_raw((*t).ml_tt.as_ptr(), (*t).ml_st.as_ptr(), ml_code, ml_state);
             let (next_ll, ll_st_bits, ll_st_nb) =
-                fse_step_raw(ll_meta, ll_st, ll_ts, ll_code, ll_state);
+                fse_step_raw((*t).ll_tt.as_ptr(), (*t).ll_st.as_ptr(), ll_code, ll_state);
             of_state = next_of;
             ml_state = next_ml;
             ll_state = next_ll;
@@ -1171,12 +1491,15 @@ pub fn fse_pack_sequences_fast<A: Allocator>(
             bits &= 7;
         }
 
-        buf |= u64::from(ml_state) << bits;
-        bits += u32::from(ml_tbl.accuracy_log);
-        buf |= u64::from(of_state) << bits;
-        bits += u32::from(of_tbl.accuracy_log);
-        buf |= u64::from(ll_state) << bits;
-        bits += u32::from(ll_tbl.accuracy_log);
+        let ml_final = ml_state.wrapping_sub(u32::from((*t).ml_table_size));
+        let of_final = of_state.wrapping_sub(u32::from((*t).of_table_size));
+        let ll_final = ll_state.wrapping_sub(u32::from((*t).ll_table_size));
+        buf |= u64::from(ml_final) << bits;
+        bits += u32::from((*t).ml_log);
+        buf |= u64::from(of_final) << bits;
+        bits += u32::from((*t).of_log);
+        buf |= u64::from(ll_final) << bits;
+        bits += u32::from((*t).ll_log);
         ptr::write_unaligned(out_ptr.cast::<u64>(), buf.to_le());
         out_ptr = out_ptr.add((bits >> 3).widen_to::<usize>());
         buf >>= bits & !7u32;

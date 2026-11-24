@@ -273,6 +273,13 @@ impl<T, const N: usize> Pow2Array<T, N> {
         }
     }
 
+    /// View the underlying table as a fixed-size array `&[T; N]`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn as_array(&self) -> &[T; N] {
+        &self.0
+    }
+
     /// View the underlying table as a slice of length `N`.
     #[inline(always)]
     #[must_use]
@@ -343,6 +350,13 @@ impl<T, const N: usize> FixedTable<T, N> {
         unsafe {
             *self.0.as_mut_ptr().add(idx.get()) = value;
         }
+    }
+
+    /// View the underlying table as a fixed-size array `&[T; N]`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn as_array(&self) -> &[T; N] {
+        &self.0
     }
 
     /// View the underlying table as a slice of length `N`.
