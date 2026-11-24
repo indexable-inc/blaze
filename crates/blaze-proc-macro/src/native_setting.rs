@@ -63,7 +63,7 @@ impl OwnedNativeSetting<'_> {
     /// The setting `script_unit::Setting::native` takes, with the command's jobserver `jobs`
     /// (`crate::jobserver::Jobserver::new`, its fifo under `work`).
     pub fn setting<'s>(&'s self, jobs: &'s crate::jobserver::Jobserver) -> NativeSetting<'s> {
-        NativeSetting { shelf: self.shelf.as_str(), sdk: self.sdk.as_str(), work: self.work.as_str(), deadline: self.deadline, jobs }
+        NativeSetting { shelf: self.shelf.as_str(), sdk: self.sdk.as_str(), work: self.work.as_str(), deadline: self.deadline, jobs, shim: None }
     }
 }
 
@@ -121,7 +121,7 @@ impl<'a> NativeRun<'a> {
 
     /// The setting `script_unit::Setting::native` takes.
     pub fn setting(&self) -> NativeSetting<'_> {
-        self.owned.setting(&self.jobs)
+        NativeSetting { shim: Some(self.shim.as_str()), ..self.owned.setting(&self.jobs) }
     }
 
     /// The jobserver ended: its descriptor closed, its fifo removed.

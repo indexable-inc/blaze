@@ -591,6 +591,10 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     /// declaring expression (and not re-initialized since), so subsequent drops and `.await`s
     /// know it is definitely uninitialized without reading its drop flag.
     definitely_uninit: blaze_own::Vec<bool, A>,
+    /// Per pattern: remaining unwalked `Expr::Local(p)` occurrences in `body.exprs` (from
+    /// `scan_flags`, decremented as `place_of` / `raw` visits them), so `end_moved_locals_before_await`
+    /// only ends a non-dropping binding proven both unsaved by `blaze-flow` and never read later.
+    uses_left: blaze_own::Vec<u32, A>,
     /// What needs drop, in declaration order, of every open drop scope.
     scope_pats: Vec<Held, A>,
     /// Per open drop scope (a fn's parameters first, then each block): where its bindings
@@ -922,6 +926,11 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             du.resize(body.pats.len(), false);
             du
         },
+        uses_left: {
+            let mut ul = blaze_own::Vec::with_capacity_in(body.pats.len(), alloc);
+            ul.resize(body.pats.len(), 0);
+            ul
+        },
         scope_pats: Vec::new_in(alloc),
         scope_marks: Vec::new_in(alloc),
         moves: moves::Moves::new_in(alloc),
@@ -1203,7 +1212,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// The layout of an enum variant `variant` of enum layout `l`: its fields' range of
     /// `layout_fields`, and the enum's layout in `ls` (whose `tag_write` makes the variant). A
     /// struct or tuple is its own variant 0, with no tag.
-    fn variant_rows(&self, l: u32, variant: u32) -> Result<(u32, u32, Option<LayoutId>), BuildError> {
+    pub(super) fn variant_rows(&self, l: u32, variant: u32) -> Result<(u32, u32, Option<LayoutId>), BuildError> {
         match self.layouts[l as usize].shape {
             Shape::Fields { first, len } if variant == 0 => Ok((first, len, None)),
             Shape::Enum { id, first, len } if variant < len => {
@@ -1258,7 +1267,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// Makes variant `variant` of the enum of layout `id` at `at`: stores what `ls.tag_write`
     /// says (nothing for a struct, an enum of one present variant, or a niche encoding's
     /// untagged variant, whose own fields hold valid values there).
-    fn write_tag(&mut self, id: Option<LayoutId>, variant: u32, at: (Value, i32)) {
+    pub(super) fn write_tag(&mut self, id: Option<LayoutId>, variant: u32, at: (Value, i32)) {
         let Some(w) = id.and_then(|id| self.ls.tag_write(id, variant)) else { return };
         let v = match w.scalar.prim {
             // A pointer niche: null, or an address that is no allocation's.
@@ -1664,7 +1673,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     }
 
     /// The rows of `e`'s adjustments: `start..end` of the record's `adjusts`.
-    fn adjust_rows(&self, e: ExprId) -> core::ops::Range<usize> {
+    pub(super) fn adjust_rows(&self, e: ExprId) -> core::ops::Range<usize> {
         let col = self.checked.adjusts.column::<0>();
         let start = col.partition_point(|&x| x < e);
         let len = col[start..].iter().take_while(|&&x| x == e).count();
@@ -2317,6 +2326,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         };
         let rest = if self.partial[p.ix()] {
             let slot = self.b.slot(8, 3, SlotKind::Named);
+            self.name_rest(slot, blaze_flow_lower::identity::Identity::Binding(p));
             Some(slot)
         } else {
             None
@@ -2370,6 +2380,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 slot
             }
         };
+        self.name_rest(slot, blaze_flow_lower::identity::Identity::Binding(p));
         if self.co.is_some() {
             let depth = self.scope_marks.len();
             if depth > 0 && self.scope_slots.scan_for(&(depth, slot)).is_none() {
@@ -2898,7 +2909,46 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.mark_decl(p, i as u32, &mut decl)?;
             }
         }
+        let in_own_body = |mut cur: u32| -> bool {
+            for _ in 0..=n {
+                if cur == self.body.root.0 {
+                    return true;
+                }
+                let Ok(cur_ix) = usize::try_from(cur) else {
+                    return false;
+                };
+                let Some(&(up, _)) = parent.get(cur_ix) else {
+                    return false;
+                };
+                if up == NO_EXPR {
+                    return false;
+                }
+                let Ok(up_ix) = usize::try_from(up) else {
+                    return false;
+                };
+                if matches!(body.exprs.get(up_ix), Some(Expr::Closure { .. } | Expr::AsyncBlock { .. })) {
+                    return false;
+                }
+                cur = up;
+            }
+            false
+        };
         for (i, x) in body.exprs.iter().enumerate() {
+            if let Ok(i_u32) = u32::try_from(i) {
+                if matches!(*x, Expr::Closure { .. } | Expr::AsyncBlock { .. }) && in_own_body(i_u32) {
+                    for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(ExprId(i_u32)) {
+                        if let Some(cnt) = self.uses_left.get_mut(f.base.ix()) {
+                            *cnt = cnt.saturating_add(1);
+                        }
+                    }
+                }
+                if let Expr::Local(p) = *x
+                    && in_own_body(i_u32)
+                    && let Some(cnt) = self.uses_left.get_mut(p.ix())
+                {
+                    *cnt = cnt.saturating_add(1);
+                }
+            }
             let Expr::Local(p) = *x else { continue };
             // The context: the parent of the outermost parenthesis around the use.
             let mut c = i as u32;
@@ -3501,35 +3551,51 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     }
 
     /// The argument values of `v`, held as `repr`, passed as `p`, into `out`.
-    fn pass_arg(&mut self, v: V, repr: Repr, p: Pass, out: &mut Vec<Value, A>) -> Result<(), BuildError> {
+    /// Returns the fresh `SlotId` when `self.place` had to allocate a temporary slot for a
+    /// non-place `v`, so the caller can end it right after the call.
+    fn pass_arg(&mut self, v: V, repr: Repr, p: Pass, out: &mut Vec<Value, A>) -> Result<Option<SlotId>, BuildError> {
+        let mut made = None;
+        let fresh = |v: V| !matches!(v, V::Place(..));
         match p {
             Pass::Ignore => {}
             Pass::Scalar { ty, agg: false, .. } => out.push(self.scalar(v, ty)?),
             Pass::Scalar { ty, agg: true, .. } => {
                 let at = self.place(v, repr)?;
+                if fresh(v) {
+                    made = self.whole_slot(at);
+                }
                 let attrs = self.mem(repr);
                 out.push(self.b.load(ty, Flags::NONE, at.0, at.1, attrs));
             }
             // `ArgCopy` made the caller's copy; a `byval` one is copied again by the call.
             Pass::Ref | Pass::Memory { .. } => {
                 let at = self.place(v, repr)?;
+                if fresh(v) {
+                    made = self.whole_slot(at);
+                }
                 out.push(self.address(at));
             }
             Pass::Wide { metadata } => {
                 let (ptr, off) = self.place(v, repr)?;
+                if fresh(v) {
+                    made = self.whole_slot((ptr, off));
+                }
                 let attrs = self.mem(repr);
                 out.push(self.b.load(Ty::PTR, Flags::NONE, ptr, off, attrs));
                 out.push(self.b.load(metadata, Flags::NONE, ptr, off + 8, attrs));
             }
             Pass::Words { size } => {
                 let at = self.place(v, repr)?;
+                if fresh(v) {
+                    made = self.whole_slot(at);
+                }
                 let align = self.size_align(repr).1;
                 for k in 0..size.div_ceil(8) {
                     out.push(self.read_word(at, k * 8, (size - k * 8).min(8), align)?);
                 }
             }
         }
-        Ok(())
+        Ok(made)
     }
 
     /// A value of `repr`, passed as `p`, from the values `next` yields: a parameter in the
@@ -3592,7 +3658,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let to = self.sret.ok_or(malformed("an aggregate result without its pointer"))?;
                 self.store(v, ret, (to, 0))?;
             }
-            p => self.pass_arg(v, ret, p, &mut xs)?,
+            p => {
+                let _ = self.pass_arg(v, ret, p, &mut xs)?;
+            }
         }
         self.drop_from(0)?;
         self.b.ret(&xs);
@@ -5308,7 +5376,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// inherent impl's constant, none for a free `const`) grounded at this instance's: the
     /// Reference, "Associated Items", "Associated Constants": `<T as Tr>::C` at `T = u8` is
     /// `u8`'s impl's value, so `size_of::<u8>` and `size_of::<u64>` read different records.
-    fn const_value(&mut self, e: ExprId, item: ItemKey) -> Result<V, BuildError> {
+    pub(super) fn const_value(&mut self, e: ExprId, item: ItemKey) -> Result<V, BuildError> {
         let args = self.const_path_args(e)?;
         let adts = self.adts;
         let record = adts.const_value(item, &args[..]).ok_or(BuildError::NoConstValue { expr: e, item })?;
@@ -5385,7 +5453,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// root's bytes, little-endian at the type's width; anything else is the place of the root's
     /// data row, its relocations to the record's other allocations (each a data row of its own),
     /// to statics and to fns.
-    fn const_record_value(&mut self, e: ExprId, record: &DataRecord<Global>) -> Result<V, BuildError> {
+    pub(super) fn const_record_value(&mut self, e: ExprId, record: &DataRecord<Global>) -> Result<V, BuildError> {
         let repr = self.expr_repr(e)?;
         self.const_record_value_as(e, repr, record)
     }
@@ -5605,6 +5673,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
         match self.expr(e)? {
             Expr::Local(p) => {
+                if let Some(cnt) = self.uses_left.get_mut(p.ix()) {
+                    *cnt = cnt.saturating_sub(1);
+                }
                 let (home, _) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a local used before its binding"))?;
                 let at = self.home(home);
                 self.push_val(V::Place(at.0, at.1), None);
@@ -5694,6 +5765,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Expr::Missing => return Err(unsupported(e, "a missing expression")),
             Expr::Lit(lit) => self.lit(e, lit)?,
             Expr::Local(p) => {
+                if let Some(cnt) = self.uses_left.get_mut(p.ix()) {
+                    *cnt = cnt.saturating_sub(1);
+                }
                 let (home, repr) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a local used before its binding"))?;
                 // A use by value: a move, when its type needs drop (its memory is read where
                 // the value lands, before anything else runs that could drop it).
@@ -6213,6 +6287,19 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         Ok(())
     }
 
+    pub(super) fn str_lit(&mut self, e: ExprId) -> Result<V, BuildError> {
+        let text = self.adts.str_lit(self.body.owner, e).ok_or(BuildError::NoLiteralValue { expr: e })?;
+        let len = u128::try_from(text.len()).unwrap_or(u128::MAX);
+        let data = self.b.data(text.as_bytes(), 0, &[]);
+        let p = self.b.data_addr(data);
+        let repr = self.expr_repr(e)?;
+        let at = self.temp(repr);
+        self.b.store(Flags::NONE, p, at.0, at.1, MemAttrs::aligned(3));
+        let n = self.b.iconst(Ty::I64, len);
+        self.b.store(Flags::NONE, n, at.0, at.1 + 8, MemAttrs::aligned(3));
+        Ok(V::Place(at.0, at.1))
+    }
+
     fn lit(&mut self, e: ExprId, lit: Lit) -> Result<(), BuildError> {
         let v = match lit {
             Lit::Bool(b) => self.b.iconst(Ty::I8, u128::from(b)),
@@ -6236,16 +6323,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             }
             // Its bytes as data, and the pair of their address and length (lib.rs, "Wide pointers").
             Lit::Str => {
-                let text = self.adts.str_lit(self.body.owner, e).ok_or(BuildError::NoLiteralValue { expr: e })?;
-                let len = text.len() as u128;
-                let data = self.b.data(text.as_bytes(), 0, &[]);
-                let p = self.b.data_addr(data);
-                let repr = self.expr_repr(e)?;
-                let at = self.temp(repr);
-                self.b.store(Flags::NONE, p, at.0, at.1, MemAttrs::aligned(3));
-                let n = self.b.iconst(Ty::I64, len);
-                self.b.store(Flags::NONE, n, at.0, at.1 + 8, MemAttrs::aligned(3));
-                self.push_val(V::Place(at.0, at.1), None);
+                let v = self.str_lit(e)?;
+                self.push_val(v, None);
                 return Ok(());
             }
             // strs.rs: a wide pointer over the bytes and their nul; a `char` as its `u32`.

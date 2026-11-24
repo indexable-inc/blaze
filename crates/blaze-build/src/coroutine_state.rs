@@ -47,18 +47,22 @@ pub struct LaidState {
     pub niche: crate::StateNiche,
 }
 
-/// [`lay_state`]'s answer: the state, per saved local (the recipe's order) its field's offset
-/// and its drop flag's offset (`None`: its type needs no drop), and per by-value upvar needing
-/// a drop flag its flag's offset.
+/// [`lay_state`]'s answer: the state, per saved local (the recipe's order) its field's offset,
+/// its drop flag's offset (`None`: its type needs no drop), and its 8-byte partial-move
+/// field-flags word offset (`rest`), plus per by-value upvar needing a drop flag or field-flags
+/// word its offset(s).
 pub struct Laid<A: Allocator> {
     pub state: LaidState,
     pub field: Vec<u32, A>,
     pub flag: Vec<Option<u32>, A>,
+    pub rest: Vec<Option<u32>, A>,
     pub upvar_flag: Vec<u32, A>,
+    pub upvar_rest: Vec<Option<u32>, A>,
 }
 
 /// One saved local as the builder looks it up: its identity in the flow, its field's offset
-/// and size, its drop flag's offset. A table of these is sorted by `identity`, each once
+/// and size, its drop flag's offset, and its optional 8-byte field-flags word (`rest`, for a
+/// partially moved binding). A table of these is sorted by `identity`, each once
 /// (state_recipe.rs refuses a saved identity twice).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct StateName {
@@ -66,6 +70,7 @@ pub struct StateName {
     pub offset: u32,
     pub size: u32,
     pub flag: Option<u32>,
+    pub rest: Option<u32>,
 }
 
 /// What `build_coroutine` builds a coroutine into: the state laid from types and the table of
@@ -106,7 +111,11 @@ impl<'a> StateNames<'a> {
             return Err(BuildError::Malformed { what: "a coroutine state's names not sorted by identity, or one identity twice" });
         }
         let inside = |at: u32, len: u32| at >= region.start && u64::from(at) + u64::from(len) <= u64::from(region.end);
-        if rows.iter().any(|r| !inside(r.offset, r.size) || r.flag.is_some_and(|f| !inside(f, 1))) {
+        if rows.iter().any(|r| {
+            !inside(r.offset, r.size)
+                || r.flag.is_some_and(|f| !inside(f, 1))
+                || r.rest.is_some_and(|w| !inside(w, 8) || w % 8 != 0)
+        }) {
             return Err(BuildError::Malformed { what: "a coroutine state's saved field or flag outside its region" });
         }
         Ok(StateNames { rows })
@@ -157,10 +166,34 @@ pub fn lay_state_with_upvar_flags<A: Allocator + Copy>(
     scratch: Alloc<'_>,
     alloc: A,
 ) -> Result<Laid<A>, BuildError> {
+    let mut needs_rest: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(saved.len(), scratch);
+    needs_rest.resize(saved.len(), false);
+    let mut upvar_has_flag: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(upvar_flags, scratch);
+    upvar_has_flag.resize(upvar_flags, true);
+    let mut upvar_has_rest: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(upvar_flags, scratch);
+    upvar_has_rest.resize(upvar_flags, false);
+    lay_state_with_flags(env, saved, needs_flag, &needs_rest, &upvar_has_flag, &upvar_has_rest, points, scratch, alloc)
+}
+
+/// [`lay_state`] with drop flags (`needs_flag`, 1 byte each) and 8-byte (align 3) partial-move
+/// field-flags words (`needs_rest`) for saved locals, plus extra drop flags (`upvar_has_flag`)
+/// and field-flags words (`upvar_has_rest`) for by-value upvars not in `saved`.
+#[expect(clippy::too_many_arguments, reason = "explicit layout slices keep lay_state_with_flags allocation-free and clear")]
+pub fn lay_state_with_flags<A: Allocator + Copy>(
+    env: (u64, u8),
+    saved: &[(u64, u8)],
+    needs_flag: &[bool],
+    needs_rest: &[bool],
+    upvar_has_flag: &[bool],
+    upvar_has_rest: &[bool],
+    points: u32,
+    scratch: Alloc<'_>,
+    alloc: A,
+) -> Result<Laid<A>, BuildError> {
     // Built at each use: `BuildError` is not `Clone`.
     let too_big = || BuildError::UnsupportedSig { what: "a coroutine state past 4 GiB" };
     let too_aligned = BuildError::UnsupportedSig { what: "a coroutine state field aligned past 2^31" };
-    if needs_flag.len() != saved.len() {
+    if needs_flag.len() != saved.len() || needs_rest.len() != saved.len() || upvar_has_flag.len() != upvar_has_rest.len() {
         return Err(BuildError::Malformed { what: "a coroutine state's drop-flag rows not one per saved local" });
     }
     if env.1 > MOST_ALIGN || saved.iter().any(|f| f.1 > MOST_ALIGN) {
@@ -182,7 +215,8 @@ pub fn lay_state_with_upvar_flags<A: Allocator + Copy>(
     order.extend(0..saved.len() as u32);
     // Keys are unique (the index is in them): an unstable sort is deterministic.
     order.sort_unstable_by_key(|&i| (core::cmp::Reverse(saved[i as usize].1), i));
-    let region_align = saved.iter().map(|f| f.1).max().unwrap_or(0);
+    let any_rest = needs_rest.iter().any(|&r| r) || upvar_has_rest.iter().any(|&r| r);
+    let region_align = saved.iter().map(|f| f.1).max().unwrap_or(0).max(if any_rest { 3 } else { 0 });
     let start = align_up(env.0, region_align);
     let mut at = start;
     let mut field: Vec<u32, A> = Vec::with_capacity_in(saved.len(), alloc);
@@ -192,6 +226,27 @@ pub fn lay_state_with_upvar_flags<A: Allocator + Copy>(
         let here = align_up(at, align);
         field[i as usize] = u32::try_from(here).map_err(|_| too_big())?;
         at = here.checked_add(size).ok_or_else(too_big)?;
+    }
+    // The 8-byte partial-move field-flags words (`rest`, align 3), in recipe then upvar order.
+    let mut rest: Vec<Option<u32>, A> = Vec::with_capacity_in(saved.len(), alloc);
+    for &needs in needs_rest {
+        if needs {
+            let here = align_up(at, 3);
+            rest.push(Some(u32::try_from(here).map_err(|_| too_big())?));
+            at = here.checked_add(8).ok_or_else(too_big)?;
+        } else {
+            rest.push(None);
+        }
+    }
+    let mut upvar_rest: Vec<Option<u32>, A> = Vec::with_capacity_in(upvar_has_rest.len(), alloc);
+    for &needs in upvar_has_rest {
+        if needs {
+            let here = align_up(at, 3);
+            upvar_rest.push(Some(u32::try_from(here).map_err(|_| too_big())?));
+            at = here.checked_add(8).ok_or_else(too_big)?;
+        } else {
+            upvar_rest.push(None);
+        }
     }
     // The drop flags, a byte each, in recipe order, followed by upvar drop flags.
     let mut flag: Vec<Option<u32>, A> = Vec::with_capacity_in(saved.len(), alloc);
@@ -203,10 +258,14 @@ pub fn lay_state_with_upvar_flags<A: Allocator + Copy>(
             flag.push(None);
         }
     }
-    let mut upvar_flag: Vec<u32, A> = Vec::with_capacity_in(upvar_flags, alloc);
-    for _ in 0..upvar_flags {
-        upvar_flag.push(u32::try_from(at).map_err(|_| too_big())?);
-        at += 1;
+    let mut upvar_flag: Vec<u32, A> = Vec::with_capacity_in(upvar_has_flag.len(), alloc);
+    for &needs in upvar_has_flag {
+        if needs {
+            upvar_flag.push(u32::try_from(at).map_err(|_| too_big())?);
+            at += 1;
+        } else {
+            upvar_flag.push(u32::MAX);
+        }
     }
     let tag_offset = align_up(at, tag_align);
     let align = env.1.max(region_align).max(tag_align);
@@ -218,5 +277,63 @@ pub fn lay_state_with_upvar_flags<A: Allocator + Copy>(
     let shape = StateShape { size: size as u32, align, tag_offset: tag_offset as u32, tag_ty };
     let niche = crate::StateNiche { tag_offset: tag_offset as u32, tag_ty, valid_end: (tags - 1) as u32 };
     let region = StateRegion { start: start as u32, end: tag_offset as u32, align: region_align };
-    Ok(Laid { state: LaidState { shape, region, niche }, field, flag, upvar_flag })
+    Ok(Laid { state: LaidState { shape, region, niche }, field, flag, rest, upvar_flag, upvar_rest })
+}
+
+/// Conservative syntactic scan over `body` and `checked`: returns a bit per `PatId` that is `true`
+/// whenever the walk (`Walk::scan_flags`) may allocate an 8-byte partial-move field-flags word
+/// (`rest` / `KeptFlags`) for that binding (field/tuple-field/deref place move, struct update base,
+/// match/let destructuring scrutinee, or non-whole closure/async capture).
+pub fn may_partial_move_bindings<'a>(body: &blaze_typeck::BodyView<'_>, checked: &blaze_typeck::Checked<'_>, alloc: Alloc<'a>) -> Vec<bool, Alloc<'a>> {
+    use blaze_typeck::{Expr, ExprId, Stmt, UnOp};
+
+    let mut out = Vec::with_capacity_in(body.pats.len(), alloc);
+    out.resize(body.pats.len(), false);
+    let root_local = |mut cur: ExprId| -> Option<blaze_typeck::PatId> {
+        for _ in 0..=body.exprs.len() {
+            match *body.exprs.get(cur.ix())? {
+                Expr::Local(p) => return Some(p),
+                Expr::Paren(inner)
+                | Expr::Field { base: inner, .. }
+                | Expr::TupleField { base: inner, .. }
+                | Expr::Unary { op: UnOp::Deref, operand: inner } => cur = inner,
+                _ => return None,
+            }
+        }
+        None
+    };
+    let mark = |out: &mut Vec<bool, Alloc<'a>>, e: ExprId| {
+        if let Some(p) = root_local(e)
+            && let Some(slot) = out.get_mut(p.ix())
+        {
+            *slot = true;
+        }
+    };
+    for (i, x) in body.exprs.iter().enumerate() {
+        match *x {
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Unary { op: UnOp::Deref, operand: base } => {
+                mark(&mut out, base);
+            }
+            Expr::Match { scrutinee, .. } => mark(&mut out, scrutinee),
+            Expr::Struct { base: blaze_typeck::StructBase::Expr(base), .. } | Expr::Record { base: blaze_typeck::StructBase::Expr(base), .. } => mark(&mut out, base),
+            Expr::Closure { .. } | Expr::AsyncBlock { .. } => {
+                if let Ok(ix) = u32::try_from(i) {
+                    for f in checked.env_fields_by::<crate::layout::BuildEnv>(ExprId(ix)) {
+                        if !f.is_whole()
+                            && let Some(slot) = out.get_mut(f.base.ix())
+                        {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for s in body.stmts.iter() {
+        if let Stmt::Let { init: Some(init), .. } = *s {
+            mark(&mut out, init);
+        }
+    }
+    out
 }

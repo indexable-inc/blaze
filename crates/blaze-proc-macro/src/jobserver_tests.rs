@@ -203,3 +203,50 @@ fn overlapping_runs_of_same_key_use_disjoint_work_dirs_and_clean_up() {
     cmd_b.end().expect("end cmd_b");
     let _ = crate::native_script::remove(&work_dir, "fake-shim");
 }
+
+/// Placing two different `blaze-fact-shim` binaries into the same shared native work directory
+/// puts them at distinct content-addressed paths under `fact-shim/<digest>/blaze-fact-shim`, so a
+/// concurrent or rebuilt `blaze` binary never overwrites the shim an in-flight command is running
+/// scripts against (which otherwise causes `EngineError::TwoValues` on `Name { kind: Given, .. }`).
+#[test]
+fn place_shim_content_addresses_distinct_shims_without_clobbering() {
+    use bstd::{fs::Durable, mem::TASK_FRAME, procs::hermetic::RootFiles as _};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let work_dir = work("shim-content-addr");
+    let (io, root) = crate::record::native_world(work_dir.as_ref()).expect("native world");
+    let cx = io.cx(core::time::Duration::from_secs(60), TASK_FRAME).expect("cx");
+
+    let write_shim = |name: &str, bytes: &[u8]| {
+        let rel = bstd::path::Path::new(name).expect("rel");
+        let f = root.create(&cx, &rel).expect("create");
+        f.write_at(&cx, 0, bytes, Durable::No).expect("write");
+        f.close(&cx, Durable::No).expect("close");
+        blaze_own::format_in!(alloc, "{work_dir}/{name}")
+    };
+
+    let bytes_a = b"#!/bin/sh\necho shim-a\n";
+    let bytes_b = b"#!/bin/sh\necho shim-b\n";
+    let src_a = write_shim("fake-shim-a", bytes_a);
+    let src_b = write_shim("fake-shim-b", bytes_b);
+
+    let placed_a = crate::native_facts::place_shim(&work_dir, src_a.as_str()).expect("place shim a");
+    let placed_b = crate::native_facts::place_shim(&work_dir, src_b.as_str()).expect("place shim b");
+    let placed_a2 = crate::native_facts::place_shim(&work_dir, src_a.as_str()).expect("place shim a again");
+
+    assert_ne!(placed_a.as_str(), placed_b.as_str(), "distinct shim contents must get distinct paths");
+    assert_eq!(placed_a.as_str(), placed_a2.as_str(), "identical shim contents reuse the same content-addressed path");
+    let read_placed = |path: &str| {
+        let mut buf = [0u8; 64];
+        let mut f = OpenOptions::new().read(true).open(path).expect("open placed");
+        let n = f.read(&mut buf).expect("read placed");
+        (buf, n)
+    };
+    let (buf_a, len_a) = read_placed(placed_a.as_str());
+    let (buf_b, len_b) = read_placed(placed_b.as_str());
+    assert_eq!(buf_a.get(..len_a), Some(bytes_a.as_slice()), "placing b must not clobber a");
+    assert_eq!(buf_b.get(..len_b), Some(bytes_b.as_slice()), "placed b has its own bytes");
+
+    let _ = crate::native_script::remove(&work_dir, "fake-shim-a");
+    let _ = crate::native_script::remove(&work_dir, "fake-shim-b");
+}

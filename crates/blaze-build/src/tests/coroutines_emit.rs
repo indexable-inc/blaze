@@ -77,6 +77,11 @@ struct World {
     zst_fut_adt: ItemKey,
     zst_fut: ItemKey,
     zst_fut_poll: ItemKey,
+    /// `struct Big { a..d: u64 }` (`Copy`, 32 bytes), `fn mk_big() -> Big`, `fn sum_big(b: Big) -> u64`,
+    /// plus fieldless `enum Tag { A, B, C }` (`Copy`) and `fn tag_plus(t: Tag, n: u64) -> u64`.
+    mk_big: ItemKey,
+    sum_big: ItemKey,
+    tag_plus: ItemKey,
     /// Names with no body of their own: `main`, the host's executor, and the item a
     /// coroutine's resume fn is named by (`AsyncItems::resume`).
     main: ItemKey,
@@ -142,6 +147,29 @@ extern "C" fn host_mk_d(out: *mut u64) {
 /// the host.
 extern "C" fn host_consume_d(p: *const u64) {
     host_drop_d(p);
+}
+
+/// `mk_big()`: writes a 32-byte `Copy` `Big { 10, 10, 10, 10 }` through the result pointer.
+extern "C" fn host_mk_big(out: *mut u64) {
+    // SAFETY: `out` is the caller's result slot of one `Big` (four u64s).
+    unsafe {
+        for i in 0..4 {
+            out.add(i).write(10);
+        }
+    }
+}
+
+/// `sum_big(b: Big) -> u64`: reads a `Big` passed by address and returns the sum of its four fields.
+extern "C" fn host_sum_big(p: *const u64) -> u64 {
+    // SAFETY: `p` points to a live `Big` (four u64s).
+    unsafe { p.read() + p.add(1).read() + p.add(2).read() + p.add(3).read() }
+}
+
+/// `tag_plus(t: Tag, n: u64) -> u64`: reads a 1-byte unit enum `Tag` passed by address and returns
+/// `discriminant * 10 + n`.
+extern "C" fn host_tag_plus(p: *const u8, n: u64) -> u64 {
+    // SAFETY: `p` points to a live 1-byte `Tag` enum discriminant.
+    u64::from(unsafe { p.read() }) * 10 + n
 }
 
 /// `zst_fut()`: zero-sized `ZstFut`; sets `ZST_LEFT = 1` so the first poll is `Pending` and the
@@ -319,6 +347,18 @@ fn open_world() -> World {
     let zst_fut = fx.func("zst_fut", 0, &[], zst_fut_t, StdVec::new());
     let zst_fut_poll = fx.func("zst_fut_poll", 0, &[], unit, StdVec::new());
 
+    let big_adt = fx.strukt("Big", 0, &[("a", u64_), ("b", u64_), ("c", u64_), ("d", u64_)]);
+    let big_t = fx.adt(big_adt, &[]);
+    fx.imp("copy_big", 0, big_t, Some((copy, &[])), &[], StdVec::new());
+    let mk_big = fx.func("mk_big", 0, &[], big_t, StdVec::new());
+    let sum_big = fx.func("sum_big", 0, &[big_t], u64_, StdVec::new());
+
+    let empty: &[PTy] = &[];
+    let (tag_adt, _) = fx.enum_("Tag", 0, &[("A", empty), ("B", empty), ("C", empty)]);
+    let tag_t = fx.adt(tag_adt, &[]);
+    fx.imp("copy_tag", 0, tag_t, Some((copy, &[])), &[], StdVec::new());
+    let tag_plus = fx.func("tag_plus", 0, &[tag_t, u64_], u64_, StdVec::new());
+
     let main = fx.func("main", 0, &[], u64_, StdVec::new());
     let drive = fx.func("drive", 0, &[], u64_, StdVec::new());
     let resume = fx.func("coroutine_resume", 0, &[], unit, StdVec::new());
@@ -342,6 +382,9 @@ fn open_world() -> World {
         zst_fut_adt,
         zst_fut,
         zst_fut_poll,
+        mk_big,
+        sum_big,
+        tag_plus,
         main,
         drive,
         resume,
@@ -770,6 +813,9 @@ fn run_laid(w: &World, progs: &[Prog<'_>], script: Script, laid: Option<&state_n
         (w.twice_poll, host_poll_twice as *const () as usize as u64),
         (w.zst_fut, host_zst_fut as *const () as usize as u64),
         (w.zst_fut_poll, host_poll_zst_fut as *const () as usize as u64),
+        (w.mk_big, host_mk_big as *const () as usize as u64),
+        (w.sum_big, host_sum_big as *const () as usize as u64),
+        (w.tag_plus, host_tag_plus as *const () as usize as u64),
         (w.drive, host_drive as *const () as usize as u64),
     ];
     DROPS.with(|d| d.set(0));

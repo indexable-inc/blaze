@@ -477,6 +477,10 @@ pub(crate) struct ScriptsStage<'f> {
     /// Each planned `Given` cell of a build script's read, by name, sorted, with today's answer
     /// from the sweep's row (engine_script_reads.rs `plan`).
     given: Vec<(Name, ContentId, crate::engine_script_reads::ReadKind), &'f Frame>,
+    /// Each newly observed `Given` cell made inline by a script in this request, by name, sorted,
+    /// with the answer first merged: a later script observing a different answer for the same cell
+    /// is reported as `CliError::Changed` instead of colliding in `engine.rs` `merge` (rule 21).
+    made_given: Vec<(Name, ContentId), &'f Frame>,
     /// Each read of the checkout a run of this request made, with the script that read it: the
     /// leaf rows the answer keeps, and the `Given` records of reads no plan holds.
     fresh: Vec<(Name, crate::engine_script_reads::CheckoutRead), &'f Frame>,
@@ -596,6 +600,7 @@ impl<'f> ScriptsStage<'f> {
             made: Vec::new_in(frame),
             results: Vec::new_in(frame),
             given: Vec::new_in(frame),
+            made_given: Vec::new_in(frame),
             fresh: Vec::new_in(frame),
             tools: None,
             plant: crate::engine_script_reads::ReadsPlant::None,
@@ -1297,11 +1302,23 @@ impl<'f> ScriptsStage<'f> {
                         // its reader, at wave 0, keyed as next request's planned task.
                         let tools = self.tools.ok_or(EngineCheckError::Unseen { task: name, read: Name::unit_graph() })?;
                         for (_, read) in self.fresh.iter().filter(|(by, _)| *by == name) {
-                            match self.given.binary_search_by_key(&read.name(), |(cell, _, _)| *cell) {
-                                Ok(at) if self.given[at].1 != read.answer => {
+                            let cell = read.name();
+                            let diverged = match self.given.binary_search_by_key(&cell, |(cell, _, _)| *cell) {
+                                Ok(at) => self.given.get(at).is_some_and(|g| g.1 != read.answer),
+                                Err(_) => match self.made_given.binary_search_by_key(&cell, |(c, _)| *c) {
+                                    Ok(at) => self.made_given.get(at).is_some_and(|g| g.1 != read.answer),
+                                    Err(at) => {
+                                        self.made_given.insert_shift(at, (cell, read.answer));
+                                        buffer.made.push(crate::engine_script_reads::made(read, name, &tools, alloc));
+                                        false
+                                    }
+                                },
+                            };
+                            match diverged {
+                                true => {
                                     // Named by its package (rule 19); the task name follows for
                                     // the profile's rows.
-                                    let script = self.runs.binary_search_by_key(&name, |run| run.task.planned.name).ok().and_then(|at| self.runs[at].script);
+                                    let script = self.runs.binary_search_by_key(&name, |run| run.task.planned.name).ok().and_then(|at| self.runs.get(at)?.script);
                                     let subject = match script {
                                         Some((_, package, version, side)) => bstd::mem::format_in!(
                                             frame,
@@ -1313,8 +1330,7 @@ impl<'f> ScriptsStage<'f> {
                                     };
                                     return Err(CliError::Changed { paths: subject.as_str().to_owned() });
                                 }
-                                Ok(_) => {}
-                                Err(_) => buffer.made.push(crate::engine_script_reads::made(read, name, &tools, alloc)),
+                                false => {}
                             }
                         }
                     }
