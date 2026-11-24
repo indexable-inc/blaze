@@ -42,9 +42,9 @@ pub fn first_tier(func: View<'_>, machine: Machine, dependency: bool) -> TierNam
 /// The default optimizing tier for tier-up (from `Fast` stencils) and release/export builds on
 /// `machine`.
 ///
-/// Routes through Blaze's native non-LLVM [`TierName::Sota`] tier by default on both AArch64 and
-/// x86-64, falling back to [`TierName::Optimized`] only when the function requires raw `asm!`,
-/// target intrinsics, or non-base target features (e.g. `+sve`, `+avx512f`).
+/// On AArch64 (`Arch::Arm64`), routes through Blaze's native non-LLVM [`TierName::Sota`] tier by
+/// default instead of LLVM `-O3`, falling back to [`TierName::Optimized`] only when the function
+/// requires raw `asm!`, target intrinsics, or non-base target features (e.g. `+sve`).
 pub fn optimizing_tier(func: View<'_>, machine: Machine) -> TierName {
     let target_intrinsic = Op::TargetIntrinsic as u8;
     let asm = Op::Asm as u8;
@@ -56,7 +56,8 @@ pub fn optimizing_tier(func: View<'_>, machine: Machine) -> TierName {
         return TierName::Optimized;
     }
     match machine.arch {
-        Arch::Arm64 | Arch::X86_64 => TierName::Sota,
+        Arch::Arm64 => TierName::Sota,
+        Arch::X86_64 => TierName::Optimized,
     }
 }
 

@@ -1272,12 +1272,12 @@ mod std_readiness_tests {
             b.set_signature(sig);
             let e = b.create_block(BlockKind::Normal);
             b.begin(e);
-            let mut gprs: AVec<'static, blaze_lir::Val> = Vec::new_in(alloc);
+            let mut gprs = Vec::new_in(alloc);
             for _ in 0..10 {
                 gprs.push(b.param(Ty::I64));
             }
             let bv_ptr = b.param(Ty::PTR);
-            let mut fps: AVec<'static, blaze_lir::Val> = Vec::new_in(alloc);
+            let mut fps = Vec::new_in(alloc);
             for _ in 0..10 {
                 fps.push(b.param(Ty::F64));
             }
@@ -1328,7 +1328,7 @@ mod std_readiness_tests {
             let e = b.create_block(BlockKind::Normal);
             b.begin(e);
             let src_struct = b.param(Ty::PTR);
-            let mut args: AVec<'static, blaze_lir::Val> = Vec::new_in(alloc);
+            let mut args = Vec::new_in(alloc);
             for k in 1u64..=10 {
                 args.push(b.iconst(Ty::I64, u128::from(k * 10)));
             }
@@ -1386,7 +1386,8 @@ mod std_readiness_tests {
                 match of {
                     Outside::Static(0) => Some(blaze_tier::Named::Symbol(Symbol::of_name("sym_static_0"))),
                     Outside::Tls(0) => Some(blaze_tier::Named::Symbol(Symbol::of_name("sym_tls_0"))),
-                    _ => None,
+                    Outside::TlsDesc => Some(blaze_tier::Named::Symbol(Symbol::of_name("sym_tls_desc"))),
+                    _ => Some(blaze_tier::Named::Symbol(Symbol::of_name("sym_tls_aux"))),
                 }
             }
             fn routines(&self) -> RoutinePlaces {
