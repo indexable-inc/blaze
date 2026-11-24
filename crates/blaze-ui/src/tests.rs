@@ -544,3 +544,95 @@ fn workbench_100k_lab_actions_patch_incrementally() {
     assert!(!app.ui.draw.full_upload);
     assert_eq!(app.ui.last_stats.layout_nodes_visited, 0);
 }
+
+#[test]
+fn rust_gpu_slug_shader_emits_wgsl_and_msl_and_evaluates_on_cpu_at_any_zoom() {
+    use crate::slug::{Outline, PathBuilder, pack_outline_into, slug_render_cpu};
+    use crate::slug_shader::{
+        SiteUniform, SlugSiteVaryings, emit_slug_site_msl, emit_slug_site_wgsl, slug_site_fs,
+    };
+
+    // 1. Verify real Rust `#[gpu::vertex(ir)]` + `#[gpu::fragment(ir)]` + `#[gpu::helper]`
+    //    emits linked WebGPU WGSL and Metal MSL 2.4 cleanly!
+    let mut wgsl = StackWriter::<32768>::new();
+    assert!(emit_slug_site_wgsl(&mut wgsl).is_ok());
+    let w = wgsl.as_str();
+    assert!(w.contains("fn slug_root_code("));
+    assert!(w.contains("fn slug_solve_horiz("));
+    assert!(w.contains("fn slug_solve_vert("));
+    assert!(w.contains("@group(0) @binding(0) var<uniform> u: SiteUniform;"));
+    assert!(w.contains("@group(0) @binding(1) var<storage, read> insts: array<SiteInst>;"));
+    assert!(w.contains("@group(0) @binding(2) var<storage, read> curves: array<vec4<f32>>;"));
+    assert!(w.contains("@group(0) @binding(3) var<storage, read> bands: array<u32>;"));
+    assert!(w.contains("textureSampleLevel(atlas_tex, atlas_samp, v.uv, 0"));
+    assert!(w.contains("pow(cov, gam)"));
+    assert!(w.contains("mix(v.color.xyz, u.pulse_ink.xyz, lit)"));
+
+    let mut msl = StackWriter::<32768>::new();
+    assert!(emit_slug_site_msl(&mut msl).is_ok());
+    let m = msl.as_str();
+    assert!(m.contains("#include <metal_stdlib>"));
+    assert!(m.contains("uint slug_root_code("));
+    assert!(m.contains("vertex slug_site_vs_out slug_site_vs("));
+    assert!(m.contains("fragment float4 slug_site_fs("));
+
+    // 2. Build a vector glyph (CCW unit square [0.1..0.9] x [0.0..0.8] in em space) and pack into den buffers!
+    let alloc = test_alloc();
+    let mut pb = PathBuilder::new_in(alloc);
+    pb.move_to([0.1, 0.0]).expect("m");
+    pb.line_to([0.9, 0.0]).expect("l1");
+    pb.line_to([0.9, 0.8]).expect("l2");
+    pb.line_to([0.1, 0.8]).expect("l3");
+    let contours = pb.finish().expect("finish");
+    let outline = Outline::new(contours, alloc).expect("ok").expect("some");
+    let mut curves = OwnVec::new_in(alloc);
+    let mut bands = OwnVec::new_in(alloc);
+    let meta = pack_outline_into(&outline, &mut curves, &mut bands, alloc).expect("pack");
+    assert!(meta.drawable);
+
+    // 3. Evaluate BOTH `slug_render_cpu` AND the ACTUAL Rust GPU fragment shader `slug_site_fs`
+    //    at 16 ppem (100% zoom) and 256 ppem (1600% trackpad zoom)!
+    let curves_v4: OwnVec<GVec4, _> = {
+        let mut v = OwnVec::new_in(alloc);
+        for c in curves.as_slice() {
+            v.try_push(gvec4(c[0], c[1], c[2], c[3])).expect("push");
+        }
+        v
+    };
+    let tex_px = [GVec4::splat(1.0)];
+    let tex = gpu::Texture2d::from_rgba32f(1, 1, &tex_px);
+    let smp = gpu::Sampler::LINEAR_CLAMP;
+    let uniform = SiteUniform {
+        view_origin: gvec4(1280.0, 800.0, 0.0, 0.0),
+        pulse: gvec4(0.0, 0.0, 1.0, 0.0),
+        pulse_ink: gvec4(1.0, 1.0, 1.0, 1.0),
+        slug: gvec4(0.0, 1.0, 1.0, 0.25),
+    };
+
+    for ppem in [16.0f32, 256.0f32] {
+        let cov_in = slug_render_cpu(curves.as_slice(), bands.as_slice(), [0.5, 0.4], meta.band_tf, meta.gdata, [ppem, ppem], 0.0);
+        let cov_out = slug_render_cpu(curves.as_slice(), bands.as_slice(), [0.02, 0.4], meta.band_tf, meta.gdata, [ppem, ppem], 0.0);
+        assert!(cov_in > 0.99, "interior must be filled at {ppem} ppem (got {cov_in})");
+        assert!(cov_out < 0.01, "exterior must be empty at {ppem} ppem (got {cov_out})");
+
+        let v_in = SlugSiteVaryings {
+            pos: Position(gvec4(0.0, 0.0, 0.0, 1.0)),
+            uv: gvec2(0.5, 0.4),
+            local: gvec2(0.0, 0.0),
+            color: gpu::Flat(gvec4(1.0, 1.0, 1.0, 1.0)),
+            half_ext: gpu::Flat(gvec2(10.0, 10.0)),
+            radii: gpu::Flat(gvec4(0.0, 0.0, 0.0, 0.0)),
+            fx: gpu::Flat(gvec4(0.0, 0.0, ppem, 0.0)),
+            band_tf: gpu::Flat(gvec4(meta.band_tf[0], meta.band_tf[1], meta.band_tf[2], meta.band_tf[3])),
+            gdata: gpu::Flat(gpu::prelude::uvec4(meta.gdata[0], meta.gdata[1], meta.gdata[2], meta.gdata[3])),
+            ppem: gpu::Flat(ppem),
+        };
+        let px_in = slug_site_fs(v_in, &uniform, curves_v4.as_slice(), bands.as_slice(), &smp, &tex);
+        assert!(px_in.w > 0.99, "real Rust slug_site_fs must match CPU oracle inside glyph at {ppem} ppem");
+
+        let mut v_out = v_in;
+        v_out.uv = gvec2(0.02, 0.4);
+        let px_out = slug_site_fs(v_out, &uniform, curves_v4.as_slice(), bands.as_slice(), &smp, &tex);
+        assert!(px_out.w < 0.01, "real Rust slug_site_fs must match CPU oracle outside glyph at {ppem} ppem");
+    }
+}

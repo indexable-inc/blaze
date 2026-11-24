@@ -1,0 +1,22 @@
+[package]
+name = "blaze-site-wasm"
+description = "Zero-import, `#![no_std]`, `#![blaze::sans_io]` WebAssembly (`wasm32-unknown-unknown`) C-ABI cdylib over `blaze-site` with Rust-authored `gpu::emit` Slug & SDF WebGPU shaders and smooth trackpad pinch-to-zoom"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+blaze-own.workspace = true
+blaze-site.workspace = true
+
+[lints]
+workspace = true

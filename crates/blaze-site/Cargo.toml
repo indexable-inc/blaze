@@ -1,0 +1,34 @@
+[package]
+name = "blaze-site"
+description = "Zero-dependency, `#![no_std]`, `#![forbid(unsafe_code)]`, `#![blaze::sans_io]` Blaze homepage engine over `blaze-ecs`, `blaze-ui`, `den` Slug GPU vector font rendering, trackpad pinch-to-zoom, and Rust-authored `gpu::emit` WebGPU & MSL 2.4 shaders"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Relational ECS + reactive signal graph (`World`, `Entity`, `ChildOf`, `DontFragment`, `ReactiveGraph`).
+blaze-ecs.workspace = true
+# Explicit integer conversions (zero `as` casts).
+blaze-int.workspace = true
+# Zero-dependency `#![no_std]` JSON parser for `PageModel`.
+blaze-json.workspace = true
+# Explicit-allocator owning collections (`Vec`, `String`, `Box`, `Alloc`).
+blaze-own.workspace = true
+# Shared UI types, Slug outline/curve/band packer, and Rust -> WGSL/MSL shaders.
+blaze-ui.workspace = true
+# Rust -> WGSL & MSL 2.4 shader IR + `#![no_std]` `f32` math.
+gpu.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

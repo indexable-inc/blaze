@@ -25,8 +25,7 @@
 #![cfg_attr(not(test), no_std)]
 #![feature(core_float_math)]
 
-// The macros write `::gpu::...`, which this lets the crate's own tests use too.
-#[cfg(test)]
+// The macros write `::gpu::...`, which this lets the crate's own shaders and tests use too.
 extern crate self as gpu;
 
 pub mod compute;
@@ -37,6 +36,7 @@ pub mod intrinsic;
 pub mod mat;
 pub mod math;
 pub mod ray;
+pub mod slug;
 pub mod vec;
 
 pub use compute::{
@@ -49,7 +49,7 @@ pub use entry::{
     Position, RawOut, Sampler, Slot, Stage, Table, Texture2d, Thread, Value, ValueTy, Varying, Varyings, VertexIndex,
     check, layout, layout_fields, mip_chain_texels, sizes_slot,
 };
-pub use gpu_macros::{Pod, Varyings, fragment, kernel, vertex};
+pub use gpu_macros::{Pod, ShaderStruct, Varyings, fragment, helper, kernel, vertex};
 pub use mat::{Mat2, Mat3, Mat4};
 pub use ray::{Candidate, Hit, HostTlas, ProceduralAabb, Ray, RayFlags, RayQuery, Tlas, Triangle};
 
@@ -62,9 +62,9 @@ pub mod prelude {
     pub use crate::intrinsic::{discard, dpdx, dpdy, fwidth};
     pub use crate::mat::{Mat2, Mat3, Mat4};
     pub use crate::math::{
-        abs, asfloat, asint, asuint, atan2, ceil, cos, cross, distance, dot, exp, exp2, f16tof32, f32tof16,
-        faceforward, floor, fma, frac, fract, length, lerp, ln, log2, normalize, pow, reflect, refract, round, rsqrt,
-        saturate, sign, sin, smoothstep, sqrt, step, tan, trunc,
+        abs, asfloat, asint, asuint, at, atan2, ceil, cos, cross, distance, dot, exp, exp2, f16tof32, f32tof16,
+        faceforward, floor, fma, frac, fract, length, lerp, ln, log2, mix, normalize, pow, reflect, refract, round,
+        rsqrt, saturate, sign, sin, smoothstep, sqrt, step, tan, to_f32, to_u32, trunc,
     };
     pub use crate::ray::{Candidate, Hit, ProceduralAabb, Ray, RayFlags, RayQuery, Tlas, Triangle};
     pub use crate::vec::{

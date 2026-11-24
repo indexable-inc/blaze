@@ -2020,6 +2020,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-site"
+version = "0.0.0"
+dependencies = [
+ "blaze-ecs",
+ "blaze-int",
+ "blaze-json",
+ "blaze-own",
+ "blaze-ui",
+ "gpu",
+]
+
+[[package]]
+name = "blaze-site-wasm"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-site",
+]
+
+[[package]]
 name = "blaze-solve"
 version = "0.0.0"
 dependencies = [

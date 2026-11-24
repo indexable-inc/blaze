@@ -15,6 +15,8 @@
 
 #![forbid(unsafe_code)]
 
+mod ir;
+
 use proc_macro::{Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
 
 #[proc_macro_attribute]
@@ -58,7 +60,7 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
     push_lit_u32(&mut fields, z, span);
     push_group(&mut stage, Delimiter::Brace, fields, span);
 
-    emit_entry(original, &parsed, stage)
+    emit_entry(original, parsed, stage, false, false)
 }
 
 #[proc_macro_derive(Varyings)]
@@ -75,6 +77,18 @@ pub fn derive_pod(input: TokenStream) -> TokenStream {
         Ok(ts) => ts,
         Err(e) => e.into_tokens(),
     }
+}
+
+/// Derive `pub const IR: ::gpu::emit::IrStruct` from a `#[repr(C)]` struct definition (zero `unsafe`).
+#[proc_macro_derive(ShaderStruct)]
+pub fn derive_shader_struct(input: TokenStream) -> TokenStream {
+    ir::expand_shader_struct(input)
+}
+
+/// Compile a plain Rust GPU helper function to both runnable CPU Rust and `pub mod <name> { pub const IR: gpu::emit::IrFn }`.
+#[proc_macro_attribute]
+pub fn helper(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    ir::expand_helper(item)
 }
 
 // ---------------------------------------------------------------------------
@@ -307,12 +321,19 @@ struct ParsedFn {
     name: Ident,
     params: Vec<ParsedParam>,
     ret_ty: Vec<TokenTree>,
+    body_stream: TokenStream,
 }
 
 fn entry(attr: TokenStream, item: TokenStream, stage_variant: &str, attr_name: &str) -> TokenStream {
-    let attr_tokens: Vec<TokenTree> = attr.into_iter().collect();
-    if let Some(first) = attr_tokens.first() {
-        return Error::new(first.span(), format!("#[gpu::{attr_name}] takes no arguments")).into_tokens();
+    let mut emit_ir = false;
+    let mut seen_any = false;
+    for tt in attr {
+        if !seen_any && is_ident(&tt, "ir") {
+            emit_ir = true;
+            seen_any = true;
+        } else {
+            return Error::new(tt.span(), format!("#[gpu::{attr_name}] takes no arguments (or `ir`)")).into_tokens();
+        }
     }
     let original = item.clone();
     let parsed = match parse_fn(item, attr_name) {
@@ -322,7 +343,7 @@ fn entry(attr: TokenStream, item: TokenStream, stage_variant: &str, attr_name: &
     let span = parsed.name.span();
     let mut stage = TokenStream::new();
     push_path(&mut stage, &["gpu", "Stage", stage_variant], span);
-    emit_entry(original, &parsed, stage)
+    emit_entry(original, parsed, stage, emit_ir, stage_variant == "Vertex")
 }
 
 fn parse_threads(attr: TokenStream, what: &str, fallback_span: Span) -> Result<[u32; 3], Error> {
@@ -522,12 +543,15 @@ fn parse_fn(item: TokenStream, attr: &str) -> Result<ParsedFn, Error> {
     }
 
     // Ensure there is a function body `{ ... }`.
-    if !matches!(tokens.get(pos), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace) {
-        let sp = tokens.get(pos).map_or_else(|| name.span(), TokenTree::span);
-        return Err(Error::new(sp, format!("{what}: expected function body")));
-    }
+    let body_stream = match tokens.get(pos) {
+        Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => g.stream(),
+        _ => {
+            let sp = tokens.get(pos).map_or_else(|| name.span(), TokenTree::span);
+            return Err(Error::new(sp, format!("{what}: expected function body")));
+        }
+    };
 
-    Ok(ParsedFn { vis, name, params, ret_ty })
+    Ok(ParsedFn { vis, name, params, ret_ty, body_stream })
 }
 
 fn is_self_receiver(arg: &[TokenTree]) -> bool {
@@ -556,7 +580,13 @@ fn extract_plain_param_ident(pat: &[TokenTree], what: &str) -> Result<Ident, Err
     Ok(id)
 }
 
-fn emit_entry(original: TokenStream, f: &ParsedFn, stage: TokenStream) -> TokenStream {
+fn emit_entry(
+    original: TokenStream,
+    f: ParsedFn,
+    stage: TokenStream,
+    emit_ir: bool,
+    is_vertex: bool,
+) -> TokenStream {
     let mut out = original;
     let span = f.name.span();
     let name_s = f.name.to_string();
@@ -744,6 +774,11 @@ fn emit_entry(original: TokenStream, f: &ParsedFn, stage: TokenStream) -> TokenS
         push_punct(&mut body, '.', Spacing::Alone, pspan);
         push_ident(&mut body, "slot", pspan);
         push_punct(&mut body, ';', Spacing::Alone, pspan);
+    }
+
+    if emit_ir {
+        let ir_ts = ir::emit_ir_body_const(f.body_stream, is_vertex.then_some(name_s.as_str()), span);
+        body.extend(ir_ts);
     }
 
     push_group(&mut out, Delimiter::Brace, body, span);
