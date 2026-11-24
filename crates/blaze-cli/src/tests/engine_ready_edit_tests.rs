@@ -907,7 +907,7 @@ fn given_edit_with_body_readers_stays_on_ready_and_script_reader_refuses_to_phas
     assert_eq!(r1_stored.pages, p1_stored.pages, "pure Given edit pages equal Phases");
     let r1_prof = profile(&ready_io);
     assert!(r1_prof.contains("driver: ready"), "profile names ready:\n{r1_prof}");
-    assert!(r1_prof.contains("2 Given"), "profile counts both discovered Given tasks on first edit after cold:\n{r1_prof}");
+    assert!(r1_prof.contains("1 Given"), "profile counts the discovered Given task on first edit after cold (dual-included spec.rs binds via FileItems::DATA):\n{r1_prof}");
     assert!(r1_prof.contains("bodies memory: 2 bodies"), "each woken body ran once (Tick-1 Given peek):\n{r1_prof}");
 
     // 2. `.rs` body edit in `a/src/spec.rs` (both `Slot` AND `Given` move): stays on `ready`!
@@ -922,7 +922,7 @@ fn given_edit_with_body_readers_stays_on_ready_and_script_reader_refuses_to_phas
     assert_eq!(r2_stored.pages, p2_stored.pages, "Slot+Given body edit pages equal Phases");
     let r2_prof = profile(&ready_io);
     assert!(r2_prof.contains("driver: ready"), "Slot+Given profile names ready:\n{r2_prof}");
-    assert!(r2_prof.contains("1 Given"), "only the edited spec.rs Given entered:\n{r2_prof}");
+    assert!(r2_prof.contains("1 FileItems") && r2_prof.contains("4 BodyCheck"), "dual-included spec.rs wakes via FileItems::DATA without a redundant Given:\n{r2_prof}");
 
     // Part B: `Given` read by a `Script` (build.rs) refuses `ready` with `PhasesWhy::ScriptRead`
     // and falls back cleanly on `Driver::Auto`.

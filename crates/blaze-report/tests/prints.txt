@@ -20,7 +20,7 @@ blaze-engine 36
 blaze-expand 13
 blaze-export 13
 blaze-flow 6
-blaze-flow-lower 185
+blaze-flow-lower 162
 blaze-fmt 42
 blaze-format-core 1
 blaze-graph 5

@@ -84,7 +84,7 @@ impl fmt::Display for EcsError {
             Self::EntityCapacityExceeded => write!(f, "entity slot capacity exceeded"),
             Self::ComponentCapacityExceeded => write!(f, "component registry capacity exceeded"),
             Self::SystemAccessConflict { system, id } => {
-                write!(f, "system `{system}` declared conflicting access to {id:?}")
+                write!(f, "system '{system}' declared conflicting access to {id:?}")
             }
             Self::TraversalBoundExceeded { limit } => {
                 write!(f, "graph traversal exceeded bound {limit}")

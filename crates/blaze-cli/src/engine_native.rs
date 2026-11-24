@@ -831,17 +831,31 @@ pub(crate) fn export_native_for<'r, 'm: 's, 's>(
     if !has_text && image.words.is_empty() && image.inits == 0 && image.tls.is_empty() && !has_extra_lib {
         return Ok(None);
     }
-    // Collect every Rust C export (unmangled name -> fn symbol), sorted by name for `native_merge`.
+    // Collect only the Rust C exports referenced by `image.words` (matching `send_of`), sorted by
+    // name for `native_merge`. Unreferenced `#[no_mangle]` items in the closure (such as Linux
+    // `compiler_builtins` outline-atomic helpers like `__aarch64_cas16_acq`) are never called by
+    // the native image and must not be forced as mandatory export roots.
+    let strip_underscore = prepared.platform == Platform::MacosArm64;
     let mut exports: AVec<'s, blaze_export::CExport<'s>> = Vec::new_in(alloc);
     let mut items: AVec<'s, blaze_id::ItemKey> = Vec::new_in(alloc);
-    for table in tables.iter() {
-        for export in table.exports.iter() {
-            let checker = blaze_ladder::front2::keys::checker_of(export.item);
-            let symbol = blaze_ladder::symbols::fn_symbol(checker, blaze_typeck::List::EMPTY, blaze_typeck::PTys::EMPTY, alloc)
-                .map_err(|why| NativeError::Send { words: held(bstd::mem::format_in!(out_frame, "export `{}` symbol: {why:?}", export.name).as_str(), ask) })?;
-            exports.push(blaze_export::CExport { name: export.name.as_bytes(), symbol });
-            if items.scan_for(&export.item).is_none() {
-                items.push(export.item);
+    if !image.words.is_empty() {
+        for table in tables.iter() {
+            for export in table.exports.iter() {
+                let raw_name = export.name.as_bytes();
+                let needed = image.words.iter().any(|&word| {
+                    let word = if strip_underscore { word.strip_prefix(b"_").unwrap_or(word) } else { word };
+                    word == raw_name
+                });
+                if !needed {
+                    continue;
+                }
+                let checker = blaze_ladder::front2::keys::checker_of(export.item);
+                let symbol = blaze_ladder::symbols::fn_symbol(checker, blaze_typeck::List::EMPTY, blaze_typeck::PTys::EMPTY, alloc)
+                    .map_err(|why| NativeError::Send { words: held(bstd::mem::format_in!(out_frame, "export `{}` symbol: {why:?}", export.name).as_str(), ask) })?;
+                exports.push(blaze_export::CExport { name: raw_name, symbol });
+                if items.scan_for(&export.item).is_none() {
+                    items.push(export.item);
+                }
             }
         }
     }

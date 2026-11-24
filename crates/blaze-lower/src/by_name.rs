@@ -12,8 +12,8 @@
 //! the answers, to [`EAGER_DEPTH`] deep.
 
 use blaze_expand::{
-    BuiltinDerive, BuiltinFn, Call, CallSite, Ctx, DefAt, DefSite, DeriveFacts, Eager, ExpandCx, Expanded, Export, Inside, LocalInner,
-    LexError, MacroDefinition, NestedCall, NestedKind, Prepared, ProcKind, Reads, StreamError, TokenKind, TokenStream, call_key, expand, expand_prepared, lex, prepare,
+    BuiltinDerive, BuiltinFn, Call, CallSite, Ctx, DefAt, DefSite, DeriveFacts, Eager, ExpandCx, Expanded, Export, Hole, HoleOf, Inside, LitKind, LocalInner,
+    LexError, MacroDefinition, NestedCall, NestedKind, Place, PlaceOf, Prepared, ProcKind, ReadAnswer, ReadKind, Reads, Spacing, StreamError, TokenKind, TokenStream, call_key, expand, expand_prepared, lex, prepare,
 };
 use blaze_ids::ContentId;
 use blaze_own::{AString, AVec, Alloc, Vec};
@@ -670,14 +670,19 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                         let text = diagnostic_text(diagnostic, &exp.notes, self.alloc);
                         return Err(Refused::Failed(Failure::Diagnostic { diagnostic: *diagnostic, text }));
                     }
+                    let tokens = if exp.holes.is_empty() {
+                        exp.tokens
+                    } else {
+                        self.fill_holes(&exp.tokens, &exp.holes, current.written)?
+                    };
                     match parents.pop() {
                         Some(mut parent) => {
-                            let mut tokens = exp.tokens;
+                            let mut tokens = tokens;
                             tokens.seal(key);
                             parent.answers.push(tokens);
                             current = parent;
                         }
-                        None => return Ok((key, exp.tokens)),
+                        None => return Ok((key, tokens)),
                     }
                 }
                 Ok(Expanded::NeedsExpanded(mut nested)) if current.answers.is_empty() && current.depth < EAGER_DEPTH => {
@@ -688,6 +693,76 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                 Err(e) => return Err(Refused::Failed(Failure::Expand(e))),
             }
         }
+    }
+
+    /// Replaces placeholder tokens recorded in `holes` (`line!()`, `column!()`, `file!()`,
+    /// `module_path!()` outside eager input) with the host's answer at `written`, recording each
+    /// answered read. When the host refuses a position (e.g. a stub host with no place), the
+    /// placeholder token stands.
+    fn fill_holes(&mut self, from: &TokenStream<'a>, holes: &[Hole], written: Option<u32>) -> Result<TokenStream<'a>, Refused<'a>> {
+        let mut out = TokenStream::new_in(self.alloc);
+        let mut next_hole = 0usize;
+        for at in 0..from.len() {
+            let hole = holes.get(next_hole).filter(|h| usize::try_from(h.token).ok() == Some(at));
+            let Some(hole) = hole else {
+                out.push_from(from, at).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                continue;
+            };
+            next_hole += 1;
+            let (ask, read_kind, number) = match hole.of {
+                HoleOf::Line => (PlaceOf::Line, ReadKind::Line, true),
+                HoleOf::Column => (PlaceOf::Column, ReadKind::Column, true),
+                HoleOf::File => (PlaceOf::File, ReadKind::File, false),
+                HoleOf::ModulePath => (PlaceOf::ModulePath, ReadKind::ModulePath, false),
+            };
+            let got = match written {
+                Some(call) => self.cx.place_of_call(ask, call),
+                None => self.cx.place(ask),
+            };
+            let Ok(place) = got else {
+                out.push_from(from, at).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                continue;
+            };
+            if usize::try_from(self.read_cap).is_ok_and(|cap| self.reads.list().len() >= cap) {
+                return Err(Refused::ReadList(ReadLimit::Cap(self.read_cap)));
+            }
+            self.reads.push(read_kind, "", ReadAnswer::of_place(place)).map_err(|e| Refused::ReadList(ReadLimit::Table(e)))?;
+            let Some(tok) = from.tokens().get(at) else {
+                continue;
+            };
+            let ctx = out.import_ctx(from, tok.ctx).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+            match (place, number) {
+                (Place::Number(value), true) => {
+                    use core::fmt::Write;
+                    let mut text = AString::new_in(self.alloc);
+                    let _ = write!(text, "{value}u32");
+                    let kind = TokenKind::Literal { kind: LitKind::Integer, suffix_len: 3, spacing: Spacing::Alone };
+                    out.push(kind, text.as_str(), ctx).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                }
+                (Place::Text(value), false) => {
+                    let mut text = AString::new_in(self.alloc);
+                    text.push('"');
+                    for ch in value.chars() {
+                        match ch {
+                            '\\' => text.push_str("\\\\"),
+                            '"' => text.push_str("\\\""),
+                            '\n' => text.push_str("\\n"),
+                            '\r' => text.push_str("\\r"),
+                            '\t' => text.push_str("\\t"),
+                            '\0' => text.push_str("\\0"),
+                            c => text.push(c),
+                        }
+                    }
+                    text.push('"');
+                    let kind = TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, spacing: Spacing::Alone };
+                    out.push(kind, text.as_str(), ctx).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                }
+                _ => {
+                    out.push_from(from, at).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

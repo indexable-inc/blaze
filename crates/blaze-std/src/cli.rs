@@ -153,10 +153,10 @@ impl fmt::Display for CliError<'_> {
                 write!(f, "bstd::cli: unknown short flag `-{flag}`")
             }
             CliError::UnknownSubcommand { name, suggestion: Some(suggest) } => {
-                write!(f, "bstd::cli: unknown subcommand `{name}`; did you mean `{suggest}`?")
+                write!(f, "bstd::cli: unknown subcommand '{name}'; did you mean '{suggest}'?")
             }
             CliError::UnknownSubcommand { name, suggestion: None } => {
-                write!(f, "bstd::cli: unknown subcommand `{name}`")
+                write!(f, "bstd::cli: unknown subcommand '{name}'")
             }
             CliError::MissingValue { opt } => {
                 write!(f, "bstd::cli: option `--{opt}` requires a value")
@@ -174,10 +174,10 @@ impl fmt::Display for CliError<'_> {
                 write!(f, "bstd::cli: flag `--{flag}` does not take a value")
             }
             CliError::UnexpectedPositional { value } => {
-                write!(f, "bstd::cli: unexpected argument `{value}`")
+                write!(f, "bstd::cli: unexpected argument '{value}'")
             }
             CliError::InvalidValue { opt, value } => {
-                write!(f, "bstd::cli: invalid value `{value}` for option `--{opt}`")
+                write!(f, "bstd::cli: invalid value '{value}' for option `--{opt}`")
             }
             CliError::Alloc(err) => write!(f, "bstd::cli: allocation failed ({err})"),
         }
@@ -1326,7 +1326,7 @@ mod tests {
             Err(CliError::UnknownSubcommand { name: "g", suggestion: Some("gc") })
         );
         let sub_msg = format_in!(h.alloc(), "{}", sub_typo.expect_err("err"));
-        assert!(sub_msg.as_str().contains("did you mean `gc`?"));
+        assert!(sub_msg.as_str().contains("did you mean 'gc'?"));
     }
 
     #[test]

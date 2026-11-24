@@ -6173,9 +6173,9 @@ pub fn p<'a>(x: &u8) -> impl Tr + '_ { loop {} }
             (k, crate::front2::keys::opaque_key(k, 0))
         };
         for name in ["o", "n", "w", "d", "p"] {
-            store.ensure(names, &mut keys, Want::Fn(item(names, name))).unwrap_or_else(|e| panic!("ensure `{name}`: {e:?}"));
+            store.ensure(names, &mut keys, Want::Fn(item(names, name))).unwrap_or_else(|e| panic!("ensure {name}: {e:?}"));
             let (fk, _) = opaque_of(name);
-            assert!(store.fn_gaps.get(&fk).is_none(), "ORACLE: `{name}`'s head was refused: {:?}", store.fn_gaps.get(&fk));
+            assert!(store.fn_gaps.get(&fk).is_none(), "ORACLE: {name}'s head was refused: {:?}", store.fn_gaps.get(&fk));
         }
         let outlives = |k: ItemKey| -> Vec<Region> {
             let p = store.preds.get(&k).unwrap_or_else(|| panic!("the opaque's predicates"));
