@@ -162,7 +162,7 @@ pub use texts::{SortedTexts, Texts};
 pub use arc::Arc;
 pub use boxed::{Box, CallOnce};
 pub use btree::{BTreeMap, BTreeSet};
-pub use byte_cursor::{ByteCursor, RevBitCursor, SliceWriter, common_prefix_len};
+pub use byte_cursor::{ByteCursor, RevBitCursor, SeqOp, SliceWriter, common_prefix_len};
 pub use cow::{Cow, ToOwnedIn};
 pub use deque::VecDeque;
 pub use error::AllocFailure;

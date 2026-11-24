@@ -367,19 +367,37 @@ impl FseDecEntry {
     pub(crate) const ZERO: Self = Self { symbol: 0, num_bits: 0, baseline: 0 };
 }
 
-/// Pre-resolved sequence FSE decoding entry (exact C zstd `ZSTD_seqSymbol` layout): stores
-/// the resolved baseline value (`LL_BASE`, `ML_BASE`, or `1 << of_code`) and `extra_bits`
-/// directly in the FSE table so the inner sequence loop does zero secondary LUT lookups.
+/// Pre-resolved sequence FSE decoding entry packed into one `u64` (single `ldr x` per table
+/// lookup instead of 4 separate field loads):
+/// - bits `0..32`: `base: u32` (`LL_BASE`, `ML_BASE`, or `1 << of_code`)
+/// - bits `32..48`: `baseline: u16` (FSE next-state baseline)
+/// - bits `48..56`: `extra_bits: u8`
+/// - bits `56..64`: `num_bits: u8` (FSE state transition bits)
+#[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct SeqDecEntry {
-    pub(crate) base: u32,
-    pub(crate) extra_bits: u8,
-    pub(crate) num_bits: u8,
-    pub(crate) baseline: u16,
-}
+pub(crate) struct SeqDecEntry(u64);
 
 impl SeqDecEntry {
-    pub(crate) const ZERO: Self = Self { base: 0, extra_bits: 0, num_bits: 0, baseline: 0 };
+    pub(crate) const ZERO: Self = Self(0);
+
+    #[inline(always)]
+    pub(crate) const fn new(base: u32, extra_bits: u8, num_bits: u8, baseline: u16) -> Self {
+        let [b0, b1, b2, b3] = base.to_le_bytes();
+        let [bl0, bl1] = baseline.to_le_bytes();
+        Self(u64::from_le_bytes([b0, b1, b2, b3, bl0, bl1, extra_bits, num_bits]))
+    }
+
+    /// Unpack `(base, extra_bits, num_bits, baseline)` from a single register value.
+    #[inline(always)]
+    pub(crate) fn unpack(self) -> (u32, u32, u32, usize) {
+        let [b0, b1, b2, b3, bl0, bl1, eb, nb] = self.0.to_le_bytes();
+        (
+            u32::from_le_bytes([b0, b1, b2, b3]),
+            u32::from(eb),
+            u32::from(nb),
+            usize::from(u16::from_le_bytes([bl0, bl1])),
+        )
+    }
 }
 
 /// Which sequence field a [`SeqDecTable`] resolves.
@@ -394,16 +412,22 @@ pub(crate) enum SeqKind {
 pub(crate) struct SeqDecTable {
     entries: [SeqDecEntry; MAX_FSE_TABLE_SIZE],
     accuracy_log: u8,
+    max_extra_bits: u8,
 }
 
 impl SeqDecTable {
     pub(crate) const fn new_empty() -> Self {
-        Self { entries: [SeqDecEntry::ZERO; MAX_FSE_TABLE_SIZE], accuracy_log: 0 }
+        Self { entries: [SeqDecEntry::ZERO; MAX_FSE_TABLE_SIZE], accuracy_log: 0, max_extra_bits: 0 }
     }
 
     #[inline(always)]
     pub(crate) const fn accuracy_log(&self) -> u8 {
         self.accuracy_log
+    }
+
+    #[inline(always)]
+    pub(crate) const fn max_extra_bits(&self) -> u8 {
+        self.max_extra_bits
     }
 
     #[inline(always)]
@@ -422,6 +446,7 @@ impl SeqDecTable {
             return Err(ZstdError::CorruptFse);
         }
         let table_size = 1usize << u32::from(log);
+        let mut max_eb: u8 = 0;
         for state in 0..table_size {
             let e = dec.entry(state).ok_or(ZstdError::CorruptFse)?;
             let (base, extra_bits) = match kind {
@@ -444,16 +469,15 @@ impl SeqDecTable {
                     (b, eb)
                 }
             };
+            if extra_bits > max_eb {
+                max_eb = extra_bits;
+            }
             if let Some(slot) = self.entries.get_mut(state) {
-                *slot = SeqDecEntry {
-                    base,
-                    extra_bits,
-                    num_bits: e.num_bits,
-                    baseline: e.baseline,
-                };
+                *slot = SeqDecEntry::new(base, extra_bits, e.num_bits, e.baseline);
             }
         }
         self.accuracy_log = log;
+        self.max_extra_bits = max_eb;
         Ok(())
     }
 }
