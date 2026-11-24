@@ -86,7 +86,7 @@ blaze-macro-run	4
 blaze-malloc	65
 blaze-manifest	150
 blaze-math	42
-blaze-mem	112
+blaze-mem	104
 blaze-memchr	17
 blaze-memo	95
 blaze-memo-macros	3
@@ -145,7 +145,7 @@ blaze-trace	56
 blaze-ty	239
 blaze-typeck	503
 blaze-unicode	7
-blaze-unit-graph	77
+blaze-unit-graph	71
 blaze-units	7
 blaze-url	17
 blaze-v2-proof	6

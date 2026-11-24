@@ -309,3 +309,32 @@ fn a_leaked_root_gives_static_handles() {
     assert_eq!(leaked.used().live_blocks, 0);
     assert!(leaked.used().carved >= size_of::<Root>(), "the root's own block is carved");
 }
+
+/// Resetting a root returns every committed page to the kernel while keeping the virtual
+/// reservation intact so the next phase reuses the same base address without `munmap`/`mmap`.
+#[test]
+fn root_reset_decommits_and_reuses_reservation() {
+    let mut r = root();
+    let first_offset = {
+        let mut buf: Vec<u8, _> = Vec::new_in(r.alloc());
+        buf.resize(2 << 20, 0x5A);
+        let at = r.offset_of(core::ptr::NonNull::from(&buf[0])).expect("inside root");
+        assert!(r.used().committed >= (2 << 20));
+        at
+    };
+    let returned = r.reset();
+    assert!(returned >= (2 << 20), "reset returned committed bytes: {returned}");
+    let after = r.used();
+    assert_eq!(after.committed, 0, "all committed pages returned");
+    assert_eq!(after.carved, 0);
+    assert_eq!(after.live_blocks, 0);
+    assert_eq!(after.allocations, 0);
+    // Reusing the reset root starts at the exact same offset (same reservation).
+    {
+        let mut buf: Vec<u8, _> = Vec::new_in(r.alloc());
+        buf.resize(2 << 20, 0xA5);
+        let at = r.offset_of(core::ptr::NonNull::from(&buf[0])).expect("inside root");
+        assert_eq!(at, first_offset);
+        assert_eq!(buf[(2 << 20) - 1], 0xA5);
+    }
+}

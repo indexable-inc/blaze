@@ -566,9 +566,22 @@ impl Sources {
 /// for a refusal, nothing more where the refusal is lasting (built with `fetch`). Built without
 /// it the refusal also read cargo's archive cache, which no stamp of the sweep's covers: it never
 /// stands, and is asked again each command.
-fn fetch_stands(cx: &Cx, name: Name, row: &Row<'_>, tools: blaze_engine::Tools, sources: &mut Sources, env: &FetchEnv<'_>) -> Result<Result<ContentId, UnitsCause>, CliError> {
+/// Whether the stored `Fetch` row `row` stands for `name` (discover path: no sweep proof, so a
+/// held record is mapped once here and handed to both discovery and world construction, avoiding
+/// a separate `stat` before the `mmap`). Returns its out when it stands, or why not.
+#[expect(clippy::too_many_arguments, reason = "fetch standing helper taking lockfile and graph to map once")]
+fn fetch_stands<'f>(
+    cx: &Cx,
+    name: Name,
+    row: &Row<'_>,
+    tools: blaze_engine::Tools,
+    sources: &mut Sources,
+    lockfile: &mut crate::fetch::Lockfile<'f>,
+    graph: &mut crate::graph::Graph<'f>,
+    env: &FetchEnv<'_>,
+) -> Result<Result<ContentId, UnitsCause>, CliError> {
     match fetch_row_stands(name, row, tools) {
-        Ok(Fetched::Held) => held_stands(cx, name, sources, env),
+        Ok(Fetched::Held) => held_stands(cx, name, sources, lockfile, graph, env),
         Ok(Fetched::Refused(out)) => Ok(Ok(out)),
         Err(why) => Ok(Err(why)),
     }
@@ -601,13 +614,24 @@ fn fetch_row_stands(name: Name, row: &Row<'_>, tools: blaze_engine::Tools) -> Re
     }
 }
 
-/// Whether the held fetch `name`'s record is still in the sources store, by one stat (its bytes
-/// were checked once, when fetched or adopted, rule 74): its out (its subject), or why not.
-fn held_stands(cx: &Cx, name: Name, sources: &mut Sources, env: &FetchEnv<'_>) -> Result<Result<ContentId, UnitsCause>, CliError> {
+/// Whether the held fetch `name`'s record is still in the sources store, verified and mapped in
+/// one `open` + `fstat` + `mmap` (`Lockfile::try_map_source`) and cached in `graph.mapped` so
+/// neither the next discovery wave nor `names::world_with_mapped` stats or maps it again.
+fn held_stands<'f>(
+    cx: &Cx,
+    name: Name,
+    sources: &mut Sources,
+    lockfile: &mut crate::fetch::Lockfile<'f>,
+    graph: &mut crate::graph::Graph<'f>,
+    env: &FetchEnv<'_>,
+) -> Result<Result<ContentId, UnitsCause>, CliError> {
     sources.statted = sources.statted.saturating_add(1);
-    match crate::fetch::holds(cx, sources.open(cx, env)?, &name.subject)? {
-        true => Ok(Ok(name.subject)),
-        false => Ok(Err(UnitsCause::SourceGone { name })),
+    match lockfile.try_map_source(cx, env, &name.subject)? {
+        Some(mapping) => {
+            graph.record_mapped(name.subject, mapping, env.heap.alloc());
+            Ok(Ok(name.subject))
+        }
+        None => Ok(Err(UnitsCause::SourceGone { name })),
     }
 }
 
@@ -830,83 +854,130 @@ pub(crate) fn discover<'f>(
         let mut inputs: Vec<Input, blaze_own::Alloc<'_>> = Vec::new_in(alloc);
         let mut failed: Vec<Name, blaze_own::Alloc<'_>> = Vec::new_in(alloc);
         let mut level = 0u32;
-        let made = loop {
-            level += 1;
-            if level > LEVELS {
-                return Err(EngineCheckError::Levels { levels: LEVELS }.into());
-            }
-            let task = drive_task(name, key, graph.source, inputs.clone(), failed.clone(), alloc);
-            let did = crate::graph::run(&cx, lockfile, graph, &task, env, frame, frame)?;
-            let wants = match did {
-                Did::Need(wants) => wants,
-                did => {
-                    // The graph whose sources were not fetched is owed with them.
+        let mut git_dirs: Vec<(blaze_manifest::lock::LockId, &'f str), &'f Frame> = Vec::new_in(frame);
+        // Stateful multi-wave discovery in one bump scratch frame: `plan::plan(lock)`, every
+        // crate's manifest layout, and every git workspace layout (`reth`) run once instead of
+        // once per dependency level, with zero global heap churn for transient parse/layout data.
+        let made = {
+            let scratch = Frame::new(bstd::mem::Tag::Other)
+                .map_err(|_| CliError::Text { what: "a scratch frame for unit-graph discovery could not be reserved" })?;
+            let erased = blaze_own::Erased::new(&scratch);
+            let scratch_alloc = erased.handle();
+            match blaze_drive::unit_graph_task::UnitGraphSession::new(
+                graph.inputs_ref(),
+                lockfile.lock,
+                blaze_fetch::pack::PackView::open_source_put,
+                scratch_alloc,
+            ) {
+                Err(error) => {
+                    let words = bstd::mem::format_in!(frame, "the dependency graph: {error}");
+                    let did = Did::FailedSaying(
+                        TaskFailure {
+                            name,
+                            why: blaze_drive::Why::Refused { what: "the dependency graph could not be resolved", rule: "unit_graph_task" },
+                        },
+                        crate::work::held_str(words.as_str(), frame),
+                    );
                     if owes(name, &did) {
                         owed.push(name);
                     }
-                    break published(name, did)?;
+                    published(name, did)?
                 }
-            };
-            // One level's lock entries, each fetched and handed to the next level.
-            let fetch_mark = board.phase_began(blaze_engine::Stage::Units, u64::try_from(wants.len()).unwrap_or(u64::MAX), board.now(&env.clock));
-            for want in wants.iter() {
-                let fetch = want.name;
-                if fetch.kind != Kind::Fetch || inputs.iter().any(|input| input.name == fetch) || failed.contains(&fetch) {
-                    board.phase_ended(fetch_mark, 0, board.now(&env.clock));
-                    return Err(EngineCheckError::Unseen { task: name, read: fetch }.into());
-                }
-                let fetch_key = tools.key(fetch, &fetch.subject);
-                // A fetch whose stored row stands is handed as it was (rule 77): only a fetch
-                // one of whose inputs moved, one never made, or one the last command owed runs.
-                let stands = match back.row(fetch)? {
-                    Some(row) => fetch_stands(&cx, fetch, &row, tools, &mut sources, env)?,
-                    None => Err(UnitsCause::NoAnswer),
-                };
-                let made = match stands {
-                    Ok(out) => {
-                        let mut record = Made::new_in(fetch, frame);
-                        record.out = out;
-                        Ok(record)
-                    }
-                    Err(why) => {
-                        counts.fetches_run += 1;
-                        let again = matches!(why, UnitsCause::Failed { .. } | UnitsCause::Unfetched { .. });
-                        plan.owed_again = plan.owed_again.saturating_add(u32::from(again));
-                        let label = lockfile.display_name(fetch).map_or_else(
-                            || crate::engine_status::Label::of("crate"),
-                            crate::engine_status::Label::of,
-                        );
-                        let shown = board.show_kind(
-                            blaze_engine::Stage::Units,
-                            blaze_screen::WorkKind::Fetch,
-                            label,
-                            0,
-                            board.now(&env.clock),
-                        );
-                        let did = crate::fetch::run(&cx, lockfile, env, fetch, frame);
-                        shown.end(board.now(&env.clock));
-                        let did = did?;
-                        if owes(fetch, &did) {
-                            owed.push(fetch);
-                            plan.owed_still = plan.owed_still.saturating_add(u32::from(again));
+                Ok(mut session) => {
+                    let made = loop {
+                        level += 1;
+                        if level > LEVELS {
+                            return Err(EngineCheckError::Levels { levels: LEVELS }.into());
                         }
-                        published(fetch, did)?
+                        let task = drive_task(name, key, graph.source, inputs.clone(), failed.clone(), alloc);
+                        let did = crate::graph::run_session(&cx, lockfile, graph, &mut session, &task, env, frame, scratch_alloc)?;
+                        let wants = match did {
+                            Did::Need(wants) => wants,
+                            did => {
+                                // The graph whose sources were not fetched is owed with them.
+                                if owes(name, &did) {
+                                    owed.push(name);
+                                }
+                                break published(name, did)?;
+                            }
+                        };
+                        // One level's lock entries, each fetched and handed to the next level.
+                        let fetch_mark = board.phase_began(blaze_engine::Stage::Units, u64::try_from(wants.len()).unwrap_or(u64::MAX), board.now(&env.clock));
+                        for want in wants.iter() {
+                            let fetch = want.name;
+                            if fetch.kind != Kind::Fetch || inputs.iter().any(|input| input.name == fetch) || failed.contains(&fetch) {
+                                board.phase_ended(fetch_mark, 0, board.now(&env.clock));
+                                return Err(EngineCheckError::Unseen { task: name, read: fetch }.into());
+                            }
+                            let fetch_key = tools.key(fetch, &fetch.subject);
+                            // A fetch whose stored row stands is handed as it was (rule 77): only a fetch
+                            // one of whose inputs moved, one never made, or one the last command owed runs.
+                            let stands = match back.row(fetch)? {
+                                Some(row) => fetch_stands(&cx, fetch, &row, tools, &mut sources, lockfile, graph, env)?,
+                                None => Err(UnitsCause::NoAnswer),
+                            };
+                            let made = match stands {
+                                Ok(out) => {
+                                    let mut record = Made::new_in(fetch, frame);
+                                    record.out = out;
+                                    Ok(record)
+                                }
+                                Err(why) => {
+                                    counts.fetches_run += 1;
+                                    let again = matches!(why, UnitsCause::Failed { .. } | UnitsCause::Unfetched { .. });
+                                    plan.owed_again = plan.owed_again.saturating_add(u32::from(again));
+                                    let label = lockfile.display_name(fetch).map_or_else(
+                                        || crate::engine_status::Label::of("crate"),
+                                        crate::engine_status::Label::of,
+                                    );
+                                    let shown = board.show_kind(
+                                        blaze_engine::Stage::Units,
+                                        blaze_screen::WorkKind::Fetch,
+                                        label,
+                                        0,
+                                        board.now(&env.clock),
+                                    );
+                                    let did = crate::fetch::run(&cx, lockfile, env, fetch, frame);
+                                    shown.end(board.now(&env.clock));
+                                    let did = did?;
+                                    if owes(fetch, &did) {
+                                        owed.push(fetch);
+                                        plan.owed_still = plan.owed_still.saturating_add(u32::from(again));
+                                    }
+                                    published(fetch, did)?
+                                }
+                            };
+                            match &made {
+                                Ok(record) => inputs.push(Input { name: fetch, at: fetch_key, out: record.out }),
+                                Err(_) => failed.push(fetch),
+                            }
+                            records.push(Published { name: fetch, source: fetch.subject, wave: 0, made });
+                        }
+                        board.phase_ended(fetch_mark, u64::try_from(wants.len()).unwrap_or(u64::MAX), board.now(&env.clock));
+                    };
+                    for (id, dir) in session.located_git_dirs() {
+                        git_dirs.push((id, frame.alloc_str(dir)));
                     }
-                };
-                match &made {
-                    Ok(record) => inputs.push(Input { name: fetch, at: fetch_key, out: record.out }),
-                    Err(_) => failed.push(fetch),
+                    made
                 }
-                records.push(Published { name: fetch, source: fetch.subject, wave: 0, made });
             }
-            board.phase_ended(fetch_mark, u64::try_from(wants.len()).unwrap_or(u64::MAX), board.now(&env.clock));
         };
         let made = match made {
             Ok(mut record) => {
                 // The names world (work.rs's `UnitGraph` arm): every crate of the build.
+                // Reuses the already-mapped source packs and git package dirs from discovery.
                 let world = {
                     let _cx = cx.span("names: make the world");
-                    crate::names::world(&cx, root, record.payload_bytes()?, Some(lockfile.lock), Some(graph.member_dirs()), env)
+                    crate::names::world_with_mapped(
+                        &cx,
+                        root,
+                        record.payload_bytes()?,
+                        Some(lockfile.lock),
+                        Some(graph.member_dirs()),
+                        graph.mapped_slice(),
+                        &git_dirs,
+                        env,
+                    )
                 };
                 // The record sealed with the crate list as work.rs's arm seals it: its readers
                 // (a `Script` job, a macro module's lookup) open its two sections

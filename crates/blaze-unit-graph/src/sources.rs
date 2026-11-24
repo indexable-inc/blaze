@@ -43,6 +43,19 @@ pub trait Records<'b> {
     fn record(&mut self, source: &SourceId<'_>) -> Option<&'b [u8]>;
 }
 
+/// Placeholder [`Records`] for a [`StoreSources`] whose records are supplied per call through
+/// [`StoreSources::package_with`], allowing a stateful discovery session to keep its parsed plan,
+/// opened views, and git layouts across waves without borrowing the driver's record store between
+/// waves.
+#[derive(Clone, Copy, Default)]
+pub struct ExternalRecords;
+
+impl<'b> Records<'b> for ExternalRecords {
+    fn record(&mut self, _source: &SourceId<'_>) -> Option<&'b [u8]> {
+        None
+    }
+}
+
 /// The layout gives up after this many passes (its depth: the root above, globs, targets).
 const LAYOUT_PASSES: u32 = 64;
 
@@ -78,6 +91,9 @@ pub struct StoreSources<'l, 'b, 'a, R: Records<'b>> {
     open: Open<'b>,
     /// Per plan unit, its record once opened.
     views: AVec<'a, Option<PackView<'b>>>,
+    /// Per locked package, its located directory in its pack (`""` for a crate; subdirectory for
+    /// a git workspace member), cached on first lookup or seeded from an earlier discovery wave.
+    dirs: AVec<'a, Option<Text<'a>>>,
     commits: AVec<'a, Commit<'a>>,
     alloc: Alloc<'a>,
     _bytes: core::marker::PhantomData<&'b [u8]>,
@@ -172,7 +188,9 @@ impl<'l, 'b, 'a, R: Records<'b>> StoreSources<'l, 'b, 'a, R> {
         }
         let mut views = Vec::with_capacity_in(plan.units.len(), alloc);
         views.resize(plan.units.len(), None);
-        Ok(StoreSources { lock, plan, place, records, open, views, commits: Vec::new_in(alloc), alloc, _bytes: core::marker::PhantomData })
+        let mut dirs = Vec::with_capacity_in(lock.packages.len(), alloc);
+        dirs.resize(lock.packages.len(), None);
+        Ok(StoreSources { lock, plan, place, records, open, views, dirs, commits: Vec::new_in(alloc), alloc, _bytes: core::marker::PhantomData })
     }
 
     /// The store, as handed in.
@@ -180,67 +198,166 @@ impl<'l, 'b, 'a, R: Records<'b>> StoreSources<'l, 'b, 'a, R> {
         &self.records
     }
 
+    /// Seeds the located directory of locked package `id` inside its pack (e.g. from a discovery
+    /// session that already laid out its git commit workspace) so [`Self::files`] returns it
+    /// without re-running `Layout`.
+    pub fn seed_dir(&mut self, id: LockId, dir: &str) {
+        if let Some(slot) = self.dirs.get_mut(id.index()) {
+            *slot = Some(own(dir, self.alloc));
+        }
+    }
+
+    /// Every non-empty located package directory discovered so far (git workspace subdirectories),
+    /// as `(LockId, &str)`.
+    pub fn located_git_dirs(&self) -> impl Iterator<Item = (LockId, &str)> {
+        self.dirs.iter().enumerate().filter_map(|(i, dir)| {
+            let id = u32::try_from(i).ok().map(LockId)?;
+            dir.as_deref().filter(|d| !d.is_empty()).map(|d| (id, d))
+        })
+    }
+
     /// The facts of locked package `id`, from its record.
     pub fn package(&mut self, id: LockId) -> Result<Package<'a>, SourceError<'a>> {
-        self.locate(id).map(|(_, package, _)| package)
+        let StoreSources { lock, plan, place, records, open, views, dirs, commits, alloc, .. } = self;
+        locate_inner(lock, plan, place, records, *open, views, dirs, commits, *alloc, id).map(|(_, package, _)| package)
+    }
+
+    /// As [`Self::package`], reading any not-yet-opened pack record from `records` instead of the
+    /// stored `R` (for stateful multi-wave discovery sessions).
+    pub fn package_with<R2: Records<'b>>(&mut self, id: LockId, records: &mut R2) -> Result<Package<'a>, SourceError<'a>> {
+        let StoreSources { lock, plan, place, open, views, dirs, commits, alloc, .. } = self;
+        locate_inner(lock, plan, place, records, *open, views, dirs, commits, *alloc, id).map(|(_, package, _)| package)
     }
 
     /// Where locked package `id`'s files are: its record, opened, and the package's directory
     /// in it (`""` for a crate; a git package's directory in its commit, as [`Self::package`]
     /// found it). What a runner serves as the package's sources.
     pub fn files(&mut self, id: LockId) -> Result<(PackView<'b>, Text<'a>), SourceError<'a>> {
-        self.locate(id).map(|(view, _, dir)| (view, dir))
-    }
-
-    /// Package `id`'s record, its facts and its directory in the record: the one lookup
-    /// [`Self::package`] and [`Self::files`] share.
-    fn locate(&mut self, id: LockId) -> Result<(PackView<'b>, Package<'a>, Text<'a>), SourceError<'a>> {
-        let alloc = self.alloc;
-        let p = self.lock.package(id);
-        let name = p.name.as_str();
-        let version = version_text(self.lock, id, alloc);
-        let at = match self.place[id.index()] {
-            Where::Path => return Err(SourceError::PathOutsideWorkspace { package: p.name.clone(), version }),
-            Where::Skipped(at) => {
-                return Err(SourceError::NotFetchable { package: p.name.clone(), version, why: shown(&self.plan.skipped[at as usize], alloc) });
-            }
-            Where::Unit(at) => at as usize,
-        };
-        let unit = &self.plan.units[at];
-        // A record is mapped and opened once (a git commit's serves all its packages).
-        let view = match self.views[at] {
-            Some(view) => view,
-            None => {
-                let source = unit.source();
-                let Some(bytes) = self.records.record(&source) else {
-                    return Err(SourceError::NotFetched { package: p.name.clone(), version, source: p.source_text.clone(), key: source.key().0 });
-                };
-                let view = (self.open)(&source, bytes).map_err(|why| SourceError::Refused { package: p.name.clone(), version: version.clone(), why })?;
-                self.views[at] = Some(view);
-                view
-            }
-        };
-        match unit {
-            plan::Unit::Crate { .. } => {
-                let units = lay_out(&view, "", name, &version, alloc)?;
-                match units.members.iter().find(|m| m.name.as_str() == name) {
-                    Some(member) => Ok((view, Package::from_member(member, alloc), member.dir.clone())),
-                    None => Err(SourceError::NoManifest { package: p.name.clone(), version }),
+        let StoreSources { lock, plan, place, records, open, views, dirs, commits, alloc, .. } = self;
+        let (at, view) = open_view_inner(lock, plan, place, records, *open, views, *alloc, id)?;
+        // Fast path: directory already located (by an earlier `package`/`files` call or seeded
+        // from the unit-graph discovery session) — skip re-parsing `Cargo.toml` and `Layout`.
+        if let Some(Some(dir)) = dirs.get(id.index()) {
+            return Ok((view, own(dir.as_str(), *alloc)));
+        }
+        // Fast path for crates.io archives: a `.crate` pack always has its package at `""`.
+        // Verify `Cargo.toml` exists in the pack index without re-running full manifest layout.
+        if matches!(plan.units.get(at), Some(plan::Unit::Crate { .. })) {
+            let p = lock.package(id);
+            if view.find_entry("Cargo.toml").is_some() {
+                if let Some(slot) = dirs.get_mut(id.index()) {
+                    *slot = Some(Text::new_in(*alloc));
                 }
+                return Ok((view, Text::new_in(*alloc)));
             }
-            plan::Unit::Git { commit, .. } => {
-                let commit = *commit;
-                let at = match self.commits.iter().position(|c| c.commit == commit) {
-                    Some(at) => at,
-                    None => {
-                        self.commits.push(Commit { commit, layouts: Vec::new_in(alloc), root_tried: false, scan: None });
-                        self.commits.len() - 1
+            return Err(SourceError::NoManifest { package: own(p.name.as_str(), *alloc), version: version_text(lock, id, *alloc) });
+        }
+        locate_inner(lock, plan, place, records, *open, views, dirs, commits, *alloc, id).map(|(view, _, dir)| (view, dir))
+    }
+}
+
+/// Resolves `id`'s plan unit and opens (or reuses) its [`PackView`].
+#[expect(clippy::too_many_arguments, reason = "internal split-borrow helper shared by package, package_with, and files")]
+fn open_view_inner<'l, 'b, 'a, R: Records<'b>>(
+    lock: &'l Lock<'a>,
+    plan: &plan::Plan<'l, 'a>,
+    place: &[Where],
+    records: &mut R,
+    open: Open<'b>,
+    views: &mut [Option<PackView<'b>>],
+    alloc: Alloc<'a>,
+    id: LockId,
+) -> Result<(usize, PackView<'b>), SourceError<'a>> {
+    let p = lock.package(id);
+    let version = version_text(lock, id, alloc);
+    let at = match place.get(id.index()).copied().unwrap_or(Where::Path) {
+        Where::Path => return Err(SourceError::PathOutsideWorkspace { package: own(p.name.as_str(), alloc), version }),
+        Where::Skipped(at) => {
+            let why = match plan.skipped.get(usize::try_from(at).unwrap_or(usize::MAX)) {
+                Some(skip) => shown(skip, alloc),
+                None => own("skipped", alloc),
+            };
+            return Err(SourceError::NotFetchable { package: own(p.name.as_str(), alloc), version, why });
+        }
+        Where::Unit(at) => usize::try_from(at).unwrap_or(usize::MAX),
+    };
+    let Some(unit) = plan.units.get(at) else {
+        return Err(SourceError::NoManifest { package: own(p.name.as_str(), alloc), version });
+    };
+    // A record is mapped and opened once (a git commit's serves all its packages).
+    let view = match views.get(at).copied().flatten() {
+        Some(view) => view,
+        None => {
+            let source = unit.source();
+            let Some(bytes) = records.record(&source) else {
+                return Err(SourceError::NotFetched {
+                    package: own(p.name.as_str(), alloc),
+                    version,
+                    source: own(p.source_text.as_str(), alloc),
+                    key: source.key().0,
+                });
+            };
+            let view = (open)(&source, bytes).map_err(|why| SourceError::Refused { package: own(p.name.as_str(), alloc), version, why })?;
+            if let Some(slot) = views.get_mut(at) {
+                *slot = Some(view);
+            }
+            view
+        }
+    };
+    Ok((at, view))
+}
+
+/// Package `id`'s record, its facts and its directory in the record: the one lookup
+/// [`StoreSources::package`], [`StoreSources::package_with`], and [`StoreSources::files`] share.
+#[expect(clippy::too_many_arguments, reason = "internal split-borrow helper shared by package, package_with, and files")]
+fn locate_inner<'l, 'b, 'a, R: Records<'b>>(
+    lock: &'l Lock<'a>,
+    plan: &plan::Plan<'l, 'a>,
+    place: &[Where],
+    records: &mut R,
+    open: Open<'b>,
+    views: &mut [Option<PackView<'b>>],
+    dirs: &mut [Option<Text<'a>>],
+    commits: &mut AVec<'a, Commit<'a>>,
+    alloc: Alloc<'a>,
+    id: LockId,
+) -> Result<(PackView<'b>, Package<'a>, Text<'a>), SourceError<'a>> {
+    let (at, view) = open_view_inner(lock, plan, place, records, open, views, alloc, id)?;
+    let p = lock.package(id);
+    let name = p.name.as_str();
+    let version = version_text(lock, id, alloc);
+    match plan.units.get(at) {
+        Some(plan::Unit::Crate { .. }) => {
+            let units = lay_out(&view, "", name, &version, alloc)?;
+            match units.members.iter().find(|m| m.name.as_str() == name) {
+                Some(member) => {
+                    if let Some(slot) = dirs.get_mut(id.index()) {
+                        *slot = Some(own(member.dir.as_str(), alloc));
                     }
-                };
-                let (package, dir) = git_package(&mut self.commits[at], &view, name, &version, alloc)?;
-                Ok((view, package, dir))
+                    Ok((view, Package::from_member(member, alloc), own(member.dir.as_str(), alloc)))
+                }
+                None => Err(SourceError::NoManifest { package: own(p.name.as_str(), alloc), version }),
             }
         }
+        Some(plan::Unit::Git { commit, .. }) => {
+            let commit = *commit;
+            let c_at = match commits.iter().position(|c| c.commit == commit) {
+                Some(c_at) => c_at,
+                None => {
+                    commits.push(Commit { commit, layouts: Vec::new_in(alloc), root_tried: false, scan: None });
+                    commits.len() - 1
+                }
+            };
+            let Some(c) = commits.get_mut(c_at) else {
+                return Err(SourceError::NoManifest { package: own(p.name.as_str(), alloc), version });
+            };
+            let (package, dir) = git_package(c, &view, name, &version, alloc)?;
+            if let Some(slot) = dirs.get_mut(id.index()) {
+                *slot = Some(own(dir.as_str(), alloc));
+            }
+            Ok((view, package, dir))
+        }
+        None => Err(SourceError::NoManifest { package: own(p.name.as_str(), alloc), version }),
     }
 }
 
