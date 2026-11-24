@@ -223,6 +223,8 @@ enum Fusion {
     MemBaseOff { base: u32, off: i64, imm_inst: u32 },
     /// `load`/`store` directly from `[base, idx, lsl #size]` (scaled register index).
     MemScaledIdx { base: u32, idx: u32, shift_imm: u32 },
+    /// `load`/`store` directly from `[base, widx, uxtw (#size)]` (32-bit unsigned-extended index).
+    MemUxtwIdx { base: u32, idx: u32, scaled: bool, shift_imm: u32 },
     /// `load`/`store` directly from `[base, idx]` (unscaled register index).
     MemRegIdx { base: u32, idx: u32 },
     /// `and(a, not(b))` -> `bic rd, a, b`.
@@ -2788,7 +2790,8 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                                 }
                             }
                         } else if pi_uses == 1 && off == 0 && ty_at(view.tys, to_idx(by)).bits(64) == 64 {
-                            // Pattern B2: `ptr_add(base, shl(idx, log2(size)))` -> `[base, idx, lsl #size]`!
+                            // Pattern B2: `ptr_add(base, shl(idx, log2(size)))` -> `[base, idx, lsl #size]`
+                            // (or `[base, widx, uxtw #size]` when `idx = zext(u32 -> u64, widx)`).
                             let bi = to_idx(by);
                             if size_shift > 0
                                 && at_u32(&use_count, bi) == 1
@@ -2800,7 +2803,56 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                                 let idx_v = at_u32(view.extra, sat);
                                 let sh_v = at_u32(view.extra, sat + 1);
                                 if at_opt(&const_u64, to_idx(sh_v)) == Some(u64::from(size_shift)) {
+                                    let zi = to_idx(idx_v);
+                                    if mem_sz.is_some()
+                                        && at_u32(&use_count, zi) == 1
+                                        && at_u32(&inst_block, zi) == b
+                                        && view.op(zi) == Op::Zext
+                                        && !at_bool(&skip_emit, zi)
+                                    {
+                                        let src_v = at_u32(view.data, zi);
+                                        if ty_at(view.tys, to_idx(src_v)).bits(64) == 32 {
+                                            set_at(
+                                                &mut fusion,
+                                                inst,
+                                                Fusion::MemUxtwIdx {
+                                                    base,
+                                                    idx: src_v,
+                                                    scaled: true,
+                                                    shift_imm: sh_v,
+                                                },
+                                            );
+                                            set_at(&mut skip_emit, pi, true);
+                                            set_at(&mut skip_emit, bi, true);
+                                            set_at(&mut skip_emit, zi, true);
+                                            continue;
+                                        }
+                                    }
                                     set_at(&mut fusion, inst, Fusion::MemScaledIdx { base, idx: idx_v, shift_imm: sh_v });
+                                    set_at(&mut skip_emit, pi, true);
+                                    set_at(&mut skip_emit, bi, true);
+                                    continue;
+                                }
+                            }
+                            // Pattern B3: `ptr_add(base, zext(u32 -> u64, widx))` -> `[base, widx, uxtw]`.
+                            if mem_sz.is_some()
+                                && at_u32(&use_count, bi) == 1
+                                && at_u32(&inst_block, bi) == b
+                                && view.op(bi) == Op::Zext
+                                && !at_bool(&skip_emit, bi)
+                            {
+                                let src_v = at_u32(view.data, bi);
+                                if ty_at(view.tys, to_idx(src_v)).bits(64) == 32 {
+                                    set_at(
+                                        &mut fusion,
+                                        inst,
+                                        Fusion::MemUxtwIdx {
+                                            base,
+                                            idx: src_v,
+                                            scaled: false,
+                                            shift_imm: u32::MAX,
+                                        },
+                                    );
                                     set_at(&mut skip_emit, pi, true);
                                     set_at(&mut skip_emit, bi, true);
                                     continue;
@@ -3421,6 +3473,11 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
             }
             Fusion::MemScaledIdx { shift_imm, .. } => {
                 inc_u32(&mut imm_uses, to_idx(shift_imm));
+            }
+            Fusion::MemUxtwIdx { shift_imm, .. } => {
+                if shift_imm != u32::MAX {
+                    inc_u32(&mut imm_uses, to_idx(shift_imm));
+                }
             }
             Fusion::TbzBr { mask_imm, .. } => {
                 inc_u32(&mut imm_uses, to_idx(mask_imm));
@@ -4381,7 +4438,9 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
             match at_fusion(&fusion, k) {
                 Fusion::MemSpOff { .. } => false,
                 Fusion::MemBaseOff { base, .. } => loc_is_reg(base),
-                Fusion::MemScaledIdx { base, idx, .. } | Fusion::MemRegIdx { base, idx } => {
+                Fusion::MemScaledIdx { base, idx, .. }
+                | Fusion::MemUxtwIdx { base, idx, .. }
+                | Fusion::MemRegIdx { base, idx } => {
                     loc_is_reg(base) || loc_is_reg(idx)
                 }
                 Fusion::None => {
@@ -6426,6 +6485,16 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             let raw = enc::ldr_reg_scaled(size, dst, rbase, ridx);
                             words.push(if is_fp { enc::fp_access(raw) } else { raw });
                         }
+                        Fusion::MemUxtwIdx { base, idx, scaled, .. } => {
+                            let rbase = load_gpr(&mut words, base, X16);
+                            let ridx = load_gpr(&mut words, idx, X17);
+                            let raw = if scaled {
+                                enc::ldr_reg_uxtw_scaled(size, dst, rbase, ridx)
+                            } else {
+                                enc::ldr_reg_uxtw(size, dst, rbase, ridx)
+                            };
+                            words.push(if is_fp { enc::fp_access(raw) } else { raw });
+                        }
                         Fusion::MemRegIdx { base, idx } => {
                             let rbase = load_gpr(&mut words, base, X16);
                             let ridx = load_gpr(&mut words, idx, X17);
@@ -6508,6 +6577,57 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                                     let rbase = load_gpr(&mut words, base, X16);
                                     let ridx = load_gpr(&mut words, idx, X17);
                                     words.push(enc::add_lsl(X17, rbase, ridx, mem_shift(size)));
+                                    let rval = load_gpr(&mut words, val, X16);
+                                    emit_mem_imm(&mut words, false, false, size, rval, X17, 0);
+                                }
+                            }
+                        }
+                        Fusion::MemUxtwIdx { base, idx, scaled, .. } => {
+                            if is_fp {
+                                let rval = load_fp(&mut words, val, V30);
+                                let rbase = load_gpr(&mut words, base, X16);
+                                let ridx = load_gpr(&mut words, idx, X17);
+                                let raw = if scaled {
+                                    enc::str_reg_uxtw_scaled(size, rval, rbase, ridx)
+                                } else {
+                                    enc::str_reg_uxtw(size, rval, rbase, ridx)
+                                };
+                                words.push(enc::fp_access(raw));
+                            } else {
+                                let spilled = [val, base, idx]
+                                    .iter()
+                                    .filter(|&&v| !matches!(at_loc(&reg_alloc.loc_of, to_idx(v)), AllocLoc::Gpr(_)))
+                                    .count();
+                                if spilled <= 2 {
+                                    let mut next_s = X16;
+                                    let mut grab = |words: &mut Vec<u32, Alloc<'a>>, v: u32| -> Reg {
+                                        match at_loc(&reg_alloc.loc_of, to_idx(v)) {
+                                            AllocLoc::Gpr(r) => u32::from(r),
+                                            _ => {
+                                                let s = next_s;
+                                                next_s = X17;
+                                                load_gpr(words, v, s)
+                                            }
+                                        }
+                                    };
+                                    let rval = grab(&mut words, val);
+                                    let rbase = grab(&mut words, base);
+                                    let ridx = grab(&mut words, idx);
+                                    let raw = if scaled {
+                                        enc::str_reg_uxtw_scaled(size, rval, rbase, ridx)
+                                    } else {
+                                        enc::str_reg_uxtw(size, rval, rbase, ridx)
+                                    };
+                                    words.push(raw);
+                                } else {
+                                    let rbase = load_gpr(&mut words, base, X16);
+                                    let ridx = load_gpr(&mut words, idx, X17);
+                                    emit_narrow(&mut words, ridx, 32);
+                                    if scaled {
+                                        words.push(enc::add_lsl(X17, rbase, ridx, mem_shift(size)));
+                                    } else {
+                                        words.push(enc::add(X17, rbase, ridx));
+                                    }
                                     let rval = load_gpr(&mut words, val, X16);
                                     emit_mem_imm(&mut words, false, false, size, rval, X17, 0);
                                 }

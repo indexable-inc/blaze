@@ -180,9 +180,13 @@ pub fn lz77_scan_fast<A: Allocator>(
     //   `SeqOp`s are written within `seqs_out`'s reserved `block_len / 3 + 32` capacity.
     unsafe {
         let b_end = base.add(end);
+        let mut step = 1usize;
+        let mut next_step = pos + 64;
         while pos <= match_limit {
-            let lit_gap = pos - lit_anchor;
-            let step = 1usize + (lit_gap >> 4);
+            if pos >= next_step {
+                step += 1;
+                next_step = pos + 64;
+            }
             let pos1 = pos + step;
 
             // 2-position pipelined 10-bit-tagged 7-byte hash probe: overlaps both table loads.
@@ -260,10 +264,8 @@ pub fn lz77_scan_fast<A: Allocator>(
                 u32::try_from(off).unwrap_or(0).wrapping_add(3)
             };
 
-            if lit_len > 0 {
-                copy_lits_wild_ptr(base.add(lit_anchor), lit_dst, lit_len);
-                lit_dst = lit_dst.add(lit_len);
-            }
+            copy_lits_wild_ptr(base.add(lit_anchor), lit_dst, lit_len);
+            lit_dst = lit_dst.add(lit_len);
             ptr::write(
                 seq_dst,
                 SeqOp {
@@ -276,71 +278,41 @@ pub fn lz77_scan_fast<A: Allocator>(
 
             pos += ml;
             lit_anchor = pos;
+            step = 1;
+            next_step = pos + 64;
             if pos <= match_limit && pos >= 2 {
                 let tail8 = read_u64_unaligned(base.add(pos - 2));
                 let (th, te) = hash7_tagged(tail8, pos - 2, LZ77_FAST_HASH_LOG);
                 *ht.add(th) = te;
             }
 
-            // Harvest `rep[0]` (at `pos + 1`) and `rep[1]` (at `pos + 2`) chains (zero hash lookups).
-            loop {
-                if pos + 1 <= match_limit && r0 <= pos + 1 && r0 <= win {
-                    let rp = pos + 1;
-                    let rprev = rp - r0;
-                    if read_u32_unaligned(base.add(rprev)) == read_u32_unaligned(base.add(rp)) {
-                        let rml = 4 + match_len_ptr(base.add(rprev + 4), base.add(rp + 4), b_end);
-                        *lit_dst = *base.add(pos);
-                        lit_dst = lit_dst.add(1);
-                        ptr::write(
-                            seq_dst,
-                            SeqOp {
-                                lit_len: 1,
-                                match_len: u32::try_from(rml).unwrap_or(0),
-                                offset: 1,
-                            },
-                        );
-                        seq_dst = seq_dst.add(1);
-                        pos = rp + rml;
-                        lit_anchor = pos;
-                        if pos <= match_limit && pos >= 2 {
-                            let tail8 = read_u64_unaligned(base.add(pos - 2));
-                            let (th, te) = hash7_tagged(tail8, pos - 2, LZ77_FAST_HASH_LOG);
-                            *ht.add(th) = te;
-                        }
-                        continue;
-                    }
+            // Harvest `rep[0]` (at `pos + 1`) chains (zero hash lookups).
+            while pos + 1 <= match_limit && r0 <= pos + 1 && r0 <= win {
+                let rp = pos + 1;
+                let rprev = rp - r0;
+                if read_u32_unaligned(base.add(rprev)) != read_u32_unaligned(base.add(rp)) {
+                    break;
                 }
-                if pos + 2 <= match_limit && r1 <= pos + 2 && r1 <= win {
-                    let rp = pos + 2;
-                    let rprev = rp - r1;
-                    if read_u32_unaligned(base.add(rprev)) == read_u32_unaligned(base.add(rp)) {
-                        let rml = 4 + match_len_ptr(base.add(rprev + 4), base.add(rp + 4), b_end);
-                        ptr::write_unaligned(
-                            lit_dst.cast::<u16>(),
-                            ptr::read_unaligned(base.add(pos).cast::<u16>()),
-                        );
-                        lit_dst = lit_dst.add(2);
-                        ptr::write(
-                            seq_dst,
-                            SeqOp {
-                                lit_len: 2,
-                                match_len: u32::try_from(rml).unwrap_or(0),
-                                offset: 2,
-                            },
-                        );
-                        seq_dst = seq_dst.add(1);
-                        core::mem::swap(&mut r0, &mut r1);
-                        pos = rp + rml;
-                        lit_anchor = pos;
-                        if pos <= match_limit && pos >= 2 {
-                            let tail8 = read_u64_unaligned(base.add(pos - 2));
-                            let (th, te) = hash7_tagged(tail8, pos - 2, LZ77_FAST_HASH_LOG);
-                            *ht.add(th) = te;
-                        }
-                        continue;
-                    }
+                let rml = 4 + match_len_ptr(base.add(rprev + 4), base.add(rp + 4), b_end);
+                *lit_dst = *base.add(pos);
+                lit_dst = lit_dst.add(1);
+                ptr::write(
+                    seq_dst,
+                    SeqOp {
+                        lit_len: 1,
+                        match_len: u32::try_from(rml).unwrap_or(0),
+                        offset: 1,
+                    },
+                );
+                seq_dst = seq_dst.add(1);
+                pos = rp + rml;
+                lit_anchor = pos;
+                next_step = pos + 64;
+                if pos <= match_limit && pos >= 2 {
+                    let tail8 = read_u64_unaligned(base.add(pos - 2));
+                    let (th, te) = hash7_tagged(tail8, pos - 2, LZ77_FAST_HASH_LOG);
+                    *ht.add(th) = te;
                 }
-                break;
             }
         }
 
@@ -417,9 +389,13 @@ pub fn lz77_scan_default<A: Allocator>(
     // SAFETY: Same buffer, pointer, and capacity invariants as `lz77_scan_fast`.
     unsafe {
         let b_end = base.add(end);
+        let mut step = 1usize;
+        let mut next_step = pos + 64;
         while pos <= match_limit {
-            let lit_gap = pos - lit_anchor;
-            let step = 1usize + (lit_gap >> 5);
+            if pos >= next_step {
+                step += 1;
+                next_step = pos + 64;
+            }
             let pos1 = pos + step;
 
             // 2-position pipelined probe of `ht_long` (`hash7`) + 2-way `ht_short` (`hash4`):
@@ -619,10 +595,8 @@ pub fn lz77_scan_default<A: Allocator>(
                     u32::try_from(m_off).unwrap_or(0).wrapping_add(3)
                 };
 
-                if lit_len > 0 {
-                    copy_lits_wild_ptr(base.add(lit_anchor), lit_dst, lit_len);
-                    lit_dst = lit_dst.add(lit_len);
-                }
+                copy_lits_wild_ptr(base.add(lit_anchor), lit_dst, lit_len);
+                lit_dst = lit_dst.add(lit_len);
                 ptr::write(
                     seq_dst,
                     SeqOp {
@@ -636,6 +610,8 @@ pub fn lz77_scan_default<A: Allocator>(
                 let match_start = m_pos;
                 pos += m_ml;
                 lit_anchor = pos;
+                step = 1;
+                next_step = pos + 64;
                 if match_start + 2 < pos && match_start + 2 <= match_limit {
                     insert_dfast_short(base, ht_short, match_start + 2);
                     let m8 = read_u64_unaligned(base.add(match_start + 2));
@@ -670,6 +646,7 @@ pub fn lz77_scan_default<A: Allocator>(
                             seq_dst = seq_dst.add(1);
                             pos = rp + rml;
                             lit_anchor = pos;
+                            next_step = pos + 64;
                             if pos <= match_limit && pos >= 2 {
                                 insert_dfast_short(base, ht_short, pos - 2);
                                 let t8 = read_u64_unaligned(base.add(pos - 2));
@@ -702,6 +679,7 @@ pub fn lz77_scan_default<A: Allocator>(
                             core::mem::swap(&mut r0, &mut r1);
                             pos = rp + rml;
                             lit_anchor = pos;
+                            next_step = pos + 64;
                             if pos <= match_limit && pos >= 2 {
                                 insert_dfast_short(base, ht_short, pos - 2);
                                 let t8 = read_u64_unaligned(base.add(pos - 2));
