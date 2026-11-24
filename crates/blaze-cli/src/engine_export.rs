@@ -573,7 +573,10 @@ fn export_program<'f>(
     let ids_ns = phases.since(began_ids);
     let ids_line = ids.line(&asked, ids_ns);
 
-    let overflow = program::dev_overflow(cx, root, frame)?;
+    // `blaze export` produces a release native executable: disable dev overflow checks so
+    // hot arithmetic loops compile without per-add/sub panic branches (matching release builds)
+    // and small helpers become pure 0-call leaves eligible for bottom-up LTO inlining.
+    let overflow = blaze_ladder::run::OverflowChecks::Off;
     let panic_profile = program::dev_profile_panic(cx, root, frame)?;
     let panic_ladder = blaze_ladder::panic_strategy::of_profile(panic_profile);
     let export_panic = match panic_profile {
@@ -682,6 +685,36 @@ fn export_program<'f>(
     phases.run_names = Some(run_names::NamesRead::of(read.counts(), &seen).with_ids(ids_line));
     if let Some(why) = seen.refused() {
         return Err(CliError::RunNames(run_names::RunNamesError::Trees { why }));
+    }
+
+    // Multi-pass bottom-up whole-program LTO inlining:
+    // - Passes 0..2 (`populate_only = true`): collect all small closed 0-call LIR leaves (including
+    //   shared `core` helpers discovered early in BFS like `ptr::add` / `read_unaligned`) and
+    //   fold them into mid-level helpers (`hash7_tagged`, `lookup_x2`, etc.) without emitting code.
+    // - Pass 2 (`populate_only = false`): splice all banked helpers into callers and re-emit SOTA
+    //   AArch64 code records for every caller that spliced >= 1 callee.
+    {
+        let mut lto_buf: AVec<'_, u8> = Vec::new_in(alloc);
+        for pass in 0u8..3 {
+            let populate_only = pass < 2;
+            for row in (0..outcomes.len()).rev() {
+                if walk.kind(row) != RowKind::Instance {
+                    continue;
+                }
+                if matches!(outcomes[row], RowOutcome::UnbuiltStub(_)) {
+                    continue;
+                }
+                lto_buf.clear();
+                let sym = walk.symbol(row);
+                let tabled = walk.tabled(row);
+                let name = walk.name(row);
+                if let Ok(true) = maker.make_export_lto(sym, tabled, name, populate_only, &mut lto_buf) {
+                    let mut copied: AVec<'_, u8> = Vec::with_capacity_in(lto_buf.len(), alloc);
+                    copied.extend_from_slice(lto_buf.as_slice());
+                    outcomes[row] = RowOutcome::Unkeyed(copied);
+                }
+            }
+        }
     }
 
     // Detect whether any walked row or code record touches Rust thread-locals.
