@@ -106,6 +106,52 @@ where
     a + (b - a) * t
 }
 
+/// Alias for [`lerp`] matching WGSL/MSL `mix(a, b, t)`.
+#[inline]
+pub fn mix<T, S>(a: T, b: T, t: S) -> T
+where
+    T: Copy + Add<Output = T> + Sub<Output = T> + Mul<S, Output = T>,
+{
+    lerp(a, b, t)
+}
+
+/// Bounds-checked `u32` storage-buffer read (lowers to `slice[index]` in WGSL/MSL, zero stops on CPU).
+#[inline]
+pub fn at<T: Copy + Default>(slice: &[T], index: u32) -> T {
+    let i = usize::try_from(index).unwrap_or(usize::MAX);
+    slice.get(i).copied().unwrap_or_default()
+}
+
+/// Exact zero-cast `u32 -> f32` conversion (lowers to `f32(u)` in WGSL and `float(u)` in MSL).
+#[inline]
+pub fn to_f32(u: u32) -> f32 {
+    let hi = u16::try_from(u >> 16).unwrap_or(0);
+    let lo = u16::try_from(u & 0xffff).unwrap_or(0);
+    f32::from(hi) * 65536.0 + f32::from(lo)
+}
+
+/// Clamped zero-cast `f32 -> u32` conversion (lowers to `u32(x)` in WGSL and `uint(x)` in MSL).
+#[inline]
+pub fn to_u32(x: f32) -> u32 {
+    if !x.is_finite() || x <= 0.0 {
+        return 0;
+    }
+    if x >= 4_294_967_040.0 {
+        return u32::MAX;
+    }
+    let mut lo: u32 = 0;
+    let mut hi: u32 = u32::MAX;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2 + 1;
+        if to_f32(mid) <= x {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
 /// Absolute value of `x` (clears the sign bit).
 #[inline]
 pub const fn abs(x: f32) -> f32 {

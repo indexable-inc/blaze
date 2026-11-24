@@ -33,6 +33,8 @@ pub mod extract;
 pub mod input;
 pub mod layout;
 pub mod shaders;
+pub mod slug;
+pub mod slug_shader;
 pub mod style;
 pub mod types;
 pub mod ui;

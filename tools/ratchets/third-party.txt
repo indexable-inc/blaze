@@ -129,6 +129,8 @@ blaze-screen	1	1	62
 blaze-script	1	0	16
 blaze-semver	0	0	1
 blaze-sim	0	0	1
+blaze-site	0	0	1
+blaze-site-wasm	0	0	1
 blaze-solve	0	0	1
 blaze-sort	0	0	1
 blaze-source	3	0	38

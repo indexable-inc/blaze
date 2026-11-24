@@ -16,6 +16,8 @@ pub enum UiError {
     InvalidEntity(Entity),
     /// Bounded layout or dock tree capacity exceeded.
     CapacityExceeded,
+    /// Malformed or truncated `BZG1` Slug vector glyph table.
+    InvalidGlyphTable,
 }
 
 impl From<EcsError> for UiError {
