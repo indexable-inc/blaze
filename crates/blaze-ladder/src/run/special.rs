@@ -213,6 +213,33 @@ pub enum MakerStart {
     Direct(blaze_id::ItemKey),
 }
 
+/// Which start class a [`crate::run::make_one::Maker`] serves (rule 76):
+/// - [`MakerKind::ByRule`]: starts by THE start rule (`MakerStart::ByRule`), which runs
+///   `start_of` and (for a Rust start) mutates the program's head store via `rust_start` for a
+///   specific `entry` (`main`). Must never be conflated with another `ByRule` entry or with
+///   [`MakerKind::Direct`].
+/// - [`MakerKind::Direct`]: starts directly at a test fn (`MakerStart::Direct(_)`).
+///   `LazyProgram::decide_start(MakerStart::Direct(_))` mutates no head store, `rust_start()`
+///   is always `None`, `locate_local` never takes the `Hosted`/`CMain` start-chain branch, and
+///   `make_one` never reads `FrontEnd::entry()`. Every `Direct(_)` test in one suite therefore
+///   shares ONE `Maker` (`RecordsProgram` + `MakerState`), updating its direct entry via
+///   [`crate::run::make_one::Maker::set_direct_entry`] without rebuilding cached state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MakerKind {
+    ByRule(Option<ItemKey>),
+    Direct,
+}
+
+impl MakerKind {
+    /// The start class for `(entry, start)`.
+    pub const fn of(entry: Option<ItemKey>, start: MakerStart) -> MakerKind {
+        match start {
+            MakerStart::ByRule => MakerKind::ByRule(entry),
+            MakerStart::Direct(_) => MakerKind::Direct,
+        }
+    }
+}
+
 /// The run's roots ([`roots`]; the module doc's table).
 pub struct Roots<'a> {
     /// What the start rule answered.

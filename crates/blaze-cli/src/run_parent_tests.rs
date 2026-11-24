@@ -1487,7 +1487,7 @@ fn the_native_library_is_the_first_frame() {
     std::println!("native: the library told first, its words slots 0 and 1; told late refused");
 }
 
-/// The toy's maker as a code worker keeps it: made for one entry and start (test_drive.rs
+/// The toy's maker as a code worker keeps it: made for one start class (test_drive.rs
 /// `MadeFor`).
 struct ToyKept<'t> {
     maker: ToyMaker<'t>,
@@ -1496,8 +1496,17 @@ struct ToyKept<'t> {
 }
 
 impl crate::test_drive::MadeFor for ToyKept<'_> {
-    fn made_for(&self) -> (Option<ItemKey>, blaze_ladder::run::special::MakerStart) {
-        (self.entry, self.start)
+    fn made_for(&self) -> blaze_ladder::run::special::MakerKind {
+        blaze_ladder::run::special::MakerKind::of(self.entry, self.start)
+    }
+
+    fn set_direct_entry(&mut self, entry: Option<ItemKey>, start: blaze_ladder::run::special::MakerStart) -> bool {
+        if !matches!((self.start, start), (blaze_ladder::run::special::MakerStart::Direct(_), blaze_ladder::run::special::MakerStart::Direct(_))) {
+            return false;
+        }
+        self.entry = entry;
+        self.start = start;
+        true
     }
 }
 
@@ -1506,6 +1515,7 @@ impl crate::test_drive::MadeFor for ToyKept<'_> {
 /// `Makers`. `panics`: how many makes left panic before they make (rule 20's plant).
 struct ToyMakers<'t> {
     calls: &'t Cell<usize>,
+    created: Cell<usize>,
     kept: crate::test_drive::Makers<ToyKept<'t>>,
     panics: usize,
     forgot: usize,
@@ -1518,7 +1528,11 @@ impl crate::test_drive::KeptMakers for ToyMakers<'_> {
             panic!("a planted panic in a toy make");
         }
         let calls = self.calls;
-        let kept = self.kept.of(job, || Ok(ToyKept { maker: ToyMaker { calls, typed: true }, entry: job.entry, start: job.start }))?;
+        let created = &self.created;
+        let kept = self.kept.of(job, || {
+            created.set(created.get() + 1);
+            Ok(ToyKept { maker: ToyMaker { calls, typed: true }, entry: job.entry, start: job.start })
+        })?;
         job.order.make(&mut kept.maker, &job.proof, job.name.as_slice(), entry)
     }
 
@@ -1534,12 +1548,12 @@ impl crate::test_drive::KeptMakers for ToyMakers<'_> {
 }
 
 fn toy_makers(calls: &Cell<usize>, plant: crate::test_drive::MakersPlant, panics: usize) -> ToyMakers<'_> {
-    ToyMakers { calls, kept: crate::test_drive::Makers::new(blaze_own::testing::heap().alloc(), plant), panics, forgot: 0 }
+    ToyMakers { calls, created: Cell::new(0), kept: crate::test_drive::Makers::new(blaze_own::testing::heap().alloc(), plant), panics, forgot: 0 }
 }
 
-/// A make of the toy's fn `item` for a test whose roots start at `entry`, as the relay hands it
-/// to a worker (test_drive.rs `Job`).
-fn toy_job(item: u128, entry: u128) -> crate::test_drive::Job<'static> {
+/// A make of the toy's fn `item` for a test whose roots start at `entry` with `start`, as the
+/// relay hands it to a worker (test_drive.rs `Job`).
+fn toy_job_start(item: u128, entry: u128, start: blaze_ladder::run::special::MakerStart) -> crate::test_drive::Job<'static> {
     let heap = blaze_own::testing::heap();
     let mut name = blaze_engine::SVec::with_capacity_in(20, heap.shared());
     name.extend_from_slice(&name_of(item));
@@ -1549,8 +1563,13 @@ fn toy_job(item: u128, entry: u128) -> crate::test_drive::Job<'static> {
         name,
         proof: Checked::Clean.runs(ItemKey(item)).expect("a clean body runs"),
         entry: Some(ItemKey(entry)),
-        start: blaze_ladder::run::special::MakerStart::ByRule,
+        start,
     }
+}
+
+/// A make of the toy's fn `item` for a `ByRule` run starting at `entry`.
+fn toy_job(item: u128, entry: u128) -> crate::test_drive::Job<'static> {
+    toy_job_start(item, entry, blaze_ladder::run::special::MakerStart::ByRule)
 }
 
 /// `symbol` resolved under `Codes::Pooled` through the real relay and the real pool's channels
@@ -1665,35 +1684,69 @@ fn pooled_codes_equal_serial() {
 }
 
 /// THE SEAM TEST's control (rule 78, a planted bug): a worker whose makers are found by suite
-/// alone (`MakersPlant::BySuiteAlone`) hands a make of a test starting at `a` the maker made for
-/// `main`'s; `Makers::of` refuses it by name, typed, and never makes with it. Asserts the clean
-/// makers make both, and the planted ones refuse the second with the words of `ANOTHER_START`.
+/// alone (`MakersPlant::BySuiteAlone`) hands a make of another start class (another `ByRule`
+/// entry, or `Direct` vs `ByRule`) the kept maker of the first; `Makers::of` refuses it by
+/// name, typed, and never makes with it. Asserts the clean makers make both, and the planted
+/// ones refuse the second with the words of `ANOTHER_START`.
 /// Prints "seam control: a maker of another start refused".
 #[test]
 fn a_maker_of_another_start_is_refused() {
+    use blaze_ladder::run::special::MakerStart;
     use crate::test_drive::{MakersPlant, make_one};
 
     let heap = blaze_own::testing::heap();
     let mut scratch: AVec<'static, u8> = blaze_own::Vec::new_in(heap.alloc());
-    for plant in [MakersPlant::None, MakersPlant::BySuiteAlone] {
-        let calls = Cell::new(0);
-        let mut makers = toy_makers(&calls, plant, 0);
-        make_one(&mut makers, &toy_job(MAIN, MAIN), &mut scratch, heap.shared()).expect("main's make");
-        let second = make_one(&mut makers, &toy_job(A, A), &mut scratch, heap.shared());
-        match plant {
-            MakersPlant::None => {
-                second.expect("a make of another test's roots gets a maker of its own");
-                assert_eq!(calls.get(), 2, "the clean makers did not make both");
-            }
-            MakersPlant::BySuiteAlone => {
-                let why = second.expect_err("the planted makers handed a maker of another start, and it was used");
-                assert!(why.walk.as_str().contains("another entry or start"), "the refusal does not name the start: {why}");
-                assert!(why.whole, "the refusal's words were cut");
-                assert_eq!(calls.get(), 1, "the maker of another start made the instance");
+    let direct_a = MakerStart::Direct(blaze_id::ItemKey(blaze_ids::ContentId::of("direct test", b"a")));
+    for second_job in [toy_job(A, A), toy_job_start(A, A, direct_a)] {
+        for plant in [MakersPlant::None, MakersPlant::BySuiteAlone] {
+            let calls = Cell::new(0);
+            let mut makers = toy_makers(&calls, plant, 0);
+            make_one(&mut makers, &toy_job(MAIN, MAIN), &mut scratch, heap.shared()).expect("main's make");
+            let second = make_one(&mut makers, &second_job, &mut scratch, heap.shared());
+            match plant {
+                MakersPlant::None => {
+                    second.expect("a make of another start class gets a maker of its own");
+                    assert_eq!(calls.get(), 2, "the clean makers did not make both");
+                    assert_eq!(makers.created.get(), 2, "distinct start classes must not share one maker");
+                }
+                MakersPlant::BySuiteAlone => {
+                    let why = second.expect_err("the planted makers handed a maker of another start, and it was used");
+                    assert!(why.walk.as_str().contains("another entry or start"), "the refusal does not name the start: {why}");
+                    assert!(why.whole, "the refusal's words were cut");
+                    assert_eq!(calls.get(), 1, "the maker of another start made the instance");
+                }
             }
         }
     }
     std::println!("seam control: a maker of another start refused");
+}
+
+/// All `MakerStart::Direct(_)` tests in one suite share ONE persistent maker per worker
+/// (retargeted cleanly via `set_direct_entry`), never allocating one maker per test and never
+/// evicting at `MOST_MAKERS = 64`; a `ByRule` job in the same suite gets its own maker.
+#[test]
+fn direct_tests_in_one_suite_share_one_persistent_maker() {
+    use blaze_ladder::run::special::MakerStart;
+    use crate::test_drive::{MakersPlant, make_one};
+
+    let heap = blaze_own::testing::heap();
+    let mut scratch: AVec<'static, u8> = blaze_own::Vec::new_in(heap.alloc());
+    let calls = Cell::new(0);
+    let mut makers = toy_makers(&calls, MakersPlant::None, 0);
+    for i in 1u128..=100u128 {
+        let start = MakerStart::Direct(blaze_id::ItemKey(blaze_ids::ContentId::of("direct test", &i.to_be_bytes())));
+        let job = toy_job_start(A, i, start);
+        make_one(&mut makers, &job, &mut scratch, heap.shared()).expect("direct test make");
+        let kept = makers.kept.kept(&job).expect("shared direct maker is kept");
+        assert_eq!(kept.entry, Some(ItemKey(i)), "shared direct maker retargeted its entry");
+        assert_eq!(kept.start, start, "shared direct maker retargeted its start");
+    }
+    assert_eq!(calls.get(), 100, "every direct test made its instance");
+    assert_eq!(makers.created.get(), 1, "all 100 direct tests in one suite must reuse ONE persistent maker");
+
+    // A `ByRule` job in the same suite must NOT reuse the `Direct` maker.
+    make_one(&mut makers, &toy_job(MAIN, MAIN), &mut scratch, heap.shared()).expect("by-rule make");
+    assert_eq!(makers.created.get(), 2, "ByRule in the same suite must get its own maker");
 }
 
 /// Rule 20 on a code worker: a make that panics fails alone, typed, naming that it panicked;

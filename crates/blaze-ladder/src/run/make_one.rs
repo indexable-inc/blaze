@@ -1112,12 +1112,11 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
     // Phase 1: lay out coroutine states and build LIR ONCE into an owned `BuiltPhase`. Any
     // missing fact (`Missing` / `OpaqueOwnerUnchecked` / `NoTrait` / `Check`) retries only Phase 1.
     let mut asked = AskProgress::new_in(alloc);
-    let is_lir_sink = matches!(sink, BuildSink::Lir { .. });
     let built_phase = loop {
         let MakerState { checked, tables, work, .. } = &mut *state;
         let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
         let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
-        let step = build_lir_phase(&*program, &bodies, work, build_i, build_instance, is_lir_sink);
+        let step = build_lir_phase(&*program, &bodies, work, build_i, build_instance);
         *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
         match step {
             Ok(Phase1::Built(built)) => break built,
@@ -2038,7 +2037,6 @@ fn build_lir_phase<P: FrontEnd>(
     work: &mut Work,
     i: usize,
     instance: Instance,
-    is_lir_sink: bool,
 ) -> Result<Phase1<Global>, RunError> {
     let function = program.function(i);
     let name = || function.named();
@@ -2121,8 +2119,7 @@ fn build_lir_phase<P: FrontEnd>(
         None => None,
         Some((of, part)) => {
             let find = |stash: &[BuiltParts]| stash.iter().position(|b| b.owner == of.owner && b.ordinal == of.ordinal && b.args[..] == args[..]);
-            if is_lir_sink
-                && let Some(at) = find(&work.stash[..])
+            if let Some(at) = find(&work.stash[..])
                 && work.stash.get(at).and_then(|b| b.parts.get(part.index())).is_some_and(Option::is_none)
             {
                 bodies.coroutines.states.forget(of.owner, of.ordinal, &args);
@@ -2983,11 +2980,29 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         Self::starting(names, entry, start, typing, builder, alloc)
     }
 
-    /// Where this maker's program starts and from which entry: what it was made for, so a
-    /// keeper of makers can check that a make is handed to the maker of its own start (blaze-cli
-    /// test_drive.rs `SuiteMakers`).
-    pub fn made_for(&self) -> (Option<ItemKey>, crate::run::special::MakerStart) {
-        (self.entry, self.start)
+    /// Which start class this maker was made for (`MakerKind::ByRule(entry)` or
+    /// `MakerKind::Direct`), so a keeper of makers can verify that a make is handed to a maker
+    /// of its own start class without splitting `Direct(_)` tests in one suite into separate
+    /// makers (blaze-cli test_drive.rs `SuiteMakers`).
+    pub fn made_for(&self) -> crate::run::special::MakerKind {
+        crate::run::special::MakerKind::of(self.entry, self.start)
+    }
+
+    /// Retargets a `MakerStart::Direct(_)` maker to another direct test entry in the same
+    /// suite without reconstructing its `RecordsProgram` or `MakerState`. Returns `false` if
+    /// either this maker or `start` is `MakerStart::ByRule`.
+    pub fn set_direct_entry(&mut self, entry: Option<ItemKey>, start: crate::run::special::MakerStart) -> bool {
+        let (crate::run::special::MakerStart::Direct(_), crate::run::special::MakerStart::Direct(lib)) = (self.start, start) else {
+            return false;
+        };
+        if let Some((program, _)) = self.made.as_mut()
+            && !program.set_direct_entry(entry, lib)
+        {
+            return false;
+        }
+        self.entry = entry;
+        self.start = start;
+        true
     }
 
     fn starting(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, G, T> {

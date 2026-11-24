@@ -520,3 +520,117 @@ fn a_std_world_programs_records_are_the_same_in_every_make_order() {
 fn a_dyn_rungs_records_are_the_same_in_every_make_order() {
     same_bytes_in_every_order("dyn rung", &alone(&dyn_rung()), "m_of");
 }
+
+/// The library key of crate 0's fn named `name`.
+fn lib_fn_named(records: &'static Records<'static>, name: &str) -> blaze_id::ItemKey {
+    let mut found = None;
+    assert!(
+        records.each_item(0, &mut |key, _| if found.is_none() && records.kind_of_item(key) == Some(ItemKind::Function) && records.name_of(key) == Some(name) {
+            found = Some(key);
+        }),
+        "the program's items record lists its items"
+    );
+    found.unwrap_or_else(|| panic!("no fn named `{name}` in crate 0"))
+}
+
+/// Sharing ONE `Maker` across multiple `MakerStart::Direct(test_i)` entries in the same suite:
+/// (1) constructs `RecordsProgram` once (`constructed == 1`);
+/// (2) does NOT re-check shared bodies when retargeted to `test_b` (`check_one` grows only by
+///     `test_b`'s own unchecked body, not `shared_helper` or `leaf`);
+/// (3) produces byte-for-byte identical code entries (code + declared rows + read list) to
+///     fresh per-test `Maker`s; and
+/// (4) refuses `set_direct_entry` on a `MakerStart::ByRule` maker.
+#[test]
+fn shared_direct_maker_reuses_checked_bodies_and_matches_fresh_bytes() {
+    use blaze_ladder::run::make_one::SecondCheck;
+    use blaze_ladder::run::special::{MakerKind, MakerStart};
+
+    const TWO_TESTS: &str = "#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+pub trait Sized {}
+
+#[lang = \"copy\"]
+pub trait Copy {}
+
+fn leaf(x: u32) -> u32 {
+    x + 1
+}
+
+fn shared_helper(x: u32) -> u32 {
+    leaf(x) + leaf(x + 2)
+}
+
+fn test_a() -> u32 {
+    shared_helper(10)
+}
+
+fn test_b() -> u32 {
+    shared_helper(20) + 7
+}
+";
+    let prog = alone(&[(ROOT.to_string(), TWO_TESTS.to_string())]);
+    let b = builder(prog.panic());
+
+    let walk_one_test = |maker: Maker<'static>, test_key: ItemKey| {
+        let mut store = MemoryStore::new_in(alloc());
+        let ids = EveryItemBut { left_out: None };
+        let prod = producer();
+        let mut rec = Recording { inner: maker, made: Default::default(), grant: None };
+        let (_, counts) = walk_records(test_key, &ids, &mut store, &b, &prod, &mut rec, alloc()).expect("walk direct test");
+        assert!(counts.made > 0 && counts.found == 0, "cold walk builds every reached instance: {counts}");
+        (rec.inner, rec.made)
+    };
+
+    // Baseline: two completely separate fresh `Maker`s, one for `test_a` and one for `test_b`.
+    let names_a = prog.reader();
+    let lib_a = lib_fn_named(names_a.records, "test_a");
+    let key_a = checker_of(lib_a);
+    let fresh_a = Maker::of_start(names_a, Some(key_a), MakerStart::Direct(lib_a), SecondCheck, &b, alloc());
+    let (fresh_a, fresh_entries_a) = walk_one_test(fresh_a, key_a);
+
+    let names_b = prog.reader();
+    let lib_b = lib_fn_named(names_b.records, "test_b");
+    let key_b = checker_of(lib_b);
+    let fresh_b = Maker::of_start(names_b, Some(key_b), MakerStart::Direct(lib_b), SecondCheck, &b, alloc());
+    let (fresh_b, fresh_entries_b) = walk_one_test(fresh_b, key_b);
+    assert_eq!(fresh_a.checks().check_one, 3, "fresh test_a checks test_a + shared_helper + leaf");
+    assert_eq!(fresh_b.checks().check_one, 3, "fresh test_b re-checks test_b + shared_helper + leaf");
+
+    // Shared suite Maker: ONE maker started at `Direct(lib_a)`, then retargeted to `Direct(lib_b)`.
+    let names_shared = prog.reader();
+    let shared = Maker::of_start(names_shared, Some(key_a), MakerStart::Direct(lib_a), SecondCheck, &b, alloc());
+    assert_eq!(shared.made_for(), MakerKind::Direct);
+
+    let (mut shared, shared_entries_a) = walk_one_test(shared, key_a);
+    let after_a = shared.checks();
+    assert_eq!(after_a.constructed, 1, "shared maker constructs RecordsProgram once");
+    assert_eq!(after_a.check_one, 3, "test_a checks test_a + shared_helper + leaf");
+
+    assert!(shared.set_direct_entry(Some(key_b), MakerStart::Direct(lib_b)), "direct maker retargets to test_b");
+    assert_eq!(shared.made_for(), MakerKind::Direct);
+    assert!(!shared.set_direct_entry(Some(key_b), MakerStart::ByRule), "direct maker refuses ByRule retarget");
+
+    let (shared, shared_entries_b) = walk_one_test(shared, key_b);
+    let after_b = shared.checks();
+    assert_eq!(after_b.constructed, 1, "retargeting direct entry never reconstructs RecordsProgram");
+    assert_eq!(after_b.check_one, 4, "test_b checks ONLY test_b (+1), reusing shared_helper and leaf without re-checking");
+
+    assert_eq!(shared_entries_a.len(), fresh_entries_a.len());
+    for (s, f) in shared_entries_a.iter().zip(fresh_entries_a.iter()) {
+        assert_eq!(s.key(), f.key());
+        assert!(differs(&f.bytes, &s.bytes).is_none(), "shared test_a entry differs from fresh: {:?}", differs(&f.bytes, &s.bytes));
+    }
+    assert_eq!(shared_entries_b.len(), fresh_entries_b.len());
+    for (s, f) in shared_entries_b.iter().zip(fresh_entries_b.iter()) {
+        assert_eq!(s.key(), f.key());
+        assert!(differs(&f.bytes, &s.bytes).is_none(), "shared test_b entry differs from fresh: {:?}", differs(&f.bytes, &s.bytes));
+    }
+
+    // Control: a `ByRule` maker must report `MakerKind::ByRule` and refuse `set_direct_entry`.
+    let names_rule = prog.reader();
+    let mut by_rule: Maker<'static> = Maker::of_start(names_rule, Some(key_a), MakerStart::ByRule, SecondCheck, &b, alloc());
+    assert_eq!(by_rule.made_for(), MakerKind::ByRule(Some(key_a)));
+    assert!(!by_rule.set_direct_entry(Some(key_b), MakerStart::Direct(lib_b)), "ByRule maker must refuse direct retarget");
+}
