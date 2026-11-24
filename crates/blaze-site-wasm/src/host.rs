@@ -311,32 +311,47 @@ async function boot() {
     if (wantsNext) kick();
   };
 
-  // Smooth macOS Trackpad Pinch-to-Zoom + 2-Finger Scroll/Pan
-  let ctrlHeld = false;
-  window.addEventListener('keyup', (e) => { if (e.key === 'Control') ctrlHeld = false; });
+  // Smooth macOS Trackpad Pinch-to-Zoom + 2-Finger Scroll/Pan.
+  // Only zoom on true trackpad pinch (`e.ctrlKey` without `e.metaKey`, or Safari `gesturechange`),
+  // never sticky key state or accidental `Cmd`+scroll after `Cmd+Tab` / `Cmd+C`.
+  let inGesture = false;
+  let gestureScale = 1;
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
-    if (e.ctrlKey || e.metaKey || ctrlHeld) {
-      const factor = Math.exp(-e.deltaY * 0.01);
+    if (inGesture) return;
+    const scale = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? window.innerHeight : 1;
+    const dx = e.deltaX * scale;
+    const dy = e.deltaY * scale;
+    if (e.ctrlKey && !e.metaKey) {
+      if (Math.abs(dy) < 0.05) return;
+      const clamped = Math.max(-40, Math.min(40, dy));
+      const factor = Math.exp(-clamped * 0.008);
       w.site_pinch(h, e.clientX, e.clientY, factor);
     } else {
-      w.site_wheel(h, e.deltaX, e.deltaY);
+      w.site_wheel(h, dx, dy);
     }
     dirty = true;
     kick();
   }, { passive: false });
 
-  // Safari trackpad pinch gesture events
-  let gestureScale = 1;
-  canvas.addEventListener('gesturestart', (e) => { e.preventDefault(); gestureScale = 1; });
+  // Safari trackpad pinch gesture events (guarded so wheel + gesture never double-apply)
+  canvas.addEventListener('gesturestart', (e) => {
+    e.preventDefault();
+    inGesture = true;
+    gestureScale = e.scale || 1;
+  });
   canvas.addEventListener('gesturechange', (e) => {
     e.preventDefault();
-    const f = e.scale / (gestureScale || 1);
+    if (!inGesture || !e.scale || !Number.isFinite(e.scale)) return;
+    const f = Math.max(0.5, Math.min(2.0, e.scale / (gestureScale || 1)));
     gestureScale = e.scale;
     w.site_pinch(h, e.clientX || window.innerWidth * 0.5, e.clientY || window.innerHeight * 0.5, f);
     dirty = true;
     kick();
   });
+  const endGesture = (e) => { e?.preventDefault?.(); inGesture = false; gestureScale = 1; };
+  canvas.addEventListener('gestureend', endGesture);
+  window.addEventListener('blur', () => { inGesture = false; gestureScale = 1; });
 
   // Pointer interaction
   canvas.addEventListener('pointermove', (e) => {
@@ -362,7 +377,6 @@ async function boot() {
 
   // Keyboard shortcuts (`Cmd+F`, `Cmd+C`, `Cmd+A`, `Cmd+`/`Cmd-`/`Cmd0`, `Cmd+Shift+L`)
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Control') ctrlHeld = true;
     const mod = e.metaKey || e.ctrlKey;
     const k = e.key;
     let code = 0;

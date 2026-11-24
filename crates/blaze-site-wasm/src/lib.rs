@@ -578,5 +578,7 @@ mod tests {
         assert!(SITE_HTML.contains("site_pinch"));
         assert!(SITE_HTML.contains("slug_site_vs"));
         assert!(SITE_HTML.contains("slug_site_fs"));
+        assert!(!SITE_HTML.contains("ctrlHeld"));
+        assert!(SITE_HTML.contains("e.ctrlKey && !e.metaKey"));
     }
 }
