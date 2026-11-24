@@ -197,6 +197,10 @@ enum Fusion {
     EorLsl { a: u32, b: u32, shift: u32, imm_inst: u32 },
     /// `xor(a, lshr(b, k))` -> `eor rd, a, b, lsr #k`.
     EorLsr { a: u32, b: u32, shift: u32, imm_inst: u32 },
+    /// `xor(a, rotl/rotr(b, k))` -> `eor rd, a, b, ror #shift`.
+    EorRor { a: u32, b: u32, shift: u32, imm_inst: u32 },
+    /// `or`/`xor(shl(x, k), lshr(x, bits - k))` -> single `extr rd, x, x, #(bits - k)`.
+    RorImm { x: u32, ror_amt: u32, imm1: u32, imm2: u32 },
     /// `br(icmp(cond, a, b), then, else)` -> fused `cmp`/`cbz` + `b.cond`.
     CmpBr { cond: IntCond, a: u32, b: u32, op_ty: Ty },
     /// `br(fcmp(cond, a, b), then, else)` -> fused `fcmp` + `b.cond`.
@@ -205,6 +209,14 @@ enum Fusion {
     CmpSelect { cond: IntCond, a: u32, b: u32, op_ty: Ty },
     /// `select(fcmp(cond, a, b), t, f)` -> fused `fcmp` + `csel`/`fcsel`.
     FcmpSelect { cond: Cond, a: u32, b: u32, double: bool },
+    /// `select(shared_cmp, t, f)` reusing live NZCV flags from an earlier fused compare -> `csel`/`fcsel`.
+    ReuseFlagsSelect { cond: Cond },
+    /// `select(shared_cmp, rn, add(rm, 1))` reusing live NZCV flags -> `csinc rd, rn, rm, cond`.
+    ReuseFlagsCsinc { cond: Cond, rn: u32, rm: u32, one_imm: u32 },
+    /// `br(shared_cmp, then, else)` reusing live NZCV flags from an earlier fused compare -> `b.cond`.
+    ReuseFlagsBr { cond: Cond, zero_imm: u32 },
+    /// `sub(a, b)` emitting `subs` so a following `icmp(Eq/Ne, sub, 0) + br` reuses live NZCV flags!
+    SubsFlags,
     /// `load`/`store` directly from `[sp, #off]` (folded `slot_addr`).
     MemSpOff { off: i64 },
     /// `load`/`store` directly from `[base, #off]` (folded `add`/`ptr_add` with constant).
@@ -225,8 +237,8 @@ enum Fusion {
     TstBr { a: u32, rhs: u32, imm_nrs: Option<u32>, nonzero_is_then: bool },
     /// `select(icmp, x, neg(x))` -> `cmp` + `csneg`.
     CsnegSelect { cond: IntCond, a: u32, b: u32, op_ty: Ty, x: u32, neg_when_false: bool },
-    /// `select(icmp, x, add(x, 1))` -> `cmp` + `csinc`.
-    CsincSelect { cond: IntCond, a: u32, b: u32, op_ty: Ty, x: u32, inc_when_false: bool },
+    /// `select(icmp, rn, add(rm, 1))` or `select(icmp, add(rm, 1), rn)` -> `cmp` + `csinc`.
+    CsincSelect { cond: IntCond, a: u32, b: u32, op_ty: Ty, rn: u32, rm: u32, inc_when_false: bool, one_imm: u32 },
     /// `select(icmp, x, not(x))` -> `cmp` + `csinv`.
     CsinvSelect { cond: IntCond, a: u32, b: u32, op_ty: Ty, x: u32, inv_when_false: bool },
     /// ARMv8.2-SHA3 `xor(xor(a, b), c)` on 128-bit vectors -> 1-instruction `eor3 vd.16b, va, vb, vc`!
@@ -266,6 +278,165 @@ struct BranchPatch {
     word_idx: usize,
     kind: PatchKind,
     target_block: u32,
+}
+
+/// Deferred cold edge-move stub emitted at the end of the function so hot fallthrough edges
+/// incur zero inline move instructions and zero taken branches.
+#[derive(Clone, Copy, Debug)]
+struct ColdEdgeStub {
+    branch_word_idx: usize,
+    branch_kind: PatchKind,
+    target_block: u32,
+    args_start: usize,
+    args_len: usize,
+}
+
+/// Shared out-of-line PC-relative jump table placed at the end of the function for zero-move
+/// dense `Op::Switch` sites sharing identical target blocks (e.g. `taildup` interpreter dispatch).
+struct SharedJumpTable<'a> {
+    targets: Vec<u32, Alloc<'a>>,
+    adr_sites: Vec<usize, Alloc<'a>>,
+}
+
+/// Planned post-index `ldp`/`stp` group that folds a subsequent `PtrAdd(p, step)`.
+#[derive(Clone, Copy, Debug)]
+enum PostIndexPlan {
+    /// Single post-index pair (`[rp], #step`) spanning `(first_inst, second_inst)`.
+    Single {
+        first_inst: usize,
+        second_inst: usize,
+        word: u32,
+    },
+    /// Two zero-dependency pairs emitted together at `i0`:
+    /// `hi_word` (`[rp, #half]`, no writeback) followed by `lo_word` (`[rp], #full`, full post-index).
+    /// Eliminates the RAW stall on `rp` between consecutive post-index `ldp`/`stp` pairs.
+    Quad {
+        i0: usize,
+        i1: usize,
+        i2: usize,
+        i3: usize,
+        hi_word: u32,
+        lo_word: u32,
+    },
+}
+
+impl PostIndexPlan {
+    #[inline]
+    fn trigger_inst(self) -> usize {
+        match self {
+            Self::Single { first_inst, .. } => first_inst,
+            Self::Quad { i0, .. } => i0,
+        }
+    }
+
+    #[inline]
+    fn contains(self, idx: usize) -> bool {
+        match self {
+            Self::Single { first_inst, second_inst, .. } => first_inst == idx || second_inst == idx,
+            Self::Quad { i0, i1, i2, i3, .. } => idx == i0 || idx == i1 || idx == i2 || idx == i3,
+        }
+    }
+}
+
+/// Addressing mode for a pair emitted by post-index pair-advance fusion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PairAddrMode {
+    /// Post-index writeback by 1 pair width: `[rp], #32` (Vec128) or `[rp], #16` (Gpr64/Fp64).
+    PostHalf,
+    /// Post-index writeback by 2 pair widths: `[rp], #64` (Vec128) or `[rp], #32` (Gpr64/Fp64).
+    PostFull,
+    /// Signed offset without writeback at 1 pair width: `[rp, #32]` (Vec128) or `[rp, #16]` (Gpr64/Fp64).
+    OffHalf,
+}
+
+/// Access width classification for post-index pair advance fusion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PostAccessKind {
+    Vec128,
+    Gpr64,
+    Fp64,
+    Other,
+}
+
+/// True iff emitting `(op, ty, fus)` is strictly guaranteed to preserve ARM64 NZCV flags.
+#[inline]
+fn op_preserves_nzcv(op: Op, ty: Ty, fus: Fusion) -> bool {
+    matches!(
+        op,
+        Op::Param
+            | Op::Iconst
+            | Op::IconstWide
+            | Op::Fconst
+            | Op::FconstWide
+            | Op::Null
+            | Op::Uninit
+            | Op::Freeze
+            | Op::Assume
+            | Op::SlotAddr
+            | Op::SlotLive
+            | Op::SlotDead
+            | Op::PtrAdd
+            | Op::PtrAddr
+            | Op::Expose
+            | Op::FromExposed
+            | Op::PtrWithAddr
+            | Op::Load
+            | Op::Store
+            | Op::Zext
+            | Op::Sext
+            | Op::Trunc
+            | Op::Bitcast
+            | Op::Project
+            | Op::Splat
+            | Op::Insert
+            | Op::Shuffle
+            | Op::Fpext
+            | Op::Fptrunc
+            | Op::SitoFp
+            | Op::UitoFp
+            | Op::Fadd
+            | Op::Fsub
+            | Op::Fmul
+            | Op::Fdiv
+            | Op::Fneg
+            | Op::Fabs
+            | Op::Sqrt
+            | Op::Floor
+            | Op::Ceil
+            | Op::Ftrunc
+            | Op::Nearest
+            | Op::Fround
+            | Op::Fma
+            | Op::Fmuladd
+            | Op::FminNum
+            | Op::FmaxNum
+            | Op::Fminimum
+            | Op::Fmaximum
+    ) || (ty != Ty::I128
+        && matches!(
+            op,
+            Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Neg
+                | Op::And
+                | Op::Or
+                | Op::Xor
+                | Op::Not
+                | Op::Shl
+                | Op::Lshr
+                | Op::Ashr
+                | Op::Rotl
+                | Op::Rotr
+                | Op::Umulhi
+                | Op::Smulhi
+                | Op::Clz
+                | Op::Ctz
+                | Op::Popcnt
+                | Op::Bswap
+                | Op::Bitrev
+        )
+        && !matches!(fus, Fusion::AdcsChain { .. } | Fusion::SubsFlags))
 }
 
 /// Source or destination location for a parallel move (register, 8-byte spill slot, or 16-byte SIMD spill),
@@ -627,6 +798,31 @@ fn emit_ld_spill_vec(words: &mut Vec<u32, Alloc<'_>>, vd: Reg, spill_base: u32, 
 fn emit_st_spill_vec(words: &mut Vec<u32, Alloc<'_>>, vs: Reg, spill_base: u32, slot: u32) {
     let off = i64::from(spill_base) + i64::from(slot) * 8;
     emit_mem_q(words, false, vs, SP, off);
+}
+
+/// Emits a destructive 3-operand 128-bit NEON multiply-accumulate/sub (`vd = vc ± va * vb`),
+/// assuming `va` was loaded with scratch `V29`, `vb` with `V30`, and `vc` with `V31`.
+#[inline]
+fn emit_vec_acc3(
+    words: &mut Vec<u32, Alloc<'_>>,
+    vd: Reg,
+    va: Reg,
+    vb: Reg,
+    vc: Reg,
+    acc_word: impl Fn(Reg, Reg, Reg) -> u32,
+) {
+    if vd == vc {
+        words.push(acc_word(vd, va, vb));
+    } else if vd != va && vd != vb {
+        words.push(enc::orr_v(vd, vc, vc));
+        words.push(acc_word(vd, va, vb));
+    } else {
+        if vc != V31 {
+            words.push(enc::orr_v(V31, vc, vc));
+        }
+        words.push(acc_word(V31, va, vb));
+        words.push(enc::orr_v(vd, V31, V31));
+    }
 }
 
 /// Resolves an arbitrary simultaneous parallel copy `[(dst, src)]` over registers and spill slots,
@@ -1056,7 +1252,7 @@ fn check_subset(view: &View<'_>, has_lse: bool, os: crate::Os) -> Result<(), Tie
                 | Op::UsubSat
                 | Op::SaddSat
                 | Op::SsubSat => !vfp,
-                Op::Umin | Op::Umax | Op::Smin | Op::Smax => !vfp && vsize < 3,
+                Op::Umin | Op::Umax | Op::Smin | Op::Smax => !vfp,
                 Op::Mul => {
                     if !vfp && vsize < 3 {
                         true
@@ -1099,7 +1295,7 @@ fn check_subset(view: &View<'_>, has_lse: bool, os: crate::Os) -> Result<(), Tie
                     let max_lane = if vsize == 2 { 4 } else { 2 };
                     at_u32(view.extra, at + 2) < max_lane
                 }
-                Op::Fadd | Op::Fsub | Op::Fmul => vfp,
+                Op::Fadd | Op::Fsub | Op::Fmul | Op::Fma | Op::Fmuladd => vfp,
                 Op::Shuffle => {
                     if !vfp && vsize == 0 {
                         let at = to_idx(at_u32(view.data, inst));
@@ -1769,12 +1965,81 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
     let mut fusion: Vec<Fusion, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
     let mut skip_emit: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
     let mut slot_addr_folded_uses: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+    let mut ptr_off_foldable_uses: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
     let mut blaze_result_br_fused: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
     for _ in 0..len {
         fusion.push(Fusion::None);
         skip_emit.push(false);
         slot_addr_folded_uses.push(0);
+        ptr_off_foldable_uses.push(0);
         blaze_result_br_fused.push(false);
+    }
+
+    // Pre-pass: count foldable Load/Store pointer uses of same-block `PtrAdd(base, const)` and
+    // 64-bit `Add(base, const)` so multi-use pointer offsets (e.g. `saxpy` load + store at
+    // `[py + 16]`) fold cleanly into `MemBaseOff` whenever ALL uses fold!
+    for inst in 0..len {
+        let op = view.op(inst);
+        if !matches!(op, Op::Load | Op::Store) {
+            continue;
+        }
+        let at = to_idx(at_u32(view.data, inst));
+        let (ptr, off, access_ty, store_val) = if op == Op::Load {
+            (at_u32(view.extra, at), i64::from(at_u32(view.extra, at + 1).cast_signed()), ty_at(view.tys, inst), u32::MAX)
+        } else {
+            let val = at_u32(view.extra, at);
+            (at_u32(view.extra, at + 1), i64::from(at_u32(view.extra, at + 2).cast_signed()), ty_at(view.tys, to_idx(val)), val)
+        };
+        if access_ty == Ty::I128 || store_val == ptr {
+            continue;
+        }
+        let is_vec128 = is_vec128_ty(access_ty).is_some();
+        let mem_sz = if is_vec128 {
+            None
+        } else {
+            let Some((sz, _)) = mem_size_of(access_ty) else {
+                continue;
+            };
+            Some(sz)
+        };
+        let fits_off = |o: i64| -> bool {
+            match mem_sz {
+                None => (o >= 0 && o % 16 == 0 && o / 16 < 4096) || (-256..=255).contains(&o),
+                Some(sz) => fits_mem_off(sz, o),
+            }
+        };
+        let pi = to_idx(ptr);
+        if at_u32(&inst_block, pi) != at_u32(&inst_block, inst) {
+            continue;
+        }
+        let pop = view.op(pi);
+        if pop == Op::PtrAdd {
+            let pat = to_idx(at_u32(view.data, pi));
+            let by = at_u32(view.extra, pat + 1);
+            if let Some(cv) = at_opt(&const_u64, to_idx(by)) {
+                let by_bits = ty_at(view.tys, to_idx(by)).bits(64);
+                let delta = sign_extend_u64(cv, by_bits);
+                if delta.checked_add(off).is_some_and(fits_off) {
+                    inc_u32(&mut ptr_off_foldable_uses, pi);
+                }
+            }
+        } else if pop == Op::Add && ty_at(view.tys, pi).bits(64) == 64 {
+            let pat = to_idx(at_u32(view.data, pi));
+            let a_lhs = at_u32(view.extra, pat);
+            let a_rhs = at_u32(view.extra, pat + 1);
+            let delta_opt = if let Some(cv) = at_opt(&const_u64, to_idx(a_rhs)) {
+                Some(cv.cast_signed())
+            } else if let Some(cv) = at_opt(&const_u64, to_idx(a_lhs)) {
+                Some(cv.cast_signed())
+            } else {
+                None
+            };
+            if let Some(delta) = delta_opt {
+                if delta.checked_add(off).is_some_and(fits_off) {
+                    inc_u32(&mut ptr_off_foldable_uses, pi);
+                }
+            }
+        }
     }
 
     for inst in 0..len {
@@ -2188,6 +2453,52 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                     continue;
                 }
             }
+            Op::Add if is_vec128_ty(ty).is_some_and(|(vsize, vfp)| !vfp && vsize < 3) => {
+                // Fuse 128-bit NEON integer `add(acc, mul(a, b))` / `add(mul(a, b), acc)` -> `mla.16b/8h/4s`!
+                let at = to_idx(at_u32(view.data, inst));
+                let lhs = at_u32(view.extra, at);
+                let rhs = at_u32(view.extra, at + 1);
+                let try_vmul = |prod: u32, acc: u32| -> Option<(u32, u32, u32)> {
+                    let pi = to_idx(prod);
+                    if at_u32(&use_count, pi) == 1
+                        && at_u32(&inst_block, pi) == b
+                        && view.op(pi) == Op::Mul
+                        && !at_bool(&skip_emit, pi)
+                    {
+                        let pat = to_idx(at_u32(view.data, pi));
+                        Some((at_u32(view.extra, pat), at_u32(view.extra, pat + 1), acc))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((a, mb, acc)) = try_vmul(lhs, rhs) {
+                    set_at(&mut fusion, inst, Fusion::Madd { a, b: mb, acc });
+                    set_at(&mut skip_emit, to_idx(lhs), true);
+                    continue;
+                }
+                if let Some((a, mb, acc)) = try_vmul(rhs, lhs) {
+                    set_at(&mut fusion, inst, Fusion::Madd { a, b: mb, acc });
+                    set_at(&mut skip_emit, to_idx(rhs), true);
+                    continue;
+                }
+            }
+            Op::Sub if is_vec128_ty(ty).is_some_and(|(vsize, vfp)| !vfp && vsize < 3) => {
+                // Fuse 128-bit NEON integer `sub(acc, mul(a, b))` -> `mls.16b/8h/4s`!
+                let at = to_idx(at_u32(view.data, inst));
+                let lhs = at_u32(view.extra, at);
+                let rhs = at_u32(view.extra, at + 1);
+                let ri = to_idx(rhs);
+                if at_u32(&use_count, ri) == 1
+                    && at_u32(&inst_block, ri) == b
+                    && view.op(ri) == Op::Mul
+                    && !at_bool(&skip_emit, ri)
+                {
+                    let pat = to_idx(at_u32(view.data, ri));
+                    set_at(&mut fusion, inst, Fusion::Msub { a: at_u32(view.extra, pat), b: at_u32(view.extra, pat + 1), acc: lhs });
+                    set_at(&mut skip_emit, ri, true);
+                    continue;
+                }
+            }
             Op::Sub if bits == 64 => {
                 let at = to_idx(at_u32(view.data, inst));
                 let lhs = at_u32(view.extra, at);
@@ -2242,15 +2553,23 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                     continue;
                 }
             }
-            Op::Fsub if is_fp_ty(ty).is_some() && Flags(at_u8(view.flags, inst)).contains(Flags::CONTRACT) => {
+            Op::Fsub
+                if (is_fp_ty(ty).is_some() && Flags(at_u8(view.flags, inst)).contains(Flags::CONTRACT))
+                    || (is_vec128_ty(ty).is_some_and(|(_, fp)| fp)
+                        && (Flags(at_u8(view.flags, inst)).contains(Flags::CONTRACT)
+                            || Flags(at_u8(view.flags, inst)).contains(Flags::REASSOC))) =>
+            {
                 let at = to_idx(at_u32(view.data, inst));
                 let lhs = at_u32(view.extra, at);
                 let rhs = at_u32(view.extra, at + 1);
                 let ri = to_idx(rhs);
+                let is_vec = is_vec128_ty(ty).is_some();
+                let rflags = Flags(at_u8(view.flags, ri));
+                let ok_flag = rflags.contains(Flags::CONTRACT) || (is_vec && rflags.contains(Flags::REASSOC));
                 if at_u32(&use_count, ri) == 1
                     && at_u32(&inst_block, ri) == b
                     && view.op(ri) == Op::Fmul
-                    && Flags(at_u8(view.flags, ri)).contains(Flags::CONTRACT)
+                    && ok_flag
                     && !at_bool(&skip_emit, ri)
                 {
                     let pat = to_idx(at_u32(view.data, ri));
@@ -2288,6 +2607,85 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                     });
                     set_at(&mut skip_emit, to_idx(lhs), true);
                     continue;
+                }
+                if matches!(op, Op::Or | Op::Xor) {
+                    // Fuse open-coded rotate `(x << k) | (x >> (bits - k))` -> 1-instruction `extr`/`extr_w`!
+                    let li = to_idx(lhs);
+                    let ri = to_idx(rhs);
+                    if at_u32(&use_count, li) == 1
+                        && at_u32(&use_count, ri) == 1
+                        && at_u32(&inst_block, li) == b
+                        && at_u32(&inst_block, ri) == b
+                        && !at_bool(&skip_emit, li)
+                        && !at_bool(&skip_emit, ri)
+                        && at_fusion(&fusion, li) == Fusion::None
+                        && at_fusion(&fusion, ri) == Fusion::None
+                    {
+                        let lop = view.op(li);
+                        let rop = view.op(ri);
+                        let sh_pair = if lop == Op::Shl && rop == Op::Lshr {
+                            Some((li, ri))
+                        } else if lop == Op::Lshr && rop == Op::Shl {
+                            Some((ri, li))
+                        } else {
+                            None
+                        };
+                        if let Some((shl_i, lshr_i)) = sh_pair {
+                            let lat = to_idx(at_u32(view.data, shl_i));
+                            let rat = to_idx(at_u32(view.data, lshr_i));
+                            let (lx, lk) = (at_u32(view.extra, lat), at_u32(view.extra, lat + 1));
+                            let (rx, rk) = (at_u32(view.extra, rat), at_u32(view.extra, rat + 1));
+                            if lx == rx {
+                                if let (Some(k1), Some(k2)) = (at_opt(&const_u64, to_idx(lk)), at_opt(&const_u64, to_idx(rk))) {
+                                    let b64 = u64::from(bits);
+                                    if k1 > 0 && k1 < b64 && k1 + k2 == b64 {
+                                        set_at(&mut fusion, inst, Fusion::RorImm {
+                                            x: lx,
+                                            ror_amt: trunc_u32(k2),
+                                            imm1: lk,
+                                            imm2: rk,
+                                        });
+                                        set_at(&mut skip_emit, li, true);
+                                        set_at(&mut skip_emit, ri, true);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if op == Op::Xor {
+                    // Fuse `xor(a, rotl/rotr(b, k))` -> 1-instruction `eor rd, ra, rb, ror #ror_amt`!
+                    let try_xor_rot = |rot: u32, other: u32| -> Option<(u32, u32, u32, u32)> {
+                        let ri = to_idx(rot);
+                        let rop = view.op(ri);
+                        if at_u32(&use_count, ri) == 1
+                            && at_u32(&inst_block, ri) == b
+                            && matches!(rop, Op::Rotl | Op::Rotr)
+                            && !at_bool(&skip_emit, ri)
+                        {
+                            let rat = to_idx(at_u32(view.data, ri));
+                            let sb = at_u32(view.extra, rat);
+                            let sk = at_u32(view.extra, rat + 1);
+                            if let Some(k) = at_opt(&const_u64, to_idx(sk)) {
+                                let mask = bits - 1;
+                                let sh = trunc_u32(k) & mask;
+                                let ror_amt = if rop == Op::Rotl { (bits - sh) & mask } else { sh };
+                                return Some((other, sb, ror_amt, sk));
+                            }
+                        }
+                        None
+                    };
+                    if let Some((a, sb, shift, sk)) = try_xor_rot(rhs, lhs) {
+                        set_at(&mut fusion, inst, Fusion::EorRor { a, b: sb, shift, imm_inst: sk });
+                        set_at(&mut skip_emit, to_idx(rhs), true);
+                        continue;
+                    }
+                    if let Some((a, sb, shift, sk)) = try_xor_rot(lhs, rhs) {
+                        set_at(&mut fusion, inst, Fusion::EorRor { a, b: sb, shift, imm_inst: sk });
+                        set_at(&mut skip_emit, to_idx(lhs), true);
+                        continue;
+                    }
                 }
                 if op == Op::Xor && ty.bits(64) == 64 {
                     let try_xor_shift = |sh: u32, other: u32| -> Option<(Op, u32, u32, u32, u32)> {
@@ -2366,8 +2764,14 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                         continue;
                     }
                 }
-                // Pattern B: `load`/`store` on single-use same-block `add`/`ptr_add` -> `[base, #imm]` or `[base, idx, lsl #size]`!
-                if at_u32(&use_count, pi) == 1 && at_u32(&inst_block, pi) == b && !at_bool(&skip_emit, pi) {
+                // Pattern B: `load`/`store` on same-block `add`/`ptr_add` -> `[base, #imm]` or `[base, idx, lsl #size]`!
+                let pi_uses = at_u32(&use_count, pi);
+                let pi_same_blk = at_u32(&inst_block, pi) == b;
+                let pi_all_fold_off = pi_uses > 1
+                    && pi_same_blk
+                    && at_u32(&ptr_off_foldable_uses, pi) == pi_uses
+                    && at_fusion(&fusion, pi) == Fusion::None;
+                if (pi_uses == 1 && pi_same_blk && !at_bool(&skip_emit, pi)) || pi_all_fold_off {
                     if pop == Op::PtrAdd {
                         let pat = to_idx(at_u32(view.data, pi));
                         let base = at_u32(view.extra, pat);
@@ -2377,12 +2781,13 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             let delta = sign_extend_u64(cv, by_bits);
                             if let Some(total) = delta.checked_add(off) {
                                 if fits_off(total) {
-                                    set_at(&mut fusion, inst, Fusion::MemBaseOff { base, off: total, imm_inst: by });
+                                    let imm_inst = if at_bool(&skip_emit, pi) { u32::MAX } else { by };
+                                    set_at(&mut fusion, inst, Fusion::MemBaseOff { base, off: total, imm_inst });
                                     set_at(&mut skip_emit, pi, true);
                                     continue;
                                 }
                             }
-                        } else if off == 0 && ty_at(view.tys, to_idx(by)).bits(64) == 64 {
+                        } else if pi_uses == 1 && off == 0 && ty_at(view.tys, to_idx(by)).bits(64) == 64 {
                             // Pattern B2: `ptr_add(base, shl(idx, log2(size)))` -> `[base, idx, lsl #size]`!
                             let bi = to_idx(by);
                             if size_shift > 0
@@ -2406,7 +2811,9 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             continue;
                         }
                     } else if pop == Op::Add && ty_at(view.tys, pi).bits(64) == 64 {
-                        if let Fusion::AddLsl { a: base, b: idx, shift, imm_inst } = at_fusion(&fusion, pi) {
+                        if pi_uses == 1
+                            && let Fusion::AddLsl { a: base, b: idx, shift, imm_inst } = at_fusion(&fusion, pi)
+                        {
                             if off == 0 && shift == size_shift && shift > 0 {
                                 set_at(&mut fusion, inst, Fusion::MemScaledIdx { base, idx, shift_imm: imm_inst });
                                 set_at(&mut skip_emit, pi, true);
@@ -2423,15 +2830,16 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             } else {
                                 None
                             };
-                            if let Some((base, imm_inst, delta)) = cand {
+                            if let Some((base, by, delta)) = cand {
                                 if let Some(total) = delta.checked_add(off) {
                                     if fits_off(total) {
+                                        let imm_inst = if at_bool(&skip_emit, pi) { u32::MAX } else { by };
                                         set_at(&mut fusion, inst, Fusion::MemBaseOff { base, off: total, imm_inst });
                                         set_at(&mut skip_emit, pi, true);
                                         continue;
                                     }
                                 }
-                            } else if off == 0 {
+                            } else if pi_uses == 1 && off == 0 {
                                 set_at(&mut fusion, inst, Fusion::MemRegIdx { base: a_lhs, idx: a_rhs });
                                 set_at(&mut skip_emit, pi, true);
                                 continue;
@@ -2609,6 +3017,44 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                                     }
                                 }
                             }
+                            // Fuse `d = sub(a, rhs); icmp(Eq/Ne, d, 0); br` -> `subs rd, ra, rhs; b.eq/b.ne`
+                            // (macro-op fused on Apple Silicon / Neoverse when adjacent, zero extra `cmp`/`cbnz`)!
+                            if !fused_bit_br && matches!(cond, IntCond::Eq | IntCond::Ne) {
+                                let sub_zero = if at_opt(&const_u64, to_idx(bv)) == Some(0) {
+                                    Some((to_idx(a), bv))
+                                } else if at_opt(&const_u64, to_idx(a)) == Some(0) {
+                                    Some((to_idx(bv), a))
+                                } else {
+                                    None
+                                };
+                                if let Some((sub_i, zero_imm)) = sub_zero {
+                                    let sub_ty = ty_at(view.tys, sub_i);
+                                    let sub_bits = if sub_ty.is_scalar() && sub_ty.is_int() { sub_ty.bits(64) } else { 0 };
+                                    if (sub_bits == 64 || sub_bits == 32)
+                                        && at_u32(&inst_block, sub_i) == b
+                                        && view.op(sub_i) == Op::Sub
+                                        && !at_bool(&skip_emit, sub_i)
+                                        && at_fusion(&fusion, sub_i) == Fusion::None
+                                    {
+                                        let mut flags_safe = true;
+                                        for k in (sub_i + 1)..inst {
+                                            if at_bool(&skip_emit, k) || k == cond_v {
+                                                continue;
+                                            }
+                                            if !op_preserves_nzcv(view.op(k), ty_at(view.tys, k), at_fusion(&fusion, k)) {
+                                                flags_safe = false;
+                                                break;
+                                            }
+                                        }
+                                        if flags_safe {
+                                            set_at(&mut fusion, sub_i, Fusion::SubsFlags);
+                                            set_at(&mut fusion, inst, Fusion::ReuseFlagsBr { cond: cond_of(cond), zero_imm });
+                                            set_at(&mut skip_emit, cond_v, true);
+                                            fused_bit_br = true;
+                                        }
+                                    }
+                                }
+                            }
                             if !fused_bit_br {
                                 set_at(&mut fusion, inst, Fusion::CmpBr { cond, a, b: bv, op_ty });
                                 set_at(&mut skip_emit, cond_v, true);
@@ -2671,10 +3117,51 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                                 } else if at_u32(&use_count, fi) == 1 && at_u32(&inst_block, fi) == b && view.op(fi) == Op::Add && at_fusion(&fusion, fi) == Fusion::None && !at_bool(&skip_emit, fi) {
                                     let fat = to_idx(at_u32(view.data, fi));
                                     let (fl, fr) = (at_u32(view.extra, fat), at_u32(view.extra, fat + 1));
-                                    if (fl == t_val && at_opt(&const_u64, to_idx(fr)) == Some(1)) || (fr == t_val && at_opt(&const_u64, to_idx(fl)) == Some(1)) {
-                                        set_at(&mut fusion, inst, Fusion::CsincSelect { cond, a, b: bv, op_ty, x: t_val, inc_when_false: true });
+                                    let add1 = if at_opt(&const_u64, to_idx(fr)) == Some(1) {
+                                        Some((fl, fr))
+                                    } else if at_opt(&const_u64, to_idx(fl)) == Some(1) {
+                                        Some((fr, fl))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some((rm, one_imm)) = add1 {
+                                        set_at(&mut fusion, inst, Fusion::CsincSelect {
+                                            cond,
+                                            a,
+                                            b: bv,
+                                            op_ty,
+                                            rn: t_val,
+                                            rm,
+                                            inc_when_false: true,
+                                            one_imm,
+                                        });
                                         set_at(&mut skip_emit, cond_v, true);
                                         set_at(&mut skip_emit, fi, true);
+                                        special = true;
+                                    }
+                                } else if at_u32(&use_count, ti) == 1 && at_u32(&inst_block, ti) == b && view.op(ti) == Op::Add && at_fusion(&fusion, ti) == Fusion::None && !at_bool(&skip_emit, ti) {
+                                    let tat = to_idx(at_u32(view.data, ti));
+                                    let (tl, tr) = (at_u32(view.extra, tat), at_u32(view.extra, tat + 1));
+                                    let add1 = if at_opt(&const_u64, to_idx(tr)) == Some(1) {
+                                        Some((tl, tr))
+                                    } else if at_opt(&const_u64, to_idx(tl)) == Some(1) {
+                                        Some((tr, tl))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some((rm, one_imm)) = add1 {
+                                        set_at(&mut fusion, inst, Fusion::CsincSelect {
+                                            cond,
+                                            a,
+                                            b: bv,
+                                            op_ty,
+                                            rn: f_val,
+                                            rm,
+                                            inc_when_false: false,
+                                            one_imm,
+                                        });
+                                        set_at(&mut skip_emit, cond_v, true);
+                                        set_at(&mut skip_emit, ti, true);
                                         special = true;
                                     }
                                 }
@@ -2698,6 +3185,199 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                 }
             }
             _ => {}
+        }
+    }
+
+    // 2a-ii. Multi-use shared `Icmp`/`Fcmp` fusion (`bsearch` dual-`Select` -> ONE `cmp` + TWO `csel`/`csinc`!):
+    // When a compare has >= 2 uses, ALL in the same block as live `Select`/`Br` condition operands
+    // with no intervening NZCV-clobbering instruction between the first and last user, emit `cmp`
+    // once at the first user and have every subsequent user reuse live hardware NZCV flags directly!
+    {
+        let mut shared_users: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(8, alloc);
+        for cond_v in 0..len {
+            if at_bool(&skip_emit, cond_v) || at_u32(&use_count, cond_v) < 2 {
+                continue;
+            }
+            let cop = view.op(cond_v);
+            let cmp_info = if cop == Op::Icmp && is_vec_mask_ty(ty_at(view.tys, cond_v)).is_none() {
+                let cat = to_idx(at_u32(view.data, cond_v));
+                IntCond::from_word(at_u32(view.extra, cat)).and_then(|ic| {
+                    let a = at_u32(view.extra, cat + 1);
+                    let bv = at_u32(view.extra, cat + 2);
+                    let op_ty = ty_at(view.tys, to_idx(a));
+                    if op_ty == Ty::I128 {
+                        None
+                    } else {
+                        Some((cond_of(ic), Some((ic, a, bv, op_ty)), None))
+                    }
+                })
+            } else if cop == Op::Fcmp {
+                let cat = to_idx(at_u32(view.data, cond_v));
+                FloatCond::from_word(at_u32(view.extra, cat)).and_then(fcond_of).and_then(|fc| {
+                    let a = at_u32(view.extra, cat + 1);
+                    let bv = at_u32(view.extra, cat + 2);
+                    is_fp_ty(ty_at(view.tys, to_idx(a))).map(|double| (fc, None, Some((fc, a, bv, double))))
+                })
+            } else {
+                None
+            };
+            let Some((hw_cond, int_cmp, fp_cmp)) = cmp_info else {
+                continue;
+            };
+            let b = at_u32(&inst_block, cond_v);
+            let range = view.block(Block(b));
+            shared_users.clear();
+            let mut matched_uses = 0u32;
+            let mut all_ok = true;
+            for k in (cond_v + 1)..range.end {
+                let mut uses_in_k = 0u32;
+                regalloc::for_each_use(&view, k, |v| {
+                    if to_idx(v) == cond_v {
+                        uses_in_k += 1;
+                    }
+                });
+                if uses_in_k == 0 {
+                    continue;
+                }
+                if uses_in_k > 1 || at_bool(&skip_emit, k) || at_fusion(&fusion, k) != Fusion::None {
+                    all_ok = false;
+                    break;
+                }
+                let kop = view.op(k);
+                let kat = to_idx(at_u32(view.data, k));
+                if kop == Op::Select {
+                    let kty = ty_at(view.tys, k);
+                    if to_idx(at_u32(view.extra, kat)) == cond_v
+                        && is_vec128_ty(kty).is_none()
+                        && kty != Ty::I128
+                        && at_u32(&use_count, k) > 0
+                    {
+                        shared_users.push(k);
+                        matched_uses += 1;
+                    } else {
+                        all_ok = false;
+                        break;
+                    }
+                } else if kop == Op::Br && to_idx(at_u32(view.extra, kat)) == cond_v {
+                    shared_users.push(k);
+                    matched_uses += 1;
+                } else {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if !all_ok || matched_uses != at_u32(&use_count, cond_v) || shared_users.len() < 2 {
+                continue;
+            }
+            let (Some(&first_u), Some(&last_u)) = (shared_users.first(), shared_users.last()) else {
+                continue;
+            };
+            if view.op(first_u) != Op::Select {
+                continue;
+            }
+            // Verify every instruction strictly between `first_u` and `last_u` is either another
+            // user of `cond_v` or strictly guaranteed to preserve ARM64 NZCV flags!
+            let mut flags_safe = true;
+            for k in (first_u + 1)..last_u {
+                if at_bool(&skip_emit, k) || shared_users.iter().any(|&u| u == k) {
+                    continue;
+                }
+                if !op_preserves_nzcv(view.op(k), ty_at(view.tys, k), at_fusion(&fusion, k)) {
+                    flags_safe = false;
+                    break;
+                }
+            }
+            if !flags_safe {
+                continue;
+            }
+            // Commit shared-flag fusion: emit `cmp`/`fcmp` once at `first_u`, reuse NZCV on all others!
+            set_at(&mut skip_emit, cond_v, true);
+            let try_add_one = |val: u32, skip_ref: &[bool], fus_ref: &[Fusion]| -> Option<(usize, u32, u32)> {
+                let vi = to_idx(val);
+                if at_u32(&use_count, vi) == 1
+                    && at_u32(&inst_block, vi) == b
+                    && view.op(vi) == Op::Add
+                    && at_fusion(fus_ref, vi) == Fusion::None
+                    && !at_bool(skip_ref, vi)
+                {
+                    let vat = to_idx(at_u32(view.data, vi));
+                    let (vl, vr) = (at_u32(view.extra, vat), at_u32(view.extra, vat + 1));
+                    if at_opt(&const_u64, to_idx(vr)) == Some(1) {
+                        return Some((vi, vl, vr));
+                    }
+                    if at_opt(&const_u64, to_idx(vl)) == Some(1) {
+                        return Some((vi, vr, vl));
+                    }
+                }
+                None
+            };
+            for (u_idx, &u) in shared_users.iter().enumerate() {
+                if view.op(u) == Op::Br {
+                    set_at(&mut fusion, u, Fusion::ReuseFlagsBr { cond: hw_cond, zero_imm: u32::MAX });
+                    continue;
+                }
+                let uat = to_idx(at_u32(view.data, u));
+                let t_val = at_u32(view.extra, uat + 1);
+                let f_val = at_u32(view.extra, uat + 2);
+                let uty = ty_at(view.tys, u);
+                let is_i64_sel = uty.is_scalar() && uty.is_int() && uty.bits(64) == 64;
+                if u_idx == 0 {
+                    if let Some((ic, a, bv, op_ty)) = int_cmp {
+                        if is_i64_sel {
+                            if let Some((fi, rm, one_imm)) = try_add_one(f_val, &skip_emit, &fusion) {
+                                set_at(&mut fusion, u, Fusion::CsincSelect {
+                                    cond: ic,
+                                    a,
+                                    b: bv,
+                                    op_ty,
+                                    rn: t_val,
+                                    rm,
+                                    inc_when_false: true,
+                                    one_imm,
+                                });
+                                set_at(&mut skip_emit, fi, true);
+                                continue;
+                            }
+                            if let Some((ti, rm, one_imm)) = try_add_one(t_val, &skip_emit, &fusion) {
+                                set_at(&mut fusion, u, Fusion::CsincSelect {
+                                    cond: ic,
+                                    a,
+                                    b: bv,
+                                    op_ty,
+                                    rn: f_val,
+                                    rm,
+                                    inc_when_false: false,
+                                    one_imm,
+                                });
+                                set_at(&mut skip_emit, ti, true);
+                                continue;
+                            }
+                        }
+                        set_at(&mut fusion, u, Fusion::CmpSelect { cond: ic, a, b: bv, op_ty });
+                    } else if let Some((fc, a, bv, double)) = fp_cmp {
+                        set_at(&mut fusion, u, Fusion::FcmpSelect { cond: fc, a, b: bv, double });
+                    }
+                } else {
+                    if is_i64_sel {
+                        if let Some((fi, rm, one_imm)) = try_add_one(f_val, &skip_emit, &fusion) {
+                            set_at(&mut fusion, u, Fusion::ReuseFlagsCsinc { cond: hw_cond, rn: t_val, rm, one_imm });
+                            set_at(&mut skip_emit, fi, true);
+                            continue;
+                        }
+                        if let Some((ti, rm, one_imm)) = try_add_one(t_val, &skip_emit, &fusion) {
+                            set_at(&mut fusion, u, Fusion::ReuseFlagsCsinc {
+                                cond: invert_cond(hw_cond),
+                                rn: f_val,
+                                rm,
+                                one_imm,
+                            });
+                            set_at(&mut skip_emit, ti, true);
+                            continue;
+                        }
+                    }
+                    set_at(&mut fusion, u, Fusion::ReuseFlagsSelect { cond: hw_cond });
+                }
+            }
         }
     }
 
@@ -2727,8 +3407,17 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
             | Fusion::SubLsl { imm_inst, .. }
             | Fusion::EorLsl { imm_inst, .. }
             | Fusion::EorLsr { imm_inst, .. }
-            | Fusion::MemBaseOff { imm_inst, .. } => {
+            | Fusion::EorRor { imm_inst, .. } => {
                 inc_u32(&mut imm_uses, to_idx(imm_inst));
+            }
+            Fusion::MemBaseOff { imm_inst, .. } => {
+                if imm_inst != u32::MAX {
+                    inc_u32(&mut imm_uses, to_idx(imm_inst));
+                }
+            }
+            Fusion::RorImm { imm1, imm2, .. } => {
+                inc_u32(&mut imm_uses, to_idx(imm1));
+                inc_u32(&mut imm_uses, to_idx(imm2));
             }
             Fusion::MemScaledIdx { shift_imm, .. } => {
                 inc_u32(&mut imm_uses, to_idx(shift_imm));
@@ -2742,12 +3431,34 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
             Fusion::CmpBr { b: bv, op_ty, .. }
             | Fusion::CmpSelect { b: bv, op_ty, .. }
             | Fusion::CsnegSelect { b: bv, op_ty, .. }
-            | Fusion::CsincSelect { b: bv, op_ty, .. }
             | Fusion::CsinvSelect { b: bv, op_ty, .. } => {
                 if (op_ty.bits(64) == 64 || op_ty.bits(64) == 32)
                     && at_opt(&const_u64, to_idx(bv)).is_some_and(|v| v <= 4095)
                 {
                     inc_u32(&mut imm_uses, to_idx(bv));
+                }
+            }
+            Fusion::CsincSelect { b: bv, op_ty, one_imm, .. } => {
+                if (op_ty.bits(64) == 64 || op_ty.bits(64) == 32)
+                    && at_opt(&const_u64, to_idx(bv)).is_some_and(|v| v <= 4095)
+                {
+                    inc_u32(&mut imm_uses, to_idx(bv));
+                }
+                inc_u32(&mut imm_uses, to_idx(one_imm));
+            }
+            Fusion::ReuseFlagsCsinc { one_imm, .. } => {
+                inc_u32(&mut imm_uses, to_idx(one_imm));
+            }
+            Fusion::ReuseFlagsBr { zero_imm, .. } => {
+                if zero_imm != u32::MAX {
+                    inc_u32(&mut imm_uses, to_idx(zero_imm));
+                }
+            }
+            Fusion::SubsFlags => {
+                let at = to_idx(at_u32(view.data, inst));
+                let rhs = to_idx(at_u32(view.extra, at + 1));
+                if at_opt(&const_u64, rhs).is_some_and(|v| v <= 4095) {
+                    inc_u32(&mut imm_uses, rhs);
                 }
             }
             Fusion::Madd { .. }
@@ -2761,6 +3472,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
             | Fusion::AdcsOverflowChain { .. }
             | Fusion::FcmpBr { .. }
             | Fusion::FcmpSelect { .. }
+            | Fusion::ReuseFlagsSelect { .. }
             | Fusion::MemSpOff { .. }
             | Fusion::MemRegIdx { .. }
             | Fusion::Bic { .. }
@@ -3407,16 +4119,70 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
         }
     };
 
-    // Identify loop-header blocks (targets of backward edges) for 16-byte fetch-boundary alignment.
-    let mut is_loop_header: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
-    for _ in 0..blocks {
-        is_loop_header.push(false);
+    // Helper: true iff `emit_edge_moves` would emit 0 instructions for this edge (all args coalesced).
+    let edge_is_nop = |target_block: u32, args_start: usize, args_len: usize| -> bool {
+        let target_params = view.params(Block(target_block));
+        for k in 0..args_len {
+            let param_inst = target_params.start + k;
+            let dst_loc = at_loc(&reg_alloc.loc_of, param_inst);
+            if matches!(dst_loc, AllocLoc::None | AllocLoc::RematConst(_)) {
+                continue;
+            }
+            let src_v = at_u32(view.extra, args_start + k);
+            let src_loc = at_loc(&reg_alloc.loc_of, to_idx(src_v));
+            if dst_loc != src_loc {
+                return false;
+            }
+        }
+        true
+    };
+
+    // Precompute per-value single-block use ownership across the entire function in O(N):
+    // `u32::MAX` = unused, `blk` = used ONLY in block `blk`, `u32::MAX - 1` = used in multiple blocks.
+    let mut use_blk_state: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+    for _ in 0..len {
+        use_blk_state.push(u32::MAX);
     }
     for b in 0..blocks {
+        let bu = u32_of(b);
+        for inst in view.block(Block(bu)) {
+            regalloc::for_each_use(&view, inst, |v| {
+                let vi = to_idx(v);
+                if let Some(slot) = use_blk_state.get_mut(vi) {
+                    if *slot == u32::MAX {
+                        *slot = bu;
+                    } else if *slot != bu {
+                        *slot = u32::MAX - 1;
+                    }
+                }
+            });
+        }
+    }
+
+    let mut cold_stubs: Vec<ColdEdgeStub, Alloc<'a>> = Vec::new_in(alloc);
+    let mut shared_jump_tables: Vec<SharedJumpTable<'a>, Alloc<'a>> = Vec::new_in(alloc);
+    let mut post_pairs: Vec<PostIndexPlan, Alloc<'a>> = Vec::with_capacity_in(8, alloc);
+    let mut ptr_accesses: Vec<(usize, bool, PostAccessKind, i64), Alloc<'a>> = Vec::with_capacity_in(16, alloc);
+    let mut skip_p_nexts: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(8, alloc);
+
+    // Identify loop-header blocks (targets of backward edges in original or emitted block order)
+    // for 16-byte fetch-boundary alignment on Apple Silicon (full 8-wide fetch bandwidth).
+    let mut block_pos: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    let mut is_loop_header: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    for _ in 0..blocks {
+        block_pos.push(0);
+        is_loop_header.push(false);
+    }
+    for (pos, &blk) in block_order.iter().enumerate() {
+        set_at(&mut block_pos, blk, pos);
+    }
+    for b in 0..blocks {
+        let b_pos = at_usize(&block_pos, b);
         let term = view.terminator(Block(u32_of(b)));
         regalloc::for_each_edge(&view, term, |target, _, _| {
-            if to_idx(target) <= b {
-                set_at(&mut is_loop_header, to_idx(target), true);
+            let tb = to_idx(target);
+            if tb <= b || at_usize(&block_pos, tb) <= b_pos {
+                set_at(&mut is_loop_header, tb, true);
             }
         });
     }
@@ -3566,101 +4332,721 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                 _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(exc_param)), what: "unexpected landing block param loc" }),
             }
         }
+        let is_zero_emit = |k: usize, skip: &[bool]| -> bool {
+            if at_bool(skip, k) {
+                return true;
+            }
+            if at_fusion(&fusion, k) == Fusion::SubsFlags {
+                return false;
+            }
+            let kop = view.op(k);
+            if matches!(kop, Op::Param | Op::SlotLive | Op::SlotDead | Op::Assume) {
+                return true;
+            }
+            if !matches!(at_loc(&reg_alloc.loc_of, k), AllocLoc::None | AllocLoc::RematConst(_)) {
+                return false;
+            }
+            let side_eff = kop.is_terminator()
+                || matches!(
+                    kop,
+                    Op::Call
+                        | Op::CallIndirect
+                        | Op::Load
+                        | Op::Store
+                        | Op::Memcpy
+                        | Op::Memmove
+                        | Op::Memset
+                        | Op::Memcmp
+                        | Op::TargetIntrinsic
+                        | Op::TlsAddr
+                        | Op::AtomicLoad
+                        | Op::AtomicStore
+                        | Op::AtomicRmw
+                        | Op::Cmpxchg
+                        | Op::Fence
+                        | Op::Trap
+                        | Op::Udiv
+                        | Op::Sdiv
+                        | Op::Urem
+                        | Op::Srem
+                );
+            !side_eff
+        };
+        let load_reads_gpr = |k: usize, reg: Reg| -> bool {
+            let loc_is_reg = |v: u32| match at_loc(&reg_alloc.loc_of, to_idx(v)) {
+                AllocLoc::Gpr(r) => u32::from(r) == reg,
+                AllocLoc::GprPair(r0, r1) => u32::from(r0) == reg || u32::from(r1) == reg,
+                _ => false,
+            };
+            match at_fusion(&fusion, k) {
+                Fusion::MemSpOff { .. } => false,
+                Fusion::MemBaseOff { base, .. } => loc_is_reg(base),
+                Fusion::MemScaledIdx { base, idx, .. } | Fusion::MemRegIdx { base, idx } => {
+                    loc_is_reg(base) || loc_is_reg(idx)
+                }
+                Fusion::None => {
+                    let kat = to_idx(at_u32(view.data, k));
+                    loc_is_reg(at_u32(view.extra, kat))
+                }
+                _ => true,
+            }
+        };
+        let try_emit_pair = |words: &mut Vec<u32, Alloc<'a>>, i1: usize, i2: usize, allow_store: bool| -> bool {
+            if let (Some((base1, off1, fp1)), Some((base2, off2, fp2))) =
+                (mem64_pair_addr(i1, true), mem64_pair_addr(i2, true))
+            {
+                let ordered = if fp1 == fp2 && base1 == base2 && off2 == off1 + 8 {
+                    Some((off1, i1, i2))
+                } else if fp1 == fp2 && base1 == base2 && off1 == off2 + 8 {
+                    Some((off2, i2, i1))
+                } else {
+                    None
+                };
+                if let Some((lo_off, lo_i, hi_i)) = ordered
+                    && lo_off % 8 == 0
+                    && (-512..=504).contains(&lo_off)
+                {
+                    if !fp1 {
+                        if let (AllocLoc::Gpr(r_first), AllocLoc::Gpr(r_lo), AllocLoc::Gpr(r_hi)) = (
+                            at_loc(&reg_alloc.loc_of, i1),
+                            at_loc(&reg_alloc.loc_of, lo_i),
+                            at_loc(&reg_alloc.loc_of, hi_i),
+                        ) {
+                            let (rt_first, rt_lo, rt_hi) = (u32::from(r_first), u32::from(r_lo), u32::from(r_hi));
+                            if rt_lo != rt_hi && rt_first != base1 {
+                                words.push(enc::ldp_off(rt_lo, rt_hi, base1, i32_of(lo_off)));
+                                return true;
+                            }
+                        }
+                    } else if let (AllocLoc::Fp(r_lo), AllocLoc::Fp(r_hi)) =
+                        (at_loc(&reg_alloc.loc_of, lo_i), at_loc(&reg_alloc.loc_of, hi_i))
+                    {
+                        let (dt_lo, dt_hi) = (u32::from(r_lo), u32::from(r_hi));
+                        if dt_lo != dt_hi {
+                            words.push(enc::ldp_d_off(dt_lo, dt_hi, base1, i32_of(lo_off)));
+                            return true;
+                        }
+                    }
+                }
+            } else if allow_store
+                && let (Some((base1, off1, fp1)), Some((base2, off2, fp2))) =
+                    (mem64_pair_addr(i1, false), mem64_pair_addr(i2, false))
+            {
+                let ordered = if fp1 == fp2 && base1 == base2 && off2 == off1 + 8 {
+                    Some((off1, i1, i2))
+                } else if fp1 == fp2 && base1 == base2 && off1 == off2 + 8 {
+                    Some((off2, i2, i1))
+                } else {
+                    None
+                };
+                if let Some((lo_off, lo_i, hi_i)) = ordered
+                    && lo_off % 8 == 0
+                    && (-512..=504).contains(&lo_off)
+                {
+                    let v_lo = at_u32(view.extra, to_idx(at_u32(view.data, lo_i)));
+                    let v_hi = at_u32(view.extra, to_idx(at_u32(view.data, hi_i)));
+                    if !fp1 {
+                        if let (AllocLoc::Gpr(r_lo), AllocLoc::Gpr(r_hi)) =
+                            (at_loc(&reg_alloc.loc_of, to_idx(v_lo)), at_loc(&reg_alloc.loc_of, to_idx(v_hi)))
+                        {
+                            words.push(enc::stp_off(u32::from(r_lo), u32::from(r_hi), base1, i32_of(lo_off)));
+                            return true;
+                        }
+                    } else if let (AllocLoc::Fp(r_lo), AllocLoc::Fp(r_hi)) =
+                        (at_loc(&reg_alloc.loc_of, to_idx(v_lo)), at_loc(&reg_alloc.loc_of, to_idx(v_hi)))
+                    {
+                        words.push(enc::stp_d_off(u32::from(r_lo), u32::from(r_hi), base1, i32_of(lo_off)));
+                        return true;
+                    }
+                }
+            } else if let (Some((base1, off1)), Some((base2, off2))) =
+                (mem128_pair_addr(i1, true), mem128_pair_addr(i2, true))
+            {
+                // Adjacent 128-bit NEON vector pair load -> `ldp q1, q2, [base, #off]` (32 bytes in 1 op)!
+                let ordered = if base1 == base2 && off2 == off1 + 16 {
+                    Some((off1, i1, i2))
+                } else if base1 == base2 && off1 == off2 + 16 {
+                    Some((off2, i2, i1))
+                } else {
+                    None
+                };
+                if let Some((lo_off, lo_i, hi_i)) = ordered
+                    && lo_off % 16 == 0
+                    && (-1024..=1008).contains(&lo_off)
+                {
+                    if let (AllocLoc::Vec(v_lo), AllocLoc::Vec(v_hi)) =
+                        (at_loc(&reg_alloc.loc_of, lo_i), at_loc(&reg_alloc.loc_of, hi_i))
+                    {
+                        if v_lo != v_hi {
+                            words.push(enc::ldp_q_off(u32::from(v_lo), u32::from(v_hi), base1, i32_of(lo_off / 16)));
+                            return true;
+                        }
+                    }
+                }
+            } else if allow_store
+                && let (Some((base1, off1)), Some((base2, off2))) =
+                    (mem128_pair_addr(i1, false), mem128_pair_addr(i2, false))
+            {
+                // Adjacent 128-bit NEON vector pair store -> `stp q1, q2, [base, #off]` (32 bytes in 1 op)!
+                let ordered = if base1 == base2 && off2 == off1 + 16 {
+                    Some((off1, i1, i2))
+                } else if base1 == base2 && off1 == off2 + 16 {
+                    Some((off2, i2, i1))
+                } else {
+                    None
+                };
+                if let Some((lo_off, lo_i, hi_i)) = ordered
+                    && lo_off % 16 == 0
+                    && (-1024..=1008).contains(&lo_off)
+                {
+                    let v_lo = at_u32(view.extra, to_idx(at_u32(view.data, lo_i)));
+                    let v_hi = at_u32(view.extra, to_idx(at_u32(view.data, hi_i)));
+                    if let (AllocLoc::Vec(r_lo), AllocLoc::Vec(r_hi)) =
+                        (at_loc(&reg_alloc.loc_of, to_idx(v_lo)), at_loc(&reg_alloc.loc_of, to_idx(v_hi)))
+                    {
+                        words.push(enc::stp_q_off(u32::from(r_lo), u32::from(r_hi), base1, i32_of(lo_off / 16)));
+                        return true;
+                    }
+                }
+            }
+            false
+        };
         let range = view.block(Block(u32_of(b)));
+        // Post-Index Pair Advance Fusion: fold `p_next = PtrAdd(p, 64|32|16)` (allocated to the
+        // SAME physical GPR `rp` as `p`) directly into post-index `ldp`/`stp` pairs on the LAST
+        // contiguous access group of `p` in block `b`, skipping `p_next`!
+        // For 2-pair groups (`step == 64` Vec128 or `step == 32` Gpr64/Fp64), prefer zero-dependency
+        // `PostIndexPlan::Quad`: `[rp, #half]` (no writeback) followed by `[rp], #full` (full writeback)
+        // so both `ldp`/`stp` issue in the same cycle with zero RAW stall on `rp`.
+        post_pairs.clear();
+        skip_p_nexts.clear();
+        let blk_u32 = u32_of(b);
+        let encode_pair_word = |lo_i: usize,
+                                hi_i: usize,
+                                is_load: bool,
+                                kind: PostAccessKind,
+                                mode: PairAddrMode,
+                                rp: Reg|
+         -> Option<u32> {
+            match (kind, is_load) {
+                (PostAccessKind::Vec128, true) => {
+                    let (AllocLoc::Vec(v_lo), AllocLoc::Vec(v_hi)) =
+                        (at_loc(&reg_alloc.loc_of, lo_i), at_loc(&reg_alloc.loc_of, hi_i))
+                    else {
+                        return None;
+                    };
+                    if v_lo == v_hi {
+                        return None;
+                    }
+                    let (rt1, rt2) = (u32::from(v_lo), u32::from(v_hi));
+                    Some(match mode {
+                        PairAddrMode::PostHalf => enc::ldp_q_post(rt1, rt2, rp, 2),
+                        PairAddrMode::PostFull => enc::ldp_q_post(rt1, rt2, rp, 4),
+                        PairAddrMode::OffHalf => enc::ldp_q_off(rt1, rt2, rp, 2),
+                    })
+                }
+                (PostAccessKind::Vec128, false) => {
+                    let v_lo = at_u32(view.extra, to_idx(at_u32(view.data, lo_i)));
+                    let v_hi = at_u32(view.extra, to_idx(at_u32(view.data, hi_i)));
+                    let (AllocLoc::Vec(r_lo), AllocLoc::Vec(r_hi)) =
+                        (at_loc(&reg_alloc.loc_of, to_idx(v_lo)), at_loc(&reg_alloc.loc_of, to_idx(v_hi)))
+                    else {
+                        return None;
+                    };
+                    let (rt1, rt2) = (u32::from(r_lo), u32::from(r_hi));
+                    Some(match mode {
+                        PairAddrMode::PostHalf => enc::stp_q_post(rt1, rt2, rp, 2),
+                        PairAddrMode::PostFull => enc::stp_q_post(rt1, rt2, rp, 4),
+                        PairAddrMode::OffHalf => enc::stp_q_off(rt1, rt2, rp, 2),
+                    })
+                }
+                (PostAccessKind::Gpr64, true) => {
+                    let (AllocLoc::Gpr(r_lo), AllocLoc::Gpr(r_hi)) =
+                        (at_loc(&reg_alloc.loc_of, lo_i), at_loc(&reg_alloc.loc_of, hi_i))
+                    else {
+                        return None;
+                    };
+                    let (rt_lo, rt_hi) = (u32::from(r_lo), u32::from(r_hi));
+                    if rt_lo == rt_hi || rt_lo == rp || rt_hi == rp {
+                        return None;
+                    }
+                    Some(match mode {
+                        PairAddrMode::PostHalf => enc::ldp_post(rt_lo, rt_hi, rp, 16),
+                        PairAddrMode::PostFull => enc::ldp_post(rt_lo, rt_hi, rp, 32),
+                        PairAddrMode::OffHalf => enc::ldp_off(rt_lo, rt_hi, rp, 16),
+                    })
+                }
+                (PostAccessKind::Gpr64, false) => {
+                    let v_lo = at_u32(view.extra, to_idx(at_u32(view.data, lo_i)));
+                    let v_hi = at_u32(view.extra, to_idx(at_u32(view.data, hi_i)));
+                    let (AllocLoc::Gpr(r_lo), AllocLoc::Gpr(r_hi)) =
+                        (at_loc(&reg_alloc.loc_of, to_idx(v_lo)), at_loc(&reg_alloc.loc_of, to_idx(v_hi)))
+                    else {
+                        return None;
+                    };
+                    let (rt_lo, rt_hi) = (u32::from(r_lo), u32::from(r_hi));
+                    if rt_lo == rp || rt_hi == rp {
+                        return None;
+                    }
+                    Some(match mode {
+                        PairAddrMode::PostHalf => enc::stp_post(rt_lo, rt_hi, rp, 16),
+                        PairAddrMode::PostFull => enc::stp_post(rt_lo, rt_hi, rp, 32),
+                        PairAddrMode::OffHalf => enc::stp_off(rt_lo, rt_hi, rp, 16),
+                    })
+                }
+                (PostAccessKind::Fp64, true) => {
+                    let (AllocLoc::Fp(r_lo), AllocLoc::Fp(r_hi)) =
+                        (at_loc(&reg_alloc.loc_of, lo_i), at_loc(&reg_alloc.loc_of, hi_i))
+                    else {
+                        return None;
+                    };
+                    let (dt_lo, dt_hi) = (u32::from(r_lo), u32::from(r_hi));
+                    if dt_lo == dt_hi {
+                        return None;
+                    }
+                    Some(match mode {
+                        PairAddrMode::PostHalf => enc::ldp_post_d(dt_lo, dt_hi, rp, 16),
+                        PairAddrMode::PostFull => enc::ldp_post_d(dt_lo, dt_hi, rp, 32),
+                        PairAddrMode::OffHalf => enc::ldp_d_off(dt_lo, dt_hi, rp, 16),
+                    })
+                }
+                (PostAccessKind::Fp64, false) => {
+                    let v_lo = at_u32(view.extra, to_idx(at_u32(view.data, lo_i)));
+                    let v_hi = at_u32(view.extra, to_idx(at_u32(view.data, hi_i)));
+                    let (AllocLoc::Fp(r_lo), AllocLoc::Fp(r_hi)) =
+                        (at_loc(&reg_alloc.loc_of, to_idx(v_lo)), at_loc(&reg_alloc.loc_of, to_idx(v_hi)))
+                    else {
+                        return None;
+                    };
+                    let (dt_lo, dt_hi) = (u32::from(r_lo), u32::from(r_hi));
+                    Some(match mode {
+                        PairAddrMode::PostHalf => enc::stp_post_d(dt_lo, dt_hi, rp, 16),
+                        PairAddrMode::PostFull => enc::stp_post_d(dt_lo, dt_hi, rp, 32),
+                        PairAddrMode::OffHalf => enc::stp_d_off(dt_lo, dt_hi, rp, 16),
+                    })
+                }
+                (PostAccessKind::Other, _) => None,
+            }
+        };
+        let build_post_pair = |a_inst: usize,
+                               a_off: i64,
+                               b_inst: usize,
+                               b_off: i64,
+                               is_load: bool,
+                               kind: PostAccessKind,
+                               want_lo_off: i64,
+                               elem_bytes: i64,
+                               rp: Reg|
+         -> Option<PostIndexPlan> {
+            let (lo_i, hi_i) = if a_off == want_lo_off && b_off == want_lo_off + elem_bytes {
+                (a_inst, b_inst)
+            } else if b_off == want_lo_off && a_off == want_lo_off + elem_bytes {
+                (b_inst, a_inst)
+            } else {
+                return None;
+            };
+            // Verify intervening instructions strictly between `a_inst` and `b_inst` are safely pairable.
+            let mut mid_opt: Option<usize> = None;
+            for k in (a_inst + 1)..b_inst {
+                if is_zero_emit(k, &skip_emit) {
+                    continue;
+                }
+                if !is_load || mid_opt.is_some() {
+                    return None;
+                }
+                mid_opt = Some(k);
+            }
+            if let Some(mid) = mid_opt {
+                if view.op(mid) != Op::Load || Flags(at_u8(view.flags, mid)).contains(Flags::VOLATILE) {
+                    return None;
+                }
+                let loc1 = at_loc(&reg_alloc.loc_of, mid);
+                let loc2 = at_loc(&reg_alloc.loc_of, b_inst);
+                if !matches!(loc1, AllocLoc::Gpr(_) | AllocLoc::Fp(_) | AllocLoc::Vec(_)) {
+                    return None;
+                }
+                let clobbers_base = matches!(loc1, AllocLoc::Gpr(r) if u32::from(r) == rp);
+                let dst_hazard = loc1 == loc2
+                    || matches!(loc2, AllocLoc::Gpr(r2) if load_reads_gpr(mid, u32::from(r2)));
+                if clobbers_base || dst_hazard || load_reads_gpr(mid, rp) {
+                    return None;
+                }
+            }
+            let word = encode_pair_word(lo_i, hi_i, is_load, kind, PairAddrMode::PostHalf, rp)?;
+            Some(PostIndexPlan::Single { first_inst: a_inst, second_inst: b_inst, word })
+        };
+        let build_post_quad = |a0: (usize, bool, PostAccessKind, i64),
+                               a1: (usize, bool, PostAccessKind, i64),
+                               a2: (usize, bool, PostAccessKind, i64),
+                               a3: (usize, bool, PostAccessKind, i64),
+                               elem_bytes: i64,
+                               rp: Reg,
+                               pending_skips: &[usize]|
+         -> Option<PostIndexPlan> {
+            let is_load = a0.1;
+            let kind = a0.2;
+            let mut lo0_opt = None;
+            let mut lo1_opt = None;
+            let mut hi0_opt = None;
+            let mut hi1_opt = None;
+            for &(idx, _, _, off) in &[a0, a1, a2, a3] {
+                if off == 0 {
+                    lo0_opt = Some(idx);
+                } else if off == elem_bytes {
+                    lo1_opt = Some(idx);
+                } else if off == 2 * elem_bytes {
+                    hi0_opt = Some(idx);
+                } else if off == 3 * elem_bytes {
+                    hi1_opt = Some(idx);
+                } else {
+                    return None;
+                }
+            }
+            let (lo0_i, lo1_i, hi0_i, hi1_i) = (lo0_opt?, lo1_opt?, hi0_opt?, hi1_opt?);
+            let loc0 = at_loc(&reg_alloc.loc_of, lo0_i);
+            let loc1 = at_loc(&reg_alloc.loc_of, lo1_i);
+            let loc2 = at_loc(&reg_alloc.loc_of, hi0_i);
+            let loc3 = at_loc(&reg_alloc.loc_of, hi1_i);
+            if is_load
+                && (loc0 == loc1
+                    || loc0 == loc2
+                    || loc0 == loc3
+                    || loc1 == loc2
+                    || loc1 == loc3
+                    || loc2 == loc3)
+            {
+                return None;
+            }
+            // Verify every instruction strictly between `a0.0` and `a3.0` (excluding `a1.0`, `a2.0`)
+            // is either zero-emit (for loads & stores) or an independent register Load (loads only).
+            for k in (a0.0 + 1)..a3.0 {
+                if k == a1.0 || k == a2.0 || is_zero_emit(k, &skip_emit) || pending_skips.iter().any(|&pn| pn == k) {
+                    continue;
+                }
+                if !is_load {
+                    return None;
+                }
+                if view.op(k) != Op::Load || Flags(at_u8(view.flags, k)).contains(Flags::VOLATILE) {
+                    return None;
+                }
+                let loc_k = at_loc(&reg_alloc.loc_of, k);
+                if !matches!(loc_k, AllocLoc::Gpr(_) | AllocLoc::Fp(_) | AllocLoc::Vec(_)) {
+                    return None;
+                }
+                let clobbers_base = matches!(loc_k, AllocLoc::Gpr(r) if u32::from(r) == rp);
+                let dst_collision = loc_k == loc0 || loc_k == loc1 || loc_k == loc2 || loc_k == loc3;
+                let gpr_read_hazard = [loc0, loc1, loc2, loc3]
+                    .iter()
+                    .any(|loc| matches!(*loc, AllocLoc::Gpr(r) if load_reads_gpr(k, u32::from(r))));
+                if clobbers_base || dst_collision || gpr_read_hazard || load_reads_gpr(k, rp) {
+                    return None;
+                }
+            }
+            let hi_word = encode_pair_word(hi0_i, hi1_i, is_load, kind, PairAddrMode::OffHalf, rp)?;
+            let lo_word = encode_pair_word(lo0_i, lo1_i, is_load, kind, PairAddrMode::PostFull, rp)?;
+            Some(PostIndexPlan::Quad { i0: a0.0, i1: a1.0, i2: a2.0, i3: a3.0, hi_word, lo_word })
+        };
+        let range_preserves_rp = |start_i: usize, cand_i: usize, rp: Reg| -> bool {
+            for k in start_i..=cand_i {
+                if k != cand_i && matches!(at_loc(&reg_alloc.loc_of, k), AllocLoc::Gpr(r) if u32::from(r) == rp) {
+                    return false;
+                }
+                if !at_bool(&skip_emit, k)
+                    && matches!(
+                        view.op(k),
+                        Op::Call
+                            | Op::CallIndirect
+                            | Op::Invoke
+                            | Op::InvokeIndirect
+                            | Op::Memcpy
+                            | Op::Memmove
+                            | Op::Memset
+                            | Op::Memcmp
+                            | Op::TlsAddr
+                    )
+                {
+                    return false;
+                }
+            }
+            true
+        };
+        for cand in range.start..range.end {
+            if at_bool(&skip_emit, cand) || view.op(cand) != Op::PtrAdd || at_fusion(&fusion, cand) != Fusion::None {
+                continue;
+            }
+            let cat = to_idx(at_u32(view.data, cand));
+            let p_u32 = at_u32(view.extra, cat);
+            let by_u32 = at_u32(view.extra, cat + 1);
+            let p_idx = to_idx(p_u32);
+            if p_idx == cand || by_u32 == p_u32 {
+                continue;
+            }
+            let Some(cv) = at_opt(&const_u64, to_idx(by_u32)) else {
+                continue;
+            };
+            let step = sign_extend_u64(cv, ty_at(view.tys, to_idx(by_u32)).bits(64));
+            if !matches!(step, 16 | 32 | 64) {
+                continue;
+            }
+            let (AllocLoc::Gpr(rp_p), AllocLoc::Gpr(rp_n)) =
+                (at_loc(&reg_alloc.loc_of, p_idx), at_loc(&reg_alloc.loc_of, cand))
+            else {
+                continue;
+            };
+            if rp_p != rp_n {
+                continue;
+            }
+            let rp = u32::from(rp_p);
+            if at_u32(&use_blk_state, p_idx) != blk_u32 {
+                continue;
+            }
+            // Verify EVERY raw LIR use of `p` in block `b` is either `cand`, a direct non-volatile
+            // Load/Store `< cand`, or a skipped `PtrAdd`/`Add` used solely by `MemBaseOff { base: p }` `< cand`.
+            let mut all_uses_safe = true;
+            for k in range.start..range.end {
+                let mut p_uses_in_k = 0u32;
+                regalloc::for_each_use(&view, k, |v| {
+                    if v == p_u32 {
+                        p_uses_in_k += 1;
+                    }
+                });
+                if p_uses_in_k == 0 {
+                    continue;
+                }
+                if k == cand {
+                    if p_uses_in_k != 1 {
+                        all_uses_safe = false;
+                        break;
+                    }
+                    continue;
+                }
+                if at_bool(&skip_emit, k) && matches!(view.op(k), Op::PtrAdd | Op::Add) {
+                    let k_u32 = u32_of(k);
+                    if at_u32(&use_blk_state, k) != blk_u32 {
+                        all_uses_safe = false;
+                        break;
+                    }
+                    for m in (k + 1)..range.end {
+                        let mut k_uses_in_m = 0u32;
+                        regalloc::for_each_use(&view, m, |v| {
+                            if v == k_u32 {
+                                k_uses_in_m += 1;
+                            }
+                        });
+                        if k_uses_in_m == 0 {
+                            continue;
+                        }
+                        let mop = view.op(m);
+                        let ok_mem = m < cand
+                            && !at_bool(&skip_emit, m)
+                            && matches!(mop, Op::Load | Op::Store)
+                            && !Flags(at_u8(view.flags, m)).contains(Flags::VOLATILE)
+                            && matches!(at_fusion(&fusion, m), Fusion::MemBaseOff { base, .. } if base == p_u32)
+                            && (mop == Op::Load || at_u32(view.extra, to_idx(at_u32(view.data, m))) != k_u32);
+                        if !ok_mem {
+                            all_uses_safe = false;
+                            break;
+                        }
+                    }
+                    if !all_uses_safe {
+                        break;
+                    }
+                    continue;
+                }
+                let kop = view.op(k);
+                let ok_direct = k < cand
+                    && !at_bool(&skip_emit, k)
+                    && matches!(kop, Op::Load | Op::Store)
+                    && !Flags(at_u8(view.flags, k)).contains(Flags::VOLATILE)
+                    && at_fusion(&fusion, k) == Fusion::None
+                    && if kop == Op::Load {
+                        at_u32(view.extra, to_idx(at_u32(view.data, k))) == p_u32
+                    } else {
+                        let kat = to_idx(at_u32(view.data, k));
+                        at_u32(view.extra, kat) != p_u32 && at_u32(view.extra, kat + 1) == p_u32
+                    };
+                if !ok_direct {
+                    all_uses_safe = false;
+                    break;
+                }
+            }
+            if !all_uses_safe {
+                continue;
+            }
+            ptr_accesses.clear();
+            for k in range.start..cand {
+                if at_bool(&skip_emit, k) {
+                    continue;
+                }
+                let kop = view.op(k);
+                if !matches!(kop, Op::Load | Op::Store) {
+                    continue;
+                }
+                let is_load = kop == Op::Load;
+                let kat = to_idx(at_u32(view.data, k));
+                let acc_off = match at_fusion(&fusion, k) {
+                    Fusion::MemBaseOff { base, off, .. } if base == p_u32 => Some(off),
+                    Fusion::None => {
+                        let (ptr_v, off) = if is_load {
+                            (at_u32(view.extra, kat), i64::from(at_u32(view.extra, kat + 1).cast_signed()))
+                        } else {
+                            (at_u32(view.extra, kat + 1), i64::from(at_u32(view.extra, kat + 2).cast_signed()))
+                        };
+                        (ptr_v == p_u32).then_some(off)
+                    }
+                    _ => None,
+                };
+                let Some(off) = acc_off else {
+                    continue;
+                };
+                let acc_ty = if is_load {
+                    ty_at(view.tys, k)
+                } else {
+                    ty_at(view.tys, to_idx(at_u32(view.extra, kat)))
+                };
+                let kind = if is_vec128_ty(acc_ty).is_some() {
+                    PostAccessKind::Vec128
+                } else if let Some((Size::X, is_fp)) = mem_size_of(acc_ty) {
+                    if is_fp { PostAccessKind::Fp64 } else { PostAccessKind::Gpr64 }
+                } else {
+                    PostAccessKind::Other
+                };
+                ptr_accesses.push((k, is_load, kind, off));
+            }
+            let n_acc = ptr_accesses.len();
+            let already_claimed = |pairs: &[PostIndexPlan], idx: usize| {
+                pairs.iter().any(|pp| pp.contains(idx))
+            };
+            // Case 1 (2x 128-bit pairs, step=64) & Case 2 (2x 64-bit pairs, step=32):
+            let mut matched = false;
+            if n_acc >= 4
+                && matches!(step, 32 | 64)
+                && let (Some(&a0), Some(&a1), Some(&a2), Some(&a3)) = (
+                    ptr_accesses.get(n_acc - 4),
+                    ptr_accesses.get(n_acc - 3),
+                    ptr_accesses.get(n_acc - 2),
+                    ptr_accesses.get(n_acc - 1),
+                )
+            {
+                let want_kind_ok = (step == 64 && a0.2 == PostAccessKind::Vec128)
+                    || (step == 32 && matches!(a0.2, PostAccessKind::Gpr64 | PostAccessKind::Fp64));
+                if want_kind_ok
+                    && a1.1 == a0.1
+                    && a2.1 == a0.1
+                    && a3.1 == a0.1
+                    && a1.2 == a0.2
+                    && a2.2 == a0.2
+                    && a3.2 == a0.2
+                    && !already_claimed(&post_pairs, a0.0)
+                    && !already_claimed(&post_pairs, a1.0)
+                    && !already_claimed(&post_pairs, a2.0)
+                    && !already_claimed(&post_pairs, a3.0)
+                    && range_preserves_rp(a0.0, cand, rp)
+                {
+                    let elem_bytes = if a0.2 == PostAccessKind::Vec128 { 16 } else { 8 };
+                    if let Some(quad) = build_post_quad(a0, a1, a2, a3, elem_bytes, rp, &skip_p_nexts) {
+                        post_pairs.push(quad);
+                        skip_p_nexts.push(cand);
+                        matched = true;
+                    } else if let (Some(p1), Some(p2)) = (
+                        build_post_pair(a0.0, a0.3, a1.0, a1.3, a0.1, a0.2, 0, elem_bytes, rp),
+                        build_post_pair(a2.0, a2.3, a3.0, a3.3, a0.1, a0.2, 2 * elem_bytes, elem_bytes, rp),
+                    ) {
+                        post_pairs.push(p1);
+                        post_pairs.push(p2);
+                        skip_p_nexts.push(cand);
+                        matched = true;
+                    }
+                }
+            }
+            // Case 3 (1x 128-bit pair, step=32; or 1x 64-bit pair, step=16):
+            if !matched
+                && n_acc >= 2
+                && matches!(step, 16 | 32)
+                && let (Some(&a0), Some(&a1)) = (ptr_accesses.get(n_acc - 2), ptr_accesses.get(n_acc - 1))
+            {
+                let want_kind_ok = (step == 32 && a0.2 == PostAccessKind::Vec128)
+                    || (step == 16 && matches!(a0.2, PostAccessKind::Gpr64 | PostAccessKind::Fp64));
+                if want_kind_ok
+                    && a1.1 == a0.1
+                    && a1.2 == a0.2
+                    && !already_claimed(&post_pairs, a0.0)
+                    && !already_claimed(&post_pairs, a1.0)
+                    && range_preserves_rp(a0.0, cand, rp)
+                {
+                    let elem_bytes = if a0.2 == PostAccessKind::Vec128 { 16 } else { 8 };
+                    if let Some(p1) = build_post_pair(a0.0, a0.3, a1.0, a1.3, a0.1, a0.2, 0, elem_bytes, rp) {
+                        post_pairs.push(p1);
+                        skip_p_nexts.push(cand);
+                    }
+                }
+            }
+        }
+        for &pn in &skip_p_nexts {
+            set_at(&mut skip_emit, pn, true);
+        }
+
         let mut inst = range.start;
         while inst < range.end {
             if at_bool(&skip_emit, inst) {
                 inst += 1;
                 continue;
             }
-            // Adjacent 64-bit `ldp`/`stp` pair fusion: fuse `[base, #off]` + `[base, #off+8]`!
-            if inst + 1 < range.end && !at_bool(&skip_emit, inst + 1) {
-                if let (Some((base1, off1, fp1)), Some((base2, off2, fp2))) =
-                    (mem64_pair_addr(inst, true), mem64_pair_addr(inst + 1, true))
-                {
-                    if fp1 == fp2
-                        && base1 == base2
-                        && off2 == off1 + 8
-                        && off1 % 8 == 0
-                        && (-512..=504).contains(&off1)
-                    {
-                        if !fp1 {
-                            if let (AllocLoc::Gpr(r1), AllocLoc::Gpr(r2)) =
-                                (at_loc(&reg_alloc.loc_of, inst), at_loc(&reg_alloc.loc_of, inst + 1))
-                            {
-                                let (rt1, rt2) = (u32::from(r1), u32::from(r2));
-                                if rt1 != rt2 && rt1 != base1 {
-                                    words.push(enc::ldp_off(rt1, rt2, base1, i32_of(off1)));
-                                    inst += 2;
-                                    continue;
-                                }
-                            }
-                        } else if let (AllocLoc::Fp(r1), AllocLoc::Fp(r2)) =
-                            (at_loc(&reg_alloc.loc_of, inst), at_loc(&reg_alloc.loc_of, inst + 1))
-                        {
-                            let (dt1, dt2) = (u32::from(r1), u32::from(r2));
-                            if dt1 != dt2 {
-                                words.push(enc::ldp_d_off(dt1, dt2, base1, i32_of(off1)));
-                                inst += 2;
+            if let Some(pp) = post_pairs.iter().find(|pp| pp.trigger_inst() == inst).copied() {
+                match pp {
+                    PostIndexPlan::Single { second_inst, word, .. } => {
+                        words.push(word);
+                        set_at(&mut skip_emit, second_inst, true);
+                    }
+                    PostIndexPlan::Quad { i1, i2, i3, hi_word, lo_word, .. } => {
+                        words.push(hi_word);
+                        words.push(lo_word);
+                        set_at(&mut skip_emit, i1, true);
+                        set_at(&mut skip_emit, i2, true);
+                        set_at(&mut skip_emit, i3, true);
+                    }
+                }
+                inst += 1;
+                continue;
+            }
+            // Generalized 64-bit (`ldp x/d` / `stp x/d`) & 128-bit NEON (`ldp q` / `stp q`) pair fusion:
+            // skips folded/zero-emit instructions (`PtrAdd`/`Iconst`) between consecutive accesses, AND
+            // pairs 1-interleaved loads (`a0, b0, a1, b1` -> `ldp a0, a1` + `ldp b0, b1`) safely!
+            let is_post_member = |idx: usize| post_pairs.iter().any(|pp| pp.contains(idx));
+            let mut next1 = inst + 1;
+            while next1 < range.end && is_zero_emit(next1, &skip_emit) {
+                next1 += 1;
+            }
+            if next1 < range.end {
+                if !is_post_member(next1) && try_emit_pair(&mut words, inst, next1, true) {
+                    set_at(&mut skip_emit, next1, true);
+                    inst += 1;
+                    continue;
+                }
+                // Check 1-interleaved load pairing across an independent register-resident non-volatile Load.
+                let next1_is_reg_load = view.op(next1) == Op::Load
+                    && !Flags(at_u8(view.flags, next1)).contains(Flags::VOLATILE)
+                    && matches!(at_loc(&reg_alloc.loc_of, next1), AllocLoc::Gpr(_) | AllocLoc::Fp(_) | AllocLoc::Vec(_));
+                if view.op(inst) == Op::Load && next1_is_reg_load {
+                    let mut next2 = next1 + 1;
+                    while next2 < range.end && is_zero_emit(next2, &skip_emit) {
+                        next2 += 1;
+                    }
+                    if next2 < range.end && view.op(next2) == Op::Load && !is_post_member(next2) {
+                        let base_of_inst = mem128_pair_addr(inst, true)
+                            .map(|(b_reg, _)| b_reg)
+                            .or_else(|| mem64_pair_addr(inst, true).map(|(b_reg, _, _)| b_reg));
+                        if let Some(base1) = base_of_inst {
+                            let loc1 = at_loc(&reg_alloc.loc_of, next1);
+                            let loc2 = at_loc(&reg_alloc.loc_of, next2);
+                            let clobbers_base = matches!(loc1, AllocLoc::Gpr(r) if u32::from(r) == base1);
+                            let dst_hazard = loc1 == loc2
+                                || matches!(loc2, AllocLoc::Gpr(r2) if load_reads_gpr(next1, u32::from(r2)));
+                            if !clobbers_base && !dst_hazard && try_emit_pair(&mut words, inst, next2, false) {
+                                set_at(&mut skip_emit, next2, true);
+                                inst += 1;
                                 continue;
                             }
-                        }
-                    }
-                } else if let (Some((base1, off1, fp1)), Some((base2, off2, fp2))) =
-                    (mem64_pair_addr(inst, false), mem64_pair_addr(inst + 1, false))
-                {
-                    if fp1 == fp2
-                        && base1 == base2
-                        && off2 == off1 + 8
-                        && off1 % 8 == 0
-                        && (-512..=504).contains(&off1)
-                    {
-                        let v1 = at_u32(view.extra, to_idx(at_u32(view.data, inst)));
-                        let v2 = at_u32(view.extra, to_idx(at_u32(view.data, inst + 1)));
-                        if !fp1 {
-                            if let (AllocLoc::Gpr(r1), AllocLoc::Gpr(r2)) =
-                                (at_loc(&reg_alloc.loc_of, to_idx(v1)), at_loc(&reg_alloc.loc_of, to_idx(v2)))
-                            {
-                                words.push(enc::stp_off(u32::from(r1), u32::from(r2), base1, i32_of(off1)));
-                                inst += 2;
-                                continue;
-                            }
-                        } else if let (AllocLoc::Fp(r1), AllocLoc::Fp(r2)) =
-                            (at_loc(&reg_alloc.loc_of, to_idx(v1)), at_loc(&reg_alloc.loc_of, to_idx(v2)))
-                        {
-                            words.push(enc::stp_d_off(u32::from(r1), u32::from(r2), base1, i32_of(off1)));
-                            inst += 2;
-                            continue;
-                        }
-                    }
-                } else if let (Some((base1, off1)), Some((base2, off2))) =
-                    (mem128_pair_addr(inst, true), mem128_pair_addr(inst + 1, true))
-                {
-                    // Adjacent 128-bit NEON vector pair load -> `ldp q1, q2, [base, #off]` (32 bytes / 256 bits in 1 op)!
-                    if base1 == base2 && off2 == off1 + 16 && off1 % 16 == 0 && (-1024..=1008).contains(&off1) {
-                        if let (AllocLoc::Vec(v1), AllocLoc::Vec(v2)) =
-                            (at_loc(&reg_alloc.loc_of, inst), at_loc(&reg_alloc.loc_of, inst + 1))
-                        {
-                            if v1 != v2 {
-                                words.push(enc::ldp_q_off(u32::from(v1), u32::from(v2), base1, i32_of(off1 / 16)));
-                                inst += 2;
-                                continue;
-                            }
-                        }
-                    }
-                } else if let (Some((base1, off1)), Some((base2, off2))) =
-                    (mem128_pair_addr(inst, false), mem128_pair_addr(inst + 1, false))
-                {
-                    // Adjacent 128-bit NEON vector pair store -> `stp q1, q2, [base, #off]` (32 bytes in 1 op)!
-                    if base1 == base2 && off2 == off1 + 16 && off1 % 16 == 0 && (-1024..=1008).contains(&off1) {
-                        let v1 = at_u32(view.extra, to_idx(at_u32(view.data, inst)));
-                        let v2 = at_u32(view.extra, to_idx(at_u32(view.data, inst + 1)));
-                        if let (AllocLoc::Vec(r1), AllocLoc::Vec(r2)) =
-                            (at_loc(&reg_alloc.loc_of, to_idx(v1)), at_loc(&reg_alloc.loc_of, to_idx(v2)))
-                        {
-                            words.push(enc::stp_q_off(u32::from(r1), u32::from(r2), base1, i32_of(off1 / 16)));
-                            inst += 2;
-                            continue;
                         }
                     }
                 }
@@ -3737,7 +5123,10 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                         | Op::Urem
                         | Op::Srem
                 );
-            if !has_side_effect && matches!(loc, AllocLoc::None | AllocLoc::RematConst(_)) {
+            if !has_side_effect
+                && matches!(loc, AllocLoc::None | AllocLoc::RematConst(_))
+                && at_fusion(&fusion, inst) != Fusion::SubsFlags
+            {
                 inst += 1;
                 continue;
             }
@@ -3896,19 +5285,46 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                     | Op::SsubSat => {
                         let (vd, sp) = dst_vec(inst);
                         if op == Op::Add {
-                            if let Fusion::VecUadalp { acc, src_4s } = at_fusion(&fusion, inst) {
-                                let vacc = load_vec(&mut words, acc, V30);
-                                let vsrc = load_vec(&mut words, src_4s, V29);
-                                if vd == vacc {
-                                    words.push(enc::uadalp_2d(vd, vsrc));
-                                } else if vd != vsrc {
-                                    words.push(enc::orr_v(vd, vacc, vacc));
-                                    words.push(enc::uadalp_2d(vd, vsrc));
-                                } else {
-                                    words.push(enc::orr_v(V31, vacc, vacc));
-                                    words.push(enc::uadalp_2d(V31, vsrc));
-                                    words.push(enc::orr_v(vd, V31, V31));
+                            match at_fusion(&fusion, inst) {
+                                Fusion::VecUadalp { acc, src_4s } => {
+                                    let vacc = load_vec(&mut words, acc, V30);
+                                    let vsrc = load_vec(&mut words, src_4s, V29);
+                                    if vd == vacc {
+                                        words.push(enc::uadalp_2d(vd, vsrc));
+                                    } else if vd != vsrc {
+                                        words.push(enc::orr_v(vd, vacc, vacc));
+                                        words.push(enc::uadalp_2d(vd, vsrc));
+                                    } else {
+                                        words.push(enc::orr_v(V31, vacc, vacc));
+                                        words.push(enc::uadalp_2d(V31, vsrc));
+                                        words.push(enc::orr_v(vd, V31, V31));
+                                    }
+                                    if let Some(s) = sp {
+                                        emit_st_spill_vec(&mut words, vd, spill_base, s);
+                                    }
+                                    inst += 1;
+                                    continue;
                                 }
+                                Fusion::Madd { a, b: mb, acc } => {
+                                    let va = load_vec(&mut words, a, V29);
+                                    let vb = load_vec(&mut words, mb, V30);
+                                    let vc = load_vec(&mut words, acc, V31);
+                                    emit_vec_acc3(&mut words, vd, va, vb, vc, |d, n, m| enc::mla_v(vsize, d, n, m));
+                                    if let Some(s) = sp {
+                                        emit_st_spill_vec(&mut words, vd, spill_base, s);
+                                    }
+                                    inst += 1;
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if op == Op::Sub {
+                            if let Fusion::Msub { a, b: mb, acc } = at_fusion(&fusion, inst) {
+                                let va = load_vec(&mut words, a, V29);
+                                let vb = load_vec(&mut words, mb, V30);
+                                let vc = load_vec(&mut words, acc, V31);
+                                emit_vec_acc3(&mut words, vd, va, vb, vc, |d, n, m| enc::mls_v(vsize, d, n, m));
                                 if let Some(s) = sp {
                                     emit_st_spill_vec(&mut words, vd, spill_base, s);
                                 }
@@ -3961,6 +5377,20 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             words.push(enc::xtn_2s(V29, va));
                             words.push(enc::xtn_2s(V31, vb));
                             words.push(enc::umull_2d(vd, V29, V31));
+                        } else if vsize == 3 && matches!(op, Op::Umin | Op::Umax | Op::Smin | Op::Smax) {
+                            // `<2 x i64>` vector min/max via `cmgt.2d`/`cmhi.2d` + `bsl`/`bit`/`bif`!
+                            let unsigned = matches!(op, Op::Umin | Op::Umax);
+                            let is_min = matches!(op, Op::Umin | Op::Smin);
+                            let (lhs_cmp, rhs_cmp) = if is_min { (vb, va) } else { (va, vb) };
+                            words.push(enc::cmgt_v(unsigned, 3, V29, lhs_cmp, rhs_cmp));
+                            if vd == vb {
+                                words.push(enc::bit_v(vd, va, V29));
+                            } else if vd == va {
+                                words.push(enc::bif_v(vd, vb, V29));
+                            } else {
+                                words.push(enc::bsl_v(V29, va, vb));
+                                words.push(enc::orr_v(vd, V29, V29));
+                            }
                         } else {
                             let w = match op {
                                 Op::Add => enc::add_v(vsize, vd, va, vb),
@@ -3985,25 +5415,40 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             emit_st_spill_vec(&mut words, vd, spill_base, s);
                         }
                     }
-                    Op::Fadd | Op::Fsub | Op::Fmul => {
+                    Op::Fadd | Op::Fsub | Op::Fmul | Op::Fma | Op::Fmuladd => {
                         let (vd, sp) = dst_vec(inst);
                         let double = vsize == 3;
+                        if matches!(op, Op::Fma | Op::Fmuladd) {
+                            let at = to_idx(at_u32(view.data, inst));
+                            let va = load_vec(&mut words, at_u32(view.extra, at), V29);
+                            let vb = load_vec(&mut words, at_u32(view.extra, at + 1), V30);
+                            let vc = load_vec(&mut words, at_u32(view.extra, at + 2), V31);
+                            emit_vec_acc3(&mut words, vd, va, vb, vc, |d, n, m| enc::fmla_v(double, d, n, m));
+                            if let Some(s) = sp {
+                                emit_st_spill_vec(&mut words, vd, spill_base, s);
+                            }
+                            inst += 1;
+                            continue;
+                        }
                         if op == Op::Fadd {
                             if let Fusion::Fmadd { a, b: mb, acc } = at_fusion(&fusion, inst) {
                                 let va = load_vec(&mut words, a, V29);
                                 let vb = load_vec(&mut words, mb, V30);
                                 let vc = load_vec(&mut words, acc, V31);
-                                if vd == vc {
-                                    // Zero-copy 1-instruction `fmla vd.2d, va.2d, vb.2d`!
-                                    words.push(enc::fmla_v(double, vd, va, vb));
-                                } else if vd != va && vd != vb {
-                                    words.push(enc::orr_v(vd, vc, vc));
-                                    words.push(enc::fmla_v(double, vd, va, vb));
-                                } else {
-                                    words.push(enc::orr_v(V31, vc, vc));
-                                    words.push(enc::fmla_v(double, V31, va, vb));
-                                    words.push(enc::orr_v(vd, V31, V31));
+                                emit_vec_acc3(&mut words, vd, va, vb, vc, |d, n, m| enc::fmla_v(double, d, n, m));
+                                if let Some(s) = sp {
+                                    emit_st_spill_vec(&mut words, vd, spill_base, s);
                                 }
+                                inst += 1;
+                                continue;
+                            }
+                        }
+                        if op == Op::Fsub {
+                            if let Fusion::Fmsub { a, b: mb, acc } = at_fusion(&fusion, inst) {
+                                let va = load_vec(&mut words, a, V29);
+                                let vb = load_vec(&mut words, mb, V30);
+                                let vc = load_vec(&mut words, acc, V31);
+                                emit_vec_acc3(&mut words, vd, va, vb, vc, |d, n, m| enc::fmls_v(double, d, n, m));
                                 if let Some(s) = sp {
                                     emit_st_spill_vec(&mut words, vd, spill_base, s);
                                 }
@@ -4781,14 +6226,18 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             } else {
                                 words.push(enc::umov_lane(3, 0, X16, vs));
                                 words.push(enc::umov_lane(3, 1, X17, vs));
-                                words.push(enc::cmp(X16, X17));
-                                let cond = match (unsigned, is_min) {
-                                    (true, true) => Cond::Lo,
-                                    (true, false) => Cond::Hi,
-                                    (false, true) => Cond::Lt,
-                                    (false, false) => Cond::Gt,
-                                };
-                                words.push(enc::csel(rd, X16, X17, cond));
+                                if has_cssc {
+                                    words.push(enc::cssc_minmax(unsigned, is_min, rd, X16, X17));
+                                } else {
+                                    words.push(enc::cmp(X16, X17));
+                                    let cond = match (unsigned, is_min) {
+                                        (true, true) => Cond::Lo,
+                                        (true, false) => Cond::Hi,
+                                        (false, true) => Cond::Lt,
+                                        (false, false) => Cond::Gt,
+                                    };
+                                    words.push(enc::csel(rd, X16, X17, cond));
+                                }
                             }
                         }
                         Op::ReduceXor | Op::ReduceOr | Op::ReduceAnd => {
@@ -5965,6 +7414,21 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             let rb = load_gpr(&mut words, sb, X17);
                             words.push(enc::sub_lsl(rd, ra, rb, shift));
                         }
+                        Fusion::SubsFlags => {
+                            let at = to_idx(at_u32(view.data, inst));
+                            let lhs = at_u32(view.extra, at);
+                            let rhs = at_u32(view.extra, at + 1);
+                            let w32 = bits == 32;
+                            let dst = if loc == AllocLoc::None { ZR } else { rd };
+                            if let Some(imm) = at_opt(&const_u64, to_idx(rhs)).filter(|&v| v <= 4095) {
+                                let rl = load_gpr(&mut words, lhs, X16);
+                                words.push(enc::sf(!w32, enc::subs_imm(dst, rl, trunc_u32(imm), false)));
+                            } else {
+                                let rl = load_gpr(&mut words, lhs, X16);
+                                let rr = load_gpr(&mut words, rhs, X17);
+                                words.push(enc::sf(!w32, enc::subs(dst, rl, rr)));
+                            }
+                        }
                         _ => {
                             let at = to_idx(at_u32(view.data, inst));
                             let lhs = at_u32(view.extra, at);
@@ -6044,30 +7508,41 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                 Op::Or => {
                     let (rd, sp) = dst_gpr(inst);
                     let w32 = bits == 32;
-                    if let Fusion::Orn { a, b: nb } = at_fusion(&fusion, inst) {
-                        let ra = load_gpr(&mut words, a, X16);
-                        let rb = load_gpr(&mut words, nb, X17);
-                        words.push(enc::sf(!w32, enc::orn(rd, ra, rb)));
-                    } else {
-                        let at = to_idx(at_u32(view.data, inst));
-                        let lhs = at_u32(view.extra, at);
-                        let rhs = at_u32(view.extra, at + 1);
-                        if let Some(nrs) = (bits == 64 || w32)
-                            .then(|| at_opt(&const_u64, to_idx(rhs)).and_then(|v| enc::logical_imm(v, bits)))
-                            .flatten()
-                        {
-                            let rl = load_gpr(&mut words, lhs, X16);
-                            words.push(enc::sf(!w32, enc::orr_imm_nrs(rd, rl, u32_of(nrs))));
-                        } else if let Some(nrs) = (bits == 64 || w32)
-                            .then(|| at_opt(&const_u64, to_idx(lhs)).and_then(|v| enc::logical_imm(v, bits)))
-                            .flatten()
-                        {
-                            let rr = load_gpr(&mut words, rhs, X16);
-                            words.push(enc::sf(!w32, enc::orr_imm_nrs(rd, rr, u32_of(nrs))));
-                        } else {
-                            let rl = load_gpr(&mut words, lhs, X16);
-                            let rr = load_gpr(&mut words, rhs, X17);
-                            words.push(enc::sf(!w32, enc::orr(rd, rl, rr)));
+                    match at_fusion(&fusion, inst) {
+                        Fusion::Orn { a, b: nb } => {
+                            let ra = load_gpr(&mut words, a, X16);
+                            let rb = load_gpr(&mut words, nb, X17);
+                            words.push(enc::sf(!w32, enc::orn(rd, ra, rb)));
+                        }
+                        Fusion::RorImm { x, ror_amt, .. } => {
+                            let rx = load_gpr(&mut words, x, X16);
+                            words.push(if w32 {
+                                enc::extr_w(rd, rx, rx, ror_amt)
+                            } else {
+                                enc::extr(rd, rx, rx, ror_amt)
+                            });
+                        }
+                        _ => {
+                            let at = to_idx(at_u32(view.data, inst));
+                            let lhs = at_u32(view.extra, at);
+                            let rhs = at_u32(view.extra, at + 1);
+                            if let Some(nrs) = (bits == 64 || w32)
+                                .then(|| at_opt(&const_u64, to_idx(rhs)).and_then(|v| enc::logical_imm(v, bits)))
+                                .flatten()
+                            {
+                                let rl = load_gpr(&mut words, lhs, X16);
+                                words.push(enc::sf(!w32, enc::orr_imm_nrs(rd, rl, u32_of(nrs))));
+                            } else if let Some(nrs) = (bits == 64 || w32)
+                                .then(|| at_opt(&const_u64, to_idx(lhs)).and_then(|v| enc::logical_imm(v, bits)))
+                                .flatten()
+                            {
+                                let rr = load_gpr(&mut words, rhs, X16);
+                                words.push(enc::sf(!w32, enc::orr_imm_nrs(rd, rr, u32_of(nrs))));
+                            } else {
+                                let rl = load_gpr(&mut words, lhs, X16);
+                                let rr = load_gpr(&mut words, rhs, X17);
+                                words.push(enc::sf(!w32, enc::orr(rd, rl, rr)));
+                            }
                         }
                     }
                     if let Some(s) = sp {
@@ -6082,6 +7557,19 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             let ra = load_gpr(&mut words, a, X16);
                             let rb = load_gpr(&mut words, nb, X17);
                             words.push(enc::sf(!w32, enc::eon(rd, ra, rb)));
+                        }
+                        Fusion::RorImm { x, ror_amt, .. } => {
+                            let rx = load_gpr(&mut words, x, X16);
+                            words.push(if w32 {
+                                enc::extr_w(rd, rx, rx, ror_amt)
+                            } else {
+                                enc::extr(rd, rx, rx, ror_amt)
+                            });
+                        }
+                        Fusion::EorRor { a, b: sb, shift, .. } => {
+                            let ra = load_gpr(&mut words, a, X16);
+                            let rb = load_gpr(&mut words, sb, X17);
+                            words.push(enc::sf(!w32, enc::eor_ror(rd, ra, rb, shift)));
                         }
                         Fusion::EorLsl { a, b: sb, shift, .. } => {
                             let ra = load_gpr(&mut words, a, X16);
@@ -7309,12 +8797,24 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             inst += 1;
                             continue;
                         }
-                        Fusion::CsincSelect { cond, a, b: bv, op_ty, x, inc_when_false } => {
+                        Fusion::CsincSelect { cond, a, b: bv, op_ty, rn, rm, inc_when_false, .. } => {
                             let (rd, sp) = dst_gpr(inst);
                             emit_cmp(&mut words, cond, a, bv, op_ty);
-                            let rx = load_gpr(&mut words, x, X16);
+                            let r_n = load_gpr(&mut words, rn, X16);
+                            let r_m = load_gpr(&mut words, rm, X17);
                             let c = if inc_when_false { cond_of(cond) } else { invert_cond(cond_of(cond)) };
-                            words.push(enc::csinc(rd, rx, rx, c));
+                            words.push(enc::csinc(rd, r_n, r_m, c));
+                            if let Some(s) = sp {
+                                emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                            }
+                            inst += 1;
+                            continue;
+                        }
+                        Fusion::ReuseFlagsCsinc { cond, rn, rm, .. } => {
+                            let (rd, sp) = dst_gpr(inst);
+                            let r_n = load_gpr(&mut words, rn, X16);
+                            let r_m = load_gpr(&mut words, rm, X17);
+                            words.push(enc::csinc(rd, r_n, r_m, cond));
                             if let Some(s) = sp {
                                 emit_st_spill_gpr(&mut words, rd, spill_base, s);
                             }
@@ -7346,6 +8846,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             words.push(enc::fcmp(double, va, vb));
                             cond
                         }
+                        Fusion::ReuseFlagsSelect { cond } => cond,
                         _ => {
                             let rc = load_gpr(&mut words, at_u32(view.extra, at), X16);
                             words.push(enc::cmp_imm(rc, 0));
@@ -7800,7 +9301,10 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                     let else_block = at_u32(view.extra, else_at);
                     let else_argc = to_idx(at_u32(view.extra, else_at + 1));
 
-                    if then_argc == 0 && else_argc == 0 {
+                    let then_nop = then_argc == 0 || edge_is_nop(then_block, at + 3, then_argc);
+                    let else_nop = else_argc == 0 || edge_is_nop(else_block, else_at + 2, else_argc);
+
+                    if then_nop && else_nop {
                         match at_fusion(&fusion, inst) {
                             Fusion::TbzBr { val, bit, nonzero_is_then, .. } => {
                                 let rv = load_gpr(&mut words, val, X16);
@@ -7874,6 +9378,9 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                                 // Single-instruction `b.cs err_blk` directly on the callee's Carry flag (`C=1` = Err)!
                                 emit_cond_branch_pair(&mut words, &mut patches, Cond::Hs, then_block, else_block, next_block);
                             }
+                            Fusion::ReuseFlagsBr { cond, .. } => {
+                                emit_cond_branch_pair(&mut words, &mut patches, cond, then_block, else_block, next_block);
+                            }
                             _ => {
                                 let rc = load_gpr(&mut words, cond_v, X16);
                                 if next_block == Some(to_idx(else_block)) {
@@ -7894,6 +9401,120 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                                 }
                             }
                         }
+                    } else if then_nop && !else_nop && next_block == Some(to_idx(then_block)) && len < 32_768 {
+                        // Hot `then` falls straight through into `next_block` with ZERO moves;
+                        // sink cold `else` edge moves to a deferred stub at the end of the function!
+                        let (widx, kind) = match at_fusion(&fusion, inst) {
+                            Fusion::CmpBr { cond, a, b: bv, op_ty } => {
+                                if at_opt(&const_u64, to_idx(bv)) == Some(0) && matches!(cond, IntCond::Eq | IntCond::Ne) {
+                                    let ra = load_gpr(&mut words, a, X16);
+                                    let w = words.len();
+                                    let k = if cond == IntCond::Eq {
+                                        words.push(enc::cbnz(ra, 0));
+                                        PatchKind::Cbnz(ra)
+                                    } else {
+                                        words.push(enc::cbz(ra, 0));
+                                        PatchKind::Cbz(ra)
+                                    };
+                                    (w, k)
+                                } else {
+                                    emit_cmp(&mut words, cond, a, bv, op_ty);
+                                    let inv = invert_cond(cond_of(cond));
+                                    let w = words.len();
+                                    words.push(enc::b_cond(inv, 0));
+                                    (w, PatchKind::BCond(inv))
+                                }
+                            }
+                            Fusion::FcmpBr { cond, a, b: bv, double } => {
+                                let va = load_fp(&mut words, a, V30);
+                                let vb = load_fp(&mut words, bv, V31);
+                                words.push(enc::fcmp(double, va, vb));
+                                let inv = invert_cond(cond);
+                                let w = words.len();
+                                words.push(enc::b_cond(inv, 0));
+                                (w, PatchKind::BCond(inv))
+                            }
+                            Fusion::BlazeResultCallBr => {
+                                let w = words.len();
+                                words.push(enc::b_cond(Cond::Lo, 0));
+                                (w, PatchKind::BCond(Cond::Lo))
+                            }
+                            Fusion::ReuseFlagsBr { cond, .. } => {
+                                let inv = invert_cond(cond);
+                                let w = words.len();
+                                words.push(enc::b_cond(inv, 0));
+                                (w, PatchKind::BCond(inv))
+                            }
+                            _ => {
+                                let rc = load_gpr(&mut words, cond_v, X16);
+                                let w = words.len();
+                                words.push(enc::cbz(rc, 0));
+                                (w, PatchKind::Cbz(rc))
+                            }
+                        };
+                        cold_stubs.push(ColdEdgeStub {
+                            branch_word_idx: widx,
+                            branch_kind: kind,
+                            target_block: else_block,
+                            args_start: else_at + 2,
+                            args_len: else_argc,
+                        });
+                    } else if !then_nop && else_nop && next_block == Some(to_idx(else_block)) && len < 32_768 {
+                        // Hot `else` falls straight through into `next_block` with ZERO moves;
+                        // sink cold `then` edge moves to a deferred stub at the end of the function!
+                        let (widx, kind) = match at_fusion(&fusion, inst) {
+                            Fusion::CmpBr { cond, a, b: bv, op_ty } => {
+                                if at_opt(&const_u64, to_idx(bv)) == Some(0) && matches!(cond, IntCond::Eq | IntCond::Ne) {
+                                    let ra = load_gpr(&mut words, a, X16);
+                                    let w = words.len();
+                                    let k = if cond == IntCond::Eq {
+                                        words.push(enc::cbz(ra, 0));
+                                        PatchKind::Cbz(ra)
+                                    } else {
+                                        words.push(enc::cbnz(ra, 0));
+                                        PatchKind::Cbnz(ra)
+                                    };
+                                    (w, k)
+                                } else {
+                                    emit_cmp(&mut words, cond, a, bv, op_ty);
+                                    let c = cond_of(cond);
+                                    let w = words.len();
+                                    words.push(enc::b_cond(c, 0));
+                                    (w, PatchKind::BCond(c))
+                                }
+                            }
+                            Fusion::FcmpBr { cond, a, b: bv, double } => {
+                                let va = load_fp(&mut words, a, V30);
+                                let vb = load_fp(&mut words, bv, V31);
+                                words.push(enc::fcmp(double, va, vb));
+                                let w = words.len();
+                                words.push(enc::b_cond(cond, 0));
+                                (w, PatchKind::BCond(cond))
+                            }
+                            Fusion::BlazeResultCallBr => {
+                                let w = words.len();
+                                words.push(enc::b_cond(Cond::Hs, 0));
+                                (w, PatchKind::BCond(Cond::Hs))
+                            }
+                            Fusion::ReuseFlagsBr { cond, .. } => {
+                                let w = words.len();
+                                words.push(enc::b_cond(cond, 0));
+                                (w, PatchKind::BCond(cond))
+                            }
+                            _ => {
+                                let rc = load_gpr(&mut words, cond_v, X16);
+                                let w = words.len();
+                                words.push(enc::cbnz(rc, 0));
+                                (w, PatchKind::Cbnz(rc))
+                            }
+                        };
+                        cold_stubs.push(ColdEdgeStub {
+                            branch_word_idx: widx,
+                            branch_kind: kind,
+                            target_block: then_block,
+                            args_start: at + 3,
+                            args_len: then_argc,
+                        });
                     } else {
                         let skip_then = match at_fusion(&fusion, inst) {
                             Fusion::CmpBr { cond, a, b: bv, op_ty } => {
@@ -7915,6 +9536,12 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             Fusion::BlazeResultCallBr => {
                                 // Skip `then` (Err) edge moves when Carry Clear (`Ok`, `Cond::Lo` = `b.cc`)!
                                 let inv = Cond::Lo;
+                                let idx = words.len();
+                                words.push(enc::b_cond(inv, 0));
+                                (idx, PatchKind::BCond(inv))
+                            }
+                            Fusion::ReuseFlagsBr { cond, .. } => {
+                                let inv = invert_cond(cond);
                                 let idx = words.len();
                                 words.push(enc::b_cond(inv, 0));
                                 (idx, PatchKind::BCond(inv))
@@ -7975,7 +9602,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                     let sr = load_gpr(&mut words, scrutinee, X16);
 
                     // Dense O(1) PC-relative jump table (`adr` + `ldrsw [tab, idx, lsl #2]` + `add` + `br`),
-                    // supporting both 0-arg direct targets and block-param-carrying edges via compact inline trampolines!
+                    // sharing out-of-line tables across zero-move `taildup` dispatch sites for peak I-cache/L1D density!
                     if let Some((min_v, span)) = dense_switch_plan(&view, inst) {
                         // `(target_block, args_start, argc)` per dense table entry; default fills holes.
                         let mut entries: Vec<(u32, usize, usize), Alloc<'a>> = Vec::with_capacity_in(span, alloc);
@@ -7995,17 +9622,20 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             pos += 2 + case_argc;
                             set_at(&mut entries, to_idx(case_val - min_v), (case_block, case_args_start, case_argc));
                         }
-                        // Compute `idx = sr - min_v` in `X16`.
-                        if min_v == 0 {
-                            if sr != X16 {
-                                words.push(enc::mov(X16, sr));
-                            }
+                        // Use `sr` directly when `min_v == 0` (eliminates wasted `mov x16, sr`!).
+                        let idx_reg = if min_v == 0 && sr != X17 {
+                            sr
+                        } else if min_v == 0 {
+                            words.push(enc::mov(X16, sr));
+                            X16
                         } else if min_v <= 4095 {
                             words.push(enc::sub_imm(X16, sr, trunc_u32(min_v), false));
+                            X16
                         } else {
                             emit_const_u64(&mut words, X17, min_v);
                             words.push(enc::sub(X16, sr, X17));
-                        }
+                            X16
+                        };
                         // Exhaustive enum niche switch: if `default_block` is `Op::Unreachable`-only,
                         // skip the `cmp + b.hi` bounds check completely (saves 2 ops + 1 BTB entry)!
                         let default_is_unreachable = default_argc == 0
@@ -8013,33 +9643,79 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                                 .block(Block(default_block))
                                 .find(|&i| view.op(i) != Op::Param)
                                 .is_some_and(|i| view.op(i) == Op::Unreachable);
+                        let default_nop = default_is_unreachable
+                            || default_argc == 0
+                            || edge_is_nop(default_block, at + 3, default_argc);
+                        let all_entries_nop = entries
+                            .iter()
+                            .all(|&(tb, astart, argc)| argc == 0 || edge_is_nop(tb, astart, argc));
+                        let share_table = all_entries_nop && len < 32_768;
+
                         let b_def = if default_is_unreachable {
                             None
                         } else {
-                            words.push(enc::cmp_imm(X16, u32_of(span - 1)));
+                            words.push(enc::cmp_imm(idx_reg, u32_of(span - 1)));
                             let idx = words.len();
                             words.push(enc::b_cond(Cond::Hi, 0));
-                            if default_argc == 0 {
+                            if default_nop {
                                 patches.push(BranchPatch {
                                     word_idx: idx,
                                     kind: PatchKind::BCond(Cond::Hi),
                                     target_block: default_block,
                                 });
+                            } else if share_table {
+                                cold_stubs.push(ColdEdgeStub {
+                                    branch_word_idx: idx,
+                                    branch_kind: PatchKind::BCond(Cond::Hi),
+                                    target_block: default_block,
+                                    args_start: at + 3,
+                                    args_len: default_argc,
+                                });
                             }
                             Some(idx)
                         };
+                        if share_table {
+                            // Out-of-line shared jump table at function tail: keeps hot arms tiny & L1D-hot!
+                            let adr_word_idx = words.len();
+                            words.push(enc::adr(X17, 0));
+                            words.push(enc::ldrsw_reg_scaled(X16, X17, idx_reg));
+                            words.push(enc::add(X17, X17, X16));
+                            words.push(enc::br(X17));
+                            let mut found = false;
+                            for tab in shared_jump_tables.iter_mut() {
+                                if tab.targets.len() == span
+                                    && tab.targets.iter().zip(entries.iter()).all(|(&t, &(tb, _, _))| t == tb)
+                                {
+                                    tab.adr_sites.push(adr_word_idx);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found {
+                                let mut targets: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(span, alloc);
+                                for &(tb, _, _) in entries.iter() {
+                                    targets.push(tb);
+                                }
+                                let mut adr_sites: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(4, alloc);
+                                adr_sites.push(adr_word_idx);
+                                shared_jump_tables.push(SharedJumpTable { targets, adr_sites });
+                            }
+                            inst += 1;
+                            continue;
+                        }
+                        // Inline fallback for switches whose case entries require edge-move trampolines.
                         // `adr x17, table` (4 instructions ahead = +16 bytes).
                         words.push(enc::adr(X17, 16));
-                        words.push(enc::ldrsw_reg_scaled(X16, X17, X16));
+                        words.push(enc::ldrsw_reg_scaled(X16, X17, idx_reg));
                         words.push(enc::add(X17, X17, X16));
                         words.push(enc::br(X17));
                         let table_start_word = words.len();
                         for _ in 0..span {
                             words.push(0);
                         }
-                        // Emit default trampoline once if `default_argc > 0`.
+                        // Emit default trampoline once only when default actually requires edge moves.
                         let mut def_tramp_word: Option<usize> = None;
-                        if default_argc > 0 {
+                        if !default_nop {
                             let tw = words.len();
                             def_tramp_word = Some(tw);
                             if let Some(b_def_idx) = b_def {
@@ -8052,7 +9728,7 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                         }
                         for (k, &(tb, astart, argc)) in entries.iter().enumerate() {
                             let eidx = table_start_word + k;
-                            if argc == 0 {
+                            if argc == 0 || edge_is_nop(tb, astart, argc) {
                                 patches.push(BranchPatch {
                                     word_idx: eidx,
                                     kind: PatchKind::JumpTableEntry { table_start_word },
@@ -8068,19 +9744,10 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                             } else {
                                 let tw = words.len();
                                 emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, tb, astart, argc);
-                                if words.len() == tw {
-                                    // Edge was fully coalesced (0 moves!): jump straight to `tb`!
-                                    patches.push(BranchPatch {
-                                        word_idx: eidx,
-                                        kind: PatchKind::JumpTableEntry { table_start_word },
-                                        target_block: tb,
-                                    });
-                                } else {
-                                    let wb = words.len();
-                                    words.push(enc::b(0));
-                                    patches.push(BranchPatch { word_idx: wb, kind: PatchKind::B, target_block: tb });
-                                    set_at(&mut words, eidx, word_delta(tw, table_start_word).wrapping_mul(4).cast_unsigned());
-                                }
+                                let wb = words.len();
+                                words.push(enc::b(0));
+                                patches.push(BranchPatch { word_idx: wb, kind: PatchKind::B, target_block: tb });
+                                set_at(&mut words, eidx, word_delta(tw, table_start_word).wrapping_mul(4).cast_unsigned());
                             }
                         }
                         inst += 1;
@@ -8299,8 +9966,54 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
             inst += 1;
         }
     }
+    // 4b. Emit deferred cold edge-move stubs at the tail of the function (out of hot I-cache lines).
+    for stub in &cold_stubs {
+        let stub_w = words.len();
+        let delta = word_delta(stub_w, stub.branch_word_idx);
+        set_at(&mut words, stub.branch_word_idx, match stub.branch_kind {
+            PatchKind::B => enc::b(delta),
+            PatchKind::BCond(c) => enc::b_cond(c, delta),
+            PatchKind::Cbz(r) => enc::cbz(r, delta),
+            PatchKind::Cbnz(r) => enc::cbnz(r, delta),
+            PatchKind::Tbz(r, bit) => enc::tbz(r, bit, delta),
+            PatchKind::Tbnz(r, bit) => enc::tbnz(r, bit, delta),
+            PatchKind::JumpTableEntry { .. } => {
+                return Err(TierError::Refused { tier: TIER, inst: None, what: "unexpected cold stub patch kind" });
+            }
+        });
+        emit_edge_moves(
+            &mut words,
+            &mut gpr_moves,
+            &mut fp_moves,
+            &mut const_edge_writes,
+            stub.target_block,
+            stub.args_start,
+            stub.args_len,
+        );
+        let wb = words.len();
+        words.push(enc::b(0));
+        patches.push(BranchPatch { word_idx: wb, kind: PatchKind::B, target_block: stub.target_block });
+    }
     if let Some(err) = internal_err.get() {
         return Err(err);
+    }
+
+    // 4c. Emit shared out-of-line PC-relative jump tables at the tail of the function.
+    for tab in &shared_jump_tables {
+        let table_start_word = words.len();
+        for &adr_w in &tab.adr_sites {
+            let byte_delta = word_delta(table_start_word, adr_w).wrapping_mul(4);
+            set_at(&mut words, adr_w, enc::adr(X17, byte_delta));
+        }
+        for &tb in &tab.targets {
+            let eidx = words.len();
+            words.push(0);
+            patches.push(BranchPatch {
+                word_idx: eidx,
+                kind: PatchKind::JumpTableEntry { table_start_word },
+                target_block: tb,
+            });
+        }
     }
 
     // 5. Patch all intra-function branch displacements & jump table entries.

@@ -97,8 +97,8 @@ pub enum DataError {
     NoFn { key: InstanceKey },
     /// `fill` was given a buffer of another length, or a base not aligned to the image.
     Placement,
-    /// A static points to a vtable: the image places no vtables yet.
-    Vtable { key: crate::vtable::VtableKey },
+    /// Placement found no address for a vtable a static points to.
+    NoVtable { key: crate::vtable::VtableKey },
 }
 
 impl fmt::Display for DataError {
@@ -115,7 +115,7 @@ impl fmt::Display for DataError {
             DataError::TooLarge => write!(f, "the statics' image passes 4 GiB"),
             DataError::NoFn { key } => write!(f, "a static points to fn instance {:?}, which placement has no address for", key.0),
             DataError::Placement => write!(f, "the image was placed in a buffer of another length or alignment"),
-            DataError::Vtable { key } => write!(f, "a static points to vtable {:?}: the statics' image places no vtables yet", key.0),
+            DataError::NoVtable { key } => write!(f, "a static points to vtable {:?}, which placement has no address for", key.0),
         }
     }
 }
@@ -169,6 +169,7 @@ pub enum ImageTarget {
     /// A byte of the image.
     Image(u32),
     Fn(InstanceKey),
+    Vtable(crate::vtable::VtableKey),
 }
 
 /// An absolute address word of the image: at `at`, the target plus `addend`.
@@ -245,7 +246,7 @@ impl<A: Allocator + Copy> StaticImage<A> {
                         DataTarget::Local(t) => ImageTarget::Image(at_of[i][t as usize]),
                         DataTarget::Static(key) => ImageTarget::Image(root_of(key).ok_or(DataError::NoStatic { static_: key })?),
                         DataTarget::Fn(key) => ImageTarget::Fn(key),
-                        DataTarget::Vtable(key) => return Err(DataError::Vtable { key }),
+                        DataTarget::Vtable(key) => ImageTarget::Vtable(key),
                     };
                     relocs.push(ImageReloc { at: word as u32, target, addend: i64::from_le_bytes(addend) });
                 }
@@ -262,8 +263,15 @@ impl<A: Allocator + Copy> StaticImage<A> {
     }
 
     /// Writes the image into `out`, which is placed at address `base` (aligned to the image),
-    /// every relocation word made absolute; `fn_at` gives each fn instance's address.
-    pub fn fill(&self, base: u64, out: &mut [u8], mut fn_at: impl FnMut(InstanceKey) -> Option<u64>) -> Result<(), DataError> {
+    /// every relocation word made absolute; `fn_at` gives each fn instance's address and
+    /// `vtable_at` gives each vtable's address.
+    pub fn fill(
+        &self,
+        base: u64,
+        out: &mut [u8],
+        mut fn_at: impl FnMut(InstanceKey) -> Option<u64>,
+        mut vtable_at: impl FnMut(crate::vtable::VtableKey) -> Option<u64>,
+    ) -> Result<(), DataError> {
         if out.len() != self.bytes.len() || base & ((1u64 << self.align) - 1) != 0 {
             return Err(DataError::Placement);
         }
@@ -272,6 +280,7 @@ impl<A: Allocator + Copy> StaticImage<A> {
             let to = match r.target {
                 ImageTarget::Image(off) => base + u64::from(off),
                 ImageTarget::Fn(key) => fn_at(key).ok_or(DataError::NoFn { key })?,
+                ImageTarget::Vtable(key) => vtable_at(key).ok_or(DataError::NoVtable { key })?,
             };
             let at = r.at as usize;
             out[at..at + 8].copy_from_slice(&to.wrapping_add_signed(r.addend).to_le_bytes());
@@ -301,10 +310,11 @@ mod tests {
     }
 
     /// `static A: &[u8] = b"hey";` (a wide pointer to a local allocation), `static B: &&[u8] =
-    /// &A` with addend, and `static F: fn() = f`: each word becomes base + offset + addend.
+    /// &A` with addend, `static F: fn() = f`, and `static D: &dyn Tr = &A`: each word becomes
+    /// base + offset + addend, fn address, or vtable address.
     #[test]
     fn statics_point_at_each_other_their_allocations_and_fns() {
-        let (a, b, f) = (ItemKey(3), ItemKey(1), ItemKey(2));
+        let (a, b, f, d) = (ItemKey(3), ItemKey(1), ItemKey(2), ItemKey(4));
         let mut wide = [0u8; 16];
         wide[8..].copy_from_slice(&3u64.to_le_bytes());
         let ra = record(vec![alloc(&wide, 3, &[DataReloc { offset: 0, target: DataTarget::Local(1) }]), alloc(b"hey", 0, &[])]);
@@ -313,18 +323,22 @@ mod tests {
         let rb = record(vec![alloc(&word, 3, &[DataReloc { offset: 0, target: DataTarget::Static(a) }])]);
         let key = InstanceKey(ContentId::of("test fn", b"f"));
         let rf = record(vec![alloc(&[0; 8], 3, &[DataReloc { offset: 0, target: DataTarget::Fn(key) }])]);
-        let image = StaticImage::new(&[(a, &ra), (b, &rb), (f, &rf)], Global).expect("lays out");
-        // Sorted by key: B (1) at 0, F (2) at 8, A (3) at 16, A's text at 32.
-        assert_eq!((image.static_at(b), image.static_at(f), image.static_at(a)), (Some(0), Some(8), Some(16)));
+        let vkey = crate::vtable::VtableKey(ContentId::of("test vtable", b"v"));
+        let rd = record(vec![alloc(&[0; 16], 3, &[DataReloc { offset: 0, target: DataTarget::Static(a) }, DataReloc { offset: 8, target: DataTarget::Vtable(vkey) }])]);
+        let image = StaticImage::new(&[(a, &ra), (b, &rb), (f, &rf), (d, &rd)], Global).expect("lays out");
+        // Sorted by key: B (1) at 0, F (2) at 8, A (3) at 16, A's text at 32 (len 3 -> pad to 40), D (4) at 40.
+        assert_eq!((image.static_at(b), image.static_at(f), image.static_at(a), image.static_at(d)), (Some(0), Some(8), Some(16), Some(40)));
         let base = 0x1_0000u64;
         let mut out = vec![0u8; image.bytes.len()];
-        image.fill(base, &mut out, |k| (k == key).then_some(0xF00D)).expect("fills");
+        image.fill(base, &mut out, |k| (k == key).then_some(0xF00D), |v| (v == vkey).then_some(0xBEEF)).expect("fills");
         let word = |at: usize| u64::from_le_bytes(out[at..at + 8].try_into().unwrap());
         assert_eq!(word(0), base + 16 + 4, "B: A's address plus the addend 4");
         assert_eq!(word(8), 0xF00D, "F: the fn's address");
         assert_eq!(word(16), base + 32, "A's pointer: its text");
         assert_eq!(word(24), 3, "A's length is kept");
         assert_eq!(&out[32..35], b"hey");
+        assert_eq!(word(40), base + 16, "D's data pointer: A's address");
+        assert_eq!(word(48), 0xBEEF, "D's vtable pointer: the vtable's address");
     }
 
     #[test]

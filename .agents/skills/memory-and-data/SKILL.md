@@ -1,6 +1,6 @@
 ---
 name: memory-and-data
-description: "How blaze holds memory and keeps what it computes: no allocation where none is needed, and a named allocator where one is (a task's frame, reset per item in a long task; `Global` named in code); footprint as the one measure reported and the kernel's limit as the one ceiling, with nothing admitting or throttling by memory; outputs as blaze-format records written once to the store, small ones read with pread into the task's frame and large plain arrays mapped read-only, the kernel's page cache the only cache; no state between requests that is not a record; persistence from one generic impl over `for const`; bytes verified once per boot or fetch, never on each read; and caches keyed by code identity. Load before allocating, adding a query result or anything persisted or kept between requests, touching blaze-mem, blaze-format, the store, the allocator or the memory ceiling, or caching a function's results. Finding where a build's memory went is the `debugging` skill."
+description: "How blaze holds memory and keeps what it computes: no allocation where none is needed, and a named allocator where one is (a task's frame, reset per item in a long task; `Global` named in code); footprint as the one measure reported and the kernel's limit as the one ceiling, with nothing admitting or throttling by memory; outputs as blaze-format records written once to the store, small ones read with pread into the task's frame and large plain arrays mapped read-only, the kernel's page cache the only cache; no state between requests that is not a record; persistence from one generic impl over `inline for`; bytes verified once per boot or fetch, never on each read; and caches keyed by code identity. Load before allocating, adding a query result or anything persisted or kept between requests, touching blaze-mem, blaze-format, the store, the allocator or the memory ceiling, or caching a function's results. Finding where a build's memory went is the `debugging` skill."
 ---
 
 # Memory and durable data
@@ -81,10 +81,9 @@ reclaim and counts nothing against blaze. Records are immutable and a store file
 (pruned at start by what the roots name, under a byte cap), never truncated or rewritten while it
 can be mapped, so a mapping never faults past its end. The store's buffer pool, collector and
 tenants that exist today are to be deleted by the target design: do not put new outputs on them. A
-new persisted type gets `Persist` from the one generic impl over `for const` (`#[blaze::reflect]` on
-the struct, `for<F: Field<T>> F::Type: Flat`) once that lands, never a new hand-written impl; until
-then a hand-written one names the generic impl's issue. Its round-trip test is the `testing`
-skill's.
+new persisted type gets `Persist` from the one generic impl over `inline for` (`#[blaze::reflect]`
+on the struct) once that lands, never a new hand-written impl; until then a hand-written one names
+the generic impl's issue. Its round-trip test is the `testing` skill's.
 
 See [crates/blaze-format/src/lib.rs](../../../crates/blaze-format/src/lib.rs).
 

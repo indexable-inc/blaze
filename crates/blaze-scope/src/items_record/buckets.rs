@@ -44,7 +44,8 @@ use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
 use blaze_surface::{CrateRootBuilder, DefKind, ItemKind, Namespace, PathKind, RecordBytes, ScopeBuilder};
 
-use super::{BARE, HAS_TRAIT, ItemsRecord, ItemsRecordError, SelfHead, T_IMPLS, key_at, le32, pad, path_and_bare, put32, u32_of};
+use super::cols::{BucketCol, BucketColsBuf, OptId, OptInt, encode_opt_id, encode_opt_u64, patch_dir, read_dir};
+use super::{BARE, HAS_TRAIT, ItemsRecord, ItemsRecordError, SelfHead, T_IMPLS, le32, pad, path_and_bare, put32, u32_of};
 use crate::builtin::is_builtin_type;
 use crate::names::{self, PathError, Resolved, Unheld, VariantHit, Why, World, Written, variant_in};
 use crate::resolve::{CrateNames, Names};
@@ -58,8 +59,6 @@ pub(crate) const F_BUCKETS_AT: usize = 32;
 pub(crate) const F_UNFILED_COUNT: usize = 33;
 /// The header field holding the unfiled list's offset.
 pub(crate) const F_UNFILED_AT: usize = 34;
-/// A bucket row: key 68, impl row u32, 8 zero bytes.
-pub(crate) const BUCKET_ROW: usize = 80;
 /// An unfiled row: impl row u32, why u8, 3 zero bytes.
 pub(crate) const UNFILED_ROW: usize = 8;
 /// A whole bucket key: kind 1, trait key 32, head code 1, arity 2, head key 32.
@@ -424,6 +423,96 @@ pub(super) fn filing<H: HeadNames>(
     }
 }
 
+/// Columnar bucket table opened once in [`ItemsRecord::open`]: packed `(kind, head_code, arity)`,
+/// deduplicated `trait_keys` and `head_keys` (`IdView<32>`), and bit-packed `impl_rows`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BucketsCols<'a> {
+    count: usize,
+    meta: OptInt<'a>,
+    trait_keys: OptId<'a>,
+    head_keys: OptId<'a>,
+    impl_rows: OptInt<'a>,
+}
+
+impl<'a> BucketsCols<'a> {
+    pub(super) const fn empty() -> Self {
+        BucketsCols {
+            count: 0,
+            meta: OptInt::empty(0),
+            trait_keys: OptId::empty(),
+            head_keys: OptId::empty(),
+            impl_rows: OptInt::empty(0),
+        }
+    }
+
+    pub(super) fn open(bytes: &'a [u8], base: usize, count: usize) -> Result<Self, ItemsRecordError> {
+        if count == 0 {
+            return Ok(Self::empty());
+        }
+        let (_, [meta_b, trait_b, head_b, impl_b]) = read_dir::<4>(bytes, base, 0, "the bucket table")?;
+        let meta = OptInt::open(meta_b, count, 0, "the bucket table's meta", base)?;
+        let trait_keys = OptId::open(trait_b, count, "the bucket table's trait keys", base)?;
+        let head_keys = OptId::open(head_b, count, "the bucket table's head keys", base)?;
+        let impl_rows = OptInt::open(impl_b, count, 0, "the bucket table's impl rows", base)?;
+        Ok(BucketsCols { count, meta, trait_keys, head_keys, impl_rows })
+    }
+
+    #[inline]
+    fn row_bytes(&self, at: usize) -> [u8; KEY] {
+        let m = self.meta.get(at);
+        let kind = u8::try_from(m & 0xff).unwrap_or(0);
+        let head_code = u8::try_from((m >> 8) & 0xff).unwrap_or(0);
+        let arity = u16::try_from((m >> 16) & 0xffff).unwrap_or(0);
+        let mut out = [0u8; KEY];
+        out[0] = kind;
+        out[1..33].copy_from_slice(self.trait_keys.get(at));
+        out[33] = head_code;
+        out[34..36].copy_from_slice(&arity.to_be_bytes());
+        out[36..68].copy_from_slice(self.head_keys.get(at));
+        out
+    }
+
+    #[inline]
+    fn cmp_want(&self, at: usize, want: &[u8]) -> core::cmp::Ordering {
+        use core::cmp::Ordering;
+        let m = self.meta.get(at);
+        let kind = u8::try_from(m & 0xff).unwrap_or(0);
+        if let Some(&want_kind) = want.first() {
+            let ord = kind.cmp(&want_kind);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        if let Some(want_trait) = want.get(1..33) {
+            let ord = self.trait_keys.get(at).as_slice().cmp(want_trait);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        if want.len() <= TRAIT_PREFIX {
+            return Ordering::Equal;
+        }
+        let head_code = u8::try_from((m >> 8) & 0xff).unwrap_or(0);
+        if let Some(&want_head) = want.get(33) {
+            let ord = head_code.cmp(&want_head);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        let arity = u16::try_from((m >> 16) & 0xffff).unwrap_or(0);
+        if let Some(want_arity) = want.get(34..36) {
+            let ord = arity.to_be_bytes().as_slice().cmp(want_arity);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        if let Some(want_head_key) = want.get(36..68) {
+            return self.head_keys.get(at).as_slice().cmp(want_head_key);
+        }
+        Ordering::Equal
+    }
+}
+
 /// Appends the two tables for `filings` (impl row `i`'s filing at index `i`, the impl table's
 /// order) to `out`, a record whose header is written, and sets their counts and offsets.
 pub(super) fn append(out: &mut RecordBytes<'_>, filings: &[Filing], alloc: Alloc<'_>) -> Result<(), ItemsRecordError> {
@@ -444,10 +533,28 @@ pub(super) fn append(out: &mut RecordBytes<'_>, filings: &[Filing], alloc: Alloc
     }
     pad(out);
     let at = u32_of(out.len(), "the bucket table")?;
-    for (key, row) in filed.iter() {
-        out.extend_from_slice(&key.bytes);
-        put32(out, *row);
-        out.extend_from_slice(&[0u8; 8]);
+    if !filed.is_empty() {
+        let dir_at = out.len();
+        for _ in 0..4 {
+            put32(out, 0);
+        }
+        let mut buf = BucketColsBuf::with_capacity_in(filed.len(), alloc);
+        for (key, row) in filed.iter() {
+            let kind = u64::from(key.bytes[0]);
+            let head_code = u64::from(key.bytes[33]);
+            let arity = u64::from(u16::from_be_bytes([key.bytes[34], key.bytes[35]]));
+            let mut trait_key = [0u8; 32];
+            trait_key.copy_from_slice(&key.bytes[1..33]);
+            let mut head_key = [0u8; 32];
+            head_key.copy_from_slice(&key.bytes[36..68]);
+            buf.push(BucketCol { meta: kind | (head_code << 8) | (arity << 16), trait_key, head_key, impl_row: u64::from(*row) });
+        }
+        let mut scratch = AVec::new_in(alloc);
+        let l0 = encode_opt_u64(buf.metas(), 0, "the bucket table's meta", alloc, &mut scratch, out)?;
+        let l1 = encode_opt_id(buf.trait_keys(), "the bucket table's trait keys", alloc, &mut scratch, out)?;
+        let l2 = encode_opt_id(buf.head_keys(), "the bucket table's head keys", alloc, &mut scratch, out)?;
+        let l3 = encode_opt_u64(buf.impl_rows(), 0, "the bucket table's impl rows", alloc, &mut scratch, out)?;
+        patch_dir(out, dir_at, [l0, l1, l2, l3]);
     }
     set(out, F_BUCKETS_COUNT, u32_of(filed.len(), "the bucket table's rows")?);
     set(out, F_BUCKETS_AT, at);
@@ -480,7 +587,7 @@ pub struct BucketImpl {
 }
 
 impl<'a> ItemsRecord<'a> {
-    /// A table of this section: its offset and row count, checked to lie in the record.
+    /// A fixed-width table of this section: its offset and row count, checked to lie in the record.
     fn bucket_table(&self, what: &'static str, at: usize, count: usize, width: usize) -> Result<(usize, usize), ItemsRecordError> {
         let (base, count) = (self.field(at) as usize, self.field(count) as usize);
         if count.checked_mul(width).and_then(|len| base.checked_add(len)).is_none_or(|end| end > self.bytes.len()) {
@@ -491,26 +598,25 @@ impl<'a> ItemsRecord<'a> {
 
     /// How many impls the writer filed under a bucket.
     pub fn bucket_rows(&self) -> usize {
-        self.field(F_BUCKETS_COUNT) as usize
+        self.buckets.count
     }
 
     /// The rows of the bucket table `key` names (a whole key: one bucket; a prefix: every
     /// bucket under it), as a range of [`ItemsRecord::bucket_impl`]'s indices: two binary
-    /// searches over the record's bytes; no row outside the range is read.
+    /// searches over the columnar views; no row outside the range is read.
     pub fn bucket(&self, key: &BucketKey) -> Result<core::ops::Range<usize>, ItemsRecordError> {
-        let (base, count) = self.bucket_table("the bucket table", F_BUCKETS_AT, F_BUCKETS_COUNT, BUCKET_ROW)?;
+        use core::cmp::Ordering;
+        let count = self.buckets.count;
         let want = key.bytes();
         // The first row at or after `want` (`after`: the first row after every row under it).
         let bound = |after: bool| {
             let (mut lo, mut hi) = (0usize, count);
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
-                let r = base + mid * BUCKET_ROW;
-                let row = &self.bytes[r..r + want.len()];
-                if row < want || (after && row == want) {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
+                match self.buckets.cmp_want(mid, want) {
+                    Ordering::Less => lo = mid + 1,
+                    Ordering::Equal if after => lo = mid + 1,
+                    Ordering::Equal | Ordering::Greater => hi = mid,
                 }
             }
             lo
@@ -520,34 +626,34 @@ impl<'a> ItemsRecord<'a> {
 
     /// Row `at` of the bucket table: the impl it files, read from the impl's row in place.
     pub fn bucket_impl(&self, at: usize) -> Result<BucketImpl, ItemsRecordError> {
-        let (base, count) = self.bucket_table("the bucket table", F_BUCKETS_AT, F_BUCKETS_COUNT, BUCKET_ROW)?;
-        if at >= count {
+        if at >= self.buckets.count {
             return Err(ItemsRecordError::Short { what: "a bucket row", at });
         }
-        self.filed_impl("a bucket row's impl row", le32(self.bytes, base + at * BUCKET_ROW + KEY) as usize)
+        let Ok(row) = usize::try_from(self.buckets.impl_rows.get(at)) else {
+            return Err(ItemsRecordError::Short { what: "a bucket row's impl row", at });
+        };
+        self.filed_impl("a bucket row's impl row", row)
     }
 
     fn filed_impl(&self, what: &'static str, row: usize) -> Result<BucketImpl, ItemsRecordError> {
         if row >= self.counts[T_IMPLS] {
             return Err(ItemsRecordError::Short { what, at: row });
         }
-        let r = self.row(T_IMPLS, row);
-        let (head, marks) = (self.bytes[r + 56], self.bytes[r + 57]);
+        let (key, head, marks) = self.impl_bucket_fields(row);
         // The head byte is `SelfHead`'s (items_record.rs `SelfHead::byte`): 0 a path, 1 a parameter.
-        Ok(BucketImpl { key: key_at(self.bytes, r), row, bare: marks & BARE != 0, blanket: marks & HAS_TRAIT != 0 && head == 1, self_path: head == 0 })
+        Ok(BucketImpl { key, row, bare: marks & BARE != 0, blanket: marks & HAS_TRAIT != 0 && head == 1, self_path: head == 0 })
     }
 
     /// The digest of what `key` answers: the key asked, and each row under it (the rest of its
     /// key and its impl's KEY, never its row number). An impl added to or taken from another
     /// bucket of the crate leaves it equal: what a body's read list holds for (crate, bucket).
     pub fn bucket_digest(&self, key: &BucketKey, alloc: Alloc<'_>) -> Result<ContentId, ItemsRecordError> {
-        let (base, _) = self.bucket_table("the bucket table", F_BUCKETS_AT, F_BUCKETS_COUNT, BUCKET_ROW)?;
         let want = key.bytes();
         let mut bytes: AVec<'_, u8> = AVec::new_in(alloc);
         bytes.extend_from_slice(want);
         for at in self.bucket(key)? {
-            let r = base + at * BUCKET_ROW;
-            bytes.extend_from_slice(&self.bytes[r + want.len()..r + KEY]);
+            let row = self.buckets.row_bytes(at);
+            bytes.extend_from_slice(&row[want.len()..KEY]);
             bytes.extend_from_slice(&self.bucket_impl(at)?.key.0.0);
         }
         Ok(ContentId::of(BUCKET_DOMAIN, &bytes))

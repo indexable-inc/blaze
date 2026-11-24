@@ -1023,7 +1023,7 @@ fn cells_of<'a>(name: Name, record: &work::Record<SharedAlloc<'_>>, exports: &[u
     for bytes in table.chunks_exact(row) {
         let mut key = [0u8; 16];
         key.copy_from_slice(&bytes[..16]);
-        let mut digest = [0u8; 32];
+        let mut digest = [0u8; 16];
         digest.copy_from_slice(&bytes[16..]);
         // The table is sorted by key, each once (names_cells.rs `table`): a row out of order
         // would be a reader's binary search missing it, so it is refused here, not sorted.
@@ -1036,7 +1036,7 @@ fn cells_of<'a>(name: Name, record: &work::Record<SharedAlloc<'_>>, exports: &[u
         if key[1..] == [0u8; 15] {
             return Err(EngineCheckError::CellTable { task: name, what: "holds a key equal to one of the engine's own cells" });
         }
-        EngineCheckError::push(&mut defines, (Cell(key), ContentId(digest)), WHAT)?;
+        EngineCheckError::push(&mut defines, (Cell(key), blaze_scope::names_cells::expand_digest(digest)), WHAT)?;
     }
     defines.sort_unstable_by_key(|(cell, _)| *cell);
     Ok(defines)

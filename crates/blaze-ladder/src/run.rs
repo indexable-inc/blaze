@@ -12,7 +12,7 @@ use std::alloc::Global;
 use blaze_build::data::{DataAlloc, DataError, DataRecord, DataTarget, ImageTarget, StaticImage};
 use blaze_build::tls::{self, TlsError};
 use blaze_build::layout::{LayoutCx, LayoutFacts, Layouts, Missing, ReprAttrs, ValidRange};
-use blaze_build::vtable::{Shape, Vtable, VtableRef, VtableTarget};
+use blaze_build::vtable::{Shape, Vtable, VtableKey, VtableRef, VtableTarget};
 use blaze_consteval::{
     Answer, Codes, ConstError, ConstRecord, ConstWorld, FnKind as ConstFnKind, Limits, Lits, Need, NeedKind, RecordKey, Settle,
     Typed, value_of,
@@ -739,6 +739,7 @@ fn eval_consts<P: FrontEnd>(
     checked: &[Option<Checked<'static>>],
     ground: &mut PortableTys<'_>,
     static_instances: &mut blaze_hash::HashMap<InstanceKey, Instance, Alloc<'static>>,
+    static_vtables: &mut blaze_hash::HashMap<VtableKey, VtableRef, Alloc<'static>>,
     alloc: Alloc<'static>,
 ) -> Result<Vec<(ItemKey, DataRecord<Global>), Global>, RunError> {
     let mut world = FrontConsts { program, checked, store: Vec::new_in(Global) };
@@ -779,6 +780,7 @@ fn eval_consts<P: FrontEnd>(
         if matches!(function.kind, FnKind::Static) {
             static_instances.extend(record.fns.iter().map(|named| (named.key, named.instance)));
         }
+        static_vtables.extend(record.vtables.iter().map(|named| (named.key, named.vtable)));
         let mut allocs = Vec::with_capacity_in(record.data.allocs.len(), Global);
         for a in record.data.allocs.iter() {
             let mut bytes = Vec::with_capacity_in(a.bytes.len(), Global);
@@ -1241,6 +1243,10 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
         self.0.const_fn_instance(key, ground, self.4.alloc)
     }
 
+    fn const_vtable_ref(&self, key: VtableKey, ground: &mut PortableTys<'_>) -> Option<VtableRef> {
+        self.0.const_vtable_ref(key, ground, self.4.alloc)
+    }
+
     fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic> {
         self.0.intrinsic(item)
     }
@@ -1360,6 +1366,9 @@ pub struct Built {
     /// Each fn instance a static points at, sorted by key, and its slot ([`static_fn_slots`]):
     /// placement writes the slot's thunk into the static's word.
     static_fns: Vec<(InstanceKey, u32), Global>,
+    /// Each vtable a static points at, sorted by key, and its table index in `vtables`:
+    /// placement writes the table's address into the static's word.
+    static_vtables: blaze_own::Vec<(VtableKey, u32), Global>,
     /// Each slot's function path, by slot: what a trap's line names (crate::trap).
     paths: Vec<Box<str, Global>, Global>,
 }
@@ -1583,7 +1592,7 @@ pub fn ran_built_given(mut built: Built, given: Given, alloc: blaze_own::SharedA
     // A raise's stub (D91) is no function left unbuilt: not counted.
     let raises = built.refused.iter().filter(|refusal| matches!(refusal, RunError::UnwindRaised { .. })).count();
     let not_built = u32::try_from(built.refused.len() - raises).map_err(|_| RunError::TooManyInstances)?;
-    let placed = place::place(&built.bodies, &built.vtables, image, &built.static_fns, tls, said).map_err(RunError::Place)?;
+    let placed = place::place(&built.bodies, &built.vtables, image, &built.static_fns, &built.static_vtables, tls, said).map_err(RunError::Place)?;
     if let (Some(tls), Some(ender)) = (tls, built.ender) {
         let ender = placed.thunk(ender).ok_or(RunError::Place(PlaceError::NoEnder))?;
         tls_index::create_key(tls.desc, ender).map_err(RunError::Place)?;
@@ -1972,6 +1981,116 @@ struct Tables {
     images: Vec<VtableImage, Global>,
 }
 
+/// Builds `want` (and any supertrait tables off its first chain) into `tables`, reaching each
+/// method and drop glue into `reached`; returns `want`'s table index.
+#[allow(clippy::too_many_arguments)]
+fn build_vtable_in_tables<P: FrontEnd>(
+    program: &P,
+    adts: &FrontAdts<'_, P>,
+    caller_i: usize,
+    caller_name: &impl Fn() -> Named,
+    caller_args: List,
+    want: VtableRef,
+    tables: &mut Tables,
+    reached: &mut Reached,
+    ground: &mut PortableTys<'_>,
+    layouts: &mut Layouts<Alloc<'static>>,
+    key_of: &impl Fn(&P, usize, Instance, &mut PortableTys<'_>, &dyn LayoutFacts) -> Result<InstanceKey, RunError>,
+    alloc: Alloc<'static>,
+) -> Result<u32, RunError> {
+    let fail = |why| RunError::Vtable { function: caller_name(), principal: want.principal, why };
+    let full = || fail(VtableFail::Build(BuildError::Malformed { what: "the ground table is full" }));
+    let mut stack: blaze_own::Vec<VtableRef, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+    stack.push(want);
+    while let Some(&t) = stack.last() {
+        if tables.refs.contains(&t) {
+            stack.pop();
+            continue;
+        }
+        let shape = Shape::of(t.principal, |k| program.object_trait(k), alloc).map_err(|e| fail(VtableFail::Shape(e)))?;
+        let mut cx = LayoutCx { ground, facts: adts, scratch: alloc };
+        let id = layouts.of(t.concrete, &mut cx).map_err(|e| fail(VtableFail::Layout(e)))?;
+        let (size, align) = (layouts.get(id).size, layouts.get(id).align_bytes());
+        // Word 0: `drop_in_place::<T>` (a no-op glue when `T` needs none). With no
+        // glue fn AND no `Drop` trait, no type of the program can need drop: word 0
+        // is 0, which the built object drop skips (walk.rs `dyn_glue`).
+        let glue = match program.fn_lang(FnLang::DropInPlace) {
+            Some(item) => Some(Instance { item, args: ground.intern_list(&[t.concrete]).map_err(|_| full())? }),
+            None => match program.lang_item(LangItem::Drop).map_err(RunError::Lang)? {
+                None => None,
+                Some(_) => return Err(fail(VtableFail::NoDropGlue)),
+            },
+        };
+        let glue_item = glue.map(|g| g.item);
+        let mut targs: blaze_own::Vec<PTy, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        targs.extend_from_slice(ground.view().list(t.args).map_err(|_| full())?);
+        let table = Vtable::build(&shape, t.concrete, &targs, size, align, glue, ground, adts, alloc, Global)
+            .map_err(|e| fail(VtableFail::Build(e)))?;
+        let mut pushed_super = false;
+        for &(_, to) in table.relocs.iter() {
+            if let VtableTarget::Super(sup) = to
+                && !tables.refs.contains(&sup)
+                && stack.scan_for(&sup).is_none()
+            {
+                stack.push(sup);
+                pushed_super = true;
+            }
+        }
+        if pushed_super {
+            continue;
+        }
+        let mut words = Vec::with_capacity_in(table.relocs.len(), Global);
+        for &(offset, to) in table.relocs.iter() {
+            let word = match to {
+                VtableTarget::Fn(f) | VtableTarget::ByValueShim(f) => {
+                    let by_value_shim = matches!(to, VtableTarget::ByValueShim(_));
+                    let f = crate::fn_item_resolve::resolved_shim_self(program, adts, caller_i, f, ground).map_err(|error| {
+                        RunError::Resolve { function: caller_name(), callee: f.item, path: program.item_named(f.item), at: crate::callee_shown::self_shown(program, ground.view(), f.args), error }
+                    })?;
+                    if let Some(c) = language_owner(program, adts, f, ground, caller_i) {
+                        let inst = match by_value_shim {
+                            true => blaze_build::vtable_shim_instance(f, ground).map_err(|e| fail(VtableFail::Build(e)))?,
+                            false => f,
+                        };
+                        let key = key_of(program, c, inst, ground, adts)?;
+                        VtableWord::Slot(reached.slot(inst, c, key)?)
+                    } else {
+                        let (item, args) = match Some(f.item) == glue_item {
+                            true => (f.item, f.args),
+                            false => program
+                                .resolve(caller_i, f.item, f.args, ground)
+                                .map_err(|error| RunError::Resolve { function: caller_name(), callee: f.item, path: program.item_named(f.item), at: crate::callee_shown::self_shown(program, ground.view(), f.args), error })?,
+                        };
+                        let c = program.fn_index(item).filter(|&c| program.function(c).body.is_some());
+                        let Some(c) = c else {
+                            return Err(callee_refusal(program, caller_name(), caller_args, Instance { item, args }, crate::callee_shown::CalleeGap::VtableWord, ground.view()));
+                        };
+                        let target = Instance { item, args };
+                        let inst = match by_value_shim {
+                            true => blaze_build::vtable_shim_instance(target, ground).map_err(|e| fail(VtableFail::Build(e)))?,
+                            false => target,
+                        };
+                        let key = key_of(program, c, inst, ground, adts)?;
+                        VtableWord::Slot(reached.slot(inst, c, key)?)
+                    }
+                }
+                VtableTarget::Super(sup) => match tables.refs.iter().position(|r| *r == sup) {
+                    Some(n) => VtableWord::Table(u32::try_from(n).map_err(|_| RunError::TooManyInstances)?),
+                    None => return Err(fail(VtableFail::Shape(blaze_build::vtable::VtableError::NoTrait(sup.principal)))),
+                },
+            };
+            words.push((offset, word));
+        }
+        tables.refs.push(t);
+        tables.images.push(VtableImage { bytes: table.bytes, words });
+        stack.pop();
+    }
+    match tables.refs.iter().position(|r| *r == want) {
+        Some(n) => u32::try_from(n).map_err(|_| RunError::TooManyInstances),
+        None => Err(fail(VtableFail::Shape(blaze_build::vtable::VtableError::NoTrait(want.principal)))),
+    }
+}
+
 /// The reached instances: slot `n` is `instances[n]`, of fn `tabled[n]`, told apart by `keys[n]`
 /// (`None`: a reference the stub build could not resolve or key, in a slot of its own).
 struct Reached {
@@ -2169,7 +2288,8 @@ fn build_from<P: FrontEnd>(
     let program = &*program_mut;
     let mut ground = PortableTys::new_in(alloc);
     let mut static_instances = blaze_hash::HashMap::new_in(alloc);
-    let consts = eval_consts(program, &checked, &mut ground, &mut static_instances, alloc)?;
+    let mut eval_vtables = blaze_hash::HashMap::new_in(alloc);
+    let consts = eval_consts(program, &checked, &mut ground, &mut static_instances, &mut eval_vtables, alloc)?;
     let langs = BackLangs::of(program)?;
     // `Clone::clone` at a tuple, closure, fn item or fn pointer: built (clone_shim.rs).
     let clones = crate::clone_shim::Clones::of(program).map_err(RunError::Lang)?;
@@ -2338,7 +2458,61 @@ fn build_from<P: FrontEnd>(
             reloc.target = ImageTarget::Fn(reached_key);
         }
     }
-    let mut bodies = Vec::with_capacity_in(program.fn_count(), Global);
+    // Each vtable a static points at (`ImageTarget::Vtable`): built into `tables` (reaching its
+    // method and drop-glue instances into `reached`) so placement can write its address into the
+    // static image.
+    let mut static_vtables: blaze_own::Vec<(VtableKey, u32), Global> = blaze_own::Vec::new_in(Global);
+    if let Some(caller_i) = entry
+        && let Some(image) = image.as_ref()
+    {
+        let mut keys_todo: blaze_own::Vec<VtableKey, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        for reloc in &image.relocs {
+            if let ImageTarget::Vtable(key) = reloc.target
+                && keys_todo.scan_for(&key).is_none()
+            {
+                keys_todo.push(key);
+            }
+        }
+        keys_todo.sort_unstable();
+        for key in keys_todo {
+            let want = if program_mut.evaluates_at_args() {
+                program_mut.const_vtable_ref(key, &mut ground, alloc)
+            } else {
+                eval_vtables.get(&key).copied()
+            };
+            let Some(want) = want else { continue };
+            let mut rounds = 0u32;
+            let table_idx = loop {
+                let program = &*program_mut;
+                let adts = FrontAdts(program, caller_i, &consts, &langs, &checked_bodies);
+                let caller_name = || program.function(caller_i).named();
+                match build_vtable_in_tables(program, &adts, caller_i, &caller_name, List::EMPTY, want, &mut tables, &mut reached, &mut ground, &mut layouts, &key_of, alloc) {
+                    Ok(idx) => break idx,
+                    Err(e) if asks_again(&e) && rounds < crate::front2::check::MOST_ROUNDS => {
+                        rounds += 1;
+                        if !program_mut.make_asked(caller_i)? {
+                            return Err(e);
+                        }
+                    }
+                    Err(RunError::Vtable { why: VtableFail::Shape(blaze_build::vtable::VtableError::NoTrait(t)), .. })
+                        if rounds < crate::front2::check::MOST_ROUNDS =>
+                    {
+                        rounds += 1;
+                        if !program_mut.object_table(t)? {
+                            return Err(RunError::Vtable {
+                                function: program_mut.function(caller_i).named(),
+                                principal: want.principal,
+                                why: VtableFail::Shape(blaze_build::vtable::VtableError::NoTrait(t)),
+                            });
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            static_vtables.push((key, table_idx));
+        }
+    }
+    let mut bodies = Vec::with_capacity_in(program_mut.fn_count(), Global);
     let mut args = Vec::new_in(Global);
     let mut at = 0;
     // The constants each instance reads at its ground arguments (front2/const_at.rs), refilled
@@ -2721,7 +2895,8 @@ fn build_from<P: FrontEnd>(
                 BuildError::Unsupported { expr, .. }
                 | BuildError::UnsupportedType { expr, .. }
                 | BuildError::NoConstBlockValue { expr, .. }
-                | BuildError::NoConstFnInstance { expr, .. } => {
+                | BuildError::NoConstFnInstance { expr, .. }
+                | BuildError::NoConstVtable { expr, .. } => {
                     body.and_then(|body| ranges(&body.expr_ranges, expr.0))
                 }
                 BuildError::UnsupportedPat { pat, .. } => body.and_then(|body| ranges(&body.pat_ranges, pat.0)),
@@ -2988,117 +3163,7 @@ fn build_from<P: FrontEnd>(
             false => &built.vtables,
         };
         for &want in vtables.iter() {
-            let made = (|| -> Result<u32, RunError> {
-                let fail = |why| RunError::Vtable { function: name(), principal: want.principal, why };
-                let full = || fail(VtableFail::Build(BuildError::Malformed { what: "the ground table is full" }));
-                let mut stack = Vec::new_in(Global);
-                stack.push(want);
-                while let Some(&t) = stack.last() {
-                    if tables.refs.contains(&t) {
-                        stack.pop();
-                        continue;
-                    }
-                    let shape = Shape::of(t.principal, |k| program.object_trait(k), alloc).map_err(|e| fail(VtableFail::Shape(e)))?;
-                    let mut cx = LayoutCx { ground: &mut ground, facts: &adts, scratch: alloc };
-                    let id = layouts.of(t.concrete, &mut cx).map_err(|e| fail(VtableFail::Layout(e)))?;
-                    let (size, align) = (layouts.get(id).size, layouts.get(id).align_bytes());
-                    // Word 0: `drop_in_place::<T>` (a no-op glue when `T` needs none). With no
-                    // glue fn AND no `Drop` trait, no type of the program can need drop: word 0
-                    // is 0, which the built object drop skips (walk.rs `dyn_glue`).
-                    let glue = match program.fn_lang(FnLang::DropInPlace) {
-                        Some(item) => Some(Instance { item, args: ground.intern_list(&[t.concrete]).map_err(|_| full())? }),
-                        None => match program.lang_item(LangItem::Drop).map_err(RunError::Lang)? {
-                            None => None,
-                            Some(_) => return Err(fail(VtableFail::NoDropGlue)),
-                        },
-                    };
-                    let glue_item = glue.map(|g| g.item);
-                    let mut targs = Vec::new_in(Global);
-                    targs.extend_from_slice(ground.view().list(t.args).map_err(|_| full())?);
-                    let table = Vtable::build(&shape, t.concrete, &targs, size, align, glue, &mut ground, &adts, alloc, Global)
-                        .map_err(|e| fail(VtableFail::Build(e)))?;
-                    let mut pushed_super = false;
-                    for &(_, to) in table.relocs.iter() {
-                        if let VtableTarget::Super(sup) = to
-                            && !tables.refs.contains(&sup)
-                            && !stack.contains(&sup)
-                        {
-                            stack.push(sup);
-                            pushed_super = true;
-                        }
-                    }
-                    if pushed_super {
-                        continue;
-                    }
-                    let mut words = Vec::with_capacity_in(table.relocs.len(), Global);
-                    for &(offset, to) in table.relocs.iter() {
-                        // A fn item of a trait's method as the word's self: the body that runs,
-                        // as for a call (fn_item_resolve.rs).
-                        let (to, by_value_shim) = match to {
-                            VtableTarget::Fn(f) => {
-                                let f = crate::fn_item_resolve::resolved_shim_self(program, &adts, i, f, &mut ground).map_err(|error| {
-                                    RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), at: crate::callee_shown::self_shown(program, ground.view(), f.args), error }
-                                })?;
-                                (VtableTarget::Fn(f), false)
-                            }
-                            VtableTarget::ByValueShim(f) => {
-                                let f = crate::fn_item_resolve::resolved_shim_self(program, &adts, i, f, &mut ground).map_err(|error| {
-                                    RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), at: crate::callee_shown::self_shown(program, ground.view(), f.args), error }
-                                })?;
-                                (VtableTarget::Fn(f), true)
-                            }
-                            to => (to, false),
-                        };
-                        let word = match to {
-                            // A coroutine's own `Future::poll` or drop (`dyn Future` of an async
-                            // block), a closure's `Fn*` method (`&dyn FnMut` of a closure), a fn
-                            // item's or pointer's (its shim): what the language gives, as a
-                            // call's callee (`language_owner`), never a selected impl.
-                            VtableTarget::Fn(f) if let Some(c) = language_owner(program, &adts, f, &ground, i) => {
-                                let inst = match by_value_shim {
-                                    true => blaze_build::vtable_shim_instance(f, &mut ground).map_err(|e| fail(VtableFail::Build(e)))?,
-                                    false => f,
-                                };
-                                let key = key_of(program, c, inst, &mut ground, &adts)?;
-                                VtableWord::Slot(reached.slot(inst, c, key)?)
-                            }
-                            VtableTarget::Fn(f) => {
-                                // A trait method runs as the selected impl's; the glue is itself.
-                                let (item, args) = match Some(f.item) == glue_item {
-                                    true => (f.item, f.args),
-                                    false => program
-                                        .resolve(i, f.item, f.args, &mut ground)
-                                        .map_err(|error| RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), at: crate::callee_shown::self_shown(program, ground.view(), f.args), error })?,
-                                };
-                                let c = program.fn_index(item).filter(|&c| program.function(c).body.is_some());
-                                let Some(c) = c else {
-                                    return Err(callee_refusal(&*program, name(), instance.args, Instance { item, args }, crate::callee_shown::CalleeGap::VtableWord, ground.view()));
-                                };
-                                let target = Instance { item, args };
-                                let inst = match by_value_shim {
-                                    true => blaze_build::vtable_shim_instance(target, &mut ground).map_err(|e| fail(VtableFail::Build(e)))?,
-                                    false => target,
-                                };
-                                let key = key_of(program, c, inst, &mut ground, &adts)?;
-                                VtableWord::Slot(reached.slot(inst, c, key)?)
-                            }
-                            VtableTarget::ByValueShim(_) => unreachable!("normalized above"),
-                            VtableTarget::Super(sup) => match tables.refs.iter().position(|r| *r == sup) {
-                                Some(n) => VtableWord::Table(u32::try_from(n).map_err(|_| RunError::TooManyInstances)?),
-                                None => return Err(fail(VtableFail::Shape(blaze_build::vtable::VtableError::NoTrait(sup.principal)))),
-                            },
-                        };
-                        words.push((offset, word));
-                    }
-                    tables.refs.push(t);
-                    tables.images.push(VtableImage { bytes: table.bytes, words });
-                    stack.pop();
-                }
-                match tables.refs.iter().position(|r| *r == want) {
-                    Some(n) => u32::try_from(n).map_err(|_| RunError::TooManyInstances),
-                    None => Err(fail(VtableFail::Shape(blaze_build::vtable::VtableError::NoTrait(want.principal)))),
-                }
-            })();
+            let made = build_vtable_in_tables(program, &adts, i, &name, instance.args, want, &mut tables, &mut reached, &mut ground, &mut layouts, &key_of, alloc);
             match made {
                 Ok(n) => table_of.push(n),
                 Err(e) if may_ask && asks_again(&e) => {
@@ -3408,7 +3473,7 @@ fn build_from<P: FrontEnd>(
     // has any refusal to list.
     let reached = u32::try_from(reached.instances.len()).map_err(|_| RunError::TooManyInstances)?;
     let refused = survey.stubs.map_or_else(|| Vec::new_in(Global), |stubs| stubs.refused);
-    Ok(Some(Built { bodies, vtables: tables.images, start, start_fn: program.function(main).named(), image, getter, ender, refused, reached, static_fns, paths }))
+    Ok(Some(Built { bodies, vtables: tables.images, start, start_fn: program.function(main).named(), image, getter, ender, refused, reached, static_fns, static_vtables, paths }))
 }
 
 /// Each fn instance `image` points at (its `ImageTarget::Fn` words), sorted by key, with its

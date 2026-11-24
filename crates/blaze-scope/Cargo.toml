@@ -21,6 +21,8 @@ doctest = false
 [dependencies]
 # `ItemKey`, `CrateItemKey`, `ContentId`: every module, item and crate is named by its key.
 blaze-id.workspace = true
+# `enc::{IntView, IdView}`: columnar encoding for `ItemsRecord` tables (rule 30, rule 51).
+blaze-columns.workspace = true
 # `HashMap`: the machine's single-owner indexes, in the allocator it is made in.
 blaze-hash.workspace = true
 # The words of the item layer (`Namespace`, `Def`, `Binding`, `Visibility`, ...), the working

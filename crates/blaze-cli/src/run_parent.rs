@@ -1910,7 +1910,19 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             data.push(Datum { symbol: Symbol(static_), record: filed });
             front.statics_named(entry, named).map_err(|why| ParentError::Entry { symbol: static_, why })?;
             callees(&started.walk, at, declares, told, statics);
-            folder.kept(filed, stored(&served).map_or(Kept::Unkept, |under| Kept::Static { under }), &mut **store)?;
+            let svtables = data.len();
+            front.each_vtable(static_, entry, &mut |vtable, vdatum| {
+                if let Err(at) = told.binary_search(&vtable.0) {
+                    told.insert(at, vtable.0);
+                    data.push(Datum { symbol: vtable, record: folder.file(vdatum)? });
+                }
+                Ok(())
+            })?;
+            let sunder = stored(&served);
+            folder.kept(filed, sunder.map_or(Kept::Unkept, |under| Kept::Static { under }), &mut **store)?;
+            for vdatum in data.iter().skip(svtables) {
+                folder.kept(vdatum.record, sunder.map_or(Kept::Unkept, |under| Kept::Vtable { under }), &mut **store)?;
+            }
             count(tally, &served);
         }
         named.sort_unstable();

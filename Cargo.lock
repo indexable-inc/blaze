@@ -1945,6 +1945,7 @@ name = "blaze-scope"
 version = "0.0.0"
 dependencies = [
  "blaze-build-script",
+ "blaze-columns",
  "blaze-expand",
  "blaze-fetch",
  "blaze-file-items",
