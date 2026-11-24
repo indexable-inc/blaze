@@ -18,7 +18,8 @@
 //!   DECLARED, so the parent sends it with this one (one batch: a cycle of statics is one);
 //! - `Fn`: a `Space::Func` target, named by its instance symbol, and a declared instance row so
 //!   the parent gives its slot before the datum is placed;
-//! - `Vtable`: refused by name until the evaluator carries its table datum.
+//! - `Vtable`: a `Space::Vtable` target, named by its vtable symbol, with its datum carried in
+//!   the entry's vtables block (form 9) and its method instances declared beside the static's own.
 //!
 //! THE PLACE: read-only for a static that is neither `static mut` nor holds an allocation the
 //! evaluator marked mutable (interior mutability: data.rs `DataAlloc::mutable`); writable
@@ -29,21 +30,24 @@
 //!
 //! THE FORM, little-endian: [`STATIC_ENTRY_MAGIC`], [`super::ENTRY_FORM`], the datum's
 //! length (4) and bytes, the declared instances' block as a code entry's (count 4, then rows:
-//! each tabled fn key, name length and canonical instance name), and the declared statics' block (count 4, then item keys 16 each,
-//! ascending, each once). The KEY is a walk row's (body_ids.rs `record_key`: the static's
-//! symbol, its initializer's BodyCheck key and reads, its crate's fact), so an edit of the
-//! initializer moves this record's key alone: code names the static's word, not its value.
+//! each tabled fn key, name length and canonical instance name), the declared statics' block
+//! (count 4, then item keys 16 each, ascending, each once), and the vtables' block (count 4,
+//! then each: symbol 32, datum length 4 and bytes, ascending by symbol, each once). The KEY is
+//! a walk row's (body_ids.rs `record_key`: the static's symbol, its initializer's BodyCheck key
+//! and reads, its crate's fact), so an edit of the initializer moves this record's key alone:
+//! code names the static's word, not its value.
 
 use core::fmt;
 
-use blaze_build::{InstanceKey, StaticItem};
 use blaze_build::data::DataTarget;
+use blaze_build::vtable::VtableKey;
+use blaze_build::{InstanceKey, StaticItem};
 use blaze_code::datum::{Datum, DatumError, DatumView, OWN_DATUM, Place};
 use blaze_code::record::{Space, Symbol, Target, Word};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_typeck::ItemKey;
 
-use super::{Cursor, Declared, ENTRY_FORM, EntryError, each_key, put_statics};
+use super::{Cursor, Declared, ENTRY_FORM, EntryError, VtableDatum, each_key, put_statics};
 use crate::seam::SeamData;
 use crate::symbols::{SymbolError, fn_symbol_of_name, static_symbol};
 
@@ -63,6 +67,8 @@ pub enum StaticRecordError {
     FnName { alloc: u32, at: u32, error: SymbolError },
     /// The word at `at` of allocation `alloc` names a vtable, whose datum is unavailable.
     Vtable { alloc: u32, at: u32 },
+    /// The vtable at this word has no encodable ground symbol.
+    VtableName { alloc: u32, at: u32, error: SymbolError },
     /// Relocation `reloc` of allocation `alloc` is past its bytes, or names an allocation past
     /// the record's.
     Reloc { alloc: u32, reloc: u32 },
@@ -88,6 +94,7 @@ impl fmt::Display for StaticRecordError {
             StaticRecordError::Fn { alloc, at } => write!(f, "its value's allocation {alloc} holds a fn's address at byte {at}, but the fn instance's symbol and name are unavailable ({spec}, step 2)"),
             StaticRecordError::FnName { alloc, at, error } => write!(f, "its value's allocation {alloc} holds a fn's address at byte {at}: {error}"),
             StaticRecordError::Vtable { alloc, at } => write!(f, "its value's allocation {alloc} holds a vtable's address at byte {at}, but its datum is unavailable ({spec}, step 2)"),
+            StaticRecordError::VtableName { alloc, at, error } => write!(f, "its value's allocation {alloc} holds a vtable's address at byte {at}: {error}"),
             StaticRecordError::Reloc { alloc, reloc } => write!(f, "relocation {reloc} of its value's allocation {alloc} is past its bytes or names no allocation of the record (blaze-build data.rs, \"The form\")"),
             StaticRecordError::TooLarge { what } => write!(f, "its {what} is larger than a static's entry counts"),
             StaticRecordError::Datum(why) => write!(f, "its datum: {why}"),
@@ -103,18 +110,24 @@ impl core::error::Error for StaticRecordError {}
 /// A static's entry from the evaluator's record of its initializer, `value`, and its kind (the
 /// module doc).
 pub fn make_static_entry<'a>(value: &SeamData, kind: StaticItem, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, StaticRecordError> {
-    make_static_entry_with_targets(value, kind, |_| Ok(None), alloc)
+    make_static_entry_with_targets(value, kind, |_| Ok(None), |_| Ok(None), &[], &[], alloc)
 }
 
-/// A static entry with the function-instance metadata needed by `DataTarget::Fn` words.
-pub fn make_static_entry_with_targets<'a, F>(
+/// A static entry with the function-instance and vtable metadata needed by `DataTarget::Fn` and
+/// `DataTarget::Vtable` words, plus any extra declared instances and vtable datums those vtables carry.
+#[allow(clippy::too_many_arguments)]
+pub fn make_static_entry_with_targets<'a, F, V>(
     value: &SeamData,
     kind: StaticItem,
     mut fn_target: F,
+    mut vtable_target: V,
+    extra_declared: &[Declared<'_>],
+    vtables: &[VtableDatum<'_>],
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, StaticRecordError>
 where
     F: FnMut(InstanceKey) -> Result<Option<(ItemKey, AVec<'a, u8>)>, SymbolError>,
+    V: FnMut(VtableKey) -> Result<Option<Symbol>, SymbolError>,
 {
     if kind.thread_local {
         return Err(StaticRecordError::ThreadLocal);
@@ -123,7 +136,7 @@ where
         true => Place::Writable,
         false => Place::ReadOnly,
     };
-    datum_entry(value, place, false, &mut fn_target, alloc)
+    datum_entry(value, place, false, &mut fn_target, &mut vtable_target, extra_declared, vtables, alloc)
 }
 
 /// A `#[thread_local]` static's TEMPLATE entry (run.md, "Statics in the run", step 4): its
@@ -135,18 +148,24 @@ where
 /// a mutable one is refused, and so is a word naming the value's own bytes (each copy would
 /// point at the template, not at itself).
 pub fn make_template_entry<'a>(value: &SeamData, kind: StaticItem, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, StaticRecordError> {
-    make_template_entry_with_targets(value, kind, |_| Ok(None), alloc)
+    make_template_entry_with_targets(value, kind, |_| Ok(None), |_| Ok(None), &[], &[], alloc)
 }
 
-/// A thread-local template with the function-instance metadata needed by `DataTarget::Fn` words.
-pub fn make_template_entry_with_targets<'a, F>(
+/// A thread-local template with the function-instance and vtable metadata needed by `DataTarget::Fn`
+/// and `DataTarget::Vtable` words.
+#[allow(clippy::too_many_arguments)]
+pub fn make_template_entry_with_targets<'a, F, V>(
     value: &SeamData,
     kind: StaticItem,
     mut fn_target: F,
+    mut vtable_target: V,
+    extra_declared: &[Declared<'_>],
+    vtables: &[VtableDatum<'_>],
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, StaticRecordError>
 where
     F: FnMut(InstanceKey) -> Result<Option<(ItemKey, AVec<'a, u8>)>, SymbolError>,
+    V: FnMut(VtableKey) -> Result<Option<Symbol>, SymbolError>,
 {
     if !kind.thread_local {
         return Err(StaticRecordError::NotThreadLocal);
@@ -154,20 +173,25 @@ where
     if let Some(n) = value.allocs.iter().skip(1).position(|a| a.mutable) {
         return Err(StaticRecordError::SharedMutable { alloc: n as u32 + 1 });
     }
-    datum_entry(value, Place::ReadOnly, true, &mut fn_target, alloc)
+    datum_entry(value, Place::ReadOnly, true, &mut fn_target, &mut vtable_target, extra_declared, vtables, alloc)
 }
 
 /// The entry of `value` as a datum at `place`; `template`: a word naming allocation 0 is refused
 /// ([`StaticRecordError::SelfPointer`]).
-fn datum_entry<'a, F>(
+#[allow(clippy::too_many_arguments)]
+fn datum_entry<'a, F, V>(
     value: &SeamData,
     place: Place,
     template: bool,
     fn_target: &mut F,
+    vtable_target: &mut V,
+    extra_declared: &[Declared<'_>],
+    vtables: &[VtableDatum<'_>],
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, StaticRecordError>
 where
     F: FnMut(InstanceKey) -> Result<Option<(ItemKey, AVec<'a, u8>)>, SymbolError>,
+    V: FnMut(VtableKey) -> Result<Option<Symbol>, SymbolError>,
 {
     let first = value.allocs.first().ok_or(StaticRecordError::Empty)?;
     // Each allocation's offset in the datum, in order, each at its own alignment.
@@ -188,7 +212,12 @@ where
         d.bytes[at..at + a.bytes.len()].copy_from_slice(&a.bytes);
     }
     let mut statics: AVec<'_, ItemKey> = Vec::new_in(alloc);
-    let mut declared: AVec<'_, (ItemKey, AVec<'_, u8>)> = Vec::new_in(alloc);
+    let mut declared: AVec<'_, (ItemKey, AVec<'_, u8>)> = Vec::with_capacity_in(extra_declared.len(), alloc);
+    for row in extra_declared {
+        let mut name = Vec::with_capacity_in(row.name.len(), alloc);
+        name.extend_from_slice(row.name);
+        declared.push((row.tabled, name));
+    }
     for (n, a) in value.allocs.iter().enumerate() {
         for (r, reloc) in a.relocs.iter().enumerate() {
             let refused = StaticRecordError::Reloc { alloc: n as u32, reloc: r as u32 };
@@ -223,7 +252,13 @@ where
                     declared.push((tabled, name));
                     (d.target(Target { space: Space::Func, symbol }), addend)
                 }
-                DataTarget::Vtable(_) => return Err(StaticRecordError::Vtable { alloc: n as u32, at: reloc.offset }),
+                DataTarget::Vtable(key) => {
+                    let alloc_idx = u32::try_from(n).unwrap_or(u32::MAX);
+                    let symbol = vtable_target(key)
+                        .map_err(|error| StaticRecordError::VtableName { alloc: alloc_idx, at: reloc.offset, error })?
+                        .ok_or(StaticRecordError::Vtable { alloc: alloc_idx, at: reloc.offset })?;
+                    (d.target(Target { space: Space::Vtable, symbol }), addend)
+                }
             };
             d.words.push(Word { at, target, addend });
         }
@@ -246,6 +281,16 @@ where
         out.extend_from_slice(name.as_slice());
     }
     put_statics(&statics, &mut out, alloc).map_err(too_large)?;
+    let mut carried: AVec<'_, VtableDatum<'_>> = Vec::with_capacity_in(vtables.len(), alloc);
+    carried.extend_from_slice(vtables);
+    carried.sort_unstable_by(|a, b| a.symbol.0.cmp(&b.symbol.0));
+    carried.dedup_by(|a, b| a.symbol == b.symbol);
+    out.extend_from_slice(&u32::try_from(carried.len()).map_err(|_| too_large("vtables"))?.to_le_bytes());
+    for v in carried.iter() {
+        out.extend_from_slice(&v.symbol.0);
+        out.extend_from_slice(&u32::try_from(v.datum.len()).map_err(|_| too_large("vtable's datum"))?.to_le_bytes());
+        out.extend_from_slice(v.datum);
+    }
     Ok(out)
 }
 
@@ -256,6 +301,8 @@ pub struct StaticEntryView<'b> {
     declared: &'b [u8],
     count: u32,
     statics: &'b [u8],
+    vtables: &'b [u8],
+    vtables_count: u32,
 }
 
 impl<'b> StaticEntryView<'b> {
@@ -274,10 +321,21 @@ impl<'b> StaticEntryView<'b> {
         let datum = DatumView::read(c.take(len, "datum")?).map_err(EntryError::Datum)?;
         let (declared, count) = c.declared_block()?;
         let statics = c.statics_block()?;
+        let vtables_count = c.u32("count of vtables")?;
+        let vtables_start = c.at;
+        let mut last_vtable: Option<[u8; 32]> = None;
+        for _ in 0..vtables_count {
+            let (symbol, _) = c.vtable()?;
+            if last_vtable.is_some_and(|before| before >= symbol.0) {
+                return Err(EntryError::VtablesOrder);
+            }
+            last_vtable = Some(symbol.0);
+        }
+        let vtables = bytes.get(vtables_start..c.at).ok_or(EntryError::Truncated { what: "vtables block" })?;
         if c.at != bytes.len() {
             return Err(EntryError::Trailing);
         }
-        Ok(StaticEntryView { datum, declared, count, statics })
+        Ok(StaticEntryView { datum, declared, count, statics, vtables, vtables_count })
     }
 
     /// Each declared instance, in the entry's order, passed to `each`.
@@ -293,6 +351,16 @@ impl<'b> StaticEntryView<'b> {
     pub fn each_static(&self, each: impl FnMut(ItemKey)) {
         each_key(self.statics, each);
     }
+
+    /// Each vtable the static entry carries: its symbol and its datum, ascending by symbol.
+    pub fn each_vtable<E>(&self, mut each: impl FnMut(Symbol, DatumView<'b>) -> Result<(), E>, malformed: impl Fn(EntryError) -> E) -> Result<(), E> {
+        let mut c = Cursor { bytes: self.vtables, at: 0 };
+        for _ in 0..self.vtables_count {
+            let (symbol, datum) = c.vtable().map_err(&malformed)?;
+            each(symbol, datum)?;
+        }
+        Ok(())
+    }
 }
 
 /// Each static an entry's RECORD names, by symbol, in its targets' order: the `Space::Static`
@@ -304,19 +372,32 @@ impl<'b> StaticEntryView<'b> {
 /// numbers a thread-local from its template, the datum the parent sends under the same symbol.
 /// The run's parent publishes no record before checking each of these was sent (blaze-cli
 /// run_parent.rs `Needs::publish`). A `Space::Vtable` target is named too, as is each target
-/// of that kind in the datum of a vtable the code entry carries (a supertrait's table): the
-/// child binds a vtable to its datum, sent as a static's is (form 6, [`each_vtable_datum`]).
+/// of that kind in the datum of a vtable the entry carries (a supertrait's table): the
+/// child binds a vtable to its datum, sent as a static's is (form 6/9, [`each_vtable_datum`]).
 pub fn each_static_named(entry: &[u8], mut each: impl FnMut(Symbol)) -> Result<(), EntryError> {
     let sent = |space| matches!(space, Space::Static | Space::Tls | Space::Vtable);
     match entry.get(..8) {
         Some(magic) if magic == STATIC_ENTRY_MAGIC => {
-            let datum = StaticEntryView::read(entry)?.datum;
+            let view = StaticEntryView::read(entry)?;
+            let datum = view.datum;
             for i in 0..datum.targets() {
                 let target = datum.target(i);
                 if sent(target.space) {
                     each(target.symbol);
                 }
             }
+            view.each_vtable(
+                |_, datum| {
+                    for i in 0..datum.targets() {
+                        let target = datum.target(i);
+                        if sent(target.space) {
+                            each(target.symbol);
+                        }
+                    }
+                    Ok(())
+                },
+                |why| why,
+            )?;
         }
         _ => {
             let view = super::EntryView::read(entry)?;
@@ -344,12 +425,13 @@ pub fn each_static_named(entry: &[u8], mut each: impl FnMut(Symbol)) -> Result<(
     Ok(())
 }
 
-/// Each vtable a code entry carries (form 6): its symbol and its encoded datum, what the run's
-/// parent files and sends in the record's `Data` (blaze-cli run_parent.rs `Lazy::resolve`). A
-/// static's entry carries none.
+/// Each vtable an entry carries (code entry form 6, static entry form 9): its symbol and its
+/// encoded datum, what the run's parent files and sends in the record's `Data` (blaze-cli
+/// run_parent.rs `Lazy::resolve`).
 pub fn each_vtable_datum<'e, E>(entry: &'e [u8], mut each: impl FnMut(Symbol, &'e [u8]) -> Result<(), E>, malformed: impl Fn(EntryError) -> E) -> Result<(), E> {
     if entry.get(..8).is_some_and(|magic| magic == STATIC_ENTRY_MAGIC) {
-        return Ok(());
+        let view = StaticEntryView::read(entry).map_err(&malformed)?;
+        return view.each_vtable(|symbol, datum| each(symbol, datum.encoded()), malformed);
     }
     let view = super::EntryView::read(entry).map_err(&malformed)?;
     view.each_vtable(|symbol, datum| each(symbol, datum.encoded()), malformed)
@@ -454,9 +536,9 @@ mod tests {
                 Ok(Some((item, name)))
             };
             let made = if thread_local {
-                make_template_entry_with_targets(&value, kind, target, alloc)
+                make_template_entry_with_targets(&value, kind, target, |_| Ok(None), &[], &[], alloc)
             } else {
-                make_static_entry_with_targets(&value, kind, target, alloc)
+                make_static_entry_with_targets(&value, kind, target, |_| Ok(None), &[], &[], alloc)
             }.expect("a fn word has a place in both kinds of datum");
             let view = StaticEntryView::read(&made).expect("the entry reads");
             assert_eq!(view.datum.place(), Place::ReadOnly);
@@ -471,6 +553,43 @@ mod tests {
             assert_eq!(declared, [(item, expected.as_slice())]);
         }
         std::println!("a static fn word names Space::Func and declares its instance name");
+    }
+
+    #[test]
+    fn a_vtable_word_names_its_table_and_carries_its_datum() {
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let vkey = blaze_build::vtable::VtableKey(blaze_ids::ContentId([9; 32]));
+        let vsym = blaze_code::record::Symbol([3; 32]);
+        let value = value(false, DataTarget::Vtable(vkey));
+        let kind = StaticItem { thread_local: false, mutable: false };
+        assert_eq!(make_static_entry(&value, kind, alloc).map(|_| ()), Err(StaticRecordError::Vtable { alloc: 0, at: 0 }));
+
+        let mut vd = blaze_code::datum::Datum::new_in(Place::ReadOnly, 3, alloc);
+        vd.bytes.extend_from_slice(&[0; 24]);
+        let sealed = vd.seal().expect("vtable datum seals");
+        let mut vbytes = blaze_own::Vec::new_in(alloc);
+        sealed.encode(&mut vbytes);
+        let carried = [super::VtableDatum { symbol: vsym, datum: vbytes.as_slice() }];
+        let item = ItemKey(22);
+        let mut fn_name = [0u8; 20];
+        fn_name[..16].copy_from_slice(&item.0.to_le_bytes());
+        let extra = [super::Declared { tabled: item, name: &fn_name }];
+
+        let made = make_static_entry_with_targets(&value, kind, |_| Ok(None), |asked| Ok((asked == vkey).then_some(vsym)), &extra, &carried, alloc)
+            .expect("a vtable word builds into a static entry");
+        let view = StaticEntryView::read(&made).expect("static entry reads");
+        assert_eq!(view.datum.target(0), Target { space: Space::Vtable, symbol: vsym });
+        let mut got_vtables = blaze_own::Vec::new_in(alloc);
+        super::each_vtable_datum(&made, |sym, bytes| {
+            got_vtables.push((sym, bytes));
+            Ok::<(), ()>(())
+        }, |_| ()).expect("each_vtable_datum reads static entry");
+        assert_eq!(got_vtables.as_slice(), [(vsym, vbytes.as_slice())]);
+        let mut named = blaze_own::Vec::new_in(alloc);
+        super::each_static_named(&made, |sym| named.push(sym)).expect("each_static_named");
+        assert_eq!(named.as_slice(), [vsym]);
     }
 
     #[test]

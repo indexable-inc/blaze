@@ -423,6 +423,13 @@ pub trait FrontEnd {
         let _ = (key, ground, scratch);
         None
     }
+    /// The vtable reference that key `key` names in a constant's or static's record this front
+    /// end evaluated (`DataTarget::Vtable(key)`), its types copied into `ground`: the record
+    /// names the table it made each vtable word from (blaze-consteval `ConstRecord::vtables`).
+    fn const_vtable_ref(&self, key: blaze_build::vtable::VtableKey, ground: &mut PortableTys<'_>, scratch: Alloc<'_>) -> Option<blaze_build::vtable::VtableRef> {
+        let _ = (key, ground, scratch);
+        None
+    }
     /// Whether the build pulls each instance's constants at its ground arguments from
     /// [`FrontEnd::const_at`] (front2), or the front end evaluates constants only at no
     /// arguments, as records the build reads (the old front: run.rs `eval_consts`).

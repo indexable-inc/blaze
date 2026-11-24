@@ -56,6 +56,8 @@ pub enum Origin {
     Static(ItemKey),
     /// A fn instance (a fn pointer's target): no bytes.
     Fn(InstanceKey),
+    /// A vtable (`&dyn Tr`'s second word): no bytes.
+    Vtable(blaze_build::vtable::VtableKey),
 }
 
 /// One allocation: a region of the evaluation's heap.

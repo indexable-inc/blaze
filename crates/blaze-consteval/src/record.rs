@@ -6,6 +6,7 @@
 
 use core::alloc::Allocator;
 
+use blaze_build::vtable::{VtableKey, VtableRef};
 use blaze_build::{Instance, InstanceKey};
 pub use blaze_build::data::{DataAlloc, DataRecord, DataReloc, DataTarget};
 use blaze_ids::{ContentId, Hasher};
@@ -42,22 +43,42 @@ pub struct ConstFn {
     pub instance: Instance,
 }
 
+/// A vtable a value's words name: the key a `DataTarget::Vtable` word holds (a hash with no
+/// inverse) and the table reference (`VtableRef`: concrete type, principal trait and its
+/// ground arguments after `Self`) the evaluator made it from. Its types live in the
+/// evaluation's ground table, the one the key was made over: a reader copies them into its
+/// own table (blaze-ladder front2/consts.rs `Consts::vtable_ref`), so a builder or static
+/// entry that meets the word knows which vtable to emit without searching the program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ConstVtable {
+    pub key: VtableKey,
+    pub vtable: VtableRef,
+}
+
 /// One constant's record: its value, what the evaluation read, by content (each other value's
-/// key and each body's text hash), sorted, each once (rule 25), and the fn instances its words
+/// key and each body's text hash), sorted, each once (rule 25), the fn instances its words
 /// name ([`ConstFn`], sorted by key, each once: exactly the keys of the value's
-/// `DataTarget::Fn` words, a value read from another record's included). The record stands
-/// while every read is unchanged (AGENTS.md: "valid by its key, or else by its read list").
+/// `DataTarget::Fn` words, a value read from another record's included), and the vtables its
+/// words name ([`ConstVtable`], sorted by key, each once: exactly the keys of the value's
+/// `DataTarget::Vtable` words). The record stands while every read is unchanged (AGENTS.md:
+/// "valid by its key, or else by its read list").
 pub struct ConstRecord<A: Allocator> {
     pub key: RecordKey,
     pub data: DataRecord<A>,
     pub reads: Vec<ContentId, A>,
     pub fns: Vec<ConstFn, A>,
+    pub vtables: Vec<ConstVtable, A>,
 }
 
 impl<A: Allocator> ConstRecord<A> {
     /// The instance fn word `key` of this record names.
     pub fn fn_named(&self, key: InstanceKey) -> Option<ConstFn> {
         self.fns.binary_search_by_key(&key, |f| f.key).ok().map(|at| self.fns[at])
+    }
+
+    /// The vtable word `key` of this record names.
+    pub fn vtable_named(&self, key: VtableKey) -> Option<ConstVtable> {
+        self.vtables.binary_search_by_key(&key, |v| v.key).ok().and_then(|at| self.vtables.get(at).copied())
     }
 }
 

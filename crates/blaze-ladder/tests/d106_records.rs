@@ -1728,6 +1728,163 @@ fn a_vtable_is_a_datum_its_namer_carries() {
     println!("d106 vtable: main carries 1 datum of {} bytes, its method word a declared instance; edit made {}", bytes.len(), third.made);
 }
 
+/// Exact `tracing` static META shape (`static CALLSITE: MyCallsite`, `static META: Meta<'static>`
+/// holding `&CALLSITE as &dyn Callsite`) plus `const X: &dyn Callsite = &UnitCallsite` on the
+/// lazy JIT code-records path: `META`'s static entry carries the `(MyCallsite, Callsite)` vtable
+/// datum, declares `MyCallsite::id`, and names both `CALLSITE` (`Space::Static`) and the vtable
+/// (`Space::Vtable`).
+#[test]
+fn a_static_holding_dyn_trait_carries_its_vtable_datum() {
+    use blaze_code::datum::Place;
+    use blaze_code::record::Space;
+    use blaze_ladder::code_records::statics::{StaticEntryView, each_static_named, each_vtable_datum};
+
+    const STATIC_DYN: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+#[lang = \"pointee_sized\"]
+trait PointeeSized {}
+
+#[lang = \"meta_sized\"]
+trait MetaSized: PointeeSized {}
+
+#[lang = \"sized\"]
+trait Sized: MetaSized {}
+
+#[lang = \"legacy_receiver\"]
+trait LegacyReceiver: PointeeSized {}
+
+impl<T: PointeeSized> LegacyReceiver for &T {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u32 {}
+impl Copy for i32 {}
+impl<T: PointeeSized> Copy for &T {}
+
+#[lang = \"unsize\"]
+trait Unsize<T: PointeeSized>: PointeeSized {}
+
+#[lang = \"coerce_unsized\"]
+trait CoerceUnsized<T: PointeeSized> {}
+
+impl<'a, 'b: 'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a U> for &'b T {}
+
+#[lang = \"dispatch_from_dyn\"]
+trait DispatchFromDyn<T> {}
+
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<&'a U> for &'a T {}
+
+trait Callsite {
+    fn id(&self) -> u32;
+}
+
+struct MyCallsite {
+    id: u32,
+}
+
+struct UnitCallsite;
+
+struct Meta<'a> {
+    callsite: &'a dyn Callsite,
+}
+
+impl Callsite for MyCallsite {
+    fn id(&self) -> u32 {
+        self.id
+    }
+}
+
+impl Callsite for UnitCallsite {
+    fn id(&self) -> u32 {
+        9
+    }
+}
+
+static CALLSITE: MyCallsite = MyCallsite { id: 42 };
+static META: Meta<'static> = Meta { callsite: &CALLSITE };
+const UNIT_DYN: &dyn Callsite = &UnitCallsite;
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    (META.callsite.id() + UNIT_DYN.id()) as i32
+}
+";
+
+    let f = fixture(STATIC_DYN);
+    let main = fn_named(&f, "main");
+    let meta_key = {
+        let records = reader(&f).records;
+        let mut found = None;
+        assert!(records.each_item(0, &mut |key, _| {
+            if records.name_of(key) == Some("META") {
+                found = Some(checker_of(key));
+            }
+        }));
+        found.expect("META item key")
+    };
+    let mut store = MemoryStore::new_in(alloc());
+    let names = reader(&f);
+    let mut maker = Maker::new(names, Some(main), &builder(), alloc());
+    let (walk, summary) = walk_records(main, &EveryItem, &mut store, &builder(), &producer(), &mut maker, alloc()).unwrap_or_else(|e| {
+        panic!("the record walk for STATIC_DYN: {e}");
+    });
+    assert!(logged(names.records).is_empty(), "the records filed {:?}", logged(names.records));
+    assert!(summary.made > 0);
+    // Find META's static entry in the walk.
+    let meta_row = (0..walk.len()).find(|&r| walk.tabled(r) == meta_key).expect("META reached in walk");
+    let meta_bytes = store.get(walk.key(meta_row).expect("META keyed")).expect("store reads").expect("META put");
+    let view = StaticEntryView::read(meta_bytes).expect("META static entry reads");
+    let mut vtable_target = None;
+    let mut vtable_count = 0usize;
+    let mut static_target = None;
+    let mut static_count = 0usize;
+    for i in 0..view.datum.targets() {
+        let t = view.datum.target(i);
+        match t.space {
+            Space::Vtable => {
+                vtable_target = Some(t.symbol);
+                vtable_count += 1;
+            }
+            Space::Static => {
+                static_target = Some(t.symbol);
+                static_count += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(vtable_count, 1, "META datum targets one vtable");
+    assert_eq!(static_count, 1, "META datum targets CALLSITE");
+    let vtable_sym = vtable_target.expect("vtable symbol");
+    let static_sym = static_target.expect("static symbol");
+    let mut carried_count = 0usize;
+    each_vtable_datum(meta_bytes, |sym, bytes| -> Result<(), ()> {
+        let dv = blaze_code::datum::DatumView::read(bytes).expect("vtable datum reads");
+        assert_eq!(sym, vtable_sym, "carried vtable matches datum's Space::Vtable target");
+        assert_eq!((dv.place(), dv.bytes().len(), dv.words()), (Place::ReadOnly, 32, 1));
+        carried_count += 1;
+        Ok(())
+    }, |e| panic!("META vtables: {e}")).expect("read META vtables");
+    assert_eq!(carried_count, 1, "META static entry carries 1 vtable datum");
+    let (mut saw_static, mut saw_vtable) = (false, false);
+    each_static_named(meta_bytes, |sym| {
+        if sym == static_sym {
+            saw_static = true;
+        }
+        if sym == vtable_sym {
+            saw_vtable = true;
+        }
+    }).expect("each_static_named on META");
+    assert!(saw_static, "each_static_named lists CALLSITE");
+    assert!(saw_vtable, "each_static_named lists vtable symbol");
+    let mut declared_count = 0usize;
+    view.each_declared(|_| -> Result<(), ()> { declared_count += 1; Ok(()) }, |e| panic!("declared: {e}")).expect("read declared");
+    assert_eq!(declared_count, 1, "META declares the vtable's Callsite::id method instance");
+}
+
 /// The pinned std's `panicking::catch_unwind` in miniature (library/std/src/panicking.rs): a
 /// cfg'd-out twin of the same name before it, then a body declaring `union Data<F, R>` with
 /// `ManuallyDrop` fields, writing `Data { f: ManuallyDrop::new(f) }`, passing `&raw mut data` to
