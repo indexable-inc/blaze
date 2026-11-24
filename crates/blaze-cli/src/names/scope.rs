@@ -513,6 +513,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
                 let mut out = blaze_ids::Hasher::new(OUT_DOMAIN);
                 out.update(&(done.record.len() as u64).to_le_bytes()).update(&done.record);
                 out.update(&(done.inner.len() as u64).to_le_bytes()).update(&done.inner);
+                out.id(&record.expansions_out);
                 (Some(out), record.payload, record.findings, record.tests_refused, true, record.unresolved, record.test_marks, record.expansions)
             }
             Err(unwritten) => (

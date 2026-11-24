@@ -182,6 +182,13 @@ pub trait FrontEnd {
     fn specialized_row(&self, _i: usize, _args: &[PTy], _ground: PTys<'_>) -> Option<usize> {
         None
     }
+    /// On-demand specialization of a generic `inline for` function at row `i` for concrete ground
+    /// `args` (in `ground`). Returns `Ok(Some((spec_row, checked)))` when row `i` has generic
+    /// `inline for` loops (`checked` is `Some` the first time the specialization is created or
+    /// handed over, `None` when already cached), or `Ok(None)` for ordinary functions.
+    fn specialize_inline_for(&mut self, _i: usize, _args: &[PTy], _ground: PTys<'_>) -> Result<Option<(usize, Option<Checked<'static>>)>, RunError> {
+        Ok(None)
+    }
     /// Each soft-float routine's fn in the program's compiler_builtins, found by its exported
     /// name (front2/builtins_shim.rs `find`, INTRINSICS.md 3.5): asked once a run by the record
     /// walk's maker; `alloc` holds the scratch. Default: not looked up, so an `f128` operation
