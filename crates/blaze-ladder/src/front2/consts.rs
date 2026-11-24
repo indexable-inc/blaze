@@ -818,7 +818,14 @@ impl<'n> Consts<'n> {
         // (check.rs `make`).
         r.store.maps.evaluating.set(r.store.maps.evaluating.get().saturating_add(1));
         let out = self.value_listed(r, prepared, item, root, build);
-        r.store.maps.evaluating.set(r.store.maps.evaluating.get().saturating_sub(1));
+        let left = r.store.maps.evaluating.get().saturating_sub(1);
+        r.store.maps.evaluating.set(left);
+        if left == 0 {
+            r.store.clear_all_provisional();
+            if let Some(b) = r.buckets.as_ref() {
+                b.clear_provisional();
+            }
+        }
         out
     }
 
@@ -840,7 +847,12 @@ impl<'n> Consts<'n> {
             match step {
                 Ok(Some(key)) => break key,
                 Ok(None) => {
-                    firsts.pop();
+                    if let Some(done_c) = firsts.pop()
+                        && r.store.clear_provisional_for(done_c)
+                        && let Some(b) = r.buckets.as_ref()
+                    {
+                        b.clear_provisional();
+                    }
                 }
                 Err(e) => {
                     let Some(c) = super::const_open::needed_first(&e) else { return Err(e) };
@@ -849,7 +861,11 @@ impl<'n> Consts<'n> {
                     // same way; a qualified leaf's need key is not: it is answered by
                     // selection (`const_qpath::eval_asked`), which needs the evaluator free.
                     let fileable = !r.store.maps.qpaths.borrow().is_leaf(c);
-                    if rounds >= super::const_open::MOST_FIRSTS || firsts.contains(&c) || !fileable {
+                    if rounds >= super::const_open::MOST_FIRSTS
+                        || firsts.contains(&c)
+                        || (firsts.is_empty() && super::keys::checker_of(c) == item)
+                        || !fileable
+                    {
                         return Err(e);
                     }
                     rounds += 1;

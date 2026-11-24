@@ -270,6 +270,145 @@ pub fn check_body_asked<'n, S: NamesSource<'n>>(
     check_body_keyed(r, body, scope, count, asked, None)
 }
 
+/// Checks whether a body checked while provisional impl headers were active (`provisional_used`)
+/// actually projected a pending associated type of any of those provisional impls. If so, returns
+/// the `waiting_const` of that provisional impl so the check is refused as a cycle instead of
+/// observing a missing associated type or falling back to a trait default.
+fn provisional_pending_assoc_cycle(
+    store: &super::heads::Store<'_>,
+    body: &Body<'_>,
+    done: &tc::Checked<'_>,
+    used: &[ItemKey],
+    scratch: Alloc<'_>,
+) -> Option<blaze_id::ItemKey> {
+    let matches_pending = |trait_: ItemKey, name: tc::Name| -> Option<blaze_id::ItemKey> {
+        for &ck in used {
+            if let Some(p) = store.provisional_impls.get(&ck)
+                && p.head.trait_ == Some(trait_)
+                && p.pending_assoc.iter().any(|&n| n == name)
+            {
+                return Some(p.waiting_const);
+            }
+        }
+        None
+    };
+    for proj in done.selected.iter() {
+        if let (Some(name), tc::Selected::Impl { imp, .. }) = (proj.name, proj.selected)
+            && used.iter().any(|&ck| ck == imp)
+            && let Some(p) = store.provisional_impls.get(&imp)
+            && p.pending_assoc.iter().any(|&n| n == name)
+        {
+            return Some(p.waiting_const);
+        }
+    }
+    let Ok(tys) = body.tys.view(&store.tys) else { return None };
+    let mut work: AVec<'_, tc::PTy> = Vec::new_in(scratch);
+    work.extend_from_slice(&body.typeck.type_lists);
+    for &opt in body.typeck.opt_types.iter() {
+        if let Some(t) = opt {
+            work.push(t);
+        }
+    }
+    for &(_, t) in body.typeck.legacy_args.iter() {
+        work.push(t);
+    }
+    for e in body.typeck.exprs.iter() {
+        match *e {
+            tc::Expr::Cast { ty, .. } | tc::Expr::OffsetOf { ty, .. } => work.push(ty),
+            tc::Expr::Repeat { len, .. } => work.push(len),
+            tc::Expr::Closure { ret: Some(ty), .. } => work.push(ty),
+            _ => {}
+        }
+    }
+    for s in body.typeck.stmts.iter() {
+        if let tc::Stmt::Let { ty: Some(ty), .. } = *s {
+            work.push(ty);
+        }
+    }
+    for p in body.typeck.pats.iter() {
+        if let tc::Pat::Bind { ty: Some(ty), .. } = *p {
+            work.push(ty);
+        }
+    }
+    for p in body.typeck.paths.iter() {
+        if let Some(anchor) = p.anchor {
+            work.push(anchor.ty);
+        }
+    }
+    const MOST_WALK: u32 = 1 << 16;
+    let mut steps = 0u32;
+    while let Some(ty) = work.pop() {
+        steps += 1;
+        if steps > MOST_WALK {
+            break;
+        }
+        let Some(node) = tys.get(ty).copied() else { continue };
+        match node {
+            tc::PNode::Alias { trait_, name, args } => {
+                if let Some(waiting) = matches_pending(trait_, name) {
+                    return Some(waiting);
+                }
+                if let Ok(list) = tys.list(args) {
+                    work.extend_from_slice(list);
+                }
+            }
+            tc::PNode::Tuple(l)
+            | tc::PNode::Record(_, l)
+            | tc::PNode::Union(l)
+            | tc::PNode::Adt(_, l)
+            | tc::PNode::FnDef(_, l)
+            | tc::PNode::FnPtr(l, _)
+            | tc::PNode::Opaque(_, l)
+            | tc::PNode::Dynamic(l)
+            | tc::PNode::ExTrait(_, l)
+            | tc::PNode::Closure { args: l, .. }
+            | tc::PNode::Coroutine { args: l, .. } => {
+                if let Ok(list) = tys.list(l) {
+                    work.extend_from_slice(list);
+                }
+            }
+            tc::PNode::Ref(_, p) | tc::PNode::Ptr(_, p) | tc::PNode::Slice(p) | tc::PNode::ConstValue { ty: p, .. } => work.push(p),
+            tc::PNode::Array(e, n) => {
+                work.push(e);
+                work.push(n);
+            }
+            tc::PNode::Pat(b, l) => {
+                work.push(b);
+                if let Ok(list) = tys.list(l) {
+                    work.extend_from_slice(list);
+                }
+            }
+            tc::PNode::Future(_, output, interior) => {
+                work.push(output);
+                work.push(interior);
+            }
+            tc::PNode::ExProj { trait_, name, args, term } => {
+                if let Some(waiting) = matches_pending(trait_, name) {
+                    return Some(waiting);
+                }
+                if let Ok(list) = tys.list(args) {
+                    work.extend_from_slice(list);
+                }
+                work.push(term);
+            }
+            tc::PNode::Bool
+            | tc::PNode::Char
+            | tc::PNode::Int(_)
+            | tc::PNode::Uint(_)
+            | tc::PNode::Float(_)
+            | tc::PNode::Str
+            | tc::PNode::Never
+            | tc::PNode::Param(_)
+            | tc::PNode::ConstParam(_)
+            | tc::PNode::Foreign(_)
+            | tc::PNode::ExAuto(_)
+            | tc::PNode::Infer
+            | tc::PNode::Error => {}
+        }
+    }
+    None
+}
+
 /// [`check_body_asked`] that also leaves the last round's ground root goal digests in
 /// `root_keys` (check.rs `check_body_metered`).
 pub(crate) fn check_body_keyed<'n, S: NamesSource<'n>>(
@@ -280,19 +419,36 @@ pub(crate) fn check_body_keyed<'n, S: NamesSource<'n>>(
     asked: Option<&mut super::reads::Asked<'_>>,
     root_keys: Option<&mut std::vec::Vec<u64, Global>>,
 ) -> Result<tc::Checked<'static>, CheckFail> {
+    r.store.provisional_used.borrow_mut().clear();
     let mut done = check_rounds(r, body, scope, count, asked, root_keys)?;
+    let scratch = r.store.tys.alloc();
+    let owner = body.typeck.owner;
+    let mut used_provisional = false;
+    if !r.store.provisional_used.borrow().is_empty() {
+        used_provisional = true;
+        let used = r.store.provisional_used.borrow();
+        let cycle = provisional_pending_assoc_cycle(r.store, body, &done, &used, scratch);
+        drop(used);
+        r.store.provisional_used.borrow_mut().clear();
+        if let Some(waiting) = cycle {
+            return Err(super::check::const_nested_fail(r, owner, waiting));
+        }
+    }
     // Its opaques' hidden types, for an auto trait asked by another body (front2 opaque_auto.rs).
     super::opaque_auto::file(r, body, &done)?;
     let filed = done.file_out();
-    let scratch = r.store.tys.alloc();
-    let owner = body.typeck.owner;
-    match r.store.reads.file(owner, &filed.reads, scratch) {
-        Ok(()) => {}
-        Err(CheckFail::ReadsDiffer { owner, mut diff }) => {
-            diff.name(r, owner);
-            return Err(CheckFail::ReadsDiffer { owner, diff });
+    // A check that read a provisional impl header during constant evaluation does not file its
+    // read-list digest: once the impl's associated types finish, subsequent checks read the
+    // complete `ImplHead` and file its one canonical digest.
+    if !used_provisional {
+        match r.store.reads.file(owner, &filed.reads, scratch) {
+            Ok(()) => {}
+            Err(CheckFail::ReadsDiffer { owner, mut diff }) => {
+                diff.name(r, owner);
+                return Err(CheckFail::ReadsDiffer { owner, diff });
+            }
+            Err(other) => return Err(other),
         }
-        Err(other) => return Err(other),
     }
     drop(filed);
     // Its closures, for a body that names one outside its owner (front2 foreign_closures.rs).

@@ -2071,6 +2071,23 @@ pub struct ConstWait {
     pub need: LibKey,
 }
 
+/// A trait impl whose header (`generics`, `self_ty`, `trait_`, `trait_args`, `preds`, `fns`,
+/// `consts`, `polarity`) has been lowered while one or more of its associated types
+/// (`type Name = ..;`) is waiting on a constant (`Why::NeedConst`).
+///
+/// Kept apart from [`Store::impls`] (never frozen or encoded as a head record) and visible
+/// only while constant evaluation is running (`Maps::evaluating > 0`), so evaluating the
+/// constant can prove `T: Trait` (e.g. `itoa`'s `Integer: private::Sealed` where `impl Sealed
+/// for i128` writes `type Buffer = [MaybeUninit<u8>; Self::MAX_STR_LEN]`, or a same-trait
+/// `impl Tr for T` with `type Buf = [u8; Self::N]`) without re-entering the pending
+/// associated type. Removed as soon as `Store::impl_` finishes or fails the impl, or when the
+/// waited-on constant finishes.
+pub struct ProvisionalImpl {
+    pub head: ImplHead,
+    pub pending_assoc: blaze_own::Vec<Name, Alloc<'static>>,
+    pub waiting_const: LibKey,
+}
+
 pub struct Store<'n> {
     pub tys: PortableTys<'static>,
     pub maps: Maps,
@@ -2087,6 +2104,12 @@ pub struct Store<'n> {
     /// without its entry is the world's gap `field_defaults`, never "no defaults".
     pub field_defaults: Rows<ItemKey, Vec<Option<ItemKey>, Global>>,
     pub impls: Rows<ItemKey, ImplHead>,
+    /// Trait impls whose header is lowered while one of their associated types waits on a
+    /// constant ([`ProvisionalImpl`]). Visible only while `maps.evaluating > 0`.
+    pub provisional_impls: Rows<ItemKey, ProvisionalImpl>,
+    /// Provisional impl keys read during the current body check or projection normalization
+    /// (`BodyWorld::impl_header_once`, `BodyWorld::assoc_item_once`).
+    pub(super) provisional_used: core::cell::RefCell<blaze_own::Vec<ItemKey, Alloc<'static>>>,
     pub fns: Rows<ItemKey, FnHead<'n>>,
     /// Each head's regions (D148), by [`super::head_record::regions_key`]: a fn's made by
     /// [`Store::fn_head`] in the walk that makes its types, or filed from its record.
@@ -2565,6 +2588,8 @@ impl<'n> Store<'n> {
             adt_declarations: Rows::new_in(alloc),
             field_defaults: Rows::new_in(alloc),
             impls: Rows::new_in(alloc),
+            provisional_impls: Rows::new_in(alloc),
+            provisional_used: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)),
             fns: Rows::new_in(alloc),
             regions: super::head_record::RegionTable::new_in(alloc),
             region_gaps: Rows::new_in(alloc),
@@ -4311,6 +4336,63 @@ impl<'n> Store<'n> {
         Ok(())
     }
 
+    /// The impl head of `ck` if complete, or its provisional header while constant evaluation
+    /// is running (`maps.evaluating > 0`) and one of its associated types is waiting on a
+    /// constant. Returns `(head, is_provisional)`.
+    pub(super) fn impl_or_provisional(&self, ck: ItemKey) -> Option<(&ImplHead, bool)> {
+        if let Some(h) = self.impls.get(&ck) {
+            return Some((h, false));
+        }
+        if self.maps.evaluating.get() > 0 {
+            if let Some(p) = self.provisional_impls.get(&ck) {
+                return Some((&p.head, true));
+            }
+        }
+        None
+    }
+
+    /// Records that the current check or projection read the provisional impl `ck`.
+    pub(super) fn note_provisional_read(&self, ck: ItemKey) {
+        let mut used = self.provisional_used.borrow_mut();
+        if !used.iter().any(|&k| k == ck) {
+            used.push(ck);
+        }
+    }
+
+    /// Removes any provisional impl waiting on constant `need` now that `need` has been
+    /// answered (or refused). Returns whether any entry was removed.
+    pub(super) fn clear_provisional_for(&self, need: LibKey) -> bool {
+        if self.provisional_impls.is_empty() {
+            return false;
+        }
+        let mut drop_keys: blaze_own::Vec<ItemKey, Alloc<'static>> = blaze_own::Vec::new_in(self.tys.alloc());
+        for (&ck, p) in self.provisional_impls.iter() {
+            if p.waiting_const == need {
+                drop_keys.push(ck);
+            }
+        }
+        for &ck in drop_keys.iter() {
+            self.provisional_impls.remove(&ck);
+        }
+        !drop_keys.is_empty()
+    }
+
+    /// Removes every provisional impl entry (called when constant evaluation returns to
+    /// depth 0 so no provisional state can outlive an evaluation).
+    pub(super) fn clear_all_provisional(&self) -> bool {
+        if self.provisional_impls.is_empty() {
+            return false;
+        }
+        let mut drop_keys: blaze_own::Vec<ItemKey, Alloc<'static>> = blaze_own::Vec::new_in(self.tys.alloc());
+        for (&ck, _) in self.provisional_impls.iter() {
+            drop_keys.push(ck);
+        }
+        for &ck in drop_keys.iter() {
+            self.provisional_impls.remove(&ck);
+        }
+        !drop_keys.is_empty()
+    }
+
     fn impl_<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let mut polarity = if v.head[head::FLAGS] & sig::NEGATIVE != 0 { tc::ImplPolarity::Negative } else { tc::ImplPolarity::Positive };
@@ -4320,6 +4402,7 @@ impl<'n> Store<'n> {
             }
         }
         let ck = checker_of(key);
+        self.provisional_impls.remove(&ck);
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
         let marks = self.marks(names, key, v.item())?;
@@ -4433,6 +4516,13 @@ impl<'n> Store<'n> {
         // Each `type X = U;` value's column (D148, `HeadRegions::impl_assoc`), or why not: filed
         // with the impl's regions below, a refusal refusing them.
         let mut assoc_cols: blaze_own::Vec<Result<(Name, RegionCol<Alloc<'static>>), RegionsRefusal>, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        // For a trait impl, `Self::X` in where-clauses and members lowers to `<SelfTy as Trait>::X`
+        // (types.rs `self_assoc_path`), never reading `env.self_assoc`. When an associated type's
+        // value needs a constant (`Why::NeedConst`), we still lower the impl's header, where-clauses
+        // and associated constants into `provisional_impls` before returning `NeedConst` so that
+        // evaluating the constant can prove `T: Trait` without re-entering the pending associated type.
+        let mut first_assoc_const: Option<(LibKey, Why)> = None;
+        let mut pending_assoc: blaze_own::Vec<Name, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         for m in &ms {
             let low = lower(names, key, m.text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
             let mv = low.view();
@@ -4476,18 +4566,31 @@ impl<'n> Store<'n> {
                     for &row in mv.rows(mv.list(head::GENERICS))? {
                         own_lifetimes |= matches!(lf::GenericParam::decode(row)?, lf::GenericParam::Lifetime { .. });
                     }
-                    let (value, laid) = if mv.rows(mv.list(head::GENERICS))?.is_empty() {
-                        let value = mb.ty(&mut self.tys, &env, &mv, written_t)?;
-                        (value, lay_written(&mb, &mut self.tys, &env, &mv, &[written_t], given, Captures::NONE, alloc)?)
+                    let lowered_assoc = if mv.rows(mv.list(head::GENERICS))?.is_empty() {
+                        mb.ty(&mut self.tys, &env, &mv, written_t).and_then(|value| {
+                            lay_written(&mb, &mut self.tys, &env, &mv, &[written_t], given, Captures::NONE, alloc).map(|laid| (value, laid))
+                        })
                     } else {
                         let mut own_ps = Vec::new_in(Global);
                         own_ps.extend_from_slice(&ps);
                         let mut own_cs = Vec::new_in(Global);
                         own_cs.extend_from_slice(&cs);
-                        own_generics(&mb, &mut self.tys, module, &mv, generics, &mut own_ps, &mut own_cs)?;
-                        let own_env = Env { params: &own_ps, consts: &own_cs, ..env };
-                        let value = mb.ty(&mut self.tys, &own_env, &mv, written_t)?;
-                        (value, lay_written(&mb, &mut self.tys, &own_env, &mv, &[written_t], given, Captures::NONE, alloc)?)
+                        own_generics(&mb, &mut self.tys, module, &mv, generics, &mut own_ps, &mut own_cs).and_then(|_| {
+                            let own_env = Env { params: &own_ps, consts: &own_cs, ..env };
+                            let value = mb.ty(&mut self.tys, &own_env, &mv, written_t)?;
+                            lay_written(&mb, &mut self.tys, &own_env, &mv, &[written_t], given, Captures::NONE, alloc).map(|laid| (value, laid))
+                        })
+                    };
+                    let (value, laid) = match lowered_assoc {
+                        Ok(pair) => pair,
+                        Err(why @ Why::NeedConst(need, _)) if trait_.is_some() => {
+                            if first_assoc_const.is_none() {
+                                first_assoc_const = Some((need, why));
+                            }
+                            pending_assoc.push(Name::of(m.name));
+                            continue;
+                        }
+                        Err(why) => return Err(why),
                     };
                     super::gat::member_where(&mv, m.name)?;
                     let arity = HeadsArity { heads: &self.maps, opaques: &[], names };
@@ -4512,6 +4615,28 @@ impl<'n> Store<'n> {
         let env = Env { self_assoc: &assoc, ..env };
         let mut preds = Preds::new_in(scope.clone_in(alloc));
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
+        let mut consts = Vec::with_capacity_in(const_texts.len(), Global);
+        let mut life_names = Vec::new_in(alloc);
+        lifetime_names(v, &mut life_names)?;
+        if let Some((waiting_const, need_const)) = first_assoc_const {
+            self.container_scopes.insert(ck, Scope::container(&life_names, scope.params(), alloc).map_err(Why::Regions)?);
+            for &(name, mk, text, written_by) in &const_texts {
+                if self.impl_const(names, key, ck, mk, text, written_by, &env, (&preds.scope, preds.clauses.as_slice()), &bounds, generics).is_ok() {
+                    self.fn_gaps.remove(&mk);
+                    consts.push((name, mk));
+                }
+            }
+            self.preds.insert(ck, preds);
+            self.provisional_impls.insert(
+                ck,
+                ProvisionalImpl {
+                    head: ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, fn_vis, unstable, consts, polarity },
+                    pending_assoc,
+                    waiting_const,
+                },
+            );
+            return Err(need_const);
+        }
         // D148: the impl's regions (its header's columns, laid above; its clauses'; its values'),
         // filed under its key, and its members' container group. L1a's group
         // (`impl_container`, from the self type's walk) and the header's (heads_regions.rs
@@ -4564,11 +4689,8 @@ impl<'n> Store<'n> {
         // The members' clauses name the impl's declared lifetimes; their own come after every
         // lifetime of the impl's group (its elided ones too), when that group is known.
         let group = self.container_regions.get(&ck).map_or(scope.params(), |c| c.count);
-        let mut life_names = Vec::new_in(alloc);
-        lifetime_names(v, &mut life_names)?;
         self.container_scopes.insert(ck, Scope::container(&life_names, group, alloc).map_err(Why::Regions)?);
         file_regions(self, ck, filed);
-        let mut consts = Vec::with_capacity_in(const_texts.len(), Global);
         // Every constant's name and key, for the waits below (`ConstWait`).
         let mut declared_consts = Vec::with_capacity_in(const_texts.len(), Global);
         declared_consts.extend(const_texts.iter().map(|&(name, mk, ..)| (name, mk)));
