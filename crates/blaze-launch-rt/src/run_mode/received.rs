@@ -35,7 +35,7 @@ use blaze_launch::wire::RecordId;
 use blaze_launch::wire::run::BYTES_HELD_MOST;
 use blaze_own::{AVec, Alloc, Vec};
 
-use super::{RecordSource, RunModeError, Short};
+use super::{HashIndexMap, RecordSource, RunModeError, Short};
 
 /// Why the parent's inline bytes for a record are refused (module doc).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -98,8 +98,8 @@ struct Open<'a> {
 
 /// The records sent inline (module doc).
 pub(super) struct Received<'a> {
-    /// Each whole record, sorted by id: checked against it when it became whole.
-    held: AVec<'a, ([u8; 32], AVec<'a, u8>)>,
+    /// Each whole record, indexed in O(1) by its BLAKE3 id: checked against it when it became whole.
+    held: HashIndexMap<'a, AVec<'a, u8>>,
     open: Option<Open<'a>>,
     /// Bytes held and being assembled: each record counted whole at its first part.
     counted: u64,
@@ -110,7 +110,7 @@ pub(super) struct Received<'a> {
 
 impl<'a> Received<'a> {
     pub(super) fn new(alloc: Alloc<'a>) -> Received<'a> {
-        Received { held: Vec::new_in(alloc), open: None, counted: 0, files: Cell::new(false), alloc }
+        Received { held: HashIndexMap::new_in(alloc), open: None, counted: 0, files: Cell::new(false), alloc }
     }
 
     /// Whether this run's records come inline: a `Bytes` came.
@@ -138,7 +138,7 @@ impl<'a> Received<'a> {
             if at != 0 {
                 return Err(refused(SentRefused::FirstAt { at }));
             }
-            if self.find(record).is_ok() {
+            if self.held.contains_key(&record.0) {
                 return Err(refused(SentRefused::Again));
             }
             // `counted` never passes the bound, so the difference cannot wrap.
@@ -170,19 +170,15 @@ impl<'a> Received<'a> {
             if got != record.0 {
                 return Err(refused(SentRefused::Digest { got }));
             }
-            let at = self.find(record).expect_err("a held record was refused at its first part");
-            self.held.insert_shift(at, (record.0, whole.bytes));
+            let inserted = self.held.insert(record.0, whole.bytes);
+            debug_assert!(inserted, "a held record was refused at its first part");
         }
         Ok(())
     }
 
-    fn find(&self, record: RecordId) -> Result<usize, usize> {
-        self.held.binary_search_by(|(id, _)| id.cmp(&record.0))
-    }
-
     /// The bytes of a held record, checked when they became whole.
     fn held(&self, record: RecordId) -> Option<&[u8]> {
-        self.find(record).ok().map(|at| self.held[at].1.as_slice())
+        self.held.get(&record.0).map(AVec::as_slice)
     }
 
     /// Record `record`'s bytes, read the one way this run reads: held, in a run whose records

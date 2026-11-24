@@ -80,6 +80,11 @@ impl Sent<'static> {
 }
 
 impl<'s> Sent<'s> {
+    /// Builds a [`Sent`] view over already-staged `(id, end_offset)` pairs and flat `bytes`.
+    pub(crate) fn from_parts(records: &'s [([u8; 32], usize)], bytes: &'s [u8]) -> Sent<'s> {
+        Sent { records, bytes }
+    }
+
     /// Each record, its id and its bytes, in the order queued.
     pub(crate) fn each(self) -> impl Iterator<Item = (RecordId, &'s [u8])> + 's {
         let mut start = 0;

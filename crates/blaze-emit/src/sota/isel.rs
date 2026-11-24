@@ -1212,7 +1212,7 @@ fn check_sota_sig(view: &View<'_>, sig_id: SigId, inst: Option<u32>, os: crate::
 
 /// Validates that `view` is inside `Sota`'s direct AArch64 fused subset, returning `Err` naming the
 /// exact offending instruction so `Sota::with_fallback` can cleanly delegate exotic ops.
-fn check_subset(view: &View<'_>, has_lse: bool, os: crate::Os) -> Result<(), TierError> {
+fn check_subset(view: &View<'_>, has_lse: bool, has_crc32: bool, os: crate::Os) -> Result<(), TierError> {
     if view.head.ptr_bits != 64 {
         return Err(TierError::Refused { tier: TIER, inst: None, what: "non-64-bit pointers" });
     }
@@ -1670,7 +1670,23 @@ fn check_subset(view: &View<'_>, has_lse: bool, os: crate::Os) -> Result<(), Tie
                 let at = to_idx(at_u32(view.data, inst));
                 let name = view.intrinsic_name(IntrinsicId(at_u32(view.extra, at)));
                 let argc = to_idx(at_u32(view.extra, at + 1));
+                let is_crc32_b = name == b"blaze.a64.crc32b" || name == b"blaze.a64.crc32cb";
+                let is_crc32_x = name == b"blaze.a64.crc32x" || name == b"blaze.a64.crc32cx";
+                let crc32_ok = has_crc32
+                    && (is_crc32_b || is_crc32_x)
+                    && argc == 2
+                    && ty == Ty::I32
+                    && ty_at(view.tys, to_idx(at_u32(view.extra, at + 2))) == Ty::I32
+                    && {
+                        let data_ty = ty_at(view.tys, to_idx(at_u32(view.extra, at + 3)));
+                        if is_crc32_b {
+                            data_ty == Ty::I32 || data_ty == Ty::I8
+                        } else {
+                            data_ty == Ty::I64
+                        }
+                    };
                 let ok = (name == b"blaze.prefetch.r1" && argc == 1 && ty == Ty::NONE)
+                    || crc32_ok
                     || ((name == b"blaze.sme2.gemm_f32"
                         || name == b"blaze.sme2.gemm_f64"
                         || name == b"blaze.sme2.gemm_i8_i32"
@@ -2095,8 +2111,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     let has_lse = features & blaze_tier::Machine::LSE != 0;
     let has_cssc = features & blaze_tier::Machine::CSSC != 0;
     let has_sha3 = features & blaze_tier::Machine::SHA3 != 0;
+    let has_crc32 = features & blaze_tier::Machine::CRC32 != 0;
     let os = if is_macos { crate::Os::MacOs } else { crate::Os::Linux };
-    check_subset(&view, has_lse, os)?;
+    check_subset(&view, has_lse, has_crc32, os)?;
 
     // Canonicalize into dominator-respecting RPO order before fusion, loop-depth analysis, and
     // linear-interval register allocation (`regalloc` requires `def_block <= use_block` for all
@@ -8444,6 +8461,26 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         let ptr_v = at_u32(view.extra, at + 2);
                         let rptr = load_gpr(&mut words, ptr_v, X16);
                         words.push(enc::prfm_pldl1keep(rptr, 0));
+                    } else if matches!(
+                        name,
+                        b"blaze.a64.crc32b"
+                            | b"blaze.a64.crc32x"
+                            | b"blaze.a64.crc32cb"
+                            | b"blaze.a64.crc32cx"
+                    ) {
+                        let (c, sz) = match name {
+                            b"blaze.a64.crc32b" => (false, 0u32),
+                            b"blaze.a64.crc32x" => (false, 3u32),
+                            b"blaze.a64.crc32cb" => (true, 0u32),
+                            _ => (true, 3u32),
+                        };
+                        let rn = load_gpr(&mut words, at_u32(view.extra, at + 2), X16);
+                        let rm = load_gpr(&mut words, at_u32(view.extra, at + 3), X17);
+                        let (rd, sp) = dst_gpr(inst);
+                        words.push(enc::crc32(c, sz, rd, rn, rm));
+                        if let Some(s) = sp {
+                            emit_st_spill_gpr(&mut words, rd, spill_base, s);
+                        }
                     } else if name == b"blaze.sme2.gemm_f32"
                         || name == b"blaze.sme2.gemm_f64"
                         || name == b"blaze.sme2.gemm_i8_i32"
@@ -13298,6 +13335,162 @@ mod tests {
                     "escaping shl mismatch at slot {slot}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn crc32_target_intrinsics_emit_and_execute_exact() {
+        let alloc = test_alloc();
+        let emit_crc = |name: &str, data_ty: Ty, features: u64| {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I32), Param::of(data_ty)],
+                &[Param::of(Ty::I32)],
+            );
+            b.set_signature(sig);
+            let intr = b.intrinsic(name, sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let acc = b.param(Ty::I32);
+            let data = b.param(data_ty);
+            let out = b.target_intrinsic(intr, &[acc, data]);
+            b.ret(&[out]);
+            let func = b.finish_checked().expect("crc32 leaf LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, features, true, alloc)
+        };
+
+        // Without `Machine::CRC32`, `check_subset` must refuse all `blaze.a64.crc32*` intrinsics.
+        assert!(
+            emit_crc("blaze.a64.crc32b", Ty::I8, Machine::LSE).is_err(),
+            "crc32b must be refused when Machine::CRC32 is absent"
+        );
+        assert!(
+            emit_crc("blaze.a64.crc32cx", Ty::I64, Machine::LSE).is_err(),
+            "crc32cx must be refused when Machine::CRC32 is absent"
+        );
+
+        let feats = Machine::LSE | Machine::CRC32;
+        let crc32b_i8 = emit_crc("blaze.a64.crc32b", Ty::I8, feats).expect("crc32b(i8) emits");
+        let crc32b_i32 = emit_crc("blaze.a64.crc32b", Ty::I32, feats).expect("crc32b(i32) emits");
+        let crc32x = emit_crc("blaze.a64.crc32x", Ty::I64, feats).expect("crc32x emits");
+        let crc32cb_i8 = emit_crc("blaze.a64.crc32cb", Ty::I8, feats).expect("crc32cb(i8) emits");
+        let crc32cb_i32 = emit_crc("blaze.a64.crc32cb", Ty::I32, feats).expect("crc32cb(i32) emits");
+        let crc32cx = emit_crc("blaze.a64.crc32cx", Ty::I64, feats).expect("crc32cx emits");
+
+        for (label, code, c, sz) in [
+            ("crc32b(i8)", &crc32b_i8.code, false, 0u32),
+            ("crc32b(i32)", &crc32b_i32.code, false, 0u32),
+            ("crc32x", &crc32x.code, false, 3u32),
+            ("crc32cb(i8)", &crc32cb_i8.code, true, 0u32),
+            ("crc32cb(i32)", &crc32cb_i32.code, true, 0u32),
+            ("crc32cx", &crc32cx.code, true, 3u32),
+        ] {
+            let words = decode_words(code, alloc);
+            let want_fixed = crate::enc::crc32(c, sz, 0, 0, 0);
+            let crc_count = words
+                .iter()
+                .filter(|&&w| (w & 0x7fe0_e000) == 0x1ac0_4000 && (w & 0xffe0_fc00) == want_fixed)
+                .count();
+            assert_eq!(
+                crc_count, 1,
+                "{label}: expected 1 exact crc32 opcode word ({want_fixed:#010x}), got {crc_count}"
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            const IEEE_POLY: u32 = 0xedb8_8320;
+            const CASTAGNOLI_POLY: u32 = 0x82f6_3b78;
+            fn crc_model(mut crc: u32, data: u64, bytes: usize, poly: u32) -> u32 {
+                for &byte in data.to_le_bytes().iter().take(bytes) {
+                    crc ^= u32::from(byte);
+                    for _ in 0..8 {
+                        crc = (crc >> 1) ^ (poly & (crc & 1).wrapping_neg());
+                    }
+                }
+                crc
+            }
+
+            let ex_b_i8 = exec_leaf(crc32b_i8);
+            let ex_b_i32 = exec_leaf(crc32b_i32);
+            let ex_x = exec_leaf(crc32x);
+            let ex_cb_i8 = exec_leaf(crc32cb_i8);
+            let ex_cb_i32 = exec_leaf(crc32cb_i32);
+            let ex_cx = exec_leaf(crc32cx);
+
+            let f_b_i8: extern "C" fn(u32, u8) -> u32 = unsafe { ex_b_i8.as_fn() };
+            let f_b_i32: extern "C" fn(u32, u32) -> u32 = unsafe { ex_b_i32.as_fn() };
+            let f_x: extern "C" fn(u32, u64) -> u32 = unsafe { ex_x.as_fn() };
+            let f_cb_i8: extern "C" fn(u32, u8) -> u32 = unsafe { ex_cb_i8.as_fn() };
+            let f_cb_i32: extern "C" fn(u32, u32) -> u32 = unsafe { ex_cb_i32.as_fn() };
+            let f_cx: extern "C" fn(u32, u64) -> u32 = unsafe { ex_cx.as_fn() };
+
+            for &(acc, byte) in &[
+                (0xffff_ffffu32, 0x61u8),
+                (0, 0),
+                (0x1234_5678, 0xff),
+                (0xdead_beef, 0x80),
+                (0xcafe_babe, 0x39),
+            ] {
+                let want_ieee = crc_model(acc, u64::from(byte), 1, IEEE_POLY);
+                let want_c = crc_model(acc, u64::from(byte), 1, CASTAGNOLI_POLY);
+                assert_eq!(f_b_i8(acc, byte), want_ieee, "crc32b(i8) {acc:#x}, {byte:#x}");
+                assert_eq!(
+                    f_b_i32(acc, u32::from(byte) | 0xdead_be00),
+                    want_ieee,
+                    "crc32b(i32) {acc:#x}, {byte:#x}"
+                );
+                assert_eq!(f_cb_i8(acc, byte), want_c, "crc32cb(i8) {acc:#x}, {byte:#x}");
+                assert_eq!(
+                    f_cb_i32(acc, u32::from(byte) | 0xfeed_fa00),
+                    want_c,
+                    "crc32cb(i32) {acc:#x}, {byte:#x}"
+                );
+            }
+
+            for &(acc, word) in &[
+                (0xffff_ffffu32, 0x0123_4567_89ab_cdefu64),
+                (0, 0),
+                (1, u64::MAX),
+                (0xcafe_babe, 0x8000_0000_0000_0001),
+                (0xdead_beef, u64::from_le_bytes(*b"12345678")),
+            ] {
+                assert_eq!(
+                    f_x(acc, word),
+                    crc_model(acc, word, 8, IEEE_POLY),
+                    "crc32x {acc:#x}, {word:#x}"
+                );
+                assert_eq!(
+                    f_cx(acc, word),
+                    crc_model(acc, word, 8, CASTAGNOLI_POLY),
+                    "crc32cx {acc:#x}, {word:#x}"
+                );
+            }
+
+            // Standard check values on `"123456789"`:
+            // IEEE CRC-32 = `0xcbf4_3926`, Castagnoli CRC-32C = `0xe306_9283`.
+            let mut ieee_by_byte = 0xffff_ffffu32;
+            let mut crc32c_by_byte = 0xffff_ffffu32;
+            for &byte in b"123456789" {
+                ieee_by_byte = f_b_i8(ieee_by_byte, byte);
+                crc32c_by_byte = f_cb_i8(crc32c_by_byte, byte);
+            }
+            assert_eq!(!ieee_by_byte, 0xcbf4_3926, "IEEE CRC-32(\"123456789\") byte-by-byte");
+            assert_eq!(!crc32c_by_byte, 0xe306_9283, "Castagnoli CRC-32C(\"123456789\") byte-by-byte");
+
+            let w8 = u64::from_le_bytes(*b"12345678");
+            assert_eq!(
+                !f_b_i8(f_x(0xffff_ffff, w8), b'9'),
+                0xcbf4_3926,
+                "IEEE CRC-32(\"123456789\") via crc32x + crc32b"
+            );
+            assert_eq!(
+                !f_cb_i8(f_cx(0xffff_ffff, w8), b'9'),
+                0xe306_9283,
+                "Castagnoli CRC-32C(\"123456789\") via crc32cx + crc32cb"
+            );
         }
     }
 }

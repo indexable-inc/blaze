@@ -19,6 +19,13 @@
 //!    1-cycle CSSC `smin`/`smax` or NEON `smin.4s`/`smax.4s`), plus verified branchless
 //!    constant-width builders [`emit_sort4_network`] (5 comparators, depth 3) and
 //!    [`emit_sort8_network`] (19 comparators, depth 6).
+//! 4. **Hardware `FEAT_CRC32` Reflected-Table Auto-Acceleration (`lower_crc32_table_loops`)**:
+//!    detects reflected 256-entry `u32` lookup-table CRC-32 byte loops
+//!    (`crc = table[(crc as u8 ^ b) as usize] ^ (crc >> 8)`), proves at runtime that all 256
+//!    table entries equal `crc32b(0, i)` (IEEE 802.3 `0xEDB8_8320`) or `crc32cb(0, i)`
+//!    (Castagnoli `0x82F6_3B78`), and executes a 4x-unrolled 32 B/iter + 8 B/iter hardware
+//!    `crc32x`/`crc32cx` fast path with the original scalar loop as both `< 8` B tail and exact
+//!    sound fallback for any non-matching table.
 //!
 //! Pure sans-IO, `#![forbid(unsafe_code)]`, deterministic (Rule 25), bounded (Rule 18), explicit
 //! allocator only.
@@ -55,6 +62,18 @@ pub const NEON_SDOT_INTRINSIC: &str = "blaze.neon.sdot";
 /// `(acc: <4 x i32>, a: <16 x i8>, b: <16 x i8>) -> <4 x i32>`.
 pub const NEON_UDOT_INTRINSIC: &str = "blaze.neon.udot";
 
+/// `FEAT_CRC32` IEEE 802.3 byte step (`crc32b wd, wn, wm`): `(crc: i32, byte: i32) -> i32`.
+pub const A64_CRC32B_INTRINSIC: &str = "blaze.a64.crc32b";
+
+/// `FEAT_CRC32` IEEE 802.3 64-bit step (`crc32x wd, wn, xm`): `(crc: i32, word: i64) -> i32`.
+pub const A64_CRC32X_INTRINSIC: &str = "blaze.a64.crc32x";
+
+/// `FEAT_CRC32` Castagnoli CRC-32C byte step (`crc32cb wd, wn, wm`): `(crc: i32, byte: i32) -> i32`.
+pub const A64_CRC32CB_INTRINSIC: &str = "blaze.a64.crc32cb";
+
+/// `FEAT_CRC32` Castagnoli CRC-32C 64-bit step (`crc32cx wd, wn, xm`): `(crc: i32, word: i64) -> i32`.
+pub const A64_CRC32CX_INTRINSIC: &str = "blaze.a64.crc32cx";
+
 /// Bounded maximum number of loops transformed per idiom pass in a single function (Rule 18).
 const MAX_LOOPS_PER_FUNC: usize = 8;
 
@@ -72,15 +91,17 @@ pub struct SimdIdiomOpts {
     pub enable_tbl: bool,
     pub enable_dotprod: bool,
     pub enable_sort_net: bool,
+    pub enable_crc32: bool,
 }
 
 impl SimdIdiomOpts {
-    /// Enables all Apple Silicon NEON / `FEAT_DotProd` / CSSC idiom lowerings.
+    /// Enables all Apple Silicon NEON / `FEAT_DotProd` / `FEAT_CRC32` / CSSC idiom lowerings.
     pub const fn apple_silicon() -> Self {
         Self {
             enable_tbl: true,
             enable_dotprod: true,
             enable_sort_net: true,
+            enable_crc32: true,
         }
     }
 }
@@ -97,6 +118,7 @@ pub struct SimdIdiomStats {
     pub tbl_loops: u32,
     pub dotprod_loops: u32,
     pub sort_swaps_canonicalized: u32,
+    pub crc32_loops: u32,
 }
 
 /// Output of [`lower_simd_idioms`] and individual idiom passes.
@@ -2177,6 +2199,7 @@ pub fn lower_byte_lut_loops<A: Allocator + Copy>(
             tbl_loops,
             dotprod_loops: 0,
             sort_swaps_canonicalized: 0,
+            crc32_loops: 0,
         },
     })
 }
@@ -2700,6 +2723,7 @@ pub fn lower_dotprod_loops<A: Allocator + Copy>(
             tbl_loops: 0,
             dotprod_loops,
             sort_swaps_canonicalized: 0,
+            crc32_loops: 0,
         },
     })
 }
@@ -3122,6 +3146,7 @@ pub fn lower_sorting_networks<A: Allocator + Copy>(
             tbl_loops: 0,
             dotprod_loops: 0,
             sort_swaps_canonicalized: total_swaps,
+            crc32_loops: 0,
         },
     })
 }
@@ -3258,12 +3283,1222 @@ pub fn emit_sort8_network<A: Allocator + Copy>(
 }
 
 // ============================================================================
+// Idiom 4: Hardware `FEAT_CRC32` Reflected-Table Auto-Accelerator
+// ============================================================================
+
+/// Reflected IEEE 802.3 CRC-32 polynomial (`table[128]` for the standard 256-entry table).
+const CRC32_IEEE_POLY: u64 = 0xEDB8_8320;
+
+/// Reflected Castagnoli CRC-32C polynomial (`table[128]` for the Castagnoli 256-entry table).
+const CRC32_CASTAGNOLI_POLY: u64 = 0x82F6_3B78;
+
+/// Minimum remaining byte count to enter the 256-entry proof + 4x-unrolled `crc32x` fast path.
+const CRC32_MIN_BYTES: u64 = 64;
+
+/// Number of basic blocks inserted per transformed CRC-32 table loop:
+/// `crc_gate` + `crc_probe_ieee` + `crc_probe_castagnoli` + 2 x 7-block verify+fast subgraphs.
+const CRC32_EXTRA_BLOCKS: usize = 17;
+
+#[derive(Clone, Copy)]
+enum CrcPreTerm {
+    Jump,
+    Br {
+        cond: u32,
+        hdr_on_true: bool,
+        other_blk: u32,
+        other_args_at: usize,
+        other_argc: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum CrcIvKind {
+    Counted { src_base: u32 },
+    Pointer { len_val: Option<u32> },
+}
+
+#[derive(Clone, Copy)]
+struct Crc32Plan {
+    shape: LoopShape,
+    pre_term: CrcPreTerm,
+    iv_kind: CrcIvKind,
+    preheader: u32,
+    header: u32,
+    body: u32,
+    iv_pos: usize,
+    iv_init: u32,
+    iv_next: u32,
+    bound: u32,
+    crc_init: u32,
+    crc_next: u32,
+    src_off: i32,
+    table_base: u32,
+    table_off: i32,
+    table_attr: u32,
+    stay_on_true: bool,
+    single_exit_argc: usize,
+    single_exit_args: [u32; 4],
+    direct_crc_escape: bool,
+}
+
+#[inline]
+fn ordered_crc_header_args(iv_pos: usize, iv_val: u32, crc_val: u32) -> [u32; 2] {
+    if iv_pos == 0 {
+        [iv_val, crc_val]
+    } else {
+        [crc_val, iv_val]
+    }
+}
+
+fn push_extra_val<A: Allocator>(
+    func: &mut Func<A>,
+    val_map: &[u32],
+    old_val: u32,
+    fixups: &mut Vec<ValFixup, A>,
+) {
+    let mapped = at(val_map, to_idx(old_val));
+    if mapped == NONE {
+        fixups.push(ValFixup::Extra { pos: func.extra.len(), old_val });
+        func.extra.push(0);
+    } else {
+        func.extra.push(mapped);
+    }
+}
+
+#[inline]
+fn is_crc_lshr8(
+    view: &View<'_>,
+    cfg: &CfgInfo<impl Allocator>,
+    val: u32,
+    crc_param: u32,
+    body: u32,
+) -> bool {
+    let vi = to_idx(val);
+    if at(&cfg.inst_block, vi) != body || view.op(vi) != Op::Lshr {
+        return false;
+    }
+    let pos = to_idx(at(view.data, vi));
+    at(view.extra, pos) == crc_param && const_u64(view, to_idx(at(view.extra, pos + 1))) == Some(8)
+}
+
+/// Unwraps `Shl(idx, 2)` or `Mul(idx, 4)` (optionally wrapped in a single `Zext`).
+fn match_crc_table_scaled_idx(
+    view: &View<'_>,
+    cfg: &CfgInfo<impl Allocator>,
+    scaled_idx: u32,
+    body: u32,
+) -> Option<u32> {
+    let mut cur = to_idx(scaled_idx);
+    if at(&cfg.inst_block, cur) == body && view.op(cur) == Op::Zext {
+        cur = to_idx(at(view.data, cur));
+    }
+    if at(&cfg.inst_block, cur) != body {
+        return None;
+    }
+    match view.op(cur) {
+        Op::Shl => {
+            let pos = to_idx(at(view.data, cur));
+            let (l, r) = (at(view.extra, pos), at(view.extra, pos + 1));
+            (const_u64(view, to_idx(r)) == Some(2)).then_some(l)
+        }
+        Op::Mul => {
+            let pos = to_idx(at(view.data, cur));
+            let (l, r) = (at(view.extra, pos), at(view.extra, pos + 1));
+            if const_u64(view, to_idx(r)) == Some(4) {
+                Some(l)
+            } else if const_u64(view, to_idx(l)) == Some(4) {
+                Some(r)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// True iff `val` extracts the low 8 bits of `crc_param` (requiring an explicit `Trunc(_, i8)` or
+/// `And(_, 0xff)` unless `masked_outside` is already true).
+fn is_crc_low8(
+    view: &View<'_>,
+    cfg: &CfgInfo<impl Allocator>,
+    val: u32,
+    crc_param: u32,
+    body: u32,
+    masked_outside: bool,
+) -> bool {
+    let mut cur = val;
+    let mut saw_mask8 = masked_outside;
+    for _ in 0..4 {
+        if cur == crc_param {
+            return saw_mask8;
+        }
+        let ci = to_idx(cur);
+        if at(&cfg.inst_block, ci) != body {
+            return false;
+        }
+        match view.op(ci) {
+            Op::Zext => cur = at(view.data, ci),
+            Op::Trunc => {
+                let bits = Ty(at(view.tys, ci)).bits(64);
+                if bits < 8 {
+                    return false;
+                }
+                if bits == 8 {
+                    saw_mask8 = true;
+                }
+                cur = at(view.data, ci);
+            }
+            Op::And => {
+                let pos = to_idx(at(view.data, ci));
+                let (l, r) = (at(view.extra, pos), at(view.extra, pos + 1));
+                if const_u64(view, to_idx(r)) == Some(0xff) {
+                    saw_mask8 = true;
+                    cur = l;
+                } else if const_u64(view, to_idx(l)) == Some(0xff) {
+                    saw_mask8 = true;
+                    cur = r;
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    cur == crc_param && saw_mask8
+}
+
+/// Traces a zero-extended byte value (optionally masked by `0xff`) to its non-volatile `Ty::I8` load.
+fn match_crc_byte_load_val(
+    view: &View<'_>,
+    cfg: &CfgInfo<impl Allocator>,
+    val: u32,
+    body: u32,
+) -> Option<usize> {
+    let mut cur = to_idx(val);
+    for _ in 0..3 {
+        if at(&cfg.inst_block, cur) != body {
+            return None;
+        }
+        match view.op(cur) {
+            Op::Zext => cur = to_idx(at(view.data, cur)),
+            Op::And => {
+                let pos = to_idx(at(view.data, cur));
+                let (l, r) = (at(view.extra, pos), at(view.extra, pos + 1));
+                if const_u64(view, to_idx(r)) == Some(0xff) {
+                    cur = to_idx(l);
+                } else if const_u64(view, to_idx(l)) == Some(0xff) {
+                    cur = to_idx(r);
+                } else {
+                    return None;
+                }
+            }
+            _ => break,
+        }
+    }
+    if at(&cfg.inst_block, cur) == body
+        && view.op(cur) == Op::Load
+        && Ty(at(view.tys, cur)) == Ty::I8
+        && !Flags(at(view.flags, cur)).contains(Flags::VOLATILE)
+    {
+        Some(cur)
+    } else {
+        None
+    }
+}
+
+/// Matches all commutative index forms of `((crc as u8) ^ b) as usize` feeding `table[idx]`:
+/// - `Xor(Zext(Trunc(I8, crc)), Zext(b))`
+/// - `Zext(Xor(Trunc(I8, crc), b))`
+/// - `Xor(And(Zext(crc), 0xff), Zext(b))` / `Xor(Zext(And(crc, 0xff)), Zext(b))`
+/// - `Zext(And(Xor(crc, Zext(b)), 0xff))`
+/// - `And(Xor(Zext(crc), Zext(b)), 0xff)`
+/// - `Zext(Trunc(I8, Xor(crc, Zext(b))))`
+fn match_crc_byte_xor_idx(
+    view: &View<'_>,
+    cfg: &CfgInfo<impl Allocator>,
+    idx: u32,
+    crc_param: u32,
+    body: u32,
+) -> Option<usize> {
+    let mut cur = to_idx(unwrap_unit_scale(view, cfg, idx, body));
+    let mut masked_outside = false;
+    for _ in 0..3 {
+        if at(&cfg.inst_block, cur) != body {
+            return None;
+        }
+        match view.op(cur) {
+            Op::Zext => cur = to_idx(at(view.data, cur)),
+            Op::Trunc => {
+                if Ty(at(view.tys, cur)) == Ty::I8 {
+                    masked_outside = true;
+                    cur = to_idx(at(view.data, cur));
+                } else {
+                    break;
+                }
+            }
+            Op::And => {
+                let pos = to_idx(at(view.data, cur));
+                let (l, r) = (at(view.extra, pos), at(view.extra, pos + 1));
+                if const_u64(view, to_idx(r)) == Some(0xff) {
+                    masked_outside = true;
+                    cur = to_idx(l);
+                } else if const_u64(view, to_idx(l)) == Some(0xff) {
+                    masked_outside = true;
+                    cur = to_idx(r);
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    if at(&cfg.inst_block, cur) != body || view.op(cur) != Op::Xor {
+        return None;
+    }
+    if Ty(at(view.tys, cur)) == Ty::I8 {
+        masked_outside = true;
+    }
+    let xat = to_idx(at(view.data, cur));
+    let (xl, xr) = (at(view.extra, xat), at(view.extra, xat + 1));
+    if is_crc_low8(view, cfg, xl, crc_param, body, masked_outside)
+        && let Some(b_load) = match_crc_byte_load_val(view, cfg, xr, body)
+    {
+        return Some(b_load);
+    }
+    if is_crc_low8(view, cfg, xr, crc_param, body, masked_outside)
+        && let Some(b_load) = match_crc_byte_load_val(view, cfg, xl, body)
+    {
+        return Some(b_load);
+    }
+    None
+}
+
+/// If `end_ptr` is `PtrAdd(p_init, len_i64)` where `len_i64` is ready invariant at `preheader`,
+/// returns `Some(len_i64)` so the fast path avoids `PtrAddr` completely (preserving provenance).
+fn match_ptr_end_len(
+    view: &View<'_>,
+    cfg: &CfgInfo<impl Allocator>,
+    p_init: u32,
+    end_ptr: u32,
+    preheader: u32,
+) -> Option<u32> {
+    let ei = to_idx(end_ptr);
+    if view.op(ei) != Op::PtrAdd {
+        return None;
+    }
+    let pat = to_idx(at(view.data, ei));
+    let (base, by) = (at(view.extra, pat), at(view.extra, pat + 1));
+    if base == p_init
+        && Ty(at(view.tys, to_idx(by))) == Ty::I64
+        && is_ready_invariant(&cfg.inst_block, &cfg.idom, by, preheader)
+    {
+        Some(by)
+    } else {
+        None
+    }
+}
+
+fn find_crc32_table_loop(view: &View<'_>, cfg: &CfgInfo<impl Allocator>) -> Option<Crc32Plan> {
+    for h in 1..view.blocks() {
+        let header = to_u32(h);
+        if view.block_kind(Block(header)) != BlockKind::Normal {
+            continue;
+        }
+        let (p0, p1) = match cfg.preds.get(h).map(Vec::as_slice) {
+            Some(&[p0, p1]) => (p0, p1),
+            _ => continue,
+        };
+        let (preheader, body) = if dominates(&cfg.idom, header, p1) && !dominates(&cfg.idom, header, p0) {
+            (p0, p1)
+        } else if dominates(&cfg.idom, header, p0) && !dominates(&cfg.idom, header, p1) {
+            (p1, p0)
+        } else {
+            continue;
+        };
+        if preheader == header || preheader == body || view.block_kind(Block(body)) != BlockKind::Normal {
+            continue;
+        }
+
+        let h_params = view.params(Block(header));
+        if h_params.len() != 2 {
+            continue;
+        }
+
+        // `preheader` may end with either `Jump(header, args)` or `Br(cond, header(args), other)` /
+        // `Br(cond, other, header(args))` (the rotated empty-slice guard).
+        let pre_term_inst = view.terminator(Block(preheader));
+        let (pre_term, pre_args_at) = match view.op(pre_term_inst) {
+            Op::Jump => {
+                let pat = to_idx(at(view.data, pre_term_inst));
+                if at(view.extra, pat) != header || to_idx(at(view.extra, pat + 1)) != 2 {
+                    continue;
+                }
+                (CrcPreTerm::Jump, pat + 2)
+            }
+            Op::Br => {
+                let bat = to_idx(at(view.data, pre_term_inst));
+                let cond = at(view.extra, bat);
+                let t_blk = at(view.extra, bat + 1);
+                let t_argc = to_idx(at(view.extra, bat + 2));
+                let f_at = bat + 3 + t_argc;
+                let f_blk = at(view.extra, f_at);
+                let f_argc = to_idx(at(view.extra, f_at + 1));
+                if t_blk == header && f_blk != header && t_argc == 2 {
+                    (
+                        CrcPreTerm::Br {
+                            cond,
+                            hdr_on_true: true,
+                            other_blk: f_blk,
+                            other_args_at: f_at + 2,
+                            other_argc: f_argc,
+                        },
+                        bat + 3,
+                    )
+                } else if f_blk == header && t_blk != header && f_argc == 2 {
+                    (
+                        CrcPreTerm::Br {
+                            cond,
+                            hdr_on_true: false,
+                            other_blk: t_blk,
+                            other_args_at: bat + 3,
+                            other_argc: t_argc,
+                        },
+                        f_at + 2,
+                    )
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+
+        let h_range = view.block(Block(header));
+        let Some(h_term) = h_range.end.checked_sub(1) else {
+            continue;
+        };
+        if view.op(h_term) != Op::Br {
+            continue;
+        }
+        let h_at = to_idx(at(view.data, h_term));
+        let raw_cmp_val = at(view.extra, h_at);
+        let t_blk = at(view.extra, h_at + 1);
+        let t_argc = to_idx(at(view.extra, h_at + 2));
+        let f_at = h_at + 3 + t_argc;
+        let f_blk = at(view.extra, f_at);
+        let f_argc = to_idx(at(view.extra, f_at + 1));
+
+        let (shape, latch_args_at, stay_on_true, single_exit_argc, single_exit_args) = if body == header {
+            let mut ex_args = [0u32; 4];
+            if t_blk == header && f_blk != header && f_blk != preheader && t_argc == 2 && f_argc <= 4 {
+                for k in 0..f_argc {
+                    set_at(&mut ex_args, k, at(view.extra, f_at + 2 + k));
+                }
+                (LoopShape::SingleBlock { exit: f_blk }, h_at + 3, true, f_argc, ex_args)
+            } else if f_blk == header && t_blk != header && t_blk != preheader && f_argc == 2 && t_argc <= 4 {
+                for k in 0..t_argc {
+                    set_at(&mut ex_args, k, at(view.extra, h_at + 3 + k));
+                }
+                (LoopShape::SingleBlock { exit: t_blk }, f_at + 2, false, t_argc, ex_args)
+            } else {
+                continue;
+            }
+        } else {
+            if cfg.preds.get(to_idx(body)).map(Vec::len) != Some(1)
+                || !view.params(Block(body)).is_empty()
+            {
+                continue;
+            }
+            let b_term = view.terminator(Block(body));
+            if view.op(b_term) != Op::Jump {
+                continue;
+            }
+            let latch_at = to_idx(at(view.data, b_term));
+            if at(view.extra, latch_at) != header || to_idx(at(view.extra, latch_at + 1)) != 2 {
+                continue;
+            }
+            let hdr_pure = (h_range.start..h_term).all(|inst| {
+                matches!(
+                    view.op(inst),
+                    Op::Param | Op::Icmp | Op::PtrAddr | Op::Not | Op::Xor | Op::Zext | Op::Iconst | Op::IconstWide
+                )
+            });
+            if !hdr_pure {
+                continue;
+            }
+            let body_on_true = if t_blk == body && t_argc == 0 && f_blk != body && f_blk != header {
+                true
+            } else if f_blk == body && f_argc == 0 && t_blk != body && t_blk != header {
+                false
+            } else {
+                continue;
+            };
+            (LoopShape::HeaderBody, latch_at + 2, body_on_true, 0, [0u32; 4])
+        };
+
+        let (inner_cmp, flipped) = unwrap_bool_cond(view, raw_cmp_val);
+        let stay_cond = stay_on_true ^ flipped;
+        let cmp_inst = to_idx(inner_cmp);
+        if view.op(cmp_inst) != Op::Icmp {
+            continue;
+        }
+        let cmp_at = to_idx(at(view.data, cmp_inst));
+        let Some(cond) = IntCond::from_word(at(view.extra, cmp_at)) else {
+            continue;
+        };
+        let cmp_a = at(view.extra, cmp_at + 1);
+        let cmp_b = at(view.extra, cmp_at + 2);
+
+        // Identify the primary IV (`Ty::PTR` or `Ty::I64`) and the `Ty::I32` CRC accumulator param.
+        let mut found_iv: Option<(usize, u32, u32, u32, u32, bool)> = None;
+        for pos in 0..2usize {
+            let p_idx = h_params.start + pos;
+            let p_inst = to_u32(p_idx);
+            let p_ty = Ty(at(view.tys, p_idx));
+            let p_init = at(view.extra, pre_args_at + pos);
+            let p_next = at(view.extra, latch_args_at + pos);
+            if !is_ready_invariant(&cfg.inst_block, &cfg.idom, p_init, preheader) {
+                continue;
+            }
+            let cmp_target = match shape {
+                LoopShape::HeaderBody => p_inst,
+                LoopShape::SingleBlock { .. } => p_next,
+            };
+            if p_ty == Ty::PTR && is_ptr_step1(view, cfg, body, p_next, p_inst) {
+                let ua = unwrap_ptr_addr(view, cmp_a);
+                let ub = unwrap_ptr_addr(view, cmp_b);
+                let end_opt = if stay_cond {
+                    if ua == cmp_target && matches!(cond, IntCond::Ult | IntCond::Ne) {
+                        Some(ub)
+                    } else if ub == cmp_target && matches!(cond, IntCond::Ugt | IntCond::Ne) {
+                        Some(ua)
+                    } else {
+                        None
+                    }
+                } else if ua == cmp_target && matches!(cond, IntCond::Uge | IntCond::Eq) {
+                    Some(ub)
+                } else if ub == cmp_target && matches!(cond, IntCond::Ule | IntCond::Eq) {
+                    Some(ua)
+                } else {
+                    None
+                };
+                if let Some(end_ptr) = end_opt
+                    && Ty(at(view.tys, to_idx(end_ptr))) == Ty::PTR
+                    && is_ready_invariant(&cfg.inst_block, &cfg.idom, end_ptr, preheader)
+                {
+                    found_iv = Some((pos, p_inst, p_init, p_next, end_ptr, true));
+                    break;
+                }
+            } else if p_ty == Ty::I64 && is_int_step1(view, cfg, body, p_next, p_inst) {
+                let bound_opt = if stay_cond {
+                    if cmp_a == cmp_target && matches!(cond, IntCond::Ult | IntCond::Ne) {
+                        Some(cmp_b)
+                    } else if cmp_b == cmp_target && matches!(cond, IntCond::Ugt | IntCond::Ne) {
+                        Some(cmp_a)
+                    } else {
+                        None
+                    }
+                } else if cmp_a == cmp_target && matches!(cond, IntCond::Uge | IntCond::Eq) {
+                    Some(cmp_b)
+                } else if cmp_b == cmp_target && matches!(cond, IntCond::Ule | IntCond::Eq) {
+                    Some(cmp_a)
+                } else {
+                    None
+                };
+                if let Some(bnd) = bound_opt
+                    && Ty(at(view.tys, to_idx(bnd))) == Ty::I64
+                    && is_ready_invariant(&cfg.inst_block, &cfg.idom, bnd, preheader)
+                {
+                    found_iv = Some((pos, p_inst, p_init, p_next, bnd, false));
+                    break;
+                }
+            }
+        }
+        let Some((iv_pos, iv_inst, iv_init, iv_next, bound, is_ptr_iv)) = found_iv else {
+            continue;
+        };
+
+        let crc_pos = 1 - iv_pos;
+        let crc_idx = h_params.start + crc_pos;
+        if Ty(at(view.tys, crc_idx)) != Ty::I32 {
+            continue;
+        }
+        let crc_inst = to_u32(crc_idx);
+        let crc_init = at(view.extra, pre_args_at + crc_pos);
+        let crc_next = at(view.extra, latch_args_at + crc_pos);
+        if !is_ready_invariant(&cfg.inst_block, &cfg.idom, crc_init, preheader) {
+            continue;
+        }
+
+        // Match `crc_next = Xor(table_load, Lshr(crc_param, 8))` (commutative).
+        let upd = to_idx(crc_next);
+        if at(&cfg.inst_block, upd) != body
+            || view.op(upd) != Op::Xor
+            || Ty(at(view.tys, upd)) != Ty::I32
+        {
+            continue;
+        }
+        let uat = to_idx(at(view.data, upd));
+        let (ul, ur) = (at(view.extra, uat), at(view.extra, uat + 1));
+        let table_load_inst = if is_crc_lshr8(view, cfg, ur, crc_inst, body) {
+            to_idx(ul)
+        } else if is_crc_lshr8(view, cfg, ul, crc_inst, body) {
+            to_idx(ur)
+        } else {
+            continue;
+        };
+
+        // `table_load_inst` must be a non-volatile `Ty::I32` load from `PtrAdd(table_base, idx * 4)`.
+        if at(&cfg.inst_block, table_load_inst) != body
+            || view.op(table_load_inst) != Op::Load
+            || Ty(at(view.tys, table_load_inst)) != Ty::I32
+            || Flags(at(view.flags, table_load_inst)).contains(Flags::VOLATILE)
+        {
+            continue;
+        }
+        let tlat = to_idx(at(view.data, table_load_inst));
+        let t_ptr = to_idx(at(view.extra, tlat));
+        let table_off = at(view.extra, tlat + 1).cast_signed();
+        let table_attr = at(view.attrs, table_load_inst);
+        if at(&cfg.inst_block, t_ptr) != body || view.op(t_ptr) != Op::PtrAdd {
+            continue;
+        }
+        let tpat = to_idx(at(view.data, t_ptr));
+        let (table_base, scaled_idx) = (at(view.extra, tpat), at(view.extra, tpat + 1));
+        if !is_ready_invariant(&cfg.inst_block, &cfg.idom, table_base, preheader) {
+            continue;
+        }
+        let Some(raw_idx) = match_crc_table_scaled_idx(view, cfg, scaled_idx, body) else {
+            continue;
+        };
+        let Some(byte_load_inst) = match_crc_byte_xor_idx(view, cfg, raw_idx, crc_inst, body) else {
+            continue;
+        };
+        if byte_load_inst == table_load_inst {
+            continue;
+        }
+
+        // Verify `byte_load_inst` is a unit-stride byte stream driven by `iv_inst`.
+        let blat = to_idx(at(view.data, byte_load_inst));
+        let b_ptr = at(view.extra, blat);
+        let b_off = at(view.extra, blat + 1).cast_signed();
+        let (iv_kind, src_off) = if is_ptr_iv {
+            let mut cur = b_ptr;
+            let mut total_off = b_off;
+            let mut matched = false;
+            for _ in 0..2 {
+                if cur == iv_inst {
+                    matched = true;
+                    break;
+                }
+                let ci = to_idx(cur);
+                if view.op(ci) == Op::PtrAdd {
+                    let pat = to_idx(at(view.data, ci));
+                    let (base, by) = (at(view.extra, pat), at(view.extra, pat + 1));
+                    if let Some(c) = const_u64(view, to_idx(by))
+                        && let Ok(c32) = i32::try_from(c.cast_signed())
+                        && let Some(sum) = total_off.checked_add(c32)
+                    {
+                        cur = base;
+                        total_off = sum;
+                        continue;
+                    }
+                }
+                break;
+            }
+            if !matched {
+                continue;
+            }
+            let len_val = match_ptr_end_len(view, cfg, iv_init, bound, preheader);
+            (CrcIvKind::Pointer { len_val }, total_off)
+        } else {
+            let bi = to_idx(b_ptr);
+            if view.op(bi) != Op::PtrAdd {
+                continue;
+            }
+            let pat = to_idx(at(view.data, bi));
+            let src_base = at(view.extra, pat);
+            let idx = unwrap_unit_scale(view, cfg, at(view.extra, pat + 1), body);
+            if idx != iv_inst || !is_ready_invariant(&cfg.inst_block, &cfg.idom, src_base, preheader) {
+                continue;
+            }
+            (CrcIvKind::Counted { src_base }, b_off)
+        };
+
+        // Purity check: no stores, calls, traps, intrinsics, or other loads in `body`.
+        let b_range = view.block(Block(body));
+        let b_term = b_range.end.saturating_sub(1);
+        let is_single = matches!(shape, LoopShape::SingleBlock { .. });
+        let body_ok = (b_range.start..b_term).all(|k| {
+            k == byte_load_inst
+                || k == table_load_inst
+                || matches!(
+                    view.op(k),
+                    Op::PtrAdd
+                        | Op::And
+                        | Op::Lshr
+                        | Op::Shl
+                        | Op::Zext
+                        | Op::Trunc
+                        | Op::Add
+                        | Op::Mul
+                        | Op::Xor
+                        | Op::Iconst
+                        | Op::IconstWide
+                        | Op::Freeze
+                        | Op::Assume
+                )
+                || (is_single
+                    && matches!(view.op(k), Op::Param | Op::Icmp | Op::PtrAddr | Op::Not))
+        });
+        if !body_ok {
+            continue;
+        }
+
+        // For `SingleBlock`, check exit arguments and any direct escape of `crc_next`.
+        let mut direct_crc_escape = false;
+        if let LoopShape::SingleBlock { exit } = shape {
+            let mut bad_escape = false;
+            for b in 0..view.blocks() {
+                let b32 = to_u32(b);
+                if b32 == header {
+                    continue;
+                }
+                for inst in view.block(Block(b32)) {
+                    each(view, inst, |item| match item {
+                        Item::Value(v) => {
+                            if at(&cfg.inst_block, to_idx(v)) == header {
+                                if v == crc_next {
+                                    direct_crc_escape = true;
+                                } else {
+                                    bad_escape = true;
+                                }
+                            }
+                        }
+                        Item::Edge(edge) => {
+                            if let Some((start, argc)) = edge.args {
+                                for k in 0..argc {
+                                    let v = at(view.extra, start + k);
+                                    if at(&cfg.inst_block, to_idx(v)) == header {
+                                        if v == crc_next {
+                                            direct_crc_escape = true;
+                                        } else {
+                                            bad_escape = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    if bad_escape {
+                        break;
+                    }
+                }
+                if bad_escape {
+                    break;
+                }
+            }
+            if bad_escape {
+                continue;
+            }
+            if direct_crc_escape {
+                let sole_pred_hdr = cfg.preds.get(to_idx(exit)).map(Vec::as_slice) == Some(&[header]);
+                if !sole_pred_hdr || view.block_kind(Block(exit)) != BlockKind::Normal {
+                    continue;
+                }
+            }
+            let exit_args_ok = (0..single_exit_argc).all(|k| {
+                let ea = at(&single_exit_args, k);
+                ea == crc_next || is_ready_invariant(&cfg.inst_block, &cfg.idom, ea, preheader)
+            });
+            if !exit_args_ok {
+                continue;
+            }
+        }
+
+        return Some(Crc32Plan {
+            shape,
+            pre_term,
+            iv_kind,
+            preheader,
+            header,
+            body,
+            iv_pos,
+            iv_init,
+            iv_next,
+            bound,
+            crc_init,
+            crc_next,
+            src_off,
+            table_base,
+            table_off,
+            table_attr,
+            stay_on_true,
+            single_exit_argc,
+            single_exit_args,
+            direct_crc_escape,
+        });
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+struct CrcEmitCtx {
+    plan: Crc32Plan,
+    orig_hdr_new: u32,
+    orig_exit_new: u32,
+    orig_iv_init: u32,
+    orig_bound: u32,
+    crc_init: u32,
+    rem: u32,
+    table_base_adj: u32,
+    k0_32: u32,
+    k1_32: u32,
+    k256_32: u32,
+    k2_64: u32,
+    orig_pre_args: [u32; 2],
+}
+
+/// Emits the 7-block exact 256-entry proof + 4x-unrolled 32 B/iter + 8 B/iter hardware
+/// `crc32x`/`crc32cx` subgraph starting at block `base_blk`.
+fn emit_verify_and_fast_crc_path<A: Allocator>(
+    func: &mut Func<A>,
+    val_map: &[u32],
+    ctx: CrcEmitCtx,
+    base_blk: u32,
+    crc_b_id: IntrinsicId,
+    crc_x_id: IntrinsicId,
+) {
+    let verify_hdr_blk = base_blk;
+    let verify_check_blk = base_blk + 1;
+    let fast_pre_blk = base_blk + 2;
+    let fast32_loop_blk = base_blk + 3;
+    let fast8_check_blk = base_blk + 4;
+    let fast8_loop_blk = base_blk + 5;
+    let tail_check_blk = base_blk + 6;
+
+    // 0. `verify_hdr(i: I32, diff: I32)`: prove `table[i] == crc32{,c}b(0, i)` for all 256 entries.
+    func.block_starts.push(to_u32(func.ops.len()));
+    func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+    let i_v = push_inst(func, Op::Param, Flags::NONE, Ty::I32, 0, 0);
+    let diff_v = push_inst(func, Op::Param, Flags::NONE, Ty::I32, 0, 0);
+    let exp = push_target_intrinsic(func, crc_b_id, Ty::I32, &[ctx.k0_32, i_v]);
+    let i64_v = push_unary(func, Op::Zext, Ty::I64, i_v);
+    let off = push_bin(func, Op::Shl, Flags::NONE, Ty::I64, i64_v, ctx.k2_64);
+    let addr = push_bin(func, Op::PtrAdd, Flags::NONE, Ty::PTR, ctx.table_base_adj, off);
+    let act = push_load(func, Ty::I32, addr, 0, ctx.plan.table_attr);
+    let mismatch = push_bin(func, Op::Xor, Flags::NONE, Ty::I32, exp, act);
+    let diff_next = push_bin(func, Op::Or, Flags::NONE, Ty::I32, diff_v, mismatch);
+    let i_next = push_bin(func, Op::Add, Flags::NONE, Ty::I32, i_v, ctx.k1_32);
+    let more_v = push_icmp(func, IntCond::Ult, Ty::I1, i_next, ctx.k256_32);
+    push_br(func, more_v, verify_hdr_blk, &[i_next, diff_next], verify_check_blk, &[diff_next]);
+
+    // 1. `verify_check(diff: I32)`: enter fast path iff `diff == 0`; else fall back to scalar loop.
+    func.block_starts.push(to_u32(func.ops.len()));
+    func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+    let diff_final = push_inst(func, Op::Param, Flags::NONE, Ty::I32, 0, 0);
+    let table_exact = push_icmp(func, IntCond::Eq, Ty::I1, diff_final, ctx.k0_32);
+    push_br(func, table_exact, fast_pre_blk, &[], ctx.orig_hdr_new, &ctx.orig_pre_args);
+
+    // 2. `fast_pre`: compute 32B/8B aligned end pointers and enter the 4x-unrolled `crc32x` loop.
+    func.block_starts.push(to_u32(func.ops.len()));
+    func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+    let p_base = match ctx.plan.iv_kind {
+        CrcIvKind::Pointer { .. } => emit_offset_base(func, ctx.orig_iv_init, ctx.plan.src_off),
+        CrcIvKind::Counted { src_base } => {
+            let sb = at(val_map, to_idx(src_base));
+            let sb_adj = emit_offset_base(func, sb, ctx.plan.src_off);
+            push_bin(func, Op::PtrAdd, Flags::NONE, Ty::PTR, sb_adj, ctx.orig_iv_init)
+        }
+    };
+    let kmask32 = push_iconst(func, Ty::I64, !31u64);
+    let n32 = push_bin(func, Op::And, Flags::NONE, Ty::I64, ctx.rem, kmask32);
+    let end32 = push_bin(func, Op::PtrAdd, Flags::NONE, Ty::PTR, p_base, n32);
+    let kmask8 = push_iconst(func, Ty::I64, !7u64);
+    let n8 = push_bin(func, Op::And, Flags::NONE, Ty::I64, ctx.rem, kmask8);
+    let end8 = push_bin(func, Op::PtrAdd, Flags::NONE, Ty::PTR, p_base, n8);
+    let k32 = push_iconst(func, Ty::I64, 32);
+    let k8 = push_iconst(func, Ty::I64, 8);
+    push_jump(func, fast32_loop_blk, &[p_base, ctx.crc_init]);
+
+    // 3. `fast32_loop(p: PTR, crc: I32)`: 4x-unrolled 32 B/iter unaligned `Load(I64)` + `crc32{,c}x`.
+    func.block_starts.push(to_u32(func.ops.len()));
+    func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+    let p32 = push_inst(func, Op::Param, Flags::NONE, Ty::PTR, 0, 0);
+    let crc32_in = push_inst(func, Op::Param, Flags::NONE, Ty::I32, 0, 0);
+    let w0 = push_load(func, Ty::I64, p32, 0, 0);
+    let w1 = push_load(func, Ty::I64, p32, 8, 0);
+    let w2 = push_load(func, Ty::I64, p32, 16, 0);
+    let w3 = push_load(func, Ty::I64, p32, 24, 0);
+    let c1 = push_target_intrinsic(func, crc_x_id, Ty::I32, &[crc32_in, w0]);
+    let c2 = push_target_intrinsic(func, crc_x_id, Ty::I32, &[c1, w1]);
+    let c3 = push_target_intrinsic(func, crc_x_id, Ty::I32, &[c2, w2]);
+    let c4 = push_target_intrinsic(func, crc_x_id, Ty::I32, &[c3, w3]);
+    let p32_next = push_bin(func, Op::PtrAdd, Flags::NONE, Ty::PTR, p32, k32);
+    let more32 = push_icmp(func, IntCond::Ult, Ty::I1, p32_next, end32);
+    push_br(func, more32, fast32_loop_blk, &[p32_next, c4], fast8_check_blk, &[p32_next, c4]);
+
+    // 4. `fast8_check(p: PTR, crc: I32)`: dispatch remaining 8..=24 B words to `fast8_loop`.
+    func.block_starts.push(to_u32(func.ops.len()));
+    func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+    let p8_chk = push_inst(func, Op::Param, Flags::NONE, Ty::PTR, 0, 0);
+    let crc8_chk = push_inst(func, Op::Param, Flags::NONE, Ty::I32, 0, 0);
+    let has8 = push_icmp(func, IntCond::Ult, Ty::I1, p8_chk, end8);
+    push_br(func, has8, fast8_loop_blk, &[p8_chk, crc8_chk], tail_check_blk, &[p8_chk, crc8_chk]);
+
+    // 5. `fast8_loop(p: PTR, crc: I32)`: 8 B/iter hardware `crc32{,c}x`.
+    func.block_starts.push(to_u32(func.ops.len()));
+    func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+    let p8 = push_inst(func, Op::Param, Flags::NONE, Ty::PTR, 0, 0);
+    let crc8_in = push_inst(func, Op::Param, Flags::NONE, Ty::I32, 0, 0);
+    let w = push_load(func, Ty::I64, p8, 0, 0);
+    let c_next = push_target_intrinsic(func, crc_x_id, Ty::I32, &[crc8_in, w]);
+    let p8_next = push_bin(func, Op::PtrAdd, Flags::NONE, Ty::PTR, p8, k8);
+    let more8 = push_icmp(func, IntCond::Ult, Ty::I1, p8_next, end8);
+    push_br(func, more8, fast8_loop_blk, &[p8_next, c_next], tail_check_blk, &[p8_next, c_next]);
+
+    // 6. `tail_check(p: PTR, crc: I32)`: dispatch `< 8` B tail to original scalar loop (or exit).
+    func.block_starts.push(to_u32(func.ops.len()));
+    func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+    let p_tail = push_inst(func, Op::Param, Flags::NONE, Ty::PTR, 0, 0);
+    let crc_tail = push_inst(func, Op::Param, Flags::NONE, Ty::I32, 0, 0);
+    let iv_after = match ctx.plan.iv_kind {
+        CrcIvKind::Pointer { .. } if ctx.plan.src_off == 0 => p_tail,
+        CrcIvKind::Pointer { .. } => {
+            push_bin(func, Op::PtrAdd, Flags::NONE, Ty::PTR, ctx.orig_iv_init, n8)
+        }
+        CrcIvKind::Counted { .. } => {
+            push_bin(func, Op::Add, Flags::NONE, Ty::I64, ctx.orig_iv_init, n8)
+        }
+    };
+    let tail_args = ordered_crc_header_args(ctx.plan.iv_pos, iv_after, crc_tail);
+    if ctx.orig_exit_new != NONE {
+        let has_tail = match ctx.plan.iv_kind {
+            CrcIvKind::Pointer { .. } if ctx.plan.src_off == 0 => {
+                push_icmp(func, IntCond::Ult, Ty::I1, p_tail, ctx.orig_bound)
+            }
+            _ => push_icmp(func, IntCond::Ult, Ty::I1, n8, ctx.rem),
+        };
+        let mut ex_buf = [0u32; 5];
+        for k in 0..ctx.plan.single_exit_argc {
+            let ea = at(&ctx.plan.single_exit_args, k);
+            let mapped = if ea == ctx.plan.crc_next {
+                crc_tail
+            } else {
+                at(val_map, to_idx(ea))
+            };
+            set_at(&mut ex_buf, k, mapped);
+        }
+        if ctx.plan.direct_crc_escape {
+            set_at(&mut ex_buf, ctx.plan.single_exit_argc, crc_tail);
+        }
+        let ex_len = ctx.plan.single_exit_argc + usize::from(ctx.plan.direct_crc_escape);
+        let ex_slice = ex_buf.get(..ex_len).unwrap_or(&[]);
+        push_br(func, has_tail, ctx.orig_hdr_new, &tail_args, ctx.orig_exit_new, ex_slice);
+    } else {
+        push_jump(func, ctx.orig_hdr_new, &tail_args);
+    }
+}
+
+fn apply_crc32_plan<A: Allocator + Copy>(
+    view: &View<'_>,
+    plan: Crc32Plan,
+    alloc: A,
+) -> Result<Func<A>, SimplifyError> {
+    let single_exit_old = match plan.shape {
+        LoopShape::HeaderBody => NONE,
+        LoopShape::SingleBlock { exit } => exit,
+    };
+
+    let blocks = view.blocks();
+    let len = view.len();
+    let insert_at = to_idx(plan.preheader) + 1;
+    let crc_gate_blk = to_u32(insert_at);
+    let crc_probe_ieee_blk = to_u32(insert_at + 1);
+    let crc_probe_cast_blk = to_u32(insert_at + 2);
+    let verify_ieee_base = to_u32(insert_at + 3);
+    let verify_cast_base = to_u32(insert_at + 10);
+
+    let mut blk_map: Vec<u32, A> = Vec::with_capacity_in(blocks, alloc);
+    for b in 0..blocks {
+        blk_map.push(if b < insert_at {
+            to_u32(b)
+        } else {
+            to_u32(b + CRC32_EXTRA_BLOCKS)
+        });
+    }
+    let orig_hdr_new = at(&blk_map, to_idx(plan.header));
+    let orig_exit_new = if single_exit_old != NONE {
+        at(&blk_map, to_idx(single_exit_old))
+    } else {
+        NONE
+    };
+
+    let mut func = view.to_func_in(alloc);
+    clear_func_code(&mut func);
+
+    let crc32b_id = ensure_intrinsic(&mut func, A64_CRC32B_INTRINSIC, &[Ty::I32, Ty::I32], Ty::I32);
+    let crc32x_id = ensure_intrinsic(&mut func, A64_CRC32X_INTRINSIC, &[Ty::I32, Ty::I64], Ty::I32);
+    let crc32cb_id = ensure_intrinsic(&mut func, A64_CRC32CB_INTRINSIC, &[Ty::I32, Ty::I32], Ty::I32);
+    let crc32cx_id = ensure_intrinsic(&mut func, A64_CRC32CX_INTRINSIC, &[Ty::I32, Ty::I64], Ty::I32);
+
+    let mut val_map = filled(len, NONE, &alloc);
+    let mut fixups: Vec<ValFixup, A> = Vec::new_in(alloc);
+    let mut promoted_crc = NONE;
+
+    for b in 0..blocks {
+        let b_u32 = to_u32(b);
+        func.block_starts.push(to_u32(func.ops.len()));
+        func.block_kinds.push(at(view.block_kinds, b));
+        let range = view.block(Block(b_u32));
+
+        if b_u32 == single_exit_old && plan.direct_crc_escape {
+            let p_range = view.params(Block(b_u32));
+            for inst in p_range.start..p_range.end {
+                let mapped = copy_remapped(view, inst, &val_map, Some(&blk_map), &mut func, &mut fixups);
+                set_at(&mut val_map, inst, mapped);
+            }
+            promoted_crc = push_inst(&mut func, Op::Param, Flags::NONE, Ty::I32, 0, 0);
+            set_at(&mut val_map, to_idx(plan.crc_next), promoted_crc);
+            for inst in p_range.end..range.end {
+                let mapped = copy_remapped(view, inst, &val_map, Some(&blk_map), &mut func, &mut fixups);
+                set_at(&mut val_map, inst, mapped);
+            }
+            continue;
+        }
+
+        if b_u32 == plan.header && plan.direct_crc_escape {
+            let term = range.end.saturating_sub(1);
+            for inst in range.start..term {
+                let mapped = copy_remapped(view, inst, &val_map, Some(&blk_map), &mut func, &mut fixups);
+                set_at(&mut val_map, inst, mapped);
+            }
+            // Rewrite `SingleBlock` header terminator to pass `crc_next` to the promoted exit param.
+            let raw_cond = at(view.extra, to_idx(at(view.data, term)));
+            let iv_next_m = at(&val_map, to_idx(plan.iv_next));
+            let crc_next_m = at(&val_map, to_idx(plan.crc_next));
+            let stay_args = ordered_crc_header_args(plan.iv_pos, iv_next_m, crc_next_m);
+            let br_idx = to_u32(func.extra.len());
+            push_extra_val(&mut func, &val_map, raw_cond, &mut fixups);
+            let emit_stay = |func: &mut Func<A>| {
+                func.extra.push(orig_hdr_new);
+                func.extra.push(2);
+                func.extra.push(at(&stay_args, 0));
+                func.extra.push(at(&stay_args, 1));
+            };
+            let emit_exit = |func: &mut Func<A>, fixups: &mut Vec<ValFixup, A>| {
+                func.extra.push(orig_exit_new);
+                func.extra.push(to_u32(plan.single_exit_argc + 1));
+                for k in 0..plan.single_exit_argc {
+                    push_extra_val(func, &val_map, at(&plan.single_exit_args, k), fixups);
+                }
+                func.extra.push(crc_next_m);
+            };
+            if plan.stay_on_true {
+                emit_stay(&mut func);
+                emit_exit(&mut func, &mut fixups);
+            } else {
+                emit_exit(&mut func, &mut fixups);
+                emit_stay(&mut func);
+            }
+            let mapped_term = push_inst(&mut func, Op::Br, Flags::NONE, Ty::NONE, br_idx, 0);
+            set_at(&mut val_map, term, mapped_term);
+            set_at(&mut val_map, to_idx(plan.crc_next), promoted_crc);
+            continue;
+        }
+
+        if b_u32 != plan.preheader {
+            for inst in range {
+                let mapped = copy_remapped(view, inst, &val_map, Some(&blk_map), &mut func, &mut fixups);
+                set_at(&mut val_map, inst, mapped);
+            }
+            continue;
+        }
+
+        // Copy non-terminator instructions of `preheader` and redirect its edge into `crc_gate_blk`.
+        let term = range.end.saturating_sub(1);
+        for inst in range.start..term {
+            let mapped = copy_remapped(view, inst, &val_map, Some(&blk_map), &mut func, &mut fixups);
+            set_at(&mut val_map, inst, mapped);
+        }
+        let pre_term_mapped = match plan.pre_term {
+            CrcPreTerm::Jump => push_jump(&mut func, crc_gate_blk, &[]),
+            CrcPreTerm::Br { cond, hdr_on_true, other_blk, other_args_at, other_argc } => {
+                let other_new = remap_blk(Some(&blk_map), other_blk);
+                let br_idx = to_u32(func.extra.len());
+                push_extra_val(&mut func, &val_map, cond, &mut fixups);
+                if hdr_on_true {
+                    func.extra.push(crc_gate_blk);
+                    func.extra.push(0);
+                    func.extra.push(other_new);
+                    func.extra.push(to_u32(other_argc));
+                    for k in 0..other_argc {
+                        push_extra_val(&mut func, &val_map, at(view.extra, other_args_at + k), &mut fixups);
+                    }
+                } else {
+                    func.extra.push(other_new);
+                    func.extra.push(to_u32(other_argc));
+                    for k in 0..other_argc {
+                        push_extra_val(&mut func, &val_map, at(view.extra, other_args_at + k), &mut fixups);
+                    }
+                    func.extra.push(crc_gate_blk);
+                    func.extra.push(0);
+                }
+                push_inst(&mut func, Op::Br, Flags::NONE, Ty::NONE, br_idx, 0)
+            }
+        };
+        set_at(&mut val_map, term, pre_term_mapped);
+
+        let orig_iv_init = at(&val_map, to_idx(plan.iv_init));
+        let orig_bound = at(&val_map, to_idx(plan.bound));
+        let crc_init = at(&val_map, to_idx(plan.crc_init));
+        let table_base = at(&val_map, to_idx(plan.table_base));
+        let orig_pre_args = ordered_crc_header_args(plan.iv_pos, orig_iv_init, crc_init);
+
+        // --- `crc_gate_blk`: require `rem >= 64` and non-wrapping range ---
+        func.block_starts.push(to_u32(func.ops.len()));
+        func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+        let (has_rem, rem) = match plan.iv_kind {
+            CrcIvKind::Counted { .. } => {
+                let hr = push_icmp(&mut func, IntCond::Ult, Ty::I1, orig_iv_init, orig_bound);
+                let r = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, orig_bound, orig_iv_init);
+                (hr, r)
+            }
+            CrcIvKind::Pointer { len_val: Some(len_v) } => {
+                let len_m = at(&val_map, to_idx(len_v));
+                let k0_64 = push_iconst(&mut func, Ty::I64, 0);
+                let nonneg = push_icmp(&mut func, IntCond::Sge, Ty::I1, len_m, k0_64);
+                let in_order = push_icmp(&mut func, IntCond::Ult, Ty::I1, orig_iv_init, orig_bound);
+                let hr = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, nonneg, in_order);
+                (hr, len_m)
+            }
+            CrcIvKind::Pointer { len_val: None } => {
+                let p0_addr = push_unary(&mut func, Op::PtrAddr, Ty::I64, orig_iv_init);
+                let end_addr = push_unary(&mut func, Op::PtrAddr, Ty::I64, orig_bound);
+                let hr = push_icmp(&mut func, IntCond::Ult, Ty::I1, p0_addr, end_addr);
+                let r = push_bin(&mut func, Op::Sub, Flags::NONE, Ty::I64, end_addr, p0_addr);
+                (hr, r)
+            }
+        };
+        let k64 = push_iconst(&mut func, Ty::I64, CRC32_MIN_BYTES);
+        let enough = push_icmp(&mut func, IntCond::Uge, Ty::I1, rem, k64);
+        let go_fast = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, has_rem, enough);
+        push_br(&mut func, go_fast, crc_probe_ieee_blk, &[], orig_hdr_new, &orig_pre_args);
+
+        // --- `crc_probe_ieee_blk`: quick O(1) probe on `table[128] == 0xEDB8_8320` ---
+        func.block_starts.push(to_u32(func.ops.len()));
+        func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+        let table_base_adj = emit_offset_base(&mut func, table_base, plan.table_off);
+        let t128 = push_load(&mut func, Ty::I32, table_base_adj, 512, plan.table_attr);
+        let k_ieee = push_iconst(&mut func, Ty::I32, CRC32_IEEE_POLY);
+        let is_ieee = push_icmp(&mut func, IntCond::Eq, Ty::I1, t128, k_ieee);
+        let k0_32 = push_iconst(&mut func, Ty::I32, 0);
+        let k1_32 = push_iconst(&mut func, Ty::I32, 1);
+        let k256_32 = push_iconst(&mut func, Ty::I32, 256);
+        let k2_64 = push_iconst(&mut func, Ty::I64, 2);
+        push_br(
+            &mut func,
+            is_ieee,
+            verify_ieee_base,
+            &[k0_32, k0_32],
+            crc_probe_cast_blk,
+            &[],
+        );
+
+        // --- `crc_probe_cast_blk`: quick O(1) probe on `table[128] == 0x82F6_3B78` ---
+        func.block_starts.push(to_u32(func.ops.len()));
+        func.block_kinds.push(block_kind_byte(BlockKind::Normal));
+        let k_cast = push_iconst(&mut func, Ty::I32, CRC32_CASTAGNOLI_POLY);
+        let is_cast = push_icmp(&mut func, IntCond::Eq, Ty::I1, t128, k_cast);
+        push_br(
+            &mut func,
+            is_cast,
+            verify_cast_base,
+            &[k0_32, k0_32],
+            orig_hdr_new,
+            &orig_pre_args,
+        );
+
+        let ctx = CrcEmitCtx {
+            plan,
+            orig_hdr_new,
+            orig_exit_new,
+            orig_iv_init,
+            orig_bound,
+            crc_init,
+            rem,
+            table_base_adj,
+            k0_32,
+            k1_32,
+            k256_32,
+            k2_64,
+            orig_pre_args,
+        };
+        emit_verify_and_fast_crc_path(&mut func, &val_map, ctx, verify_ieee_base, crc32b_id, crc32x_id);
+        emit_verify_and_fast_crc_path(&mut func, &val_map, ctx, verify_cast_base, crc32cb_id, crc32cx_id);
+    }
+
+    if plan.direct_crc_escape && promoted_crc != NONE {
+        set_at(&mut val_map, to_idx(plan.crc_next), promoted_crc);
+    }
+    apply_val_fixups(&mut func, &val_map, &fixups);
+    verify(func.view()).map_err(SimplifyError::Verify)?;
+    Ok(func)
+}
+
+/// Lowers reflected 256-entry `u32` lookup-table CRC-32 byte loops into a 100% sound runtime
+/// 256-entry exact proof (`blaze.a64.crc32{,c}b`) + 4x-unrolled 32 B/iter & 8 B/iter hardware
+/// `FEAT_CRC32` (`blaze.a64.crc32{,c}x`) fast path, keeping the original scalar loop for `< 8` B
+/// tails and any non-matching lookup table.
+pub fn lower_crc32_table_loops<A: Allocator + Copy>(
+    view: View<'_>,
+    alloc: A,
+) -> Result<SimdIdiomOutput<A>, SimplifyError> {
+    if view.blocks() < 3 || view.head.ptr_bits != 64 {
+        return Ok(SimdIdiomOutput {
+            func: view.to_func_in(alloc),
+            stats: SimdIdiomStats::default(),
+        });
+    }
+
+    let mut current: Option<Func<A>> = None;
+    let mut crc32_loops = 0u32;
+
+    for _ in 0..MAX_LOOPS_PER_FUNC {
+        let cur_view = match &current {
+            Some(f) => f.view(),
+            None => view,
+        };
+        let cfg = build_cfg_info(&cur_view, &alloc);
+        let Some(plan) = find_crc32_table_loop(&cur_view, &cfg) else {
+            break;
+        };
+        let next = apply_crc32_plan(&cur_view, plan, alloc)?;
+        current = Some(next);
+        crc32_loops = crc32_loops.saturating_add(1);
+    }
+
+    let func = match current {
+        Some(f) => f,
+        None => view.to_func_in(alloc),
+    };
+    Ok(SimdIdiomOutput {
+        func,
+        stats: SimdIdiomStats {
+            tbl_loops: 0,
+            dotprod_loops: 0,
+            sort_swaps_canonicalized: 0,
+            crc32_loops,
+        },
+    })
+}
+
+// ============================================================================
 // Top-Level Entrypoint
 // ============================================================================
 
 /// Runs all enabled SIMD data-parallel idiom lowerings (`lower_sorting_networks`,
-/// `lower_byte_lut_loops`, `lower_dotprod_loops`) in deterministic order and returns the verified
-/// transformed function plus telemetry.
+/// `lower_byte_lut_loops`, `lower_dotprod_loops`, `lower_crc32_table_loops`) in deterministic
+/// order and returns the verified transformed function plus telemetry.
 pub fn lower_simd_idioms<A: Allocator + Copy>(
     view: View<'_>,
     opts: SimdIdiomOpts,
@@ -3304,6 +4539,18 @@ pub fn lower_simd_idioms<A: Allocator + Copy>(
         let out = lower_dotprod_loops(cur_view, alloc)?;
         if out.stats.dotprod_loops > 0 {
             stats.dotprod_loops = out.stats.dotprod_loops;
+            current = Some(out.func);
+        }
+    }
+
+    if opts.enable_crc32 {
+        let cur_view = match &current {
+            Some(f) => f.view(),
+            None => view,
+        };
+        let out = lower_crc32_table_loops(cur_view, alloc)?;
+        if out.stats.crc32_loops > 0 {
+            stats.crc32_loops = out.stats.crc32_loops;
             current = Some(out.func);
         }
     }
@@ -4000,5 +5247,315 @@ mod tests {
             v_aliased.block(Block(0)).filter(|&i| v_aliased.op(i) == Op::Umin).count(),
             1
         );
+    }
+
+    fn make_reflected_crc32_table(poly: u32) -> [u32; 256] {
+        let mut table = [0u32; 256];
+        for i in 0..256usize {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                if (c & 1) != 0 {
+                    c = (c >> 1) ^ poly;
+                } else {
+                    c >>= 1;
+                }
+            }
+            table[i] = c;
+        }
+        table
+    }
+
+    fn ref_crc32_with_table(bytes: &[u8], table: &[u32; 256]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for &b in bytes {
+            let idx = ((crc as u8) ^ b) as usize;
+            crc = table[idx] ^ (crc >> 8);
+        }
+        !crc
+    }
+
+    struct CrcCallee<'a> {
+        callee: View<'a>,
+        callee_ref: crate::func::RefId,
+    }
+
+    impl eval::Bodies for CrcCallee<'_> {
+        fn callee(
+            &self,
+            from: eval::BodyId,
+            reference: crate::func::RefId,
+        ) -> Option<(eval::BodyId, View<'_>)> {
+            if from == eval::BodyId([1; 32]) && reference == self.callee_ref {
+                Some((eval::BodyId([2; 32]), self.callee))
+            } else {
+                None
+            }
+        }
+    }
+
+    fn eval_crc32_func(callee: View<'_>, bytes: &[u8], align_off: usize, table: &[u32; 256]) -> u32 {
+        let mut padded: Vec<u8, TestHeap> = Vec::with_capacity_in(align_off + bytes.len().max(1), TestHeap);
+        for _ in 0..align_off {
+            padded.push(0xAA);
+        }
+        padded.extend_from_slice(bytes);
+        if padded.is_empty() {
+            padded.push(0);
+        }
+        let mut table_bytes = [0u8; 1024];
+        for (i, &w) in table.iter().enumerate() {
+            let le = w.to_le_bytes();
+            table_bytes[i * 4..i * 4 + 4].copy_from_slice(&le);
+        }
+
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I32)]);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let data_ref = b.data(&padded, 3, &[]);
+        let tbl_ref = b.data(&table_bytes, 2, &[]);
+        let base_ptr = b.data_addr(data_ref);
+        let off_v = b.iconst(Ty::I64, align_off as u128);
+        let slice_ptr = b.ptr_add(Flags::NONE, base_ptr, off_v);
+        let len_v = b.iconst(Ty::I64, bytes.len() as u128);
+        let tbl_ptr = b.data_addr(tbl_ref);
+        let callee_sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::PTR)],
+            &[Param::of(Ty::I32)],
+        );
+        let callee_ref = b.reference(crate::func::RefKind::Func, 0);
+        let res = b.call(Flags::NONE, callee_ref, callee_sig, &[slice_ptr, len_v, tbl_ptr]);
+        b.ret(&[res]);
+        let driver = b.finish_checked().unwrap();
+
+        let bodies = CrcCallee { callee, callee_ref };
+        let outcome = eval::run_calls_in(
+            driver.view(),
+            eval::BodyId([1; 32]),
+            &[],
+            100_000,
+            &bodies,
+            TestHeap,
+        )
+        .unwrap();
+        match outcome {
+            Outcome::Returned(vals) => match vals.as_slice() {
+                [Val::Int(v)] => (*v & 0xffff_ffff) as u32,
+                other => panic!("unexpected return values: {other:?}"),
+            },
+            other => panic!("unexpected eval outcome: {other:?}"),
+        }
+    }
+
+    /// Builds exact `w9b` rotated `SingleBlock` pointer-IV CRC-32 table loop with `PreTerm::Br`:
+    /// `fn(bytes_ptr: ptr, len: i64, table: ptr) -> i32`.
+    fn build_crc32_single_block_br(direct_escape: bool) -> Func<TestHeap> {
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::PTR)],
+            &[Param::of(Ty::I32)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let hdr = b.create_block(BlockKind::Normal);
+        let after_loop = if direct_escape { Some(b.create_block(BlockKind::Normal)) } else { None };
+        let exit = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let p_init = b.param(Ty::PTR);
+        let len = b.param(Ty::I64);
+        let table = b.param(Ty::PTR);
+        let end_ptr = b.ptr_add(Flags::NONE, p_init, len);
+        let init_crc = b.iconst(Ty::I32, 0xffff_ffff);
+        let empty = b.icmp(IntCond::Eq, p_init, end_ptr);
+        let one = b.iconst(Ty::I64, 1);
+        let k2 = b.iconst(Ty::I64, 2);
+        let k8 = b.iconst(Ty::I32, 8);
+        b.br(Flags::NONE, empty, (exit, &[init_crc]), (hdr, &[p_init, init_crc]));
+
+        b.begin(hdr);
+        let p = b.param(Ty::PTR);
+        let crc = b.param(Ty::I32);
+        let byte = b.load(Ty::I8, Flags::NONE, p, 0, MemAttrs::default());
+        let p_next = b.ptr_add(Flags::NONE, p, one);
+        let crc_lo = b.convert(Op::Trunc, Flags::NONE, Ty::I8, crc);
+        let xored = b.binary(Op::Xor, Flags::NONE, crc_lo, byte);
+        let idx = b.convert(Op::Zext, Flags::NONE, Ty::I64, xored);
+        let off = b.binary(Op::Shl, Flags::NONE, idx, k2);
+        let t_addr = b.ptr_add(Flags::NONE, table, off);
+        let t_val = b.load(Ty::I32, Flags::NONE, t_addr, 0, MemAttrs::aligned(2));
+        let crc_shr = b.binary(Op::Lshr, Flags::NONE, crc, k8);
+        let crc_next = b.binary(Op::Xor, Flags::NONE, t_val, crc_shr);
+        let keep = b.icmp(IntCond::Ne, p_next, end_ptr);
+        if let Some(after) = after_loop {
+            b.br(Flags::NONE, keep, (hdr, &[p_next, crc_next]), (after, &[]));
+            b.begin(after);
+            b.jump((exit, &[crc_next]));
+        } else {
+            b.br(Flags::NONE, keep, (hdr, &[p_next, crc_next]), (exit, &[crc_next]));
+        }
+
+        b.begin(exit);
+        let final_crc = b.param(Ty::I32);
+        let inv = b.unary(Op::Not, Flags::NONE, final_crc);
+        b.ret(&[inv]);
+        b.finish_checked().unwrap()
+    }
+
+    /// Builds `HeaderBody` (`PreTerm::Jump`, counted `i in 0..n`) CRC-32 table loop using
+    /// `And(Xor(Zext(crc), Zext(b)), 0xff)` + `Mul(idx, 4)` index form.
+    fn build_crc32_header_body_counted() -> Func<TestHeap> {
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::PTR)],
+            &[Param::of(Ty::I32)],
+        );
+        b.set_signature(sig);
+        let [entry, hdr, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let bytes = b.param(Ty::PTR);
+        let n = b.param(Ty::I64);
+        let table = b.param(Ty::PTR);
+        let z0 = b.iconst(Ty::I64, 0);
+        let init_crc = b.iconst(Ty::I32, 0xffff_ffff);
+        b.jump((hdr, &[z0, init_crc]));
+
+        b.begin(hdr);
+        let i = b.param(Ty::I64);
+        let crc = b.param(Ty::I32);
+        let keep = b.icmp(IntCond::Ult, i, n);
+        b.br(Flags::NONE, keep, (body, &[]), (exit, &[]));
+
+        b.begin(body);
+        let bp = b.ptr_add(Flags::NONE, bytes, i);
+        let byte = b.load(Ty::I8, Flags::NONE, bp, 0, MemAttrs::default());
+        let crc64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, crc);
+        let byte64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, byte);
+        let xored = b.binary(Op::Xor, Flags::NONE, crc64, byte64);
+        let kff = b.iconst(Ty::I64, 0xff);
+        let idx = b.binary(Op::And, Flags::NONE, xored, kff);
+        let k4 = b.iconst(Ty::I64, 4);
+        let off = b.binary(Op::Mul, Flags::NONE, idx, k4);
+        let t_addr = b.ptr_add(Flags::NONE, table, off);
+        let t_val = b.load(Ty::I32, Flags::NONE, t_addr, 0, MemAttrs::aligned(2));
+        let k8 = b.iconst(Ty::I32, 8);
+        let crc_shr = b.binary(Op::Lshr, Flags::NONE, crc, k8);
+        let crc_next = b.binary(Op::Xor, Flags::NONE, crc_shr, t_val);
+        let one = b.iconst(Ty::I64, 1);
+        let i_next = b.binary(Op::Add, Flags::NONE, i, one);
+        b.jump((hdr, &[i_next, crc_next]));
+
+        b.begin(exit);
+        let inv = b.unary(Op::Not, Flags::NONE, crc);
+        b.ret(&[inv]);
+        b.finish_checked().unwrap()
+    }
+
+    #[test]
+    fn lower_crc32_table_ieee_single_block_and_header_body() {
+        let ieee_table = make_reflected_crc32_table(0xEDB8_8320);
+        let mut payload = [0u8; 131];
+        for (i, slot) in payload.iter_mut().enumerate() {
+            *slot = ((i * 73 + 19) ^ (i >> 1)) as u8;
+        }
+        let lengths = [0usize, 1, 7, 8, 63, 64, 65, 95, 96, 97, 131];
+        let offsets = [0usize, 1, 3, 7];
+
+        for orig in [
+            build_crc32_single_block_br(false),
+            build_crc32_single_block_br(true),
+            build_crc32_header_body_counted(),
+        ] {
+            let out = lower_simd_idioms(orig.view(), SimdIdiomOpts::apple_silicon(), TestHeap).unwrap();
+            let v = out.func.view();
+            verify(v).unwrap();
+            assert_eq!(out.stats.crc32_loops, 1);
+            assert!(has_intrinsic(&v, A64_CRC32B_INTRINSIC));
+            assert!(has_intrinsic(&v, A64_CRC32X_INTRINSIC));
+            assert_eq!(count_intrinsic_calls(&v, A64_CRC32B_INTRINSIC), 1);
+            assert_eq!(count_intrinsic_calls(&v, A64_CRC32X_INTRINSIC), 5);
+
+            // Idempotence: a second pass must not re-transform the lowered function.
+            let out2 = lower_simd_idioms(v, SimdIdiomOpts::apple_silicon(), TestHeap).unwrap();
+            assert_eq!(out2.stats.crc32_loops, 0);
+
+            for &len in &lengths {
+                let slice = &payload[..len];
+                let expected = ref_crc32_with_table(slice, &ieee_table);
+                for &off in &offsets {
+                    let got_orig = eval_crc32_func(orig.view(), slice, off, &ieee_table);
+                    let got_opt = eval_crc32_func(v, slice, off, &ieee_table);
+                    assert_eq!(got_orig, expected, "scalar mismatch len={len} off={off}");
+                    assert_eq!(got_opt, expected, "fast-path mismatch len={len} off={off}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_crc32_table_castagnoli_crc32c() {
+        let cast_table = make_reflected_crc32_table(0x82F6_3B78);
+        let mut payload = [0u8; 100];
+        for (i, slot) in payload.iter_mut().enumerate() {
+            *slot = ((i * 131 + 7) & 0xff) as u8;
+        }
+        let orig = build_crc32_single_block_br(false);
+        let out = lower_simd_idioms(orig.view(), SimdIdiomOpts::apple_silicon(), TestHeap).unwrap();
+        let v = out.func.view();
+        verify(v).unwrap();
+        assert_eq!(out.stats.crc32_loops, 1);
+        assert!(has_intrinsic(&v, A64_CRC32CB_INTRINSIC));
+        assert!(has_intrinsic(&v, A64_CRC32CX_INTRINSIC));
+        assert_eq!(count_intrinsic_calls(&v, A64_CRC32CB_INTRINSIC), 1);
+        assert_eq!(count_intrinsic_calls(&v, A64_CRC32CX_INTRINSIC), 5);
+
+        for &len in &[0usize, 64, 100] {
+            let slice = &payload[..len];
+            let expected = ref_crc32_with_table(slice, &cast_table);
+            let got_orig = eval_crc32_func(orig.view(), slice, 1, &cast_table);
+            let got_opt = eval_crc32_func(v, slice, 1, &cast_table);
+            assert_eq!(got_orig, expected);
+            assert_eq!(got_opt, expected);
+        }
+    }
+
+    #[test]
+    fn lower_crc32_table_adversarial_mutated_entry_falls_back_soundly() {
+        let ieee_table = make_reflected_crc32_table(0xEDB8_8320);
+        let mut tampered = ieee_table;
+        // Keep `table[128] == 0xEDB8_8320` intact so the O(1) probe succeeds and ONLY the
+        // exhaustive 256-entry verifier catches the single-bit mutation in `table[255]`.
+        tampered[255] ^= 1;
+
+        // First byte `0x00` with initial `crc = 0xffff_ffff` hits `idx = 0xff ^ 0x00 = 255` immediately!
+        let mut payload = [0u8; 128];
+        for (i, slot) in payload.iter_mut().enumerate() {
+            *slot = (i * 17) as u8;
+        }
+        let orig = build_crc32_single_block_br(false);
+        let out = lower_simd_idioms(orig.view(), SimdIdiomOpts::apple_silicon(), TestHeap).unwrap();
+        let v = out.func.view();
+        verify(v).unwrap();
+        assert_eq!(out.stats.crc32_loops, 1);
+
+        let expected_tampered = ref_crc32_with_table(&payload, &tampered);
+        let expected_ieee = ref_crc32_with_table(&payload, &ieee_table);
+        assert_ne!(
+            expected_tampered, expected_ieee,
+            "test input must observe tampered table[255] so fallback is non-vacuously proven"
+        );
+
+        let got_orig = eval_crc32_func(orig.view(), &payload, 0, &tampered);
+        let got_opt = eval_crc32_func(v, &payload, 0, &tampered);
+        assert_eq!(got_orig, expected_tampered);
+        assert_eq!(got_opt, expected_tampered);
     }
 }

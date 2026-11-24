@@ -1715,3 +1715,77 @@ fn a_panicking_make_fails_alone_and_the_next_one_makes() {
     assert_eq!(calls.get(), 1, "the panicked make reached the maker");
     std::println!("code worker: a panicked make failed alone");
 }
+
+#[test]
+fn publish_precomputed_emits_bytes_declare_data_publish_and_answers_later_needs_without_resolving() {
+    let frame = bstd::mem::Frame::with_reserve(1 << 18, bstd::mem::Tag::Other).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let mut needs = Needs::new(alloc);
+    let mut out = wire_out(alloc);
+
+    let fn_sym = Symbol([0x11; 32]);
+    let callee_sym = Symbol([0x22; 32]);
+    let static_sym = Symbol([0x33; 32]);
+    let fn_bytes = b"fn-code-record";
+    let datum_bytes = b"static-datum";
+    let fn_rec = RecordId(blaze_blake3::hash(fn_bytes));
+    let datum_rec = RecordId(blaze_blake3::hash(datum_bytes));
+    let datum = Datum { symbol: static_sym, record: datum_rec };
+
+    assert!(!needs.is_settled(&fn_sym));
+    let first = needs
+        .publish_precomputed(
+            fn_sym,
+            fn_rec,
+            &[callee_sym],
+            &[datum],
+            &[static_sym],
+            &[],
+            &[(fn_rec, fn_bytes), (datum_rec, datum_bytes)],
+            &mut out,
+        )
+        .expect("precomputed publish");
+    assert!(first);
+    assert!(needs.is_settled(&fn_sym));
+
+    // Second precomputed publish of the same symbol is an idempotent no-op.
+    let len_after_first = out.len();
+    let second = needs
+        .publish_precomputed(fn_sym, fn_rec, &[callee_sym], &[datum], &[static_sym], &[], &[], &mut out)
+        .expect("idempotent second publish");
+    assert!(!second);
+    assert_eq!(out.len(), len_after_first);
+
+    // Wire order: Bytes before Declare, Declare before Data, Data before Publish.
+    let mut seen: AVec<'_, &str> = AVec::new_in(alloc);
+    let mut rest = out.as_slice();
+    while let Some((item, len)) = split(rest).expect("whole frame") {
+        let (_, down) = Down::decode(item).expect("valid down frame");
+        let kind = match down {
+            Down::Bytes { .. } => "Bytes",
+            Down::Declare { .. } => "Declare",
+            Down::Data { .. } => "Data",
+            Down::Publish { .. } => "Publish",
+            _ => "Other",
+        };
+        seen.push(kind);
+        rest = &rest[len..];
+    }
+    assert_eq!(seen.as_slice(), ["Bytes", "Bytes", "Declare", "Data", "Publish"]);
+
+    // Subsequent `Up::Need` for the pre-published symbol answers directly without calling `Resolve`.
+    struct NeverResolve;
+    impl Resolve for NeverResolve {
+        fn resolve(&mut self, _symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
+            panic!("pre-published symbol must not hit the resolver");
+        }
+        fn publication(&mut self, _symbol: &Symbol, _values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {
+            panic!("pre-published symbol must not hit the resolver");
+        }
+    }
+    let mut reply = wire_out(alloc);
+    needs.serve(&mut NeverResolve, &need(Needed::Symbol(fn_sym)), &mut reply).expect("answered from cache");
+    let (item, _) = split(&reply).expect("whole frame").expect("one reply");
+    assert!(matches!(Down::decode(item).expect("valid"), (_, Down::Publish { record, .. }) if record == fn_rec));
+}
