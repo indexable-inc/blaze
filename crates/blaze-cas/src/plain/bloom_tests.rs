@@ -64,6 +64,9 @@ fn read_bytes(d: &mut Driven<Sim, &Frame>, k: &Key) -> Option<OwnedVec<u8, Kept>
 fn bloom_skips_non_matching_segments_and_root_hint_maps_two_without_bloom() {
     let root = test_root();
     let mut w = Driven::with(Sim::new(41, Faults::default()), "/sim".as_ref(), cfg(0, 1, &root), &root).expect("writer opens");
+    // Deliberately build 120 unmerged segments so this test exercises Bloom skipping and
+    // root-generation locality across a high-segment-count store.
+    w.disable_auto_merge();
     let mut next_id = 1u32;
     // 118 larger older segments (20..40 records each).
     for seg in 0..118u32 {
@@ -140,6 +143,8 @@ fn bloom_skips_non_matching_segments_and_root_hint_maps_two_without_bloom() {
 fn bloom_backfills_existing_store_and_survives_compaction() {
     let root = test_root();
     let mut w = Driven::with(Sim::new(42, Faults::default()), "/sim".as_ref(), cfg(0, 1, &root), &root).expect("writer opens");
+    // Deliberately keep all 40+ segments separate to verify Bloom backfill across many segments.
+    w.disable_auto_merge();
     let mut all_keys = OwnedVec::new_in(BLOOM_ALLOC);
     for seg in 0..40u32 {
         for j in 0..10u32 {
@@ -159,6 +164,7 @@ fn bloom_backfills_existing_store_and_survives_compaction() {
 
     // One commit on an eager writer backfills `bloom` for every live segment.
     let mut w2 = Driven::with(sim, "/sim".as_ref(), cfg(1, 1, &root), &root).expect("writer2 opens");
+    w2.disable_auto_merge();
     w2.put(key(9999), Namespace::LOCAL, TAG, &value(9999)).unwrap();
     all_keys.push(9999);
     w2.commit_with(&[]).unwrap();
