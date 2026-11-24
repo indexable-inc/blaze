@@ -207,6 +207,118 @@ pub fn control() -> Exec {
 }
 ";
 
+const CFG_IF: &str = "#![no_std]
+#[macro_export]
+macro_rules! cfg_if {
+    (
+        if #[cfg( $($i_meta:tt)+ )] { $( $i_tokens:tt )* }
+        $(
+            else if #[cfg( $($ei_meta:tt)+ )] { $( $ei_tokens:tt )* }
+        )*
+        $(
+            else { $( $e_tokens:tt )* }
+        )?
+    ) => {
+        $crate::cfg_if! {
+            @__items () ;
+            (( $($i_meta)+ ) ( $( $i_tokens )* )),
+            $(
+                (( $($ei_meta)+ ) ( $( $ei_tokens )* )),
+            )*
+            $(
+                (() ( $( $e_tokens )* )),
+            )?
+        }
+    };
+    (@__items ( $( ($($_:tt)*) , )* ) ; ) => {};
+    (
+        @__items ( $( ($($no:tt)+) , )* ) ;
+        (( $( $($yes:tt)+ )? ) ( $( $tokens:tt )* )),
+        $( $rest:tt , )*
+    ) => {
+        #[cfg(all(
+            $( $($yes)+ , )?
+            not(any( $( $($no)+ ),* ))
+        ))]
+        $crate::cfg_if! { @__temp_group $( $tokens )* }
+
+        $crate::cfg_if! {
+            @__items ( $( ($($no)+) , )* $( ($($yes)+) , )? ) ;
+            $( $rest , )*
+        }
+    };
+    (@__temp_group $( $tokens:tt )* ) => {
+        $( $tokens )*
+    };
+}
+#[macro_export]
+macro_rules! check_true {
+    ($cond:expr) => {
+        if !$cond { loop {} }
+    };
+}
+";
+
+/// nybbles 0.4.8's `Nibbles::as_array` (`cfg_if!` expanding to `#[cfg(all(..))] $crate::cfg_if!
+/// { @__temp_group const { assert!(..); } .. }`), plus the `else` branch (a false `#[cfg]` call
+/// before the live one), a hand-written attributed statement call, and an `extern crate` inside
+/// the `cfg_if!`-expanded block whose macro call must resolve in that exact block module.
+const NYBBLES: &str = "#![no_std]
+use cfg_if::{cfg_if, check_true};
+pub enum Opt<T> { Some(T), None }
+pub struct AsArray([u64; 5]);
+pub struct Nibbles([u64; 5]);
+impl Nibbles {
+    pub const fn as_array(&self) -> Opt<&AsArray> {
+        cfg_if! {
+            if #[cfg(all())] {
+                const {
+                    check_true!(true);
+                    check_true!(1 == 1);
+                }
+                Opt::None
+            } else {
+                Opt::None
+            }
+        }
+    }
+    pub const fn as_array_else(&self) -> Opt<&AsArray> {
+        cfg_if! {
+            if #[cfg(any())] {
+                Opt::None
+            } else {
+                const {
+                    check_true!(true);
+                }
+                Opt::None
+            }
+        }
+    }
+}
+pub fn attr_on_stmt_call() {
+    #[cfg(all())]
+    cfg_if! {
+        if #[cfg(all())] {
+            {
+                struct Local;
+                check_true!(true);
+                let _ = Local;
+            }
+        }
+    }
+}
+pub fn block_extern_crate_in_cfg_if() {
+    cfg_if! {
+        if #[cfg(all())] {
+            {
+                extern crate cfg_if as __c;
+                __c::check_true!(true);
+            }
+        }
+    }
+}
+";
+
 const APP_AT: usize = 0;
 const DEP_AT: usize = 1;
 const CORE_AT: usize = 2;
@@ -221,6 +333,8 @@ impl SourceTexts<'static> for Texts {
             (DEP_AT, "/dep/lib.rs") => Some(DEP),
             (APP_AT, "/tempo/lib.rs") => Some(TEMPO),
             (DEP_AT, "/evm2/lib.rs") => Some(EVM2),
+            (APP_AT, "/nybbles/lib.rs") => Some(NYBBLES),
+            (DEP_AT, "/cfg_if/lib.rs") => Some(CFG_IF),
             (CORE_AT, "/core/lib.rs") => Some(CORE),
             _ => None,
         }
@@ -443,4 +557,37 @@ fn a_const_an_expansion_declares_in_its_block_names_a_const_argument() {
     assert!(!all.iter().any(|r| r.contains("the names scope of the block containing the path")), "no block scope is a gap: {all:#?}");
     assert_eq!(saying.iter().filter(|s| !s.is_empty()).count(), 1, "only the twin says anything: {all:#?}");
     assert!(all.iter().any(|r| r.contains("SPEC_ID")), "the twin names `SPEC_ID`: {all:#?}");
+}
+
+/// nybbles 0.4.8's `Nibbles::as_array`: `cfg_if!` expands via `#[cfg(all(..))] $crate::cfg_if!
+/// { @__temp_group const { assert!(..); } .. }`. In body lowering the `MACRO_CALL` starts at
+/// `$crate`, after `#[cfg(..)]`, while `nested::scan` previously put `#[cfg(..)]` inside
+/// `NestedCall::path`, so `statement_call` missed the attributed call and left the expanded
+/// `const { .. }` block unfiled (`UNFILED_BLOCK`). Every body here must check cleanly with zero
+/// refusals, and `block_extern_crate_in_cfg_if` proves `__c::check_true!` resolves in the exact
+/// expansion block module that declares `extern crate cfg_if as __c;`.
+#[test]
+fn an_attributed_macro_call_in_an_expansion_files_its_block_modules() {
+    let kept = kept_of(&[
+        input("nybbles", "/nybbles/lib.rs", &[("cfg_if", DEP_AT), ("core", CORE_AT)]),
+        input("cfg_if", "/cfg_if/lib.rs", &[("core", CORE_AT)]),
+        input("core", "/core/lib.rs", &[]),
+    ]);
+    let records = reader(kept);
+    let list = bodies(records);
+    let frame = blaze_own::testing::bump().alloc_val(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("today's frame"));
+    let mut today = ProjectWorld::from_records(records, frame, LANG, a()).unwrap_or_else(|e| panic!("the world did not start: {e}"));
+    for (key, body) in list.iter() {
+        let root = Listed { body: *body, at: None, entry: None };
+        let reached = today.each_from(&[root], a(), |w, b| w.check_borrows(b, a()));
+        let mut want = blaze_own::Vec::new_in(a());
+        for one in reached.iter() {
+            let (verdict, borrows) = &one.got;
+            want.extend_from_slice(&verdict_bytes(verdict, borrows, Facts::Digest, a()).expect("today's bytes"));
+        }
+        let got = run(records, *key);
+        assert!(got.said.is_empty(), "body {key:x} {body:?} under attributed macro calls was not clean: {:#?}", got.said);
+        assert_eq!(core::str::from_utf8(&got.bytes), core::str::from_utf8(&want), "the body {key:x} {body:?} answers otherwise over the view");
+    }
+    assert_eq!(list.len(), 4, "the four fns are listed: {list:?}");
 }

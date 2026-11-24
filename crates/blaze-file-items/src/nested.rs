@@ -112,10 +112,10 @@ impl NestedItem {
 const MAX_BODY_DEPTH: u16 = 64;
 
 /// A macro call in a block: its innermost block, the range of its path (`a::b` of
-/// `a::b!(..)`, with the outer attributes written before it at a statement's start) and the
-/// range of the whole call (from the path's start through the bracket closing its arguments;
-/// a `;` after it is not in it). Not expanded here: the items it may write are not in
-/// [`Nested::items`].
+/// `a::b!(..)`, after any outer attributes written before it) and the range of the whole call
+/// (from its outer attributes at a statement's start, or its path, through the bracket closing
+/// its arguments; a `;` after it is not in it). Not expanded here: the items it may write are
+/// not in [`Nested::items`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NestedCall {
     pub block: u32,
@@ -128,9 +128,10 @@ pub struct NestedCall {
     pub expr: bool,
     /// The outer attributes of the statement an expression call stands in (`#[cfg(x)]` of
     /// `#[cfg(x)] let d = m!(..);`); empty at [`NestedCall::path`]'s start when it has none,
-    /// and always for a statement call, whose path holds its own. The Reference, "Statements":
-    /// a statement's outer attributes apply to the whole statement, and "Conditional
-    /// compilation": a false `cfg` removes it, every call in it with it, before expansion.
+    /// and always for a statement call, whose [`NestedCall::range`] holds its own. The
+    /// Reference, "Statements": a statement's outer attributes apply to the whole statement,
+    /// and "Conditional compilation": a false `cfg` removes it, every call in it with it,
+    /// before expansion.
     pub attrs: Range,
 }
 
@@ -776,6 +777,14 @@ fn outer_attrs(text: &str, stmt_start: Option<u32>, attrs_end: u32) -> Option<Ra
     stmt_start.filter(|&s| attrs_end > s && text[s as usize..].starts_with('#')).map(|start| Range { start, end: attrs_end })
 }
 
+/// The call start (first outer attribute at a statement's start, or the path's start) and
+/// path range (without outer attributes) of the macro call whose `!` was just read.
+#[derive(Clone, Copy)]
+struct CallHead {
+    start: u32,
+    path: Range,
+}
+
 /// One text's scan, its items' own bodies not read ([`NestedItem::body_writes`] all `false`).
 fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
     let mut out = Nested {
@@ -802,9 +811,13 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
     let mut attrs_end = 0u32;
     let mut inner_attr = false;
     let mut lead = Lead::None;
-    // The start of the path under way in a block: a call's name, at a statement's start (with
-    // the outer attributes before it) or in an expression (`let x = a::m!{..}`, `f(m!())`).
+    // The start of the path under way in a block: a call's path itself (`a::b`, `::a`,
+    // `$crate::a`), never including outer attributes written before it.
     let mut path_start: Option<u32> = None;
+    // Where the whole call starts: the statement's first outer attribute when `path_start`
+    // began at a statement's start with outer attributes (`#[cfg(..)] a::m!(..)`), else
+    // `path_start`.
+    let mut call_start: Option<u32> = None;
     // Whether `path_start` began at a statement's start ([`NestedCall::expr`] is its negation),
     // and, for the `name!` read last, whether its path did.
     let mut path_stmt = false;
@@ -813,7 +826,7 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
     let mut after_pound = false;
     let mut after_pub = false;
     let mut after_ident = false;
-    let mut after_bang_of: Option<Option<Range>> = None;
+    let mut after_bang_of: Option<Option<CallHead>> = None;
     // After the first `:` of a `::` (1) or its second (2): a word after the second goes on
     // the path, a single `:` (`let x: T`) ends it.
     let mut sep = 0u8;
@@ -919,12 +932,18 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                 // block expression declares is scoped to that block, wherever the block stands:
                 // `let read = tokio::select! { .. }` writes `{ mod __tokio_select_util { .. }
                 // .. }`, reth's `with_adapter!` writes `{ type $A = ..; $body }`).
-                (_, Some(path)) => {
-                    if let (Some(path), Some(block)) = (path, enclosing) {
+                (_, Some(head)) => {
+                    if let (Some(head), Some(block)) = (head, enclosing) {
                         open_call = Some(out.calls.len());
-                        let none = Range { start: path.start, end: path.start };
+                        let none = Range { start: head.path.start, end: head.path.start };
                         let attrs = if bang_stmt { none } else { stmt_attrs.get(block as usize).copied().flatten().unwrap_or(none) };
-                        out.calls.push(NestedCall { block, path, range: Range { start: path.start, end: path.end }, expr: !bang_stmt, attrs });
+                        out.calls.push(NestedCall {
+                            block,
+                            path: head.path,
+                            range: Range { start: head.start, end: head.path.end },
+                            expr: !bang_stmt,
+                            attrs,
+                        });
                     }
                     in_call += 1;
                     Open::Call
@@ -935,6 +954,7 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                     lead = Lead::None;
                     stmt_start = None;
                     path_start = None;
+                    call_start = None;
                     continue;
                 }
                 (TokenKind::OpenBrace, None) => {
@@ -972,6 +992,7 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
             }
             lead = Lead::None;
             path_start = None;
+            call_start = None;
             continue;
         }
         if is_close {
@@ -1004,6 +1025,7 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
             }
             lead = Lead::None;
             path_start = None;
+            call_start = None;
             continue;
         }
         let Some(block) = block else {
@@ -1014,24 +1036,34 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
             after_ident = matches!(kind, TokenKind::Ident | TokenKind::RawIdent) && !not_a_macro(&text[start..at]);
             match kind {
                 TokenKind::Bang if was_ident => {
-                    after_bang_of = Some(path_start.take().filter(|_| enclosing.is_some()).map(|p| Range { start: p, end: offset(start) }));
+                    call_start = None;
+                    after_bang_of = Some(path_start.take().filter(|_| enclosing.is_some()).map(|p| CallHead { start: p, path: Range { start: p, end: offset(start) } }));
                     bang_stmt = false;
                 }
-                _ if enclosing.is_none() => path_start = None,
+                _ if enclosing.is_none() => {
+                    path_start = None;
+                    call_start = None;
+                }
                 TokenKind::Ident | TokenKind::RawIdent if was_sep == 2 || was_dollar => {}
-                TokenKind::Ident | TokenKind::RawIdent => path_start = after_ident.then_some(offset(start)),
+                TokenKind::Ident | TokenKind::RawIdent => {
+                    path_start = after_ident.then_some(offset(start));
+                    call_start = path_start;
+                }
                 TokenKind::Colon if was_sep == 1 => sep = 2,
                 TokenKind::Colon if text[start..].starts_with("::") && (path_start.is_some() || !was_ident) => {
                     sep = 1;
                     path_start.get_or_insert(offset(start));
+                    call_start = path_start;
                 }
                 TokenKind::Dollar if dollar_crate(&text[at..]) => {
                     after_dollar = true;
                     path_start = Some(offset(start));
+                    call_start = path_start;
                 }
                 _ => {
                     after_dollar = kind == TokenKind::Dollar;
                     path_start = None;
+                    call_start = None;
                 }
             }
             continue;
@@ -1043,6 +1075,7 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                 stmt_start = None;
                 lead = Lead::None;
                 path_start = None;
+                call_start = None;
             }
             TokenKind::Pound if fresh && lead == Lead::None => {
                 stmt_start.get_or_insert(offset(start));
@@ -1058,9 +1091,12 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                 skip = Some(Skip { kind: NestedKind::MacroRules, start: stmt_start.unwrap_or(offset(start)), block, body: true, depth: 0, in_body: false, closed: None });
                 lead = Lead::None;
                 stmt_start = None;
+                path_start = None;
+                call_start = None;
             }
             TokenKind::Bang if was_ident => {
-                after_bang_of = Some(path_start.take().map(|p| Range { start: p, end: offset(start) }));
+                let start_at = call_start.take();
+                after_bang_of = Some(path_start.take().map(|p| CallHead { start: start_at.unwrap_or(p), path: Range { start: p, end: offset(start) } }));
                 bang_stmt = path_stmt;
                 fresh = false;
                 lead = Lead::None;
@@ -1091,6 +1127,7 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                     lead = Lead::None;
                     stmt_start = None;
                     path_start = None;
+                    call_start = None;
                     continue;
                 }
                 let next = match (lead, word) {
@@ -1110,13 +1147,16 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                     stmt_attrs[block as usize] = outer_attrs(text, stmt_start, attrs_end);
                     fresh = false;
                     stmt_start = None;
-                    path_start = (lead == Lead::None && !not_a_macro(word)).then_some(begin);
+                    let is_path = lead == Lead::None && !not_a_macro(word);
+                    path_start = is_path.then_some(offset(start));
+                    call_start = is_path.then_some(begin);
                     after_ident = !not_a_macro(word);
                 } else {
                     stmt_start = Some(begin);
                     // `union` and `default` may be plain names: `union!(..)`, `default.x`.
                     after_ident = true;
-                    path_start = Some(begin);
+                    path_start = Some(offset(start));
+                    call_start = Some(begin);
                 }
                 path_stmt = true;
                 lead = next;
@@ -1129,8 +1169,10 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                 // A word after `::` or `$` goes on the path; any other starts one: a call in an
                 // expression (`let read = tokio::select! { .. }`) is listed too.
                 if was_sep != 2 && !was_dollar {
+                    let stmt = fresh && lead == Lead::None && after_ident;
                     path_start = after_ident.then_some(offset(start));
-                    path_stmt = false;
+                    call_start = if stmt { Some(stmt_start.unwrap_or(offset(start))) } else { path_start };
+                    path_stmt = stmt;
                 }
                 fresh = false;
                 lead = Lead::None;
@@ -1153,7 +1195,8 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                     stmt_attrs[block as usize] = outer_attrs(text, stmt_start, attrs_end);
                 }
                 if path_start.is_none() {
-                    path_start = Some(stmt_start.take().unwrap_or(offset(start)));
+                    call_start = Some(stmt_start.take().unwrap_or(offset(start)));
+                    path_start = Some(offset(start));
                     path_stmt = fresh;
                 }
                 fresh = false;
@@ -1174,7 +1217,8 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                 if fresh {
                     stmt_attrs[block as usize] = outer_attrs(text, stmt_start, attrs_end);
                 }
-                path_start = Some(stmt_start.take().unwrap_or(offset(start)));
+                call_start = Some(stmt_start.take().unwrap_or(offset(start)));
+                path_start = Some(offset(start));
                 path_stmt = fresh;
                 after_dollar = true;
                 fresh = false;
@@ -1191,6 +1235,7 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                 lead = Lead::None;
                 stmt_start = None;
                 path_start = None;
+                call_start = None;
             }
         }
     }
@@ -1387,8 +1432,13 @@ mod tests {
         );
         assert_eq!(
             attrs("fn f() { let d = serde_json::json!({}); #[cfg(x)] s!(); { #![allow(x)] let e = t!(); } }"),
-            [s("serde_json::json", ""), s("#[cfg(x)] s", ""), s("t", "")]
+            [s("serde_json::json", ""), s("s", ""), s("t", "")]
         );
+        // A statement call's own outer attributes stay in `range` while `path` starts at the path.
+        let stmt_attr = "fn f() { #[cfg(x)] s!(); }";
+        let n = scan(stmt_attr, heap.alloc());
+        assert_eq!(&stmt_attr[n.calls[0].path.start as usize..n.calls[0].path.end as usize], "s");
+        assert_eq!(&stmt_attr[n.calls[0].range.start as usize..n.calls[0].range.end as usize], "#[cfg(x)] s!()");
     }
 
     /// tokio 1.53.3 macros/select.rs: the entry arm expands to `$crate::select!(@{ .. })`, and
@@ -1417,8 +1467,12 @@ mod tests {
         assert_eq!(paths(rendered).len(), 1);
         let attr = "{ #[allow(unreachable_code)] $crate::count!(_ _) ; let x = $crate::m!(); $crater!(); }";
         let n = scan(attr, heap.alloc());
-        let calls: std::vec::Vec<&str> = n.calls.iter().map(|c| &attr[c.path.start as usize..c.path.end as usize]).collect();
-        assert_eq!(calls, ["#[allow(unreachable_code)] $crate::count", "$crate::m"], "`$crater` is not listed; an expression call is");
+        let paths: std::vec::Vec<&str> = n.calls.iter().map(|c| &attr[c.path.start as usize..c.path.end as usize]).collect();
+        assert_eq!(paths, ["$crate::count", "$crate::m"], "`$crater` is not listed; an attributed statement call's `path` starts after its attributes");
+        assert!(
+            n.calls.iter().map(|c| &attr[c.range.start as usize..c.range.end as usize]).eq(["#[allow(unreachable_code)] $crate::count!(_ _)", "$crate::m!()"]),
+            "the statement call's `range` keeps its attributes"
+        );
     }
 
     /// `may_declare` is a superset of "writes an item": true for an item word or any macro call
