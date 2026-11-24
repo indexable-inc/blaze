@@ -1114,7 +1114,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 let consts = self.heads.const_params(found.key).ok_or(Why::Need(found.key))?;
                 match consts.iter().find(|(i, _)| *i == at) {
                     Some(&(_, t)) => Ok(t),
-                    None => Err(program(format!("argument {} of `{}` is a constant; that parameter is not a const parameter", index + 1, texts.join("::")), r)),
+                    None => Err(program(format!("argument {} of {} is a constant; that parameter is not a const parameter", index + 1, texts.join("::")), r)),
                 }
             }
             ConstTarget::ParamAssoc { param, name, shown } => {
@@ -1162,7 +1162,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     }
                     match found.as_slice() {
                         &[(owner, _)] => self.gat_const_want(owner, name, index, r, shown),
-                        [] => Err(Why::Program(blaze_own::format_in!(tys.alloc(), "`{shown}` names no associated type of the trait, its supertraits or a bound on `Self` in scope").as_str().into(), r)),
+                        [] => Err(Why::Program(blaze_own::format_in!(tys.alloc(), "{shown} names no associated type of the trait, its supertraits or a bound on `Self` in scope").as_str().into(), r)),
                         many => {
                             let traits = many.iter().map(|&(t, _)| t).collect();
                             Err(Why::AssocAmbiguous(shown.into(), traits, r))
@@ -1171,7 +1171,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 }
                 SelfTy::Ty(_, Some((tr, args))) => match self.assoc_owner(tys, tr, args, name, r, shown)? {
                     Some((owner, _)) => self.gat_const_want(owner, name, index, r, shown),
-                    None => Err(Why::Program(blaze_own::format_in!(tys.alloc(), "`{shown}` names no associated type of the trait or its supertraits").as_str().into(), r)),
+                    None => Err(Why::Program(blaze_own::format_in!(tys.alloc(), "{shown} names no associated type of the trait or its supertraits").as_str().into(), r)),
                 },
                 SelfTy::Ty(_, None) => Err(Why::Unsupported("type or const arguments on an inherent associated type", r)),
                 SelfTy::None => Err(Why::Unsupported(SELF_HERE, r)),

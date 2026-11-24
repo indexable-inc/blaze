@@ -1969,10 +1969,14 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         let kids = self.kids_of(trait_ref)?;
         let (_, rest) = trait_ref.slots.split(own).ok_or(self.malformed(trait_ref.ty, Bad::StepBound))?;
         let (subject, mut rest) = self.kid(trait_ref, &kids, rest, 0)?;
-        let subject = match self.resolve(subject)? {
-            Resolved::Side(s) => self.try_normalize_subject(s, 0),
+        let raw_subject = match self.resolve(subject)? {
+            Resolved::Side(s) => s,
             Resolved::Unbound { param, .. } => return Err(self.malformed(subject.ty, Bad::Unconstrained { index: param })),
         };
+        if self.try_prove_trait_non_impl(raw_subject, trait_ref, true, trait_)? {
+            return Ok(());
+        }
+        let subject = self.try_normalize_subject(raw_subject, 0);
         // If normalizing the subject or any alias trait argument yields an all-inert goal
         // (e.g. `usize: Sum<<Map<Iter<'a, _>, C> as Iterator>::Item>` -> `usize: Sum<usize>`),
         // the normalized impls' own where-clauses have already been checked and the goal itself
@@ -2003,7 +2007,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
-        if self.try_prove_trait_non_impl(subject, trait_ref, true, trait_)? {
+        if subject.ty != raw_subject.ty && self.try_prove_trait_non_impl(subject, trait_ref, true, trait_)? {
             return Ok(());
         }
         let param_miss = matches!(self.node(subject)?, PNode::Param(_));

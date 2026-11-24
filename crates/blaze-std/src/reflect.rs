@@ -33,7 +33,14 @@ pub use core::reflect::Enum;
 pub trait Enum {}
 
 /// Compiler-builtin marker trait satisfied by every fieldless (`CtorKind::Unit`) `enum` type.
-#[cfg_attr(blaze, lang = "blaze_unit_enum")]
+///
+/// Under Blaze (`cfg(blaze)`), this is `core::reflect::UnitEnum` (`#[lang = "blaze_unit_enum"]`).
+#[cfg(blaze)]
+pub use core::reflect::UnitEnum;
+
+/// Compiler-builtin marker trait satisfied by every fieldless (`CtorKind::Unit`) `enum` type.
+/// Plain Rust stub under `rustc` (`cfg(not(blaze))`).
+#[cfg(not(blaze))]
 pub trait UnitEnum: Enum {}
 
 /// Zero-cost compile-time metadata reflection for every enum (`E: Enum`).

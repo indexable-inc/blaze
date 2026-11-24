@@ -596,8 +596,8 @@ pub struct BorrowFacts<'a> {
     rpitit_opaques: AVec<'a, (u128, blaze_flow_lower::RpititOpaque)>,
     /// Trait-impl methods overriding RPITIT fns, sorted by `(imp, fn_name)` (`Facts::impl_fn`).
     impl_fns: AVec<'a, (u128, tc::Name, tc::ItemKey)>,
-    /// Enclosing trait impl of `owner`, if `owner` is a method of `impl<..> Trait for SelfTy`.
-    owner_trait_impl: Option<blaze_flow_lower::OwnerTraitImpl>,
+    /// Enclosing trait impl of `owner` and its `Self`-supertrait impls (when unique for `SelfTy`).
+    owner_trait_impls: AVec<'a, blaze_flow_lower::OwnerTraitImpl>,
 }
 
 /// The facts the lowering asks: a body's gathered [`BorrowFacts`] with the head records' region
@@ -680,7 +680,7 @@ impl<'a> BorrowFacts<'a> {
             assoc_items: AVec::new_in(alloc),
             rpitit_opaques: AVec::new_in(alloc),
             impl_fns: AVec::new_in(alloc),
-            owner_trait_impl: None,
+            owner_trait_impls: AVec::new_in(alloc),
         }
     }
 
@@ -843,8 +843,8 @@ impl Facts for ReadBy<'_, '_> {
         let at = self.facts.assoc_items.binary_search_by_key(&(trait_.0, name), |&(k, n, _)| (k, n)).ok()?;
         Some(self.facts.assoc_items[at].2)
     }
-    fn owner_trait_impl(&self) -> Option<blaze_flow_lower::OwnerTraitImpl> {
-        self.facts.owner_trait_impl
+    fn owner_trait_impl(&self, trait_: tc::ItemKey) -> Option<blaze_flow_lower::OwnerTraitImpl> {
+        self.facts.owner_trait_impls.iter().copied().find(|oti| oti.trait_ == trait_)
     }
     fn deref_impl(&self, adt: tc::ItemKey) -> Option<tc::ItemKey> {
         let at = self.facts.deref_impls.binary_search_by_key(&adt.0, |&(k, _)| k).ok()?;
@@ -1671,16 +1671,62 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         && let Some(tr) = ih.trait_
     {
         let tys = r.store.tys.view();
-        let self_shape = match tys.node(ih.self_ty) {
-            Ok(tc::PNode::Adt(k, _)) => Some(blaze_flow_lower::SelfShape::Adt(k)),
-            Ok(tc::PNode::Ref(m, _)) => Some(blaze_flow_lower::SelfShape::Ref(m)),
-            Ok(tc::PNode::Tuple(l)) => tys.list(l).ok().and_then(|ks| u32::try_from(ks.len()).ok()).map(blaze_flow_lower::SelfShape::Tuple),
-            _ => None,
+        let (self_shape, tc_shape) = match tys.node(ih.self_ty) {
+            Ok(tc::PNode::Adt(k, _)) => (Some(blaze_flow_lower::SelfShape::Adt(k)), Some(tc::Shape::Adt(k))),
+            Ok(tc::PNode::Ref(m, _)) => (Some(blaze_flow_lower::SelfShape::Ref(m)), Some(tc::Shape::Ref(m))),
+            Ok(tc::PNode::Tuple(l)) => {
+                let n = tys.list(l).ok().and_then(|ks| u32::try_from(ks.len()).ok());
+                (n.map(blaze_flow_lower::SelfShape::Tuple), n.map(tc::Shape::Tuple))
+            }
+            _ => (None, None),
         };
-        if let Some(self_shape) = self_shape {
-            g.owner_trait_impl = Some(blaze_flow_lower::OwnerTraitImpl { imp: container, trait_: tr, generics: ih.generics, self_shape });
+        if let (Some(self_shape), Some(tc_shape)) = (self_shape, tc_shape) {
+            g.owner_trait_impls.push(blaze_flow_lower::OwnerTraitImpl { imp: container, trait_: tr, generics: ih.generics, self_shape });
             traits.push(tr.0);
             selected.push((container.0, None));
+            // Also record unique impls of `tr`'s `Self`-supertraits for `SelfTy` (e.g.
+            // `Cloned<I>: Iterator` inside `impl DoubleEndedIterator for Cloned<I>`).
+            let mut work: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+            let mut seen: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+            work.push(tr);
+            seen.push(tr);
+            while let Some(cur) = work.pop() {
+                if seen.len() >= 32 {
+                    break;
+                }
+                if !r.store.trait_defs.contains_key(&cur)
+                    && let Some(lib) = r.keys.library_in(r.names, cur)
+                {
+                    ensure_one(r, Want::Members(lib));
+                }
+                let mut sups: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+                if let Some(def) = r.store.trait_defs.get(&cur) {
+                    let tys = r.store.tys.view();
+                    for sc in def.supertraits.iter() {
+                        if let tc::PClause::Trait { trait_: sup, args } = *sc
+                            && let Ok(list) = tys.list(args)
+                            && list.first().is_some_and(|&a| matches!(tys.node(a), Ok(tc::PNode::Param(0))))
+                            && seen.scan_for(&sup).is_none()
+                        {
+                            seen.push(sup);
+                            sups.push(sup);
+                        }
+                    }
+                }
+                for &sup in sups.iter() {
+                    work.push(sup);
+                    if let Some(impls) = answer_impls(r, sup, tc_shape)
+                        && let &[imp] = &impls[..]
+                        && let Some(lib) = r.keys.library_in(r.names, imp)
+                        && container_head(r, lib, false)
+                        && let Some(sup_ih) = r.store.impls.get(&imp)
+                    {
+                        g.owner_trait_impls.push(blaze_flow_lower::OwnerTraitImpl { imp, trait_: sup, generics: sup_ih.generics, self_shape });
+                        traits.push(sup.0);
+                        selected.push((imp.0, None));
+                    }
+                }
+            }
         }
     }
     for p in c.selected.iter() {

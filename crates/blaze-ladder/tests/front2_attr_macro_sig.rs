@@ -42,8 +42,8 @@ use blaze_surface::{Namespace, PathKind};
 const MAIN: &str = "fn main() {}
 pub struct Ctx { pub gas: u64 }
 macro_rules! instruction {
-    attr() ($v:vis fn $name:ident(cx: _) -> $r:ty $body:block) => {
-        $v fn $name(cx: &Ctx) -> $r $body
+    attr() ($v:vis fn $name:ident($cx:ident: _) -> $r:ty $body:block) => {
+        $v fn $name($cx: &Ctx) -> $r $body
     };
 }
 #[instruction]

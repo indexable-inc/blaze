@@ -27,8 +27,13 @@ use edition::PackageEdition;
 
 pub mod library;
 
-/// The one target the ladder runs on.
+/// The host target the ladder runs on.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub const TRIPLE: &str = "aarch64-apple-darwin";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub const TRIPLE: &str = "aarch64-unknown-linux-gnu";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub const TRIPLE: &str = "x86_64-unknown-linux-gnu";
 
 /// The profile's atoms, beside the target's: the ladder builds as `dev`.
 const PROFILE: &[(&str, Option<&str>)] = &[("debug_assertions", None)];
@@ -249,7 +254,7 @@ impl Toolchain {
 /// one list that names every target atom (`target_pointer_width`, `target_os`, ..). Asserted
 /// equal in triple by the constant's name: [`TRIPLE`] is `aarch64-apple-darwin`.
 fn target_cfg(alloc: Alloc<'_>) -> Vec<(String, Option<String>)> {
-    let target = blaze_scope::task::Target::AARCH64_APPLE_DARWIN;
+    let target = blaze_scope::task::Target::host();
     let cfg = blaze_scope::task::Cfg::of(&target, &[], alloc);
     cfg.atoms().iter().map(|&(n, v)| (n.to_owned(), v.map(str::to_owned))).collect()
 }

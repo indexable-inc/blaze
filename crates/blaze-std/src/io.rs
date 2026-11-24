@@ -1885,6 +1885,31 @@ impl Io {
         None
     }
 
+    /// Checks for an already-polled completion of `tag` and, only if none is waiting, runs one
+    /// poll of the driver under the same world lock — preventing a multi-thread lost-wakeup where
+    /// another task reaps `tag` between `take` and `poll`.
+    pub(crate) fn take_or_poll(&self, tag: Tag, until: Deadline) -> Result<Done, usize> {
+        let mut world = self.world().lock();
+        if let Some(at) = world.got.iter().position(|it| it.tag == tag) {
+            return Ok(world.got.remove(at).done);
+        }
+        let World { driver, polled, got, abandoned, disk, .. } = &mut *world;
+        let moved = driver.poll(polled, until);
+        for completion in polled.drain(..) {
+            if let Some(disk) = disk.as_deref_mut() {
+                disk.completed(&completion);
+            }
+            keep(got, abandoned, completion);
+        }
+        if moved == 0 {
+            driver.idle_until(until);
+        }
+        if let Some(at) = world.got.iter().position(|it| it.tag == tag) {
+            return Ok(world.got.remove(at).done);
+        }
+        Err(moved)
+    }
+
     /// One poll of the driver, waiting at most until `until`: what it brought kept for each
     /// waiter (or dropped, a stopped waiter's), and how many completions it moved. A poll that
     /// moved nothing moves the simulation's clock to `until`, as a real wait sleeps to it. The

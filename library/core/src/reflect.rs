@@ -64,6 +64,17 @@ pub unsafe trait Enum: Sized {
     const NAME: &'static str = intrinsics::blaze_adt_name::<Self>();
 }
 
+/// A fieldless (`CtorKind::Unit`) enum. Only the trait solver implements it.
+///
+/// # Safety
+///
+/// `Self` is a fieldless enum. Only the trait solver implements it.
+#[lang = "blaze_unit_enum"]
+#[rustc_deny_explicit_impl]
+#[rustc_dyn_incompatible_trait]
+#[unstable(feature = "blaze_comptime", issue = "none")]
+pub unsafe trait UnitEnum: Enum {}
+
 /// `Self` is a field of `Base`: what `for<F: Field<T>>` ranges over and the type of the
 /// constant a `for const f in fields_of::<T>()` loop binds.
 ///

@@ -1803,7 +1803,7 @@ impl<'f> Front<'f> {
             (None, false) => None,
         };
         if kind == FnKind::Static {
-            self.statics.push((key, StaticItem { thread_local: attrs.thread_local, mutable: flags & sig::MUT != 0 }));
+            self.statics.push((key, StaticItem { thread_local: attrs.thread_local, mutable: flags & sig::MUT != 0, extern_weak: false }));
         } else if attrs.thread_local {
             return Err(Why::Unsupported("`#[thread_local]` on other than a `static`", whole).at(at));
         }

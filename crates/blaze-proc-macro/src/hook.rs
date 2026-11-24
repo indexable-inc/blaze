@@ -842,7 +842,7 @@ mod listed_dir_tests {
         assert!(safe_rel_path("Cargo.toml"));
         assert!(safe_rel_path("i18n/en-US/age.ftl"));
         for bad in ["", "/etc/passwd", "../escape", "a/../b", "./a", "a/./b", "a//b", "a\0b", r"a\b"] {
-            assert!(!safe_rel_path(bad), "expected `{bad:?}` to be rejected");
+            assert!(!safe_rel_path(bad), "expected {bad:?} to be rejected");
         }
     }
 

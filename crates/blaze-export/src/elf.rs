@@ -457,7 +457,12 @@ pub fn write_native<'a>(
     // The ELF header and program headers.
     out.clear();
     out.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    let native_missing = if native.is_some() { 0u64 } else { 2u64 };
+    let has_native_text = native.is_some() && native_code_len > 0;
+    let native_missing = match (native.is_some(), has_native_text) {
+        (true, true) => 0u64,
+        (true, false) => 1u64,
+        (false, _) => 2u64,
+    };
     let phnum = MAX_PHDRS - u64::from(!has_data) - u64::from(tls_phdr.is_none()) - native_missing;
     let phnum16 = u16::try_from(phnum).map_err(|_| ExportError::TooLarge { what: "e_phnum", len: phnum })?;
     bytes::u16(out, 3); // ET_DYN
@@ -484,7 +489,9 @@ pub fn write_native<'a>(
         phdr(out, PT_LOAD, PF_R | PF_W, laid.data_at, laid.data_at, data_len, laid.end - laid.data_at, PAGE);
     }
     if let Some(m) = native {
-        phdr(out, PT_LOAD, PF_R | PF_X, native_file, m.text_at, native_code_len, native_code_len, PAGE);
+        if has_native_text {
+            phdr(out, PT_LOAD, PF_R | PF_X, native_file, m.text_at, native_code_len, native_code_len, PAGE);
+        }
         phdr(out, PT_LOAD, PF_R | PF_W, native_file + native_code_len, m.data_at, native_data_filesz, m.end - m.data_at, PAGE);
     }
     phdr(out, PT_LOAD, PF_R, meta_off, meta_at, meta_len, meta_len, PAGE);

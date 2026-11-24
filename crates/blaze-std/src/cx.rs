@@ -746,9 +746,10 @@ impl Cx {
                 }
                 return Err(stopped);
             }
-            match io.poll(deadline) {
-                0 => idle += 1,
-                _ => idle = 0,
+            match io.take_or_poll(tag, deadline) {
+                Ok(done) => return Ok(done),
+                Err(0) => idle += 1,
+                Err(_) => idle = 0,
             }
             self.resumed();
         }

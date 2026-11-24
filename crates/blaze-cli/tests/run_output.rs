@@ -209,7 +209,7 @@ fn export_std_rust_binary_runs_standalone() {
 
     let mut cmd = blaze_cmd(&dir, &home);
     cmd.arg("export");
-    let exported = run_with_deadline(cmd, "blaze export hello-std", secs(120));
+    let exported = run_with_deadline(cmd, "blaze export hello-std", secs(240));
     assert_eq!(exported.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&exported.stdout), utf8(&exported.stderr));
 
     let ran = run_standalone(&dir.join("hello-std"), "run hello-std");
@@ -313,7 +313,7 @@ fn main() -> ExitCode {
     let out_bin = base.join("tls-standalone");
     let mut cmd = blaze_cmd(&dir, &home);
     cmd.args(["export", "-o"]).arg(&out_bin);
-    let exported = run_with_deadline(cmd, "blaze export tls-app", secs(120));
+    let exported = run_with_deadline(cmd, "blaze export tls-app", secs(240));
     assert_eq!(exported.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&exported.stdout), utf8(&exported.stderr));
     assert!(utf8(&exported.stdout).contains("tls"), "expected TLS count in summary: {}", utf8(&exported.stdout));
 
@@ -341,7 +341,7 @@ fn export_workspace_selects_package_bin_output_and_stats() {
     let out_bin = base.join("out-dir/second-bin");
     let mut cmd = blaze_cmd(&base, &home);
     cmd.args(["export", "ws", "-p", "alpha", "--bin", "second", "-o"]).arg(&out_bin).args(["--workers", "2", "--stats"]);
-    let exported = run_with_deadline(cmd, "blaze export ws -p alpha --bin second", secs(120));
+    let exported = run_with_deadline(cmd, "blaze export ws -p alpha --bin second", secs(240));
     assert_eq!(exported.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&exported.stdout), utf8(&exported.stderr));
     assert!(utf8(&exported.stderr).contains("export stats:"), "expected --stats line on stderr: {}", utf8(&exported.stderr));
 

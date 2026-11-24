@@ -232,30 +232,25 @@ mod placed {
         {
             let mut writer = registry.writer().expect("the one writer");
             // Monotonic appends exercise the O(1) append fast path and alternating Left-Right sync.
+            // Uses `add_table`/`remove_table` so synthetic `eh_at` addresses are never handed to
+            // Linux libgcc's `__register_frame`.
             for i in 0..32u64 {
                 let lo = 0x1000 + i * 0x100;
-                // SAFETY: test-only synthetic spans; this local registry is never installed into the OS unwinder.
-                unsafe { writer.add(span(lo, 0x80, i + 1)) }.expect("monotonic add");
+                writer.add_table(span(lo, 0x80, i + 1)).expect("monotonic add");
             }
             // Out-of-order insert between existing spans.
-            // SAFETY: synthetic span in local registry.
-            unsafe { writer.add(span(0x1080, 0x40, 100)) }.expect("interior insert");
+            writer.add_table(span(0x1080, 0x40, 100)).expect("interior insert");
             // Overlap refusal must leave both tables consistent on the next valid edit.
-            // SAFETY: synthetic span in local registry.
-            assert!(matches!(unsafe { writer.add(span(0x1090, 0x20, 101)) }, Err(super::RegError::Overlaps { .. })));
+            assert!(matches!(writer.add_table(span(0x1090, 0x20, 101)), Err(super::RegError::Overlaps { .. })));
             // Remove an interior span, then add another.
-            // SAFETY: synthetic span in local registry.
-            unsafe { writer.remove(0x1080) }.expect("remove interior");
-            // SAFETY: synthetic span in local registry.
-            unsafe { writer.add(span(0x9000, 0x80, 200)) }.expect("post-remove append");
+            writer.remove_table(0x1080).expect("remove interior");
+            writer.add_table(span(0x9000, 0x80, 200)).expect("post-remove append");
         }
         // Re-acquiring the writer after dropping must resync the spare cleanly.
         {
             let mut writer = registry.writer().expect("re-acquired writer");
-            // SAFETY: synthetic span in local registry.
-            unsafe { writer.remove(0x1000) }.expect("remove first after re-acquire");
-            // SAFETY: synthetic span in local registry.
-            unsafe { writer.add(span(0x9100, 0x80, 201)) }.expect("append after re-acquire");
+            writer.remove_table(0x1000).expect("remove first after re-acquire");
+            writer.add_table(span(0x9100, 0x80, 201)).expect("append after re-acquire");
         }
         assert_eq!(registry.lookup(0x1000), None);
         assert_eq!(registry.lookup(0x1080), None);
