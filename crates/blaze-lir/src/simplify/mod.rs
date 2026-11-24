@@ -87,9 +87,10 @@ pub use rvsdg::{PortCostModel, RegionCost, RvsdgOutput, RvsdgStats, co_optimize_
 pub use sched::{SchedOutput, SchedStats, schedule_dag};
 pub use semproof::{ParamProof, SemProofOutput, SemProofStats, apply_semantic_proofs};
 pub use simd_idioms::{
-    NEON_SDOT_INTRINSIC, NEON_TBL16_INTRINSIC, NEON_TBL64_INTRINSIC, NEON_UDOT_INTRINSIC, SimdIdiomOpts,
-    SimdIdiomOutput, SimdIdiomStats, emit_sort4_network, emit_sort4_values, emit_sort8_network, emit_sort8_values,
-    lower_byte_lut_loops, lower_dotprod_loops, lower_simd_idioms, lower_sorting_networks,
+    A64_CRC32B_INTRINSIC, A64_CRC32CB_INTRINSIC, A64_CRC32CX_INTRINSIC, A64_CRC32X_INTRINSIC, NEON_SDOT_INTRINSIC,
+    NEON_TBL16_INTRINSIC, NEON_TBL64_INTRINSIC, NEON_UDOT_INTRINSIC, SimdIdiomOpts, SimdIdiomOutput, SimdIdiomStats,
+    emit_sort4_network, emit_sort4_values, emit_sort8_network, emit_sort8_values, lower_byte_lut_loops,
+    lower_crc32_table_loops, lower_dotprod_loops, lower_simd_idioms, lower_sorting_networks,
 };
 pub use slp::{MemchrOutput, MemchrStats, SlpOutput, SlpStats, slp_vectorize, vectorize_memchr_loops};
 pub use soa::{SoaAnalysis, SoaOutput, SoaStats, StructField, analyze_aos_loop, rewrite_aos_to_soa};

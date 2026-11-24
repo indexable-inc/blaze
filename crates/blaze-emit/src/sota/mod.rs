@@ -399,14 +399,16 @@ fn run_sota_loop_and_late_passes<'a>(
                 enable_tbl: true,
                 enable_dotprod: (machine.features & Machine::DOTPROD) != 0,
                 enable_sort_net: true,
+                enable_crc32: (machine.features & Machine::CRC32) != 0,
             };
             let v = loop_cur.as_ref().map_or(post_nest, |f| f.view());
             if let Ok(o) = lower_simd_idioms(v, idiom_opts, alloc)
                 && (o.stats.tbl_loops > 0
                     || o.stats.dotprod_loops > 0
+                    || o.stats.crc32_loops > 0
                     || o.stats.sort_swaps_canonicalized > 0)
             {
-                did_simd_idiom = o.stats.tbl_loops > 0 || o.stats.dotprod_loops > 0;
+                did_simd_idiom = o.stats.tbl_loops > 0 || o.stats.dotprod_loops > 0 || o.stats.crc32_loops > 0;
                 loop_cur = Some(o.func);
             }
 
@@ -846,7 +848,8 @@ pub fn emit_sota_record_for_machine<'a>(
 
 /// Default AArch64 optimizing record emitter for `blaze-ladder` (`blaze run` / `blaze test`):
 /// derives the target [`Machine`] from `isa` (enabling `Machine::LSE` when advertised and
-/// `Machine::DOTPROD` on Apple Silicon macOS) and delegates to [`emit_sota_record_for_machine`].
+/// `Machine::DOTPROD | Machine::CRC32` on Apple Silicon macOS) and delegates to
+/// [`emit_sota_record_for_machine`].
 pub fn emit_sota_record_measured<'a>(
     func: Verified<'_>,
     names: &dyn Names,
@@ -856,7 +859,7 @@ pub fn emit_sota_record_measured<'a>(
     alloc: Alloc<'a>,
 ) -> Result<(CodeRecord<'a>, u32, Called), RecordEmitError> {
     let features = (if isa.lse { Machine::LSE } else { 0 })
-        | (if isa.os == crate::Os::MacOs { Machine::DOTPROD } else { 0 });
+        | (if isa.os == crate::Os::MacOs { Machine::DOTPROD | Machine::CRC32 } else { 0 });
     let os = match isa.os {
         crate::Os::MacOs => blaze_tier::Os::MacOs,
         crate::Os::Linux => blaze_tier::Os::Linux,
