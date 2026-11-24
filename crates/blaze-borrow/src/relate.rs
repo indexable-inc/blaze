@@ -325,7 +325,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     /// The table a side's type is a node of ([`Cx`], "TWO TABLES").
     fn tab(&self, s: Slots<'c>) -> &'c dyn RegionTypes {
         match s {
-            Slots::Caller(_) | Slots::CallerEnv { .. } => self.types,
+            Slots::Caller(_) | Slots::CallerEnv { .. } | Slots::CallerFresh { .. } => self.types,
             Slots::Sig { .. } => self.sig_types,
         }
     }
@@ -366,6 +366,13 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             Slots::Sig { col, env } | Slots::CallerEnv { col, env } => {
                 let r = *usize::try_from(k).ok().and_then(|i| col.get(i)).ok_or(self.malformed(s.ty, Bad::StepBound))?;
                 self.envs.reg(env, r).map_err(|w| self.malformed(s.ty, w))
+            }
+            Slots::CallerFresh { env, start, len } => {
+                if k >= len.get() {
+                    return Err(self.malformed(s.ty, Bad::StepBound));
+                }
+                let idx = start.checked_add(k).ok_or(self.malformed(s.ty, Bad::StepBound))?;
+                self.envs.reg(env, Region::Param(idx)).map_err(|w| self.malformed(s.ty, w))
             }
         }
     }
@@ -528,7 +535,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     /// The environment a side's slots are read in (`None`: the caller's own slots).
     fn env_of(s: Side<'c>) -> Option<EnvId> {
         match s.slots {
-            Slots::Caller(_) => None,
+            Slots::Caller(_) | Slots::CallerFresh { .. } => None,
             Slots::Sig { env, .. } | Slots::CallerEnv { env, .. } => Some(env),
         }
     }
@@ -649,7 +656,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     }
                 };
                 // One table: a node is its type (regions live in columns, never in nodes).
-                if let Slots::Caller(_) = a.slots
+                if matches!(a.slots, Slots::Caller(_) | Slots::CallerFresh { .. })
                     && a.ty == b
                 {
                     continue;
@@ -2240,10 +2247,10 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         trait_ref: Side<'c>,
         has_subject: bool,
         depth: u32,
-        visited: &mut [ItemKey; 16],
+        visited: &mut [(ItemKey, bool); 64],
         vlen: &mut usize,
     ) -> Result<bool, Refused> {
-        let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; 64] = [None; 64];
+        let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; 128] = [None; 128];
         let mut sp = 0usize;
         if let Some(slot) = stack.get_mut(sp) {
             *slot = Some((seed_tr, seed_self, seed_trait, seed_has_self, depth));
@@ -2254,11 +2261,13 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             let Some((cur_tr, cur_self, cur_trait, cur_has_self, cur_depth)) = stack.get_mut(sp).and_then(Option::take) else {
                 continue;
             };
-            if cur_depth >= 8 || *vlen >= 16 || visited.iter().take(*vlen).any(|&k| k == cur_tr) {
+            let is_sub = self.erased_sides(cur_self, subject);
+            let visit_key = (cur_tr, is_sub);
+            if cur_depth >= 12 || *vlen >= 64 || visited.iter().take(*vlen).any(|&k| k == visit_key) {
                 continue;
             }
             if let Some(slot) = visited.get_mut(*vlen) {
-                *slot = cur_tr;
+                *slot = visit_key;
                 *vlen += 1;
             } else {
                 continue;
@@ -2275,7 +2284,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
             let next_depth = cur_depth + 1;
-            if next_depth < 8 {
+            if next_depth < 12 {
                 let start = sp;
                 for cv in views {
                     let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
@@ -2286,7 +2295,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                         && ckids.len() > 0
                         && let Some((_, crest)) = c.slots.split(c_own)
                         && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
-                        && self.erased_sides(c_self, subject)
+                        && (self.erased_sides(c_self, subject) || self.erased_sides(c_self, cur_self))
                         && let Some(slot) = stack.get_mut(sp)
                     {
                         *slot = Some((ct, c_self, c, true, next_depth));
@@ -2314,10 +2323,10 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         want_tr: ItemKey,
         want_name: blaze_typeck::Name,
         depth: u32,
-        visited: &mut [ItemKey; 16],
+        visited: &mut [(ItemKey, bool); 64],
         vlen: &mut usize,
     ) -> Result<Option<Side<'c>>, Refused> {
-        let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; 64] = [None; 64];
+        let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; 128] = [None; 128];
         let mut sp = 0usize;
         if let Some(slot) = stack.get_mut(sp) {
             *slot = Some((seed_tr, seed_self, seed_trait, seed_has_self, depth));
@@ -2328,11 +2337,13 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             let Some((cur_tr, cur_self, cur_trait, cur_has_self, cur_depth)) = stack.get_mut(sp).and_then(Option::take) else {
                 continue;
             };
-            if cur_depth >= 8 || *vlen >= 16 || visited.iter().take(*vlen).any(|&k| k == cur_tr) {
+            let is_sub = self.erased_sides(cur_self, subject);
+            let visit_key = (cur_tr, is_sub);
+            if cur_depth >= 12 || *vlen >= 64 || visited.iter().take(*vlen).any(|&k| k == visit_key) {
                 continue;
             }
             if let Some(slot) = visited.get_mut(*vlen) {
-                *slot = cur_tr;
+                *slot = visit_key;
                 *vlen += 1;
             } else {
                 continue;
@@ -2349,7 +2360,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
             let next_depth = cur_depth + 1;
-            if next_depth < 8 {
+            if next_depth < 12 {
                 let start = sp;
                 for cv in views {
                     let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
@@ -2360,7 +2371,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                         && ckids.len() > 0
                         && let Some((_, crest)) = c.slots.split(c_own)
                         && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
-                        && self.erased_sides(c_self, subject)
+                        && (self.erased_sides(c_self, subject) || self.erased_sides(c_self, cur_self))
                         && let Some(slot) = stack.get_mut(sp)
                     {
                         *slot = Some((ct, c_self, c, true, next_depth));
@@ -2373,6 +2384,32 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             }
         }
         Ok(None)
+    }
+
+    /// Collect up to 4 ancestor `Self` subjects of a nested `PNode::Alias` (e.g. for
+    /// `<<N as FullNodeTypes>::Provider as BlockReader>::Header`, returns `[N::Provider, N]`)
+    /// so caller clauses on `N: FullNodeComponents` can elaborate associated-type bounds.
+    fn alias_self_chain(&self, subject: Side<'c>) -> ([Option<Side<'c>>; 4], usize) {
+        let mut out = [None; 4];
+        let mut len = 0usize;
+        let mut cur = subject;
+        for _ in 0..4 {
+            let Ok(PNode::Alias { .. }) = self.node(cur) else { break };
+            let Ok(own) = self.own(cur) else { break };
+            let Ok(kids) = self.kids_of(cur) else { break };
+            if kids.len() == 0 {
+                break;
+            }
+            let Some((_, rest)) = cur.slots.split(own) else { break };
+            let Ok((inner, _)) = self.kid(cur, &kids, rest, 0) else { break };
+            let Ok(Resolved::Side(inner)) = self.resolve(inner) else { break };
+            if let Some(slot) = out.get_mut(len) {
+                *slot = Some(inner);
+                len += 1;
+            }
+            cur = inner;
+        }
+        (out, len)
     }
 
     /// Bind an opaque type's defining-item env from a clause whose child 0 is `Opaque(op_key, ..)`.
@@ -2427,6 +2464,15 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
+        // 1b. Builtin `async { .. }: Future` and `async { .. }: IntoFuture` (via the blanket
+        //     `impl<F: Future> IntoFuture for F`): neither puts any extra region constraint on
+        //     an anonymous `PNode::Future`.
+        if matches!(self.node(subject)?, PNode::Future(..))
+            && (self.selected.is_future_trait(trait_) || self.selected.is_into_future_trait(trait_))
+            && self.nothing_to_tie(trait_ref, u32::from(has_subject))?
+        {
+            return Ok(true);
+        }
         let owner: &'c dyn Owner = self.owner;
         let clauses = owner.clauses();
         // 2. Direct `Param(p)` bound via `Owner::bound` ONLY when `Owner::clauses` is empty
@@ -2453,7 +2499,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     }
                 }
             }
-            let mut visited = [ItemKey(0); 16];
+            let mut visited = [(ItemKey(0), false); 64];
             let mut vlen = 0usize;
             for cv in clauses {
                 let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: oenv } };
@@ -2468,6 +2514,28 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     && self.elaborate_for_trait(ct, c_self, c, true, trait_, subject, trait_ref, has_subject, 0, &mut visited, &mut vlen)?
                 {
                     return Ok(true);
+                }
+            }
+            // If `subject` is a projection (e.g. `<N as FullNodeTypes>::Provider`), also
+            // elaborate caller clauses on its ancestor `Self` (`N: FullNodeComponents`) so
+            // subtrait where-clauses constraining associated types (`Self::Provider: Tr`) apply.
+            let (roots, rlen) = self.alias_self_chain(subject);
+            for root_opt in roots.iter().take(rlen) {
+                let Some(root_self) = *root_opt else { continue };
+                for cv in clauses {
+                    let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: oenv } };
+                    if let Ok(PNode::ExTrait(ct, _)) = self.node(c)
+                        && self.fits(c).is_ok()
+                        && let Ok(c_own) = self.own(c)
+                        && let Ok(ckids) = self.kids_of(c)
+                        && ckids.len() > 0
+                        && let Some((_, crest)) = c.slots.split(c_own)
+                        && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
+                        && self.erased_sides(c_self, root_self)
+                        && self.elaborate_for_trait(ct, c_self, c, true, trait_, subject, trait_ref, has_subject, 0, &mut visited, &mut vlen)?
+                    {
+                        return Ok(true);
+                    }
                 }
             }
         }
@@ -2494,7 +2562,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     }
                 }
                 let (_, mut srest) = subject.slots.split(s_own).ok_or(self.malformed(subject.ty, Bad::StepBound))?;
-                let mut visited = [ItemKey(0); 16];
+                let mut visited = [(ItemKey(0), false); 64];
                 let mut vlen = 0usize;
                 for k in 0..skids.len() {
                     let (pred, sr) = self.kid(subject, &skids, srest, k)?;
@@ -2520,7 +2588,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                             }
                         }
                     }
-                    let mut visited = [ItemKey(0); 16];
+                    let mut visited = [(ItemKey(0), false); 64];
                     let mut vlen = 0usize;
                     for cv in views {
                         if let Ok(PNode::ExTrait(ct, _)) = self.sig_types.node(cv.col.ty())
@@ -2592,7 +2660,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
-        let mut visited = [ItemKey(0); 16];
+        let mut visited = [(ItemKey(0), false); 64];
         let mut vlen = 0usize;
         for cv in views {
             let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: aenv } };
@@ -2634,14 +2702,36 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 return Ok(Some(out));
             }
         }
-        // 1b. Builtin `<async { .. } as Future>::Output`: when the future's output carries zero
-        // lifetime slots (e.g. `()` or a bare type parameter `T`), normalize directly to `output`.
+        // 1b. Builtin `<async { .. } as Future>::Output` and `<async { .. } as IntoFuture>::IntoFuture`
+        // (via `impl<F: Future> IntoFuture for F { type Output = F::Output; type IntoFuture = F; }`).
         if want_arg_count == 1
             && let PNode::Future(_, output, _) = self.node(subject)?
         {
-            let out_side = Side { ty: output, slots: Slots::Caller(crate::SlotRange::EMPTY) };
-            if self.fits(out_side).is_ok() {
-                return Ok(Some(out_side));
+            if name == blaze_typeck::Name::of("Output") {
+                if let Ok(n) = self.types.count(output) {
+                    if n == SlotCount::ZERO {
+                        return Ok(Some(Side { ty: output, slots: Slots::Caller(crate::SlotRange::EMPTY) }));
+                    }
+                    if n.get() <= 64
+                        && let Some(env) = self.envs.impl_env(n.get(), 0)
+                    {
+                        let cap_len = subject.slots.len().map_or(0, SlotCount::get);
+                        for k in 0..n.get() {
+                            let o = self.out.fresh(Kind::Existential);
+                            self.envs.bind_reg(env, k, Reg::Origin(o)).map_err(|w| self.malformed(want.ty, w))?;
+                            // Discharge `coroutine.rs`'s assumption that every captured region
+                            // of the async block outlives every output region slot.
+                            for u in 0..cap_len {
+                                if let RegAt::Known(cap_r) = self.slot(subject, u)? {
+                                    self.outlives(want.ty, cap_r, Reg::Origin(o))?;
+                                }
+                            }
+                        }
+                        return Ok(Some(Side { ty: output, slots: Slots::CallerFresh { env, start: 0, len: n } }));
+                    }
+                }
+            } else if name == blaze_typeck::Name::of("IntoFuture") && self.selected.is_into_future_trait(trait_) {
+                return Ok(Some(subject));
             }
         }
         let owner: &'c dyn Owner = self.owner;
@@ -2668,7 +2758,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     }
                 }
             }
-            let mut visited = [ItemKey(0); 16];
+            let mut visited = [(ItemKey(0), false); 64];
             let mut vlen = 0usize;
             for cv in clauses {
                 let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: oenv } };
@@ -2683,6 +2773,25 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     && let Some(term) = self.elaborate_for_proj(ct, c_self, c, true, want, want_arg_count, subject, trait_, name, 0, &mut visited, &mut vlen)?
                 {
                     return Ok(Some(term));
+                }
+            }
+            let (roots, rlen) = self.alias_self_chain(subject);
+            for root_opt in roots.iter().take(rlen) {
+                let Some(root_self) = *root_opt else { continue };
+                for cv in clauses {
+                    let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: oenv } };
+                    if let Ok(PNode::ExTrait(ct, _)) = self.node(c)
+                        && self.fits(c).is_ok()
+                        && let Ok(c_own) = self.own(c)
+                        && let Ok(ckids) = self.kids_of(c)
+                        && ckids.len() > 0
+                        && let Some((_, crest)) = c.slots.split(c_own)
+                        && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
+                        && self.erased_sides(c_self, root_self)
+                        && let Some(term) = self.elaborate_for_proj(ct, c_self, c, true, want, want_arg_count, subject, trait_, name, 0, &mut visited, &mut vlen)?
+                    {
+                        return Ok(Some(term));
+                    }
                 }
             }
         }
@@ -2742,7 +2851,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     }
                 }
                 let (_, mut srest) = subject.slots.split(s_own).ok_or(self.malformed(subject.ty, Bad::StepBound))?;
-                let mut visited = [ItemKey(0); 16];
+                let mut visited = [(ItemKey(0), false); 64];
                 let mut vlen = 0usize;
                 for k in 0..skids.len() {
                     let (pred, sr) = self.kid(subject, &skids, srest, k)?;
@@ -2769,7 +2878,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                             }
                         }
                     }
-                    let mut visited = [ItemKey(0); 16];
+                    let mut visited = [(ItemKey(0), false); 64];
                     let mut vlen = 0usize;
                     for cv in views {
                         if let Ok(PNode::ExTrait(ct, _)) = self.sig_types.node(cv.col.ty())
@@ -2828,7 +2937,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                                 }
                             }
                         }
-                        let mut visited = [ItemKey(0); 16];
+                        let mut visited = [(ItemKey(0), false); 64];
                         let mut vlen = 0usize;
                         for cv in views {
                             let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: aenv } };

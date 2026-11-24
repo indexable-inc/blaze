@@ -449,6 +449,8 @@ pub struct BorrowLangs {
     pub fn_traits: [Option<tc::ItemKey>; 3],
     /// `Deref`: for [`Facts::deref_impl`].
     pub deref: Option<tc::ItemKey>,
+    /// `core::future::Future`, for [`Facts::is_future_trait`].
+    pub future: Option<tc::ItemKey>,
     /// Compiler-builtin traits whose associated types always have zero lifetimes:
     /// `DiscriminantKind::Discriminant` and `Pointee::Metadata`.
     pub discriminant_kind: Option<tc::ItemKey>,
@@ -470,6 +472,7 @@ impl BorrowLangs {
             relates_nothing: [lang("sized"), lang("meta_sized"), lang("pointee_sized"), lang("destruct")],
             fn_traits: [lang("fn"), lang("fn_mut"), lang("fn_once")],
             deref: lang("deref"),
+            future: lang("future_trait"),
             discriminant_kind,
             pointee,
         }
@@ -580,6 +583,8 @@ pub struct BorrowFacts<'a> {
     /// the toolchain's library (its key covers them).
     relates_nothing: [Option<tc::ItemKey>; 4],
     fn_traits: [Option<tc::ItemKey>; 3],
+    future_trait: Option<tc::ItemKey>,
+    into_future_trait: Option<tc::ItemKey>,
     discriminant_kind: Option<tc::ItemKey>,
     pointee: Option<tc::ItemKey>,
     /// Unique `Deref` impl per ADT, sorted by ADT key (`Facts::deref_impl`).
@@ -666,6 +671,8 @@ impl<'a> BorrowFacts<'a> {
             constant_initializer: false,
             relates_nothing: [None; 4],
             fn_traits: [None; 3],
+            future_trait: None,
+            into_future_trait: None,
             discriminant_kind: None,
             pointee: None,
             deref_impls: AVec::new_in(alloc),
@@ -824,6 +831,12 @@ impl Facts for ReadBy<'_, '_> {
     }
     fn is_fn_trait(&self, trait_: tc::ItemKey) -> bool {
         self.facts.fn_traits.contains(&Some(trait_))
+    }
+    fn is_future_trait(&self, trait_: tc::ItemKey) -> bool {
+        Some(trait_) == self.facts.future_trait
+    }
+    fn is_into_future_trait(&self, trait_: tc::ItemKey) -> bool {
+        Some(trait_) == self.facts.into_future_trait
     }
     fn assoc_item(&self, trait_: tc::ItemKey, name: tc::Name) -> Option<tc::ItemKey> {
         let at = self.facts.assoc_items.binary_search_by_key(&(trait_.0, name), |&(k, n, _)| (k, n)).ok()?;
@@ -1446,6 +1459,8 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     g.fn_binders = plant != FactsPlant::FnBindersFree;
     g.relates_nothing = langs.relates_nothing;
     g.fn_traits = langs.fn_traits;
+    g.future_trait = langs.future;
+    g.into_future_trait = super::langs::find(r.index, crate::resolve::Paths { names: r.names }, tc::LangItem::IntoFuture).ok().flatten().map(checker_of);
     g.discriminant_kind = langs.discriminant_kind;
     g.pointee = langs.pointee;
     // A `const` or `static` item's body (module-level, local in a fn/macro, associated, or
@@ -1571,6 +1586,14 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     let mut items: AVec<'a, u128> = AVec::new_in(alloc);
     for k in c.callees.column::<1>().iter() {
         items.push(k.0);
+    }
+    let has_value_callable = c.types.view().nodes().any(|n| matches!(n, tc::PNode::FnPtr(..) | tc::PNode::Dynamic(_)));
+    if has_value_callable {
+        for d in c.expr_defs.column::<1>().iter() {
+            if let tc::Def::Static(k, _) | tc::Def::Const(k) = *d {
+                items.push(k.0);
+            }
+        }
     }
     let mut opaques: AVec<'a, u128> = AVec::new_in(alloc);
     let mut traits: AVec<'a, u128> = AVec::new_in(alloc);
@@ -1886,6 +1909,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         }
         for &tk_u128 in traits.iter() {
             let tk = tc::ItemKey(tk_u128);
+            ensure_rpitit_trait_rows(r, tk);
             let Some(tr_rows) = r.store.rpitit_traits.get(&tk) else { continue };
             let Some(trait_types) = r.keys.library_in(r.names, tk).and_then(|lib| r.store.maps.traits.get(&lib)).map(|th| th.generics) else {
                 continue;
@@ -1920,8 +1944,9 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             }
             last_imp = Some(imp_u128);
             let imp_k = tc::ItemKey(imp_u128);
+            let Some(tr) = r.store.impls.get(&imp_k).and_then(|ih| ih.trait_) else { continue };
+            ensure_rpitit_trait_rows(r, tr);
             let Some(ih) = r.store.impls.get(&imp_k) else { continue };
-            let Some(tr) = ih.trait_ else { continue };
             let Some(tr_rows) = r.store.rpitit_traits.get(&tr) else { continue };
             for s in tr_rows.rows.iter() {
                 if let Some(&(_, impl_fn)) = ih.fns.iter().find(|&&(n, _)| n == s.fn_name) {
@@ -2621,6 +2646,39 @@ fn ensure_twin_opaque_regions<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>
         r.store.regions.file(twin_k, filed);
         if let Some(n) = src.opaque_captures {
             r.store.maps.opaque_lifetimes.insert_absent(twin_k, n);
+        }
+    }
+}
+
+/// Populate `Store::rpitit_traits` for `trait_` if not already computed (e.g. when borrow
+/// checking runs against a warm cached `Checked` record without re-running typeck in this process).
+fn ensure_rpitit_trait_rows<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, trait_: tc::ItemKey) {
+    if r.store.rpitit_traits.contains_key(&trait_) {
+        return;
+    }
+    let Some(lib) = r.keys.library_in(r.names, trait_) else { return };
+    if !matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Trait)) {
+        return;
+    }
+    container_head(r, lib, true);
+    if !r.store.maps.traits.get(&lib).is_some_and(super::rpitit::may_have_rows) {
+        return;
+    }
+    for _ in 0..256 {
+        let step = {
+            let Some(t) = r.store.maps.traits.get(&lib) else { return };
+            let Some(extra) = r.store.trait_defs.get(&trait_) else { return };
+            match super::rpitit::trait_rows(r.store, trait_, t, &extra.assoc) {
+                Ok(_) => None,
+                Err(super::rpitit::Need::Fn(fk)) => Some(fk),
+                Err(super::rpitit::Need::Refused(..)) => None,
+            }
+        };
+        let Some(fk) = step else { break };
+        if let Some(w) = member_fn_want(r.names, &*r.keys, fk) {
+            ensure_one(r, w);
+        } else {
+            break;
         }
     }
 }

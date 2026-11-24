@@ -390,6 +390,16 @@ pub trait Facts {
         let _ = trait_;
         false
     }
+    /// Whether `trait_` is `core::future::Future`.
+    fn is_future_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
+    /// Whether `trait_` is `core::future::IntoFuture`.
+    fn is_into_future_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
     /// The `AssocTyDef::item` key of associated type `trait_::name` (whose head record holds its
     /// item bounds such as `type Searcher<'a>: Searcher<'a>` or `type Structural: UniqueSet`).
     fn assoc_item(&self, trait_: ItemKey, name: Name) -> Option<ItemKey> {
@@ -4253,31 +4263,114 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// `trait_`'s `name`: its rows at the body's root (`Checked::selected_at(root)`, filed by
     /// the type check for the signature it normalized, D-sig-rows). Order-free: EVERY such row
     /// must name the same impl (`Ok(Some(imp))`), or every one be `Selected::Generic`
-    /// (`Ok(None)`: placeholders). Anything else, why by name: no row, a `NotImpl` or
-    /// `Unanswered` row, rows naming two impls or an impl and `Generic`.
-    fn sig_impl(&self, trait_: ItemKey, name: Name) -> Result<Option<ItemKey>, ProjectionUnbound> {
+    /// (`Ok(None)`: placeholders). When multiple rows for `(trait_, name)` exist for distinct
+    /// projected arguments (e.g. two concrete `SolType::Token` elements in one tuple), `key_args`
+    /// disambiguates by matching each argument's erased head/structure against `r.args`.
+    fn sig_impl(
+        &self,
+        heads: &blaze_borrow::Columns<'_>,
+        trait_: ItemKey,
+        name: Name,
+        key_args: Option<&[PTy]>,
+    ) -> Result<Option<ItemKey>, ProjectionUnbound> {
+        use blaze_borrow::RegionTypes;
         use blaze_typeck::Selected;
-        let mut found: Option<ItemKey> = None;
-        let (mut any, mut generic) = (false, false);
-        for r in self.ck.selected_at(self.body.root).iter().filter(|r| r.trait_ == trait_ && r.name == Some(name)) {
-            any = true;
-            match r.selected {
-                Selected::Impl { imp, .. } if found.is_none_or(|f| f == imp) => found = Some(imp),
-                Selected::Impl { .. } => return Err(ProjectionUnbound::RowsDisagree),
-                // FROZEN path (D190): the sources the record now names read as before they
-                // were named (`Generic`, `NotImpl`).
-                Selected::Generic | Selected::ParamEnv { .. } | Selected::OpaqueBound | Selected::ObjectBound => generic = true,
-                Selected::NotImpl | Selected::Builtin => return Err(ProjectionUnbound::RowNotImpl),
-                Selected::Unanswered => return Err(ProjectionUnbound::RowUnanswered),
+        let classify = |filter: bool| -> Result<Option<ItemKey>, ProjectionUnbound> {
+            let mut found: Option<ItemKey> = None;
+            let (mut any, mut generic) = (false, false);
+            for r in self.ck.selected_at(self.body.root).iter().filter(|r| r.trait_ == trait_ && r.name == Some(name)) {
+                if filter
+                    && let Some(want) = key_args
+                    && !self.sig_args_match(heads, want, r.args)
+                {
+                    continue;
+                }
+                any = true;
+                match r.selected {
+                    Selected::Impl { imp, .. } if found.is_none_or(|f| f == imp) => found = Some(imp),
+                    Selected::Impl { .. } => return Err(ProjectionUnbound::RowsDisagree),
+                    // FROZEN path (D190): the sources the record now names read as before they
+                    // were named (`Generic`, `NotImpl`).
+                    Selected::Generic | Selected::ParamEnv { .. } | Selected::OpaqueBound | Selected::ObjectBound => generic = true,
+                    Selected::NotImpl | Selected::Builtin => return Err(ProjectionUnbound::RowNotImpl),
+                    Selected::Unanswered => return Err(ProjectionUnbound::RowUnanswered),
+                }
+            }
+            match (any, generic, found) {
+                (true, true, Some(_)) => Err(ProjectionUnbound::RowsDisagree),
+                (true, true, None) => Ok(None),
+                (true, false, Some(imp)) => Ok(Some(imp)),
+                // No row (an `Impl` row always sets `found`).
+                (false, ..) | (true, false, None) => Err(ProjectionUnbound::NoRow),
+            }
+        };
+        match classify(false) {
+            Err(ProjectionUnbound::RowsDisagree) if key_args.is_some() => classify(true).or(Err(ProjectionUnbound::RowsDisagree)),
+            Err(ProjectionUnbound::NoRow) => {
+                if let Some(oti) = self.facts.owner_trait_impl()
+                    && oti.trait_ == trait_
+                {
+                    let self_ok = match key_args.and_then(|ks| ks.first().copied()) {
+                        None => true,
+                        Some(st) => match (oti.self_shape, heads.node(st)) {
+                            (SelfShape::Adt(k), Ok(PNode::Adt(a, _))) => k == a,
+                            (SelfShape::Ref(m), Ok(PNode::Ref(n, _))) => m == n,
+                            (SelfShape::Tuple(n), Ok(PNode::Tuple(l))) => heads.kids(st).ok().is_some_and(|ks| ks.len() == n),
+                            _ => false,
+                        },
+                    };
+                    if self_ok {
+                        return Ok(Some(oti.imp));
+                    }
+                }
+                Err(ProjectionUnbound::NoRow)
+            }
+            other => other,
+        }
+    }
+
+    /// Whether erased argument list `want` (in `heads`) structurally matches `row_args` (in
+    /// `self.tys`). An unnormalized `Alias`, `Param`, or `Infer` on either side does not prove a
+    /// mismatch (returns `true` for that position so the caller falls back to `RowsDisagree` if
+    /// ambiguous).
+    fn sig_args_match(&self, heads: &blaze_borrow::Columns<'_>, want: &[PTy], row_args: List) -> bool {
+        use blaze_borrow::RegionTypes;
+        let Ok(rargs) = self.tys.list(row_args) else { return false };
+        if want.len() != rargs.len() {
+            return false;
+        }
+        let arity = crate::one_call::FactsArity { facts: self.facts };
+        let body_cols = blaze_borrow::Columns::new(self.tys, &arity, &arity);
+        let mut stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
+        for (&a, &b) in want.iter().zip(rargs.iter()) {
+            stack.push((a, b));
+        }
+        let mut steps = 0u32;
+        while let Some((a, b)) = stack.pop() {
+            steps += 1;
+            if steps > 128 {
+                return false;
+            }
+            let (Ok(na), Ok(nb)) = (heads.node(a), self.tys.node(b)) else { return false };
+            if matches!(na, PNode::Alias { .. } | PNode::Param(_) | PNode::Infer) || matches!(nb, PNode::Alias { .. } | PNode::Param(_) | PNode::Infer) {
+                continue;
+            }
+            if matches!(na, PNode::ConstValue { .. } | PNode::ConstParam(_)) && matches!(nb, PNode::ConstValue { .. } | PNode::ConstParam(_)) {
+                continue;
+            }
+            if !blaze_borrow::head_eq(na, nb) {
+                return false;
+            }
+            let (Ok(ka), Ok(kb)) = (heads.kids(a), body_cols.kids(b)) else { return false };
+            if ka.len() != kb.len() {
+                return false;
+            }
+            for k in 0..ka.len() {
+                let (Some(ca), Some(cb)) = (ka.get(k), kb.get(k)) else { return false };
+                stack.push((ca, cb));
             }
         }
-        match (any, generic, found) {
-            (true, true, Some(_)) => Err(ProjectionUnbound::RowsDisagree),
-            (true, true, None) => Ok(None),
-            (true, false, Some(imp)) => Ok(Some(imp)),
-            // No row (an `Impl` row always sets `found`).
-            (false, ..) | (true, false, None) => Err(ProjectionUnbound::NoRow),
-        }
+        true
     }
 
     /// One declared projection `<S as trait_>::name` (`alias`: its trait, name and arguments;
@@ -4322,32 +4415,44 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     ) -> Result<Through, Refusal> {
         use blaze_borrow::{Kids, RegionTypes};
         let (trait_, name, _) = alias;
-        let imp = match self.sig_impl(trait_, name) {
+        let key_args = match heads.kids(d) {
+            Ok(Kids::List(args)) => Some(args),
+            _ => None,
+        };
+        let imp = match self.sig_impl(heads, trait_, name, key_args) {
             Ok(Some(imp)) => imp,
             Ok(None) => return Ok(Through::Placeholders),
             Err(why) => return Ok(self.unbound(trait_, why, e)),
         };
         let regions = self.facts.regions();
-        let Ok((self_col, _)) = regions.impl_header(imp) else { return Ok(self.unbound(trait_, ProjectionUnbound::ImplHeaderUnread, e)) };
+        let Ok((self_col, trait_col)) = regions.impl_header(imp) else { return Ok(self.unbound(trait_, ProjectionUnbound::ImplHeaderUnread, e)) };
         let Ok(value) = regions.impl_assoc(imp, name) else { return Ok(self.unbound(trait_, ProjectionUnbound::ImplAssocUnread, e)) };
         let Ok(params) = regions.lifetime_params(imp) else { return Ok(self.unbound(trait_, ProjectionUnbound::ImplParamsUnread, e)) };
-        // The alias's own slots (the trait's lifetimes, always none; a GAT's own): a GAT's are
-        // not numbered in the impl's value here.
-        match heads.own(d) {
-            Ok(own) if own.get() == 0 => {}
-            _ => return Ok(self.unbound(trait_, ProjectionUnbound::GatLifetimes, e)),
+        let Ok(own) = heads.own(d) else { return Ok(self.unbound(trait_, ProjectionUnbound::GatLifetimes, e)) };
+        let own_len = own.len();
+        let trait_own: &[Region] = match trait_col {
+            Some(tc) => tc.own(),
+            None if own_len == 0 => &[],
+            None => return Ok(self.unbound(trait_, ProjectionUnbound::GatLifetimes, e)),
+        };
+        let tl = trait_own.len();
+        if own_len < tl {
+            return Ok(self.unbound(trait_, ProjectionUnbound::GatLifetimes, e));
         }
+        let Some(decl_trait_lts) = mine.get(..tl) else { return Ok(self.unbound(trait_, ProjectionUnbound::GatLifetimes, e)) };
+        let Some(decl_gat_lts) = mine.get(tl..own_len) else { return Ok(self.unbound(trait_, ProjectionUnbound::GatLifetimes, e)) };
+        let Some(after_own) = mine.get(own_len..) else { return Ok(self.unbound(trait_, ProjectionUnbound::GatLifetimes, e)) };
         let Ok(Kids::List(args)) = heads.kids(d) else { return Ok(self.unbound(trait_, ProjectionUnbound::SelfTypeUnread, e)) };
         let Some(&self_ty) = args.first() else { return Ok(self.unbound(trait_, ProjectionUnbound::SelfTypeUnread, e)) };
         let Ok(self_n) = heads.count(self_ty) else { return Ok(self.unbound(trait_, ProjectionUnbound::SelfTypeUnread, e)) };
         let differ = ProjectionUnbound::SelfSlotsDiffer { imp: self_col.as_slice().len() as u32, declared: self_n.get() };
-        let Some(decl_self) = mine.get(..self_n.get() as usize) else { return Ok(self.unbound(trait_, differ, e)) };
+        let Some(decl_self) = after_own.get(..self_n.len()) else { return Ok(self.unbound(trait_, differ, e)) };
         if self_col.as_slice().len() != decl_self.len() {
             return Ok(self.unbound(trait_, differ, e));
         }
         let mut bind: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         bind.resize(params.count() as usize, None);
-        for (&ir, &dr) in self_col.as_slice().iter().zip(decl_self.iter()) {
+        for (&ir, &dr) in trait_own.iter().zip(decl_trait_lts.iter()).chain(self_col.as_slice().iter().zip(decl_self.iter())) {
             match ir {
                 Region::Param(i) => {
                     let Some(slot) = bind.get_mut(i as usize) else { return Ok(self.unbound(trait_, ProjectionUnbound::SelfRegionUnnumbered, e)) };
@@ -4370,6 +4475,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             out.push(match v {
                 Some(Region::Param(i)) => bind.get(i as usize).copied().flatten(),
                 Some(Region::Static) => Some(Region::Static),
+                Some(Region::Late { binder: u32::MAX, var }) => usize::try_from(var).ok().and_then(|idx| decl_gat_lts.get(idx)).copied(),
                 Some(Region::Late { .. }) | None => None,
             });
         }
@@ -6991,51 +7097,21 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             self.stats.calls_by_signature += 1;
             return Ok(());
         }
+        // A callable loaded from a static/const, an indexed slice/array (`DECODE_SHIMS[idx](..)`),
+        // a struct/tuple field holding `dyn Fn*` (`(self.0)(parent)`), or a local initialized from
+        // a call returning a callable (`let prev = take_hook(); prev(info)`).
+        if let Some(&v0) = vs.first()
+            && self.call_through_source_callable(c, v0, args, dest, dest_ty, e)?
+        {
+            self.stats.calls_by_signature += 1;
+            return Ok(());
+        }
         let param = match self.expr(c)? {
             Expr::Local(p) => self.body.params.iter().position(|x| *x == p),
             _ => None,
         };
         let facts: &'b F = self.facts;
         let Some(param) = param else {
-            if let Expr::Local(p) = self.expr(c)?
-                && let Some(&(_, adt, variant, field)) = self.local_field_source.iter().find(|&&(pat, ..)| pat == p)
-                && let Ok(col) = facts.regions().field(adt, variant, field)
-                && dest_ty.wrap.is_none()
-                && !args.iter().any(|v| v.ty.wrap.is_some())
-            {
-                let mut declared = col.ty();
-                let mut slots = col.as_slice();
-                for _ in 0..16 {
-                    match self.head_node(declared, e)? {
-                        PNode::Ref(_, inner) => {
-                            let Some(rest) = slots.get(1..) else { break };
-                            declared = inner;
-                            slots = rest;
-                        }
-                        PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.lifetimes == 0) => {
-                            let list = self.head_list(l, e)?;
-                            let Some(&inner) = list.first() else { break };
-                            if list.len() > 2 {
-                                break;
-                            }
-                            let arity = crate::one_call::FactsArity { facts };
-                            let heads = blaze_borrow::Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
-                            let Ok(ic) = blaze_borrow::RegionTypes::count(&heads, inner) else { break };
-                            let Some(inner_slots) = slots.get(..ic.get() as usize) else { break };
-                            declared = inner;
-                            slots = inner_slots;
-                        }
-                        _ => break,
-                    }
-                }
-                if let PNode::Dynamic(list) = self.head_node(declared, e)?
-                    && !slots.iter().any(|r| matches!(r, Region::Param(_)))
-                    && self.call_through_dyn_fn(list, slots, args, dest, dest_ty, e)?
-                {
-                    self.stats.calls_by_signature += 1;
-                    return Ok(());
-                }
-            }
             return self.refuse(Form::CalleeValueUnknown, e);
         };
         // The parameter's regions are the body's own signature column's input `param` (D148):
@@ -7462,6 +7538,216 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         self.call_laid(laid, None, &seed, args, dest, dest_ty, e)
     }
 
+    /// Resolves a callable expression `c` whose declared region column lives in a static/const,
+    /// an indexed slice/array (`DECODE_SHIMS[idx](data, config)`), a struct/tuple field holding
+    /// `dyn Fn*` (`(self.0)(parent)`), or a local initialized from a call returning a callable
+    /// (`let prev = take_hook(); prev(info)`), and relates the call through its declared column.
+    fn call_through_source_callable(&mut self, mut c: ExprId, callee_val: Val, args: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+        if dest_ty.wrap.is_some() || args.iter().any(|v| v.ty.wrap.is_some()) || callee_val.ty.wrap.is_some() {
+            return Ok(false);
+        }
+        let mut peel_index = false;
+        for _ in 0..16 {
+            match self.expr(c)? {
+                Expr::Paren(i) | Expr::Unary { op: UnOp::Deref, operand: i } => c = i,
+                Expr::Index { base, .. } => {
+                    peel_index = true;
+                    c = base;
+                }
+                _ => break,
+            }
+        }
+        let facts: &'b F = self.facts;
+        let place_info = match callee_val.at {
+            At::Place(p) => Some(self.info(p)),
+            At::Const => None,
+        };
+        let resolved: Option<(PTy, &'b [Region], bool)> = match self.expr(c)? {
+            Expr::Path(_) => match self.expr_def(c) {
+                Some(Def::Static(item, _) | Def::Const(item)) => {
+                    if let Ok(sig) = facts.sig(item)
+                        && let Some(out_slots) = sig.output()
+                        && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                    {
+                        Some((out_ty, out_slots, false))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
+                let field_idx = match self.expr(c)? {
+                    Expr::Field { .. } => self.field_of(c),
+                    Expr::TupleField { index, .. } => Some(index),
+                    _ => None,
+                };
+                if let Some(fi) = field_idx
+                    && let Some(adt) = self.peel_field_adt(base, e)?
+                    && let Ok(col) = facts.regions().field(adt, 0, fi)
+                {
+                    Some((col.ty(), col.as_slice(), false))
+                } else {
+                    None
+                }
+            }
+            Expr::Local(p) => {
+                if let Some(&(_, adt, variant, field)) = self.local_field_source.iter().find(|&&(pat, ..)| pat == p)
+                    && let Ok(col) = facts.regions().field(adt, variant, field)
+                {
+                    Some((col.ty(), col.as_slice(), false))
+                } else if peel_index
+                    && !self.in_nested
+                    && let Some(param) = self.body.params.iter().position(|x| *x == p)
+                    && let Ok(param32) = u32::try_from(param)
+                    && let Ok(own_sig) = facts.sig(self.body.owner)
+                    && let Some(in_slots) = own_sig.input(param32)
+                    && let Ok(in_ty) = self.sig_declared(own_sig, param32, e)
+                {
+                    Some((in_ty, in_slots, true))
+                } else if let Some(callee) = self.local_call_init(p)
+                    && let Ok(sig) = facts.sig(callee)
+                    && let Some(out_slots) = sig.output()
+                    && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                {
+                    Some((out_ty, out_slots, false))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let Some((mut declared, mut slots, owner_numbered)) = resolved else {
+            return Ok(false);
+        };
+        let arity = crate::one_call::FactsArity { facts };
+        let heads = blaze_borrow::Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
+        for _ in 0..16 {
+            match self.head_node(declared, e)? {
+                PNode::Ref(_, inner) => {
+                    let Some(rest) = slots.get(1..) else { break };
+                    declared = inner;
+                    slots = rest;
+                }
+                PNode::Slice(inner) | PNode::Array(inner, _) if peel_index => {
+                    declared = inner;
+                }
+                PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.lifetimes == 0) => {
+                    let list = self.head_list(l, e)?;
+                    let Some(&inner) = list.first() else { break };
+                    if list.len() > 2 {
+                        break;
+                    }
+                    let Ok(ic) = blaze_borrow::RegionTypes::count(&heads, inner) else { break };
+                    let Some(inner_slots) = slots.get(..ic.len()) else { break };
+                    declared = inner;
+                    slots = inner_slots;
+                }
+                _ => break,
+            }
+        }
+        match self.head_node(declared, e)? {
+            PNode::Dynamic(list) => {
+                if !owner_numbered && slots.iter().any(|r| matches!(r, Region::Param(_))) {
+                    return Ok(false);
+                }
+                self.call_through_dyn_fn(list, slots, args, dest, dest_ty, e)
+            }
+            PNode::FnPtr(fn_list, _) => {
+                let fn_kids = self.head_list(fn_list, e)?;
+                if fn_kids.len() != args.len() + 1 {
+                    return Ok(false);
+                }
+                let mut ends: Vec<u32, A> = Vec::new_in(self.alloc);
+                let mut at = 0u32;
+                for v in args.iter() {
+                    at += self.npos_d(v.ty, e)?;
+                    ends.push(at);
+                }
+                let dlen = self.npos_d(dest_ty, e)?;
+                let Some(total) = at.checked_add(dlen) else { return Ok(false) };
+                if usize::try_from(total).ok() != Some(slots.len()) {
+                    return Ok(false);
+                }
+                let mut prev = 0u32;
+                for (i, &kid) in fn_kids.iter().take(args.len()).enumerate() {
+                    let Some(&end_i) = ends.get(i) else { return Ok(false) };
+                    let want = end_i - prev;
+                    prev = end_i;
+                    if blaze_borrow::RegionTypes::count(&heads, kid).ok().map(|c| c.get()) != Some(want) {
+                        return Ok(false);
+                    }
+                }
+                let Some(&ret_kid) = fn_kids.get(args.len()) else { return Ok(false) };
+                if blaze_borrow::RegionTypes::count(&heads, ret_kid).ok().map(|c| c.get()) != Some(dlen) {
+                    return Ok(false);
+                }
+                let binders = facts.fn_binders();
+                let mut seed: Vec<(Region, Origin), A> = Vec::new_in(self.alloc);
+                for (j, &r) in slots.iter().enumerate() {
+                    let free = matches!(r, Region::Param(_)) || (!binders && matches!(r, Region::Late { .. }));
+                    if free && !seed.iter().any(|(x, _)| *x == r) {
+                        if owner_numbered && matches!(r, Region::Param(_)) && !self.in_nested {
+                            seed.push((r, self.universal(r)));
+                            continue;
+                        }
+                        let Some(pi) = place_info else { return Ok(false) };
+                        if !pi.exact || usize::try_from(pi.len).ok() != Some(slots.len()) {
+                            return Ok(false);
+                        }
+                        let Some(idx) = usize::try_from(pi.start).ok().and_then(|s| s.checked_add(j)) else { return Ok(false) };
+                        let Some(&orig) = self.origs.get(idx) else { return Ok(false) };
+                        seed.push((r, orig));
+                    }
+                }
+                let laid = Laid { regions: slots, ends: &ends, bounds: &[] };
+                self.call_laid(laid, None, &seed, args, dest, dest_ty, e)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Peels `&`/`&mut`/`Box` off a field expression's base to find its `PNode::Adt` key.
+    fn peel_field_adt(&self, base: ExprId, e: ExprId) -> Result<Option<ItemKey>, Refusal> {
+        let facts: &'b F = self.facts;
+        let mut bt = self.adjusted_ty(base)?;
+        for _ in 0..16 {
+            match self.node(bt, e)? {
+                PNode::Ref(_, inner) => bt = inner,
+                PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.is_box) => {
+                    let Some(&inner) = self.list(l, e)?.first() else { return Ok(None) };
+                    bt = inner;
+                }
+                PNode::Adt(adt, _) => return Ok(Some(adt)),
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    /// If local binding `p` was introduced by `let p = callee(..);` where `callee` is a known
+    /// item key, return that callee so a callable returned by it (e.g. `std::panic::take_hook()`)
+    /// can read its declared output region column even when captured into a nested closure.
+    fn local_call_init(&self, p: PatId) -> Option<ItemKey> {
+        for stmt in self.body.stmts.iter() {
+            if let blaze_typeck::Stmt::Let { pat, init: Some(init), .. } = *stmt
+                && pat == p
+            {
+                let mut cur = init;
+                for _ in 0..8 {
+                    match self.body.exprs.get(cur.ix()) {
+                        Some(&Expr::Paren(i)) => cur = i,
+                        _ => break,
+                    }
+                }
+                if let Some((callee, _)) = self.callee_of(cur) {
+                    return Some(callee);
+                }
+            }
+        }
+        None
+    }
+
     /// Calls a fn pointer loaded from a struct field (`(self.cb)(args)`, or extracted via a
     /// pattern like `let Some(dup) = self.duplicator; dup(x)`), reading the field's declared
     /// regions from `Facts::regions().field(...)` (or `Facts::field_regions(...)`).
@@ -7485,9 +7771,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         }
         let facts: &'b F = self.facts;
         let (adt, variant, field_idx, adt_args) = match self.expr(c)? {
-            Expr::Field { base, .. } => {
-                let Some(field_idx) = self.field_of(c) else {
-                    return Ok(false);
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
+                let field_idx = match self.expr(c)? {
+                    Expr::Field { .. } => {
+                        let Some(fi) = self.field_of(c) else { return Ok(false) };
+                        fi
+                    }
+                    Expr::TupleField { index, .. } => index,
+                    _ => return Ok(false),
                 };
                 let mut bt = self.adjusted_ty(base)?;
                 let mut bsteps = 0u32;

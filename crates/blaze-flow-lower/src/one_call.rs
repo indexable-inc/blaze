@@ -500,6 +500,12 @@ impl<F: Facts> Selected for CallSel<'_, F> {
     fn is_fn_trait(&self, trait_: ItemKey) -> bool {
         self.facts.is_fn_trait(trait_)
     }
+    fn is_future_trait(&self, trait_: ItemKey) -> bool {
+        self.facts.is_future_trait(trait_)
+    }
+    fn is_into_future_trait(&self, trait_: ItemKey) -> bool {
+        self.facts.is_into_future_trait(trait_)
+    }
     fn fn_def_sig(&self, item: ItemKey) -> Result<(blaze_typeck::region_facts::ParamsView<'_>, blaze_typeck::region_facts::ColView<'_>, ImplWhere<'_>), NotSelected> {
         let regions = self.facts.regions();
         let Ok(sig) = regions.sig(item) else { return Err(NotSelected::Builtin) };
@@ -537,34 +543,31 @@ impl<F: Facts> Selected for CallSel<'_, F> {
         let mut exact: Option<&Projected> = None;
         let mut loose: Option<&Projected> = None;
         for r in self.rows.iter().filter(answers) {
-            let keyed = if r.name.is_none() {
-                match self.tys.list(r.args) {
-                    Ok(list) if u32::try_from(list.len()).ok() == Some(info.trait_types) => {
-                        let mut all_exact = true;
-                        let mut differ = false;
-                        for (k, &t) in (0..info.trait_types).zip(list.iter()) {
-                            match args.compare(k, t) {
-                                Keyed::Differ => {
-                                    differ = true;
-                                    break;
-                                }
-                                Keyed::Unknown => all_exact = false,
-                                Keyed::Same => {}
+            let keyed = match self.tys.list(r.args) {
+                Ok(list) if usize::try_from(info.trait_types).is_ok_and(|tt| list.len() >= tt) => {
+                    let mut all_exact = true;
+                    let mut differ = false;
+                    for (k, &t) in (0..info.trait_types).zip(list.iter()) {
+                        match args.compare(k, t) {
+                            Keyed::Differ => {
+                                differ = true;
+                                break;
                             }
-                        }
-                        if differ {
-                            Keyed::Differ
-                        } else if all_exact {
-                            Keyed::Same
-                        } else {
-                            Keyed::Unknown
+                            Keyed::Unknown => all_exact = false,
+                            Keyed::Same => {}
                         }
                     }
-                    Ok(_) => Keyed::Differ,
-                    Err(_) => Keyed::Unknown,
+                    if differ {
+                        Keyed::Differ
+                    } else if all_exact {
+                        Keyed::Same
+                    } else {
+                        Keyed::Unknown
+                    }
                 }
-            } else {
-                self.match_row(r, args)
+                _ if r.name.is_some() => self.match_row(r, args),
+                Ok(_) => Keyed::Differ,
+                Err(_) => Keyed::Unknown,
             };
             match keyed {
                 Keyed::Differ => continue,

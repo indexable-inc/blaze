@@ -1007,6 +1007,160 @@ fn control_nested_rpit_dangling(p: &u8) -> Result<impl Iterator<Item = &u8> + '_
 fn control_nested_rpit_uncaptured<'a, 'b>(_a: &'a u8, b: &'b u8) -> Result<impl Iterator<Item = u8> + use<'a>, ()> {
     Ok(core::iter::once(b).copied())
 }
+
+// Class H: Trait-lifetime & chained GAT projections (`type Token<'a> = <Self::Params<'a> as SolTy>::Token<'a>`)
+trait Vis<'de> {
+    type Val;
+    fn visit(&self, data: &'de [u8]) -> Self::Val;
+}
+struct SliceVis;
+impl<'de> Vis<'de> for SliceVis {
+    type Val = &'de [u8];
+    fn visit(&self, data: &'de [u8]) -> Self::Val { data }
+}
+fn use_trait_lt_assoc<'a>(v: &SliceVis, data: &'a [u8]) -> &'a [u8] {
+    v.visit(data)
+}
+fn control_trait_lt_assoc_dangling(v: &SliceVis) -> &'static [u8] {
+    let local = [1u8, 2];
+    v.visit(&local)
+}
+
+trait SolTy {
+    type Tok<'a>;
+}
+struct SolU8;
+impl SolU8 {
+    fn tok(x: &u8) -> &u8 { x }
+}
+impl SolTy for SolU8 {
+    type Tok<'a> = &'a u8;
+}
+impl<A: SolTy, B: SolTy> SolTy for (A, B) {
+    type Tok<'a> = (A::Tok<'a>, B::Tok<'a>);
+}
+trait SolFn {
+    type Params<'a>: SolTy;
+    type Tok<'a>;
+    fn tokenize(&self) -> Self::Tok<'_>;
+}
+struct PairCall {
+    a: u8,
+    b: u8,
+}
+impl SolFn for PairCall {
+    type Params<'a> = (SolU8, SolU8);
+    type Tok<'a> = <Self::Params<'a> as SolTy>::Tok<'a>;
+    fn tokenize(&self) -> Self::Tok<'_> {
+        (SolU8::tok(&self.a), SolU8::tok(&self.b))
+    }
+}
+fn use_chained_gat(c: &PairCall) -> (&u8, &u8) {
+    c.tokenize()
+}
+fn control_chained_gat_dangling() -> &'static u8 {
+    let local = PairCall { a: 1, b: 2 };
+    local.tokenize().0
+}
+
+// Class I: Value callables (`static` fn-ptr slice indexing, tuple-field `Box<dyn FnOnce>`, local from call)
+fn shim_first(xs: &[u8]) -> u8 { xs.first().copied().unwrap_or(0) }
+static SHIMS: &[fn(&[u8]) -> u8] = &[shim_first];
+fn call_static_fn_shim(idx: usize, data: &[u8]) -> u8 {
+    SHIMS[idx](data)
+}
+fn shim_need_static(x: &'static u8) -> u8 { *x }
+static STATIC_SHIMS: &[fn(&'static u8) -> u8] = &[shim_need_static];
+fn control_static_fn_shim_non_static(idx: usize) -> u8 {
+    let local = 7u8;
+    STATIC_SHIMS[idx](&local)
+}
+struct Deferred(Box<dyn FnOnce(&u8) -> u8>);
+impl Deferred {
+    fn resolve(self, x: &u8) -> u8 {
+        (self.0)(x)
+    }
+}
+struct DeferredStatic(Box<dyn FnOnce(&'static u8) -> u8>);
+impl DeferredStatic {
+    fn control_tuple_field_fn_non_static(self) -> u8 {
+        let local = 9u8;
+        (self.0)(&local)
+    }
+}
+fn make_hook() -> Box<dyn Fn(&u8) -> u8> {
+    Box::new(|x| *x)
+}
+fn call_local_returned_dyn_fn_in_closure(x: &u8) -> u8 {
+    let hook = make_hook();
+    let run = move |y: &u8| hook(y);
+    run(x)
+}
+fn make_static_hook() -> Box<dyn Fn(&'static u8) -> u8> {
+    Box::new(|x| *x)
+}
+fn control_local_returned_dyn_fn_non_static() -> u8 {
+    let hook = make_static_hook();
+    let local = 3u8;
+    hook(&local)
+}
+
+// Class J: Builtin `<async { .. } as Future>::Output` with non-zero lifetime slots & `IntoFuture`
+fn drive_future<F: core::future::IntoFuture>(f: F) -> F::Output {
+    let _ = f;
+    loop {}
+}
+fn async_output_with_lifetime_slot() -> Result<(), Box<dyn core::error::Error>> {
+    drive_future(async { Ok(()) })
+}
+fn async_output_borrows_outer(x: &u8) -> &u8 {
+    drive_future(async move { x })
+}
+fn control_async_output_dangling() -> &'static u8 {
+    let local = 42u8;
+    drive_future(async { &local })
+}
+
+// Class K: Generic RPITIT trait method (`fn req<R, F>(&self, f: F) -> impl Future<Output = Option<R>>`)
+trait ReqExt<T> {
+    fn req<R, F>(&self, f: F) -> impl core::future::Future<Output = Option<R>>
+    where
+        F: FnOnce(T) -> Option<R>;
+}
+struct Chan<T>(T);
+impl<T: Copy> ReqExt<T> for Chan<T> {
+    async fn req<R, F>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(T) -> Option<R>,
+    {
+        f(self.0)
+    }
+}
+async fn use_generic_rpitit(ch: &Chan<u8>) -> Option<u8> {
+    ch.req(|v| Some(v + 1)).await
+}
+async fn control_generic_rpitit_dangling(ch: &Chan<u8>) -> Option<&'static u8> {
+    let local = 5u8;
+    ch.req(|_| Some(&local)).await
+}
+
+// Class L: Subtrait elaboration on associated types (`trait Outer: Base<Item: Helper>`)
+trait Helper {
+    fn help<'a>(&self, x: &'a u8) -> &'a u8;
+}
+trait Base {
+    type Item;
+}
+trait Outer: Base<Item: Helper> {
+    fn item(&self) -> &Self::Item;
+}
+fn use_assoc_subtrait<'a, T: Outer>(o: &T, x: &'a u8) -> &'a u8 {
+    o.item().help(x)
+}
+fn control_assoc_subtrait_dangling<T: Outer>(o: &T) -> &'static u8 {
+    let local = 11u8;
+    o.item().help(&local)
+}
 "#;
     let heap = blaze_own::testing::heap();
     let tc = open_toolchain();
