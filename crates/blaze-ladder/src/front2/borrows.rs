@@ -1657,10 +1657,10 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         if let Some(f) = r.store.fns.get(&key) {
             let tys = r.store.tys.view();
             let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(tys.node(t), Ok(tc::PNode::Ref(..))));
-            let callee = CalleeFacts { writes_lifetimes: f.qualifiers.writes_lifetimes(), self_ref };
+            let callee = CalleeFacts { writes_lifetimes: f.qualifiers.writes_lifetimes(), self_ref, c_variadic: f.c_variadic };
             g.callees.push((k, callee));
         } else if r.store.ctors.contains_key(&key) {
-            g.callees.push((k, CalleeFacts { writes_lifetimes: true, self_ref: false }));
+            g.callees.push((k, CalleeFacts { writes_lifetimes: true, self_ref: false, c_variadic: false }));
         } else {
             g.reads.push(head_read(k, HeadAnswer::NotMade));
         }
@@ -2014,7 +2014,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             if let Some(f) = r.store.fns.get(&impl_fn) {
                 let tys = r.store.tys.view();
                 let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(tys.node(t), Ok(tc::PNode::Ref(..))));
-                g.callees.push((impl_fn.0, CalleeFacts { writes_lifetimes: f.qualifiers.writes_lifetimes(), self_ref }));
+                g.callees.push((impl_fn.0, CalleeFacts { writes_lifetimes: f.qualifiers.writes_lifetimes(), self_ref, c_variadic: f.c_variadic }));
                 let out = r.store.fn_output(impl_fn).unwrap_or(f.output);
                 let mut st: AVec<'a, tc::PTy> = AVec::new_in(alloc);
                 st.push(out);

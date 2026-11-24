@@ -106,7 +106,7 @@ impl Facts for Heads {
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
-        Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
+        Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
     }
     fn call_bounds(&self, item: ItemKey) -> Option<CallBounds<'_>> {
         (item == self.take).then_some(CallBounds { outlives: &[], unread_below: 0, trait_bounded: TRAIT_BOUNDED })
@@ -334,7 +334,7 @@ impl Facts for Rung {
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum, is_box: false })
     }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
-        Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
+        Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
     }
     fn call_bounds(&self, item: ItemKey) -> Option<CallBounds<'_>> {
         let trait_bounded: &[u32] = if self.trait_fns.contains(&item) { TRAIT_BOUNDED } else { &[] };

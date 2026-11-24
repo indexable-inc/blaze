@@ -136,7 +136,7 @@ impl Facts for Heads {
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
-        Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
+        Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
     }
     fn shape(&self, item: ItemKey) -> Option<Shape<'_>> {
         self.shapes.iter().find(|(k, _)| *k == item).map(|(_, s)| s.shape())

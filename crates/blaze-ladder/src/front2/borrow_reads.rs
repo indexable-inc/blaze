@@ -298,9 +298,10 @@ pub fn head_read(item: u128, answer: HeadAnswer<'_>) -> Read {
         HeadAnswer::NotMade => h.tag(0),
         HeadAnswer::Made { callee, sig } => {
             h.tag(1);
-            let CalleeFacts { writes_lifetimes, self_ref } = callee;
+            let CalleeFacts { writes_lifetimes, self_ref, c_variadic } = callee;
             flag(&mut h, writes_lifetimes);
             flag(&mut h, self_ref);
+            flag(&mut h, c_variadic);
             match sig {
                 Ok(life) => {
                     h.tag(1);

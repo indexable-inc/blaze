@@ -26,7 +26,7 @@ use blaze_own::{AVec, Alloc};
 use crate::task::{Variant, WalkRow};
 
 const MAGIC: [u8; 4] = *b"BZMT";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const NONE: u32 = u32::MAX;
 
 /// One module of the tree, root first, each after its parent (the walk's order).
@@ -43,14 +43,16 @@ pub struct TreeModule<'r> {
     pub dir: &'r str,
     pub path_dir: &'r str,
     pub no_implicit_prelude: bool,
+    pub macro_use: bool,
     /// `krate::a::b`.
     pub path: &'r str,
     /// Its `mod` lines as its `ModuleDecls` hold them: each child and its `#[macro_use]` bit.
     pub lines: AVec<'r, (ItemKey, bool)>,
     /// What the walk read of its text.
     pub rows: AVec<'r, WalkRow<'r>>,
-    /// For a file's own items: the file's inner `#![cfg]` verdict and `#![no_implicit_prelude]`.
-    pub file_attrs: Option<(bool, bool)>,
+    /// For a file's own items: the file's inner `#![cfg]` verdict, `#![no_implicit_prelude]`,
+    /// and `#![macro_use]`.
+    pub file_attrs: Option<(bool, bool, bool)>,
     /// How many `#[macro_export]` macros its text defines (the crate root lists them).
     pub exports: u32,
     /// How many macros (`macro_rules!`, `macro`) its own text defines: a one-group solve
@@ -180,6 +182,7 @@ impl<'r> TreeRecord<'r> {
             out.u32(m.exports as usize, "exports")?;
             out.u32(m.macros as usize, "macros")?;
             out.flag(m.no_implicit_prelude);
+            out.flag(m.macro_use);
             out.flag(m.name.is_some());
             out.str(m.name.unwrap_or(""), "name")?;
             out.str(m.file, "file")?;
@@ -187,9 +190,10 @@ impl<'r> TreeRecord<'r> {
             out.str(m.path_dir, "path dir")?;
             out.str(m.path, "path")?;
             out.flag(m.file_attrs.is_some());
-            let (cfg_ok, nip) = m.file_attrs.unwrap_or((false, false));
+            let (cfg_ok, nip, mu) = m.file_attrs.unwrap_or((false, false, false));
             out.flag(cfg_ok);
             out.flag(nip);
+            out.flag(mu);
             out.u32(m.lines.len(), "mod lines")?;
             for &(k, macro_use) in m.lines.iter() {
                 out.key(k);
@@ -200,6 +204,7 @@ impl<'r> TreeRecord<'r> {
                 out.str(row.name, "row name")?;
                 out.flag(row.inline);
                 out.flag(row.no_implicit_prelude);
+                out.flag(row.macro_use);
                 out.flag(row.path.is_some());
                 out.str(row.path.unwrap_or(""), "row path")?;
             }
@@ -250,11 +255,12 @@ impl<'r> TreeRecord<'r> {
             let exports = r.u32().map_err(TreeRecordError::Short)?;
             let macros = r.u32().map_err(TreeRecordError::Short)?;
             let no_implicit_prelude = flag(&mut r)?;
+            let macro_use = flag(&mut r)?;
             let named = flag(&mut r)?;
             let name = text(&mut r)?;
             let (file, dir, path_dir, path) = (text(&mut r)?, text(&mut r)?, text(&mut r)?, text(&mut r)?);
             let has_file_attrs = flag(&mut r)?;
-            let (cfg_ok, nip) = (flag(&mut r)?, flag(&mut r)?);
+            let (cfg_ok, nip, mu) = (flag(&mut r)?, flag(&mut r)?, flag(&mut r)?);
             let n = count(&mut r)?;
             let mut lines = AVec::with_capacity_in(n.min(bytes.len() / 33), alloc);
             for _ in 0..n {
@@ -264,9 +270,9 @@ impl<'r> TreeRecord<'r> {
             let mut rows = AVec::with_capacity_in(n.min(bytes.len() / 11), alloc);
             for _ in 0..n {
                 let name = text(&mut r)?;
-                let (inline, no_implicit_prelude, has_path) = (flag(&mut r)?, flag(&mut r)?, flag(&mut r)?);
+                let (inline, no_implicit_prelude, row_macro_use, has_path) = (flag(&mut r)?, flag(&mut r)?, flag(&mut r)?, flag(&mut r)?);
                 let path = text(&mut r)?;
-                rows.push(WalkRow { name, inline, no_implicit_prelude, path: has_path.then_some(path) });
+                rows.push(WalkRow { name, inline, no_implicit_prelude, macro_use: row_macro_use, path: has_path.then_some(path) });
             }
             modules.push(TreeModule {
                 key: module,
@@ -277,10 +283,11 @@ impl<'r> TreeRecord<'r> {
                 dir,
                 path_dir,
                 no_implicit_prelude,
+                macro_use,
                 path,
                 lines,
                 rows,
-                file_attrs: has_file_attrs.then_some((cfg_ok, nip)),
+                file_attrs: has_file_attrs.then_some((cfg_ok, nip, mu)),
                 exports,
                 macros,
             });
@@ -309,5 +316,20 @@ impl<'r> TreeRecord<'r> {
         }
         r.finish().map_err(TreeRecordError::Short)?;
         Ok(TreeRecord { modules, enums, tools, no_std, no_core, arbitrary_ints, crate_root })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn previous_version_3_is_rejected() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let mut bytes = AVec::new_in(alloc);
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        assert_eq!(TreeRecord::read(&bytes, alloc), Err(TreeRecordError::NotTree));
     }
 }

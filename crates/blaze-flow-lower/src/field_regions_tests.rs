@@ -150,7 +150,7 @@ impl Facts for World {
         }))
     }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
-        Some(CalleeFacts { writes_lifetimes: true, self_ref: false })
+        Some(CalleeFacts { writes_lifetimes: true, self_ref: false, c_variadic: false })
     }
     fn field(&self, adt: ItemKey, _: u32, name: Name) -> Option<u32> {
         let names: &[&str] = if adt == self.b {

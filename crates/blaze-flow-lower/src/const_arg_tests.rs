@@ -108,7 +108,7 @@ impl Facts for Heads {
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
-        Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
+        Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
     }
     fn call_bounds(&self, _: ItemKey) -> Option<CallBounds<'_>> {
         Some(CallBounds { outlives: &[], unread_below: 0, trait_bounded: &[] })

@@ -161,3 +161,42 @@ fn control_without_the_reexport_vec_is_not_found() {
         assert_eq!(got.map(|r| r.def), Ok(want.def), "`eprintln` from k2's root ({side})");
     }
 }
+
+/// An out-of-line module file with inner `#![macro_use]` exports its `macro_rules!` to subsequent
+/// sibling modules, and a `#[cfg_attr(..., // comment, \n allow(...))]` comment with commas does
+/// not split into bogus attribute macros.
+#[test]
+fn inner_macro_use_on_out_of_line_module_and_cfg_attr_comments() {
+    static LIB: &str = "#![no_core]
+mod defs;
+mod user;
+#[cfg_attr(
+    not(feature = \"nope\"),
+    // NB: Rust 1.89, current stable, has commas here.
+    // however, does, allow below still parses cleanly.
+    allow(dead_code, reason = \"keep\")
+)]
+pub trait Kept {}
+";
+    static DEFS: &str = "#![macro_use]
+macro_rules! make_type {
+    ($name:ident) => { pub struct $name; };
+}
+";
+    static USER: &str = "make_type!(Made);
+pub type Alias = (Made, crate::Kept);
+";
+    static FILES: Texts = Texts(&[&[("/k/lib.rs", LIB), ("/k/defs.rs", DEFS), ("/k/user.rs", USER)]]);
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
+    let inputs = [input("k", "/k/lib.rs", &[])];
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &FILES, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let c = solved[0].names;
+    assert!(c.notes.is_empty(), "expected no resolution notes, got {:?}", c.notes);
+    let fresh = Names::of_crates(&inputs, Sysroot::default(), &[c], g).unwrap_or_else(|e| panic!("names: {e:?}"));
+    let root = fresh.root(0);
+    let kept = Written { kind: PathKind::Plain, segments: &["Kept"] };
+    assert!(path(&fresh, root, Namespace::Types, kept, g).is_ok(), "`Kept` must be declared despite comments in #[cfg_attr]");
+    let made = Written { kind: PathKind::Plain, segments: &["user", "Made"] };
+    assert!(path(&fresh, root, Namespace::Types, made, g).is_ok(), "`user::Made` must expand via inner #![macro_use] in defs.rs");
+}

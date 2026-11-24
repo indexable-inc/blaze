@@ -192,7 +192,9 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// 37: a trait's record holds each associated type's regions state (laid, softly refused, or
 /// head refused, filed under the associated type's key by `Store::trait_members`) in
 /// `Parts::WithRegions`, left out of the erased digest.
-pub const VERSION: u32 = 37;
+/// 38: a fn's text slot starts with a mode byte (`0` external whole text, `1` external signature
+/// prefix, `2` inline synthetic text for synthesized fn heads such as RFC 3681 field defaults).
+pub const VERSION: u32 = 38;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -1203,20 +1205,28 @@ fn encode_into_scratch<'b>(
     let kind = match head {
         HeadRef::Fn { key, head, preds, static_, regions: _, misses } => {
             o.key(key);
-            match slot {
-                Text::Kept => {
-                    let text = fn_record_text(head.text, head.text_prefix).ok_or(E::Shape { what: "a fn text prefix must end at the body's opening brace" })?;
-                    let len = u32::try_from(text.len()).map_err(|_| E::TooBig { what: "a fn's text" })?;
-                    let z_start = o.body.len();
-                    o.flag(head.text_prefix.is_some());
-                    o.u32(len);
-                    o.body.extend_from_slice(&ContentId::of(TEXT_DOMAIN, text).0);
-                    o.zero_ranges.push((z_start, o.body.len()));
-                }
-                Text::Zeroed => {
-                    o.flag(false);
-                    o.u32(0);
-                    o.body.extend_from_slice(&[0; 32]);
+            if head.text_inline {
+                let text = head.text.as_bytes();
+                let len = u32::try_from(text.len()).map_err(|_| E::TooBig { what: "a synthetic fn's text" })?;
+                o.byte(2);
+                o.u32(len);
+                o.body.extend_from_slice(text);
+            } else {
+                match slot {
+                    Text::Kept => {
+                        let text = fn_record_text(head.text, head.text_prefix).ok_or(E::Shape { what: "a fn text prefix must end at the body's opening brace" })?;
+                        let len = u32::try_from(text.len()).map_err(|_| E::TooBig { what: "a fn's text" })?;
+                        let z_start = o.body.len();
+                        o.byte(u8::from(head.text_prefix.is_some()));
+                        o.u32(len);
+                        o.body.extend_from_slice(&ContentId::of(TEXT_DOMAIN, text).0);
+                        o.zero_ranges.push((z_start, o.body.len()));
+                    }
+                    Text::Zeroed => {
+                        o.byte(0);
+                        o.u32(0);
+                        o.body.extend_from_slice(&[0; 32]);
+                    }
                 }
             }
             o.lib(head.lib);
@@ -2428,6 +2438,23 @@ pub fn decode_with_origins_boxed<'n>(
     Ok(record.head)
 }
 
+/// As [`decode_with_origins_boxed`], using `keep_text` to retain inline synthetic text (such as
+/// RFC 3681 field defaults) into the store's `'n` text frame.
+pub fn decode_with_origins_boxed_inline<'n>(
+    bytes: &[u8],
+    text: Option<&'n str>,
+    tys: &PortableTys<'_>,
+    alloc: Mem,
+    keep_text: &mut dyn FnMut(&str) -> &'n str,
+    register: &mut dyn FnMut(ItemKey, OpaqueOrigin) -> Result<(), HeadRecordError>,
+) -> Result<blaze_own::Box<Head<'n>, Mem>, HeadRecordError> {
+    let record = decode_retaining_with(bytes, text, tys, alloc, Some(keep_text))?;
+    for &(key, origin) in record.origins.iter() {
+        register(key, origin)?;
+    }
+    Ok(record.head)
+}
+
 /// A standalone head and its origin table. The table belongs to this record, so writing it
 /// again needs only the table in which its terms were interned.
 pub struct DecodedHead<'n> {
@@ -2451,6 +2478,16 @@ impl<'n> DecodedHead<'n> {
 /// Open a head for standalone inspection or byte-exact rewriting. A store imports with
 /// [`decode_with_origins`] so it also has the routes when another type exposes an opaque.
 pub fn decode_retaining<'n>(bytes: &[u8], text: Option<&'n str>, tys: &PortableTys<'_>, alloc: Mem) -> Result<DecodedHead<'n>, HeadRecordError> {
+    decode_retaining_with(bytes, text, tys, alloc, None)
+}
+
+fn decode_retaining_with<'n>(
+    bytes: &[u8],
+    text: Option<&'n str>,
+    tys: &PortableTys<'_>,
+    alloc: Mem,
+    keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
+) -> Result<DecodedHead<'n>, HeadRecordError> {
     let mut r = In { bytes, at: 0, tys, locals: Vec::new_in(alloc), scratch: Vec::new_in(alloc), origins: Vec::new_in(alloc), alloc };
     if r.take(4, "the magic")? != &MAGIC[..] {
         return Err(E::NotThisRecord);
@@ -2464,7 +2501,7 @@ pub fn decode_retaining<'n>(bytes: &[u8], text: Option<&'n str>, tys: &PortableT
     for _ in 0..terms {
         r.node()?;
     }
-    let head = r.decode_head_kind(kind, text)?;
+    let head = r.decode_head_kind(kind, text, keep_text)?;
     let mut head = head;
     // Form 22: the regions section, every column laid again over its type here, once.
     if let Some(filed) = r.opt("a head's regions section", |r| r.regions_section())? {
@@ -2496,9 +2533,14 @@ impl<'r> In<'r, '_, '_> {
     }
 
     #[inline(never)]
-    fn decode_head_kind<'n>(&mut self, kind: u8, text: Option<&'n str>) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+    fn decode_head_kind<'n>(
+        &mut self,
+        kind: u8,
+        text: Option<&'n str>,
+        keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
+    ) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
         match kind {
-            K_FN => self.fn_head(text),
+            K_FN => self.fn_head(text, keep_text),
             K_ADT => self.adt(),
             K_CTOR => self.ctor(),
             K_TRAIT => self.trait_(),
@@ -3160,8 +3202,12 @@ impl<'r> In<'r, '_, '_> {
     }
 
     #[inline(never)]
-    fn fn_head<'n>(&mut self, text: Option<&'n str>) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
-        let (key, head) = self.fn_head_core(text)?;
+    fn fn_head<'n>(
+        &mut self,
+        text: Option<&'n str>,
+        keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
+    ) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        let (key, head) = self.fn_head_core(text, keep_text)?;
         let preds = self.opt("a fn's where-clauses", |r| r.preds())?;
         let static_ = self.opt("a static's mutability", |r| mutbl_of(r.u8("a static's mutability")?))?;
         let misses = self.fn_head_misses(head.text.len())?;
@@ -3169,16 +3215,41 @@ impl<'r> In<'r, '_, '_> {
     }
 
     #[inline(never)]
-    fn fn_head_core<'n>(&mut self, text: Option<&'n str>) -> Result<(ItemKey, FnHead<'n>), E> {
+    fn fn_head_core<'n>(
+        &mut self,
+        text: Option<&'n str>,
+        keep_text: Option<&mut dyn FnMut(&str) -> &'n str>,
+    ) -> Result<(ItemKey, FnHead<'n>), E> {
         let key = self.key("a fn's key")?;
-        let prefix = self.flag("a fn text's signature-prefix flag")?;
-        let want_len = self.u32("a fn text's length")?;
-        let want: [u8; 32] = self.array("a fn text's digest")?;
-        let text = text.ok_or(E::NoText)?;
-        let text_prefix = prefix.then_some(want_len);
-        if !fn_record_text(text, text_prefix).is_some_and(|part| part.len() == want_len as usize && ContentId::of(TEXT_DOMAIN, part).0 == want) {
-            return Err(E::Text { key, want_len, got_len: text.len() });
-        }
+        let mode = self.u8("a fn text's mode")?;
+        let (text, text_prefix, text_inline) = match mode {
+            0 | 1 => {
+                let prefix = mode == 1;
+                let want_len = self.u32("a fn text's length")?;
+                let want: [u8; 32] = self.array("a fn text's digest")?;
+                let text = text.ok_or(E::NoText)?;
+                let text_prefix = prefix.then_some(want_len);
+                if !fn_record_text(text, text_prefix).is_some_and(|part| u32::try_from(part.len()) == Ok(want_len) && ContentId::of(TEXT_DOMAIN, part).0 == want) {
+                    return Err(E::Text { key, want_len, got_len: text.len() });
+                }
+                (text, text_prefix, false)
+            }
+            2 => {
+                let len = usize::try_from(self.u32("a synthetic fn text's length")?)
+                    .map_err(|_| E::Shape { what: "a synthetic fn's text length overflows usize" })?;
+                let raw = self.take(len, "a synthetic fn's text")?;
+                let s = core::str::from_utf8(raw).map_err(|_| E::Shape { what: "a synthetic fn's text is not UTF-8" })?;
+                let kept = match keep_text {
+                    Some(keep) => keep(s),
+                    None => match text {
+                        Some(given) if given == s => given,
+                        _ => return Err(E::NoText),
+                    },
+                };
+                (kept, None, true)
+            }
+            byte => return Err(E::Byte { what: "a fn text's mode", byte }),
+        };
         let lib = self.lib("a fn's library key")?;
         let container = self.opt("a fn's container", |r| r.key("a fn's container"))?;
         let parent = self.u32("a fn's parent generics")?;
@@ -3202,6 +3273,7 @@ impl<'r> In<'r, '_, '_> {
                 lib,
                 text,
                 text_prefix,
+                text_inline,
                 container,
                 parent,
                 own,
@@ -3616,6 +3688,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(k1 == k2, "a fn's key");
             need!(h1.lib == h2.lib, "a fn's library key");
             need!(h1.text == h2.text, "a fn's text");
+            need!(h1.text_inline == h2.text_inline, "a fn's inline-text flag");
             need!(h1.container == h2.container, "a fn's container");
             need!((h1.parent, h1.own, h1.declared) == (h2.parent, h2.own, h2.declared), "a fn's generic counts");
             need!(h1.self_param == h2.self_param, "a fn's `self` parameter");

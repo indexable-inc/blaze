@@ -284,7 +284,7 @@ pub(crate) fn built_for<'s, 'm: 's>(
     }
     let (source, files) = match <CrateList<'_> as CrateTable<'_>>::place(list, r) {
         Place::Fetched { source, files } => (source, files),
-        Place::Checkout => return Err(CTaskWhy::NotPinned { why: "a workspace member's files can change; its objects are not found by a pinned key yet" }),
+        Place::Checkout | Place::CheckoutDep => return Err(CTaskWhy::NotPinned { why: "a checkout crate's files can change; its objects are not found by a pinned key yet" }),
         Place::Toolchain => return Err(CTaskWhy::NotPinned { why: "a toolchain crate with C requests" }),
         Place::Unplaced { why } => return Err(CTaskWhy::NotPinned { why }),
     };

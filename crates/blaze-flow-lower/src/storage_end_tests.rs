@@ -115,7 +115,7 @@ impl Facts for World {
         Some(AdtFacts { copy: self.copy, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
     fn callee(&self, k: ItemKey) -> Option<CalleeFacts> {
-        Some(CalleeFacts { writes_lifetimes: k == self.keep, self_ref: false })
+        Some(CalleeFacts { writes_lifetimes: k == self.keep, self_ref: false, c_variadic: false })
     }
     fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> {
         None

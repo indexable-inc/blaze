@@ -129,7 +129,7 @@ impl Facts for Lives {
         Some(crate::region_fixture::all_co(self.lifetimes(k)))
     }
     fn callee(&self, k: ItemKey) -> Option<CalleeFacts> {
-        Some(CalleeFacts { writes_lifetimes: false, self_ref: self.self_ref.contains(&k) })
+        Some(CalleeFacts { writes_lifetimes: false, self_ref: self.self_ref.contains(&k), c_variadic: false })
     }
     fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> {
         None

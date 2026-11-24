@@ -432,11 +432,12 @@ fn search_dirs<'a>(package: &'a str, outputs: &OutputsRef<'a>, dirs: &mut AVec<'
     Ok(())
 }
 
-/// The program's own crate's link arguments for a binary: `-pthread` only (NATIVE.md 3.2).
+/// The program's own crate's link arguments for a binary: `-pthread` and `-Wl,-dead_strip_dylibs`
+/// (NATIVE.md 3.2; Blaze's exporter only links referenced dylibs).
 fn link_args<'a>(package: &'a str, outputs: &OutputsRef<'a>) -> Result<(), NativeError<'a>> {
     let binary = [LinkTo::All.code(), LinkTo::Bins.code(), LinkTo::Bin("").code()];
     for (to, _bin, arg) in outputs.link_args() {
-        if binary.contains(&to) && arg != "-pthread" {
+        if binary.contains(&to) && !matches!(arg, "-pthread" | "-Wl,-dead_strip_dylibs" | "-dead_strip_dylibs") {
             return Err(NativeError::LinkArg { package, arg });
         }
     }
