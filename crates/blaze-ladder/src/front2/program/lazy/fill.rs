@@ -262,6 +262,19 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         Ok(())
     }
 
+    /// Retargets a `MakerStart::Direct(_)` program to another direct test entry in the same
+    /// suite without rebuilding the program or any cached heads, bodies, or tables. Refuses
+    /// (`false`) if the program was started by rule (`Entry2::Rust`, `Hosted`, `CMain`) or has
+    /// no start decided yet.
+    pub fn set_direct_entry(&mut self, entry: Option<ItemKey>, direct: blaze_id::ItemKey) -> bool {
+        if !matches!(self.start, Some(crate::front2::start::Entry2::Direct(_))) {
+            return false;
+        }
+        self.entry_key = entry;
+        self.start = Some(crate::front2::start::Entry2::Direct(direct));
+        true
+    }
+
     /// The seam's `head_row`: fn item `key`'s row from its head, made once, no body lowered or
     /// checked. Its head is made first by THE one rule for a key's want (front2 fill.rs
     /// `want_of_key`): a fn's signature, an impl member's `MemberFn`, a trait's members, and

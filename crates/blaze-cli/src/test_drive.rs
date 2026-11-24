@@ -87,7 +87,7 @@ pub(crate) type TestMaker<'h> = Maker<'h, crate::run_ids::Runnable, SecondCheck>
 use blaze_engine::SVec;
 use blaze_engine::code_pool::relay::{self as code_relay, Relay as PoolRelay, RelayError, Reply};
 use blaze_engine::code_pool::{Child, Time, Worker};
-use blaze_ladder::run::special::MakerStart;
+use blaze_ladder::run::special::{MakerKind, MakerStart};
 use blaze_own::SharedAlloc;
 use crate::store::CommandLent;
 use crate::test_loop::{CannotRun, Effect, Event, LoopConfig, LoopError, Status, SuiteId, TestLoop};
@@ -1730,10 +1730,12 @@ const HAND_WAIT: Duration = Duration::from_secs(5);
 /// the command fails naming the workers ([`DriveError::CodeWorkers`]), never waits on.
 const END_WAIT: Duration = CODE_WAIT;
 
-/// The most makers one code worker keeps (rule 18: a table has a cap): one a (suite, entry,
-/// start) its makes asked, the oldest dropped first. A test's roots start at its fn, so this is
-/// about the tests whose code one worker made lately; a maker dropped is made again, cheaply
-/// (make_one.rs `Maker::of_start` reads nothing), its program state lowered again by need.
+/// The most makers one code worker keeps (rule 18: a table has a cap): one per `(suite,
+/// MakerKind)` its makes asked, the oldest dropped first. Every `MakerStart::Direct(_)` test in
+/// a suite shares ONE `(suite, MakerKind::Direct)` maker, so this caps distinct suites (and
+/// `ByRule` entries) per worker rather than individual test functions; a maker dropped is made
+/// again cleanly (make_one.rs `Maker::of_start` reads nothing), its program state lowered again
+/// by need.
 const MOST_MAKERS: usize = 64;
 
 /// The scratch of a code worker's task (bstd `Scope::must_overlap`): its waits and spans; its
@@ -2084,30 +2086,40 @@ impl<'w, 'p: 'w> crate::job_texts::ProcsByNeed<'w> for WorkerProcs<'w, 'p> {
     }
 }
 
-/// What a maker was made for (make_one.rs `Maker::made_for`): its entry and start.
+/// What start class a maker was made for (make_one.rs `Maker::made_for`): `ByRule(entry)` or
+/// `Direct`. All `MakerStart::Direct(_)` tests in one suite share a single `Direct` maker,
+/// retargeted cleanly via [`MadeFor::set_direct_entry`] without rebuilding cached program state.
 pub(crate) trait MadeFor {
-    fn made_for(&self) -> (Option<ItemKey>, MakerStart);
+    fn made_for(&self) -> MakerKind;
+    fn set_direct_entry(&mut self, entry: Option<ItemKey>, start: MakerStart) -> bool;
 }
 
 impl MadeFor for TestMaker<'_> {
-    fn made_for(&self) -> (Option<ItemKey>, MakerStart) {
+    fn made_for(&self) -> MakerKind {
         Maker::made_for(self)
+    }
+
+    fn set_direct_entry(&mut self, entry: Option<ItemKey>, start: MakerStart) -> bool {
+        Maker::set_direct_entry(self, entry, start)
     }
 }
 
 /// A PLANTED BUG for the seam test's control (skill `testing`): `BySuiteAlone` finds a kept
-/// maker by its suite alone, so a make may be handed a maker of another test's start, which
-/// [`Makers::of`] must catch. Always `None` outside the test.
+/// maker by its suite alone, so a make may be handed a maker of another start class (e.g. a
+/// different `ByRule` entry or `ByRule` vs `Direct`), which [`Makers::of`] must catch. Always
+/// `None` outside the test.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum MakersPlant {
     None,
     BySuiteAlone,
 }
 
-/// One worker's makers, one a (suite, entry, start) its makes asked, made at the first and kept
-/// (at most [`MOST_MAKERS`], the oldest dropped first), in the command's heap.
+/// One worker's makers, one per `(suite, MakerKind)` its makes asked, made at the first and kept
+/// (at most [`MOST_MAKERS`], the oldest dropped first), in the command's heap. All
+/// `MakerStart::Direct(_)` tests in the same suite share ONE persistent `Direct` maker per
+/// worker rather than allocating or evicting one per test function.
 pub(crate) struct Makers<M> {
-    kept: AVec<'static, (SuiteId, Option<ItemKey>, MakerStart, M)>,
+    kept: AVec<'static, (SuiteId, MakerKind, M)>,
     plant: MakersPlant,
 }
 
@@ -2116,12 +2128,14 @@ impl<M: MadeFor> Makers<M> {
         Makers { kept: Vec::new_in(alloc), plant }
     }
 
-    /// The maker of `job`'s suite, entry and start: kept, or made by `make` and kept. A kept
-    /// maker made for another entry or start than `job`'s is refused by name (its control:
-    /// [`MakersPlant::BySuiteAlone`]), never used.
+    /// The maker of `job`'s suite and start class: kept, or made by `make` and kept. A kept
+    /// maker made for another start class than `job`'s is refused by name (its control:
+    /// [`MakersPlant::BySuiteAlone`]), never used. For `MakerStart::Direct(_)`, retargets the
+    /// shared suite maker to `job`'s direct entry without recreating its program or tables.
     pub(crate) fn of(&mut self, job: &Job<'_>, make: impl FnOnce() -> Result<M, Unmade>) -> Result<&mut M, Unmade> {
         let plant = self.plant;
-        let found = self.kept.iter().position(|(suite, entry, start, _)| *suite == job.suite && (plant == MakersPlant::BySuiteAlone || (*entry == job.entry && *start == job.start)));
+        let kind = MakerKind::of(job.entry, job.start);
+        let found = self.kept.iter().position(|(suite, kept_kind, _)| *suite == job.suite && (plant == MakersPlant::BySuiteAlone || *kept_kind == kind));
         let at = match found {
             Some(at) => at,
             None => {
@@ -2130,12 +2144,15 @@ impl<M: MadeFor> Makers<M> {
                     // The oldest first: at most `MOST_MAKERS` moved, once a maker is made.
                     drop(self.kept.remove_shift(0));
                 }
-                self.kept.push((job.suite, job.entry, job.start, maker));
+                self.kept.push((job.suite, kind, maker));
                 self.kept.len() - 1
             }
         };
-        let Some((_, _, _, maker)) = self.kept.get_mut(at) else { return Err(refused(job, ANOTHER_START)) };
-        if maker.made_for() != (job.entry, job.start) {
+        let Some((_, _, maker)) = self.kept.get_mut(at) else { return Err(refused(job, ANOTHER_START)) };
+        if maker.made_for() != kind {
+            return Err(refused(job, ANOTHER_START));
+        }
+        if matches!(job.start, MakerStart::Direct(_)) && !maker.set_direct_entry(job.entry, job.start) {
             return Err(refused(job, ANOTHER_START));
         }
         Ok(maker)
@@ -2145,9 +2162,10 @@ impl<M: MadeFor> Makers<M> {
         self.kept.retain(|(kept, ..)| *kept != suite);
     }
 
-    /// The kept maker of `job`'s suite, entry and start, never made here: `None` when none is kept.
+    /// The kept maker of `job`'s suite and start class, never made here: `None` when none is kept.
     pub(crate) fn kept(&self, job: &Job<'_>) -> Option<&M> {
-        let (_, _, _, maker) = self.kept.iter().find(|(suite, entry, start, _)| *suite == job.suite && *entry == job.entry && *start == job.start)?;
+        let kind = MakerKind::of(job.entry, job.start);
+        let (_, _, maker) = self.kept.iter().find(|(suite, kept_kind, _)| *suite == job.suite && *kept_kind == kind)?;
         Some(maker)
     }
 }
@@ -2158,7 +2176,7 @@ impl<M: MadeFor> Makers<M> {
 pub(crate) struct SuiteSide<'s> {
     pub crates: crate::run_names::RunCrates<'s>,
     pub builder: Builder,
-    /// The command's make watch ([`Launched::make_watch`]): every worker's makers are handed it.
+    /// The command's make watch (run_parent.rs `command_make_watch`): every worker's makers are handed it.
     pub make_watch: blaze_ladder::run::make_one::MakeWatch<'static>,
 }
 
@@ -2361,9 +2379,6 @@ pub(crate) struct Launched<'c, 'h, 'a> {
     pub lent: &'c CommandLent,
     pub tables: Alloc<'static>,
     pub watch: &'c dyn Watch,
-    /// What its makers report their large or slow makes with: the command's one clock
-    /// (run_parent.rs `command_make_watch`, made in [`run_suites`]).
-    pub make_watch: blaze_ladder::run::make_one::MakeWatch<'static>,
     /// Its suite's native library ([`Suite::native`]), as `blaze run` starts its program
     /// (own_process.rs `run_own`): named in the start (`BLAZE_LAUNCH_NATIVE`), told as the first
     /// frame (`Down::Native`, before the personality and any `Declare`), and the one file the
@@ -2582,7 +2597,7 @@ impl<'c> Launched<'c, '_, '_> {
         let temp = bstd::mem::format_in!(frame, "{}/{row}", self.temp);
         // 2. The lazy parent with the test's roots; nothing built yet.
         let exports = self.native.map_or(&[][..], |send| send.items);
-        let front = TestFront { names: self.names, ids: self.ids, builder: self.builder, tables: self.tables, alloc, test, exports, harness: self.tests.harnessed(), watch: self.watch, make_watch: self.make_watch };
+        let front = TestFront { names: self.names, ids: self.ids, builder: self.builder, tables: self.tables, alloc, test, exports, harness: self.tests.harnessed(), watch: self.watch, suite_cache: self.suite_cache };
         let mut codes = HomeCodeStore::new(self.lent);
         // THE SEAM LINE: how the records reach the program (run_bytes.rs `Delivery`; `Inline`
         // sends them over descriptor 3 and files none).
@@ -3689,8 +3704,10 @@ fn drain_pipes(cx: &Cx, pipes: &mut [Option<OutPipe>; 2], output: &mut Output<'_
     Ok(active)
 }
 
-/// The front of one test's run: the command's names records and body ids (made once for the
-/// suite, shared by every test), the roots of row n's test fn (test_roots.rs).
+/// The front of one test's run: the command's names records, body ids, and shared suite cache
+/// (made once for the suite, shared by every test), and the roots of row n's test fn
+/// (test_roots.rs). Reuses the suite's single persistent `RunMaker` and verified-entry cache
+/// via [`suite_cache::SuiteSharedMaker`] instead of constructing a fresh `Maker` per test.
 pub(crate) struct TestFront<'s, 'h, 'r> {
     pub harness: bool,
     pub names: NamesRecords<'h>,
@@ -3702,14 +3719,14 @@ pub(crate) struct TestFront<'s, 'h, 'r> {
     /// The Rust fns the test binary's C calls (its image's words, `NativeSend::items`): roots.
     pub exports: &'s [LibKey],
     pub watch: &'s dyn Watch,
-    /// The command's make watch ([`Launched::make_watch`]), handed to each maker made.
-    pub make_watch: blaze_ladder::run::make_one::MakeWatch<'static>,
+    /// Suite-wide shared maker and verified-entry cache (borrowed synchronously only, rule 27).
+    pub suite_cache: &'s RefCell<suite_cache::SuiteCache<'h>>,
 }
 
 impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
     type Start = Roots<'r>;
     type Ids = &'s RunIds<'h>;
-    type Maker = TestMaker<'h>;
+    type Maker = suite_cache::SuiteSharedMaker<'s, 'h>;
 
     fn start(&mut self) -> Result<Roots<'r>, ParentError> {
         entry_roots(self.harness, self.names, self.test, self.exports, self.builder, self.tables, self.alloc).map_err(ParentError::Roots)
@@ -3719,12 +3736,16 @@ impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
         Ok(self.ids)
     }
 
-    fn maker(&mut self, start: &Roots<'r>, _ids: &&'s RunIds<'h>) -> Result<TestMaker<'h>, ParentError> {
-        // The test's roots start its program at the test fn (`MakerStart::Direct`), not at `main`.
-        // The typing is the test's ([`TestMaker`]: the workers' too).
-        let mut maker = Maker::of_roots(self.names, start.maker_entry(), start, SecondCheck, &self.builder, self.tables);
-        maker.watch(self.make_watch);
-        Ok(maker)
+    fn maker(&mut self, start: &Roots<'r>, ids: &&'s RunIds<'h>) -> Result<suite_cache::SuiteSharedMaker<'s, 'h>, ParentError> {
+        let entry = start.maker_entry();
+        self.suite_cache
+            .borrow_mut()
+            .ensure_maker(entry, start.maker_start, **ids)
+            .map_err(|why| ParentError::Walk {
+                symbol: start.head().line.symbol.0,
+                why: blaze_ladder::body_ids::WalkError::Make { tabled: entry.unwrap_or(ItemKey(0)), why },
+            })?;
+        Ok(suite_cache::SuiteSharedMaker::new(self.suite_cache, **ids, entry, start.maker_start))
     }
 
     /// As run_parent.rs `CommandFront::path_of`: the one printer over the names records.
@@ -3734,7 +3755,7 @@ impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
         blaze_ladder::front2::item_shown::ItemShown::of_lib(self.names.records, lib).path().map(Box::from)
     }
 
-    fn named(&mut self, maker: Option<&TestMaker<'h>>, tabled: ItemKey, name: &[u8]) -> crate::run_fault::Named {
+    fn named(&mut self, maker: Option<&suite_cache::SuiteSharedMaker<'s, 'h>>, tabled: ItemKey, name: &[u8]) -> crate::run_fault::Named {
         use crate::run_fault::Named;
         if let Some(shown) = maker.and_then(|maker| maker.instance_shown(tabled, name)) {
             return Named::Shown { item: shown.item, args: shown.args };
@@ -3745,7 +3766,7 @@ impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
         }
     }
 
-    fn site_shown(&mut self, maker: Option<&TestMaker<'h>>, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
+    fn site_shown(&mut self, maker: Option<&suite_cache::SuiteSharedMaker<'s, 'h>>, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
         let (file, line, column) = maker?.site_shown(item, site)?;
         Some(crate::run_fault::SiteShown { file: Box::from(file), line, column })
     }
@@ -4177,7 +4198,7 @@ fn run_selected<'h>(
             err: &err, package: unit.package, target: unit.target,
             cx: &cx, spawner: &spawner, launcher: launcher.as_str(), records: &records, store: store.as_str(),
             temps: dir, temp: temp.as_str(), env: vars.as_slice(), place: suite.place, tests, names: suite.names, ids,
-            builder: suite.builder, lent, tables, watch, make_watch,
+            builder: suite.builder, lent, tables, watch,
             args: if tests.harnessed() { &[] } else { args },
             native: suite.native.ok().flatten(),
             codes: relay,

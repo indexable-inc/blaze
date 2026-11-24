@@ -33,7 +33,7 @@ use blaze_ladder::code_records::statics::{each_static_named, each_vtable_datum, 
 use blaze_ladder::code_records::{Builder, CodeClass, CodeKey, CodeStore, content_key};
 use blaze_ladder::code_records::reads::Verdict;
 use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, MakeWatch, Maker, NamesRecords};
-use blaze_ladder::run::special::{Roots, StartHead};
+use blaze_ladder::run::special::{MakerKind, MakerStart, Roots, StartHead};
 use blaze_ladder::run::RunError as LadderRunError;
 use blaze_launch::wire::RecordId;
 use blaze_launch::wire::data::Datum;
@@ -563,11 +563,20 @@ impl<'h> SuiteCache<'h> {
                 let path = shown.as_ref().and_then(|s| s.path());
                 watch.see(Step::Resolving { path: path.as_deref() });
                 let span = cx.span(FIRST_CALL_SPAN);
-                let maker = self.maker.get_or_insert_with(|| {
-                    let mut maker = Maker::of_roots(self.names, roots.maker_entry(), roots, ByKind::new(self.typed.over(*ids)), &self.builder, self.tables);
-                    maker.watch(self.make_watch);
-                    maker
-                });
+                self.ensure_maker(roots.maker_entry(), roots.maker_start, *ids)
+                    .map_err(|why| ParentError::Walk {
+                        symbol,
+                        why: blaze_ladder::body_ids::WalkError::Make { tabled, why },
+                    })?;
+                let Some(maker) = self.maker.as_mut() else {
+                    return Err(ParentError::Walk {
+                        symbol,
+                        why: blaze_ladder::body_ids::WalkError::Make {
+                            tabled,
+                            why: LadderRunError::OneBody { key: tabled, why: "suite maker absent after ensure_maker" },
+                        },
+                    });
+                };
                 let mut vm = VerifyingMaker {
                     maker,
                     verified: &mut self.verified,
@@ -816,6 +825,114 @@ impl<'h> SuiteCache<'h> {
     pub(crate) fn site_of(&self, item: ItemKey, site: u32) -> Option<SiteShown> {
         let (file, line, column) = self.maker.as_ref()?.site_shown(item, site)?;
         Some(SiteShown { file: file.into(), line, column })
+    }
+
+    /// Returns the suite's single persistent [`RunMaker`] and verified-entry cache, creating the
+    /// maker on first use or verifying its start class and retargeting `MakerStart::Direct(_)`
+    /// entries without rebuilding `RecordsProgram` or `MakerState`.
+    fn ensure_maker_parts(
+        &mut self,
+        entry: Option<ItemKey>,
+        start: MakerStart,
+        ids: RunIds<'h>,
+    ) -> Result<(&mut RunMaker<'h>, &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>, &mut bool), LadderRunError> {
+        let want = MakerKind::of(entry, start);
+        let maker = self.maker.get_or_insert_with(|| {
+            let mut maker = Maker::of_start(self.names, entry, start, ByKind::new(self.typed.over(ids)), &self.builder, self.tables);
+            maker.watch(self.make_watch);
+            maker
+        });
+        if maker.made_for() != want
+            || (matches!(start, MakerStart::Direct(_)) && !maker.set_direct_entry(entry, start))
+        {
+            return Err(LadderRunError::OneBody {
+                key: entry.unwrap_or(ItemKey(0)),
+                why: "the suite maker was made for another entry or start than this test's roots say (test_suite_cache.rs `SuiteCache`)",
+            });
+        }
+        Ok((maker, &mut self.verified, &mut self.verified_dirty))
+    }
+
+    /// Checks or initializes the suite's shared maker for `(entry, start)`.
+    pub(crate) fn ensure_maker(&mut self, entry: Option<ItemKey>, start: MakerStart, ids: RunIds<'h>) -> Result<(), LadderRunError> {
+        let _ = self.ensure_maker_parts(entry, start, ids)?;
+        Ok(())
+    }
+
+    pub(crate) fn instance_shown(&self, tabled: ItemKey, name: &[u8]) -> Option<blaze_ladder::run::make_one::InstanceShown> {
+        self.maker.as_ref()?.instance_shown(tabled, name)
+    }
+
+    pub(crate) fn site_shown(&self, item: ItemKey, site: u32) -> Option<(&'h str, u32, u32)> {
+        self.maker.as_ref()?.site_shown(item, site)
+    }
+}
+
+/// Thin command-thread [`Make`] handle borrowing the suite's single persistent [`RunMaker`] and
+/// verified-entry cache from [`SuiteCache`] strictly inside each synchronous `Make` call (never
+/// across `.await`, rule 27). Used by `TestFront` so per-test `Lazy` instances never construct a
+/// fresh `Maker` per test.
+pub(crate) struct SuiteSharedMaker<'s, 'h> {
+    cache: &'s RefCell<SuiteCache<'h>>,
+    ids: RunIds<'h>,
+    entry: Option<ItemKey>,
+    start: MakerStart,
+}
+
+impl<'s, 'h> SuiteSharedMaker<'s, 'h> {
+    pub(crate) fn new(cache: &'s RefCell<SuiteCache<'h>>, ids: RunIds<'h>, entry: Option<ItemKey>, start: MakerStart) -> SuiteSharedMaker<'s, 'h> {
+        SuiteSharedMaker { cache, ids, entry, start }
+    }
+
+    pub(crate) fn instance_shown(&self, tabled: ItemKey, name: &[u8]) -> Option<blaze_ladder::run::make_one::InstanceShown> {
+        self.cache.borrow().instance_shown(tabled, name)
+    }
+
+    pub(crate) fn site_shown(&self, item: ItemKey, site: u32) -> Option<(&'h str, u32, u32)> {
+        self.cache.borrow().site_shown(item, site)
+    }
+}
+
+impl Make for SuiteSharedMaker<'_, '_> {
+    type Error = LadderRunError;
+    type Grant = Runnable;
+
+    fn make(&mut self, grant: &Self::Grant, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+        let mut cache = self.cache.borrow_mut();
+        let (maker, _, _) = cache.ensure_maker_parts(self.entry, self.start, self.ids)?;
+        maker.make(grant, tabled, name, entry)
+    }
+
+    fn make_static(&mut self, grant: &Self::Grant, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+        let mut cache = self.cache.borrow_mut();
+        let (maker, _, _) = cache.ensure_maker_parts(self.entry, self.start, self.ids)?;
+        maker.make_static(grant, item, entry)
+    }
+
+    fn make_thread_local(&mut self, grant: &Self::Grant, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+        let mut cache = self.cache.borrow_mut();
+        let (maker, _, _) = cache.ensure_maker_parts(self.entry, self.start, self.ids)?;
+        maker.make_thread_local(grant, item, entry)
+    }
+
+    fn verify(&mut self, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<Verdict>, Self::Error> {
+        let mut cache = self.cache.borrow_mut();
+        let (maker, _, _) = cache.ensure_maker_parts(self.entry, self.start, self.ids)?;
+        maker.verify(tabled, name, entry)
+    }
+
+    fn verify_keyed(
+        &mut self,
+        key: CodeKey,
+        under: CodeKey,
+        tabled: ItemKey,
+        name: &[u8],
+        entry: &[u8],
+    ) -> Result<Option<Verdict>, Self::Error> {
+        let mut cache = self.cache.borrow_mut();
+        let (maker, verified, verified_dirty) = cache.ensure_maker_parts(self.entry, self.start, self.ids)?;
+        let mut vm = VerifyingMaker { maker, verified, verified_dirty };
+        vm.verify_keyed(key, under, tabled, name, entry)
     }
 }
 
