@@ -535,8 +535,9 @@ fn stream_pieces(stream: &TokenStream<'_>, mut out: impl FnMut(&[u8])) {
 /// token spans / `TokenOrigin` hygiene and empty attribute streams. 4: native bridge remaps host
 /// `CARGO_MANIFEST_DIR` back to virtual mount root in emitted string literals (D60/D96). 5: native
 /// bridge materializes all safe relative files of `Files::Listed` into `$CARGO_MANIFEST_DIR`, not
-/// only `Cargo.toml`.
-pub const HOST_VERSION: u32 = 5;
+/// only `Cargo.toml`. 6: native bridge preserves non-invisible root subtree delimiters
+/// (`Paren`/`Brace`/`Bracket`) in `FlatTree` replies (e.g. `paste::paste! {{ ... }}`).
+pub const HOST_VERSION: u32 = 6;
 
 /// The base of `call`'s record: computed from text, before the run.
 pub fn base_key(module_wasm_sha256: &str, export: &Exported, edition: Edition, call: &ProcCall<'_>) -> ContentId {
