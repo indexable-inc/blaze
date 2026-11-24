@@ -573,6 +573,24 @@ const RUNS_DIR: &str = "v2/runs";
 const TEST_TMP_DIR: &str = "v2/test/tmp";
 /// Legacy run records / native dylib directory beneath `<HOME>/.blaze`.
 const RUN_RECORDS_DIR: &str = "v2/run/records";
+/// Native unit work root (`<cmd>/{pkg,out,deps,facts,jobs}/...`) beneath `<HOME>/.blaze`.
+const NATIVE_WORK_DIR: &str = "v2/native-work";
+/// Toolchain shelf root beneath `<HOME>/.blaze`.
+const TOOLCHAIN_DIR: &str = "v2/toolchain";
+/// Rebuildable cache directories (never touching `modules/` bootstrap dirs) expired at
+/// [`CACHE_EXPIRY_NS`] (`ROOT_LIFE_NS` = 30 days, matching store root lifetime).
+const CACHE_EXPIRY_DIRS: [&str; 6] = [
+    "v2/proc-macro/compiled",
+    "v2/proc-macro/expansions",
+    "v2/build-script/compiled",
+    "v2/build-script/records",
+    "v2/build-script/files",
+    "v2/sdk-answers",
+];
+/// Maximum bytes read when verifying the active `PINNED` toolchain manifest (typically ~64 KiB).
+const TOOLCHAIN_MANIFEST_MOST: u64 = 8 << 20;
+/// Expiry window for cache directories and superseded toolchain packs (30 days = `ROOT_LIFE_NS`).
+pub(crate) const CACHE_EXPIRY_NS: u64 = blaze_cas::plain::ROOT_LIFE_NS;
 
 /// Maximum entries inspected per auxiliary directory in one GC pass (rule 18).
 const AUX_SWEEP_MOST: usize = 4096;
@@ -638,6 +656,10 @@ pub(crate) enum AuxSweepPlant {
     /// deletion.
     #[cfg(test)]
     IgnorePidAlive,
+    /// Planted bug: ignores the active `PINNED` toolchain pack set, proving the test oracle
+    /// catches active-pack deletion.
+    #[cfg(test)]
+    IgnoreActiveToolchain,
 }
 
 /// Counts from an auxiliary directory sweep.
@@ -776,7 +798,9 @@ fn remove_tree_impl(cx: &Cx, root: &Dir<ReadWrite>, start: &Path, dry_run: bool)
     summary
 }
 
-/// Sweeps stale files in `v2/runs/`, `v2/test/tmp/`, and `v2/run/records/`.
+/// Sweeps stale files in `v2/runs/`, `v2/test/tmp/`, `v2/run/records/`, `v2/native-work/`,
+/// `v2/proc-macro/{compiled,expansions}`, `v2/build-script/{compiled,records,files}`,
+/// `v2/sdk-answers/`, and superseded loose packs in `v2/toolchain/`.
 pub(crate) fn sweep_aux_with(
     cx: &Cx,
     blaze_dir: &Dir<ReadWrite>,
@@ -786,11 +810,18 @@ pub(crate) fn sweep_aux_with(
     plant: AuxSweepPlant,
 ) -> AuxSummary {
     let mut total = AuxSummary::default();
-    let runs = sweep_runs(cx, blaze_dir, now_ns, probe, dry_run, plant);
-    let tmps = sweep_test_tmp(cx, blaze_dir, now_ns, probe, dry_run, plant);
-    let recs = sweep_run_records(cx, blaze_dir, now_ns, dry_run);
-    total.files = runs.files.saturating_add(tmps.files).saturating_add(recs.files);
-    total.bytes = runs.bytes.saturating_add(tmps.bytes).saturating_add(recs.bytes);
+    let add = |acc: &mut AuxSummary, part: AuxSummary| {
+        acc.files = acc.files.saturating_add(part.files);
+        acc.bytes = acc.bytes.saturating_add(part.bytes);
+    };
+    add(&mut total, sweep_runs(cx, blaze_dir, now_ns, probe, dry_run, plant));
+    add(&mut total, sweep_test_tmp(cx, blaze_dir, now_ns, probe, dry_run, plant));
+    add(&mut total, sweep_run_records(cx, blaze_dir, now_ns, dry_run));
+    add(&mut total, sweep_native_work(cx, blaze_dir, now_ns, probe, dry_run, plant));
+    for dir in CACHE_EXPIRY_DIRS {
+        add(&mut total, sweep_expired_dir(cx, blaze_dir, dir, CACHE_EXPIRY_NS, now_ns, dry_run));
+    }
+    add(&mut total, sweep_toolchain_packs(cx, blaze_dir, blaze_toolchain::PINNED, now_ns, dry_run, plant));
     total
 }
 
@@ -985,6 +1016,255 @@ fn sweep_run_records(cx: &Cx, blaze_dir: &Dir<ReadWrite>, now_ns: u64, dry_run: 
                 out.files = out.files.saturating_add(1);
                 out.bytes = out.bytes.saturating_add(len);
             }
+        }
+    }
+    out
+}
+
+/// Sweeps expired work trees under `v2/native-work/<cmd>/<bucket>/<key>` (7-day expiry) and
+/// dead-PID jobserver FIFOs under `v2/native-work/<cmd>/jobs/<pid>` (never touching live FIFOs).
+fn sweep_native_work(
+    cx: &Cx,
+    blaze_dir: &Dir<ReadWrite>,
+    now_ns: u64,
+    probe: &impl PidProbe,
+    dry_run: bool,
+    plant: AuxSweepPlant,
+) -> AuxSummary {
+    use bstd::fs::{Durable, EntryKind};
+    let mut out = AuxSummary::default();
+    let Ok(work_root) = Path::new(NATIVE_WORK_DIR) else {
+        return out;
+    };
+    let Ok(Some(cmds)) = blaze_dir.entries(cx, &work_root) else {
+        return out;
+    };
+    let cmd_limit = cmds.len().min(64);
+    for c in 0..cmd_limit {
+        if cmds.kind(c) != EntryKind::Dir {
+            continue;
+        }
+        let Ok(cmd_path) = cmds.path(c) else {
+            continue;
+        };
+        let Ok(Some(buckets)) = blaze_dir.entries(cx, &cmd_path) else {
+            continue;
+        };
+        let bucket_limit = buckets.len().min(64);
+        for b in 0..bucket_limit {
+            if buckets.kind(b) != EntryKind::Dir {
+                continue;
+            }
+            let bucket_name = buckets.name(b);
+            let Ok(bucket_path) = buckets.path(b) else {
+                continue;
+            };
+            let Ok(Some(items)) = blaze_dir.entries(cx, &bucket_path) else {
+                continue;
+            };
+            let item_limit = items.len().min(AUX_SWEEP_MOST);
+            if bucket_name == "jobs" {
+                for i in 0..item_limit {
+                    let Ok(item_path) = items.path(i) else {
+                        continue;
+                    };
+                    let mtime_ns = blaze_dir.stat(cx, &item_path).ok().flatten().map_or(0, |s| s.stamp.modified_ns);
+                    let pid = items.name(i).parse::<u32>().ok().filter(|p| *p > 0);
+                    let pid_state = pid.map(|p| probe.probe(p));
+                    if should_sweep_run(pid_state, false, mtime_ns, now_ns, plant) {
+                        let len = items.len_of(i);
+                        if dry_run || blaze_dir.remove(cx, &item_path, Durable::No).is_ok() {
+                            out.files = out.files.saturating_add(1);
+                            out.bytes = out.bytes.saturating_add(len);
+                        }
+                    }
+                }
+            } else {
+                for i in 0..item_limit {
+                    let name = items.name(i);
+                    if name.ends_with(".bstd-new") {
+                        continue;
+                    }
+                    let Ok(item_path) = items.path(i) else {
+                        continue;
+                    };
+                    let mtime_ns = blaze_dir.stat(cx, &item_path).ok().flatten().map_or(0, |s| s.stamp.modified_ns);
+                    if now_ns.saturating_sub(mtime_ns) < AUX_EXPIRY_NS {
+                        continue;
+                    }
+                    match items.kind(i) {
+                        EntryKind::Dir => {
+                            let gone = remove_tree_impl(cx, blaze_dir, &item_path, dry_run);
+                            out.files = out.files.saturating_add(gone.files);
+                            out.bytes = out.bytes.saturating_add(gone.bytes);
+                        }
+                        EntryKind::File | EntryKind::Link => {
+                            let len = items.len_of(i);
+                            if dry_run || blaze_dir.remove(cx, &item_path, Durable::No).is_ok() {
+                                out.files = out.files.saturating_add(1);
+                                out.bytes = out.bytes.saturating_add(len);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Sweeps files and subdirectories directly under `rel_dir` untouched past `expiry_ns`.
+fn sweep_expired_dir(
+    cx: &Cx,
+    blaze_dir: &Dir<ReadWrite>,
+    rel_dir: &str,
+    expiry_ns: u64,
+    now_ns: u64,
+    dry_run: bool,
+) -> AuxSummary {
+    use bstd::fs::{Durable, EntryKind};
+    let mut out = AuxSummary::default();
+    let Ok(dir_path) = Path::new(rel_dir) else {
+        return out;
+    };
+    let Ok(Some(entries)) = blaze_dir.entries(cx, &dir_path) else {
+        return out;
+    };
+    let limit = entries.len().min(AUX_SWEEP_MOST);
+    for i in 0..limit {
+        let name = entries.name(i);
+        if name.ends_with(".bstd-new") {
+            continue;
+        }
+        let Ok(path) = entries.path(i) else {
+            continue;
+        };
+        let mtime_ns = blaze_dir.stat(cx, &path).ok().flatten().map_or(0, |s| s.stamp.modified_ns);
+        if now_ns.saturating_sub(mtime_ns) < expiry_ns {
+            continue;
+        }
+        match entries.kind(i) {
+            EntryKind::Dir => {
+                let gone = remove_tree_impl(cx, blaze_dir, &path, dry_run);
+                out.files = out.files.saturating_add(gone.files);
+                out.bytes = out.bytes.saturating_add(gone.bytes);
+            }
+            EntryKind::File | EntryKind::Link => {
+                let len = entries.len_of(i);
+                if dry_run || blaze_dir.remove(cx, &path, Durable::No).is_ok() {
+                    out.files = out.files.saturating_add(1);
+                    out.bytes = out.bytes.saturating_add(len);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Pure parser for a 64-lowercase-hex digest filename (`[u8; 32]`).
+pub(crate) fn parse_hex_32(name: &str) -> Option<[u8; 32]> {
+    let bytes = name.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let nibble = |b: u8| -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            _ => None,
+        }
+    };
+    let mut out = [0u8; 32];
+    for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+        let hi = nibble(*pair.first()?)?;
+        let lo = nibble(*pair.get(1)?)?;
+        *slot = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+/// Sweeps superseded loose 64-hex pack/manifest files under `v2/toolchain/` that are NOT
+/// referenced by `pinned`'s verified manifest and have been untouched past [`CACHE_EXPIRY_NS`].
+/// Never touches `clang/`, any subdirectory, non-64-hex files, or anything when the active
+/// manifest is absent/unreadable.
+pub(crate) fn sweep_toolchain_packs(
+    cx: &Cx,
+    blaze_dir: &Dir<ReadWrite>,
+    pinned: blaze_toolchain::ToolchainId,
+    now_ns: u64,
+    dry_run: bool,
+    plant: AuxSweepPlant,
+) -> AuxSummary {
+    use bstd::fs::{Durable, EntryKind};
+    let mut out = AuxSummary::default();
+    let frame = cx.frame();
+    let pinned_hex_bytes = crate::fetch::key_hex(&blaze_ids::ContentId(pinned.0));
+    let Ok(pinned_hex) = core::str::from_utf8(&pinned_hex_bytes) else {
+        return out;
+    };
+    let manifest_rel = bstd::mem::format_in!(frame, "{TOOLCHAIN_DIR}/{pinned_hex}");
+    let Ok(manifest_path) = Path::new(manifest_rel.as_str()) else {
+        return out;
+    };
+    let Some(st) = blaze_dir.stat(cx, &manifest_path).ok().flatten() else {
+        return out;
+    };
+    if st.len > TOOLCHAIN_MANIFEST_MOST {
+        return out;
+    }
+    let mut buf = bstd::mem::Bytes::new_in(frame, "gc toolchain manifest read");
+    if blaze_dir.read_all(cx, &manifest_path, &mut buf).is_err() {
+        return out;
+    }
+    let Ok(view) = blaze_toolchain::ToolchainView::open(buf.as_slice(), pinned) else {
+        return out;
+    };
+    let mut keep: blaze_own::Vec<[u8; 32], &bstd::mem::Frame> = blaze_own::Vec::new_in(frame);
+    #[cfg(test)]
+    let ignore_active = plant == AuxSweepPlant::IgnoreActiveToolchain;
+    #[cfg(not(test))]
+    let ignore_active = {
+        let _ = plant;
+        false
+    };
+    if !ignore_active {
+        keep.push(pinned.0);
+        for krate in view.crates() {
+            keep.push(krate.pack);
+        }
+        keep.sort_unstable();
+        keep.dedup();
+    }
+    let Ok(tc_root) = Path::new(TOOLCHAIN_DIR) else {
+        return out;
+    };
+    let Ok(Some(entries)) = blaze_dir.entries(cx, &tc_root) else {
+        return out;
+    };
+    let limit = entries.len().min(AUX_SWEEP_MOST);
+    for i in 0..limit {
+        if entries.kind(i) != EntryKind::File {
+            continue;
+        }
+        let Some(digest) = parse_hex_32(entries.name(i)) else {
+            continue;
+        };
+        if keep.binary_search(&digest).is_ok() {
+            continue;
+        }
+        let Ok(path) = entries.path(i) else {
+            continue;
+        };
+        let mtime_ns = blaze_dir.stat(cx, &path).ok().flatten().map_or(0, |s| s.stamp.modified_ns);
+        if now_ns.saturating_sub(mtime_ns) < CACHE_EXPIRY_NS {
+            continue;
+        }
+        let len = entries.len_of(i);
+        if dry_run || blaze_dir.remove(cx, &path, Durable::No).is_ok() {
+            out.files = out.files.saturating_add(1);
+            out.bytes = out.bytes.saturating_add(len);
         }
     }
     out

@@ -426,6 +426,8 @@ pub enum RunModeError {
     /// The parent's inline bytes for `record` (`Down::Bytes`) are refused, for `why`
     /// (run_mode/received.rs).
     Sent { record: RecordId, why: SentRefused },
+    /// An uncaught guest exception unwound out of the program's entry under [`End::Return`].
+    Unwound,
 }
 
 impl From<WireError> for RunModeError {
@@ -553,6 +555,9 @@ impl fmt::Display for RunModeError {
             }
             RunModeError::Sent { record, why } => {
                 write!(f, "the parent's bytes for record {} (run wire `Bytes`): {why}", Short(&record.0))
+            }
+            RunModeError::Unwound => {
+                write!(f, "an uncaught panic unwound out of the program's entry")
             }
         }
     }
@@ -2258,9 +2263,9 @@ pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
         if let Some(loaded) = loaded {
             crate::native_lib::run_inits(loaded)?;
         }
-        let status = call_entry(thunk, handed);
-        match end {
-            End::Exit => {
+        let exit = call_entry(thunk, handed);
+        match (exit, end) {
+            (EntryExit::Returned(status), End::Exit) => {
                 // The main thread stays a mutator to the end: `exit` runs the program's
                 // `atexit` functions, which are its code.
                 core::mem::forget(me);
@@ -2268,7 +2273,17 @@ pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
                 // every mapping end with it.
                 unsafe { libc::exit(status) }
             }
-            End::Return => {
+            (EntryExit::Unwound, End::Exit) => {
+                // An uncaught guest panic unwound out of the entry (for instance a failing
+                // `#[test]` entered via `Handed::Unit`): guest destructors and the guest panic
+                // hook have already run. End the process cleanly with `SIGABRT` rather than
+                // letting the guest exception cross into `std::thread::scope`'s host
+                // `catch_unwind` (whose `panic_unwind` has a different `CANARY` and aborts with
+                // `"Rust cannot catch foreign exceptions"`).
+                core::mem::forget(me);
+                crate::observe::abort_process()
+            }
+            (EntryExit::Returned(status), End::Return) => {
                 // The control thread's loop ends at `Stop` (no code is placed after it: the
                 // program's one thread has returned). The wait "run mode: the control thread
                 // stops" is the join; it is bounded by the loop's next event, at most the
@@ -2281,37 +2296,92 @@ pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
                 }
                 Ok(status)
             }
+            (EntryExit::Unwound, End::Return) => {
+                drop(me);
+                shared.stop();
+                if control.join().is_err() {
+                    return Err(RunModeError::Thread { what: "control (it panicked while stopping)" });
+                }
+                Err(RunModeError::Unwound)
+            }
         }
     })
 }
 
-/// Calls the entry's thunk on this thread with what `handed` holds: the `i32` the process
-/// exits with. Every form's status is the same rule (the in-process runner's, blaze-ladder
-/// place.rs `Placed::call`): `fn()` gives 0, and an `i32`-returning entry's value is handed to
-/// `exit` whole, whose status the parent sees as its low 8 bits. A hosted program that calls its
-/// table's `exit` never returns here: the host's `exit` (bstd hosting.rs) writes what its
-/// streams hold and ends the process with that status, the same low 8 bits.
-fn call_entry(thunk: u64, handed: Handed) -> i32 {
+/// How the program's entry ended when called from the launcher's run thread.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EntryExit {
+    /// Returned normally with the `i32` process exit status.
+    Returned(i32),
+    /// Unwound out of the entry via an uncaught guest exception.
+    Unwound,
+}
+
+/// Calls the entry's thunk on this thread with what `handed` holds: [`EntryExit::Returned`]
+/// with the `i32` the process exits with, or [`EntryExit::Unwound`] when an uncaught guest
+/// exception unwound out of the entry. Every form's status is the same rule (the in-process
+/// runner's, blaze-ladder place.rs `Placed::call`): `fn()` gives 0, and an `i32`-returning
+/// entry's value is handed to `exit` whole, whose status the parent sees as its low 8 bits. A
+/// hosted program that calls its table's `exit` never returns here: the host's `exit` (bstd
+/// hosting.rs) writes what its streams hold and ends the process with that status, the same low
+/// 8 bits.
+///
+/// The guest runs its own `std` and `panic_unwind` (with its own `CANARY` static). Wrapping the
+/// call in `core::intrinsics::catch_unwind` installs a raw catch-all landing pad at the
+/// host/guest boundary so phase 2 runs all guest destructors cleanly and stops the unwind here
+/// without invoking host `panic_unwind::__rust_panic_cleanup` (which would reject the guest's
+/// `CANARY` with `"fatal runtime error: Rust cannot catch foreign exceptions, aborting"`) or
+/// `_Unwind_DeleteException` (which would invoke guest `__rust_drop_panic`).
+fn call_entry(thunk: u64, handed: Handed) -> EntryExit {
     use core::ffi::{c_char, c_int, c_void};
     use std::os::unix::ffi::OsStringExt;
 
-    match handed {
+    enum Call {
+        Hosted { entry: extern "C-unwind" fn(*const c_void) -> c_int, table: *const c_void },
+        Unit { entry: extern "C-unwind" fn() },
+        Main { entry: extern "C-unwind" fn(c_int, *const *const c_char) -> c_int, argc: c_int, argv: *const *const c_char },
+    }
+
+    struct State {
+        call: Call,
+        status: i32,
+    }
+
+    // SAFETY: `data` points to the live `State` local in `call_entry` and is called once.
+    unsafe fn do_call(data: *mut State) {
+        let state = unsafe { &mut *data };
+        state.status = match state.call {
+            Call::Hosted { entry, table } => entry(table),
+            Call::Unit { entry } => {
+                entry();
+                0
+            }
+            Call::Main { entry, argc, argv } => entry(argc, argv),
+        };
+    }
+
+    // `catch_unwind` requires `catch_fn` never to unwind; leaving the guest exception object
+    // untouched avoids both host `__rust_panic_cleanup` (foreign `CANARY`) and
+    // `_Unwind_DeleteException` (guest `__rust_drop_panic`).
+    unsafe fn do_catch(_data: *mut State, _exception: *mut u8) {}
+
+    let entry_addr = thunk as usize;
+    let call = match handed {
         Handed::Hosted(table) => {
             // SAFETY: `thunk` is the entry slot's thunk, in a mapping never unmapped (or, in a
             // test, a function of this form); the function there is bstd's hosted entry,
-            // `extern "C" fn(*const HostTable) -> i32` (the form the parent named, `hosted:`),
-            // compiled when this first call fires its stub. `table` lives across the call and
-            // every later reach of the program (`HostTableAt::new`'s contract).
-            let entry: extern "C" fn(*const c_void) -> c_int = unsafe { core::mem::transmute(thunk as usize) };
-            entry(table.0.as_ptr().cast_const())
+            // `extern "C-unwind" fn(*const HostTable) -> i32` (the form the parent named,
+            // `hosted:`), compiled when this first call fires its stub. `table` lives across
+            // the call and every later reach of the program (`HostTableAt::new`'s contract).
+            let entry: extern "C-unwind" fn(*const c_void) -> c_int = unsafe { core::mem::transmute(entry_addr) };
+            Call::Hosted { entry, table: table.0.as_ptr().cast_const() }
         }
         Handed::Unit => {
             // SAFETY: `thunk` is the entry slot's thunk, in a mapping never unmapped; the
-            // function there is `extern "C" fn()` (the form the parent named), compiled when
-            // this first call fires its stub.
-            let entry: extern "C" fn() = unsafe { core::mem::transmute(thunk as usize) };
-            entry();
-            0
+            // function there is a guest `fn()` (which may unwind on panic), compiled when this
+            // first call fires its stub.
+            let entry: extern "C-unwind" fn() = unsafe { core::mem::transmute(entry_addr) };
+            Call::Unit { entry }
         }
         Handed::CMain => {
             // The program's `argv`, leaked for its life (it is the process's).
@@ -2325,19 +2395,25 @@ fn call_entry(thunk: u64, handed: Handed) -> i32 {
             args.push(core::ptr::null());
             let argc = (args.len() - 1) as c_int;
             let argv = args.leak().as_ptr();
-            // SAFETY: as above, for `extern "C" fn(c_int, *const *const c_char) -> c_int`.
-            let entry: extern "C" fn(c_int, *const *const c_char) -> c_int =
-                unsafe { core::mem::transmute(thunk as usize) };
-            entry(argc, argv)
+            // SAFETY: as above, for `extern "C-unwind" fn(c_int, *const *const c_char) -> c_int`.
+            let entry: extern "C-unwind" fn(c_int, *const *const c_char) -> c_int =
+                unsafe { core::mem::transmute(entry_addr) };
+            Call::Main { entry, argc, argv }
         }
         Handed::Comptime(args) => {
             // SAFETY: as for `CMain` (the form the parent named, `comptime:`); `args` holds the
             // host's arguments, live for the process (`ComptimeArgs::new`'s contract).
-            let entry: extern "C" fn(c_int, *const *const c_char) -> c_int =
-                unsafe { core::mem::transmute(thunk as usize) };
-            entry(args.argc, args.argv)
+            let entry: extern "C-unwind" fn(c_int, *const *const c_char) -> c_int =
+                unsafe { core::mem::transmute(entry_addr) };
+            Call::Main { entry, argc: args.argc, argv: args.argv }
         }
-    }
+    };
+
+    let mut state = State { call, status: 0 };
+    // SAFETY: `state` is a live, aligned local; `do_call` accesses it only during this call;
+    // `do_catch` never unwinds.
+    let unwound = unsafe { core::intrinsics::catch_unwind(do_call, &raw mut state, do_catch) };
+    if unwound { EntryExit::Unwound } else { EntryExit::Returned(state.status) }
 }
 
 /// Counts the thread events the run mode does not act on (births, ends, reports: it retires

@@ -427,6 +427,20 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         r
     }
 
+    fn const_vtable_ref(&self, key: blaze_build::vtable::VtableKey, ground: &mut PortableTys<'_>, scratch: Alloc<'_>) -> Option<blaze_build::vtable::VtableRef> {
+        let r = self.inner.const_vtable_ref(key, ground, scratch);
+        let mut o = self.text();
+        match &r {
+            Some(v) => write!(o, "{v:?}"),
+            None => o.write_str("none"),
+        }
+        .expect(WRITES);
+        let mut q = self.text();
+        write!(q, "const_vtable_ref {key:?}").expect(WRITES);
+        self.push(q, o);
+        r
+    }
+
     fn evaluates_at_args(&self) -> bool {
         let r = self.inner.evaluates_at_args();
         self.note(format_args!("evaluates_at_args"), |o| write!(o, "{r}"));

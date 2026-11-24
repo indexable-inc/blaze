@@ -2741,7 +2741,7 @@ impl Tables<'_> {
             for &(offset, to) in table.relocs.iter() {
                 words[offset as usize / 8] = match to {
                     VtableTarget::Fn(i) if Some(i.item) == glue => fn_addr(i.item, Some(i.args)),
-                    VtableTarget::Fn(i) => {
+                    VtableTarget::Fn(i) | VtableTarget::ByValueShim(i) => {
                         let &(_, _, f) = self
                             .impls
                             .iter()

@@ -12,7 +12,6 @@ use std::time::Instant;
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
 use blaze_ladder::refusal::SourceFile;
-use blaze_own::Alloc;
 
 const EDITION: &str = "blaze-2026.11";
 
@@ -43,10 +42,11 @@ fn own_bodies_checked_with_item_relative_diagnostics() {
 
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+    let alloc = blaze_own::testing::heap().alloc();
     let t = Instant::now();
-    let mut world = ProjectWorld::new(&names, &frame, &sources, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
     let t_world = t.elapsed();
-    let bodies = world.bodies(Alloc::global());
+    let bodies = world.bodies(alloc);
     let name_of = |b: &BodyRef<'_>| -> String {
         match b {
             BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name).unwrap_or("?").to_string(),
@@ -59,13 +59,13 @@ fn own_bodies_checked_with_item_relative_diagnostics() {
     let bad = bodies.iter().find(|(b, _)| name_of(b) == "bad").map(|(b, _)| *b).expect("`bad` listed");
 
     let t = Instant::now();
-    let m = world.check(main, Alloc::global());
+    let m = world.check(main, alloc);
     let t_first = t.elapsed();
     let t = Instant::now();
-    let b = world.check(bad, Alloc::global());
+    let b = world.check(bad, alloc);
     let t_next = t.elapsed();
     let t = Instant::now();
-    let again = world.check(main, Alloc::global());
+    let again = world.check(main, alloc);
     let t_again = t.elapsed();
     println!("COST: names {t_names:?}; world {t_world:?}; first body (main) {t_first:?}; next body (bad) {t_next:?}; main again {t_again:?}");
     println!("main: {m:?}");

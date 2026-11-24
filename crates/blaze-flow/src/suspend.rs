@@ -89,15 +89,16 @@ fn zeroed<A: Allocator>(words: usize, alloc: A) -> Vec<u64, A> {
 }
 
 fn saved_with<A: Allocator + Copy>(flow: &Flow<A>, borrows: bool, alloc: A) -> Result<Saved<A>, Bound> {
-    let locals = flow.locals as usize;
+    let locals = usize::try_from(flow.locals).unwrap_or(usize::MAX);
     let words = locals.div_ceil(64);
     let mut out = zeroed(words, alloc);
     let suspends =
-        flow.stmts.iter().filter(|row| matches!(row.kind, StmtKind::Suspend { .. })).count() as u32;
+        u32::try_from(flow.stmts.iter().filter(|row| matches!(row.kind, StmtKind::Suspend { .. })).count()).unwrap_or(u32::MAX);
     if suspends == 0 {
         return Ok(Saved { bits: out, suspends });
     }
-    let limit = flow.blocks.len() as u64 * locals as u64 + 1;
+    let blocks_u64 = u64::try_from(flow.blocks.len()).unwrap_or(u64::MAX);
+    let limit = blocks_u64.saturating_mul(u64::from(flow.locals)).saturating_add(1);
 
     // Maybe storage-live on entry: the arguments, and every local no storage statement names.
     let mut named = zeroed(words, alloc);
@@ -107,8 +108,9 @@ fn saved_with<A: Allocator + Copy>(flow: &Flow<A>, borrows: bool, alloc: A) -> R
         }
     }
     let mut entry = zeroed(words, alloc);
+    let args = usize::try_from(flow.args).unwrap_or(usize::MAX);
     for l in 1..locals {
-        if l <= flow.args as usize || !bits::test(&named, l) {
+        if l <= args || !bits::test(&named, l) {
             bits::put(&mut entry, l, true);
         }
     }
@@ -131,7 +133,8 @@ fn saved_with<A: Allocator + Copy>(flow: &Flow<A>, borrows: bool, alloc: A) -> R
         let range = flow.blocks[b];
         st.copy_from_slice(storage.row(b));
         bo.copy_from_slice(borrowed.row(b));
-        for t in range.start..s as u32 {
+        let s_u32 = u32::try_from(s).unwrap_or(u32::MAX);
+        for t in range.start..s_u32 {
             storage_step(flow, Stmt(t), &mut st);
             borrow_step(flow, Stmt(t), &mut bo);
         }
@@ -177,7 +180,7 @@ fn forward<A: Allocator + Copy>(
     alloc: A,
 ) -> Result<Bits<A>, Bound> {
     let blocks = flow.blocks.len();
-    let mut rows = Bits::new_in(blocks, flow.locals as usize, alloc);
+    let mut rows = Bits::new_in(blocks, usize::try_from(flow.locals).unwrap_or(usize::MAX), alloc);
     if blocks == 0 {
         return Ok(rows);
     }
@@ -273,7 +276,7 @@ fn live_by_use<A: Allocator + Copy>(
     alloc: A,
 ) -> Result<Bits<A>, Bound> {
     let blocks = flow.blocks.len();
-    let mut rows = Bits::new_in(blocks, flow.locals as usize, alloc);
+    let mut rows = Bits::new_in(blocks, usize::try_from(flow.locals).unwrap_or(usize::MAX), alloc);
     let mut cur = zeroed(rows.words(), alloc);
     let mut passes = 0u64;
     loop {

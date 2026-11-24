@@ -254,6 +254,21 @@ fn decompose_sub_const(view: &View<'_>, val: u32) -> Option<(u32, u128)> {
     None
 }
 
+/// Decomposes `val` into `Some((n, k))` when `val` is `Op::UsubSat(n, const_k)` (`n.saturating_sub(k)`).
+#[inline]
+fn decompose_usub_sat_const(view: &View<'_>, val: u32) -> Option<(u32, u128)> {
+    let vi = to_idx(val);
+    if vi < view.len() && view.op(vi) == Op::UsubSat {
+        let at = to_idx(*view.data.get(vi)?);
+        let l = *view.extra.get(at)?;
+        let r = *view.extra.get(at + 1)?;
+        if let Some((c, _)) = const_int(view, to_idx(r)) {
+            return Some((l, c));
+        }
+    }
+    None
+}
+
 fn eval_fact(view: &View<'_>, facts: &[RelFact], q_cond: IntCond, q_a: u32, q_b: u32) -> Option<bool> {
     // 1. Direct & symmetric relational match.
     for &f in facts {
@@ -296,19 +311,60 @@ fn eval_fact(view: &View<'_>, facts: &[RelFact], q_cond: IntCond, q_a: u32, q_b:
             }
         }
     }
-    // 3. Affine slice-window BCE: if `i < (n - k)` AND `n >= k`, then for every `0 <= j <= k`,
-    //    `i + j < n` (provably overflow-free!).
+    // 3. Affine slice-window BCE:
+    //    - `i < (n - k)` with `n >= k` => for every `0 <= j <= k`, `i + j < n` (overflow-free).
+    //    - `i < n.saturating_sub(k)` => unconditionally proves `n > k` (since `i >= 0`), so for
+    //      every `0 <= j <= k`, `i + j < n` (overflow-free, beats LLVM on saturating_sub loops!).
+    //    - `i <= n.saturating_sub(k)` with `n >= k` => `i + j < n` for `j < k` and `i + k <= n`.
     let try_affine_ult = |lhs: u32, rhs: u32, cond: IntCond| -> Option<bool> {
         let (base_i, add_j) = decompose_add_const(view, lhs);
+        let check_n_ge_k = |k: u128| -> bool {
+            facts.iter().any(|&nf| {
+                if nf.a == rhs {
+                    const_int(view, to_idx(nf.b))
+                        .and_then(|(nc, nw)| eval_const_range(nf.cond, nc, IntCond::Uge, k, nw))
+                        == Some(true)
+                } else if nf.b == rhs {
+                    const_int(view, to_idx(nf.a))
+                        .and_then(|(nc, nw)| {
+                            eval_const_range(swap_cond(nf.cond), nc, IntCond::Uge, k, nw)
+                        })
+                        == Some(true)
+                } else {
+                    false
+                }
+            })
+        };
         for &f in facts {
-            let (fi, flim) = if f.cond == IntCond::Ult {
-                (f.a, f.b)
-            } else if f.cond == IntCond::Ugt {
-                (f.b, f.a)
-            } else {
-                continue;
+            let (strict, fi, flim) = match f.cond {
+                IntCond::Ult => (true, f.a, f.b),
+                IntCond::Ugt => (true, f.b, f.a),
+                IntCond::Ule => (false, f.a, f.b),
+                IntCond::Uge => (false, f.b, f.a),
+                _ => continue,
             };
             if fi != base_i {
+                continue;
+            }
+            if let Some((fn_val, sub_k)) = decompose_usub_sat_const(view, flim) {
+                if fn_val != rhs || add_j > sub_k {
+                    continue;
+                }
+                if strict {
+                    // `base_i < n.saturating_sub(k)` unconditionally implies `n > k`, so
+                    // `base_i + add_j < n` for every `0 <= add_j <= k`.
+                    if let Some(res) = implies(IntCond::Ult, cond) {
+                        return Some(res);
+                    }
+                } else if check_n_ge_k(sub_k) {
+                    let proven = if add_j < sub_k { IntCond::Ult } else { IntCond::Ule };
+                    if let Some(res) = implies(proven, cond) {
+                        return Some(res);
+                    }
+                }
+                continue;
+            }
+            if !strict {
                 continue;
             }
             let Some((fn_val, sub_k)) = decompose_sub_const(view, flim) else {
@@ -318,20 +374,7 @@ fn eval_fact(view: &View<'_>, facts: &[RelFact], q_cond: IntCond, q_a: u32, q_b:
                 continue;
             }
             // Verify `n >= sub_k` is also proven in `facts` so `n - sub_k` cannot underflow!
-            let n_ge_k = facts.iter().any(|&nf| {
-                if nf.a == rhs {
-                    const_int(view, to_idx(nf.b))
-                        .and_then(|(nc, nw)| eval_const_range(nf.cond, nc, IntCond::Uge, sub_k, nw))
-                        == Some(true)
-                } else if nf.b == rhs {
-                    const_int(view, to_idx(nf.a))
-                        .and_then(|(nc, nw)| eval_const_range(swap_cond(nf.cond), nc, IntCond::Uge, sub_k, nw))
-                        == Some(true)
-                } else {
-                    false
-                }
-            });
-            if n_ge_k {
+            if check_n_ge_k(sub_k) {
                 // Proven: `lhs < rhs` (`Ult`).
                 if let Some(res) = implies(IntCond::Ult, cond) {
                     return Some(res);
@@ -859,6 +902,7 @@ fn copy_inst<A: Allocator>(view: &View<'_>, inst: usize, val_map: &[u32], func: 
 mod tests {
     use blaze_own::testing::TestHeap;
     use super::*;
+    use crate::eval::{self, Outcome, Val};
     use crate::{
         Flags,
         builder::{Builder, Full, MemAttrs, Param, Variadic},
@@ -1005,6 +1049,61 @@ mod tests {
             let Outcome::Returned(a) = eval::run_in(opt_func.view(), &[Val::Int(xv)], 10_000, TestHeap).unwrap() else { panic!() };
             let Outcome::Returned(c) = eval::run_in(jt.func.view(), &[Val::Int(xv)], 10_000, TestHeap).unwrap() else { panic!() };
             assert_eq!(a, c, "jump threading mismatch at x={xv}");
+        }
+    }
+
+    #[test]
+    fn usub_sat_slice_window_bce_eliminates_traps_without_precheck() {
+        // `lim = n.saturating_sub(8); while i < lim { check i + 8 <= n && i + 7 < n; i += 1; }`
+        // Unlike plain `Sub`, `i < UsubSat(n, 8)` unconditionally proves `n > 8` with NO `n >= 8` guard!
+        let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        b.set_signature(sig);
+        let [entry, hdr, chk1, oob1, chk2, oob2, body, exit] =
+            [(); 8].map(|_| b.create_block(BlockKind::Normal));
+        b.begin(entry);
+        let n = b.param(Ty::I64);
+        let z = b.iconst(Ty::I64, 0);
+        let c1 = b.iconst(Ty::I64, 1);
+        let c7 = b.iconst(Ty::I64, 7);
+        let c8 = b.iconst(Ty::I64, 8);
+        let lim = b.binary(Op::UsubSat, Flags::NONE, n, c8);
+        b.jump((hdr, &[z, z]));
+        b.begin(hdr);
+        let i = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let keep = b.icmp(IntCond::Ult, i, lim);
+        b.br(Flags::NONE, keep, (chk1, &[]), (exit, &[acc]));
+        b.begin(chk1);
+        let ip7 = b.binary(Op::Add, Flags::NONE, i, c7);
+        let bad1 = b.icmp(IntCond::Uge, ip7, n);
+        b.br(Flags::NONE, bad1, (oob1, &[]), (chk2, &[]));
+        b.begin(oob1);
+        b.trap(1);
+        b.begin(chk2);
+        let ip8 = b.binary(Op::Add, Flags::NONE, i, c8);
+        let bad2 = b.icmp(IntCond::Ugt, ip8, n);
+        b.br(Flags::NONE, bad2, (oob2, &[]), (body, &[]));
+        b.begin(oob2);
+        b.trap(2);
+        b.begin(body);
+        let ip1 = b.binary(Op::Add, Flags::NONE, i, c1);
+        let acc2 = b.binary(Op::Add, Flags::NONE, acc, ip8);
+        b.jump((hdr, &[ip1, acc2]));
+        b.begin(exit);
+        let res = b.param(Ty::I64);
+        b.ret(&[res]);
+        let func = b.finish_checked().unwrap();
+
+        let bce = eliminate_redundant_checks(func.view(), TestHeap).unwrap();
+        assert!(
+            !(0..bce.func.view().len()).any(|k| bce.func.view().op(k) == Op::Trap),
+            "UsubSat BCE must eliminate BOTH `i + 7 >= n` and `i + 8 > n` traps without an `n >= 8` guard!"
+        );
+        for &nv in &[0u128, 1, 7, 8, 9, 16, 32] {
+            let Outcome::Returned(a) = eval::run_in(func.view(), &[Val::Int(nv)], 10_000, TestHeap).unwrap() else { panic!() };
+            let Outcome::Returned(c) = eval::run_in(bce.func.view(), &[Val::Int(nv)], 10_000, TestHeap).unwrap() else { panic!() };
+            assert_eq!(a, c, "UsubSat BCE mismatch at n={nv}");
         }
     }
 }

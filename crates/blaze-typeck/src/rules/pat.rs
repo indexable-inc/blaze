@@ -17,9 +17,8 @@
 //! pattern's type needs no result of theirs.
 //!
 //! Omitted for now: recording the peeled references (`pat_adjustments`, which MIR building
-//! reads), `box` and deref patterns, the
-//! or-pattern check that every alternative binds a name at one type, and the 2024 rule's exact
-//! diagnostic split (one code here).
+//! reads), `box` and deref patterns, checking that every alternative binds the exact same set of
+//! names (E0408), and the 2024 rule's exact diagnostic split (one code here).
 
 use blaze_own::{Alloc, Vec};
 
@@ -43,7 +42,15 @@ fn peeled_mode(mode: u32, m: Mutbl) -> u32 {
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// One pattern. `f.expect` holds the expected type, `f.a` the default binding mode.
     pub(crate) fn step_pat(&mut self, f: Frame, p: PatId) -> Result<(), Stop> {
+        if f.state == 1 {
+            return self.unify_or_bindings(p);
+        }
         let pat = self.body.pat(p)?;
+        if let Pat::Or { alts } = pat
+            && self.body.pat_list(alts)?.len() >= 2
+        {
+            self.resume(f, 1)?;
+        }
         let mut expected = f.expect.to_option().unwrap_or(self.common.err);
         let mut mode = f.a;
         // A path pattern's type is known before it meets the expected type, and a constant of
@@ -489,6 +496,92 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         }
         Ok(false)
+    }
+
+    /// Unifies the binding types of every alternative of `Pat::Or` `p` against the first
+    /// alternative's bindings of the same name (rustc E0308 / inference across `(Err(e), _) |
+    /// (_, Err(e))`). Iterative worklist, bounded by `self.body.pats.len()`.
+    fn unify_or_bindings(&mut self, p: PatId) -> Result<(), Stop> {
+        let Pat::Or { alts } = self.body.pat(p)? else {
+            return Ok(());
+        };
+        let pats = self.body.pat_list(alts)?;
+        let Some((&first, rest)) = pats.split_first() else {
+            return Ok(());
+        };
+        if rest.is_empty() {
+            return Ok(());
+        }
+        let limit = self.body.pats.len().saturating_mul(2).saturating_add(16);
+        let mut first_binds: Vec<(crate::ids::Name, Ty), Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut work: Vec<PatId, Alloc<'a>> = Vec::new_in(self.alloc);
+        work.push(first);
+        let mut steps = 0usize;
+        while let Some(cur) = work.pop() {
+            steps += 1;
+            if steps > limit {
+                return Ok(());
+            }
+            match self.body.pat(cur)? {
+                Pat::Bind { name, sub, .. } => {
+                    if let Some(&ty) = self.local_ty.get(cur.ix())
+                        && !first_binds.iter().any(|&(n, _)| n == name)
+                    {
+                        first_binds.push((name, ty));
+                    }
+                    if let Some(sub) = sub {
+                        work.push(sub);
+                    }
+                }
+                Pat::Ref { inner, .. } => work.push(inner),
+                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => {
+                    work.extend_from_slice(self.body.pat_list(elems)?);
+                }
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                    for fp in self.body.field_pat_list(fields)? {
+                        work.push(fp.pat);
+                    }
+                }
+                Pat::Missing | Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } => {}
+            }
+        }
+        if first_binds.is_empty() {
+            return Ok(());
+        }
+        for &alt in rest {
+            work.clear();
+            work.push(alt);
+            let mut alt_steps = 0usize;
+            while let Some(cur) = work.pop() {
+                alt_steps += 1;
+                if alt_steps > limit {
+                    break;
+                }
+                match self.body.pat(cur)? {
+                    Pat::Bind { name, sub, .. } => {
+                        if let Some(&(_, first_ty)) = first_binds.iter().find(|&&(n, _)| n == name)
+                            && let Some(&alt_ty) = self.local_ty.get(cur.ix())
+                        {
+                            self.demand_eq(At::Pat(cur), first_ty, alt_ty)?;
+                        }
+                        if let Some(sub) = sub {
+                            work.push(sub);
+                        }
+                    }
+                    Pat::Ref { inner, .. } => work.push(inner),
+                    Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => {
+                        work.extend_from_slice(self.body.pat_list(elems)?);
+                    }
+                    Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                        for fp in self.body.field_pat_list(fields)? {
+                            work.push(fp.pat);
+                        }
+                    }
+                    Pat::Missing | Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Pushes `pats` against the element types `tys`, `..` at `rest` skipping the middle

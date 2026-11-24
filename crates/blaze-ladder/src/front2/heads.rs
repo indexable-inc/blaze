@@ -1322,7 +1322,7 @@ pub struct ContainerRegions {
     pub trait_regions: Option<Vec<Region, Alloc<'static>>>,
     /// Non-higher-ranked trait bounds on the container's own type parameters (`Param(p): Trait<..>`),
     /// extracted from the container's filed clause columns (numbered in `Param(0..count)`).
-    pub param_bounds: Vec<ContainerParamBound, Alloc<'static>>,
+    pub param_bounds: blaze_own::Vec<ContainerParamBound, Alloc<'static>>,
 }
 
 /// Extract non-higher-ranked trait bounds on bare type parameters (`PNode::Param(p)`) from a
@@ -1331,8 +1331,8 @@ fn extract_container_param_bounds<A: core::alloc::Allocator>(
     tys: tc::PTys<'_>,
     clauses: &[tc::region_facts::ClauseRegions<A>],
     alloc: Alloc<'static>,
-) -> Vec<ContainerParamBound, Alloc<'static>> {
-    let mut out = Vec::new_in(alloc);
+) -> blaze_own::Vec<ContainerParamBound, Alloc<'static>> {
+    let mut out = blaze_own::Vec::new_in(alloc);
     for c in clauses {
         if c.binders != 0 {
             continue;
@@ -1341,7 +1341,7 @@ fn extract_container_param_bounds<A: core::alloc::Allocator>(
         let Ok(list) = tys.list(args) else { continue };
         let Some(&first) = list.first() else { continue };
         let Ok(PNode::Param(param)) = tys.node(first) else { continue };
-        let mut regions = Vec::with_capacity_in(c.col.as_slice().len(), alloc);
+        let mut regions = blaze_own::Vec::with_capacity_in(c.col.as_slice().len(), alloc);
         regions.extend_from_slice(c.col.as_slice());
         out.push(ContainerParamBound { param, trait_, regions });
     }
@@ -1353,8 +1353,8 @@ impl ContainerRegions {
     pub fn of_header(v: &View<'_>, self_regions: Option<Vec<Region, Alloc<'static>>>, alloc: Alloc<'static>) -> Result<ContainerRegions, Why> {
         let mut names = Vec::new_in(alloc);
         lifetime_names(v, &mut names)?;
-        let count = names.len() as u32;
-        Ok(ContainerRegions { names, count, self_regions, self_binders: 0, trait_regions: None, param_bounds: Vec::new_in(alloc) })
+        let count = u32::try_from(names.len()).unwrap_or(u32::MAX);
+        Ok(ContainerRegions { names, count, self_regions, self_binders: 0, trait_regions: None, param_bounds: blaze_own::Vec::new_in(alloc) })
     }
 
     /// What a member walk in `env` is given ([`SelfGiven`]): in an impl's member, `Self`'s
@@ -2105,11 +2105,15 @@ pub struct Store<'n> {
     pub field_defaults: Rows<ItemKey, Vec<Option<ItemKey>, Global>>,
     pub impls: Rows<ItemKey, ImplHead>,
     /// Trait impls whose header is lowered while one of their associated types waits on a
-    /// constant ([`ProvisionalImpl`]). Visible only while `maps.evaluating > 0`.
+    /// constant ([`ProvisionalImpl`]). Visible only while that impl's `waiting_const` is on
+    /// `active_consts` (currently being evaluated).
     pub provisional_impls: Rows<ItemKey, ProvisionalImpl>,
     /// Provisional impl keys read during the current body check or projection normalization
     /// (`BodyWorld::impl_header_once`, `BodyWorld::assoc_item_once`).
     pub(super) provisional_used: core::cell::RefCell<blaze_own::Vec<ItemKey, Alloc<'static>>>,
+    /// `NeedConst` keys currently on the constant evaluation stack; a provisional impl is
+    /// visible only while its `waiting_const` is in this stack.
+    pub(super) active_consts: core::cell::RefCell<blaze_own::Vec<LibKey, Alloc<'static>>>,
     pub fns: Rows<ItemKey, FnHead<'n>>,
     /// Each head's regions (D148), by [`super::head_record::regions_key`]: a fn's made by
     /// [`Store::fn_head`] in the walk that makes its types, or filed from its record.
@@ -2590,6 +2594,7 @@ impl<'n> Store<'n> {
             impls: Rows::new_in(alloc),
             provisional_impls: Rows::new_in(alloc),
             provisional_used: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)),
+            active_consts: core::cell::RefCell::new(blaze_own::Vec::new_in(alloc)),
             fns: Rows::new_in(alloc),
             regions: super::head_record::RegionTable::new_in(alloc),
             region_gaps: Rows::new_in(alloc),
@@ -3447,7 +3452,7 @@ impl<'n> Store<'n> {
         owned.extend_from_slice(names);
         let container = match impl_ {
             // A trait's group is its declared lifetimes (`ContainerRegions::of_header`).
-            None => Some(ContainerRegions { names: owned, count: declared, self_regions: None, self_binders: 0, trait_regions: None, param_bounds: Vec::new_in(alloc) }),
+            None => Some(ContainerRegions { names: owned, count: declared, self_regions: None, self_binders: 0, trait_regions: None, param_bounds: blaze_own::Vec::new_in(alloc) }),
             // An impl's whose regions were refused has none (its members' are refused by name).
             Some((None, _)) => None,
             Some((Some(r), self_ty)) => {
@@ -4336,17 +4341,47 @@ impl<'n> Store<'n> {
         Ok(())
     }
 
-    /// The impl head of `ck` if complete, or its provisional header while constant evaluation
-    /// is running (`maps.evaluating > 0`) and one of its associated types is waiting on a
-    /// constant. Returns `(head, is_provisional)`.
+    /// Current depth of `active_consts` so callers can truncate cleanly on exit.
+    pub(super) fn active_consts_len(&self) -> usize {
+        self.active_consts.borrow().len()
+    }
+
+    /// Pushes `key` onto `active_consts` while that constant is actively being evaluated.
+    pub(super) fn push_active_const(&self, key: LibKey) {
+        self.active_consts.borrow_mut().push(key);
+    }
+
+    /// Pops the most recent occurrence of `key` from `active_consts` (LIFO).
+    pub(super) fn pop_active_const(&self, key: LibKey) {
+        let mut active = self.active_consts.borrow_mut();
+        if let Some(pos) = active.iter().rposition(|&k| k == key) {
+            active.remove_shift(pos);
+        }
+    }
+
+    /// Truncates `active_consts` back to `len`.
+    pub(super) fn truncate_active_consts(&self, len: usize) {
+        self.active_consts.borrow_mut().truncate(len);
+    }
+
+    /// Whether `ck` has a provisional impl header whose `waiting_const` is currently being
+    /// evaluated (so lowering `ck` again would re-enter that constant).
+    pub(super) fn is_provisional_active(&self, ck: ItemKey) -> bool {
+        let Some(p) = self.provisional_impls.get(&ck) else { return false };
+        self.active_consts.borrow().iter().any(|&k| k == p.waiting_const)
+    }
+
+    /// The impl head of `ck` if complete, or its provisional header while the constant its
+    /// associated type waits on (`waiting_const`) is actively being evaluated.
+    /// Returns `(head, is_provisional)`.
     pub(super) fn impl_or_provisional(&self, ck: ItemKey) -> Option<(&ImplHead, bool)> {
         if let Some(h) = self.impls.get(&ck) {
             return Some((h, false));
         }
-        if self.maps.evaluating.get() > 0 {
-            if let Some(p) = self.provisional_impls.get(&ck) {
-                return Some((&p.head, true));
-            }
+        if let Some(p) = self.provisional_impls.get(&ck)
+            && self.active_consts.borrow().iter().any(|&k| k == p.waiting_const)
+        {
+            return Some((&p.head, true));
         }
         None
     }
@@ -4627,6 +4662,7 @@ impl<'n> Store<'n> {
                 }
             }
             self.preds.insert(ck, preds);
+            self.maps.const_params.insert(key, cs);
             self.provisional_impls.insert(
                 ck,
                 ProvisionalImpl {
@@ -6173,9 +6209,9 @@ pub fn p<'a>(x: &u8) -> impl Tr + '_ { loop {} }
             (k, crate::front2::keys::opaque_key(k, 0))
         };
         for name in ["o", "n", "w", "d", "p"] {
-            store.ensure(names, &mut keys, Want::Fn(item(names, name))).unwrap_or_else(|e| panic!("ensure `{name}`: {e:?}"));
+            store.ensure(names, &mut keys, Want::Fn(item(names, name))).unwrap_or_else(|e| panic!("ensure {name}: {e:?}"));
             let (fk, _) = opaque_of(name);
-            assert!(store.fn_gaps.get(&fk).is_none(), "ORACLE: `{name}`'s head was refused: {:?}", store.fn_gaps.get(&fk));
+            assert!(store.fn_gaps.get(&fk).is_none(), "ORACLE: {name}'s head was refused: {:?}", store.fn_gaps.get(&fk));
         }
         let outlives = |k: ItemKey| -> Vec<Region> {
             let p = store.preds.get(&k).unwrap_or_else(|| panic!("the opaque's predicates"));

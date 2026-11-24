@@ -312,7 +312,7 @@ pub mod record_ty;
 /// Zero-unsafe, sans-IO, Flecs 4.2-equivalent archetype Entity-Component-System (`World`,
 /// generational `Entity`, `(Rel, Target)` pairs with `ChildOf` cascade & `IsA` prefab inheritance,
 /// incrementally synced `CachedQuery`, reactive observers, and conflict-free phased `Pipeline`).
-pub mod ecs;
+pub use blaze_ecs as ecs;
 pub mod prefab;
 /// The native backend's reads of its host's facts.
 #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]

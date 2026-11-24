@@ -521,6 +521,13 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             }
         };
         if let Some(at) = owned {
+            // Own the moved closure environment in the entry's drop scope BEFORE the call so
+            // it is dropped on unwind if the inner `call`/`call_mut` panics as well as on normal
+            // return (the Reference, "Closure types", "Drop order").
+            if self.needs_drop(g).map_err(|error| Self::ty_err(closure, error))? {
+                let l = self.layout(g).map_err(|error| Self::ty_err(closure, error))?;
+                self.scope_pats.push(Held::Rest { at, l, variant: None, moved: 0 });
+            }
             let a = self.address(at);
             self.push_val(V::Scalar(a), None);
         }
@@ -539,11 +546,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         if let PNode::Never = self.ground_node(output).map_err(|error| Self::ty_err(closure, error))? {
             self.unreachable_of(TrapKind::AfterDivergingCall, Some(closure));
         } else {
-            if let Some(at) = owned
-                && self.needs_drop(g).map_err(|error| Self::ty_err(closure, error))?
-            {
-                self.drop_at(g, at)?;
-            }
+            // `ret_value` stores/passes `v` and then runs `drop_from(0)`, dropping `owned`.
             self.ret_value(v)?;
         }
         if let Some(error) = self.b.error() {
@@ -770,6 +773,157 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
         self.check_lir_error()
     }
+
+    /// The by-value `self` `VTableShim` for `target` (lib.rs `build_vtable_shim`): receives
+    /// `(data_ptr: *mut Self, args..)` from a dynamic call (e.g. `Box<dyn FnOnce>::call_once`),
+    /// reads/moves the concrete `Self` by value from `data_ptr`, and calls `target` directly.
+    fn run_vtable_shim(&mut self, target: Instance, sig: Option<&FnSig<'_>>) -> Result<(), BuildError> {
+        let sig_err = |error: TyErr| match error {
+            TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
+            TyErr::Malformed(what) => malformed(what),
+            TyErr::Other(error) => error,
+        };
+        let past = |_| malformed("a list past the ground table");
+        let is_fn_once_method = self.adts.fn_trait_method(FnTrait::FnOnce) == Some(target.item);
+        let target_args = self.ground.view().list(target.args).map_err(past)?;
+        let builtin_fn_once = if is_fn_once_method
+            && let &[callee_ty, tuple_ty] = target_args
+        {
+            match self.ground_node(callee_ty).map_err(sig_err)? {
+                PNode::Closure { .. } | PNode::FnDef(..) | PNode::FnPtr(..) => Some((callee_ty, tuple_ty)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let mut arg_tys: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc);
+        let (self_ty, output, callee_abi, callee_item) = if let Some((callee_ty, tuple_ty)) = builtin_fn_once {
+            let PNode::Tuple(tl) = self.ground_node(tuple_ty).map_err(sig_err)? else {
+                return Err(malformed("a `FnOnce` vtable shim's arguments not a tuple"));
+            };
+            arg_tys.extend_from_slice(self.ground.view().list(tl).map_err(past)?);
+            let output = match self.ground_node(callee_ty).map_err(sig_err)? {
+                PNode::Closure { .. } => {
+                    let parts = self.closure_parts(callee_ty).map_err(sig_err)?;
+                    let PNode::FnPtr(fl, _) = self.ground_node(parts.sig).map_err(sig_err)? else {
+                        return Err(malformed("a closure's signature that is not a fn pointer"));
+                    };
+                    *self.ground.view().list(fl).map_err(past)?.last().ok_or(malformed("a closure's signature without its output"))?
+                }
+                PNode::FnDef(_, fn_args) => {
+                    let sig = sig.ok_or(malformed("a fn item's vtable shim built without the item's signature"))?;
+                    if self.ground.view().list(fn_args).map_err(past)? != self.args {
+                        return Err(malformed("a fn item's vtable shim whose instance arguments are not the item's"));
+                    }
+                    self.ground_in(sig.types, sig.output).map_err(sig_err)?
+                }
+                PNode::FnPtr(fl, _) => {
+                    *self.ground.view().list(fl).map_err(past)?.last().ok_or(malformed("a fn pointer type without its output"))?
+                }
+                _ => return Err(malformed("a built-in `FnOnce` vtable shim on an unexpected receiver type")),
+            };
+            (callee_ty, output, Abi::RustCall, None)
+        } else {
+            let sig = sig.ok_or(malformed("a vtable shim built without its target's signature"))?;
+            let abi = self.adts.abi(target.item).ok_or(BuildError::NoAbi { item: target.item })?;
+            let (&first, rest) = sig.inputs.split_first().ok_or(malformed("a by-value vtable shim target without a `self` parameter"))?;
+            let self_ty = self.ground_in(sig.types, first).map_err(sig_err)?;
+            let output = self.ground_in(sig.types, sig.output).map_err(sig_err)?;
+            if abi == Abi::RustCall {
+                let (&last, mid) = rest.split_last().ok_or(malformed("a \"rust-call\" vtable shim target without its tuple parameter"))?;
+                for &t in mid {
+                    arg_tys.push(self.ground_in(sig.types, t).map_err(sig_err)?);
+                }
+                let tuple_ty = self.ground_in(sig.types, last).map_err(sig_err)?;
+                let PNode::Tuple(tl) = self.ground_node(tuple_ty).map_err(sig_err)? else {
+                    return Err(malformed("a \"rust-call\" vtable shim target's last parameter is not a tuple"));
+                };
+                arg_tys.extend_from_slice(self.ground.view().list(tl).map_err(past)?);
+            } else {
+                for &t in rest {
+                    arg_tys.push(self.ground_in(sig.types, t).map_err(sig_err)?);
+                }
+            }
+            (self_ty, output, abi, Some(target.item))
+        };
+
+        let n_args = arg_tys.len();
+        let mut arg_reprs = blaze_own::Vec::with_capacity_in(n_args, self.alloc);
+        let mut shim_passes = blaze_own::Vec::with_capacity_in(1 + n_args, self.alloc);
+        shim_passes.push(self.rust_pass(Repr::Ptr)?);
+        for &gi in arg_tys.iter() {
+            let repr = self.repr(gi).map_err(sig_err)?;
+            let pass = self.pass(gi, repr, callee_abi, callee_item)?;
+            arg_reprs.push(repr);
+            shim_passes.push(pass);
+        }
+        self.ret = self.repr(output).map_err(sig_err)?;
+        self.ret_pass = self.pass(output, self.ret, callee_abi, callee_item)?;
+        let (params, rets) = self.sig_of(&shim_passes, self.ret_pass);
+        let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        self.b.set_signature(own);
+        let entry = self.create();
+        if let Some(slot) = self.reached.get_mut(entry.index()) {
+            *slot = true;
+        }
+        self.begin(entry);
+        let mut values = blaze_own::Vec::with_capacity_in(params.len(), self.alloc);
+        for p in params.iter() {
+            values.push(self.b.param(p.ty));
+        }
+        let mut next = values.iter().copied();
+        if let Pass::Ref | Pass::Memory { .. } = self.ret_pass {
+            self.sret = Some(next.next().ok_or(malformed("a result pointer without its value"))?);
+        }
+        self.scope_marks.push(0);
+
+        let V::Scalar(data_ptr) = self.take_passed(Repr::Ptr, shim_passes[0], &mut next)? else {
+            return Err(malformed("a vtable shim's data pointer not passed as a scalar"));
+        };
+        let self_repr = self.repr(self_ty).map_err(sig_err)?;
+        let self_pass = self.pass(self_ty, self_repr, callee_abi, callee_item)?;
+        match self_repr {
+            Repr::None => self.push_val(V::None, None),
+            Repr::Agg(_) => self.push_val(V::Place(data_ptr, 0), None),
+            scalar => {
+                let v = self.load(scalar, (data_ptr, 0));
+                self.push_val(v, None);
+            }
+        }
+        for (&repr, &pass) in arg_reprs.iter().zip(shim_passes.iter().skip(1)) {
+            let v = self.take_passed(repr, pass, &mut next)?;
+            self.push_val(v, None);
+        }
+        let loc = match callee_item {
+            Some(_) => self.reify_caller_arg(target)?,
+            None => None,
+        };
+        let extra = usize::from(loc.is_some());
+        let mut treprs = blaze_own::Vec::with_capacity_in(1 + n_args + extra, self.alloc);
+        let mut tpasses = blaze_own::Vec::with_capacity_in(1 + n_args + extra, self.alloc);
+        treprs.push(self_repr);
+        tpasses.push(self_pass);
+        treprs.extend_from_slice(&arg_reprs);
+        tpasses.extend_from_slice(&shim_passes[1..]);
+        if let Some(loc) = loc {
+            self.push_val(V::Scalar(loc), None);
+            treprs.push(Repr::Ptr);
+            tpasses.push(track_caller::PASS);
+        }
+        let callee_nounwind = callee_item.is_some_and(|item| self.adts.nounwind(item) == Some(true));
+        let place = self.ref_place(target);
+        let reference = self.b.reference(RefKind::Func, place);
+        let (rrepr, rpass) = (self.ret, self.ret_pass);
+        self.emit_call_from(Callee::Direct(reference), &treprs, &tpasses, None, callee_nounwind, rrepr, rpass)?;
+        let v = self.pop()?;
+        if let PNode::Never = self.ground_node(output).map_err(sig_err)? {
+            self.unreachable_of(TrapKind::AfterDivergingCall, None);
+        } else {
+            self.ret_value(v)?;
+        }
+        self.check_lir_error()
+    }
 }
 
 /// An empty check record: a shim has no body of its own, and its walk reads none.
@@ -845,6 +999,23 @@ pub(crate) fn build_reify_shim<A: Allocator + Copy>(
     let body = empty_view(callee, checked.types.view());
     let mut w = Walk::new(&body, &checked, subst, adts, alloc);
     w.run_reify_shim(callee, sig)?;
+    w.into_built()
+}
+
+/// Builds the by-value `self` `VTableShim` for `target` (lib.rs `build_vtable_shim`,
+/// `Walk::run_vtable_shim`). Its walk is given an empty body named by `target.item` and an empty
+/// check record: neither is read.
+pub(crate) fn build_vtable_shim<A: Allocator + Copy>(
+    target: Instance,
+    sig: Option<&FnSig<'_>>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    let checked = empty_record(subst.scratch);
+    let body = empty_view(target.item, checked.types.view());
+    let mut w = Walk::new(&body, &checked, subst, adts, alloc);
+    w.run_vtable_shim(target, sig)?;
     w.into_built()
 }
 

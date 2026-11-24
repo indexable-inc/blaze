@@ -1362,3 +1362,265 @@ fn raw_borrows_of_statics_in_static_initializers() {
     assert_eq!(w.eval("READ_SM_RAW").expect_err("READ_SM_RAW").refusal, Refusal::MutableStatic { item: sm_key });
     assert_eq!(w.eval("WRITE_SM_RAW").expect_err("WRITE_SM_RAW").refusal, Refusal::MutableStatic { item: sm_key });
 }
+
+/// Trait-object unsizing coercions in `blaze-consteval`:
+/// - `&S -> &dyn Tr` (non-ZST concrete struct)
+/// - `&Unit -> &dyn Tr` (ZST concrete struct)
+/// - `*const S -> *const dyn Tr` and `*mut S -> *mut dyn Tr`
+/// - `static CALLSITE: S; static META: Meta = Meta { callsite: &CALLSITE };` (exact `tracing` shape)
+/// - `&*x` reborrow preserving vtable metadata + `&dyn Sub -> &dyn Super` upcast
+/// - `&Wrap<S> -> &Wrap<dyn Tr>` pointee struct-tail unsizing
+#[test]
+fn dyn_trait_unsizing_coercions_produce_vtable_relocs() {
+    use blaze_ids::ContentId;
+    use blaze_own::Alloc;
+    use blaze_typeck::fixture::{Bb, Fx};
+    use blaze_typeck::{
+        Adt, Checked, Expr, Fetch, InferCtx, IntSuffix, LangItem, List, Mutbl, Needs, Outcome, Range, UintTy, UnOp, check,
+    };
+
+    use crate::layout::{LayoutFacts, Missing, ReprAttrs, ValidRange};
+    use crate::machine::{Codes, value_of};
+    use crate::record::{ConstRecord, RecordKey};
+    use crate::{ConstWorld, FnKind, Lits, Typed};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 0, StdVec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let unsize = fx.tr("Unsize", 1, StdVec::new(), &[]);
+    fx.lang(LangItem::Unsize, unsize);
+    let coerce = fx.tr("CoerceUnsized", 1, StdVec::new(), &[]);
+    fx.lang(LangItem::CoerceUnsized, coerce);
+    let p0 = fx.param(0);
+    let p1 = fx.param(1);
+    let ref_t = fx.r(Mutbl::Not, p0);
+    let ref_u = fx.r(Mutbl::Not, p1);
+    let ptr_c_t = fx.ty(PNode::Ptr(Mutbl::Not, p0));
+    let ptr_c_u = fx.ty(PNode::Ptr(Mutbl::Not, p1));
+    let ptr_m_t = fx.ty(PNode::Ptr(Mutbl::Mut, p0));
+    let ptr_m_u = fx.ty(PNode::Ptr(Mutbl::Mut, p1));
+    let unsize_bound = fx.bound(unsize, &[p0, p1]);
+    let imp_ref = fx.imp("coerce_ref", 2, ref_t, Some((coerce, &[ref_u])), &[], StdVec::from([unsize_bound]));
+    fx.unsized_param(imp_ref, 0);
+    fx.unsized_param(imp_ref, 1);
+    let imp_cptr = fx.imp("coerce_cptr", 2, ptr_c_t, Some((coerce, &[ptr_c_u])), &[], StdVec::from([unsize_bound]));
+    fx.unsized_param(imp_cptr, 0);
+    fx.unsized_param(imp_cptr, 1);
+    let imp_mptr = fx.imp("coerce_mptr", 2, ptr_m_t, Some((coerce, &[ptr_m_u])), &[], StdVec::from([unsize_bound]));
+    fx.unsized_param(imp_mptr, 0);
+    fx.unsized_param(imp_mptr, 1);
+
+    let super_tr = fx.tr("Super", 0, StdVec::new(), &[]);
+    let super_bound = fx.bound(super_tr, &[p0]);
+    let sub_tr = fx.tr("Sub", 0, StdVec::from([super_bound]), &[]);
+    let u32_ = fx.u32();
+    let s_adt = fx.tuple_strukt("S", 0, &[u32_]);
+    let s_ty = fx.adt(s_adt, &[]);
+    let unit_adt = fx.tuple_strukt("Unit", 0, &[]);
+    let unit_ty = fx.adt(unit_adt, &[]);
+    let wrap_adt = fx.tuple_strukt("Wrap", 1, &[u32_, p0]);
+    fx.imp("s_sized", 0, s_ty, Some((sized, &[])), &[], StdVec::new());
+    fx.imp("unit_sized", 0, unit_ty, Some((sized, &[])), &[], StdVec::new());
+    fx.imp("s_super", 0, s_ty, Some((super_tr, &[])), &[], StdVec::new());
+    fx.imp("s_sub", 0, s_ty, Some((sub_tr, &[])), &[], StdVec::new());
+    fx.imp("unit_super", 0, unit_ty, Some((super_tr, &[])), &[], StdVec::new());
+    let wrap_s = fx.adt(wrap_adt, &[s_ty]);
+    fx.imp("wrap_s_sized", 0, wrap_s, Some((sized, &[])), &[], StdVec::new());
+
+    let ex_super = fx.ty(PNode::ExTrait(super_tr, List::EMPTY));
+    let ex_super_list = fx.list(&[ex_super]);
+    let dyn_super = fx.ty(PNode::Dynamic(ex_super_list));
+
+    let ref_dyn_super = fx.r(Mutbl::Not, dyn_super);
+    let ptr_c_dyn_super = fx.ty(PNode::Ptr(Mutbl::Not, dyn_super));
+    let ptr_m_dyn_super = fx.ty(PNode::Ptr(Mutbl::Mut, dyn_super));
+    let wrap_dyn_super = fx.adt(wrap_adt, &[dyn_super]);
+    let ref_wrap_dyn = fx.r(Mutbl::Not, wrap_dyn_super);
+    let meta_adt = fx.tuple_strukt("Meta", 0, &[u32_, ref_dyn_super]);
+    let meta_ty = fx.adt(meta_adt, &[]);
+    fx.imp("meta_sized", 0, meta_ty, Some((sized, &[])), &[], StdVec::new());
+
+    fx.finish();
+    let s_ctor = fx.adt_of(s_adt).expect("S adt").variants[0].key;
+    let wrap_ctor = fx.adt_of(wrap_adt).expect("Wrap adt").variants[0].key;
+    let meta_ctor = fx.adt_of(meta_adt).expect("Meta adt").variants[0].key;
+    fx.use_path("S", blaze_typeck::Def::Fn(s_ctor));
+    fx.use_path("Unit", blaze_typeck::Def::Ctor { adt: unit_adt, variant: 0, kind: blaze_typeck::CtorKind::Unit });
+    fx.use_path("Wrap", blaze_typeck::Def::Fn(wrap_ctor));
+    fx.use_path("Meta", blaze_typeck::Def::Fn(meta_ctor));
+    let ctors = [(s_ctor, s_adt), (wrap_ctor, wrap_adt), (meta_ctor, meta_adt)];
+    let callsite_item = fx.konst("_callsite_static", s_ty);
+    fx.use_path("CALLSITE", blaze_typeck::Def::Static(callsite_item, Mutbl::Not));
+    let callsite_mut_item = fx.konst("_callsite_mut_static", s_ty);
+    fx.use_path("CALLSITE_MUT", blaze_typeck::Def::Static(callsite_mut_item, Mutbl::Mut));
+    let c_non_zst = fx.konst("C_NON_ZST", ref_dyn_super);
+    let c_unit = fx.konst("C_UNIT", ref_dyn_super);
+    let c_raw_c = fx.konst("C_RAW_C", ptr_c_dyn_super);
+    let c_raw_m = fx.konst("C_RAW_M", ptr_m_dyn_super);
+    let c_meta = fx.konst("META", meta_ty);
+    let c_upcast = fx.konst("C_UPCAST", ref_dyn_super);
+    let c_tail = fx.konst("C_TAIL", ref_wrap_dyn);
+    fx.finish();
+
+    struct DynWorld<'b> {
+        fx: &'b Fx,
+        item: ItemKey,
+        typed: Typed<'b>,
+        ctors: &'b [(ItemKey, ItemKey)],
+        statics: &'b [ItemKey],
+        is_root_static: bool,
+    }
+    impl LayoutFacts for DynWorld<'_> {
+        fn adt(&self, key: ItemKey) -> Option<Adt<'_>> { self.fx.adt_of(key) }
+        fn repr(&self, _: ItemKey) -> Result<ReprAttrs, Missing> { Ok(ReprAttrs::RUST) }
+        fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> { Ok(None) }
+        fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> { Ok(ValidRange::default()) }
+    }
+    impl ConstWorld for DynWorld<'_> {
+        fn body(&self, item: ItemKey) -> Fetch<Option<Typed<'_>>> {
+            Ok((item == self.item).then_some(self.typed))
+        }
+        fn fn_kind(&self, item: ItemKey) -> FnKind {
+            if let Some(&(_, adt)) = self.ctors.iter().find(|&&(ctor, _)| ctor == item) {
+                FnKind::Ctor { adt, variant: 0 }
+            } else {
+                FnKind::NotConst
+            }
+        }
+        fn code_id(&self, item: ItemKey) -> ContentId { ContentId::of("dyn-test", &item.0.to_le_bytes()) }
+        fn is_static(&self, item: ItemKey) -> bool {
+            self.statics.contains(&item) || (self.is_root_static && item == self.item)
+        }
+        fn record(&self, _: RecordKey) -> Fetch<&ConstRecord<Alloc<'_>>> { Err(blaze_typeck::Missing) }
+        fn explicit_discriminant(&self, _: ItemKey, _: u32) -> Option<ItemKey> { None }
+    }
+
+    let eval_case = |owner: ItemKey, bb: &Bb, root: blaze_typeck::ExprId, lit_text: &str, lit_exprs: (&[blaze_typeck::ExprId], &[Range]), is_root_static: bool, ground: &mut PortableTys<'static>| -> ConstRecord<Alloc<'static>> {
+        let bv = bb.view(owner, root);
+        let mut cx = InferCtx::new_in(alloc);
+        let checked: Checked<'static> = match check(&bv, &fx, &mut cx, &Needs::new_in(alloc), alloc) {
+            Ok(Outcome::Done(c)) => {
+                assert!(c.diags.is_empty(), "check diags for {owner:?}: {:?}", c.diags);
+                c
+            }
+            Ok(Outcome::Need(n)) => panic!("check missed {:?}", n.questions),
+            Err(e) => panic!("check error: {e:?}"),
+        };
+        let lits = Lits { text: lit_text, exprs: lit_exprs, pats: (&[], &[]) };
+        let typed = Typed::new(bv, &checked, lit_text, lits, ContentId::of("dyn-body", &owner.0.to_le_bytes()));
+        let statics = [callsite_item, callsite_mut_item];
+        let world = DynWorld { fx: &fx, item: owner, typed, ctors: &ctors, statics: &statics, is_root_static };
+        let mut layouts = Layouts::new_in(alloc);
+        let mut codes = Codes::new_in(alloc);
+        match value_of(&world, &mut layouts, &mut codes, owner, List::EMPTY, ground, Limits::DEFAULT, alloc) {
+            Ok(Answer::Done(rec)) => rec,
+            other => panic!("eval {owner:?} failed: {other:?}"),
+        }
+    };
+
+    let mut ground = PortableTys::new_in(alloc);
+    let u32_suf = Some(IntSuffix::Uint(UintTy::U32));
+
+    // 1. Non-ZST `&S(42) -> &dyn Super`
+    let mut bb = Bb::new();
+    let v42 = bb.int(u32_suf);
+    let s_fn = bb.path(&["S"]);
+    let s_val = bb.call(s_fn, &[v42]);
+    let root = bb.borrow(Mutbl::Not, s_val);
+    let rec = eval_case(c_non_zst, &bb, root, "42u32", (&[v42], &[Range { start: 0, end: 5 }]), false, &mut ground);
+    assert_eq!(rec.data.allocs.len(), 2);
+    assert_eq!(rec.data.allocs[0].bytes.len(), 16);
+    assert_eq!(rec.data.allocs[0].relocs.len(), 2);
+    assert_eq!(rec.data.allocs[0].relocs[0].offset, 0);
+    assert_eq!(rec.data.allocs[0].relocs[0].target, DataTarget::Local(1));
+    assert_eq!(rec.data.allocs[0].relocs[1].offset, 8);
+    let DataTarget::Vtable(vk) = rec.data.allocs[0].relocs[1].target else { panic!("expected Vtable reloc") };
+    assert_eq!(rec.data.allocs[1].bytes.as_slice(), &42u32.to_le_bytes());
+    let cv = rec.vtable_named(vk).expect("vtable named in ConstRecord::vtables");
+    assert_eq!(cv.vtable.principal, super_tr);
+    assert_eq!(ground.view().node(cv.vtable.concrete), Ok(PNode::Adt(s_adt, List::EMPTY)));
+
+    // 2. ZST `&Unit -> &dyn Super`
+    let mut bb = Bb::new();
+    let u_val = bb.path(&["Unit"]);
+    let root = bb.borrow(Mutbl::Not, u_val);
+    let rec = eval_case(c_unit, &bb, root, "", (&[], &[]), false, &mut ground);
+    assert_eq!(rec.data.allocs.len(), 2);
+    assert_eq!(rec.data.allocs[0].bytes.len(), 16);
+    assert!(rec.data.allocs[1].bytes.is_empty(), "ZST concrete allocation has 0 bytes");
+    let DataTarget::Vtable(vk_u) = rec.data.allocs[0].relocs[1].target else { panic!("expected Vtable reloc") };
+    let cv_u = rec.vtable_named(vk_u).expect("ZST vtable named");
+    assert_eq!(cv_u.vtable.principal, super_tr);
+    assert_eq!(ground.view().node(cv_u.vtable.concrete), Ok(PNode::Adt(unit_adt, List::EMPTY)));
+
+    // 3. Raw `*const S -> *const dyn Super` and `*mut S -> *mut dyn Super`
+    let mut bb = Bb::new();
+    let cs_path = bb.path(&["CALLSITE"]);
+    let raw_c = bb.borrow(Mutbl::Not, cs_path);
+    bb.exprs[raw_c.0 as usize] = Expr::RawRef { mutbl: Mutbl::Not, operand: cs_path };
+    let rec = eval_case(c_raw_c, &bb, raw_c, "", (&[], &[]), false, &mut ground);
+    assert_eq!(rec.data.allocs[0].relocs.len(), 2);
+    assert_eq!(rec.data.allocs[0].relocs[0].target, DataTarget::Static(callsite_item));
+    assert!(matches!(rec.data.allocs[0].relocs[1].target, DataTarget::Vtable(k) if k == vk));
+
+    let mut bb = Bb::new();
+    let csm_path = bb.path(&["CALLSITE_MUT"]);
+    let raw_m = bb.borrow(Mutbl::Mut, csm_path);
+    bb.exprs[raw_m.0 as usize] = Expr::RawRef { mutbl: Mutbl::Mut, operand: csm_path };
+    let rec = eval_case(c_raw_m, &bb, raw_m, "", (&[], &[]), false, &mut ground);
+    assert_eq!(rec.data.allocs[0].relocs.len(), 2);
+    assert_eq!(rec.data.allocs[0].relocs[0].target, DataTarget::Static(callsite_mut_item));
+    assert!(matches!(rec.data.allocs[0].relocs[1].target, DataTarget::Vtable(k) if k == vk));
+
+    // 4. Exact `tracing` static META shape: `static META: Meta = Meta(5, &CALLSITE)`
+    let mut bb = Bb::new();
+    let tag5 = bb.int(u32_suf);
+    let cs_path = bb.path(&["CALLSITE"]);
+    let cs_ref = bb.borrow(Mutbl::Not, cs_path);
+    let m_fn = bb.path(&["Meta"]);
+    let meta_val = bb.call(m_fn, &[tag5, cs_ref]);
+    let rec = eval_case(c_meta, &bb, meta_val, "5u32", (&[tag5], &[Range { start: 0, end: 4 }]), true, &mut ground);
+    assert_eq!(rec.data.allocs.len(), 1, "META points to static CALLSITE and vtable, no local allocs");
+    assert_eq!(rec.data.allocs[0].relocs.len(), 2);
+    assert!(rec.data.allocs[0].relocs.iter().any(|r| r.target == DataTarget::Static(callsite_item)));
+    assert!(rec.data.allocs[0].relocs.iter().any(|r| r.target == DataTarget::Vtable(vk)));
+
+    // 5. Reborrow `&*sub` + upcast `&dyn Sub -> &dyn Super`
+    let mut bb = Bb::new();
+    let v9 = bb.int(u32_suf);
+    let s_fn = bb.path(&["S"]);
+    let s_val = bb.call(s_fn, &[v9]);
+    let s_ref = bb.borrow(Mutbl::Not, s_val);
+    let p_sub = bb.bind("sub");
+    let sub_ty_in_bb = {
+        let ex = bb.ty(PNode::ExTrait(sub_tr, List::EMPTY));
+        let exl = bb.t.intern_list(&[ex]).expect("list");
+        let d = bb.ty(PNode::Dynamic(exl));
+        bb.ty(PNode::Ref(Mutbl::Not, d))
+    };
+    let s1 = bb.let_(p_sub, Some(sub_ty_in_bb), s_ref);
+    let sub_local = bb.local(p_sub);
+    let derefed = bb.borrow(Mutbl::Not, sub_local);
+    bb.exprs[derefed.0 as usize] = Expr::Unary { op: UnOp::Deref, operand: sub_local };
+    let reborrowed = bb.borrow(Mutbl::Not, derefed);
+    let blk = bb.block(&[s1], Some(reborrowed));
+    let rec = eval_case(c_upcast, &bb, blk, "9u32", (&[v9], &[Range { start: 0, end: 4 }]), false, &mut ground);
+    assert_eq!(rec.data.allocs[0].relocs.len(), 2);
+    let DataTarget::Vtable(vk_up) = rec.data.allocs[0].relocs[1].target else { panic!("expected upcast Vtable reloc") };
+    assert_eq!(vk_up, vk, "upcast `&dyn Sub -> &dyn Super` produces `(S, Super)`'s vtable");
+
+    // 6. Pointee struct-tail unsizing: `&Wrap<S> -> &Wrap<dyn Super>`
+    let mut bb = Bb::new();
+    let tag3 = bb.int(u32_suf);
+    let v11 = bb.int(u32_suf);
+    let s_fn = bb.path(&["S"]);
+    let s_val = bb.call(s_fn, &[v11]);
+    let w_fn = bb.path(&["Wrap"]);
+    let w_val = bb.call(w_fn, &[tag3, s_val]);
+    let w_ref = bb.borrow(Mutbl::Not, w_val);
+    let rec = eval_case(c_tail, &bb, w_ref, "3u3211u32", (&[tag3, v11], &[Range { start: 0, end: 4 }, Range { start: 4, end: 9 }]), false, &mut ground);
+    assert_eq!(rec.data.allocs[0].relocs.len(), 2);
+    let DataTarget::Vtable(vk_tail) = rec.data.allocs[0].relocs[1].target else { panic!("expected tail Vtable reloc") };
+    assert_eq!(vk_tail, vk, "struct-tail unsizing `&Wrap<S> -> &Wrap<dyn Super>` carries `(S, Super)`'s vtable");
+}

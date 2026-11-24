@@ -176,6 +176,12 @@ impl Drop for RequestMem {
     }
 }
 
+/// Phases that committed at least this many bytes trigger an inter-phase `blaze-mem` trim
+/// (`MADV_FREE_REUSABLE`/`MADV_DONTNEED`) so idle worker shelves, span pools, and warm chunk
+/// caches return to the OS before the next heavy cold phase peaks; warm/edit phases stay below
+/// this threshold and pay zero trim overhead.
+const PHASE_TRIM_THRESHOLD: u64 = 16 << 20;
+
 /// One phase's arena (the module's doc).
 pub(crate) struct PhaseMem<'r> {
     request: &'r RequestMem,
@@ -214,6 +220,12 @@ impl PhaseMem<'_> {
             kept_on_heap: signed(heap).saturating_sub(signed(self.heap_at_start)),
         };
         drop(self);
+        if committed >= PHASE_TRIM_THRESHOLD {
+            blaze_mem::frame::ask_spare_trim();
+            let _ = blaze_mem::frame::trim_spare(0);
+            let _ = blaze_mem::frame::trim_span_pool();
+            let _ = blaze_mem::chunks::trim();
+        }
         row
     }
 }

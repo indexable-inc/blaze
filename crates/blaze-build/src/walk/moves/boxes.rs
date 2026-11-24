@@ -332,6 +332,99 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         Ok(V::Place(tmp.0, tmp.1))
     }
 
+    /// By-value dynamic call on `*b` where `b: Box<dyn Tr>` (e.g. `Box<dyn FnOnce>::call_once`'s
+    /// `<F as FnOnce<Args>>::call_once(*self, args)`): clears the `[Deref]` bit of the owning
+    /// local or temporary `Box` so its drop frees the allocation without running `dyn_glue` on
+    /// the already-consumed trait object (both on normal exit and on unwind).
+    pub(in crate::walk) fn move_unsized_box_contents(&mut self, mut e: ExprId) -> Result<(), BuildError> {
+        while let Expr::Paren(inner) = self.expr(e)? {
+            e = inner;
+        }
+        let rows = self.adjust_rows(e);
+        let kinds = self.checked.adjusts.column::<1>().get(rows.start..rows.end).ok_or(malformed("adjustment rows past their column"))?;
+        let lead = kinds.iter().take_while(|k| matches!(k, AdjustKind::Deref { .. })).count();
+        let (start, derefs, temp_box) = if lead > 0 {
+            if !self.box_rows(e, lead)? {
+                return Err(unsupported(e, "a by-value dynamic call on a dereference other than of a `Box` (E0507)"));
+            }
+            let lead32 = u32::try_from(lead).map_err(|_| malformed("dereference adjustments past u32"))?;
+            (e, lead32, (e, lead - 1))
+        } else if let Expr::Unary { op: UnOp::Deref, operand } = self.expr(e)?
+            && self.deref_on_operand(operand)
+        {
+            let op_len = self.adjust_rows(operand).len();
+            if op_len == 0 || !self.box_rows(operand, op_len)? {
+                return Err(unsupported(e, "a by-value dynamic call on a dereference other than of a `Box` (E0507)"));
+            }
+            (e, 0, (operand, op_len - 1))
+        } else {
+            return Err(unsupported(e, "a by-value dynamic call on a trait object not moved out of a `Box`"));
+        };
+        if let Some((_, mask, path_start, path_len, drops)) = self.place_path(start, derefs)? {
+            if drops {
+                let keep = usize::try_from(path_start).map_err(|_| malformed("move step offset past usize"))?;
+                self.moves.steps.truncate(keep);
+                return Err(unsupported(e, "a move out of a field of a type that implements `Drop` (E0509)"));
+            }
+            let Some(bit) = self.part_bit(mask, path_start, path_len, 0, Some(e))? else {
+                return Err(unsupported(e, "a move out of more than 64 parts of one local (its word)"));
+            };
+            self.clear_bit(mask, bit);
+            return Ok(());
+        }
+        let temp_derefs = u32::try_from(temp_box.1).map_err(|_| malformed("temporary box dereferences past u32"))?;
+        self.move_temp_unsized_box_contents(temp_box.0, temp_derefs)
+    }
+
+    /// `move_unsized_box_contents` for a temporary `Box<dyn Tr>` (e.g. `(*make_box())()`).
+    fn move_temp_unsized_box_contents(&mut self, e: ExprId, n: u32) -> Result<(), BuildError> {
+        if self.is_place_expr(e)? {
+            return Err(unsupported(
+                e,
+                "a move out of a `Box`'s contents whose box is a place no local's field flags cover (behind a reference or a pointer: E0507)",
+            ));
+        }
+        if n != 0 {
+            return Err(unsupported(e, "a move out of the contents of a temporary `Box` reached by more than one dereference (`**make()`)"));
+        }
+        if !self.live {
+            return Ok(());
+        }
+        let p = match self.moves.box_self {
+            Some((b, p)) if b == e => p,
+            _ => return Err(malformed("a move out of a temporary `Box`'s contents with no recorded dereference of the box")),
+        };
+        let found = self
+            .scope_pats
+            .iter()
+            .rposition(|h| matches!(*h, Held::Rest { at: a, variant: None, .. } | Held::Moved { at: a, .. } if a == (p, 0)));
+        let Some(i) = found else {
+            return Err(unsupported(e, "a move out of the contents of a temporary `Box` not held to its scope's end (an extended temporary)"));
+        };
+        let existing = *self.scope_pats.get(i).ok_or(malformed("temporary `Box` scope entry past scope_pats"))?;
+        let mask = match existing {
+            Held::Moved { mask, .. } => mask,
+            _ => {
+                let t = self.expr_ty(e)?;
+                let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
+                let slot = self.b.slot(8, 3, SlotKind::Named);
+                let fa = self.b.slot_addr(slot);
+                let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
+                self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
+                let entry = self.scope_pats.get_mut(i).ok_or(malformed("temporary `Box` scope entry past scope_pats"))?;
+                *entry = Held::Moved { at: (p, 0), g, mask: slot };
+                slot
+            }
+        };
+        let start = u32::try_from(self.moves.steps.len()).map_err(|_| malformed("move steps past u32"))?;
+        self.moves.steps.push(Step::Deref);
+        let Some(bit) = self.part_bit(mask, start, 1, 0, Some(e))? else {
+            return Err(unsupported(e, "a move out of more than 64 parts of one temporary (its word)"));
+        };
+        self.clear_bit(mask, bit);
+        Ok(())
+    }
+
     /// walk.rs `deref_call` for a `Box` `Self` (`g_self`, its target `g_target`, `m` the
     /// recorded mutability): the builtin dereference, never a call of `Deref::deref` (alloc's
     /// body, `&**self`, is itself this dereference). The pointer to the box is on top; the
@@ -383,7 +476,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         if ps.iter().any(|&q| self.under(q, rep, n.depth, None) && !self.under(q, rep, n.depth, Some(Step::Deref))) {
             return Err(malformed("a moved part under a `Box` other than through its contents"));
         }
-        if matches!(self.ground_node(t).map_err(from_ty)?, PNode::Dynamic(_) | PNode::Slice(_) | PNode::Str) {
+        let t_node = self.ground_node(t).map_err(from_ty)?;
+        if matches!(t_node, PNode::Slice(_) | PNode::Str) {
             return Err(malformed("a moved part of an unsized `Box`'s contents (E0161)"));
         }
         // The controls of tests/box_moves.rs: the path state ignored, the box dropped whole by
@@ -397,7 +491,6 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return self.drop_at(n.g, place);
         }
         let off = self.box_data_word(n.g).map_err(from_ty)?;
-        let data = self.b.load(Ty::PTR, Flags::NONE, place.0, place.1 + off, MemAttrs::aligned(3));
         #[cfg(test)]
         let free = planted != crate::Planted::MovedBoxNotFreed;
         #[cfg(not(test))]
@@ -405,6 +498,28 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             let () = planted;
             true
         };
+        if matches!(t_node, PNode::Dynamic(_)) {
+            let deref_depth = n.depth + 1;
+            let mut exact_bit = None;
+            for &q in ps {
+                if !self.under(q, rep, n.depth, Some(Step::Deref)) {
+                    continue;
+                }
+                let qi = usize::try_from(q).map_err(|_| malformed("moved part index past usize"))?;
+                let qp = *self.moves.parts.get(qi).ok_or(malformed("moved part index past parts table"))?;
+                if qp.len != deref_depth {
+                    return Err(malformed("a moved part below a `Box<dyn>`'s contents (E0161)"));
+                }
+                exact_bit = Some(qp.bit);
+            }
+            let bit = exact_bit.ok_or(malformed("a `Box<dyn>` descended into without a `[Deref]` part"))?;
+            if free {
+                todo.push(Do::BoxFree { g: n.g, place });
+            }
+            todo.push(Do::BoxDyn { g: n.g, place, off, bit, free });
+            return Ok(());
+        }
+        let data = self.b.load(Ty::PTR, Flags::NONE, place.0, place.1 + off, MemAttrs::aligned(3));
         if free {
             todo.push(Do::BoxFree { g: n.g, place });
         }

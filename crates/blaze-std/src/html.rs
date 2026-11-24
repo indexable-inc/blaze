@@ -1292,7 +1292,7 @@ mod tests {
                 return Err(Broke::Oracle(
                     format_in!(
                         alloc,
-                        "forbidden `{forbidden}` leaked into sanitized output: {:?}",
+                        "forbidden '{forbidden}' leaked into sanitized output: {:?}",
                         out.as_str()
                     )
                     .as_str()

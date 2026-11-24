@@ -493,10 +493,13 @@ fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
         _ => return Err(BuildError::UnsupportedSig { what: "an async block whose flow was refused: its state recipe was not made" }),
     };
     let points = recipe.points;
-    // An ADT whose row is not made stays `NoAdt` (the need the lazy program fills, then the
-    // instance is built again); any other layout refusal is the state's.
+    // Needs the lazy program fills (`NoAdt`, `Select(Missing(_))`, `OpaqueOwnerUnchecked`) and
+    // named refusals (`Projection`, `Malformed`) pass through verbatim so the instance loop makes
+    // what was asked and tries again (or names the real refusal, rule 19).
     let refused = |e: blaze_build::layout::LayoutError| match e.why {
         blaze_build::layout::Refusal::NoAdt(adt) => BuildError::NoAdt { adt },
+        blaze_build::layout::Refusal::Ground(error) | blaze_build::layout::Refusal::FieldGround { error, .. } => error,
+        blaze_build::layout::Refusal::Missing(m) => BuildError::MissingRecord { item: m.item },
         _ => BuildError::UnsupportedSig { what: "the layout of an upvar or saved local of a coroutine state was refused" },
     };
     let mut sizes: AVec<'_, (u64, u8)> = AVec::with_capacity_in(types.len(), alloc);
@@ -515,6 +518,8 @@ fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
         let needs = blaze_build::drop_facts::needs_drop(t, &mut *ground, adts.facts(), manually_drop, &mut drop_impl, alloc)
             .map_err(|e| match e {
                 blaze_build::drop_facts::NeedsDropError::NoAdt { adt } => BuildError::NoAdt { adt },
+                blaze_build::drop_facts::NeedsDropError::Ask(error) | blaze_build::drop_facts::NeedsDropError::Ground(error) => error,
+                blaze_build::drop_facts::NeedsDropError::Malformed { what } => BuildError::Malformed { what },
                 _ => BuildError::UnsupportedSig { what: "whether a saved local of a coroutine state needs drop was not answered" },
             })?;
         flags.push(needs);

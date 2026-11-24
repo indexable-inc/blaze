@@ -2,16 +2,16 @@
 //!
 //! - [`ReflectError`]: typed reflection, decoding, and lookup error enum.
 //! - [`ReflectComponent`]: reflection trait bridging Rust component types with
-//!   [`crate::data::Value`], schema inspection, full decoding, and partial-map in-place patching.
-//! - [`reflect_struct!`]: zero-boilerplate declarative macro implementing [`crate::data::ToValue`],
-//!   [`crate::data::FromValue`], and [`ReflectComponent`] for any plain Rust struct.
+//!   [`blaze_data::Value`], schema inspection, full decoding, and partial-map in-place patching.
+//! - [`reflect_struct!`]: zero-boilerplate declarative macro implementing [`blaze_data::ToValue`],
+//!   [`blaze_data::FromValue`], and [`ReflectComponent`] for any plain Rust struct.
 
 use core::alloc::Allocator;
 use core::fmt::{self, Write as _};
 
 use blaze_own::{AllocFailure, FixedString, String as OwnString};
 
-use crate::data::{Cursor, FromValue, Kind, Map, Shape, ShapeError, ToValue, Value};
+use blaze_data::{Cursor, FromValue, Kind, Map, Shape, ShapeError, ToValue, Value};
 
 use super::error::EcsError;
 use super::id::{ComponentId, Entity};
@@ -34,7 +34,7 @@ pub enum ReflectError {
     /// Entity does not currently possess the target component.
     MissingComponent(ComponentId),
     /// Input bytes failed strict RFC 8259 JSON parsing.
-    InvalidJson(crate::json::Error),
+    InvalidJson(blaze_json::Error),
     /// Floating-point value was NaN or infinite and cannot be represented in JSON or checked f32.
     NotFinite,
 }
@@ -65,9 +65,9 @@ impl<A: Allocator> From<ShapeError<A>> for ReflectError {
     }
 }
 
-impl From<crate::json::Error> for ReflectError {
+impl From<blaze_json::Error> for ReflectError {
     #[inline]
-    fn from(err: crate::json::Error) -> Self {
+    fn from(err: blaze_json::Error) -> Self {
         Self::InvalidJson(err)
     }
 }
@@ -192,7 +192,7 @@ fn f64_to_f32_no_cast(v: f64) -> Option<f32> {
 }
 
 /// Convert a `blaze_data::Int` to `f32` without `as` casts.
-fn int_to_f32_no_cast(n: crate::data::Int) -> Option<f32> {
+fn int_to_f32_no_cast(n: blaze_data::Int) -> Option<f32> {
     let mut buf = FixedString::<64>::new();
     write!(buf, "{n}").ok()?;
     let parsed = buf.as_str().parse::<f32>().ok()?;
@@ -200,7 +200,7 @@ fn int_to_f32_no_cast(n: crate::data::Int) -> Option<f32> {
 }
 
 /// Convert a `blaze_data::Int` to `f64` without `as` casts.
-fn int_to_f64_no_cast(n: crate::data::Int) -> Option<f64> {
+fn int_to_f64_no_cast(n: blaze_data::Int) -> Option<f64> {
     let mut buf = FixedString::<64>::new();
     write!(buf, "{n}").ok()?;
     let parsed = buf.as_str().parse::<f64>().ok()?;
@@ -343,229 +343,58 @@ impl<T: ReflectComponent> ReflectComponent for Option<T> {
     }
 }
 
-/// Internal helpers used by [`crate::reflect_struct!`]; not part of the stable public API.
-#[doc(hidden)]
-pub mod __private {
-    use core::alloc::Allocator;
-
-    pub use blaze_own::{AllocFailure, String as OwnString};
-
-    use crate::data::{Map, Value};
-
-    use super::{ReflectComponent, ReflectError};
-
-    /// Insert a field into a [`Map`] inside `ToValue::to_value` without calling `.clone()`.
-    #[inline]
-    pub fn insert_field_value<A: Allocator + Copy>(
-        map: &mut Map<A>,
-        name: &str,
-        val: Value<A>,
-        alloc: A,
-    ) {
-        let key = OwnString::from_str_in(name, alloc);
-        let _ = map.insert(key, val);
-    }
-
-    /// Insert a fallibly reflected field into a [`Map`].
-    #[inline]
-    pub fn try_insert_reflected_field<T: ReflectComponent, A: Allocator + Copy>(
-        map: &mut Map<A>,
-        name: &str,
-        field: &T,
-        alloc: A,
-    ) -> Result<(), ReflectError> {
-        let key = OwnString::try_from_str_in(name, alloc)?;
-        let val = field.reflect_to_value(alloc)?;
-        let _ = map.insert(key, val);
-        Ok(())
-    }
-
-    /// Build a canonical struct schema:
-    /// `{"kind": "struct", "name": "<Name>", "fields": [{"name": "x", "type": "f32"}, ...]}`.
-    pub fn struct_schema<A: Allocator + Copy>(
-        name: &str,
-        fields: &[(&str, &str)],
-        alloc: A,
-    ) -> Result<Value<A>, AllocFailure> {
-        let mut root = Map::new_in(alloc);
-        let _ = root.insert(
-            OwnString::try_from_str_in("kind", alloc)?,
-            Value::Text(OwnString::try_from_str_in("struct", alloc)?),
-        );
-        let _ = root.insert(
+/// Build a canonical struct schema:
+/// `{"kind": "struct", "name": "<Name>", "fields": [{"name": "x", "type": "f32"}, ...]}`.
+pub fn struct_schema<A: Allocator + Copy>(
+    name: &str,
+    fields: &[(&str, &str)],
+    alloc: A,
+) -> Result<Value<A>, AllocFailure> {
+    let mut root = Map::new_in(alloc);
+    let _ = root.insert(
+        OwnString::try_from_str_in("kind", alloc)?,
+        Value::Text(OwnString::try_from_str_in("struct", alloc)?),
+    );
+    let _ = root.insert(
+        OwnString::try_from_str_in("name", alloc)?,
+        Value::Text(OwnString::try_from_str_in(name, alloc)?),
+    );
+    let mut list = blaze_own::Vec::try_with_capacity_in(fields.len(), alloc)?;
+    for &(fname, ftype) in fields {
+        let mut fobj = Map::new_in(alloc);
+        let _ = fobj.insert(
             OwnString::try_from_str_in("name", alloc)?,
-            Value::Text(OwnString::try_from_str_in(name, alloc)?),
+            Value::Text(OwnString::try_from_str_in(fname, alloc)?),
         );
-        let mut list = blaze_own::Vec::try_with_capacity_in(fields.len(), alloc)?;
-        for &(fname, ftype) in fields {
-            let mut fobj = Map::new_in(alloc);
-            let _ = fobj.insert(
-                OwnString::try_from_str_in("name", alloc)?,
-                Value::Text(OwnString::try_from_str_in(fname, alloc)?),
-            );
-            let _ = fobj.insert(
-                OwnString::try_from_str_in("type", alloc)?,
-                Value::Text(OwnString::try_from_str_in(ftype, alloc)?),
-            );
-            list.try_push(Value::Map(fobj)).map_err(|r| r.why)?;
-        }
-        let _ = root.insert(OwnString::try_from_str_in("fields", alloc)?, Value::List(list));
-        Ok(Value::Map(root))
-    }
-
-    /// Build a canonical single-field newtype struct schema:
-    /// `{"kind": "newtype", "name": "<Name>", "type": "<Inner>"}`.
-    pub fn newtype_schema<A: Allocator + Copy>(
-        name: &str,
-        inner_type: &str,
-        alloc: A,
-    ) -> Result<Value<A>, AllocFailure> {
-        let mut root = Map::new_in(alloc);
-        let _ = root.insert(
-            OwnString::try_from_str_in("kind", alloc)?,
-            Value::Text(OwnString::try_from_str_in("newtype", alloc)?),
-        );
-        let _ = root.insert(
-            OwnString::try_from_str_in("name", alloc)?,
-            Value::Text(OwnString::try_from_str_in(name, alloc)?),
-        );
-        let _ = root.insert(
+        let _ = fobj.insert(
             OwnString::try_from_str_in("type", alloc)?,
-            Value::Text(OwnString::try_from_str_in(inner_type, alloc)?),
+            Value::Text(OwnString::try_from_str_in(ftype, alloc)?),
         );
-        Ok(Value::Map(root))
+        list.try_push(Value::Map(fobj)).map_err(|r| r.why)?;
     }
+    let _ = root.insert(OwnString::try_from_str_in("fields", alloc)?, Value::List(list));
+    Ok(Value::Map(root))
 }
 
-/// Implement [`crate::data::ToValue`], [`crate::data::FromValue`], and
-/// [`crate::ecs::ReflectComponent`] for an existing plain struct in one line, with zero `unsafe`,
-/// zero panics, zero casts, zero clones, and explicit allocator support.
-///
-/// Supports named-field structs and single-field newtype structs:
-/// ```ignore
-/// #[derive(Clone, Copy, PartialEq, Debug)]
-/// struct Pos { x: f32, y: f32 }
-/// reflect_struct!(Pos { x: f32, y: f32 });
-///
-/// #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-/// struct Health(i32);
-/// reflect_struct!(Health(i32));
-/// ```
-#[macro_export]
-macro_rules! reflect_struct {
-    ($name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
-        impl<A: ::core::alloc::Allocator + ::core::marker::Copy> $crate::data::ToValue<A> for $name {
-            fn to_value(&self, alloc: A) -> $crate::data::Value<A> {
-                let mut map = $crate::data::Map::new_in(alloc);
-                $(
-                    $crate::ecs::reflect::__private::insert_field_value(
-                        &mut map,
-                        ::core::stringify!($field),
-                        $crate::data::ToValue::to_value(&self.$field, alloc),
-                        alloc,
-                    );
-                )*
-                $crate::data::Value::Map(map)
-            }
-        }
-
-        impl<A: ::core::alloc::Allocator + ::core::marker::Copy> $crate::data::FromValue<A> for $name {
-            fn from_value(
-                cursor: &$crate::data::Cursor<'_, '_, A>,
-            ) -> ::core::result::Result<Self, $crate::data::ShapeError<A>> {
-                cursor.fields(|f| {
-                    ::core::result::Result::Ok(Self {
-                        $(
-                            $field: {
-                                let fc = f.cursor(::core::stringify!($field))?;
-                                <$ty as $crate::ecs::ReflectComponent>::reflect_from_cursor(&fc)?
-                            },
-                        )*
-                    })
-                })
-            }
-        }
-
-        impl $crate::ecs::ReflectComponent for $name {
-            fn reflect_to_value<A: ::core::alloc::Allocator + ::core::marker::Copy>(
-                &self,
-                alloc: A,
-            ) -> ::core::result::Result<$crate::data::Value<A>, $crate::ecs::ReflectError> {
-                let mut map = $crate::data::Map::new_in(alloc);
-                $(
-                    $crate::ecs::reflect::__private::try_insert_reflected_field(
-                        &mut map,
-                        ::core::stringify!($field),
-                        &self.$field,
-                        alloc,
-                    )?;
-                )*
-                ::core::result::Result::Ok($crate::data::Value::Map(map))
-            }
-
-            #[inline]
-            fn reflect_from_cursor<A: ::core::alloc::Allocator + ::core::marker::Copy>(
-                cursor: &$crate::data::Cursor<'_, '_, A>,
-            ) -> ::core::result::Result<Self, $crate::data::ShapeError<A>> {
-                <Self as $crate::data::FromValue<A>>::from_value(cursor)
-            }
-
-            #[inline]
-            fn schema<A: ::core::alloc::Allocator + ::core::marker::Copy>(
-                alloc: A,
-            ) -> ::core::result::Result<$crate::data::Value<A>, $crate::ecs::reflect::__private::AllocFailure> {
-                $crate::ecs::reflect::__private::struct_schema(
-                    ::core::stringify!($name),
-                    &[$( (::core::stringify!($field), ::core::stringify!($ty)) ),*],
-                    alloc,
-                )
-            }
-        }
-    };
-    ($name:ident ( $ty:ty )) => {
-        impl<A: ::core::alloc::Allocator + ::core::marker::Copy> $crate::data::ToValue<A> for $name {
-            #[inline]
-            fn to_value(&self, alloc: A) -> $crate::data::Value<A> {
-                $crate::data::ToValue::to_value(&self.0, alloc)
-            }
-        }
-
-        impl<A: ::core::alloc::Allocator + ::core::marker::Copy> $crate::data::FromValue<A> for $name {
-            #[inline]
-            fn from_value(
-                cursor: &$crate::data::Cursor<'_, '_, A>,
-            ) -> ::core::result::Result<Self, $crate::data::ShapeError<A>> {
-                let inner = <$ty as $crate::ecs::ReflectComponent>::reflect_from_cursor(cursor)?;
-                ::core::result::Result::Ok(Self(inner))
-            }
-        }
-
-        impl $crate::ecs::ReflectComponent for $name {
-            #[inline]
-            fn reflect_to_value<A: ::core::alloc::Allocator + ::core::marker::Copy>(
-                &self,
-                alloc: A,
-            ) -> ::core::result::Result<$crate::data::Value<A>, $crate::ecs::ReflectError> {
-                <$ty as $crate::ecs::ReflectComponent>::reflect_to_value(&self.0, alloc)
-            }
-
-            #[inline]
-            fn reflect_from_cursor<A: ::core::alloc::Allocator + ::core::marker::Copy>(
-                cursor: &$crate::data::Cursor<'_, '_, A>,
-            ) -> ::core::result::Result<Self, $crate::data::ShapeError<A>> {
-                <Self as $crate::data::FromValue<A>>::from_value(cursor)
-            }
-
-            #[inline]
-            fn schema<A: ::core::alloc::Allocator + ::core::marker::Copy>(
-                alloc: A,
-            ) -> ::core::result::Result<$crate::data::Value<A>, $crate::ecs::reflect::__private::AllocFailure> {
-                $crate::ecs::reflect::__private::newtype_schema(
-                    ::core::stringify!($name),
-                    ::core::stringify!($ty),
-                    alloc,
-                )
-            }
-        }
-    };
+/// Build a canonical single-field newtype struct schema:
+/// `{"kind": "newtype", "name": "<Name>", "type": "<Inner>"}`.
+pub fn newtype_schema<A: Allocator + Copy>(
+    name: &str,
+    inner_type: &str,
+    alloc: A,
+) -> Result<Value<A>, AllocFailure> {
+    let mut root = Map::new_in(alloc);
+    let _ = root.insert(
+        OwnString::try_from_str_in("kind", alloc)?,
+        Value::Text(OwnString::try_from_str_in("newtype", alloc)?),
+    );
+    let _ = root.insert(
+        OwnString::try_from_str_in("name", alloc)?,
+        Value::Text(OwnString::try_from_str_in(name, alloc)?),
+    );
+    let _ = root.insert(
+        OwnString::try_from_str_in("type", alloc)?,
+        Value::Text(OwnString::try_from_str_in(inner_type, alloc)?),
+    );
+    Ok(Value::Map(root))
 }

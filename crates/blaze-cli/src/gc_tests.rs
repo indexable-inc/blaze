@@ -12,9 +12,10 @@ use bstd::path::Path;
 use bstd::test::BUDGET;
 
 use super::{
-    AUX_EXPIRY_NS, AuxSweepPlant, DEFAULT_BUDGET, GcError, GcOpts, ORPHAN_GRACE_NS, PidProbe, PidState,
-    VIEWER_DEAD_GRACE_NS, parse_args, parse_budget_values, parse_meta_pid, parse_pid_prefix, run_with,
-    should_sweep_run, sweep_aux_with, try_acquire_gc_lock,
+    AUX_EXPIRY_NS, AuxSweepPlant, CACHE_EXPIRY_NS, DEFAULT_BUDGET, GcError, GcOpts, ORPHAN_GRACE_NS,
+    PidProbe, PidState, VIEWER_DEAD_GRACE_NS, parse_args, parse_budget_values, parse_hex_32,
+    parse_meta_pid, parse_pid_prefix, run_with, should_sweep_run, sweep_aux_with,
+    sweep_toolchain_packs, try_acquire_gc_lock,
 };
 use crate::CliError;
 use crate::store::plain_place::{Facts, STORE_DIR, STORE_ROOT};
@@ -343,4 +344,105 @@ fn gc_sweeps_dead_runs_keeps_live_and_viewer_protected_with_planted_control() {
     let planted = sweep_aux_with(&cx, home.dir(), later, &probe, false, AuxSweepPlant::IgnorePidAlive);
     assert!(planted.files >= 2, "planted bug must delete live run to prove oracle");
     assert!(home.dir().stat(&cx, &Path::new("v2/runs/live-1111.telem").expect("p")).expect("s").is_none());
+}
+
+#[test]
+fn gc_sweeps_native_work_caches_and_superseded_toolchain_packs_preserving_active_and_bootstrap() {
+    use bstd::fs::{Content, Durable};
+
+    let io = Io::simulated(SimWorld::new(75, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+    let fs = io.need_fs().expect("fs");
+    let clock = io.need_clock().expect("clock");
+    let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+    let put = |rel: &str, bytes: &[u8]| {
+        home.dir().publish(&cx, &Path::new(rel).expect("path"), Content::bytes(bytes), Durable::No).expect("publish");
+    };
+
+    // Native-work: expired work dir + live/dead jobserver FIFOs.
+    put("v2/native-work/build-script/out/oldkey/libfoo.a", &[7u8; 64]);
+    put("v2/native-work/build-script/jobs/1001", b"");
+    put("v2/native-work/build-script/jobs/2002", b"");
+
+    // Caches vs bootstrap `modules/` directories (layout.rs: modules/ must NEVER be swept).
+    put("v2/proc-macro/modules/keep.wasm", b"boot-pm");
+    put("v2/proc-macro/compiled/old.cwasm", &[1u8; 32]);
+    put("v2/proc-macro/expansions/old.exp", &[2u8; 32]);
+    put("v2/build-script/modules/keep.wasm", b"boot-bs");
+    put("v2/build-script/compiled/old.cwasm", &[3u8; 32]);
+    put("v2/build-script/records/old.rec", &[4u8; 32]);
+    put("v2/build-script/files/old.out", &[5u8; 32]);
+    put("v2/sdk-answers/old.ans", &[6u8; 16]);
+
+    // Real verified toolchain manifest with 1 active pack + 1 superseded 64-hex pack + clang dir.
+    let active_pack = [0xabu8; 32];
+    let stale_pack = [0xcdu8; 32];
+    let heap = blaze_own::testing::heap();
+    let krate = blaze_toolchain::record::CrateIn {
+        name: "core",
+        version: "0.0.0",
+        edition: "2024",
+        lib: "core",
+        root: "src/lib.rs",
+        dir: "core",
+        role: blaze_toolchain::Role::Core,
+        pack_kind: 3,
+        pack_len: 16,
+        pack: active_pack,
+    };
+    let manifest = blaze_toolchain::record::write(&[krate], &[], heap.alloc()).expect("write manifest");
+    let pinned = blaze_toolchain::ToolchainView::id_of_bytes(manifest.as_slice());
+    let hex_of = |id: [u8; 32]| {
+        let h = crate::fetch::key_hex(&blaze_ids::ContentId(id));
+        bstd::mem::format_in!(cx.frame(), "{}", core::str::from_utf8(&h).expect("hex"))
+    };
+    let pinned_hex = hex_of(pinned.0);
+    let active_hex = hex_of(active_pack);
+    let stale_hex = hex_of(stale_pack);
+    assert_eq!(parse_hex_32(active_hex.as_str()), Some(active_pack));
+    assert_eq!(parse_hex_32("not-hex"), None);
+
+    put(bstd::mem::format_in!(cx.frame(), "v2/toolchain/{}", pinned_hex.as_str()).as_str(), manifest.as_slice());
+    put(bstd::mem::format_in!(cx.frame(), "v2/toolchain/{}", active_hex.as_str()).as_str(), &[0x11u8; 16]);
+    put(bstd::mem::format_in!(cx.frame(), "v2/toolchain/{}", stale_hex.as_str()).as_str(), &[0x22u8; 48]);
+    put("v2/toolchain/clang/bin/clang", b"elf");
+
+    let after_puts_ns = clock.wall().as_ns();
+    let probe = FixedPids(&[1001]);
+
+    // 1. At after_puts_ns: only dead jobserver entry (2002) is swept; fresh work/caches/packs stay.
+    let immediate = sweep_aux_with(&cx, home.dir(), after_puts_ns, &probe, false, AuxSweepPlant::None);
+    assert_eq!(immediate.files, 1, "only dead jobserver FIFO 2002 swept immediately");
+    assert!(home.dir().stat(&cx, &Path::new("v2/native-work/build-script/jobs/1001").expect("p")).expect("s").is_some());
+    assert!(home.dir().stat(&cx, &Path::new("v2/native-work/build-script/jobs/2002").expect("p")).expect("s").is_none());
+
+    // 2. Past 7d (AUX_EXPIRY_NS) but before 30d: native-work out dir swept, 30d caches/packs kept.
+    let after_7d = after_puts_ns.saturating_add(AUX_EXPIRY_NS).saturating_add(1_000_000_000);
+    let week = sweep_aux_with(&cx, home.dir(), after_7d, &probe, false, AuxSweepPlant::None);
+    assert_eq!(week.files, 1, "expired native-work out/oldkey/libfoo.a swept at 7d");
+    assert!(home.dir().stat(&cx, &Path::new("v2/native-work/build-script/out/oldkey").expect("p")).expect("s").is_none());
+    assert!(home.dir().stat(&cx, &Path::new("v2/proc-macro/compiled/old.cwasm").expect("p")).expect("s").is_some());
+    let tc_early = sweep_toolchain_packs(&cx, home.dir(), pinned, after_7d, false, AuxSweepPlant::None);
+    assert_eq!(tc_early.files, 0, "superseded pack kept within 30d grace");
+
+    // 3. Past 30d (CACHE_EXPIRY_NS): all 6 cache dirs + superseded pack swept; bootstrap modules,
+    //    live job FIFO, active manifest, active pack, and clang/ ALL preserved.
+    let after_30d = after_puts_ns.saturating_add(CACHE_EXPIRY_NS).saturating_add(1_000_000_000);
+    let month = sweep_aux_with(&cx, home.dir(), after_30d, &probe, false, AuxSweepPlant::None);
+    assert_eq!(month.files, 6, "6 expired cache files swept at 30d");
+    let tc_swept = sweep_toolchain_packs(&cx, home.dir(), pinned, after_30d, false, AuxSweepPlant::None);
+    assert_eq!(tc_swept.files, 1, "only superseded toolchain pack swept");
+    assert_eq!(tc_swept.bytes, 48);
+
+    assert!(home.dir().stat(&cx, &Path::new("v2/proc-macro/modules/keep.wasm").expect("p")).expect("s").is_some(), "bootstrap proc-macro/modules kept");
+    assert!(home.dir().stat(&cx, &Path::new("v2/build-script/modules/keep.wasm").expect("p")).expect("s").is_some(), "bootstrap build-script/modules kept");
+    assert!(home.dir().stat(&cx, &Path::new("v2/native-work/build-script/jobs/1001").expect("p")).expect("s").is_some(), "live jobserver FIFO kept");
+    assert!(home.dir().stat(&cx, &Path::new("v2/toolchain/clang/bin/clang").expect("p")).expect("s").is_some(), "clang kept");
+    assert!(home.dir().stat(&cx, &Path::new(bstd::mem::format_in!(cx.frame(), "v2/toolchain/{}", pinned_hex.as_str()).as_str()).expect("p")).expect("s").is_some(), "pinned manifest kept");
+    assert!(home.dir().stat(&cx, &Path::new(bstd::mem::format_in!(cx.frame(), "v2/toolchain/{}", active_hex.as_str()).as_str()).expect("p")).expect("s").is_some(), "active pack kept");
+    assert!(home.dir().stat(&cx, &Path::new(bstd::mem::format_in!(cx.frame(), "v2/toolchain/{}", stale_hex.as_str()).as_str()).expect("p")).expect("s").is_none(), "stale pack swept");
+
+    // 4. Planted bug control (rule 43): ignoring active toolchain pack set deletes active pack + manifest.
+    let planted = sweep_toolchain_packs(&cx, home.dir(), pinned, after_30d, false, AuxSweepPlant::IgnoreActiveToolchain);
+    assert_eq!(planted.files, 2, "planted bug must delete pinned manifest + active pack to prove oracle");
 }

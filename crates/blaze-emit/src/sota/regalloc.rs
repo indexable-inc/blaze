@@ -27,6 +27,7 @@ use blaze_own::Vec;
 use blaze_tier::{CallClobbers, Reg as TierReg, RegSet};
 
 use crate::enc::{Reg, X0, X1, X2, X8, X9, X10, X11, X12, X13, X14, X15};
+use crate::pass::{Loc, Regs};
 
 const X3: Reg = 3;
 const X4: Reg = 4;
@@ -82,12 +83,6 @@ const CALLER_SAVED_FP: &[Reg] = &[
 
 /// Callee-saved allocatable FP registers (low 64 bits `d8..d15`, saved/restored in canonical pairs `d8:d9..d14:d15`).
 const CALLEE_SAVED_FP: &[Reg] = &[8, 9, 10, 11, 12, 13, 14, 15];
-
-/// AAPCS64 integer argument registers `X0..X7`.
-pub(crate) const ARG_REGS: [Reg; 8] = [X0, X1, X2, X3, X4, X5, X6, X7];
-
-/// AAPCS64 floating-point argument registers `V0..V7`.
-pub(crate) const FP_ARG_REGS: [Reg; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 
 /// Physical location assigned to a single LIR SSA value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -811,9 +806,10 @@ pub(crate) fn allocate<A: Allocator + Copy>(
     skip_alloc: &[bool],
     tail_calls: &[bool],
     max_spill_slots: u32,
+    os: crate::Os,
     alloc: A,
 ) -> Result<Allocation<A>, RegAllocError> {
-    allocate_with_ipra(view, skip_alloc, tail_calls, max_spill_slots, |_| CallClobbers::C_ABI_ARM64, alloc)
+    allocate_with_ipra(view, skip_alloc, tail_calls, max_spill_slots, os, |_| CallClobbers::C_ABI_ARM64, alloc)
 }
 
 /// IPRA-aware Greedy Priority-Weighted Graph-Coloring Register Allocator with True Constant
@@ -829,6 +825,7 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
     skip_alloc: &[bool],
     tail_calls: &[bool],
     max_spill_slots: u32,
+    os: crate::Os,
     call_clobbers: impl Fn(usize) -> CallClobbers,
     alloc: A,
 ) -> Result<Allocation<A>, RegAllocError> {
@@ -1005,8 +1002,7 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
 
     let func_sig = view.sig(SigId(view.head.sig));
     let entry_params = view.params(Block(0));
-    let mut gpr_arg_idx = 0usize;
-    let mut fp_arg_idx = 0usize;
+    let mut regs = Regs::new(os);
     for (k, p) in entry_params.clone().enumerate() {
         let pkind = func_sig
             .params
@@ -1020,26 +1016,13 @@ pub(crate) fn allocate_with_ipra<A: Allocator + Copy>(
             continue;
         }
         let ty = view.tys.get(p).copied().map_or(Ty::NONE, Ty);
-        if is_fp_ty(ty).is_some() {
-            if let Some(&reg) = FP_ARG_REGS.get(fp_arg_idx) {
+        match regs.next(ty) {
+            Some(Loc::V(reg, _)) | Some(Loc::X(reg)) => {
                 if let Some(slot) = hint.get_mut(p) {
                     *slot = reg_u8(reg);
                 }
-                fp_arg_idx += 1;
             }
-        } else if ty == Ty::I128 {
-            // AAPCS64 C.8/C.9/C.11: 16-byte-aligned `i128` takes next even GPR pair, else stacks (NGRN = 8).
-            let aligned = (gpr_arg_idx + 1) & !1;
-            if aligned + 2 <= ARG_REGS.len() {
-                gpr_arg_idx = aligned + 2;
-            } else {
-                gpr_arg_idx = ARG_REGS.len();
-            }
-        } else if let Some(&reg) = ARG_REGS.get(gpr_arg_idx) {
-            if let Some(slot) = hint.get_mut(p) {
-                *slot = reg_u8(reg);
-            }
-            gpr_arg_idx += 1;
+            Some(Loc::Pair(_)) | None => {}
         }
     }
     // Landing-block exception parameters enter in `X0` from the unwinder.

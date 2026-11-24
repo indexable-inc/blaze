@@ -1,0 +1,28 @@
+[package]
+name = "blaze-ecs-wasm"
+description = "Zero-import, `#![no_std]`, `#![blaze::sans_io]` WebAssembly (`wasm32-unknown-unknown`) C-ABI host over `blaze-ecs::ui::ExplorerApp` for the Blaze ECS Explorer UI and WebGPU scene buffers"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+# The relational ECS core + Explorer UI + WebGPU layout engine.
+blaze-ecs.workspace = true
+# Explicit integer conversions (zero `as` casts).
+blaze-int.workspace = true
+# Explicit-allocator owning collections (`Box`, `Vec`, `Alloc`).
+blaze-own.workspace = true
+# Rust -> WGSL shader IR & entry descriptors for the WebGPU graph viewport.
+gpu.workspace = true
+
+[lints]
+workspace = true

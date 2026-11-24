@@ -399,23 +399,23 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         for f in ck.env_fields_by::<blaze_typeck::Places>(closure) {
             self.env_now.push(f);
         }
-        let nu = self.env_now.len() as u32;
-        let np = params.len() as u32;
+        let nu = to_u32(self.env_now.len());
+        let np = to_u32(params.len());
         self.b.replace(FlowBuilder::new_in(1 + nu + np, nu + np, self.alloc));
         self.nargs = nu + np;
         let entry = self.b.block();
         self.ret_block = self.b.block();
         self.b.start(entry);
         self.scope_marks.push(0);
-        self.scope_temps.push((self.temps.len() as u32, self.temp_marks.len() as u32));
+        self.scope_temps.push((to_u32(self.temps.len()), to_u32(self.temp_marks.len())));
         // The next position of the closure value (`External::Capture`).
         let mut value_at = 0u32;
         for k in 0..self.env_now.len() {
             let f = self.env_now[k];
             let cap = f.how;
-            let l = Local(1 + k as u32);
+            let l = Local(1 + to_u32(k));
             let (through, env) = Self::field_through(cap, kind);
-            let first = self.origs.len() as u32;
+            let first = to_u32(self.origs.len());
             if f.is_whole() {
                 let p = f.base;
                 let t = match ck.local_ty.get(p.ix()) {
@@ -439,9 +439,9 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
                     }
                 }
             } else {
-                self.place_upvar(closure, k as u32, f, through)?;
+                self.place_upvar(closure, to_u32(k), f, through)?;
             }
-            let made = self.origs.len() as u32;
+            let made = to_u32(self.origs.len());
             // A by-value capture reached through `&'env self` has the environment's reference
             // first and no position of the value for it; a `&mut` capture of an `FnMut` has its
             // reference at the value's position, but reaches it only for `'env`: neither is a
@@ -453,7 +453,7 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
                 } else {
                     External::Capture(value_at + (o - first) - u32::from(by_value_env))
                 };
-                externals.push((self.origs[o as usize], what));
+                externals.push((self.origs[to_usize(o)], what));
             }
             value_at += (made - first) - u32::from(by_value_env);
             self.vars.push(l);
@@ -466,7 +466,7 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
                 Some(&t) => TyD::of(t),
                 None => return self.refuse_pat(Form::Malformed, p),
             };
-            let l = Local(1 + nu + i as u32);
+            let l = Local(1 + nu + to_u32(i));
             self.new_local_with(t, true, Some(l), closure)?;
             self.vars.push(l);
         }
@@ -487,7 +487,7 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         if slots.len() != all - upvar_origins {
             return self.refuse(Form::SigPositionsUnaligned { positions: all - upvar_origins, regions: slots.len(), site: crate::SigSite::ClosureSlots }, closure);
         }
-        if slots.len() as u64 * slots.len() as u64 > u64::from(MOST_POSITIONS) {
+        if to_u64(slots.len()) * to_u64(slots.len()) > u64::from(MOST_POSITIONS) {
             return self.refuse(Form::Bound, closure);
         }
         for (j, &s) in slots.iter().enumerate() {
@@ -520,14 +520,14 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         // lifetimes outlive `'r` and inner type parameters `P: 'r`, RFC 1214).
         let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
         for l in 0..=self.nargs {
-            let (start, _) = self.local_origs[l as usize];
-            let t = self.local_ty[l as usize];
+            let (start, _) = self.local_origs[to_usize(l)];
+            let t = self.local_ty[to_usize(l)];
             self.ref_ranges(t, closure, &mut ranges)?;
             for j in 0..ranges.len() {
                 let (at, inner_n) = ranges[j];
-                let outer = self.origs[(start + at) as usize];
+                let outer = self.origs[to_usize(start + at)];
                 for k in 1..=inner_n {
-                    let o = self.origs[(start + at + k) as usize];
+                    let o = self.origs[to_usize(start + at + k)];
                     if o != outer {
                         self.b.known(o, outer);
                     }
@@ -537,8 +537,8 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         }
         // The parameters' patterns, bound as a fn body's are.
         for (i, &p) in params.iter().enumerate() {
-            let l = Local(1 + nu + i as u32);
-            let ty = self.local_ty[l.0 as usize];
+            let l = Local(1 + nu + to_u32(i));
+            let ty = self.local_ty[to_usize(l.0)];
             let pl = self.place_of(l);
             match self.body.pats.get(p.ix()) {
                 Some(Pat::Bind { ann, sub: None, .. }) if ann.by_ref.is_none() => {
@@ -550,7 +550,7 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         self.tasks.push(Task::RootEnd(inner));
         self.tasks.push(Task::Eval(inner, false));
         let body = self.body;
-        let fuel = 32 * (body.exprs.len() + body.pats.len() + body.stmts.len()) as u64 + 256;
+        let fuel = 32 * to_u64(body.exprs.len() + body.pats.len() + body.stmts.len()) + 256;
         let mut steps = 0u64;
         while let Some(t) = self.tasks.pop() {
             steps += 1;
@@ -687,7 +687,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 });
                 for (pi, &t) in inputs.iter().enumerate() {
                     let pn = self.npos(t, e)?;
-                    let is_static_outer = ce.is_some_and(|ce| self.body.closure_static_params.binary_search(&(ce, pi as u32)).is_ok());
+                    let is_static_outer = ce.is_some_and(|ce| self.body.closure_static_params.binary_search(&(ce, to_u32(pi))).is_ok());
                     let param_written = written_tys.and_then(|l| l.get(pi)).is_some_and(Option::is_some);
                     for pos in 0..pn {
                         if pos == 0 && is_static_outer {
@@ -746,7 +746,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             }
             return Ok(());
         }
-        if s.len() as u32 != n {
+        if to_u32(s.len()) != n {
             // The counts part where a type parameter or a projection of the clause stands for
             // a type with positions (`P: FnMut(&Self::Item) -> bool` with `Item = (&'a A, &'b
             // B)`: one slot, three positions). Laid by walking the declared part beside the
@@ -903,7 +903,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 _ => return self.refuse(unaligned(ClosureSigWhy::Shape { declared: node_kind(dn), closure: node_kind(an) }), e),
             }
         }
-        if at != s.len() || (out.len() - first) as u32 != n {
+        if at != s.len() || to_u32(out.len() - first) != n {
             return self.refuse(unaligned(ClosureSigWhy::CountsDiffer), e);
         }
         Ok(())
@@ -932,7 +932,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         }
         let mut slots: Vec<SigSlot, A> = Vec::new_in(self.alloc);
         self.sig_slots(row, e, &mut slots)?;
-        Ok(slots.iter().filter(|s| matches!(s, SigSlot::Owner(_))).count() as u32)
+        Ok(to_u32(slots.iter().filter(|s| matches!(s, SigSlot::Owner(_))).count()))
     }
 
     /// Whether closure row `row`'s body needs a relation on one of its owner signature
@@ -963,7 +963,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         if owner != self.body.owner {
             return self.refuse(Form::TypeNode, e);
         }
-        let row = ordinal as usize;
+        let row = to_usize(ordinal);
         let ck: &'c Checked<'c> = self.ck;
         let Some(&sig) = ck.closures.column::<2>().get(row) else { return self.refuse(Form::Malformed, e) };
         let all: &'c [PTy] = match self.node(sig, e)? {
@@ -972,11 +972,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         };
         let Some((&output, inputs)) = all.split_last() else { return self.refuse(Form::Malformed, e) };
         if inputs.len() != args.len() {
-            return self.refuse(Form::ClosureCallUnaligned { arg: args.len() as u32 }, e);
+            return self.refuse(Form::ClosureCallUnaligned { arg: to_u32(args.len()) }, e);
         }
         let mut slots: Vec<SigSlot, A> = Vec::new_in(self.alloc);
         self.sig_slots(row, e, &mut slots)?;
-        let nsig = slots.iter().filter(|s| matches!(s, SigSlot::Owner(_))).count() as u32;
+        let nsig = to_u32(slots.iter().filter(|s| matches!(s, SigSlot::Owner(_))).count());
         let ci = self.info(cp);
         if !ci.exact || ci.len < skip + nsig {
             return self.refuse(Form::Malformed, e);
@@ -988,24 +988,24 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let mut at = 0usize;
         for i in 0..=args.len() {
             let (place, n) = if i < args.len() {
-                let n = self.npos(inputs[i], e)? as usize;
+                let n = to_usize(self.npos(inputs[i], e)?);
                 match args[i].at {
                     At::Place(p) => (Some(p), n),
                     At::Const => (None, n),
                 }
             } else {
-                (Some(dest), self.npos(output, e)? as usize)
+                (Some(dest), to_usize(self.npos(output, e)?))
             };
             let Some(part) = slots.get(at..at + n) else { return self.refuse(Form::Malformed, e) };
             let binds = part.iter().any(|s| !matches!(s, SigSlot::Late(None)));
             if let (Some(p), true) = (place, binds) {
                 let s = self.info(p);
-                if !s.exact || s.len as usize != n {
-                    return self.refuse(Form::ClosureCallUnaligned { arg: i as u32 }, e);
+                if !s.exact || to_usize(s.len) != n {
+                    return self.refuse(Form::ClosureCallUnaligned { arg: to_u32(i) }, e);
                 }
                 for j in 0..n {
                     let target = match slots[at + j] {
-                        SigSlot::Owner(k) => self.origs[(base + k) as usize],
+                        SigSlot::Owner(k) => self.origs[to_usize(base + k)],
                         SigSlot::Static => self.universal(Region::Static),
                         SigSlot::Late(Some(v)) => match vars.iter().find(|(w, _)| *w == v) {
                             Some(&(_, o)) => {
@@ -1020,7 +1020,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         },
                         SigSlot::Late(None) => continue,
                     };
-                    let here = self.origs[(s.start + j as u32) as usize];
+                    let here = self.origs[to_usize(s.start + to_u32(j))];
                     self.b.subset(here, target);
                     self.b.subset(target, here);
                 }
@@ -1064,7 +1064,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             if owner != self.body.owner {
                 continue;
             }
-            let row = ordinal as usize;
+            let row = to_usize(ordinal);
             let nsig = self.owner_sig_count(row, e)?;
             if nsig == 0 {
                 continue;
@@ -1101,7 +1101,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             if binds && !self.sig_from_call(row, e)? && self.sig_needs(row, e)? {
                 return self.refuse(Form::ClosureSigHigherRanked { callee }, e);
             }
-            if self.tie_closure_sig_exact(callee, p as u32, row, ncap, nsig, args, inst, &mut origin, e)? {
+            if self.tie_closure_sig_exact(callee, to_u32(p), row, ncap, nsig, args, inst, &mut origin, e)? {
                 params = Some(written);
                 continue;
             }
@@ -1113,19 +1113,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     ties = ties.saturating_add(self.npos(args[q], e)?);
                 }
             }
-            ties = ties.saturating_add(written.iter().filter(|r| !is_late(*r)).count() as u32);
+            ties = ties.saturating_add(to_u32(written.iter().filter(|r| !is_late(*r)).count()));
             if ties > 1 {
                 self.coarse_step(Form::Unified { why: crate::Unified::ClosureSigTies }, e);
             }
             for k in 0..nsig {
-                let Some(o) = origin(self, p as u32, ncap + k) else { return self.refuse(Form::Malformed, e) };
+                let Some(o) = origin(self, to_u32(p), ncap + k) else { return self.refuse(Form::Malformed, e) };
                 for q in 0..args.len() {
                     if q == p {
                         continue;
                     }
                     let n = self.npos(args[q], e)?;
                     for j in 0..n {
-                        let Some(a) = origin(self, q as u32, j) else { return self.refuse(Form::Malformed, e) };
+                        let Some(a) = origin(self, to_u32(q), j) else { return self.refuse(Form::Malformed, e) };
                         self.b.subset(a, o);
                         self.b.subset(o, a);
                     }
@@ -1184,7 +1184,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             nin += self.npos(t, e)?;
         }
         let nout = self.npos(act_out, e)?;
-        if cslots.len() != (nin + nout) as usize {
+        if cslots.len() != to_usize(nin + nout) {
             return Ok(false);
         }
         let arity = crate::one_call::FactsArity { facts };
@@ -1203,7 +1203,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     }
                     let Ok(PNode::Tuple(_)) = blaze_borrow::RegionTypes::node(&heads, tup) else { continue };
                     let Ok(tkids) = blaze_borrow::RegionTypes::kids(&heads, tup) else { continue };
-                    if tkids.len() as usize != act_ins.len() {
+                    if to_usize(tkids.len()) != act_ins.len() {
                         continue;
                     }
                     if let Some(tslots) = c.col.child(1) {
@@ -1218,7 +1218,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     }
                     let Ok(PNode::Tuple(_)) = blaze_borrow::RegionTypes::node(&heads, tup) else { continue };
                     let Ok(tkids) = blaze_borrow::RegionTypes::kids(&heads, tup) else { continue };
-                    if tkids.len() as usize != act_ins.len() {
+                    if to_usize(tkids.len()) != act_ins.len() {
                         continue;
                     }
                     if let Some(oslots) = c.col.child(2) {
@@ -1237,7 +1237,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             let Some((decl_out, decl_out_slots)) = out_clause else {
                 return Ok(false);
             };
-            work.push((decl_out, decl_out_slots, act_out, nin as usize, (nin + nout) as usize));
+            work.push((decl_out, decl_out_slots, act_out, to_usize(nin), to_usize(nin + nout)));
         }
         // Push each input pair from `ArgsTuple` alongside `act_ins`.
         let Ok(tkids) = blaze_borrow::RegionTypes::kids(&heads, decl_tup) else {
@@ -1246,22 +1246,22 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let mut d_off = 0usize;
         let mut c_off = 0usize;
         for (i, &act_in) in act_ins.iter().enumerate() {
-            let Some(dk) = tkids.get(i as u32) else { return Ok(false) };
+            let Some(dk) = tkids.get(to_u32(i)) else { return Ok(false) };
             let Ok(dc) = blaze_borrow::RegionTypes::count(&heads, dk) else { return Ok(false) };
-            let dn = dc.get() as usize;
+            let dn = to_usize(dc.get());
             let Some(dslice) = decl_tup_slots.get(d_off..d_off + dn) else { return Ok(false) };
             d_off += dn;
-            let cn = self.npos(act_in, e)? as usize;
+            let cn = to_usize(self.npos(act_in, e)?);
             work.push((dk, dslice, act_in, c_off, c_off + cn));
             c_off += cn;
         }
-        if d_off != decl_tup_slots.len() || c_off != nin as usize {
+        if d_off != decl_tup_slots.len() || c_off != to_usize(nin) {
             return Ok(false);
         }
         // Collect `(owner_k, target_origin)` ties.
         let mut pairs: Vec<(u32, Origin), A> = Vec::new_in(self.alloc);
         let mut seen: Vec<u32, A> = Vec::new_in(self.alloc);
-        seen.resize(nsig as usize, 0u32);
+        seen.resize(to_usize(nsig), 0u32);
         let mut steps = 0u32;
         while let Some((decl, dslots, act, clo, chi)) = work.pop() {
             steps += 1;
@@ -1277,9 +1277,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             };
             match (dnode, self.node(act, e)?) {
                 (PNode::Param(q), _) => {
-                    let Some(&arg_ty) = args.get(q as usize) else { return Ok(false) };
+                    let Some(&arg_ty) = args.get(to_usize(q)) else { return Ok(false) };
                     let n = self.npos(arg_ty, e)?;
-                    if n as usize != slice.len() {
+                    if to_usize(n) != slice.len() {
                         return Ok(false);
                     }
                     for (j, &ss) in slice.iter().enumerate() {
@@ -1287,9 +1287,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             if k >= nsig {
                                 return Ok(false);
                             }
-                            let Some(t) = origin(self, q, j as u32) else { return Ok(false) };
+                            let Some(t) = origin(self, q, to_u32(j)) else { return Ok(false) };
                             pairs.push((k, t));
-                            seen[k as usize] = seen[k as usize].saturating_add(1);
+                            seen[to_usize(k)] = seen[to_usize(k)].saturating_add(1);
                         }
                     }
                 }
@@ -1305,7 +1305,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             Region::Late { .. } => return Ok(false),
                         };
                         pairs.push((k, t));
-                        seen[k as usize] = seen[k as usize].saturating_add(1);
+                        seen[to_usize(k)] = seen[to_usize(k)].saturating_add(1);
                     }
                     work.push((di, &dslots[1..], ai, clo + 1, chi));
                 }
@@ -1318,18 +1318,18 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 (PNode::Tuple(_), PNode::Tuple(al)) => {
                     let Ok(dkids) = blaze_borrow::RegionTypes::kids(&heads, decl) else { return Ok(false) };
                     let alist = self.list(al, e)?;
-                    if dkids.len() as usize != alist.len() {
+                    if to_usize(dkids.len()) != alist.len() {
                         return Ok(false);
                     }
                     let mut doff = 0usize;
                     let mut coff = clo;
                     for (i, &ak) in alist.iter().enumerate() {
-                        let Some(dk) = dkids.get(i as u32) else { return Ok(false) };
+                        let Some(dk) = dkids.get(to_u32(i)) else { return Ok(false) };
                         let Ok(dc) = blaze_borrow::RegionTypes::count(&heads, dk) else { return Ok(false) };
-                        let dn = dc.get() as usize;
+                        let dn = to_usize(dc.get());
                         let Some(ds) = dslots.get(doff..doff + dn) else { return Ok(false) };
                         doff += dn;
-                        let cn = self.npos(ak, e)? as usize;
+                        let cn = to_usize(self.npos(ak, e)?);
                         work.push((dk, ds, ak, coff, coff + cn));
                         coff += cn;
                     }
@@ -1338,7 +1338,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     }
                 }
                 (PNode::Adt(dk, _), PNode::Adt(ak, al)) if dk == ak => {
-                    let lts = self.adt_facts(ak, e)?.lifetimes as usize;
+                    let lts = to_usize(self.adt_facts(ak, e)?.lifetimes);
                     if dslots.len() < lts || slice.len() < lts {
                         return Ok(false);
                     }
@@ -1353,23 +1353,23 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                                 Region::Late { .. } => return Ok(false),
                             };
                             pairs.push((k, t));
-                            seen[k as usize] = seen[k as usize].saturating_add(1);
+                            seen[to_usize(k)] = seen[to_usize(k)].saturating_add(1);
                         }
                     }
                     let Ok(dkids) = blaze_borrow::RegionTypes::kids(&heads, decl) else { return Ok(false) };
                     let alist = self.list(al, e)?;
-                    if dkids.len() as usize != alist.len() {
+                    if to_usize(dkids.len()) != alist.len() {
                         return Ok(false);
                     }
                     let mut doff = lts;
                     let mut coff = clo + lts;
                     for (i, &ak_ty) in alist.iter().enumerate() {
-                        let Some(dk_ty) = dkids.get(i as u32) else { return Ok(false) };
+                        let Some(dk_ty) = dkids.get(to_u32(i)) else { return Ok(false) };
                         let Ok(dc) = blaze_borrow::RegionTypes::count(&heads, dk_ty) else { return Ok(false) };
-                        let dn = dc.get() as usize;
+                        let dn = to_usize(dc.get());
                         let Some(ds) = dslots.get(doff..doff + dn) else { return Ok(false) };
                         doff += dn;
-                        let cn = self.npos(ak_ty, e)? as usize;
+                        let cn = to_usize(self.npos(ak_ty, e)?);
                         work.push((dk_ty, ds, ak_ty, coff, coff + cn));
                         coff += cn;
                     }
@@ -1419,12 +1419,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             return Ok(false);
                         }
                         for &q in &qparams {
-                            let Some(&arg_ty) = args.get(q as usize) else { return Ok(false) };
+                            let Some(&arg_ty) = args.get(to_usize(q)) else { return Ok(false) };
                             let n = self.npos(arg_ty, e)?;
                             for j in 0..n {
                                 let Some(t) = origin(self, q, j) else { return Ok(false) };
                                 pairs.push((k, t));
-                                seen[k as usize] = seen[k as usize].saturating_add(1);
+                                seen[to_usize(k)] = seen[to_usize(k)].saturating_add(1);
                             }
                         }
                         for &r in dslots {
@@ -1433,7 +1433,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             }
                             let t = if r == Region::Static { self.universal(Region::Static) } else { self.instance(inst, r) };
                             pairs.push((k, t));
-                            seen[k as usize] = seen[k as usize].saturating_add(1);
+                            seen[to_usize(k)] = seen[to_usize(k)].saturating_add(1);
                         }
                     }
                 }
@@ -1471,7 +1471,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             }
             match self.node(t, e)? {
                 PNode::Closure { owner, ordinal, .. } if owner == self.body.owner => {
-                    if self.sig_needs(ordinal as usize, e)? {
+                    if self.sig_needs(to_usize(ordinal), e)? {
                         return self.refuse(Form::ClosureSigErased, e);
                     }
                 }
@@ -1482,4 +1482,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         }
         Ok(())
     }
+}
+
+#[inline]
+fn to_u32(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+#[inline]
+fn to_usize(n: u32) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+#[inline]
+fn to_u64(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
 }

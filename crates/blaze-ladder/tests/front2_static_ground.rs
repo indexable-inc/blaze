@@ -198,3 +198,105 @@ fn static_fields_ground_through_projections() {
         Err(other) => panic!("BAD: refused, but not by name: {other}"),
     }
 }
+
+/// Regression for ICU's `SINGLETON_NORMALIZER_UTS46_DATA_V1` (`CodePointTrie<'static, u32>`
+/// containing both `ZeroVec<'static, u16>` and `ZeroVec<'static, u32>` where `impl AsULE for
+/// u16` / `u32` define `type ULE = RawBytesULE<{ size_of::<T>() }>`). Evaluating a constant
+/// whose body requires multiple trait impls whose associated types each wait on a distinct
+/// anonymous constant must not leave the non-evaluated impl provisionally active and missing
+/// its associated type during layout normalization (`const_project.rs`).
+#[test]
+fn const_layout_projection_with_multiple_assoc_const_impls() {
+    const SRC: &str = "fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+    Ok(())
+}
+
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+pub struct RawBytesULE<const N: usize>(pub [u8; N]);
+
+pub trait AsULE: Copy {
+    type ULE: Copy;
+}
+
+impl AsULE for u16 {
+    type ULE = RawBytesULE<{ core::mem::size_of::<u16>() }>;
+}
+
+impl AsULE for u32 {
+    type ULE = RawBytesULE<{ core::mem::size_of::<u32>() }>;
+}
+
+pub struct ZeroVec<'a, T: AsULE> {
+    data: &'a [T::ULE],
+}
+
+impl<'a, T: AsULE> ZeroVec<'a, T> {
+    pub const unsafe fn from_bytes_unchecked(bytes: &'a [u8]) -> Self {
+        let len = bytes.len() / core::mem::size_of::<T::ULE>();
+        let ptr = bytes.as_ptr() as *const T::ULE;
+        Self { data: unsafe { core::slice::from_raw_parts(ptr, len) } }
+    }
+}
+
+#[repr(C)]
+pub struct Trie<'a, T: AsULE> {
+    pub index: ZeroVec<'a, u16>,
+    pub data: ZeroVec<'a, T>,
+    pub passthrough_cap: u16,
+}
+
+pub const SINGLETON: &'static Trie<'static, u32> = &Trie {
+    index: unsafe { ZeroVec::from_bytes_unchecked(b\"\\x01\\x00\\x02\\x00\") },
+    data: unsafe { ZeroVec::from_bytes_unchecked(b\"\\x03\\x00\\x00\\x00\\x04\\x00\\x00\\x00\") },
+    passthrough_cap: 65u16,
+};
+
+#[repr(C)]
+pub struct Summary {
+    pub index_len: usize,
+    pub data_len: usize,
+    pub passthrough_cap: u16,
+}
+
+pub const SUMMARY: Summary = Summary {
+    index_len: SINGLETON.index.data.len(),
+    data_len: SINGLETON.data.data.len(),
+    passthrough_cap: SINGLETON.passthrough_cap,
+};
+";
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let files = [("/icu/src/main.rs".to_string(), SRC.to_string())];
+    let edition = edition::PackageEdition::of_manifest("blaze-2026.11").expect("a known edition");
+    let user = UserCrate { name: "icu", dir: "/icu/", root: "/icu/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let sources = [SourceFile { path: "src/main.rs", text: SRC }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+    let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
+    let mut buckets = None;
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let root = names.root(0);
+    let lookup = |name: &'static str| {
+        names::path(&names, root, Namespace::Values, Written { kind: PathKind::Plain, segments: &[name] }, Alloc::global())
+            .ok()
+            .and_then(|f| f.whole(1))
+            .map(|d| d.key)
+            .unwrap_or_else(|| panic!("`{name}` from the crate root"))
+    };
+    let singleton = front.keys.item(lookup("SINGLETON")).expect("SINGLETON's key");
+    let summary = front.keys.item(lookup("SUMMARY")).expect("SUMMARY's key");
+    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
+    let mut consts = Consts::default();
+    let rec = consts.value(&mut records, prepared, singleton).unwrap_or_else(|e| panic!("SINGLETON: {e}"));
+    assert!(!rec.data.allocs.is_empty(), "SINGLETON evaluated to a record");
+    let sum = consts.value(&mut records, prepared, summary).unwrap_or_else(|e| panic!("SUMMARY: {e}"));
+    let root_bytes = &sum.data.allocs.first().expect("SUMMARY root allocation").bytes[..];
+    assert_eq!(le(root_bytes, 0, 8), 2, "index ZeroVec<u16> length is 4 / size_of::<RawBytesULE<2>>()");
+    assert_eq!(le(root_bytes, 8, 8), 2, "data ZeroVec<u32> length is 8 / size_of::<RawBytesULE<4>>()");
+    assert_eq!(le(root_bytes, 16, 2), 65, "passthrough_cap");
+}

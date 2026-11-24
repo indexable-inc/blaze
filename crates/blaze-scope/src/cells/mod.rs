@@ -424,6 +424,36 @@ struct Frag<'a, N> {
     /// The fragment and position of the call it is the expansion of; `None` for a module's text.
     up: Option<(FragId, u32)>,
     slots: AVec<'a, (u32, Slot<N>)>,
+    /// Lazily-populated path-compressed previous live slot index (1-based: 0 means no live slot
+    /// at or before this index; `i + 1` means slot `i` may still contribute a `Slot::Rules`, a
+    /// `#[macro_use]` `Slot::Mod`, or an ungrown/non-empty `Slot::Call`). Monotonic because
+    /// `slots` is immutable after creation and `Item::grown` only transitions `false -> true`.
+    prev_live: AVec<'a, u32>,
+    /// Permanently `true` once every slot in `slots` is known to contribute neither a
+    /// `Slot::Rules`, nor a `#[macro_use]` `Slot::Mod`, nor an ungrown `Slot::Call`.
+    textual_empty: bool,
+}
+
+/// Path-halving lookup in `prev_live` (1-based cursor `k`: `0` = exhausted, `1..=len` = slot `k - 1`).
+#[inline]
+fn live_at(prev_live: &mut [u32], mut k: usize) -> usize {
+    while let Some(idx) = k.checked_sub(1) {
+        let Some(&p32) = prev_live.get(idx) else {
+            return 0;
+        };
+        let p = usize::try_from(p32).unwrap_or(0);
+        if p == k {
+            return k;
+        }
+        if let Some(p_idx) = p.checked_sub(1)
+            && let Some(&gp) = prev_live.get(p_idx)
+            && let Some(slot) = prev_live.get_mut(idx)
+        {
+            *slot = gp;
+        }
+        k = p;
+    }
+    0
 }
 
 /// Where a call is written.
@@ -1621,7 +1651,14 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         // Positions are unique in a fragment: no sort order is left open.
         slots.sort_unstable_by_key(|s| s.0);
-        self.frags.push(Frag { module: m, up, slots });
+        let textual_empty = !slots.iter().any(|(_, s)| !matches!(s, Slot::Mod(_, false)));
+        self.frags.push(Frag {
+            module: m,
+            up,
+            slots,
+            prev_live: AVec::new_in(self.alloc),
+            textual_empty,
+        });
         for (k, u) in d.uses.iter().enumerate() {
             let vis = self.import_vis(m, &u.vis, vis::VisAt { module: m, frag: fid, ord: (vis::ORD_USE, k as u32) })?;
             let (glob, binds) = match u.leaf {
@@ -3413,6 +3450,41 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         self.frags[self.modules[m as usize].text as usize].slots.iter().any(|s| matches!(s.1, Slot::Rules(n, ..) if n == name))
     }
 
+    /// Ensures `self.frags[f].prev_live` is initialized for `textual` skip compression.
+    #[inline]
+    fn ensure_prev_live(&mut self, f: FragId) {
+        let Some(frag) = usize::try_from(f).ok().and_then(|ix| self.frags.get_mut(ix)) else {
+            return;
+        };
+        if !frag.prev_live.is_empty() || frag.slots.is_empty() {
+            return;
+        }
+        frag.prev_live.reserve(frag.slots.len());
+        let mut last = 0u32;
+        for (i, (_, slot)) in frag.slots.iter().enumerate() {
+            if !matches!(slot, Slot::Mod(_, false)) {
+                last = u32::try_from(i.saturating_add(1)).unwrap_or(u32::MAX);
+            }
+            frag.prev_live.push(last);
+        }
+        if last == 0 {
+            frag.textual_empty = true;
+        }
+    }
+
+    /// Marks slot `idx` of `f` permanently dead in `prev_live` (e.g. a grown `Slot::Call` whose
+    /// expansion is absent or `textual_empty`).
+    #[inline]
+    fn mark_slot_dead(&mut self, f: FragId, idx: usize) {
+        let Some(frag) = usize::try_from(f).ok().and_then(|ix| self.frags.get_mut(ix)) else {
+            return;
+        };
+        let before = idx.checked_sub(1).and_then(|j| frag.prev_live.get(j).copied()).unwrap_or(0);
+        if let Some(slot) = frag.prev_live.get_mut(idx) {
+            *slot = before;
+        }
+    }
+
     /// `name!` by the textual scope just before `pos` of fragment `frag` (Reference
     /// `macros.by-example.scope`): backward through the text, the latest definition first, into
     /// `#[macro_use]` modules and expansions met on the way, then out to the enclosing text at
@@ -3425,28 +3497,57 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         let (mut f, mut end) = (frag, pos);
         self.textual_stack.clear();
         loop {
-            let below = self.frags[f as usize].slots.partition_point(|s| s.0 < end);
-            self.textual_stack.push((f, below));
             // Every fragment the walk reads, its slots before the cut or all of them (one it
             // finds empty there is read too): groups.rs's textual cells.
             if let Some(log) = self.textual_log.as_mut() {
                 log.push(f);
             }
-            while let Some(top) = self.textual_stack.last_mut() {
-                if top.1 == 0 {
+            if let Some(cur) = usize::try_from(f).ok().and_then(|ix| self.frags.get(ix))
+                && !cur.textual_empty
+            {
+                let below = cur.slots.partition_point(|s| s.0 < end);
+                if below > 0 {
+                    self.ensure_prev_live(f);
+                    self.textual_stack.push((f, below));
+                }
+            }
+            while let Some(&(top_f, cursor)) = self.textual_stack.last() {
+                let top_ix = usize::try_from(top_f).unwrap_or(usize::MAX);
+                let next_k = match self.frags.get_mut(top_ix) {
+                    Some(cur) if !cur.textual_empty => live_at(&mut cur.prev_live, cursor),
+                    _ => 0,
+                };
+                if next_k == 0 {
                     self.textual_stack.pop();
+                    // If we scanned the entire fragment down to 0 and its last slot is dead,
+                    // every slot in `top_f` is permanently dead.
+                    if let Some(cur) = self.frags.get_mut(top_ix) {
+                        let len = cur.slots.len();
+                        if len > 0 && !cur.textual_empty && live_at(&mut cur.prev_live, len) == 0 {
+                            cur.textual_empty = true;
+                        }
+                    }
                     continue;
                 }
-                top.1 -= 1;
-                let (top_f, top_i) = *top;
-                let (_, slot) = self.frags[top_f as usize].slots[top_i];
+                let top_i = next_k - 1;
+                if let Some(top) = self.textual_stack.last_mut() {
+                    top.1 = top_i;
+                }
+                let Some(&(_, slot)) = self.frags.get(top_ix).and_then(|cur| cur.slots.get(top_i)) else {
+                    continue;
+                };
                 match slot {
                     Slot::Rules(n, def, _) if n == name && (self.plant == CellPlant::SubNamespaceIgnored || sub.is_none_or(|s| same_sub(def, s))) => {
                         return Step::Done(Some(def));
                     }
-                    Slot::Rules(..) | Slot::Mod(_, false) => {}
+                    Slot::Rules(..) => {}
+                    Slot::Mod(_, false) => {
+                        self.mark_slot_dead(top_f, top_i);
+                    }
                     Slot::Mod(child, true) => {
-                        let t = self.modules[child as usize].text;
+                        let Some(t) = usize::try_from(child).ok().and_then(|ix| self.modules.get(ix)).map(|m| m.text) else {
+                            continue;
+                        };
                         if t == FragId::MAX {
                             // A `#[macro_use]` child outside the group: its textual sequence
                             // from its record; one not held is refused (rule 3: never skipped).
@@ -3460,18 +3561,40 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                             }
                             continue;
                         }
-                        self.textual_stack.push((t, self.frags[t as usize].slots.len()));
                         if let Some(log) = self.textual_log.as_mut() {
                             log.push(t);
                         }
+                        if let Some(target) = usize::try_from(t).ok().and_then(|ix| self.frags.get(ix))
+                            && !target.textual_empty
+                        {
+                            let len = target.slots.len();
+                            self.ensure_prev_live(t);
+                            self.textual_stack.push((t, len));
+                        }
                     }
                     Slot::Call(j) => {
-                        let it = &self.items[j as usize];
+                        let Some(it) = usize::try_from(j).ok().and_then(|ix| self.items.get(ix)) else {
+                            continue;
+                        };
                         if it.grown {
-                            if let Some(x) = it.expansion {
-                                self.textual_stack.push((x, self.frags[x as usize].slots.len()));
-                                if let Some(log) = self.textual_log.as_mut() {
-                                    log.push(x);
+                            match it.expansion {
+                                None => {
+                                    self.mark_slot_dead(top_f, top_i);
+                                }
+                                Some(x) => {
+                                    let exp_info = usize::try_from(x).ok().and_then(|ix| self.frags.get(ix)).map(|fr| (fr.textual_empty, fr.slots.len()));
+                                    match exp_info {
+                                        Some((true, _)) | None => {
+                                            self.mark_slot_dead(top_f, top_i);
+                                        }
+                                        Some((false, len)) => {
+                                            if let Some(log) = self.textual_log.as_mut() {
+                                                log.push(x);
+                                            }
+                                            self.ensure_prev_live(x);
+                                            self.textual_stack.push((x, len));
+                                        }
+                                    }
                                 }
                             }
                         } else if !guess.is_some_and(|g| g.items.contains_key(&j)) {

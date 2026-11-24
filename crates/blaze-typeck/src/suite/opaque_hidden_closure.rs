@@ -180,3 +180,132 @@ fn the_same_where_clause_is_unmet_in_analysis() {
     let e = cx.next_error().unwrap_or_else(|| panic!("analysis revealed mk's opaque: `Flat<Map<..>, fn mk>: Iterator` held"));
     assert_eq!(e.kind, FulfillErrorKind::Unsatisfied, "a rigid opaque is no `Map<..>`: the goal is unmet, not ambiguous");
 }
+
+/// Models `cookie_factory::sequence::Tuple::serialize` with `Self` a tuple of closures where an
+/// imported foreign closure carries an opaque in its owner arguments (directly and nested inside a
+/// tuple). In `TypingMode::PostAnalysis`, `unify_header` (`Relate::Lazy`) generalizes the
+/// non-rigid opaque to a fresh variable, and `select_all` normalizes it to the hidden closure.
+/// Exporting the selected impl's arguments then meets a new term for the already-imported foreign
+/// closure; `Exporter::adopt` must recognize its identity from `rows.foreign` rather than
+/// rejecting it with `Malformed::UnseenBodyType`.
+#[test]
+fn tuple_impl_of_imported_closure_with_opaque_owner_arg_adopts() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Default::default(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let (p0, p1, p2) = (fx.param(0), fx.param(1), fx.param(2));
+    let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe, c_variadic: false };
+    let fn_once = fx.tr("FnOnce", 2, Default::default(), &["Output"]);
+    fx.lang(LangItem::FnOnce, fn_once);
+    let out = fx.alias(fn_once, "Output", &[p0, p1]);
+    let call_once = fx.trait_fn(fn_once, "call_once", true, &[p0, p1], out);
+    fx.set_header(call_once, rust_call);
+    let sup = fx.bound(fn_once, &[p0, p1]);
+    let fn_mut = fx.tr("FnMut", 2, [sup].into(), &[]);
+    fx.lang(LangItem::FnMut, fn_mut);
+    let m_self = fx.r(Mutbl::Mut, p0);
+    let call_mut = fx.trait_fn(fn_mut, "call_mut", true, &[m_self, p1], out);
+    fx.set_header(call_mut, rust_call);
+    let sup = fx.bound(fn_mut, &[p0, p1]);
+    let fn_ = fx.tr("Fn", 2, [sup].into(), &[]);
+    fx.lang(LangItem::Fn, fn_);
+    let r_self = fx.r(Mutbl::Not, p0);
+    let call = fx.trait_fn(fn_, "call", true, &[r_self, p1], out);
+    fx.set_header(call, rust_call);
+
+    let u8_ = fx.ty(PNode::Uint(UintTy::U8));
+
+    // trait SerializeFn<W>: Fn(W) -> u8 {}
+    // impl<W, F: Fn(W) -> u8> SerializeFn<W> for F {}
+    let arg_w = fx.tuple(&[p1]);
+    let fn_w = fx.bound(fn_, &[p0, arg_w]);
+    let fn_w_out = fx.proj(fn_once, &[p0, arg_w], "Output", u8_);
+    let serialize_fn = fx.tr("SerializeFn", 2, [fn_w, fn_w_out].into(), &[]);
+    let arg_p0 = fx.tuple(&[p0]);
+    let f_fn = fx.bound(fn_, &[p1, arg_p0]);
+    let f_out = fx.proj(fn_once, &[p1, arg_p0], "Output", u8_);
+    fx.imp("impl SerializeFn for F", 2, p1, Some((serialize_fn, &[p0])), &[], [f_fn, f_out].into());
+
+    // trait Tuple<W> { fn serialize(&self, w: W) -> u8; }
+    // impl<W, A: SerializeFn<W>, B: SerializeFn<W>> Tuple<W> for (A, B)
+    let tuple_tr = fx.tr("Tuple", 2, Default::default(), &[]);
+    let r_self = fx.r(Mutbl::Not, p0);
+    let serialize = fx.trait_fn(tuple_tr, "serialize", true, &[r_self, p1], u8_);
+    let pair_ab = fx.tuple(&[p1, p2]);
+    let a_ser = fx.bound(serialize_fn, &[p1, p0]);
+    let b_ser = fx.bound(serialize_fn, &[p2, p0]);
+    let pair_imp = fx.imp("impl Tuple for (A, B)", 3, pair_ab, Some((tuple_tr, &[p0])), &[], [a_ser, b_ser].into());
+    let r_pair = fx.r(Mutbl::Not, pair_ab);
+    let pair_serialize = fx.impl_fn(pair_imp, "serialize", true, &[r_pair, p0], u8_);
+
+    // fn leaf<W>() -> impl SerializeFn<W> { |w: W| 0u8 }
+    let leaf_opaque_k = fx.opaque_key("leaf::{opaque#0}");
+    let p0_list = fx.list(&[p0]);
+    let leaf_opaque = fx.ty(PNode::Opaque(leaf_opaque_k, p0_list));
+    let leaf_ser = fx.bound(serialize_fn, &[leaf_opaque, p0]);
+    let leaf_sized = fx.bound(sized, &[leaf_opaque]);
+    fx.set_opaque_bounds(leaf_opaque_k, [leaf_ser, leaf_sized].into());
+    let probe = fx.opaque_key("probe_leaf");
+    let leaf_k = ItemKey(probe.0 + 1);
+    let leaf_cl = fx.ty(PNode::Closure { owner: leaf_k, ordinal: 0, args: p0_list });
+    let leaf = fx.func("leaf", 1, &[], leaf_opaque, Default::default());
+    assert_eq!(leaf, leaf_k);
+    fx.hidden.push((leaf_opaque_k, leaf_cl));
+    let io_p0 = fx.list(&[p0, u8_]);
+    let sig_p0 = fx.ty(PNode::FnPtr(io_p0, FnPtrHeader::RUST));
+    fx.closures.push((leaf, 0, ClosureKind::Fn, sig_p0));
+
+    // fn all<G: SerializeFn<W>, W>() -> {closure#0 of all<G, W>} (sig: fn(W) -> u8)
+    let g_ser = fx.bound(serialize_fn, &[p0, p1]);
+    let all = fx.func("all", 2, &[], u8_, [g_ser].into());
+    let io_p1 = fx.list(&[p1, u8_]);
+    let sig_p1 = fx.ty(PNode::FnPtr(io_p1, FnPtrHeader::RUST));
+    fx.closures.push((all, 0, ClosureKind::Fn, sig_p1));
+
+    // fn nested<W, L>() -> {closure#0 of nested<W, L>} (sig: fn(W) -> u8)
+    let nested = fx.func("nested", 2, &[], u8_, Default::default());
+    fx.closures.push((nested, 0, ClosureKind::Fn, sig_p0));
+
+    fx.use_trait(tuple_tr);
+    fx.finish();
+
+    let alloc: Alloc<'static> = blaze_own::testing::heap().alloc();
+    let mut ground = PortableTys::new_in(alloc);
+    let u8_g = ground.intern(PNode::Uint(UintTy::U8)).expect("intern");
+    let u8_list = ground.intern_list(&[u8_g]).expect("intern");
+    let leaf_cl_g = ground.intern(PNode::Closure { owner: leaf, ordinal: 0, args: u8_list }).expect("intern");
+    let leaf_op_g = ground.intern(PNode::Opaque(leaf_opaque_k, u8_list)).expect("intern");
+
+    // Case 1: direct opaque in an imported closure's owner arguments (`all<Opaque(leaf)<u8>, u8>`).
+    let all_args = ground.intern_list(&[leaf_op_g, u8_g]).expect("intern");
+    let all_cl_g = ground.intern(PNode::Closure { owner: all, ordinal: 0, args: all_args }).expect("intern");
+    let self_elems = ground.intern_list(&[leaf_cl_g, all_cl_g]).expect("intern");
+    let self_ty = ground.intern(PNode::Tuple(self_elems)).expect("intern");
+    let call_args = ground.intern_list(&[self_ty, u8_g]).expect("intern");
+    let r = crate::resolve_instance(&fx, serialize, call_args, &mut ground, alloc)
+        .unwrap_or_else(|e| panic!("resolving Tuple::serialize with opaque in imported closure's args failed: {e}"));
+    assert_eq!(r.item, pair_serialize);
+    let expected_all_args = ground.intern_list(&[leaf_cl_g, u8_g]).expect("intern");
+    let expected_all_cl = ground.intern(PNode::Closure { owner: all, ordinal: 0, args: expected_all_args }).expect("intern");
+    let resolved_args = ground.view().list(r.args).expect("list");
+    assert_eq!(resolved_args, &[u8_g, leaf_cl_g, expected_all_cl]);
+
+    // Case 2: opaque nested inside a tuple in an imported closure's owner arguments
+    // (`nested<u8, (Opaque(leaf)<u8>,)>`).
+    let one_op = ground.intern_list(&[leaf_op_g]).expect("intern");
+    let one_op_tup = ground.intern(PNode::Tuple(one_op)).expect("intern");
+    let nested_args = ground.intern_list(&[u8_g, one_op_tup]).expect("intern");
+    let nested_cl_g = ground.intern(PNode::Closure { owner: nested, ordinal: 0, args: nested_args }).expect("intern");
+    let self_elems = ground.intern_list(&[leaf_cl_g, nested_cl_g]).expect("intern");
+    let self_ty = ground.intern(PNode::Tuple(self_elems)).expect("intern");
+    let call_args = ground.intern_list(&[self_ty, u8_g]).expect("intern");
+    let r = crate::resolve_instance(&fx, serialize, call_args, &mut ground, alloc)
+        .unwrap_or_else(|e| panic!("resolving Tuple::serialize with opaque nested in tuple arg failed: {e}"));
+    assert_eq!(r.item, pair_serialize);
+    let one_cl = ground.intern_list(&[leaf_cl_g]).expect("intern");
+    let one_cl_tup = ground.intern(PNode::Tuple(one_cl)).expect("intern");
+    let expected_nested_args = ground.intern_list(&[u8_g, one_cl_tup]).expect("intern");
+    let expected_nested_cl = ground.intern(PNode::Closure { owner: nested, ordinal: 0, args: expected_nested_args }).expect("intern");
+    let resolved_args = ground.view().list(r.args).expect("list");
+    assert_eq!(resolved_args, &[u8_g, leaf_cl_g, expected_nested_cl]);
+}

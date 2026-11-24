@@ -1036,12 +1036,19 @@ impl<'x, 'a> Exporter<'x, 'a> {
         match self.terms.cx.tys.ty_kind(made) {
             TyKind::Closure(d, l) => {
                 let k = def_of(self.terms.cx.tys.item_key(d));
-                if self.rows.closures.contains_key(&k) || self.rows.foreign.iter().any(|f| f.made == made) || self.seen().foreign_resolved(d, l).is_some() {
+                if self.rows.closures.contains_key(&k) || self.rows.foreign.iter().any(|f| f.made == made) {
                     return Ok(());
                 }
-                let Some(&facts::HiddenBody { owner, ordinal, args: n }) = self.facts.hidden_bodies.get(&k) else {
-                    return Err(unseen());
-                };
+                // A newly resolved instance of a term we imported has the same
+                // definition even when one of its arguments has since been bound
+                // or an opaque inside it revealed.
+                let seen = self.seen();
+                let identity = self.facts.hidden_bodies.get(&k).map(|f| (f.owner, f.ordinal, f.args))
+                    .or_else(|| seen.rows.foreign.iter().find_map(|f| {
+                        matches!(seen.terms.cx.tys.ty_kind(f.made), TyKind::Closure(original, _) if original == d)
+                            .then(|| (f.owner, f.ordinal, seen.list_len(f.args)))
+                    }));
+                let (owner, ordinal, n) = identity.ok_or_else(unseen)?;
                 let tys = &mut self.terms.cx.tys;
                 if tys.list_len(l) != n + 3 {
                     return Err(unseen());

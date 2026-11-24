@@ -413,13 +413,28 @@ struct ObjectTable {
     shape: ContentId,
 }
 
-/// Whether a trait's method has a slot (the Reference, "Trait objects": a method callable on
-/// the object): dyn-compatible by the checker's one rule ([`tc::dyn_compat::member_verdict`]),
-/// and not one of the explicitly non-dispatchable (`where Self: Sized`, a `self` receiver).
-/// Whether a trait's method has a slot in its vtables (the builder's `ObjectMethod::dispatch`):
+/// How a trait's method is dispatched in its vtables (the builder's `ObjectMethod::dispatch`):
 /// also the rule the reach walk reaches each table's slots by (reach/instances/slots.rs).
-pub(super) fn dispatchable(m: &tc::dyn_compat::MemberFacts, f: &tc::dyn_compat::FnFacts) -> bool {
-    !(f.where_self_sized || f.receiver == tc::dyn_compat::Receiver::Value) && tc::dyn_compat::member_verdict(m) == tc::dyn_compat::MemberVerdict::Compatible
+///
+/// `allow_by_value_self`: true for `#[lang = "fn_once"]` (and `#[lang = "async_fn_once"]`),
+/// whose `call_once(self, args)` / `async_call_once(self, args)` is dispatched through a
+/// `VTableShim` taking `*mut Self` (`Box<dyn FnOnce<Args>>::call_once` via `unsized_fn_params`).
+pub(super) fn method_dispatch(
+    m: &tc::dyn_compat::MemberFacts,
+    f: &tc::dyn_compat::FnFacts,
+    allow_by_value_self: bool,
+) -> blaze_build::vtable::MethodDispatch {
+    use blaze_build::vtable::MethodDispatch;
+    if f.where_self_sized || tc::dyn_compat::member_verdict(m) != tc::dyn_compat::MemberVerdict::Compatible {
+        return MethodDispatch::None;
+    }
+    if f.receiver == tc::dyn_compat::Receiver::Value {
+        if allow_by_value_self && f.own_non_lifetime_params == 0 && !f.self_outside_receiver && !f.is_async && !f.opaque_return {
+            return MethodDispatch::ByValueShim;
+        }
+        return MethodDispatch::None;
+    }
+    MethodDispatch::Direct
 }
 
 /// The most traits one program's objects reach, supertraits included (rule 18).
@@ -597,20 +612,27 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
             if waiting {
                 return Ok(None);
             }
+            let allow_by_value_self = r.index.lang("fn_once").is_some_and(|l| checker_of(l) == k)
+                || r.index.lang("async_fn_once").is_some_and(|l| checker_of(l) == k);
             let mut methods = Vec::with_capacity_in(head.members.len(), Global);
             for m in head.members.iter() {
                 let dispatch = match &m.shape {
-                    tc::dyn_compat::MemberShape::Fn(f) => dispatchable(m, f),
+                    tc::dyn_compat::MemberShape::Fn(f) => method_dispatch(m, f, allow_by_value_self),
                     tc::dyn_compat::MemberShape::Unread(u) => return Err(format!("a member the front end could not read ({u:?})")),
                     _ => continue,
                 };
                 let item = head.fns.iter().find(|(n, _)| *n == m.name).map(|(_, f)| *f).ok_or_else(|| String::from("a method with no fn filed under its name"))?;
                 methods.push(blaze_build::vtable::ObjectMethod { item, dispatch });
             }
-            let mut h = blaze_ids::Hasher::new("blaze-ladder front2 object trait 3");
+            let mut h = blaze_ids::Hasher::new("blaze-ladder front2 object trait 4");
             h.update(&k.0.to_le_bytes());
             for m in methods.iter() {
-                h.update(&m.item.0.to_le_bytes()).update(&[u8::from(m.dispatch)]);
+                let tag: u8 = match m.dispatch {
+                    blaze_build::vtable::MethodDispatch::None => 0,
+                    blaze_build::vtable::MethodDispatch::Direct => 1,
+                    blaze_build::vtable::MethodDispatch::ByValueShim => 2,
+                };
+                h.update(&m.item.0.to_le_bytes()).update(&[tag]);
             }
             let super_view = super_tys.as_ref().map_or(PTys::EMPTY, PortableTys::view);
             for s in supers.iter() {
@@ -1920,10 +1942,10 @@ impl FrontEnd for Front2Program<'_> {
         self.front.index.fn_lang(l).map(checker_of)
     }
 
-    /// The `drop` lang trait and its `drop` fn (filed once the trait's head was made).
+    /// The `drop` lang trait and its `drop` fn (from its filed head or the library's member row).
     fn drop_trait(&self) -> Option<(ItemKey, Option<ItemKey>)> {
         let tr = self.made_lang(LangItem::Drop)?;
-        Some((tr, self.front.keys.filed_member(tr, MemberKind::Fn, "drop")))
+        Some((tr, self.lang_trait_fn(LangItem::Drop, "drop")))
     }
 
     /// The library item for `item`, by the one home the checker's world asks too
@@ -2133,6 +2155,10 @@ impl FrontEnd for Front2Program<'_> {
     /// instance (consts.rs `Consts::fn_instance`).
     fn const_fn_instance(&self, key: blaze_build::InstanceKey, ground: &mut tc::PortableTys<'_>, scratch: Alloc<'_>) -> Option<blaze_build::Instance> {
         self.consts.fn_instance(key, ground, scratch)
+    }
+
+    fn const_vtable_ref(&self, key: blaze_build::vtable::VtableKey, ground: &mut tc::PortableTys<'_>, scratch: Alloc<'_>) -> Option<blaze_build::vtable::VtableRef> {
+        self.consts.vtable_ref(key, ground, scratch)
     }
 
     fn evaluates_at_args(&self) -> bool {

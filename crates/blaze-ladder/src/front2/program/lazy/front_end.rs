@@ -506,7 +506,7 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
 
     fn drop_trait(&self) -> Option<(ItemKey, Option<ItemKey>)> {
         let tr = self.made_lang(LangItem::Drop)?;
-        Some((tr, self.front.keys.filed_member(tr, MemberKind::Fn, "drop")))
+        Some((tr, self.lang_trait_fn(LangItem::Drop, "drop")))
     }
 
     fn lang_item(&self, item: LangItem) -> Result<Option<ItemKey>, crate::seam::LangRefusal> {
@@ -735,6 +735,10 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// instance's arguments (`const_at`).
     fn const_fn_instance(&self, key: blaze_build::InstanceKey, ground: &mut tc::PortableTys<'_>, scratch: blaze_own::Alloc<'_>) -> Option<blaze_build::Instance> {
         self.consts.fn_instance(key, ground, scratch)
+    }
+
+    fn const_vtable_ref(&self, key: blaze_build::vtable::VtableKey, ground: &mut tc::PortableTys<'_>, scratch: blaze_own::Alloc<'_>) -> Option<blaze_build::vtable::VtableRef> {
+        self.consts.vtable_ref(key, ground, scratch)
     }
 
     fn evaluates_at_args(&self) -> bool {

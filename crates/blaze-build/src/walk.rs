@@ -26,7 +26,7 @@ use crate::{Abi, Adts, BuildError, Built, Instance, Intrinsic, Subst, ground};
 
 #[path = "closure.rs"]
 mod closure;
-pub(crate) use closure::{build_builtin_clone, build_builtin_from, build_ctor_fn, build_fn_shim, build_reify_shim, closures_in};
+pub(crate) use closure::{build_builtin_clone, build_builtin_from, build_ctor_fn, build_fn_shim, build_reify_shim, build_vtable_shim, closures_in};
 #[cfg(test)]
 pub(crate) use closure::{empty_record as empty_record_for_tests, empty_view as empty_view_for_tests};
 #[path = "coroutine.rs"]
@@ -804,6 +804,15 @@ struct UnsizeEnds {
     to: PTy,
 }
 
+/// A dynamic call's vtable slot: the principal trait, the slot index (after the header), and
+/// whether the slot holds a by-value `self` `VTableShim` (`MethodDispatch::ByValueShim`).
+#[derive(Clone, Copy)]
+struct DynSlot {
+    principal: ItemKey,
+    slot: u32,
+    by_value: bool,
+}
+
 /// What the instance `subst` names of `body` reads of trait shapes, in expression order: the
 /// part of its record's key the world's trait facts give ([`crate::vtable::record_key`]). Walks
 /// the checked body's calls and unsizings without building code.
@@ -923,6 +932,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     let t = self.adjusted_ty(callee)?;
                     match self.node_at(callee, t)? {
                         PNode::FnDef(item, args) => Some(Instance { item, args }),
+                        _ if self.checked.callees.column::<0>().contains(&e) => Some(self.method_callee(e)?),
                         _ => None,
                     }
                 }
@@ -930,7 +940,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 _ => None,
             };
             if let Some(instance) = instance
-                && let Some((principal, slot)) = self.dyn_slot(e, instance)?
+                && let Some(DynSlot { principal, slot, .. }) = self.dyn_slot(e, instance)?
             {
                 out.push(ObjectRead::Call { principal, method: instance.item, slot });
             }
@@ -2256,6 +2266,10 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
 
     /// Whether ground type `g` needs drop.
     fn needs_drop(&mut self, g: PTy) -> Result<bool, TyErr> {
+        // A trait object's concrete destructor is only known at run time (drop_facts.rs).
+        if matches!(self.ground_node(g)?, PNode::Dynamic(_)) {
+            return Ok(true);
+        }
         if !self.is_agg(g)? {
             return Ok(false);
         }
@@ -5224,9 +5238,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         self.b.func_addr(r)
     }
 
-    /// The address of `table`: `data_addr` of its `Vtable` reference, one place per table. The
-    /// unsizing to `dyn` (codegen.md, "Trait objects") pairs it with the data pointer.
-    fn vtable_addr(&mut self, table: crate::vtable::VtableRef) -> Result<Value, BuildError> {
+    /// The place of `table` in `self.vtables`, one place per table.
+    pub(super) fn vtable_place(&mut self, table: crate::vtable::VtableRef) -> Result<u32, BuildError> {
         let place = match self.vtables.iter().position(|&t| t == table) {
             Some(at) => at,
             None => {
@@ -5234,7 +5247,13 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.vtables.len() - 1
             }
         };
-        let place = u32::try_from(place).map_err(|_| malformed("more than 2^32 vtables"))?;
+        u32::try_from(place).map_err(|_| malformed("more than 2^32 vtables"))
+    }
+
+    /// The address of `table`: `data_addr` of its `Vtable` reference, one place per table. The
+    /// unsizing to `dyn` (codegen.md, "Trait objects") pairs it with the data pointer.
+    fn vtable_addr(&mut self, table: crate::vtable::VtableRef) -> Result<Value, BuildError> {
+        let place = self.vtable_place(table)?;
         let r = self.b.reference(RefKind::Vtable, place);
         Ok(self.b.data_addr(r))
     }
@@ -5600,8 +5619,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Expr::Call { callee, args } => {
                 let list = self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?;
                 let t = self.adjusted_ty(callee)?;
-                let item = match self.node_at(callee, t)? {
-                    PNode::FnDef(item, _) => item,
+                let (item, fn_args) = match self.node_at(callee, t)? {
+                    PNode::FnDef(item, fn_args) => (item, fn_args),
                     // Through a fn pointer: its value first, then the arguments, then the call
                     // (lib.rs, "Fn pointers").
                     PNode::FnPtr(..) => {
@@ -5623,12 +5642,22 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     // then the arguments, each a field of the method's tuple (lib.rs
                     // `Abi::RustCall`).
                     _ if self.checked.callees.column::<0>().contains(&e) => {
+                        let instance = self.method_callee(e)?;
+                        let by_value_dyn = matches!(self.dyn_slot(e, instance)?, Some(DynSlot { by_value: true, .. }));
                         self.work.push(Task::Call(e));
-                        for &a in list.iter().rev().chain([&callee]) {
+                        for &a in list.iter().rev() {
                             if let Repr::Agg(_) = self.adjusted_repr(a)? {
                                 self.work.push(Task::ArgCopy(a));
                             }
                             self.work.push(Task::Eval(a));
+                        }
+                        if by_value_dyn {
+                            self.work.push(Task::Place(callee));
+                        } else {
+                            if let Repr::Agg(_) = self.adjusted_repr(callee)? {
+                                self.work.push(Task::ArgCopy(callee));
+                            }
+                            self.work.push(Task::Eval(callee));
                         }
                         return Ok(());
                     }
@@ -5648,9 +5677,14 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 // A `#[rustc_legacy_const_generics]` argument is the callee's const generic, not a
                 // value it is passed (`Self::legacy_listed`).
                 let listed = self.legacy_listed(callee, item, list.len())?;
+                let by_value_dyn = matches!(self.dyn_slot(e, Instance { item, args: fn_args })?, Some(DynSlot { by_value: true, .. }));
                 self.work.push(Task::Call(e));
                 for (k, &a) in list.iter().enumerate().rev() {
                     if listed.contains(&(k as u32)) {
+                        continue;
+                    }
+                    if k == 0 && by_value_dyn {
+                        self.work.push(Task::Place(a));
                         continue;
                     }
                     // An aggregate argument gets its caller's copy at once, before the next
@@ -5667,12 +5701,22 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             // adjustments: the autoderef, the autoref) its first argument.
             Expr::MethodCall { receiver, args, .. } => {
                 let list = self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?;
+                let instance = self.method_callee(e)?;
+                let by_value_dyn = matches!(self.dyn_slot(e, instance)?, Some(DynSlot { by_value: true, .. }));
                 self.work.push(Task::Call(e));
-                for &a in list.iter().rev().chain([&receiver]) {
+                for &a in list.iter().rev() {
                     if let Repr::Agg(_) = self.adjusted_repr(a)? {
                         self.work.push(Task::ArgCopy(a));
                     }
                     self.work.push(Task::Eval(a));
+                }
+                if by_value_dyn {
+                    self.work.push(Task::Place(receiver));
+                } else {
+                    if let Repr::Agg(_) = self.adjusted_repr(receiver)? {
+                        self.work.push(Task::ArgCopy(receiver));
+                    }
+                    self.work.push(Task::Eval(receiver));
                 }
             }
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
@@ -6150,13 +6194,13 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             }
             _ => return Err(malformed("a call task on another expression")),
         };
-        if let Some((_, slot)) = self.dyn_slot(e, instance)? {
+        if let Some(DynSlot { slot, by_value, .. }) = self.dyn_slot(e, instance)? {
             self.refuse_tracked_slot(e, instance)?;
             // A "rust-call" method called with its tuple written whole (`(**self).call_mut(args)`
             // in core's `impl FnMut<A> for &mut F` at `F = dyn FnMut(..)`): the slot's fn takes
             // the tuple's fields apart, as a direct call does (`spread_tuple`).
             let spread = !overloaded && self.adts.abi(instance.item) == Some(Abi::RustCall);
-            return self.dyn_call(e, instance, &list, slot, spread);
+            return self.dyn_call(e, instance, &list, slot, spread, by_value);
         }
         let item = instance.item;
         let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
@@ -6199,7 +6243,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// of a trait above it, with `Self` (its first argument) a trait object. The checker records
     /// no other mark (codegen.md, "Trait objects"). A trait implemented for a `dyn` type by an
     /// impl, or a generic fn at `T = dyn Tr`, has no slot there: an ordinary call.
-    fn dyn_slot(&mut self, e: ExprId, instance: Instance) -> Result<Option<(ItemKey, u32)>, BuildError> {
+    fn dyn_slot(&mut self, e: ExprId, instance: Instance) -> Result<Option<DynSlot>, BuildError> {
         let view = self.ground.view();
         let Some(&self_ty) = view.list(instance.args).map_err(|_| malformed("a callee's arguments past the ground table"))?.first() else {
             return Ok(None);
@@ -6213,16 +6257,16 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let adts = self.adts;
         let shape = crate::vtable::Shape::of(principal, |t| adts.object_trait(t), self.scratch)
             .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
-        if let Some(slot) = shape.slot(instance.item) {
-            return Ok(Some((principal, slot)));
+        if let Some((slot, by_value)) = shape.slot_info(instance.item) {
+            return Ok(Some(DynSlot { principal, slot, by_value }));
         }
         // No slot. A method of a trait on the object's own tree (the principal or a supertrait)
         // with `Self` the object is still a dynamic call by the Reference ("Trait objects"; no
         // impl of such a trait for the object type can be written, E0371): built as a direct
         // call it would run the trait's default body, not the concrete type's. Such a method
         // has no slot when the world marks it not dispatchable (`where Self: Sized`, generic,
-        // or `self` by value, which `unsized_fn_params` can call on `Box<dyn FnOnce>`): refused
-        // by name. A method of another trait (`impl Other for dyn Tr`) is an ordinary call.
+        // or a non-dispatchable `self` by value): refused by name. A method of another trait
+        // (`impl Other for dyn Tr`) is an ordinary call.
         let traits = shape.prefix.iter().copied().chain(shape.words.iter().filter_map(|w| match *w {
             crate::vtable::Word::Super { trait_, .. } => Some(trait_),
             crate::vtable::Word::Method { .. } => None,
@@ -6237,12 +6281,14 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     }
 
     /// Dynamic call `e` of `instance` at vtable `slot` (codegen.md, "Trait objects"): the
-    /// receiver, a wide pointer, is the `list.len()`-th value from the top; `f = load [vtable +
-    /// 8 * (3 + slot)]`, then `f(data, args..)`. The callee is the impl's method at the concrete
-    /// type, so the receiver is passed in its thin form (`DispatchFromDyn`): `&self` and `&mut
-    /// self` as a pointer, `self: Box<Self>` as a `Box` of a sized type. With `spread`, the
-    /// last argument is a "rust-call" method's tuple written whole, passed as its fields.
-    fn dyn_call(&mut self, e: ExprId, instance: Instance, list: &[ExprId], slot: u32, spread: bool) -> Result<(), BuildError> {
+    /// receiver, a wide pointer (or an unsized place `V::Unsized` when `by_value` is true, e.g.
+    /// `Box<dyn FnOnce>::call_once`), is the `list.len()`-th value from the top; `f = load
+    /// [vtable + 8 * (3 + slot)]`, then `f(data, args..)`. For `by_value`, the slot holds a
+    /// `VTableShim` taking `data: *mut Self`, and the caller clears the owning `Box`'s `[Deref]`
+    /// drop bit right before the call so the box's drop frees the allocation without
+    /// double-dropping the consumed trait object. With `spread`, the last argument is a
+    /// "rust-call" method's tuple written whole, passed as its fields.
+    fn dyn_call(&mut self, e: ExprId, instance: Instance, list: &[ExprId], slot: u32, spread: bool, by_value: bool) -> Result<(), BuildError> {
         let item = instance.item;
         let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
         let n = list.len();
@@ -6250,6 +6296,11 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let mut passes = Vec::with_capacity_in(n, self.alloc);
         let mut wide = Repr::None;
         for (i, &a) in list.iter().enumerate() {
+            if i == 0 && by_value {
+                reprs.push(Repr::Ptr);
+                passes.push(self.rust_pass(Repr::Ptr)?);
+                continue;
+            }
             let t = self.adjusted_ty(a)?;
             let mut g = self.ground_ty(t).map_err(|error| Self::ty_err(a, error))?;
             if i == 0 {
@@ -6271,21 +6322,47 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             }
             self.spread_tuple(&mut reprs, &mut passes)?;
         }
-        let v = core::mem::replace(&mut self.vals[at], V::None);
-        let place = self.place(v, wide)?;
-        let data = self.load(Repr::Ptr, place);
-        let data = self.scalar(data, Ty::PTR)?;
-        let vt = self.load(Repr::Ptr, (place.0, place.1 + 8));
-        let vt = self.scalar(vt, Ty::PTR)?;
-        self.vals[at] = match reprs[0] {
-            Repr::Ptr => V::Scalar(data),
-            Repr::Agg(_) => {
-                let to = self.temp(reprs[0]);
-                self.b.store(Flags::NONE, data, to.0, to.1, MemAttrs::aligned(3));
-                V::Place(to.0, to.1)
+        let recv_slot = self.vals.get_mut(at).ok_or(malformed("a dynamic call's receiver missing from the value stack (a build bug)"))?;
+        let v = core::mem::replace(recv_slot, V::None);
+        let (data, vt) = if by_value {
+            let V::Unsized(p, off) = v else {
+                return Err(malformed("a by-value dynamic call's receiver is not an unsized place"));
+            };
+            let data = self.load(Repr::Ptr, (p, off));
+            let data = self.scalar(data, Ty::PTR)?;
+            let vt = self.load(Repr::Ptr, (p, off + 8));
+            let vt = self.scalar(vt, Ty::PTR)?;
+            if let Some(slot) = self.vals.get_mut(at) {
+                *slot = V::Scalar(data);
             }
-            _ => return Err(malformed("a thin receiver held as other than a pointer or an aggregate")),
+            // Clear the owning `Box`'s `[Deref]` bit right before entering the call so an unwind
+            // in an earlier argument still drops `*self`, while normal return or unwind inside
+            // the call frees the box without running `dyn_glue` on the moved-out object.
+            let recv_expr = *list.first().ok_or(malformed("a by-value dynamic call without a receiver expression"))?;
+            self.move_unsized_box_contents(recv_expr)?;
+            (data, vt)
+        } else {
+            let place = self.place(v, wide)?;
+            let data = self.load(Repr::Ptr, place);
+            let data = self.scalar(data, Ty::PTR)?;
+            let vt = self.load(Repr::Ptr, (place.0, place.1 + 8));
+            let vt = self.scalar(vt, Ty::PTR)?;
+            let r0 = *reprs.first().ok_or(malformed("a dynamic call without a receiver representation"))?;
+            let recv_val = match r0 {
+                Repr::Ptr => V::Scalar(data),
+                Repr::Agg(_) => {
+                    let to = self.temp(r0);
+                    self.b.store(Flags::NONE, data, to.0, to.1, MemAttrs::aligned(3));
+                    V::Place(to.0, to.1)
+                }
+                _ => return Err(malformed("a thin receiver held as other than a pointer or an aggregate")),
+            };
+            if let Some(slot) = self.vals.get_mut(at) {
+                *slot = recv_val;
+            }
+            (data, vt)
         };
+        let _ = data;
         let off = 8 * (crate::vtable::HEADER_WORDS + slot);
         let off = i32::try_from(off).map_err(|_| malformed("a vtable slot past 2^31 bytes"))?;
         let f = self.b.load(Ty::PTR, Flags::NONE, vt, off, MemAttrs::aligned(3));

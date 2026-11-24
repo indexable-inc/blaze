@@ -897,4 +897,728 @@ pub extern \"C\" fn main() -> i32 {
             "promoted autoref `&'static Fork` (33) + `(&Fork::Homestead).score()` (22)"
         );
     }
+
+    const CONST_AND_STATIC_DYN_PROGRAM: &str = "
+impl<T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<*const U> for *const T {}
+impl<T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<*mut U> for *mut T {}
+
+trait SuperA {
+    fn a(&self) -> u32;
+}
+
+trait SuperB {
+    fn b(&self) -> u32;
+}
+
+trait Sub: SuperA + SuperB {
+    fn sub(&self) -> u32;
+}
+
+trait Callsite {
+    fn id(&self) -> u32;
+}
+
+#[repr(C)]
+struct NonZst {
+    val: u32,
+}
+
+struct Unit;
+
+struct MyCallsite {
+    id: u32,
+}
+
+struct UnitCallsite;
+
+struct Meta<'a> {
+    tag: u32,
+    callsite: &'a dyn Callsite,
+}
+
+struct Wrap<T: PointeeSized> {
+    prefix: u32,
+    tail: T,
+}
+
+impl SuperA for NonZst {
+    fn a(&self) -> u32 { self.val + 1 }
+}
+
+impl SuperB for NonZst {
+    fn b(&self) -> u32 { self.val + 2 }
+}
+
+impl Sub for NonZst {
+    fn sub(&self) -> u32 { self.val + 3 }
+}
+
+impl SuperA for Unit {
+    fn a(&self) -> u32 { 7 }
+}
+
+impl Callsite for MyCallsite {
+    fn id(&self) -> u32 { self.id }
+}
+
+impl Callsite for UnitCallsite {
+    fn id(&self) -> u32 { 13 }
+}
+
+const CONST_NON_ZST: &dyn SuperA = &NonZst { val: 10 };
+const CONST_UNIT: &dyn SuperA = &Unit;
+const CONST_REBORROW: &dyn SuperA = &*CONST_NON_ZST;
+const CONST_RAW: *const dyn SuperA = &NonZst { val: 4 };
+const CONST_SUB: &dyn Sub = &NonZst { val: 5 };
+const CONST_UP_PREFIX: &dyn SuperA = CONST_SUB;
+const CONST_UP_OFFCHAIN: &dyn SuperB = CONST_SUB;
+const W_TAIL: Wrap<NonZst> = Wrap { prefix: 3, tail: NonZst { val: 8 } };
+const CONST_TAIL: &Wrap<dyn SuperA> = &W_TAIL;
+
+// Exact `tracing` static CALLSITE + static META shape:
+static CALLSITE: MyCallsite = MyCallsite { id: 19 };
+static META: Meta<'static> = Meta { tag: 2, callsite: &CALLSITE };
+
+static ZST_CALLSITE: UnitCallsite = UnitCallsite;
+static ZST_META: Meta<'static> = Meta { tag: 1, callsite: &ZST_CALLSITE };
+
+static DIRECT_DYN: &dyn SuperA = &NonZst { val: 6 };
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let r1 = CONST_NON_ZST.a();           // 11
+    let r2 = CONST_UNIT.a();              // 7
+    let r3 = CONST_REBORROW.a();          // 11
+    let r4 = unsafe { (*CONST_RAW).a() }; // 5
+    let r5 = CONST_UP_PREFIX.a();         // 6
+    let r6 = CONST_UP_OFFCHAIN.b();       // 7
+    let r7 = CONST_TAIL.prefix + CONST_TAIL.tail.a(); // 3 + 9 = 12
+    let r8 = META.tag + META.callsite.id();           // 2 + 19 = 21
+    let r9 = ZST_META.tag + ZST_META.callsite.id();   // 1 + 13 = 14
+    let r10 = DIRECT_DYN.a();             // 7
+    (r1 + r2 + r3 + r4 + r5 + r6 + r7 + r8 + r9 + r10) as i32
+}
+";
+
+    #[test]
+    fn const_and_static_dyn_unsize_runs_end_to_end() {
+        survey_clean(CONST_AND_STATIC_DYN_PROGRAM, "ConstAndStaticDyn");
+        // 11 + 7 + 11 + 5 + 6 + 7 + 12 + 21 + 14 + 7 = 101
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(run(CONST_AND_STATIC_DYN_PROGRAM), Ok(101), "const and static &dyn Trait dispatch");
+    }
+}
+
+mod box_dyn_fnonce {
+    //! End-to-end tests for `Box<dyn FnOnce<Args>>` (`alloc::boxed::<impl FnOnce<Args> for
+    //! Box<F, A>>::call_once`): by-value `VTableShim` dispatch, exact drop count (no double-drop,
+    //! no leak), multi-arg `rust-call`, ZST/fn-item/fn-ptr/custom-struct/nested-Box/upcast
+    //! receivers, lazy record-walk caching, unwind safety, and real `std` + `std::thread::spawn`.
+
+    use blaze_ladder::refusal::SourceFile;
+    use blaze_ladder::run::{FrontChoice, NewFront, run_with};
+
+    const NEW_NO_CORE: NewFront<'static> = NewFront {
+        package: "ladder",
+        edition: "2024",
+        shelf: None,
+        overflow: blaze_build::OverflowChecks::Off,
+    };
+
+    const NO_CORE_PROGRAM: &str = "#![feature(no_core, lang_items, unboxed_closures, fn_traits, unsized_fn_params, rustc_attrs, intrinsics)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+#[lang = \"pointee_sized\"]
+trait PointeeSized {}
+
+#[lang = \"meta_sized\"]
+trait MetaSized: PointeeSized {}
+
+#[lang = \"sized\"]
+trait Sized: MetaSized {}
+
+#[lang = \"legacy_receiver\"]
+trait LegacyReceiver: PointeeSized {}
+
+impl<T: PointeeSized> LegacyReceiver for &T {}
+impl<T: PointeeSized> LegacyReceiver for &mut T {}
+impl<T: PointeeSized> LegacyReceiver for MyBox<T> {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for bool {}
+impl Copy for u8 {}
+impl Copy for u32 {}
+impl Copy for i32 {}
+impl Copy for usize {}
+impl<T: PointeeSized> Copy for &T {}
+impl<T: PointeeSized> Copy for *const T {}
+impl<T: PointeeSized> Copy for *mut T {}
+
+#[lang = \"drop\"]
+trait Drop {
+    fn drop(&mut self);
+}
+
+#[lang = \"drop_in_place\"]
+unsafe fn drop_in_place<T: PointeeSized>(_to_drop: *mut T) {}
+
+#[lang = \"panic_cannot_unwind\"]
+fn panic_cannot_unwind() -> ! {
+    loop {}
+}
+
+#[lang = \"deref\"]
+trait Deref {
+    type Target: PointeeSized;
+    fn deref(&self) -> &Self::Target;
+}
+
+#[lang = \"unsize\"]
+trait Unsize<T: PointeeSized>: PointeeSized {}
+
+#[lang = \"coerce_unsized\"]
+trait CoerceUnsized<T: PointeeSized> {}
+
+impl<'a, 'b: 'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a U> for &'b T {}
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a mut U> for &'a mut T {}
+impl<T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<MyBox<U>> for MyBox<T> {}
+
+#[lang = \"dispatch_from_dyn\"]
+trait DispatchFromDyn<T> {}
+
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<&'a U> for &'a T {}
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<&'a mut U> for &'a mut T {}
+impl<T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<MyBox<U>> for MyBox<T> {}
+
+#[lang = \"tuple_trait\"]
+trait Tuple {}
+
+#[lang = \"fn_once\"]
+#[rustc_paren_sugar]
+trait FnOnce<Args: Tuple> {
+    #[lang = \"fn_once_output\"]
+    type Output;
+    extern \"rust-call\" fn call_once(self, args: Args) -> Self::Output;
+}
+
+#[lang = \"fn_mut\"]
+#[rustc_paren_sugar]
+trait FnMut<Args: Tuple>: FnOnce<Args> {
+    extern \"rust-call\" fn call_mut(&mut self, args: Args) -> Self::Output;
+}
+
+#[lang = \"fn\"]
+#[rustc_paren_sugar]
+trait Fn<Args: Tuple>: FnMut<Args> {
+    extern \"rust-call\" fn call(&self, args: Args) -> Self::Output;
+}
+
+#[rustc_intrinsic]
+const fn size_of<T>() -> usize;
+
+#[rustc_intrinsic]
+unsafe fn size_of_val<T: PointeeSized>(ptr: *const T) -> usize;
+
+#[rustc_intrinsic]
+unsafe fn write_via_move<T>(dst: *mut T, value: T);
+
+#[rustc_intrinsic]
+const fn forget<T>(_: T);
+
+static mut ARENA: [u64; 256] = [0; 256];
+static mut NEXT_SLOT: usize = 0;
+static mut DROP_COUNT: i32 = 0;
+static mut DROP_SUM: i32 = 0;
+static mut FREE_COUNT: i32 = 0;
+
+#[lang = \"owned_box\"]
+struct MyBox<T: PointeeSized>(*mut T);
+
+impl<T> MyBox<T> {
+    fn new(v: T) -> MyBox<T> {
+        let sz = size_of::<T>();
+        if sz == 0 {
+            forget(v);
+            // Dangling non-null aligned pointer for ZSTs (never dereferenced).
+            let ptr = 8usize as *mut T;
+            return MyBox(ptr);
+        }
+        unsafe {
+            let words = (sz + 7) >> 3;
+            let base = &raw mut ARENA as usize;
+            let slot = (base + NEXT_SLOT * 8) as *mut T;
+            NEXT_SLOT = NEXT_SLOT + words;
+            write_via_move(slot, v);
+            MyBox(slot)
+        }
+    }
+}
+
+impl<T: PointeeSized> Deref for MyBox<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &**self
+    }
+}
+
+impl<T: PointeeSized> Drop for MyBox<T> {
+    fn drop(&mut self) {
+        let sz = unsafe { size_of_val(self.0 as *const T) };
+        if sz != 0 {
+            unsafe {
+                FREE_COUNT = FREE_COUNT + 1;
+            }
+        }
+    }
+}
+
+impl<Args: Tuple, F: FnOnce<Args> + MetaSized> FnOnce<Args> for MyBox<F> {
+    type Output = <F as FnOnce<Args>>::Output;
+    extern \"rust-call\" fn call_once(self, args: Args) -> Self::Output {
+        <F as FnOnce<Args>>::call_once(*self, args)
+    }
+}
+
+impl<Args: Tuple, F: FnMut<Args> + MetaSized> FnMut<Args> for MyBox<F> {
+    extern \"rust-call\" fn call_mut(&mut self, args: Args) -> Self::Output {
+        <F as FnMut<Args>>::call_mut(self, args)
+    }
+}
+
+impl<Args: Tuple, F: Fn<Args> + MetaSized> Fn<Args> for MyBox<F> {
+    extern \"rust-call\" fn call(&self, args: Args) -> Self::Output {
+        <F as Fn<Args>>::call(self, args)
+    }
+}
+
+struct Guard {
+    id: i32,
+    pad0: u64,
+    pad1: u64,
+}
+
+impl Guard {
+    fn new(id: i32) -> Guard {
+        Guard { id, pad0: 0xAA, pad1: 0xBB }
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        unsafe {
+            DROP_COUNT = DROP_COUNT + 1;
+            DROP_SUM = DROP_SUM + self.id;
+        }
+    }
+}
+
+fn consume_guard(g: Guard) -> i32 {
+    g.id
+}
+
+fn peek_guard(g: &Guard) -> i32 {
+    g.id
+}
+
+fn sub_i32(a: i32, b: i32) -> i32 {
+    a - b
+}
+
+struct CustomOnce {
+    g: Guard,
+    delta: i32,
+}
+
+impl FnOnce<()> for CustomOnce {
+    type Output = i32;
+    extern \"rust-call\" fn call_once(self, _args: ()) -> i32 {
+        self.g.id + self.delta
+    }
+}
+
+fn call_boxed_once_0(f: MyBox<dyn FnOnce() -> i32>) -> i32 {
+    f()
+}
+
+fn call_boxed_once_2(f: MyBox<dyn FnOnce(i32, i32) -> i32>, a: i32, b: i32) -> i32 {
+    f(a, b)
+}
+
+fn reset_counts() {
+    unsafe {
+        DROP_COUNT = 0;
+        DROP_SUM = 0;
+        FREE_COUNT = 0;
+    }
+}
+
+fn counts() -> (i32, i32, i32) {
+    unsafe { (DROP_COUNT, DROP_SUM, FREE_COUNT) }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    // 1. FnOnce-only closure moving a large non-Copy Guard out and returning a value.
+    reset_counts();
+    let g1 = Guard::new(11);
+    let f1: MyBox<dyn FnOnce() -> i32> = MyBox::new(move || consume_guard(g1) + 4);
+    let r1 = call_boxed_once_0(f1);
+    let (dc1, ds1, fc1) = counts();
+    if r1 != 15 || dc1 != 1 || ds1 != 11 || fc1 != 1 {
+        return 1;
+    }
+
+    // 2. Multi-argument Box<dyn FnOnce(i32, i32) -> i32> moving a captured Guard.
+    reset_counts();
+    let g2 = Guard::new(5);
+    let f2: MyBox<dyn FnOnce(i32, i32) -> i32> = MyBox::new(move |a: i32, b: i32| consume_guard(g2) * 100 + a * 10 + b);
+    let r2 = call_boxed_once_2(f2, 2, 3);
+    let (dc2, ds2, fc2) = counts();
+    if r2 != 523 || dc2 != 1 || ds2 != 5 || fc2 != 1 {
+        return 2;
+    }
+
+    // 3. Fn closure capturing a Guard by value (borrows `&g3` inside body -> captures whole `Guard`
+    //    under RFC 2229 and runs `run_entry`).
+    reset_counts();
+    let g3 = Guard::new(17);
+    let f3: MyBox<dyn FnOnce() -> i32> = MyBox::new(move || peek_guard(&g3) + 3);
+    let r3 = call_boxed_once_0(f3);
+    let (dc3, ds3, fc3) = counts();
+    if r3 != 20 || dc3 != 1 || ds3 != 17 || fc3 != 1 {
+        return 3;
+    }
+
+    // 4. ZST non-capturing closure (no allocation, dangling ptr must not be dereferenced).
+    reset_counts();
+    let f4: MyBox<dyn FnOnce() -> i32> = MyBox::new(|| 42);
+    let r4 = call_boxed_once_0(f4);
+    let (dc4, _, fc4) = counts();
+    if r4 != 42 || dc4 != 0 || fc4 != 0 {
+        return 4;
+    }
+
+    // 5. Fn item coerced to Box<dyn FnOnce(i32, i32) -> i32>.
+    reset_counts();
+    let f5: MyBox<dyn FnOnce(i32, i32) -> i32> = MyBox::new(sub_i32);
+    let r5 = call_boxed_once_2(f5, 30, 7);
+    let (dc5, _, fc5) = counts();
+    if r5 != 23 || dc5 != 0 || fc5 != 0 {
+        return 5;
+    }
+
+    // 6. Fn pointer coerced to Box<dyn FnOnce(i32, i32) -> i32>.
+    reset_counts();
+    let fp: fn(i32, i32) -> i32 = sub_i32;
+    let f6: MyBox<dyn FnOnce(i32, i32) -> i32> = MyBox::new(fp);
+    let r6 = call_boxed_once_2(f6, 50, 8);
+    let (dc6, _, fc6) = counts();
+    if r6 != 42 || dc6 != 0 || fc6 != 1 {
+        return 6;
+    }
+
+    // 7. Custom struct implementing FnOnce directly.
+    reset_counts();
+    let f7: MyBox<dyn FnOnce() -> i32> = MyBox::new(CustomOnce { g: Guard::new(13), delta: 6 });
+    let r7 = call_boxed_once_0(f7);
+    let (dc7, ds7, fc7) = counts();
+    if r7 != 19 || dc7 != 1 || ds7 != 13 || fc7 != 1 {
+        return 7;
+    }
+
+    // 8. Nested Box<Box<dyn FnOnce() -> i32>> coerced to Box<dyn FnOnce() -> i32>.
+    reset_counts();
+    let g8 = Guard::new(21);
+    let inner: MyBox<dyn FnOnce() -> i32> = MyBox::new(move || consume_guard(g8) + 1);
+    let outer: MyBox<dyn FnOnce() -> i32> = MyBox::new(inner);
+    let r8 = call_boxed_once_0(outer);
+    let (dc8, ds8, fc8) = counts();
+    if r8 != 22 || dc8 != 1 || ds8 != 21 || fc8 != 2 {
+        return 8;
+    }
+
+    // 9. Box<dyn Fn() -> i32> upcast to Box<dyn FnOnce() -> i32> (prefix vtable).
+    reset_counts();
+    let g9 = Guard::new(29);
+    let fn_box: MyBox<dyn Fn() -> i32> = MyBox::new(move || peek_guard(&g9) + 1);
+    let once_box: MyBox<dyn FnOnce() -> i32> = fn_box;
+    let r9 = call_boxed_once_0(once_box);
+    let (dc9, ds9, fc9) = counts();
+    if r9 != 30 || dc9 != 1 || ds9 != 29 || fc9 != 1 {
+        return 9;
+    }
+
+    // 10. Box<dyn FnOnce() -> i32> dropped WITHOUT being called: Guard dropped once via dyn_glue, Box freed once.
+    reset_counts();
+    {
+        let g10 = Guard::new(37);
+        let _uncalled: MyBox<dyn FnOnce() -> i32> = MyBox::new(move || consume_guard(g10));
+    }
+    let (dc10, ds10, fc10) = counts();
+    if dc10 != 1 || ds10 != 37 || fc10 != 1 {
+        return 10;
+    }
+
+    0
+}
+";
+
+    fn walk_lazy_twice(text: &str) {
+        use blaze_emit::{Isa, Os};
+        use blaze_id::{CrateItemKey, ItemKey as LibKey};
+        use blaze_ids::Hasher;
+        use blaze_ids::producer::{CodeBuilder, ProducerId, Producers};
+        use blaze_ladder::body_ids::{BodyId, BodyIds, Read};
+        use blaze_ladder::code_records::{Builder, MemoryStore, Settings, TierName};
+        use blaze_ladder::crates::{Inputs, Toolchain, UserCrate};
+        use blaze_ladder::front2::keys::checker_of;
+        use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
+        use blaze_ladder::run::make_one::{Maker, NamesRecords, walk_records};
+        use blaze_scope::package_path::PackagePath;
+        use blaze_scope::resolve::aligned;
+        use blaze_scope::{items_record, names_record};
+        use blaze_surface::ItemKind;
+        use blaze_toolchain::ToolchainId;
+        use blaze_typeck::ItemKey;
+
+        struct SingleCrate<'a> {
+            names: &'a [u8],
+            items: &'a [u8],
+            text: &'a str,
+        }
+        impl<'a> Load<'a> for SingleCrate<'a> {
+            fn names(&self, krate: usize) -> Option<&'a [u8]> {
+                (krate == 0).then_some(self.names)
+            }
+            fn items(&self, krate: usize) -> Option<&'a [u8]> {
+                (krate == 0).then_some(self.items)
+            }
+            fn file(&self, krate: usize, path: PackagePath<'_>) -> Option<&'a str> {
+                (krate == 0 && path.as_str() == "src/main.rs").then_some(self.text)
+            }
+            fn expansion(&self, _krate: usize, _call: LibKey) -> Option<LoadedExpansion<'a>> {
+                None
+            }
+        }
+        const READS: [Read; 1] = [Read { fact: [3; 32], digest: [4; 32] }];
+        struct StrictBodyIds;
+        impl BodyIds for StrictBodyIds {
+            fn body_check(&self, item: ItemKey) -> Option<BodyId<'_>> {
+                Some(BodyId { key: Hasher::new("box dyn fnonce body").part(&item.0.to_le_bytes()[..]).finish(), reads: &READS })
+            }
+            fn today(&self, fact: &[u8; 32]) -> Option<[u8; 32]> {
+                (*fact == READS[0].fact).then_some(READS[0].digest)
+            }
+            fn crate_fact(&self, item: ItemKey) -> Option<Read> {
+                if item == blaze_build::REIFY_SHIM_ITEM || item == blaze_build::VTABLE_SHIM_ITEM {
+                    return None;
+                }
+                Some(Read { fact: [8; 32], digest: [9; 32] })
+            }
+        }
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let edition = edition::PackageEdition::of_manifest("2024").expect("2024 edition");
+        let files = [("/ladder/src/main.rs".into(), text.into())];
+        let user = UserCrate { name: "ladder", dir: "/ladder/", root: "/ladder/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let tc = Toolchain::none(alloc);
+        let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("inputs: {e}"));
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
+        let c = &names.crates()[0];
+        let names_bytes = aligned(&names_record::encode(c, alloc).expect("names record"), blaze_own::testing::bump());
+        let items_bytes = aligned(&items_record::encode_with(c, &names, alloc).expect("items record"), blaze_own::testing::bump());
+        let keys_slice: [CrateItemKey; 1] = [c.key];
+        let crate_names: [&str; 1] = ["ladder"];
+        let lang_crates: [usize; 1] = [0];
+        let producer: ProducerId<CodeBuilder> = Producers::for_tests(b"box dyn fnonce").get::<CodeBuilder>();
+        let builder = Builder {
+            isa: Isa { lse: true, os: Os::MacOs },
+            tier: TierName::Reference,
+            settings: Settings::baseline(blaze_build::OverflowChecks::Off, blaze_build::Panic::Unwind),
+            toolchain: ToolchainId([7; 32]),
+            producer,
+            edition,
+        };
+        let mut store = MemoryStore::new_in(alloc);
+
+        let frame1 = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame1");
+        let log1 = frame1.alloc(Log::new(&crate_names, alloc));
+        let load1 = frame1.alloc(SingleCrate { names: names_bytes, items: items_bytes, text });
+        let rec1 = frame1.alloc(Records::new(&keys_slice, load1, log1, &frame1, alloc));
+        let mut main_key = None;
+        assert!(rec1.each_item(0, &mut |key, _| if main_key.is_none() && rec1.kind_of_item(key) == Some(ItemKind::Function) && rec1.name_of(key) == Some("main") {
+            main_key = Some(checker_of(key));
+        }));
+        let main = main_key.expect("main fn");
+        let nr1 = NamesRecords { records: rec1, frame: &frame1, lang_crates: &lang_crates, body_sources: None };
+        let mut maker1 = Maker::new(nr1, Some(main), &builder, alloc);
+        let (_, counts1) = walk_records(main, &StrictBodyIds, &mut store, &builder, &producer, &mut maker1, alloc)
+            .unwrap_or_else(|e| panic!("first lazy walk refused: {e}"));
+        assert!(counts1.made > 0, "first walk must build entries");
+
+        let frame2 = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame2");
+        let log2 = frame2.alloc(Log::new(&crate_names, alloc));
+        let load2 = frame2.alloc(SingleCrate { names: names_bytes, items: items_bytes, text });
+        let rec2 = frame2.alloc(Records::new(&keys_slice, load2, log2, &frame2, alloc));
+        let nr2 = NamesRecords { records: rec2, frame: &frame2, lang_crates: &lang_crates, body_sources: None };
+        let mut maker2 = Maker::new(nr2, Some(main), &builder, alloc);
+        let (_, counts2) = walk_records(main, &StrictBodyIds, &mut store, &builder, &producer, &mut maker2, alloc)
+            .unwrap_or_else(|e| panic!("second lazy walk refused: {e}"));
+        assert_eq!(counts2.made, 0, "second walk must reuse all cached entries including VTableShims: {counts2}");
+    }
+
+    #[test]
+    fn box_dyn_fnonce_no_core_closures_shims_upcasts_and_drop_counts() {
+        walk_lazy_twice(NO_CORE_PROGRAM);
+        #[cfg(target_arch = "aarch64")]
+        {
+            let files = [SourceFile { path: "src/main.rs", text: NO_CORE_PROGRAM }];
+            let status = run_with(&files, "src/main.rs", None, FrontChoice::New(NEW_NO_CORE), blaze_own::testing::heap().shared())
+                .unwrap_or_else(|e| panic!("box_dyn_fnonce no_core run refused: {e}"));
+            assert_eq!(status, 0, "all 10 Box<dyn FnOnce> cases must pass, failed at step {status}");
+        }
+    }
+
+    const STD_PROGRAM: &str = "
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct DropFlag {
+    drops: Arc<AtomicUsize>,
+    tag: i32,
+}
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn read_tag(flag: &DropFlag) -> i32 {
+    flag.tag
+}
+
+fn main() {
+    // 1. Box<dyn FnOnce() -> i32> moving a String, Vec, and DropFlag.
+    let d1 = Arc::new(AtomicUsize::new(0));
+    let flag1 = DropFlag { drops: Arc::clone(&d1), tag: 10 };
+    let text = String::from(\"hello-box-dyn-fnonce\");
+    let nums = vec![1i32, 2, 3, 4];
+    let f1: Box<dyn FnOnce() -> i32> = Box::new(move || {
+        let len = text.len() as i32;
+        let sum: i32 = nums.into_iter().sum();
+        let tag = flag1.tag;
+        drop(flag1);
+        len + sum + tag
+    });
+    assert_eq!(f1(), 40);
+    assert_eq!(d1.load(Ordering::SeqCst), 1);
+
+    // 2. Box<dyn FnOnce(i32, i32) -> i32> with multiple arguments.
+    let d2 = Arc::new(AtomicUsize::new(0));
+    let flag2 = DropFlag { drops: Arc::clone(&d2), tag: 5 };
+    let s2 = String::from(\"abc\");
+    let f2: Box<dyn FnOnce(i32, i32) -> i32> = Box::new(move |a: i32, b: i32| {
+        let out = read_tag(&flag2) * 100 + a * 10 + b + s2.len() as i32;
+        drop(s2);
+        out
+    });
+    assert_eq!(f2(2, 3), 526);
+    assert_eq!(d2.load(Ordering::SeqCst), 1);
+
+    // 3. Dropped without calling: DropFlag dropped once.
+    let d3 = Arc::new(AtomicUsize::new(0));
+    {
+        let flag3 = DropFlag { drops: Arc::clone(&d3), tag: 7 };
+        let _uncalled: Box<dyn FnOnce() -> i32> = Box::new(move || read_tag(&flag3));
+    }
+    assert_eq!(d3.load(Ordering::SeqCst), 1);
+
+    // 4. Unwind safety: panicking FnOnce closure drops captured DropFlag exactly once (no double-drop, no leak).
+    let d4 = Arc::new(AtomicUsize::new(0));
+    let flag4 = DropFlag { drops: Arc::clone(&d4), tag: 9 };
+    let s4 = String::from(\"boom\");
+    let f4: Box<dyn FnOnce() -> i32> = Box::new(move || {
+        let _moved_s = s4;
+        let _moved_f = flag4;
+        panic!(\"expected panic inside Box<dyn FnOnce>\");
+    });
+    let res4 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f4));
+    assert!(res4.is_err());
+    assert_eq!(d4.load(Ordering::SeqCst), 1);
+
+    // 5. Unwind safety for an Fn closure inside Box<dyn FnOnce> (`run_entry` unwind path).
+    let d5 = Arc::new(AtomicUsize::new(0));
+    let flag5 = DropFlag { drops: Arc::clone(&d5), tag: 12 };
+    let f5: Box<dyn FnOnce() -> i32> = Box::new(move || {
+        let tag = read_tag(&flag5);
+        if tag == 12 {
+            panic!(\"expected panic inside Fn-as-Box<dyn FnOnce>\");
+        }
+        tag
+    });
+    let res5 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f5));
+    assert!(res5.is_err());
+    assert_eq!(d5.load(Ordering::SeqCst), 1);
+
+    // 6. std::thread::spawn calling Box<dyn FnOnce() -> i32 + Send>.
+    let d6 = Arc::new(AtomicUsize::new(0));
+    let flag6 = DropFlag { drops: Arc::clone(&d6), tag: 33 };
+    let msg = String::from(\"from-thread\");
+    let job: Box<dyn FnOnce() -> i32 + Send> = Box::new(move || {
+        let n = msg.len() as i32;
+        let t = flag6.tag;
+        drop(flag6);
+        n + t
+    });
+    let handle = std::thread::spawn(job);
+    let joined = handle.join().expect(\"spawned thread panicked\");
+    assert_eq!(joined, 44);
+    assert_eq!(d6.load(Ordering::SeqCst), 1);
+}
+";
+
+    #[test]
+    fn box_dyn_fnonce_real_std_drop_multi_arg_unwind_and_thread_spawn() {
+        use blaze_ladder::crates::{DirShelf, Inputs, Toolchain};
+        use blaze_ladder::program_texts::ProgramTexts;
+        use blaze_ladder::run::build_stubbed;
+
+        let home = std::env::var("HOME").expect("HOME is set");
+        let shelf = format!("{home}/.blaze/v2/toolchain");
+        let tc = Toolchain::open(&mut DirShelf::new(shelf.clone()))
+            .unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+        let new = NewFront {
+            package: "box_dyn_fnonce_std",
+            edition: "2024",
+            shelf: Some(&shelf),
+            overflow: blaze_build::OverflowChecks::Off,
+        };
+        let files = [SourceFile { path: "src/main.rs", text: STD_PROGRAM }];
+        let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind)
+            .unwrap_or_else(|e| panic!("texts: {e}"));
+        let user = texts.user();
+        let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("inputs: {e}"));
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
+        let built = build_stubbed(&names, &files, &texts, blaze_own::testing::heap().alloc())
+            .unwrap_or_else(|e| panic!("real-std Box<dyn FnOnce> build_stubbed refused: {e}"));
+        assert!(built.reached() > 0, "expected reached instances");
+        for r in built.refused() {
+            let msg = format!("{r}");
+            assert!(
+                !msg.contains("call_once")
+                    && !msg.contains("trait object")
+                    && !msg.contains("vts1")
+                    && !msg.contains("boxed::")
+                    && !msg.contains("thread::"),
+                "unexpected refusal in Box<dyn FnOnce> / std::thread::spawn build: {msg}"
+            );
+        }
+    }
 }

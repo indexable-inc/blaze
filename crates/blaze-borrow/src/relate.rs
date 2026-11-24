@@ -345,7 +345,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 Ok(RegAt::Known(Reg::Slot(slot)))
             }
             Slots::Sig { col, env } | Slots::CallerEnv { col, env } => {
-                let r = *col.get(k as usize).ok_or(self.malformed(s.ty, Bad::StepBound))?;
+                let r = *usize::try_from(k).ok().and_then(|i| col.get(i)).ok_or(self.malformed(s.ty, Bad::StepBound))?;
                 self.envs.reg(env, r).map_err(|w| self.malformed(s.ty, w))
             }
         }
@@ -1928,7 +1928,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         seed_self: Side<'c>,
         seed_trait: Side<'c>,
         seed_has_self: bool,
-        want_tr: ItemKey,
+        _want_tr: ItemKey,
         subject: Side<'c>,
         trait_ref: Side<'c>,
         has_subject: bool,
@@ -1936,35 +1936,59 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         visited: &mut [ItemKey; 16],
         vlen: &mut usize,
     ) -> Result<bool, Refused> {
-        if depth >= 8 || *vlen >= 16 || visited[..*vlen].contains(&seed_tr) {
-            return Ok(false);
+        let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; 64] = [None; 64];
+        let mut sp = 0usize;
+        if let Some(slot) = stack.get_mut(sp) {
+            *slot = Some((seed_tr, seed_self, seed_trait, seed_has_self, depth));
+            sp += 1;
         }
-        visited[*vlen] = seed_tr;
-        *vlen += 1;
-        let Some((tenv, views)) = self.trait_env_from_seed(seed_tr, seed_self, seed_trait, seed_has_self)? else {
-            return Ok(false);
-        };
-        for allow_alias in [false, true] {
-            for cv in views {
-                let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
-                if self.match_trait_clause(c, subject, trait_ref, has_subject, allow_alias)? {
-                    return Ok(true);
+        while sp > 0 {
+            sp -= 1;
+            let Some((cur_tr, cur_self, cur_trait, cur_has_self, cur_depth)) = stack.get_mut(sp).and_then(Option::take) else {
+                continue;
+            };
+            if cur_depth >= 8 || *vlen >= 16 || visited.iter().take(*vlen).any(|&k| k == cur_tr) {
+                continue;
+            }
+            if let Some(slot) = visited.get_mut(*vlen) {
+                *slot = cur_tr;
+                *vlen += 1;
+            } else {
+                continue;
+            }
+            let Some((tenv, views)) = self.trait_env_from_seed(cur_tr, cur_self, cur_trait, cur_has_self)? else {
+                continue;
+            };
+            for allow_alias in [false, true] {
+                for cv in views {
+                    let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
+                    if self.match_trait_clause(c, subject, trait_ref, has_subject, allow_alias)? {
+                        return Ok(true);
+                    }
                 }
             }
-        }
-        for cv in views {
-            let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
-            if let Ok(PNode::ExTrait(ct, _)) = self.node(c)
-                && self.fits(c).is_ok()
-                && let Ok(c_own) = self.own(c)
-                && let Ok(ckids) = self.kids_of(c)
-                && ckids.len() > 0
-                && let Some((_, crest)) = c.slots.split(c_own)
-                && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
-                && self.erased_sides(c_self, subject)
-                && self.elaborate_for_trait(ct, c_self, c, true, want_tr, subject, trait_ref, has_subject, depth + 1, visited, vlen)?
-            {
-                return Ok(true);
+            let next_depth = cur_depth + 1;
+            if next_depth < 8 {
+                let start = sp;
+                for cv in views {
+                    let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
+                    if let Ok(PNode::ExTrait(ct, _)) = self.node(c)
+                        && self.fits(c).is_ok()
+                        && let Ok(c_own) = self.own(c)
+                        && let Ok(ckids) = self.kids_of(c)
+                        && ckids.len() > 0
+                        && let Some((_, crest)) = c.slots.split(c_own)
+                        && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
+                        && self.erased_sides(c_self, subject)
+                        && let Some(slot) = stack.get_mut(sp)
+                    {
+                        *slot = Some((ct, c_self, c, true, next_depth));
+                        sp += 1;
+                    }
+                }
+                if let Some(pushed) = stack.get_mut(start..sp) {
+                    pushed.reverse();
+                }
             }
         }
         Ok(false)
@@ -1986,35 +2010,59 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         visited: &mut [ItemKey; 16],
         vlen: &mut usize,
     ) -> Result<Option<Side<'c>>, Refused> {
-        if depth >= 8 || *vlen >= 16 || visited[..*vlen].contains(&seed_tr) {
-            return Ok(None);
+        let mut stack: [Option<(ItemKey, Side<'c>, Side<'c>, bool, u32)>; 64] = [None; 64];
+        let mut sp = 0usize;
+        if let Some(slot) = stack.get_mut(sp) {
+            *slot = Some((seed_tr, seed_self, seed_trait, seed_has_self, depth));
+            sp += 1;
         }
-        visited[*vlen] = seed_tr;
-        *vlen += 1;
-        let Some((tenv, views)) = self.trait_env_from_seed(seed_tr, seed_self, seed_trait, seed_has_self)? else {
-            return Ok(None);
-        };
-        for allow_alias in [false, true] {
-            for cv in views {
-                let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
-                if let Some(term) = self.match_proj_clause(c, want, want_arg_count, want_tr, want_name, allow_alias)? {
-                    return Ok(Some(term));
+        while sp > 0 {
+            sp -= 1;
+            let Some((cur_tr, cur_self, cur_trait, cur_has_self, cur_depth)) = stack.get_mut(sp).and_then(Option::take) else {
+                continue;
+            };
+            if cur_depth >= 8 || *vlen >= 16 || visited.iter().take(*vlen).any(|&k| k == cur_tr) {
+                continue;
+            }
+            if let Some(slot) = visited.get_mut(*vlen) {
+                *slot = cur_tr;
+                *vlen += 1;
+            } else {
+                continue;
+            }
+            let Some((tenv, views)) = self.trait_env_from_seed(cur_tr, cur_self, cur_trait, cur_has_self)? else {
+                continue;
+            };
+            for allow_alias in [false, true] {
+                for cv in views {
+                    let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
+                    if let Some(term) = self.match_proj_clause(c, want, want_arg_count, want_tr, want_name, allow_alias)? {
+                        return Ok(Some(term));
+                    }
                 }
             }
-        }
-        for cv in views {
-            let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
-            if let Ok(PNode::ExTrait(ct, _)) = self.node(c)
-                && self.fits(c).is_ok()
-                && let Ok(c_own) = self.own(c)
-                && let Ok(ckids) = self.kids_of(c)
-                && ckids.len() > 0
-                && let Some((_, crest)) = c.slots.split(c_own)
-                && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
-                && self.erased_sides(c_self, subject)
-                && let Some(term) = self.elaborate_for_proj(ct, c_self, c, true, want, want_arg_count, subject, want_tr, want_name, depth + 1, visited, vlen)?
-            {
-                return Ok(Some(term));
+            let next_depth = cur_depth + 1;
+            if next_depth < 8 {
+                let start = sp;
+                for cv in views {
+                    let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: tenv } };
+                    if let Ok(PNode::ExTrait(ct, _)) = self.node(c)
+                        && self.fits(c).is_ok()
+                        && let Ok(c_own) = self.own(c)
+                        && let Ok(ckids) = self.kids_of(c)
+                        && ckids.len() > 0
+                        && let Some((_, crest)) = c.slots.split(c_own)
+                        && let Ok((c_self, _)) = self.kid(c, &ckids, crest, 0)
+                        && self.erased_sides(c_self, subject)
+                        && let Some(slot) = stack.get_mut(sp)
+                    {
+                        *slot = Some((ct, c_self, c, true, next_depth));
+                        sp += 1;
+                    }
+                }
+                if let Some(pushed) = stack.get_mut(start..sp) {
+                    pushed.reverse();
+                }
             }
         }
         Ok(None)

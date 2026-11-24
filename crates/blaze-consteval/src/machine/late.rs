@@ -167,7 +167,7 @@ pub(super) fn waited(lates: &[Late]) -> impl Iterator<Item = Wait> + '_ {
     })
 }
 
-impl<A: Allocator + Clone> Codes<A> {
+impl<A: Allocator + Copy> Codes<A> {
     /// How many times the body of `item` was compiled, over every instance of it in the table:
     /// the tests' counter of recompiles.
     pub(crate) fn compiles(&self, item: ItemKey) -> u32 {
@@ -180,7 +180,7 @@ impl<A: Allocator + Clone> Codes<A> {
     }
 }
 
-impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
+impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
     /// Charges a recompile of `item`'s body (`ops` operations) to the evaluation's step bound;
     /// past it, the refusal names the body recompiled.
     pub(super) fn charge_recompile(&mut self, item: ItemKey, ops: usize) -> R<'a, ()> {

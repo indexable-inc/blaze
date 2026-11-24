@@ -1508,4 +1508,207 @@ mod std_readiness_tests {
         assert_eq!(rows.row(2).action, Action::Continue);
         assert_eq!(rows.row(2).landing, 0);
     }
+
+    /// Regression test for the `block_buffer::BlockBuffer::len128_padding_be` SIGSEGV on macOS:
+    /// Apple ARM64 passes a `u128`/`i128` after an odd number of GPR parameters in `x1:x2` (not
+    /// rounded up to even `x2:x3` as generic AAPCS64 C.8 does), leaving the following parameter in
+    /// `x3`. `Sota` and `Reference` must agree with each other and with host `extern "C"` on both
+    /// macOS and Linux, including cross-tier calls and stacked overflow past `x7`.
+    #[test]
+    fn sota_i128_odd_register_abi_matches_host_and_reference() {
+        let alloc = test_alloc();
+
+        // Shape of `BlockBuffer::len128_padding_be(&mut self, data_len: u128, compress: Ptr)`:
+        // loads `*self_ptr` (x0) and `*closure_ptr` (x3 on macOS, x4 on Linux), folds them into
+        // `data_len` (x1:x2 on macOS, x2:x3 on Linux), and returns the `u128`.
+        let callee_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I128), Param::of(Ty::PTR)],
+                &[Param::of(Ty::I128)],
+            );
+            b.set_signature(sig);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let p0 = b.param(Ty::PTR);
+            let wide = b.param(Ty::I128);
+            let p2 = b.param(Ty::PTR);
+            let v0 = b.load(Ty::I64, Flags::NONE, p0, 0, MemAttrs::default());
+            let v2 = b.load(Ty::I64, Flags::NONE, p2, 0, MemAttrs::default());
+            let z0 = b.convert(Op::Zext, Flags::NONE, Ty::I128, v0);
+            let z2 = b.convert(Op::Zext, Flags::NONE, Ty::I128, v2);
+            let s1 = b.binary(Op::Add, Flags::NONE, wide, z0);
+            let s2 = b.binary(Op::Xor, Flags::NONE, s1, z2);
+            b.ret(&[s2]);
+            b.finish_checked().unwrap()
+        };
+
+        let a_word: u64 = 0x1122_3344_5566_7788;
+        let b_word: u64 = 0x99aa_bbcc_ddee_ff01;
+        let wide_val: u128 = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
+        let want: u128 = wide_val.wrapping_add(u128::from(a_word)) ^ u128::from(b_word);
+
+        // 1. Host `extern "C"` -> Sota callee directly on macOS arm64.
+        let sota_callee_em = Sota::standalone()
+            .emit(verify(callee_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits (ptr, i128, ptr) -> i128");
+        let (sota_callee_ex, _ks1) = load_exec_with_syms(sota_callee_em, &[]);
+        let sota_callee_addr = unsafe { sota_callee_ex.as_fn::<extern "C" fn()>() as usize as u64 };
+        let f_sota: extern "C" fn(*const u64, u128, *const u64) -> u128 = unsafe { sota_callee_ex.as_fn() };
+        assert_eq!(f_sota(&a_word, wide_val, &b_word), want, "host -> Sota (ptr, u128, ptr) mismatch");
+
+        // 2. Reference callee -> host `extern "C"`.
+        let ref_callee_em = Reference
+            .emit(verify(callee_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Reference emits (ptr, i128, ptr) -> i128");
+        let (ref_callee_ex, _ks2) = load_exec_with_syms(ref_callee_em, &[]);
+        let ref_callee_addr = unsafe { ref_callee_ex.as_fn::<extern "C" fn()>() as usize as u64 };
+
+        // Caller that invokes the target via `(ptr, i128, ptr) -> i128`.
+        let sym = Symbol::of_name("odd_i128_callee");
+        struct OneName(Symbol);
+        impl Names for OneName {
+            fn name(&self, of: Outside) -> Option<blaze_tier::Named<'_>> {
+                match of {
+                    Outside::Func(0) => Some(blaze_tier::Named::Symbol(self.0)),
+                    _ => None,
+                }
+            }
+            fn routines(&self) -> RoutinePlaces {
+                RoutinePlaces::NONE
+            }
+        }
+        let caller_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I128), Param::of(Ty::PTR)],
+                &[Param::of(Ty::I128)],
+            );
+            b.set_signature(sig);
+            let target = b.reference(RefKind::Func, 0);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let p0 = b.param(Ty::PTR);
+            let w = b.param(Ty::I128);
+            let p2 = b.param(Ty::PTR);
+            let res = b.call(Flags::NONE, target, sig, &[p0, w, p2]);
+            b.ret(&[res]);
+            b.finish_checked().unwrap()
+        };
+
+        // 3. Cross-tier: Reference caller -> Sota callee (exact `finalize_variable_core` -> `len128_padding_be` crash).
+        let ref_caller_em = Reference
+            .emit(verify(caller_fn.view()).unwrap(), &OneName(sym), MAC_ARM64, alloc)
+            .expect("Reference emits caller");
+        let (ref_caller_ex, _ks3) = load_exec_with_syms(ref_caller_em, &[(sym, sota_callee_addr)]);
+        let f_ref_to_sota: extern "C" fn(*const u64, u128, *const u64) -> u128 = unsafe { ref_caller_ex.as_fn() };
+        assert_eq!(f_ref_to_sota(&a_word, wide_val, &b_word), want, "Reference -> Sota cross-tier mismatch");
+
+        // 4. Cross-tier: Sota caller -> Reference callee.
+        let sota_caller_em = Sota::standalone()
+            .emit(verify(caller_fn.view()).unwrap(), &OneName(sym), MAC_ARM64, alloc)
+            .expect("Sota emits caller");
+        let (sota_caller_ex, _ks4) = load_exec_with_syms(sota_caller_em, &[(sym, ref_callee_addr)]);
+        let f_sota_to_ref: extern "C" fn(*const u64, u128, *const u64) -> u128 = unsafe { sota_caller_ex.as_fn() };
+        assert_eq!(f_sota_to_ref(&a_word, wide_val, &b_word), want, "Sota -> Reference cross-tier mismatch");
+
+        // 5. Stacked `i128` after 7 GPRs (`x0..x6`), plus trailing `u64` (AAPCS64 C.11: both stacked).
+        let stacked_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let params = [
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I128),
+                Param::of(Ty::I64),
+            ];
+            let sig = b.sig(Conv::C, Variadic::No, &params, &[Param::of(Ty::I128)]);
+            b.set_signature(sig);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let mut gprs = Vec::new_in(alloc);
+            for _ in 0..7 {
+                gprs.push(b.param(Ty::I64));
+            }
+            let w = b.param(Ty::I128);
+            let tail = b.param(Ty::I64);
+            let mut sum = gprs[0];
+            for &p in &gprs[1..] {
+                sum = b.binary(Op::Add, Flags::NONE, sum, p);
+            }
+            let sum = b.binary(Op::Add, Flags::NONE, sum, tail);
+            let z = b.convert(Op::Zext, Flags::NONE, Ty::I128, sum);
+            let out = b.binary(Op::Add, Flags::NONE, w, z);
+            b.ret(&[out]);
+            b.finish_checked().unwrap()
+        };
+        let stacked_em = Sota::standalone()
+            .emit(verify(stacked_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits stacked i128 after 7 GPRs");
+        let (stacked_ex, _ks5) = load_exec_with_syms(stacked_em, &[]);
+        let f_stacked: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u128, u64) -> u128 =
+            unsafe { stacked_ex.as_fn() };
+        assert_eq!(
+            f_stacked(1, 2, 3, 4, 5, 6, 7, wide_val, 100),
+            wide_val.wrapping_add(1 + 2 + 3 + 4 + 5 + 6 + 7 + 100),
+            "host -> Sota stacked i128 after 7 GPRs mismatch"
+        );
+
+        // 6. `Op::Invoke` returning `Ty::I128` must be emitted directly by Sota without refusal.
+        let invoke_i128_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I128), Param::of(Ty::PTR)],
+                &[Param::of(Ty::I128)],
+            );
+            b.set_signature(sig);
+            let target = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            let normal = b.create_block(BlockKind::Normal);
+            let pad = b.create_block(BlockKind::Cleanup);
+            b.begin(entry);
+            let p0 = b.param(Ty::PTR);
+            let w = b.param(Ty::I128);
+            let p2 = b.param(Ty::PTR);
+            let res = b.invoke(Flags::NONE, target, sig, &[p0, w, p2], normal, pad);
+            b.begin(normal);
+            b.ret(&[res]);
+            b.begin(pad);
+            let ex = b.param(Ty::PTR);
+            b.resume(ex);
+            b.finish_checked().unwrap()
+        };
+        let inv_em = Sota::standalone()
+            .emit(verify(invoke_i128_fn.view()).unwrap(), &OneName(sym), MAC_ARM64, alloc)
+            .expect("Sota must emit Op::Invoke returning Ty::I128");
+        let unwind_sym = Symbol::of_name("_Unwind_Resume");
+        let (inv_ex, _ks6) = load_exec_with_syms(inv_em, &[(sym, sota_callee_addr), (unwind_sym, sota_callee_addr)]);
+        let f_inv: extern "C" fn(*const u64, u128, *const u64) -> u128 = unsafe { inv_ex.as_fn() };
+        assert_eq!(f_inv(&a_word, wide_val, &b_word), want, "Sota Invoke returning i128 mismatch");
+
+        // 7. Linux AAPCS64 C.8 still aligns `i128` to an even register pair (`x2:x3`) and places
+        //    the following pointer in `x4`, whereas macOS uses `x1:x2` and `x3`.
+        let linux_arm64 = Machine { arch: Arch::Arm64, os: Os::Linux, features: 0 };
+        let sota_linux = Sota::standalone()
+            .emit(verify(callee_fn.view()).unwrap(), &NoNames, linux_arm64, alloc)
+            .expect("Sota emits Linux (ptr, i128, ptr) -> i128");
+        let sota_mac = Sota::standalone()
+            .emit(verify(callee_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits macOS (ptr, i128, ptr) -> i128");
+        assert_ne!(
+            sota_linux.code.as_slice(),
+            sota_mac.code.as_slice(),
+            "Linux AAPCS64 (even pair x2:x3, ptr in x4) and macOS (unaligned pair x1:x2, ptr in x3) must emit distinct register placements"
+        );
+    }
 }

@@ -1448,29 +1448,123 @@ struct Transform2D {
     y: f32,
     active: bool,
 }
-super::reflect_struct!(Transform2D { x: f32, y: f32, active: bool });
+
+impl<A: core::alloc::Allocator + Copy> blaze_data::ToValue<A> for Transform2D {
+    fn to_value(&self, alloc: A) -> blaze_data::Value<A> {
+        let mut m = blaze_data::Map::new_in(alloc);
+        let _ = m.insert(blaze_own::String::from_str_in("x", alloc), blaze_data::ToValue::to_value(&self.x, alloc));
+        let _ = m.insert(blaze_own::String::from_str_in("y", alloc), blaze_data::ToValue::to_value(&self.y, alloc));
+        let _ = m.insert(blaze_own::String::from_str_in("active", alloc), blaze_data::ToValue::to_value(&self.active, alloc));
+        blaze_data::Value::Map(m)
+    }
+}
+
+impl<A: core::alloc::Allocator + Copy> blaze_data::FromValue<A> for Transform2D {
+    fn from_value(c: &blaze_data::Cursor<'_, '_, A>) -> Result<Self, blaze_data::ShapeError<A>> {
+        c.fields(|f| {
+            Ok(Self {
+                x: <f32 as super::ReflectComponent>::reflect_from_cursor(&f.cursor("x")?)?,
+                y: <f32 as super::ReflectComponent>::reflect_from_cursor(&f.cursor("y")?)?,
+                active: <bool as super::ReflectComponent>::reflect_from_cursor(&f.cursor("active")?)?,
+            })
+        })
+    }
+}
+
+impl super::ReflectComponent for Transform2D {
+    fn reflect_to_value<A: core::alloc::Allocator + Copy>(&self, alloc: A) -> Result<blaze_data::Value<A>, super::ReflectError> {
+        let mut m = blaze_data::Map::new_in(alloc);
+        let _ = m.insert(blaze_own::String::try_from_str_in("x", alloc)?, self.x.reflect_to_value(alloc)?);
+        let _ = m.insert(blaze_own::String::try_from_str_in("y", alloc)?, self.y.reflect_to_value(alloc)?);
+        let _ = m.insert(blaze_own::String::try_from_str_in("active", alloc)?, self.active.reflect_to_value(alloc)?);
+        Ok(blaze_data::Value::Map(m))
+    }
+    fn reflect_from_cursor<A: core::alloc::Allocator + Copy>(c: &blaze_data::Cursor<'_, '_, A>) -> Result<Self, blaze_data::ShapeError<A>> {
+        <Self as blaze_data::FromValue<A>>::from_value(c)
+    }
+    fn schema<A: core::alloc::Allocator + Copy>(alloc: A) -> Result<blaze_data::Value<A>, blaze_own::AllocFailure> {
+        super::reflect::struct_schema("Transform2D", &[("x", "f32"), ("y", "f32"), ("active", "bool")], alloc)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Velocity2D {
     vx: i32,
     vy: i32,
 }
-super::reflect_struct!(Velocity2D { vx: i32, vy: i32 });
+
+impl<A: core::alloc::Allocator + Copy> blaze_data::ToValue<A> for Velocity2D {
+    fn to_value(&self, alloc: A) -> blaze_data::Value<A> {
+        let mut m = blaze_data::Map::new_in(alloc);
+        let _ = m.insert(blaze_own::String::from_str_in("vx", alloc), blaze_data::ToValue::to_value(&self.vx, alloc));
+        let _ = m.insert(blaze_own::String::from_str_in("vy", alloc), blaze_data::ToValue::to_value(&self.vy, alloc));
+        blaze_data::Value::Map(m)
+    }
+}
+
+impl<A: core::alloc::Allocator + Copy> blaze_data::FromValue<A> for Velocity2D {
+    fn from_value(c: &blaze_data::Cursor<'_, '_, A>) -> Result<Self, blaze_data::ShapeError<A>> {
+        c.fields(|f| {
+            Ok(Self {
+                vx: <i32 as super::ReflectComponent>::reflect_from_cursor(&f.cursor("vx")?)?,
+                vy: <i32 as super::ReflectComponent>::reflect_from_cursor(&f.cursor("vy")?)?,
+            })
+        })
+    }
+}
+
+impl super::ReflectComponent for Velocity2D {
+    fn reflect_to_value<A: core::alloc::Allocator + Copy>(&self, alloc: A) -> Result<blaze_data::Value<A>, super::ReflectError> {
+        let mut m = blaze_data::Map::new_in(alloc);
+        let _ = m.insert(blaze_own::String::try_from_str_in("vx", alloc)?, self.vx.reflect_to_value(alloc)?);
+        let _ = m.insert(blaze_own::String::try_from_str_in("vy", alloc)?, self.vy.reflect_to_value(alloc)?);
+        Ok(blaze_data::Value::Map(m))
+    }
+    fn reflect_from_cursor<A: core::alloc::Allocator + Copy>(c: &blaze_data::Cursor<'_, '_, A>) -> Result<Self, blaze_data::ShapeError<A>> {
+        <Self as blaze_data::FromValue<A>>::from_value(c)
+    }
+    fn schema<A: core::alloc::Allocator + Copy>(alloc: A) -> Result<blaze_data::Value<A>, blaze_own::AllocFailure> {
+        super::reflect::struct_schema("Velocity2D", &[("vx", "i32"), ("vy", "i32")], alloc)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Score(u32);
-super::reflect_struct!(Score(u32));
+
+impl<A: core::alloc::Allocator + Copy> blaze_data::ToValue<A> for Score {
+    fn to_value(&self, alloc: A) -> blaze_data::Value<A> {
+        blaze_data::ToValue::to_value(&self.0, alloc)
+    }
+}
+
+impl<A: core::alloc::Allocator + Copy> blaze_data::FromValue<A> for Score {
+    fn from_value(c: &blaze_data::Cursor<'_, '_, A>) -> Result<Self, blaze_data::ShapeError<A>> {
+        Ok(Self(<u32 as super::ReflectComponent>::reflect_from_cursor(c)?))
+    }
+}
+
+impl super::ReflectComponent for Score {
+    fn reflect_to_value<A: core::alloc::Allocator + Copy>(&self, alloc: A) -> Result<blaze_data::Value<A>, super::ReflectError> {
+        self.0.reflect_to_value(alloc)
+    }
+    fn reflect_from_cursor<A: core::alloc::Allocator + Copy>(c: &blaze_data::Cursor<'_, '_, A>) -> Result<Self, blaze_data::ShapeError<A>> {
+        <Self as blaze_data::FromValue<A>>::from_value(c)
+    }
+    fn schema<A: core::alloc::Allocator + Copy>(alloc: A) -> Result<blaze_data::Value<A>, blaze_own::AllocFailure> {
+        super::reflect::newtype_schema("Score", "u32", alloc)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct OpaqueSecret(u64);
 
-fn parse_json_body(body: &[u8]) -> crate::data::Value<Alloc<'static>> {
-    crate::json::read_in(body, crate::json::Limits::SHIPPED, alloc()).expect("valid json body")
+fn parse_json_body(body: &[u8]) -> blaze_data::Value<Alloc<'static>> {
+    blaze_json::read_in(body, blaze_json::Limits::SHIPPED, alloc()).expect("valid json body")
 }
 
 #[test]
 fn reflect_struct_to_from_value_schema_and_partial_patch() {
-    use crate::data::{Cursor, FromValue, ToValue};
+    use blaze_data::{Cursor, FromValue, ToValue};
     use super::{ReflectComponent, ReflectError};
 
     let a = alloc();
@@ -1834,7 +1928,7 @@ fn explorer_api_all_endpoints_and_error_cases() {
     assert_eq!(res_tab.status, 200);
     assert_eq!(res_tab.content_type, "text/plain; charset=utf-8");
     let tab_parsed =
-        crate::tab::read(res_tab.body.as_slice(), crate::tab::Limits::SHIPPED, a).expect("parse tab");
+        blaze_tab::read(res_tab.body.as_slice(), blaze_tab::Limits::SHIPPED, a).expect("parse tab");
     assert_eq!(tab_parsed, world_json);
 
     // 10. DELETE /api/entity/<root_slot> cascades to Drone1 and SubDrone!
@@ -1904,4 +1998,56 @@ fn explorer_http_1_1_wire_framing_round_trip() {
     let bad_resp = handle_http_request(&mut w, b"NOT_HTTP", a).expect("bad http");
     let bad_str = core::str::from_utf8(bad_resp.as_slice()).expect("utf8 bad");
     assert!(bad_str.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+}
+
+
+#[test]
+fn ui_relational_ecs_app_renders_compact_icons_and_packs_webgpu_buffers() {
+    use super::explorer::{handle_request, handle_request_with_wasm};
+    use super::ui::ExplorerApp;
+
+    let mut srv = World::new_in(alloc()).expect("world");
+    let prefab = srv.spawn_named("Spaceship").expect("prefab");
+    srv.add_tag(prefab, srv.builtins().prefab).expect("tag prefab");
+    srv.set_reflected_copy(prefab, Transform2D { x: 10.0, y: 20.0, active: true }).expect("t");
+
+    let parent = srv.spawn_named("FleetAlpha").expect("parent");
+    let ship = srv.spawn_named("Flagship_Apollo").expect("ship");
+    srv.add_pair(ship, srv.builtins().child_of, parent).expect("child_of");
+    srv.add_pair(ship, srv.builtins().is_a, prefab).expect("is_a");
+    let friendly = srv.spawn_named("Friendly").expect("tag");
+    srv.add_tag(ship, friendly).expect("add tag");
+    srv.set_reflected_copy(ship, Transform2D { x: 42.5, y: 18.0, active: true }).expect("t");
+
+    // Verify /explorer.wasm endpoint serves application/wasm bytes.
+    let wasm_res = handle_request_with_wasm(&mut srv, "GET", "/explorer.wasm", b"", Some(b"\0asm"), alloc()).expect("wasm");
+    assert_eq!(wasm_res.status, 200);
+    assert_eq!(wasm_res.content_type, "application/wasm");
+    assert_eq!(wasm_res.body.as_slice(), b"\0asm");
+
+    // Fetch /api/world JSON and load it into the client-side relational ECS ExplorerApp.
+    let world_res = handle_request(&mut srv, "GET", "/api/world", b"", alloc()).expect("world json");
+    assert_eq!(world_res.status, 200);
+
+    let mut app = ExplorerApp::new_in(alloc()).expect("app");
+    assert!(app.load_world_json(world_res.body.as_slice()));
+    assert!(app.mirrored_entity_count() >= 3);
+
+    // Compact sidebar & inspector HTML include Phosphor icons and NO hashtag `#Friendly`.
+    let side = app.render_sidebar();
+    assert!(side.contains("blaze"));
+    assert!(side.contains("Flagship_Apollo"));
+    assert!(side.contains("viewBox=\"0 0 24 24\""));
+
+    let main_html = app.render_main();
+    assert!(main_html.contains("Transform2D"));
+    assert!(!main_html.contains("#Friendly"), "tags must not render ugly # hashtags");
+
+    // Step relational ECS physics and verify packed 8-float WebGPU instance buffers.
+    app.step_graph(0.016);
+    assert_eq!(app.gpu.nodes.len() % 8, 0);
+    assert!(app.gpu.nodes.len() >= 24);
+    assert_eq!(app.gpu.edges.len() % 8, 0);
+    assert!(app.gpu.edges.len() >= 16, "expected ChildOf and IsA edges packed for WebGPU");
+    assert!(app.gpu.labels.as_str().contains("Flagship_Apollo"));
 }

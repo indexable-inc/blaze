@@ -236,7 +236,8 @@ use blaze_lir::VerifyError;
 use blaze_typeck::{Adt, BodyView, Checked, Expr, ExprId, FmtTrait, FnSig, ItemKey, LangItem, List, Mutbl, PTy, PTys, PatId, PortableTys};
 
 pub use instance::{
-    Instance, InstanceKey, REIFY_SHIM_ITEM, closure_method_key_args, copy_written, ground, instance_key, instance_key_normalized, reify_shim_instance, reify_shim_key_args, reify_shim_of,
+    Instance, InstanceKey, REIFY_SHIM_ITEM, VTABLE_SHIM_ITEM, closure_method_key_args, copy_written, ground, instance_key, instance_key_normalized, reify_shim_instance, reify_shim_key_args,
+    reify_shim_of, vtable_shim_instance, vtable_shim_key_args, vtable_shim_of,
 };
 pub use walk::arith_checks::PanicConst;
 pub use walk::coroutine::{CoroutineFacts, CoroutineOf, StateShape, coroutine_facts, coroutine_of, coroutines_in, identity as coroutine_identity};
@@ -542,6 +543,16 @@ pub trait Adts {
     /// its fn words (blaze-consteval `ConstRecord::fns`): a world answers from that, never by
     /// searching its fns for one whose key matches.
     fn const_fn_instance(&self, key: InstanceKey, ground: &mut PortableTys<'_>) -> Option<Instance> {
+        let _ = (key, ground);
+        None
+    }
+
+    /// The vtable reference that key `key` names in an evaluated constant's record (a
+    /// `DataTarget::Vtable(key)` of a [`Adts::const_value`], [`Adts::const_block_value`] or
+    /// [`Adts::promoted_value`] answer: `const X: &dyn Tr = &S;`), its types interned in `ground`.
+    /// No answer is refused with [`BuildError::NoConstVtable`]. An evaluator's record names the
+    /// table of each of its vtable words (blaze-consteval `ConstRecord::vtables`).
+    fn const_vtable_ref(&self, key: vtable::VtableKey, ground: &mut PortableTys<'_>) -> Option<vtable::VtableRef> {
         let _ = (key, ground);
         None
     }
@@ -992,6 +1003,9 @@ pub enum BuildError {
     /// The value of constant path, const block or promoted borrow `expr` holds a fn pointer to
     /// instance `key`, which [`Adts::const_fn_instance`] does not give.
     NoConstFnInstance { expr: ExprId, key: InstanceKey },
+    /// The value of constant path, const block or promoted borrow `expr` holds a vtable pointer
+    /// `key`, which [`Adts::const_vtable_ref`] does not give.
+    NoConstVtable { expr: ExprId, key: vtable::VtableKey },
     /// Path pattern `pat` names const `item`, whose value [`Adts::const_value`] does not hold.
     NoPatConstValue { pat: PatId, item: ItemKey },
     /// A layout read a record that is not made yet: `item`'s (an enum's explicit discriminant).
@@ -1141,6 +1155,15 @@ impl fmt::Display for BuildError {
                     "expression {}: the value of the constant, const block or promoted borrow here holds a fn pointer to instance {key:?}, \
                      which no record the build's `Adts` holds names (every evaluated record names the instance of each of its fn words: \
                      blaze-consteval `ConstRecord::fns`)",
+                    expr.0
+                )
+            }
+            BuildError::NoConstVtable { expr, key } => {
+                write!(
+                    f,
+                    "expression {}: the value of the constant, const block or promoted borrow here holds a vtable pointer {key:?}, \
+                     which no record the build's `Adts` holds names (every evaluated record names the table of each of its vtable words: \
+                     blaze-consteval `ConstRecord::vtables`)",
                     expr.0
                 )
             }
@@ -1318,6 +1341,24 @@ pub fn build_reify_shim<A: Allocator + Copy>(
     alloc: A,
 ) -> Result<Built<A>, BuildError> {
     walk::build_reify_shim(callee, sig, subst, adts, alloc)
+}
+
+/// Builds the by-value `self` `VTableShim` for `target` (named by [`VTABLE_SHIM_ITEM`]): takes
+/// `(data_ptr: *mut Self, args..)` where `data_ptr` points to the concrete receiver in memory
+/// (e.g. a `Box<dyn FnOnce>`'s heap allocation), moves `Self` out by value according to its Rust
+/// ABI, and calls `target` directly.
+///
+/// `sig` is `Some` for a concrete impl method (`subst.args == target.args`) or a fn item's
+/// `FnOnce::call_once` (`subst.args == fn_item_args`); `None` for a closure's `FnOnce::call_once`
+/// or a fn pointer's `FnOnce::call_once`.
+pub fn build_vtable_shim<A: Allocator + Copy>(
+    target: Instance,
+    sig: Option<&FnSig<'_>>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    walk::build_vtable_shim(target, sig, subst, adts, alloc)
 }
 
 /// Builds the CTOR FN `ctor` of variant `variant` (a struct's is 0) of a tuple struct or tuple
