@@ -119,6 +119,13 @@ fn an_impl_s_parameters_read_past_their_own_attributes() {
     // Several attributes, brackets and a lifetime inside one, and a const parameter after.
     assert_eq!(read("impl<#[a] #[b(c[d], 'x)] T, #[e] const N: usize> Tr for S<T, N>").1, ["T", "N"]);
     assert_eq!(read("impl<T, const N: usize> Tr for S<T, N>").1, ["T", "N"]);
+
+    // `impl_may_dangle_params`: bitmask over type/const generic params (lifetimes omitted).
+    let md = |text: &str| blaze_file_items::impl_may_dangle_params(text, Edition::E2024);
+    assert_eq!(md("unsafe impl<#[may_dangle] T, A: Allocator> Drop for Vec<T, A>"), Ok(0b01));
+    assert_eq!(md("#[stable]\nunsafe impl<#[may_dangle] K, #[may_dangle] V, A: Allocator> Drop for BTreeMap<K, V, A>"), Ok(0b011));
+    assert_eq!(md("unsafe impl<'a, #[may_dangle] T> Drop for Ref<'a, T>"), Ok(0b1));
+    assert_eq!(md("impl<W: ?Sized + Write> Drop for BufWriter<W>"), Ok(0));
 }
 
 /// The pinned std's lock headers, exactly as written (library/std/src/sync/poison/mutex.rs:269

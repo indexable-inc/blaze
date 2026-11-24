@@ -39,7 +39,8 @@ use super::reads::{Fact, FactKind, Read, ReadsError};
 /// type is read, so the asked ADT counts and path answers are no longer in the row.
 /// v7: structural `needs_drop` and `drop_args` (borrow_fields.rs `drop_facts_of`).
 /// v8: `field_row` lays `PNode::Alias` fields (`CharSliceSearcher`, `CharArrayRefSearcher`).
-const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v8";
+/// v9: `drop_strict` (RFC 1327 `#[may_dangle]` / transitive strict drop args, `drop_facts_of`).
+const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v9";
 /// The domain of a [`FactKind::BorrowHead`] answer.
 /// v2 (piece RB8): a head's verdict now also reads its trait bounds' lifetime arguments
 /// (borrows_ties.rs), so a list filed under v1 never answers for one checked since.
@@ -78,6 +79,8 @@ pub enum AdtAnswer<'f> {
         copy_args: Option<&'f [bool]>,
         /// Which arguments its drop glue drops (`None`: not read; borrow_fields.rs `drop_facts_of`).
         drop_args: Option<&'f [bool]>,
+        /// Which arguments reach a non-`#[may_dangle]` `Drop` impl (`None`: not read; RFC 1327).
+        drop_strict: Option<&'f [bool]>,
         /// The ADT's unique `Deref` impl (`Facts::deref_impl`), when any.
         deref_impl: Option<u128>,
         /// Its lifetime parameters' variances, in head order (`None`: not read; borrows.rs
@@ -159,7 +162,7 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
     let mut h = StableHasher::new(ADT_DOMAIN);
     match answer {
         AdtAnswer::NotMade => h.tag(0),
-        AdtAnswer::Made { copy, drop_impl, facts, variant_lens, fields, field_params, field_leads, field_regions, region_list, copy_args, drop_args, deref_impl, variances } => {
+        AdtAnswer::Made { copy, drop_impl, facts, variant_lens, fields, field_params, field_leads, field_regions, region_list, copy_args, drop_args, drop_strict, deref_impl, variances } => {
             h.tag(1);
             option_bool(&mut h, copy);
             option_bool(&mut h, drop_impl);
@@ -235,6 +238,16 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
                     h.tag(1);
                     h.u32(u32::try_from(need.len()).unwrap_or(u32::MAX));
                     for &n in need {
+                        flag(&mut h, n);
+                    }
+                }
+            }
+            match drop_strict {
+                None => h.tag(0),
+                Some(strict) => {
+                    h.tag(1);
+                    h.u32(u32::try_from(strict.len()).unwrap_or(u32::MAX));
+                    for &n in strict {
                         flag(&mut h, n);
                     }
                 }

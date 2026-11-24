@@ -287,6 +287,9 @@ impl Facts for NestedFacts<'_, '_> {
     fn drop_args(&self, adt: tc::ItemKey) -> Option<&[bool]> {
         self.facts.drop_args(adt)
     }
+    fn drop_strict(&self, adt: tc::ItemKey) -> Option<&[bool]> {
+        self.facts.drop_strict(adt)
+    }
     fn closure_requirements(&self, closure: tc::ExprId) -> &[Requirement] {
         let (lo, hi) = run_of(self.closures, closure);
         self.needs.get(lo..hi).unwrap_or(&[])
