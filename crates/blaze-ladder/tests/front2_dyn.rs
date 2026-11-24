@@ -761,4 +761,140 @@ pub extern \"C\" fn main() -> i32 {{
         assert_eq!(w_u16, l_u16, "whole and lazy object_trait shapes must agree for AsRef<[u16]>");
         assert_ne!(w_u8, w_u16, "changing supertrait argument [u8] -> [u16] must change ObjectTable::shape");
     }
+
+    const AUTOREF_PROMOTED_DYN_PROGRAM: &str = "#![feature(no_core, lang_items, rustc_attrs, auto_traits)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+#[lang = \"pointee_sized\"]
+trait PointeeSized {}
+
+#[lang = \"meta_sized\"]
+trait MetaSized: PointeeSized {}
+
+#[lang = \"sized\"]
+trait Sized: MetaSized {}
+
+#[lang = \"freeze\"]
+unsafe auto trait Freeze {}
+
+#[lang = \"legacy_receiver\"]
+trait LegacyReceiver: PointeeSized {}
+
+impl<T: PointeeSized> LegacyReceiver for &T {}
+impl<T: PointeeSized> LegacyReceiver for &mut T {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u8 {}
+impl Copy for u32 {}
+impl Copy for u64 {}
+impl Copy for i32 {}
+impl<T: PointeeSized> Copy for &T {}
+
+#[lang = \"unsize\"]
+trait Unsize<T: PointeeSized>: PointeeSized {}
+
+#[lang = \"coerce_unsized\"]
+trait CoerceUnsized<T: PointeeSized> {}
+
+impl<'a, 'b: 'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a U> for &'b T {}
+
+#[lang = \"dispatch_from_dyn\"]
+trait DispatchFromDyn<T> {}
+
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<&'a U> for &'a T {}
+
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_: usize, _: usize) -> ! {
+    loop {}
+}
+
+enum Fork {
+    Frontier,
+    Homestead,
+    Cancun,
+    Prague,
+}
+
+impl Fork {
+    fn score(&self) -> u8 {
+        match self {
+            Fork::Frontier => 11,
+            Fork::Homestead => 22,
+            Fork::Cancun => 33,
+            Fork::Prague => 44,
+        }
+    }
+
+    fn as_static_ref(&self) -> &Self {
+        self
+    }
+}
+
+trait Hardfork {
+    fn score(&self) -> u8;
+}
+
+impl Hardfork for Fork {
+    fn score(&self) -> u8 {
+        Fork::score(self)
+    }
+}
+
+// Mirrors `#[auto_impl(&, Box)]` on `alloy_hardforks::Hardfork`.
+impl<'a, T: 'a + Hardfork + ?Sized> Hardfork for &'a T {
+    fn score(&self) -> u8 {
+        T::score(self)
+    }
+}
+
+#[inline(never)]
+fn make_promoted_ref() -> &'static Fork {
+    // Implicit shared autoref on a unit enum variant (mirrors `EthereumHardfork::Frontier.boxed()`).
+    Fork::Cancun.as_static_ref()
+}
+
+#[inline(never)]
+fn clobber_stack(seed: u64) -> u64 {
+    let a = [seed ^ 0xd8d8_d8d8_d8d8_d8d8u64; 32];
+    a[0] ^ a[31]
+}
+
+#[inline(never)]
+fn dispatch_dyn(h: &dyn Hardfork) -> u8 {
+    h.score()
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let r: &'static Fork = make_promoted_ref();
+    let _noise = clobber_stack(0x1234_5678);
+    // Concrete `Self` behind `dyn Hardfork` is `&'static Fork`, exercising
+    // `<&Fork as Hardfork>::score` -> `Fork::score` after `make_promoted_ref`'s frame is gone.
+    let via_dyn = dispatch_dyn(&r);
+    // Also exercise an autoref on a promoted `Expr::Ref` (`&&Fork` via `Hardfork for &T`).
+    let via_ref_autoref = (&Fork::Homestead).score();
+    (via_dyn + via_ref_autoref) as i32
+}
+";
+
+    /// Regression test for the `tempo-chainspec` SIGTRAP (`brk #0xff02`, bad enum discriminant
+    /// `0xd8`): `EthereumHardfork::Variant.boxed()` autorefs a unit variant rvalue to `&'static
+    /// Self` via `AdjustKind::Borrow { mutbl: Not, raw: false }` (no `Expr::Ref`). Without
+    /// promoting shared autorefs, the returned `&'static Fork` pointed into the returning fn's
+    /// dead stack frame, which subsequent calls overwrote before `<&Fork as Hardfork>::score`
+    /// matched on the discriminant.
+    #[test]
+    fn autoref_promoted_enum_survives_stack_clobber_through_dyn_ref() {
+        let files = [SourceFile { path: "src/main.rs", text: AUTOREF_PROMOTED_DYN_PROGRAM }];
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            run_with(&files, "src/main.rs", None, FrontChoice::New(NEW), blaze_own::testing::heap().shared()).map_err(|e| format!("{e}")),
+            Ok(55),
+            "promoted autoref `&'static Fork` (33) + `(&Fork::Homestead).score()` (22)"
+        );
+    }
 }

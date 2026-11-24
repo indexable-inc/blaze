@@ -134,3 +134,95 @@ fn a_promoted_borrow_evaluates_to_its_operand() {
     println!("{refused}");
     assert_eq!(refused, "not promoted: refused (NotPromoted)");
 }
+
+const AUTOREF_PROGRAM: &str = r#"#![feature(no_core, lang_items, rustc_attrs, auto_traits)]
+#![no_core]
+#![no_main]
+
+#[lang = "pointee_sized"]
+trait PointeeSized {}
+
+#[lang = "meta_sized"]
+trait MetaSized: PointeeSized {}
+
+#[lang = "sized"]
+trait Sized: MetaSized {}
+
+#[lang = "freeze"]
+unsafe auto trait Freeze {}
+
+#[lang = "legacy_receiver"]
+trait LegacyReceiver: PointeeSized {}
+
+impl<T: PointeeSized> LegacyReceiver for &T {}
+
+#[lang = "copy"]
+trait Copy {}
+
+enum Fork {
+    A,
+    B,
+    C,
+}
+
+impl Fork {
+    fn as_ref(&self) -> &Self {
+        self
+    }
+}
+
+fn pick_autoref() -> &'static Fork {
+    Fork::C.as_ref()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    let _ = pick_autoref();
+    0
+}
+"#;
+
+#[test]
+fn a_promoted_autoref_evaluates_to_its_unadjusted_value() {
+    let heap = blaze_own::testing::heap();
+    let alloc = heap.alloc();
+    let files = [SourceFile { path: "src/main.rs", text: AUTOREF_PROGRAM }];
+    let tc = Toolchain::none(alloc);
+    let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
+    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("texts: {e}"));
+    let user = texts.user();
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("inputs: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    let mut front = Front2::new(&names, &frame, &files, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
+    let pick = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["pick_autoref"] }, alloc)
+        .ok()
+        .and_then(|f| f.whole(1))
+        .map(|d| d.key)
+        .unwrap_or_else(|| panic!("`pick_autoref` from root"));
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let mut buckets = None;
+    store.ensure(&names, &mut front.keys, Want::Fn(pick)).unwrap_or_else(|e| panic!("head: {e:?}"));
+    let owner = front.keys.item(pick).unwrap_or_else(|_| panic!("owner key"));
+    let body = lower_fn(&names, prepared, &mut front.keys, &mut store, pick).unwrap_or_else(|e| panic!("lower: {e}"));
+    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
+    let borrow = {
+        let view = body.lowered.view();
+        let spell = Spelling::of(&view).expect("spelling");
+        let scope = body.scope(&spell);
+        let checked = check_body(&mut records, &body, &scope).unwrap_or_else(|e| panic!("check: {e:?}"));
+        assert!(checked.diags.is_empty(), "diags: {:?}", checked.diags);
+        assert_eq!(checked.promoted.len(), 1, "expected 1 promoted autoref, got {:?}", checked.promoted);
+        checked.promoted[0]
+    };
+    let mut consts = Consts::default();
+    let key = promoted_key(owner, borrow, AUTOREF_PROGRAM);
+    let rec = consts
+        .body_value(&mut records, prepared, owner, BodyRoot::Promoted(borrow), key, blaze_typeck::PTys::EMPTY, &[], None, alloc)
+        .unwrap_or_else(|e| panic!("body_value failed: {e}"));
+    assert_eq!(rec.data.allocs.len(), 1, "single allocation for unadjusted enum value: {rec:?}");
+    assert!(rec.data.allocs[0].relocs.is_empty(), "no relocations for unadjusted enum value: {rec:?}");
+    assert_eq!(rec.data.allocs[0].bytes.as_slice(), &[2u8], "`Fork::C` discriminant is 2");
+}
