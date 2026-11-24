@@ -343,6 +343,47 @@ pub fn closure_method_key_args(instance: Instance, ground: &mut PortableTys<'_>,
     ground.intern_list(&all).map_err(full)
 }
 
+/// Synthetic item key naming the `ReifyShim` of a `#[track_caller]` fn item taken as a fn
+/// pointer: `Instance { item: REIFY_SHIM_ITEM, args: [PNode::FnDef(target, target_args)] }`.
+///
+/// The shim has the plain fn pointer ABI (no hidden `&Location` parameter), materializes a
+/// `Location` row for `target`'s own definition site (`Adts::def_site(target)`), and calls
+/// `target` directly with that location passed last.
+pub const REIFY_SHIM_ITEM: ItemKey = ItemKey(u128::from_be_bytes(*b"blaze-build rfy1"));
+
+/// The `ReifyShim` instance of `#[track_caller]` fn `callee`:
+/// `Instance { item: REIFY_SHIM_ITEM, args: [PNode::FnDef(callee.item, callee.args)] }`.
+pub fn reify_shim_instance(callee: Instance, ground: &mut PortableTys<'_>) -> Result<Instance, BuildError> {
+    let full = |_| BuildError::Malformed { what: "the ground table is full" };
+    let fn_ty = ground.intern(PNode::FnDef(callee.item, callee.args)).map_err(full)?;
+    let args = ground.intern_list(&[fn_ty]).map_err(full)?;
+    Ok(Instance { item: REIFY_SHIM_ITEM, args })
+}
+
+/// If `instance` is a `ReifyShim` (`item == REIFY_SHIM_ITEM`, `args == [FnDef(target, args)]`),
+/// returns the underlying tracked fn `Instance`.
+pub fn reify_shim_of(instance: Instance, ground: PTys<'_>) -> Option<Instance> {
+    if instance.item != REIFY_SHIM_ITEM {
+        return None;
+    }
+    let &[fn_ty] = ground.list(instance.args).ok()? else { return None };
+    let PNode::FnDef(item, args) = ground.node(fn_ty).ok()? else { return None };
+    Some(Instance { item, args })
+}
+
+/// The list a `ReifyShim` for `target` is keyed by over `target`'s code identity: `target`'s own
+/// arguments first (so any projection in `target`'s checked types normalizes at them), then
+/// `REIFY_SHIM_ITEM` as a `FnDef`. Never equal to `target`'s own list: it is one longer, and the
+/// count is hashed.
+pub fn reify_shim_key_args(target: Instance, ground: &mut PortableTys<'_>, scratch: Alloc<'_>) -> Result<List, BuildError> {
+    let malformed = |_| BuildError::Malformed { what: "a reify shim's target arguments past the ground table" };
+    let full = |_| BuildError::Malformed { what: "the ground table is full" };
+    let mut all: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
+    all.extend_from_slice(ground.view().list(target.args).map_err(malformed)?);
+    all.push(ground.intern(PNode::FnDef(REIFY_SHIM_ITEM, List::EMPTY)).map_err(full)?);
+    ground.intern_list(&all).map_err(full)
+}
+
 /// The one function every type lowered at an instance passes through (signatures, locals,
 /// fields, casts, a callee's signature): `ty` of table `from`, in `ground` with `Param(i)`
 /// replaced by `args[i]` (`args` are types of `ground`), every projection then normalized by

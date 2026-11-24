@@ -561,8 +561,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     fn asm_sym(&mut self, x: ExprId) -> Result<u32, BuildError> {
         let t = self.expr_ty(x)?;
         if let PNode::FnDef(item, args) = self.node_at(x, t)? {
-            self.refuse_tracked_pointer(x, Instance { item, args })?;
-            let place = self.ref_place(Instance { item, args });
+            let target = self.reify_target(Instance { item, args })?;
+            let place = self.ref_place(target);
             return Ok(self.b.reference(RefKind::Func, place).0);
         }
         let Some(Def::Static(item, _)) = self.expr_def(x) else {
