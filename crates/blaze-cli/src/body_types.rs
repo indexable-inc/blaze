@@ -202,8 +202,13 @@ impl<'f> SyncLazyTrees<'f> {
                         open_tree(cx, from, &self.list, k, &mut local, scratch)
                     }
                 };
-                let newly_opened = slot.set(opened).is_ok();
-                (*slot.get()?, newly_opened)
+                // `PublishOnce::set` returns `Err(mine)` if another thread is currently in
+                // `WRITING` (not yet `READY`); in that window `slot.get()` is `None`, so fall
+                // back to `mine` rather than returning `None` (`Gone`).
+                match slot.set(opened) {
+                    Ok(()) => (opened, true),
+                    Err(mine) => (slot.get().copied().unwrap_or(mine), false),
+                }
             }
         };
         match got {
@@ -354,17 +359,27 @@ fn open_row_shared(cx: &Cx, from: PackHome<'_>, row: TreeRow, k: usize, dirs: &S
     let hex = crate::fetch::key_hex(&ContentId(name));
     let hex = core::str::from_utf8(&hex).map_err(|_| PackRefusal("a pack's name is not hex (fetch.rs `key_hex`)"))?;
     let at = bstd::mem::format_in!(scratch, "tree {k} of the crate list, `<home>/{folder}/{hex}`");
+    let dir_owned;
     let dir = match slot.get() {
         Some(dir) => dir,
         None => {
             let opened = open_home_pack_dir(cx, from, folder, at.as_str(), scratch)?;
-            // If another thread raced and published first, `opened` drops here and closes its driver.
-            let _ = slot.set(opened);
-            let Some(dir) = slot.get() else {
-                let kept = |words: &str| -> PackRefusal { PackRefusal(blaze_own::Box::leak_static(blaze_own::AString::from_str_in(words, from.heap.alloc()).into_boxed_str())) };
-                return Err(kept(bstd::mem::format_in!(scratch, "{at}: its folder was not opened").as_str()));
-            };
-            dir
+            // If another thread raced and is still in `WRITING`, `slot.set` returns `Err(mine)`
+            // while `slot.get()` is briefly `None`; borrow `dir_owned` for this call so it never
+            // fails spuriously, then drop it cleanly on return.
+            match slot.set(opened) {
+                Ok(()) => match slot.get() {
+                    Some(dir) => dir,
+                    None => {
+                        let kept = |words: &str| -> PackRefusal { PackRefusal(blaze_own::Box::leak_static(blaze_own::AString::from_str_in(words, from.heap.alloc()).into_boxed_str())) };
+                        return Err(kept(bstd::mem::format_in!(scratch, "{at}: its folder was not opened").as_str()));
+                    }
+                },
+                Err(mine) => {
+                    dir_owned = mine;
+                    slot.get().unwrap_or(&dir_owned)
+                }
+            }
         }
     };
     map_pack_in_dir(cx, dir, row, hex, at.as_str(), from.heap, scratch)

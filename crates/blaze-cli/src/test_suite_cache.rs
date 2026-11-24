@@ -25,9 +25,10 @@ use core::cell::RefCell;
 
 use blaze_code::datum::DatumView;
 use blaze_code::record::{Space, Symbol as CodeSymbol};
+use blaze_engine::SVec;
 use blaze_hash::{BuildKeyHasher, FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_ladder::body_ids::{
-    BodyIds as _, DeclaredList, EntryForm, Form as _, How, Make, RowKind, Scratch, Stepped, Unkeyed, Walk, instance_key,
+    Begun, DeclaredList, EntryForm, Form as _, How, Make, Order, Pending, RowKind, Scratch, Stepped, Unkeyed, Walk, instance_key,
 };
 use blaze_ladder::code_records::statics::{each_static_named, each_vtable_datum, entry_record};
 use blaze_ladder::code_records::{Builder, CodeKey, CodeStore, content_key};
@@ -38,7 +39,7 @@ use blaze_ladder::run::RunError as LadderRunError;
 use blaze_launch::wire::RecordId;
 use blaze_launch::wire::data::Datum;
 use blaze_launch::wire::run::Symbol;
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AVec, Alloc, SharedAlloc, Vec};
 use blaze_run::plan::NotKept;
 use blaze_run::postings::FnName;
 use blaze_screen::{Answered, Step, Watch};
@@ -49,10 +50,12 @@ use crate::run_bytes::Sent;
 use crate::run_fault::{Named, Places, SiteShown};
 use crate::run_ids::{RunIds, Runnable};
 use crate::run_parent::{
-    self, FIRST_CALL_SPAN, HOW_FOUND, HOW_MADE, HOW_NO_RECORD, HOW_SPECIAL, HOW_STALE, Needs, ParentError, Resolve,
+    self, Codes, FIRST_CALL_SPAN, HOW_FOUND, HOW_MADE, HOW_NO_RECORD, HOW_SPECIAL, HOW_STALE, Needs, ParentError, Resolve,
     Resolved, RunMaker, Start as _, Tally,
 };
 use crate::test_cache::{EnteredFn, check_datum_purity, check_record_purity};
+use crate::test_drive::Job;
+use crate::test_loop::SuiteId;
 
 /// Cap on warm suite functions queued for batch pre-publishing per suite (rule 18).
 const WARM_CAP: usize = 16_384;
@@ -106,32 +109,74 @@ pub(crate) struct StepCounts {
     pub unkeyed: usize,
 }
 
-/// Thin [`Make`] wrapper that consults and updates `SuiteCache::verified` before delegating
-/// read-list verification to the suite's single [`RunMaker`].
-struct VerifyingMaker<'a, 'h> {
-    maker: &'a mut RunMaker<'h>,
+/// Lazily-initialized [`Make`] adapter that consults `SuiteCache::verified` in O(1) before ever
+/// constructing the command-thread [`RunMaker`]. On warm `BZTV` hits and on cold `Codes::Pooled`
+/// misses (dispatched to off-thread `CodePool` workers), no command-thread `Maker` is constructed.
+struct LazyVerifyingMaker<'a, 'h> {
+    names: NamesRecords<'h>,
+    builder: &'a Builder,
+    typed: crate::engine_body_record::TypedFrom<'h>,
+    tables: Alloc<'static>,
+    make_watch: MakeWatch<'static>,
+    entry: Option<ItemKey>,
+    start: MakerStart,
+    ids: RunIds<'h>,
+    enclosers: LocalEnclosers,
+    maker: &'a mut Option<RunMaker<'h>>,
     verified: &'a mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
     verified_dirty: &'a mut bool,
 }
 
-impl Make for VerifyingMaker<'_, '_> {
+impl<'h> LazyVerifyingMaker<'_, 'h> {
+    fn ensure_maker(&mut self) -> Result<&mut RunMaker<'h>, LadderRunError> {
+        let want = MakerKind::of(self.entry, self.start);
+        let maker = self.maker.get_or_insert_with(|| {
+            let mut maker = Maker::of_start(self.names, self.entry, self.start, ByKind::new(self.typed.over(self.ids)), self.builder, self.tables);
+            maker.watch(self.make_watch);
+            maker
+        });
+        if maker.made_for() != want
+            || (matches!(self.start, MakerStart::Direct(_)) && !maker.set_direct_entry(self.entry, self.start))
+        {
+            return Err(LadderRunError::OneBody {
+                key: self.entry.unwrap_or(ItemKey(0)),
+                why: "the suite maker was made for another entry or start than this test's roots say (test_suite_cache.rs `SuiteCache`)",
+            });
+        }
+        Ok(maker)
+    }
+}
+
+impl Make for LazyVerifyingMaker<'_, '_> {
     type Error = LadderRunError;
     type Grant = Runnable;
 
     fn make(&mut self, grant: &Self::Grant, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
-        self.maker.make(grant, tabled, name, entry)
+        let enclosers = self.enclosers;
+        let maker = self.ensure_maker()?;
+        maker.prepare_local(enclosers.locals(), enclosers.enclosers());
+        maker.make(grant, tabled, name, entry)
     }
 
     fn make_static(&mut self, grant: &Self::Grant, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
-        self.maker.make_static(grant, item, entry)
+        let enclosers = self.enclosers;
+        let maker = self.ensure_maker()?;
+        maker.prepare_local(enclosers.locals(), enclosers.enclosers());
+        maker.make_static(grant, item, entry)
     }
 
     fn make_thread_local(&mut self, grant: &Self::Grant, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
-        self.maker.make_thread_local(grant, item, entry)
+        let enclosers = self.enclosers;
+        let maker = self.ensure_maker()?;
+        maker.prepare_local(enclosers.locals(), enclosers.enclosers());
+        maker.make_thread_local(grant, item, entry)
     }
 
     fn verify(&mut self, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<Verdict>, Self::Error> {
-        self.maker.verify(tabled, name, entry)
+        let enclosers = self.enclosers;
+        let maker = self.ensure_maker()?;
+        maker.prepare_local(enclosers.locals(), enclosers.enclosers());
+        maker.verify(tabled, name, entry)
     }
 
     fn verify_keyed(
@@ -146,12 +191,104 @@ impl Make for VerifyingMaker<'_, '_> {
         if self.verified.contains(&pair) {
             return Ok(Some(Verdict::Holds));
         }
-        let verdict = self.maker.verify(tabled, name, entry)?;
+        let enclosers = self.enclosers;
+        let maker = self.ensure_maker()?;
+        maker.prepare_local(enclosers.locals(), enclosers.enclosers());
+        let verdict = maker.verify(tabled, name, entry)?;
         if matches!(verdict, Some(Verdict::Holds)) && self.verified.insert(pair) {
             *self.verified_dirty = true;
         }
         Ok(verdict)
     }
+}
+
+/// Bounded inline chain of body-local keys (`LibKey::INNER` set — either the row's tabled item or
+/// local items referenced in its generic arguments) and their same-crate declarer `ItemKey`s
+/// (outermost first), so any `CodePool` worker (or partial-warm serial run) can file local fns
+/// (e.g. `const_eval_select!` -> `is_null::runtime`, or `thread_local!` closures) in O(1).
+pub(crate) const MAX_LOCAL_ENCLOSERS: usize = 8;
+
+#[derive(Clone, Copy)]
+pub(crate) struct LocalEnclosers {
+    pub locals: [ItemKey; MAX_LOCAL_ENCLOSERS],
+    pub locals_len: usize,
+    pub items: [ItemKey; MAX_LOCAL_ENCLOSERS],
+    pub len: usize,
+}
+
+impl Default for LocalEnclosers {
+    fn default() -> Self {
+        Self {
+            locals: [ItemKey(0); MAX_LOCAL_ENCLOSERS],
+            locals_len: 0,
+            items: [ItemKey(0); MAX_LOCAL_ENCLOSERS],
+            len: 0,
+        }
+    }
+}
+
+impl LocalEnclosers {
+    pub(crate) fn locals(&self) -> &[ItemKey] {
+        self.locals.get(..self.locals_len).unwrap_or(&[])
+    }
+
+    pub(crate) fn enclosers(&self) -> &[ItemKey] {
+        self.items.get(..self.len).unwrap_or(&[])
+    }
+}
+
+/// In-flight pooled build for one `Walk` row currently in `How::Making`.
+struct InFlight {
+    pending: Pending,
+    /// Monotonic epoch token distinguishing this build attempt from any later retry of the
+    /// same row after an abandon/refusal.
+    epoch: u64,
+    key: Option<CodeKey>,
+    order: Order,
+    proof: Runnable,
+    symbol: [u8; 32],
+    entry: Option<ItemKey>,
+    start: MakerStart,
+    enclosers: LocalEnclosers,
+    /// Number of children currently parked on `CodeRelay` for this row.
+    waiters: usize,
+}
+
+/// Payload for submitting a cold row to `CodeRelay` from the child's turn.
+#[derive(Clone, Copy)]
+pub(crate) struct NeedAsk {
+    pub row: usize,
+    pub epoch: u64,
+    pub symbol: [u8; 32],
+    pub key: Option<CodeKey>,
+    pub order: Order,
+    pub proof: Runnable,
+    pub entry: Option<ItemKey>,
+    pub start: MakerStart,
+    pub enclosers: LocalEnclosers,
+}
+
+/// What a child must wait for when `SuiteCache::ensure_cached` hits a cold miss under
+/// `Codes::Pooled`.
+#[derive(Clone, Copy)]
+pub(crate) enum NeedCode {
+    /// Ask `CodeRelay` for this job (deduplicated across children/suites when `key.is_some()`).
+    Ask(NeedAsk),
+    /// Another child in this suite already submitted an unkeyed (`key.is_none()`) ask for `row`;
+    /// park until `SuiteCache::is_in_flight(row, epoch)` becomes false without submitting a duplicate.
+    WaitPeer { row: usize, epoch: u64, symbol: [u8; 32] },
+}
+
+/// Result of `SuiteCache::ensure_cached`.
+pub(crate) enum EnsureCached {
+    Ready(StepCounts),
+    Unknown,
+    NeedCode(NeedCode),
+}
+
+enum StepRow {
+    Ready(Stepped, AVec<'static, u8>),
+    Need(NeedCode),
 }
 
 /// Per-child tracking of which statics/vtables and inline record bytes have been sent to THIS
@@ -190,6 +327,12 @@ pub(crate) struct SuiteCache<'h> {
     datums: Map<[u8; 32], CachedDatum, BuildKeyHasher, Alloc<'static>>,
     by_record: Map<[u8; 32], CachedRecord, BuildKeyHasher, Alloc<'static>>,
     warm_order: AVec<'static, Symbol>,
+    /// Rows currently being compiled on `CodePool` workers (`How::Making`), keyed by walk row.
+    in_flight: Map<usize, InFlight, FixedState, Alloc<'static>>,
+    /// Entry bytes for `How::Done(Stepped::Unkeyed(_))` rows finished by a worker before their
+    /// `CachedPub` / `CachedDatum` has been finalized (unkeyed rows are not stored in CAS).
+    unkeyed_entries: Map<usize, AVec<'static, u8>, FixedState, Alloc<'static>>,
+    next_epoch: u64,
 }
 
 impl<'h> SuiteCache<'h> {
@@ -216,6 +359,9 @@ impl<'h> SuiteCache<'h> {
             datums: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: tables, capacity: None }),
             by_record: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: tables, capacity: None }),
             warm_order: Vec::new_in(tables),
+            in_flight: Map::new(MapOpts { hasher: FixedState, alloc: tables, capacity: None }),
+            unkeyed_entries: Map::new(MapOpts { hasher: FixedState, alloc: tables, capacity: None }),
+            next_epoch: 1,
         }
     }
 
@@ -253,27 +399,29 @@ impl<'h> SuiteCache<'h> {
     }
 
     /// Ensures `symbol` (and every transitive static/vtable it references) is cached in `self`.
-    /// Returns `Ok(None)` when `symbol` is unknown to the program.
+    /// Under `Codes::Pooled`, returns [`EnsureCached::NeedCode`] on a cold miss (after marking the
+    /// row `How::Making`) so the calling child submits the job to `CodeRelay` and parks.
     #[expect(clippy::too_many_arguments, reason = "borrows the test's roots, ids, store and trace context")]
     pub(crate) fn ensure_cached(
         &mut self,
         symbol: Symbol,
         test_entry: [u8; 32],
+        codes: Codes,
         roots: &Roots<'_>,
         ids: &RunIds<'h>,
         store: &mut dyn CodeStore,
         cx: &Cx,
         watch: &dyn Watch,
         alloc: Alloc<'_>,
-    ) -> Result<Option<StepCounts>, ParentError> {
+    ) -> Result<EnsureCached, ParentError> {
         if self.pubs.contains_key(&symbol.0) {
-            return Ok(Some(StepCounts { made: 0, found: 1, unkeyed: 0 }));
+            return Ok(EnsureCached::Ready(StepCounts { made: 0, found: 1, unkeyed: 0 }));
         }
         let code_sym = CodeSymbol(symbol.0);
         let head = roots.head();
         let Some(row) = self.walk.row_of(&code_sym) else {
             let Some(made) = roots.special(&code_sym, &self.builder, store, alloc)? else {
-                return Ok(None);
+                return Ok(EnsureCached::Unknown);
             };
             cx.span(FIRST_CALL_SPAN).event(HOW_SPECIAL);
             let entry = store
@@ -328,16 +476,19 @@ impl<'h> SuiteCache<'h> {
             if !is_entry_shim && symbol.0 != test_entry && self.warm_order.len() < WARM_CAP {
                 self.warm_order.push(symbol);
             }
-            return Ok(Some(StepCounts { made: usize::from(!made.found), found: usize::from(made.found), unkeyed: 0 }));
+            return Ok(EnsureCached::Ready(StepCounts { made: usize::from(!made.found), found: usize::from(made.found), unkeyed: 0 }));
         };
 
         if matches!(self.walk.kind(row), RowKind::Static | RowKind::ThreadLocal) {
-            return Ok(None);
+            return Ok(EnsureCached::Unknown);
         }
 
         let mut counts = StepCounts::default();
         let tabled = self.walk.tabled(row);
-        let (stepped, entry_copy) = self.step_row(row, roots, ids, store, cx, watch, &mut counts)?;
+        let (stepped, entry_copy) = match self.step_or_begin_row(row, codes, roots, ids, store, cx, watch, &mut counts)? {
+            StepRow::Ready(stepped, copy) => (stepped, copy),
+            StepRow::Need(need) => return Ok(EnsureCached::NeedCode(need)),
+        };
         let entry = entry_copy.as_slice();
         let record = entry_record(entry).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
         let mut values = Vec::new_in(self.tables);
@@ -369,39 +520,47 @@ impl<'h> SuiteCache<'h> {
         named.sort_unstable();
         named.dedup();
 
-        // Cache any vtable datums carried by this entry.
-        self.cache_vtables(symbol.0, entry)?;
-
-        // Compute `EnteredFn` metadata once for this function (and record newly made verified pair).
-        let entered = if unkeyed_step {
-            None
-        } else {
-            let name_slice = self.walk.name(row);
-            let inst_key = instance_key(code_sym, tabled, name_slice, ids, &self.builder, &self.builder.producer, self.tables);
-            if let (Stepped::Made(under), Some(ik)) = (stepped, inst_key)
-                && self.verified.insert((ik.0.0, under.0.0))
-            {
-                self.verified_dirty = true;
-            }
-            inst_key.map(|ik| {
-                let mut name_copy = Vec::with_capacity_in(name_slice.len(), self.tables);
-                name_copy.extend_from_slice(name_slice);
-                CachedEntered { symbol: FnName(symbol.0), code_key: ik.0.0, tabled, name: name_copy }
-            })
-        };
-        let unkeyed = unkeyed_step || entered.is_none();
-        let purity = if unkeyed { Err(NotKept::Untraced) } else { check_record_purity(record) };
-
-        // Resolve and cache every transitive static/thread-local row not already in `self.datums`.
+        // Stage and resolve every transitive static/thread-local row not already in `self.datums`.
+        // Under `Codes::Pooled`, a cold transitive static returns `NeedCode` BEFORE inserting any
+        // staged datum into `self.datums` (or mutating `self.pubs`) so a retry never skips an
+        // already-cached parent static whose child static was still cold (`StaticUnsent`).
+        struct StagedDatum {
+            at: usize,
+            sym: [u8; 32],
+            stepped: Stepped,
+            entry: AVec<'static, u8>,
+        }
+        let mut staged: AVec<'_, StagedDatum> = Vec::new_in(alloc);
+        let mut seen_statics: Set<[u8; 32], FixedState, Alloc<'_>> = Set::new_in(alloc);
         let mut next = 0usize;
         while let Some(&at) = static_work.get(next) {
             next += 1;
             let static_sym = self.walk.symbol(at).0;
-            if self.datums.contains_key(&static_sym) {
+            if self.datums.contains_key(&static_sym) || !seen_statics.insert(static_sym) {
                 continue;
             }
-            let (s_stepped, s_entry_copy) = self.step_row(at, roots, ids, store, cx, watch, &mut counts)?;
-            let s_entry = s_entry_copy.as_slice();
+            let (s_stepped, s_entry_copy) = match self.step_or_begin_row(at, codes, roots, ids, store, cx, watch, &mut counts)? {
+                StepRow::Ready(stepped, copy) => (stepped, copy),
+                StepRow::Need(need) => return Ok(EnsureCached::NeedCode(need)),
+            };
+            for &callee in self.walk.declared(at) {
+                let callee = usize::try_from(callee).unwrap_or(0);
+                if matches!(self.walk.kind(callee), RowKind::Static | RowKind::ThreadLocal) {
+                    let csym = self.walk.symbol(callee).0;
+                    if !self.datums.contains_key(&csym) {
+                        static_work.push(callee);
+                    }
+                }
+            }
+            staged.push(StagedDatum { at, sym: static_sym, stepped: s_stepped, entry: s_entry_copy });
+        }
+
+        // Commit all staged datums atomically now that the entire transitive static closure is ready.
+        for item in staged {
+            let at = item.at;
+            let static_sym = item.sym;
+            let s_stepped = item.stepped;
+            let s_entry = item.entry.as_slice();
             let s_datum = entry_record(s_entry).map_err(|why| ParentError::Entry { symbol: static_sym, why })?;
             let s_record = RecordId(blaze_blake3::hash(s_datum));
             let mut s_bytes = Vec::with_capacity_in(s_datum.len(), self.tables);
@@ -410,14 +569,8 @@ impl<'h> SuiteCache<'h> {
             let mut s_declares = Vec::new_in(self.tables);
             for &callee in self.walk.declared(at) {
                 let callee = usize::try_from(callee).unwrap_or(0);
-                match self.walk.kind(callee) {
-                    RowKind::Instance => s_declares.push(Symbol(self.walk.symbol(callee).0)),
-                    RowKind::Static | RowKind::ThreadLocal => {
-                        let csym = self.walk.symbol(callee).0;
-                        if !self.datums.contains_key(&csym) {
-                            static_work.push(callee);
-                        }
-                    }
+                if matches!(self.walk.kind(callee), RowKind::Instance) {
+                    s_declares.push(Symbol(self.walk.symbol(callee).0));
                 }
             }
             let mut s_named = Vec::new_in(self.tables);
@@ -447,6 +600,7 @@ impl<'h> SuiteCache<'h> {
             };
             let s_unkeyed = s_unkeyed_step || s_entered.is_none();
             let s_purity = if s_unkeyed { Err(NotKept::Untraced) } else { check_datum_purity(s_datum) };
+            let _ = self.unkeyed_entries.remove(&at);
             self.by_record.insert(s_record.0, CachedRecord::Datum(static_sym));
             self.datums.insert(
                 static_sym,
@@ -462,6 +616,30 @@ impl<'h> SuiteCache<'h> {
             );
         }
 
+        // Cache any vtable datums carried by this entry.
+        self.cache_vtables(symbol.0, entry)?;
+
+        // Compute `EnteredFn` metadata once for this function (and record newly made verified pair).
+        let entered = if unkeyed_step {
+            None
+        } else {
+            let name_slice = self.walk.name(row);
+            let inst_key = instance_key(code_sym, tabled, name_slice, ids, &self.builder, &self.builder.producer, self.tables);
+            if let (Stepped::Made(under), Some(ik)) = (stepped, inst_key)
+                && self.verified.insert((ik.0.0, under.0.0))
+            {
+                self.verified_dirty = true;
+            }
+            inst_key.map(|ik| {
+                let mut name_copy = Vec::with_capacity_in(name_slice.len(), self.tables);
+                name_copy.extend_from_slice(name_slice);
+                CachedEntered { symbol: FnName(symbol.0), code_key: ik.0.0, tabled, name: name_copy }
+            })
+        };
+        let unkeyed = unkeyed_step || entered.is_none();
+        let purity = if unkeyed { Err(NotKept::Untraced) } else { check_record_purity(record) };
+
+        let _ = self.unkeyed_entries.remove(&row);
         self.by_record.insert(record_id.0, CachedRecord::Fn(symbol.0));
         self.pubs.insert(
             symbol.0,
@@ -482,7 +660,7 @@ impl<'h> SuiteCache<'h> {
         if symbol.0 != test_entry && self.warm_order.len() < WARM_CAP {
             self.warm_order.push(symbol);
         }
-        Ok(Some(counts))
+        Ok(EnsureCached::Ready(counts))
     }
 
     fn cache_vtables(&mut self, owner_symbol: [u8; 32], entry: &[u8]) -> Result<(), ParentError> {
@@ -524,20 +702,21 @@ impl<'h> SuiteCache<'h> {
         )
     }
 
-    /// Steps `row` in the shared walk if `How::Waiting`, or reads its stored entry if already done.
-    /// Returns `(stepped, entry_bytes)` copied into a temporary buffer so borrows on `self.scratch`
-    /// and `store` are released immediately.
+    /// Steps `row` in the shared walk if `How::Waiting`, returns its stored/unkeyed entry if
+    /// already `How::Done`, or returns [`StepRow::Need`] under `Codes::Pooled` on a cold miss (or
+    /// when another child in this suite already began compiling `row`).
     #[expect(clippy::too_many_arguments, reason = "borrows walk state, ids, store and trace context")]
-    fn step_row(
+    fn step_or_begin_row(
         &mut self,
         row: usize,
+        codes: Codes,
         roots: &Roots<'_>,
         ids: &RunIds<'h>,
         store: &mut dyn CodeStore,
         cx: &Cx,
         watch: &dyn Watch,
         counts: &mut StepCounts,
-    ) -> Result<(Stepped, AVec<'static, u8>), ParentError> {
+    ) -> Result<StepRow, ParentError> {
         let symbol = self.walk.symbol(row).0;
         let tabled = self.walk.tabled(row);
         match self.walk.how(row) {
@@ -548,10 +727,40 @@ impl<'h> SuiteCache<'h> {
                     .ok_or(ParentError::NotStored { symbol })?;
                 let mut copy = Vec::with_capacity_in(bytes.len(), self.tables);
                 copy.extend_from_slice(bytes);
-                counts.found += 1;
-                Ok((stepped, copy))
+                match stepped {
+                    Stepped::Made(_) => counts.made += 1,
+                    _ => counts.found += 1,
+                }
+                Ok(StepRow::Ready(stepped, copy))
             }
-            How::Done(Stepped::Unkeyed(_)) | How::Making => Err(ParentError::ResolvedTwice { symbol }),
+            How::Done(stepped @ Stepped::Unkeyed(_)) => {
+                let bytes = self.unkeyed_entries.get(&row).ok_or(ParentError::ResolvedTwice { symbol })?;
+                let mut copy = Vec::with_capacity_in(bytes.len(), self.tables);
+                copy.extend_from_slice(bytes.as_slice());
+                counts.unkeyed += 1;
+                Ok(StepRow::Ready(stepped, copy))
+            }
+            How::Making => {
+                let Some(flight) = self.in_flight.get_mut(&row) else {
+                    return Err(ParentError::ResolvedTwice { symbol });
+                };
+                if flight.key.is_some() {
+                    flight.waiters += 1;
+                    Ok(StepRow::Need(NeedCode::Ask(NeedAsk {
+                        row,
+                        epoch: flight.epoch,
+                        symbol: flight.symbol,
+                        key: flight.key,
+                        order: flight.order,
+                        proof: flight.proof,
+                        entry: flight.entry,
+                        start: flight.start,
+                        enclosers: flight.enclosers,
+                    })))
+                } else {
+                    Ok(StepRow::Need(NeedCode::WaitPeer { row, epoch: flight.epoch, symbol: flight.symbol }))
+                }
+            }
             How::Waiting => {
                 let proof = ids
                     .runnable(tabled)
@@ -559,31 +768,51 @@ impl<'h> SuiteCache<'h> {
                 let shown = watch.paths().then(|| self.shown_of(tabled)).flatten();
                 let path = shown.as_ref().and_then(|s| s.path());
                 watch.see(Step::Resolving { path: path.as_deref() });
+                let enclosers = self.local_enclosers(row, tabled);
                 let span = cx.span(FIRST_CALL_SPAN);
-                self.ensure_maker(roots.maker_entry(), roots.maker_start, *ids)
-                    .map_err(|why| ParentError::Walk {
-                        symbol,
-                        why: blaze_ladder::body_ids::WalkError::Make { tabled, why },
-                    })?;
-                let Some(maker) = self.maker.as_mut() else {
-                    return Err(ParentError::Walk {
-                        symbol,
-                        why: blaze_ladder::body_ids::WalkError::Make {
-                            tabled,
-                            why: LadderRunError::OneBody { key: tabled, why: "suite maker absent after ensure_maker" },
-                        },
-                    });
-                };
-                let mut vm = VerifyingMaker {
-                    maker,
+                let mut vm = LazyVerifyingMaker {
+                    names: self.names,
+                    builder: &self.builder,
+                    typed: self.typed,
+                    tables: self.tables,
+                    make_watch: self.make_watch,
+                    entry: roots.maker_entry(),
+                    start: roots.maker_start,
+                    ids: *ids,
+                    enclosers,
+                    maker: &mut self.maker,
                     verified: &mut self.verified,
                     verified_dirty: &mut self.verified_dirty,
                 };
-                let stepped = self
-                    .walk
-                    .one(row, &ids, store, &self.builder, &self.builder.producer, &mut vm, &proof, &EntryForm, MOST_WALKED, &mut self.scratch)
-                    .map_err(|why| ParentError::Walk { symbol, why })?
-                    .stepped;
+                let stepped = match codes {
+                    Codes::Serial => self
+                        .walk
+                        .one(row, ids, store, &self.builder, &self.builder.producer, &mut vm, &proof, &EntryForm, MOST_WALKED, &mut self.scratch)
+                        .map_err(|why| ParentError::Walk { symbol, why })?
+                        .stepped,
+                    Codes::Pooled => {
+                        match self
+                            .walk
+                            .begin(row, ids, store, &self.builder, &self.builder.producer, &mut vm, &EntryForm, MOST_WALKED, &mut self.scratch)
+                            .map_err(|why| ParentError::Walk { symbol, why })?
+                        {
+                            Begun::Stepped(one) => one.stepped,
+                            Begun::Make(pending) => {
+                                let epoch = self.next_epoch;
+                                self.next_epoch = self.next_epoch.wrapping_add(1).max(1);
+                                let key = pending.key();
+                                let order = pending.order();
+                                let entry = roots.maker_entry();
+                                let start = roots.maker_start;
+                                self.in_flight.insert(
+                                    row,
+                                    InFlight { pending, epoch, key, order, proof, symbol, entry, start, enclosers, waiters: 1 },
+                                );
+                                return Ok(StepRow::Need(NeedCode::Ask(NeedAsk { row, epoch, symbol, key, order, proof, entry, start, enclosers })));
+                            }
+                        }
+                    }
+                };
                 match stepped {
                     Stepped::Found(_) => {
                         span.event(HOW_FOUND);
@@ -615,9 +844,158 @@ impl<'h> SuiteCache<'h> {
                 };
                 let mut copy = Vec::with_capacity_in(raw.len(), self.tables);
                 copy.extend_from_slice(raw);
-                Ok((stepped, copy))
+                Ok(StepRow::Ready(stepped, copy))
             }
         }
+    }
+
+    /// Collects any body-local keys (`LibKey::INNER` set) in `tabled` or the encoded generic
+    /// arguments of `row`, together with their outermost-first same-crate declarer chain from
+    /// `Walk::declarer` (fast-path returns empty in ~20 ns when no key is local).
+    fn local_enclosers(&self, row: usize, key: ItemKey) -> LocalEnclosers {
+        let mut out = LocalEnclosers::default();
+        let mut push_local = |k: ItemKey| {
+            if blaze_ladder::front2::program::lazy::typed::is_local(k)
+                && !out.locals().contains(&k)
+                && let Some(slot) = out.locals.get_mut(out.locals_len)
+            {
+                *slot = k;
+                out.locals_len += 1;
+            }
+        };
+        push_local(key);
+        let name = self.walk.name(row);
+        if !name.is_empty() {
+            let _ = blaze_ladder::body_ids::each_item(name, |k| push_local(k));
+        }
+        if out.locals_len == 0 {
+            return out;
+        }
+        let mut cur = row;
+        let mut hops = 0usize;
+        while let Some(parent) = self.walk.declarer(cur) {
+            hops += 1;
+            if hops > MAX_LOCAL_ENCLOSERS * 2 || out.len >= MAX_LOCAL_ENCLOSERS {
+                break;
+            }
+            let tabled = self.walk.tabled(parent);
+            let prefix = tabled.0 >> 64;
+            if out.locals().iter().any(|l| (l.0 >> 64) == prefix && *l != tabled)
+                && !out.enclosers().contains(&tabled)
+                && let Some(slot) = out.items.get_mut(out.len)
+            {
+                *slot = tabled;
+                out.len += 1;
+            }
+            cur = parent;
+        }
+        if let Some(slice) = out.items.get_mut(..out.len) {
+            slice.reverse();
+        }
+        out
+    }
+
+    /// Builds a `CodePool` [`Job`] for `need`, copying the row's instance name into `alloc`.
+    pub(crate) fn job_for(&self, suite: SuiteId, need: &NeedAsk, alloc: SharedAlloc<'static>) -> Job<'static> {
+        let name_slice = self.walk.name(need.row);
+        let mut name = SVec::with_capacity_in(name_slice.len(), alloc);
+        name.extend_from_slice(name_slice);
+        Job { suite, order: need.order, name, proof: need.proof, entry: need.entry, start: need.start, enclosers: need.enclosers }
+    }
+
+    /// Finishes an in-flight pooled row when a worker returns `entry`: stores into CAS via
+    /// `Walk::finish`, records `(instance_key, content_key)` in `self.verified` for `BZTV`, and
+    /// retains unkeyed bytes in `self.unkeyed_entries` until `ensure_cached` caches the row.
+    /// Idempotent across multiple waiters sharing the same `(row, epoch)`.
+    #[expect(clippy::too_many_arguments, reason = "finishes a worker's entry into the shared walk, CAS store, and verified cache")]
+    pub(crate) fn finish_in_flight(
+        &mut self,
+        row: usize,
+        epoch: u64,
+        entry: &[u8],
+        ids: &RunIds<'h>,
+        store: &mut dyn CodeStore,
+        cx: &Cx,
+        watch: &dyn Watch,
+    ) -> Result<(), ParentError> {
+        if !self.in_flight.get(&row).is_some_and(|flight| flight.epoch == epoch) {
+            return Ok(());
+        }
+        let Some(flight) = self.in_flight.remove(&row) else {
+            return Ok(());
+        };
+        let one = self
+            .walk
+            .finish::<LadderRunError>(flight.pending, entry, store, &EntryForm, MOST_WALKED, &mut self.scratch)
+            .map_err(|why| ParentError::Walk { symbol: flight.symbol, why })?;
+        let stepped = one.stepped;
+        let span = cx.span(FIRST_CALL_SPAN);
+        match stepped {
+            Stepped::Found(_) => {
+                span.event(HOW_FOUND);
+                watch.see(Step::Answered(Answered::Found));
+            }
+            Stepped::Made(under) => {
+                span.event(HOW_MADE);
+                watch.see(Step::Answered(Answered::Made));
+                let tabled = self.walk.tabled(row);
+                let name_slice = self.walk.name(row);
+                if let Some(ik) = instance_key(CodeSymbol(flight.symbol), tabled, name_slice, ids, &self.builder, &self.builder.producer, self.tables)
+                    && self.verified.insert((ik.0.0, under.0.0))
+                {
+                    self.verified_dirty = true;
+                }
+            }
+            Stepped::Unkeyed(Unkeyed::NoRecord) => {
+                span.event(HOW_NO_RECORD);
+                watch.see(Step::Answered(Answered::Unkeyed));
+                let mut copy = Vec::with_capacity_in(entry.len(), self.tables);
+                copy.extend_from_slice(entry);
+                self.unkeyed_entries.insert(row, copy);
+            }
+            Stepped::Unkeyed(Unkeyed::Stale { .. }) => {
+                span.event(HOW_STALE);
+                watch.see(Step::Answered(Answered::Unkeyed));
+                let mut copy = Vec::with_capacity_in(entry.len(), self.tables);
+                copy.extend_from_slice(entry);
+                self.unkeyed_entries.insert(row, copy);
+            }
+        }
+        Ok(())
+    }
+
+    /// Abandons an in-flight pooled row when a worker refuses it so the row returns cleanly to
+    /// `How::Waiting` (refusals are never cached). Idempotent across multiple waiters.
+    pub(crate) fn refused_in_flight(&mut self, row: usize, epoch: u64) -> Result<(), ParentError> {
+        if !self.in_flight.get(&row).is_some_and(|flight| flight.epoch == epoch) {
+            return Ok(());
+        }
+        let Some(flight) = self.in_flight.remove(&row) else {
+            return Ok(());
+        };
+        self.walk
+            .abandon::<LadderRunError>(flight.pending)
+            .map_err(|why| ParentError::Walk { symbol: flight.symbol, why })
+    }
+
+    /// Releases one child's waiter count on `(row, epoch)` (e.g. on child drop, timeout, or late
+    /// wake). Abandons the underlying `Walk` row only when the last waiter leaves.
+    pub(crate) fn release_in_flight(&mut self, row: usize, epoch: u64) {
+        let drop_it = match self.in_flight.get_mut(&row) {
+            Some(flight) if flight.epoch == epoch => {
+                flight.waiters = flight.waiters.saturating_sub(1);
+                flight.waiters == 0
+            }
+            _ => false,
+        };
+        if drop_it && let Some(flight) = self.in_flight.remove(&row) {
+            let _ = self.walk.abandon::<LadderRunError>(flight.pending);
+        }
+    }
+
+    /// Whether `(row, epoch)` is still actively in flight on a worker.
+    pub(crate) fn is_in_flight(&self, row: usize, epoch: u64) -> bool {
+        self.in_flight.get(&row).is_some_and(|flight| flight.epoch == epoch)
     }
 
     /// Gathers all unsent datums, transitive declares, named statics, inline byte slices,
@@ -810,114 +1188,6 @@ impl<'h> SuiteCache<'h> {
         let (file, line, column) = self.maker.as_ref()?.site_shown(item, site)?;
         Some(SiteShown { file: file.into(), line, column })
     }
-
-    /// Returns the suite's single persistent [`RunMaker`] and verified-entry cache, creating the
-    /// maker on first use or verifying its start class and retargeting `MakerStart::Direct(_)`
-    /// entries without rebuilding `RecordsProgram` or `MakerState`.
-    fn ensure_maker_parts(
-        &mut self,
-        entry: Option<ItemKey>,
-        start: MakerStart,
-        ids: RunIds<'h>,
-    ) -> Result<(&mut RunMaker<'h>, &mut Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>, &mut bool), LadderRunError> {
-        let want = MakerKind::of(entry, start);
-        let maker = self.maker.get_or_insert_with(|| {
-            let mut maker = Maker::of_start(self.names, entry, start, ByKind::new(self.typed.over(ids)), &self.builder, self.tables);
-            maker.watch(self.make_watch);
-            maker
-        });
-        if maker.made_for() != want
-            || (matches!(start, MakerStart::Direct(_)) && !maker.set_direct_entry(entry, start))
-        {
-            return Err(LadderRunError::OneBody {
-                key: entry.unwrap_or(ItemKey(0)),
-                why: "the suite maker was made for another entry or start than this test's roots say (test_suite_cache.rs `SuiteCache`)",
-            });
-        }
-        Ok((maker, &mut self.verified, &mut self.verified_dirty))
-    }
-
-    /// Checks or initializes the suite's shared maker for `(entry, start)`.
-    pub(crate) fn ensure_maker(&mut self, entry: Option<ItemKey>, start: MakerStart, ids: RunIds<'h>) -> Result<(), LadderRunError> {
-        let _ = self.ensure_maker_parts(entry, start, ids)?;
-        Ok(())
-    }
-
-    pub(crate) fn instance_shown(&self, tabled: ItemKey, name: &[u8]) -> Option<blaze_ladder::run::make_one::InstanceShown> {
-        self.maker.as_ref()?.instance_shown(tabled, name)
-    }
-
-    pub(crate) fn site_shown(&self, item: ItemKey, site: u32) -> Option<(&'h str, u32, u32)> {
-        self.maker.as_ref()?.site_shown(item, site)
-    }
-}
-
-/// Thin command-thread [`Make`] handle borrowing the suite's single persistent [`RunMaker`] and
-/// verified-entry cache from [`SuiteCache`] strictly inside each synchronous `Make` call (never
-/// across `.await`, rule 27). Used by `TestFront` so per-test `Lazy` instances never construct a
-/// fresh `Maker` per test.
-pub(crate) struct SuiteSharedMaker<'s, 'h> {
-    cache: &'s RefCell<SuiteCache<'h>>,
-    ids: RunIds<'h>,
-    entry: Option<ItemKey>,
-    start: MakerStart,
-}
-
-impl<'s, 'h> SuiteSharedMaker<'s, 'h> {
-    pub(crate) fn new(cache: &'s RefCell<SuiteCache<'h>>, ids: RunIds<'h>, entry: Option<ItemKey>, start: MakerStart) -> SuiteSharedMaker<'s, 'h> {
-        SuiteSharedMaker { cache, ids, entry, start }
-    }
-
-    pub(crate) fn instance_shown(&self, tabled: ItemKey, name: &[u8]) -> Option<blaze_ladder::run::make_one::InstanceShown> {
-        self.cache.borrow().instance_shown(tabled, name)
-    }
-
-    pub(crate) fn site_shown(&self, item: ItemKey, site: u32) -> Option<(&'h str, u32, u32)> {
-        self.cache.borrow().site_shown(item, site)
-    }
-}
-
-impl Make for SuiteSharedMaker<'_, '_> {
-    type Error = LadderRunError;
-    type Grant = Runnable;
-
-    fn make(&mut self, grant: &Self::Grant, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
-        let mut cache = self.cache.borrow_mut();
-        let (maker, _, _) = cache.ensure_maker_parts(self.entry, self.start, self.ids)?;
-        maker.make(grant, tabled, name, entry)
-    }
-
-    fn make_static(&mut self, grant: &Self::Grant, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
-        let mut cache = self.cache.borrow_mut();
-        let (maker, _, _) = cache.ensure_maker_parts(self.entry, self.start, self.ids)?;
-        maker.make_static(grant, item, entry)
-    }
-
-    fn make_thread_local(&mut self, grant: &Self::Grant, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
-        let mut cache = self.cache.borrow_mut();
-        let (maker, _, _) = cache.ensure_maker_parts(self.entry, self.start, self.ids)?;
-        maker.make_thread_local(grant, item, entry)
-    }
-
-    fn verify(&mut self, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<Verdict>, Self::Error> {
-        let mut cache = self.cache.borrow_mut();
-        let (maker, _, _) = cache.ensure_maker_parts(self.entry, self.start, self.ids)?;
-        maker.verify(tabled, name, entry)
-    }
-
-    fn verify_keyed(
-        &mut self,
-        key: CodeKey,
-        under: CodeKey,
-        tabled: ItemKey,
-        name: &[u8],
-        entry: &[u8],
-    ) -> Result<Option<Verdict>, Self::Error> {
-        let mut cache = self.cache.borrow_mut();
-        let (maker, verified, verified_dirty) = cache.ensure_maker_parts(self.entry, self.start, self.ids)?;
-        let mut vm = VerifyingMaker { maker, verified, verified_dirty };
-        vm.verify_keyed(key, under, tabled, name, entry)
-    }
 }
 
 impl Places for SuiteCache<'_> {
@@ -941,11 +1211,10 @@ impl Places for SuiteCache<'_> {
 pub(crate) enum ChildAnswer {
     Ready {
         symbol: Symbol,
-        purity: Result<(), NotKept>,
-        any_unkeyed: bool,
         counts: StepCounts,
     },
     Unresolved(Symbol),
+    Waiting(NeedCode),
 }
 
 /// Short-lived per-serve [`Resolve`] adapter over [`SuiteCache`] for one child turn.
@@ -955,6 +1224,7 @@ pub(crate) struct ChildResolver<'r, 'c, 'h, 'a> {
     pub child: &'r mut ChildSent<'a>,
     pub roots: &'r Roots<'a>,
     pub test_entry: [u8; 32],
+    pub codes: Codes,
     pub ids: &'r RunIds<'h>,
     pub store: &'r mut dyn CodeStore,
     pub cx: &'r Cx,
@@ -980,6 +1250,7 @@ impl<'r, 'c, 'h, 'a> ChildResolver<'r, 'c, 'h, 'a> {
         child: &'r mut ChildSent<'a>,
         roots: &'r Roots<'a>,
         test_entry: [u8; 32],
+        codes: Codes,
         ids: &'r RunIds<'h>,
         store: &'r mut dyn CodeStore,
         cx: &'r Cx,
@@ -995,6 +1266,7 @@ impl<'r, 'c, 'h, 'a> ChildResolver<'r, 'c, 'h, 'a> {
             child,
             roots,
             test_entry,
+            codes,
             ids,
             store,
             cx,
@@ -1034,18 +1306,26 @@ impl Resolve for ChildResolver<'_, '_, '_, '_> {
         needs_native: &mut bool,
     ) -> Result<Resolved<'_>, ParentError> {
         let mut cache = self.cache.borrow_mut();
-        let Some(counts) = cache.ensure_cached(
+        let counts = match cache.ensure_cached(
             *symbol,
             self.test_entry,
+            self.codes,
             self.roots,
             self.ids,
             self.store,
             self.cx,
             self.watch,
             self.alloc,
-        )? else {
-            self.requested = Some(ChildAnswer::Unresolved(*symbol));
-            return Ok(Resolved::Unknown);
+        )? {
+            EnsureCached::Ready(counts) => counts,
+            EnsureCached::Unknown => {
+                self.requested = Some(ChildAnswer::Unresolved(*symbol));
+                return Ok(Resolved::Unknown);
+            }
+            EnsureCached::NeedCode(need) => {
+                self.requested = Some(ChildAnswer::Waiting(need));
+                return Ok(Resolved::Waiting);
+            }
         };
         let mut inline = Vec::new_in(self.alloc);
         let mut entered = Vec::new_in(self.alloc);
@@ -1103,7 +1383,7 @@ impl Resolve for ChildResolver<'_, '_, '_, '_> {
         }
         let key = entry.key;
         let record = entry.record;
-        self.requested = Some(ChildAnswer::Ready { symbol: *symbol, purity: combined_purity, any_unkeyed, counts });
+        self.requested = Some(ChildAnswer::Ready { symbol: *symbol, counts });
         Ok(Resolved::Record {
             key,
             record,

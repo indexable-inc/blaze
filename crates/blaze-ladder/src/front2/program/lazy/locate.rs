@@ -71,6 +71,43 @@ struct Searched<'n> {
 }
 
 impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
+    /// Hints the cold lookup of a body-local item `key` (`LibKey::INNER` set) by lowering each
+    /// hinted enclosing body in `enclosers` (outermost first) until `key` is filed in
+    /// `self.front.keys`. Used by parallel `CodePool` workers (and partial-warm serial runs)
+    /// when a macro-generated local fn (e.g. `const_eval_select!` -> `is_null::runtime`) was
+    /// declared by a caller compiled on another worker or loaded from CAS, filing `key` in O(1)
+    /// without scanning every body in the crate.
+    ///
+    /// A hint that cannot be located or does not file `key` is ignored so the caller falls
+    /// through cleanly to [`LazyProgram::locate`].
+    pub(crate) fn prepare_local(&mut self, key: ItemKey, enclosers: &[ItemKey]) {
+        if key.0.to_be_bytes()[8] & LibKey::INNER == 0 {
+            return;
+        }
+        if self.front.keys.origin(key).is_some() || self.front.keys.library_in(self.front.names, key).is_some() {
+            return;
+        }
+        for &encloser in enclosers {
+            if self.front.keys.origin(key).is_some() || self.front.keys.library_in(self.front.names, key).is_some() {
+                return;
+            }
+            if self.store.locals.body(encloser).is_some() {
+                continue;
+            }
+            if self.locate(encloser).is_err() {
+                continue;
+            }
+            let target = if let Some(lib) = self.front.keys.library_in(self.front.names, encloser) {
+                LowerTarget::Free(lib)
+            } else if matches!(self.front.keys.origin(encloser), Some(crate::front2::keys::Origin::Member { kind: MemberKind::Fn | MemberKind::Const, .. })) {
+                LowerTarget::Member(encloser)
+            } else {
+                continue;
+            };
+            let _ = self.lower_chain(key, &[target]);
+        }
+    }
+
     /// Files `key` in the key map from the records (module docs), or refuses naming what was
     /// searched. `Ok` when the key map already knows it or the names source finds its row.
     pub(super) fn locate(&mut self, key: ItemKey) -> Result<(), LazyRefusal> {
@@ -267,7 +304,9 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             if lowered > MOST_SEARCHED {
                 return Err(LazyRefusal::NotFound { key, krate: self.crate_shown(krate), searched: format!("{rows}; more bodies than the most one search lowers ({MOST_SEARCHED})").into_boxed_str() });
             }
-            self.lower_chain(key, &chain)?;
+            if self.lower_chain(key, &chain).is_err() {
+                continue;
+            }
             if self.front.keys.local_kind(key).is_some() {
                 return Ok(());
             }

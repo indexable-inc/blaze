@@ -3080,6 +3080,26 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         true
     }
 
+    /// Hints the cold lookup of body-local items in `locals` (`LibKey::INNER` set — either the
+    /// tabled item itself or a local fn/closure owner referenced inside its generic arguments) by
+    /// lowering their declarer chain `enclosers` (outermost first) in this maker's lazy program so
+    /// macro-generated local fns (e.g. `const_eval_select!` -> `runtime`, or `thread_local!`) are
+    /// filed in O(1) on any worker without scanning the crate.
+    pub fn prepare_local(&mut self, locals: &[ItemKey], enclosers: &[ItemKey]) {
+        if locals.is_empty() || enclosers.is_empty() {
+            return;
+        }
+        let Some(&first) = locals.first() else { return };
+        if self.construct(first).is_err() {
+            return;
+        }
+        if let Some((program, _)) = self.made.as_mut() {
+            for &key in locals {
+                program.prepare_local(key, enclosers);
+            }
+        }
+    }
+
     fn starting(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, G, T> {
         Maker {
             typing,

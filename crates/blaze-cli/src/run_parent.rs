@@ -883,12 +883,6 @@ impl Publication for CommandFront<'_, '_, '_> {
     }
 }
 
-impl Publication for crate::test_drive::TestFront<'_, '_, '_> {
-    fn for_publication(&mut self, symbol: [u8; 32], record: &[u8], no_personality: bool, values: &mut AVec<'_, u8>) -> Result<bool, ParentError> {
-        record_publication(symbol, record, no_personality, values, || Ok(self.names))
-    }
-}
-
 pub(crate) fn record_publication<'h>(
     symbol: [u8; 32], record: &[u8], no_personality: bool, values: &mut AVec<'_, u8>,
     names: impl FnOnce() -> Result<NamesRecords<'h>, ParentError>,

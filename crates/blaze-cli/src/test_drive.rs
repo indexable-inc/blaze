@@ -46,9 +46,8 @@ use core::time::Duration;
 
 use blaze_id::ItemKey as LibKey;
 use blaze_ids::{ContentId, Hasher};
-use blaze_ladder::body_ids::{BodyId, BodyIds, Read};
-use blaze_ladder::code_records::{Builder, CodeClass};
-use blaze_ladder::run::make_one::{Maker, NamesRecords, SecondCheck};
+use blaze_ladder::code_records::Builder;
+use blaze_ladder::run::make_one::{ByKind, Maker, NamesRecords};
 use blaze_ladder::run::special::Roots;
 use blaze_ladder::run::special::test_roots::test_roots;
 use blaze_launch::wire::run::Symbol;
@@ -74,16 +73,13 @@ use crate::code_store::HomeCodeStore;
 use crate::run_names::{Found, TestRows, TestUnit};
 use crate::run_ids::RunIds;
 use crate::run_loop::LoopError as RunLoopError;
-use crate::run_bytes::{Chosen, Delivery};
-use crate::run_parent::{self, CodeRefusal, Codes, Front, Gate, Lazy, Needs, ParentError, RECORDS, RecordsDir, Resolve, Resolved, Start as _, WRITE_BOUND};
+use crate::run_parent::{self, CodeRefusal, Codes, Needs, ParentError, RECORDS, WRITE_BOUND};
 
-/// THE TEST'S MAKER: every body checked by the run, as before D197 root 1, for now. `run`
-/// reads bodies from the check's records by kind (run_parent.rs `RunMaker`); a test's code
-/// workers cannot yet: the command's store handle (`CommandLent`) is a `RefCell`, not `Sync`,
-/// and the shared snapshot does not hold this command's own puts. What a worker needs: a `Sync`
-/// view that sees this command's puts, or the relay serving the record reads. The serial
-/// step's maker and the workers' are one type, so they flip together.
-pub(crate) type TestMaker<'h> = Maker<'h, crate::run_ids::Runnable, SecondCheck>;
+/// THE TEST WORKER'S MAKER: reads each workspace body's checked columns directly from the
+/// post-check [`StoreSnapshot`](crate::store::StoreSnapshot) via [`SnapshotTyped`](crate::engine_body_record::SnapshotTyped)
+/// (`ByKind`, zero lock contention across worker threads), matching `RunMaker` (`FromRecord`)
+/// without re-typechecking workspace bodies on worker threads.
+pub(crate) type TestMaker<'h> = Maker<'h, crate::run_ids::Runnable, ByKind<crate::engine_body_record::SnapshotTyped<'h>>>;
 use blaze_engine::SVec;
 use blaze_engine::code_pool::relay::{self as code_relay, Relay as PoolRelay, RelayError, Reply};
 use blaze_engine::code_pool::{Child, Time, Worker};
@@ -94,7 +90,7 @@ use crate::test_loop::{CannotRun, Effect, Event, LoopConfig, LoopError, Status, 
 use crate::test_run::{Answers, ChildEnd, Heard, Host as TestHost, RunError, Runner, Start, Zygotes};
 
 #[path = "test_suite_cache.rs"]
-mod suite_cache;
+pub(crate) mod suite_cache;
 
 /// The system's launcher of `sandbox_init` (blaze-proc-macro native_sandbox.rs uses the same):
 /// it applies the profile, then executes the launcher in its place, so the launcher's process is
@@ -361,10 +357,6 @@ impl fmt::Display for InstanceRefusal {
 /// Only a refusal of the requested instance belongs to its test. A broken shared record, a
 /// wire error, or an invariant of the parent stops the command; a names-record read that did
 /// not answer while one instance was made (`LazyRefusal::RecordsVoid`) is that test's. Keep the walk alive until the instance and item-relative site have been named.
-fn test_parent_error<F: Front, D: run_parent::Folder>(lazy: &mut Lazy<'_, '_, F, D>, cause: ParentError) -> OneError {
-    test_parent_error_places(lazy, cause)
-}
-
 fn test_parent_error_places(places: &mut impl crate::run_fault::Places, cause: ParentError) -> OneError {
     let Some((symbol, location)) = instance_site(&cause) else { return OneError::Parent(cause) };
     let site = location.map(|(item, byte)| match places.site(item, byte) {
@@ -1576,13 +1568,15 @@ impl Refuse for EntryCheck<'_, '_> {
 }
 
 /// Where `blaze test`'s code is made (D194, rule 78: THE seam, one line to flip). `Serial`: in
-/// the turn of the test that asked, on the command thread (today's; one long make holds every
-/// other test's answer). `Pooled`: each make is handed to a worker through [`CodeRelay`], the
-/// command thread only relays, and the asking test is parked, its allowance stopped, until its
-/// code comes or [`CODE_WAIT`] passes. `Pooled` for the real command needs [`CodeWorkers`] made
-/// on the command's pool (piece 2 of D194, [`pooled`]); with no worker beside the command
-/// thread, [`run_suites`] refuses it by name (`DriveError::NoCodeWorkers`), never runs serially.
-pub(crate) const CODES: Codes = Codes::Serial;
+/// the turn of the test that asked, on the command thread. `Pooled`: cache hits (`SuiteCache` /
+/// CAS store) answer immediately on the command thread, while cold misses are handed to off-thread
+/// [`CodeWorkers`] through [`CodeRelay`] in parallel whenever `workers > 1` (falling back cleanly
+/// to `Serial` when `--workers 1`, only one test runs, or the thread pool has 1 thread).
+pub(crate) const CODES: Codes = Codes::Pooled;
+
+/// Upper cap on concurrent `CodePool` compiler workers so per-worker `Maker` memory stays bounded
+/// even on 128-core hosts while scaling parallel JIT compilation across cores.
+const MAX_CODE_WORKERS: usize = 16;
 
 /// How long one test's ask for its code may wait for a worker's make (rule 18): past it the test
 /// is stopped with [`OneError::CodeLate`] naming the instance. The longest make met on tempo was
@@ -1608,6 +1602,8 @@ pub(crate) struct Job<'a> {
     /// The asking test's roots as its maker is made of them ([`TestFront::maker`]).
     pub entry: Option<ItemKey>,
     pub start: MakerStart,
+    /// Outermost-first declarer chain for a body-local item (`LibKey::INNER` set), empty otherwise.
+    pub enclosers: suite_cache::LocalEnclosers,
 }
 
 /// A worker's refusal of one make: the walk's error of it, as the serial step's would be.
@@ -1667,14 +1663,17 @@ impl<'a> CodeRelay<'a> {
     }
 
     /// One turn of relaying, never waiting: every finished make given back, the asks' deadlines
-    /// ticked, every make the pool wants handed to its worker.
-    pub(crate) fn pump(&self) -> Result<(), OneError> {
+    /// ticked, every make the pool wants handed to its worker. Returns whether any finished make
+    /// was drained from the workers.
+    pub(crate) fn pump(&self) -> Result<bool, OneError> {
         if let Some(fault) = self.fault.take() {
             return Err(OneError::Relay(fault));
         }
         let now = self.time();
         let mut relay = self.relay.borrow_mut();
+        let mut drained = false;
         while let Some((worker, result)) = self.workers.finished()? {
+            drained = true;
             match result {
                 Ok(bytes) => relay.made(now, worker, bytes),
                 Err(why) => relay.refused(now, worker, why),
@@ -1685,14 +1684,15 @@ impl<'a> CodeRelay<'a> {
         while let Some((worker, _, job)) = relay.job() {
             self.workers.give(worker, job)?;
         }
-        Ok(())
+        Ok(drained)
     }
 
     /// Child `child` asks for the code of `key` (`None`: unkeyed, its own), to be made by `job`.
     pub(crate) fn ask(&self, child: Child, key: Option<blaze_ladder::code_records::CodeKey>, job: Job<'static>) -> Result<(), OneError> {
         let key = key.map(|key| blaze_engine::code_pool::CodeKey(key.0));
         self.relay.borrow_mut().ask(self.time(), child, key, job).map_err(OneError::Relay)?;
-        self.pump()
+        let _ = self.pump()?;
+        Ok(())
     }
 
     /// Child `child`'s answer through `with`, once it came; `None` while it has not.
@@ -1731,12 +1731,12 @@ const HAND_WAIT: Duration = Duration::from_secs(5);
 const END_WAIT: Duration = CODE_WAIT;
 
 /// The most makers one code worker keeps (rule 18: a table has a cap): one per `(suite,
-/// MakerKind)` its makes asked, the oldest dropped first. Every `MakerStart::Direct(_)` test in
-/// a suite shares ONE `(suite, MakerKind::Direct)` maker, so this caps distinct suites (and
-/// `ByRule` entries) per worker rather than individual test functions; a maker dropped is made
-/// again cleanly (make_one.rs `Maker::of_start` reads nothing), its program state lowered again
-/// by need.
-const MOST_MAKERS: usize = 64;
+/// MakerKind)` its makes asked, least-recently-used dropped first. Every `MakerStart::Direct(_)`
+/// test in a suite shares ONE `(suite, MakerKind::Direct)` maker, so keeping 4 makers per worker
+/// prevents boundary thrashing when `OneEach` overlaps tail tests across adjacent suites while
+/// still evicting finished suites' multi-GB `LazyProgram` tables on large multi-crate workspaces.
+/// A maker dropped is made again cleanly (`Maker::of_start` reads nothing).
+const MOST_MAKERS: usize = 4;
 
 /// The scratch of a code worker's task (bstd `Scope::must_overlap`): its waits and spans; its
 /// names records and makers are in a frame of its own ([`work`]).
@@ -2137,11 +2137,18 @@ impl<M: MadeFor> Makers<M> {
         let kind = MakerKind::of(job.entry, job.start);
         let found = self.kept.iter().position(|(suite, kept_kind, _)| *suite == job.suite && (plant == MakersPlant::BySuiteAlone || *kept_kind == kind));
         let at = match found {
-            Some(at) => at,
+            Some(at) => {
+                if at + 1 < self.kept.len()
+                    && let Some(tail) = self.kept.get_mut(at..)
+                {
+                    tail.rotate_left(1);
+                }
+                self.kept.len() - 1
+            }
             None => {
                 let maker = make()?;
                 if self.kept.len() >= MOST_MAKERS {
-                    // The oldest first: at most `MOST_MAKERS` moved, once a maker is made.
+                    // Least-recently-used first: at most `MOST_MAKERS` moved, once a maker is made.
                     drop(self.kept.remove_shift(0));
                 }
                 self.kept.push((job.suite, kind, maker));
@@ -2194,6 +2201,7 @@ pub(crate) struct SuiteMakers<'w> {
     cx: &'w Cx,
     root: &'w Dir<ReadWrite>,
     sides: &'w [SuiteSide<'w>],
+    typed: crate::engine_body_record::SyncTypedFrom<'w>,
     procs: crate::job_texts::Procs<'w>,
     frame: &'w Frame,
     tables: Alloc<'static>,
@@ -2202,10 +2210,18 @@ pub(crate) struct SuiteMakers<'w> {
 }
 
 impl<'w> SuiteMakers<'w> {
-    pub(crate) fn new(cx: &'w Cx, root: &'w Dir<ReadWrite>, sides: &'w [SuiteSide<'w>], procs: crate::job_texts::Procs<'w>, frame: &'w Frame, heap: &'static blaze_own::Heap) -> SuiteMakers<'w> {
+    pub(crate) fn new(
+        cx: &'w Cx,
+        root: &'w Dir<ReadWrite>,
+        sides: &'w [SuiteSide<'w>],
+        typed: crate::engine_body_record::SyncTypedFrom<'w>,
+        procs: crate::job_texts::Procs<'w>,
+        frame: &'w Frame,
+        heap: &'static blaze_own::Heap,
+    ) -> SuiteMakers<'w> {
         let mut names = Vec::with_capacity_in(sides.len(), heap.alloc());
         names.resize(sides.len(), None);
-        SuiteMakers { cx, root, sides, procs, frame, tables: heap.alloc(), names, makers: Makers::new(heap.alloc(), MakersPlant::None) }
+        SuiteMakers { cx, root, sides, typed, procs, frame, tables: heap.alloc(), names, makers: Makers::new(heap.alloc(), MakersPlant::None) }
     }
 }
 
@@ -2227,12 +2243,16 @@ impl KeptMakers for SuiteMakers<'_> {
                 names
             }
         };
+        let cx = self.cx;
+        let typed = self.typed;
         let tables = self.tables;
         let maker = self.makers.of(job, || {
-            let mut maker = Maker::of_start(names, job.entry, job.start, SecondCheck, &side.builder, tables);
+            let reader = typed.reader(cx, side.crates.snapshot(), tables);
+            let mut maker = Maker::of_start(names, job.entry, job.start, ByKind::new(reader), &side.builder, tables);
             maker.watch(side.make_watch);
             Ok(maker)
         })?;
+        maker.prepare_local(job.enclosers.locals(), job.enclosers.enclosers());
         job.order.make(maker, &job.proof, job.name.as_slice(), entry)
     }
 
@@ -2252,7 +2272,17 @@ impl KeptMakers for SuiteMakers<'_> {
 
 /// One code worker's task (D194 piece 2): its frame, its proc-macro runner by need, its
 /// makers over every suite, then its loop until the command closes its lane.
-pub(crate) fn work(cx: &Cx, lane: WorkerLane<'_, '_>, clock: &bstd::clock::Clock, sides: &[SuiteSide<'_>], root: &Dir<ReadWrite>, procs: ProcsSide<'_>, heap: &'static blaze_own::Heap) -> Result<(), WorkerEnd> {
+#[expect(clippy::too_many_arguments, reason = "worker task entry receives the shared read-only suite sides and typed lookup")]
+pub(crate) fn work(
+    cx: &Cx,
+    lane: WorkerLane<'_, '_>,
+    clock: &bstd::clock::Clock,
+    sides: &[SuiteSide<'_>],
+    typed: crate::engine_body_record::SyncTypedFrom<'_>,
+    root: &Dir<ReadWrite>,
+    procs: ProcsSide<'_>,
+    heap: &'static blaze_own::Heap,
+) -> Result<(), WorkerEnd> {
     let frame = Frame::new(bstd::mem::Tag::Other).map_err(WorkerEnd::Frame)?;
     let by_need = WorkerProcs { cx, clock, lane, got: core::cell::OnceCell::new() };
     let procs = match procs {
@@ -2260,7 +2290,7 @@ pub(crate) fn work(cx: &Cx, lane: WorkerLane<'_, '_>, clock: &bstd::clock::Clock
         ProcsSide::Made(made) => crate::job_texts::Procs::Made(made),
         ProcsSide::ByNeed => crate::job_texts::Procs::ByNeed(&by_need),
     };
-    let mut makers = SuiteMakers::new(cx, root, sides, procs, &frame, heap);
+    let mut makers = SuiteMakers::new(cx, root, sides, typed, procs, &frame, heap);
     lane.run(cx, clock, &mut makers, heap)
 }
 
@@ -2334,11 +2364,31 @@ impl CodeWorkers<'static> for CodePool<'_, '_> {
     }
 }
 
-/// A test's run parked on its code (D194): since when (the run's clock) and for which symbol.
+/// A test's run parked on its code (D194): since when (the run's clock), which symbol and walk
+/// row generation it awaits, and whether it is waiting on a peer's unkeyed build without asking
+/// `CodeRelay`.
 #[derive(Clone, Copy)]
 struct Parked {
     since: Duration,
     symbol: [u8; 32],
+    row: usize,
+    epoch: u64,
+    peer: bool,
+}
+
+/// RAII guard ensuring a parked child always releases its waiter count in `SuiteCache` on drop
+/// (e.g. `OneEach::kill` or early error return) so no walk row stays stuck in `How::Making`.
+struct ParkedGuard<'c, 'h> {
+    cache: &'c RefCell<suite_cache::SuiteCache<'h>>,
+    parked: Option<Parked>,
+}
+
+impl Drop for ParkedGuard<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(park) = self.parked.take() && !park.peer {
+            self.cache.borrow_mut().release_in_flight(park.row, park.epoch);
+        }
+    }
 }
 
 /// What a parked run's answer was, taken out of the relay's borrow.
@@ -2358,9 +2408,8 @@ pub(crate) struct Launched<'c, 'h, 'a> {
     pub spawner: &'c Spawner,
     /// `blaze-launcher` beside this binary (own_process.rs `launcher_beside`).
     pub launcher: &'c str,
-    /// The records folder (run_parent.rs `RECORDS` under the home), and its absolute path: the
+    /// Absolute path of the records folder (run_parent.rs `RECORDS` under the home): the
     /// launcher's `BLAZE_LAUNCH_STORE`.
-    pub records: &'c Dir<ReadWrite>,
     pub store: &'c str,
     /// This command's folder of test folders, and its absolute path.
     pub temps: &'c Dir<ReadWrite>,
@@ -2484,73 +2533,6 @@ impl StderrCapture<'_> {
     }
 }
 
-/// One fd 3 request is served per turn. The resolver sees the symbol even for a request
-/// by slot, after Needs has looked the slot up in its own declaration table.
-struct TestResolve<'r, R> {
-    parent: &'r mut R,
-    requested: Option<TestAnswer>,
-}
-
-enum TestAnswer {
-    Ready {
-        symbol: Symbol,
-        record: blaze_launch::wire::RecordId,
-        purity: Result<(), NotKept>,
-        saw_record: bool,
-    },
-    Unresolved(Symbol),
-    /// Its row waits for its code, made by a worker (run_parent.rs `Codes::Pooled`, D194): the
-    /// need is not taken, and the run parks until the relay answers it.
-    Waiting(Symbol),
-}
-
-impl<R: Resolve> Resolve for TestResolve<'_, R> {
-    #[cfg(test)]
-    fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
-        self.parent.resolve(symbol)
-    }
-
-    fn publication(&mut self, symbol: &Symbol, values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {
-        let mut needs_native = false;
-        self.publication_with_native(symbol, values, &mut needs_native)
-    }
-
-    fn publication_with_native(
-        &mut self,
-        symbol: &Symbol,
-        values: &mut AVec<'_, u8>,
-        needs_native: &mut bool,
-    ) -> Result<Resolved<'_>, ParentError> {
-        let answer = self.parent.publication(symbol, values)?;
-        self.requested = Some(match answer {
-            Resolved::Record { record, sent, .. } => {
-                let mut purity = Ok(());
-                let mut saw_record = false;
-                for (rec_id, bytes) in sent.each() {
-                    let check = if rec_id == record {
-                        saw_record = true;
-                        crate::test_cache::check_record_purity(bytes)
-                    } else {
-                        crate::test_cache::check_datum_purity(bytes)
-                    };
-                    if purity.is_ok()
-                        && let Err(why) = check
-                    {
-                        purity = Err(why);
-                    }
-                }
-                if purity.is_err() {
-                    *needs_native = true;
-                }
-                TestAnswer::Ready { symbol: *symbol, record, purity, saw_record }
-            }
-            Resolved::Unknown => TestAnswer::Unresolved(*symbol),
-            Resolved::Waiting => TestAnswer::Waiting(*symbol),
-        });
-        Ok(answer)
-    }
-}
-
 struct FirstCall {
     symbol: Symbol,
     elapsed: Duration,
@@ -2604,469 +2586,15 @@ fn stop_child<C: RunChild>(run: C) -> Result<Stopped<C::Left>, ProcError> {
 }
 
 impl<'c> Launched<'c, '_, '_> {
-    /// The make `lazy`'s waiting row asked for, handed to the relay as child `child`'s ask: its
-    /// order, name and proof, and the maker its roots make ([`TestFront::maker`]).
-    fn ask_code<'r, D: run_parent::Folder>(&self, code: &'c CodeRelay<'c>, child: Child, lazy: &Lazy<'_, '_, TestFront<'_, '_, 'r>, D>) -> Result<(), OneError> {
-        let start = lazy.start().ok_or(OneError::Parent(ParentError::NothingAsked))?;
-        let ask = lazy.asked().ok_or(OneError::Parent(ParentError::NothingAsked))?;
-        let mut name = SVec::new_in(code.alloc);
-        name.extend_from_slice(ask.name);
-        let job = Job { suite: self.suite, order: ask.order, name, proof: ask.proof, entry: start.maker_entry(), start: start.maker_start };
-        code.ask(child, ask.key, job)
-    }
-
+    /// Unified suite-cached test execution path for BOTH `Codes::Serial` (`self.codes.is_none()`)
+    /// and `Codes::Pooled` (`self.codes.is_some()`):
+    /// - Cache hits (`SuiteCache` RAM / CAS store) answer immediately on the command thread with
+    ///   zero worker round-trip (preserving warm cache speed and lazy-native incremental caching).
+    /// - Under `Codes::Pooled`, cold misses dispatch to off-thread `CodePool` workers in parallel
+    ///   via `CodeRelay` (deduplicating in-flight symbols across children and suites), parking
+    ///   this child with its execution allowance paused until the worker finishes.
     async fn run_captured(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals, stderr: &mut StderrCapture<'_>, frame: &Frame) -> Result<RunOutcome, OneError> {
-        if self.codes.is_none() {
-            return self.run_captured_cached(row, budget, output, signals, stderr, frame).await;
-        }
-        let cx = self.cx;
-        let test = key_of(&self.tests, row)?;
-        // The test's own frame: everything of its run, dropped with it.
-        let erased = blaze_own::Erased::new(frame);
-        let alloc = erased.handle();
-        // 1. Its temporary folder, made empty: one already there is refused by name, so
-        // nothing another run left is read as this one's.
-        let name = bstd::mem::format_in!(frame, "{row}");
-        let named = Path::new(name.as_str()).map_err(OneError::Path)?;
-        self.temps.make_dir(cx, &named, Durable::No).map_err(OneError::Temp)?;
-        let temp = bstd::mem::format_in!(frame, "{}/{row}", self.temp);
-        // 2. The lazy parent with the test's roots; nothing built yet.
-        let exports = self.native.map_or(&[][..], |send| send.items);
-        let front = TestFront { names: self.names, ids: self.ids, builder: self.builder, tables: self.tables, alloc, test, exports, harness: self.tests.harnessed(), watch: self.watch, suite_cache: self.suite_cache };
-        let mut codes = HomeCodeStore::new(self.lent);
-        // THE SEAM LINE: how the records reach the program (run_bytes.rs `Delivery`; `Inline`
-        // sends them over descriptor 3 and files none).
-        let mut lazy = Lazy::new(cx, front, Chosen::of(Delivery::Inline, RecordsDir { cx, dir: self.records }, alloc), &mut codes, self.builder, alloc);
-        // Its place in the relay, told its end however the run ends (D194).
-        let child = Child(self.child_base + row as usize);
-        let _asking = self.codes.map(|code| Asking { code, child });
-        if self.codes.is_some() {
-            lazy.make_by(Codes::Pooled);
-        }
-        let mut needs = Needs::new(alloc);
-        let mut ahead = std::vec::Vec::new_in(alloc);
-        let mut placed = Vec::new_in(alloc);
-        // Eager native library first, before any `Declare`, when the image carries C initializers,
-        // shadows a pure libc symbol, or runs an unharnessed custom test. Otherwise arm lazy
-        // delivery so pure tests never load the dylib and remain cacheable.
-        let eager_native = self.native.is_some_and(|send| {
-            send.load_mode == crate::engine_native::NativeLoadMode::Eager || !self.tests.harnessed()
-        });
-        if let Some(send) = self.native {
-            if eager_native {
-                needs.tell_native(send.library, send.words, &mut ahead).map_err(|cause| test_parent_error(&mut lazy, cause))?;
-            } else {
-                needs.arm_lazy_native(send.library, send.words);
-            }
-        }
-        signals.begin(Doing::Roots);
-        let head = run_parent::ahead_of(None, &mut lazy, &mut needs, &mut placed, &mut ahead)
-            .map_err(|cause| test_parent_error(&mut lazy, cause))?;
-        let line = head.line;
-        let entry = bstd::mem::format_in!(frame, "{line}");
-        // 3. Its environment: its own `TMPDIR`, its package's variables (`PackageRun`), then the
-        // command's (less the names those set), then the run mode's names.
-        let mut vars: Vec<(&str, &str), &Frame> = Vec::with_capacity_in(self.env.len() + self.place.vars.len() + 8, frame);
-        vars.push(("TMPDIR", temp.as_str()));
-        vars.extend_from_slice(self.place.vars);
-        let package = self.place.vars;
-        let command = self.env.iter().copied().filter(|(name, _)| *name != "TMPDIR" && package.binary_search_by(|(set, _)| set.cmp(name)).is_err());
-        run_parent::launch_env(command, self.store, entry.as_str(), None, &mut vars);
-        // `launch_env` left out any `BLAZE_LAUNCH_NATIVE` of the command's own: the parent's word.
-        let lazy_native = self.native.filter(|_| !eager_native).map(|send| bstd::mem::format_in!(frame, "lazy:{}", send.hex));
-        if let Some(send) = self.native {
-            let value = lazy_native.as_ref().map_or(send.hex, |s| s.as_str());
-            vars.push(("BLAZE_LAUNCH_NATIVE", value));
-        }
-        // 4. The profile (blaze-run child.rs, the one test profile), the launcher under it.
-        let profile = seatbelt_profile(temp.as_str(), self.store, self.native, frame, alloc)?;
-        let mut args = Vec::with_capacity_in(self.args.len() + 3, frame);
-        args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
-        args.extend_from_slice(self.args);
-        // Its working directory: its package's root, as `cargo test` runs it (`PackageRun`).
-        let spec = RunSpec { program: SANDBOX_EXEC, arg0: None, args: args.as_slice(), env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
-        signals.begin(Doing::Starting);
-        let Started { child: mut run, pipes: given } = self.spawner.start_served(cx, &spec).map_err(OneError::Start)?;
-        // Its allowance runs from its start, less the time it was parked waiting for its code
-        // (D194) or stalled behind command-thread host work: those waits never eat the test's own
-        // execution budget.
-        let started_at = run.now();
-        signals.started.set(true);
-        let allowance = Duration::from_nanos(budget.0);
-        let mut parked_for = Duration::ZERO;
-        let mut parked: Option<Parked> = None;
-        // Its code came: the inbox kept from the waiting frame on is served again, unread.
-        let mut again = false;
-        let stdout = given.stdout.ok_or(OneError::MissingPipe { stream: "stdout" })?;
-        let stderr_pipe = given.stderr.ok_or(OneError::MissingPipe { stream: "stderr" })?;
-        let mut pipes = [Some(stdout), Some(stderr_pipe)];
-        let mut relay = Relay::new(GRACE);
-        let mut inbox = std::vec::Vec::new_in(alloc);
-        let mut reply = ahead;
-        let mut reply_at = 0usize;
-        let mut write_since: Option<Duration> = None;
-        let mut open = true;
-        let mut calls = Vec::new_in(alloc);
-        let mut published = 0;
-        let mut service_time = Duration::ZERO;
-        let mut torn = None;
-        let mut keep: Result<(), NotKept> = if !self.tests.harnessed() {
-            Err(NotKept::Untraced)
-        } else if eager_native {
-            Err(NotKept::Foreign)
-        } else {
-            Ok(())
-        };
-        let mut entered_fns: AVec<'_, crate::test_cache::EnteredFn<'_>> = Vec::new_in(self.cache_alloc);
-        let mut rec_bytes = bstd::mem::Bytes::new_in(frame, "the code record inspected for test purity");
-        let child_error = |error| OneError::Loop(RunLoopError::Child(error));
-        // Start the other ready children before building any first-call answer. The loop ends
-        // with the child's end and what it left (its channel, still read for what it wrote).
-        let (ended, mut over) = loop {
-            next_turn().await;
-            let _span = cx.span("blaze test: service one child's pipes, requests and deadline");
-            signals.begin(Doing::Relaying);
-            let now = run.now();
-            let open_park = parked.map_or(Duration::ZERO, |park| now.saturating_sub(park.since));
-            if let Some(code) = self.codes {
-                let pumping = run.now();
-                code.pump()?;
-                let pumped = run.now().saturating_sub(pumping);
-                if pumped >= DRAIN_EVERY {
-                    signals.begin(Doing::Serving);
-                    signals.add_host_nanos(pumped);
-                }
-                // The runner's watch moves its answer's due by it (test_run.rs `answer_due`).
-                signals.parked.set(u64::try_from(parked_for.saturating_add(open_park).as_nanos()).unwrap_or(u64::MAX));
-                signals.parked_now.set(parked.is_some());
-            }
-            if let (Some(park), Some(code)) = (parked, self.codes) {
-                let came = code.answer(child, |reply| match reply {
-                    Reply::Made(entry) => match lazy.made(entry) {
-                        Ok(()) => Came::Made,
-                        Err(cause) => Came::Failed(cause),
-                    },
-                    // Every asker of the key is handed the same refusal (rule 19).
-                    Reply::Refused(why) => Came::Failed(lazy.refused(why.for_asker())),
-                    Reply::Late { waited, .. } => Came::Late { waited },
-                })?;
-                if let Some(came) = came {
-                    parked_for = parked_for.saturating_add(open_park);
-                    parked = None;
-                    signals.parked.set(u64::try_from(parked_for.as_nanos()).unwrap_or(u64::MAX));
-                    signals.parked_now.set(false);
-                    let stop = match came {
-                        Came::Made => None,
-                        Came::Failed(cause) => Some(test_parent_error(&mut lazy, cause)),
-                        Came::Late { waited } => Some(match lazy.withdraw() {
-                            Ok(()) => OneError::CodeLate { instance: lazy.name_of(park.symbol), symbol: park.symbol, waited },
-                            Err(cause) => OneError::Parent(cause),
-                        }),
-                    };
-                    if let Some(error) = stop {
-                        // Its process waits for code it will never receive.
-                        stop_child(run).map_err(child_error)?;
-                        return Err(error);
-                    }
-                    again = true;
-                }
-            }
-            let until = current_until(started_at, allowance, parked_for.saturating_add(parked.map_or(Duration::ZERO, |park| now.saturating_sub(park.since))), signals);
-            if until.passed(now) {
-                match stop_child(run).map_err(child_error)? {
-                    Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
-                    Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
-                    Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
-                }
-            }
-            match relay.turn(now, signals.terminate(now)?) {
-                RelayAct::Forward => {
-                    if let Err(error) = run.terminate() {
-                        if is_macos_group_eperm(&error, RunStep::Terminate) {
-                            match run.wait(Deadline::PASSED).map_err(child_error)? {
-                                Waited::Ended(reaped) => break (child_outcome(reaped.exit), Some(reaped.left)),
-                                Waited::Running(_) => return Err(child_error(error)),
-                            }
-                        }
-                        return Err(child_error(error));
-                    }
-                }
-                RelayAct::Kill => {
-                    // A kill reaps: its end is always known.
-                    match stop_child(run).map_err(child_error)? {
-                        Stopped::Exited { exit, left } | Stopped::Killed { exit, left } => break (child_outcome(exit), Some(left)),
-                        Stopped::ZombieRace => break (How::Signal { number: 9 }, None),
-                    }
-                }
-                RelayAct::Nothing => {}
-            }
-            let bound = until.min(relay.bound());
-            if drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)? {
-                signals.progress.set(true);
-            }
-            if open && reply_at < reply.len() {
-                match flush_reply(&mut run, &mut reply, &mut reply_at, &mut write_since, until, signals) {
-                    Ok(FlushOut::Done) => published = calls.len(),
-                    Ok(FlushOut::Pending) => {}
-                    Ok(FlushOut::Hangup) => open = false,
-                    Ok(FlushOut::TimedOut) => match stop_child(run).map_err(child_error)? {
-                        Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
-                        Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
-                        Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
-                    },
-                    Err(error) => {
-                        stop_child(run).map_err(child_error)?;
-                        return Err(error);
-                    }
-                }
-            }
-            let write_bound = write_since.map_or(Deadline::NEVER, |since| Deadline::after(since, WRITE_BOUND));
-            let poll = Deadline::after(run.now(), signals.wait.replace(Duration::ZERO)).min(bound).min(write_bound);
-            let mut try_recv = open && parked.is_none();
-            let mut recv_deadline = poll;
-            if open && reply_at < reply.len() {
-                let ready = run.wait_ready(parked.is_none(), true, poll).map_err(child_error)?;
-                if ready.writable {
-                    match flush_reply(&mut run, &mut reply, &mut reply_at, &mut write_since, until, signals) {
-                        Ok(FlushOut::Done) => published = calls.len(),
-                        Ok(FlushOut::Pending) => {}
-                        Ok(FlushOut::Hangup) => open = false,
-                        Ok(FlushOut::TimedOut) => match stop_child(run).map_err(child_error)? {
-                            Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
-                            Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
-                            Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
-                        },
-                        Err(error) => {
-                            stop_child(run).map_err(child_error)?;
-                            return Err(error);
-                        }
-                    }
-                }
-                try_recv = open && parked.is_none() && ready.readable;
-                recv_deadline = Deadline::PASSED;
-            }
-            // Parked, nothing is read or served: its frames wait in the channel, in order.
-            if try_recv {
-                let got = if core::mem::take(&mut again) {
-                    // Its code came: the frames kept from the waiting one on, served again.
-                    Some(inbox.len())
-                } else {
-                    match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, recv_deadline) {
-                        Ok(Message::Whole { len }) => {
-                            signals.progress.set(true);
-                            Some(len)
-                        }
-                        Ok(Message::Closed) => {
-                            open = false;
-                            signals.progress.set(true);
-                            None
-                        }
-                        Err(error @ ProcError { fault: RunFault::Channel(ChannelError::Torn { .. }), .. }) => {
-                            torn = Some(error);
-                            open = false;
-                            None
-                        }
-                        Ok(Message::Deadline) => None,
-                        Err(error) => return Err(child_error(error)),
-                    }
-                };
-                if let Some(len) = got {
-                        compact_reply(&mut reply, &mut reply_at);
-                        self.watch.see(blaze_screen::Step::Waits);
-                        signals.begin(Doing::Serving);
-                        let serving = run.now();
-                        let before = lazy.tally();
-                        let mut resolver = TestResolve { parent: &mut lazy, requested: None };
-                        let frame_bytes = inbox.get(..len).unwrap_or(inbox.as_slice());
-                    let taken = match needs.serve(&mut resolver, frame_bytes, &mut reply) {
-                            Ok(taken) => taken,
-                            Err(cause) => {
-                                signals.add_host_nanos(run.now().saturating_sub(serving));
-                                // This group is waiting for code it will never receive.
-                                // Kill and reap before returning its typed outcome to the plan.
-                                stop_child(run).map_err(child_error)?;
-                                return Err(test_parent_error(&mut lazy, cause));
-                            }
-                        };
-                        let elapsed = run.now().saturating_sub(serving);
-                        service_time += elapsed;
-                        signals.add_host_nanos(elapsed);
-                        match resolver.requested {
-                            Some(TestAnswer::Unresolved(Symbol(symbol))) => {
-                                // Sending Failed would turn the unavailable instance into a launcher exit.
-                                stop_child(run).map_err(child_error)?;
-                                return Err(OneError::CannotBuild(InstanceRefusal {
-                                    instance: lazy.name_of(symbol), symbol, site: None, cause: RefusalCause::Unresolved,
-                                }));
-                            }
-                            Some(TestAnswer::Ready { symbol, record, purity, saw_record }) => {
-                                let after = lazy.tally();
-                                let unkeyed = after.unkeyed - before.unkeyed;
-                                if keep.is_ok() {
-                                    if unkeyed > 0 {
-                                        keep = Err(NotKept::Untraced);
-                                    } else if let Err(why) = purity {
-                                        keep = Err(why);
-                                    } else if !saw_record {
-                                        rec_bytes.clear();
-                                        match lazy.read_record(&record, &mut rec_bytes) {
-                                            Ok(()) => {
-                                                if let Err(why) = crate::test_cache::check_record_purity(rec_bytes.as_slice()) {
-                                                    keep = Err(why);
-                                                }
-                                            }
-                                            Err(_) => keep = Err(NotKept::Untraced),
-                                        }
-                                    }
-                                    if keep.is_ok() {
-                                        let cache_alloc = self.cache_alloc;
-                                        lazy.walked_entered(&symbol, |sym, tabled, name, key| {
-                                            if key.is_none() {
-                                                keep = Err(NotKept::Untraced);
-                                                return;
-                                            }
-                                            match blaze_ladder::body_ids::instance_key(
-                                                blaze_code::record::Symbol(sym.0),
-                                                tabled,
-                                                name,
-                                                self.ids,
-                                                &self.builder,
-                                                &self.builder.producer,
-                                                cache_alloc,
-                                            ) {
-                                                Some(inst_key) => {
-                                                    let mut name_copy = Vec::with_capacity_in(name.len(), cache_alloc);
-                                                    name_copy.extend_from_slice(name);
-                                                    entered_fns.push(crate::test_cache::EnteredFn {
-                                                        symbol: FnName(sym.0),
-                                                        code_key: inst_key.0.0,
-                                                        tabled,
-                                                        name: name_copy,
-                                                    });
-                                                }
-                                                None => keep = Err(NotKept::Untraced),
-                                            }
-                                        });
-                                    }
-                                }
-                                calls.push(FirstCall {
-                                    symbol, elapsed, made: after.made - before.made,
-                                    found: after.found - before.found, unkeyed,
-                                });
-                            }
-                            // Its row waits for its code, made by a worker (D194): the run parks.
-                            Some(TestAnswer::Waiting(Symbol(symbol))) => {
-                                let asked = match self.codes {
-                                    Some(code) => self.ask_code(code, child, &lazy),
-                                    // `Serial` makes inside the step and never waits.
-                                    None => Err(OneError::Parent(ParentError::NotReady { symbol })),
-                                };
-                                if let Err(error) = asked {
-                                    stop_child(run).map_err(child_error)?;
-                                    return Err(error);
-                                }
-                                parked = Some(Parked { since: run.now(), symbol });
-                                signals.parked_now.set(true);
-                            }
-                            // Faults and requests for an already answered slot need no resolution.
-                            None => {}
-                        }
-                        self.watch.see(blaze_screen::Step::Answers);
-                        // The served prefix out, the rest kept in order, as run_loop.rs does
-                        // (`drain` wants the nightly-only allocator trait of the vec's allocator).
-                        let left = inbox.len() - taken;
-                        inbox.copy_within(taken.., 0);
-                        inbox.truncate(left);
-                        if open && reply_at < reply.len() {
-                            let fresh_until = current_until(
-                                started_at,
-                                allowance,
-                                parked_for.saturating_add(parked.map_or(Duration::ZERO, |park| run.now().saturating_sub(park.since))),
-                                signals,
-                            );
-                            match flush_reply(&mut run, &mut reply, &mut reply_at, &mut write_since, fresh_until, signals) {
-                                Ok(FlushOut::Done) => published = calls.len(),
-                                Ok(FlushOut::Pending) => {}
-                                Ok(FlushOut::Hangup) => open = false,
-                                Ok(FlushOut::TimedOut) => match stop_child(run).map_err(child_error)? {
-                                    Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
-                                    Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
-                                    Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
-                                },
-                                Err(error) => {
-                                    stop_child(run).map_err(child_error)?;
-                                    return Err(error);
-                                }
-                            }
-                        }
-                        continue;
-                }
-            }
-            // Parked, the turn's wait is the sweep's interval (as a read's would be).
-            let look = if open && parked.is_none() { Deadline::PASSED } else if open && reply_at < reply.len() { Deadline::PASSED } else { poll };
-            run = match run.wait(look).map_err(child_error)? {
-                Waited::Ended(reaped) => break (child_outcome(reaped.exit), Some(reaped.left)),
-                Waited::Running(running) => running,
-            };
-        };
-        // The reaped child's remaining output belongs to its own capture.
-        if let Some(over_ref) = over.as_ref() {
-            let drain_until = Deadline::after(over_ref.now(), DRAIN_AFTER);
-            while pipes.iter().any(Option::is_some) && !drain_until.passed(over_ref.now()) {
-                let poll = Deadline::after(over_ref.now(), signals.wait.replace(Duration::ZERO)).min(drain_until);
-                let _ = drain_pipes(cx, &mut pipes, output, stderr, poll)?;
-                if pipes.iter().any(Option::is_some) {
-                    next_turn().await;
-                }
-            }
-        } else {
-            let _ = drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)?;
-        }
-        if let How::Signal { number } = ended {
-            let tally = lazy.tally();
-            self.write_signal_report(
-                row,
-                number,
-                stderr,
-                pipes[1].is_some(),
-                service_time,
-                tally,
-                calls.as_slice(),
-                published,
-                &needs,
-                &mut over,
-                &mut inbox,
-                torn,
-                frame,
-                &mut lazy,
-                |lazy, rec, bytes| lazy.read_record(rec, bytes),
-            )?;
-        } else if let Some(error) = torn {
-            return Err(child_error(error));
-        }
-        if entered_fns.is_empty() && keep.is_ok() {
-            keep = Err(NotKept::Untraced);
-        }
-        entered_fns.sort_unstable_by_key(|e| e.symbol);
-        entered_fns.dedup_by_key(|e| e.symbol);
-        let mut entered = Vec::with_capacity_in(entered_fns.len(), self.tables);
-        for e in entered_fns.iter() {
-            entered.push(e.symbol);
-        }
-        if !entered_fns.is_empty() {
-            let mut sink = self.entered_sink.borrow_mut();
-            for e in entered_fns {
-                sink.push((self.suite, e));
-            }
-        }
-        Ok(RunOutcome { how: ended, keep, entered })
-    }
-
-    /// Suite-cached serial execution path: shares one `Walk`, one `TestMaker`, one verified-entry
-    /// cache, and pre-resolved publications across all tests of the suite, with batch
-    /// pre-publishing for impure tests and heavy pure tests.
-    async fn run_captured_cached(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals, stderr: &mut StderrCapture<'_>, frame: &Frame) -> Result<RunOutcome, OneError> {
-        use suite_cache::{ChildAnswer, ChildResolver, ChildSent};
+        use suite_cache::{ChildAnswer, ChildResolver, ChildSent, NeedCode};
 
         let cx = self.cx;
         let test = key_of(&self.tests, row)?;
@@ -3091,10 +2619,17 @@ impl<'c> Launched<'c, '_, '_> {
             }
         };
         let mut codes = HomeCodeStore::new(self.lent);
+        // Its place in the relay, told its end however the run ends (D194).
+        let child = Child(self.child_base + usize::try_from(row).unwrap_or(0));
+        let _asking = self.codes.map(|code| Asking { code, child });
+        let code_mode = if self.codes.is_some() { Codes::Pooled } else { Codes::Serial };
         let mut needs = Needs::new(alloc);
         let mut child_sent = ChildSent::new(alloc);
         let mut ahead = run_parent::wire_out(alloc);
         let mut tally = run_parent::Tally::default();
+        // Eager native library first, before any `Declare`, when the image carries C initializers,
+        // shadows a pure libc symbol, or runs an unharnessed custom test. Otherwise arm lazy
+        // delivery so pure tests never load the dylib and remain cacheable.
         let eager_native = self.native.is_some_and(|send| {
             send.load_mode == crate::engine_native::NativeLoadMode::Eager || !self.tests.harnessed()
         });
@@ -3160,6 +2695,10 @@ impl<'c> Launched<'c, '_, '_> {
         signals.started.set(true);
         signals.progress.set(true);
         let allowance = Duration::from_nanos(budget.0);
+        let mut parked_for = Duration::ZERO;
+        let mut parked_guard = ParkedGuard { cache: self.suite_cache, parked: None };
+        // Its code came: the inbox kept from the waiting frame on is served again, unread.
+        let mut again = false;
         let stdout = given.stdout.ok_or(OneError::MissingPipe { stream: "stdout" })?;
         let stderr_pipe = given.stderr.ok_or(OneError::MissingPipe { stream: "stderr" })?;
         let mut pipes = [Some(stdout), Some(stderr_pipe)];
@@ -3179,7 +2718,90 @@ impl<'c> Launched<'c, '_, '_> {
             let _span = cx.span("blaze test: service one child's pipes, requests and deadline");
             signals.begin(Doing::Relaying);
             let now = run.now();
-            let until = current_until(started_at, allowance, Duration::ZERO, signals);
+            let open_park = parked_guard.parked.map_or(Duration::ZERO, |park| now.saturating_sub(park.since));
+            if let Some(code) = self.codes {
+                let pumping = run.now();
+                if code.pump()? {
+                    signals.progress.set(true);
+                }
+                let pumped = run.now().saturating_sub(pumping);
+                if pumped >= DRAIN_EVERY {
+                    signals.begin(Doing::Serving);
+                    signals.add_host_nanos(pumped);
+                }
+                // The runner's watch moves its answer's due by it (test_run.rs `answer_due`).
+                signals.parked.set(u64::try_from(parked_for.saturating_add(open_park).as_nanos()).unwrap_or(u64::MAX));
+                signals.parked_now.set(parked_guard.parked.is_some());
+            }
+            if let (Some(park), Some(code)) = (parked_guard.parked, self.codes) {
+                if park.peer {
+                    let done = !self.suite_cache.borrow().is_in_flight(park.row, park.epoch);
+                    if done {
+                        parked_for = parked_for.saturating_add(open_park);
+                        parked_guard.parked = None;
+                        signals.parked.set(u64::try_from(parked_for.as_nanos()).unwrap_or(u64::MAX));
+                        signals.parked_now.set(false);
+                        signals.progress.set(true);
+                        again = true;
+                    } else if open_park >= CODE_WAIT {
+                        parked_guard.parked = None;
+                        signals.parked_now.set(false);
+                        stop_child(run).map_err(child_error)?;
+                        let instance = self.suite_cache.borrow().name_of(park.symbol);
+                        let waited = u64::try_from(open_park.as_nanos()).unwrap_or(u64::MAX);
+                        return Err(OneError::CodeLate { instance, symbol: park.symbol, waited });
+                    }
+                } else {
+                    let came = code.answer(child, |reply| match reply {
+                        Reply::Made(entry) => {
+                            match self.suite_cache.borrow_mut().finish_in_flight(
+                                park.row,
+                                park.epoch,
+                                entry,
+                                self.ids,
+                                &mut codes,
+                                cx,
+                                self.watch,
+                            ) {
+                                Ok(()) => Came::Made,
+                                Err(cause) => Came::Failed(cause),
+                            }
+                        }
+                        // Every asker of the key is handed the same refusal (rule 19).
+                        Reply::Refused(why) => {
+                            let refused = self.suite_cache.borrow_mut().refused_in_flight(park.row, park.epoch);
+                            match refused {
+                                Ok(()) => Came::Failed(ParentError::CodeRefused { symbol: park.symbol, why: why.for_asker() }),
+                                Err(cause) => Came::Failed(cause),
+                            }
+                        }
+                        Reply::Late { waited, .. } => Came::Late { waited },
+                    })?;
+                    if let Some(came) = came {
+                        parked_for = parked_for.saturating_add(open_park);
+                        parked_guard.parked = None;
+                        signals.parked.set(u64::try_from(parked_for.as_nanos()).unwrap_or(u64::MAX));
+                        signals.parked_now.set(false);
+                        signals.progress.set(true);
+                        let stop = match came {
+                            Came::Made => None,
+                            Came::Failed(cause) => Some(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause)),
+                            Came::Late { waited } => {
+                                let mut sc = self.suite_cache.borrow_mut();
+                                sc.release_in_flight(park.row, park.epoch);
+                                Some(OneError::CodeLate { instance: sc.name_of(park.symbol), symbol: park.symbol, waited })
+                            }
+                        };
+                        if let Some(error) = stop {
+                            stop_child(run).map_err(child_error)?;
+                            return Err(error);
+                        }
+                        again = true;
+                    }
+                }
+            }
+            let total_parked = parked_for.saturating_add(parked_guard.parked.map_or(Duration::ZERO, |park| now.saturating_sub(park.since)));
+            let until = current_until(started_at, allowance, total_parked, signals);
             if until.passed(now) {
                 match stop_child(run).map_err(child_error)? {
                     Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
@@ -3229,10 +2851,10 @@ impl<'c> Launched<'c, '_, '_> {
             }
             let write_bound = write_since.map_or(Deadline::NEVER, |since| Deadline::after(since, WRITE_BOUND));
             let poll = Deadline::after(run.now(), signals.wait.replace(Duration::ZERO)).min(bound).min(write_bound);
-            let mut try_recv = open;
+            let mut try_recv = open && parked_guard.parked.is_none();
             let mut recv_deadline = poll;
             if open && reply_at < reply.len() {
-                let ready = run.wait_ready(true, true, poll).map_err(child_error)?;
+                let ready = run.wait_ready(parked_guard.parked.is_none(), true, poll).map_err(child_error)?;
                 if ready.writable {
                     match flush_reply(&mut run, &mut reply, &mut reply_at, &mut write_since, until, signals) {
                         Ok(FlushOut::Done) => published = calls.len(),
@@ -3249,27 +2871,32 @@ impl<'c> Launched<'c, '_, '_> {
                         }
                     }
                 }
-                try_recv = open && ready.readable;
+                try_recv = open && parked_guard.parked.is_none() && ready.readable;
                 recv_deadline = Deadline::PASSED;
             }
             if try_recv {
-                let got = match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, recv_deadline) {
-                    Ok(Message::Whole { len }) => {
-                        signals.progress.set(true);
-                        Some(len)
+                let got = if core::mem::take(&mut again) {
+                    // Its code came: the frames kept from the waiting one on, served again.
+                    Some(inbox.len())
+                } else {
+                    match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, recv_deadline) {
+                        Ok(Message::Whole { len }) => {
+                            signals.progress.set(true);
+                            Some(len)
+                        }
+                        Ok(Message::Closed) => {
+                            open = false;
+                            signals.progress.set(true);
+                            None
+                        }
+                        Err(error @ ProcError { fault: RunFault::Channel(ChannelError::Torn { .. }), .. }) => {
+                            torn = Some(error);
+                            open = false;
+                            None
+                        }
+                        Ok(Message::Deadline) => None,
+                        Err(error) => return Err(child_error(error)),
                     }
-                    Ok(Message::Closed) => {
-                        open = false;
-                        signals.progress.set(true);
-                        None
-                    }
-                    Err(error @ ProcError { fault: RunFault::Channel(ChannelError::Torn { .. }), .. }) => {
-                        torn = Some(error);
-                        open = false;
-                        None
-                    }
-                    Ok(Message::Deadline) => None,
-                    Err(error) => return Err(child_error(error)),
                 };
                 if let Some(len) = got {
                     compact_reply(&mut reply, &mut reply_at);
@@ -3282,6 +2909,7 @@ impl<'c> Launched<'c, '_, '_> {
                         &mut child_sent,
                         &roots,
                         test_entry,
+                        code_mode,
                         self.ids,
                         &mut codes,
                         cx,
@@ -3312,7 +2940,7 @@ impl<'c> Launched<'c, '_, '_> {
                                 instance, symbol, site: None, cause: RefusalCause::Unresolved,
                             }));
                         }
-                        Some(ChildAnswer::Ready { symbol, counts, .. }) => {
+                        Some(ChildAnswer::Ready { symbol, counts }) => {
                             // Batch pre-publish for impure tests: when a test becomes impure (or
                             // warm_order grew by >= 256 while impure), push all remaining warm
                             // suite functions in one batch. Pure tests never receive pre-published
@@ -3350,6 +2978,45 @@ impl<'c> Launched<'c, '_, '_> {
                                 symbol, elapsed, made: counts.made, found: counts.found, unkeyed: counts.unkeyed,
                             });
                         }
+                        Some(ChildAnswer::Waiting(need)) => {
+                            let elapsed = run.now().saturating_sub(serving);
+                            service_time += elapsed;
+                            signals.add_host_nanos(elapsed);
+                            match need {
+                                NeedCode::Ask(ask) => {
+                                    let asked = match self.codes {
+                                        Some(code) => {
+                                            let job = self.suite_cache.borrow().job_for(self.suite, &ask, code.alloc);
+                                            code.ask(child, ask.key, job)
+                                        }
+                                        None => Err(OneError::Parent(ParentError::NotReady { symbol: ask.symbol })),
+                                    };
+                                    if let Err(error) = asked {
+                                        self.suite_cache.borrow_mut().release_in_flight(ask.row, ask.epoch);
+                                        stop_child(run).map_err(child_error)?;
+                                        return Err(error);
+                                    }
+                                    parked_guard.parked = Some(Parked {
+                                        since: run.now(),
+                                        symbol: ask.symbol,
+                                        row: ask.row,
+                                        epoch: ask.epoch,
+                                        peer: false,
+                                    });
+                                    signals.parked_now.set(true);
+                                }
+                                NeedCode::WaitPeer { row: wait_row, epoch, symbol } => {
+                                    parked_guard.parked = Some(Parked {
+                                        since: run.now(),
+                                        symbol,
+                                        row: wait_row,
+                                        epoch,
+                                        peer: true,
+                                    });
+                                    signals.parked_now.set(true);
+                                }
+                            }
+                        }
                         None => {
                             let elapsed = run.now().saturating_sub(serving);
                             service_time += elapsed;
@@ -3363,7 +3030,8 @@ impl<'c> Launched<'c, '_, '_> {
                     // Flush as much as fits non-blockingly on the same turn so small replies wake
                     // the child immediately while large batches stream without blocking or deadlocking.
                     if open && reply_at < reply.len() {
-                        let fresh_until = current_until(started_at, allowance, Duration::ZERO, signals);
+                        let fresh_parked = parked_for.saturating_add(parked_guard.parked.map_or(Duration::ZERO, |park| run.now().saturating_sub(park.since)));
+                        let fresh_until = current_until(started_at, allowance, fresh_parked, signals);
                         match flush_reply(&mut run, &mut reply, &mut reply_at, &mut write_since, fresh_until, signals) {
                             Ok(FlushOut::Done) => published = calls.len(),
                             Ok(FlushOut::Pending) => {}
@@ -3382,12 +3050,13 @@ impl<'c> Launched<'c, '_, '_> {
                     continue;
                 }
             }
-            let look = if open { Deadline::PASSED } else { poll };
+            let look = if open && parked_guard.parked.is_none() { Deadline::PASSED } else if open && reply_at < reply.len() { Deadline::PASSED } else { poll };
             run = match run.wait(look).map_err(child_error)? {
                 Waited::Ended(reaped) => break (child_outcome(reaped.exit), Some(reaped.left)),
                 Waited::Running(running) => running,
             };
         };
+        drop(parked_guard);
         if let Some(over_ref) = over.as_ref() {
             let drain_until = Deadline::after(over_ref.now(), DRAIN_AFTER);
             while pipes.iter().any(Option::is_some) && !drain_until.passed(over_ref.now()) {
@@ -3743,100 +3412,6 @@ fn drain_pipes(cx: &Cx, pipes: &mut [Option<OutPipe>; 2], output: &mut Output<'_
     Ok(active)
 }
 
-/// The front of one test's run: the command's names records, body ids, and shared suite cache
-/// (made once for the suite, shared by every test), and the roots of row n's test fn
-/// (test_roots.rs). Reuses the suite's single persistent `RunMaker` and verified-entry cache
-/// via [`suite_cache::SuiteSharedMaker`] instead of constructing a fresh `Maker` per test.
-pub(crate) struct TestFront<'s, 'h, 'r> {
-    pub harness: bool,
-    pub names: NamesRecords<'h>,
-    pub ids: &'s RunIds<'h>,
-    pub builder: Builder,
-    pub tables: Alloc<'static>,
-    pub alloc: Alloc<'r>,
-    pub test: LibKey,
-    /// The Rust fns the test binary's C calls (its image's words, `NativeSend::items`): roots.
-    pub exports: &'s [LibKey],
-    pub watch: &'s dyn Watch,
-    /// Suite-wide shared maker and verified-entry cache (borrowed synchronously only, rule 27).
-    pub suite_cache: &'s RefCell<suite_cache::SuiteCache<'h>>,
-}
-
-impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
-    type Start = Roots<'r>;
-    type Ids = &'s RunIds<'h>;
-    type Maker = suite_cache::SuiteSharedMaker<'s, 'h>;
-
-    fn start(&mut self) -> Result<Roots<'r>, ParentError> {
-        entry_roots(self.harness, self.names, self.test, self.exports, self.builder, self.tables, self.alloc).map_err(ParentError::Roots)
-    }
-
-    fn ids(&mut self) -> Result<&'s RunIds<'h>, ParentError> {
-        Ok(self.ids)
-    }
-
-    fn maker(&mut self, start: &Roots<'r>, ids: &&'s RunIds<'h>) -> Result<suite_cache::SuiteSharedMaker<'s, 'h>, ParentError> {
-        let entry = start.maker_entry();
-        self.suite_cache
-            .borrow_mut()
-            .ensure_maker(entry, start.maker_start, **ids)
-            .map_err(|why| ParentError::Walk {
-                symbol: start.head().line.symbol.0,
-                why: blaze_ladder::body_ids::WalkError::Make { tabled: entry.unwrap_or(ItemKey(0)), why },
-            })?;
-        Ok(suite_cache::SuiteSharedMaker::new(self.suite_cache, **ids, entry, start.maker_start))
-    }
-
-    /// As run_parent.rs `CommandFront::path_of`: the one printer over the names records.
-    fn path_of(&mut self, item: ItemKey) -> Option<Box<str>> {
-        use blaze_ladder::front2::source::NamesSource;
-        let lib = self.names.records.key_beginning(item.0.to_be_bytes())?;
-        blaze_ladder::front2::item_shown::ItemShown::of_lib(self.names.records, lib).path().map(Box::from)
-    }
-
-    fn named(&mut self, maker: Option<&suite_cache::SuiteSharedMaker<'s, 'h>>, tabled: ItemKey, name: &[u8]) -> crate::run_fault::Named {
-        use crate::run_fault::Named;
-        if let Some(shown) = maker.and_then(|maker| maker.instance_shown(tabled, name)) {
-            return Named::Shown { item: shown.item, args: shown.args };
-        }
-        match self.path_of(tabled) {
-            Some(path) => Named::Path(path),
-            None => Named::Item(tabled),
-        }
-    }
-
-    fn site_shown(&mut self, maker: Option<&suite_cache::SuiteSharedMaker<'s, 'h>>, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
-        let (file, line, column) = maker?.site_shown(item, site)?;
-        Some(crate::run_fault::SiteShown { file: Box::from(file), line, column })
-    }
-
-    fn watch(&self) -> &dyn Watch {
-        self.watch
-    }
-}
-
-/// The body ids one suite's tests share: each test's lazy parent borrows them.
-impl BodyIds for &RunIds<'_> {
-    fn body_check(&self, item: ItemKey) -> Option<BodyId<'_>> {
-        (**self).body_check(item)
-    }
-    fn today(&self, fact: &[u8; 32]) -> Option<[u8; 32]> {
-        (**self).today(fact)
-    }
-    fn crate_fact(&self, item: ItemKey) -> Option<Read> {
-        (**self).crate_fact(item)
-    }
-    fn class(&self, item: ItemKey) -> CodeClass {
-        (**self).class(item)
-    }
-}
-
-impl Gate for &RunIds<'_> {
-    fn runnable(&self, item: ItemKey) -> Result<crate::run_ids::Runnable, crate::run_ids::NotRunnable> {
-        RunIds::runnable(self, item)
-    }
-}
-
 /// `name` beneath `dir`, made; one already there taken as it is (a folder is the state wanted);
 /// anything else fails naming it.
 /// Whether a file is at `launcher` (an absolute path, own_process.rs `launcher_beside`): its
@@ -4049,31 +3624,50 @@ pub(crate) fn run_suites<'h>(
     // The command's one make watch (rule 75: its clock started here, at the edge), handed to
     // every maker, the serial turns' and each code worker's (rule 16: a large or slow make's line).
     let make_watch = crate::run_parent::command_make_watch();
+    let total_tests: usize = suites.iter().map(|suite| suite.unit.tests.len()).sum();
+    let want_workers = usize::try_from(config.plan.width).unwrap_or(MAX_CODE_WORKERS).min(total_tests).min(MAX_CODE_WORKERS);
     match CODES {
-        Codes::Serial => run_selected(cx, fs, env, host, clock, out, err, suites, ids, typed, certificate, config, args, lent, tables, watch, make_watch, frame, None),
-        Codes::Pooled => pooled(cx, clock, rng, suites, root, procs, heap, make_watch, |relay| run_selected(cx, fs, env, host, clock, out, err, suites, ids, typed, certificate, config, args, lent, tables, watch, make_watch, frame, Some(relay))),
+        Codes::Pooled if want_workers > 1 && cx.workers() > 1 => {
+            let sync_typed = typed.sync_over(*ids);
+            pooled(cx, clock, rng, suites, sync_typed, want_workers, root, procs, heap, make_watch, |relay| {
+                run_selected(cx, fs, env, host, clock, out, err, suites, ids, typed, certificate, config, args, lent, tables, watch, make_watch, frame, Some(relay))
+            })
+        }
+        Codes::Serial | Codes::Pooled => {
+            run_selected(cx, fs, env, host, clock, out, err, suites, ids, typed, certificate, config, args, lent, tables, watch, make_watch, frame, None)
+        }
     }
 }
 
-/// [`run_suites`] under `Codes::Pooled` (D194 piece 2): the command's code workers started (one
-/// a worker of the pool beside the command thread, as many as are idle now: the pool's size is
-/// the machine's, never waited for; none is a refusal by name, never a serial run in its place,
-/// rule 3), the relay made over them, `run` handed it; then every lane closed and each worker
-/// joined within [`END_WAIT`] (a make in flight ends, its entry dropped: its asker is gone).
+/// [`run_suites`] under `Codes::Pooled` (D194 piece 2): spawns up to `want_workers` code workers
+/// (bounded by available pool threads beside the command thread and [`MAX_CODE_WORKERS`]), runs
+/// `run` over the shared [`CodeRelay`], then closes every lane and joins all workers within
+/// [`END_WAIT`].
 ///
 /// What is shared and what is not (the doc of run_names.rs `RunCrates`): each worker reads the
-/// suites' crates in place and makes its own names records, trees, environments and makers; the
-/// proc-macro runner, made by need on this thread, is relayed ([`CodePool::finished`]).
+/// suites' crates and post-check typed records (`SyncTypedFrom` + `StoreSnapshot`) lock-free in
+/// place and maintains ONE persistent per-suite `Maker` (`Makers`), lazily initialized on its
+/// first cold miss; the proc-macro runner, made by need on this thread, is relayed
+/// ([`CodePool::finished`]).
 #[expect(clippy::too_many_arguments, reason = "the command supplies the suites, the workers' inputs and the run")]
 fn pooled<'h>(
-    cx: &Cx, clock: &bstd::clock::Clock, rng: &mut bstd::rng::Rng, suites: &[Suite<'_, 'h>], root: &Dir<ReadWrite>, procs: crate::job_texts::Procs<'_>, heap: &'static blaze_own::Heap,
+    cx: &Cx,
+    clock: &bstd::clock::Clock,
+    rng: &mut bstd::rng::Rng,
+    suites: &[Suite<'_, 'h>],
+    typed: crate::engine_body_record::SyncTypedFrom<'h>,
+    want_workers: usize,
+    root: &Dir<ReadWrite>,
+    procs: crate::job_texts::Procs<'_>,
+    heap: &'static blaze_own::Heap,
     make_watch: blaze_ladder::run::make_one::MakeWatch<'static>,
     run: impl FnOnce(&CodeRelay<'_>) -> Result<Status, DriveError>,
 ) -> Result<Status, DriveError> {
     let cx = cx.span("blaze test: the command's code workers");
     let hash_seed = rng.next_u64();
     let have = cx.workers();
-    let Some(most) = core::num::NonZeroUsize::new(usize::try_from(have.saturating_sub(1)).unwrap_or(0)) else {
+    let avail = usize::try_from(have.saturating_sub(1)).unwrap_or(0);
+    let Some(most) = core::num::NonZeroUsize::new(avail.min(want_workers).min(MAX_CODE_WORKERS)) else {
         return Err(DriveError::NoCodeWorkers { have });
     };
     let lanes = Lanes::new(most, heap);
@@ -4089,7 +3683,7 @@ fn pooled<'h>(
     for at in 0..most.get() {
         let lane = lanes.lane(at);
         let clock = clock.clone();
-        match scope.must_overlap("blaze test: a code worker", WORKER_SCRATCH, move |cx: &Cx| work(cx, lane, &clock, sides, root, side, heap)) {
+        match scope.must_overlap("blaze test: a code worker", WORKER_SCRATCH, move |cx: &Cx| work(cx, lane, &clock, sides, typed, root, side, heap)) {
             Ok(task) => tasks.push(task),
             // No worker idle now: the workers are the ones the pool gave at the start.
             Err(_) => break,
@@ -4148,7 +3742,6 @@ fn run_selected<'h>(
     let home_name = bstd::env::VarName::new("HOME").map_err(|_| one(OneError::NoHome))?;
     let home = env.get(&home_name).ok().flatten().ok_or(one(OneError::NoHome))?;
     let home = home.trim_end_matches('/');
-    let records = fs.home(&cx, home, &Path::new(RECORDS).map_err(|why| one(OneError::Path(why)))?).map_err(|why| one(OneError::Home(why)))?;
     // The test folders, each level made or taken as it is beneath the home's `.blaze/v2` (which
     // holds the toolchain this command has read, so it is there): a home folder's handle makes
     // nothing until a file is made in it (bstd fs.rs `home`), and `make_dir` makes one level
@@ -4235,7 +3828,7 @@ fn run_selected<'h>(
         let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
         launches.push(Launched {
             err: &err, package: unit.package, target: unit.target,
-            cx: &cx, spawner: &spawner, launcher: launcher.as_str(), records: &records, store: store.as_str(),
+            cx: &cx, spawner: &spawner, launcher: launcher.as_str(), store: store.as_str(),
             temps: dir, temp: temp.as_str(), env: vars.as_slice(), place: suite.place, tests, names: suite.names, ids,
             builder: suite.builder, lent, tables, watch,
             args: if tests.harnessed() { &[] } else { args },

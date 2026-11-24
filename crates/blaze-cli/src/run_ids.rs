@@ -1659,6 +1659,49 @@ fn read_at(b: &[u8]) -> Read {
     Read { fact: word_at(b, 0), digest: word_at(b, 32) }
 }
 
+/// Read-only `Send + Sync` projection of [`RunIds`] holding only the immutable crate/body byte
+/// tables needed by off-thread code workers (`engine_body_record.rs` `SnapshotTyped`) to resolve
+/// a body's grain and `BodyCheck` name without touching `OnceCell` proof slots.
+#[derive(Clone, Copy)]
+pub(crate) struct IdsLookup<'a> {
+    crates: &'a [u8],
+    grains: &'a [GrainTag],
+    bodies: &'a [u8],
+}
+
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<IdsLookup<'static>>();
+};
+
+impl IdsLookup<'_> {
+    /// The grain `item`'s body is keyed at; `None`: its key's prefix is of no crate of the list.
+    pub(crate) fn grain(&self, item: ItemKey) -> Option<Grain> {
+        let prefix = prefix_of(item);
+        let n = self.crates.len() / CRATE_ROW;
+        let at = search(n, |i| {
+            let row = self.crates.get(i * CRATE_ROW..i * CRATE_ROW + 8).unwrap_or(&[]);
+            row.cmp(&prefix[..])
+        })?;
+        Some(match *self.grains.get(at)? {
+            GrainTag::Toolchain => Grain::Toolchain,
+            GrainTag::Locked => Grain::Dependency,
+            GrainTag::Workspace | GrainTag::WorkspaceNone => Grain::Workspace,
+        })
+    }
+
+    /// The `BodyCheck` (or `Signature`) task of the workspace body `item`'s row; `None`: no row.
+    pub(crate) fn check_of(&self, item: ItemKey) -> Option<Name> {
+        let n = self.bodies.len() / BODY_ROW;
+        let at = search(n, |i| {
+            let row = self.bodies.get(i * BODY_ROW..(i + 1) * BODY_ROW).unwrap_or(&[]);
+            body_item(row).cmp(&item)
+        })?;
+        let row = self.bodies.get(at * BODY_ROW..(at + 1) * BODY_ROW)?;
+        Some(row_check(row))
+    }
+}
+
 /// The command's body ids for `blaze run` (the module doc). Its crate and body rows are the
 /// table record's bytes ([`RunIds::read`]: the store's, in place, on a certificate hit; the
 /// builder's, on a walk); today's table (the crates' facts, one per crate) is one copy in the
@@ -2139,13 +2182,15 @@ impl<'a> RunIds<'a> {
         }
     }
 
+    /// Read-only `Send + Sync` view over this table's immutable crate/body lookup slices for
+    /// parallel code workers (`engine_body_record.rs` `SnapshotTyped`).
+    pub(crate) fn lookup(&self) -> IdsLookup<'a> {
+        IdsLookup { crates: self.crates, grains: self.grains, bodies: self.bodies }
+    }
+
     /// The grain `item`'s body is keyed at; `None`: its key's prefix is of no crate of the list.
     pub(crate) fn grain(&self, item: ItemKey) -> Option<Grain> {
-        Some(match self.crate_of(item)?.grain {
-            CrateGrain::Toolchain => Grain::Toolchain,
-            CrateGrain::Locked(_) => Grain::Dependency,
-            CrateGrain::Workspace(_) => Grain::Workspace,
-        })
+        self.lookup().grain(item)
     }
 
     /// What the store holds of the workspace body `item`'s check today; `None`: `item` is no
@@ -2160,7 +2205,7 @@ impl<'a> RunIds<'a> {
     /// body's typed record (engine_body_record.rs `StoreTyped`). `None`: no body row (a
     /// toolchain or dependency body, or one the command did not name).
     pub(crate) fn check_of(&self, item: ItemKey) -> Option<Name> {
-        self.body(item).map(|row| row.check)
+        self.lookup().check_of(item)
     }
 
     /// THE GATE, asked at the call (states.md item 13): the proof that the fn `item` may run,
