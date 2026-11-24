@@ -236,8 +236,8 @@ use blaze_lir::VerifyError;
 use blaze_typeck::{Adt, BodyView, Checked, Expr, ExprId, FmtTrait, FnSig, ItemKey, LangItem, List, Mutbl, PTy, PTys, PatId, PortableTys};
 
 pub use instance::{
-    Instance, InstanceKey, REIFY_SHIM_ITEM, VTABLE_SHIM_ITEM, closure_method_key_args, copy_written, ground, instance_key, instance_key_normalized, reify_shim_instance, reify_shim_key_args,
-    reify_shim_of, vtable_shim_instance, vtable_shim_key_args, vtable_shim_of,
+    Instance, InstanceKey, REIFY_SHIM_ITEM, TEST_REPORT_SHIM_ITEM, VTABLE_SHIM_ITEM, closure_method_key_args, copy_written, ground, instance_key, instance_key_normalized, reify_shim_instance,
+    reify_shim_key_args, reify_shim_of, test_report_shim_instance, test_report_shim_key_args, test_report_shim_of, vtable_shim_instance, vtable_shim_key_args, vtable_shim_of,
 };
 pub use walk::arith_checks::PanicConst;
 pub use walk::coroutine::{CoroutineFacts, CoroutineOf, StateShape, coroutine_facts, coroutine_of, coroutines_in, identity as coroutine_identity};
@@ -1359,6 +1359,23 @@ pub fn build_vtable_shim<A: Allocator + Copy>(
     alloc: A,
 ) -> Result<Built<A>, BuildError> {
     walk::build_vtable_shim(target, sig, subst, adts, alloc)
+}
+
+/// Builds the test report shim for a monomorphic `#[test]` fn returning a `T: Termination` other
+/// than `()` (docs/v2/plan/design/test.md, piece 8; named by [`TEST_REPORT_SHIM_ITEM`]): takes C
+/// `main`'s `(argc, argv)` arguments (ignored), calls `test()`, passes its return value to
+/// `<R as Termination>::report` (`report_fn`), and returns the resulting `ExitCode` byte
+/// zero-extended to `i32` (`0` = pass, non-zero = failure).
+pub fn build_test_report_shim<A: Allocator + Copy>(
+    test: ItemKey,
+    test_sig: &FnSig<'_>,
+    report_fn: ItemKey,
+    report_sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    walk::build_test_report_shim(test, test_sig, report_fn, report_sig, subst, adts, alloc)
 }
 
 /// Builds the CTOR FN `ctor` of variant `variant` (a struct's is 0) of a tuple struct or tuple

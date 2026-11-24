@@ -924,6 +924,124 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
         self.check_lir_error()
     }
+
+    /// The test report shim of `#[test]` fn `test` (docs/v2/plan/design/test.md, piece 8;
+    /// lib.rs `build_test_report_shim`): has C `main`'s signature
+    /// `extern "C" fn(argc: i32, argv: *const *const c_char) -> i32`, ignores `argc`/`argv`,
+    /// calls `test()` -> `r: R`, calls `<R as Termination>::report(r)` -> `ExitCode`, and
+    /// returns the status byte zero-extended to `i32` (`0` = success, non-zero = failure).
+    fn run_test_report_shim(&mut self, test: ItemKey, test_sig: &FnSig<'_>, report_fn: ItemKey, report_sig: &FnSig<'_>) -> Result<(), BuildError> {
+        let sig_err = |error: TyErr| match error {
+            TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
+            TyErr::Malformed(what) => malformed(what),
+            TyErr::Other(error) => error,
+        };
+        let generics = test_sig.parent_count.checked_add(test_sig.own_count).ok_or(malformed("a generic count past u32"))?;
+        if generics != 0 || !self.args.is_empty() {
+            return Err(malformed("a test report shim whose test fn has generic parameters"));
+        }
+        if !test_sig.inputs.is_empty() {
+            return Err(malformed("a test report shim whose test fn takes parameters"));
+        }
+        let test_abi = self.adts.abi(test).ok_or(BuildError::NoAbi { item: test })?;
+        let output = self.ground_in(test_sig.types, test_sig.output).map_err(sig_err)?;
+        let output_repr = self.repr(output).map_err(sig_err)?;
+        let output_pass = self.pass(output, output_repr, test_abi, Some(test))?;
+
+        let own = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I32), Param::of(Ty::PTR)], &[Param::of(Ty::I32)]);
+        self.b.set_signature(own);
+        self.ret = Repr::Int { ty: Ty::I32, signed: true };
+        self.ret_pass = self.rust_pass(self.ret)?;
+
+        let entry = self.create();
+        if let Some(slot) = self.reached.get_mut(entry.index()) {
+            *slot = true;
+        }
+        self.begin(entry);
+        let _argc = self.b.param(Ty::I32);
+        let _argv = self.b.param(Ty::PTR);
+        self.scope_marks.push(0);
+
+        let test_inst = Instance { item: test, args: List::EMPTY };
+        let test_loc = self.reify_caller_arg(test_inst)?;
+        let test_nounwind = self.adts.nounwind(test) == Some(true);
+        let test_place = self.ref_place(test_inst);
+        let test_ref = Callee::Direct(self.b.reference(RefKind::Func, test_place));
+        if let Some(loc) = test_loc {
+            self.push_val(V::Scalar(loc), None);
+            self.emit_call_from(test_ref, &[Repr::Ptr], &[track_caller::PASS], None, test_nounwind, output_repr, output_pass)?;
+        } else {
+            self.emit_call_from(test_ref, &[], &[], None, test_nounwind, output_repr, output_pass)?;
+        }
+        let r_val = self.pop()?;
+        if let PNode::Never = self.ground_node(output).map_err(sig_err)? {
+            self.unreachable_of(TrapKind::AfterDivergingCall, None);
+            return self.check_lir_error();
+        }
+
+        let report_abi = self.adts.abi(report_fn).ok_or(BuildError::NoAbi { item: report_fn })?;
+        let report_self_pass = self.pass(output, output_repr, report_abi, Some(report_fn))?;
+        let exit_ty = crate::instance::ground(report_sig.types, report_sig.output, &[output], self.ground, self.scratch, self.adts.facts())
+            .map_err(ground_err)
+            .map_err(sig_err)?;
+        let exit_repr = self.repr(exit_ty).map_err(sig_err)?;
+        let exit_pass = self.pass(exit_ty, exit_repr, report_abi, Some(report_fn))?;
+
+        let report_args = self.ground.intern_list(&[output]).map_err(|_| malformed("the ground table is full"))?;
+        let report_inst = Instance { item: report_fn, args: report_args };
+        let report_loc = self.reify_caller_arg(report_inst)?;
+        let report_nounwind = self.adts.nounwind(report_fn) == Some(true);
+        let report_place = self.ref_place(report_inst);
+        let report_ref = Callee::Direct(self.b.reference(RefKind::Func, report_place));
+        self.push_val(r_val, None);
+        if let Some(loc) = report_loc {
+            self.push_val(V::Scalar(loc), None);
+            self.emit_call_from(
+                report_ref,
+                &[output_repr, Repr::Ptr],
+                &[report_self_pass, track_caller::PASS],
+                None,
+                report_nounwind,
+                exit_repr,
+                exit_pass,
+            )?;
+        } else {
+            self.emit_call_from(report_ref, &[output_repr], &[report_self_pass], None, report_nounwind, exit_repr, exit_pass)?;
+        }
+        let exit_val = self.pop()?;
+        if let PNode::Never = self.ground_node(exit_ty).map_err(sig_err)? {
+            self.unreachable_of(TrapKind::AfterDivergingCall, None);
+            return self.check_lir_error();
+        }
+
+        let status = match (exit_val, exit_repr) {
+            (V::Place(ptr, off), Repr::Agg(row)) => {
+                let row_idx = usize::try_from(row).map_err(|_| malformed("a layout row past usize"))?;
+                let layout_id = self.layouts.get(row_idx).ok_or(malformed("a layout row past the table"))?.id;
+                match self.ls.get(layout_id).size {
+                    1 => {
+                        let V::Scalar(byte) = self.load(Repr::Int { ty: Ty::I8, signed: false }, (ptr, off)) else {
+                            return Err(malformed("loading 1-byte `ExitCode` did not yield a scalar"));
+                        };
+                        self.b.convert(Op::Zext, Flags::NONE, Ty::I32, byte)
+                    }
+                    4 => {
+                        let V::Scalar(word) = self.load(Repr::Int { ty: Ty::I32, signed: true }, (ptr, off)) else {
+                            return Err(malformed("loading 4-byte `ExitCode` did not yield a scalar"));
+                        };
+                        word
+                    }
+                    _ => return Err(BuildError::UnsupportedSig { what: "a `Termination::report` return type whose size is neither 1 nor 4 bytes" }),
+                }
+            }
+            (V::Scalar(val), Repr::Int { ty: Ty::I8, .. } | Repr::Bool) => self.b.convert(Op::Zext, Flags::NONE, Ty::I32, val),
+            (V::Scalar(val), Repr::Int { ty: Ty::I32, .. }) => val,
+            (V::None, Repr::None) => self.b.iconst(Ty::I32, 0),
+            _ => return Err(BuildError::UnsupportedSig { what: "a `Termination::report` return type that is neither `ExitCode`, `u8`, nor `i32`" }),
+        };
+        self.b.ret(&[status]);
+        self.check_lir_error()
+    }
 }
 
 /// An empty check record: a shim has no body of its own, and its walk reads none.
@@ -1016,6 +1134,25 @@ pub(crate) fn build_vtable_shim<A: Allocator + Copy>(
     let body = empty_view(target.item, checked.types.view());
     let mut w = Walk::new(&body, &checked, subst, adts, alloc);
     w.run_vtable_shim(target, sig)?;
+    w.into_built()
+}
+
+/// Builds the test report shim of `#[test]` fn `test` (lib.rs `build_test_report_shim`,
+/// `Walk::run_test_report_shim`). Its walk is given an empty body named by `test` and an empty
+/// check record: neither is read.
+pub(crate) fn build_test_report_shim<A: Allocator + Copy>(
+    test: ItemKey,
+    test_sig: &FnSig<'_>,
+    report_fn: ItemKey,
+    report_sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    let checked = empty_record(subst.scratch);
+    let body = empty_view(test, checked.types.view());
+    let mut w = Walk::new(&body, &checked, subst, adts, alloc);
+    w.run_test_report_shim(test, test_sig, report_fn, report_sig)?;
     w.into_built()
 }
 

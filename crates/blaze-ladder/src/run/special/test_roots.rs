@@ -2,17 +2,18 @@
 //! test", piece 8): `blaze test` enters row n of a unit's tests record in a process of its own,
 //! through the same lazy parent `blaze run` starts a program with (blaze-cli run_parent.rs
 //! `Lazy`, own_process.rs): one builder, work at item grain, a run compiles what is called.
-//! What differs from a program's roots ([`super::run_roots`]) is only the entry: the test fn
-//! itself, called directly ([`EntryForm::Unit`]: the launcher calls an `extern "C" fn()` and the
-//! process exits 0 when it returns), and, for a test built `panic = "unwind"`, the personality
-//! routine as the last root row, exactly as a program's (personality.rs `personality_of`).
+//! What differs from a program's roots ([`super::run_roots`]) is only the entry:
+//! - for a test returning `()`: the test fn itself, called directly ([`EntryForm::Unit`]: the
+//!   launcher calls an `extern "C" fn()` and the process exits 0 when it returns);
+//! - for a test returning another `T: Termination`: its test report shim instance
+//!   ([`blaze_build::TEST_REPORT_SHIM_ITEM`], tabled at the test fn), called via
+//!   [`EntryForm::CMain`], which calls the test fn, passes its value to
+//!   `<T as Termination>::report`, and returns the resulting `ExitCode` byte as the process status;
+//! and, for a test built `panic = "unwind"`, the personality routine as the last root row,
+//! exactly as a program's (personality.rs `personality_of`).
 //!
 //! The entry rule is front2 test_entry.rs [`head_shape`], its one home (rule 30): a free,
-//! monomorphic fn taking no arguments, not `async`. Only a test returning `()` is entered here;
-//! one returning another `T: Termination` is entered through the report shim
-//! ([`crate::front2::test_entry::EntryShape::Report`]), which the builder does not make yet: it
-//! is refused by name ([`TestRefusal::ReturnsValue`]), never entered as a `fn()` whose `Err`
-//! would be dropped and read as a pass. What the launcher's `fn()` call needs beyond the rule
+//! monomorphic fn taking no arguments, not `async`. What the launcher's call needs beyond the rule
 //! (the Rust ABI, a safe fn) is checked here, as start.rs `rust_start` checks `main`'s.
 //!
 //! Nothing here reads a body. `alloc` holds the roots; the head store lives in `frame` with
@@ -32,7 +33,7 @@ use crate::front2::item_shown::ItemShown;
 use crate::front2::keys::{Keys, checker_of};
 use crate::front2::program::StartOf;
 use crate::front2::source::NamesSource;
-use crate::front2::test_entry::{HeadShape, TestEntryRefusal, head_shape};
+use crate::front2::test_entry::{HeadShape, TERMINATION_LANG, TestEntryRefusal, head_shape};
 
 /// Why a test fn has no roots of its own run: each by the test's printed path (rule 19) and the
 /// rule that refuses it.
@@ -42,10 +43,8 @@ pub enum TestRefusal {
     Head { test: Box<str>, why: Box<str> },
     /// The entry rule refused it (test_entry.rs `head_shape`).
     Entry { test: Box<str>, refusal: TestEntryRefusal },
-    /// The launcher's `fn()` call cannot enter it: `what` says why.
+    /// The launcher's call cannot enter it: `what` says why.
     Call { test: Box<str>, what: &'static str },
-    /// It returns a value other than `()`: its entry is the report shim, not built yet.
-    ReturnsValue { test: Box<str> },
 }
 
 impl fmt::Display for TestRefusal {
@@ -53,19 +52,32 @@ impl fmt::Display for TestRefusal {
         match self {
             TestRefusal::Head { test, why } => write!(f, "the test fn `{test}`'s head: {why}"),
             TestRefusal::Entry { test, refusal } => write!(f, "the test fn `{test}`: {refusal}"),
-            TestRefusal::Call { test, what } => write!(f, "the test fn `{test}` {what}: the launcher enters a test as a safe Rust `fn()`"),
-            TestRefusal::ReturnsValue { test } => write!(
-                f,
-                "the test fn `{test}` returns a value: it is entered through the report shim, which the code builder does not make yet (test.md, piece 8)"
-            ),
+            TestRefusal::Call { test, what } => write!(f, "the test fn `{test}` {what}: the launcher enters a test as a safe Rust fn"),
         }
     }
 }
 
 impl core::error::Error for TestRefusal {}
 
+/// Whether any crate in `lang_crates` declares `#[lang = "termination"]`.
+fn has_termination<'n, S: NamesSource<'n>>(names: S, lang_crates: &[usize]) -> bool {
+    let mut found = false;
+    for &krate in lang_crates {
+        names.each_lang(krate, &mut |name, _| {
+            if name == TERMINATION_LANG {
+                found = true;
+            }
+        });
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
 /// The roots of the run of the test fn `test` (its library key, a tests record row's `key`):
-/// row 0 the test fn at no arguments, the entry [`EntryForm::Unit`] at its symbol; then, for
+/// row 0 the test fn at no arguments ([`EntryForm::Unit`]) for `()`, or its test report shim
+/// instance ([`EntryForm::CMain`], tabled at the test fn) for any other return type; then, for
 /// `panic = "unwind"`, the personality routine over `lang_crates`, its symbol in
 /// [`Roots::head`]. `start` is [`StartOf::Direct`]: the entry is called directly, through no
 /// `#[lang = "start"]` item. `exports`: the Rust fns the test binary's C calls, each a root row
@@ -90,11 +102,11 @@ pub fn test_roots<'n, 'a, S: NamesSource<'n>>(
         return Err(refused(TestRefusal::Head { test: shown(), why: error.to_string().into_boxed_str() }));
     }
     let key = checker_of(test);
-    match head_shape(&store, test, key) {
-        Ok(HeadShape::Unit) => {}
-        Ok(HeadShape::Returns(_)) => return Err(refused(TestRefusal::ReturnsValue { test: shown() })),
+    let returns_value = match head_shape(&store, test, key) {
+        Ok(HeadShape::Unit) => false,
+        Ok(HeadShape::Returns(_)) => true,
         Err(refusal) => return Err(refused(TestRefusal::Entry { test: shown(), refusal })),
-    }
+    };
     // `head_shape` found the head; what the launcher's call needs of it.
     let Some(head) = store.fns.get(&key) else { return Err(refused(TestRefusal::Entry { test: shown(), refusal: TestEntryRefusal::NoHead { test } })) };
     if !matches!(head.header.abi, tc::Abi::Rust) {
@@ -104,7 +116,18 @@ pub fn test_roots<'n, 'a, S: NamesSource<'n>>(
         return Err(refused(TestRefusal::Call { test: shown(), what: "is `unsafe`" }));
     }
     let mut table = RootTable { rows: DeclaredList::new_in(alloc), symbols: Vec::new_in(alloc), name: Vec::new_in(alloc), alloc };
-    let entry = table.push("the test fn", key, List::EMPTY, store.tys.view())?;
+    let (form, entry) = if returns_value {
+        if !has_termination(names, lang_crates) {
+            return Err(refused(TestRefusal::Entry { test: shown(), refusal: TestEntryRefusal::NoTermination }));
+        }
+        let fn_ty = store.tys.intern(tc::PNode::FnDef(key, List::EMPTY)).map_err(RootsError::Types)?;
+        let shim_args = store.tys.intern_list(&[fn_ty]).map_err(RootsError::Types)?;
+        let sym = table.push_as("the test report shim", key, blaze_build::TEST_REPORT_SHIM_ITEM, shim_args, store.tys.view())?;
+        (EntryForm::CMain, sym)
+    } else {
+        let sym = table.push("the test fn", key, List::EMPTY, store.tys.view())?;
+        (EntryForm::Unit, sym)
+    };
     super::push_exports(&mut table, exports, store.tys.view())?;
     let personality = match crate::personality::personality_of(names, lang_crates, panic).map_err(RootsError::Personality)? {
         None => None,
@@ -112,5 +135,5 @@ pub fn test_roots<'n, 'a, S: NamesSource<'n>>(
     };
     // The maker builds for this entry (`MakerStart::Direct`), not by the run's start rule,
     // which would look for the crate's `fn main` (run_entry.rs `root_main`).
-    Ok(Roots { start: StartOf::Direct, maker_start: MakerStart::Direct(test), form: EntryForm::Unit, entry, rows: table.rows, symbols: table.symbols, shim: false, personality })
+    Ok(Roots { start: StartOf::Direct, maker_start: MakerStart::Direct(test), form, entry, rows: table.rows, symbols: table.symbols, shim: false, personality })
 }

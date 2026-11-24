@@ -230,7 +230,7 @@ pub fn each_item(name: &[u8], mut each: impl FnMut(ItemKey)) -> Result<(), NameE
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     };
     let head = key_at(0)?;
-    if head != blaze_build::REIFY_SHIM_ITEM && head != blaze_build::VTABLE_SHIM_ITEM {
+    if head != blaze_build::REIFY_SHIM_ITEM && head != blaze_build::VTABLE_SHIM_ITEM && head != blaze_build::TEST_REPORT_SHIM_ITEM {
         each(head);
     }
     // The item's key (16) and the count of arguments (4); at no argument, nothing more.

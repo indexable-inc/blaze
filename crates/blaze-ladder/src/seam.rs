@@ -207,6 +207,9 @@ pub trait FrontEnd {
     /// Every body checked, by index: `None` for a fn without one. A body with any diagnostic
     /// or gap is a refusal, never a `Some`.
     fn check_all(&mut self) -> Result<Vec<Option<Checked<'static>>, Global>, RunError>;
+    /// Returns checked bodies taken by [`FrontEnd::check_all`] so a multi-entry program (a test
+    /// suite) can build further entries without losing earlier checks.
+    fn restore_checked(&mut self, _checked: &mut [Option<Checked<'static>>]) {}
     /// The digest of fn `i`'s checked body's read list (front2 body_reads.rs), `checked` the
     /// body [`FrontEnd::check_all`] handed over for `i`: what a code record's key holds of what
     /// the check read. `None` where none was filed, which the caller refuses by name.
@@ -245,6 +248,11 @@ pub trait FrontEnd {
     /// marked item the front end cannot read is a refusal naming it, never a panic.
     fn lang_item(&self, item: LangItem) -> Result<Option<ItemKey>, LangRefusal>;
     fn lang_trait_fn(&self, trait_: LangItem, name: &str) -> Option<ItemKey>;
+    /// The `report` method of `#[lang = "termination"]` (`std::process::Termination::report`),
+    /// if the program's crates declare `#[lang = "termination"]`.
+    fn termination_report(&self) -> Option<ItemKey> {
+        None
+    }
     /// Trait `t` as a trait object sees it (blaze-build's `Adts::object_trait`); `None` where
     /// the front end made no table of it (the builder then refuses the vtable by name).
     fn object_trait(&self, t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>>;

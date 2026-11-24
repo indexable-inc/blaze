@@ -379,10 +379,16 @@ impl<'a> RootTable<'a> {
     /// The instance `item` at `args` (ground in `ground`) as the next row: its symbol. `what`
     /// names it in a refusal.
     fn push(&mut self, what: &'static str, item: ItemKey, args: List, ground: PTys<'_>) -> Result<Symbol, RootsError> {
+        self.push_as(what, item, item, args, ground)
+    }
+
+    /// The instance `item` at `args` (ground in `ground`), tabled under `tabled`, as the next
+    /// row: its symbol. Used for synthetic shim roots such as the test report shim.
+    fn push_as(&mut self, what: &'static str, tabled: ItemKey, item: ItemKey, args: List, ground: PTys<'_>) -> Result<Symbol, RootsError> {
         self.name.clear();
         encode_instance(item, args, ground, self.alloc, &mut self.name).map_err(|error| RootsError::Symbol { what, error })?;
         let symbol = fn_symbol_of_name(&self.name);
-        self.rows.push(item, &self.name);
+        self.rows.push(tabled, &self.name);
         self.symbols.push(symbol);
         Ok(symbol)
     }

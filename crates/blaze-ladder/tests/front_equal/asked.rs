@@ -264,6 +264,12 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         r
     }
 
+    fn termination_report(&self) -> Option<ItemKey> {
+        let r = self.inner.termination_report();
+        self.note(format_args!("termination_report"), |o| write!(o, "{r:?}"));
+        r
+    }
+
     fn object_trait(&self, t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>> {
         let r = self.inner.object_trait(t);
         self.note(format_args!("object_trait {t:?}"), |o| write!(o, "{r:?}"));
