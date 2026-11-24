@@ -377,6 +377,10 @@ pub struct Consts<'n> {
     /// constant's, a const block's owner's), made by the build's one rule
     /// (`run::ClosureTable::add`); `None` until the first body with a closure is checked.
     closures: Option<crate::run::ClosureTable>,
+    /// Memo of each crate's `#[define_opaque(..)]` defining fns (tait.rs `Definers`), read when
+    /// a layout in constant evaluation meets a type alias's `impl Trait` (e.g. `std::backtrace::
+    /// Backtrace`'s `LazyResolve` under `SizedTypeProperties::LAYOUT`).
+    definers: Option<super::tait::Definers<'static>>,
 }
 
 /// An instance's arguments refer to this evaluator's ground table. Only the
@@ -389,7 +393,7 @@ struct Evaluated {
 
 impl Default for Consts<'_> {
     fn default() -> Self {
-        Consts { bodies: Vec::new_in(Global), records: Vec::new_in(Global), unit: None, closures: None }
+        Consts { bodies: Vec::new_in(Global), records: Vec::new_in(Global), unit: None, closures: None, definers: None }
     }
 }
 
@@ -415,6 +419,8 @@ struct ConstsWorld<'w, 'n, S> {
     /// arguments, `<{closure} as SizedTypeProperties>::SIZE` under `Box::new`), which
     /// [`LayoutFacts::closure`] answers from.
     closures: Closures<'w>,
+    /// Each crate's `#[define_opaque(..)]` definers, for [`LayoutFacts::opaque_hidden`].
+    definers: &'w super::tait::Definers<'static>,
 }
 
 /// Where [`ConstsWorld`]'s closure facts come from: the evaluator's own checked bodies and the
@@ -525,6 +531,48 @@ impl<'n, S: NamesSource<'n>> LayoutFacts for ConstsWorld<'_, 'n, S> {
     /// checked. `None`: no such body was checked, and the layout refuses naming the closure.
     fn closure(&self, owner: ItemKey, ordinal: u32) -> Option<blaze_build::layout::ClosureFacts<'_>> {
         self.closures.get(owner, ordinal)
+    }
+
+    /// The hidden type of `opaque` at ground `args` (coroutines.rs `opaque_hidden`'s rule for
+    /// constant evaluation): a type alias's `impl Trait` (`#[define_opaque(Alias)]`, e.g. std's
+    /// `LazyResolve` inside `std::backtrace::Backtrace` under `SizedTypeProperties::LAYOUT`) or a
+    /// non-trait fn's return opaque. If the defining fn's body has not been checked here yet,
+    /// returns `BuildError::OpaqueOwnerUnchecked` so `Consts::value_key` checks it and retries.
+    fn opaque_hidden(&self, opaque: ItemKey, args: &[tc::PTy], ground: &mut PortableTys<'_>) -> Result<tc::PTy, blaze_build::BuildError> {
+        let refused = |what| blaze_build::BuildError::UnsupportedSig { what };
+        let Some(&(owner, index)) = self.store.opaques.get(&opaque) else {
+            return Err(refused("an `impl Trait` type no head of the store made (`store.opaques`)"));
+        };
+        let definer = if super::tait::of_alias(index) {
+            if !args.is_empty() {
+                return Err(refused("a generic type alias's `impl Trait` laid out (its defining fn's parameters are not mapped to the alias's yet)"));
+            }
+            let alias_lib = self.keys.library_in(self.names, owner).ok_or_else(|| refused(super::tait::DefinerMiss::NoLibraryKey.form()))?;
+            let definer_lib = super::tait::defining_fn(self.definers, self.names, alias_lib).map_err(|miss| refused(miss.form()))?;
+            super::keys::checker_of(definer_lib)
+        } else {
+            if self.trait_fn(owner).is_some() {
+                return Err(refused("a trait fn's `impl Trait` type in constant evaluation"));
+            }
+            owner
+        };
+        let Some(body) = self.bodies.iter().find(|b| b.key == definer && b.root.is_none()) else {
+            return Err(blaze_build::BuildError::OpaqueOwnerUnchecked { opaque, owner: definer });
+        };
+        if self.store.maps.const_proofs.is_some() {
+            self.store.maps.read_inputs(body.inputs.as_ref());
+        }
+        let Some(&(_, hidden)) = body.checked.hidden.iter().find(|h| h.0 == opaque) else {
+            return Err(refused("an `impl Trait` type its defining body gave no hidden type (a body that never returns)"));
+        };
+        let from = body.checked.types.view();
+        match from.node(hidden) {
+            Ok(tc::PNode::Future(..)) => Err(blaze_build::BuildError::Malformed {
+                what: "a hidden type naming an async block by its expression (the checker writes it by identity, `PNode::Coroutine`, since async P3)",
+            }),
+            Ok(_) => blaze_build::ground(from, hidden, args, ground, self.alloc, self),
+            Err(_) => Err(blaze_build::BuildError::Malformed { what: "a hidden type past its record's table" }),
+        }
     }
 }
 
@@ -800,7 +848,7 @@ impl<'n> Consts<'n> {
     /// fill loop (const_select.rs `select_made`): the impl's definition at the impl's
     /// arguments, or the trait's default at `args`. Any other constant is its own root.
     fn select_args<S: NamesSource<'n>>(&self, r: &mut Records<'_, 'n, S>, item: ItemKey, args: List, ground: &mut PortableTys<'_>, alloc: Alloc<'_>) -> Result<(ItemKey, List), ConstFail> {
-        let Some(trait_) = self.trait_of_const(&*r, item, alloc) else {
+        let Some(trait_) = self.trait_of_const(&*r, item) else {
             return Ok((item, args));
         };
         super::const_select::select_made(r, item, trait_, args, ground, alloc)
@@ -810,7 +858,7 @@ impl<'n> Consts<'n> {
     /// ground `self_ty`: `[self_ty]` as the arguments, selected as [`Consts::select_args`]
     /// selects them.
     fn select_root<S: NamesSource<'n>>(&self, r: &mut Records<'_, 'n, S>, declared: ItemKey, self_ty: tc::PNode, ground: &mut PortableTys<'_>, alloc: Alloc<'_>) -> Result<(ItemKey, List), ConstFail> {
-        let Some(trait_) = self.trait_of_const(&*r, declared, alloc) else {
+        let Some(trait_) = self.trait_of_const(&*r, declared) else {
             return Err(ConstFail::TraitConstNoSelf { item: declared, constant: declared });
         };
         let full = |_| ConstFail::Eval(Box::from("the constant evaluator's type table is full"));
@@ -821,9 +869,11 @@ impl<'n> Consts<'n> {
 
     /// The trait that declares `item`, when `item` is a trait's associated constant
     /// ([`ConstsWorld::trait_const`], over the records as they are now).
-    fn trait_of_const<S: NamesSource<'n>>(&self, r: &Records<'_, 'n, S>, item: ItemKey, alloc: Alloc<'_>) -> Option<ItemKey> {
-        let world = ConstsWorld { names: r.names, keys: &*r.keys, index: r.index, store: &*r.store, bodies: &self.bodies, records: &self.records, selected: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()), alloc, closures: Closures { own: self.closures.as_ref(), build: None } };
-        world.trait_const(item).map(|(trait_, _)| trait_)
+    fn trait_of_const<S: NamesSource<'n>>(&self, r: &Records<'_, 'n, S>, item: ItemKey) -> Option<ItemKey> {
+        match r.keys.origin(item)? {
+            super::keys::Origin::Member { container, kind: super::keys::MemberKind::Const, .. } if r.store.trait_defs.contains_key(container) => Some(*container),
+            _ => None,
+        }
     }
 
     /// [`Consts::value`] (`self_ty` is `None`: `item` at no arguments), or
@@ -1035,7 +1085,8 @@ impl<'n> Consts<'n> {
                 continue;
             }
             let capture = r.store.maps.capture_const(alloc);
-            let world = ConstsWorld { names: r.names, keys: r.keys, index: r.index, store: r.store, bodies: &self.bodies, records: &self.records, selected: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()), alloc, closures: Closures { own: self.closures.as_ref(), build } };
+            let definers = self.definers.get_or_insert_with(|| super::tait::Definers::new_in(alloc));
+            let world = ConstsWorld { names: r.names, keys: r.keys, index: r.index, store: r.store, bodies: &self.bodies, records: &self.records, selected: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()), alloc, closures: Closures { own: self.closures.as_ref(), build }, definers };
             let answer = value_of(&world, &mut layout, &mut codes, n.item, n.args, &mut ground, Limits::DEFAULT, alloc);
             let selected = world.selected.take();
             // A call refused by its callee's kind: the refusal carries what `fn_kind` said
@@ -1075,6 +1126,14 @@ impl<'n> Consts<'n> {
                         Refusal::Missing { what: "ADT definition", item: adt } => Some(adt),
                         _ => None,
                     };
+                    // A layout or `needs_drop` met an opaque type whose defining fn has not been
+                    // checked here yet (e.g. `std::backtrace::Backtrace`'s `LazyResolve` under
+                    // `SizedTypeProperties::LAYOUT`): check that fn's body once (recording its
+                    // hidden type and any closures in `self.bodies`/`self.closures`) and retry.
+                    let no_opaque_owner = match e.refusal {
+                        Refusal::Missing { what: "opaque defining body", item: owner } => Some(owner),
+                        _ => None,
+                    };
                     // `<T as Trait>::NAME` reached at a ground `T` that the solver selected no
                     // definition for (const_select.rs, kept in `selected` by `resolve`): the
                     // step's refusal is that one, by name. A selection that asked for records
@@ -1093,31 +1152,41 @@ impl<'n> Consts<'n> {
                         _ => None,
                     };
                     let text = format!("{e}").into_boxed_str();
-                    match (called, unknown, no_adt, no_impl) {
-                        (Some((callee, None)), _, _, _) => Err(ConstFail::NotConstFn { callee, shown: super::const_fn_fact::shown(r, callee) }),
-                        (Some((callee, Some(fact))), _, _, _) => match super::const_fn_fact::answer(r, &mut made, callee, fact) {
+                    match (called, unknown, no_adt, no_opaque_owner, no_impl) {
+                        (Some((callee, None)), _, _, _, _) => Err(ConstFail::NotConstFn { callee, shown: super::const_fn_fact::shown(r, callee) }),
+                        (Some((callee, Some(fact))), _, _, _, _) => match super::const_fn_fact::answer(r, &mut made, callee, fact) {
                             // The fact was made: the code holding the refusal is pending
                             // (blaze-consteval machine/late.rs `Wait::FnFact`), so the
                             // evaluator compiles it again; the same need is evaluated again.
                             Ok(()) => continue,
                             Err(e) => Err(e),
                         },
-                        (None, Some(item), _, _) => Err(match r.keys.library_in(r.names, item).and_then(|lib| written_name(r.names, lib)) {
+                        (None, Some(item), _, _, _) => Err(match r.keys.library_in(r.names, item).and_then(|lib| written_name(r.names, lib)) {
                             Some(name) => ConstFail::UnknownIntrinsic { item, name: Box::from(name) },
                             // Not reached: `free_fn_kind` answers `UnknownIntrinsic` only after
                             // reading this name; the evaluator's own text names the item and why.
                             None => ConstFail::Eval(text),
                         }),
-                        (None, None, Some(adt), _) => match adt_row(r, n.item, adt) {
+                        (None, None, Some(adt), _, _) => match adt_row(r, n.item, adt) {
                             Ok(()) => continue,
                             Err(e) => Err(e),
                         },
-                        (None, None, None, Some(refused)) => Err(refused.into_fail()),
+                        (None, None, None, Some(owner), _) => {
+                            if self.bodies.iter().any(|b| b.key == owner && b.root.is_none()) {
+                                Err(ConstFail::Eval(text))
+                            } else {
+                                match self.check_one(r, prepared, owner) {
+                                    Ok(()) => continue,
+                                    Err(cause) => Err(cause.required_by(r, item, owner)),
+                                }
+                            }
+                        }
+                        (None, None, None, None, Some(refused)) => Err(refused.into_fail()),
                         // A projection a type of the step holds (a field's `T::Storage`): the
                         // records its normalization needs are made now and the same need is
                         // evaluated again; one the solver refuses is named
                         // (front2/const_project.rs `answer`).
-                        (None, None, None, None) => match super::const_project::answer(r, n.item, asked) {
+                        (None, None, None, None, None) => match super::const_project::answer(r, n.item, asked) {
                             // The fills change what a type grounds to: code that met the
                             // unanswered projection is not complete (blaze-consteval
                             // machine/late.rs), so the evaluator compiles that body again.

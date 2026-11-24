@@ -277,7 +277,7 @@ impl core::fmt::Display for ConstRefused {
 }
 
 /// How many constants one freeze evaluates at most (rule 18).
-pub const MOST_FREEZE_CONSTS: usize = 256;
+pub const MOST_FREEZE_CONSTS: usize = 1024;
 
 /// What evaluates a constant a frozen head's type holds (an array length naming a constant,
 /// an anonymous constant `[u8; 1 << 2]`): the body side's evaluator behind one seam.

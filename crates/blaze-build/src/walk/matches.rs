@@ -205,7 +205,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             first,
             arms: n,
             guarded: true,
-            by_ref: false,
+            by_ref: None,
             owner: Owner::None,
             tested,
         });

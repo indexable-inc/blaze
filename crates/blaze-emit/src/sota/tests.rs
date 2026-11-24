@@ -1959,4 +1959,69 @@ mod std_readiness_tests {
             assert_eq!(f_loop(n), want, "aligned loop mismatch for n={n}");
         }
     }
+
+    #[test]
+    fn sota_i128_switch_compares_both_words() {
+        let alloc = test_alloc();
+        let high_case: u128 = 0x1234_5678_9abc_def0_0000_0000_0000_0000;
+        let full_case: u128 = 0xfedc_ba98_7654_3210_0123_4567_89ab_cdef;
+        let lo_only: u128 = 42;
+
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I128)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, b_zero, b_lo, b_hi, b_join, b_def] = [(); 6].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let x = b.param(Ty::I128);
+            let arg_full = b.iconst(Ty::I64, 44);
+            b.switch(
+                x,
+                (b_def, &[]),
+                &[
+                    (0, (b_zero, &[])),
+                    (lo_only, (b_lo, &[])),
+                    (high_case, (b_hi, &[])),
+                    (full_case, (b_join, &[arg_full])),
+                ],
+            );
+
+            b.begin(b_zero);
+            let r0 = b.iconst(Ty::I64, 10);
+            b.ret(&[r0]);
+
+            b.begin(b_lo);
+            let r1 = b.iconst(Ty::I64, 20);
+            b.ret(&[r1]);
+
+            b.begin(b_hi);
+            let r2 = b.iconst(Ty::I64, 30);
+            b.ret(&[r2]);
+
+            b.begin(b_join);
+            let p = b.param(Ty::I64);
+            b.ret(&[p]);
+
+            b.begin(b_def);
+            let rd = b.iconst(Ty::I64, 99);
+            b.ret(&[rd]);
+            b.finish_checked().unwrap()
+        };
+
+        let em = Sota::standalone()
+            .emit(verify(func.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota must emit i128 Op::Switch");
+        let (ex, _k) = load_exec_with_syms(em, &[]);
+        let f: extern "C" fn(u128) -> u64 = unsafe { ex.as_fn() };
+        assert_eq!(f(0), 10);
+        assert_eq!(f(lo_only), 20);
+        assert_eq!(f(high_case), 30);
+        assert_eq!(f(full_case), 44);
+        assert_eq!(f(1u128 << 64), 99);
+        assert_eq!(f((1u128 << 64) | lo_only), 99);
+        assert_eq!(f(full_case ^ (1u128 << 127)), 99);
+        assert_eq!(f(full_case ^ 1), 99);
+        assert_eq!(f(high_case | 1), 99);
+    }
 }
