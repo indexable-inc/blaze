@@ -9568,6 +9568,19 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             words.push(enc::cset(rd_hi, Cond::Vs));
                         }
                         (Op::UmulOverflow, 64) => {
+                            if let Some((s0, s1)) = sp_pair {
+                                // `rd_lo = X16, rd_hi = X17` can both alias spilled/remat `rl`/`rr`;
+                                // store the low product first and reload `a_v` before `umulh`.
+                                words.push(enc::mul(X16, rl, rr));
+                                emit_st_spill_gpr(&mut words, X16, spill_base, s0);
+                                let rl2 = if rl == X16 { load_gpr(&mut words, a_v, X16) } else { rl };
+                                words.push(enc::umulh(X17, rl2, rr));
+                                words.push(enc::cmp_imm(X17, 0));
+                                words.push(enc::cset(X17, Cond::Ne));
+                                emit_st_spill_gpr(&mut words, X17, spill_base, s1);
+                                inst += 1;
+                                continue;
+                            }
                             // Compute high half BEFORE overwriting if `rd_lo` aliases `rl`/`rr`!
                             if rd_lo == rl || rd_lo == rr {
                                 words.push(enc::umulh(rd_hi, rl, rr));
@@ -9580,6 +9593,21 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             words.push(enc::cset(rd_hi, Cond::Ne));
                         }
                         (Op::SmulOverflow, 64) => {
+                            if let Some((s0, s1)) = sp_pair {
+                                // `rd_lo = X16, rd_hi = X17` can both alias spilled/remat `rl`/`rr`;
+                                // store the low product first, reload `a_v` for `smulh`, then reload `lo` for sign check.
+                                words.push(enc::mul(X16, rl, rr));
+                                emit_st_spill_gpr(&mut words, X16, spill_base, s0);
+                                let rl2 = if rl == X16 { load_gpr(&mut words, a_v, X16) } else { rl };
+                                words.push(enc::smulh(X17, rl2, rr));
+                                emit_ld_spill_gpr(&mut words, X16, spill_base, s0);
+                                words.push(enc::asr_imm(X16, X16, 63));
+                                words.push(enc::cmp(X17, X16));
+                                words.push(enc::cset(X17, Cond::Ne));
+                                emit_st_spill_gpr(&mut words, X17, spill_base, s1);
+                                inst += 1;
+                                continue;
+                            }
                             if rd_lo == rl || rd_lo == rr {
                                 words.push(enc::smulh(rd_hi, rl, rr));
                                 words.push(enc::mul(rd_lo, rl, rr));
@@ -9588,20 +9616,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 words.push(enc::smulh(rd_hi, rl, rr));
                             }
                             let tmp = if rd_lo == X16 || rd_hi == X16 { X17 } else { X16 };
-                            // Wait: if `sp_pair.is_some()` then `rd_lo=X16, rd_hi=X17`; spill `rd_lo` first so X16 is free!
-                            if let Some((s0, s1)) = sp_pair {
-                                emit_st_spill_gpr(&mut words, rd_lo, spill_base, s0);
-                                words.push(enc::asr_imm(X16, rd_lo, 63));
-                                words.push(enc::cmp(rd_hi, X16));
-                                words.push(enc::cset(rd_hi, Cond::Ne));
-                                emit_st_spill_gpr(&mut words, rd_hi, spill_base, s1);
-                                inst += 1;
-                                continue;
-                            } else {
-                                words.push(enc::asr_imm(tmp, rd_lo, 63));
-                                words.push(enc::cmp(rd_hi, tmp));
-                                words.push(enc::cset(rd_hi, Cond::Ne));
-                            }
+                            words.push(enc::asr_imm(tmp, rd_lo, 63));
+                            words.push(enc::cmp(rd_hi, tmp));
+                            words.push(enc::cset(rd_hi, Cond::Ne));
                         }
                         _ => {
                             words.push(match op {

@@ -2462,4 +2462,156 @@ block4 normal:
         let f_ptr2: extern "C" fn() -> u64 = unsafe { exec2.as_fn() };
         assert_eq!(f_ptr2(), 3);
     }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sota_a64_spilled_i128_and_mul_overflow_preserve_both_halves() {
+        extern "C" fn clobber_caller_saved(x: u64) -> u64 {
+            x.wrapping_mul(3).wrapping_add(7)
+        }
+
+        struct OneSym(Symbol);
+        impl Names for OneSym {
+            fn name(&self, of: Outside) -> Option<blaze_tier::Named<'_>> {
+                match of {
+                    Outside::Func(0) => Some(blaze_tier::Named::Symbol(self.0)),
+                    _ => None,
+                }
+            }
+            fn routines(&self) -> RoutinePlaces {
+                RoutinePlaces::NONE
+            }
+        }
+
+        let alloc = test_alloc();
+        let sym = Symbol::of_name("spilled_pair_helper");
+        let helper_addr = u64::try_from((clobber_caller_saved as *const ()).addr()).unwrap_or(0);
+
+        // 1. 8 simultaneously live `u128` values crossing a call force `GprPairSpill` in exact-CFG
+        //    regalloc; every low half (including values with `hi == 0` like `8u128`) must survive.
+        let i128_spill_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I128), Param::of(Ty::I64)],
+                &[Param::of(Ty::I128)],
+            );
+            b.set_signature(sig);
+            let hsig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            let href = b.reference(RefKind::Func, 0);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let seed = b.param(Ty::I128);
+            let tag = b.param(Ty::I64);
+            let mut live: Vec<blaze_lir::Value, Alloc<'static>> = Vec::with_capacity_in(8, alloc);
+            let mut cur = seed;
+            for k in 1u128..=8 {
+                let delta = b.iconst(Ty::I128, k);
+                cur = b.binary(Op::Add, Flags::NONE, cur, delta);
+                live.push(cur);
+            }
+            let h = b.call(Flags::NONE, href, hsig, &[tag]);
+            let mut acc = b.convert(Op::Zext, Flags::NONE, Ty::I128, h);
+            for (idx, &v) in live.iter().enumerate() {
+                let sh = b.iconst(Ty::I128, u128::try_from(idx).unwrap_or(0));
+                let shifted = b.binary(Op::Shl, Flags::NONE, v, sh);
+                acc = b.binary(Op::Add, Flags::NONE, acc, shifted);
+            }
+            b.ret(&[acc]);
+            b.finish_checked().unwrap()
+        };
+        let emitted1 = Sota::standalone()
+            .emit(verify(i128_spill_fn.view()).unwrap(), &OneSym(sym), MAC_ARM64, alloc)
+            .expect("Sota emits spilled i128 across call");
+        let (ex1, _ks1) = load_exec_with_syms(emitted1, &[(sym, helper_addr)]);
+        let f1: extern "C" fn(u128, u64) -> u128 = unsafe { ex1.as_fn() };
+        for (seed, tag) in [
+            (0u128, 5u64),
+            (8u128, 11u64),
+            ((1u128 << 63) | 0x1234, 42u64),
+            (0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128, 99u64),
+        ] {
+            let mut expected = u128::from(clobber_caller_saved(tag));
+            let mut cur = seed;
+            for k in 1u128..=8 {
+                cur = cur.wrapping_add(k);
+                expected = expected.wrapping_add(cur << (k - 1));
+            }
+            assert_eq!(f1(seed, tag), expected, "spilled i128 mismatch for seed={seed:#x}, tag={tag}");
+        }
+
+        // 2. Spilled `UmulOverflow` and `SmulOverflow` with spilled inputs and spilled pair results.
+        let mul_ov_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let hsig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            let href = b.reference(RefKind::Func, 0);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            // Force >= 14 live values across calls so both operands and overflow pairs spill.
+            let mut anchors: Vec<blaze_lir::Value, Alloc<'static>> = Vec::with_capacity_in(14, alloc);
+            let mut cur = a;
+            for k in 1u128..=14 {
+                let ck = b.iconst(Ty::I64, k);
+                cur = b.binary(Op::Add, Flags::NONE, cur, ck);
+                anchors.push(cur);
+            }
+            let h0 = b.call(Flags::NONE, href, hsig, &[a]);
+            let upair = b.overflow(Op::UmulOverflow, a, bv);
+            let spair = b.overflow(Op::SmulOverflow, a, bv);
+            let h1 = b.call(Flags::NONE, href, hsig, &[h0]);
+            let ulo = b.project(upair, 0);
+            let uov_flag = b.project(upair, 1);
+            let uov = b.convert(Op::Zext, Flags::NONE, Ty::I64, uov_flag);
+            let slo = b.project(spair, 0);
+            let sov_flag = b.project(spair, 1);
+            let sov = b.convert(Op::Zext, Flags::NONE, Ty::I64, sov_flag);
+            let mut out = b.binary(Op::Xor, Flags::NONE, ulo, slo);
+            let c1 = b.iconst(Ty::I64, 1);
+            let uov_s = b.binary(Op::Shl, Flags::NONE, uov, c1);
+            out = b.binary(Op::Add, Flags::NONE, out, uov_s);
+            out = b.binary(Op::Add, Flags::NONE, out, sov);
+            out = b.binary(Op::Add, Flags::NONE, out, h1);
+            for &v in &anchors {
+                out = b.binary(Op::Xor, Flags::NONE, out, v);
+            }
+            b.ret(&[out]);
+            b.finish_checked().unwrap()
+        };
+        let emitted2 = Sota::standalone()
+            .emit(verify(mul_ov_fn.view()).unwrap(), &OneSym(sym), MAC_ARM64, alloc)
+            .expect("Sota emits spilled UmulOverflow/SmulOverflow");
+        let (ex2, _ks2) = load_exec_with_syms(emitted2, &[(sym, helper_addr)]);
+        let f2: extern "C" fn(u64, u64) -> u64 = unsafe { ex2.as_fn() };
+        for (a, bv) in [
+            (7u64, 9u64),
+            (1u64 << 40, 1u64 << 30),
+            (i64::MIN.cast_unsigned(), 2u64),
+            (u64::MAX, u64::MAX),
+            ((-5i64).cast_unsigned(), (-7i64).cast_unsigned()),
+        ] {
+            let (ulo, uov) = a.overflowing_mul(bv);
+            let (slo, sov) = a.cast_signed().overflowing_mul(bv.cast_signed());
+            let h1 = clobber_caller_saved(clobber_caller_saved(a));
+            let mut expected = (ulo ^ slo.cast_unsigned())
+                .wrapping_add(u64::from(uov) << 1)
+                .wrapping_add(u64::from(sov))
+                .wrapping_add(h1);
+            let mut cur = a;
+            for k in 1u64..=14 {
+                cur = cur.wrapping_add(k);
+                expected ^= cur;
+            }
+            assert_eq!(f2(a, bv), expected, "spilled mul_overflow mismatch for a={a:#x}, b={bv:#x}");
+        }
+    }
 }
