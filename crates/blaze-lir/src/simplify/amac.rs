@@ -95,15 +95,17 @@ impl AmacOpts {
         }
     }
 
-    /// Apple Silicon M-series (128 KB L1d / 16 MB L2) SOTA preset: enters variable-trip masked
-    /// AMAC only when the searched table exceeds L2 (`>= 2M` elements / 16 MB DRAM) so L1/L2
-    /// searches stay on the tight 192B branchless scalar loop while DRAM searches gain 1.5x+ MLP.
+    /// Apple Silicon M-series (128 KB L1d / 16 MB L2) SOTA preset: 8-way lockstep AMAC with L1
+    /// read prefetching (`max_state_regs: 28` fits 8-way binary search `8 * 3 = 24 <= 28`, and
+    /// steps down cleanly to 4-way for wider state), entering variable-trip masked AMAC once the
+    /// searched table exceeds L1d (`>= 65_536` elements / 512 KB) so L1-resident searches stay on
+    /// the tight scalar loop while L2/SLC/DRAM searches gain full 8-way MLP.
     pub const fn apple_silicon() -> Self {
         Self {
-            group_width: 4,
+            group_width: 8,
             emit_prefetch: true,
-            max_state_regs: 20,
-            min_var_trip_bound: 2_097_152,
+            max_state_regs: 28,
+            min_var_trip_bound: 65_536,
         }
     }
 
@@ -853,7 +855,7 @@ fn unwrap_ptr_addr(view: &View<'_>, v: u32) -> u32 {
 fn is_pure_outer_hdr_helper(op: Op) -> bool {
     matches!(
         op,
-        Op::Icmp | Op::PtrAddr | Op::Not | Op::Xor | Op::Zext | Op::Iconst | Op::IconstWide
+        Op::Icmp | Op::PtrAddr | Op::Not | Op::Xor | Op::Zext | Op::Iconst | Op::IconstWide | Op::Assume
     )
 }
 
@@ -1082,12 +1084,6 @@ impl<A: Allocator> InnerShape<A> {
     }
 }
 
-struct OuterGuard<A: Allocator> {
-    cond_val: u32,
-    inner_is_then: bool,
-    skip_args: Vec<u32, A>,
-}
-
 #[derive(Clone, Copy)]
 struct OuterReduction {
     param_pos: usize,
@@ -1112,7 +1108,10 @@ struct AmacPlan<A: Allocator> {
     outer_reductions: Vec<OuterReduction, A>,
     outer_body_insts: Vec<u32, A>,
     outer_body_inv: Vec<bool, A>,
-    outer_guard: Option<OuterGuard<A>>,
+    /// Optional outer-loop-invariant entry guard `(guard_cond, enter_is_then)` from `outer_body`'s
+    /// `Op::Br` (one arm enters `inner_hdr`, the other skips directly to `outer_latch`). Evaluated
+    /// once in `b_amac_entry` so `b_amac_outer_body` always jumps straight into `b_amac_inner_hdr`.
+    inner_entry_guard: Option<(u32, bool)>,
     inner_shape: InnerShape<A>,
     inner_init_args: Vec<u32, A>,
     inner_next_args: Vec<u32, A>,
@@ -1390,9 +1389,11 @@ fn detect_amac_nest<A: Allocator + Copy>(
             vb < outer_hdr && dominates(&idom, vb, outer_hdr)
         };
 
-        // Parse `outer_body`'s transition into the inner loop (`Jump` or guarded `Br` to `outer_latch`).
+        // Parse `outer_body`'s transition into the inner loop (`Jump` or outer-invariant-guarded
+        // `Br` where one arm enters `inner_hdr` and the other skips directly to `outer_latch`).
         let ob_term = view.terminator(Block(outer_body));
-        let (inner_hdr, inner_init_args, outer_guard) = match view.op(ob_term) {
+        let ol_params = view.params(Block(outer_latch));
+        let (inner_hdr, inner_init_args, inner_entry_guard) = match view.op(ob_term) {
             Op::Jump => {
                 let jat = to_idx(at_u32(view.data, ob_term));
                 let ih = at_u32(view.extra, jat);
@@ -1411,23 +1412,22 @@ fn detect_amac_nest<A: Allocator + Copy>(
                 let e_at = bat + 3 + t_argc;
                 let e_blk = at_u32(view.extra, e_at);
                 let e_argc = to_idx(at_u32(view.extra, e_at + 1));
-                let (ih, i_at, i_argc, s_at, s_argc, inner_is_then) =
+                let (ih, i_at, i_argc, s_argc, enter_is_then) =
                     if e_blk == outer_latch && t_blk != outer_latch {
-                        (t_blk, bat + 3, t_argc, e_at + 2, e_argc, true)
+                        (t_blk, bat + 3, t_argc, e_argc, true)
                     } else if t_blk == outer_latch && e_blk != outer_latch {
-                        (e_blk, e_at + 2, e_argc, bat + 3, t_argc, false)
+                        (e_blk, e_at + 2, e_argc, t_argc, false)
                     } else {
                         continue;
                     };
+                if s_argc != ol_params.len() {
+                    continue;
+                }
                 let mut init: Vec<u32, A> = Vec::with_capacity_in(i_argc, alloc);
                 for k in 0..i_argc {
                     init.push(at_u32(view.extra, i_at + k));
                 }
-                let mut skip: Vec<u32, A> = Vec::with_capacity_in(s_argc, alloc);
-                for k in 0..s_argc {
-                    skip.push(at_u32(view.extra, s_at + k));
-                }
-                (ih, init, Some(OuterGuard { cond_val: gv, inner_is_then, skip_args: skip }))
+                (ih, init, Some((gv, enter_is_then)))
             }
             _ => continue,
         };
@@ -1456,7 +1456,6 @@ fn detect_amac_nest<A: Allocator + Copy>(
         };
 
         // Match `SingleBlock`, `HeaderBody`, or `HeaderBranch` inner loop shape.
-        let ol_params = view.params(Block(outer_latch));
         let (inner_shape, inner_next_args, inner_exit_args) = if inner_back1 == NONE && inner_back0 == inner_hdr {
             let ih_term = view.terminator(Block(inner_hdr));
             if view.op(ih_term) != Op::Br {
@@ -1697,7 +1696,7 @@ fn detect_amac_nest<A: Allocator + Copy>(
         };
 
         // Verify `outer_latch` predecessors are exclusively `{inner_hdr}` (or `{inner_hdr, outer_body}` with guard).
-        let ol_preds_ok = match &outer_guard {
+        let ol_preds_ok = match inner_entry_guard {
             None => preds.get(to_idx(outer_latch)).map(Vec::as_slice) == Some(&[inner_hdr]),
             Some(_) => match preds.get(to_idx(outer_latch)).map(Vec::as_slice) {
                 Some(&[a, b]) => (a == inner_hdr && b == outer_body) || (a == outer_body && b == inner_hdr),
@@ -1849,17 +1848,13 @@ fn detect_amac_nest<A: Allocator + Copy>(
             continue;
         }
 
-        // If `outer_guard` is present, its condition MUST be outer-loop-invariant (same across all K lanes).
-        if let Some(ref g) = outer_guard {
-            if !(is_pre_outer_inv(g.cond_val) || at_bool(&is_ob_inv_val, to_idx(g.cond_val))) {
-                continue;
-            }
-            if !g.skip_args.iter().all(|&v| {
-                let vb = at_u32(&inst_block, to_idx(v));
-                is_pre_outer_inv(v) || vb == outer_body || v == iv_inst
-            }) {
-                continue;
-            }
+        // If `inner_entry_guard` is present, its condition MUST be outer-loop-invariant (either
+        // defined strictly before `outer_hdr` or computed inside `outer_body` purely from
+        // outer-invariant operands) so it can be hoisted and checked once in `b_amac_entry`.
+        if let Some((guard_cond, _)) = inner_entry_guard
+            && !(is_pre_outer_inv(guard_cond) || at_bool(&is_ob_inv_val, to_idx(guard_cond)))
+        {
+            continue;
         }
 
         // Validate `inner_hdr`, `inner_body`, and (for `HeaderBranch`) pure branch arms & merge block.
@@ -2110,7 +2105,7 @@ fn detect_amac_nest<A: Allocator + Copy>(
                 let vb = at_u32(&inst_block, to_idx(v));
                 if is_inner_blk(vb) {
                     // Direct use of an inner-loop value (allowed only when `inner_hdr` dominates `outer_latch`).
-                    if outer_guard.is_some() || vb != inner_hdr {
+                    if inner_entry_guard.is_some() || vb != inner_hdr {
                         ol_ok = false;
                     } else if inner_direct_uses.scan_for(&v).is_none() {
                         inner_direct_uses.push(v);
@@ -2139,7 +2134,7 @@ fn detect_amac_nest<A: Allocator + Copy>(
             }
             let vb = at_u32(&inst_block, to_idx(cv));
             if is_inner_blk(vb) {
-                if outer_guard.is_some() || vb != inner_hdr {
+                if inner_entry_guard.is_some() || vb != inner_hdr {
                     ol_ok = false;
                     break;
                 }
@@ -2438,7 +2433,7 @@ fn detect_amac_nest<A: Allocator + Copy>(
             outer_reductions,
             outer_body_insts,
             outer_body_inv,
-            outer_guard,
+            inner_entry_guard,
             inner_shape,
             inner_init_args,
             inner_next_args,
@@ -3101,12 +3096,36 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
             ok
         }
     };
+    // Hoist all pure outer-loop-invariant `outer_body` instructions once into `b_amac_entry` so
+    // `inner_entry_guard` and `min_var_trip_bound` can read them directly and `b_amac_outer_body`
+    // avoids re-evaluating them per K-query batch.
+    let mut ob_inv_map = filled(len, NONE, &alloc);
+    for (oi, &inst32) in plan.outer_body_insts.iter().enumerate() {
+        if !at_bool(&plan.outer_body_inv, oi) {
+            continue;
+        }
+        let inst = to_idx(inst32);
+        let mapped = emit_lane_inst(view, inst, &ob_inv_map, &val_map, &mut func);
+        set_at(&mut ob_inv_map, inst, mapped);
+    }
+    // Check outer-loop-invariant `inner_entry_guard` once in `b_amac_entry`: when false (e.g.
+    // `table_len == 0`), jump straight to `orig_outer_hdr_new` (exact original scalar loop); when
+    // true, every lane in `b_amac_outer_body` enters `b_amac_inner_hdr` unconditionally!
+    if let Some((guard_cond, enter_is_then)) = plan.inner_entry_guard {
+        let raw_guard = resolve_lane_val(guard_cond, &ob_inv_map, &val_map);
+        let guard_ok = if enter_is_then {
+            raw_guard
+        } else {
+            push_unary(&mut func, Op::Not, Ty::I1, raw_guard)
+        };
+        has_k = push_bin(&mut func, Op::And, Flags::NONE, Ty::I1, has_k, guard_ok);
+    }
     // For variable-trip masked AMAC (e.g. `while lo < hi` binary search), skip AMAC overhead when
-    // the searched table fits inside L1/L2 cache (guided by `opts.min_var_trip_bound`).
+    // the searched table fits inside L1 cache (guided by `opts.min_var_trip_bound`).
     if !plan.inner_is_uniform && opts.min_var_trip_bound > 0 {
         for &orig_init in &plan.inner_init_args {
             let oi = to_idx(orig_init);
-            let mapped = at_u32(&val_map, oi);
+            let mapped = resolve_lane_val(orig_init, &ob_inv_map, &val_map);
             if mapped == NONE {
                 continue;
             }
@@ -3165,12 +3184,10 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
         }
         let inst = to_idx(inst32);
         if at_bool(&plan.outer_body_inv, oi) {
-            let mapped = match lane_maps.first() {
-                Some(lm) => emit_lane_inst(view, inst, lm, &val_map, &mut func),
-                None => 0,
-            };
+            // Already hoisted once into `b_amac_entry`; bind every lane to the hoisted SSA value.
+            let hoisted = at_u32(&ob_inv_map, inst);
             for lm in lane_maps.iter_mut() {
-                set_at(lm, inst, mapped);
+                set_at(lm, inst, hoisted);
             }
         } else {
             // For pointer-IV outer loops loading directly from `[p + off]`, emit contiguous
@@ -3243,25 +3260,9 @@ fn rewrite_amac_nest<A: Allocator + Copy>(
         }
     }
 
-    if let Some(ref guard) = plan.outer_guard {
-        let g_cond = match lane_maps.first() {
-            Some(lm) => resolve_lane_val(guard.cond_val, lm, &val_map),
-            None => 0,
-        };
-        let mut skip_packed: Vec<u32, A> = Vec::with_capacity_in(guard.skip_args.len() * k_width, alloc);
-        for &sa in &guard.skip_args {
-            for lm in lane_maps.iter() {
-                skip_packed.push(resolve_lane_val(sa, lm, &val_map));
-            }
-        }
-        if guard.inner_is_then {
-            push_br(&mut func, g_cond, b_amac_inner_hdr, &inner_init_packed, b_amac_outer_latch, &skip_packed);
-        } else {
-            push_br(&mut func, g_cond, b_amac_outer_latch, &skip_packed, b_amac_inner_hdr, &inner_init_packed);
-        }
-    } else {
-        push_jump(&mut func, b_amac_inner_hdr, &inner_init_packed);
-    }
+    // Any `inner_entry_guard` was already proven true in `b_amac_entry`, so all K lanes enter
+    // `b_amac_inner_hdr` unconditionally with ZERO skip branch inside the AMAC loop.
+    push_jump(&mut func, b_amac_inner_hdr, &inner_init_packed);
 
     // 4. Emit K-way inner loop (`HeaderBody`, `HeaderBranch`, or `SingleBlock`).
     let mut prefetches_inserted = 0u32;
@@ -4652,6 +4653,175 @@ mod tests {
                 let expected = eval_u64(orig_if.view(), &args);
                 let got = eval_u64(eval_rot.view(), &args);
                 assert_eq!(expected, got, "rotated pointer-IV AMAC mismatch at N={n}, Q={q}");
+            }
+        }
+    }
+
+    /// Builds the exact post-inlining, post-inner-rotation `bsearch_batch` LIR CFG:
+    /// `outer_hdr(acc, p)` (`Icmp(Ne, p, end)`) -> `outer_body` (`p_next = PtrAdd[INBOUNDS](p, 8)`,
+    /// `q = Load(I64, p, 0)`, outer-invariant guard `0 < table_len` / `table_len == 0`) ->
+    /// 1-block rotated `inner_hdr(lo, hi)` (`mid = lo + ((hi - lo) >> 1)`, `Load`, `Select`) vs
+    /// skip to `outer_latch(0)` -> `outer_latch(res)` (`acc_next = Add(acc, res)`).
+    fn build_guarded_rotated_bsearch_batch<A: Allocator + Copy>(
+        table: &[u64],
+        queries: &[u64],
+        enter_is_then: bool,
+        alloc: A,
+    ) -> Func<A> {
+        let mut b = Builder::<A, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let table_bytes = (table.len().max(1) * 8) as u32;
+        let query_bytes = (queries.len().max(1) * 8) as u32;
+        let arr_slot = b.slot(table_bytes, 3, SlotKind::Temp);
+        let qry_slot = b.slot(query_bytes, 3, SlotKind::Temp);
+
+        let [entry, outer_hdr, outer_body, inner_hdr, outer_latch, exit] =
+            [(); 6].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let table_len = b.param(Ty::I64);
+        let q_len = b.param(Ty::I64);
+        let table_ptr = b.slot_addr(arr_slot);
+        let q_ptr = b.slot_addr(qry_slot);
+        if table.is_empty() {
+            // Seed slot[0] = 0 so a buggy AMAC that enters `inner_hdr` when `table_len == 0`
+            // sees `0 < q` and produces a wrong non-zero `lo_next` instead of `0`.
+            let z = b.iconst(Ty::I64, 0);
+            b.store(Flags::NONE, z, table_ptr, 0, MemAttrs::aligned(3));
+        }
+        for (k, &v) in table.iter().enumerate() {
+            let cv = b.iconst(Ty::I64, u128::from(v));
+            b.store(Flags::NONE, cv, table_ptr, (k * 8) as i32, MemAttrs::aligned(3));
+        }
+        for (k, &v) in queries.iter().enumerate() {
+            let cv = b.iconst(Ty::I64, u128::from(v));
+            b.store(Flags::NONE, cv, q_ptr, (k * 8) as i32, MemAttrs::aligned(3));
+        }
+        let zero = b.iconst(Ty::I64, 0);
+        let one = b.iconst(Ty::I64, 1);
+        let three = b.iconst(Ty::I64, 3);
+        let eight = b.iconst(Ty::I64, 8);
+        let q_bytes = b.binary(Op::Shl, Flags::NONE, q_len, three);
+        let end = b.ptr_add(Flags::INBOUNDS, q_ptr, q_bytes);
+        b.jump((outer_hdr, &[zero, q_ptr]));
+
+        b.begin(outer_hdr);
+        let acc = b.param(Ty::I64);
+        let p = b.param(Ty::PTR);
+        let keep_outer = b.icmp(IntCond::Ne, p, end);
+        b.br(Flags::NONE, keep_outer, (outer_body, &[]), (exit, &[acc]));
+
+        b.begin(outer_body);
+        let p_next = b.ptr_add(Flags::INBOUNDS, p, eight);
+        let q = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+        if enter_is_then {
+            let nonempty = b.icmp(IntCond::Ult, zero, table_len);
+            b.br(Flags::NONE, nonempty, (inner_hdr, &[zero, table_len]), (outer_latch, &[zero]));
+        } else {
+            let empty = b.icmp(IntCond::Eq, table_len, zero);
+            b.br(Flags::NONE, empty, (outer_latch, &[zero]), (inner_hdr, &[zero, table_len]));
+        }
+
+        b.begin(inner_hdr);
+        let lo = b.param(Ty::I64);
+        let hi = b.param(Ty::I64);
+        let diff = b.binary(Op::Sub, Flags::NONE, hi, lo);
+        let half = b.binary(Op::Lshr, Flags::NONE, diff, one);
+        let mid = b.binary(Op::Add, Flags::NONE, lo, half);
+        let mid_off = b.binary(Op::Shl, Flags::NONE, mid, three);
+        let mid_ptr = b.ptr_add(Flags::NONE, table_ptr, mid_off);
+        let val = b.load(Ty::I64, Flags::NONE, mid_ptr, 0, MemAttrs::aligned(3));
+        let lt = b.icmp(IntCond::Ult, val, q);
+        let mid_p1 = b.binary(Op::Add, Flags::NONE, mid, one);
+        let lo_next = b.select(Flags::NONE, lt, mid_p1, lo);
+        let hi_next = b.select(Flags::NONE, lt, hi, mid);
+        let keep_inner = b.icmp(IntCond::Ult, lo_next, hi_next);
+        b.br(Flags::NONE, keep_inner, (inner_hdr, &[lo_next, hi_next]), (outer_latch, &[lo_next]));
+
+        b.begin(outer_latch);
+        let res = b.param(Ty::I64);
+        let acc_next = b.binary(Op::Add, Flags::NONE, acc, res);
+        b.jump((outer_hdr, &[acc_next, p_next]));
+
+        b.begin(exit);
+        let final_acc = b.param(Ty::I64);
+        b.ret(&[final_acc]);
+        b.finish_checked().unwrap()
+    }
+
+    #[test]
+    fn amac_8way_guarded_rotated_bsearch_batch_matches_eval() {
+        let alloc = blaze_own::testing::heap().alloc();
+        // Verify Apple Silicon preset enables 8-way AMAC and passes `table_len = 1_048_576`.
+        let m_opts = AmacOpts::apple_silicon();
+        assert_eq!(m_opts.group_width, 8);
+        assert!(m_opts.min_var_trip_bound <= 1_048_576);
+
+        for enter_is_then in [true, false] {
+            for &table_len in &[0usize, 1, 16, 64] {
+                let q_max = 25usize;
+                let (table, queries) = make_table_and_queries(table_len, q_max);
+                let orig = build_guarded_rotated_bsearch_batch(&table, &queries, enter_is_then, alloc);
+
+                for opts in [AmacOpts::wide_8(), AmacOpts::apple_silicon()] {
+                    let out = interleave_amac_loops(orig.view(), opts, alloc).unwrap();
+                    let v = out.func.view();
+                    verify(v).expect("8-way guarded rotated AMAC output must verify");
+                    assert_eq!(out.stats.nests_interleaved, 1);
+                    assert_eq!(out.stats.group_width_used, 8);
+                    assert_eq!(out.stats.prefetches_inserted, 8);
+                    assert_eq!(count_prefetches(v), 8);
+
+                    // Guard was hoisted into `b_amac_entry`, so `b_amac_outer_body` (block 2) MUST
+                    // jump unconditionally into `b_amac_inner_hdr` (block 3) with ZERO skip branch!
+                    assert_eq!(
+                        v.op(v.terminator(Block(2))),
+                        Op::Jump,
+                        "b_amac_outer_body must enter b_amac_inner_hdr unconditionally"
+                    );
+
+                    // All 8 software prefetches in `b_amac_inner_hdr` (block 3) MUST precede all 8 loads.
+                    let mut pf_count = 0usize;
+                    let mut ld_count = 0usize;
+                    let mut last_pf = 0usize;
+                    let mut first_ld = usize::MAX;
+                    for inst in v.block(Block(3)) {
+                        if v.op(inst) == Op::TargetIntrinsic
+                            && v.intrinsic_name(IntrinsicId(v.extra[v.data[inst] as usize]))
+                                == PREFETCH_READ_L1_INTRINSIC.as_bytes()
+                        {
+                            pf_count += 1;
+                            last_pf = inst;
+                        } else if v.op(inst) == Op::Load {
+                            ld_count += 1;
+                            first_ld = first_ld.min(inst);
+                        }
+                    }
+                    assert_eq!(pf_count, 8, "expected 8 prefetches in b_amac_inner_hdr");
+                    assert_eq!(ld_count, 8, "expected 8 loads in b_amac_inner_hdr");
+                    assert!(last_pf < first_ld, "all 8 prefetches must be emitted before all 8 loads");
+
+                    // Idempotence: second pass must be a no-op.
+                    let again = interleave_amac_loops(v, opts, alloc).unwrap();
+                    assert_eq!(again.stats.nests_interleaved, 0);
+
+                    let eval_fn = strip_prefetch_intrinsics(v);
+                    for &q_len in &[0usize, 1, 7, 8, 15, 25] {
+                        let args = [Val::Int(table_len as u128), Val::Int(q_len as u128)];
+                        let expected = eval_u64(orig.view(), &args);
+                        let got = eval_u64(eval_fn.view(), &args);
+                        assert_eq!(
+                            expected, got,
+                            "8-way guarded rotated bsearch_batch mismatch at enter_is_then={enter_is_then}, table_len={table_len}, q_len={q_len}, opts={opts:?}"
+                        );
+                    }
+                }
             }
         }
     }

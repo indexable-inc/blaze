@@ -33,11 +33,11 @@ use blaze_own::Vec;
 
 use super::{
     SimplifyError,
-    dce::{Edge, Item, NONE, coalesce_cfg, each, filled},
+    dce::{Edit, Edge, Item, NONE, coalesce_cfg, dead, each, filled, reachable, rebuild},
 };
 use crate::{
     Block, Flags, Func, IntCond, Op, Ty, View,
-    arith::{binary, compare, convert, iconst_value, unary, wide_value},
+    arith::{binary, compare, convert, iconst_value, mask, unary, wide_value},
     func::{MemAttrsRec, ParamFactsRec, SigId},
     op::{Field, Layout},
     verify,
@@ -558,8 +558,923 @@ fn eval_int_convert(op: Op, from_ty: Ty, to_ty: Ty, ptr_bits: u32, src: EvalVal)
     }
 }
 
+#[inline]
+fn invert_cond(cond: IntCond) -> IntCond {
+    match cond {
+        IntCond::Eq => IntCond::Ne,
+        IntCond::Ne => IntCond::Eq,
+        IntCond::Ult => IntCond::Uge,
+        IntCond::Uge => IntCond::Ult,
+        IntCond::Ule => IntCond::Ugt,
+        IntCond::Ugt => IntCond::Ule,
+        IntCond::Slt => IntCond::Sge,
+        IntCond::Sge => IntCond::Slt,
+        IntCond::Sle => IntCond::Sgt,
+        IntCond::Sgt => IntCond::Sle,
+    }
+}
+
+/// If `cond_inst` being `when_true` proves that scalar integer `var` equals a single constant `c`,
+/// returns `Some(c)`. Used to recognize two-valued niche selects such as
+/// `select (icmp ule addr, 0), addr, 1` -> `{0, 1}`.
+fn cond_implies_eq(view: &View<'_>, mut cond_inst: usize, mut when_true: bool, var: u32) -> Option<u128> {
+    for _ in 0..4 {
+        if cond_inst >= view.len() {
+            return None;
+        }
+        let flagless = at(view.flags, cond_inst, 0) == 0;
+        match view.op(cond_inst) {
+            Op::Freeze => {
+                cond_inst = to_idx(view.operands(cond_inst).value().0);
+            }
+            Op::Not if flagless && Ty(at(view.tys, cond_inst, 0)) == Ty::I1 => {
+                cond_inst = to_idx(view.operands(cond_inst).value().0);
+                when_true = !when_true;
+            }
+            Op::Icmp if flagless => {
+                let mut o = view.operands(cond_inst);
+                let raw_cond = o.int_cond();
+                let lhs = o.value().0;
+                let rhs = o.value().0;
+                let op_ty = Ty(at(view.tys, to_idx(lhs), 0));
+                if !op_ty.is_scalar() || !op_ty.is_int() {
+                    return None;
+                }
+                let eff = if when_true { raw_cond } else { invert_cond(raw_cond) };
+                return match eff {
+                    IntCond::Eq => {
+                        if lhs == var {
+                            unsigned_const(view, to_idx(rhs))
+                        } else if rhs == var {
+                            unsigned_const(view, to_idx(lhs))
+                        } else {
+                            None
+                        }
+                    }
+                    IntCond::Ule => {
+                        if lhs == var && unsigned_const(view, to_idx(rhs)) == Some(0) {
+                            Some(0)
+                        } else {
+                            None
+                        }
+                    }
+                    IntCond::Uge => {
+                        if rhs == var && unsigned_const(view, to_idx(lhs)) == Some(0) {
+                            Some(0)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// If scalar integer instruction `inst` can only ever evaluate to one of two distinct constants
+/// `(a, b)`, returns `Some((a, b))`. Never relies on `Op::Uninit` being consistent across uses.
+fn two_const_range(view: &View<'_>, mut inst: usize) -> Option<(u128, u128)> {
+    for _ in 0..4 {
+        if inst >= view.len() {
+            return None;
+        }
+        let op = view.op(inst);
+        if op == Op::Uninit {
+            return None;
+        }
+        let ty = Ty(at(view.tys, inst, 0));
+        if !ty.is_scalar() || !ty.is_int() {
+            return None;
+        }
+        if ty == Ty::I1 {
+            return Some((0, 1));
+        }
+        let flagless = at(view.flags, inst, 0) == 0;
+        match op {
+            Op::Freeze => {
+                inst = to_idx(view.operands(inst).value().0);
+            }
+            Op::Zext if flagless => {
+                inst = to_idx(view.operands(inst).value().0);
+            }
+            Op::And if flagless => {
+                let mut o = view.operands(inst);
+                let a = to_idx(o.value().0);
+                let b = to_idx(o.value().0);
+                if unsigned_const(view, a) == Some(1) || unsigned_const(view, b) == Some(1) {
+                    return Some((0, 1));
+                }
+                return None;
+            }
+            Op::Select => {
+                let mut o = view.operands(inst);
+                let cond = to_idx(o.value().0);
+                let t_v = to_idx(o.value().0);
+                let f_v = to_idx(o.value().0);
+                let t_c = unsigned_const(view, t_v);
+                let f_c = unsigned_const(view, f_v);
+                if let (Some(a), Some(b)) = (t_c, f_c) {
+                    return if a != b { Some((a, b)) } else { None };
+                }
+                if let Some(b) = f_c {
+                    if t_v < view.len() && view.op(t_v) != Op::Uninit {
+                        if let Some(a) = cond_implies_eq(view, cond, true, to_u32(t_v)) {
+                            return if a != b { Some((a, b)) } else { None };
+                        }
+                    }
+                }
+                if let Some(a) = t_c {
+                    if f_v < view.len() && view.op(f_v) != Op::Uninit {
+                        if let Some(b) = cond_implies_eq(view, cond, false, to_u32(f_v)) {
+                            return if a != b { Some((a, b)) } else { None };
+                        }
+                    }
+                }
+                return None;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Small stack-allocated table of edge-refined value facts valid along a CFG edge or dominated region.
+const MAX_EDGE_FACTS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct EdgeFacts {
+    items: [(u32, EvalVal); MAX_EDGE_FACTS],
+    len: usize,
+}
+
+impl EdgeFacts {
+    #[inline]
+    fn empty() -> Self {
+        Self { items: [(NONE, EvalVal::Unknown); MAX_EDGE_FACTS], len: 0 }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn is_full(&self) -> bool {
+        self.len >= MAX_EDGE_FACTS
+    }
+
+    fn push(&mut self, v: u32, val: EvalVal) {
+        if val == EvalVal::Unknown {
+            return;
+        }
+        for i in 0..self.len {
+            let (cur_v, cur_val) = at(&self.items, i, (NONE, EvalVal::Unknown));
+            if cur_v == v {
+                if cur_val == EvalVal::IntNonZero && matches!(val, EvalVal::Int(_)) {
+                    set_at(&mut self.items, i, (v, val));
+                }
+                return;
+            }
+        }
+        if self.len < MAX_EDGE_FACTS {
+            set_at(&mut self.items, self.len, (v, val));
+            self.len += 1;
+        }
+    }
+
+    #[inline]
+    fn lookup(&self, v: u32, global_vals: &[EvalVal]) -> EvalVal {
+        for i in 0..self.len {
+            let (fv, fval) = at(&self.items, i, (NONE, EvalVal::Unknown));
+            if fv == v {
+                return fval;
+            }
+        }
+        at(global_vals, to_idx(v), EvalVal::Unknown)
+    }
+}
+
+/// Records any sound value facts implied by taking edge `ordinal` out of terminator `pred_term`.
+fn derive_edge_facts(
+    view: &View<'_>,
+    pred_term: usize,
+    ordinal: u32,
+    global_vals: &[EvalVal],
+    out: &mut EdgeFacts,
+) {
+    let is_stable = |v: u32| -> bool {
+        let idx = to_idx(v);
+        idx < view.len() && view.op(idx) != Op::Uninit
+    };
+
+    match view.op(pred_term) {
+        Op::Br => {
+            let mut cond_v = view.operands(pred_term).value().0;
+            let mut taken_true = ordinal == 0;
+            if is_stable(cond_v) {
+                out.push(cond_v, EvalVal::Int(u128::from(taken_true)));
+            }
+            for _ in 0..4 {
+                let idx = to_idx(cond_v);
+                if idx >= view.len() {
+                    return;
+                }
+                let flagless = at(view.flags, idx, 0) == 0;
+                match view.op(idx) {
+                    Op::Freeze => {
+                        cond_v = view.operands(idx).value().0;
+                    }
+                    Op::Not if flagless && Ty(at(view.tys, idx, 0)) == Ty::I1 => {
+                        cond_v = view.operands(idx).value().0;
+                        taken_true = !taken_true;
+                        if is_stable(cond_v) {
+                            out.push(cond_v, EvalVal::Int(u128::from(taken_true)));
+                        }
+                    }
+                    Op::Xor if flagless && Ty(at(view.tys, idx, 0)) == Ty::I1 => {
+                        let mut o = view.operands(idx);
+                        let a = o.value().0;
+                        let b = o.value().0;
+                        let av = at(global_vals, to_idx(a), EvalVal::Unknown);
+                        let bv = at(global_vals, to_idx(b), EvalVal::Unknown);
+                        if av == EvalVal::Int(1) {
+                            cond_v = b;
+                            taken_true = !taken_true;
+                        } else if bv == EvalVal::Int(1) {
+                            cond_v = a;
+                            taken_true = !taken_true;
+                        } else if av == EvalVal::Int(0) {
+                            cond_v = b;
+                        } else if bv == EvalVal::Int(0) {
+                            cond_v = a;
+                        } else {
+                            return;
+                        }
+                        if is_stable(cond_v) {
+                            out.push(cond_v, EvalVal::Int(u128::from(taken_true)));
+                        }
+                    }
+                    _ => break,
+                }
+            }
+
+            let cond_idx = to_idx(cond_v);
+            if cond_idx >= view.len() || at(view.flags, cond_idx, 0) != 0 {
+                return;
+            }
+            match view.op(cond_idx) {
+                Op::Icmp => {
+                    let mut o = view.operands(cond_idx);
+                    let raw_cond = o.int_cond();
+                    let lhs = o.value().0;
+                    let rhs = o.value().0;
+                    let eff = if taken_true { raw_cond } else { invert_cond(raw_cond) };
+                    let op_ty = Ty(at(view.tys, to_idx(lhs), 0));
+                    let lval = at(global_vals, to_idx(lhs), EvalVal::Unknown);
+                    let rval = at(global_vals, to_idx(rhs), EvalVal::Unknown);
+
+                    if op_ty == Ty::PTR {
+                        match eff {
+                            IntCond::Eq => {
+                                if rval == EvalVal::PtrNull && is_stable(lhs) {
+                                    out.push(lhs, EvalVal::PtrNull);
+                                } else if lval == EvalVal::PtrNull && is_stable(rhs) {
+                                    out.push(rhs, EvalVal::PtrNull);
+                                }
+                            }
+                            IntCond::Ne => {
+                                if rval == EvalVal::PtrNull && is_stable(lhs) {
+                                    out.push(lhs, EvalVal::PtrNonNull);
+                                } else if lval == EvalVal::PtrNull && is_stable(rhs) {
+                                    out.push(rhs, EvalVal::PtrNonNull);
+                                }
+                            }
+                            IntCond::Ule if rval == EvalVal::PtrNull && is_stable(lhs) => {
+                                out.push(lhs, EvalVal::PtrNull);
+                            }
+                            IntCond::Uge if lval == EvalVal::PtrNull && is_stable(rhs) => {
+                                out.push(rhs, EvalVal::PtrNull);
+                            }
+                            IntCond::Ugt if rval == EvalVal::PtrNull && is_stable(lhs) => {
+                                out.push(lhs, EvalVal::PtrNonNull);
+                            }
+                            IntCond::Ult if lval == EvalVal::PtrNull && is_stable(rhs) => {
+                                out.push(rhs, EvalVal::PtrNonNull);
+                            }
+                            _ => {}
+                        }
+                    } else if op_ty.is_scalar() && op_ty.is_int() {
+                        let width = op_ty.bits(view.head.ptr_bits);
+                        let push_int = |var: u32, refined: EvalVal, out: &mut EdgeFacts| {
+                            out.push(var, refined);
+                            let v_idx = to_idx(var);
+                            if v_idx < view.len() && view.op(v_idx) == Op::PtrAddr {
+                                let ptr_v = view.operands(v_idx).value().0;
+                                if is_stable(ptr_v) {
+                                    match refined {
+                                        EvalVal::Int(0) => out.push(ptr_v, EvalVal::PtrNull),
+                                        EvalVal::Int(_) | EvalVal::IntNonZero => {
+                                            out.push(ptr_v, EvalVal::PtrNonNull);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        };
+
+                        let refine_var_vs_const =
+                            |var: u32, c: u128, var_on_left: bool, out: &mut EdgeFacts| {
+                                if !is_stable(var) {
+                                    return;
+                                }
+                                if let Some((a, b)) = two_const_range(view, to_idx(var)) {
+                                    let a_ok = if var_on_left {
+                                        compare(eff, a, c, width)
+                                    } else {
+                                        compare(eff, c, a, width)
+                                    };
+                                    let b_ok = if var_on_left {
+                                        compare(eff, b, c, width)
+                                    } else {
+                                        compare(eff, c, b, width)
+                                    };
+                                    if a_ok && !b_ok {
+                                        push_int(var, EvalVal::Int(a), out);
+                                        return;
+                                    } else if !a_ok && b_ok {
+                                        push_int(var, EvalVal::Int(b), out);
+                                        return;
+                                    }
+                                }
+                                match (eff, var_on_left, c) {
+                                    (IntCond::Eq, _, _) => push_int(var, EvalVal::Int(c), out),
+                                    (IntCond::Ule, true, 0) | (IntCond::Uge, false, 0) => {
+                                        push_int(var, EvalVal::Int(0), out);
+                                    }
+                                    (IntCond::Ne, _, 0)
+                                    | (IntCond::Ugt, true, 0)
+                                    | (IntCond::Ult, false, 0) => {
+                                        let v = if width == 1 {
+                                            EvalVal::Int(1)
+                                        } else {
+                                            EvalVal::IntNonZero
+                                        };
+                                        push_int(var, v, out);
+                                    }
+                                    _ => {}
+                                }
+                            };
+
+                        if let EvalVal::Int(c) = rval {
+                            refine_var_vs_const(lhs, c, true, out);
+                        } else if let EvalVal::Int(c) = lval {
+                            refine_var_vs_const(rhs, c, false, out);
+                        }
+                    }
+                }
+                Op::Trunc => {
+                    let src = view.operands(cond_idx).value().0;
+                    if is_stable(src) {
+                        if let Some((a, b)) = two_const_range(view, to_idx(src)) {
+                            let a_ok = ((a & 1) != 0) == taken_true;
+                            let b_ok = ((b & 1) != 0) == taken_true;
+                            if a_ok && !b_ok {
+                                out.push(src, EvalVal::Int(a));
+                            } else if !a_ok && b_ok {
+                                out.push(src, EvalVal::Int(b));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Op::Switch => {
+            let mut o = view.operands(pred_term);
+            let scrut = o.value();
+            if !is_stable(scrut.0) {
+                return;
+            }
+            let width = Ty(at(view.tys, scrut.index(), 0)).bits(view.head.ptr_bits);
+            let _default = o.target();
+            if ordinal >= 1 {
+                let want = to_idx(ordinal - 1);
+                for (idx, (words, _)) in o.cases(scrut).enumerate() {
+                    if idx == want {
+                        out.push(scrut.0, EvalVal::Int(wide_value(words, width)));
+                        return;
+                    }
+                }
+            } else if let Some((a, b)) = two_const_range(view, scrut.index()) {
+                let mut seen_a = false;
+                let mut seen_b = false;
+                for (words, _) in o.cases(scrut) {
+                    let cv = wide_value(words, width);
+                    if cv == a {
+                        seen_a = true;
+                    }
+                    if cv == b {
+                        seen_b = true;
+                    }
+                }
+                if seen_a && !seen_b {
+                    out.push(scrut.0, EvalVal::Int(b));
+                } else if !seen_a && seen_b {
+                    out.push(scrut.0, EvalVal::Int(a));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walks up to 4 dominators from `cur`, collecting branch facts from every unique-incoming-edge
+/// block that dominates `cur`. Sound because every path from entry (and from each refined SSA
+/// value's definition) to `cur` must traverse each such unique incoming edge.
+fn collect_dom_edge_facts<A: Allocator + Copy>(
+    view: &View<'_>,
+    cfg: &Cfg<A>,
+    mut cur: u32,
+    global_vals: &[EvalVal],
+    out: &mut EdgeFacts,
+) {
+    for _ in 0..4 {
+        if cur == 0 || cur == NONE || out.is_full() {
+            break;
+        }
+        if at(&cfg.plain_only, to_idx(cur), false) {
+            let in_edges = cfg.incoming_of(cur);
+            if let [sole] = in_edges {
+                if sole.pred != cur && at(&cfg.unique_pred, to_idx(cur), NONE) == sole.pred {
+                    let pred_term = view.terminator(Block(sole.pred));
+                    derive_edge_facts(view, pred_term, sole.ordinal, global_vals, out);
+                }
+            }
+        }
+        let parent = at(&cfg.idom, to_idx(cur), NONE);
+        if parent == NONE || parent == cur {
+            break;
+        }
+        cur = parent;
+    }
+}
+
+/// Abstractly evaluates a pure / value-producing instruction `inst` using `lookup`.
+fn eval_pure_inst(view: &View<'_>, inst: usize, lookup: impl Fn(u32) -> EvalVal) -> EvalVal {
+    let op = view.op(inst);
+    let ty = Ty(at(view.tys, inst, 0));
+    let flagless = at(view.flags, inst, 0) == 0;
+    match op {
+        Op::Iconst | Op::IconstWide => match unsigned_const(view, inst) {
+            Some(v) => EvalVal::Int(v),
+            None => EvalVal::Unknown,
+        },
+        Op::Null => EvalVal::PtrNull,
+        Op::SlotAddr | Op::DataAddr | Op::FuncAddr | Op::TlsAddr => EvalVal::PtrNonNull,
+        Op::Freeze => lookup(view.operands(inst).value().0),
+        Op::PtrAddr | Op::Expose => match lookup(view.operands(inst).value().0) {
+            EvalVal::PtrNull => EvalVal::Int(0),
+            EvalVal::PtrNonNull => EvalVal::IntNonZero,
+            _ => EvalVal::Unknown,
+        },
+        Op::FromExposed if ty == Ty::PTR => match lookup(view.operands(inst).value().0) {
+            EvalVal::Int(0) => EvalVal::PtrNull,
+            EvalVal::Int(_) | EvalVal::IntNonZero => EvalVal::PtrNonNull,
+            _ => EvalVal::Unknown,
+        },
+        Op::PtrWithAddr if ty == Ty::PTR => {
+            let mut o = view.operands(inst);
+            let _base = o.value();
+            match lookup(o.value().0) {
+                EvalVal::Int(0) => EvalVal::PtrNull,
+                EvalVal::Int(_) | EvalVal::IntNonZero => EvalVal::PtrNonNull,
+                _ => EvalVal::Unknown,
+            }
+        }
+        Op::PtrAdd if ty == Ty::PTR => {
+            let mut o = view.operands(inst);
+            let base = lookup(o.value().0);
+            let by = lookup(o.value().0);
+            let flags = view.flags(inst);
+            if base == EvalVal::PtrNonNull
+                && (flags.contains(Flags::INBOUNDS) || flags.contains(Flags::NUW) || by == EvalVal::Int(0))
+            {
+                EvalVal::PtrNonNull
+            } else if base == EvalVal::PtrNull && by == EvalVal::Int(0) {
+                EvalVal::PtrNull
+            } else {
+                EvalVal::Unknown
+            }
+        }
+        Op::Icmp if flagless => {
+            let mut o = view.operands(inst);
+            let cond = o.int_cond();
+            let a_v = o.value().0;
+            let b_v = o.value().0;
+            let op_ty = Ty(at(view.tys, to_idx(a_v), 0));
+            eval_icmp(cond, op_ty, view.head.ptr_bits, lookup(a_v), lookup(b_v))
+        }
+        Op::Zext | Op::Sext | Op::Trunc if flagless => {
+            let a_v = view.operands(inst).value().0;
+            let from_ty = Ty(at(view.tys, to_idx(a_v), 0));
+            eval_int_convert(op, from_ty, ty, view.head.ptr_bits, lookup(a_v))
+        }
+        Op::Bitcast if flagless && ty.is_scalar() && ty.is_int() => {
+            let a_v = view.operands(inst).value().0;
+            let from_ty = Ty(at(view.tys, to_idx(a_v), 0));
+            if from_ty.is_scalar() && from_ty.is_int() {
+                lookup(a_v)
+            } else {
+                EvalVal::Unknown
+            }
+        }
+        Op::Neg | Op::Not if flagless && ty.is_scalar() && ty.is_int() => {
+            let width = ty.bits(view.head.ptr_bits);
+            let a_v = view.operands(inst).value().0;
+            match lookup(a_v) {
+                EvalVal::Int(a) => EvalVal::Int(unary(op, a, width)),
+                EvalVal::IntNonZero if op == Op::Not && width == 1 => EvalVal::Int(0),
+                EvalVal::IntNonZero if op == Op::Neg => {
+                    if width == 1 {
+                        EvalVal::Int(1)
+                    } else {
+                        EvalVal::IntNonZero
+                    }
+                }
+                _ => EvalVal::Unknown,
+            }
+        }
+        Op::Or if ty.is_scalar() && ty.is_int() => {
+            let width = ty.bits(view.head.ptr_bits);
+            let all_ones = mask(width);
+            let mut o = view.operands(inst);
+            let a_v = o.value().0;
+            let b_v = o.value().0;
+            match (lookup(a_v), lookup(b_v)) {
+                (EvalVal::Int(a), EvalVal::Int(b)) => EvalVal::Int(a | b),
+                (EvalVal::Int(v), _) | (_, EvalVal::Int(v)) if v == all_ones => EvalVal::Int(all_ones),
+                (EvalVal::Int(0), x) | (x, EvalVal::Int(0)) => x,
+                (EvalVal::IntNonZero, _) | (_, EvalVal::IntNonZero) => {
+                    if width == 1 {
+                        EvalVal::Int(1)
+                    } else {
+                        EvalVal::IntNonZero
+                    }
+                }
+                (EvalVal::Int(v), _) | (_, EvalVal::Int(v)) if v != 0 => EvalVal::IntNonZero,
+                _ => EvalVal::Unknown,
+            }
+        }
+        Op::And if flagless && ty.is_scalar() && ty.is_int() => {
+            let width = ty.bits(view.head.ptr_bits);
+            let all_ones = mask(width);
+            let mut o = view.operands(inst);
+            let a_v = o.value().0;
+            let b_v = o.value().0;
+            match (lookup(a_v), lookup(b_v)) {
+                (EvalVal::Int(a), EvalVal::Int(b)) => EvalVal::Int(a & b),
+                (EvalVal::Int(0), _) | (_, EvalVal::Int(0)) => EvalVal::Int(0),
+                (EvalVal::Int(v), x) | (x, EvalVal::Int(v)) if v == all_ones => x,
+                _ => EvalVal::Unknown,
+            }
+        }
+        Op::Xor if flagless && ty.is_scalar() && ty.is_int() => {
+            let width = ty.bits(view.head.ptr_bits);
+            let mut o = view.operands(inst);
+            let a_v = o.value().0;
+            let b_v = o.value().0;
+            match (lookup(a_v), lookup(b_v)) {
+                (EvalVal::Int(a), EvalVal::Int(b)) => EvalVal::Int(a ^ b),
+                (EvalVal::Int(0), x) | (x, EvalVal::Int(0)) => x,
+                (EvalVal::IntNonZero, EvalVal::Int(b)) | (EvalVal::Int(b), EvalVal::IntNonZero)
+                    if width == 1 =>
+                {
+                    EvalVal::Int(1 ^ b)
+                }
+                _ => EvalVal::Unknown,
+            }
+        }
+        Op::Add | Op::Sub | Op::Mul | Op::Shl | Op::Lshr | Op::Ashr | Op::Rotl | Op::Rotr | Op::Umin
+        | Op::Umax | Op::Smin | Op::Smax
+            if flagless && ty.is_scalar() && ty.is_int() =>
+        {
+            let mut o = view.operands(inst);
+            let a_v = o.value().0;
+            let b_v = o.value().0;
+            match (lookup(a_v), lookup(b_v)) {
+                (EvalVal::Int(a), EvalVal::Int(b)) => match binary(op, a, b, ty.bits(view.head.ptr_bits)) {
+                    Ok(res) => EvalVal::Int(res),
+                    Err(_) => EvalVal::Unknown,
+                },
+                (EvalVal::Int(0), x) | (x, EvalVal::Int(0)) if op == Op::Add => x,
+                (x, EvalVal::Int(0)) if op == Op::Sub => x,
+                _ => EvalVal::Unknown,
+            }
+        }
+        Op::Select => {
+            let mut o = view.operands(inst);
+            let c_v = o.value().0;
+            let a_v = o.value().0;
+            let b_v = o.value().0;
+            match lookup(c_v) {
+                EvalVal::Int(c) => lookup(if c != 0 { a_v } else { b_v }),
+                EvalVal::IntNonZero => lookup(a_v),
+                _ => {
+                    let la = lookup(a_v);
+                    let lb = lookup(b_v);
+                    let is_nonzero = |x: EvalVal| matches!(x, EvalVal::IntNonZero) || matches!(x, EvalVal::Int(v) if v != 0);
+                    if la == lb {
+                        la
+                    } else if ty.is_scalar() && ty.is_int() && is_nonzero(la) && is_nonzero(lb) {
+                        if ty == Ty::I1 { EvalVal::Int(1) } else { EvalVal::IntNonZero }
+                    } else {
+                        EvalVal::Unknown
+                    }
+                }
+            }
+        }
+        _ => EvalVal::Unknown,
+    }
+}
+
+/// Evaluates `Op::Br` or `Op::Switch` terminator `term` under `lookup`, returning its resolved
+/// target ordinal when statically decided.
+fn eval_terminator_static(view: &View<'_>, term: usize, lookup: impl Fn(u32) -> EvalVal) -> Option<u32> {
+    match view.op(term) {
+        Op::Br => {
+            let cond = view.operands(term).value().0;
+            match lookup(cond) {
+                EvalVal::Int(v) => Some(if v != 0 { 0u32 } else { 1u32 }),
+                EvalVal::IntNonZero => Some(0u32),
+                _ => None,
+            }
+        }
+        Op::Switch => {
+            let mut o = view.operands(term);
+            let scrutinee = o.value();
+            let width = Ty(at(view.tys, scrutinee.index(), 0)).bits(view.head.ptr_bits);
+            let _default = o.target();
+            match lookup(scrutinee.0) {
+                EvalVal::Int(v) => {
+                    let mut found = None;
+                    for (idx, (words, _)) in o.cases(scrutinee).enumerate() {
+                        if wide_value(words, width) == v {
+                            found = Some(1 + to_u32(idx));
+                            break;
+                        }
+                    }
+                    Some(found.unwrap_or(0))
+                }
+                EvalVal::IntNonZero if width == 1 => {
+                    let mut found = None;
+                    for (idx, (words, _)) in o.cases(scrutinee).enumerate() {
+                        if wide_value(words, width) == 1 {
+                            found = Some(1 + to_u32(idx));
+                            break;
+                        }
+                    }
+                    Some(found.unwrap_or(0))
+                }
+                EvalVal::IntNonZero => {
+                    let all_zero = o.cases(scrutinee).all(|(words, _)| wide_value(words, width) == 0);
+                    if all_zero { Some(0) } else { None }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Returns whether byte offset `off` is a provably non-negative multiple of `step` (or any
+/// non-negative offset when `step == 1`), so a pointer loop stepping by `+step` from `entry_base`
+/// to `PtrAdd[INBOUNDS](entry_base, off)` cannot overshoot `end` and wrap through address 0.
+fn offset_is_step_multiple(
+    view: &View<'_>,
+    mut off: usize,
+    step: i128,
+    step_u128: u128,
+    is_ult: bool,
+) -> bool {
+    if step <= 0 || step_u128 == 0 {
+        return false;
+    }
+    let ptr_bits = view.head.ptr_bits;
+    for _ in 0..4 {
+        if off >= view.len() {
+            return false;
+        }
+        if let Some(c) = signed_const(view, off) {
+            if c < 0 {
+                return false;
+            }
+            return (is_ult && step == 1) || (c % step) == 0;
+        }
+        match view.op(off) {
+            Op::Freeze | Op::Zext | Op::Sext if at(view.flags, off, 0) == 0 => {
+                off = to_idx(view.operands(off).value().0);
+            }
+            Op::Shl => {
+                if step == 1 {
+                    return true;
+                }
+                let mut o = view.operands(off);
+                let _v = o.value();
+                let sh_idx = to_idx(o.value().0);
+                if let Some(sh) = signed_const(view, sh_idx) {
+                    if sh >= 0 && sh < i128::from(ptr_bits) {
+                        if let Ok(sh_u32) = u32::try_from(sh) {
+                            if let Some(stride) = 1u128.checked_shl(sh_u32) {
+                                return (stride % step_u128) == 0;
+                            }
+                        }
+                    }
+                }
+                return false;
+            }
+            Op::Mul => {
+                if step == 1 {
+                    return true;
+                }
+                let mut o = view.operands(off);
+                let a = to_idx(o.value().0);
+                let b = to_idx(o.value().0);
+                let a_ok = signed_const(view, a).is_some_and(|m| m > 0 && (m % step) == 0);
+                let b_ok = signed_const(view, b).is_some_and(|m| m > 0 && (m % step) == 0);
+                return a_ok || b_ok;
+            }
+            _ => return step == 1,
+        }
+    }
+    step == 1
+}
+
+/// Checks whether `inst = PtrAdd(base, by)` (even without `INBOUNDS`/`NUW`) is the induction step
+/// of a loop header `hdr(p, ...)` whose entry arg `entry_base` is `PtrNonNull`, whose header tests
+/// `p != end` or `p < end` with `end = PtrAdd[INBOUNDS | NUW](entry_base, byte_len)` where
+/// `byte_len` is a non-negative multiple of `step > 0`, and `inst` is dominated by the loop body
+/// arm. Under these conditions `p` stays strictly in `[entry_base, end)` and `p + step <= end`
+/// inside the inbounds allocation, so `inst` cannot wrap through address 0.
+fn is_loop_bounded_nonnull_ptr_add<A: Allocator + Copy>(
+    view: &View<'_>,
+    cfg: &Cfg<A>,
+    vals: &[EvalVal],
+    inst: usize,
+    inst_block: u32,
+    base: usize,
+    by: usize,
+) -> bool {
+    let Some(step) = signed_const(view, by) else {
+        return false;
+    };
+    if step <= 0 {
+        return false;
+    }
+    let Ok(step_u128) = u128::try_from(step) else {
+        return false;
+    };
+    if base >= view.len() || view.op(base) != Op::Param {
+        return false;
+    }
+    let hdr = at(&cfg.owner, base, NONE);
+    if hdr == NONE || hdr == 0 || !at(&cfg.plain_only, to_idx(hdr), false) {
+        return false;
+    }
+    let hdr_params = view.params(Block(hdr));
+    if base < hdr_params.start || base >= hdr_params.end {
+        return false;
+    }
+    let param_k = base - hdr_params.start;
+    let base_u32 = to_u32(base);
+
+    let hdr_term = view.terminator(Block(hdr));
+    if view.op(hdr_term) != Op::Br {
+        return false;
+    }
+    let mut to = view.operands(hdr_term);
+    let cond_v = to.value().0;
+    let then_blk = to.target().block.0;
+    let else_blk = to.target().block.0;
+    let cond_idx = to_idx(cond_v);
+    if cond_idx >= view.len() || view.op(cond_idx) != Op::Icmp || at(view.flags, cond_idx, 0) != 0 {
+        return false;
+    }
+    let mut co = view.operands(cond_idx);
+    let icond = co.int_cond();
+    let raw_lhs = co.value().0;
+    let raw_rhs = co.value().0;
+    let cmp_ty = Ty(at(view.tys, to_idx(raw_lhs), 0));
+    let ptr_int_cmp = cmp_ty.is_scalar()
+        && cmp_ty.is_int()
+        && cmp_ty.bits(view.head.ptr_bits) == view.head.ptr_bits;
+    if cmp_ty != Ty::PTR && !ptr_int_cmp {
+        return false;
+    }
+    let strip_ptr_addr = |v: u32| -> u32 {
+        let idx = to_idx(v);
+        if cmp_ty != Ty::PTR && idx < view.len() && view.op(idx) == Op::PtrAddr {
+            view.operands(idx).value().0
+        } else {
+            v
+        }
+    };
+    let lhs = strip_ptr_addr(raw_lhs);
+    let rhs = strip_ptr_addr(raw_rhs);
+    let (end_v, p_on_left) = if lhs == base_u32 {
+        (rhs, true)
+    } else if rhs == base_u32 {
+        (lhs, false)
+    } else {
+        return false;
+    };
+
+    let (body_blk, is_ult) = match (icond, p_on_left) {
+        (IntCond::Ne, _) => (then_blk, false),
+        (IntCond::Eq, _) => (else_blk, false),
+        (IntCond::Ult, true) | (IntCond::Ugt, false) => (then_blk, true),
+        (IntCond::Uge, true) | (IntCond::Ule, false) => (else_blk, true),
+        _ => return false,
+    };
+    if body_blk == hdr || at(&cfg.unique_pred, to_idx(body_blk), NONE) != hdr {
+        return false;
+    }
+    if !cfg.is_dom(inst_block, body_blk) {
+        return false;
+    }
+
+    let edges = cfg.incoming_of(hdr);
+    if edges.is_empty() {
+        return false;
+    }
+    let mut entry_base: Option<u32> = None;
+    let mut has_self_inst_edge = false;
+    let inst_u32 = to_u32(inst);
+    for edge in edges {
+        if param_k >= edge.args_len {
+            return false;
+        }
+        let arg = at(view.extra, edge.args_start + param_k, NONE);
+        if cfg.is_dom(edge.pred, hdr) {
+            if arg == base_u32 {
+                continue;
+            }
+            let arg_idx = to_idx(arg);
+            if arg_idx >= view.len() || view.op(arg_idx) != Op::PtrAdd {
+                return false;
+            }
+            if !cfg.is_dom(at(&cfg.owner, arg_idx, NONE), body_blk) {
+                return false;
+            }
+            let mut ao = view.operands(arg_idx);
+            let a_base = ao.value().0;
+            let a_by = to_idx(ao.value().0);
+            if a_base != base_u32 || signed_const(view, a_by) != Some(step) {
+                return false;
+            }
+            if arg == inst_u32 {
+                has_self_inst_edge = true;
+            }
+        } else {
+            if at(vals, to_idx(arg), EvalVal::Unknown) != EvalVal::PtrNonNull {
+                return false;
+            }
+            match entry_base {
+                None => entry_base = Some(arg),
+                Some(prev) if prev == arg => {}
+                Some(_) => return false,
+            }
+        }
+    }
+    let Some(entry_base) = entry_base else {
+        return false;
+    };
+    if !has_self_inst_edge {
+        return false;
+    }
+
+    let end_idx = to_idx(end_v);
+    if end_idx >= view.len() || view.op(end_idx) != Op::PtrAdd {
+        return false;
+    }
+    let end_flags = view.flags(end_idx);
+    if !end_flags.contains(Flags::INBOUNDS) && !end_flags.contains(Flags::NUW) {
+        return false;
+    }
+    let mut eo = view.operands(end_idx);
+    let end_base = eo.value().0;
+    let end_off = to_idx(eo.value().0);
+    if end_base != entry_base {
+        return false;
+    }
+    offset_is_step_multiple(view, end_off, step, step_u128, is_ult)
+}
+
 /// Computes sound global static facts (integer constants, `null`, and provably non-null pointers,
-/// including loop-inductive `ptr_add inbounds` pointers from `slice::Iter::next`).
+/// including loop-inductive `ptr_add` pointers from `slice::Iter::next`, plus `icmp`/`select`/
+/// bitwise folding over those facts).
 fn compute_global_vals<A: Allocator + Copy>(view: &View<'_>, cfg: &Cfg<A>, alloc: A) -> Vec<EvalVal, A> {
     let len = view.len();
     let mut vals = filled(len, EvalVal::Unknown, &alloc);
@@ -600,53 +1515,22 @@ fn compute_global_vals<A: Allocator + Copy>(view: &View<'_>, cfg: &Cfg<A>, alloc
     let mut converged = false;
     for _ in 0..MAX_NONNULL_ROUNDS {
         let mut changed = false;
+
+        // Phase A: evaluate body instructions in RPO using current param facts BEFORE demoting
+        // params so loop back-edge values (`p_next = ptr_add p, 8`) are computed before `hdr(p)`
+        // checks its incoming back-edge!
         for &b in cfg.rpo.iter() {
             let params = view.params(Block(b));
-            if b != 0 && at(&cfg.plain_only, to_idx(b), false) {
-                let edges = cfg.incoming_of(b);
-                for (k, inst) in (params.start..params.end).enumerate() {
-                    if at(&vals, inst, EvalVal::Unknown) != EvalVal::PtrNonNull {
-                        continue;
-                    }
-                    let inst_u32 = to_u32(inst);
-                    let mut all_nonnull = !edges.is_empty();
-                    for edge in edges {
-                        if k >= edge.args_len {
-                            all_nonnull = false;
-                            break;
-                        }
-                        let arg = at(view.extra, edge.args_start + k, NONE);
-                        if arg == inst_u32 {
-                            continue;
-                        }
-                        if at(&vals, to_idx(arg), EvalVal::Unknown) != EvalVal::PtrNonNull {
-                            all_nonnull = false;
-                            break;
-                        }
-                    }
-                    if !all_nonnull {
-                        set_at(&mut vals, inst, EvalVal::Unknown);
-                        changed = true;
-                    }
-                }
-            }
-
             let range = view.block(Block(b));
             for inst in params.end..range.end {
                 let op = view.op(inst);
                 let ty = Ty(at(view.tys, inst, 0));
                 let next_val = match op {
-                    Op::Iconst | Op::IconstWide => match unsigned_const(view, inst) {
-                        Some(v) => EvalVal::Int(v),
-                        None => EvalVal::Unknown,
-                    },
-                    Op::Null => EvalVal::PtrNull,
-                    Op::SlotAddr | Op::DataAddr | Op::FuncAddr | Op::TlsAddr => EvalVal::PtrNonNull,
-                    Op::Load if ty == Ty::PTR => match view.mem_attrs(inst) {
+                    Op::Load | Op::AtomicLoad if ty == Ty::PTR => match view.mem_attrs(inst) {
                         Some(m) if (m.bits & MemAttrsRec::NONNULL) != 0 => EvalVal::PtrNonNull,
                         _ => EvalVal::Unknown,
                     },
-                    Op::Call if ty == Ty::PTR => {
+                    Op::Call | Op::Invoke if ty == Ty::PTR => {
                         let mut o = view.operands(inst);
                         let _callee = o.reference();
                         let sig = view.sig(o.sig());
@@ -659,12 +1543,41 @@ fn compute_global_vals<A: Allocator + Copy>(view: &View<'_>, cfg: &Cfg<A>, alloc
                             EvalVal::Unknown
                         }
                     }
-                    Op::CallIndirect if ty == Ty::PTR => {
+                    Op::CallIndirect | Op::InvokeIndirect if ty == Ty::PTR => {
                         let mut o = view.operands(inst);
                         let _callee = o.value();
                         let sig = view.sig(o.sig());
                         if sig.rets.len() == 1 {
                             match sig.rets.first().and_then(|r| view.facts(r)) {
+                                Some(facts) if is_nonnull_facts(facts) => EvalVal::PtrNonNull,
+                                _ => EvalVal::Unknown,
+                            }
+                        } else {
+                            EvalVal::Unknown
+                        }
+                    }
+                    Op::Project if ty == Ty::PTR => {
+                        let mut o = view.operands(inst);
+                        let src = to_idx(o.value().0);
+                        let slot = to_idx(o.imm());
+                        if src < len {
+                            let sig_id = match view.op(src) {
+                                Op::Call | Op::Invoke => {
+                                    let mut so = view.operands(src);
+                                    let _callee = so.reference();
+                                    Some(so.sig())
+                                }
+                                Op::CallIndirect | Op::InvokeIndirect => {
+                                    let mut so = view.operands(src);
+                                    let _callee = so.value();
+                                    Some(so.sig())
+                                }
+                                _ => None,
+                            };
+                            match sig_id
+                                .and_then(|sid| view.sig(sid).rets.get(slot))
+                                .and_then(|r| view.facts(r))
+                            {
                                 Some(facts) if is_nonnull_facts(facts) => EvalVal::PtrNonNull,
                                 _ => EvalVal::Unknown,
                             }
@@ -678,10 +1591,13 @@ fn compute_global_vals<A: Allocator + Copy>(view: &View<'_>, cfg: &Cfg<A>, alloc
                         let by = to_idx(o.value().0);
                         let flags = view.flags(inst);
                         let base_val = at(&vals, base, EvalVal::Unknown);
+                        let zero_off =
+                            signed_const(view, by) == Some(0) || at(&vals, by, EvalVal::Unknown) == EvalVal::Int(0);
                         if base_val == EvalVal::PtrNonNull
                             && (flags.contains(Flags::INBOUNDS)
                                 || flags.contains(Flags::NUW)
-                                || signed_const(view, by) == Some(0))
+                                || zero_off
+                                || is_loop_bounded_nonnull_ptr_add(view, cfg, &vals, inst, b, base, by))
                         {
                             EvalVal::PtrNonNull
                         } else if base < len && view.op(base) == Op::SlotAddr {
@@ -691,63 +1607,13 @@ fn compute_global_vals<A: Allocator + Copy>(view: &View<'_>, cfg: &Cfg<A>, alloc
                                 Some(off) if off >= 0 && off <= slot_size => EvalVal::PtrNonNull,
                                 _ => EvalVal::Unknown,
                             }
-                        } else if base_val == EvalVal::PtrNull && signed_const(view, by) == Some(0) {
+                        } else if base_val == EvalVal::PtrNull && zero_off {
                             EvalVal::PtrNull
                         } else {
                             EvalVal::Unknown
                         }
                     }
-                    Op::FromExposed if ty == Ty::PTR => {
-                        let src = to_idx(view.operands(inst).value().0);
-                        match at(&vals, src, EvalVal::Unknown) {
-                            EvalVal::Int(0) => EvalVal::PtrNull,
-                            EvalVal::Int(_) | EvalVal::IntNonZero => EvalVal::PtrNonNull,
-                            _ => EvalVal::Unknown,
-                        }
-                    }
-                    Op::PtrWithAddr if ty == Ty::PTR => {
-                        let mut o = view.operands(inst);
-                        let _base = o.value();
-                        let addr = to_idx(o.value().0);
-                        match at(&vals, addr, EvalVal::Unknown) {
-                            EvalVal::Int(0) => EvalVal::PtrNull,
-                            EvalVal::Int(_) | EvalVal::IntNonZero => EvalVal::PtrNonNull,
-                            _ => EvalVal::Unknown,
-                        }
-                    }
-                    Op::Freeze => {
-                        let src = to_idx(view.operands(inst).value().0);
-                        at(&vals, src, EvalVal::Unknown)
-                    }
-                    Op::Select => {
-                        let mut o = view.operands(inst);
-                        let cond = to_idx(o.value().0);
-                        let a = to_idx(o.value().0);
-                        let b_v = to_idx(o.value().0);
-                        match at(&vals, cond, EvalVal::Unknown) {
-                            EvalVal::Int(c) => at(&vals, if c != 0 { a } else { b_v }, EvalVal::Unknown),
-                            EvalVal::IntNonZero => at(&vals, a, EvalVal::Unknown),
-                            _ => {
-                                let va = at(&vals, a, EvalVal::Unknown);
-                                let vb = at(&vals, b_v, EvalVal::Unknown);
-                                if va == vb { va } else { EvalVal::Unknown }
-                            }
-                        }
-                    }
-                    Op::PtrAddr | Op::Expose => {
-                        let src = to_idx(view.operands(inst).value().0);
-                        match at(&vals, src, EvalVal::Unknown) {
-                            EvalVal::PtrNull => EvalVal::Int(0),
-                            EvalVal::PtrNonNull => EvalVal::IntNonZero,
-                            _ => EvalVal::Unknown,
-                        }
-                    }
-                    Op::Zext | Op::Sext | Op::Trunc if at(view.flags, inst, 0) == 0 => {
-                        let src = to_idx(view.operands(inst).value().0);
-                        let from_ty = Ty(at(view.tys, src, 0));
-                        eval_int_convert(op, from_ty, ty, view.head.ptr_bits, at(&vals, src, EvalVal::Unknown))
-                    }
-                    _ => EvalVal::Unknown,
+                    _ => eval_pure_inst(view, inst, |v| at(&vals, to_idx(v), EvalVal::Unknown)),
                 };
                 if next_val != at(&vals, inst, EvalVal::Unknown) {
                     set_at(&mut vals, inst, next_val);
@@ -755,6 +1621,42 @@ fn compute_global_vals<A: Allocator + Copy>(view: &View<'_>, cfg: &Cfg<A>, alloc
                 }
             }
         }
+
+        // Phase B: verify optimistically seeded non-entry `ptr` block parameters against all
+        // reachable incoming edges, monotonically demoting any param with a non-proven argument.
+        for &b in cfg.rpo.iter().skip(1) {
+            if !at(&cfg.plain_only, to_idx(b), false) {
+                continue;
+            }
+            let params = view.params(Block(b));
+            let edges = cfg.incoming_of(b);
+            for (k, inst) in (params.start..params.end).enumerate() {
+                if at(&vals, inst, EvalVal::Unknown) != EvalVal::PtrNonNull {
+                    continue;
+                }
+                let inst_u32 = to_u32(inst);
+                let mut all_nonnull = !edges.is_empty();
+                for edge in edges {
+                    if k >= edge.args_len {
+                        all_nonnull = false;
+                        break;
+                    }
+                    let arg = at(view.extra, edge.args_start + k, NONE);
+                    if arg == inst_u32 {
+                        continue;
+                    }
+                    if at(&vals, to_idx(arg), EvalVal::Unknown) != EvalVal::PtrNonNull {
+                        all_nonnull = false;
+                        break;
+                    }
+                }
+                if !all_nonnull {
+                    set_at(&mut vals, inst, EvalVal::Unknown);
+                    changed = true;
+                }
+            }
+        }
+
         if !changed {
             converged = true;
             break;
@@ -854,10 +1756,117 @@ fn target_by_ordinal(view: &View<'_>, term_inst: usize, want_ordinal: u32) -> Op
     found
 }
 
+/// Evaluates `b`'s `Op::Br` or `Op::Switch` terminator under `global_vals` and any dominating
+/// single-edge branch facts, returning the resolved target ordinal if statically decided.
+fn eval_block_terminator<A: Allocator + Copy>(
+    view: &View<'_>,
+    cfg: &Cfg<A>,
+    b: u32,
+    global_vals: &[EvalVal],
+    local_buf: &mut Vec<EvalVal, A>,
+) -> Option<u32> {
+    let range = view.block(Block(b));
+    let params = view.params(Block(b));
+    let term = range.end.checked_sub(1)?;
+    if !matches!(view.op(term), Op::Br | Op::Switch) {
+        return None;
+    }
+
+    // Fast path: terminator already decided directly by `global_vals`.
+    if let Some(chosen) = eval_terminator_static(view, term, |v| at(global_vals, to_idx(v), EvalVal::Unknown)) {
+        return Some(chosen);
+    }
+
+    // Collect dominating single-edge branch facts along `b`'s unique-predecessor dominator chain.
+    let mut facts = EdgeFacts::empty();
+    collect_dom_edge_facts(view, cfg, b, global_vals, &mut facts);
+    if facts.is_empty() {
+        return None;
+    }
+
+    let b_len = range.end.saturating_sub(range.start);
+    local_buf.clear();
+    local_buf.resize(b_len, EvalVal::Unknown);
+
+    let param_count = params.end.saturating_sub(params.start);
+    if b != 0 && at(&cfg.plain_only, to_idx(b), false) {
+        let in_edges = cfg.incoming_of(b);
+        if let [sole] = in_edges {
+            if sole.pred != b && sole.args_len == param_count {
+                for k in 0..param_count {
+                    let arg = at(view.extra, sole.args_start + k, NONE);
+                    set_at(local_buf, k, facts.lookup(arg, global_vals));
+                }
+            }
+        }
+    }
+
+    let lookup = |v: u32, local: &[EvalVal]| -> EvalVal {
+        let idx = to_idx(v);
+        if idx >= range.start && idx < range.end {
+            let lv = at(local, idx - range.start, EvalVal::Unknown);
+            if lv != EvalVal::Unknown {
+                return lv;
+            }
+        }
+        facts.lookup(v, global_vals)
+    };
+
+    for inst in params.end..term {
+        let val = eval_pure_inst(view, inst, |v| lookup(v, local_buf));
+        let merged = if val != EvalVal::Unknown {
+            val
+        } else {
+            at(global_vals, inst, EvalVal::Unknown)
+        };
+        set_at(local_buf, inst - range.start, merged);
+    }
+
+    eval_terminator_static(view, term, |v| lookup(v, local_buf))
+}
+
+/// Rewrites every terminator marked in `jump` into an unconditional `Op::Jump` and drops any
+/// blocks made unreachable, returning verified LIR.
+fn fold_terminators<A: Allocator + Copy>(
+    view: View<'_>,
+    jump: &[u32],
+    alloc: A,
+) -> Result<Func<A>, SimplifyError> {
+    let blocks = view.blocks();
+    let len = view.len();
+    let reached = reachable(&view, jump, &alloc);
+    let mut stands = Vec::with_capacity_in(len, alloc);
+    for v in 0..len {
+        stands.push(to_u32(v));
+    }
+    let mut inst_kept = filled(len, false, &alloc);
+    for b in 0..blocks {
+        if at(&reached, b, false) {
+            for inst in view.block(Block(to_u32(b))) {
+                set_at(&mut inst_kept, inst, true);
+            }
+        }
+    }
+    let mut jump_vec = Vec::with_capacity_in(len, alloc);
+    jump_vec.extend_from_slice(jump);
+    let edit = Edit {
+        block_kept: reached,
+        inst_kept,
+        stands,
+        constant: filled(len, None, &alloc),
+        jump: jump_vec,
+        devirt: filled(len, NONE, &alloc),
+        merge_next: filled(blocks, NONE, &alloc),
+        fma_fuse: filled(len, None, &alloc),
+    };
+    rebuild(view, &edit, alloc)
+}
+
 /// Evaluates `M`'s pure body and terminator for one incoming edge `edge`, returning the resolved
 /// successor target if `M`'s control flow is statically decided for `edge`.
-fn eval_block_for_edge<A: Allocator>(
+fn eval_block_for_edge<A: Allocator + Copy>(
     view: &View<'_>,
+    cfg: &Cfg<A>,
     m_block: u32,
     edge: InEdge,
     global_vals: &[EvalVal],
@@ -881,225 +1890,43 @@ fn eval_block_for_edge<A: Allocator>(
     local_buf.clear();
     local_buf.resize(m_len, EvalVal::Unknown);
 
-    // Seed M's parameters from the incoming edge's arguments.
+    // Derive facts along `edge` (`edge.pred -> m_block`) and its dominating unique-edge ancestors.
+    let mut facts = EdgeFacts::empty();
+    let pred_term = view.terminator(Block(edge.pred));
+    derive_edge_facts(view, pred_term, edge.ordinal, global_vals, &mut facts);
+    collect_dom_edge_facts(view, cfg, edge.pred, global_vals, &mut facts);
+
+    // Seed M's parameters from the incoming edge's arguments refined by `facts`.
     let param_count = params.end.saturating_sub(params.start);
     if edge.args_len != param_count {
         return None;
     }
     for k in 0..param_count {
         let arg = at(view.extra, edge.args_start + k, NONE);
-        set_at(local_buf, k, at(global_vals, to_idx(arg), EvalVal::Unknown));
+        set_at(local_buf, k, facts.lookup(arg, global_vals));
     }
 
     let lookup = |v: u32, local: &[EvalVal]| -> EvalVal {
         let idx = to_idx(v);
         if idx >= range.start && idx < range.end {
-            at(local, idx - range.start, EvalVal::Unknown)
-        } else {
+            let lv = at(local, idx - range.start, EvalVal::Unknown);
+            if lv != EvalVal::Unknown {
+                return lv;
+            }
             at(global_vals, idx, EvalVal::Unknown)
+        } else {
+            facts.lookup(v, global_vals)
         }
     };
 
     // Abstractly evaluate M's body instructions in order.
     for inst in params.end..term {
-        let op = view.op(inst);
-        let ty = Ty(at(view.tys, inst, 0));
-        let flagless = at(view.flags, inst, 0) == 0;
-        let val = match op {
-            Op::Iconst | Op::IconstWide => match unsigned_const(view, inst) {
-                Some(v) => EvalVal::Int(v),
-                None => EvalVal::Unknown,
-            },
-            Op::Null => EvalVal::PtrNull,
-            Op::SlotAddr | Op::DataAddr | Op::FuncAddr | Op::TlsAddr => EvalVal::PtrNonNull,
-            Op::Freeze => lookup(view.operands(inst).value().0, local_buf),
-            Op::PtrAddr => match lookup(view.operands(inst).value().0, local_buf) {
-                EvalVal::PtrNull => EvalVal::Int(0),
-                EvalVal::PtrNonNull => EvalVal::IntNonZero,
-                EvalVal::Int(v) => EvalVal::Int(v),
-                _ => EvalVal::Unknown,
-            },
-            Op::FromExposed if ty == Ty::PTR => match lookup(view.operands(inst).value().0, local_buf) {
-                EvalVal::Int(0) => EvalVal::PtrNull,
-                EvalVal::Int(_) | EvalVal::IntNonZero => EvalVal::PtrNonNull,
-                _ => EvalVal::Unknown,
-            },
-            Op::PtrWithAddr if ty == Ty::PTR => {
-                let mut o = view.operands(inst);
-                let _base = o.value();
-                match lookup(o.value().0, local_buf) {
-                    EvalVal::Int(0) => EvalVal::PtrNull,
-                    EvalVal::Int(_) | EvalVal::IntNonZero => EvalVal::PtrNonNull,
-                    _ => EvalVal::Unknown,
-                }
-            }
-            Op::PtrAdd if ty == Ty::PTR => {
-                let mut o = view.operands(inst);
-                let base_v = o.value().0;
-                let by_v = o.value().0;
-                let base = lookup(base_v, local_buf);
-                let by = lookup(by_v, local_buf);
-                let flags = view.flags(inst);
-                if base == EvalVal::PtrNonNull
-                    && (flags.contains(Flags::INBOUNDS) || flags.contains(Flags::NUW) || by == EvalVal::Int(0))
-                {
-                    EvalVal::PtrNonNull
-                } else if base == EvalVal::PtrNull && by == EvalVal::Int(0) {
-                    EvalVal::PtrNull
-                } else {
-                    EvalVal::Unknown
-                }
-            }
-            Op::Icmp if flagless => {
-                let mut o = view.operands(inst);
-                let cond = o.int_cond();
-                let a_v = o.value().0;
-                let b_v = o.value().0;
-                let op_ty = Ty(at(view.tys, to_idx(a_v), 0));
-                eval_icmp(cond, op_ty, view.head.ptr_bits, lookup(a_v, local_buf), lookup(b_v, local_buf))
-            }
-            Op::Zext | Op::Sext | Op::Trunc if flagless => {
-                let a_v = view.operands(inst).value().0;
-                let from_ty = Ty(at(view.tys, to_idx(a_v), 0));
-                eval_int_convert(op, from_ty, ty, view.head.ptr_bits, lookup(a_v, local_buf))
-            }
-            Op::Bitcast if flagless && ty.is_scalar() && ty.is_int() => {
-                let a_v = view.operands(inst).value().0;
-                let from_ty = Ty(at(view.tys, to_idx(a_v), 0));
-                if from_ty.is_scalar() && from_ty.is_int() {
-                    lookup(a_v, local_buf)
-                } else {
-                    EvalVal::Unknown
-                }
-            }
-            Op::Neg | Op::Not if flagless && ty.is_scalar() && ty.is_int() => {
-                let a_v = view.operands(inst).value().0;
-                match lookup(a_v, local_buf) {
-                    EvalVal::Int(a) => EvalVal::Int(unary(op, a, ty.bits(view.head.ptr_bits))),
-                    _ => EvalVal::Unknown,
-                }
-            }
-            Op::Or if ty.is_scalar() && ty.is_int() => {
-                let mut o = view.operands(inst);
-                let a_v = o.value().0;
-                let b_v = o.value().0;
-                match (lookup(a_v, local_buf), lookup(b_v, local_buf)) {
-                    (EvalVal::Int(a), EvalVal::Int(b)) => EvalVal::Int(a | b),
-                    (EvalVal::IntNonZero, _) | (_, EvalVal::IntNonZero) => EvalVal::IntNonZero,
-                    (EvalVal::Int(v), _) | (_, EvalVal::Int(v)) if v != 0 => EvalVal::IntNonZero,
-                    _ => EvalVal::Unknown,
-                }
-            }
-            Op::And if flagless && ty.is_scalar() && ty.is_int() => {
-                let mut o = view.operands(inst);
-                let a_v = o.value().0;
-                let b_v = o.value().0;
-                match (lookup(a_v, local_buf), lookup(b_v, local_buf)) {
-                    (EvalVal::Int(a), EvalVal::Int(b)) => EvalVal::Int(a & b),
-                    (EvalVal::Int(0), _) | (_, EvalVal::Int(0)) => EvalVal::Int(0),
-                    _ => EvalVal::Unknown,
-                }
-            }
-            Op::Xor if flagless && ty.is_scalar() && ty.is_int() => {
-                let mut o = view.operands(inst);
-                let a_v = o.value().0;
-                let b_v = o.value().0;
-                match (lookup(a_v, local_buf), lookup(b_v, local_buf)) {
-                    (EvalVal::Int(a), EvalVal::Int(b)) => EvalVal::Int(a ^ b),
-                    (EvalVal::Int(0), x) | (x, EvalVal::Int(0)) => x,
-                    _ => EvalVal::Unknown,
-                }
-            }
-            Op::Add | Op::Sub | Op::Mul | Op::Shl | Op::Lshr | Op::Ashr | Op::Rotl | Op::Rotr | Op::Umin
-            | Op::Umax | Op::Smin | Op::Smax
-                if flagless && ty.is_scalar() && ty.is_int() =>
-            {
-                let mut o = view.operands(inst);
-                let a_v = o.value().0;
-                let b_v = o.value().0;
-                match (lookup(a_v, local_buf), lookup(b_v, local_buf)) {
-                    (EvalVal::Int(a), EvalVal::Int(b)) => match binary(op, a, b, ty.bits(view.head.ptr_bits)) {
-                        Ok(res) => EvalVal::Int(res),
-                        Err(_) => EvalVal::Unknown,
-                    },
-                    (EvalVal::Int(0), x) | (x, EvalVal::Int(0)) if op == Op::Add => x,
-                    (x, EvalVal::Int(0)) if op == Op::Sub => x,
-                    _ => EvalVal::Unknown,
-                }
-            }
-            Op::Select => {
-                let mut o = view.operands(inst);
-                let c_v = o.value().0;
-                let a_v = o.value().0;
-                let b_v = o.value().0;
-                match lookup(c_v, local_buf) {
-                    EvalVal::Int(c) => lookup(if c != 0 { a_v } else { b_v }, local_buf),
-                    EvalVal::IntNonZero => lookup(a_v, local_buf),
-                    _ => {
-                        let la = lookup(a_v, local_buf);
-                        let lb = lookup(b_v, local_buf);
-                        if la == lb { la } else { EvalVal::Unknown }
-                    }
-                }
-            }
-            _ => EvalVal::Unknown,
-        };
+        let val = eval_pure_inst(view, inst, |v| lookup(v, local_buf));
         set_at(local_buf, inst - range.start, val);
     }
 
-    // Evaluate M's terminator.
-    match term_op {
-        Op::Br => {
-            let cond = view.operands(term).value().0;
-            let chosen = match lookup(cond, local_buf) {
-                EvalVal::Int(v) => {
-                    if v != 0 {
-                        0u32
-                    } else {
-                        1u32
-                    }
-                }
-                EvalVal::IntNonZero => 0u32,
-                _ => return None,
-            };
-            target_by_ordinal(view, term, chosen)
-        }
-        Op::Switch => {
-            let mut o = view.operands(term);
-            let scrutinee = o.value();
-            let width = Ty(at(view.tys, scrutinee.index(), 0)).bits(view.head.ptr_bits);
-            let _default = o.target();
-            let chosen = match lookup(scrutinee.0, local_buf) {
-                EvalVal::Int(v) => {
-                    let mut found = None;
-                    for (idx, (words, _)) in o.cases(scrutinee).enumerate() {
-                        if wide_value(words, width) == v {
-                            found = Some(1 + to_u32(idx));
-                            break;
-                        }
-                    }
-                    found.unwrap_or(0)
-                }
-                EvalVal::IntNonZero if width == 1 => {
-                    let mut found = None;
-                    for (idx, (words, _)) in o.cases(scrutinee).enumerate() {
-                        if wide_value(words, width) == 1 {
-                            found = Some(1 + to_u32(idx));
-                            break;
-                        }
-                    }
-                    found.unwrap_or(0)
-                }
-                EvalVal::IntNonZero => {
-                    let all_zero = o.cases(scrutinee).all(|(words, _)| wide_value(words, width) == 0);
-                    if all_zero { 0 } else { return None }
-                }
-                _ => return None,
-            };
-            target_by_ordinal(view, term, chosen)
-        }
-        _ => None,
-    }
+    let chosen = eval_terminator_static(view, term, |v| lookup(v, local_buf))?;
+    target_by_ordinal(view, term, chosen)
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,7 +1997,7 @@ fn plan_block_threading<A: Allocator + Copy>(
         if edge.pred == m_block {
             continue;
         }
-        let Some(target) = eval_block_for_edge(view, m_block, edge, global_vals, local_buf) else {
+        let Some(target) = eval_block_for_edge(view, cfg, m_block, edge, global_vals, local_buf) else {
             continue;
         };
         if target.block == m_block {
@@ -1605,14 +2432,36 @@ pub fn thread_jumps<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Fun
         let v = cur.view();
         let blocks = v.blocks();
         let cfg = Cfg::build(&v, alloc)?;
-        let cross = CrossUses::build(&v, &cfg, alloc);
         let global_vals = compute_global_vals(&v, &cfg, alloc);
+        let mut local_buf: Vec<EvalVal, A> = Vec::new_in(alloc);
 
+        // Phase 1: direct terminator folding for any reachable block whose `Br` or `Switch`
+        // outcome is statically decided by `global_vals` or dominating single-edge branch facts.
+        let mut fold_jumps = filled(v.len(), NONE, &alloc);
+        let mut any_fold = false;
+        for &b in cfg.rpo.iter() {
+            let term = v.terminator(Block(b));
+            if !matches!(v.op(term), Op::Br | Op::Switch) {
+                continue;
+            }
+            if let Some(chosen) = eval_block_terminator(&v, &cfg, b, &global_vals, &mut local_buf) {
+                set_at(&mut fold_jumps, term, chosen);
+                any_fold = true;
+            }
+        }
+        if any_fold {
+            let folded = fold_terminators(v, &fold_jumps, alloc)?;
+            cur = dead(folded.view(), alloc)?;
+            any_coalesced = true;
+            continue;
+        }
+
+        // Phase 2: phi-discriminant & forwarding-block edge threading (Patterns A & B).
+        let cross = CrossUses::build(&v, &cfg, alloc);
         let mut round_edges: Vec<ThreadedEdge, A> = Vec::new_in(alloc);
         let mut round_promos: Vec<Promotion, A> = Vec::new_in(alloc);
         let mut claimed_m = filled(blocks, false, &alloc);
         let mut claimed_ep = filled(blocks, false, &alloc);
-        let mut local_buf: Vec<EvalVal, A> = Vec::new_in(alloc);
 
         // Bottom-up walk so nested multi-level Switch chains (B0 -> B1 -> Body) thread inner B1
         // before outer B0, collapsing cross-block payload uses cleanly in consecutive rounds.
@@ -2221,6 +3070,454 @@ mod tests {
                 matches!(after, Outcome::Returned(ref vals) if vals[..] == [Val::Int(expected)]),
                 "unexpected result for n={n_val}: {after:?}"
             );
+        }
+    }
+
+    /// Exact live `for &x in slice` loop pattern with `NonNull` double niche checks + trap:
+    /// `addr = ptr_addr(p); c0 = icmp ule addr, 0; tag = select c0, addr, 1;
+    ///  br icmp(eq, tag, 0), exit, chk1; chk1: br icmp(ne, tag, 1), trap, body2`.
+    /// Verifies BOTH `PtrAdd[INBOUNDS]` and loop-bounded `PtrAdd(Flags::NONE)` eliminate both
+    /// niche branches, the trap block, `Select`, and `PtrAddr`, collapsing to a 4-block loop with
+    /// a single exit (`icmp ne p, end`), plus evaluator equivalence via `run_in`.
+    #[test]
+    fn folds_slice_iter_nonnull_double_niche_branch_and_trap() {
+        let alloc = blaze_own::testing::heap().alloc();
+
+        for step_flags in [Flags::INBOUNDS, Flags::NONE] {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let mut ptr_param = Param::of(Ty::PTR);
+            ptr_param.facts = Facts { bits: ParamFactsRec::NONNULL, ..Facts::default() };
+            let sig = b.sig(Conv::C, Variadic::No, &[ptr_param, Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+
+            let [entry, hdr, body, chk1, trap_blk, body2, exit] =
+                [(); 7].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let x0 = b.param(Ty::PTR);
+            let x1 = b.param(Ty::I64);
+            let sh3 = b.iconst(Ty::I64, 3);
+            let byte_len = b.binary(Op::Shl, Flags::NONE, x1, sh3);
+            let end = b.ptr_add(Flags::INBOUNDS, x0, byte_len);
+            let zero = b.iconst(Ty::I64, 0);
+            b.jump((hdr, &[x0, zero]));
+
+            b.begin(hdr);
+            let p = b.param(Ty::PTR);
+            let acc = b.param(Ty::I64);
+            let has_next = b.icmp(IntCond::Ne, p, end);
+            b.br(Flags::NONE, has_next, (body, &[]), (exit, &[acc]));
+
+            b.begin(body);
+            let eight = b.iconst(Ty::I64, 8);
+            let p_next = b.ptr_add(step_flags, p, eight);
+            let addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, p);
+            let z0 = b.iconst(Ty::I64, 0);
+            let c0 = b.icmp(IntCond::Ule, addr, z0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let tag = b.select(Flags::NONE, c0, addr, c1);
+            let is_none = b.icmp(IntCond::Eq, tag, z0);
+            b.br(Flags::NONE, is_none, (exit, &[acc]), (chk1, &[]));
+
+            b.begin(chk1);
+            let not_one = b.icmp(IntCond::Ne, tag, c1);
+            b.br(Flags::NONE, not_one, (trap_blk, &[]), (body2, &[]));
+
+            b.begin(trap_blk);
+            b.trap(1);
+
+            b.begin(body2);
+            let elem = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+            let acc_next = b.binary(Op::Add, Flags::NONE, acc, elem);
+            b.jump((hdr, &[p_next, acc_next]));
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+
+            let input = b.finish_checked().expect("valid slice iter niche branch input");
+            let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+            verify(out.view()).expect("output verifies");
+
+            let v = out.view();
+            assert_eq!(count_op(v, Op::Trap), 0, "expected 0 traps ({step_flags:?}):\n{}", print(v));
+            assert_eq!(count_op(v, Op::Select), 0, "expected 0 selects ({step_flags:?}):\n{}", print(v));
+            assert_eq!(count_op(v, Op::PtrAddr), 0, "expected 0 ptr_addrs ({step_flags:?}):\n{}", print(v));
+            assert_eq!(count_op(v, Op::Br), 1, "expected single loop exit branch ({step_flags:?}):\n{}", print(v));
+            assert_eq!(v.blocks(), 4, "expected 4 blocks (entry, hdr, body, exit) ({step_flags:?}):\n{}", print(v));
+        }
+
+        // Runtime-evaluated equivalence check on the same double-niche-branch + trap pattern.
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let mut ptr_param = Param::of(Ty::PTR);
+        ptr_param.facts = Facts { bits: ParamFactsRec::NONNULL, ..Facts::default() };
+        let sig = b.sig(Conv::C, Variadic::No, &[ptr_param, Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        b.set_signature(sig);
+
+        let [entry, hdr, body, chk1, trap_blk, body2, exit] =
+            [(); 7].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let x0 = b.param(Ty::PTR);
+        let n = b.param(Ty::I64);
+        let zero = b.iconst(Ty::I64, 0);
+        b.jump((hdr, &[x0, zero, zero]));
+
+        b.begin(hdr);
+        let p = b.param(Ty::PTR);
+        let i = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let has_next = b.icmp(IntCond::Ult, i, n);
+        b.br(Flags::NONE, has_next, (body, &[]), (exit, &[acc]));
+
+        b.begin(body);
+        let z0 = b.iconst(Ty::I64, 0);
+        let p_next = b.ptr_add(Flags::INBOUNDS, p, z0);
+        let addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, p);
+        let c0 = b.icmp(IntCond::Ule, addr, z0);
+        let c1 = b.iconst(Ty::I64, 1);
+        let tag = b.select(Flags::NONE, c0, addr, c1);
+        let is_none = b.icmp(IntCond::Eq, tag, z0);
+        b.br(Flags::NONE, is_none, (exit, &[acc]), (chk1, &[]));
+
+        b.begin(chk1);
+        let not_one = b.icmp(IntCond::Ne, tag, c1);
+        b.br(Flags::NONE, not_one, (trap_blk, &[]), (body2, &[]));
+
+        b.begin(trap_blk);
+        b.trap(1);
+
+        b.begin(body2);
+        let i_next = b.binary(Op::Add, Flags::NONE, i, c1);
+        let acc_next = b.binary(Op::Add, Flags::NONE, acc, i);
+        b.jump((hdr, &[p_next, i_next, acc_next]));
+
+        b.begin(exit);
+        let res = b.param(Ty::I64);
+        b.ret(&[res]);
+
+        let input = b.finish_checked().expect("valid eval double-niche input");
+        let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+        verify(out.view()).expect("output verifies");
+
+        let v = out.view();
+        assert_eq!(count_op(v, Op::Trap), 0, "expected 0 traps:\n{}", print(v));
+        assert_eq!(count_op(v, Op::Select), 0, "expected 0 selects:\n{}", print(v));
+        assert_eq!(count_op(v, Op::PtrAddr), 0, "expected 0 ptr_addrs:\n{}", print(v));
+        assert_eq!(count_op(v, Op::Br), 1, "expected 1 loop branch:\n{}", print(v));
+        assert_eq!(v.blocks(), 4, "expected 4 blocks:\n{}", print(v));
+
+        let p0 = Val::Ptr { slot: Val::NO_SLOT, offset: 0x1000 };
+        for n_val in [0u128, 1, 2, 5, 10] {
+            let expected = n_val * n_val.saturating_sub(1) / 2;
+            let args = [p0, Val::Int(n_val)];
+            let before = run_in(input.view(), &args, FUEL, alloc).expect("eval input");
+            let after = run_in(v, &args, FUEL, alloc).expect("eval output");
+            assert_eq!(before, after, "semantics diverged for n={n_val}");
+            assert!(
+                matches!(after, Outcome::Returned(ref vals) if vals[..] == [Val::Int(expected)]),
+                "unexpected result for n={n_val}: {after:?}"
+            );
+        }
+    }
+
+    /// Tests `Op::Switch` on the `NonNull` niche tag (`select (icmp ule ptr_addr(p), 0), addr, 1`),
+    /// verifying direct switch folding removes the switch, trap block, `Select`, and `PtrAddr`
+    /// while preserving exact runtime semantics.
+    #[test]
+    fn folds_slice_iter_nonnull_switch_niche_tag() {
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Real slice::Iter loop with `PtrAdd[INBOUNDS](p, 8)` + `Load` + `Switch` on niche tag.
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let mut ptr_param = Param::of(Ty::PTR);
+            ptr_param.facts = Facts { bits: ParamFactsRec::NONNULL, ..Facts::default() };
+            let sig = b.sig(Conv::C, Variadic::No, &[ptr_param, Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+
+            let [entry, hdr, body, trap_blk, body2, exit] =
+                [(); 6].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let x0 = b.param(Ty::PTR);
+            let x1 = b.param(Ty::I64);
+            let sh3 = b.iconst(Ty::I64, 3);
+            let byte_len = b.binary(Op::Shl, Flags::NONE, x1, sh3);
+            let end = b.ptr_add(Flags::INBOUNDS, x0, byte_len);
+            let zero = b.iconst(Ty::I64, 0);
+            b.jump((hdr, &[x0, zero]));
+
+            b.begin(hdr);
+            let p = b.param(Ty::PTR);
+            let acc = b.param(Ty::I64);
+            let has_next = b.icmp(IntCond::Ne, p, end);
+            b.br(Flags::NONE, has_next, (body, &[]), (exit, &[acc]));
+
+            b.begin(body);
+            let eight = b.iconst(Ty::I64, 8);
+            let p_next = b.ptr_add(Flags::INBOUNDS, p, eight);
+            let addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, p);
+            let z0 = b.iconst(Ty::I64, 0);
+            let c0 = b.icmp(IntCond::Ule, addr, z0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let tag = b.select(Flags::NONE, c0, addr, c1);
+            b.switch(tag, (trap_blk, &[]), &[(0, (exit, &[acc])), (1, (body2, &[]))]);
+
+            b.begin(trap_blk);
+            b.trap(2);
+
+            b.begin(body2);
+            let elem = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+            let acc_next = b.binary(Op::Add, Flags::NONE, acc, elem);
+            b.jump((hdr, &[p_next, acc_next]));
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+
+            let input = b.finish_checked().expect("valid slice iter switch input");
+            let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+            verify(out.view()).expect("output verifies");
+
+            let v = out.view();
+            assert_eq!(count_op(v, Op::Switch), 0, "expected 0 switches:\n{}", print(v));
+            assert_eq!(count_op(v, Op::Trap), 0, "expected 0 traps:\n{}", print(v));
+            assert_eq!(count_op(v, Op::Select), 0, "expected 0 selects:\n{}", print(v));
+            assert_eq!(count_op(v, Op::PtrAddr), 0, "expected 0 ptr_addrs:\n{}", print(v));
+            assert_eq!(count_op(v, Op::Br), 1, "expected 1 loop branch:\n{}", print(v));
+            assert_eq!(v.blocks(), 4, "expected 4 blocks:\n{}", print(v));
+        }
+
+        // Runtime-evaluated equivalence check for `Op::Switch` on niche tag.
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let mut ptr_param = Param::of(Ty::PTR);
+        ptr_param.facts = Facts { bits: ParamFactsRec::NONNULL, ..Facts::default() };
+        let sig = b.sig(Conv::C, Variadic::No, &[ptr_param, Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        b.set_signature(sig);
+
+        let [entry, hdr, body, trap_blk, body2, exit] =
+            [(); 6].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let x0 = b.param(Ty::PTR);
+        let n = b.param(Ty::I64);
+        let zero = b.iconst(Ty::I64, 0);
+        b.jump((hdr, &[x0, zero, zero]));
+
+        b.begin(hdr);
+        let p = b.param(Ty::PTR);
+        let i = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let has_next = b.icmp(IntCond::Ult, i, n);
+        b.br(Flags::NONE, has_next, (body, &[]), (exit, &[acc]));
+
+        b.begin(body);
+        let z0 = b.iconst(Ty::I64, 0);
+        let p_next = b.ptr_add(Flags::INBOUNDS, p, z0);
+        let addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, p);
+        let c0 = b.icmp(IntCond::Ule, addr, z0);
+        let c1 = b.iconst(Ty::I64, 1);
+        let tag = b.select(Flags::NONE, c0, addr, c1);
+        b.switch(tag, (trap_blk, &[]), &[(0, (exit, &[acc])), (1, (body2, &[]))]);
+
+        b.begin(trap_blk);
+        b.trap(2);
+
+        b.begin(body2);
+        let i_next = b.binary(Op::Add, Flags::NONE, i, c1);
+        let acc_next = b.binary(Op::Add, Flags::NONE, acc, i);
+        b.jump((hdr, &[p_next, i_next, acc_next]));
+
+        b.begin(exit);
+        let res = b.param(Ty::I64);
+        b.ret(&[res]);
+
+        let input = b.finish_checked().expect("valid eval switch niche input");
+        let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+        verify(out.view()).expect("output verifies");
+
+        let v = out.view();
+        assert_eq!(count_op(v, Op::Switch), 0, "expected 0 switches:\n{}", print(v));
+        assert_eq!(count_op(v, Op::Trap), 0, "expected 0 traps:\n{}", print(v));
+        assert_eq!(count_op(v, Op::Select), 0, "expected 0 selects:\n{}", print(v));
+        assert_eq!(count_op(v, Op::PtrAddr), 0, "expected 0 ptr_addrs:\n{}", print(v));
+        assert_eq!(count_op(v, Op::Br), 1, "expected 1 loop branch:\n{}", print(v));
+        assert_eq!(v.blocks(), 4, "expected 4 blocks:\n{}", print(v));
+
+        let p0 = Val::Ptr { slot: Val::NO_SLOT, offset: 0x1000 };
+        for n_val in [0u128, 1, 2, 5, 10] {
+            let expected = n_val * n_val.saturating_sub(1) / 2;
+            let args = [p0, Val::Int(n_val)];
+            let before = run_in(input.view(), &args, FUEL, alloc).expect("eval input");
+            let after = run_in(v, &args, FUEL, alloc).expect("eval output");
+            assert_eq!(before, after, "semantics diverged for n={n_val}");
+            assert!(
+                matches!(after, Outcome::Returned(ref vals) if vals[..] == [Val::Int(expected)]),
+                "unexpected result for n={n_val}: {after:?}"
+            );
+        }
+    }
+
+    /// Soundness controls:
+    /// 1. When the entry pointer does NOT carry `ParamFactsRec::NONNULL`, the `tag == 0` exit
+    ///    branch MUST be preserved (and runtime behavior on `null` and wrap-to-zero matches
+    ///    identically), while the impossible `tag != 1 -> trap` arm still folds cleanly because
+    ///    `select (icmp ule addr, 0), addr, 1` is provably in `{0, 1}`.
+    /// 2. When `end = ptr_add inbounds x0, -8` has a negative offset and `p_next = ptr_add p, 8`
+    ///    lacks `INBOUNDS`, loop-bounded non-null propagation MUST refuse to assume `p_next` is
+    ///    non-null so `tag == 0` is preserved.
+    #[test]
+    fn preserves_niche_zero_branch_for_nullable_raw_ptr() {
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Control 1: nullable raw pointer (no `ParamFactsRec::NONNULL`).
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+
+            let [entry, hdr, body, chk1, trap_blk, body2, exit] =
+                [(); 7].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let x0 = b.param(Ty::PTR);
+            let x1 = b.param(Ty::I64);
+            let sh3 = b.iconst(Ty::I64, 3);
+            let byte_len = b.binary(Op::Shl, Flags::NONE, x1, sh3);
+            let end = b.ptr_add(Flags::NONE, x0, byte_len);
+            let zero = b.iconst(Ty::I64, 0);
+            b.jump((hdr, &[x0, zero]));
+
+            b.begin(hdr);
+            let p = b.param(Ty::PTR);
+            let acc = b.param(Ty::I64);
+            let has_next = b.icmp(IntCond::Ne, p, end);
+            b.br(Flags::NONE, has_next, (body, &[]), (exit, &[acc]));
+
+            b.begin(body);
+            let eight = b.iconst(Ty::I64, 8);
+            let p_next = b.ptr_add(Flags::NONE, p, eight);
+            let addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, p);
+            let z0 = b.iconst(Ty::I64, 0);
+            let c0 = b.icmp(IntCond::Ule, addr, z0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let tag = b.select(Flags::NONE, c0, addr, c1);
+            let is_none = b.icmp(IntCond::Eq, tag, z0);
+            b.br(Flags::NONE, is_none, (exit, &[acc]), (chk1, &[]));
+
+            b.begin(chk1);
+            let not_one = b.icmp(IntCond::Ne, tag, c1);
+            b.br(Flags::NONE, not_one, (trap_blk, &[]), (body2, &[]));
+
+            b.begin(trap_blk);
+            b.trap(1);
+
+            b.begin(body2);
+            let acc_next = b.binary(Op::Add, Flags::NONE, acc, c1);
+            b.jump((hdr, &[p_next, acc_next]));
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+
+            let input = b.finish_checked().expect("valid nullable raw ptr input");
+            let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+            verify(out.view()).expect("output verifies");
+
+            let v = out.view();
+            assert_eq!(
+                count_op(v, Op::Br),
+                2,
+                "nullable ptr MUST keep `tag == 0` exit branch:\n{}",
+                print(v)
+            );
+            assert_eq!(
+                count_op(v, Op::Trap),
+                0,
+                "impossible `tag != 1 -> trap` arm should still fold via two-valued select:\n{}",
+                print(v)
+            );
+
+            for (offset, n_val, expected) in [
+                (0i128, 4u128, 0u128),      // null entry exits immediately with 0
+                (0x1000, 0, 0),             // empty range exits at header
+                (0x1000, 4, 4),             // normal non-null slice counts all 4
+                (-8, 4, 1),                 // wraps through 0 on iteration 2 -> exits with 1
+            ] {
+                let args = [Val::Ptr { slot: Val::NO_SLOT, offset }, Val::Int(n_val)];
+                let before = run_in(input.view(), &args, FUEL, alloc).expect("eval input");
+                let after = run_in(v, &args, FUEL, alloc).expect("eval output");
+                assert_eq!(before, after, "semantics diverged for offset={offset}, n={n_val}");
+                assert!(
+                    matches!(after, Outcome::Returned(ref vals) if vals[..] == [Val::Int(expected)]),
+                    "unexpected result for offset={offset}, n={n_val}: {after:?}"
+                );
+            }
+        }
+
+        // Control 2: negative `end` offset with non-INBOUNDS `p_next` MUST NOT assume non-null.
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let mut ptr_param = Param::of(Ty::PTR);
+            ptr_param.facts = Facts { bits: ParamFactsRec::NONNULL, ..Facts::default() };
+            let sig = b.sig(Conv::C, Variadic::No, &[ptr_param], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+
+            let [entry, hdr, body, chk1, trap_blk, body2, exit] =
+                [(); 7].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let x0 = b.param(Ty::PTR);
+            let neg8 = b.iconst(Ty::I64, (-8i64) as u64 as u128);
+            let end = b.ptr_add(Flags::INBOUNDS, x0, neg8);
+            let zero = b.iconst(Ty::I64, 0);
+            b.jump((hdr, &[x0, zero]));
+
+            b.begin(hdr);
+            let p = b.param(Ty::PTR);
+            let acc = b.param(Ty::I64);
+            let has_next = b.icmp(IntCond::Ne, p, end);
+            b.br(Flags::NONE, has_next, (body, &[]), (exit, &[acc]));
+
+            b.begin(body);
+            let eight = b.iconst(Ty::I64, 8);
+            let p_next = b.ptr_add(Flags::NONE, p, eight);
+            let addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, p);
+            let z0 = b.iconst(Ty::I64, 0);
+            let c0 = b.icmp(IntCond::Ule, addr, z0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let tag = b.select(Flags::NONE, c0, addr, c1);
+            let is_none = b.icmp(IntCond::Eq, tag, z0);
+            b.br(Flags::NONE, is_none, (exit, &[acc]), (chk1, &[]));
+
+            b.begin(chk1);
+            let not_one = b.icmp(IntCond::Ne, tag, c1);
+            b.br(Flags::NONE, not_one, (trap_blk, &[]), (body2, &[]));
+
+            b.begin(trap_blk);
+            b.trap(1);
+
+            b.begin(body2);
+            let acc_next = b.binary(Op::Add, Flags::NONE, acc, c1);
+            b.jump((hdr, &[p_next, acc_next]));
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+
+            let input = b.finish_checked().expect("valid negative-end control input");
+            let out = thread_jumps(input.view(), alloc).expect("thread_jumps");
+            verify(out.view()).expect("output verifies");
+
+            let v = out.view();
+            assert_eq!(
+                count_op(v, Op::Br),
+                2,
+                "negative end offset with flagless ptr_add MUST keep `tag == 0` branch:\n{}",
+                print(v)
+            );
+            assert_eq!(count_op(v, Op::Trap), 0, "trap still folds via two-valued select:\n{}", print(v));
         }
     }
 }
