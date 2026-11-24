@@ -134,16 +134,13 @@ fn write_num_sequences<A: Allocator>(out: &mut Vec<u8, A>, n: usize) -> Result<(
 fn is_all_same(bytes: &[u8]) -> Option<u8> {
     let &first = bytes.first()?;
     let pattern = u64::from_ne_bytes([first; 8]);
-    let mut chunks = bytes.chunks_exact(8);
-    for ch in &mut chunks {
-        let Ok(arr) = <[u8; 8]>::try_from(ch) else {
-            return None;
-        };
+    let (chunks, rem) = bytes.as_chunks::<8>();
+    for &arr in chunks {
         if u64::from_ne_bytes(arr) != pattern {
             return None;
         }
     }
-    for &b in chunks.remainder() {
+    for &b in rem {
         if b != first {
             return None;
         }

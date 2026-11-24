@@ -491,9 +491,7 @@ impl HuffTable {
             return Err(ZstdError::CorruptHuffman);
         }
         let (jump, rest) = src.split_at_checked(6).ok_or(ZstdError::CorruptHuffman)?;
-        let [a0, a1, b0, b1, c0, c1] = *jump else {
-            return Err(ZstdError::CorruptHuffman);
-        };
+        let &[a0, a1, b0, b1, c0, c1] = jump.first_chunk::<6>().ok_or(ZstdError::CorruptHuffman)?;
         let s1_len = usize::from(u16::from_le_bytes([a0, a1]));
         let s2_len = usize::from(u16::from_le_bytes([b0, b1]));
         let s3_len = usize::from(u16::from_le_bytes([c0, c1]));
@@ -928,11 +926,8 @@ pub(crate) fn encode_huffman_literals_into<A: Allocator + Copy>(
     let mut c1 = [0u32; 256];
     let mut c2 = [0u32; 256];
     let mut c3 = [0u32; 256];
-    let mut chunks = literals.chunks_exact(4);
-    for ch in &mut chunks {
-        let [b0, b1, b2, b3] = *ch else {
-            break;
-        };
+    let (chunks, rem) = literals.as_chunks::<4>();
+    for &[b0, b1, b2, b3] in chunks {
         if let Some(s) = c0.get_mut(usize::from(b0)) {
             *s += 1;
         }
@@ -946,7 +941,7 @@ pub(crate) fn encode_huffman_literals_into<A: Allocator + Copy>(
             *s += 1;
         }
     }
-    for &b in chunks.remainder() {
+    for &b in rem {
         if let Some(s) = c0.get_mut(usize::from(b)) {
             *s += 1;
         }

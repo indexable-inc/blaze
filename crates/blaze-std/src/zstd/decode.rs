@@ -88,28 +88,22 @@ impl<'a> Cursor<'a> {
     #[inline]
     fn read_u16_le(&mut self) -> Result<u16, ZstdError> {
         let bytes = self.read_slice(2)?;
-        let [b0, b1] = *bytes else {
-            return Err(ZstdError::Truncated);
-        };
-        Ok(u16::from_le_bytes([b0, b1]))
+        let &arr = bytes.first_chunk::<2>().ok_or(ZstdError::Truncated)?;
+        Ok(u16::from_le_bytes(arr))
     }
 
     #[inline]
     fn read_u32_le(&mut self) -> Result<u32, ZstdError> {
         let bytes = self.read_slice(4)?;
-        let [b0, b1, b2, b3] = *bytes else {
-            return Err(ZstdError::Truncated);
-        };
-        Ok(u32::from_le_bytes([b0, b1, b2, b3]))
+        let &arr = bytes.first_chunk::<4>().ok_or(ZstdError::Truncated)?;
+        Ok(u32::from_le_bytes(arr))
     }
 
     #[inline]
     fn read_u64_le(&mut self) -> Result<u64, ZstdError> {
         let bytes = self.read_slice(8)?;
-        let [b0, b1, b2, b3, b4, b5, b6, b7] = *bytes else {
-            return Err(ZstdError::Truncated);
-        };
-        Ok(u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]))
+        let &arr = bytes.first_chunk::<8>().ok_or(ZstdError::Truncated)?;
+        Ok(u64::from_le_bytes(arr))
     }
 }
 
@@ -336,9 +330,7 @@ impl<A: Allocator + Copy> ZstdDecoder<A> {
 
                 loop {
                     let bh = cur.read_slice(3)?;
-                    let [b0, b1, b2] = *bh else {
-                        return Err(ZstdError::Truncated);
-                    };
+                    let &[b0, b1, b2] = bh.first_chunk::<3>().ok_or(ZstdError::Truncated)?;
                     let hdr_u32 = u32::from_le_bytes([b0, b1, b2, 0]);
                     let last_block = (hdr_u32 & 1) != 0;
                     let block_type = (hdr_u32 >> 1) & 0x03;
