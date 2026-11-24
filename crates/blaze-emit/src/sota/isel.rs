@@ -179,6 +179,14 @@ fn inc_sat_u32(s: &mut [u32], i: usize) {
     }
 }
 
+/// ARM64 shifted-register shift kind for logical instructions (`AND`/`ORR`/`EOR`, C6.2.15/104/246).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LogShift {
+    Lsl,
+    Lsr,
+    Asr,
+}
+
 /// Fused instruction selection pattern chosen for an instruction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Fusion {
@@ -197,10 +205,8 @@ enum Fusion {
     AddLsr { a: u32, b: u32, shift: u32, imm_inst: u32 },
     /// `sub(a, shl(b, k))` -> `sub rd, a, b, lsl #k`.
     SubLsl { a: u32, b: u32, shift: u32, imm_inst: u32 },
-    /// `xor(a, shl(b, k))` -> `eor rd, a, b, lsl #k`.
-    EorLsl { a: u32, b: u32, shift: u32, imm_inst: u32 },
-    /// `xor(a, lshr(b, k))` -> `eor rd, a, b, lsr #k`.
-    EorLsr { a: u32, b: u32, shift: u32, imm_inst: u32 },
+    /// `and`/`or`/`xor(a, shl/lshr/ashr(b, k))` -> single `and`/`orr`/`eor rd, a, b, {lsl,lsr,asr} #k`.
+    LogicalShifted { a: u32, b: u32, kind: LogShift, shift: u32, imm_inst: u32 },
     /// `xor(a, rotl/rotr(b, k))` -> `eor rd, a, b, ror #shift`.
     EorRor { a: u32, b: u32, shift: u32, imm_inst: u32 },
     /// `or`/`xor(shl(x, k), lshr(x, bits - k))` -> single `extr rd, x, x, #(bits - k)`.
@@ -931,6 +937,27 @@ const fn fmla_elem0_v(double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
 #[inline]
 const fn fmls_elem0_v(double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
     (if double { 0x4fc0_5000 } else { 0x4f80_5000 }) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `and`/`orr`/`eor rd, rn, rm, {lsl,lsr,asr} #shift` (C6.2.15/246/104, `N = 0`):
+/// `opc = 0: AND, 1: ORR, 2: EOR`; `shift` in `0..=63` (`is64`) or `0..=31` (`!is64`).
+#[inline]
+const fn logical_shifted(is64: bool, opc: u32, kind: LogShift, rd: Reg, rn: Reg, rm: Reg, shift: u32) -> u32 {
+    if is64 && opc == 2 {
+        match kind {
+            LogShift::Lsl => return enc::eor_lsl(rd, rn, rm, shift),
+            LogShift::Lsr => return enc::eor_lsr(rd, rn, rm, shift),
+            LogShift::Asr => {}
+        }
+    }
+    let sh_bits = match kind {
+        LogShift::Lsl => 0u32,
+        LogShift::Lsr => 1u32,
+        LogShift::Asr => 2u32,
+    };
+    let sf_bit = if is64 { 1u32 << 31 } else { 0u32 };
+    let imm6 = if is64 { shift & 63 } else { shift & 31 };
+    sf_bit | ((opc & 3) << 29) | 0x0a00_0000 | (sh_bits << 22) | (rm << 16) | (imm6 << 10) | (rn << 5) | rd
 }
 
 /// Emits a destructive 3-operand 128-bit NEON multiply-accumulate/sub (`vd = vc ± va * vb`),
@@ -2201,20 +2228,25 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     let mut skip_emit: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
     let mut slot_addr_folded_uses: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
     let mut ptr_off_foldable_uses: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
-    let mut ptr_scaled_foldable_uses: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+    let mut ptr_shl_foldable_uses: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+    let mut ptr_byte_foldable_uses: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+    let mut shl_foldable_ptr_uses: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
     let mut blaze_result_br_fused: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
     for _ in 0..len {
         fusion.push(Fusion::None);
         skip_emit.push(false);
         slot_addr_folded_uses.push(0);
         ptr_off_foldable_uses.push(0);
-        ptr_scaled_foldable_uses.push(0);
+        ptr_shl_foldable_uses.push(0);
+        ptr_byte_foldable_uses.push(0);
+        shl_foldable_ptr_uses.push(0);
         blaze_result_br_fused.push(false);
     }
 
     // Pre-pass: count foldable Load/Store pointer uses of:
     // - same-block `PtrAdd(base, const)` and 64-bit `Add(base, const)` (`MemBaseOff`)
     // - cross-block multi-use (1..=4 uses) non-volatile offset-0 `PtrAdd(base, Shl(idx, scale))`
+    //   (including shared `Shl(idx, scale)` across 1..=4 foldable `PtrAdd`s like `keys[slot]` + `vals[slot]`)
     //   and byte `PtrAdd(base, idx)` (`MemScaledIdx` / `MemUxtwIdx` / `MemRegIdx`) whenever ALL uses fold!
     for inst in 0..len {
         let op = view.op(inst);
@@ -2261,13 +2293,13 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     let bi = to_idx(by);
                     if size_shift == 0 {
                         if at_opt(&const_u64, bi).is_none() {
-                            inc_u32(&mut ptr_scaled_foldable_uses, pi);
+                            inc_u32(&mut ptr_byte_foldable_uses, pi);
                         }
-                    } else if at_u32(&use_count, bi) == 1 && view.op(bi) == Op::Shl {
+                    } else if (1..=4).contains(&at_u32(&use_count, bi)) && view.op(bi) == Op::Shl {
                         let sat = to_idx(at_u32(view.data, bi));
                         let sh_v = at_u32(view.extra, sat + 1);
                         if at_opt(&const_u64, to_idx(sh_v)) == Some(u64::from(size_shift)) {
-                            inc_u32(&mut ptr_scaled_foldable_uses, pi);
+                            inc_u32(&mut ptr_shl_foldable_uses, pi);
                         }
                     }
                 }
@@ -2301,6 +2333,23 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                 if delta.checked_add(off).is_some_and(fits_off) {
                     inc_u32(&mut ptr_off_foldable_uses, pi);
                 }
+            }
+        }
+    }
+
+    // Count how many foldable scaled `PtrAdd`s (all of whose uses fold) consume each shared `Op::Shl`.
+    for pi in 0..len {
+        if view.op(pi) != Op::PtrAdd {
+            continue;
+        }
+        let pi_uses = at_u32(&use_count, pi);
+        if (1..=4).contains(&pi_uses) && at_u32(&ptr_shl_foldable_uses, pi) == pi_uses {
+            let pat = to_idx(at_u32(view.data, pi));
+            let base = at_u32(view.extra, pat);
+            let by = at_u32(view.extra, pat + 1);
+            let bi = to_idx(by);
+            if base != by && view.op(bi) == Op::Shl && (1..=4).contains(&at_u32(&use_count, bi)) {
+                inc_u32(&mut shl_foldable_ptr_uses, bi);
             }
         }
     }
@@ -3063,42 +3112,54 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         continue;
                     }
                 }
-                if op == Op::Xor && ty.bits(64) == 64 {
-                    let try_xor_shift = |sh: u32, other: u32| -> Option<(Op, u32, u32, u32, u32)> {
-                        let si = to_idx(sh);
-                        let sop = view.op(si);
-                        if at_u32(&use_count, si) == 1
-                            && at_u32(&inst_block, si) == b
-                            && matches!(sop, Op::Shl | Op::Lshr)
-                            && !at_bool(&skip_emit, si)
-                        {
-                            let sat = to_idx(at_u32(view.data, si));
-                            let sb = at_u32(view.extra, sat);
-                            let sk = at_u32(view.extra, sat + 1);
-                            if let Some(k) = at_opt(&const_u64, to_idx(sk)) {
-                                return Some((sop, other, sb, trunc_u32(k & 63), sk));
-                            }
-                        }
-                        None
+                // Fuse `and`/`or`/`xor(a, shl/lshr/ashr(b, k))` (commutative, 64-bit or 32-bit, `1 <= k < bits`)
+                // -> single ARM64 shifted-register `and`/`orr`/`eor rd, ra, rb, {lsl,lsr,asr} #k`!
+                let try_log_shift = |sh: u32, other: u32| -> Option<(LogShift, u32, u32, u32, u32)> {
+                    let si = to_idx(sh);
+                    let kind = match view.op(si) {
+                        Op::Shl => LogShift::Lsl,
+                        Op::Lshr => LogShift::Lsr,
+                        Op::Ashr => LogShift::Asr,
+                        _ => return None,
                     };
-                    if let Some((sop, a, sb, shift, sk)) = try_xor_shift(rhs, lhs) {
-                        set_at(&mut fusion, inst, if sop == Op::Shl {
-                            Fusion::EorLsl { a, b: sb, shift, imm_inst: sk }
-                        } else {
-                            Fusion::EorLsr { a, b: sb, shift, imm_inst: sk }
-                        });
-                        set_at(&mut skip_emit, to_idx(rhs), true);
-                        continue;
+                    if at_u32(&use_count, si) != 1
+                        || at_u32(&inst_block, si) != b
+                        || at_bool(&skip_emit, si)
+                        || at_fusion(&fusion, si) != Fusion::None
+                    {
+                        return None;
                     }
-                    if let Some((sop, a, sb, shift, sk)) = try_xor_shift(lhs, rhs) {
-                        set_at(&mut fusion, inst, if sop == Op::Shl {
-                            Fusion::EorLsl { a, b: sb, shift, imm_inst: sk }
-                        } else {
-                            Fusion::EorLsr { a, b: sb, shift, imm_inst: sk }
-                        });
-                        set_at(&mut skip_emit, to_idx(lhs), true);
-                        continue;
+                    // Keep already-immediate same-block single-use logical constants (`and`/`orr`/`eor #imm`)
+                    // as immediates instead of forcing constant materialization + shifted register.
+                    let oi = to_idx(other);
+                    if at_u32(&use_count, oi) == 1
+                        && at_u32(&inst_block, oi) == b
+                        && at_opt(&const_u64, oi).is_some_and(|c| {
+                            enc::logical_imm(c, bits).is_some()
+                                || (op == Op::And && bits == 64 && is_low_bitmask(c).is_some())
+                        })
+                    {
+                        return None;
                     }
+                    let sat = to_idx(at_u32(view.data, si));
+                    let sb = at_u32(view.extra, sat);
+                    let sk = at_u32(view.extra, sat + 1);
+                    let k = at_opt(&const_u64, to_idx(sk))?;
+                    if k >= 1 && k < u64::from(bits) {
+                        Some((kind, other, sb, trunc_u32(k), sk))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((kind, a, sb, shift, sk)) = try_log_shift(rhs, lhs) {
+                    set_at(&mut fusion, inst, Fusion::LogicalShifted { a, b: sb, kind, shift, imm_inst: sk });
+                    set_at(&mut skip_emit, to_idx(rhs), true);
+                    continue;
+                }
+                if let Some((kind, a, sb, shift, sk)) = try_log_shift(lhs, rhs) {
+                    set_at(&mut fusion, inst, Fusion::LogicalShifted { a, b: sb, kind, shift, imm_inst: sk });
+                    set_at(&mut skip_emit, to_idx(lhs), true);
+                    continue;
                 }
             }
             Op::Load | Op::Store => {
@@ -3141,7 +3202,9 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     }
                 }
                 // Pattern B0: Multi-use (1..=4 uses, even cross-block!) non-volatile offset-0
-                // `ptr_add(base, shl(idx, scale))` or byte `ptr_add(base, idx)` -> `[base, idx, lsl #scale]`!
+                // `ptr_add(base, shl(idx, scale))` (including shared `shl(idx, scale)` across
+                // 1..=4 foldable `ptr_add`s like `keys[slot]` + `vals[slot]`) or byte
+                // `ptr_add(base, idx)` -> `[base, idx, lsl #scale]`!
                 let pi_uses = at_u32(&use_count, pi);
                 let is_volatile = Flags(at_u8(view.flags, inst)).contains(Flags::VOLATILE);
                 if !is_volatile
@@ -3150,7 +3213,6 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     && pop == Op::PtrAdd
                     && mem_sz.is_some()
                     && (1..=4).contains(&pi_uses)
-                    && at_u32(&ptr_scaled_foldable_uses, pi) == pi_uses
                     && at_fusion(&fusion, pi) == Fusion::None
                 {
                     let pat = to_idx(at_u32(view.data, pi));
@@ -3158,21 +3220,26 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     let by = at_u32(view.extra, pat + 1);
                     if ty_at(view.tys, to_idx(by)).bits(64) == 64 {
                         let bi = to_idx(by);
-                        let first_fold = !at_bool(&skip_emit, pi);
+                        let bi_uses = at_u32(&use_count, bi);
                         if size_shift > 0
-                            && at_u32(&use_count, bi) == 1
+                            && at_u32(&ptr_shl_foldable_uses, pi) == pi_uses
+                            && (1..=4).contains(&bi_uses)
+                            && at_u32(&shl_foldable_ptr_uses, bi) == bi_uses
                             && view.op(bi) == Op::Shl
-                            && (!at_bool(&skip_emit, bi) || !first_fold)
+                            && at_fusion(&fusion, bi) == Fusion::None
                         {
                             let sat = to_idx(at_u32(view.data, bi));
                             let idx_v = at_u32(view.extra, sat);
                             let sh_v = at_u32(view.extra, sat + 1);
                             if at_opt(&const_u64, to_idx(sh_v)) == Some(u64::from(size_shift)) {
-                                let shift_imm = if first_fold { sh_v } else { u32::MAX };
+                                // Count `imm_uses[sh_v]` ONLY ONCE per folded `shl` even when
+                                // shared across multiple `PtrAdd`s and multiple loads/stores!
+                                let first_fold_shl = !at_bool(&skip_emit, bi);
+                                let shift_imm = if first_fold_shl { sh_v } else { u32::MAX };
                                 let zi = to_idx(idx_v);
                                 if at_u32(&use_count, zi) == 1
                                     && view.op(zi) == Op::Zext
-                                    && (!at_bool(&skip_emit, zi) || !first_fold)
+                                    && (!at_bool(&skip_emit, zi) || !first_fold_shl)
                                 {
                                     let src_v = at_u32(view.data, zi);
                                     if ty_at(view.tys, to_idx(src_v)).bits(64) == 32 {
@@ -3201,8 +3268,12 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 set_at(&mut skip_emit, bi, true);
                                 continue;
                             }
-                        } else if size_shift == 0 && at_opt(&const_u64, bi).is_none() {
-                            if at_u32(&use_count, bi) == 1
+                        } else if size_shift == 0
+                            && at_u32(&ptr_byte_foldable_uses, pi) == pi_uses
+                            && at_opt(&const_u64, bi).is_none()
+                        {
+                            let first_fold = !at_bool(&skip_emit, pi);
+                            if bi_uses == 1
                                 && view.op(bi) == Op::Shl
                                 && (!at_bool(&skip_emit, bi) || !first_fold)
                             {
@@ -3221,7 +3292,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                     continue;
                                 }
                             }
-                            if at_u32(&use_count, bi) == 1
+                            if bi_uses == 1
                                 && view.op(bi) == Op::Zext
                                 && (!at_bool(&skip_emit, bi) || !first_fold)
                             {
@@ -4171,8 +4242,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
             Fusion::AddLsl { imm_inst, .. }
             | Fusion::AddLsr { imm_inst, .. }
             | Fusion::SubLsl { imm_inst, .. }
-            | Fusion::EorLsl { imm_inst, .. }
-            | Fusion::EorLsr { imm_inst, .. }
+            | Fusion::LogicalShifted { imm_inst, .. }
             | Fusion::EorRor { imm_inst, .. } => {
                 inc_u32(&mut imm_uses, to_idx(imm_inst));
             }
@@ -8900,6 +8970,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             let rs = load_gpr(&mut words, src, X16);
                             words.push(enc::ubfx(!w32, rd, rs, lsb, width));
                         }
+                        Fusion::LogicalShifted { a, b: sb, kind, shift, .. } => {
+                            let ra = load_gpr(&mut words, a, X16);
+                            let rb = load_gpr(&mut words, sb, X17);
+                            words.push(logical_shifted(!w32, 0, kind, rd, ra, rb, shift));
+                        }
                         _ => {
                             let at = to_idx(at_u32(view.data, inst));
                             let lhs = at_u32(view.extra, at);
@@ -8966,6 +9041,11 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 words.push(enc::bfxil(!w32, rd, rsrc, lsb, width));
                             }
                         }
+                        Fusion::LogicalShifted { a, b: sb, kind, shift, .. } => {
+                            let ra = load_gpr(&mut words, a, X16);
+                            let rb = load_gpr(&mut words, sb, X17);
+                            words.push(logical_shifted(!w32, 1, kind, rd, ra, rb, shift));
+                        }
                         _ => {
                             let at = to_idx(at_u32(view.data, inst));
                             let lhs = at_u32(view.extra, at);
@@ -9015,15 +9095,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             let rb = load_gpr(&mut words, sb, X17);
                             words.push(enc::sf(!w32, enc::eor_ror(rd, ra, rb, shift)));
                         }
-                        Fusion::EorLsl { a, b: sb, shift, .. } => {
+                        Fusion::LogicalShifted { a, b: sb, kind, shift, .. } => {
                             let ra = load_gpr(&mut words, a, X16);
                             let rb = load_gpr(&mut words, sb, X17);
-                            words.push(enc::eor_lsl(rd, ra, rb, shift));
-                        }
-                        Fusion::EorLsr { a, b: sb, shift, .. } => {
-                            let ra = load_gpr(&mut words, a, X16);
-                            let rb = load_gpr(&mut words, sb, X17);
-                            words.push(enc::eor_lsr(rd, ra, rb, shift));
+                            words.push(logical_shifted(!w32, 2, kind, rd, ra, rb, shift));
                         }
                         _ => {
                             let at = to_idx(at_u32(view.data, inst));
@@ -12943,6 +13018,286 @@ mod tests {
             let r2 = f(arr.as_mut_ptr(), 5, 55, 777);
             assert_eq!(r2, 60);
             assert_eq!(arr, [10, 20, 30, 999, 50, 60, 70, 80]);
+        }
+    }
+
+    #[test]
+    fn logical_shifted_fuses_lsr_and_into_single_instruction() {
+        let alloc = test_alloc();
+
+        let build_case = |ty: Ty, log_op: Op, sh_op: Op, shamt: u64, shift_on_lhs: bool| -> Emitted<'static> {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(ty), Param::of(ty)],
+                &[Param::of(ty)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(ty);
+            let bv = b.param(ty);
+            let k = b.iconst(ty, u128::from(shamt));
+            let shifted = b.binary(sh_op, Flags::NONE, bv, k);
+            let res = if shift_on_lhs {
+                b.binary(log_op, Flags::NONE, shifted, a)
+            } else {
+                b.binary(log_op, Flags::NONE, a, shifted)
+            };
+            b.ret(&[res]);
+            let func = b.finish_checked().expect("logical shifted LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("logical shifted emits")
+        };
+
+        // Standalone shift (`ubfm` 32/64-bit `0x5300_0000`/`0xd340_0000` or `sbfm` 32/64-bit `0x1300_0000`/`0x9340_0000`),
+        // excluding ABI entry `uxtw xN, wN` (`ubfm xN, xN, #0, #31`, `immr=0, imms=31`, `(w & 0xffff_fc00) == 0xd340_7c00`).
+        let is_uxtw = |w: u32| (w & 0xffff_fc00) == 0xd340_7c00;
+        let is_standalone_shift = |w: u32| {
+            !is_uxtw(w) && ((w & 0x7f80_0000) == 0x5300_0000 || (w & 0x7f80_0000) == 0x1300_0000)
+        };
+        // Shifted-register `and`/`orr`/`eor` (`N = 0`, `opc != 3`, non-zero `imm6` in bits 15..10).
+        let is_shifted_logical = |w: u32| {
+            (w & 0x1f20_0000) == 0x0a00_0000 && ((w >> 29) & 3) != 3 && ((w >> 10) & 0x3f) != 0
+        };
+
+        // 1. 64-bit cases (including exact `hash_probe_batch` `And(mask, Lshr(x, 44))` in both operand orders).
+        let and_lsr64 = build_case(Ty::I64, Op::And, Op::Lshr, 44, false);
+        let and_lsr64_lhs = build_case(Ty::I64, Op::And, Op::Lshr, 44, true);
+        let or_lsl64 = build_case(Ty::I64, Op::Or, Op::Shl, 8, false);
+        let xor_asr64 = build_case(Ty::I64, Op::Xor, Op::Ashr, 3, false);
+
+        // 2. 32-bit cases (`I32`).
+        let and_lsr32 = build_case(Ty::I32, Op::And, Op::Lshr, 12, false);
+        let or_lsl32 = build_case(Ty::I32, Op::Or, Op::Shl, 8, true);
+        let xor_asr32 = build_case(Ty::I32, Op::Xor, Op::Ashr, 3, false);
+
+        for (label, max_words, code) in [
+            ("i64 and lsr #44", 3usize, &and_lsr64.code),
+            ("i64 and lsr #44 (lhs)", 3, &and_lsr64_lhs.code),
+            ("i64 or lsl #8", 3, &or_lsl64.code),
+            ("i64 xor asr #3", 3, &xor_asr64.code),
+            ("i32 and lsr #12", 4, &and_lsr32.code),
+            ("i32 or lsl #8 (lhs)", 4, &or_lsl32.code),
+            ("i32 xor asr #3", 4, &xor_asr32.code),
+        ] {
+            let words = decode_words(code, alloc);
+            assert_eq!(
+                words.iter().filter(|&&w| is_standalone_shift(w)).count(),
+                0,
+                "{label}: must emit ZERO standalone shift instructions, words={words:#x?}"
+            );
+            assert_eq!(
+                words.iter().filter(|&&w| is_shifted_logical(w)).count(),
+                1,
+                "{label}: must emit 1 fused shifted-register logical instruction, words={words:#x?}"
+            );
+            assert!(
+                words.len() <= max_words,
+                "{label}: expected minimal instruction count (<= {max_words}), got {} ({words:#x?})",
+                words.len()
+            );
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex_and64 = exec_leaf(and_lsr64);
+            let f_and64: extern "C" fn(u64, u64) -> u64 = unsafe { ex_and64.as_fn() };
+            let ex_and64_lhs = exec_leaf(and_lsr64_lhs);
+            let f_and64_lhs: extern "C" fn(u64, u64) -> u64 = unsafe { ex_and64_lhs.as_fn() };
+            let ex_or64 = exec_leaf(or_lsl64);
+            let f_or64: extern "C" fn(u64, u64) -> u64 = unsafe { ex_or64.as_fn() };
+            let ex_xor64 = exec_leaf(xor_asr64);
+            let f_xor64: extern "C" fn(u64, u64) -> u64 = unsafe { ex_xor64.as_fn() };
+
+            let ex_and32 = exec_leaf(and_lsr32);
+            let f_and32: extern "C" fn(u32, u32) -> u32 = unsafe { ex_and32.as_fn() };
+            let ex_or32 = exec_leaf(or_lsl32);
+            let f_or32: extern "C" fn(u32, u32) -> u32 = unsafe { ex_or32.as_fn() };
+            let ex_xor32 = exec_leaf(xor_asr32);
+            let f_xor32: extern "C" fn(u32, u32) -> u32 = unsafe { ex_xor32.as_fn() };
+
+            let cases64: &[(u64, u64)] = &[
+                (0x000f_ffff, 0xfedc_ba98_7654_3210),
+                (0xffff_ffff_ffff_ffff, 0x8000_0000_0000_0001),
+                (0x1234_5678_9abc_def0, 0x7fff_ffff_ffff_fff8),
+                (0x0000_0000_0000_ffff, 0xffff_ffff_ffff_ffff),
+            ];
+            for &(a, bv) in cases64 {
+                assert_eq!(f_and64(a, bv), a & (bv >> 44));
+                assert_eq!(f_and64_lhs(a, bv), (bv >> 44) & a);
+                assert_eq!(f_or64(a, bv), a | (bv << 8));
+                assert_eq!(f_xor64(a, bv), a ^ ((bv as i64) >> 3) as u64);
+            }
+
+            let cases32: &[(u32, u32)] = &[
+                (0x000f_ffff, 0xfedc_ba98),
+                (0xffff_ffff, 0x8000_0001),
+                (0x1234_5678, 0x7fff_fff8),
+                (0x0000_ffff, 0xffff_ffff),
+            ];
+            for &(a, bv) in cases32 {
+                assert_eq!(f_and32(a, bv), a & (bv >> 12));
+                assert_eq!(f_or32(a, bv), (bv << 8) | a);
+                assert_eq!(f_xor32(a, bv), a ^ ((bv as i32) >> 3) as u32);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_shl_folds_into_dual_array_indexed_loads() {
+        let alloc = test_alloc();
+
+        // 1. Same-block `keys[slot]` + `vals[slot]` sharing `off = Shl(slot, 3)` (`use_count[off] == 2`):
+        //    must emit ZERO `lsl`, ZERO register `add`, and 2 scaled `ldr xt, [base, slot, lsl #3]`.
+        let dual_same_blk = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let keys = b.param(Ty::PTR);
+            let vals = b.param(Ty::PTR);
+            let slot = b.param(Ty::I64);
+            let c3 = b.iconst(Ty::I64, 3);
+            let off = b.binary(Op::Shl, Flags::NONE, slot, c3);
+            let pk = b.ptr_add(Flags::NONE, keys, off);
+            let pv = b.ptr_add(Flags::NONE, vals, off);
+            let k = b.load(Ty::I64, Flags::NONE, pk, 0, MemAttrs::aligned(8));
+            let v = b.load(Ty::I64, Flags::NONE, pv, 0, MemAttrs::aligned(8));
+            let mixed = b.binary(Op::Xor, Flags::NONE, k, v);
+            b.ret(&[mixed]);
+            let func = b.finish_checked().expect("dual array same-block LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("dual array same-block emits")
+        };
+
+        // 2. Cross-block `keys[slot]` in `entry` + `vals[slot]` in `hit_blk` (exact `hash_probe_batch` shape!):
+        let dual_cross_blk = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let hit_blk = b.create_block(BlockKind::Normal);
+            let miss_blk = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let keys = b.param(Ty::PTR);
+            let vals = b.param(Ty::PTR);
+            let slot = b.param(Ty::I64);
+            let query = b.param(Ty::I64);
+            let c3 = b.iconst(Ty::I64, 3);
+            let off = b.binary(Op::Shl, Flags::NONE, slot, c3);
+            let pk = b.ptr_add(Flags::NONE, keys, off);
+            let k = b.load(Ty::I64, Flags::NONE, pk, 0, MemAttrs::aligned(8));
+            let is_hit = b.icmp(IntCond::Eq, k, query);
+            b.br(Flags::NONE, is_hit, (hit_blk, &[]), (miss_blk, &[]));
+
+            b.begin(hit_blk);
+            let pv = b.ptr_add(Flags::NONE, vals, off);
+            let v = b.load(Ty::I64, Flags::NONE, pv, 0, MemAttrs::aligned(8));
+            b.ret(&[v]);
+
+            b.begin(miss_blk);
+            let zero = b.iconst(Ty::I64, 0);
+            b.ret(&[zero]);
+
+            let func = b.finish_checked().expect("dual array cross-block LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("dual array cross-block emits")
+        };
+
+        // 3. Guard case: `off = Shl(slot, 3)` has a non-`PtrAdd` user (`Xor(k, off)`) -> `off` must remain live!
+        let shared_shl_escaping = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let keys = b.param(Ty::PTR);
+            let slot = b.param(Ty::I64);
+            let c3 = b.iconst(Ty::I64, 3);
+            let off = b.binary(Op::Shl, Flags::NONE, slot, c3);
+            let pk = b.ptr_add(Flags::NONE, keys, off);
+            let k = b.load(Ty::I64, Flags::NONE, pk, 0, MemAttrs::aligned(8));
+            let res = b.binary(Op::Xor, Flags::NONE, k, off);
+            b.ret(&[res]);
+            let func = b.finish_checked().expect("escaping shared shl LIR builds");
+            emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("escaping shared shl emits")
+        };
+
+        for (label, code) in [
+            ("same-block dual array", &dual_same_blk.code),
+            ("cross-block dual array", &dual_cross_blk.code),
+        ] {
+            let words = decode_words(code, alloc);
+            let lsl_count = words.iter().filter(|&&w| (w & 0xffc0_0000) == 0xd340_0000).count();
+            let add_reg_count = words.iter().filter(|&&w| (w & 0xff20_0000) == 0x8b00_0000).count();
+            let ldr_scaled_count = words.iter().filter(|&&w| (w & 0xffe0_fc00) == 0xf860_7800).count();
+            assert_eq!(lsl_count, 0, "{label}: must emit ZERO lsl instructions, got {lsl_count}");
+            assert_eq!(add_reg_count, 0, "{label}: must emit ZERO add instructions, got {add_reg_count}");
+            assert_eq!(ldr_scaled_count, 2, "{label}: must emit 2 scaled ldr [base, slot, lsl #3], got {ldr_scaled_count}");
+        }
+        let esc_words = decode_words(&shared_shl_escaping.code, alloc);
+        let esc_lsl_count = esc_words.iter().filter(|&&w| (w & 0xffc0_0000) == 0xd340_0000).count();
+        assert_eq!(esc_lsl_count, 1, "escaping shared shl must keep its lsl instruction, got {esc_lsl_count}");
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let keys_arr: [u64; 8] = [101, 202, 303, 404, 505, 606, 707, 808];
+            let vals_arr: [u64; 8] = [1111, 2222, 3333, 4444, 5555, 6666, 7777, 8888];
+
+            let ex_same = exec_leaf(dual_same_blk);
+            let f_same: extern "C" fn(*const u64, *const u64, u64) -> u64 = unsafe { ex_same.as_fn() };
+            for slot in 0..8usize {
+                assert_eq!(
+                    f_same(keys_arr.as_ptr(), vals_arr.as_ptr(), slot as u64),
+                    keys_arr[slot] ^ vals_arr[slot],
+                    "same-block dual array mismatch at slot {slot}"
+                );
+            }
+
+            let ex_cross = exec_leaf(dual_cross_blk);
+            let f_cross: extern "C" fn(*const u64, *const u64, u64, u64) -> u64 = unsafe { ex_cross.as_fn() };
+            for slot in 0..8usize {
+                assert_eq!(
+                    f_cross(keys_arr.as_ptr(), vals_arr.as_ptr(), slot as u64, keys_arr[slot]),
+                    vals_arr[slot],
+                    "cross-block hit mismatch at slot {slot}"
+                );
+                assert_eq!(
+                    f_cross(keys_arr.as_ptr(), vals_arr.as_ptr(), slot as u64, 9999),
+                    0,
+                    "cross-block miss mismatch at slot {slot}"
+                );
+            }
+
+            let ex_esc = exec_leaf(shared_shl_escaping);
+            let f_esc: extern "C" fn(*const u64, u64) -> u64 = unsafe { ex_esc.as_fn() };
+            for slot in 0..8usize {
+                assert_eq!(
+                    f_esc(keys_arr.as_ptr(), slot as u64),
+                    keys_arr[slot] ^ ((slot as u64) << 3),
+                    "escaping shl mismatch at slot {slot}"
+                );
+            }
         }
     }
 }

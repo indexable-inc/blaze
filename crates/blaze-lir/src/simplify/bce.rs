@@ -68,6 +68,24 @@ fn op_byte(op: Op) -> u8 {
 }
 
 #[inline]
+fn cond_word(cond: IntCond) -> u32 {
+    IntCond::ALL
+        .iter()
+        .position(|&c| c == cond)
+        .and_then(|i| u32::try_from(i).ok())
+        .unwrap_or(0)
+}
+
+struct CfgInfo<'a, A: Allocator> {
+    preds: &'a [Vec<u32, A>],
+    inst_block: &'a [u32],
+    reachable: &'a [bool],
+    idom: &'a [u32],
+    rpo_pos: &'a [u32],
+    dom_converged: bool,
+}
+
+#[inline]
 fn at_u32(slice: &[u32], i: usize) -> u32 {
     slice.get(i).copied().unwrap_or(0)
 }
@@ -746,13 +764,263 @@ fn is_proven_ule_direct(
     false
 }
 
-#[inline]
-fn eval_fact(view: &View<'_>, facts: &[RelFact], q_cond: IntCond, q_a: u32, q_b: u32) -> Option<bool> {
-    eval_fact_extra(view, facts, None, q_cond, q_a, q_b)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoundMaskProof {
+    /// Not proven masked by `len - 1` or reduced modulo `len`.
+    None,
+    /// Exact bijection: `Ult(val, len) <=> Ne(len, 0)` (and `Uge(val, len) <=> Eq(len, 0)`)
+    /// for EVERY unsigned `len` (including `len == 0` and non-power-of-2 `len`).
+    IfLenNonZero,
+    /// Every path to `val` executed `Op::Urem(_, len)`, which already trapped if `len == 0`,
+    /// so `Ult(val, len)` holds unconditionally.
+    AlwaysLt,
 }
 
-fn eval_fact_extra(
+#[inline]
+fn is_len_minus_one(view: &View<'_>, cand: u32, len: u32, width: u32) -> bool {
+    if decompose_sub_or_add_neg_const(view, cand)
+        .is_some_and(|(base, k, w, _)| base == len && k == 1 && w == width)
+    {
+        return true;
+    }
+    if let (Some((cc, cw)), Some((lc, lw))) =
+        (const_int(view, to_idx(cand)), const_int(view, to_idx(len)))
+    {
+        let expected = if lc == 0 { mask(width) } else { lc - 1 };
+        return cw == width && lw == width && cc == expected;
+    }
+    false
+}
+
+/// Bounded iterative proof (<= 16 visited values, zero recursion) that `val` is always
+/// masked by `len - 1` (`And(_, Sub(len, 1))` / `And(_, Add(len, -1))`) or reduced by
+/// `Urem(_, len)` across `Select`s and closed `Param` cycles (open-addressing hash probing
+/// `slot = Phi(h & mask, (slot + 1) & mask)` and ring buffers `idx = Phi(0, (idx + 1) & mask)`).
+fn masked_by_len_minus_one<A: Allocator>(
     view: &View<'_>,
+    cfg: &CfgInfo<'_, A>,
+    val: u32,
+    len: u32,
+) -> BoundMaskProof {
+    const MAX_VISITED: usize = 16;
+
+    let vi = to_idx(val);
+    let li = to_idx(len);
+    if vi >= view.len() || li >= view.len() {
+        return BoundMaskProof::None;
+    }
+    if !matches!(view.op(vi), Op::And | Op::Urem | Op::Select | Op::Param) {
+        return BoundMaskProof::None;
+    }
+    let ty = Ty(at_u16(view.tys, vi));
+    if !ty.is_scalar() || !ty.is_int() || ty != Ty(at_u16(view.tys, li)) {
+        return BoundMaskProof::None;
+    }
+    let width = ty.bits(view.head.ptr_bits);
+    if width == 0 || width > 128 {
+        return BoundMaskProof::None;
+    }
+    let len_is_const = const_int(view, li).is_some();
+    let len_blk = to_idx(at_u32(cfg.inst_block, li));
+
+    let mut visited = [0u32; MAX_VISITED];
+    let mut vlen: usize = 0;
+    let mut work = [0u32; MAX_VISITED];
+    let mut wlen: usize = 0;
+
+    if let Some(slot) = visited.get_mut(vlen) {
+        *slot = val;
+        vlen += 1;
+    }
+    if let Some(slot) = work.get_mut(wlen) {
+        *slot = val;
+        wlen += 1;
+    }
+
+    let mut saw_and_or_zero = false;
+    let mut saw_and = false;
+    let mut saw_urem = false;
+
+    while wlen > 0 {
+        wlen -= 1;
+        let Some(&cur) = work.get(wlen) else {
+            return BoundMaskProof::None;
+        };
+        let ci = to_idx(cur);
+        if ci >= view.len() || Ty(at_u16(view.tys, ci)) != ty {
+            return BoundMaskProof::None;
+        }
+        match view.op(ci) {
+            Op::And => {
+                let Some(&at_raw) = view.data.get(ci) else {
+                    return BoundMaskProof::None;
+                };
+                let at = to_idx(at_raw);
+                let (Some(&l), Some(&r)) = (view.extra.get(at), view.extra.get(at + 1)) else {
+                    return BoundMaskProof::None;
+                };
+                if is_len_minus_one(view, l, len, width) || is_len_minus_one(view, r, len, width) {
+                    saw_and = true;
+                    saw_and_or_zero = true;
+                } else {
+                    return BoundMaskProof::None;
+                }
+            }
+            Op::Urem => {
+                let Some(&at_raw) = view.data.get(ci) else {
+                    return BoundMaskProof::None;
+                };
+                let at = to_idx(at_raw);
+                let Some(&r) = view.extra.get(at + 1) else {
+                    return BoundMaskProof::None;
+                };
+                if r == len {
+                    saw_urem = true;
+                } else {
+                    return BoundMaskProof::None;
+                }
+            }
+            Op::Iconst | Op::IconstWide => {
+                if const_int(view, ci).is_some_and(|(c, cw)| cw == width && c == 0) {
+                    saw_and_or_zero = true;
+                } else {
+                    return BoundMaskProof::None;
+                }
+            }
+            Op::Select => {
+                let Some(&at_raw) = view.data.get(ci) else {
+                    return BoundMaskProof::None;
+                };
+                let at = to_idx(at_raw);
+                let (Some(&tv), Some(&fv)) = (view.extra.get(at + 1), view.extra.get(at + 2))
+                else {
+                    return BoundMaskProof::None;
+                };
+                for child in [tv, fv] {
+                    if !visited.iter().take(vlen).any(|&v| v == child) {
+                        let (Some(vslot), Some(wslot)) =
+                            (visited.get_mut(vlen), work.get_mut(wlen))
+                        else {
+                            return BoundMaskProof::None;
+                        };
+                        *vslot = child;
+                        vlen += 1;
+                        *wslot = child;
+                        wlen += 1;
+                    }
+                }
+            }
+            Op::Param => {
+                let b = to_idx(at_u32(cfg.inst_block, ci));
+                if b == 0
+                    || !cfg.reachable.get(b).copied().unwrap_or(false)
+                    || view.block_kind(Block(to_u32(b))) != BlockKind::Normal
+                {
+                    return BoundMaskProof::None;
+                }
+                // `len` must strictly dominate every visited `Param` block so no cycle can carry
+                // a value masked by an earlier iteration's `len` across a redefinition of `len`.
+                if !len_is_const
+                    && (!cfg.dom_converged
+                        || !strictly_dominates(len_blk, b, cfg.idom, cfg.rpo_pos, cfg.reachable))
+                {
+                    return BoundMaskProof::None;
+                }
+                let b_params = view.params(Block(to_u32(b)));
+                if ci < b_params.start || ci >= b_params.end {
+                    return BoundMaskProof::None;
+                }
+                let param_pos = ci - b_params.start;
+                let Some(ps) = cfg.preds.get(b) else {
+                    return BoundMaskProof::None;
+                };
+                if ps.is_empty() {
+                    return BoundMaskProof::None;
+                }
+                let mut saw_edge = false;
+                let mut ok = true;
+                for &p_u32 in ps {
+                    if !cfg.reachable.get(to_idx(p_u32)).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    let term = view.terminator(Block(p_u32));
+                    each(view, term, |item| {
+                        if !ok {
+                            return;
+                        }
+                        if let Item::Edge(edge) = item && to_idx(edge.block) == b {
+                            saw_edge = true;
+                            if let Some((astart, argc)) = edge.args && param_pos < argc {
+                                let arg = at_u32(view.extra, astart + param_pos);
+                                if !visited.iter().take(vlen).any(|&v| v == arg) {
+                                    if let (Some(vslot), Some(wslot)) =
+                                        (visited.get_mut(vlen), work.get_mut(wlen))
+                                    {
+                                        *vslot = arg;
+                                        vlen += 1;
+                                        *wslot = arg;
+                                        wlen += 1;
+                                    } else {
+                                        ok = false;
+                                    }
+                                }
+                            } else {
+                                ok = false;
+                            }
+                        }
+                    });
+                    if !ok {
+                        break;
+                    }
+                }
+                if !ok || !saw_edge {
+                    return BoundMaskProof::None;
+                }
+            }
+            _ => return BoundMaskProof::None,
+        }
+    }
+
+    if saw_urem && !saw_and_or_zero {
+        BoundMaskProof::AlwaysLt
+    } else if saw_and || saw_urem {
+        BoundMaskProof::IfLenNonZero
+    } else {
+        BoundMaskProof::None
+    }
+}
+
+/// Finds an existing `Op::Iconst(0)` of type `ty` in entry block 0 that dominates `cmp_inst`.
+fn find_entry_zero(view: &View<'_>, ty: Ty, cmp_blk: usize, cmp_inst: usize) -> Option<u32> {
+    let b0 = view.block(Block(0));
+    let limit = if cmp_blk == 0 { cmp_inst.min(b0.end) } else { b0.end };
+    for inst in b0.start..limit {
+        if view.op(inst) == Op::Iconst
+            && at_u8(view.flags, inst) == 0
+            && Ty(at_u16(view.tys, inst)) == ty
+            && at_u32(view.data, inst) == 0
+        {
+            return Some(to_u32(inst));
+        }
+    }
+    None
+}
+
+#[inline]
+fn eval_fact<A: Allocator>(
+    view: &View<'_>,
+    cfg: &CfgInfo<'_, A>,
+    facts: &[RelFact],
+    q_cond: IntCond,
+    q_a: u32,
+    q_b: u32,
+) -> Option<bool> {
+    eval_fact_extra(view, cfg, facts, None, q_cond, q_a, q_b)
+}
+
+fn eval_fact_extra<A: Allocator>(
+    view: &View<'_>,
+    cfg: &CfgInfo<'_, A>,
     facts: &[RelFact],
     extra: Option<RelFact>,
     q_cond: IntCond,
@@ -1020,6 +1288,37 @@ fn eval_fact_extra(
         return Some(res);
     }
     if let Some(res) = try_sub_const_bound(q_b, q_a, swap_cond(q_cond)) {
+        return Some(res);
+    }
+    // 5b. Bitwise-AND mask & unsigned-remainder bounds proof:
+    //     - `val = Urem(_, bound)` unconditionally proves `Ult(val, bound)` (`Urem` traps on 0).
+    //     - `val` masked by `bound - 1` (`And(_, Sub(bound, 1))` / `And(_, Add(bound, -1))` across
+    //       `Select`s and closed `Param` cycles) satisfies `Ult(val, bound) <=> Ne(bound, 0)`, so
+    //       whenever `bound >= 1` (`bound != 0` / `bound > 0` / `other < bound`) is already known
+    //       in dominating facts, `Ult(val, bound)` holds immediately!
+    let try_masked_bound = |val: u32, bound: u32, cond: IntCond| -> Option<bool> {
+        match masked_by_len_minus_one(view, cfg, val, bound) {
+            BoundMaskProof::None => None,
+            BoundMaskProof::AlwaysLt => implies(IntCond::Ult, cond),
+            BoundMaskProof::IfLenNonZero => {
+                let bi = to_idx(bound);
+                let w = Ty(at_u16(view.tys, bi)).bits(view.head.ptr_bits);
+                if w > 0 && w <= 128 {
+                    if is_proven_uge_const(view, facts, extra, bound, 1, w) {
+                        return implies(IntCond::Ult, cond);
+                    }
+                    if const_int(view, bi).is_some_and(|(c, cw)| cw == w && c == 0) {
+                        return implies(IntCond::Uge, cond);
+                    }
+                }
+                None
+            }
+        }
+    };
+    if let Some(res) = try_masked_bound(q_a, q_b, q_cond) {
+        return Some(res);
+    }
+    if let Some(res) = try_masked_bound(q_b, q_a, swap_cond(q_cond)) {
         return Some(res);
     }
     // 6. One-step unsigned transitivity (`a < m && m <= b => a < b`, `a <= m && m < b => a < b`,
@@ -1291,12 +1590,8 @@ fn edge_br_ult(view: &View<'_>, pred: u32, target: u32, ordinal: u32) -> Option<
 #[allow(clippy::too_many_arguments)]
 fn is_proven_ule<A: Allocator>(
     view: &View<'_>,
-    preds: &[Vec<u32, A>],
-    inst_block: &[u32],
+    cfg: &CfgInfo<'_, A>,
     block_facts: &[Vec<RelFact, A>],
-    reachable: &[bool],
-    idom: &[u32],
-    rpo_pos: &[u32],
     loop_hdr: usize,
     start_blk: usize,
     start_edge_fact: Option<RelFact>,
@@ -1326,7 +1621,9 @@ fn is_proven_ule<A: Allocator>(
             continue;
         }
         let facts = block_facts.get(blk).map_or(&[][..], Vec::as_slice);
-        if eval_fact_extra(view, facts, edge_fact, IntCond::Ule, val, target_param) == Some(true) {
+        if eval_fact_extra(view, cfg, facts, edge_fact, IntCond::Ule, val, target_param)
+            == Some(true)
+        {
             continue;
         }
         if depth >= MAX_DEPTH {
@@ -1408,9 +1705,9 @@ fn is_proven_ule<A: Allocator>(
                 };
                 let ok = l == target_param
                     || r == target_param
-                    || eval_fact_extra(view, facts, edge_fact, IntCond::Ule, l, target_param)
+                    || eval_fact_extra(view, cfg, facts, edge_fact, IntCond::Ule, l, target_param)
                         == Some(true)
-                    || eval_fact_extra(view, facts, edge_fact, IntCond::Ule, r, target_param)
+                    || eval_fact_extra(view, cfg, facts, edge_fact, IntCond::Ule, r, target_param)
                         == Some(true);
                 if !ok {
                     return false;
@@ -1453,8 +1750,8 @@ fn is_proven_ule<A: Allocator>(
                 }
             }
             Op::Param => {
-                let m = to_idx(at_u32(inst_block, vi));
-                if m == loop_hdr || !dominates(loop_hdr, m, idom, rpo_pos, reachable) {
+                let m = to_idx(at_u32(cfg.inst_block, vi));
+                if m == loop_hdr || !dominates(loop_hdr, m, cfg.idom, cfg.rpo_pos, cfg.reachable) {
                     return false;
                 }
                 let m_params = view.params(Block(to_u32(m)));
@@ -1462,7 +1759,7 @@ fn is_proven_ule<A: Allocator>(
                     return false;
                 }
                 let param_pos = vi - m_params.start;
-                let Some(mps) = preds.get(m) else {
+                let Some(mps) = cfg.preds.get(m) else {
                     return false;
                 };
                 if mps.is_empty() {
@@ -1472,10 +1769,10 @@ fn is_proven_ule<A: Allocator>(
                 let mut ok = true;
                 for &mp_u32 in mps {
                     let mp = to_idx(mp_u32);
-                    if !reachable.get(mp).copied().unwrap_or(false) {
+                    if !cfg.reachable.get(mp).copied().unwrap_or(false) {
                         continue;
                     }
-                    if !dominates(loop_hdr, mp, idom, rpo_pos, reachable) {
+                    if !dominates(loop_hdr, mp, cfg.idom, cfg.rpo_pos, cfg.reachable) {
                         ok = false;
                         break;
                     }
@@ -1516,8 +1813,10 @@ fn is_proven_ule<A: Allocator>(
 
 /// Checks whether `cond(init_v, bound)` (`cond` is `Ult` or `Ule`) is proven on an entry edge
 /// whose predecessor facts are `facts` plus optional branch edge fact `ef`.
-fn entry_edge_proves_bound(
+#[allow(clippy::too_many_arguments)]
+fn entry_edge_proves_bound<A: Allocator>(
     view: &View<'_>,
+    cfg: &CfgInfo<'_, A>,
     facts: &[RelFact],
     ef: Option<RelFact>,
     cond: IntCond,
@@ -1528,7 +1827,7 @@ fn entry_edge_proves_bound(
     if cond == IntCond::Ule && init_v == bound {
         return true;
     }
-    if eval_fact_extra(view, facts, ef, cond, init_v, bound) == Some(true) {
+    if eval_fact_extra(view, cfg, facts, ef, cond, init_v, bound) == Some(true) {
         return true;
     }
     if cond == IntCond::Ule
@@ -1606,6 +1905,14 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
 
     let (rpo, rpo_pos, reachable, idom, dom_converged) =
         compute_rpo_and_idom(&view, &preds, edge_count, alloc);
+    let cfg = CfgInfo {
+        preds: &preds,
+        inst_block: &inst_block,
+        reachable: &reachable,
+        idom: &idom,
+        rpo_pos: &rpo_pos,
+        dom_converged,
+    };
 
     // Compute per-block dominating relational and boolean facts down the dominator tree.
     let mut block_facts: Vec<Vec<RelFact, A>, A> = Vec::with_capacity_in(blocks, alloc);
@@ -1903,12 +2210,8 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
                                 let ef = edge_br_rel(&view, bp_u32, h_u32, edge.ordinal);
                                 if !is_proven_ule(
                                     &view,
-                                    &preds,
-                                    &inst_block,
+                                    &cfg,
                                     &block_facts,
-                                    &reachable,
-                                    &idom,
-                                    &rpo_pos,
                                     h,
                                     bpi,
                                     ef,
@@ -2018,7 +2321,9 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
                     }
                 }
                 if let Some((_, hi)) = decompose_midpoint(&view, init_0) {
-                    if eval_fact_extra(&view, facts_0, ef_0, IntCond::Ult, init_0, hi) == Some(true) {
+                    if eval_fact_extra(&view, &cfg, facts_0, ef_0, IntCond::Ult, init_0, hi)
+                        == Some(true)
+                    {
                         add_cand(IntCond::Ult, hi);
                     }
                     for f in facts_0.iter().copied().chain(ef_0) {
@@ -2030,7 +2335,8 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
                             None
                         };
                         if let Some(ob) = outer
-                            && eval_fact_extra(&view, facts_0, ef_0, IntCond::Ult, init_0, ob) == Some(true)
+                            && eval_fact_extra(&view, &cfg, facts_0, ef_0, IntCond::Ult, init_0, ob)
+                                == Some(true)
                         {
                             add_cand(IntCond::Ult, ob);
                         }
@@ -2103,12 +2409,12 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
                             }
                         }
                     } else if init_is_const {
-                        if eval_fact_extra(&view, facts_0, ef_0, IntCond::Ult, init_0, f.a)
+                        if eval_fact_extra(&view, &cfg, facts_0, ef_0, IntCond::Ult, init_0, f.a)
                             == Some(true)
                         {
                             add_cand(IntCond::Ult, f.a);
                         }
-                        if eval_fact_extra(&view, facts_0, ef_0, IntCond::Ult, init_0, f.b)
+                        if eval_fact_extra(&view, &cfg, facts_0, ef_0, IntCond::Ult, init_0, f.b)
                             == Some(true)
                         {
                             add_cand(IntCond::Ult, f.b);
@@ -2120,8 +2426,15 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
                                 .map(|(o, _)| o)
                                 .or_else(|| decompose_usub_sat_const(&view, side).map(|(o, _)| o));
                             if let Some(ob) = outer
-                                && eval_fact_extra(&view, facts_0, ef_0, IntCond::Ult, init_0, ob)
-                                    == Some(true)
+                                && eval_fact_extra(
+                                    &view,
+                                    &cfg,
+                                    facts_0,
+                                    ef_0,
+                                    IntCond::Ult,
+                                    init_0,
+                                    ob,
+                                ) == Some(true)
                             {
                                 add_cand(IntCond::Ult, ob);
                             }
@@ -2139,11 +2452,12 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
                         let facts_e = block_facts.get(to_idx(pre_e)).map_or(&[][..], Vec::as_slice);
                         let ef_e = edge_br_rel(&view, pre_e, h_u32, ord_e);
                         if !entry_edge_proves_bound(
-                            &view, facts_e, ef_e, cond, init_e, bound, p_width,
+                            &view, &cfg, facts_e, ef_e, cond, init_e, bound, p_width,
                         ) {
                             if cond == IntCond::Ult
                                 && entry_edge_proves_bound(
                                     &view,
+                                    &cfg,
                                     facts_e,
                                     ef_e,
                                     IntCond::Ule,
@@ -2181,14 +2495,27 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
         }
     }
 
-    // Fold any dominated `Op::Icmp` or `Op::Br` whose truth value is statically implied!
+    #[derive(Clone, Copy)]
+    struct IcmpRewrite {
+        cond: IntCond,
+        bound: u32,
+        bound_ty: Ty,
+        zero_val: Option<u32>,
+    }
+
+    // Fold any dominated `Op::Icmp` or `Op::Br` whose truth value is statically implied,
+    // and rewrite masked bounds checks (`Ult(x & (len - 1), len)` -> `Ne(len, 0)`) into
+    // loop-invariant zero checks on `len`!
     let mut folded_const: Vec<Option<bool>, A> = Vec::with_capacity_in(len, alloc);
+    let mut rewritten_icmp: Vec<Option<IcmpRewrite>, A> = Vec::with_capacity_in(len, alloc);
     for _ in 0..len {
         folded_const.push(None);
+        rewritten_icmp.push(None);
     }
     let mut eliminated = 0u32;
 
     for b in 0..blocks {
+        let b_reachable = reachable.get(b).copied().unwrap_or(false);
         let b_facts: &[RelFact] = match block_facts.get(b) {
             Some(v) => v.as_slice(),
             None => &[],
@@ -2204,9 +2531,38 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
                 if let Some(cond) = IntCond::from_word(at_u32(view.extra, cat)) {
                     let a = at_u32(view.extra, cat + 1);
                     let bv = at_u32(view.extra, cat + 2);
-                    if let Some(res) = eval_fact(&view, b_facts, cond, a, bv) {
+                    if let Some(res) = eval_fact(&view, &cfg, b_facts, cond, a, bv) {
                         set_at(&mut folded_const, inst, Some(res));
                         eliminated += 1;
+                    } else if b_reachable {
+                        let oriented = match cond {
+                            IntCond::Ult => Some((a, bv, IntCond::Ne)),
+                            IntCond::Uge => Some((a, bv, IntCond::Eq)),
+                            IntCond::Ugt => Some((bv, a, IntCond::Ne)),
+                            IntCond::Ule => Some((bv, a, IntCond::Eq)),
+                            _ => None,
+                        };
+                        if let Some((val, bound, new_cond)) = oriented
+                            && masked_by_len_minus_one(&view, &cfg, val, bound)
+                                == BoundMaskProof::IfLenNonZero
+                        {
+                            let bi = to_idx(bound);
+                            let bound_ty = Ty(at_u16(view.tys, bi));
+                            if bound_ty.is_scalar() && bound_ty.is_int() {
+                                let zero_val = find_entry_zero(&view, bound_ty, b, inst);
+                                set_at(
+                                    &mut rewritten_icmp,
+                                    inst,
+                                    Some(IcmpRewrite {
+                                        cond: new_cond,
+                                        bound,
+                                        bound_ty,
+                                        zero_val,
+                                    }),
+                                );
+                                eliminated += 1;
+                            }
+                        }
                     }
                 }
             } else if op == Op::Br {
@@ -2366,9 +2722,28 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
     func.block_kinds.clear();
 
     let iconst_op = op_byte(Op::Iconst);
+    let icmp_op = op_byte(Op::Icmp);
     let jump_op = op_byte(Op::Jump);
 
+    // Precompute old-inst -> new-inst mapping before emission so extra `Iconst(0)` insertions
+    // stay exact across all blocks and value references.
     let mut val_map = filled(len, NONE, &alloc);
+    let mut out_len: usize = 0;
+    for b in 0..blocks {
+        for inst in view.block(Block(to_u32(b))) {
+            if rewritten_icmp
+                .get(inst)
+                .copied()
+                .flatten()
+                .is_some_and(|rw| rw.zero_val.is_none())
+            {
+                out_len += 1;
+            }
+            set_at(&mut val_map, inst, to_u32(out_len));
+            out_len += 1;
+        }
+    }
+
     for b in 0..blocks {
         func.block_starts.push(to_u32(func.ops.len()));
         func.block_kinds.push(at_u8(view.block_kinds, b));
@@ -2376,14 +2751,39 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
             let op = view.op(inst);
             if op == Op::Icmp {
                 if let Some(val) = folded_const.get(inst).copied().flatten() {
-                    let idx = to_u32(func.ops.len());
                     func.ops.push(iconst_op);
                     func.flags.push(0);
                     func.tys.push(Ty::I1.0);
                     func.data.push(u32::from(val));
                     func.attrs.push(0);
                     func.locs.push(at_u32(view.locs, inst));
-                    set_at(&mut val_map, inst, idx);
+                    continue;
+                }
+                if let Some(rw) = rewritten_icmp.get(inst).copied().flatten() {
+                    let loc = at_u32(view.locs, inst);
+                    let zero_mapped = match rw.zero_val {
+                        Some(zv) => at_u32(&val_map, to_idx(zv)),
+                        None => {
+                            let z_idx = to_u32(func.ops.len());
+                            func.ops.push(iconst_op);
+                            func.flags.push(0);
+                            func.tys.push(rw.bound_ty.0);
+                            func.data.push(0);
+                            func.attrs.push(0);
+                            func.locs.push(loc);
+                            z_idx
+                        }
+                    };
+                    let cat = to_u32(func.extra.len());
+                    func.extra.push(cond_word(rw.cond));
+                    func.extra.push(at_u32(&val_map, to_idx(rw.bound)));
+                    func.extra.push(zero_mapped);
+                    func.ops.push(icmp_op);
+                    func.flags.push(0);
+                    func.tys.push(Ty::I1.0);
+                    func.data.push(cat);
+                    func.attrs.push(0);
+                    func.locs.push(loc);
                     continue;
                 }
             } else if op == Op::Br {
@@ -2401,14 +2801,12 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
                     for k in 0..argc {
                         func.extra.push(at_u32(&val_map, to_idx(at_u32(view.extra, astart + k))));
                     }
-                    let idx = to_u32(func.ops.len());
                     func.ops.push(jump_op);
                     func.flags.push(0);
                     func.tys.push(Ty::NONE.0);
                     func.data.push(jat);
                     func.attrs.push(0);
                     func.locs.push(at_u32(view.locs, inst));
-                    set_at(&mut val_map, inst, idx);
                     continue;
                 }
             } else if op == Op::Jump {
@@ -2436,20 +2834,17 @@ pub fn eliminate_redundant_checks<A: Allocator + Copy>(
                             };
                             func.extra.push(mapped);
                         }
-                        let idx = to_u32(func.ops.len());
                         func.ops.push(jump_op);
                         func.flags.push(0);
                         func.tys.push(Ty::NONE.0);
                         func.data.push(jat);
                         func.attrs.push(0);
                         func.locs.push(at_u32(view.locs, inst));
-                        set_at(&mut val_map, inst, idx);
                         continue;
                     }
                 }
             }
-            let copied = copy_inst(&view, inst, &val_map, &mut func);
-            set_at(&mut val_map, inst, copied);
+            let _ = copy_inst(&view, inst, &val_map, &mut func);
         }
     }
 
@@ -3510,5 +3905,536 @@ mod tests {
         let opt2 = eval::run_in(bce2.func.view(), &[Val::Int(0)], 10_000, alloc).unwrap();
         assert!(matches!(orig2, Outcome::Trapped(_)), "expected len=0 to wrap and trap");
         assert_eq!(orig2, opt2, "BCE must preserve wrap trap at len=0");
+    }
+
+    #[test]
+    fn bce_rewrites_and_mask_loop_check_to_invariant_len_nonzero() {
+        use crate::func::SlotKind;
+        use crate::unswitch::unswitch_loops;
+
+        // Models open-addressing `hash_probe_batch`:
+        //   let mask = len - 1;
+        //   let mut slot = hash & mask;
+        //   for _ in 0..steps {
+        //       let v = keys[slot]; // Ult(slot, len) / Uge(slot, len) / Ugt(len, slot) / Ule(len, slot)
+        //       acc += v;
+        //       slot = (slot + 1) & mask;
+        //   }
+        // Verifies all 4 operand orientations + `Sub(len, 1)` & `Add(len, -1)` rewrite to
+        // loop-invariant `Ne(len, 0)` / `Eq(len, 0)`, unlock `unswitch_loops`, and match
+        // `eval::run_in` on `len == 0` (MUST STILL TRAP!) and `len == 1, 7, 16`.
+        let alloc = blaze_own::testing::heap().alloc();
+
+        let build = |cond: IntCond, swapped: bool, use_add_neg: bool| {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let arr_slot = b.slot(16 * 8, 8, SlotKind::Temp);
+            let [entry, hdr, chk, oob, body, exit] =
+                [(); 6].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let len = b.param(Ty::I64);
+            let hash = b.param(Ty::I64);
+            let steps = b.param(Ty::I64);
+            let ptr = b.slot_addr(arr_slot);
+            for k in 0..16u32 {
+                let elem = b.iconst(Ty::I64, u128::from((k + 1) * 10));
+                b.store(
+                    Flags::NONE,
+                    elem,
+                    ptr,
+                    i32::try_from(k * 8).unwrap(),
+                    MemAttrs::aligned(3),
+                );
+            }
+            let c0 = b.iconst(Ty::I64, 0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let c3 = b.iconst(Ty::I64, 3);
+            let mask_v = if use_add_neg {
+                let neg1 = b.iconst(Ty::I64, u128::from(u64::MAX));
+                b.binary(Op::Add, Flags::NONE, len, neg1)
+            } else {
+                b.binary(Op::Sub, Flags::NONE, len, c1)
+            };
+            let slot0 = b.binary(Op::And, Flags::NONE, hash, mask_v);
+            b.jump((hdr, &[slot0, c0, c0]));
+
+            b.begin(hdr);
+            let slot = b.param(Ty::I64);
+            let iter = b.param(Ty::I64);
+            let acc = b.param(Ty::I64);
+            let keep = b.icmp(IntCond::Ult, iter, steps);
+            b.br(Flags::NONE, keep, (chk, &[]), (exit, &[acc]));
+
+            b.begin(chk);
+            let cmp = if swapped {
+                b.icmp(cond, len, slot)
+            } else {
+                b.icmp(cond, slot, len)
+            };
+            let is_in_bounds_cond = matches!(
+                (cond, swapped),
+                (IntCond::Ult, false) | (IntCond::Ugt, true)
+            );
+            if is_in_bounds_cond {
+                b.br(Flags::NONE, cmp, (body, &[]), (oob, &[]));
+            } else {
+                b.br(Flags::NONE, cmp, (oob, &[]), (body, &[]));
+            }
+
+            b.begin(oob);
+            b.trap(1);
+
+            b.begin(body);
+            let byte_off = b.binary(Op::Shl, Flags::NONE, slot, c3);
+            let ep = b.ptr_add(Flags::NONE, ptr, byte_off);
+            let val = b.load(Ty::I64, Flags::NONE, ep, 0, MemAttrs::aligned(3));
+            let acc2 = b.binary(Op::Add, Flags::NONE, acc, val);
+            let slot_inc = b.binary(Op::Add, Flags::NONE, slot, c1);
+            let slot_next = b.binary(Op::And, Flags::NONE, slot_inc, mask_v);
+            let iter_next = b.binary(Op::Add, Flags::NONE, iter, c1);
+            b.jump((hdr, &[slot_next, iter_next, acc2]));
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+            b.finish_checked().unwrap()
+        };
+
+        let cases = [
+            (IntCond::Ult, false, false, IntCond::Ne),
+            (IntCond::Uge, false, false, IntCond::Eq),
+            (IntCond::Ugt, true, false, IntCond::Ne),
+            (IntCond::Ule, true, true, IntCond::Eq),
+        ];
+
+        for (cond, swapped, use_add_neg, expected_cond) in cases {
+            let func = build(cond, swapped, use_add_neg);
+            let bce = eliminate_redundant_checks(func.view(), alloc).unwrap();
+            verify(bce.func.view()).unwrap();
+            assert!(bce.stats.checks_eliminated >= 1);
+
+            // Verify `Ult/Uge/Ugt/Ule` on `(slot, len)` was rewritten to `Ne/Eq(len, 0)`.
+            let v = bce.func.view();
+            let mut saw_invariant_len_cmp = false;
+            for k in 0..v.len() {
+                if v.op(k) == Op::Icmp {
+                    let cat = to_idx(at_u32(v.data, k));
+                    let ic = IntCond::from_word(at_u32(v.extra, cat));
+                    let lhs = at_u32(v.extra, cat + 1);
+                    let rhs = at_u32(v.extra, cat + 2);
+                    if ic == Some(expected_cond)
+                        && lhs == 0
+                        && const_int(&v, to_idx(rhs)).is_some_and(|(c, _)| c == 0)
+                    {
+                        saw_invariant_len_cmp = true;
+                    }
+                    assert!(
+                        !(matches!(ic, Some(IntCond::Ult | IntCond::Uge)) && rhs == 0 && lhs != 0),
+                        "loop check must no longer compare `slot` against `len`"
+                    );
+                    assert!(
+                        !(matches!(ic, Some(IntCond::Ugt | IntCond::Ule)) && lhs == 0 && rhs != 0),
+                        "loop check must no longer compare `len` against `slot`"
+                    );
+                }
+            }
+            assert!(
+                saw_invariant_len_cmp,
+                "expected rewritten {expected_cond:?}(len, 0) for ({cond:?}, swapped={swapped}, add_neg={use_add_neg})"
+            );
+
+            // Rewriting must be idempotent on a second BCE pass.
+            let bce_again = eliminate_redundant_checks(bce.func.view(), alloc).unwrap();
+            assert_eq!(bce_again.stats.checks_eliminated, 0);
+
+            // `unswitch_loops` must now hoist the loop-invariant `len != 0` guard out of the loop!
+            let unswitched = unswitch_loops(bce.func.view(), 4, alloc).unwrap();
+            verify(unswitched.func.view()).unwrap();
+            assert!(unswitched.stats.loops_unswitched >= 1);
+
+            // `len == 0` with `steps > 0` MUST STILL TRAP!
+            let trap_args = [Val::Int(0), Val::Int(0x1234_5678), Val::Int(1)];
+            let orig_trap = eval::run_in(func.view(), &trap_args, 20_000, alloc).unwrap();
+            let bce_trap = eval::run_in(bce.func.view(), &trap_args, 20_000, alloc).unwrap();
+            let unsw_trap =
+                eval::run_in(unswitched.func.view(), &trap_args, 20_000, alloc).unwrap();
+            assert!(matches!(orig_trap, Outcome::Trapped(_)));
+            assert_eq!(orig_trap, bce_trap);
+            assert_eq!(orig_trap, unsw_trap);
+
+            // `len == 0` with `steps == 0` must NOT trap (returns 0).
+            let zero_steps = [Val::Int(0), Val::Int(42), Val::Int(0)];
+            assert_eq!(
+                eval::run_in(func.view(), &zero_steps, 20_000, alloc).unwrap(),
+                eval::run_in(bce.func.view(), &zero_steps, 20_000, alloc).unwrap(),
+            );
+
+            // Exact match on both non-power-of-2 (`7`) and power-of-2 (`1`, `16`) lengths!
+            for &len_v in &[1u128, 7, 16] {
+                for &h_v in &[0u128, 5, 13, 0xdead_beef] {
+                    let args = [Val::Int(len_v), Val::Int(h_v), Val::Int(5)];
+                    let orig = eval::run_in(func.view(), &args, 20_000, alloc).unwrap();
+                    let opt = eval::run_in(bce.func.view(), &args, 20_000, alloc).unwrap();
+                    let unsw = eval::run_in(unswitched.func.view(), &args, 20_000, alloc).unwrap();
+                    assert!(matches!(orig, Outcome::Returned(_)));
+                    assert_eq!(orig, opt, "BCE mismatch at len={len_v}, h={h_v}");
+                    assert_eq!(orig, unsw, "unswitch mismatch at len={len_v}, h={h_v}");
+                }
+            }
+        }
+
+        // Also exercise fresh `Iconst(Ty::I32, 0)` emission when entry has NO `Iconst(Ty::I32, 0)`.
+        let mut b32 = Builder::<_, Full>::new_in(64, alloc);
+        let sig32 = b32.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I32), Param::of(Ty::I32)],
+            &[Param::of(Ty::I32)],
+        );
+        b32.set_signature(sig32);
+        let [e32, ok32, oob32] = [(); 3].map(|_| b32.create_block(BlockKind::Normal));
+        b32.begin(e32);
+        let len32 = b32.param(Ty::I32);
+        let h32 = b32.param(Ty::I32);
+        let one32 = b32.iconst(Ty::I32, 1);
+        let mask32 = b32.binary(Op::Sub, Flags::NONE, len32, one32);
+        let slot32 = b32.binary(Op::And, Flags::NONE, h32, mask32);
+        let in_b32 = b32.icmp(IntCond::Ult, slot32, len32);
+        b32.br(Flags::NONE, in_b32, (ok32, &[]), (oob32, &[]));
+        b32.begin(ok32);
+        b32.ret(&[slot32]);
+        b32.begin(oob32);
+        b32.trap(1);
+        let func32 = b32.finish_checked().unwrap();
+
+        let bce32 = eliminate_redundant_checks(func32.view(), alloc).unwrap();
+        verify(bce32.func.view()).unwrap();
+        assert!(bce32.stats.checks_eliminated >= 1);
+        for &(lv, hv) in &[(0u128, 7u128), (1, 99), (7, 15), (16, 33)] {
+            let args = [Val::Int(lv), Val::Int(hv)];
+            assert_eq!(
+                eval::run_in(func32.view(), &args, 10_000, alloc).unwrap(),
+                eval::run_in(bce32.func.view(), &args, 10_000, alloc).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn bce_eliminates_and_mask_check_when_len_proven_nonzero() {
+        use crate::func::SlotKind;
+
+        // Same open-addressing probe loop guarded by `if len == 0 { return 0; }`:
+        // Rule A must fold `Ult(slot, len)` -> `true` and eliminate the trap completely!
+        let alloc = blaze_own::testing::heap().alloc();
+
+        for use_add_neg in [false, true] {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let arr_slot = b.slot(16 * 8, 8, SlotKind::Temp);
+            let [entry, pre, hdr, chk, oob, body, exit] =
+                [(); 7].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let len = b.param(Ty::I64);
+            let hash = b.param(Ty::I64);
+            let steps = b.param(Ty::I64);
+            let ptr = b.slot_addr(arr_slot);
+            for k in 0..16u32 {
+                let elem = b.iconst(Ty::I64, u128::from((k + 1) * 10));
+                b.store(
+                    Flags::NONE,
+                    elem,
+                    ptr,
+                    i32::try_from(k * 8).unwrap(),
+                    MemAttrs::aligned(3),
+                );
+            }
+            let c0 = b.iconst(Ty::I64, 0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let c3 = b.iconst(Ty::I64, 3);
+            let is_zero = b.icmp(IntCond::Eq, len, c0);
+            b.br(Flags::NONE, is_zero, (exit, &[c0]), (pre, &[]));
+
+            b.begin(pre);
+            let mask_v = if use_add_neg {
+                let neg1 = b.iconst(Ty::I64, u128::from(u64::MAX));
+                b.binary(Op::Add, Flags::NONE, len, neg1)
+            } else {
+                b.binary(Op::Sub, Flags::NONE, len, c1)
+            };
+            let slot0 = b.binary(Op::And, Flags::NONE, hash, mask_v);
+            b.jump((hdr, &[slot0, c0, c0]));
+
+            b.begin(hdr);
+            let slot = b.param(Ty::I64);
+            let iter = b.param(Ty::I64);
+            let acc = b.param(Ty::I64);
+            let keep = b.icmp(IntCond::Ult, iter, steps);
+            b.br(Flags::NONE, keep, (chk, &[]), (exit, &[acc]));
+
+            b.begin(chk);
+            let in_bounds = b.icmp(IntCond::Ult, slot, len);
+            b.br(Flags::NONE, in_bounds, (body, &[]), (oob, &[]));
+
+            b.begin(oob);
+            b.trap(1);
+
+            b.begin(body);
+            let byte_off = b.binary(Op::Shl, Flags::NONE, slot, c3);
+            let ep = b.ptr_add(Flags::NONE, ptr, byte_off);
+            let val = b.load(Ty::I64, Flags::NONE, ep, 0, MemAttrs::aligned(3));
+            let acc2 = b.binary(Op::Add, Flags::NONE, acc, val);
+            let slot_inc = b.binary(Op::Add, Flags::NONE, slot, c1);
+            let slot_next = b.binary(Op::And, Flags::NONE, slot_inc, mask_v);
+            let iter_next = b.binary(Op::Add, Flags::NONE, iter, c1);
+            b.jump((hdr, &[slot_next, iter_next, acc2]));
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+            let func = b.finish_checked().unwrap();
+
+            let bce = eliminate_redundant_checks(func.view(), alloc).unwrap();
+            verify(bce.func.view()).unwrap();
+            assert!(bce.stats.checks_eliminated >= 1);
+            let traps = (0..bce.func.view().len())
+                .filter(|&k| matches!(bce.func.view().op(k), Op::Trap | Op::Unreachable))
+                .count();
+            assert_eq!(
+                traps, 0,
+                "guarded and-mask loop (use_add_neg={use_add_neg}) must eliminate trap completely"
+            );
+
+            for &len_v in &[0u128, 1, 7, 16] {
+                for &h_v in &[0u128, 3, 11, 0xfeed_face] {
+                    let args = [Val::Int(len_v), Val::Int(h_v), Val::Int(5)];
+                    let Outcome::Returned(orig) =
+                        eval::run_in(func.view(), &args, 20_000, alloc).unwrap()
+                    else {
+                        panic!("orig guarded and-mask failed at len={len_v}, h={h_v}");
+                    };
+                    let Outcome::Returned(opt) =
+                        eval::run_in(bce.func.view(), &args, 20_000, alloc).unwrap()
+                    else {
+                        panic!("bce guarded and-mask failed at len={len_v}, h={h_v}");
+                    };
+                    assert_eq!(
+                        orig, opt,
+                        "guarded and-mask mismatch at len={len_v}, h={h_v}, add_neg={use_add_neg}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bce_does_not_rewrite_wrong_mask() {
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Negative control 1: `mask = len` (not `len - 1`). At `len = 4, hash = 4`,
+        // `slot = 4 & 4 = 4 >= 4`, which MUST trap!
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let [entry, hdr, chk, oob, body, exit] =
+                [(); 6].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let len = b.param(Ty::I64);
+            let hash = b.param(Ty::I64);
+            let steps = b.param(Ty::I64);
+            let c0 = b.iconst(Ty::I64, 0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let slot0 = b.binary(Op::And, Flags::NONE, hash, len);
+            b.jump((hdr, &[slot0, c0, c0]));
+
+            b.begin(hdr);
+            let slot = b.param(Ty::I64);
+            let iter = b.param(Ty::I64);
+            let acc = b.param(Ty::I64);
+            let keep = b.icmp(IntCond::Ult, iter, steps);
+            b.br(Flags::NONE, keep, (chk, &[]), (exit, &[acc]));
+
+            b.begin(chk);
+            let in_bounds = b.icmp(IntCond::Ult, slot, len);
+            b.br(Flags::NONE, in_bounds, (body, &[]), (oob, &[]));
+
+            b.begin(oob);
+            b.trap(1);
+
+            b.begin(body);
+            let acc2 = b.binary(Op::Add, Flags::NONE, acc, slot);
+            let slot_inc = b.binary(Op::Add, Flags::NONE, slot, c1);
+            let slot_next = b.binary(Op::And, Flags::NONE, slot_inc, len);
+            let iter_next = b.binary(Op::Add, Flags::NONE, iter, c1);
+            b.jump((hdr, &[slot_next, iter_next, acc2]));
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+            let func = b.finish_checked().unwrap();
+
+            let bce = eliminate_redundant_checks(func.view(), alloc).unwrap();
+            verify(bce.func.view()).unwrap();
+            assert_eq!(bce.stats.checks_eliminated, 0, "`mask = len` must not be rewritten or eliminated");
+            assert!((0..bce.func.view().len()).any(|k| bce.func.view().op(k) == Op::Trap));
+
+            let args = [Val::Int(4), Val::Int(4), Val::Int(1)];
+            let orig = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let opt = eval::run_in(bce.func.view(), &args, 10_000, alloc).unwrap();
+            assert!(matches!(orig, Outcome::Trapped(_)));
+            assert_eq!(orig, opt);
+        }
+
+        // Negative control 2: `mask = Sub(len, 2)` (even when `len != 0` is guarded!).
+        // At `len = 1, hash = 5`, `Sub(1, 2)` wraps to `u64::MAX`, `slot = 5 >= 1`, MUST trap!
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let [entry, pre, hdr, chk, oob, body, exit] =
+                [(); 7].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let len = b.param(Ty::I64);
+            let hash = b.param(Ty::I64);
+            let steps = b.param(Ty::I64);
+            let c0 = b.iconst(Ty::I64, 0);
+            let c1 = b.iconst(Ty::I64, 1);
+            let c2 = b.iconst(Ty::I64, 2);
+            let is_zero = b.icmp(IntCond::Eq, len, c0);
+            b.br(Flags::NONE, is_zero, (exit, &[c0]), (pre, &[]));
+
+            b.begin(pre);
+            let mask_v = b.binary(Op::Sub, Flags::NONE, len, c2);
+            let slot0 = b.binary(Op::And, Flags::NONE, hash, mask_v);
+            b.jump((hdr, &[slot0, c0, c0]));
+
+            b.begin(hdr);
+            let slot = b.param(Ty::I64);
+            let iter = b.param(Ty::I64);
+            let acc = b.param(Ty::I64);
+            let keep = b.icmp(IntCond::Ult, iter, steps);
+            b.br(Flags::NONE, keep, (chk, &[]), (exit, &[acc]));
+
+            b.begin(chk);
+            let in_bounds = b.icmp(IntCond::Ult, slot, len);
+            b.br(Flags::NONE, in_bounds, (body, &[]), (oob, &[]));
+
+            b.begin(oob);
+            b.trap(1);
+
+            b.begin(body);
+            let acc2 = b.binary(Op::Add, Flags::NONE, acc, slot);
+            let slot_inc = b.binary(Op::Add, Flags::NONE, slot, c1);
+            let slot_next = b.binary(Op::And, Flags::NONE, slot_inc, mask_v);
+            let iter_next = b.binary(Op::Add, Flags::NONE, iter, c1);
+            b.jump((hdr, &[slot_next, iter_next, acc2]));
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+            let func = b.finish_checked().unwrap();
+
+            let bce = eliminate_redundant_checks(func.view(), alloc).unwrap();
+            verify(bce.func.view()).unwrap();
+            assert_eq!(bce.stats.checks_eliminated, 0, "`mask = len - 2` must not be rewritten or eliminated");
+            assert!((0..bce.func.view().len()).any(|k| bce.func.view().op(k) == Op::Trap));
+
+            let args = [Val::Int(1), Val::Int(5), Val::Int(1)];
+            let orig = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let opt = eval::run_in(bce.func.view(), &args, 10_000, alloc).unwrap();
+            assert!(matches!(orig, Outcome::Trapped(_)));
+            assert_eq!(orig, opt);
+        }
+
+        // Negative control 3: `len` is a loop-varying `Param` (does not strictly dominate `hdr`).
+        // Iter 0: `slot = 0, len = 10` -> `slot_next = 1 & 9 = 1`; Iter 1: `len = 1` -> `1 < 1` traps!
+        {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let [entry, hdr, chk, oob, body, exit] =
+                [(); 6].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let init_len = b.param(Ty::I64);
+            let next_len = b.param(Ty::I64);
+            let steps = b.param(Ty::I64);
+            let c0 = b.iconst(Ty::I64, 0);
+            let c1 = b.iconst(Ty::I64, 1);
+            b.jump((hdr, &[c0, init_len, c0, c0]));
+
+            b.begin(hdr);
+            let slot = b.param(Ty::I64);
+            let cur_len = b.param(Ty::I64);
+            let iter = b.param(Ty::I64);
+            let acc = b.param(Ty::I64);
+            let keep = b.icmp(IntCond::Ult, iter, steps);
+            b.br(Flags::NONE, keep, (chk, &[]), (exit, &[acc]));
+
+            b.begin(chk);
+            let in_bounds = b.icmp(IntCond::Ult, slot, cur_len);
+            b.br(Flags::NONE, in_bounds, (body, &[]), (oob, &[]));
+
+            b.begin(oob);
+            b.trap(1);
+
+            b.begin(body);
+            let acc2 = b.binary(Op::Add, Flags::NONE, acc, slot);
+            let mask_v = b.binary(Op::Sub, Flags::NONE, cur_len, c1);
+            let slot_inc = b.binary(Op::Add, Flags::NONE, slot, c1);
+            let slot_next = b.binary(Op::And, Flags::NONE, slot_inc, mask_v);
+            let iter_next = b.binary(Op::Add, Flags::NONE, iter, c1);
+            b.jump((hdr, &[slot_next, next_len, iter_next, acc2]));
+
+            b.begin(exit);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+            let func = b.finish_checked().unwrap();
+
+            let bce = eliminate_redundant_checks(func.view(), alloc).unwrap();
+            verify(bce.func.view()).unwrap();
+            assert_eq!(
+                bce.stats.checks_eliminated, 0,
+                "loop-variant `len` param must not be rewritten or eliminated"
+            );
+            assert!((0..bce.func.view().len()).any(|k| bce.func.view().op(k) == Op::Trap));
+
+            let args = [Val::Int(10), Val::Int(1), Val::Int(2)];
+            let orig = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let opt = eval::run_in(bce.func.view(), &args, 10_000, alloc).unwrap();
+            assert!(matches!(orig, Outcome::Trapped(_)));
+            assert_eq!(orig, opt);
+        }
     }
 }
