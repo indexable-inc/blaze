@@ -561,6 +561,8 @@ pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
         let Some((slot, e)) = next else { break };
         from = slot + 1;
         r.store.maps.inherents.borrow_mut().set(e.need, State::Running);
+        let active_before = r.store.active_consts_len();
+        r.store.push_active_const(e.need);
         let out = match find(r, e) {
             Ok(Some((constant, ty))) => match r.consts.take() {
                 Some((consts, prepared)) => {
@@ -577,6 +579,12 @@ pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
             Ok(None) => Ok(None),
             Err(e) => Err(e),
         };
+        r.store.truncate_active_consts(active_before);
+        if r.store.clear_provisional_for(e.need)
+            && let Some(b) = r.buckets.as_ref()
+        {
+            b.clear_provisional();
+        }
         file(r, e.need, out);
     }
     true
