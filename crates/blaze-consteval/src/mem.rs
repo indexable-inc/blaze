@@ -69,6 +69,9 @@ pub struct Allocation {
     pub origin: Origin,
     /// A static's bytes have been read from its record.
     pub(crate) loaded: bool,
+    /// A `static mut`: its address may be taken (`&raw const` / `&raw mut`), while reading or
+    /// writing it in a constant is refused with `Refusal::MutableStatic`.
+    pub(crate) mut_static: bool,
 }
 
 impl Allocation {
@@ -265,7 +268,7 @@ impl<A: Allocator + Clone> Memory<A> {
         }
         let id = AllocId(self.allocs.len() as u32);
         let start = self.region(size)?;
-        self.allocs.push(Allocation { start, len: size, align_log2, mutable, live: true, origin, loaded: true });
+        self.allocs.push(Allocation { start, len: size, align_log2, mutable, live: true, origin, loaded: true, mut_static: false });
         if self.relocs.len() < self.allocs.len() {
             self.relocs.push(Vec::new_in(self.alloc.clone()));
         }
