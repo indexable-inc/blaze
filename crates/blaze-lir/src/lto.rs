@@ -247,7 +247,7 @@ impl<A: Allocator> Bodies for ModuleBodies<'_, A> {
 
     fn body(&self, id: BodyId) -> Option<View<'_>> {
         if let Some(&idx) = self.id_to_index.get(&id) {
-            return Some(self.bodies[idx].func.view());
+            return self.bodies.get(idx).map(|b| b.func.view());
         }
         self.external.body(id)
     }
@@ -405,6 +405,26 @@ pub fn lto_optimize_module<A: Allocator + Copy>(
             module[idx].func = final_func;
             reads[idx] = inlined.read;
             imports[idx] = inlined.imported_refs;
+
+            let tce = if let Some(mb) = module.get(idx) {
+                let overlay = ModuleBodies {
+                    bodies: &module,
+                    imports: &imports,
+                    id_to_index: &id_to_index,
+                    external,
+                };
+                eliminate_self_tail_calls_if_any(mb.func.view(), body_id, &overlay, alloc)?
+            } else {
+                None
+            };
+            if let Some((tce_func, _)) = tce {
+                let post_tce = simplify_body(tce_func.view(), alloc)?;
+                let sum = FnSummary::compute(post_tce.view(), &alloc);
+                summaries.insert(body_id, sum);
+                if let Some(mb) = module.get_mut(idx) {
+                    mb.func = post_tce;
+                }
+            }
         }
     }
 
@@ -796,6 +816,981 @@ pub fn specialize_body_const_param<A: Allocator + Copy>(
     sota_optimize_body(func.view(), opts, alloc)
 }
 
+/// Telemetry from [`eliminate_self_tail_calls`].
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct SelfTceStats {
+    /// Number of direct self-tail-call sites rewritten into entry loop back-edges.
+    pub tail_calls_eliminated: u32,
+}
+
+/// Output of [`eliminate_self_tail_calls`].
+#[derive(Debug)]
+pub struct SelfTceOutput<A: Allocator> {
+    pub func: Func<A>,
+    pub stats: SelfTceStats,
+}
+
+/// Pending value operand fixup for forward dominating references across non-RPO blocks.
+#[derive(Clone, Copy)]
+struct TceValFixup {
+    in_extra: bool,
+    pos: usize,
+    old_val: u32,
+}
+
+/// Resolves whether a direct call reference in `self_id` targets `self_id` itself.
+fn is_self_target(bodies: &dyn Bodies, self_id: BodyId, reference: RefId) -> bool {
+    if let Some((callee_id, _)) = bodies.callee(self_id, reference) {
+        return callee_id == self_id;
+    }
+    matches!(bodies.target(self_id, reference), Some(Target::Func(callee_id)) if callee_id == self_id)
+}
+
+/// Returns `true` if `inst` is safe to discard when it appears between a self-tail-call and `Op::Return`.
+///
+/// Only non-trapping pure operations, compound `Project` extractions, `Assume`, and stack-slot
+/// lifetime markers (`SlotLive`/`SlotDead`) are permitted; all memory accesses, calls, trapping
+/// divisions/remainders, provenance exposures, and meaning-flagged ops stop the scan.
+fn is_tail_trailing_allowed(view: &View<'_>, inst: usize) -> bool {
+    let op = view.op(inst);
+    if matches!(op, Op::Project | Op::SlotDead | Op::SlotLive | Op::Assume) {
+        return true;
+    }
+    if op.info().flags.meanings_only(view.flags(inst)).0 != 0 {
+        return false;
+    }
+    matches!(
+        op,
+        Op::Iconst
+            | Op::IconstWide
+            | Op::Fconst
+            | Op::FconstWide
+            | Op::Vconst
+            | Op::Null
+            | Op::Uninit
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Neg
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Not
+            | Op::Shl
+            | Op::Lshr
+            | Op::Ashr
+            | Op::Rotl
+            | Op::Rotr
+            | Op::Umulhi
+            | Op::Smulhi
+            | Op::UaddSat
+            | Op::SaddSat
+            | Op::UsubSat
+            | Op::SsubSat
+            | Op::Umin
+            | Op::Umax
+            | Op::Smin
+            | Op::Smax
+            | Op::UaddOverflow
+            | Op::SaddOverflow
+            | Op::UsubOverflow
+            | Op::SsubOverflow
+            | Op::UmulOverflow
+            | Op::SmulOverflow
+            | Op::Clz
+            | Op::Ctz
+            | Op::Popcnt
+            | Op::Bswap
+            | Op::Bitrev
+            | Op::Icmp
+            | Op::Fcmp
+            | Op::Select
+            | Op::Zext
+            | Op::Sext
+            | Op::Trunc
+            | Op::Fpext
+            | Op::Fptrunc
+            | Op::FptoUi
+            | Op::FptoSi
+            | Op::UitoFp
+            | Op::SitoFp
+            | Op::Bitcast
+            | Op::Fadd
+            | Op::Fsub
+            | Op::Fmul
+            | Op::Fdiv
+            | Op::Frem
+            | Op::FminNum
+            | Op::FmaxNum
+            | Op::Fminimum
+            | Op::Fmaximum
+            | Op::Fcopysign
+            | Op::Fneg
+            | Op::Fabs
+            | Op::Sqrt
+            | Op::Floor
+            | Op::Ceil
+            | Op::Ftrunc
+            | Op::Nearest
+            | Op::Fround
+            | Op::Fma
+            | Op::Fmuladd
+            | Op::Freeze
+            | Op::PtrAdd
+            | Op::PtrAddr
+            | Op::FromExposed
+            | Op::PtrWithAddr
+            | Op::FuncAddr
+            | Op::DataAddr
+            | Op::TlsAddr
+            | Op::SlotAddr
+            | Op::Splat
+            | Op::Extract
+            | Op::Insert
+            | Op::Shuffle
+            | Op::Swizzle
+            | Op::ReduceAdd
+            | Op::ReduceMul
+            | Op::ReduceAnd
+            | Op::ReduceOr
+            | Op::ReduceXor
+            | Op::ReduceUmin
+            | Op::ReduceUmax
+            | Op::ReduceSmin
+            | Op::ReduceSmax
+            | Op::ReduceFadd
+            | Op::ReduceFmul
+            | Op::ReduceFmin
+            | Op::ReduceFmax
+            | Op::Bitmask
+    )
+}
+
+/// Returns `true` if any value operand of `inst` is tainted in `taint`.
+fn any_value_operand_tainted(view: &View<'_>, inst: usize, taint: &[bool]) -> bool {
+    use crate::{
+        Ty,
+        op::{Field, Layout},
+    };
+
+    let op = view.op(inst);
+    match op.info().layout {
+        Layout::None => false,
+        Layout::Data(Field::Value) => at(taint, to_idx(at(view.data, inst, 0)), false),
+        Layout::Data(_) => false,
+        Layout::Extra(fields) => {
+            let src = to_idx(at(view.data, inst, 0));
+            let mut p = src;
+            for &f in fields {
+                match f {
+                    Field::Value => {
+                        if at(taint, to_idx(at(view.extra, p, 0)), false) {
+                            return true;
+                        }
+                        p += 1;
+                    }
+                    Field::Values => {
+                        let n = to_idx(at(view.extra, p, 0));
+                        p += 1;
+                        for k in 0..n {
+                            if at(taint, to_idx(at(view.extra, p + k, 0)), false) {
+                                return true;
+                            }
+                        }
+                        p += n;
+                    }
+                    Field::Target => {
+                        let n = to_idx(at(view.extra, p + 1, 0));
+                        p += 2;
+                        for k in 0..n {
+                            if at(taint, to_idx(at(view.extra, p + k, 0)), false) {
+                                return true;
+                            }
+                        }
+                        p += n;
+                    }
+                    Field::Cases => {
+                        let n = to_idx(at(view.extra, p, 0));
+                        p += 1;
+                        let scrutinee = at(view.extra, src, 0);
+                        let w = to_idx(Ty(at(view.tys, to_idx(scrutinee), 0)).const_words());
+                        for _ in 0..n {
+                            p += w;
+                            let an = to_idx(at(view.extra, p + 1, 0));
+                            p += 2;
+                            for k in 0..an {
+                                if at(taint, to_idx(at(view.extra, p + k, 0)), false) {
+                                    return true;
+                                }
+                            }
+                            p += an;
+                        }
+                    }
+                    Field::Mask | Field::Blocks => {
+                        let n = to_idx(at(view.extra, p, 0));
+                        p += 1 + n;
+                    }
+                    Field::Const => {
+                        let w = to_idx(Ty(at(view.tys, inst, 0)).const_words());
+                        p += w;
+                    }
+                    Field::Imm
+                    | Field::Offset
+                    | Field::IntCond
+                    | Field::FloatCond
+                    | Field::Rmw
+                    | Field::Ref
+                    | Field::Sig
+                    | Field::Slot
+                    | Field::Intrinsic
+                    | Field::Asm
+                    | Field::Block => {
+                        p += 1;
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Sound escape check for local `StackSlot`s: returns `true` if any `Op::SlotAddr` (or pointer
+/// derived from it through `PtrAdd`/`PtrWithAddr`/`Freeze`/`Select`/block-param edges) could
+/// escape into memory, a callee, a return value, an address cast, or an entry parameter.
+///
+/// Local stack slots used strictly as address operands of `Load`/`Store`/`Memcpy`/`Memmove`/
+/// `Memset`/`Memcmp`/atomics/`MaskedLoad`/`MaskedStore` (such as `slice::swap`'s temporary
+/// `StackSlot` in `Op::Memmove`) do NOT escape and remain 100% sound to reuse across loop
+/// iterations after tail-call elimination.
+fn any_slot_escapes<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> bool {
+    use crate::Block;
+
+    if view.slots.is_empty() {
+        return false;
+    }
+    let len = view.len();
+    let mut taint: OwnVec<bool, A> = OwnVec::from_elem_in(false, len, alloc);
+    let mut has_slot_addr = false;
+    for inst in 0..len {
+        if view.op(inst) == Op::SlotAddr {
+            set_at(&mut taint, inst, true);
+            has_slot_addr = true;
+        }
+    }
+    if !has_slot_addr {
+        return false;
+    }
+
+    // Phase 1: monotone fixed-point propagation of slot-derived pointers (bounded by `len + 1`).
+    for _ in 0..=len {
+        let mut changed = false;
+        for inst in 0..len {
+            match view.op(inst) {
+                Op::PtrAdd | Op::PtrWithAddr => {
+                    let mut o = view.operands(inst);
+                    let base = o.value().index();
+                    if at(&taint, base, false) && !at(&taint, inst, false) {
+                        set_at(&mut taint, inst, true);
+                        changed = true;
+                    }
+                }
+                Op::Freeze => {
+                    let v = to_idx(at(view.data, inst, 0));
+                    if at(&taint, v, false) && !at(&taint, inst, false) {
+                        set_at(&mut taint, inst, true);
+                        changed = true;
+                    }
+                }
+                Op::Select => {
+                    let mut o = view.operands(inst);
+                    let _cond = o.value();
+                    let a = o.value().index();
+                    let b = o.value().index();
+                    if (at(&taint, a, false) || at(&taint, b, false)) && !at(&taint, inst, false) {
+                        set_at(&mut taint, inst, true);
+                        changed = true;
+                    }
+                }
+                Op::Jump => {
+                    let mut o = view.operands(inst);
+                    let target = o.target();
+                    let params = view.params(target.block);
+                    for (k, arg) in target.args.iter().enumerate() {
+                        if at(&taint, arg.index(), false) {
+                            let p_inst = params.start + k;
+                            if !at(&taint, p_inst, false) {
+                                set_at(&mut taint, p_inst, true);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                Op::Br => {
+                    let mut o = view.operands(inst);
+                    let _cond = o.value();
+                    for target in [o.target(), o.target()] {
+                        let params = view.params(target.block);
+                        for (k, arg) in target.args.iter().enumerate() {
+                            if at(&taint, arg.index(), false) {
+                                let p_inst = params.start + k;
+                                if !at(&taint, p_inst, false) {
+                                    set_at(&mut taint, p_inst, true);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                Op::Switch => {
+                    let mut o = view.operands(inst);
+                    let scrut = o.value();
+                    let def = o.target();
+                    let def_params = view.params(def.block);
+                    for (k, arg) in def.args.iter().enumerate() {
+                        if at(&taint, arg.index(), false) {
+                            let p_inst = def_params.start + k;
+                            if !at(&taint, p_inst, false) {
+                                set_at(&mut taint, p_inst, true);
+                                changed = true;
+                            }
+                        }
+                    }
+                    for (_, target) in o.cases(scrut) {
+                        let params = view.params(target.block);
+                        for (k, arg) in target.args.iter().enumerate() {
+                            if at(&taint, arg.index(), false) {
+                                let p_inst = params.start + k;
+                                if !at(&taint, p_inst, false) {
+                                    set_at(&mut taint, p_inst, true);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // If any back-edge carried a slot pointer into an entry param, refuse conservatively.
+    for p in view.params(Block(0)) {
+        if at(&taint, p, false) {
+            return true;
+        }
+    }
+
+    // Phase 2: verify every use of every slot-derived value is strictly a non-escaping address use.
+    for inst in 0..len {
+        match view.op(inst) {
+            Op::Param
+            | Op::SlotAddr
+            | Op::PtrAdd
+            | Op::PtrWithAddr
+            | Op::Freeze
+            | Op::Select
+            | Op::Jump
+            | Op::Br
+            | Op::Switch
+            | Op::Load
+            | Op::AtomicLoad
+            | Op::Memcpy
+            | Op::Memmove
+            | Op::Memset
+            | Op::Memcmp
+            | Op::Icmp => {}
+            Op::Store | Op::AtomicStore => {
+                let mut o = view.operands(inst);
+                let val = o.value();
+                if at(&taint, val.index(), false) {
+                    return true;
+                }
+            }
+            Op::AtomicRmw => {
+                let mut o = view.operands(inst);
+                let _rmw = o.rmw();
+                let _ptr = o.value();
+                let val = o.value();
+                if at(&taint, val.index(), false) {
+                    return true;
+                }
+            }
+            Op::Cmpxchg => {
+                let mut o = view.operands(inst);
+                let _ptr = o.value();
+                let exp = o.value();
+                let new = o.value();
+                if at(&taint, exp.index(), false) || at(&taint, new.index(), false) {
+                    return true;
+                }
+            }
+            Op::MaskedLoad => {
+                let mut o = view.operands(inst);
+                let _ptr = o.value();
+                let _mask = o.value();
+                let pass = o.value();
+                if at(&taint, pass.index(), false) {
+                    return true;
+                }
+            }
+            Op::MaskedStore => {
+                let mut o = view.operands(inst);
+                let val = o.value();
+                if at(&taint, val.index(), false) {
+                    return true;
+                }
+            }
+            _ => {
+                if any_value_operand_tainted(view, inst, &taint) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Checks whether `call_inst` (an `Op::Call` inside a block ending with `Op::Return` at `term`)
+/// is a sound direct self-tail-call matching `self_id`'s entry signature and return values.
+fn is_eligible_self_tail_call(
+    view: &View<'_>,
+    call_inst: usize,
+    term: usize,
+    self_id: BodyId,
+    bodies: &dyn Bodies,
+    entry_params: &core::ops::Range<usize>,
+    own_sig: &crate::func::Sig<'_>,
+) -> bool {
+    use crate::{
+        Ty,
+        func::{RefKind, SigRec},
+    };
+
+    let mut o = view.operands(call_inst);
+    let callee_ref = o.reference();
+    let call_sig_id = o.sig();
+    let call_args = o.values();
+
+    if RefKind::from_word(view.reference(callee_ref).kind) != Some(RefKind::Func) {
+        return false;
+    }
+    if !is_self_target(bodies, self_id, callee_ref) {
+        return false;
+    }
+
+    let call_sig = view.sig(call_sig_id);
+    if (call_sig.bits & SigRec::VARIADIC) != 0 || call_sig.conv != own_sig.conv {
+        return false;
+    }
+    if call_args.len() != entry_params.len() {
+        return false;
+    }
+    for (k, param_inst) in (entry_params.start..entry_params.end).enumerate() {
+        if view.ty(call_args.get(k)) != Ty(at(view.tys, param_inst, 0)) {
+            return false;
+        }
+    }
+    if call_sig.rets.len() != own_sig.rets.len()
+        || !call_sig.rets.iter().map(|r| r.ty).eq(own_sig.rets.iter().map(|r| r.ty))
+    {
+        return false;
+    }
+
+    let mut ro = view.operands(term);
+    let ret_vals = ro.values();
+    if ret_vals.len() != own_sig.rets.len() {
+        return false;
+    }
+    match ret_vals.len() {
+        0 => Ty(at(view.tys, call_inst, 0)) == Ty::NONE,
+        1 => ret_vals.get(0).index() == call_inst,
+        k => {
+            for idx in 0..k {
+                let rv = ret_vals.get(idx).index();
+                if rv <= call_inst || rv >= term || view.op(rv) != Op::Project {
+                    return false;
+                }
+                let mut po = view.operands(rv);
+                let src = po.value();
+                let member = po.imm();
+                if src.index() != call_inst || member != u32_of(idx) {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+}
+
+fn emit_remapped_inst<A: Allocator>(
+    view: &View<'_>,
+    inst: usize,
+    blk_shift: u32,
+    val_map: &[u32],
+    fixups: &mut OwnVec<TceValFixup, A>,
+    func: &mut Func<A>,
+) -> u32 {
+    use crate::{
+        Ty,
+        op::{Field, Layout},
+    };
+
+    let op = view.op(inst);
+    let new_idx = func.ops.len();
+    let data = match op.info().layout {
+        Layout::None => 0,
+        Layout::Data(Field::Value) => {
+            let old_v = at(view.data, inst, 0);
+            let mapped = at(val_map, to_idx(old_v), crate::func::NONE);
+            if mapped == crate::func::NONE {
+                fixups.push(TceValFixup { in_extra: false, pos: new_idx, old_val: old_v });
+            }
+            mapped
+        }
+        Layout::Data(Field::Block) => at(view.data, inst, 0).wrapping_add(blk_shift),
+        Layout::Data(_) => at(view.data, inst, 0),
+        Layout::Extra(fields) => {
+            let src = to_idx(at(view.data, inst, 0));
+            let dst = u32_of(func.extra.len());
+            let mut p = src;
+            for &f in fields {
+                match f {
+                    Field::Value => {
+                        let old_v = at(view.extra, p, 0);
+                        let mapped = at(val_map, to_idx(old_v), crate::func::NONE);
+                        let pos = func.extra.len();
+                        func.extra.push(mapped);
+                        if mapped == crate::func::NONE {
+                            fixups.push(TceValFixup { in_extra: true, pos, old_val: old_v });
+                        }
+                        p += 1;
+                    }
+                    Field::Block => {
+                        func.extra.push(at(view.extra, p, 0).wrapping_add(blk_shift));
+                        p += 1;
+                    }
+                    Field::Values => {
+                        let n_u32 = at(view.extra, p, 0);
+                        let n = to_idx(n_u32);
+                        func.extra.push(n_u32);
+                        p += 1;
+                        for k in 0..n {
+                            let old_v = at(view.extra, p + k, 0);
+                            let mapped = at(val_map, to_idx(old_v), crate::func::NONE);
+                            let pos = func.extra.len();
+                            func.extra.push(mapped);
+                            if mapped == crate::func::NONE {
+                                fixups.push(TceValFixup { in_extra: true, pos, old_val: old_v });
+                            }
+                        }
+                        p += n;
+                    }
+                    Field::Target => {
+                        func.extra.push(at(view.extra, p, 0).wrapping_add(blk_shift));
+                        let n_u32 = at(view.extra, p + 1, 0);
+                        let n = to_idx(n_u32);
+                        func.extra.push(n_u32);
+                        p += 2;
+                        for k in 0..n {
+                            let old_v = at(view.extra, p + k, 0);
+                            let mapped = at(val_map, to_idx(old_v), crate::func::NONE);
+                            let pos = func.extra.len();
+                            func.extra.push(mapped);
+                            if mapped == crate::func::NONE {
+                                fixups.push(TceValFixup { in_extra: true, pos, old_val: old_v });
+                            }
+                        }
+                        p += n;
+                    }
+                    Field::Cases => {
+                        let n_u32 = at(view.extra, p, 0);
+                        let n = to_idx(n_u32);
+                        func.extra.push(n_u32);
+                        p += 1;
+                        let scrutinee = at(view.extra, src, 0);
+                        let w = to_idx(Ty(at(view.tys, to_idx(scrutinee), 0)).const_words());
+                        for _ in 0..n {
+                            for k in 0..w {
+                                func.extra.push(at(view.extra, p + k, 0));
+                            }
+                            p += w;
+                            func.extra.push(at(view.extra, p, 0).wrapping_add(blk_shift));
+                            let an_u32 = at(view.extra, p + 1, 0);
+                            let an = to_idx(an_u32);
+                            func.extra.push(an_u32);
+                            p += 2;
+                            for k in 0..an {
+                                let old_v = at(view.extra, p + k, 0);
+                                let mapped = at(val_map, to_idx(old_v), crate::func::NONE);
+                                let pos = func.extra.len();
+                                func.extra.push(mapped);
+                                if mapped == crate::func::NONE {
+                                    fixups.push(TceValFixup { in_extra: true, pos, old_val: old_v });
+                                }
+                            }
+                            p += an;
+                        }
+                    }
+                    Field::Blocks => {
+                        let n_u32 = at(view.extra, p, 0);
+                        let n = to_idx(n_u32);
+                        func.extra.push(n_u32);
+                        p += 1;
+                        for k in 0..n {
+                            func.extra.push(at(view.extra, p + k, 0).wrapping_add(blk_shift));
+                        }
+                        p += n;
+                    }
+                    Field::Mask => {
+                        let n_u32 = at(view.extra, p, 0);
+                        let n = to_idx(n_u32);
+                        func.extra.push(n_u32);
+                        p += 1;
+                        for k in 0..n {
+                            func.extra.push(at(view.extra, p + k, 0));
+                        }
+                        p += n;
+                    }
+                    Field::Const => {
+                        let w = to_idx(Ty(at(view.tys, inst, 0)).const_words());
+                        for k in 0..w {
+                            func.extra.push(at(view.extra, p + k, 0));
+                        }
+                        p += w;
+                    }
+                    Field::Imm
+                    | Field::Offset
+                    | Field::IntCond
+                    | Field::FloatCond
+                    | Field::Rmw
+                    | Field::Ref
+                    | Field::Sig
+                    | Field::Slot
+                    | Field::Intrinsic
+                    | Field::Asm => {
+                        func.extra.push(at(view.extra, p, 0));
+                        p += 1;
+                    }
+                }
+            }
+            dst
+        }
+    };
+    func.ops.push(at(view.ops, inst, 0));
+    func.flags.push(at(view.flags, inst, 0));
+    func.tys.push(at(view.tys, inst, 0));
+    func.data.push(data);
+    func.attrs.push(at(view.attrs, inst, 0));
+    func.locs.push(at(view.locs, inst, 0));
+    u32_of(new_idx)
+}
+
+fn emit_tail_jump<A: Allocator>(
+    view: &View<'_>,
+    call_inst: usize,
+    loop_header_blk: u32,
+    val_map: &[u32],
+    fixups: &mut OwnVec<TceValFixup, A>,
+    func: &mut Func<A>,
+) {
+    use crate::{Flags, Ty};
+
+    let mut o = view.operands(call_inst);
+    let _callee_ref = o.reference();
+    let _sig = o.sig();
+    let args = o.values();
+
+    let extra_at = u32_of(func.extra.len());
+    func.extra.push(loop_header_blk);
+    func.extra.push(u32_of(args.len()));
+    for arg in args.iter() {
+        let old_v = arg.0;
+        let mapped = at(val_map, to_idx(old_v), crate::func::NONE);
+        let pos = func.extra.len();
+        func.extra.push(mapped);
+        if mapped == crate::func::NONE {
+            fixups.push(TceValFixup { in_extra: true, pos, old_val: old_v });
+        }
+    }
+    func.ops.push(op_byte(Op::Jump));
+    func.flags.push(Flags::NONE.0);
+    func.tys.push(Ty::NONE.0);
+    func.data.push(extra_at);
+    func.attrs.push(0);
+    func.locs.push(at(view.locs, call_inst, 0));
+}
+
+/// Internal zero-clone helper: returns `Ok(None)` when no eligible self-tail-call sites exist.
+fn eliminate_self_tail_calls_if_any<A: Allocator + Copy>(
+    view: View<'_>,
+    self_id: BodyId,
+    bodies: &dyn Bodies,
+    alloc: A,
+) -> Result<Option<(Func<A>, SelfTceStats)>, SimplifyError> {
+    use crate::{
+        Block, BlockKind, Flags, Ty,
+        func::{ParamKind, SigId, SigRec},
+        verify,
+    };
+
+    let old_blocks = view.blocks();
+    let len = view.len();
+    if old_blocks == 0 || len == 0 || view.block_kind(Block(0)) != BlockKind::Normal {
+        return Ok(None);
+    }
+
+    let own_sig = view.sig(SigId(view.head.sig));
+    if (own_sig.bits & SigRec::VARIADIC) != 0 {
+        return Ok(None);
+    }
+    if own_sig.params.iter().any(|p| ParamKind::from_byte(p.kind) == Some(ParamKind::Byval)) {
+        return Ok(None);
+    }
+
+    // Refuse coroutines and frame-introspection ops; also collect slots closed by `SlotDead`.
+    let mut has_slot_dead: OwnVec<bool, A> = OwnVec::from_elem_in(false, view.slots.len(), alloc);
+    for inst in 0..len {
+        match view.op(inst) {
+            Op::Suspend | Op::FrameAddress | Op::ReturnAddress | Op::StackPointer => return Ok(None),
+            Op::SlotDead => set_at(&mut has_slot_dead, to_idx(at(view.data, inst, 0)), true),
+            _ => {}
+        }
+    }
+
+    let entry_range = view.block(Block(0));
+    let entry_params = view.params(Block(0));
+    let mut tail_call_at: OwnVec<u32, A> = OwnVec::from_elem_in(crate::func::NONE, old_blocks, alloc);
+    let mut sites = 0u32;
+
+    for b in 0..old_blocks {
+        let blk = Block(u32_of(b));
+        let range = view.block(blk);
+        let term = range.end - 1;
+        if view.op(term) != Op::Return {
+            continue;
+        }
+        let params_end = view.params(blk).end;
+        for inst in (params_end..term).rev() {
+            if view.op(inst) == Op::Call {
+                if is_eligible_self_tail_call(&view, inst, term, self_id, bodies, &entry_params, &own_sig) {
+                    set_at(&mut tail_call_at, b, u32_of(inst));
+                    sites += 1;
+                }
+                break;
+            }
+            if !is_tail_trailing_allowed(&view, inst) {
+                break;
+            }
+        }
+    }
+
+    if sites == 0 {
+        return Ok(None);
+    }
+
+    // Soundness check: if any local StackSlot address can escape to memory, a callee, or a return,
+    // skip TCE conservatively so distinct recursive frames never alias a single loop frame.
+    if any_slot_escapes(&view, alloc) {
+        return Ok(None);
+    }
+
+    let mut func = view.to_func_in(alloc);
+    func.ops.clear();
+    func.flags.clear();
+    func.tys.clear();
+    func.data.clear();
+    func.extra.clear();
+    func.attrs.clear();
+    func.locs.clear();
+    func.block_starts.clear();
+    func.block_kinds.clear();
+
+    let mut val_map: OwnVec<u32, A> = OwnVec::from_elem_in(crate::func::NONE, len, alloc);
+    let mut fixups: OwnVec<TceValFixup, A> = OwnVec::new_in(alloc);
+
+    // New Block(0): tiny entry pre-header forwarding entry params to `loop_header` (Block(1)).
+    let param_count = entry_params.len();
+    func.block_starts.push(0);
+    func.block_kinds.push(at(view.block_kinds, 0, 0));
+    for inst in entry_params.start..entry_params.end {
+        func.ops.push(at(view.ops, inst, 0));
+        func.flags.push(at(view.flags, inst, 0));
+        func.tys.push(at(view.tys, inst, 0));
+        func.data.push(at(view.data, inst, 0));
+        func.attrs.push(at(view.attrs, inst, 0));
+        func.locs.push(at(view.locs, inst, 0));
+    }
+    let pre_jump_extra = u32_of(func.extra.len());
+    func.extra.push(1); // Block(1) = loop_header
+    func.extra.push(u32_of(param_count));
+    for k in 0..param_count {
+        func.extra.push(u32_of(k));
+    }
+    func.ops.push(op_byte(Op::Jump));
+    func.flags.push(Flags::NONE.0);
+    func.tys.push(Ty::NONE.0);
+    func.data.push(pre_jump_extra);
+    func.attrs.push(0);
+    func.locs.push(0);
+
+    // New Block(1): `loop_header` receiving original entry params and holding original Block(0)'s body.
+    func.block_starts.push(u32_of(func.ops.len()));
+    func.block_kinds.push(at(view.block_kinds, 0, 0));
+    for inst in entry_params.start..entry_params.end {
+        let idx = u32_of(func.ops.len());
+        func.ops.push(at(view.ops, inst, 0));
+        func.flags.push(at(view.flags, inst, 0));
+        func.tys.push(at(view.tys, inst, 0));
+        func.data.push(at(view.data, inst, 0));
+        func.attrs.push(at(view.attrs, inst, 0));
+        func.locs.push(at(view.locs, inst, 0));
+        set_at(&mut val_map, inst, idx);
+    }
+    for (slot_idx, &had_dead) in has_slot_dead.iter().enumerate() {
+        if had_dead {
+            func.ops.push(op_byte(Op::SlotLive));
+            func.flags.push(Flags::NONE.0);
+            func.tys.push(Ty::NONE.0);
+            func.data.push(u32_of(slot_idx));
+            func.attrs.push(0);
+            func.locs.push(0);
+        }
+    }
+    let tc0 = at(&tail_call_at, 0, crate::func::NONE);
+    if tc0 == crate::func::NONE {
+        for inst in entry_params.end..entry_range.end {
+            let idx = emit_remapped_inst(&view, inst, 1, &val_map, &mut fixups, &mut func);
+            set_at(&mut val_map, inst, idx);
+        }
+    } else {
+        let call_inst = to_idx(tc0);
+        for inst in entry_params.end..call_inst {
+            let idx = emit_remapped_inst(&view, inst, 1, &val_map, &mut fixups, &mut func);
+            set_at(&mut val_map, inst, idx);
+        }
+        emit_tail_jump(&view, call_inst, 1, &val_map, &mut fixups, &mut func);
+    }
+
+    // Remaining blocks `1..old_blocks` shifted to `2..=old_blocks`.
+    for b in 1..old_blocks {
+        func.block_starts.push(u32_of(func.ops.len()));
+        func.block_kinds.push(at(view.block_kinds, b, 0));
+        let range = view.block(Block(u32_of(b)));
+        let tc = at(&tail_call_at, b, crate::func::NONE);
+        if tc == crate::func::NONE {
+            for inst in range {
+                let idx = emit_remapped_inst(&view, inst, 1, &val_map, &mut fixups, &mut func);
+                set_at(&mut val_map, inst, idx);
+            }
+        } else {
+            let call_inst = to_idx(tc);
+            for inst in range.start..call_inst {
+                let idx = emit_remapped_inst(&view, inst, 1, &val_map, &mut fixups, &mut func);
+                set_at(&mut val_map, inst, idx);
+            }
+            emit_tail_jump(&view, call_inst, 1, &val_map, &mut fixups, &mut func);
+        }
+    }
+
+    // Patch any forward cross-block dominating value references.
+    for fix in fixups.iter() {
+        let mapped = at(&val_map, to_idx(fix.old_val), crate::func::NONE);
+        if mapped == crate::func::NONE {
+            return Err(SimplifyError::Refused {
+                inst: to_idx(fix.old_val),
+                what: "unmapped value in self-tail-call elimination",
+            });
+        }
+        if fix.in_extra {
+            set_at(&mut func.extra, fix.pos, mapped);
+        } else {
+            set_at(&mut func.data, fix.pos, mapped);
+        }
+    }
+
+    verify(func.view()).map_err(SimplifyError::Verify)?;
+    Ok(Some((func, SelfTceStats { tail_calls_eliminated: sites })))
+}
+
+/// Converts direct self-tail-calls (`Op::Call` to `self_id` whose exact results feed `Op::Return`
+/// with no intervening side effects and no escaping local `StackSlot`s) into `Op::Jump` back-edges
+/// to a newly created entry loop header (`Block(1)`).
+pub fn eliminate_self_tail_calls<A: Allocator + Copy>(
+    view: View<'_>,
+    self_id: BodyId,
+    bodies: &dyn Bodies,
+    alloc: A,
+) -> Result<SelfTceOutput<A>, SimplifyError> {
+    match eliminate_self_tail_calls_if_any(view, self_id, bodies, alloc)? {
+        Some((func, stats)) => Ok(SelfTceOutput { func, stats }),
+        None => Ok(SelfTceOutput { func: view.to_func_in(alloc), stats: SelfTceStats::default() }),
+    }
+}
+
+/// Internal `Bodies` overlay over [`OptimizedBody`]s that resolves transitive `ImportedRef` chains
+/// created during bottom-up inlining so post-inline passes (like [`eliminate_self_tail_calls`])
+/// resolve self-calls exposed by inlining.
+struct OptimizedBodies<'a, A: Allocator> {
+    bodies: &'a [OptimizedBody<A>],
+    id_to_index: &'a Map<BodyId, usize, FixedState, A>,
+    external: &'a dyn Bodies,
+}
+
+impl<A: Allocator> OptimizedBodies<'_, A> {
+    fn resolve_origin(&self, mut from: BodyId, mut reference: RefId) -> (BodyId, RefId) {
+        for _ in 0..32 {
+            let Some(&idx) = self.id_to_index.get(&from) else {
+                break;
+            };
+            let Some(ob) = self.bodies.get(idx) else {
+                break;
+            };
+            let Some(imp) = ob.imported_refs.iter().find(|r| r.caller_ref == reference) else {
+                break;
+            };
+            from = imp.source_body;
+            reference = imp.source_ref;
+        }
+        (from, reference)
+    }
+}
+
+impl<A: Allocator> Bodies for OptimizedBodies<'_, A> {
+    fn callee(&self, from: BodyId, reference: RefId) -> Option<(BodyId, View<'_>)> {
+        let (orig_from, orig_ref) = self.resolve_origin(from, reference);
+        let (callee_id, ext_view) = self.external.callee(orig_from, orig_ref)?;
+        if let Some(&idx) = self.id_to_index.get(&callee_id)
+            && let Some(ob) = self.bodies.get(idx)
+        {
+            return Some((callee_id, ob.func.view()));
+        }
+        Some((callee_id, ext_view))
+    }
+
+    fn target(&self, from: BodyId, reference: RefId) -> Option<Target> {
+        let (orig_from, orig_ref) = self.resolve_origin(from, reference);
+        self.external.target(orig_from, orig_ref)
+    }
+
+    fn datum(&self, id: DatumId) -> Option<Datum<'_>> {
+        self.external.datum(id)
+    }
+
+    fn body(&self, id: BodyId) -> Option<View<'_>> {
+        if let Some(&idx) = self.id_to_index.get(&id) {
+            return self.bodies.get(idx).map(|b| b.func.view());
+        }
+        self.external.body(id)
+    }
+
+    fn position(&self, item: u128, site: u32) -> Option<(u32, u32)> {
+        self.external.position(item, site)
+    }
+}
+
 /// Full SOTA Cross-Function Bottom-Up ThinLTO:
 ///
 /// 1. Runs PGO mono/bimorphic `dyn Trait` / fn-pointer [`speculative_devirt`] across the module
@@ -804,9 +1799,10 @@ pub fn specialize_body_const_param<A: Allocator + Copy>(
 /// 2. Condenses the enriched call graph with iterative Tarjan SCCs (callees before callers).
 /// 3. For each SCC bottom-up: simplifies callees, runs PGO-guided multi-function inlining
 ///    (`inline_guided_with_cache`, splicing chains `a -> b -> c` and devirtualized `dyn` methods),
-///    and runs the full cross-function SOTA pipeline (`SROA -> aegraph -> BCE -> Loop Unswitching
-///    -> Memory LICM/DSE -> 4x SIMD Auto-Vectorization -> 4x Scalar Unrolling -> Superopt`) over
-///    the merged multi-function body!
+///    eliminates direct self-tail-calls into loops ([`eliminate_self_tail_calls`]), and runs the
+///    full cross-function SOTA pipeline (`SROA -> aegraph -> BCE -> Loop Unswitching -> Memory
+///    LICM/DSE -> 4x SIMD Auto-Vectorization -> 4x Scalar Unrolling -> Superopt`) over the merged
+///    multi-function body!
 pub fn lto_optimize_module_sota<A: Allocator + Copy>(
     mut module: OwnVec<ModuleBody<A>, A>,
     external: &dyn Bodies,
@@ -831,13 +1827,392 @@ pub fn lto_optimize_module_sota<A: Allocator + Copy>(
     // Phase 1: Bottom-up Tarjan SCC multi-function PGO inlining (reusing `lto_optimize_module`).
     let mut lto = lto_optimize_module(module, external, weights, policy, alloc)?;
 
-    // Phase 2: Full cross-function SOTA optimization over every merged body (SROA + aegraph + BCE +
-    // Loop Unswitching + Memory LICM/DSE + 4x SIMD + 4x Scalar Unroll + Bounded E-Graph Superopt)!
-    for ob in lto.bodies.iter_mut() {
-        ob.func = sota_optimize_body(ob.func.view(), opts, alloc)?;
-        ob.summary = FnSummary::compute(ob.func.view(), &alloc);
-        ob.summary_changed = ob.summary.summary_hash != ob.prev_summary.summary_hash;
+    let mut id_to_index: Map<BodyId, usize, FixedState, A> = Map::new(MapOpts {
+        hasher: FixedState,
+        alloc,
+        capacity: Some(lto.bodies.len()),
+    });
+    for (idx, ob) in lto.bodies.iter().enumerate() {
+        id_to_index.insert(ob.id, idx);
+    }
+
+    // Phase 2: Self-tail-call elimination (TCE) + full cross-function SOTA optimization over every
+    // merged body so newly formed loops get full SROA/aegraph/BCE/unswitch/memory-LICM/SIMD/unroll/
+    // superopt treatment!
+    for idx in 0..lto.bodies.len() {
+        let pre_tce = if let Some(ob) = lto.bodies.get(idx) {
+            let overlay = OptimizedBodies {
+                bodies: &lto.bodies,
+                id_to_index: &id_to_index,
+                external,
+            };
+            eliminate_self_tail_calls_if_any(ob.func.view(), ob.id, &overlay, alloc)?
+        } else {
+            None
+        };
+        if let Some(ob) = lto.bodies.get_mut(idx) {
+            if let Some((tce_func, _)) = pre_tce {
+                ob.func = tce_func;
+            }
+            ob.func = sota_optimize_body(ob.func.view(), opts, alloc)?;
+        }
+
+        let post_tce = if let Some(ob) = lto.bodies.get(idx) {
+            let overlay = OptimizedBodies {
+                bodies: &lto.bodies,
+                id_to_index: &id_to_index,
+                external,
+            };
+            eliminate_self_tail_calls_if_any(ob.func.view(), ob.id, &overlay, alloc)?
+        } else {
+            None
+        };
+        if let Some(ob) = lto.bodies.get_mut(idx) {
+            if let Some((tce_func, _)) = post_tce {
+                ob.func = sota_optimize_body(tce_func.view(), opts, alloc)?;
+            }
+            ob.summary = FnSummary::compute(ob.func.view(), &alloc);
+            ob.summary_changed = ob.summary.summary_hash != ob.prev_summary.summary_hash;
+        }
     }
 
     Ok(lto)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        BlockKind, Flags, IntCond, Ty,
+        builder::{Builder, Full, MemAttrs, Param, Variadic},
+        eval::{self, Outcome, Val},
+        func::{Conv, RefKind, SlotKind},
+        inline::NoWeights,
+        verify,
+    };
+
+    struct SingleSelfBodies<'a> {
+        id: BodyId,
+        ref_id: RefId,
+        view: View<'a>,
+    }
+
+    impl Bodies for SingleSelfBodies<'_> {
+        fn callee(&self, from: BodyId, reference: RefId) -> Option<(BodyId, View<'_>)> {
+            (from == self.id && reference == self.ref_id).then_some((self.id, self.view))
+        }
+
+        fn target(&self, from: BodyId, reference: RefId) -> Option<Target> {
+            (from == self.id && reference == self.ref_id).then_some(Target::Func(self.id))
+        }
+    }
+
+    struct TwoBodyBank<'a> {
+        driver_id: BodyId,
+        driver_to_dc: RefId,
+        dc_id: BodyId,
+        dc_self_ref: RefId,
+        dc_view: View<'a>,
+    }
+
+    impl Bodies for TwoBodyBank<'_> {
+        fn callee(&self, from: BodyId, reference: RefId) -> Option<(BodyId, View<'_>)> {
+            if (from == self.driver_id && reference == self.driver_to_dc)
+                || (from == self.dc_id && reference == self.dc_self_ref)
+            {
+                return Some((self.dc_id, self.dc_view));
+            }
+            None
+        }
+
+        fn target(&self, from: BodyId, reference: RefId) -> Option<Target> {
+            if (from == self.driver_id && reference == self.driver_to_dc)
+                || (from == self.dc_id && reference == self.dc_self_ref)
+            {
+                return Some(Target::Func(self.dc_id));
+            }
+            None
+        }
+    }
+
+    #[test]
+    fn self_tce_turns_tail_recursive_sum_into_loop_and_matches_eval() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let self_ref = b.reference(RefKind::Func, 0);
+        let [entry, done, recurse] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let n = b.param(Ty::I64);
+        let acc = b.param(Ty::I64);
+        let zero = b.iconst(Ty::I64, 0);
+        let is_zero = b.icmp(IntCond::Eq, n, zero);
+        b.br(Flags::NONE, is_zero, (done, &[]), (recurse, &[]));
+
+        b.begin(done);
+        b.ret(&[acc]);
+
+        b.begin(recurse);
+        let one = b.iconst(Ty::I64, 1);
+        let next_n = b.binary(Op::Sub, Flags::NONE, n, one);
+        let next_acc = b.binary(Op::Add, Flags::NONE, acc, n);
+        let res = b.call(Flags::NONE, self_ref, sig, &[next_n, next_acc]);
+        b.ret(&[res]);
+
+        let func = b.finish_checked().unwrap();
+        let self_id = BodyId([1u8; 32]);
+        let bank = SingleSelfBodies { id: self_id, ref_id: self_ref, view: func.view() };
+
+        let out = eliminate_self_tail_calls(func.view(), self_id, &bank, alloc).unwrap();
+        assert_eq!(out.stats.tail_calls_eliminated, 1);
+        verify(out.func.view()).unwrap();
+
+        let call_count = (0..out.func.view().len())
+            .filter(|&i| out.func.view().op(i) == Op::Call)
+            .count();
+        assert_eq!(call_count, 0, "expected direct self-tail-call eliminated into a loop");
+
+        for &(nv, accv) in &[(0u64, 5u64), (1, 0), (10, 0), (25, 100)] {
+            let args = [Val::Int(u128::from(nv)), Val::Int(u128::from(accv))];
+            let before = eval::run_calls_in(func.view(), self_id, &args, 100_000, &bank, alloc).unwrap();
+            let after = eval::run_in(out.func.view(), &args, 100_000, alloc).unwrap();
+            assert_eq!(before, after, "tail-recursive sum mismatch on ({nv}, {accv})");
+            let expected = accv + nv * (nv + 1) / 2;
+            match after {
+                Outcome::Returned(vals) => assert_eq!(vals.as_slice(), &[Val::Int(u128::from(expected))]),
+                other => panic!("expected Returned, got {other:?}"),
+            }
+        }
+
+        // Also verify `lto_optimize_module` itself eliminates the direct self-tail-call.
+        let mut plain_module = OwnVec::with_capacity_in(1, alloc);
+        plain_module.push(ModuleBody { id: self_id, func: func.view().to_func_in(alloc) });
+        let plain_lto = lto_optimize_module(
+            plain_module,
+            &bank,
+            &NoWeights,
+            InlinePolicy::default(),
+            alloc,
+        )
+        .unwrap();
+        let plain_view = plain_lto.bodies.first().expect("one body").func.view();
+        verify(plain_view).unwrap();
+        let plain_calls = (0..plain_view.len()).filter(|&i| plain_view.op(i) == Op::Call).count();
+        assert_eq!(plain_calls, 0, "expected lto_optimize_module to eliminate self-tail-call");
+        let after_plain = eval::run_in(plain_view, &[Val::Int(25), Val::Int(100)], 100_000, alloc).unwrap();
+        assert_eq!(
+            after_plain,
+            eval::run_calls_in(func.view(), self_id, &[Val::Int(25), Val::Int(100)], 100_000, &bank, alloc).unwrap()
+        );
+
+        // Also verify `lto_optimize_module_sota` eliminates the self-tail-call end-to-end.
+        let mut module = OwnVec::with_capacity_in(1, alloc);
+        module.push(ModuleBody { id: self_id, func: func.view().to_func_in(alloc) });
+        let lto = lto_optimize_module_sota(
+            module,
+            &bank,
+            &NoWeights,
+            &NoIndirectProfiles,
+            InlinePolicy::default(),
+            SotaLtoOpts::default(),
+            alloc,
+        )
+        .unwrap();
+        let lto_view = lto.bodies[0].func.view();
+        verify(lto_view).unwrap();
+        let lto_calls = (0..lto_view.len()).filter(|&i| lto_view.op(i) == Op::Call).count();
+        assert_eq!(lto_calls, 0, "expected lto_optimize_module_sota to eliminate self-tail-call");
+        let after_lto = eval::run_in(lto_view, &[Val::Int(25), Val::Int(100)], 100_000, alloc).unwrap();
+        assert_eq!(
+            after_lto,
+            eval::run_calls_in(func.view(), self_id, &[Val::Int(25), Val::Int(100)], 100_000, &bank, alloc).unwrap()
+        );
+    }
+
+    #[test]
+    fn self_tce_divide_and_conquer_keeps_first_call_eliminates_tail_call_with_memmove_slot() {
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Build `dc(ptr: PTR, lo: I64, hi: I64) -> ()`:
+        //   if lo >= hi { return; }
+        //   swap(ptr[lo], ptr[hi]) using a local non-escaping 8-byte StackSlot + Op::Memmove;
+        //   mid = (lo + hi) >> 1;
+        //   dc(ptr, lo, mid);      // non-tail self-call (MUST remain Op::Call)
+        //   dc(ptr, mid + 1, hi);  // tail self-call (MUST become loop back-edge)
+        //   slot_dead(tmp);
+        //   return;
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let dc_sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[],
+        );
+        b.set_signature(dc_sig);
+        let dc_self_ref = b.reference(RefKind::Func, 0);
+        let tmp_slot = b.slot(8, 3, SlotKind::Temp);
+        let [entry, done, work] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let ptr = b.param(Ty::PTR);
+        let lo = b.param(Ty::I64);
+        let hi = b.param(Ty::I64);
+        let base_case = b.icmp(IntCond::Uge, lo, hi);
+        b.br(Flags::NONE, base_case, (done, &[]), (work, &[]));
+
+        b.begin(done);
+        b.ret(&[]);
+
+        b.begin(work);
+        let tmp_ptr = b.slot_addr(tmp_slot);
+        let c8 = b.iconst(Ty::I64, 8);
+        let lo_off = b.binary(Op::Mul, Flags::NONE, lo, c8);
+        let hi_off = b.binary(Op::Mul, Flags::NONE, hi, c8);
+        let p_lo = b.ptr_add(Flags::NONE, ptr, lo_off);
+        let p_hi = b.ptr_add(Flags::NONE, ptr, hi_off);
+        b.bulk(Op::Memmove, Flags::NONE, tmp_ptr, p_lo, c8, MemAttrs::aligned(3));
+        b.bulk(Op::Memmove, Flags::NONE, p_lo, p_hi, c8, MemAttrs::aligned(3));
+        b.bulk(Op::Memmove, Flags::NONE, p_hi, tmp_ptr, c8, MemAttrs::aligned(3));
+        let sum = b.binary(Op::Add, Flags::NONE, lo, hi);
+        let one = b.iconst(Ty::I64, 1);
+        let mid = b.binary(Op::Lshr, Flags::NONE, sum, one);
+        let mid_plus_1 = b.binary(Op::Add, Flags::NONE, mid, one);
+        // Non-tail first recursive call:
+        b.call(Flags::NONE, dc_self_ref, dc_sig, &[ptr, lo, mid]);
+        // Tail second recursive call:
+        b.call(Flags::NONE, dc_self_ref, dc_sig, &[ptr, mid_plus_1, hi]);
+        b.slot_dead(tmp_slot);
+        b.ret(&[]);
+
+        let dc_func = b.finish_checked().unwrap();
+        let dc_id = BodyId([2u8; 32]);
+        let self_bank = SingleSelfBodies { id: dc_id, ref_id: dc_self_ref, view: dc_func.view() };
+
+        let out = eliminate_self_tail_calls(dc_func.view(), dc_id, &self_bank, alloc).unwrap();
+        assert_eq!(out.stats.tail_calls_eliminated, 1);
+        verify(out.func.view()).unwrap();
+
+        let calls_after = (0..out.func.view().len())
+            .filter(|&i| out.func.view().op(i) == Op::Call)
+            .count();
+        assert_eq!(
+            calls_after, 1,
+            "expected ONLY the second (tail) self-call eliminated while keeping the first non-tail self-call"
+        );
+
+        // Build driver `run_dc(n: i64) -> i64` that initializes an 8-element u64 array on stack,
+        // invokes `dc(arr, 0, n - 1)`, and returns a position-weighted checksum.
+        let mut d = Builder::<_, Full>::new_in(64, alloc);
+        let driver_sig = d.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        d.set_signature(driver_sig);
+        let d_dc_sig = d.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[],
+        );
+        let d_dc_ref = d.reference(RefKind::Func, 1);
+        let arr_slot = d.slot(64, 3, SlotKind::Named);
+        let d_entry = d.create_block(BlockKind::Normal);
+        d.begin(d_entry);
+        let n = d.param(Ty::I64);
+        let arr = d.slot_addr(arr_slot);
+        for k in 0..8u64 {
+            let v = d.iconst(Ty::I64, u128::from((k * 13 + 7) ^ 0x5a));
+            d.store(Flags::NONE, v, arr, (k * 8) as i32, MemAttrs::aligned(3));
+        }
+        let zero = d.iconst(Ty::I64, 0);
+        let one = d.iconst(Ty::I64, 1);
+        let last = d.binary(Op::Sub, Flags::NONE, n, one);
+        d.call(Flags::NONE, d_dc_ref, d_dc_sig, &[arr, zero, last]);
+        let mut acc = d.iconst(Ty::I64, 0);
+        for k in 0..8u64 {
+            let elem = d.load(Ty::I64, Flags::NONE, arr, (k * 8) as i32, MemAttrs::aligned(3));
+            let w = d.iconst(Ty::I64, u128::from(k + 1));
+            let term = d.binary(Op::Mul, Flags::NONE, elem, w);
+            acc = d.binary(Op::Add, Flags::NONE, acc, term);
+        }
+        d.ret(&[acc]);
+        let driver_func = d.finish_checked().unwrap();
+
+        let driver_id = BodyId([3u8; 32]);
+        let bank_before = TwoBodyBank {
+            driver_id,
+            driver_to_dc: d_dc_ref,
+            dc_id,
+            dc_self_ref,
+            dc_view: dc_func.view(),
+        };
+        let bank_after = TwoBodyBank {
+            driver_id,
+            driver_to_dc: d_dc_ref,
+            dc_id,
+            dc_self_ref,
+            dc_view: out.func.view(),
+        };
+
+        for nv in [1u64, 2, 4, 6, 8] {
+            let args = [Val::Int(u128::from(nv))];
+            let before = eval::run_calls_in(driver_func.view(), driver_id, &args, 100_000, &bank_before, alloc).unwrap();
+            let after = eval::run_calls_in(driver_func.view(), driver_id, &args, 100_000, &bank_after, alloc).unwrap();
+            assert_eq!(before, after, "divide-and-conquer TCE mismatch for n={nv}");
+        }
+    }
+
+    #[test]
+    fn self_tce_skips_when_slot_addr_escapes_into_tail_call_argument() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let self_ref = b.reference(RefKind::Func, 0);
+        let local_slot = b.slot(8, 3, SlotKind::Named);
+        let [entry, done, recurse] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let p = b.param(Ty::PTR);
+        let n = b.param(Ty::I64);
+        let sp = b.slot_addr(local_slot);
+        b.store(Flags::NONE, n, sp, 0, MemAttrs::aligned(3));
+        let zero = b.iconst(Ty::I64, 0);
+        let is_zero = b.icmp(IntCond::Eq, n, zero);
+        b.br(Flags::NONE, is_zero, (done, &[]), (recurse, &[]));
+
+        b.begin(done);
+        let loaded = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+        b.ret(&[loaded]);
+
+        b.begin(recurse);
+        let one = b.iconst(Ty::I64, 1);
+        let next_n = b.binary(Op::Sub, Flags::NONE, n, one);
+        // Passes local `SlotAddr` as an argument to the self-tail-call -> MUST NOT fire TCE!
+        let res = b.call(Flags::NONE, self_ref, sig, &[sp, next_n]);
+        b.ret(&[res]);
+
+        let func = b.finish_checked().unwrap();
+        let self_id = BodyId([4u8; 32]);
+        let bank = SingleSelfBodies { id: self_id, ref_id: self_ref, view: func.view() };
+
+        let out = eliminate_self_tail_calls(func.view(), self_id, &bank, alloc).unwrap();
+        assert_eq!(
+            out.stats.tail_calls_eliminated, 0,
+            "TCE must NOT fire when a local StackSlot address escapes into a self-tail-call argument"
+        );
+        let call_count = (0..out.func.view().len())
+            .filter(|&i| out.func.view().op(i) == Op::Call)
+            .count();
+        assert_eq!(call_count, 1);
+    }
 }

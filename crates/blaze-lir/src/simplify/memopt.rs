@@ -25,6 +25,7 @@ use super::{
 use crate::{
     Block, Flags, Func, Op, Ty, View,
     arith::{iconst_value, wide_value},
+    func::MemAttrsRec,
     verify,
 };
 
@@ -112,6 +113,167 @@ fn const_i64(view: &View<'_>, inst: usize) -> Option<i64> {
         _ => return None,
     };
     Some(trunc_u64(v).cast_signed())
+}
+
+#[inline]
+fn const_u64(view: &View<'_>, inst: usize) -> Option<u64> {
+    let ty = Ty(view.tys.get(inst).copied()?);
+    if !ty.is_scalar() || !ty.is_int() {
+        return None;
+    }
+    let width = ty.bits(view.head.ptr_bits);
+    let v = match view.op(inst) {
+        Op::Iconst => iconst_value(view.data.get(inst).copied()?, width),
+        Op::IconstWide => {
+            let at = to_idx(view.data.get(inst).copied()?);
+            let end = at.checked_add(to_idx(ty.const_words()))?;
+            wide_value(view.extra.get(at..end)?, width)
+        }
+        _ => return None,
+    };
+    u64::try_from(v).ok()
+}
+
+#[inline]
+fn op_byte(op: Op) -> u8 {
+    Op::ALL.iter().position(|&o| o == op).and_then(|i| u8::try_from(i).ok()).unwrap_or(0)
+}
+
+#[inline]
+fn small_memop_ty(view: &View<'_>, inst: usize) -> Option<Ty> {
+    if !matches!(view.op(inst), Op::Memcpy | Op::Memmove) {
+        return None;
+    }
+    if Flags(at_u8(view.flags, inst)).contains(Flags::VOLATILE) {
+        return None;
+    }
+    let at = to_idx(at_u32(view.data, inst));
+    let len_val = at_u32(view.extra, at.checked_add(2)?);
+    match const_u64(view, to_idx(len_val))? {
+        1 => Some(Ty::I8),
+        2 => Some(Ty::I16),
+        4 => Some(Ty::I32),
+        8 => Some(Ty::I64),
+        _ => None,
+    }
+}
+
+fn intern_align_attr<A: Allocator>(func: &mut Func<A>, align: u8) -> u32 {
+    if align == 0 {
+        return 0;
+    }
+    let rec = MemAttrsRec { range: 0, align, src_align: 0, pointee_align: 0, bits: 0 };
+    if let Some(pos) = func.mem_attrs.iter().position(|it| *it == rec) {
+        return to_u32(pos).saturating_add(1);
+    }
+    let row = to_u32(func.mem_attrs.len());
+    func.mem_attrs.push(rec);
+    row.saturating_add(1)
+}
+
+/// Scalarizes non-volatile `Op::Memcpy` and `Op::Memmove` instructions with constant length
+/// `1`, `2`, `4`, or `8` bytes into an overlap-safe `Op::Load` + `Op::Store` pair (`Ty::I8`,
+/// `Ty::I16`, `Ty::I32`, `Ty::I64`).
+///
+/// Returns `Ok(None)` with zero heap allocations when no eligible instruction exists.
+pub fn scalarize_small_memops<A: Allocator + Copy>(
+    view: View<'_>,
+    alloc: A,
+) -> Result<Option<Func<A>>, SimplifyError> {
+    let len = view.len();
+    let mut has_small = false;
+    for inst in 0..len {
+        if small_memop_ty(&view, inst).is_some() {
+            has_small = true;
+            break;
+        }
+    }
+    if !has_small {
+        return Ok(None);
+    }
+
+    // Pass 1: precompute the exact old->new instruction index map in layout order so any
+    // non-RPO forward value reference resolves in O(1) without a fixup pass.
+    let mut val_map = filled(len, NONE, &alloc);
+    let mut next_idx: usize = 0;
+    for inst in 0..len {
+        if small_memop_ty(&view, inst).is_some() {
+            // `Memcpy`/`Memmove` produces no value (`Ty::NONE`) and expands to `Load` + `Store`.
+            next_idx = next_idx.saturating_add(2);
+        } else {
+            set_at(&mut val_map, inst, to_u32(next_idx));
+            next_idx = next_idx.saturating_add(1);
+        }
+    }
+    if next_idx >= to_idx(NONE) {
+        return Err(SimplifyError::Refused { inst: 0, what: "more values than LIR numbers" });
+    }
+
+    // Pass 2: rebuild instructions, replacing each matching bulk op with `Load(ty, src)` +
+    // `Store(val, dst)`. Because the full `k`-byte load finishes into an SSA value before the
+    // store writes a single byte, this is overlap-safe even for `Op::Memmove`.
+    let mut func = view.to_func_in(alloc);
+    func.ops.clear();
+    func.flags.clear();
+    func.tys.clear();
+    func.data.clear();
+    func.extra.clear();
+    func.attrs.clear();
+    func.locs.clear();
+    func.block_starts.clear();
+    func.block_kinds.clear();
+
+    let load_op = op_byte(Op::Load);
+    let store_op = op_byte(Op::Store);
+    let blocks = view.blocks();
+    for b in 0..blocks {
+        let b32 = to_u32(b);
+        func.block_starts.push(to_u32(func.ops.len()));
+        func.block_kinds.push(at_u8(view.block_kinds, b));
+        for inst in view.block(Block(b32)) {
+            if let Some(ty) = small_memop_ty(&view, inst) {
+                let at = to_idx(at_u32(view.data, inst));
+                let old_dst = at_u32(view.extra, at);
+                let old_src = at_u32(view.extra, at.saturating_add(1));
+                let new_dst = at_u32(&val_map, to_idx(old_dst));
+                let new_src = at_u32(&val_map, to_idx(old_src));
+                let loc = at_u32(view.locs, inst);
+                let (dst_align, src_align) = match view.mem_attrs(inst) {
+                    Some(m) => (m.align, m.src_align),
+                    None => (0, 0),
+                };
+                let load_attr = intern_align_attr(&mut func, src_align);
+                let store_attr = intern_align_attr(&mut func, dst_align);
+
+                let load_extra = to_u32(func.extra.len());
+                func.extra.push(new_src);
+                func.extra.push(0);
+                let load_idx = to_u32(func.ops.len());
+                func.ops.push(load_op);
+                func.flags.push(Flags::NONE.0);
+                func.tys.push(ty.0);
+                func.data.push(load_extra);
+                func.attrs.push(load_attr);
+                func.locs.push(loc);
+
+                let store_extra = to_u32(func.extra.len());
+                func.extra.push(load_idx);
+                func.extra.push(new_dst);
+                func.extra.push(0);
+                func.ops.push(store_op);
+                func.flags.push(Flags::NONE.0);
+                func.tys.push(Ty::NONE.0);
+                func.data.push(store_extra);
+                func.attrs.push(store_attr);
+                func.locs.push(loc);
+            } else {
+                let _ = copy_inst_same_blocks(&view, inst, &val_map, &mut func);
+            }
+        }
+    }
+
+    verify(func.view()).map_err(SimplifyError::Verify)?;
+    Ok(Some(func))
 }
 
 #[inline]
@@ -901,5 +1063,169 @@ mod tests {
             out.stats.loads_hoisted, 0,
             "load from [slot+0] must NOT hoist across dynamic PtrAdd(slot, i) store"
         );
+    }
+
+    #[test]
+    fn scalarize_small_memops_rewrites_swap_and_enables_sroa() {
+        use crate::{
+            eval::{Bodies, BodyId, Outcome, Val, run_calls_in, run_in},
+            func::{RefId, RefKind},
+        };
+
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Build a `slice::swap`-style function using a local 8-byte `StackSlot` and 3
+        // `Op::Memmove(..., 8)` calls (`tmp <- p`, `p <- q`, `q <- tmp`).
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let swap_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+        b.set_signature(swap_sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let p = b.param(Ty::PTR);
+        let q = b.param(Ty::PTR);
+        let tmp = b.slot(8, 3, SlotKind::Temp);
+        let tp = b.slot_addr(tmp);
+        let eight = b.iconst(Ty::I64, 8);
+        let aligned8 = MemAttrs { align: 3, src_align: 3, pointee_align: 0, bits: 0, range: None };
+        let dst_only = MemAttrs::aligned(3);
+        b.bulk(Op::Memmove, Flags::NONE, tp, p, eight, dst_only);
+        b.bulk(Op::Memmove, Flags::NONE, p, q, eight, aligned8);
+        b.bulk(Op::Memmove, Flags::NONE, q, tp, eight, aligned8);
+        b.ret(&[]);
+        let swap_fn = b.finish_checked().expect("valid swap input");
+
+        // Run `scalarize_small_memops` -> `scalar_replace` -> `aegraph_optimize`.
+        let scalarized = scalarize_small_memops(swap_fn.view(), alloc)
+            .expect("scalarize_small_memops succeeds")
+            .expect("must scalarize 8-byte memmove");
+        // First `Memmove` had `src_align == 0`: emitted `Load` must not over-claim alignment.
+        let first_load = (0..scalarized.view().len())
+            .find(|&i| scalarized.view().op(i) == Op::Load)
+            .expect("must emit Load");
+        assert_eq!(scalarized.view().attrs.get(first_load).copied(), Some(0));
+
+        let after_sroa = super::super::scalar_replace(scalarized.view(), alloc).expect("sroa succeeds");
+        let after_ae = super::super::egraph::aegraph_optimize(after_sroa.view(), alloc)
+            .expect("aegraph succeeds")
+            .func;
+        verify(after_ae.view()).expect("optimized swap verifies");
+        assert!(after_ae.slots.is_empty(), "swap temp stack slot must be eliminated by SROA");
+        for inst in 0..after_ae.view().len() {
+            let op = after_ae.view().op(inst);
+            assert_ne!(op, Op::Memmove, "no Op::Memmove may remain after scalarize + sroa + aegraph");
+            assert_ne!(op, Op::SlotAddr, "no Op::SlotAddr may remain after scalarize + sroa + aegraph");
+        }
+
+        // Caller `driver(a0, a1, same)` swaps `arr[0]` and `arr[same ? 0 : 1]` via `swap(p, q)`,
+        // exercising both distinct (`i != j`) and overlapping (`i == j`) pointers.
+        let mut db = Builder::<_, Full>::new_in(64, alloc);
+        let drv_sig = db.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I1)],
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+        );
+        db.set_signature(drv_sig);
+        let callee_sig = db.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+        let callee = db.reference(RefKind::Func, 0);
+        let d_entry = db.create_block(BlockKind::Normal);
+        db.begin(d_entry);
+        let a0 = db.param(Ty::I64);
+        let a1 = db.param(Ty::I64);
+        let same = db.param(Ty::I1);
+        let arr = db.slot(16, 3, SlotKind::Named);
+        let base = db.slot_addr(arr);
+        db.store(Flags::NONE, a0, base, 0, MemAttrs::aligned(3));
+        db.store(Flags::NONE, a1, base, 8, MemAttrs::aligned(3));
+        let off8 = db.iconst(Ty::I64, 8);
+        let p1 = db.ptr_add(Flags::NONE, base, off8);
+        let q_ptr = db.select(Flags::NONE, same, base, p1);
+        let _ = db.call(Flags::NONE, callee, callee_sig, &[base, q_ptr]);
+        let r0 = db.load(Ty::I64, Flags::NONE, base, 0, MemAttrs::aligned(3));
+        let r1 = db.load(Ty::I64, Flags::NONE, base, 8, MemAttrs::aligned(3));
+        db.ret(&[r0, r1]);
+        let driver = db.finish_checked().expect("valid driver");
+
+        struct OneCallee<'a> {
+            view: View<'a>,
+        }
+        impl Bodies for OneCallee<'_> {
+            fn callee(&self, _from: BodyId, reference: RefId) -> Option<(BodyId, View<'_>)> {
+                match reference {
+                    RefId(0) => Some((BodyId([2; 32]), self.view)),
+                    _ => None,
+                }
+            }
+        }
+
+        let root = BodyId([1; 32]);
+        let fuel = 10_000;
+        let x: u128 = 0x1111_2222_3333_4444;
+        let y: u128 = 0xAAAA_BBBB_CCCC_DDDD;
+        for (same_flag, want0, want1) in [(0u128, y, x), (1u128, x, y)] {
+            let args = [Val::Int(x), Val::Int(y), Val::Int(same_flag)];
+            let before =
+                run_calls_in(driver.view(), root, &args, fuel, &OneCallee { view: swap_fn.view() }, alloc)
+                    .expect("eval unoptimized swap");
+            let after =
+                run_calls_in(driver.view(), root, &args, fuel, &OneCallee { view: after_ae.view() }, alloc)
+                    .expect("eval optimized swap");
+            assert_eq!(before, after, "swap mismatch for same={same_flag}");
+            assert!(
+                matches!(after, Outcome::Returned(ref vals) if vals.as_slice() == [Val::Int(want0), Val::Int(want1)]),
+                "unexpected swap result for same={same_flag}: {after:?}"
+            );
+        }
+
+        // Also test direct partial-overlap `Op::Memmove(buf + 4, buf + 0, 8)` via `eval::run_in`.
+        let mut ob = Builder::<_, Full>::new_in(64, alloc);
+        let ov_sig = ob.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        ob.set_signature(ov_sig);
+        let o_entry = ob.create_block(BlockKind::Normal);
+        ob.begin(o_entry);
+        let val = ob.param(Ty::I64);
+        let buf = ob.slot(12, 2, SlotKind::Named);
+        let bp = ob.slot_addr(buf);
+        ob.store(Flags::NONE, val, bp, 0, MemAttrs::aligned(2));
+        let off4 = ob.iconst(Ty::I64, 4);
+        let dst4 = ob.ptr_add(Flags::NONE, bp, off4);
+        let len8 = ob.iconst(Ty::I64, 8);
+        let al4 = MemAttrs { align: 2, src_align: 2, pointee_align: 0, bits: 0, range: None };
+        ob.bulk(Op::Memmove, Flags::NONE, dst4, bp, len8, al4);
+        let moved = ob.load(Ty::I64, Flags::NONE, dst4, 0, MemAttrs::aligned(2));
+        ob.ret(&[moved]);
+        let ov_fn = ob.finish_checked().expect("valid overlap fn");
+        let ov_opt = scalarize_small_memops(ov_fn.view(), alloc)
+            .expect("scalarize overlap succeeds")
+            .expect("must scalarize overlap memmove");
+        let ov_before = run_in(ov_fn.view(), &[Val::Int(x)], fuel, alloc).expect("eval overlap before");
+        let ov_after = run_in(ov_opt.view(), &[Val::Int(x)], fuel, alloc).expect("eval overlap after");
+        assert_eq!(ov_before, ov_after);
+        assert!(matches!(ov_after, Outcome::Returned(ref vals) if vals.as_slice() == [Val::Int(x)]));
+    }
+
+    #[test]
+    fn scalarize_small_memops_skips_volatile_and_large_sizes() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let dst = b.param(Ty::PTR);
+        let src = b.param(Ty::PTR);
+        let len8 = b.iconst(Ty::I64, 8);
+        let len16 = b.iconst(Ty::I64, 16);
+        let len3 = b.iconst(Ty::I64, 3);
+        let attrs = MemAttrs { align: 3, src_align: 3, pointee_align: 0, bits: 0, range: None };
+        b.bulk(Op::Memmove, Flags::VOLATILE, dst, src, len8, attrs);
+        b.bulk(Op::Memmove, Flags::NONE, dst, src, len16, attrs);
+        b.bulk(Op::Memcpy, Flags::VOLATILE, dst, src, len8, attrs);
+        b.bulk(Op::Memcpy, Flags::NONE, dst, src, len3, attrs);
+        b.ret(&[]);
+        let func = b.finish_checked().expect("valid input");
+
+        let out = scalarize_small_memops(func.view(), alloc).expect("pass succeeds");
+        assert!(out.is_none(), "volatile 8B and non-1/2/4/8B memops must return Ok(None)");
     }
 }

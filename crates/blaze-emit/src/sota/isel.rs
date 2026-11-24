@@ -58,6 +58,8 @@ const MOST_SLOT_ALIGN: u8 = 12;
 const MOST_DATA_ALIGN: u8 = blaze_code::record::MOST_PART_ALIGN;
 /// Maximum byte length for `Sota`'s inline NEON 64B/iter `Memcpy`, 32B/instr `Memset`, and 16B/iter `Memcmp`.
 const SOTA_BULK_INLINE_MOST: u64 = 256;
+/// Maximum byte length for `Sota`'s inline overlap-safe NEON `Memmove` (load all into `V30`/`V31`, then store).
+const SOTA_MEMMOVE_INLINE_MOST: u64 = 32;
 
 #[inline]
 fn to_idx<T>(n: T) -> usize
@@ -549,6 +551,17 @@ fn extract_const_u64(view: &View<'_>, inst: usize) -> Option<u64> {
         }
         _ => None,
     }
+}
+
+/// Returns `Some(n)` when `inst` is an `Op::Memmove` with known constant byte length `n <= SOTA_MEMMOVE_INLINE_MOST`.
+#[inline]
+fn small_const_memmove_len(view: &View<'_>, inst: usize, const_u64: &[Option<u64>]) -> Option<u64> {
+    if view.op(inst) != Op::Memmove {
+        return None;
+    }
+    let at = to_idx(at_u32(view.data, inst));
+    let len_v = to_idx(at_u32(view.extra, at + 2));
+    at_opt(const_u64, len_v).filter(|&n| n <= SOTA_MEMMOVE_INLINE_MOST)
 }
 
 /// True iff an `I128` SSA value is provably zero in its upper 64 bits (`bits 64..128 == 0`).
@@ -4158,6 +4171,13 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         inc_u32(&mut imm_uses, len_v);
                     }
                 }
+                Op::Memmove => {
+                    let at = to_idx(at_u32(view.data, inst));
+                    let len_v = to_idx(at_u32(view.extra, at + 2));
+                    if at_opt(&const_u64, len_v).is_some_and(|n| n <= SOTA_MEMMOVE_INLINE_MOST) {
+                        inc_u32(&mut imm_uses, len_v);
+                    }
+                }
                 Op::Return => {
                     let at = to_idx(at_u32(view.data, inst));
                     let retc = to_idx(at_u32(view.extra, at));
@@ -4192,11 +4212,20 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
         }
     }
 
+    // Inline small constant `Op::Memmove` (`<= 32 B`) uses only reserved scratch (`X16`/`X17`/`V30`/`V31`)
+    // with zero call instructions and zero caller-saved clobbers; exclude those sites from regalloc's
+    // call-clobber / `has_calls` tracking while preserving `tail_calls` for `Op::Call`.
+    let mut regalloc_no_call: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(len, alloc);
+    for inst in 0..len {
+        let no_call = at_bool(&tail_calls, inst) || small_const_memmove_len(&view, inst, &const_u64).is_some();
+        regalloc_no_call.push(no_call);
+    }
+
     // 3. IPRA-aware Greedy Priority-Weighted Graph-Coloring Regalloc + True Constant Rematerialization!
     let reg_alloc = regalloc::allocate_with_ipra_and_order(
         &view,
         &skip_emit,
-        &tail_calls,
+        &regalloc_no_call,
         max_spill_slots,
         os,
         call_clobbers,
@@ -7691,10 +7720,82 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                     }
                 }
                 Op::Memmove => {
+                    // Overlap-safe inline NEON `memmove` for constant `len <= 32 B`: load ALL source bytes
+                    // into permanently reserved scratch `V30`/`V31` FIRST, then store ALL bytes to `dst`
+                    // SECOND (zero GPR pressure, zero call clobbers, exact for forward & backward overlap).
                     let at = to_idx(at_u32(view.data, inst));
                     let dst_v = at_u32(view.extra, at);
                     let src_v = at_u32(view.extra, at + 1);
                     let len_v = at_u32(view.extra, at + 2);
+                    if let Some(n) = small_const_memmove_len(&view, inst, &const_u64) {
+                        let orig_len = to_idx(n);
+                        if orig_len > 0 {
+                            let rdst = load_gpr(&mut words, dst_v, X16);
+                            let rsrc = load_gpr(&mut words, src_v, X17);
+                            match orig_len {
+                                1 => {
+                                    words.push(enc::fp_access(enc::ldr(Size::B, V30, rsrc, 0)));
+                                    words.push(enc::fp_access(enc::str(Size::B, V30, rdst, 0)));
+                                }
+                                2 => {
+                                    words.push(enc::fp_access(enc::ldr(Size::H, V30, rsrc, 0)));
+                                    words.push(enc::fp_access(enc::str(Size::H, V30, rdst, 0)));
+                                }
+                                3 => {
+                                    words.push(enc::fp_access(enc::ldr(Size::H, V30, rsrc, 0)));
+                                    words.push(enc::fp_access(enc::ldr(Size::B, V31, rsrc, 2)));
+                                    words.push(enc::fp_access(enc::str(Size::H, V30, rdst, 0)));
+                                    words.push(enc::fp_access(enc::str(Size::B, V31, rdst, 2)));
+                                }
+                                4 => {
+                                    words.push(enc::fp_access(enc::ldr(Size::W, V30, rsrc, 0)));
+                                    words.push(enc::fp_access(enc::str(Size::W, V30, rdst, 0)));
+                                }
+                                5..=7 => {
+                                    let tail = i32_of(orig_len - 4);
+                                    words.push(enc::fp_access(enc::ldr(Size::W, V30, rsrc, 0)));
+                                    words.push(enc::fp_access(enc::ldur(Size::W, V31, rsrc, tail)));
+                                    words.push(enc::fp_access(enc::str(Size::W, V30, rdst, 0)));
+                                    words.push(enc::fp_access(enc::stur(Size::W, V31, rdst, tail)));
+                                }
+                                8 => {
+                                    words.push(enc::fp_access(enc::ldr(Size::X, V30, rsrc, 0)));
+                                    words.push(enc::fp_access(enc::str(Size::X, V30, rdst, 0)));
+                                }
+                                9..=15 => {
+                                    let tail = i32_of(orig_len - 8);
+                                    words.push(enc::fp_access(enc::ldr(Size::X, V30, rsrc, 0)));
+                                    words.push(enc::fp_access(enc::ldur(Size::X, V31, rsrc, tail)));
+                                    words.push(enc::fp_access(enc::str(Size::X, V30, rdst, 0)));
+                                    words.push(enc::fp_access(enc::stur(Size::X, V31, rdst, tail)));
+                                }
+                                16 => {
+                                    words.push(enc::ldr_q(V30, rsrc, 0));
+                                    words.push(enc::str_q(V30, rdst, 0));
+                                }
+                                17..=23 | 25..=31 => {
+                                    let tail = i32_of(orig_len - 16);
+                                    words.push(enc::ldr_q(V30, rsrc, 0));
+                                    words.push(enc::ldur_q(V31, rsrc, tail));
+                                    words.push(enc::str_q(V30, rdst, 0));
+                                    words.push(enc::stur_q(V31, rdst, tail));
+                                }
+                                24 => {
+                                    words.push(enc::ldr_q(V30, rsrc, 0));
+                                    words.push(enc::fp_access(enc::ldr(Size::X, V31, rsrc, 2)));
+                                    words.push(enc::str_q(V30, rdst, 0));
+                                    words.push(enc::fp_access(enc::str(Size::X, V31, rdst, 2)));
+                                }
+                                32 => {
+                                    words.push(enc::ldp_q_off(V30, V31, rsrc, 0));
+                                    words.push(enc::stp_q_off(V30, V31, rdst, 0));
+                                }
+                                _ => {}
+                            }
+                        }
+                        inst += 1;
+                        continue;
+                    }
                     gpr_moves.clear();
                     const_edge_writes.clear();
                     for (k, arg_v) in [(X0, dst_v), (X1, src_v), (X2, len_v)] {
@@ -9259,22 +9360,25 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                             let is_cs = (19..=28).contains(&qr);
                                             let clobbered = ((prev + 1)..inst).any(|mid| {
                                                 let mop = view.op(mid);
-                                                (!is_cs
-                                                    && matches!(
-                                                        mop,
-                                                        Op::Call
-                                                            | Op::CallIndirect
-                                                            | Op::Memcpy
-                                                            | Op::Memmove
-                                                            | Op::Memset
-                                                            | Op::Memcmp
-                                                            | Op::Frem
-                                                            | Op::TlsAddr
-                                                            | Op::Udiv
-                                                            | Op::Sdiv
-                                                            | Op::Urem
-                                                            | Op::Srem
-                                                    ))
+                                                let mid_is_call = matches!(
+                                                    mop,
+                                                    Op::Call
+                                                        | Op::CallIndirect
+                                                        | Op::Frem
+                                                        | Op::TlsAddr
+                                                        | Op::Udiv
+                                                        | Op::Sdiv
+                                                        | Op::Urem
+                                                        | Op::Srem
+                                                ) || (matches!(mop, Op::Memcpy | Op::Memset | Op::Memcmp)
+                                                    && !at_opt(
+                                                        &const_u64,
+                                                        to_idx(at_u32(view.extra, to_idx(at_u32(view.data, mid)) + 2)),
+                                                    )
+                                                    .is_some_and(|n| n <= SOTA_BULK_INLINE_MOST))
+                                                    || (mop == Op::Memmove
+                                                        && small_const_memmove_len(&view, mid, &const_u64).is_none());
+                                                (!is_cs && mid_is_call)
                                                     || matches!(
                                                         at_loc(&reg_alloc.loc_of, mid),
                                                         AllocLoc::Gpr(r) if r == qr
@@ -12273,6 +12377,125 @@ mod tests {
                     assert_eq!(f(data.as_ptr(), len as u64, seed), want, "inverted={inverted} len={len}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn small_const_memmove_inlines_overlap_safe_and_frameless() {
+        let alloc = test_alloc();
+
+        // Every representative length in `0..=32` (exact powers of two, 24, and unaligned odd/tail sizes)
+        // must inline with ZERO call instructions, ZERO frame setup, ZERO relocations, and exact
+        // overlap-safe semantics for both forward (`dst > src`) and backward (`dst < src`) overlaps.
+        for &n in &[0usize, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 24, 31, 32] {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let len_c = b.iconst(Ty::I64, n as u128);
+            b.bulk(Op::Memmove, Flags::NONE, dst, src, len_c, MemAttrs::aligned(0));
+            b.ret(&[]);
+            let func = b.finish_checked().expect("small const memmove LIR builds");
+
+            let emitted = emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+                .expect("small const memmove emits");
+            let words = decode_words(&emitted.code, alloc);
+
+            assert!(
+                emitted.relocs.is_empty(),
+                "n={n}: inline memmove must emit ZERO relocations"
+            );
+            let has_call = words
+                .iter()
+                .any(|&w| (w & 0xfc00_0000) == 0x9400_0000 || (w & 0xffff_fc1f) == 0xd63f_0000);
+            assert!(!has_call, "n={n}: inline memmove must emit ZERO bl/blr calls");
+            assert!(
+                words.scan_for(&0xa9bf_7bfd).is_none(),
+                "n={n}: pure leaf inline memmove must NOT push fp/lr frame"
+            );
+
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let ex = exec_leaf(emitted);
+                let f: extern "C" fn(*mut u8, *const u8) = unsafe { ex.as_fn() };
+                let init: [u8; 128] = core::array::from_fn(|i| ((i.wrapping_mul(37).wrapping_add(13)) & 0xff) as u8);
+                let src_off = 32usize;
+                // Forward overlaps (`dst = src + k`), identical (`k = 0`), backward overlaps (`dst = src - k`),
+                // and disjoint copy (`dst = src + 40`).
+                let mut deltas: Vec<isize, Alloc<'static>> = Vec::new_in(alloc);
+                deltas.push(0);
+                deltas.push(40);
+                for k in 1..=n.min(8) {
+                    deltas.push(k as isize);
+                    deltas.push(-(k as isize));
+                }
+                for &delta in deltas.iter() {
+                    let dst_off = (src_off as isize + delta) as usize;
+                    let mut got = init;
+                    let mut want = init;
+                    want.copy_within(src_off..(src_off + n), dst_off);
+                    let base = got.as_mut_ptr();
+                    unsafe {
+                        f(base.add(dst_off), base.add(src_off));
+                    }
+                    assert_eq!(got, want, "n={n} delta={delta}: overlap-safe memmove mismatch");
+                }
+            }
+        }
+
+        // Caller-saved values live across an inlined 8-byte `Op::Memmove` (like `slice::swap`)
+        // must remain frameless with ZERO calls and preserve live GPR values intact.
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let dst = b.param(Ty::PTR);
+        let src = b.param(Ty::PTR);
+        let a = b.param(Ty::I64);
+        let bv = b.param(Ty::I64);
+        let c = b.param(Ty::I64);
+        let ab = b.binary(Op::Add, Flags::NONE, a, bv);
+        let t = b.binary(Op::Xor, Flags::NONE, ab, c);
+        let eight = b.iconst(Ty::I64, 8);
+        b.bulk(Op::Memmove, Flags::NONE, dst, src, eight, MemAttrs::aligned(0));
+        let s1 = b.binary(Op::Add, Flags::NONE, t, a);
+        let s2 = b.binary(Op::Add, Flags::NONE, s1, bv);
+        let res = b.binary(Op::Add, Flags::NONE, s2, c);
+        b.ret(&[res]);
+        let func = b.finish_checked().expect("live-across memmove LIR builds");
+
+        let emitted = emit_sota_a64(func.view(), &NoNames, CallMode::DirectBl, Machine::LSE, true, alloc)
+            .expect("live-across memmove emits");
+        let words = decode_words(&emitted.code, alloc);
+        let has_call = words
+            .iter()
+            .any(|&w| (w & 0xfc00_0000) == 0x9400_0000 || (w & 0xffff_fc1f) == 0xd63f_0000);
+        assert!(!has_call, "8-byte memmove with live caller-saved GPRs must emit ZERO calls");
+        assert!(
+            words.scan_for(&0xa9bf_7bfd).is_none(),
+            "8-byte memmove with live caller-saved GPRs must stay a frameless leaf"
+        );
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let ex = exec_leaf(emitted);
+            let f: extern "C" fn(*mut u8, *const u8, u64, u64, u64) -> u64 = unsafe { ex.as_fn() };
+            let mut buf = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+            let (av, bv, cv) = (0x1111_2222_3333_4444u64, 0x5555_6666_7777_8888, 0x9999_aaaa_bbbb_cccc);
+            let base = buf.as_mut_ptr();
+            let got_ret = unsafe { f(base.add(2), base, av, bv, cv) };
+            let want_ret = ((av.wrapping_add(bv)) ^ cv).wrapping_add(av).wrapping_add(bv).wrapping_add(cv);
+            assert_eq!(got_ret, want_ret);
+            assert_eq!(buf, [1, 2, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12]);
         }
     }
 }
