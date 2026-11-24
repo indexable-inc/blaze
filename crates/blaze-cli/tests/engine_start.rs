@@ -72,6 +72,10 @@ impl Said {
     }
 }
 
+fn pause_poll() {
+    std::thread::sleep(Duration::from_millis(10));
+}
+
 /// A scratch package of `files` and its home; `check` is given both, then they are removed.
 fn fixture<T>(name: &str, files: &[(&str, &str)], check: impl FnOnce(&Path, &Path) -> T) -> T {
     let base = fresh_home(name, true);
@@ -82,7 +86,15 @@ fn fixture<T>(name: &str, files: &[(&str, &str)], check: impl FnOnce(&Path, &Pat
         write(&dir, name, source);
     }
     let result = check(&dir, &home);
-    std::fs::remove_dir_all(&base).expect("remove the scratch command fixture");
+    // A detached `blaze gc --background` child may still be unlinking its lock file inside `home`.
+    for attempt in 0..100 {
+        match std::fs::remove_dir_all(&base) {
+            Ok(()) => break,
+            Err(_) if !base.exists() => break,
+            Err(_) if attempt + 1 < 100 => pause_poll(),
+            Err(err) => panic!("remove the scratch command fixture: {err}"),
+        }
+    }
     result
 }
 
@@ -118,7 +130,7 @@ fn blaze(dir: &Path, home: &Path, command: &str, args: &[&str]) -> Said {
             let _ = child.wait();
             panic!("`blaze {command}` past {DEADLINE:?} in {}: the command hung (rule 18)", dir.display());
         }
-        std::thread::sleep(Duration::from_millis(10));
+        pause_poll();
     };
     Said {
         stdout: std::fs::read_to_string(stdout).expect("read blaze's standard output"),

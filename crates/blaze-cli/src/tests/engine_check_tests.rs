@@ -60,6 +60,7 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
         names_oracle: crate::engine_names::NamesOracle::Off,
         driver: crate::engine_ready_edit::Driver::Phases,
         ready_plant: crate::engine_ready_edit::CommitPlant::None,
+        scope: crate::engine_check::CheckScope::Whole,
     }
 }
 
@@ -2431,4 +2432,71 @@ fn engine_why_reads_a_body_under_its_crates_edition() {
     let said = why(&io, "a/src/lib.rs::one");
     println!("why under 2024:\n{said}");
     assert!(said.contains("(read as edition 2024"), "why names the crate's edition, 2024: {said}");
+}
+
+/// SCOPED CHECK FOR `blaze test <member>` / `-p <pkg>`: checking only `a` (which depends on `dep`)
+/// skips unrelated broken sibling `b`, handles both an inline `#[cfg(test)]` body and a
+/// `#[cfg(test)] mod tests;` submodule in `dep` without ownerless bodies, hits its own scoped
+/// certificate on repeat, and never poisons the whole-workspace stored answer.
+#[test]
+fn engine_check_scoped_skips_unrelated_sibling_and_preserves_whole_answer() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    write(&io, "Cargo.toml", "[workspace]\nmembers = [\"dep\", \"a\", \"b\"]\nresolver = \"2\"\n");
+    write(&io, "dep/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(
+        &io,
+        "dep/src/lib.rs",
+        "#[cfg(test)]\nmod tests;\n\npub fn one() -> u8 {\n    1\n}\n\n#[cfg(test)]\nfn dep_inline_test() {\n    let _ = one();\n}\n",
+    );
+    write(&io, "dep/src/tests.rs", "pub fn dep_submod_helper() -> u8 {\n    super::one()\n}\n");
+    write(&io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n");
+    write(&io, "a/src/lib.rs", "pub fn two() -> u8 {\n    dep::one() + 1\n}\n");
+    write(&io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(&io, "b/src/lib.rs", "pub fn wrong() -> u8 {\n    true\n}\n");
+
+    // Verify scoped_root_name keeps Whole, Test, and Bin root names disjoint.
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let whole_root = crate::engine_answer::scoped_root_name("ws", crate::engine_check::CheckScope::Whole, cx.frame());
+    let test_root = crate::engine_answer::scoped_root_name(
+        "ws",
+        crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] },
+        cx.frame(),
+    );
+    let bin_root = crate::engine_answer::scoped_root_name(
+        "ws",
+        crate::engine_check::CheckScope::Bin { package: "a", root: "a/src/main.rs" },
+        cx.frame(),
+    );
+    assert_ne!(whole_root.as_str(), test_root.as_str(), "Whole and Test roots must be disjoint");
+    assert_ne!(whole_root.as_str(), bin_root.as_str(), "Whole and Bin roots must be disjoint");
+    assert_ne!(test_root.as_str(), bin_root.as_str(), "Test and Bin roots must be disjoint");
+
+    // 1. Scoped check on `a`: 0 findings (`b`'s type error is skipped), 0 ownerless bodies.
+    let mut scoped_opts = opts(&io, 2, false);
+    scoped_opts.scope = crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] };
+    let (scoped_ids, scoped) = engine_opts(&io, scoped_opts);
+    assert!(scoped_ids.is_empty(), "scoped check on `a` must not report `b`'s error: {scoped_ids:?}");
+    let scoped_bodies = scoped.stages[blaze_engine::Stage::Bodies.index()].entered;
+    assert_eq!(scoped_bodies, 3, "only `dep::one` (lib) and `a::two` (lib + lib-test) should be checked; got {scoped_bodies}");
+
+    // 2. Repeated scoped check on `a` hits its own scoped certificate (0 tasks entered).
+    let mut scoped_again_opts = opts(&io, 2, false);
+    scoped_again_opts.scope = crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] };
+    let (again_ids, again) = engine_opts(&io, scoped_again_opts);
+    assert!(again.certified, "repeated scoped check must hit its certificate");
+    assert_eq!(again.entered, 0, "certificate hit enters 0 tasks");
+    assert!(again_ids.is_empty(), "repeated scoped check still has 0 findings: {again_ids:?}");
+
+    // 3. Whole-workspace check right after scoped check was NOT poisoned and reports `b`'s error.
+    let (whole_ids, whole) = engine_from(&io, 2, false);
+    assert!(whole_ids.iter().any(|(code, _)| code == "types"), "whole-workspace check must report `b`'s types error: {whole_ids:?}");
+    let whole_bodies = whole.stages[blaze_engine::Stage::Bodies.index()].entered;
+    assert!(whole_bodies > scoped_bodies, "whole-workspace bodies ({whole_bodies}) must exceed scoped bodies ({scoped_bodies})");
+
+    // 4. Scoped check on `a` after whole-workspace check still hits its own clean certificate.
+    let mut after_whole_opts = opts(&io, 2, false);
+    after_whole_opts.scope = crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] };
+    let (after_ids, after) = engine_opts(&io, after_whole_opts);
+    assert!(after.certified, "scoped certificate remains valid after whole-workspace check");
+    assert!(after_ids.is_empty(), "scoped check stays clean after whole-workspace check: {after_ids:?}");
 }

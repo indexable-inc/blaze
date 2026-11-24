@@ -218,10 +218,13 @@ pub(crate) fn command(
     let line = crate::run_line::LineOpts { live: false, ..line };
     let lined = crate::run_line::watched(cx, err, clock, line, |watch, _bg| {
         watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
-        check_for_start(cx, Some(args), fs, env, net, host, rng, err, err, phases, heap, &flags, true, None, |standing, phases, _rng| {
+        check_for_start(cx, Some(args), fs, env, net, host, rng, err, err, phases, heap, &flags, true, crate::engine_check::StartScope::Bin(select), None, |standing, phases, _rng| {
             let (root, frame) = (standing.checkout, standing.frame);
             let select = run_package::Select { member: standing.member, ..select };
-            let picked = run_package::pick(cx, root, select, frame)?;
+            let picked = match standing.picked {
+                Some(picked) => picked,
+                None => run_package::pick(cx, root, select, frame)?,
+            };
             let summary = export_program(cx, standing, &picked, fs, output_flag, phases, watch)?;
             write_start_profile(cx, root, phases, frame)?;
             let wall_ns = phases.since(started_ns);

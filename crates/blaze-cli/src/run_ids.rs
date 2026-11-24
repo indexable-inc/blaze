@@ -655,12 +655,13 @@ pub(crate) struct UnitRoot {
 }
 
 /// Every member unit of `list` (its root in the checkout, tree 0) as a [`UnitRoot`], in the
-/// list's order, in `alloc`. A member whose root is not a checkout path (`/0/...`) is refused by
-/// name ([`RunIdsError::UnitRootOutside`]), never given another file.
-pub(crate) fn unit_roots<'n, 'a>(list: &CrateList<'n>, alloc: Alloc<'a>) -> Result<AVec<'a, UnitRoot>, RunIdsError<'n>> {
+/// list's order, in `alloc`. When `scoped` is `Some`, only active member units in that closure
+/// are returned. A member whose root is not a checkout path (`/0/...`) is refused by name
+/// ([`RunIdsError::UnitRootOutside`]), never given another file.
+pub(crate) fn unit_roots_scoped<'n, 'a>(list: &CrateList<'n>, scoped: Option<&crate::engine_check::ScopedUnits>, alloc: Alloc<'a>) -> Result<AVec<'a, UnitRoot>, RunIdsError<'n>> {
     let mut units: AVec<'a, UnitRoot> = Vec::new_in(alloc);
     for at in 0..CrateGraph::len(list) {
-        if !list.member(at) {
+        if !list.member(at) || scoped.is_some_and(|s| !s.allows(at)) {
             continue;
         }
         let root = list.root(at);
@@ -669,6 +670,11 @@ pub(crate) fn unit_roots<'n, 'a>(list: &CrateList<'n>, alloc: Alloc<'a>) -> Resu
         units.push(UnitRoot { root: Name::file(path.as_bytes()), view: crate::engine_body_plan::unit_view(list, at), prefix: key.prefix() });
     }
     Ok(units)
+}
+
+/// Every member unit of `list` (whole workspace).
+pub(crate) fn unit_roots<'n, 'a>(list: &CrateList<'n>, alloc: Alloc<'a>) -> Result<AVec<'a, UnitRoot>, RunIdsError<'n>> {
+    unit_roots_scoped(list, None, alloc)
 }
 
 /// The parts `edges` (sorted) list under the walked record `parent`.
@@ -775,14 +781,29 @@ fn views_of<'a>(edges: &[Edge], units: &[UnitRoot], alloc: Alloc<'a>) -> AVec<'a
 /// (O(names log names)); a record it does not know is a binary search of `previous`'s edges.
 /// The views: one point read of the answer per (body, unit reaching its file) ([`views_of`]),
 /// a store get for each that has a row.
+/// Which roots [`workspace_of_scoped`] starts its walk from: whole-workspace starts at
+/// `Name::units()`, scoped starts directly at the active member units' crate roots.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WalkFrom {
+    Workspace,
+    UnitRoots,
+}
+
 pub(crate) fn workspace_of<'a>(cx: &Cx, answer: &mut dyn Answer, tool: Tool, units: &[UnitRoot], previous: Option<&RunIds<'_>>, alloc: Alloc<'a>) -> Result<Walked<'a>, RunIdsError<'static>> {
+    workspace_of_scoped(cx, answer, tool, units, WalkFrom::Workspace, previous, alloc)
+}
+
+pub(crate) fn workspace_of_scoped<'a>(cx: &Cx, answer: &mut dyn Answer, tool: Tool, units: &[UnitRoot], from: WalkFrom, previous: Option<&RunIds<'_>>, alloc: Alloc<'a>) -> Result<Walked<'a>, RunIdsError<'static>> {
     let _cx = cx.span("run ids: the workspace bodies of the answer");
     let mut edges: AVec<'a, Edge> = Vec::new_in(alloc);
     let mut visited: AVec<'a, Name> = Vec::new_in(alloc);
     let mut frontier: AVec<'a, Name> = Vec::new_in(alloc);
     let mut next: AVec<'a, Name> = Vec::new_in(alloc);
     let mut checks: AVec<'a, Name> = Vec::new_in(alloc);
-    frontier.push(Name::units());
+    match from {
+        WalkFrom::Workspace => frontier.push(Name::units()),
+        WalkFrom::UnitRoots => frontier.extend(units.iter().map(|unit| unit.root)),
+    }
     while !frontier.is_empty() {
         frontier.sort_unstable();
         frontier.dedup();
@@ -845,6 +866,13 @@ pub(crate) fn workspace_of<'a>(cx: &Cx, answer: &mut dyn Answer, tool: Tool, uni
             for item in scratch.covers.iter().copied() {
                 bodies.push(WorkspaceBody { item, check, text: held.text, file: held.file });
             }
+            continue;
+        }
+        if from == WalkFrom::UnitRoots && check.kind == Kind::BodyCheck && previous.is_none() {
+            // Under a scoped check, cfg-aware planning (D191 `plan_views`) plans zero rows for a
+            // body cut by every active unit reaching its file (e.g. an inline `#[cfg(test)]` fn in
+            // a library dependency whose test harness is out of scope). Omitting it here is
+            // fail-closed: any call to an unlisted body is refused at runtime (`NotRunnable::NoRow`).
             continue;
         }
         let Some(previous) = previous else { return Err(RunIdsError::NotWalked { name: check }) };

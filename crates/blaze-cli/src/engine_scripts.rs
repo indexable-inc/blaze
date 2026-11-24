@@ -740,7 +740,18 @@ impl<'f> ScriptsStage<'f> {
 
     /// The stage's tasks: the lookups in wave 0, each run after its `links` producers. Nothing
     /// when the graph was not made (no lock, or its task failed): no crate then has names.
-    pub(crate) fn plan<'h>(&mut self, names: &NamesStage<'_>, discovered: &Discovered<'_>, tools: Tools, env: &FetchEnv<'_>, alloc: SharedAlloc<'h>, frame: &'f Frame) -> Result<SVec<'h, Planned>, CliError> {
+    /// When `scoped` is `Some`, only the build scripts (and their transitive `links` producers),
+    /// build-script modules, and proc-macro modules needed by crates in `scoped` are planned.
+    pub(crate) fn plan<'h>(
+        &mut self,
+        names: &NamesStage<'_>,
+        discovered: &Discovered<'_>,
+        tools: Tools,
+        env: &FetchEnv<'_>,
+        scoped: Option<&crate::engine_check::ScopedUnits>,
+        alloc: SharedAlloc<'h>,
+        frame: &'f Frame,
+    ) -> Result<SVec<'h, Planned>, CliError> {
         let mut planned = SVec::new_in(alloc);
         self.tools = Some(tools);
         let (Some(names), Some(graph)) = (names.names.as_ref(), discovered.get(Name::unit_graph())) else { return Ok(planned) };
@@ -752,10 +763,53 @@ impl<'f> ScriptsStage<'f> {
             reads.extend_from_slice(names);
             reads
         };
+        let scoped_sets = scoped.map(|scoped| {
+            use blaze_world::crate_list::CrateGraph as _;
+            let list = names.list();
+            let mut allowed_scripts: blaze_engine::SSet<'h, Name> = blaze_engine::SSet::new_in(alloc);
+            let mut stack: Vec<Name, &'f Frame> = Vec::new_in(frame);
+            let mut allowed_script_modules: blaze_engine::SSet<'h, ContentId> = blaze_engine::SSet::new_in(alloc);
+            let mut allowed_macro_modules: blaze_engine::SSet<'h, ContentId> = blaze_engine::SSet::new_in(alloc);
+            for at in 0..list.len() {
+                if !scoped.allows(at) {
+                    continue;
+                }
+                if list.proc_macro(at) {
+                    allowed_macro_modules.insert(crate::macros::subject_of(list.package(at), list.version(at)));
+                }
+                if let Some(script) = names.script_of(at)
+                    && allowed_scripts.insert(script)
+                {
+                    stack.push(script);
+                }
+                if let Some(module) = names.script_module_of(at) {
+                    allowed_script_modules.insert(module.subject);
+                }
+            }
+            while let Some(script) = stack.pop() {
+                if let Some(module) = names.script_readers(script).next().and_then(|at| names.script_module_of(at)) {
+                    allowed_script_modules.insert(module.subject);
+                }
+                if let Some(run) = names.script_run(script.subject) {
+                    for producer in run.producers() {
+                        let producer = Name::new(Kind::Script, ContentId(producer));
+                        if allowed_scripts.insert(producer) {
+                            stack.push(producer);
+                        }
+                    }
+                }
+            }
+            (allowed_scripts, allowed_script_modules, allowed_macro_modules)
+        });
         // Wave 0: the proc-macro crates' lookups (they read the graph) and the build scripts'
         // (they read nothing: their source holds the module store's listing).
         for part in record.parts.iter() {
             if let (Kind::MacroModule, Locate::Source(source)) = (part.name.kind, part.locate) {
+                if let Some((_, _, allowed_macros)) = &scoped_sets
+                    && !allowed_macros.contains(&part.name.subject)
+                {
+                    continue;
+                }
                 planned.push(Planned { name: part.name, phase: Phase::new(Stage::Scripts, 0), source, file: part.name });
                 self.reads.push((part.name, reads_only(&[unit_graph])));
             }
@@ -766,6 +820,11 @@ impl<'f> ScriptsStage<'f> {
                 continue;
             }
             last = Some(subject);
+            if let Some((_, allowed_modules, _)) = &scoped_sets
+                && !allowed_modules.contains(&subject)
+            {
+                continue;
+            }
             let name = crate::script_modules::name(subject);
             planned.push(Planned { name, phase: Phase::new(Stage::Scripts, 0), source: crate::script_modules::part_source(graph.source, subject), file: name });
             self.reads.push((name, reads_only(&[])));
@@ -775,6 +834,11 @@ impl<'f> ScriptsStage<'f> {
         // `ListFacts` wrote it from the graph): the runs the world's crates read, never every
         // unit of the graph on both sides, and no graph decoded to plan them.
         for (name, source) in crate::scripts::parts(names.script_keys(), crate::scripts::sdk_identity(env)) {
+            if let Some((allowed_scripts, _, _)) = &scoped_sets
+                && !allowed_scripts.contains(&name)
+            {
+                continue;
+            }
             let mut reads = reads_only(&[unit_graph]);
             if let Some(run) = names.script_run(name.subject) {
                 // Its module's lookup: the one its reading crate names (scripts.rs `job`).

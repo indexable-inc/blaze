@@ -537,9 +537,9 @@ pub(crate) struct FoundEdge {
 /// units may share `(root, test)` — for example a workspace library compiled for both
 /// `Side::Target` and `Side::Macro` (used by a member proc-macro) or under distinct feature sets.
 /// In `g`.
-pub(crate) fn found_units(list: &CrateList<'_>, g: blaze_own::Alloc<'static>) -> AVec<'static, (Name, bool, Name)> {
+pub(crate) fn found_units(list: &CrateList<'_>, scoped: Option<&crate::engine_check::ScopedUnits>, g: blaze_own::Alloc<'static>) -> AVec<'static, (Name, bool, Name)> {
     let mut units: AVec<'static, (Name, bool, Name)> = Vec::new_in(g);
-    for at in (0..CrateGraph::len(list)).filter(|at| list.member(*at)) {
+    for at in (0..CrateGraph::len(list)).filter(|at| list.member(*at) && scoped.is_none_or(|s| s.allows(*at))) {
         units.push((root_file(list, at), list.test(at), blaze_drive::key::crate_scope_name(&list.key(at))));
     }
     units.sort_unstable();
@@ -600,9 +600,9 @@ pub(crate) struct Reach {
 impl Reach {
     /// The member units of `list` in rank, each with its list row; their crates' names into
     /// `names`.
-    fn ranked(list: &CrateList<'_>, names: &mut AVec<'static, u8>, g: blaze_own::Alloc<'static>) -> AVec<'static, (usize, Reacher)> {
+    fn ranked(list: &CrateList<'_>, scoped: Option<&crate::engine_check::ScopedUnits>, names: &mut AVec<'static, u8>, g: blaze_own::Alloc<'static>) -> AVec<'static, (usize, Reacher)> {
         let mut units: AVec<'static, (usize, Reacher)> = Vec::new_in(g);
-        for at in (0..CrateGraph::len(list)).filter(|at| list.member(*at)) {
+        for at in (0..CrateGraph::len(list)).filter(|at| list.member(*at) && scoped.is_none_or(|s| s.allows(*at))) {
             let key = list.key(at);
             let from = u32::try_from(names.len()).unwrap_or(u32::MAX);
             names.extend_from_slice(CrateGraph::name(list, at).as_bytes());
@@ -642,9 +642,9 @@ impl Reach {
     /// what plan time knows of its `test` ([`reached_under`]), each (root, `test`) once (a lib
     /// with no build script and its test build walk one root twice, unless their found files
     /// differ: [`FoundEdge`]). `found`: every member unit's found files. In `g`.
-    pub(crate) fn walk(list: &CrateList<'_>, outlined: &[Outlined<'_>], found: &[FoundEdge], g: blaze_own::Alloc<'static>) -> Result<Reach, Unoutlined> {
+    pub(crate) fn walk(list: &CrateList<'_>, scoped: Option<&crate::engine_check::ScopedUnits>, outlined: &[Outlined<'_>], found: &[FoundEdge], g: blaze_own::Alloc<'static>) -> Result<Reach, Unoutlined> {
         let mut names: AVec<'static, u8> = Vec::new_in(g);
-        let ranked = Reach::ranked(list, &mut names, g);
+        let ranked = Reach::ranked(list, scoped, &mut names, g);
         let mut sorted: AVec<'static, FoundEdge> = Vec::with_capacity_in(found.len(), g);
         sorted.extend_from_slice(found);
         sorted.sort_unstable();
@@ -691,9 +691,9 @@ impl Reach {
     /// (engine_bodies.rs `groups`, [`Reach::disagrees`]). `found`: every member unit's found
     /// files, kept for the setup's walk ([`Reach::found_of`]); the record's files hold them already
     /// (the walk of its visit took them). In `g`.
-    pub(crate) fn of_members(list: &CrateList<'_>, members: &crate::engine_members_record::View<'_>, found: &[FoundEdge], g: blaze_own::Alloc<'static>) -> Result<Reach, ReachUnknown> {
+    pub(crate) fn of_members(list: &CrateList<'_>, scoped: Option<&crate::engine_check::ScopedUnits>, members: &crate::engine_members_record::View<'_>, found: &[FoundEdge], g: blaze_own::Alloc<'static>) -> Result<Reach, ReachUnknown> {
         let mut names: AVec<'static, u8> = Vec::new_in(g);
-        let ranked = Reach::ranked(list, &mut names, g);
+        let ranked = Reach::ranked(list, scoped, &mut names, g);
         let mut files: AVec<'static, (Name, u32)> = Vec::new_in(g);
         for (rank, (at, one)) in ranked.iter().enumerate() {
             let rank = u32::try_from(rank).unwrap_or(u32::MAX);

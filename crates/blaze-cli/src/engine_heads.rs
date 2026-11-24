@@ -119,12 +119,15 @@ use crate::work;
 /// A task's frame: its scope's records opened, its filing's scratch (blocks taken as used).
 const HEADS_FRAME: usize = 1 << 30;
 
-/// One `ImplBucket` task a crate of the names world (sorted by name).
-pub(crate) fn plan<'h>(names: &NamesStage<'_>, alloc: SharedAlloc<'h>) -> Result<SVec<'h, Planned>, CliError> {
+/// One `ImplBucket` task a crate of the names world (or the active scoped closure) (sorted by name).
+pub(crate) fn plan<'h>(names: &NamesStage<'_>, scoped: Option<&crate::engine_check::ScopedUnits>, alloc: SharedAlloc<'h>) -> Result<SVec<'h, Planned>, CliError> {
     let mut planned = SVec::new_in(alloc);
     let Some(world) = names.names.as_ref() else { return Ok(planned) };
     for (name, source) in crate::names::parts(world).iter() {
         let at = world.crate_at(name.subject).ok_or(EngineCheckError::MissingEntry { task: *name, table: crate::engine_check::Table::WorldCrates, key: *name })?;
+        if scoped.is_some_and(|s| !s.allows(at)) {
+            continue;
+        }
         // A crate with no check scope (refused by the list, or a dependency's proc macro kept for
         // its macros only) has no tables task: it could only fail, and no body asks a proc
         // macro's or a refused crate's impls (blaze-world check_scope.rs `has_check_scope`).
@@ -857,11 +860,14 @@ impl HeadsStage {
 /// answer keeps (`record`), so every body reads one shelf holding every crate. A crate whose
 /// task failed, or that has no row, is left off: a body asking it fails naming the crate
 /// (buckets/records.rs `NoTables`), never answered from less (rule 3).
-pub(crate) fn complete(cx: &Cx, store: &mut dyn crate::store::Store<'_>, names: &NamesStage<'_>, shelf: &mut ImplShelf, record: &dyn Fn(Name) -> Option<Key>, view: View<'_, '_>, frame: &Frame) -> Result<u32, CliError> {
+pub(crate) fn complete(cx: &Cx, store: &mut dyn crate::store::Store<'_>, names: &NamesStage<'_>, scoped: Option<&crate::engine_check::ScopedUnits>, shelf: &mut ImplShelf, record: &dyn Fn(Name) -> Option<Key>, view: View<'_, '_>, frame: &Frame) -> Result<u32, CliError> {
     let Some(world) = names.names.as_ref() else { return Ok(0) };
     let mut read_back = 0u32;
     let list = world.list();
     for r in 0..blaze_world::crate_list::CrateGraph::len(list) {
+        if scoped.is_some_and(|s| !s.allows(r)) {
+            continue;
+        }
         if !blaze_world::check_scope::has_check_scope(list, r) {
             continue;
         }
@@ -3079,7 +3085,7 @@ impl HeadsStage {
             cells,
             tasks: std::vec::Vec::new_in(Global),
         };
-        for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at)) {
+        for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at) && handles.scoped.is_none_or(|s| s.allows(*at))) {
             let root = list.root(member);
             let root_name = Name::file(root.strip_prefix("/0/").unwrap_or(root).as_bytes());
             let scope_name = blaze_drive::key::crate_scope_name(&list.key(member));
@@ -3214,7 +3220,7 @@ impl HeadsStage {
                     let no_member = no_member_cells.get_or_insert_with(|| {
                         let mut cells = Vec::new_in(g);
                         cells.push(graph_cell);
-                        for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at)) {
+                        for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at) && handles.scoped.is_none_or(|s| s.allows(*at))) {
                             let scope_name = blaze_drive::key::crate_scope_name(&list.key(member));
                             let prefix = list.key(member).prefix();
                             cells.push(crate::engine_body_plan::file_not_held_cell(view, scope_name, prefix));
@@ -3232,7 +3238,7 @@ impl HeadsStage {
                     let no_member = no_member_cells.get_or_insert_with(|| {
                         let mut cells = Vec::new_in(g);
                         cells.push(graph_cell);
-                        for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at)) {
+                        for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at) && handles.scoped.is_none_or(|s| s.allows(*at))) {
                             let scope_name = blaze_drive::key::crate_scope_name(&list.key(member));
                             let prefix = list.key(member).prefix();
                             cells.push(crate::engine_body_plan::file_not_held_cell(view, scope_name, prefix));

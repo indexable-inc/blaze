@@ -442,8 +442,9 @@ impl<'f> NamesStage<'f> {
         walk.ready[at].1
     }
 
-    /// One `CrateScope` task a crate of the world, at its depth (sorted by name).
-    pub(crate) fn plan<'h>(&self, alloc: SharedAlloc<'h>, _frame: &Frame) -> Result<SVec<'h, Planned>, CliError> {
+    /// One `CrateScope` task a crate of the world (or the active scoped closure), at its depth
+    /// (sorted by name).
+    pub(crate) fn plan<'h>(&self, scoped: Option<&crate::engine_check::ScopedUnits>, alloc: SharedAlloc<'h>, _frame: &Frame) -> Result<SVec<'h, Planned>, CliError> {
         let names = self.names.as_ref().ok_or(CliError::Text { what: "the names world, made by the planner, is gone (engine_names.rs `plan`)" })?;
         // Planned from the crate list: no world is made to plan (names.rs `made_or_make`).
         let list = names.list();
@@ -455,6 +456,9 @@ impl<'f> NamesStage<'f> {
         loop {
             let mut moved = false;
             for at in 0..count {
+                if scoped.is_some_and(|s| !s.allows(at)) {
+                    continue;
+                }
                 let deepest = edges_listed(list, at).map(|g| {
                     if rounds == 0 { plan[g].has_readers = true; }
                     plan[g].depth.saturating_add(1)
@@ -475,6 +479,9 @@ impl<'f> NamesStage<'f> {
         let mut planned = SVec::new_in(alloc);
         for (name, source) in crate::names::parts(names).iter() {
             let at = names.crate_at(name.subject).ok_or(EngineCheckError::MissingEntry { task: *name, table: Table::WorldCrates, key: *name })?;
+            if scoped.is_some_and(|s| !s.allows(at)) {
+                continue;
+            }
             planned.push(Planned { name: *name, phase: Phase::new(Stage::Names, plan[at].depth), source: *source, file: *name });
         }
         planned.sort_unstable_by_key(|one| one.name);
