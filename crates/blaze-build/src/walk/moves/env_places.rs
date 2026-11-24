@@ -181,11 +181,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// with `Drop` (E0509), more than 64 parts.
     fn move_env_part(&mut self, e: ExprId, f: EnvField) -> Result<(), BuildError> {
         let mask = self
-            .owned
-            .get(f.base.ix())
-            .copied()
-            .flatten()
-            .and_then(|o| o.rest)
+            .field_mask(f.base)
             .ok_or(malformed("a binding a closure moves a part of without field flags (`scan_env_moves` did not mark it)"))?;
         let start = self.moves.steps.len() as u32;
         for i in 0..f.len {

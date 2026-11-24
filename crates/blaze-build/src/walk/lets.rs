@@ -143,7 +143,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             s = inner;
         }
         match self.expr(s)? {
-            Expr::Local(p) if self.owned[p.ix()].is_some() && self.adjust_rows(init).is_empty() => {
+            Expr::Local(p) if self.local_drops(p) && self.adjust_rows(init).is_empty() => {
                 self.work.push(Task::Place(s));
             }
             // A place behind a pointer that needs drop (`if let Reach::Hosted = self.reach`):

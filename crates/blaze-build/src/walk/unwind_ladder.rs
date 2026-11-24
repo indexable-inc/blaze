@@ -186,7 +186,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         match h {
             Held::Rest { .. } | Held::Moved { .. } | Held::Temp { .. } => true,
             Held::EnvPlace(j) => self.env_place_pending(j),
-            Held::Pat(p) => match self.owned[p.ix()] {
+            Held::Pat(p) => match self.owned.get(p.ix()).copied().and_then(super::LocalOwn::as_drop) {
                 Some(Owned { flag: Some(_), .. }) => true,
                 Some(Owned { flag: None, .. }) => self.init[p.ix()],
                 None => false,

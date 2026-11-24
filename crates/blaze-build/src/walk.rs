@@ -231,6 +231,31 @@ struct Owned {
     rest: Option<SlotId>,
 }
 
+/// Ownership state of a binding in this body: dropping bindings live in `scope_pats`, while
+/// non-dropping owned bindings (`!needs_drop`, e.g. `ManuallyDrop<T>`) never drop at scope end
+/// yet own their place and may hold a field-flags word for `assign_over` when a dropping part
+/// moves out (`partial`).
+#[derive(Clone, Copy)]
+enum LocalOwn {
+    /// Not owned by this body (not yet bound, or a borrowed / non-`FnOnce` capture).
+    None,
+    /// Owned by this body and its type needs drop (lives in `scope_pats`).
+    Drop(Owned),
+    /// Owned by this body, its type needs no drop, no field flags needed.
+    Kept,
+    /// Owned by this body, its type needs no drop, with field-flags word `SlotId`.
+    KeptFlags(SlotId),
+}
+
+impl LocalOwn {
+    fn as_drop(self) -> Option<Owned> {
+        match self {
+            LocalOwn::Drop(o) => Some(o),
+            LocalOwn::None | LocalOwn::Kept | LocalOwn::KeptFlags(_) => None,
+        }
+    }
+}
+
 /// An entry of a drop scope: a binding, or what an arm of a `match` by value on a temporary
 /// left of it (`variant` the arm's, `moved` the `field_bit`s it moved out; `None`: nothing
 /// moved, the whole value), dropped at the arm's end, after the arm's bindings.
@@ -552,8 +577,9 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     /// `super let` bindings owned by a temporary scope (not extended): `temp_end` drops them
     /// (walk/super_let.rs).
     super_temps: Vec<PatId, A>,
-    /// Per pattern: the binding, if its type needs drop.
-    owned: Vec<Option<Owned>, A>,
+    /// Per pattern: ownership state of the binding (`Drop` when its type needs drop, `Kept*`
+    /// when owned by this body without needing drop).
+    owned: Vec<LocalOwn, A>,
     /// Per pattern: whether a binding without a flag is initialized here.
     init: Vec<bool, A>,
     /// What needs drop, in declaration order, of every open drop scope.
@@ -814,7 +840,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     let mut partial = Vec::with_capacity_in(body.pats.len(), alloc);
     partial.resize(body.pats.len(), false);
     let mut owned = Vec::with_capacity_in(body.pats.len(), alloc);
-    owned.resize(body.pats.len(), None);
+    owned.resize(body.pats.len(), LocalOwn::None);
     let mut init = Vec::with_capacity_in(body.pats.len(), alloc);
     init.resize(body.pats.len(), false);
     Walk {
@@ -2272,6 +2298,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let t = *self.checked.local_ty.get(p.ix()).ok_or(malformed("a binding without a type in the record"))?;
         let g = self.ground_ty(t).map_err(|error| Self::pat_ty_err(p, error))?;
         if !self.needs_drop(g).map_err(|error| Self::pat_ty_err(p, error))? {
+            self.own_kept(p, init);
             return Ok(());
         }
         let (_, repr) = self.slots[p.ix()].ok_or(malformed("a binding owned before it has a home"))?;
@@ -2279,7 +2306,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         if repr == Repr::None {
             return Err(malformed("a binding whose type needs drop held as no value"));
         }
-        if self.owned[p.ix()].is_some() {
+        if self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop).is_some() {
             return Err(malformed("a binding owned twice"));
         }
         let flag = if self.needs_flag[p.ix()] {
@@ -2298,17 +2325,59 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         } else {
             None
         };
-        self.owned[p.ix()] = Some(Owned { ty: g, flag, rest });
+        self.owned[p.ix()] = LocalOwn::Drop(Owned { ty: g, flag, rest });
         self.hold_all(p);
         self.init[p.ix()] = init;
         self.scope_pats.push(Held::Pat(p));
         Ok(())
     }
 
+    /// Marks binding `p` whose type needs no drop (e.g. `ManuallyDrop<T>`) as owned by this body,
+    /// allocating its field-flags word when a dropping part moves out of it (`partial`).
+    fn own_kept(&mut self, p: PatId, init: bool) {
+        let Some(entry) = self.owned.get_mut(p.ix()) else { return };
+        if !self.partial.get(p.ix()).copied().unwrap_or(false) {
+            *entry = LocalOwn::Kept;
+            return;
+        }
+        let slot = match *entry {
+            LocalOwn::KeptFlags(slot) => slot,
+            LocalOwn::None | LocalOwn::Kept | LocalOwn::Drop(_) => {
+                let slot = self.b.slot(8, 3, SlotKind::Named);
+                *entry = LocalOwn::KeptFlags(slot);
+                slot
+            }
+        };
+        let at = self.b.slot_addr(slot);
+        let bits = self.b.iconst(Ty::I64, if init { u128::from(u64::MAX) } else { 0 });
+        self.b.store(Flags::NONE, bits, at, 0, MemAttrs::aligned(3));
+    }
+
+    /// The field-flags word of binding `p`, whether its type needs drop (`Owned::rest`) or not
+    /// (`LocalOwn::KeptFlags`, e.g. `ManuallyDrop<T>`).
+    fn field_mask(&self, p: PatId) -> Option<SlotId> {
+        match self.owned.get(p.ix()).copied() {
+            Some(LocalOwn::Drop(o)) => o.rest,
+            Some(LocalOwn::KeptFlags(slot)) => Some(slot),
+            Some(LocalOwn::None | LocalOwn::Kept) | None => None,
+        }
+    }
+
+    /// Whether binding `p` is owned by this body (not a borrowed or non-`FnOnce` capture),
+    /// whether its own type needs drop or not (`ManuallyDrop<T>`).
+    fn local_is_owned(&self, p: PatId) -> bool {
+        !matches!(self.owned.get(p.ix()).copied(), None | Some(LocalOwn::None))
+    }
+
+    /// Whether binding `p` is owned by this body and its type needs drop.
+    fn local_drops(&self, p: PatId) -> bool {
+        self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop).is_some()
+    }
+
     /// Sets every field flag of binding `p`, if it has them: it holds all of its value again
     /// (its `let`, an assignment over it).
     fn hold_all(&mut self, p: PatId) {
-        if let Some(Owned { rest: Some(slot), .. }) = self.owned[p.ix()] {
+        if let Some(slot) = self.field_mask(p) {
             let at = self.b.slot_addr(slot);
             let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
             self.b.store(Flags::NONE, all, at, 0, MemAttrs::aligned(3));
@@ -2448,7 +2517,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
 
     /// Stores `on` into binding `p`'s flag, if it has one.
     fn set_flag(&mut self, p: PatId, on: bool) {
-        if let Some(Owned { flag: Some(slot), .. }) = self.owned[p.ix()] {
+        if let Some(Owned { flag: Some(slot), .. }) = self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop) {
             let at = self.b.slot_addr(slot);
             let v = self.b.iconst(Ty::I8, u128::from(on));
             self.b.store(Flags::NONE, v, at, 0, MemAttrs::aligned(0));
@@ -2459,7 +2528,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// so a scope entered again starts clean). `kill`: its scope ends, it is not initialized
     /// after (an early exit leaves the state of the code that follows it as it was).
     fn drop_local(&mut self, p: PatId, kill: bool) -> Result<(), BuildError> {
-        let Some(o) = self.owned[p.ix()] else { return Ok(()) };
+        let Some(o) = self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop) else { return Ok(()) };
         let (home, _) = self.slots[p.ix()].ok_or(malformed("an owned binding without a home"))?;
         match o.flag {
             None => {
@@ -2525,7 +2594,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
 
     /// Binding `p` is used by value: a move, when its type needs drop.
     fn moved(&mut self, e: ExprId, p: PatId) -> Result<(), BuildError> {
-        let Some(o) = self.owned[p.ix()] else { return Ok(()) };
+        let Some(o) = self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop) else { return Ok(()) };
         if o.flag.is_some() {
             self.set_flag(p, false);
             return Ok(());
@@ -3535,7 +3604,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.drop_scope(mark, true)?;
                 for i in mark..self.scope_pats.len() {
                     if let Held::Pat(p) = self.scope_pats[i] {
-                        self.owned[p.ix()] = None;
+                        self.owned[p.ix()] = LocalOwn::None;
                     }
                 }
                 self.scope_pats.truncate(mark);
@@ -3797,7 +3866,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         other => other,
                     };
                     match self.local_of(lhs)? {
-                        Some(p) if self.owned[p.ix()].is_some() => {
+                        Some(p) if self.local_drops(p) => {
                             self.note_whole_assign(e, p);
                             self.drop_local(p, false)?;
                             self.store(v, repr, at)?;
@@ -3837,6 +3906,17 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     }
                 } else {
                     self.store(v, repr, at)?;
+                    if self.live {
+                        if let Some(p) = self.local_of(lhs)? {
+                            self.note_whole_assign(e, p);
+                            self.hold_all(p);
+                        } else if let Repr::Agg(l) = repr
+                            && let Ok(ix) = usize::try_from(l)
+                            && self.layouts.get(ix).is_some_and(|row| row.placed)
+                        {
+                            self.reinit_field_bits(lhs)?;
+                        }
+                    }
                 }
                 self.push_val(V::None, None);
             }
@@ -5431,7 +5511,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     s = inner;
                 }
                 match self.expr(s)? {
-                    Expr::Local(p) if self.owned[p.ix()].is_some() && self.adjust_rows(scrutinee).is_empty() => {
+                    Expr::Local(p) if self.local_drops(p) && self.adjust_rows(scrutinee).is_empty() => {
                         self.work.push(Task::Place(s));
                     }
                     // An unsized scrutinee (`match *w { [a, .., d] => .. }`, `w: Deref<Target =
@@ -6537,7 +6617,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 if self.layouts[l as usize].needs_drop && !by_ref {
                     owner = match self.local_of(scrutinee)? {
                         // As `Expr::Match` evaluated it: in place.
-                        Some(p) if self.owned[p.ix()].is_some() && self.adjust_rows(scrutinee).is_empty() => Owner::Local(p),
+                        Some(p) if self.local_drops(p) && self.adjust_rows(scrutinee).is_empty() => Owner::Local(p),
                         // A temporary: held in its temporary scope like every temporary
                         // (walk/temps.rs `hold_temp`, as `Held::Moved` with its word: "The
                         // scrutinee of a `match` expression is not a temporary scope"), wherever
@@ -6663,8 +6743,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     }
                     match st.owner {
                         Owner::Local(x) => {
-                            let slot = self.owned[x.ix()]
-                                .and_then(|o| o.rest)
+                            let slot = self
+                                .field_mask(x)
                                 .ok_or(malformed("a match moving fields out of a local without field flags"))?;
                             self.arm_effect(moves::Pending::Clear { mask: slot, bits: moved }, hold)?;
                         }
