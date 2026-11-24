@@ -981,68 +981,6 @@ pub(crate) fn encode_huffman_literals_into<A: Allocator + Copy>(
         return Ok(false);
     }
 
-    // Zero-histogram Treeless fast path for `Level::Fast` blocks 1..N: `fast_mode` seeds all 256
-    // byte values when building block 0's Huffman table, so every byte has a valid code in
-    // `cache.codes` and blocks 1..N skip the histogram and table build completely.
-    if fast_mode && cache.valid && lit_len >= 256 {
-        payload.clear();
-        let seg = lit_len.div_ceil(4);
-        if let Some((st1, rest)) = literals.split_at_checked(seg)
-            && let Some((st2, rest)) = rest.split_at_checked(seg)
-            && let Some((st3, st4)) = rest.split_at_checked(seg)
-        {
-            payload.try_extend_from_slice(&[0u8; 6])?;
-            let s1_start = payload.len();
-            let _ = encode_huff_stream::<false, A>(st1, &cache.codes, payload)?;
-            let s1_len = payload.len() - s1_start;
-            let s2_start = payload.len();
-            let _ = encode_huff_stream::<false, A>(st2, &cache.codes, payload)?;
-            let s2_len = payload.len() - s2_start;
-            let s3_start = payload.len();
-            let _ = encode_huff_stream::<false, A>(st3, &cache.codes, payload)?;
-            let s3_len = payload.len() - s3_start;
-            let _ = encode_huff_stream::<false, A>(st4, &cache.codes, payload)?;
-
-            if payload.len().saturating_add(8) < lit_len
-                && let (Ok(l1), Ok(l2), Ok(l3)) =
-                    (u16::try_from(s1_len), u16::try_from(s2_len), u16::try_from(s3_len))
-            {
-                if let Some(jt) = payload.as_mut_slice().get_mut(..6) {
-                    let [a0, a1] = l1.to_le_bytes();
-                    let [b0, b1] = l2.to_le_bytes();
-                    let [c0, c1] = l3.to_le_bytes();
-                    jt.copy_from_slice(&[a0, a1, b0, b1, c0, c1]);
-                }
-                let comp_len = payload.len();
-                let lit_type_bits: u64 = 3; // Treeless_Literals_Block
-                if lit_len < 1_024 && comp_len < 1_024 {
-                    let v = lit_type_bits
-                        | (1u64 << 2)
-                        | (u64::try_from(lit_len).unwrap_or(0) << 4)
-                        | (u64::try_from(comp_len).unwrap_or(0) << 14);
-                    let [h0, h1, h2, ..] = v.to_le_bytes();
-                    out.try_extend_from_slice(&[h0, h1, h2])?;
-                } else if lit_len < 16_384 && comp_len < 16_384 {
-                    let v = lit_type_bits
-                        | (2u64 << 2)
-                        | (u64::try_from(lit_len).unwrap_or(0) << 4)
-                        | (u64::try_from(comp_len).unwrap_or(0) << 18);
-                    let [h0, h1, h2, h3, ..] = v.to_le_bytes();
-                    out.try_extend_from_slice(&[h0, h1, h2, h3])?;
-                } else {
-                    let v = lit_type_bits
-                        | (3u64 << 2)
-                        | (u64::try_from(lit_len).unwrap_or(0) << 4)
-                        | (u64::try_from(comp_len).unwrap_or(0) << 22);
-                    let [h0, h1, h2, h3, h4, ..] = v.to_le_bytes();
-                    out.try_extend_from_slice(&[h0, h1, h2, h3, h4])?;
-                }
-                out.try_extend_from_slice(payload.as_slice())?;
-                return Ok(true);
-            }
-        }
-    }
-
     // 4-way unrolled histogram to avoid store-to-load forwarding stalls on repeated bytes.
     let mut c0 = [0u32; 256];
     let mut c1 = [0u32; 256];
@@ -1130,13 +1068,6 @@ pub(crate) fn encode_huffman_literals_into<A: Allocator + Copy>(
     if can_reuse && fast_mode && reuse_bytes + 8 < lit_len {
         use_treeless = true;
     } else {
-        if fast_mode {
-            for c in &mut counts {
-                if *c == 0 {
-                    *c = 1;
-                }
-            }
-        }
         let mut weights = [0u8; 256];
         let Some((max_bits, max_sym)) = build_huffman_weights(&counts, &mut weights) else {
             return Ok(false);
