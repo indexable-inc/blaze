@@ -1040,11 +1040,12 @@ impl FnQualifiers {
     }
 
     fn attribute(&mut self, path: &str) {
-        use super::fn_attrs::{INTRINSIC, PROMOTABLE, TARGET_FEATURE};
+        use super::fn_attrs::{COMPTIME, INTRINSIC, PROMOTABLE, TARGET_FEATURE};
         self.0 |= match path {
             PROMOTABLE => tc::TypeAttrs::PROMOTABLE as u8,
             INTRINSIC => tc::TypeAttrs::INTRINSIC as u8,
             TARGET_FEATURE => tc::TypeAttrs::TARGET_FEATURE as u8,
+            COMPTIME => Self::CONST.0,
             super::internal_symbol::ATTR => Self::INTERNAL_SYMBOL,
             _ => 0,
         };
@@ -3831,14 +3832,14 @@ impl<'n> Store<'n> {
             (Want::Fn(_), ItemDetail::Fn { .. } | ItemDetail::Const { .. }) => {
                 let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
                 let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
-                self.fn_head(names, keys, key, ck, None, &env, 0, &[], &v, text, detail, marks)
+                self.fn_head(names, keys, key, ck, None, &env, 0, &[], &v, text, detail, marks, false)
             }
             // A static's head is its type, as a const's, and its mutability (the Reference,
             // "Static items": "Mutable statics", `static mut`).
             (Want::Fn(_), ItemDetail::Static { .. }) => {
                 let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
                 let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
-                let made = self.fn_head(names, keys, key, ck, None, &env, 0, &[], &v, text, detail, marks);
+                let made = self.fn_head(names, keys, key, ck, None, &env, 0, &[], &v, text, detail, marks, false);
                 if made.is_ok() {
                     let m = if v.head[head::FLAGS] & sig::MUT != 0 { tc::Mutbl::Mut } else { tc::Mutbl::Not };
                     self.statics.insert(ck, m);
@@ -4975,7 +4976,8 @@ impl<'n> Store<'n> {
                     ItemDetail::Fn { .. } => {
                         let Some(mk) = pre_mk else { return Ok(()) };
                         let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
-                        match self.member_fn_head(names, keys, key, mk, Some(ck), &env, own + 1, &inherited, mv, m, marks) {
+                        let trait_const = v.head.get(head::FLAGS).is_some_and(|&f| f & sig::CONST != 0);
+                        match self.member_fn_head(names, keys, key, mk, Some(ck), &env, own + 1, &inherited, mv, m, marks, trait_const) {
                             Ok(()) => {}
                             Err(Why::Need(k)) if self.needs == NeedsMet::All => needs.push(k),
                             Err(why) => return Err(why),
@@ -5765,7 +5767,8 @@ impl<'n> Store<'n> {
         let mut frame_bounds = Vec::with_capacity_in(bounds.len(), Global);
         frame_bounds.extend_from_slice(&bounds);
         let self_ = env.self_;
-        self.member_frames.insert(ck, member_fn::MemberFrame { module, generics, params: ps, consts: cs.to_vec_in(*cs.allocator()), bounds: frame_bounds, self_ });
+        let is_const = v.head.get(head::FLAGS).is_some_and(|&f| f & sig::CONST != 0);
+        self.member_frames.insert(ck, member_fn::MemberFrame { module, generics, is_const, params: ps, consts: cs.to_vec_in(*cs.allocator()), bounds: frame_bounds, self_ });
         self.preds.insert(ck, preds);
         self.impls.insert(ck, ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, fn_vis, unstable, consts, polarity });
         self.maps.const_params.insert(key, cs);
@@ -5904,9 +5907,9 @@ impl<'n> Store<'n> {
     /// `fn_gaps` and the container's head goes on (a need is passed up: the store makes the
     /// head it names and makes the container again).
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
-    fn member_fn_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, member: &Member<'n>, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
+    fn member_fn_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, member: &Member<'n>, marks: Option<TextMarks<'n>>, container_const: bool) -> Result<(), Why> {
         names.read_member_signature(member.lib, member.written_by);
-        match self.fn_head(names, keys, lib, key, container, outer, parent, inherited, v, member.text, member.detail, marks) {
+        match self.fn_head(names, keys, lib, key, container, outer, parent, inherited, v, member.text, member.detail, marks, container_const) {
             Err(why @ (Why::Need(_) | Why::NeedConst(..))) => Err(why),
             Err(why) => {
                 self.fn_gaps.insert(key, why);
@@ -6110,7 +6113,7 @@ impl<'n> Store<'n> {
     /// `inherited` its container's clauses, `v` its own text's, `marks` its text's tokens'
     /// (front2 item_site.rs).
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
-    fn fn_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, detail: ItemDetail, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
+    fn fn_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, detail: ItemDetail, marks: Option<TextMarks<'n>>, container_const: bool) -> Result<(), Why> {
         let mut ps = Vec::new_in(Global);
         ps.extend_from_slice(outer.params);
         let mut cs = Vec::new_in(Global);
@@ -6551,6 +6554,9 @@ impl<'n> Store<'n> {
         // of the call arguments that are the fn's own const generic arguments.
         let mut legacy_const_generics = Vec::new_in(Global);
         let mut qualifiers = FnQualifiers::of_flags(flags).note_lifetimes(text);
+        if container_const {
+            qualifiers.0 |= FnQualifiers::CONST.0;
+        }
         let attrs = v.list(head::ATTRS);
         for (i, &n) in v.rows(attrs)?.iter().enumerate() {
             let a = v.attr(n)?;

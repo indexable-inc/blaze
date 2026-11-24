@@ -516,3 +516,29 @@ fn self_struct_variant() {
 
     std::println!("self_struct_variant: clean");
 }
+
+/// `Self::BITS` inside `impl S` when `S`'s own `Adt` definition is absent (the `regalloc2::PRegSet`
+/// pattern: `struct S { bits: [u8; Self::LEN] }; impl S { const BITS: u8 = 8; const LEN: u8 = Self::BITS; }`):
+/// `Self` resolves from the impl header and finds the inherent const before touching `world.adt(S)`.
+#[test]
+fn inherent_const_through_self_does_not_read_adt() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Default::default(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let u8_ = fx.u8();
+    let missing_adt = ItemKey(0xDEAD_0001);
+    let s_ty = fx.adt(missing_adt, &[]);
+    fx.use_path("Self", Def::Adt(missing_adt));
+    let imp = fx.imp("impl S", 0, s_ty, None, &[], Default::default());
+    fx.impl_const(imp, "BITS", u8_);
+    let len = fx.impl_const(imp, "LEN", u8_);
+    fx.finish();
+
+    let mut b = Bb::new();
+    let p = b.path(&["Self", "BITS"]);
+    let root = b.block(&[], Some(p));
+    let c = check_body(&fx, &b, len, root, Plant::None, InferPlant::None);
+    let want = Want { exprs: &[(p, "u8"), (root, "u8")], pats: &[], diags: &[] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "\n{}", d.join("\n"));
+}

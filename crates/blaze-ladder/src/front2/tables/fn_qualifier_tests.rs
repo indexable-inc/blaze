@@ -77,3 +77,12 @@ fn frozen_callee_distinguishes_written_and_elided_lifetimes() {
     assert_ne!(explicit, implicit, "callee lifetime spelling is an input of the borrow check");
     std::println!("frozen callee lifetimes: written true, elided false");
 }
+
+#[test]
+fn rustc_comptime_fn_is_const_callable() {
+    let (_, kind, comptime_digest) = facts("#![no_std]\n#![feature(rustc_attrs)]\n#[rustc_comptime] pub fn f() -> u8 { 1 }");
+    let (_, ordinary, runtime_digest) = facts("#![no_std]\n#![feature(rustc_attrs)]\npub fn f() -> u8 { 1 }");
+    assert_eq!(kind, FnKind::Const);
+    assert_eq!(ordinary, FnKind::NotConst);
+    assert_ne!(comptime_digest, runtime_digest);
+}

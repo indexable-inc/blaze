@@ -54,6 +54,11 @@ pub const INTRINSIC: &str = "rustc_intrinsic";
 /// `cfg_attr(target_feature = ..)` also contains the word; the head's lowered qualifiers decide.
 pub const TARGET_FEATURE: &str = "target_feature";
 
+/// The attribute that marks a compile-time-only fn (`core::mem::type_info`, `TypeId::info`,
+/// `blaze_std::own::raw`): callable only during constant evaluation, so consteval treats it
+/// as a `const fn` (`FnQualifiers::CONST`).
+pub const COMPTIME: &str = "rustc_comptime";
+
 /// The typing attributes of the fn whose head is `f`, already read while that head was made.
 pub fn fn_type_attrs(f: &FnHead<'_>) -> TypeAttrs {
     f.qualifiers.typing()

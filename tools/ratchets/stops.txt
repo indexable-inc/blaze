@@ -37,7 +37,7 @@ blaze-comptime	68
 blaze-comptime-sys	48
 blaze-comptime/rungs/derive-hello	2
 blaze-cond	115
-blaze-consteval	204
+blaze-consteval	203
 blaze-core	907
 blaze-cunit	41
 blaze-data	52

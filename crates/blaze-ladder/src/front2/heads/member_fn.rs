@@ -38,6 +38,7 @@ use super::{Global, Store, Vec, Want, format, lower, members};
 pub struct MemberFrame {
     pub module: LibKey,
     pub generics: u32,
+    pub is_const: bool,
     pub params: Vec<(Name, u32), Global>,
     pub consts: Vec<(u32, PTy), Global>,
     pub bounds: Vec<ParamBound, Global>,
@@ -103,7 +104,7 @@ impl<'n> Store<'n> {
                 continue;
             }
             let frame = self.member_frames.get(&ck).ok_or_else(|| Why::Program(format!("impl {ck:?}: its head is made but its members' frame is not kept").into_boxed_str(), whole))?;
-            let (module, generics, self_) = (frame.module, frame.generics, frame.self_);
+            let (module, generics, is_const, self_) = (frame.module, frame.generics, frame.is_const, frame.self_);
             let mut params = Vec::with_capacity_in(frame.params.len(), Global);
             params.extend_from_slice(&frame.params);
             let mut consts = Vec::with_capacity_in(frame.consts.len(), Global);
@@ -118,7 +119,7 @@ impl<'n> Store<'n> {
             inherited.extend_from_slice(&clauses.clauses);
             let env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
             let marks = super::super::item_site::member_marks(names, impl_, m.written_by, m.text).map_err(super::super::item_site::MarksLost::why)?;
-            return self.member_fn_head(names, keys, impl_, fn_, Some(ck), &env, generics, &inherited, &v, m, marks);
+            return self.member_fn_head(names, keys, impl_, fn_, Some(ck), &env, generics, &inherited, &v, m, marks, is_const);
         }
         Err(Why::Program(format!("impl {ck:?} holds no fn `{name}` its crate's cfg keeps").into_boxed_str(), whole))
     }

@@ -32,9 +32,9 @@ use core::alloc::Allocator;
 use blaze_code::record::TrapKind;
 use blaze_lir::Block;
 use blaze_own::Vec;
-use blaze_typeck::{BinOp, Expr, ExprId, Stmt, StmtId};
+use blaze_typeck::{BinOp, Expr, ExprId, PNode, Stmt, StmtId};
 
-use super::{Held, Task, Walk, malformed, unsupported};
+use super::{Held, Repr, Task, V, Walk, malformed, unsupported};
 use crate::BuildError;
 
 pub(super) mod scope;
@@ -148,6 +148,14 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             Expr::Local(p) if self.local_drops(p) && self.adjust_rows(init).is_empty() => {
                 self.work.push(Task::Place(s));
             }
+            // An unsized scrutinee (`if let [a, b, c, d] = *chunk`, `let [head, ..] = *s else { .. }`):
+            // an unsized value is never copied, so its place (`V::Unsized`) is what is tested
+            // (mirrors walk.rs `Expr::Match`).
+            _ if self.is_place_expr(init)?
+                && matches!(self.node_at(init, self.adjusted_ty(init)?)?, PNode::Slice(_) | PNode::Str) =>
+            {
+                self.work.push(Task::Place(init));
+            }
             // A place behind a pointer that needs drop (`if let Reach::Hosted = self.reach`):
             // matched in place, nothing moved (walk/moves.rs `scrutinee_in_place`).
             _ if self.scrutinee_in_place(init)? => self.work.push(Task::Place(init)),
@@ -164,7 +172,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     pub(super) fn let_link(&mut self, l: ExprId, fail: Block) -> Result<(), BuildError> {
         let Expr::Let { pat, init } = self.expr(l)? else { return Err(malformed("a `let` link's task on another expression")) };
         let s = self.pop()?;
-        let srepr = self.adjusted_repr(init)?;
+        let srepr = if matches!(s, V::Unsized(..)) { Repr::None } else { self.adjusted_repr(init)? };
         // Owned as a `match`'s scrutinee (`owned_place`, as `let_else_test`): a place is tested
         // where it is (a local by its own scope, a place behind a pointer by no one here); a
         // temporary that needs drop joins the condition's region (`hold_temp`, anchored by
@@ -244,7 +252,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return Err(malformed("a drop scope left open inside a `let`-`else` initializer"));
         }
         let v = self.pop()?;
-        let srepr = self.adjusted_repr(init)?;
+        let srepr = if matches!(v, V::Unsized(..)) { Repr::None } else { self.adjusted_repr(init)? };
         // The scrutinee is owned like a match's (`owned_place`): a temporary that needs drop
         // joins the statement's temporaries with a word, and a binding by value moves its part
         // out of it. A local scrutinee keeps the place it has; a binding by value moves its

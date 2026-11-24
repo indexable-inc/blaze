@@ -464,13 +464,41 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         Ok(false)
     }
 
+    /// Whether pattern `root` contains an or-pattern (`Pat::Or`), e.g. an exhaustive
+    /// `let (A { x } | B { x }) = v;` destructuring (built by tests + unreachable miss).
+    pub(in crate::walk) fn pat_has_or(&self, root: PatId) -> Result<bool, BuildError> {
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
+        todo.push(root);
+        while let Some(p) = todo.pop() {
+            match self.pat(p)? {
+                Pat::Or { .. } => return Ok(true),
+                Pat::Bind { sub, .. } => todo.extend(sub),
+                Pat::Ref { inner, .. } => todo.push(inner),
+                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } => {
+                    let subs = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
+                    todo.extend(subs.iter().copied());
+                }
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                    let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
+                    todo.extend(fps.iter().map(|fp| fp.pat));
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether `let pat = init;` owns its initializer's parts (the module doc's "Ownership"):
     /// `pat` is neither a binding nor `_` (walk.rs `stmt` builds those), does not borrow
     /// `init`'s place (ref_bind.rs), and leaves unbound a part that needs drop
-    /// (`let_leaves_drops`). A pure fact of the body, asked by walk.rs `scan_flags` (the
-    /// local's field flags), `stmt` (`init` pushed as a scrutinee) and `Task::Let` (bound by
-    /// `bind_let_owned`): all three answers are the same.
+    /// (`let_leaves_drops`), or contains an irrefutable or-pattern (`pat_has_or`). A pure fact
+    /// of the body, asked by walk.rs `scan_flags` (the local's field flags), `stmt` (`init`
+    /// pushed as a scrutinee) and `Task::Let` (bound by `bind_let_owned`): all three answers are
+    /// the same.
     pub(in crate::walk) fn let_owns_parts(&mut self, pat: PatId, init: ExprId) -> Result<bool, BuildError> {
+        if self.pat_has_or(pat)? {
+            return Ok(true);
+        }
         if matches!(self.pat(pat)?, Pat::Bind { .. } | Pat::Wild) || self.pat_has_ref_bind(pat)? {
             return Ok(false);
         }
@@ -540,12 +568,26 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// declaration order, as `own_pat` does ("Destructors": variables drop in reverse order of
     /// declaration). Returns where they start in `scope_pats` (for `place_super_let`).
     pub(in crate::walk) fn bind_let_owned(&mut self, pat: PatId, init: ExprId, v: V) -> Result<usize, BuildError> {
-        // `bind_tested` tests nothing: what would make the pattern refutable is refused first.
-        self.refuse_refutable(pat)?;
-        let srepr = self.adjusted_repr(init)?;
+        let has_or = self.pat_has_or(pat)?;
+        if !has_or {
+            // `bind_tested` tests nothing: what would make the pattern refutable is refused first.
+            self.refuse_refutable(pat)?;
+        }
+        let srepr = if matches!(v, V::Unsized(..)) { crate::walk::Repr::None } else { self.adjusted_repr(init)? };
         let m = self.matches.len() as u32;
         let at = self.owned_place(m, init, init, v, srepr)?;
         let from = self.scope_pats.len();
+        if has_or {
+            let pass = self.create();
+            let fail = self.create();
+            self.move_arm(m, pat, false);
+            let tested = self.test_pat(pat, at, pass, fail);
+            self.move_arm_end();
+            tested?;
+            self.begin(fail);
+            self.unreachable_of(blaze_code::record::TrapKind::MatchNoArm, Some(init));
+            self.begin(pass);
+        }
         self.move_arm(m, pat, false);
         let bound = self.bind_tested(pat, at);
         self.move_arm_end();
