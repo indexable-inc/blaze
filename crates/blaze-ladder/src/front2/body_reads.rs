@@ -335,6 +335,11 @@ fn provisional_pending_assoc_cycle(
             work.push(anchor.ty);
         }
     }
+    for site in body.typeck.inline_fors.iter() {
+        if let blaze_lower::typeck::InlineForKind::Variants { ty, .. } = site.kind {
+            work.push(ty);
+        }
+    }
     const MOST_WALK: u32 = 1 << 16;
     let mut steps = 0u32;
     while let Some(ty) = work.pop() {
