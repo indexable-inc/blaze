@@ -71,6 +71,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Expr::Break { value, target } => self.expr_break(f, e, value, target),
             Expr::Continue { target: _ } => Ok(Flow::Done(self.common.never)),
             Expr::Return { value } => self.expr_return(f, e, value),
+            Expr::Become { value } => self.expr_return(f, e, Some(value)),
             Expr::Call { callee, args } => self.expr_call(f, e, callee, args),
             Expr::MethodCall { receiver, name, generic_args, args, scope } => {
                 self.expr_method_call(f, e, receiver, name, generic_args, args, scope)

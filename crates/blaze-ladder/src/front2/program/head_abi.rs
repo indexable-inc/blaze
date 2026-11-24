@@ -95,7 +95,10 @@ pub(super) fn placed_ctor<'n, S: crate::front2::source::NamesSource<'n>>(names: 
 /// compiling instead of being guessed. `None`: no builder ABI (refused by the caller).
 pub(super) fn of_head(abi: tc::Abi) -> Option<BuildAbi> {
     match abi {
-        tc::Abi::Rust => Some(BuildAbi { abi: Abi::Rust, nounwind: false }),
+        tc::Abi::Rust
+        | tc::Abi::RustCold
+        | tc::Abi::RustPreserveNone
+        | tc::Abi::RustTail => Some(BuildAbi { abi: Abi::Rust, nounwind: false }),
         tc::Abi::RustCall => Some(BuildAbi { abi: Abi::RustCall, nounwind: false }),
         tc::Abi::C => Some(BuildAbi { abi: Abi::C, nounwind: true }),
         tc::Abi::CUnwind => Some(BuildAbi { abi: Abi::C, nounwind: false }),
@@ -125,14 +128,11 @@ pub(super) fn of_head(abi: tc::Abi) -> Option<BuildAbi> {
         | tc::Abi::PtxKernel
         | tc::Abi::RiscvInterruptM
         | tc::Abi::RiscvInterruptS
-        | tc::Abi::RustCold
         | tc::Abi::RustInvalid
-        | tc::Abi::RustPreserveNone
         | tc::Abi::Stdcall
         | tc::Abi::StdcallUnwind
         | tc::Abi::SysV64
         | tc::Abi::SysV64Unwind
-        | tc::Abi::RustTail
         | tc::Abi::Thiscall
         | tc::Abi::ThiscallUnwind
         | tc::Abi::Vectorcall
@@ -193,6 +193,9 @@ mod tests {
         assert_eq!(defined("\"system\""), Some(BuildAbi { abi: Abi::C, nounwind: true }));
         assert_eq!(defined("\"system-unwind\""), Some(BuildAbi { abi: Abi::C, nounwind: false }));
         assert_eq!(defined("\"Rust\""), Some(BuildAbi { abi: Abi::Rust, nounwind: false }));
+        assert_eq!(defined("\"rust-preserve-none\""), Some(BuildAbi { abi: Abi::Rust, nounwind: false }));
+        assert_eq!(defined("\"rust-cold\""), Some(BuildAbi { abi: Abi::Rust, nounwind: false }));
+        assert_eq!(defined("\"tail\""), Some(BuildAbi { abi: Abi::Rust, nounwind: false }));
         assert_eq!(defined("\"rust-call\""), Some(BuildAbi { abi: Abi::RustCall, nounwind: false }));
         // A declaration: a call of a foreign "C" fn never unwinds; of a "C-unwind" one, may.
         assert_eq!(of_block("C"), Some(BuildAbi { abi: Abi::C, nounwind: true }));

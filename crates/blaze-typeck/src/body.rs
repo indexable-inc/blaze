@@ -95,6 +95,9 @@ pub enum Expr {
     Break { value: Option<ExprId>, target: ExprId },
     Continue { target: ExprId },
     Return { value: Option<ExprId> },
+    /// `become value` (RFC 3407 explicit tail call): type-checks `value` against the enclosing
+    /// function's return type and diverges (`!`).
+    Become { value: ExprId },
     /// `args` in `BodyView::expr_lists`.
     Call { callee: ExprId, args: List },
     /// `generic_args` in `BodyView::type_lists`, `args` in `expr_lists`.
@@ -674,6 +677,7 @@ impl<'b> BodyView<'b> {
                 }
             }
             Expr::Break { value, .. } | Expr::Return { value } => out.extend(value),
+            Expr::Become { value } => out.push(value),
             Expr::Call { callee, args } => {
                 out.push(callee);
                 out.extend_from_slice(self.expr_list(args)?);

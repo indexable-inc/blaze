@@ -1607,7 +1607,7 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
     }
     for b in 0..blocks {
         let term = view.terminator(Block(u32_of(b)));
-        can_return.push(view.op(term) == Op::Return);
+        can_return.push(matches!(view.op(term), Op::Return | Op::TailCall | Op::TailCallIndirect));
         for_each_edge(view, term, |target_block, _, _| {
             let tb = idx(target_block);
             if tb <= b {

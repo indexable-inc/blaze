@@ -1330,6 +1330,7 @@ where
                 Expr::Missing
                     | Expr::Block { .. }
                     | Expr::Return { .. }
+                    | Expr::Become { .. }
                     | Expr::Break { .. }
                     | Expr::Continue { .. }
                     | Expr::Assign { .. }
@@ -1387,7 +1388,7 @@ fn mark_expr_shallow_synthetic<A: Allocator + Copy>(
         *slot = true;
         let Some(&expr) = body.exprs.get(eid.ix()) else { continue };
         match expr {
-            Expr::Return { value: Some(v) } | Expr::Break { value: Some(v), .. } | Expr::Paren(v) => {
+            Expr::Return { value: Some(v) } | Expr::Become { value: v } | Expr::Break { value: Some(v), .. } | Expr::Paren(v) => {
                 stack.push(v);
             }
             Expr::Call { callee, args } => {

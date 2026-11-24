@@ -2532,6 +2532,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
             Expr::Underscore => return Err(unsupported("`_` (`_ = e`) in a constant")),
             // The Reference, inline-assembly: "asm! ... cannot be used in const contexts".
             Expr::Asm { .. } => return Err(unsupported("inline assembly in a constant")),
+            Expr::Become { .. } => return Err(unsupported("`become` in a constant")),
             Expr::RawRef { operand, .. } => {
                 cc.tasks.push(C::RawRef(e));
                 cc.tasks.push(C::Eval(operand, Mode::Place));

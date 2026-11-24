@@ -15,7 +15,7 @@ blaze-base64	24
 blaze-bench	7
 blaze-blake3	413
 blaze-bstd-convert	109
-blaze-build	518
+blaze-build	517
 blaze-build-script	246
 blaze-bytes	3
 blaze-c	325
@@ -52,7 +52,7 @@ blaze-export	224
 blaze-fetch	170
 blaze-file-items	277
 blaze-flow	277
-blaze-flow-lower	261
+blaze-flow-lower	258
 blaze-fmt	352
 blaze-format	24
 blaze-format-core	103

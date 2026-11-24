@@ -464,7 +464,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     }
                     Expr::If { ref cond, .. } => core::slice::from_ref(cond),
                     Expr::Unary { op, ref operand } if op != crate::body::UnOp::Deref => core::slice::from_ref(operand),
-                    Expr::Block { tail: Some(ref value), .. } | Expr::Return { value: Some(ref value) } | Expr::Await(ref value) => core::slice::from_ref(value),
+                    Expr::Block { tail: Some(ref value), .. }
+                    | Expr::Return { value: Some(ref value) }
+                    | Expr::Become { ref value }
+                    | Expr::Await(ref value) => core::slice::from_ref(value),
                     _ => &[],
                 };
                 for &value in values {
@@ -628,6 +631,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
             }
             Expr::Break { value, .. } | Expr::Return { value } => exprs.extend(value),
+            Expr::Become { value } => exprs.push(value),
             Expr::Call { callee, args } => {
                 exprs.push(callee);
                 exprs.extend_from_slice(b.expr_list(args)?);

@@ -686,6 +686,15 @@ pub(crate) fn call_rip_got<A: Allocator>(buf: &mut Vec<u8, A>) -> usize {
     at
 }
 
+/// `jmp [rip + disp32]` (GOT slot tail jump for JIT; returns byte offset of disp32 for `RelocKind::GotPc32`).
+pub(crate) fn jmp_rip_got<A: Allocator>(buf: &mut Vec<u8, A>) -> usize {
+    buf.push(0xff);
+    buf.push(0x25);
+    let at = buf.len();
+    buf.extend_from_slice(&0i32.to_le_bytes());
+    at
+}
+
 /// `mov dst, [rip + disp32]` (GOT load; returns byte offset of disp32 for `RelocKind::GotPc32`).
 pub(crate) fn mov_rip_got<A: Allocator>(buf: &mut Vec<u8, A>, dst: XReg) -> usize {
     buf.push(rex(true, dst, 0, 0));

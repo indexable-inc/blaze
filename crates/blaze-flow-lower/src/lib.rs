@@ -1321,6 +1321,13 @@ enum Task {
     LoopBack(ExprId),
     BreakDone(ExprId, bool),
     ReturnDone(ExprId, bool),
+    /// Settles the top `n_vals` evaluated callee/argument values into fresh temps at `temp_mark..`
+    /// and drops all locals and pre-`become` temps (below `temp_mark`) before transferring control
+    /// to the tail-called callee (RFC 3407: locals drop before the call runs).
+    BecomeDrops(ExprId, u32, u32),
+    /// Finishes `become` after the tail call completes: assigns the return place, drops the
+    /// settled argument temps from `temp_mark` up, and branches to `ret_block`.
+    BecomeReturnDone(ExprId, u32),
     RootEnd(ExprId),
     CallDone(ExprId, u32, bool, u32),
     CtorDone(ExprId, u32),
@@ -5002,6 +5009,80 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 self.vals.push(Val { at: At::Const, ty });
                 Ok(())
             }
+            Task::BecomeDrops(e, temp_mark, n_vals) => {
+                // Move/copy every evaluated callee and argument value (including those with
+                // lifetime positions, which `settle_operand` leaves in place) into a fresh temp
+                // above `temp_mark` BEFORE dropping all locals and pre-`become` temps.
+                let n = usize::try_from(n_vals).unwrap_or(0);
+                let Some(start) = self.vals.len().checked_sub(n) else {
+                    return self.refuse(Form::Malformed, e);
+                };
+                for idx in start..self.vals.len() {
+                    let Some(&v) = self.vals.get(idx) else {
+                        return self.refuse(Form::Malformed, e);
+                    };
+                    if let At::Place(p) = v.at {
+                        let pi = self.info(p);
+                        let mark = usize::try_from(temp_mark).unwrap_or(self.temps.len()).min(self.temps.len());
+                        let already_settled = pi.parent == u32::MAX
+                            && self.temps.get(mark..).is_some_and(|ts| ts.iter().any(|l| l.0 == pi.local));
+                        if !already_settled {
+                            let t = self.temp(v.ty, e)?;
+                            let tp = self.place_of(t);
+                            self.assign_val(tp, v.ty, v, e)?;
+                            if let Some(slot) = self.vals.get_mut(idx) {
+                                *slot = Val { at: At::Place(tp), ty: v.ty };
+                            }
+                        }
+                    }
+                }
+                let mark = usize::try_from(temp_mark).unwrap_or(self.temps.len()).min(self.temps.len());
+                let saved_len = self.temps.len() - mark;
+                let mut saved: Vec<Local, A> = Vec::with_capacity_in(saved_len, self.alloc);
+                if let Some(tail) = self.temps.get(mark..) {
+                    for &l in tail {
+                        saved.push(l);
+                    }
+                }
+                self.temps.truncate(mark);
+                let res = self.exit_drops(0, 0, e);
+                for l in saved {
+                    self.temps.push(l);
+                }
+                res
+            }
+            Task::BecomeReturnDone(e, temp_mark) => {
+                let v = self.pop(e)?;
+                let rp = self.place_of(Local(0));
+                let rt = self.local_ty[0];
+                if v.ty != rt {
+                    self.closure_sig_kept(v.ty.ty, e)?;
+                }
+                self.assign_val(rp, rt, v, e)?;
+                if !self.rpit_outs.is_empty() {
+                    let ri = self.info(rp);
+                    for &(slot, out_o) in self.rpit_outs.iter() {
+                        if let Some(idx) = ri.start.checked_add(slot).and_then(|v| usize::try_from(v).ok())
+                            && let Some(&orig) = self.origs.get(idx)
+                        {
+                            self.b.subset(orig, out_o);
+                        }
+                    }
+                }
+                let mark = usize::try_from(temp_mark).unwrap_or(self.temps.len()).min(self.temps.len());
+                let mut i = self.temps.len();
+                while i > mark {
+                    i -= 1;
+                    if let Some(&l) = self.temps.get(i) {
+                        self.drop_local(l, e)?;
+                    }
+                }
+                self.b.goto(self.ret_block, self.span(e));
+                self.fresh();
+                let ty = TyD::of(self.expr_ty(e)?);
+                self.vals.push(Val { at: At::Const, ty });
+                Ok(())
+            }
             Task::RootEnd(e) => {
                 let v = self.pop(e)?;
                 let rp = self.place_of(Local(0));
@@ -5374,6 +5455,87 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 self.tasks.push(Task::ReturnDone(e, value.is_some()));
                 if let Some(v) = value {
                     self.tasks.push(Task::Eval(v, false));
+                }
+            }
+            Expr::Become { value } => {
+                let mut call_e = value;
+                for _ in 0..16 {
+                    if let Expr::Paren(inner) = self.expr(call_e)? {
+                        call_e = inner;
+                    } else {
+                        break;
+                    }
+                }
+                match self.expr(call_e)? {
+                    Expr::Call { callee, args } => {
+                        let args = match body.expr_lists.get(args.range()) {
+                            Some(a) => a,
+                            None => return self.refuse(Form::Malformed, call_e),
+                        };
+                        let def = match self.expr(callee)? {
+                            Expr::Path(_) => self.expr_def(callee),
+                            _ => None,
+                        };
+                        if matches!(def, Some(Def::Ctor { .. })) {
+                            self.tasks.push(Task::ReturnDone(e, true));
+                            self.tasks.push(Task::Eval(value, false));
+                        } else {
+                            let value_callee = !matches!(def, Some(Def::Fn(_)));
+                            let mark = u32::try_from(self.two_phase.len()).unwrap_or(u32::MAX);
+                            let temp_mark = u32::try_from(self.temps.len()).unwrap_or(u32::MAX);
+                            let arg_count = u32::try_from(args.len()).unwrap_or(u32::MAX);
+                            let n_vals = arg_count + u32::from(value_callee);
+                            self.tasks.push(Task::BecomeReturnDone(e, temp_mark));
+                            if self.adjust_rows(call_e).0 < self.adjust_rows(call_e).1 {
+                                self.tasks.push(Task::Adjust(call_e, false, 0));
+                            }
+                            self.tasks.push(Task::CallDone(call_e, arg_count, value_callee, mark));
+                            self.tasks.push(Task::BecomeDrops(e, temp_mark, n_vals));
+                            for (j, &a) in args.iter().enumerate().rev() {
+                                if j + 1 < args.len() {
+                                    self.tasks.push(Task::Settle(a));
+                                }
+                                self.tasks.push(Task::Eval(a, false));
+                            }
+                            if value_callee {
+                                self.tasks.push(Task::Eval(callee, false));
+                            }
+                        }
+                    }
+                    Expr::MethodCall { receiver, args, .. } => {
+                        let args = match body.expr_lists.get(args.range()) {
+                            Some(a) => a,
+                            None => return self.refuse(Form::Malformed, call_e),
+                        };
+                        let mark = u32::try_from(self.two_phase.len()).unwrap_or(u32::MAX);
+                        let temp_mark = u32::try_from(self.temps.len()).unwrap_or(u32::MAX);
+                        let n_vals = 1 + u32::try_from(args.len()).unwrap_or(u32::MAX);
+                        self.tasks.push(Task::BecomeReturnDone(e, temp_mark));
+                        if self.adjust_rows(call_e).0 < self.adjust_rows(call_e).1 {
+                            self.tasks.push(Task::Adjust(call_e, false, 0));
+                        }
+                        self.tasks.push(Task::CallDone(call_e, n_vals, false, mark));
+                        self.tasks.push(Task::BecomeDrops(e, temp_mark, n_vals));
+                        for (j, &a) in args.iter().enumerate().rev() {
+                            if j + 1 < args.len() {
+                                self.tasks.push(Task::Settle(a));
+                            }
+                            self.tasks.push(Task::Eval(a, false));
+                        }
+                        if !args.is_empty() {
+                            self.tasks.push(Task::Settle(receiver));
+                        }
+                        let (lo, hi) = self.adjust_rows(receiver);
+                        let recv_mut = self.ck.adjusts.column::<1>().get(lo..hi).is_some_and(|ks| {
+                            ks.iter()
+                                .any(|k| matches!(k, AdjustKind::Borrow { mutbl: Mutbl::Mut, .. } | AdjustKind::Deref { overloaded: Some(Mutbl::Mut) }))
+                        });
+                        self.tasks.push(Task::Eval(receiver, recv_mut));
+                    }
+                    _ => {
+                        self.tasks.push(Task::ReturnDone(e, true));
+                        self.tasks.push(Task::Eval(value, false));
+                    }
                 }
             }
             Expr::Call { callee, args } => {
@@ -6048,7 +6210,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                                         self.b.subset(st, d_orig);
                                         self.b.subset(d_orig, st);
                                     }
-                                    closure::SigSlot::Late(_) => {}
+                                    closure::SigSlot::Late(_) | closure::SigSlot::InnerBound(..) => {}
                                     closure::SigSlot::Owner(_) => {}
                                 }
                             }
@@ -6418,6 +6580,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 | Expr::Break { .. }
                 | Expr::Continue { .. }
                 | Expr::Return { .. }
+                | Expr::Become { .. }
                 | Expr::Closure { .. }
                 | Expr::Await(_)
                 | Expr::AsyncBlock { .. }

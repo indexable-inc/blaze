@@ -2614,4 +2614,125 @@ block4 normal:
             assert_eq!(f2(a, bv), expected, "spilled mul_overflow mismatch for a={a:#x}, b={bv:#x}");
         }
     }
+
+    #[test]
+    fn explicit_tail_call_direct_and_indirect_baseline_sota_and_x64() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+
+        extern "C" fn add_pair(a: u64, b: u64) -> u64 {
+            a.wrapping_add(b).wrapping_add(1)
+        }
+        let target_addr = add_pair as *const () as u64;
+
+        // Direct `Op::TailCall` with a local stack slot (proving explicit tail calls work even
+        // when `view.slots` is non-empty, unlike implicit TCO).
+        let direct_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64), Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let slot = b.slot(16, 3, blaze_lir::func::SlotKind::Named);
+            let callee = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let addr = b.slot_addr(slot);
+            b.store(Flags::NONE, a, addr, 0, MemAttrs::aligned(3));
+            let loaded = b.load(Ty::I64, Flags::NONE, addr, 0, MemAttrs::aligned(3));
+            b.tail_call(Flags::NONE, callee, sig, &[loaded, bv]);
+            b.finish_checked().unwrap()
+        };
+
+        // Indirect `Op::TailCallIndirect` with a local stack slot.
+        let indirect_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            let callee_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64), Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let slot = b.slot(16, 3, blaze_lir::func::SlotKind::Named);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let fp = b.param(Ty::PTR);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let addr = b.slot_addr(slot);
+            b.store(Flags::NONE, bv, addr, 0, MemAttrs::aligned(3));
+            let loaded = b.load(Ty::I64, Flags::NONE, addr, 0, MemAttrs::aligned(3));
+            b.tail_call_indirect(Flags::NONE, fp, callee_sig, &[a, loaded]);
+            b.finish_checked().unwrap()
+        };
+
+        struct OneSym(Symbol);
+        impl Names for OneSym {
+            fn name(&self, of: Outside) -> Option<blaze_tier::Named<'_>> {
+                match of {
+                    Outside::Func(0) => Some(blaze_tier::Named::Symbol(self.0)),
+                    _ => None,
+                }
+            }
+            fn routines(&self) -> blaze_tier::RoutinePlaces {
+                NoNames.routines()
+            }
+        }
+        let sym = Symbol::of_name("add_pair");
+
+        // 1. Baseline (Reference) tier: record form + native execution.
+        let ref_direct = crate::Reference
+            .emit(verify(direct_fn.view()).unwrap(), &OneSym(sym), MAC_ARM64, alloc)
+            .expect("Reference emits Op::TailCall");
+        let (ex_rd, _k1) = load_exec_with_syms(ref_direct, &[(sym, target_addr)]);
+        let f_rd: extern "C" fn(u64, u64) -> u64 = unsafe { ex_rd.as_fn() };
+        assert_eq!(f_rd(19, 22), 42, "Reference Op::TailCall mismatch");
+
+        let ref_indirect = crate::Reference
+            .emit(verify(indirect_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Reference emits Op::TailCallIndirect");
+        let (ex_ri, _k2) = load_exec_with_syms(ref_indirect, &[]);
+        let f_ri: extern "C" fn(*const (), u64, u64) -> u64 = unsafe { ex_ri.as_fn() };
+        assert_eq!(f_ri(add_pair as *const (), 19, 22), 42, "Reference Op::TailCallIndirect mismatch");
+
+        // 2. SOTA ARM64 (GotSlot JIT mode AND DirectBl export mode): native execution.
+        let sota_direct = Sota::standalone()
+            .emit(verify(direct_fn.view()).unwrap(), &OneSym(sym), MAC_ARM64, alloc)
+            .expect("Sota ARM64 GotSlot emits Op::TailCall");
+        let (ex_sd, _k3) = load_exec_with_syms(sota_direct, &[(sym, target_addr)]);
+        let f_sd: extern "C" fn(u64, u64) -> u64 = unsafe { ex_sd.as_fn() };
+        assert_eq!(f_sd(19, 22), 42, "Sota ARM64 GotSlot Op::TailCall mismatch");
+
+        let sota_indirect = Sota::standalone()
+            .emit(verify(indirect_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota ARM64 emits Op::TailCallIndirect");
+        let (ex_si, _k4) = load_exec_with_syms(sota_indirect, &[]);
+        let f_si: extern "C" fn(*const (), u64, u64) -> u64 = unsafe { ex_si.as_fn() };
+        assert_eq!(f_si(add_pair as *const (), 19, 22), 42, "Sota ARM64 Op::TailCallIndirect mismatch");
+
+        let sota_direct_bl = Sota::for_export()
+            .emit(verify(direct_fn.view()).unwrap(), &OneSym(sym), MAC_ARM64, alloc)
+            .expect("Sota ARM64 DirectBl emits Op::TailCall");
+        assert!(
+            sota_direct_bl.relocs.iter().any(|r| r.kind == blaze_tier::RelocKind::Branch26),
+            "Sota DirectBl Op::TailCall must emit a Branch26 tail branch"
+        );
+
+        // 3. SOTA x86-64 (GotSlot and DirectBl): emit cleanly without refusal.
+        let linux_x64 = Machine { arch: Arch::X86_64, os: Os::Linux, features: 0 };
+        let x64_d_got = Sota::standalone()
+            .emit(verify(direct_fn.view()).unwrap(), &OneSym(sym), linux_x64, alloc)
+            .expect("Sota x86-64 GotSlot emits Op::TailCall");
+        assert!(!x64_d_got.code.is_empty());
+        let x64_d_rel = Sota::for_export()
+            .emit(verify(direct_fn.view()).unwrap(), &OneSym(sym), linux_x64, alloc)
+            .expect("Sota x86-64 DirectBl emits Op::TailCall");
+        assert!(!x64_d_rel.code.is_empty());
+        let x64_ind = Sota::standalone()
+            .emit(verify(indirect_fn.view()).unwrap(), &NoNames, linux_x64, alloc)
+            .expect("Sota x86-64 emits Op::TailCallIndirect");
+        assert!(!x64_ind.code.is_empty());
+    }
 }
