@@ -13,6 +13,20 @@ use core::slice;
 
 use crate::{AllocFailure, Vec};
 
+/// A decoded LZ77 sequence `(lit_len, match_len, offset)` for batched execution via
+/// [`ByteCursor::exec_seq_batch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeqOp {
+    pub lit_len: u32,
+    pub match_len: u32,
+    pub offset: u32,
+}
+
+impl SeqOp {
+    /// Zero-initialized placeholder entry for fixed-size stack batches.
+    pub const ZERO: Self = Self { lit_len: 0, match_len: 0, offset: 0 };
+}
+
 /// A register-cached, zero-pre-zeroing append cursor over a [`Vec<u8, A>`].
 ///
 /// Maintains `0..self.len` as initialized bytes within `self.base` (`self.len <= self.cap <=
@@ -48,6 +62,13 @@ impl<'a, A: Allocator> ByteCursor<'a, A> {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Total allocated capacity of the underlying vector in bytes.
+    #[inline(always)]
+    #[must_use]
+    pub const fn cap(&self) -> usize {
+        self.cap
     }
 
     /// Allocated spare bytes remaining before a reallocation is required.
@@ -364,10 +385,373 @@ impl<'a, A: Allocator> ByteCursor<'a, A> {
         true
     }
 
+    /// Call-free inline fast path for executing one decoded LZ77 sequence inside a zero-call
+    /// fused decoder loop (`decode_exec_leaf`).
+    ///
+    /// Executes inline with 16B/32B NEON wildcopies (plus 8B/16B inline copies for `8 <= offset
+    /// < 16` and an inline 16B match wildcopy loop for `match_len > 32`) whenever `lit_len <= 32`,
+    /// `lit_pos <= literals.len().saturating_sub(32)`, `after_lit + match_len <=
+    /// self.cap.saturating_sub(48)`, and `offset <= after_lit`.
+    /// Returns `false` without mutating `self.len` on rare cases (`lit_len > 32`, `offset < 8`,
+    /// `offset < 16 && match_len > 16`, or final 32B literal slack) so the caller can dispatch
+    /// that single sequence out-of-line without placing any `bl` call inside the hot leaf loop.
+    #[inline(always)]
+    pub fn try_exec_seq_leaf(
+        &mut self,
+        literals: &[u8],
+        lit_pos: usize,
+        lit_len: usize,
+        offset: usize,
+        match_len: usize,
+    ) -> bool {
+        let lit_safe_end = literals.len().saturating_sub(32);
+        let out_safe_end = self.cap.saturating_sub(48);
+        let len = self.len;
+        let after_lit = len + lit_len;
+        let next_out = after_lit + match_len;
+        if lit_len > 32
+            || lit_pos > lit_safe_end
+            || next_out > out_safe_end
+            || offset == 0
+            || offset > after_lit
+        {
+            return false;
+        }
+        if offset < 16 {
+            if offset < 8 || match_len > 16 {
+                return false;
+            }
+            // SAFETY:
+            // - `lit_pos + 32 <= literals.len()` and `len + 32 < self.cap`.
+            // - `8 <= offset <= after_lit`, `match_len <= 16`, and `after_lit + 16 < self.cap`,
+            //   so each 8B copy is non-overlapping and reads initialized history.
+            unsafe {
+                let ls = literals.as_ptr().add(lit_pos);
+                let ld = self.base.add(len);
+                ptr::copy_nonoverlapping(ls, ld, 16);
+                if lit_len > 16 {
+                    ptr::copy_nonoverlapping(ls.add(16), ld.add(16), 16);
+                }
+                let ms = self.base.add(after_lit - offset);
+                let md = self.base.add(after_lit);
+                ptr::copy_nonoverlapping(ms, md, 8);
+                if match_len > 8 {
+                    ptr::copy_nonoverlapping(ms.add(8), md.add(8), 8);
+                }
+            }
+            self.len = next_out;
+            return true;
+        }
+        // SAFETY:
+        // - `lit_pos + 32 <= literals.len()` and `len + 32 < self.cap`, so 1x16B and 2x16B
+        //   wildcopies of literals stay strictly in bounds and non-overlapping.
+        // - `16 <= offset <= after_lit` and `next_out + 48 <= self.cap`, so every 16B match
+        //   wildcopy chunk reads initialized history non-overlapping with `dst` and writes
+        //   strictly inside `self.base..self.base + self.cap`.
+        unsafe {
+            let ls = literals.as_ptr().add(lit_pos);
+            let ld = self.base.add(len);
+            ptr::copy_nonoverlapping(ls, ld, 16);
+            if lit_len > 16 {
+                ptr::copy_nonoverlapping(ls.add(16), ld.add(16), 16);
+            }
+
+            let ms = self.base.add(after_lit - offset);
+            let md = self.base.add(after_lit);
+            ptr::copy_nonoverlapping(ms, md, 16);
+            if match_len > 16 {
+                ptr::copy_nonoverlapping(ms.add(16), md.add(16), 16);
+                if match_len > 32 {
+                    let mut sp = ms.add(32);
+                    let mut dp = md.add(32);
+                    let end = md.add(match_len);
+                    while dp < end {
+                        ptr::copy_nonoverlapping(sp, dp, 16);
+                        sp = sp.add(16);
+                        dp = dp.add(16);
+                    }
+                }
+            }
+        }
+        self.len = next_out;
+        true
+    }
+
+    /// Execute a batch of decoded LZ77 sequences (`&[SeqOp]`) back-to-back in a tight
+    /// register-resident 128-bit NEON wildcopy loop.
+    ///
+    /// Pre-verifies the entire batch's literal and output slack once up front so the 99% hot
+    /// loop runs with zero per-sequence bounds checks, inline 16B/32B NEON literal & match
+    /// wildcopies (never calling `_memcpy`), and a single unsigned offset check.
+    ///
+    /// Returns `false` if any sequence violates `literals`, `self.spare()`, or `offset` bounds.
+    #[inline(never)]
+    pub fn exec_seq_batch(
+        &mut self,
+        literals: &[u8],
+        lit_pos: &mut usize,
+        seqs: &[SeqOp],
+    ) -> bool {
+        let base = self.base;
+        let cap = self.cap;
+        let mut len = self.len;
+        let lit_base = literals.as_ptr();
+        let lit_total = literals.len();
+        let mut lp = *lit_pos;
+        if lp > lit_total {
+            return false;
+        }
+
+        // Verify once whether the entire batch has >= 32B literal slack and >= 48B output slack.
+        // For batches `<= 64`, `sum_lits` and `sum_out` in `u64` cannot overflow (`<= 128 * u32::MAX`).
+        let mut sum_lits_u64: u64 = 0;
+        let mut sum_out_u64: u64 = 0;
+        let fits_fast = seqs.len() <= 64;
+        if fits_fast {
+            for seq in seqs {
+                let ll = u64::from(seq.lit_len);
+                let ml = u64::from(seq.match_len);
+                sum_lits_u64 += ll;
+                sum_out_u64 += ll + ml;
+            }
+        }
+        let (Ok(sum_lits), Ok(sum_out)) =
+            (usize::try_from(sum_lits_u64), usize::try_from(sum_out_u64))
+        else {
+            return self.exec_seq_batch_tail(literals, lit_pos, seqs);
+        };
+
+        let lit_slack_ok = fits_fast && lit_total - lp >= sum_lits.saturating_add(32);
+        let out_slack_ok = fits_fast && cap - len >= sum_out.saturating_add(48);
+        if lit_slack_ok && out_slack_ok {
+            for seq in seqs {
+                let Ok(lit_len) = usize::try_from(seq.lit_len) else {
+                    self.len = len;
+                    *lit_pos = lp;
+                    return false;
+                };
+                let Ok(match_len) = usize::try_from(seq.match_len) else {
+                    self.len = len;
+                    *lit_pos = lp;
+                    return false;
+                };
+                let Ok(offset) = usize::try_from(seq.offset) else {
+                    self.len = len;
+                    *lit_pos = lp;
+                    return false;
+                };
+
+                // 1. Copy literals: 1x16B for <= 16, 2x16B for 17..=32, cold helper for > 32.
+                // SAFETY: Batch pre-check guarantees `lp + lit_len + 32 <= lit_total` and
+                // `len + lit_len + 48 <= cap`.
+                unsafe {
+                    let s = lit_base.add(lp);
+                    let d = base.add(len);
+                    ptr::copy_nonoverlapping(s, d, 16);
+                    if lit_len > 16 {
+                        ptr::copy_nonoverlapping(s.add(16), d.add(16), 16);
+                        if lit_len > 32 {
+                            copy_lit_tail_raw(s.add(32), d.add(32), lit_len - 32);
+                        }
+                    }
+                }
+                lp += lit_len;
+                let after_lit = len + lit_len;
+
+                // Single unsigned compare rejects both `offset == 0` and `offset > after_lit`.
+                if offset.wrapping_sub(1) >= after_lit {
+                    self.len = after_lit;
+                    *lit_pos = lp;
+                    return false;
+                }
+
+                // 2. Copy match: 1x16B for <= 16, 2x16B for 17..=32, wildcopy loop for > 32.
+                if offset >= 16 {
+                    // SAFETY: `16 <= offset <= after_lit` and `after_lit + match_len + 48 <= cap`.
+                    unsafe {
+                        let s = base.add(after_lit - offset);
+                        let d = base.add(after_lit);
+                        ptr::copy_nonoverlapping(s, d, 16);
+                        if match_len > 16 {
+                            ptr::copy_nonoverlapping(s.add(16), d.add(16), 16);
+                            if match_len > 32 {
+                                let mut sp = s.add(32);
+                                let mut dp = d.add(32);
+                                let end = d.add(match_len);
+                                while dp < end {
+                                    ptr::copy_nonoverlapping(sp, dp, 16);
+                                    sp = sp.add(16);
+                                    dp = dp.add(16);
+                                }
+                            }
+                        }
+                    }
+                } else if offset >= 8 && match_len <= 16 {
+                    // SAFETY: `8 <= offset <= after_lit` and `after_lit + 16 <= cap`.
+                    unsafe {
+                        let s = base.add(after_lit - offset);
+                        let d = base.add(after_lit);
+                        ptr::copy_nonoverlapping(s, d, 8);
+                        if match_len > 8 {
+                            ptr::copy_nonoverlapping(s.add(8), d.add(8), 8);
+                        }
+                    }
+                } else if match_len > 0 {
+                    copy_match_overlap_raw(base, after_lit, offset, match_len);
+                }
+                len = after_lit + match_len;
+            }
+            self.len = len;
+            *lit_pos = lp;
+            return true;
+        }
+
+        self.exec_seq_batch_tail(literals, lit_pos, seqs)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn exec_seq_batch_tail(
+        &mut self,
+        literals: &[u8],
+        lit_pos: &mut usize,
+        seqs: &[SeqOp],
+    ) -> bool {
+        let base = self.base;
+        let cap = self.cap;
+        let mut len = self.len;
+        let lit_base = literals.as_ptr();
+        let lit_total = literals.len();
+        let mut lp = *lit_pos;
+        if lp > lit_total {
+            return false;
+        }
+        // Tail fallback for the final batch of a block where < 32B literal slack remains.
+        for seq in seqs {
+            let Ok(lit_len) = usize::try_from(seq.lit_len) else {
+                self.len = len;
+                *lit_pos = lp;
+                return false;
+            };
+            let Ok(match_len) = usize::try_from(seq.match_len) else {
+                self.len = len;
+                *lit_pos = lp;
+                return false;
+            };
+            let Ok(offset) = usize::try_from(seq.offset) else {
+                self.len = len;
+                *lit_pos = lp;
+                return false;
+            };
+
+            let src_rem = lit_total - lp;
+            let spare = cap - len;
+            let Some(seq_out) = lit_len.checked_add(match_len) else {
+                self.len = len;
+                *lit_pos = lp;
+                return false;
+            };
+            if lit_len > src_rem || seq_out > spare {
+                self.len = len;
+                *lit_pos = lp;
+                return false;
+            }
+            let after_lit = len + lit_len;
+            if offset.wrapping_sub(1) >= after_lit {
+                self.len = len;
+                *lit_pos = lp;
+                return false;
+            }
+
+            if lit_len <= 16 && src_rem >= 16 && spare >= 16 {
+                // SAFETY: `lp + 16 <= lit_total` and `len + 16 <= cap`.
+                unsafe {
+                    ptr::copy_nonoverlapping(lit_base.add(lp), base.add(len), 16);
+                }
+            } else if lit_len > 0 {
+                // SAFETY: `lp + lit_len <= lit_total` and `len + lit_len <= cap`.
+                unsafe {
+                    copy_lit_tail_raw(lit_base.add(lp), base.add(len), lit_len);
+                }
+            }
+            lp += lit_len;
+
+            let spare_m = cap - after_lit;
+            if offset >= 16 && spare_m - match_len >= 16 {
+                // SAFETY: `16 <= offset <= after_lit` and `spare_m >= match_len + 16`.
+                unsafe {
+                    let mut s = base.add(after_lit - offset);
+                    let mut d = base.add(after_lit);
+                    ptr::copy_nonoverlapping(s, d, 16);
+                    if match_len > 16 {
+                        let end = d.add(match_len);
+                        s = s.add(16);
+                        d = d.add(16);
+                        while d < end {
+                            ptr::copy_nonoverlapping(s, d, 16);
+                            s = s.add(16);
+                            d = d.add(16);
+                        }
+                    }
+                }
+            } else if offset >= 8 && match_len <= 16 && spare_m >= 16 {
+                // SAFETY: `8 <= offset <= after_lit` and `after_lit + 16 <= cap`.
+                unsafe {
+                    let s = base.add(after_lit - offset);
+                    let d = base.add(after_lit);
+                    ptr::copy_nonoverlapping(s, d, 8);
+                    if match_len > 8 {
+                        ptr::copy_nonoverlapping(s.add(8), d.add(8), 8);
+                    }
+                }
+            } else if match_len > 0 {
+                copy_match_overlap_raw(base, after_lit, offset, match_len);
+            }
+            len = after_lit + match_len;
+        }
+
+        self.len = len;
+        *lit_pos = lp;
+        true
+    }
+
     /// Commit the written length back into the underlying [`Vec<u8, A>`].
     #[inline(always)]
     pub fn finish(self) {
         drop(self);
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn copy_lit_tail_raw(src: *const u8, dst: *mut u8, len: usize) {
+    // SAFETY: Caller verified `src..src + len` and `dst..dst + len` are valid and non-overlapping.
+    unsafe {
+        ptr::copy_nonoverlapping(src, dst, len);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn copy_match_overlap_raw(base: *mut u8, after_lit: usize, offset: usize, match_len: usize) {
+    // SAFETY: Caller verified `1 <= offset <= after_lit` and `after_lit + match_len <= cap`.
+    unsafe {
+        let src = base.add(after_lit - offset);
+        let dst = base.add(after_lit);
+        if offset == 1 {
+            let byte = *src;
+            ptr::write_bytes(dst, byte, match_len);
+        } else if offset >= match_len {
+            ptr::copy_nonoverlapping(src, dst, match_len);
+        } else {
+            ptr::copy_nonoverlapping(src, dst, offset);
+            let mut copied = offset;
+            while copied < match_len {
+                let chunk = copied.min(match_len - copied);
+                ptr::copy_nonoverlapping(dst, dst.add(copied), chunk);
+                copied += chunk;
+            }
+        }
     }
 }
 
@@ -585,6 +969,58 @@ impl<'a> RevBitCursor<'a> {
             }
             false
         }
+    }
+
+    /// Call-free, branch-minimal reload for loops that guard `self.avail_bytes() >= 8` and
+    /// `self.bits_consumed() < 64`. Because `bits_consumed >> 3 <= 7 < 8 <= avail`, this compiles
+    /// to a single 4-instruction unaligned load with no clamping or tail call.
+    /// Returns `false` if `< 8` unread bytes remain or `bits_consumed >= 64`.
+    #[inline(always)]
+    pub fn reload_if_slack8(&mut self) -> bool {
+        let avail = self.avail_bytes();
+        if avail < 8 || self.bits_consumed >= 64 {
+            return false;
+        }
+        let [lo, ..] = self.bits_consumed.to_le_bytes();
+        let adv = usize::from(lo >> 3);
+        // SAFETY: `adv <= 7 < 8 <= avail = ptr - start`, so `ptr.sub(adv) > start` and
+        // `ptr.sub(adv)..ptr.sub(adv) + 8` lies strictly within the borrowed slice.
+        unsafe {
+            self.ptr = self.ptr.sub(adv);
+            self.container = u64::from_le(ptr::read_unaligned(self.ptr.cast::<u64>()));
+        }
+        self.bits_consumed &= 7;
+        true
+    }
+
+    /// Call-free, branch-minimal reload for loops that already guard `self.avail_bytes() >= 16`.
+    /// Clamps safely to `self.start` if called with less slack, with zero out-of-line calls so
+    /// LLVM keeps every hot cursor register live with zero spills.
+    #[inline(always)]
+    pub fn reload_fast(&mut self) {
+        let avail = self.avail_bytes();
+        if avail > 0 {
+            let [lo, ..] = self.bits_consumed.to_le_bytes();
+            let adv = usize::from(lo >> 3);
+            let step = adv.min(avail);
+            // SAFETY: `avail > 0` implies original `len >= 8`, and `step <= avail = ptr - start`,
+            // so `self.ptr.sub(step)..self.ptr.sub(step) + 8` lies strictly inside the slice.
+            unsafe {
+                self.ptr = self.ptr.sub(step);
+                self.container = u64::from_le(ptr::read_unaligned(self.ptr.cast::<u64>()));
+            }
+            let step_bits = u32::try_from(step).unwrap_or(0) << 3;
+            self.bits_consumed = self.bits_consumed.saturating_sub(step_bits);
+        }
+    }
+
+    /// Return the current bit container shifted left by `bits_consumed & 63` so the next unread
+    /// bits sit at the MSB (`63` down). Enables parallel multi-field bit extraction after a
+    /// verified reload (`bits_consumed <= 7`, `>= 57` live bits).
+    #[inline(always)]
+    #[must_use]
+    pub const fn bits_window(&self) -> u64 {
+        self.container.wrapping_shl(self.bits_consumed)
     }
 
     /// Branchless peek of `64 - shift_r` bits (`1..=16`). Caller must ensure `bits_consumed < 64`.
@@ -889,5 +1325,97 @@ mod tests {
         assert_eq!(&out.as_slice()[28..52], &lits[..24]);
         assert_eq!(&out.as_slice()[52..62], &lits[24..34]);
         assert_eq!(out.len(), 92);
+    }
+
+    #[test]
+    fn byte_cursor_leaf_batch_and_rev_bit_cursor_fast_reloads() {
+        use super::{RevBitCursor, SeqOp};
+
+        let h = heap();
+        let alloc = h.alloc();
+        let lits = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+        // 1. `try_exec_seq_leaf` covers <=16B & 17..=32B literals, >=16B & 8..15B offsets,
+        //    and rejects out-of-contract inputs without mutating `len`.
+        let mut out = Vec::try_with_capacity_in(512, alloc).expect("cap");
+        let mut expected = Vec::new_in(alloc);
+        {
+            let mut cur = out.byte_cursor();
+            assert!(cur.cap() >= 512);
+            // 20B lits (>16, <=32) + 20B match (offset 20 >= 16, ml > 16)
+            assert!(cur.try_exec_seq_leaf(lits, 0, 20, 20, 20));
+            // 5B lits (<=16) + 40B match (offset 25 >= 16, ml > 32 wildcopy loop)
+            assert!(cur.try_exec_seq_leaf(lits, 20, 5, 25, 40));
+            // 18B lits + offset 10 (8..15 inline path), ml 13 (>8, <=16)
+            assert!(cur.try_exec_seq_leaf(lits, 25, 18, 10, 13));
+            // Rejections must leave `cur.len()` untouched:
+            let saved_len = cur.len();
+            assert!(!cur.try_exec_seq_leaf(lits, 43, 33, 16, 4)); // lit_len > 32
+            assert!(!cur.try_exec_seq_leaf(lits, 43, 4, 4, 8)); // offset < 8
+            assert!(!cur.try_exec_seq_leaf(lits, 43, 4, 10, 20)); // offset < 16 && ml > 16
+            assert!(!cur.try_exec_seq_leaf(lits, 43, 4, 0, 4)); // offset == 0
+            assert!(!cur.try_exec_seq_leaf(lits, 43, 4, saved_len + 100, 4)); // offset > after_lit
+            assert!(!cur.try_exec_seq_leaf(lits, lits.len() - 10, 4, 16, 4)); // <32B lit slack
+            assert_eq!(cur.len(), saved_len);
+            cur.finish();
+        }
+        for &(lp, ll, off, ml) in &[(0usize, 20usize, 20usize, 20usize), (20, 5, 25, 40), (25, 18, 10, 13)]
+        {
+            expected.extend_from_slice(&lits[lp..lp + ll]);
+            for _ in 0..ml {
+                let b = expected[expected.len() - off];
+                expected.push(b);
+            }
+        }
+        assert_eq!(out.as_slice(), expected.as_slice());
+
+        // 2. `exec_seq_batch` fast batch path + tail path.
+        let mut batch_out = Vec::try_with_capacity_in(512, alloc).expect("cap");
+        let seqs = [
+            SeqOp { lit_len: 20, match_len: 20, offset: 20 },
+            SeqOp { lit_len: 5, match_len: 40, offset: 25 },
+            SeqOp { lit_len: 18, match_len: 13, offset: 10 },
+        ];
+        let mut lp = 0usize;
+        {
+            let mut cur = batch_out.byte_cursor();
+            assert!(cur.exec_seq_batch(lits, &mut lp, &seqs));
+            // Tail path (<32B literal slack remaining):
+            let tail_start = lits.len() - 12;
+            lp = tail_start;
+            assert!(cur.exec_seq_batch(
+                lits,
+                &mut lp,
+                &[SeqOp { lit_len: 12, match_len: 6, offset: 3 }],
+            ));
+            assert_eq!(lp, lits.len());
+            cur.finish();
+        }
+        expected.extend_from_slice(&lits[lits.len() - 12..]);
+        for _ in 0..6 {
+            let b = expected[expected.len() - 3];
+            expected.push(b);
+        }
+        assert_eq!(batch_out.as_slice(), expected.as_slice());
+
+        // 3. `RevBitCursor::reload_if_slack8`, `bits_window`, and `reload_fast`.
+        let stream: [u8; 20] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10, 0x11, 0x12, 0x13, 0x80,
+        ];
+        let mut rbc = RevBitCursor::new(&stream).expect("valid");
+        assert_eq!(rbc.avail_bytes(), 12);
+        assert!(rbc.reload_if_slack8());
+        // Sentinel `0x80` leaves 7 zero bits before 0x13, 0x12, 0x11, ...
+        let w = rbc.bits_window();
+        assert_eq!(w >> (64 - 7), 0);
+        assert_eq!((w << 7) >> (64 - 8), 0x13);
+        rbc.advance_fast(7 + 8 + 8 + 8 + 8); // 1 sentinel + 39 = 40 bits -> advances 5 bytes
+        assert!(rbc.reload_if_slack8());
+        assert_eq!(rbc.avail_bytes(), 7);
+        assert!(!rbc.reload_if_slack8()); // avail == 7 (< 8)
+        rbc.advance_fast(32); // advances 4 bytes via clamping `reload_fast` -> avail becomes 3
+        rbc.reload_fast();
+        assert_eq!(rbc.avail_bytes(), 3);
     }
 }

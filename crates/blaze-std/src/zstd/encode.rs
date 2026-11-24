@@ -16,46 +16,54 @@ use crate::zstd::fse::{
 use crate::zstd::huffman::{HuffEncCache, encode_huffman_literals_into};
 use crate::zstd::{CompressOpts, Level, MAX_BLOCK_SIZE, ZSTD_MAGIC, ZstdError};
 
-/// 1 MiB sliding window for multi-block frames (well within `ZstdLimits::USUAL` = 8 MiB).
-const MAX_WINDOW: usize = 1 << 20;
-/// Window_Descriptor for exact 1 MiB window: exponent = 10, mantissa = 0 (`1 << (10 + 10)`).
-const WINDOW_DESC_1M: u8 = 10u8 << 3;
-const EMPTY_HASH: u32 = u32::MAX;
+/// 4 MiB sliding window for multi-block frames (well within `ZstdLimits::USUAL` = 8 MiB).
+const MAX_WINDOW: usize = 4 << 20;
+/// Window_Descriptor for exact 4 MiB window: exponent = 12, mantissa = 0 (`1 << (10 + 12)`).
+const WINDOW_DESC_4M: u8 = 12u8 << 3;
 const HASH5_PRIME: u64 = 889_523_592_379;
 const MASK_5BYTES: u64 = 0x0000_00FF_FFFF_FFFF;
 
-const FAST_HASH_LOG: u32 = 14;
-const FAST_HASH_SIZE: usize = 1 << FAST_HASH_LOG;
+const FAST_HASH_LOG: u32 = 15;
+const FAST_HASH_SIZE: usize = 1 << FAST_HASH_LOG; // 32K entries = 128 KiB (L1D-resident)
 const FAST_HASH_MASK: usize = FAST_HASH_SIZE - 1;
 
-const DEF_HASH_LOG: u32 = 14;
-const DEF_TABLE_SIZE: usize = 1 << (DEF_HASH_LOG + 1); // 2-way associative: 16K buckets x 2
+const DEF_HASH_LOG: u32 = 15;
+const DEF_TABLE_SIZE: usize = 1 << (DEF_HASH_LOG + 1); // 2-way associative: 32K buckets x 2 = 256 KiB
 const DEF_BUCKET_MASK: usize = (1 << DEF_HASH_LOG) - 1;
 
+/// Raw LZ77 sequence `(lit_len, match_len, offset_value)` stored directly by match finders
+/// without touching LL/ML/OF code LUTs in the hot LZ77 loop (mirrors C zstd `seqDef`).
+#[derive(Clone, Copy)]
+struct RawSeq {
+    lit_len: u32,
+    match_len: u32,
+    offset_value: u32,
+}
+
+/// Compact 16-byte FSE-encoded sequence (`of_bits == u32::from(of_code)`).
 #[derive(Clone, Copy)]
 struct EncodedSeq {
-    ll_code: u8,
-    ll_extra: u32,
-    ll_bits: u32,
-    ml_code: u8,
-    ml_extra: u32,
-    ml_bits: u32,
-    of_code: u8,
     of_extra: u32,
-    of_bits: u32,
+    ll_extra: u16,
+    ml_extra: u16,
+    ll_code: u8,
+    ml_code: u8,
+    of_code: u8,
+    ll_bits: u8,
+    ml_bits: u8,
 }
 
 #[inline]
-fn ensure_empty_hash<A: Allocator>(table: &mut Vec<u32, A>, len: usize) -> Result<(), ZstdError> {
+fn ensure_zero_hash<A: Allocator>(table: &mut Vec<u32, A>, len: usize) -> Result<(), ZstdError> {
     if table.len() >= len {
         if let Some(s) = table.as_mut_slice().get_mut(..len) {
-            s.fill(EMPTY_HASH);
+            s.fill(0);
         }
         return Ok(());
     }
     table.clear();
     table.try_reserve(len)?;
-    let chunk = [EMPTY_HASH; 256];
+    let chunk = [0u32; 256];
     let mut rem = len;
     while rem >= chunk.len() {
         table.try_extend_from_slice(&chunk)?;
@@ -149,14 +157,16 @@ fn is_all_same(bytes: &[u8]) -> Option<u8> {
 
 #[inline(always)]
 fn read_u32_at(input: &[u8], pos: usize) -> Option<u32> {
-    let arr = input.get(pos..)?.first_chunk::<4>()?;
-    Some(u32::from_le_bytes(*arr))
+    let s = input.get(pos..pos + 4)?;
+    let arr: [u8; 4] = s.try_into().ok()?;
+    Some(u32::from_le_bytes(arr))
 }
 
 #[inline(always)]
 fn read_u64_at(input: &[u8], pos: usize) -> Option<u64> {
-    let arr = input.get(pos..)?.first_chunk::<8>()?;
-    Some(u64::from_le_bytes(*arr))
+    let s = input.get(pos..pos + 8)?;
+    let arr: [u8; 8] = s.try_into().ok()?;
+    Some(u64::from_le_bytes(arr))
 }
 
 #[inline(always)]
@@ -226,44 +236,33 @@ impl PredefinedEncTables {
 }
 
 #[inline(always)]
-fn emit_sequence<A: Allocator>(
-    input: &[u8],
+fn emit_raw_seq<A: Allocator>(
+    src: &[u8],
     lit_anchor: usize,
     pos: usize,
     ml: usize,
     ov: u32,
     rep: &mut [usize; 3],
     lit_cur: &mut blaze_own::ByteCursor<'_, A>,
-    seqs: &mut Vec<EncodedSeq, A>,
+    raw_seqs: &mut Vec<RawSeq, A>,
 ) -> Result<(), ZstdError> {
     let lit_len = pos - lit_anchor;
-    if lit_len > 0 && !lit_cur.write_lits_wild(input, lit_anchor, lit_len) {
+    if lit_len > 0 && !lit_cur.write_lits_wild(src, lit_anchor, lit_len) {
         return Err(ZstdError::CorruptLiterals);
     }
-
-    let (ll_code, ll_extra, ll_bits) = encode_ll(lit_len).ok_or(ZstdError::CorruptSequences)?;
-    let (ml_code, ml_extra, ml_bits) = encode_ml(ml).ok_or(ZstdError::CorruptSequences)?;
-    let (of_code, of_extra, of_bits) = encode_of(ov).ok_or(ZstdError::CorruptSequences)?;
-
-    seqs.try_push(EncodedSeq {
-        ll_code,
-        ll_extra,
-        ll_bits,
-        ml_code,
-        ml_extra,
-        ml_bits,
-        of_code,
-        of_extra,
-        of_bits,
-    })
-    .map_err(|r| r.why)?;
-
+    let lit_u32 = u32::try_from(lit_len).map_err(|_| ZstdError::CorruptSequences)?;
+    let ml_u32 = u32::try_from(ml).map_err(|_| ZstdError::CorruptSequences)?;
+    raw_seqs
+        .try_push(RawSeq { lit_len: lit_u32, match_len: ml_u32, offset_value: ov })
+        .map_err(|r| r.why)?;
     apply_rep_update(rep, ov, lit_len);
     Ok(())
 }
 
-/// Fast 5-byte-hash single-probe matcher over a fixed-size `&mut [u32; FAST_HASH_SIZE]` array
-/// (masked index elides hash-table bounds checks) and zero-pre-zeroing `ByteCursor` literals.
+/// Fast 5-byte-hash single-probe matcher over a 17-bit zero-initialized `&mut [u32; FAST_HASH_SIZE]`
+/// table. Marked `#[inline(never)]` so `HASH5_PRIME`, `src.as_ptr()`, `hash_table.as_ptr()`, and
+/// `lit_cur` stay register-pinned with zero LL/ML/OF LUT lookups in the LZ77 hot loop.
+#[inline(never)]
 fn find_block_sequences_fast<A: Allocator>(
     input: &[u8],
     block_start: usize,
@@ -271,84 +270,66 @@ fn find_block_sequences_fast<A: Allocator>(
     hash_table: &mut [u32; FAST_HASH_SIZE],
     rep: &mut [usize; 3],
     literals_buf: &mut Vec<u8, A>,
-    seqs: &mut Vec<EncodedSeq, A>,
+    raw_seqs: &mut Vec<RawSeq, A>,
 ) -> Result<(), ZstdError> {
     literals_buf.clear();
-    seqs.clear();
+    raw_seqs.clear();
+
+    let src = input.get(..block_end).ok_or(ZstdError::CorruptLiterals)?;
+    let max_u32_idx = usize::try_from(u32::MAX - 1).unwrap_or(usize::MAX);
+    if src.len() > max_u32_idx {
+        return Err(ZstdError::CorruptSequences);
+    }
 
     let block_len = block_end.saturating_sub(block_start);
+    raw_seqs.try_reserve(block_len / 3 + 32)?;
     let mut lit_cur = literals_buf.byte_cursor();
     lit_cur.try_reserve(block_len.saturating_add(32))?;
 
-    let mut pos = block_start;
+    let mut pos = block_start.max(1);
     let mut lit_anchor = block_start;
-    let match_limit = block_end.saturating_sub(8);
-    let window_limit = MAX_WINDOW.min(input.len());
+    let match_limit = src.len().saturating_sub(8);
+    let window_limit = MAX_WINDOW.min(src.len());
 
     while pos <= match_limit {
-        let Some(cur8) = read_u64_at(input, pos) else {
+        let Some(cur8) = read_u64_at(src, pos) else {
             break;
         };
 
-        // 1. Fast 1-compare repeat-offset probe (`rep[0]` at `pos + 1`, where `lit_len >= 1`).
-        let [r0, r1, _] = *rep;
-        if pos + 1 <= match_limit
-            && r0 >= 1
-            && r0 <= pos + 1
-            && r0 <= window_limit
-            && let Some(next4) = read_u32_at(input, pos + 1)
-            && read_u32_at(input, pos + 1 - r0) == Some(next4)
-        {
-            let h = hash5_u64(cur8, FAST_HASH_LOG) & FAST_HASH_MASK;
-            if let Ok(pos_u32) = u32::try_from(pos)
-                && pos_u32 != EMPTY_HASH
-                && let Some(slot) = hash_table.get_mut(h)
-            {
-                *slot = pos_u32;
-            }
-            pos += 1;
-            let ml = 4 + match_len_at(input, pos - r0 + 4, pos + 4, block_end);
-            emit_sequence(input, lit_anchor, pos, ml, 1, rep, &mut lit_cur, seqs)?;
-            pos += ml;
-            lit_anchor = pos;
-            continue;
-        }
-
-        // 2. Single 5-byte hash probe with 64-bit SWAR prefix compare.
+        // 1. Single 12-instruction L1D-resident 5-byte hash probe (zero per-byte `r0` random load
+        //    on literal runs; `rep[0]` chains are harvested immediately after every match).
         let h = hash5_u64(cur8, FAST_HASH_LOG) & FAST_HASH_MASK;
-        let prev = hash_table.get(h).copied().unwrap_or(EMPTY_HASH);
+        let prev = hash_table.get(h).copied().unwrap_or(0);
         if let Ok(pos_u32) = u32::try_from(pos)
-            && pos_u32 != EMPTY_HASH
             && let Some(slot) = hash_table.get_mut(h)
         {
             *slot = pos_u32;
         }
 
-        if prev != EMPTY_HASH
-            && let Ok(mut prev_usize) = usize::try_from(prev)
-            && prev_usize < pos
-        {
-            let off = pos - prev_usize;
-            if off <= window_limit
-                && let Some(prev8) = read_u64_at(input, prev_usize)
+        if let Ok(mut prev_usize) = usize::try_from(prev) {
+            let off = pos.wrapping_sub(prev_usize);
+            if off.wrapping_sub(1) < window_limit
+                && let Some(prev8) = read_u64_at(src, prev_usize)
             {
                 let diff = cur8 ^ prev8;
-                if (diff & MASK_5BYTES) == 0 {
+                let mask = if off < 65_536 { 0xFFFF_FFFFu64 } else { MASK_5BYTES };
+                if (diff & mask) == 0 {
                     let mut ml = if diff != 0 {
-                        usize::try_from(diff.trailing_zeros() >> 3).unwrap_or(5)
+                        usize::try_from(diff.trailing_zeros() >> 3).unwrap_or(4)
                     } else {
-                        8 + match_len_at(input, prev_usize + 8, pos + 8, block_end)
+                        8 + match_len_at(src, prev_usize + 8, pos + 8, block_end)
                     };
 
                     while pos > lit_anchor
                         && prev_usize > 0
-                        && input.get(pos - 1) == input.get(prev_usize - 1)
+                        && src.get(pos - 1) == src.get(prev_usize - 1)
                     {
                         pos -= 1;
                         prev_usize -= 1;
                         ml += 1;
                     }
 
+                    let [r0, r1, _] = *rep;
                     let lit_len = pos - lit_anchor;
                     let ov = if lit_len > 0 && off == r0 {
                         1
@@ -362,19 +343,37 @@ fn find_block_sequences_fast<A: Allocator>(
                         pos += 1;
                         continue;
                     };
-                    emit_sequence(input, lit_anchor, pos, ml, ov, rep, &mut lit_cur, seqs)?;
+                    emit_raw_seq(src, lit_anchor, pos, ml, ov, rep, &mut lit_cur, raw_seqs)?;
                     pos += ml;
                     lit_anchor = pos;
 
-                    if pos >= 2
-                        && pos + 6 <= block_end
-                        && let Some(b8) = read_u64_at(input, pos - 2)
+                    if pos <= match_limit
+                        && let Some(b8) = read_u64_at(src, pos - 2)
                         && let Ok(bu32) = u32::try_from(pos - 2)
-                        && bu32 != EMPTY_HASH
                         && let Some(slot) =
                             hash_table.get_mut(hash5_u64(b8, FAST_HASH_LOG) & FAST_HASH_MASK)
                     {
                         *slot = bu32;
+                    }
+
+                    // Harvest consecutive `rep[0]` chains right after a match (at `pos + 1` or
+                    // `pos + 2`) without paying a random load on literal-scanning iterations.
+                    while pos + 1 <= match_limit {
+                        let [cur_r0, _, _] = *rep;
+                        if cur_r0 == 0 || cur_r0 > pos || cur_r0 > window_limit {
+                            break;
+                        }
+                        let Some(next4) = read_u32_at(src, pos + 1) else {
+                            break;
+                        };
+                        if read_u32_at(src, pos + 1 - cur_r0) != Some(next4) {
+                            break;
+                        }
+                        pos += 1;
+                        let rml = 4 + match_len_at(src, pos - cur_r0 + 4, pos + 4, block_end);
+                        emit_raw_seq(src, lit_anchor, pos, rml, 1, rep, &mut lit_cur, raw_seqs)?;
+                        pos += rml;
+                        lit_anchor = pos;
                     }
                     continue;
                 }
@@ -382,17 +381,18 @@ fn find_block_sequences_fast<A: Allocator>(
         }
 
         let step = 1usize + ((pos - lit_anchor) >> 5);
-        pos = pos.saturating_add(step);
+        pos += step;
     }
 
-    let trailing = input.get(lit_anchor..block_end).ok_or(ZstdError::CorruptLiterals)?;
+    let trailing = src.get(lit_anchor..block_end).ok_or(ZstdError::CorruptLiterals)?;
     lit_cur.try_write_slice(trailing)?;
     lit_cur.finish();
     Ok(())
 }
 
-/// Default 2-way associative 5-byte hash matcher with repeat-offset probing, backward match
-/// extension, and one-step lazy evaluation.
+/// Default 2-way associative 16-bit 5-byte hash matcher with repeat-offset probing, early
+/// good-match exit, backward match extension, and one-step lazy evaluation.
+#[inline(never)]
 fn find_block_sequences_default<A: Allocator>(
     input: &[u8],
     block_start: usize,
@@ -400,22 +400,29 @@ fn find_block_sequences_default<A: Allocator>(
     hash_table: &mut [u32; DEF_TABLE_SIZE],
     rep: &mut [usize; 3],
     literals_buf: &mut Vec<u8, A>,
-    seqs: &mut Vec<EncodedSeq, A>,
+    raw_seqs: &mut Vec<RawSeq, A>,
 ) -> Result<(), ZstdError> {
     literals_buf.clear();
-    seqs.clear();
+    raw_seqs.clear();
+
+    let src = input.get(..block_end).ok_or(ZstdError::CorruptLiterals)?;
+    let max_u32_idx = usize::try_from(u32::MAX - 1).unwrap_or(usize::MAX);
+    if src.len() > max_u32_idx {
+        return Err(ZstdError::CorruptSequences);
+    }
 
     let block_len = block_end.saturating_sub(block_start);
+    raw_seqs.try_reserve(block_len / 3 + 32)?;
     let mut lit_cur = literals_buf.byte_cursor();
     lit_cur.try_reserve(block_len.saturating_add(32))?;
 
-    let mut pos = block_start;
+    let mut pos = block_start.max(1);
     let mut lit_anchor = block_start;
-    let match_limit = block_end.saturating_sub(8);
-    let window_limit = MAX_WINDOW.min(input.len());
+    let match_limit = src.len().saturating_sub(8);
+    let window_limit = MAX_WINDOW.min(src.len());
 
     while pos <= match_limit {
-        let Some(cur8) = read_u64_at(input, pos) else {
+        let Some(cur8) = read_u64_at(src, pos) else {
             break;
         };
         let [c0, c1, c2, c3, ..] = cur8.to_le_bytes();
@@ -428,22 +435,21 @@ fn find_block_sequences_default<A: Allocator>(
         let mut best_ov: u32 = 0;
         let mut best_is_rep = false;
 
-        if rep_off >= 1
+        if lit_len < 8
             && rep_off <= pos
             && rep_off <= window_limit
-            && read_u32_at(input, pos - rep_off) == Some(cur4)
+            && rep_off >= 1
+            && read_u32_at(src, pos - rep_off) == Some(cur4)
         {
-            best_ml = 4 + match_len_at(input, pos - rep_off + 4, pos + 4, block_end);
+            best_ml = 4 + match_len_at(src, pos - rep_off + 4, pos + 4, block_end);
             best_ov = 1;
             best_is_rep = true;
         }
 
         let b_idx = (hash5_u64(cur8, DEF_HASH_LOG) & DEF_BUCKET_MASK) << 1;
-        let p0 = hash_table.get(b_idx).copied().unwrap_or(EMPTY_HASH);
-        let p1 = hash_table.get(b_idx + 1).copied().unwrap_or(EMPTY_HASH);
-        if let Ok(pos_u32) = u32::try_from(pos)
-            && pos_u32 != EMPTY_HASH
-        {
+        let p0 = hash_table.get(b_idx).copied().unwrap_or(0);
+        let p1 = hash_table.get(b_idx + 1).copied().unwrap_or(0);
+        if let Ok(pos_u32) = u32::try_from(pos) {
             if let Some(s1) = hash_table.get_mut(b_idx + 1) {
                 *s1 = p0;
             }
@@ -454,65 +460,54 @@ fn find_block_sequences_default<A: Allocator>(
 
         let mut hash_prev: usize = 0;
         let mut hash_off: usize = 0;
-        for cand in [p0, p1] {
-            if cand != EMPTY_HASH
-                && let Ok(prev_u) = usize::try_from(cand)
-                && prev_u < pos
-            {
-                let off = pos - prev_u;
-                if off <= window_limit
-                    && let Some(prev8) = read_u64_at(input, prev_u)
-                {
-                    let diff = cur8 ^ prev8;
-                    if (diff & MASK_5BYTES) == 0 {
-                        let ml = if diff != 0 {
-                            usize::try_from(diff.trailing_zeros() >> 3).unwrap_or(5)
-                        } else {
-                            8 + match_len_at(input, prev_u + 8, pos + 8, block_end)
-                        };
-                        let beats = if best_is_rep { ml > best_ml + 2 } else { ml > best_ml };
-                        if beats {
-                            best_ml = ml;
-                            best_is_rep = false;
-                            hash_prev = prev_u;
-                            hash_off = off;
+        if !(best_is_rep && best_ml >= 16) {
+            for cand in [p0, p1] {
+                if let Ok(prev_u) = usize::try_from(cand) {
+                    let off = pos.wrapping_sub(prev_u);
+                    if off.wrapping_sub(1) < window_limit
+                        && let Some(prev8) = read_u64_at(src, prev_u)
+                    {
+                        let diff = cur8 ^ prev8;
+                        let mask = if off < 65_536 { 0xFFFF_FFFFu64 } else { MASK_5BYTES };
+                        if (diff & mask) == 0 {
+                            let ml = if diff != 0 {
+                                usize::try_from(diff.trailing_zeros() >> 3).unwrap_or(4)
+                            } else {
+                                8 + match_len_at(src, prev_u + 8, pos + 8, block_end)
+                            };
+                            let beats = if best_is_rep { ml > best_ml + 2 } else { ml > best_ml };
+                            if beats {
+                                best_ml = ml;
+                                best_is_rep = false;
+                                hash_prev = prev_u;
+                                hash_off = off;
+                                if ml >= 24 {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
             }
         }
 
-        if best_ml == 0
-            && lit_len > 0
-            && r1 >= 1
-            && r1 <= pos
-            && r1 <= window_limit
-            && read_u32_at(input, pos - r1) == Some(cur4)
-        {
-            best_ml = 4 + match_len_at(input, pos - r1 + 4, pos + 4, block_end);
-            best_ov = 2;
-            best_is_rep = true;
-        }
-
         if best_ml >= 4 {
-            if best_ml < 32
+            if best_ml < 24
                 && pos + 1 <= match_limit
-                && let Some(next8) = read_u64_at(input, pos + 1)
+                && let Some(next8) = read_u64_at(src, pos + 1)
             {
                 let nb_idx = (hash5_u64(next8, DEF_HASH_LOG) & DEF_BUCKET_MASK) << 1;
-                let np0 = hash_table.get(nb_idx).copied().unwrap_or(EMPTY_HASH);
-                if np0 != EMPTY_HASH
-                    && let Ok(prev_u) = usize::try_from(np0)
-                    && prev_u < pos + 1
-                    && (pos + 1 - prev_u) <= window_limit
-                    && let Some(prev8) = read_u64_at(input, prev_u)
+                let np0 = hash_table.get(nb_idx).copied().unwrap_or(0);
+                if let Ok(prev_u) = usize::try_from(np0)
+                    && (pos + 1).wrapping_sub(prev_u).wrapping_sub(1) < window_limit
+                    && let Some(prev8) = read_u64_at(src, prev_u)
                     && ((next8 ^ prev8) & MASK_5BYTES) == 0
                 {
                     let diff = next8 ^ prev8;
                     let lazy_ml = if diff != 0 {
                         usize::try_from(diff.trailing_zeros() >> 3).unwrap_or(5)
                     } else {
-                        8 + match_len_at(input, prev_u + 8, pos + 9, block_end)
+                        8 + match_len_at(src, prev_u + 8, pos + 9, block_end)
                     };
                     if lazy_ml >= best_ml + 2 {
                         pos += 1;
@@ -527,7 +522,7 @@ fn find_block_sequences_default<A: Allocator>(
                 let mut prev_u = hash_prev;
                 while pos > lit_anchor
                     && prev_u > 0
-                    && input.get(pos - 1) == input.get(prev_u - 1)
+                    && src.get(pos - 1) == src.get(prev_u - 1)
                 {
                     pos -= 1;
                     prev_u -= 1;
@@ -551,18 +546,16 @@ fn find_block_sequences_default<A: Allocator>(
                 }
             };
 
-            emit_sequence(input, lit_anchor, pos, best_ml, ov, rep, &mut lit_cur, seqs)?;
+            emit_raw_seq(src, lit_anchor, pos, best_ml, ov, rep, &mut lit_cur, raw_seqs)?;
             pos += best_ml;
             lit_anchor = pos;
 
-            if pos >= 2
-                && pos + 6 <= block_end
-                && let Some(back8) = read_u64_at(input, pos - 2)
+            if pos <= match_limit
+                && let Some(back8) = read_u64_at(src, pos - 2)
                 && let Ok(back_u32) = u32::try_from(pos - 2)
-                && back_u32 != EMPTY_HASH
             {
                 let hb = (hash5_u64(back8, DEF_HASH_LOG) & DEF_BUCKET_MASK) << 1;
-                let old0 = hash_table.get(hb).copied().unwrap_or(EMPTY_HASH);
+                let old0 = hash_table.get(hb).copied().unwrap_or(0);
                 if let Some(s1) = hash_table.get_mut(hb + 1) {
                     *s1 = old0;
                 }
@@ -571,14 +564,141 @@ fn find_block_sequences_default<A: Allocator>(
                 }
             }
         } else {
-            let step = 1usize + (lit_len >> 7);
-            pos = pos.saturating_add(step);
+            let step = 1usize + (lit_len >> 6);
+            pos += step;
         }
     }
 
-    let trailing = input.get(lit_anchor..block_end).ok_or(ZstdError::CorruptLiterals)?;
+    let trailing = src.get(lit_anchor..block_end).ok_or(ZstdError::CorruptLiterals)?;
     lit_cur.try_write_slice(trailing)?;
     lit_cur.finish();
+    Ok(())
+}
+
+/// Convert raw LZ77 sequences into FSE codes/extras and tally symbol histograms in one sequential
+/// pass outside the LZ77 match-finder loop.
+#[inline(never)]
+fn encode_raw_sequences<A: Allocator>(
+    raw_seqs: &[RawSeq],
+    out: &mut Vec<EncodedSeq, A>,
+    ll_counts: &mut [u32; LL_MAX_CODE + 1],
+    of_counts: &mut [u32; OF_MAX_CODE + 1],
+    ml_counts: &mut [u32; ML_MAX_CODE + 1],
+    count_hist: bool,
+) -> Result<(), ZstdError> {
+    out.clear();
+    out.try_reserve(raw_seqs.len())?;
+    for raw in raw_seqs {
+        let lit_len = usize::try_from(raw.lit_len).map_err(|_| ZstdError::CorruptSequences)?;
+        let ml = usize::try_from(raw.match_len).map_err(|_| ZstdError::CorruptSequences)?;
+        let (ll_code, ll_extra_u32, ll_bits_u32) =
+            encode_ll(lit_len).ok_or(ZstdError::CorruptSequences)?;
+        let (ml_code, ml_extra_u32, ml_bits_u32) =
+            encode_ml(ml).ok_or(ZstdError::CorruptSequences)?;
+        let (of_code, of_extra, _of_bits) =
+            encode_of(raw.offset_value).ok_or(ZstdError::CorruptSequences)?;
+        let ll_extra = u16::try_from(ll_extra_u32).map_err(|_| ZstdError::CorruptSequences)?;
+        let ml_extra = u16::try_from(ml_extra_u32).map_err(|_| ZstdError::CorruptSequences)?;
+        let ll_bits = u8::try_from(ll_bits_u32).map_err(|_| ZstdError::CorruptSequences)?;
+        let ml_bits = u8::try_from(ml_bits_u32).map_err(|_| ZstdError::CorruptSequences)?;
+
+        if count_hist {
+            if let Some(s) = ll_counts.get_mut(usize::from(ll_code)) {
+                *s += 1;
+            }
+            if let Some(s) = of_counts.get_mut(usize::from(of_code)) {
+                *s += 1;
+            }
+            if let Some(s) = ml_counts.get_mut(usize::from(ml_code)) {
+                *s += 1;
+            }
+        }
+        out.try_push(EncodedSeq {
+            of_extra,
+            ll_extra,
+            ml_extra,
+            ll_code,
+            ml_code,
+            of_code,
+            ll_bits,
+            ml_bits,
+        })
+        .map_err(|r| r.why)?;
+    }
+    Ok(())
+}
+
+/// Reverse-pack all FSE-encoded sequences directly into `comp_buf` via `ByteCursor`.
+/// Marked `#[inline(never)]` so `ByteCursor` (`base`, `len`, `cap`) and FSE tables stay in
+/// registers across the entire loop with zero stack spills.
+#[inline(never)]
+fn pack_sequences_fse<A: Allocator>(
+    seqs: &[EncodedSeq],
+    ll_tbl: &FseEncTable,
+    of_tbl: &FseEncTable,
+    ml_tbl: &FseEncTable,
+    comp_buf: &mut Vec<u8, A>,
+) -> Result<(), ZstdError> {
+    let last = seqs.last().ok_or(ZstdError::CorruptSequences)?;
+    let mut ll_state = ll_tbl.init_state(last.ll_code).ok_or(ZstdError::CorruptFse)?;
+    let mut of_state = of_tbl.init_state(last.of_code).ok_or(ZstdError::CorruptFse)?;
+    let mut ml_state = ml_tbl.init_state(last.ml_code).ok_or(ZstdError::CorruptFse)?;
+
+    let mut cur = comp_buf.byte_cursor();
+    cur.try_reserve(seqs.len().saturating_mul(11).saturating_add(48))?;
+    let mut buf: u64 = 0;
+    let mut bits: u32 = 0;
+
+    buf |= u64::from(last.ll_extra) << bits;
+    bits += u32::from(last.ll_bits);
+    buf |= u64::from(last.ml_extra) << bits;
+    bits += u32::from(last.ml_bits);
+    flush_bits_u64_cur(&mut buf, &mut bits, &mut cur);
+    buf |= u64::from(last.of_extra) << bits;
+    bits += u32::from(last.of_code);
+    flush_bits_u64_cur(&mut buf, &mut bits, &mut cur);
+
+    let head_seqs = seqs.get(..seqs.len().saturating_sub(1)).unwrap_or(&[]);
+    for seq in head_seqs.iter().rev() {
+        let (next_of, of_st_bits, of_st_nb) =
+            of_tbl.encode_step(seq.of_code, of_state).ok_or(ZstdError::CorruptFse)?;
+        let (next_ml, ml_st_bits, ml_st_nb) =
+            ml_tbl.encode_step(seq.ml_code, ml_state).ok_or(ZstdError::CorruptFse)?;
+        let (next_ll, ll_st_bits, ll_st_nb) =
+            ll_tbl.encode_step(seq.ll_code, ll_state).ok_or(ZstdError::CorruptFse)?;
+        of_state = next_of;
+        ml_state = next_ml;
+        ll_state = next_ll;
+
+        buf |= u64::from(of_st_bits) << bits;
+        bits += of_st_nb;
+        buf |= u64::from(ml_st_bits) << bits;
+        bits += ml_st_nb;
+        buf |= u64::from(ll_st_bits) << bits;
+        bits += ll_st_nb;
+        buf |= u64::from(seq.ll_extra) << bits;
+        bits += u32::from(seq.ll_bits);
+        flush_bits_u64_cur(&mut buf, &mut bits, &mut cur);
+
+        buf |= u64::from(seq.ml_extra) << bits;
+        bits += u32::from(seq.ml_bits);
+        buf |= u64::from(seq.of_extra) << bits;
+        bits += u32::from(seq.of_code);
+        flush_bits_u64_cur(&mut buf, &mut bits, &mut cur);
+    }
+
+    buf |= u64::from(ml_state) << bits;
+    bits += u32::from(ml_tbl.accuracy_log());
+    buf |= u64::from(of_state) << bits;
+    bits += u32::from(of_tbl.accuracy_log());
+    buf |= u64::from(ll_state) << bits;
+    bits += u32::from(ll_tbl.accuracy_log());
+    flush_bits_u64_cur(&mut buf, &mut bits, &mut cur);
+
+    buf |= 1u64 << bits;
+    let [b0, ..] = buf.to_le_bytes();
+    let _ = cur.push_within_cap(b0);
+    cur.finish();
     Ok(())
 }
 
@@ -647,6 +767,7 @@ pub struct ZstdEncoder<A: Allocator + Copy> {
     custom_ml: FseEncTable,
     hash_table: Vec<u32, A>,
     literals_buf: Vec<u8, A>,
+    raw_seqs: Vec<RawSeq, A>,
     seqs: Vec<EncodedSeq, A>,
     comp_buf: Vec<u8, A>,
     huff_payload: Vec<u8, A>,
@@ -665,6 +786,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
             custom_ml: FseEncTable::new_empty(),
             hash_table: Vec::new_in(alloc),
             literals_buf: Vec::new_in(alloc),
+            raw_seqs: Vec::new_in(alloc),
             seqs: Vec::new_in(alloc),
             comp_buf: Vec::new_in(alloc),
             huff_payload: Vec::new_in(alloc),
@@ -715,7 +837,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
         out.try_push(fhd).map_err(|r| r.why)?;
 
         if !single_segment {
-            out.try_push(WINDOW_DESC_1M).map_err(|r| r.why)?;
+            out.try_push(WINDOW_DESC_4M).map_err(|r| r.why)?;
         }
 
         match fcs_flag {
@@ -742,7 +864,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
         } else {
             let fast_mode = matches!(opts.level, Level::Fast);
             let table_len = if fast_mode { FAST_HASH_SIZE } else { DEF_TABLE_SIZE };
-            ensure_empty_hash(&mut self.hash_table, table_len)?;
+            ensure_zero_hash(&mut self.hash_table, table_len)?;
             self.huff_cache.reset();
 
             let mut rep = [1usize, 4usize, 8usize];
@@ -778,7 +900,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
                         table_arr,
                         &mut trial_rep,
                         &mut self.literals_buf,
-                        &mut self.seqs,
+                        &mut self.raw_seqs,
                     )?;
                 } else {
                     let table_arr: &mut [u32; DEF_TABLE_SIZE] = self
@@ -794,12 +916,13 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
                         table_arr,
                         &mut trial_rep,
                         &mut self.literals_buf,
-                        &mut self.seqs,
+                        &mut self.raw_seqs,
                     )?;
                 }
 
-                if !self.seqs.is_empty() {
-                    let use_custom_fse = !fast_mode && self.seqs.len() >= 128;
+                if !self.raw_seqs.is_empty() {
+                    let use_custom_fse =
+                        if fast_mode { self.raw_seqs.len() >= 256 } else { self.raw_seqs.len() >= 128 };
                     self.encode_compressed_block(
                         fast_mode,
                         use_custom_fse,
@@ -852,25 +975,23 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
             self.comp_buf.try_extend_from_slice(self.literals_buf.as_slice())?;
         }
 
+        let mut ll_counts = [0u32; LL_MAX_CODE + 1];
+        let mut of_counts = [0u32; OF_MAX_CODE + 1];
+        let mut ml_counts = [0u32; ML_MAX_CODE + 1];
+        encode_raw_sequences(
+            self.raw_seqs.as_slice(),
+            &mut self.seqs,
+            &mut ll_counts,
+            &mut of_counts,
+            &mut ml_counts,
+            use_custom_fse,
+        )?;
+
         let seqs = self.seqs.as_slice();
         write_num_sequences(&mut self.comp_buf, seqs.len())?;
 
         let (ll_tbl, of_tbl, ml_tbl): (&FseEncTable, &FseEncTable, &FseEncTable) = if use_custom_fse
         {
-            let mut ll_counts = [0u32; LL_MAX_CODE + 1];
-            let mut of_counts = [0u32; OF_MAX_CODE + 1];
-            let mut ml_counts = [0u32; ML_MAX_CODE + 1];
-            for seq in seqs {
-                if let Some(s) = ll_counts.get_mut(usize::from(seq.ll_code)) {
-                    *s += 1;
-                }
-                if let Some(s) = of_counts.get_mut(usize::from(seq.of_code)) {
-                    *s += 1;
-                }
-                if let Some(s) = ml_counts.get_mut(usize::from(seq.ml_code)) {
-                    *s += 1;
-                }
-            }
             let total = u32::try_from(seqs.len()).map_err(|_| ZstdError::CorruptSequences)?;
 
             let ll_choice =
@@ -931,70 +1052,7 @@ impl<A: Allocator + Copy> ZstdEncoder<A> {
             (&self.predef.ll, &self.predef.of, &self.predef.ml)
         };
 
-        let last = seqs.last().ok_or(ZstdError::CorruptSequences)?;
-        let mut ll_state = ll_tbl.init_state(last.ll_code).ok_or(ZstdError::CorruptFse)?;
-        let mut of_state = of_tbl.init_state(last.of_code).ok_or(ZstdError::CorruptFse)?;
-        let mut ml_state = ml_tbl.init_state(last.ml_code).ok_or(ZstdError::CorruptFse)?;
-
-        let mut cur = self.comp_buf.byte_cursor();
-        // Upper bound per sequence: LL extra(16) + ML extra(16) + OF extra(28) + states(26) = 86 bits <= 11 bytes.
-        cur.try_reserve(seqs.len().saturating_mul(11).saturating_add(48))?;
-        let mut buf: u64 = 0;
-        let mut bits: u32 = 0;
-
-        buf |= u64::from(last.ll_extra) << bits;
-        bits += last.ll_bits;
-        buf |= u64::from(last.ml_extra) << bits;
-        bits += last.ml_bits;
-        flush_bits_u64_cur(&mut buf, &mut bits, &mut cur);
-        buf |= u64::from(last.of_extra) << bits;
-        bits += last.of_bits;
-        flush_bits_u64_cur(&mut buf, &mut bits, &mut cur);
-
-        let head_seqs = seqs.get(..seqs.len().saturating_sub(1)).unwrap_or(&[]);
-        for seq in head_seqs.iter().rev() {
-            let (next_of, of_st_bits, of_st_nb) =
-                of_tbl.encode_step(seq.of_code, of_state).ok_or(ZstdError::CorruptFse)?;
-            let (next_ml, ml_st_bits, ml_st_nb) =
-                ml_tbl.encode_step(seq.ml_code, ml_state).ok_or(ZstdError::CorruptFse)?;
-            let (next_ll, ll_st_bits, ll_st_nb) =
-                ll_tbl.encode_step(seq.ll_code, ll_state).ok_or(ZstdError::CorruptFse)?;
-            of_state = next_of;
-            ml_state = next_ml;
-            ll_state = next_ll;
-
-            // `bits <= 7`; states (<= 26) + ll_extra (<= 16) = <= 49 <= 64 bits.
-            buf |= u64::from(of_st_bits) << bits;
-            bits += of_st_nb;
-            buf |= u64::from(ml_st_bits) << bits;
-            bits += ml_st_nb;
-            buf |= u64::from(ll_st_bits) << bits;
-            bits += ll_st_nb;
-            buf |= u64::from(seq.ll_extra) << bits;
-            bits += seq.ll_bits;
-            flush_bits_u64_cur(&mut buf, &mut bits, &mut cur);
-
-            // `bits <= 7`; ml_extra (<= 16) + of_extra (<= 28) = <= 51 <= 64 bits.
-            buf |= u64::from(seq.ml_extra) << bits;
-            bits += seq.ml_bits;
-            buf |= u64::from(seq.of_extra) << bits;
-            bits += seq.of_bits;
-            flush_bits_u64_cur(&mut buf, &mut bits, &mut cur);
-        }
-
-        buf |= u64::from(ml_state) << bits;
-        bits += u32::from(ml_tbl.accuracy_log());
-        buf |= u64::from(of_state) << bits;
-        bits += u32::from(of_tbl.accuracy_log());
-        buf |= u64::from(ll_state) << bits;
-        bits += u32::from(ll_tbl.accuracy_log());
-        flush_bits_u64_cur(&mut buf, &mut bits, &mut cur);
-
-        buf |= 1u64 << bits;
-        let [b0, ..] = buf.to_le_bytes();
-        let _ = cur.push_within_cap(b0);
-        cur.finish();
-        Ok(())
+        pack_sequences_fse(seqs, ll_tbl, of_tbl, ml_tbl, &mut self.comp_buf)
     }
 }
 
