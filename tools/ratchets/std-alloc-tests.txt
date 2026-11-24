@@ -90,7 +90,7 @@ blaze-launcher	20	1	0	17	8	0	0	1	0	0
 blaze-lex	13	0	0	21	2	0	1	0	0	0
 blaze-lint	6	0	0	2	0	0	0	0	0	0
 blaze-lint-defs	12	0	0	34	0	0	0	0	0	1
-blaze-lir	26	0	2	107	0	0	0	0	0	0
+blaze-lir	23	0	2	105	0	0	0	0	0	0
 blaze-lower	175	2	0	163	0	0	4	0	0	0
 blaze-macro-run	2	0	0	3	0	0	0	0	0	0
 blaze-malloc	9	7	5	41	0	4	12	0	0	1

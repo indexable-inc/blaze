@@ -48,7 +48,7 @@ blaze-dbsp	38
 blaze-deflate	152
 blaze-drive	64
 blaze-ed25519	5
-blaze-emit	570
+blaze-emit	568
 blaze-engine	119
 blaze-expand	284
 blaze-export	425
@@ -80,7 +80,7 @@ blaze-launch-rt	461
 blaze-launcher	6
 blaze-lint	187
 blaze-lint-defs	21
-blaze-lir	1446
+blaze-lir	1444
 blaze-lower	306
 blaze-malloc	48
 blaze-manifest	6
