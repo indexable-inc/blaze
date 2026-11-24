@@ -145,6 +145,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             self.callee_row(callee)?;
         }
         self.async_rows(&made)?;
+        self.closure_rows(checked)?;
         self.fmt_rows(&made, fmt_owner, function)?;
         // Again after the callees' and async items' heads: their types name ADTs too (the
         // rounds over the store's table pick them up; nothing missing is nothing made).
@@ -683,12 +684,26 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     }
 
     /// The row of every ADT `checked`'s types and the heads' table name, in rounds as a row's
-    /// fields name more (make_from's loop, over ONE body).
+    /// fields name more (make_from's loop, over ONE body). Uses an append-only cursor into
+    /// `self.store.tys` so earlier bodies' head types are never rescanned.
     fn adt_rows(&mut self, checked: &Checked<'static>) -> Result<(), LazyRefusal> {
         for round in 0.. {
             let mut missing: AVec<'_, ItemKey> = AVec::new_in(self.alloc);
-            for v in [self.store.tys.view(), checked.types.view()] {
-                for n in v.nodes() {
+            {
+                let store_view = self.store.tys.view();
+                let total = store_view.len();
+                let start = self.adt_scanned_tys.min(total);
+                for n in store_view.nodes().skip(start) {
+                    if let tc::PNode::Adt(k, _) = n
+                        && !self.store.adts.contains_key(k)
+                    {
+                        missing.push(*k);
+                    }
+                }
+                self.adt_scanned_tys = total;
+            }
+            if round == 0 {
+                for n in checked.types.view().nodes() {
                     if let tc::PNode::Adt(k, _) = n
                         && !self.store.adts.contains_key(k)
                     {
@@ -785,6 +800,23 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             }
             let of_trait = matches!(self.front.keys.origin(k), Some(Origin::Member { container, kind: MemberKind::Fn, .. }) if !self.store.impls.contains_key(container));
             self.row(k, of_trait)?;
+        }
+        Ok(())
+    }
+
+    /// For a body that declares closures, ensures the `Fn`, `FnMut`, and `FnOnce` trait heads and
+    /// their declared methods are filed so direct closure calls (`d(x)`) answer `nounwind` and
+    /// `track_caller` identically whether the body was checked here or read from its typed record.
+    fn closure_rows(&mut self, checked: &Checked<'static>) -> Result<(), LazyRefusal> {
+        if checked.closures.is_empty() {
+            return Ok(());
+        }
+        for name in ["fn", "fn_mut", "fn_once"] {
+            let Some(lib) = self.front.index.lang(name) else { continue };
+            let want = Want::Members(lib);
+            if !self.store.made(want) {
+                self.make_want(want, checker_of(lib), "closure_rows (Fn/FnMut/FnOnce trait members)")?;
+            }
         }
         Ok(())
     }
@@ -941,7 +973,31 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// ([`Self::object_asked`], the seam's `object_table`), so no make depends on which bodies
     /// were checked before it (D194: a `dyn` only an instance's ground arguments hold).
     fn body_objects(&mut self, checked: &Checked<'static>, function: &str) -> Result<(), LazyRefusal> {
-        let asked = dyn_principals([self.store.tys.view(), checked.types.view()].into_iter());
+        let mut asked: Vec<ItemKey, Global> = Vec::new_in(Global);
+        {
+            let store_view = self.store.tys.view();
+            let total = store_view.len();
+            let start = self.object_scanned_tys.min(total);
+            for n in store_view.nodes().skip(start) {
+                if let tc::PNode::Dynamic(l) = *n
+                    && let Some(k) = tc::object_principal(store_view, l)
+                {
+                    asked.push(k);
+                }
+            }
+            self.object_scanned_tys = total;
+        }
+        let body_view = checked.types.view();
+        for n in body_view.nodes() {
+            if let tc::PNode::Dynamic(l) = *n
+                && let Some(k) = tc::object_principal(body_view, l)
+            {
+                asked.push(k);
+            }
+        }
+        asked.sort_unstable();
+        asked.dedup();
+        asked.reverse();
         self.objects_made(asked, function)
     }
 

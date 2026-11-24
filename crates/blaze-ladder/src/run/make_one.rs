@@ -496,6 +496,10 @@ struct Work {
     /// The read-list answers found holding this run, by question ([`verify_instance`]): a
     /// question many found entries ask is asked of the front end once.
     answers: Answers<'static>,
+    /// Per-`MakerState` memoization cache for pure ground-type queries (`normalize`,
+    /// `adt_drop_impl`, `resolve`) keyed by interned IDs in `self.ground`. Sits below `Recorded` /
+    /// `Asking` so every build's `ReadLog` is unchanged.
+    query_cache: core::cell::RefCell<QueryCache>,
     /// Whole-program bottom-up export LTO mode: builds small closed callees into `inline_bank`
     /// and splices them into callers via `blaze_lir::inline::inline_guided` before SOTA emission.
     export_lto: bool,
@@ -510,6 +514,51 @@ struct Work {
     >,
 }
 
+/// Compact stack-inline argument list key for [`QueryCache::normalize`] (99%+ of projections have
+/// <= 4 arguments, avoiding heap allocation on every lookup).
+#[derive(PartialEq, Eq, Hash)]
+enum SmallArgs {
+    Inline { len: u8, buf: [PTy; 4] },
+    Heap(AVec<'static, PTy>),
+}
+
+impl SmallArgs {
+    fn of(args: &[PTy], alloc: Alloc<'static>) -> Self {
+        if let Ok(len) = u8::try_from(args.len())
+            && len <= 4
+        {
+            let mut buf = [PTy(0); 4];
+            if let Some(dst) = buf.get_mut(..args.len()) {
+                dst.copy_from_slice(args);
+            }
+            SmallArgs::Inline { len, buf }
+        } else {
+            let mut heap = AVec::with_capacity_in(args.len(), alloc);
+            heap.extend_from_slice(args);
+            SmallArgs::Heap(heap)
+        }
+    }
+}
+
+/// Memoization cache for pure ground-type front-end queries over `Work::ground`.
+struct QueryCache {
+    alloc: Alloc<'static>,
+    normalize: blaze_hash::HashMap<(ItemKey, blaze_typeck::Name, SmallArgs), PTy, Alloc<'static>>,
+    drop_impl: blaze_hash::HashMap<ItemKey, Option<ItemKey>, Alloc<'static>>,
+    resolve: blaze_hash::HashMap<(ItemKey, List), (ItemKey, List), Alloc<'static>>,
+}
+
+impl QueryCache {
+    fn new_in(alloc: Alloc<'static>) -> Self {
+        Self {
+            alloc,
+            normalize: blaze_hash::HashMap::new_in(alloc),
+            drop_impl: blaze_hash::HashMap::new_in(alloc),
+            resolve: blaze_hash::HashMap::new_in(alloc),
+        }
+    }
+}
+
 /// One maker's state over program `P` (made with the program, on the first miss).
 pub struct MakerState {
     /// Each fn key asked of `check_one`, sorted: the fn's index, `None` when it had no body.
@@ -520,16 +569,45 @@ pub struct MakerState {
     work: Work,
 }
 
-/// The step's outcome inside one borrow of [`Bodies`].
-enum Step {
-    Entry,
+/// Outcome of Phase 1 (LIR construction) before reference resolution and emission.
+struct BuiltPhase<A: core::alloc::Allocator> {
+    own: Option<blaze_build::Built<A>>,
+    from_coroutine: Option<(usize, usize)>,
+}
+
+/// Phase 1 step outcome.
+enum Phase1<A: core::alloc::Allocator> {
+    Built(BuiltPhase<A>),
     /// The lay of a coroutine state met owner fn `.0` not checked yet (lay_states.rs
-    /// `Lay::Unchecked`): check it, then make the instance again.
+    /// `Lay::Unchecked`): check it, then build again.
     Check(ItemKey),
-    /// Fns the build's references resolved to that no row tables yet ([`Named1::Untabled`]):
-    /// check each (which tables its row), then make the instance again; each with the refusal
-    /// given when its check tables none.
-    Table(Vec<(ItemKey, RunError), Global>),
+}
+
+/// Missing facts collected in a single Phase 2 sweep across all `built.refs` and `built.vtables`.
+struct RefGaps {
+    first_ask: Option<RunError>,
+    missing_objects: AVec<'static, (ItemKey, RunError)>,
+    untabled: AVec<'static, (ItemKey, RunError)>,
+}
+
+impl RefGaps {
+    fn new_in(alloc: Alloc<'static>) -> Self {
+        Self {
+            first_ask: None,
+            missing_objects: AVec::new_in(alloc),
+            untabled: AVec::new_in(alloc),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.first_ask.is_none() && self.missing_objects.is_empty() && self.untabled.is_empty()
+    }
+}
+
+/// Phase 2 step outcome (reference resolution, vtable assembly, and emission).
+enum Phase2 {
+    Done,
+    Needs(RefGaps),
 }
 
 fn tables_gone(key: ItemKey) -> RunError {
@@ -625,6 +703,7 @@ impl MakerState {
             reported: None,
             reads: ReadLog::new(ReadPlant::None),
             answers: Answers::new_in(alloc),
+            query_cache: core::cell::RefCell::new(QueryCache::new_in(alloc)),
             export_lto: false,
             export_lto_populate_only: false,
             export_lto_symbol: None,
@@ -1029,33 +1108,35 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
             Err(e) => return Err(e),
         }
     }
-    // The build, its coroutine states laid out from types first (lay_states.rs); a lay that
-    // meets an owner fn not checked yet has it checked and the instance made again (no LIR
-    // was built: types only were read); bounded (rule 18).
     let mut owners = 0usize;
-    // An instance-time question that met an answer no check made (`Missing`): the program
-    // makes what its worlds asked (`FrontEnd::make_asked`) and the instance is built again,
-    // as build_from's step is; bounded (rule 18), and nothing made is the `Missing` itself.
+    // Phase 1: lay out coroutine states and build LIR ONCE into an owned `BuiltPhase`. Any
+    // missing fact (`Missing` / `OpaqueOwnerUnchecked` / `NoTrait` / `Check`) retries only Phase 1.
     let mut asked = AskProgress::new_in(alloc);
-    loop {
+    let is_lir_sink = matches!(sink, BuildSink::Lir { .. });
+    let built_phase = loop {
         let MakerState { checked, tables, work, .. } = &mut *state;
         let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
         let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
-        let step = build_one(&*program, &bodies, work, build_i, build_instance, sink);
+        let step = build_lir_phase(&*program, &bodies, work, build_i, build_instance, is_lir_sink);
         *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
-        let step = match step {
+        match step {
+            Ok(Phase1::Built(built)) => break built,
+            Ok(Phase1::Check(owner)) => {
+                owners += 1;
+                if owners > MOST_HELD_COROUTINES {
+                    let error = BuildError::UnsupportedSig { what: "an instance whose coroutine states needed more than 4096 owner fns checked" };
+                    return Err(RunError::Build { function: program.function(build_i).named(), error, range: None });
+                }
+                if state.ensure(program, typing, owner, checks)?.is_none() {
+                    return Err(unchecked_owner(&*program, build_i, owner));
+                }
+            }
             Err(e) if asks_again(&e) && asked.allow(&e) => {
                 if program.make_asked(build_i)? {
                     continue;
                 }
                 return Err(e);
             }
-            // A layout met an `impl Trait` whose defining fn (a TAIT's `#[define_opaque]` fn, a
-            // trait fn's RPITIT declaration, or its selected impl fn) is not tabled/checked yet
-            // (coroutines.rs `opaque_hidden` / `opaque_at_impl`): check it (or table its head row
-            // when it is a required trait fn with no body), as a lay's owner is (`Step::Check`),
-            // and build the instance again; bounded by the same count, and an owner asked before
-            // is the refusal itself (its check made no row).
             Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { owner, .. }, .. })
                 if owners < MOST_HELD_COROUTINES
                     && match state.asked.binary_search_by_key(&owner, |r| r.0) {
@@ -1074,45 +1155,83 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
                         entry.1 = Some(row);
                     }
                 }
-                continue;
             }
-            // INTERIM (D197, audit F2): replaced when the build asks its facts as needs through
-            // the seam before/while lowering instead of failing and being rebuilt: delete with
-            // the other `asks_again` loops. The `dyn` principals of the ground arguments are
-            // asked before the build (`Held::objects` above); this covers a `dyn` the build
-            // meets only at the instance (a projection normalized to `Box<dyn Fn()>`, a field
-            // of a head made by `make_asked`), whose trait is then made by name from its head
-            // (`FrontEnd::object_table`) and the instance built again, so its bytes never
-            // depend on which body was checked before it (D194); bounded by the same count,
-            // and nothing made is the `NoTrait` itself.
             Err(e) if let Some(t) = object_missing(&e) && asked.allow(&e) => {
                 if program.object_table(t)? {
                     continue;
                 }
                 return Err(e);
             }
-            step => step?,
-        };
-        match step {
-            Step::Entry => break,
-            Step::Check(owner) => {
-                owners += 1;
-                if owners > MOST_HELD_COROUTINES {
-                    let error = BuildError::UnsupportedSig { what: "an instance whose coroutine states needed more than 4096 owner fns checked" };
-                    return Err(RunError::Build { function: program.function(build_i).named(), error, range: None });
-                }
-                if state.ensure(program, typing, owner, checks)?.is_none() {
-                    return Err(unchecked_owner(&*program, build_i, owner));
-                }
-            }
-            Step::Table(keys) => {
-                for (key, refusal) in keys {
-                    owners += 1;
-                    // Asked before: its check tabled no row, so the build met it untabled again.
-                    if owners > MOST_HELD_COROUTINES || state.asked.binary_search_by_key(&key, |r| r.0).is_ok() {
-                        return Err(refusal);
+            Err(e) => return Err(e),
+        }
+    };
+    // Phase 2: resolve all call refs and vtables over the ALREADY-BUILT LIR, batch-collecting all
+    // missing impls/ADTs/object tables/head rows in one sweep per round without ever re-running
+    // `blaze_build::build`, and using `program.head_row` (not `state.ensure`) for untabled callees.
+    let mut ref_asked = AskProgress::new_in(alloc);
+    let mut tried_table: blaze_hash::HashSet<ItemKey, Alloc<'_>> = blaze_hash::HashSet::new_in(alloc);
+    let ref_reads = ReadLog::new(ReadPlant::None);
+    let mut built_phase = Some(built_phase);
+    loop {
+        ref_reads.clear();
+        let MakerState { checked, tables, work, .. } = &mut *state;
+        let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
+        let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
+        let phase_step = resolve_and_emit_phase(
+            &*program,
+            &bodies,
+            work,
+            build_i,
+            build_instance,
+            &mut built_phase,
+            &ref_reads,
+            sink,
+        );
+        *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
+        match phase_step? {
+            Phase2::Done => break,
+            Phase2::Needs(gaps) => {
+                let mut made_any = false;
+                let mut unrecovered: Option<RunError> = None;
+                if let Some(e) = gaps.first_ask {
+                    if ref_asked.allow(&e) {
+                        if program.make_asked(build_i)? {
+                            made_any = true;
+                        } else {
+                            unrecovered.get_or_insert(e);
+                        }
+                    } else {
+                        unrecovered.get_or_insert(e);
                     }
-                    state.ensure(program, typing, key, checks)?;
+                }
+                for (t, e) in gaps.missing_objects {
+                    if ref_asked.allow(&e) && program.object_table(t)? {
+                        made_any = true;
+                    } else {
+                        unrecovered.get_or_insert(e);
+                    }
+                }
+                if !gaps.untabled.is_empty() {
+                    for (key, refusal) in gaps.untabled {
+                        owners += 1;
+                        if owners > MOST_HELD_COROUTINES || !tried_table.insert(key) {
+                            return Err(refusal);
+                        }
+                        if program.head_row(key)?.is_some() {
+                            made_any = true;
+                        } else if state.asked.binary_search_by_key(&key, |r| r.0).is_ok() {
+                            return Err(refusal);
+                        } else {
+                            state.ensure(program, typing, key, checks)?;
+                            made_any = true;
+                        }
+                    }
+                }
+                if !made_any {
+                    if let Some(e) = unrecovered {
+                        return Err(e);
+                    }
+                    return Err(RunError::OneBody { key: tabled, why: "phase 2 reported missing facts without making progress" });
                 }
             }
         }
@@ -1291,7 +1410,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     let t = tables.take().ok_or_else(|| tables_gone(function.key))?;
     let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
     let view = body.view(program.body_types(i));
-    let facts = FrontAdts(&*program, i, &[], &work.langs, &bodies);
+    let facts = CachedFront { front: FrontAdts(&*program, i, &[], &work.langs, &bodies), cache: &work.query_cache };
     // The arguments `build_one` reads the body at: the instance's own; a coroutine's
     // function's or a closure's owner's; a `Fn*` shim reads no body.
     let at = if instance.item == function.key {
@@ -1385,21 +1504,142 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     Ok(PullStep::Done)
 }
 
-/// The one interface a build asks the world through (F20; rule 30: the recorder of
-/// code_reads.rs, no second one): the build's facts through [`Recorded`] over [`FrontAdts`]
-/// ([`Asking::world`]), and the questions beyond them (a call's instance, a C symbol) by its
-/// own methods, each logged in `log` as it is answered. [`build_one`], [`name_ref`] and
-/// [`vtable_rows`] take this, not a `FrontAdts`: a build cannot ask a fact unlogged (rule 76).
-/// What is still asked of the program directly is in no read list (the report's OPEN rows:
-/// lang items, intrinsics, a ctor's head).
-struct Asking<'w, P> {
+/// Caching wrapper around [`FrontAdts`] backed by [`Work::query_cache`]. Sits strictly below
+/// [`Recorded`] so every build's [`ReadLog`] records the exact same questions and answers while
+/// repeated `normalize` and `drop_impl` queries over `Work::ground` hit in O(1).
+struct CachedFront<'w, P> {
     front: FrontAdts<'w, P>,
+    cache: &'w core::cell::RefCell<QueryCache>,
+}
+
+impl<P: FrontEnd> blaze_build::layout::LayoutFacts for CachedFront<'_, P> {
+    fn adt(&self, key: ItemKey) -> Option<blaze_typeck::Adt<'_>> {
+        self.front.0.adt(key)
+    }
+
+    fn repr(&self, key: ItemKey) -> Result<blaze_build::layout::ReprAttrs, blaze_build::layout::Missing> {
+        self.front.repr(key)
+    }
+
+    fn discriminant(&self, adt: ItemKey, variant: u32) -> Result<Option<i128>, blaze_build::layout::Missing> {
+        self.front.discriminant(adt, variant)
+    }
+
+    fn valid_range(&self, key: ItemKey) -> Result<blaze_build::layout::ValidRange, blaze_build::layout::Missing> {
+        self.front.valid_range(key)
+    }
+
+    fn normalize(&self, trait_: ItemKey, name: blaze_typeck::Name, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<PTy, BuildError> {
+        let alloc = self.cache.borrow().alloc;
+        let key = (trait_, name, SmallArgs::of(args, alloc));
+        if let Some(&hit) = self.cache.borrow().normalize.get(&key) {
+            return Ok(hit);
+        }
+        let res = self.front.normalize(trait_, name, args, ground)?;
+        self.cache.borrow_mut().normalize.insert(key, res);
+        Ok(res)
+    }
+
+    fn closure(&self, owner: ItemKey, ordinal: u32) -> Option<blaze_build::layout::ClosureFacts<'_>> {
+        self.front.closure(owner, ordinal)
+    }
+
+    fn coroutine(&self, owner: ItemKey, ordinal: u32) -> Option<blaze_build::CoroutineFacts<'_>> {
+        self.front.coroutine(owner, ordinal)
+    }
+
+    fn coroutine_state(&self, owner: ItemKey, ordinal: u32, args: &[PTy], ground: PTys<'_>) -> Result<Option<blaze_build::StateShape>, blaze_build::layout::Missing> {
+        self.front.coroutine_state(owner, ordinal, args, ground)
+    }
+
+    fn opaque_hidden(&self, opaque: ItemKey, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<PTy, BuildError> {
+        crate::front2::coroutines::opaque_hidden(self.front.0, self.front.4.checked, self, opaque, args, ground, self.front.4.alloc)
+    }
+}
+
+impl<P: FrontEnd> blaze_build::Adts for CachedFront<'_, P> {
+    fn adt(&self, key: ItemKey) -> Option<blaze_typeck::Adt<'_>> { self.front.0.adt(key) }
+    fn opaque_of(&self, opaque: ItemKey) -> Option<(ItemKey, u32)> { self.front.opaque_of(opaque) }
+    fn overflow_checks(&self) -> OverflowChecks { self.front.overflow_checks() }
+    fn ub_checks(&self) -> blaze_build::UbChecks { self.front.ub_checks() }
+    fn panic(&self) -> blaze_build::Panic { self.front.panic() }
+    fn facts(&self) -> &dyn blaze_build::layout::LayoutFacts { self }
+    fn int_lit(&self, owner: ItemKey, expr: blaze_typeck::ExprId) -> Option<u128> { self.front.int_lit(owner, expr) }
+    fn int_pat(&self, owner: ItemKey, pat: blaze_typeck::PatId) -> Option<u128> { self.front.int_pat(owner, pat) }
+    fn byte_str(&self, owner: ItemKey, expr: blaze_typeck::ExprId) -> Option<&[u8]> { self.front.byte_str(owner, expr) }
+    fn str_lit(&self, owner: ItemKey, expr: blaze_typeck::ExprId) -> Option<&str> { self.front.str_lit(owner, expr) }
+    fn format_template(&self, owner: ItemKey, expr: blaze_typeck::ExprId) -> Option<&[blaze_build::FmtPiece<'_>]> { self.front.format_template(owner, expr) }
+    fn fmt_argument_new(&self, trait_: blaze_typeck::FmtTrait) -> Option<ItemKey> { self.front.fmt_argument_new(trait_) }
+    fn fmt_argument_adt(&self) -> Option<ItemKey> { self.front.fmt_argument_adt() }
+    fn float_lit(&self, owner: ItemKey, expr: blaze_typeck::ExprId) -> Option<u128> { self.front.float_lit(owner, expr) }
+    fn float_pat(&self, owner: ItemKey, pat: blaze_typeck::PatId) -> Option<u128> { self.front.float_pat(owner, pat) }
+    fn str_pat(&self, owner: ItemKey, pat: blaze_typeck::PatId) -> Option<&[u8]> { self.front.str_pat(owner, pat) }
+    fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> { self.front.fn_trait_method(which) }
+    fn lang_fn(&self, name: &str) -> Option<ItemKey> { self.front.lang_fn(name) }
+    fn type_names(&self) -> Option<&dyn blaze_build::type_name::TypeNames> { self.front.type_names() }
+    fn future_poll(&self) -> Option<ItemKey> { self.front.future_poll() }
+    fn async_items(&self) -> Option<blaze_build::AsyncItems> { self.front.async_items() }
+
+    fn drop_impl(&self, ty: PTy, ground: &mut PortableTys<'_>) -> Result<Option<ItemKey>, BuildError> {
+        let Some((trait_, f)) = self.front.0.drop_trait() else { return Ok(None) };
+        let PNode::Adt(adt, _) = ground.view().node(ty).map_err(|_| BuildError::Malformed { what: "a type past the ground table" })? else {
+            return Ok(None);
+        };
+        let has_drop = if let Some(&cached) = self.cache.borrow().drop_impl.get(&adt) {
+            cached
+        } else {
+            let found = self.front.0.adt_drop_impl(self.front.1, trait_, adt, ground.alloc()).map_err(BuildError::Select)?;
+            self.cache.borrow_mut().drop_impl.insert(adt, found);
+            found
+        };
+        if has_drop.is_none() {
+            return Ok(None);
+        }
+        f.map(Some).ok_or(BuildError::Malformed { what: "the `drop` lang trait has no `drop` fn" })
+    }
+
+    fn index_fn(&self, mutbl: blaze_typeck::Mutbl) -> Option<ItemKey> { self.front.index_fn(mutbl) }
+    fn deref_fn(&self, mutbl: blaze_typeck::Mutbl) -> Option<ItemKey> { self.front.deref_fn(mutbl) }
+    fn lang_adt(&self, item: LangItem) -> Option<ItemKey> { self.front.lang_adt(item) }
+    fn object_trait(&self, t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>> { self.front.object_trait(t) }
+    fn abi(&self, item: ItemKey) -> Option<blaze_build::Abi> { self.front.abi(item) }
+    fn nounwind(&self, owner: ItemKey) -> Option<bool> { self.front.nounwind(owner) }
+    fn fn_attrs(&self, owner: ItemKey) -> blaze_lir::func::FnAttrs { self.front.fn_attrs(owner) }
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> { self.front.track_caller(instance, ground) }
+    fn location_adt(&self) -> Option<ItemKey> { self.front.location_adt() }
+    fn caller_site(&self, owner: ItemKey, expr: blaze_typeck::ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> { self.front.caller_site(owner, expr) }
+    fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> { self.front.def_site(item) }
+    fn expr_site(&self, owner: ItemKey, expr: blaze_typeck::ExprId) -> Option<u32> { self.front.expr_site(owner, expr) }
+    fn c_variadic(&self, item: ItemKey) -> Option<u32> { self.front.c_variadic(item) }
+    fn legacy_const_generics(&self, item: ItemKey) -> &[u32] { self.front.legacy_const_generics(item) }
+    fn static_item(&self, item: ItemKey) -> Option<StaticItem> { self.front.static_item(item) }
+    fn const_value(&self, item: ItemKey, args: &[PTy]) -> Option<&crate::seam::SeamData> { self.front.const_value(item, args) }
+    fn const_block_value(&self, owner: ItemKey, block: blaze_typeck::ExprId, args: &[PTy]) -> Option<&crate::seam::SeamData> { self.front.const_block_value(owner, block, args) }
+    fn promoted_value(&self, owner: ItemKey, borrow: blaze_typeck::ExprId, args: &[PTy]) -> Option<&crate::seam::SeamData> { self.front.promoted_value(owner, borrow, args) }
+    fn const_fn_instance(&self, key: blaze_build::InstanceKey, ground: &mut PortableTys<'_>) -> Option<Instance> { self.front.const_fn_instance(key, ground) }
+    fn const_vtable_ref(&self, key: blaze_build::vtable::VtableKey, ground: &mut PortableTys<'_>) -> Option<blaze_build::vtable::VtableRef> { self.front.const_vtable_ref(key, ground) }
+    fn intrinsic(&self, item: ItemKey) -> Option<blaze_build::Intrinsic> { self.front.intrinsic(item) }
+}
+
+/// The one interface a build asks the world through (F20; rule 30: the recorder of
+/// code_reads.rs, no second one): the build's facts through [`Recorded`] over [`CachedFront`]
+/// ([`Asking::world`]), and the questions beyond them (a call's instance, a C symbol) by its
+/// own methods, each logged in `log` as it is answered.
+struct Asking<'w, P> {
+    front: CachedFront<'w, P>,
     log: &'w ReadLog,
 }
 
 impl<'w, P: FrontEnd> Asking<'w, P> {
-    fn new(program: &'w P, i: usize, langs: &'w BackLangs, bodies: &'w Bodies<'w>, log: &'w ReadLog) -> Asking<'w, P> {
-        Asking { front: FrontAdts(program, i, &[], langs, bodies), log }
+    fn new(
+        program: &'w P,
+        i: usize,
+        langs: &'w BackLangs,
+        bodies: &'w Bodies<'w>,
+        cache: &'w core::cell::RefCell<QueryCache>,
+        log: &'w ReadLog,
+    ) -> Asking<'w, P> {
+        Asking { front: CachedFront { front: FrontAdts(program, i, &[], langs, bodies), cache }, log }
     }
 
     /// The build's facts, each answer logged.
@@ -1409,13 +1649,21 @@ impl<'w, P: FrontEnd> Asking<'w, P> {
 
     /// The checked bodies (not a fact of the world: which fns this run checked).
     fn checked(&self) -> &'w [Option<Checked<'static>>] {
-        self.front.4.checked
+        self.front.front.4.checked
     }
 
     /// The instance a call of `called` from this build's fn runs (the seam's `resolve`, in the
     /// fn's world), logged (`ReadKind::Resolve`); a refusal is logged as no instance.
     fn resolve(&self, called: Instance, ground: &mut PortableTys<'_>, scratch: Alloc<'_>) -> Result<(ItemKey, List), blaze_typeck::ResolveError> {
-        let answer = self.front.0.resolve(self.front.1, called.item, called.args, ground);
+        let key = (called.item, called.args);
+        if let Some(&hit) = self.front.cache.borrow().resolve.get(&key) {
+            self.log.ask_resolve(called, Some(hit), ground.view(), scratch);
+            return Ok(hit);
+        }
+        let answer = self.front.front.0.resolve(self.front.front.1, called.item, called.args, ground);
+        if let Ok(hit) = answer {
+            self.front.cache.borrow_mut().resolve.insert(key, hit);
+        }
         self.log.ask_resolve(called, answer.as_ref().ok().copied(), ground.view(), scratch);
         answer
     }
@@ -1428,7 +1676,7 @@ impl<'w, P: FrontEnd> Asking<'w, P> {
 
     /// Static `s`'s C symbol (`None`: a record of its own), logged.
     fn foreign_static(&self, s: ItemKey) -> Option<&'w str> {
-        let answer = self.front.0.foreign_static(s);
+        let answer = self.front.front.0.foreign_static(s);
         self.log.ask_foreign_static(s, answer);
         answer
     }
@@ -1436,7 +1684,7 @@ impl<'w, P: FrontEnd> Asking<'w, P> {
     /// Fn row `c`'s C symbol when it is an `extern` block's fn (`None`: an instance of its
     /// own), logged under its item.
     fn foreign_fn(&self, c: usize) -> Option<&'w str> {
-        let f = self.front.0.function(c);
+        let f = self.front.front.0.function(c);
         let answer = (f.kind == FnKind::Foreign).then_some(f.symbol);
         self.log.ask_foreign_fn(f.key, answer);
         answer
@@ -1781,19 +2029,23 @@ fn verify_rows<'n>(program: &mut RecordsProgram<'n>, state: &mut MakerState, i: 
     }
 }
 
-/// build_from's step for one instance, from "A closure's `Fn*` method instance" to
-/// `make_entry` (or LIR extraction for LTO), over one borrow of the bodies.
-fn build_one<'a, P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: usize, instance: Instance, sink: &mut BuildSink<'_, 'a>) -> Result<Step, RunError> {
+/// Phase 1 of making one instance: lays out coroutine states and lowers the body to LIR
+/// (`blaze_build::build`), recording Phase 1's reads in `work.reads`. Returns an owned
+/// [`BuiltPhase`] so Phase 2 can retry reference/vtable resolution without ever rebuilding LIR.
+fn build_lir_phase<P: FrontEnd>(
+    program: &P,
+    bodies: &Bodies<'_>,
+    work: &mut Work,
+    i: usize,
+    instance: Instance,
+    is_lir_sink: bool,
+) -> Result<Phase1<Global>, RunError> {
     let function = program.function(i);
     let name = || function.named();
-    // A ctor's row has no body: its own instance is built as a fn, and a `Fn*` shim of it
-    // (`.map(S)`) as any fn item's (as run.rs `build_from`).
     let ctor_row = match (function.kind, function.body) {
         (FnKind::Ctor, None) => program.ctor_of(function.key).map(|(_, variant)| variant),
         _ => None,
     };
-    // The trait's bodiless `Clone::clone` at a fn item, fn pointer, tuple or closure: the
-    // language's clone (clone_shim.rs `language_clone`), built with no body.
     let builtin_clone = match function.body {
         None if instance.item == function.key => crate::clone_shim::language_clone(program, instance, &work.ground),
         _ => None,
@@ -1810,11 +2062,8 @@ fn build_one<'a, P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work,
         _ => return Err(callee_refusal(program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, work.ground.view())),
     };
     let malformed = |_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
-    // Every question of THIS build logged where it is answered (F20): the log holds only this
-    // build's answers (a build made again after a retry starts it over), sealed into the
-    // entry's read list below.
     work.reads.clear();
-    let asking = Asking::new(program, i, &work.langs, bodies, &work.reads);
+    let asking = Asking::new(program, i, &work.langs, bodies, &work.query_cache, &work.reads);
     let adts = asking.world();
     let vtable_shim = if instance.item == function.key {
         None
@@ -1867,16 +2116,12 @@ fn build_one<'a, P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work,
     };
     let mut args: AVec<'_, PTy> = blaze_own::Vec::new_in(work.alloc);
     args.extend_from_slice(work.ground.view().list(owner_args).map_err(malformed)?);
-    // One of a coroutine's three functions: its instance is built once for all three. The part
-    // is READ in the stash, (stash row, part) here, and leaves it only when its entry is made
-    // (the end of this fn): a make that stops first (`Step::Table`, `Step::Check`) is made again
-    // and reads the same part.
     let twice = || RunError::Build { function: name(), error: BuildError::Malformed { what: "a coroutine's function its instance's build did not leave (asked for twice)" }, range: None };
     let from_coroutine: Option<(usize, usize)> = match coroutine {
         None => None,
         Some((of, part)) => {
             let find = |stash: &[BuiltParts]| stash.iter().position(|b| b.owner == of.owner && b.ordinal == of.ordinal && b.args[..] == args[..]);
-            if matches!(sink, BuildSink::Lir { .. })
+            if is_lir_sink
                 && let Some(at) = find(&work.stash[..])
                 && work.stash.get(at).and_then(|b| b.parts.get(part.index())).is_some_and(Option::is_none)
             {
@@ -1884,10 +2129,8 @@ fn build_one<'a, P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work,
                 work.stash.swap_remove(at);
             }
             if find(&work.stash[..]).is_none() {
-                // Its state laid out from types, with every state it holds, and each built into
-                // its state (lay_states.rs).
                 if let Lay::Unchecked(owner) = lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &[of], work.alloc)? {
-                    return Ok(Step::Check(owner));
+                    return Ok(Phase1::Check(owner));
                 }
             }
             let Some(at) = find(&work.stash[..]) else {
@@ -1897,26 +2140,18 @@ fn build_one<'a, P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work,
             if work.stash[at].parts[part.index()].is_none() {
                 return Err(twice());
             }
-            // What the coroutine's build asked (logged apart: lay_states.rs `build_laid`), and
-            // the full lay it was built into, digested ([`ReadKind::Laid`]): the verifier lays
-            // it again and compares (`verify_instance`).
             work.reads.absorb(&work.stash[at].reads);
             work.reads.ask_laid(of.owner, of.ordinal, &args[..], work.stash[at].laid);
             Some((at, part.index()))
         }
     };
-    // The states this instance's own types hold, laid out from types and each coroutine built
-    // into its state BEFORE this build (lay_states.rs): the build never meets a state not laid.
     if from_coroutine.is_none() && shim.is_none() && vtable_shim.is_none() && test_report.is_none() {
         let roots = roots_of_instance(program, bodies, &adts, i, &args, &mut work.ground, work.alloc)?;
         if !roots.is_empty()
             && let Lay::Unchecked(owner) = lay_and_build(program, &[], &work.langs, bodies, &mut work.ground, &mut work.layouts, &mut work.stash, i, &roots, work.alloc)?
         {
-            return Ok(Step::Check(owner));
+            return Ok(Phase1::Check(owner));
         }
-        // What the build reads of those states (their shapes, their niches) it asks through
-        // `adts`, logged as asked (`ReadKind::CoroutineState`, `CoroutineNiche`); the verifier
-        // lays them again before it asks.
     }
     let view = checked.map(|(body, done)| (body.view(program.body_types(i)), done));
     use blaze_core::wait::Clock as _;
@@ -1925,13 +2160,13 @@ fn build_one<'a, P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work,
         None
     } else {
         let mut subst = Subst { args: &args, ground: &mut work.ground, scratch: work.alloc };
+        let g = Global;
         let made = if let Some(s) = shim {
             match s.item {
-                Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, &adts, Global),
-                None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, &adts, Global),
+                Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, &adts, g),
+                None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, &adts, g),
             }
         } else if vtable_shim.is_some() || reify.is_some() || test_report.is_some() || builtin_clone.is_some() || builtin_from.is_some() {
-            let g = Global;
             if let Some(plan) = vtable_shim {
                 let sig = plan.needs_sig.then(|| program.sig(i));
                 blaze_build::build_vtable_shim(plan.target, sig.as_ref(), &mut subst, &adts, g)
@@ -1944,9 +2179,6 @@ fn build_one<'a, P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work,
                     blaze_build::build_test_report_shim(test_item, &program.sig(i), report_fn, &program.sig(report_row), &mut subst, &adts, g)
                 })
             } else if let Some(made) = builtin_clone {
-                // A fn item's and a fn pointer's clone is a copy of its bytes (`Copy` by the
-                // language, no solver asked); a tuple's or a closure's clones each field by its own
-                // `clone` (clone_shim.rs `language_clone`: what it does is a function of the type).
                 blaze_build::build_builtin_clone(made.clone, made.bytes, &mut subst, &adts, g)
             } else if let Some(made) = builtin_from {
                 blaze_build::build_builtin_from(made.from, &mut subst, &adts, g)
@@ -1954,15 +2186,14 @@ fn build_one<'a, P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work,
                 Err(BuildError::Malformed { what: "unreachable builtin row" })
             }
         } else if let Some(variant) = ctor_row {
-            // The ctor's own instance (a shim of it was taken above): its fields in, its value out.
-            blaze_build::build_ctor_fn(function.key, variant, &program.sig(i), &mut subst, &adts, Global)
+            blaze_build::build_ctor_fn(function.key, variant, &program.sig(i), &mut subst, &adts, g)
         } else if let Some((view, done)) = view.as_ref() {
             if let Some((of, which)) = closure {
-                blaze_build::build_closure(view, done, of.ordinal, which, &program.sig(i), &mut subst, &adts, Global)
+                blaze_build::build_closure(view, done, of.ordinal, which, &program.sig(i), &mut subst, &adts, g)
             } else if Some(function.key) == program.fn_lang(FnLang::DropInPlace) {
-                blaze_build::build_drop_glue(view, done, &program.sig(i), &mut subst, &adts, Global)
+                blaze_build::build_drop_glue(view, done, &program.sig(i), &mut subst, &adts, g)
             } else {
-                blaze_build::build(view, done, &program.sig(i), &mut subst, &adts, Global)
+                blaze_build::build(view, done, &program.sig(i), &mut subst, &adts, g)
             }
         } else {
             Err(BuildError::Malformed { what: "a row with no body built as other than a ctor or its shim" })
@@ -1972,33 +2203,62 @@ fn build_one<'a, P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work,
     if let (Some(c), Some(from)) = (work.clock, built_from) {
         work.times.build += c.now().saturating_sub(from);
     }
-    let built: &blaze_build::Built<Global> = match (&own, from_coroutine) {
+    Ok(Phase1::Built(BuiltPhase { own, from_coroutine }))
+}
+
+/// Phase 2 of making one instance: resolves all call references and vtable datums over the
+/// already-built LIR, batch-collecting all missing facts in one sweep, then seals the read log
+/// and emits the entry (or hands back `BuiltLir`). Never re-runs `blaze_build::build`.
+#[allow(clippy::too_many_arguments)]
+fn resolve_and_emit_phase<'a, P: FrontEnd>(
+    program: &P,
+    bodies: &Bodies<'_>,
+    work: &mut Work,
+    i: usize,
+    instance: Instance,
+    built_slot: &mut Option<BuiltPhase<Global>>,
+    ref_reads: &ReadLog,
+    sink: &mut BuildSink<'_, 'a>,
+) -> Result<Phase2, RunError> {
+    let function = program.function(i);
+    let name = || function.named();
+    let twice = || RunError::Build { function: name(), error: BuildError::Malformed { what: "a coroutine's function its instance's build did not leave (asked for twice)" }, range: None };
+    let built_phase = built_slot.as_ref().ok_or_else(twice)?;
+    let from_coroutine = built_phase.from_coroutine;
+    let built = match (&built_phase.own, from_coroutine) {
         (Some(b), _) => b,
         (None, Some((at, part))) => work.stash[at].parts[part].as_ref().ok_or_else(twice)?,
         (None, None) => return Err(twice()),
     };
-    // Every reference named; each instance it reaches declared by (tabled fn, name).
+    let asking = Asking::new(program, i, &work.langs, bodies, &work.query_cache, ref_reads);
     work.thread_locals |= !built.thread_locals.is_empty();
     let mut reach = Reach::new_in(work.alloc);
     let mut funcs: AVec<'_, Callee<'_>> = blaze_own::Vec::with_capacity_in(built.refs.len(), work.alloc);
-    let mut untabled: Vec<(ItemKey, RunError), Global> = Vec::new_in(Global);
+    let mut gaps = RefGaps::new_in(work.alloc);
     for &called in built.refs.iter() {
-        match name_ref(program, &asking, &mut work.ground, work.alloc, &mut reach, i, instance.args, called)? {
-            Named1::Instance(symbol) => funcs.push(Callee::Symbol(symbol)),
-            Named1::C(c_name) => funcs.push(Callee::C(c_name)),
-            Named1::Untabled(key, refusal) => {
-                if !untabled.iter().any(|(k, _)| *k == key) {
-                    untabled.push((key, refusal));
+        match name_ref(program, &asking, &mut work.ground, work.alloc, &mut reach, i, instance.args, called) {
+            Ok(Named1::Instance(symbol)) => funcs.push(Callee::Symbol(symbol)),
+            Ok(Named1::C(c_name)) => funcs.push(Callee::C(c_name)),
+            Ok(Named1::Untabled(key, refusal)) => {
+                if !gaps.untabled.iter().any(|(k, _)| *k == key) {
+                    gaps.untabled.push((key, refusal));
                 }
             }
+            Err(e) if asks_again(&e) => {
+                gaps.first_ask.get_or_insert(e);
+            }
+            Err(e) if let Some(t) = object_missing(&e) => {
+                if !gaps.missing_objects.iter().any(|(k, _)| *k == t) {
+                    gaps.missing_objects.push((t, e));
+                }
+            }
+            Err(e) => return Err(e),
         }
     }
     let mut vtable_data: AVec<'_, (blaze_code::record::Symbol, AVec<'static, u8>)> = blaze_own::Vec::new_in(work.alloc);
-    // This build's own layouts: one cached by an earlier build was asked in that build's log,
-    // not this one's, so a vtable's size read through it would be in no read list.
     let mut layouts: Layouts<Alloc<'static>> = Layouts::new_in(work.alloc);
     for &want in built.vtables.iter() {
-        vtable_rows(
+        match vtable_rows(
             program,
             &asking,
             &mut work.ground,
@@ -2009,31 +2269,40 @@ fn build_one<'a, P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work,
             instance.args,
             want,
             &mut |k, e| {
-                if !untabled.iter().any(|(x, _)| *x == k) {
-                    untabled.push((k, e));
+                if !gaps.untabled.iter().any(|(x, _)| *x == k) {
+                    gaps.untabled.push((k, e));
                 }
             },
             &mut vtable_data,
-        )?;
+        ) {
+            Ok(()) => {}
+            Err(e) if asks_again(&e) => {
+                gaps.first_ask.get_or_insert(e);
+            }
+            Err(e) if let Some(t) = object_missing(&e) => {
+                if !gaps.missing_objects.iter().any(|(k, _)| *k == t) {
+                    gaps.missing_objects.push((t, e));
+                }
+            }
+            Err(e) => return Err(e),
+        }
     }
-    // Every untabled callee of this build at once (its calls' and its vtables' words): checked,
-    // then the instance made again.
-    if !untabled.is_empty() {
-        return Ok(Step::Table(untabled));
+    if !gaps.is_empty() {
+        return Ok(Phase2::Needs(gaps));
     }
     let sym = |e| RunError::CodeRecord { function: name(), error: CodeRecordError::Symbol(e) };
     let mut vtables: AVec<'_, blaze_code::record::Symbol> = blaze_own::Vec::with_capacity_in(built.vtables.len(), work.alloc);
     for &table in built.vtables.iter() {
         vtables.push(vtable_symbol(table, work.ground.view(), work.alloc).map_err(sym)?);
     }
-    // A static an `extern` block declares is named by its C symbol (the seam's
-    // `foreign_static`), never by a record of its own.
     let mut c_statics: AVec<'_, (ItemKey, &str)> = blaze_own::Vec::new_in(work.alloc);
     for &s in built.statics.iter() {
         if let Some(c) = asking.foreign_static(s) {
             c_statics.push((s, c));
         }
     }
+    // Absorb Phase 2's clean read log into `work.reads` (which applies `work.reads.plant`).
+    work.reads.absorb(ref_reads);
     match sink {
         BuildSink::Lir { alloc, out } => {
             let out_alloc = *alloc;
@@ -2090,11 +2359,11 @@ fn build_one<'a, P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work,
                 traps: lir_traps,
                 c_text,
             });
-            return Ok(Step::Entry);
+            let _ = built_slot.take();
+            return Ok(Phase2::Done);
         }
         BuildSink::Entry(entry) => {
-            // The soft-float routines after the instance's own references: the emitter's one table
-            // (front2/builtins_shim.rs); `make_entry` declares those it says the record calls.
+            use blaze_core::wait::Clock as _;
             let routines = work.routines.bind(&mut funcs).map_err(|error| RunError::CodeRecord { function: name(), error })?;
             let names = InstanceNames { funcs: &funcs, statics: &built.statics, c_statics: &c_statics, vtables: &vtables, tls: &built.thread_locals };
             let mut declared: AVec<'_, Declared<'_>> = blaze_own::Vec::with_capacity_in(reach.rows.len(), work.alloc);
@@ -2106,8 +2375,6 @@ fn build_one<'a, P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work,
             for (symbol, datum) in vtable_data.iter() {
                 carried.push(VtableDatum { symbol: *symbol, datum: datum.as_slice() });
             }
-            // The read list: every question this build asked, named for good now that the build is
-            // done (code_reads.rs `ReadLog::seal`); a question answered two ways is refused (rule 21).
             let read_list = work.reads.seal(&mut work.ground, work.alloc).map_err(|error| RunError::CodeRecord { function: name(), error: CodeRecordError::Reads(error) })?;
             let emitted_from = work.clock.map(|c| c.now());
             let mut inlined_func: Option<blaze_lir::func::Func<Global>> = None;
@@ -2206,12 +2473,11 @@ fn build_one<'a, P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work,
                 }
                 entry.extend_from_slice(made);
             }
+            let own = built_slot.take().and_then(|bp| bp.own);
             if work.export_lto
                 && from_coroutine.is_none()
                 && let Some(sym) = work.export_lto_symbol
-                && built.statics.is_empty()
-                && built.vtables.is_empty()
-                && built.thread_locals.is_empty()
+                && own.as_ref().is_some_and(|b| b.statics.is_empty() && b.vtables.is_empty() && b.thread_locals.is_empty())
             {
                 let shrink_for_bank = |raw: blaze_lir::func::Func<Global>| -> Option<blaze_lir::func::Func<Global>> {
                     if raw.view().ops.len() > 2048 {
@@ -2249,7 +2515,7 @@ fn build_one<'a, P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work,
             }
         }
     }
-    Ok(Step::Entry)
+    Ok(Phase2::Done)
 }
 
 /// build_from's mapping of a build error to the run's refusal, by the body's ranges (a ctor's
@@ -2289,13 +2555,19 @@ fn build_refusal<P: FrontEnd>(program: &P, function: Named, body: Option<&blaze_
 /// The instances one made entry declares: (tabled fn, name) rows over one arena, each once.
 struct Reach<'a> {
     rows: AVec<'a, (ItemKey, u32, u32)>,
+    seen: blaze_hash::HashSet<(ItemKey, [u8; 32]), Alloc<'a>>,
     text: AVec<'a, u8>,
     scratch: AVec<'a, u8>,
 }
 
 impl<'a> Reach<'a> {
     fn new_in(alloc: Alloc<'a>) -> Reach<'a> {
-        Reach { rows: blaze_own::Vec::new_in(alloc), text: blaze_own::Vec::new_in(alloc), scratch: blaze_own::Vec::new_in(alloc) }
+        Reach {
+            rows: blaze_own::Vec::new_in(alloc),
+            seen: blaze_hash::HashSet::new_in(alloc),
+            text: blaze_own::Vec::new_in(alloc),
+            scratch: blaze_own::Vec::new_in(alloc),
+        }
     }
 
     fn row(&self, n: usize) -> (ItemKey, &[u8]) {
@@ -2308,11 +2580,7 @@ impl<'a> Reach<'a> {
         self.scratch.clear();
         encode_instance(callee.item, callee.args, ground.view(), alloc, &mut self.scratch)?;
         let symbol = fn_symbol_of_name(&self.scratch);
-        let seen = (0..self.rows.len()).any(|n| {
-            let (t, bytes) = self.row(n);
-            t == tabled && bytes == &self.scratch[..]
-        });
-        if !seen {
+        if self.seen.insert((tabled, symbol.0)) {
             let at = self.text.len() as u32;
             self.text.extend_from_slice(&self.scratch);
             self.rows.push((tabled, at, self.scratch.len() as u32));
@@ -2974,7 +3242,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
                     let t = tables.take().ok_or_else(|| tables_gone(item))?;
                     let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
                     work.reads.clear();
-                    let asking = Asking::new(&*program, 0, &work.langs, &bodies, &work.reads);
+                    let asking = Asking::new(&*program, 0, &work.langs, &bodies, &work.query_cache, &work.reads);
                     let mut layouts: Layouts<Alloc<'static>> = Layouts::new_in(alloc);
                     let mut res = Ok(());
                     for &(_, want) in resolved.iter() {

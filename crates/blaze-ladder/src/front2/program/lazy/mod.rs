@@ -247,6 +247,126 @@ pub struct LazyCounts {
 }
 
 /// The program filled one body at a time (module docs).
+struct LazyConsts<'n, S> {
+    names: S,
+    index: crate::front2::index::Index<'n>,
+    prepared: &'n Prepares<'n>,
+}
+
+struct SharedLazyConsts<'n, S>(&'n RefCell<Option<LazyConsts<'n, S>>>);
+
+impl<'n, S: NamesSource<'n>> crate::front2::tables::head::ConstValues<'n> for SharedLazyConsts<'n, S> {
+    fn eval(
+        &mut self,
+        store: &mut Store<'n>,
+        keys: &mut crate::front2::keys::Keys,
+        c: blaze_id::ItemKey,
+    ) -> Result<(), crate::front2::consts::ConstFail> {
+        let guard = self.0.borrow();
+        let Some(consts) = guard.as_ref() else {
+            let item = checker_of(c);
+            return Err(crate::front2::consts::ConstFail::Body { item, error: BodyError::NoBody(item) });
+        };
+        crate::front2::tables::head::StoreConsts {
+            names: consts.names,
+            index: &consts.index,
+            prepared: consts.prepared,
+        }
+        .eval(store, keys, c)
+    }
+}
+
+/// On-the-spot head seeder for [`LazyProgram`]: freezes each requested head cell once into a
+/// per-program [`SeededHeads`] cache and files it into `&Store` in place during `check_body` and
+/// `in_world` queries (`BodyWorld::store_want`, `BodyWorld::impl_question`, and ADT layout
+/// lookups). Any head that belongs to a body-local item or cannot be frozen falls back cleanly to
+/// [`Seeded::Lower`] so the existing lowering + `eval_len` path handles it identically.
+struct LazySeed<'n, S> {
+    names: S,
+    heads: RefCell<Option<crate::front2::tables::head::SeededHeads<'n, 'n, S>>>,
+    consts: &'n RefCell<Option<LazyConsts<'n, S>>>,
+}
+
+impl<'n, S> LazySeed<'n, S> {
+    fn clear(&self) {
+        if let Ok(mut guard) = self.heads.try_borrow_mut() {
+            let _ = guard.take();
+        }
+        if let Ok(mut guard) = self.consts.try_borrow_mut() {
+            let _ = guard.take();
+        }
+    }
+}
+
+impl<'n, S: NamesSource<'n>> crate::front2::tables::seeds::HeadSeed<'n> for LazySeed<'n, S> {
+    fn seed(
+        &self,
+        store: &Store<'n>,
+        keys: &crate::front2::keys::Keys,
+        need: crate::front2::heads::Want,
+        scratch: Alloc<'static>,
+    ) -> Result<crate::front2::heads::Seeded, crate::front2::tables::seeds::SeedError> {
+        use crate::front2::heads::{Seeded, Want};
+        if crate::front2::tables::seeds::of_the_body(store, need) {
+            return Ok(Seeded::Lower);
+        }
+        let Ok(mut guard) = self.heads.try_borrow_mut() else {
+            return Ok(Seeded::Lower);
+        };
+        let Some(heads) = guard.as_mut() else {
+            return Ok(Seeded::Lower);
+        };
+        // A member fn's body lowering (`lower_member` -> `own_trait::of_member`) reads its
+        // container's head (`store.impls` / `store.trait_defs`), and `track_caller` for a trait
+        // impl method reads the trait's declared member (`keys.filed_member`) and trait head
+        // (`store.trait_defs`), so seed parent heads alongside member cells.
+        match need {
+            Want::MemberFn(container, _) => {
+                let parent = Want::Head(container);
+                if !store.made(parent)
+                    && !crate::front2::tables::seeds::of_the_body(store, parent)
+                    && crate::front2::tables::head::seed(self.names, None, parent, heads, store, keys, scratch).is_err()
+                {
+                    return Ok(Seeded::Lower);
+                }
+                if let Some(imp) = store.impls.get(&checker_of(container))
+                    && let Some(trait_) = imp.trait_
+                    && let Some(trait_lib) = keys.library_in(self.names, trait_)
+                {
+                    let trait_head = Want::Head(trait_lib);
+                    if !store.made(trait_head)
+                        && !crate::front2::tables::seeds::of_the_body(store, trait_head)
+                        && crate::front2::tables::head::seed(self.names, None, trait_head, heads, store, keys, scratch).is_err()
+                    {
+                        return Ok(Seeded::Lower);
+                    }
+                    let members = Want::Members(trait_lib);
+                    if !store.made(members)
+                        && !crate::front2::tables::seeds::of_the_body(store, members)
+                        && crate::front2::tables::head::seed(self.names, None, members, heads, store, keys, scratch).is_err()
+                    {
+                        return Ok(Seeded::Lower);
+                    }
+                }
+            }
+            Want::Members(container) => {
+                let parent = Want::Head(container);
+                if !store.made(parent)
+                    && !crate::front2::tables::seeds::of_the_body(store, parent)
+                    && crate::front2::tables::head::seed(self.names, None, parent, heads, store, keys, scratch).is_err()
+                {
+                    return Ok(Seeded::Lower);
+                }
+            }
+            _ => {}
+        }
+        match crate::front2::tables::head::seed(self.names, None, need, heads, store, keys, scratch) {
+            Ok(seeded) => Ok(seeded),
+            Err(_) => Ok(Seeded::Lower),
+        }
+    }
+}
+
 pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     front: Front2<'n, S>,
     store: Store<'n>,
@@ -295,8 +415,27 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     /// Monomorphized specializations of generic `inline for` functions (`FrontEnd::specialized_row`,
     /// `FrontEnd::specialize_inline_for`), created on demand per `(orig, concrete_args)`.
     inline_for_specs: AVec<'n, crate::front2::inline_for::SpecRow>,
+    /// Prebuilt fixed spelling table reused by every `in_world` query (ground-type trait
+    /// selection/normalization never resolves written body paths, avoiding O(names) HashMap
+    /// rebuilds on every query).
+    fixed_spell: Spelling<'static>,
+    /// Append-only scan cursors into `self.store.tys.nodes()` for `adt_rows` and `body_objects`,
+    /// preventing O(N^2) prefix rescans across checked bodies.
+    adt_scanned_tys: usize,
+    object_scanned_tys: usize,
+    /// Frame-allocated [`LazySeed`] wired into `self.store.seeds`; cleared on drop so all
+    /// heap-backed [`SeededHeads`] buffers are released with the program.
+    seed: Option<&'n LazySeed<'n, S>>,
     counts: LazyCounts,
     alloc: Alloc<'n>,
+}
+
+impl<'n, S: NamesSource<'n>> Drop for LazyProgram<'n, S> {
+    fn drop(&mut self) {
+        if let Some(seed) = self.seed.take() {
+            seed.clear();
+        }
+    }
 }
 
 impl<'n> LazyProgram<'n> {
@@ -305,7 +444,7 @@ impl<'n> LazyProgram<'n> {
     /// `alloc` is `'static` because the head store's tables are (`Store::new`).
     pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], entry: Option<ItemKey>, alloc: Alloc<'static>) -> Result<LazyProgram<'n>, Front2Refusal> {
         let front = Front2::new(names, frame, user, alloc).map_err(Front2Refusal::Front)?;
-        Self::over(front, entry, alloc)
+        Self::over(front, entry, alloc, false)
     }
 }
 
@@ -323,7 +462,7 @@ impl<'n> LazyProgram<'n, &'n crate::front2::source::Records<'n>> {
         alloc: Alloc<'static>,
     ) -> Result<LazyProgram<'n, &'n crate::front2::source::Records<'n>>, Front2Refusal> {
         let front = Front2::from_records(records, frame, lang_crates).map_err(Front2Refusal::Front)?;
-        Self::over(front, entry, alloc)
+        Self::over(front, entry, alloc, true)
     }
 
     /// The run's sources a body's macro calls expand with (the crate's environment, texts and
@@ -336,22 +475,55 @@ impl<'n> LazyProgram<'n, &'n crate::front2::source::Records<'n>> {
 }
 
 impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
-    fn over(front: Front2<'n, S>, entry: Option<ItemKey>, alloc: Alloc<'static>) -> Result<LazyProgram<'n, S>, Front2Refusal> {
-        let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
-        store.pointers = super::super::receiver::Pointers::find(&front.index, front.resolver);
+    fn over(front: Front2<'n, S>, entry: Option<ItemKey>, alloc: Alloc<'static>, seeded_heads: bool) -> Result<LazyProgram<'n, S>, Front2Refusal> {
+        let sized = front.index.lang("sized");
+        let pointers = super::super::receiver::Pointers::find(&front.index, front.resolver);
+        let mut store = Store::new(sized, front.frame, alloc);
+        store.pointers = pointers;
+        let bump = front.frame.alloc(blaze_own::Erased::new(front.frame)).bump();
+        let prepared = Prepares::new_in(bump);
+        let (seed, buckets) = if seeded_heads {
+            let consts_index = crate::front2::index::Index::from_source(front.names, front.index.scope())
+                .map_err(|e| Front2Refusal::Front(crate::front2::FrontError::Lang(e)))?;
+            let consts_cell: &'n RefCell<Option<LazyConsts<'n, S>>> = front.frame.alloc(RefCell::new(Some(LazyConsts {
+                names: front.names,
+                index: consts_index,
+                prepared,
+            })));
+            let consts_eval: &'n mut SharedLazyConsts<'n, S> = front.frame.alloc(SharedLazyConsts(consts_cell));
+            let seeded = crate::front2::tables::head::SeededHeads::new(crate::front2::tables::head::SeededHeadsOpts {
+                names: front.names,
+                sized,
+                pointers,
+                frame: front.frame,
+                scratch: alloc,
+                alloc,
+                consts: Some(consts_eval),
+                known: None,
+                owners: None,
+            });
+            let seed: &'n LazySeed<'n, S> = front.frame.alloc(LazySeed {
+                names: front.names,
+                heads: RefCell::new(Some(seeded)),
+                consts: consts_cell,
+            });
+            store.seeds = Some(seed);
+            (Some(seed), Some(Buckets::for_source(front.names, &front.index)))
+        } else {
+            (None, None)
+        };
         let mut langs = [(LangItem::Drop, None); SEAM_LANGS.len()];
         for (slot, item) in langs.iter_mut().zip(SEAM_LANGS) {
             // As `lang_of` in program.rs, over any source.
             let found = super::super::langs::find(&front.index, front.resolver, item).map_err(|why| Front2Refusal::Lang { item, why })?;
             *slot = (item, found.map(checker_of));
         }
-        let bump = front.frame.alloc(blaze_own::Erased::new(front.frame)).bump();
         Ok(LazyProgram {
             front,
             store,
-            buckets: None,
+            buckets,
             consts: Consts::default(),
-            prepared: Prepares::new_in(bump),
+            prepared,
             lowerings: fill::Lowerings::default(),
             rows: Rows::new_in(alloc),
             live: AVec::new_in(alloc),
@@ -369,6 +541,10 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             internal_bindings: RefCell::new(front_end::InternalBindings::new_in(alloc)),
             member_rows: HashMap::new_in(Global),
             inline_for_specs: AVec::new_in(alloc),
+            fixed_spell: Spelling::fixed(),
+            adt_scanned_tys: 0,
+            object_scanned_tys: 0,
+            seed,
             counts: LazyCounts::default(),
             alloc,
         })

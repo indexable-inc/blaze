@@ -42,7 +42,7 @@ use blaze_own::Alloc;
 use bstd::Cx;
 use bstd::Deadline;
 use blaze_screen::Step;
-use bstd::procs::{ChannelError, Exit, GRACE, Held, Message, ParentDeath, ParentSignals, Relay, RelayAct, RunChild, RunError, RunFault, RunSpec, SignalError, Spawner, Started, Streams, Waited};
+use bstd::procs::{ChannelError, Exit, GRACE, Held, Message, ParentDeath, ParentSignals, Relay, RelayAct, RunChild, RunError, RunFault, RunSpec, RunStep, SignalError, Spawner, Started, Streams, Waited, Write, whole_messages};
 
 use crate::run_parent::{Needs, ParentError, Resolve, TICK, WRITE_BOUND, status_of};
 
@@ -213,15 +213,21 @@ fn drive_with<C: RunChild, S: ParentSignals, R: Resolve + ?Sized, A: Allocator>(
     let mut served = 0u64;
     let mut torn = None;
     let mut relay = Relay::new(bounds.grace);
-    // Today's start list, before any of the program's messages is read (run.md D124).
+    let mut out_at = 0usize;
+    let mut write_since: Option<Duration> = None;
+    // Today's start list, queued before any of the program's messages is read (run.md D124),
+    // and flushed incrementally alongside reads so arbitrary payload sizes never deadlock.
+    out.clear();
     if !ahead.is_empty() {
-        let by = Deadline::after(child.now(), bounds.write).min(bounds.until);
-        match child.send(ahead, by) {
-            Ok(()) => {}
-            // The child's end closed before it read them: its end is next.
-            Err(RunError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => open = false,
-            Err(error) => return Err(LoopError::Child(error)),
+        let whole = whole_messages(ahead);
+        if whole != ahead.len() {
+            return Err(LoopError::Child(RunError {
+                step: RunStep::Send,
+                proc: None,
+                fault: RunFault::Channel(ChannelError::NotWhole { at: whole, of: ahead.len() }),
+            }));
         }
+        out.extend_from_slice(ahead);
     }
     loop {
         let now = child.now();
@@ -246,46 +252,126 @@ fn drive_with<C: RunChild, S: ParentSignals, R: Resolve + ?Sized, A: Allocator>(
             Plant::GraceUncapped => Deadline::NEVER,
             Plant::None | Plant::DropPartial | Plant::KillAtOnce => relay.bound(),
         };
-        let tick = Deadline::after(now, bounds.tick).min(bounds.until).min(grace_end);
-        if open {
-            match child.recv_message(inbox, LONGEST_FRAME, tick) {
-                Ok(Message::Whole { .. }) => {
-                    // The program is blocked on its need while it is served: the live line may
-                    // show, and is erased before the answer frees it.
-                    resolve.watch().see(Step::Waits);
-                    let taken = needs.serve(resolve, &inbox[..], out).map_err(LoopError::Parent)?;
-                    resolve.watch().see(Step::Answers);
-                    served += count(&inbox[..taken]);
-                    match plant {
-                        // The served prefix out, the rest kept in order (`drain` wants the
-                        // nightly-only allocator trait of `A`).
-                        Plant::None | Plant::KillAtOnce | Plant::GraceUncapped => {
-                            let left = inbox.len() - taken;
-                            inbox.copy_within(taken.., 0);
-                            inbox.truncate(left);
-                        }
-                        Plant::DropPartial => inbox.clear(),
-                    }
-                    if !out.is_empty() {
-                        let by = Deadline::after(child.now(), bounds.write).min(bounds.until);
-                        match child.send(&out[..], by) {
-                            Ok(()) => {}
-                            // The child's end closed while it was answered: its end is next.
-                            Err(RunError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => open = false,
-                            Err(error) => return Err(LoopError::Child(error)),
-                        }
+        if open
+            && let Some(pending) = out.get(out_at..)
+            && !pending.is_empty()
+        {
+            match child.send_some(pending, Deadline::PASSED) {
+                Ok(Write::Bytes(n)) if n > 0 => {
+                    out_at += n;
+                    if out_at >= out.len() {
                         out.clear();
+                        out_at = 0;
+                        write_since = None;
+                    } else {
+                        write_since = Some(child.now());
                     }
-                    continue;
                 }
-                Ok(Message::Deadline) => {}
-                Ok(Message::Closed) => open = false,
-                Err(RunError { fault: RunFault::Channel(ChannelError::Torn { have, want }), .. }) => {
-                    torn = Some((have, want));
-                    inbox.clear();
+                Ok(Write::Bytes(_) | Write::Deadline) => {
+                    let cur = child.now();
+                    if bounds.until.passed(cur) {
+                        let killed = child.kill().map_err(LoopError::Child)?;
+                        return Err(LoopError::Deadline { at: cur, killed: killed.exit });
+                    }
+                    let since = *write_since.get_or_insert(cur);
+                    if cur.saturating_sub(since) >= bounds.write {
+                        return Err(LoopError::Child(RunError {
+                            step: RunStep::Send,
+                            proc: None,
+                            fault: RunFault::Channel(ChannelError::WriteDeadline { sent: out_at, of: out.len() }),
+                        }));
+                    }
+                }
+                Err(RunError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => {
                     open = false;
+                    out.clear();
+                    out_at = 0;
+                    write_since = None;
                 }
                 Err(error) => return Err(LoopError::Child(error)),
+            }
+        }
+        let write_bound = write_since.map_or(Deadline::NEVER, |since| Deadline::after(since, bounds.write));
+        let tick = Deadline::after(now, bounds.tick).min(bounds.until).min(grace_end).min(write_bound);
+        if open {
+            let mut try_recv = true;
+            let mut recv_deadline = tick;
+            if out_at < out.len() {
+                let ready = child.wait_ready(true, true, tick).map_err(LoopError::Child)?;
+                if ready.writable && !ready.readable {
+                    continue;
+                }
+                try_recv = ready.readable;
+                recv_deadline = Deadline::PASSED;
+            }
+            if try_recv {
+                match child.recv_message(inbox, LONGEST_FRAME, recv_deadline) {
+                    Ok(Message::Whole { .. }) => {
+                        if out_at > 0 {
+                            let rem = out.len() - out_at;
+                            out.copy_within(out_at.., 0);
+                            out.truncate(rem);
+                            out_at = 0;
+                        }
+                        // The program is blocked on its need while it is served: the live line may
+                        // show, and is erased before the answer frees it.
+                        resolve.watch().see(Step::Waits);
+                        let taken = needs.serve(resolve, &inbox[..], out).map_err(LoopError::Parent)?;
+                        resolve.watch().see(Step::Answers);
+                        if let Some(prefix) = inbox.get(..taken) {
+                            served += count(prefix);
+                        }
+                        match plant {
+                            // The served prefix out, the rest kept in order (`drain` wants the
+                            // nightly-only allocator trait of `A`).
+                            Plant::None | Plant::KillAtOnce | Plant::GraceUncapped => {
+                                let left = inbox.len() - taken;
+                                inbox.copy_within(taken.., 0);
+                                inbox.truncate(left);
+                            }
+                            Plant::DropPartial => inbox.clear(),
+                        }
+                        if let Some(pending) = out.get(out_at..)
+                            && !pending.is_empty()
+                        {
+                            match child.send_some(pending, Deadline::PASSED) {
+                                Ok(Write::Bytes(n)) if n > 0 => {
+                                    out_at += n;
+                                    if out_at >= out.len() {
+                                        out.clear();
+                                        out_at = 0;
+                                        write_since = None;
+                                    } else {
+                                        write_since = Some(child.now());
+                                    }
+                                }
+                                Ok(Write::Bytes(_) | Write::Deadline) => {
+                                    write_since.get_or_insert_with(|| child.now());
+                                }
+                                // The child's end closed while it was answered: its end is next.
+                                Err(RunError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => {
+                                    open = false;
+                                    out.clear();
+                                    out_at = 0;
+                                    write_since = None;
+                                }
+                                Err(error) => return Err(LoopError::Child(error)),
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(Message::Deadline) => {}
+                    Ok(Message::Closed) => open = false,
+                    Err(RunError { fault: RunFault::Channel(ChannelError::Torn { have, want }), .. }) => {
+                        torn = Some((have, want));
+                        inbox.clear();
+                        open = false;
+                    }
+                    Err(error) => return Err(LoopError::Child(error)),
+                }
+            }
+            if out_at < out.len() {
+                continue;
             }
         }
         // While the channel is open the read was the wait: one look. Once it closed, the
@@ -597,5 +683,184 @@ mod tests {
             assert_eq!(seen.ignored, 3, "seed {seed}: all three came during the run and were ignored");
         }
         println!("run loop: SIGINT and SIGQUIT during the waits leave the program its own end");
+    }
+
+    /// Sends a >1 MiB `ahead` batch across a REAL OS Unix stream socketpair (exceeding even a
+    /// tuned 256 KiB kernel buffer by >4x) while the peer end has already written `Up::Need`
+    /// requests before draining, proving `drive` interleaves `send_some`, `wait_ready`, and
+    /// `recv_message` without deadlock.
+    #[test]
+    fn large_ahead_across_real_channel_never_deadlocks() {
+        use blaze_core::linked::channel::{self, Channel, DeadlineFd};
+        use blaze_core::wait::Clock;
+        use blaze_launch::Slot;
+        use blaze_launch::wire::List;
+        use blaze_launch::wire::run::{Declared, Down};
+        use blaze_own::AVec;
+
+        struct StepClock(core::cell::Cell<u64>);
+
+        impl Clock for StepClock {
+            fn now(&self) -> Duration {
+                let n = self.0.get();
+                self.0.set(n + 1);
+                Duration::from_millis(n)
+            }
+        }
+
+        struct SocketChild<'a> {
+            parent: Channel,
+            peer: Option<Channel>,
+            clock: StepClock,
+            ahead_len: usize,
+            peer_got: AVec<'a, u8>,
+            done: bool,
+        }
+
+        impl SocketChild<'_> {
+            fn pump_peer(&mut self, drain_all: bool) {
+                let Some(peer) = self.peer.as_ref() else {
+                    return;
+                };
+                // Drain 16 KiB per step during backpressure (so the parent experiences repeated
+                // partial writes), or drain everything currently buffered once waiting for EOF.
+                let mut buf = [0u8; 16384];
+                loop {
+                    match peer.end().read_some(&mut buf, Deadline::PASSED, &self.clock) {
+                        Ok(channel::Read::Bytes(n)) if n > 0 => {
+                            self.peer_got.extend_from_slice(&buf[..n]);
+                            if !drain_all {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                if self.peer_got.len() >= self.ahead_len {
+                    let mut at = self.ahead_len;
+                    let mut frames_after_ahead = 0usize;
+                    while let Some(prefix) = self.peer_got.get(at..).and_then(|s| s.first_chunk::<4>()) {
+                        let end = at + 4 + u32::from_be_bytes(*prefix) as usize;
+                        if end > self.peer_got.len() {
+                            break;
+                        }
+                        at = end;
+                        frames_after_ahead += 1;
+                    }
+                    if frames_after_ahead >= 6 {
+                        self.peer = None;
+                        self.done = true;
+                    }
+                }
+            }
+        }
+
+        impl RunChild for &mut SocketChild<'_> {
+            type Left = ();
+
+            fn now(&self) -> Duration {
+                self.clock.now()
+            }
+
+            fn recv_message<A: Allocator>(
+                &mut self,
+                into: &mut crate::run_parent::WireOut<A>,
+                most: u32,
+                _deadline: Deadline,
+            ) -> Result<Message, RunError> {
+                self.pump_peer(true);
+                self.parent
+                    .recv_message(into, most, Deadline::PASSED, &self.clock)
+                    .map_err(|e| RunError { step: RunStep::Recv, proc: None, fault: RunFault::Channel(e) })
+            }
+
+            fn send(&mut self, bytes: &[u8], deadline: Deadline) -> Result<(), RunError> {
+                self.parent
+                    .send(bytes, deadline, &self.clock)
+                    .map_err(|e| RunError { step: RunStep::Send, proc: None, fault: RunFault::Channel(e) })
+            }
+
+            fn send_some(&mut self, bytes: &[u8], deadline: Deadline) -> Result<Write, RunError> {
+                self.parent
+                    .send_some(bytes, deadline, &self.clock)
+                    .map_err(|e| RunError { step: RunStep::Send, proc: None, fault: RunFault::Channel(e) })
+            }
+
+            fn wait_ready(
+                &mut self,
+                want_read: bool,
+                want_write: bool,
+                _deadline: Deadline,
+            ) -> Result<bstd::procs::ChannelReady, RunError> {
+                self.pump_peer(false);
+                let soon = Deadline::after(self.clock.now(), Duration::from_millis(5));
+                self.parent
+                    .wait_ready(want_read, want_write, soon, &self.clock)
+                    .map_err(|e| RunError { step: RunStep::Recv, proc: None, fault: RunFault::Channel(e) })
+            }
+
+            fn wait(self, _deadline: Deadline) -> Result<bstd::procs::RunWaited<Self>, RunError> {
+                self.pump_peer(true);
+                if self.done {
+                    Ok(Waited::Ended(bstd::procs::Reaped { exit: Exit::Exited(0), left: () }))
+                } else {
+                    Ok(Waited::Running(self))
+                }
+            }
+
+            fn kill(self) -> Result<bstd::procs::Reaped<()>, RunError> {
+                Ok(bstd::procs::Reaped { exit: Exit::Signaled(9), left: () })
+            }
+
+            fn terminate(&mut self) -> Result<(), RunError> {
+                Ok(())
+            }
+        }
+
+        let frame = bstd::mem::Frame::with_reserve(1 << 23, bstd::mem::Tag::Other).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+
+        let (parent, child_end) = channel::pair().expect("socket pair");
+        let mut peer_chan = Channel::from_end(DeadlineFd::new(child_end.into_fd(), "peer").expect("peer fd"));
+        let clock = StepClock(core::cell::Cell::new(0));
+        // Peer writes three Up::Need messages into the real OS socket before draining any `ahead`.
+        for msg in [need(1, 1000), need(2, 1001), need(3, 1002)] {
+            peer_chan.send(&msg, Deadline::after(clock.now(), Duration::from_secs(5)), &clock).expect("peer send");
+        }
+
+        // Build >1 MiB of valid `Down::Declare` frames in `ahead` (exceeds even a 256 KiB buffer).
+        let mut ahead = crate::run_parent::wire_out(alloc);
+        let mut pairs = AVec::with_capacity_in(64, alloc);
+        for batch in 0u32..500 {
+            pairs.clear();
+            for j in 0u32..64 {
+                let id = batch * 64 + j + 100;
+                let mut sym = [0u8; 32];
+                sym[..4].copy_from_slice(&id.to_le_bytes());
+                pairs.push(Declared { symbol: Symbol(sym), slot: Slot(id) });
+            }
+            Down::Declare { pairs: List::of(&pairs) }.encode(u64::from(batch) + 1, &mut ahead).expect("encode ahead");
+        }
+        assert!(ahead.len() > 1024 * 1024, "ahead must exceed 1 MiB (got {})", ahead.len());
+
+        let mut needs = Needs::new(alloc);
+        let mut resolver = Table;
+        let mut child = SocketChild {
+            parent,
+            peer: Some(peer_chan),
+            clock,
+            ahead_len: ahead.len(),
+            peer_got: AVec::with_capacity_in(ahead.len() + 1024, alloc),
+            done: false,
+        };
+        let mut signals = Scripted::new(&[]);
+        let mut inbox = crate::run_parent::wire_out(alloc);
+        let mut out = crate::run_parent::wire_out(alloc);
+        let b = Bounds { tick: Duration::from_millis(50), write: Duration::from_secs(5), until: Deadline::after(child.clock.now(), Duration::from_secs(10)), grace: GRACE };
+        let ran = drive(&mut child, &mut needs, &mut resolver, &ahead, &b, &mut signals, &mut inbox, &mut out)
+            .expect("large >1 MiB ahead across real channel must never deadlock");
+        assert_eq!(ran, Ran { status: 0, served: 3, torn: None, terminated: false });
+        assert_eq!(&child.peer_got[..ahead.len()], &ahead[..], "all >1 MiB of ahead arrived byte-for-byte");
     }
 }

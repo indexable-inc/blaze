@@ -41,19 +41,34 @@ impl core::fmt::Display for LangTwice {
     }
 }
 
-/// The lang items by name, without the crate each was found in (kept only to name a clash).
-fn keys_of<'n>(found: HashMap<&'n str, (LibKey, usize), Global>) -> HashMap<&'n str, LibKey, Global> {
-    let mut langs = HashMap::new_in(Global);
+/// The lang items by name, and the deterministic reverse map by key (for O(1) `lang_name_of`).
+fn keys_of<'n, A: core::alloc::Allocator + Copy>(
+    found: HashMap<&'n str, (LibKey, usize), A>,
+) -> (HashMap<&'n str, LibKey, A>, HashMap<LibKey, &'n str, A>) {
+    let alloc = *found.allocator();
+    let mut langs = HashMap::with_capacity_in(found.len(), alloc);
+    let mut lang_by_key: HashMap<LibKey, &'n str, A> = HashMap::with_capacity_in(found.len(), alloc);
     for (name, (key, _)) in found {
         langs.insert(name, key);
+        // Pick the lexicographically smallest name if two lang names ever alias one LibKey so
+        // the reverse map is independent of HashMap iteration order.
+        lang_by_key
+            .entry(key)
+            .and_modify(|prev| {
+                if name < *prev {
+                    *prev = name;
+                }
+            })
+            .or_insert(name);
     }
-    langs
+    (langs, lang_by_key)
 }
 
 /// Every impl, and every lang item of ONE program by its name.
 pub struct Index<'n> {
     pub impls: Vec<ImplAt<'n>, Global>,
     langs: HashMap<&'n str, LibKey, Global>,
+    lang_by_key: HashMap<LibKey, &'n str, Global>,
     /// What the lang rows are a function of (with the names; rule 21): the roots of the
     /// program they were filed for ([`Linked::roots`]), or, from records, the lang crates
     /// given, sorted. Two indexes of different scope are two programs' and never shared.
@@ -103,7 +118,8 @@ impl<'n> Index<'n> {
         impls.sort_by_key(|i| i.key);
         let mut scope = Vec::with_capacity_in(linked.roots().len(), Global);
         scope.extend_from_slice(linked.roots());
-        Ok(Index { impls, langs: keys_of(langs), scope })
+        let (langs, lang_by_key) = keys_of(langs);
+        Ok(Index { impls, langs, lang_by_key, scope })
     }
 
     /// What the lang rows are a function of: the program's roots (or, from records, the lang
@@ -145,7 +161,8 @@ impl<'n> Index<'n> {
         scope.extend_from_slice(lang_crates);
         scope.sort_unstable();
         scope.dedup();
-        Ok(Index { impls: Vec::new_in(Global), langs: keys_of(langs), scope })
+        let (langs, lang_by_key) = keys_of(langs);
+        Ok(Index { impls: Vec::new_in(Global), langs, lang_by_key, scope })
     }
 
     /// The item `#[lang = "name"]` declares.
@@ -170,9 +187,9 @@ impl<'n> Index<'n> {
         found.find(|k| *k != first).map(|second| (first, second))
     }
 
-    /// The `#[lang]` name `key` is declared under, if any (a scan of the few lang items).
+    /// The `#[lang]` name `key` is declared under, if any (O(1) reverse map lookup).
     pub fn lang_name_of(&self, key: LibKey) -> Option<&'n str> {
-        self.langs.iter().find(|(_, k)| **k == key).map(|(n, _)| *n)
+        self.lang_by_key.get(&key).copied()
     }
 
     pub fn lang_count(&self) -> usize {
