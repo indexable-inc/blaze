@@ -344,6 +344,12 @@ pub trait Adts {
         None
     }
 
+    /// Code-generation function attributes (`#[inline]`, `#[inline(always)]`, `#[inline(never)]`, `#[cold]`).
+    fn fn_attrs(&self, owner: ItemKey) -> blaze_lir::func::FnAttrs {
+        let _ = owner;
+        blaze_lir::func::FnAttrs::default()
+    }
+
     /// Whether `+ - *`, shifts and unary `-` on integers panic on overflow (the Reference,
     /// [expr.operator.int-overflow]: "Integer operators will panic when they overflow when
     /// compiled in debug mode. The -C debug-assertions and -C overflow-checks compiler flags

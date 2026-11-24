@@ -1105,6 +1105,10 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
         self.0.nounwind(owner)
     }
 
+    fn fn_attrs(&self, owner: ItemKey) -> blaze_lir::func::FnAttrs {
+        self.0.fn_attrs(owner)
+    }
+
     /// The front end resolves the function's own or inherited caller-tracking attribute.
     /// At a call from an untracked function, the fast emitter records the item-relative
     /// caller site. Placement supplies its current line and column.

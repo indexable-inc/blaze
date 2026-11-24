@@ -888,6 +888,10 @@ impl Adts for Recorded<'_> {
         answer
     }
 
+    fn fn_attrs(&self, owner: ItemKey) -> blaze_lir::func::FnAttrs {
+        self.world.fn_attrs(owner)
+    }
+
     fn overflow_checks(&self) -> blaze_build::OverflowChecks {
         self.world.overflow_checks()
     }

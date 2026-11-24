@@ -23,7 +23,7 @@ blaze-data	49
 blaze-dbsp	1
 blaze-deflate	5
 blaze-drive	17
-blaze-emit	27
+blaze-emit	18
 blaze-engine	3
 blaze-expand	29
 blaze-fetch	12

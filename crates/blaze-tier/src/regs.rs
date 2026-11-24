@@ -32,7 +32,63 @@ pub struct Machine {
 
 impl Machine {
     /// arm64: the large-system atomics (`cas`, `ldadd`, ..).
-    pub const LSE: u64 = 1;
+    pub const LSE: u64 = 1 << 0;
+    /// arm64: NEON dot-product instructions (`sdot`/`udot`, Apple Silicon & Neoverse).
+    pub const DOTPROD: u64 = 1 << 1;
+    /// arm64: ARMv8.9/v9.4 Common Short Sequence Compression (`smin`/`smax`/`umin`/`umax`/`abs`/`cnt`).
+    pub const CSSC: u64 = 1 << 2;
+    /// x86-64: BMI2 non-destructive shifts & flagless multiply (`mulx`/`shlx`/`shrx`/`sarx`).
+    pub const BMI2: u64 = 1 << 3;
+    /// x86-64: FMA3 fused multiply-add (`vfmadd213sd`/`ss`/`pd`/`ps`).
+    pub const FMA: u64 = 1 << 4;
+    /// x86-64: AVX2 3-operand non-destructive VEX SIMD (`vpaddq`/`vpxor`/`vaddpd`/...).
+    pub const AVX2: u64 = 1 << 5;
+    /// AArch64 ARMv8.2-SHA3 (`eor3` 3-way 128-bit XOR, `xar` XOR+rotate, `bcax`, `rax1` for Keccak-256).
+    pub const SHA3: u64 = 1 << 6;
+    /// AArch64 hardware `crc32{b,h,w,x}` / `crc32c{b,h,w,x}`.
+    pub const CRC32: u64 = 1 << 7;
+    /// AArch64 ARMv8.6-I8MM (`smmla`/`ummla` 2x8x2 int8 matrix multiply-accumulate).
+    pub const I8MM: u64 = 1 << 8;
+    /// AArch64 ARMv8-AES (`aese`/`aesmc`/`aesd`/`aesimc`) / x86-64 AES-NI.
+    pub const AES: u64 = 1 << 9;
+    /// AArch64 ARMv8-SHA2 (`sha256h`/`sha256su0`/`sha256su1`) / x86-64 SHA-NI.
+    pub const SHA2: u64 = 1 << 10;
+    /// x86-64 AVX-512F/BW/DQ/VL (512-bit `zmm` vectors + opmask `k1..k7`).
+    pub const AVX512: u64 = 1 << 11;
+}
+
+/// Interprocedural Register Allocation (IPRA) clobber summary for a compiled callee:
+/// bits `0..32` mark clobbered GPRs and bits `32..64` mark clobbered FP/SIMD registers.
+/// Internal callers keep live values in caller-saved registers outside `clobbered` across calls
+/// with zero spills!
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct CallClobbers {
+    pub clobbered: RegSet,
+}
+
+impl CallClobbers {
+    /// Conservative AAPCS64 C-ABI clobber set (`X0..X18`, `X30`, `V0..V7`, `V16..V31`).
+    pub const C_ABI_ARM64: Self = Self {
+        clobbered: RegSet(0x4007_ffff | (0xffff_00ffu64 << 32)),
+    };
+
+    /// Conservative System V AMD64 C-ABI clobber set (`RAX, RCX, RDX, RSI, RDI, R8..R11`, `XMM0..XMM15`).
+    pub const C_ABI_X64: Self = Self {
+        clobbered: RegSet(0x0000_0fc7 | (0x0000_ffffu64 << 32)),
+    };
+
+    /// Empty clobber set (pure leaf that touches no registers).
+    pub const EMPTY: Self = Self { clobbered: RegSet::EMPTY };
+
+    #[inline]
+    pub const fn clobbers_gpr(self, reg: u8) -> bool {
+        self.clobbered.contains(Reg(reg))
+    }
+
+    #[inline]
+    pub const fn clobbers_fp(self, reg: u8) -> bool {
+        self.clobbered.contains(Reg(32 + reg))
+    }
 }
 
 /// One register by its number (see the module's documentation).

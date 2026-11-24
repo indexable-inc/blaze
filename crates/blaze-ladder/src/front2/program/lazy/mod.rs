@@ -177,6 +177,7 @@ struct Rows<'n> {
     /// The fn's OWN `#[track_caller]` (program.rs `symbols_of`); the seam's answer adds its
     /// trait's declaration's (program/seam_rules.rs `track_caller`).
     track_caller: AVec<'n, bool>,
+    fn_attrs: AVec<'n, blaze_lir::func::FnAttrs>,
     at: AVec<'n, At>,
     path: AVec<'n, Span>,
     symbol: AVec<'n, Span>,
@@ -199,6 +200,7 @@ impl<'n> Rows<'n> {
             abi: AVec::new_in(alloc),
             nounwind: AVec::new_in(alloc),
             track_caller: AVec::new_in(alloc),
+            fn_attrs: AVec::new_in(alloc),
             at: AVec::new_in(alloc),
             path: AVec::new_in(alloc),
             symbol: AVec::new_in(alloc),

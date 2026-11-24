@@ -425,7 +425,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             // A ctor is a safe Rust fn (head_abi.rs `head_abi`, the one home): unwinding, never
             // nounwind, never tracked.
             let ctor = head_abi(self.front.names, &self.store, key, || Box::from(path.as_str())).map_err(&refuse)?;
-            return Ok(self.push(key, FnKind::Ctor, ctor, false, at, &path, "", None, None));
+            return Ok(self.push(key, FnKind::Ctor, ctor, false, blaze_lir::func::FnAttrs::default(), at, &path, "", None, None));
         }
         if !self.store.fns.contains_key(&key) {
             let (_, want) = self.target_of(key)?;
@@ -441,7 +441,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let local = |why: crate::front2::panic_entry::Refused| Front2Refusal::Attrs { function: Box::from(path.as_str()), why: why.form().into() };
         let foreign = foreign.or_else(|| crate::front2::panic_entry::local_abi(&self.store, key));
         if let Some(llvm) = seam_rules::llvm_row(foreign, symbols.link_name.as_deref(), &path).map_err(&refuse)? {
-            return Ok(self.push(key, llvm.kind, llvm.build, llvm.track_caller, at, &path, llvm.symbol, symbols.export.as_deref(), Some(llvm.intrinsic)));
+            return Ok(self.push(key, llvm.kind, llvm.build, llvm.track_caller, symbols.fn_attrs, at, &path, llvm.symbol, symbols.export.as_deref(), Some(llvm.intrinsic)));
         }
         let declared_name = crate::front2::panic_entry::local_name(&self.store, key).map_err(local).map_err(&refuse)?;
         let alloc = self.store.tys.alloc();
@@ -501,11 +501,11 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let own = head_abi(self.front.names, &self.store, key, || Box::from(path.as_str())).map_err(&refuse)?;
         // `#[rustc_nounwind]` makes any fn nounwind (core/src/panicking.rs:88-92), as tabled.rs.
         let build = BuildAbi { abi: own.abi, nounwind: own.nounwind || symbols.nounwind };
-        Ok(self.push(key, kind, build, symbols.track_caller, at, &path, symbol, symbols.export.as_deref(), intrinsic))
+        Ok(self.push(key, kind, build, symbols.track_caller, symbols.fn_attrs, at, &path, symbol, symbols.export.as_deref(), intrinsic))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn push(&mut self, key: ItemKey, kind: FnKind, build: BuildAbi, track_caller: bool, at: At, path: &str, symbol: &str, export: Option<&str>, intrinsic: Option<Intrinsic>) -> usize {
+    fn push(&mut self, key: ItemKey, kind: FnKind, build: BuildAbi, track_caller: bool, fn_attrs: blaze_lir::func::FnAttrs, at: At, path: &str, symbol: &str, export: Option<&str>, intrinsic: Option<Intrinsic>) -> usize {
         let i = self.rows.len();
         let path = self.rows.put(path);
         let symbol = self.rows.put(symbol);
@@ -515,6 +515,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         self.rows.abi.push(build.abi);
         self.rows.nounwind.push(build.nounwind);
         self.rows.track_caller.push(track_caller);
+        self.rows.fn_attrs.push(fn_attrs);
         self.rows.at.push(at);
         self.rows.path.push(path);
         self.rows.symbol.push(symbol);

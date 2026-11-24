@@ -2613,3 +2613,85 @@ fn heap_leak_flags_leak_and_allows_root_and_bump() {
         "#[test]\nfn t() { let _ = v.leak(); }",
     ]);
 }
+
+#[test]
+fn jit_telemetry_driven_perf_lints_rank_soa_and_hot_paths() {
+    use crate::pgo::{AdviceKind, Heat, HotSite, JitObservation, JitTelemetryKind, PgoHints, suggest_from_jit};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let hints = PgoHints::from_sites(
+        &[
+            HotSite::for_symbol("sim::step_particles", 900_000, 120_000), // Critical (12%)
+            HotSite::for_symbol("rpc::decode_frame", 200_000, 25_000),    // Hot (2.5%)
+            HotSite::for_symbol("cli::rare_help", 10, 50),                // Cold (0.005%)
+        ],
+        alloc,
+    );
+
+    let obs = [
+        // Critical 64B AoS loop touching only 8B (87.5% cache-line waste -> UseSoaLayout!)
+        JitObservation::for_symbol(
+            "sim::step_particles",
+            Span::new(10, 60),
+            JitTelemetryKind::AosStrideLoop { stride_bytes: 64, accessed_bytes: 8, trip_count: 500_000 },
+        ),
+        // Critical non-escaping heap alloc in hot loop
+        JitObservation::for_symbol(
+            "sim::step_particles",
+            Span::new(70, 90),
+            JitTelemetryKind::NonEscapingHeapAlloc { alloc_bytes: 256, executions: 100_000 },
+        ),
+        // Hot 99.9% skewed error branch -> UseColdErrorPath / Conv::BlazeResult
+        JitObservation::for_symbol(
+            "rpc::decode_frame",
+            Span::new(100, 140),
+            JitTelemetryKind::SkewedBranch { taken_ppm: 1_000, executions: 250_000 },
+        ),
+        // Hot oversized async frame (512 B -> graph-colored 128 B)
+        JitObservation::for_symbol(
+            "rpc::decode_frame",
+            Span::new(150, 200),
+            JitTelemetryKind::OversizedAsyncFrame { frame_bytes: 512, colored_bytes: 128, polls: 80_000 },
+        ),
+        // Hot skewed integer divisor (95% divisor == 10)
+        JitObservation::for_symbol(
+            "rpc::decode_frame",
+            Span::new(210, 240),
+            JitTelemetryKind::SkewedDivisor { dominant_divisor: 10, dominant_ppm: 950_000, executions: 100_000 },
+        ),
+        // Hot indirect gather loop with 25% cache miss rate
+        JitObservation::for_symbol(
+            "rpc::decode_frame",
+            Span::new(250, 300),
+            JitTelemetryKind::IndirectGatherLoop { miss_rate_ppm: 250_000, trip_count: 50_000 },
+        ),
+        // Negative controls: cold AoS loop (filtered by min_heat), and dense AoS (48/64 = 75% accessed)
+        JitObservation::for_symbol(
+            "cli::rare_help",
+            Span::new(400, 440),
+            JitTelemetryKind::AosStrideLoop { stride_bytes: 64, accessed_bytes: 8, trip_count: 500_000 },
+        ),
+        JitObservation::for_symbol(
+            "sim::step_particles",
+            Span::new(450, 490),
+            JitTelemetryKind::AosStrideLoop { stride_bytes: 64, accessed_bytes: 48, trip_count: 500_000 },
+        ),
+    ];
+
+    let adv = suggest_from_jit(&obs, &hints, Heat::Hot, alloc);
+    assert_eq!(adv.len(), 6, "expected exactly 6 hot JIT findings, got {adv:?}");
+    // Critical findings come strictly before Hot findings.
+    assert_eq!(adv[0].heat, Heat::Critical);
+    assert_eq!(adv[1].heat, Heat::Critical);
+    assert!(adv[0].impact_score >= adv[1].impact_score);
+    let soa = adv.iter().find(|a| a.kind == AdviceKind::UseSoaLayout).expect("missing UseSoaLayout");
+    assert_eq!(soa.waste_pct, 87);
+    assert_eq!(soa.est_speedup_x10, 80); // 64/8 = 8.0x capped at 80
+    assert!(soa.kind.message().contains("Struct-of-Arrays"));
+
+    assert!(adv.iter().any(|a| a.kind == AdviceKind::PromoteHotHeapAlloc));
+    assert!(adv.iter().any(|a| a.kind == AdviceKind::UseColdErrorPath));
+    assert!(adv.iter().any(|a| a.kind == AdviceKind::ShrinkAsyncFrame && a.waste_pct == 75));
+    assert!(adv.iter().any(|a| a.kind == AdviceKind::SpecializeHotDivisor));
+    assert!(adv.iter().any(|a| a.kind == AdviceKind::PrefetchHotGather));
+}
