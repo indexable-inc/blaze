@@ -17,7 +17,7 @@
 use core::alloc::Allocator;
 use core::fmt;
 
-use blaze_own::{AllocFailure, Vec};
+use blaze_own::{AllocFailure, ByteCursor, Vec};
 
 use crate::digest::crc32c;
 
@@ -51,7 +51,6 @@ const STREAM_IDENTIFIER_CHUNK: [u8; 10] = [
 ];
 const MAX_CHUNK_UNCOMPRESSED: usize = 65_536;
 const MAX_EXACT_PREALLOC: usize = 16 << 20;
-const ZERO_PAGE: [u8; 4096] = [0u8; 4096];
 
 /// Caller-supplied bounds enforced while decoding untrusted Snappy framed streams.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -176,25 +175,6 @@ pub const fn mask_crc32c(crc: u32) -> u32 {
 }
 
 #[inline]
-fn grow_zeroed<A: Allocator>(out: &mut Vec<u8, A>, extra: usize) -> Result<(), SnappyError> {
-    if extra == 0 {
-        return Ok(());
-    }
-    out.try_reserve(extra)?;
-    let mut rem = extra;
-    while rem >= ZERO_PAGE.len() {
-        out.try_extend_from_slice(&ZERO_PAGE)?;
-        rem -= ZERO_PAGE.len();
-    }
-    if rem > 0
-        && let Some(tail) = ZERO_PAGE.get(..rem)
-    {
-        out.try_extend_from_slice(tail)?;
-    }
-    Ok(())
-}
-
-#[inline]
 fn alloc_hash_table<A: Allocator>(alloc: A) -> Result<Vec<u32, A>, SnappyError> {
     let mut table = Vec::try_with_capacity_in(HASH_SIZE, alloc)?;
     let zeros = [0u32; 256];
@@ -239,21 +219,19 @@ fn snappy_hash(seq: u32) -> usize {
 }
 
 #[inline]
-fn write_varint_u32_slice(out_buf: &mut [u8], op: &mut usize, mut value: u32) {
+fn write_varint_u32<A: Allocator>(
+    cur: &mut ByteCursor<'_, A>,
+    mut value: u32,
+) -> Result<(), SnappyError> {
+    cur.try_reserve(5)?;
     loop {
         let low = u8::try_from(value & 0x7F).unwrap_or(0);
         value >>= 7;
         if value == 0 {
-            if let Some(slot) = out_buf.get_mut(*op) {
-                *slot = low;
-            }
-            *op += 1;
-            return;
+            let _ = cur.push_within_cap(low);
+            return Ok(());
         }
-        if let Some(slot) = out_buf.get_mut(*op) {
-            *slot = low | 0x80;
-        }
-        *op += 1;
+        let _ = cur.push_within_cap(low | 0x80);
     }
 }
 
@@ -314,38 +292,6 @@ fn count_match(a: &[u8], b: &[u8]) -> usize {
 }
 
 #[inline]
-fn copy_lits_fast(input: &[u8], src_pos: usize, lit_len: usize, out_buf: &mut [u8], dst_pos: usize) {
-    if lit_len == 0 {
-        return;
-    }
-    if lit_len <= 16
-        && let Some(s16) = input.get(src_pos..).and_then(|s| s.first_chunk::<16>())
-        && let Some(d16) = out_buf.get_mut(dst_pos..).and_then(|s| s.first_chunk_mut::<16>())
-    {
-        *d16 = *s16;
-        return;
-    }
-    if lit_len <= 32
-        && let Some(s32) = input.get(src_pos..).and_then(|s| s.first_chunk::<32>())
-        && let Some(d32) = out_buf.get_mut(dst_pos..).and_then(|s| s.first_chunk_mut::<32>())
-    {
-        *d32 = *s32;
-        return;
-    }
-    copy_lits_exact(input, src_pos, lit_len, out_buf, dst_pos);
-}
-
-#[cold]
-#[inline(never)]
-fn copy_lits_exact(input: &[u8], src_pos: usize, lit_len: usize, out_buf: &mut [u8], dst_pos: usize) {
-    if let (Some(src), Some(dst)) =
-        (input.get(src_pos..src_pos + lit_len), out_buf.get_mut(dst_pos..dst_pos + lit_len))
-    {
-        dst.copy_from_slice(src);
-    }
-}
-
-#[inline]
 const fn literal_encoded_len(len: usize) -> usize {
     if len == 0 {
         return 0;
@@ -397,9 +343,8 @@ const fn copy_encoded_len(offset: usize, mut len: usize) -> usize {
 }
 
 #[inline]
-fn write_literal_slice(
-    out_buf: &mut [u8],
-    op: &mut usize,
+fn write_literal<A: Allocator>(
+    cur: &mut ByteCursor<'_, A>,
     input: &[u8],
     src_pos: usize,
     lit_len: usize,
@@ -410,115 +355,79 @@ fn write_literal_slice(
     let n = lit_len - 1;
     if n < 60 {
         let tag = (u8::try_from(n).unwrap_or(0) << 2) | TAG_LITERAL;
-        if let Some(slot) = out_buf.get_mut(*op) {
-            *slot = tag;
-        }
-        *op += 1;
+        let _ = cur.push_within_cap(tag);
     } else {
-        write_long_literal_hdr(out_buf, op, n);
+        write_long_literal_hdr(cur, n);
     }
-    copy_lits_fast(input, src_pos, lit_len, out_buf, *op);
-    *op += lit_len;
+    let _ = cur.write_lits_wild(input, src_pos, lit_len);
 }
 
 #[cold]
 #[inline(never)]
-fn write_long_literal_hdr(out_buf: &mut [u8], op: &mut usize, n: usize) {
+fn write_long_literal_hdr<A: Allocator>(cur: &mut ByteCursor<'_, A>, n: usize) {
     if n <= 0xFF {
         let b0 = u8::try_from(n).unwrap_or(0);
-        if let Some(d2) = out_buf.get_mut(*op..).and_then(|s| s.first_chunk_mut::<2>()) {
-            *d2 = [(60u8 << 2) | TAG_LITERAL, b0];
-        }
-        *op += 2;
+        let _ = cur.write_array_within_cap([(60u8 << 2) | TAG_LITERAL, b0]);
     } else if n <= 0xFFFF {
         let [b0, b1] = u16::try_from(n).unwrap_or(0).to_le_bytes();
-        if let Some(d3) = out_buf.get_mut(*op..).and_then(|s| s.first_chunk_mut::<3>()) {
-            *d3 = [(61u8 << 2) | TAG_LITERAL, b0, b1];
-        }
-        *op += 3;
+        let _ = cur.write_array_within_cap([(61u8 << 2) | TAG_LITERAL, b0, b1]);
     } else if n <= 0xFF_FFFF {
         let [b0, b1, b2, _] = u32::try_from(n).unwrap_or(0).to_le_bytes();
-        if let Some(d4) = out_buf.get_mut(*op..).and_then(|s| s.first_chunk_mut::<4>()) {
-            *d4 = [(62u8 << 2) | TAG_LITERAL, b0, b1, b2];
-        }
-        *op += 4;
+        let _ = cur.write_array_within_cap([(62u8 << 2) | TAG_LITERAL, b0, b1, b2]);
     } else {
         let [b0, b1, b2, b3] = u32::try_from(n).unwrap_or(0).to_le_bytes();
-        if let Some(d5) = out_buf.get_mut(*op..).and_then(|s| s.first_chunk_mut::<5>()) {
-            *d5 = [(63u8 << 2) | TAG_LITERAL, b0, b1, b2, b3];
-        }
-        *op += 5;
+        let _ = cur.write_array_within_cap([(63u8 << 2) | TAG_LITERAL, b0, b1, b2, b3]);
     }
 }
 
 #[inline]
-fn write_copy_chunk_slice(out_buf: &mut [u8], op: &mut usize, offset: usize, chunk_len: usize) {
+fn write_copy_chunk<A: Allocator>(cur: &mut ByteCursor<'_, A>, offset: usize, chunk_len: usize) {
     if offset < 2_048 && (4..=11).contains(&chunk_len) {
         let off_hi = u8::try_from(offset >> 8).unwrap_or(0);
         let off_lo = u8::try_from(offset & 0xFF).unwrap_or(0);
         let len_bits = u8::try_from(chunk_len - 4).unwrap_or(0);
         let tag = (off_hi << 5) | (len_bits << 2) | TAG_COPY_1;
-        if let Some(d2) = out_buf.get_mut(*op..).and_then(|s| s.first_chunk_mut::<2>()) {
-            *d2 = [tag, off_lo];
-        }
-        *op += 2;
+        let _ = cur.write_array_within_cap([tag, off_lo]);
     } else if offset <= 65_535 {
         let len_bits = u8::try_from(chunk_len - 1).unwrap_or(0);
         let tag = (len_bits << 2) | TAG_COPY_2;
         let [o0, o1] = u16::try_from(offset).unwrap_or(0).to_le_bytes();
-        if let Some(d3) = out_buf.get_mut(*op..).and_then(|s| s.first_chunk_mut::<3>()) {
-            *d3 = [tag, o0, o1];
-        }
-        *op += 3;
+        let _ = cur.write_array_within_cap([tag, o0, o1]);
     } else {
         let len_bits = u8::try_from(chunk_len - 1).unwrap_or(0);
         let tag = (len_bits << 2) | TAG_COPY_4;
         let [o0, o1, o2, o3] = u32::try_from(offset).unwrap_or(0).to_le_bytes();
-        if let Some(d5) = out_buf.get_mut(*op..).and_then(|s| s.first_chunk_mut::<5>()) {
-            *d5 = [tag, o0, o1, o2, o3];
-        }
-        *op += 5;
+        let _ = cur.write_array_within_cap([tag, o0, o1, o2, o3]);
     }
 }
 
 #[inline]
-fn write_copy_slice(out_buf: &mut [u8], op: &mut usize, offset: usize, mut len: usize) {
+fn write_copy<A: Allocator>(cur: &mut ByteCursor<'_, A>, offset: usize, mut len: usize) {
     if len <= 64 {
-        write_copy_chunk_slice(out_buf, op, offset, len);
+        write_copy_chunk(cur, offset, len);
         return;
     }
     while len >= 68 {
-        write_copy_chunk_slice(out_buf, op, offset, 64);
+        write_copy_chunk(cur, offset, 64);
         len -= 64;
     }
     if len > 64 {
-        write_copy_chunk_slice(out_buf, op, offset, 60);
+        write_copy_chunk(cur, offset, 60);
         len -= 60;
     }
     if len > 0 {
-        write_copy_chunk_slice(out_buf, op, offset, len);
+        write_copy_chunk(cur, offset, len);
     }
 }
 
-enum CompressStep {
-    Done,
-    Aborted,
-    NeedRoomForMatch { needed_end: usize, prev: usize, match_len: usize },
-    NeedRoomForTail { needed_end: usize },
-}
-
-fn compress_raw_slice(
+fn compress_raw_into_cursor<A: Allocator>(
     input: &[u8],
-    ip_out: &mut usize,
-    anchor_out: &mut usize,
-    out_buf: &mut [u8],
-    op_out: &mut usize,
+    cur: &mut ByteCursor<'_, A>,
     table: &mut [u32; HASH_SIZE],
     abort_limit: Option<usize>,
-) -> CompressStep {
-    let mut ip = *ip_out;
-    let mut anchor = *anchor_out;
-    let mut op = *op_out;
+) -> Result<bool, SnappyError> {
+    let mut ip: usize = 1;
+    let mut anchor: usize = 0;
     let input_limit = input.len().saturating_sub(4);
 
     while ip <= input_limit {
@@ -569,26 +478,20 @@ fn compress_raw_slice(
         let lit_len = ip - anchor;
         let offset = ip - found_prev;
         let seq_bytes = literal_encoded_len(lit_len) + copy_encoded_len(offset, match_len);
-        let next_op = op.saturating_add(seq_bytes);
+        let next_op = cur.len().saturating_add(seq_bytes);
 
         if let Some(lim) = abort_limit
             && next_op > lim
         {
-            return CompressStep::Aborted;
+            return Ok(false);
         }
-        if next_op > out_buf.len() {
-            *ip_out = ip;
-            *anchor_out = anchor;
-            *op_out = op;
-            return CompressStep::NeedRoomForMatch {
-                needed_end: next_op,
-                prev: found_prev,
-                match_len,
-            };
+        if cur.spare() < seq_bytes.saturating_add(32) {
+            let extra = seq_bytes.max(cur.len() / 2).saturating_add(64);
+            cur.try_reserve(extra)?;
         }
 
-        write_literal_slice(out_buf, &mut op, input, anchor, lit_len);
-        write_copy_slice(out_buf, &mut op, offset, match_len);
+        write_literal(cur, input, anchor, lit_len);
+        write_copy(cur, offset, match_len);
 
         ip += match_len;
         anchor = ip;
@@ -604,24 +507,18 @@ fn compress_raw_slice(
 
     let tail_len = input.len().saturating_sub(anchor);
     let tail_bytes = literal_encoded_len(tail_len);
-    let final_op = op.saturating_add(tail_bytes);
+    let final_op = cur.len().saturating_add(tail_bytes);
     if let Some(lim) = abort_limit
         && final_op > lim
     {
-        return CompressStep::Aborted;
+        return Ok(false);
     }
-    if final_op > out_buf.len() {
-        *ip_out = ip;
-        *anchor_out = anchor;
-        *op_out = op;
-        return CompressStep::NeedRoomForTail { needed_end: final_op };
+    if cur.spare() < tail_bytes.saturating_add(32) {
+        cur.try_reserve(tail_bytes.saturating_add(32))?;
     }
 
-    write_literal_slice(out_buf, &mut op, input, anchor, tail_len);
-    *ip_out = ip;
-    *anchor_out = anchor;
-    *op_out = op;
-    CompressStep::Done
+    write_literal(cur, input, anchor, tail_len);
+    Ok(true)
 }
 
 /// Compress `input` into a Google Snappy raw block allocated in `alloc`.
@@ -639,19 +536,17 @@ pub fn compress_in<A: Allocator + Copy>(
     })?;
 
     if input.len() < 4 {
-        let cap = 6 + input.len();
+        let cap = 6 + input.len() + 32;
         let mut out = Vec::try_with_capacity_in(cap, alloc)?;
-        grow_zeroed(&mut out, cap)?;
-        let mut op: usize = 0;
-        write_varint_u32_slice(out.as_mut_slice(), &mut op, len_u32);
-        write_literal_slice(out.as_mut_slice(), &mut op, input, 0, input.len());
-        out.truncate(op);
+        let mut cur = out.byte_cursor();
+        write_varint_u32(&mut cur, len_u32)?;
+        write_literal(&mut cur, input, 0, input.len());
+        cur.finish();
         return Ok(out);
     }
 
     let init_size = input.len().saturating_add(input.len() / 6).saturating_add(64);
     let mut out = Vec::try_with_capacity_in(init_size, alloc)?;
-    grow_zeroed(&mut out, init_size)?;
 
     let mut table_vec = alloc_hash_table(alloc)?;
     let table_arr: &mut [u32; HASH_SIZE] =
@@ -663,206 +558,11 @@ pub fn compress_in<A: Allocator + Copy>(
         *slot = 0;
     }
 
-    let mut op: usize = 0;
-    write_varint_u32_slice(out.as_mut_slice(), &mut op, len_u32);
-
-    let mut ip: usize = 1;
-    let mut anchor: usize = 0;
-    let input_limit = input.len().saturating_sub(4);
-
-    loop {
-        match compress_raw_slice(input, &mut ip, &mut anchor, out.as_mut_slice(), &mut op, table_arr, None)
-        {
-            CompressStep::Done | CompressStep::Aborted => break,
-            CompressStep::NeedRoomForMatch { needed_end, prev, match_len } => {
-                let target = needed_end.saturating_add(out.len() / 2).saturating_add(64);
-                let extra = target.saturating_sub(out.len());
-                grow_zeroed(&mut out, extra)?;
-                let lit_len = ip - anchor;
-                let offset = ip - prev;
-                write_literal_slice(out.as_mut_slice(), &mut op, input, anchor, lit_len);
-                write_copy_slice(out.as_mut_slice(), &mut op, offset, match_len);
-                ip += match_len;
-                anchor = ip;
-                if let Some(prev_idx) = ip.checked_sub(1)
-                    && prev_idx <= input_limit
-                    && let Some(prev_seq) = read_u32_le_fast(input, prev_idx)
-                    && let Some(slot) = table_arr.get_mut(snappy_hash(prev_seq))
-                {
-                    *slot = u32::try_from(prev_idx).unwrap_or(0);
-                }
-            }
-            CompressStep::NeedRoomForTail { needed_end } => {
-                let target = needed_end.saturating_add(32);
-                let extra = target.saturating_sub(out.len());
-                grow_zeroed(&mut out, extra)?;
-                let tail_len = input.len().saturating_sub(anchor);
-                write_literal_slice(out.as_mut_slice(), &mut op, input, anchor, tail_len);
-                break;
-            }
-        }
-    }
-
-    out.truncate(op);
+    let mut cur = out.byte_cursor();
+    write_varint_u32(&mut cur, len_u32)?;
+    let _ = compress_raw_into_cursor(input, &mut cur, table_arr, None)?;
+    cur.finish();
     Ok(out)
-}
-
-#[inline]
-fn copy_match_short_11(buf: &mut [u8], dst: usize, offset: usize, copy_len: usize) {
-    let Some(src) = dst.checked_sub(offset) else {
-        return;
-    };
-
-    if offset >= 16
-        && let Some(s16) = buf.get(src..).and_then(|s| s.first_chunk::<16>())
-    {
-        let v0 = *s16;
-        if let Some(d16) = buf.get_mut(dst..).and_then(|s| s.first_chunk_mut::<16>()) {
-            *d16 = v0;
-            return;
-        }
-    }
-
-    if offset >= 8 && dst.saturating_add(16) <= buf.len() {
-        if let Some(s8) = buf.get(src..).and_then(|s| s.first_chunk::<8>()) {
-            let v0 = *s8;
-            if let Some(d8) = buf.get_mut(dst..).and_then(|s| s.first_chunk_mut::<8>()) {
-                *d8 = v0;
-            }
-        }
-        if copy_len > 8
-            && let Some(s8) = buf.get(src + 8..).and_then(|s| s.first_chunk::<8>())
-        {
-            let v1 = *s8;
-            if let Some(d8) = buf.get_mut(dst + 8..).and_then(|s| s.first_chunk_mut::<8>()) {
-                *d8 = v1;
-            }
-        }
-        return;
-    }
-
-    if offset == 1
-        && let Some(&byte) = buf.get(src)
-        && let Some(d16) = buf.get_mut(dst..).and_then(|s| s.first_chunk_mut::<16>())
-    {
-        *d16 = [byte; 16];
-        return;
-    }
-
-    copy_match_slow(buf, dst, src, offset, copy_len);
-}
-
-#[inline]
-fn copy_match_in_slice(buf: &mut [u8], dst: usize, offset: usize, copy_len: usize) {
-    let Some(src) = dst.checked_sub(offset) else {
-        return;
-    };
-
-    if offset >= 16
-        && copy_len <= 16
-        && let Some(s16) = buf.get(src..).and_then(|s| s.first_chunk::<16>())
-    {
-        let v0 = *s16;
-        if let Some(d16) = buf.get_mut(dst..).and_then(|s| s.first_chunk_mut::<16>()) {
-            *d16 = v0;
-            return;
-        }
-    }
-
-    if offset >= 16 && copy_len <= 32 && dst.saturating_add(32) <= buf.len() {
-        if let Some(s16) = buf.get(src..).and_then(|s| s.first_chunk::<16>()) {
-            let v0 = *s16;
-            if let Some(d16) = buf.get_mut(dst..).and_then(|s| s.first_chunk_mut::<16>()) {
-                *d16 = v0;
-            }
-        }
-        if let Some(s16) = buf.get(src + 16..).and_then(|s| s.first_chunk::<16>()) {
-            let v1 = *s16;
-            if let Some(d16) = buf.get_mut(dst + 16..).and_then(|s| s.first_chunk_mut::<16>()) {
-                *d16 = v1;
-            }
-        }
-        return;
-    }
-
-    if offset >= 8 && copy_len <= 16 && dst.saturating_add(16) <= buf.len() {
-        if let Some(s8) = buf.get(src..).and_then(|s| s.first_chunk::<8>()) {
-            let v0 = *s8;
-            if let Some(d8) = buf.get_mut(dst..).and_then(|s| s.first_chunk_mut::<8>()) {
-                *d8 = v0;
-            }
-        }
-        if copy_len > 8
-            && let Some(s8) = buf.get(src + 8..).and_then(|s| s.first_chunk::<8>())
-        {
-            let v1 = *s8;
-            if let Some(d8) = buf.get_mut(dst + 8..).and_then(|s| s.first_chunk_mut::<8>()) {
-                *d8 = v1;
-            }
-        }
-        return;
-    }
-
-    if offset == 1
-        && copy_len <= 16
-        && let Some(&byte) = buf.get(src)
-        && let Some(d16) = buf.get_mut(dst..).and_then(|s| s.first_chunk_mut::<16>())
-    {
-        *d16 = [byte; 16];
-        return;
-    }
-
-    copy_match_slow(buf, dst, src, offset, copy_len);
-}
-
-#[cold]
-#[inline(never)]
-fn copy_match_slow(buf: &mut [u8], dst: usize, src: usize, offset: usize, copy_len: usize) {
-    let Some(dst_end) = dst.checked_add(copy_len) else {
-        return;
-    };
-    if dst_end > buf.len() {
-        return;
-    }
-
-    if offset == 1 {
-        if let Some(&byte) = buf.get(src)
-            && let Some(d) = buf.get_mut(dst..dst_end)
-        {
-            d.fill(byte);
-        }
-        return;
-    }
-
-    if offset >= copy_len {
-        if let Some((head, tail)) = buf.split_at_mut_checked(dst)
-            && let Some(s) = head.get(src..src + copy_len)
-            && let Some(d) = tail.get_mut(..copy_len)
-        {
-            d.copy_from_slice(s);
-        }
-        return;
-    }
-
-    // Overlapping match (1 < offset < copy_len): seed `offset` bytes, then double.
-    let seed = offset.min(copy_len);
-    if let Some((head, tail)) = buf.split_at_mut_checked(dst)
-        && let Some(s) = head.get(src..src + seed)
-        && let Some(d) = tail.get_mut(..seed)
-    {
-        d.copy_from_slice(s);
-    }
-    let mut copied = seed;
-    while copied < copy_len {
-        let step = copied.min(copy_len - copied);
-        if let Some((head, tail)) = buf.split_at_mut_checked(dst + copied)
-            && let Some(s) = head.get(dst..dst + step)
-            && let Some(d) = tail.get_mut(..step)
-        {
-            d.copy_from_slice(s);
-        }
-        copied += step;
-    }
 }
 
 #[cold]
@@ -903,28 +603,52 @@ fn read_long_lit_len(
     }
 }
 
-enum DecodeStep {
-    Done,
-    NeedRoomForLit { needed_end: usize },
-    NeedRoomForCopy { needed_end: usize, offset: usize, copy_len: usize },
+#[cold]
+#[inline(never)]
+fn reserve_for_decode<A: Allocator>(
+    cur: &mut ByteCursor<'_, A>,
+    base_len: usize,
+    needed_end: usize,
+    target_end: usize,
+) -> Result<(), SnappyError> {
+    let cur_len = cur.len();
+    let written = cur_len.saturating_sub(base_len);
+    let grow_to = needed_end
+        .max(cur_len.saturating_add(written.max(4096)))
+        .min(target_end);
+    let additional = grow_to.saturating_sub(cur_len).saturating_add(32);
+    cur.try_reserve(additional)?;
+    Ok(())
 }
 
-fn decompress_raw_slice_loop(
+fn decompress_raw_into<A: Allocator>(
     input: &[u8],
-    pos_out: &mut usize,
-    buf: &mut [u8],
-    dst_out: &mut usize,
-    base_len: usize,
+    cur: &mut ByteCursor<'_, A>,
     declared_len: usize,
-    target_end: usize,
-) -> Result<DecodeStep, SnappyError> {
-    let mut pos = *pos_out;
-    let mut dst = *dst_out;
+    start_pos: usize,
+) -> Result<(), SnappyError> {
+    let base_len = cur.len();
+    let target_end = base_len.checked_add(declared_len).ok_or(SnappyError::LengthMismatch {
+        expected: declared_len,
+        found: usize::MAX,
+    })?;
+
+    // Every 3 bytes of Snappy payload produce at most 64 bytes (21.33x), so a valid block never
+    // exceeds `22 * payload_len`; capping by this prevents a tiny hostile block from OOMing while
+    // still reserving the exact output size (plus 32-byte wildcopy slack) in one shot without
+    // pre-zeroing for all valid blocks up to 16 MiB.
+    if declared_len > 0 {
+        let max_possible = input.len().saturating_sub(start_pos).saturating_mul(22);
+        let initial_reserve = declared_len.min(MAX_EXACT_PREALLOC).min(max_possible.max(64));
+        cur.try_reserve(initial_reserve.saturating_add(32))?;
+    }
+
+    let mut pos = start_pos;
 
     while pos < input.len() {
-        let seq_pos = pos;
         let tag = *input.get(pos).ok_or(SnappyError::Truncated)?;
         pos += 1;
+        let dst = cur.len();
 
         match tag & 0b11 {
             TAG_LITERAL => {
@@ -948,15 +672,13 @@ fn decompress_raw_slice_loop(
                     return Err(SnappyError::Truncated);
                 }
                 let new_dst = dst + lit_len;
-                if new_dst > buf.len() {
-                    *pos_out = seq_pos;
-                    *dst_out = dst;
-                    return Ok(DecodeStep::NeedRoomForLit { needed_end: new_dst });
+                if cur.spare() < lit_len.saturating_add(32) {
+                    reserve_for_decode(cur, base_len, new_dst, target_end)?;
                 }
-
-                copy_lits_fast(input, pos, lit_len, buf, dst);
+                if !cur.write_lits_wild(input, pos, lit_len) {
+                    return Err(SnappyError::Truncated);
+                }
                 pos = lit_end;
-                dst = new_dst;
             }
             TAG_COPY_1 => {
                 let copy_len = usize::from((tag >> 2) & 0x07) + 4;
@@ -974,21 +696,17 @@ fn decompress_raw_slice_loop(
                     });
                 }
                 let new_dst = dst + copy_len;
-                if new_dst > buf.len() {
-                    *pos_out = pos;
-                    *dst_out = dst;
-                    return Ok(DecodeStep::NeedRoomForCopy {
-                        needed_end: new_dst,
-                        offset,
-                        copy_len,
-                    });
+                if cur.spare() < copy_len.saturating_add(16) {
+                    reserve_for_decode(cur, base_len, new_dst, target_end)?;
                 }
-                copy_match_short_11(buf, dst, offset, copy_len);
-                dst = new_dst;
+                if !cur.copy_match_within_cap(offset, copy_len) {
+                    return Err(SnappyError::InvalidOffset { offset, available });
+                }
             }
             TAG_COPY_2 => {
                 let copy_len = usize::from(tag >> 2) + 1;
-                let offset = usize::from(read_u16_le_fast(input, pos).ok_or(SnappyError::Truncated)?);
+                let offset =
+                    usize::from(read_u16_le_fast(input, pos).ok_or(SnappyError::Truncated)?);
                 pos += 2;
                 let available = dst.saturating_sub(base_len);
                 if offset == 0 || offset > available {
@@ -1001,17 +719,12 @@ fn decompress_raw_slice_loop(
                     });
                 }
                 let new_dst = dst + copy_len;
-                if new_dst > buf.len() {
-                    *pos_out = pos;
-                    *dst_out = dst;
-                    return Ok(DecodeStep::NeedRoomForCopy {
-                        needed_end: new_dst,
-                        offset,
-                        copy_len,
-                    });
+                if cur.spare() < copy_len.saturating_add(16) {
+                    reserve_for_decode(cur, base_len, new_dst, target_end)?;
                 }
-                copy_match_in_slice(buf, dst, offset, copy_len);
-                dst = new_dst;
+                if !cur.copy_match_within_cap(offset, copy_len) {
+                    return Err(SnappyError::InvalidOffset { offset, available });
+                }
             }
             _ => {
                 let copy_len = usize::from(tag >> 2) + 1;
@@ -1030,83 +743,23 @@ fn decompress_raw_slice_loop(
                     });
                 }
                 let new_dst = dst + copy_len;
-                if new_dst > buf.len() {
-                    *pos_out = pos;
-                    *dst_out = dst;
-                    return Ok(DecodeStep::NeedRoomForCopy {
-                        needed_end: new_dst,
-                        offset,
-                        copy_len,
-                    });
+                if cur.spare() < copy_len.saturating_add(16) {
+                    reserve_for_decode(cur, base_len, new_dst, target_end)?;
                 }
-                copy_match_in_slice(buf, dst, offset, copy_len);
-                dst = new_dst;
+                if !cur.copy_match_within_cap(offset, copy_len) {
+                    return Err(SnappyError::InvalidOffset { offset, available });
+                }
             }
         }
     }
 
-    *pos_out = pos;
-    *dst_out = dst;
-    Ok(DecodeStep::Done)
-}
-
-fn decompress_raw_into<A: Allocator>(
-    input: &[u8],
-    out: &mut Vec<u8, A>,
-    declared_len: usize,
-    start_pos: usize,
-) -> Result<(), SnappyError> {
-    let base_len = out.len();
-    let target_end = base_len.checked_add(declared_len).ok_or(SnappyError::LengthMismatch {
-        expected: declared_len,
-        found: usize::MAX,
-    })?;
-
-    // Every 3 bytes of Snappy payload produce at most 64 bytes (21.33x), so a valid block never
-    // exceeds `22 * payload_len`; capping by this prevents a tiny hostile block from OOMing while
-    // still pre-allocating the exact output size in one shot for all valid blocks up to 16 MiB.
-    let max_possible = input.len().saturating_sub(start_pos).saturating_mul(22);
-    let initial_grow = declared_len.min(MAX_EXACT_PREALLOC).min(max_possible.max(64));
-    grow_zeroed(out, initial_grow)?;
-
-    let mut pos = start_pos;
-    let mut dst = base_len;
-
-    while pos < input.len() {
-        match decompress_raw_slice_loop(
-            input,
-            &mut pos,
-            out.as_mut_slice(),
-            &mut dst,
-            base_len,
-            declared_len,
-            target_end,
-        )? {
-            DecodeStep::Done => break,
-            DecodeStep::NeedRoomForLit { needed_end } => {
-                let grow_to = needed_end
-                    .max(out.len().saturating_add(out.len().saturating_sub(base_len).max(4096)))
-                    .min(target_end);
-                grow_zeroed(out, grow_to.saturating_sub(out.len()))?;
-            }
-            DecodeStep::NeedRoomForCopy { needed_end, offset, copy_len } => {
-                let grow_to = needed_end
-                    .max(out.len().saturating_add(out.len().saturating_sub(base_len).max(4096)))
-                    .min(target_end);
-                grow_zeroed(out, grow_to.saturating_sub(out.len()))?;
-                copy_match_in_slice(out.as_mut_slice(), dst, offset, copy_len);
-                dst = needed_end;
-            }
-        }
-    }
-
+    let dst = cur.len();
     if dst != target_end {
         return Err(SnappyError::LengthMismatch {
             expected: declared_len,
             found: dst.saturating_sub(base_len),
         });
     }
-    out.truncate(target_end);
     Ok(())
 }
 
@@ -1131,10 +784,18 @@ pub fn decompress_in<A: Allocator + Copy>(
         });
     }
 
-    let max_possible = input.len().saturating_sub(start_pos).saturating_mul(22);
-    let prealloc = declared_len.min(MAX_EXACT_PREALLOC).min(max_possible.max(64));
-    let mut out = Vec::try_with_capacity_in(prealloc, alloc)?;
-    decompress_raw_into(input, &mut out, declared_len, start_pos)?;
+    let mut out = if declared_len > 0 {
+        let max_possible = input.len().saturating_sub(start_pos).saturating_mul(22);
+        let prealloc = declared_len.min(MAX_EXACT_PREALLOC).min(max_possible.max(64));
+        Vec::try_with_capacity_in(prealloc.saturating_add(32), alloc)?
+    } else {
+        Vec::new_in(alloc)
+    };
+    {
+        let mut cur = out.byte_cursor();
+        decompress_raw_into(input, &mut cur, declared_len, start_pos)?;
+        cur.finish();
+    }
     Ok(out)
 }
 
@@ -1160,20 +821,15 @@ pub fn compress_framed_in<A: Allocator + Copy>(
         .saturating_add(num_chunks.saturating_mul(8))
         .saturating_add(64);
     let mut out = Vec::try_with_capacity_in(max_framed_len, alloc)?;
-    grow_zeroed(&mut out, max_framed_len)?;
-    let out_buf = out.as_mut_slice();
-
-    if let Some(dst) = out_buf.get_mut(..STREAM_IDENTIFIER_CHUNK.len()) {
-        dst.copy_from_slice(&STREAM_IDENTIFIER_CHUNK);
-    }
-    let mut frame_op: usize = STREAM_IDENTIFIER_CHUNK.len();
+    out.try_extend_from_slice(&STREAM_IDENTIFIER_CHUNK)?;
 
     let mut table_vec = if input.len() >= 4 { Some(alloc_hash_table(alloc)?) } else { None };
 
     for chunk in input.chunks(MAX_CHUNK_UNCOMPRESSED) {
         let masked_crc = mask_crc32c(crc32c(chunk));
-        let header_pos = frame_op;
-        let payload_start = frame_op + 8;
+        let header_pos = out.len();
+        out.try_extend_from_slice(&[0u8; 8])?;
+        let payload_start = out.len();
 
         let compressed_len = if chunk.len() >= 4
             && let Some(ref mut tvec) = table_vec
@@ -1186,25 +842,13 @@ pub fn compress_framed_in<A: Allocator + Copy>(
                 *slot = 0;
             }
             let chunk_len_u32 = u32::try_from(chunk.len()).unwrap_or(0);
-            let mut op = payload_start;
-            write_varint_u32_slice(out_buf, &mut op, chunk_len_u32);
-            let mut ip: usize = 1;
-            let mut anchor: usize = 0;
             let abort_at = payload_start + chunk.len() - 1;
-            match compress_raw_slice(
-                chunk,
-                &mut ip,
-                &mut anchor,
-                out_buf,
-                &mut op,
-                table_arr,
-                Some(abort_at),
-            ) {
-                CompressStep::Done => Some(op - payload_start),
-                CompressStep::Aborted
-                | CompressStep::NeedRoomForMatch { .. }
-                | CompressStep::NeedRoomForTail { .. } => None,
-            }
+            let mut cur = out.byte_cursor();
+            write_varint_u32(&mut cur, chunk_len_u32)?;
+            let fitted = compress_raw_into_cursor(chunk, &mut cur, table_arr, Some(abort_at))?;
+            let end_len = cur.len();
+            cur.finish();
+            if fitted { Some(end_len.saturating_sub(payload_start)) } else { None }
         } else {
             None
         };
@@ -1212,9 +856,8 @@ pub fn compress_framed_in<A: Allocator + Copy>(
         let (chunk_type, payload_len) = match compressed_len {
             Some(clen) if clen < chunk.len() => (CHUNK_COMPRESSED, clen),
             _ => {
-                if let Some(dst) = out_buf.get_mut(payload_start..payload_start + chunk.len()) {
-                    dst.copy_from_slice(chunk);
-                }
+                out.truncate(payload_start);
+                out.try_extend_from_slice(chunk)?;
                 (CHUNK_UNCOMPRESSED, chunk.len())
             }
         };
@@ -1235,13 +878,13 @@ pub fn compress_framed_in<A: Allocator + Copy>(
         }
         let [l0, l1, l2, _] = body_u32.to_le_bytes();
         let [c0, c1, c2, c3] = masked_crc.to_le_bytes();
-        if let Some(d8) = out_buf.get_mut(header_pos..).and_then(|s| s.first_chunk_mut::<8>()) {
+        if let Some(d8) =
+            out.as_mut_slice().get_mut(header_pos..).and_then(|s| s.first_chunk_mut::<8>())
+        {
             *d8 = [chunk_type, l0, l1, l2, c0, c1, c2, c3];
         }
-        frame_op = payload_start + payload_len;
     }
 
-    out.truncate(frame_op);
     Ok(out)
 }
 
@@ -1266,126 +909,139 @@ fn decompress_framed_in_planted<A: Allocator + Copy>(
     }
 
     let est = input.len().min(limits.most_output_bytes).min(MAX_EXACT_PREALLOC);
-    let mut out = Vec::try_with_capacity_in(est, alloc)?;
-    let mut pos: usize = 0;
-    let mut chunks: usize = 0;
-    let mut saw_stream_id = false;
+    let mut out = if est > 0 {
+        Vec::try_with_capacity_in(est.saturating_add(32), alloc)?
+    } else {
+        Vec::new_in(alloc)
+    };
+    {
+        let mut cur = out.byte_cursor();
+        let mut pos: usize = 0;
+        let mut chunks: usize = 0;
+        let mut saw_stream_id = false;
 
-    while pos < input.len() {
-        chunks = chunks.saturating_add(1);
-        if chunks > limits.most_chunks {
-            return Err(SnappyError::TooManyChunks { count: chunks, limit: limits.most_chunks });
-        }
-
-        let chunk_type = *input.get(pos).ok_or(SnappyError::Truncated)?;
-        let chunk_len_u32 = read_u24_le(input, pos + 1)?;
-        pos += 4;
-
-        let chunk_len = usize::try_from(chunk_len_u32).map_err(|_| SnappyError::Truncated)?;
-        let body_end = pos.checked_add(chunk_len).ok_or(SnappyError::Truncated)?;
-        let body = input.get(pos..body_end).ok_or(SnappyError::Truncated)?;
-        pos = body_end;
-
-        if !saw_stream_id {
-            if chunk_type != CHUNK_STREAM_ID {
-                return Err(SnappyError::MissingStreamIdentifier);
+        while pos < input.len() {
+            chunks = chunks.saturating_add(1);
+            if chunks > limits.most_chunks {
+                return Err(SnappyError::TooManyChunks {
+                    count: chunks,
+                    limit: limits.most_chunks,
+                });
             }
-            if body != STREAM_IDENTIFIER_PAYLOAD.as_slice() {
-                return Err(SnappyError::InvalidStreamIdentifier);
-            }
-            saw_stream_id = true;
-            continue;
-        }
 
-        match chunk_type {
-            CHUNK_STREAM_ID => {
+            let chunk_type = *input.get(pos).ok_or(SnappyError::Truncated)?;
+            let chunk_len_u32 = read_u24_le(input, pos + 1)?;
+            pos += 4;
+
+            let chunk_len = usize::try_from(chunk_len_u32).map_err(|_| SnappyError::Truncated)?;
+            let body_end = pos.checked_add(chunk_len).ok_or(SnappyError::Truncated)?;
+            let body = input.get(pos..body_end).ok_or(SnappyError::Truncated)?;
+            pos = body_end;
+
+            if !saw_stream_id {
+                if chunk_type != CHUNK_STREAM_ID {
+                    return Err(SnappyError::MissingStreamIdentifier);
+                }
                 if body != STREAM_IDENTIFIER_PAYLOAD.as_slice() {
                     return Err(SnappyError::InvalidStreamIdentifier);
                 }
+                saw_stream_id = true;
+                continue;
             }
-            CHUNK_COMPRESSED => {
-                let expected_masked = read_u32_le(body, 0)?;
-                let block_bytes = body.get(4..).ok_or(SnappyError::Truncated)?;
-                let (declared_u32, data_start) = decode_varint_u32(block_bytes)?;
-                let declared_len = usize::try_from(declared_u32).map_err(|_| {
-                    SnappyError::ChunkTooLarge {
-                        bytes: usize::MAX,
-                        limit: MAX_CHUNK_UNCOMPRESSED,
+
+            match chunk_type {
+                CHUNK_STREAM_ID => {
+                    if body != STREAM_IDENTIFIER_PAYLOAD.as_slice() {
+                        return Err(SnappyError::InvalidStreamIdentifier);
                     }
-                })?;
-                if declared_len > MAX_CHUNK_UNCOMPRESSED {
-                    return Err(SnappyError::ChunkTooLarge {
-                        bytes: declared_len,
-                        limit: MAX_CHUNK_UNCOMPRESSED,
-                    });
                 }
-                let total_after = out.len().checked_add(declared_len).ok_or(
-                    SnappyError::OutputLimitExceeded {
-                        bytes: usize::MAX,
-                        limit: limits.most_output_bytes,
-                    },
-                )?;
-                if total_after > limits.most_output_bytes {
-                    return Err(SnappyError::OutputLimitExceeded {
-                        bytes: total_after,
-                        limit: limits.most_output_bytes,
-                    });
-                }
-
-                let chunk_out_start = out.len();
-                decompress_raw_into(block_bytes, &mut out, declared_len, data_start)?;
-
-                if !plant_skip_crc {
-                    let decoded = out.get(chunk_out_start..).ok_or(SnappyError::Truncated)?;
-                    let actual_masked = mask_crc32c(crc32c(decoded));
-                    if actual_masked != expected_masked {
-                        return Err(SnappyError::ChecksumMismatch {
-                            expected: expected_masked,
-                            found: actual_masked,
+                CHUNK_COMPRESSED => {
+                    let expected_masked = read_u32_le(body, 0)?;
+                    let block_bytes = body.get(4..).ok_or(SnappyError::Truncated)?;
+                    let (declared_u32, data_start) = decode_varint_u32(block_bytes)?;
+                    let declared_len = usize::try_from(declared_u32).map_err(|_| {
+                        SnappyError::ChunkTooLarge {
+                            bytes: usize::MAX,
+                            limit: MAX_CHUNK_UNCOMPRESSED,
+                        }
+                    })?;
+                    if declared_len > MAX_CHUNK_UNCOMPRESSED {
+                        return Err(SnappyError::ChunkTooLarge {
+                            bytes: declared_len,
+                            limit: MAX_CHUNK_UNCOMPRESSED,
                         });
                     }
-                }
-            }
-            CHUNK_UNCOMPRESSED => {
-                let expected_masked = read_u32_le(body, 0)?;
-                let payload = body.get(4..).ok_or(SnappyError::Truncated)?;
-                if payload.len() > MAX_CHUNK_UNCOMPRESSED {
-                    return Err(SnappyError::ChunkTooLarge {
-                        bytes: payload.len(),
-                        limit: MAX_CHUNK_UNCOMPRESSED,
-                    });
-                }
-                let total_after = out.len().checked_add(payload.len()).ok_or(
-                    SnappyError::OutputLimitExceeded {
-                        bytes: usize::MAX,
-                        limit: limits.most_output_bytes,
-                    },
-                )?;
-                if total_after > limits.most_output_bytes {
-                    return Err(SnappyError::OutputLimitExceeded {
-                        bytes: total_after,
-                        limit: limits.most_output_bytes,
-                    });
-                }
-
-                if !plant_skip_crc {
-                    let actual_masked = mask_crc32c(crc32c(payload));
-                    if actual_masked != expected_masked {
-                        return Err(SnappyError::ChecksumMismatch {
-                            expected: expected_masked,
-                            found: actual_masked,
+                    let total_after = cur.len().checked_add(declared_len).ok_or(
+                        SnappyError::OutputLimitExceeded {
+                            bytes: usize::MAX,
+                            limit: limits.most_output_bytes,
+                        },
+                    )?;
+                    if total_after > limits.most_output_bytes {
+                        return Err(SnappyError::OutputLimitExceeded {
+                            bytes: total_after,
+                            limit: limits.most_output_bytes,
                         });
                     }
+
+                    let chunk_out_start = cur.len();
+                    decompress_raw_into(block_bytes, &mut cur, declared_len, data_start)?;
+
+                    if !plant_skip_crc {
+                        let decoded =
+                            cur.as_slice().get(chunk_out_start..).ok_or(SnappyError::Truncated)?;
+                        let actual_masked = mask_crc32c(crc32c(decoded));
+                        if actual_masked != expected_masked {
+                            return Err(SnappyError::ChecksumMismatch {
+                                expected: expected_masked,
+                                found: actual_masked,
+                            });
+                        }
+                    }
                 }
-                out.try_extend_from_slice(payload)?;
-            }
-            // Reserved skippable chunks (0x80..=0xFD) and padding (0xFE).
-            0x80..=0xFE => {}
-            // Reserved unskippable chunks (0x02..=0x7F) must be refused.
-            0x02..=0x7F => {
-                return Err(SnappyError::UnsupportedChunk { chunk_type });
+                CHUNK_UNCOMPRESSED => {
+                    let expected_masked = read_u32_le(body, 0)?;
+                    let payload = body.get(4..).ok_or(SnappyError::Truncated)?;
+                    if payload.len() > MAX_CHUNK_UNCOMPRESSED {
+                        return Err(SnappyError::ChunkTooLarge {
+                            bytes: payload.len(),
+                            limit: MAX_CHUNK_UNCOMPRESSED,
+                        });
+                    }
+                    let total_after = cur.len().checked_add(payload.len()).ok_or(
+                        SnappyError::OutputLimitExceeded {
+                            bytes: usize::MAX,
+                            limit: limits.most_output_bytes,
+                        },
+                    )?;
+                    if total_after > limits.most_output_bytes {
+                        return Err(SnappyError::OutputLimitExceeded {
+                            bytes: total_after,
+                            limit: limits.most_output_bytes,
+                        });
+                    }
+
+                    if !plant_skip_crc {
+                        let actual_masked = mask_crc32c(crc32c(payload));
+                        if actual_masked != expected_masked {
+                            return Err(SnappyError::ChecksumMismatch {
+                                expected: expected_masked,
+                                found: actual_masked,
+                            });
+                        }
+                    }
+                    cur.try_write_slice(payload)?;
+                }
+                // Reserved skippable chunks (0x80..=0xFD) and padding (0xFE).
+                0x80..=0xFE => {}
+                // Reserved unskippable chunks (0x02..=0x7F) must be refused.
+                0x02..=0x7F => {
+                    return Err(SnappyError::UnsupportedChunk { chunk_type });
+                }
             }
         }
+
+        cur.finish();
     }
 
     Ok(out)

@@ -15,7 +15,7 @@
 use core::alloc::Allocator;
 use core::fmt;
 
-use blaze_own::{AllocFailure, Vec};
+use blaze_own::{AllocFailure, ByteCursor, Vec};
 
 use crate::digest::{Xxh32, xxh32};
 
@@ -251,27 +251,7 @@ impl fmt::Display for Lz4Error {
 
 impl core::error::Error for Lz4Error {}
 
-const ZERO_PAGE: [u8; 4096] = [0u8; 4096];
 const MAX_FRAME_PREALLOC: usize = 16 << 20;
-
-#[inline]
-fn grow_zeroed<A: Allocator>(out: &mut Vec<u8, A>, extra: usize) -> Result<(), Lz4Error> {
-    if extra == 0 {
-        return Ok(());
-    }
-    out.try_reserve(extra)?;
-    let mut rem = extra;
-    while rem >= ZERO_PAGE.len() {
-        out.try_extend_from_slice(&ZERO_PAGE)?;
-        rem -= ZERO_PAGE.len();
-    }
-    if rem > 0
-        && let Some(tail) = ZERO_PAGE.get(..rem)
-    {
-        out.try_extend_from_slice(tail)?;
-    }
-    Ok(())
-}
 
 #[inline]
 fn alloc_hash_table<A: Allocator>(alloc: A) -> Result<Vec<u32, A>, Lz4Error> {
@@ -329,18 +309,12 @@ const fn extra_len_bytes(n: usize) -> usize {
 }
 
 #[cold]
-fn write_extra_len(out_buf: &mut [u8], op: &mut usize, mut rem: usize) {
+fn write_extra_len<A: Allocator>(cur: &mut ByteCursor<'_, A>, mut rem: usize) {
     while rem >= 255 {
-        if let Some(slot) = out_buf.get_mut(*op) {
-            *slot = 255;
-        }
-        *op += 1;
+        let _ = cur.push_within_cap(255);
         rem -= 255;
     }
-    if let Some(slot) = out_buf.get_mut(*op) {
-        *slot = u8::try_from(rem).unwrap_or(0);
-    }
-    *op += 1;
+    let _ = cur.push_within_cap(u8::try_from(rem).unwrap_or(0));
 }
 
 #[inline]
@@ -377,69 +351,31 @@ fn count_match(a: &[u8], b: &[u8]) -> usize {
     matched
 }
 
-#[inline]
-fn copy_lits_fast(input: &[u8], src_pos: usize, lit_len: usize, out_buf: &mut [u8], dst_pos: usize) {
-    if lit_len == 0 {
-        return;
-    }
-    if lit_len <= 16
-        && let Some(s16) = input.get(src_pos..).and_then(|s| s.first_chunk::<16>())
-        && let Some(d16) = out_buf.get_mut(dst_pos..).and_then(|s| s.first_chunk_mut::<16>())
-    {
-        *d16 = *s16;
-        return;
-    }
-    if lit_len <= 32
-        && let Some(s32) = input.get(src_pos..).and_then(|s| s.first_chunk::<32>())
-        && let Some(d32) = out_buf.get_mut(dst_pos..).and_then(|s| s.first_chunk_mut::<32>())
-    {
-        *d32 = *s32;
-        return;
-    }
-    copy_lits_exact(input, src_pos, lit_len, out_buf, dst_pos);
-}
-
-#[cold]
-#[inline(never)]
-fn copy_lits_exact(input: &[u8], src_pos: usize, lit_len: usize, out_buf: &mut [u8], dst_pos: usize) {
-    if let (Some(src), Some(dst)) =
-        (input.get(src_pos..src_pos + lit_len), out_buf.get_mut(dst_pos..dst_pos + lit_len))
-    {
-        dst.copy_from_slice(src);
-    }
-}
-
-fn compress_block_to_slice(
+fn compress_block_into_cursor<A: Allocator>(
     input: &[u8],
-    out_buf: &mut [u8],
+    cur: &mut ByteCursor<'_, A>,
     table: &mut [u32; HASH_SIZE],
-    limit_op: usize,
-) -> Result<Option<usize>, Lz4Error> {
-    let limit = limit_op.min(out_buf.len());
+    limit_bytes: usize,
+) -> Result<bool, Lz4Error> {
     if input.is_empty() {
-        return Ok(Some(0));
+        return Ok(true);
     }
+
+    cur.try_reserve(limit_bytes.saturating_add(32))?;
 
     if input.len() <= MFLIMIT {
         let lit_len = input.len();
         let needed = 1 + extra_len_bytes(lit_len) + lit_len;
-        if needed > limit {
-            return Ok(None);
+        if needed > limit_bytes {
+            return Ok(false);
         }
-        let mut op: usize = 0;
         let token_lit = if lit_len >= 15 { 15u8 } else { u8::try_from(lit_len).unwrap_or(15) };
-        if let Some(slot) = out_buf.get_mut(op) {
-            *slot = token_lit << 4;
-        }
-        op += 1;
+        let _ = cur.push_within_cap(token_lit << 4);
         if lit_len >= 15 {
-            write_extra_len(out_buf, &mut op, lit_len - 15);
+            write_extra_len(cur, lit_len - 15);
         }
-        if let Some(dst) = out_buf.get_mut(op..op + lit_len) {
-            dst.copy_from_slice(input);
-        }
-        op += lit_len;
-        return Ok(Some(op));
+        let _ = cur.write_lits_wild(input, 0, lit_len);
+        return Ok(true);
     }
 
     let mf_limit = input.len() - MFLIMIT;
@@ -519,31 +455,27 @@ fn compress_block_to_slice(
         let ml_code = match_len - MINMATCH;
 
         let seq_bytes = 1 + extra_len_bytes(lit_len) + lit_len + 2 + extra_len_bytes(ml_code);
-        if op.saturating_add(seq_bytes) > limit {
-            return Ok(None);
+        if op.saturating_add(seq_bytes) > limit_bytes {
+            return Ok(false);
         }
 
         let token_lit = if lit_len >= 15 { 15u8 } else { u8::try_from(lit_len).unwrap_or(15) };
         let token_ml = if ml_code >= 15 { 15u8 } else { u8::try_from(ml_code).unwrap_or(15) };
-        if let Some(slot) = out_buf.get_mut(op) {
-            *slot = (token_lit << 4) | token_ml;
-        }
-        op += 1;
+        let _ = cur.push_within_cap((token_lit << 4) | token_ml);
 
         if lit_len >= 15 {
-            write_extra_len(out_buf, &mut op, lit_len - 15);
+            write_extra_len(cur, lit_len - 15);
         }
-        copy_lits_fast(input, anchor, lit_len, out_buf, op);
-        op += lit_len;
+        if lit_len > 0 {
+            let _ = cur.write_lits_wild(input, anchor, lit_len);
+        }
 
-        if let Some(d2) = out_buf.get_mut(op..).and_then(|s| s.first_chunk_mut::<2>()) {
-            *d2 = offset_u16.to_le_bytes();
-        }
-        op += 2;
+        let _ = cur.write_array_within_cap(offset_u16.to_le_bytes());
 
         if ml_code >= 15 {
-            write_extra_len(out_buf, &mut op, ml_code - 15);
+            write_extra_len(cur, ml_code - 15);
         }
+        op += seq_bytes;
 
         ip += match_len;
         anchor = ip;
@@ -561,24 +493,20 @@ fn compress_block_to_slice(
 
     let tail_len = input.len() - anchor;
     let tail_bytes = 1 + extra_len_bytes(tail_len) + tail_len;
-    if op.saturating_add(tail_bytes) > limit {
-        return Ok(None);
+    if op.saturating_add(tail_bytes) > limit_bytes {
+        return Ok(false);
     }
 
     let token_lit = if tail_len >= 15 { 15u8 } else { u8::try_from(tail_len).unwrap_or(15) };
-    if let Some(slot) = out_buf.get_mut(op) {
-        *slot = token_lit << 4;
-    }
-    op += 1;
+    let _ = cur.push_within_cap(token_lit << 4);
     if tail_len >= 15 {
-        write_extra_len(out_buf, &mut op, tail_len - 15);
+        write_extra_len(cur, tail_len - 15);
     }
-    if let (Some(src), Some(dst)) = (input.get(anchor..), out_buf.get_mut(op..op + tail_len)) {
-        dst.copy_from_slice(src);
+    if tail_len > 0 {
+        let _ = cur.write_lits_wild(input, anchor, tail_len);
     }
-    op += tail_len;
 
-    Ok(Some(op))
+    Ok(true)
 }
 
 /// Compress `input` into a raw LZ4 block allocated in `alloc`.
@@ -595,33 +523,30 @@ pub fn compress_block_in<A: Allocator + Copy>(
         return Err(Lz4Error::InputTooLarge { bytes: input.len(), limit: MAX_BLOCK_INPUT_SIZE });
     }
 
-    let max_out = input.len().saturating_add(input.len() / 255).saturating_add(32);
-    let mut out = Vec::try_with_capacity_in(max_out, alloc)?;
-    grow_zeroed(&mut out, max_out)?;
-
     if input.len() <= MFLIMIT {
         let lit_len = input.len();
-        let mut op: usize = 0;
-        let token_lit = if lit_len >= 15 { 15u8 } else { u8::try_from(lit_len).unwrap_or(15) };
-        if let Some(slot) = out.get_mut(op) {
-            *slot = token_lit << 4;
-        }
-        op += 1;
-        if let Some(dst) = out.get_mut(op..op + lit_len) {
-            dst.copy_from_slice(input);
-        }
-        op += lit_len;
-        out.truncate(op);
+        let token_lit = u8::try_from(lit_len).unwrap_or(15);
+        let mut out = Vec::try_with_capacity_in(lit_len + 1, alloc)?;
+        let mut cur = out.byte_cursor();
+        cur.try_push(token_lit << 4)?;
+        cur.try_write_slice(input)?;
+        cur.finish();
         return Ok(out);
     }
+
+    let max_out = input.len().saturating_add(input.len() / 255).saturating_add(32);
+    let mut out = Vec::try_with_capacity_in(max_out.saturating_add(32), alloc)?;
 
     let mut table_vec = alloc_hash_table(alloc)?;
     let table_arr: &mut [u32; HASH_SIZE] =
         table_vec.as_mut_slice().try_into().map_err(|_| Lz4Error::Truncated)?;
 
-    let written = compress_block_to_slice(input, out.as_mut_slice(), table_arr, max_out)?
-        .ok_or(Lz4Error::InputTooLarge { bytes: input.len(), limit: MAX_BLOCK_INPUT_SIZE })?;
-    out.truncate(written);
+    let mut cur = out.byte_cursor();
+    let fitted = compress_block_into_cursor(input, &mut cur, table_arr, max_out)?;
+    cur.finish();
+    if !fitted {
+        return Err(Lz4Error::InputTooLarge { bytes: input.len(), limit: MAX_BLOCK_INPUT_SIZE });
+    }
     Ok(out)
 }
 
@@ -689,147 +614,57 @@ fn read_extra_len(
     }
 }
 
-#[inline]
-fn copy_match_in_slice(buf: &mut [u8], dst: usize, offset: usize, match_len: usize) {
-    let Some(src) = dst.checked_sub(offset) else {
-        return;
-    };
-
-    // Fast path 1: offset >= 16 and match_len <= 16 -> single 128-bit load+store.
-    if offset >= 16
-        && match_len <= 16
-        && let Some(s16) = buf.get(src..).and_then(|s| s.first_chunk::<16>())
-    {
-        let v0 = *s16;
-        if let Some(d16) = buf.get_mut(dst..).and_then(|s| s.first_chunk_mut::<16>()) {
-            *d16 = v0;
-            return;
-        }
-    }
-
-    // Fast path 2: offset >= 16 and match_len <= 32 -> two 128-bit load+stores.
-    if offset >= 16 && match_len <= 32 && dst.saturating_add(32) <= buf.len() {
-        if let Some(s16) = buf.get(src..).and_then(|s| s.first_chunk::<16>()) {
-            let v0 = *s16;
-            if let Some(d16) = buf.get_mut(dst..).and_then(|s| s.first_chunk_mut::<16>()) {
-                *d16 = v0;
-            }
-        }
-        if let Some(s16) = buf.get(src + 16..).and_then(|s| s.first_chunk::<16>()) {
-            let v1 = *s16;
-            if let Some(d16) = buf.get_mut(dst + 16..).and_then(|s| s.first_chunk_mut::<16>()) {
-                *d16 = v1;
-            }
-        }
-        return;
-    }
-
-    // Fast path 3: offset >= 8 and match_len <= 16 -> 1 or 2 64-bit load+stores.
-    if offset >= 8 && match_len <= 16 && dst.saturating_add(16) <= buf.len() {
-        if let Some(s8) = buf.get(src..).and_then(|s| s.first_chunk::<8>()) {
-            let v0 = *s8;
-            if let Some(d8) = buf.get_mut(dst..).and_then(|s| s.first_chunk_mut::<8>()) {
-                *d8 = v0;
-            }
-        }
-        if match_len > 8
-            && let Some(s8) = buf.get(src + 8..).and_then(|s| s.first_chunk::<8>())
-        {
-            let v1 = *s8;
-            if let Some(d8) = buf.get_mut(dst + 8..).and_then(|s| s.first_chunk_mut::<8>()) {
-                *d8 = v1;
-            }
-        }
-        return;
-    }
-
-    // Fast path 4: short RLE (offset == 1, match_len <= 16) -> single 128-bit splat store.
-    if offset == 1
-        && match_len <= 16
-        && let Some(&byte) = buf.get(src)
-        && let Some(d16) = buf.get_mut(dst..).and_then(|s| s.first_chunk_mut::<16>())
-    {
-        *d16 = [byte; 16];
-        return;
-    }
-
-    copy_match_slow(buf, dst, src, offset, match_len);
-}
-
 #[cold]
 #[inline(never)]
-fn copy_match_slow(buf: &mut [u8], dst: usize, src: usize, offset: usize, match_len: usize) {
-    let Some(dst_end) = dst.checked_add(match_len) else {
-        return;
-    };
-    if dst_end > buf.len() {
-        return;
-    }
-
-    if offset == 1 {
-        if let Some(&byte) = buf.get(src)
-            && let Some(d) = buf.get_mut(dst..dst_end)
-        {
-            d.fill(byte);
-        }
-        return;
-    }
-
-    if offset >= match_len {
-        if let Some((head, tail)) = buf.split_at_mut_checked(dst)
-            && let Some(s) = head.get(src..src + match_len)
-            && let Some(d) = tail.get_mut(..match_len)
-        {
-            d.copy_from_slice(s);
-        }
-        return;
-    }
-
-    // Overlapping match (1 < offset < match_len): seed `offset` bytes, then double.
-    let seed = offset.min(match_len);
-    if let Some((head, tail)) = buf.split_at_mut_checked(dst)
-        && let Some(s) = head.get(src..src + seed)
-        && let Some(d) = tail.get_mut(..seed)
-    {
-        d.copy_from_slice(s);
-    }
-    let mut copied = seed;
-    while copied < match_len {
-        let step = copied.min(match_len - copied);
-        if let Some((head, tail)) = buf.split_at_mut_checked(dst + copied)
-            && let Some(s) = head.get(dst..dst + step)
-            && let Some(d) = tail.get_mut(..step)
-        {
-            d.copy_from_slice(s);
-        }
-        copied += step;
-    }
-}
-
-enum DecodeStep {
-    Done,
-    NeedRoomForLit { needed_end: usize },
-    NeedRoomForMatch { needed_end: usize, offset: usize, match_len: usize },
-}
-
-fn decompress_block_slice_loop(
-    input: &[u8],
-    pos_out: &mut usize,
-    buf: &mut [u8],
-    dst_out: &mut usize,
-    history_base: usize,
+fn reserve_for_decode<A: Allocator>(
+    cur: &mut ByteCursor<'_, A>,
     block_start: usize,
-    block_max_size: Option<usize>,
+    needed_end: usize,
     block_limit: usize,
+) -> Result<(), Lz4Error> {
+    let cur_len = cur.len();
+    let block_written = cur_len.saturating_sub(block_start);
+    let grow_to = needed_end
+        .max(cur_len.saturating_add(block_written.max(4096)))
+        .min(block_limit);
+    let additional = grow_to.saturating_sub(cur_len).saturating_add(32);
+    cur.try_reserve(additional)?;
+    Ok(())
+}
+
+fn decompress_block_into<A: Allocator>(
+    input: &[u8],
+    cur: &mut ByteCursor<'_, A>,
+    history_base: usize,
+    block_max_size: Option<usize>,
+    hint_bytes: Option<usize>,
     total_limit: usize,
-) -> Result<DecodeStep, Lz4Error> {
-    let mut pos = *pos_out;
-    let mut dst = *dst_out;
+) -> Result<(), Lz4Error> {
+    let block_start = cur.len();
+    let block_limit = match block_max_size {
+        Some(max_block) => block_start.saturating_add(max_block).min(total_limit),
+        None => total_limit,
+    };
+    let max_growth = block_limit.saturating_sub(block_start);
+    if max_growth > 0 && !input.is_empty() {
+        let initial = match hint_bytes {
+            Some(hint) => hint.min(max_growth).min(1 << 20),
+            None => match block_max_size {
+                Some(block_max) if block_max <= 256 * 1024 => {
+                    input.len().saturating_mul(255).min(block_max).min(max_growth)
+                }
+                _ => input.len().saturating_mul(4).max(4096).min(max_growth).min(1 << 20),
+            },
+        };
+        cur.try_reserve(initial.saturating_add(32))?;
+    }
+
+    let mut pos: usize = 0;
 
     while pos < input.len() {
-        let seq_pos = pos;
         let token = *input.get(pos).ok_or(Lz4Error::Truncated)?;
         pos += 1;
+        let dst = cur.len();
 
         let mut lit_len = usize::from(token >> 4);
         if lit_len == 15 {
@@ -855,15 +690,16 @@ fn decompress_block_slice_loop(
         if new_dst > block_limit {
             return Err(output_limit_err(new_dst, block_start, block_max_size, total_limit));
         }
-        if new_dst > buf.len() {
-            *pos_out = seq_pos;
-            *dst_out = dst;
-            return Ok(DecodeStep::NeedRoomForLit { needed_end: new_dst });
-        }
 
-        copy_lits_fast(input, pos, lit_len, buf, dst);
-        pos = lit_end;
-        dst = new_dst;
+        if lit_len > 0 {
+            if cur.spare() < lit_len.saturating_add(32) {
+                reserve_for_decode(cur, block_start, new_dst, block_limit)?;
+            }
+            if !cur.write_lits_wild(input, pos, lit_len) {
+                return Err(Lz4Error::Truncated);
+            }
+            pos = lit_end;
+        }
 
         // Per LZ4 block spec, the final sequence ends immediately after its literals.
         if pos == input.len() {
@@ -872,7 +708,8 @@ fn decompress_block_slice_loop(
 
         let offset = usize::from(read_u16_le_fast(input, pos).ok_or(Lz4Error::Truncated)?);
         pos += 2;
-        let available = dst.saturating_sub(history_base);
+        let match_dst = cur.len();
+        let available = match_dst.saturating_sub(history_base);
         if offset == 0 || offset > available {
             return Err(Lz4Error::InvalidOffset { offset, available });
         }
@@ -884,90 +721,28 @@ fn decompress_block_slice_loop(
                 input,
                 &mut pos,
                 match_len,
-                dst,
+                match_dst,
                 block_start,
                 block_max_size,
                 total_limit,
             )?;
         }
-        let match_end = dst.checked_add(match_len).ok_or(Lz4Error::OutputLimitExceeded {
+        let match_end = match_dst.checked_add(match_len).ok_or(Lz4Error::OutputLimitExceeded {
             bytes: usize::MAX,
             limit: total_limit,
         })?;
         if match_end > block_limit {
             return Err(output_limit_err(match_end, block_start, block_max_size, total_limit));
         }
-        if match_end > buf.len() {
-            *pos_out = pos;
-            *dst_out = dst;
-            return Ok(DecodeStep::NeedRoomForMatch { needed_end: match_end, offset, match_len });
+
+        if cur.spare() < match_len.saturating_add(16) {
+            reserve_for_decode(cur, block_start, match_end, block_limit)?;
         }
-
-        copy_match_in_slice(buf, dst, offset, match_len);
-        dst = match_end;
-    }
-
-    *pos_out = pos;
-    *dst_out = dst;
-    Ok(DecodeStep::Done)
-}
-
-fn decompress_block_into<A: Allocator>(
-    input: &[u8],
-    out: &mut Vec<u8, A>,
-    history_base: usize,
-    block_max_size: Option<usize>,
-    hint_bytes: Option<usize>,
-    total_limit: usize,
-) -> Result<(), Lz4Error> {
-    let block_start = out.len();
-    let block_limit = match block_max_size {
-        Some(max_block) => block_start.saturating_add(max_block).min(total_limit),
-        None => total_limit,
-    };
-    let max_growth = block_limit.saturating_sub(block_start);
-    if max_growth > 0 && !input.is_empty() {
-        let initial = match hint_bytes {
-            Some(hint) => hint.min(max_growth).min(1 << 20),
-            None => input.len().saturating_mul(4).max(4096).min(max_growth).min(1 << 20),
-        };
-        grow_zeroed(out, initial)?;
-    }
-
-    let mut pos: usize = 0;
-    let mut dst: usize = block_start;
-
-    while pos < input.len() {
-        match decompress_block_slice_loop(
-            input,
-            &mut pos,
-            out.as_mut_slice(),
-            &mut dst,
-            history_base,
-            block_start,
-            block_max_size,
-            block_limit,
-            total_limit,
-        )? {
-            DecodeStep::Done => break,
-            DecodeStep::NeedRoomForLit { needed_end } => {
-                let grow_to = needed_end
-                    .max(out.len().saturating_add(out.len().saturating_sub(block_start).max(4096)))
-                    .min(block_limit);
-                grow_zeroed(out, grow_to.saturating_sub(out.len()))?;
-            }
-            DecodeStep::NeedRoomForMatch { needed_end, offset, match_len } => {
-                let grow_to = needed_end
-                    .max(out.len().saturating_add(out.len().saturating_sub(block_start).max(4096)))
-                    .min(block_limit);
-                grow_zeroed(out, grow_to.saturating_sub(out.len()))?;
-                copy_match_in_slice(out.as_mut_slice(), dst, offset, match_len);
-                dst = needed_end;
-            }
+        if !cur.copy_match_within_cap(offset, match_len) {
+            return Err(Lz4Error::InvalidOffset { offset, available });
         }
     }
 
-    out.truncate(dst);
     Ok(())
 }
 
@@ -978,7 +753,11 @@ pub fn decompress_block_in<A: Allocator + Copy>(
     alloc: A,
 ) -> Result<Vec<u8, A>, Lz4Error> {
     let mut out = Vec::new_in(alloc);
-    decompress_block_into(input, &mut out, 0, None, None, max_output_bytes)?;
+    {
+        let mut cur = out.byte_cursor();
+        decompress_block_into(input, &mut cur, 0, None, None, max_output_bytes)?;
+        cur.finish();
+    }
     Ok(out)
 }
 
@@ -1002,14 +781,7 @@ pub fn compress_frame_in<A: Allocator + Copy>(
         .saturating_add(32);
 
     let mut out = Vec::try_with_capacity_in(max_frame_len, alloc)?;
-    grow_zeroed(&mut out, max_frame_len)?;
-    let out_buf = out.as_mut_slice();
-    let mut frame_op: usize = 0;
-
-    if let Some(d4) = out_buf.get_mut(frame_op..).and_then(|s| s.first_chunk_mut::<4>()) {
-        *d4 = LZ4_FRAME_MAGIC.to_le_bytes();
-    }
-    frame_op += 4;
+    out.try_extend_from_slice(&LZ4_FRAME_MAGIC.to_le_bytes())?;
 
     let mut flg: u8 = FLG_VERSION_01 | FLG_BLOCK_INDEP;
     if opts.block_checksum {
@@ -1044,83 +816,69 @@ pub fn compress_frame_in<A: Allocator + Copy>(
 
     let desc_slice = desc.get(..desc_len).ok_or(Lz4Error::Truncated)?;
     let hc = header_checksum_byte(desc_slice);
-    if let Some(dst) = out_buf.get_mut(frame_op..frame_op + desc_len) {
-        dst.copy_from_slice(desc_slice);
-    }
-    frame_op += desc_len;
-    if let Some(slot) = out_buf.get_mut(frame_op) {
-        *slot = hc;
-    }
-    frame_op += 1;
+    out.try_extend_from_slice(desc_slice)?;
+    out.try_extend_from_slice(&[hc])?;
 
     let mut table_vec = if input.len() > MFLIMIT { Some(alloc_hash_table(alloc)?) } else { None };
 
     for chunk in input.chunks(block_max) {
-        let header_pos = frame_op;
-        let payload_start = frame_op + 4;
+        let header_pos = out.len();
+        out.try_extend_from_slice(&[0u8; 4])?;
+        let payload_start = out.len();
 
         let compressed_len = if chunk.len() > MFLIMIT
             && let Some(ref mut tvec) = table_vec
             && let Ok(table_arr) = <&mut [u32; HASH_SIZE]>::try_from(tvec.as_mut_slice())
         {
             table_arr.fill(0);
-            let dst_slice = out_buf.get_mut(payload_start..).ok_or(Lz4Error::Truncated)?;
-            compress_block_to_slice(chunk, dst_slice, table_arr, chunk.len() - 1)?
+            let mut cur = out.byte_cursor();
+            let fitted = compress_block_into_cursor(chunk, &mut cur, table_arr, chunk.len() - 1)?;
+            let end_len = cur.len();
+            cur.finish();
+            if fitted { Some(end_len.saturating_sub(payload_start)) } else { None }
         } else {
             None
         };
 
-        let (header_u32, payload_len) = match compressed_len {
+        let header_u32 = match compressed_len {
             Some(clen) if clen < chunk.len() => {
-                let size_u32 = u32::try_from(clen).map_err(|_| Lz4Error::BlockTooLarge {
+                u32::try_from(clen).map_err(|_| Lz4Error::BlockTooLarge {
                     size: clen,
                     limit: block_max,
-                })?;
-                (size_u32, clen)
+                })?
             }
             _ => {
                 let size_u32 = u32::try_from(chunk.len()).map_err(|_| Lz4Error::BlockTooLarge {
                     size: chunk.len(),
                     limit: block_max,
                 })?;
-                if let Some(dst) = out_buf.get_mut(payload_start..payload_start + chunk.len()) {
-                    dst.copy_from_slice(chunk);
-                }
-                (BLOCK_UNCOMPRESSED_BIT | size_u32, chunk.len())
+                out.truncate(payload_start);
+                out.try_extend_from_slice(chunk)?;
+                BLOCK_UNCOMPRESSED_BIT | size_u32
             }
         };
 
-        if let Some(d4) = out_buf.get_mut(header_pos..).and_then(|s| s.first_chunk_mut::<4>()) {
+        if let Some(d4) =
+            out.as_mut_slice().get_mut(header_pos..).and_then(|s| s.first_chunk_mut::<4>())
+        {
             *d4 = header_u32.to_le_bytes();
         }
-        frame_op = payload_start + payload_len;
 
         if opts.block_checksum {
-            let payload_slice =
-                out_buf.get(payload_start..frame_op).ok_or(Lz4Error::Truncated)?;
+            let payload_slice = out.get(payload_start..).ok_or(Lz4Error::Truncated)?;
             let block_crc = xxh32(payload_slice, 0);
-            if let Some(d4) = out_buf.get_mut(frame_op..).and_then(|s| s.first_chunk_mut::<4>()) {
-                *d4 = block_crc.to_le_bytes();
-            }
-            frame_op += 4;
+            out.try_extend_from_slice(&block_crc.to_le_bytes())?;
         }
     }
 
     // EndMark
-    if let Some(d4) = out_buf.get_mut(frame_op..).and_then(|s| s.first_chunk_mut::<4>()) {
-        *d4 = 0u32.to_le_bytes();
-    }
-    frame_op += 4;
+    out.try_extend_from_slice(&0u32.to_le_bytes())?;
 
     if opts.content_checksum {
         let content_crc = xxh32(input, 0);
-        if let Some(d4) = out_buf.get_mut(frame_op..).and_then(|s| s.first_chunk_mut::<4>()) {
-            *d4 = content_crc.to_le_bytes();
-        }
-        frame_op += 4;
+        out.try_extend_from_slice(&content_crc.to_le_bytes())?;
     }
 
-    out.truncate(frame_op);
     Ok(out)
 }
 
@@ -1145,199 +903,210 @@ fn decompress_frame_in_planted<A: Allocator + Copy>(
     }
 
     let mut out = Vec::new_in(alloc);
-    let mut pos: usize = 0;
-    let mut frames: usize = 0;
+    {
+        let mut cur = out.byte_cursor();
+        let mut pos: usize = 0;
+        let mut frames: usize = 0;
 
-    while pos < input.len() {
-        frames = frames.saturating_add(1);
-        if frames > limits.most_frames {
-            return Err(Lz4Error::TooManyFrames { count: frames, limit: limits.most_frames });
-        }
-
-        let magic = read_u32_le(input, pos)?;
-        pos += 4;
-
-        if (magic & LZ4_SKIPPABLE_MAGIC_MASK) == LZ4_SKIPPABLE_MAGIC_BASE {
-            let skip_len_u32 = read_u32_le(input, pos)?;
-            pos += 4;
-            let skip_len = usize::try_from(skip_len_u32).map_err(|_| Lz4Error::Truncated)?;
-            let next_pos = pos.checked_add(skip_len).ok_or(Lz4Error::Truncated)?;
-            if next_pos > input.len() {
-                return Err(Lz4Error::Truncated);
+        while pos < input.len() {
+            frames = frames.saturating_add(1);
+            if frames > limits.most_frames {
+                return Err(Lz4Error::TooManyFrames { count: frames, limit: limits.most_frames });
             }
-            pos = next_pos;
-            continue;
-        }
 
-        if magic != LZ4_FRAME_MAGIC {
-            return Err(Lz4Error::BadMagic { found: magic });
-        }
-
-        let desc_start = pos;
-        let flg = *input.get(pos).ok_or(Lz4Error::Truncated)?;
-        let bd = *input.get(pos + 1).ok_or(Lz4Error::Truncated)?;
-        pos += 2;
-
-        if (flg & FLG_VERSION_MASK) != FLG_VERSION_01 {
-            return Err(Lz4Error::UnsupportedVersion { version: flg >> 6 });
-        }
-        if (flg & FLG_RESERVED) != 0 || (bd & BD_RESERVED_MASK) != 0 {
-            return Err(Lz4Error::ReservedBitSet);
-        }
-
-        let block_indep = (flg & FLG_BLOCK_INDEP) != 0;
-        let has_block_checksum = (flg & FLG_BLOCK_CHECKSUM) != 0;
-        let has_content_size = (flg & FLG_CONTENT_SIZE) != 0;
-        let has_content_checksum = (flg & FLG_CONTENT_CHECKSUM) != 0;
-        let has_dict_id = (flg & FLG_DICT_ID) != 0;
-
-        let block_max_size = BlockMaxSize::from_code((bd >> 4) & 0x07)?.max_bytes();
-
-        let declared_content_size = if has_content_size {
-            let sz = read_u64_le(input, pos)?;
-            pos += 8;
-            Some(sz)
-        } else {
-            None
-        };
-
-        if has_dict_id {
-            // Advance past DictID before validating header checksum, then refuse preset dict.
-            let _dict_id = read_u32_le(input, pos)?;
+            let magic = read_u32_le(input, pos)?;
             pos += 4;
-        }
 
-        let desc_bytes = input.get(desc_start..pos).ok_or(Lz4Error::Truncated)?;
-        let expected_hc = header_checksum_byte(desc_bytes);
-        let found_hc = *input.get(pos).ok_or(Lz4Error::Truncated)?;
-        pos += 1;
-        if found_hc != expected_hc {
-            return Err(Lz4Error::HeaderChecksumMismatch {
-                expected: expected_hc,
-                found: found_hc,
-            });
-        }
+            if (magic & LZ4_SKIPPABLE_MAGIC_MASK) == LZ4_SKIPPABLE_MAGIC_BASE {
+                let skip_len_u32 = read_u32_le(input, pos)?;
+                pos += 4;
+                let skip_len = usize::try_from(skip_len_u32).map_err(|_| Lz4Error::Truncated)?;
+                let next_pos = pos.checked_add(skip_len).ok_or(Lz4Error::Truncated)?;
+                if next_pos > input.len() {
+                    return Err(Lz4Error::Truncated);
+                }
+                pos = next_pos;
+                continue;
+            }
 
-        if has_dict_id {
-            return Err(Lz4Error::UnsupportedDictionary);
-        }
+            if magic != LZ4_FRAME_MAGIC {
+                return Err(Lz4Error::BadMagic { found: magic });
+            }
 
-        let declared_frame_end = if let Some(declared_u64) = declared_content_size {
-            let declared_usize =
-                usize::try_from(declared_u64).map_err(|_| Lz4Error::OutputLimitExceeded {
-                    bytes: usize::MAX,
-                    limit: limits.most_output_bytes,
-                })?;
-            let total_needed = out.len().checked_add(declared_usize).ok_or(
-                Lz4Error::OutputLimitExceeded {
-                    bytes: usize::MAX,
-                    limit: limits.most_output_bytes,
-                },
-            )?;
-            if total_needed > limits.most_output_bytes {
-                return Err(Lz4Error::OutputLimitExceeded {
-                    bytes: total_needed,
-                    limit: limits.most_output_bytes,
+            let desc_start = pos;
+            let flg = *input.get(pos).ok_or(Lz4Error::Truncated)?;
+            let bd = *input.get(pos + 1).ok_or(Lz4Error::Truncated)?;
+            pos += 2;
+
+            if (flg & FLG_VERSION_MASK) != FLG_VERSION_01 {
+                return Err(Lz4Error::UnsupportedVersion { version: flg >> 6 });
+            }
+            if (flg & FLG_RESERVED) != 0 || (bd & BD_RESERVED_MASK) != 0 {
+                return Err(Lz4Error::ReservedBitSet);
+            }
+
+            let block_indep = (flg & FLG_BLOCK_INDEP) != 0;
+            let has_block_checksum = (flg & FLG_BLOCK_CHECKSUM) != 0;
+            let has_content_size = (flg & FLG_CONTENT_SIZE) != 0;
+            let has_content_checksum = (flg & FLG_CONTENT_CHECKSUM) != 0;
+            let has_dict_id = (flg & FLG_DICT_ID) != 0;
+
+            let block_max_size = BlockMaxSize::from_code((bd >> 4) & 0x07)?.max_bytes();
+
+            let declared_content_size = if has_content_size {
+                let sz = read_u64_le(input, pos)?;
+                pos += 8;
+                Some(sz)
+            } else {
+                None
+            };
+
+            if has_dict_id {
+                // Advance past DictID before validating header checksum, then refuse preset dict.
+                let _dict_id = read_u32_le(input, pos)?;
+                pos += 4;
+            }
+
+            let desc_bytes = input.get(desc_start..pos).ok_or(Lz4Error::Truncated)?;
+            let expected_hc = header_checksum_byte(desc_bytes);
+            let found_hc = *input.get(pos).ok_or(Lz4Error::Truncated)?;
+            pos += 1;
+            if found_hc != expected_hc {
+                return Err(Lz4Error::HeaderChecksumMismatch {
+                    expected: expected_hc,
+                    found: found_hc,
                 });
             }
-            let prealloc = declared_usize.min(limits.most_output_bytes).min(MAX_FRAME_PREALLOC);
-            out.try_reserve(prealloc)?;
-            Some(total_needed)
-        } else {
-            let est = input
-                .len()
-                .saturating_sub(pos)
-                .min(limits.most_output_bytes.saturating_sub(out.len()))
-                .min(MAX_FRAME_PREALLOC);
-            out.try_reserve(est)?;
-            None
-        };
 
-        let frame_start = out.len();
-        let mut content_hasher = Xxh32::new(0);
-
-        loop {
-            let block_header = read_u32_le(input, pos)?;
-            pos += 4;
-            if block_header == 0 {
-                break;
+            if has_dict_id {
+                return Err(Lz4Error::UnsupportedDictionary);
             }
 
-            let is_uncompressed = (block_header & BLOCK_UNCOMPRESSED_BIT) != 0;
-            let block_len = usize::try_from(block_header & BLOCK_SIZE_MASK)
-                .map_err(|_| Lz4Error::Truncated)?;
-            if block_len > block_max_size {
-                return Err(Lz4Error::BlockTooLarge { size: block_len, limit: block_max_size });
-            }
+            let declared_frame_end = if let Some(declared_u64) = declared_content_size {
+                let declared_usize =
+                    usize::try_from(declared_u64).map_err(|_| Lz4Error::OutputLimitExceeded {
+                        bytes: usize::MAX,
+                        limit: limits.most_output_bytes,
+                    })?;
+                let total_needed = cur.len().checked_add(declared_usize).ok_or(
+                    Lz4Error::OutputLimitExceeded {
+                        bytes: usize::MAX,
+                        limit: limits.most_output_bytes,
+                    },
+                )?;
+                if total_needed > limits.most_output_bytes {
+                    return Err(Lz4Error::OutputLimitExceeded {
+                        bytes: total_needed,
+                        limit: limits.most_output_bytes,
+                    });
+                }
+                if declared_usize > 0 {
+                    let prealloc =
+                        declared_usize.min(limits.most_output_bytes).min(MAX_FRAME_PREALLOC);
+                    cur.try_reserve(prealloc.saturating_add(32))?;
+                }
+                Some(total_needed)
+            } else {
+                let est = input
+                    .len()
+                    .saturating_sub(pos)
+                    .min(limits.most_output_bytes.saturating_sub(cur.len()))
+                    .min(MAX_FRAME_PREALLOC);
+                if est > 0 {
+                    cur.try_reserve(est.saturating_add(32))?;
+                }
+                None
+            };
 
-            let block_end = pos.checked_add(block_len).ok_or(Lz4Error::Truncated)?;
-            let block_data = input.get(pos..block_end).ok_or(Lz4Error::Truncated)?;
-            pos = block_end;
+            let frame_start = cur.len();
+            let mut content_hasher = Xxh32::new(0);
 
-            if has_block_checksum {
-                let expected_block_crc = read_u32_le(input, pos)?;
+            loop {
+                let block_header = read_u32_le(input, pos)?;
                 pos += 4;
-                let actual_block_crc = xxh32(block_data, 0);
-                if actual_block_crc != expected_block_crc {
-                    return Err(Lz4Error::BlockChecksumMismatch {
-                        expected: expected_block_crc,
-                        found: actual_block_crc,
+                if block_header == 0 {
+                    break;
+                }
+
+                let is_uncompressed = (block_header & BLOCK_UNCOMPRESSED_BIT) != 0;
+                let block_len = usize::try_from(block_header & BLOCK_SIZE_MASK)
+                    .map_err(|_| Lz4Error::Truncated)?;
+                if block_len > block_max_size {
+                    return Err(Lz4Error::BlockTooLarge { size: block_len, limit: block_max_size });
+                }
+
+                let block_end = pos.checked_add(block_len).ok_or(Lz4Error::Truncated)?;
+                let block_data = input.get(pos..block_end).ok_or(Lz4Error::Truncated)?;
+                pos = block_end;
+
+                if has_block_checksum {
+                    let expected_block_crc = read_u32_le(input, pos)?;
+                    pos += 4;
+                    let actual_block_crc = xxh32(block_data, 0);
+                    if actual_block_crc != expected_block_crc {
+                        return Err(Lz4Error::BlockChecksumMismatch {
+                            expected: expected_block_crc,
+                            found: actual_block_crc,
+                        });
+                    }
+                }
+
+                let block_out_start = cur.len();
+                if is_uncompressed {
+                    check_output_bounds(
+                        cur.len(),
+                        block_len,
+                        block_out_start,
+                        Some(block_max_size),
+                        limits.most_output_bytes,
+                    )?;
+                    cur.try_write_slice(block_data)?;
+                } else {
+                    let history_base = if block_indep { block_out_start } else { frame_start };
+                    let hint_bytes =
+                        declared_frame_end.map(|end| end.saturating_sub(block_out_start));
+                    decompress_block_into(
+                        block_data,
+                        &mut cur,
+                        history_base,
+                        Some(block_max_size),
+                        hint_bytes,
+                        limits.most_output_bytes,
+                    )?;
+                }
+
+                if has_content_checksum {
+                    let written =
+                        cur.as_slice().get(block_out_start..).ok_or(Lz4Error::Truncated)?;
+                    content_hasher.update(written);
+                }
+            }
+
+            if has_content_checksum {
+                let expected_content_crc = read_u32_le(input, pos)?;
+                pos += 4;
+                let actual_content_crc = content_hasher.finish();
+                if !plant_skip_checksum && actual_content_crc != expected_content_crc {
+                    return Err(Lz4Error::ContentChecksumMismatch {
+                        expected: expected_content_crc,
+                        found: actual_content_crc,
                     });
                 }
             }
 
-            let block_out_start = out.len();
-            if is_uncompressed {
-                check_output_bounds(
-                    out.len(),
-                    block_len,
-                    block_out_start,
-                    Some(block_max_size),
-                    limits.most_output_bytes,
-                )?;
-                out.try_extend_from_slice(block_data)?;
-            } else {
-                let history_base = if block_indep { block_out_start } else { frame_start };
-                let hint_bytes =
-                    declared_frame_end.map(|end| end.saturating_sub(block_out_start));
-                decompress_block_into(
-                    block_data,
-                    &mut out,
-                    history_base,
-                    Some(block_max_size),
-                    hint_bytes,
-                    limits.most_output_bytes,
-                )?;
-            }
-
-            if has_content_checksum {
-                let written = out.get(block_out_start..).ok_or(Lz4Error::Truncated)?;
-                content_hasher.update(written);
+            if let Some(declared_u64) = declared_content_size {
+                let decoded_frame = cur.len().saturating_sub(frame_start);
+                let decoded_u64 = u64::try_from(decoded_frame).unwrap_or(u64::MAX);
+                if decoded_u64 != declared_u64 {
+                    return Err(Lz4Error::ContentSizeMismatch {
+                        expected: declared_u64,
+                        found: decoded_u64,
+                    });
+                }
             }
         }
 
-        if has_content_checksum {
-            let expected_content_crc = read_u32_le(input, pos)?;
-            pos += 4;
-            let actual_content_crc = content_hasher.finish();
-            if !plant_skip_checksum && actual_content_crc != expected_content_crc {
-                return Err(Lz4Error::ContentChecksumMismatch {
-                    expected: expected_content_crc,
-                    found: actual_content_crc,
-                });
-            }
-        }
-
-        if let Some(declared_u64) = declared_content_size {
-            let decoded_frame = out.len().saturating_sub(frame_start);
-            let decoded_u64 = u64::try_from(decoded_frame).unwrap_or(u64::MAX);
-            if decoded_u64 != declared_u64 {
-                return Err(Lz4Error::ContentSizeMismatch {
-                    expected: declared_u64,
-                    found: decoded_u64,
-                });
-            }
-        }
+        cur.finish();
     }
 
     Ok(out)

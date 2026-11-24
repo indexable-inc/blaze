@@ -6,7 +6,8 @@ use blaze_sim::{Broke, Config, Tape, check, control};
 use crate::hex::decode_in as hex_decode_in;
 use crate::zstd::decode::decompress_in_inner;
 use crate::zstd::{
-    CompressOpts, Level, ZstdError, ZstdLimits, compress_in, decompress_in, frame_content_size,
+    CompressOpts, Level, ZstdDecoder, ZstdEncoder, ZstdError, ZstdLimits, compress_in,
+    decompress_in, frame_content_size,
 };
 
 const EMPTY_L3_CHECK_HEX: &[u8] = b"28b52ffd240001000099e9d851";
@@ -161,6 +162,25 @@ fn compression_ratio_and_multiblock_round_trip() {
         assert!(comp.len() < utf8_payload.len() / 2);
         let dec = decompress_in(comp.as_slice(), ZstdLimits::SHIPPED, alloc).expect("utf8 dec");
         assert_eq!(dec.as_slice(), utf8_payload.as_slice());
+    }
+
+    // Reusable ZstdEncoder / ZstdDecoder across multiple frames & levels (Treeless + custom FSE).
+    let mut enc = ZstdEncoder::try_new_in(alloc).expect("enc");
+    let mut dec = ZstdDecoder::new_in(alloc);
+    let mut comp_buf = OwnVec::new_in(alloc);
+    let mut dec_buf = OwnVec::new_in(alloc);
+    for (payload, opts) in [
+        (big.as_slice(), CompressOpts::DEFAULT),
+        (big.as_slice(), CompressOpts::FAST),
+        (utf8_payload.as_slice(), CompressOpts::DEFAULT),
+        (rep_json.as_slice(), CompressOpts::FAST),
+    ] {
+        comp_buf.clear();
+        dec_buf.clear();
+        enc.compress_into(payload, opts, &mut comp_buf).expect("reuse enc");
+        dec.decompress_into(comp_buf.as_slice(), ZstdLimits::SHIPPED, &mut dec_buf)
+            .expect("reuse dec");
+        assert_eq!(dec_buf.as_slice(), payload);
     }
 }
 

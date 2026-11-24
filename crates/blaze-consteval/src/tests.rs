@@ -1171,3 +1171,194 @@ fn offset_intrinsic_overflow_is_refused() {
     assert!(refusal(&mut w, "OVER_MUL").contains("OutOfBounds"));
     assert!(refusal(&mut w, "OVER_MIN").contains("OutOfBounds"));
 }
+
+/// The Reference, "Raw borrow operators" (`&raw const`, `&raw mut`): forms a thin or wide raw
+/// pointer to a place (locals, struct/tuple fields, array elements, slices/`str`/DST tails,
+/// and `static` / `static mut` items) without reading the pointee or requiring a safe
+/// reference.
+#[test]
+fn raw_borrows_of_locals_fields_elements_and_wide_places() {
+    let mut w = world();
+    let usize_ = w.fx.usize();
+    let bytes_ptr = w.ty("*const [u8]");
+    let str_ptr = w.ty("*const str");
+    w.intrinsic("ptr_metadata_slice", 0, &[bytes_ptr], usize_, Intrinsic::PtrMetadata);
+    w.intrinsic("ptr_metadata_str", 0, &[str_ptr], usize_, Intrinsic::PtrMetadata);
+    w.strukt("Pair", &[("a", "u32"), ("b", "u32")]);
+    w.strukt("Dst", &[("head", "u16"), ("tail", "[u8]")]);
+    // Scalar local (restarts from register home to memory slot) & mutable local.
+    w.konst("LOCAL_CONST", "u32", "{ let x = 42u32; let p = &raw const x; unsafe { *p } }");
+    w.konst("LOCAL_MUT", "u32", "{ let mut x = 10u32; let p = &raw mut x; unsafe { *p = 99; } x }");
+    // Uninitialized scalar local initialized through `&raw mut`.
+    w.konst("UNINIT_LOCAL", "u32", "{ let mut x: u32; let p = &raw mut x; unsafe { *p = 77; } x }");
+    // Struct field, tuple field, and array element raw borrows.
+    w.konst(
+        "STRUCT_FIELD",
+        "u32",
+        "{ let mut s = Pair { a: 3, b: 4 }; let pb = &raw mut s.b; unsafe { *pb = 40; } let pa = &raw const s.a; unsafe { *pa + s.b } }",
+    );
+    w.konst(
+        "TUPLE_FIELD",
+        "u16",
+        "{ let mut t = (1u8, 200u16); let p = &raw mut t.1; unsafe { *p = 300; *(&raw const t.1) } }",
+    );
+    w.konst(
+        "ARRAY_ELEM",
+        "u8",
+        "{ let mut a = [10u8, 20, 30]; let p = &raw mut a[1]; unsafe { *p = 25; } let q = &raw const a[2]; unsafe { a[1] + *q } }",
+    );
+    // Wide raw pointers: `[u8]` and `str` keep their length metadata.
+    w.konst("BYTES", "[u8; 4]", "[5, 6, 7, 8]");
+    w.konst(
+        "WIDE_SLICE_LEN",
+        "usize",
+        "{ let s: &[u8] = &BYTES; let p: *const [u8] = &raw const *s; ptr_metadata_slice(p) }",
+    );
+    w.konst(
+        "WIDE_SLICE_ELEM",
+        "u8",
+        "{ let mut a = [1u8, 2, 3]; let s: &mut [u8] = &mut a; let p: *mut [u8] = &raw mut *s; unsafe { (*p)[2] = 9; (*(&raw const *p))[2] } }",
+    );
+    w.konst(
+        "WIDE_STR_LEN",
+        "usize",
+        "{ let s: &str = \"hello\"; let p: *const str = &raw const *s; ptr_metadata_str(p) }",
+    );
+    // DST struct: `&raw const (*p).tail` keeps length, `&raw const (*p).head` is thin.
+    w.konst(
+        "DST_TAIL_LEN",
+        "usize",
+        "{ let s: &[u8] = &BYTES; let d: *const Dst = s as *const [u8] as *const Dst; ptr_metadata_slice(unsafe { &raw const (*d).tail }) }",
+    );
+    w.konst(
+        "DST_HEAD",
+        "u16",
+        "{ let a = [0x34u8, 0x12, 0x78, 0x56]; let s: &[u8] = &a; let d: *const Dst = s as *const [u8] as *const Dst; unsafe { *(&raw const (*d).head) } }",
+    );
+    w.build();
+
+    assert_eq!(eval_int(&mut w, "LOCAL_CONST"), Ok(42));
+    assert_eq!(eval_int(&mut w, "LOCAL_MUT"), Ok(99));
+    assert_eq!(eval_int(&mut w, "UNINIT_LOCAL"), Ok(77));
+    assert_eq!(eval_int(&mut w, "STRUCT_FIELD"), Ok(43));
+    assert_eq!(eval_int(&mut w, "TUPLE_FIELD"), Ok(300));
+    assert_eq!(eval_int(&mut w, "ARRAY_ELEM"), Ok(55));
+    assert_eq!(eval_int(&mut w, "WIDE_SLICE_LEN"), Ok(4));
+    assert_eq!(eval_int(&mut w, "WIDE_SLICE_ELEM"), Ok(9));
+    assert_eq!(eval_int(&mut w, "WIDE_STR_LEN"), Ok(5));
+    assert_eq!(eval_int(&mut w, "DST_TAIL_LEN"), Ok(4));
+    assert_eq!(eval_int(&mut w, "DST_HEAD"), Ok(0x1234));
+}
+
+/// `&raw const (*p).field` / `&raw mut (*p).field` forms the field's address without reading
+/// the pointee: uninitialized structs, zero-offset null pointers, and transient dangling raw
+/// borrows succeed, while non-zero null offsets, out-of-bounds field projections, escaping
+/// dangling pointers, and invalid safe references are refused by name.
+#[test]
+fn raw_borrow_deref_projection_without_loading_pointee() {
+    let mut w = world();
+    w.strukt("Pair", &[("a", "u32"), ("b", "u32")]);
+    w.const_fn("dangle", &[], "*const u8", "{ let x = 5u8; &raw const x }");
+    // Partial initialization through `&raw mut (*p).b`: `s.a` stays uninitialized, never read.
+    w.konst(
+        "UNINIT_DEREF_FIELD",
+        "u32",
+        "{ let mut s: Pair; let p = &raw mut s; let pb = unsafe { &raw mut (*p).b }; unsafe { *pb = 123; *pb } }",
+    );
+    // Null / zero-offset deref raw borrows succeed without reading.
+    w.konst("NULL_RAW", "*const u8", "&raw const *(0usize as *const u8)");
+    w.konst("NULL_FIELD0", "*const u32", "unsafe { &raw const (*(0usize as *const Pair)).a }");
+    // Non-zero offset on a provenance-free pointer is refused.
+    w.konst("NULL_FIELD4", "*const u32", "unsafe { &raw const (*(0usize as *const Pair)).b }");
+    // Out-of-bounds field projection past a live allocation is refused; one-past-end succeeds.
+    w.konst(
+        "ONE_PAST_END",
+        "bool",
+        "{ let x = 1u32; let p = &raw const x as *const Pair; let _pb = unsafe { &raw const (*p).b }; true }",
+    );
+    w.konst(
+        "PAST_END",
+        "bool",
+        "{ let x = 1u8; let p = &raw const x as *const Pair; let _pb = unsafe { &raw const (*p).b }; true }",
+    );
+    // Transient dangling raw reborrow succeeds; escaping dangling raw pointer is refused at intern.
+    w.konst("TRANSIENT_DANGLE", "u32", "{ let p = dangle(); let _q = &raw const *p; 7 }");
+    w.konst("ESCAPING_DANGLE", "*const u8", "{ let p = dangle(); &raw const *p }");
+    // Safe references still reject null and dangling pointers immediately.
+    w.konst("SAFE_NULL_REF", "u32", "{ let _r: &u8 = unsafe { &*(0usize as *const u8) }; 1 }");
+    w.konst("SAFE_DANGLE_REF", "u32", "{ let p = dangle(); let _r: &u8 = unsafe { &*p }; 1 }");
+    w.build();
+
+    assert_eq!(eval_int(&mut w, "UNINIT_DEREF_FIELD"), Ok(123));
+    let null_raw = w.eval("NULL_RAW").expect("NULL_RAW");
+    assert_eq!(null_raw.data.allocs[0].bytes.as_slice(), &[0; 8]);
+    assert!(null_raw.data.allocs[0].relocs.is_empty());
+    let null_f0 = w.eval("NULL_FIELD0").expect("NULL_FIELD0");
+    assert_eq!(null_f0.data.allocs[0].bytes.as_slice(), &[0; 8]);
+    assert!(null_f0.data.allocs[0].relocs.is_empty());
+    assert_eq!(w.eval("NULL_FIELD4").expect_err("NULL_FIELD4").refusal, Refusal::IntAsPointer);
+    assert_eq!(eval_int(&mut w, "ONE_PAST_END"), Ok(1));
+    assert_eq!(
+        w.eval("PAST_END").expect_err("PAST_END").refusal,
+        Refusal::OutOfBounds { offset: 4, size: 0, len: 1 }
+    );
+    assert_eq!(eval_int(&mut w, "TRANSIENT_DANGLE"), Ok(7));
+    assert_eq!(w.eval("ESCAPING_DANGLE").expect_err("ESCAPING_DANGLE").refusal, Refusal::Dangling);
+    assert_eq!(w.eval("SAFE_NULL_REF").expect_err("SAFE_NULL_REF").refusal, Refusal::IntAsPointer);
+    assert_eq!(w.eval("SAFE_DANGLE_REF").expect_err("SAFE_DANGLE_REF").refusal, Refusal::Dangling);
+}
+
+/// Raw borrows of `static` and `static mut` items in `static` initializers (the shape of
+/// `ANTITHESIS_GUIDANCE_CATALOG`) produce `DataTarget::Static` relocations with the field
+/// offset without reading the target static's bytes; reading or writing a `static mut` through
+/// the raw pointer is still refused with `Refusal::MutableStatic`.
+#[test]
+fn raw_borrows_of_statics_in_static_initializers() {
+    let mut w = world();
+    w.strukt("Pair", &[("a", "u32"), ("b", "u32")]);
+    w.strukt("Catalog", &[("id", "u32"), ("ro", "*const u32"), ("rw", "*mut u32"), ("slice", "*const [u8]")]);
+    w.stat("S", "Pair", "Pair { a: 1, b: 2 }");
+    w.stat_mut("SM", "Pair", "Pair { a: 3, b: 4 }");
+    w.stat("ARR", "[u8; 3]", "[9, 8, 7]");
+    w.stat(
+        "ANTITHESIS_GUIDANCE_CATALOG",
+        "Catalog",
+        "Catalog { id: 1, ro: &raw const S.b, rw: unsafe { &raw mut SM.b }, slice: &raw const ARR }",
+    );
+    w.stat("LOCAL_MUT_PTR", "*mut u32", "&raw mut (Pair { a: 5, b: 6 }).b");
+    w.konst("READ_SM_RAW", "u32", "unsafe { *(&raw const SM.b) }");
+    w.konst("WRITE_SM_RAW", "()", "unsafe { *(&raw mut SM.a) = 99; }");
+    w.build();
+
+    let s_key = w.key("S");
+    let sm_key = w.key("SM");
+    let arr_key = w.key("ARR");
+    let cat = w.eval("ANTITHESIS_GUIDANCE_CATALOG").expect("ANTITHESIS_GUIDANCE_CATALOG");
+    assert_eq!(cat.data.allocs.len(), 1, "only static relocations, no extra local allocs");
+    let relocs = &cat.data.allocs[0].relocs;
+    assert_eq!(relocs.len(), 3, "ro, rw, and slice pointers");
+    assert!(relocs.iter().any(|r| r.target == DataTarget::Static(s_key)));
+    assert!(relocs.iter().any(|r| r.target == DataTarget::Static(sm_key)));
+    assert!(relocs.iter().any(|r| r.target == DataTarget::Static(arr_key)));
+    // Each `.b` pointer relocation carries field offset 4 as its little-endian addend.
+    for r in relocs.iter().filter(|r| r.target == DataTarget::Static(s_key) || r.target == DataTarget::Static(sm_key)) {
+        let off = usize::try_from(r.offset).expect("offset fits usize");
+        let addend = u64::from_le_bytes(cat.data.allocs[0].bytes[off..off + 8].try_into().expect("8-byte word"));
+        assert_eq!(addend, 4, "field `b` offset");
+    }
+    // The slice raw pointer carries length 3 in the word right after its data pointer.
+    let slice_reloc = relocs.iter().find(|r| r.target == DataTarget::Static(arr_key)).expect("ARR reloc");
+    let slice_off = usize::try_from(slice_reloc.offset).expect("offset fits usize");
+    let slice_len = u64::from_le_bytes(cat.data.allocs[0].bytes[slice_off + 8..slice_off + 16].try_into().expect("8-byte len"));
+    assert_eq!(slice_len, 3);
+
+    // `&raw mut` to a local/promoted allocation inside a static marks the target allocation mutable.
+    let local_mut = w.eval("LOCAL_MUT_PTR").expect("LOCAL_MUT_PTR");
+    assert_eq!(local_mut.data.allocs.len(), 2);
+    assert_eq!(local_mut.data.allocs[0].relocs[0].target, DataTarget::Local(1));
+    assert!(local_mut.data.allocs[1].mutable, "target of `*mut` in a static is writable");
+
+    // Reading or writing a `static mut` through a raw pointer is still refused.
+    assert_eq!(w.eval("READ_SM_RAW").expect_err("READ_SM_RAW").refusal, Refusal::MutableStatic { item: sm_key });
+    assert_eq!(w.eval("WRITE_SM_RAW").expect_err("WRITE_SM_RAW").refusal, Refusal::MutableStatic { item: sm_key });
+}

@@ -39,7 +39,7 @@ use bstd::mem::Frame;
 use bstd::out::Out;
 use bstd::path::{Path, PathError};
 
-use crate::body_types::TreesSeen;
+use crate::body_types::{SyncPackDirs, TreesSeen};
 use crate::code_store::HomeCodeStore;
 use crate::engine_check::{Standing, check_for_start};
 use crate::engine_records::EngineRecords;
@@ -545,6 +545,7 @@ fn export_program<'f>(
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
     let mut read = EngineRecords::new(heap.alloc());
     let seen = TreesSeen::default();
+    let pack_dirs = SyncPackDirs::default();
     let root = standing.checkout;
     let lints = crate::lints::of_root(cx, root, frame)?;
     let mut facts = start_facts(&standing, fs, phases, lints);
@@ -600,7 +601,7 @@ fn export_program<'f>(
     let maker_procs = crate::job_texts::MadeOnce::new(|| inputs.make());
     let procs = crate::job_texts::Procs::ByNeed(&maker_procs);
 
-    let names = run_names::names_of(cx, root, &found, owner, &mut *standing.store, &mut facts.bodies, &mut read, env, procs, &seen, frame, heap).map_err(CliError::RunNames)?;
+    let names = run_names::names_of(cx, root, &found, owner, &mut *standing.store, &mut facts.bodies, &mut read, env, &pack_dirs, procs, &seen, frame, heap).map_err(CliError::RunNames)?;
 
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Roots));
     let export_items: &[blaze_id::ItemKey] = native_export.as_ref().map_or(&[], |n| n.items.as_slice());

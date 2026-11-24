@@ -178,6 +178,17 @@ impl LinkOp {
     }
 }
 
+/// Formats a raw OS error number as `std::io::Error::from_raw_os_error` displays it, for
+/// `#![no_std]` callers (`bstd::procs`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OsError(pub i32);
+
+impl fmt::Display for OsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", io::Error::from_raw_os_error(self.0))
+    }
+}
+
 /// A step on a linked child that failed: the program, the step, and the system's error number
 /// (0 where the refusal is blaze's own).
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
@@ -192,7 +203,7 @@ impl fmt::Display for LinkError {
         write!(f, "{}: linked child: {}", self.program.display(), self.op.what())?;
         match self.os {
             0 => Ok(()),
-            os => write!(f, ": {}", io::Error::from_raw_os_error(os)),
+            os => write!(f, ": {}", OsError(os)),
         }
     }
 }
