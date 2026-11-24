@@ -528,6 +528,88 @@ impl<F: Facts> Selected for CallSel<'_, F> {
         let lts = regions.lifetime_params(opaque).ok()?.count();
         Some((lts, views))
     }
+    fn rpitit_target(&self, opaque: ItemKey, args: &dyn AskArgs) -> Option<blaze_borrow::RpititTarget<'_>> {
+        let info = self.facts.rpitit_opaque(opaque)?;
+        let answers = |r: &&Projected| {
+            r.trait_ == info.trait_
+                && (r.name == Some(info.name) || (r.name.is_none() && matches!(r.selected, blaze_typeck::Selected::Impl { .. })))
+        };
+        let mut exact: Option<&Projected> = None;
+        let mut loose: Option<&Projected> = None;
+        for r in self.rows.iter().filter(answers) {
+            let keyed = if r.name.is_none() {
+                match self.tys.list(r.args) {
+                    Ok(list) if u32::try_from(list.len()).ok() == Some(info.trait_types) => {
+                        let mut all_exact = true;
+                        let mut differ = false;
+                        for (k, &t) in (0..info.trait_types).zip(list.iter()) {
+                            match args.compare(k, t) {
+                                Keyed::Differ => {
+                                    differ = true;
+                                    break;
+                                }
+                                Keyed::Unknown => all_exact = false,
+                                Keyed::Same => {}
+                            }
+                        }
+                        if differ {
+                            Keyed::Differ
+                        } else if all_exact {
+                            Keyed::Same
+                        } else {
+                            Keyed::Unknown
+                        }
+                    }
+                    Ok(_) => Keyed::Differ,
+                    Err(_) => Keyed::Unknown,
+                }
+            } else {
+                self.match_row(r, args)
+            };
+            match keyed {
+                Keyed::Differ => continue,
+                Keyed::Same => match exact {
+                    None => exact = Some(r),
+                    Some(f) if f.selected == r.selected => {}
+                    Some(_) => return None,
+                },
+                Keyed::Unknown => match loose {
+                    None => loose = Some(r),
+                    Some(f) if f.selected == r.selected => {}
+                    Some(_) => return None,
+                },
+            }
+        }
+        let r = exact.or(loose)?;
+        let blaze_typeck::Selected::Impl { imp, args: imp_args } = r.selected else {
+            return None;
+        };
+        let Some(impl_fn) = self.facts.impl_fn(imp, info.fn_name) else {
+            return info.default_twin.map(|twin| blaze_borrow::RpititTarget::Twin { twin });
+        };
+        let types = self.tys.list(imp_args).ok()?;
+        let ntypes = u32::try_from(types.len()).ok()?;
+        let regions = self.facts.regions();
+        let (_, Some(trait_col)) = regions.impl_header(imp).ok()? else { return None };
+        let params = regions.lifetime_params(imp).ok()?;
+        let impl_sig = regions.sig(impl_fn).ok()?;
+        let trait_sig = regions.sig(info.trait_fn).ok()?;
+        let head = ImplHead {
+            imp,
+            lifetimes: params.count(),
+            types: ntypes,
+            trait_ref: Typed { ty: trait_col.ty(), col: trait_col.as_slice() },
+        };
+        Some(blaze_borrow::RpititTarget::ImplFn {
+            trait_: info.trait_,
+            head,
+            trait_types: info.trait_types,
+            impl_fn,
+            impl_params: impl_sig.params,
+            impl_col: impl_sig.col,
+            trait_col: trait_sig.col,
+        })
+    }
 
     fn select_keyed(&self, ask: Ask, args: &dyn AskArgs) -> Selection<'_> {
         let answers = |r: &&Projected| {

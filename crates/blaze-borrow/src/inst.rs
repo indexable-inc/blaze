@@ -684,6 +684,27 @@ impl AskArgs for Unkeyed {
     }
 }
 
+/// Normalization target of a trait fn's RPITIT opaque (`Opaque(op_key, ..)`) at a concrete
+/// call site (RFC 3425).
+#[derive(Clone, Copy, Debug)]
+pub enum RpititTarget<'s> {
+    /// The selected impl inherits the trait's provided fn (`rpitit::Twin`): identical captured
+    /// lifetimes and type arguments, with `Opaque(twin, ..)` replacing `Opaque(op_key, ..)`.
+    Twin { twin: ItemKey },
+    /// The selected impl overrides the fn with `impl_fn`: bind `impl_fn`'s environment from
+    /// `head`, `impl_col` vs `trait_col` inputs, and take the return subtree at `op_key`'s place
+    /// inside `impl_col`'s output.
+    ImplFn {
+        trait_: ItemKey,
+        head: ImplHead<'s>,
+        trait_types: u32,
+        impl_fn: ItemKey,
+        impl_params: ParamsView<'s>,
+        impl_col: ColView<'s>,
+        trait_col: ColView<'s>,
+    },
+}
+
 /// The answer to an [`Ask`].
 #[derive(Clone, Copy, Debug)]
 pub enum Selection<'s> {
@@ -758,6 +779,12 @@ pub trait Selected {
     /// along with its defining item's lifetime parameter count (`regions.lifetime_params(opaque).count()`).
     fn opaque_clauses(&self, opaque: ItemKey) -> Option<(u32, &[ClauseView<'_>])> {
         let _ = opaque;
+        None
+    }
+    /// If `opaque` is an RPITIT opaque of a trait fn whose impl was selected at this call
+    /// (`args` = `[Self, trait_args.., fn_args..]`), returns its concrete normalization target.
+    fn rpitit_target(&self, opaque: ItemKey, args: &dyn AskArgs) -> Option<RpititTarget<'_>> {
+        let _ = (opaque, args);
         None
     }
 }

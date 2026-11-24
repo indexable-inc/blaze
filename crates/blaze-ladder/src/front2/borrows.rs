@@ -579,6 +579,10 @@ pub struct BorrowFacts<'a> {
     deref_impls: AVec<'a, (u128, tc::ItemKey)>,
     /// `(trait_key, assoc_name, assoc_item)` sorted by `(trait_key, assoc_name)` (`Facts::assoc_item`).
     assoc_items: AVec<'a, (u128, tc::Name, tc::ItemKey)>,
+    /// RPITIT opaques sorted by opaque key (`Facts::rpitit_opaque`).
+    rpitit_opaques: AVec<'a, (u128, blaze_flow_lower::RpititOpaque)>,
+    /// Trait-impl methods overriding RPITIT fns, sorted by `(imp, fn_name)` (`Facts::impl_fn`).
+    impl_fns: AVec<'a, (u128, tc::Name, tc::ItemKey)>,
     /// Enclosing trait impl of `owner`, if `owner` is a method of `impl<..> Trait for SelfTy`.
     owner_trait_impl: Option<blaze_flow_lower::OwnerTraitImpl>,
 }
@@ -656,6 +660,8 @@ impl<'a> BorrowFacts<'a> {
             pointee: None,
             deref_impls: AVec::new_in(alloc),
             assoc_items: AVec::new_in(alloc),
+            rpitit_opaques: AVec::new_in(alloc),
+            impl_fns: AVec::new_in(alloc),
             owner_trait_impl: None,
         }
     }
@@ -813,6 +819,14 @@ impl Facts for ReadBy<'_, '_> {
     fn is_zero_slot_builtin_assoc(&self, trait_: tc::ItemKey, name: tc::Name) -> bool {
         (Some(trait_) == self.facts.discriminant_kind && name == tc::Name::of("Discriminant"))
             || (Some(trait_) == self.facts.pointee && name == tc::Name::of("Metadata"))
+    }
+    fn rpitit_opaque(&self, opaque: tc::ItemKey) -> Option<blaze_flow_lower::RpititOpaque> {
+        let at = self.facts.rpitit_opaques.binary_search_by_key(&opaque.0, |&(k, _)| k).ok()?;
+        self.facts.rpitit_opaques.get(at).map(|&(_, v)| v)
+    }
+    fn impl_fn(&self, imp: tc::ItemKey, fn_name: tc::Name) -> Option<tc::ItemKey> {
+        let at = self.facts.impl_fns.binary_search_by_key(&(imp.0, fn_name), |&(k, n, _)| (k, n)).ok()?;
+        self.facts.impl_fns.get(at).map(|&(_, _, v)| v)
     }
     fn adt_variances(&self, adt: tc::ItemKey) -> Option<&[blaze_flow_lower::Variance]> {
         let at = self.facts.variance_at.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
@@ -1556,6 +1570,24 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             container_head(r, lib, false);
         }
     }
+    for &k in items.iter() {
+        if let Some(p) = r.store.preds.get(&tc::ItemKey(k)) {
+            for cl in p.clauses.iter() {
+                if let tc::PClause::Trait { trait_, .. } | tc::PClause::Projection { trait_, .. } = *cl {
+                    traits.push(trait_.0);
+                }
+            }
+        }
+    }
+    for &(k, _) in selected.iter() {
+        if let Some(p) = r.store.preds.get(&tc::ItemKey(k)) {
+            for cl in p.clauses.iter() {
+                if let tc::PClause::Trait { trait_, .. } | tc::PClause::Projection { trait_, .. } = *cl {
+                    traits.push(trait_.0);
+                }
+            }
+        }
+    }
     // Ensure trait heads transitively through supertraits so `regions.clauses(trait_)` is loaded
     // for supertrait elaboration in `blaze-borrow`.
     {
@@ -1569,6 +1601,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 && matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Trait))
             {
                 container_head(r, lib, true);
+                r.store.ensure_assoc_regions(r.names, r.keys, lib);
             }
             if let Some(def) = r.store.trait_defs.get(&tk) {
                 for sc in def.supertraits.iter() {
@@ -1596,6 +1629,117 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         traits.dedup();
         g.assoc_items.sort_unstable_by_key(|&(k, n, _)| (k, n));
         g.assoc_items.dedup_by_key(|&mut (k, n, _)| (k, n));
+    }
+    // Gather RPITIT synthetic metadata (`rpitit_opaques`, overriding `impl_fns`, and `Twin`
+    // default opaque regions) before ADT/read collection so every overriding impl fn and Twin
+    // opaque participates in ADT variance/outlives, read tracking (Rule 21), and signature facts.
+    {
+        let mut extra_opaques: AVec<'a, u128> = AVec::new_in(alloc);
+        for &ok_u128 in opaques.iter() {
+            if let Some(twin) = r.store.rpitit_defaults.get(&tc::ItemKey(ok_u128)) {
+                extra_opaques.push(twin.source.0);
+            }
+        }
+        for &tk_u128 in traits.iter() {
+            let tk = tc::ItemKey(tk_u128);
+            let Some(tr_rows) = r.store.rpitit_traits.get(&tk) else { continue };
+            let Some(trait_types) = r.keys.library_in(r.names, tk).and_then(|lib| r.store.maps.traits.get(&lib)).map(|th| th.generics) else {
+                continue;
+            };
+            for s in tr_rows.rows.iter() {
+                let default_twin = s.default.and_then(|d| match r.store.tys.view().node(d) {
+                    Ok(tc::PNode::Opaque(k, _)) => Some(k),
+                    _ => None,
+                });
+                g.rpitit_opaques.push((
+                    s.opaque.0,
+                    blaze_flow_lower::RpititOpaque {
+                        trait_: tk,
+                        name: s.name,
+                        fn_name: s.fn_name,
+                        trait_fn: s.trait_fn,
+                        trait_types,
+                        default_twin,
+                    },
+                ));
+                extra_opaques.push(s.opaque.0);
+                if let Some(tw) = default_twin {
+                    extra_opaques.push(tw.0);
+                }
+            }
+        }
+        let mut last_imp = None;
+        let mut new_impl_fns: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+        for &(imp_u128, _) in selected.iter() {
+            if last_imp == Some(imp_u128) {
+                continue;
+            }
+            last_imp = Some(imp_u128);
+            let imp_k = tc::ItemKey(imp_u128);
+            let Some(ih) = r.store.impls.get(&imp_k) else { continue };
+            let Some(tr) = ih.trait_ else { continue };
+            let Some(tr_rows) = r.store.rpitit_traits.get(&tr) else { continue };
+            for s in tr_rows.rows.iter() {
+                if let Some(&(_, impl_fn)) = ih.fns.iter().find(|&&(n, _)| n == s.fn_name) {
+                    g.impl_fns.push((imp_u128, s.fn_name, impl_fn));
+                    if items.scan_for(&impl_fn.0).is_none() && new_impl_fns.scan_for(&impl_fn).is_none() {
+                        new_impl_fns.push(impl_fn);
+                    }
+                }
+            }
+        }
+        for &impl_fn in new_impl_fns.iter() {
+            if !r.store.fns.contains_key(&impl_fn)
+                && let Some(w) = member_fn_want(r.names, &*r.keys, impl_fn)
+            {
+                ensure_one(r, w);
+            }
+            items.push(impl_fn.0);
+            if let Some(f) = r.store.fns.get(&impl_fn) {
+                let tys = r.store.tys.view();
+                let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(tys.node(t), Ok(tc::PNode::Ref(..))));
+                g.callees.push((impl_fn.0, CalleeFacts { writes_lifetimes: f.qualifiers.writes_lifetimes(), self_ref }));
+                let out = r.store.fn_output(impl_fn).unwrap_or(f.output);
+                let mut st: AVec<'a, tc::PTy> = AVec::new_in(alloc);
+                st.push(out);
+                let mut steps = 0u32;
+                while let Some(t) = st.pop() {
+                    steps += 1;
+                    if steps > 1024 {
+                        break;
+                    }
+                    let Ok(node) = tys.node(t) else { continue };
+                    if let tc::PNode::Opaque(ok, _) = node {
+                        extra_opaques.push(ok.0);
+                    }
+                    if let Ok((list, last)) = super::adt_variance::children(tys, t, node) {
+                        st.extend_from_slice(list);
+                        if let Some(ch) = last {
+                            st.push(ch);
+                        }
+                    }
+                }
+            } else {
+                g.reads.push(head_read(impl_fn.0, HeadAnswer::NotMade));
+            }
+        }
+        opaques.extend_from_slice(&extra_opaques);
+        opaques.sort_unstable();
+        opaques.dedup();
+        items.sort_unstable();
+        items.dedup();
+        g.callees.sort_unstable_by_key(|&(k, _)| k);
+        g.callees.dedup_by_key(|&mut (k, _)| k);
+        g.rpitit_opaques.sort_unstable_by_key(|&(k, _)| k);
+        g.rpitit_opaques.dedup_by_key(|&mut (k, _)| k);
+        g.impl_fns.sort_unstable_by_key(|&(imp, n, _)| (imp, n));
+        g.impl_fns.dedup_by_key(|&mut (imp, n, _)| (imp, n));
+        for &ok_u128 in opaques.iter() {
+            let ok = tc::ItemKey(ok_u128);
+            if r.store.rpitit_defaults.contains_key(&ok) && r.store.regions.made(ok).is_none() {
+                ensure_twin_opaque_regions(r, ok);
+            }
+        }
     }
     let mut adts: AVec<'a, u128> = AVec::new_in(alloc);
     for n in c.types.view().nodes() {
@@ -2111,6 +2255,116 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     }
     g.items = items;
     g
+}
+
+/// Files `FiledRegions` for a provided trait fn's RPITIT `Twin` opaque (`rpitit::default_key`)
+/// by cloning its source opaque's regions and rewriting `Opaque(source, args)` to
+/// `Opaque(twin, args)` in each clause column root.
+fn ensure_twin_opaque_regions<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, twin_k: tc::ItemKey) {
+    let Some((source, owner)) = r.store.rpitit_defaults.get(&twin_k).map(|t| (t.source, t.owner)) else {
+        return;
+    };
+    if r.store.regions.made(twin_k).is_some() {
+        return;
+    }
+    if r.store.regions.made(source).is_none()
+        && let Some(w) = member_fn_want(r.names, &*r.keys, owner)
+    {
+        ensure_one(r, w);
+    }
+    let Some(src_filed) = r.store.regions.made(source) else {
+        return;
+    };
+    let alloc = r.store.tys.alloc();
+    let src = src_filed.regions();
+    let mut lifetimes = tc::regions::LifetimeParams::new_in(src.params.count(), alloc);
+    for i in 0..src.params.count() {
+        if src.params.is_late(i) == Ok(true) {
+            let _ = lifetimes.set_late(i);
+        }
+    }
+    for &(longer, shorter) in src.params.outlives() {
+        let _ = lifetimes.add_outlives(longer, shorter);
+    }
+    let mut hr = tc::region_facts::HeadRegions::new_in(lifetimes, alloc);
+    hr.opaque_captures = src.opaque_captures;
+    hr.outlives.extend_from_slice(&src.outlives);
+
+    struct TwinArity<'a> {
+        inner: &'a dyn tc::regions::Arity,
+        twin: tc::ItemKey,
+        source: tc::ItemKey,
+        captures: Option<u32>,
+    }
+    impl tc::regions::Arity for TwinArity<'_> {
+        fn adt_lifetimes(&self, adt: tc::ItemKey) -> tc::regions::Count {
+            self.inner.adt_lifetimes(adt)
+        }
+        fn opaque_captures(&self, opaque: tc::ItemKey) -> tc::regions::Count {
+            if opaque == self.twin {
+                match self.captures {
+                    Some(n) => tc::regions::Count::Known(n),
+                    None => self.inner.opaque_captures(self.source),
+                }
+            } else {
+                self.inner.opaque_captures(opaque)
+            }
+        }
+        fn alias_lifetimes(&self, trait_: tc::ItemKey, name: tc::Name) -> tc::regions::Count {
+            self.inner.alias_lifetimes(trait_, name)
+        }
+        fn trait_lifetimes(&self, trait_: tc::ItemKey) -> tc::regions::Count {
+            self.inner.trait_lifetimes(trait_)
+        }
+    }
+
+    let swap_one = |tys: &tc::PortableTys<'_>, t: tc::PTy| -> Option<tc::PTy> {
+        match tys.view().node(t).ok()? {
+            tc::PNode::Opaque(k, args) if k == source => tys.intern_shared(tc::PNode::Opaque(twin_k, args)).ok(),
+            _ => Some(t),
+        }
+    };
+    let swap_list = |tys: &tc::PortableTys<'_>, l: tc::List| -> Option<tc::List> {
+        let items = tys.view().list(l).ok()?;
+        let mut out: AVec<'static, tc::PTy> = AVec::with_capacity_in(items.len(), alloc);
+        let mut changed = false;
+        for &it in items {
+            let sw = swap_one(tys, it)?;
+            if sw != it {
+                changed = true;
+            }
+            out.push(sw);
+        }
+        if !changed {
+            return Some(l);
+        }
+        tys.intern_list_shared(&out).ok()
+    };
+
+    let arity = TwinArity { inner: src_filed.arity(), twin: twin_k, source, captures: src.opaque_captures };
+    for cl in src.clauses.iter() {
+        let root_ty = cl.col.ty();
+        let Ok(node) = r.store.tys.view().node(root_ty) else { continue };
+        let new_ty = match node {
+            tc::PNode::Opaque(k, args) if k == source => r.store.tys.intern_shared(tc::PNode::Opaque(twin_k, args)).ok(),
+            tc::PNode::ExTrait(tr, args) => swap_list(&r.store.tys, args).and_then(|a| r.store.tys.intern_shared(tc::PNode::ExTrait(tr, a)).ok()),
+            tc::PNode::ExProj { trait_, name, args, term } => swap_list(&r.store.tys, args).and_then(|a| {
+                let t = swap_one(&r.store.tys, term)?;
+                r.store.tys.intern_shared(tc::PNode::ExProj { trait_, name, args: a, term: t }).ok()
+            }),
+            _ => Some(root_ty),
+        };
+        let Some(new_ty) = new_ty else { continue };
+        if let Ok(col) = tc::regions::RegionCol::lay(r.store.tys.view(), new_ty, &arity, cl.col.as_slice(), alloc) {
+            hr.clauses.push(tc::region_facts::ClauseRegions { nth: cl.nth, binders: cl.binders, col });
+        }
+    }
+    if let Ok(filed) = super::head_record::FiledRegions::new(hr, &arity, r.store.tys.view(), alloc) {
+        r.store.regions.file(twin_k, filed);
+        if let Some(n) = src.opaque_captures {
+            r.store.maps.opaque_lifetimes.insert_absent(twin_k, n);
+        }
+    }
 }
 
 /// The variances of ADT `key`'s parameters, lifetimes first then its type and const

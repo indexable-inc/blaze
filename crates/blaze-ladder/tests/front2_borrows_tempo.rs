@@ -531,12 +531,16 @@ fn shown(item: &str, v: &BorrowVerdict<'_>) -> String {
     format!("{found:?} refused {:?}", v.refused)
 }
 
+fn open_toolchain() -> Toolchain {
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"))
+}
+
 #[test]
 fn tempo_classes_and_controls() {
     let heap = blaze_own::testing::heap();
-    let home = std::env::var("HOME").expect("HOME is set");
-    let shelf = format!("{home}/.blaze/v2/toolchain");
-    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let tc = open_toolchain();
     let files = [("/bw/src/main.rs".to_string(), MAIN.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
     let user = UserCrate { name: "bw", dir: "/bw/", root: "/bw/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
@@ -610,4 +614,234 @@ fn tempo_classes_and_controls() {
         assert!(seen.iter().any(|s| s == e), "an expected body was not checked: {e}");
     }
     assert!(wrong.is_empty(), "{} bodies not as Rust has them:\n{}\n{}", wrong.len(), wrong.join("\n"), flows_of_wrong.join("\n"));
+}
+
+#[test]
+fn onerule_tempo_buckets() {
+    const SRC: &str = r#"
+fn main() {}
+
+// Bucket 1: GenericSelf(Alias)
+fn for_impl_into_iter(xs: impl IntoIterator<Item = u8>) -> u8 {
+    let mut s = 0;
+    for x in xs {
+        s += x;
+    }
+    s
+}
+
+fn for_impl_into_iter_ref<'a>(xs: impl IntoIterator<Item = &'a u8>) -> u8 {
+    let mut s = 0;
+    for x in xs {
+        s += *x;
+    }
+    s
+}
+
+trait DeError: Sized {
+    fn missing_field(name: &'static str) -> Self;
+}
+trait MapAcc<'de> {
+    type Error: DeError;
+    fn next_key(&mut self) -> Result<Option<&'de str>, Self::Error>;
+}
+fn visit_map<'de, A: MapAcc<'de>>(mut map: A) -> Result<u8, A::Error> {
+    let _ = map.next_key()?;
+    Err(<A::Error as DeError>::missing_field("x"))
+}
+
+// Bucket 2: Unanswered (Serialize-style ? on Result<S::SerStruct, S::Error>)
+trait SerStruct {
+    type Ok;
+    type Error;
+    fn ser_field(&mut self, k: &'static str, v: &u8) -> Result<(), Self::Error>;
+    fn end(self) -> Result<Self::Ok, Self::Error>;
+}
+trait Ser {
+    type Ok;
+    type Error;
+    type SerStruct: SerStruct<Ok = Self::Ok, Error = Self::Error>;
+    fn ser_struct(self, name: &'static str, len: usize) -> Result<Self::SerStruct, Self::Error>;
+}
+fn ser_group<S: Ser>(s: S, x: &u8) -> Result<S::Ok, S::Error> {
+    let mut st = S::ser_struct(s, "G", 1)?;
+    SerStruct::ser_field(&mut st, "x", x)?;
+    SerStruct::end(st)
+}
+
+// Bucket 2: Unanswered (`Deserialize<'de>` / trait with lifetime param proved for primitive `usize`)
+trait De<'de>: Sized {}
+impl<'de> De<'de> for usize {}
+trait MapDe<'de> {
+    fn next_val<V: De<'de>>(&mut self) -> Result<V, ()>;
+}
+fn de_primitive<'de, M: MapDe<'de>>(m: &mut M) -> Result<usize, ()> {
+    m.next_val::<usize>()
+}
+// Negative control: `trait LtTrait<'a>` with `impl LtTrait<'static> for usize` MUST constrain `'a: 'static`!
+trait LtTrait<'a> {}
+impl LtTrait<'static> for usize {}
+fn need_lt_trait<'a, T: LtTrait<'a>>(_: &'a u8, _: T) {}
+fn control_lt_trait_primitive_dangling() {
+    let local = 1u8;
+    need_lt_trait(&local, 0usize);
+}
+
+// Bucket 3: HeadUnread (tracing_subscriber `FormatFields` with supertrait param bound `M: MakeOutput<Writer<'w>, Out>` where `MakeOutput<T, Out>: MakeVisitor<T>` defines `type Visitor`)
+struct Writer<'w>(&'w mut u8);
+trait VisitFmt {}
+trait MakeVisitor<T> {
+    type Visitor;
+}
+trait MakeOut<T, Out>: MakeVisitor<T> {}
+struct DefVis;
+impl VisitFmt for DefVis {}
+struct DefFields;
+impl<'w> MakeVisitor<Writer<'w>> for DefFields {
+    type Visitor = DefVis;
+}
+impl<'w> MakeOut<Writer<'w>, ()> for DefFields {}
+trait LookupSpan<'a> {}
+trait Sub {}
+trait FmtFields<'w> {}
+trait FmtLayer<S> {}
+trait SubExt: Sub + Sized {
+    fn with<L: FmtLayer<Self>>(self, layer: L) -> Layered<L, Self> {
+        Layered(layer, self)
+    }
+}
+struct Reg;
+impl Sub for Reg {}
+impl<'a> LookupSpan<'a> for Reg {}
+impl<S: Sub> SubExt for S {}
+struct Layered<L, S>(L, S);
+struct Fmt<S, N>(core::marker::PhantomData<fn(S, N)>);
+impl<'w, M> FmtFields<'w> for M
+where
+    M: MakeOut<Writer<'w>, ()>,
+    M::Visitor: VisitFmt,
+{}
+impl<S, N> FmtLayer<S> for Fmt<S, N>
+where
+    S: Sub + for<'a> LookupSpan<'a>,
+    N: for<'w> FmtFields<'w> + 'static,
+{}
+fn test_traced_repro() {
+    let _ = Reg.with(Fmt::<_, DefFields>(core::marker::PhantomData));
+}
+
+// DefaultArg with parameter-substituted default (e.g. `once_cell::sync::Lazy<T, F = fn() -> T>`)
+struct LazyCell<T, F = fn() -> T> {
+    val: Option<T>,
+    init: F,
+}
+impl<T, F> LazyCell<T, F> {
+    fn get_ref(&self) -> Option<&T> {
+        self.val.as_ref()
+    }
+}
+fn use_lazy_static<'a>(cell: &'a LazyCell<&'static str>) -> Option<&'a &'static str> {
+    cell.get_ref()
+}
+fn use_lazy_local<'a, 'b>(cell: &'a LazyCell<&'b str>) -> Option<&'a &'b str> {
+    cell.get_ref()
+}
+
+// Negative soundness controls (must report borrow errors, never silently accept!)
+fn control_rpitit_concrete_dangling(r: &RpititImpl) -> impl core::future::Future<Output = u8> + '_ {
+    let local = 1u8;
+    r.fetch(&local)
+}
+fn control_rpitit_default_dangling(r: &RpititDefImpl) -> impl core::future::Future<Output = u8> + '_ {
+    let local = 1u8;
+    r.get(&local)
+}
+fn control_async_fn_dangling() -> impl core::future::Future<Output = u8> {
+    let local = 1u8;
+    take_fut(wait_val(&local))
+}
+fn control_lazy_dangling<'a>() -> Option<&'a str> {
+    let local = String::new();
+    let cell: LazyCell<&str> = LazyCell { val: Some(local.as_str()), init: || "" };
+    cell.val
+}
+
+// Bucket 4: Shape { Heads { Opaque, Opaque } } (RPITIT concrete & default)
+trait RpititTr {
+    async fn fetch(&self, x: &u8) -> u8;
+}
+struct RpititImpl;
+impl RpititTr for RpititImpl {
+    async fn fetch(&self, x: &u8) -> u8 {
+        *x
+    }
+}
+async fn call_rpitit_concrete(r: &RpititImpl, x: &u8) -> u8 {
+    r.fetch(x).await
+}
+
+trait RpititDefault {
+    async fn get(&self, x: &u8) -> u8 {
+        *x
+    }
+}
+struct RpititDefImpl;
+impl RpititDefault for RpititDefImpl {}
+async fn call_rpitit_default(r: &RpititDefImpl, x: &u8) -> u8 {
+    r.get(x).await
+}
+
+// Bucket 5: GenericSelf(Opaque) (async fn opaque passed to FutureExt / Future bound)
+trait FutExt: core::future::Future {
+    fn poll_now(self: core::pin::Pin<&mut Self>) -> Option<Self::Output> {
+        None
+    }
+}
+impl<F: core::future::Future + ?Sized> FutExt for F {}
+async fn wait_val(x: &u8) -> u8 {
+    *x
+}
+fn call_future_ext_on_async_fn(x: &u8) -> Option<u8> {
+    let mut f = core::pin::pin!(wait_val(x));
+    f.as_mut().poll_now()
+}
+fn take_fut<F: core::future::Future<Output = u8>>(f: F) -> F {
+    f
+}
+fn pass_async_fn_to_fut_bound(x: &u8) -> impl core::future::Future<Output = u8> + '_ {
+    take_fut(wait_val(x))
+}
+"#;
+    let heap = blaze_own::testing::heap();
+    let tc = open_toolchain();
+    let files = [("/or/src/main.rs".to_string(), SRC.to_string())];
+    let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+    let user = UserCrate { name: "or", dir: "/or/", root: "/or/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let sources = [SourceFile { path: "src/main.rs", text: SRC }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    let mut world = ProjectWorld::new(&names, &frame, &sources, heap.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let bodies = world.bodies(heap.alloc());
+    let mut report = blaze_own::Vec::new_in(heap.alloc());
+    for (b, _) in bodies.iter() {
+        let name = match b {
+            BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name).unwrap_or("?").to_string(),
+            BodyRef::Member { name, .. } => name.to_string(),
+        };
+        if name == "main" {
+            continue;
+        }
+        let mut flows = "".to_owned();
+        let (types, v) = world.check_borrows_shown(*b, &mut flows, heap.alloc());
+        if name.starts_with("control_") {
+            if !types.is_clean() || v.refused.is_some() || v.findings.is_empty() {
+                report.push(format!("{name} (control): types_clean={} findings={:?} refused={:?}", types.is_clean(), v.findings, v.refused));
+            }
+        } else if !types.is_clean() || v.refused.is_some() || !v.findings.is_empty() {
+            report.push(format!("{name}: types_clean={} findings={:?} refused={:?}", types.is_clean(), v.findings, v.refused));
+        }
+    }
+    assert!(report.is_empty(), "Bucket repros:\n{}", report.join("\n"));
 }
