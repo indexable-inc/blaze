@@ -165,7 +165,7 @@ fn a_where_const_condition_is_evaluated_at_the_impl_arguments() {
             "#![feature(no_core, lang_items, blaze_comptime)]\n#![no_core]\n#[lang = \"sized\"] trait Sized {{}}\n\
              {body} small<T>() -> bool {{ {value} }}\n\
              trait Flat {{ fn flat(&self) -> i32 {{ 42 }} }}\nimpl<T> Flat for T where const {{ small::<T>() }} {{}}\n\
-             fn main() {{ let _ = 0u8.flat(); }}"
+             fn main() {{ let x = 0u8; let _ = x.flat(); }}"
         );
         let files = [SourceFile { path: "src/main.rs", text: &text }];
         let all = refusals(&files, "src/main.rs", OverflowChecks::On, Alloc::global());

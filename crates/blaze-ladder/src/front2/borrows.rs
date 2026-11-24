@@ -1911,8 +1911,11 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         // A `Copy` type has no `Drop` impl: the Reference, "Special types and traits", `Copy`:
         // "Copy cannot be implemented for types that implement Drop" (rustc E0184), so YES to
         // `Copy` is NO to `Drop` without asking (an unread candidate cannot be its `Drop`).
+        // Likewise, in a `#![no_core]` crate graph with no `#[lang = "drop"]` trait at all, no ADT
+        // can implement `Drop`.
         let drop_impl = match copy_state {
             Ok(CopyImpl::Positive) => Ok(false),
+            _ if langs.drop.is_none() => Ok(false),
             _ => has_impl(r, langs.drop, key),
         };
         if let Err(why) = copy_state {

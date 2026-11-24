@@ -152,6 +152,23 @@ fn elf_is_deterministic_and_valid() {
     println!("elf: {} bytes, {} binds (exit, __libc_start_main), byte-equal across two exports", one.len(), facts.binds);
 }
 
+#[test]
+fn elf_synthesizes_dso_handle_as_relative_not_dynsym() {
+    let main = rec(
+        &[STP, MOV_FP, ADRP_X16, LDR_X16, BLR_X16, ADRP_X16, LDR_X16, BLR_X16, LDP, RET],
+        &[],
+        &[(8, "__dso_handle"), (20, "exit")],
+    );
+    let second = rec(&[MOV_W0_42, RET], &[], &[]);
+    let fs = functions(&main, &second);
+    let bytes = exported(&program(&fs, &[], None), Platform::LinuxArm64);
+    let facts = check::elf(&bytes).unwrap();
+    // `__dso_handle` becomes an `R_AARCH64_RELATIVE` (ELF header, addend 0), leaving only
+    // `exit` and `__libc_start_main` as dynamic binds.
+    assert_eq!((facts.binds, facts.relative), (2, 1));
+    assert!(!bytes.windows(b"__dso_handle".len()).any(|w| w == b"__dso_handle"), "__dso_handle must not appear in .dynstr");
+}
+
 /// The control: the writer with its page hashes taken before the last fixup is written. Prints
 /// `planted: check: the code directory's hash of page <P> is not the page's SHA-256`.
 #[test]

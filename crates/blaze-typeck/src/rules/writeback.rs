@@ -755,7 +755,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         awaited.sort_unstable_by_key(|r| r.0);
         // The impl chosen for each projection of a callee's signature at each call
         // (writeback/selected_rows.rs), over the body's own reads: before they are finished.
-        let selected = self.selected_rows(&mut ex, &closures);
+        let selected = self.selected_rows(&mut ex, &closures, &expr_ty);
         // Reading an unfiled coroutine supplies a stand-in. Any result of selection
         // using it (including a missing-facts error) belongs to this unfinished round.
         if self.reads.holed() {

@@ -1778,13 +1778,13 @@ fn stop_bounded(
         }
     }
     let member = shared.member.load(Ordering::Relaxed);
+    let panicking = thread::panicking();
     let in_graph = crate::sched::job_in_graph();
     let _linked = in_graph
         .as_ref()
-        .filter(|(job, theirs)| crate::sched::stop_begins(&shared.sched, member, *job, theirs))
+        .filter(|(job, theirs)| crate::sched::stop_begins(&shared.sched, member, *job, theirs, panicking))
         .map(|&(job, _)| Linked(&shared.sched, job));
     let dropper = in_graph.map(|(job, _)| job);
-    let panicking = thread::panicking();
     let recheck = || {
         if ended() {
             return true;

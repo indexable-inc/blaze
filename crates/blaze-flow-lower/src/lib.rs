@@ -1249,7 +1249,7 @@ enum Agg {
 #[derive(Clone, Copy, Debug)]
 enum Task {
     Eval(ExprId, bool),
-    Adjust(ExprId, bool),
+    Adjust(ExprId, bool, u32),
     Stmt(StmtId),
     OpenTemps,
     CloseTemps(ExprId),
@@ -4565,7 +4565,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     fn step(&mut self, t: Task) -> Result<(), Refusal> {
         match t {
             Task::Eval(e, m) => self.eval(e, m),
-            Task::Adjust(e, m) => self.adjust(e, m),
+            Task::Adjust(e, m, skip) => self.adjust(e, m, skip),
             Task::Stmt(s) => self.stmt(s),
             Task::OpenTemps => {
                 self.temp_marks.push(self.temps.len() as u32);
@@ -4990,10 +4990,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     }
 
     fn eval(&mut self, e: ExprId, m: bool) -> Result<(), Refusal> {
-        self.tasks.push(Task::Adjust(e, m));
-        if self.place_capture_use(e)? {
+        if let Some(skip) = self.place_capture_use(e)? {
+            self.tasks.push(Task::Adjust(e, m, skip));
             return Ok(());
         }
+        self.tasks.push(Task::Adjust(e, m, 0));
         let ty = TyD::of(self.expr_ty(e)?);
         let body = self.body;
         match self.expr(e)? {
@@ -5518,8 +5519,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     }
 
     /// The expression's adjustments, in order, on its value.
-    fn adjust(&mut self, e: ExprId, m: bool) -> Result<(), Refusal> {
+    fn adjust(&mut self, e: ExprId, m: bool, skip: u32) -> Result<(), Refusal> {
         let (lo, hi) = self.adjust_rows(e);
+        let lo = lo.saturating_add(usize::try_from(skip).unwrap_or(usize::MAX)).min(hi);
         if lo == hi {
             return Ok(());
         }

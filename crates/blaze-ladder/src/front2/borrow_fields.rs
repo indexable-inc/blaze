@@ -775,7 +775,7 @@ pub(super) fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
         };
         let drop_impl = if is_root {
             adt_drop_impl
-        } else if inert || uncond_copy {
+        } else if inert || uncond_copy || langs.drop.is_none() {
             Some(false)
         } else {
             super::has_impl(r, langs.drop, key).ok()
@@ -1151,8 +1151,8 @@ mod field_row_tests {
     }
 
     /// `&'a (dyn Tr<'b> + 'c)` in `struct D<'a, 'b, 'c>`: the column is `['a, 'c, 'b]` (the
-    /// object's own slot before its trait's); the row is the reference's and the object's
-    /// positions, `['a, 'c]`, the trait's slot stepped over.
+    /// reference's slot, the object's own slot, then its trait's); the row walks `Dynamic` and
+    /// `ExTrait` in pre-order matching `RegionCol` / `RegionSlots`, yielding `['a, 'c, 'b]`.
     #[test]
     fn a_trait_objects_position_is_its_own_slot() {
         let mut t = PortableTys::new_in(a());
@@ -1160,7 +1160,7 @@ mod field_row_tests {
         let d = t.dynamic(&[principal]).unwrap();
         let r = t.intern(PNode::Ref(Mutbl::Not, d)).unwrap();
         let col = [Region::Param(0), Region::Param(2), Region::Param(1)];
-        assert_eq!(row(&t, r, &col, 3), Ok(std::vec![FieldRegion::Lifetime(0), FieldRegion::Lifetime(2)]));
+        assert_eq!(row(&t, r, &col, 3), Ok(std::vec![FieldRegion::Lifetime(0), FieldRegion::Lifetime(2), FieldRegion::Lifetime(1)]));
     }
 
     /// `fn(&u8, fn(&u8))`: two binders' variables are two bound regions, not one; a type

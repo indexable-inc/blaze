@@ -288,12 +288,18 @@ pub(crate) fn stop_begins(
     member: u32,
     dropper: JobId,
     theirs: &Scheduler,
+    panicking: bool,
 ) -> bool {
     let mut g = lock_joined(sched.cell(), || Some(Arc::clone(theirs.cell()))); // clone: a reference count
     if g.world.home(dropper).0 == member {
         return false;
     }
     g.world.stop_begins(dropper, member);
+    // Wake any parked job of `member` whose wait chain already closes a cycle through `dropper`
+    // under this same lock acquisition, before `check_stall` on a worker can observe the cycle
+    // and fail it with `Stalled` instead of `StopReason::Dropper`.
+    let woke = g.world.stop_own(member, super::StopReason::Dropper { dropper, panicking });
+    woke_failing(&mut g, woke);
     true
 }
 

@@ -1714,7 +1714,8 @@ mod std_readiness_tests {
 
     #[test]
     fn sota_mem_uxtw_idx_folding() {
-        let alloc = Alloc::global();
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
 
         // 1. Unscaled `ptr_add(base, zext(u32 -> u64, idx))` -> `ldr xt, [xn, wm, uxtw]`.
         let unscaled_fn = {
@@ -1739,12 +1740,10 @@ mod std_readiness_tests {
         let em_unscaled = Sota::standalone()
             .emit(verify(unscaled_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
             .expect("Sota emits unscaled MemUxtwIdx load");
-        let words_unscaled: std::vec::Vec<u32> = em_unscaled
-            .code
-            .as_slice()
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let mut words_unscaled = blaze_own::Vec::new_in(alloc);
+        for c in em_unscaled.code.as_slice().chunks_exact(4) {
+            words_unscaled.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        }
         assert!(
             words_unscaled.iter().any(|&w| (w & 0x3fe0_fc00) == 0x3860_4800),
             "expected folded `ldr [rn, wm, uxtw]` instruction, got: {words_unscaled:#x?}"
@@ -1785,12 +1784,10 @@ mod std_readiness_tests {
         let em_scaled = Sota::standalone()
             .emit(verify(scaled_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
             .expect("Sota emits scaled MemUxtwIdx load");
-        let words_scaled: std::vec::Vec<u32> = em_scaled
-            .code
-            .as_slice()
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let mut words_scaled = blaze_own::Vec::new_in(alloc);
+        for c in em_scaled.code.as_slice().chunks_exact(4) {
+            words_scaled.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        }
         assert!(
             words_scaled.iter().any(|&w| (w & 0x3fe0_fc00) == 0x3860_5800),
             "expected folded `ldr wt, [rn, wm, uxtw #2]` instruction, got: {words_scaled:#x?}"

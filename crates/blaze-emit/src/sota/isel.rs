@@ -10197,6 +10197,15 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                         }
                     }
                     emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, default_block, at + 3, default_argc);
+                    let def_range = view.block(Block(default_block));
+                    if default_argc == 0
+                        && !def_range.is_empty()
+                        && view.op(def_range.start) == Op::Unreachable
+                        && blaze_lir::verify::sole_switch_default(&view, Block(default_block)).is_some()
+                        && sr != X9
+                    {
+                        words.push(enc::mov(X9, sr));
+                    }
                     if next_block != Some(to_idx(default_block)) {
                         let widx = words.len();
                         words.push(enc::b(0));
@@ -10358,11 +10367,27 @@ pub(crate) fn emit_sota_a64_with_ipra<'a>(
                 Op::Unreachable => {
                     let ord = at_u32(&unreach_ord, inst);
                     if ord != u32::MAX {
+                        let blk = Block(u32_of(b));
+                        let held = if view.block(blk).start == inst
+                            && blaze_lir::verify::sole_switch_default(&view, blk).is_some()
+                            && (0..view.blocks()).any(|pb| {
+                                let term = view.terminator(Block(u32_of(pb)));
+                                if view.op(term) != Op::Switch {
+                                    return false;
+                                }
+                                let mut ops = view.operands(term);
+                                let _ = ops.value();
+                                ops.target().block == blk && dense_switch_plan(&view, term).is_none()
+                            }) {
+                            Held::Reg(9)
+                        } else {
+                            Held::Unknown
+                        };
                         out.traps.push(TrapRow {
                             at: u32_of(words.len() * 4),
                             kind: TrapKind::Intrinsic,
                             site: Some((0, ord)),
-                            held: Held::Unknown,
+                            held,
                             subject: None,
                         });
                     }

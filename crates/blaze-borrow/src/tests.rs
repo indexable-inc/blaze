@@ -1273,7 +1273,7 @@ fn an_impls_empty_column_clause_is_tied_where_it_names_a_region() {
     let facts = Facts::default().trait_(T_OTHER, 0).trait_(T_MARKER, 0).adt(K_WRAP, 0, &[Variance::Co, Variance::Co]);
     let marker_col = blaze_typeck::regions::RegionCol::lay(t.t.view(), marker_clause, &facts, NONE, alloc()).expect("`A: Marker`'s column is empty");
     assert_eq!(marker_col.len(), 0, "`A: Marker` writes no region");
-    let views = [blaze_typeck::region_facts::ClauseView { nth: 0, binders: 0, col: blaze_typeck::region_facts::ColView::of(&marker_col) }];
+    let views = [blaze_typeck::region_facts::ClauseView { nth: 0, binders: 0, col: blaze_typeck::region_facts::ColView::of(&marker_col), outlives: None }];
     let where_marker = ImplWhere { params: &[], outlives: &[], views: &views };
     let cols = Columns::new(t.t.view(), &facts, &facts);
 
@@ -1575,7 +1575,7 @@ fn assoc_item_bounds_prove_alias_trait_clauses() {
     let dest = arg(r, 3, 1);
 
     let item_col = blaze_typeck::regions::RegionCol::lay(t.t.view(), item_bound_ty, &facts, P00, alloc()).expect("item bound laid");
-    let cv = ClauseView { nth: 0, binders: 0, col: ColView::of(&item_col) };
+    let cv = ClauseView { nth: 0, binders: 0, col: ColView::of(&item_col), outlives: None };
     let sel_with = AssocSel { bound: Some((1, [cv])) };
     let (res, rec) = run(&cols, &sel_with, &Own::default(), 4, Callee::Fn(sig), generics, &args, dest);
     assert_eq!(res, Ok(()), "assoc item bound proves P::Searcher<'a>: Searcher<'a>: {res:?}");
@@ -1631,7 +1631,7 @@ fn higher_ranked_clause_instantiation_and_negative_control() {
     let generics = GenericArgs { lifetimes: range(0, 1), types: &types };
     let args = [arg(p0, 0, 0), arg(r, 1, 1)];
     let hrtb_col = blaze_typeck::regions::RegionCol::lay(t.t.view(), tr_r, &facts, L00, alloc()).expect("hrtb clause laid");
-    let own_hrtb = OwnClauses { views: [ClauseView { nth: 0, binders: 1, col: ColView::of(&hrtb_col) }] };
+    let own_hrtb = OwnClauses { views: [ClauseView { nth: 0, binders: 1, col: ColView::of(&hrtb_col), outlives: None }] };
     let (res, rec) = run(&cols, &Sel::default(), &own_hrtb, 2, Callee::Fn(sig), generics, &args, arg(unit, 2, 0));
     assert_eq!(res, Ok(()), "for<'a> Tr<&'a u8> proves Tr<&'x u8>: {res:?}");
     assert!(!rejects(&rec, &[1], &[10]), "local slot 1 does not reach any universal: {:?}", rec.subsets);
@@ -1645,7 +1645,7 @@ fn higher_ranked_clause_instantiation_and_negative_control() {
     let generics_hr = GenericArgs { lifetimes: SlotRange::EMPTY, types: &types };
     let args_hr = [arg(p0, 0, 0)];
     let fixed_col = blaze_typeck::regions::RegionCol::lay(t.t.view(), tr_r, &facts, P0, alloc()).expect("fixed clause laid");
-    let own_fixed = OwnClauses { views: [ClauseView { nth: 0, binders: 0, col: ColView::of(&fixed_col) }] };
+    let own_fixed = OwnClauses { views: [ClauseView { nth: 0, binders: 0, col: ColView::of(&fixed_col), outlives: None }] };
     let (res, rec) = run(&cols, &Sel::default(), &own_fixed, 1, Callee::Fn(sig_hr), generics_hr, &args_hr, arg(unit, 1, 0));
     assert_eq!(res, Ok(()), "clause Skolemization emits placeholder constraint: {res:?}");
     assert!(!rec.placeholders.is_empty(), "callee's for<'b> must create a rigid placeholder");

@@ -250,12 +250,13 @@ pub struct Solver<'a, E = NoDerivation> {
     maybe: MaybeLog<'a>,
     /// Whether [`Solver::why_maybe`] is running: every hook of its rows tests this one flag.
     maybe_on: bool,
-    /// The plain-goal memo: a goal with no inference variable, by its own identity (mode,
-    /// env id, interned predicate handles, bound count), to its interned canonical input.
-    /// Such a goal's canonical words are a function of those handles alone (`goal_input`
-    /// reads `tys` only to resolve variables), so a hit skips the canonical walk. Only goals
-    /// whose canonical form has no variable are kept; at most [`MAX_PLAIN`] entries.
-    plain: Map<(TypingMode, Goal), u32, FixedState, Alloc<'a>>,
+    /// The plain-goal memo: a goal whose shallow-resolved top-level terms hold no bindable
+    /// inference variable, keyed by its resolved handles (mode, env id, bound count, resolved
+    /// predicate), to its interned canonical input. Such a goal's canonical words are a function
+    /// of those handles alone (`goal_input` reads `tys` only to resolve variables), so a hit
+    /// skips the canonical walk. Only goals whose canonical form has no variable are kept; at
+    /// most [`MAX_PLAIN`] entries.
+    plain: Map<PlainKey, u32, FixedState, Alloc<'a>>,
     /// Whether the root being solved shares its goals (its source hands a table:
     /// `facts::Source::goals`): `finish` then keeps each final goal in `share_new`.
     sharing: bool,
@@ -499,6 +500,80 @@ impl<'a> Solver<'a, Derivations<'a>> {
     pub fn derivations(&self) -> &Derivations<'a> {
         &self.emit
     }
+}
+
+/// Key of the plain-goal memo (`Solver::plain`): a goal whose shallow-resolved top-level terms
+/// hold no bindable inference variable. Storing shallow-resolved term handles for the common
+/// predicate shapes avoids re-canonicalizing nested goals whose arguments are already-bound
+/// inference variables or freshly interned argument lists.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PlainKey {
+    mode: TypingMode,
+    env: EnvId,
+    bound: u32,
+    pred: PlainPred,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum PlainPred {
+    Trait1(Def, Polarity, Ty),
+    Trait2(Def, Polarity, Ty, Ty),
+    Trait3(Def, Polarity, Ty, Ty, Ty),
+    WellFormed(Ty),
+    NormalizesTo(Ty, Ty),
+    Projection(Ty, Ty),
+    Other(Pred),
+}
+
+fn plain_key<T: Tys>(tys: &T, mode: TypingMode, goal: Goal) -> Result<Option<PlainKey>, Stop> {
+    let infer_flags = if T::REGIONS_BIND { Flags::HAS_INFER | Flags::HAS_RE_INFER } else { Flags::HAS_INFER };
+    let resolve_plain = |t: Ty| -> Option<Ty> {
+        let r = tys.shallow_resolve(t);
+        (!tys.flags(r).has(infer_flags)).then_some(r)
+    };
+    let pred = match goal.pred {
+        Pred::Trait { trait_, args, polarity } if args.len == 1 => {
+            let Some(a0) = resolve_plain(tys.list_get(args, 0)) else { return Ok(None) };
+            PlainPred::Trait1(trait_, polarity, a0)
+        }
+        Pred::Trait { trait_, args, polarity } if args.len == 2 => {
+            let Some(a0) = resolve_plain(tys.list_get(args, 0)) else { return Ok(None) };
+            let Some(a1) = resolve_plain(tys.list_get(args, 1)) else { return Ok(None) };
+            PlainPred::Trait2(trait_, polarity, a0, a1)
+        }
+        Pred::Trait { trait_, args, polarity } if args.len == 3 => {
+            let Some(a0) = resolve_plain(tys.list_get(args, 0)) else { return Ok(None) };
+            let Some(a1) = resolve_plain(tys.list_get(args, 1)) else { return Ok(None) };
+            let Some(a2) = resolve_plain(tys.list_get(args, 2)) else { return Ok(None) };
+            PlainPred::Trait3(trait_, polarity, a0, a1, a2)
+        }
+        Pred::WellFormed(t) => {
+            let Some(r) = resolve_plain(t) else { return Ok(None) };
+            PlainPred::WellFormed(r)
+        }
+        Pred::NormalizesTo { alias, term } => {
+            let Some(a) = resolve_plain(alias) else { return Ok(None) };
+            let Some(t) = resolve_plain(term) else { return Ok(None) };
+            PlainPred::NormalizesTo(a, t)
+        }
+        Pred::Projection { alias, term } => {
+            let Some(a) = resolve_plain(alias) else { return Ok(None) };
+            let Some(t) = resolve_plain(term) else { return Ok(None) };
+            PlainPred::Projection(a, t)
+        }
+        other => {
+            let mut ok = true;
+            pred_terms(tys, other, &mut |t| {
+                ok &= !tys.flags(t).has(infer_flags);
+                Ok(())
+            })?;
+            if !ok {
+                return Ok(None);
+            }
+            PlainPred::Other(other)
+        }
+    };
+    Ok(Some(PlainKey { mode, env: goal.env, bound: goal.bound, pred }))
 }
 
 impl<'a, E: Emit> Solver<'a, E> {
@@ -1093,14 +1168,10 @@ impl<'a, E: Emit> Solver<'a, E> {
     /// (`canonicalized`). `self.words` holds the canonical words only after a walk: read them
     /// back by `Inputs::words_of`.
     fn input_of<T: Tys>(&mut self, tys: &T, mode: TypingMode, goal: Goal) -> Result<u32, Stop> {
-        let mut plain = !self.scratch.off.memo;
-        if plain {
-            pred_terms(tys, goal.pred, &mut |t| {
-                plain &= !tys.flags(t).has(Flags::HAS_INFER | Flags::HAS_RE_INFER);
-                Ok(())
-            })?;
-        }
-        if plain && let Some(&input) = self.plain.get(&(mode, goal)) {
+        let key = if !self.scratch.off.memo { plain_key(tys, mode, goal)? } else { None };
+        if let Some(k) = key
+            && let Some(&input) = self.plain.get(&k)
+        {
             self.canon.clear();
             self.scratch.stats.canon_skipped += 1;
             return Ok(input);
@@ -1109,8 +1180,11 @@ impl<'a, E: Emit> Solver<'a, E> {
         self.scratch.stats.canonicalized += 1;
         self.scratch.stats.canon_words += self.words.len() as u64;
         let input = self.inputs.intern(&self.words)?;
-        if plain && self.canon.orig.is_empty() && self.plain.len() < MAX_PLAIN {
-            let _ = self.plain.insert((mode, goal), input);
+        if let Some(k) = key
+            && self.canon.orig.is_empty()
+            && self.plain.len() < MAX_PLAIN
+        {
+            let _ = self.plain.insert(k, input);
         }
         Ok(input)
     }
