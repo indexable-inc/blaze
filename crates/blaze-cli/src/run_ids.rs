@@ -864,6 +864,12 @@ pub(crate) fn workspace_of_scoped<'a>(cx: &Cx, answer: &mut dyn Answer, tool: To
     for check in checks.iter().copied() {
         if let Some(held) = answer.body(cx, check, tool, None, &mut scratch)? {
             for item in scratch.covers.iter().copied() {
+                if from == WalkFrom::UnitRoots && !units.iter().any(|unit| unit.prefix == prefix_of(item)) {
+                    // Under a scoped walk, a plain row reused from a whole-workspace answer may
+                    // cover an out-of-scope holder of the same file (e.g. a non-test bin unit when
+                    // running `blaze test --bin`); skip keys outside the active member units.
+                    continue;
+                }
                 bodies.push(WorkspaceBody { item, check, text: held.text, file: held.file });
             }
             continue;
@@ -1707,6 +1713,27 @@ impl<'a> RunIds<'a> {
         most: Most,
         bump: Bump<'a>,
     ) -> Result<RunIds<'a>, RunIdsError<'n>> {
+        RunIds::new_scoped(cx, toolchain, crates, None, tools, workspace, edges, answer, previous, most, bump)
+    }
+
+    /// [`RunIds::new`], optionally restricted to the transitive unit closure `scoped`. When
+    /// `scoped` is `Some`, out-of-scope crates are excluded from crate rows, locked closure
+    /// digests, and validation so unrelated workspace crates (such as a locked crate patched
+    /// onto a vendored checkout crate outside the target's closure) never block a scoped start.
+    #[expect(clippy::too_many_arguments, reason = "the seam's edge: each argument one input the command already holds")]
+    pub(crate) fn new_scoped<'n, C: CrateTable<'n> + ?Sized>(
+        cx: &Cx,
+        toolchain: ToolchainId,
+        crates: &C,
+        scoped: Option<&crate::engine_check::ScopedUnits>,
+        tools: &[Tool; blaze_drive::key::KINDS],
+        workspace: &[WorkspaceBody],
+        edges: &[Edge],
+        answer: &mut dyn Answer,
+        previous: Option<&RunIds<'_>>,
+        most: Most,
+        bump: Bump<'a>,
+    ) -> Result<RunIds<'a>, RunIdsError<'n>> {
         let _cx = cx.span("run ids: the body ids of the program's crates");
         let alloc = bump.alloc();
         let producers = {
@@ -1722,9 +1749,12 @@ impl<'a> RunIds<'a> {
 
         // The crates' grains, and each locked crate's closure digest.
         let n = crates.len();
-        let digests = locked_digests(crates, toolchain, alloc)?;
+        let digests = locked_digests(crates, toolchain, scoped, alloc)?;
         let mut rows: AVec<'a, CrateRow> = Vec::with_capacity_in(n, alloc);
         for at in 0..n {
+            if scoped.is_some_and(|s| !s.allows(at)) {
+                continue;
+            }
             let key = crates.key(at);
             let grain = match crates.place(at) {
                 Place::Toolchain => CrateGrain::Toolchain,
@@ -2235,7 +2265,12 @@ pub(crate) fn cell_fact(name: Name, cell: Cell) -> [u8; 32] {
 /// its pack and its dependencies' digests; a toolchain crate's the toolchain's id; a checkout
 /// crate's [`ABSENT`] (never read: its bodies are keyed by their checks). Iterative, each crate
 /// hashed once: O(crates + dependency edges).
-fn locked_digests<'n, 'a, C: CrateTable<'n> + ?Sized>(crates: &C, toolchain: ToolchainId, alloc: Alloc<'a>) -> Result<AVec<'a, [u8; 32]>, RunIdsError<'n>> {
+fn locked_digests<'n, 'a, C: CrateTable<'n> + ?Sized>(
+    crates: &C,
+    toolchain: ToolchainId,
+    scoped: Option<&crate::engine_check::ScopedUnits>,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, [u8; 32]>, RunIdsError<'n>> {
     const UNSEEN: u8 = 0;
     const OPEN: u8 = 1;
     const DONE: u8 = 2;
@@ -2248,7 +2283,7 @@ fn locked_digests<'n, 'a, C: CrateTable<'n> + ?Sized>(crates: &C, toolchain: Too
     // (row, its dependencies pushed)
     let mut stack: AVec<'a, (usize, bool)> = Vec::new_in(alloc);
     for root in 0..n {
-        if !matches!(crates.place(root), Place::Fetched { .. }) || state[root] == DONE {
+        if scoped.is_some_and(|s| !s.allows(root)) || !matches!(crates.place(root), Place::Fetched { .. }) || state[root] == DONE {
             continue;
         }
         stack.push((root, false));

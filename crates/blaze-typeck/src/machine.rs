@@ -2609,9 +2609,10 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             let (next, overloaded) = match self.view(cur) {
                 TyView::Ref(_, t) => (t, false),
                 TyView::Ptr(_, t) if raw_ptrs => (t, false),
-                // An object can itself implement Deref, e.g. `impl Deref for dyn Inspector`.
-                // Its Target is another receiver step with its own inherent methods.
-                TyView::Adt(..) | TyView::Param(_) | TyView::Opaque(..) | TyView::Dynamic(_) => {
+                // An object or rigid associated type projection can itself implement Deref, e.g.
+                // `impl Deref for dyn Inspector` or `type Guard<'a, T>: DerefMut<Target = T>`.
+                // Its Target is another receiver step with its own inherent methods and fields.
+                TyView::Adt(..) | TyView::Param(_) | TyView::Opaque(..) | TyView::Alias { .. } | TyView::Dynamic(_) => {
                     match self.overloaded_deref_at(cur, DerefAt::Autoderef)? {
                         Some(t) => (t, true),
                         None => return Ok((steps, false)),

@@ -270,3 +270,75 @@ fn control_without_the_bounds_the_body_is_refused() {
     let d = diags_shown(&fx, &c);
     assert!(c.diags.iter().any(|x| x.code == DiagCode::Unsatisfied), "no E0277 without the bounds:\n{}", d.join("\n"));
 }
+
+/// A rigid associated type projection with `DerefMut<Target = Writer>` autoderefs for both field
+/// access (`guard.used`) and `&mut guard` -> `&mut Writer` coercion (`blaze-hash/src/shared.rs`
+/// `ShardLock::Guard`). Control: without the `Deref`/`DerefMut` bounds, both fail cleanly.
+#[test]
+fn rigid_projection_autoderefs_for_field_and_deref_mut_coercion() {
+    let run = |with_deref_bounds: bool| {
+        let mut world = Fx::new();
+        let fx = &mut world;
+        let sized = fx.tr("Sized", 1, Default::default(), &[]);
+        fx.lang(LangItem::Sized, sized);
+        let deref = fx.tr("Deref", 1, Default::default(), &["Target"]);
+        fx.lang(LangItem::Deref, deref);
+        let p0 = fx.param(0);
+        let super_deref = fx.bound(deref, &[p0]);
+        let deref_mut = fx.tr("DerefMut", 1, From::from([super_deref]), &[]);
+        fx.lang(LangItem::DerefMut, deref_mut);
+
+        let usize_ = fx.usize();
+        let writer = fx.strukt("Writer", 0, &[("used", usize_)]);
+        let writer_ty = fx.adt(writer, &[]);
+        let mut_writer = fx.r(Mutbl::Mut, writer_ty);
+        let unit = fx.unit();
+        let take_writer = fx.func("take_writer", 0, &[mut_writer], unit, Default::default());
+
+        let lock_tr = fx.tr("ShardLock", 1, Default::default(), &["Guard"]);
+        let guard_alias = fx.alias(lock_tr, "Guard", &[p0]);
+        if with_deref_bounds {
+            let is_sized = fx.bound(sized, &[guard_alias]);
+            let is_deref_mut = fx.bound(deref_mut, &[guard_alias]);
+            let target_writer = fx.proj(deref, &[guard_alias], "Target", writer_ty);
+            fx.set_assoc_bounds(lock_tr, "Guard", From::from([is_sized, is_deref_mut, target_writer]));
+        } else {
+            let is_sized = fx.bound(sized, &[guard_alias]);
+            fx.set_assoc_bounds(lock_tr, "Guard", From::from([is_sized]));
+        }
+        fx.use_path("take_writer", Def::Fn(take_writer));
+
+        let is_lock = fx.bound(lock_tr, &[p0]);
+        let f = fx.func("use_guard", 1, &[guard_alias], usize_, From::from([is_lock]));
+        fx.finish();
+
+        // fn use_guard<L: ShardLock>(mut guard: L::Guard) -> usize {
+        //     take_writer(&mut guard);
+        //     guard.used
+        // }
+        let mut b = Bb::new();
+        let g = b.param("guard");
+        let callee = b.path(&["take_writer"]);
+        let g0 = b.local(g);
+        let r_mut = b.borrow(Mutbl::Mut, g0);
+        let call = b.call(callee, &[r_mut]);
+        let s0 = b.semi(call);
+        let g1 = b.local(g);
+        let field = b.e(crate::body::Expr::Field { base: g1, name: crate::ids::Name::of("used") });
+        let root = b.block(&[s0], Some(field));
+
+        let c = check_body(&world, &b, f, root, Plant::None, InferPlant::None);
+        let has_mismatch = c.diags.iter().any(|d| d.code == DiagCode::Mismatch);
+        let has_prim_field = c.diags.iter().any(|d| d.code == DiagCode::PrimitiveField);
+        (diags_shown(&world, &c), has_mismatch, has_prim_field)
+    };
+
+    let (clean_shown, _, _) = run(true);
+    assert!(clean_shown.is_empty(), "rigid projection with DerefMut<Target = Writer> should autoderef cleanly:\n{}", clean_shown.join("\n"));
+    let (ctrl_shown, has_mismatch, has_prim_field) = run(false);
+    assert!(
+        has_mismatch && has_prim_field,
+        "control without DerefMut bound must report Mismatch + PrimitiveField:\n{}",
+        ctrl_shown.join("\n")
+    );
+}
