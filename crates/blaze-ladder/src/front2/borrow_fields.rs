@@ -343,6 +343,31 @@ fn read_copy_impl<'a>(store: &Store<'_>, langs: super::BorrowLangs, adt: tc::Ite
     let sized = sized.or_else(|| store.sized.map(checker_of));
     let adt_preds = store.preds.get(&adt)?;
     for c in store.preds.get(&imp)?.clauses.iter() {
+        if let tc::PClause::TypeOutlives { ty, region } = *c {
+            // A `T: 'r` clause already required by the ADT's own predicates (e.g.
+            // `struct ReflectVtable<T: 'static, A>` with `impl<T: 'static, A> Copy`) is
+            // implied by well-formedness of any value of the ADT.
+            let implied = tys
+                .node(ty)
+                .ok()
+                .and_then(|n| match n {
+                    tc::PNode::Param(p) => param_of.iter().position(|&q| q == Some(p)),
+                    _ => None,
+                })
+                .is_some_and(|j| {
+                    adt_preds.clauses.iter().any(|ac| {
+                        matches!(
+                            *ac,
+                            tc::PClause::TypeOutlives { ty: aty, region: ar }
+                                if ar == region && matches!(tys.node(aty), Ok(tc::PNode::Param(q)) if q as usize == j)
+                        )
+                    })
+                });
+            if implied {
+                continue;
+            }
+            return None;
+        }
         let tc::PClause::Trait { trait_, args: cargs } = *c else { return None };
         // `PointeeSized` and `Destruct` hold for every type and ask nothing of the arguments.
         if Some(trait_) == pointee_sized || Some(trait_) == destruct {
