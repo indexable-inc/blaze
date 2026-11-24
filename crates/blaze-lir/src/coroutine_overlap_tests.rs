@@ -37,12 +37,16 @@ fn awaits_body(t: &Tape) -> Result<(Func<Global>, Shape), BuildError> {
     b.begin(entry);
     let (_state, cx) = (b.param(Ty::PTR), b.param(Ty::I64));
     let count = 2 + t.below(3, "futures") as usize;
-    let mut futures = Vec::new();
+    let test_alloc = blaze_own::testing::heap().alloc();
+    let mut futures = blaze_own::AVec::new_in(test_alloc);
     for _ in 0..count {
         let cells = 1 + t.below(FUTURE_CELLS_MOST, "a future's cells") as u32;
         futures.push((b.slot(8 * cells, 3, SlotKind::Temp), cells));
     }
-    let mut live = vec![false; count];
+    let mut live = blaze_own::AVec::new_in(test_alloc);
+    for _ in 0..count {
+        live.push(false);
+    }
     let (mut made, mut points) = (0u64, 0u32);
     let finish = |b: &mut Builder<Global, Full>, (slot, cells): (SlotId, u32)| {
         for cell in 0..cells {

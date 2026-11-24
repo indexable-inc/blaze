@@ -121,7 +121,7 @@ impl World {
                 bytes[8 * i + j] = Byte::Int((upvar >> (8 * j)) as u8);
             }
         }
-        World { regions: vec![Region { bytes, live: true }], trace: Vec::new(), fuel: FUEL }
+        World { regions: vec![Region { bytes, live: true }], trace: Default::default(), fuel: FUEL }
     }
 
     fn frame(&mut self, view: View<'_>) -> Frame {
@@ -222,11 +222,11 @@ fn mask(value: u64, ty: Ty) -> u64 {
 
 /// The target's parameters take its arguments, all read before any is written.
 fn enter(frame: &mut Frame, view: View<'_>, to: Target<'_>) -> Result<Block, Fault> {
-    let mut args = Vec::new();
+    let mut args = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
     for value in to.args.iter() {
         args.push(get(frame, value)?);
     }
-    for (param, arg) in view.params(to.block).zip(args) {
+    for (param, &arg) in view.params(to.block).zip(args.iter()) {
         frame.values[param] = Some(arg);
     }
     Ok(to.block)
@@ -500,12 +500,15 @@ fn agree<A: Allocator>(view: View<'_>, shape: Shape, split: &Split<A>, upvars: [
     }
     let full = direct(view, shape, upvars, None).map_err(|f| Broke::Harness(format!("the direct run: {f}\n{}", texts())))?;
     let yields = full.iter().filter(|event| matches!(event, Event::Out(values) if values.first() == Some(&PENDING))).count() as u32;
-    let mut schedules = vec![None];
-    schedules.extend((0..=yields.min(4)).map(Some));
+    let mut schedules = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+    schedules.push(None);
+    for k in 0..=yields.min(4) {
+        schedules.push(Some(k));
+    }
     if yields > 4 {
         schedules.push(Some(yields));
     }
-    for cancel in schedules {
+    for &cancel in schedules.iter() {
         let want = direct(view, shape, upvars, cancel)
             .map_err(|f| Broke::Harness(format!("the direct run: {f} (cancel {cancel:?})\n{}", texts())))?;
         let got = machine(split, upvars, cancel, u64::from(yields) + 2)

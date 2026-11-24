@@ -650,11 +650,10 @@ impl<F: Facts> Selected for CallSel<'_, F> {
             loose
         };
         let Some(r) = found else {
-            // If no call row answers, check the body owner's own enclosing trait impl (for
-            // projections on `Self` inside the caller's own `where`-clauses, e.g. `Cycle<I>::Item`,
-            // `Zip<A, B>::Item`, `(&T0, &T1)::Item`).
-            if let Some(oti) = self.facts.owner_trait_impl()
-                && oti.trait_ == ask.trait_
+            // If no call row answers, check the body owner's own enclosing trait impl (and its
+            // supertrait impls for the same `SelfTy`, e.g. `Cloned<I>: Iterator` inside
+            // `impl DoubleEndedIterator for Cloned<I>`).
+            if let Some(oti) = self.facts.owner_trait_impl(ask.trait_)
                 && args.self_shape() == Some(oti.self_shape)
             {
                 return self.impl_at_count(ask, oti.imp, oti.generics);

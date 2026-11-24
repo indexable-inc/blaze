@@ -116,7 +116,7 @@ impl<'b, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> {
             Some(consts) => match consts.iter().find(|(i, _)| *i == index) {
                 Some(&(_, t)) => Ok(t),
                 None => Err(Why::Program(
-                    format!("`{shown}`: argument {} of a generic associated type is a constant; that parameter of the associated type is not a const parameter", index + 1).into_boxed_str(),
+                    format!("{shown}: argument {} of a generic associated type is a constant; that parameter of the associated type is not a const parameter", index + 1).into_boxed_str(),
                     r,
                 )),
             },

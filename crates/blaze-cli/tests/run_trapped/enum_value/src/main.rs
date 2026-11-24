@@ -51,8 +51,16 @@ unsafe fn make(size: usize, align: usize) -> L {
 }
 
 #[inline(never)]
-fn pass(l: L) -> L {
-    l
+fn inspect(l: L) -> i32 {
+    match l.align {
+        Two::One => 1,
+        Two::Other => 2,
+    }
+}
+
+#[inline(never)]
+fn pass(l: L) -> i32 {
+    inspect(l) + 1
 }
 
 /// `make` one call below `run`, as core's `Layout::from_size_align_unchecked` is below its
@@ -65,11 +73,7 @@ fn build(size: usize, align: usize) -> L {
 
 #[inline(never)]
 fn run() -> i32 {
-    let l = pass(build(8, three()));
-    match l.align {
-        Two::One => 1,
-        Two::Other => 2,
-    }
+    pass(build(8, three())) + 1
 }
 
 // `extern "C-unwind"`, as run_trapped/abort's `main` is and for its reason: no

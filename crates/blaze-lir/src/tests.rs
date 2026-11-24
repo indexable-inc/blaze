@@ -208,7 +208,8 @@ impl<S: Sink> Gen<S> {
             crate::ty::Form::Vector => {
                 let n = ty.const_words() as usize;
                 let bits = ty.bits(self.b.ptr_bits());
-                let mut words = vec![seed; n];
+                let mut words = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+                words.resize(n, seed);
                 let spare = 32 * n as u32 - bits;
                 if spare > 0 {
                     words[n - 1] &= u32::MAX >> spare;

@@ -496,7 +496,7 @@ type FpCopyLoc = CopyLoc<true>;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RematWrite {
     Const(u64),
-    Global(u32),
+    GlobalSym(u32),
 }
 
 /// Pre-resolved relocation plan for a rematerialized `Op::DataAddr` / `Op::FuncAddr`.
@@ -4608,7 +4608,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
     let emit_remat_write_reg = |words: &mut Vec<u32, Alloc<'a>>, rd: Reg, w: RematWrite| {
         match w {
             RematWrite::Const(cval) => emit_const_u64(words, rd, cval),
-            RematWrite::Global(g_inst) => emit_remat_global(words, rd, g_inst),
+            RematWrite::GlobalSym(g_inst) => emit_remat_global(words, rd, g_inst),
         }
     };
 
@@ -5156,7 +5156,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                         AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
                         AllocLoc::RematConst(cval) => const_writes.push((dst, RematWrite::Const(cval))),
-                        AllocLoc::RematGlobal(g_inst) => const_writes.push((dst, RematWrite::Global(g_inst))),
+                        AllocLoc::RematGlobal(g_inst) => const_writes.push((dst, RematWrite::GlobalSym(g_inst))),
                         AllocLoc::None => {
                             if let Some(cval) = at_opt(&const_u64, to_idx(src_v)) {
                                 const_writes.push((dst, RematWrite::Const(cval)));
@@ -5173,7 +5173,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                         AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                         AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
                         AllocLoc::RematConst(cval) => const_writes.push((dst, RematWrite::Const(cval))),
-                        AllocLoc::RematGlobal(g_inst) => const_writes.push((dst, RematWrite::Global(g_inst))),
+                        AllocLoc::RematGlobal(g_inst) => const_writes.push((dst, RematWrite::GlobalSym(g_inst))),
                         AllocLoc::None => {
                             if let Some(cval) = at_opt(&const_u64, to_idx(src_v)) {
                                 const_writes.push((dst, RematWrite::Const(cval)));
@@ -8013,7 +8013,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                                 AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
                                 AllocLoc::RematConst(cval) => const_edge_writes.push((dst, RematWrite::Const(cval))),
-                                AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::Global(g_inst))),
+                                AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::GlobalSym(g_inst))),
                                 AllocLoc::None => {
                                     let cval = at_opt(&const_u64, to_idx(arg_v)).ok_or(TierError::Refused {
                                         tier: TIER,
@@ -8201,7 +8201,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                             AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
                             AllocLoc::RematConst(cval) => const_edge_writes.push((dst, RematWrite::Const(cval))),
-                            AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::Global(g_inst))),
+                            AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::GlobalSym(g_inst))),
                             AllocLoc::None => {
                                 let cval = at_opt(&const_u64, to_idx(arg_v)).ok_or(TierError::Refused {
                                     tier: TIER,
@@ -8238,7 +8238,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                                 AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
                                 AllocLoc::RematConst(cval) => const_edge_writes.push((dst, RematWrite::Const(cval))),
-                                AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::Global(g_inst))),
+                                AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::GlobalSym(g_inst))),
                                 AllocLoc::None => {
                                     let cval = at_opt(&const_u64, to_idx(arg_v)).ok_or(TierError::Refused {
                                         tier: TIER,
@@ -8356,7 +8356,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                                 AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
                                 AllocLoc::RematConst(cval) => const_edge_writes.push((dst, RematWrite::Const(cval))),
-                                AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::Global(g_inst))),
+                                AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::GlobalSym(g_inst))),
                                 AllocLoc::None => {
                                     let cval = at_opt(&const_u64, to_idx(arg_v)).ok_or(TierError::Refused {
                                         tier: TIER,
@@ -8531,7 +8531,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                     const_edge_writes.push((dst, RematWrite::Const(imm)));
                                 }
                                 AllocLoc::RematGlobal(g_inst) => {
-                                    const_edge_writes.push((dst, RematWrite::Global(g_inst)));
+                                    const_edge_writes.push((dst, RematWrite::GlobalSym(g_inst)));
                                 }
                                 _ => {
                                     let r = load_gpr(&mut words, arg_v, X16);
@@ -10692,7 +10692,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                         AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                                         AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
                                         AllocLoc::RematConst(cval) => const_edge_writes.push((dst, RematWrite::Const(cval))),
-                                        AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::Global(g_inst))),
+                                        AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::GlobalSym(g_inst))),
                                         AllocLoc::None => {
                                             let cval = at_opt(&const_u64, to_idx(arg_v)).ok_or(TierError::Refused {
                                                 tier: TIER,
@@ -11546,7 +11546,7 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                                 AllocLoc::Gpr(s) => gpr_moves.push((dst, GprCopyLoc::Reg(u32::from(s)))),
                                 AllocLoc::GprSpill(s) => gpr_moves.push((dst, GprCopyLoc::Spill(s))),
                                 AllocLoc::RematConst(cval) => const_edge_writes.push((dst, RematWrite::Const(cval))),
-                                AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::Global(g_inst))),
+                                AllocLoc::RematGlobal(g_inst) => const_edge_writes.push((dst, RematWrite::GlobalSym(g_inst))),
                                 AllocLoc::None => {
                                     let cval = at_opt(&const_u64, to_idx(rv)).ok_or(TierError::Refused {
                                         tier: TIER,

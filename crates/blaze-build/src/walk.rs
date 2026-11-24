@@ -3908,7 +3908,13 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let st = self.matches.pop().ok_or(malformed("a match's state out of order"))?;
                 let none = self.arm_blocks[(st.first + st.arms) as usize];
                 self.begin(none);
-                self.unreachable_of(TrapKind::MatchNoArm, Some(st.expr));
+                if let Some((_, _, id)) = st.of_enum
+                    && let Variants::Multiple { count, .. } = self.ls.get(id).variants
+                {
+                    self.unreachable_of_enum(id, count, Some(st.expr))?;
+                } else {
+                    self.unreachable_of(TrapKind::MatchNoArm, Some(st.expr));
+                }
                 self.arm_blocks.truncate(st.first as usize);
                 self.begin(st.join);
                 let v = self.join_value(st.repr, st.res);
@@ -5603,7 +5609,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let at = self.home(home);
                 self.push_val(V::Place(at.0, at.1), None);
             }
-            Expr::Path(_) if matches!(self.expr_def(e), Some(Def::Static(..))) => {
+            Expr::Path(_) if matches!(self.expr_def(e), Some(Def::Static(item, _)) if !self.adts.static_item(item).is_some_and(|s| s.extern_weak)) => {
                 let at = self.static_addr(e)?;
                 self.push_val(V::Place(at, 0), None);
             }
@@ -5709,17 +5715,30 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         let v = self.const_param_value(e, index)?;
                         self.push_val(v, None);
                     }
-                    // A static by value: a copy read from its memory.
-                    (_, Some(Def::Static(..))) => {
+                    // A static by value: a copy read from its memory (except foreign
+                    // `#[linkage = "extern_weak"]`, which evaluates to the symbol's address
+                    // directly — e.g. `Option<fn>` or `*mut u8` — never dereferencing `*(&sym)`).
+                    (_, Some(Def::Static(item, _))) => {
                         let at = self.static_addr(e)?;
                         let repr = self.expr_repr(e)?;
-                        let v = match repr {
-                            Repr::Agg(_) => {
-                                let to = self.temp(repr);
-                                self.copy(repr, (at, 0), to)?;
-                                V::Place(to.0, to.1)
+                        let v = if self.adts.static_item(item).is_some_and(|s| s.extern_weak) {
+                            match repr {
+                                Repr::Agg(_) => {
+                                    let to = self.temp(repr);
+                                    self.store(V::Scalar(at), Repr::Ptr, to)?;
+                                    V::Place(to.0, to.1)
+                                }
+                                _ => V::Scalar(at),
                             }
-                            _ => self.load(repr, (at, 0)),
+                        } else {
+                            match repr {
+                                Repr::Agg(_) => {
+                                    let to = self.temp(repr);
+                                    self.copy(repr, (at, 0), to)?;
+                                    V::Place(to.0, to.1)
+                                }
+                                _ => self.load(repr, (at, 0)),
+                            }
                         };
                         self.push_val(v, None);
                     }

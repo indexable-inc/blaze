@@ -905,7 +905,9 @@ fn count(c: &CrateNames<'static>, std_absent: bool) -> Counts {
         tally(d);
     }
     for e in c.expansions.values() {
-        tally(&e.decls);
+        if let Some(d) = e.decls() {
+            tally(d);
+        }
     }
     for m in c.made.values() {
         tally(&m.decls);

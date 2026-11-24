@@ -7,4 +7,5 @@ self-hosted-runner:
     - ix
     - ix-mode-cold
     - ix-cpu-*
+    - blaze
     - blaze-*

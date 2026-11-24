@@ -943,7 +943,6 @@ mod tests {
     fn tell_parent_fits_a_16kib_signal_stack() {
         use blaze_launch::wire::split;
         use blaze_sys::posix::net::{AF_UNIX, SOCK_STREAM, socketpair};
-        use blaze_sys::posix::thread::{pthread_kill, pthread_self};
 
         static TEST_FD: AtomicI32 = AtomicI32::new(-1);
         static TEST_SCRATCH: AtomicPtr<Scratch> = AtomicPtr::new(ptr::null_mut());
@@ -1016,9 +1015,8 @@ mod tests {
         let set_act_ok = unsafe { os::set_action(os::SIGUSR1, &act) }.is_ok();
         assert!(set_act_ok, "set_action(SIGUSR1) failed");
 
-        // SAFETY: `pthread_self()` is this live thread and `SIGUSR1` is handled above.
-        let kill_rc = unsafe { pthread_kill(pthread_self(), os::SIGUSR1) };
-        assert_eq!(kill_rc, 0, "pthread_kill(SIGUSR1) failed");
+        let raise_res = os::raise_signal(os::SIGUSR1);
+        assert!(raise_res.is_ok(), "raise_signal(SIGUSR1) failed: {raise_res:?}");
 
         // SAFETY: restoring the thread's prior signal action and alternate stack.
         let _ = unsafe { os::set_action(os::SIGUSR1, &prev_action) };

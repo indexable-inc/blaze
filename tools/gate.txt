@@ -1,37 +1,18 @@
-# The gate: every check the tree is held to without a compiler of its own, one row a check, in the
-# order they run. The ONE list: `just lint` and blaze.yaml's `scripts` job both run it through
-# scripts/src/bin/gate.rs (`{"command": "run"}`), which first checks that neither runs a check
-# outside it (`{"command": "check"}`: a gate that runs different things in two places is two
-# gates). The cargo job (check and the workspace's tests) and the lean job are not here: they
-# build.
+# The gate: every check the tree is held to without compiling the workspace, one row a check, in
+# order. Both `just lint` and blaze.yaml's `scripts` job run this exact list via
+# scripts/src/bin/gate.rs (zero Python).
 #
 # A row:  name | seconds | base | command
 #   name     unique, what the run prints
 #   seconds  its timeout (rule 69): an expiry is its failure, named, never retried
-#   base     `base`: the command's last word is a JSON object in single quotes, and a run given a
-#            base (CI's pull request, merge queue or push) gets `"base": "<sha>"` added to it, so
-#            a ratchet is held to the base's rows too; `-`: it takes none
+#   base     `base`: appends `"base": "<sha>"` to the trailing JSON object; `-`: takes none
 #   command  bash, run from the checkout's root; `$BLAZE_SCRIPTS` is the built scripts' directory
-#            (the run's `scripts` field)
 
-# The repository's Python workspace (pyproject.toml, uv.lock) lints. Some scripts
-# ask rustc for the host when imported: in the workspace's Python, with its helpers.
-python lint | 300 | - | uv run --frozen ruff check
-python imports | 300 | - | uv run --frozen python harness/imports.py
-# The list of tests that may fail holds together and is as its recorder writes it.
-failures selftest | 120 | - | uv run --frozen python harness/failures.py selftest
-# A row or a test run counts only with proof that it ran (harness/v2/ran.py).
-ran selftest | 120 | - | uv run --frozen python harness/v2/ran.py selftest
-# library/DIGEST is the digest of library/ as it is (a stale one stops every fresh home).
-library digest | 120 | - | uv run --frozen python harness/library.py check '{}'
-# The agent rules: tools/agents/rules.ts type-checks (under bun: tsc's script asks for node), and
-# AGENTS.md and the rules in .agents/skills/*/SKILL.md are what it generates. The site's lock is
-# installed as it is (`--frozen-lockfile` refuses a stale one).
+# The agent rules: tools/agents/rules.ts type-checks and AGENTS.md / skills match what it generates.
 site packages | 300 | - | bun install --frozen-lockfile --cwd site
 agent rules types | 300 | - | bun site/node_modules/.bin/tsc -p tools/agents
 agent rules | 120 | - | bun tools/agents/rules.ts --check
-# Each doc says what it is, the current ones hold against the tree, docs/README.md is their index,
-# and no Python file is added (tools/python-allowed.txt only shrinks; scripts/src/bin/docs.rs).
+# Docs front matter, index (docs/README.md), and Python allowlist (only shrinks).
 docs selftest | 120 | - | "$BLAZE_SCRIPTS/docs" selftest
 docs | 300 | - | "$BLAZE_SCRIPTS/docs" check
 # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md).
@@ -44,46 +25,31 @@ changed selftest | 120 | - | "$BLAZE_SCRIPTS/changed" selftest
 # Every stated invariant has a control beside it, and docs/v2/plan/invariants.md lists them.
 invariants selftest | 120 | - | "$BLAZE_SCRIPTS/invariants" selftest
 invariants | 300 | - | "$BLAZE_SCRIPTS/invariants" '{"command": "check"}'
-# The Lean proofs as far as no Lean is needed: lean/theorems.json names statements that are
-# there, no source says `sorry`, `native_decide`, `axiom` or `partial def`, lean/analysis's
-# manifest is at the pinned Mathlib, docs/v2/plan/proofs.md is current. The `lean` job builds them.
-lean sources selftest | 120 | - | uv run --frozen python harness/v2/lean_gate.py selftest
-lean sources | 300 | - | uv run --frozen python harness/v2/lean_gate.py '{"command": "sources"}'
-# blaze's registry of rustc's lints is the one written from rustc's source at library/UPSTREAM.
+# The Lean proof sources (pure Rust port: zero Python).
+lean sources selftest | 120 | - | "$BLAZE_SCRIPTS/lean_gate" selftest
+lean sources | 300 | - | "$BLAZE_SCRIPTS/lean_gate" '{"command": "sources"}'
+# blaze's registry of rustc's lints matches library/UPSTREAM.
 lint table selftest | 120 | - | "$BLAZE_SCRIPTS/lint_table" selftest
 lint table | 300 | - | "$BLAZE_SCRIPTS/lint_table" '{"command": "check"}'
-# Each hash domain in crates/ is written once outside tests and is under a cache of
-# docs/v2/plan/design/caches.md with the grain of its key.
+# Each hash domain in crates/ is written once outside tests and documented in caches.md.
 hash domains | 300 | - | "$BLAZE_SCRIPTS/domains" '{"root": "."}'
-# The ratchets: each crate's count equals its row, a crate with no row is held to 0, no row is
-# above the base's, and a crate over its row has its new sites named. The global heap
-# (alloc-sites.txt), untyped errors (untyped-errors.txt), third-party packages (third-party.txt,
-# and reached.txt: the crates the binaries reach), std and alloc lines (std-alloc.txt).
+# The ratchets: global heap, untyped errors, third-party packages, manifests, sys imports,
+# std/alloc, sans-io, stops, clones, casts, recursion, dups, layouts.
 global heap selftest | 120 | - | "$BLAZE_SCRIPTS/allocs" selftest
 global heap | 300 | base | "$BLAZE_SCRIPTS/allocs" '{"command": "check"}'
 untyped errors selftest | 120 | - | "$BLAZE_SCRIPTS/untyped" selftest
 untyped errors | 300 | base | "$BLAZE_SCRIPTS/untyped" '{"command": "check"}'
 third party selftest | 120 | - | "$BLAZE_SCRIPTS/thirdparty" selftest
 third party (and reached) | 300 | base | "$BLAZE_SCRIPTS/thirdparty" '{"command": "check"}'
-# Every member names each dependency through the root's [workspace.dependencies] (`workspace =
-# true`, no path or version of its own), and the root names every member there once by its path.
 manifests | 120 | - | "$BLAZE_SCRIPTS/thirdparty" '{"command": "manifests-check"}'
-# D180: blaze-sys references no C-library symbol on Linux and only the libSystem symbols of
-# tools/ratchets/blaze-sys-libsystem.txt on macOS; its own cases run here.
 sys imports selftest | 120 | - | "$BLAZE_SCRIPTS/sys_imports" selftest
 ambient selftest | 120 | - | "$BLAZE_SCRIPTS/ambient" selftest
 std and alloc | 300 | base | "$BLAZE_SCRIPTS/ambient" '{"command": "check"}'
-# Every crate goes down to sans-IO on bstd (D170, C1 to C7 of docs/v2/plan/design/end-state.md),
-# read with the tree's lexer, and the `bare` column: a crate the binaries reach is no_std without
-# alloc (D173) or has a row of sansio.rs's exemption table (tools/ratchets/sans-io.txt).
 sans-io and bare | 300 | base | "$BLAZE_SCRIPTS/ambient" '{"command": "sansio-check"}'
-# The other lists of ambient: std and alloc in tests, the global heap, process reads, producer
-# strings.
 std and alloc in tests | 300 | base | "$BLAZE_SCRIPTS/ambient" '{"command": "tests-check"}'
 heap from nowhere | 300 | base | "$BLAZE_SCRIPTS/ambient" '{"command": "heap-check"}'
 ambient reach | 300 | base | "$BLAZE_SCRIPTS/ambient" '{"command": "reach-check"}'
 producer strings | 300 | base | "$BLAZE_SCRIPTS/ambient" '{"command": "producers-check"}'
-# The token ratchets: stops, clones, casts and recursion.
 stops selftest | 120 | - | "$BLAZE_SCRIPTS/stops" selftest
 stops | 300 | base | "$BLAZE_SCRIPTS/stops" '{"command": "check"}'
 clones selftest | 120 | - | "$BLAZE_SCRIPTS/clones" selftest
@@ -93,10 +59,7 @@ casts | 300 | base | "$BLAZE_SCRIPTS/casts" '{"command": "check"}'
 recursion selftest | 120 | - | "$BLAZE_SCRIPTS/recursion" selftest
 recursion | 300 | base | "$BLAZE_SCRIPTS/recursion" '{"command": "check"}'
 dups selftest | 120 | - | "$BLAZE_SCRIPTS/dups" selftest
-# Every SCHEMA/LAYOUT/FORMAT/MAGIC/VERSION constant under crates/ has a row of
-# scripts/layouts.txt, and a persisted one whose value changed against the base names its crate's
-# test of the previous layout (rule persisted-state-round-trips).
 layouts selftest | 120 | - | "$BLAZE_SCRIPTS/layouts" selftest
 layouts | 300 | base | "$BLAZE_SCRIPTS/layouts" '{"command": "check"}'
-# The runner's own cases (its `check` runs before every run).
+# The runner's own selftest.
 gate selftest | 120 | - | "$BLAZE_SCRIPTS/gate" selftest

@@ -127,7 +127,7 @@ pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame:
     };
     let solve_scratch = match Frame::with_reserve(SCOPE_FRAME, Tag::Nameres) {
         Ok(solve_scratch) => solve_scratch,
-        Err(error) => return (failed_with(std::format!("crate `{}`: its cell solver's scratch frame ({SCOPE_FRAME} bytes) could not be reserved: {error:?}", job.input.name)), super::metered::ScopeBytes::default()),
+        Err(error) => return (failed_with(std::format!("crate {}: its cell solver's scratch frame ({SCOPE_FRAME} bytes) could not be reserved: {error:?}", job.input.name)), super::metered::ScopeBytes::default()),
     };
     let metered = super::metered::Metered::new(frame, scratch, solve_scratch, super::metered::CallScratch::Reset);
     let resolution = resolve_metered(cx, root, job, frame, &metered);

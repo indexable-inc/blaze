@@ -407,27 +407,29 @@ fn run(w: &World, form: Form, t: Int, a: u128, b: u128, s: Setting) -> Result<En
     };
     blaze_lir::verify(built.func.view()).map_err(|error| format!("main does not verify: {error}"))?;
     let host: StdVec<(ItemKey, u64)> = w.panics.iter().zip(HOSTS).map(|(&k, f)| (k, f as usize as u64)).collect();
+    // Emit and map BEFORE `fork()` so the child performs zero heap allocations (calling glibc
+    // `malloc` after `fork()` in a multi-threaded test process deadlocks on Linux arena locks).
+    let placed = super::place_native_with(&host, &[(w.main, None, &built)], Global);
+    let (_, _, entry) = placed.last().expect("one fn to run");
+    // SAFETY: `entry` is emitted and mapped above and remains mapped across `fork()` until dropped
+    // after `waitpid`.
+    let f: extern "C" fn() -> u64 = unsafe { entry.as_fn() };
     let mut fds = [0i32; 2];
     // SAFETY: `fds` holds two ints, as `pipe` writes.
     if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
         return Err(String::from("pipe failed"));
     }
-    // SAFETY: the child runs the placed code and leaves by `_exit` alone (never back into the
-    // test harness); macOS's libSystem makes malloc safe across `fork`.
+    // SAFETY: the child only runs the already-mapped entry (which either returns or calls a host
+    // `_exit` panic stub), writes 8 bytes to the pipe, and leaves via `_exit` — no allocator or
+    // lock is touched after `fork()`.
     let pid = unsafe { fork() };
     if pid == 0 {
-        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_native_with(&host, &[(w.main, None, &built)])));
-        let status = match ran {
-            Ok(v) => {
-                let bytes = v.to_le_bytes();
-                // SAFETY: eight bytes from a live array to the pipe's write end.
-                unsafe { write(fds[1], bytes.as_ptr(), 8) };
-                RETURNED
-            }
-            Err(_) => BROKE,
-        };
+        let v = f();
+        let bytes = v.to_le_bytes();
+        // SAFETY: eight bytes from a live array to the pipe's write end.
+        unsafe { write(fds[1], bytes.as_ptr(), 8) };
         // SAFETY: the child ends here.
-        unsafe { _exit(status) }
+        unsafe { _exit(RETURNED) }
     }
     // SAFETY: the parent's copy of the write end is closed so the read sees the child's end.
     unsafe { close(fds[1]) };

@@ -165,12 +165,14 @@ fn args_of(ground: &PortableTys<'_>, c: CoroutineOf, alloc: Alloc<'static>) -> R
 ///    state, but its build lays their slots, so they are laid before it is built. A coroutine
 ///    held by a state is never a use only (it is in that state's own held list), so the
 ///    concatenated order lays every state after each one it holds.
+type Consts<'a> = &'a [(ItemKey, DataRecord<Global>)];
+
 /// 2. LAY each in that order, the state recorded (`States::record`).
 /// 3. BUILD each into its laid state.
 #[expect(clippy::too_many_arguments, reason = "run.rs's own per-instance tables, borrowed apart")]
 pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     program: &P,
-    consts: &[(ItemKey, DataRecord<Global>)],
+    consts: Consts<'_>,
     langs: &BackLangs,
     bodies: &Bodies<'_>,
     ground: &mut PortableTys<'_>,
@@ -271,7 +273,7 @@ pub(super) enum LaidOnly {
 #[expect(clippy::too_many_arguments, reason = "the lay's tables, borrowed apart")]
 pub(super) fn lay_only<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     program: &P,
-    consts: &[(ItemKey, DataRecord<Global>)],
+    consts: Consts<'_>,
     langs: &BackLangs,
     bodies: &Bodies<'_>,
     ground: &mut PortableTys<'_>,
@@ -312,7 +314,7 @@ enum Ordered {
 #[expect(clippy::too_many_arguments, reason = "lay_and_build's tables, borrowed apart")]
 fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     program: &P,
-    consts: &[(ItemKey, DataRecord<Global>)],
+    consts: Consts<'_>,
     langs: &BackLangs,
     bodies: &Bodies<'_>,
     ground: &mut PortableTys<'_>,
@@ -429,7 +431,7 @@ fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
 #[expect(clippy::too_many_arguments, reason = "lay_and_build's tables, borrowed apart")]
 fn build_laid<P: FrontEnd>(
     program: &P,
-    consts: &[(ItemKey, DataRecord<Global>)],
+    consts: Consts<'_>,
     langs: &BackLangs,
     bodies: &Bodies<'_>,
     ground: &mut PortableTys<'_>,

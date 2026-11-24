@@ -2826,7 +2826,7 @@ mod copy_tests {
         for inst in 0..out.view().len() {
             assert!(
                 !matches!(out.view().op(inst), Op::Memcpy | Op::Load | Op::Store | Op::SlotAddr),
-                "unexpected memory op `{}`:\n{}",
+                "unexpected memory op {}:\n{}",
                 out.view().op(inst).name(),
                 print(out.view())
             );
@@ -3014,7 +3014,7 @@ mod copy_tests {
             let op = out.view().op(inst);
             assert!(
                 !matches!(op, Op::Load | Op::Store | Op::SlotAddr),
-                "unexpected memory op `{}`:\n{}",
+                "unexpected memory op {}:\n{}",
                 op.name(),
                 print(out.view())
             );
@@ -3093,7 +3093,7 @@ mod copy_tests {
             let op = out.view().op(inst);
             assert!(
                 !matches!(op, Op::Load | Op::Store | Op::SlotAddr),
-                "unexpected memory op `{}`:\n{}",
+                "unexpected memory op {}:\n{}",
                 op.name(),
                 print(out.view())
             );

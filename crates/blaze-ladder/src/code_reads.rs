@@ -985,7 +985,7 @@ impl Adts for Recorded<'_> {
         let answer = self.world.static_item(item);
         let digest = match answer {
             None => small(0u8),
-            Some(s) => small((1u8, s.thread_local, s.mutable)),
+            Some(s) => small((1u8, s.thread_local, s.mutable, s.extern_weak)),
         };
         self.log.ask(ReadKind::Static, item, 0, &[], Ok(digest));
         answer

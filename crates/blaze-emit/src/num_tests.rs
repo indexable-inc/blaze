@@ -30,8 +30,8 @@ fn float_arithmetic_crosses_in_vector_registers() {
         // SAFETY: emitted C functions of these signatures, mapped while `d` and `s` live.
         let (fd, fs) = unsafe {
             (
-                std::mem::transmute::<usize, extern "C" fn(f64, f64) -> f64>(d.code_address() as usize),
-                std::mem::transmute::<usize, extern "C" fn(f32, f32) -> f32>(s.code_address() as usize),
+                core::mem::transmute::<usize, extern "C" fn(f64, f64) -> f64>(d.code_address() as usize),
+                core::mem::transmute::<usize, extern "C" fn(f32, f32) -> f32>(s.code_address() as usize),
             )
         };
         for a in SAMPLES {
@@ -45,7 +45,7 @@ fn float_arithmetic_crosses_in_vector_registers() {
     }
     let neg = place(&one(&[Ty::F64], Ty::F64, |b, v| b.unary(Op::Fneg, Flags::NONE, v[0])));
     // SAFETY: as above.
-    let neg = unsafe { std::mem::transmute::<usize, extern "C" fn(f64) -> f64>(neg.code_address() as usize) };
+    let neg = unsafe { core::mem::transmute::<usize, extern "C" fn(f64) -> f64>(neg.code_address() as usize) };
     assert_eq!(neg(1.5), -1.5);
 }
 
@@ -67,7 +67,7 @@ fn float_comparisons_follow_nan() {
             b.convert(Op::Zext, Flags::NONE, Ty::I8, bit)
         }));
         // SAFETY: an emitted C function of this signature, mapped while `f` lives.
-        let f = unsafe { std::mem::transmute::<usize, extern "C" fn(f64, f64) -> u8>(f.code_address() as usize) };
+        let f = unsafe { core::mem::transmute::<usize, extern "C" fn(f64, f64) -> u8>(f.code_address() as usize) };
         for a in SAMPLES {
             for b in SAMPLES {
                 assert_eq!(f(a, b) != 0, rust(a, b), "{cond:?} {a} {b}");
@@ -85,7 +85,7 @@ fn float_casts_saturate_and_round() {
             let ret = blaze_lir::builder::Param { ext: $ext, ..blaze_lir::builder::Param::of($ty) };
             let f = place(&one(&[Ty::F64], ret, |b, v| b.convert($op, Flags::NONE, $ty, v[0])));
             // SAFETY: an emitted C function of this signature, mapped while `f` lives.
-            let g = unsafe { std::mem::transmute::<usize, extern "C" fn(f64) -> $t>(f.code_address() as usize) };
+            let g = unsafe { core::mem::transmute::<usize, extern "C" fn(f64) -> $t>(f.code_address() as usize) };
             for a in SAMPLES {
                 assert_eq!(g(a), a as $t, "{a} as {}", stringify!($t));
             }
@@ -105,9 +105,9 @@ fn float_casts_saturate_and_round() {
     // SAFETY: emitted C functions of these signatures, mapped while they live.
     let (from, ufrom, narrow) = unsafe {
         (
-            std::mem::transmute::<usize, extern "C" fn(i64) -> f64>(from.code_address() as usize),
-            std::mem::transmute::<usize, extern "C" fn(u32) -> f32>(ufrom.code_address() as usize),
-            std::mem::transmute::<usize, extern "C" fn(f64) -> f32>(narrow.code_address() as usize),
+            core::mem::transmute::<usize, extern "C" fn(i64) -> f64>(from.code_address() as usize),
+            core::mem::transmute::<usize, extern "C" fn(u32) -> f32>(ufrom.code_address() as usize),
+            core::mem::transmute::<usize, extern "C" fn(f64) -> f32>(narrow.code_address() as usize),
         )
     };
     for x in [0i64, -1, i64::MAX, i64::MIN, (1 << 53) + 1, -(1 << 60) - 3] {
@@ -152,7 +152,7 @@ fn i128_arithmetic_crosses_in_even_register_pairs() {
     for (op, rust) in ops {
         let f = place(&one(&[Ty::I128, Ty::I64, Ty::I128], Ty::I128, |b, v| b.binary(op, Flags::NONE, v[0], v[2])));
         // SAFETY: an emitted C function of this signature, mapped while `f` lives.
-        let f = unsafe { std::mem::transmute::<usize, extern "C" fn(u128, u64, u128) -> u128>(f.code_address() as usize) };
+        let f = unsafe { core::mem::transmute::<usize, extern "C" fn(u128, u64, u128) -> u128>(f.code_address() as usize) };
         for a in WIDE {
             for b in WIDE.iter().copied().chain([3, 63, 64, 65, 127]) {
                 assert_eq!(f(a, 7, b), rust(a, b), "{op:?} {a:#x} {b:#x}");
@@ -178,7 +178,7 @@ fn i128_compares_and_casts() {
             b.convert(Op::Zext, Flags::NONE, Ty::I8, bit)
         }));
         // SAFETY: an emitted C function of this signature, mapped while `f` lives.
-        let f = unsafe { std::mem::transmute::<usize, extern "C" fn(u128, u128) -> u8>(f.code_address() as usize) };
+        let f = unsafe { core::mem::transmute::<usize, extern "C" fn(u128, u128) -> u8>(f.code_address() as usize) };
         for a in WIDE {
             for b in WIDE {
                 assert_eq!(f(a, b) != 0, rust(a, b), "{cond:?} {a:#x} {b:#x}");
@@ -191,9 +191,9 @@ fn i128_compares_and_casts() {
     // SAFETY: emitted C functions of these signatures, mapped while they live.
     let (sext, trunc, big) = unsafe {
         (
-            std::mem::transmute::<usize, extern "C" fn(i32) -> i128>(sext.code_address() as usize),
-            std::mem::transmute::<usize, extern "C" fn(u128) -> u64>(trunc.code_address() as usize),
-            std::mem::transmute::<usize, extern "C" fn() -> u128>(big.code_address() as usize),
+            core::mem::transmute::<usize, extern "C" fn(i32) -> i128>(sext.code_address() as usize),
+            core::mem::transmute::<usize, extern "C" fn(u128) -> u64>(trunc.code_address() as usize),
+            core::mem::transmute::<usize, extern "C" fn() -> u128>(big.code_address() as usize),
         )
     };
     assert_eq!(sext(-5), -5i128);
@@ -258,8 +258,8 @@ fn i128_overflow_operations_match_rusts_overflowing_ops() {
         // SAFETY: emitted C functions of these signatures, mapped while `value` and `flag` live.
         let (value_fn, flag_fn) = unsafe {
             (
-                std::mem::transmute::<usize, extern "C" fn(u128, u128) -> u128>(value.code_address() as usize),
-                std::mem::transmute::<usize, extern "C" fn(u128, u128) -> u8>(flag.code_address() as usize),
+                core::mem::transmute::<usize, extern "C" fn(u128, u128) -> u128>(value.code_address() as usize),
+                core::mem::transmute::<usize, extern "C" fn(u128, u128) -> u8>(flag.code_address() as usize),
             )
         };
         for a in WIDE_OVERFLOW {
@@ -323,8 +323,8 @@ fn i128_overflow_pairs_cross_block_edges() {
         // signature its `k` gives is called.
         let (wide, narrow) = unsafe {
             (
-                std::mem::transmute::<usize, extern "C" fn(u128, u128, u8) -> u128>(at),
-                std::mem::transmute::<usize, extern "C" fn(u128, u128, u8) -> u8>(at),
+                core::mem::transmute::<usize, extern "C" fn(u128, u128, u8) -> u128>(at),
+                core::mem::transmute::<usize, extern "C" fn(u128, u128, u8) -> u8>(at),
             )
         };
         let call = |a: u128, c: u128, n: u8| -> u128 {
@@ -372,7 +372,7 @@ fn i128_saturating_and_bit_operations_match_rust() {
     for (op, rust) in sat {
         let exec = place(&one(&[Ty::I128, Ty::I128], Ty::I128, |b, v| b.binary(op, Flags::NONE, v[0], v[1])));
         // SAFETY: an emitted C function of two `i128`s returning one, mapped while `exec` lives.
-        let f = unsafe { std::mem::transmute::<usize, extern "C" fn(u128, u128) -> u128>(exec.code_address() as usize) };
+        let f = unsafe { core::mem::transmute::<usize, extern "C" fn(u128, u128) -> u128>(exec.code_address() as usize) };
         for a in EDGES {
             for b in EDGES {
                 assert_eq!(f(a, b), rust(a, b), "{op:?} {a:#x} {b:#x}");
@@ -389,7 +389,7 @@ fn i128_saturating_and_bit_operations_match_rust() {
     for (op, rust) in bits {
         let exec = place(&one(&[Ty::I128], Ty::I128, |b, v| b.unary(op, Flags::NONE, v[0])));
         // SAFETY: an emitted C function of one `i128` returning one, mapped while `exec` lives.
-        let f = unsafe { std::mem::transmute::<usize, extern "C" fn(u128) -> u128>(exec.code_address() as usize) };
+        let f = unsafe { core::mem::transmute::<usize, extern "C" fn(u128) -> u128>(exec.code_address() as usize) };
         for a in EDGES {
             assert_eq!(f(a), rust(a), "{op:?} {a:#x}");
         }

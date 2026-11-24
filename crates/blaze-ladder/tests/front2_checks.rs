@@ -256,8 +256,9 @@ fn deref_and_try_through_front2() {
     let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut buckets = None;
     let mut consts = Consts::default();
-    let mut failed = Vec::new();
-    let mut report: Vec<String> = Vec::new();
+    let test_alloc = blaze_own::testing::heap().alloc();
+    let mut failed = blaze_own::AVec::new_in(test_alloc);
+    let mut report = blaze_own::AVec::new_in(test_alloc);
     let cases = CLEAN.iter().map(|&(n, p)| (n, p, None)).chain(REFUSED.iter().map(|&(n, w)| (n, "must be refused", Some(w))));
     for (name, proves, want) in cases {
         if let Err(e) = store.ensure(&names, &mut front.keys, Want::Fn(lib(name))) {

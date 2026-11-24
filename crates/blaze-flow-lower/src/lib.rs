@@ -407,10 +407,13 @@ pub trait Facts {
         None
     }
     /// If the body owner is a method of a trait impl `impl<..> Trait for SelfTy` (where `SelfTy`
-    /// is an `Adt`, `Ref`, or `Tuple`), returns its [`OwnerTraitImpl`] so `blaze-borrow` can
+    /// is an `Adt`, `Ref`, or `Tuple`), returns the [`OwnerTraitImpl`] for `trait_` (either `Trait`
+    /// itself or a supertrait of `Trait` with a unique impl for `SelfTy`) so `blaze-borrow` can
     /// normalize projections on the enclosing impl's own `Self` (e.g. `Cycle<I>::Item`,
-    /// `Zip<A, B>::Item`, `(&T0, &T1)::Item`) even when the call site has no explicit selection row.
-    fn owner_trait_impl(&self) -> Option<OwnerTraitImpl> {
+    /// `Zip<A, B>::Item`, `(&T0, &T1)::Item`, `Cloned<I>::Item`) even when the call site has no
+    /// explicit selection row.
+    fn owner_trait_impl(&self, trait_: ItemKey) -> Option<OwnerTraitImpl> {
+        let _ = trait_;
         None
     }
     /// The unique `Deref` impl for ADT `adt`, when known (`answer_impls(Deref, Adt(adt))` has
@@ -4360,9 +4363,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         match classify(false) {
             Err(ProjectionUnbound::RowsDisagree) if key_args.is_some() => classify(true).or(Err(ProjectionUnbound::RowsDisagree)),
             Err(ProjectionUnbound::NoRow) => {
-                if let Some(oti) = self.facts.owner_trait_impl()
-                    && oti.trait_ == trait_
-                {
+                if let Some(oti) = self.facts.owner_trait_impl(trait_) {
                     let self_ok = match key_args.and_then(|ks| ks.first().copied()) {
                         None => true,
                         Some(st) => match (oti.self_shape, heads.node(st)) {
@@ -7187,6 +7188,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             self.stats.calls_by_signature += 1;
             return Ok(());
         }
+        // An immutable local fn pointer initialized from a bounded tree of `FnDef` leaves (e.g.
+        // `let fun = const { if ... { f1 } else { f2 } }; fun(self)` in `core::iter::Filter::next_chunk`).
+        if self.call_through_fndef_local(c, args, dest, dest_ty, e)? {
+            return Ok(());
+        }
         let param = match self.expr(c)? {
             Expr::Local(p) => self.body.params.iter().position(|x| *x == p),
             _ => None,
@@ -7809,6 +7815,72 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// If local binding `p` was introduced by `let p = callee(..);` where `callee` is a known
     /// item key, return that callee so a callable returned by it (e.g. `std::panic::take_hook()`)
     /// can read its declared output region column even when captured into a nested closure.
+    /// An immutable local fn pointer initialized from a bounded tree of `FnDef` expressions
+    /// (`let fun = const { if ... { f1 } else { f2 } }; fun(x)`): enforces the call contract of
+    /// every leaf `FnDef`, which is sound because the runtime target is one of them.
+    fn call_through_fndef_local(&mut self, c: ExprId, args: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+        let Expr::Local(p) = self.expr(c)? else { return Ok(false) };
+        let Ok(c_ty) = self.expr_ty(c) else { return Ok(false) };
+        if !matches!(self.node(c_ty, c), Ok(PNode::FnPtr(..))) {
+            return Ok(false);
+        }
+        // Reject if `p` is ever assigned or mutably borrowed anywhere in the body.
+        for expr in self.body.exprs.iter() {
+            match *expr {
+                Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. } if matches!(self.body.exprs.get(lhs.ix()), Some(&Expr::Local(q)) if q == p) => {
+                    return Ok(false);
+                }
+                Expr::Ref { mutbl: Mutbl::Mut, operand } if matches!(self.body.exprs.get(operand.ix()), Some(&Expr::Local(q)) if q == p) => {
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+        let mut init = None;
+        for stmt in self.body.stmts.iter() {
+            if let blaze_typeck::Stmt::Let { pat, init: Some(i), .. } = *stmt
+                && pat == p
+            {
+                if init.is_some() {
+                    return Ok(false);
+                }
+                init = Some(i);
+            }
+        }
+        let Some(init) = init else { return Ok(false) };
+        let mut stack: Vec<ExprId, _> = Vec::new_in(self.alloc);
+        let mut leaves: Vec<(ItemKey, List), _> = Vec::new_in(self.alloc);
+        stack.push(init);
+        let mut steps = 0u32;
+        while let Some(cur) = stack.pop() {
+            steps += 1;
+            if steps > 64 {
+                return Ok(false);
+            }
+            match self.expr(cur)? {
+                Expr::Paren(inner) => stack.push(inner),
+                Expr::Block { tail: Some(t), .. } | Expr::ConstBlock { tail: Some(t), .. } => stack.push(t),
+                Expr::If { then, else_: Some(el), .. } => {
+                    stack.push(el);
+                    stack.push(then);
+                }
+                _ => {
+                    let Ok(ty) = self.expr_ty(cur) else { return Ok(false) };
+                    let Ok(PNode::FnDef(item, ty_args)) = self.node(ty, cur) else { return Ok(false) };
+                    leaves.push((item, ty_args));
+                }
+            }
+        }
+        if leaves.is_empty() {
+            return Ok(false);
+        }
+        let out = self.info(dest);
+        for &(item, ty_args) in leaves.iter() {
+            self.call_by_rule(&crate::one_call::CallSite { e, vs: args, ins: &[], tp: dest, ty: dest_ty, out, callee: Some((item, ty_args)) })?;
+        }
+        Ok(true)
+    }
+
     fn local_call_init(&self, p: PatId) -> Option<ItemKey> {
         for stmt in self.body.stmts.iter() {
             if let blaze_typeck::Stmt::Let { pat, init: Some(init), .. } = *stmt

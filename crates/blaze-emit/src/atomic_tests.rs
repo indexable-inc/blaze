@@ -39,13 +39,23 @@ fn function(
     body: impl FnOnce(&mut Builder<Global, Full>, &[Value]) -> Vec<Value>,
 ) -> Func<Global> {
     let mut b = Builder::<Global, Full>::new_in(64, Global);
-    let sig_params: Vec<Param> = params.iter().map(|&ty| Param::of(ty)).collect();
-    let sig_rets: Vec<Param> = rets.iter().map(|&ty| Param::of(ty)).collect();
+    let test_alloc = blaze_own::testing::heap().alloc();
+    let mut sig_params = blaze_own::AVec::new_in(test_alloc);
+    for &ty in params {
+        sig_params.push(Param::of(ty));
+    }
+    let mut sig_rets = blaze_own::AVec::new_in(test_alloc);
+    for &ty in rets {
+        sig_rets.push(Param::of(ty));
+    }
     let sig = b.sig(Conv::C, Variadic::No, &sig_params, &sig_rets);
     b.set_signature(sig);
     let entry = b.create_block(BlockKind::Normal);
     b.begin(entry);
-    let values: Vec<Value> = params.iter().map(|&ty| b.param(ty)).collect();
+    let mut values = blaze_own::AVec::new_in(test_alloc);
+    for &ty in params {
+        values.push(b.param(ty));
+    }
     let out = body(&mut b, &values);
     b.ret(&out);
     b.finish_checked().expect("a hand-built function builds")

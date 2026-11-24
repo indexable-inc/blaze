@@ -2426,8 +2426,8 @@ fn a_static_and_a_thread_local_are_places() {
     w.func(1, "main", &[], U32);
     w.func(20, "N", &[], U32);
     w.func(21, "T", &[], U32);
-    w.statics.push((ItemKey(20), StaticItem { thread_local: false, mutable: true }));
-    w.statics.push((ItemKey(21), StaticItem { thread_local: true, mutable: false }));
+    w.statics.push((ItemKey(20), StaticItem { thread_local: false, mutable: true, extern_weak: false }));
+    w.statics.push((ItemKey(21), StaticItem { thread_local: true, mutable: false, extern_weak: false }));
     let mut b = BodyBuf::new();
     let n_path = b.path("N");
     let n_lhs = b.e(Expr::Path(n_path));
@@ -2765,19 +2765,45 @@ impl Tables<'_> {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+type PlacedFns<A> = blaze_own::Vec<(ItemKey, Option<List>, blaze_inproc::exec::Executable), A>;
+
 /// [`run_native_with`], placing the vtables each fn names from `tables`.
 #[cfg(target_arch = "aarch64")]
-fn run_native_vt(host: &[(ItemKey, u64)], fns: &[(ItemKey, Option<List>, &Built<Global>)], mut tables: Option<&mut Tables<'_>>) -> u64 {
+fn run_native_vt(host: &[(ItemKey, u64)], fns: &[(ItemKey, Option<List>, &Built<Global>)], tables: Option<&mut Tables<'_>>) -> u64 {
+    let placed = place_native_vt(host, fns, tables, Global);
+    let (_, _, entry) = placed.last().expect("one fn to run");
+    // SAFETY: the entry is an emitted function of no parameters returning one integer in x0;
+    // every callee it names is mapped and held in `placed` until it returns.
+    let f: extern "C" fn() -> u64 = unsafe { entry.as_fn() };
+    f()
+}
+
+/// Emits and maps each built fn without calling it yet (so callers that `fork()` before calling
+/// the entry perform zero heap allocations in the child).
+#[cfg(target_arch = "aarch64")]
+fn place_native_with<A: core::alloc::Allocator + Copy>(host: &[(ItemKey, u64)], fns: &[(ItemKey, Option<List>, &Built<A>)], alloc: A) -> PlacedFns<A> {
+    place_native_vt(host, fns, None, alloc)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn place_native_vt<A: core::alloc::Allocator + Copy>(
+    host: &[(ItemKey, u64)],
+    fns: &[(ItemKey, Option<List>, &Built<A>)],
+    mut tables: Option<&mut Tables<'_>>,
+    alloc: A,
+) -> PlacedFns<A> {
     use blaze_emit::RelocTo;
     use blaze_inproc::exec::Executable;
-    let mut placed: Vec<(ItemKey, Option<List>, Executable), Global> = Vec::new_in(Global);
+    let mut placed: PlacedFns<A> = PlacedFns::new_in(alloc);
     for &(key, key_args, built) in fns {
-        let mut vias = Vec::new_in(Global);
+        let mut vias = Vec::new_in(alloc);
         vias.resize(built.refs.len(), blaze_emit::Via::Address);
-        let mut code = blaze_emit::Code::new_in(Global);
-        let isa = blaze_emit::Isa { lse: true, os: blaze_emit::Os::MacOs };
+        let mut code = blaze_emit::Code::new_in(alloc);
+        let os = if cfg!(target_os = "macos") { blaze_emit::Os::MacOs } else { blaze_emit::Os::Linux };
+        let isa = blaze_emit::Isa { lse: true, os };
         blaze_emit::emit(built.func.verified(), &vias, isa, &mut code).unwrap_or_else(|e| panic!("{e}"));
-        let mut table_at: Vec<(u32, u64), Global> = Vec::new_in(Global);
+        let mut table_at: Vec<(u32, u64), A> = Vec::new_in(alloc);
         for r in code.relocs.iter() {
             if let RelocTo::Vtable(p) = r.to {
                 let fn_addr = |item: ItemKey, args: Option<List>| -> u64 {
@@ -2825,11 +2851,7 @@ fn run_native_vt(host: &[(ItemKey, u64)], fns: &[(ItemKey, Option<List>, &Built<
         .expect("the code maps");
         placed.push((key, key_args, exec));
     }
-    let (_, _, entry) = placed.last().expect("one fn to run");
-    // SAFETY: the entry is an emitted function of no parameters returning one integer in x0;
-    // every callee it names is mapped and held in `placed` until it returns.
-    let f: extern "C" fn() -> u64 = unsafe { entry.as_fn() };
-    f()
+    placed
 }
 
 /// lib.rs, "Adjustments": `&[u8; 3]` to `&[u8]` (s1-layout's `let wide: &[u8] = &bytes;`), and

@@ -372,6 +372,16 @@ impl Writer<'_> {
         self.run_edit(code_lo, SpareState::Desynced, change)
     }
 
+    /// Internal table-only add (without calling OS unwinder registration).
+    fn add_table(&mut self, span: Span) -> Result<(), RegError> {
+        self.run_edit(span.code_lo, SpareState::Behind(PendingEdit::Add(span)), |spans| insert(spans, span))
+    }
+
+    /// Internal table-only remove (without calling OS unwinder deregistration).
+    fn remove_table(&mut self, code_lo: u64) -> Result<Span, RegError> {
+        self.run_edit(code_lo, SpareState::Behind(PendingEdit::Remove(code_lo)), |spans| remove(spans, code_lo))
+    }
+
     /// Registers `span`: from the return, a throw through its code finds its entry.
     ///
     /// # Safety
@@ -380,7 +390,7 @@ impl Writer<'_> {
     /// are at `span.eh_at`, and they and the code stay as they are until [`Writer::remove`] of
     /// the span has returned `Ok`.
     pub unsafe fn add(&mut self, span: Span) -> Result<(), RegError> {
-        self.run_edit(span.code_lo, SpareState::Behind(PendingEdit::Add(span)), |spans| insert(spans, span))?;
+        self.add_table(span)?;
         // SAFETY: the caller's contract, passed on.
         unsafe { os_add(span) };
         Ok(())
@@ -393,7 +403,7 @@ impl Writer<'_> {
     ///
     /// No thread is, or will be, in the record's code.
     pub unsafe fn remove(&mut self, code_lo: u64) -> Result<Span, RegError> {
-        let span = self.run_edit(code_lo, SpareState::Behind(PendingEdit::Remove(code_lo)), |spans| remove(spans, code_lo))?;
+        let span = self.remove_table(code_lo)?;
         // SAFETY: the span was in the registry, so `add` registered it, once; no thread is in
         // its code (the caller's contract).
         unsafe { os_remove(span) };

@@ -966,6 +966,9 @@ impl Uring {
         let len = self.ops.buf(id).len() as u64;
         if hot.flags & ZERO_COPY == 0 {
             if res < 0 {
+                if -res == i32::from(Errno::Intr.raw()) || -res == i32::from(Errno::Again.raw()) {
+                    return Step::Again;
+                }
                 return self.unsent(id, -res);
             }
             return match (self.progress(id, res) < len as usize, res) {

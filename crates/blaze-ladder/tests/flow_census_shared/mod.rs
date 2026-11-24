@@ -292,6 +292,7 @@ fn list<'n>(names: &'n Names<'n>, world: &ProjectWorld<'n>, krate: usize, a: All
             _ => {}
         }
     }
+    entries.sort_unstable_by(|x, y| x.path.as_str().cmp(y.path.as_str()).then_with(|| x.text.cmp(y.text)));
     entries
 }
 

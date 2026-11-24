@@ -3097,14 +3097,14 @@ mod tests {
     };
 
     /// Finds an `Op::TargetIntrinsic` call matching `name` and returns its argument values.
-    fn find_intrinsic_call(view: View<'_>, name: &str) -> Option<alloc::vec::Vec<u32>> {
+    fn find_intrinsic_call<'a>(view: View<'a>, name: &str) -> Option<&'a [u32]> {
         for inst in 0..view.len() {
             if view.op(inst) == Op::TargetIntrinsic {
                 let pos = view.data[inst] as usize;
                 let id = IntrinsicId(view.extra[pos]);
                 if view.intrinsic_name(id) == name.as_bytes() {
                     let n = view.extra[pos + 1] as usize;
-                    return Some(view.extra[pos + 2..pos + 2 + n].to_vec());
+                    return Some(&view.extra[pos + 2..pos + 2 + n]);
                 }
             }
         }

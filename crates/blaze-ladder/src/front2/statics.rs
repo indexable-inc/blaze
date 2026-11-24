@@ -173,8 +173,8 @@ pub(crate) fn one_static<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, k: 
     let Some(&m) = r.store.statics.get(&k) else {
         return Err(Box::from("no static head in the store (heads.rs `Store::statics`)"));
     };
-    let thread_local = thread_local_of(r, k)?;
-    Ok((record, StaticItem { thread_local, mutable: matches!(m, tc::Mutbl::Mut) }))
+    let (thread_local, _) = static_attrs_of(r, k)?;
+    Ok((record, StaticItem { thread_local, mutable: matches!(m, tc::Mutbl::Mut), extern_weak: false }))
 }
 
 /// Static `k`'s kind when an `extern` block declares it: its head's mutability, nothing
@@ -184,15 +184,16 @@ pub(crate) fn foreign_kind<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: It
     let Some(&m) = r.store.statics.get(&k) else {
         return Err(Box::from("no static head in the store (heads.rs `Store::statics`)"));
     };
-    if thread_local_of(r, k)? {
+    let (thread_local, extern_weak) = static_attrs_of(r, k)?;
+    if thread_local {
         return Err(Box::from("a `#[thread_local]` static an `extern` block declares: no foreign thread-local is built (statics.rs `foreign_kind`)"));
     }
-    Ok(StaticItem { thread_local: false, mutable: matches!(m, tc::Mutbl::Mut) })
+    Ok(StaticItem { thread_local: false, mutable: matches!(m, tc::Mutbl::Mut), extern_weak })
 }
 
-/// Whether static `k`'s signature carries `#[thread_local]` (its attribute rows, read as
-/// program.rs `symbols_of` reads a fn's).
-fn thread_local_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Result<bool, Box<str>> {
+/// Whether static `k`'s signature carries `#[thread_local]` and/or `#[linkage = "extern_weak"]`
+/// (its attribute rows, read as program.rs `symbols_of` reads a fn's).
+fn static_attrs_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Result<(bool, bool), Box<str>> {
     let refuse = |why: String| Box::<str>::from(format!("its attributes: {why}"));
     let f = r.store.fns.get(&k).ok_or_else(|| refuse(String::from("no head in the store")))?;
     let krate = r.names.crate_of(f.lib).ok_or_else(|| refuse(format!("no crate holds {:x}", f.lib)))?;
@@ -201,11 +202,20 @@ fn thread_local_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -
     let sig = blaze_lower::lower_signature(f.text, edition, &mut CrateCfg(atoms), r.store.tys.alloc())
         .map_err(|_| refuse(String::from("its signature needs a `cfg` the crate does not answer")))?;
     let v = sig.view();
+    let mut thread_local = false;
+    let mut extern_weak = false;
+    let text = |r| v.text_at(r).map_err(|e| refuse(format!("{e:?}")));
     for &n in v.rows(v.list(head::ATTRS)).map_err(|e| refuse(format!("{e:?}")))? {
         let a = v.attr(n).map_err(|e| refuse(format!("{e:?}")))?;
-        if v.text_at(a.path).map_err(|e| refuse(format!("{e:?}")))?.trim() == "thread_local" {
-            return Ok(true);
+        let path = text(a.path)?.trim();
+        if path == "thread_local" {
+            thread_local = true;
+        } else if path == "linkage" {
+            let val = text(a.args)?.trim().trim_start_matches('=').trim().trim_matches('"');
+            if val == "extern_weak" {
+                extern_weak = true;
+            }
         }
     }
-    Ok(false)
+    Ok((thread_local, extern_weak))
 }

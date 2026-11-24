@@ -159,6 +159,56 @@ impl Target<'static> {
             "vh",
         ],
     };
+
+    /// `aarch64-unknown-linux-gnu`, a dev build (pins/answers/rustc.json).
+    pub const AARCH64_UNKNOWN_LINUX_GNU: Target<'static> = Target {
+        os: "linux",
+        arch: "aarch64",
+        family: "unix",
+        pointer_width: "64",
+        endian: "little",
+        env: "gnu",
+        vendor: "unknown",
+        debug_assertions: true,
+        reliable_f16: true,
+        reliable_f128: true,
+        reliable_f128_math: true,
+        atomic_widths: &["8", "16", "32", "64", "128", "ptr"],
+        target_features: &["neon", "outline-atomics"],
+    };
+
+    /// `x86_64-unknown-linux-gnu`, a dev build (pins/answers/rustc.json).
+    pub const X86_64_UNKNOWN_LINUX_GNU: Target<'static> = Target {
+        os: "linux",
+        arch: "x86_64",
+        family: "unix",
+        pointer_width: "64",
+        endian: "little",
+        env: "gnu",
+        vendor: "unknown",
+        debug_assertions: true,
+        reliable_f16: true,
+        reliable_f128: true,
+        reliable_f128_math: true,
+        atomic_widths: &["8", "16", "32", "64", "ptr"],
+        target_features: &["fxsr", "sse", "sse2"],
+    };
+
+    /// The host's own target.
+    pub const fn host() -> Target<'static> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            Self::AARCH64_APPLE_DARWIN
+        }
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        {
+            Self::AARCH64_UNKNOWN_LINUX_GNU
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            Self::X86_64_UNKNOWN_LINUX_GNU
+        }
+    }
 }
 
 impl fmt::Display for Target<'_> {
