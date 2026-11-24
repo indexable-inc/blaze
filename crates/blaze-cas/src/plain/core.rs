@@ -3440,18 +3440,40 @@ impl<A: Allocator + Clone> Plain<A> {
                 return Err(StoreError::Shape { namespace, why: RowRefused::TooLong { len, most } });
             }
             // The payloads from [`HEADER`] on, each at a multiple of [`ALIGN`] of the segment:
-            // exact single allocation on the process heap (no doubling reallocs / full memcpys).
-            let cap = usize::try_from(payload_bytes).unwrap_or(usize::MAX);
-            let mut bytes: Vec<u8> = Vec::with_capacity_in(cap, Global);
-            for (payload, pad_len) in kept_payloads {
-                bytes.extend_from_slice(payload);
-                if pad_len > 0 {
-                    bytes.resize(bytes.len() + pad_len, 0);
+            // split at record boundaries into bounded 4 MiB pieces (exact capacity per piece,
+            // zero doubling reallocs) so large commits avoid 64 MiB contiguous heap spikes,
+            // issue parallel `WriteAt` effects, and release each piece as its write finishes.
+            const COMMIT_PIECE_BYTES: usize = 4 << 20;
+            let mut spans: blaze_own::Vec<(usize, usize, usize), &A> = blaze_own::Vec::new_in(&self.alloc);
+            let mut span_start = 0usize;
+            let mut span_bytes = 0usize;
+            for (idx, (payload, pad_len)) in kept_payloads.iter().enumerate() {
+                let rec_len = payload.len().saturating_add(*pad_len);
+                if span_bytes > 0 && span_bytes.saturating_add(rec_len) > COMMIT_PIECE_BYTES {
+                    spans.push((span_start, idx, span_bytes));
+                    span_start = idx;
+                    span_bytes = 0;
                 }
+                span_bytes = span_bytes.saturating_add(rec_len);
             }
-            let mut pieces: Vec<(u64, Vec<u8>), A> = Vec::with_capacity_in(1, self.alloc.clone());
-            if !bytes.is_empty() {
-                pieces.push((HEADER as u64, bytes));
+            if span_bytes > 0 {
+                spans.push((span_start, kept_payloads.len(), span_bytes));
+            }
+            let mut pieces: Vec<(u64, Vec<u8>), A> = Vec::with_capacity_in(spans.len(), self.alloc.clone());
+            let mut piece_at = HEADER as u64;
+            for (from, to, cap) in spans {
+                let mut bytes: Vec<u8> = Vec::with_capacity_in(cap, Global);
+                if let Some(slice) = kept_payloads.get(from..to) {
+                    for (payload, pad_len) in slice {
+                        bytes.extend_from_slice(payload);
+                        if *pad_len > 0 {
+                            bytes.resize(bytes.len() + *pad_len, 0);
+                        }
+                    }
+                }
+                let written = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                pieces.push((piece_at, bytes));
+                piece_at = piece_at.saturating_add(written);
             }
             let run = format::sorted_run(entries)?;
             out.push(Laid { pieces, index_at, run, namespace });
