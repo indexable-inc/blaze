@@ -2158,6 +2158,13 @@ fn allocate_exact_cfg<A: Allocator + Copy>(
         let is_reg_free = |busy: &[u64], reg: usize, vid: usize| -> bool {
             let r_base = reg.saturating_mul(val_words);
             let v_base = vid.saturating_mul(val_words);
+            // A register or spill slot already claimed by `vid` itself (e.g. the low half of a
+            // `GprPairSpill`) is never free for `vid`'s second half, even though `interf[vid][vid]`
+            // is zero.
+            let self_bit = 1u64 << (vid & 63);
+            if (busy.get(r_base + (vid >> 6)).copied().unwrap_or(0) & self_bit) != 0 {
+                return false;
+            }
             for w in 0..val_words {
                 let bw = busy.get(r_base + w).copied().unwrap_or(0);
                 let iw = interf.get(v_base + w).copied().unwrap_or(0);
@@ -4300,5 +4307,91 @@ mod tests {
             ra.loc_of[gaddr.index()],
         );
         assert!(ra.remat_count > 0, "expected remat_count > 0 under >26 GPR pressure");
+    }
+
+    #[test]
+    fn exact_cfg_gpr_pair_spill_uses_distinct_slots() {
+        let alloc = test_alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I128)], &[Param::of(Ty::I128)]);
+        b.set_signature(sig);
+        let helper_sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+        let helper = b.reference(RefKind::Func, 0);
+
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let base = b.param(Ty::I128);
+        // 8 simultaneously live `i128` values crossing a call require 16 callee-saved GPRs,
+        // exceeding the 10 available (`x19..=x28`) and forcing `AllocLoc::GprPairSpill`.
+        let mut vals: Vec<blaze_lir::Value, Alloc<'static>> = Vec::with_capacity_in(8, alloc);
+        let mut cur = base;
+        for k in 1u128..=8 {
+            let ck = b.iconst(Ty::I128, k);
+            cur = b.binary(Op::Add, Flags::NONE, cur, ck);
+            vals.push(cur);
+        }
+        let call_res = b.call(Flags::NONE, helper, helper_sig, &[]);
+        let mut acc = b.convert(Op::Zext, Flags::NONE, Ty::I128, call_res);
+        for &v in &vals {
+            acc = b.binary(Op::Xor, Flags::NONE, acc, v);
+        }
+        b.ret(&[acc]);
+
+        let func = b.finish_checked().expect("spilled i128 LIR builds");
+        let view = func.view();
+        let n_inst = view.len();
+        let mut skip: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        let mut tail: Vec<bool, Alloc<'static>> = Vec::with_capacity_in(n_inst, alloc);
+        for _ in 0..n_inst {
+            skip.push(false);
+            tail.push(false);
+        }
+
+        let ra_exact = allocate(&view, &skip, &tail, 64, crate::Os::MacOs, alloc)
+            .expect("exact-CFG regalloc succeeds");
+        let gpr_ord = build_caller_gpr_order(None);
+        let fp_ord = build_caller_fp_order(None);
+        let ra_rpo = allocate_linear_scan_rpo(
+            &view,
+            &skip,
+            &tail,
+            64,
+            crate::Os::MacOs,
+            |_| CallClobbers::C_ABI_ARM64,
+            &gpr_ord,
+            &fp_ord,
+            alloc,
+        )
+        .expect("RPO linear-scan regalloc succeeds");
+
+        for (label, ra) in [("exact_cfg", &ra_exact), ("linear_scan_rpo", &ra_rpo)] {
+            let mut spill_count = 0usize;
+            let mut live_slots: Vec<u32, Alloc<'static>> = Vec::new_in(alloc);
+            for &v in &vals {
+                match ra.loc_of[v.index()] {
+                    AllocLoc::GprPair(lo, hi) => {
+                        assert_ne!(lo, hi, "{label}: GprPair halves must use distinct regs");
+                    }
+                    AllocLoc::GprPairSpill(s0, s1) => {
+                        assert_ne!(
+                            s0, s1,
+                            "{label}: GprPairSpill halves must use distinct spill slots (got ({s0}, {s1}))"
+                        );
+                        assert!(
+                            !live_slots.iter().any(|&s| s == s0 || s == s1),
+                            "{label}: simultaneously live GprPairSpill ({s0}, {s1}) collided with {live_slots:?}"
+                        );
+                        live_slots.push(s0);
+                        live_slots.push(s1);
+                        spill_count += 1;
+                    }
+                    other => panic!("{label}: unexpected i128 loc {other:?}"),
+                }
+            }
+            assert!(
+                spill_count >= 3,
+                "{label}: expected at least 3 spilled i128 values across call, got {spill_count}"
+            );
+        }
     }
 }
