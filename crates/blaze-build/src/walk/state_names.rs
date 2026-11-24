@@ -42,8 +42,9 @@ use crate::coroutine_state::{StateName, StateNames, StatePlant, UNNAMED_ACROSS};
 /// The table, what the walk named, and where each slot and stack value came from.
 pub(super) struct Names<'n, A: Allocator> {
     table: StateNames<'n>,
-    /// Each slot named: the slot, the identity, whether it is that local's drop flag, its offset.
-    named: Vec<(SlotId, Identity, bool, u32), A>,
+    /// Each slot named: the slot, the identity, whether it is that local's drop flag, its offset,
+    /// and the coroutine suspend counter (`Co::points`) when it was named.
+    named: Vec<(SlotId, Identity, bool, u32, u32), A>,
     /// Beside the walk's value stack: the expression whose task pushed each value.
     val_at: Vec<ExprId, A>,
     /// The expression of the task being run.
@@ -72,7 +73,7 @@ impl<'n, A: Allocator + Copy> Names<'n, A> {
     /// The names for blaze-lir `split_in`, in `alloc`.
     pub(super) fn slot_names<B: Allocator>(&self, alloc: B) -> Vec<SlotName, B> {
         let mut out = Vec::with_capacity_in(self.named.len(), alloc);
-        out.extend(self.named.iter().map(|&(slot, _, _, offset)| SlotName { slot, offset }));
+        out.extend(self.named.iter().map(|&(slot, _, _, offset, _)| SlotName { slot, offset }));
         out
     }
 
@@ -137,7 +138,8 @@ pub(super) fn task_expr(t: &Task) -> Option<ExprId> {
         | Task::IfThen { expr, .. }
         | Task::IfElse { expr, .. }
         | Task::LetLink { expr, .. }
-        | Task::Short { expr, .. } => Some(expr),
+        | Task::Short { expr, .. }
+        | Task::BuildAgg { expr, .. } => Some(expr),
         Task::Let(_, init) => init,
         Task::Stmt(_)
         | Task::Discard
@@ -202,6 +204,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// saves `id` and no other slot holds it yet. A slot named before by another identity is
     /// renamed (a later, sharper key: `hold_temp`'s expression over `temp`'s task).
     fn name(&mut self, slot: SlotId, id: Identity, flag: bool) {
+        let point = self.co.map_or(0, |c| c.points);
         let Some(n) = self.names.as_mut() else { return };
         let Some(row) = n.table.get(id) else { return };
         let offset = match (flag, row.flag) {
@@ -218,7 +221,20 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         if n.named.iter().any(|r| r.1 == id && r.2 == flag) {
             return;
         }
-        n.named.push((slot, id, flag, offset));
+        n.named.push((slot, id, flag, offset, point));
+    }
+
+    /// Releases `slot`'s name when `slot` is ended (`slot_dead`) without any suspension point
+    /// having been emitted since it was named (e.g. a call-result temporary copied into a
+    /// `SpillAdjusted` / `Spill` / `ArgCopy` slot and immediately ended). That frees the identity
+    /// for the live successor slot that crosses the suspension and avoids keeping the dead slot
+    /// in the coroutine state.
+    pub(super) fn release_dead_slot(&mut self, slot: SlotId) {
+        let cur_points = self.co.map_or(0, |c| c.points);
+        let Some(n) = self.names.as_mut() else { return };
+        if let Some(i) = n.named.iter().position(|r| r.0 == slot && r.4 == cur_points) {
+            n.named.remove_shift(i);
+        }
     }
 
     /// Names `slot` as saved local `id`'s field (bind, `.await`'s future).

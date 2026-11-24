@@ -111,11 +111,13 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     }
 
     /// The block a failed test of an `if let` link goes to, given the `else` block `fail`:
-    /// `fail` itself when the region holds nothing that may need a drop here, else a new block
-    /// `link_fail_end` fills once the test is built.
+    /// `fail` itself when the region holds nothing that may need a drop or slot end here, else a
+    /// new block `link_fail_end` fills once the test is built.
     pub(in crate::walk) fn link_fail(&mut self, fail: Block) -> Result<(Block, bool), BuildError> {
+        let depth = self.scope_marks.len();
         let mark = *self.scope_marks.last().ok_or(malformed("an `if let` link outside its region"))? as usize;
-        if !self.pending_from(mark) {
+        let has_slots = self.co.is_some() && self.scope_slots.iter().any(|&(d, _)| d >= depth);
+        if !self.pending_from(mark) && !has_slots {
             return Ok((fail, false));
         }
         Ok((self.create(), true))
@@ -123,12 +125,18 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
 
     /// Fills block `undo` (from `link_fail`): the region's entries dropped, last made first,
     /// each by its static state or its word (`drop_from`, leaving the walk's state as it is:
-    /// the matched path still holds them), then on to the `else` block `fail`. The current
-    /// block when this is called is left as it was: the caller begins its own next block.
-    pub(in crate::walk) fn link_fail_end(&mut self, undo: Block, fail: Block) -> Result<(), BuildError> {
+    /// the matched path still holds them), then their slots ended, then on to the `else` block
+    /// `fail`. The current block when this is called is left as it was: the caller begins its own
+    /// next block.
+    pub(in crate::walk) fn link_fail_end(&mut self, undo: Block, fail: Block, extra_slot: Option<blaze_lir::func::SlotId>) -> Result<(), BuildError> {
+        let depth = self.scope_marks.len();
         let mark = *self.scope_marks.last().ok_or(malformed("an `if let` link outside its region"))? as usize;
         self.begin(undo);
         self.drop_from(mark)?;
+        self.end_scope_slots_peek(mark, depth);
+        if let Some(slot) = extra_slot {
+            self.end_temp_slot(slot);
+        }
         self.jump(fail, &[]);
         Ok(())
     }

@@ -463,20 +463,25 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 self.scope_pats.remove(i);
             }
         }
-        // End non-dropping temporary slots registered in this temporary scope.
+        // End non-dropping temporary slots (and non-dropping `super let` binding slots)
+        // registered in this temporary scope.
         let mut j = self.temp_slots.len();
         while j > 0 {
             j -= 1;
             if self.temp_slots.get(j).is_some_and(|&(d, _)| d >= depth) {
                 let (_, slot) = self.temp_slots.remove_swap(j);
-                self.end_temp_slot(slot);
+                if self.is_temp_slot(slot) {
+                    self.end_temp_slot(slot);
+                } else if self.live && !self.vals_use_slot(slot) && !self.slot_held(slot) {
+                    self.b.slot_dead(slot);
+                }
             }
         }
         Ok(())
     }
 
     /// Whether `slot` is a `SlotKind::Temp` in the current LIR function.
-    fn is_temp_slot(&self, slot: SlotId) -> bool {
+    pub(super) fn is_temp_slot(&self, slot: SlotId) -> bool {
         self.b
             .func()
             .view()
@@ -556,7 +561,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     }
 
     /// Whether `slot` is bound as any local's home (even a non-dropping local not in `scope_pats`).
-    fn slot_is_local(&self, slot: SlotId) -> bool {
+    pub(super) fn slot_is_local(&self, slot: SlotId) -> bool {
         self.slots.iter().any(|s| match *s {
             Some((Home::Slot(s), _)) => s == slot,
             Some((Home::At(v, _), _)) => self.value_slot(v) == Some(slot),
@@ -577,6 +582,43 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return;
         }
         self.b.slot_dead(slot);
+        self.release_dead_slot(slot);
+    }
+
+    /// Before an `.await`'s suspension loop: ends the storage of any statically moved-out local
+    /// binding (either unflagged with `!self.init[p]`, or flagged with `self.definitely_uninit[p]`
+    /// after an unconditional move in its declaring expression) whose home is a slot of this body
+    /// not currently on the value stack. A moved-out binding cannot be read without being
+    /// re-initialized (which emits a fresh `slot_addr` via `Home::Slot`), and cannot be borrowed
+    /// (borrowck E0505), so ending its slot before the suspend prevents an `sret`-escaped local
+    /// moved before `.await` from falsely staying live across it.
+    pub(super) fn end_moved_locals_before_await(&mut self) {
+        if !self.live {
+            return;
+        }
+        for i in 0..self.scope_pats.len() {
+            let Some(&Held::Pat(p)) = self.scope_pats.get(i) else { continue };
+            if self.captured_whole(p) {
+                continue;
+            }
+            let Some(LocalOwn::Drop(o)) = self.owned.get(p.ix()).copied() else { continue };
+            if o.rest.is_some() {
+                continue;
+            }
+            let moved_out = match o.flag {
+                None => !self.init.get(p.ix()).copied().unwrap_or(false),
+                Some(_) => self.definitely_uninit.get(p.ix()).copied().unwrap_or(false),
+            };
+            if !moved_out {
+                continue;
+            }
+            if let Some((Home::Slot(slot), _)) = self.slots.get(p.ix()).copied().flatten()
+                && !self.vals_use_slot(slot)
+            {
+                self.b.slot_dead(slot);
+                self.release_dead_slot(slot);
+            }
+        }
     }
 
     /// Ends the `SlotKind::Temp` slot underlying `v`, if `v` is a whole-slot place and unused.
@@ -588,6 +630,86 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
     }
 
+    /// Collects the slots owned by `self.scope_pats[mark..]` into `dead`.
+    fn collect_held_slots(&self, mark: usize, dead: &mut Vec<SlotId, A>) {
+        let Some(held) = self.scope_pats.get(mark..) else { return };
+        for &h in held {
+            match h {
+                Held::Pat(p) => {
+                    match self.slots.get(p.ix()).copied().flatten() {
+                        Some((Home::Slot(s), _)) => dead.push(s),
+                        Some((Home::At(val, off), _)) => {
+                            if let Some(s) = self.whole_slot((val, off)) {
+                                dead.push(s);
+                            }
+                        }
+                        None => {}
+                    }
+                    match self.owned.get(p.ix()).copied() {
+                        Some(LocalOwn::Drop(o)) => {
+                            if let Some(f) = o.flag {
+                                dead.push(f);
+                            }
+                            if let Some(r) = o.rest {
+                                dead.push(r);
+                            }
+                        }
+                        Some(LocalOwn::KeptFlags(r)) => dead.push(r),
+                        _ => {}
+                    }
+                }
+                Held::Rest { at, .. } => {
+                    if let Some(s) = self.whole_slot(at)
+                        && self.is_temp_slot(s)
+                    {
+                        dead.push(s);
+                    }
+                }
+                Held::Moved { at, mask, .. } => {
+                    dead.push(mask);
+                    if let Some(s) = self.whole_slot(at)
+                        && self.is_temp_slot(s)
+                    {
+                        dead.push(s);
+                    }
+                }
+                Held::Temp { at, flag, .. } => {
+                    if let Some(s) = self.whole_slot(at)
+                        && self.is_temp_slot(s)
+                    {
+                        dead.push(s);
+                    }
+                    if let Some((f, home)) = flag {
+                        dead.push(f);
+                        dead.push(home);
+                    }
+                }
+                Held::EnvPlace(_) => {}
+            }
+        }
+    }
+
+    /// Emits `slot_dead` on slots owned by `self.scope_pats[mark..]` and `self.scope_slots` at
+    /// depth `>= depth` WITHOUT modifying `scope_pats` or `scope_slots` (for a failed `if let`
+    /// link or `let`-`else` miss path, where the matched path still owns them).
+    pub(super) fn end_scope_slots_peek(&mut self, mark: usize, depth: usize) {
+        if !self.live {
+            return;
+        }
+        let mut dead: Vec<SlotId, A> = Vec::new_in(self.alloc);
+        self.collect_held_slots(mark, &mut dead);
+        for &(d, slot) in self.scope_slots.iter() {
+            if d >= depth {
+                dead.push(slot);
+            }
+        }
+        for slot in dead {
+            if !self.vals_use_slot(slot) {
+                self.b.slot_dead(slot);
+            }
+        }
+    }
+
     /// Ends the storage of slots owned by the drop scope closing at `(mark, depth)`, sparing any
     /// slot backing the scope's settled tail value `v` or still live on the value stack.
     pub(super) fn end_scope_slots(&mut self, mark: usize, depth: usize, v: V) {
@@ -596,63 +718,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             V::None => None,
         };
         let mut dead: Vec<SlotId, A> = Vec::new_in(self.alloc);
-        if self.live
-            && let Some(held) = self.scope_pats.get(mark..)
-        {
-            for &h in held {
-                match h {
-                    Held::Pat(p) => {
-                        match self.slots.get(p.ix()).copied().flatten() {
-                            Some((Home::Slot(s), _)) => dead.push(s),
-                            Some((Home::At(val, off), _)) => {
-                                if let Some(s) = self.whole_slot((val, off)) {
-                                    dead.push(s);
-                                }
-                            }
-                            None => {}
-                        }
-                        match self.owned.get(p.ix()).copied() {
-                            Some(LocalOwn::Drop(o)) => {
-                                if let Some(f) = o.flag {
-                                    dead.push(f);
-                                }
-                                if let Some(r) = o.rest {
-                                    dead.push(r);
-                                }
-                            }
-                            Some(LocalOwn::KeptFlags(r)) => dead.push(r),
-                            _ => {}
-                        }
-                    }
-                    Held::Rest { at, .. } => {
-                        if let Some(s) = self.whole_slot(at)
-                            && self.is_temp_slot(s)
-                        {
-                            dead.push(s);
-                        }
-                    }
-                    Held::Moved { at, mask, .. } => {
-                        dead.push(mask);
-                        if let Some(s) = self.whole_slot(at)
-                            && self.is_temp_slot(s)
-                        {
-                            dead.push(s);
-                        }
-                    }
-                    Held::Temp { at, flag, .. } => {
-                        if let Some(s) = self.whole_slot(at)
-                            && self.is_temp_slot(s)
-                        {
-                            dead.push(s);
-                        }
-                        if let Some((f, home)) = flag {
-                            dead.push(f);
-                            dead.push(home);
-                        }
-                    }
-                    Held::EnvPlace(_) => {}
-                }
-            }
+        if self.live {
+            self.collect_held_slots(mark, &mut dead);
         }
         let mut j = self.scope_slots.len();
         while j > 0 {

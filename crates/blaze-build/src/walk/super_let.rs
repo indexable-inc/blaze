@@ -69,6 +69,53 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         Ok(())
     }
 
+    /// Collects the slots of any non-dropping bindings declared in `pat` (registered in
+    /// `scope_slots` by `own_kept` / `track_local_slot`) so `place_super_let` can move them to
+    /// the extended scope too.
+    fn super_let_kept_slots(&self, pat: PatId) -> Result<blaze_own::Vec<blaze_lir::func::SlotId, A>, BuildError> {
+        let mut slots = blaze_own::Vec::new_in(self.alloc);
+        if self.co.is_none() || self.scope_slots.is_empty() {
+            return Ok(slots);
+        }
+        let mut todo = blaze_own::Vec::new_in(self.alloc);
+        todo.push(pat);
+        while let Some(p) = todo.pop() {
+            match self.pat(p)? {
+                blaze_typeck::Pat::Bind { sub, .. } => {
+                    if let Some((home, _)) = self.slots.get(p.ix()).copied().flatten() {
+                        let s = match home {
+                            super::Home::Slot(s) => Some(s),
+                            super::Home::At(v, off) => self.whole_slot((v, off)),
+                        };
+                        if let Some(s) = s {
+                            slots.push(s);
+                        }
+                    }
+                    if let Some(super::LocalOwn::KeptFlags(s)) = self.owned.get(p.ix()).copied() {
+                        slots.push(s);
+                    }
+                    todo.extend(sub);
+                }
+                blaze_typeck::Pat::Ref { inner, .. } => todo.push(inner),
+                blaze_typeck::Pat::Tuple { elems, .. }
+                | blaze_typeck::Pat::TupleStruct { elems, .. }
+                | blaze_typeck::Pat::Slice { elems, .. }
+                | blaze_typeck::Pat::Or { alts: elems } => {
+                    let list = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
+                    todo.extend_from_slice(list);
+                }
+                blaze_typeck::Pat::Struct { fields, .. } => {
+                    let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
+                    for fp in fps {
+                        todo.push(fp.pat);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(slots)
+    }
+
     /// After the `let` whose pattern is `pat` owned its bindings (the entries `from..` of
     /// `scope_pats`, all `Held::Pat`): when it is a `super let`, moves them to the scope a
     /// temporary of its block's value would be owned by (the module's rule).
@@ -78,8 +125,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return Err(malformed("a `super let`'s bindings start past `scope_pats`"));
         }
         let n = self.scope_pats.len() - from;
-        if n == 0 {
-            // No binding of it needs drop: nothing is held, nothing to move.
+        let kept_slots = self.super_let_kept_slots(pat)?;
+        if n == 0 && kept_slots.is_empty() {
+            // No binding of it needs drop or scope-slot tracking: nothing to move.
             return Ok(());
         }
         let block = self.block_of_stmt(s)?;
@@ -108,6 +156,11 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     self.insert_held(pos, t, depth, h);
                     at += 1;
                 }
+                for (d, slot) in self.scope_slots.iter_mut() {
+                    if kept_slots.scan_for(slot).is_some() && *d > depth {
+                        *d = depth;
+                    }
+                }
                 Ok(())
             }
             None => {
@@ -135,6 +188,16 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     self.insert_held(pos, t + 1, depth, h);
                     self.super_temps.push(p);
                     at += 1;
+                }
+                if !kept_slots.is_empty() {
+                    let mut j = self.scope_slots.len();
+                    while j > 0 {
+                        j -= 1;
+                        if self.scope_slots.get(j).is_some_and(|&(_, s)| kept_slots.scan_for(&s).is_some()) {
+                            let (_, slot) = self.scope_slots.remove_swap(j);
+                            self.temp_slots.push((t, slot));
+                        }
+                    }
                 }
                 Ok(())
             }
