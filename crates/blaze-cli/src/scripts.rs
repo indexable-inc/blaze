@@ -374,19 +374,21 @@ impl<'f> Records<'f> for SourcesDir<'f> {
 pub(crate) struct CommandFeatures<'c, 's, 'm> {
     pub(crate) cx: &'c Cx,
     pub(crate) store: &'s mut dyn Store<'m>,
-    /// The last record read: its bytes are lent for `'m` and answered from here.
-    pub(crate) held: Option<crate::store::Held<'m>>,
+    /// Owned copy of the last record read (`Store::get_into`), so reading an uncommitted
+    /// features record never pins its shared arena in `Lent::kept_arenas`.
+    pub(crate) held: bstd::mem::Bytes<'c>,
 }
 
 impl blaze_world::lib_features_record::FeatureRecords for CommandFeatures<'_, '_, '_> {
     type Error = CliError;
 
     fn get(&mut self, key: ContentId) -> Result<Option<&[u8]>, CliError> {
-        self.held = self.store.get(self.cx, blaze_drive::Key(key))?;
-        if self.held.is_some() {
-            self.store.keep_with_toolchain(blaze_drive::Key(key))?;
+        self.held = bstd::mem::Bytes::new_in(self.cx.frame(), "a library-features record");
+        if !self.store.get_into(self.cx, blaze_drive::Key(key), &mut self.held)? {
+            return Ok(None);
         }
-        Ok(self.held.as_ref().map(|held| held.bytes))
+        self.store.keep_with_toolchain(blaze_drive::Key(key))?;
+        Ok(Some(self.held.as_slice()))
     }
 
     fn put(&mut self, key: ContentId, bytes: &[u8]) -> Result<(), CliError> {
@@ -585,7 +587,7 @@ impl<'f> Scripts<'f> {
         };
         let setup = {
             let _cx = cx.span("scripts: each side's probe answers (library features listed) and the native runner");
-            let mut features = CommandFeatures { cx, store: records, held: None };
+            let mut features = CommandFeatures { cx, store: records, held: bstd::mem::Bytes::new_in(cx.frame(), "a library-features record") };
             blaze_world::script_setting::ScriptSetup::open_recorded(
                 blaze_world::script_setting::ScriptSetupOpts { world, target: host, macro_target: MACRO_TARGET, native: native_opts, alloc: alloc.clone() },
                 tool.0,

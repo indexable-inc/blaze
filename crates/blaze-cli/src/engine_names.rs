@@ -18,11 +18,11 @@ use blaze_drive::cells::Cell;
 use blaze_drive::{Input, Key, Kind, Locate, Name, Part, TaskFailure, Why};
 use blaze_engine::{Buffer, CellId, Done, Phase, Planned, SVec, Stage, Task as EngineTask};
 use blaze_ids::ContentId;
-use blaze_own::{BTreeMap, SharedAlloc, Vec, VecDeque};
+use blaze_own::{BTreeMap, Share, SharedAlloc, Vec, VecDeque};
 use blaze_scope::crate_env::EnvLent;
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::resolve::{CrateInput, SourceTexts};
-use blaze_scope::scope_record::Verified;
+use blaze_scope::scope_record::{CheckedHead, Verified};
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::{Frame, Tag};
@@ -529,6 +529,7 @@ impl<'f> NamesStage<'f> {
         let serve = handles.serve();
         let failed_out = self.failed_out;
         let mut exports = ReadExports { read, route: crate::engine_memory::route_now() };
+        let phase_snap = store.snapshot()?;
         let mut stack = Vec::new_in(&own);
         let mut scratch = Vec::new_in(&own);
         let mut answered = Vec::with_capacity_in(tasks.len(), &own);
@@ -583,10 +584,19 @@ impl<'f> NamesStage<'f> {
                         let bytes = if input.out == failed_out {
                             Mapped::Failed
                         } else {
-                            match exports.exports(&cx, store, &input, crates[g].input.name, &own, wave) {
+                            let krate_g = crates.get(g).map_or("", |c| c.input.name);
+                            let got = match exports.exports_committed(&cx, store, &input, krate_g, wave) {
+                                Ok(Some(bytes)) => Ok(bytes),
+                                Ok(None) => match phase_snap.as_ref() {
+                                    Some(snap) => exports.exports_from_snapshot(snap.as_ref(), &input, krate_g, wave).map(|(bytes, _, _)| bytes),
+                                    None => exports.exports(&cx, store, &input, krate_g, &own, wave),
+                                },
+                                Err(error) => Err(error),
+                            };
+                            match got {
                                 Ok(bytes) => {
                                     let has_exports = blaze_engine::CellDigests::cell(&view, &CellId { of: input.name, cell: EXPORTS }) != blaze_drive::key::ABSENT;
-                                    checked(bytes, crates[g].input.name, has_exports, &own)
+                                    checked(bytes, krate_g, has_exports, &own)
                                 }
                                 Err(ReadError::Load(crate::front_load::LoadError::Store(error))) => return Err(error),
                                 Err(error) => Mapped::Unreadable(blaze_own::format_in!(&own, "{error}").into_bump_str()),
@@ -631,7 +641,7 @@ impl<'f> NamesStage<'f> {
                                 let g = dep.index;
                                 match inputs.slots[g].get().ok_or(EngineCheckError::MissingEntry { task: name, table: Table::MappedExports, key: dep.input.name })? {
                                     Mapped::Exports(proof, has_exports) => {
-                                        dep.exports = Some(*proof);
+                                        dep.exports = Some(ExportRef::Borrowed(*proof));
                                         dep.has_exports = *has_exports;
                                     }
                                     Mapped::Failed => {}
@@ -642,7 +652,7 @@ impl<'f> NamesStage<'f> {
                                     }
                                 }
                             }
-                            let job = Job { at, crates, all, deps: &deps, script: script_bytes, home, env, packs, corrected, procs, kept, workers, oracle, clock, board, serve };
+                            let job = Job { at, crates, all, deps: &deps, uncommitted_snap: None, script: script_bytes, home, env, packs, corrected, procs, kept, workers, oracle, clock, board, serve };
                             job.run(cx, root, task, outlined, alloc)
                         });
                         shown.end(board.now(clock));
@@ -965,6 +975,38 @@ struct ReadExports<'e, 'r> {
     route: crate::engine_memory::ExportsRoute,
 }
 
+impl<'e, 'r> ReadExports<'e, 'r> {
+    fn exports_committed<'j>(&mut self, cx: &Cx, store: &mut dyn crate::store::Store<'r>, input: &Input, krate: &str, alloc: blaze_own::Alloc<'j>) -> Result<Option<&'j [u8]>, ReadError>
+    where
+        'r: 'j,
+    {
+        let read = match self.route {
+            crate::engine_memory::ExportsRoute::InPlace => self.read.exports_committed::<InPlace>(cx, store, input, alloc)?,
+            #[cfg(test)]
+            crate::engine_memory::ExportsRoute::Copying => self.read.exports_committed::<crate::engine_records::Copying>(cx, store, input, alloc)?,
+        };
+        let Some(read) = read else { return Ok(None) };
+        #[cfg(test)]
+        crate::names::sections::watch(krate, read.payload);
+        #[cfg(not(test))]
+        let _ = krate;
+        Ok(Some(read.exports))
+    }
+
+    fn exports_from_snapshot<'j>(&mut self, snap: &'j crate::store::StoreSnapshot, input: &Input, krate: &str, alloc: blaze_own::Alloc<'j>) -> Result<(&'j [u8], usize, usize), ReadError> {
+        let (read, offset, len) = match self.route {
+            crate::engine_memory::ExportsRoute::InPlace => self.read.exports_from_snapshot::<InPlace>(snap, input, alloc)?,
+            #[cfg(test)]
+            crate::engine_memory::ExportsRoute::Copying => self.read.exports_from_snapshot::<crate::engine_records::Copying>(snap, input, alloc)?,
+        };
+        #[cfg(test)]
+        crate::names::sections::watch(krate, read.payload);
+        #[cfg(not(test))]
+        let _ = krate;
+        Ok((read.exports, offset, len))
+    }
+}
+
 impl<'j, 'r: 'j> crate::names::DepExports<'j, 'r> for ReadExports<'_, 'r> {
     fn exports(&mut self, cx: &Cx, store: &mut dyn crate::store::Store<'r>, input: &Input, krate: &str, _frame: &'j Frame, alloc: blaze_own::Alloc<'j>) -> Result<&'j [u8], ReadError> {
         let read = match self.route {
@@ -1042,15 +1084,30 @@ fn cells_of<'a>(name: Name, record: &work::Record<SharedAlloc<'_>>, exports: &[u
     Ok(defines)
 }
 
-/// The mapped exports of a dependency, checked once ([`checked`]), or its failed out (the
-/// worker makes an error crate).
+/// How a dependency's verified exports reach `Job::run`: borrowed directly from a committed
+/// segment (or wave-scoped snapshot), or re-bound in O(1) from `Job::uncommitted_snap` (an
+/// uncommitted shared arena that drops when the `Job` ends, never pinning `Lent::kept_arenas`).
+#[derive(Clone, Copy)]
+enum ExportRef<'j> {
+    Borrowed(Verified<'j>),
+    InSnapshot { head: CheckedHead, offset: usize, len: usize, digest: ContentId },
+}
+
+#[derive(Clone, Copy)]
+enum UncommittedMapped<'w> {
+    Exports { head: CheckedHead, offset: usize, len: usize, digest: ContentId, has_exports: bool },
+    Unreadable(&'w str),
+}
+
+/// The mapped exports of a dependency, checked once ([`checked`] or [`checked_head`]), or its
+/// failed out (the worker makes an error crate).
 #[derive(Clone, Copy)]
 struct Dependency<'j> {
     index: usize,
     input: Input,
     absent: bool,
     has_exports: bool,
-    exports: Option<Verified<'j>>,
+    exports: Option<ExportRef<'j>>,
 }
 
 /// Scratch shared by successive producer walks. Only visited indices need clearing.
@@ -1182,6 +1239,10 @@ pub(crate) struct NamesQueue<'j, 'a> {
     columns: Option<WorldColumns<'j>>,
     walk: ProducerWalk<'j>,
     mapped: Vec<Option<(Input, Mapped<'j>)>, &'j Frame>,
+    /// Short-lived snapshot of the current uncommitted shared arena, keyed by `store.commits()`:
+    /// dropped as soon as a commit advances so `Arc<Arena>` frees without pinning `kept_arenas`.
+    uncommitted_snap: Option<(u32, crate::store::SharedSnapshot)>,
+    uncommitted_mapped: Vec<Option<(Input, UncommittedMapped<'j>)>, &'j Frame>,
     width: usize,
     order: BTreeMap<(bool, u16, Name), EngineTask, &'j Frame>,
     waiting: VecDeque<WaitingName<'j, 'a>, &'j Frame>,
@@ -1198,6 +1259,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
     pub(crate) fn new(frame: &'j Frame, local: blaze_own::Alloc<'j>, slots: &'j crate::engine_scripts::PoolSlots) -> Self {
         let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
         Self { frame, bump, local, slots, columns: None, walk: ProducerWalk::new(frame), mapped: Vec::new_in(frame),
+            uncommitted_snap: None, uncommitted_mapped: Vec::new_in(frame),
             width: 1, order: BTreeMap::new_in(frame), waiting: VecDeque::new_in(frame), running: BTreeMap::new_in(frame), answered: BTreeMap::new_in(frame),
             scratch: BTreeMap::new_in(frame), ended: Vec::new_in(frame), edges: Vec::new_in(frame) }
     }
@@ -1329,45 +1391,170 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         if let Some((input, _)) = script {
             self.edges.push((name, input.name));
         }
+        let commits = store.commits();
+        if self.uncommitted_snap.as_ref().is_some_and(|(was, _)| *was != commits) {
+            self.uncommitted_snap = None;
+            self.uncommitted_mapped.clear();
+        }
         self.mapped.resize(columns.crates.len(), None);
+        self.uncommitted_mapped.resize(columns.crates.len(), None);
         self.walk.start(at, columns.crates.len());
         let mut deps = Vec::new_in(self.frame);
-        let mut exports = ReadExports { read, route: crate::engine_memory::route_now() };
+        let route = crate::engine_memory::route_now();
+        let mut exports = ReadExports { read, route };
         let mut unreadable: Option<(usize, &str)> = None;
+        let mut needs_uncommitted_snap = false;
         while let Some(g) = self.walk.pop() {
             self.walk.stack.extend(edges_of(&columns.crates[g], all, g));
             if g == at { continue; }
             let (input, absent) = lookup(&stage.made, name, stage.crate_names[g], stage.failed_out)?;
             let mut dep = Dependency { index: g, input, absent, has_exports: false, exports: None };
             if gate.is_ok() {
-                let mapped = match self.mapped[g] {
-                    Some((previous, mapped)) if previous == input => mapped,
-                    _ => {
-                        let mapped = if input.out == stage.failed_out {
-                            Mapped::Failed
-                        } else {
-                            match exports.exports(cx, store, &input, columns.crates[g].input.name, self.frame, self.local) {
-                                Ok(bytes) => {
-                                    let has_exports = blaze_engine::CellDigests::cell(&view, &CellId { of: input.name, cell: EXPORTS }) != blaze_drive::key::ABSENT;
-                                    checked(bytes, columns.crates[g].input.name, has_exports, self.frame)
-                                }
-                                Err(ReadError::Load(crate::front_load::LoadError::Store(error))) => return Err(error),
-                                Err(error) => Mapped::Unreadable(blaze_own::format_in!(self.frame, "{error}").into_bump_str()),
+                let krate_g = columns.crates.get(g).map_or("", |c| c.input.name);
+                if let Some((previous, mapped)) = self.mapped.get(g).copied().flatten()
+                    && previous == input
+                {
+                    match mapped {
+                        Mapped::Exports(proof, has_exports) => {
+                            dep.exports = Some(ExportRef::Borrowed(proof));
+                            dep.has_exports = has_exports;
+                        }
+                        Mapped::Failed => {}
+                        Mapped::Unreadable(why) => {
+                            if unreadable.is_none_or(|(first, _)| g < first) {
+                                unreadable = Some((g, why));
                             }
-                        };
-                        self.mapped[g] = Some((input, mapped));
-                        mapped
+                        }
                     }
-                };
-                match mapped {
-                    Mapped::Exports(proof, has_exports) => {
-                        dep.exports = Some(proof);
-                        dep.has_exports = has_exports;
+                } else if let Some((previous, mapped)) = self.uncommitted_mapped.get(g).copied().flatten()
+                    && previous == input
+                {
+                    match mapped {
+                        UncommittedMapped::Exports { head, offset, len, digest, has_exports } => {
+                            dep.exports = Some(ExportRef::InSnapshot { head, offset, len, digest });
+                            dep.has_exports = has_exports;
+                            needs_uncommitted_snap = true;
+                        }
+                        UncommittedMapped::Unreadable(why) => {
+                            if unreadable.is_none_or(|(first, _)| g < first) {
+                                unreadable = Some((g, why));
+                            }
+                        }
                     }
-                    Mapped::Failed => {}
-                    Mapped::Unreadable(why) => {
-                        if unreadable.is_none_or(|(first, _)| g < first) {
-                            unreadable = Some((g, why));
+                } else if input.out == stage.failed_out {
+                    if let Some(slot) = self.mapped.get_mut(g) {
+                        *slot = Some((input, Mapped::Failed));
+                    }
+                } else {
+                    match exports.exports_committed(cx, store, &input, krate_g, self.local) {
+                        Ok(Some(bytes)) => {
+                            let has_exports = blaze_engine::CellDigests::cell(&view, &CellId { of: input.name, cell: EXPORTS }) != blaze_drive::key::ABSENT;
+                            let mapped = checked(bytes, krate_g, has_exports, self.frame);
+                            if let Some(slot) = self.mapped.get_mut(g) {
+                                *slot = Some((input, mapped));
+                            }
+                            match mapped {
+                                Mapped::Exports(proof, has_exports) => {
+                                    dep.exports = Some(ExportRef::Borrowed(proof));
+                                    dep.has_exports = has_exports;
+                                }
+                                Mapped::Failed => {}
+                                Mapped::Unreadable(why) => {
+                                    if unreadable.is_none_or(|(first, _)| g < first) {
+                                        unreadable = Some((g, why));
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // Uncommitted shared-arena record: read via a short-lived snapshot so
+                            // `Lent::shared_lent` stays false and the arena frees on commit.
+                            let use_snapshot = matches!(route, crate::engine_memory::ExportsRoute::InPlace);
+                            if use_snapshot {
+                                let has_key = match &self.uncommitted_snap {
+                                    Some((_, snap)) => snap.get(input.at).ok().flatten().is_some(),
+                                    None => false,
+                                };
+                                if !has_key {
+                                    self.uncommitted_snap = store.snapshot()?.map(|snap| (commits, snap));
+                                }
+                            }
+                            if use_snapshot && let Some((_, snap)) = self.uncommitted_snap.as_ref() {
+                                match exports.exports_from_snapshot(snap.as_ref(), &input, krate_g, self.local) {
+                                    Ok((bytes, offset, len)) => {
+                                        let has_exports = blaze_engine::CellDigests::cell(&view, &CellId { of: input.name, cell: EXPORTS }) != blaze_drive::key::ABSENT;
+                                        let mapped = checked_head(bytes, offset, len, krate_g, has_exports, self.frame);
+                                        if let Some(slot) = self.uncommitted_mapped.get_mut(g) {
+                                            *slot = Some((input, mapped));
+                                        }
+                                        match mapped {
+                                            UncommittedMapped::Exports { head, offset, len, digest, has_exports } => {
+                                                dep.exports = Some(ExportRef::InSnapshot { head, offset, len, digest });
+                                                dep.has_exports = has_exports;
+                                                needs_uncommitted_snap = true;
+                                            }
+                                            UncommittedMapped::Unreadable(why) => {
+                                                if unreadable.is_none_or(|(first, _)| g < first) {
+                                                    unreadable = Some((g, why));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(ReadError::Load(crate::front_load::LoadError::Store(error))) => return Err(error),
+                                    Err(error) => {
+                                        let why = blaze_own::format_in!(self.frame, "{error}").into_bump_str();
+                                        if let Some(slot) = self.uncommitted_mapped.get_mut(g) {
+                                            *slot = Some((input, UncommittedMapped::Unreadable(why)));
+                                        }
+                                        if unreadable.is_none_or(|(first, _)| g < first) {
+                                            unreadable = Some((g, why));
+                                        }
+                                    }
+                                }
+                            } else {
+                                // `Copying` test control (or non-snapshot test store).
+                                match exports.exports(cx, store, &input, krate_g, self.frame, self.local) {
+                                    Ok(bytes) => {
+                                        let has_exports = blaze_engine::CellDigests::cell(&view, &CellId { of: input.name, cell: EXPORTS }) != blaze_drive::key::ABSENT;
+                                        let mapped = checked(bytes, krate_g, has_exports, self.frame);
+                                        if let Some(slot) = self.mapped.get_mut(g) {
+                                            *slot = Some((input, mapped));
+                                        }
+                                        match mapped {
+                                            Mapped::Exports(proof, has_exports) => {
+                                                dep.exports = Some(ExportRef::Borrowed(proof));
+                                                dep.has_exports = has_exports;
+                                            }
+                                            Mapped::Failed => {}
+                                            Mapped::Unreadable(why) => {
+                                                if unreadable.is_none_or(|(first, _)| g < first) {
+                                                    unreadable = Some((g, why));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(ReadError::Load(crate::front_load::LoadError::Store(error))) => return Err(error),
+                                    Err(error) => {
+                                        let why = blaze_own::format_in!(self.frame, "{error}").into_bump_str();
+                                        if let Some(slot) = self.mapped.get_mut(g) {
+                                            *slot = Some((input, Mapped::Unreadable(why)));
+                                        }
+                                        if unreadable.is_none_or(|(first, _)| g < first) {
+                                            unreadable = Some((g, why));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(ReadError::Load(crate::front_load::LoadError::Store(error))) => return Err(error),
+                        Err(error) => {
+                            let why = blaze_own::format_in!(self.frame, "{error}").into_bump_str();
+                            if let Some(slot) = self.mapped.get_mut(g) {
+                                *slot = Some((input, Mapped::Unreadable(why)));
+                            }
+                            if unreadable.is_none_or(|(first, _)| g < first) {
+                                unreadable = Some((g, why));
+                            }
                         }
                     }
                 }
@@ -1390,7 +1577,12 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
             }
         } else { None };
         let workers = self.set_width(scope, handles, scripts_pending);
-        let job = Job { at, crates: columns.crates, all, deps, script: script_bytes, home: handles.env.home, env, packs: columns.packs,
+        let uncommitted_snap = if gate.is_ok() && needs_uncommitted_snap {
+            self.uncommitted_snap.as_ref().map(|(_, snap)| Share::share(snap))
+        } else {
+            None
+        };
+        let job = Job { at, crates: columns.crates, all, deps, uncommitted_snap, script: script_bytes, home: handles.env.home, env, packs: columns.packs,
             corrected: columns.corrected, procs: gate.as_ref().ok().copied().flatten(), kept: handles.env.heap.shared(), workers, oracle: handles.oracle, clock: &handles.env.clock, board: handles.board, serve: handles.serve() };
         self.order.insert((!feeds_names, task.planned.phase.wave, name), task);
         self.waiting.push_back(WaitingName { task, scope, job, script, blocked: gate.err(), root: handles.root, clock: &handles.env.clock,
@@ -1440,6 +1632,8 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         while let Some(handle) = self.ended.pop() {
             if let Err(why) = handle.join(cx) { error.get_or_insert(CliError::Pool(why)); }
         }
+        self.uncommitted_snap = None;
+        self.uncommitted_mapped.clear();
         error.map_or(Ok(()), Err)
     }
 }
@@ -1467,7 +1661,8 @@ fn input_cell(input: Input, absent: bool) -> (CellId, ContentId) {
 
 fn dep_input_cell(dep: &Dependency<'_>) -> (CellId, ContentId) {
     match (dep.absent, dep.has_exports, dep.exports) {
-        (false, true, Some(proof)) => (CellId { of: dep.input.name, cell: EXPORTS }, exports_digest(proof.bytes())),
+        (false, true, Some(ExportRef::Borrowed(proof))) => (CellId { of: dep.input.name, cell: EXPORTS }, exports_digest(proof.bytes())),
+        (false, true, Some(ExportRef::InSnapshot { digest, .. })) => (CellId { of: dep.input.name, cell: EXPORTS }, digest),
         _ => input_cell(dep.input, dep.absent),
     }
 }
@@ -1484,6 +1679,8 @@ struct Job<'j> {
     crates: &'j [blaze_world::Crate<'j>],
     all: Sysroot,
     deps: &'j [Dependency<'j>],
+    /// Short-lived snapshot keeping any `ExportRef::InSnapshot` arena alive for this job alone.
+    uncommitted_snap: Option<crate::store::SharedSnapshot>,
     script: Option<(Input, &'j [u8])>,
     home: Option<&'j str>,
     env: Option<EnvLent<'j, 'j>>,
@@ -1614,7 +1811,25 @@ impl Job<'_> {
         let mut exports = Vec::with_capacity_in(order.len(), local);
         for dep in &order {
             let proof = match dep.exports {
-                Some(proof) => proof,
+                Some(ExportRef::Borrowed(proof)) => proof,
+                Some(ExportRef::InSnapshot { head, offset, len, .. }) => {
+                    let dep_krate = self.crates.get(dep.index).map_or("", |c| c.input.name);
+                    let Some(snap) = self.uncommitted_snap.as_ref() else {
+                        return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate `{}`: missing snapshot for uncommitted dependency `{dep_krate}`", input.name)));
+                    };
+                    let record = match snap.get(dep.input.at) {
+                        Ok(Some(bytes)) => bytes,
+                        Ok(None) => return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate `{}`: uncommitted dependency `{dep_krate}` absent from snapshot", input.name))),
+                        Err(why) => return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate `{}`: uncommitted dependency `{dep_krate}` snapshot error: {why}", input.name))),
+                    };
+                    let Some(slice) = offset.checked_add(len).and_then(|end| record.get(offset..end)) else {
+                        return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate `{}`: uncommitted dependency `{dep_krate}` exports slice out of bounds", input.name)));
+                    };
+                    let Some(proof) = head.rebind(slice) else {
+                        return Ok(refuse("a dependency's record", blaze_own::format_in!(alloc, "crate `{}`: uncommitted dependency `{dep_krate}` exports identity mismatch", input.name)));
+                    };
+                    proof
+                }
                 None => {
                     // A failed dependency's error record: a header and one empty root, made and
                     // checked here, for this crate alone.
@@ -2062,6 +2277,22 @@ fn checked<'w>(bytes: &'w [u8], krate: &str, has_exports: bool, frame: &'w Frame
     match Verified::check(bytes) {
         Ok(proof) => Mapped::Exports(proof, has_exports),
         Err(error) => Mapped::Unreadable(blaze_own::format_in!(frame, "its exports record did not check: {error:?}").into_bump_str()),
+    }
+}
+
+fn checked_head<'w>(bytes: &[u8], offset: usize, len: usize, krate: &str, has_exports: bool, frame: &'w Frame) -> UncommittedMapped<'w> {
+    #[cfg(test)]
+    {
+        let mut checks = CHECKED.lock();
+        if !checks.krate.is_empty() && checks.krate == krate {
+            checks.count += 1;
+        }
+    }
+    #[cfg(not(test))]
+    let _ = krate;
+    match CheckedHead::check(bytes) {
+        Ok(head) => UncommittedMapped::Exports { head, offset, len, digest: exports_digest(bytes), has_exports },
+        Err(error) => UncommittedMapped::Unreadable(blaze_own::format_in!(frame, "its exports record did not check: {error:?}").into_bump_str()),
     }
 }
 

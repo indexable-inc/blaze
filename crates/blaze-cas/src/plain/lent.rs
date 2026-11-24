@@ -187,6 +187,15 @@ impl<'l> Lend<'l> {
     }
 }
 
+/// Answer of [`Lent::get_committed`]: a committed segment borrow, an uncommitted arena record
+/// (caller reads through a [`super::Snapshot`] so the arena frees on commit), or absent.
+#[derive(Clone, Copy, Debug)]
+pub enum CommittedLend<'l> {
+    Found(Lend<'l>),
+    InArena,
+    Absent,
+}
+
 /// The alignment every record of a segment starts at, and every section a reader cuts at a
 /// multiple of it inside one (blaze-drive record.rs `PAYLOAD_ALIGN`, blaze-cli names/sections.rs).
 const ALIGN_BYTES: usize = blaze_keyed::store::ALIGN as usize;
@@ -541,6 +550,85 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         self.inner.borrow_mut().store.driver().wall_ns()
     }
 
+    /// A non-lending lookup against committed segments alone ([`Lent::get_committed`]).
+    /// Never marks an uncommitted arena chunk or shared arena as lent.
+    pub fn get_committed(&self, key: &Key) -> Result<CommittedLend<'_>, LentError> {
+        let mut inner = self.inner.borrow_mut();
+        let inner = &mut *inner;
+        inner.counts.gets += 1;
+        if let Some(at) = inner.puts.get(&key.0.0).copied() {
+            if at.tag == ReservedTag::Pointer.tag() {
+                return Err(LentError::PointerTag { key: *key });
+            }
+            return Ok(CommittedLend::InArena);
+        }
+        let Some(found) = inner.store.get(key).map_err(stopped("reading a committed record"))? else {
+            inner.counts.misses += 1;
+            return Ok(CommittedLend::Absent);
+        };
+        let got = inner.store.got(found);
+        if got.tag == ReservedTag::Pointer.tag() {
+            return Err(LentError::PointerTag { key: *key });
+        }
+        let (ptr, len, tag, namespace) = (got.bytes.as_ptr(), got.bytes.len(), got.tag, got.namespace);
+        inner.counts.from_segments += 1;
+        // SAFETY: `got` comes from a proved segment mapping held by `inner.store`, which stays
+        // mapped for the life of this `Lent` (`lend`'s contract).
+        Ok(CommittedLend::Found(Lend { tag, namespace, bytes: unsafe { lend(ptr, len) }, own: false, shared: false }))
+    }
+
+    /// The tag of the record under `key`, without lending its bytes: inspects uncommitted puts
+    /// first, else committed segments. Never sets `shared_lent` or pins an arena chunk.
+    pub fn tag_of(&self, key: &Key) -> Result<Option<Tag>, LentError> {
+        let mut inner = self.inner.borrow_mut();
+        let inner = &mut *inner;
+        if let Some(at) = inner.puts.get(&key.0.0).copied() {
+            if at.tag == ReservedTag::Pointer.tag() {
+                return Err(LentError::PointerTag { key: *key });
+            }
+            return Ok(Some(at.tag));
+        }
+        let Some(found) = inner.store.get(key).map_err(stopped("inspecting a record's tag"))? else {
+            return Ok(None);
+        };
+        let got = inner.store.got(found);
+        if got.tag == ReservedTag::Pointer.tag() {
+            return Err(LentError::PointerTag { key: *key });
+        }
+        Ok(Some(got.tag))
+    }
+
+    /// Reads the bytes under `key` inside `f` without lending them past this call, so an
+    /// uncommitted put never pins its arena chunk or shared arena.
+    pub fn with_bytes<R>(&self, key: &Key, f: impl FnOnce(Tag, Namespace, &[u8]) -> R) -> Result<Option<R>, LentError> {
+        let mut inner = self.inner.borrow_mut();
+        let inner = &mut *inner;
+        inner.counts.gets += 1;
+        if let Some(at) = inner.puts.get(&key.0.0).copied() {
+            if at.tag == ReservedTag::Pointer.tag() {
+                return Err(LentError::PointerTag { key: *key });
+            }
+            inner.counts.from_puts += 1;
+            let kept = inner.kept(&at);
+            return Ok(Some(f(at.tag, at.namespace, kept)));
+        }
+        let Some(found) = inner.store.get(key).map_err(stopped("reading a record into a buffer"))? else {
+            inner.counts.misses += 1;
+            return Ok(None);
+        };
+        let got = inner.store.got(found);
+        if got.tag == ReservedTag::Pointer.tag() {
+            return Err(LentError::PointerTag { key: *key });
+        }
+        inner.counts.from_segments += 1;
+        Ok(Some(f(got.tag, got.namespace, got.bytes)))
+    }
+
+    /// Number of shared arenas pinned past commit because a `Lent::get` borrowed from them.
+    pub fn kept_arenas(&self) -> usize {
+        self.inner.borrow().kept_arenas.len()
+    }
+
     /// The record under `key`, for the life of this borrow: this command's own put while it
     /// is not yet committed (from the arena: not in place), else the committed record of the
     /// first namespace read that holds it (a segment mapped at its first probe, `Driven::get`),
@@ -770,9 +858,9 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// command already pointed at `target`, not yet committed, is [`Put::Same`]; every other
     /// point is written, so of two processes the later commit wins.
     pub fn point(&self, tag: Tag, name: &Key, target: &Key) -> Result<Put, LentError> {
-        match self.get(target)? {
+        match self.tag_of(target)? {
             None => return Err(LentError::PointsAtNothing { name: *name, target: *target }),
-            Some(lend) if lend.tag != tag => return Err(LentError::TargetTag { name: *name, target: *target, want: tag, found: lend.tag }),
+            Some(found) if found != tag => return Err(LentError::TargetTag { name: *name, target: *target, want: tag, found }),
             Some(_) => {}
         }
         let now = self.newest_target(name)?;
@@ -805,9 +893,9 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// [`LentError::TargetGone`]; one of another tag [`LentError::TargetTag`].
     pub fn pointed(&self, tag: Tag, name: &Key) -> Result<Option<Key>, LentError> {
         let Some(target) = self.newest_target(name)? else { return Ok(None) };
-        match self.get(&target)? {
+        match self.tag_of(&target)? {
             None => Err(LentError::TargetGone { name: *name, target }),
-            Some(lend) if lend.tag != tag => Err(LentError::TargetTag { name: *name, target, want: tag, found: lend.tag }),
+            Some(found) if found != tag => Err(LentError::TargetTag { name: *name, target, want: tag, found }),
             Some(_) => Ok(Some(target)),
         }
     }
