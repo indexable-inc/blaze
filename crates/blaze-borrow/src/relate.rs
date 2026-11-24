@@ -34,7 +34,7 @@ use blaze_typeck::region_facts::Outlives;
 use blaze_typeck::regions::Region;
 use blaze_typeck::{ItemKey, PNode, PTy};
 
-use crate::inst::{Arg, Ask, AskArgs, Clause, EnvId, Envs, ImplValue, Inst, Keyed, RegAt, Selected, Selection, Side, Slots, TypeAt, Typed};
+use crate::inst::{Arg, Ask, AskArgs, Clause, EnvId, Envs, ImplValue, Inst, Keyed, RegAt, RpititTarget, Selected, Selection, Side, Slots, TypeAt, Typed};
 use crate::types::{Kids, Pos, RegionTypes, SlotCount, Unknown};
 use crate::{Bad, Head, NotSelected, Refused, Reg, ShapeWhy, Variance};
 
@@ -276,6 +276,17 @@ impl<A: Allocator + Copy> AskArgs for Keyer<'_, '_, '_, A> {
             _ => None,
         }
     }
+}
+
+/// Outcome of attempting to normalize a trait fn's RPITIT opaque ([`Walk::normalize_rpitit`]).
+enum RpititStep<'c> {
+    /// Not an RPITIT opaque or no concrete impl was selected.
+    None,
+    /// Provided default (`rpitit::Twin`): the other side is `Opaque(twin, ..)` with identical
+    /// captured lifetimes and type arguments.
+    Twin,
+    /// Concrete impl fn's return subtree at the opaque's place, in the impl fn's environment.
+    Normalized(Side<'c>),
 }
 
 /// A side after its type parameters are followed.
@@ -811,7 +822,32 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                         continue;
                     }
                 }
-                if !head_eq(na, nb) {
+                let mut heads_match = head_eq(na, nb);
+                if !heads_match {
+                    if let PNode::Opaque(op_key, _) = na {
+                        match self.normalize_rpitit(a, op_key, nb, d)? {
+                            RpititStep::Twin => heads_match = true,
+                            RpititStep::Normalized(a_norm) => {
+                                enter = Some((a_norm, b, v, bv, d + 1));
+                                continue;
+                            }
+                            RpititStep::None => {}
+                        }
+                    }
+                    if !heads_match
+                        && let PNode::Opaque(op_key, _) = nb
+                    {
+                        match self.normalize_rpitit(b, op_key, na, d)? {
+                            RpititStep::Twin => heads_match = true,
+                            RpititStep::Normalized(b_norm) => {
+                                enter = Some((a, b_norm, v, bv, d + 1));
+                                continue;
+                            }
+                            RpititStep::None => {}
+                        }
+                    }
+                }
+                if !heads_match {
                     return Err(Refused::Shape { item: self.item, a: a.ty, b: b.ty, why: ShapeWhy::Heads { a: Head::of(na), b: Head::of(nb) } });
                 }
                 self.fits(a)?;
@@ -970,6 +1006,184 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         Ok(Side { ty: value.ty, slots: Slots::Sig { col: value.col, env } })
     }
 
+    /// Normalize a trait fn's RPITIT opaque (`Opaque(op_key, ..)`, RFC 3425) at a concrete call
+    /// site to either its provided default `Twin` or the selected impl fn's return subtree.
+    fn normalize_rpitit(&mut self, s: Side<'c>, op_key: ItemKey, other: PNode, depth: u32) -> Result<RpititStep<'c>, Refused> {
+        let Slots::Sig { env: call_env, .. } = s.slots else { return Ok(RpititStep::None) };
+        let selected: &'c dyn Selected = self.selected;
+        let key = Keyer { walk: &*self, at: AskAt::Kids(s), budget: Cell::new(MOST_WALK_STEPS) };
+        let Some(target) = selected.rpitit_target(op_key, &key) else {
+            return Ok(RpititStep::None);
+        };
+        match target {
+            RpititTarget::Twin { twin } => {
+                if matches!(other, PNode::Opaque(k, _) if k == twin) {
+                    Ok(RpititStep::Twin)
+                } else {
+                    Ok(RpititStep::None)
+                }
+            }
+            RpititTarget::ImplFn { trait_, head, trait_types, impl_fn: _, impl_params, impl_col, trait_col } => {
+                self.fits(s)?;
+                let own = self.own(s)?;
+                let s_kids = self.kids_of(s)?;
+                let Some(fn_types) = s_kids.len().checked_sub(trait_types) else {
+                    return Ok(RpititStep::None);
+                };
+                let Some(total_types) = head.types.checked_add(fn_types) else {
+                    return Ok(RpititStep::None);
+                };
+                let impl_env = self.envs.impl_env(impl_params.count(), total_types).ok_or(self.malformed(s.ty, Bad::StepBound))?;
+                let saved = (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v);
+                self.bound_len = 0;
+                self.hr_len = 0;
+                self.binder_v = BinderCtx::None;
+                let res = self.bind_rpitit_impl(s, own, &s_kids, call_env, impl_env, trait_, head, trait_types, fn_types, impl_params, impl_col, trait_col, op_key, depth);
+                (self.bound, self.bound_len, self.hr, self.hr_len, self.binder_v) = saved;
+                match res? {
+                    Some(side) => Ok(RpititStep::Normalized(side)),
+                    None => Ok(RpititStep::None),
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_rpitit_impl(
+        &mut self,
+        s: Side<'c>,
+        own: SlotCount,
+        s_kids: &Kids<'c>,
+        call_env: EnvId,
+        impl_env: EnvId,
+        trait_: ItemKey,
+        head: crate::inst::ImplHead<'c>,
+        trait_types: u32,
+        fn_types: u32,
+        impl_params: blaze_typeck::region_facts::ParamsView<'c>,
+        impl_col: blaze_typeck::region_facts::ColView<'c>,
+        trait_col: blaze_typeck::region_facts::ColView<'c>,
+        op_key: ItemKey,
+        depth: u32,
+    ) -> Result<Option<Side<'c>>, Refused> {
+        let header = Side { ty: head.trait_ref.ty, slots: Slots::Sig { col: head.trait_ref.col, env: impl_env } };
+        self.fits(header)?;
+        let tl = self.own(header)?;
+        for k in 0..tl.get() {
+            let x = self.slot(header, k)?;
+            let y = self.envs.reg(call_env, Region::Param(k)).map_err(|w| self.malformed(s.ty, w))?;
+            self.pair(s.ty, x, y, Variance::In, Self::env_of(header), Some(call_env))?;
+        }
+        let hkids = self.kids_of(header)?;
+        if hkids.len() != trait_types {
+            return Err(self.malformed(s.ty, Bad::HeaderKids { alias: trait_types, header: hkids.len() }));
+        }
+        let (_, mut srest) = s.slots.split(own).ok_or(self.malformed(s.ty, Bad::StepBound))?;
+        let (_, mut hrest) = header.slots.split(tl).ok_or(self.malformed(header.ty, Bad::StepBound))?;
+        for k in 0..trait_types {
+            let (h, hr) = self.kid(header, &hkids, hrest, k)?;
+            let (x, sr) = self.kid(s, s_kids, srest, k)?;
+            hrest = hr;
+            srest = sr;
+            self.walk(h, x, Variance::In, depth + 1)?;
+        }
+        for k in 0..fn_types {
+            let (x, sr) = self.kid(s, s_kids, srest, trait_types + k)?;
+            srest = sr;
+            self.envs.bind_type(impl_env, head.types + k, x).map_err(|w| self.malformed(s.ty, w))?;
+        }
+        let impl_sig_kids = self.sig_types.kids(impl_col.ty()).map_err(|u| self.count_err(u))?;
+        let trait_sig_kids = self.sig_types.kids(trait_col.ty()).map_err(|u| self.count_err(u))?;
+        let Some(n_in) = impl_sig_kids.len().checked_sub(1) else {
+            return Ok(None);
+        };
+        if trait_sig_kids.len() != impl_sig_kids.len() {
+            return Ok(None);
+        }
+        for k in 0..n_in {
+            let (Some(i_ty), Some(t_ty), Some(i_sl), Some(t_sl)) = (impl_sig_kids.get(k), trait_sig_kids.get(k), impl_col.child(k), trait_col.child(k)) else {
+                return Ok(None);
+            };
+            let i_side = Side { ty: i_ty, slots: Slots::Sig { col: i_sl, env: impl_env } };
+            let t_side = Side { ty: t_ty, slots: Slots::Sig { col: t_sl, env: call_env } };
+            self.walk(i_side, t_side, Variance::In, depth + 1)?;
+        }
+        self.impl_where(head.imp, trait_, s.ty, impl_env, head.lifetimes)?;
+        for i in head.lifetimes..impl_params.count() {
+            if let RegAt::Unbound { param, .. } = self.envs.reg(impl_env, Region::Param(i)).map_err(|w| self.malformed(s.ty, w))? {
+                let o = self.out.fresh(Kind::Existential);
+                self.envs.bind_reg(impl_env, param, Reg::Origin(o)).map_err(|w| self.malformed(s.ty, w))?;
+            }
+        }
+        for &(long, short) in impl_params.outlives() {
+            let (l, sh) = (self.known_in(impl_env, long, s.ty)?, self.known_in(impl_env, short, s.ty)?);
+            self.outlives(s.ty, l, sh)?;
+        }
+        let (Some(i_out_ty), Some(t_out_ty), Some(i_out_sl)) = (impl_sig_kids.get(n_in), trait_sig_kids.get(n_in), impl_col.child(n_in)) else {
+            return Ok(None);
+        };
+        let Some((val_ty, val_col)) = self.rpitit_place(t_out_ty, i_out_ty, i_out_sl, op_key)? else {
+            return Ok(None);
+        };
+        Ok(Some(Side { ty: val_ty, slots: Slots::Sig { col: val_col, env: impl_env } }))
+    }
+
+    /// Find the subtree `(impl_ty, impl_col)` at the exact position `PNode::Opaque(op_key, _)`
+    /// occupies in `trait_ty`, slicing `impl_col` in pre-order (iterative, bounded).
+    fn rpitit_place(&self, trait_ty: PTy, impl_ty: PTy, impl_col: &'c [Region], op_key: ItemKey) -> Result<Option<(PTy, &'c [Region])>, Refused> {
+        const CAP: usize = 64;
+        let mut stack: [Option<(PTy, PTy, &'c [Region])>; CAP] = [None; CAP];
+        let mut sp = 0usize;
+        if let Some(slot) = stack.get_mut(sp) {
+            *slot = Some((trait_ty, impl_ty, impl_col));
+            sp += 1;
+        }
+        let mut steps = 0u32;
+        while let Some(top_idx) = sp.checked_sub(1) {
+            sp = top_idx;
+            let Some(Some((t, i, col))) = stack.get(top_idx).copied() else {
+                return Ok(None);
+            };
+            steps += 1;
+            if steps > MOST_WALK_STEPS {
+                return Err(self.malformed(t, Bad::StepBound));
+            }
+            let nt = self.sig_types.node(t).map_err(|u| self.count_err(u))?;
+            if matches!(nt, PNode::Opaque(k, _) if k == op_key) {
+                return Ok(Some((i, col)));
+            }
+            let ni = self.sig_types.node(i).map_err(|u| self.count_err(u))?;
+            if !head_eq(nt, ni) {
+                continue;
+            }
+            let tkids = self.sig_types.kids(t).map_err(|u| self.count_err(u))?;
+            let ikids = self.sig_types.kids(i).map_err(|u| self.count_err(u))?;
+            if tkids.len() != ikids.len() {
+                continue;
+            }
+            let i_own = self.sig_types.own(i).map_err(|u| self.count_err(u))?;
+            let Some((_, mut rest)) = col.split_at_checked(i_own.len()) else {
+                return Ok(None);
+            };
+            for k in 0..tkids.len() {
+                let (Some(tk), Some(ik)) = (tkids.get(k), ikids.get(k)) else {
+                    return Ok(None);
+                };
+                let kc = self.sig_types.count(ik).map_err(|u| self.count_err(u))?;
+                let Some((kcol, next_rest)) = rest.split_at_checked(kc.len()) else {
+                    return Ok(None);
+                };
+                rest = next_rest;
+                let Some(slot) = stack.get_mut(sp) else {
+                    return Err(self.malformed(t, Bad::StepBound));
+                };
+                *slot = Some((tk, ik, kcol));
+                sp += 1;
+            }
+        }
+        Ok(None)
+    }
+
     /// Every component of `s` outlives `region`.
     fn components(&mut self, s: Side<'c>, region: Reg, depth: u32) -> Result<(), Refused> {
         let base_sp = self.comp_sp;
@@ -998,10 +1212,72 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     PNode::Alias { trait_, name, .. } => {
                         let selected: &'c dyn Selected = self.selected;
                         let key = Keyer { walk: &*self, at: AskAt::Kids(cur), budget: Cell::new(MOST_WALK_STEPS) };
-                        if let Selection::Impl { value: Some(_), .. } = selected.select_keyed(Ask { trait_, name: Some(name), written: cur.ty }, &key) {
-                            let value = self.normalize(cur, n, d)?;
-                            enter = Some((value, d + 1));
-                            continue;
+                        match selected.select_keyed(Ask { trait_, name: Some(name), written: cur.ty }, &key) {
+                            Selection::Impl { value: Some(_), .. } => {
+                                let value = self.normalize(cur, n, d)?;
+                                enter = Some((value, d + 1));
+                                continue;
+                            }
+                            Selection::Not(_) => {
+                                // Caller's own `where <Alias>: 'rhs` clause (e.g. `forward_output`:
+                                // `fn f<F: Future>(f: F) where F::Output: 'static { output_only(f); }`):
+                                // if the caller already assumes `cur: 'rhs` and `'rhs` satisfies
+                                // `region`, no further outlives requirement on `cur`'s arguments is needed.
+                                let owner: &'c dyn Owner = self.owner;
+                                let clauses = owner.clauses();
+                                if !clauses.is_empty()
+                                    && let Some(oenv) = self.envs.owner_env()
+                                {
+                                    let mut satisfied = false;
+                                    for cv in clauses {
+                                        let Some(rhs) = cv.outlives else { continue };
+                                        if cv.binders != 0 {
+                                            continue;
+                                        }
+                                        let rhs_reg = if rhs == Region::Static { Reg::Static } else { Reg::Owner(rhs) };
+                                        if rhs_reg != Reg::Static && rhs_reg != region {
+                                            continue;
+                                        }
+                                        let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: oenv } };
+                                        if let Some(n) = c.slots.len()
+                                            && cur.slots.len() == Some(n)
+                                            && self.erased_sides(c, cur)
+                                            && (0..n.get()).all(|k| {
+                                                matches!(
+                                                    (self.slot(c, k), self.slot(cur, k)),
+                                                    (Ok(RegAt::Known(a)), Ok(RegAt::Known(b))) if a == b
+                                                )
+                                            })
+                                        {
+                                            self.outlives(cur.ty, rhs_reg, region)?;
+                                            satisfied = true;
+                                            break;
+                                        }
+                                    }
+                                    if satisfied {
+                                        continue;
+                                    }
+                                }
+                                // Builtin `<async { .. } as Future>::Output`: when the future's
+                                // output type carries zero lifetime slots (e.g. `()` or a bare
+                                // type parameter `T`), normalize straight to `output` so its
+                                // outlives bound does not constrain the future's own captures.
+                                let kids = self.kids_of(cur)?;
+                                if kids.len() == 1
+                                    && let Ok(own) = self.own(cur)
+                                    && let Some((_, rest)) = cur.slots.split(own)
+                                    && let Ok((subj, _)) = self.kid(cur, &kids, rest, 0)
+                                    && let Ok(Resolved::Side(subj)) = self.resolve(subj)
+                                    && let Ok(PNode::Future(_, output, _)) = self.node(subj)
+                                {
+                                    let out_side = Side { ty: output, slots: Slots::Caller(crate::SlotRange::EMPTY) };
+                                    if self.fits(out_side).is_ok() {
+                                        enter = Some((out_side, d + 1));
+                                        continue;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                         // Not selected: the alias outlives `'r` if its arguments do (RFC 1214's
                         // projection rule, its sufficient half).
@@ -2325,6 +2601,16 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             let (args_tuple, _) = self.kid(want, &kids, rest, 1)?;
             if let Some(out) = self.builtin_fn_trait(subject, args_tuple, None, trait_, want.ty)? {
                 return Ok(Some(out));
+            }
+        }
+        // 1b. Builtin `<async { .. } as Future>::Output`: when the future's output carries zero
+        // lifetime slots (e.g. `()` or a bare type parameter `T`), normalize directly to `output`.
+        if want_arg_count == 1
+            && let PNode::Future(_, output, _) = self.node(subject)?
+        {
+            let out_side = Side { ty: output, slots: Slots::Caller(crate::SlotRange::EMPTY) };
+            if self.fits(out_side).is_ok() {
+                return Ok(Some(out_side));
             }
         }
         let owner: &'c dyn Owner = self.owner;

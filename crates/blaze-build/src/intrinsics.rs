@@ -163,6 +163,8 @@ pub enum Which {
     OverflowChecks,
     /// `ptr_mask::<T>(ptr, mask)`: the address `and` the mask, the provenance kept.
     PtrMask,
+    /// `variant_count::<T>()`: the number of variants of an enum type (0 for any other type).
+    VariantCount,
     /// `raw_eq::<T>(a, b)`: whether the `size_of::<T>()` bytes behind both are equal
     /// ([`byte_order`] the rule the constant evaluator computes).
     RawEq,
@@ -305,6 +307,7 @@ pub const TABLE: &[Entry] = &[
     e("unchecked_sub", Which::UncheckedSub, "Returns the result of an unchecked subtraction, resulting in undefined behavior when `x - y > T::MAX` or `x - y < T::MIN`.", "`sub nsw`/`sub nuw`"),
     e("unlikely", Which::Unlikely, "Hints to the compiler that branch condition is likely to be false. Returns the value passed to it.", "its argument"),
     e("unreachable", Which::Unreachable, "Informs the optimizer that this point in the code is not reachable, enabling further optimizations.", "`unreachable`"),
+    e("variant_count", Which::VariantCount, "Returns the number of variants of the type `T`, or `0` if `T` is not an enum.", "a constant from the ADT's variants"),
     e("volatile_copy_memory", Which::VolatileCopyMemory, "Equivalent to the appropriate `llvm.memmove.p0i8.0i8.*` intrinsic, with a size of `count * size_of::<T>()` and an alignment of `align_of::<T>()`.", "`memmove volatile`"),
     e("volatile_copy_nonoverlapping_memory", Which::VolatileCopyNonoverlappingMemory, "Equivalent to the appropriate `llvm.memcpy.p0i8.0i8.*` intrinsic, with a size of `count` * `size_of::<T>()` and an alignment of `align_of::<T>()`.", "`memcpy volatile`"),
     e("volatile_load", Which::VolatileLoad, "Performs a volatile load from the `src` pointer.", "`load volatile`; an aggregate as `load volatile`s of its alignment's width (at most 8 bytes, a pointer's word as a pointer), at most 512, into a temporary"),
@@ -559,6 +562,20 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             let l = *s.cx.layouts.get(id);
             let v = if c.which == W::SizeOf { l.size } else { l.align_bytes() };
             Out::Scalar(s.usize(v))
+        }
+        W::VariantCount => {
+            let t = t0.ok_or_else(need_t)?;
+            let n = match s.cx.cx.ground.view().node(t).map_err(|_| shape())? {
+                blaze_typeck::PNode::Adt(key, _) => {
+                    let adt = s.cx.cx.facts.adt(key).ok_or(IntrinsicError::Shape { which: c.which, why: "the ADT's definition is missing" })?;
+                    match adt.kind {
+                        blaze_typeck::AdtKind::Enum => adt.variants.len() as u64,
+                        blaze_typeck::AdtKind::Struct | blaze_typeck::AdtKind::Union => 0,
+                    }
+                }
+                _ => 0,
+            };
+            Out::Scalar(s.usize(n))
         }
         W::SizeOfVal | W::AlignOfVal => {
             let id = s.layout(t0.ok_or_else(need_t)?)?;

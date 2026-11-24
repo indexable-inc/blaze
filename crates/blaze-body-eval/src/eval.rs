@@ -1369,6 +1369,20 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 let v = if i == Intrinsic::SizeOf { size as u128 } else { 1u128 << align };
                 self.put(need_dest(d)?, v)
             }
+            Intrinsic::VariantCount => {
+                let t = *self.ground.view().list(iargs).map_err(|_| malformed("an intrinsic's arguments"))?.first().ok_or(Stop::from(malformed("`variant_count` with no type")))?;
+                let n = match self.ground.view().node(t).map_err(|_| malformed("`variant_count` type"))? {
+                    blaze_typeck::PNode::Adt(key, _) => {
+                        let adt = self.world.adt(key).ok_or(Stop::from(Refusal::Missing { what: "ADT definition", item: key }))?;
+                        match adt.kind {
+                            blaze_typeck::AdtKind::Enum => adt.variants.len() as u128,
+                            blaze_typeck::AdtKind::Struct | blaze_typeck::AdtKind::Union => 0,
+                        }
+                    }
+                    _ => 0,
+                };
+                self.put(need_dest(d)?, n)
+            }
             // `true` in a constant, as the old evaluator answers.
             Intrinsic::UbChecks => self.put(need_dest(d)?, 1),
             Intrinsic::Likely | Intrinsic::Unlikely | Intrinsic::BlackBox => {

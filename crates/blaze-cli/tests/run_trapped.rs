@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use support::fresh_home;
 
 /// A trap is milliseconds after the start; a hang is a bug (rule 18), named, never waited out.
-const DEADLINE: Duration = Duration::from_secs(60);
+/// Cold shelf indexing in a fresh home on CI can take ~60s under parallel load (cf. run_output.rs).
+const DEADLINE: Duration = Duration::from_secs(120);
 
 /// tests/run_trapped/abort: `main` calls `give_up`, which reaches `abort_immediate` (`brk
 /// #0xfe00`). The program ends by SIGTRAP (status 128 + 5 = 133); `blaze run`'s error stream
@@ -33,6 +34,7 @@ fn a_trap_is_said_by_the_function_s_path_and_its_reason() {
         .current_dir(&dir)
         .env("HOME", &home)
         .env("CARGO_HOME", home.join(".cargo"))
+        .env("BLAZE_NO_DAEMON", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

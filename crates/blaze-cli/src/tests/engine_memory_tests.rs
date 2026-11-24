@@ -102,3 +102,15 @@ fn engine_memory_prints_a_line_for_every_stage() {
     assert_eq!(number_after(kept, "their payloads not yet put"), 0, "every payload was handed to its record: {kept}");
     assert!(number_after(kept, "the names world's frame") > 0, "the names world's frame is in use: {kept}");
 }
+
+/// COLD CHECK PINS NO SHARED ARENAS: after `Names` flushes at the stage boundary and `Heads`
+/// flushes at its stage boundary, no uncommitted `InArena` bytes remain pinned (`held == 0`)
+/// because non-lending probes (`tag_of`, `with_bytes`, `get_committed`) and short-lived
+/// snapshots never set `Lent::shared_lent`.
+#[test]
+fn engine_memory_cold_check_frees_shared_arenas_at_stage_boundaries() {
+    let (checked, text) = chain(37);
+    let heads = checked.records.lines[Stage::Heads.index()];
+    let store_held = heads.held.saturating_sub(heads.results_held);
+    assert_eq!(store_held, 0, "no shared arena bytes pinned after Names & Heads flushes: {heads} (results_held={})\n{text}", heads.results_held);
+}

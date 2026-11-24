@@ -248,6 +248,30 @@ pub(super) fn segment_args<'t>(tys: &mut PortableTys<'t>, v: &View<'_>, seg: &lf
     super::const_args_in_bounds::angle_args(tys, v, seg, r, None, make)
 }
 
+/// Output sink for [`Builder::param_bounds`], allowing both legacy `Vec` and arena `OwnVec`.
+trait ParamBoundOut {
+    fn slice(&self) -> &[ParamBound];
+    fn push_bound(&mut self, b: ParamBound);
+}
+
+impl<A: core::alloc::Allocator> ParamBoundOut for Vec<ParamBound, A> {
+    fn slice(&self) -> &[ParamBound] {
+        self.as_slice()
+    }
+    fn push_bound(&mut self, b: ParamBound) {
+        self.push(b);
+    }
+}
+
+impl<A: core::alloc::Allocator> ParamBoundOut for OwnVec<ParamBound, A> {
+    fn slice(&self) -> &[ParamBound] {
+        self.as_slice()
+    }
+    fn push_bound(&mut self, b: ParamBound) {
+        self.push(b);
+    }
+}
+
 // `'n` is the lowered text's (`View<'n>`); `'s` the names source's.
 impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> {
     /// The bound `b` on `self_ty` (written as `on`, under the where predicate's `binders`) as
@@ -493,7 +517,12 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
     /// before it in scope. Only the trait and its arguments are read here; the bound's other
     /// parts (`Name = Type`, `?Sized`, `!Trait`) are [`Builder::predicates`]'s to take or refuse.
     pub fn param_bounds(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, base: u32, out: &mut Vec<ParamBound, Global>) -> Result<(), Why> {
-        self.param_bounds_kept(tys, env, v, base, out, None)
+        self.param_bounds_out(tys, env, v, base, out, None)
+    }
+
+    /// [`Builder::param_bounds`] into an arena-backed [`OwnVec`].
+    pub fn param_bounds_in(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, base: u32, out: &mut OwnVec<ParamBound, Mem>) -> Result<(), Why> {
+        self.param_bounds_out(tys, env, v, base, out, None)
     }
 
     /// [`Builder::param_bounds`] for a fn head: a bound whose trait the library decided names
@@ -505,6 +534,18 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
         v: &View<'n>,
         base: u32,
         out: &mut Vec<ParamBound, Global>,
+        misses: Option<&mut OwnVec<(PathError, Range), Mem>>,
+    ) -> Result<(), Why> {
+        self.param_bounds_out(tys, env, v, base, out, misses)
+    }
+
+    fn param_bounds_out<O: ParamBoundOut>(
+        &self,
+        tys: &mut PortableTys<'_>,
+        env: &Env<'_>,
+        v: &View<'n>,
+        base: u32,
+        out: &mut O,
         mut misses: Option<&mut OwnVec<(PathError, Range), Mem>>,
     ) -> Result<(), Why> {
         let mut i = base;
@@ -544,14 +585,14 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
     }
 
     #[expect(clippy::too_many_arguments, reason = "one bound, where it is written, and the out lists")]
-    fn param_bound(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, b: lf::Bound, param: u32, out: &mut Vec<ParamBound, Global>, misses: Option<&mut OwnVec<(PathError, Range), Mem>>) -> Result<(), Why> {
+    fn param_bound<O: ParamBoundOut>(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, b: lf::Bound, param: u32, out: &mut O, misses: Option<&mut OwnVec<(PathError, Range), Mem>>) -> Result<(), Why> {
         let lf::Bound::Trait { ty, mods, .. } = b else { return Ok(()) };
         // `?Sized` and `!Trait` declare no associated type of the parameter.
         if mods.maybe || mods.negative {
             return Ok(());
         }
         let lf::TypeRef::Path(p) = v.ty(ty)? else { return Ok(()) };
-        let e = Env { bounds: Bounds::Building(out), ..*env };
+        let e = Env { bounds: Bounds::Building(out.slice()), ..*env };
         let (abs, texts, segs, pr) = path_texts_of(v, p, true)?;
         // A fn head's bound whose trait names nothing (decided): kept, declaring nothing; its
         // predicates walk keeps the same bound's miss, the head says it once (heads.rs).
@@ -570,7 +611,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
         match target {
             Bounded::Trait(key) => {
                 let (trait_, args) = self.trait_args(tys, key, pr, me, &given)?;
-                out.push(ParamBound { param, trait_, args });
+                out.push_bound(ParamBound { param, trait_, args });
             }
             // `T: Thin` declares through each trait the alias stands for on `Self`.
             Bounded::Alias(alias) => {
@@ -583,7 +624,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                 args.extend_from_slice(&given);
                 for &(trait_, l) in &head.traits {
                     let PClause::Trait { args, .. } = subst_clause(tys, PClause::Trait { trait_: self.heads.checker(trait_), args: l }, &args)? else { continue };
-                    out.push(ParamBound { param, trait_, args });
+                    out.push_bound(ParamBound { param, trait_, args });
                 }
             }
         }

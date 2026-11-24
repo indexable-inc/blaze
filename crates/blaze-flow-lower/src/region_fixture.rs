@@ -393,7 +393,7 @@ impl Arity for Decls {
 /// both live as long as the views handed out (`RegionFacts::clauses` returns a slice of views).
 fn leak(item: ItemKey, head: HeadRegions<Alloc<'static>>) -> (ItemKey, &'static HeadRegions<Alloc<'static>>, &'static [ClauseView<'static>]) {
     let head: &'static HeadRegions<Alloc<'static>> = Box::leak(Box::new(head));
-    let views: vec::Vec<ClauseView<'static>> = head.clauses.iter().map(ClauseView::of).collect();
+    let views: vec::Vec<ClauseView<'static>> = head.clauses.iter().map(|c| ClauseView::of_in(c, &head.outlives)).collect();
     (item, head, Box::leak(views.into_boxed_slice()))
 }
 

@@ -1062,6 +1062,9 @@ pub(crate) enum Plant {
     /// Skips CRC verification on mapped `bloom` records so corrupt/torn filters can cause
     /// false negatives (bloom_tests DST control).
     TrustsCorruptBloom,
+    /// Emits all commit payload chunks at once instead of respecting [`COMMIT_PIECES_IN_FLIGHT`]
+    /// (tests, `the_commit_meter_catches_an_unbounded_window`).
+    CommitWholeWindow,
 }
 
 /// What one slice of the background pass did ([`Plain::scrub_next`]).
@@ -1321,12 +1324,104 @@ enum Ctx {
     Flip,
 }
 
+/// Hard cap on one streamed commit payload piece (`4 MiB`).
+pub const COMMIT_PIECE_BYTES: usize = 4 << 20;
+/// Hard cap on streamed commit payload pieces in flight at once (`4 * 4 MiB = 16 MiB` ceiling).
+pub const COMMIT_PIECES_IN_FLIGHT: u32 = 4;
+
 /// What a write of a segment is for.
 enum Why<A: Allocator + Clone> {
     /// A commit's segments are written one after another, one for each namespace with
     /// records, then flipped at once: `rest` still to write, `done` written.
-    Commit { started_ns: u64, roots: Vec<RootEdit, A>, rest: Vec<Laid<A>, A>, done: Vec<(Segment, FileName), A> },
+    Commit { started_ns: u64, roots: Vec<RootEdit, A>, rest: Vec<NextCommit<A>, A>, done: Vec<(Segment, FileName), A> },
     Compact { candidates: Vec<u64, A>, stats: Sliced },
+}
+
+/// Next segment queued behind the current commit write: either a zero-copy streamed plan
+/// (`Planned`, used by `Driven::commit_records` and self-contained `Plain::commit`) or a
+/// materialized batch (`Laid`, used by carry-forward and external-batch `Plain::commit`).
+enum NextCommit<A: Allocator + Clone> {
+    Laid(Laid<A>),
+    Planned(PlannedSegment<A>),
+}
+
+enum WriteBody<A: Allocator + Clone> {
+    Run(Vec<u8>),
+    Stream { bloom: blaze_own::Vec<u8, Kept>, commit: CommitStream<A> },
+}
+
+/// Source locator for one record in a zero-copy streamed commit (no lifetime; borrows resolved
+/// on demand against `(Plain::sealed, batches, records)` during `commit_stream_on`).
+#[derive(Clone, Copy)]
+enum RecordFrom {
+    Sealed { batch: u32, at: u64, len: u32 },
+    Batch { batch: u32, at: u64, len: u32 },
+    Lent { index: u32 },
+}
+
+/// One commit segment planned and digested in place with zero payload copy upfront.
+struct PlannedSegment<A: Allocator + Clone> {
+    sealed: format::Sealed,
+    bloom: blaze_own::Vec<u8, Kept>,
+    kept: blaze_own::Vec<(RecordFrom, u8), A>,
+    entries: blaze_own::Vec<Entry, A>,
+}
+
+/// Which leg a bounded-window [`CommitStream`] is emitting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CommitLeg {
+    Payloads,
+    Index,
+    Done,
+}
+
+/// Bounded-window commit streamer: emits at most [`COMMIT_PIECES_IN_FLIGHT`] payload chunks of
+/// `piece_bytes` at a time (splitting oversized single records across chunks), then 1 MiB index
+/// chunks one at a time, then the 48-byte footer.
+struct CommitStream<A: Allocator + Clone> {
+    kept: blaze_own::Vec<(RecordFrom, u8), A>,
+    entries: blaze_own::Vec<Entry, A>,
+    footer: [u8; FOOTER],
+    leg: CommitLeg,
+    rec: usize,
+    within: usize,
+    at: u64,
+    index_at: u64,
+    indexed: usize,
+    piece_bytes: usize,
+    index_entries: usize,
+    asked: u32,
+    flying: u32,
+    index_asked: u32,
+    index_flying: bool,
+}
+
+fn resolve_record<'b>(src: RecordFrom, sealed: &'b [Held], batches: &[&'b Batch], records: &[LentRecord<'b>]) -> &'b [u8] {
+    match src {
+        RecordFrom::Sealed { batch, at, len } => {
+            let Ok(b) = usize::try_from(batch) else { return &[] };
+            let Ok(from) = usize::try_from(at) else { return &[] };
+            let Ok(n) = usize::try_from(len) else { return &[] };
+            sealed.get(b).and_then(|h| h.batch.bytes.get(from..from.saturating_add(n))).unwrap_or(&[])
+        }
+        RecordFrom::Batch { batch, at, len } => {
+            let Ok(b) = usize::try_from(batch) else { return &[] };
+            let Ok(from) = usize::try_from(at) else { return &[] };
+            let Ok(n) = usize::try_from(len) else { return &[] };
+            batches.get(b).and_then(|h| h.bytes.get(from..from.saturating_add(n))).unwrap_or(&[])
+        }
+        RecordFrom::Lent { index } => {
+            let Ok(i) = usize::try_from(index) else { return &[] };
+            records.get(i).map_or(&[], |r| r.bytes)
+        }
+    }
+}
+
+/// Allocates a buffer for a `blaze_core::Effect::WriteAt` payload (`Global`).
+macro_rules! effect_bytes {
+    ($cap:expr) => {
+        Vec::with_capacity_in($cap, Global)
+    };
 }
 
 /// One segment laid out and not yet written: the payloads at their offsets, from [`HEADER`]
@@ -1540,6 +1635,9 @@ struct Writing<A: Allocator + Clone> {
     /// A compaction's copy, streamed from the inputs' mappings after `pieces`: `None` for a
     /// commit's segment, whose payloads are its own batches'.
     stream: Option<Stream<A>>,
+    /// A commit's segment streamed through a bounded [`COMMIT_PIECES_IN_FLIGHT`] window from
+    /// `(Plain::sealed, batches, records)` without copying all payloads upfront.
+    commit: Option<CommitStream<A>>,
 }
 
 /// One record of a streamed copy: where its payload lies in a mapping of this process.
@@ -1702,7 +1800,7 @@ mod proof {
         /// Bytes a row of this generation names already, under this name, so nothing is
         /// written: the row's own write was synced before the flip that named it.
         pub(super) fn already_named(writing: Writing<A>) -> Synced<A> {
-            debug_assert!(writing.pieces.is_empty() && writing.stream.is_none(), "nothing of a named segment is written again");
+            debug_assert!(writing.pieces.is_empty() && writing.stream.is_none() && writing.commit.is_none(), "nothing of a named segment is written again");
             Synced(writing)
         }
 
@@ -1852,6 +1950,11 @@ pub struct Plain<A: Allocator + Clone> {
     /// A test's index chunk; outside tests, [`INDEX_CHUNK`].
     #[cfg(test)]
     index_chunk: u64,
+    /// A test's streamed commit piece cap; outside tests, [`COMMIT_PIECE_BYTES`].
+    #[cfg(test)]
+    commit_piece_bytes: usize,
+    /// When true (set by `Driven`), `commit_records` uses bounded-window zero-copy streaming.
+    stream_commits: bool,
     /// The most bytes a streamed copy built at once, its index chunk and its cursors: what the
     /// merge meter checks beside the writes in flight (tests).
     #[cfg(test)]
@@ -2197,6 +2300,26 @@ impl<A: Allocator + Clone> Plain<A> {
         MERGE_BUFFER
     }
 
+    pub(super) fn set_stream_commits(&mut self, on: bool) {
+        self.stream_commits = on;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_commit_piece_bytes(&mut self, bytes: usize) {
+        self.commit_piece_bytes = bytes.max(64);
+    }
+
+    #[cfg(test)]
+    fn commit_piece_bytes(&self) -> usize {
+        self.commit_piece_bytes
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn commit_piece_bytes(&self) -> usize {
+        COMMIT_PIECE_BYTES
+    }
+
     #[cfg(test)]
     pub(crate) fn index_chunk(&self) -> u64 {
         self.index_chunk
@@ -2321,6 +2444,9 @@ impl<A: Allocator + Clone> Plain<A> {
             merge_buffer: MERGE_BUFFER,
             #[cfg(test)]
             index_chunk: INDEX_CHUNK,
+            #[cfg(test)]
+            commit_piece_bytes: COMMIT_PIECE_BYTES,
+            stream_commits: false,
             #[cfg(test)]
             merge_held_most: 0,
             phase: Phase::New,
@@ -2550,6 +2676,11 @@ impl<A: Allocator + Clone> Plain<A> {
     /// Allocates an empty vector in the store's allocator.
     fn alloc_vec<T>(&self) -> Vec<T, A> {
         Vec::new_in(self.alloc.clone())
+    }
+
+    /// Allocates a `blaze_own::Vec` with capacity `cap` in the store's allocator.
+    fn own_vec_cap<T>(&self, cap: usize) -> blaze_own::Vec<T, A> {
+        blaze_own::Vec::with_capacity_in(cap, self.alloc_vec::<()>().into_raw_parts_with_allocator().3)
     }
 
     /// Compaction prunes while the segments hold more than `cap_bytes`.
@@ -3249,6 +3380,7 @@ impl<A: Allocator + Clone> Plain<A> {
     }
 
     pub fn commit_records(&mut self, batches: &[&Batch], records: &[LentRecord<'_>], now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
+        let streamed = self.stream_commits || (batches.is_empty() && records.is_empty());
         if !self.ready() {
             return Err(StoreError::Busy { phase: self.what() });
         }
@@ -3285,26 +3417,62 @@ impl<A: Allocator + Clone> Plain<A> {
             }
         }
         // The held batches stay readable while they are written: sealed until the commit ends.
-        let mut fresh = Vec::with_capacity_in(self.cfg.writes.len(), self.alloc.clone());
+        let mut fresh = self.alloc_vec();
+        fresh.reserve(self.cfg.writes.len());
         fresh.extend(self.cfg.writes.iter().map(|it| Held::new(*it)));
-        self.sealed = std::mem::replace(&mut self.held, fresh);
-        let laid = self.lay_out(batches, records);
-        let laid = match laid {
-            Ok(laid) => laid,
-            Err(why) => {
-                self.sealed_back();
-                return Err(why);
+        self.sealed = core::mem::replace(&mut self.held, fresh);
+        let nexts = if streamed {
+            match self.lay_out_plan(batches, records) {
+                Ok(plans) => {
+                    let mut out = self.own_vec_cap(plans.len());
+                    for plan in plans {
+                        out.push(NextCommit::Planned(plan));
+                    }
+                    out
+                }
+                Err(why) => {
+                    self.sealed_back();
+                    return Err(why);
+                }
+            }
+        } else {
+            match self.lay_out(batches, records) {
+                Ok(laid) => {
+                    let mut out = self.own_vec_cap(laid.len());
+                    for it in laid {
+                        out.push(NextCommit::Laid(it));
+                    }
+                    out
+                }
+                Err(why) => {
+                    self.sealed_back();
+                    return Err(why);
+                }
             }
         };
-        // The measure (rule 16): what the layout copied, counted once it is made.
-        if !laid.is_empty() {
+        // The measure (rule 16): what the layout planned/copied, counted once it is made.
+        if !nexts.is_empty() {
             self.put_path.laid_commits += 1;
         }
-        self.put_path.laid_bytes += laid.iter().flat_map(|it| it.pieces.iter()).map(|(_, bytes)| bytes.len() as u64).sum::<u64>();
+        let header_u64 = u64::try_from(HEADER).unwrap_or(128);
+        let footer_u64 = u64::try_from(FOOTER).unwrap_or(48);
+        self.put_path.laid_bytes += nexts
+            .iter()
+            .map(|it| match it {
+                NextCommit::Laid(l) => l.pieces.iter().map(|(_, bytes)| u64::try_from(bytes.len()).unwrap_or(0)).sum::<u64>(),
+                NextCommit::Planned(p) => p.sealed.described.index_at.saturating_sub(header_u64),
+            })
+            .sum::<u64>();
         // A request larger than the cap alone can never fit under it: refused by name, as no
         // reclamation could make room for it (a commit is never refused for the cap otherwise:
         // over it, reclamation is owed, and the next slices pay it).
-        let request: u64 = laid.iter().map(|it| it.index_at + it.run.len() as u64 + FOOTER as u64).sum();
+        let request: u64 = nexts
+            .iter()
+            .map(|it| match it {
+                NextCommit::Laid(l) => l.index_at.saturating_add(u64::try_from(l.run.len()).unwrap_or(0)).saturating_add(footer_u64),
+                NextCommit::Planned(p) => p.sealed.len,
+            })
+            .sum();
         if request > self.cfg.cap_bytes {
             self.sealed_back();
             return Err(StoreError::OverCap { request_bytes: request, cap_bytes: self.cfg.cap_bytes });
@@ -3316,11 +3484,12 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         self.carry_rounds = 0;
         // The roots this commit's records were put with: one set after it started is the next's.
-        let mut roots = std::mem::replace(&mut self.roots_pending, Vec::new_in(self.alloc.clone()));
+        let empty_roots = self.alloc_vec();
+        let mut roots = core::mem::replace(&mut self.roots_pending, empty_roots);
         // The segments of records this commit's roots name but did not write, dead in this
         // view: computed here, before the lock; the flip marks them touched.
         self.touches = match self.cfg.liveness {
-            Liveness::Everything => Vec::new_in(self.alloc.clone()),
+            Liveness::Everything => self.alloc_vec(),
             Liveness::Reached => match self.reused(&roots, now_ns) {
                 Ok(it) => it,
                 Err(why) => {
@@ -3330,25 +3499,228 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
             },
         };
-        if self.cfg.liveness == Liveness::Reached && !laid.is_empty() && !self.released {
+        if self.cfg.liveness == Liveness::Reached && !nexts.is_empty() && !self.released {
             // Records no root names yet: this process's lease keeps them, and every segment
             // newer than the generation it opened on, until its answer roots them.
             roots.push(RootEdit::Lease { since: self.opened_generation + 1, opened_ns: self.opened_ns });
         }
-        let mut rest = laid.into_iter();
+        let mut rest = nexts.into_iter();
         match rest.next() {
             None if roots.is_empty() && !self.pending_stamps() && self.folding.is_none() && self.clearable.is_empty() => {
                 self.committed = Some(Ok(self.empty_committed()));
                 self.sealed.clear();
             }
-            None => self.start_flip(Change::Commit { segs: Vec::new_in(self.alloc.clone()), started_ns: now_ns, roots }, effects),
+            None => {
+                let segs = self.alloc_vec();
+                self.start_flip(Change::Commit { segs, started_ns: now_ns, roots }, effects);
+            }
             Some(first) => {
-                let mut left = Vec::with_capacity_in(rest.len(), self.alloc.clone());
+                let mut left = self.alloc_vec();
+                left.reserve(rest.len());
                 left.extend(rest);
-                self.write_segment(first, Why::Commit { started_ns: now_ns, roots, rest: left, done: Vec::new_in(self.alloc.clone()) }, effects);
+                let done = self.alloc_vec();
+                self.write_segment(first, Why::Commit { started_ns: now_ns, roots, rest: left, done }, effects);
             }
         }
         Ok(())
+    }
+
+    /// Zero-copy twin of [`Plain::lay_out`]: sorts, deduplicates, checks `TwoValues`, computes
+    /// segment digests via [`format::seal_entries`] and Bloom filters directly from sorted
+    /// entries, keeping only `(RecordFrom, pad_len)` + `blaze_own::Vec<Entry>` with zero payload copy.
+    fn lay_out_plan<'b>(&'b self, batches: &[&'b Batch], records: &[LentRecord<'b>]) -> Result<blaze_own::Vec<PlannedSegment<A>, A>, StoreError> {
+        let mut out = self.own_vec_cap(self.cfg.writes.len());
+        let header_u64 = u64::try_from(HEADER).unwrap_or(128);
+        let entry_u64 = u64::try_from(ENTRY).unwrap_or(48);
+        let footer_u64 = u64::try_from(FOOTER).unwrap_or(48);
+        for &namespace in self.cfg.writes.iter() {
+            let mut all: blaze_own::Vec<(Entry, RecordFrom), &A> = blaze_own::Vec::new_in(&self.alloc);
+            for (s_idx, held) in self.sealed.iter().enumerate() {
+                if held.batch.namespace != namespace {
+                    continue;
+                }
+                let batch_idx = u32::try_from(s_idx).unwrap_or(u32::MAX);
+                for it in held.batch.entries.iter() {
+                    all.push((*it, RecordFrom::Sealed { batch: batch_idx, at: it.at, len: it.len }));
+                }
+            }
+            for (b_idx, batch) in batches.iter().enumerate() {
+                if batch.namespace != namespace {
+                    continue;
+                }
+                let batch_idx = u32::try_from(b_idx).unwrap_or(u32::MAX);
+                for it in batch.entries.iter() {
+                    all.push((*it, RecordFrom::Batch { batch: batch_idx, at: it.at, len: it.len }));
+                }
+            }
+            for (r_idx, rec) in records.iter().enumerate() {
+                if rec.namespace != namespace {
+                    continue;
+                }
+                let index = u32::try_from(r_idx).unwrap_or(u32::MAX);
+                all.push((rec.entry(), RecordFrom::Lent { index }));
+            }
+            all.sort_unstable_by(|a, b| a.0.key.cmp(&b.0.key));
+            let mut entries = self.own_vec_cap(all.len());
+            let mut kept = self.own_vec_cap(all.len());
+            let mut payload_bytes: u64 = 0;
+            let mut last: Option<(Entry, RecordFrom)> = None;
+            let unpadded = self.plant() == Plant::Unpadded;
+            let off_by_one = self.plant() == Plant::IndexOffByOne;
+            for (entry, src) in all {
+                let payload = resolve_record(src, &self.sealed, batches, records);
+                if let Some((prev, prev_src)) = last
+                    && prev.key == entry.key
+                {
+                    if !prev.same_record(&entry) {
+                        let prev_payload = resolve_record(prev_src, &self.sealed, batches, records);
+                        return Err(StoreError::TwoValues(two_values(&Key(entry.key), Holder::ThisProcess, prev.tag, prev_payload, entry.tag, payload)));
+                    }
+                    continue;
+                }
+                last = Some((entry, src));
+                if ReservedTag::Pointer.is(entry.tag) {
+                    if let Some((mapped, kept_entry)) = self.newest_mapped(namespace, &Key(entry.key))
+                        && !ReservedTag::Pointer.is(kept_entry.tag)
+                    {
+                        let kept_payload = self.maps.get(mapped).map_or(&[][..], |m| m.payload(&kept_entry));
+                        return Err(StoreError::TwoValues(two_values(&Key(entry.key), Holder::Committed, kept_entry.tag, kept_payload, entry.tag, payload)));
+                    }
+                } else if let Some((mapped, kept_entry)) = self.find_in(core::slice::from_ref(&namespace), &Key(entry.key)) {
+                    if kept_entry.same_record(&entry) {
+                        continue;
+                    }
+                    let kept_payload = self.maps.get(mapped).map_or(&[][..], |m| m.payload(&kept_entry));
+                    return Err(StoreError::TwoValues(two_values(&Key(entry.key), Holder::Committed, kept_entry.tag, kept_payload, entry.tag, payload)));
+                }
+                let at = header_u64.saturating_add(payload_bytes);
+                let end = at.saturating_add(u64::from(entry.len));
+                if end > OFFSET_MOST {
+                    return Err(StoreError::TooLong { tag: entry.tag, key: entry.key, len: end });
+                }
+                let padded = if unpadded { end } else { aligned(end) };
+                let pad_len = u8::try_from(padded.saturating_sub(end)).unwrap_or(0);
+                payload_bytes = padded.saturating_sub(header_u64);
+                let mut placed = entry;
+                placed.at = at;
+                if off_by_one {
+                    placed.at = placed.at.saturating_add(ALIGN);
+                }
+                entries.push(placed);
+                kept.push((src, pad_len));
+            }
+            if entries.is_empty() {
+                continue;
+            }
+            let index_at = header_u64.saturating_add(payload_bytes);
+            let count_u64 = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+            let len = index_at.saturating_add(count_u64.saturating_mul(entry_u64).saturating_add(footer_u64));
+            let most = self.tiers().segment_most();
+            if len > most {
+                return Err(StoreError::Shape { namespace, why: RowRefused::TooLong { len, most } });
+            }
+            let sealed = format::seal_entries(
+                namespace,
+                &entries,
+                index_at,
+                kept.iter().map(|&(src, pad_len)| (resolve_record(src, &self.sealed, batches, records), pad_len)),
+            );
+            let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+            let mut bloom_builder = BloomBuilder::new(count);
+            for entry in entries.iter() {
+                bloom_builder.insert(&entry.key.0);
+            }
+            let bloom = bloom_builder.finish(&sealed.described.digest);
+            out.push(PlannedSegment { sealed, bloom, kept, entries });
+        }
+        Ok(out)
+    }
+
+    /// Emits the next bounded-window writes of a streamed commit: up to
+    /// [`COMMIT_PIECES_IN_FLIGHT`] payload chunks (`piece_bytes` each), then 1 MiB index chunks
+    /// one at a time, then the 48-byte footer.
+    fn commit_stream_on<E: Allocator>(&mut self, batches: &[&Batch], records: &[LentRecord<'_>], effects: &mut Vec<Effect, E>) {
+        let tags = self.cfg.tags;
+        let whole_window = self.plant() == Plant::CommitWholeWindow;
+        let Phase::Writing(writing, _) = &mut self.phase else { return };
+        let Some(mut commit) = writing.commit.take() else { return };
+        let file = writing.file.share();
+        let mut asked = 0u32;
+        loop {
+            match commit.leg {
+                CommitLeg::Payloads if whole_window || commit.flying < COMMIT_PIECES_IN_FLIGHT => {
+                    if commit.at >= commit.index_at {
+                        commit.leg = CommitLeg::Index;
+                    } else {
+                        let rem = commit.index_at.saturating_sub(commit.at);
+                        let cap_u64 = u64::try_from(commit.piece_bytes).unwrap_or(u64::MAX);
+                        let take = usize::try_from(rem.min(cap_u64)).unwrap_or(commit.piece_bytes);
+                        let mut bytes = effect_bytes!(take);
+                        while bytes.len() < take {
+                            let Some(&(src, pad_len)) = commit.kept.get(commit.rec) else { break };
+                            let payload = resolve_record(src, &self.sealed, batches, records);
+                            let pad = usize::from(pad_len);
+                            let span = payload.len().saturating_add(pad);
+                            let room = take.saturating_sub(bytes.len());
+                            let step = span.saturating_sub(commit.within).min(room);
+                            let real_end = payload.len().min(commit.within.saturating_add(step));
+                            let real = real_end.saturating_sub(commit.within);
+                            if real > 0
+                                && let Some(slice) = payload.get(commit.within..real_end)
+                            {
+                                bytes.extend_from_slice(slice);
+                            }
+                            let zeros = step.saturating_sub(real);
+                            if zeros > 0 {
+                                bytes.resize(bytes.len().saturating_add(zeros), 0);
+                            }
+                            commit.within = commit.within.saturating_add(step);
+                            if commit.within >= span {
+                                commit.rec = commit.rec.saturating_add(1);
+                                commit.within = 0;
+                            }
+                        }
+                        let at = commit.at;
+                        commit.at = commit.at.saturating_add(u64::try_from(bytes.len()).unwrap_or(0));
+                        commit.asked = commit.asked.saturating_add(1);
+                        effects.push(Effect::WriteAt { file: file.share(), at, bytes, tag: tag_of(tags, SEG_PIECE, commit.asked) });
+                        commit.flying = commit.flying.saturating_add(1);
+                        asked = asked.saturating_add(1);
+                    }
+                }
+                CommitLeg::Index if !commit.index_flying => {
+                    let left = commit.entries.len().saturating_sub(commit.indexed);
+                    if left == 0 {
+                        let mut bytes = effect_bytes!(FOOTER);
+                        bytes.extend_from_slice(&commit.footer);
+                        let at = commit.at;
+                        commit.at = commit.at.saturating_add(u64::try_from(FOOTER).unwrap_or(48));
+                        commit.leg = CommitLeg::Done;
+                        effects.push(Effect::WriteAt { file: file.share(), at, bytes, tag: tag_of(tags, SEG_PIECE, FOOTER_PIECE) });
+                        asked = asked.saturating_add(1);
+                    } else {
+                        let fit = left.min(commit.index_entries.max(1));
+                        let mut bytes = effect_bytes!(fit.saturating_mul(ENTRY));
+                        if let Some(slice) = commit.entries.get(commit.indexed..commit.indexed.saturating_add(fit)) {
+                            for entry in slice {
+                                entry.encode_into(&mut bytes);
+                            }
+                        }
+                        let at = commit.at;
+                        commit.at = commit.at.saturating_add(u64::try_from(bytes.len()).unwrap_or(0));
+                        commit.indexed = commit.indexed.saturating_add(fit);
+                        commit.index_asked = commit.index_asked.saturating_add(1);
+                        effects.push(Effect::WriteAt { file: file.share(), at, bytes, tag: tag_of(tags, SEG_PIECE, INDEX_PIECE.saturating_add(commit.index_asked)) });
+                        commit.index_flying = true;
+                        asked = asked.saturating_add(1);
+                    }
+                }
+                _ => break,
+            }
+        }
+        let Phase::Writing(writing, _) = &mut self.phase else { return };
+        writing.left = writing.left.saturating_add(asked);
+        writing.commit = Some(commit);
     }
 
     /// One segment laid out for each namespace of [`PlainConfig::writes`] (in its order) that
@@ -3505,17 +3877,46 @@ impl<A: Allocator + Clone> Plain<A> {
     /// the digest of all before it), names it by its digest, and starts its write: the file
     /// made at its length, then each piece written at its offset, in parallel. A segment of the
     /// same bytes already here is not written again (a published file is never rewritten).
-    fn write_segment(&mut self, laid: Laid<A>, why: Why<A>, effects: &mut Vec<Effect>) {
-        let Laid { pieces, index_at, run, namespace } = laid;
-        debug_assert!(pieces.iter().scan(HEADER as u64, |at, (piece_at, bytes)| {
-            let ok = *piece_at == *at;
-            *at += bytes.len() as u64;
-            Some(ok)
-        }).all(|it| it), "pieces lie end to end");
-        let sealed = format::seal_parts(namespace, &run, index_at, pieces.iter().map(|(_, bytes)| bytes.as_slice()));
-        // The measure: every byte before the digest itself was read by it.
-        self.put_path.digested_bytes += sealed.len.saturating_sub(32);
-        self.start_write(sealed, pieces, run, why, effects);
+    fn write_segment(&mut self, next: NextCommit<A>, why: Why<A>, effects: &mut Vec<Effect>) {
+        match next {
+            NextCommit::Laid(laid) => {
+                let Laid { pieces, index_at, run, namespace } = laid;
+                debug_assert!(pieces.iter().scan(HEADER as u64, |at, (piece_at, bytes)| {
+                    let ok = *piece_at == *at;
+                    *at += bytes.len() as u64;
+                    Some(ok)
+                }).all(|it| it), "pieces lie end to end");
+                let sealed = format::seal_parts(namespace, &run, index_at, pieces.iter().map(|(_, bytes)| bytes.as_slice()));
+                // The measure: every byte before the digest itself was read by it.
+                self.put_path.digested_bytes += sealed.len.saturating_sub(32);
+                self.start_write(sealed, pieces, WriteBody::Run(run), why, effects);
+            }
+            NextCommit::Planned(planned) => {
+                let PlannedSegment { sealed, bloom, kept, entries } = planned;
+                self.put_path.digested_bytes += sealed.len.saturating_sub(32);
+                let index_at = sealed.described.index_at;
+                let index_entries = usize::try_from((self.index_chunk() / u64::try_from(ENTRY).unwrap_or(48)).max(1)).unwrap_or(1);
+                let commit = CommitStream {
+                    kept,
+                    entries,
+                    footer: sealed.footer,
+                    leg: CommitLeg::Payloads,
+                    rec: 0,
+                    within: 0,
+                    at: u64::try_from(HEADER).unwrap_or(128),
+                    index_at,
+                    indexed: 0,
+                    piece_bytes: self.commit_piece_bytes(),
+                    index_entries,
+                    asked: 0,
+                    flying: 0,
+                    index_asked: 0,
+                    index_flying: false,
+                };
+                let pieces = self.alloc_vec();
+                self.start_write(sealed, pieces, WriteBody::Stream { bloom, commit }, why, effects);
+            }
+        }
     }
 
     /// A streamed copy's next writes ([`Plain::stream_segment`]): payload chunks while fewer
@@ -3630,12 +4031,12 @@ impl<A: Allocator + Clone> Plain<A> {
         // Its row until the stream seals it: no digest yet, so no id.
         let mut seg = Segment::of(&format::Described { namespace, count, index_at, digest: ContentId([0; 32]) }, len);
         seg.boot = self.cfg.boot;
-        let mut head = Vec::with_capacity_in(HEADER, Global);
+        let mut head = effect_bytes!(HEADER);
         head.extend_from_slice(&header);
-        let mut pieces = Vec::with_capacity_in(1, self.alloc.clone());
+        let mut pieces = self.alloc_vec();
         pieces.push((0, head));
         effects.push(Effect::Truncate { file: file.share(), len, tag: self.tag(SEG_TRUNCATE, 0) });
-        self.phase = Phase::Writing(Box::new(Writing { seg, file, pieces, left: 0, stream: Some(stream) }), Box::new(why));
+        self.phase = Phase::Writing(Box::new(Writing { seg, file, pieces, left: 0, stream: Some(stream), commit: None }), Box::new(why));
     }
 
     /// A streamed copy every write of which completed ([`Plain::stream_segment`]): its row
@@ -3656,7 +4057,7 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         let file = self.segment_file(seg.id);
         let back = matches!(&why, Why::Compact { candidates, .. } if candidates.contains(&seg.id));
-        let named = Writing { seg, file: file.share(), pieces: Vec::new_in(self.alloc.clone()), left: 0, stream: None };
+        let named = Writing { seg, file: file.share(), pieces: Vec::new_in(self.alloc.clone()), left: 0, stream: None, commit: None };
         if back || self.by_id.contains_key(&seg.id) {
             effects.push(Effect::Remove { file: temp.share(), tag: self.tag(SEG_UNWRITE, 0) });
             self.phase = Phase::Unwriting { writing: Box::new(named), why: Box::new(why), temp };
@@ -3696,8 +4097,8 @@ impl<A: Allocator + Clone> Plain<A> {
     }
 
     /// The write of a segment `sealed` describes (a commit's, or a carry's): `pieces` (its
-    /// payloads), then `run` and the footer.
-    fn start_write(&mut self, sealed: format::Sealed, mut pieces: Vec<(u64, Vec<u8>), A>, run: Vec<u8>, why: Why<A>, effects: &mut Vec<Effect>) {
+    /// payloads), then `run` and the footer — or a bounded-window `CommitStream`.
+    fn start_write(&mut self, sealed: format::Sealed, mut pieces: Vec<(u64, Vec<u8>), A>, body: WriteBody<A>, why: Why<A>, effects: &mut Vec<Effect>) {
         let index_at = sealed.described.index_at;
         let (count, len) = (sealed.described.count, sealed.len);
         let mut seg = Segment::of(&sealed.described, len);
@@ -3712,26 +4113,34 @@ impl<A: Allocator + Clone> Plain<A> {
             self.phase = Phase::Ready;
             return;
         }
-        let bloom_record = BloomBuilder::from_run(&run, &sealed.described.digest);
+        let (bloom_record, run, commit) = match body {
+            WriteBody::Run(run) => (BloomBuilder::from_run(&run, &sealed.described.digest), Some(run), None),
+            WriteBody::Stream { bloom, commit } => (bloom, None, Some(commit)),
+        };
         self.record_pending_bloom(sealed.described.digest, bloom_record);
         if self.by_id.contains_key(&seg.id) {
             // These bytes are here already, under this name: flip without writing them. They
             // are a named segment's, proved as its row is (synced before the flip that named
             // them, when durable): nothing of them is written here, so no sync is owed.
-            self.segment_written(Synced::already_named(Writing { seg, file, pieces: Vec::new_in(self.alloc.clone()), left: 0, stream: None }), why, effects);
+            let empty_pieces = self.alloc_vec();
+            self.segment_written(Synced::already_named(Writing { seg, file, pieces: empty_pieces, left: 0, stream: None, commit: None }), why, effects);
             return;
         }
         self.put_path.segments_written += 1;
-        let mut header = Vec::with_capacity_in(HEADER, Global);
+        let mut header = effect_bytes!(HEADER);
         header.extend_from_slice(&sealed.header);
-        let mut footer = Vec::with_capacity_in(FOOTER, Global);
-        footer.extend_from_slice(&sealed.footer);
-        pieces.insert(0, (0, header));
-        let footer_at = index_at + u64::from(count) * ENTRY as u64;
-        pieces.push((index_at, run));
-        pieces.push((footer_at, footer));
+        if let Some(run) = run {
+            let mut footer = effect_bytes!(FOOTER);
+            footer.extend_from_slice(&sealed.footer);
+            pieces.insert(0, (0, header));
+            let footer_at = index_at + u64::from(count) * ENTRY as u64;
+            pieces.push((index_at, run));
+            pieces.push((footer_at, footer));
+        } else {
+            pieces.push((0, header));
+        }
         effects.push(Effect::Truncate { file: file.share(), len, tag: self.tag(SEG_TRUNCATE, 0) });
-        self.phase = Phase::Writing(Box::new(Writing { seg, file, pieces, left: 0, stream: None }), Box::new(why));
+        self.phase = Phase::Writing(Box::new(Writing { seg, file, pieces, left: 0, stream: None, commit }), Box::new(why));
     }
 
     /// Names segments fetched from a source (their files already written here, unchanged,
@@ -5343,7 +5752,10 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         self.carried += out.entries.len() as u64;
         match laid_of(out, self.alloc.clone()) {
-            Ok(laid) => self.write_segment(laid, Why::Commit { started_ns, roots, rest: Vec::new_in(self.alloc.clone()), done: segs }, effects),
+            Ok(laid) => {
+                let rest = self.alloc_vec();
+                self.write_segment(NextCommit::Laid(laid), Why::Commit { started_ns, roots, rest, done: segs }, effects);
+            }
             Err(why) => self.commit_refused(why, roots),
         }
     }
@@ -5752,6 +6164,12 @@ impl<A: Allocator + Clone> Plain<A> {
     /// Takes one of this store's completions; `now_ns` is the wall clock as the driver reads it
     /// (the simulation's own in tests).
     pub fn complete(&mut self, completion: Completion, now_ns: u64, effects: &mut Vec<Effect>) {
+        self.complete_with(completion, now_ns, &[], &[], effects);
+    }
+
+    /// [`Plain::complete`] with the external commit `batches` and `records` kept alive by the
+    /// driver across a streamed commit ([`Plain::commit_records_streamed`]).
+    pub(super) fn complete_with(&mut self, completion: Completion, now_ns: u64, batches: &[&Batch], records: &[LentRecord<'_>], effects: &mut Vec<Effect>) {
         debug_assert!(self.owns(completion.tag));
         let op = ((completion.tag.0 - self.cfg.tags) >> 32) as u8;
         let index = completion.tag.0 as u32;
@@ -5766,24 +6184,12 @@ impl<A: Allocator + Clone> Plain<A> {
             // the first reason is the one kept.
             return;
         }
-        if let Err(why) = self.step(op, index, completion.done, now_ns, effects) {
-            if self.holds_lock {
-                // A failure under the flip lock lets the lock go as the store stops, with
-                // nothing this process wrote under it still in flight (a flip writes under it
-                // one effect at a time, [`Plain::write_slot`]): a process
-                // that lives on with a broken store (a daemon) must not hold every other
-                // process's commit for good, and the kernel would let it go only at exit.
-                self.unlock(effects);
-            }
-            self.stop(why);
-        }
-    }
-
-    fn step(&mut self, op: u8, index: u32, done: Done, now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
-        let unexpected = |phase: &'static str| StoreError::Unasked { op, index, phase };
-        let fail = |doing: &'static str, file: &FileName, done: &Done| io(doing, file, done);
-        let unlink_early = self.plant() == Plant::UnlinkEarly;
-        match (op, &mut self.phase) {
+        let done = completion.done;
+        let outcome: Result<(), StoreError> = (|| {
+            let unexpected = |phase: &'static str| StoreError::Unasked { op, index, phase };
+            let fail = |doing: &'static str, file: &FileName, done: &Done| io(doing, file, done);
+            let unlink_early = self.plant() == Plant::UnlinkEarly;
+            match (op, &mut self.phase) {
             (BLOOM_MAP, _) if self.bloom_loading => {
                 self.bloom_loading = false;
                 if let Done::Mapped(map) = done {
@@ -6090,8 +6496,9 @@ impl<A: Allocator + Clone> Plain<A> {
                 for (i, (at, bytes)) in pieces.into_iter().enumerate() {
                     effects.push(Effect::WriteAt { file: file.share(), at, bytes, tag: self.tag(SEG_PIECE, i as u32) });
                 }
-                // A streamed copy's first chunks, behind its header.
+                // A streamed copy's or streamed commit's first chunks, behind its header.
                 self.stream_on(effects);
+                self.commit_stream_on(batches, records, effects);
                 Ok(())
             }
             (SEG_PIECE, Phase::Writing(writing, _)) => {
@@ -6106,9 +6513,17 @@ impl<A: Allocator + Clone> Plain<A> {
                         _ => stream.flying -= 1,
                     }
                 }
-                // A streamed copy's next chunk, as one completes; its index chunks once every
-                // payload chunk is asked, its footer after the last.
+                if let Some(commit) = &mut writing.commit {
+                    match index {
+                        0 | FOOTER_PIECE => {}
+                        index if index >= INDEX_PIECE => commit.index_flying = false,
+                        _ => commit.flying = commit.flying.saturating_sub(1),
+                    }
+                }
+                // A streamed copy's or streamed commit's next chunk, as one completes; its index
+                // chunks once every payload chunk is asked, its footer after the last.
                 self.stream_on(effects);
+                self.commit_stream_on(batches, records, effects);
                 let Phase::Writing(writing, _) = &self.phase else { unreachable!("streaming keeps the phase") };
                 if writing.left > 0 {
                     return Ok(());
@@ -6292,6 +6707,18 @@ impl<A: Allocator + Clone> Plain<A> {
                 Ok(())
             }
             _ => Err(unexpected(self.what())),
+        }
+        })();
+        if let Err(why) = outcome {
+            if self.holds_lock {
+                // A failure under the flip lock lets the lock go as the store stops, with
+                // nothing this process wrote under it still in flight (a flip writes under it
+                // one effect at a time, [`Plain::write_slot`]): a process
+                // that lives on with a broken store (a daemon) must not hold every other
+                // process's commit for good, and the kernel would let it go only at exit.
+                self.unlock(effects);
+            }
+            self.stop(why);
         }
     }
 

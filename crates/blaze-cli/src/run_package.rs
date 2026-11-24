@@ -734,16 +734,15 @@ fn with_layout<'f, T>(
                     layout.manifest(path.as_str(), text).map_err(|e| refused(&e))?;
                 }
                 Need::Listing(dir) => {
-                    // `Dir::list` gives no entries for a directory that is not there.
-                    let listed = match dir.as_str() {
-                        "" => root.list(cx, frame)?,
-                        named => root.subdir(&Path::new(named)?).list(cx, frame)?,
-                    };
-                    let mut entries: Vec<Entry<'_>, &Frame> = Vec::with_capacity_in(listed.len(), frame);
-                    for (path, meta) in listed.iter() {
-                        entries.push(Entry { name: path.as_str(), is_dir: meta.dir });
-                    }
-                    layout.listing(dir.as_str(), Some(&entries));
+                    // Direct entries of `dir` (one level, same filter as `units::lay`), never
+                    // `Dir::list` (which walks recursively and can truncate or emit nested paths).
+                    let listing = crate::sweep::list_dir(cx, root, dir.as_str(), frame)?;
+                    let entries: Option<Vec<Entry<'_>, &Frame>> = listing.as_ref().map(|listing| {
+                        let mut entries = Vec::with_capacity_in(listing.dirs.len(), frame);
+                        entries.extend(listing.entries().map(|(name, is_dir)| Entry { name, is_dir }));
+                        entries
+                    });
+                    layout.listing(dir.as_str(), entries.as_deref());
                 }
             }
         }

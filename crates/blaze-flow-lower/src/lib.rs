@@ -232,6 +232,19 @@ pub struct OwnerTraitImpl {
     pub self_shape: SelfShape,
 }
 
+/// Metadata for a trait fn's RPITIT opaque (`-> impl Trait` or `async fn` in a trait, RFC 3425):
+/// maps the opaque back to its trait, synthetic associated type name, trait fn, method name,
+/// trait generic count (including `Self`), and optional default `Twin` opaque key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RpititOpaque {
+    pub trait_: ItemKey,
+    pub name: Name,
+    pub trait_fn: ItemKey,
+    pub fn_name: Name,
+    pub trait_types: u32,
+    pub default_twin: Option<ItemKey>,
+}
+
 /// What the lowering needs to know about a callee's signature (flow.md section 7, heads).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CalleeFacts {
@@ -403,6 +416,17 @@ pub trait Facts {
     fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
         let _ = (trait_, name);
         false
+    }
+    /// If `opaque` is an RPITIT opaque of a trait fn, returns its [`RpititOpaque`] metadata so
+    /// `blaze-borrow` can normalize concrete RPITIT calls through the selected impl's method.
+    fn rpitit_opaque(&self, opaque: ItemKey) -> Option<RpititOpaque> {
+        let _ = opaque;
+        None
+    }
+    /// The impl method key overriding `fn_name` in trait impl `imp`, if overridden.
+    fn impl_fn(&self, imp: ItemKey, fn_name: Name) -> Option<ItemKey> {
+        let _ = (imp, fn_name);
+        None
     }
     /// The trait bounds with lifetime arguments of fn `item` ([`Ties`]): a callee's tie its
     /// trait lifetimes to what the call's arguments answer them with, the body's own say what
@@ -1225,7 +1249,7 @@ enum Agg {
 #[derive(Clone, Copy, Debug)]
 enum Task {
     Eval(ExprId, bool),
-    Adjust(ExprId, bool),
+    Adjust(ExprId, bool, u32),
     Stmt(StmtId),
     OpenTemps,
     CloseTemps(ExprId),
@@ -4541,7 +4565,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     fn step(&mut self, t: Task) -> Result<(), Refusal> {
         match t {
             Task::Eval(e, m) => self.eval(e, m),
-            Task::Adjust(e, m) => self.adjust(e, m),
+            Task::Adjust(e, m, skip) => self.adjust(e, m, skip),
             Task::Stmt(s) => self.stmt(s),
             Task::OpenTemps => {
                 self.temp_marks.push(self.temps.len() as u32);
@@ -4966,10 +4990,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     }
 
     fn eval(&mut self, e: ExprId, m: bool) -> Result<(), Refusal> {
-        self.tasks.push(Task::Adjust(e, m));
-        if self.place_capture_use(e)? {
+        if let Some(skip) = self.place_capture_use(e)? {
+            self.tasks.push(Task::Adjust(e, m, skip));
             return Ok(());
         }
+        self.tasks.push(Task::Adjust(e, m, 0));
         let ty = TyD::of(self.expr_ty(e)?);
         let body = self.body;
         match self.expr(e)? {
@@ -5494,8 +5519,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     }
 
     /// The expression's adjustments, in order, on its value.
-    fn adjust(&mut self, e: ExprId, m: bool) -> Result<(), Refusal> {
+    fn adjust(&mut self, e: ExprId, m: bool, skip: u32) -> Result<(), Refusal> {
         let (lo, hi) = self.adjust_rows(e);
+        let lo = lo.saturating_add(usize::try_from(skip).unwrap_or(usize::MAX)).min(hi);
         if lo == hi {
             return Ok(());
         }

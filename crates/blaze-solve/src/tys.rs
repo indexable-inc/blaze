@@ -44,6 +44,12 @@ pub trait Tys {
     /// A snapshot of the inference table and the binding log.
     type Snapshot: Copy;
 
+    /// Whether region inference variables (`VarKind::Region`) can ever be bound in this arena.
+    /// When `false` (as in `blaze-ty`, which has no region unification table), every region
+    /// variable forever canonicalizes to `ReErased` with no entry in `Canon::orig`, so goals
+    /// with only region variables are eligible for the plain canonical-input memo.
+    const REGIONS_BIND: bool = true;
+
     fn kind(&self, t: Ty) -> TyKind;
     fn flags(&self, t: Ty) -> Flags;
     /// Rebuilds a bound variable at a new De Bruijn index, keeping its original term sort.

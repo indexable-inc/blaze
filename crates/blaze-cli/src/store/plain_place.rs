@@ -341,6 +341,48 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         Ok(lent.get(&CasKey(key.0))?.map(|lend| Held { bytes: lend.bytes, proof: Checked { _private: PhantomData }, place: lend.in_place() }))
     }
 
+    /// Committed-only in-place lookup: borrows a committed segment for `'m` without pinning any
+    /// uncommitted arena; returns [`CommittedLend::InArena`] when the record is an uncommitted put.
+    pub fn get_committed(&self, key: Key) -> Result<super::Committed<'m>, PlaceError> {
+        let lent: &'m Lent<D, StoreAlloc> = self.lent;
+        Ok(match lent.get_committed(&CasKey(key.0))? {
+            blaze_cas::plain::CommittedLend::Found(lend) => {
+                super::Committed::Found(Held { bytes: lend.bytes, proof: Checked { _private: PhantomData }, place: lend.in_place() })
+            }
+            blaze_cas::plain::CommittedLend::InArena => super::Committed::InArena,
+            blaze_cas::plain::CommittedLend::Absent => super::Committed::Absent,
+        })
+    }
+
+    /// Non-lending existence check (uncommitted puts or committed segments); never pins an arena.
+    pub fn contains(&self, key: Key) -> Result<bool, PlaceError> {
+        Ok(self.lent.tag_of(&CasKey(key.0))?.is_some())
+    }
+
+    /// Reads `key`'s bytes inside `f` without lending them past the call; never pins an arena.
+    pub fn with_bytes<R>(&self, key: Key, f: impl FnOnce(&[u8]) -> R) -> Result<Option<R>, PlaceError> {
+        Ok(self.lent.with_bytes(&CasKey(key.0), |_tag, _ns, bytes| f(bytes))?)
+    }
+
+    /// Commits any uncommitted puts immediately (even below `COMMIT_BYTES`) so the current shared
+    /// arena is freed and later stages read from file-backed segment mappings with zero pinning.
+    pub fn flush_puts(&mut self) -> Result<(), PlaceError> {
+        if self.lent.uncommitted_bytes() > 0 {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Number of commits completed through this handle so far.
+    pub fn commits(&self) -> u32 {
+        self.commits
+    }
+
+    /// Number of shared arenas pinned past commit on the underlying `Lent`.
+    pub fn kept_arenas(&self) -> usize {
+        self.lent.kept_arenas()
+    }
+
     /// `bytes` under `key`, copied once into the arena. A key held with equal bytes is left as
     /// it is (rule 25); with other bytes it is refused (rule 21). Past [`COMMIT_BYTES`]
     /// uncommitted, one commit first.
@@ -452,7 +494,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// its tag): `None` when `owner` was put with no records beside it.
     pub(crate) fn beside(&self, owner: Key) -> Result<Option<CasKey>, PlaceError> {
         let key = blaze_cas::plain::beside_key(CasKey(owner.0));
-        Ok(self.lent.get(&key)?.filter(|held| ReservedTag::Index.is(held.tag)).map(|_| key))
+        Ok(self.lent.tag_of(&key)?.filter(|tag| ReservedTag::Index.is(*tag)).map(|_| key))
     }
 
     /// The store's owner, for a class root of store/roots.rs written beside the engine's

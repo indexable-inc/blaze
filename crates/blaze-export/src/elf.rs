@@ -204,8 +204,15 @@ pub fn write_native<'a>(
     out: &mut AVec<'a, u8>,
     alloc: Alloc<'a>,
 ) -> Result<[u8; 16], ExportError> {
-    // Program imports defined by the native image become R_AARCH64_RELATIVE and leave `.dynsym`.
-    let direct = |import: u32| {
+    // Program imports defined by the native image — plus ELF linker-synthesized symbols such as
+    // `__dso_handle` (the image's ELF header at vaddr 0, matching crtbegin.o / lld's
+    // `ElfSym::__dso_handle`) — become `R_AARCH64_RELATIVE` and leave `.dynsym`.
+    let direct = |import: u32| -> Option<u64> {
+        if let Ok(imp_idx) = usize::try_from(import)
+            && laid.imports.get(imp_idx).is_some_and(|imp| imp.name == "__dso_handle")
+        {
+            return Some(0);
+        }
         native.and_then(|m| {
             m.direct
                 .binary_search_by_key(&import, |&(row, _)| row)

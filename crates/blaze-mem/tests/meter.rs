@@ -110,8 +110,9 @@ fn two_threads_allocations_do_not_bleed() {
             start.wait();
             let before = Meter::now();
             for _ in 0..times {
-                // SAFETY: a non-zero size, freed at once with the same layout.
-                unsafe { std::alloc::dealloc(std::alloc::alloc(layout), layout) };
+                // SAFETY: a non-zero size, freed at once with the same layout; `black_box` prevents
+                // LLVM from eliding the dead alloc/dealloc pair under `opt-level = 2`.
+                unsafe { std::alloc::dealloc(core::hint::black_box(std::alloc::alloc(layout)), layout) }
             }
             Meter::now().since(&before).expect("one thread's pair")
         }

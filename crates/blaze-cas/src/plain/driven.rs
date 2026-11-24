@@ -307,7 +307,8 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         self.cut = at;
     }
 
-    fn bare(driver: D, root: &Path, core: Plain<A>) -> Driven<D, A> {
+    fn bare(driver: D, root: &Path, mut core: Plain<A>) -> Driven<D, A> {
+        core.set_stream_commits(true);
         Driven {
             driver,
             root: root.to_owned(),
@@ -395,6 +396,10 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
 
     /// Runs until nothing is in flight, the store's completions to it, the driver's own kept.
     fn run(&mut self, what: &'static str) -> Result<(), StoreError> {
+        self.run_with(what, &[], &[])
+    }
+
+    fn run_with(&mut self, what: &'static str, batches: &[&Batch], records: &[LentRecord<'_>]) -> Result<(), StoreError> {
         let _span = blaze_trace::info_span!("plain.wait", what).entered();
         let mut since = self.driver.now();
         #[cfg(test)]
@@ -431,7 +436,7 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
                         }
                     }
                     if self.core.owns(completion.tag) {
-                        self.core.complete(completion, wall, &mut self.effects);
+                        self.core.complete_with(completion, wall, batches, records, &mut self.effects);
                     } else {
                         self.own.push(completion);
                     }
@@ -664,7 +669,7 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         }
         let now = self.driver.wall_ns();
         self.core.commit_records(batches, records, now, &mut self.effects)?;
-        self.run("committing")?;
+        self.run_with("committing", batches, records)?;
         match self.core.take_committed() {
             Some(outcome) => outcome,
             None => Err(StoreError::Unfinished { what: "a commit" }),

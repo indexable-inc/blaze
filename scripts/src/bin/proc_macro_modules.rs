@@ -673,12 +673,14 @@ fn read_members(checkout: &Path, alloc: blaze_own::Alloc<'_>) -> Result<Vec<Path
     use blaze_manifest::layout::{Entry, Layout, Need, Pass};
     let absent = |error: &std::io::Error| matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory);
     let root = checkout.join("Cargo.toml");
-    let mut reader = Layout::new("", alloc).map_err(|why| Failure::Manifest { path: root.clone(), why: why.to_string() })?;
+    let mut reader = Layout::new("", alloc)
+        .map_err(|why| Failure::Manifest { path: root.clone(), why: why.to_string() })?
+        .with_path_packages();
     for _ in 0..LAYOUT_PASSES {
         let needs = match reader.pass().map_err(|why| Failure::Manifest { path: root.clone(), why: why.to_string() })? {
             Pass::Done(units) => {
-                let mut out = Vec::with_capacity(units.members.len());
-                for member in units.members.iter() {
+                let mut out = Vec::with_capacity(units.members.len() + units.path_packages.len());
+                for member in units.members.iter().chain(units.path_packages.iter()) {
                     let dir = member.dir.as_str();
                     out.push(PathPackage {
                         name: member.name.as_str().to_owned(),
@@ -1064,6 +1066,7 @@ fn table_value<'m>(manifest: &'m str, table: &str, key: &str) -> Option<&'m str>
                 '"' => quoted = !quoted,
                 '[' | '{' if !quoted => depth += 1,
                 ']' | '}' if !quoted => depth -= 1,
+                '#' if !quoted && depth <= 0 => return Some(manifest[start..start + index].trim()),
                 '\n' if depth <= 0 => return Some(manifest[start..start + index].trim()),
                 _ => {}
             }
@@ -1073,10 +1076,31 @@ fn table_value<'m>(manifest: &'m str, table: &str, key: &str) -> Option<&'m str>
     None
 }
 
+/// Strip a trailing `# ...` TOML comment outside double-quoted strings.
+fn strip_toml_comment(value: &str) -> &str {
+    let (mut quoted, mut escaped) = (false, false);
+    for (at, c) in value.char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                quoted = false;
+            }
+        } else if c == '"' {
+            quoted = true;
+        } else if c == '#' {
+            return value[..at].trim();
+        }
+    }
+    value.trim()
+}
+
 /// The entries of an inline table's text `{ a = 1, b = [x, y] }`, split at its top-level
 /// commas, each trimmed; `None` for text that is not one inline table on its line.
 fn inline_entries(value: &str) -> Option<Vec<&str>> {
-    let inner = value.trim().strip_prefix('{')?.strip_suffix('}')?;
+    let inner = strip_toml_comment(value).strip_prefix('{')?.strip_suffix('}')?;
     let (mut out, mut depth, mut start, mut quoted) = (Vec::new(), 0_i32, 0, false);
     for (at, c) in inner.char_indices() {
         match c {
@@ -1632,7 +1656,14 @@ impl Plan<'_> {
                 features.sort();
                 features.dedup();
                 let default = features.iter().any(|it| it == "default");
-                let named: Vec<&String> = features.iter().filter(|it| *it != "default").collect();
+                let declared = match origin {
+                    Origin::Path { manifest, .. } | Origin::Git { manifest, .. } => Some(feature_names(manifest)),
+                    Origin::Registry { .. } => None,
+                };
+                let named: Vec<&String> = features
+                    .iter()
+                    .filter(|it| *it != "default" && declared.as_ref().is_none_or(|known| known.iter().any(|k| k == *it)))
+                    .collect();
                 let from = match origin {
                     Origin::Registry { .. } => format!("package = {:?}, version = \"={}\"", wanted.name, wanted.version),
                     Origin::Path { .. } | Origin::Git { .. } => {

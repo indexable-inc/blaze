@@ -686,3 +686,36 @@ fn a_root_naming_a_key_never_put_is_refused_when_set_and_its_twin_is_set() {
     }
     println!("set-time guard: a never-put name refused by root and key under both visibilities; the twin set");
 }
+
+/// Non-lending probes (`tag_of`, `with_bytes`, `get_committed`, `point`, `pointed`) and
+/// dropped snapshots never set `shared_lent`, so `commit()` frees the shared arena immediately
+/// (`kept_arenas() == 0`, `held_bytes == 0`), whereas a direct `Lent::get` of an uncommitted
+/// put pins it (control).
+#[test]
+fn non_lending_reads_and_pointers_free_shared_arena_on_commit() {
+    let root = test_root();
+    let lent = open(Sim::new(77, Faults::default()), 1, 1, &root, IN_ARENA).expect("open");
+    let ptr_name = key(90);
+    lent.put(&key(1), Namespace::LOCAL, TAG, &value(1)).expect("put 1");
+    assert_eq!(lent.tag_of(&key(1)).expect("tag_of"), Some(TAG));
+    let matched = lent.with_bytes(&key(1), |tag, ns, bytes| tag == TAG && ns == Namespace::LOCAL && bytes == value(1).as_slice()).expect("with_bytes");
+    assert_eq!(matched, Some(true));
+    assert!(matches!(lent.get_committed(&key(1)).expect("get_committed"), super::CommittedLend::InArena));
+    lent.point(TAG, &ptr_name, &key(1)).expect("point");
+    assert_eq!(lent.pointed(TAG, &ptr_name).expect("pointed"), Some(key(1)));
+    let snap = lent.snapshot_in(Kept(blaze_mem::Tag::Store)).expect("snapshot");
+    assert_eq!(snap.get(&key(1)).expect("snap get"), Some(value(1).as_slice()));
+    drop(snap);
+    lent.commit().expect("commit");
+    assert_eq!(lent.kept_arenas(), 0, "no shared arena pinned by non-lending reads or pointers");
+    assert_eq!(lent.counts().held_bytes, 0, "all shared arena bytes freed after commit");
+    assert!(matches!(lent.get_committed(&key(1)).expect("committed after commit"), super::CommittedLend::Found(_)));
+
+    // Control: `Lent::get` on an uncommitted put DOES pin the shared arena across commit.
+    lent.put(&key(2), Namespace::LOCAL, TAG, &value(2)).expect("put 2");
+    let held = lent.get(&key(2)).expect("lent get").expect("present");
+    assert_eq!(held.bytes, value(2).as_slice());
+    lent.commit().expect("commit 2");
+    assert_eq!(lent.kept_arenas(), 1, "control: Lent::get pins its shared arena");
+    assert_eq!(held.bytes, value(2).as_slice());
+}

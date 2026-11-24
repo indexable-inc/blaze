@@ -171,12 +171,9 @@ fn class(u: Unlaid) -> String {
 /// `&self`'s by the output rule, "Lifetime elision in functions"), then its arguments' (`T`:
 /// none). So `stv_to_tokens`'s column is `[P0, P0]`, wherever the bound is written.
 ///
-/// Refused: the same projection through a trait that DECLARES a lifetime, bound on the
-/// container (`T: Lt<'static>`): its lifetime is written on the container's bound, which the
-/// member's walk does not read: `NotLaid/ProjectionBoundElsewhere/Output`.
-///
-/// Twin (laid, rule 23): the trait without a lifetime, bound on the container; and the same
-/// trait with a lifetime bound on the fn itself (`U: Lt<'a>`), whose bound the walk reads.
+/// With `ContainerRegions::param_bounds` carrying non-higher-ranked container bounds into member
+/// walks, a projection through a container-bound trait that DECLARES a lifetime (`T: Lt<'static>`)
+/// is also laid (`[P0, Static]`), alongside traits without a lifetime and fn-local bounds.
 #[test]
 fn a_projection_through_a_container_bound_is_laid_unless_its_trait_has_a_lifetime() {
     const TEXT: &str = "
@@ -188,9 +185,7 @@ pub fn own_bound<'a, U: Lt<'a>>(x: &'a u8) -> U::Token { let _ = x; loop {} }
 fn main() {}
 ";
     let got = heads(TEXT, &[Ask::TraitFn("Holder", "held"), Ask::TraitFn("SolTypeValue", "stv_to_tokens"), Ask::Free("own_bound")]);
-    assert_eq!(got[0], refused(NotLaidWhy::ProjectionBoundElsewhere, SigPart::Output), "`held`: a container-bound projection whose trait has a lifetime");
-    let Got::Refused(Some(u)) = got[0] else { unreachable!() };
-    assert_eq!(class(u), "NotLaid/ProjectionBoundElsewhere/Output", "the class printed first");
+    assert_eq!(got[0], Got::Laid(vec![P0, Region::Static]), "`held`: a container-bound projection whose trait has a lifetime is laid via ContainerRegions::param_bounds");
     assert_eq!(got[1], Got::Laid(vec![P0, P0]), "TWIN: alloy's `T::Token<'_>` under the container's `T: SolType` is laid");
     assert_eq!(got[2], Got::Laid(vec![P0, P0]), "TWIN: `U::Token` through the fn's own `U: Lt<'a>` takes `'a` (`x`'s slot, then the trait's)");
     println!("front2_unlaid_classes: projection: held {:?}; stv_to_tokens and own_bound laid", got[0]);

@@ -1711,4 +1711,252 @@ mod std_readiness_tests {
             "Linux AAPCS64 (even pair x2:x3, ptr in x4) and macOS (unaligned pair x1:x2, ptr in x3) must emit distinct register placements"
         );
     }
+
+    #[test]
+    fn sota_mem_uxtw_idx_folding() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+
+        // 1. Unscaled `ptr_add(base, zext(u32 -> u64, idx))` -> `ldr xt, [xn, wm, uxtw]`.
+        let unscaled_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I32)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let base = b.param(Ty::PTR);
+            let idx32 = b.param(Ty::I32);
+            let idx64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, idx32);
+            let p = b.ptr_add(Flags::NONE, base, idx64);
+            let v = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(0));
+            b.ret(&[v]);
+            b.finish_checked().unwrap()
+        };
+        let em_unscaled = Sota::standalone()
+            .emit(verify(unscaled_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits unscaled MemUxtwIdx load");
+        let mut words_unscaled = blaze_own::Vec::new_in(alloc);
+        for c in em_unscaled.code.as_slice().chunks_exact(4) {
+            words_unscaled.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        }
+        assert!(
+            words_unscaled.iter().any(|&w| (w & 0x3fe0_fc00) == 0x3860_4800),
+            "expected folded `ldr [rn, wm, uxtw]` instruction, got: {words_unscaled:#x?}"
+        );
+        let (ex_unscaled, _k1) = load_exec_with_syms(em_unscaled, &[]);
+        // Pass a `u64` with dirty upper 32 bits in x1 to prove `UXTW` ignores bits 63..32.
+        let f_unscaled: extern "C" fn(*const u8, u64) -> u64 = unsafe { ex_unscaled.as_fn() };
+        let mut buf = [0u8; 32];
+        buf[5..13].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(
+            f_unscaled(buf.as_ptr(), 0xDEAD_BEEF_0000_0005u64),
+            0x1122_3344_5566_7788u64,
+            "unscaled UXTW load must zero-extend low 32 bits of index"
+        );
+
+        // 2. Scaled `ptr_add(base, shl(zext(u32 -> u64, idx), 2))` -> `ldr wt, [xn, wm, uxtw #2]`.
+        let scaled_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I32)],
+                &[Param::of(Ty::I32)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let base = b.param(Ty::PTR);
+            let idx32 = b.param(Ty::I32);
+            let idx64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, idx32);
+            let c2 = b.iconst(Ty::I64, 2);
+            let byte_off = b.binary(Op::Shl, Flags::NONE, idx64, c2);
+            let p = b.ptr_add(Flags::NONE, base, byte_off);
+            let v = b.load(Ty::I32, Flags::NONE, p, 0, MemAttrs::aligned(2));
+            b.ret(&[v]);
+            b.finish_checked().unwrap()
+        };
+        let em_scaled = Sota::standalone()
+            .emit(verify(scaled_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits scaled MemUxtwIdx load");
+        let mut words_scaled = blaze_own::Vec::new_in(alloc);
+        for c in em_scaled.code.as_slice().chunks_exact(4) {
+            words_scaled.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        }
+        assert!(
+            words_scaled.iter().any(|&w| (w & 0x3fe0_fc00) == 0x3860_5800),
+            "expected folded `ldr wt, [rn, wm, uxtw #2]` instruction, got: {words_scaled:#x?}"
+        );
+        let (ex_scaled, _k2) = load_exec_with_syms(em_scaled, &[]);
+        let f_scaled: extern "C" fn(*const u32, u64) -> u32 = unsafe { ex_scaled.as_fn() };
+        let table = [10u32, 20, 30, 40, 0xCAFE_BABE, 60, 70, 80];
+        assert_eq!(
+            f_scaled(table.as_ptr(), 0xFFFF_0000_0000_0004u64),
+            0xCAFE_BABE,
+            "scaled UXTW #2 load must zero-extend low 32 bits and scale by 4"
+        );
+    }
+
+    #[test]
+    fn sota_ubfx_and_loop_align() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let decode_words = |bytes: &[u8]| -> AVec<'static, u32> {
+            let mut out = Vec::with_capacity_in(bytes.len() / 4, alloc);
+            for c in bytes.chunks_exact(4) {
+                out.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+            out
+        };
+
+        // 1. `UBFX` fusion: `(x >> 10) & 0x3FF` -> single `ubfx xd, xn, #10, #10` (`0xd34a_4c00`).
+        let ubfx_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let c10 = b.iconst(Ty::I64, 10);
+            let shifted = b.binary(Op::Lshr, Flags::NONE, x, c10);
+            let mask = b.iconst(Ty::I64, 0x3FF);
+            let extracted = b.binary(Op::And, Flags::NONE, shifted, mask);
+            b.ret(&[extracted]);
+            b.finish_checked().unwrap()
+        };
+        let em_ubfx = Sota::standalone()
+            .emit(verify(ubfx_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits UBFX fused bitfield extract");
+        let words_ubfx = decode_words(em_ubfx.code.as_slice());
+        // `ubfx xd, xn, #10, #10` = `ubfm xd, xn, #10, #19` = `0xd340_0000 | (10 << 16) | (19 << 10) = 0xd34a_4c00`.
+        assert!(
+            words_ubfx.iter().any(|&w| (w & 0xffff_fc00) == 0xd34a_4c00),
+            "expected fused `ubfx xd, xn, #10, #10` instruction, got: {words_ubfx:#x?}"
+        );
+        let (ex_ubfx, _k1) = load_exec_with_syms(em_ubfx, &[]);
+        let f_ubfx: extern "C" fn(u64) -> u64 = unsafe { ex_ubfx.as_fn() };
+        for &x in &[0u64, u64::MAX, 0xDEAD_BEEF_CAFE_BABE, 0x3FFu64 << 10, 1u64 << 9, 1u64 << 20] {
+            assert_eq!(f_ubfx(x), (x >> 10) & 0x3FF, "ubfx mismatch for x={x:#x}");
+        }
+
+        // 2. `BFXIL` fusion: `(dst & !0xFF) | (src & 0xFF)` -> `bfxil xd, xn, #0, #8` (`0xb340_1c00`).
+        let bfxil_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::I64);
+            let src = b.param(Ty::I64);
+            let hi_mask = b.iconst(Ty::I64, (!0xFFu64) as u128);
+            let lo_mask = b.iconst(Ty::I64, 0xFF);
+            let dst_hi = b.binary(Op::And, Flags::NONE, dst, hi_mask);
+            let src_lo = b.binary(Op::And, Flags::NONE, src, lo_mask);
+            let inserted = b.binary(Op::Or, Flags::NONE, dst_hi, src_lo);
+            b.ret(&[inserted]);
+            b.finish_checked().unwrap()
+        };
+        let em_bfxil = Sota::standalone()
+            .emit(verify(bfxil_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits BFXIL fused bitfield insert");
+        let words_bfxil = decode_words(em_bfxil.code.as_slice());
+        // `bfxil xd, xn, #0, #8` = `bfm xd, xn, #0, #7` = `0xb340_0000 | (0 << 16) | (7 << 10) = 0xb340_1c00`.
+        assert!(
+            words_bfxil.iter().any(|&w| (w & 0xffff_fc00) == 0xb340_1c00),
+            "expected fused `bfxil xd, xn, #0, #8` instruction, got: {words_bfxil:#x?}"
+        );
+        let (ex_bfxil, _k2) = load_exec_with_syms(em_bfxil, &[]);
+        let f_bfxil: extern "C" fn(u64, u64) -> u64 = unsafe { ex_bfxil.as_fn() };
+        for &(d, s) in &[
+            (0u64, u64::MAX),
+            (u64::MAX, 0u64),
+            (0xDEAD_BEEF_CAFE_BABEu64, 0x1234_5678_9ABC_DEF0u64),
+        ] {
+            assert_eq!(f_bfxil(d, s), (d & !0xFF) | (s & 0xFF), "bfxil mismatch for ({d:#x}, {s:#x})");
+        }
+
+        // 3. Simple loop with 16-byte loop-header alignment: executes cleanly & backward branches land on 16B boundary.
+        let loop_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, header, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let n = b.param(Ty::I64);
+            let zero = b.iconst(Ty::I64, 0);
+            let seed = b.iconst(Ty::I64, 0x1234);
+            b.jump((header, &[zero, seed]));
+
+            b.begin(header);
+            let i = b.param(Ty::I64);
+            let acc = b.param(Ty::I64);
+            let cont = b.icmp(IntCond::Ult, i, n);
+            b.br(Flags::NONE, cont, (body, &[]), (exit, &[]));
+
+            b.begin(body);
+            let c3 = b.iconst(Ty::I64, 3);
+            let c1 = b.iconst(Ty::I64, 1);
+            let p = b.binary(Op::Mul, Flags::NONE, acc, c3);
+            let s = b.binary(Op::Add, Flags::NONE, p, i);
+            let r = b.binary(Op::Lshr, Flags::NONE, acc, c1);
+            let next_acc = b.binary(Op::Xor, Flags::NONE, s, r);
+            let next_i = b.binary(Op::Add, Flags::NONE, i, c1);
+            b.jump((header, &[next_i, next_acc]));
+
+            b.begin(exit);
+            b.ret(&[acc]);
+            b.finish_checked().unwrap()
+        };
+        let em_loop = Sota::standalone()
+            .emit(verify(loop_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits aligned loop");
+        let words_loop = decode_words(em_loop.code.as_slice());
+        let mut saw_back_branch = false;
+        for (idx, &w) in words_loop.iter().enumerate() {
+            let delta = if (w & 0xfc00_0000) == 0x1400_0000 {
+                // `b <imm26>`
+                Some(((w & 0x03ff_ffff) as i32) << 6 >> 6)
+            } else if (w & 0xff00_0010) == 0x5400_0000 || (w & 0x7e00_0000) == 0x3400_0000 {
+                // `b.cond <imm19>` or `cbz`/`cbnz <imm19>`
+                Some((((w >> 5) & 0x7_ffff) as i32) << 13 >> 13)
+            } else {
+                None
+            };
+            if let Some(d) = delta {
+                if d < 0 {
+                    let target_w = (idx as isize + d as isize) as usize;
+                    if words_loop[target_w] == 0xd65f_03c0 {
+                        // Skip tail jump to shared `ret` epilogue (not a loop header).
+                        continue;
+                    }
+                    assert_eq!(
+                        target_w % 4,
+                        0,
+                        "loop-header target word {target_w} (from branch at {idx}) must be 16-byte aligned: {words_loop:#x?}"
+                    );
+                    saw_back_branch = true;
+                }
+            }
+        }
+        assert!(saw_back_branch, "expected at least one backward loop branch in {words_loop:#x?}");
+        let (ex_loop, _k3) = load_exec_with_syms(em_loop, &[]);
+        let f_loop: extern "C" fn(u64) -> u64 = unsafe { ex_loop.as_fn() };
+        for &n in &[0u64, 1, 5, 32, 200] {
+            let mut want = 0x1234u64;
+            for i in 0..n {
+                want = want.wrapping_mul(3).wrapping_add(i) ^ (want >> 1);
+            }
+            assert_eq!(f_loop(n), want, "aligned loop mismatch for n={n}");
+        }
+    }
 }

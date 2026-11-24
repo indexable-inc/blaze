@@ -418,11 +418,12 @@ pub(crate) fn parts_with<K: UnitKey, A: core::alloc::Allocator + Copy>(
         false => None,
     };
     let mut findings = Findings::new_in(alloc);
+    let mut scratch = blaze_lint::Scratch::new_in(alloc);
     for at in 0..count {
         let own = units.own(at, text, alloc).map_err(|_| UNLINTED)?;
         let scope = scopes[at];
         findings.clear();
-        let linted = blaze_lint::lint_own_in(&none, &own, scope, geometry(&units, at), None, alloc, &mut findings).map_err(|_| UNLINTED)?;
+        let linted = blaze_lint::lint_own_with(&none, &own, scope, geometry(&units, at), None, &mut scratch, &mut findings).map_err(|_| UNLINTED)?;
         for (child, given) in units.children_of(at).iter().zip(linted.children.iter()) {
             scopes[*child as usize] = *given;
         }
@@ -590,6 +591,7 @@ pub(crate) fn lint_units_in<S: Split>(
     let none = RuleSet::only(&[]);
     let mut findings = Findings::new_in(alloc);
     let mut stack: AVec<'_, usize> = AVec::new_in(alloc);
+    let mut scratch = blaze_lint::Scratch::new_in(alloc);
     for &(unit, _) in jobs.iter() {
         stack.clear();
         let mut up = Units::parent_of(items, unit);
@@ -605,7 +607,7 @@ pub(crate) fn lint_units_in<S: Split>(
             let scope = scopes[parent].ok_or(UNSCOPED)?;
             let own = units.own(parent, text, alloc).map_err(|_| UNLINTED)?;
             findings.clear();
-            let linted = blaze_lint::lint_own_in(&none, &own, scope, geometry(&units, parent), None, alloc, &mut findings).map_err(|_| UNLINTED)?;
+            let linted = blaze_lint::lint_own_with(&none, &own, scope, geometry(&units, parent), None, &mut scratch, &mut findings).map_err(|_| UNLINTED)?;
             for (child, given) in units.children_of(parent).iter().zip(linted.children.iter()) {
                 scopes[*child as usize] = Some(*given);
             }
@@ -687,12 +689,13 @@ fn lint_batch(shared: Shared<'_>, lone: &[Lone], alloc: Alloc<'_>) -> Result<(Ve
     let mut records = Vec::with_capacity_in(lone.len(), Global);
     let mut bytes = 0u64;
     let mut findings = Findings::new_in(alloc);
+    let mut scratch = blaze_lint::Scratch::new_in(alloc);
     for one in lone {
         let holes = blaze_lint::holes_in(one.plan, shared.holes);
         let own = blaze_lint::own_text(one.plan, holes, shared.text, alloc).map_err(|_| UNLINTED)?;
         findings.clear();
         let at = Geometry { base: one.plan.base, len: one.plan.end - one.plan.base, holes };
-        let mut linted = blaze_lint::lint_own_in(shared.rules, &own, one.scope, at, shared.variants, alloc, &mut findings).map_err(|_| UNLINTED)?;
+        let mut linted = blaze_lint::lint_own_with(shared.rules, &own, one.scope, at, shared.variants, &mut scratch, &mut findings).map_err(|_| UNLINTED)?;
         if shared.rules.runs(Rule::UnusedImport) && holes.is_empty() && own.text.contains("use") {
             blaze_lint::unused_imports_for_range(shared.text, one.scope, one.plan.base, one.plan.end, alloc, &mut findings, &mut linted).map_err(|_| UNLINTED)?;
         }
