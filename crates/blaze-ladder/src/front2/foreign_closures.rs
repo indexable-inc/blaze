@@ -81,6 +81,12 @@ impl<A: Allocator + Copy> ClosureRows<A> {
         ClosureRows { owners: Vec::new_in(alloc), rows: Vec::new_in(alloc) }
     }
 
+    pub fn clear(&mut self) {
+        let ClosureRows { owners, rows } = self;
+        owners.clear();
+        rows.clear();
+    }
+
     /// Files each closure of `checked`, the clean record of `body` (its owner `body.owner`), its
     /// signature copied as written into `into` (the head store's table; an `async` block the
     /// closure returns is its identity, which needs the body's expressions). An owner already

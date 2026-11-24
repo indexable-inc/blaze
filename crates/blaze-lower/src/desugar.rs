@@ -53,7 +53,7 @@ pub(crate) struct ForParts {
     pub(crate) inner_loop: ExprId,
 }
 
-impl Machine<'_, '_, '_> {
+impl Machine<'_, '_, '_, '_> {
     /// A path to a lang item, read by the body.
     fn lang_path(&mut self, lang: LangItem, r: Range) -> PathIdx {
         self.out.langs |= lang.bit();

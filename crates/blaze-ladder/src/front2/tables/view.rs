@@ -461,6 +461,16 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.each_member(owner, each)
     }
 
+    fn each_member_matching(
+        self,
+        owner: ItemKey,
+        want: &mut dyn FnMut(ItemKind, Option<&'n str>) -> crate::front2::source::MemberWant,
+        each: &mut dyn FnMut(MemberOf<'n>),
+    ) -> bool {
+        self.cell(NameCell::Members { owner });
+        self.records.each_member_matching(owner, want, each)
+    }
+
     /// The member's `MemberOf` cell on both paths: its digest is the answer (owner and name),
     /// and absent is "no named member of that key".
     fn member_owner(self, member: ItemKey) -> Option<(ItemKey, &'n str)> {

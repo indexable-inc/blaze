@@ -208,6 +208,10 @@ impl<'a> Definers<'a> {
     pub fn new_in(alloc: Alloc<'a>) -> Definers<'a> {
         Definers { crates: core::cell::RefCell::new(Vec::new_in(alloc)), alloc }
     }
+
+    pub fn clear(&mut self) {
+        self.crates.get_mut().clear();
+    }
 }
 
 /// Every fn of crate `krate` (in key order, `each_item`) with each type its `#[define_opaque]`

@@ -597,7 +597,7 @@ fn template_pieces(
     Ok(())
 }
 
-impl Machine<'_, '_, '_> {
+impl Machine<'_, '_, '_, '_> {
     /// Packs a closed `ASM_OPERAND_NAMED`, `ASM_CLOBBER_ABI` or `ASM_OPTIONS` into one value
     /// (an unplaced row of `ROW_ASM_OPERAND`, `ROW_ASM_CLOBBER` per ABI, or `ROW_ASM_OPTIONS`)
     /// for its `ASM_EXPR`. A part refused here writes its diagnostic and leaves a value marked

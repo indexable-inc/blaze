@@ -23,12 +23,13 @@
 //!   call and key) or a damaged row is answered none and filed in [`StoreLoad::unserved`].
 
 use core::cell::RefCell;
+use std::sync::OnceLock;
 
 use blaze_drive::{Input, Key, Name};
 use blaze_core::SharedSet;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ladder::front2::source::{Load, LoadedExpansion};
-use blaze_own::{AVec, Alloc, Bump, Vec};
+use blaze_own::{AVec, Alloc, Bump, SharedAlloc, Vec};
 use blaze_scope::items_record::{CurrentFile, ItemsRecord, ItemsRecordError};
 use blaze_scope::names_record::{NamesRecordError, Verified};
 use blaze_scope::package_path::PackagePath;
@@ -187,10 +188,34 @@ pub(crate) struct Unopened {
 /// [`ByNeedCounts::opened`] over that, 1.0 by construction (a slot opens once). Before, every
 /// crate of every opened scope was opened at the setup (tempo, one edited body: 773 records,
 /// 823 MB checked).
+/// One immutable pack file's encoded `FileItems` buffer (16-aligned slice `bytes[offset..offset + len]`)
+/// and its surface digest, cached once per file slot across all workers of a request.
+struct CachedPackFileItems {
+    edition: u8,
+    surface: ContentId,
+    /// Backing allocation sized `len + 15` (never reallocated), storing the 16-aligned `FileItems` bytes at `offset`.
+    buf: Vec<u8, SharedAlloc<'static>>,
+    offset: usize,
+    len: usize,
+}
+
+impl CachedPackFileItems {
+    fn aligned_bytes(&self) -> Option<&[u8]> {
+        let end = self.offset.checked_add(self.len)?;
+        self.buf.get(self.offset..end)
+    }
+}
+
+struct OpenedCrate<'r> {
+    records: CrateRecords<'r>,
+    /// Per-file `FileItems` cache for immutable pack crates (indexed by `file_index`).
+    pack_files: blaze_own::Vec<OnceLock<CachedPackFileItems>, blaze_own::SharedAlloc<'static>>,
+}
+
 pub(crate) struct ScopeRecords<'r> {
     snapshot: &'r StoreSnapshot,
     heap: &'static blaze_own::Heap,
-    slots: blaze_own::Vec<std::sync::OnceLock<Result<CrateRecords<'r>, &'static str>>, blaze_own::SharedAlloc<'static>>,
+    slots: blaze_own::Vec<OnceLock<Result<OpenedCrate<'r>, &'static str>>, blaze_own::SharedAlloc<'static>>,
     asks: core::sync::atomic::AtomicU64,
     opened: core::sync::atomic::AtomicU64,
     bytes: core::sync::atomic::AtomicU64,
@@ -207,8 +232,73 @@ pub(crate) struct ByNeedCounts {
 impl<'r> ScopeRecords<'r> {
     /// No crate opened yet, for a crate list of `crates` crates, over the committed `snapshot`.
     pub(crate) fn new(snapshot: &'r StoreSnapshot, crates: usize, heap: &'static blaze_own::Heap) -> ScopeRecords<'r> {
-        let slots = blaze_own::Vec::from_iter_in((0..crates).map(|_| std::sync::OnceLock::new()), heap.shared());
-        ScopeRecords { snapshot, heap, slots, asks: core::sync::atomic::AtomicU64::new(0), opened: core::sync::atomic::AtomicU64::new(0), bytes: core::sync::atomic::AtomicU64::new(0) }
+        let slots = blaze_own::Vec::from_iter_in((0..crates).map(|_| OnceLock::new()), heap.shared());
+        ScopeRecords {
+            snapshot,
+            heap,
+            slots,
+            asks: core::sync::atomic::AtomicU64::new(0),
+            opened: core::sync::atomic::AtomicU64::new(0),
+            bytes: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Build or fetch cached `CurrentFile` for an immutable pack (non-checkout) file at `(world_at, file)`.
+    pub(crate) fn cached_pack_file_items<'s>(
+        &'s self,
+        world_at: usize,
+        file: u32,
+        edition: blaze_surface::Edition,
+        text: &'s str,
+    ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
+        let opened = self.slots.get(world_at)?.get()?.as_ref().ok()?;
+        let cell = opened.pack_files.get(usize::try_from(file).ok()?)?;
+        if let Some(entry) = cell.get() {
+            if entry.edition != edition.byte() {
+                return None;
+            }
+            let bytes = entry.aligned_bytes()?;
+            let view = match blaze_surface::FileItemsView::read(bytes) {
+                Ok(v) => v,
+                Err(why) => return Some(Err(ItemsRecordError::FileItemsRead { file, why })),
+            };
+            return Some(Ok(CurrentFile { text, surface: entry.surface, view }));
+        }
+        let alloc = self.heap.alloc();
+        let outline = blaze_file_items::outline(text, edition, alloc);
+        let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
+        let encoded = match outline.to_file_items(text, digest, alloc) {
+            Ok(e) => e,
+            Err(why) => return Some(Err(ItemsRecordError::FileItemsBuild { file, why })),
+        };
+        let surface = outline.surface();
+        let len = encoded.len();
+        let mut buf = Vec::with_capacity_in(len.saturating_add(15), self.heap.shared());
+        buf.resize(len.saturating_add(15), 0);
+        let offset = (16 - (buf.as_ptr().addr() & 15)) & 15;
+        let Some(dst) = offset.checked_add(len).and_then(|end| buf.get_mut(offset..end)) else {
+            return None;
+        };
+        dst.copy_from_slice(&encoded);
+        drop(encoded);
+        drop(outline);
+        let Some(check_slice) = offset.checked_add(len).and_then(|end| buf.get(offset..end)) else {
+            return None;
+        };
+        if let Err(why) = blaze_surface::FileItemsView::read(check_slice) {
+            return Some(Err(ItemsRecordError::FileItemsRead { file, why }));
+        }
+        let _ = cell.set(CachedPackFileItems { edition: edition.byte(), surface, buf, offset, len });
+        let entry = cell.get()?;
+        if entry.edition != edition.byte() {
+            return None;
+        }
+        let bytes = entry.aligned_bytes()?;
+        let view = match blaze_surface::FileItemsView::read(bytes) {
+            Ok(v) => v,
+            Err(why) => return Some(Err(ItemsRecordError::FileItemsRead { file, why })),
+        };
+        Some(Ok(CurrentFile { text, surface: entry.surface, view }))
     }
 
     /// What it did so far.
@@ -225,13 +315,19 @@ impl<'r> ScopeRecords<'r> {
         let Some(slot) = self.slots.get(one.world_at) else {
             return Err("its place is past the request's crate list (front_load.rs `ScopeRecords`)");
         };
-        *slot.get_or_init(|| {
+        let opened = slot.get_or_init(|| {
             let mut counts = crate::engine_records::ReadCounts::default();
             let read = self.read(one, &mut counts);
             self.opened.fetch_add(counts.records, Relaxed);
             self.bytes.fetch_add(counts.bytes, Relaxed);
-            read.map_err(|why| crate::engine_head_notes::leak(self.heap.alloc(), format_args!("{why}")))
-        })
+            read.map(|records| {
+                let nfiles = ItemsRecord::open(records.items, self.heap.alloc()).map_or(0, |r| r.files());
+                let pack_files = blaze_own::Vec::from_iter_in((0..nfiles).map(|_| OnceLock::new()), self.heap.shared());
+                OpenedCrate { records, pack_files }
+            })
+            .map_err(|why| crate::engine_head_notes::leak(self.heap.alloc(), format_args!("{why}")))
+        });
+        opened.as_ref().map(|o| o.records).map_err(|&e| e)
     }
 
     /// The one read of crate `one`'s record: from the snapshot by its key, in place, opened.
@@ -281,11 +377,33 @@ impl core::fmt::Display for ByNeedError {
 /// cells).
 pub(crate) trait OpenByNeed: Sync {
     fn open<'s>(&'s self, one: &Unopened) -> Result<CrateRecords<'s>, &'static str>;
+
+    /// Cached `FileItems` view for immutable pack (non-checkout) files, keyed by
+    /// `(world_at, file_index)`. Returns `None` if no shared cache slot is available.
+    fn pack_file_items<'s>(
+        &'s self,
+        _world_at: usize,
+        _file: u32,
+        _edition: blaze_surface::Edition,
+        _text: &'s str,
+    ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
+        None
+    }
 }
 
 impl OpenByNeed for ScopeRecords<'_> {
     fn open<'s>(&'s self, one: &Unopened) -> Result<CrateRecords<'s>, &'static str> {
         self.records(one)
+    }
+
+    fn pack_file_items<'s>(
+        &'s self,
+        world_at: usize,
+        file: u32,
+        edition: blaze_surface::Edition,
+        text: &'s str,
+    ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
+        self.cached_pack_file_items(world_at, file, edition, text)
     }
 }
 
@@ -481,6 +599,10 @@ impl<'n> Load<'n> for StoreLoad<'n> {
         self.records_of(krate).map(|c| c.names)
     }
 
+    fn names_verified(&self, krate: usize) -> Option<Verified<'n>> {
+        self.records_of(krate).map(|c| c.names_proof)
+    }
+
     fn items(&self, krate: usize) -> Option<&'n [u8]> {
         self.records_of(krate).map(|c| c.items)
     }
@@ -497,6 +619,13 @@ impl<'n> Load<'n> for StoreLoad<'n> {
         // The outline planner covers checkout sources. The packed libraries and the
         // text-only driver supply immutable texts from which the view is made once.
         let (Some(outlines), Some(real)) = (self.outlines, full.strip_prefix("/0/")) else {
+            if !full.starts_with("/0/")
+                && let CratesFrom::ByNeed { rest, records, .. } = self.crates
+                && let Some(one) = krate.checked_sub(1).and_then(|i| rest.get(i))
+                && let Some(res) = records.pack_file_items(one.world_at, index, edition, text)
+            {
+                return res.map(Some);
+            }
             return CurrentFile::from_text(index, text, edition, bump).map(Some);
         };
         // A physical x/mod.rs can be a literal file or the module slot x.rs.

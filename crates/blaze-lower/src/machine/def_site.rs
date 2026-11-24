@@ -79,7 +79,7 @@ pub(super) fn form_of<'s>(text: &'s str, l: &LocalMacroAt) -> Option<crate::driv
     tree.get(1..tree.len().checked_sub(1)?).map(LocalForm::Rules)
 }
 
-impl Machine<'_, '_, '_> {
+impl Machine<'_, '_, '_, '_> {
     /// The `macro_rules!` of the body the call `request` expanded with, when it was one: the
     /// choice by_name.rs `ByName::local` makes over [`Machine::local_macros`] (a one-name
     /// path, the last written of the name in textual scope).

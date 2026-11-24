@@ -47,4 +47,16 @@ impl<'a> ListIndex<'a> {
         self.prev.push(prev);
         Ok(id)
     }
+
+    /// Clears all indexed lists while retaining bounded backing capacity for reuse.
+    pub(crate) fn clear(&mut self) {
+        self.newest.clear();
+        if self.newest.capacity() > 2048 {
+            self.newest.shrink_to(256);
+        }
+        self.prev.clear();
+        if self.prev.capacity() > 2048 {
+            self.prev.shrink_to(256);
+        }
+    }
 }

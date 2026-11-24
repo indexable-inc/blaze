@@ -114,6 +114,12 @@ impl Table {
     pub fn new_in(alloc: Alloc<'static>) -> Table {
         Table { entries: Vec::new_in(alloc), refusals: None }
     }
+
+    pub fn clear(&mut self) {
+        let Table { entries, refusals } = self;
+        entries.clear();
+        *refusals = None;
+    }
 }
 
 /// Reads the typed refusal of the leaf `need` (`None`: not refused) with `f`, while the table

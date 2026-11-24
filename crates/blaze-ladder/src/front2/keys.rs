@@ -83,6 +83,15 @@ impl Keys {
         Keys { origins: super::rows::Rows::new_in(Global), locals: HashMap::new_in(Global) }
     }
 
+    /// Resets all filed keys to empty while retaining bounded backing allocations for reuse.
+    pub fn clear(&mut self) {
+        self.origins.clear();
+        self.locals.clear();
+        if self.locals.capacity() > 256 {
+            self.locals.shrink_to(64);
+        }
+    }
+
     /// Files `key` and returns its checker key; a different library key already filed under
     /// that checker key is a [`KeyClash`].
     pub fn item(&self, key: LibKey) -> Result<ItemKey, KeyClash> {
@@ -93,6 +102,13 @@ impl Keys {
     /// The key of member `name` of kind `kind` of `container`, filed.
     pub fn member(&self, container: ItemKey, kind: MemberKind, name: &str) -> Result<ItemKey, KeyClash> {
         let k = member_key(container, kind, name);
+        if let Some((Origin::Member { container: c, kind: mk, name: existing }, _)) = self.origins.get(&k)
+            && *c == container
+            && *mk == kind
+            && existing.as_ref() == name
+        {
+            return Ok(k);
+        }
         self.file(k, Origin::Member { container, kind, name: Box::from(name) })
     }
 

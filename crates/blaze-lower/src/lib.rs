@@ -681,16 +681,28 @@ pub fn lower_signature<'a, 't>(
     cfg: &mut dyn Cfg,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
+    lower_signature_with_scratch(text, edition, cfg, alloc, alloc)
+}
+
+/// [`lower_signature`] separating the output allocator `alloc` (kept in [`Lowered`]) from
+/// `scratch` (used for temporary token/range columns and machine stacks, dropped before return).
+pub fn lower_signature_with_scratch<'a, 's, 't>(
+    text: &'t str,
+    edition: Edition,
+    cfg: &mut dyn Cfg,
+    alloc: Alloc<'a>,
+    scratch: Alloc<'s>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
     // A text that spells `$crate` is read from its words, `$crate` one of them ([`spelled_words`]).
-    if let Some(w) = spelled_words(text, edition, alloc) {
-        return lower_signature_words(text, w.item_words(), edition, cfg, alloc);
+    if let Some(w) = spelled_words(text, edition, scratch) {
+        return lower_signature_words_with_scratch(text, w.item_words(), edition, cfg, alloc, scratch);
     }
     let end = u32::try_from(text.len()).expect("an item of over 4 GiB: ranges are u32 pairs");
     let pe = parser_edition(edition);
     let lexed = parser::LexedStr::new_outline(pe, text);
-    let (words, ranges) = input_columns(&lexed, pe, alloc);
+    let (words, ranges) = input_columns(&lexed, pe, scratch);
     let output = parser::Reparser::top_level_item().parse_outline(parser::Tokens::new(&words, true));
-    let mut m = machine::Machine::new(text, Mode::Signature, edition, cfg, None, alloc);
+    let mut m = machine::Machine::new_with_scratch(text, Mode::Signature, edition, cfg, None, alloc, scratch);
     feed::feed_input(&mut m, &output, ranges, end);
     m.finish()
 }
@@ -722,15 +734,27 @@ pub fn lower_signature_with_extensions<'a, 't>(
     cfg: &mut dyn Cfg,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
+    lower_signature_with_extensions_and_scratch(text, edition, extensions, cfg, alloc, alloc)
+}
+
+/// [`lower_signature_with_extensions`] separating output allocator `alloc` from temporary `scratch`.
+pub fn lower_signature_with_extensions_and_scratch<'a, 's, 't>(
+    text: &'t str,
+    edition: Edition,
+    extensions: parser::Extensions,
+    cfg: &mut dyn Cfg,
+    alloc: Alloc<'a>,
+    scratch: Alloc<'s>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
     if extensions.is_none() {
-        return lower_signature(text, edition, cfg, alloc);
+        return lower_signature_with_scratch(text, edition, cfg, alloc, scratch);
     }
     let pe = parser_edition(edition);
     let lexed = parser::LexedStr::new(pe, text);
     let mut input = lexed.to_input(pe);
     input.mark_extensions(0, extensions);
     let output = parser::Reparser::top_level_item().parse_outline(input.tokens());
-    let mut m = machine::Machine::new(text, Mode::Signature, edition, cfg, None, alloc);
+    let mut m = machine::Machine::new_with_scratch(text, Mode::Signature, edition, cfg, None, alloc, scratch);
     feed::feed(&mut m, &lexed, &output, 0);
     m.finish()
 }
@@ -1037,8 +1061,20 @@ pub fn lower_signature_words<'a, 't>(
     cfg: &mut dyn Cfg,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
+    lower_signature_words_with_scratch(text, words, edition, cfg, alloc, alloc)
+}
+
+/// [`lower_signature_words`] separating output allocator `alloc` from temporary `scratch`.
+pub fn lower_signature_words_with_scratch<'a, 's, 't>(
+    text: &'t str,
+    words: ItemWords<'_>,
+    edition: Edition,
+    cfg: &mut dyn Cfg,
+    alloc: Alloc<'a>,
+    scratch: Alloc<'s>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
     let output = parser::Reparser::top_level_item().parse_outline(parser::Tokens::new(words.words, false));
-    let mut m = machine::Machine::new(text, Mode::Signature, edition, cfg, None, alloc);
+    let mut m = machine::Machine::new_with_scratch(text, Mode::Signature, edition, cfg, None, alloc, scratch);
     feed::feed_words(&mut m, &output, words.ranges, None);
     m.finish()
 }

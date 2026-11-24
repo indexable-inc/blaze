@@ -1001,6 +1001,161 @@ fn fn_record_text(text: &str, prefix: Option<u32>) -> Option<&[u8]> {
     }
 }
 
+/// Reusable scratch buffers for encoding one or more heads with [`encode_with_digests_into`].
+pub struct EncodeScratch<'b> {
+    terms: RecordBytes<'b>,
+    body: RecordBytes<'b>,
+    seen: HashMap<PTy, u32, Alloc<'b>>,
+    stack: Vec<(PTy, bool), Alloc<'b>>,
+    kids: Vec<PTy, Alloc<'b>>,
+    zero_ranges: Vec<(usize, usize), Alloc<'b>>,
+    erased_skip_ranges: Vec<(usize, usize), Alloc<'b>>,
+}
+
+impl<'b> EncodeScratch<'b> {
+    pub fn new_in(alloc: Alloc<'b>) -> EncodeScratch<'b> {
+        EncodeScratch {
+            terms: RecordBytes::new_in(alloc),
+            body: RecordBytes::new_in(alloc),
+            seen: HashMap::new_in(alloc),
+            stack: Vec::new_in(alloc),
+            kids: Vec::new_in(alloc),
+            zero_ranges: Vec::new_in(alloc),
+            erased_skip_ranges: Vec::new_in(alloc),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.terms.clear();
+        self.body.clear();
+        self.seen.clear();
+        self.stack.clear();
+        self.kids.clear();
+        self.zero_ranges.clear();
+        self.erased_skip_ranges.clear();
+    }
+}
+
+/// Hash `body` while replacing byte intervals in `zeros` with `0u8` and omitting byte intervals
+/// in `skips`. Both slices must be sorted, non-overlapping, and contained within `0..body.len()`.
+fn hash_body_with_edits(h: &mut blaze_ids::Hasher, body: &[u8], zeros: &[(usize, usize)], skips: &[(usize, usize)]) {
+    const ZEROS: [u8; 64] = [0u8; 64];
+    let mut pos = 0usize;
+    let mut zi = 0usize;
+    let mut si = 0usize;
+    loop {
+        let next = match (zeros.get(zi).copied(), skips.get(si).copied()) {
+            (Some(z), Some(sk)) if z.0 <= sk.0 => {
+                zi += 1;
+                (true, z)
+            }
+            (Some(z), None) => {
+                zi += 1;
+                (true, z)
+            }
+            (_, Some(sk)) => {
+                si += 1;
+                (false, sk)
+            }
+            (None, None) => break,
+        };
+        let (is_zero, (s, e)) = next;
+        if s > pos
+            && let Some(slice) = body.get(pos..s)
+        {
+            h.update(slice);
+        }
+        if is_zero {
+            let mut rem = e.saturating_sub(s);
+            while rem > 0 {
+                let n = rem.min(ZEROS.len());
+                if let Some(zslice) = ZEROS.get(..n) {
+                    h.update(zslice);
+                }
+                rem -= n;
+            }
+        }
+        pos = e;
+    }
+    if let Some(tail) = body.get(pos..)
+        && !tail.is_empty()
+    {
+        h.update(tail);
+    }
+}
+
+/// Single-pass equivalent of [`encode_with_origins`], [`reader_digest_with_origins`], and
+/// [`regions_digest_with_origins`]: appends the encoded record bytes directly into `out`, reuses
+/// `scratch` across heads, and returns `(reader_digest, regions_digest)`.
+pub fn encode_with_digests_into<'b>(
+    head: HeadRef<'_, '_>,
+    tys: PTys<'_>,
+    origin: &dyn Fn(ItemKey) -> Result<OpaqueOrigin, HeadRecordError>,
+    scratch: &mut EncodeScratch<'b>,
+    out: &mut RecordBytes<'_>,
+) -> Result<(ContentId, ContentId), HeadRecordError> {
+    if let Some(r) = head.regions() {
+        regions_fit_head(head, r.regions(), tys)?;
+    }
+    let meta = encode_into_scratch(head, tys, Text::Kept, Parts::WithRegions, origin, scratch)?;
+    let header_end = [
+        MAGIC[0],
+        MAGIC[1],
+        MAGIC[2],
+        MAGIC[3],
+        VERSION.to_le_bytes()[0],
+        VERSION.to_le_bytes()[1],
+        VERSION.to_le_bytes()[2],
+        VERSION.to_le_bytes()[3],
+        meta.kind,
+    ];
+    let count_le = meta.count.to_le_bytes();
+    out.reserve(header_end.len() + count_le.len() + scratch.terms.len() + scratch.body.len());
+    out.extend_from_slice(&header_end);
+    out.extend_from_slice(&count_le);
+    out.extend_from_slice(&scratch.terms);
+    out.extend_from_slice(&scratch.body);
+
+    let mut rh = blaze_ids::Hasher::new(REGIONS_DOMAIN);
+    rh.update(&header_end);
+    rh.update(&count_le);
+    rh.update(&scratch.terms);
+    hash_body_with_edits(&mut rh, &scratch.body, &scratch.zero_ranges, &[]);
+    let regions = rh.finish();
+
+    let meaning = if !meta.trait_had_laid_assoc {
+        let mut mh = blaze_ids::Hasher::new(DIGEST_DOMAIN);
+        mh.update(&header_end);
+        mh.update(&meta.erased_count.to_le_bytes());
+        if let Some(terms_slice) = scratch.terms.get(..meta.erased_terms_len) {
+            mh.update(terms_slice);
+        }
+        if let Some(body_slice) = scratch.body.get(..meta.erased_body_len) {
+            hash_body_with_edits(&mut mh, body_slice, &scratch.zero_ranges, &scratch.erased_skip_ranges);
+        }
+        mh.finish()
+    } else {
+        let erased = encode_into_scratch(head, tys, Text::Zeroed, Parts::Erased, origin, scratch)?;
+        let mut mh = blaze_ids::Hasher::new(DIGEST_DOMAIN);
+        mh.update(&header_end);
+        mh.update(&erased.count.to_le_bytes());
+        mh.update(&scratch.terms);
+        mh.update(&scratch.body);
+        mh.finish()
+    };
+
+    Ok((meaning, regions))
+}
+
+struct EncodedMeta {
+    kind: u8,
+    count: u32,
+    erased_count: u32,
+    erased_terms_len: usize,
+    erased_body_len: usize,
+    trait_had_laid_assoc: bool,
+}
+
 fn encode_with<'b>(
     head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot: Text, parts: Parts, origin: &dyn Fn(ItemKey) -> Result<OpaqueOrigin, E>,
 ) -> Result<RecordBytes<'b>, HeadRecordError> {
@@ -1009,17 +1164,42 @@ fn encode_with<'b>(
     if let Some(r) = head.regions() {
         regions_fit_head(head, r.regions(), tys)?;
     }
+    let mut scratch = EncodeScratch::new_in(alloc);
+    let meta = encode_into_scratch(head, tys, slot, parts, origin, &mut scratch)?;
+    let mut out = RecordBytes::with_capacity_in(13 + scratch.terms.len() + scratch.body.len(), alloc);
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.push(meta.kind);
+    out.extend_from_slice(&meta.count.to_le_bytes());
+    out.extend_from_slice(&scratch.terms);
+    out.extend_from_slice(&scratch.body);
+    Ok(out)
+}
+
+fn encode_into_scratch<'b>(
+    head: HeadRef<'_, '_>,
+    tys: PTys<'_>,
+    slot: Text,
+    parts: Parts,
+    origin: &dyn Fn(ItemKey) -> Result<OpaqueOrigin, E>,
+    scratch: &mut EncodeScratch<'b>,
+) -> Result<EncodedMeta, HeadRecordError> {
+    scratch.clear();
+    let alloc = *scratch.body.allocator();
     let mut o = Out {
         tys,
         parts,
         origin,
-        terms: RecordBytes::new_in(alloc),
-        body: RecordBytes::new_in(alloc),
-        seen: HashMap::new_in(alloc),
+        terms: &mut scratch.terms,
+        body: &mut scratch.body,
+        seen: &mut scratch.seen,
         count: 0,
-        stack: Vec::new_in(alloc),
-        kids: Vec::new_in(alloc),
+        stack: &mut scratch.stack,
+        kids: &mut scratch.kids,
+        zero_ranges: &mut scratch.zero_ranges,
+        erased_skip_ranges: &mut scratch.erased_skip_ranges,
     };
+    let mut trait_had_laid_assoc = false;
     let kind = match head {
         HeadRef::Fn { key, head, preds, static_, regions: _, misses } => {
             o.key(key);
@@ -1027,9 +1207,11 @@ fn encode_with<'b>(
                 Text::Kept => {
                     let text = fn_record_text(head.text, head.text_prefix).ok_or(E::Shape { what: "a fn text prefix must end at the body's opening brace" })?;
                     let len = u32::try_from(text.len()).map_err(|_| E::TooBig { what: "a fn's text" })?;
+                    let z_start = o.body.len();
                     o.flag(head.text_prefix.is_some());
                     o.u32(len);
                     o.body.extend_from_slice(&ContentId::of(TEXT_DOMAIN, text).0);
+                    o.zero_ranges.push((z_start, o.body.len()));
                 }
                 Text::Zeroed => {
                     o.flag(false);
@@ -1224,9 +1406,14 @@ fn encode_with<'b>(
                 o.opt(assoc_side.bounds(n, item), |o, p| o.preds(p))?;
                 // Form 37: its item-bound regions state (left out of the erased digest).
                 if o.parts == Parts::WithRegions {
+                    let s = o.body.len();
                     match assoc_side.regions(n, item) {
-                        AssocRegionsRef::None => o.byte(0),
+                        AssocRegionsRef::None => {
+                            o.byte(0);
+                            o.erased_skip_ranges.push((s, o.body.len()));
+                        }
                         AssocRegionsRef::Laid(r) => {
+                            trait_had_laid_assoc = true;
                             o.byte(1);
                             o.regions_section(r)?;
                         }
@@ -1234,8 +1421,12 @@ fn encode_with<'b>(
                             o.byte(2);
                             o.byte(u.byte());
                             o.body.extend_from_slice(&u.detail());
+                            o.erased_skip_ranges.push((s, o.body.len()));
                         }
-                        AssocRegionsRef::HeadRefused => o.byte(3),
+                        AssocRegionsRef::HeadRefused => {
+                            o.byte(3);
+                            o.erased_skip_ranges.push((s, o.body.len()));
+                        }
                     }
                 }
             }
@@ -1345,38 +1536,36 @@ fn encode_with<'b>(
             K_OPAQUE
         }
     };
+    let erased_count = o.count;
+    let erased_terms_len = o.terms.len();
+    let erased_body_len = o.body.len();
     // Form 22: the regions section, after every kind's fields; left out of the erased digest.
     if parts == Parts::WithRegions {
         o.opt(head.regions(), |o, r| o.regions_section(r))?;
     }
-    let mut out = RecordBytes::new_in(alloc);
-    out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
-    out.push(kind);
-    out.extend_from_slice(&o.count.to_le_bytes());
-    out.extend_from_slice(&o.terms);
-    out.extend_from_slice(&o.body);
-    Ok(out)
+    Ok(EncodedMeta { kind, count: o.count, erased_count, erased_terms_len, erased_body_len, trait_had_laid_assoc })
 }
 
 /// The writer: the record's term table (first-use order) and the head's fields after it.
-struct Out<'b, 't, 'o> {
+struct Out<'s, 'b, 't, 'o> {
     tys: PTys<'t>,
     /// Whether region bytes are written (the record, the regions digest) or left out (the
     /// erased digest): the regions section and an outlives clause's regions alike.
     parts: Parts,
     origin: &'o dyn Fn(ItemKey) -> Result<OpaqueOrigin, E>,
-    terms: RecordBytes<'b>,
-    body: RecordBytes<'b>,
+    terms: &'s mut RecordBytes<'b>,
+    body: &'s mut RecordBytes<'b>,
     /// Each term written, by its index in `tys`, to its index in the record's table.
-    seen: HashMap<PTy, u32, Alloc<'b>>,
+    seen: &'s mut HashMap<PTy, u32, Alloc<'b>>,
     count: u32,
     /// The walk's work list: a term, and whether its children are already pushed.
-    stack: Vec<(PTy, bool), Alloc<'b>>,
-    kids: Vec<PTy, Alloc<'b>>,
+    stack: &'s mut Vec<(PTy, bool), Alloc<'b>>,
+    kids: &'s mut Vec<PTy, Alloc<'b>>,
+    zero_ranges: &'s mut Vec<(usize, usize), Alloc<'b>>,
+    erased_skip_ranges: &'s mut Vec<(usize, usize), Alloc<'b>>,
 }
 
-impl Out<'_, '_, '_> {
+impl Out<'_, '_, '_, '_> {
     fn byte(&mut self, b: u8) {
         self.body.push(b);
     }
@@ -1530,8 +1719,12 @@ impl Out<'_, '_, '_> {
         self.byte(tag);
         let ranged = tag >= 9;
         let (a, b) = if ranged && slot == Text::Zeroed { (0, 0) } else { (a, b) };
+        let z_start = self.body.len();
         self.u32(a);
         self.u32(b);
+        if ranged && slot == Text::Kept {
+            self.zero_ranges.push((z_start, self.body.len()));
+        }
     }
     fn ty(&mut self, t: PTy) -> Result<(), E> {
         let at = self.term(t)?;
@@ -1649,14 +1842,18 @@ impl Out<'_, '_, '_> {
                     self.byte(3);
                     self.ty(ty)?;
                     if self.parts == Parts::WithRegions {
+                        let s = self.body.len();
                         self.rregion(region);
+                        self.erased_skip_ranges.push((s, self.body.len()));
                     }
                 }
                 PClause::RegionOutlives { long, short } => {
                     self.byte(4);
                     if self.parts == Parts::WithRegions {
+                        let s = self.body.len();
                         self.rregion(long);
                         self.rregion(short);
+                        self.erased_skip_ranges.push((s, self.body.len()));
                     }
                 }
                 PClause::ForFields { container, trait_, args } => {
@@ -2938,12 +3135,20 @@ impl<'r> In<'r, '_, '_> {
     fn rcol(&mut self, arity: &ArityTable, what: &'static str) -> Result<RegionCol<Mem>, E> {
         let ty = self.ty(what)?;
         let n = self.count(what)?;
-        let mut slots: Vec<RRegion, Mem> = Vec::with_capacity_in(n, self.alloc);
-        for _ in 0..n {
-            let s = self.rregion()?;
-            slots.push(s);
+        let mut inline = [RRegion::Static; 16];
+        if let Some(slice) = inline.get_mut(..n) {
+            for slot in slice.iter_mut() {
+                *slot = self.rregion()?;
+            }
+            RegionCol::lay(self.tys.view(), ty, arity, slice, self.alloc).map_err(|error| E::Regions { what, error })
+        } else {
+            let mut slots: Vec<RRegion, Mem> = Vec::with_capacity_in(n, self.alloc);
+            for _ in 0..n {
+                let s = self.rregion()?;
+                slots.push(s);
+            }
+            RegionCol::lay(self.tys.view(), ty, arity, &slots, self.alloc).map_err(|error| E::Regions { what, error })
         }
-        RegionCol::lay(self.tys.view(), ty, arity, &slots, self.alloc).map_err(|error| E::Regions { what, error })
     }
     fn rregion(&mut self) -> Result<RRegion, E> {
         Ok(match self.u8("a region's form")? {
@@ -3883,6 +4088,16 @@ pub struct RegionTable {
     unlaid: Rows<ItemKey, (Unlaid, &'static str), Mem>,
 }
 
+impl RegionTable {
+    pub fn clear(&mut self) {
+        let RegionTable { made, refused, forms, unlaid } = self;
+        made.clear();
+        refused.clear();
+        forms.clear();
+        unlaid.clear();
+    }
+}
+
 /// Why a head filed whole has no regions: the kind of its soft refusal, the one name a
 /// reader is told ([`UnreadWhy::Refused`]) and the byte a frozen cell records it by (front2
 /// tables/head.rs form 11: a head of a kind that holds regions is recorded laid or refused,
@@ -4537,5 +4752,33 @@ mod region_tests {
         old[4..8].copy_from_slice(&34u32.to_le_bytes());
         let err = decode(&old, None, &tys_empty(), a()).err().expect("version 34 must be rejected");
         assert_eq!(form_of(&err), Some(34));
+    }
+
+    /// Single-pass [`encode_with_digests_into`] reusing one [`EncodeScratch`] produces bytes,
+    /// reader digest, and regions digest identical to the separate encoders.
+    #[test]
+    fn encode_with_digests_into_matches_separate_encode_and_digests() {
+        let t = tys();
+        let sig = ctor(&t);
+        let r0 = every_part(&t, RRegion::Param(0));
+        let r1 = every_part(&t, RRegion::Param(1));
+        let cases = [
+            HeadRef::Ctor { key: CTOR, sig: &sig, regions: None },
+            HeadRef::Ctor { key: CTOR, sig: &sig, regions: Some(&r0) },
+            HeadRef::Ctor { key: CTOR, sig: &sig, regions: Some(&r1) },
+        ];
+        let mut scratch = EncodeScratch::new_in(a());
+        let mut payload: RecordBytes<'_> = RecordBytes::new_in(a());
+        for head in cases {
+            let start = payload.len();
+            let (erased, regions) = encode_with_digests_into(head, t.tys.view(), &missing_origin, &mut scratch, &mut payload)
+                .unwrap_or_else(|e| panic!("encode_with_digests_into: {e}"));
+            let want_bytes = encode(head, t.tys.view(), a()).unwrap_or_else(|e| panic!("encode: {e}"));
+            let want_erased = reader_digest(head, t.tys.view(), a()).unwrap_or_else(|e| panic!("reader_digest: {e}"));
+            let want_regions = regions_digest(head, t.tys.view(), a()).unwrap_or_else(|e| panic!("regions_digest: {e}"));
+            assert_eq!(&payload[start..], &want_bytes[..], "payload bytes differ");
+            assert_eq!(erased, want_erased, "erased reader digest differs");
+            assert_eq!(regions, want_regions, "regions digest differs");
+        }
     }
 }

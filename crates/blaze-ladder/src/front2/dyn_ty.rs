@@ -155,20 +155,22 @@ pub(super) fn dyn_bound(v: &View<'_>, b: lf::Bound, r: Range) -> Result<Option<(
 
 /// The written types of a `dyn` bound's last segment, in the order [`Builder::dyn_ty`] reads
 /// them: `Fn(A, B) -> C` its inputs then `C`; else each type argument and each `Name = T`'s `T`.
-pub(super) fn dyn_arg_types(v: &View<'_>, s: &lf::Segment, r: Range, out: &mut Vec<lf::TypeId, Global>) -> Result<(), Why> {
+pub(super) fn dyn_arg_types_into(v: &View<'_>, s: &lf::Segment, r: Range, out: &mut impl FnMut(lf::TypeId)) -> Result<(), Why> {
     if s.return_notation {
         return Err(Why::Unsupported("return type notation (`Tr(..)`)", r));
     }
     for &n in v.rows(s.args)? {
         match lf::GenericArg::decode(n)? {
-            lf::GenericArg::Type(t) => out.push(t),
+            lf::GenericArg::Type(t) => out(t),
             lf::GenericArg::Lifetime(_) if !s.parenthesized => {}
-            lf::GenericArg::AssocType { args, ty, .. } if !s.parenthesized && args.len == 0 => out.push(ty),
+            lf::GenericArg::AssocType { args, ty, .. } if !s.parenthesized && args.len == 0 => out(ty),
             _ => return Err(Why::Unsupported("this generic argument in a trait object type", r)),
         }
     }
     if s.parenthesized {
-        out.extend(s.ty);
+        if let Some(ret) = s.ty {
+            out(ret);
+        }
     }
     Ok(())
 }

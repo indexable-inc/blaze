@@ -451,6 +451,17 @@ impl<'n> Locals<'n> {
         }
     }
 
+    pub fn clear(&mut self) {
+        let Locals { frame: _, bodies, heads, foreign, anons, block_owners, planted, body_scopes } = self;
+        bodies.clear();
+        heads.clear();
+        foreign.clear();
+        anons.clear();
+        block_owners.clear();
+        *planted = super::scope_table::Planted::None;
+        *body_scopes = None;
+    }
+
     /// Reads every body kept after this under `BlockScopes::Bodies`: its block names from its
     /// `BodyScope` record (D189 S3). Never called under `Modules`.
     pub fn read_body_scopes(&mut self, scopes: &'n (dyn BodyScopes + 'n)) {

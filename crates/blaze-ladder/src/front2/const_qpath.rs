@@ -402,6 +402,12 @@ impl Default for Table {
 }
 
 impl Table {
+    pub fn clear(&mut self) {
+        let Table { asked, tys, running } = self;
+        asked.clear();
+        tys.clear();
+        *running = [None; MOST_NESTED];
+    }
     /// Keeps `ask` for [`eval_asked`]; one asked twice is kept once.
     pub fn ask(&mut self, ask: QAsk) {
         if !self.asked.as_slice().iter().any(|a| a.need == ask.need) {

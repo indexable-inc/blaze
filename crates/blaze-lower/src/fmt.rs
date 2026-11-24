@@ -94,7 +94,7 @@ struct Written {
     range: Range,
 }
 
-impl Machine<'_, '_, '_> {
+impl Machine<'_, '_, '_, '_> {
     /// Lowers `builtin # format_args(template, args..)`, the form the expander's
     /// `format_args!` gives back once its template is expanded: the same node as
     /// `format_args!(..)`. Its template and arguments are already lowered (`template` the

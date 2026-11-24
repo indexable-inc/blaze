@@ -148,6 +148,17 @@ impl<K: Copy + Eq + Hash, V, A: Allocator + Copy> Rows<K, V, A> {
     pub fn values(&self) -> impl Iterator<Item = &V> + '_ {
         self.iter().map(|(_, v)| v)
     }
+
+    /// Drops all filed rows and resets the table to empty (`&mut self`: no live references),
+    /// retaining the first segment and bounded index capacity for reuse.
+    pub fn clear(&mut self) {
+        self.rows.clear_keep_first();
+        let at = self.at.get_mut();
+        at.clear();
+        if at.capacity() > 256 {
+            at.shrink_to(64);
+        }
+    }
 }
 
 /// `rows[&k]`, as a map's: the caller has checked `k` is filed; a key that is not stops naming it.
@@ -259,6 +270,50 @@ impl<T: Copy, A: Allocator> blaze_typeck::Stable<T> for StableColumn<T, A> {
         // again (a growth copies them into a new buffer and leaves these as they are), and a
         // buffer is freed only when the column drops (`&mut self`), so they outlive `&self`.
         unsafe { core::slice::from_raw_parts(at, self.len.get()) }
+    }
+
+    fn clear(&mut self) {
+        let count = self.count.get();
+        let Some(last_idx) = count.checked_sub(1) else {
+            return;
+        };
+        let bufs = self.bufs.get_mut();
+        if let Some(prefix) = bufs.get(..last_idx) {
+            for &(at, room) in prefix {
+                let (Some(at), Ok(layout)) = (NonNull::new(at), Layout::array::<T>(room)) else { continue };
+                // SAFETY: allocated by `self.alloc` in `extend` with `room` entries of `T`,
+                // freed once here; `&mut self`: no slice of it is left. `T: Copy`.
+                unsafe { self.alloc.deallocate(at.cast::<u8>(), layout) };
+            }
+        }
+        let Some((last_at, last_room)) = bufs.get(last_idx).copied() else {
+            self.count.set(0);
+            self.len.set(0);
+            return;
+        };
+        if last_room <= 2048 {
+            if let Some(first) = bufs.first_mut() {
+                *first = (last_at, last_room);
+            }
+            if let Some(rest) = bufs.get_mut(1..count) {
+                for slot in rest {
+                    *slot = (core::ptr::null_mut(), 0);
+                }
+            }
+            self.count.set(1);
+        } else {
+            if let (Some(at), Ok(layout)) = (NonNull::new(last_at), Layout::array::<T>(last_room)) {
+                // SAFETY: allocated by `self.alloc` in `extend` with `last_room` entries of `T`.
+                unsafe { self.alloc.deallocate(at.cast::<u8>(), layout) };
+            }
+            if let Some(used) = bufs.get_mut(..count) {
+                for slot in used {
+                    *slot = (core::ptr::null_mut(), 0);
+                }
+            }
+            self.count.set(0);
+        }
+        self.len.set(0);
     }
 }
 

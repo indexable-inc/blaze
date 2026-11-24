@@ -79,10 +79,10 @@ use crate::front2::index::Index;
 use crate::front2::receiver::Pointers;
 use crate::front2::types::Why;
 use crate::front2::head_record::{self, Head, HeadAt, HeadRecordError, HeadRef};
-use crate::front2::heads::{HeadError, SeedFailed, Seeded, Store, Want};
+use crate::front2::heads::{HeadError, HeadFrame, SeedFailed, Seeded, Store, Want};
 use crate::front2::keys::{Keys, MemberKind, checker_of, member_key_of};
 use crate::front2::project::head_digest::{digest_of_heads, want_heads};
-use crate::front2::source::NamesSource;
+use crate::front2::source::{MemberWant, NamesSource};
 use crate::front2::tables::owned_reads::ReadOwners;
 
 const MAGIC: [u8; 4] = *b"BZFZ";
@@ -498,22 +498,35 @@ pub enum Plant {
 /// be made in `store`. The bytes are a function of the heads alone: two stores that made the
 /// same item give equal bytes whatever else each made before.
 pub fn export<'n, 'a, N: NamesSource<'n>>(names: N, keys: &Keys, store: &mut Store<'n>, want: Want, plant: Plant, alloc: Alloc<'a>) -> Result<RecordBytes<'a>, FreezeError> {
+    let mut enc_scratch = head_record::EncodeScratch::new_in(alloc);
+    export_with_scratch(names, keys, store, want, plant, alloc, &mut enc_scratch)
+}
+
+fn export_with_scratch<'n, 'a, N: NamesSource<'n>>(
+    names: N,
+    keys: &Keys,
+    store: &mut Store<'n>,
+    want: Want,
+    plant: Plant,
+    alloc: Alloc<'a>,
+    enc_scratch: &mut head_record::EncodeScratch<'a>,
+) -> Result<RecordBytes<'a>, FreezeError> {
     let heads = want_heads(store, want, alloc);
-    // Each head's lifetime part (head_record.rs form 10), made or refused, before it is read.
-    store.make_lives(names, keys, &heads);
+    // Each head's encoded lifetime part (ADTs, traits, impls; form 22 dropped FnLife), made
+    // or refused before it is read.
+    store.make_record_lives(names, keys, &heads);
     let store: &Store<'n> = store;
     let count = u32::try_from(heads.len()).map_err(|_| FreezeError::TooBig { want, what: "the head count" })?;
-    let mut dir = RecordBytes::new_in(alloc);
+    let mut dir = RecordBytes::with_capacity_in(heads.len() * ENTRY, alloc);
     let mut payload = RecordBytes::new_in(alloc);
     for at in heads.iter().copied() {
         let rec = |error| FreezeError::Record { want, at, error };
         let head = head_record::from_store(store, at).map_err(rec)?;
         let origin = |key| crate::front2::project::head_digest::opaque_origin(names, keys, store, key);
-        let bytes = head_record::encode_with_origins(head, store.tys.view(), alloc, &origin).map_err(rec)?;
-        let meaning = head_record::reader_digest_with_origins(head, store.tys.view(), alloc, &origin).map_err(rec)?;
-        // Beside it, the digest a lifetime-only edit moves (form 22, D148): the borrow
-        // verdict's key; type checks read `meaning`.
-        let regions = head_record::regions_digest_with_origins(head, store.tys.view(), alloc, &origin).map_err(rec)?;
+        let offset = u32::try_from(payload.len()).map_err(|_| FreezeError::TooBig { want, what: "the records" })?;
+        // Single-pass encoding: appends the record bytes directly into `payload` and computes
+        // both the erased reader digest (`meaning`) and the regions digest (`regions`, form 22).
+        let (meaning, regions) = head_record::encode_with_digests_into(head, store.tys.view(), &origin, enc_scratch, &mut payload).map_err(rec)?;
         // A refusal's kind and detail are part of what a region reader reads
         // (`UnreadWhy::Refused`): they move the regions digest too (forms 11, 12).
         let recorded = RecordedRegions::of(store, at, head);
@@ -526,8 +539,6 @@ pub fn export<'n, 'a, N: NamesSource<'n>>(names: N, keys: &Keys, store: &mut Sto
             }
             RecordedRegions::None | RecordedRegions::Laid => regions,
         };
-        let offset = u32::try_from(payload.len()).map_err(|_| FreezeError::TooBig { want, what: "the records" })?;
-        payload.extend_from_slice(&bytes);
         if let (Plant::JobLocalId, HeadRef::Fn { head, .. }) = (plant, head) {
             payload.extend_from_slice(&head.output.0.to_le_bytes());
         }
@@ -689,22 +700,181 @@ fn freeze_noting<'n, 'a, N: NamesSource<'n>, H: ConstSource<'n>>(
                 Err(Need::Const(of)) => return Err(FreezeError::Const { want, c, error: ConstRefused::TypeNeedsConst { of } }),
             }
         }
-        let before = store.lowered;
-        let evaluated = source.eval_const(&mut *store, &mut keys, c);
-        by_eval = by_eval.saturating_add(store.lowered.saturating_sub(before));
-        match evaluated {
-            Ok(()) => {}
-            // In a trait's members it is the asking member's gap, as an anonymous constant's
-            // refusal is (`Maps::anon_failed`; types.rs `const_value_bits`): the member is
-            // refused by name with this reason (head_record.rs `FnRefused`), the others stand.
-            Err(error) if matches!(want, Want::Members(_)) => {
-                store.maps.anon_failed.insert(c, std::format!("{error}").into_boxed_str());
-            }
-            Err(error) => return Err(FreezeError::Const { want, c, error }),
-        }
+        eval_const_into(want, c, source, &mut *store, &mut keys, &mut by_eval, scratch)?;
     }
     let c = asked.last().copied().unwrap_or(want.key());
     Err(FreezeError::Const { want, c, error: ConstRefused::TooMany { most: MOST_FREEZE_CONSTS } })
+}
+
+/// One in-progress cell freeze parked on [`SeededHeads::making_frames`] across `Unfrozen` pauses:
+/// keeps the populated `Store`, `Keys`, `HeadFrame` stack (with lowered `FrameLowering`s), and
+/// constant-evaluation progress intact so resuming after a dependency freezes does zero redundant
+/// store creation, re-import, or re-lowering.
+struct MakingFrame<'n, 'a> {
+    want: Want,
+    store: blaze_own::Box<Store<'n>, Alloc<'static>>,
+    keys: Keys,
+    stack: AVec<'static, HeadFrame<'n>>,
+    const_stack: AVec<'static, HeadFrame<'n>>,
+    in_const: Option<LibKey>,
+    pending_seed: Option<Want>,
+    asked: AVec<'a, LibKey>,
+    by_eval: u32,
+    noted: AVec<'a, Want>,
+    const_iters: usize,
+}
+
+impl<'n, 'a> MakingFrame<'n, 'a> {
+    fn new(
+        want: Want,
+        store: blaze_own::Box<Store<'n>, Alloc<'static>>,
+        keys: Keys,
+        scratch: Alloc<'static>,
+        alloc: Alloc<'a>,
+    ) -> MakingFrame<'n, 'a> {
+        let mut stack = AVec::new_in(scratch);
+        stack.push(HeadFrame::new(want));
+        MakingFrame {
+            want,
+            store,
+            keys,
+            stack,
+            const_stack: AVec::new_in(scratch),
+            in_const: None,
+            pending_seed: None,
+            asked: AVec::new_in(alloc),
+            by_eval: 0,
+            noted: AVec::new_in(alloc),
+            const_iters: 0,
+        }
+    }
+}
+
+/// Resumable step of [`freeze_noting`] operating on a parked [`MakingFrame`].
+#[allow(clippy::too_many_arguments)]
+fn freeze_frame_step<'n, 'a, N: NamesSource<'n>, H: ConstSource<'n>>(
+    names: N,
+    frame: &mut MakingFrame<'n, 'a>,
+    source: &mut H,
+    scratch: Alloc<'static>,
+    alloc: Alloc<'a>,
+    enc_scratch: &mut head_record::EncodeScratch<'a>,
+) -> Result<Frozen<'a>, FreezeError> {
+    let want = frame.want;
+    if let Some(pending) = frame.pending_seed.take() {
+        // Seed the exact dependency whose `Unfrozen` paused us before stepping the frame again.
+        match seed(names, Some(want), pending, source, &*frame.store, &frame.keys, scratch) {
+            Ok(Seeded::Filed | Seeded::Lower) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if let Some(c) = frame.in_const {
+        match ensure_in_stack(names, want, source, &mut *frame.store, &mut frame.keys, &mut frame.const_stack, &mut frame.noted, &mut frame.pending_seed, scratch) {
+            Ok(()) => {
+                frame.in_const = None;
+                frame.const_stack.clear();
+            }
+            Err(Need::Fail(e)) => return Err(e),
+            Err(Need::Const(of)) => return Err(FreezeError::Const { want, c, error: ConstRefused::TypeNeedsConst { of } }),
+        }
+        eval_const_into(want, c, source, &mut *frame.store, &mut frame.keys, &mut frame.by_eval, scratch)?;
+    }
+    while frame.const_iters <= MOST_FREEZE_CONSTS {
+        if frame.stack.is_empty() {
+            frame.stack.push(HeadFrame::new(want));
+        }
+        let c = match ensure_in_stack(names, want, source, &mut *frame.store, &mut frame.keys, &mut frame.stack, &mut frame.noted, &mut frame.pending_seed, scratch) {
+            Ok(()) => {
+                let mut frozen = finish_with_scratch(names, &frame.keys, &mut *frame.store, want, &frame.noted[..], alloc, enc_scratch)?;
+                frozen.lowered = frozen.lowered.saturating_sub(frame.by_eval);
+                frozen.eval_lowered = frame.by_eval;
+                return Ok(frozen);
+            }
+            Err(Need::Fail(e)) => return Err(e),
+            Err(Need::Const(c)) => c,
+        };
+        if frame.asked.scan_for(&c).is_some() {
+            return Err(FreezeError::Const { want, c, error: ConstRefused::NotFiled });
+        }
+        if frame.asked.len() == MOST_FREEZE_CONSTS {
+            break;
+        }
+        frame.asked.push(c);
+        frame.const_iters += 1;
+        if names.seeded_text_of(c).is_some() && !frame.store.made(Want::Fn(c)) {
+            frame.keys.item(c).map_err(|clash| FreezeError::Head { want, error: HeadError::Key(clash) })?;
+            frame.in_const = Some(c);
+            frame.const_stack.clear();
+            frame.const_stack.push(HeadFrame::new(Want::Fn(c)));
+            match ensure_in_stack(names, want, source, &mut *frame.store, &mut frame.keys, &mut frame.const_stack, &mut frame.noted, &mut frame.pending_seed, scratch) {
+                Ok(()) => {
+                    frame.in_const = None;
+                    frame.const_stack.clear();
+                }
+                Err(Need::Fail(e)) => return Err(e),
+                Err(Need::Const(of)) => return Err(FreezeError::Const { want, c, error: ConstRefused::TypeNeedsConst { of } }),
+            }
+        }
+        eval_const_into(want, c, source, &mut *frame.store, &mut frame.keys, &mut frame.by_eval, scratch)?;
+    }
+    let c = frame.asked.last().copied().unwrap_or(want.key());
+    Err(FreezeError::Const { want, c, error: ConstRefused::TooMany { most: MOST_FREEZE_CONSTS } })
+}
+
+fn eval_const_into<'n, H: ConstSource<'n>>(
+    want: Want,
+    c: LibKey,
+    source: &mut H,
+    store: &mut Store<'n>,
+    keys: &mut Keys,
+    by_eval: &mut u32,
+    scratch: Alloc<'static>,
+) -> Result<(), FreezeError> {
+    let before = store.lowered;
+    let evaluated = source.eval_const(store, keys, c);
+    *by_eval = by_eval.saturating_add(store.lowered.saturating_sub(before));
+    match evaluated {
+        Ok(()) => Ok(()),
+        Err(error) if matches!(want, Want::Members(_)) => {
+            let mut s = blaze_own::String::new_in(scratch);
+            let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{error}"));
+            store.maps.anon_failed.insert(c, Box::from(s.as_str()));
+            Ok(())
+        }
+        Err(error) => Err(FreezeError::Const { want, c, error }),
+    }
+}
+
+/// Resumable [`ensure_in`]: operates on caller-owned `stack` and records `pending_seed` if a
+/// seed fails with [`FreezeError::Unfrozen`].
+#[allow(clippy::too_many_arguments)]
+fn ensure_in_stack<'n, 'a, N: NamesSource<'n>, H: HeadSource>(
+    names: N,
+    own: Want,
+    source: &mut H,
+    store: &mut Store<'n>,
+    keys: &mut Keys,
+    stack: &mut AVec<'static, HeadFrame<'n>>,
+    needed: &mut AVec<'a, Want>,
+    pending_seed: &mut Option<Want>,
+    scratch: Alloc<'static>,
+) -> Result<(), Need> {
+    let mut failed: Option<FreezeError> = None;
+    let made = store.ensure_seeded_in(names, keys, stack, &mut |w| needed.push(w), &mut |store, keys, need| {
+        seed(names, Some(own), need, source, store, keys, scratch).map_err(|e| {
+            if matches!(e, FreezeError::Unfrozen { .. }) {
+                *pending_seed = Some(need);
+            }
+            failed = Some(e);
+            SeedFailed
+        })
+    });
+    match (made, failed) {
+        (Ok(()), _) => Ok(()),
+        (Err(HeadError::Seed { .. }), Some(e)) => Err(Need::Fail(e)),
+        (Err(HeadError::Item(_, Why::NeedConst(c, _))), _) => Err(Need::Const(c)),
+        (Err(error), _) => Err(Need::Fail(FreezeError::Head { want: own, error })),
+    }
 }
 
 /// A freeze's store, made in this frame and boxed in `scratch` (its own allocator): the
@@ -753,7 +923,20 @@ fn ensure_in<'n, 'a, N: NamesSource<'n>, H: HeadSource>(
 
 /// What [`freeze`] and [`freeze_seeded`] hand back once `want` is made in `store`.
 fn finish<'n, 'a, N: NamesSource<'n>>(names: N, keys: &Keys, store: &mut Store<'n>, want: Want, needed: &[Want], alloc: Alloc<'a>) -> Result<Frozen<'a>, FreezeError> {
-    let bytes = export(names, keys, store, want, Plant::None, alloc)?;
+    let mut enc_scratch = head_record::EncodeScratch::new_in(alloc);
+    finish_with_scratch(names, keys, store, want, needed, alloc, &mut enc_scratch)
+}
+
+fn finish_with_scratch<'n, 'a, N: NamesSource<'n>>(
+    names: N,
+    keys: &Keys,
+    store: &mut Store<'n>,
+    want: Want,
+    needed: &[Want],
+    alloc: Alloc<'a>,
+    enc_scratch: &mut head_record::EncodeScratch<'a>,
+) -> Result<Frozen<'a>, FreezeError> {
+    let bytes = export_with_scratch(names, keys, store, want, Plant::None, alloc, enc_scratch)?;
     let mut reads: AVec<'a, Want> = AVec::new_in(alloc);
     for w in needed.iter().copied() {
         let c = cell_of(names, w)?;
@@ -863,23 +1046,72 @@ struct MemberText<'n> {
     text: &'n str,
 }
 
-/// The members of `cell`'s item (a trait's or an impl's; none for another item).
+/// The members of `cell`'s item (a trait's or an impl's; none for another item), filtered to
+/// only the members and texts needed by [`fn_text`] and [`file_keys`].
 fn members_of<'n, N: NamesSource<'n>>(names: N, cell: Want, alloc: Alloc<'static>) -> AVec<'static, MemberText<'n>> {
     let mut out: AVec<'static, MemberText<'n>> = AVec::new_in(alloc);
-    if !matches!(cell, Want::Members(_) | Want::Impl(_) | Want::MemberFn(_, _)) {
-        return out;
-    }
     let container = checker_of(cell.key());
-    names.each_member(cell.key(), &mut |m| {
-        let kind = match m.kind {
-            ItemKind::Function => MemberKind::Fn,
-            ItemKind::Const => MemberKind::Const,
-            ItemKind::TypeAlias => MemberKind::Type,
-            _ => return,
-        };
-        let Some(name) = m.name else { return };
-        out.push(MemberText { key: member_key_of(container, kind, name), kind, name, text: m.text });
-    });
+    match cell {
+        Want::MemberFn(_, target_fn) => {
+            names.each_member_matching(
+                cell.key(),
+                &mut |kind, name| {
+                    if kind == ItemKind::Function
+                        && let Some(n) = name
+                        && member_key_of(container, MemberKind::Fn, n) == target_fn
+                    {
+                        MemberWant::WithText
+                    } else {
+                        MemberWant::Skip
+                    }
+                },
+                &mut |m| {
+                    let Some(name) = m.name else { return };
+                    out.push(MemberText { key: target_fn, kind: MemberKind::Fn, name, text: m.text });
+                },
+            );
+        }
+        Want::Impl(_) => {
+            names.each_member_matching(
+                cell.key(),
+                &mut |kind, name| match (kind, name) {
+                    (ItemKind::Const, Some(_)) => MemberWant::WithText,
+                    (ItemKind::Function, Some(_)) => MemberWant::NameOnly,
+                    _ => MemberWant::Skip,
+                },
+                &mut |m| {
+                    let kind = match m.kind {
+                        ItemKind::Function => MemberKind::Fn,
+                        ItemKind::Const => MemberKind::Const,
+                        _ => return,
+                    };
+                    let Some(name) = m.name else { return };
+                    out.push(MemberText { key: member_key_of(container, kind, name), kind, name, text: m.text });
+                },
+            );
+        }
+        Want::Members(_) => {
+            names.each_member_matching(
+                cell.key(),
+                &mut |kind, name| match (kind, name) {
+                    (ItemKind::Function | ItemKind::Const, Some(_)) => MemberWant::WithText,
+                    (ItemKind::TypeAlias, Some(_)) => MemberWant::NameOnly,
+                    _ => MemberWant::Skip,
+                },
+                &mut |m| {
+                    let kind = match m.kind {
+                        ItemKind::Function => MemberKind::Fn,
+                        ItemKind::Const => MemberKind::Const,
+                        ItemKind::TypeAlias => MemberKind::Type,
+                        _ => return,
+                    };
+                    let Some(name) = m.name else { return };
+                    out.push(MemberText { key: member_key_of(container, kind, name), kind, name, text: m.text });
+                },
+            );
+        }
+        _ => {}
+    }
     out
 }
 
@@ -1374,9 +1606,14 @@ pub struct SeededHeads<'n, 'a, N> {
     /// The cells being frozen now, innermost last: the driver's explicit stack ([`MOST_MAKING`]
     /// deep at most), each cell frozen after the needs it met unfrozen.
     making: AVec<'a, Want>,
-    /// The needs each cell on `making` noted in its last attempt (at its index there): what it
-    /// read of other heads when it is given up for a need that fails.
-    making_noted: AVec<'a, AVec<'a, Want>>,
+    /// Parked in-progress freeze frames corresponding to `making` (slot `i` holds the parked
+    /// `MakingFrame` for `making[i]`, or `None` before its first step / while actively stepping).
+    making_frames: AVec<'a, Option<MakingFrame<'n, 'a>>>,
+    /// Small LIFO pool of reset, empty `(Box<Store>, Keys)` pairs reused across freezes in this
+    /// source (bounded to 16 so deep dependency chains stay warm without hoarding memory).
+    free_stores: AVec<'a, (blaze_own::Box<Store<'n>, Alloc<'static>>, Keys)>,
+    /// Reusable head-record encoding buffers shared across all `export` calls in this source.
+    enc_scratch: head_record::EncodeScratch<'a>,
     /// Each cell whose freeze failed, in the order they failed: why (its own reason, its direct
     /// need, a refusal), and the cells of the heads its last attempt read (sorted by their bytes,
     /// each once, its own left out). Asked again it is refused by that, never frozen twice.
@@ -1558,7 +1795,9 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
             reads: AVec::new_in(o.alloc),
             values: AVec::new_in(o.alloc),
             making: AVec::new_in(o.alloc),
-            making_noted: AVec::new_in(o.alloc),
+            making_frames: AVec::new_in(o.alloc),
+            free_stores: AVec::new_in(o.alloc),
+            enc_scratch: head_record::EncodeScratch::new_in(o.alloc),
             failed: AVec::new_in(o.alloc),
             own: AVec::new_in(o.alloc),
             plant: FailPlant::Rule,
@@ -1696,46 +1935,91 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
             return Err(FreezeError::Unfrozen { need: want });
         }
         self.making.push(want);
-        self.making_noted.push(AVec::new_in(self.alloc));
+        self.making_frames.push(None);
         let driven = self.drive(want);
         self.making.clear();
-        self.making_noted.clear();
+        self.recycle_making_frames();
         driven?;
         // The driver returns once `want`, the stack's bottom, is kept.
         self.at.get(&key).copied().ok_or(FreezeError::Unfrozen { need: want })
     }
 
+    /// Acquires a clean `(Box<Store>, Keys)` from `self.free_stores` or allocates a new one.
+    /// Entries returned to `self.free_stores` by [`Self::recycle_store`] are already reset.
+    fn take_store(&mut self) -> (blaze_own::Box<Store<'n>, Alloc<'static>>, Keys) {
+        if let Some(reused) = self.free_stores.pop() {
+            reused
+        } else {
+            (store_boxed(self.sized, self.pointers, self.frame, self.scratch), Keys::new())
+        }
+    }
+
+    /// Resets and returns a `(Box<Store>, Keys)` pair to `self.free_stores` (up to 16 cached).
+    fn recycle_store(&mut self, mut store: blaze_own::Box<Store<'n>, Alloc<'static>>, mut keys: Keys) {
+        const MAX_POOLED_STORES: usize = 16;
+        if self.free_stores.len() < MAX_POOLED_STORES {
+            store.reset(self.sized, self.pointers);
+            keys.clear();
+            self.free_stores.push((store, keys));
+        }
+    }
+
+    /// Drains any remaining frames in `self.making_frames`, recycling their stores.
+    fn recycle_making_frames(&mut self) {
+        while let Some(slot) = self.making_frames.pop() {
+            if let Some(frame) = slot {
+                self.recycle_store(frame.store, frame.keys);
+            }
+        }
+    }
+
     /// Freeze the cells on `making`, innermost first, until it is empty: a freeze that meets a
-    /// need not yet frozen pushes it and is begun again once it is kept. Rule 18: each attempt
-    /// keeps a cell or pushes one, the stack at most [`MOST_MAKING`] deep, the attempts at most
-    /// [`MOST_ATTEMPTS`]. A failure fails every cell on the stack (each needs the one above it),
-    /// each kept with ITS OWN failure ([`Unmade`]): the top its own reason, each below it the
-    /// cell above it, its direct need. The asker is answered its own cell's kept failure, as every
-    /// later ask is (lane HF1).
+    /// need not yet frozen parks its [`MakingFrame`] (preserving its `Store`, `Keys`, lowered
+    /// frames, and noted needs), pushes the need, and resumes in place once the need is kept.
+    /// Rule 18: each attempt keeps a cell or pushes one, the stack at most [`MOST_MAKING`] deep,
+    /// the attempts at most [`MOST_ATTEMPTS`]. A failure fails every cell on the stack (each needs
+    /// the one above it), each kept with ITS OWN failure ([`Unmade`]): the top its own reason,
+    /// each below it the cell above it, its direct need. The asker is answered its own cell's
+    /// kept failure, as every later ask is (lane HF1).
     fn drive(&mut self, want: Want) -> Result<(), FreezeError> {
-        let (names, sized, pointers, frame, scratch, alloc, owners) = (self.names, self.sized, self.pointers, self.frame, self.scratch, self.alloc, self.owners);
+        let (names, scratch, alloc, owners) = (self.names, self.scratch, self.alloc, self.owners);
         for _ in 0..MOST_ATTEMPTS {
             let Some(&top) = self.making.last() else { return Ok(()) };
             self.attempts += 1;
-            let reentered = self.reentered;
             // This attempt's reads are `top`'s (front2 tables/owned_reads.rs): its lookups, the
             // ones that find and seed its needs, and its constants' evaluation.
             if let Some(owners) = owners {
                 owners.enter(top);
             }
-            let mut noted: AVec<'a, Want> = AVec::new_in(alloc);
-            let attempt = freeze_noting(names, sized, pointers, top, self, frame, scratch, alloc, &mut noted);
+            let existing = self.making_frames.last_mut().and_then(Option::take);
+            let mut enc_scratch = core::mem::replace(&mut self.enc_scratch, head_record::EncodeScratch::new_in(alloc));
+            let (mut active, attempt) = match existing {
+                Some(mut frame) => {
+                    let res = freeze_frame_step(names, &mut frame, self, scratch, alloc, &mut enc_scratch);
+                    (Some(frame), res)
+                }
+                None => match cell_of(names, top) {
+                    Ok(cell) if cell != top => (None, Err(FreezeError::NotACell { want: top, cell })),
+                    Ok(_) => {
+                        let (store, keys) = self.take_store();
+                        let mut frame = MakingFrame::new(top, store, keys, scratch, alloc);
+                        let res = freeze_frame_step(names, &mut frame, self, scratch, alloc, &mut enc_scratch);
+                        (Some(frame), res)
+                    }
+                    Err(e) => (None, Err(e)),
+                },
+            };
+            self.enc_scratch = enc_scratch;
             if let Some(owners) = owners {
                 owners.leave();
-            }
-            // What this attempt met of other heads: `top`'s, should it be given up for good.
-            if let Some(last) = self.making_noted.last_mut() {
-                *last = noted;
             }
             match attempt {
                 Ok(f) => {
                     self.making.pop();
-                    self.making_noted.pop();
+                    self.making_frames.pop();
+                    if let Some(frame) = active.take() {
+                        self.recycle_store(frame.store, frame.keys);
+                    }
                     self.lowered += f.lowered;
                     self.eval_lowered += f.eval_lowered;
                     self.lowered_each.push(f.lowered);
@@ -1746,19 +2030,33 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
                     self.from_known.push(false);
                 }
                 Err(FreezeError::Unfrozen { need }) => {
-                    // The attempt given up counts its re-entries when it is made again.
-                    self.reentered = reentered;
+                    if let (Some(frame), Some(slot)) = (active.take(), self.making_frames.last_mut()) {
+                        *slot = Some(frame);
+                    }
                     if self.making.len() == MOST_MAKING {
                         let m = &self.making[..];
                         let innermost = [m[m.len() - 4], m[m.len() - 3], m[m.len() - 2], m[m.len() - 1]];
                         return Err(FreezeError::TooDeep { depth: m.len(), outermost: m[0], innermost });
                     }
                     self.making.push(need);
-                    self.making_noted.push(AVec::new_in(alloc));
+                    self.making_frames.push(None);
                 }
                 Err(e) => {
+                    if let (Some(frame), Some(slot)) = (active.take(), self.making_frames.last_mut()) {
+                        *slot = Some(frame);
+                    }
                     let making = core::mem::replace(&mut self.making, AVec::new_in(alloc));
-                    let noted = core::mem::replace(&mut self.making_noted, AVec::new_in(alloc));
+                    let frames = core::mem::replace(&mut self.making_frames, AVec::new_in(alloc));
+                    let mut noted: AVec<'a, AVec<'a, Want>> = AVec::with_capacity_in(frames.len(), alloc);
+                    for slot in frames {
+                        match slot {
+                            Some(frame) => {
+                                noted.push(frame.noted);
+                                self.recycle_store(frame.store, frame.keys);
+                            }
+                            None => noted.push(AVec::new_in(alloc)),
+                        }
+                    }
                     return Err(self.fail(top, e, &making, &noted));
                 }
             }
