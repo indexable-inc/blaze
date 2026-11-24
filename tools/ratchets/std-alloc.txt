@@ -84,7 +84,7 @@ blaze-own	65	0	25	38
 blaze-pack	0	0	10	86
 blaze-parquet	0	0	2	0
 blaze-pg	0	0	7	39
-blaze-proc-macro	513	1	0	1013
+blaze-proc-macro	513	1	0	990
 blaze-profile	349	1	17	1546
 blaze-protocol	27	1	1	157
 blaze-queue	1	0	5	0

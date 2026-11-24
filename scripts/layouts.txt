@@ -190,7 +190,7 @@ crates/blaze-pins/src/lib.rs	CLANG_VERSION	none
 crates/blaze-pins/src/lib.rs	LLVM_VERSION	none
 crates/blaze-pins/src/lib.rs	RUSTC_VERSION	none
 crates/blaze-proc-macro/src/comptime_patch.rs	COMPTIME_PATCH_VERSION	none
-crates/blaze-proc-macro/src/record.rs	HOST_VERSION	none
+crates/blaze-proc-macro/src/record.rs	HOST_VERSION	test an_answer_of_a_previous_host_version_is_not_read
 crates/blaze-proc-macro/src/table.rs	MAGIC	none
 crates/blaze-profile/src/crash.rs	LAYOUT	none
 crates/blaze-profile/src/crash.rs	LAYOUT_AT	none

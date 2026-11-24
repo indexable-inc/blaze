@@ -3370,7 +3370,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         let place = match self.parent_kind() {
             Some(MACRO_PAT) => MacroPlace::Pat,
             Some(MACRO_TYPE) => MacroPlace::Type,
-            Some(STMT_LIST) => MacroPlace::Stmt,
+            Some(STMT_LIST | MACRO_STMTS) => MacroPlace::Stmt,
             Some(MACRO_EXPR) => MacroPlace::Expr,
             _ => MacroPlace::Item,
         };
@@ -3406,16 +3406,17 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         // a statement, the MacroInvocationSemi form is used where a semicolon is required at
         // the end when not using curly braces", so a braced call needs no `;` to be one; its
         // expansion is statements whose last expression, with nothing after it, is the block's
-        // tail (`stmt_list`). A tail call in parentheses or brackets stays an expression.
+        // tail (`stmt_list`). A tail call in parentheses or brackets stays an expression in a
+        // block, while ANY direct call inside `MACRO_STMTS` (already inside a statement-position
+        // macro expansion, e.g. `cmov`'s `cseleq64!();` expanding to unbraced `cseleq!(...)` with
+        // no trailing `;`) remains in statement position.
+        let grand = (self.frames.len() >= 2).then(|| self.frames[self.frames.len() - 2].kind);
         let braced_tail = place == MacroPlace::Expr
-            && self.frames.len() >= 2
-            && matches!(self.frames[self.frames.len() - 2].kind, STMT_LIST | MACRO_STMTS)
+            && grand == Some(STMT_LIST)
             && input.of(self.text()).starts_with('{');
         let in_stmt = place == MacroPlace::Stmt
             || braced_tail
-            || place == MacroPlace::Expr
-                && self.frames.len() >= 2
-                && self.frames[self.frames.len() - 2].kind == EXPR_STMT;
+            || place == MacroPlace::Expr && matches!(grand, Some(EXPR_STMT | MACRO_STMTS));
         let fragment = match place {
             MacroPlace::Pat => blaze_expand::Fragment::Pat,
             MacroPlace::Type => blaze_expand::Fragment::Type,
