@@ -48,6 +48,8 @@ const CALLER_SAVED_XMM: &[XReg] = &[8, 9, 10, 11, 12, 13, 0, 1, 2, 3, 4, 5, 6, 7
 
 const XMM14: XReg = 14;
 const XMM15: XReg = 15;
+/// Maximum byte length for x86-64 `Sota`'s inline overlap-safe `Op::Memmove`.
+const SOTA_X64_MEMMOVE_INLINE_MOST: u64 = 32;
 
 #[inline]
 fn to_idx<T>(n: T) -> usize
@@ -452,6 +454,7 @@ fn check_x64_subset(view: &View<'_>, has_fma: bool, has_avx2: bool, has_avx512: 
                 | Op::PtrWithAddr
                 | Op::Load
                 | Op::Store
+                | Op::Memmove
                 | Op::AtomicLoad
                 | Op::AtomicStore
                 | Op::AtomicRmw
@@ -464,6 +467,7 @@ fn check_x64_subset(view: &View<'_>, has_fma: bool, has_avx2: bool, has_avx512: 
                 | Op::Trap
                 | Op::Unreachable
                 | Op::Splat
+                | Op::Extract
                 | Op::ReduceAdd
                 | Op::ReduceAnd
                 | Op::ReduceOr
@@ -570,6 +574,32 @@ fn check_x64_subset(view: &View<'_>, has_fma: bool, has_avx2: bool, has_avx512: 
             };
             if (op == Op::ReduceFadd) != vfp || (op == Op::ReduceUmax && vsize != 0) || (vw == VecW::W512 && (vfp || vsize < 2)) {
                 return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "mismatched SSE2 reduce kind" });
+            }
+        }
+        if op == Op::Extract {
+            let at = to_idx(at_u32(view.data, inst));
+            let vec_v = to_idx(at_u32(view.extra, at));
+            let lane = at_u32(view.extra, at + 1);
+            let Some((vsize, vfp, vw)) = is_x64_vec_ty(ty_at(view.tys, vec_v), has_avx2, has_avx512) else {
+                return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "non-vector x86-64 extract" });
+            };
+            let total_bytes: u32 = match vw {
+                VecW::W128 => 16,
+                VecW::W256 => 32,
+                VecW::W512 => 64,
+            };
+            let max_lane = total_bytes >> vsize;
+            if lane >= max_lane || (is_fp_ty(ty).is_some() != vfp) || (vw == VecW::W512 && !has_avx2) {
+                return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unsupported x86-64 extract lane/type" });
+            }
+        }
+        if op == Op::Memmove {
+            let at = to_idx(at_u32(view.data, inst));
+            let len_v = to_idx(at_u32(view.extra, at + 2));
+            if flags.contains(Flags::VOLATILE)
+                || !extract_const_u64(view, len_v).is_some_and(|n| n <= SOTA_X64_MEMMOVE_INLINE_MOST)
+            {
+                return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "non-inline x86-64 memmove" });
             }
         }
         if matches!(op, Op::AtomicRmw) {
@@ -1136,6 +1166,13 @@ pub(crate) fn emit_sota_x64<'a>(
                         let ab = ty_at(view.tys, a).bits(64);
                         if (ab == 64 || ab == 32) && at_opt(&const_u64, bv).is_some_and(fits_i32) {
                             inc_u32(&mut imm_uses, bv);
+                        }
+                    }
+                    Op::Memmove => {
+                        let at = to_idx(at_u32(view.data, inst));
+                        let len_v = to_idx(at_u32(view.extra, at + 2));
+                        if at_opt(&const_u64, len_v).is_some_and(|n| n <= SOTA_X64_MEMMOVE_INLINE_MOST) {
+                            inc_u32(&mut imm_uses, len_v);
                         }
                     }
                     _ => {}
@@ -1757,6 +1794,7 @@ pub(crate) fn emit_sota_x64<'a>(
                         | Op::TargetIntrinsic
                         | Op::Load
                         | Op::Store
+                        | Op::Memmove
                         | Op::AtomicLoad
                         | Op::AtomicStore
                         | Op::AtomicRmw
@@ -2347,6 +2385,128 @@ pub(crate) fn emit_sota_x64<'a>(
                     continue;
                 }
             }
+            if op == Op::Extract {
+                let at = to_idx(at_u32(view.data, inst));
+                let vec_v = at_u32(view.extra, at);
+                let lane = at_u32(view.extra, at + 1);
+                let (vsize, vfp, vw) = is_x64_vec_ty(ty_at(view.tys, to_idx(vec_v)), has_avx2, has_avx512).ok_or(
+                    TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "non-vector x86-64 extract" },
+                )?;
+                let lanes_per_128 = 16u32 >> vsize;
+                let chunk128 = lane / lanes_per_128;
+                let lane128 = lane % lanes_per_128;
+                // Load source vector using `XMM15` so `dst_xmm`'s `XMM14` spill scratch never collides.
+                let vs = load_vec(&mut code, vec_v, XMM15)?;
+                let src128 = match vw {
+                    VecW::W128 => vs,
+                    VecW::W256 => {
+                        if chunk128 == 0 {
+                            vs
+                        } else {
+                            x64::avx2_vextracti128(&mut code, XMM15, vs, 1);
+                            XMM15
+                        }
+                    }
+                    VecW::W512 => {
+                        let chunk256 = chunk128 / 2;
+                        let sub128 = chunk128 % 2;
+                        if chunk256 == 1 {
+                            x64::avx512_vextracti64x4(&mut code, XMM15, vs, 1);
+                            if sub128 == 1 {
+                                x64::avx2_vextracti128(&mut code, XMM15, XMM15, 1);
+                            }
+                            XMM15
+                        } else if sub128 == 1 {
+                            x64::avx2_vextracti128(&mut code, XMM15, vs, 1);
+                            XMM15
+                        } else {
+                            vs
+                        }
+                    }
+                };
+                if vfp {
+                    let double = vsize == 3;
+                    let (vd, sp) = dst_xmm(inst)?;
+                    if double {
+                        if lane128 == 0 {
+                            if vd != src128 {
+                                x64::movdqa_rr(&mut code, vd, src128);
+                            }
+                        } else {
+                            // `0xEE`: duplicate upper 64 bits (dwords 2,3) into lower 64 bits.
+                            x64::pshufd(&mut code, vd, src128, 0xee);
+                        }
+                    } else if lane128 == 0 {
+                        if vd != src128 {
+                            x64::movdqa_rr(&mut code, vd, src128);
+                        }
+                    } else {
+                        x64::pshufd(&mut code, vd, src128, u8_of(lane128));
+                    }
+                    if let Some(s) = sp {
+                        x64::store_fp_disp(&mut code, double, vd, RSP, spill_off(spill_base, s));
+                    }
+                } else {
+                    let (rd, sp) = dst_gpr(inst)?;
+                    match vsize {
+                        3 => {
+                            let xmm_src = if lane128 == 0 {
+                                src128
+                            } else {
+                                x64::pshufd(&mut code, XMM14, src128, 0xee);
+                                XMM14
+                            };
+                            x64::mov_xmm_to_gpr(&mut code, true, rd, xmm_src);
+                        }
+                        2 => {
+                            let xmm_src = if lane128 == 0 {
+                                src128
+                            } else {
+                                x64::pshufd(&mut code, XMM14, src128, u8_of(lane128));
+                                XMM14
+                            };
+                            x64::mov_xmm_to_gpr(&mut code, false, rd, xmm_src);
+                        }
+                        1 => {
+                            let dword = lane128 / 2;
+                            let xmm_src = if dword == 0 {
+                                src128
+                            } else {
+                                x64::pshufd(&mut code, XMM14, src128, u8_of(dword));
+                                XMM14
+                            };
+                            x64::mov_xmm_to_gpr(&mut code, false, rd, xmm_src);
+                            if lane128 % 2 == 1 {
+                                x64::shift_ri(&mut code, false, 5, rd, 16);
+                            } else {
+                                x64::movzx_w(&mut code, rd, rd);
+                            }
+                        }
+                        _ => {
+                            let dword = lane128 / 4;
+                            let byte_in_dword = lane128 % 4;
+                            let xmm_src = if dword == 0 {
+                                src128
+                            } else {
+                                x64::pshufd(&mut code, XMM14, src128, u8_of(dword));
+                                XMM14
+                            };
+                            x64::mov_xmm_to_gpr(&mut code, false, rd, xmm_src);
+                            if byte_in_dword > 0 {
+                                x64::shift_ri(&mut code, false, 5, rd, u8_of(byte_in_dword * 8));
+                            }
+                            if byte_in_dword < 3 {
+                                x64::movzx_b(&mut code, rd, rd);
+                            }
+                        }
+                    }
+                    if let Some(s) = sp {
+                        x64::store_disp(&mut code, 8, rd, RSP, spill_off(spill_base, s));
+                    }
+                }
+                inst += 1;
+                continue;
+            }
             if matches!(op, Op::ReduceAdd | Op::ReduceAnd | Op::ReduceOr | Op::ReduceXor | Op::ReduceUmax | Op::ReduceFadd) {
                 if op == Op::ReduceFadd {
                     let at = to_idx(at_u32(view.data, inst));
@@ -2650,6 +2810,107 @@ pub(crate) fn emit_sota_x64<'a>(
                                 x64::store_disp(&mut code, bytes, rv, rb, off);
                             }
                         }
+                    }
+                }
+                Op::Memmove => {
+                    // Overlap-safe inline `memmove` for constant `len <= 32 B`: load ALL source bytes
+                    // first (into `XMM14`/`XMM15` or `R11`), then store ALL bytes to `dst` second!
+                    let at = to_idx(at_u32(view.data, inst));
+                    let dst_v = at_u32(view.extra, at);
+                    let src_v = at_u32(view.extra, at + 1);
+                    let len_v = at_u32(view.extra, at + 2);
+                    let orig_len = to_idx(
+                        at_opt(&const_u64, to_idx(len_v))
+                            .filter(|&n| n <= SOTA_X64_MEMMOVE_INLINE_MOST)
+                            .ok_or(TierError::Refused {
+                                tier: TIER,
+                                inst: Some(u32_of(inst)),
+                                what: "non-inline x86-64 memmove",
+                            })?,
+                    );
+                    match orig_len {
+                        0 => {}
+                        1 | 2 => {
+                            let bytes = u8_of(orig_len);
+                            let rsrc = load_gpr(&mut code, src_v, R11)?;
+                            x64::load_disp(&mut code, bytes, R11, rsrc, 0);
+                            let rdst = load_gpr(&mut code, dst_v, R10)?;
+                            x64::store_disp(&mut code, bytes, R11, rdst, 0);
+                        }
+                        3 => {
+                            let rsrc = load_gpr(&mut code, src_v, R11)?;
+                            x64::load_disp(&mut code, 2, R10, rsrc, 0);
+                            x64::load_disp(&mut code, 1, R11, rsrc, 2);
+                            x64::mov_gpr_to_xmm(&mut code, false, XMM14, R10);
+                            x64::mov_gpr_to_xmm(&mut code, false, XMM15, R11);
+                            let rdst = load_gpr(&mut code, dst_v, R10)?;
+                            x64::mov_xmm_to_gpr(&mut code, false, R11, XMM14);
+                            x64::store_disp(&mut code, 2, R11, rdst, 0);
+                            x64::mov_xmm_to_gpr(&mut code, false, R11, XMM15);
+                            x64::store_disp(&mut code, 1, R11, rdst, 2);
+                        }
+                        4 => {
+                            let rdst = load_gpr(&mut code, dst_v, R10)?;
+                            let rsrc = load_gpr(&mut code, src_v, R11)?;
+                            x64::load_fp_disp(&mut code, false, XMM14, rsrc, 0);
+                            x64::store_fp_disp(&mut code, false, XMM14, rdst, 0);
+                        }
+                        5..=7 => {
+                            let tail = i32_of(orig_len - 4);
+                            let rdst = load_gpr(&mut code, dst_v, R10)?;
+                            let rsrc = load_gpr(&mut code, src_v, R11)?;
+                            x64::load_fp_disp(&mut code, false, XMM14, rsrc, 0);
+                            x64::load_fp_disp(&mut code, false, XMM15, rsrc, tail);
+                            x64::store_fp_disp(&mut code, false, XMM14, rdst, 0);
+                            x64::store_fp_disp(&mut code, false, XMM15, rdst, tail);
+                        }
+                        8 => {
+                            let rdst = load_gpr(&mut code, dst_v, R10)?;
+                            let rsrc = load_gpr(&mut code, src_v, R11)?;
+                            x64::load_fp_disp(&mut code, true, XMM14, rsrc, 0);
+                            x64::store_fp_disp(&mut code, true, XMM14, rdst, 0);
+                        }
+                        9..=15 => {
+                            let tail = i32_of(orig_len - 8);
+                            let rdst = load_gpr(&mut code, dst_v, R10)?;
+                            let rsrc = load_gpr(&mut code, src_v, R11)?;
+                            x64::load_fp_disp(&mut code, true, XMM14, rsrc, 0);
+                            x64::load_fp_disp(&mut code, true, XMM15, rsrc, tail);
+                            x64::store_fp_disp(&mut code, true, XMM14, rdst, 0);
+                            x64::store_fp_disp(&mut code, true, XMM15, rdst, tail);
+                        }
+                        16 => {
+                            let rdst = load_gpr(&mut code, dst_v, R10)?;
+                            let rsrc = load_gpr(&mut code, src_v, R11)?;
+                            x64::movdqu_load(&mut code, XMM14, rsrc, 0);
+                            x64::movdqu_store(&mut code, XMM14, rdst, 0);
+                        }
+                        17..=23 | 25..=31 => {
+                            let tail = i32_of(orig_len - 16);
+                            let rdst = load_gpr(&mut code, dst_v, R10)?;
+                            let rsrc = load_gpr(&mut code, src_v, R11)?;
+                            x64::movdqu_load(&mut code, XMM14, rsrc, 0);
+                            x64::movdqu_load(&mut code, XMM15, rsrc, tail);
+                            x64::movdqu_store(&mut code, XMM14, rdst, 0);
+                            x64::movdqu_store(&mut code, XMM15, rdst, tail);
+                        }
+                        24 => {
+                            let rdst = load_gpr(&mut code, dst_v, R10)?;
+                            let rsrc = load_gpr(&mut code, src_v, R11)?;
+                            x64::movdqu_load(&mut code, XMM14, rsrc, 0);
+                            x64::load_fp_disp(&mut code, true, XMM15, rsrc, 16);
+                            x64::movdqu_store(&mut code, XMM14, rdst, 0);
+                            x64::store_fp_disp(&mut code, true, XMM15, rdst, 16);
+                        }
+                        32 => {
+                            let rdst = load_gpr(&mut code, dst_v, R10)?;
+                            let rsrc = load_gpr(&mut code, src_v, R11)?;
+                            x64::movdqu_load(&mut code, XMM14, rsrc, 0);
+                            x64::movdqu_load(&mut code, XMM15, rsrc, 16);
+                            x64::movdqu_store(&mut code, XMM14, rdst, 0);
+                            x64::movdqu_store(&mut code, XMM15, rdst, 16);
+                        }
+                        _ => {}
                     }
                 }
                 Op::AtomicLoad => {
@@ -4113,5 +4374,132 @@ mod tests {
                 "expected vzeroupper in epilogue for {name}"
             );
         }
+    }
+
+    #[test]
+    fn emits_sse2_extract_for_float_and_int_vectors() {
+        let alloc = test_alloc();
+
+        // Baseline SSE2 (`features = 0`): `<4 x f32>`, `<2 x f64>`, `<4 x i32>`, `<2 x i64>`,
+        // `<8 x i16>`, and `<16 x i8>` must all compile cleanly without SSE4.1 or AVX2!
+        let cases: &[(Scalar, u32, Ty, &[u32], bool)] = &[
+            (Scalar::F32, 4, Ty::F32, &[0, 1, 2, 3], true),
+            (Scalar::F64, 2, Ty::F64, &[0, 1], true),
+            (Scalar::I32, 4, Ty::I32, &[0, 1, 2, 3], false),
+            (Scalar::I64, 2, Ty::I64, &[0, 1], false),
+            (Scalar::I16, 8, Ty::I16, &[0, 1, 5, 7], false),
+            (Scalar::I8, 16, Ty::I8, &[0, 1, 3, 7, 15], false),
+        ];
+
+        for &(scalar, lanes, ret_ty, test_lanes, is_fp) in cases {
+            let vty = Ty::vector(scalar, lanes).expect("vector ty");
+            for &lane in test_lanes {
+                let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+                let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[Param::of(ret_ty)]);
+                b.set_signature(sig);
+                let entry = b.create_block(BlockKind::Normal);
+                b.begin(entry);
+                let p = b.param(Ty::PTR);
+                let v = b.load(vty, Flags::NONE, p, 0, MemAttrs::aligned(0));
+                let elem = b.extract(v, lane);
+                b.ret(&[elem]);
+                let func = b.finish_checked().expect("extract LIR builds");
+
+                let emitted = emit_sota_x64(func.view(), &NoNames, CallMode::DirectBl, 0, alloc)
+                    .expect("baseline SSE2 Op::Extract must emit cleanly");
+                assert!(emitted.relocs.is_empty(), "extract must emit zero relocs");
+                assert_eq!(emitted.code.last().copied(), Some(0xc3), "extract fn must end in ret");
+                if !is_fp {
+                    assert!(
+                        emitted.code.windows(2).any(|w| w == [0x0f, 0x7e]),
+                        "int extract ({scalar:?}x{lanes} lane={lane}) expected movd/movq (0F 7E), got {:02x?}",
+                        emitted.code.as_slice()
+                    );
+                }
+                let needs_pshufd = match (scalar, lane) {
+                    (Scalar::F32 | Scalar::I32, l) => l > 0,
+                    (Scalar::F64 | Scalar::I64, l) => l > 0,
+                    (Scalar::I16, l) => l / 2 > 0,
+                    (Scalar::I8, l) => l / 4 > 0,
+                    _ => false,
+                };
+                if needs_pshufd {
+                    assert!(
+                        emitted.code.windows(2).any(|w| w == [0x0f, 0x70]),
+                        "extract ({scalar:?}x{lanes} lane={lane}) expected pshufd (0F 70), got {:02x?}",
+                        emitted.code.as_slice()
+                    );
+                }
+            }
+        }
+
+        // AVX2 256-bit upper-half extract (`<8 x f32>` lane 5, `<4 x f64>` lane 3) uses `vextracti128` + `pshufd`.
+        for (scalar, lanes, ret_ty, lane) in [
+            (Scalar::F32, 8u32, Ty::F32, 5u32),
+            (Scalar::F64, 4, Ty::F64, 3),
+        ] {
+            let vty = Ty::vector(scalar, lanes).expect("avx2 vec ty");
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[Param::of(ret_ty)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let p = b.param(Ty::PTR);
+            let v = b.load(vty, Flags::NONE, p, 0, MemAttrs::aligned(0));
+            let elem = b.extract(v, lane);
+            b.ret(&[elem]);
+            let func = b.finish_checked().expect("avx2 extract LIR builds");
+
+            let emitted = emit_sota_x64(func.view(), &NoNames, CallMode::DirectBl, Machine::AVX2, alloc)
+                .expect("AVX2 256-bit Op::Extract must emit cleanly");
+            assert!(
+                has_vex3(&emitted.code, 3, false, true, 0x39),
+                "expected vextracti128 for upper-half AVX2 extract ({scalar:?}x{lanes} lane={lane})"
+            );
+            assert!(
+                emitted.code.windows(3).any(|w| w == [0xc5, 0xf8, 0x77]),
+                "expected vzeroupper in epilogue for AVX2 extract"
+            );
+        }
+    }
+
+    #[test]
+    fn emits_inline_small_const_memmove_on_x86_64() {
+        let alloc = test_alloc();
+        for &n in &[0usize, 1, 2, 3, 4, 7, 8, 13, 16, 24, 31, 32] {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let len_c = b.iconst(Ty::I64, n as u128);
+            b.bulk(Op::Memmove, Flags::NONE, dst, src, len_c, MemAttrs::aligned(0));
+            b.ret(&[]);
+            let func = b.finish_checked().expect("x64 small memmove LIR builds");
+
+            let emitted = emit_sota_x64(func.view(), &NoNames, CallMode::DirectBl, 0, alloc)
+                .expect("x64 small const memmove must emit cleanly");
+            assert!(emitted.relocs.is_empty(), "n={n}: inline x64 memmove must have zero relocs");
+            assert_eq!(emitted.code.last().copied(), Some(0xc3), "n={n}: inline x64 memmove must end in ret");
+        }
+
+        // Non-inline size (`64 > 32`) refuses cleanly.
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let dst = b.param(Ty::PTR);
+        let src = b.param(Ty::PTR);
+        let len_c = b.iconst(Ty::I64, 64);
+        b.bulk(Op::Memmove, Flags::NONE, dst, src, len_c, MemAttrs::aligned(0));
+        b.ret(&[]);
+        let func = b.finish_checked().expect("x64 large memmove LIR builds");
+        assert!(
+            emit_sota_x64(func.view(), &NoNames, CallMode::DirectBl, 0, alloc).is_err(),
+            "x64 memmove > 32B must refuse cleanly"
+        );
     }
 }

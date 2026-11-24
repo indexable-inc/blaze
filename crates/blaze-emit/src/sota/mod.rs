@@ -52,7 +52,7 @@ use blaze_lir::{
     ifconv::if_convert,
     loopnest::{fuse_adjacent_loops, interchange_and_tile_loops},
     mach_egraph::{MachEGraphOpts, optimize_mach_egraph},
-    memopt::optimize_memory,
+    memopt::{optimize_memory, scalarize_small_memops},
     modulo_sched::{ModuloSchedOpts, swing_modulo_schedule},
     prefetch::insert_software_prefetch,
     sched::schedule_dag,
@@ -235,14 +235,17 @@ fn run_sota_loop_and_late_passes<'a>(
         Arch::X86_64 => blaze_lir::superopt::AArch64MicroArch::X86_64Zen5,
     };
 
-    // Stage 1a: Post-fixpoint SROA + copy/const propagation + phi-discriminant jump threading +
-    // DCE + CFG coalescing so `Option`/iterator `Switch`/`Br` discriminants exposed by
-    // `sota_optimize_fixpoint` collapse into canonical counted/pointer-IV loops before BCE
-    // hoisting, GEMM, SIMD idioms, vectorization, and AMAC inspect the CFG.
-    let pre_loop_clean = run_sroa_thread_cleanup(input, alloc);
+    // Stage 1a: Small-constant `Memcpy`/`Memmove` scalarization (`1, 2, 4, 8` bytes ->
+    // `Load` + `Store`) + post-fixpoint SROA + copy/const propagation + phi-discriminant jump
+    // threading + DCE + CFG coalescing so swap temporaries and `Option`/iterator `Switch`/`Br`
+    // discriminants exposed by `sota_optimize_fixpoint` collapse into canonical SSA loops before
+    // BCE hoisting, GEMM, SIMD idioms, vectorization, and AMAC inspect the CFG.
+    let scalarized_mem = scalarize_small_memops(input, alloc).ok().flatten();
+    let sroa_in = scalarized_mem.as_ref().map_or(input, |f| f.view());
+    let pre_loop_clean = run_sroa_thread_cleanup(sroa_in, alloc);
     let loop_in = match &pre_loop_clean {
         Some(f) => f.view(),
-        None => input,
+        None => sroa_in,
     };
 
     // Stage 1b-0: Dominating BCE + Safe-Rust Loop-Versioning Bounds-Check Hoisting + Triple-Nested
@@ -582,13 +585,16 @@ pub(crate) fn optimize_sota_midend<'a>(
         Arch::X86_64 => RegBudget { hardware_fma: (machine.features & Machine::FMA) != 0, ..RegBudget::X86_64 },
     };
 
-    // Stage 0: SROA + copy/const propagation + phi-discriminant jump threading + DCE + CFG
-    // coalescing promotes non-escaping local stack slots into SSA registers and collapses
-    // `Option`/iterator discriminants before Aegraph + LICM + Strength Reduction.
-    let pre_clean = run_sroa_thread_cleanup(input, alloc);
+    // Stage 0: Small-constant `Memcpy`/`Memmove` scalarization + SROA + copy/const propagation +
+    // phi-discriminant jump threading + DCE + CFG coalescing promotes swap temporaries and
+    // non-escaping local stack slots into SSA registers and collapses `Option`/iterator
+    // discriminants before Aegraph + LICM + Strength Reduction.
+    let scalarized_mem = scalarize_small_memops(input, alloc).ok().flatten();
+    let stage0_in = scalarized_mem.as_ref().map_or(input, |f| f.view());
+    let pre_clean = run_sroa_thread_cleanup(stage0_in, alloc);
     let mid_in = match &pre_clean {
         Some(f) => f.view(),
-        None => input,
+        None => stage0_in,
     };
 
     // Stage 1: Fixed-point Aegraph + Reassociation + Strength Reduction + LICM + DCE.
@@ -786,10 +792,12 @@ pub fn emit_sota_record_for_machine<'a>(
         },
     };
 
-    let pre_clean = run_sroa_thread_cleanup(func.view(), alloc);
+    let scalarized_mem = scalarize_small_memops(func.view(), alloc).ok().flatten();
+    let stage0_in = scalarized_mem.as_ref().map_or(func.view(), |f| f.view());
+    let pre_clean = run_sroa_thread_cleanup(stage0_in, alloc);
     let mid_in = match &pre_clean {
         Some(f) => f.view(),
-        None => func.view(),
+        None => stage0_in,
     };
     let sota_opt = sota_optimize_fixpoint(mid_in, RegBudget::AARCH64, 3, |_| 1, alloc).ok();
     let chosen_opt = sota_opt.as_ref().and_then(|res| verify(res.func.view()).ok());

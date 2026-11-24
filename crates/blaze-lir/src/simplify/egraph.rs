@@ -637,13 +637,47 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
         ..AegraphStats::default()
     };
 
+    let mut inst_kept = filled(len, true, &alloc);
     let mut table = ScopedENodes::new(len, &alloc);
-    let mut mem_known: Vec<(u32, i32, u16, u32), A> = Vec::new_in(alloc);
+    let mut mem_known: Vec<(u32, i32, u16, u8, u32), A> = Vec::new_in(alloc);
+    let mut mem_saved: Vec<(u32, i32, u16, u8, u32), A> = Vec::new_in(alloc);
 
-    // Explicit DFS over the dominator tree with scoped hash-consing rollback.
+    // A reachable non-entry block `b` soundly inherits `idom[b]`'s end-of-block `mem_known` iff
+    // `b` has at least one reachable predecessor and EVERY reachable predecessor edge into `b`
+    // comes directly from `idom[b]` (so no other path, merge, or back-edge can clobber memory).
+    let mut has_pred = filled(blocks, false, &alloc);
+    let mut only_idom_pred = filled(blocks, true, &alloc);
+    if let Some(slot) = only_idom_pred.first_mut() {
+        *slot = false;
+    }
+    for pred in 0..blocks {
+        if !reached.get(pred).copied().unwrap_or(false) {
+            continue;
+        }
+        let pred_u32 = usize_u32(pred);
+        let term = view.terminator(Block(pred_u32));
+        each(&view, term, |item| {
+            if let Item::Edge(edge) = item {
+                let to = u32_ix(edge.block);
+                if to < blocks && reached.get(to).copied().unwrap_or(false) {
+                    set_at(&mut has_pred, to, true);
+                    if idom.get(to).copied() != Some(pred_u32) {
+                        set_at(&mut only_idom_pred, to, false);
+                    }
+                }
+            }
+        });
+    }
+    for b in 0..blocks {
+        if !has_pred.get(b).copied().unwrap_or(false) || idom.get(b).copied().unwrap_or(NONE) == NONE {
+            set_at(&mut only_idom_pred, b, false);
+        }
+    }
+
+    // Explicit DFS over the dominator tree with scoped hash-consing and memory-state rollback.
     enum Frame {
         Enter(u32),
-        Exit(usize),
+        Exit { table_mark: usize, mem_mark: usize },
     }
     let mut dfs: Vec<Frame, A> = Vec::with_capacity_in(blocks * 2, alloc);
     if reached[0] {
@@ -652,40 +686,58 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
 
     while let Some(frame) = dfs.pop() {
         match frame {
-            Frame::Exit(mark) => table.rollback(mark),
+            Frame::Exit { table_mark, mem_mark } => {
+                table.rollback(table_mark);
+                mem_known.clear();
+                if let Some(saved) = mem_saved.get(mem_mark..) {
+                    mem_known.extend_from_slice(saved);
+                }
+                mem_saved.truncate(mem_mark);
+            }
             Frame::Enter(b) => {
-                let mark = table.mark();
-                dfs.push(Frame::Exit(mark));
+                let table_mark = table.mark();
+                let mem_mark = mem_saved.len();
+                mem_saved.extend_from_slice(&mem_known);
+                dfs.push(Frame::Exit { table_mark, mem_mark });
                 // Push children in reverse so they visit in forward order.
                 for &child in dom_children[b as usize].iter().rev() {
                     dfs.push(Frame::Enter(child));
                 }
 
-                mem_known.clear();
+                if !only_idom_pred.get(u32_ix(b)).copied().unwrap_or(false) {
+                    mem_known.clear();
+                }
                 let range = view.block(Block(b));
                 for inst in range {
                     let op = view.op(inst);
                     let flags = Flags(view.flags[inst]);
                     let ty = Ty(view.tys[inst]);
 
-                    // Local sound store-to-load forwarding & redundant non-volatile load GVN.
+                    // Sound store-to-load forwarding & redundant non-volatile load GVN across
+                    // local and single-predecessor dominated edges.
                     match op {
                         Op::Load if !flags.contains(Flags::VOLATILE) => {
                             let Some(at) = get_u32(view.data, inst).map(u32_ix) else { continue };
                             let Some((raw_ptr, raw_off)) = extra_pair(&view, at) else { continue };
                             let Some(ptr) = stand_of(&stands, raw_ptr) else { continue };
                             let off = raw_off.cast_signed();
-                            if let Some(&(_, _, _, prev_v)) = mem_known
+                            let align = view.mem_attrs(inst).map_or(0, |m| m.align);
+                            if let Some(&(_, _, _, prev_align, prev_v)) = mem_known
                                 .iter()
-                                .find(|&&(p, o, t, _)| p == ptr && o == off && t == ty.0)
+                                .find(|&&(p, o, t, _, _)| p == ptr && o == off && t == ty.0)
                             {
                                 set_at(&mut stands, inst, prev_v);
                                 copy_const(&mut known_const, inst, prev_v);
+                                if align <= prev_align
+                                    && let Some(k) = inst_kept.get_mut(inst)
+                                {
+                                    *k = false;
+                                }
                                 stats.gvn_hits += 1;
                                 continue;
                             }
                             if mem_known.len() < 32 {
-                                mem_known.push((ptr, off, ty.0, usize_u32(inst)));
+                                mem_known.push((ptr, off, ty.0, align, usize_u32(inst)));
                             }
                             continue;
                         }
@@ -696,9 +748,10 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                             let Some(ptr) = stand_of(&stands, raw_ptr) else { continue };
                             let off = raw_off.cast_signed();
                             let Some(val_ty) = get_u16(view.tys, u32_ix(raw_val)) else { continue };
+                            let align = view.mem_attrs(inst).map_or(0, |m| m.align);
                             // Conservative alias flush, then record exact forwarded store.
                             mem_known.clear();
-                            mem_known.push((ptr, off, val_ty, val));
+                            mem_known.push((ptr, off, val_ty, align, val));
                             continue;
                         }
                         Op::Load
@@ -710,6 +763,8 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                         | Op::Memcpy
                         | Op::Memmove
                         | Op::Memset
+                        | Op::MaskedStore
+                        | Op::Scatter
                         | Op::AtomicLoad
                         | Op::AtomicStore
                         | Op::AtomicRmw
@@ -717,7 +772,10 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                         | Op::Fence
                         | Op::Asm
                         | Op::AsmBr
-                        | Op::TargetIntrinsic => {
+                        | Op::TargetIntrinsic
+                        | Op::Suspend
+                        | Op::SlotLive
+                        | Op::SlotDead => {
                             mem_known.clear();
                         }
                         _ => {}
@@ -1476,7 +1534,7 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
 
     let edit = Edit {
         block_kept: filled(blocks, true, &alloc),
-        inst_kept: filled(len, true, &alloc),
+        inst_kept,
         stands,
         constant: edit_const,
         jump: filled(len, NONE, &alloc),
@@ -3708,6 +3766,201 @@ mod tests {
             let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
             let after = eval::run_in(res.func.view(), &args, 10_000, alloc).unwrap();
             assert_eq!(before, after, "mulhi rewrite mismatch on ({av:#x}, {bv:#x})");
+        }
+    }
+
+    #[test]
+    fn aegraph_forwards_load_across_single_pred_dominated_edge() {
+        use crate::{builder::MemAttrs, func::SlotKind};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let s1 = b.slot(16, 3, SlotKind::Temp);
+        let s2 = b.slot(16, 3, SlotKind::Temp);
+        let out_slot = b.slot(8, 3, SlotKind::Temp);
+        let [b0, b1, b2] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(b0);
+        let x = b.param(Ty::I64);
+        let key = b.param(Ty::I64);
+        let sp1 = b.slot_addr(s1);
+        let sp2 = b.slot_addr(s2);
+        let out_p = b.slot_addr(out_slot);
+        let c8 = b.iconst(Ty::I64, 8);
+        let c16 = b.iconst(Ty::I64, 16);
+        b.store(Flags::NONE, x, sp1, 8, MemAttrs::aligned(3));
+        // `Memmove` clears `mem_known` so the load in `b0` is a real memory read, not a store forward.
+        b.bulk(Op::Memmove, Flags::NONE, sp2, sp1, c16, MemAttrs::aligned(3));
+        let p1 = b.ptr_add(Flags::NONE, sp2, c8);
+        let v = b.load(Ty::I64, Flags::NONE, p1, 0, MemAttrs::aligned(3));
+        let gt = b.icmp(IntCond::Ugt, v, key);
+        b.br(Flags::NONE, gt, (b1, &[]), (b2, &[]));
+
+        // `b1` has unique predecessor `b0`: recomputes `PtrAdd(sp2, 8)` (GVN'd to `p1`) and
+        // reloads from it -> must forward `v` and eliminate the second load!
+        b.begin(b1);
+        let c8_b1 = b.iconst(Ty::I64, 8);
+        let p2 = b.ptr_add(Flags::NONE, sp2, c8_b1);
+        let v2 = b.load(Ty::I64, Flags::NONE, p2, 0, MemAttrs::aligned(3));
+        b.store(Flags::NONE, v2, out_p, 0, MemAttrs::aligned(3));
+        b.ret(&[v2]);
+
+        b.begin(b2);
+        b.ret(&[key]);
+
+        let func = b.finish_checked().unwrap();
+        let loads_before = (0..func.view().len()).filter(|&i| func.view().op(i) == Op::Load).count();
+        assert_eq!(loads_before, 2);
+
+        let opt = aegraph_optimize(func.view(), alloc).unwrap();
+        verify(opt.func.view()).unwrap();
+        let loads_after = (0..opt.func.view().len())
+            .filter(|&i| opt.func.view().op(i) == Op::Load)
+            .count();
+        assert_eq!(
+            loads_after, 1,
+            "expected redundant load in single-pred dominated child block to be eliminated"
+        );
+
+        for &(xv, kv) in &[(10u64, 5u64), (5, 10), (7, 7), (u64::MAX, 0)] {
+            let args = [Val::Int(u128::from(xv)), Val::Int(u128::from(kv))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(opt.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "single-pred load forwarding mismatch on ({xv}, {kv})");
+        }
+    }
+
+    #[test]
+    fn aegraph_isolates_mem_known_across_domtree_siblings() {
+        use crate::{builder::MemAttrs, func::SlotKind};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let s1 = b.slot(8, 3, SlotKind::Temp);
+        let s2 = b.slot(8, 3, SlotKind::Temp);
+        let [b0, b1, b2] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(b0);
+        let x = b.param(Ty::I64);
+        let flag = b.param(Ty::I64);
+        let sp1 = b.slot_addr(s1);
+        let sp2 = b.slot_addr(s2);
+        let c8 = b.iconst(Ty::I64, 8);
+        b.store(Flags::NONE, x, sp1, 0, MemAttrs::aligned(3));
+        b.bulk(Op::Memmove, Flags::NONE, sp2, sp1, c8, MemAttrs::aligned(3));
+        let _v = b.load(Ty::I64, Flags::NONE, sp2, 0, MemAttrs::aligned(3));
+        let zero = b.iconst(Ty::I64, 0);
+        let cond = b.icmp(IntCond::Ne, flag, zero);
+        b.br(Flags::NONE, cond, (b1, &[]), (b2, &[]));
+
+        // First dom-tree child: stores 99 into `sp2`.
+        b.begin(b1);
+        let c99 = b.iconst(Ty::I64, 99);
+        b.store(Flags::NONE, c99, sp2, 0, MemAttrs::aligned(3));
+        let v1 = b.load(Ty::I64, Flags::NONE, sp2, 0, MemAttrs::aligned(3));
+        b.ret(&[v1]);
+
+        // Sibling dom-tree child: MUST see `b0`'s `v`, NEVER `b1`'s `99`!
+        b.begin(b2);
+        let v2 = b.load(Ty::I64, Flags::NONE, sp2, 0, MemAttrs::aligned(3));
+        b.ret(&[v2]);
+
+        let func = b.finish_checked().unwrap();
+        let opt = aegraph_optimize(func.view(), alloc).unwrap();
+        verify(opt.func.view()).unwrap();
+        let loads_after = (0..opt.func.view().len())
+            .filter(|&i| opt.func.view().op(i) == Op::Load)
+            .count();
+        assert_eq!(loads_after, 1, "expected both sibling child loads forwarded without cross-pollution");
+
+        for &(xv, fv, expected) in &[(42u64, 1u64, 99u64), (42, 0, 42), (7, 0, 7), (7, 1, 99)] {
+            let args = [Val::Int(u128::from(xv)), Val::Int(u128::from(fv))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(opt.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "sibling isolation mismatch on ({xv}, {fv})");
+            match after {
+                Outcome::Returned(vals) => assert_eq!(vals.as_slice(), &[Val::Int(u128::from(expected))]),
+                other => panic!("expected Returned, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn aegraph_clears_mem_known_at_diamond_join_block() {
+        use crate::{builder::MemAttrs, func::SlotKind};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let s1 = b.slot(8, 3, SlotKind::Temp);
+        let s2 = b.slot(8, 3, SlotKind::Temp);
+        let [b0, b1, b2, b3] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(b0);
+        let x = b.param(Ty::I64);
+        let flag = b.param(Ty::I64);
+        let sp1 = b.slot_addr(s1);
+        let sp2 = b.slot_addr(s2);
+        let c8 = b.iconst(Ty::I64, 8);
+        b.store(Flags::NONE, x, sp1, 0, MemAttrs::aligned(3));
+        b.bulk(Op::Memmove, Flags::NONE, sp2, sp1, c8, MemAttrs::aligned(3));
+        let _v = b.load(Ty::I64, Flags::NONE, sp2, 0, MemAttrs::aligned(3));
+        let zero = b.iconst(Ty::I64, 0);
+        let cond = b.icmp(IntCond::Ne, flag, zero);
+        b.br(Flags::NONE, cond, (b1, &[]), (b2, &[]));
+
+        b.begin(b1);
+        let c99 = b.iconst(Ty::I64, 99);
+        b.store(Flags::NONE, c99, sp2, 0, MemAttrs::aligned(3));
+        b.jump((b3, &[]));
+
+        b.begin(b2);
+        b.jump((b3, &[]));
+
+        // Diamond join `b3` has `idom[b3] == b0` but predecessors `b1` and `b2` (`!= idom[b3]`):
+        // its load MUST NOT be forwarded from `b0`!
+        b.begin(b3);
+        let v3 = b.load(Ty::I64, Flags::NONE, sp2, 0, MemAttrs::aligned(3));
+        let sum = b.binary(Op::Add, Flags::NONE, _v, v3);
+        b.ret(&[sum]);
+
+        let func = b.finish_checked().unwrap();
+        let opt = aegraph_optimize(func.view(), alloc).unwrap();
+        verify(opt.func.view()).unwrap();
+        let loads_after = (0..opt.func.view().len())
+            .filter(|&i| opt.func.view().op(i) == Op::Load)
+            .count();
+        assert_eq!(loads_after, 2, "join block load must NOT be forwarded across diamond merge");
+
+        for &(xv, fv, expected) in &[(42u64, 1u64, 141u64), (42, 0, 84), (10, 1, 109), (10, 0, 20)] {
+            let args = [Val::Int(u128::from(xv)), Val::Int(u128::from(fv))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(opt.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "diamond join mismatch on ({xv}, {fv})");
+            match after {
+                Outcome::Returned(vals) => assert_eq!(vals.as_slice(), &[Val::Int(u128::from(expected))]),
+                other => panic!("expected Returned, got {other:?}"),
+            }
         }
     }
 }
