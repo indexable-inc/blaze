@@ -31,7 +31,7 @@ use blaze_expand::{
 use blaze_own::{AVec, Alloc};
 
 /// Versioned digest domain used when caching pure comptime-patch expansions.
-pub const COMPTIME_PATCH_VERSION: &[u8] = b"blaze-comptime-patch-v2";
+pub const COMPTIME_PATCH_VERSION: &[u8] = b"blaze-comptime-patch-v3";
 
 /// Cumulative telemetry counters for the built-in comptime patch library.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -415,10 +415,12 @@ fn render_tokens(stream: &TokenStream<'_>, start: usize, end: usize) -> String {
                                 | "ref" | "mut" | "dyn" | "if" | "else" | "while"
                         )
                     );
+                let colon_after_colon = c == ':' && !prev_joint && out.ends_with(':');
                 if !out.is_empty()
                     && !prev_joint
-                    && (is_leading_path_sep || !matches!(c, ',' | ';' | ':' | '.' | '>' | '!' | '?'))
-                    && !out.ends_with(['(', '[', '{', ':', '\'', '<', '&', '#'])
+                    && (colon_after_colon
+                        || ((is_leading_path_sep || !matches!(c, ',' | ';' | ':' | '.' | '>' | '!' | '?'))
+                            && !out.ends_with(['(', '[', '{', ':', '\'', '<', '&', '#'])))
                 {
                     out.push(' ');
                 }
@@ -1426,6 +1428,14 @@ fn gen_serde_deserialize(
     };
 
     let mut out = String::new();
+    if adt.kind == AdtKind::Struct
+        && !cattrs.transparent
+        && !cattrs.default
+        && adt.variants[0].shape == FieldsShape::Named
+        && fattrs[0].iter().any(|f| !f.skip_deserializing && !f.default)
+    {
+        emit_serde_missing_field_helper(&mut out, sp);
+    }
     let _ = writeln!(
         out,
         "#[automatically_derived] impl{impl_g} {sp}::Deserialize<'de> for {name}{ty_g}{where_c} {{"
@@ -1834,7 +1844,7 @@ fn gen_serde_struct_visitor(
             };
             let _ = writeln!(
                 out,
-                "                let __f{i} = match __f{i} {{ ::core::option::Option::Some(v) => v, ::core::option::Option::None => return ::core::result::Result::Err({sp}::de::Error::missing_field({})) }};",
+                "                let __f{i} = match __f{i} {{ ::core::option::Option::Some(v) => v, ::core::option::Option::None => __missing_field::<_, __A::Error>({})? }};",
                 quote_str(&wire)
             );
         }
@@ -1858,6 +1868,93 @@ fn gen_serde_struct_visitor(
         quote_str(container_wire)
     );
     Some(())
+}
+
+/// Emit `serde::private::de::missing_field` semantics inline without depending on serde's
+/// version-suffixed private module (`__privateNNN`) or expanding `forward_to_deserialize_any!`.
+///
+/// Missing map fields deserialize through `__MissingFieldDeserializer`: `deserialize_option`
+/// calls `visitor.visit_none()` so `Option<T>` (and any `Option`-like type) deserializes as
+/// `None` when omitted, while `deserialize_any` and every other `Deserializer` method returns
+/// `Err(Error::missing_field(self.0))`.
+fn emit_serde_missing_field_helper(out: &mut impl core::fmt::Write, sp: &str) {
+    const FORWARD_UNARY: &[&str] = &[
+        "deserialize_bool",
+        "deserialize_i8",
+        "deserialize_i16",
+        "deserialize_i32",
+        "deserialize_i64",
+        "deserialize_i128",
+        "deserialize_u8",
+        "deserialize_u16",
+        "deserialize_u32",
+        "deserialize_u64",
+        "deserialize_u128",
+        "deserialize_f32",
+        "deserialize_f64",
+        "deserialize_char",
+        "deserialize_str",
+        "deserialize_string",
+        "deserialize_bytes",
+        "deserialize_byte_buf",
+        "deserialize_unit",
+        "deserialize_seq",
+        "deserialize_map",
+        "deserialize_identifier",
+        "deserialize_ignored_any",
+    ];
+    let _ = writeln!(
+        out,
+        "#[allow(dead_code)] struct __MissingFieldDeserializer<__E>(&'static str, ::core::marker::PhantomData<__E>);"
+    );
+    let _ = writeln!(
+        out,
+        "#[automatically_derived] impl<'de, __E> {sp}::Deserializer<'de> for __MissingFieldDeserializer<__E> where __E: {sp}::de::Error {{"
+    );
+    let _ = writeln!(out, "    type Error = __E;");
+    let _ = writeln!(
+        out,
+        "    fn deserialize_any<__W>(self, _v: __W) -> ::core::result::Result<__W::Value, __E> where __W: {sp}::de::Visitor<'de> {{ ::core::result::Result::Err({sp}::de::Error::missing_field(self.0)) }}"
+    );
+    let _ = writeln!(
+        out,
+        "    fn deserialize_option<__W>(self, __v: __W) -> ::core::result::Result<__W::Value, __E> where __W: {sp}::de::Visitor<'de> {{ {sp}::de::Visitor::visit_none(__v) }}"
+    );
+    for m in FORWARD_UNARY {
+        let _ = writeln!(
+            out,
+            "    fn {m}<__W>(self, __v: __W) -> ::core::result::Result<__W::Value, __E> where __W: {sp}::de::Visitor<'de> {{ {sp}::Deserializer::deserialize_any(self, __v) }}"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "    fn deserialize_unit_struct<__W>(self, _: &'static str, __v: __W) -> ::core::result::Result<__W::Value, __E> where __W: {sp}::de::Visitor<'de> {{ {sp}::Deserializer::deserialize_any(self, __v) }}"
+    );
+    let _ = writeln!(
+        out,
+        "    fn deserialize_newtype_struct<__W>(self, _: &'static str, __v: __W) -> ::core::result::Result<__W::Value, __E> where __W: {sp}::de::Visitor<'de> {{ {sp}::Deserializer::deserialize_any(self, __v) }}"
+    );
+    let _ = writeln!(
+        out,
+        "    fn deserialize_tuple<__W>(self, _: usize, __v: __W) -> ::core::result::Result<__W::Value, __E> where __W: {sp}::de::Visitor<'de> {{ {sp}::Deserializer::deserialize_any(self, __v) }}"
+    );
+    let _ = writeln!(
+        out,
+        "    fn deserialize_tuple_struct<__W>(self, _: &'static str, _: usize, __v: __W) -> ::core::result::Result<__W::Value, __E> where __W: {sp}::de::Visitor<'de> {{ {sp}::Deserializer::deserialize_any(self, __v) }}"
+    );
+    let _ = writeln!(
+        out,
+        "    fn deserialize_struct<__W>(self, _: &'static str, _: &'static [&'static str], __v: __W) -> ::core::result::Result<__W::Value, __E> where __W: {sp}::de::Visitor<'de> {{ {sp}::Deserializer::deserialize_any(self, __v) }}"
+    );
+    let _ = writeln!(
+        out,
+        "    fn deserialize_enum<__W>(self, _: &'static str, _: &'static [&'static str], __v: __W) -> ::core::result::Result<__W::Value, __E> where __W: {sp}::de::Visitor<'de> {{ {sp}::Deserializer::deserialize_any(self, __v) }}"
+    );
+    let _ = writeln!(out, "}}");
+    let _ = writeln!(
+        out,
+        "fn __missing_field<'de, __V, __E>(__field: &'static str) -> ::core::result::Result<__V, __E> where __V: {sp}::Deserialize<'de>, __E: {sp}::de::Error {{ {sp}::Deserialize::deserialize(__MissingFieldDeserializer(__field, ::core::marker::PhantomData)) }}"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2973,6 +3070,52 @@ mod tests {
     }
 
     #[test]
+    fn serde_missing_field_uses_missing_field_deserializer() {
+        let item = r#"
+            pub struct ReleaseBinary {
+                pub url: String,
+                pub sha256: String,
+                pub signature: Option<String>,
+            }
+        "#;
+        let de = expand_code("serde_derive", ProcKind::Derive, "Deserialize", item)
+            .expect("Deserialize expands at comptime");
+        assert!(de.contains("struct __MissingFieldDeserializer"), "must emit __MissingFieldDeserializer:\n{de}");
+        assert!(de.contains("fn deserialize_option"), "must implement deserialize_option:\n{de}");
+        assert!(de.contains("visit_none"), "deserialize_option must call visit_none:\n{de}");
+        assert!(de.contains("fn deserialize_u128"), "must forward deserialize_u128 to deserialize_any:\n{de}");
+        assert!(de.contains("__missing_field"), "visit_map must route missing fields through __missing_field:\n{de}");
+        assert!(
+            !de.contains("return :: core :: result :: Result :: Err (_serde :: de :: Error :: missing_field"),
+            "visit_map must not bypass MissingFieldDeserializer with unconditional missing_field error:\n{de}"
+        );
+
+        let defaulted = r#"
+            #[serde(default)]
+            pub struct AllDefaulted {
+                pub a: u32,
+                pub b: Option<String>,
+            }
+        "#;
+        let de_def = expand_code("serde_derive", ProcKind::Derive, "Deserialize", defaulted)
+            .expect("Deserialize with #[serde(default)] expands");
+        assert!(
+            !de_def.contains("__MissingFieldDeserializer"),
+            "structs with #[serde(default)] need not emit __MissingFieldDeserializer:\n{de_def}"
+        );
+    }
+
+    #[test]
+    fn comptime_patch_previous_version_is_distinct() {
+        assert_ne!(
+            COMPTIME_PATCH_VERSION,
+            b"blaze-comptime-patch-v2",
+            "v3 expansion changes struct Deserialize missing-field semantics and must not share v2's digest domain"
+        );
+        assert_eq!(COMPTIME_PATCH_VERSION, b"blaze-comptime-patch-v3");
+    }
+
+    #[test]
     fn bytemuck_thiserror_derive_more_strum_and_paste_expand_cleanly() {
         // bytemuck_derive
         let pod_item = "#[repr(C)] #[derive(Clone, Copy)] pub struct Header { pub a: u32, pub b: u32 }";
@@ -3081,8 +3224,171 @@ mod tests {
 
         let pasted = expand_raw("paste", ProcKind::FnLike, "paste", "fn [<compute_ Answer:snake>]() -> u32 { 42 }");
 
+        let serde_bin_def = "pub struct ReleaseBinary { pub url: String, pub signature: Option<String> }";
+        let serde_bin_annotated = r#"#[serde(crate = "mini_serde")] pub struct ReleaseBinary { pub url: String, pub signature: Option<String> }"#;
+        let serde_bin_de = expand_raw("serde_derive", ProcKind::Derive, "Deserialize", serde_bin_annotated);
+
+        let serde_env_def = "pub struct Envelope<T> { pub payload: Option<T>, pub count: u128 }";
+        let serde_env_annotated = r#"#[serde(crate = "mini_serde")] pub struct Envelope<T> { pub payload: Option<T>, pub count: u128 }"#;
+        let serde_env_de = expand_raw("serde_derive", ProcKind::Derive, "Deserialize", serde_env_annotated);
+
         let program = format!(
             r#"
+mod mini_serde {{
+    pub mod de {{
+        #[derive(Debug, PartialEq, Eq)]
+        pub enum ErrKind {{
+            Missing(&'static str),
+            Dup(&'static str),
+            Other,
+        }}
+        pub trait Error: Sized {{
+            fn missing_field(field: &'static str) -> Self;
+            fn duplicate_field(field: &'static str) -> Self;
+            fn invalid_length(_len: usize, _exp: &dyn core::fmt::Display) -> Self;
+            fn custom<T: core::fmt::Display>(_msg: T) -> Self;
+        }}
+        impl Error for ErrKind {{
+            fn missing_field(field: &'static str) -> Self {{ ErrKind::Missing(field) }}
+            fn duplicate_field(field: &'static str) -> Self {{ ErrKind::Dup(field) }}
+            fn invalid_length(_len: usize, _exp: &dyn core::fmt::Display) -> Self {{ ErrKind::Other }}
+            fn custom<T: core::fmt::Display>(_msg: T) -> Self {{ ErrKind::Other }}
+        }}
+        pub trait Visitor<'de>: Sized {{
+            type Value;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result;
+            fn visit_str<E: Error>(self, _v: &str) -> Result<Self::Value, E> {{ Err(E::custom("str")) }}
+            fn visit_u128<E: Error>(self, _v: u128) -> Result<Self::Value, E> {{ Err(E::custom("u128")) }}
+            fn visit_none<E: Error>(self) -> Result<Self::Value, E> {{ Err(E::custom("none")) }}
+            fn visit_some<D: super::Deserializer<'de>>(self, _d: D) -> Result<Self::Value, D::Error> {{ Err(D::Error::custom("some")) }}
+            fn visit_seq<A: SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {{ Err(A::Error::custom("seq")) }}
+            fn visit_map<A: MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {{ Err(A::Error::custom("map")) }}
+        }}
+        pub trait SeqAccess<'de> {{
+            type Error: Error;
+            fn next_element<T: super::Deserialize<'de>>(&mut self) -> Result<Option<T>, Self::Error>;
+        }}
+        pub trait MapAccess<'de> {{
+            type Error: Error;
+            fn next_key<K: super::Deserialize<'de>>(&mut self) -> Result<Option<K>, Self::Error>;
+            fn next_value<V: super::Deserialize<'de>>(&mut self) -> Result<V, Self::Error>;
+        }}
+        pub struct IgnoredAny;
+        impl<'de> super::Deserialize<'de> for IgnoredAny {{
+            fn deserialize<D: super::Deserializer<'de>>(_d: D) -> Result<Self, D::Error> {{ Ok(IgnoredAny) }}
+        }}
+    }}
+    pub trait Deserialize<'de>: Sized {{
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error>;
+    }}
+    pub trait Deserializer<'de>: Sized {{
+        type Error: de::Error;
+        fn deserialize_any<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error>;
+        fn deserialize_bool<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_i8<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_i16<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_i32<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_i64<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_i128<V: de::Visitor<'de>>(self, _v: V) -> Result<V::Value, Self::Error> {{ Err(de::Error::custom("i128 unsupported")) }}
+        fn deserialize_u8<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_u16<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_u32<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_u64<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_u128<V: de::Visitor<'de>>(self, _v: V) -> Result<V::Value, Self::Error> {{ Err(de::Error::custom("u128 unsupported")) }}
+        fn deserialize_f32<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_f64<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_char<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_str<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_string<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_bytes<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_byte_buf<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_option<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_unit<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_unit_struct<V: de::Visitor<'de>>(self, _: &'static str, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_newtype_struct<V: de::Visitor<'de>>(self, _: &'static str, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_seq<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_tuple<V: de::Visitor<'de>>(self, _: usize, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_tuple_struct<V: de::Visitor<'de>>(self, _: &'static str, _: usize, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_map<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_struct<V: de::Visitor<'de>>(self, _: &'static str, _: &'static [&'static str], v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_enum<V: de::Visitor<'de>>(self, _: &'static str, _: &'static [&'static str], v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_identifier<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_ignored_any<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+    }}
+    impl<'de> Deserialize<'de> for String {{
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {{
+            struct V;
+            impl<'de> de::Visitor<'de> for V {{
+                type Value = String;
+                fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {{ f.write_str("str") }}
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {{ Ok(v.to_owned()) }}
+            }}
+            d.deserialize_string(V)
+        }}
+    }}
+    impl<'de> Deserialize<'de> for u128 {{
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {{
+            struct V;
+            impl<'de> de::Visitor<'de> for V {{
+                type Value = u128;
+                fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {{ f.write_str("u128") }}
+                fn visit_u128<E: de::Error>(self, v: u128) -> Result<u128, E> {{ Ok(v) }}
+            }}
+            d.deserialize_u128(V)
+        }}
+    }}
+    impl<'de, T: Deserialize<'de>> Deserialize<'de> for Option<T> {{
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {{
+            struct V<T>(core::marker::PhantomData<T>);
+            impl<'de, T: Deserialize<'de>> de::Visitor<'de> for V<T> {{
+                type Value = Option<T>;
+                fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {{ f.write_str("opt") }}
+                fn visit_none<E: de::Error>(self) -> Result<Option<T>, E> {{ Ok(None) }}
+                fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Option<T>, D::Error> {{ T::deserialize(d).map(Some) }}
+            }}
+            d.deserialize_option(V(core::marker::PhantomData))
+        }}
+    }}
+    #[derive(Clone, Copy)]
+    pub enum Val {{ Str(&'static str), U128(u128) }}
+    struct ValDe(Val);
+    impl<'de> Deserializer<'de> for ValDe {{
+        type Error = de::ErrKind;
+        fn deserialize_any<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{
+            match self.0 {{
+                Val::Str(s) => v.visit_str(s),
+                Val::U128(n) => v.visit_u128(n),
+            }}
+        }}
+        fn deserialize_u128<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ self.deserialize_any(v) }}
+        fn deserialize_option<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ v.visit_some(self) }}
+    }}
+    struct KeyDe(&'static str);
+    impl<'de> Deserializer<'de> for KeyDe {{
+        type Error = de::ErrKind;
+        fn deserialize_any<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ v.visit_str(self.0) }}
+    }}
+    pub struct MapDe<'a> {{ entries: &'a [(&'static str, Val)], idx: usize }}
+    impl<'a> MapDe<'a> {{
+        pub fn new(entries: &'a [(&'static str, Val)]) -> Self {{ Self {{ entries, idx: 0 }} }}
+    }}
+    impl<'de, 'a> de::MapAccess<'de> for MapDe<'a> {{
+        type Error = de::ErrKind;
+        fn next_key<K: Deserialize<'de>>(&mut self) -> Result<Option<K>, Self::Error> {{
+            if self.idx >= self.entries.len() {{ return Ok(None); }}
+            K::deserialize(KeyDe(self.entries[self.idx].0)).map(Some)
+        }}
+        fn next_value<V: Deserialize<'de>>(&mut self) -> Result<V, Self::Error> {{
+            let val = self.entries[self.idx].1;
+            self.idx += 1;
+            V::deserialize(ValDe(val))
+        }}
+    }}
+    impl<'de, 'a> Deserializer<'de> for MapDe<'a> {{
+        type Error = de::ErrKind;
+        fn deserialize_any<V: de::Visitor<'de>>(self, v: V) -> Result<V::Value, Self::Error> {{ v.visit_map(self) }}
+    }}
+}}
 {dm_struct}
 {dm_from}
 {dm_deref}
@@ -3095,6 +3401,10 @@ mod tests {
 {strum_into_str}
 {is_var}
 {pasted}
+{serde_bin_def}
+{serde_bin_de}
+{serde_env_def}
+{serde_env_de}
 
 fn main() {{
     let p = Port::new(8080);
@@ -3116,6 +3426,39 @@ fn main() {{
     assert!(Kind::FastPath.is_fast_path());
     assert!(!Kind::FastPath.is_slow_fallback());
     assert_eq!(compute_answer(), 42);
+
+    // Omitted Option<String> deserializes as None; present deserializes as Some.
+    let min = <ReleaseBinary as mini_serde::Deserialize>::deserialize(
+        mini_serde::MapDe::new(&[("url", mini_serde::Val::Str("https://example.com"))])
+    ).expect("missing Option<String> must succeed as None");
+    assert_eq!(min.url, "https://example.com");
+    assert_eq!(min.signature, None);
+
+    let full = <ReleaseBinary as mini_serde::Deserialize>::deserialize(
+        mini_serde::MapDe::new(&[
+            ("url", mini_serde::Val::Str("https://example.com")),
+            ("signature", mini_serde::Val::Str("sig123")),
+        ])
+    ).expect("present Option<String> must succeed as Some");
+    assert_eq!(full.signature.as_deref(), Some("sig123"));
+
+    // Omitted required String still returns Missing("url").
+    let missing_req = <ReleaseBinary as mini_serde::Deserialize>::deserialize(
+        mini_serde::MapDe::new(&[])
+    );
+    assert!(matches!(missing_req, Err(mini_serde::de::ErrKind::Missing("url"))));
+
+    // Generic Option<T> omitted succeeds as None; omitted u128 returns Missing("count") (not unsupported).
+    let env_ok = <Envelope<String> as mini_serde::Deserialize>::deserialize(
+        mini_serde::MapDe::new(&[("count", mini_serde::Val::U128(42))])
+    ).expect("missing generic Option<T> must succeed as None");
+    assert_eq!(env_ok.payload, None);
+    assert_eq!(env_ok.count, 42);
+
+    let env_missing_u128 = <Envelope<String> as mini_serde::Deserialize>::deserialize(
+        mini_serde::MapDe::new(&[])
+    );
+    assert!(matches!(env_missing_u128, Err(mini_serde::de::ErrKind::Missing("count"))));
 }}
 "#
         );
