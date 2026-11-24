@@ -201,7 +201,7 @@ pub enum ConstKind {
     Bytes { start: u32, len: u32 },
     /// A `const` item at generic arguments (a list of the checked record's type table).
     Item { key: ItemKey, args: List },
-    /// The body's promoted constant at this index (`&3` lifted to `'static`).
+    /// The body's promoted constant for borrow expression `ExprId(id)` (`&3` lifted to `'static`).
     Promoted(u32),
     /// A fn item as a value (zero-sized), at generic arguments.
     FnItem { key: ItemKey, args: List },

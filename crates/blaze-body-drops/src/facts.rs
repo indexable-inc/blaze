@@ -21,7 +21,7 @@
 //! is left out.
 #![blaze::sans_io]
 
-use blaze_body::Stmt;
+use blaze_body::{Proj, Stmt};
 use blaze_body::body::PTy;
 
 /// One field step of a part's path: `.index`, whose type is `ty`.
@@ -79,4 +79,11 @@ pub trait DropFacts {
     fn needs_drop(&self, ty: PTy) -> NeedsDrop;
     /// The checked record's `bool`: the type of every drop flag.
     fn bool_ty(&self) -> PTy;
+    /// The type reached by non-field projection `proj` from `parent_ty` (`Deref`, `DerefBox`,
+    /// `Index`, `ConstIndex`, `Subslice`, `Downcast`). Defaults to `None` (`Downcast` falls back
+    /// to `parent_ty`; other non-field projections without an answer refuse with
+    /// [`crate::ElabError::PlaceType`]).
+    fn project_ty(&self, _parent_ty: PTy, _proj: Proj) -> Option<PTy> {
+        None
+    }
 }

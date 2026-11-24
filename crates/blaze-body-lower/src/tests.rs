@@ -921,3 +921,275 @@ fn let_else_range_or_slice_and_destructuring_assign_lower_and_verify() {
     assert!(text.contains("[-1 of 2]"), "slice pattern emits from_end ConstIndex:\n{text}");
     let _ = PNode::Bool;
 }
+
+/// Lowers `LetChain`, binding `OrPattern` (`E::A(x) | E::B(x)`), float & string `ValuePattern`,
+/// `SuperLet`, `OverloadedDeref`, `OverloadedIndex`, and `CallThroughFnTrait` (closure call),
+/// verifying every resulting `blaze-body`.
+#[test]
+fn wave2_let_chain_binding_or_value_pat_super_let_deref_index_fn_trait_lower_and_verify() {
+    use blaze_typeck::{
+        Arm, BinOp, BindAnn, BodyPath, ClosureKind, FloatTy, IntSuffix, LangItem, List, Lit, Mutbl,
+        PNode, Pat, PatId, PathIdx, PortableTys, Range, ScopeId, Segment, Stmt, StmtId, UintTy, UnOp,
+    };
+
+    // 1. Binding OrPattern + LetChain + SuperLet + Float/Str ValuePatterns
+    let mut fx = Fx::new();
+    let u32_t = fx.u32();
+    let f64_t = fx.ty(PNode::Float(FloatTy::F64));
+    let str_t = fx.ty(PNode::Str);
+    let ref_str_t = fx.ty(PNode::Ref(Mutbl::Not, str_t));
+    let (ek, _evs) = fx.enum_("E", 0, &[("A", &[u32_t]), ("B", &[u32_t]), ("C", &[])]);
+    let e_t = fx.adt(ek, &[]);
+    let owner = fx.func("f", 0, &[e_t, f64_t, ref_str_t], u32_t, Default::default());
+    fx.finish();
+
+    let body_tys = PortableTys::new_in(heap());
+    let mk_bind = |name: &str| Pat::Bind {
+        ann: BindAnn { by_ref: None, mutable: false },
+        name: Name::of(name),
+        sub: None,
+        ty: None,
+    };
+    let segments = [
+        Segment { name: Name::of("E"), generic_args: List::EMPTY, has_args: false },
+        Segment { name: Name::of("A"), generic_args: List::EMPTY, has_args: false },
+        Segment { name: Name::of("E"), generic_args: List::EMPTY, has_args: false },
+        Segment { name: Name::of("B"), generic_args: List::EMPTY, has_args: false },
+    ];
+    let paths = [
+        BodyPath { scope: ScopeId(0), segments: List { start: 0, len: 2 }, lang: None, anchor: None }, // 0: E::A
+        BodyPath { scope: ScopeId(0), segments: List { start: 2, len: 2 }, lang: None, anchor: None }, // 1: E::B
+    ];
+    let pats = [
+        mk_bind("e"),                                                       // 0: param e
+        mk_bind("fl"),                                                      // 1: param fl
+        mk_bind("s"),                                                       // 2: param s
+        mk_bind("v"),                                                       // 3: v in E::A(v)
+        Pat::TupleStruct { path: PathIdx(0), elems: List { start: 0, len: 1 }, rest: None }, // 4: E::A(v)
+        mk_bind("v"),                                                       // 5: v in E::B(v)
+        Pat::TupleStruct { path: PathIdx(1), elems: List { start: 1, len: 1 }, rest: None }, // 6: E::B(v)
+        Pat::Or { alts: List { start: 2, len: 2 } },                        // 7: E::A(v) | E::B(v)
+        Pat::NegLit(Lit::Float(Some(FloatTy::F64))),                        // 8: -1.5f64
+        Pat::Lit(Lit::Str),                                                 // 9: "ok"
+        mk_bind("sl"),                                                      // 10: super let sl
+        mk_bind("res"),                                                     // 11: let res
+    ];
+    let pat_lists = [PatId(3), PatId(5), PatId(4), PatId(6)];
+    let mut pat_ranges = blaze_own::Vec::with_capacity_in(pats.len(), heap());
+    for i in 0..pats.len() {
+        let s = u32::try_from(i).unwrap_or(0);
+        pat_ranges.push(Range { start: s, end: s + 1 });
+    }
+    let exprs = [
+        Expr::Local(PatId(0)),                                              // 0: e
+        Expr::Let { pat: PatId(7), init: ExprId(0) },                       // 1: let E::A(v) | E::B(v) = e
+        Expr::Local(PatId(1)),                                              // 2: fl
+        Expr::Let { pat: PatId(8), init: ExprId(2) },                       // 3: let -1.5 = fl
+        Expr::Binary { op: BinOp::And, lhs: ExprId(1), rhs: ExprId(3) },    // 4: (1) && (3)
+        Expr::Local(PatId(2)),                                              // 5: s
+        Expr::Let { pat: PatId(9), init: ExprId(5) },                       // 6: let "ok" = s
+        Expr::Binary { op: BinOp::And, lhs: ExprId(4), rhs: ExprId(6) },    // 7: (1) && (3) && (6)
+        Expr::Local(PatId(3)),                                              // 8: v
+        Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U32)))),            // 9: 0u32
+        Expr::If { cond: ExprId(7), then: ExprId(8), else_: Some(ExprId(9)) }, // 10
+        Expr::Block { stmts: List { start: 0, len: 1 }, tail: Some(ExprId(12)), scope: ScopeId(1) }, // 11: { super let sl = 10; sl }
+        Expr::Local(PatId(10)),                                             // 12: sl
+        Expr::Local(PatId(11)),                                             // 13: res
+        Expr::Binary { op: BinOp::Add, lhs: ExprId(13), rhs: ExprId(13) },  // 14: res + res
+        Expr::Block { stmts: List { start: 1, len: 1 }, tail: Some(ExprId(14)), scope: ScopeId(0) }, // 15
+    ];
+    let mut expr_ranges = blaze_own::Vec::with_capacity_in(exprs.len(), heap());
+    for i in 0..exprs.len() {
+        let s = u32::try_from(i).unwrap_or(0);
+        expr_ranges.push(Range { start: s, end: s + 1 });
+    }
+    let stmts = [
+        Stmt::Let { pat: PatId(10), ty: None, init: Some(ExprId(10)), else_: None }, // 0: super let sl = if ...
+        Stmt::Let { pat: PatId(11), ty: None, init: Some(ExprId(11)), else_: None }, // 1: let res = { super let sl = ...; sl }
+    ];
+    let stmt_lists = [StmtId(0), StmtId(1)];
+    let super_lets = [StmtId(0)];
+    let call_arg_ints = [(ExprId(9), 0)];
+    let params = [PatId(0), PatId(1), PatId(2)];
+    let mut bv = empty_body_view(owner, body_tys.view(), ExprId(15));
+    bv.params = &params;
+    bv.segments = &segments;
+    bv.paths = &paths;
+    bv.pats = &pats;
+    bv.pat_lists = &pat_lists;
+    bv.pat_ranges = &pat_ranges;
+    bv.exprs = &exprs;
+    bv.expr_ranges = &expr_ranges;
+    bv.stmts = &stmts;
+    bv.stmt_lists = &stmt_lists;
+    bv.super_lets = &super_lets;
+    bv.call_arg_ints = &call_arg_ints;
+
+    let mut cx = InferCtx::new_in(heap());
+    let ck = match blaze_typeck::check(&bv, &fx, &mut cx, &Needs::new_in(heap()), heap()) {
+        Ok(Outcome::Done(c)) => {
+            assert!(c.diags.is_empty(), "fixture type-checks clean: {:?}", c.diags);
+            c
+        }
+        Ok(Outcome::Need(n)) => panic!("world missed {:?}", n.questions),
+        Err(e) => panic!("{e:?}"),
+    };
+
+    struct Wave2Facts {
+        ek: ItemKey,
+        deref_k: Option<ItemKey>,
+        index_k: Option<ItemKey>,
+        fn_call_k: Option<ItemKey>,
+    }
+    impl Facts for Wave2Facts {
+        fn regions(&self) -> &dyn blaze_flow_lower::RegionFacts { &blaze_flow_lower::NoRegions }
+        fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> { None }
+        fn adt_variances(&self, _: ItemKey) -> Option<&[blaze_flow_lower::Variance]> { None }
+        fn implied_bounds(&self) -> Option<(&[(u32, blaze_flow_lower::Region)], &[(blaze_flow_lower::Region, blaze_flow_lower::Region)])> { None }
+        fn constant_initializer(&self) -> bool { false }
+        fn fn_binders(&self) -> bool { true }
+        fn closure_bodies_checked(&self) -> bool { false }
+        fn closure_requirements(&self, _: ExprId) -> &[blaze_flow_lower::Requirement] { &[] }
+        fn async_bodies_checked(&self) -> bool { false }
+        fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> { None }
+        fn shape(&self, _: ItemKey) -> Option<blaze_flow_lower::Shape<'_>> { None }
+        fn object_trait_lifetimes(&self, _: ItemKey) -> Option<bool> { None }
+        fn call_bounds(&self, _: ItemKey) -> Option<blaze_flow_lower::CallBounds<'_>> { None }
+        fn trait_lifetimes(&self, _: ItemKey) -> Option<u32> { None }
+        fn alias_lifetimes(&self, _: ItemKey, _: Name) -> Option<u32> { None }
+        fn ties(&self, _: ItemKey) -> Option<blaze_flow_lower::Ties<'_>> { None }
+        fn field_param(&self, _: ItemKey, _: u32, _: u32) -> Option<u32> { None }
+        fn field_lead(&self, _: ItemKey, _: u32, _: u32) -> Option<blaze_flow_lower::FieldLead> { None }
+        fn field_regions(&self, _: ItemKey, _: u32, _: u32) -> Option<&[blaze_flow_lower::FieldRegion]> { None }
+        fn copy_args(&self, _: ItemKey) -> Option<&[bool]> { None }
+        fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
+            Some(AdtFacts { copy: true, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: k == self.ek, is_box: false })
+        }
+        fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
+            Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
+        }
+        fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> { None }
+        fn field_count(&self, k: ItemKey, v: u32) -> Option<u32> {
+            if k == self.ek { Some(if v < 2 { 1 } else { 0 }) } else { None }
+        }
+        fn param_copy(&self, _: u32) -> bool { false }
+    }
+    impl BodyFacts for Wave2Facts {
+        fn float_pat(&self, p: PatId) -> Option<u128> {
+            if p == PatId(8) { Some(u128::from(1.5f64.to_bits())) } else { None }
+        }
+        fn str_pat(&self, p: PatId) -> Option<&[u8]> {
+            if p == PatId(9) { Some(b"ok") } else { None }
+        }
+        fn discr(&self, adt: ItemKey, variant: u32) -> Option<crate::Discr> {
+            if adt == self.ek {
+                Some(crate::Discr { int: crate::DiscrInt::Int(blaze_typeck::IntTy::Isize), bits: u128::from(variant) })
+            } else {
+                None
+            }
+        }
+        fn pointer_bits(&self) -> Option<u32> { Some(64) }
+        fn trait_item(&self, _: ItemKey) -> Option<bool> { Some(false) }
+        fn deref_fn(&self, _: Mutbl) -> Option<ItemKey> { self.deref_k }
+        fn index_fn(&self, _: Mutbl) -> Option<ItemKey> { self.index_k }
+        fn fn_trait_method(&self, _: ClosureKind) -> Option<ItemKey> { self.fn_call_k }
+    }
+
+    let facts = Wave2Facts { ek, deref_k: None, index_k: None, fn_call_k: None };
+    let body = lower(&bv, &ck, &facts, heap()).expect("let-chain + binding or + float/str pat + super let lowers");
+    let mut text = blaze_own::String::new_in(heap());
+    blaze_body::print(&body.view(), &mut text).expect("prints");
+    blaze_body::verify(&body).unwrap_or_else(|e| panic!("verify failed: {e:?}\n{text}"));
+    assert!(text.contains("eq("), "float pattern emits eq:\n{text}");
+    assert!(text.contains("= len "), "str pattern emits len:\n{text}");
+
+    // 2. OverloadedDeref + OverloadedIndex + CallThroughFnTrait (closure)
+    let mut fx2 = Fx::new();
+    let u32_2 = fx2.u32();
+    let usize_2 = fx2.usize();
+    let copy_tr = fx2.tr("Copy", 1, Default::default(), &[]);
+    fx2.lang(LangItem::Copy, copy_tr);
+    fx2.imp("impl Copy for u32", 0, u32_2, Some((copy_tr, &[])), &[], Default::default());
+    let deref_tr = fx2.tr("Deref", 1, Default::default(), &["Target"]);
+    fx2.lang(LangItem::Deref, deref_tr);
+    let index_tr = fx2.tr("Index", 2, Default::default(), &["Output"]);
+    fx2.lang(LangItem::Index, index_tr);
+    let wrap_k = fx2.strukt("Wrap", 0, &[("v", u32_2)]);
+    let wrap_t = fx2.adt(wrap_k, &[]);
+    fx2.imp("impl Deref for Wrap", 0, wrap_t, Some((deref_tr, &[])), &[("Target", u32_2)], Default::default());
+    fx2.imp("impl Index<usize> for Wrap", 0, wrap_t, Some((index_tr, &[usize_2])), &[("Output", u32_2)], Default::default());
+    let owner2 = fx2.func("use_ops", 0, &[wrap_t, usize_2], u32_2, Default::default());
+    fx2.finish();
+
+    let mut body_tys2 = PortableTys::new_in(heap());
+    let b_u32 = body_tys2.intern(PNode::Uint(blaze_typeck::UintTy::U32)).unwrap();
+    let opt_types2 = [Some(b_u32)];
+    let pats2 = [mk_bind("w"), mk_bind("i"), mk_bind("c"), mk_bind("a")];
+    let pat_lists2 = [PatId(3)];
+    let mut pat_ranges2 = blaze_own::Vec::with_capacity_in(pats2.len(), heap());
+    for i in 0..pats2.len() {
+        let s = u32::try_from(i).unwrap_or(0);
+        pat_ranges2.push(Range { start: s, end: s + 1 });
+    }
+    let exprs2 = [
+        Expr::Local(PatId(3)),                                              // 0: a
+        Expr::Local(PatId(0)),                                              // 1: w
+        Expr::Unary { op: UnOp::Deref, operand: ExprId(1) },                // 2: *w (OverloadedDeref)
+        Expr::Binary { op: BinOp::Add, lhs: ExprId(0), rhs: ExprId(2) },    // 3: a + *w
+        Expr::Closure { params: List { start: 0, len: 1 }, param_tys: List { start: 0, len: 1 }, ret: None, body: ExprId(3), is_move: false, is_async: false }, // 4: |a: u32| a + *w
+        Expr::Local(PatId(2)),                                              // 5: c
+        Expr::Local(PatId(0)),                                              // 6: w
+        Expr::Local(PatId(1)),                                              // 7: i
+        Expr::Index { base: ExprId(6), index: ExprId(7) },                  // 8: w[i] (OverloadedIndex)
+        Expr::Call { callee: ExprId(5), args: List { start: 0, len: 1 } },  // 9: c(w[i]) (CallThroughFnTrait)
+        Expr::Block { stmts: List { start: 0, len: 1 }, tail: Some(ExprId(9)), scope: ScopeId(0) }, // 10
+    ];
+    let expr_lists2 = [ExprId(8)];
+    let mut expr_ranges2 = blaze_own::Vec::with_capacity_in(exprs2.len(), heap());
+    for i in 0..exprs2.len() {
+        let s = u32::try_from(i).unwrap_or(0);
+        expr_ranges2.push(Range { start: s, end: s + 1 });
+    }
+    let stmts2 = [Stmt::Let { pat: PatId(2), ty: None, init: Some(ExprId(4)), else_: None }];
+    let stmt_lists2 = [StmtId(0)];
+    let params2 = [PatId(0), PatId(1)];
+    let mut bv2 = empty_body_view(owner2, body_tys2.view(), ExprId(10));
+    bv2.params = &params2;
+    bv2.opt_types = &opt_types2;
+    bv2.pats = &pats2;
+    bv2.pat_lists = &pat_lists2;
+    bv2.pat_ranges = &pat_ranges2;
+    bv2.exprs = &exprs2;
+    bv2.expr_lists = &expr_lists2;
+    bv2.expr_ranges = &expr_ranges2;
+    bv2.stmts = &stmts2;
+    bv2.stmt_lists = &stmt_lists2;
+
+    let mut cx2 = InferCtx::new_in(heap());
+    let ck2 = match blaze_typeck::check(&bv2, &fx2, &mut cx2, &Needs::new_in(heap()), heap()) {
+        Ok(Outcome::Done(c)) => {
+            assert!(c.diags.is_empty(), "fixture2 type-checks clean: {:?}", c.diags);
+            c
+        }
+        Ok(Outcome::Need(n)) => panic!("world2 missed {:?}", n.questions),
+        Err(e) => panic!("{e:?}"),
+    };
+    let facts2 = Wave2Facts {
+        ek: ItemKey(9999),
+        deref_k: Some(ItemKey(0x301)),
+        index_k: Some(ItemKey(0x302)),
+        fn_call_k: Some(ItemKey(0x303)),
+    };
+    let body2 = lower(&bv2, &ck2, &facts2, heap()).expect("deref + index + closure call lowers");
+    blaze_body::verify(&body2).expect("body2 verifies");
+    let closure_body = crate::lower_closure(&bv2, &ck2, &facts2, ExprId(4), heap()).expect("closure body with *w lowers");
+    blaze_body::verify(&closure_body).expect("closure body verifies");
+    let mut t2 = blaze_own::String::new_in(heap());
+    blaze_body::print(&body2.view(), &mut t2).expect("prints");
+    assert!(t2.contains("method k302"), "OverloadedIndex must emit method call k302:\n{t2}");
+    assert!(t2.contains("method k303"), "Closure call must emit Fn-trait method call k303:\n{t2}");
+    let mut tc = blaze_own::String::new_in(heap());
+    blaze_body::print(&closure_body.view(), &mut tc).expect("prints");
+    assert!(tc.contains("method k301"), "OverloadedDeref in closure must emit method call k301:\n{tc}");
+    let _ = Arm { pat: PatId(0), guard: None, body: ExprId(0) };
+}

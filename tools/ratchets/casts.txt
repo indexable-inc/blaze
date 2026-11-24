@@ -18,7 +18,7 @@ blaze-body-build	19
 blaze-body-drops	16
 blaze-body-eval	57
 blaze-body-flow	24
-blaze-body-lower	24
+blaze-body-lower	22
 blaze-borrow	21
 blaze-bstd-convert	9
 blaze-build	738

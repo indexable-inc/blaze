@@ -16,9 +16,9 @@ use core::alloc::Allocator;
 
 use blaze_body::{BlockKind, Place, Role, StmtKind};
 use blaze_own::Vec;
-use blaze_typeck::{Edition, Expr, ExprId, List, PNode, PatId, Stmt, StmtId};
+use blaze_typeck::{BinOp, Edition, Expr, ExprId, List, PNode, PatId, Stmt, StmtId};
 
-use crate::scope::{Binding, Target};
+use crate::scope::{Binding, Entry, Target};
 use crate::{At, BodyFacts, Construct, Lower, LowerError, MOST_POSITIONS};
 
 impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
@@ -83,7 +83,10 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
             }
             Stmt::Let { pat, init, else_, .. } => {
                 if self.is_super_let(s) {
-                    return self.refuse_pat(Construct::SuperLet, pat);
+                    if else_.is_some() {
+                        return self.refuse_pat(Construct::SuperLet, pat);
+                    }
+                    return self.super_let_stmt(pat, init, block);
                 }
                 match else_ {
                     Some(diverge) => self.let_else_stmt(pat, init, diverge),
@@ -119,6 +122,7 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
         };
         self.open();
         let prev = core::mem::replace(&mut self.extended, Vec::new_in(self.alloc));
+        let prev_blocks = core::mem::replace(&mut self.extended_blocks, Vec::new_in(self.alloc));
         let prev_mark = self.ext_mark.take();
         self.mark_extending(init)?;
         self.ext_mark = Some(self.marks.len() - 1);
@@ -135,9 +139,75 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
             self.bind_irrefutable(pat, p, ty, &mut out)?;
         }
         self.extended = prev;
+        self.extended_blocks = prev_blocks;
         self.ext_mark = prev_mark;
         self.close(span)?;
         self.schedule(&out);
+        Ok(())
+    }
+
+    /// `super let pat = init;`: bindings outlive `block`, placed in the scope a temporary of
+    /// `block`'s value would live in (the extending `let`'s block scope if `block` is an
+    /// extending expression of a `let`, else the scope immediately enclosing `block`).
+    fn super_let_stmt(&mut self, pat: PatId, init: Option<ExprId>, block: ExprId) -> Result<(), LowerError> {
+        let span = self.pat_span(pat);
+        let mut out: Vec<Binding, A> = Vec::new_in(self.alloc);
+        match init {
+            None => self.declare_uninit(pat, &mut out)?,
+            Some(init) => {
+                self.open();
+                let prev = core::mem::replace(&mut self.extended, Vec::new_in(self.alloc));
+                let prev_blocks = core::mem::replace(&mut self.extended_blocks, Vec::new_in(self.alloc));
+                let prev_mark = self.ext_mark.take();
+                self.mark_extending(init)?;
+                self.ext_mark = Some(self.marks.len() - 1);
+                if self.simple_bind(pat)? {
+                    let ty = self.local_ty(pat)?;
+                    let (local, place) = self.binding_local(pat, ty)?;
+                    self.lower_into(place, init)?;
+                    let drops = self.needs_drop(ty, At::Pat(pat))?;
+                    out.push(Binding { local, place, ty, drops });
+                    self.bind(pat, place);
+                } else {
+                    let ty = self.adjusted_ty(init)?;
+                    let p = self.place(init)?;
+                    self.bind_irrefutable(pat, p, ty, &mut out)?;
+                }
+                self.extended = prev;
+                self.extended_blocks = prev_blocks;
+                self.ext_mark = prev_mark;
+                self.close(span)?;
+            }
+        }
+        let target_d = match self.ext_mark {
+            Some(d) if self.extended_blocks.scan_for(&block).is_some() => d,
+            _ => match self.marks.len().checked_sub(1) {
+                Some(d) => d,
+                None => {
+                    self.schedule(&out);
+                    return Ok(());
+                }
+            },
+        };
+        let mut first_at: Option<usize> = None;
+        for b in out.iter() {
+            let Some(&mark_u32) = self.marks.get(target_d) else {
+                return self.refuse_pat(Construct::Malformed, pat);
+            };
+            let Ok(at) = usize::try_from(mark_u32) else {
+                return self.refuse_pat(Construct::Malformed, pat);
+            };
+            if first_at.is_none() {
+                first_at = Some(at);
+            }
+            self.sched.insert_shift(at, Entry { local: b.local, place: b.place, drops: b.drops, storage: true, cleanup: None });
+            for m in self.marks.iter_mut().skip(target_d) {
+                *m += 1;
+            }
+        }
+        if let Some(at) = first_at {
+            self.invalidate_from(at);
+        }
         Ok(())
     }
 
@@ -156,9 +226,8 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
         let p = self.place(init)?;
         let eb = self.b.new_block(BlockKind::Normal);
         let after = self.b.new_block(BlockKind::Normal);
-        self.test_pat(pat, p, ty, eb, init)?;
         let mut out: Vec<Binding, A> = Vec::new_in(self.alloc);
-        self.bind_pat(pat, p, ty, &mut out)?;
+        self.match_and_bind(pat, p, ty, eb, init, &mut out)?;
         self.emit_exit(tm, span)?;
         self.goto(after, span);
         self.b.start(eb);
@@ -202,11 +271,63 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
                 Expr::Call { callee, args } if matches!(self.expr_def(callee), Some(blaze_typeck::Def::Ctor { .. })) => {
                     work.extend_from_slice(self.exprs_in(args, x)?);
                 }
-                Expr::Block { tail: Some(t), .. } => work.push(t),
+                Expr::Block { tail: Some(t), .. } => {
+                    self.extended_blocks.push(x);
+                    work.push(t);
+                }
+                Expr::Block { tail: None, .. } => {
+                    self.extended_blocks.push(x);
+                }
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    /// Whether condition expression `cond` contains a `let` (alone or inside an `&&` chain).
+    pub(crate) fn cond_has_let(&self, cond: ExprId) -> Result<bool, LowerError> {
+        let mut work: Vec<ExprId, A> = Vec::new_in(self.alloc);
+        work.push(cond);
+        let mut steps = 0u32;
+        while let Some(x) = work.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Construct::Bound, cond);
+            }
+            match self.expr(x)? {
+                Expr::Let { .. } => return Ok(true),
+                Expr::Paren(y) => work.push(y),
+                Expr::Binary { op: BinOp::And, lhs, rhs } => {
+                    work.push(lhs);
+                    work.push(rhs);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
+    /// Flattens `a && b && c` left to right into its condition links.
+    pub(crate) fn links_of(&self, cond: ExprId) -> Result<Vec<ExprId, A>, LowerError> {
+        let mut links: Vec<ExprId, A> = Vec::new_in(self.alloc);
+        let mut work: Vec<ExprId, A> = Vec::new_in(self.alloc);
+        work.push(cond);
+        let mut steps = 0u32;
+        while let Some(x) = work.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Construct::Bound, cond);
+            }
+            match self.expr(x)? {
+                Expr::Paren(y) => work.push(y),
+                Expr::Binary { op: BinOp::And, lhs, rhs } => {
+                    work.push(rhs);
+                    work.push(lhs);
+                }
+                _ => links.push(x),
+            }
+        }
+        Ok(links)
     }
 
     /// `if cond { then } else { else_ }` into `dest`.
@@ -218,8 +339,15 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
         then: ExprId,
         else_: Option<ExprId>,
     ) -> Result<(), LowerError> {
-        if let Expr::Let { pat, init } = self.expr(cond)? {
-            return self.if_let_into(dest, e, pat, init, then, else_);
+        if self.cond_has_let(cond)? {
+            let links = self.links_of(cond)?;
+            if !self.edition_2024()
+                && let [only] = links.as_slice()
+                && let Expr::Let { pat, init } = self.expr(*only)?
+            {
+                return self.if_let_into(dest, e, pat, init, then, else_);
+            }
+            return self.if_let_chain_into(dest, e, &links, then, else_);
         }
         let span = self.span(e);
         let tm = self.open();
@@ -253,8 +381,8 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
         }
     }
 
-    /// `if let pat = init { then } else { else_ }`: the pattern's tests fail to the `else`
-    /// branch; its bindings live in the `then` branch.
+    /// `if let pat = init { then } else { else_ }` (pre-2024 temporary drop order: scrutinee
+    /// temporaries drop after `else`).
     fn if_let_into(
         &mut self,
         dest: Place,
@@ -270,10 +398,9 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
         let p = self.place(init)?;
         let eb = self.b.new_block(BlockKind::Normal);
         let join = self.b.new_block(BlockKind::Normal);
-        self.test_pat(pat, p, ty, eb, e)?;
         self.open();
         let mut out: Vec<Binding, A> = Vec::new_in(self.alloc);
-        self.bind_pat(pat, p, ty, &mut out)?;
+        self.match_and_bind(pat, p, ty, eb, e, &mut out)?;
         self.schedule(&out);
         self.lower_into(dest, then)?;
         self.close(span)?;
@@ -289,6 +416,63 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
         }
         self.goto(join, span);
         self.pop_scope();
+        self.b.start(join);
+        Ok(())
+    }
+
+    /// `if let P1 = e1 && cond && let P2 = e2 { then } else { else_ }` (the Reference,
+    /// "Chains of conditions"): each link evaluates left to right; any failed `let` or `false`
+    /// link drops bindings and scrutinee temporaries accumulated so far in reverse order before
+    /// jumping to `else_`; on full match, `then` runs with all bindings in scope and drops them
+    /// in reverse order afterward.
+    fn if_let_chain_into(
+        &mut self,
+        dest: Place,
+        e: ExprId,
+        links: &[ExprId],
+        then: ExprId,
+        else_: Option<ExprId>,
+    ) -> Result<(), LowerError> {
+        let span = self.span(e);
+        let tm = self.open();
+        let eb = self.b.new_block(BlockKind::Normal);
+        let join = self.b.new_block(BlockKind::Normal);
+        for &link in links {
+            match self.expr(link)? {
+                Expr::Let { pat, init } => {
+                    let ty = self.adjusted_ty(init)?;
+                    let p = self.place(init)?;
+                    let link_fail = self.b.new_block(BlockKind::Normal);
+                    let link_ok = self.b.new_block(BlockKind::Normal);
+                    let mut out: Vec<Binding, A> = Vec::new_in(self.alloc);
+                    self.match_and_bind(pat, p, ty, link_fail, e, &mut out)?;
+                    self.goto(link_ok, span);
+                    self.b.start(link_fail);
+                    self.emit_exit(tm, span)?;
+                    self.goto(eb, span);
+                    self.b.start(link_ok);
+                    self.schedule(&out);
+                }
+                _ => {
+                    let c = self.operand(link)?;
+                    let link_ok = self.b.new_block(BlockKind::Normal);
+                    let link_fail = self.b.new_block(BlockKind::Normal);
+                    let cases = self.b.cases(&[(0, link_fail)]);
+                    self.b.terminate(StmtKind::Switch { on: c, cases, otherwise: link_ok }, span);
+                    self.b.start(link_fail);
+                    self.emit_exit(tm, span)?;
+                    self.goto(eb, span);
+                    self.b.start(link_ok);
+                }
+            }
+        }
+        self.lower_into(dest, then)?;
+        self.emit_exit(tm, span)?;
+        self.goto(join, span);
+        self.pop_scope();
+        self.b.start(eb);
+        self.else_into(dest, e, else_)?;
+        self.goto(join, span);
         self.b.start(join);
         Ok(())
     }

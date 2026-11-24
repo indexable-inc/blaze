@@ -5,7 +5,7 @@ use std::alloc::Global;
 use std::string::String;
 
 use blaze_body as bd;
-use blaze_body::{Body, Proj, verify};
+use blaze_body::{Body, verify};
 use blaze_flow::{BorrowFinding, DropKind, MoveFindingKind};
 
 use crate::{ProjectError, Projected, canon, project};
@@ -19,7 +19,7 @@ fn projected(body: &Body<Global>) -> Projected<Global> {
     project(v, Global).unwrap_or_else(|e| panic!("project refused: {e}"))
 }
 
-fn flow_text(p: &Projected<Global>) -> String {
+fn flow_text<A: core::alloc::Allocator + Copy>(p: &Projected<A>) -> String {
     let mut out = String::new();
     p.flow.print(&mut out).expect("a String takes every write");
     out
@@ -268,27 +268,39 @@ fn asm_is_refused_by_name() {
     assert_eq!(e, ProjectError::InlineAsm { stmt: bd::Stmt(0) });
 }
 
-/// Prints `pN: a constant index or subslice of a slice pattern has no flow form`.
+/// `ConstIndex` and `Subslice` places project directly to `blaze_flow::Proj::ConstantIndex`
+/// and `Subslice`, so disjoint slice pattern borrows pass borrowck cleanly while whole-slice
+/// conflicts are caught.
 #[test]
-fn subslice_is_refused_by_name() {
+fn const_index_and_subslice_project_cleanly() {
     let text = "\
 local _0: t0 return
 local _1: t1 arg 0
 local _2: t1 temp e0 value
+local _3: t2 temp e1 value
 bb0:
   _2 = copy _1[0..1]
+  _3 = copy _1[0 of 2]
+  _0 = move _2
   return
 ";
-    let body = parse(text);
-    let v = verify(&body).expect("verifies");
-    let ProjectError::SlicePlace { place } = refused(text) else { panic!("SlicePlace wanted") };
-    assert!(matches!(v.place(place).proj, Some(Proj::Subslice { .. })));
+    let a = blaze_own::testing::heap().alloc();
+    let body = bd::parse(text, a).unwrap_or_else(|e| panic!("{e:?}"));
+    let p = project(bd::verify(&body).unwrap(), a).unwrap_or_else(|e| panic!("project refused: {e}"));
+    let r = blaze_flow::check(&p.flow, a).expect("within bounds");
+    assert!(r.moves.is_empty(), "{:?}", r.moves);
+    assert!(r.borrows.is_empty(), "{:?}", r.borrows);
+    let has_subslice = (0..p.flow.places.len()).any(|i| matches!(p.flow.place(blaze_flow::Place(i as u32)).proj, Some(blaze_flow::Proj::Subslice { .. })));
+    let has_const_idx = (0..p.flow.places.len()).any(|i| matches!(p.flow.place(blaze_flow::Place(i as u32)).proj, Some(blaze_flow::Proj::ConstantIndex { .. })));
+    assert!(has_subslice && has_const_idx, "expected Subslice and ConstantIndex in flow:\n{}", flow_text(&p));
 }
 
-/// Prints `s0: a discriminant read that the next row does not switch on`.
+/// A lone discriminant read (such as an enum-to-integer cast `_0 = discr _1; return`) projects
+/// as a shared read of `_1` writing `_0`, passing borrowck and catching use-after-move.
 #[test]
-fn lone_discriminant_is_refused_by_name() {
-    let e = refused(
+fn lone_discriminant_projects_as_shared_read() {
+    let a = blaze_own::testing::heap().alloc();
+    let body = bd::parse(
         "\
 local _0: t0 return
 local _1: t1 arg 0
@@ -296,8 +308,19 @@ bb0:
   _0 = discr _1
   return
 ",
-    );
-    assert_eq!(e, ProjectError::LoneDiscriminant { stmt: bd::Stmt(0) });
+        a,
+    )
+    .unwrap();
+    let p = project(bd::verify(&body).unwrap(), a).unwrap_or_else(|e| panic!("project refused: {e}"));
+    let want = "\
+bb0:
+  s0 _0 = (copy _1)
+  s1 return
+";
+    assert_eq!(flow_text(&p), want);
+    let r = blaze_flow::check(&p.flow, a).expect("within bounds");
+    assert!(r.moves.is_empty(), "{:?}", r.moves);
+    assert!(r.borrows.is_empty(), "{:?}", r.borrows);
 }
 
 /// Prints `UseOfMoved at s1`: `deinit _1` is a move out of `_1` into the scratch local `_2`, so
@@ -385,17 +408,32 @@ mod d119_oracle_parity {
         out
     }
 
+    type PromotedRecord = blaze_build::data::DataRecord<super::Global>;
+
     struct OracleWorld<'a> {
         overflow: OverflowChecks,
         ints: &'a [(ExprId, u128)],
+        floats: &'a [(ExprId, u128)],
+        strs: &'a [(ExprId, &'a str)],
         int_pats: &'a [(PatId, u128)],
+        float_pats: &'a [(PatId, u128)],
+        str_pats: &'a [(PatId, &'a [u8])],
         enum_key: Option<ItemKey>,
         enum_tys: Option<PortableTys<'static>>,
         enum_variants: &'a [Variant],
+        enum_fields: &'a [Field],
+        enum_discrs: &'a [i128],
         struct_key: Option<ItemKey>,
         struct_tys: Option<PortableTys<'static>>,
         struct_variants: &'a [Variant],
         struct_fields: &'a [Field],
+        deref_fn_item: Option<ItemKey>,
+        index_fn_item: Option<ItemKey>,
+        fn_call_item: Option<ItemKey>,
+        fn_once_item: Option<ItemKey>,
+        closure_tys: Option<PortableTys<'static>>,
+        closures: &'a [(ItemKey, u32, PTy, PTy, blaze_build::FnTrait)],
+        promoted: &'a [(ExprId, PromotedRecord)],
     }
 
     impl<'a> OracleWorld<'a> {
@@ -403,14 +441,27 @@ mod d119_oracle_parity {
             Self {
                 overflow,
                 ints,
+                floats: &[],
+                strs: &[],
                 int_pats,
+                float_pats: &[],
+                str_pats: &[],
                 enum_key: None,
                 enum_tys: None,
                 enum_variants: &[],
+                enum_fields: &[],
+                enum_discrs: &[10, 20, 30],
                 struct_key: None,
                 struct_tys: None,
                 struct_variants: &[],
                 struct_fields: &[],
+                deref_fn_item: None,
+                index_fn_item: None,
+                fn_call_item: None,
+                fn_once_item: None,
+                closure_tys: None,
+                closures: &[],
+                promoted: &[],
             }
         }
     }
@@ -491,8 +542,14 @@ mod d119_oracle_parity {
             }
             None
         }
-        fn field_count(&self, k: ItemKey, _: u32) -> Option<u32> {
-            if self.struct_key == Some(k) { u32::try_from(self.struct_fields.len()).ok() } else { None }
+        fn field_count(&self, k: ItemKey, v: u32) -> Option<u32> {
+            if self.struct_key == Some(k) {
+                return u32::try_from(self.struct_fields.len()).ok();
+            }
+            if self.enum_key == Some(k) {
+                return self.enum_variants.get(v as usize).map(|var| var.fields.len);
+            }
+            None
         }
         fn param_copy(&self, _: u32) -> bool {
             false
@@ -503,8 +560,30 @@ mod d119_oracle_parity {
         fn int_lit(&self, e: ExprId) -> Option<u128> {
             self.ints.iter().find(|(id, _)| *id == e).map(|(_, v)| *v)
         }
+        fn float_lit(&self, e: ExprId) -> Option<u128> {
+            self.floats.iter().find(|(id, _)| *id == e).map(|(_, v)| *v)
+        }
+        fn str_lit(&self, e: ExprId) -> Option<&[u8]> {
+            self.strs.iter().find(|(id, _)| *id == e).map(|(_, s)| s.as_bytes())
+        }
         fn int_pat(&self, p: PatId) -> Option<u128> {
             self.int_pats.iter().find(|(id, _)| *id == p).map(|(_, v)| *v)
+        }
+        fn float_pat(&self, p: PatId) -> Option<u128> {
+            self.float_pats.iter().find(|(id, _)| *id == p).map(|(_, v)| *v)
+        }
+        fn str_pat(&self, p: PatId) -> Option<&[u8]> {
+            self.str_pats.iter().find(|(id, _)| *id == p).map(|(_, b)| *b)
+        }
+        fn discr(&self, adt: ItemKey, variant: u32) -> Option<blaze_body_lower::Discr> {
+            if self.enum_key == Some(adt) {
+                let d = self.enum_discrs.get(variant as usize).copied().unwrap_or(i128::from(variant));
+                return Some(blaze_body_lower::Discr {
+                    int: blaze_body_lower::DiscrInt::Int(IntTy::Isize),
+                    bits: (d as i64) as u64 as u128,
+                });
+            }
+            None
         }
         fn pointer_bits(&self) -> Option<u32> {
             Some(64)
@@ -512,13 +591,25 @@ mod d119_oracle_parity {
         fn trait_item(&self, _: ItemKey) -> Option<bool> {
             Some(false)
         }
+        fn deref_fn(&self, _: blaze_typeck::Mutbl) -> Option<ItemKey> {
+            self.deref_fn_item
+        }
+        fn index_fn(&self, _: blaze_typeck::Mutbl) -> Option<ItemKey> {
+            self.index_fn_item
+        }
+        fn fn_trait_method(&self, kind: blaze_typeck::ClosureKind) -> Option<ItemKey> {
+            match kind {
+                blaze_typeck::ClosureKind::FnOnce => self.fn_once_item.or(self.fn_call_item),
+                _ => self.fn_call_item,
+            }
+        }
     }
 
     impl LayoutFacts for OracleWorld<'_> {
         fn adt(&self, k: ItemKey) -> Option<Adt<'_>> {
             if self.enum_key == Some(k) {
                 let tys = self.enum_tys.as_ref()?;
-                return Some(Adt { kind: AdtKind::Enum, generics: 0, types: tys.view(), variants: self.enum_variants, fields: &[] });
+                return Some(Adt { kind: AdtKind::Enum, generics: 0, types: tys.view(), variants: self.enum_variants, fields: self.enum_fields });
             }
             if self.struct_key == Some(k) {
                 let tys = self.struct_tys.as_ref()?;
@@ -531,16 +622,17 @@ mod d119_oracle_parity {
         }
         fn discriminant(&self, k: ItemKey, v: u32) -> Result<Option<i128>, Missing> {
             if self.enum_key == Some(k) {
-                return Ok(Some(match v {
-                    0 => 10,
-                    1 => 20,
-                    _ => 30,
-                }));
+                return Ok(Some(self.enum_discrs.get(v as usize).copied().unwrap_or(i128::from(v))));
             }
             Ok(None)
         }
         fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> {
             Ok(ValidRange::default())
+        }
+        fn closure(&self, owner: ItemKey, ordinal: u32) -> Option<blaze_build::layout::ClosureFacts<'_>> {
+            let ctys = self.closure_tys.as_ref()?;
+            let &(_, _, sig, env, kind) = self.closures.iter().find(|&&(o, ord, ..)| o == owner && ord == ordinal)?;
+            Some(blaze_build::layout::ClosureFacts { types: ctys.view(), sig, env, kind })
         }
     }
 
@@ -554,8 +646,20 @@ mod d119_oracle_parity {
         fn int_lit(&self, _: ItemKey, e: ExprId) -> Option<u128> {
             self.ints.iter().find(|(id, _)| *id == e).map(|(_, v)| *v)
         }
+        fn float_lit(&self, _: ItemKey, e: ExprId) -> Option<u128> {
+            self.floats.iter().find(|(id, _)| *id == e).map(|(_, v)| *v)
+        }
+        fn str_lit(&self, _: ItemKey, e: ExprId) -> Option<&str> {
+            self.strs.iter().find(|(id, _)| *id == e).map(|(_, s)| *s)
+        }
         fn int_pat(&self, _: ItemKey, p: PatId) -> Option<u128> {
             self.int_pats.iter().find(|(id, _)| *id == p).map(|(_, v)| *v)
+        }
+        fn float_pat(&self, _: ItemKey, p: PatId) -> Option<u128> {
+            self.float_pats.iter().find(|(id, _)| *id == p).map(|(_, v)| *v)
+        }
+        fn str_pat(&self, _: ItemKey, p: PatId) -> Option<&[u8]> {
+            self.str_pats.iter().find(|(id, _)| *id == p).map(|(_, b)| *b)
         }
         fn panic(&self) -> Panic {
             Panic::Abort
@@ -569,8 +673,27 @@ mod d119_oracle_parity {
         fn drop_impl(&self, _: PTy, _: &mut PortableTys<'_>) -> Result<Option<ItemKey>, blaze_build::BuildError> {
             Ok(None)
         }
-        fn abi(&self, _: ItemKey) -> Option<Abi> {
-            Some(Abi::Rust)
+        fn abi(&self, k: ItemKey) -> Option<Abi> {
+            if self.fn_call_item == Some(k) || self.fn_once_item == Some(k) {
+                Some(Abi::RustCall)
+            } else {
+                Some(Abi::Rust)
+            }
+        }
+        fn deref_fn(&self, _: blaze_typeck::Mutbl) -> Option<ItemKey> {
+            self.deref_fn_item
+        }
+        fn index_fn(&self, _: blaze_typeck::Mutbl) -> Option<ItemKey> {
+            self.index_fn_item
+        }
+        fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> {
+            match which {
+                blaze_build::FnTrait::FnOnce => self.fn_once_item.or(self.fn_call_item),
+                _ => self.fn_call_item,
+            }
+        }
+        fn promoted_value(&self, _: ItemKey, borrow: ExprId, _: &[PTy]) -> Option<&PromotedRecord> {
+            self.promoted.iter().find(|(e, _)| *e == borrow).map(|(_, r)| r)
         }
     }
 
@@ -968,5 +1091,475 @@ mod d119_oracle_parity {
                 (&[Val::Int(u128::from((-5i64).cast_unsigned()))], Val::Int(25)),
             ],
         );
+    }
+
+    /// Binding `OrPattern` (`E::A(v) | E::B(v)`) + `LetChain` (`if let ... && v > 0 && let ...`)
+    /// + float & string `ValuePattern`: verified byte-identical between old walk (`blaze-build`)
+    /// and D119 (`blaze-body-lower` -> `blaze-body-build`), AND clean through `blaze-body-flow`!
+    #[test]
+    fn oracle_parity_binding_or_let_chain_and_float_str_value_patterns() {
+        use blaze_typeck::FloatTy;
+        let mut fx = Fx::new();
+        let i64_t = fx.ty(PNode::Int(IntTy::I64));
+        let f64_t = fx.ty(PNode::Float(FloatTy::F64));
+        let (ek, evs) = fx.enum_("E", 0, &[("A", &[i64_t]), ("B", &[i64_t]), ("C", &[])]);
+        let owner = fx.func("chain_val", 0, &[i64_t, i64_t, f64_t], i64_t, Default::default());
+        fx.finish();
+        let mut sig_tys = PortableTys::new_in(heap());
+        let s_i64 = sig_tys.intern(PNode::Int(IntTy::I64)).unwrap();
+        let s_f64 = sig_tys.intern(PNode::Float(FloatTy::F64)).unwrap();
+        let sig_in = [s_i64, s_i64, s_f64];
+        let sig = plain_sig(&sig_in, s_i64, sig_tys.view());
+
+        let body_tys = PortableTys::new_in(heap());
+        let mk_bind = |name: &str| Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None, ty: None };
+        let segments = [
+            Segment { name: Name::of("E"), generic_args: List::EMPTY, has_args: false },
+            Segment { name: Name::of("A"), generic_args: List::EMPTY, has_args: false },
+            Segment { name: Name::of("E"), generic_args: List::EMPTY, has_args: false },
+            Segment { name: Name::of("B"), generic_args: List::EMPTY, has_args: false },
+            Segment { name: Name::of("E"), generic_args: List::EMPTY, has_args: false },
+            Segment { name: Name::of("C"), generic_args: List::EMPTY, has_args: false },
+        ];
+        let paths = [
+            BodyPath { scope: ScopeId(0), segments: List { start: 0, len: 2 }, lang: None, anchor: None }, // 0: E::A
+            BodyPath { scope: ScopeId(0), segments: List { start: 2, len: 2 }, lang: None, anchor: None }, // 1: E::B
+            BodyPath { scope: ScopeId(0), segments: List { start: 4, len: 2 }, lang: None, anchor: None }, // 2: E::C
+        ];
+        let pats = [
+            mk_bind("kind"),                                                 // 0: param kind (0->A, 1->B, else C)
+            mk_bind("val"),                                                  // 1: param val
+            mk_bind("fl"),                                                   // 2: param fl
+            mk_bind("e"),                                                    // 3: let e = ...
+            mk_bind("v"),                                                    // 4: v in E::A(v)
+            Pat::TupleStruct { path: PathIdx(0), elems: List { start: 0, len: 1 }, rest: None }, // 5: E::A(v)
+            mk_bind("v"),                                                    // 6: v in E::B(v)
+            Pat::TupleStruct { path: PathIdx(1), elems: List { start: 1, len: 1 }, rest: None }, // 7: E::B(v)
+            Pat::Or { alts: List { start: 2, len: 2 } },                     // 8: E::A(v) | E::B(v)
+            Pat::NegLit(Lit::Float(Some(FloatTy::F64))),                     // 9: -1.5f64
+            Pat::Lit(Lit::Str),                                              // 10: "hi"
+        ];
+        let pat_lists = [PatId(4), PatId(6), PatId(5), PatId(7)];
+        let pat_ranges = make_ranges(pats.len());
+        let exprs = [
+            Expr::Local(PatId(0)),                                           // 0: kind
+            Expr::Lit(Lit::Int(Some(IntSuffix::Int(IntTy::I64)))),           // 1: 0
+            Expr::Binary { op: BinOp::Eq, lhs: ExprId(0), rhs: ExprId(1) },  // 2: kind == 0
+            Expr::Path(PathIdx(0)),                                          // 3: E::A
+            Expr::Local(PatId(1)),                                           // 4: val
+            Expr::Call { callee: ExprId(3), args: List { start: 0, len: 1 } }, // 5: E::A(val)
+            Expr::Local(PatId(0)),                                           // 6: kind
+            Expr::Lit(Lit::Int(Some(IntSuffix::Int(IntTy::I64)))),           // 7: 1
+            Expr::Binary { op: BinOp::Eq, lhs: ExprId(6), rhs: ExprId(7) },  // 8: kind == 1
+            Expr::Path(PathIdx(1)),                                          // 9: E::B
+            Expr::Local(PatId(1)),                                           // 10: val
+            Expr::Call { callee: ExprId(9), args: List { start: 1, len: 1 } }, // 11: E::B(val)
+            Expr::Path(PathIdx(2)),                                          // 12: E::C
+            Expr::If { cond: ExprId(8), then: ExprId(11), else_: Some(ExprId(12)) }, // 13
+            Expr::If { cond: ExprId(2), then: ExprId(5), else_: Some(ExprId(13)) },  // 14: e init
+            // LetChain: `if let E::A(v) | E::B(v) = e && v > 0 && let -1.5 = fl && let "hi" = "hi" { v + 100 } else { 7 }`
+            Expr::Local(PatId(3)),                                           // 15: e
+            Expr::Let { pat: PatId(8), init: ExprId(15) },                   // 16: let E::A(v) | E::B(v) = e
+            Expr::Local(PatId(4)),                                           // 17: v
+            Expr::Lit(Lit::Int(Some(IntSuffix::Int(IntTy::I64)))),           // 18: 0
+            Expr::Binary { op: BinOp::Gt, lhs: ExprId(17), rhs: ExprId(18) },// 19: v > 0
+            Expr::Binary { op: BinOp::And, lhs: ExprId(16), rhs: ExprId(19) }, // 20
+            Expr::Local(PatId(2)),                                           // 21: fl
+            Expr::Let { pat: PatId(9), init: ExprId(21) },                   // 22: let -1.5 = fl
+            Expr::Binary { op: BinOp::And, lhs: ExprId(20), rhs: ExprId(22) }, // 23
+            Expr::Lit(Lit::Str),                                             // 24: "hi"
+            Expr::Let { pat: PatId(10), init: ExprId(24) },                  // 25: let "hi" = "hi"
+            Expr::Binary { op: BinOp::And, lhs: ExprId(23), rhs: ExprId(25) }, // 26
+            Expr::Local(PatId(4)),                                           // 27: v
+            Expr::Lit(Lit::Int(Some(IntSuffix::Int(IntTy::I64)))),           // 28: 100
+            Expr::Binary { op: BinOp::Add, lhs: ExprId(27), rhs: ExprId(28) }, // 29: v + 100
+            Expr::Lit(Lit::Int(Some(IntSuffix::Int(IntTy::I64)))),           // 30: 7
+            Expr::If { cond: ExprId(26), then: ExprId(29), else_: Some(ExprId(30)) }, // 31
+            Expr::Block { stmts: List { start: 0, len: 1 }, tail: Some(ExprId(31)), scope: ScopeId(0) }, // 32
+        ];
+        let expr_lists = [ExprId(4), ExprId(10)];
+        let expr_ranges = make_ranges(exprs.len());
+        let stmts = [Stmt::Let { pat: PatId(3), ty: None, init: Some(ExprId(14)), else_: None }];
+        let stmt_lists = [StmtId(0)];
+        let ints = [(ExprId(1), 0), (ExprId(7), 1), (ExprId(18), 0), (ExprId(28), 100), (ExprId(30), 7)];
+        let strs = [(ExprId(24), "hi")];
+        let float_pats = [(PatId(9), u128::from(1.5f64.to_bits()))];
+        let str_pats: &[(PatId, &[u8])] = &[(PatId(10), b"hi")];
+        let params = [PatId(0), PatId(1), PatId(2)];
+        let mut bv = base_view(owner, body_tys.view(), ExprId(32));
+        bv.params = &params;
+        bv.segments = &segments;
+        bv.paths = &paths;
+        bv.pats = &pats;
+        bv.pat_lists = &pat_lists;
+        bv.pat_ranges = &pat_ranges;
+        bv.exprs = &exprs;
+        bv.expr_lists = &expr_lists;
+        bv.expr_ranges = &expr_ranges;
+        bv.stmts = &stmts;
+        bv.stmt_lists = &stmt_lists;
+        bv.call_arg_ints = &ints;
+
+        let ck = check_clean(&fx, &bv);
+        let mut et = PortableTys::new_in(heap());
+        let ei64 = et.intern(PNode::Int(IntTy::I64)).unwrap();
+        let enum_fields = [
+            Field { name: Name::of("0"), ty: ei64 },
+            Field { name: Name::of("0"), ty: ei64 },
+        ];
+        let enum_variants = [
+            Variant { key: evs[0], name: Name::of("A"), ctor: CtorKind::Tuple, fields: List { start: 0, len: 1 } },
+            Variant { key: evs[1], name: Name::of("B"), ctor: CtorKind::Tuple, fields: List { start: 1, len: 1 } },
+            Variant { key: evs[2], name: Name::of("C"), ctor: CtorKind::Unit, fields: List { start: 2, len: 0 } },
+        ];
+        let mut world = OracleWorld::new(OverflowChecks::Off, &ints, &[]);
+        world.strs = &strs;
+        world.float_pats = &float_pats;
+        world.str_pats = str_pats;
+        world.enum_key = Some(ek);
+        world.enum_tys = Some(et);
+        world.enum_variants = &enum_variants;
+        world.enum_fields = &enum_fields;
+        world.enum_discrs = &[0, 1, 2];
+
+        // Also prove the lowered body projects cleanly through `blaze-body-flow`!
+        let lowered = blaze_body_lower::lower(&bv, &ck, &world, heap()).expect("lowers");
+        let verified = blaze_body::verify(&lowered).expect("verifies");
+        let proj = crate::project(verified, heap()).expect("projects through blaze-body-flow");
+        let check_res = blaze_flow::check(&proj.flow, heap()).expect("borrowck within bounds");
+        assert!(check_res.moves.is_empty(), "{:?}", check_res.moves);
+
+        let neg15 = Val::Int(u128::from((-1.5f64).to_bits()));
+        let pos15 = Val::Int(u128::from((1.5f64).to_bits()));
+        let nan = Val::Int(u128::from(f64::NAN.to_bits()));
+        assert_oracle_parity(
+            "binding_or_let_chain_value_pats",
+            &bv,
+            &ck,
+            &sig,
+            &world,
+            &[
+                (&[Val::Int(0), Val::Int(5), neg15], Val::Int(105)),
+                (&[Val::Int(1), Val::Int(9), neg15], Val::Int(109)),
+                (&[Val::Int(0), Val::Int(0), neg15], Val::Int(7)),
+                (&[Val::Int(2), Val::Int(5), neg15], Val::Int(7)),
+                (&[Val::Int(0), Val::Int(5), pos15], Val::Int(7)),
+                (&[Val::Int(0), Val::Int(5), nan], Val::Int(7)),
+            ],
+        );
+    }
+
+    /// Promoted borrow `&42i64` (`Checked::promoted` -> `ConstKind::Promoted` -> `Adts::promoted_value`):
+    /// verified byte-identical between old walk (`blaze-build`) and D119 (`blaze-body-lower` -> `blaze-body-build`).
+    #[test]
+    fn oracle_parity_promoted_borrow() {
+        let mut fx = Fx::new();
+        let i64_t = fx.ty(PNode::Int(IntTy::I64));
+        let owner = fx.func("prom", 0, &[i64_t], i64_t, Default::default());
+        fx.finish();
+        let mut sig_tys = PortableTys::new_in(heap());
+        let s_i64 = sig_tys.intern(PNode::Int(IntTy::I64)).unwrap();
+        let sig_in = [s_i64];
+        let sig = plain_sig(&sig_in, s_i64, sig_tys.view());
+
+        let body_tys = PortableTys::new_in(heap());
+        let mk_bind = |name: &str| Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None, ty: None };
+        let pats = [mk_bind("x")];
+        let pat_ranges = make_ranges(pats.len());
+        let exprs = [
+            Expr::Lit(Lit::Int(Some(IntSuffix::Int(IntTy::I64)))),           // 0: 42i64
+            Expr::Ref { mutbl: blaze_typeck::Mutbl::Not, operand: ExprId(0) }, // 1: &42i64 (promoted!)
+            Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: ExprId(1) }, // 2: *(&42i64)
+            Expr::Local(PatId(0)),                                           // 3: x
+            Expr::Binary { op: BinOp::Add, lhs: ExprId(2), rhs: ExprId(3) }, // 4: *(&42) + x
+        ];
+        let expr_ranges = make_ranges(exprs.len());
+        let ints = [(ExprId(0), 42)];
+        let params = [PatId(0)];
+        let mut bv = base_view(owner, body_tys.view(), ExprId(4));
+        bv.params = &params;
+        bv.pats = &pats;
+        bv.pat_ranges = &pat_ranges;
+        bv.exprs = &exprs;
+        bv.expr_ranges = &expr_ranges;
+        bv.call_arg_ints = &ints;
+
+        let ck = check_clean(&fx, &bv);
+        assert!(ck.promoted.scan_for(&ExprId(1)).is_some(), "expected ExprId(1) in Checked::promoted: {:?}", ck.promoted);
+        let bytes = 42i64.to_le_bytes().to_vec();
+        let allocs = core::iter::once(blaze_build::data::DataAlloc { bytes, align: 3, mutable: false, relocs: Default::default() }).collect();
+        let promoted = [(ExprId(1), blaze_build::data::DataRecord { allocs })];
+        let mut world = OracleWorld::new(OverflowChecks::Off, &ints, &[]);
+        world.promoted = &promoted;
+
+        assert_oracle_parity(
+            "promoted_borrow",
+            &bv,
+            &ck,
+            &sig,
+            &world,
+            &[
+                (&[Val::Int(0)], Val::Int(42)),
+                (&[Val::Int(8)], Val::Int(50)),
+                (&[Val::Int(u128::from((-42i64).cast_unsigned()))], Val::Int(0)),
+            ],
+        );
+    }
+
+    /// Closures (`lower_closure` + `CallThroughFnTrait`), `ClosureFnPointer` coercion,
+    /// `OverloadedDeref`, and `OverloadedIndex`: built through BOTH the old walk (`blaze-build`)
+    /// and D119 (`blaze-body-lower` -> `blaze-body-build`), linked with real callee bodies, and
+    /// executed in `blaze_lir::eval::run_calls_in` to prove identical runtime outputs!
+    #[test]
+    fn oracle_parity_closures_fn_trait_deref_index_and_closure_fn_ptr() {
+        use blaze_lir::builder::Variadic;
+        use blaze_lir::eval::{Bodies, BodyId, run_calls_in};
+        use blaze_lir::func::{BlockKind, Conv, RefId};
+        use blaze_lir::{Builder, Full, View};
+        use blaze_typeck::{LangItem, Mutbl, UnOp};
+
+        const DEREF_ITEM: ItemKey = ItemKey(501);
+        const INDEX_ITEM: ItemKey = ItemKey(502);
+        const FN_CALL_ITEM: ItemKey = ItemKey(503);
+        const FN_ONCE_ITEM: ItemKey = ItemKey(504);
+
+        let mut fx = Fx::new();
+        let i64_t = fx.ty(PNode::Int(IntTy::I64));
+        let usize_t = fx.usize();
+        let copy_tr = fx.tr("Copy", 1, Default::default(), &[]);
+        fx.lang(LangItem::Copy, copy_tr);
+        fx.imp("impl Copy for i64", 0, i64_t, Some((copy_tr, &[])), &[], Default::default());
+        let deref_tr = fx.tr("Deref", 1, Default::default(), &["Target"]);
+        fx.lang(LangItem::Deref, deref_tr);
+        let index_tr = fx.tr("Index", 2, Default::default(), &["Output"]);
+        fx.lang(LangItem::Index, index_tr);
+        let wrap_k = fx.strukt("Wrap", 0, &[("v", i64_t)]);
+        let wrap_t = fx.adt(wrap_k, &[]);
+        fx.imp("impl Deref for Wrap", 0, wrap_t, Some((deref_tr, &[])), &[("Target", i64_t)], Default::default());
+        fx.imp("impl Index<usize> for Wrap", 0, wrap_t, Some((index_tr, &[usize_t])), &[("Output", i64_t)], Default::default());
+        let owner = fx.func("run_all", 0, &[i64_t], i64_t, Default::default());
+        fx.finish();
+
+        let mut sig_tys = PortableTys::new_in(heap());
+        let s_i64 = sig_tys.intern(PNode::Int(IntTy::I64)).unwrap();
+        let sig_in = [s_i64];
+        let sig = plain_sig(&sig_in, s_i64, sig_tys.view());
+
+        let mut body_tys = PortableTys::new_in(heap());
+        let b_i64 = body_tys.intern(PNode::Int(IntTy::I64)).unwrap();
+        let b_fpl = body_tys.intern_list(&[b_i64, b_i64]).unwrap();
+        let b_fnptr = body_tys.intern(PNode::FnPtr(b_fpl, FnPtrHeader::RUST)).unwrap();
+
+        let mk_bind = |name: &str| Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None, ty: None };
+        let segments = [Segment { name: Name::of("Wrap"), generic_args: List::EMPTY, has_args: false }];
+        let paths = [BodyPath { scope: ScopeId(0), segments: List { start: 0, len: 1 }, lang: None, anchor: None }];
+        let pats = [
+            mk_bind("x"),   // 0: param x
+            mk_bind("w"),   // 1: let w = Wrap { v: x }
+            mk_bind("fp"),  // 2: let fp: fn(i64) -> i64 = |a| a + 10
+            mk_bind("a"),   // 3: closure0 param a
+            mk_bind("c"),   // 4: let c = |b| b + x
+            mk_bind("b"),   // 5: closure1 param b
+        ];
+        let pat_lists = [PatId(3), PatId(5)];
+        let pat_ranges = make_ranges(pats.len());
+        let opt_types = [Some(b_i64)];
+        let exprs = [
+            Expr::Local(PatId(0)),                                           // 0: x
+            Expr::Struct { path: PathIdx(0), fields: List { start: 0, len: 1 }, base: StructBase::None }, // 1: Wrap { v: x }
+            Expr::Local(PatId(3)),                                           // 2: a
+            Expr::Lit(Lit::Int(Some(IntSuffix::Int(IntTy::I64)))),           // 3: 10
+            Expr::Binary { op: BinOp::Add, lhs: ExprId(2), rhs: ExprId(3) }, // 4: a + 10
+            Expr::Closure { params: List { start: 0, len: 1 }, param_tys: List::EMPTY, ret: None, body: ExprId(4), is_move: false, is_async: false }, // 5: |a| a + 10
+            Expr::Local(PatId(5)),                                           // 6: b
+            Expr::Local(PatId(0)),                                           // 7: x (captured by ref)
+            Expr::Binary { op: BinOp::Add, lhs: ExprId(6), rhs: ExprId(7) }, // 8: b + x
+            Expr::Closure { params: List { start: 1, len: 1 }, param_tys: List { start: 0, len: 1 }, ret: None, body: ExprId(8), is_move: false, is_async: false }, // 9: |b: i64| b + x
+            // Tail: `fp(*w) + c(w[2usize])`
+            Expr::Local(PatId(2)),                                           // 10: fp
+            Expr::Local(PatId(1)),                                           // 11: w
+            Expr::Unary { op: UnOp::Deref, operand: ExprId(11) },            // 12: *w
+            Expr::Call { callee: ExprId(10), args: List { start: 0, len: 1 } }, // 13: fp(*w)
+            Expr::Local(PatId(4)),                                           // 14: c
+            Expr::Local(PatId(1)),                                           // 15: w
+            Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::Usize)))),       // 16: 2usize
+            Expr::Index { base: ExprId(15), index: ExprId(16) },             // 17: w[2usize]
+            Expr::Call { callee: ExprId(14), args: List { start: 1, len: 1 } }, // 18: c(w[2usize])
+            Expr::Binary { op: BinOp::Add, lhs: ExprId(13), rhs: ExprId(18) }, // 19: fp(*w) + c(w[2])
+            Expr::Block { stmts: List { start: 0, len: 3 }, tail: Some(ExprId(19)), scope: ScopeId(0) }, // 20
+        ];
+        let expr_lists = [ExprId(12), ExprId(17)];
+        let expr_ranges = make_ranges(exprs.len());
+        let field_inits = [FieldInit { name: Name::of("v"), expr: ExprId(0) }];
+        let stmts = [
+            Stmt::Let { pat: PatId(1), ty: None, init: Some(ExprId(1)), else_: None },
+            Stmt::Let { pat: PatId(2), ty: Some(b_fnptr), init: Some(ExprId(5)), else_: None },
+            Stmt::Let { pat: PatId(4), ty: None, init: Some(ExprId(9)), else_: None },
+        ];
+        let stmt_lists = [StmtId(0), StmtId(1), StmtId(2)];
+        let ints = [(ExprId(3), 10), (ExprId(16), 2)];
+        let params = [PatId(0)];
+        let mut bv = base_view(owner, body_tys.view(), ExprId(20));
+        bv.params = &params;
+        bv.segments = &segments;
+        bv.paths = &paths;
+        bv.opt_types = &opt_types;
+        bv.pats = &pats;
+        bv.pat_lists = &pat_lists;
+        bv.pat_ranges = &pat_ranges;
+        bv.exprs = &exprs;
+        bv.expr_lists = &expr_lists;
+        bv.expr_ranges = &expr_ranges;
+        bv.field_inits = &field_inits;
+        bv.stmts = &stmts;
+        bv.stmt_lists = &stmt_lists;
+        bv.call_arg_ints = &ints;
+
+        let ck = check_clean(&fx, &bv);
+
+        let mut st = PortableTys::new_in(heap());
+        let si64 = st.intern(PNode::Int(IntTy::I64)).unwrap();
+        let struct_fields = [Field { name: Name::of("v"), ty: si64 }];
+        let struct_variants = [Variant { key: wrap_k, name: Name::of("Wrap"), ctor: CtorKind::Braces, fields: List { start: 0, len: 1 } }];
+
+        let mut ctys = PortableTys::new_in(heap());
+        let ci64 = ctys.intern(PNode::Int(IntTy::I64)).unwrap();
+        let cref_i64 = ctys.intern(PNode::Ref(Mutbl::Not, ci64)).unwrap();
+        let csig_l = ctys.intern_list(&[ci64, ci64]).unwrap();
+        let csig = ctys.intern(PNode::FnPtr(csig_l, FnPtrHeader::RUST)).unwrap();
+        let empty_l = ctys.intern_list(&[]).unwrap();
+        let cenv0 = ctys.intern(PNode::Tuple(empty_l)).unwrap();
+        let cap1_l = ctys.intern_list(&[cref_i64]).unwrap();
+        let cenv1 = ctys.intern(PNode::Tuple(cap1_l)).unwrap();
+        let closures = [
+            (owner, 0u32, csig, cenv0, blaze_build::FnTrait::Fn),
+            (owner, 1u32, csig, cenv1, blaze_build::FnTrait::Fn),
+        ];
+
+        let mut world = OracleWorld::new(OverflowChecks::Off, &ints, &[]);
+        world.struct_key = Some(wrap_k);
+        world.struct_tys = Some(st);
+        world.struct_variants = &struct_variants;
+        world.struct_fields = &struct_fields;
+        world.deref_fn_item = Some(DEREF_ITEM);
+        world.index_fn_item = Some(INDEX_ITEM);
+        world.fn_call_item = Some(FN_CALL_ITEM);
+        world.fn_once_item = Some(FN_ONCE_ITEM);
+        world.closure_tys = Some(ctys);
+        world.closures = &closures;
+
+        let mut g_old = PortableTys::new_in(heap());
+        let mut subst_old = Subst { args: &[], ground: &mut g_old, scratch: heap() };
+        let old_built = blaze_build::build(&bv, &ck, &sig, &mut subst_old, &world, heap()).expect("old walk builds");
+
+        let body = blaze_body_lower::lower(&bv, &ck, &world, heap()).expect("D119 lowers");
+        let verified = blaze_body::verify(&body).expect("D119 verifies");
+        let mut g_new = PortableTys::new_in(heap());
+        let mut subst_new = Subst { args: &[], ground: &mut g_new, scratch: heap() };
+        let new_built = blaze_body_build::build(verified, ck.types.view(), bv.owner, &mut subst_new, &world, heap()).expect("D119 builds");
+
+        // Build both closure bodies through D119 (`lower_closure` -> `blaze_body_build`) too!
+        let c0_body = blaze_body_lower::lower_closure(&bv, &ck, &world, ExprId(5), heap()).expect("closure 0 lowers");
+        let c0_v = blaze_body::verify(&c0_body).expect("closure 0 verifies");
+        let mut g_c0 = PortableTys::new_in(heap());
+        let mut s_c0 = Subst { args: &[], ground: &mut g_c0, scratch: heap() };
+        let c0_built = blaze_body_build::build(c0_v, ck.types.view(), owner, &mut s_c0, &world, heap()).expect("closure 0 builds");
+
+        let c1_body = blaze_body_lower::lower_closure(&bv, &ck, &world, ExprId(9), heap()).expect("closure 1 lowers");
+        let c1_v = blaze_body::verify(&c1_body).expect("closure 1 verifies");
+        let mut g_c1 = PortableTys::new_in(heap());
+        let mut s_c1 = Subst { args: &[], ground: &mut g_c1, scratch: heap() };
+        let c1_built = blaze_body_build::build(c1_v, ck.types.view(), owner, &mut s_c1, &world, heap()).expect("closure 1 builds");
+
+        // `deref(&Wrap) -> &i64` returns `self` ptr directly (field 0 at offset 0).
+        let deref_fn = {
+            let mut b: Builder<Alloc<'static>, Full> = Builder::new_in(64, heap());
+            let p = blaze_lir::builder::Param::of(blaze_lir::Ty::PTR);
+            let s = b.sig(Conv::C, Variadic::No, &[p], &[p]);
+            b.set_signature(s);
+            let ent = b.create_block(BlockKind::Normal);
+            b.begin(ent);
+            let ptr = b.param(blaze_lir::Ty::PTR);
+            b.ret(&[ptr]);
+            b.finish_checked().unwrap()
+        };
+        // `index(&Wrap, usize) -> &i64` returns `self` ptr directly (reads `w.v`).
+        let index_fn = {
+            let mut b: Builder<Alloc<'static>, Full> = Builder::new_in(64, heap());
+            let p = blaze_lir::builder::Param::of(blaze_lir::Ty::PTR);
+            let u = blaze_lir::builder::Param::of(blaze_lir::Ty::I64);
+            let s = b.sig(Conv::C, Variadic::No, &[p, u], &[p]);
+            b.set_signature(s);
+            let ent = b.create_block(BlockKind::Normal);
+            b.begin(ent);
+            let ptr = b.param(blaze_lir::Ty::PTR);
+            let _idx = b.param(blaze_lir::Ty::I64);
+            b.ret(&[ptr]);
+            b.finish_checked().unwrap()
+        };
+        // Verify `c0_built` (`(&C, a) -> a + 10`) directly, and provide its `call_once(a) -> a + 10` entry.
+        let c0_res = run_in(c0_built.func.view(), &[Val::Ptr { slot: Val::NO_SLOT, offset: 0 }, Val::Int(5)], 1000, heap()).unwrap();
+        let Outcome::Returned(c0_vals) = c0_res else { panic!("c0_built did not return") };
+        assert_eq!(c0_vals.as_slice(), &[Val::Int(15)]);
+        let c0_fn_ptr = {
+            let mut b: Builder<Alloc<'static>, Full> = Builder::new_in(64, heap());
+            let i = blaze_lir::builder::Param::of(blaze_lir::Ty::I64);
+            let s = b.sig(Conv::C, Variadic::No, &[i], &[i]);
+            b.set_signature(s);
+            let ent = b.create_block(BlockKind::Normal);
+            b.begin(ent);
+            let a = b.param(blaze_lir::Ty::I64);
+            let ten = b.iconst(blaze_lir::Ty::I64, 10);
+            let sum = b.binary(blaze_lir::Op::Add, blaze_lir::Flags::NONE, a, ten);
+            b.ret(&[sum]);
+            b.finish_checked().unwrap()
+        };
+
+        struct Table<'a> {
+            refs: &'a [blaze_build::Instance],
+            deref_v: View<'a>,
+            index_v: View<'a>,
+            c0_v: View<'a>,
+            c1_v: View<'a>,
+        }
+        impl Bodies for Table<'_> {
+            fn callee(&self, _: BodyId, r: RefId) -> Option<(BodyId, View<'_>)> {
+                let ix = usize::try_from(r.0).ok()?;
+                let inst = self.refs.get(ix)?;
+                match inst.item {
+                    DEREF_ITEM => Some((BodyId([1; 32]), self.deref_v)),
+                    INDEX_ITEM => Some((BodyId([2; 32]), self.index_v)),
+                    FN_ONCE_ITEM => Some((BodyId([3; 32]), self.c0_v)),
+                    FN_CALL_ITEM => Some((BodyId([4; 32]), self.c1_v)),
+                    _ => None,
+                }
+            }
+            fn target(&self, from: BodyId, r: RefId) -> Option<blaze_lir::body::Target> {
+                self.callee(from, r).map(|(id, _)| blaze_lir::body::Target::Func(id))
+            }
+            fn body(&self, id: BodyId) -> Option<View<'_>> {
+                match id.0[0] {
+                    1 => Some(self.deref_v),
+                    2 => Some(self.index_v),
+                    3 => Some(self.c0_v),
+                    4 => Some(self.c1_v),
+                    _ => None,
+                }
+            }
+        }
+        let old_tbl = Table { refs: &old_built.refs, deref_v: deref_fn.view(), index_v: index_fn.view(), c0_v: c0_fn_ptr.view(), c1_v: c1_built.func.view() };
+        let new_tbl = Table { refs: &new_built.refs, deref_v: deref_fn.view(), index_v: index_fn.view(), c0_v: c0_fn_ptr.view(), c1_v: c1_built.func.view() };
+
+        // For input `x`: `fp(*w) + c(w[2]) = (x + 10) + (x + x) = 3*x + 10`!
+        for x in [0i64, 5, 11, -3] {
+            let arg = Val::Int(u128::from(x.cast_unsigned()));
+            let expected = Val::Int(u128::from((3 * x + 10).cast_unsigned()));
+            let old_out = run_calls_in(old_built.func.view(), BodyId([0; 32]), &[arg], 20_000, &old_tbl, heap()).expect("old run");
+            let new_out = run_calls_in(new_built.func.view(), BodyId([0; 32]), &[arg], 20_000, &new_tbl, heap()).expect("new run");
+            let Outcome::Returned(old_vals) = old_out else { panic!("old walk did not return for x={x}") };
+            let Outcome::Returned(new_vals) = new_out else { panic!("D119 build did not return for x={x}") };
+            assert_eq!(old_vals.as_slice(), &[expected], "old walk mismatch for x={x}");
+            assert_eq!(new_vals.as_slice(), old_vals.as_slice(), "D119 vs old walk divergence for x={x}");
+        }
     }
 }

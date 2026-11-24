@@ -182,6 +182,15 @@ pub trait BodyFacts: Facts {
     fn int_pat(&self, _p: PatId) -> Option<u128> {
         None
     }
+    /// The magnitude bits of float literal pattern `p` in its type's format (`Pat::NegLit` flips
+    /// the sign bit during lowering).
+    fn float_pat(&self, _p: PatId) -> Option<u128> {
+        None
+    }
+    /// The bytes of string or byte-string literal pattern `p`.
+    fn str_pat(&self, _p: PatId) -> Option<&[u8]> {
+        None
+    }
     /// The discriminant of `variant` of enum `adt`.
     fn discr(&self, _adt: ItemKey, _variant: u32) -> Option<Discr> {
         None
@@ -193,6 +202,22 @@ pub trait BodyFacts: Facts {
     /// Whether `item` is a trait's method (its call is `Callee::Method`, resolved per
     /// instance) or not (`Callee::FnItem`).
     fn trait_item(&self, item: ItemKey) -> Option<bool>;
+    /// The `Deref::deref` (`Mutbl::Not`) or `DerefMut::deref_mut` (`Mutbl::Mut`) trait method item.
+    fn deref_fn(&self, _mutbl: Mutbl) -> Option<ItemKey> {
+        None
+    }
+    /// The `Index::index` (`Mutbl::Not`) or `IndexMut::index_mut` (`Mutbl::Mut`) trait method item.
+    fn index_fn(&self, _mutbl: Mutbl) -> Option<ItemKey> {
+        None
+    }
+    /// The `Fn::call` / `FnMut::call_mut` / `FnOnce::call_once` trait method item for `kind`.
+    fn fn_trait_method(&self, _kind: blaze_typeck::ClosureKind) -> Option<ItemKey> {
+        None
+    }
+    /// The `ClosureKind` of closure `(owner, ordinal)` when defined in another body.
+    fn closure_kind(&self, _owner: ItemKey, _ordinal: u32) -> Option<blaze_typeck::ClosureKind> {
+        None
+    }
 }
 
 /// Lowers the body of a fn (`body`, checked as `ck`) to a [`Body`] in `alloc`.
@@ -284,8 +309,10 @@ pub(crate) struct Lower<'b, 'v, 'c, F, A: Allocator + Copy> {
     /// The one `resume` block, made when first needed.
     pub(crate) resume: Option<Block>,
     /// The operands of extending borrows of the `let` being lowered (the Reference, "Temporary
-    /// lifetime extension"), and the index in `marks` of its statement's scope.
+    /// lifetime extension"), extending blocks (for `super let`), and the index in `marks` of its
+    /// statement's scope.
     pub(crate) extended: Vec<ExprId, A>,
+    pub(crate) extended_blocks: Vec<ExprId, A>,
     pub(crate) ext_mark: Option<usize>,
     /// Two-phase loans made for the call being lowered, activated at the call.
     pub(crate) activate: Vec<Loan, A>,
@@ -333,6 +360,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             pending: Vec::new_in(alloc),
             resume: None,
             extended: Vec::new_in(alloc),
+            extended_blocks: Vec::new_in(alloc),
             ext_mark: None,
             activate: Vec::new_in(alloc),
             depth: 0,

@@ -7,17 +7,17 @@ use core::alloc::Allocator;
 
 use blaze_body::{AssertKind, BinOp, Block as BodyBlock, Callee, CalleeId, Operand, Ops, Place, StmtKind, Unwind};
 use blaze_build::intrinsics::target::{Target as IntrinsicTarget, float::FloatCall};
-use blaze_build::intrinsics::{Arg, Call, GenericArg, IntrinsicCx, Out, Which};
+use blaze_build::intrinsics::{Arg, Call, GenericArg, IntrinsicCx, Out, Site, Which};
 use blaze_build::layout::{LayoutCx, LayoutId};
 use blaze_build::vtable::{self, HEADER_WORDS};
-use blaze_build::{Abi, Instance, Intrinsic, OverflowChecks, Panic, PanicConst, abi};
-use blaze_lir::builder::{MemAttrs, Variadic};
-use blaze_lir::func::{BlockKind, Conv, RefId, SigId, SlotKind};
+use blaze_build::{Abi, CallerSite, Instance, Intrinsic, OverflowChecks, Panic, PanicConst, abi};
+use blaze_lir::builder::{MemAttrs, Param, Variadic};
+use blaze_lir::func::{BlockKind, Conv, Ext, RefId, SigId, SlotKind};
 use blaze_lir::{Block, Flags, IntCond, Ty, Value};
 use blaze_typeck::{ItemKey, List, Mutbl, PNode, PTy};
 
 use crate::value::At;
-use crate::{BuildError, Cx, Pass, V};
+use crate::{BuildError, Cx, Pass, Track, V};
 
 /// Maps a fn-pointer's surface ABI onto the calling convention plan (matching `blaze-build`).
 fn pointer_abi(abi: blaze_typeck::Abi) -> Option<Abi> {
@@ -65,7 +65,7 @@ enum ResultTo {
     Words { dest: Place, lay: LayoutId, size: u32 },
 }
 
-impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
+impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
     /// The terminator `kind`, the last row of its block.
     pub(crate) fn terminator(&mut self, kind: StmtKind) -> Result<(), BuildError> {
         match kind {
@@ -187,16 +187,81 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         Ok(Instance { item, args })
     }
 
-    /// The instance of lang fn `name` at `args` (ground), refusing a `#[track_caller]` one.
+    /// The instance of lang fn `name` at `args` (ground).
     fn lang_instance(&mut self, name: &'static str, args: &[blaze_typeck::PTy]) -> Result<(Instance, bool), BuildError> {
         let stmt = self.row()?;
         let item = self.adts.lang_fn(name).ok_or(BuildError::NoLangFn { stmt, name })?;
         let args = self.subst.ground.intern_list(args).map_err(|_| self.malformed("the ground table is full"))?;
         let instance = Instance { item, args };
-        if self.adts.track_caller(instance, self.subst.ground) == Some(true) {
-            return Err(BuildError::TrackCaller { stmt, name });
-        }
         Ok((instance, self.adts.nounwind(item) != Some(true)))
+    }
+
+    /// `core::panic::Location` and `&'static Location<'static>` in the ground table.
+    fn location_tys(&mut self) -> Result<(PTy, PTy), BuildError> {
+        let stmt = self.row()?;
+        let adt = self.adts.location_adt().ok_or(BuildError::NoLangFn { stmt, name: "panic_location" })?;
+        let loc_ty = self.subst.ground.intern(PNode::Adt(adt, List::EMPTY)).map_err(|_| self.malformed("the ground table is full"))?;
+        let ret = self.subst.ground.intern(PNode::Ref(Mutbl::Not, loc_ty)).map_err(|_| self.malformed("the ground table is full"))?;
+        Ok((loc_ty, ret))
+    }
+
+    /// The `CallerSite` of the current row, using `Adts::def_site(self.item)` for file identity
+    /// and the row's item-relative byte offset (`Span::lo`) when present.
+    fn row_caller_site(&self, name: &'static str) -> Result<CallerSite<'a>, BuildError> {
+        let stmt = self.row()?;
+        let def = self.adts.def_site(self.item).map_err(|_| BuildError::TrackCaller { stmt, name })?;
+        let span = self.v.stmt(stmt).span;
+        let offset = if span.lo != 0 || span.hi != 0 { span.lo } else { def.offset };
+        Ok(CallerSite { file: def.file, item: self.item, offset })
+    }
+
+    /// The `Site` and `Location` type for `core::intrinsics::caller_location` at the current row.
+    fn caller_location_site(&mut self, name: &'static str) -> Result<(Site<'a>, PTy), BuildError> {
+        let stmt = self.row()?;
+        let (loc_ty, _) = self.location_tys()?;
+        let site = match self.track {
+            Track::Passed(v) => Site::Passed(v),
+            Track::No => Site::Here(self.row_caller_site(name)?),
+            Track::Unsaid => return Err(BuildError::TrackCaller { stmt, name }),
+        };
+        Ok((site, loc_ty))
+    }
+
+    /// The hidden last `Location` argument for a call to `callee`, when `callee` is
+    /// `#[track_caller]`: forwards this fn's own hidden parameter if tracked, or materializes a
+    /// `Location` data row at the current row's site if untracked.
+    fn caller_arg(&mut self, callee: Instance, name: &'static str) -> Result<Option<Value>, BuildError> {
+        if self.adts.track_caller(callee, self.subst.ground) != Some(true) {
+            return Ok(None);
+        }
+        let stmt = self.row()?;
+        match self.track {
+            Track::Passed(v) => Ok(Some(v)),
+            Track::Unsaid => Err(BuildError::TrackCaller { stmt, name }),
+            Track::No => {
+                let (loc_ty, ret) = self.location_tys()?;
+                let here = Site::Here(self.row_caller_site(name)?);
+                let call = Call { which: Which::CallerLocation, generics: &[], args: &[], ret, site: Some((here, loc_ty)) };
+                let adts = self.adts;
+                let needs_drop = |_: PTy| false;
+                let out = {
+                    let mut lcx = LayoutCx { ground: &mut *self.subst.ground, facts: adts.facts(), scratch: self.subst.scratch };
+                    let mut icx = IntrinsicCx {
+                        layouts: &mut self.layouts,
+                        cx: &mut lcx,
+                        needs_drop: &needs_drop,
+                        ub_checks: adts.ub_checks(),
+                        overflow_checks: adts.overflow_checks(),
+                    };
+                    blaze_build::intrinsics::build(&mut self.b, &call, &mut icx)
+                }
+                .map_err(|error| BuildError::Intrinsic { stmt, error })?;
+                match out {
+                    Out::Scalar(v) => Ok(Some(v)),
+                    _ => Err(self.malformed("a `Location` row whose address is not one pointer")),
+                }
+            }
+        }
     }
 
     /// Append the registers for argument `x` of layout `lay`: a scalar, the two words of a
@@ -297,8 +362,13 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
             (Which::NeedsDrop, Some(&GenericArg::Ty(t0))) => self.needs_drop_of(t0)?,
             _ => false,
         };
+        let site = if which == Which::CallerLocation {
+            Some(self.caller_location_site("caller_location")?)
+        } else {
+            None
+        };
         let needs_drop = move |_: PTy| answer;
-        let call = Call { which, generics: &generics, args: &cargs, ret, site: None };
+        let call = Call { which, generics: &generics, args: &cargs, ret, site };
         let adts = self.adts;
         let out = {
             let mut lcx = LayoutCx { ground: &mut *self.subst.ground, facts: adts.facts(), scratch: self.subst.scratch };
@@ -446,6 +516,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         };
         let mut dyn_slot: Option<u32> = None;
         let mut variadic = Variadic::No;
+        let mut tracked_loc: Option<Value> = None;
         let (to, call_abi, may_unwind) = match self.v.callee(callee) {
             Callee::FnItem { key, args: fn_args } => {
                 match self.adts.intrinsic(key) {
@@ -465,23 +536,25 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                     variadic = Variadic::Yes;
                 }
                 let instance = self.instance(key, fn_args)?;
-                if self.adts.track_caller(instance, self.subst.ground) == Some(true) {
-                    return Err(BuildError::TrackCaller { stmt: self.row()?, name: "the callee" });
+                tracked_loc = self.caller_arg(instance, "the callee")?;
+                if tracked_loc.is_some() && variadic == Variadic::Yes {
+                    return Err(self.malformed("a C-variadic fn that is `#[track_caller]` (E0737)"));
                 }
                 (Target::Direct(self.func_ref(instance)), abi, self.adts.nounwind(key) != Some(true))
             }
             Callee::Method { key, args: fn_args } => {
                 let abi = self.adts.abi(key).ok_or(BuildError::NoAbi { item: key })?;
                 let instance = self.instance(key, fn_args)?;
-                if self.adts.track_caller(instance, self.subst.ground) == Some(true) {
-                    return Err(BuildError::TrackCaller { stmt: self.row()?, name: "the callee" });
-                }
                 let may_unwind = self.adts.nounwind(key) != Some(true);
                 if let Some(slot) = self.dyn_vtable_slot(instance)? {
+                    if self.adts.track_caller(instance, self.subst.ground) == Some(true) {
+                        return Err(BuildError::TrackCaller { stmt: self.row()?, name: "the dyn method" });
+                    }
                     dyn_slot = Some(slot);
                     // Placeholder target; replaced below after evaluating receiver's `(data, vtable)`.
                     (Target::Direct(RefId(0)), abi, may_unwind)
                 } else {
+                    tracked_loc = self.caller_arg(instance, "the callee")?;
                     (Target::Direct(self.func_ref(instance)), abi, may_unwind)
                 }
             }
@@ -588,6 +661,10 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                     passes.push(fpass);
                 }
             }
+        }
+        if let Some(loc) = tracked_loc {
+            values.push(loc);
+            passes.push(Pass::Scalar { ty: Ty::PTR, ext: Ext::None, agg: false });
         }
         let (params, rets) = abi::sig_of_in(&passes, rpass, self.alloc);
         let sig = self.b.sig(Conv::C, variadic, &params, &rets);
@@ -708,9 +785,16 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// A call of `panic_cannot_unwind`, which does not return: a `Terminate` row or landing.
     fn cannot_unwind(&mut self) -> Result<(), BuildError> {
         let (instance, _) = self.lang_instance("panic_cannot_unwind", &[])?;
+        let loc = self.caller_arg(instance, "panic_cannot_unwind")?;
         let r = self.func_ref(instance);
-        let sig = self.b.sig(Conv::C, Variadic::No, &[], &[]);
-        self.b.call(Flags::NONE, r, sig, &[]);
+        let mut ps: Vec<Param, A> = Vec::with_capacity_in(1, self.alloc);
+        let mut vs: Vec<Value, A> = Vec::with_capacity_in(1, self.alloc);
+        if let Some(loc) = loc {
+            ps.push(Param::of(Ty::PTR));
+            vs.push(loc);
+        }
+        let sig = self.b.sig(Conv::C, Variadic::No, &ps, &[]);
+        self.b.call(Flags::NONE, r, sig, &vs);
         self.b.unreachable();
         Ok(())
     }
@@ -726,6 +810,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
             return Err(self.malformed("a drop of a value local (the frame holds it in memory)"));
         };
         let (instance, may_unwind) = self.lang_instance("drop_in_place", &[g])?;
+        let loc = self.caller_arg(instance, "drop_in_place")?;
         let r = self.func_ref(instance);
         // The argument: a `*mut T`, wide when `T` is unsized.
         let pointer = self.subst.ground.intern(PNode::Ptr(Mutbl::Mut, g)).map_err(|_| self.malformed("the ground table is full"))?;
@@ -736,9 +821,15 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
             Some(m) => V::Two(address, m),
             None => V::One(address),
         };
-        let mut values: Vec<Value, A> = Vec::with_capacity_in(1, self.alloc);
+        let mut values: Vec<Value, A> = Vec::with_capacity_in(2, self.alloc);
+        let mut passes: Vec<Pass, A> = Vec::with_capacity_in(2, self.alloc);
         self.pass_arg(x, plain, pass, false, &mut values)?;
-        let (params, rets) = abi::sig_of_in(&[pass], Pass::Ignore, self.alloc);
+        passes.push(pass);
+        if let Some(loc) = loc {
+            values.push(loc);
+            passes.push(Pass::Scalar { ty: Ty::PTR, ext: Ext::None, agg: false });
+        }
+        let (params, rets) = abi::sig_of_in(&passes, Pass::Ignore, self.alloc);
         let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
         let landing = self.landing(unwind, may_unwind);
         self.emit(Target::Direct(r), sig, &values, landing, ResultTo::Nothing, Some(target))
@@ -787,10 +878,17 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
             }
         };
         let (instance, may_unwind) = self.lang_instance(panic.lang(), &[])?;
+        let loc = self.caller_arg(instance, panic.lang())?;
         let r = self.func_ref(instance);
-        let sig = self.b.sig(Conv::C, Variadic::No, &[], &[]);
+        let mut ps: Vec<Param, A> = Vec::with_capacity_in(1, self.alloc);
+        let mut vs: Vec<Value, A> = Vec::with_capacity_in(1, self.alloc);
+        if let Some(loc) = loc {
+            ps.push(Param::of(Ty::PTR));
+            vs.push(loc);
+        }
+        let sig = self.b.sig(Conv::C, Variadic::No, &ps, &[]);
         let landing = self.landing(unwind, may_unwind);
-        self.emit(Target::Direct(r), sig, &[], landing, ResultTo::Nothing, None)
+        self.emit(Target::Direct(r), sig, &vs, landing, ResultTo::Nothing, None)
     }
 
     /// The cold path of a bounds assert: `panic_bounds_check(index, len)`; the row's operands
@@ -806,12 +904,22 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         };
         let (len, _) = self.operand(*len)?;
         let (index, _) = self.operand(*index)?;
-        let values = [self.scalar(index)?, self.scalar(len)?];
         let (instance, may_unwind) = self.lang_instance("panic_bounds_check", &[])?;
+        let loc = self.caller_arg(instance, "panic_bounds_check")?;
         let r = self.func_ref(instance);
         let usize_ty = self.b.usize_ty();
-        let param = blaze_lir::builder::Param::of(usize_ty);
-        let sig = self.b.sig(Conv::C, Variadic::No, &[param, param], &[]);
+        let param = Param::of(usize_ty);
+        let mut ps: Vec<Param, A> = Vec::with_capacity_in(3, self.alloc);
+        ps.push(param);
+        ps.push(param);
+        let mut values: Vec<Value, A> = Vec::with_capacity_in(3, self.alloc);
+        values.push(self.scalar(index)?);
+        values.push(self.scalar(len)?);
+        if let Some(loc) = loc {
+            ps.push(Param::of(Ty::PTR));
+            values.push(loc);
+        }
+        let sig = self.b.sig(Conv::C, Variadic::No, &ps, &[]);
         let landing = self.landing(unwind, may_unwind);
         self.emit(Target::Direct(r), sig, &values, landing, ResultTo::Nothing, None)
     }

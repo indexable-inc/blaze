@@ -9,13 +9,13 @@ use blaze_build::cabi::{self, CAbiError, Class};
 use blaze_build::drop_facts::needs_drop;
 use blaze_build::intrinsics::{lir, resize_in};
 use blaze_build::layout::{LayoutCx, LayoutError, LayoutId, Variants};
-use blaze_build::{Abi, Panic, abi};
+use blaze_build::{Abi, Instance, Panic, abi};
 use blaze_lir::builder::{MemAttrs, Variadic};
 use blaze_lir::func::{BlockKind, Conv, Ext, SlotKind};
 use blaze_lir::{Flags, Op, Ty, Value};
 use blaze_typeck::{AdtKind, LangItem, PNode, PTy};
 
-use crate::{BuildError, Cx, Held, Pass, V};
+use crate::{BuildError, Cx, Held, Pass, Track, V};
 
 /// Integer width for C ABI `Pass::Words` power-of-two chunk loads/stores: log2 in 0..=3 -> 1, 2, 4, 8 bytes.
 fn word_width(log: u32) -> Ty {
@@ -357,6 +357,23 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
             }
             rust_call_spread = Some((last, fields_plan));
         }
+        // `#[track_caller]`: a tracked fn takes one hidden last parameter (`&'static Location`).
+        let own_args = self.subst.ground.intern_list(self.subst.args).map_err(|_| self.malformed("the ground table is full"))?;
+        let own_inst = Instance { item: self.item, args: own_args };
+        let own_tracked = match self.adts.track_caller(own_inst, self.subst.ground) {
+            Some(true) => {
+                passes.push(Pass::Scalar { ty: Ty::PTR, ext: Ext::None, agg: false });
+                true
+            }
+            Some(false) => {
+                self.track = Track::No;
+                false
+            }
+            None => {
+                self.track = Track::Unsaid;
+                false
+            }
+        };
         let (params, rets) = abi::sig_of_in(&passes, self.ret, self.alloc);
         let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
         self.b.set_signature(sig);
@@ -437,6 +454,10 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 fvals.push((idx, v, flay));
             }
             spread_values = Some((last, fvals));
+        }
+        if own_tracked {
+            let loc = next.next().ok_or(self.malformed("a `#[track_caller]` fn without its hidden location parameter"))?;
+            self.track = Track::Passed(loc);
         }
         self.cur.resize(locals, [None, None]);
         for i in 0..locals {

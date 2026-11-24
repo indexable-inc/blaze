@@ -9,11 +9,11 @@ use blaze_build::data::{DataRecord, DataTarget};
 use blaze_build::intrinsics::{lir, read_discriminant, resize_in};
 use blaze_build::layout::{Fields, Layout, LayoutCx, LayoutId, Variants};
 use blaze_build::vtable::{self, HEADER_WORDS, VtableRef};
-use blaze_build::{Instance, ground};
+use blaze_build::{FnTrait, Instance, ground, reify_shim_instance};
 use blaze_lir::builder::{DataReloc, MemAttrs};
 use blaze_lir::func::{BlockKind, RefId, RefKind, SlotKind};
 use blaze_lir::{Flags, FloatCond, IntCond, Op, Scalar, Ty, Value};
-use blaze_typeck::{AdtKind, List, PNode, PTy, UintTy};
+use blaze_typeck::{AdtKind, ExprId, List, PNode, PTy, UintTy};
 
 use crate::{BuildError, Cx, Held, V};
 
@@ -464,10 +464,12 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         Ok((at, g))
     }
 
-    /// The element type, layout and stride of array or slice `g` of layout `lay`.
+    /// The element type, layout and stride of array, slice, or `str` `g` of layout `lay`.
     fn element(&mut self, g: PTy, lay: LayoutId) -> Result<(PTy, LayoutId, u64), BuildError> {
         let elem_g = match self.node(g)? {
             PNode::Array(t, _) | PNode::Slice(t) => t,
+            PNode::Str => self.subst.ground.intern(PNode::Uint(UintTy::U8))
+                .map_err(|_| self.malformed("the ground table is full"))?,
             _ => return Err(self.malformed("an index into a type that is not an array or slice")),
         };
         let elem = self.layout(elem_g)?;
@@ -598,7 +600,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                     DataTarget::Static(s) => self.static_ref(s),
                     DataTarget::Fn(key) => {
                         let instance = self.adts.const_fn_instance(key, self.subst.ground).ok_or(BuildError::NoConstFnInstance { stmt, key })?;
-                        self.func_ref(instance)
+                        let target = self.reify_target(instance)?;
+                        self.func_ref(target)
                     }
                     DataTarget::Vtable(key) => {
                         let vt = self.adts.const_vtable_ref(key, self.subst.ground).ok_or(BuildError::NoConstVtable { stmt, key })?;
@@ -704,7 +707,15 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 let record = self.adts.const_value(key, &ground_args).ok_or(BuildError::NoConstValue { stmt, item: key })?;
                 self.const_record_value(lay, record)?
             }
-            ConstKind::Promoted(_) => return Err(self.unsupported("a promoted constant")),
+            ConstKind::Promoted(id) => {
+                let stmt = self.row()?;
+                let expr = ExprId(id);
+                let record = self.adts.promoted_value(self.item, expr, self.subst.args)
+                    .ok_or(BuildError::NoPromotedValue { stmt, expr })?;
+                record.check().map_err(|_| self.malformed("a promoted borrow's record that breaks the data form"))?;
+                let at = self.data_rows(record)?;
+                V::One(at)
+            }
             ConstKind::StaticAddr(item) => {
                 let r = self.static_ref(item);
                 V::One(self.b.data_addr(r))
@@ -1206,7 +1217,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 let PNode::FnDef(item, args) = self.node(g)? else {
                     return Err(self.malformed("a fn pointer made from a value that is not a fn item"));
                 };
-                let r = self.func_ref(Instance { item, args });
+                let target = self.reify_target(Instance { item, args })?;
+                let r = self.func_ref(target);
                 V::One(self.b.func_addr(r))
             }
             CastKind::IntToFloat => {
@@ -1234,8 +1246,50 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                     V::One(self.b.convert(Op::Fptrunc, Flags::NONE, ty, x))
                 }
             }
-            CastKind::ClosureFnPointer => return Err(self.unsupported("a closure to fn pointer cast")),
+            CastKind::ClosureFnPointer => {
+                let PNode::Closure { owner, ordinal, args } = self.node(g)? else {
+                    return Err(self.malformed("a closure to fn pointer cast of a value that is not a closure"));
+                };
+                let flay = self.layout(g)?;
+                if self.layouts.get(flay).size != 0 {
+                    return Err(self.unsupported("a closure with captures coerced to a fn pointer"));
+                }
+                let c = self.adts.facts().closure(owner, ordinal)
+                    .ok_or(self.unsupported("a closure whose facts the world did not answer"))?;
+                let mut owner_args: Vec<PTy, A> = Vec::new_in(self.alloc);
+                owner_args.extend_from_slice(
+                    self.subst.ground.view().list(args)
+                        .map_err(|_| self.malformed("a closure's arguments past the ground table"))?,
+                );
+                let sig = ground(c.types, c.sig, &owner_args, self.subst.ground, self.subst.scratch, self.adts.facts())
+                    .map_err(|e| self.facts(e))?;
+                let PNode::FnPtr(sig_list, _) = self.node(sig)? else {
+                    return Err(self.malformed("a closure's signature that is not a fn pointer"));
+                };
+                let all = self.subst.ground.view().list(sig_list)
+                    .map_err(|_| self.malformed("a closure's signature past the ground table"))?;
+                let (_, inputs) = all.split_last().ok_or(self.malformed("a closure's signature without its output"))?;
+                let mut in_vec: Vec<PTy, A> = Vec::with_capacity_in(inputs.len(), self.alloc);
+                in_vec.extend_from_slice(inputs);
+                let in_list = self.subst.ground.intern_list(&in_vec).map_err(|_| self.malformed("the ground table is full"))?;
+                let args_tuple = self.subst.ground.intern(PNode::Tuple(in_list)).map_err(|_| self.malformed("the ground table is full"))?;
+                let item = self.adts.fn_trait_method(FnTrait::FnOnce)
+                    .ok_or(BuildError::NoLangFn { stmt: self.row()?, name: "call_once" })?;
+                let inst_args = self.subst.ground.intern_list(&[g, args_tuple])
+                    .map_err(|_| self.malformed("the ground table is full"))?;
+                let r = self.func_ref(Instance { item, args: inst_args });
+                V::One(self.b.func_addr(r))
+            }
         })
+    }
+
+    /// The target instance for a fn-item reification: `ReifyShim` when `instance` is
+    /// `#[track_caller]`, else `instance` itself.
+    fn reify_target(&mut self, instance: Instance) -> Result<Instance, BuildError> {
+        if self.adts.track_caller(instance, self.subst.ground) == Some(true) {
+            return reify_shim_instance(instance, self.subst.ground).map_err(|e| self.facts(e));
+        }
+        Ok(instance)
     }
 
     /// `kind ty (operands)` written field by field into `dest`.
