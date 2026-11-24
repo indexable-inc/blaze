@@ -435,6 +435,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let total = stride.checked_mul(count).ok_or(unsupported(e, "a `format_args!` argument array past 4 GiB"))?;
         let slot = self.b.slot(total, align, SlotKind::Temp);
         let arr = self.b.slot_addr(slot);
+        if self.live {
+            self.hold_copy_temp(e, (arr, 0))?;
+        }
         for (i, u) in in_order.enumerate() {
             let a = *list.get(u.arg as usize).ok_or(malformed("a format use past its arguments"))?;
             let r = refs[u.arg as usize];
@@ -466,6 +469,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             let made = self.pop()?;
             let off = i32::try_from(stride * i as u32).map_err(|_| malformed("an argument array offset past 2 GiB"))?;
             self.store(made, arg_repr, (arr, off))?;
+            self.end_temp_val(made);
         }
         self.b.store(Flags::NONE, arr, at.0, at.1 + args_off, MemAttrs::aligned(3));
         self.push_val(V::Place(at.0, at.1), None);

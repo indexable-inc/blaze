@@ -866,7 +866,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     }
 
     /// The slot whose whole storage the place `at` is, if it is one (its `slot_addr`, offset 0).
-    fn whole_slot(&self, at: (Value, i32)) -> Option<SlotId> {
+    pub(super) fn whole_slot(&self, at: (Value, i32)) -> Option<SlotId> {
         let view = self.b.func().view();
         let ix = at.0.index();
         (at.1 == 0 && ix < view.len() && view.op(ix) == Op::SlotAddr).then(|| SlotId(view.data[ix]))

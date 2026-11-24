@@ -573,6 +573,12 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     /// Per open temporary scope, beside `temp_marks`: the expression it is of and how many
     /// drop scopes were open when it began (walk/temps.rs).
     temp_scopes: Vec<(u32, u32), A>,
+    /// Non-dropping temporary slots (`SlotKind::Temp`) whose storage ends when their temporary
+    /// scope closes (`(temp_scope_index, slot)`, walk/temps.rs).
+    temp_slots: blaze_own::Vec<(usize, SlotId), A>,
+    /// Extended non-dropping temporary slots whose storage ends when their block's drop scope
+    /// closes (`(scope_depth, slot)`, walk/temps.rs).
+    scope_slots: blaze_own::Vec<(usize, SlotId), A>,
     /// Per extending borrow under a branch, of a `let` being built: its temporary's drop flag
     /// (walk/temps.rs `ext_flags_for`).
     ext_flags: Vec<(u32, SlotId), A>,
@@ -903,6 +909,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             here
         },
         temp_scopes: Vec::new_in(alloc),
+        temp_slots: blaze_own::Vec::new_in(alloc),
+        scope_slots: blaze_own::Vec::new_in(alloc),
         ext_flags: Vec::new_in(alloc),
         super_temps: Vec::new_in(alloc),
         owned,
@@ -2061,6 +2069,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
         let repr = self.local_repr(p)?;
         self.slots[p.ix()] = Some((Home::At(at.0, at.1), repr));
+        self.name_at(at, blaze_flow_lower::identity::Identity::Binding(p));
         Ok(())
     }
 
@@ -3600,12 +3609,15 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     _ => {
                         let at = self.temp(repr);
                         self.store(v, repr, at)?;
+                        self.end_temp_val(v);
                         at
                     }
                 };
                 // Dropped at its statement's end (walk/temps.rs).
                 if drop && self.live {
                     self.hold_temp(e, at, repr)?;
+                } else if !drop && self.live {
+                    self.hold_copy_temp(e, at)?;
                 }
                 self.push_val(V::Place(at.0, at.1), None);
             }
@@ -3614,7 +3626,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Task::Intrinsic(e, which) => self.intrinsic(e, which)?,
             Task::Stmt(s) => self.stmt(s)?,
             Task::Discard => {
-                self.pop()?;
+                let v = self.pop()?;
+                self.end_temp_val(v);
             }
             Task::DropValue(e) => {
                 let v = self.pop()?;
@@ -3625,15 +3638,18 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     let g = self.layouts[l as usize].ty;
                     self.drop_at(g, at)?;
                 }
+                self.end_temp_val(v);
             }
             Task::ScopeEnd(e) => {
                 let v = self.pop()?;
+                let depth = self.scope_marks.len();
                 let mark = self.scope_marks.pop().ok_or(malformed("a block's drop scope out of order"))? as usize;
                 let repr = self.expr_repr(e)?;
                 let v = self.settle(v, repr, mark)?;
                 // Last declared first, each with its unwind ladder (walk/unwind_ladder.rs); each
                 // binding's own drop reads only its own `owned`, so they are cleared after.
                 self.drop_scope(mark, true)?;
+                self.end_scope_slots(mark, depth, v);
                 for i in mark..self.scope_pats.len() {
                     if let Held::Pat(p) = self.scope_pats[i] {
                         self.owned[p.ix()] = LocalOwn::None;
@@ -3674,14 +3690,17 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     }
                     // The initializer's own type: a pattern that peels a reference is recorded
                     // at the peeled one (`bind_value_of`).
-                    None => match init {
-                        Some(e) => {
-                            let t = self.adjusted_ty(e)?;
-                            let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
-                            self.bind_value_of(p, v, g)?
+                    None => {
+                        match init {
+                            Some(e) => {
+                                let t = self.adjusted_ty(e)?;
+                                let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
+                                self.bind_value_of(p, v, g)?
+                            }
+                            None => self.bind_value(p, v)?,
                         }
-                        None => self.bind_value(p, v)?,
-                    },
+                        self.end_temp_val(v);
+                    }
                 }
                 let from = self.scope_pats.len();
                 self.own_pat(p)?;
@@ -3898,6 +3917,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         V::Place(..) => {
                             let tmp = self.temp(repr);
                             self.store(v, repr, tmp)?;
+                            self.end_temp_val(v);
                             V::Place(tmp.0, tmp.1)
                         }
                         other => other,
@@ -3941,8 +3961,10 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                             }
                         }
                     }
+                    self.end_temp_val(v);
                 } else {
                     self.store(v, repr, at)?;
+                    self.end_temp_val(v);
                     if self.live {
                         if let Some(p) = self.local_of(lhs)? {
                             self.note_whole_assign(e, p);
@@ -3988,6 +4010,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     return Err(malformed("an aggregate literal without its place"));
                 };
                 self.store(v, repr, (p, at + off as i32))?;
+                self.end_temp_val(v);
                 // The literal owns it now (walk/val_stack.rs).
                 self.stored_part(off, repr)?;
             }
@@ -4001,8 +4024,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             }
             Task::Field(e) | Task::FieldPlace(e) => {
                 let (field_off, repr) = self.field(e)?;
-                let v = self.pop()?;
-                let (p, off) = self.place_any(v)?;
+                let src = self.pop()?;
+                let (p, off) = self.place_any(src)?;
                 let at = (p, off + field_off as i32);
                 let v = match task {
                     // A partial move out of a local (walk/moves.rs).
@@ -4011,18 +4034,20 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     _ => V::Place(at.0, at.1),
                 };
                 self.push_val(v, None);
+                self.end_temp_val(src);
             }
             Task::IndexPlace(e) => self.index_place(e)?,
             Task::IndexCall(e) => self.index_call(e)?,
             Task::LoadPlace(e) => {
-                let v = self.pop()?;
-                let at = self.place_any(v)?;
+                let src = self.pop()?;
+                let at = self.place_any(src)?;
                 let repr = self.expr_repr(e)?;
                 if self.repr_needs_drop(repr) {
                     return Err(unsupported(e, "a move out of an indexed element whose type needs drop"));
                 }
                 let v = self.load(repr, at);
                 self.push_val(v, None);
+                self.end_temp_val(src);
             }
             Task::DerefPlace => {
                 // A thin pointer is a scalar (`repr`); a wide one is an aggregate whose
@@ -4042,12 +4067,15 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     _ => {
                         let at = self.temp(repr);
                         self.store(v, repr, at)?;
+                        self.end_temp_val(v);
                         at
                     }
                 };
                 // Dropped at its statement's end (walk/temps.rs).
                 if drop && self.live {
                     self.hold_temp(e, at, repr)?;
+                } else if !drop && self.live {
+                    self.hold_copy_temp(e, at)?;
                 }
                 self.push_val(V::Place(at.0, at.1), None);
             }
@@ -4059,6 +4087,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     _ => {
                         let at = self.temp(repr);
                         self.store(v, repr, at)?;
+                        self.end_temp_val(v);
                         V::Place(at.0, at.1)
                     }
                 };
@@ -5318,6 +5347,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             self.jump(header, &[next]);
             self.begin(exit);
         }
+        self.end_temp_val(v);
         self.push_val(V::Place(to.0, to.1), None);
         Ok(())
     }
@@ -6652,6 +6682,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         if let V::Unsized(..) = s {
             return self.match_tested(e, scrutinee, arms, s, Repr::None);
         }
+        if self.try_match_whole_bind(e, scrutinee, arms, s)? {
+            return Ok(());
+        }
         let mut srepr = self.adjusted_repr(scrutinee)?;
         // A place behind a pointer that needs drop, matched in place (`Expr::Match` pushed its
         // place): by tests, whose bindings refuse a move out with no owner (walk/moves.rs
@@ -6905,6 +6938,15 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 Owner::Temp => return Err(malformed("a switch owning a temporary scrutinee (the match by tests owns those)")),
                 Owner::None => {}
             }
+        }
+        if arm.guard.is_none()
+            && st.by_ref.is_none()
+            && matches!(st.owner, Owner::None)
+            && let Some((at, ..)) = st.of_enum
+            && !self.pat_has_ref(arm.pat)?
+            && let Some(slot) = self.whole_slot(at)
+        {
+            self.end_temp_slot(slot);
         }
         self.work.push(Task::ArmEnd { m });
         self.work.push(Task::ScopeEnd(arm.body));

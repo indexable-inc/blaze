@@ -29,7 +29,7 @@
 
 use core::cell::Cell;
 
-use blaze_build::coroutine_state::{LaidState, StateName, StateNames, StatePlan, StatePlant, lay_state};
+use blaze_build::coroutine_state::{LaidState, StateName, StateNames, StatePlan, StatePlant, lay_state_with_upvar_flags};
 use blaze_build::layout::{LayoutCx, Layouts};
 use blaze_build::{CoroutineOf, coroutine_identity, coroutines_in};
 use blaze_own::AVec;
@@ -509,8 +509,10 @@ fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
         let row = layouts.get(id);
         sizes.push((row.size, row.align));
     }
-    // One drop flag per saved local whose ground type needs drop (main's ruling (ii)); the
-    // upvars (types[0]) are dropped by the unresumed path, not flagged.
+    // One drop flag per saved local whose ground type needs drop (main's ruling (ii)), plus
+    // one drop flag per by-value whole-binding upvar whose ground type needs drop (the
+    // unresumed path drops upvars if never polled; once polled, the body owns them and may
+    // move one conditionally before a suspension).
     let manually_drop = program.lang_named("manually_drop");
     let mut flags: AVec<'_, bool> = AVec::with_capacity_in(types.len(), alloc);
     for &t in types.iter().skip(1) {
@@ -524,6 +526,36 @@ fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
             })?;
         flags.push(needs);
     }
+    let mut upvar_flag_ids: AVec<'_, blaze_flow_lower::identity::Identity> = AVec::new_in(alloc);
+    if let (Some((body, _)), Some(done)) = (program.function(ci).body, bodies.checked.get(ci).and_then(Option::as_ref)) {
+        let view = body.view(program.body_types(ci));
+        if let Some(block) = coroutines_in(&view).find(|x| x.0 == c.ordinal).map(|x| x.1)
+            && let Ok(PNode::Tuple(env_list)) = ground.view().node(types[0])
+            && let Ok(env_slice) = ground.view().list(env_list)
+        {
+            let mut env_tys: AVec<'_, PTy> = AVec::with_capacity_in(env_slice.len(), alloc);
+            env_tys.extend_from_slice(env_slice);
+            for (f, &ty) in done.env_fields_by::<blaze_build::layout::BuildEnv>(block).zip(env_tys.iter()) {
+                if !f.is_whole() || f.how != blaze_typeck::CaptureKind::ByValue {
+                    continue;
+                }
+                let mut drop_impl = |ty: PTy, g: &mut PortableTys<'_>| adts.drop_impl(ty, g);
+                let needs = blaze_build::drop_facts::needs_drop(ty, &mut *ground, adts.facts(), manually_drop, &mut drop_impl, alloc)
+                    .map_err(|e| match e {
+                        blaze_build::drop_facts::NeedsDropError::NoAdt { adt } => BuildError::NoAdt { adt },
+                        blaze_build::drop_facts::NeedsDropError::Ask(error) | blaze_build::drop_facts::NeedsDropError::Ground(error) => error,
+                        blaze_build::drop_facts::NeedsDropError::Malformed { what } => BuildError::Malformed { what },
+                        _ => BuildError::UnsupportedSig { what: "whether an upvar of a coroutine state needs drop was not answered" },
+                    })?;
+                if needs {
+                    let id = blaze_flow_lower::identity::Identity::Binding(f.base);
+                    if !recipe.saved.iter().any(|s| s.identity == id) && !upvar_flag_ids.iter().any(|&x| x == id) {
+                        upvar_flag_ids.push(id);
+                    }
+                }
+            }
+        }
+    }
     let (env, saved) = match sizes.split_first() {
         Some((env, saved)) => (*env, saved),
         None => return Err(BuildError::Malformed { what: "a coroutine state with no upvars' row" }),
@@ -531,11 +563,14 @@ fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     if saved.len() != recipe.saved.len() {
         return Err(BuildError::Malformed { what: "a coroutine state's held types not one per saved local of its recipe" });
     }
-    let laid = lay_state(env, saved, &flags, points, alloc, alloc)?;
+    let laid = lay_state_with_upvar_flags(env, saved, &flags, upvar_flag_ids.len(), points, alloc, alloc)?;
     // Every size fits a u32: the state does (`lay_state` refused past 4 GiB).
-    let mut rows: AVec<'static, StateName> = AVec::with_capacity_in(saved.len(), alloc);
+    let mut rows: AVec<'static, StateName> = AVec::with_capacity_in(saved.len() + upvar_flag_ids.len(), alloc);
     for (i, s) in recipe.saved.iter().enumerate() {
         rows.push(StateName { identity: s.identity, offset: laid.field[i], size: saved[i].0 as u32, flag: laid.flag[i] });
+    }
+    for (&id, &flag_off) in upvar_flag_ids.iter().zip(laid.upvar_flag.iter()) {
+        rows.push(StateName { identity: id, offset: flag_off, size: 0, flag: Some(flag_off) });
     }
     // Unique keys (state_recipe.rs refused a saved identity twice): an unstable sort is
     // deterministic.
