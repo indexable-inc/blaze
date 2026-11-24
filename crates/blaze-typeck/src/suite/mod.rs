@@ -85,6 +85,7 @@ mod opaque_post_analysis_recursive;
 /// E0425 names the segment that failed (rules/lit_path.rs `path_miss`).
 mod path_miss;
 mod pat_editions;
+mod or_pat_bindings;
 /// An impl parameter named only by a where-clause projection (reth's `DebugNodeLauncher`).
 mod impl_param_by_projection;
 /// The body's own signature's projections as rows at its root (design B).

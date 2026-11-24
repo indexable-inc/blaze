@@ -115,7 +115,7 @@ blaze-rng	3
 blaze-roots	24
 blaze-run	273
 blaze-rungs	2
-blaze-scope	1705
+blaze-scope	1698
 blaze-screen	30
 blaze-script	91
 blaze-semver	9

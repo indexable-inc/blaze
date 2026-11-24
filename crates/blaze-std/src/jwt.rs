@@ -346,7 +346,7 @@ impl fmt::Display for JwtError {
             }
             JwtError::MissingExp => f.write_str("bstd::jwt: missing required `exp` claim"),
             JwtError::InvalidClaimType { claim } => {
-                write!(f, "bstd::jwt: invalid JSON type for registered claim `{claim}`")
+                write!(f, "bstd::jwt: invalid JSON type for registered claim '{claim}'")
             }
             JwtError::Alloc(err) => write!(f, "bstd::jwt: allocation failed ({err})"),
         }

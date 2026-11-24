@@ -2994,7 +2994,7 @@ impl HeadsStage {
             // The whole task failed: named by the file its entry is in.
             let file = handles.outlined.binary_search_by(|one| one.name.cmp(&task.planned.file)).ok().and_then(|at| core::str::from_utf8(&handles.outlined[at].path).ok());
             let head = match file {
-                Some(path) => crate::engine_head_notes::leak(g, format_args!("a head of `{path}`")),
+                Some(path) => crate::engine_head_notes::leak(g, format_args!("a head of '{path}'")),
                 None => "a head of a file the outlines do not hold",
             };
             refused.push(crate::engine_head_notes::Refused::whole(task.planned.name, head, why));

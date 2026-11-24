@@ -624,13 +624,14 @@ fn report(mut out: String, start: Instant) {
 }
 
 /// D104: every blaze `main` is `std::main`'s input, through the run path's front half
-/// (`run::build_new` over the installed toolchain), each as far as it gets. The owner's hello
-/// builds; a `main` that asks a whole world is refused in the words `Grant`'s
-/// `#[diagnostic::on_unimplemented]` gives, which name what to write instead. With
-/// `FRONT2_ENTRY_LIST` set, the lines are written there.
+/// (`run::build_stubbed` over the installed toolchain, matching `blaze run` and
+/// `front2_hello_manifest`), each as far as it gets. The owner's hello builds; a `main` that asks
+/// a whole world is refused in the words `Grant`'s `#[diagnostic::on_unimplemented]` gives, which
+/// name what to write instead. With `FRONT2_ENTRY_LIST` set, the lines are written there.
 #[test]
 fn the_entry_programs_as_far_as_each_gets() {
-    use blaze_ladder::run::{NewFront, build_new};
+    use blaze_ladder::program_texts::ProgramTexts;
+    use blaze_ladder::run::{NewFront, build_stubbed};
     use std::{env, fs, thread};
     let home = env::var("HOME").expect("HOME is set");
     let shelf = format!("{home}/.blaze/v2/toolchain");
@@ -646,13 +647,24 @@ fn the_entry_programs_as_far_as_each_gets() {
     let mut out = String::from("ENTRY PROGRAMS (D104, edition blaze-2026.11):\n");
     // Every row runs and is printed; what each missed is said at the end, all together.
     let alloc = blaze_own::testing::heap().alloc();
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let rows = thread::scope(|s| {
         let mut handles = blaze_own::Vec::with_capacity_in(programs.len(), alloc);
         for (shape, text) in programs {
             let shelf = shelf.as_str();
+            let tc = &tc;
             handles.push(s.spawn(move || {
                 let files = [SourceFile { path: "src/main.rs", text }];
-                let got = build_new(&files, "src/main.rs", NewFront { package: "entry", edition: EDITION, shelf: Some(shelf), overflow: blaze_build::OverflowChecks::On }, blaze_own::Alloc::global());
+                let new = NewFront { package: "entry", edition: EDITION, shelf: Some(shelf), overflow: blaze_build::OverflowChecks::On };
+                let got = ProgramTexts::new(&files, "src/main.rs", new, tc, blaze_build::Panic::Unwind).and_then(|texts| {
+                    let user = texts.user();
+                    let inputs = Inputs::new(&user, tc).map_err(blaze_ladder::run::RunError::Crates)?;
+                    let crates = inputs.crates();
+                    let names = inputs
+                        .resolve(&crates, blaze_own::testing::bump())
+                        .map_err(|e| blaze_ladder::run::RunError::Names { shown: format!("{e}").into_boxed_str() })?;
+                    build_stubbed(&names, &files, &texts, blaze_own::Alloc::global())
+                });
                 let line = match &got {
                     Ok(_) => "BUILT (front, checker and builder: no refusal)".to_string(),
                     Err(e) => format!("REFUSED: {e}"),

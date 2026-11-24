@@ -3807,6 +3807,9 @@ impl<'f> BodiesStage<'f> {
         let heap = handles.env.heap;
         // 0 to 2: the phase's setup, its plan-time rows in `buffer` ([`BodiesStage::prepare`]).
         let prepared = self.prepare(&cx, store, read, handles, tasks, &view, buffer, request_heads, listings, alloc, frame)?;
+        if handles.board.stopping().is_some() {
+            return Ok(MadeFacts { bytes: SVec::new_in(at_phase), index: SVec::new_in(at_phase) });
+        }
         // 3. The bodies to run, by member, file, name ([`Prepared::ones`]).
         let mut ones: Vec<One<'f>, Global> = Vec::new_in(Global);
         ones.extend_from_slice(prepared.ones);
@@ -4333,6 +4336,9 @@ impl<'f> BodiesStage<'f> {
             }
         };
         loop {
+            if handles.board.stopping().is_some() {
+                return Ok(Err(("stopped by signal", &[])));
+            }
             let (member, again) = match first_turn.next() {
                 Some(member) => (member, None),
                 None => {
@@ -4541,6 +4547,9 @@ impl<'f> BodiesStage<'f> {
             // its names record (engine_member_rows.rs `row_key`).
             let mut file_heads: Vec<crate::engine_member_rows::FileHead, blaze_own::Alloc<'static>> = Vec::with_capacity_in(items.files(), g);
             for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
+                if (file & 15) == 0 && handles.board.stopping().is_some() {
+                    return Ok(Err(("stopped by signal", &[])));
+                }
                 let head = 'head: {
                     let Ok(Some(row)) = items.file_surface(file) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
                     let Some(path) = row.path.in_package(list.shown_from(member), g) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
@@ -4775,6 +4784,9 @@ impl<'f> BodiesStage<'f> {
                     Some(row)
                 }
                 (stored, Some(records)) => {
+                    if handles.board.stopping().is_some() {
+                        return Ok(Err(("stopped by signal", &[])));
+                    }
                     let damaged = matches!(stored, Some(Err(_)));
                     let made = crate::engine_member_rows::make(records, expansions.as_ref(), frame, g);
                     let mut bytes: Vec<u8, blaze_own::Alloc<'static>> = Vec::new_in(g);
@@ -4869,6 +4881,9 @@ impl<'f> BodiesStage<'f> {
                     }
                 }
             }
+            if handles.board.stopping().is_some() {
+                return Ok(Err(("stopped by signal", &[])));
+            }
             let mut list_mark = handles.clock.now();
             let index = records.zip(row).map(|(records, row)| {
                 // The listed bodies of the member's OWED files alone (front2 project_records.rs
@@ -4909,6 +4924,9 @@ impl<'f> BodiesStage<'f> {
             // Only the owed files: a file no entered task is in is asked of by no decision
             // (`Holders::decide` reads the claims of the decided task's file alone).
             for &(file, outline_at) in owed_files.iter() {
+                if handles.board.stopping().is_some() {
+                    return Ok(Err(("stopped by signal", &[])));
+                }
                 let file_name = handles.outlined[outline_at as usize].name;
                 let root_file = handles.outlined[outline_at as usize].path.as_slice() == root_path.as_bytes();
                 let Some((records, mine, row, cfg, block_locals)) = index.as_ref() else {
@@ -6792,6 +6810,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
             let package = group.crates.world_at(0).map(|at| group.list.shown_from(at));
             for &(from, at, shape, call, path) in &opened.sources.0.left.borrow()[left_at..] {
                 found.push(left_found((from, at, shape, call, path), package, one.place.item, item_text, sc));
+                findings = findings.saturating_add(1);
             }
             // A scope crate opened by need whose record did not open (front_load.rs
             // `StoreLoad::refused`): the records answered this body, and every later one of the
